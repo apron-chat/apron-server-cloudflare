@@ -323,10 +323,13 @@ For direct Wrangler production commands, always pass
    object to work around a quota or schema issue. Stored data is not migrated
    between schema versions: a deploy that changes the storage schema resets the
    demo on the object's first wake (the current schema is 4; see
-   [SPEC section 8](../SPEC.md#schema-versions)). All chat history, passkey
-   identities, sessions, and limiter windows are deleted; users must register
-   their passkeys again, and saved session tokens fall back to sign-in. Only the
-   current day's resource reservations are carried over. Deploy the matching
+   [SPEC section 8](../SPEC.md#schema-versions)). All chat history, rooms,
+   sessions, bot tokens, and limiter windows are deleted, and saved session
+   tokens fall back to sign-in. Registered passkeys survive: up to 1,000 of the
+   most recently used are carried over with their identities, so users sign in
+   with the passkey they already have; older ones past that cap must be
+   registered again. Besides those, only the current day's resource
+   reservations and the guest-number mark are carried over. Deploy the matching
    frontend together with this backend.
 6. When deployment is authorized, merge to `main` (or run the Deploy workflow)
    and deploy the matching frontend from shazow/apron. Verify guest access, passkey registration/login, edits, threads, reactions, history,

@@ -548,6 +548,16 @@ interface RawCredentialRow {
   updated_ms: number;
 }
 
+/** A passkey a schema reset carries over, with its identity (see readCarriedPasskeys). */
+interface CarriedPasskey extends RawCredentialRow {
+  user_handle: string;
+  name: string;
+  tier: string;
+  identity_created_ms: number;
+  identity_updated_ms: number;
+  in_general: number;
+}
+
 interface RawIdentityRow {
   user_id: string;
   user_handle: string;
@@ -595,6 +605,19 @@ const META_ACCOUNT_USAGE = "account_usage_snapshot";
  * means none: the row is additive, so schema 4 objects need no reset for it.
  */
 const META_GUEST_NUMBER_MARK = "guest_number_mark";
+/**
+ * Most passkeys a schema reset carries over (see resetStorage), most recently
+ * used first; any beyond it are dropped with the rest of the object. It bounds
+ * the reset's uncharged-for-capacity SQL work to a small share of a day's
+ * writes, and so the identities that can survive a wipe.
+ */
+export const MAX_CARRIED_PASSKEYS = 1_000;
+/**
+ * Rows one carried passkey may read and write: the identity, credential and
+ * `general` membership reads before the wipe, and the same rows with their
+ * indexes written back afterwards.
+ */
+const CARRIED_PASSKEY_COST = { reads: 4, writes: 8 } as const;
 /** Rows one guest-number block reservation may read and write, before control overhead. */
 const GUEST_NUMBER_BLOCK_COST = { reads: 8, writes: 8 } as const;
 
@@ -1013,14 +1036,22 @@ export class Store {
   }
 
   /**
-   * Wipe every SQLite table and key-value entry (identities, credentials,
-   * passkey sessions, chat, limiter windows) and initialize a fresh schema.
+   * Wipe every SQLite table and key-value entry (chat, rooms, passkey
+   * sessions, bot tokens, limiter windows) and initialize a fresh schema.
    * Used whenever the stored schema version differs from this code's, in
    * either direction; there is no data migration.
    *
+   * Registered passkeys survive: up to MAX_CARRIED_PASSKEYS of the most
+   * recently used are read before the wipe and written back, with their
+   * identities (same `user_id`, name, and WebAuthn user handle) and their
+   * `general` membership, so users sign in again with the passkey they have
+   * rather than deleting it and registering anew. Their rows are charged to
+   * the day's maintenance reservation below. Older passkeys past the cap,
+   * bots, and every session are dropped.
+   *
    * The guest-number high-water mark is carried over, so a guest ID is never
    * reissued across a reset (a wipe does not restart guests at `guest_1`).
-   * Besides it, only the current UTC day's resource reservations are carried
+   * Besides those, only the current UTC day's resource reservations are carried
    * over, when the old schema's budget row is readable, so a deploy cannot replenish the
    * daily SQL allowance the platform has already metered. The fresh schema's
    * bootstrap reservation is added to that row without a capacity check, so
@@ -1052,6 +1083,7 @@ export class Store {
     } catch {
       // An unreadable old meta table carries no guest numbers.
     }
+    const passkeys = this.readCarriedPasskeys();
     await deleteAll.call(this.durableStorage);
     this.initialized = false;
     this.accountingUnsafe = false;
@@ -1065,10 +1097,21 @@ export class Store {
       // budget row, this is one uncharged control write.
       this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_GUEST_NUMBER_MARK, String(guestNumberMark));
     }
-    if (!carried) return;
+    if (passkeys.length) this.writeCarriedPasskeys(passkeys);
+    const carryCost = { reads: passkeys.length * CARRIED_PASSKEY_COST.reads, writes: passkeys.length * CARRIED_PASSKEY_COST.writes };
+    if (!carried && !passkeys.length) return;
     const columns = ["reads_reserved", "writes_reserved", "frames_reserved", "admissions_reserved", "posts_reserved",
       "registrations_reserved", "foreground_reads", "foreground_writes", "maintenance_reads", "maintenance_writes"] as const;
-    const values = columns.map((column) => Math.max(0, integerColumn(carried![column])));
+    const values = columns.map((column) => {
+      const value = carried ? Math.max(0, integerColumn(carried[column])) : 0;
+      // The carry is maintenance work, charged like the bootstrap: added
+      // without a capacity check, so it cannot block the reset.
+      if (column === "reads_reserved" || column === "maintenance_reads") return value + carryCost.reads;
+      if (column === "writes_reserved" || column === "maintenance_writes") return value + carryCost.writes;
+      return value;
+    });
+    this.observed.reservedReads += carryCost.reads;
+    this.observed.reservedWrites += carryCost.writes;
     this.transaction(() => {
       this.rawExec(
         `INSERT OR IGNORE INTO resource_budgets (day, ${columns.join(", ")}) VALUES (?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)`,
@@ -1082,6 +1125,56 @@ export class Store {
     });
     this.budgetCacheDay = null;
     this.budgetCache = null;
+  }
+
+  /**
+   * The registered passkeys a reset keeps, with their identities and whether
+   * each had joined `general`: at most MAX_CARRIED_PASSKEYS, most recently
+   * used (signed in or registered) first. Read from the old schema by column
+   * name, so a schema change that alters these tables must keep them readable
+   * here or accept that the reset drops them; an unreadable table carries none.
+   */
+  private readCarriedPasskeys(): CarriedPasskey[] {
+    try {
+      return this.rawRows<CarriedPasskey>(
+        `SELECT c.credential_id, c.user_id, c.public_key_json, c.sign_count, c.transports_json,
+            c.created_ms, c.updated_ms, i.user_handle, i.name, i.tier,
+            i.created_ms AS identity_created_ms, i.updated_ms AS identity_updated_ms,
+            EXISTS (SELECT 1 FROM memberships m WHERE m.room_id = ? AND m.user_id = c.user_id) AS in_general
+         FROM credentials c JOIN identities i ON i.user_id = c.user_id
+         WHERE i.tier = 'registered'
+         ORDER BY c.updated_ms DESC, c.credential_id LIMIT ?`,
+        ROOM_ID, MAX_CARRIED_PASSKEYS,
+      );
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Restore carried passkeys into a fresh schema: the identity, its
+   * credential, and its `general` membership. The membership row is restored
+   * without a log record, like the rest of the old log it is not replayed;
+   * member listings read the table. Other rooms did not survive the wipe.
+   */
+  private writeCarriedPasskeys(passkeys: readonly CarriedPasskey[]): void {
+    this.transaction(() => {
+      for (const row of passkeys) {
+        this.rawExec(
+          "INSERT OR IGNORE INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES (?, ?, ?, 'registered', ?, ?)",
+          row.user_id, row.user_handle, row.name, row.identity_created_ms, row.identity_updated_ms,
+        );
+        this.rawExec(
+          `INSERT OR IGNORE INTO credentials
+           (credential_id, user_id, public_key_json, sign_count, transports_json, created_ms, updated_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          row.credential_id, row.user_id, row.public_key_json, row.sign_count, row.transports_json, row.created_ms, row.updated_ms,
+        );
+        if (row.in_general) this.rawExec("INSERT OR IGNORE INTO memberships (room_id, user_id) VALUES (?, ?)", ROOM_ID, row.user_id);
+      }
+      const count = this.rawRows<{ count: number }>("SELECT COUNT(*) AS count FROM identities")[0];
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(integerColumn(count?.count)));
+    });
   }
 
   /** Log the `general` room's creation record as the next server record. */

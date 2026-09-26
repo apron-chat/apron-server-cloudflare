@@ -335,7 +335,9 @@ A stored schema version other than the current one resets the object with
 `deleteAll()` and recreates the schema (`test/schema-reset.integration.test.ts`).
 The reset is charged the same one-time 512/512 bootstrap reservation as a new
 object, added to the carried-over current-day reservation row without a
-capacity check.
+capacity check. Carried passkeys (at most `MAX_CARRIED_PASSKEYS`, 1,000) add 4
+reads and 8 writes each to that row's maintenance counters, so a full carry
+costs at most 4,000 reads and 8,000 writes, 10% of the 80,000 daily writes.
 
 ## Measurement limits
 
