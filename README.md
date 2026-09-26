@@ -237,7 +237,7 @@ Do not delete the database or run unmetered VACUUM as a space-recovery measure.
 [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) runs
 `npm run typecheck` and `npm test` on every pull request and on `main`. A push
 to `main` (a merged pull request), or a manual run of the workflow on `main`,
-then runs `npm run deploy` in the `production` GitHub environment: it checks
+then runs `npm run deploy` in the `server.apron.chat` GitHub environment: it checks
 generated-policy freshness and deploys with `wrangler.production.toml`. Deploys
 never run concurrently, and a newer queued deploy replaces an older one that has
 not started. Merging is deploying: review changes to bindings, migrations, the
@@ -245,7 +245,7 @@ storage schema, and the compatibility date against the checklist below before
 merging them.
 
 The deploy job needs two GitHub Actions secrets, on the repository or on the
-`production` environment:
+`server.apron.chat` environment:
 
 - `CLOUDFLARE_API_TOKEN`: an API token that can deploy Workers to the account
   and manage the `server.apron.chat` custom domain (for example, the "Edit
@@ -253,7 +253,7 @@ The deploy job needs two GitHub Actions secrets, on the repository or on the
 - `CLOUDFLARE_ACCOUNT_ID`: the account ID (`ACCOUNT_ID` in
   `wrangler.production.toml`).
 
-Add protection rules, such as required reviewers, to the `production`
+Add protection rules, such as required reviewers, to the `server.apron.chat`
 environment to hold deploys for approval. Worker secrets such as
 `ACCOUNT_ANALYTICS_TOKEN` are provisioned once with `wrangler secret put` and
 persist across deploys.
