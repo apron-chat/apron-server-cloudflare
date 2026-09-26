@@ -41,53 +41,53 @@ test('malformed generated sections fail without rewriting configuration', () => 
 
 test('deployment configuration isolates development and protects production selection', () => {
 	const packageJson = { scripts: { deploy: 'npm run budget:check && wrangler deploy --config wrangler.production.toml' } };
-	const makefile = 'deploy-worker:\n\tnpm --prefix servers/cloudflare-worker run deploy\n';
+	const workflow = '      - run: npm run deploy\n';
 	assert.doesNotThrow(() => validateDeploymentConfiguration({
 		development: 'name = "apron-cloudflare-demo-dev"\n',
 		production: 'name = "apron-cloudflare-demo"\nworkers_dev = false\npreview_urls = false\nroutes = [{ pattern = "server.apron.chat", custom_domain = true }]\n',
 		packageJson,
-		makefile,
+		workflow,
 	}));
 	assert.throws(() => validateDeploymentConfiguration({
 		development: 'name = "apron-cloudflare-demo"\n',
 		production: 'name = "apron-cloudflare-demo"\nworkers_dev = false\npreview_urls = false\nroutes = [{ pattern = "server.apron.chat", custom_domain = true }]\n',
 		packageJson,
-		makefile,
+		workflow,
 	}), /distinct/);
 	assert.throws(() => validateDeploymentConfiguration({
 		development: 'name = "apron-cloudflare-demo-dev"\n',
 		production: 'name = "apron-cloudflare-demo"\nworkers_dev = true\npreview_urls = false\nroutes = [{ pattern = "server.apron.chat", custom_domain = true }]\n',
 		packageJson,
-		makefile,
+		workflow,
 	}), /workers\.dev/);
 	assert.throws(() => validateDeploymentConfiguration({
 		development: 'name = "apron-cloudflare-demo-dev"\n',
 		production: 'name = "apron-cloudflare-demo"\nworkers_dev = false\npreview_urls = true\nroutes = [{ pattern = "server.apron.chat", custom_domain = true }]\n',
 		packageJson,
-		makefile,
+		workflow,
 	}), /preview/);
 	assert.throws(() => validateDeploymentConfiguration({
 		development: 'name = "apron-cloudflare-demo-dev"\n',
 		production: 'name = "apron-cloudflare-demo"\nworkers_dev = false\npreview_urls = false\nroutes = [{ pattern = "other.example", custom_domain = true }]\n',
 		packageJson,
-		makefile,
+		workflow,
 	}), /custom domain/);
 	assert.throws(() => validateDeploymentConfiguration({
 		development: 'name = "apron-cloudflare-demo-dev"\n',
 		production: 'name = "apron-cloudflare-demo"\nworkers_dev = false\npreview_urls = false\nroutes = [{ pattern = "server.apron.chat", custom_domain = true }]\n',
 		packageJson: { scripts: { deploy: 'wrangler deploy' } },
-		makefile,
+		workflow,
 	}), /production\.toml/);
 	assert.throws(() => validateDeploymentConfiguration({
 		development: 'name = "apron-cloudflare-demo-dev"\n',
 		production: 'name = "apron-cloudflare-demo"\nworkers_dev = false\npreview_urls = false\nroutes = [{ pattern = "server.apron.chat", custom_domain = true }]\n[assets]\ndirectory = "../../clients/web/build"\n',
 		packageJson,
-		makefile,
+		workflow,
 	}), /static assets/);
 	assert.throws(() => validateDeploymentConfiguration({
 		development: 'name = "apron-cloudflare-demo-dev"\n',
 		production: 'name = "apron-cloudflare-demo"\nworkers_dev = false\npreview_urls = false\nroutes = [{ pattern = "server.apron.chat", custom_domain = true }]\n',
 		packageJson,
-		makefile: 'deploy-worker:\n\twrangler deploy\n',
-	}), /Makefile/);
+		workflow: '      - run: npx wrangler deploy\n',
+	}), /deploy workflow/);
 });

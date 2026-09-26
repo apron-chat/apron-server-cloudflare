@@ -93,7 +93,7 @@ function configName(source, file) {
 	return match[1];
 }
 
-export function validateDeploymentConfiguration({ development, production, packageJson, makefile }) {
+export function validateDeploymentConfiguration({ development, production, packageJson, workflow }) {
 	const developmentName = configName(development, 'wrangler.toml');
 	const productionName = configName(production, 'wrangler.production.toml');
 	const productionTopLevel = topLevelConfig(production);
@@ -115,8 +115,8 @@ export function validateDeploymentConfiguration({ development, production, packa
 	if (!packageJson?.scripts?.deploy?.includes('--config wrangler.production.toml')) {
 		throw new Error('The package deploy script must select wrangler.production.toml');
 	}
-	if (!/deploy-worker:\s*\n\s*npm --prefix servers\/cloudflare-worker run deploy/.test(makefile ?? '')) {
-		throw new Error('The Makefile deploy-worker target must use the guarded package deploy script');
+	if (!/^\s*(?:-\s+)?run:\s*npm run deploy\s*$/m.test(workflow ?? '')) {
+		throw new Error('The deploy workflow must use the guarded package deploy script');
 	}
 }
 
@@ -128,8 +128,8 @@ function main() {
 	const development = readFileSync(new URL('wrangler.toml', root), 'utf8');
 	const production = readFileSync(new URL('wrangler.production.toml', root), 'utf8');
 	const packageJson = JSON.parse(readFileSync(new URL('package.json', root), 'utf8'));
-	const makefile = readFileSync(new URL('../../Makefile', root), 'utf8');
-	validateDeploymentConfiguration({ development, production, packageJson, makefile });
+	const workflow = readFileSync(new URL('.github/workflows/deploy.yml', root), 'utf8');
+	validateDeploymentConfiguration({ development, production, packageJson, workflow });
 	const outputs = [];
 	for (const [file, namespace] of [['wrangler.toml', '73001'], ['wrangler.production.toml', '73002']]) {
 		const source = readFileSync(new URL(file, root), 'utf8');
