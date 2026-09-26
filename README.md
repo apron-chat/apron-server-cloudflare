@@ -37,34 +37,40 @@ periodically and keeps local limits as the fallback when analytics is unavailabl
 Provision it with `npx wrangler secret put ACCOUNT_ANALYTICS_TOKEN --config wrangler.production.toml`.
 
 Use **Workers Free**, with SQLite Durable Objects. No paid plan or auxiliary
-service is required. This repository does not deploy as part of installation
-or tests. A paid plan's included allowance is not a spending cap.
+service is required. Installation and tests never deploy; merging to `main`
+does (see [continuous deployment](#continuous-deployment)). A paid plan's
+included allowance is not a spending cap.
 
 ## Local development
 
-Use Node.js 24 and the repository's existing Nix/devenv environment. From the
-repository root, `make install` installs each package from its lockfile.
+Use Node.js 24 (see `.node-version`); on NixOS, use `devenv shell` as described
+below. Install from the lockfile:
+
+```sh
+npm ci
+```
 
 No secret provisioning is required for local development. Production can run
 with local limits alone; configure the optional analytics secret above to enable
 the delayed account-wide safety stop.
 
-Start `make dev-worker` and `make dev-web` in separate terminals, then open
-`http://localhost:5173`. The existing frontend proxy connects to port 8080.
-Use **localhost**, matching the development passkey RP ID and origin.
-Wrangler persists local SQLite state between runs. Do not delete its state
-while investigating restart-safe quotas or identity recovery.
+`npx wrangler dev --port 8080` serves the development Worker. To use it with the
+web client, run the frontend from [shazow/apron](https://github.com/shazow/apron)
+(`make dev-web`) in another terminal and open `http://localhost:5173`; its dev
+proxy connects to port 8080. Use **localhost**, matching the development passkey
+RP ID and origin. Wrangler persists local SQLite state between runs. Do not
+delete its state while investigating restart-safe quotas or identity recovery.
 
 ```sh
-make test-worker
-make test-worker-browser
+npm run typecheck
+npm test
 ```
 
-The first command runs pure-policy and actual Workers runtime tests. The
-second starts an isolated local Wrangler serving the built frontend and uses Chromium's
-virtual authenticator against the real verifier. Existing browser prerequisites
-are documented in [DEVELOPMENT.md](../../DEVELOPMENT.md). Tests use local
-resources, never production account quotas.
+`npm test` runs pure-policy and actual Workers runtime tests. The end-to-end
+browser test, which drives the web client against this Worker with Chromium's
+virtual authenticator and the real verifier, lives with the web client in
+[shazow/apron](https://github.com/shazow/apron). Tests use local resources,
+never production account quotas.
 
 On NixOS, enter `devenv shell` before running Wrangler or Workers tests. The
 repository sets `MINIFLARE_WORKERD_PATH` to a launcher using Nix's ELF loader
@@ -226,7 +232,33 @@ stops growth at 96 MiB and resumes only below 80 MiB; transactions also check th
 128 MiB hard target before committing. Recheck this runtime assumption on upgrades.
 Do not delete the database or run unmetered VACUUM as a space-recovery measure.
 
-## Deployment checklist (manual, separately authorized)
+## Continuous deployment
+
+[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) runs
+`npm run typecheck` and `npm test` on every pull request and on `main`. A push
+to `main` (a merged pull request), or a manual run of the workflow on `main`,
+then runs `npm run deploy` in the `production` GitHub environment: it checks
+generated-policy freshness and deploys with `wrangler.production.toml`. Deploys
+never run concurrently, and a newer queued deploy replaces an older one that has
+not started. Merging is deploying: review changes to bindings, migrations, the
+storage schema, and the compatibility date against the checklist below before
+merging them.
+
+The deploy job needs two GitHub Actions secrets, on the repository or on the
+`production` environment:
+
+- `CLOUDFLARE_API_TOKEN`: an API token that can deploy Workers to the account
+  and manage the `server.apron.chat` custom domain (for example, the "Edit
+  Cloudflare Workers" template scoped to this account and the `apron.chat` zone).
+- `CLOUDFLARE_ACCOUNT_ID`: the account ID (`ACCOUNT_ID` in
+  `wrangler.production.toml`).
+
+Add protection rules, such as required reviewers, to the `production`
+environment to hold deploys for approval. Worker secrets such as
+`ACCOUNT_ANALYTICS_TOKEN` are provisioned once with `wrangler secret put` and
+persist across deploys.
+
+## Deployment checklist
 
 The production backend at `wss://server.apron.chat/` uses
 `wrangler.production.toml`. The frontend is deployed separately at
@@ -234,9 +266,9 @@ The production backend at `wss://server.apron.chat/` uses
 reserved for static documentation. The production backend has no static assets.
 WebSocket upgrades use `/` or `/ws`.
 The default development Worker is `apron-cloudflare-demo-dev`; it is separate
-from the production Worker `apron-cloudflare-demo`. It keeps serving the
-frontend for local development and browser tests. Keep bindings, migrations,
-and compatibility settings in sync.
+from the production Worker `apron-cloudflare-demo`. Like production, it binds no
+static assets: the frontend's development server proxies to it. Keep bindings,
+migrations, and compatibility settings in sync.
 Custom Domains configure DNS and HTTPS through Cloudflare; workers.dev and
 preview URLs are disabled for both deployments.
 
@@ -247,20 +279,20 @@ verification allows only the exact `https://web.apron.chat` origin. Browser
 local storage is origin-specific, so saved names and server preferences do not
 move from the apex automatically.
 
-From `devenv shell`, authenticate:
+Merging to `main` deploys the backend (see
+[continuous deployment](#continuous-deployment)). The frontend is deployed from
+[shazow/apron](https://github.com/shazow/apron) with `make deploy-web`, which
+builds it with `wss://server.apron.chat/` as its default server. For manual
+Wrangler commands, authenticate from `devenv shell`:
 
 ```sh
-cd servers/cloudflare-worker
 npx wrangler login
 npx wrangler whoami
 ```
 
-After completing the checks below, run `make deploy-worker` and
-`make deploy-web` from the repository root. The former deploys only the backend;
-the latter builds the frontend with `wss://server.apron.chat/` as its default
-server and deploys the static assets using the existing Worker package's Wrangler.
 For direct Wrangler production commands, always pass
-`--config wrangler.production.toml` and run `npm run budget:check` first.
+`--config wrangler.production.toml` and run `npm run budget:check` first;
+`npm run deploy` does both.
 
 1. Verify the **actual account is on Workers Free** and SQLite Durable Objects
    are enabled. Inventory other Workers, DO namespaces, and staging workloads;
@@ -277,7 +309,7 @@ For direct Wrangler production commands, always pass
    wildcard guest admission never enables wildcard passkey verification.
    RP changes can make previously registered credentials unusable.
 4. Build the frontend, check the static-asset output, and run all checks plus
-   the browser test. Review the lockfile and compatibility date together.
+   the browser test in shazow/apron. Review the lockfile and compatibility date together.
 5. Review `wrangler.production.toml`: fixed DO binding, `new_sqlite_classes` migration,
    no paid-service bindings. Apply the initial migration once using the normal
    Wrangler deployment workflow. Do not rename or recreate the production
@@ -289,8 +321,8 @@ For direct Wrangler production commands, always pass
    their passkeys again, and saved session tokens fall back to sign-in. Only the
    current day's resource reservations are carried over. Deploy the matching
    frontend together with this backend.
-6. When deployment is authorized, run `make deploy-worker deploy-web` from the
-   repository root. Verify guest access, passkey registration/login, edits, threads, reactions, history,
+6. When deployment is authorized, merge to `main` (or run the Deploy workflow)
+   and deploy the matching frontend from shazow/apron. Verify guest access, passkey registration/login, edits, threads, reactions, history,
    duplicate retries, custom-origin guest access, and rejection of passkey
    requests from unapproved origins against the deployed endpoint.
 7. Exercise idle **hibernation and wake**, then a real redeploy/reconnect. Check

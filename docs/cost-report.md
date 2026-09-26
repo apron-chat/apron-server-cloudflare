@@ -11,7 +11,7 @@ The figures were measured on 2026-09-26 with the repository's workerd
 launcher:
 
 ```sh
-devenv shell -- npm --prefix servers/cloudflare-worker test -- \
+devenv shell -- npm test -- \
   --run test/accounting.integration.test.ts --reporter=verbose
 ```
 

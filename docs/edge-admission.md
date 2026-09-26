@@ -32,8 +32,8 @@ During an authorized deployment:
    `web.apron.chat`, and every other hostname in the zone. Enable it only after
    explicitly accepting that impact and checking the available single rate-rule
    slot. Leave it disabled otherwise; the Worker admission limiter still applies.
-5. Deploy the Worker via `make deploy-worker` or the package's `npm run deploy`.
-   Both check generated-policy freshness and select `wrangler.production.toml`.
+5. Deploy the Worker by merging to `main` (the Deploy workflow runs
+   `npm run deploy`) or with `npm run deploy`. Both check generated-policy freshness and select `wrangler.production.toml`.
    These commands do not install WAF rules. A budget change affecting an enabled
    edge rate rule requires updating that rule from the regenerated definition.
 

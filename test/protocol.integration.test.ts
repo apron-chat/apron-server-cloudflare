@@ -203,10 +203,10 @@ it('keeps server-owned state out of public protocol frames', async () => {
 	} finally { peer.close(); }
 });
 
-it('authenticates on the root WebSocket endpoint and still serves the homepage', async () => {
+it('authenticates on the root WebSocket endpoint and answers plain requests with 404', async () => {
+	// Like production, the development config binds no static assets.
 	const response = await SELF.fetch('https://demo.test/');
-	expect(response.status).toBe(200);
-	expect(response.headers.get('content-type')).toContain('text/html');
+	expect(response.status).toBe(404);
 	const peer = await connect(undefined, '/');
 	try { await authenticate(peer); } finally { peer.close(); }
 	const denied = await SELF.fetch('https://demo.test/', { headers: {

@@ -6,11 +6,6 @@ compatibility_flags = ["nodejs_compat"]
 [observability]
 enabled = true
 
-[assets]
-directory = "../../clients/web/build"
-binding = "ASSETS"
-run_worker_first = ["/", "/ws"]
-
 [durable_objects]
 bindings = [
   { name = "DEMO", class_name = "ApronDemoServer" }

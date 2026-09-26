@@ -9,7 +9,7 @@ defaults rather than repeating numeric allocations. Separate calibrated parser,
 payload, and memory bounds remain in that same file; increasing them requires
 reviewing their consumers and repeating cost calibration.
 
-After changing the policy, run from `servers/cloudflare-worker`:
+After changing the policy, run from the repository root:
 
 ```sh
 npm run budget:generate
