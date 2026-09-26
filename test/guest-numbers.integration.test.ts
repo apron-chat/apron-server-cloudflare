@@ -1,9 +1,9 @@
-import { SELF, env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
+import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_LIMITS } from '../src/budget';
 import { Store } from '../src/store';
+import { connect as open } from './helpers/socket';
 
-type Frame = { id?: string | null; method?: string; result?: any; error?: any; params?: any };
 type Runtime = {
 	store: Store;
 	nextGuestNumber(): number;
@@ -12,29 +12,9 @@ type Runtime = {
 const BLOCK = DEFAULT_LIMITS.guestNumberBlock;
 let nextNet = 1;
 
-/** A socket to the public object from its own IPv6 /64, so per-IP limits never meet. */
+/** A socket to the public object from its own IPv6 /64, so per-IP limits never meet; its server frame is consumed. */
 async function connect() {
-	const response = await SELF.fetch('https://demo.test/ws', { headers: {
-		Upgrade: 'websocket', Origin: 'http://localhost:5173', 'CF-Connecting-IP': `2001:db8:${(0x4700 + nextNet++).toString(16)}::1`,
-	} });
-	expect(response.status).toBe(101);
-	const socket = response.webSocket!;
-	const frames: Frame[] = [];
-	const waiters: ((frame: Frame) => void)[] = [];
-	socket.addEventListener('message', event => {
-		const frame = JSON.parse(String(event.data));
-		const waiter = waiters.shift();
-		if (waiter) waiter(frame); else frames.push(frame);
-	});
-	socket.accept();
-	const peer = {
-		send(frame: unknown) { socket.send(JSON.stringify(frame)); },
-		next(): Promise<Frame> {
-			const frame = frames.shift();
-			return frame ? Promise.resolve(frame) : new Promise(resolve => waiters.push(resolve));
-		},
-		close() { socket.close(1000, 'test complete'); },
-	};
+	const peer = await open({ ip: `2001:db8:${(0x4700 + nextNet++).toString(16)}::1` });
 	expect((await peer.next()).method).toBe('server');
 	return peer;
 }
@@ -114,7 +94,6 @@ describe('guest numbers', () => {
 				nextWrites: afterNext.writes - afterBlock.writes,
 			};
 		});
-		console.info('guest-number-block', JSON.stringify(firstRun));
 		// 1..BLOCK from the first block, then BLOCK + 1 opens the second.
 		expect(firstRun.numbers).toEqual(Array.from({ length: BLOCK + 1 }, (_, index) => index + 1));
 		expect(firstRun.reservations).toBe(2);

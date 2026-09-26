@@ -1,38 +1,9 @@
-import { env, runInDurableObject } from "cloudflare:test";
 import { expect, it } from "vitest";
-import { RETENTION_MS, Store, StoreError, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
+import { RETENTION_MS, Store, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
+import { errorCode, messagesOf, withStore as withNamedStore, type TestClock } from "./helpers/store";
 
-/** A history page's messages; the array is omitted when empty (§4.1). */
-function messagesOf(page: { messages?: Array<{ log_id: string; message_id: string; room_id?: string; body?: Record<string, unknown> & { text?: string } }> }) {
-	return page.messages ?? [];
-}
-
-type TestClock = {
-	value: number;
-	readonly clock: { now(): number };
-};
-
-function makeClock(): TestClock {
-	const clock: TestClock = {
-		value: Date.now() + 1_000,
-		clock: { now: () => clock.value },
-	};
-	return clock;
-}
-
-async function withStore<T>(
-	name: string,
-	config: Partial<StoreConfig> = {},
-	fn: (store: Store, clock: TestClock, state: DurableObjectState) => T | Promise<T>,
-): Promise<T> {
-	const stub = env.DEMO.getByName(`history-${name}-${crypto.randomUUID()}`);
-	return runInDurableObject(stub, async (_instance, state) => {
-		const clock = makeClock();
-		const store = new Store(state, config, clock.clock);
-		store.initialize();
-		return fn(store, clock, state);
-	});
-}
+const withStore = <T>(name: string, config: Partial<StoreConfig>, fn: Parameters<typeof withNamedStore<T>>[2]) =>
+	withNamedStore(`history-${name}`, config, fn);
 
 function op(
 	clock: TestClock,
@@ -43,7 +14,6 @@ function op(
 ): StoreMutationInput {
 	return {
 		userId,
-		tier: "anonymous",
 		ipKey: "history-ip",
 		requestId,
 		method,
@@ -61,16 +31,6 @@ function logId(result: StoreMutationResult): bigint {
 	const value = result.broadcasts[0]?.params.log_id ?? result.room?.log_id;
 	if (typeof value !== "string") throw new Error("mutation did not produce a record");
 	return BigInt(value);
-}
-
-function errorCode(fn: () => unknown): string {
-	try {
-		fn();
-	} catch (error) {
-		if (error instanceof StoreError) return error.code;
-		throw error;
-	}
-	throw new Error("expected StoreError");
 }
 
 const ROOMY: Partial<StoreConfig> = {
@@ -290,6 +250,10 @@ it("continues bounded cleanup while retaining recent edits and moves out of a th
 		expect(messagesOf(history).map((entry) => BigInt(entry.log_id))).toEqual([recentRootLog, departureLog]);
 		expect(messagesOf(history)[0].body?.text).toBe("root-recent");
 		expect(messagesOf(history)[1]).toMatchObject({ room_id: "general", body: { text: "reply-departed" } });
+		// General's expired creation record leaves the log, but the room stays
+		// listed from the current-state table with its original log_id.
+		expect(history.rooms).toBeUndefined();
+		expect(BigInt(room.log_id)).toBeLessThan(BigInt(rootId));
 
 		// The thread keeps its room record: the move still touches its log.
 		const retained = store.getRoomState(threadId);

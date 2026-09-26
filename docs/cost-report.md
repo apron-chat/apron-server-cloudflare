@@ -15,7 +15,7 @@ devenv shell -- npm test -- \
   --run test/accounting.integration.test.ts --reporter=verbose
 ```
 
-The test uses ten separate Durable Objects through `runInDurableObject` and
+The test uses eleven separate Durable Objects through `runInDurableObject` and
 constructs a `Store` over each object's native SQLite state with a fake clock.
 The traffic tests start at a future UTC noon, cross three UTC posting days,
 run cleanup a day and a half later, and evict/reinitialize one object to check
@@ -347,9 +347,9 @@ and runtime, not deployed billing or a guaranteed per-message capacity.
 
 The native calibration in
 [`test/native-storage.test.ts`](../test/native-storage.test.ts) measures basic
-indexed insert/update/delete costs and page reuse. Its freelist result is
-explicitly unsupported by this runtime; this report does not infer physical
-freelist behavior from `databaseSize` alone.
+indexed insert/update/delete costs and page reuse. It does not read a
+freelist count (`PRAGMA freelist_count` is unsupported by this runtime); this
+report does not infer physical freelist behavior from `databaseSize` alone.
 
 The executable coverage for this report is in
 [`test/accounting.integration.test.ts`](../test/accounting.integration.test.ts)

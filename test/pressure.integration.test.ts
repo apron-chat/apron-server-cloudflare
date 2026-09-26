@@ -1,6 +1,7 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
-import { Store, StoreError, defaultStoreConfig } from '../src/store';
+import { Store, defaultStoreConfig } from '../src/store';
+import { expectRetryAfter } from './helpers/store';
 
 const MIB = 1024 * 1024;
 const SNAPSHOT_BYTES = 8 * 1024;
@@ -15,40 +16,30 @@ type CalibrationSql = {
 	};
 };
 
-function retryAfter(error: unknown): asserts error is StoreError {
-	expect(error).toBeInstanceOf(StoreError);
-	expect((error as StoreError).code).toBe('retry_after');
-}
-
 function insertCalibrationRows(
 	sql: CalibrationSql,
 	payload: string,
 	start: number,
 	end: number,
-	transactionSync?: (callback: () => void) => void,
+	transactionSync: (callback: () => void) => void,
 ): void {
 	if (end < start) return;
 	for (let chunkStart = start; chunkStart <= end; chunkStart += INSERT_CHUNK) {
 		const chunkEnd = Math.min(end, chunkStart + INSERT_CHUNK - 1);
 		// Keep each local calibration transaction bounded. This table is test
 		// data only; it is deliberately outside Store's request accounting.
-		const insertChunk = () => {
-				for (let id = chunkStart; id <= chunkEnd; id += 1) {
-					sql.exec('INSERT INTO pressure_calibration (id, snapshot_json) VALUES (?, ?)', id, payload);
-				}
-		};
-		if (transactionSync) {
-			transactionSync(insertChunk);
-		} else {
-			insertChunk();
-		}
+		transactionSync(() => {
+			for (let id = chunkStart; id <= chunkEnd; id += 1) {
+				sql.exec('INSERT INTO pressure_calibration (id, snapshot_json) VALUES (?, ?)', id, payload);
+			}
+		});
 	}
 }
 
 function deleteUntilBelow(sql: CalibrationSql, target: number, rows: number): number {
 	let keep = rows;
 	for (let iteration = 0; iteration < 128 && sql.databaseSize > target && keep > 1; iteration += 1) {
-		// Small bounded decrements keep the 90 MiB checkpoint above low-water;
+		// Small bounded decrements keep a between-water checkpoint above low-water;
 		// a single large delete can free several MiB of pages at once.
 		const nextKeep = Math.max(1, Math.floor(keep * 0.98));
 		sql.exec('DELETE FROM pressure_calibration WHERE id > ?', nextKeep).toArray();
@@ -97,7 +88,7 @@ it('stops growth near the hard target, reuses pages without VACUUM, and resumes 
 		} catch (error) {
 			pressureError = error;
 		}
-		retryAfter(pressureError);
+		expectRetryAfter(pressureError);
 
 		// Delete and reinsert the same bounded rows repeatedly. The workerd
 		// databaseSize contract excludes freelist pages, so reuse should keep
@@ -112,9 +103,11 @@ it('stops growth near the hard target, reuses pages without VACUUM, and resumes 
 		const minReinsertSize = Math.min(...reinsertSizes);
 		expect(maxReinsertSize - minReinsertSize).toBeLessThanOrEqual(2 * MIB);
 
-		const rowsAtHigh = deleteUntilBelow(sql, 90 * MIB, rows);
+		// Between the water marks: paused writes stay paused across a restart.
+		const betweenWater = (config.storageLowWaterBytes + config.storageHighWaterBytes) / 2;
+		const rowsAtHigh = deleteUntilBelow(sql, betweenWater, rows);
 		const highSize = sql.databaseSize;
-		expect(highSize).toBeLessThanOrEqual(90 * MIB);
+		expect(highSize).toBeLessThanOrEqual(betweenWater);
 		expect(highSize).toBeGreaterThan(config.storageLowWaterBytes);
 		return {
 			nearHardSize,
@@ -138,7 +131,7 @@ it('stops growth near the hard target, reuses pages without VACUUM, and resumes 
 		} catch (candidate) {
 			error = candidate;
 		}
-		retryAfter(error);
+		expectRetryAfter(error);
 		const rows = Number(sql.exec<{ count: number }>('SELECT COUNT(*) AS count FROM pressure_calibration').one().count);
 		const rowsAtLow = deleteUntilBelow(sql, config.storageLowWaterBytes - 2 * MIB, rows);
 		const lowSize = sql.databaseSize;
