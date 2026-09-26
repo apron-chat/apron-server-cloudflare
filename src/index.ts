@@ -111,6 +111,9 @@ const GUEST_READ_ONLY = "Guests can only read here; sign in with a passkey to po
  * `guest_` or `bot_`, so the prefix names bots alone.
  */
 const BOT_ID_PREFIX = "bot_";
+/** The registered user `TEST_TOKEN` signs in as. */
+const TEST_USER_ID = "test_user";
+const TEST_USER_NAME = "Test User";
 /** Bot tokens start with this, so `auth` tells them from passkey session tokens without a storage read. */
 const BOT_TOKEN_PREFIX = "apron_bot_";
 /** Key prefix for bot tokens in key-value storage, by the token's SHA-256 like sessions. */
@@ -175,6 +178,11 @@ function bytesToBase64Url(bytes: Uint8Array): string {
 async function sha256Hex(token: string): Promise<string> {
 	const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token)));
 	return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/** Compares a presented token with a configured one through their digests, so the time taken says nothing of the secret. */
+async function sameToken(presented: string, configured: string): Promise<boolean> {
+	return await sha256Hex(presented) === await sha256Hex(configured);
 }
 
 async function sessionKey(token: string): Promise<string> {
@@ -1056,7 +1064,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (scheme === "token") {
 			const token = requiredString(params, "token");
-			if (token.startsWith(BOT_TOKEN_PREFIX)) await this.handleBotToken(socket, attachment, request, token);
+			if (this.config.testToken !== undefined && await sameToken(token, this.config.testToken)) await this.handleTestToken(socket, attachment, request);
+			else if (token.startsWith(BOT_TOKEN_PREFIX)) await this.handleBotToken(socket, attachment, request, token);
 			else await this.handleTokenResume(socket, attachment, request);
 			return;
 		}
@@ -1247,20 +1256,46 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!stored || stored.v !== 1 || !isBot(stored.botId)) throw invalid;
 			const identity = this.store.getIdentity(stored.botId);
 			if (!identity) throw invalid;
-			if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
-			this.assertRegisteredCapacity(socket, identity.userId);
-			const guest = attachment.tier === "anonymous" ? publicIdentity(attachment) : null;
-			const guestRooms = attachment.rooms ?? [];
-			attachment.tier = "registered";
-			attachment.userId = identity.userId;
-			attachment.name = identity.name;
-			attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
-			delete attachment.listedJoined;
-			writeSessionAttachment(socket, attachment);
-			this.reply(socket, request, { you: publicIdentity(attachment) });
-			if (guest) this.announceUser(socket, publicIdentity(attachment), [...guestRooms, ...attachment.rooms], guest);
-			await this.rescheduleAlarm();
+			await this.signInKeyless(socket, attachment, request, identity);
 		});
+	}
+
+	/**
+	 * Signs in as the test user with `TEST_TOKEN`, for testing and demos
+	 * without a passkey. Like a bot token it is taken from any origin; the
+	 * user is a registered one, created on first use, that can post and run
+	 * `/invite-bot`.
+	 */
+	private async handleTestToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
+		return this.withSessionLock(async () => {
+			if (attachment.tier === "registered") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
+			const created = this.store.ensureTestUser({ userId: TEST_USER_ID, name: TEST_USER_NAME, now: nowMs(), ipKey: attachment.ipKey });
+			for (const record of created.broadcasts) this.broadcastRecord(record);
+			const identity = this.store.getIdentity(TEST_USER_ID);
+			if (!identity) throw { name: "internal_error", message: "Test user is missing" } satisfies ProtocolError;
+			await this.signInKeyless(socket, attachment, request, identity);
+		});
+	}
+
+	/**
+	 * Finishes a bearer-token sign-in that has no passkey session behind it
+	 * (a bot or the test user): the connection becomes the identity, and those
+	 * who shared a room with the guest it replaces hear of it.
+	 */
+	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[] }): Promise<void> {
+		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
+		this.assertRegisteredCapacity(socket, identity.userId);
+		const guest = attachment.tier === "anonymous" ? publicIdentity(attachment) : null;
+		const guestRooms = attachment.rooms ?? [];
+		attachment.tier = "registered";
+		attachment.userId = identity.userId;
+		attachment.name = identity.name;
+		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
+		delete attachment.listedJoined;
+		writeSessionAttachment(socket, attachment);
+		this.reply(socket, request, { you: publicIdentity(attachment) });
+		if (guest) this.announceUser(socket, publicIdentity(attachment), [...guestRooms, ...attachment.rooms], guest);
+		await this.rescheduleAlarm();
 	}
 
 	/**
