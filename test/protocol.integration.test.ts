@@ -1,8 +1,8 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { expect, it } from 'vitest';
 import { canonicalizeIp, hashIpKey } from '../src/ip';
+import { connect as open, exchange, reply, request, until, type ConnectOptions, type Frame, type Peer } from './helpers/socket';
 
-type Frame = { id?: string | null; method?: string; result?: any; error?: any; params?: any };
 let nextIp = 1;
 
 // These are server-owned fields that must never cross the protocol boundary.
@@ -18,20 +18,19 @@ const PRIVATE_SERVER_KEYS = new Set([
 
 function serverOwnedValues(frame: Frame): Array<{ key: string; value: unknown }> {
 	const values: Array<{ key: string; value: unknown }> = [];
-	const visit = (value: unknown, path: string[], userControlled = false): void => {
+	const visit = (value: unknown, userControlled = false): void => {
 		if (userControlled || !value || typeof value !== 'object') return;
 		if (Array.isArray(value)) {
-			for (const child of value) visit(child, path, false);
+			for (const child of value) visit(child, false);
 			return;
 		}
 		for (const [key, child] of Object.entries(value)) {
 			if (PRIVATE_SERVER_KEYS.has(key)) values.push({ key, value: child });
 			// Message bodies and ext objects are client-controlled public data.
-			const childIsUserControlled = key === 'body' || key === 'ext';
-			visit(child, [...path, key], childIsUserControlled);
+			visit(child, key === 'body' || key === 'ext');
 		}
 	};
-	visit(frame, [], false);
+	visit(frame, false);
 	return values;
 }
 
@@ -39,42 +38,8 @@ function expectPublicFrame(frame: Frame): void {
 	expect(serverOwnedValues(frame), `private server data in ${JSON.stringify(frame)}`).toEqual([]);
 }
 
-async function connect(ip = `192.0.2.${nextIp++}`, path = '/ws', origin: string | null = 'http://localhost:5173') {
-	const response = await SELF.fetch(`https://demo.test${path}`, { headers: {
-		Upgrade: 'websocket', ...(origin === null ? {} : { Origin: origin }), 'CF-Connecting-IP': ip
-	} });
-	expect(response.status).toBe(101);
-	const socket = response.webSocket!;
-	const frames: Frame[] = [];
-	const waiters: ((frame: Frame) => void)[] = [];
-	socket.addEventListener('message', event => {
-		const frame = JSON.parse(String(event.data));
-		const waiter = waiters.shift();
-		if (waiter) waiter(frame); else frames.push(frame);
-	});
-	socket.accept();
-	return {
-		socket,
-		send(frame: unknown) { socket.send(JSON.stringify(frame)); },
-		next(): Promise<Frame> {
-			const frame = frames.shift();
-			return frame ? Promise.resolve(frame) : new Promise(resolve => waiters.push(resolve));
-		},
-		close() { socket.close(1000, 'test complete'); }
-	};
-}
-
-/** Drain frames until one matches; earlier frames are returned for inspection. */
-async function until(peer: Awaited<ReturnType<typeof connect>>, match: (frame: Frame) => boolean): Promise<{ frame: Frame; skipped: Frame[] }> {
-	const skipped: Frame[] = [];
-	for (;;) {
-		const frame = await peer.next();
-		if (match(frame)) return { frame, skipped };
-		skipped.push(frame);
-	}
-}
-
-type Peer = Awaited<ReturnType<typeof connect>>;
+/** A socket from its own 192.0.2.N address unless `ip` is given. */
+const connect = ({ ip = `192.0.2.${nextIp++}`, ...options }: Partial<ConnectOptions> = {}) => open({ ip, ...options });
 
 async function authenticate(peer: Peer, scheme = 'guest', extraCaps: string[] = []) {
 	const server = await peer.next();
@@ -83,19 +48,17 @@ async function authenticate(peer: Peer, scheme = 'guest', extraCaps: string[] = 
 	expect(server.params.caps).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps]);
 	expect(server.params.auth).toContain('webauthn');
 	expect(server.params.ping).toBe(45);
-	expect(server.params.extensions).toBeUndefined();
 	// Demo hints live under the standard ext object, not a top-level key.
 	expect(server.params.ext.demo.retention_seconds).toBeGreaterThan(0);
 	peer.send({ method: 'auth', id: 'auth', params: { scheme } });
 	const auth = await peer.next();
 	expect(auth.result.you.user_id).toMatch(/^guest_/);
-	// The client lists its rooms with room_list (§4.3.1).
 	return auth.result.you;
 }
 
 type ServerInternals = { config: { limits: Record<string, number>; activityEnabled: boolean }; recentFrames: number[] };
 
-/** Changes the running demo object's policy for one test; the next test restores it. */
+/** Changes the running demo object's policy; callers restore it in their own `finally`. */
 async function configure(update: (config: ServerInternals['config']) => void): Promise<void> {
 	await runInDurableObject(env.DEMO.getByName('public-demo-v1'), (instance) => {
 		const server = instance as unknown as ServerInternals;
@@ -103,22 +66,6 @@ async function configure(update: (config: ServerInternals['config']) => void): P
 		update(server.config);
 		server.recentFrames.length = 0;
 	});
-}
-
-/** Skip notifications that precede the next request's reply. */
-async function reply(peer: Peer, id: string): Promise<Frame> {
-	return (await until(peer, frame => frame.id === id)).frame;
-}
-
-/** Sends a request; its reply and the notifications that preceded it. */
-async function exchange(peer: Peer, id: string, method: string, params: unknown): Promise<{ frame: Frame; skipped: Frame[] }> {
-	peer.send({ id, method, params });
-	return until(peer, (frame) => frame.id === id);
-}
-
-/** Sends a request and returns its reply, skipping notifications before it. */
-async function request(peer: Peer, id: string, method: string, params: unknown): Promise<Frame> {
-	return (await exchange(peer, id, method, params)).frame;
 }
 
 let syncCounter = 0;
@@ -136,7 +83,7 @@ async function drain(peer: Peer): Promise<Frame[]> {
 const ids = (rooms: Array<{ room_id: string }> | undefined) => (rooms ?? []).map((room) => room.room_id);
 
 it('admits clients without Origin as guests without advertising or allowing passkeys', async () => {
-	const peer = await connect(undefined, '/', null);
+	const peer = await connect({ path: '/', origin: null });
 	try {
 		// `token` is for bot tokens (/invite-bot); passkey sessions stay on their origin.
 		expect((await peer.next()).params.auth).toEqual(['token', 'guest']);
@@ -150,7 +97,7 @@ it('admits clients without Origin as guests without advertising or allowing pass
 it('keeps server-owned state out of public protocol frames', async () => {
 	const ip = `198.51.100.${nextIp++}`;
 	const ipHash = await hashIpKey(canonicalizeIp(ip)!);
-	const peer = await connect(ip);
+	const peer = await connect({ ip });
 	const publicFrames: Frame[] = [];
 	try {
 		const server = await peer.next();
@@ -207,7 +154,7 @@ it('authenticates on the root WebSocket endpoint and answers plain requests with
 	// Like production, the development config binds no static assets.
 	const response = await SELF.fetch('https://demo.test/');
 	expect(response.status).toBe(404);
-	const peer = await connect(undefined, '/');
+	const peer = await connect({ path: '/' });
 	try { await authenticate(peer); } finally { peer.close(); }
 	const denied = await SELF.fetch('https://demo.test/', { headers: {
 		Upgrade: 'websocket', Origin: 'https://untrusted.example', 'CF-Connecting-IP': '192.0.2.240'
@@ -271,8 +218,8 @@ it('commits once for canonical retries, passes ext through, and sends no reply t
 
 it('counts guest posting across sockets and returns retained retries after posting exhaustion', async () => {
 	const ip = `198.51.100.${nextIp++}`;
-	const first = await connect(ip);
-	const second = await connect(ip);
+	const first = await connect({ ip });
+	const second = await connect({ ip });
 	try {
 		await authenticate(first);
 		await authenticate(second);
@@ -537,7 +484,7 @@ it('limits the frames the whole server processes in a minute without closing soc
 		const busy = (await request(peer, 'busy', 'me', {})).error;
 		expect(busy.code).toBe(-32002);
 		expect(busy.data.retry_after).toBeGreaterThan(0);
-		// The socket stays open and a later minute is served again.
+		// The socket stays open and is served again once the limit allows it.
 		await configure((config) => { config.limits.globalFramesPerMinute = 300; });
 		expect((await request(peer, 'again', 'me', {})).result.you).toBeTruthy();
 	} finally { peer.close(); await configure((config) => { config.limits.globalFramesPerMinute = 300; }); }
@@ -756,17 +703,25 @@ it('drops a connection that pinged and went quiet from room_list members and clo
 	} finally { alice.close(); bob.close(); carol.close(); await configure((config) => { config.limits.pingTimeoutSeconds = 150; }); }
 });
 
-it('advertises the ping interval and the demo policy hints', async () => {
+it('advertises the demo policy hints', async () => {
 	const peer = await connect();
 	try {
-		const server = await peer.next();
-		expect(server.params.ping).toBe(45);
-		expect(server.params.ext.demo.keepalive_seconds).toBeUndefined();
-		// Leaving rooms is supported, so the demo no longer says otherwise.
-		expect(server.params.ext.demo.room_leave).toBeUndefined();
-		expect(server.params.ext.demo.read_cursors).toBe(false);
-		// Registered members listed per room in `members`, besides connected ones.
-		expect(server.params.ext.demo.room_list_members).toBe(100);
+		expect((await peer.next()).params.ext.demo).toEqual({
+			retention_seconds: 86_400,
+			cleanup_seconds: 3_600,
+			max_frame_bytes: 16_384,
+			max_message_text_bytes: 4_096,
+			max_snapshot_bytes: 8_192,
+			guest_posts_per_minute: 5,
+			registered_posts_per_minute: 20,
+			// vitest.config.ts turns guest posting on.
+			guest_posting: true,
+			server_frames_per_minute: 300,
+			room_list_per_minute: 6,
+			// Registered members listed per room in `members`, besides connected ones.
+			room_list_members: 100,
+			read_cursors: false,
+		});
 	} finally { peer.close(); }
 });
 
@@ -905,7 +860,6 @@ it('returns history in v6 shape: messages, first_log_id/last_log_id, and empty a
 		const page = (await request(peer, 'after', 'history', { room_id: roomId, after: posted.frame.result.message_id })).result;
 		expect(Object.keys(page).sort()).toEqual(['first_log_id', 'history_log_id', 'last_log_id', 'latest_log_id', 'messages', 'more']);
 		expect(page.messages).toEqual([posted.skipped[0].params]);
-		expect(page.entries).toBeUndefined();
 		expect(page.users).toBeUndefined();
 		// An empty slice: `more: false` and neither bound.
 		const empty = (await request(peer, 'empty', 'history', { room_id: roomId, after: String(BigInt(page.last_log_id) + 1n) })).result;

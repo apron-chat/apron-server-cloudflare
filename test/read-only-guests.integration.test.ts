@@ -1,7 +1,7 @@
-import { SELF, env, runInDurableObject } from 'cloudflare:test';
+import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
+import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
 
-type Frame = { id?: string | null; method?: string; result?: any; error?: any; params?: any };
 let nextIp = 1;
 
 const stub = () => env.DEMO.getByName('public-demo-v1');
@@ -14,55 +14,11 @@ async function guestsReadOnly(): Promise<void> {
 	});
 }
 
-async function connect(origin: string | null = 'http://localhost:5173', ip = `203.0.113.${nextIp++}`) {
-	const response = await SELF.fetch('https://demo.test/ws', { headers: {
-		Upgrade: 'websocket', ...(origin === null ? {} : { Origin: origin }), 'CF-Connecting-IP': ip,
-	} });
-	expect(response.status).toBe(101);
-	const socket = response.webSocket!;
-	const frames: Frame[] = [];
-	const waiters: ((frame: Frame) => void)[] = [];
-	let closed: { code: number; reason: string } | undefined;
-	socket.addEventListener('message', (event) => {
-		const frame = JSON.parse(String(event.data));
-		const waiter = waiters.shift();
-		if (waiter) waiter(frame); else frames.push(frame);
-	});
-	socket.addEventListener('close', (event) => { closed = { code: event.code, reason: event.reason }; });
-	socket.accept();
-	return {
-		send(frame: unknown) { socket.send(JSON.stringify(frame)); },
-		next(): Promise<Frame> {
-			const frame = frames.shift();
-			return frame ? Promise.resolve(frame) : new Promise((resolve) => waiters.push(resolve));
-		},
-		closed: () => closed,
-		close() { try { socket.close(1000, 'test complete'); } catch { /* closed */ } },
-	};
-}
-
-type Peer = Awaited<ReturnType<typeof connect>>;
-
-async function until(peer: Peer, match: (frame: Frame) => boolean): Promise<{ frame: Frame; skipped: Frame[] }> {
-	const skipped: Frame[] = [];
-	for (;;) {
-		const frame = await peer.next();
-		if (match(frame)) return { frame, skipped };
-		skipped.push(frame);
-	}
-}
-
-async function exchange(peer: Peer, id: string, method: string, params: unknown): Promise<{ frame: Frame; skipped: Frame[] }> {
-	peer.send({ id, method, params });
-	return until(peer, (frame) => frame.id === id);
-}
-
-async function request(peer: Peer, id: string, method: string, params: unknown): Promise<Frame> {
-	return (await exchange(peer, id, method, params)).frame;
-}
+/** A socket from its own 203.0.113.N address; `null` omits the Origin, as a bot does. */
+const connect = (origin: string | null = 'http://localhost:5173') => open({ ip: `203.0.113.${nextIp++}`, origin });
 
 /** Registers a passkey user straight into the store and signs a connection in with a session token. */
-async function signedIn(userId: string): Promise<{ peer: Peer; you: { user_id: string; name?: string } }> {
+async function signedIn(userId: string): Promise<Peer> {
 	const token = await runInDurableObject(stub(), async (instance) => {
 		const runtime = instance as unknown as {
 			store: { registerIdentity(input: Record<string, unknown>): unknown };
@@ -78,7 +34,7 @@ async function signedIn(userId: string): Promise<{ peer: Peer; you: { user_id: s
 	await peer.next();
 	const auth = await request(peer, 'auth', 'auth', { scheme: 'token', token });
 	expect(auth.result.you.user_id).toBe(userId);
-	return { peer, you: auth.result.you };
+	return peer;
 }
 
 /** Runs `/invite-bot` and returns the token from the private notice that answers it. */
@@ -133,7 +89,7 @@ it('tells a guest it only reads, then denies its writes, joins and leaves includ
 		expect(listed).not.toContain('/invite-bot');
 
 		// Something to react to and a thread to read, from a registered user.
-		const { peer: owner } = await signedIn('reader_owner');
+		const owner = await signedIn('reader_owner');
 		try {
 			const posted = await request(owner, 'post', 'message', { room_id: 'general', body: { text: 'for the guest' } });
 			denied(await request(guest, 'react', 'reactions', { message_id: posted.result.message_id, emojis: ['👍'] }));
@@ -151,7 +107,7 @@ it('tells a guest it only reads, then denies its writes, joins and leaves includ
 
 it('lets a registered user invite a bot that signs in from anywhere with its token', async () => {
 	await guestsReadOnly();
-	const { peer: owner, you } = await signedIn('u_owner');
+	const owner = await signedIn('u_owner');
 	const bot = await connect(null);
 	try {
 		const help = await exchange(owner, 'help', 'command', { body: { text: '/help' } });
@@ -193,13 +149,12 @@ it('lets a registered user invite a bot that signs in from anywhere with its tok
 		const botHelp = await exchange(bot, 'bot-help', 'command', { body: { text: '/help' } });
 		expect(botHelp.skipped.find((frame) => frame.method === 'message')!.params.body.text).not.toContain('/invite-bot');
 		expect((await request(bot, 'bot-invite', 'command', { body: { text: '/invite-bot' } })).error.code).toBe(-32001);
-		expect(you.user_id).toBe('u_owner');
 	} finally { owner.close(); bot.close(); }
 });
 
 it('replaces a bot token on a new invite, signing out the old one, and renames the bot after its owner', async () => {
 	await guestsReadOnly();
-	const { peer: owner } = await signedIn('u_rotating');
+	const owner = await signedIn('u_rotating');
 	const first = await connect(null);
 	const stale = await connect(null);
 	const fresh = await connect(null);
@@ -225,7 +180,7 @@ it('replaces a bot token on a new invite, signing out the old one, and renames t
 
 it('lets a bot send auth and a post together before the server frame, and retry the post without posting twice', async () => {
 	await guestsReadOnly();
-	const { peer: owner } = await signedIn('u_deployer');
+	const owner = await signedIn('u_deployer');
 	try {
 		const { token } = await inviteBot(owner, 'invite');
 		// A deploy hook (Appendix B): both frames at once, without waiting for `server`.

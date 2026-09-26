@@ -6,14 +6,7 @@ import {
 	runInDurableObject,
 } from "cloudflare:test";
 import { expect, it } from "vitest";
-
-type Frame = {
-	id?: string | null;
-	method?: string;
-	result?: Record<string, any>;
-	error?: { code: number; message?: string; data?: Record<string, any> };
-	params?: Record<string, any>;
-};
+import { connect as open } from "./helpers/socket";
 
 let nextIpOctet = 1;
 
@@ -41,34 +34,11 @@ function waitForClose(socket: WebSocket, timeoutMs = 3_000): Promise<CloseEvent>
 	});
 }
 
-async function connect(ip: string): Promise<{
-	socket: WebSocket;
-	next: () => Promise<Frame>;
-	close: () => Promise<void>;
-}> {
-	const response = await SELF.fetch("https://lifecycle.test/ws", {
-		headers: {
-			Upgrade: "websocket",
-			Origin: "http://localhost:5173",
-			"CF-Connecting-IP": ip,
-		},
-	});
-	if (response.status !== 101) throw new Error(`WebSocket upgrade failed: ${response.status} ${await response.text()}`);
-	const socket = response.webSocket!;
-	const frames: Frame[] = [];
-	const waiters: ((frame: Frame) => void)[] = [];
-	socket.addEventListener("message", (event) => {
-		const frame = JSON.parse(String(event.data)) as Frame;
-		const waiter = waiters.shift();
-		if (waiter) waiter(frame);
-		else frames.push(frame);
-	});
-	socket.accept();
-	const next = (): Promise<Frame> => {
-		const frame = frames.shift();
-		return frame ? Promise.resolve(frame) : new Promise((resolve) => waiters.push(resolve));
-	};
+/** The shared socket on the lifecycle host, with a close that gives the DO a turn to see it. */
+async function connect(ip: string) {
+	const peer = await open({ ip, host: "lifecycle.test" });
 	const close = async () => {
+		const { socket } = peer;
 		if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
 			socket.close(1000, "test complete");
 			// The workerd test client does not always surface a peer close event
@@ -77,7 +47,22 @@ async function connect(ip: string): Promise<{
 			await new Promise<void>((resolve) => setTimeout(resolve, 10));
 		}
 	};
-	return { socket, next, close };
+	return { ...peer, close };
+}
+
+type HibernatedSocket = WebSocket & {
+	deserializeAttachment(): Record<string, any>;
+	serializeAttachment(value: unknown): void;
+};
+
+/** The object's hibernatable sockets, with their attachments typed. */
+function socketsOf(instance: unknown): HibernatedSocket[] {
+	return (instance as { ctx: { getWebSockets(): WebSocket[] } }).ctx.getWebSockets() as HibernatedSocket[];
+}
+
+/** Every socket's attachment, read inside the object. */
+function attachments(stub: DurableObjectStub): Promise<Record<string, any>[]> {
+	return runInDurableObject(stub, async (instance) => socketsOf(instance).map((socket) => socket.deserializeAttachment()));
 }
 
 async function pendingSocket(ip = testIp()) {
@@ -117,7 +102,7 @@ it("restores hibernated socket attachment state without re-announcing the sessio
 	}
 });
 
-it("enforces the pending per-IP cap and releases it only after close", async () => {
+it("enforces the per-IP anonymous connection cap (pending and guest sockets) and releases it only after close", async () => {
 	const ip = testIp();
 	const first = await pendingSocket(ip);
 	const second = await pendingSocket(ip);
@@ -162,12 +147,11 @@ it("closes binary and oversized application frames with bounded policy codes", a
 it("enforces the per-connection frame budget independently of the IP budget", async () => {
 	const peer = await pendingSocket();
 	try {
-		// Unknown notifications are deliberately no-reply frames.  They still
-		// consume the application frame budget and keep this test independent
-		// of posting/authentication quotas.  Use identifiable (denied)
-		// requests for the first 60 so each reply drains the native DO queue;
-		// the 61st frame then tests the cap without leaving work in flight for
-		// the next hibernation scenario.
+		// Requests from an unauthenticated socket are denied, yet still spend
+		// the application frame budget, which keeps this test independent of
+		// posting/authentication quotas.  Each reply drains the native DO
+		// queue, so the 61st frame tests the cap without leaving work in
+		// flight for the next hibernation scenario.
 		for (let index = 0; index < 60; index += 1) {
 			peer.socket.send(JSON.stringify({ id: `frame-${index}`, method: "lifecycle-noop" }));
 			const reply = await peer.next();
@@ -196,11 +180,7 @@ it("schedules an authentication deadline and alarm-closes an expired pending soc
 		// The test uses the native hibernation attachment itself to move this
 		// connection past its deadline, then invokes the real DO alarm hook.
 		await runInDurableObject(stub, async (instance) => {
-			const runtime = instance as unknown as { ctx: { getWebSockets(): WebSocket[] } };
-			const socket = runtime.ctx.getWebSockets()[0] as WebSocket & {
-				deserializeAttachment(): Record<string, unknown>;
-				serializeAttachment(value: unknown): void;
-			};
+			const socket = socketsOf(instance)[0];
 			const attachment = socket.deserializeAttachment();
 			socket.serializeAttachment({ ...attachment, authDeadline: Date.now() - 1 });
 		});
@@ -226,25 +206,18 @@ it("expires a pending WebAuthn challenge on the shared alarm without authenticat
 		const challengeId = begun.result?.challenge_id;
 		expect(challengeId).toEqual(expect.any(String));
 
-		await runInDurableObject(stub, async (instance, state) => {
-			const runtime = instance as unknown as { ctx: { getWebSockets(): WebSocket[] } };
-			const socket = runtime.ctx.getWebSockets().map((candidate) => candidate as WebSocket & {
-				deserializeAttachment(): Record<string, any>;
-				serializeAttachment(value: unknown): void;
-			}).find((candidate) => candidate.deserializeAttachment().challenge?.challengeId === challengeId);
+		await runInDurableObject(stub, async (instance) => {
+			const socket = socketsOf(instance).find((candidate) => candidate.deserializeAttachment().challenge?.challengeId === challengeId);
 			expect(socket).toBeDefined();
 			const attachment = socket!.deserializeAttachment();
 			socket!.serializeAttachment({
 				...attachment,
 				challenge: { ...attachment.challenge, expiresAt: Date.now() - 1 },
 			});
-			// Force the real DO alarm hook to run immediately.  The production
-			// scheduler is separately checked above through getAlarm().
-			await state.storage.setAlarm(Date.now());
 		});
-		await runInDurableObject(stub, async (instance) => {
-			await (instance as unknown as { alarm(): Promise<void> }).alarm();
-		});
+		// The pending socket's authentication deadline keeps an alarm scheduled;
+		// run the real DO alarm hook now.
+		expect(await runDurableObjectAlarm(stub)).toBe(true);
 
 		peer.socket.send(JSON.stringify({
 			id: "expired-challenge",
@@ -274,10 +247,7 @@ it("ignores WebAuthn notifications and consumes matching malformed finishes", as
 		peer.socket.send(JSON.stringify({ method: "auth", params: { scheme: "webauthn", action: "register", step: "begin" } }));
 		peer.socket.send(JSON.stringify({ id: "notification-barrier", method: "lifecycle-noop" }));
 		expect((await peer.next()).error?.code).toBe(-32001);
-		const afterNotification = await runInDurableObject(stub, async (instance) => {
-			const runtime = instance as unknown as { ctx: { getWebSockets(): WebSocket[] } };
-			return runtime.ctx.getWebSockets().map((candidate) => (candidate as WebSocket & { deserializeAttachment(): Record<string, any> }).deserializeAttachment());
-		});
+		const afterNotification = await attachments(stub);
 		expect(afterNotification.some((attachment) => attachment.tier === "pending" && attachment.challenge !== undefined)).toBe(false);
 
 		peer.socket.send(JSON.stringify({ id: "begin-for-finish", method: "auth", params: { scheme: "webauthn", action: "register", step: "begin" } }));
@@ -290,10 +260,7 @@ it("ignores WebAuthn notifications and consumes matching malformed finishes", as
 		const malformed = await peer.next();
 		expect(malformed.error?.code).toBe(-32602);
 
-		const afterMalformed = await runInDurableObject(stub, async (instance) => {
-			const runtime = instance as unknown as { ctx: { getWebSockets(): WebSocket[] } };
-			return runtime.ctx.getWebSockets().map((candidate) => (candidate as WebSocket & { deserializeAttachment(): Record<string, any> }).deserializeAttachment());
-		});
+		const afterMalformed = await attachments(stub);
 		expect(afterMalformed.some((attachment) => attachment.challenge?.challengeId === challengeId)).toBe(false);
 		peer.socket.send(JSON.stringify({ id: "replayed-finish", method: "auth", params: {
 			scheme: "webauthn", action: "register", step: "finish", challenge_id: challengeId,
@@ -316,20 +283,14 @@ it("keeps a pending ceremony for a different challenge id and consumes it on act
 			scheme: "webauthn", action: "register", step: "finish", challenge_id: "other-challenge",
 		} }));
 		expect((await peer.next()).error?.code).toBe(-32001);
-		const retained = await runInDurableObject(stub, async (instance) => {
-			const runtime = instance as unknown as { ctx: { getWebSockets(): WebSocket[] } };
-			return runtime.ctx.getWebSockets().map((candidate) => (candidate as WebSocket & { deserializeAttachment(): Record<string, any> }).deserializeAttachment());
-		});
+		const retained = await attachments(stub);
 		expect(retained.some((attachment) => attachment.challenge?.challengeId === challengeId)).toBe(true);
 
 		peer.socket.send(JSON.stringify({ id: "wrong-action", method: "auth", params: {
 			scheme: "webauthn", action: "login", step: "finish", challenge_id: challengeId,
 		} }));
 		expect((await peer.next()).error?.code).toBe(-32001);
-		const consumed = await runInDurableObject(stub, async (instance) => {
-			const runtime = instance as unknown as { ctx: { getWebSockets(): WebSocket[] } };
-			return runtime.ctx.getWebSockets().map((candidate) => (candidate as WebSocket & { deserializeAttachment(): Record<string, any> }).deserializeAttachment());
-		});
+		const consumed = await attachments(stub);
 		expect(consumed.some((attachment) => attachment.challenge?.challengeId === challengeId)).toBe(false);
 	} finally {
 		await peer.close();

@@ -22,7 +22,7 @@ announcements are complete replacements.
 Production admits guest connections from any frontend origin, including opaque
 origins and clients without Origin. This does not relax passkey verification,
 IP attribution, quotas, or the fixed shared room. See the
-[custom frontend example](../README.md#connecting-a-custom-frontend).
+[custom frontend example](guide.md#connecting-a-custom-frontend).
 
 The implementation follows the current repository protocol. Local policy
 within it:

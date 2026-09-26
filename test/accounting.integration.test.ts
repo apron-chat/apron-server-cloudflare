@@ -1,12 +1,8 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
-import { Store, StoreError, defaultStoreConfig, type StoreConfig } from '../src/store';
+import { Store, StoreError, defaultStoreConfig } from '../src/store';
 import { DEFAULT_LIMITS } from '../src/budget';
-
-/** A history page's messages; the array is omitted when empty (§4.1). */
-function messagesOf(page: { messages?: Array<{ log_id: string; message_id: string; room_id?: string; body?: Record<string, unknown> & { text?: string } }> }) {
-	return page.messages ?? [];
-}
+import { expectRetryAfter, messagesOf } from './helpers/store';
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -35,10 +31,6 @@ function futureUtcNoon(): number {
 	return (Math.floor(Date.now() / DAY) + 2) * DAY + 12 * HOUR;
 }
 
-function accountingConfig(overrides: Partial<StoreConfig> = {}): StoreConfig {
-	return defaultStoreConfig(overrides);
-}
-
 function messageInput(
 	clock: FakeClock,
 	userId: string,
@@ -63,7 +55,10 @@ function messageInput(
 	};
 }
 
-function diffAccounting(after: ReturnType<Store['storageAccounting']>, before: ReturnType<Store['storageAccounting']>) {
+type Accounting = ReturnType<Store['storageAccounting']>;
+type Budget = ReturnType<Store['budget']>;
+
+function diffAccounting(after: Accounting, before: Accounting) {
 	return {
 		reads: after.reads - before.reads,
 		writes: after.writes - before.writes,
@@ -71,23 +66,7 @@ function diffAccounting(after: ReturnType<Store['storageAccounting']>, before: R
 	};
 }
 
-/**
- * What an operation reserved. Unused reservations are refunded into later
- * budget-row updates, so the rows and columns counted per operation come from
- * the store's reservation tally; quota counters still come from the day row.
- */
-function reservedBetween(
-	after: ReturnType<Store['budget']>, before: ReturnType<Store['budget']>,
-	afterAccounting: ReturnType<Store['storageAccounting']>, beforeAccounting: ReturnType<Store['storageAccounting']>,
-) {
-	return {
-		...diffBudget(after, before),
-		reads: afterAccounting.reservedReads - beforeAccounting.reservedReads,
-		writes: afterAccounting.reservedWrites - beforeAccounting.reservedWrites,
-	};
-}
-
-function diffBudget(after: ReturnType<Store['budget']>, before: ReturnType<Store['budget']>) {
+function diffBudget(after: Budget, before: Budget) {
 	return {
 		reads: after.reads - before.reads,
 		writes: after.writes - before.writes,
@@ -99,9 +78,72 @@ function diffBudget(after: ReturnType<Store['budget']>, before: ReturnType<Store
 	};
 }
 
-function expectRetry(error: unknown): asserts error is StoreError {
-	expect(error).toBeInstanceOf(StoreError);
-	expect((error as StoreError).code).toBe('retry_after');
+type Snapshot = { budget: Budget; accounting: Accounting };
+type Cost = { observed: ReturnType<typeof diffAccounting>; reserved: ReturnType<typeof diffBudget> };
+
+/** The budget and accounting counters before an operation (see {@link costSince}). */
+function snapshot(store: Store): Snapshot {
+	return { budget: store.budget(), accounting: store.storageAccounting() };
+}
+
+/**
+ * What the store did and reserved since `before`. Unused reservations are
+ * refunded into later budget-row updates, so the rows and columns counted per
+ * operation come from the store's reservation tally; quota counters still come
+ * from the day row.
+ */
+function costSince(store: Store, before: Snapshot): Cost {
+	const accounting = store.storageAccounting();
+	return {
+		observed: diffAccounting(accounting, before.accounting),
+		reserved: {
+			...diffBudget(store.budget(), before.budget),
+			reads: accounting.reservedReads - before.accounting.reservedReads,
+			writes: accounting.reservedWrites - before.accounting.reservedWrites,
+		},
+	};
+}
+
+function withinReserve({ observed, reserved }: Cost): boolean {
+	return observed.reads <= reserved.reads && observed.writes <= reserved.writes;
+}
+
+function expectWithinReserve(cost: Cost): void {
+	expect(cost.observed.reads).toBeLessThanOrEqual(cost.reserved.reads);
+	expect(cost.observed.writes).toBeLessThanOrEqual(cost.reserved.writes);
+}
+
+type CostEntry = Cost & { label: string; withinReserve: boolean; error?: string };
+
+/** Records the cost of each labelled operation into `costs`. */
+function costLog(store: Store) {
+	const costs: CostEntry[] = [];
+	const record = (label: string, before: Snapshot, extra: { error?: string } = {}) => {
+		const cost = costSince(store, before);
+		costs.push({ label, ...cost, ...extra, withinReserve: withinReserve(cost) });
+	};
+	return {
+		costs,
+		measure<T>(label: string, callback: () => T): T {
+			const before = snapshot(store);
+			const value = callback();
+			record(label, before);
+			return value;
+		},
+		async measureAsync<T>(label: string, callback: () => Promise<T>): Promise<T> {
+			const before = snapshot(store);
+			const value = await callback();
+			record(label, before);
+			return value;
+		},
+		measureFailure(label: string, callback: () => unknown): unknown {
+			const before = snapshot(store);
+			let error: unknown;
+			try { callback(); } catch (candidate) { error = candidate; }
+			record(label, before, { error: error instanceof StoreError ? error.code : 'none' });
+			return error;
+		},
+	};
 }
 
 function explain(sql: any, query: string, ...bindings: unknown[]) {
@@ -114,58 +156,44 @@ describe('measured storage accounting', () => {
 		const stub = env.DEMO.getByName('accounting-three-days-v1');
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, accountingConfig(), clock);
+			const store = new Store(state, defaultStoreConfig(), clock);
 			store.initialize();
 			const base = clock.now();
-			const operationCosts: Array<Record<string, unknown>> = [];
-
-			const measure = (label: string, callback: () => unknown) => {
-				const beforeBudget = store.budget();
-				const beforeAccounting = store.storageAccounting();
-				const value = callback();
-				const afterAccounting = store.storageAccounting();
-				const afterBudget = store.budget();
-				const observed = diffAccounting(afterAccounting, beforeAccounting);
-				const reserved = reservedBetween(afterBudget, beforeBudget, afterAccounting, beforeAccounting);
-				operationCosts.push({ label, observed, reserved, withinReserve: observed.reads <= reserved.reads && observed.writes <= reserved.writes });
-				return value;
-			};
+			const { costs: operationCosts, measure } = costLog(store);
 
 			const first = measure('day-0 create', () => store.commitMutation(messageInput(clock, 'audit-user', 'day zero', 'day-0')));
-			const firstMessageId = (first as { result: { message_id?: string } }).result.message_id;
+			const firstMessageId = first.result.message_id as string | undefined;
 			expect(firstMessageId).toBeTruthy();
 
 			clock.set(clock.now() + DAY + 2 * HOUR);
 			measure('day-1 create', () => store.commitMutation(messageInput(clock, 'audit-user', 'day one', 'day-1')));
 
 			clock.set(clock.now() + DAY);
-			const edit = measure('day-2 edit retained message', () => store.commitMutation(messageInput(clock, 'audit-user', 'edited after original expiry', 'day-2-edit', firstMessageId)));
+			measure('day-2 edit retained message', () => store.commitMutation(messageInput(clock, 'audit-user', 'edited after original expiry', 'day-2-edit', firstMessageId)));
 			measure('day-2 create', () => store.commitMutation(messageInput(clock, 'audit-user', 'day two', 'day-2')));
 
 			clock.set(clock.now() + 11 * HOUR);
 			const cleanup = measure('cleanup', () => store.runCleanup(clock.now()));
-			const page = measure('history after cleanup', () => store.historyPage({ roomId: 'general', limit: 50, now: clock.now() }));
+			const history = measure('history after cleanup', () => store.historyPage({ roomId: 'general', limit: 50, now: clock.now() }));
 			const room = store.getRoomState();
 			const observed = store.storageAccounting();
 			const budget = store.budget();
 			const size = store.databaseSize();
 
-			const cleanupResult = cleanup as { history_floor: string; deleted_records: number; deleted_messages: number };
-			const history = page as { messages?: Array<{ log_id: string; message_id: string }>; latest_log_id: string; history_log_id: string | null };
 			// The seeded general room record, the day-0 create, and the day-1
 			// create expire; the day-0 message survives through its day-2 edit.
-			expect(cleanupResult.deleted_records).toBe(3);
-			expect(cleanupResult.deleted_messages).toBe(1);
+			expect(cleanup.deleted_records).toBe(3);
+			expect(cleanup.deleted_messages).toBe(1);
 			expect(messagesOf(history)).toHaveLength(2);
 			expect(messagesOf(history).some((entry) => entry.message_id === firstMessageId)).toBe(true);
 			expect(messagesOf(history).every((entry) => BigInt(entry.log_id) >= BigInt(history.history_log_id!))).toBe(true);
-			expect(room.history_log_id).toBe(cleanupResult.history_floor);
+			expect(room.history_log_id).toBe(cleanup.history_floor);
 			expect(history.latest_log_id).toBe(room.latest_log_id);
 			expect(BigInt(room.latest_log_id)).toBeGreaterThanOrEqual(BigInt(room.history_log_id!));
 
 			return {
 				base,
-				cleanup: cleanupResult,
+				cleanup,
 				history: { floor: history.history_log_id, messages: messagesOf(history).map((entry) => ({ log_id: entry.log_id, message_id: entry.message_id })) },
 				operationCosts,
 				budget,
@@ -174,7 +202,7 @@ describe('measured storage accounting', () => {
 			};
 		});
 		console.info('accounting-three-days', JSON.stringify(result));
-		for (const operation of result.operationCosts as Array<{ label: string; withinReserve: boolean }>) {
+		for (const operation of result.operationCosts) {
 			expect(operation.withinReserve, `${operation.label} exceeded its reserved rows`).toBe(true);
 		}
 	});
@@ -183,20 +211,18 @@ describe('measured storage accounting', () => {
 		const stub = env.DEMO.getByName('accounting-refund-v1');
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, accountingConfig(), clock);
+			const store = new Store(state, defaultStoreConfig(), clock);
 			store.initialize();
 			store.commitMutation(messageInput(clock, 'refund-user', 'warm up', 'warm'));
-			const beforeBudget = store.budget();
-			const beforeAccounting = store.storageAccounting();
+			const before = snapshot(store);
 			store.commitMutation(messageInput(clock, 'refund-user', 'refunded', 'refund'));
-			const afterAccounting = store.storageAccounting();
-			const afterBudget = store.budget();
+			const { observed, reserved } = costSince(store, before);
 			return {
-				reserved: afterAccounting.reservedWrites - beforeAccounting.reservedWrites,
-				observed: afterAccounting.writes - beforeAccounting.writes,
-				charged: afterBudget.foreground_writes - beforeBudget.foreground_writes,
-				chargedReads: afterBudget.foreground_reads - beforeBudget.foreground_reads,
-				observedReads: afterAccounting.reads - beforeAccounting.reads,
+				reserved: reserved.writes,
+				observed: observed.writes,
+				charged: reserved.foregroundWrites,
+				chargedReads: reserved.foregroundReads,
+				observedReads: observed.reads,
 			};
 		});
 		// The mutation reserved far more than it wrote; the day is charged what it
@@ -209,7 +235,7 @@ describe('measured storage accounting', () => {
 
 	it('charges rejected quota work and stops repeated denial before more SQL work', async () => {
 		const stub = env.DEMO.getByName('accounting-rejections-v1');
-		const config = accountingConfig({
+		const config = defaultStoreConfig({
 			anonymousPostsPerMinute: 1,
 			anonymousPostsPerDay: 100,
 			ipPostsPerMinute: 1,
@@ -227,8 +253,7 @@ describe('measured storage accounting', () => {
 			const store = new Store(state, config, clock);
 			store.initialize();
 			const accepted = store.commitMutation(messageInput(clock, 'reject-user', 'accepted', 'accepted'));
-			const afterAcceptedAccounting = store.storageAccounting();
-			const afterAcceptedBudget = store.budget();
+			const afterAccepted = snapshot(store);
 
 			let quotaError: unknown;
 			try {
@@ -236,11 +261,8 @@ describe('measured storage accounting', () => {
 			} catch (error) {
 				quotaError = error;
 			}
-			expectRetry(quotaError);
-			const afterRejectedAccounting = store.storageAccounting();
-			const afterRejectedBudget = store.budget();
-			const rejectedObserved = diffAccounting(afterRejectedAccounting, afterAcceptedAccounting);
-			const rejectedReserved = reservedBetween(afterRejectedBudget, afterAcceptedBudget, afterRejectedAccounting, afterAcceptedAccounting);
+			expectRetryAfter(quotaError);
+			const { observed: rejectedObserved, reserved: rejectedReserved } = costSince(store, afterAccepted);
 			// Depending on which bounded admission check rejects the request, the
 			// request may have paid either the duplicate lookup or the full
 			// mutation reservation. In both cases the charged work stays bounded.
@@ -261,7 +283,7 @@ describe('measured storage accounting', () => {
 				} catch (error) {
 					capacityError = error;
 				}
-				expectRetry(capacityError);
+				expectRetryAfter(capacityError);
 				const currentAccounting = store.storageAccounting();
 				if (currentAccounting.reads === previousCapacityAccounting.reads &&
 					currentAccounting.writes === previousCapacityAccounting.writes &&
@@ -276,7 +298,7 @@ describe('measured storage accounting', () => {
 			const transitions = state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM records WHERE kind = 'message'").one().count;
 			return {
 				accepted: accepted.result,
-				acceptedAccounting: afterAcceptedAccounting,
+				acceptedAccounting: afterAccepted.accounting,
 				rejectedObserved,
 				rejectedReserved,
 				budget: store.budget(),
@@ -289,7 +311,7 @@ describe('measured storage accounting', () => {
 
 	it('preserves limiter state across object eviction and does not rewrite schema on reinitialization', async () => {
 		const stub = env.DEMO.getByName('accounting-persistence-v1');
-		const config = accountingConfig({
+		const config = defaultStoreConfig({
 			anonymousPostsPerMinute: 100,
 			anonymousPostsPerDay: 1,
 			ipPostsPerMinute: 100,
@@ -319,7 +341,7 @@ describe('measured storage accounting', () => {
 			} catch (candidate) {
 				error = candidate;
 			}
-			expectRetry(error);
+			expectRetryAfter(error);
 			const limits = state.storage.sql.exec('SELECT scope, principal_key, post_events_json, day, posts_day FROM principal_limits').toArray();
 			const transitions = state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM records WHERE kind = 'message'").one().count;
 			return { afterInit, budget: store.budget(), size: store.databaseSize(), limits, transitions: Number(transitions) };
@@ -335,7 +357,7 @@ describe('measured storage accounting', () => {
 		const stub = env.DEMO.getByName('accounting-room-list-v2');
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, accountingConfig(), clock);
+			const store = new Store(state, defaultStoreConfig(), clock);
 			store.initialize();
 			state.storage.transactionSync(() => {
 				for (let index = 1; index <= 100; index += 1) {
@@ -354,45 +376,31 @@ describe('measured storage accounting', () => {
 				}
 			});
 
-			const beforeBudget = store.budget();
-			const beforeAccounting = store.storageAccounting();
+			const beforeListing = snapshot(store);
 			const rooms = store.listRooms(clock.now());
-			const afterAccounting = store.storageAccounting();
-			const afterBudget = store.budget();
-			const observed = diffAccounting(afterAccounting, beforeAccounting);
-			const reserved = reservedBetween(afterBudget, beforeBudget, afterAccounting, beforeAccounting);
+			const listing = costSince(store, beforeListing);
 			expect(rooms).toHaveLength(101);
 			expect(rooms[0].room_id).toBe('general');
 			expect(rooms[1].intro_message).toMatchObject({ message_id: '1', body: { text: 'intro 1' } });
-			expect(observed.reads).toBeLessThanOrEqual(reserved.reads);
-			expect(observed.writes).toBeLessThanOrEqual(reserved.writes);
+			expectWithinReserve(listing);
 
 			// A registration that starts in 100 rooms (a guest's, carried over)
 			// stores and logs a membership in each.
-			const beforeRegistrationBudget = store.budget();
-			const beforeRegistration = store.storageAccounting();
+			const beforeRegistration = snapshot(store);
 			const registered = store.registerIdentity({
 				userId: 'lister', name: 'Lister', userHandle: 'lister-handle', now: clock.now(), ipKey: 'lister-ip',
 				credential: { credentialId: 'lister-credential', userId: 'lister', publicKey: 'key', counter: 0 },
 				rooms: ['general', ...Array.from({ length: 99 }, (_, index) => `thread-${index + 1}`), 'expired-thread'],
 			});
-			const afterRegistration = store.storageAccounting();
-			const registration = {
-				observed: diffAccounting(afterRegistration, beforeRegistration),
-				reserved: reservedBetween(store.budget(), beforeRegistrationBudget, afterRegistration, beforeRegistration),
-			};
+			const registration = costSince(store, beforeRegistration);
 			expect(registered.broadcasts).toHaveLength(100);
-			expect(registration.observed.reads).toBeLessThanOrEqual(registration.reserved.reads);
-			expect(registration.observed.writes).toBeLessThanOrEqual(registration.reserved.writes);
-			const beforeJoinBudget = store.budget();
-			const beforeJoin = store.storageAccounting();
+			expectWithinReserve(registration);
+			const beforeJoin = snapshot(store);
 			const joined = store.changeMembership({ userId: 'lister', ipKey: 'lister-ip', roomId: 'thread-100', join: true, now: clock.now() });
-			const afterJoin = store.storageAccounting();
-			const join = { observed: diffAccounting(afterJoin, beforeJoin), reserved: reservedBetween(store.budget(), beforeJoinBudget, afterJoin, beforeJoin) };
+			const join = costSince(store, beforeJoin);
 			expect(joined.rooms).toHaveLength(101);
 			expect(joined.rooms).not.toContain('expired-thread');
-			expect(join.observed.reads).toBeLessThanOrEqual(join.reserved.reads);
-			expect(join.observed.writes).toBeLessThanOrEqual(join.reserved.writes);
+			expectWithinReserve(join);
 
 			// Members of every room at the listing cap: 100 registered members in
 			// each of the 101 rooms, read by primary-key range with a name lookup each.
@@ -402,15 +410,12 @@ describe('measured storage accounting', () => {
 					for (const room of rooms) state.storage.sql.exec('INSERT OR IGNORE INTO memberships (room_id, user_id) VALUES (?, ?)', room.room_id, `member-${index}`);
 				}
 			});
-			const beforeMembersBudget = store.budget();
-			const beforeMembers = store.storageAccounting();
+			const beforeMembers = snapshot(store);
 			const members = store.roomMembers(rooms.map((room) => room.room_id), DEFAULT_LIMITS.roomListMembers, clock.now());
-			const afterMembers = store.storageAccounting();
-			const memberListing = { observed: diffAccounting(afterMembers, beforeMembers), reserved: reservedBetween(store.budget(), beforeMembersBudget, afterMembers, beforeMembers) };
+			const memberListing = costSince(store, beforeMembers);
 			expect([...members.values()].every((list) => list.length === DEFAULT_LIMITS.roomListMembers)).toBe(true);
-			expect(memberListing.observed.reads).toBeLessThanOrEqual(memberListing.reserved.reads);
-			expect(memberListing.observed.writes).toBeLessThanOrEqual(memberListing.reserved.writes);
-			return { rooms: rooms.length, observed, reserved, registration, join, memberListing };
+			expectWithinReserve(memberListing);
+			return { rooms: rooms.length, ...listing, registration, join, memberListing };
 		});
 		console.info('accounting-room-list', JSON.stringify(result));
 	});
@@ -419,7 +424,7 @@ describe('measured storage accounting', () => {
 		const stub = env.DEMO.getByName('accounting-history-cardinality-v2');
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, accountingConfig(), clock);
+			const store = new Store(state, defaultStoreConfig(), clock);
 			store.initialize();
 			const totalRows = 180;
 			const kinds = ['message', 'reactions', 'room'] as const;
@@ -441,13 +446,9 @@ describe('measured storage accounting', () => {
 				state.storage.sql.exec('UPDATE log_state SET last_log_id = ?, history_floor = 1, last_commit_ms = ?', totalRows, clock.now() + totalRows);
 			});
 
-			const beforeAccounting = store.storageAccounting();
-			const beforeBudget = store.budget();
+			const before = snapshot(store);
 			const page = store.historyPage({ roomId: 'general', after: '0', limit: 50, now: clock.now() });
-			const afterAccounting = store.storageAccounting();
-			const afterBudget = store.budget();
-			const observed = diffAccounting(afterAccounting, beforeAccounting);
-			const reserved = reservedBetween(afterBudget, beforeBudget, afterAccounting, beforeAccounting);
+			const cost = costSince(store, before);
 			expect((page.rooms?.length ?? 0) + messagesOf(page).length + (page.reactions?.length ?? 0)).toBe(50);
 			expect(page.rooms).toHaveLength(17);
 			expect(page.reactions).toHaveLength(17);
@@ -455,16 +456,15 @@ describe('measured storage accounting', () => {
 			expect(page.more).toBe(true);
 			expect(page.first_log_id).toBe('1');
 			expect(page.last_log_id).toBe('50');
-			expect(observed.reads).toBeLessThanOrEqual(reserved.reads);
-			expect(observed.writes).toBeLessThanOrEqual(reserved.writes);
-			return { observed, reserved, first: page.first_log_id, last: page.last_log_id, more: page.more };
+			expectWithinReserve(cost);
+			return { ...cost, first: page.first_log_id, last: page.last_log_id, more: page.more };
 		});
 		console.info('accounting-history-cardinality', JSON.stringify(result));
 	});
 
 	it('calibrates a move that re-logs the maximum reaction sets', async () => {
 		const stub = env.DEMO.getByName('accounting-move-reactions-v1');
-		const config = accountingConfig({
+		const config = defaultStoreConfig({
 			// The calibrated per-message and per-user ceilings, not the defaults.
 			reactionUsersPerMessage: 64,
 			reactionEmojisPerUser: 16,
@@ -484,89 +484,58 @@ describe('measured storage accounting', () => {
 			const messageId = created.result.message_id;
 			// Sixteen distinct 64-byte emoji strings per user.
 			const emojis = Array.from({ length: 16 }, (_, index) => `${String.fromCodePoint(0x1F600 + index)}${'x'.repeat(60)}`);
-			let reactionCost = { observed: { reads: 0, writes: 0 }, reserved: { reads: 0, writes: 0 } };
+			let reactionCost: Cost | undefined;
 			for (let index = 0; index < 64; index += 1) {
-				const beforeBudget = store.budget();
-				const beforeAccounting = store.storageAccounting();
+				const before = snapshot(store);
 				store.commitMutation({
 					userId: `reactor-${index}`, ipKey: `react-ip-${index}`, requestId: `react-${index}`, method: 'reactions', now: clock.now(),
 					params: { message_id: messageId, emojis }, identity: identity(`reactor-${index}`),
 				});
-				const afterAccounting = store.storageAccounting();
-				const observed = diffAccounting(afterAccounting, beforeAccounting);
-				const reserved = reservedBetween(store.budget(), beforeBudget, afterAccounting, beforeAccounting);
-				expect(observed.reads).toBeLessThanOrEqual(reserved.reads);
-				expect(observed.writes).toBeLessThanOrEqual(reserved.writes);
-				if (observed.writes >= reactionCost.observed.writes) reactionCost = { observed, reserved };
+				const cost = costSince(store, before);
+				expectWithinReserve(cost);
+				if (!reactionCost || cost.observed.writes >= reactionCost.observed.writes) reactionCost = cost;
 			}
 			const thread = store.commitMutation({
 				userId: 'mover', ipKey: 'move-ip', requestId: 'thread', method: 'room_set', now: clock.now(),
 				params: { parent_room_id: 'general', title: 'Destination' }, identity: identity('mover'),
 			});
-			const beforeBudget = store.budget();
-			const beforeAccounting = store.storageAccounting();
+			const beforeMove = snapshot(store);
 			const moved = store.commitMutation({
 				userId: 'mover', ipKey: 'move-ip', requestId: 'move', method: 'message', now: clock.now(),
 				params: { message_id: messageId, room_id: thread.result.room_id, body: { text: 'moved' } }, identity: identity('mover'),
 			});
-			const afterAccounting = store.storageAccounting();
-			const observed = diffAccounting(afterAccounting, beforeAccounting);
-			const reserved = reservedBetween(store.budget(), beforeBudget, afterAccounting, beforeAccounting);
+			const move = costSince(store, beforeMove);
 			expect(moved.broadcasts.map((record) => record.method)).toEqual(['message', 'reactions']);
 			expect((moved.broadcasts[1].params.reactions as unknown[]).length).toBe(64);
 			const recordBytes = new TextEncoder().encode(JSON.stringify(moved.broadcasts[1].params)).byteLength;
-			expect(observed.reads).toBeLessThanOrEqual(reserved.reads);
-			expect(observed.writes).toBeLessThanOrEqual(reserved.writes);
+			expectWithinReserve(move);
 			// The re-logged record still fits one history response.
 			const page = store.historyPage({ roomId: String(thread.result.room_id), after: '0', limit: 50, now: clock.now() });
 			expect(page.reactions?.[0].reactions).toHaveLength(64);
 			expect(recordBytes).toBeLessThan(config.maxHistoryResponseBytes);
-			return { reaction: reactionCost, move: { observed, reserved }, recordBytes };
+			return { reaction: reactionCost, move, recordBytes };
 		});
 		console.info('accounting-move-reactions', JSON.stringify(result));
 	});
 
 	it('calibrates default costs for maximum snapshots, repeated edits, and a UTC midnight double burst', async () => {
 		const stub = env.DEMO.getByName('accounting-default-calibration-v1');
-		const config = accountingConfig();
+		const config = defaultStoreConfig();
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const midnight = (Math.floor(Date.now() / DAY) + 2) * DAY;
 			const clock = new FakeClock(midnight - 20_000);
 			const store = new Store(state, config, clock);
 			store.initialize();
-			const costs: Array<Record<string, unknown>> = [];
-			const measure = (label: string, callback: () => unknown) => {
-				const beforeBudget = store.budget();
-				const beforeAccounting = store.storageAccounting();
-				const value = callback();
-				const afterAccounting = store.storageAccounting();
-				const afterBudget = store.budget();
-				const observed = diffAccounting(afterAccounting, beforeAccounting);
-				const reserved = reservedBetween(afterBudget, beforeBudget, afterAccounting, beforeAccounting);
-				costs.push({ label, observed, reserved, withinReserve: observed.reads <= reserved.reads && observed.writes <= reserved.writes });
-				return value;
-			};
-			const measureFailure = (label: string, callback: () => unknown) => {
-				const beforeBudget = store.budget();
-				const beforeAccounting = store.storageAccounting();
-				let error: unknown;
-				try { callback(); } catch (candidate) { error = candidate; }
-				const afterAccounting = store.storageAccounting();
-				const afterBudget = store.budget();
-				const observed = diffAccounting(afterAccounting, beforeAccounting);
-				const reserved = reservedBetween(afterBudget, beforeBudget, afterAccounting, beforeAccounting);
-				costs.push({ label, observed, reserved, error: error instanceof StoreError ? error.code : 'none', withinReserve: observed.reads <= reserved.reads && observed.writes <= reserved.writes });
-				return error;
-			};
+			const { costs, measure, measureFailure } = costLog(store);
 			const maximumText = 'x'.repeat(config.maxTextBytes);
 			// Preserve a large extension field as part of the snapshot so this
 			// calibration reaches the 8 KiB snapshot ceiling instead of measuring
 			// only the 4 KiB body-text limit.
 			const maximumExtensions = { ext: { padding: 'p'.repeat(3_850) } };
 			const first = measure('maximum snapshot create', () => store.commitMutation(messageInput(clock, 'calibration-user', maximumText, 'maximum-create', undefined, maximumExtensions)));
-			const messageId = (first as { result: { message_id?: string } }).result.message_id;
+			const messageId = first.result.message_id as string | undefined;
 			expect(messageId).toBeTruthy();
-			const snapshotBytes = JSON.stringify((first as { message?: unknown }).message).length;
+			const snapshotBytes = JSON.stringify(first.message).length;
 			expect(snapshotBytes).toBeGreaterThan(8_000);
 			expect(snapshotBytes).toBeLessThanOrEqual(config.maxSnapshotBytes);
 
@@ -578,9 +547,8 @@ describe('measured storage accounting', () => {
 			}
 			clock.set(midnight - 15_000);
 			const rejected = measureFailure('sixth pre-midnight post', () => store.commitMutation(messageInput(clock, 'calibration-user', 'must be rejected', 'pre-midnight-rejected')));
-			expectRetry(rejected);
+			expectRetryAfter(rejected);
 
-			clock.set(midnight + 61_000);
 			for (let index = 0; index < 5; index += 1) {
 				clock.set(midnight + 61_000 + index * 1_000);
 				measure(`post-midnight burst ${index + 1}`, () => store.commitMutation(messageInput(clock, 'calibration-user', maximumText, `maximum-create-post-${index}`, undefined, maximumExtensions)));
@@ -603,15 +571,15 @@ describe('measured storage accounting', () => {
 			expect(limiter.posts_day).toBe(13);
 			expect(limiter.day).toBe(new Date(clock.now()).toISOString().slice(0, 10));
 			for (const operation of costs) {
-				expect(operation.withinReserve, `${String(operation.label)} exceeded its reservation`).toBe(true);
+				expect(operation.withinReserve, `${operation.label} exceeded its reservation`).toBe(true);
 			}
 			return {
 				midnight,
 				snapshotBytes,
 				acceptedTransitions: messagesOf(history).length,
 				postDay: limiter,
-				maximumObservedReads: Math.max(...costs.map((operation) => (operation.observed as { reads: number }).reads)),
-				maximumObservedWrites: Math.max(...costs.map((operation) => (operation.observed as { writes: number }).writes)),
+				maximumObservedReads: Math.max(...costs.map((operation) => operation.observed.reads)),
+				maximumObservedWrites: Math.max(...costs.map((operation) => operation.observed.writes)),
 				costs,
 			};
 		});
@@ -622,7 +590,7 @@ describe('measured storage accounting', () => {
 		const stub = env.DEMO.getByName('accounting-maintenance-reserve-v1');
 		// Tiny ceilings are used only for deterministic exhaustion. All row-cost
 		// estimates and maintenance ceilings remain the deployment defaults.
-		const config = accountingConfig({
+		const config = defaultStoreConfig({
 			anonymousPostsPerMinute: 1_000,
 			anonymousPostsPerDay: 1_000,
 			ipPostsPerMinute: 1_000,
@@ -647,7 +615,7 @@ describe('measured storage accounting', () => {
 					store.commitMutation(messageInput(clock, 'maintenance-user', `accepted-${index}`, `maintenance-${index}`));
 					acceptedMutations += 1;
 				} catch (candidate) {
-					expectRetry(candidate);
+					expectRetryAfter(candidate);
 					break;
 				}
 			}
@@ -658,7 +626,7 @@ describe('measured storage accounting', () => {
 			} catch (candidate) {
 				error = candidate;
 			}
-			expectRetry(error);
+			expectRetryAfter(error);
 			const beforeCleanup = store.storageAccounting();
 			clock.set(clock.now() + DAY + HOUR + 1);
 			const cleanup = store.runCleanup(clock.now());
@@ -686,34 +654,12 @@ describe('measured storage accounting', () => {
 
 	it('measures every Store reservation boundary used by runtime operations', async () => {
 		const stub = env.DEMO.getByName('accounting-operation-matrix-v1');
-		const config = accountingConfig();
+		const config = defaultStoreConfig();
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
 			const store = new Store(state, config, clock);
 			store.initialize();
-			const costs: Array<Record<string, unknown>> = [];
-			const measure = (label: string, callback: () => unknown) => {
-				const beforeBudget = store.budget();
-				const beforeAccounting = store.storageAccounting();
-				const value = callback();
-				const afterAccounting = store.storageAccounting();
-				const afterBudget = store.budget();
-				const observed = diffAccounting(afterAccounting, beforeAccounting);
-				const reserved = reservedBetween(afterBudget, beforeBudget, afterAccounting, beforeAccounting);
-				costs.push({ label, observed, reserved, withinReserve: observed.reads <= reserved.reads && observed.writes <= reserved.writes });
-				return value;
-			};
-			const measureAsync = async (label: string, callback: () => Promise<unknown>) => {
-				const beforeBudget = store.budget();
-				const beforeAccounting = store.storageAccounting();
-				const value = await callback();
-				const afterAccounting = store.storageAccounting();
-				const afterBudget = store.budget();
-				const observed = diffAccounting(afterAccounting, beforeAccounting);
-				const reserved = reservedBetween(afterBudget, beforeBudget, afterAccounting, beforeAccounting);
-				costs.push({ label, observed, reserved, withinReserve: observed.reads <= reserved.reads && observed.writes <= reserved.writes });
-				return value;
-			};
+			const { costs, measure, measureAsync } = costLog(store);
 
 			measure('auth attempt reservation', () => store.reserveAuthAttempt({ ipKey: 'matrix-auth', now: clock.now() }));
 			measure('history quota reservation', () => store.reserveHistory({ userId: 'matrix-history-user', ipKey: 'matrix-history-ip', now: clock.now() }));
@@ -744,29 +690,29 @@ describe('measured storage accounting', () => {
 				userId: 'matrix-user', ipKey: 'matrix-post-ip', requestId: 'matrix-message', method: 'message', now: clock.now(),
 				params: { room_id: 'general', body: { text: 'matrix message', format: 'plain' } }, identity,
 			}));
-			const messageId = (create as { result: { message_id: string } }).result.message_id;
+			const messageId = create.result.message_id as string;
 			measure('reaction set', () => store.commitMutation({
 				userId: 'matrix-user', ipKey: 'matrix-react-ip', requestId: 'matrix-react', method: 'reactions', now: clock.now(),
 				params: { message_id: messageId, emojis: ['👍', '🎉'] }, identity,
 			}));
-			const thread = measure('thread room create', () => store.commitMutation({
+			const threadId = measure('thread room create', () => store.commitMutation({
 				userId: 'matrix-user', ipKey: 'matrix-thread-ip', requestId: 'matrix-thread', method: 'room_set', now: clock.now(),
 				params: { parent_room_id: 'general', title: 'Matrix thread', intro_message: { message_id: messageId } }, identity,
-			})) as { result: { room_id: string } };
+			})).result.room_id as string;
 			measure('thread room update', () => store.commitMutation({
 				userId: 'matrix-user', ipKey: 'matrix-thread-ip', requestId: 'matrix-thread-update', method: 'room_set', now: clock.now(),
-				params: { room_id: thread.result.room_id, title: 'Matrix thread renamed', ext: { demo: true } }, identity,
+				params: { room_id: threadId, title: 'Matrix thread renamed', ext: { demo: true } }, identity,
 			}));
-			const membership = (join: boolean) => store.changeMembership({ userId: 'matrix-user', ipKey: 'matrix-member-ip', roomId: thread.result.room_id, join, now: clock.now() });
-			expect((measure('registered room leave', () => membership(false)) as { changed: boolean }).changed).toBe(true);
-			expect((measure('registered room join', () => membership(true)) as { rooms: string[] }).rooms).toEqual(['general', thread.result.room_id]);
+			const membership = (join: boolean) => store.changeMembership({ userId: 'matrix-user', ipKey: 'matrix-member-ip', roomId: threadId, join, now: clock.now() });
+			expect(measure('registered room leave', () => membership(false)).changed).toBe(true);
+			expect(measure('registered room join', () => membership(true)).rooms).toEqual(['general', threadId]);
 			expect(measure('empty new message', () => store.commitMutation({
 				userId: 'matrix-user', ipKey: 'matrix-post-ip', requestId: 'matrix-empty', method: 'message', now: clock.now(),
 				params: { body: { text: '' } }, identity,
 			}))).toEqual({ result: {}, broadcasts: [] });
 			measure('message move with reactions', () => store.commitMutation({
 				userId: 'matrix-user', ipKey: 'matrix-post-ip', requestId: 'matrix-move', method: 'message', now: clock.now(),
-				params: { message_id: messageId, room_id: thread.result.room_id, body: { text: 'matrix moved', format: 'plain' } }, identity,
+				params: { message_id: messageId, room_id: threadId, body: { text: 'matrix moved', format: 'plain' } }, identity,
 			}));
 			measure('registered name mutation', () => store.commitMutation({
 				userId: 'matrix-user', ipKey: 'matrix-nick-ip', requestId: 'matrix-nick', method: 'me', now: clock.now(),
@@ -774,20 +720,20 @@ describe('measured storage accounting', () => {
 			}));
 			measure('history page', () => store.historyPage({ roomId: 'general', limit: 50, now: clock.now() }));
 			measure('room record lookup', () => store.getRoomState());
-			measure('room join lookup', () => store.getRoom(thread.result.room_id));
+			measure('room join lookup', () => store.getRoom(threadId));
 			measure('room listing', () => store.listRooms(clock.now()));
-			measure('room members (general and one thread)', () => store.roomMembers(['general', thread.result.room_id], DEFAULT_LIMITS.roomListMembers, clock.now()));
+			measure('room members (general and one thread)', () => store.roomMembers(['general', threadId], DEFAULT_LIMITS.roomListMembers, clock.now()));
 			measure('admission snapshot', () => store.admission());
 			clock.set(clock.now() + DAY + HOUR + 1);
 			measure('cleanup', () => store.runCleanup(clock.now()));
 			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
-			expect((create as { result: { message_id?: string } }).result.message_id).toBeTruthy();
+			expect(create.result.message_id).toBeTruthy();
 			expect(costs).toHaveLength(30);
 			return { costs };
 		});
 		console.info('accounting-operation-matrix', JSON.stringify(result));
-		for (const operation of result.costs as Array<{ label: string; withinReserve: boolean }>) {
+		for (const operation of result.costs) {
 			expect(operation.withinReserve, `${operation.label} exceeded its reservation`).toBe(true);
 		}
 	});
@@ -796,7 +742,7 @@ describe('measured storage accounting', () => {
 		const stub = env.DEMO.getByName('accounting-query-plans-v2');
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, accountingConfig(), clock);
+			const store = new Store(state, defaultStoreConfig(), clock);
 			store.initialize();
 			for (let index = 0; index < 4; index += 1) {
 				store.commitMutation(messageInput(clock, 'plan-user', `plan-${index}`, `plan-${index}`));
@@ -841,6 +787,7 @@ describe('measured storage accounting', () => {
 		expect(result.plans.moveReactions.some((detail) => /SEARCH reaction_state USING/i.test(detail))).toBe(true);
 		expect(result.plans.roomListing.some((detail) => /SEARCH m USING/i.test(detail))).toBe(true);
 		expect(result.plans.dedupExpiry.some((detail) => /accepted_requests.*expiry|expiry.*accepted_requests/i.test(detail))).toBe(true);
+		expect(result.plans.limiterExpiry.some((detail) => /principal_limits_updated_idx/i.test(detail))).toBe(true);
 		expect(result.plans.roomMembers.some((detail) => /SEARCH m USING .*autoindex_memberships/i.test(detail))).toBe(true);
 		expect(result.plans.roomMembers.some((detail) => /TEMP B-TREE/i.test(detail))).toBe(false);
 		expect(result.plans.userRooms.some((detail) => /memberships_user_idx/i.test(detail))).toBe(true);

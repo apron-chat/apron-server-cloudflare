@@ -1,6 +1,7 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
-import { Store, StoreError } from '../src/store';
+import { Store } from '../src/store';
+import { expectRetryAfter } from './helpers/store';
 
 const DAY = 86_400_000;
 
@@ -13,7 +14,7 @@ it('shares an anonymous rolling window across identities and calendar-minute bou
 		for (let index = 0; index < 5; index++) post(`guest-${index}`);
 		now += 1_001;
 		try { post('fresh-guest'); expect.unreachable(); }
-		catch (error) { expect(error).toBeInstanceOf(StoreError); expect((error as StoreError).retryAfterMs).toBe(58_999); }
+		catch (error) { expectRetryAfter(error); expect(error.retryAfterMs).toBe(58_999); }
 		now += 59_000;
 		expect(post('fresh-guest').result.message_id).toBeTruthy();
 	});
@@ -47,7 +48,7 @@ it('returns the longest applicable retry window and never replenishes on a backw
 		post();
 		now -= 60_000;
 		try { post(); expect.unreachable(); }
-		catch (error) { expect(error).toBeInstanceOf(StoreError); expect((error as StoreError).retryAfterMs).toBe(43_200_000); }
+		catch (error) { expectRetryAfter(error); expect(error.retryAfterMs).toBe(43_200_000); }
 		now += 43_260_001;
 		expect(post().result.message_id).toBeTruthy();
 	});
