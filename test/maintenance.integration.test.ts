@@ -1,45 +1,15 @@
-import { env, runInDurableObject } from "cloudflare:test";
 import { expect, it } from "vitest";
-import { RETENTION_MS, Store, StoreError, type StoreMutationInput } from "../src/store";
-
-/** A history page's messages; the array is omitted when empty (§4.1). */
-function messagesOf(page: { messages?: Array<{ log_id: string; message_id: string; room_id?: string; body?: Record<string, unknown> & { text?: string } }> }) {
-	return page.messages ?? [];
-}
+import { RETENTION_MS, Store, type StoreConfig, type StoreMutationInput } from "../src/store";
+import { expectRetryAfter, messagesOf, withStore as withNamedStore, type TestClock } from "./helpers/store";
 
 const DAY_MS = 86_400_000;
 
-type TestClock = {
-	value: number;
-	readonly clock: { now(): number };
-};
-
-function makeClock(): TestClock {
-	const clock: TestClock = {
-		value: Date.now() + 1_000,
-		clock: { now: () => clock.value },
-	};
-	return clock;
-}
-
-async function withStore<T>(
-	name: string,
-	config: ConstructorParameters<typeof Store>[1] = {},
-	fn: (store: Store, clock: TestClock, state: DurableObjectState) => T | Promise<T>,
-): Promise<T> {
-	const stub = env.DEMO.getByName(`maintenance-${name}-${crypto.randomUUID()}`);
-	return runInDurableObject(stub, async (_instance, state) => {
-		const clock = makeClock();
-		const store = new Store(state, config, clock.clock);
-		store.initialize();
-		return fn(store, clock, state);
-	});
-}
+const withStore = <T>(name: string, config: Partial<StoreConfig>, fn: Parameters<typeof withNamedStore<T>>[2]) =>
+	withNamedStore(`maintenance-${name}`, config, fn);
 
 function messageInput(clock: TestClock, requestId: string, text: string): StoreMutationInput {
 	return {
 		userId: "maintenance-user",
-		tier: "anonymous",
 		ipKey: "maintenance-ip",
 		requestId,
 		method: "message",
@@ -59,10 +29,8 @@ function nextUtcDay(value: number): number {
 	return (Math.floor(value / DAY_MS) + 1) * DAY_MS;
 }
 
-function rowValue<T extends Record<string, unknown>>(state: DurableObjectState, query: string, ...bindings: unknown[]): T {
-	const rows = state.storage.sql.exec(query, ...bindings).toArray?.() as unknown as T[] | undefined ?? [];
-	if (!rows.length) throw new Error("expected native SQL row");
-	return rows[0];
+function rowValue<T extends Record<string, SqlStorageValue>>(state: DurableObjectState, query: string, ...bindings: unknown[]): T {
+	return state.storage.sql.exec<T>(query, ...bindings).one();
 }
 
 it("keeps an early authentication alarm cheap while cleanup is not due", async () => {
@@ -136,10 +104,9 @@ it("reuses a known future alarm without spending SQL and still advances earlier 
 });
 
 it("defers exhausted cleanup to the next UTC day and schedules one reset alarm", async () => {
-	await withStore("maintenance-deferral", {
-		maintenanceReadsPerDay: 1_100,
-		maintenanceWritesPerDay: 1_100,
-	}, async (initial, clock, state) => {
+	const config = { maintenanceReadsPerDay: 1_100, maintenanceWritesPerDay: 1_100 };
+	// The first Store only seeds today's budget and maintenance rows.
+	await withStore("maintenance-deferral", config, async (_seeded, clock, state) => {
 		const day = new Date(clock.value).toISOString().slice(0, 10);
 		const sql = state.storage.sql;
 		// Leave only the control reserve available. Reconstructing Store makes
@@ -149,10 +116,7 @@ it("defers exhausted cleanup to the next UTC day and schedules one reset alarm",
 			day,
 		);
 		sql.exec("UPDATE maintenance SET next_cleanup_ms = ?, cleanup_cutoff_ms = NULL, cleanup_cursor = NULL WHERE id = 1", clock.value);
-		const store = new Store(state, {
-			maintenanceReadsPerDay: 1_100,
-			maintenanceWritesPerDay: 1_100,
-		}, clock.clock);
+		const store = new Store(state, config, clock.clock);
 		store.initialize();
 		const resetAt = nextUtcDay(clock.value);
 
@@ -162,8 +126,7 @@ it("defers exhausted cleanup to the next UTC day and schedules one reset alarm",
 		} catch (error) {
 			failure = error;
 		}
-		expect(failure).toBeInstanceOf(StoreError);
-		expect((failure as StoreError).code).toBe("retry_after");
+		expectRetryAfter(failure);
 		const maintenance = rowValue<{ next_cleanup_ms: number }>(state, "SELECT next_cleanup_ms FROM maintenance WHERE id = 1");
 		expect(maintenance.next_cleanup_ms).toBe(resetAt);
 		expect(store.budget(clock.value).maintenance_reads).toBe(1_082);
@@ -177,7 +140,6 @@ it("defers exhausted cleanup to the next UTC day and schedules one reset alarm",
 		expect(store.budget(clock.value).maintenance_writes).toBe(1_088);
 		await store.scheduleAlarm(undefined, clock.value);
 		expect(await state.storage.getAlarm()).toBe(resetAt);
-		void initial;
 	});
 });
 

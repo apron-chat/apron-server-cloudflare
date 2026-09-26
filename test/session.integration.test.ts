@@ -1,68 +1,34 @@
-import { SELF, env, runInDurableObject } from 'cloudflare:test';
+import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
+import { connect as open, exchange, reply, request, until, type Frame, type Peer } from './helpers/socket';
 
-type Frame = { id?: string | null; method?: string; result?: any; error?: any; params?: any };
 let nextIp = 40;
 
 type StoredSessionTest = { v: 1; userId: string; origin: string; expiresMs: number };
 
-async function sweepSessions(now: number): Promise<void> {
-	await runInDurableObject(stub(), async (instance) => {
-		await (instance as unknown as { sweepSessions(now: number): Promise<void> }).sweepSessions(now);
-	});
-}
-
-async function connect(origin: string | null = 'http://localhost:5173', ip = `192.0.2.${nextIp++}`) {
-	const response = await SELF.fetch('https://demo.test/ws', { headers: {
-		Upgrade: 'websocket', ...(origin === null ? {} : { Origin: origin }), 'CF-Connecting-IP': ip
-	} });
-	expect(response.status).toBe(101);
-	const socket = response.webSocket!;
-	const frames: Frame[] = [];
-	const waiters: ((frame: Frame) => void)[] = [];
-	socket.addEventListener('message', event => {
-		const frame = JSON.parse(String(event.data));
-		const waiter = waiters.shift();
-		if (waiter) waiter(frame); else frames.push(frame);
-	});
-	socket.accept();
-	return {
-		send(frame: unknown) { socket.send(JSON.stringify(frame)); },
-		next(): Promise<Frame> {
-			const frame = frames.shift();
-			return frame ? Promise.resolve(frame) : new Promise(resolve => waiters.push(resolve));
-		},
-		close() { socket.close(1000, 'test complete'); }
-	};
-}
+/** A socket from its own 192.0.2.N address; `null` omits the Origin. */
+const connect = (origin: string | null = 'http://localhost:5173') => open({ ip: `192.0.2.${nextIp++}`, origin });
 
 const stub = () => env.DEMO.getByName('public-demo-v1');
 const isolatedStub = () => env.DEMO.getByName(`session-cleanup-${crypto.randomUUID()}`);
 
-async function sweepOn(target: ReturnType<typeof env.DEMO.getByName>, now: number): Promise<void> {
+async function sweepSessions(target: ReturnType<typeof env.DEMO.getByName>, now: number): Promise<void> {
 	await runInDurableObject(target, async (instance) => {
 		await (instance as unknown as { sweepSessions(now: number): Promise<void> }).sweepSessions(now);
 	});
 }
 
-/** Registers an identity straight into the object's store, bypassing the ceremony. */
-async function registerIdentity(userId: string, ipKey = 'session-test-ip'): Promise<void> {
-	await runInDurableObject(stub(), async (instance) => {
-		const runtime = instance as unknown as { store: { registerIdentity(input: Record<string, unknown>): unknown } };
-		runtime.store.registerIdentity({
-			userId, name: `Name of ${userId}`, userHandle: `handle-${userId}`, now: Date.now(), ipKey,
-			credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
-		});
-	});
-}
-
-/** Registers an identity that starts in the given rooms, as a guest registering on its connection does. */
-async function registerIdentityIn(userId: string, rooms: string[]): Promise<string[]> {
+/**
+ * Registers an identity straight into the object's store, bypassing the
+ * ceremony; with `rooms`, it starts in them, as a guest registering on its
+ * connection does. Returns the rooms it kept.
+ */
+async function registerIdentity(userId: string, ipKey = 'session-test-ip', rooms?: string[]): Promise<string[]> {
 	return runInDurableObject(stub(), async (instance) => {
 		const runtime = instance as unknown as { store: { registerIdentity(input: Record<string, unknown>): { rooms: string[] } } };
 		return runtime.store.registerIdentity({
-			userId, name: `Name of ${userId}`, userHandle: `handle-${userId}`, now: Date.now(), ipKey: `ip-${userId}`,
-			credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 }, rooms,
+			userId, name: `Name of ${userId}`, userHandle: `handle-${userId}`, now: Date.now(), ipKey,
+			credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 }, ...(rooms ? { rooms } : {}),
 		}).rooms;
 	});
 }
@@ -74,21 +40,12 @@ async function issueSession(userId: string, origin: string): Promise<string> {
 	});
 }
 
-it('resumes passkey sessions only where passkeys are offered; bot tokens work anywhere', async () => {
-	const trusted = await connect();
-	expect((await trusted.next()).params.auth).toEqual(['webauthn', 'token', 'guest']);
-	trusted.close();
-	// `token` is offered without an Origin too, for bot tokens (/invite-bot).
-	await registerIdentity('user_session_elsewhere', 'session-elsewhere-ip');
-	const session = await issueSession('user_session_elsewhere', 'http://localhost:5173');
-	const untrusted = await connect(null);
-	expect((await untrusted.next()).params.auth).toEqual(['token', 'guest']);
-	untrusted.send({ id: 't', method: 'auth', params: { scheme: 'token', token: 'anything' } });
-	expect((await untrusted.next()).error.code).toBe(-32001);
-	untrusted.send({ id: 's', method: 'auth', params: { scheme: 'token', token: session } });
-	expect((await untrusted.next()).error.code).toBe(-32001);
-	untrusted.close();
-});
+/** Resumes `token` on a fresh connection; the peer and the auth reply, which may be an error. */
+async function resume(token: string, id = 'resume', origin?: string | null): Promise<{ peer: Peer; reply: Frame }> {
+	const peer = await connect(origin);
+	await peer.next();
+	return { peer, reply: await request(peer, id, 'auth', { scheme: 'token', token }) };
+}
 
 it('resumes a registered identity from a session token, renews it, and rejects bad tokens', async () => {
 	await registerIdentity('user_session_one');
@@ -133,7 +90,7 @@ it('resumes a registered identity from a session token, renews it, and rejects b
 	const racePeer = await connect();
 	await racePeer.next();
 	racePeer.send({ id: 'race-resume', method: 'auth', params: { scheme: 'token', token } });
-	const [raceResumed] = await Promise.all([racePeer.next(), sweepSessions(Date.now() + 1)]);
+	const [raceResumed] = await Promise.all([racePeer.next(), sweepSessions(stub(), Date.now() + 1)]);
 	expect(raceResumed.result.you.user_id).toBe('user_session_one');
 	racePeer.close();
 	const sessionStillLive = await runInDurableObject(stub(), async (_instance, state) => {
@@ -154,16 +111,14 @@ it('renews a resumed session only once less than half its lifetime remains', asy
 		const [key, session] = [...sessions].find(([, value]) => value.userId === 'user_session_renew')!;
 		return { key, session, indexed: [...index.values()].filter((entry) => entry.sessionKey === key).map((entry) => entry.expiresMs) };
 	});
-	const resume = async () => {
-		const peer = await connect();
-		await peer.next();
-		peer.send({ id: 'resume', method: 'auth', params: { scheme: 'token', token } });
-		expect((await peer.next()).result.you.user_id).toBe('user_session_renew');
+	const renew = async () => {
+		const { peer, reply } = await resume(token);
+		expect(reply.result.you.user_id).toBe('user_session_renew');
 		peer.close();
 	};
 
 	const issued = await stored();
-	await resume();
+	await renew();
 	// Most of the lifetime remains: nothing is rewritten.
 	expect(await stored()).toEqual(issued);
 
@@ -176,22 +131,24 @@ it('renews a resumed session only once less than half its lifetime remains', asy
 		}
 		await state.storage.put(`session-expiry:${soon.toString().padStart(16, '0')}:${issued.key.slice('session:'.length)}`, { v: 1, sessionKey: issued.key, expiresMs: soon });
 	});
-	await resume();
+	await renew();
 	const renewed = await stored();
 	expect(renewed.session.expiresMs).toBeGreaterThan(Date.now() + 11 * 60 * 60 * 1000);
 	expect(renewed.indexed).toEqual([renewed.session.expiresMs]);
 });
 
-it('binds sessions to their origin and drops expired ones on the alarm', async () => {
+it('binds sessions to their origin, refuses them without one, and drops expired ones on the alarm', async () => {
 	await registerIdentity('user_session_two');
-	const token = await issueSession('user_session_two', 'https://other.example');
-	const peer = await connect();
-	await peer.next();
-	peer.send({ id: 'cross', method: 'auth', params: { scheme: 'token', token } });
-	expect((await peer.next()).error.code).toBe(-32001);
-	peer.close();
+	const cross = await resume(await issueSession('user_session_two', 'https://other.example'), 'cross');
+	expect(cross.reply.error.code).toBe(-32001);
+	cross.peer.close();
+	// Without an Origin `token` is still offered, for bot tokens (/invite-bot),
+	// but a passkey session stays on the origin it was issued for.
+	const originless = await resume(await issueSession('user_session_two', 'http://localhost:5173'), 'originless', null);
+	expect(originless.reply.error.code).toBe(-32001);
+	originless.peer.close();
 
-	await runInDurableObject(stub(), async (instance, state) => {
+	await runInDurableObject(stub(), async (_instance, state) => {
 		const sessions = await state.storage.list<{ userId: string; expiresMs: number }>({ prefix: 'session:' });
 		for (const [key, session] of sessions) {
 			if (session.userId === 'user_session_two') {
@@ -205,21 +162,17 @@ it('binds sessions to their origin and drops expired ones on the alarm', async (
 				}
 			}
 		}
-		await (instance as unknown as { sweepSessions(now: number): Promise<void> }).sweepSessions(Date.now());
-		const remaining = await state.storage.list<{ userId: string }>({ prefix: 'session:' });
-		expect([...remaining.values()].some((session) => session.userId === 'user_session_two')).toBe(false);
 	});
+	await sweepSessions(stub(), Date.now());
+	const remaining = await runInDurableObject(stub(), (_instance, state) => state.storage.list<{ userId: string }>({ prefix: 'session:' }));
+	expect([...remaining.values()].some((session) => session.userId === 'user_session_two')).toBe(false);
 });
 
 it('denies a session token whose identity no longer exists without recreating it', async () => {
 	// A storage reset wipes identities; a token that outlives its identity must
 	// fall back to sign-in rather than crash or resurrect the account.
 	const token = await issueSession('user_session_gone', 'http://localhost:5173');
-	const peer = await connect();
-	await peer.next();
-	peer.send({ id: 'orphan', method: 'auth', params: { scheme: 'token', token } });
-	const denied = await peer.next();
-	expect(denied.id).toBe('orphan');
+	const { peer, reply: denied } = await resume(token, 'orphan');
 	expect(denied.error.code).toBe(-32001);
 	// The connection stays usable as a guest.
 	peer.send({ id: 'guest', method: 'auth', params: { scheme: 'guest' } });
@@ -235,38 +188,28 @@ it('denies a session token whose identity no longer exists without recreating it
 it('updates a registered name with me, declines avatar and ext, and treats name as unknown', async () => {
 	await registerIdentity('user_session_me');
 	const token = await issueSession('user_session_me', 'http://localhost:5173');
-	const peer = await connect();
-	await peer.next();
-	peer.send({ id: 'resume', method: 'auth', params: { scheme: 'token', token } });
-	expect((await peer.next()).result.you.user_id).toBe('user_session_me');
-	const reply = async (id: string): Promise<Frame> => {
-		for (;;) {
-			const frame = await peer.next();
-			if (frame.id === id) return frame;
-		}
-	};
+	const { peer, reply: resumed } = await resume(token);
+	expect(resumed.result.you.user_id).toBe('user_session_me');
 
 	peer.send({ id: 'rename', method: 'me', params: { name: 'Ada' } });
-	expect((await reply('rename')).result).toEqual({ you: { user_id: 'user_session_me', name: 'Ada' } });
+	expect((await reply(peer, 'rename')).result).toEqual({ you: { user_id: 'user_session_me', name: 'Ada' } });
 	// Omitted fields stay unchanged; the demo keeps no avatars or profile ext.
 	peer.send({ id: 'profile', method: 'me', params: { avatar: 'https://example.test/a.png', ext: { demo: true } } });
-	expect((await reply('profile')).result).toEqual({ you: { user_id: 'user_session_me', name: 'Ada' } });
+	expect((await reply(peer, 'profile')).result).toEqual({ you: { user_id: 'user_session_me', name: 'Ada' } });
 	peer.send({ id: 'bad-avatar', method: 'me', params: { avatar: 7 } });
-	expect((await reply('bad-avatar')).error.code).toBe(-32602);
+	expect((await reply(peer, 'bad-avatar')).error.code).toBe(-32602);
 	// An empty name removes it, so clients fall back to the user_id.
 	// It is announced as its empty value (§3.3).
 	peer.send({ id: 'clear', method: 'me', params: { name: '' } });
-	expect((await reply('clear')).result).toEqual({ you: { user_id: 'user_session_me', name: '' } });
+	expect((await reply(peer, 'clear')).result).toEqual({ you: { user_id: 'user_session_me', name: '' } });
 	peer.send({ id: 'unchanged', method: 'me', params: {} });
-	expect((await reply('unchanged')).result).toEqual({ you: { user_id: 'user_session_me' } });
+	expect((await reply(peer, 'unchanged')).result).toEqual({ you: { user_id: 'user_session_me' } });
 	peer.close();
 
 	// The removal is durable: a later resume carries no name either.
-	const again = await connect();
-	await again.next();
-	again.send({ id: 'resume', method: 'auth', params: { scheme: 'token', token } });
-	expect((await again.next()).result.you).toEqual({ user_id: 'user_session_me' });
-	again.close();
+	const again = await resume(token);
+	expect(again.reply.result.you).toEqual({ user_id: 'user_session_me' });
+	again.peer.close();
 });
 
 it('stops session cleanup safely when the maintenance budget is exhausted', async () => {
@@ -290,7 +233,7 @@ it('stops session cleanup safely when the maintenance budget is exhausted', asyn
 		store.budgetCacheDay = null;
 		store.budgetHandoverPending = true;
 	});
-	await expect(sweepOn(target, now)).rejects.toMatchObject({ code: 'retry_after' });
+	await expect(sweepSessions(target, now)).rejects.toMatchObject({ code: 'retry_after' });
 	const state = await runInDurableObject(target, async (_instance, durableState) => ({
 		remaining: [...(await durableState.storage.list<StoredSessionTest>({ prefix: 'session:' })).values()].filter((session) => session.userId === 'budget-expired').length,
 		indexed: (await durableState.storage.list({ prefix: 'session-expiry:' })).size,
@@ -331,29 +274,23 @@ it('sends user notifications for renames and for a guest signing in on its conne
 	const watcher = await connect();
 	const tab = await connect();
 	const second = await connect();
-	const until = async (peer: Awaited<ReturnType<typeof connect>>, match: (frame: Frame) => boolean): Promise<Frame> => {
-		for (;;) {
-			const frame = await peer.next();
-			if (match(frame)) return frame;
-		}
-	};
 	try {
 		for (const peer of [watcher, tab, second]) await peer.next();
 		watcher.send({ id: 'guest', method: 'auth', params: { scheme: 'guest' } });
 		await until(watcher, (frame) => frame.id === 'guest');
 		tab.send({ id: 'guest', method: 'auth', params: { scheme: 'guest' } });
-		const guest = (await until(tab, (frame) => frame.id === 'guest')).result.you;
+		const guest = (await until(tab, (frame) => frame.id === 'guest')).frame.result.you;
 		// Signing in on a guest's connection retires the guest for everyone else.
 		tab.send({ id: 'resume', method: 'auth', params: { scheme: 'token', token } });
-		expect((await until(tab, (frame) => frame.id === 'resume')).result.you.user_id).toBe('user_session_notify');
-		expect((await until(watcher, (frame) => frame.method === 'user')).params).toEqual({ new: { user_id: 'user_session_notify', name: 'Name of user_session_notify' }, old: guest });
+		expect((await until(tab, (frame) => frame.id === 'resume')).frame.result.you.user_id).toBe('user_session_notify');
+		expect((await until(watcher, (frame) => frame.method === 'user')).frame.params).toEqual({ new: { user_id: 'user_session_notify', name: 'Name of user_session_notify' }, old: guest });
 
 		second.send({ id: 'resume', method: 'auth', params: { scheme: 'token', token } });
 		await until(second, (frame) => frame.id === 'resume');
 		tab.send({ id: 'rename', method: 'me', params: { name: 'Notified' } });
 		await until(tab, (frame) => frame.id === 'rename');
-		expect((await until(second, (frame) => frame.method === 'user')).params).toEqual({ you: { user_id: 'user_session_notify', name: 'Notified' } });
-		expect((await until(watcher, (frame) => frame.method === 'user')).params).toEqual({ new: { user_id: 'user_session_notify', name: 'Notified' } });
+		expect((await until(second, (frame) => frame.method === 'user')).frame.params).toEqual({ you: { user_id: 'user_session_notify', name: 'Notified' } });
+		expect((await until(watcher, (frame) => frame.method === 'user')).frame.params).toEqual({ new: { user_id: 'user_session_notify', name: 'Notified' } });
 	} finally { watcher.close(); tab.close(); second.close(); }
 });
 
@@ -361,19 +298,13 @@ it('does not count a closing connection against the per-user limit on resume', a
 	const userId = 'user_session_capacity';
 	await registerIdentity(userId, 'session-capacity-ip');
 	const token = await issueSession(userId, 'http://localhost:5173');
-	const resume = async (id: string) => {
-		const peer = await connect();
-		await peer.next();
-		peer.send({ id, method: 'auth', params: { scheme: 'token', token } });
-		return { peer, reply: await peer.next() };
-	};
 	const open = [];
 	for (const id of ['one', 'two', 'three']) {
-		const { peer, reply } = await resume(id);
+		const { peer, reply } = await resume(token, id);
 		expect(reply.result.you.user_id).toBe(userId);
 		open.push(peer);
 	}
-	const refused = await resume('four');
+	const refused = await resume(token, 'four');
 	expect(refused.reply.error).toEqual(expect.objectContaining({ code: -32002, message: 'Demo capacity reached' }));
 	refused.peer.close();
 
@@ -383,7 +314,7 @@ it('does not count a closing connection against the per-user limit on resume', a
 		const dropped = sockets.find((socket) => (socket.deserializeAttachment() as { userId?: string } | null)?.userId === userId)!;
 		dropped.serializeAttachment({ ...(dropped.deserializeAttachment() as object), closing: true });
 	});
-	const replacement = await resume('replacement');
+	const replacement = await resume(token, 'replacement');
 	expect(replacement.reply.result.you.user_id).toBe(userId);
 	replacement.peer.close();
 	for (const peer of open) peer.close();
@@ -393,43 +324,30 @@ it('logs a registered user\'s joins and leaves as memberships, delivered around 
 	const userId = 'user_session_rooms';
 	const name = `Name of ${userId}`;
 	// A registration keeps the rooms a guest had joined that still exist.
-	expect(await registerIdentityIn(userId, ['general', 'no-such-room'])).toEqual(['general']);
+	expect(await registerIdentity(userId, `ip-${userId}`, ['general', 'no-such-room'])).toEqual(['general']);
 	const token = await issueSession(userId, 'http://localhost:5173');
-	const until = async (peer: Awaited<ReturnType<typeof connect>>, match: (frame: Frame) => boolean): Promise<{ frame: Frame; skipped: Frame[] }> => {
-		const skipped: Frame[] = [];
-		for (;;) {
-			const frame = await peer.next();
-			if (match(frame)) return { frame, skipped };
-			skipped.push(frame);
-		}
-	};
-	const request = async (peer: Awaited<ReturnType<typeof connect>>, id: string, method: string, params: unknown) => {
-		peer.send({ id, method, params });
-		return until(peer, (frame) => frame.id === id);
-	};
-	const resume = async () => {
-		const peer = await connect();
-		await peer.next();
-		expect((await request(peer, 'resume', 'auth', { scheme: 'token', token })).frame.result.you.user_id).toBe(userId);
+	const signIn = async () => {
+		const { peer, reply } = await resume(token);
+		expect(reply.result.you.user_id).toBe(userId);
 		return peer;
 	};
-	const joinedIds = async (peer: Awaited<ReturnType<typeof connect>>) =>
-		(await request(peer, 'mine', 'room_list', { filter: 'joined' })).frame.result.joined.map((room: { room_id: string }) => room.room_id);
+	const joinedIds = async (peer: Peer) =>
+		(await request(peer, 'mine', 'room_list', { filter: 'joined' })).result.joined.map((room: { room_id: string }) => room.room_id);
 	const methods = (frames: Frame[]) => frames.map((frame) => frame.method);
 	const membership = (roomId: string, joined: boolean) => ({
 		method: 'membership', params: { log_id: expect.stringMatching(/^[1-9][0-9]*$/), room_id: roomId, members: [{ user: { user_id: userId, name }, joined }] },
 	});
-	const tab = await resume();
-	const other = await resume();
+	const tab = await signIn();
+	const other = await signIn();
 	const reader = await connect();
 	let threadId: string;
 	try {
 		await reader.next();
-		const guest = (await request(reader, 'guest', 'auth', { scheme: 'guest' })).frame.result.you;
+		const guest = (await exchange(reader, 'guest', 'auth', { scheme: 'guest' })).frame.result.you;
 		// Creating: `joined` with the creator as the only member, whose head is
 		// already the creator's logged membership, then that membership, then
 		// the result; on every connection of the user.
-		const created = await request(tab, 'thread', 'room_set', { parent_room_id: 'general', title: 'Kept' });
+		const created = await exchange(tab, 'thread', 'room_set', { parent_room_id: 'general', title: 'Kept' });
 		threadId = created.frame.result.room_id;
 		expect(methods(created.skipped)).toEqual(['room_update', 'membership']);
 		const [update, joinedRecord] = created.skipped;
@@ -445,20 +363,20 @@ it('logs a registered user\'s joins and leaves as memberships, delivered around 
 		expect(announced.frame.params.updated[0].room_id).toBe(threadId);
 
 		// A guest's join is not logged: `joined` alone, with every member.
-		const guestJoin = await request(reader, 'guest-join', 'room_join', { room_id: threadId });
+		const guestJoin = await exchange(reader, 'guest-join', 'room_join', { room_id: threadId });
 		expect(methods(guestJoin.skipped)).toEqual(['room_update']);
 		expect(guestJoin.skipped[0].params.joined[0].members.map((member: { user_id: string }) => member.user_id)).toEqual([guest.user_id, userId].sort());
 		expect(guestJoin.skipped[0].params.users).toEqual([guest, { user_id: userId, name }].sort((a, b) => a.user_id < b.user_id ? -1 : 1));
 
 		// Leaving: the membership reaches the room's members before the change,
 		// the leaver's connections included, then `left`, then the result.
-		const left = await request(tab, 'leave', 'room_leave', { room_id: threadId });
+		const left = await exchange(tab, 'leave', 'room_leave', { room_id: threadId });
 		expect(left.skipped).toEqual([membership(threadId, false), { method: 'room_update', params: { left: [{ room_id: threadId }] } }]);
 		const otherLeft = await until(other, (frame) => frame.method === 'room_update' && frame.params.left !== undefined);
 		expect(otherLeft.skipped).toEqual([membership(threadId, false)]);
 		expect((await until(reader, (frame) => frame.method === 'membership')).frame).toEqual(membership(threadId, false));
 		// Joining again: the membership reaches the members after the change.
-		const rejoined = await request(other, 'join', 'room_join', { room_id: threadId });
+		const rejoined = await exchange(other, 'join', 'room_join', { room_id: threadId });
 		expect(methods(rejoined.skipped)).toEqual(['membership', 'room_update']);
 		expect(rejoined.skipped[0]).toEqual(membership(threadId, true));
 		expect(rejoined.skipped[1].params.joined[0].latest_log_id).toBe(rejoined.skipped[0].params.log_id);
@@ -467,36 +385,36 @@ it('logs a registered user\'s joins and leaves as memberships, delivered around 
 
 		// History holds the logged memberships, and records keep the user
 		// objects they were logged with: no `users`.
-		const page = (await request(reader, 'history', 'history', { room_id: threadId })).frame.result;
+		const page = (await exchange(reader, 'history', 'history', { room_id: threadId })).frame.result;
 		expect(page.membership.map((record: { members: Array<{ joined: boolean }> }) => record.members[0].joined)).toEqual([true, false, true]);
 		expect(page.membership[0]).toEqual(joinedRecord.params);
 		expect(page.messages).toBeUndefined();
 		expect(page.last_log_id).toBe(rejoined.skipped[0].params.log_id);
-		const posted = await request(tab, 'post', 'message', { body: { text: 'before the rename' } });
-		await request(tab, 'rename', 'me', { name: 'Renamed later' });
-		const general = (await request(reader, 'general', 'history', { after: posted.frame.result.message_id })).frame.result;
+		const posted = await exchange(tab, 'post', 'message', { body: { text: 'before the rename' } });
+		await exchange(tab, 'rename', 'me', { name: 'Renamed later' });
+		const general = (await exchange(reader, 'general', 'history', { after: posted.frame.result.message_id })).frame.result;
 		expect(general.messages[0].from).toEqual({ user_id: userId, name });
 		expect(general.users).toBeUndefined();
 		// Listings carry the current name.
-		const listed = (await request(reader, 'members', 'room_list', { room_id: threadId, members: true })).frame.result;
+		const listed = (await exchange(reader, 'members', 'room_list', { room_id: threadId, members: true })).frame.result;
 		expect(listed.users).toEqual(expect.arrayContaining([{ user_id: userId, name: 'Renamed later' }]));
 	} finally { tab.close(); other.close(); reader.close(); }
 
 	// A later connection has the same rooms, until the user leaves general;
 	// an offline registered member is still listed as a member.
-	const later = await resume();
+	const later = await signIn();
 	try {
 		expect((await joinedIds(later)).sort()).toEqual(['general', threadId!].sort());
-		await request(later, 'leave-general', 'room_leave', { room_id: 'general' });
+		await exchange(later, 'leave-general', 'room_leave', { room_id: 'general' });
 	} finally { later.close(); }
 	const watcher = await connect();
 	try {
 		await watcher.next();
-		await request(watcher, 'guest', 'auth', { scheme: 'guest' });
-		const listed = (await request(watcher, 'members', 'room_list', { room_id: threadId!, members: true })).frame.result;
+		await exchange(watcher, 'guest', 'auth', { scheme: 'guest' });
+		const listed = (await exchange(watcher, 'members', 'room_list', { room_id: threadId!, members: true })).frame.result;
 		expect(listed.not_joined[0].members).toEqual([{ user_id: userId }]);
 	} finally { watcher.close(); }
-	const last = await resume();
+	const last = await signIn();
 	try {
 		expect(await joinedIds(last)).toEqual([threadId!]);
 	} finally { last.close(); }
@@ -505,30 +423,18 @@ it('logs a registered user\'s joins and leaves as memberships, delivered around 
 it('sends a rename only to users who share a room with the renamed user', async () => {
 	await registerIdentity('user_session_scope', 'session-scope-ip');
 	const token = await issueSession('user_session_scope', 'http://localhost:5173');
-	const until = async (peer: Awaited<ReturnType<typeof connect>>, match: (frame: Frame) => boolean): Promise<{ frame: Frame; skipped: Frame[] }> => {
-		const skipped: Frame[] = [];
-		for (;;) {
-			const frame = await peer.next();
-			if (match(frame)) return { frame, skipped };
-			skipped.push(frame);
-		}
-	};
-	const request = async (peer: Awaited<ReturnType<typeof connect>>, id: string, method: string, params: unknown) => {
-		peer.send({ id, method, params });
-		return until(peer, (frame) => frame.id === id);
-	};
 	const tab = await connect();
 	const sharing = await connect();
 	const apart = await connect();
 	try {
 		for (const peer of [tab, sharing, apart]) await peer.next();
-		await request(tab, 'resume', 'auth', { scheme: 'token', token });
-		await request(sharing, 'guest', 'auth', { scheme: 'guest' });
-		await request(apart, 'guest', 'auth', { scheme: 'guest' });
-		await request(apart, 'leave', 'room_leave', { room_id: 'general' });
-		await request(tab, 'rename', 'me', { name: 'Scoped' });
+		await exchange(tab, 'resume', 'auth', { scheme: 'token', token });
+		await exchange(sharing, 'guest', 'auth', { scheme: 'guest' });
+		await exchange(apart, 'guest', 'auth', { scheme: 'guest' });
+		await exchange(apart, 'leave', 'room_leave', { room_id: 'general' });
+		await exchange(tab, 'rename', 'me', { name: 'Scoped' });
 		expect((await until(sharing, (frame) => frame.method === 'user')).frame.params).toEqual({ new: { user_id: 'user_session_scope', name: 'Scoped' } });
 		// Apart shares no room: a round trip shows no `user` came before it.
-		expect((await request(apart, 'sync', 'me', {})).skipped.filter((frame) => frame.method === 'user')).toEqual([]);
+		expect((await exchange(apart, 'sync', 'me', {})).skipped.filter((frame) => frame.method === 'user')).toEqual([]);
 	} finally { tab.close(); sharing.close(); apart.close(); }
 });

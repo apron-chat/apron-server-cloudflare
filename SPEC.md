@@ -560,7 +560,7 @@ Deliver:
 - Configuration reference for every limit, RP ID/origins, account analytics, and feature toggles. Fail startup/config validation for impossible or unsafe relationships.
 - Base-protocol history documentation and minimal client integration, including retention recovery fixtures and canonical WebAuthn fixtures.
 - Automated tests, local dev commands, a bounded load/cost report, and a concise implementation summary.
-- README describing Free-plan prerequisites, guest identity limitations, rolling history with a permanent room ID, quota exhaustion/recovery, secret setup, and manual deployment steps.
+- A guide describing Free-plan prerequisites, guest identity limitations, rolling history with a permanent room ID, quota exhaustion/recovery, secret setup, and manual deployment steps.
 - A deployment checklist that verifies the real account plan and other workload usage, rechecks current platform quotas, applies migrations once, and tests the deployed hibernation/reconnect path when deployment is separately authorized.
 
 Done means the integrated demo satisfies the protocol contract and failure cases above, with measured resource accounting and an honest zero-overage/availability distinction. It must not merely return correct messages while leaving cleanup, passkey verification, restart-safe limits, or retention-aware recovery as TODOs.

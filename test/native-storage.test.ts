@@ -21,13 +21,11 @@ it('measures indexed write costs and confirms SQLite reuses deleted pages', asyn
 		removed.toArray();
 		const deleteCost = { reads: removed.rowsRead, writes: removed.rowsWritten };
 		const emptySize = sql.databaseSize;
-		let freelist: number | null = null;
-		try { freelist = Number(sql.exec('PRAGMA freelist_count').one().freelist_count); } catch { /* Record unsupported instrumentation explicitly. */ }
 		state.storage.transactionSync(() => {
 			for (let i = 1; i <= 128; i++) sql.exec('INSERT INTO calibration VALUES (?, ?, ?)', i, payload, 'x');
 		});
 		const reusedSize = sql.databaseSize;
-		return { insertCost, updateCost, deleteCost, fullSize, emptySize, reusedSize, freelist };
+		return { insertCost, updateCost, deleteCost, fullSize, emptySize, reusedSize };
 	});
 	console.info('native-sql-calibration', JSON.stringify(result));
 	expect(result.insertCost.writes).toBeGreaterThanOrEqual(2);

@@ -80,7 +80,7 @@ test('deployment configuration isolates development and protects production sele
 	}), /production\.toml/);
 	assert.throws(() => validateDeploymentConfiguration({
 		development: 'name = "apron-cloudflare-demo-dev"\n',
-		production: 'name = "apron-cloudflare-demo"\nworkers_dev = false\npreview_urls = false\nroutes = [{ pattern = "server.apron.chat", custom_domain = true }]\n[assets]\ndirectory = "../../clients/web/build"\n',
+		production: 'name = "apron-cloudflare-demo"\nworkers_dev = false\npreview_urls = false\nroutes = [{ pattern = "server.apron.chat", custom_domain = true }]\n[assets]\ndirectory = "./build"\n',
 		packageJson,
 		workflow,
 	}), /static assets/);

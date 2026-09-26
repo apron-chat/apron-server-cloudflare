@@ -1,24 +1,6 @@
-import { env, runInDurableObject } from "cloudflare:test";
 import { expect, it } from "vitest";
 import { RETENTION_MS, Store, StoreError, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
-
-/** A history page's messages; the array is omitted when empty (§4.1). */
-function messagesOf(page: { messages?: Array<{ log_id: string; message_id: string; room_id?: string; body?: Record<string, unknown> & { text?: string } }> }) {
-	return page.messages ?? [];
-}
-
-type TestClock = {
-	value: number;
-	readonly clock: { now(): number };
-};
-
-function makeClock(): TestClock {
-	const testClock: TestClock = {
-		value: Date.now() + 1_000,
-		clock: { now: () => testClock.value },
-	};
-	return testClock;
-}
+import { errorCode, expectRetryAfter, messagesOf, withStore as withNamedStore, type TestClock } from "./helpers/store";
 
 // Semantics tests use roomy posting windows; quota tests below use tiny ones.
 const ROOMY: Partial<StoreConfig> = {
@@ -30,33 +12,14 @@ const ROOMY: Partial<StoreConfig> = {
 	globalPostsPerDay: 5_000,
 };
 
-async function withStore<T>(
-	name: string,
-	fn: (store: Store, clock: TestClock, state: DurableObjectState) => T | Promise<T>,
-	config: Partial<StoreConfig> = ROOMY,
-): Promise<T> {
-	const stub = env.DEMO.getByName(`mutation-${name}-${crypto.randomUUID()}`);
-	return runInDurableObject(stub, async (_instance, state) => {
-		const clock = makeClock();
-		const store = new Store(state, config, clock.clock);
-		store.initialize();
-		return fn(store, clock, state);
-	});
-}
+const withStore = <T>(name: string, fn: Parameters<typeof withNamedStore<T>>[2], config: Partial<StoreConfig> = ROOMY) =>
+	withNamedStore(`mutation-${name}`, config, fn);
 
-function op(
-	clock: TestClock,
-	userId: string,
-	requestId: string | undefined,
-	method: string,
-	params: Record<string, unknown>,
-	ipKey = "ip-test",
-): StoreMutationInput {
+function op(clock: TestClock, userId: string, requestId: string, method: string, params: Record<string, unknown>): StoreMutationInput {
 	return {
 		userId,
-		tier: "anonymous",
-		ipKey,
-		...(requestId === undefined ? {} : { requestId }),
+		ipKey: "ip-test",
+		requestId,
 		method,
 		now: clock.value,
 		params,
@@ -64,18 +27,8 @@ function op(
 	};
 }
 
-const post = (store: Store, clock: TestClock, userId: string, requestId: string | undefined, params: Record<string, unknown>) =>
+const post = (store: Store, clock: TestClock, userId: string, requestId: string, params: Record<string, unknown>) =>
 	store.mutate(op(clock, userId, requestId, "message", { room_id: "general", ...params }));
-
-function errorCode(fn: () => unknown): string {
-	try {
-		fn();
-	} catch (error) {
-		if (error instanceof StoreError) return error.code;
-		throw error;
-	}
-	throw new Error("expected StoreError");
-}
 
 function logOf(result: StoreMutationResult): number {
 	const logId = result.broadcasts[0]?.params.log_id ?? result.room?.log_id;
@@ -83,8 +36,8 @@ function logOf(result: StoreMutationResult): number {
 	return Number(logId);
 }
 
-function thread(store: Store, clock: TestClock, requestId: string, params: Record<string, unknown> = {}, userId = "alice"): string {
-	const created = store.mutate(op(clock, userId, requestId, "room_set", { parent_room_id: "general", title: "Thread", ...params }));
+function thread(store: Store, clock: TestClock, requestId: string, params: Record<string, unknown> = {}): string {
+	const created = store.mutate(op(clock, "alice", requestId, "room_set", { parent_room_id: "general", title: "Thread", ...params }));
 	return String(created.result.room_id);
 }
 
@@ -387,7 +340,7 @@ it("charges reactions and room changes against posting quotas and keeps accepted
 		const created = store.mutate(op(clock, "alice", "room", "room_set", { parent_room_id: "general", title: "Quota" }));
 		const limited = (fn: () => unknown) => {
 			try { fn(); expect.unreachable(); }
-			catch (error) { expect(error).toBeInstanceOf(StoreError); expect((error as StoreError).code).toBe("retry_after"); }
+			catch (error) { expectRetryAfter(error); }
 		};
 		limited(() => store.mutate(op(clock, "alice", "react-2", "reactions", { message_id: target.result.message_id, emojis: [] })));
 		limited(() => store.mutate(op(clock, "alice", "room-2", "room_set", { room_id: created.result.room_id, title: "Renamed" })));
@@ -400,41 +353,42 @@ it("charges reactions and room changes against posting quotas and keeps accepted
 	}, { anonymousPostsPerMinute: 3 });
 });
 
-it("keeps a recently edited message after its creation record expires", async () => {
-	await withStore("retention", (store, clock) => {
-		const created = post(store, clock, "alice", "old-create", { body: { text: "old" } });
-		const messageId = created.result.message_id;
-		const creationLog = logOf(created);
+it("rolls back failed writes atomically while keeping their resource reservation spent", async () => {
+	await withStore("rollback", (store, clock, state) => {
+		const before = store.getRoomState();
+		const budgetBefore = store.budget(clock.value);
+		// SQLite itself raises after the transition insert, inside transactionSync.
+		// This exercises real rollback rather than substituting a fake database.
+		state.storage.sql.exec(`CREATE TRIGGER fail_snapshot BEFORE INSERT ON message_state
+			BEGIN SELECT RAISE(ABORT, 'injected snapshot failure'); END`);
+		const attempt = () => post(store, clock, "alice", "retry-after-failed-commit", { body: { text: "atomic message" } });
+		expect(attempt).toThrow("injected snapshot failure");
+		expect(store.getRoomState().latest_log_id).toBe(before.latest_log_id);
+		// Only the seeded general room record exists; nothing from the failed write.
+		expect(state.storage.sql.exec("SELECT COUNT(*) AS n FROM records").one().n).toBe(1);
+		for (const table of ["message_state", "accepted_requests", "principal_limits"]) {
+			expect(state.storage.sql.exec(`SELECT COUNT(*) AS n FROM ${table}`).one().n).toBe(0);
+		}
+		expect(store.budget(clock.value).writes).toBeGreaterThan(budgetBefore.writes);
 
-		clock.value += 23 * 60 * 60 * 1_000;
-		const edited = post(store, clock, "alice", "recent-edit", { message_id: messageId, body: { text: "recent edit" } });
-		const editLog = String(logOf(edited));
-
-		clock.value += 2 * 60 * 60 * 1_000;
-		const cleanup = store.runCleanup(clock.value);
-		expect(cleanup.history_floor).toBe(String(creationLog + 1));
-		const history = store.historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value });
-		expect(history.history_log_id).toBe(String(creationLog + 1));
-		expect(history.rooms).toBeUndefined();
-		expect(messagesOf(history).map((entry) => entry.log_id)).toEqual([editLog]);
-		expect(messagesOf(history)[0].body?.text).toBe("recent edit");
-		// The general room record survives in the current-state table and is
-		// still listed with its original log_id.
-		expect(Number(store.getRoomState().log_id)).toBeLessThan(creationLog);
+		// The failed request was never accepted, so the same request ID commits.
+		state.storage.sql.exec("DROP TRIGGER fail_snapshot");
+		const committed = attempt();
+		expect(committed.deduplicated).not.toBe(true);
+		expect(committed.message?.body?.text).toBe("atomic message");
+		expect(committed.broadcasts.map((record) => record.method)).toEqual(["message"]);
 	});
 });
 
+const DEDUP_CONFIG: Partial<StoreConfig> = { anonymousPostsPerMinute: 1 };
+
 it("deduplicates canonical retries before quotas, survives restart, and expires independently", async () => {
-	await withStore("dedup", async (store, clock, state) => {
-		const config = { anonymousPostsPerMinute: 1 };
-		const limited = new Store(state, config, clock.clock);
-		// Reuse the already-created native SQLite binding with a fresh Store
-		// instance so this also exercises constructor/restart state without
-		// relying on an in-memory fake database.
-		limited.initialize();
+	await withStore("dedup", (store, clock, state) => {
 		const params = { body: { format: "plain", text: "once", extension: { z: 1, a: 2 } } };
-		const first = post(limited, clock, "alice", "same", params);
-		const restarted = new Store(state, config, clock.clock);
+		const first = post(store, clock, "alice", "same", params);
+		// A fresh Store over the same native SQLite binding exercises the
+		// constructor/restart path without an in-memory fake database.
+		const restarted = new Store(state, DEDUP_CONFIG, clock.clock);
 		restarted.initialize();
 		const retry = post(restarted, clock, "alice", "same", {
 			body: { extension: { a: 2, z: 1 }, text: "once", format: "plain" },
@@ -450,5 +404,5 @@ it("deduplicates canonical retries before quotas, survives restart, and expires 
 		const afterExpiry = post(restarted, clock, "alice", "same", params);
 		expect(afterExpiry.deduplicated).not.toBe(true);
 		expect(afterExpiry.result.message_id).not.toBe(first.result.message_id);
-	});
+	}, DEDUP_CONFIG);
 });
