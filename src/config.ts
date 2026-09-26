@@ -15,7 +15,8 @@ export interface RuntimeConfig {
 	guestPosting: boolean;
 	/**
 	 * A fixed bearer token that signs in as the test user (`TEST_TOKEN`), for
-	 * testing and demos without a passkey; unset, no such token exists.
+	 * local testing without a passkey; never set in production. Unset, no
+	 * such token exists.
 	 */
 	testToken?: string;
 }
