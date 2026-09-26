@@ -83,6 +83,44 @@ function randomBase64Url(bytes = 24): string {
 	return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
 }
 
+/** Longest name part of a `user_id` picked from a requested name. */
+const USER_ID_SLUG_CHARS = 16;
+/** Tries at a `<slug>_<4 digits>` id before falling back to a random one. */
+const USER_ID_SLUG_ATTEMPTS = 8;
+
+/**
+ * The `user_id` part a requested name suggests: lowercase ASCII letters and
+ * digits, other runs as one `_`, at most 16 characters. Empty when nothing
+ * usable is left or when it would pass for a guest (`guest_<n>`) or a bot
+ * (`bot_…`), whose prefixes name those kinds of user.
+ */
+export function userIdSlug(name: string): string {
+	const slug = name.normalize("NFKD").replace(/\p{M}+/gu, "").toLowerCase()
+		.replace(/[^a-z0-9]+/g, "_").replace(/^_+/, "").slice(0, USER_ID_SLUG_CHARS).replace(/_+$/, "");
+	return /^(guest|bot)(_|$)/.test(slug) ? "" : slug;
+}
+
+function randomDigits(count: number): string {
+	const raw = new Uint32Array(count);
+	crypto.getRandomValues(raw);
+	return Array.from(raw, (value) => String(value % 10)).join("");
+}
+
+/**
+ * A new registered `user_id`: `<slug>_<4 random digits>` for a requested name
+ * (`Foo` → `foo_1234`), retried while taken, else `u_` plus 16 random bytes.
+ */
+function candidateUserIdFor(name: string | undefined, taken: (userId: string) => boolean): string {
+	const slug = name === undefined ? "" : userIdSlug(name);
+	if (slug) {
+		for (let attempt = 0; attempt < USER_ID_SLUG_ATTEMPTS; attempt += 1) {
+			const userId = `${slug}_${randomDigits(4)}`;
+			if (!taken(userId)) return userId;
+		}
+	}
+	return `u_${randomBase64Url(16)}`;
+}
+
 function base64UrlToBytes(value: string): Uint8Array<ArrayBuffer> {
 	if (!/^[A-Za-z0-9_-]{1,1024}$/.test(value)) throw new Error("credential id is malformed");
 	const padded = value.replaceAll("-", "+").replaceAll("_", "/") + "=".repeat((4 - value.length % 4) % 4);
@@ -162,15 +200,16 @@ export class WebAuthnService {
 		identity?: Identity,
 		existingCredentialIds: string[] = [],
 		connectionId?: string,
+		registration: { name?: string; userIdTaken?: (userId: string) => boolean } = {},
 	): Promise<BeginResult> {
 		if (!this.config.rpOrigins.includes(origin)) throw new Error("origin is not configured for passkeys");
 		if (action === "register" && identity?.tier === "registered") throw new Error("identity switching requires reconnect");
 		const challengeId = randomBase64Url(18);
 		const challenge = randomBase64Url(32);
-		const candidateUserId = action === "register" ? `u_${randomBase64Url(16)}` : undefined;
+		const candidateUserId = action === "register" ? candidateUserIdFor(registration.name, registration.userIdTaken ?? (() => false)) : undefined;
 		const candidateUserHandle = action === "register" ? randomBase64Url(16) : undefined;
 		const candidateName = action === "register"
-			? (identity?.name ?? `Guest ${randomBase64Url(4)}`.slice(0, Math.min(this.config.limits.maxNameCodePoints, this.config.limits.maxNameBytes)))
+			? (registration.name ?? identity?.name ?? `Guest ${randomBase64Url(4)}`.slice(0, Math.min(this.config.limits.maxNameCodePoints, this.config.limits.maxNameBytes)))
 			: undefined;
 		const options = action === "register"
 			? await generateRegistrationOptions({

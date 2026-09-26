@@ -107,7 +107,8 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 const GUEST_READ_ONLY = "Guests can only read here; sign in with a passkey to post or join rooms";
 /**
  * A registered user's bot is `bot_` plus the owner's `user_id`. Guests are
- * `guest_<n>` and registered users `u_…`, so the prefix names bots alone.
+ * `guest_<n>` and registered users `<name>_<digits>` or `u_…`, never starting
+ * `guest_` or `bot_`, so the prefix names bots alone.
  */
 const BOT_ID_PREFIX = "bot_";
 /** Bot tokens start with this, so `auth` tells them from passkey session tokens without a storage read. */
@@ -1068,7 +1069,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!origin || !this.config.rpOrigins.includes(origin)) throw { name: "denied", message: "Frontend origin is not configured for passkeys" } satisfies ProtocolError;
 		if (step === "begin") {
 			const identity = action === "register" ? identityOf(attachment) : undefined;
-			const begun = await this.webAuthn.begin(action, origin, nowMs(), identity ?? undefined, [], attachment.connId);
+			const name = action === "register" ? this.requestedName(params) : undefined;
+			const begun = await this.webAuthn.begin(action, origin, nowMs(), identity ?? undefined, [], attachment.connId, {
+				...(name !== undefined ? { name } : {}),
+				userIdTaken: (userId) => this.store.identityExists(userId),
+			});
 			if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
 			attachment.challenge = begun.challenge;
 			writeSessionAttachment(socket, attachment);
@@ -1127,6 +1132,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.reply(socket, request, { you: publicIdentity(attachment), token });
 		if (guest) this.announceUser(socket, publicIdentity(attachment), [...guestRooms, ...attachment.rooms], guest);
 		await this.rescheduleAlarm();
+	}
+
+	/**
+	 * The display name a passkey registration asks for, if any: trimmed, and
+	 * within the name limits. It also seeds the new `user_id` (`foo_1234`).
+	 */
+	private requestedName(params: Record<string, unknown>): string | undefined {
+		const name = optionalString(params, "name")?.trim();
+		if (!name) return undefined;
+		const { maxNameCodePoints, maxNameBytes } = this.config.limits;
+		if ([...name].length > maxNameCodePoints || utf8Bytes(name) > maxNameBytes) {
+			throw { name: "too_large", message: "name is too long" } satisfies ProtocolError;
+		}
+		return name;
 	}
 
 	/**

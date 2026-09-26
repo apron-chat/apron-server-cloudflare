@@ -1842,6 +1842,12 @@ export class Store {
     return 8 + 2 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS);
   }
 
+  /** Whether a `user_id` is taken, one indexed read: registration picks ids with it. */
+  identityExists(userId: string): boolean {
+    this.ensureReady();
+    return this.reserved({ reads: 4 }, false, this.clock.now(), () => this.identityRow(userId) !== null);
+  }
+
   getIdentity(userId: string): StoredIdentity | null {
     this.ensureReady();
     return this.reserved({ reads: 16 + this.userRoomsReads() }, false, this.clock.now(), () => {

@@ -50,6 +50,7 @@ export interface CleanupResult {
 
 export interface AuthStore {
 	getCredential(credentialId: string): StoredCredential | null;
+	identityExists(userId: string): boolean;
 	getIdentity(userId: string): StoredIdentity | null;
 	registerIdentity(input: {
 		userId: string;

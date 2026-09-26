@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
-import { WebAuthnService, type ChallengeRecord, type CredentialRepository } from '../src/auth';
+import { userIdSlug, WebAuthnService, type ChallengeRecord, type CredentialRepository } from '../src/auth';
 import { loadConfig } from '../src/config';
 import { Store } from '../src/store';
 
@@ -75,6 +75,7 @@ it('verifies signed ceremonies against SQLite identities and rejects challenge, 
 		});
 		expect(registered.identity.tier).toBe('registered');
 		expect(registered.identity.user_id).not.toBe('guest_original');
+		expect(registered.identity.user_id).toMatch(/^u_[A-Za-z0-9_-]{22}$/);
 		expect(store.getIdentity(registered.identity.user_id)?.userHandle).toBe(begun.challenge.userHandle);
 		const duplicate = await service.begin('register', 'https://chat.example.test', now);
 		await expect(service.finish(duplicate.challenge, duplicate.challenge.challengeId, await registration(duplicate.challenge), repository, { now, ipKey: 'fixture-ip' })).rejects.toThrow();
@@ -104,9 +105,33 @@ it('verifies signed ceremonies against SQLite identities and rejects challenge, 
 		expect(accepted.identity.user_id).toBe(registered.identity.user_id);
 		expect(store.getCredential(b64(credentialId))?.counter).toBe(1);
 
+		// A requested name seeds the id, `<slug>_<4 digits>`, skipping taken ones.
+		const named = await service.begin('register', 'https://chat.example.test', now, undefined, [], undefined, { name: 'Foo', userIdTaken: id => store.identityExists(id) });
+		expect(named.challenge.userId).toMatch(/^foo_\d{4}$/);
+		expect(named.challenge.userName).toBe('Foo');
+		expect(store.identityExists(registered.identity.user_id)).toBe(true);
+		const tried: string[] = [];
+		const crowded = await service.begin('register', 'https://chat.example.test', now, undefined, [], undefined, { name: 'Foo', userIdTaken: id => { tried.push(id); return true; } });
+		expect(tried).toHaveLength(8);
+		expect(crowded.challenge.userId).toMatch(/^u_/);
+
 		const connectionBound = await service.begin('login', 'https://chat.example.test', now, undefined, [], 'connection-a');
 		await expect(service.finish(connectionBound.challenge, connectionBound.challenge.challengeId, {}, repository, {
 			now, ipKey: 'fixture-ip', connectionId: 'connection-b',
 		})).rejects.toThrow('another connection');
 	});
+});
+
+it('derives user_id slugs from requested names', () => {
+	expect(userIdSlug('Foo')).toBe('foo');
+	expect(userIdSlug('  Foo Bar!! ')).toBe('foo_bar');
+	expect(userIdSlug('Zoë Ångström')).toBe('zoe_angstrom');
+	expect(userIdSlug('A very long display name indeed')).toBe('a_very_long_disp');
+	expect(userIdSlug('abcdefghijklmno pq')).toBe('abcdefghijklmno');
+	expect(userIdSlug('日本語')).toBe('');
+	expect(userIdSlug('Guest')).toBe('');
+	expect(userIdSlug('guest 12')).toBe('');
+	expect(userIdSlug('Bot')).toBe('');
+	expect(userIdSlug('Guesthouse')).toBe('guesthouse');
+	expect(userIdSlug('Bottle')).toBe('bottle');
 });
