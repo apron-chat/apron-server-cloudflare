@@ -1842,6 +1842,12 @@ export class Store {
     return 8 + 2 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS);
   }
 
+  /** Whether a `user_id` is taken, one indexed read: registration picks ids with it. */
+  identityExists(userId: string): boolean {
+    this.ensureReady();
+    return this.reserved({ reads: 4 }, false, this.clock.now(), () => this.identityRow(userId) !== null);
+  }
+
   getIdentity(userId: string): StoredIdentity | null {
     this.ensureReady();
     return this.reserved({ reads: 16 + this.userRoomsReads() }, false, this.clock.now(), () => {
@@ -2481,6 +2487,33 @@ export class Store {
       }
       return { userId: input.botId, name: input.name, created: false, renamed, broadcasts: [] };
     }
+    const created = this.createKeylessIdentity({ userId: input.botId, name: input.name, tier: "bot", now: input.now, ipKey: input.ipKey });
+    return { userId: input.botId, name: input.name, created: true, renamed: false, broadcasts: created.broadcasts };
+  }
+
+  /**
+   * The test user that `TEST_TOKEN` signs in as: a registered identity with
+   * no credential, created on first use like a bot, against the same caps.
+   * `created` is false when it already exists.
+   */
+  ensureTestUser(input: { userId: string; name: string; now: number; ipKey: string }): { created: boolean; broadcasts: Broadcast[] } {
+    this.ensureReady();
+    const existing = this.reserved({ reads: 8 }, false, input.now, () => this.identityRow(input.userId));
+    if (existing) {
+      if (existing.tier !== "registered") throw new StoreError("internal_error", "test user identity is taken");
+      return { created: false, broadcasts: [] };
+    }
+    return { created: true, broadcasts: this.createKeylessIdentity({ ...input, tier: "registered" }).broadcasts };
+  }
+
+  /**
+   * Inserts an identity that signs in by bearer token rather than a
+   * credential, charged as a registration, and starts it in `general` with a
+   * logged membership (§4.3.2) returned in `broadcasts`.
+   */
+  private createKeylessIdentity(input: { userId: string; name: string; tier: "bot" | "registered"; now: number; ipKey: string }): { broadcasts: Broadcast[] } {
+    ensureText(input.name, "name", this.config.maxNameBytes);
+    if ([...input.name].length > this.config.maxNameCodePoints) throw new StoreError("too_large", "name is too long");
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
     // The limiter and meta rows, the identity row, and one membership row and
@@ -2491,12 +2524,12 @@ export class Store {
       this.ensureGrowthCapacity(this.config.maxSnapshotBytes);
       const effective = this.effectiveNow(input.now);
       return this.transaction(() => {
-        if (this.identityRow(input.botId)) throw new StoreError("invalid_params", "identity already exists");
+        if (this.identityRow(input.userId)) throw new StoreError("invalid_params", "identity already exists");
         if (this.metaNumber("identity_count") >= this.config.registeredIdentityCount) throw new StoreError("denied", "registration_closed");
         this.chargeRegistration(input.ipKey, effective);
         this.rawExec(
-          "INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES (?, '', ?, 'bot', ?, ?)",
-          input.botId, input.name, effective, effective,
+          "INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES (?, '', ?, ?, ?, ?)",
+          input.userId, input.name, input.tier, effective, effective,
         );
         this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(this.metaNumber("identity_count") + 1));
         const broadcasts: Broadcast[] = [];
@@ -2506,14 +2539,14 @@ export class Store {
           const startLogId = state.last_log_id;
           const context: CommitContext = { state, commitMs: Math.max(effective, state.last_commit_ms), touched: new Map() };
           for (const roomId of joined) {
-            this.rawExec("INSERT OR IGNORE INTO memberships (room_id, user_id) VALUES (?, ?)", roomId, input.botId);
-            broadcasts.push(this.logMembership(context, roomId, recordedUser(input.botId, input.name), true));
+            this.rawExec("INSERT OR IGNORE INTO memberships (room_id, user_id) VALUES (?, ?)", roomId, input.userId);
+            broadcasts.push(this.logMembership(context, roomId, recordedUser(input.userId, input.name), true));
           }
           this.finishCommit(context, startLogId);
         }
         this.assertStorageTarget();
         this.assertReservation(reservation, beforeReads, beforeWrites);
-        return { userId: input.botId, name: input.name, created: true, renamed: false, broadcasts };
+        return { broadcasts };
       });
     } finally {
       this.settleReservation(reservation, beforeReads, beforeWrites);

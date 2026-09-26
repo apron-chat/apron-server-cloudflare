@@ -209,6 +209,40 @@ it('lets a bot send auth and a post together before the server frame, and retry 
 	} finally { owner.close(); }
 });
 
+it('signs in as the test user with TEST_TOKEN from anywhere, once it is set', async () => {
+	await guestsReadOnly();
+	const testToken = 'demo-token-0123456789abcdef';
+	const withTestToken = (value: string | undefined) => runInDurableObject(stub(), (instance) => {
+		const server = instance as unknown as { config: { testToken?: string } };
+		server.config = { ...server.config, testToken: value };
+	});
+	const unset = await connect(null);
+	try {
+		await unset.next();
+		// Unset, the token is only a failed session resume.
+		expect((await request(unset, 'auth', 'auth', { scheme: 'token', token: testToken })).error.code).toBe(-32001);
+	} finally { unset.close(); }
+
+	await withTestToken(testToken);
+	const first = await connect(null);
+	const second = await connect();
+	try {
+		await first.next();
+		const auth = await request(first, 'auth', 'auth', { scheme: 'token', token: testToken });
+		expect(auth.result).toEqual({ you: { user_id: 'test_user', name: 'Test User' } });
+		// Created on first use, it starts in general.
+		expect((await request(first, 'rooms', 'room_list', { filter: 'joined' })).result.joined.map((room: { room_id: string }) => room.room_id)).toEqual(['general']);
+		const posted = await request(first, 'post', 'message', { room_id: 'general', body: { text: 'testing' } });
+		expect(posted.result.message_id).toBeDefined();
+		const { token: botToken } = await inviteBot(first, 'invite');
+		expect(botToken).toMatch(/^apron_bot_/);
+
+		// The same token signs in again, as the same user, from a browser too.
+		await second.next();
+		expect((await request(second, 'auth', 'auth', { scheme: 'token', token: testToken })).result.you).toEqual({ user_id: 'test_user', name: 'Test User' });
+	} finally { first.close(); second.close(); await withTestToken(undefined); }
+});
+
 it('rejects a made-up bot token', async () => {
 	await guestsReadOnly();
 	const peer = await connect(null);

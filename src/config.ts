@@ -13,6 +13,11 @@ export interface RuntimeConfig {
 	activityEnabled: boolean;
 	/** Let guests post, react, join and leave rooms, and create threads; off unless `GUEST_POSTING=true`, so guests only read. */
 	guestPosting: boolean;
+	/**
+	 * A fixed bearer token that signs in as the test user (`TEST_TOKEN`), for
+	 * testing and demos without a passkey; unset, no such token exists.
+	 */
+	testToken?: string;
 }
 
 export class ConfigError extends Error {
@@ -30,6 +35,7 @@ type EnvLike = {
 	ADMISSION_OFF?: string;
 	ACTIVITY?: string;
 	GUEST_POSTING?: string;
+	TEST_TOKEN?: string;
 	ENVIRONMENT?: string;
 	NODE_ENV?: string;
 };
@@ -222,6 +228,11 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 	const activityEnabled = String(env.ACTIVITY ?? "").toLowerCase() === "true";
 	if (env.GUEST_POSTING !== undefined && !["true", "false"].includes(String(env.GUEST_POSTING).toLowerCase())) throw new ConfigError("GUEST_POSTING must be true or false");
 	const guestPosting = String(env.GUEST_POSTING ?? "").toLowerCase() === "true";
+	const testToken = env.TEST_TOKEN === undefined || env.TEST_TOKEN === "" ? undefined : String(env.TEST_TOKEN);
+	if (testToken !== undefined && !/^[A-Za-z0-9_-]{24,256}$/.test(testToken)) {
+		throw new ConfigError("TEST_TOKEN must be 24 to 256 letters, digits, - or _");
+	}
+	if (testToken?.startsWith("apron_bot_")) throw new ConfigError("TEST_TOKEN must not start with apron_bot_");
 	const rpName = String(env.RP_NAME ?? "Apron Demo");
 	if (!rpName.trim() || [...rpName].length > limits.maxNameCodePoints || new TextEncoder().encode(rpName).byteLength > limits.maxNameBytes) {
 		throw new ConfigError("RP_NAME exceeds the configured display-name policy");
@@ -235,6 +246,7 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 		admissionOff,
 		activityEnabled,
 		guestPosting,
+		...(testToken !== undefined ? { testToken } : {}),
 	};
 }
 
