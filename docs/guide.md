@@ -325,7 +325,7 @@ For direct Wrangler production commands, always pass
    demo on the object's first wake (the current schema is 4; see
    [SPEC section 8](../SPEC.md#schema-versions)). All chat history, rooms,
    sessions, bot tokens, and limiter windows are deleted, and saved session
-   tokens fall back to sign-in. Registered passkeys survive: up to 1,000 of the
+   tokens fall back to sign-in. Registered passkeys survive: up to 100 of the
    most recently used are carried over with their identities, so users sign in
    with the passkey they already have; older ones past that cap must be
    registered again. Besides those, only the current day's resource

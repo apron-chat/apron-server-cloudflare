@@ -611,7 +611,7 @@ const META_GUEST_NUMBER_MARK = "guest_number_mark";
  * the reset's uncharged-for-capacity SQL work to a small share of a day's
  * writes, and so the identities that can survive a wipe.
  */
-export const MAX_CARRIED_PASSKEYS = 1_000;
+export const MAX_CARRIED_PASSKEYS = 100;
 /**
  * Rows one carried passkey may read and write: the identity, credential and
  * `general` membership reads before the wipe, and the same rows with their
