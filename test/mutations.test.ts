@@ -65,6 +65,67 @@ it("allocates one strictly increasing log sequence across rooms, record kinds, a
 	});
 });
 
+it("keeps an embed's og as plain text fields and drops the rest", async () => {
+	await withStore("og", (store, clock) => {
+		const url = "https://github.com/apron-chat/apron-web/pull/11";
+		const long = "x".repeat(300);
+		const created = post(store, clock, "alice", "og1", {
+			body: {
+				text: url,
+				embeds: [
+					{
+						kind: "link", url,
+						og: {
+							site_name: "GitHub · apron-chat/apron-web",
+							title: ` Preview\u202e links\n\tbuilt  in the browser `,
+							description: long + long,
+							image: { url: "https://evil.example/pixel.png" },
+							type: "website",
+						},
+					},
+					{ kind: "link", url: "https://example.com", og: { image: { url: "https://evil.example/x.png" }, title: " \n " } },
+					{ kind: "link", url: "https://example.com/a", og: "not an object" },
+					{ kind: "html", html: "<b>opaque</b>" },
+				],
+			},
+		});
+		const embeds = created.message?.body?.embeds as Record<string, unknown>[];
+		expect(embeds[0]).toEqual({
+			kind: "link", url,
+			og: { title: "Preview links built in the browser", description: `${"x".repeat(511)}…`, site_name: "GitHub · apron-chat/apron-web" },
+		});
+		expect(embeds[1]).toEqual({ kind: "link", url: "https://example.com" });
+		expect(embeds[2]).toEqual({ kind: "link", url: "https://example.com/a" });
+		expect(embeds[3]).toEqual({ kind: "html", html: "<b>opaque</b>" });
+
+		expect(errorCode(() => post(store, clock, "alice", "og2", { body: { text: "x", embeds: ["link"] } }))).toBe("invalid_params");
+		expect(errorCode(() => post(store, clock, "alice", "og3", { body: { text: "x", embeds: [{ url }] } }))).toBe("invalid_params");
+	});
+});
+
+it("keeps og media from other servers only with ogRemoteMedia", async () => {
+	await withStore("og-media", (store, clock) => {
+		const created = post(store, clock, "alice", "ogm1", {
+			body: {
+				text: "look",
+				embeds: [{
+					kind: "link", url: "https://example.com",
+					og: {
+						title: "Example",
+						image: { url: "https://cdn.example/a.png", type: "image/png", width: 320, height: -1, alt: "An\nexample", extra: true },
+						video: { url: "javascript:alert(1)" },
+						audio: "https://cdn.example/a.mp3",
+					},
+				}],
+			},
+		});
+		expect((created.message?.body?.embeds as unknown[])[0]).toEqual({
+			kind: "link", url: "https://example.com",
+			og: { title: "Example", image: { url: "https://cdn.example/a.png", type: "image/png", width: 320, alt: "An example" } },
+		});
+	}, { ...ROOMY, ogRemoteMedia: true });
+});
+
 it("broadcasts flat self-describing snapshots and enforces replacement semantics", async () => {
 	await withStore("edits", (store, clock) => {
 		const created = post(store, clock, "alice", "m1", {
