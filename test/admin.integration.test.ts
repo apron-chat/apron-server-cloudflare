@@ -84,7 +84,8 @@ it('/admin makes a registered user an admin, but not a guest, bot, or unknown us
 		const guestId = (await request(guest, 'auth', 'auth', { scheme: 'guest' })).result.you.user_id;
 
 		expect((await command(carol, 'before', '/status')).frame.error.code).toBe(-32001);
-		const granted = await command(admin, 'grant', `/admin ${userId}`);
+		// A user_id may be written as a mention.
+		const granted = await command(admin, 'grant', `/admin @${userId}`);
 		expect(granted.frame.result).toEqual({});
 		expect(granted.notice!.params.body.text).toBe(`**Name of ${userId}** (\`${userId}\`) is now an admin.`);
 		expect((await command(admin, 'again', `/admin ${userId}`)).notice!.params.body.text).toMatch(/is already an admin/);
@@ -107,7 +108,7 @@ it('/kick removes a registered user or a guest from the room of the command', as
 		await guest.next();
 		const guestId = (await request(guest, 'auth', 'auth', { scheme: 'guest' })).result.you.user_id;
 
-		const kicked = await command(admin, 'kick-bob', `/kick ${bobId}`);
+		const kicked = await command(admin, 'kick-bob', `/kick @${bobId}`);
 		expect(kicked.frame.result).toEqual({});
 		expect(kicked.notice!.params.body.text).toBe(`Removed \`${bobId}\` from this room.`);
 		const left = await until(bob, (frame) => frame.method === 'room_update' && frame.params.left !== undefined);
@@ -127,6 +128,7 @@ it('/kick removes a registered user or a guest from the room of the command', as
 		expect((await command(admin, 'kick-nobody', '/kick nobody_123')).frame.error.code).toBe(-32602);
 		// Mistakes are shown, not counted as policy violations: the socket stays open.
 		expect((await command(admin, 'kick-usage', '/kick')).frame.error.message).toBe('Usage: /kick <user_id>');
+		expect((await command(admin, 'kick-bare-at', '/kick @')).frame.error.message).toBe('Usage: /kick <user_id>');
 		expect(admin.closed()).toBeUndefined();
 	} finally { admin.close(); bob.close(); guest.close(); }
 });
@@ -140,9 +142,11 @@ it('/status sends the caller the Cloudflare usage and the demo budgets', async (
 		expect(status.notice!.params.body.format).toBe('markdown');
 		// Tests configure no account analytics, so only the object's budgets show.
 		expect(text).toContain('no usage sample');
-		expect(text).toMatch(/\| SQL rows written \| [\d,]+ \/ 80,000 \(\d+%\) \|/);
-		expect(text).toMatch(/\| Registered users \| [\d,]+ \/ 10,000/);
-		expect(text).toContain('| Database |');
+		// Plain CommonMark: bullet lists, since clients need not render tables.
+		expect(text).not.toContain('|');
+		expect(text).toMatch(/^- SQL rows written: [\d,]+ \/ 80,000 \(\d+%\)$/m);
+		expect(text).toMatch(/^- Registered users: [\d,]+ \/ 10,000/m);
+		expect(text).toMatch(/^- Database: /m);
 	} finally { admin.close(); }
 });
 
@@ -154,7 +158,7 @@ it('/rename moves a registered user, their passkey, rooms and admin status to a 
 	const erin = await signedIn(unique('erin'));
 	try {
 		expect((await command(admin, 'grant', `/admin ${fromId}`)).frame.result).toEqual({});
-		const renamed = await command(admin, 'rename', `/rename ${fromId} ${toId}`);
+		const renamed = await command(admin, 'rename', `/rename @${fromId} @${toId}`);
 		expect(renamed.frame.result).toEqual({});
 		expect(renamed.notice!.params.body.text).toBe(`Renamed \`${fromId}\` to \`${toId}\`.`);
 		// The user's connection becomes the new identity; a room-mate learns of the change (§3.3).

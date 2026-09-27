@@ -1838,12 +1838,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (command.name === "admin" || command.name === "kick" || command.name === "rename") {
 			try {
-				const target = words[1];
+				// Every argument is a user_id, which may be written as a mention: `@u_foo`.
+				const userIds = words.slice(1).map((word) => (word.startsWith("@") ? word.slice(1) : word));
 				const argumentCount = command.name === "rename" ? 2 : 1;
-				if (!target || words.length !== argumentCount + 1) throw { name: "invalid_params", message: `Usage: ${command.usage}` } satisfies ProtocolError;
+				if (userIds.length !== argumentCount || userIds.some((id) => !id)) throw { name: "invalid_params", message: `Usage: ${command.usage}` } satisfies ProtocolError;
+				const target = userIds[0];
 				if (command.name === "admin") this.grantAdmin(socket, request, roomId, target);
 				else if (command.name === "kick") await this.kick(socket, attachment, request, roomId, target);
-				else this.rename(socket, request, roomId, target, words[2]);
+				else this.rename(socket, request, roomId, target, userIds[1]);
 			} catch (error) {
 				// A mistyped or wrong user_id is an error to show, like an unknown
 				// command, not a policy violation.
@@ -1976,35 +1978,31 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const daily = ACCOUNT_USAGE_POLICY.freeDaily;
 		if (usage) {
 			lines.push(
-				`**Cloudflare account, ${usage.day}** (sampled ${new Date(usage.sampledAt).toISOString().slice(11, 16)} UTC${usage.stop ? ", **stopped**: over " + Math.round(ACCOUNT_USAGE_POLICY.stopRatio * 100) + "% of a limit" : ""})`,
+				`**Cloudflare account, ${usage.day}**: used / Free daily (sampled ${new Date(usage.sampledAt).toISOString().slice(11, 16)} UTC${usage.stop ? ", **stopped**: over " + Math.round(ACCOUNT_USAGE_POLICY.stopRatio * 100) + "% of a limit" : ""})`,
 				"",
-				"| | Used / Free daily |",
-				"|---|---|",
-				`| Worker requests | ${share(usage.workerRequests, daily.workerRequests)} |`,
-				`| Durable Object requests | ${share(usage.durableObjectRequests, daily.durableObjectRequests)} |`,
-				`| Durable Object duration (GB-s) | ${share(usage.durableObjectDurationGbSeconds, daily.durableObjectDurationGbSeconds)} |`,
-				`| SQL rows read | ${share(usage.sqlRowsRead, daily.sqlRowsRead)} |`,
-				`| SQL rows written | ${share(usage.sqlRowsWritten, daily.sqlRowsWritten)} |`,
-				`| Stored | ${mib(usage.storedBytes)} / ${mib(ACCOUNT_USAGE_POLICY.freeStoredBytes)} |`,
+				`- Worker requests: ${share(usage.workerRequests, daily.workerRequests)}`,
+				`- Durable Object requests: ${share(usage.durableObjectRequests, daily.durableObjectRequests)}`,
+				`- Durable Object duration (GB-s): ${share(usage.durableObjectDurationGbSeconds, daily.durableObjectDurationGbSeconds)}`,
+				`- SQL rows read: ${share(usage.sqlRowsRead, daily.sqlRowsRead)}`,
+				`- SQL rows written: ${share(usage.sqlRowsWritten, daily.sqlRowsWritten)}`,
+				`- Stored: ${mib(usage.storedBytes)} / ${mib(ACCOUNT_USAGE_POLICY.freeStoredBytes)}`,
 			);
 		} else {
 			lines.push("**Cloudflare account**: no usage sample; set `ACCOUNT_ID` and `ACCOUNT_ANALYTICS_TOKEN` to read it.");
 		}
 		lines.push(
 			"",
-			`**Demo budgets, ${budget.day}** (reserved by this object)`,
+			`**Demo budgets, ${budget.day}**: reserved by this object / budget`,
 			"",
-			"| | Reserved / Budget |",
-			"|---|---|",
-			`| SQL rows read | ${share(budget.reads, limits.sqlReadsPerDay)} |`,
-			`| SQL rows written | ${share(budget.writes, limits.sqlWritesPerDay)} |`,
-			`| Frames | ${share(budget.frames, limits.processedFramesPerDay)} |`,
-			`| Connection admissions | ${share(budget.admissions, limits.connectionAdmissionsPerDay)} |`,
-			`| Posts | ${share(budget.posts, limits.globalPostsPerDay)} |`,
-			`| Registrations | ${share(budget.registrations, limits.registrationsPerDay)} |`,
-			`| Registered users | ${share(identities, limits.registeredIdentityCount)} |`,
-			`| Open connections | ${share(this.ctx.getWebSockets().length, limits.openConnections)} |`,
-			`| Database | ${databaseBytes === null ? "unknown" : mib(databaseBytes)} / ${mib(limits.databaseHardTargetBytes)} |`,
+			`- SQL rows read: ${share(budget.reads, limits.sqlReadsPerDay)}`,
+			`- SQL rows written: ${share(budget.writes, limits.sqlWritesPerDay)}`,
+			`- Frames: ${share(budget.frames, limits.processedFramesPerDay)}`,
+			`- Connection admissions: ${share(budget.admissions, limits.connectionAdmissionsPerDay)}`,
+			`- Posts: ${share(budget.posts, limits.globalPostsPerDay)}`,
+			`- Registrations: ${share(budget.registrations, limits.registrationsPerDay)}`,
+			`- Registered users: ${share(identities, limits.registeredIdentityCount)}`,
+			`- Open connections: ${share(this.ctx.getWebSockets().length, limits.openConnections)}`,
+			`- Database: ${databaseBytes === null ? "unknown" : mib(databaseBytes)} / ${mib(limits.databaseHardTargetBytes)}`,
 		);
 		this.sendNotice(socket, roomId, lines.join("\n"));
 		this.reply(socket, request, {});
