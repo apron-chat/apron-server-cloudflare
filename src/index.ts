@@ -1978,31 +1978,35 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const daily = ACCOUNT_USAGE_POLICY.freeDaily;
 		if (usage) {
 			lines.push(
-				`**Cloudflare account, ${usage.day}**: used / Free daily (sampled ${new Date(usage.sampledAt).toISOString().slice(11, 16)} UTC${usage.stop ? ", **stopped**: over " + Math.round(ACCOUNT_USAGE_POLICY.stopRatio * 100) + "% of a limit" : ""})`,
+				`**Cloudflare account, ${usage.day}** (sampled ${new Date(usage.sampledAt).toISOString().slice(11, 16)} UTC${usage.stop ? ", **stopped**: over " + Math.round(ACCOUNT_USAGE_POLICY.stopRatio * 100) + "% of a limit" : ""})`,
 				"",
-				`- Worker requests: ${share(usage.workerRequests, daily.workerRequests)}`,
-				`- Durable Object requests: ${share(usage.durableObjectRequests, daily.durableObjectRequests)}`,
-				`- Durable Object duration (GB-s): ${share(usage.durableObjectDurationGbSeconds, daily.durableObjectDurationGbSeconds)}`,
-				`- SQL rows read: ${share(usage.sqlRowsRead, daily.sqlRowsRead)}`,
-				`- SQL rows written: ${share(usage.sqlRowsWritten, daily.sqlRowsWritten)}`,
-				`- Stored: ${mib(usage.storedBytes)} / ${mib(ACCOUNT_USAGE_POLICY.freeStoredBytes)}`,
+				"| | Used / Free daily |",
+				"|---|---|",
+				`| Worker requests | ${share(usage.workerRequests, daily.workerRequests)} |`,
+				`| Durable Object requests | ${share(usage.durableObjectRequests, daily.durableObjectRequests)} |`,
+				`| Durable Object duration (GB-s) | ${share(usage.durableObjectDurationGbSeconds, daily.durableObjectDurationGbSeconds)} |`,
+				`| SQL rows read | ${share(usage.sqlRowsRead, daily.sqlRowsRead)} |`,
+				`| SQL rows written | ${share(usage.sqlRowsWritten, daily.sqlRowsWritten)} |`,
+				`| Stored | ${mib(usage.storedBytes)} / ${mib(ACCOUNT_USAGE_POLICY.freeStoredBytes)} |`,
 			);
 		} else {
 			lines.push("**Cloudflare account**: no usage sample; set `ACCOUNT_ID` and `ACCOUNT_ANALYTICS_TOKEN` to read it.");
 		}
 		lines.push(
 			"",
-			`**Demo budgets, ${budget.day}**: reserved by this object / budget`,
+			`**Demo budgets, ${budget.day}** (reserved by this object)`,
 			"",
-			`- SQL rows read: ${share(budget.reads, limits.sqlReadsPerDay)}`,
-			`- SQL rows written: ${share(budget.writes, limits.sqlWritesPerDay)}`,
-			`- Frames: ${share(budget.frames, limits.processedFramesPerDay)}`,
-			`- Connection admissions: ${share(budget.admissions, limits.connectionAdmissionsPerDay)}`,
-			`- Posts: ${share(budget.posts, limits.globalPostsPerDay)}`,
-			`- Registrations: ${share(budget.registrations, limits.registrationsPerDay)}`,
-			`- Registered users: ${share(identities, limits.registeredIdentityCount)}`,
-			`- Open connections: ${share(this.ctx.getWebSockets().length, limits.openConnections)}`,
-			`- Database: ${databaseBytes === null ? "unknown" : mib(databaseBytes)} / ${mib(limits.databaseHardTargetBytes)}`,
+			"| | Reserved / Budget |",
+			"|---|---|",
+			`| SQL rows read | ${share(budget.reads, limits.sqlReadsPerDay)} |`,
+			`| SQL rows written | ${share(budget.writes, limits.sqlWritesPerDay)} |`,
+			`| Frames | ${share(budget.frames, limits.processedFramesPerDay)} |`,
+			`| Connection admissions | ${share(budget.admissions, limits.connectionAdmissionsPerDay)} |`,
+			`| Posts | ${share(budget.posts, limits.globalPostsPerDay)} |`,
+			`| Registrations | ${share(budget.registrations, limits.registrationsPerDay)} |`,
+			`| Registered users | ${share(identities, limits.registeredIdentityCount)} |`,
+			`| Open connections | ${share(this.ctx.getWebSockets().length, limits.openConnections)} |`,
+			`| Database | ${databaseBytes === null ? "unknown" : mib(databaseBytes)} / ${mib(limits.databaseHardTargetBytes)} |`,
 		);
 		this.sendNotice(socket, roomId, lines.join("\n"));
 		this.reply(socket, request, {});

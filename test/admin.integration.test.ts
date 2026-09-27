@@ -142,11 +142,9 @@ it('/status sends the caller the Cloudflare usage and the demo budgets', async (
 		expect(status.notice!.params.body.format).toBe('markdown');
 		// Tests configure no account analytics, so only the object's budgets show.
 		expect(text).toContain('no usage sample');
-		// Plain CommonMark: bullet lists, since clients need not render tables.
-		expect(text).not.toContain('|');
-		expect(text).toMatch(/^- SQL rows written: [\d,]+ \/ 80,000 \(\d+%\)$/m);
-		expect(text).toMatch(/^- Registered users: [\d,]+ \/ 10,000/m);
-		expect(text).toMatch(/^- Database: /m);
+		expect(text).toMatch(/\| SQL rows written \| [\d,]+ \/ 80,000 \(\d+%\) \|/);
+		expect(text).toMatch(/\| Registered users \| [\d,]+ \/ 10,000/);
+		expect(text).toContain('| Database |');
 	} finally { admin.close(); }
 });
 
