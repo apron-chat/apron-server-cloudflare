@@ -80,13 +80,13 @@ describe('configuration policy boundaries', () => {
 		expect(loaded.limits.historyMaxLimit).toBe(49);
 	});
 
-	it('takes an optional ADMIN_TOKEN that is long, token-safe, and not a bot token', () => {
+	it('takes an optional APRON_ADMIN_TOKEN that is long, token-safe, and not a bot token', () => {
 		expect(config().adminToken).toBeUndefined();
-		expect(config({ ADMIN_TOKEN: '' }).adminToken).toBeUndefined();
-		expect(config({ ADMIN_TOKEN: 'demo-token-0123456789abcdef' }).adminToken).toBe('demo-token-0123456789abcdef');
-		expect(() => config({ ADMIN_TOKEN: 'too-short' })).toThrow(ConfigError);
-		expect(() => config({ ADMIN_TOKEN: 'has spaces in it 0123456789' })).toThrow(ConfigError);
-		expect(() => config({ ADMIN_TOKEN: 'apron_bot_0123456789abcdefghij' })).toThrow(ConfigError);
+		expect(config({ APRON_ADMIN_TOKEN: '' }).adminToken).toBeUndefined();
+		expect(config({ APRON_ADMIN_TOKEN: 'demo-token-0123456789abcdef' }).adminToken).toBe('demo-token-0123456789abcdef');
+		expect(() => config({ APRON_ADMIN_TOKEN: 'too-short' })).toThrow(ConfigError);
+		expect(() => config({ APRON_ADMIN_TOKEN: 'has spaces in it 0123456789' })).toThrow(ConfigError);
+		expect(() => config({ APRON_ADMIN_TOKEN: 'apron_bot_0123456789abcdefghij' })).toThrow(ConfigError);
 	});
 
 	it('rejects unsafe payload, queue, history, and maintenance combinations', () => {

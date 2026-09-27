@@ -621,7 +621,7 @@ const CARRIED_PASSKEY_COST = { reads: 4, writes: 8 } as const;
 /**
  * The registered users made admins with `/admin`, as a JSON list of
  * `user_id`s. Absent means none: the row is additive, so schema 4 objects need
- * no reset for it. The `ADMIN_TOKEN` user is an admin without being listed.
+ * no reset for it. The `APRON_ADMIN_TOKEN` user is an admin without being listed.
  */
 const META_ADMINS = "admins";
 /** Most users `/admin` may list, so the list stays one small `_meta` row. */
@@ -2698,7 +2698,7 @@ export class Store {
   }
 
   /**
-   * The admin user that `ADMIN_TOKEN` signs in as: a registered identity with
+   * The admin user that `APRON_ADMIN_TOKEN` signs in as: a registered identity with
    * no credential, created on first use like a bot, against the same caps.
    * `created` is false when it already exists.
    */

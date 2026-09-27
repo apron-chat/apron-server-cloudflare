@@ -209,7 +209,7 @@ it('lets a bot send auth and a post together before the server frame, and retry 
 	} finally { owner.close(); }
 });
 
-it('signs in as the admin user with ADMIN_TOKEN from anywhere, once it is set', async () => {
+it('signs in as the admin user with APRON_ADMIN_TOKEN from anywhere, once it is set', async () => {
 	await guestsReadOnly();
 	const adminToken = 'admin-token-0123456789abcdef';
 	const withAdminToken = (value: string | undefined) => runInDurableObject(stub(), (instance) => {

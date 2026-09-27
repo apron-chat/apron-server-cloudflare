@@ -98,7 +98,7 @@ const MAX_ATTACHED_ROOMS = 2 * (MAX_THREAD_LIMIT + 1);
 /**
  * The commands this server provides (§4.8), as `/help` lists them to those
  * who may run them: `everyone`, `owners` (registered users other than bots),
- * or `admins` (the `ADMIN_TOKEN` user and those `/admin` made admins).
+ * or `admins` (the `APRON_ADMIN_TOKEN` user and those `/admin` made admins).
  */
 const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audience: "everyone" | "owners" | "admins" }> = [
 	{ name: "help", usage: "/help", help: "list the commands you can use here", audience: "everyone" },
@@ -117,7 +117,7 @@ const GUEST_READ_ONLY = "Guests can only read here; sign in with a passkey to po
  */
 const BOT_ID_PREFIX = "bot_";
 /**
- * The registered user `ADMIN_TOKEN` signs in as, always an admin. Registered
+ * The registered user `APRON_ADMIN_TOKEN` signs in as, always an admin. Registered
  * users are `<name>_<digits>` or `u_…`, so no passkey user can take this id.
  */
 const ADMIN_USER_ID = "admin";
@@ -1269,7 +1269,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Signs in as the admin user with `ADMIN_TOKEN`, without a passkey. Like a
+	 * Signs in as the admin user with `APRON_ADMIN_TOKEN`, without a passkey. Like a
 	 * bot token it is taken from any origin; the user is a registered one,
 	 * created on first use, that can post, run `/invite-bot`, and run the admin
 	 * commands.
