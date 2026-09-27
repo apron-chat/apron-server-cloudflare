@@ -187,6 +187,12 @@ export interface StoreConfig {
   storageLowWaterBytes: number;
   /** Optional operator switch. */
   admissionEnabled: boolean;
+  /**
+   * Keep `og` media (`image`, `video`, `audio`) that point at other servers.
+   * Off: every viewer's client would load a URL the sender chose, and this
+   * server hosts and proxies no media of its own (§4.6.1).
+   */
+  ogRemoteMedia: boolean;
   /** Conservative row-cost estimate for one foreground mutation. */
   mutationCost: CostEstimate;
   /** Conservative row-cost estimate for one history read. */
@@ -257,6 +263,7 @@ const DEFAULT_CONFIG: StoreConfig = {
   storageHardTargetBytes: DEFAULT_LIMITS.databaseHardTargetBytes,
   storageLowWaterBytes: DEFAULT_LIMITS.databaseResumeLowWaterBytes,
   admissionEnabled: true,
+  ogRemoteMedia: false,
   // These bounds include the reservation row and worst-case indexed control
   // updates for one accepted operation; calibrated workloads may lower them
   // only after observing cursor counts.
@@ -763,26 +770,66 @@ function recordedUser(userId: string, name: string | null | undefined): Identity
  * The text an embed's `og` may carry, with its longest kept length in code
  * points. Clients build `og` themselves (such as link previews), and the
  * server has the last word on it (§4.6.1): it keeps these fields as one line
- * of plain text and drops the rest. Media go too, since this server neither
- * hosts nor proxies them and clients load none from other origins.
+ * of plain text and drops the rest. Media are kept only with `ogRemoteMedia`.
  */
 const OG_TEXT_FIELDS: Record<string, number> = { title: 256, description: 512, site_name: 128 };
+const OG_MEDIA_FIELDS = ["image", "video", "audio"] as const;
+const OG_MEDIA_URL_BYTES = 2_048;
+const OG_MEDIA_TYPE_BYTES = 128;
+const OG_MEDIA_ALT_CODE_POINTS = 512;
+const OG_MEDIA_MAX_DIMENSION = 16_384;
 
 /** Control, bidirectional override, and line or paragraph separator characters. */
 const OG_UNSAFE_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
 
-/** `embed` with its `og` reduced to kept text fields, or without `og` when none is left. */
-function withCleanOg(embed: Record<string, unknown>): Record<string, unknown> {
+/** `value` as one line of plain text of at most `max` code points, or undefined when empty. */
+function ogLine(value: unknown, max: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const line = value.replace(OG_UNSAFE_CHARACTERS, " ").replace(/\s+/g, " ").trim();
+  const points = [...line];
+  if (!points.length) return undefined;
+  return points.length > max ? `${points.slice(0, max - 1).join("").trimEnd()}…` : line;
+}
+
+/** An `og` media object with an absolute http(s) `url` and bounded details, or undefined. */
+function ogMedia(value: unknown): Record<string, unknown> | undefined {
+  if (!isPlainObject(value) || typeof value.url !== "string" || utf8Bytes(value.url) > OG_MEDIA_URL_BYTES) return undefined;
+  let url: URL;
+  try {
+    url = new URL(value.url);
+  } catch {
+    return undefined;
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") return undefined;
+  const media: Record<string, unknown> = { url: url.href };
+  if (typeof value.type === "string" && /^[\w.+-]+\/[\w.+-]+$/.test(value.type) && value.type.length <= OG_MEDIA_TYPE_BYTES) media.type = value.type;
+  for (const field of ["width", "height"] as const) {
+    const size = value[field];
+    if (Number.isInteger(size) && (size as number) > 0 && (size as number) <= OG_MEDIA_MAX_DIMENSION) media[field] = size;
+  }
+  const alt = ogLine(value.alt, OG_MEDIA_ALT_CODE_POINTS);
+  if (alt) media.alt = alt;
+  return media;
+}
+
+/**
+ * `embed` with its `og` reduced to kept text fields, plus media when
+ * `remoteMedia` allows them, or without `og` when nothing is left.
+ */
+function withCleanOg(embed: Record<string, unknown>, remoteMedia: boolean): Record<string, unknown> {
   if (embed.og === undefined) return embed;
   const { og, ...rest } = embed;
-  const clean: Record<string, string> = {};
+  const clean: Record<string, unknown> = {};
   if (isPlainObject(og)) {
     for (const [field, max] of Object.entries(OG_TEXT_FIELDS)) {
-      const value = og[field];
-      if (typeof value !== "string") continue;
-      const line = value.replace(OG_UNSAFE_CHARACTERS, " ").replace(/\s+/g, " ").trim();
-      const points = [...line];
-      if (points.length) clean[field] = points.length > max ? `${points.slice(0, max - 1).join("").trimEnd()}…` : line;
+      const line = ogLine(og[field], max);
+      if (line) clean[field] = line;
+    }
+    if (remoteMedia) {
+      for (const field of OG_MEDIA_FIELDS) {
+        const media = ogMedia(og[field]);
+        if (media) clean[field] = media;
+      }
     }
   }
   return Object.keys(clean).length ? { ...rest, og: clean } : rest;
@@ -2659,7 +2706,7 @@ export class Store {
       }
       mentions = [...unique];
     }
-    return { ...clone(body), text, format, embeds: (clone(embeds) as Record<string, unknown>[]).map(withCleanOg), ...(mentions ? { mentions } : {}) };
+    return { ...clone(body), text, format, embeds: (clone(embeds) as Record<string, unknown>[]).map((embed) => withCleanOg(embed, this.config.ogRemoteMedia)), ...(mentions ? { mentions } : {}) };
   }
 
   /** A new message with no text and no embeds, which is neither logged nor broadcast (§3.5). */

@@ -103,6 +103,29 @@ it("keeps an embed's og as plain text fields and drops the rest", async () => {
 	});
 });
 
+it("keeps og media from other servers only with ogRemoteMedia", async () => {
+	await withStore("og-media", (store, clock) => {
+		const created = post(store, clock, "alice", "ogm1", {
+			body: {
+				text: "look",
+				embeds: [{
+					kind: "link", url: "https://example.com",
+					og: {
+						title: "Example",
+						image: { url: "https://cdn.example/a.png", type: "image/png", width: 320, height: -1, alt: "An\nexample", extra: true },
+						video: { url: "javascript:alert(1)" },
+						audio: "https://cdn.example/a.mp3",
+					},
+				}],
+			},
+		});
+		expect((created.message?.body?.embeds as unknown[])[0]).toEqual({
+			kind: "link", url: "https://example.com",
+			og: { title: "Example", image: { url: "https://cdn.example/a.png", type: "image/png", width: 320, alt: "An example" } },
+		});
+	}, { ...ROOMY, ogRemoteMedia: true });
+});
+
 it("broadcasts flat self-describing snapshots and enforces replacement semantics", async () => {
 	await withStore("edits", (store, clock) => {
 		const created = post(store, clock, "alice", "m1", {

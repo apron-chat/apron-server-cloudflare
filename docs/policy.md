@@ -62,8 +62,12 @@ within it:
   non-empty string `kind`; other fields are stored as sent, except `og`, which
   keeps only `title` (256 code points), `description` (512), and `site_name`
   (128) as single-line text with control and bidirectional override characters
-  removed, truncated with `…`. Media and other `og` properties are dropped,
-  since the demo hosts no media, and an `og` left empty is removed. The server
+  removed, truncated with `…`. Media (`image`, `video`, `audio`) are dropped
+  because the demo hosts no media and viewers would otherwise load a URL the
+  sender chose; the store's `ogRemoteMedia` setting (off, not yet exposed as
+  an environment variable) keeps those with an absolute http(s) `url` and
+  bounded `type`, `width`, `height`, and `alt`. Other `og` properties are
+  dropped, and an `og` left empty is removed. The server
   never fetches embed URLs. Author-only edit, delete, restore, and move. `reply_to` and
   `intro_message` must name a retained message when set or changed; resubmitting
   an unchanged reference stays valid after its target expires, and expiration
