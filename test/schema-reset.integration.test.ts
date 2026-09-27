@@ -63,9 +63,9 @@ for (const storedVersion of [SCHEMA_VERSION - 1, SCHEMA_VERSION + 1]) {
 				'SELECT reads_reserved, writes_reserved FROM resource_budgets WHERE day = ?', day,
 			).one();
 			// The day's metered reservations survive, plus the bootstrap charge
-			// and the carried passkeys' rows.
-			expect(budget.reads_reserved).toBeGreaterThanOrEqual(before.reads_reserved + BOOTSTRAP_ROW_RESERVATION + 2 * 4);
-			expect(budget.writes_reserved).toBeGreaterThanOrEqual(before.writes_reserved + BOOTSTRAP_ROW_RESERVATION + 2 * 8);
+			// and the rows the passkey carry read and wrote.
+			expect(budget.reads_reserved).toBeGreaterThan(before.reads_reserved + BOOTSTRAP_ROW_RESERVATION);
+			expect(budget.writes_reserved).toBeGreaterThan(before.writes_reserved + BOOTSTRAP_ROW_RESERVATION);
 			expect(store.accountingStatus().unsafe).toBe(false);
 			const posted = store.mutate({
 				userId: 'guest_after', ipKey: 'reset-ip-2', requestId: 'after', method: 'message', now: Date.now(),

@@ -613,12 +613,6 @@ const META_GUEST_NUMBER_MARK = "guest_number_mark";
  */
 export const MAX_CARRIED_PASSKEYS = 100;
 /**
- * Rows one carried passkey may read and write: the identity, credential and
- * `general` membership reads before the wipe, and the same rows with their
- * indexes written back afterwards.
- */
-const CARRIED_PASSKEY_COST = { reads: 4, writes: 8 } as const;
-/**
  * The registered users made admins with `/admin`, as a JSON list of
  * `user_id`s. Absent means none: the row is additive, so schema 4 objects need
  * no reset for it. The `APRON_ADMIN_TOKEN` user is an admin without being listed.
@@ -1058,8 +1052,8 @@ export class Store {
    * recently used are read before the wipe and written back, with their
    * identities (same `user_id`, name, and WebAuthn user handle) and their
    * `general` membership, so users sign in again with the passkey they have
-   * rather than deleting it and registering anew. Their rows are charged to
-   * the day's maintenance reservation below, and those of them `/admin`
+   * rather than deleting it and registering anew. The rows the carry reads
+   * and writes are charged to the day's maintenance reservation below, and those of them `/admin`
    * listed stay admins. Older passkeys past the cap, bots, and every session
    * are dropped.
    *
@@ -1097,7 +1091,11 @@ export class Store {
     } catch {
       // An unreadable old meta table carries no guest numbers.
     }
+    // The carry's reads and writes are measured, not estimated: finding the
+    // most recent passkeys reads every credential and its identity.
+    const carryStart = { reads: this.observed.reads, writes: this.observed.writes };
     const passkeys = this.readCarriedPasskeys();
+    const carryReads = this.observed.reads - carryStart.reads;
     let admins: string[] = [];
     try {
       admins = this.adminIds();
@@ -1117,13 +1115,17 @@ export class Store {
       // budget row, this is one uncharged control write.
       this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_GUEST_NUMBER_MARK, String(guestNumberMark));
     }
+    const writeStart = { reads: this.observed.reads, writes: this.observed.writes };
     if (passkeys.length) this.writeCarriedPasskeys(passkeys);
     // Admins whose passkeys were carried stay admins: one control write.
     const carriedIds = new Set(passkeys.map((row) => row.user_id));
     const carriedAdmins = admins.filter((id) => carriedIds.has(id));
     if (carriedAdmins.length) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ADMINS, JSON.stringify(carriedAdmins));
-    const carryCost = { reads: passkeys.length * CARRIED_PASSKEY_COST.reads, writes: passkeys.length * CARRIED_PASSKEY_COST.writes };
-    if (!carried && !passkeys.length) return;
+    const carryCost = {
+      reads: carryReads + this.observed.reads - writeStart.reads,
+      writes: this.observed.writes - writeStart.writes,
+    };
+    if (!carried && !carryCost.reads && !carryCost.writes) return;
     const columns = ["reads_reserved", "writes_reserved", "frames_reserved", "admissions_reserved", "posts_reserved",
       "registrations_reserved", "foreground_reads", "foreground_writes", "maintenance_reads", "maintenance_writes"] as const;
     const values = columns.map((column) => {
@@ -2004,7 +2006,9 @@ export class Store {
     this.ensureReady();
     const now = input.now ?? this.clock.now();
     const membershipRows = MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS;
-    return this.reserved({ reads: 64 + membershipRows + this.userRoomsReads(), writes: 32 + 4 * membershipRows }, false, now, () => this.transaction(() => {
+    // Moving a membership row reads its index entry and row (measured: about
+    // 2 reads and 3 writes each), before the user's rooms are read back.
+    return this.reserved({ reads: 64 + 4 * membershipRows + this.userRoomsReads(), writes: 32 + 4 * membershipRows }, false, now, () => this.transaction(() => {
       const identity = this.identityRow(input.from);
       if (!identity || identity.tier !== "registered") throw new StoreError("invalid_params", `No registered user has the user_id ${input.from}`.slice(0, 200));
       if (this.idTaken(input.to)) throw new StoreError("invalid_params", `The user_id ${input.to} is taken`.slice(0, 200));
