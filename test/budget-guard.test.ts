@@ -2,8 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import { createExecutionContext, createScheduledController, env as testEnv, waitOnExecutionContext } from "cloudflare:test";
 import worker from "../src/index";
 import * as guard from "../src/budget-guard";
-import { ACCOUNT_USAGE_POLICY } from "../src/budget";
-import { EDGE_STOP_RULE_REF, runBudgetGuard } from "../src/budget-guard";
+import { ACCOUNT_USAGE_POLICY as POLICY, PLAN } from "../src/budget";
+import { EDGE_STOP_RULE_REF, resetFloodWatch, runBudgetGuard, watchForFlood } from "../src/budget-guard";
 
 const env = { ACCOUNT_ID: "account", ACCOUNT_ANALYTICS_TOKEN: "analytics", ZONE_ID: "zone", EDGE_STOP_TOKEN: "edge" };
 const rule = { id: "rule-1", ref: EDGE_STOP_RULE_REF, action: "block", expression: 'http.host eq "server.apron.chat"', description: "Apron: budget stop" };
@@ -42,7 +42,7 @@ function api({ workerRequests = 1, enabled = false, rules, analyticsStatus = 200
 	return { fetcher: fetcher as unknown as typeof fetch, updates, calls: fetcher.mock.calls };
 }
 
-const overDaily = ACCOUNT_USAGE_POLICY.daily.workerRequests;
+const overDaily = POLICY.daily.workerRequests;
 
 describe("budget guard", () => {
 	it("turns the edge stop on once usage reaches an allowance, keeping the rule as it was", async () => {
@@ -63,6 +63,17 @@ describe("budget guard", () => {
 			expect(await runBudgetGuard(env, Date.now(), fetcher)).toMatchObject({ outcome: "unchanged", stop: enabled });
 			expect(updates).toEqual([]);
 		}
+	});
+
+	it.runIf(PLAN.edgeStop)("holds a stop turned on less than holdSeconds ago, then lifts it", async () => {
+		const now = Date.parse("2026-09-27T12:00:00Z");
+		const hold = PLAN.edgeStop!.holdSeconds * 1_000;
+		const recent = api({ rules: [{ ...rule, enabled: true, last_updated: new Date(now - hold + 60_000).toISOString() }] });
+		expect(await runBudgetGuard(env, now, recent.fetcher)).toMatchObject({ outcome: "held", stop: false });
+		expect(recent.updates).toEqual([]);
+		const old = api({ rules: [{ ...rule, enabled: true, last_updated: new Date(now - hold).toISOString() }] });
+		expect(await runBudgetGuard(env, now, old.fetcher)).toMatchObject({ outcome: "changed", stop: false });
+		expect(old.updates).toEqual([expect.objectContaining({ enabled: false })]);
 	});
 
 	it("reads a rule without enabled as enabled", async () => {
@@ -98,5 +109,59 @@ describe("budget guard", () => {
 			// Tests configure no zone or tokens.
 			await expect(run.mock.results[0].value).resolves.toEqual({ outcome: "unconfigured" });
 		} finally { run.mockRestore(); }
+	});
+});
+
+// Only a plan that bills past its included usage, like Workers Paid, has an edge stop.
+describe.runIf(PLAN.edgeStop)("flood trip", () => {
+	const policy = PLAN.edgeStop!;
+
+	/** Runs watchForFlood once and waits for its work after the response. */
+	async function watch(opts: { random: number; success?: boolean; now?: number; fetcher?: typeof fetch; limiter?: RateLimit | undefined }) {
+		const limit = vi.fn(async () => ({ success: opts.success ?? true }));
+		const pending: Promise<unknown>[] = [];
+		const { fetcher } = opts.fetcher ? { fetcher: opts.fetcher } : api();
+		const floodEnv = { ...env, FLOOD_WATCH: "limiter" in opts ? opts.limiter : { limit } as unknown as RateLimit };
+		watchForFlood(floodEnv, { waitUntil: (promise) => { pending.push(promise); } }, opts.now ?? Date.now(), () => opts.random, fetcher);
+		await Promise.all(pending);
+		return { limit, pending };
+	}
+
+	it("counts one request in floodSampleEvery, after the response", async () => {
+		resetFloodWatch();
+		const counted = await watch({ random: 0.99 / policy.floodSampleEvery });
+		expect(counted.limit).toHaveBeenCalledWith({ key: "requests" });
+		const skipped = await watch({ random: 1 / policy.floodSampleEvery });
+		expect(skipped.limit).not.toHaveBeenCalled();
+		expect(skipped.pending).toEqual([]);
+	});
+
+	it("turns the edge stop on at once past the limit, and each isolate tries once a minute", async () => {
+		resetFloodWatch();
+		const now = Date.parse("2026-09-27T12:00:00Z");
+		const first = api();
+		await watch({ random: 0, success: false, now, fetcher: first.fetcher });
+		expect(first.updates).toEqual([expect.objectContaining({ enabled: true })]);
+		const soon = api();
+		const again = await watch({ random: 0, success: false, now: now + 59_000, fetcher: soon.fetcher });
+		expect(again.limit).not.toHaveBeenCalled();
+		const later = api();
+		await watch({ random: 0, success: false, now: now + 60_000, fetcher: later.fetcher });
+		expect(later.updates).toHaveLength(1);
+	});
+
+	it("does nothing under the limit or without its binding", async () => {
+		resetFloodWatch();
+		const under = api();
+		await watch({ random: 0, success: true, fetcher: under.fetcher });
+		expect(under.calls).toHaveLength(0);
+		const unbound = await watch({ random: 0, limiter: undefined });
+		expect(unbound.pending).toEqual([]);
+	});
+
+	it("is sized so ordinary traffic cannot trip it", () => {
+		// A quarter of a day's admissions, arriving at one location in one minute, stays under it.
+		expect(policy.floodRequestsPerColoMinute).toBeGreaterThan(PLAN.limits.connectionAdmissionsPerDay / 4);
+		expect(policy.holdSeconds).toBeGreaterThanOrEqual(15 * 60);
 	});
 });

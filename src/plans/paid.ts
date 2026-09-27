@@ -24,10 +24,11 @@
 // - Storage: unchanged; the database watermarks stay far below 5 GB.
 //
 // None of that bounds hostile traffic that never gets past the entry Worker,
-// which is billed per request. The budget guard (src/budget-guard.ts) checks
-// account usage every minute and turns on an edge block rule, which stops
-// requests before they invoke the Worker, when usage reaches the daily share
-// or `monthlyStopRatio` of the month's included usage.
+// which is billed per request. An edge block rule stops requests before they
+// invoke the Worker (src/budget-guard.ts). The Worker turns it on within
+// seconds of a flood; the budget guard, every minute, turns it on when usage
+// reaches the daily share or `monthlyStopRatio` of the month's included
+// usage, and off once usage is back under every allowance.
 import type { Plan } from "../budget.ts";
 import { FREE_PLAN } from "./free.ts";
 
@@ -92,6 +93,18 @@ export const PAID_PLAN: Plan = Object.freeze({
 			logEvents: 20_000_000,
 		}),
 		monthlyStopRatio: 0.5,
+	}),
+	edgeStop: Object.freeze({
+		// Legitimate traffic is a few hundred requests a day in all, so 20 a
+		// second at one location is a flood. Spread thinner than that over every
+		// location, an attack stays within what the minute guard stops in time.
+		floodRequestsPerColoMinute: 1_200,
+		// Sampling keeps the per-request cost to one random number; the rate
+		// limiter counts 60 sampled requests a minute.
+		floodSampleEvery: 20,
+		// Long enough for analytics to show the flood, so the guard's daily or
+		// monthly stop takes over before the hold ends.
+		holdSeconds: 30 * 60,
 	}),
 	features: Object.freeze({
 		// Typing costs about 5 frames a typing minute, inside the frame budget.

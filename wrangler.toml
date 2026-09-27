@@ -30,4 +30,8 @@ ALLOWED_ORIGINS = "http://localhost:5173,http://localhost:8787"
 name = "CONNECTION_ATTEMPTS"
 namespace_id = "73001"
 simple = { limit = 10, period = 60 }
+[[ratelimits]]
+name = "FLOOD_WATCH"
+namespace_id = "73003"
+simple = { limit = 60, period = 60 }
 # END GENERATED ADMISSION BUDGET

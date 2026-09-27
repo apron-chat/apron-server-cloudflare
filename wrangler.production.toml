@@ -10,6 +10,9 @@ routes = [
 
 [observability]
 enabled = true
+# Every request writes a log event, billed past 20 million a month; keep one
+# in ten so a flood costs mostly its requests.
+head_sampling_rate = 0.1
 
 # The deployed version, shown in the welcome each connection gets.
 [version_metadata]
@@ -43,4 +46,8 @@ crons = ["* * * * *"]
 name = "CONNECTION_ATTEMPTS"
 namespace_id = "73002"
 simple = { limit = 10, period = 60 }
+[[ratelimits]]
+name = "FLOOD_WATCH"
+namespace_id = "73004"
+simple = { limit = 60, period = 60 }
 # END GENERATED ADMISSION BUDGET

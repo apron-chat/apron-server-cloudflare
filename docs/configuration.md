@@ -118,6 +118,20 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
 - If usage or the rule cannot be read, the rule keeps its state and the guard
   logs an error (`budget_guard_*` events). It never turns the stop off
   without a successful reading.
+- **Flood trip.** Analytics arrive minutes late, so the Worker also watches
+  for floods itself. On every request it picks a random number; one request
+  in `floodSampleEvery` (20) is counted, after the response, against the
+  `FLOOD_WATCH` rate limiter, which allows `floodRequestsPerColoMinute / floodSampleEvery`
+  (60) a minute at each Cloudflare location. Past it, that Worker turns the
+  rule on at once. Counting writes nothing; the one write is turning the rule
+  on, and each isolate tries at most once a minute. The guard then keeps the
+  rule on for at least `holdSeconds` (30 minutes) after it was turned on,
+  long enough for analytics to show the flood and the daily or monthly stop
+  to take over. These settings are in the plan's `edgeStop`.
+- **Log sampling.** Every invocation writes a Workers Logs event, billed past
+  20 million a month at twice the request price, so production keeps one in
+  ten (`head_sampling_rate = 0.1`). The guard's `logEvents` count every
+  invocation, so it stops early on logs rather than late.
 
 Set it up once per deployment:
 
@@ -137,11 +151,20 @@ live rule; check the Worker's logs for `budget_guard_unconfigured` or
 
 What the guard cannot promise:
 
-- **Detection lag.** Analytics arrive a few minutes late, and the rule acts
-  within a minute after that. Exceeding the included usage would take an
-  attack that delivers about half a month's allowance (5 million Worker
-  requests) inside that window: about 14,000 requests a second for six
-  minutes, past Cloudflare's own DDoS mitigation.
+- **A few seconds of every flood are billed.** A request past the included
+  usage costs about $0.38 a million (request $0.30, a tenth of a log event
+  $0.06, about a millisecond of CPU $0.02). Each calendar month stops at half
+  its allowance plus whatever arrives before the stop takes effect, so a
+  billing cycle that straddles two calendar months can be billed for two such
+  windows. A flood is stopped within the rate limiter's detection (1,200
+  requests at one location, a second or less at flood rates) plus the rule
+  change reaching the edge, taken here as 30 seconds: at 100,000 requests a
+  second, two windows cost about $2.30, and the cost grows with the rate.
+  An attack spread thinly enough to stay under 20 requests a second at every
+  location (a few thousand a second in all) is left to the minute guard and
+  its analytics lag of about six minutes: about $1.80 for two windows. These
+  are worst cases for sustained attacks that Cloudflare's own DDoS mitigation
+  does not catch.
 - **Open sockets.** The edge rule stops new requests, not WebSockets already
   open. The Durable Object's own account-usage stop closes them when it next
   refreshes, and its per-connection limits bound them until then.

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ADMISSION_BUDGET, DEFAULT_LIMITS } from '../src/budget.ts';
-import { renderBinding, renderEdgeRules, replaceBinding, validateAdmission, validateDeploymentConfiguration } from './budget.mjs';
+import { renderBinding, renderEdgeRules, replaceBinding, validateAdmission, validateDeploymentConfiguration, validateEdgeStop } from './budget.mjs';
 
 test('changed admission limits propagate to both Worker and optional edge policy', () => {
 	const changed = { ...ADMISSION_BUDGET, requestsPerIpMinute: 25, edgeRequestsPerIpWindow: 20 };
@@ -108,4 +108,14 @@ test('a plan that bills past its included usage requires the budget guard cron a
 	assert.throws(() => check(base + zone), /every minute/);
 	assert.throws(() => check(base + zone + '[triggers]\ncrons = ["*/5 * * * *"]\n'), /every minute/);
 	assert.throws(() => check(base + cron), /ZONE_ID/);
+});
+
+test('a plan with an edge stop also generates the sampled flood counter', () => {
+	const edgeStop = { floodRequestsPerColoMinute: 1200, floodSampleEvery: 20, holdSeconds: 1800 };
+	const binding = renderBinding('123', ADMISSION_BUDGET, { namespace: '456', edgeStop });
+	assert.match(binding, /name = "CONNECTION_ATTEMPTS"\nnamespace_id = "123"/);
+	assert.match(binding, /name = "FLOOD_WATCH"\nnamespace_id = "456"\nsimple = \{ limit = 60, period = 60 \}/);
+	assert.doesNotMatch(renderBinding('123'), /FLOOD_WATCH/);
+	assert.throws(() => validateEdgeStop({ ...edgeStop, floodSampleEvery: 7 }), /whole number/);
+	assert.throws(() => validateEdgeStop({ ...edgeStop, holdSeconds: 0 }));
 });

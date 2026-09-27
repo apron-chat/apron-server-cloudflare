@@ -169,12 +169,26 @@ export interface Features {
 	guestPosting: boolean;
 }
 
+/**
+ * The edge stop for a plan that bills past its included usage. The Worker
+ * trips it on a flood; the budget guard holds and lifts it.
+ */
+export interface EdgeStop {
+	/** Requests one Cloudflare location may pass to the Worker in a minute before the Worker trips the stop. */
+	floodRequestsPerColoMinute: number;
+	/** The Worker counts one request in this many, chosen at random, against that limit. */
+	floodSampleEvery: number;
+	/** The budget guard keeps the stop on at least this long after it was turned on. */
+	holdSeconds: number;
+}
+
 export interface Plan {
 	name: string;
 	limits: Readonly<Limits>;
 	admission: Readonly<AdmissionBudget>;
 	account: Readonly<AccountAllowance>;
 	features: Readonly<Features>;
+	edgeStop?: Readonly<EdgeStop>;
 }
 
 // Match the account's Workers plan. To switch back to Free, import FREE_PLAN

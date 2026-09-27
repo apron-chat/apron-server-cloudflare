@@ -3,7 +3,7 @@ import { AuthError, AuthTooLargeError, WebAuthnService, type ChallengeRecord, ty
 import { isAllowedOrigin, loadConfig, type RuntimeConfig } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, MAX_FRAME_LEASE, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE } from "./budget";
 import { fetchAccountUsage, type AccountUsageSnapshot } from "./account-usage";
-import { runBudgetGuard } from "./budget-guard";
+import { runBudgetGuard, watchForFlood } from "./budget-guard";
 import { extractClientIp, hashIpKey, stripForwardingHeaders } from "./ip";
 import {
 	errorFromUnknown,
@@ -491,7 +491,9 @@ function isConnectionStatus(request: Request): boolean {
 	return request.method === "GET" && new URL(request.url).searchParams.get("apron_connection_status") === "1" && !isUpgrade(request);
 }
 
-export async function fetchEntry(request: Request, env: Env): Promise<Response> {
+export async function fetchEntry(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
+	// Every request the Worker sees is billed, whatever it answers.
+	watchForFlood(env, ctx);
 	const response = await fetchConnection(request, env);
 	if (!isConnectionStatus(request)) return response;
 	const headers = new Headers(response.headers);
