@@ -97,11 +97,16 @@ const PING_RESPONSE = '{"method":"pong"}';
 const MAX_ATTACHED_ROOMS = 2 * (MAX_THREAD_LIMIT + 1);
 /**
  * The commands this server provides (§4.8), as `/help` lists them to those
- * who may run them: `everyone`, or `owners`, registered users other than bots.
+ * who may run them: `everyone`, `owners` (registered users other than bots),
+ * or `admins` (the `APRON_ADMIN_TOKEN` user and those `/admin` made admins).
  */
-const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audience: "everyone" | "owners" }> = [
+const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audience: "everyone" | "owners" | "admins" }> = [
 	{ name: "help", usage: "/help", help: "list the commands you can use here", audience: "everyone" },
 	{ name: "invite-bot", usage: "/invite-bot", help: "get a sign-in token for your bot; a new one replaces the last", audience: "owners" },
+	{ name: "admin", usage: "/admin <user_id>", help: "make a registered user an admin", audience: "admins" },
+	{ name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", audience: "admins" },
+	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
+	{ name: "status", usage: "/status", help: "show today's Cloudflare usage and the demo's budgets", audience: "admins" },
 ];
 /** Why a guest's post, reaction, join, leave, or room change is denied while guests only read. */
 const GUEST_READ_ONLY = "Guests can only read here; sign in with a passkey to post or join rooms";
@@ -111,9 +116,12 @@ const GUEST_READ_ONLY = "Guests can only read here; sign in with a passkey to po
  * `guest_` or `bot_`, so the prefix names bots alone.
  */
 const BOT_ID_PREFIX = "bot_";
-/** The registered user `TEST_TOKEN` signs in as. */
-const TEST_USER_ID = "test_user";
-const TEST_USER_NAME = "Test User";
+/**
+ * The registered user `APRON_ADMIN_TOKEN` signs in as, always an admin. Registered
+ * users are `<name>_<digits>` or `u_…`, so no passkey user can take this id.
+ */
+const ADMIN_USER_ID = "admin";
+const ADMIN_USER_NAME = "Admin";
 /** Bot tokens start with this, so `auth` tells them from passkey session tokens without a storage read. */
 const BOT_TOKEN_PREFIX = "apron_bot_";
 /** Key prefix for bot tokens in key-value storage, by the token's SHA-256 like sessions. */
@@ -1064,7 +1072,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (scheme === "token") {
 			const token = requiredString(params, "token");
-			if (this.config.testToken !== undefined && await sameToken(token, this.config.testToken)) await this.handleTestToken(socket, attachment, request);
+			if (this.config.adminToken !== undefined && await sameToken(token, this.config.adminToken)) await this.handleAdminToken(socket, attachment, request);
 			else if (token.startsWith(BOT_TOKEN_PREFIX)) await this.handleBotToken(socket, attachment, request, token);
 			else await this.handleTokenResume(socket, attachment, request);
 			return;
@@ -1081,7 +1089,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const name = action === "register" ? this.requestedName(params) : undefined;
 			const begun = await this.webAuthn.begin(action, origin, nowMs(), identity ?? undefined, [], attachment.connId, {
 				...(name !== undefined ? { name } : {}),
-				userIdTaken: (userId) => this.store.identityExists(userId),
+				userIdTaken: (userId) => this.store.userIdTaken(userId),
 			});
 			if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
 			attachment.challenge = begun.challenge;
@@ -1261,25 +1269,25 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Signs in as the test user with `TEST_TOKEN`, for local testing without
-	 * a passkey (never set in production). Like a bot token it is taken from any origin; the
-	 * user is a registered one, created on first use, that can post and run
-	 * `/invite-bot`.
+	 * Signs in as the admin user with `APRON_ADMIN_TOKEN`, without a passkey. Like a
+	 * bot token it is taken from any origin; the user is a registered one,
+	 * created on first use, that can post, run `/invite-bot`, and run the admin
+	 * commands.
 	 */
-	private async handleTestToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
+	private async handleAdminToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		return this.withSessionLock(async () => {
 			if (attachment.tier === "registered") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
-			const created = this.store.ensureTestUser({ userId: TEST_USER_ID, name: TEST_USER_NAME, now: nowMs(), ipKey: attachment.ipKey });
+			const created = this.store.ensureAdminUser({ userId: ADMIN_USER_ID, name: ADMIN_USER_NAME, now: nowMs(), ipKey: attachment.ipKey });
 			for (const record of created.broadcasts) this.broadcastRecord(record);
-			const identity = this.store.getIdentity(TEST_USER_ID);
-			if (!identity) throw { name: "internal_error", message: "Test user is missing" } satisfies ProtocolError;
+			const identity = this.store.getIdentity(ADMIN_USER_ID);
+			if (!identity) throw { name: "internal_error", message: "Admin user is missing" } satisfies ProtocolError;
 			await this.signInKeyless(socket, attachment, request, identity);
 		});
 	}
 
 	/**
 	 * Finishes a bearer-token sign-in that has no passkey session behind it
-	 * (a bot or the test user): the connection becomes the identity, and those
+	 * (a bot or the admin user): the connection becomes the identity, and those
 	 * who shared a room with the guest it replaces hear of it.
 	 */
 	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[] }): Promise<void> {
@@ -1792,7 +1800,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * `command` (§4.8): never logged, broadcast, or saved. The demo provides
 	 * `/help`, which replies with a `@private` notice listing the commands the
-	 * sender may run, and `/invite-bot` for registered users. An unknown
+	 * sender may run, `/invite-bot` for registered users, and `/admin`,
+	 * `/kick`, `/rename` and `/status` for admins. An unknown
 	 * command is an error the client shows; it is not a policy violation,
 	 * since people mistype.
 	 */
@@ -1808,7 +1817,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const text = optionalString(body, "text") ?? "";
 		if (!this.roomExists(roomId)) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
 		const line = text.trim();
-		const name = line.startsWith("/") ? line.slice(1).split(/\s/, 1)[0].toLowerCase() : "";
+		const words = line.startsWith("/") ? line.slice(1).split(/\s+/) : [""];
+		const name = words[0].toLowerCase();
 		const command = COMMANDS.find((candidate) => candidate.name === name);
 		if (!command) {
 			const message = line.startsWith("/") ? `Unknown command /${name}; try /help` : "A command starts with /; try /help";
@@ -1819,12 +1829,36 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (command.audience === "owners" && !owner) {
 			throw { name: "denied", message: isBot(attachment.userId) ? `A bot can't use /${name}` : `Sign in with a passkey to use /${name}` } satisfies ProtocolError;
 		}
+		// Admin status is read only for the commands that need it.
+		const admin = owner && (command.audience === "admins" || command.name === "help") && this.isAdmin(attachment.userId!);
+		if (command.audience === "admins" && !admin) throw { name: "denied", message: `Only an admin can use /${name}` } satisfies ProtocolError;
 		if (command.name === "invite-bot") {
 			await this.inviteBot(socket, attachment, request, roomId);
 			return;
 		}
+		if (command.name === "admin" || command.name === "kick" || command.name === "rename") {
+			try {
+				const target = words[1];
+				const argumentCount = command.name === "rename" ? 2 : 1;
+				if (!target || words.length !== argumentCount + 1) throw { name: "invalid_params", message: `Usage: ${command.usage}` } satisfies ProtocolError;
+				if (command.name === "admin") this.grantAdmin(socket, request, roomId, target);
+				else if (command.name === "kick") await this.kick(socket, attachment, request, roomId, target);
+				else this.rename(socket, request, roomId, target, words[2]);
+			} catch (error) {
+				// A mistyped or wrong user_id is an error to show, like an unknown
+				// command, not a policy violation.
+				const protocol = errorToProtocol(error);
+				if (protocol.name !== "invalid_params") throw error;
+				this.fail(socket, request, protocol);
+			}
+			return;
+		}
+		if (command.name === "status") {
+			await this.sendStatus(socket, request, roomId);
+			return;
+		}
 		// The reply a command causes comes before its result (§1).
-		const available = COMMANDS.filter((candidate) => candidate.audience === "everyone" || owner);
+		const available = COMMANDS.filter((candidate) => candidate.audience === "everyone" || (candidate.audience === "owners" && owner) || admin);
 		this.send(socket, {
 			method: "message",
 			params: {
@@ -1833,6 +1867,146 @@ export class ApronDemoServer extends DurableObject<Env> {
 				body: { text: available.map((candidate) => `- \`${candidate.usage}\`: ${candidate.help}`).join("\n"), format: "markdown" },
 			},
 		});
+		this.reply(socket, request, {});
+	}
+
+	/** Whether a registered user may run the admin commands. */
+	private isAdmin(userId: string): boolean {
+		return userId === ADMIN_USER_ID || this.store.isAdmin(userId, nowMs());
+	}
+
+	/** Sends one connection a `@private` markdown notice in a room (Appendix A.1). */
+	private sendNotice(socket: WebSocketConnection, roomId: string, text: string): void {
+		this.send(socket, { method: "message", params: { room_id: roomId, from: { ...PRIVATE_IDENTITY }, body: { text, format: "markdown" } } });
+	}
+
+	/**
+	 * `/admin <user_id>`: lists a registered user (not a bot or guest) as an
+	 * admin. The sender gets a `@private` notice before the result (§1).
+	 */
+	private grantAdmin(socket: WebSocketConnection, request: RequestFrame, roomId: string, userId: string): void {
+		if (userId === ADMIN_USER_ID) throw { name: "invalid_params", message: "The admin user is always an admin" } satisfies ProtocolError;
+		const granted = this.store.grantAdmin({ userId, now: nowMs() });
+		const who = `**${granted.name || userId}** (\`${userId}\`)`;
+		this.sendNotice(socket, roomId, granted.added ? `${who} is now an admin.` : `${who} is already an admin.`);
+		this.reply(socket, request, {});
+	}
+
+	/**
+	 * `/kick <user_id>`: removes a user from the room of the command, as if
+	 * they had left it (§4.3.2): a registered user's leave is stored and
+	 * logged, its membership going to the room's members, and a guest's
+	 * leaves its connections. Either way the user's connections get
+	 * `room_update` `left`; they may join again. The limits charged are the
+	 * admin's. The sender gets a `@private` notice before the result (§1).
+	 */
+	private async kick(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: string): Promise<void> {
+		if (userId === attachment.userId) throw { name: "invalid_params", message: "You can't kick yourself; leave the room instead" } satisfies ProtocolError;
+		const notMember = { name: "invalid_params", message: `${userId} is not in this room`.slice(0, 200) } satisfies ProtocolError;
+		const done = () => {
+			this.sendToUser(userId, roomUpdate("left", { room_id: roomId }));
+			this.sendNotice(socket, roomId, `Removed \`${userId}\` from this room.`);
+			this.reply(socket, request, {});
+		};
+		if (!this.store.identityExists(userId)) {
+			// A guest's rooms live in its connections only.
+			const rooms = this.liveRoomsOf(userId);
+			if (!rooms?.includes(roomId)) throw notMember;
+			this.setRooms(userId, rooms.filter((id) => id !== roomId));
+			done();
+			return;
+		}
+		let changed = false;
+		await this.runMutation(async () => {
+			const change = this.store.changeMembership({ userId, ipKey: attachment.ipKey, roomId, join: false, now: nowMs(), actorId: attachment.userId });
+			// Thrown after the mutation: runMutation treats any other error as fatal.
+			if (!change.changed) return;
+			changed = true;
+			// Delivered while the kicked user is still a member.
+			if (change.membership) this.broadcastRecord(change.membership);
+			this.setRooms(userId, change.rooms);
+			done();
+		});
+		if (!changed) throw notMember;
+	}
+
+	/**
+	 * `/rename <old_user_id> <new_user_id>`: gives a registered user a new
+	 * `user_id` (Store.renameIdentity), retiring the old one. The user's
+	 * connections become the new identity and get `user` `you`, and those who
+	 * share a room with the user get `user` `new` with `old` (protocol §3.3).
+	 * Logged records, sessions, and the user's bot keep the old `user_id`: a
+	 * session for it is `denied`, and the passkey signs in as the new one.
+	 */
+	private rename(socket: WebSocketConnection, request: RequestFrame, roomId: string, from: string, to: string): void {
+		if (from === ADMIN_USER_ID || to === ADMIN_USER_ID) throw { name: "invalid_params", message: "The admin user's user_id is fixed" } satisfies ProtocolError;
+		if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(to) || /^(guest|bot)(_|$)/i.test(to)) {
+			throw { name: "invalid_params", message: "A user_id is 1 to 64 letters, digits, _ or -, starting with a letter or digit, and not guest_ or bot_" } satisfies ProtocolError;
+		}
+		const renamed = this.store.renameIdentity({ from, to, now: nowMs() });
+		for (const peer of this.connectionsOf(from)) {
+			const state = connectionAttachment(peer);
+			if (!state) continue;
+			state.userId = to;
+			writeAttachment(peer, state);
+		}
+		const identity = { user_id: to, ...(renamed.name ? { name: renamed.name } : {}) };
+		const old = { user_id: from, ...(renamed.name ? { name: renamed.name } : {}) };
+		this.announceUser(null, identity, this.liveRoomsOf(to) ?? renamed.rooms, old);
+		this.sendNotice(socket, roomId, `Renamed \`${from}\` to \`${to}\`.`);
+		this.reply(socket, request, {});
+	}
+
+	/**
+	 * `/status`: a `@private` notice to the sender with today's Cloudflare
+	 * account usage against the Free plan's daily allowance (refreshed now
+	 * when account analytics are configured, at most once a minute), and the
+	 * object's own daily reservations against their budgets.
+	 */
+	private async sendStatus(socket: WebSocketConnection, request: RequestFrame, roomId: string): Promise<void> {
+		const now = nowMs();
+		await this.refreshAccountUsage(this.runtimeEnv, now, true);
+		const { budget, identities, databaseBytes } = this.store.status(now);
+		const limits = this.config.limits;
+		const count = (value: number) => Math.round(value).toLocaleString("en-US");
+		const share = (used: number, limit: number) => `${count(used)} / ${count(limit)} (${limit > 0 ? Math.round((100 * used) / limit) : 0}%)`;
+		const mib = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+		const lines: string[] = [];
+		const usage = this.accountUsageSnapshot;
+		const daily = ACCOUNT_USAGE_POLICY.freeDaily;
+		if (usage) {
+			lines.push(
+				`**Cloudflare account, ${usage.day}** (sampled ${new Date(usage.sampledAt).toISOString().slice(11, 16)} UTC${usage.stop ? ", **stopped**: over " + Math.round(ACCOUNT_USAGE_POLICY.stopRatio * 100) + "% of a limit" : ""})`,
+				"",
+				"| | Used / Free daily |",
+				"|---|---|",
+				`| Worker requests | ${share(usage.workerRequests, daily.workerRequests)} |`,
+				`| Durable Object requests | ${share(usage.durableObjectRequests, daily.durableObjectRequests)} |`,
+				`| Durable Object duration (GB-s) | ${share(usage.durableObjectDurationGbSeconds, daily.durableObjectDurationGbSeconds)} |`,
+				`| SQL rows read | ${share(usage.sqlRowsRead, daily.sqlRowsRead)} |`,
+				`| SQL rows written | ${share(usage.sqlRowsWritten, daily.sqlRowsWritten)} |`,
+				`| Stored | ${mib(usage.storedBytes)} / ${mib(ACCOUNT_USAGE_POLICY.freeStoredBytes)} |`,
+			);
+		} else {
+			lines.push("**Cloudflare account**: no usage sample; set `ACCOUNT_ID` and `ACCOUNT_ANALYTICS_TOKEN` to read it.");
+		}
+		lines.push(
+			"",
+			`**Demo budgets, ${budget.day}** (reserved by this object)`,
+			"",
+			"| | Reserved / Budget |",
+			"|---|---|",
+			`| SQL rows read | ${share(budget.reads, limits.sqlReadsPerDay)} |`,
+			`| SQL rows written | ${share(budget.writes, limits.sqlWritesPerDay)} |`,
+			`| Frames | ${share(budget.frames, limits.processedFramesPerDay)} |`,
+			`| Connection admissions | ${share(budget.admissions, limits.connectionAdmissionsPerDay)} |`,
+			`| Posts | ${share(budget.posts, limits.globalPostsPerDay)} |`,
+			`| Registrations | ${share(budget.registrations, limits.registrationsPerDay)} |`,
+			`| Registered users | ${share(identities, limits.registeredIdentityCount)} |`,
+			`| Open connections | ${share(this.ctx.getWebSockets().length, limits.openConnections)} |`,
+			`| Database | ${databaseBytes === null ? "unknown" : mib(databaseBytes)} / ${mib(limits.databaseHardTargetBytes)} |`,
+		);
+		this.sendNotice(socket, roomId, lines.join("\n"));
 		this.reply(socket, request, {});
 	}
 
@@ -1975,7 +2149,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * everyone else who shares one of `rooms` with the user. Joins and leaves
 	 * are memberships, never `user` notifications (§4.3.2).
 	 */
-	private announceUser(origin: WebSocketConnection, identity: { user_id: string; name?: string } | null, rooms: readonly string[], old?: { user_id: string; name?: string } | null): void {
+	private announceUser(origin: WebSocketConnection | null, identity: { user_id: string; name?: string } | null, rooms: readonly string[], old?: { user_id: string; name?: string } | null): void {
 		if (!identity) return;
 		const shared = new Set(rooms);
 		for (const peer of this.ctx.getWebSockets()) {

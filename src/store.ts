@@ -548,6 +548,16 @@ interface RawCredentialRow {
   updated_ms: number;
 }
 
+/** A passkey a schema reset carries over, with its identity (see readCarriedPasskeys). */
+interface CarriedPasskey extends RawCredentialRow {
+  user_handle: string;
+  name: string;
+  tier: string;
+  identity_created_ms: number;
+  identity_updated_ms: number;
+  in_general: number;
+}
+
 interface RawIdentityRow {
   user_id: string;
   user_handle: string;
@@ -595,6 +605,26 @@ const META_ACCOUNT_USAGE = "account_usage_snapshot";
  * means none: the row is additive, so schema 4 objects need no reset for it.
  */
 const META_GUEST_NUMBER_MARK = "guest_number_mark";
+/**
+ * Most passkeys a schema reset carries over (see resetStorage), most recently
+ * used first; any beyond it are dropped with the rest of the object. It bounds
+ * the reset's uncharged-for-capacity SQL work to a small share of a day's
+ * writes, and so the identities that can survive a wipe.
+ */
+export const MAX_CARRIED_PASSKEYS = 100;
+/**
+ * The registered users made admins with `/admin`, as a JSON list of
+ * `user_id`s. Absent means none: the row is additive, so schema 4 objects need
+ * no reset for it. The `APRON_ADMIN_TOKEN` user is an admin without being listed.
+ */
+const META_ADMINS = "admins";
+/** Most users `/admin` may list, so the list stays one small `_meta` row. */
+export const MAX_ADMINS = 32;
+/**
+ * `_meta` key prefix recording a `/rename`: `renamed:<old user_id>` holds the
+ * new one, so the retired `user_id` is never reissued (protocol §3.3).
+ */
+const META_RENAMED_PREFIX = "renamed:";
 /** Rows one guest-number block reservation may read and write, before control overhead. */
 const GUEST_NUMBER_BLOCK_COST = { reads: 8, writes: 8 } as const;
 
@@ -1013,14 +1043,23 @@ export class Store {
   }
 
   /**
-   * Wipe every SQLite table and key-value entry (identities, credentials,
-   * passkey sessions, chat, limiter windows) and initialize a fresh schema.
+   * Wipe every SQLite table and key-value entry (chat, rooms, passkey
+   * sessions, bot tokens, limiter windows) and initialize a fresh schema.
    * Used whenever the stored schema version differs from this code's, in
    * either direction; there is no data migration.
    *
+   * Registered passkeys survive: up to MAX_CARRIED_PASSKEYS of the most
+   * recently used are read before the wipe and written back, with their
+   * identities (same `user_id`, name, and WebAuthn user handle) and their
+   * `general` membership, so users sign in again with the passkey they have
+   * rather than deleting it and registering anew. The rows the carry reads
+   * and writes are charged to the day's maintenance reservation below, and those of them `/admin`
+   * listed stay admins. Older passkeys past the cap, bots, and every session
+   * are dropped.
+   *
    * The guest-number high-water mark is carried over, so a guest ID is never
    * reissued across a reset (a wipe does not restart guests at `guest_1`).
-   * Besides it, only the current UTC day's resource reservations are carried
+   * Besides those, only the current UTC day's resource reservations are carried
    * over, when the old schema's budget row is readable, so a deploy cannot replenish the
    * daily SQL allowance the platform has already metered. The fresh schema's
    * bootstrap reservation is added to that row without a capacity check, so
@@ -1052,6 +1091,17 @@ export class Store {
     } catch {
       // An unreadable old meta table carries no guest numbers.
     }
+    // The carry's reads and writes are measured, not estimated: finding the
+    // most recent passkeys reads every credential and its identity.
+    const carryStart = { reads: this.observed.reads, writes: this.observed.writes };
+    const passkeys = this.readCarriedPasskeys();
+    const carryReads = this.observed.reads - carryStart.reads;
+    let admins: string[] = [];
+    try {
+      admins = this.adminIds();
+    } catch {
+      // An unreadable old meta table carries no admins.
+    }
     await deleteAll.call(this.durableStorage);
     this.initialized = false;
     this.accountingUnsafe = false;
@@ -1065,10 +1115,29 @@ export class Store {
       // budget row, this is one uncharged control write.
       this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_GUEST_NUMBER_MARK, String(guestNumberMark));
     }
-    if (!carried) return;
+    const writeStart = { reads: this.observed.reads, writes: this.observed.writes };
+    if (passkeys.length) this.writeCarriedPasskeys(passkeys);
+    // Admins whose passkeys were carried stay admins: one control write.
+    const carriedIds = new Set(passkeys.map((row) => row.user_id));
+    const carriedAdmins = admins.filter((id) => carriedIds.has(id));
+    if (carriedAdmins.length) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ADMINS, JSON.stringify(carriedAdmins));
+    const carryCost = {
+      reads: carryReads + this.observed.reads - writeStart.reads,
+      writes: this.observed.writes - writeStart.writes,
+    };
+    if (!carried && !carryCost.reads && !carryCost.writes) return;
     const columns = ["reads_reserved", "writes_reserved", "frames_reserved", "admissions_reserved", "posts_reserved",
       "registrations_reserved", "foreground_reads", "foreground_writes", "maintenance_reads", "maintenance_writes"] as const;
-    const values = columns.map((column) => Math.max(0, integerColumn(carried![column])));
+    const values = columns.map((column) => {
+      const value = carried ? Math.max(0, integerColumn(carried[column])) : 0;
+      // The carry is maintenance work, charged like the bootstrap: added
+      // without a capacity check, so it cannot block the reset.
+      if (column === "reads_reserved" || column === "maintenance_reads") return value + carryCost.reads;
+      if (column === "writes_reserved" || column === "maintenance_writes") return value + carryCost.writes;
+      return value;
+    });
+    this.observed.reservedReads += carryCost.reads;
+    this.observed.reservedWrites += carryCost.writes;
     this.transaction(() => {
       this.rawExec(
         `INSERT OR IGNORE INTO resource_budgets (day, ${columns.join(", ")}) VALUES (?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)`,
@@ -1082,6 +1151,56 @@ export class Store {
     });
     this.budgetCacheDay = null;
     this.budgetCache = null;
+  }
+
+  /**
+   * The registered passkeys a reset keeps, with their identities and whether
+   * each had joined `general`: at most MAX_CARRIED_PASSKEYS, most recently
+   * used (signed in or registered) first. Read from the old schema by column
+   * name, so a schema change that alters these tables must keep them readable
+   * here or accept that the reset drops them; an unreadable table carries none.
+   */
+  private readCarriedPasskeys(): CarriedPasskey[] {
+    try {
+      return this.rawRows<CarriedPasskey>(
+        `SELECT c.credential_id, c.user_id, c.public_key_json, c.sign_count, c.transports_json,
+            c.created_ms, c.updated_ms, i.user_handle, i.name, i.tier,
+            i.created_ms AS identity_created_ms, i.updated_ms AS identity_updated_ms,
+            EXISTS (SELECT 1 FROM memberships m WHERE m.room_id = ? AND m.user_id = c.user_id) AS in_general
+         FROM credentials c JOIN identities i ON i.user_id = c.user_id
+         WHERE i.tier = 'registered'
+         ORDER BY c.updated_ms DESC, c.credential_id LIMIT ?`,
+        ROOM_ID, MAX_CARRIED_PASSKEYS,
+      );
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Restore carried passkeys into a fresh schema: the identity, its
+   * credential, and its `general` membership. The membership row is restored
+   * without a log record, like the rest of the old log it is not replayed;
+   * member listings read the table. Other rooms did not survive the wipe.
+   */
+  private writeCarriedPasskeys(passkeys: readonly CarriedPasskey[]): void {
+    this.transaction(() => {
+      for (const row of passkeys) {
+        this.rawExec(
+          "INSERT OR IGNORE INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES (?, ?, ?, 'registered', ?, ?)",
+          row.user_id, row.user_handle, row.name, row.identity_created_ms, row.identity_updated_ms,
+        );
+        this.rawExec(
+          `INSERT OR IGNORE INTO credentials
+           (credential_id, user_id, public_key_json, sign_count, transports_json, created_ms, updated_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          row.credential_id, row.user_id, row.public_key_json, row.sign_count, row.transports_json, row.created_ms, row.updated_ms,
+        );
+        if (row.in_general) this.rawExec("INSERT OR IGNORE INTO memberships (room_id, user_id) VALUES (?, ?)", ROOM_ID, row.user_id);
+      }
+      const count = this.rawRows<{ count: number }>("SELECT COUNT(*) AS count FROM identities")[0];
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(integerColumn(count?.count)));
+    });
   }
 
   /** Log the `general` room's creation record as the next server record. */
@@ -1656,6 +1775,20 @@ export class Store {
 
   budget(now = this.clock.now()): BudgetSnapshot {
     this.ensureReady();
+    return this.budgetValue(now);
+  }
+
+  /** Today's reservations and the identity count, for `/status`. */
+  status(now = this.clock.now()): { budget: BudgetSnapshot; identities: number; databaseBytes: number | null } {
+    this.ensureReady();
+    return this.reserved({ reads: 8 }, false, now, () => ({
+      budget: this.budgetValue(now),
+      identities: this.metaNumber("identity_count"),
+      databaseBytes: this.databaseSize(),
+    }));
+  }
+
+  private budgetValue(now: number): BudgetSnapshot {
     const day = dayFor(this.effectiveNow(now));
     const row = this.budgetRow(day);
     return {
@@ -1842,10 +1975,53 @@ export class Store {
     return 8 + 2 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS);
   }
 
-  /** Whether a `user_id` is taken, one indexed read: registration picks ids with it. */
+  /** Whether an identity has this `user_id` now, one indexed read. */
   identityExists(userId: string): boolean {
     this.ensureReady();
     return this.reserved({ reads: 4 }, false, this.clock.now(), () => this.identityRow(userId) !== null);
+  }
+
+  /**
+   * Whether a `user_id` may not be issued: an identity has it, or `/rename`
+   * retired it. Registration picks ids with it.
+   */
+  userIdTaken(userId: string): boolean {
+    this.ensureReady();
+    return this.reserved({ reads: 8 }, false, this.clock.now(), () => this.idTaken(userId));
+  }
+
+  private idTaken(userId: string): boolean {
+    return this.identityRow(userId) !== null || this.metaValue(META_RENAMED_PREFIX + userId) !== "";
+  }
+
+  /**
+   * `/rename`: moves a registered user to a new `user_id`: the identity row,
+   * its credential (so its passkey signs in as the new id), its stored
+   * memberships, and its admin listing. Nothing else is migrated: logged
+   * records keep the old `user_id` (protocol §3.3), and sessions, limiter
+   * windows, reactions and the user's bot stay under it. The old `user_id` is
+   * retired, never reissued. Returns the user's name and joined rooms.
+   */
+  renameIdentity(input: { from: string; to: string; now?: number }): { name: string; rooms: string[] } {
+    this.ensureReady();
+    const now = input.now ?? this.clock.now();
+    const membershipRows = MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS;
+    // Moving a membership row reads its index entry and row (measured: about
+    // 2 reads and 3 writes each), before the user's rooms are read back.
+    return this.reserved({ reads: 64 + 4 * membershipRows + this.userRoomsReads(), writes: 32 + 4 * membershipRows }, false, now, () => this.transaction(() => {
+      const identity = this.identityRow(input.from);
+      if (!identity || identity.tier !== "registered") throw new StoreError("invalid_params", `No registered user has the user_id ${input.from}`.slice(0, 200));
+      if (this.idTaken(input.to)) throw new StoreError("invalid_params", `The user_id ${input.to} is taken`.slice(0, 200));
+      this.rawExec("UPDATE identities SET user_id = ?, updated_ms = ? WHERE user_id = ?", input.to, this.effectiveNow(now), input.from);
+      this.rawExec("UPDATE credentials SET user_id = ? WHERE user_id = ?", input.to, input.from);
+      this.rawExec("UPDATE memberships SET user_id = ? WHERE user_id = ?", input.to, input.from);
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_RENAMED_PREFIX + input.from, input.to);
+      const admins = this.adminIds();
+      if (admins.includes(input.from)) {
+        this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ADMINS, JSON.stringify(admins.map((id) => (id === input.from ? input.to : id))));
+      }
+      return { name: identity.name, rooms: this.userRooms(input.to) };
+    }));
   }
 
   getIdentity(userId: string): StoredIdentity | null {
@@ -2236,7 +2412,7 @@ export class Store {
         };
         // Recheck all persistent caps in the transaction immediately before the
         // credential is made usable; concurrent verification cannot overrun caps.
-        if (this.identityRow(input.userId)) throw new StoreError("invalid_params", "identity already exists");
+        if (this.idTaken(input.userId)) throw new StoreError("invalid_params", "identity already exists");
         if (this.credentialValue(credential.credentialId)) throw new StoreError("invalid_params", "credential is already registered");
         if (this.metaNumber("identity_count") >= this.config.registeredIdentityCount) throw new StoreError("denied", "registration_closed");
         this.chargeRegistration(input.ipKey, effective);
@@ -2491,16 +2667,50 @@ export class Store {
     return { userId: input.botId, name: input.name, created: true, renamed: false, broadcasts: created.broadcasts };
   }
 
+  /** Whether `/admin` listed this user as an admin. One `_meta` read. */
+  isAdmin(userId: string, now = this.clock.now()): boolean {
+    this.ensureReady();
+    return this.reserved({ reads: 4 }, false, now, () => this.adminIds().includes(userId));
+  }
+
   /**
-   * The test user that `TEST_TOKEN` signs in as: a registered identity with
+   * Lists a registered user (not a bot or guest) as an admin, for `/admin`.
+   * `added` is false when the user already was one. At most MAX_ADMINS.
+   */
+  grantAdmin(input: { userId: string; now?: number }): { added: boolean; name: string } {
+    this.ensureReady();
+    return this.reserved({ reads: 8, writes: 4 }, false, input.now ?? this.clock.now(), () => this.transaction(() => {
+      const identity = this.identityRow(input.userId);
+      if (!identity || identity.tier !== "registered") throw new StoreError("invalid_params", "No registered user has that user_id");
+      const admins = this.adminIds();
+      if (admins.includes(input.userId)) return { added: false, name: identity.name };
+      if (admins.length >= MAX_ADMINS) throw new StoreError("denied", `There are already ${MAX_ADMINS} admins`);
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ADMINS, JSON.stringify([...admins, input.userId]));
+      return { added: true, name: identity.name };
+    }));
+  }
+
+  private adminIds(): string[] {
+    const raw = this.metaValue(META_ADMINS);
+    if (!raw) return [];
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string").slice(0, MAX_ADMINS) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * The admin user that `APRON_ADMIN_TOKEN` signs in as: a registered identity with
    * no credential, created on first use like a bot, against the same caps.
    * `created` is false when it already exists.
    */
-  ensureTestUser(input: { userId: string; name: string; now: number; ipKey: string }): { created: boolean; broadcasts: Broadcast[] } {
+  ensureAdminUser(input: { userId: string; name: string; now: number; ipKey: string }): { created: boolean; broadcasts: Broadcast[] } {
     this.ensureReady();
     const existing = this.reserved({ reads: 8 }, false, input.now, () => this.identityRow(input.userId));
     if (existing) {
-      if (existing.tier !== "registered") throw new StoreError("internal_error", "test user identity is taken");
+      if (existing.tier !== "registered") throw new StoreError("internal_error", "admin user identity is taken");
       return { created: false, broadcasts: [] };
     }
     return { created: true, broadcasts: this.createKeylessIdentity({ ...input, tier: "registered" }).broadcasts };
@@ -2580,7 +2790,12 @@ export class Store {
    * would change writes nothing. Returns the identity's rooms, the logged
    * record, and the room's record after it.
    */
-  changeMembership(input: { userId: string; ipKey: string; roomId: string; join: boolean; now?: number }): {
+  /**
+   * Joins or leaves a room for a registered user. The posting limits charged
+   * are the user's own, or `actorId`'s when someone else makes the change
+   * (an admin's `/kick`); `ipKey` is the requesting connection's.
+   */
+  changeMembership(input: { userId: string; ipKey: string; roomId: string; join: boolean; now?: number; actorId?: string }): {
     rooms: string[]; changed: boolean; membership?: Broadcast; room?: RoomRecord;
   } {
     this.ensureReady();
@@ -2600,7 +2815,7 @@ export class Store {
         if (!room) throw new StoreError("invalid_params", "Unknown room");
         const member = this.rawRows("SELECT user_id FROM memberships WHERE room_id = ? AND user_id = ? LIMIT 1", input.roomId, input.userId).length > 0;
         if (member === input.join) return { rooms: this.userRooms(input.userId), changed: false };
-        this.chargePosting({ userId: input.userId, tier: "registered", ipKey: input.ipKey, now: effective });
+        this.chargePosting({ userId: input.actorId ?? input.userId, tier: "registered", ipKey: input.ipKey, now: effective });
         if (input.join) this.rawExec("INSERT INTO memberships (room_id, user_id) VALUES (?, ?)", input.roomId, input.userId);
         else this.rawExec("DELETE FROM memberships WHERE room_id = ? AND user_id = ?", input.roomId, input.userId);
         const state = this.logState();

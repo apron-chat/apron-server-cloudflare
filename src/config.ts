@@ -14,11 +14,21 @@ export interface RuntimeConfig {
 	/** Let guests post, react, join and leave rooms, and create threads; off unless `GUEST_POSTING=true`, so guests only read. */
 	guestPosting: boolean;
 	/**
-	 * A fixed bearer token that signs in as the test user (`TEST_TOKEN`), for
-	 * local testing without a passkey; never set in production. Unset, no
-	 * such token exists.
+	 * A fixed bearer token that signs in as the admin user
+	 * (`APRON_ADMIN_TOKEN`), who can run the admin commands. Set it as a
+	 * secret, never in source. Unset, no such token exists.
 	 */
-	testToken?: string;
+	adminToken?: string;
+}
+
+/**
+ * Why a value cannot be `APRON_ADMIN_TOKEN`, or null when it can: 24 to 256
+ * letters, digits, - or _, and not a bot token.
+ */
+export function adminTokenError(token: string): string | null {
+	if (!/^[A-Za-z0-9_-]{24,256}$/.test(token)) return "APRON_ADMIN_TOKEN must be 24 to 256 letters, digits, - or _";
+	if (token.startsWith("apron_bot_")) return "APRON_ADMIN_TOKEN must not start with apron_bot_";
+	return null;
 }
 
 export class ConfigError extends Error {
@@ -36,7 +46,7 @@ type EnvLike = {
 	ADMISSION_OFF?: string;
 	ACTIVITY?: string;
 	GUEST_POSTING?: string;
-	TEST_TOKEN?: string;
+	APRON_ADMIN_TOKEN?: string;
 	ENVIRONMENT?: string;
 	NODE_ENV?: string;
 };
@@ -229,11 +239,9 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 	const activityEnabled = String(env.ACTIVITY ?? "").toLowerCase() === "true";
 	if (env.GUEST_POSTING !== undefined && !["true", "false"].includes(String(env.GUEST_POSTING).toLowerCase())) throw new ConfigError("GUEST_POSTING must be true or false");
 	const guestPosting = String(env.GUEST_POSTING ?? "").toLowerCase() === "true";
-	const testToken = env.TEST_TOKEN === undefined || env.TEST_TOKEN === "" ? undefined : String(env.TEST_TOKEN);
-	if (testToken !== undefined && !/^[A-Za-z0-9_-]{24,256}$/.test(testToken)) {
-		throw new ConfigError("TEST_TOKEN must be 24 to 256 letters, digits, - or _");
-	}
-	if (testToken?.startsWith("apron_bot_")) throw new ConfigError("TEST_TOKEN must not start with apron_bot_");
+	const adminToken = env.APRON_ADMIN_TOKEN === undefined || env.APRON_ADMIN_TOKEN === "" ? undefined : String(env.APRON_ADMIN_TOKEN);
+	const adminTokenProblem = adminToken === undefined ? null : adminTokenError(adminToken);
+	if (adminTokenProblem) throw new ConfigError(adminTokenProblem);
 	const rpName = String(env.RP_NAME ?? "Apron Demo");
 	if (!rpName.trim() || [...rpName].length > limits.maxNameCodePoints || new TextEncoder().encode(rpName).byteLength > limits.maxNameBytes) {
 		throw new ConfigError("RP_NAME exceeds the configured display-name policy");
@@ -247,7 +255,7 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 		admissionOff,
 		activityEnabled,
 		guestPosting,
-		...(testToken !== undefined ? { testToken } : {}),
+		...(adminToken !== undefined ? { adminToken } : {}),
 	};
 }
 

@@ -546,8 +546,8 @@ it('answers /help with a private notice and rejects other commands without closi
 		});
 		// Mistyped commands are ordinary errors, not policy violations.
 		for (let index = 0; index < 4; index += 1) {
-			const unknown = await request(peer, `unknown-${index}`, 'command', { room_id: 'general', body: { text: '/kick @someone' } });
-			expect(unknown.error).toMatchObject({ code: -32602, message: 'Unknown command /kick; try /help' });
+			const unknown = await request(peer, `unknown-${index}`, 'command', { room_id: 'general', body: { text: '/frobnicate @someone' } });
+			expect(unknown.error).toMatchObject({ code: -32602, message: 'Unknown command /frobnicate; try /help' });
 		}
 		expect((await request(peer, 'saved', 'command', { message_id: '1', body: { text: '/help' } })).error.code).toBe(-32602);
 		expect((await request(peer, 'still-open', 'me', {})).result.you).toBeTruthy();
