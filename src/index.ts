@@ -1261,8 +1261,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Signs in as the test user with `TEST_TOKEN`, for testing and demos
-	 * without a passkey. Like a bot token it is taken from any origin; the
+	 * Signs in as the test user with `TEST_TOKEN`, for local testing without
+	 * a passkey (never set in production). Like a bot token it is taken from any origin; the
 	 * user is a registered one, created on first use, that can post and run
 	 * `/invite-bot`.
 	 */
