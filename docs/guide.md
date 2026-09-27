@@ -167,6 +167,14 @@ token does not expire. Running `/invite-bot` again replaces it, signs out
 connections that used the old one, and renames the bot after your current name.
 The first invite counts as a registration. See [SPEC section 5](../SPEC.md#bots).
 
+This repository runs one: the [Announce workflow](../.github/workflows/announce.yml)
+posts each pull request merged into `main` to `general`, with a link preview
+(`og` title, description, and site name) built from the pull request, using
+[`scripts/announce-pr.mjs`](../scripts/announce-pr.mjs). Set the
+`APRON_BOT_TOKEN` repository secret to a token from `/invite-bot`; rerunning
+the job for the same pull request within the deduplication window does not
+post it twice.
+
 ## User-visible policies
 
 Only roughly the last day of records (messages, reactions, room changes, and
