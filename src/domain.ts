@@ -26,6 +26,8 @@ export interface StoredIdentity {
 	credentialCount: number;
 	/** Rooms the identity has joined (protocol §4.3.2), kept across connections. */
 	rooms: string[];
+	/** The identity's avatar while it lasts (protocol §4.6.6). */
+	avatar?: string;
 }
 
 export interface DedupRecord {

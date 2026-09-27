@@ -14,6 +14,7 @@ import {
   MAINTENANCE_CONTROL_RESERVE,
   MAX_EMOJI_BYTES,
   MAX_THREAD_LIMIT,
+  type UploadPolicy,
 } from "./budget";
 import type { AccountUsageSnapshot } from "./account-usage";
 import type {
@@ -33,15 +34,16 @@ import { createHash } from "node:crypto";
 export const ROOM_ID = "general";
 export const ROOM_TITLE = "General";
 /**
- * Schema 4 stores the protocol v6 server-wide log (room records, flat message
- * snapshots, reaction sets, and registered users' memberships) and a
- * `memberships` table of registered users' joined rooms, indexed both ways.
+ * Schema 5 stores the protocol v6 server-wide log (room records, flat message
+ * snapshots, reaction sets, and registered users' memberships), a
+ * `memberships` table of registered users' joined rooms, indexed both ways,
+ * and the `uploads` held in R2 with each identity's avatar (schema 5).
  * Stored data from any other schema version is not migrated: the object is
  * wiped and started fresh (see resetStorage()). Additive rows need no new
- * version: the `_meta` guest-number mark, absent in older schema 4 objects,
- * reads as zero.
+ * version: the `_meta` guest-number mark, absent in older objects, reads as
+ * zero.
  */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 /** Rooms a new identity has joined: the permanent top-level room (§3.4). */
 export const DEFAULT_JOINED_ROOMS: readonly string[] = [ROOM_ID];
 /** Title the demo supplies for a thread room created or saved without one. */
@@ -201,6 +203,59 @@ export interface StoreConfig {
   authCost: CostEstimate;
   /** Conservative row-cost estimate for one maintenance batch. */
   cleanupCost: CostEstimate;
+  /**
+   * Uploads (protocol §4.6.3), or null without them: the plan's policy and
+   * the public origin its R2 objects are served from.
+   */
+  uploads: StoreUploadConfig | null;
+}
+
+export interface StoreUploadConfig extends UploadPolicy {
+  /** Where the bucket serves objects, such as `https://media.apron.chat`; no trailing slash. */
+  mediaOrigin: string;
+}
+
+/** An upload waiting for its write (protocol §4.6.3): what its `write_url` signs. */
+export interface PendingUpload {
+  /** The R2 object key: `f/<id>` for an attached file, `a/<id>` for an avatar. */
+  key: string;
+  purpose: UploadPurpose;
+  embedId: string;
+  maxBytes: number;
+  writeExpiresMs: number;
+}
+
+export type UploadPurpose = "file" | "avatar";
+
+/** What finishUpload did: the snapshot to broadcast, or the avatar set, and R2 objects to delete. */
+export interface UploadFinish {
+  accepted: boolean;
+  broadcasts: Broadcast[];
+  avatar?: { userId: string; url: string };
+  deletedUploads: string[];
+}
+
+/**
+ * A new upload as a result lists it (§4.6.3), with `write` in place of the
+ * `write_url` the runtime signs from it. Kept in the stored result, so a
+ * retry signs the same URL.
+ */
+export function uploadResultEmbed(upload: PendingUpload): Record<string, unknown> {
+  return {
+    embed_id: upload.embedId,
+    kind: "upload",
+    write: { key: upload.key, max_bytes: upload.maxBytes, expires_ms: upload.writeExpiresMs },
+  };
+}
+
+/** A finished write, as the Worker saw it. */
+export interface UploadWrite {
+  key: string;
+  ok: boolean;
+  bytes?: number;
+  contentType?: string;
+  width?: number;
+  height?: number;
 }
 
 export interface CostEstimate {
@@ -264,6 +319,7 @@ const DEFAULT_CONFIG: StoreConfig = {
   storageLowWaterBytes: DEFAULT_LIMITS.databaseResumeLowWaterBytes,
   admissionEnabled: true,
   ogRemoteMedia: false,
+  uploads: null,
   // These bounds include the reservation row and worst-case indexed control
   // updates for one accepted operation; calibrated workloads may lower them
   // only after observing cursor counts.
@@ -388,6 +444,10 @@ export interface StoreMutationResult {
   message?: MessageSnapshot;
   /** The saved room record, for `room_set`. */
   room?: RoomRecord;
+  /** Uploads this operation started; their `write_url`s go in the result (§4.6.3). */
+  uploads?: PendingUpload[];
+  /** R2 objects to delete: uploads whose embed or message this operation removed. */
+  deletedUploads?: string[];
   /** Whether `room_set` created the room, which joins its creator (§4.3.4). */
   created?: boolean;
   /** The creator's logged membership, for a registered creator (§4.3.4). */
@@ -572,6 +632,21 @@ interface RawIdentityRow {
   tier: string;
   created_ms: number;
   updated_ms: number;
+  avatar_url: string;
+  avatar_expires_ms: number;
+}
+
+interface RawUploadRow {
+  upload_key: string;
+  owner_id: string;
+  purpose: UploadPurpose;
+  message_id: string | null;
+  embed_id: string | null;
+  /** `pending` until the Worker claims the write, `writing` while it stores it, then `done`. */
+  state: "pending" | "writing" | "done";
+  bytes: number;
+  write_expires_ms: number;
+  expires_ms: number;
 }
 
 interface RawLimitRow {
@@ -584,6 +659,7 @@ interface RawLimitRow {
   day: string;
   posts_day: number;
   registrations_day: number;
+  uploads_day: number;
   updated_ms: number;
 }
 
@@ -632,6 +708,17 @@ export const MAX_ADMINS = 32;
  * new one, so the retired `user_id` is never reissued (protocol §3.3).
  */
 const META_RENAMED_PREFIX = "renamed:";
+/** Bytes all live uploads hold, pending writes at their largest (see startUpload). */
+const META_UPLOAD_BYTES = "upload_bytes";
+/**
+ * How long past its write window a pending upload may still finish: the write
+ * started in time and is still arriving. Expiry waits this long too.
+ */
+export const UPLOAD_WRITE_GRACE_MS = 60_000;
+/** Pending uploads or expired upload rows one maintenance pass handles. */
+const UPLOAD_SWEEP_BATCH = 32;
+/** Rows one upload's bookkeeping may write: its row and indexes, two limiter rows, and the byte count. */
+const UPLOAD_WRITES = 16;
 /** Rows one guest-number block reservation may read and write, before control overhead. */
 const GUEST_NUMBER_BLOCK_COST = { reads: 8, writes: 8 } as const;
 
@@ -783,6 +870,22 @@ const OG_MEDIA_MAX_DIMENSION = 16_384;
 const OG_UNSAFE_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
 
 /** `value` as one line of plain text of at most `max` code points, or undefined when empty. */
+/** An identity's avatar while it has not expired (protocol §4.6.6). */
+function liveAvatar(row: { avatar_url: string | null; avatar_expires_ms: number | null }, now: number): string | undefined {
+  return row.avatar_url && (row.avatar_expires_ms ?? 0) > now ? row.avatar_url : undefined;
+}
+
+/** An upload embed's `title`: its sender's single line of text, bounded like `og.title`. */
+function uploadTitle(value: unknown): string | undefined {
+  return ogLine(value, OG_TEXT_FIELDS.title);
+}
+
+/** An unguessable object key segment (protocol §4.6.2): 128 random bits, base64url. */
+function randomKey(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
 function ogLine(value: unknown, max: number): string | undefined {
   if (typeof value !== "string") return undefined;
   const line = value.replace(OG_UNSAFE_CHARACTERS, " ").replace(/\s+/g, " ").trim();
@@ -846,12 +949,14 @@ function ensureText(value: unknown, field: string, maxBytes: number): string {
 }
 
 /**
- * Schema 4: the server-wide log with membership records, and each registered
+ * Schema 5: the server-wide log with membership records, and each registered
  * identity's joined rooms as `memberships` rows, by room (the primary key, for
  * member listings) and by user (for a user's rooms). Guests' memberships live
  * in their connection only, like the guest identity itself, and are not logged.
+ * `uploads` lists the objects written to R2 (protocol §4.6.3): attached files
+ * by message and embed, and avatars, by owner, expiry, and pending write.
  */
-const SCHEMA_V4_DDL = `
+const SCHEMA_DDL = `
   CREATE TABLE IF NOT EXISTS _meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -906,8 +1011,27 @@ const SCHEMA_V4_DDL = `
     name TEXT NOT NULL,
     tier TEXT NOT NULL,
     created_ms INTEGER NOT NULL,
-    updated_ms INTEGER NOT NULL
+    updated_ms INTEGER NOT NULL,
+    avatar_url TEXT NOT NULL DEFAULT '',
+    avatar_expires_ms INTEGER NOT NULL DEFAULT 0
   );
+  CREATE TABLE IF NOT EXISTS uploads (
+    upload_key TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    message_id TEXT,
+    embed_id TEXT,
+    state TEXT NOT NULL,
+    bytes INTEGER NOT NULL,
+    content_type TEXT NOT NULL DEFAULT '',
+    write_expires_ms INTEGER NOT NULL,
+    expires_ms INTEGER NOT NULL,
+    created_ms INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS uploads_owner_idx ON uploads (owner_id);
+  CREATE INDEX IF NOT EXISTS uploads_expiry_idx ON uploads (expires_ms);
+  CREATE INDEX IF NOT EXISTS uploads_pending_idx ON uploads (state, write_expires_ms);
+  CREATE INDEX IF NOT EXISTS uploads_message_idx ON uploads (message_id);
   CREATE TABLE IF NOT EXISTS memberships (
     room_id TEXT NOT NULL,
     user_id TEXT NOT NULL,
@@ -958,6 +1082,7 @@ const SCHEMA_V4_DDL = `
     day TEXT NOT NULL,
     posts_day INTEGER NOT NULL DEFAULT 0,
     registrations_day INTEGER NOT NULL DEFAULT 0,
+    uploads_day INTEGER NOT NULL DEFAULT 0,
     updated_ms INTEGER NOT NULL,
     PRIMARY KEY (scope, principal_key)
   );
@@ -1062,7 +1187,7 @@ export class Store {
       return;
     }
     const now = this.transaction(() => {
-      this.rawScript(SCHEMA_V4_DDL);
+      this.rawScript(SCHEMA_DDL);
       const now = this.effectiveNow(this.clock.now());
       this.bootstrapSchema(now);
       // Charge the one-time schema/bootstrap work to the maintenance reserve.
@@ -2026,7 +2151,7 @@ export class Store {
 
   private identityRow(userId: string): RawIdentityRow | null {
     const rows = this.rawRows<RawIdentityRow>(
-      "SELECT user_id, user_handle, name, tier, created_ms, updated_ms FROM identities WHERE user_id = ? LIMIT 1",
+      "SELECT user_id, user_handle, name, tier, created_ms, updated_ms, avatar_url, avatar_expires_ms FROM identities WHERE user_id = ? LIMIT 1",
       userId,
     );
     return rows[0] ?? null;
@@ -2100,6 +2225,97 @@ export class Store {
     }));
   }
 
+  /**
+   * `/purge`: removes users and everything they left, silently, with no new
+   * records: their message snapshots and current messages, with every
+   * reaction set on those messages; their reaction sets elsewhere; their
+   * memberships and membership records; their uploads; and their identity,
+   * passkey, admin listing, limiter and dedup rows. A logged record that
+   * lists them beside others (a move's reaction sets) is rewritten without
+   * them. Rooms they created stay. Clients that already have their content
+   * keep it until they load history again. Returns what went, and the R2
+   * objects the caller deletes.
+   */
+  purgeUsers(input: { userIds: readonly string[]; now?: number }): { messages: number; reactions: number; deletedUploads: string[] } {
+    this.ensureReady();
+    const now = input.now ?? this.clock.now();
+    const ids = [...new Set(input.userIds)].filter((id) => id.length > 0).slice(0, 4);
+    if (!ids.length) return { messages: 0, reactions: 0, deletedUploads: [] };
+    const marks = ids.map(() => "?").join(", ");
+    // Every retained record has a log id from the oldest still stored to the
+    // newest, and a move stores one record twice: the scans below read at
+    // most this many rows each.
+    const records = this.reserved({ reads: 16 }, false, now, () => {
+      const low = this.rawRows<{ low: number | null }>("SELECT MIN(log_id) AS low FROM records INDEXED BY records_log_idx")[0]?.low;
+      return low === null || low === undefined ? 0 : 2 * (this.logState().last_log_id - low + 1);
+    });
+    const policy = this.config.uploads;
+    const uploadsPerOwner = policy
+      ? policy.uploadsPerUserDay * (Math.ceil((policy.avatarRetentionSeconds + policy.lifecycleLagSeconds) / 86_400) + 1)
+      : 0;
+    // Per user: memberships (live and awaiting a room purge), a day's dedup
+    // rows, limiter rows, credential and identity; each deletion also updates
+    // its indexes.
+    const perUser = 64 + 4 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS) + 4 * this.config.registeredPostsPerDay + 4 * uploadsPerOwner;
+    const cost = { reads: 64 + 5 * records + ids.length * perUser, writes: 64 + 4 * records + ids.length * perUser };
+    return this.reserved(cost, false, now, () => this.transaction(() => {
+      const messages = this.rawRows<{ message_id: string }>(`SELECT message_id FROM message_state WHERE author_id IN (${marks})`, ...ids)
+        .map((row) => row.message_id);
+      const messageMarks = messages.map(() => "?").join(", ");
+      const purgedMessage = messages.length ? `json_extract(record_json, '$.message_id') IN (${messageMarks})` : "0";
+      const reactionRecords = this.rawRows<{ room_id: string; log_id: number; record_json: string }>(
+        `SELECT room_id, log_id, record_json FROM records WHERE kind = 'reactions' AND (${purgedMessage} OR EXISTS (
+           SELECT 1 FROM json_each(record_json, '$.reactions') WHERE json_extract(value, '$.from.user_id') IN (${marks})))`,
+        ...messages, ...ids,
+      );
+      for (const row of reactionRecords) {
+        const record = parseJson<ReactionsRecord>(row.record_json);
+        const reactions = messages.includes(record.message_id) ? [] : record.reactions.filter((set) => !ids.includes(set.from.user_id));
+        this.rewriteRecord(row, reactions.length ? JSON.stringify({ ...record, reactions }) : null);
+      }
+      this.rawExec(`DELETE FROM records WHERE kind = 'message' AND json_extract(record_json, '$.from.user_id') IN (${marks})`, ...ids);
+      const membershipRecords = this.rawRows<{ room_id: string; log_id: number; record_json: string }>(
+        `SELECT room_id, log_id, record_json FROM records WHERE kind = 'membership' AND EXISTS (
+           SELECT 1 FROM json_each(record_json, '$.members') WHERE json_extract(value, '$.user.user_id') IN (${marks}))`,
+        ...ids,
+      );
+      for (const row of membershipRecords) {
+        const record = parseJson<MembershipRecord>(row.record_json);
+        const members = record.members.filter((member) => !ids.includes(member.user.user_id));
+        this.rewriteRecord(row, members.length ? JSON.stringify({ ...record, members }) : null);
+      }
+      const reactions = this.rawRows<{ count: number }>(
+        `SELECT COUNT(*) AS count FROM reaction_state WHERE user_id IN (${marks})`, ...ids,
+      )[0]?.count ?? 0;
+      this.rawExec(`DELETE FROM reaction_state WHERE user_id IN (${marks})`, ...ids);
+      if (messages.length) this.rawExec(`DELETE FROM reaction_state WHERE message_id IN (${messageMarks})`, ...messages);
+      this.rawExec(`DELETE FROM message_state WHERE author_id IN (${marks})`, ...ids);
+      const uploads = this.rawRows<RawUploadRow>(
+        `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
+         FROM uploads INDEXED BY uploads_owner_idx WHERE owner_id IN (${marks})`,
+        ...ids,
+      );
+      const deletedUploads = this.releaseUploadRows(uploads);
+      const identities = this.rawRows<{ count: number }>(`SELECT COUNT(*) AS count FROM identities WHERE user_id IN (${marks})`, ...ids)[0]?.count ?? 0;
+      for (const table of ["memberships", "credentials", "accepted_requests", "identities"]) {
+        this.rawExec(`DELETE FROM ${table} WHERE user_id IN (${marks})`, ...ids);
+      }
+      this.rawExec(`DELETE FROM principal_limits WHERE principal_key IN (${marks})`, ...ids.map((id) => `user:${id}`));
+      if (identities) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(Math.max(0, this.metaNumber("identity_count") - integerColumn(identities))));
+      const admins = this.adminIds();
+      if (admins.some((id) => ids.includes(id))) {
+        this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ADMINS, JSON.stringify(admins.filter((id) => !ids.includes(id))));
+      }
+      return { messages: messages.length, reactions: integerColumn(reactions), deletedUploads };
+    }));
+  }
+
+  /** Replaces one logged record's JSON, or deletes the record when `json` is null. */
+  private rewriteRecord(row: { room_id: string; log_id: number }, json: string | null): void {
+    if (json === null) this.rawExec("DELETE FROM records WHERE room_id = ? AND log_id = ?", row.room_id, row.log_id);
+    else this.rawExec("UPDATE records SET record_json = ? WHERE room_id = ? AND log_id = ?", json, row.room_id, row.log_id);
+  }
+
   getIdentity(userId: string): StoredIdentity | null {
     this.ensureReady();
     return this.reserved({ reads: 16 + this.userRoomsReads() }, false, this.clock.now(), () => {
@@ -2107,36 +2323,43 @@ export class Store {
       if (!row) return null;
       const count = this.rawRows<{ count: number }>("SELECT COUNT(*) AS count FROM credentials WHERE user_id = ? LIMIT 1", userId)[0];
       const credentialCount = integerColumn(count?.count);
+      const avatar = liveAvatar(row, this.clock.now());
       return {
         userId: row.user_id,
         name: row.name,
         userHandle: row.user_handle,
         credentialCount,
         rooms: this.userRooms(userId),
+        ...(avatar ? { avatar } : {}),
       };
     });
   }
 
   /**
    * The registered members of each room (§4.3.1), as `user_id` with the
-   * current `name` (`""` when removed), in `user_id` order: at most `limit`
+   * current `name` (`""` when removed) and live `avatar`, in `user_id` order: at most `limit`
    * per room, read from the room's primary-key range with one identity lookup
    * each. Guests' memberships are not stored; the caller adds connected ones.
    */
-  roomMembers(roomIds: readonly string[], limit: number, now = this.clock.now()): Map<string, Array<{ user_id: string; name: string }>> {
+  roomMembers(roomIds: readonly string[], limit: number, now = this.clock.now()): Map<string, Array<{ user_id: string; name: string; avatar?: string }>> {
     this.ensureReady();
     const ids = [...new Set(roomIds)].slice(0, MAX_THREAD_LIMIT + 1);
     const perRoom = Math.max(0, Math.floor(limit));
-    const members = new Map<string, Array<{ user_id: string; name: string }>>();
+    const members = new Map<string, Array<{ user_id: string; name: string; avatar?: string }>>();
     if (!ids.length || perRoom === 0) return members;
     return this.reserved({ reads: 8 + ids.length * (4 + 2 * perRoom) }, false, now, () => {
       for (const roomId of ids) {
-        const rows = this.rawRows<{ user_id: string; name: string | null }>(
-          `SELECT m.user_id, i.name FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id
+        const rows = this.rawRows<{ user_id: string; name: string | null; avatar_url: string | null; avatar_expires_ms: number | null }>(
+          `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id
            WHERE m.room_id = ? ORDER BY m.user_id LIMIT ?`,
           roomId, perRoom,
         );
-        if (rows.length) members.set(roomId, rows.map((row) => ({ user_id: row.user_id, name: row.name ?? "" })));
+        if (rows.length) {
+          members.set(roomId, rows.map((row) => {
+            const avatar = liveAvatar(row, now);
+            return { user_id: row.user_id, name: row.name ?? "", ...(avatar ? { avatar } : {}) };
+          }));
+        }
       }
       return members;
     });
@@ -2216,7 +2439,7 @@ export class Store {
     const rows = this.rawRows<RawLimitRow>(
       `SELECT scope, principal_key, post_events_json, auth_events_json,
           history_events_json, admission_events_json, day, posts_day,
-          registrations_day, updated_ms
+          registrations_day, uploads_day, updated_ms
        FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1`,
       scope,
       principalKey,
@@ -2248,6 +2471,7 @@ export class Store {
       day,
       posts_day: 0,
       registrations_day: 0,
+      uploads_day: 0,
       updated_ms: now,
     };
   }
@@ -2257,7 +2481,7 @@ export class Store {
     this.rawExec(
       `UPDATE principal_limits SET post_events_json = ?, auth_events_json = ?,
         history_events_json = ?, admission_events_json = ?, day = ?,
-        posts_day = ?, registrations_day = ?, updated_ms = ?
+        posts_day = ?, registrations_day = ?, uploads_day = ?, updated_ms = ?
        WHERE scope = ? AND principal_key = ?`,
       next.post_events_json,
       next.auth_events_json,
@@ -2266,6 +2490,7 @@ export class Store {
       next.day,
       next.posts_day,
       next.registrations_day,
+      next.uploads_day,
       next.updated_ms,
       next.scope,
       next.principal_key,
@@ -3006,6 +3231,14 @@ export class Store {
 
     const logId = this.allocateLogId(context);
     const messageId = previous ? previous.message_id : idString(logId);
+    let uploads: PendingUpload[] = [];
+    let deletedUploads: string[] = [];
+    if (this.config.uploads) {
+      const identified = this.identifyEmbeds(body ? body.embeds as Record<string, unknown>[] : [], previous, input.userId, messageId, logId, context.commitMs);
+      if (body) body.embeds = identified.embeds;
+      uploads = identified.uploads;
+      deletedUploads = this.releaseUploadRows(this.messageUploads(messageId, identified.removed));
+    }
     // Deletion omits the body from the tombstone; the other client fields keep
     // replacement semantics, so omitted fields are removed.
     const snapshot: MessageSnapshot = { message_id: messageId, log_id: idString(logId), room_id: roomId, from: clone(from) };
@@ -3058,7 +3291,335 @@ export class Store {
         broadcasts.push({ method: "reactions", params: clone(record) as unknown as Record<string, unknown>, rooms: [roomId] });
       }
     }
-    return { result: { message_id: messageId }, broadcasts, message: snapshot };
+    // New uploads' writes go in the result, in request order (§4.6.3); the
+    // runtime signs each into a `write_url`, so a retry gets the same URLs.
+    const result: Record<string, unknown> = { message_id: messageId };
+    if (uploads.length) result.embeds = uploads.map(uploadResultEmbed);
+    return { result, broadcasts, message: snapshot, uploads, deletedUploads };
+  }
+
+  /**
+   * Embed identity (protocol §4.6.2) on a server with `embed:upload`: every
+   * embed gets an `embed_id`. One sent back with its `embed_id` keeps what the
+   * server owns from the previous snapshot: an upload keeps its `url` and
+   * `og` and takes only a new `title`. One without is new, and a new `upload`
+   * starts a pending write. Returns the embeds, the uploads started, and the
+   * previous upload embeds the save left out, whose content goes with them.
+   */
+  private identifyEmbeds(
+    embeds: readonly Record<string, unknown>[],
+    previous: MessageSnapshot | null,
+    userId: string,
+    messageId: string,
+    logId: number,
+    now: number,
+  ): { embeds: Record<string, unknown>[]; uploads: PendingUpload[]; removed: string[] } {
+    const earlier = new Map<string, Record<string, unknown>>();
+    const previousEmbeds = previous?.body?.embeds;
+    if (Array.isArray(previousEmbeds)) {
+      for (const embed of previousEmbeds) if (isPlainObject(embed) && typeof embed.embed_id === "string") earlier.set(embed.embed_id, embed);
+    }
+    const kept = new Set<string>();
+    const uploads: PendingUpload[] = [];
+    const identified = embeds.map((embed, index) => {
+      const { embed_id: embedId, ...fields } = embed;
+      if (embedId !== undefined) {
+        const before = typeof embedId === "string" && !kept.has(embedId) ? earlier.get(embedId) : undefined;
+        if (!before || (fields.kind === "upload") !== (before.kind === "upload")) throw new StoreError("invalid_params", "unknown embed_id");
+        kept.add(embedId as string);
+        if (before.kind !== "upload") return { embed_id: embedId, ...fields };
+        const title = uploadTitle(fields.title);
+        return { ...before, ...(title ? { title } : {}) };
+      }
+      const id = `embed_${idString(logId)}_${index}`;
+      if (fields.kind !== "upload") return { embed_id: id, ...fields };
+      uploads.push(this.startUpload("file", userId, now, { messageId, embedId: id }));
+      const title = uploadTitle(fields.title);
+      return { embed_id: id, kind: "upload", ...(title ? { title } : {}) };
+    });
+    const removed = [...earlier.values()]
+      .filter((embed) => embed.kind === "upload" && !kept.has(embed.embed_id as string))
+      .map((embed) => embed.embed_id as string);
+    return { embeds: identified, uploads, removed };
+  }
+
+  /**
+   * Starts an upload (protocol §4.6.3) for a registered user: charges the
+   * user's and the server's daily upload counts, and reserves the largest
+   * size against the stored-bytes cap until the write reports its size.
+   */
+  private startUpload(purpose: UploadPurpose, userId: string, now: number, link: { messageId?: string; embedId: string }): PendingUpload {
+    const policy = this.config.uploads;
+    if (!policy) throw new StoreError("unsupported", "Uploads are not available here");
+    if (!this.identityRow(userId)) throw new StoreError("denied", "Sign in with a passkey to upload");
+    const maxBytes = purpose === "file" ? policy.maxFileBytes : policy.maxAvatarBytes;
+    const day = dayFor(now);
+    const rows = [this.limitRow("upload", `user:${userId}`, now), this.limitRow("upload", "global", now)];
+    const counts = rows.map((row) => (row.day === day ? row.uploads_day : 0));
+    const untilReset = Math.max(1, 86_400_000 - now % 86_400_000);
+    if (counts[1] >= policy.uploadsPerDay) throw new StoreError("retry_after", "Uploads are closed until the daily reset", { retryAfterMs: untilReset });
+    if (counts[0] >= policy.uploadsPerUserDay) throw new StoreError("retry_after", "Daily upload limit reached", { retryAfterMs: untilReset });
+    const stored = this.metaNumber(META_UPLOAD_BYTES);
+    if (stored + maxBytes > policy.storedBytesCap) {
+      throw new StoreError("retry_after", "Upload storage is full; try again later", { retryAfterMs: 3_600_000 });
+    }
+    rows.forEach((row, index) => this.updateLimitRow(row, { day, uploads_day: counts[index] + 1 }, now));
+    this.setUploadBytes(stored + maxBytes);
+    const key = `${purpose === "file" ? "f" : "a"}/${randomKey()}`;
+    const writeExpiresMs = now + policy.writeWindowSeconds * 1_000;
+    const retentionMs = (purpose === "file" ? policy.fileRetentionSeconds : policy.avatarRetentionSeconds) * 1_000;
+    this.rawExec(
+      `INSERT INTO uploads (upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms, created_ms)
+       VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
+      key, userId, purpose, link.messageId ?? null, link.embedId, maxBytes, writeExpiresMs, now + retentionMs, now,
+    );
+    return { key, purpose, embedId: link.embedId, maxBytes, writeExpiresMs };
+  }
+
+  private setUploadBytes(bytes: number): void {
+    this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_UPLOAD_BYTES, String(Math.max(0, bytes)));
+  }
+
+  private uploadRow(key: string): RawUploadRow | null {
+    return this.rawRows<RawUploadRow>(
+      `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
+       FROM uploads WHERE upload_key = ? LIMIT 1`,
+      key,
+    )[0] ?? null;
+  }
+
+  /** A message's uploads, all of them or those of some embeds. Bounded by the embeds a message may carry. */
+  private messageUploads(messageId: string, embedIds?: readonly string[]): RawUploadRow[] {
+    if (embedIds && !embedIds.length) return [];
+    const rows = this.rawRows<RawUploadRow>(
+      `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
+       FROM uploads INDEXED BY uploads_message_idx WHERE message_id = ? LIMIT ?`,
+      messageId, 4 * this.config.maxEmbeds,
+    );
+    return embedIds ? rows.filter((row) => row.embed_id !== null && embedIds.includes(row.embed_id)) : rows;
+  }
+
+  /** Forgets uploads and frees their bytes; returns their keys, whose R2 objects the caller deletes. */
+  private releaseUploadRows(rows: readonly RawUploadRow[]): string[] {
+    if (!rows.length) return [];
+    let freed = 0;
+    for (const row of rows) {
+      this.rawExec("DELETE FROM uploads WHERE upload_key = ?", row.upload_key);
+      freed += row.bytes;
+    }
+    this.setUploadBytes(this.metaNumber(META_UPLOAD_BYTES) - freed);
+    return rows.map((row) => row.upload_key);
+  }
+
+  /** Marks a pending upload written, counting its real size in place of the largest. */
+  private completeUploadRow(row: RawUploadRow, bytes: number, contentType: string): void {
+    this.rawExec("UPDATE uploads SET state = 'done', bytes = ?, content_type = ? WHERE upload_key = ?", bytes, contentType, row.upload_key);
+    this.setUploadBytes(this.metaNumber(META_UPLOAD_BYTES) - row.bytes + bytes);
+  }
+
+  /**
+   * Starts an avatar upload (protocol §4.6.6): `/avatar` with one `upload`
+   * embed. The avatar is set when the write finishes (finishUpload).
+   */
+  startAvatarUpload(input: { userId: string; now?: number }): PendingUpload {
+    this.ensureReady();
+    const now = input.now ?? this.clock.now();
+    return this.reserved({ reads: 32, writes: UPLOAD_WRITES + 8 }, false, now, () => this.transaction(() => {
+      const effective = this.effectiveNow(now);
+      return this.startUpload("avatar", input.userId, effective, { embedId: `embed_${randomKey()}` });
+    }));
+  }
+
+  /**
+   * Finishes a write exactly once (protocol §4.6.3). A file's message gets a
+   * new snapshot, with the embed completed (`url`, and `og.image` describing
+   * it) or, for a failed write, without it; an avatar becomes its owner's.
+   * A write that is not pending, came too late, or whose embed or message is
+   * gone is not accepted, and its object is the caller's to delete.
+   */
+  finishUpload(write: UploadWrite, now = this.clock.now()): UploadFinish {
+    this.ensureReady();
+    return this.reserved({ reads: 96, writes: 64 + UPLOAD_WRITES }, false, now, () => this.transaction(() => {
+      const effective = this.effectiveNow(now);
+      const row = this.uploadRow(write.key);
+      if (!row || row.state !== "writing" || effective > row.write_expires_ms + UPLOAD_WRITE_GRACE_MS) {
+        return { accepted: false, broadcasts: [], deletedUploads: [] };
+      }
+      return this.completeUpload(row, write, effective);
+    }));
+  }
+
+  /**
+   * Claims a pending upload's write for the one request that arrived in its
+   * window, before any byte reaches R2: a `write_url` used again is refused,
+   * so it cannot overwrite a finished upload.
+   */
+  claimUpload(key: string, now = this.clock.now()): boolean {
+    this.ensureReady();
+    return this.reserved({ reads: 8, writes: 8 }, false, now, () => this.transaction(() => {
+      const row = this.uploadRow(key);
+      if (!row || row.state !== "pending" || this.effectiveNow(now) > row.write_expires_ms) return false;
+      this.rawExec("UPDATE uploads SET state = 'writing' WHERE upload_key = ?", key);
+      return true;
+    }));
+  }
+
+  private completeUpload(row: RawUploadRow, write: UploadWrite, now: number): UploadFinish {
+    const ok = write.ok && typeof write.bytes === "number" && write.bytes > 0 && write.bytes <= row.bytes && !!write.contentType;
+    const url = `${this.config.uploads?.mediaOrigin ?? ""}/${row.upload_key}`;
+    if (row.purpose === "avatar") {
+      const identity = this.identityRow(row.owner_id);
+      if (!ok || !identity) return { accepted: false, broadcasts: [], deletedUploads: this.releaseUploadRows([row]) };
+      this.completeUploadRow(row, write.bytes!, write.contentType!);
+      const replaced = this.rawRows<RawUploadRow>(
+        `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
+         FROM uploads INDEXED BY uploads_owner_idx WHERE owner_id = ? AND purpose = 'avatar' AND state = 'done' AND upload_key <> ? LIMIT 8`,
+        row.owner_id, row.upload_key,
+      );
+      this.rawExec("UPDATE identities SET avatar_url = ?, avatar_expires_ms = ?, updated_ms = ? WHERE user_id = ?", url, row.expires_ms, now, row.owner_id);
+      return { accepted: true, broadcasts: [], avatar: { userId: row.owner_id, url }, deletedUploads: this.releaseUploadRows(replaced) };
+    }
+    const message = row.message_id ? this.currentMessage(row.message_id) : null;
+    const snapshot = message ? parseJson<MessageSnapshot>(message.snapshot_json) : null;
+    const embeds = snapshot && !snapshot.deleted && Array.isArray(snapshot.body?.embeds) ? snapshot.body.embeds as Record<string, unknown>[] : [];
+    const embed = embeds.find((candidate) => candidate.embed_id === row.embed_id);
+    if (!message || !snapshot || !embed) return { accepted: false, broadcasts: [], deletedUploads: this.releaseUploadRows([row]) };
+    let replacement: Record<string, unknown> | null = null;
+    let deletedUploads: string[] = [];
+    if (ok) {
+      this.completeUploadRow(row, write.bytes!, write.contentType!);
+      const size = write.width && write.height ? { width: write.width, height: write.height } : {};
+      replacement = { ...embed, url, og: { ...(typeof embed.title === "string" ? { title: embed.title } : {}), image: { url, type: write.contentType, ...size } } };
+    } else deletedUploads = this.releaseUploadRows([row]);
+    return { accepted: ok, broadcasts: this.rewriteEmbed(message, snapshot, row.embed_id!, replacement, now), deletedUploads };
+  }
+
+  /**
+   * A server-made snapshot of a message with one embed replaced, or removed
+   * when `replacement` is null. A message left with no text and no embeds is
+   * a tombstone, like a deletion.
+   */
+  private rewriteEmbed(message: RawMessageRow, snapshot: MessageSnapshot, embedId: string, replacement: Record<string, unknown> | null, now: number): Broadcast[] {
+    const state = this.logState();
+    const startLogId = state.last_log_id;
+    const context: CommitContext = { state, commitMs: Math.max(now, state.last_commit_ms), touched: new Map() };
+    const logId = this.allocateLogId(context);
+    const embeds = (snapshot.body?.embeds as Record<string, unknown>[]).flatMap((embed) => (embed.embed_id === embedId ? (replacement ? [replacement] : []) : [embed]));
+    const { prev_room_id: _moved, body: previousBody, ...rest } = snapshot;
+    const next: MessageSnapshot = { ...rest, log_id: idString(logId), prev_log_id: idString(message.latest_log_id) };
+    if (previousBody?.text === "" && !embeds.length) next.deleted = true;
+    else next.body = { ...previousBody, embeds };
+    const json = JSON.stringify(next);
+    this.appendRecord(context, [message.room_id], "message", logId, json);
+    this.rawExec("UPDATE message_state SET latest_log_id = ?, snapshot_json = ? WHERE message_id = ?", logId, json, message.message_id);
+    this.finishCommit(context, startLogId);
+    return [{ method: "message", params: clone(next) as unknown as Record<string, unknown>, rooms: [message.room_id] }];
+  }
+
+  /**
+   * Fails pending uploads whose write never came (protocol §4.6.3): their
+   * messages get a snapshot without the embed. Maintenance work, a bounded
+   * batch per call; `next` is when the next one falls due.
+   */
+  expirePendingUploads(now = this.clock.now()): { broadcasts: Broadcast[]; deletedUploads: string[]; next?: number } {
+    this.ensureReady();
+    const done = { broadcasts: [] as Broadcast[], deletedUploads: [] as string[] };
+    if (!this.config.uploads) return done;
+    const due = this.reserved({ reads: 16 + UPLOAD_SWEEP_BATCH }, true, now, () => this.rawRows<RawUploadRow>(
+      `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
+       FROM uploads INDEXED BY uploads_pending_idx WHERE state IN ('pending', 'writing') AND write_expires_ms < ?
+       ORDER BY write_expires_ms LIMIT ?`,
+      this.effectiveNow(now) - UPLOAD_WRITE_GRACE_MS, UPLOAD_SWEEP_BATCH,
+    ));
+    for (const row of due) {
+      const finished = this.reserved({ reads: 96, writes: 64 + UPLOAD_WRITES }, true, now, () => this.transaction(() => {
+        const current = this.uploadRow(row.upload_key);
+        return current && current.state !== "done" ? this.completeUpload(current, { key: row.upload_key, ok: false }, this.effectiveNow(now)) : null;
+      }));
+      if (!finished) continue;
+      done.broadcasts.push(...finished.broadcasts);
+      done.deletedUploads.push(...finished.deletedUploads);
+    }
+    const next = this.reserved({ reads: 8 }, true, now, () => this.rawRows<{ due: number | null }>(
+      "SELECT MIN(write_expires_ms) AS due FROM uploads INDEXED BY uploads_pending_idx WHERE state IN ('pending', 'writing')",
+    )[0]?.due);
+    return typeof next === "number" ? { ...done, next: next + UPLOAD_WRITE_GRACE_MS } : done;
+  }
+
+  /**
+   * Forgets uploads past their expiry plus the lifecycle lag, when R2 has
+   * deleted them, freeing their bytes; an expired avatar leaves its owner.
+   * Maintenance work, a bounded batch per call.
+   */
+  cleanupUploads(now = this.clock.now()): number {
+    this.ensureReady();
+    const policy = this.config.uploads;
+    if (!policy) return 0;
+    return this.reserved({ reads: 16 + 4 * UPLOAD_SWEEP_BATCH, writes: 8 + 12 * UPLOAD_SWEEP_BATCH }, true, now, () => this.transaction(() => {
+      const rows = this.rawRows<RawUploadRow>(
+        `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
+         FROM uploads INDEXED BY uploads_expiry_idx WHERE expires_ms < ? ORDER BY expires_ms LIMIT ?`,
+        this.effectiveNow(now) - policy.lifecycleLagSeconds * 1_000, UPLOAD_SWEEP_BATCH,
+      );
+      for (const row of rows) {
+        if (row.purpose !== "avatar") continue;
+        this.rawExec(
+          "UPDATE identities SET avatar_url = '', avatar_expires_ms = 0 WHERE user_id = ? AND avatar_url = ?",
+          row.owner_id, `${policy.mediaOrigin}/${row.upload_key}`,
+        );
+      }
+      this.releaseUploadRows(rows);
+      return rows.length;
+    }));
+  }
+
+  /**
+   * A user's avatar key when it is due to be written again: live, and within
+   * `avatarRefreshSeconds` of its expiry.
+   */
+  avatarRefreshDue(userId: string, now = this.clock.now()): string | null {
+    this.ensureReady();
+    const policy = this.config.uploads;
+    if (!policy) return null;
+    return this.reserved({ reads: 8 }, false, now, () => {
+      const row = this.identityRow(userId);
+      const prefix = `${policy.mediaOrigin}/`;
+      if (!row?.avatar_url.startsWith(prefix) || row.avatar_expires_ms <= now) return null;
+      return row.avatar_expires_ms - now <= policy.avatarRefreshSeconds * 1_000 ? row.avatar_url.slice(prefix.length) : null;
+    });
+  }
+
+  /** Restarts an avatar's expiry after its object was written again. */
+  renewAvatar(input: { userId: string; key: string; now?: number }): void {
+    this.ensureReady();
+    const policy = this.config.uploads;
+    if (!policy) return;
+    const now = input.now ?? this.clock.now();
+    this.reserved({ reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
+      const expires = this.effectiveNow(now) + policy.avatarRetentionSeconds * 1_000;
+      this.rawExec("UPDATE uploads SET expires_ms = ? WHERE upload_key = ? AND owner_id = ?", expires, input.key, input.userId);
+      this.rawExec(
+        "UPDATE identities SET avatar_expires_ms = ? WHERE user_id = ? AND avatar_url = ?",
+        expires, input.userId, `${policy.mediaOrigin}/${input.key}`,
+      );
+    }));
+  }
+
+  /** Removes a user's avatar (`me` with `avatar: ""`, §3.3); returns whether one was set and the keys to delete. */
+  clearAvatar(input: { userId: string; now?: number }): { changed: boolean; deletedUploads: string[] } {
+    this.ensureReady();
+    const now = input.now ?? this.clock.now();
+    return this.reserved({ reads: 32, writes: 32 }, false, now, () => this.transaction(() => {
+      const identity = this.identityRow(input.userId);
+      const rows = this.rawRows<RawUploadRow>(
+        `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
+         FROM uploads INDEXED BY uploads_owner_idx WHERE owner_id = ? AND purpose = 'avatar' AND state = 'done' LIMIT 8`,
+        input.userId,
+      );
+      const changed = !!identity?.avatar_url;
+      if (changed) this.rawExec("UPDATE identities SET avatar_url = '', avatar_expires_ms = 0, updated_ms = ? WHERE user_id = ?", this.effectiveNow(now), input.userId);
+      return { changed, deletedUploads: this.releaseUploadRows(rows) };
+    }));
   }
 
   /** Normalize a reaction set: strings, duplicates collapsed, bounded. */
@@ -3315,10 +3876,12 @@ export class Store {
     // writes); every other mutation measured at most 37. Unused rows are
     // credited back, so the floor only decides admission near the ceiling.
     const mayMove = method === "message" && typeof input.params.message_id === "string";
+    // Each embed may start or release an upload (§4.6.3).
+    const uploadWrites = this.config.uploads && method === "message" ? this.config.maxEmbeds * UPLOAD_WRITES : 0;
     const mutationCost = {
       ...this.config.mutationCost,
       reads: Math.max(256, this.config.mutationCost.reads ?? 0),
-      writes: Math.max(mayMove ? 256 : 96, this.config.mutationCost.writes ?? 0),
+      writes: Math.max(mayMove ? 256 : 96, this.config.mutationCost.writes ?? 0) + uploadWrites,
     };
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;

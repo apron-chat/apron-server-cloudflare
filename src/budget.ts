@@ -151,6 +151,18 @@ export interface AccountAllowance {
 	 */
 	monthly?: Readonly<MonthlyAllowance>;
 	monthlyStopRatio?: number;
+	/**
+	 * R2's free tier, for a plan that stores uploads there. Each day stops at
+	 * its share (a 31st) of the monthly operations, and the month at
+	 * `monthlyStopRatio` of them, like the Workers allowances.
+	 */
+	r2?: Readonly<R2Allowance>;
+}
+
+export interface R2Allowance {
+	classAOperationsMonthly: number;
+	classBOperationsMonthly: number;
+	storedBytes: number;
 }
 
 export interface MonthlyAllowance {
@@ -182,6 +194,34 @@ export interface EdgeStop {
 	holdSeconds: number;
 }
 
+/**
+ * Uploads (protocol §4.6.3, cap `embed:upload`): images registered users
+ * attach to messages or set as avatars, stored in R2 and served from its
+ * public bucket domain.
+ */
+export interface UploadPolicy {
+	/** Largest attached image. */
+	maxFileBytes: number;
+	/** Largest avatar image. */
+	maxAvatarBytes: number;
+	/** Uploads the whole server issues a UTC day, avatars included. */
+	uploadsPerDay: number;
+	/** Uploads one user may start a UTC day. */
+	uploadsPerUserDay: number;
+	/** How long a `write_url` stays usable. */
+	writeWindowSeconds: number;
+	/** How long an attached image lives; the bucket's lifecycle rule for `f/` must match. */
+	fileRetentionSeconds: number;
+	/** How long an avatar lives; the bucket's lifecycle rule for `a/` must match. */
+	avatarRetentionSeconds: number;
+	/** A signed-in user's avatar closer than this to expiry is written again, restarting it. */
+	avatarRefreshSeconds: number;
+	/** How long R2 may keep an object after its lifecycle expiry; still counted as stored. */
+	lifecycleLagSeconds: number;
+	/** Bytes all live uploads may hold, pending writes counted at their largest. */
+	storedBytesCap: number;
+}
+
 export interface Plan {
 	name: string;
 	limits: Readonly<Limits>;
@@ -189,6 +229,7 @@ export interface Plan {
 	account: Readonly<AccountAllowance>;
 	features: Readonly<Features>;
 	edgeStop?: Readonly<EdgeStop>;
+	uploads?: Readonly<UploadPolicy>;
 }
 
 // Match the account's Workers plan. To switch back to Free, import FREE_PLAN
@@ -197,6 +238,7 @@ export const PLAN: Plan = PAID_PLAN;
 
 export const DEFAULT_LIMITS: Readonly<Limits> = PLAN.limits;
 export const DEFAULT_FEATURES: Readonly<Features> = PLAN.features;
+export const UPLOAD_POLICY: Readonly<UploadPolicy> | undefined = PLAN.uploads;
 
 // Calibrated implementation bounds remain explicit: raising a payload or parser
 // bound requires rechecking its consumers. Resource ceilings below instead use
