@@ -1,6 +1,6 @@
 import { SELF } from 'cloudflare:test';
 import { expect, it } from 'vitest';
-import { connect, type Peer } from './helpers/socket';
+import { connect, greeting, type Peer } from './helpers/socket';
 
 it('bounds admission at 100 live sockets and delivers one ordered maximum fan-out', async () => {
 	const peers: Peer[] = [];
@@ -8,7 +8,7 @@ it('bounds admission at 100 live sockets and delivers one ordered maximum fan-ou
 		for (let index = 1; index <= 100; index++) {
 			const peer = await connect({ ip: `198.51.100.${index}`, origin: null, host: 'capacity.test' });
 			peers.push(peer);
-			expect((await peer.next()).method).toBe('server');
+			await greeting(peer);
 			peer.send({ id: 'auth', method: 'auth', params: { scheme: 'guest' } });
 			expect((await peer.next()).result.you.user_id).toBeTruthy();
 		}

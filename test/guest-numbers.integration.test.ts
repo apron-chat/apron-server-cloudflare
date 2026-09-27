@@ -2,7 +2,7 @@ import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_LIMITS } from '../src/budget';
 import { Store } from '../src/store';
-import { connect as open } from './helpers/socket';
+import { connect as open, greeting } from './helpers/socket';
 
 type Runtime = {
 	store: Store;
@@ -15,7 +15,7 @@ let nextNet = 1;
 /** A socket to the public object from its own IPv6 /64, so per-IP limits never meet; its server frame is consumed. */
 async function connect() {
 	const peer = await open({ ip: `2001:db8:${(0x4700 + nextNet++).toString(16)}::1` });
-	expect((await peer.next()).method).toBe('server');
+	await greeting(peer);
 	return peer;
 }
 

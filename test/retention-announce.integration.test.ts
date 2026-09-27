@@ -1,11 +1,11 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
-import { connect } from './helpers/socket';
+import { connect, greeting } from './helpers/socket';
 
 it('tells members of expired thread rooms they left, even when the room listing fails', async () => {
 	const peer = await connect({ ip: '192.0.2.77' });
 	try {
-		expect((await peer.next()).method).toBe('server');
+		await greeting(peer);
 		peer.send({ id: 'auth', method: 'auth', params: { scheme: 'guest' } });
 		expect((await peer.next()).id).toBe('auth');
 		peer.send({ id: 'thread', method: 'room_set', params: { parent_room_id: 'general', title: 'Short-lived' } });
