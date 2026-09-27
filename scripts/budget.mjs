@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { ADMISSION_BUDGET, DEFAULT_LIMITS } from '../src/budget.ts';
+import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, DEFAULT_LIMITS } from '../src/budget.ts';
 import { loadConfig } from '../src/config.ts';
 
 const root = new URL('../', import.meta.url);
@@ -50,6 +50,12 @@ export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET) {
 					expression: host,
 					action: 'block', enabled: false,
 				},
+				{
+					ref: 'apron_budget_stop',
+					description: 'Apron: budget stop (the budget guard turns it on and off; leave it to the guard)',
+					expression: host,
+					action: 'block', enabled: false,
+				},
 			],
 		},
 		// Free WAF cannot scope a rate-limiting rule by hostname. Keep this
@@ -93,7 +99,7 @@ function configName(source, file) {
 	return match[1];
 }
 
-export function validateDeploymentConfiguration({ development, production, packageJson, workflow }) {
+export function validateDeploymentConfiguration({ development, production, packageJson, workflow, budgetGuard = false }) {
 	const developmentName = configName(development, 'wrangler.toml');
 	const productionName = configName(production, 'wrangler.production.toml');
 	const productionTopLevel = topLevelConfig(production);
@@ -118,6 +124,16 @@ export function validateDeploymentConfiguration({ development, production, packa
 	if (!/^\s*(?:-\s+)?run:\s*npm run deploy\s*$/m.test(workflow ?? '')) {
 		throw new Error('The deploy workflow must use the guarded package deploy script');
 	}
+	// A plan that bills past its included usage relies on the budget guard,
+	// which needs its minute cron and the zone it controls.
+	if (budgetGuard) {
+		if (!/^\[triggers\]\s*(?:#.*)?\n(?:[^\[].*\n)*?crons\s*=\s*\[[^\]]*"\* \* \* \* \*"[^\]]*\]/m.test(production)) {
+			throw new Error('Production Wrangler config must run the budget guard every minute');
+		}
+		if (!/^ZONE_ID\s*=\s*"[0-9a-f]{32}"\s*(?:#.*)?$/m.test(production)) {
+			throw new Error('Production Wrangler config must set ZONE_ID for the budget guard');
+		}
+	}
 }
 
 function main() {
@@ -129,7 +145,7 @@ function main() {
 	const production = readFileSync(new URL('wrangler.production.toml', root), 'utf8');
 	const packageJson = JSON.parse(readFileSync(new URL('package.json', root), 'utf8'));
 	const workflow = readFileSync(new URL('.github/workflows/deploy.yml', root), 'utf8');
-	validateDeploymentConfiguration({ development, production, packageJson, workflow });
+	validateDeploymentConfiguration({ development, production, packageJson, workflow, budgetGuard: Boolean(ACCOUNT_USAGE_POLICY.monthly) });
 	const outputs = [];
 	for (const [file, namespace] of [['wrangler.toml', '73001'], ['wrangler.production.toml', '73002']]) {
 		const source = readFileSync(new URL(file, root), 'utf8');

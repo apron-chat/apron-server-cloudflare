@@ -22,6 +22,12 @@
 // - Durable Object duration: one object awake all day is 10,800 GB-s, under
 //   the 12,900 daily share, so duration cannot run over.
 // - Storage: unchanged; the database watermarks stay far below 5 GB.
+//
+// None of that bounds hostile traffic that never gets past the entry Worker,
+// which is billed per request. The budget guard (src/budget-guard.ts) checks
+// account usage every minute and turns on an edge block rule, which stops
+// requests before they invoke the Worker, when usage reaches the daily share
+// or `monthlyStopRatio` of the month's included usage.
 import type { Plan } from "../budget.ts";
 import { FREE_PLAN } from "./free.ts";
 
@@ -68,11 +74,29 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// Paid bills 20 incoming WebSocket messages as one request; analytics
 		// report each message.
 		webSocketMessagesPerRequest: 20,
+		// Paid bills past these instead of failing. The daily shares keep any 31
+		// days under 90% of them, but each daily stop lands a detection lag
+		// late; stopping usage since the start of the calendar month at
+		// monthlyStopRatio bounds those overshoots too. A billing cycle overlaps
+		// at most two calendar months, so at one half the cycle stays inside
+		// what the plan includes even when it does not start on the 1st.
+		monthly: Object.freeze({
+			workerRequests: 10_000_000,
+			workerCpuMs: 30_000_000,
+			durableObjectRequests: 1_000_000,
+			durableObjectDurationGbSeconds: 400_000,
+			sqlRowsRead: 25_000_000_000,
+			sqlRowsWritten: 50_000_000,
+			// Workers Logs: one event per Worker or Durable Object invocation,
+			// counted without the WebSocket ratio.
+			logEvents: 20_000_000,
+		}),
+		monthlyStopRatio: 0.5,
 	}),
 	features: Object.freeze({
 		// Typing costs about 5 frames a typing minute, inside the frame budget.
 		activity: true,
-		// Guests post under the anonymous, IP, and global quotas.
-		guestPosting: true,
+		// Guests only read, as on Free: a moderation choice, not a budget one.
+		guestPosting: false,
 	}),
 });

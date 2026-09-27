@@ -3,6 +3,7 @@ import { AuthError, AuthTooLargeError, WebAuthnService, type ChallengeRecord, ty
 import { isAllowedOrigin, loadConfig, type RuntimeConfig } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, MAX_FRAME_LEASE, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE } from "./budget";
 import { fetchAccountUsage, type AccountUsageSnapshot } from "./account-usage";
+import { runBudgetGuard } from "./budget-guard";
 import { extractClientIp, hashIpKey, stripForwardingHeaders } from "./ip";
 import {
 	errorFromUnknown,
@@ -543,7 +544,13 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 	catch { return responseError(503, "Demo capacity reached", 60_000); }
 }
 
-export default { fetch: fetchEntry };
+export default {
+	fetch: fetchEntry,
+	// The cron trigger in wrangler.production.toml runs the budget guard.
+	scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): void {
+		ctx.waitUntil(runBudgetGuard(env, controller.scheduledTime));
+	},
+} satisfies ExportedHandler<Env>;
 
 export class ApronDemoServer extends DurableObject<Env> {
 	private readonly config: RuntimeConfig;
@@ -1998,6 +2005,22 @@ export class ApronDemoServer extends DurableObject<Env> {
 				`| SQL rows written | ${share(usage.sqlRowsWritten, daily.sqlRowsWritten)} |`,
 				`| Stored | ${mib(usage.storedBytes)} / ${mib(ACCOUNT_USAGE_POLICY.storedBytes)} |`,
 			);
+			const monthly = ACCOUNT_USAGE_POLICY.monthly;
+			if (monthly && usage.month) {
+				const month = usage.month;
+				lines.push(
+					"",
+					`| ${month.month} | Used / ${PLAN.name} monthly (stops at ${Math.round((ACCOUNT_USAGE_POLICY.monthlyStopRatio ?? ACCOUNT_USAGE_POLICY.stopRatio) * 100)}%) |`,
+					"|---|---|",
+					`| Worker requests | ${share(month.workerRequests, monthly.workerRequests)} |`,
+					`| Worker CPU (ms) | ${share(month.workerCpuMs, monthly.workerCpuMs)} |`,
+					`| Durable Object requests | ${share(month.durableObjectRequests, monthly.durableObjectRequests)} |`,
+					`| Durable Object duration (GB-s) | ${share(month.durableObjectDurationGbSeconds, monthly.durableObjectDurationGbSeconds)} |`,
+					`| SQL rows read | ${share(month.sqlRowsRead, monthly.sqlRowsRead)} |`,
+					`| SQL rows written | ${share(month.sqlRowsWritten, monthly.sqlRowsWritten)} |`,
+					`| Log events | ${share(month.logEvents, monthly.logEvents)} |`,
+				);
+			}
 		} else {
 			lines.push("**Cloudflare account**: no usage sample; set `ACCOUNT_ID` and `ACCOUNT_ANALYTICS_TOKEN` to read it.");
 		}

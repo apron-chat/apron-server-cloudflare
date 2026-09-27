@@ -15,6 +15,13 @@
         "expression": "http.host eq \"server.apron.chat\"",
         "action": "block",
         "enabled": false
+      },
+      {
+        "ref": "apron_budget_stop",
+        "description": "Apron: budget stop (the budget guard turns it on and off; leave it to the guard)",
+        "expression": "http.host eq \"server.apron.chat\"",
+        "action": "block",
+        "enabled": false
       }
     ]
   },

@@ -9,7 +9,21 @@ export interface AccountUsageSnapshot {
 	sqlRowsRead: number;
 	sqlRowsWritten: number;
 	storedBytes: number;
+	/** Usage since the start of the UTC calendar month, for a plan that bills past its included usage. */
+	month?: AccountUsageMonth;
 	stop: boolean;
+}
+
+export interface AccountUsageMonth {
+	/** The month, `YYYY-MM`. */
+	month: string;
+	workerRequests: number;
+	workerCpuMs: number;
+	durableObjectRequests: number;
+	durableObjectDurationGbSeconds: number;
+	sqlRowsRead: number;
+	sqlRowsWritten: number;
+	logEvents: number;
 }
 
 export interface AccountUsageEnvironment {
@@ -61,14 +75,24 @@ function max(groups: unknown, field: string): number {
 	}, 0);
 }
 
-function exceedsPolicy(usage: Omit<AccountUsageSnapshot, "stop">): boolean {
-	const daily = ACCOUNT_USAGE_POLICY.daily;
-	return usage.workerRequests >= daily.workerRequests * ACCOUNT_USAGE_POLICY.stopRatio ||
-		usage.durableObjectRequests >= daily.durableObjectRequests * ACCOUNT_USAGE_POLICY.stopRatio ||
-		usage.durableObjectDurationGbSeconds >= daily.durableObjectDurationGbSeconds * ACCOUNT_USAGE_POLICY.stopRatio ||
-		usage.sqlRowsRead >= daily.sqlRowsRead * ACCOUNT_USAGE_POLICY.stopRatio ||
-		usage.sqlRowsWritten >= daily.sqlRowsWritten * ACCOUNT_USAGE_POLICY.stopRatio ||
-		usage.storedBytes >= ACCOUNT_USAGE_POLICY.storedBytes * ACCOUNT_USAGE_POLICY.stopRatio;
+/**
+ * The allowances usage has reached its stop ratio of, as `daily.<field>`,
+ * `storedBytes`, or `monthly.<field>`; empty while it may continue.
+ */
+export function exceededAllowances(usage: Omit<AccountUsageSnapshot, "stop">): string[] {
+	const { daily, monthly, monthlyStopRatio, stopRatio, storedBytes } = ACCOUNT_USAGE_POLICY;
+	const exceeded = (Object.keys(daily) as (keyof typeof daily)[])
+		.filter((field) => usage[field] >= daily[field] * stopRatio)
+		.map((field) => `daily.${field}`);
+	if (usage.storedBytes >= storedBytes * stopRatio) exceeded.push("storedBytes");
+	if (monthly && usage.month) {
+		const month = usage.month;
+		const ratio = monthlyStopRatio ?? stopRatio;
+		for (const field of Object.keys(monthly) as (keyof typeof monthly)[]) {
+			if (month[field] >= monthly[field] * ratio) exceeded.push(`monthly.${field}`);
+		}
+	}
+	return exceeded;
 }
 
 export function accountUsageSnapshotFromResult(result: unknown, sampledAt: number): AccountUsageSnapshot {
@@ -89,21 +113,47 @@ export function accountUsageSnapshotFromResult(result: unknown, sampledAt: numbe
 		sqlRowsRead: sum(account.durableObjectsPeriodicGroups, "rowsRead"),
 		sqlRowsWritten: sum(account.durableObjectsPeriodicGroups, "rowsWritten"),
 		storedBytes: max(account.durableObjectsStorageGroups, "storedBytes"),
+		...(ACCOUNT_USAGE_POLICY.monthly ? { month: monthUsage(account, sampledAt) } : {}),
 	};
-	return { ...usage, stop: exceedsPolicy(usage) };
+	return { ...usage, stop: exceededAllowances(usage).length > 0 };
 }
 
-export async function fetchAccountUsage(env: AccountUsageEnvironment, sampledAt = Date.now(), signal?: AbortSignal): Promise<AccountUsageSnapshot> {
+function monthUsage(account: Record<string, unknown>, sampledAt: number): AccountUsageMonth {
+	const workerRequests = sum(account.monthWorkers, "requests");
+	const invocations = sum(account.monthInvocations, "requests");
+	return {
+		month: dayFor(sampledAt).slice(0, 7),
+		workerRequests,
+		workerCpuMs: sum(account.monthWorkers, "cpuTimeUs") / 1_000,
+		durableObjectRequests: sum(account.monthInvocations, "requests", billedRequestWeight),
+		durableObjectDurationGbSeconds: sum(account.monthPeriodic, "duration"),
+		sqlRowsRead: sum(account.monthPeriodic, "rowsRead"),
+		sqlRowsWritten: sum(account.monthPeriodic, "rowsWritten"),
+		logEvents: workerRequests + invocations,
+	};
+}
+
+/** Dataset arguments for the range from `startMs` to `endMs`. */
+function range(startMs: number, endMs: number): string {
+	return `filter: { datetime_geq: ${JSON.stringify(new Date(startMs).toISOString())}, datetime_leq: ${JSON.stringify(new Date(endMs).toISOString())} }, limit: 1000`;
+}
+
+export async function fetchAccountUsage(env: AccountUsageEnvironment, sampledAt = Date.now(), signal?: AbortSignal, fetcher: typeof fetch = fetch): Promise<AccountUsageSnapshot> {
 	if (!env.ACCOUNT_ID || !env.ACCOUNT_ANALYTICS_TOKEN) throw new AccountUsageError("account analytics credentials are not configured");
-	const start = new Date(Date.UTC(new Date(sampledAt).getUTCFullYear(), new Date(sampledAt).getUTCMonth(), new Date(sampledAt).getUTCDate())).toISOString();
-	const end = new Date(sampledAt).toISOString();
+	const date = new Date(sampledAt);
+	const day = range(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()), sampledAt);
+	const month = range(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1), sampledAt);
+	const monthly = ACCOUNT_USAGE_POLICY.monthly ? `
+		monthWorkers: workersInvocationsAdaptive(${month}) { sum { requests cpuTimeUs } }
+		monthInvocations: durableObjectsInvocationsAdaptiveGroups(${month}) { dimensions { type } sum { requests } }
+		monthPeriodic: durableObjectsPeriodicGroups(${month}) { sum { duration rowsRead rowsWritten } }` : "";
 	const query = `query { viewer { accounts(filter: { accountTag: ${JSON.stringify(env.ACCOUNT_ID)} }) {
-		workersInvocationsAdaptive(filter: { datetime_geq: ${JSON.stringify(start)}, datetime_leq: ${JSON.stringify(end)} }, limit: 1000) { sum { requests } }
-		durableObjectsInvocationsAdaptiveGroups(filter: { datetime_geq: ${JSON.stringify(start)}, datetime_leq: ${JSON.stringify(end)} }, limit: 1000) { dimensions { type } sum { requests } }
-		durableObjectsPeriodicGroups(filter: { datetime_geq: ${JSON.stringify(start)}, datetime_leq: ${JSON.stringify(end)} }, limit: 1000) { sum { duration rowsRead rowsWritten } }
-		durableObjectsStorageGroups(filter: { datetime_geq: ${JSON.stringify(start)}, datetime_leq: ${JSON.stringify(end)} }, limit: 1000) { max { storedBytes } }
+		workersInvocationsAdaptive(${day}) { sum { requests } }
+		durableObjectsInvocationsAdaptiveGroups(${day}) { dimensions { type } sum { requests } }
+		durableObjectsPeriodicGroups(${day}) { sum { duration rowsRead rowsWritten } }
+		durableObjectsStorageGroups(${day}) { max { storedBytes } }${monthly}
 	} } }`;
-	const response = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+	const response = await fetcher("https://api.cloudflare.com/client/v4/graphql", {
 		method: "POST",
 		headers: { Authorization: `Bearer ${env.ACCOUNT_ANALYTICS_TOKEN}`, "Content-Type": "application/json" },
 		body: JSON.stringify({ query }),

@@ -7,6 +7,8 @@ declare global {
 		CF_VERSION_METADATA?: WorkerVersionMetadata;
 		ACCOUNT_ID?: string;
 		ACCOUNT_ANALYTICS_TOKEN?: string;
+		ZONE_ID?: string;
+		EDGE_STOP_TOKEN?: string;
 		ASSETS?: Fetcher;
 		ALLOWED_ORIGINS?: string;
 		RP_ID?: string;
@@ -22,6 +24,8 @@ declare global {
 			CF_VERSION_METADATA?: WorkerVersionMetadata;
 			ACCOUNT_ID?: string;
 			ACCOUNT_ANALYTICS_TOKEN?: string;
+			ZONE_ID?: string;
+			EDGE_STOP_TOKEN?: string;
 			ASSETS?: Fetcher;
 			ALLOWED_ORIGINS?: string;
 			RP_ID?: string;

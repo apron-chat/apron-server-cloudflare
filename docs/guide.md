@@ -9,9 +9,8 @@ A single SQLite Durable Object serves the permanent `general` room and its
 thread rooms over hibernating WebSockets. The backend supports guest access,
 discoverable passkeys, complete-snapshot history, message
 replacement/deletion/restoration/moves, thread rooms, emoji reactions, and a
-rolling retention floor. Guests post with the Workers Paid budgets and only
-read with the Free ones (`GUEST_POSTING` overrides); signing in with a passkey
-lets a user post and invite a bot. It speaks protocol 6 with `history`,
+rolling retention floor. Guests only read (set `GUEST_POSTING=true` to let
+them post); signing in with a passkey lets a user post and invite a bot. It speaks protocol 6 with `history`,
 `edit`, `rooms`, `reactions`, and `command` (`/help` and `/invite-bot`), and
 advertises liveness pings and, with the Workers Paid budgets, typing through
 `activity` (`ACTIVITY` overrides); see [authentication and policy](policy.md) and [the
@@ -195,8 +194,7 @@ message ownership.
 Passkeys require authentication on each new connection and do not prevent
 multiple registrations by one person.
 
-Guests post by default with the Workers Paid budgets and only read with the
-Free ones. Where guests post, guest posting is
+Guests only read by default. With `GUEST_POSTING=true`, guest posting is
 shared by IP (native IPv6 grouped by /64): five accepted
 mutations per rolling minute and 200 per UTC day (100 with the Free budgets).
 Registered users receive 20/minute and 1,000/day (500), subject to the common IP and global limits. NAT users
@@ -317,8 +315,10 @@ For direct Wrangler production commands, always pass
    entry Worker requests. Reserve headroom for all account workloads. Confirm
    the application cost tests and configured limits still fit; the daily post
    ceiling (10,000; 5,000 on Free) is a ceiling, not a promise. On Paid, set
-   `ACCOUNT_ID` and `ACCOUNT_ANALYTICS_TOKEN` so the account-usage stop runs,
-   and consider Cloudflare billing notifications as well.
+   up the [budget guard](configuration.md#budget-guard): the
+   `apron_budget_stop` rule, the `EDGE_STOP_TOKEN` secret, and
+   `ACCOUNT_ID` with `ACCOUNT_ANALYTICS_TOKEN`. Keep a Cloudflare budget alert
+   as a second signal.
 3. Set `ALLOWED_ORIGINS = "*"` for the public reference server. Keep the
    passkey RP ID `apron.chat` and the explicit, exact `RP_ORIGINS` allowlist;
    wildcard guest admission never enables wildcard passkey verification.
@@ -352,8 +352,8 @@ For direct Wrangler production commands, always pass
    costs exceed tested bounds; do not raise budgets to conceal a discrepancy.
 
 On Workers Free, the plan's hard limits are the zero-overage backstop. Workers
-Paid has none: traffic past the included usage is billed, and the account-usage
-stop and `ADMISSION_OFF` are what limit it. Application quotas provide
+Paid has none: traffic past the included usage is billed, and the budget
+guard's edge stop is what limits it. Application quotas provide
 controlled degradation for admitted work, not availability under unlimited
 hostile traffic: rejected HTTP requests and incoming frames still cost platform
 resources. Local calibration is not proof of production billing or availability.

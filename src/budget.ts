@@ -145,6 +145,22 @@ export interface AccountAllowance {
 	storedBytes: number;
 	/** Incoming WebSocket messages billed as one Durable Object request. */
 	webSocketMessagesPerRequest: number;
+	/**
+	 * Included usage per month, for a plan that bills past it. Usage since the
+	 * start of the UTC calendar month stops at `monthlyStopRatio` of any of it.
+	 */
+	monthly?: Readonly<MonthlyAllowance>;
+	monthlyStopRatio?: number;
+}
+
+export interface MonthlyAllowance {
+	workerRequests: number;
+	workerCpuMs: number;
+	durableObjectRequests: number;
+	durableObjectDurationGbSeconds: number;
+	sqlRowsRead: number;
+	sqlRowsWritten: number;
+	logEvents: number;
 }
 
 /** Defaults for the feature switches; `ACTIVITY` and `GUEST_POSTING` override them. */

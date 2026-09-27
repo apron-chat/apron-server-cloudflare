@@ -9,7 +9,7 @@ one, and must match the account's plan.
 
 | File | Plan | Features on by default |
 | --- | --- | --- |
-| [`src/plans/paid.ts`](../src/plans/paid.ts) (selected) | Workers Paid, $5/month | `activity` (typing), guest posting |
+| [`src/plans/paid.ts`](../src/plans/paid.ts) (selected) | Workers Paid, $5/month | `activity` (typing) |
 | [`src/plans/free.ts`](../src/plans/free.ts) | Workers Free | none |
 
 The paid plan starts from the free one and raises only what Paid's included
@@ -76,7 +76,9 @@ daily allowances: Free's own daily ones, or Paid's monthly included usage
 divided by 31 days, so stopping inside each day's share keeps the month inside
 what the plan includes. Incoming WebSocket messages, which analytics report as
 `hibernation` invocations, count as a twentieth of a request on Paid, as it
-bills them, and as a whole one on Free. At 90% of any allowance, the object
+bills them, and as a whole one on Free. On Paid it also reads usage since the
+start of the calendar month against the plan's `monthly` allowances. At 90% of
+any daily allowance, or `monthlyStopRatio` of a monthly one, the object
 persists a stop for that UTC day, rejects new connections,
 and closes live sockets. This is an early-stop signal, not an exact remaining-
 quota meter: analytics lag, sampling, and other account workloads can still cause
@@ -88,13 +90,67 @@ blocking windows must both be 10 seconds on Free. It is generated disabled becau
 it applies across hostnames in the zone. See [edge admission operations](edge-admission.md)
 before applying rules or deploying changed budgets.
 
-Only **Workers Free** gives an absolute zero-overage boundary. On Workers Paid,
-rejected and hostile traffic past the included usage is billed rather than
-refused: entry Worker requests (every WebSocket attempt and status probe) at
-$0.30 a million and Durable Object requests at $0.15 a million, at the rates
-checked 2026-09-27. The account-usage stop, `ADMISSION_OFF`, and the edge rules
-limit that; none of them is a spending cap. Changing these files never changes
-the account plan, and the budgets cannot guarantee availability under attack.
+Changing these files never changes the account plan, and the budgets cannot
+guarantee availability under attack.
+
+## Budget guard
+
+Workers Free refuses work past its allowances. Workers Paid bills it instead,
+and Cloudflare offers no spending cap (budget alerts only send email, a day
+late). Application limits cannot bound traffic that never gets past the entry
+Worker, since every request that reaches the Worker is billed, even one it
+rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
+
+- The production Worker's cron trigger runs it every minute. It reads the
+  account's usage for today and for the calendar month so far, the same way
+  the account-usage stop does (above).
+- While usage has reached 90% of any daily share, or `monthlyStopRatio` (one
+  half) of any monthly allowance, it turns on the zone custom rule
+  `apron_budget_stop`, which blocks `server.apron.chat` at the edge. Blocked
+  requests never invoke the Worker and are not billed. It turns the rule off
+  once usage is back under every allowance: at the next UTC day for a daily
+  share, or the next month for a monthly one. It touches no other rule, so
+  `apron_admission_off` stays yours to use by hand.
+- The monthly allowances are Worker requests, Worker CPU, Durable Object
+  requests and duration, SQL rows read and written, and Workers Logs events.
+  A billing cycle overlaps at most two calendar months, so stopping each month
+  at one half keeps any cycle inside the included usage.
+- If usage or the rule cannot be read, the rule keeps its state and the guard
+  logs an error (`budget_guard_*` events). It never turns the stop off
+  without a successful reading.
+
+Set it up once per deployment:
+
+1. Create `apron_budget_stop` (disabled) from
+   [the generated definition](edge-rules.generated.json), as described in
+   [edge admission operations](edge-admission.md). The guard only turns an
+   existing rule on and off.
+2. Create an API token with **Zone > WAF > Edit** on the `apron.chat` zone
+   only, and store it with `npx wrangler secret put EDGE_STOP_TOKEN --config
+   wrangler.production.toml`. `ZONE_ID` is a Wrangler var.
+3. Keep `ACCOUNT_ID` and the `ACCOUNT_ANALYTICS_TOKEN` secret set.
+
+`npm run deploy` refuses a plan with monthly allowances unless the production
+config has the minute cron trigger and `ZONE_ID`. It cannot see secrets or the
+live rule; check the Worker's logs for `budget_guard_unconfigured` or
+`budget_guard_rule_missing` after deploying.
+
+What the guard cannot promise:
+
+- **Detection lag.** Analytics arrive a few minutes late, and the rule acts
+  within a minute after that. Exceeding the included usage would take an
+  attack that delivers about half a month's allowance (5 million Worker
+  requests) inside that window: about 14,000 requests a second for six
+  minutes, past Cloudflare's own DDoS mitigation.
+- **Open sockets.** The edge rule stops new requests, not WebSockets already
+  open. The Durable Object's own account-usage stop closes them when it next
+  refreshes, and its per-connection limits bound them until then.
+- **Other Workers.** Allowances are account-wide. The guard counts every
+  Worker's usage but blocks only this server. Another Worker reachable on
+  `workers.dev` or preview URLs, where zone WAF rules do not apply, can still
+  run up the bill; turn those off for Workers that do not need them.
+- **Other products** on the account (R2, KV, Queues, and so on) are not
+  measured.
 
 ## Runtime overrides
 
@@ -166,7 +222,7 @@ and recalibrating its resource model.
 | `ALLOWED_ORIGINS` | Exact browser-origin allowlist, or standalone `*` to admit every guest origin (including opaque/missing Origin); cannot mix `*` with explicit origins; all clients remain subject to quotas |
 | `RP_NAME` | Bounded display name for browser passkey prompts |
 | `ACTIVITY` | `true` advertises and relays typing (cap `activity`, section 4.2 of the spec); `false` turns it off. Unset, the plan decides: on for Workers Paid, off for Free. Read cursors are never kept |
-| `GUEST_POSTING` | `true` lets guests post, react, join and leave rooms, and create threads under the guest quotas; `false` leaves guests to list rooms and read history until they sign in with a passkey. Unset, the plan decides: on for Workers Paid, off for Free. Announced as `ext.demo.guest_posting` |
+| `GUEST_POSTING` | `true` lets guests post, react, join and leave rooms, and create threads under the guest quotas; default off in both plans, so guests only list rooms and read history until they sign in with a passkey. Announced as `ext.demo.guest_posting` |
 | `APRON_ADMIN_TOKEN` | Optional fixed bearer token, 24 to 256 of `A-Z a-z 0-9 - _` and not starting `apron_bot_`: `auth` with `scheme: "token"` and this token signs in as the registered user `admin` ("Admin"), from any origin and without a passkey, created on first use (a registration against the usual caps). That user is always an admin and can run `/admin <user_id>`, `/kick <user_id>`, `/rename <old_user_id> <new_user_id>` and `/status` (see [SPEC section 5, Admins](../SPEC.md#admins)). Unset by default. Anyone holding it can act as the admin, so set it only as a secret, never a Wrangler var in source: `npx wrangler secret put APRON_ADMIN_TOKEN --config wrangler.production.toml`. It persists across deploys; delete it with `npx wrangler secret delete APRON_ADMIN_TOKEN --config wrangler.production.toml` to turn it off. A malformed value makes every request fail its configuration check. Locally, use `npx wrangler dev --var APRON_ADMIN_TOKEN:…` or `.dev.vars` |
 | `ADMISSION_OFF` | Operator admission switch; `true` rejects new sockets in the entry Worker before the limiter or DO call; existing sockets remain subject to DO budgets |
 | `ENVIRONMENT` | Set to `development` to enable local origin defaults when `ALLOWED_ORIGINS` and `RP_ORIGINS` are omitted |

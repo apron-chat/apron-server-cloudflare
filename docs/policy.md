@@ -117,9 +117,8 @@ are stored hashed in the object and swept on expiry. Signing out is local to
 the client: it drops the stored token, and the connection returns as a fresh
 guest.
 
-Guests post with the Workers Paid budgets and only read with the Free ones;
-`GUEST_POSTING` overrides either (`ext.demo.guest_posting` says which). Where
-guests only read, they can list rooms, read any room's
+Guests only read unless the deployment sets `GUEST_POSTING=true`
+(`ext.demo.guest_posting` says which): they can list rooms, read any room's
 history without joining it, and run `/help`, and stay in `general`, where
 authentication put them. Posting, reacting, joining, leaving, and creating or
 editing threads are writes, `denied` ("Guests can only read here; sign in with
@@ -155,7 +154,7 @@ advisory 256 KiB recommendation. Payload lengths count UTF-8 bytes. Errors use
 the base protocol codes; `retry_after` includes `data.retry_after`, whole
 seconds rounded up. Permanent identity/thread-room ceilings return `denied`, not a fabricated replenishment time.
 
-Guest posting allowances (where guests post) are shared across a normalized IP; native IPv6
+Guest posting allowances (with `GUEST_POSTING=true`) are shared across a normalized IP; native IPv6
 addresses share a /64 bucket. Registered users also share the aggregate IP
 limit. NAT users can therefore limit one another. Passkeys do not provide
 one-person-one-account or prevent Sybil attacks.

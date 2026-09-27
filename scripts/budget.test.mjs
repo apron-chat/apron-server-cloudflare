@@ -11,6 +11,9 @@ test('changed admission limits propagate to both Worker and optional edge policy
 	assert.equal(edge.optionalZoneRateLimit.rules[0].enabled, false);
 	assert.match(edge.custom.rules[0].expression, /http.host eq "chat.example.test"/);
 	assert.equal(edge.custom.rules[1].enabled, false);
+	assert.deepEqual(edge.custom.rules.map((rule) => rule.ref), ['apron_invalid_request', 'apron_admission_off', 'apron_budget_stop']);
+	assert.equal(edge.custom.rules[2].enabled, false);
+	assert.equal(edge.custom.rules[2].expression, 'http.host eq "chat.example.test"');
 });
 
 test('generation is idempotent and preserves unrelated Wrangler settings', () => {
@@ -90,4 +93,19 @@ test('deployment configuration isolates development and protects production sele
 		packageJson,
 		workflow: '      - run: npx wrangler deploy\n',
 	}), /deploy workflow/);
+});
+
+test('a plan that bills past its included usage requires the budget guard cron and zone', () => {
+	const packageJson = { scripts: { deploy: 'npm run budget:check && wrangler deploy --config wrangler.production.toml' } };
+	const workflow = '      - run: npm run deploy\n';
+	const development = 'name = "apron-cloudflare-demo-dev"\n';
+	const base = 'name = "apron-cloudflare-demo"\nworkers_dev = false\npreview_urls = false\nroutes = [{ pattern = "server.apron.chat", custom_domain = true }]\n';
+	const zone = '[vars]\nZONE_ID = "d7467571c212da5b57bbc92afeb967b7"\n';
+	const cron = '[triggers]\ncrons = ["* * * * *"]\n';
+	const check = (production) => validateDeploymentConfiguration({ development, production, packageJson, workflow, budgetGuard: true });
+	assert.doesNotThrow(() => check(base + zone + cron));
+	assert.doesNotThrow(() => validateDeploymentConfiguration({ development, production: base, packageJson, workflow }));
+	assert.throws(() => check(base + zone), /every minute/);
+	assert.throws(() => check(base + zone + '[triggers]\ncrons = ["*/5 * * * *"]\n'), /every minute/);
+	assert.throws(() => check(base + cron), /ZONE_ID/);
 });

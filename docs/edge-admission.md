@@ -29,6 +29,10 @@ During an authorized deployment:
 3. Optionally create `apron_admission_off`, disabled, as an emergency Block rule.
    Enabling it prevents new requests from invoking the Worker. It does not close
    already upgraded sockets. Never replace unrelated rules with this file.
+   On Workers Paid, also create `apron_budget_stop`, disabled, with its
+   generated expression. The [budget guard](configuration.md#budget-guard)
+   turns it on and off; do not change it by hand or reuse it for anything
+   else. Place both before any applicable Skip rule.
 4. The optional rate rule is **disabled by design**. Free WAF rate rules cannot
    filter by hostname: it would count `/` and `/ws` on `apron.chat`,
    `web.apron.chat`, and every other hostname in the zone. Enable it only after
