@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { ADMISSION_BUDGET, DEFAULT_LIMITS } from '../src/budget.ts';
+import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, DEFAULT_LIMITS, PLAN } from '../src/budget.ts';
 import { loadConfig } from '../src/config.ts';
 
 const root = new URL('../', import.meta.url);
@@ -20,14 +20,36 @@ export function validateAdmission(admission = ADMISSION_BUDGET, limits = DEFAULT
 	}
 }
 
-export function renderBinding(namespace, admission = ADMISSION_BUDGET) {
+export function validateEdgeStop(edgeStop) {
+	for (const [name, value] of Object.entries(edgeStop)) {
+		if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive safe integer`);
+	}
+	if (edgeStop.floodRequestsPerColoMinute % edgeStop.floodSampleEvery !== 0) {
+		throw new Error('floodRequestsPerColoMinute must be a whole number of samples');
+	}
+}
+
+/**
+ * The generated rate-limiter bindings. `flood`, for a plan with an edge stop,
+ * adds the sampled per-location counter the Worker trips the stop on.
+ */
+export function renderBinding(namespace, admission = ADMISSION_BUDGET, flood = undefined) {
 	validateAdmission(admission);
+	let floodBinding = '';
+	if (flood) {
+		validateEdgeStop(flood.edgeStop);
+		floodBinding = `
+[[ratelimits]]
+name = "FLOOD_WATCH"
+namespace_id = "${flood.namespace}"
+simple = { limit = ${flood.edgeStop.floodRequestsPerColoMinute / flood.edgeStop.floodSampleEvery}, period = 60 }`;
+	}
 	return `${begin}
 # Edit src/budget.ts, then run npm run budget:generate.
 [[ratelimits]]
 name = "CONNECTION_ATTEMPTS"
 namespace_id = "${namespace}"
-simple = { limit = ${admission.requestsPerIpMinute}, period = ${admission.workerWindowSeconds} }
+simple = { limit = ${admission.requestsPerIpMinute}, period = ${admission.workerWindowSeconds} }${floodBinding}
 ${end}`;
 }
 
@@ -47,6 +69,12 @@ export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET) {
 				{
 					ref: 'apron_admission_off',
 					description: 'Apron: emergency admission shutdown (enable manually)',
+					expression: host,
+					action: 'block', enabled: false,
+				},
+				{
+					ref: 'apron_budget_stop',
+					description: 'Apron: budget stop (the budget guard turns it on and off; leave it to the guard)',
 					expression: host,
 					action: 'block', enabled: false,
 				},
@@ -93,7 +121,7 @@ function configName(source, file) {
 	return match[1];
 }
 
-export function validateDeploymentConfiguration({ development, production, packageJson, workflow }) {
+export function validateDeploymentConfiguration({ development, production, packageJson, workflow, budgetGuard = false }) {
 	const developmentName = configName(development, 'wrangler.toml');
 	const productionName = configName(production, 'wrangler.production.toml');
 	const productionTopLevel = topLevelConfig(production);
@@ -118,6 +146,16 @@ export function validateDeploymentConfiguration({ development, production, packa
 	if (!/^\s*(?:-\s+)?run:\s*npm run deploy\s*$/m.test(workflow ?? '')) {
 		throw new Error('The deploy workflow must use the guarded package deploy script');
 	}
+	// A plan that bills past its included usage relies on the budget guard,
+	// which needs its minute cron and the zone it controls.
+	if (budgetGuard) {
+		if (!/^\[triggers\]\s*(?:#.*)?\n(?:[^\[].*\n)*?crons\s*=\s*\[[^\]]*"\* \* \* \* \*"[^\]]*\]/m.test(production)) {
+			throw new Error('Production Wrangler config must run the budget guard every minute');
+		}
+		if (!/^ZONE_ID\s*=\s*"[0-9a-f]{32}"\s*(?:#.*)?$/m.test(production)) {
+			throw new Error('Production Wrangler config must set ZONE_ID for the budget guard');
+		}
+	}
 }
 
 function main() {
@@ -129,11 +167,12 @@ function main() {
 	const production = readFileSync(new URL('wrangler.production.toml', root), 'utf8');
 	const packageJson = JSON.parse(readFileSync(new URL('package.json', root), 'utf8'));
 	const workflow = readFileSync(new URL('.github/workflows/deploy.yml', root), 'utf8');
-	validateDeploymentConfiguration({ development, production, packageJson, workflow });
+	validateDeploymentConfiguration({ development, production, packageJson, workflow, budgetGuard: Boolean(ACCOUNT_USAGE_POLICY.monthly) });
 	const outputs = [];
-	for (const [file, namespace] of [['wrangler.toml', '73001'], ['wrangler.production.toml', '73002']]) {
+	for (const [file, namespace, floodNamespace] of [['wrangler.toml', '73001', '73003'], ['wrangler.production.toml', '73002', '73004']]) {
 		const source = readFileSync(new URL(file, root), 'utf8');
-		outputs.push([file, replaceBinding(source, renderBinding(namespace))]);
+		const flood = PLAN.edgeStop ? { namespace: floodNamespace, edgeStop: PLAN.edgeStop } : undefined;
+		outputs.push([file, replaceBinding(source, renderBinding(namespace, ADMISSION_BUDGET, flood))]);
 	}
 	const hosts = [...production.matchAll(/pattern\s*=\s*"([a-z0-9.-]+)"\s*,\s*custom_domain\s*=\s*true/g)];
 	if (hosts.length !== 1) throw new Error('Expected exactly one production custom domain');

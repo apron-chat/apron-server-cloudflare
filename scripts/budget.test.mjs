@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ADMISSION_BUDGET, DEFAULT_LIMITS } from '../src/budget.ts';
-import { renderBinding, renderEdgeRules, replaceBinding, validateAdmission, validateDeploymentConfiguration } from './budget.mjs';
+import { renderBinding, renderEdgeRules, replaceBinding, validateAdmission, validateDeploymentConfiguration, validateEdgeStop } from './budget.mjs';
 
 test('changed admission limits propagate to both Worker and optional edge policy', () => {
 	const changed = { ...ADMISSION_BUDGET, requestsPerIpMinute: 25, edgeRequestsPerIpWindow: 20 };
@@ -11,6 +11,9 @@ test('changed admission limits propagate to both Worker and optional edge policy
 	assert.equal(edge.optionalZoneRateLimit.rules[0].enabled, false);
 	assert.match(edge.custom.rules[0].expression, /http.host eq "chat.example.test"/);
 	assert.equal(edge.custom.rules[1].enabled, false);
+	assert.deepEqual(edge.custom.rules.map((rule) => rule.ref), ['apron_invalid_request', 'apron_admission_off', 'apron_budget_stop']);
+	assert.equal(edge.custom.rules[2].enabled, false);
+	assert.equal(edge.custom.rules[2].expression, 'http.host eq "chat.example.test"');
 });
 
 test('generation is idempotent and preserves unrelated Wrangler settings', () => {
@@ -90,4 +93,29 @@ test('deployment configuration isolates development and protects production sele
 		packageJson,
 		workflow: '      - run: npx wrangler deploy\n',
 	}), /deploy workflow/);
+});
+
+test('a plan that bills past its included usage requires the budget guard cron and zone', () => {
+	const packageJson = { scripts: { deploy: 'npm run budget:check && wrangler deploy --config wrangler.production.toml' } };
+	const workflow = '      - run: npm run deploy\n';
+	const development = 'name = "apron-cloudflare-demo-dev"\n';
+	const base = 'name = "apron-cloudflare-demo"\nworkers_dev = false\npreview_urls = false\nroutes = [{ pattern = "server.apron.chat", custom_domain = true }]\n';
+	const zone = '[vars]\nZONE_ID = "d7467571c212da5b57bbc92afeb967b7"\n';
+	const cron = '[triggers]\ncrons = ["* * * * *"]\n';
+	const check = (production) => validateDeploymentConfiguration({ development, production, packageJson, workflow, budgetGuard: true });
+	assert.doesNotThrow(() => check(base + zone + cron));
+	assert.doesNotThrow(() => validateDeploymentConfiguration({ development, production: base, packageJson, workflow }));
+	assert.throws(() => check(base + zone), /every minute/);
+	assert.throws(() => check(base + zone + '[triggers]\ncrons = ["*/5 * * * *"]\n'), /every minute/);
+	assert.throws(() => check(base + cron), /ZONE_ID/);
+});
+
+test('a plan with an edge stop also generates the sampled flood counter', () => {
+	const edgeStop = { floodRequestsPerColoMinute: 1200, floodSampleEvery: 20, holdSeconds: 1800 };
+	const binding = renderBinding('123', ADMISSION_BUDGET, { namespace: '456', edgeStop });
+	assert.match(binding, /name = "CONNECTION_ATTEMPTS"\nnamespace_id = "123"/);
+	assert.match(binding, /name = "FLOOD_WATCH"\nnamespace_id = "456"\nsimple = \{ limit = 60, period = 60 \}/);
+	assert.doesNotMatch(renderBinding('123'), /FLOOD_WATCH/);
+	assert.throws(() => validateEdgeStop({ ...edgeStop, floodSampleEvery: 7 }), /whole number/);
+	assert.throws(() => validateEdgeStop({ ...edgeStop, holdSeconds: 0 }));
 });

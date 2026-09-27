@@ -1,20 +1,22 @@
 # Edge admission and quota exhaustion
 
-The account must remain on Workers Free. Its hard quotas, rather than application
-counters, prevent Workers/SQLite DO overage charges. Paid-plan included usage is
-not a spending cap. This policy reduces abuse and preserves capacity where
+On Workers Free, the plan's hard quotas, rather than application counters,
+prevent Workers/SQLite DO overage charges. On Workers Paid, included usage is
+not a spending cap: requests these rules block at the edge never invoke the
+Worker and are not billed as Worker requests, which makes the rules the first
+line against billed abuse traffic there. This policy reduces abuse and preserves capacity where
 possible; distributed attacks can still exhaust a day's allowance.
 
 ## Applying the generated rules
 
-Edit limits in `src/budget.ts`, then run `npm run budget:generate` and review
+Edit limits in the selected plan file under `src/plans/`, then run `npm run budget:generate` and review
 `edge-rules.generated.json`. The production hostname is read from the production
 Wrangler custom domain. This file contains rule definitions grouped by phase;
 it is not a payload for replacing an entire zone ruleset.
 
 During an authorized deployment:
 
-1. Verify the actual account's Workers Free plan, the zone's WAF capabilities,
+1. Verify the account's Workers plan matches `PLAN` in `src/budget.ts`, the zone's WAF capabilities,
    available rule slots, and existing rules/Skip actions. Keep HTTP DDoS protection
    enabled. Do not enable a paid feature to install these rules.
 2. Add or update `apron_invalid_request` in the zone's custom-rule phase using
@@ -27,6 +29,10 @@ During an authorized deployment:
 3. Optionally create `apron_admission_off`, disabled, as an emergency Block rule.
    Enabling it prevents new requests from invoking the Worker. It does not close
    already upgraded sockets. Never replace unrelated rules with this file.
+   On Workers Paid, also create `apron_budget_stop`, disabled, with its
+   generated expression. The [budget guard](configuration.md#budget-guard)
+   turns it on and off; do not change it by hand or reuse it for anything
+   else. Place both before any applicable Skip rule.
 4. The optional rate rule is **disabled by design**. Free WAF rate rules cannot
    filter by hostname: it would count `/` and `/ws` on `apron.chat`,
    `web.apron.chat`, and every other hostname in the zone. Enable it only after

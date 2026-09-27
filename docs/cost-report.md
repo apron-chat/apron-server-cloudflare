@@ -174,7 +174,7 @@ memory. Guest auth still stores no identity row.
   reserves a fresh block, since the in-memory block is lost; the unused numbers
   are skipped. The cost is therefore about four rows per block of guests or
   per waking visit, whichever is more: at most about 800 rows a day at the
-  2,000 guest admissions a day, against about 61 charged writes for each guest
+  Free plan's 2,000 guest admissions a day (1,600 at Paid's 4,000), against about 61 charged writes for each guest
   reconnect (admission, auth, history, listing).
 - A schema reset reads the mark before the wipe and writes it back afterwards,
   one uncharged control row like the carried budget row, so guest IDs are
@@ -213,14 +213,15 @@ clients that support it) is answered by `setWebSocketAutoResponse`: it never
 wakes the object or reaches `webSocketMessage`, so it uses no duration, frame
 budget, or SQL. A ping with other spacing is an ordinary frame. Incoming
 WebSocket messages count as Durable Object requests at 20:1, so 100 connections
-that ping all day add about 9,600 requests (under 10% of the 100,000 daily
-allowance). Pings are not rate limited by the demo; a client flooding them can
-spend that allowance, which the account-usage stop and the platform's own Free
-limits bound.
+that ping all day add about 9,600 requests (under 10% of Free's 100,000 daily
+allowance, and 30% of Paid's 32,000 daily share). Pings are not rate limited by
+the demo; a client flooding them can spend that allowance, which the
+account-usage stop bounds, and on Free also the platform's own limits.
 
-The default foreground write ceiling is 60,000 rows per UTC day. Charged at
-about 39 writes each, that is roughly 1,500 posts a day before other
-foreground operations consume the same daily budget; near the ceiling a post
+The Free plan's foreground write ceiling is 60,000 rows per UTC day. Charged
+at about 39 writes each, that is roughly 1,500 posts a day before other
+foreground operations consume the same daily budget (the Paid plan's 700,000
+leaves the 10,000-post ceiling reachable); near the ceiling a post
 is admitted only while its full reservation (120 writes with a request ID, 280
 for an edit) still fits. The 96- and 256-row mutation floors are the
 configured conservative upper bounds for the posting and editing paths and

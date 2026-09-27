@@ -1,4 +1,8 @@
-// Single source for deployment resource policy. Keep the account on Workers Free.
+// Single source for deployment resource policy. The plan files under
+// src/plans/ hold each Cloudflare plan's budgets, allowances, and feature
+// defaults; PLAN below selects the one that matches the account.
+import { PAID_PLAN } from "./plans/paid.ts";
+
 export interface Limits {
 	retentionSeconds: number;
 	cleanupSeconds: number;
@@ -48,10 +52,10 @@ export interface Limits {
 	/**
 	 * Frames the whole server processes in a rolling minute, counted in memory
 	 * before any SQL. Past it, requests get `retry_after` and notifications are
-	 * dropped; the socket stays open. Sized for a spike from 50 connected users,
-	 * 10 of them active: about 20 frames a minute per active user (posts,
-	 * reactions, edits, history pages, room lookups), one per quiet user, and a
-	 * reconnect wave of auth plus a history page each.
+	 * dropped; the socket stays open. Free's 300 is sized for a spike from 50
+	 * connected users, 10 of them active: about 20 frames a minute per active
+	 * user (posts, reactions, edits, history pages, room lookups), one per quiet
+	 * user, and a reconnect wave of auth plus a history page each.
 	 */
 	globalFramesPerMinute: number;
 	/**
@@ -121,79 +125,78 @@ export interface Limits {
 	maxChallengeBytes: number;
 }
 
-export const DEFAULT_LIMITS: Readonly<Limits> = Object.freeze({
-	retentionSeconds: 86_400,
-	cleanupSeconds: 3_600,
-	challengeTtlSeconds: 120,
-	sessionTtlSeconds: 12 * 60 * 60,
-	maxFrameBytes: 16_384,
-	maxTextBytes: 4_096,
-	maxSnapshotBytes: 8_192,
-	maxJsonDepth: 8,
-	maxJsonNodes: 2_048,
-	maxRequestIdBytes: 128,
-	maxNameCodePoints: 80,
-	maxNameBytes: 320,
-	maxEmbeds: 4,
-	historyDefaultLimit: 20,
-	historyMaxLimit: 50,
-	historyMaxResponseBytes: 262_144,
-	historyRequestsPerUserMinute: 10,
-	historyRequestsPerIpMinute: 30,
-	concurrentHistoryPerConnection: 1,
-	anonymousPostsPerMinute: 5,
-	anonymousPostsPerDay: 100,
-	registeredPostsPerMinute: 20,
-	registeredPostsPerDay: 500,
-	ipPostsPerMinute: 30,
-	ipPostsPerDay: 1_000,
-	globalPostsPerMinute: 60,
-	globalPostsPerDay: 5_000,
-	registrationsPerIpDay: 3,
-	registrationsPerDay: 100,
-	registeredIdentityCount: 10_000,
-	authAttemptsPerIpMinute: 10,
-	openConnections: 100,
-	anonymousConnectionsPerIp: 2,
-	registeredConnectionsPerUser: 3,
-	connectionsPerIp: 10,
-	connectionAdmissionsPerIpMinute: 5,
-	connectionAdmissionsPerDay: 2_000,
-	unauthenticatedTimeoutSeconds: 30,
-	pendingFramesPerConnection: 8,
-	pendingBytesPerConnection: 131_072,
-	framesPerConnectionMinute: 60,
-	framesPerIpMinute: 120,
-	processedFramesPerDay: 100_000,
-	repeatedPolicyViolations: 3,
-	globalFramesPerMinute: 300,
-	activityBroadcastsPerUserMinute: 10,
-	roomListRequestsPerUserMinute: 6,
-	activityMaxTypingSeconds: 30,
-	frameLease: 10,
-	roomListMembers: 100,
-	pingSeconds: 45,
-	pingTimeoutSeconds: 150,
-	guestNumberBlock: 10,
-	sqlWritesPerDay: 80_000,
-	sqlReadsPerDay: 3_000_000,
-	foregroundWritesPerDay: 60_000,
-	maintenanceWritesPerDay: 20_000,
-	foregroundReadsPerDay: 2_500_000,
-	maintenanceReadsPerDay: 500_000,
-	databaseHighWaterBytes: 96 * 1024 * 1024,
-	databaseHardTargetBytes: 128 * 1024 * 1024,
-	databaseResumeLowWaterBytes: 80 * 1024 * 1024,
-	cleanupBatch: 100,
-	threadLimit: 100,
-	threadMetadataBytes: 2 * 1024,
-	reactionUsersPerMessage: 32,
-	reactionEmojisPerUser: 8,
-	dedupTtlSeconds: 86_400,
-	limiterRecordCap: 10_000,
-	maxCredentialBytes: 16 * 1024,
-	maxChallengeBytes: 16 * 1024,
-});
+export interface AdmissionBudget {
+	requestsPerIpMinute: number;
+	workerWindowSeconds: number;
+	edgeRequestsPerIpWindow: number;
+	edgeWindowSeconds: number;
+	edgeBlockSeconds: number;
+}
+
+/** A plan's included usage per UTC day, which the account-usage stop compares against. */
+export interface AccountAllowance {
+	daily: Readonly<{
+		workerRequests: number;
+		durableObjectRequests: number;
+		durableObjectDurationGbSeconds: number;
+		sqlRowsRead: number;
+		sqlRowsWritten: number;
+	}>;
+	storedBytes: number;
+	/** Incoming WebSocket messages billed as one Durable Object request. */
+	webSocketMessagesPerRequest: number;
+	/**
+	 * Included usage per month, for a plan that bills past it. Usage since the
+	 * start of the UTC calendar month stops at `monthlyStopRatio` of any of it.
+	 */
+	monthly?: Readonly<MonthlyAllowance>;
+	monthlyStopRatio?: number;
+}
+
+export interface MonthlyAllowance {
+	workerRequests: number;
+	workerCpuMs: number;
+	durableObjectRequests: number;
+	durableObjectDurationGbSeconds: number;
+	sqlRowsRead: number;
+	sqlRowsWritten: number;
+	logEvents: number;
+}
+
+/** Defaults for the feature switches; `ACTIVITY` and `GUEST_POSTING` override them. */
+export interface Features {
+	activity: boolean;
+	guestPosting: boolean;
+}
+
+/**
+ * The edge stop for a plan that bills past its included usage. The Worker
+ * trips it on a flood; the budget guard holds and lifts it.
+ */
+export interface EdgeStop {
+	/** Requests one Cloudflare location may pass to the Worker in a minute before the Worker trips the stop. */
+	floodRequestsPerColoMinute: number;
+	/** The Worker counts one request in this many, chosen at random, against that limit. */
+	floodSampleEvery: number;
+	/** The budget guard keeps the stop on at least this long after it was turned on. */
+	holdSeconds: number;
+}
+
+export interface Plan {
+	name: string;
+	limits: Readonly<Limits>;
+	admission: Readonly<AdmissionBudget>;
+	account: Readonly<AccountAllowance>;
+	features: Readonly<Features>;
+	edgeStop?: Readonly<EdgeStop>;
+}
+
+// Match the account's Workers plan. To switch back to Free, import FREE_PLAN
+// from ./plans/free.ts here, then run npm run budget:generate.
+export const PLAN: Plan = PAID_PLAN;
+
+export const DEFAULT_LIMITS: Readonly<Limits> = PLAN.limits;
+export const DEFAULT_FEATURES: Readonly<Features> = PLAN.features;
 
 // Calibrated implementation bounds remain explicit: raising a payload or parser
 // bound requires rechecking its consumers. Resource ceilings below instead use
@@ -250,16 +253,7 @@ export const MAX_DATABASE_HARD_TARGET_BYTES = DEFAULT_LIMITS.databaseHardTargetB
 export const MAINTENANCE_CONTROL_RESERVE = 8;
 export const BOOTSTRAP_ROW_RESERVATION = 512;
 export const MAX_SOCKET_QUEUE_ALLOCATION = 32 * 1024 * 1024;
-// Attempts are counted before the Durable Object, including its later rejections.
-// This is an approximate, per-Cloudflare-location limiter, not a billing cap.
-export const ADMISSION_BUDGET = Object.freeze({
-	requestsPerIpMinute: 10,
-	workerWindowSeconds: 60,
-	// Free WAF supports only 10-second windows; this optional rule is zone-wide.
-	edgeRequestsPerIpWindow: 10,
-	edgeWindowSeconds: 10,
-	edgeBlockSeconds: 10,
-});
+export const ADMISSION_BUDGET: Readonly<AdmissionBudget> = PLAN.admission;
 
 // Account analytics are a delayed safety signal, not an exact quota meter.
 // Keep this policy separate from local application reservations: a refresh can
@@ -272,12 +266,5 @@ export const ACCOUNT_USAGE_POLICY = Object.freeze({
 	initialRetryMs: 60_000,
 	maxRetryMs: 15 * 60_000,
 	stopRatio: 0.90,
-	freeDaily: Object.freeze({
-		workerRequests: 100_000,
-		durableObjectRequests: 100_000,
-		durableObjectDurationGbSeconds: 13_000,
-		sqlRowsRead: 5_000_000,
-		sqlRowsWritten: 100_000,
-	}),
-	freeStoredBytes: 5 * 1024 * 1024 * 1024,
+	...PLAN.account,
 });

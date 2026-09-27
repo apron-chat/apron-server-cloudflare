@@ -8,7 +8,7 @@ Protocol reference reviewed: protocol version 6, the repository's `PROTOCOL.md`.
 
 ## 1. Objective and instructions to the coding harness
 
-Build a usable, publicly accessible Apron demo backend using native Cloudflare Workers, one SQLite-backed Durable Object (DO), and hibernating WebSockets. Support guest use and passkey authentication, bounded posting and history, and graceful resource exhaustion. The demo must run on the actual Workers Free plan without enabling paid services.
+Build a usable, publicly accessible Apron demo backend using native Cloudflare Workers, one SQLite-backed Durable Object (DO), and hibernating WebSockets. Support guest use and passkey authentication, bounded posting and history, and graceful resource exhaustion. The demo runs on Workers Paid ($5/month) within its included usage, and must still run on the actual Workers Free plan without enabling paid services when its free budgets are selected (`src/plans/free.ts`).
 
 Read the repository's `AGENTS.md`, existing code, package-manager configuration, and `PROTOCOL.md` before implementing. Reuse existing client/protocol utilities where appropriate. Compare the current protocol with the reference above; preserve its mandatory behavior and document material differences. This specification defines deployment policies within the base chat protocol.
 
@@ -23,7 +23,7 @@ Use MUST for required behavior and SHOULD for preferences. Centralize all limits
 - `edit`: owner-authorized replacement, deletion, restoration, and moves between rooms of retained messages.
 - `rooms`: rooms by request (`room_list`, `room_update`); thread rooms (rooms with `parent_room_id`) created and edited by participants with `room_set`; `room_join`/`room_leave` for `general` and threads, with deliveries only to joined rooms (a thread's messages to its members only). Registered users' joins and leaves are logged `membership` records; guests' are not (section 4). The permanent `general` room is the only top-level room.
 - `reactions`: per-user emoji sets on messages.
-- `activity`: implemented but off by default (`ACTIVITY=true` advertises it): typing only, relayed to the room's members and never stored, at most 10 relays per user per minute (section 4.2). Read cursors are neither kept nor relayed; `away` is accepted and ignored (there is no push).
+- `activity`: implemented; on by default with the Workers Paid budgets and off with the Free ones (`ACTIVITY` overrides; advertised when on): typing only, relayed to the room's members and never stored, at most 10 relays per user per minute (section 4.2). Read cursors are neither kept nor relayed; `away` is accepted and ignored (there is no push).
 - `room_list`: joined rooms and rooms to join, by the protocol's `filter`, with `members` and `users` on request.
 - `command`: `/help`, answered with a `@private` notice, `/invite-bot` for registered users (section 5, Bots), and `/admin`, `/kick`, `/rename` and `/status` for admins (section 5, Admins).
 - Guest authentication (`guest`), read-only unless `GUEST_POSTING=true`; verified WebAuthn registration/login; bot tokens (`token`).
@@ -88,7 +88,7 @@ API reference: [Durable Object state](https://developers.cloudflare.com/durable-
 An illustrative initial announcement is:
 
 ```json
-{"method":"server","params":{"protocol":6,"name":"apron-cloudflare-demo/6","caps":["history","edit","rooms","reactions","command"],"auth":["webauthn","token","guest"],"ping":45,"ext":{"demo":{"retention_seconds":86400,"cleanup_seconds":3600,"max_frame_bytes":16384,"max_message_text_bytes":4096,"max_snapshot_bytes":8192,"guest_posts_per_minute":5,"registered_posts_per_minute":20,"guest_posting":false,"server_frames_per_minute":300,"room_list_per_minute":6,"room_list_members":100,"read_cursors":false}}}}
+{"method":"server","params":{"protocol":6,"name":"apron-cloudflare-demo/6","caps":["history","edit","rooms","reactions","command","activity"],"auth":["webauthn","token","guest"],"ping":45,"ext":{"demo":{"retention_seconds":86400,"cleanup_seconds":3600,"max_frame_bytes":16384,"max_message_text_bytes":4096,"max_snapshot_bytes":8192,"guest_posts_per_minute":5,"registered_posts_per_minute":20,"guest_posting":false,"server_frames_per_minute":600,"room_list_per_minute":6,"room_list_members":200,"read_cursors":false}}}}
 ```
 
 `ext.demo` is additive server-announcement policy metadata in the standard `ext` object. Authentication uses the canonical `webauthn` scheme in protocol [§4.9](https://github.com/shazow/apron/blob/main/PROTOCOL.md#49-webauthn-authentication), without an extension flag. Every later `server` announcement is a full replacement, including auth/caps/policy metadata. Temporary throttling does not mean a capability is unimplemented.
@@ -158,7 +158,7 @@ The protocol logs every membership change, and lets a server keep some out of th
 
 The whole server processes at most `globalFramesPerMinute` (300) frames in a rolling minute, counted in memory after the per-connection gates and parsing but before any SQL. Over it, a request gets `retry_after` with the seconds until the oldest counted frame leaves the window, and a notification or malformed frame is dropped; the socket stays open and nothing is charged. The default is sized for a spike from 50 connected users, 10 of them active: about 20 frames a minute per active user (posts, reactions, edits, history pages, room lookups), about one per quiet user, and a reconnect wave of one auth and one history page each. It is at least one IP's frame minute, so a single client cannot be starved by its own limits. The window is lost on hibernation, when the object has received nothing to count. It shapes spikes; the daily frame and SQL budgets still bound the day.
 
-`activity` is off by default and not advertised; typing then gets the unsupported-method path (notifications are ignored, requests get `unsupported`). With `ACTIVITY=true`: `activity` is a notification. Typing (`typing`, seconds, capped at 30) in a known room (`general` without `room_id`) is relayed to the room's other members' connections as `{room_id, from, typing}` and never stored. `read_message_id` is dropped: the demo keeps no read cursors. `away` is accepted and ignored: the demo sends no push, and `away` is never delivered. An unknown room drops the update; room existence comes from an in-memory cache refilled by listings, room changes, and one bounded lookup per unknown ID.
+`activity` is on by default with the Workers Paid budgets and off with the Free ones; `ACTIVITY` overrides either. When off it is not advertised, and typing gets the unsupported-method path (notifications are ignored, requests get `unsupported`). When on: `activity` is a notification. Typing (`typing`, seconds, capped at 30) in a known room (`general` without `room_id`) is relayed to the room's other members' connections as `{room_id, from, typing}` and never stored. `read_message_id` is dropped: the demo keeps no read cursors. `away` is accepted and ignored: the demo sends no push, and `away` is never delivered. An unknown room drops the update; room existence comes from an in-memory cache refilled by listings, room changes, and one bounded lookup per unknown ID.
 
 Some message types have their own per-user rate, counted across the user's connections in a rolling 60-second window whose events live in connection attachments (so they survive hibernation and need no SQL):
 
@@ -200,7 +200,7 @@ Where `APRON_ADMIN_TOKEN` is set ([configuration](docs/configuration.md)), as a 
 - `/admin <user_id>`: makes that registered user an admin, or says they already are.
 - `/kick <user_id>`: removes the user from the room of the command, as if they had left it (`room_leave`): a registered user's leave is stored and logged and its `membership` goes to the room's members; a connected guest's leaves its connections. The user's connections get `room_update` `left`, and they may join again. It is charged to the admin's posting limits. Kicking oneself, or a user not in the room, is `invalid_params`.
 - `/rename <old_user_id> <new_user_id>`: gives a registered user (not a bot, a guest, or `admin`) a new `user_id`, 1 to 64 letters, digits, `_` or `-`, starting with a letter or digit, not `guest_…` or `bot_…`, and not taken. The identity row, its credential (so the passkey signs in as the new id), its stored memberships, and its admin listing move to the new id; nothing else is migrated. The old `user_id` is retired in a `_meta` row (`renamed:<old>`) and never reissued, until a schema reset wipes the row. The user's connections become the new identity and get `user` `you`, and those who share a room with the user get `user` `new` with `old` ([PROTOCOL.md §3.3](https://github.com/shazow/apron/blob/main/PROTOCOL.md#33-identity)). Logged records keep the old `user_id`, so earlier messages are no longer the user's to edit; the user's sessions are `denied` on resume, sending the client back to its passkey; limiter windows start afresh; and the user's bot keeps its `bot_<old>` id and token, while a later `/invite-bot` makes a new `bot_<new>`.
-- `/status`: today's Cloudflare account usage (refreshed from account analytics at most once a minute, where `ACCOUNT_ID` and `ACCOUNT_ANALYTICS_TOKEN` are set) against the Free plan's daily allowance, and the object's own daily reservations (SQL reads and writes, frames, admissions, posts, registrations), registered users, open connections and database size against their budgets, as markdown tables.
+- `/status`: today's Cloudflare account usage (refreshed from account analytics at most once a minute, where `ACCOUNT_ID` and `ACCOUNT_ANALYTICS_TOKEN` are set) against the selected plan's daily allowance (for Workers Paid, its monthly included usage over 31 days), and the object's own daily reservations (SQL reads and writes, frames, admissions, posts, registrations), registered users, open connections and database size against their budgets, as markdown tables.
 
 ### Canonical WebAuthn authentication
 
@@ -248,15 +248,15 @@ All applicable limits compose: passing one does not bypass another. Time means s
 | Key | Default | Scope |
 | --- | ---: | --- |
 | anonymous_posts_per_minute | 5 | Normalized IP, all guest sockets |
-| anonymous_posts_per_day | 100 | Normalized IP |
+| anonymous_posts_per_day | 200 (Free: 100) | Normalized IP |
 | registered_posts_per_minute | 20 | Verified user ID, all sockets |
-| registered_posts_per_day | 500 | Verified user ID |
+| registered_posts_per_day | 1,000 (Free: 500) | Verified user ID |
 | ip_posts_per_minute | 30 | IP across guest/registered identities |
-| ip_posts_per_day | 1,000 | IP across identities |
-| global_posts_per_minute | 60 | Entire demo |
-| global_posts_per_day | 5,000 | Entire demo |
-| registrations_per_ip_day | 3 | Successful registrations |
-| registrations_per_day | 100 | Entire demo |
+| ip_posts_per_day | 2,000 (Free: 1,000) | IP across identities |
+| global_posts_per_minute | 120 (Free: 60) | Entire demo |
+| global_posts_per_day | 10,000 (Free: 5,000) | Entire demo |
+| registrations_per_ip_day | 5 (Free: 3) | Successful registrations |
+| registrations_per_day | 300 (Free: 100) | Entire demo |
 | registered_identity_count | 10,000 | Persistent total |
 | auth_attempts_per_ip_minute | 10 | Begin/finish/guest/failed attempts |
 
@@ -277,8 +277,8 @@ Posting includes message creates, edits, deletes, restores, moves, reaction chan
 | history_default_limit | 20 |
 | history_max_limit | 50 |
 | history_max_response_bytes | 262,144 including envelope |
-| history_requests_per_user_minute | 10 |
-| history_requests_per_ip_minute | 30 |
+| history_requests_per_user_minute | 20 (Free: 10) |
+| history_requests_per_ip_minute | 60 (Free: 30) |
 | concurrent_history_per_connection | 1 |
 
 The smaller frame limit is a documented demo exception to the protocol's advisory 256 KiB recommendation. UTF-8 byte size is not JavaScript string length. The final authoritative snapshot must fit after server-owned fields are added. No truncation of accepted text/extensions. Decode and validate depth/nodes after the raw byte check; reject object/array top-level batches and pathological structures. Bound the byte sizes of auth options, credential IDs, public keys, and all persisted metadata as well.
@@ -292,19 +292,19 @@ The smaller frame limit is a documented demo exception to the protocol's advisor
 | registered_connections_per_user | 3 |
 | connections_per_ip | 10 total |
 | connection_admissions_per_ip_minute | 5 |
-| connection_admissions_per_day | 2,000 globally |
+| connection_admissions_per_day | 4,000 globally (Free: 2,000) |
 | unauthenticated_timeout_seconds | 30 |
 | pending_frames_per_connection | 8, additionally bounded to 128 KiB |
 | frames_per_connection_minute | 60 |
 | frames_per_ip_minute | 120 |
-| global_frames_per_minute | 300 server-wide, in memory, before SQL |
+| global_frames_per_minute | 600 server-wide, in memory, before SQL (Free: 300) |
 | frame_lease | 10 frames reserved per block, per connection |
 | activity_broadcasts_per_user_minute | 10 relayed typing updates |
 | room_list_requests_per_user_minute | 6 |
-| room_list_members | 100 registered members listed per room (calibrated ceiling 200); connected members are always listed |
+| room_list_members | 200 registered members listed per room, the calibrated ceiling (Free: 100); connected members are always listed |
 | ping_seconds | 45, advertised as `server.ping`; answered by the runtime, not counted as frames |
 | ping_timeout_seconds | 150 without a ping or frame, once one was sent |
-| processed_frames_per_day | 100,000 globally |
+| processed_frames_per_day | 150,000 globally (Free: 100,000) |
 | repeated_policy_violations | Close after 3 within 60 seconds; severe oversized/binary input closes immediately |
 
 Minute limits other than posting may use a documented token bucket with a burst no greater than the listed minute allowance. First-check cheap frame/connection gates precede JSON parsing, SQL queries, and cryptographic work. WebSocket control frames are not application frames.
@@ -313,33 +313,33 @@ Use a staged handshake for registered reconnects: pending sockets initially obey
 
 Stop admission and close remaining sockets when the global frame budget is exhausted. Buffered/in-flight hostile frames can still reach handlers and platform meters; this budget limits admitted processing, not the network's ability to send traffic. Client reconnects use exponential backoff with jitter and honor server retry instructions. No application-level infinite resend queue.
 
-## 7. Budget accounting and free-plan guarantee
+## 7. Budget accounting and plan guarantee
 
-Current planning baseline, checked 2026-09-20:
+Current planning baseline, checked 2026-09-27. Each plan's budgets live in `src/plans/`; `PLAN` in `src/budget.ts` selects the one that matches the account.
 
-| Cloudflare resource | Workers Free allowance |
-| --- | ---: |
-| DO request units | 100,000/day |
-| DO duration | 13,000 GB-seconds/day |
-| SQLite rows read | 5,000,000/day |
-| SQLite rows written | 100,000/day |
-| SQLite storage | 5 GB/account |
-| Entry Worker requests | 100,000/day |
+| Cloudflare resource | Workers Free allowance | Workers Paid included usage (per 31-day share) |
+| --- | ---: | ---: |
+| DO request units | 100,000/day | 1,000,000/month (32,000/day) |
+| DO duration | 13,000 GB-seconds/day | 400,000 GB-seconds/month (12,900/day) |
+| SQLite rows read | 5,000,000/day | 25 billion/month (800 million/day) |
+| SQLite rows written | 100,000/day | 50 million/month (1.6 million/day) |
+| SQLite storage | 5 GB/account | 5 GB-month |
+| Entry Worker requests | 100,000/day | 10 million/month (320,000/day) |
 
-DO incoming WebSocket messages have a 20:1 request-metering ratio; handshakes/RPC/alarms also count. Outgoing messages have no request charge. These are shared allowances, not per-object allocations. Free-plan exhaustion fails operations; a paid plan's included allowance is not a spending cap. See [DO pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/) and [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/). Recheck these sources before deployment and record the verified date.
+DO incoming WebSocket messages have a 20:1 request-metering ratio; handshakes/RPC/alarms also count. Outgoing messages have no request charge. These are shared allowances, not per-object allocations. Free-plan exhaustion fails operations; a paid plan's included allowance is not a spending cap, so the Paid budgets are sized against its per-day share with headroom and the account-usage stop acts at 90% of it. Paid includes fewer DO requests than Free, so frame and connection budgets rise much less than SQL ones. See [DO pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/) and [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/). Recheck these sources before deployment and record the verified date.
 
 ### Application allocations
 
 | Budget | Ceiling | Allocation |
 | --- | ---: | --- |
-| SQL writes/day | 80,000 | Up to 60,000 foreground; 20,000 reserved maintenance/control |
-| SQL reads/day | 3,000,000 | Up to 2,500,000 foreground; 500,000 reserved maintenance/control |
+| SQL writes/day | 800,000 (Free: 80,000) | Up to 700,000 foreground; 100,000 reserved maintenance/control (Free: 60,000 and 20,000) |
+| SQL reads/day | 30,000,000 (Free: 3,000,000) | Up to 25,000,000 foreground; 5,000,000 reserved maintenance/control (Free: 2,500,000 and 500,000) |
 | Database operational high-water | 96 MiB | Suspend growth and prioritize expired-data cleanup |
 | Database hard target | 128 MiB | Includes indexes, control/auth state, and cleanup headroom |
 | Resume growth low-water | 80 MiB effective occupied storage | Avoid oscillating admission |
 | Cleanup batch | At most 100 source records | Further limited by measured reads/writes and available reserve |
 
-The 5,000-post ceiling is a maximum, not a promise. If the measured schema/traffic exhausts resources earlier, refuse work earlier. Do not claim capacity from a guess of one write per message. Include snapshot/log/index/dedup writes, limiter state, credential counters, alarms, failed work, expired-data deletion, migrations, and bookkeeping. Cleanup's workload includes yesterday's records while accepting today's. Avoid indexing every metadata column or enabling FTS.
+The daily post ceiling (10,000; Free: 5,000) is a maximum, not a promise. If the measured schema/traffic exhausts resources earlier, refuse work earlier. Do not claim capacity from a guess of one write per message. Include snapshot/log/index/dedup writes, limiter state, credential counters, alarms, failed work, expired-data deletion, migrations, and bookkeeping. Cleanup's workload includes yesterday's records while accepting today's. Avoid indexing every metadata column or enabling FTS.
 
 Implementation must have one metered storage boundary for all SQL/KV/alarm work. For each operation class, establish a conservative cost bound, reserve it before work, and observe actual SQL cursor row counts to verify the model. Include the cost of the reservation itself. No public request may trigger a full-table scan, unbounded join, migration, or unmetered maintenance query. `LIMIT` alone does not prove bounded scan cost. A cap breach in cost calibration is a release blocker, not a reason to silently raise budgets.
 
@@ -353,11 +353,11 @@ The DO is the authoritative limiter. Cloudflare's edge Rate Limiting binding is 
 
 Measure physical database bytes and bounded logical payload totals. Reject growth with enough margin for the largest admitted operation, indexes, and control updates; check again after commits. Deletions may free SQLite pages for reuse without shrinking `databaseSize`. A file staying large must not be mistaken for still-occupied data, and delete/reinsert churn must not make it grow without bound. Determine actual supported freelist/page instrumentation and page reuse in tests. Do not assume VACUUM is available or free, and do not put it on a request path.
 
-At pressure thresholds, purge only already-expired data and stop growth if that is insufficient. Do not silently shorten the advertised retention window to accept another message. A 128 MiB target does not guarantee 5,000 maximum-size messages plus all ancillary data; size admission takes precedence. Never delete the whole database to reclaim chat space because it contains credential and quota authority.
+At pressure thresholds, purge only already-expired data and stop growth if that is insufficient. Do not silently shorten the advertised retention window to accept another message. A 128 MiB target does not guarantee a day's ceiling of maximum-size messages plus all ancillary data; size admission takes precedence. Never delete the whole database to reclaim chat space because it contains credential and quota authority.
 
 ### What can and cannot be guaranteed
 
-Deploy only on Workers Free, with no paid ancillary services, and reserve account headroom for this workload. Incoming rejected HTTP/WebSocket traffic still consumes platform resources; no application limiter can guarantee availability under unlimited hostile traffic. Cloudflare's hard free-plan limits are the final zero-overage backstop. App quotas provide controlled degradation under admitted traffic, not a network-level request shield.
+Select the budgets that match the account's plan, use no paid ancillary services, and reserve account headroom for this workload. Incoming rejected HTTP/WebSocket traffic still consumes platform resources; no application limiter can guarantee availability under unlimited hostile traffic. On Workers Free, Cloudflare's hard free-plan limits are the final zero-overage backstop. On Workers Paid there is no such backstop: rejected traffic past the included usage is billed (at the checked rates, $0.30 per million Worker requests and $0.15 per million DO requests). A budget guard on a minute cron trigger reads account usage for the day and the calendar month and, at 90% of a daily share or half of a monthly allowance, enables a zone WAF rule that blocks the server's hostname before the Worker runs, so blocked requests are not billed; see [the budget guard](docs/configuration.md#budget-guard) for its lag and limits. App quotas provide controlled degradation under admitted traffic, not a network-level request shield.
 
 One active object at the documented memory allocation uses roughly 11,000 GB-seconds over a full day, below the duration allowance; still use hibernation and avoid extra production objects. Fan-out remains processing/memory work even when it has no outgoing request charge. Native resource errors must be caught where possible and fail closed without reconnect or alarm retry storms.
 
@@ -542,7 +542,7 @@ Use unit tests for pure logic and Cloudflare's Workers/Vitest integration for ru
 ### Capacity, accounting, and lifecycle
 
 - Measure rows read/written per operation with the actual indexes, including quota writes, auth, alarms, failure paths, and deletion. Produce a cost table and test every claimed upper bound.
-- Exercise at least three simulated UTC days: accepted traffic plus previous-day cleanup, midnight double bursts, worst-case snapshots, frequent edits, reconnect/history load, and invalid traffic. A 24–25 hour retention interval can span two daily posting allowances; never assume it contains at most 5,000 records.
+- Exercise at least three simulated UTC days: accepted traffic plus previous-day cleanup, midnight double bursts, worst-case snapshots, frequent edits, reconnect/history load, and invalid traffic. A 24–25 hour retention interval can span two daily posting allowances; never assume it contains at most one day's post ceiling of records.
 - Verify metered work stops below configured ceilings with maintenance reserve intact. Include budget leases lost during crash, rollover while a handler is in flight, and accounting update failures. No allowance is reissued after a restart.
 - Demonstrate 128 MiB pressure control and SQLite page reuse under repeated delete/reinsert cycles. No unmetered VACUUM/DDL/full scan or accidental account-wide delete.
 - Hibernation wake restores socket auth/challenges and budget authority without reannouncing sessions, losing IP counters, resetting IDs, or storing history in attachments.

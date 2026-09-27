@@ -1,5 +1,6 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { expect, it } from 'vitest';
+import { DEFAULT_LIMITS } from '../src/budget';
 import { canonicalizeIp, hashIpKey } from '../src/ip';
 import { connect as open, exchange, greeting, reply, request, until, type ConnectOptions, type Frame, type Peer } from './helpers/socket';
 
@@ -457,7 +458,7 @@ it('creates threads with room_set, delivers only to joined rooms, and moves mess
 	} finally { late.close(); }
 });
 
-it('leaves activity off by default: not advertised, and typing is not relayed', async () => {
+it('leaves activity off when ACTIVITY is false: not advertised, and typing is not relayed', async () => {
 	const alice = await connect();
 	const bob = await connect();
 	try {
@@ -484,9 +485,9 @@ it('limits the frames the whole server processes in a minute without closing soc
 		expect(busy.code).toBe(-32002);
 		expect(busy.data.retry_after).toBeGreaterThan(0);
 		// The socket stays open and is served again once the limit allows it.
-		await configure((config) => { config.limits.globalFramesPerMinute = 300; });
+		await configure((config) => { config.limits.globalFramesPerMinute = DEFAULT_LIMITS.globalFramesPerMinute; });
 		expect((await request(peer, 'again', 'me', {})).result.you).toBeTruthy();
-	} finally { peer.close(); await configure((config) => { config.limits.globalFramesPerMinute = 300; }); }
+	} finally { peer.close(); await configure((config) => { config.limits.globalFramesPerMinute = DEFAULT_LIMITS.globalFramesPerMinute; }); }
 });
 
 it('with ACTIVITY on, relays typing to room members, accepts away, throttles per user, and tells only the sender once', async () => {
@@ -715,10 +716,10 @@ it('advertises the demo policy hints', async () => {
 			registered_posts_per_minute: 20,
 			// vitest.config.ts turns guest posting on.
 			guest_posting: true,
-			server_frames_per_minute: 300,
+			server_frames_per_minute: DEFAULT_LIMITS.globalFramesPerMinute,
 			room_list_per_minute: 6,
 			// Registered members listed per room in `members`, besides connected ones.
-			room_list_members: 100,
+			room_list_members: DEFAULT_LIMITS.roomListMembers,
 			read_cursors: false,
 		});
 	} finally { peer.close(); }
