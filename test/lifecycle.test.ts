@@ -6,7 +6,7 @@ import {
 	runInDurableObject,
 } from "cloudflare:test";
 import { expect, it } from "vitest";
-import { connect as open } from "./helpers/socket";
+import { connect as open, greeting } from "./helpers/socket";
 
 let nextIpOctet = 1;
 
@@ -67,7 +67,7 @@ function attachments(stub: DurableObjectStub): Promise<Record<string, any>[]> {
 
 async function pendingSocket(ip = testIp()) {
 	const peer = await connect(ip);
-	expect((await peer.next()).method).toBe("server");
+	await greeting(peer);
 	return peer;
 }
 

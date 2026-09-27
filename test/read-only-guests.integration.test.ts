@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
-import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
+import { connect as open, exchange, greeting, request, until, type Frame, type Peer } from './helpers/socket';
 
 let nextIp = 1;
 
@@ -52,16 +52,14 @@ it('tells a guest it only reads, then denies its writes, joins and leaves includ
 	await guestsReadOnly();
 	const guest = await connect();
 	try {
-		const server = await guest.next();
+		const { server, welcome } = await greeting(guest);
 		expect(server.params.ext.demo.guest_posting).toBe(false);
-		// A welcome follows the server frame, before any auth (Appendix B):
+		// The welcome follows the server frame, before any auth (Appendix B):
 		// transient (§3.5), with no room_id since the client knows no rooms yet.
-		const welcome = await guest.next();
-		expect(welcome.method).toBe('message');
-		expect(welcome.params.from.user_id).toBe('@private');
+		// Where guests only read, it says so after the server version.
 		expect(welcome.params.room_id).toBeUndefined();
 		expect(welcome.params.message_id).toBeUndefined();
-		expect(welcome.params.body.text).toBe('Guests can read. *Sign in with passkey* to participate.');
+		expect(welcome.params.body.text).toMatch(/\n\nGuests can read\. \*Sign in with passkey\* to participate\.$/);
 		guest.send({ id: 'auth', method: 'auth', params: { scheme: 'guest' } });
 		const auth = await guest.next();
 		expect(auth.id).toBe('auth');
@@ -188,10 +186,8 @@ it('lets a bot send auth and a post together before the server frame, and retry 
 		const hook = await connect(null);
 		hook.send({ id: 'auth', method: 'auth', params: { scheme: 'token', token, client: 'deploy-hook/1.0' } });
 		hook.send({ id: 'deploy-7f3a', method: 'message', params: post });
-		const server = await hook.next();
-		expect(server.method).toBe('server');
 		// Guests only read, and a bot has no Origin: its welcome points at the demo's site.
-		const welcome = await hook.next();
+		const { welcome } = await greeting(hook);
 		expect(welcome.params.body.text).toMatch(/bot token/);
 		expect((await hook.next()).result.you.user_id).toBe('bot_u_deployer');
 		// The bot joined general when it was made, so its broadcast comes first (§1).

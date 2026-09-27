@@ -658,10 +658,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.ctx.acceptWebSocket(server);
 		writeAttachment(server, attachment);
 		this.send(server, this.serverAnnouncement(origin));
-		// Where guests only read, a welcome says so before any auth (§3.2,
+		// A welcome with the deployed version, before any auth (§3.2,
 		// Appendix B): to this connection only, with no room_id, since the
-		// client knows no rooms yet.
-		if (!this.config.guestPosting) this.send(server, this.readOnlyWelcome(origin));
+		// client knows no rooms yet. A deploy closes every socket, so each
+		// reconnect after one shows the new version.
+		this.send(server, this.welcome(origin));
 		await this.rescheduleAlarm();
 		return new Response(null, { status: 101, webSocket: pair[0] });
 	}
@@ -828,12 +829,22 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/** The `@private` welcome for a server whose guests only read, worded for what this origin can sign in with. */
-	private readOnlyWelcome(origin: string | null): Record<string, unknown> {
-		const passkeys = origin !== null && this.config.rpOrigins.includes(origin);
-		const text = passkeys
-			? "Guests can read. *Sign in with passkey* to participate."
-			: "Guests can read. *Sign in with passkey* on the demo's own site, or use a bot token from `/invite-bot` there, to participate.";
-		return { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text, format: "markdown" } } };
+	/** The `@private` welcome; where guests only read, it says so (Appendix B). */
+	private welcome(origin: string | null): Record<string, unknown> {
+		const lines = [`Welcome to Apron Chat. Server version: \`${this.serverVersion()}\``];
+		if (!this.config.guestPosting) {
+			const passkeys = origin !== null && this.config.rpOrigins.includes(origin);
+			lines.push(passkeys
+				? "Guests can read. *Sign in with passkey* to participate."
+				: "Guests can read. *Sign in with passkey* on the demo's own site, or use a bot token from `/invite-bot` there, to participate.");
+		}
+		return { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text: lines.join("\n\n"), format: "markdown" } } };
+	}
+
+	/** The deploy's tag (`wrangler deploy --tag`), else the start of its version ID. */
+	private serverVersion(): string {
+		const version = this.runtimeEnv.CF_VERSION_METADATA;
+		return version?.tag || version?.id?.slice(0, 8) || "unknown";
 	}
 
 	private send(socket: WebSocketConnection, value: unknown): boolean {

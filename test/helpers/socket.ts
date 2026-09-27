@@ -42,6 +42,20 @@ export async function connect({ ip, origin = "http://localhost:5173", path = "/w
 
 export type Peer = Awaited<ReturnType<typeof connect>>;
 
+/**
+ * Reads the frames every connection opens with: `server`, then the
+ * `@private` welcome naming the server version (Appendix B).
+ */
+export async function greeting(peer: Peer): Promise<{ server: Frame; welcome: Frame }> {
+	const server = await peer.next();
+	expect(server.method).toBe("server");
+	const welcome = await peer.next();
+	expect(welcome.method).toBe("message");
+	expect(welcome.params.from.user_id).toBe("@private");
+	expect(welcome.params.body.text).toMatch(/^Welcome to Apron Chat\. Server version: `[^`]+`/);
+	return { server, welcome };
+}
+
 /** Drains frames until one matches; earlier frames are returned for inspection. */
 export async function until(peer: Peer, match: (frame: Frame) => boolean): Promise<{ frame: Frame; skipped: Frame[] }> {
 	const skipped: Frame[] = [];

@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
-import { connect as open, exchange, reply, request, until, type Frame, type Peer } from './helpers/socket';
+import { connect as open, exchange, greeting, reply, request, until, type Frame, type Peer } from './helpers/socket';
 
 let nextIp = 40;
 
@@ -43,7 +43,7 @@ async function issueSession(userId: string, origin: string): Promise<string> {
 /** Resumes `token` on a fresh connection; the peer and the auth reply, which may be an error. */
 async function resume(token: string, id = 'resume', origin?: string | null): Promise<{ peer: Peer; reply: Frame }> {
 	const peer = await connect(origin);
-	await peer.next();
+	await greeting(peer);
 	return { peer, reply: await request(peer, id, 'auth', { scheme: 'token', token }) };
 }
 
@@ -52,7 +52,7 @@ it('resumes a registered identity from a session token, renews it, and rejects b
 	const token = await issueSession('user_session_one', 'http://localhost:5173');
 
 	const peer = await connect();
-	await peer.next();
+	await greeting(peer);
 	peer.send({ id: 'bad', method: 'auth', params: { scheme: 'token', token: 'not-a-session' } });
 	const denied = await peer.next();
 	expect(denied.id).toBe('bad');
@@ -88,7 +88,7 @@ it('resumes a registered identity from a session token, renews it, and rejects b
 		});
 	});
 	const racePeer = await connect();
-	await racePeer.next();
+	await greeting(racePeer);
 	racePeer.send({ id: 'race-resume', method: 'auth', params: { scheme: 'token', token } });
 	const [raceResumed] = await Promise.all([racePeer.next(), sweepSessions(stub(), Date.now() + 1)]);
 	expect(raceResumed.result.you.user_id).toBe('user_session_one');
@@ -275,7 +275,7 @@ it('sends user notifications for renames and for a guest signing in on its conne
 	const tab = await connect();
 	const second = await connect();
 	try {
-		for (const peer of [watcher, tab, second]) await peer.next();
+		for (const peer of [watcher, tab, second]) await greeting(peer);
 		watcher.send({ id: 'guest', method: 'auth', params: { scheme: 'guest' } });
 		await until(watcher, (frame) => frame.id === 'guest');
 		tab.send({ id: 'guest', method: 'auth', params: { scheme: 'guest' } });
@@ -342,7 +342,7 @@ it('logs a registered user\'s joins and leaves as memberships, delivered around 
 	const reader = await connect();
 	let threadId: string;
 	try {
-		await reader.next();
+		await greeting(reader);
 		const guest = (await exchange(reader, 'guest', 'auth', { scheme: 'guest' })).frame.result.you;
 		// Creating: `joined` with the creator as the only member, whose head is
 		// already the creator's logged membership, then that membership, then
@@ -409,7 +409,7 @@ it('logs a registered user\'s joins and leaves as memberships, delivered around 
 	} finally { later.close(); }
 	const watcher = await connect();
 	try {
-		await watcher.next();
+		await greeting(watcher);
 		await exchange(watcher, 'guest', 'auth', { scheme: 'guest' });
 		const listed = (await exchange(watcher, 'members', 'room_list', { room_id: threadId!, members: true })).frame.result;
 		expect(listed.not_joined[0].members).toEqual([{ user_id: userId }]);
@@ -427,7 +427,7 @@ it('sends a rename only to users who share a room with the renamed user', async 
 	const sharing = await connect();
 	const apart = await connect();
 	try {
-		for (const peer of [tab, sharing, apart]) await peer.next();
+		for (const peer of [tab, sharing, apart]) await greeting(peer);
 		await exchange(tab, 'resume', 'auth', { scheme: 'token', token });
 		await exchange(sharing, 'guest', 'auth', { scheme: 'guest' });
 		await exchange(apart, 'guest', 'auth', { scheme: 'guest' });

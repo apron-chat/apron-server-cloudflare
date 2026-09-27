@@ -1,7 +1,7 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { expect, it } from 'vitest';
 import { canonicalizeIp, hashIpKey } from '../src/ip';
-import { connect as open, exchange, reply, request, until, type ConnectOptions, type Frame, type Peer } from './helpers/socket';
+import { connect as open, exchange, greeting, reply, request, until, type ConnectOptions, type Frame, type Peer } from './helpers/socket';
 
 let nextIp = 1;
 
@@ -42,8 +42,7 @@ function expectPublicFrame(frame: Frame): void {
 const connect = ({ ip = `192.0.2.${nextIp++}`, ...options }: Partial<ConnectOptions> = {}) => open({ ip, ...options });
 
 async function authenticate(peer: Peer, scheme = 'guest', extraCaps: string[] = []) {
-	const server = await peer.next();
-	expect(server.method).toBe('server');
+	const { server } = await greeting(peer);
 	expect(server.params.protocol).toBe(6);
 	expect(server.params.caps).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps]);
 	expect(server.params.auth).toContain('webauthn');
@@ -86,7 +85,7 @@ it('admits clients without Origin as guests without advertising or allowing pass
 	const peer = await connect({ path: '/', origin: null });
 	try {
 		// `token` is for bot tokens (/invite-bot); passkey sessions stay on their origin.
-		expect((await peer.next()).params.auth).toEqual(['token', 'guest']);
+		expect((await greeting(peer)).server.params.auth).toEqual(['token', 'guest']);
 		peer.send({ id: 'auth', method: 'auth', params: { scheme: 'guest' } });
 		expect((await peer.next()).result.you.user_id).toMatch(/^guest_/);
 		peer.send({ id: 'passkey', method: 'auth', params: { scheme: 'webauthn', action: 'register', step: 'begin' } });
@@ -100,7 +99,7 @@ it('keeps server-owned state out of public protocol frames', async () => {
 	const peer = await connect({ ip });
 	const publicFrames: Frame[] = [];
 	try {
-		const server = await peer.next();
+		const { server } = await greeting(peer);
 		publicFrames.push(server);
 		expectPublicFrame(server);
 		expect(server.params.auth).toEqual(['webauthn', 'token', 'guest']);
@@ -165,7 +164,7 @@ it('authenticates on the root WebSocket endpoint and answers plain requests with
 it('answers the liveness ping before and after authentication', async () => {
 	const peer = await connect();
 	try {
-		const server = await peer.next();
+		const { server } = await greeting(peer);
 		expect(server.params.ping).toBe(45);
 		// The exact bytes are answered by the runtime, before auth too (§1).
 		peer.socket.send('{"method":"ping"}');
@@ -247,7 +246,7 @@ it('counts guest posting across sockets and returns retained retries after posti
 it('pipelined guest auth precedes mutation and errors preserve identifiable IDs', async () => {
 	const peer = await connect();
 	try {
-		expect((await peer.next()).method).toBe('server');
+		await greeting(peer);
 		peer.send({ id: 'a', method: 'auth', params: { scheme: 'guest' } });
 		peer.send({ id: 'm', method: 'message', params: { room_id: 'general', body: { text: 'pipelined' } } });
 		expect((await peer.next()).id).toBe('a');
@@ -778,7 +777,7 @@ it('finishes auth before later frames: pipelined requests run as the new identit
 	// run after the guest auth completes.
 	const peer = await connect();
 	try {
-		expect((await peer.next()).method).toBe('server');
+		await greeting(peer);
 		peer.send({ id: 'auth', method: 'auth', params: { scheme: 'guest' } });
 		peer.send({ id: 'rooms', method: 'room_list', params: { filter: 'joined', members: true } });
 		peer.send({ id: 'history', method: 'history', params: { limit: 1 } });
@@ -798,7 +797,7 @@ it('finishes auth before later frames: pipelined requests run as the new identit
 	// are denied when it fails.
 	const failed = await connect();
 	try {
-		await failed.next();
+		await greeting(failed);
 		failed.send({ id: 'auth', method: 'auth', params: { scheme: 'token', token: 'no-such-session' } });
 		failed.send({ id: 'rooms', method: 'room_list', params: { filter: 'joined' } });
 		failed.send({ id: 'post', method: 'message', params: { body: { text: 'behind a failed auth' } } });
@@ -810,7 +809,7 @@ it('finishes auth before later frames: pipelined requests run as the new identit
 	// A WebAuthn begin step authenticates nothing, so requests behind it are denied.
 	const begun = await connect();
 	try {
-		await begun.next();
+		await greeting(begun);
 		begun.send({ id: 'begin', method: 'auth', params: { scheme: 'webauthn', action: 'login', step: 'begin' } });
 		begun.send({ id: 'rooms', method: 'room_list', params: { filter: 'joined' } });
 		const challenge = await begun.next();
