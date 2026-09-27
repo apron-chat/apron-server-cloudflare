@@ -13,6 +13,14 @@ function result(overrides: Record<string, unknown> = {}) {
 		monthWorkers: [{ sum: { requests: 10, cpuTimeUs: 7_000 } }],
 		monthInvocations: [{ dimensions: { type: "http" }, sum: { requests: 20 } }, { dimensions: { type: "hibernation" }, sum: { requests: 40 } }],
 		monthPeriodic: [{ sum: { duration: 30, rowsRead: 40, rowsWritten: 50 } }],
+		r2Operations: [
+			{ dimensions: { actionType: "PutObject" }, sum: { requests: 3 } },
+			{ dimensions: { actionType: "GetObject" }, sum: { requests: 5 } },
+			{ dimensions: { actionType: "DeleteObject" }, sum: { requests: 7 } },
+			{ dimensions: { actionType: "SomethingNew" }, sum: { requests: 1 } },
+		],
+		r2Storage: [{ dimensions: { bucketName: "a" }, max: { payloadSize: 100, metadataSize: 10 } }, { dimensions: { bucketName: "b" }, max: { payloadSize: 1, metadataSize: 0 } }],
+		monthR2Operations: [{ dimensions: { actionType: "PutObject" }, sum: { requests: 30 } }, { dimensions: { actionType: "HeadObject" }, sum: { requests: 50 } }],
 	};
 	return { data: { viewer: { accounts: [{ ...base, ...overrides }] } } };
 }
@@ -79,6 +87,7 @@ describe("account usage snapshots", () => {
 			sqlRowsRead: 40,
 			sqlRowsWritten: 50,
 			logEvents: 70,
+			...(ACCOUNT_USAGE_POLICY.r2 ? { r2: { classAOperations: 30, classBOperations: 50 } } : {}),
 		});
 		expect(exceededAllowances(snapshot)).toEqual([]);
 		// Well under the daily share, but past the month's ratio.
@@ -94,6 +103,26 @@ describe("account usage snapshots", () => {
 		expect(() => accountUsageSnapshotFromResult(result({ monthWorkers: undefined }), Date.now())).toThrow();
 	});
 
+	it("counts R2 operations by class, free ones aside, and stops at R2's shares", () => {
+		const r2 = ACCOUNT_USAGE_POLICY.r2;
+		const snapshot = accountUsageSnapshotFromResult(result(), Date.now());
+		if (!r2) return expect(snapshot.r2).toBeUndefined();
+		// An action R2 does not list yet counts as the dearer Class A.
+		expect(snapshot.r2).toEqual({ classAOperations: 4, classBOperations: 5, storedBytes: 111 });
+		expect(snapshot.month?.r2).toEqual({ classAOperations: 30, classBOperations: 50 });
+		expect(exceededAllowances(snapshot)).toEqual([]);
+		const reads = accountUsageSnapshotFromResult(result({
+			r2Operations: [{ dimensions: { actionType: "GetObject" }, sum: { requests: Math.ceil(r2.classBOperationsMonthly / 31) } }],
+		}), Date.now());
+		expect(exceededAllowances(reads)).toEqual(["daily.r2ClassBOperations"]);
+		const month = accountUsageSnapshotFromResult(result({
+			monthR2Operations: [{ dimensions: { actionType: "PutObject" }, sum: { requests: r2.classAOperationsMonthly / 2 } }],
+		}), Date.now());
+		expect(exceededAllowances(month)).toEqual(["monthly.r2ClassAOperations"]);
+		const stored = accountUsageSnapshotFromResult(result({ r2Storage: [{ max: { payloadSize: r2.storedBytes, metadataSize: 0 } }] }), Date.now());
+		expect(exceededAllowances(stored)).toEqual(["r2StoredBytes"]);
+	});
+
 	it("queries today and the month so far", async () => {
 		const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
 			const { query } = JSON.parse(String(init?.body));
@@ -103,6 +132,9 @@ describe("account usage snapshots", () => {
 				expect(query).toContain('monthWorkers: workersInvocationsAdaptive(filter: { datetime_geq: "2026-09-01T00:00:00.000Z", datetime_leq: "2026-09-21T12:00:00.000Z" }, limit: 1000) { sum { requests cpuTimeUs } }');
 				expect(query).toContain("monthInvocations: durableObjectsInvocationsAdaptiveGroups(");
 				expect(query).toContain("monthPeriodic: durableObjectsPeriodicGroups(");
+				expect(query).toContain("r2Operations: r2OperationsAdaptiveGroups(");
+				expect(query).toContain("r2Storage: r2StorageAdaptiveGroups(");
+				expect(query).toContain("monthR2Operations: r2OperationsAdaptiveGroups(");
 			}
 			return Response.json(result());
 		});

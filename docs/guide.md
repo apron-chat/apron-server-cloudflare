@@ -318,7 +318,9 @@ For direct Wrangler production commands, always pass
    up the [budget guard](configuration.md#budget-guard): the
    `apron_budget_stop` rule, the `EDGE_STOP_TOKEN` secret, and
    `ACCOUNT_ID` with `ACCOUNT_ANALYTICS_TOKEN`. Keep a Cloudflare budget alert
-   as a second signal.
+   as a second signal. For uploads, create the bucket, its lifecycle rules,
+   domain, cache rule and signing key first ([uploads](configuration.md#uploads));
+   deploying fails without the bucket.
 3. Set `ALLOWED_ORIGINS = "*"` for the public reference server. Keep the
    passkey RP ID `apron.chat` and the explicit, exact `RP_ORIGINS` allowlist;
    wildcard guest admission never enables wildcard passkey verification.
@@ -330,7 +332,7 @@ For direct Wrangler production commands, always pass
    Wrangler deployment workflow. Do not rename or recreate the production
    object to work around a quota or schema issue. Stored data is not migrated
    between schema versions: a deploy that changes the storage schema resets the
-   demo on the object's first wake (the current schema is 4; see
+   demo on the object's first wake (the current schema is 5; see
    [SPEC section 8](../SPEC.md#schema-versions)). All chat history, rooms,
    sessions, bot tokens, and limiter windows are deleted, and saved session
    tokens fall back to sign-in. Registered passkeys survive: up to 100 of the

@@ -321,6 +321,48 @@ describe('uploads end to end', () => {
 		} finally { peer.close(); }
 	});
 
+	/** Signs an existing user in on a new connection. */
+	async function resume(userId: string): Promise<Peer> {
+		const token = await runInDurableObject(stub(), (instance) => (instance as unknown as { issueSession(userId: string, origin: string, now: number): Promise<string> }).issueSession(userId, 'http://localhost:5173', Date.now()));
+		const peer = await connect();
+		await peer.next();
+		expect((await request(peer, 'auth', 'auth', { scheme: 'token', token })).result.you.user_id).toBe(userId);
+		return peer;
+	}
+
+	/** Moves a user's avatar to one day before it expires. */
+	const nearExpiry = (userId: string) => runInDurableObject(stub(), (_instance, state) => {
+		const soon = Date.now() + 86_400_000;
+		state.storage.sql.exec('UPDATE identities SET avatar_expires_ms = ? WHERE user_id = ?', soon, userId);
+		state.storage.sql.exec("UPDATE uploads SET expires_ms = ? WHERE owner_id = ? AND purpose = 'avatar'", soon, userId);
+		return state.storage.sql.exec<{ avatar_url: string }>('SELECT avatar_url FROM identities WHERE user_id = ?', userId).one().avatar_url;
+	});
+	const avatarExpiry = (userId: string) => runInDurableObject(stub(), (_instance, state) => state.storage.sql.exec<{ avatar_url: string; avatar_expires_ms: number }>('SELECT avatar_url, avatar_expires_ms FROM identities WHERE user_id = ?', userId).one());
+
+	it('writes an avatar again when its owner signs in during its last week, and drops one whose object is gone', async () => {
+		const userId = unique('regular');
+		const first = await signedIn(userId);
+		const started = await request(first, 'avatar', 'command', { body: { text: '/avatar', embeds: [{ kind: 'upload' }] } });
+		expect((await put(started.result.embeds[0].write_url, png())).status).toBe(204);
+		await until(first, (frame) => frame.method === 'user');
+		first.close();
+		const url = await nearExpiry(userId);
+		const key = url.slice('https://media.test/'.length);
+		const uploaded = (await media().head(key))!.uploaded.getTime();
+		const second = await resume(userId);
+		await expect.poll(async () => (await avatarExpiry(userId)).avatar_expires_ms).toBeGreaterThan(Date.now() + 29 * 86_400_000);
+		expect((await media().head(key))!.uploaded.getTime()).toBeGreaterThanOrEqual(uploaded);
+		second.close();
+		// The bucket already deleted it: signing in removes the avatar.
+		await nearExpiry(userId);
+		await media().delete(key);
+		const third = await resume(userId);
+		try {
+			await expect.poll(async () => (await avatarExpiry(userId)).avatar_url).toBe('');
+			expect((await until(third, (frame) => frame.method === 'user')).frame.params.you.avatar).toBe('');
+		} finally { third.close(); }
+	});
+
 	it('/purge disconnects a user and deletes their content and uploads', async () => {
 		const userId = unique('spammer');
 		const spammer = await signedIn(userId);

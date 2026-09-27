@@ -35,6 +35,16 @@ ACCOUNT_ID = "2bfd32937c0c07a923c79f6bb1a17253"
 # The apron.chat zone, where the budget guard turns the apron_budget_stop rule
 # on and off (with the EDGE_STOP_TOKEN secret).
 ZONE_ID = "d7467571c212da5b57bbc92afeb967b7"
+# Uploads: the bucket's public domain, and where write URLs point. Uploads are
+# off until the UPLOAD_SIGNING_KEY secret is set too.
+MEDIA_ORIGIN = "https://media.apron.chat"
+PUBLIC_ORIGIN = "https://server.apron.chat"
+
+# Uploaded images (src/budget.ts). The bucket needs lifecycle rules deleting
+# f/ after 7 days and a/ after 30, and a custom domain for MEDIA_ORIGIN.
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "apron-media"
 
 # The budget guard checks account usage every minute (src/budget-guard.ts).
 [triggers]

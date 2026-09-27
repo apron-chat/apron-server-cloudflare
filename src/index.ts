@@ -2233,6 +2233,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 				`| SQL rows written | ${share(usage.sqlRowsWritten, daily.sqlRowsWritten)} |`,
 				`| Stored | ${mib(usage.storedBytes)} / ${mib(ACCOUNT_USAGE_POLICY.storedBytes)} |`,
 			);
+			const r2 = ACCOUNT_USAGE_POLICY.r2;
+			if (r2 && usage.r2) {
+				lines.push(
+					`| R2 Class A operations | ${share(usage.r2.classAOperations, r2.classAOperationsMonthly / 31)} |`,
+					`| R2 Class B operations | ${share(usage.r2.classBOperations, r2.classBOperationsMonthly / 31)} |`,
+					`| R2 stored | ${mib(usage.r2.storedBytes)} / ${mib(r2.storedBytes)} |`,
+				);
+			}
 			const monthly = ACCOUNT_USAGE_POLICY.monthly;
 			if (monthly && usage.month) {
 				const month = usage.month;
@@ -2248,6 +2256,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 					`| SQL rows written | ${share(month.sqlRowsWritten, monthly.sqlRowsWritten)} |`,
 					`| Log events | ${share(month.logEvents, monthly.logEvents)} |`,
 				);
+				if (r2 && month.r2) {
+					lines.push(
+						`| R2 Class A operations | ${share(month.r2.classAOperations, r2.classAOperationsMonthly)} |`,
+						`| R2 Class B operations | ${share(month.r2.classBOperations, r2.classBOperationsMonthly)} |`,
+					);
+				}
 			}
 		} else {
 			lines.push("**Cloudflare account**: no usage sample; set `ACCOUNT_ID` and `ACCOUNT_ANALYTICS_TOKEN` to read it.");

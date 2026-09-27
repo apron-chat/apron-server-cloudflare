@@ -4,8 +4,8 @@
     "rules": [
       {
         "ref": "apron_invalid_request",
-        "description": "Apron: allow WebSocket handshakes and connection status probes",
-        "expression": "(http.host eq \"server.apron.chat\") and (http.request.method ne \"GET\" or not http.request.uri.path in {\"/\" \"/ws\"} or (not any(lower(http.request.headers[\"upgrade\"][*])[*] eq \"websocket\") and not any(http.request.uri.args[\"apron_connection_status\"][*] eq \"1\")))",
+        "description": "Apron: allow WebSocket handshakes, connection status probes, and upload writes",
+        "expression": "(http.host eq \"server.apron.chat\") and not (http.request.method in {\"PUT\" \"OPTIONS\"} and starts_with(http.request.uri.path, \"/w/\")) and (http.request.method ne \"GET\" or not http.request.uri.path in {\"/\" \"/ws\"} or (not any(lower(http.request.headers[\"upgrade\"][*])[*] eq \"websocket\") and not any(http.request.uri.args[\"apron_connection_status\"][*] eq \"1\")))",
         "action": "block",
         "enabled": true
       },
@@ -17,9 +17,16 @@
         "enabled": false
       },
       {
+        "ref": "apron_media_invalid",
+        "description": "Apron: the upload bucket serves only GET and HEAD of object keys, without a query string that would skip the cache",
+        "expression": "(http.host eq \"media.apron.chat\") and (not http.request.method in {\"GET\" \"HEAD\"} or http.request.uri.query ne \"\" or not (starts_with(http.request.uri.path, \"/f/\") or starts_with(http.request.uri.path, \"/a/\")))",
+        "action": "block",
+        "enabled": true
+      },
+      {
         "ref": "apron_budget_stop",
         "description": "Apron: budget stop (the budget guard turns it on and off; leave it to the guard)",
-        "expression": "http.host eq \"server.apron.chat\"",
+        "expression": "http.host in {\"server.apron.chat\" \"media.apron.chat\"}",
         "action": "block",
         "enabled": false
       }

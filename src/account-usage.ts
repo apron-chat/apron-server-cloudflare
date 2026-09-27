@@ -11,7 +11,14 @@ export interface AccountUsageSnapshot {
 	storedBytes: number;
 	/** Usage since the start of the UTC calendar month, for a plan that bills past its included usage. */
 	month?: AccountUsageMonth;
+	/** R2 today, for a plan with R2 allowances: operations by class, and bytes stored across buckets. */
+	r2?: R2Usage & { storedBytes: number };
 	stop: boolean;
+}
+
+export interface R2Usage {
+	classAOperations: number;
+	classBOperations: number;
 }
 
 export interface AccountUsageMonth {
@@ -24,6 +31,32 @@ export interface AccountUsageMonth {
 	sqlRowsRead: number;
 	sqlRowsWritten: number;
 	logEvents: number;
+	/** R2 operations this month, for a plan with R2 allowances. */
+	r2?: R2Usage;
+}
+
+// R2 bills operations by class (developers.cloudflare.com/r2/pricing). Deletes
+// and aborted multipart uploads are free; any other action is counted as the
+// dearer Class A, so a new one is never missed.
+const R2_CLASS_B = new Set(["HeadBucket", "HeadObject", "GetObject", "UsageSummary", "GetBucketEncryption", "GetBucketLocation", "GetBucketCors", "GetBucketLifecycleConfiguration"]);
+const R2_FREE = new Set(["DeleteObject", "DeleteObjects", "DeleteBucket", "AbortMultipartUpload"]);
+
+function r2Operations(groups: unknown): R2Usage {
+	const actionType = (group: object) => String((group as { dimensions?: { actionType?: unknown } }).dimensions?.actionType ?? "");
+	return {
+		classAOperations: sum(groups, "requests", (group) => (R2_FREE.has(actionType(group)) || R2_CLASS_B.has(actionType(group)) ? 0 : 1)),
+		classBOperations: sum(groups, "requests", (group) => (R2_CLASS_B.has(actionType(group)) ? 1 : 0)),
+	};
+}
+
+/** Bytes stored across buckets: each bucket's largest reading, added up. */
+function r2StoredBytes(groups: unknown): number {
+	if (!Array.isArray(groups)) throw new AccountUsageError("analytics field storedBytes is missing");
+	return groups.reduce((total, group) => {
+		const largest = (group as { max?: Record<string, unknown> } | null)?.max;
+		if (!largest) throw new AccountUsageError("analytics field storedBytes is invalid");
+		return total + numberValue(largest.payloadSize ?? 0, "payloadSize") + numberValue(largest.metadataSize ?? 0, "metadataSize");
+	}, 0);
 }
 
 export interface AccountUsageEnvironment {
@@ -80,17 +113,25 @@ function max(groups: unknown, field: string): number {
  * `storedBytes`, or `monthly.<field>`; empty while it may continue.
  */
 export function exceededAllowances(usage: Omit<AccountUsageSnapshot, "stop">): string[] {
-	const { daily, monthly, monthlyStopRatio, stopRatio, storedBytes } = ACCOUNT_USAGE_POLICY;
+	const { daily, monthly, monthlyStopRatio, stopRatio, storedBytes, r2 } = ACCOUNT_USAGE_POLICY;
+	const ratio = monthlyStopRatio ?? stopRatio;
 	const exceeded = (Object.keys(daily) as (keyof typeof daily)[])
 		.filter((field) => usage[field] >= daily[field] * stopRatio)
 		.map((field) => `daily.${field}`);
 	if (usage.storedBytes >= storedBytes * stopRatio) exceeded.push("storedBytes");
 	if (monthly && usage.month) {
 		const month = usage.month;
-		const ratio = monthlyStopRatio ?? stopRatio;
 		for (const field of Object.keys(monthly) as (keyof typeof monthly)[]) {
 			if (month[field] >= monthly[field] * ratio) exceeded.push(`monthly.${field}`);
 		}
+	}
+	if (r2 && usage.r2) {
+		// Each day stops at its share of the month, like the Workers allowances.
+		if (usage.r2.classAOperations >= (r2.classAOperationsMonthly / 31) * stopRatio) exceeded.push("daily.r2ClassAOperations");
+		if (usage.r2.classBOperations >= (r2.classBOperationsMonthly / 31) * stopRatio) exceeded.push("daily.r2ClassBOperations");
+		if (usage.r2.storedBytes >= r2.storedBytes * stopRatio) exceeded.push("r2StoredBytes");
+		if (usage.month?.r2 && usage.month.r2.classAOperations >= r2.classAOperationsMonthly * ratio) exceeded.push("monthly.r2ClassAOperations");
+		if (usage.month?.r2 && usage.month.r2.classBOperations >= r2.classBOperationsMonthly * ratio) exceeded.push("monthly.r2ClassBOperations");
 	}
 	return exceeded;
 }
@@ -114,6 +155,7 @@ export function accountUsageSnapshotFromResult(result: unknown, sampledAt: numbe
 		sqlRowsWritten: sum(account.durableObjectsPeriodicGroups, "rowsWritten"),
 		storedBytes: max(account.durableObjectsStorageGroups, "storedBytes"),
 		...(ACCOUNT_USAGE_POLICY.monthly ? { month: monthUsage(account, sampledAt) } : {}),
+		...(ACCOUNT_USAGE_POLICY.r2 ? { r2: { ...r2Operations(account.r2Operations), storedBytes: r2StoredBytes(account.r2Storage) } } : {}),
 	};
 	return { ...usage, stop: exceededAllowances(usage).length > 0 };
 }
@@ -130,6 +172,7 @@ function monthUsage(account: Record<string, unknown>, sampledAt: number): Accoun
 		sqlRowsRead: sum(account.monthPeriodic, "rowsRead"),
 		sqlRowsWritten: sum(account.monthPeriodic, "rowsWritten"),
 		logEvents: workerRequests + invocations,
+		...(ACCOUNT_USAGE_POLICY.r2 ? { r2: r2Operations(account.monthR2Operations) } : {}),
 	};
 }
 
@@ -147,11 +190,15 @@ export async function fetchAccountUsage(env: AccountUsageEnvironment, sampledAt 
 		monthWorkers: workersInvocationsAdaptive(${month}) { sum { requests cpuTimeUs } }
 		monthInvocations: durableObjectsInvocationsAdaptiveGroups(${month}) { dimensions { type } sum { requests } }
 		monthPeriodic: durableObjectsPeriodicGroups(${month}) { sum { duration rowsRead rowsWritten } }` : "";
+	const r2 = ACCOUNT_USAGE_POLICY.r2 ? `
+		r2Operations: r2OperationsAdaptiveGroups(${day}) { dimensions { actionType } sum { requests } }
+		r2Storage: r2StorageAdaptiveGroups(${day}) { dimensions { bucketName } max { payloadSize metadataSize } }${ACCOUNT_USAGE_POLICY.monthly ? `
+		monthR2Operations: r2OperationsAdaptiveGroups(${month}) { dimensions { actionType } sum { requests } }` : ""}` : "";
 	const query = `query { viewer { accounts(filter: { accountTag: ${JSON.stringify(env.ACCOUNT_ID)} }) {
 		workersInvocationsAdaptive(${day}) { sum { requests } }
 		durableObjectsInvocationsAdaptiveGroups(${day}) { dimensions { type } sum { requests } }
 		durableObjectsPeriodicGroups(${day}) { sum { duration rowsRead rowsWritten } }
-		durableObjectsStorageGroups(${day}) { max { storedBytes } }${monthly}
+		durableObjectsStorageGroups(${day}) { max { storedBytes } }${monthly}${r2}
 	} } }`;
 	const response = await fetcher("https://api.cloudflare.com/client/v4/graphql", {
 		method: "POST",
