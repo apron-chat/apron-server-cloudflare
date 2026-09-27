@@ -58,7 +58,13 @@ within it:
 - Messages: a request without `room_id` is in `general`. A new message with
   empty text and no embeds is not logged and returns `{}`; an empty save is
   `invalid_params` (delete instead). `body.mentions` is stored as sent, and
-  text is never parsed for mentions. Author-only edit, delete, restore, and move. `reply_to` and
+  text is never parsed for mentions. Each embed must be an object with a
+  non-empty string `kind`; other fields are stored as sent, except `og`, which
+  keeps only `title` (256 code points), `description` (512), and `site_name`
+  (128) as single-line text with control and bidirectional override characters
+  removed, truncated with `…`. Media and other `og` properties are dropped,
+  since the demo hosts no media, and an `og` left empty is removed. The server
+  never fetches embed URLs. Author-only edit, delete, restore, and move. `reply_to` and
   `intro_message` must name a retained message when set or changed; resubmitting
   an unchanged reference stays valid after its target expires, and expiration
   never invalidates an accepted snapshot. The server keeps references bare.

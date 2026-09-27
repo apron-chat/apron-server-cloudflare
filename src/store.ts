@@ -759,6 +759,35 @@ function recordedUser(userId: string, name: string | null | undefined): Identity
   return { user_id: userId, ...(name ? { name } : {}) };
 }
 
+/**
+ * The text an embed's `og` may carry, with its longest kept length in code
+ * points. Clients build `og` themselves (such as link previews), and the
+ * server has the last word on it (§4.6.1): it keeps these fields as one line
+ * of plain text and drops the rest. Media go too, since this server neither
+ * hosts nor proxies them and clients load none from other origins.
+ */
+const OG_TEXT_FIELDS: Record<string, number> = { title: 256, description: 512, site_name: 128 };
+
+/** Control, bidirectional override, and line or paragraph separator characters. */
+const OG_UNSAFE_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
+
+/** `embed` with its `og` reduced to kept text fields, or without `og` when none is left. */
+function withCleanOg(embed: Record<string, unknown>): Record<string, unknown> {
+  if (embed.og === undefined) return embed;
+  const { og, ...rest } = embed;
+  const clean: Record<string, string> = {};
+  if (isPlainObject(og)) {
+    for (const [field, max] of Object.entries(OG_TEXT_FIELDS)) {
+      const value = og[field];
+      if (typeof value !== "string") continue;
+      const line = value.replace(OG_UNSAFE_CHARACTERS, " ").replace(/\s+/g, " ").trim();
+      const points = [...line];
+      if (points.length) clean[field] = points.length > max ? `${points.slice(0, max - 1).join("").trimEnd()}…` : line;
+    }
+  }
+  return Object.keys(clean).length ? { ...rest, og: clean } : rest;
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
@@ -2611,6 +2640,11 @@ export class Store {
     const embeds = body.embeds === undefined ? [] : body.embeds;
     if (!Array.isArray(embeds)) throw new StoreError("invalid_params", "body.embeds must be an array");
     if (embeds.length > this.config.maxEmbeds) throw new StoreError("too_large", "too many embeds");
+    for (const embed of embeds) {
+      if (!isPlainObject(embed) || typeof embed.kind !== "string" || embed.kind.length === 0) {
+        throw new StoreError("invalid_params", "body.embeds must be objects with a kind");
+      }
+    }
     // Who a message mentions is the list its sender gives (§3.5); the server
     // never reads mentions out of text. Duplicates collapse.
     let mentions: string[] | undefined;
@@ -2625,7 +2659,7 @@ export class Store {
       }
       mentions = [...unique];
     }
-    return { ...clone(body), text, format, embeds: clone(embeds), ...(mentions ? { mentions } : {}) };
+    return { ...clone(body), text, format, embeds: (clone(embeds) as Record<string, unknown>[]).map(withCleanOg), ...(mentions ? { mentions } : {}) };
   }
 
   /** A new message with no text and no embeds, which is neither logged nor broadcast (§3.5). */
