@@ -618,6 +618,14 @@ export const MAX_CARRIED_PASSKEYS = 100;
  * indexes written back afterwards.
  */
 const CARRIED_PASSKEY_COST = { reads: 4, writes: 8 } as const;
+/**
+ * The registered users made admins with `/admin`, as a JSON list of
+ * `user_id`s. Absent means none: the row is additive, so schema 4 objects need
+ * no reset for it. The `ADMIN_TOKEN` user is an admin without being listed.
+ */
+const META_ADMINS = "admins";
+/** Most users `/admin` may list, so the list stays one small `_meta` row. */
+export const MAX_ADMINS = 32;
 /** Rows one guest-number block reservation may read and write, before control overhead. */
 const GUEST_NUMBER_BLOCK_COST = { reads: 8, writes: 8 } as const;
 
@@ -1046,8 +1054,9 @@ export class Store {
    * identities (same `user_id`, name, and WebAuthn user handle) and their
    * `general` membership, so users sign in again with the passkey they have
    * rather than deleting it and registering anew. Their rows are charged to
-   * the day's maintenance reservation below. Older passkeys past the cap,
-   * bots, and every session are dropped.
+   * the day's maintenance reservation below, and those of them `/admin`
+   * listed stay admins. Older passkeys past the cap, bots, and every session
+   * are dropped.
    *
    * The guest-number high-water mark is carried over, so a guest ID is never
    * reissued across a reset (a wipe does not restart guests at `guest_1`).
@@ -1084,6 +1093,12 @@ export class Store {
       // An unreadable old meta table carries no guest numbers.
     }
     const passkeys = this.readCarriedPasskeys();
+    let admins: string[] = [];
+    try {
+      admins = this.adminIds();
+    } catch {
+      // An unreadable old meta table carries no admins.
+    }
     await deleteAll.call(this.durableStorage);
     this.initialized = false;
     this.accountingUnsafe = false;
@@ -1098,6 +1113,10 @@ export class Store {
       this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_GUEST_NUMBER_MARK, String(guestNumberMark));
     }
     if (passkeys.length) this.writeCarriedPasskeys(passkeys);
+    // Admins whose passkeys were carried stay admins: one control write.
+    const carriedIds = new Set(passkeys.map((row) => row.user_id));
+    const carriedAdmins = admins.filter((id) => carriedIds.has(id));
+    if (carriedAdmins.length) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ADMINS, JSON.stringify(carriedAdmins));
     const carryCost = { reads: passkeys.length * CARRIED_PASSKEY_COST.reads, writes: passkeys.length * CARRIED_PASSKEY_COST.writes };
     if (!carried && !passkeys.length) return;
     const columns = ["reads_reserved", "writes_reserved", "frames_reserved", "admissions_reserved", "posts_reserved",
@@ -1749,6 +1768,20 @@ export class Store {
 
   budget(now = this.clock.now()): BudgetSnapshot {
     this.ensureReady();
+    return this.budgetValue(now);
+  }
+
+  /** Today's reservations and the identity count, for `/status`. */
+  status(now = this.clock.now()): { budget: BudgetSnapshot; identities: number; databaseBytes: number | null } {
+    this.ensureReady();
+    return this.reserved({ reads: 8 }, false, now, () => ({
+      budget: this.budgetValue(now),
+      identities: this.metaNumber("identity_count"),
+      databaseBytes: this.databaseSize(),
+    }));
+  }
+
+  private budgetValue(now: number): BudgetSnapshot {
     const day = dayFor(this.effectiveNow(now));
     const row = this.budgetRow(day);
     return {
@@ -2584,16 +2617,50 @@ export class Store {
     return { userId: input.botId, name: input.name, created: true, renamed: false, broadcasts: created.broadcasts };
   }
 
+  /** Whether `/admin` listed this user as an admin. One `_meta` read. */
+  isAdmin(userId: string, now = this.clock.now()): boolean {
+    this.ensureReady();
+    return this.reserved({ reads: 4 }, false, now, () => this.adminIds().includes(userId));
+  }
+
   /**
-   * The test user that `TEST_TOKEN` signs in as: a registered identity with
+   * Lists a registered user (not a bot or guest) as an admin, for `/admin`.
+   * `added` is false when the user already was one. At most MAX_ADMINS.
+   */
+  grantAdmin(input: { userId: string; now?: number }): { added: boolean; name: string } {
+    this.ensureReady();
+    return this.reserved({ reads: 8, writes: 4 }, false, input.now ?? this.clock.now(), () => this.transaction(() => {
+      const identity = this.identityRow(input.userId);
+      if (!identity || identity.tier !== "registered") throw new StoreError("invalid_params", "No registered user has that user_id");
+      const admins = this.adminIds();
+      if (admins.includes(input.userId)) return { added: false, name: identity.name };
+      if (admins.length >= MAX_ADMINS) throw new StoreError("denied", `There are already ${MAX_ADMINS} admins`);
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ADMINS, JSON.stringify([...admins, input.userId]));
+      return { added: true, name: identity.name };
+    }));
+  }
+
+  private adminIds(): string[] {
+    const raw = this.metaValue(META_ADMINS);
+    if (!raw) return [];
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string").slice(0, MAX_ADMINS) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * The admin user that `ADMIN_TOKEN` signs in as: a registered identity with
    * no credential, created on first use like a bot, against the same caps.
    * `created` is false when it already exists.
    */
-  ensureTestUser(input: { userId: string; name: string; now: number; ipKey: string }): { created: boolean; broadcasts: Broadcast[] } {
+  ensureAdminUser(input: { userId: string; name: string; now: number; ipKey: string }): { created: boolean; broadcasts: Broadcast[] } {
     this.ensureReady();
     const existing = this.reserved({ reads: 8 }, false, input.now, () => this.identityRow(input.userId));
     if (existing) {
-      if (existing.tier !== "registered") throw new StoreError("internal_error", "test user identity is taken");
+      if (existing.tier !== "registered") throw new StoreError("internal_error", "admin user identity is taken");
       return { created: false, broadcasts: [] };
     }
     return { created: true, broadcasts: this.createKeylessIdentity({ ...input, tier: "registered" }).broadcasts };
@@ -2673,7 +2740,12 @@ export class Store {
    * would change writes nothing. Returns the identity's rooms, the logged
    * record, and the room's record after it.
    */
-  changeMembership(input: { userId: string; ipKey: string; roomId: string; join: boolean; now?: number }): {
+  /**
+   * Joins or leaves a room for a registered user. The posting limits charged
+   * are the user's own, or `actorId`'s when someone else makes the change
+   * (an admin's `/kick`); `ipKey` is the requesting connection's.
+   */
+  changeMembership(input: { userId: string; ipKey: string; roomId: string; join: boolean; now?: number; actorId?: string }): {
     rooms: string[]; changed: boolean; membership?: Broadcast; room?: RoomRecord;
   } {
     this.ensureReady();
@@ -2693,7 +2765,7 @@ export class Store {
         if (!room) throw new StoreError("invalid_params", "Unknown room");
         const member = this.rawRows("SELECT user_id FROM memberships WHERE room_id = ? AND user_id = ? LIMIT 1", input.roomId, input.userId).length > 0;
         if (member === input.join) return { rooms: this.userRooms(input.userId), changed: false };
-        this.chargePosting({ userId: input.userId, tier: "registered", ipKey: input.ipKey, now: effective });
+        this.chargePosting({ userId: input.actorId ?? input.userId, tier: "registered", ipKey: input.ipKey, now: effective });
         if (input.join) this.rawExec("INSERT INTO memberships (room_id, user_id) VALUES (?, ?)", input.roomId, input.userId);
         else this.rawExec("DELETE FROM memberships WHERE room_id = ? AND user_id = ?", input.roomId, input.userId);
         const state = this.logState();

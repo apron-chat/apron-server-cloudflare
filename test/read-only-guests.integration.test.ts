@@ -209,27 +209,27 @@ it('lets a bot send auth and a post together before the server frame, and retry 
 	} finally { owner.close(); }
 });
 
-it('signs in as the test user with TEST_TOKEN from anywhere, once it is set', async () => {
+it('signs in as the admin user with ADMIN_TOKEN from anywhere, once it is set', async () => {
 	await guestsReadOnly();
-	const testToken = 'demo-token-0123456789abcdef';
-	const withTestToken = (value: string | undefined) => runInDurableObject(stub(), (instance) => {
-		const server = instance as unknown as { config: { testToken?: string } };
-		server.config = { ...server.config, testToken: value };
+	const adminToken = 'admin-token-0123456789abcdef';
+	const withAdminToken = (value: string | undefined) => runInDurableObject(stub(), (instance) => {
+		const server = instance as unknown as { config: { adminToken?: string } };
+		server.config = { ...server.config, adminToken: value };
 	});
 	const unset = await connect(null);
 	try {
 		await unset.next();
 		// Unset, the token is only a failed session resume.
-		expect((await request(unset, 'auth', 'auth', { scheme: 'token', token: testToken })).error.code).toBe(-32001);
+		expect((await request(unset, 'auth', 'auth', { scheme: 'token', token: adminToken })).error.code).toBe(-32001);
 	} finally { unset.close(); }
 
-	await withTestToken(testToken);
+	await withAdminToken(adminToken);
 	const first = await connect(null);
 	const second = await connect();
 	try {
 		await first.next();
-		const auth = await request(first, 'auth', 'auth', { scheme: 'token', token: testToken });
-		expect(auth.result).toEqual({ you: { user_id: 'test_user', name: 'Test User' } });
+		const auth = await request(first, 'auth', 'auth', { scheme: 'token', token: adminToken });
+		expect(auth.result).toEqual({ you: { user_id: 'admin', name: 'Admin' } });
 		// Created on first use, it starts in general.
 		expect((await request(first, 'rooms', 'room_list', { filter: 'joined' })).result.joined.map((room: { room_id: string }) => room.room_id)).toEqual(['general']);
 		const posted = await request(first, 'post', 'message', { room_id: 'general', body: { text: 'testing' } });
@@ -239,8 +239,8 @@ it('signs in as the test user with TEST_TOKEN from anywhere, once it is set', as
 
 		// The same token signs in again, as the same user, from a browser too.
 		await second.next();
-		expect((await request(second, 'auth', 'auth', { scheme: 'token', token: testToken })).result.you).toEqual({ user_id: 'test_user', name: 'Test User' });
-	} finally { first.close(); second.close(); await withTestToken(undefined); }
+		expect((await request(second, 'auth', 'auth', { scheme: 'token', token: adminToken })).result.you).toEqual({ user_id: 'admin', name: 'Admin' });
+	} finally { first.close(); second.close(); await withAdminToken(undefined); }
 });
 
 it('rejects a made-up bot token', async () => {

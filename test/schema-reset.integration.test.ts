@@ -25,6 +25,7 @@ for (const storedVersion of [SCHEMA_VERSION - 1, SCHEMA_VERSION + 1]) {
 				credential: { credentialId: 'cred-left', userId: 'user_left_general', publicKey: 'BBBB', counter: 7 },
 			});
 			state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES ('bot_x', '', 'Bot', 'bot', 1, 1)");
+			state.storage.sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('admins', ?)", JSON.stringify(['user_before_reset', 'gone_user']));
 			await state.storage.put('session:stale', { v: 1, userId: 'user_before_reset', origin: 'http://localhost:5173', expiresMs: Date.now() + 60_000 });
 			state.storage.sql.exec("UPDATE _meta SET value = ? WHERE key = 'schema_version'", String(storedVersion));
 			state.storage.sql.exec("UPDATE _meta SET value = '1' WHERE key = 'accounting_unsafe'");
@@ -45,6 +46,9 @@ for (const storedVersion of [SCHEMA_VERSION - 1, SCHEMA_VERSION + 1]) {
 			expect(store.getCredential('cred-before')).toMatchObject({ credentialId: 'cred-before', userId: 'user_before_reset', publicKey: 'AAAA', counter: 0 });
 			expect(store.getCredential('cred-left')).toMatchObject({ userId: 'user_left_general', publicKey: 'BBBB', counter: 7 });
 			expect(store.getIdentity('bot_x')).toBeNull();
+			// Admins whose passkeys were carried stay admins.
+			expect(store.isAdmin('user_before_reset')).toBe(true);
+			expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'admins'").one().value).toBe('["user_before_reset"]');
 			expect(sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM message_state').one().n).toBe(0);
 			expect((await state.storage.list({ prefix: 'session:' })).size).toBe(0);
 			const general = store.getRoomState();
