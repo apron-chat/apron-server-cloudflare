@@ -194,3 +194,48 @@ it('/rename moves a registered user, their passkey, rooms and admin status to a 
 		expect(admin.closed()).toBeUndefined();
 	} finally { admin.close(); dave.close(); erin.close(); }
 });
+
+it('/invite-token creates a user who signs in with the token, which /rename moves and /purge revokes', async () => {
+	const admin = await signedInAdmin();
+	const userId = unique('invited');
+	const signIn = async (token: string) => {
+		const peer = await connect(null);
+		await peer.next();
+		return { peer, reply: await request(peer, 'auth', 'auth', { scheme: 'token', token }) };
+	};
+	try {
+		const invited = await command(admin, 'invite', `/invite-token @${userId}`);
+		expect(invited.frame.result).toEqual({});
+		const text: string = invited.notice!.params.body.text;
+		expect(text).toContain(`Created \`${userId}\``);
+		const token = text.match(/```\n(apron_invite_[A-Za-z0-9_-]{43})\n```/)![1];
+
+		// The token signs in from any origin, as a registered user in general.
+		const first = await signIn(token);
+		expect(first.reply.result.you).toEqual({ user_id: userId, name: userId });
+		expect((await request(first.peer, 'rename-self', 'me', { name: 'Newcomer' })).result.you.name).toBe('Newcomer');
+		first.peer.close();
+
+		// A taken user_id, a guest's or bot's, and a non-admin are refused.
+		expect((await command(admin, 'again', `/invite-token ${userId}`)).frame.error.message).toBe(`The user_id ${userId} is taken`);
+		expect((await command(admin, 'guest', '/invite-token guest_9')).frame.error.code).toBe(-32602);
+		expect((await command(admin, 'self', '/invite-token admin')).frame.error.code).toBe(-32602);
+		expect((await command(admin, 'usage', '/invite-token')).frame.error.message).toBe('Usage: /invite-token <user_id>');
+		const other = await signedIn(unique('plain'));
+		expect((await command(other, 'denied', `/invite-token ${unique('x')}`)).frame.error.code).toBe(-32001);
+		other.close();
+
+		// /rename moves the token to the new user_id.
+		const renamedId = unique('renamed');
+		await command(admin, 'rename', `/rename ${userId} ${renamedId}`);
+		const second = await signIn(token);
+		expect(second.reply.result.you.user_id).toBe(renamedId);
+		second.peer.close();
+
+		// /purge revokes it.
+		await command(admin, 'purge', `/purge ${renamedId}`);
+		const third = await signIn(token);
+		expect(third.reply.error.message).toBe('This invite token is not valid; ask an admin for a new one');
+		third.peer.close();
+	} finally { admin.close(); }
+});

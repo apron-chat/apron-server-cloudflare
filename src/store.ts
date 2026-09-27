@@ -3028,6 +3028,20 @@ export class Store {
   }
 
   /**
+   * `/invite-token`: a registered user with no passkey, who signs in with a
+   * bearer token an admin hands out. The `user_id` must be free: no identity
+   * has it and `/rename` never retired it. Charged as a registration, and
+   * starts in `general` like any other identity.
+   */
+  createInvitedIdentity(input: { userId: string; name: string; now: number; ipKey: string }): { broadcasts: Broadcast[] } {
+    this.ensureReady();
+    if (this.reserved({ reads: 8 }, false, input.now, () => this.idTaken(input.userId))) {
+      throw new StoreError("invalid_params", `The user_id ${input.userId} is taken`.slice(0, 200));
+    }
+    return this.createKeylessIdentity({ ...input, tier: "registered" });
+  }
+
+  /**
    * Inserts an identity that signs in by bearer token rather than a
    * credential, charged as a registration, and starts it in `general` with a
    * logged membership (§4.3.2) returned in `broadcasts`.

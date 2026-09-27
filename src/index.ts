@@ -128,6 +128,7 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "admin", usage: "/admin <user_id>", help: "make a registered user an admin", audience: "admins" },
 	{ name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", audience: "admins" },
 	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
+	{ name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", audience: "admins" },
 	{ name: "toggle", usage: "/toggle <activity|uploads>", help: "turn typing activity or uploads off or on for everyone", audience: "admins" },
 	{ name: "purge", usage: "/purge <user_id>", help: "disconnect a user and delete their account, bot, and everything they posted or uploaded", audience: "admins" },
 	{ name: "status", usage: "/status", help: "show today's Cloudflare usage and the demo's budgets", audience: "admins" },
@@ -154,6 +155,10 @@ const BOT_TOKEN_PREFIX = "apron_bot_";
 const BOT_TOKEN_KEY_PREFIX = "bot-token:";
 /** Key prefix for each bot's current token key, so a new `/invite-bot` revokes the last token. */
 const BOT_KEY_PREFIX = "bot:";
+/** Invite tokens (`/invite-token`): what they look like, their hashed keys, and each user's pointer to theirs. */
+const INVITE_TOKEN_PREFIX = "apron_invite_";
+const INVITE_TOKEN_KEY_PREFIX = "invite-token:";
+const INVITE_KEY_PREFIX = "invite:";
 /** The protocol a bot's instructions point it at (`/invite-bot`). */
 const PROTOCOL_URL = "https://github.com/shazow/apron/blob/main/PROTOCOL.md";
 
@@ -185,6 +190,16 @@ interface StoredBotToken {
 interface StoredBot {
 	v: 1;
 	tokenKey: string;
+}
+
+/**
+ * An invite token (`/invite-token`), stored only as its SHA-256 under
+ * INVITE_TOKEN_KEY_PREFIX: the registered user it signs in as. The user's
+ * INVITE_KEY_PREFIX entry is a StoredBot-shaped pointer back to it.
+ */
+interface StoredInviteToken {
+	v: 1;
+	userId: string;
 }
 
 interface SessionExpiryEntry {
@@ -231,6 +246,17 @@ function endpointOf(request: Request): string | undefined {
 	const url = new URL(request.url);
 	const endpoint = `${url.protocol === "http:" ? "ws:" : "wss:"}//${url.host}${url.pathname}`;
 	return endpoint.length <= MAX_ENDPOINT_CHARS ? endpoint : undefined;
+}
+
+/**
+ * Throws unless `userId` may be issued by an admin (`/rename`, `/invite-token`):
+ * 1 to 64 letters, digits, `_` or `-`, starting with a letter or digit, and
+ * not a guest's or bot's.
+ */
+function assertIssuableUserId(userId: string): void {
+	if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(userId) || /^(guest|bot)(_|$)/i.test(userId)) {
+		throw { name: "invalid_params", message: "A user_id is 1 to 64 letters, digits, _ or -, starting with a letter or digit, and not guest_ or bot_" } satisfies ProtocolError;
+	}
 }
 
 function isBot(userId: string | undefined): boolean {
@@ -1231,6 +1257,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const token = requiredString(params, "token");
 			if (this.config.adminToken !== undefined && await sameToken(token, this.config.adminToken)) await this.handleAdminToken(socket, attachment, request);
 			else if (token.startsWith(BOT_TOKEN_PREFIX)) await this.handleBotToken(socket, attachment, request, token);
+			else if (token.startsWith(INVITE_TOKEN_PREFIX)) await this.handleInviteToken(socket, attachment, request, token);
 			else await this.handleTokenResume(socket, attachment, request);
 			return;
 		}
@@ -1427,6 +1454,24 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const invalid = { name: "denied", message: "Bot token is not valid; its owner can get a new one with /invite-bot" } satisfies ProtocolError;
 			if (!stored || stored.v !== 1 || !isBot(stored.botId)) throw invalid;
 			const identity = this.store.getIdentity(stored.botId);
+			if (!identity) throw invalid;
+			await this.signInKeyless(socket, attachment, request, identity);
+		});
+	}
+
+	/**
+	 * Signs a user in with the token an admin made for them (`/invite-token`),
+	 * through the `token` scheme (§3.2), from any origin like a bot token.
+	 */
+	private async handleInviteToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, token: string): Promise<void> {
+		return this.withSessionLock(async () => {
+			if (attachment.tier === "registered") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
+			if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "invalid_params", message: "token is too long" } satisfies ProtocolError;
+			const key = INVITE_TOKEN_KEY_PREFIX + await sha256Hex(token);
+			const stored = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredInviteToken>(key));
+			const invalid = { name: "denied", message: "This invite token is not valid; ask an admin for a new one" } satisfies ProtocolError;
+			if (!stored || stored.v !== 1 || typeof stored.userId !== "string") throw invalid;
+			const identity = this.store.getIdentity(stored.userId);
 			if (!identity) throw invalid;
 			await this.signInKeyless(socket, attachment, request, identity);
 		});
@@ -2019,7 +2064,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await this.startAvatar(socket, attachment, request, body);
 			return;
 		}
-		if (command.name === "admin" || command.name === "kick" || command.name === "rename" || command.name === "purge" || command.name === "toggle") {
+		if (["admin", "kick", "rename", "purge", "toggle", "invite-token"].includes(command.name)) {
 			try {
 				const target = words[1];
 				const argumentCount = command.name === "rename" ? 2 : 1;
@@ -2028,7 +2073,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 				else if (command.name === "kick") await this.kick(socket, attachment, request, roomId, target);
 				else if (command.name === "purge") await this.purge(socket, attachment, request, roomId, target);
 				else if (command.name === "toggle") this.toggle(socket, request, roomId, target);
-				else this.rename(socket, request, roomId, target, words[2]);
+				else if (command.name === "invite-token") await this.inviteToken(socket, attachment, request, roomId, target);
+				else await this.rename(socket, request, roomId, target, words[2]);
 			} catch (error) {
 				// A mistyped or wrong user_id is an error to show, like an unknown
 				// command, not a policy violation.
@@ -2152,21 +2198,65 @@ export class ApronDemoServer extends DurableObject<Env> {
 			purged = this.store.purgeUsers({ userIds, now: nowMs() });
 		});
 		this.deleteMedia(purged.deletedUploads);
-		await this.forgetBotTokens(userIds.filter((id) => isBot(id)));
+		await this.forgetTokens(userIds);
 		const uploads = purged.deletedUploads.length;
 		this.sendNotice(socket, roomId, `Purged \`${userId}\`: ${purged.messages} message${purged.messages === 1 ? "" : "s"}, ${purged.reactions} reaction set${purged.reactions === 1 ? "" : "s"}, ${uploads} upload${uploads === 1 ? "" : "s"}.`);
 		this.reply(socket, request, {});
 	}
 
-	/** Revokes bots' tokens, so a purged bot cannot sign in again. */
-	private async forgetBotTokens(botIds: readonly string[]): Promise<void> {
-		if (!botIds.length) return;
-		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: botIds.length, writes: 2 * botIds.length }, async () => {
-			for (const botId of botIds) {
-				const stored = await this.ctx.storage.get<StoredBot>(BOT_KEY_PREFIX + botId);
-				if (stored?.v === 1 && typeof stored.tokenKey === "string") await this.ctx.storage.delete(stored.tokenKey);
-				await this.ctx.storage.delete(BOT_KEY_PREFIX + botId);
+	/** Revokes bot and invite tokens, so purged users cannot sign in again. */
+	private async forgetTokens(userIds: readonly string[]): Promise<void> {
+		if (!userIds.length) return;
+		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 2 * userIds.length, writes: 4 * userIds.length }, async () => {
+			for (const userId of userIds) {
+				for (const pointer of [BOT_KEY_PREFIX + userId, INVITE_KEY_PREFIX + userId]) {
+					const stored = await this.ctx.storage.get<StoredBot>(pointer);
+					if (stored?.v !== 1 || typeof stored.tokenKey !== "string") continue;
+					await this.ctx.storage.delete(stored.tokenKey);
+					await this.ctx.storage.delete(pointer);
+				}
 			}
+		}));
+	}
+
+	/**
+	 * `/invite-token <user_id>` (a leading `@` is allowed): creates a
+	 * registered user with no passkey (Store.createInvitedIdentity), who signs
+	 * in with the bearer token the sender gets in a `@private` notice before
+	 * the result (§1). A taken `user_id` is `invalid_params`. The token does
+	 * not expire; `/purge` revokes it, and `/rename` moves it.
+	 */
+	private async inviteToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, target: string): Promise<void> {
+		const userId = target.replace(/^@/, "");
+		if (userId === ADMIN_USER_ID) throw { name: "invalid_params", message: `The user_id ${userId} is taken` } satisfies ProtocolError;
+		assertIssuableUserId(userId);
+		await this.runMutation(async () => {
+			const created = this.store.createInvitedIdentity({ userId, name: userId, now: nowMs(), ipKey: attachment.ipKey });
+			// The new user's logged join of `general` goes to its members (§4.3.2).
+			for (const record of created.broadcasts) this.broadcastRecord(record);
+		});
+		const token = INVITE_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+		const key = INVITE_TOKEN_KEY_PREFIX + await sha256Hex(token);
+		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { writes: 2 }, async () => {
+			await this.ctx.storage.put<StoredInviteToken>(key, { v: 1, userId });
+			await this.ctx.storage.put<StoredBot>(INVITE_KEY_PREFIX + userId, { v: 1, tokenKey: key });
+		}));
+		this.sendNotice(socket, roomId, [
+			`Created \`${userId}\`, who signs in with this token instead of a passkey. It does not expire, and anyone who has it signs in as \`${userId}\`, so hand it over privately. \`/purge ${userId}\` removes them and the token.`,
+			"```\n" + token + "\n```",
+			`To sign in, authenticate with the token scheme: \`{"method": "auth", "params": {"scheme": "token", "token": "${token}"}}\``,
+		].join("\n\n"));
+		this.reply(socket, request, {});
+	}
+
+	/** After `/rename`, points the user's invite token, if any, at the new `user_id`. */
+	private async moveInviteToken(from: string, to: string): Promise<void> {
+		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1, writes: 3 }, async () => {
+			const pointer = await this.ctx.storage.get<StoredBot>(INVITE_KEY_PREFIX + from);
+			if (pointer?.v !== 1 || typeof pointer.tokenKey !== "string") return;
+			await this.ctx.storage.put<StoredInviteToken>(pointer.tokenKey, { v: 1, userId: to });
+			await this.ctx.storage.put<StoredBot>(INVITE_KEY_PREFIX + to, pointer);
+			await this.ctx.storage.delete(INVITE_KEY_PREFIX + from);
 		}));
 	}
 
@@ -2238,12 +2328,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * Logged records, sessions, and the user's bot keep the old `user_id`: a
 	 * session for it is `denied`, and the passkey signs in as the new one.
 	 */
-	private rename(socket: WebSocketConnection, request: RequestFrame, roomId: string, from: string, to: string): void {
+	private async rename(socket: WebSocketConnection, request: RequestFrame, roomId: string, from: string, to: string): Promise<void> {
 		if (from === ADMIN_USER_ID || to === ADMIN_USER_ID) throw { name: "invalid_params", message: "The admin user's user_id is fixed" } satisfies ProtocolError;
-		if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(to) || /^(guest|bot)(_|$)/i.test(to)) {
-			throw { name: "invalid_params", message: "A user_id is 1 to 64 letters, digits, _ or -, starting with a letter or digit, and not guest_ or bot_" } satisfies ProtocolError;
-		}
+		assertIssuableUserId(to);
 		const renamed = this.store.renameIdentity({ from, to, now: nowMs() });
+		await this.moveInviteToken(from, to);
 		for (const peer of this.connectionsOf(from)) {
 			const state = connectionAttachment(peer);
 			if (!state) continue;
