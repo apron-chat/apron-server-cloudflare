@@ -708,6 +708,8 @@ export const MAX_ADMINS = 32;
  * new one, so the retired `user_id` is never reissued (protocol §3.3).
  */
 const META_RENAMED_PREFIX = "renamed:";
+/** `1` while an admin has turned uploads off (`/toggle uploads`); absent means on. */
+const META_UPLOADS_OFF = "uploads_off";
 /** Bytes all live uploads hold, pending writes at their largest (see startUpload). */
 const META_UPLOAD_BYTES = "upload_bytes";
 /**
@@ -3352,6 +3354,7 @@ export class Store {
     const policy = this.config.uploads;
     if (!policy) throw new StoreError("unsupported", "Uploads are not available here");
     if (!this.identityRow(userId)) throw new StoreError("denied", "Sign in with a passkey to upload");
+    if (this.metaValue(META_UPLOADS_OFF) === "1") throw new StoreError("denied", "Uploads are turned off here");
     const maxBytes = purpose === "file" ? policy.maxFileBytes : policy.maxAvatarBytes;
     const day = dayFor(now);
     const rows = [this.limitRow("upload", `user:${userId}`, now), this.limitRow("upload", "global", now)];
@@ -3415,6 +3418,23 @@ export class Store {
   private completeUploadRow(row: RawUploadRow, bytes: number, contentType: string): void {
     this.rawExec("UPDATE uploads SET state = 'done', bytes = ?, content_type = ? WHERE upload_key = ?", bytes, contentType, row.upload_key);
     this.setUploadBytes(this.metaNumber(META_UPLOAD_BYTES) - row.bytes + bytes);
+  }
+
+  /** Whether an admin has turned uploads off (`/toggle uploads`). */
+  uploadsOff(now = this.clock.now()): boolean {
+    this.ensureReady();
+    return this.reserved({ reads: 4 }, false, now, () => this.metaValue(META_UPLOADS_OFF) === "1");
+  }
+
+  /**
+   * Turns new uploads off or on (`/toggle uploads`). Writes already started
+   * still finish; while off, new upload embeds and `/avatar` are `denied`.
+   */
+  setUploadsOff(off: boolean, now = this.clock.now()): void {
+    this.ensureReady();
+    this.reserved({ reads: 4, writes: 4 }, false, now, () => {
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_UPLOADS_OFF, off ? "1" : "0");
+    });
   }
 
   /**

@@ -228,6 +228,10 @@ Uploads are off until all of these are set:
    [the generated definitions](edge-rules.generated.json). The old
    `apron_invalid_request` blocks `write_url` requests.
 
+An admin can turn uploads off and on again with `/toggle uploads`, without a
+deploy: new connections stop being offered `embed:upload`, and new
+attachments and avatars are refused until it is turned back on.
+
 `MEDIA_ORIGIN` (`https://media.apron.chat`) and `PUBLIC_ORIGIN`
 (`https://server.apron.chat`, where `write_url`s point) are Wrangler vars;
 `npm run deploy` refuses a plan with uploads that lacks them or the bucket

@@ -126,6 +126,21 @@ describe('store uploads', () => {
 		});
 	});
 
+	it('refuses new uploads while an admin has turned them off', async () => {
+		await withStore('uploads-off', { uploads: UPLOADS }, (store, clock) => {
+			register(store, clock, 'frank');
+			expect(store.uploadsOff(clock.value)).toBe(false);
+			store.setUploadsOff(true, clock.value);
+			expect(store.uploadsOff(clock.value)).toBe(true);
+			expect(errorCode(() => post(store, clock, 'frank', { body: { embeds: [{ kind: 'upload' }] } }))).toBe('denied');
+			expect(errorCode(() => store.startAvatarUpload({ userId: 'frank', now: clock.value }))).toBe('denied');
+			// Other embeds still post.
+			post(store, clock, 'frank', { body: { embeds: [{ kind: 'link', url: 'https://example.com' }] } });
+			store.setUploadsOff(false, clock.value);
+			post(store, clock, 'frank', { body: { embeds: [{ kind: 'upload' }] } });
+		});
+	});
+
 	it('sets, replaces, refreshes, clears, and expires avatars, shown in identities and member lists', async () => {
 		await withStore('uploads-avatar', { uploads: UPLOADS }, (store, clock) => {
 			register(store, clock, 'erin');
@@ -361,6 +376,34 @@ describe('uploads end to end', () => {
 			await expect.poll(async () => (await avatarExpiry(userId)).avatar_url).toBe('');
 			expect((await until(third, (frame) => frame.method === 'user')).frame.params.you.avatar).toBe('');
 		} finally { third.close(); }
+	});
+
+	it('/toggle uploads turns uploads off and on for admins, saying which', async () => {
+		const user = await signedIn(unique('toggler'));
+		const admin = await connect(null);
+		await admin.next();
+		expect((await request(admin, 'auth', 'auth', { scheme: 'token', token: ADMIN_TOKEN })).result.you.user_id).toBe('admin');
+		const notice = (skipped: Frame[]) => skipped.find((frame) => frame.params?.from?.user_id === '@private')!.params.body.text;
+		const toggle = (id: string) => exchange(admin, id, 'command', { room_id: 'general', body: { text: '/toggle uploads' } });
+		try {
+			const off = await toggle('off');
+			expect(off.frame.result).toEqual({});
+			expect(notice(off.skipped)).toMatch(/^Uploads are now \*\*off\*\*/);
+			const refused = await request(user, 'post', 'message', { body: { text: 'x', embeds: [{ kind: 'upload' }] } });
+			expect(refused.error.message).toBe('Uploads are turned off here');
+			expect((await request(user, 'avatar', 'command', { body: { text: '/avatar', embeds: [{ kind: 'upload' }] } })).error.code).toBe(-32602);
+			const late = await connect();
+			expect((await late.next()).params.caps).not.toContain('embed:upload');
+			late.close();
+			const on = await toggle('on');
+			expect(notice(on.skipped)).toBe('Uploads are now **on**.');
+			expect((await request(user, 'post2', 'message', { body: { text: 'y', embeds: [{ kind: 'upload' }] } })).result.embeds).toHaveLength(1);
+			const fresh = await connect();
+			expect((await fresh.next()).params.caps).toContain('embed:upload');
+			fresh.close();
+			expect((await request(user, 'nope', 'command', { body: { text: '/toggle uploads' } })).error.code).toBe(-32001);
+			expect((await request(admin, 'bad', 'command', { room_id: 'general', body: { text: '/toggle typing' } })).error.message).toBe('Usage: /toggle uploads');
+		} finally { user.close(); admin.close(); }
 	});
 
 	it('/purge disconnects a user and deletes their content and uploads', async () => {

@@ -128,6 +128,7 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "admin", usage: "/admin <user_id>", help: "make a registered user an admin", audience: "admins" },
 	{ name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", audience: "admins" },
 	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
+	{ name: "toggle", usage: "/toggle uploads", help: "turn uploads off or on", audience: "admins" },
 	{ name: "purge", usage: "/purge <user_id>", help: "disconnect a user and delete their account, bot, and everything they posted or uploaded", audience: "admins" },
 	{ name: "status", usage: "/status", help: "show today's Cloudflare usage and the demo's budgets", audience: "admins" },
 ];
@@ -680,6 +681,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private alarmKnown = false;
 	/** When the next alarm may sweep sessions; in memory, so a wake sweeps once. */
 	private nextSessionSweepAt = 0;
+	/** Whether uploads are off, once read (see uploadsOff). */
+	private uploadsOffCache: boolean | undefined;
 	/** When the earliest pending upload's write window closes, if one is known (§4.6.3). */
 	private uploadDeadline: number | undefined;
 	private accountUsageEvents = 0;
@@ -937,7 +940,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				caps: [
 					"history", "edit", "rooms", "reactions", "command",
 					...(this.config.activityEnabled ? ["activity"] : []),
-					...(this.config.uploads ? ["embed:upload"] : []),
+					...(this.config.uploads && !this.uploadsOff() ? ["embed:upload"] : []),
 				],
 				// Passkeys and their session tokens only where passkeys are offered;
 				// bot tokens (`/invite-bot`) from anywhere, since bots are not browsers.
@@ -2014,7 +2017,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await this.startAvatar(socket, attachment, request, body);
 			return;
 		}
-		if (command.name === "admin" || command.name === "kick" || command.name === "rename" || command.name === "purge") {
+		if (command.name === "admin" || command.name === "kick" || command.name === "rename" || command.name === "purge" || command.name === "toggle") {
 			try {
 				const target = words[1];
 				const argumentCount = command.name === "rename" ? 2 : 1;
@@ -2022,6 +2025,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (command.name === "admin") this.grantAdmin(socket, request, roomId, target);
 				else if (command.name === "kick") await this.kick(socket, attachment, request, roomId, target);
 				else if (command.name === "purge") await this.purge(socket, attachment, request, roomId, target);
+				else if (command.name === "toggle") this.toggle(socket, request, roomId, target);
 				else this.rename(socket, request, roomId, target, words[2]);
 			} catch (error) {
 				// A mistyped or wrong user_id is an error to show, like an unknown
@@ -2049,9 +2053,33 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.reply(socket, request, {});
 	}
 
-	/** The commands this deployment offers: `/avatar` only with uploads. */
+	/** The commands this deployment offers: `/toggle` only with uploads, and `/avatar` only while they are on. */
 	private commands(): typeof COMMANDS {
-		return this.config.uploads ? COMMANDS : COMMANDS.filter((command) => command.name !== "avatar");
+		if (!this.config.uploads) return COMMANDS.filter((command) => command.name !== "avatar" && command.name !== "toggle");
+		return this.uploadsOff() ? COMMANDS.filter((command) => command.name !== "avatar") : COMMANDS;
+	}
+
+	/** Whether an admin turned uploads off; read once, then kept in memory with every change. */
+	private uploadsOff(): boolean {
+		this.uploadsOffCache ??= this.store.uploadsOff(nowMs());
+		return this.uploadsOffCache;
+	}
+
+	/**
+	 * `/toggle uploads`: turns uploads off or on for everyone, and tells the
+	 * sender which with a `@private` notice before the result (§1). While off,
+	 * new connections are not offered `embed:upload`, and new upload embeds and
+	 * `/avatar` are `denied`; writes already started still finish.
+	 */
+	private toggle(socket: WebSocketConnection, request: RequestFrame, roomId: string, feature: string): void {
+		if (feature !== "uploads") throw { name: "invalid_params", message: "Usage: /toggle uploads" } satisfies ProtocolError;
+		const off = !this.uploadsOff();
+		this.store.setUploadsOff(off, nowMs());
+		this.uploadsOffCache = off;
+		this.sendNotice(socket, roomId, off
+			? "Uploads are now **off**: new attachments and avatars are refused, and new connections are not offered uploads."
+			: "Uploads are now **on**.");
+		this.reply(socket, request, {});
 	}
 
 	/**

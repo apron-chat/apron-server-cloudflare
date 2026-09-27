@@ -65,7 +65,8 @@ within it:
   and WebP are kept, at most 5 MB each (avatars 256 KB), 20 a day per user and
   500 a day in all. Images last a week and avatars a month; an avatar lasts
   while its owner keeps signing in. Every embed gets an `embed_id`, and saves
-  keep embeds by it. Clients should resize images and strip their metadata
+  keep embeds by it. Admins can turn uploads off and on with
+  `/toggle uploads`. Clients should resize images and strip their metadata
   (such as location) before uploading: the server stores the bytes as sent.
 - Messages: a request without `room_id` is in `general`. A new message with
   empty text and no embeds is not logged and returns `{}`; an empty save is
