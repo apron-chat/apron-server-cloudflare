@@ -61,6 +61,7 @@ it('lists and runs the admin commands for admins only', async () => {
 		expect(help.notice!.params.body.text).toContain('/admin <user_id>');
 		expect(help.notice!.params.body.text).toContain('/kick <user_id>');
 		expect(help.notice!.params.body.text).toContain('/status');
+		expect(help.notice!.params.body.text).toContain('/rename <old_user_id> <new_user_id>');
 
 		const plain = await command(alice, 'help', '/help');
 		expect(plain.notice!.params.body.text).toContain('/invite-bot');
@@ -143,4 +144,52 @@ it('/status sends the caller the Cloudflare usage and the demo budgets', async (
 		expect(text).toMatch(/\| Registered users \| [\d,]+ \/ 10,000/);
 		expect(text).toContain('| Database |');
 	} finally { admin.close(); }
+});
+
+it('/rename moves a registered user, their passkey, rooms and admin status to a new user_id', async () => {
+	const admin = await signedInAdmin();
+	const fromId = unique('dave');
+	const toId = unique('david');
+	const dave = await signedIn(fromId);
+	const erin = await signedIn(unique('erin'));
+	try {
+		expect((await command(admin, 'grant', `/admin ${fromId}`)).frame.result).toEqual({});
+		const renamed = await command(admin, 'rename', `/rename ${fromId} ${toId}`);
+		expect(renamed.frame.result).toEqual({});
+		expect(renamed.notice!.params.body.text).toBe(`Renamed \`${fromId}\` to \`${toId}\`.`);
+		// The user's connection becomes the new identity; a room-mate learns of the change (§3.3).
+		const you = await until(dave, (frame) => frame.method === 'user');
+		expect(you.frame.params).toEqual({ you: { user_id: toId, name: `Name of ${fromId}` } });
+		const change = await until(erin, (frame) => frame.method === 'user' && frame.params.old?.user_id === fromId);
+		expect(change.frame.params).toEqual({ new: { user_id: toId, name: `Name of ${fromId}` }, old: { user_id: fromId, name: `Name of ${fromId}` } });
+		const posted = await exchange(dave, 'post', 'message', { room_id: 'general', body: { text: 'renamed' } });
+		expect(posted.frame.result.message_id).toBeDefined();
+		// Still an admin under the new id.
+		expect((await command(dave, 'status', '/status')).frame.result).toEqual({});
+
+		await runInDurableObject(stub(), (instance) => {
+			const { store } = instance as unknown as { store: {
+				getIdentity(id: string): { rooms: string[] } | null; getCredential(id: string): { userId: string } | null;
+				identityExists(id: string): boolean; userIdTaken(id: string): boolean;
+			} };
+			expect(store.getIdentity(toId)?.rooms).toContain('general');
+			expect(store.getCredential(`cred-${fromId}`)?.userId).toBe(toId);
+			expect(store.identityExists(fromId)).toBe(false);
+			// The old user_id is retired, never reissued.
+			expect(store.userIdTaken(fromId)).toBe(true);
+		});
+
+		for (const [id, text] of [
+			['taken', `/rename ${toId} ${fromId}`],
+			['guest', `/rename ${toId} guest_77`],
+			['bot', `/rename ${toId} bot_x`],
+			['bad-chars', `/rename ${toId} no@pe`],
+			['admin', `/rename admin somebody_else`],
+			['unknown', `/rename nobody_123 somebody_else`],
+		]) {
+			expect((await command(admin, `rename-${id}`, text)).frame.error.code).toBe(-32602);
+		}
+		expect((await command(admin, 'rename-usage', `/rename ${toId}`)).frame.error.message).toBe('Usage: /rename <old_user_id> <new_user_id>');
+		expect(admin.closed()).toBeUndefined();
+	} finally { admin.close(); dave.close(); erin.close(); }
 });

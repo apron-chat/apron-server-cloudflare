@@ -626,6 +626,11 @@ const CARRIED_PASSKEY_COST = { reads: 4, writes: 8 } as const;
 const META_ADMINS = "admins";
 /** Most users `/admin` may list, so the list stays one small `_meta` row. */
 export const MAX_ADMINS = 32;
+/**
+ * `_meta` key prefix recording a `/rename`: `renamed:<old user_id>` holds the
+ * new one, so the retired `user_id` is never reissued (protocol §3.3).
+ */
+const META_RENAMED_PREFIX = "renamed:";
 /** Rows one guest-number block reservation may read and write, before control overhead. */
 const GUEST_NUMBER_BLOCK_COST = { reads: 8, writes: 8 } as const;
 
@@ -1968,10 +1973,51 @@ export class Store {
     return 8 + 2 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS);
   }
 
-  /** Whether a `user_id` is taken, one indexed read: registration picks ids with it. */
+  /** Whether an identity has this `user_id` now, one indexed read. */
   identityExists(userId: string): boolean {
     this.ensureReady();
     return this.reserved({ reads: 4 }, false, this.clock.now(), () => this.identityRow(userId) !== null);
+  }
+
+  /**
+   * Whether a `user_id` may not be issued: an identity has it, or `/rename`
+   * retired it. Registration picks ids with it.
+   */
+  userIdTaken(userId: string): boolean {
+    this.ensureReady();
+    return this.reserved({ reads: 8 }, false, this.clock.now(), () => this.idTaken(userId));
+  }
+
+  private idTaken(userId: string): boolean {
+    return this.identityRow(userId) !== null || this.metaValue(META_RENAMED_PREFIX + userId) !== "";
+  }
+
+  /**
+   * `/rename`: moves a registered user to a new `user_id`: the identity row,
+   * its credential (so its passkey signs in as the new id), its stored
+   * memberships, and its admin listing. Nothing else is migrated: logged
+   * records keep the old `user_id` (protocol §3.3), and sessions, limiter
+   * windows, reactions and the user's bot stay under it. The old `user_id` is
+   * retired, never reissued. Returns the user's name and joined rooms.
+   */
+  renameIdentity(input: { from: string; to: string; now?: number }): { name: string; rooms: string[] } {
+    this.ensureReady();
+    const now = input.now ?? this.clock.now();
+    const membershipRows = MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS;
+    return this.reserved({ reads: 64 + membershipRows + this.userRoomsReads(), writes: 32 + 4 * membershipRows }, false, now, () => this.transaction(() => {
+      const identity = this.identityRow(input.from);
+      if (!identity || identity.tier !== "registered") throw new StoreError("invalid_params", `No registered user has the user_id ${input.from}`.slice(0, 200));
+      if (this.idTaken(input.to)) throw new StoreError("invalid_params", `The user_id ${input.to} is taken`.slice(0, 200));
+      this.rawExec("UPDATE identities SET user_id = ?, updated_ms = ? WHERE user_id = ?", input.to, this.effectiveNow(now), input.from);
+      this.rawExec("UPDATE credentials SET user_id = ? WHERE user_id = ?", input.to, input.from);
+      this.rawExec("UPDATE memberships SET user_id = ? WHERE user_id = ?", input.to, input.from);
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_RENAMED_PREFIX + input.from, input.to);
+      const admins = this.adminIds();
+      if (admins.includes(input.from)) {
+        this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ADMINS, JSON.stringify(admins.map((id) => (id === input.from ? input.to : id))));
+      }
+      return { name: identity.name, rooms: this.userRooms(input.to) };
+    }));
   }
 
   getIdentity(userId: string): StoredIdentity | null {
@@ -2362,7 +2408,7 @@ export class Store {
         };
         // Recheck all persistent caps in the transaction immediately before the
         // credential is made usable; concurrent verification cannot overrun caps.
-        if (this.identityRow(input.userId)) throw new StoreError("invalid_params", "identity already exists");
+        if (this.idTaken(input.userId)) throw new StoreError("invalid_params", "identity already exists");
         if (this.credentialValue(credential.credentialId)) throw new StoreError("invalid_params", "credential is already registered");
         if (this.metaNumber("identity_count") >= this.config.registeredIdentityCount) throw new StoreError("denied", "registration_closed");
         this.chargeRegistration(input.ipKey, effective);

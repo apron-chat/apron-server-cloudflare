@@ -105,6 +105,7 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "invite-bot", usage: "/invite-bot", help: "get a sign-in token for your bot; a new one replaces the last", audience: "owners" },
 	{ name: "admin", usage: "/admin <user_id>", help: "make a registered user an admin", audience: "admins" },
 	{ name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", audience: "admins" },
+	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
 	{ name: "status", usage: "/status", help: "show today's Cloudflare usage and the demo's budgets", audience: "admins" },
 ];
 /** Why a guest's post, reaction, join, leave, or room change is denied while guests only read. */
@@ -1088,7 +1089,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const name = action === "register" ? this.requestedName(params) : undefined;
 			const begun = await this.webAuthn.begin(action, origin, nowMs(), identity ?? undefined, [], attachment.connId, {
 				...(name !== undefined ? { name } : {}),
-				userIdTaken: (userId) => this.store.identityExists(userId),
+				userIdTaken: (userId) => this.store.userIdTaken(userId),
 			});
 			if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
 			attachment.challenge = begun.challenge;
@@ -1800,7 +1801,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `command` (§4.8): never logged, broadcast, or saved. The demo provides
 	 * `/help`, which replies with a `@private` notice listing the commands the
 	 * sender may run, `/invite-bot` for registered users, and `/admin`,
-	 * `/kick` and `/status` for admins. An unknown
+	 * `/kick`, `/rename` and `/status` for admins. An unknown
 	 * command is an error the client shows; it is not a policy violation,
 	 * since people mistype.
 	 */
@@ -1835,12 +1836,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await this.inviteBot(socket, attachment, request, roomId);
 			return;
 		}
-		if (command.name === "admin" || command.name === "kick") {
+		if (command.name === "admin" || command.name === "kick" || command.name === "rename") {
 			try {
 				const target = words[1];
-				if (!target || words.length > 2) throw { name: "invalid_params", message: `Usage: ${command.usage}` } satisfies ProtocolError;
+				const argumentCount = command.name === "rename" ? 2 : 1;
+				if (!target || words.length !== argumentCount + 1) throw { name: "invalid_params", message: `Usage: ${command.usage}` } satisfies ProtocolError;
 				if (command.name === "admin") this.grantAdmin(socket, request, roomId, target);
-				else await this.kick(socket, attachment, request, roomId, target);
+				else if (command.name === "kick") await this.kick(socket, attachment, request, roomId, target);
+				else this.rename(socket, request, roomId, target, words[2]);
 			} catch (error) {
 				// A mistyped or wrong user_id is an error to show, like an unknown
 				// command, not a policy violation.
@@ -1925,6 +1928,33 @@ export class ApronDemoServer extends DurableObject<Env> {
 			done();
 		});
 		if (!changed) throw notMember;
+	}
+
+	/**
+	 * `/rename <old_user_id> <new_user_id>`: gives a registered user a new
+	 * `user_id` (Store.renameIdentity), retiring the old one. The user's
+	 * connections become the new identity and get `user` `you`, and those who
+	 * share a room with the user get `user` `new` with `old` (protocol §3.3).
+	 * Logged records, sessions, and the user's bot keep the old `user_id`: a
+	 * session for it is `denied`, and the passkey signs in as the new one.
+	 */
+	private rename(socket: WebSocketConnection, request: RequestFrame, roomId: string, from: string, to: string): void {
+		if (from === ADMIN_USER_ID || to === ADMIN_USER_ID) throw { name: "invalid_params", message: "The admin user's user_id is fixed" } satisfies ProtocolError;
+		if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(to) || /^(guest|bot)(_|$)/i.test(to)) {
+			throw { name: "invalid_params", message: "A user_id is 1 to 64 letters, digits, _ or -, starting with a letter or digit, and not guest_ or bot_" } satisfies ProtocolError;
+		}
+		const renamed = this.store.renameIdentity({ from, to, now: nowMs() });
+		for (const peer of this.connectionsOf(from)) {
+			const state = connectionAttachment(peer);
+			if (!state) continue;
+			state.userId = to;
+			writeAttachment(peer, state);
+		}
+		const identity = { user_id: to, ...(renamed.name ? { name: renamed.name } : {}) };
+		const old = { user_id: from, ...(renamed.name ? { name: renamed.name } : {}) };
+		this.announceUser(null, identity, this.liveRoomsOf(to) ?? renamed.rooms, old);
+		this.sendNotice(socket, roomId, `Renamed \`${from}\` to \`${to}\`.`);
+		this.reply(socket, request, {});
 	}
 
 	/**
@@ -2119,7 +2149,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * everyone else who shares one of `rooms` with the user. Joins and leaves
 	 * are memberships, never `user` notifications (§4.3.2).
 	 */
-	private announceUser(origin: WebSocketConnection, identity: { user_id: string; name?: string } | null, rooms: readonly string[], old?: { user_id: string; name?: string } | null): void {
+	private announceUser(origin: WebSocketConnection | null, identity: { user_id: string; name?: string } | null, rooms: readonly string[], old?: { user_id: string; name?: string } | null): void {
 		if (!identity) return;
 		const shared = new Set(rooms);
 		for (const peer of this.ctx.getWebSockets()) {
