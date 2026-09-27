@@ -1,5 +1,5 @@
 import * as budget from "./budget.ts";
-import { DEFAULT_LIMITS, type Limits } from "./budget.ts";
+import { DEFAULT_FEATURES, DEFAULT_LIMITS, type Limits } from "./budget.ts";
 export { DEFAULT_LIMITS, BOOTSTRAP_ROW_RESERVATION, type Limits } from "./budget.ts";
 
 export interface RuntimeConfig {
@@ -9,9 +9,9 @@ export interface RuntimeConfig {
 	rpOrigins: readonly string[];
 	rpName: string;
 	admissionOff: boolean;
-	/** Advertise and relay typing (cap `activity`); off unless `ACTIVITY=true`. */
+	/** Advertise and relay typing (cap `activity`); `ACTIVITY` overrides the plan's default. */
 	activityEnabled: boolean;
-	/** Let guests post, react, join and leave rooms, and create threads; off unless `GUEST_POSTING=true`, so guests only read. */
+	/** Let guests post, react, join and leave rooms, and create threads; `GUEST_POSTING` overrides the plan's default. Off, guests only read. */
 	guestPosting: boolean;
 	/**
 	 * A fixed bearer token that signs in as the admin user
@@ -80,6 +80,13 @@ function parsePositiveInt(env: EnvLike, name: string, fallback: number): number 
 	const value = typeof raw === "number" ? raw : Number(raw);
 	if (!Number.isSafeInteger(value) || value <= 0) throw new ConfigError(`${name} must be a positive safe integer`);
 	return value;
+}
+
+function parseSwitch(raw: string | undefined, name: string, fallback: boolean): boolean {
+	if (raw === undefined || raw === "") return fallback;
+	const value = String(raw).toLowerCase();
+	if (value !== "true" && value !== "false") throw new ConfigError(`${name} must be true or false`);
+	return value === "true";
 }
 
 function validateLimits(limits: Limits): void {
@@ -235,10 +242,8 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 	}
 	if (env.ADMISSION_OFF !== undefined && !["true", "false"].includes(String(env.ADMISSION_OFF).toLowerCase())) throw new ConfigError("ADMISSION_OFF must be true or false");
 	const admissionOff = String(env.ADMISSION_OFF ?? "").toLowerCase() === "true";
-	if (env.ACTIVITY !== undefined && !["true", "false"].includes(String(env.ACTIVITY).toLowerCase())) throw new ConfigError("ACTIVITY must be true or false");
-	const activityEnabled = String(env.ACTIVITY ?? "").toLowerCase() === "true";
-	if (env.GUEST_POSTING !== undefined && !["true", "false"].includes(String(env.GUEST_POSTING).toLowerCase())) throw new ConfigError("GUEST_POSTING must be true or false");
-	const guestPosting = String(env.GUEST_POSTING ?? "").toLowerCase() === "true";
+	const activityEnabled = parseSwitch(env.ACTIVITY, "ACTIVITY", DEFAULT_FEATURES.activity);
+	const guestPosting = parseSwitch(env.GUEST_POSTING, "GUEST_POSTING", DEFAULT_FEATURES.guestPosting);
 	const adminToken = env.APRON_ADMIN_TOKEN === undefined || env.APRON_ADMIN_TOKEN === "" ? undefined : String(env.APRON_ADMIN_TOKEN);
 	const adminTokenProblem = adminToken === undefined ? null : adminTokenError(adminToken);
 	if (adminTokenProblem) throw new ConfigError(adminTokenProblem);

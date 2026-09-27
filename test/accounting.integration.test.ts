@@ -402,10 +402,11 @@ describe('measured storage accounting', () => {
 			expect(joined.rooms).not.toContain('expired-thread');
 			expectWithinReserve(join);
 
-			// Members of every room at the listing cap: 100 registered members in
-			// each of the 101 rooms, read by primary-key range with a name lookup each.
+			// Members of every room at the listing cap: roomListMembers registered
+			// members in each of the 101 rooms, read by primary-key range with a
+			// name lookup each.
 			state.storage.transactionSync(() => {
-				for (let index = 1; index <= 100; index += 1) {
+				for (let index = 1; index <= DEFAULT_LIMITS.roomListMembers; index += 1) {
 					state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES (?, ?, ?, 'registered', 0, 0)", `member-${index}`, `member-handle-${index}`, `Member ${index}`);
 					for (const room of rooms) state.storage.sql.exec('INSERT OR IGNORE INTO memberships (room_id, user_id) VALUES (?, ?)', room.room_id, `member-${index}`);
 				}

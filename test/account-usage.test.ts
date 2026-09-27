@@ -35,9 +35,29 @@ describe("account usage snapshots", () => {
 		expect(snapshot).toMatchObject({ day: "2026-09-21", workerRequests: 1, durableObjectRequests: 2, sqlRowsRead: 4, sqlRowsWritten: 5, storedBytes: 6, stop: false });
 	});
 
+	it("bills incoming WebSocket messages at the plan's ratio", async () => {
+		const snapshot = accountUsageSnapshotFromResult(result({
+			durableObjectsInvocationsAdaptiveGroups: [
+				{ dimensions: { type: "http" }, sum: { requests: 3 } },
+				{ dimensions: { type: "hibernation" }, sum: { requests: 40 } },
+				{ dimensions: { type: "alarm" }, sum: { requests: 1 } },
+			],
+		}), Date.now());
+		expect(snapshot.durableObjectRequests).toBe(4 + 40 / ACCOUNT_USAGE_POLICY.webSocketMessagesPerRequest);
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+			expect(JSON.parse(String(init?.body)).query).toMatch(/durableObjectsInvocationsAdaptiveGroups\([^)]*\) \{ dimensions \{ type \}/);
+			return Response.json(result());
+		});
+		try {
+			await fetchAccountUsage({ ACCOUNT_ID: "test-account", ACCOUNT_ANALYTICS_TOKEN: "test-token" });
+		} finally {
+			fetchSpy.mockRestore();
+		}
+	});
+
 	it("stops when any shared allowance reaches the configured ratio", () => {
 		const snapshot = accountUsageSnapshotFromResult(result({
-			workersInvocationsAdaptive: [{ sum: { requests: ACCOUNT_USAGE_POLICY.freeDaily.workerRequests * ACCOUNT_USAGE_POLICY.stopRatio } }],
+			workersInvocationsAdaptive: [{ sum: { requests: ACCOUNT_USAGE_POLICY.daily.workerRequests * ACCOUNT_USAGE_POLICY.stopRatio } }],
 		}), Date.now());
 		expect(snapshot.stop).toBe(true);
 	});

@@ -1,10 +1,38 @@
 # Configuration reference
 
+## Plans
+
+Each Cloudflare Workers plan has its own policy file: its application
+defaults, admission rates, feature-switch defaults, and the included usage
+the account-usage stop compares against. `PLAN` in `src/budget.ts` selects
+one, and must match the account's plan.
+
+| File | Plan | Features on by default |
+| --- | --- | --- |
+| [`src/plans/paid.ts`](../src/plans/paid.ts) (selected) | Workers Paid, $5/month | `activity` (typing), guest posting |
+| [`src/plans/free.ts`](../src/plans/free.ts) | Workers Free | none |
+
+The paid plan starts from the free one and raises only what Paid's included
+usage pays for, sized against its monthly allowances divided by 31 days with
+headroom. Paid includes 16 times the SQL rows written and 160 times the rows
+read, so the SQL ceilings rise tenfold, and posts, registrations, admissions,
+history pages, and member listings with them. It includes only a third of
+Free's Durable Object requests (1 million a month against 100,000 a day), so
+the frame budgets rise by half and connection limits stay. The header of
+`src/plans/paid.ts` gives the worst case of each allowance.
+
+To switch plans, import the other plan in `src/budget.ts`, then run the
+commands below. The generated rate-limiter blocks and edge rules follow the
+plan's admission rates. The calibrated ceilings that reference defaults (open
+sockets, identities, limiter records, processed frames, global posts,
+registrations, SQL ceilings, database watermarks) follow the selected plan too.
+
 ## Editing the deployment budget
 
-`src/budget.ts` is the source of truth for application defaults, resource ceilings,
-maintenance reserves, and admission rates. The Worker, standalone store, and
-protocol parser all consume its defaults. Resource ceilings reference those
+`src/budget.ts` and the plan files are the source of truth for application
+defaults, resource ceilings, maintenance reserves, and admission rates. The
+Worker, standalone store, and protocol parser all consume the selected plan's
+defaults. Resource ceilings reference those
 defaults rather than repeating numeric allocations. Separate calibrated parser,
 payload, and memory bounds remain in that same file; increasing them requires
 reviewing their consumers and repeating cost calibration.
@@ -43,8 +71,13 @@ successful snapshot and retry with backoff; they do not pause the service.
 Set the token with `npx wrangler secret put ACCOUNT_ANALYTICS_TOKEN --config
 wrangler.production.toml`; never put the token in Wrangler vars or source code.
 
-The snapshot is account-wide and delayed. At 90% of any configured Workers Free
-allowance, the object persists a stop for that UTC day, rejects new connections,
+The snapshot is account-wide and delayed. Each plan file's `account` sets the
+daily allowances: Free's own daily ones, or Paid's monthly included usage
+divided by 31 days, so stopping inside each day's share keeps the month inside
+what the plan includes. Incoming WebSocket messages, which analytics report as
+`hibernation` invocations, count as a twentieth of a request on Paid, as it
+bills them, and as a whole one on Free. At 90% of any allowance, the object
+persists a stop for that UTC day, rejects new connections,
 and closes live sockets. This is an early-stop signal, not an exact remaining-
 quota meter: analytics lag, sampling, and other account workloads can still cause
 an earlier or later platform limit.
@@ -55,9 +88,13 @@ blocking windows must both be 10 seconds on Free. It is generated disabled becau
 it applies across hostnames in the zone. See [edge admission operations](edge-admission.md)
 before applying rules or deploying changed budgets.
 
-Keep the account on **Workers Free** for an absolute zero-overage boundary.
-Changing this file never changes the account plan. These resource budgets are
-not an account-wide dollar cap, and cannot guarantee availability under attack.
+Only **Workers Free** gives an absolute zero-overage boundary. On Workers Paid,
+rejected and hostile traffic past the included usage is billed rather than
+refused: entry Worker requests (every WebSocket attempt and status probe) at
+$0.30 a million and Durable Object requests at $0.15 a million, at the rates
+checked 2026-09-27. The account-usage stop, `ADMISSION_OFF`, and the edge rules
+limit that; none of them is a spending cap. Changing these files never changes
+the account plan, and the budgets cannot guarantee availability under attack.
 
 ## Runtime overrides
 
@@ -110,12 +147,12 @@ The calibrated hard ceilings are `maxFrameBytes` 16 KiB, `maxTextBytes` 4 KiB,
 bytes, names 80 Unicode code points/320 UTF-8 bytes, embeds 4, history limit
 50, history response 256 KiB, pending work 8 frames/128 KiB, open sockets 100,
 registered identities and limiter records 10,000 each, processed frames
-100,000/day, global posts 60/minute and 5,000/day, registrations 100/day,
+150,000/day, global posts 120/minute and 10,000/day, registrations 300/day,
 connection frame rate 120/minute, server-wide frames 1,000/minute (at least one
 IP's minute), per-type throttles 60/minute, frame blocks
 20 frames (and one block per anonymous connection must fit the IP's frame
 minute), `room_list` registered members 200 per room, guest-number blocks
-10,000 numbers, SQL writes 80,000/day, SQL reads 3,000,000/day,
+10,000 numbers, SQL writes 800,000/day, SQL reads 30,000,000/day,
 database high-water 96 MiB and hard target 128 MiB, cleanup 100 records,
 thread rooms 100 with 2 KiB of client fields, reactions 64 users per message
 and 16 emoji per user, and credentials/challenges 16 KiB. Operators
@@ -128,8 +165,8 @@ and recalibrating its resource model.
 | `RP_ORIGINS` | Comma-separated exact WebAuthn origins; required explicitly with wildcard guest admission; never accepts wildcards |
 | `ALLOWED_ORIGINS` | Exact browser-origin allowlist, or standalone `*` to admit every guest origin (including opaque/missing Origin); cannot mix `*` with explicit origins; all clients remain subject to quotas |
 | `RP_NAME` | Bounded display name for browser passkey prompts |
-| `ACTIVITY` | `true` advertises and relays typing (cap `activity`, section 4.2 of the spec); default off. Read cursors are never kept |
-| `GUEST_POSTING` | `true` lets guests post, react, join and leave rooms, and create threads under the guest quotas; default off, so guests only list rooms and read history until they sign in with a passkey. Announced as `ext.demo.guest_posting` |
+| `ACTIVITY` | `true` advertises and relays typing (cap `activity`, section 4.2 of the spec); `false` turns it off. Unset, the plan decides: on for Workers Paid, off for Free. Read cursors are never kept |
+| `GUEST_POSTING` | `true` lets guests post, react, join and leave rooms, and create threads under the guest quotas; `false` leaves guests to list rooms and read history until they sign in with a passkey. Unset, the plan decides: on for Workers Paid, off for Free. Announced as `ext.demo.guest_posting` |
 | `APRON_ADMIN_TOKEN` | Optional fixed bearer token, 24 to 256 of `A-Z a-z 0-9 - _` and not starting `apron_bot_`: `auth` with `scheme: "token"` and this token signs in as the registered user `admin` ("Admin"), from any origin and without a passkey, created on first use (a registration against the usual caps). That user is always an admin and can run `/admin <user_id>`, `/kick <user_id>`, `/rename <old_user_id> <new_user_id>` and `/status` (see [SPEC section 5, Admins](../SPEC.md#admins)). Unset by default. Anyone holding it can act as the admin, so set it only as a secret, never a Wrangler var in source: `npx wrangler secret put APRON_ADMIN_TOKEN --config wrangler.production.toml`. It persists across deploys; delete it with `npx wrangler secret delete APRON_ADMIN_TOKEN --config wrangler.production.toml` to turn it off. A malformed value makes every request fail its configuration check. Locally, use `npx wrangler dev --var APRON_ADMIN_TOKEN:…` or `.dev.vars` |
 | `ADMISSION_OFF` | Operator admission switch; `true` rejects new sockets in the entry Worker before the limiter or DO call; existing sockets remain subject to DO budgets |
 | `ENVIRONMENT` | Set to `development` to enable local origin defaults when `ALLOWED_ORIGINS` and `RP_ORIGINS` are omitted |
@@ -159,8 +196,8 @@ reserves a fresh block and the unused numbers are skipped; numbers are never
 reissued. The default of 10 favours a meaningful count over saved writes:
 this object sleeps between quiet visits, and each visit after a sleep burns
 the rest of a block whatever its size, so a block of 1,000 would number
-occasional visitors 1, 1001, 2001, … while saving at most about 800 written rows
-a day (at most 200 blocks for the 2,000 guest admissions a day, against
+occasional visitors 1, 1001, 2001, … while saving at most about 1,600 written rows
+a day (at most 400 blocks for the 4,000 guest admissions a day, against
 about 60 rows each guest connection already writes). Raise it only for a deployment that stays awake.
 
 The numeric rows are grouped by their unit and enforcement scope:
@@ -201,75 +238,76 @@ The numeric rows are grouped by their unit and enforcement scope:
   `foregroundWritesPerDay`, `maintenanceWritesPerDay`,
   `foregroundReadsPerDay`, `maintenanceReadsPerDay`.
 
-| Variable | Default |
-| --- | ---: |
-| `retentionSeconds` | 86400 |
-| `cleanupSeconds` | 3600 |
-| `challengeTtlSeconds` | 120 |
-| `maxFrameBytes` | 16384 |
-| `maxTextBytes` | 4096 |
-| `maxSnapshotBytes` | 8192 |
-| `maxJsonDepth` | 8 |
-| `maxJsonNodes` | 2048 |
-| `maxRequestIdBytes` | 128 |
-| `maxNameCodePoints` | 80 |
-| `maxNameBytes` | 320 |
-| `maxEmbeds` | 4 |
-| `historyDefaultLimit` | 20 |
-| `historyMaxLimit` | 50 |
-| `historyMaxResponseBytes` | 262144 |
-| `historyRequestsPerUserMinute` | 10 |
-| `historyRequestsPerIpMinute` | 30 |
-| `concurrentHistoryPerConnection` | 1 |
-| `anonymousPostsPerMinute` | 5 |
-| `anonymousPostsPerDay` | 100 |
-| `registeredPostsPerMinute` | 20 |
-| `registeredPostsPerDay` | 500 |
-| `ipPostsPerMinute` | 30 |
-| `ipPostsPerDay` | 1000 |
-| `globalPostsPerMinute` | 60 |
-| `globalPostsPerDay` | 5000 |
-| `registrationsPerIpDay` | 3 |
-| `registrationsPerDay` | 100 |
-| `registeredIdentityCount` | 10000 |
-| `authAttemptsPerIpMinute` | 10 |
-| `openConnections` | 100 |
-| `anonymousConnectionsPerIp` | 2 |
-| `registeredConnectionsPerUser` | 3 |
-| `connectionsPerIp` | 10 |
-| `connectionAdmissionsPerIpMinute` | 5 |
-| `connectionAdmissionsPerDay` | 2000 |
-| `unauthenticatedTimeoutSeconds` | 30 |
-| `pendingFramesPerConnection` | 8 |
-| `pendingBytesPerConnection` | 131072 |
-| `framesPerConnectionMinute` | 60 |
-| `framesPerIpMinute` | 120 |
-| `processedFramesPerDay` | 100000 |
-| `repeatedPolicyViolations` | 3 |
-| `globalFramesPerMinute` | 300 |
-| `activityBroadcastsPerUserMinute` | 10 |
-| `roomListRequestsPerUserMinute` | 6 |
-| `activityMaxTypingSeconds` | 30 |
-| `frameLease` | 10 |
-| `roomListMembers` | 100 |
-| `pingSeconds` | 45 |
-| `pingTimeoutSeconds` | 150 |
-| `guestNumberBlock` | 10 |
-| `sqlWritesPerDay` | 80000 |
-| `sqlReadsPerDay` | 3000000 |
-| `foregroundWritesPerDay` | 60000 |
-| `maintenanceWritesPerDay` | 20000 |
-| `foregroundReadsPerDay` | 2500000 |
-| `maintenanceReadsPerDay` | 500000 |
-| `databaseHighWaterBytes` | 100663296 |
-| `databaseHardTargetBytes` | 134217728 |
-| `databaseResumeLowWaterBytes` | 83886080 |
-| `cleanupBatch` | 100 |
-| `threadLimit` | 100 |
-| `threadMetadataBytes` | 2048 |
-| `reactionUsersPerMessage` | 32 |
-| `reactionEmojisPerUser` | 8 |
-| `dedupTtlSeconds` | 86400 |
-| `limiterRecordCap` | 10000 |
-| `maxCredentialBytes` | 16384 |
-| `maxChallengeBytes` | 16384 |
+| Variable | Workers Paid default | Workers Free, where different |
+| --- | ---: | ---: |
+| `retentionSeconds` | 86400 |  |
+| `cleanupSeconds` | 3600 |  |
+| `challengeTtlSeconds` | 120 |  |
+| `maxFrameBytes` | 16384 |  |
+| `maxTextBytes` | 4096 |  |
+| `maxSnapshotBytes` | 8192 |  |
+| `maxJsonDepth` | 8 |  |
+| `maxJsonNodes` | 2048 |  |
+| `maxRequestIdBytes` | 128 |  |
+| `maxNameCodePoints` | 80 |  |
+| `maxNameBytes` | 320 |  |
+| `maxEmbeds` | 4 |  |
+| `historyDefaultLimit` | 20 |  |
+| `historyMaxLimit` | 50 |  |
+| `historyMaxResponseBytes` | 262144 |  |
+| `historyRequestsPerUserMinute` | 20 | 10 |
+| `historyRequestsPerIpMinute` | 60 | 30 |
+| `concurrentHistoryPerConnection` | 1 |  |
+| `anonymousPostsPerMinute` | 5 |  |
+| `anonymousPostsPerDay` | 200 | 100 |
+| `registeredPostsPerMinute` | 20 |  |
+| `registeredPostsPerDay` | 1000 | 500 |
+| `ipPostsPerMinute` | 30 |  |
+| `ipPostsPerDay` | 2000 | 1000 |
+| `globalPostsPerMinute` | 120 | 60 |
+| `globalPostsPerDay` | 10000 | 5000 |
+| `registrationsPerIpDay` | 5 | 3 |
+| `registrationsPerDay` | 300 | 100 |
+| `registeredIdentityCount` | 10000 |  |
+| `authAttemptsPerIpMinute` | 10 |  |
+| `openConnections` | 100 |  |
+| `anonymousConnectionsPerIp` | 2 |  |
+| `registeredConnectionsPerUser` | 3 |  |
+| `connectionsPerIp` | 10 |  |
+| `connectionAdmissionsPerIpMinute` | 5 |  |
+| `connectionAdmissionsPerDay` | 4000 | 2000 |
+| `unauthenticatedTimeoutSeconds` | 30 |  |
+| `pendingFramesPerConnection` | 8 |  |
+| `pendingBytesPerConnection` | 131072 |  |
+| `framesPerConnectionMinute` | 60 |  |
+| `framesPerIpMinute` | 120 |  |
+| `processedFramesPerDay` | 150000 | 100000 |
+| `repeatedPolicyViolations` | 3 |  |
+| `globalFramesPerMinute` | 600 | 300 |
+| `activityBroadcastsPerUserMinute` | 10 |  |
+| `roomListRequestsPerUserMinute` | 6 |  |
+| `activityMaxTypingSeconds` | 30 |  |
+| `frameLease` | 10 |  |
+| `roomListMembers` | 200 | 100 |
+| `pingSeconds` | 45 |  |
+| `pingTimeoutSeconds` | 150 |  |
+| `guestNumberBlock` | 10 |  |
+| `sqlWritesPerDay` | 800000 | 80000 |
+| `sqlReadsPerDay` | 30000000 | 3000000 |
+| `foregroundWritesPerDay` | 700000 | 60000 |
+| `maintenanceWritesPerDay` | 100000 | 20000 |
+| `foregroundReadsPerDay` | 25000000 | 2500000 |
+| `maintenanceReadsPerDay` | 5000000 | 500000 |
+| `databaseHighWaterBytes` | 100663296 |  |
+| `databaseHardTargetBytes` | 134217728 |  |
+| `databaseResumeLowWaterBytes` | 83886080 |  |
+| `cleanupBatch` | 100 |  |
+| `threadLimit` | 100 |  |
+| `threadMetadataBytes` | 2048 |  |
+| `reactionUsersPerMessage` | 32 |  |
+| `reactionEmojisPerUser` | 8 |  |
+| `dedupTtlSeconds` | 86400 |  |
+| `limiterRecordCap` | 10000 |  |
+| `maxCredentialBytes` | 16384 |  |
+| `maxChallengeBytes` | 16384 |  |
+| `sessionTtlSeconds` | 43200 |  |

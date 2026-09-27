@@ -2,8 +2,10 @@
 
 The public demo server for the [Apron](https://github.com/shazow/apron) chat
 protocol. It runs the whole chat — rooms, threads, reactions,
-history, passkeys, and bots — in a single SQLite Durable Object, and fits
-comfortably on the **Cloudflare Workers Free** plan with zero overage.
+history, passkeys, and bots — in a single SQLite Durable Object, and stays
+inside the usage included with the **Cloudflare Workers Paid** ($5/month) plan.
+The **Workers Free** budgets are kept in [`src/plans/free.ts`](src/plans/free.ts)
+for a zero-overage deployment.
 
 **Try it:** [web.apron.chat](https://web.apron.chat) &nbsp;·&nbsp;
 **Connect:** `wss://server.apron.chat/`
@@ -17,9 +19,9 @@ comfortably on the **Cloudflare Workers Free** plan with zero overage.
   to post, and run `/invite-bot` to get a token for your own bot.
 - **Bring your own frontend.** Guest connections are accepted from any
   origin — even `localhost` or a browser console.
-- **Built to stay free.** Every operation is metered against the Free-plan
-  allowances, with rolling one-day retention and graceful read-only
-  degradation when budgets run out.
+- **Built to stay inside its plan.** Every operation is metered against
+  budgets sized under the plan's included usage, with rolling one-day
+  retention and graceful read-only degradation when budgets run out.
 
 ## Quick start
 

@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { ConfigError, DEFAULT_LIMITS, isAllowedOrigin, loadConfig } from '../src/config';
+import { ACCOUNT_USAGE_POLICY, DEFAULT_FEATURES, PLAN } from '../src/budget';
+import { FREE_PLAN } from '../src/plans/free';
+import { PAID_PLAN } from '../src/plans/paid';
 import { canonicalizeIp, extractClientIp, hashIpKey } from '../src/ip';
 import { DEFAULT_PARSE_OPTIONS, FrameError, parseFrame } from '../src/protocol';
 
@@ -113,14 +116,42 @@ describe('configuration policy boundaries', () => {
 		expect(() => config({}, { databaseHighWaterBytes: 97 * 1024 * 1024 })).toThrow(ConfigError);
 		expect(() => config({}, { framesPerConnectionMinute: 61, framesPerIpMinute: 60 })).toThrow(ConfigError);
 		expect(() => config({}, { openConnections: 11, connectionsPerIp: 12 })).toThrow(ConfigError);
-		expect(() => config({}, { registrationsPerDay: 101 })).toThrow(ConfigError);
+		expect(() => config({}, { registrationsPerDay: DEFAULT_LIMITS.registrationsPerDay + 1 })).toThrow(ConfigError);
 	});
 
-	it('keeps activity off unless ACTIVITY is true, and bounds the server-wide frame minute', () => {
-		expect(config().activityEnabled).toBe(false);
+	it('takes feature switches from the plan unless ACTIVITY or GUEST_POSTING says otherwise', () => {
+		expect(config().activityEnabled).toBe(DEFAULT_FEATURES.activity);
+		expect(config().guestPosting).toBe(DEFAULT_FEATURES.guestPosting);
+		expect(config({ ACTIVITY: '' }).activityEnabled).toBe(DEFAULT_FEATURES.activity);
 		expect(config({ ACTIVITY: 'true' }).activityEnabled).toBe(true);
+		expect(config({ ACTIVITY: 'FALSE' }).activityEnabled).toBe(false);
+		expect(config({ GUEST_POSTING: 'true' }).guestPosting).toBe(true);
+		expect(config({ GUEST_POSTING: 'false' }).guestPosting).toBe(false);
 		expect(() => config({ ACTIVITY: 'maybe' })).toThrow(ConfigError);
-		expect(config().limits.globalFramesPerMinute).toBe(300);
+		expect(() => config({ GUEST_POSTING: '1' })).toThrow(ConfigError);
+	});
+
+	it('keeps the free plan as it was and valid, and the paid plan inside its allowances', () => {
+		expect(FREE_PLAN.features).toEqual({ activity: false, guestPosting: false });
+		expect(FREE_PLAN.limits).toMatchObject({ globalFramesPerMinute: 300, processedFramesPerDay: 100_000, globalPostsPerDay: 5_000, registrationsPerDay: 100, sqlWritesPerDay: 80_000, sqlReadsPerDay: 3_000_000 });
+		expect(FREE_PLAN.account.daily.sqlRowsWritten).toBe(100_000);
+		// The calibrated ceilings follow the selected plan, and Free fits under any.
+		for (const plan of new Set([FREE_PLAN, PLAN])) expect(() => config({}, plan.limits)).not.toThrow();
+		for (const plan of [FREE_PLAN, PAID_PLAN]) {
+			const { daily, storedBytes } = plan.account;
+			expect(plan.limits.sqlWritesPerDay).toBeLessThan(daily.sqlRowsWritten * ACCOUNT_USAGE_POLICY.stopRatio);
+			expect(plan.limits.sqlReadsPerDay).toBeLessThan(daily.sqlRowsRead * ACCOUNT_USAGE_POLICY.stopRatio);
+			expect(plan.limits.databaseHardTargetBytes).toBeLessThan(storedBytes * ACCOUNT_USAGE_POLICY.stopRatio);
+			// Worst-case billed Durable Object requests: processed frames and pings
+			// from every open connection every pingSeconds, at 20 incoming WebSocket
+			// messages a request, plus admissions and a cleanup alarm an hour.
+			const messages = plan.limits.processedFramesPerDay + plan.limits.openConnections * Math.ceil(86_400 / plan.limits.pingSeconds);
+			const requests = messages / 20 + plan.limits.connectionAdmissionsPerDay + 24;
+			expect(requests).toBeLessThan(daily.durableObjectRequests * ACCOUNT_USAGE_POLICY.stopRatio);
+		}
+	});
+
+	it('bounds the server-wide frame minute', () => {
 		expect(() => config({}, { globalFramesPerMinute: DEFAULT_LIMITS.framesPerIpMinute - 1 })).toThrow(ConfigError);
 		expect(() => config({}, { globalFramesPerMinute: 1_001 })).toThrow(ConfigError);
 		expect(config().limits.frameLease).toBe(10);

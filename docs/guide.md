@@ -9,12 +9,12 @@ A single SQLite Durable Object serves the permanent `general` room and its
 thread rooms over hibernating WebSockets. The backend supports guest access,
 discoverable passkeys, complete-snapshot history, message
 replacement/deletion/restoration/moves, thread rooms, emoji reactions, and a
-rolling retention floor. Guests only read (set `GUEST_POSTING=true` to let
-them post); signing in with a passkey lets a user post and invite a bot. It
-speaks protocol 6 with `history`, `edit`, `rooms`, `reactions`, and `command`
-(`/help` and `/invite-bot`), and advertises liveness pings
-(typing through `activity` is built in but off; set `ACTIVITY=true` to
-advertise it); see [authentication and policy](policy.md) and [the
+rolling retention floor. Guests post with the Workers Paid budgets and only
+read with the Free ones (`GUEST_POSTING` overrides); signing in with a passkey
+lets a user post and invite a bot. It speaks protocol 6 with `history`,
+`edit`, `rooms`, `reactions`, and `command` (`/help` and `/invite-bot`), and
+advertises liveness pings and, with the Workers Paid budgets, typing through
+`activity` (`ACTIVITY` overrides); see [authentication and policy](policy.md) and [the
 implementation specification](../SPEC.md).
 
 ## Budgets, sessions, and analytics
@@ -43,8 +43,10 @@ the `ACCOUNT_ANALYTICS_TOKEN` secret. The Durable Object refreshes account usage
 periodically and keeps local limits as the fallback when analytics is unavailable.
 Provision it with `npx wrangler secret put ACCOUNT_ANALYTICS_TOKEN --config wrangler.production.toml`.
 
-Use **Workers Free**, with SQLite Durable Objects. No paid plan or auxiliary
-service is required. Installation and tests never deploy; merging to `main`
+The selected budgets are for **Workers Paid** ($5/month), with SQLite Durable
+Objects; select the Free ones (`src/plans/free.ts`, see
+[plans](configuration.md#plans)) to deploy on **Workers Free** instead. No
+auxiliary service is required. Installation and tests never deploy; merging to `main`
 does (see [continuous deployment](#continuous-deployment)). A paid plan's
 included allowance is not a spending cap.
 
@@ -122,10 +124,10 @@ listing after authentication is free), and `room_update` reports changes.
 A registered user's joins and leaves are logged `membership` records,
 returned in `history`; a guest's live in its connection and are not logged,
 so `room_list` ignores `latest_log_id` and always answers with a full
-listing. `members` lists every connected member and at most 100 registered
-members per room. See [SPEC section 4](../SPEC.md#memberships).
-The whole server processes at most 300 frames a
-minute; past that, requests get `retry_after` and the socket stays open. The demo
+listing. `members` lists every connected member and at most 200 registered
+members per room (100 with the Free budgets). See [SPEC section 4](../SPEC.md#memberships).
+The whole server processes at most 600 frames a
+minute (300 with the Free budgets); past that, requests get `retry_after` and the socket stays open. The demo
 only creates thread rooms: `room_set` creations need `parent_room_id: "general"`,
 and `general` itself cannot be edited. This is a shared public room, not
 an isolated sandbox: test messages are visible to others, guest ownership lasts
@@ -193,10 +195,11 @@ message ownership.
 Passkeys require authentication on each new connection and do not prevent
 multiple registrations by one person.
 
-Guests only read by default. With `GUEST_POSTING=true`, guest posting is
+Guests post by default with the Workers Paid budgets and only read with the
+Free ones. Where guests post, guest posting is
 shared by IP (native IPv6 grouped by /64): five accepted
-mutations per rolling minute and 100 per UTC day. Registered users receive
-20/minute and 500/day, subject to the common IP and global limits. NAT users
+mutations per rolling minute and 200 per UTC day (100 with the Free budgets).
+Registered users receive 20/minute and 1,000/day (500), subject to the common IP and global limits. NAT users
 share allowances. Creates, edits, deletion, restoration, moves, reaction
 changes, thread room creation or edits, and a registered user's room joins and
 leaves all consume posting quota.
@@ -301,16 +304,21 @@ For direct Wrangler production commands, always pass
 `--config wrangler.production.toml` and run `npm run budget:check` first;
 `npm run deploy` does both.
 
-1. Verify the **actual account is on Workers Free** and SQLite Durable Objects
-   are enabled. Inventory other Workers, DO namespaces, and staging workloads;
-   their usage shares the same account allowances. Do not switch billing plans.
+1. Verify the **account's actual plan matches `PLAN`** in `src/budget.ts` and
+   SQLite Durable Objects are enabled. Inventory other Workers, DO namespaces,
+   and staging workloads; their usage shares the same account allowances.
 2. Recheck [DO pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/)
    and [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/).
-   The documentation checked 2026-09-20 lists daily Free allowances of 100,000 DO
+   The documentation checked 2026-09-27 lists daily Free allowances of 100,000 DO
    requests, 13,000 GB-seconds, 5 million SQLite rows read, 100,000 rows written,
-   5 GB account SQLite storage, and 100,000 entry Worker requests. Reserve
-   headroom for all account workloads. Confirm the application cost tests and
-   configured limits still fit; 5,000 daily posts is a ceiling, not a promise.
+   5 GB account SQLite storage, and 100,000 entry Worker requests; and monthly
+   Paid included usage of 1 million DO requests, 400,000 GB-seconds, 25 billion
+   rows read, 50 million rows written, 5 GB-month of storage, and 10 million
+   entry Worker requests. Reserve headroom for all account workloads. Confirm
+   the application cost tests and configured limits still fit; the daily post
+   ceiling (10,000; 5,000 on Free) is a ceiling, not a promise. On Paid, set
+   `ACCOUNT_ID` and `ACCOUNT_ANALYTICS_TOKEN` so the account-usage stop runs,
+   and consider Cloudflare billing notifications as well.
 3. Set `ALLOWED_ORIGINS = "*"` for the public reference server. Keep the
    passkey RP ID `apron.chat` and the explicit, exact `RP_ORIGINS` allowlist;
    wildcard guest admission never enables wildcard passkey verification.
@@ -340,10 +348,12 @@ For direct Wrangler production commands, always pass
    scheduling, and recovery. A local reconnect test alone does not establish
    production hibernation behavior.
 8. Observe aggregate resource use and cleanup across daily rollover. Never use
-   production Free quotas for exhaustive stress tests. Stop admission if actual
+   production quotas for exhaustive stress tests. Stop admission if actual
    costs exceed tested bounds; do not raise budgets to conceal a discrepancy.
 
-Free-plan hard limits are the zero-overage backstop. Application quotas provide
+On Workers Free, the plan's hard limits are the zero-overage backstop. Workers
+Paid has none: traffic past the included usage is billed, and the account-usage
+stop and `ADMISSION_OFF` are what limit it. Application quotas provide
 controlled degradation for admitted work, not availability under unlimited
 hostile traffic: rejected HTTP requests and incoming frames still cost platform
 resources. Local calibration is not proof of production billing or availability.

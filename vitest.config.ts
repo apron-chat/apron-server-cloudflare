@@ -5,9 +5,10 @@ export default defineConfig({
 	plugins: [
 		cloudflareTest({
 			wrangler: { configPath: "./wrangler.toml" },
-			// Most suites use guests as convenient posters; test/read-only-guests
-			// turns this off to cover the deployed default, where guests only read.
-			miniflare: { bindings: { GUEST_POSTING: "true" } },
+			// Pin the feature switches whatever the plan's defaults. Most suites use
+			// guests as convenient posters; test/read-only-guests turns this off to
+			// cover guests that only read. Suites that cover typing turn it on.
+			miniflare: { bindings: { GUEST_POSTING: "true", ACTIVITY: "false" } },
 		}),
 	],
 	test: {

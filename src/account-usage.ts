@@ -34,14 +34,21 @@ function numberValue(value: unknown, field: string): number {
 	return number;
 }
 
-function sum(groups: unknown, field: string): number {
+function sum(groups: unknown, field: string, weight: (group: object) => number = () => 1): number {
 	if (!Array.isArray(groups)) throw new AccountUsageError(`analytics field ${field} is missing`);
 	return groups.reduce((total, group) => {
 		if (!group || typeof group !== "object") throw new AccountUsageError(`analytics field ${field} is invalid`);
 		const value = (group as { sum?: Record<string, unknown> }).sum?.[field];
 		if (value === undefined || value === null) throw new AccountUsageError(`analytics field ${field} is missing`);
-		return total + numberValue(value, field);
+		return total + numberValue(value, field) * weight(group);
 	}, 0);
+}
+
+// Incoming messages on hibernatable WebSockets are invocations of type
+// `hibernation`; the plan may bill several of them as one request.
+function billedRequestWeight(group: object): number {
+	const type = (group as { dimensions?: { type?: unknown } }).dimensions?.type;
+	return type === "hibernation" ? 1 / ACCOUNT_USAGE_POLICY.webSocketMessagesPerRequest : 1;
 }
 
 function max(groups: unknown, field: string): number {
@@ -55,13 +62,13 @@ function max(groups: unknown, field: string): number {
 }
 
 function exceedsPolicy(usage: Omit<AccountUsageSnapshot, "stop">): boolean {
-	const daily = ACCOUNT_USAGE_POLICY.freeDaily;
+	const daily = ACCOUNT_USAGE_POLICY.daily;
 	return usage.workerRequests >= daily.workerRequests * ACCOUNT_USAGE_POLICY.stopRatio ||
 		usage.durableObjectRequests >= daily.durableObjectRequests * ACCOUNT_USAGE_POLICY.stopRatio ||
 		usage.durableObjectDurationGbSeconds >= daily.durableObjectDurationGbSeconds * ACCOUNT_USAGE_POLICY.stopRatio ||
 		usage.sqlRowsRead >= daily.sqlRowsRead * ACCOUNT_USAGE_POLICY.stopRatio ||
 		usage.sqlRowsWritten >= daily.sqlRowsWritten * ACCOUNT_USAGE_POLICY.stopRatio ||
-		usage.storedBytes >= ACCOUNT_USAGE_POLICY.freeStoredBytes * ACCOUNT_USAGE_POLICY.stopRatio;
+		usage.storedBytes >= ACCOUNT_USAGE_POLICY.storedBytes * ACCOUNT_USAGE_POLICY.stopRatio;
 }
 
 export function accountUsageSnapshotFromResult(result: unknown, sampledAt: number): AccountUsageSnapshot {
@@ -77,7 +84,7 @@ export function accountUsageSnapshotFromResult(result: unknown, sampledAt: numbe
 		day: dayFor(sampledAt),
 		sampledAt,
 		workerRequests: sum(account.workersInvocationsAdaptive, "requests"),
-		durableObjectRequests: sum(account.durableObjectsInvocationsAdaptiveGroups, "requests"),
+		durableObjectRequests: sum(account.durableObjectsInvocationsAdaptiveGroups, "requests", billedRequestWeight),
 		durableObjectDurationGbSeconds: sum(account.durableObjectsPeriodicGroups, "duration"),
 		sqlRowsRead: sum(account.durableObjectsPeriodicGroups, "rowsRead"),
 		sqlRowsWritten: sum(account.durableObjectsPeriodicGroups, "rowsWritten"),
@@ -92,7 +99,7 @@ export async function fetchAccountUsage(env: AccountUsageEnvironment, sampledAt 
 	const end = new Date(sampledAt).toISOString();
 	const query = `query { viewer { accounts(filter: { accountTag: ${JSON.stringify(env.ACCOUNT_ID)} }) {
 		workersInvocationsAdaptive(filter: { datetime_geq: ${JSON.stringify(start)}, datetime_leq: ${JSON.stringify(end)} }, limit: 1000) { sum { requests } }
-		durableObjectsInvocationsAdaptiveGroups(filter: { datetime_geq: ${JSON.stringify(start)}, datetime_leq: ${JSON.stringify(end)} }, limit: 1000) { sum { requests } }
+		durableObjectsInvocationsAdaptiveGroups(filter: { datetime_geq: ${JSON.stringify(start)}, datetime_leq: ${JSON.stringify(end)} }, limit: 1000) { dimensions { type } sum { requests } }
 		durableObjectsPeriodicGroups(filter: { datetime_geq: ${JSON.stringify(start)}, datetime_leq: ${JSON.stringify(end)} }, limit: 1000) { sum { duration rowsRead rowsWritten } }
 		durableObjectsStorageGroups(filter: { datetime_geq: ${JSON.stringify(start)}, datetime_leq: ${JSON.stringify(end)} }, limit: 1000) { max { storedBytes } }
 	} } }`;

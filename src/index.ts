@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { AuthError, AuthTooLargeError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, type RuntimeConfig } from "./config";
-import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, MAX_FRAME_LEASE, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE } from "./budget";
+import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, MAX_FRAME_LEASE, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE } from "./budget";
 import { fetchAccountUsage, type AccountUsageSnapshot } from "./account-usage";
 import { extractClientIp, hashIpKey, stripForwardingHeaders } from "./ip";
 import {
@@ -1012,7 +1012,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				await this.handleMe(socket, attachment, request);
 				return;
 			case "activity":
-				// Off by default (`ACTIVITY`): typing then gets the unsupported-method path.
+				// Off unless the plan or `ACTIVITY` enables it: typing then gets the unsupported-method path.
 				if (!this.config.activityEnabled) break;
 				await this.handleActivity(socket, request);
 				return;
@@ -1984,19 +1984,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const mib = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 		const lines: string[] = [];
 		const usage = this.accountUsageSnapshot;
-		const daily = ACCOUNT_USAGE_POLICY.freeDaily;
+		const daily = ACCOUNT_USAGE_POLICY.daily;
 		if (usage) {
 			lines.push(
 				`**Cloudflare account, ${usage.day}** (sampled ${new Date(usage.sampledAt).toISOString().slice(11, 16)} UTC${usage.stop ? ", **stopped**: over " + Math.round(ACCOUNT_USAGE_POLICY.stopRatio * 100) + "% of a limit" : ""})`,
 				"",
-				"| | Used / Free daily |",
+				`| | Used / ${PLAN.name} daily |`,
 				"|---|---|",
 				`| Worker requests | ${share(usage.workerRequests, daily.workerRequests)} |`,
 				`| Durable Object requests | ${share(usage.durableObjectRequests, daily.durableObjectRequests)} |`,
 				`| Durable Object duration (GB-s) | ${share(usage.durableObjectDurationGbSeconds, daily.durableObjectDurationGbSeconds)} |`,
 				`| SQL rows read | ${share(usage.sqlRowsRead, daily.sqlRowsRead)} |`,
 				`| SQL rows written | ${share(usage.sqlRowsWritten, daily.sqlRowsWritten)} |`,
-				`| Stored | ${mib(usage.storedBytes)} / ${mib(ACCOUNT_USAGE_POLICY.freeStoredBytes)} |`,
+				`| Stored | ${mib(usage.storedBytes)} / ${mib(ACCOUNT_USAGE_POLICY.storedBytes)} |`,
 			);
 		} else {
 			lines.push("**Cloudflare account**: no usage sample; set `ACCOUNT_ID` and `ACCOUNT_ANALYTICS_TOKEN` to read it.");

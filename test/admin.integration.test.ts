@@ -1,5 +1,6 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, expect, it } from 'vitest';
+import { DEFAULT_LIMITS } from '../src/budget';
 import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
 
 let nextIp = 1;
@@ -140,7 +141,7 @@ it('/status sends the caller the Cloudflare usage and the demo budgets', async (
 		expect(status.notice!.params.body.format).toBe('markdown');
 		// Tests configure no account analytics, so only the object's budgets show.
 		expect(text).toContain('no usage sample');
-		expect(text).toMatch(/\| SQL rows written \| [\d,]+ \/ 80,000 \(\d+%\) \|/);
+		expect(text).toMatch(new RegExp(`\\| SQL rows written \\| [\\d,]+ / ${DEFAULT_LIMITS.sqlWritesPerDay.toLocaleString('en-US')} \\(\\d+%\\) \\|`));
 		expect(text).toMatch(/\| Registered users \| [\d,]+ \/ 10,000/);
 		expect(text).toContain('| Database |');
 	} finally { admin.close(); }

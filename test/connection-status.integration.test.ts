@@ -1,5 +1,6 @@
 import { env, evictDurableObject, runInDurableObject, SELF } from 'cloudflare:test';
 import { expect, it } from 'vitest';
+import { DEFAULT_LIMITS } from '../src/budget';
 import { Store } from '../src/store';
 
 const headers = { Origin: 'http://localhost:5173', 'CF-Connecting-IP': '198.18.7.1' };
@@ -10,7 +11,7 @@ it('exposes daily exhaustion and Retry-After to browsers without spending SQL or
 	const original = await runInDurableObject(stub, (_instance, state) => {
 		const rows = state.storage.sql.exec<{ day: string; foreground_writes: number; writes_reserved: number }>(
 			'SELECT day, foreground_writes, writes_reserved FROM resource_budgets').toArray();
-		state.storage.sql.exec('UPDATE resource_budgets SET foreground_writes = 60000, writes_reserved = 60000');
+		state.storage.sql.exec('UPDATE resource_budgets SET foreground_writes = ?, writes_reserved = ?', DEFAULT_LIMITS.foregroundWritesPerDay, DEFAULT_LIMITS.foregroundWritesPerDay);
 		return rows;
 	});
 	await evictDurableObject(stub);
@@ -59,7 +60,7 @@ it('allows an advisory healthy probe without creating a connection', async () =>
 
 it('does not keep reporting yesterday\'s exhausted budget after UTC rollover', async () => {
 	await runInDurableObject(env.DEMO.getByName('status-rollover'), (_instance, state) => {
-		state.storage.sql.exec('UPDATE resource_budgets SET foreground_writes = 60000, writes_reserved = 60000');
+		state.storage.sql.exec('UPDATE resource_budgets SET foreground_writes = ?, writes_reserved = ?', DEFAULT_LIMITS.foregroundWritesPerDay, DEFAULT_LIMITS.foregroundWritesPerDay);
 		let now = Date.now();
 		const store = new Store(state, {}, () => now);
 		store.initialize();

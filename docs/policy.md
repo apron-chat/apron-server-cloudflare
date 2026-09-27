@@ -2,7 +2,8 @@
 
 The demo speaks Apron protocol **6**, advertising `history`, `edit`, `rooms`,
 `reactions`, and `command`, and `server.ping` (45 seconds). `activity`
-(typing) is implemented but off unless the deployment sets `ACTIVITY=true`. History availability uses each room's `latest_log_id` and
+(typing) is on with the Workers Paid budgets and off with the Free ones;
+`ACTIVITY` overrides either (see [plans](configuration.md#plans)). History availability uses each room's `latest_log_id` and
 nullable `history_log_id`, without extension negotiation. See
 [history and recovery](https://github.com/shazow/apron/blob/main/PROTOCOL.md#41-history) and the
 [retention implementation specification](../SPEC.md#9-rolling-history-and-base-protocol-availability).
@@ -42,13 +43,14 @@ within it:
   room's members before the `room_update` and kept in history. Joins and
   leaves are never `user` notifications. `room_list` takes `filter`,
   `parent_room_id`, and `room_id`, and with `members: true` lists each room's
-  members (every connected one and at most 100 registered ones) and their
+  members (every connected one and at most 200 registered ones, 100 with the
+  Free budgets) and their
   current objects in `users`; it ignores `latest_log_id` and always returns a
   full listing, since guest memberships are not logged. A client that sends
   the `{"method":"ping"}` liveness ping every 45 seconds and then goes quiet
   for 150 is disconnected, so a peer that vanished without closing is not
   listed.
-- Activity (only with `ACTIVITY=true`): typing is relayed to the room's other
+- Activity (where on): typing is relayed to the room's other
   members and never stored, at most 10 relays per user per minute; past that, updates are dropped and the
   sender gets one `@private` notice a minute saying so. Read cursors are
   neither kept nor relayed. `away` is accepted and ignored: the demo has no push.
@@ -76,7 +78,8 @@ within it:
   characters) per user per message and 32 reacting users per message. New
   reactions on a deleted message are rejected; clearing is allowed. An
   unchanged set is accepted without a new record.
-- Load: the whole server processes at most 300 frames a minute. Past that,
+- Load: the whole server processes at most 600 frames a minute (300 with the
+  Free budgets). Past that,
   requests get `retry_after` and notifications are dropped; sockets stay open.
 - `me` renames registered users only; given fields replace, omitted ones stay,
   and `name: ""` removes the name (announced as `name: ""`). `avatar` and `ext`
@@ -114,8 +117,9 @@ are stored hashed in the object and swept on expiry. Signing out is local to
 the client: it drops the stored token, and the connection returns as a fresh
 guest.
 
-Guests only read unless the deployment sets `GUEST_POSTING=true`
-(`ext.demo.guest_posting` says which): they can list rooms, read any room's
+Guests post with the Workers Paid budgets and only read with the Free ones;
+`GUEST_POSTING` overrides either (`ext.demo.guest_posting` says which). Where
+guests only read, they can list rooms, read any room's
 history without joining it, and run `/help`, and stay in `general`, where
 authentication put them. Posting, reacting, joining, leaving, and creating or
 editing threads are writes, `denied` ("Guests can only read here; sign in with
@@ -151,7 +155,7 @@ advisory 256 KiB recommendation. Payload lengths count UTF-8 bytes. Errors use
 the base protocol codes; `retry_after` includes `data.retry_after`, whole
 seconds rounded up. Permanent identity/thread-room ceilings return `denied`, not a fabricated replenishment time.
 
-Guest posting allowances (with `GUEST_POSTING=true`) are shared across a normalized IP; native IPv6
+Guest posting allowances (where guests post) are shared across a normalized IP; native IPv6
 addresses share a /64 bucket. Registered users also share the aggregate IP
 limit. NAT users can therefore limit one another. Passkeys do not provide
 one-person-one-account or prevent Sybil attacks.
