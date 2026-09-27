@@ -128,7 +128,7 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "admin", usage: "/admin <user_id>", help: "make a registered user an admin", audience: "admins" },
 	{ name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", audience: "admins" },
 	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
-	{ name: "toggle", usage: "/toggle uploads", help: "turn uploads off or on", audience: "admins" },
+	{ name: "toggle", usage: "/toggle <activity|uploads>", help: "turn typing activity or uploads off or on for everyone", audience: "admins" },
 	{ name: "purge", usage: "/purge <user_id>", help: "disconnect a user and delete their account, bot, and everything they posted or uploaded", audience: "admins" },
 	{ name: "status", usage: "/status", help: "show today's Cloudflare usage and the demo's budgets", audience: "admins" },
 ];
@@ -140,6 +140,8 @@ const GUEST_READ_ONLY = "Guests can only read here; sign in with a passkey to po
  * `guest_` or `bot_`, so the prefix names bots alone.
  */
 const BOT_ID_PREFIX = "bot_";
+/** Features an admin can turn off and on with `/toggle`. */
+type ToggleFeature = "activity" | "uploads";
 /**
  * The registered user `APRON_ADMIN_TOKEN` signs in as, always an admin. Registered
  * users are `<name>_<digits>` or `u_…`, so no passkey user can take this id.
@@ -681,8 +683,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private alarmKnown = false;
 	/** When the next alarm may sweep sessions; in memory, so a wake sweeps once. */
 	private nextSessionSweepAt = 0;
-	/** Whether uploads are off, once read (see uploadsOff). */
-	private uploadsOffCache: boolean | undefined;
+	/** Admins' `/toggle`s, once read: a feature absent here has not been read yet. */
+	private readonly toggles = new Map<ToggleFeature, boolean | undefined>();
 	/** When the earliest pending upload's write window closes, if one is known (§4.6.3). */
 	private uploadDeadline: number | undefined;
 	private accountUsageEvents = 0;
@@ -939,8 +941,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 				name: "apron-cloudflare-demo/6",
 				caps: [
 					"history", "edit", "rooms", "reactions", "command",
-					...(this.config.activityEnabled ? ["activity"] : []),
-					...(this.config.uploads && !this.uploadsOff() ? ["embed:upload"] : []),
+					...(this.activityOn() ? ["activity"] : []),
+					...(this.uploadsOn() ? ["embed:upload"] : []),
 				],
 				// Passkeys and their session tokens only where passkeys are offered;
 				// bot tokens (`/invite-bot`) from anywhere, since bots are not browsers.
@@ -965,7 +967,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 						// `read_message_id` in `activity` is dropped: no read cursors are kept.
 						read_cursors: false,
 						// With `activity`, typing is relayed; read cursors are neither kept nor relayed.
-						...(this.config.activityEnabled ? { activity_per_minute: limits.activityBroadcastsPerUserMinute } : {}),
+						...(this.activityOn() ? { activity_per_minute: limits.activityBroadcastsPerUserMinute } : {}),
 					},
 				},
 			},
@@ -1157,7 +1159,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return;
 			case "activity":
 				// Off unless the plan or `ACTIVITY` enables it: typing then gets the unsupported-method path.
-				if (!this.config.activityEnabled) break;
+				if (!this.activityOn()) break;
 				await this.handleActivity(socket, request);
 				return;
 			case "room_list":
@@ -2053,32 +2055,56 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.reply(socket, request, {});
 	}
 
-	/** The commands this deployment offers: `/toggle` only with uploads, and `/avatar` only while they are on. */
+	/** The commands this deployment offers: `/avatar` only while uploads are on. */
 	private commands(): typeof COMMANDS {
-		if (!this.config.uploads) return COMMANDS.filter((command) => command.name !== "avatar" && command.name !== "toggle");
-		return this.uploadsOff() ? COMMANDS.filter((command) => command.name !== "avatar") : COMMANDS;
+		return this.uploadsOn() ? COMMANDS : COMMANDS.filter((command) => command.name !== "avatar");
 	}
 
-	/** Whether an admin turned uploads off; read once, then kept in memory with every change. */
-	private uploadsOff(): boolean {
-		this.uploadsOffCache ??= this.store.uploadsOff(nowMs());
-		return this.uploadsOffCache;
+	/** An admin's `/toggle` of a feature, read once and then kept in memory with every change. */
+	private toggled(feature: ToggleFeature): boolean | undefined {
+		if (!this.toggles.has(feature)) this.toggles.set(feature, this.store.toggle(feature, nowMs()));
+		return this.toggles.get(feature);
+	}
+
+	/** Uploads: configured, and not turned off by an admin. */
+	private uploadsOn(): boolean {
+		return !!this.config.uploads && (this.toggled("uploads") ?? true);
+	}
+
+	/** Activity (typing): the deployment's default (plan or `ACTIVITY`) unless an admin toggled it. */
+	private activityOn(): boolean {
+		return this.toggled("activity") ?? this.config.activityEnabled;
 	}
 
 	/**
-	 * `/toggle uploads`: turns uploads off or on for everyone, and tells the
-	 * sender which with a `@private` notice before the result (§1). While off,
-	 * new connections are not offered `embed:upload`, and new upload embeds and
-	 * `/avatar` are `denied`; writes already started still finish.
+	 * `/toggle <feature>`: turns `activity` (typing) or, where configured,
+	 * `uploads` off or on for everyone, and tells the sender which with a
+	 * `@private` notice before the result (§1). Kept across restarts; toggling
+	 * back to the deployment's default forgets the override. New connections
+	 * are offered the cap only while it is on. With activity off, typing is
+	 * no longer relayed; with uploads off, new upload embeds and `/avatar` are
+	 * `denied`, and writes already started still finish.
 	 */
 	private toggle(socket: WebSocketConnection, request: RequestFrame, roomId: string, feature: string): void {
-		if (feature !== "uploads") throw { name: "invalid_params", message: "Usage: /toggle uploads" } satisfies ProtocolError;
-		const off = !this.uploadsOff();
-		this.store.setUploadsOff(off, nowMs());
-		this.uploadsOffCache = off;
-		this.sendNotice(socket, roomId, off
-			? "Uploads are now **off**: new attachments and avatars are refused, and new connections are not offered uploads."
-			: "Uploads are now **on**.");
+		const features: ToggleFeature[] = this.config.uploads ? ["activity", "uploads"] : ["activity"];
+		const chosen = features.find((candidate) => candidate === feature);
+		if (!chosen) throw { name: "invalid_params", message: `Usage: /toggle ${features.join("|")}` } satisfies ProtocolError;
+		const on = !(chosen === "uploads" ? this.uploadsOn() : this.activityOn());
+		const fallback = chosen === "uploads" ? true : this.config.activityEnabled;
+		const override = on === fallback ? undefined : on;
+		this.store.setToggle(chosen, override, nowMs());
+		this.toggles.set(chosen, override);
+		const notices: Record<ToggleFeature, [string, string]> = {
+			activity: [
+				"Activity is now **on**: typing is relayed, and new connections are offered it.",
+				"Activity is now **off**: typing is no longer relayed, and new connections are not offered it.",
+			],
+			uploads: [
+				"Uploads are now **on**.",
+				"Uploads are now **off**: new attachments and avatars are refused, and new connections are not offered uploads.",
+			],
+		};
+		this.sendNotice(socket, roomId, notices[chosen][on ? 0 : 1]);
 		this.reply(socket, request, {});
 	}
 

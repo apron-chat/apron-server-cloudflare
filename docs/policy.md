@@ -3,7 +3,8 @@
 The demo speaks Apron protocol **6**, advertising `history`, `edit`, `rooms`,
 `reactions`, and `command`, and `server.ping` (45 seconds). `activity`
 (typing) is on with the Workers Paid budgets and off with the Free ones;
-`ACTIVITY` overrides either (see [plans](configuration.md#plans)). History availability uses each room's `latest_log_id` and
+`ACTIVITY` overrides either (see [plans](configuration.md#plans)), and admins
+can turn it off and on with `/toggle activity`. History availability uses each room's `latest_log_id` and
 nullable `history_log_id`, without extension negotiation. See
 [history and recovery](https://github.com/shazow/apron/blob/main/PROTOCOL.md#41-history) and the
 [retention implementation specification](../SPEC.md#9-rolling-history-and-base-protocol-availability).

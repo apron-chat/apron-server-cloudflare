@@ -129,14 +129,15 @@ describe('store uploads', () => {
 	it('refuses new uploads while an admin has turned them off', async () => {
 		await withStore('uploads-off', { uploads: UPLOADS }, (store, clock) => {
 			register(store, clock, 'frank');
-			expect(store.uploadsOff(clock.value)).toBe(false);
-			store.setUploadsOff(true, clock.value);
-			expect(store.uploadsOff(clock.value)).toBe(true);
+			expect(store.toggle('uploads', clock.value)).toBeUndefined();
+			store.setToggle('uploads', false, clock.value);
+			expect(store.toggle('uploads', clock.value)).toBe(false);
 			expect(errorCode(() => post(store, clock, 'frank', { body: { embeds: [{ kind: 'upload' }] } }))).toBe('denied');
 			expect(errorCode(() => store.startAvatarUpload({ userId: 'frank', now: clock.value }))).toBe('denied');
 			// Other embeds still post.
 			post(store, clock, 'frank', { body: { embeds: [{ kind: 'link', url: 'https://example.com' }] } });
-			store.setUploadsOff(false, clock.value);
+			store.setToggle('uploads', undefined, clock.value);
+			expect(store.toggle('uploads', clock.value)).toBeUndefined();
 			post(store, clock, 'frank', { body: { embeds: [{ kind: 'upload' }] } });
 		});
 	});
@@ -402,8 +403,43 @@ describe('uploads end to end', () => {
 			expect((await fresh.next()).params.caps).toContain('embed:upload');
 			fresh.close();
 			expect((await request(user, 'nope', 'command', { body: { text: '/toggle uploads' } })).error.code).toBe(-32001);
-			expect((await request(admin, 'bad', 'command', { room_id: 'general', body: { text: '/toggle typing' } })).error.message).toBe('Usage: /toggle uploads');
+			expect((await request(admin, 'bad', 'command', { room_id: 'general', body: { text: '/toggle typing' } })).error.message).toBe('Usage: /toggle activity|uploads');
 		} finally { user.close(); admin.close(); }
+	});
+
+	it('/toggle activity turns typing relays and the activity cap off and on', async () => {
+		const admin = await connect(null);
+		await admin.next();
+		expect((await request(admin, 'auth', 'auth', { scheme: 'token', token: ADMIN_TOKEN })).result.you.user_id).toBe('admin');
+		const notice = (skipped: Frame[]) => skipped.find((frame) => frame.params?.from?.user_id === '@private')!.params.body.text;
+		const toggle = (id: string) => exchange(admin, id, 'command', { room_id: 'general', body: { text: '/toggle activity' } });
+		const guests = async () => {
+			const alice = await connect();
+			const server = await alice.next();
+			const bob = await connect();
+			await bob.next();
+			await request(alice, 'auth', 'auth', { scheme: 'guest' });
+			await request(bob, 'auth', 'auth', { scheme: 'guest' });
+			return { alice, bob, caps: server.params.caps as string[] };
+		};
+		try {
+			// Tests run with ACTIVITY=false: the first toggle turns it on.
+			const on = await toggle('on');
+			expect(notice(on.skipped)).toBe('Activity is now **on**: typing is relayed, and new connections are offered it.');
+			const live = await guests();
+			expect(live.caps).toContain('activity');
+			live.alice.send({ method: 'activity', params: { room_id: 'general', typing: 5 } });
+			expect((await until(live.bob, (frame) => frame.method === 'activity')).frame.params).toMatchObject({ room_id: 'general', typing: 5 });
+			live.alice.close(); live.bob.close();
+			// Back to the deployment's default: off again, and the override is gone.
+			const off = await toggle('off');
+			expect(notice(off.skipped)).toBe('Activity is now **off**: typing is no longer relayed, and new connections are not offered it.');
+			const quiet = await guests();
+			expect(quiet.caps).not.toContain('activity');
+			expect((await request(quiet.alice, 'typing', 'activity', { room_id: 'general', typing: 5 })).error.code).toBe(-32601);
+			quiet.alice.close(); quiet.bob.close();
+			expect(await runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.toggle('activity'))).toBeUndefined();
+		} finally { admin.close(); }
 	});
 
 	it('/purge disconnects a user and deletes their content and uploads', async () => {
