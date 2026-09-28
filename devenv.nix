@@ -16,7 +16,11 @@ in {
     package = pkgs.nodejs_24;
   };
 
-  packages = [ pkgs.git pkgs.stdenv.cc ];
+  packages = [
+    pkgs.git
+    pkgs.stdenv.cc
+    pkgs.wrangler
+  ];
 
   env = lib.optionalAttrs pkgs.stdenv.isLinux {
     MINIFLARE_WORKERD_PATH = "${workerdLauncher}";
