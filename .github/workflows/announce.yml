@@ -1,8 +1,9 @@
 name: Announce
 
 # Posts each pull request merged into main to the demo's general room, as the
-# bot whose token is the APRON_BOT_TOKEN secret (from /invite-bot). Without
-# that secret the job succeeds without posting.
+# bot whose token is the APRON_BOT_TOKEN secret (from /invite-bot) of the
+# server.apron.chat environment. Without that secret the job succeeds without
+# posting.
 #
 # pull_request_target runs this workflow and script as they are on main, with
 # secrets, even for pull requests from forks. It never checks out or runs the
@@ -20,6 +21,9 @@ jobs:
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # APRON_BOT_TOKEN is a secret of this environment, which only jobs that
+    # name it can read.
+    environment: server.apron.chat
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
