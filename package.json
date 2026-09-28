@@ -12,7 +12,7 @@
 		"budget:generate": "node scripts/budget.mjs",
 		"budget:check": "node scripts/budget.mjs --check",
 		"typecheck": "npm run budget:check && tsc --noEmit",
-		"test": "npm run budget:check && node --test scripts/budget.test.mjs && vitest run",
+		"test": "npm run budget:check && node --test scripts/budget.test.mjs scripts/announce-pr.test.mjs && vitest run",
 		"test:watch": "vitest",
 		"cf-typegen": "wrangler types"
 	},
