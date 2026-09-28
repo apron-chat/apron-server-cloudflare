@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { announcement, oneLine } from './announce-pr.mjs';
+import { announcement, firstParagraph, oneLine } from './announce-pr.mjs';
 
 const pr = {
 	number: 12,
 	title: 'Announce merged\npull requests',
 	html_url: 'https://github.com/apron-chat/apron-server-cloudflare/pull/12',
-	body: '<!-- template -->\nPosts each merged PR\n\nto the `general` room.',
+	body: '<!-- template -->\nPosts each merged PR\nto the `general` room.\n\n## Details\nMore.',
 	user: { login: 'shazow' },
 	base: { ref: 'main' },
 	merge_commit_sha: 'abc123',
@@ -43,4 +43,13 @@ test('clips long text to one bounded line', () => {
 	assert.equal(oneLine('a\n\tb  c', 10), 'a b c');
 	assert.equal(oneLine('x'.repeat(20), 10), `${'x'.repeat(9)}…`);
 	assert.equal(oneLine(undefined, 10), '');
+});
+
+test('describes a pull request by its first paragraph of text', () => {
+	assert.equal(firstParagraph('Intro line\nwraps here.\n\n## Summary\nMore.'), 'Intro line\nwraps here.');
+	assert.equal(firstParagraph('<!-- note -->\n\n## Summary\nFirst text.\n\nLater.'), 'First text.');
+	assert.equal(firstParagraph('# Title\n\n###\n\n  \n'), '');
+	assert.equal(firstParagraph('#hashtag start\n\nnext'), '#hashtag start');
+	assert.equal(oneLine(firstParagraph('## Summary\r\nFirst\r\nline.\r\n\r\nLater.'), 300), 'First line.');
+	assert.equal(firstParagraph(null), '');
 });

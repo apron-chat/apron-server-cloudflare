@@ -21,12 +21,23 @@ export function oneLine(text, max) {
 	return points.length > max ? `${points.slice(0, max - 1).join('').trimEnd()}…` : line;
 }
 
+/** The first paragraph of markdown `text` that is not only headings, or ''. */
+export function firstParagraph(text) {
+	const paragraphs = String(text ?? '').replace(/<!--[\s\S]*?-->/g, ' ').split(/\n\s*\n/);
+	for (const paragraph of paragraphs) {
+		const lines = paragraph.split('\n').filter((line) => !/^\s{0,3}#{1,6}(\s|$)/.test(line));
+		const kept = lines.join('\n').trim();
+		if (kept) return kept;
+	}
+	return '';
+}
+
 /** The `message` params announcing merged pull request `pr` of `repo` (`owner/name`) in `roomId`. */
 export function announcement(pr, repo, roomId = DEFAULT_ROOM) {
 	const author = pr.user?.login ?? 'someone';
 	const base = pr.base?.ref ?? 'main';
 	const summary = `#${pr.number} by ${author} · ${pr.commits ?? 0} commit${pr.commits === 1 ? '' : 's'} · +${pr.additions ?? 0} −${pr.deletions ?? 0}`;
-	const description = oneLine(pr.body, DESCRIPTION_CODE_POINTS) || summary;
+	const description = oneLine(firstParagraph(pr.body), DESCRIPTION_CODE_POINTS) || summary;
 	return {
 		room_id: roomId,
 		body: {
