@@ -21,7 +21,10 @@
 //   account-usage stop at 90% covers them.
 // - Durable Object duration: one object awake all day is 10,800 GB-s, under
 //   the 12,900 daily share, so duration cannot run over.
-// - Storage: unchanged; the database watermarks stay far below 5 GB.
+// - Storage: history is kept 7 days, matching uploaded images, so the
+//   database watermarks rise to 768 MB (1 GB hard), a fifth of the 5 GB-month
+//   included. Cleanup runs every 6 hours; it removes the same rows a day as
+//   hourly would, in batches that continue until it is caught up.
 //
 // None of that bounds hostile traffic that never gets past the entry Worker,
 // which is billed per request. An edge block rule stops requests before they
@@ -36,6 +39,8 @@ export const PAID_PLAN: Plan = Object.freeze({
 	name: "Workers Paid",
 	limits: Object.freeze({
 		...FREE_PLAN.limits,
+		retentionSeconds: 7 * 24 * 60 * 60,
+		cleanupSeconds: 6 * 60 * 60,
 		historyRequestsPerUserMinute: 20,
 		historyRequestsPerIpMinute: 60,
 		anonymousPostsPerDay: 200,
@@ -57,6 +62,9 @@ export const PAID_PLAN: Plan = Object.freeze({
 		maintenanceWritesPerDay: 100_000,
 		foregroundReadsPerDay: 25_000_000,
 		maintenanceReadsPerDay: 5_000_000,
+		databaseHighWaterBytes: 768 * 1024 * 1024,
+		databaseHardTargetBytes: 1024 * 1024 * 1024,
+		databaseResumeLowWaterBytes: 640 * 1024 * 1024,
 	}),
 	// The per-IP attempt limiter still guards Durable Object requests, which
 	// Paid includes fewer of than Free.

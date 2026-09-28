@@ -179,8 +179,9 @@ deduplication window does not post it twice.
 
 ## User-visible policies
 
-Only roughly the last day of records (messages, reactions, room changes, and
-registered users' memberships) is retained. Hourly cleanup normally exposes 24–25 hours; quota exhaustion may
+Only the last 7 days of records (messages, reactions, room changes, and
+registered users' memberships) are retained, 24 hours on Workers Free. Cleanup
+every 6 hours (hourly on Free) normally exposes 7 days to 7 days 6 hours; quota exhaustion may
 delay physical deletion. The `general` room ID and the log head never rotate.
 Recent edits can keep old messages visible. Rooms keep their current record
 after its log entry expires; a thread room whose whole log has expired is

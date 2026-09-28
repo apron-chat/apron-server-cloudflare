@@ -721,7 +721,7 @@ const META_UPLOAD_BYTES = "upload_bytes";
  */
 export const UPLOAD_WRITE_GRACE_MS = 60_000;
 /** Pending uploads or expired upload rows one maintenance pass handles. */
-const UPLOAD_SWEEP_BATCH = 32;
+export const UPLOAD_SWEEP_BATCH = 32;
 /** Rows one upload's bookkeeping may write: its row and indexes, two limiter rows, and the byte count. */
 const UPLOAD_WRITES = 16;
 /** Rows one guest-number block reservation may read and write, before control overhead. */

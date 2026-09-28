@@ -28,6 +28,7 @@ import {
 	ROOM_ID,
 	Store,
 	StoreError,
+	UPLOAD_SWEEP_BATCH,
 	UPLOAD_WRITE_GRACE_MS,
 	uploadResultEmbed,
 	type Broadcast,
@@ -931,7 +932,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 					this.deleteMedia(expired.deletedUploads);
 					this.uploadDeadline = expired.next;
 				});
-				this.store.cleanupUploads(now);
+				// A full batch may have left more behind: sweep again shortly rather
+				// than a cleanup interval later, so released bytes do not pile up.
+				if (this.store.cleanupUploads(now) >= UPLOAD_SWEEP_BATCH) {
+					const next = now + 1_000;
+					this.uploadDeadline = this.uploadDeadline === undefined ? next : Math.min(this.uploadDeadline, next);
+				}
 			} catch { /* a metered maintenance failure is retried on the next alarm */ }
 		}
 		const removed = result?.removed_rooms ?? [];

@@ -707,8 +707,8 @@ it('advertises the demo policy hints', async () => {
 	const peer = await connect();
 	try {
 		expect((await peer.next()).params.ext.demo).toEqual({
-			retention_seconds: 86_400,
-			cleanup_seconds: 3_600,
+			retention_seconds: DEFAULT_LIMITS.retentionSeconds,
+			cleanup_seconds: DEFAULT_LIMITS.cleanupSeconds,
 			max_frame_bytes: 16_384,
 			max_message_text_bytes: 4_096,
 			max_snapshot_bytes: 8_192,

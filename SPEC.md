@@ -29,7 +29,7 @@ Use MUST for required behavior and SHOULD for preferences. Centralize all limits
 - `embed:upload` with the Workers Paid budgets: registered users attach images to messages and set avatars, stored in R2 and served from its public bucket domain (section 4.3).
 - Guest authentication (`guest`), read-only unless `GUEST_POSTING=true`; verified WebAuthn registration/login; bot tokens (`token`).
 - Persistent request deduplication for mutating operations.
-- Rolling 24-hour history with hourly cleanup, using the same room ID indefinitely.
+- Rolling history, using the same room ID indefinitely: 7 days with cleanup every 6 hours on Workers Paid, 24 hours with hourly cleanup on Workers Free.
 - Base-protocol history availability boundaries and client recovery support.
 - Enforced application budgets, including cleanup, auth, and quota bookkeeping.
 
@@ -89,7 +89,7 @@ API reference: [Durable Object state](https://developers.cloudflare.com/durable-
 An illustrative initial announcement is:
 
 ```json
-{"method":"server","params":{"protocol":6,"name":"apron-cloudflare-demo/6","caps":["history","edit","rooms","reactions","command","activity","embed:upload"],"auth":["webauthn","token","guest"],"ping":45,"ext":{"demo":{"retention_seconds":86400,"cleanup_seconds":3600,"max_frame_bytes":16384,"max_message_text_bytes":4096,"max_snapshot_bytes":8192,"guest_posts_per_minute":5,"registered_posts_per_minute":20,"guest_posting":false,"server_frames_per_minute":600,"room_list_per_minute":6,"room_list_members":200,"read_cursors":false}}}}
+{"method":"server","params":{"protocol":6,"name":"apron-cloudflare-demo/6","caps":["history","edit","rooms","reactions","command","activity","embed:upload"],"auth":["webauthn","token","guest"],"ping":45,"ext":{"demo":{"retention_seconds":604800,"cleanup_seconds":21600,"max_frame_bytes":16384,"max_message_text_bytes":4096,"max_snapshot_bytes":8192,"guest_posts_per_minute":5,"registered_posts_per_minute":20,"guest_posting":false,"server_frames_per_minute":600,"room_list_per_minute":6,"room_list_members":200,"read_cursors":false}}}}
 ```
 
 `ext.demo` is additive server-announcement policy metadata in the standard `ext` object. Authentication uses the canonical `webauthn` scheme in protocol [§4.9](https://github.com/shazow/apron/blob/main/PROTOCOL.md#49-webauthn-authentication), without an extension flag. Every later `server` announcement is a full replacement, including auth/caps/policy metadata. Temporary throttling does not mean a capability is unimplemented.
@@ -185,7 +185,7 @@ With the Workers Paid budgets (`uploads` in `src/plans/paid.ts`) and a deploymen
 - Writes (§4.6.3): a new `{"kind": "upload"}` embed from a registered user (guests and bots of guests cannot upload) is broadcast pending, and the sender's result lists `embeds: [{embed_id, kind, write_url}]` in request order. `write_url` is `PUBLIC_ORIGIN/w/<token>`: an HMAC-signed grant naming the R2 key, the largest body, and a 10-minute expiry, so a retry of the same request gets the same URL. `PUT` the image there with `Content-Length` (any origin; CORS preflight allowed). The entry Worker checks the signature before reading the body, the Durable Object claims the upload so one request writes it, and only PNG, JPEG, GIF and WebP bytes are kept, typed from their signature (never from the sender). The object is stored at `f/<128-bit random id>`, then the message gets a server snapshot with the embed completed: `url` on `MEDIA_ORIGIN` and `og.image` with `url`, `type`, and `width`/`height` when the header gives them. A failed write, or one that never comes within the window plus a minute's grace, publishes the message without the embed; a message left with neither text nor embeds becomes a tombstone. Removing the embed or deleting the message deletes the object.
 - Avatars (§4.6.6): `/avatar` with exactly one upload embed returns its `write_url`; when the write finishes, the image (`a/<id>`) becomes the sender's avatar and they get `user` `you`, and users sharing a room `new`. `avatar` is in current objects (`you`, `new`, room `members` and `users`), never in `from`. `me` with `avatar: ""` removes it; other values are declined. A new avatar replaces and deletes the old.
 - Limits: 5 MB per image and 256 KB per avatar; 500 uploads a UTC day server-wide and 20 per user (avatars included); live upload bytes, pending writes counted at their largest, at most 5 GB. Past a daily count, `retry_after` until the reset; past the byte cap, `retry_after` of an hour.
-- Retention: images live 7 days and avatars 30, matching the bucket's lifecycle rules, and still count as stored for a day after, since R2 deletes them asynchronously. An avatar whose owner signs in during its last week is written again, restarting its 30 days. Uploads outlive their messages' 24-hour history.
+- Retention: images live 7 days and avatars 30, matching the bucket's lifecycle rules, and still count as stored for a day after, since R2 deletes them asynchronously. An avatar whose owner signs in during its last week is written again, restarting its 30 days. Messages are kept as long as their images (7 days on Workers Paid); cleanup removes a message up to one cleanup interval after its image expires, and R2 usually deletes the image later still.
 - Cost: uploads stay within R2's free tier (10 GB-month, 1 million Class A and 10 million Class B operations a month). At most about 16,000 writes a month, and the byte cap keeps storage at half the free tier. Views are served from Cloudflare's cache on the bucket's custom domain; the budget guard counts R2 operations against their daily and monthly shares and blocks the media host with the server's.
 
 ## 5. Authentication and IP attribution
@@ -416,13 +416,13 @@ Check an unexpired duplicate before applying new-post quotas or deciding an old 
 
 ## 9. Rolling history and base-protocol availability
 
-Retention replaces all earlier daily-reset/room-rotation ideas. Keep `general` unchanged. Every hour, expire the prefix of the server-wide log committed more than 24 hours earlier. Healthy operation normally exposes 24–25 hours of records; scheduling delay or quota exhaustion can delay physical cleanup. This is a demo history policy, not a secure-erasure SLA or a guarantee about backups, provider recovery, or copies on clients.
+Retention replaces all earlier daily-reset/room-rotation ideas. Keep `general` unchanged. Every cleanup interval (`cleanupSeconds`), expire the prefix of the server-wide log committed more than `retentionSeconds` earlier: 7 days every 6 hours on Workers Paid, 24 hours every hour on Workers Free. Healthy operation normally exposes the retention window plus up to one interval of records (7 days to 7 days 6 hours on Paid); scheduling delay or quota exhaustion can delay physical cleanup. This is a demo history policy, not a secure-erasure SLA or a guarantee about backups, provider recovery, or copies on clients.
 
 ### Retention semantics
 
 - Expire records by their internal nondecreasing commit time, not message creation ID. Commit times are nondecreasing in log order, so expiry is always a prefix of the one server-wide log.
 - Retain a current message while its latest record remains retained. Remove current state when its latest record expires. Tombstones and reaction sets follow the same rule; a move re-logs the moved message's reaction sets, refreshing them.
-- A recent edit can keep a message visible past 24 hours from creation. Its older creation/edit records may be removed; its latest complete snapshot is sufficient to reconstruct it.
+- A recent edit can keep a message visible past the retention window from creation. Its older creation/edit records may be removed; its latest complete snapshot is sufficient to reconstruct it.
 - A registered user's membership is current state, kept in `memberships` after its record leaves the log (see "Memberships" in section 4).
 - Room records are current state, like messages: a room keeps being listed with its latest record (and that record's original `log_id`) after the record itself leaves the log. A thread room whose entire log has expired is removed, and its members get `room_update` `left`.
 - Physical row deletion is separate from logical visibility. History, edits, and lookups always enforce the published floor, including during partial cleanup.
@@ -487,9 +487,9 @@ Include a visible demo notice that only roughly the last day is retained.
 
 ### Cleanup algorithm and failure recovery
 
-Use a single scheduler backed by the DO alarm API. Due cleanup fixes a cutoff (`effective_now - 24h`) and identifies an expired log prefix with indexed, bounded work. Persist logical floor advancement and a cleanup job before discarding its rows. Publish floor changes in commit order. If discovering the prefix requires several batches, advance the floor incrementally; each visible floor must match actual logical coverage.
+Use a single scheduler backed by the DO alarm API. Due cleanup fixes a cutoff (`effective_now - retention`) and identifies an expired log prefix with indexed, bounded work. Persist logical floor advancement and a cleanup job before discarding its rows. Publish floor changes in commit order. If discovering the prefix requires several batches, advance the floor incrementally; each visible floor must match actual logical coverage.
 
-Delete expired records, expired current message and reaction state, fully expired thread rooms and then their stored memberships, expired accepted-request entries, and expired limiter state in separately bounded, metered batches. Retained latest snapshots and necessary current state must not be accidentally removed with an older version of the same message. Never reset room head, floor, credentials, or live quota counters. A next task is scheduled until the job completes; ordinary cleanup starts hourly, continuation wakes only as needed and within the budget.
+Delete expired records, expired current message and reaction state, fully expired thread rooms and then their stored memberships, expired accepted-request entries, and expired limiter state in separately bounded, metered batches. Retained latest snapshots and necessary current state must not be accidentally removed with an older version of the same message. Never reset room head, floor, credentials, or live quota counters. A next task is scheduled until the job completes; ordinary cleanup starts every cleanup interval, continuation wakes only as needed and within the budget.
 
 Retries are idempotent and work from persisted progress. A crash before or after any batch must preserve externally advertised coverage. If maintenance budget is exhausted, defer physical work until resources reset, suspend growth as needed, and do not spin alarms. Alarm/API failures must not permanently orphan cleanup: re-establish missing due work on subsequent valid activity as well as documented alarm retries. No live socket is needed to perform cleanup.
 
@@ -537,7 +537,7 @@ Use unit tests for pure logic and Cloudflare's Workers/Vitest integration for ru
 
 - Forward/backward inclusive bounds, numeric ordering, byte-limited contiguous pages spanning every record kind, exact more/first/last behavior, empty ranges, and unknown/empty rooms.
 - Concurrent history/live delivery around captured H has no missing record; per-room checkpoints are not confused.
-- Fake-clock advance: nothing younger than cutoff expires; hourly cleanup yields the intended approximate window. Same room ID/head persists.
+- Fake-clock advance: nothing younger than cutoff expires; cleanup every interval yields the intended approximate window. Same room ID/head persists.
 - Recent edit of an old creation, recent tombstone, moves into and out of thread rooms, restoration, reaction sets, and room records survive trimming; fully expired thread rooms are removed.
 - Unused and fully expired rooms report `history_log_id: null`; an expired room preserves its nonzero `latest_log_id`. Internally F=head+1 and the next creation is newer. Empty filtered pages retain the room-wide non-null boundary when history remains. Both fields are captured with every page. No accidental reset to zero or giant integer/string comparison bug.
 - Client with C<F-1 rebuilds; C=F-1 resumes safely. Floor advancement during pagination, delayed older pages, and out-of-order replies cannot resurrect old state or create a checkpoint gap.
@@ -558,7 +558,7 @@ Use unit tests for pure logic and Cloudflare's Workers/Vitest integration for ru
 ### Capacity, accounting, and lifecycle
 
 - Measure rows read/written per operation with the actual indexes, including quota writes, auth, alarms, failure paths, and deletion. Produce a cost table and test every claimed upper bound.
-- Exercise at least three simulated UTC days: accepted traffic plus previous-day cleanup, midnight double bursts, worst-case snapshots, frequent edits, reconnect/history load, and invalid traffic. A 24–25 hour retention interval can span two daily posting allowances; never assume it contains at most one day's post ceiling of records.
+- Exercise at least three simulated UTC days: accepted traffic plus previous-day cleanup, midnight double bursts, worst-case snapshots, frequent edits, reconnect/history load, and invalid traffic. A retention window spans more than one daily posting allowance (two for 24–25 hours, eight for 7 days); never assume it contains at most one day's post ceiling of records.
 - Verify metered work stops below configured ceilings with maintenance reserve intact. Include budget leases lost during crash, rollover while a handler is in flight, and accounting update failures. No allowance is reissued after a restart.
 - Demonstrate 128 MiB pressure control and SQLite page reuse under repeated delete/reinsert cycles. No unmetered VACUUM/DDL/full scan or accidental account-wide delete.
 - Hibernation wake restores socket auth/challenges and budget authority without reannouncing sessions, losing IP counters, resetting IDs, or storing history in attachments.
