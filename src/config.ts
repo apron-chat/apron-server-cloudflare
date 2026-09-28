@@ -1,5 +1,5 @@
 import * as budget from "./budget.ts";
-import { DEFAULT_FEATURES, DEFAULT_LIMITS, type Limits } from "./budget.ts";
+import { DEFAULT_FEATURES, DEFAULT_LIMITS, UPLOAD_POLICY, type Limits } from "./budget.ts";
 export { DEFAULT_LIMITS, BOOTSTRAP_ROW_RESERVATION, type Limits } from "./budget.ts";
 
 export interface RuntimeConfig {
@@ -19,15 +19,30 @@ export interface RuntimeConfig {
 	 * secret, never in source. Unset, no such token exists.
 	 */
 	adminToken?: string;
+	/**
+	 * Uploads (protocol §4.6.3, cap `embed:upload`), on when the plan has an
+	 * upload policy and the deployment sets `MEDIA_ORIGIN`, `PUBLIC_ORIGIN`,
+	 * the `UPLOAD_SIGNING_KEY` secret, and the `MEDIA` R2 binding.
+	 */
+	uploads?: UploadConfig;
+}
+
+export interface UploadConfig {
+	/** Where the bucket serves objects, such as `https://media.apron.chat`. */
+	mediaOrigin: string;
+	/** This Worker's public origin, where `write_url`s point. */
+	publicOrigin: string;
+	/** Signs `write_url` tokens (upload-token.ts); at least 32 characters. */
+	signingKey: string;
 }
 
 /**
  * Why a value cannot be `APRON_ADMIN_TOKEN`, or null when it can: 24 to 256
- * letters, digits, - or _, and not a bot token.
+ * letters, digits, - or _, and not a bot or invite token.
  */
 export function adminTokenError(token: string): string | null {
 	if (!/^[A-Za-z0-9_-]{24,256}$/.test(token)) return "APRON_ADMIN_TOKEN must be 24 to 256 letters, digits, - or _";
-	if (token.startsWith("apron_bot_")) return "APRON_ADMIN_TOKEN must not start with apron_bot_";
+	if (token.startsWith("apron_bot_") || token.startsWith("apron_invite_")) return "APRON_ADMIN_TOKEN must not start with apron_bot_ or apron_invite_";
 	return null;
 }
 
@@ -47,6 +62,10 @@ type EnvLike = {
 	ACTIVITY?: string;
 	GUEST_POSTING?: string;
 	APRON_ADMIN_TOKEN?: string;
+	MEDIA_ORIGIN?: string;
+	PUBLIC_ORIGIN?: string;
+	UPLOAD_SIGNING_KEY?: string;
+	MEDIA?: unknown;
 	ENVIRONMENT?: string;
 	NODE_ENV?: string;
 };
@@ -247,6 +266,7 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 	const adminToken = env.APRON_ADMIN_TOKEN === undefined || env.APRON_ADMIN_TOKEN === "" ? undefined : String(env.APRON_ADMIN_TOKEN);
 	const adminTokenProblem = adminToken === undefined ? null : adminTokenError(adminToken);
 	if (adminTokenProblem) throw new ConfigError(adminTokenProblem);
+	const uploads = loadUploads(env);
 	const rpName = String(env.RP_NAME ?? "Apron Demo");
 	if (!rpName.trim() || [...rpName].length > limits.maxNameCodePoints || new TextEncoder().encode(rpName).byteLength > limits.maxNameBytes) {
 		throw new ConfigError("RP_NAME exceeds the configured display-name policy");
@@ -261,7 +281,20 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 		activityEnabled,
 		guestPosting,
 		...(adminToken !== undefined ? { adminToken } : {}),
+		...(uploads ? { uploads } : {}),
 	};
+}
+
+/** Upload settings, when the plan and the deployment both provide them; malformed ones fail the configuration check. */
+function loadUploads(env: EnvLike): UploadConfig | undefined {
+	const mediaOrigin = env.MEDIA_ORIGIN?.trim() ?? "";
+	const publicOrigin = env.PUBLIC_ORIGIN?.trim() ?? "";
+	const signingKey = env.UPLOAD_SIGNING_KEY ?? "";
+	if (!UPLOAD_POLICY || !env.MEDIA || !mediaOrigin || !publicOrigin || !signingKey) return undefined;
+	if (!validOrigin(mediaOrigin)) throw new ConfigError("MEDIA_ORIGIN must be an exact HTTP(S) origin");
+	if (!validOrigin(publicOrigin)) throw new ConfigError("PUBLIC_ORIGIN must be an exact HTTP(S) origin");
+	if (signingKey.length < 32) throw new ConfigError("UPLOAD_SIGNING_KEY must be at least 32 characters");
+	return { mediaOrigin, publicOrigin, signingKey };
 }
 
 export function isAllowedOrigin(config: RuntimeConfig, origin: string | null): boolean {

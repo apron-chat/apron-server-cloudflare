@@ -53,17 +53,24 @@ simple = { limit = ${admission.requestsPerIpMinute}, period = ${admission.worker
 ${end}`;
 }
 
-export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET) {
+/**
+ * The zone rules for the server's hostname. With `mediaHostname`, the
+ * bucket's public domain for uploads, `write_url` requests (`PUT` and its
+ * preflight on `/w/`) are allowed and the budget stop blocks both hosts.
+ */
+export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHostname = undefined) {
 	validateAdmission(admission);
 	const host = `http.host eq ${JSON.stringify(hostname)}`;
+	const writes = mediaHostname ? ' and not (http.request.method in {"PUT" "OPTIONS"} and starts_with(http.request.uri.path, "/w/"))' : '';
+	const stopped = mediaHostname ? `http.host in {${JSON.stringify(hostname)} ${JSON.stringify(mediaHostname)}}` : host;
 	return {
 		custom: {
 			phase: 'http_request_firewall_custom',
 			rules: [
 				{
 					ref: 'apron_invalid_request',
-					description: 'Apron: allow WebSocket handshakes and connection status probes',
-					expression: `(${host}) and (http.request.method ne "GET" or not http.request.uri.path in {"/" "/ws"} or (not any(lower(http.request.headers["upgrade"][*])[*] eq "websocket") and not any(http.request.uri.args["apron_connection_status"][*] eq "1")))`,
+					description: mediaHostname ? 'Apron: allow WebSocket handshakes, connection status probes, and upload writes' : 'Apron: allow WebSocket handshakes and connection status probes',
+					expression: `(${host})${writes} and (http.request.method ne "GET" or not http.request.uri.path in {"/" "/ws"} or (not any(lower(http.request.headers["upgrade"][*])[*] eq "websocket") and not any(http.request.uri.args["apron_connection_status"][*] eq "1")))`,
 					action: 'block', enabled: true,
 				},
 				{
@@ -72,10 +79,16 @@ export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET) {
 					expression: host,
 					action: 'block', enabled: false,
 				},
+				...(mediaHostname ? [{
+					ref: 'apron_media_invalid',
+					description: 'Apron: the upload bucket serves only GET and HEAD of object keys, without a query string that would skip the cache',
+					expression: `(http.host eq ${JSON.stringify(mediaHostname)}) and (not http.request.method in {"GET" "HEAD"} or http.request.uri.query ne "" or not (starts_with(http.request.uri.path, "/f/") or starts_with(http.request.uri.path, "/a/")))`,
+					action: 'block', enabled: true,
+				}] : []),
 				{
 					ref: 'apron_budget_stop',
 					description: 'Apron: budget stop (the budget guard turns it on and off; leave it to the guard)',
-					expression: host,
+					expression: stopped,
 					action: 'block', enabled: false,
 				},
 			],
@@ -121,7 +134,7 @@ function configName(source, file) {
 	return match[1];
 }
 
-export function validateDeploymentConfiguration({ development, production, packageJson, workflow, budgetGuard = false }) {
+export function validateDeploymentConfiguration({ development, production, packageJson, workflow, budgetGuard = false, uploads = false }) {
 	const developmentName = configName(development, 'wrangler.toml');
 	const productionName = configName(production, 'wrangler.production.toml');
 	const productionTopLevel = topLevelConfig(production);
@@ -156,6 +169,21 @@ export function validateDeploymentConfiguration({ development, production, packa
 			throw new Error('Production Wrangler config must set ZONE_ID for the budget guard');
 		}
 	}
+	// A plan with uploads needs its bucket and both origins, or uploads are off.
+	if (uploads) {
+		if (!/^\[\[r2_buckets\]\]\s*\n(?:[^\[].*\n)*?binding\s*=\s*"MEDIA"/m.test(production)) {
+			throw new Error('Production Wrangler config must bind the MEDIA bucket for uploads');
+		}
+		if (!mediaHostname(production)) throw new Error('Production Wrangler config must set MEDIA_ORIGIN to an https origin for uploads');
+		if (!/^PUBLIC_ORIGIN\s*=\s*"https:\/\/[a-z0-9.-]+"\s*(?:#.*)?$/m.test(production)) {
+			throw new Error('Production Wrangler config must set PUBLIC_ORIGIN for upload write URLs');
+		}
+	}
+}
+
+/** The host of a Wrangler config's `MEDIA_ORIGIN` var, if it sets an https one. */
+export function mediaHostname(source) {
+	return source.match(/^MEDIA_ORIGIN\s*=\s*"https:\/\/([a-z0-9.-]+)"\s*(?:#.*)?$/m)?.[1];
 }
 
 function main() {
@@ -167,7 +195,7 @@ function main() {
 	const production = readFileSync(new URL('wrangler.production.toml', root), 'utf8');
 	const packageJson = JSON.parse(readFileSync(new URL('package.json', root), 'utf8'));
 	const workflow = readFileSync(new URL('.github/workflows/deploy.yml', root), 'utf8');
-	validateDeploymentConfiguration({ development, production, packageJson, workflow, budgetGuard: Boolean(ACCOUNT_USAGE_POLICY.monthly) });
+	validateDeploymentConfiguration({ development, production, packageJson, workflow, budgetGuard: Boolean(ACCOUNT_USAGE_POLICY.monthly), uploads: Boolean(PLAN.uploads) });
 	const outputs = [];
 	for (const [file, namespace, floodNamespace] of [['wrangler.toml', '73001', '73003'], ['wrangler.production.toml', '73002', '73004']]) {
 		const source = readFileSync(new URL(file, root), 'utf8');
@@ -176,7 +204,8 @@ function main() {
 	}
 	const hosts = [...production.matchAll(/pattern\s*=\s*"([a-z0-9.-]+)"\s*,\s*custom_domain\s*=\s*true/g)];
 	if (hosts.length !== 1) throw new Error('Expected exactly one production custom domain');
-	outputs.push(['docs/edge-rules.generated.json', JSON.stringify(renderEdgeRules(hosts[0][1]), null, 2) + '\n']);
+	const media = PLAN.uploads ? mediaHostname(production) : undefined;
+	outputs.push(['docs/edge-rules.generated.json', JSON.stringify(renderEdgeRules(hosts[0][1], ADMISSION_BUDGET, media), null, 2) + '\n']);
 	let stale = false;
 	for (const [file, expected] of outputs) {
 		const path = new URL(file, root);

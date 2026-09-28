@@ -1,9 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
 import { AuthError, AuthTooLargeError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, type RuntimeConfig } from "./config";
-import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, MAX_FRAME_LEASE, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE } from "./budget";
+import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, MAX_FRAME_LEASE, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, UPLOAD_POLICY } from "./budget";
 import { fetchAccountUsage, type AccountUsageSnapshot } from "./account-usage";
 import { runBudgetGuard, watchForFlood } from "./budget-guard";
+import { sniffImage } from "./image";
+import { signUploadToken, verifyUploadToken } from "./upload-token";
 import { extractClientIp, hashIpKey, stripForwardingHeaders } from "./ip";
 import {
 	errorFromUnknown,
@@ -21,7 +23,21 @@ import {
 	type ProtocolError,
 	type RequestFrame,
 } from "./protocol";
-import { DEFAULT_JOINED_ROOMS, ROOM_ID, Store, StoreError, type Broadcast, type RoomRecord, type StoreConfig, type StoreMutationInput } from "./store";
+import {
+	DEFAULT_JOINED_ROOMS,
+	ROOM_ID,
+	Store,
+	StoreError,
+	UPLOAD_WRITE_GRACE_MS,
+	uploadResultEmbed,
+	type Broadcast,
+	type RoomRecord,
+	type StoreConfig,
+	type StoreMutationInput,
+	type StoreMutationResult,
+	type UploadFinish,
+	type UploadWrite,
+} from "./store";
 
 const OBJECT_NAME = "public-demo-v1";
 const INTERNAL_IP_HEADER = "X-Apron-Trusted-IP-Key";
@@ -38,6 +54,8 @@ const SESSION_CLEANUP_BATCH = 16;
  */
 const SESSION_SWEEP_INTERVAL_MS = 60 * 60_000;
 const MAX_SESSION_TOKEN_CHARS = 256;
+/** Longest avatar URL a connection keeps: the media origin and an object key. */
+const MAX_AVATAR_CHARS = 512;
 
 type WebSocketConnection = WebSocket & {
 	serializeAttachment?: (value: unknown) => void;
@@ -51,6 +69,8 @@ interface ConnectionAttachment {
 	tier: "pending" | "anonymous" | "registered";
 	userId?: string;
 	name?: string;
+	/** The user's avatar (§4.6.6), for current user objects; never in `from`. */
+	avatar?: string;
 	origin?: string;
 	/** The WebSocket URL this connection reached, for instructions that name the server (`/invite-bot`). */
 	endpoint?: string;
@@ -104,9 +124,13 @@ const MAX_ATTACHED_ROOMS = 2 * (MAX_THREAD_LIMIT + 1);
 const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audience: "everyone" | "owners" | "admins" }> = [
 	{ name: "help", usage: "/help", help: "list the commands you can use here", audience: "everyone" },
 	{ name: "invite-bot", usage: "/invite-bot", help: "get a sign-in token for your bot; a new one replaces the last", audience: "owners" },
+	{ name: "avatar", usage: "/avatar", help: "set your avatar: send this command with one image attached", audience: "owners" },
 	{ name: "admin", usage: "/admin <user_id>", help: "make a registered user an admin", audience: "admins" },
 	{ name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", audience: "admins" },
 	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
+	{ name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", audience: "admins" },
+	{ name: "toggle", usage: "/toggle <activity|uploads>", help: "turn typing activity or uploads off or on for everyone", audience: "admins" },
+	{ name: "purge", usage: "/purge <user_id>", help: "disconnect a user and delete their account, bot, and everything they posted or uploaded", audience: "admins" },
 	{ name: "status", usage: "/status", help: "show today's Cloudflare usage and the demo's budgets", audience: "admins" },
 ];
 /** Why a guest's post, reaction, join, leave, or room change is denied while guests only read. */
@@ -117,6 +141,8 @@ const GUEST_READ_ONLY = "Guests can only read here; sign in with a passkey to po
  * `guest_` or `bot_`, so the prefix names bots alone.
  */
 const BOT_ID_PREFIX = "bot_";
+/** Features an admin can turn off and on with `/toggle`. */
+type ToggleFeature = "activity" | "uploads";
 /**
  * The registered user `APRON_ADMIN_TOKEN` signs in as, always an admin. Registered
  * users are `<name>_<digits>` or `u_…`, so no passkey user can take this id.
@@ -129,6 +155,10 @@ const BOT_TOKEN_PREFIX = "apron_bot_";
 const BOT_TOKEN_KEY_PREFIX = "bot-token:";
 /** Key prefix for each bot's current token key, so a new `/invite-bot` revokes the last token. */
 const BOT_KEY_PREFIX = "bot:";
+/** Invite tokens (`/invite-token`): what they look like, their hashed keys, and each user's pointer to theirs. */
+const INVITE_TOKEN_PREFIX = "apron_invite_";
+const INVITE_TOKEN_KEY_PREFIX = "invite-token:";
+const INVITE_KEY_PREFIX = "invite:";
 /** The protocol a bot's instructions point it at (`/invite-bot`). */
 const PROTOCOL_URL = "https://github.com/shazow/apron/blob/main/PROTOCOL.md";
 
@@ -160,6 +190,16 @@ interface StoredBotToken {
 interface StoredBot {
 	v: 1;
 	tokenKey: string;
+}
+
+/**
+ * An invite token (`/invite-token`), stored only as its SHA-256 under
+ * INVITE_TOKEN_KEY_PREFIX: the registered user it signs in as. The user's
+ * INVITE_KEY_PREFIX entry is a StoredBot-shaped pointer back to it.
+ */
+interface StoredInviteToken {
+	v: 1;
+	userId: string;
 }
 
 interface SessionExpiryEntry {
@@ -206,6 +246,17 @@ function endpointOf(request: Request): string | undefined {
 	const url = new URL(request.url);
 	const endpoint = `${url.protocol === "http:" ? "ws:" : "wss:"}//${url.host}${url.pathname}`;
 	return endpoint.length <= MAX_ENDPOINT_CHARS ? endpoint : undefined;
+}
+
+/**
+ * Throws unless `userId` may be issued by an admin (`/rename`, `/invite-token`):
+ * 1 to 64 letters, digits, `_` or `-`, starting with a letter or digit, and
+ * not a guest's or bot's.
+ */
+function assertIssuableUserId(userId: string): void {
+	if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(userId) || /^(guest|bot)(_|$)/i.test(userId)) {
+		throw { name: "invalid_params", message: "A user_id is 1 to 64 letters, digits, _ or -, starting with a letter or digit, and not guest_ or bot_" } satisfies ProtocolError;
+	}
 }
 
 function isBot(userId: string | undefined): boolean {
@@ -273,6 +324,7 @@ function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		storageHardTargetBytes: limits.databaseHardTargetBytes,
 		storageLowWaterBytes: limits.databaseResumeLowWaterBytes,
 		admissionEnabled: !config.admissionOff,
+		uploads: config.uploads && UPLOAD_POLICY ? { ...UPLOAD_POLICY, mediaOrigin: config.uploads.mediaOrigin } : null,
 		processedFramesPerDay: limits.processedFramesPerDay,
 		framesPerIpMinute: limits.framesPerIpMinute,
 		connectionAdmissionsPerIpMinute: limits.connectionAdmissionsPerIpMinute,
@@ -316,6 +368,7 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			tier: attachment.tier === "anonymous" || attachment.tier === "registered" ? attachment.tier : "pending",
 			...(typeof attachment.userId === "string" ? { userId: attachment.userId } : {}),
 			...(typeof attachment.name === "string" ? { name: attachment.name } : {}),
+			...(typeof attachment.avatar === "string" && attachment.avatar.length <= MAX_AVATAR_CHARS ? { avatar: attachment.avatar } : {}),
 			...(typeof attachment.origin === "string" ? { origin: attachment.origin } : {}),
 			...(typeof attachment.endpoint === "string" && attachment.endpoint.length <= MAX_ENDPOINT_CHARS ? { endpoint: attachment.endpoint } : {}),
 			...(challenge ? { challenge } : {}),
@@ -457,13 +510,29 @@ function publicIdentity(attachment: ConnectionAttachment): { user_id: string; na
 	return identity ? { user_id: identity.user_id, ...(identity.name ? { name: identity.name } : {}) } : null;
 }
 
+/**
+ * A connection's user as a current object (§3.3): `you`, `new`, and room
+ * `members` and `users`, which carry `avatar` (§4.6.6). Recorded objects,
+ * such as a message's `from`, use publicIdentity and never do.
+ */
+function currentUser(attachment: ConnectionAttachment): PublicUser | null {
+	const identity = publicIdentity(attachment);
+	return identity && attachment.avatar ? { ...identity, avatar: attachment.avatar } : identity;
+}
+
+/** Keeps a live avatar on a connection's attachment, or none; the caller writes the attachment. */
+function setAvatar(attachment: ConnectionAttachment, avatar: string | undefined): void {
+	if (avatar) attachment.avatar = avatar;
+	else delete attachment.avatar;
+}
+
 function identityOf(attachment: ConnectionAttachment): IdentityShape | null {
 	if (!attachment.userId || (attachment.tier !== "anonymous" && attachment.tier !== "registered")) return null;
 	return { user_id: attachment.userId, ...(attachment.name ? { name: attachment.name } : {}), tier: attachment.tier };
 }
 
 /** A user object as this server sends it (§3.3): `user_id` and `name`. */
-type PublicUser = { user_id: string; name?: string };
+type PublicUser = { user_id: string; name?: string; avatar?: string };
 
 /** A room in a listing, with `members` when asked for (§4.3.1). */
 type ListedRoom = RoomRecord & { members?: Array<{ user_id: string }> };
@@ -503,8 +572,83 @@ export async function fetchEntry(request: Request, env: Env, ctx?: ExecutionCont
 	return new Response(response.body, { status: response.status, headers });
 }
 
+/**
+ * `PUT /w/<token>`: a `write_url` (§4.6.3). The token's signature is checked
+ * before the body is read, the Durable Object claims the upload so a URL
+ * writes once, and the bytes must be a PNG, JPEG, GIF, or WebP image within
+ * the token's size. The object is stored in R2 with the type its bytes
+ * show, then the Durable Object finishes the write; one it no longer wants
+ * is deleted again.
+ */
+async function handleUploadWrite(request: Request, env: Env, token: string): Promise<Response> {
+	// Any origin may write: the token is the credential, and no cookie is sent.
+	const cors = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "PUT, OPTIONS", "Access-Control-Allow-Headers": "Content-Type", "Access-Control-Max-Age": "86400" };
+	const answer = (status: number, message?: string): Response => {
+		const response = message === undefined ? new Response(null, { status }) : responseError(status, message);
+		const headers = new Headers(response.headers);
+		for (const [name, value] of Object.entries(cors)) headers.set(name, value);
+		return new Response(response.body, { status: response.status, headers });
+	};
+	if (request.method === "OPTIONS") return answer(204);
+	if (request.method !== "PUT") return answer(405, "Method not allowed");
+	let config: RuntimeConfig;
+	try {
+		config = loadConfig(env);
+	} catch {
+		return answer(503, "Configuration unavailable");
+	}
+	const uploads = config.uploads;
+	const media = env.MEDIA;
+	if (!uploads || !media || !env.DEMO) return answer(404, "Not found");
+	const grant = await verifyUploadToken(uploads.signingKey, token);
+	if (!grant) return answer(403, "This write_url is not valid or has expired");
+	const length = Number(request.headers.get("Content-Length") ?? NaN);
+	if (!Number.isSafeInteger(length) || length <= 0) return answer(411, "Content-Length is required");
+	if (length > grant.maxBytes) return answer(413, `An upload here is at most ${grant.maxBytes} bytes`);
+	const stub = env.DEMO.getByName(OBJECT_NAME);
+	try {
+		if (!await stub.claimUpload(grant.key)) return answer(409, "This write_url was already used or has expired");
+	} catch {
+		return answer(503, "Demo capacity reached");
+	}
+	const fail = async (status: number, message: string): Promise<Response> => {
+		await stub.finishUpload({ key: grant.key, ok: false }).catch(() => false);
+		return answer(status, message);
+	};
+	let body: Uint8Array;
+	try {
+		body = new Uint8Array(await request.arrayBuffer());
+	} catch {
+		return fail(400, "The upload was interrupted");
+	}
+	if (body.byteLength !== length || body.byteLength > grant.maxBytes) return fail(400, "The body does not match its Content-Length");
+	const image = sniffImage(body);
+	if (!image) return fail(415, "Only PNG, JPEG, GIF, and WebP images can be uploaded");
+	try {
+		await media.put(grant.key, body, {
+			httpMetadata: {
+				contentType: image.type,
+				// Attached images never change; an avatar key is rewritten when refreshed.
+				cacheControl: grant.key.startsWith("f/") ? "public, max-age=604800, immutable" : "public, max-age=86400",
+			},
+		});
+	} catch {
+		return fail(503, "Storage is unavailable; try again");
+	}
+	let accepted = false;
+	try {
+		accepted = await stub.finishUpload({ key: grant.key, ok: true, bytes: body.byteLength, contentType: image.type, ...(image.width && image.height ? { width: image.width, height: image.height } : {}) });
+	} catch { /* not accepted */ }
+	if (!accepted) {
+		await media.delete(grant.key).catch(() => undefined);
+		return answer(410, "This upload is no longer wanted: it expired, or its message or embed is gone");
+	}
+	return answer(204);
+}
+
 async function fetchConnection(request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url);
+	if (url.pathname.startsWith("/w/")) return handleUploadWrite(request, env, url.pathname.slice(3));
 	const status = isConnectionStatus(request);
 	const rootUpgrade = url.pathname === "/" && (isUpgrade(request) || status);
 	if (url.pathname !== "/ws" && !rootUpgrade) {
@@ -565,6 +709,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private alarmKnown = false;
 	/** When the next alarm may sweep sessions; in memory, so a wake sweeps once. */
 	private nextSessionSweepAt = 0;
+	/** Admins' `/toggle`s, once read: a feature absent here has not been read yet. */
+	private readonly toggles = new Map<ToggleFeature, boolean | undefined>();
+	/** When the earliest pending upload's write window closes, if one is known (§4.6.3). */
+	private uploadDeadline: number | undefined;
 	private accountUsageEvents = 0;
 	private accountUsageRetryAt = 0;
 	private accountUsageFailureCount = 0;
@@ -775,6 +923,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		// Committed removals need no store access; tell their members before any
 		// listing that could fail on an exhausted budget.
+		if (this.config.uploads) {
+			try {
+				await this.runMutation(async () => {
+					const expired = this.store.expirePendingUploads(now);
+					for (const record of expired.broadcasts) this.broadcastRecord(record);
+					this.deleteMedia(expired.deletedUploads);
+					this.uploadDeadline = expired.next;
+				});
+				this.store.cleanupUploads(now);
+			} catch { /* a metered maintenance failure is retried on the next alarm */ }
+		}
 		const removed = result?.removed_rooms ?? [];
 		for (const roomId of removed) this.noteRoom(roomId, false);
 		if (removed.length) this.removeRooms(removed);
@@ -806,7 +965,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			params: {
 				protocol: 6,
 				name: "apron-cloudflare-demo/6",
-				caps: ["history", "edit", "rooms", "reactions", "command", ...(this.config.activityEnabled ? ["activity"] : [])],
+				caps: [
+					"history", "edit", "rooms", "reactions", "command",
+					...(this.activityOn() ? ["activity"] : []),
+					...(this.uploadsOn() ? ["embed:upload"] : []),
+				],
 				// Passkeys and their session tokens only where passkeys are offered;
 				// bot tokens (`/invite-bot`) from anywhere, since bots are not browsers.
 				auth: origin !== null && this.config.rpOrigins.includes(origin) ? ["webauthn", "token", "guest"] : ["token", "guest"],
@@ -830,7 +993,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 						// `read_message_id` in `activity` is dropped: no read cursors are kept.
 						read_cursors: false,
 						// With `activity`, typing is relayed; read cursors are neither kept nor relayed.
-						...(this.config.activityEnabled ? { activity_per_minute: limits.activityBroadcastsPerUserMinute } : {}),
+						...(this.activityOn() ? { activity_per_minute: limits.activityBroadcastsPerUserMinute } : {}),
 					},
 				},
 			},
@@ -1022,7 +1185,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return;
 			case "activity":
 				// Off unless the plan or `ACTIVITY` enables it: typing then gets the unsupported-method path.
-				if (!this.config.activityEnabled) break;
+				if (!this.activityOn()) break;
 				await this.handleActivity(socket, request);
 				return;
 			case "room_list":
@@ -1068,7 +1231,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// A guest auth on an authenticated connection changes nothing: answer it
 		// without charging an attempt.
 		if (request.params.scheme === "guest" && (attachment.tier === "anonymous" || attachment.tier === "registered")) {
-			this.reply(socket, request, { you: publicIdentity(attachment) });
+			this.reply(socket, request, { you: currentUser(attachment) });
 			return;
 		}
 		this.store.reserveAuthAttempt({ ipKey: attachment.ipKey, now: nowMs() });
@@ -1086,7 +1249,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			attachment.rooms = [...DEFAULT_JOINED_ROOMS];
 			delete attachment.listedJoined;
 			writeAttachment(socket, attachment);
-			this.reply(socket, request, { you: publicIdentity(attachment) });
+			this.reply(socket, request, { you: currentUser(attachment) });
 			await this.rescheduleAlarm();
 			return;
 		}
@@ -1094,6 +1257,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const token = requiredString(params, "token");
 			if (this.config.adminToken !== undefined && await sameToken(token, this.config.adminToken)) await this.handleAdminToken(socket, attachment, request);
 			else if (token.startsWith(BOT_TOKEN_PREFIX)) await this.handleBotToken(socket, attachment, request, token);
+			else if (token.startsWith(INVITE_TOKEN_PREFIX)) await this.handleInviteToken(socket, attachment, request, token);
 			else await this.handleTokenResume(socket, attachment, request);
 			return;
 		}
@@ -1131,10 +1295,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (!challenge || !matchingChallenge || challenge.action !== action) throw { name: "denied", message: "Passkey challenge is missing or expired" } satisfies ProtocolError;
 		const credential = passkeyCredentialParam(params, action);
+		// A signed-in user's avatar, for the connection's current object (§4.6.6).
+		let avatar: string | undefined;
 		const repository: CredentialRepository = {
 			getCredential: (credentialId) => this.store.getCredential(credentialId),
 			getIdentity: (userId) => {
 				const identity = this.store.getIdentity(userId);
+				avatar = identity?.avatar;
 				return identity ? { user_id: identity.userId, name: identity.name, tier: "registered" } : null;
 			},
 			registerCredential: (input) => {
@@ -1163,11 +1330,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.tier = "registered";
 		attachment.userId = finished.identity.user_id;
 		attachment.name = finished.identity.name;
+		setAvatar(attachment, avatar);
 		attachment.rooms = this.registeredRooms(socket, finished.identity.user_id);
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
-		this.reply(socket, request, { you: publicIdentity(attachment), token });
-		if (guest) this.announceUser(socket, publicIdentity(attachment), [...guestRooms, ...attachment.rooms], guest);
+		this.reply(socket, request, { you: currentUser(attachment), token });
+		if (guest) this.announceUser(socket, currentUser(attachment), [...guestRooms, ...attachment.rooms], guest);
+		this.refreshAvatar(finished.identity.user_id);
 		await this.rescheduleAlarm();
 	}
 
@@ -1261,11 +1430,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.tier = "registered";
 		attachment.userId = identity.userId;
 		attachment.name = identity.name;
+		setAvatar(attachment, identity.avatar);
 		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
-		this.reply(socket, request, { you: publicIdentity(attachment), token });
-		if (guest) this.announceUser(socket, publicIdentity(attachment), [...guestRooms, ...attachment.rooms], guest);
+		this.reply(socket, request, { you: currentUser(attachment), token });
+		if (guest) this.announceUser(socket, currentUser(attachment), [...guestRooms, ...attachment.rooms], guest);
+		this.refreshAvatar(identity.userId);
 		await this.rescheduleAlarm();
 	}
 
@@ -1283,6 +1454,24 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const invalid = { name: "denied", message: "Bot token is not valid; its owner can get a new one with /invite-bot" } satisfies ProtocolError;
 			if (!stored || stored.v !== 1 || !isBot(stored.botId)) throw invalid;
 			const identity = this.store.getIdentity(stored.botId);
+			if (!identity) throw invalid;
+			await this.signInKeyless(socket, attachment, request, identity);
+		});
+	}
+
+	/**
+	 * Signs a user in with the token an admin made for them (`/invite-token`),
+	 * through the `token` scheme (§3.2), from any origin like a bot token.
+	 */
+	private async handleInviteToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, token: string): Promise<void> {
+		return this.withSessionLock(async () => {
+			if (attachment.tier === "registered") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
+			if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "invalid_params", message: "token is too long" } satisfies ProtocolError;
+			const key = INVITE_TOKEN_KEY_PREFIX + await sha256Hex(token);
+			const stored = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredInviteToken>(key));
+			const invalid = { name: "denied", message: "This invite token is not valid; ask an admin for a new one" } satisfies ProtocolError;
+			if (!stored || stored.v !== 1 || typeof stored.userId !== "string") throw invalid;
+			const identity = this.store.getIdentity(stored.userId);
 			if (!identity) throw invalid;
 			await this.signInKeyless(socket, attachment, request, identity);
 		});
@@ -1310,7 +1499,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * (a bot or the admin user): the connection becomes the identity, and those
 	 * who shared a room with the guest it replaces hear of it.
 	 */
-	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[] }): Promise<void> {
+	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[]; avatar?: string }): Promise<void> {
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
 		this.assertRegisteredCapacity(socket, identity.userId);
 		const guest = attachment.tier === "anonymous" ? publicIdentity(attachment) : null;
@@ -1318,11 +1507,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.tier = "registered";
 		attachment.userId = identity.userId;
 		attachment.name = identity.name;
+		setAvatar(attachment, identity.avatar);
 		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
-		this.reply(socket, request, { you: publicIdentity(attachment) });
-		if (guest) this.announceUser(socket, publicIdentity(attachment), [...guestRooms, ...attachment.rooms], guest);
+		this.reply(socket, request, { you: currentUser(attachment) });
+		if (guest) this.announceUser(socket, currentUser(attachment), [...guestRooms, ...attachment.rooms], guest);
+		this.refreshAvatar(identity.userId);
 		await this.rescheduleAlarm();
 	}
 
@@ -1468,17 +1659,26 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * Profile update (section 3.3): a given field replaces its value, an
 	 * omitted one is unchanged, and an empty one removes it. Only registered
 	 * users may change their name; `name: ""` removes it, so the user falls
-	 * back to `user_id`. The demo keeps no avatars or profile ext, so `avatar`
-	 * and `ext` are type-checked and declined.
+	 * back to `user_id`. With uploads, `avatar: ""` removes a registered user's
+	 * avatar; a new one comes only through `/avatar` (§4.6.6), so other values
+	 * are declined, as is `ext`.
 	 */
 	private async handleMe(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		const identity = identityOf(attachment);
 		if (!identity) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
 		const name = optionalString(request.params, "name");
-		optionalString(request.params, "avatar");
+		const avatar = optionalString(request.params, "avatar");
 		objectParam(request.params, "ext", false);
+		const removeAvatar = avatar === "" && attachment.tier === "registered" && !!this.config.uploads;
+		if (removeAvatar) {
+			const cleared = this.store.clearAvatar({ userId: identity.user_id, now: nowMs() });
+			this.deleteMedia(cleared.deletedUploads);
+			// Announced as its empty value (§3.3), before the result.
+			if (cleared.changed) this.announceAvatar(identity.user_id, "");
+		}
 		if (name === undefined) {
-			this.reply(socket, request, { you: publicIdentity(attachment) });
+			const current = connectionAttachment(socket) ?? attachment;
+			this.reply(socket, request, { you: removeAvatar ? { ...currentUser(current), avatar: "" } : currentUser(current) });
 			return;
 		}
 		if (attachment.tier !== "registered") {
@@ -1537,13 +1737,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 			params: request.params,
 			identity,
 		};
+		let started = false;
 		await this.runMutation(async () => {
 			const result = this.store.mutate(input);
 			// A deduplicated retry carries no records and is never rebroadcast.
 			// The broadcast comes before the result on the sender's connection (§1).
 			for (const record of result.broadcasts) this.broadcastRecord(record);
-			this.reply(socket, request, result.result);
+			this.reply(socket, request, await this.withWriteUrls(result.result));
+			started = this.afterUploads(result);
 		});
+		// Pending writes that never come are failed by the alarm (§4.6.3).
+		if (started) await this.rescheduleAlarm();
 	}
 
 	private async handleMessage(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
@@ -1590,7 +1794,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (result.created) {
 					this.setRooms(identity.user_id, [...(this.liveRoomsOf(identity.user_id) ?? []), room.room_id]);
 					// A new room's only member is its creator: no storage to read.
-					const creator = { user_id: identity.user_id, ...(identity.name ? { name: identity.name } : {}) };
+					const creator = currentUser(attachment)!;
 					this.sendToUser(identity.user_id, this.joinedUpdate(room, [creator]));
 					if (result.membership) this.broadcastRecord(result.membership);
 					this.deliver(roomUpdate("updated", room), scope, (state) => state.userId !== identity.user_id);
@@ -1622,7 +1826,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!known) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
 		// The members before the join, read before anything commits.
 		const before = this.membersOf([roomId]);
-		const joiner = { user_id: identity.user_id, ...(identity.name ? { name: identity.name } : {}) };
+		const joiner = currentUser(attachment)!;
 		const current = attachment.rooms ?? [];
 		if (current.includes(roomId)) {
 			this.send(socket, this.joinedUpdate(known, before.get(roomId), joiner));
@@ -1839,7 +2043,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const line = text.trim();
 		const words = line.startsWith("/") ? line.slice(1).split(/\s+/) : [""];
 		const name = words[0].toLowerCase();
-		const command = COMMANDS.find((candidate) => candidate.name === name);
+		const command = this.commands().find((candidate) => candidate.name === name);
 		if (!command) {
 			const message = line.startsWith("/") ? `Unknown command /${name}; try /help` : "A command starts with /; try /help";
 			this.fail(socket, request, { name: "invalid_params", message: message.slice(0, 200) });
@@ -1856,14 +2060,21 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await this.inviteBot(socket, attachment, request, roomId);
 			return;
 		}
-		if (command.name === "admin" || command.name === "kick" || command.name === "rename") {
+		if (command.name === "avatar") {
+			await this.startAvatar(socket, attachment, request, body);
+			return;
+		}
+		if (["admin", "kick", "rename", "purge", "toggle", "invite-token"].includes(command.name)) {
 			try {
 				const target = words[1];
 				const argumentCount = command.name === "rename" ? 2 : 1;
 				if (!target || words.length !== argumentCount + 1) throw { name: "invalid_params", message: `Usage: ${command.usage}` } satisfies ProtocolError;
 				if (command.name === "admin") this.grantAdmin(socket, request, roomId, target);
 				else if (command.name === "kick") await this.kick(socket, attachment, request, roomId, target);
-				else this.rename(socket, request, roomId, target, words[2]);
+				else if (command.name === "purge") await this.purge(socket, attachment, request, roomId, target);
+				else if (command.name === "toggle") this.toggle(socket, request, roomId, target);
+				else if (command.name === "invite-token") await this.inviteToken(socket, attachment, request, roomId, target);
+				else await this.rename(socket, request, roomId, target, words[2]);
 			} catch (error) {
 				// A mistyped or wrong user_id is an error to show, like an unknown
 				// command, not a policy violation.
@@ -1878,7 +2089,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return;
 		}
 		// The reply a command causes comes before its result (§1).
-		const available = COMMANDS.filter((candidate) => candidate.audience === "everyone" || (candidate.audience === "owners" && owner) || admin);
+		const available = this.commands().filter((candidate) => candidate.audience === "everyone" || (candidate.audience === "owners" && owner) || admin);
 		this.send(socket, {
 			method: "message",
 			params: {
@@ -1888,6 +2099,165 @@ export class ApronDemoServer extends DurableObject<Env> {
 			},
 		});
 		this.reply(socket, request, {});
+	}
+
+	/** The commands this deployment offers: `/avatar` only while uploads are on. */
+	private commands(): typeof COMMANDS {
+		return this.uploadsOn() ? COMMANDS : COMMANDS.filter((command) => command.name !== "avatar");
+	}
+
+	/** An admin's `/toggle` of a feature, read once and then kept in memory with every change. */
+	private toggled(feature: ToggleFeature): boolean | undefined {
+		if (!this.toggles.has(feature)) this.toggles.set(feature, this.store.toggle(feature, nowMs()));
+		return this.toggles.get(feature);
+	}
+
+	/** Uploads: configured, and not turned off by an admin. */
+	private uploadsOn(): boolean {
+		return !!this.config.uploads && (this.toggled("uploads") ?? true);
+	}
+
+	/** Activity (typing): the deployment's default (plan or `ACTIVITY`) unless an admin toggled it. */
+	private activityOn(): boolean {
+		return this.toggled("activity") ?? this.config.activityEnabled;
+	}
+
+	/**
+	 * `/toggle <feature>`: turns `activity` (typing) or, where configured,
+	 * `uploads` off or on for everyone, and tells the sender which with a
+	 * `@private` notice before the result (§1). Kept across restarts; toggling
+	 * back to the deployment's default forgets the override. New connections
+	 * are offered the cap only while it is on. With activity off, typing is
+	 * no longer relayed; with uploads off, new upload embeds and `/avatar` are
+	 * `denied`, and writes already started still finish.
+	 */
+	private toggle(socket: WebSocketConnection, request: RequestFrame, roomId: string, feature: string): void {
+		const features: ToggleFeature[] = this.config.uploads ? ["activity", "uploads"] : ["activity"];
+		const chosen = features.find((candidate) => candidate === feature);
+		if (!chosen) throw { name: "invalid_params", message: `Usage: /toggle ${features.join("|")}` } satisfies ProtocolError;
+		const on = !(chosen === "uploads" ? this.uploadsOn() : this.activityOn());
+		const fallback = chosen === "uploads" ? true : this.config.activityEnabled;
+		const override = on === fallback ? undefined : on;
+		this.store.setToggle(chosen, override, nowMs());
+		this.toggles.set(chosen, override);
+		const notices: Record<ToggleFeature, [string, string]> = {
+			activity: [
+				"Activity is now **on**: typing is relayed, and new connections are offered it.",
+				"Activity is now **off**: typing is no longer relayed, and new connections are not offered it.",
+			],
+			uploads: [
+				"Uploads are now **on**.",
+				"Uploads are now **off**: new attachments and avatars are refused, and new connections are not offered uploads.",
+			],
+		};
+		this.sendNotice(socket, roomId, notices[chosen][on ? 0 : 1]);
+		this.reply(socket, request, {});
+	}
+
+	/**
+	 * `/avatar` with one `upload` embed (§4.6.6): the result carries the
+	 * embed's `write_url`, and the image becomes the sender's avatar when the
+	 * write finishes (finishUpload).
+	 */
+	private async startAvatar(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, body: Record<string, unknown>): Promise<void> {
+		const embeds = body.embeds;
+		const attached = Array.isArray(embeds) && embeds.length === 1 && !!embeds[0] && typeof embeds[0] === "object" && (embeds[0] as Record<string, unknown>).kind === "upload";
+		if (!attached) throw { name: "invalid_params", message: "Attach one image to /avatar as an upload embed" } satisfies ProtocolError;
+		let started = false;
+		await this.runMutation(async () => {
+			const upload = this.store.startAvatarUpload({ userId: attachment.userId!, now: nowMs() });
+			this.reply(socket, request, await this.withWriteUrls({ embeds: [uploadResultEmbed(upload)] }));
+			started = this.afterUploads({ uploads: [upload] });
+		});
+		if (started) await this.rescheduleAlarm();
+	}
+
+	/**
+	 * `/purge <user_id>`: disconnects a user and their bot, then deletes them
+	 * and everything they posted, reacted, or uploaded (Store.purgeUsers),
+	 * silently: no records announce it, so clients showing their content keep
+	 * it until they load history again. They may register a new passkey. The
+	 * sender gets a `@private` notice before the result (§1).
+	 */
+	private async purge(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, target: string): Promise<void> {
+		const userId = target.replace(/^@/, "");
+		if (userId === attachment.userId) throw { name: "invalid_params", message: "You can't purge yourself" } satisfies ProtocolError;
+		if (userId === ADMIN_USER_ID) throw { name: "invalid_params", message: "The admin user can't be purged" } satisfies ProtocolError;
+		if (!this.store.identityExists(userId) && !this.connectionsOf(userId).length) {
+			throw { name: "invalid_params", message: `No user has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
+		}
+		const userIds = isBot(userId) ? [userId] : [userId, BOT_ID_PREFIX + userId];
+		for (const id of userIds) {
+			for (const peer of this.connectionsOf(id)) {
+				const state = connectionAttachment(peer);
+				if (state) this.closePolicy(peer, state, 1008, "Removed by an admin");
+			}
+		}
+		let purged = { messages: 0, reactions: 0, deletedUploads: [] as string[] };
+		await this.runMutation(async () => {
+			purged = this.store.purgeUsers({ userIds, now: nowMs() });
+		});
+		this.deleteMedia(purged.deletedUploads);
+		await this.forgetTokens(userIds);
+		const uploads = purged.deletedUploads.length;
+		this.sendNotice(socket, roomId, `Purged \`${userId}\`: ${purged.messages} message${purged.messages === 1 ? "" : "s"}, ${purged.reactions} reaction set${purged.reactions === 1 ? "" : "s"}, ${uploads} upload${uploads === 1 ? "" : "s"}.`);
+		this.reply(socket, request, {});
+	}
+
+	/** Revokes bot and invite tokens, so purged users cannot sign in again. */
+	private async forgetTokens(userIds: readonly string[]): Promise<void> {
+		if (!userIds.length) return;
+		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 2 * userIds.length, writes: 4 * userIds.length }, async () => {
+			for (const userId of userIds) {
+				for (const pointer of [BOT_KEY_PREFIX + userId, INVITE_KEY_PREFIX + userId]) {
+					const stored = await this.ctx.storage.get<StoredBot>(pointer);
+					if (stored?.v !== 1 || typeof stored.tokenKey !== "string") continue;
+					await this.ctx.storage.delete(stored.tokenKey);
+					await this.ctx.storage.delete(pointer);
+				}
+			}
+		}));
+	}
+
+	/**
+	 * `/invite-token <user_id>` (a leading `@` is allowed): creates a
+	 * registered user with no passkey (Store.createInvitedIdentity), who signs
+	 * in with the bearer token the sender gets in a `@private` notice before
+	 * the result (§1). A taken `user_id` is `invalid_params`. The token does
+	 * not expire; `/purge` revokes it, and `/rename` moves it.
+	 */
+	private async inviteToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, target: string): Promise<void> {
+		const userId = target.replace(/^@/, "");
+		if (userId === ADMIN_USER_ID) throw { name: "invalid_params", message: `The user_id ${userId} is taken` } satisfies ProtocolError;
+		assertIssuableUserId(userId);
+		await this.runMutation(async () => {
+			const created = this.store.createInvitedIdentity({ userId, name: userId, now: nowMs(), ipKey: attachment.ipKey });
+			// The new user's logged join of `general` goes to its members (§4.3.2).
+			for (const record of created.broadcasts) this.broadcastRecord(record);
+		});
+		const token = INVITE_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+		const key = INVITE_TOKEN_KEY_PREFIX + await sha256Hex(token);
+		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { writes: 2 }, async () => {
+			await this.ctx.storage.put<StoredInviteToken>(key, { v: 1, userId });
+			await this.ctx.storage.put<StoredBot>(INVITE_KEY_PREFIX + userId, { v: 1, tokenKey: key });
+		}));
+		this.sendNotice(socket, roomId, [
+			`Created \`${userId}\`, who signs in with this token instead of a passkey. It does not expire, and anyone who has it signs in as \`${userId}\`, so hand it over privately. \`/purge ${userId}\` removes them and the token.`,
+			"```\n" + token + "\n```",
+			`To sign in, authenticate with the token scheme: \`{"method": "auth", "params": {"scheme": "token", "token": "${token}"}}\``,
+		].join("\n\n"));
+		this.reply(socket, request, {});
+	}
+
+	/** After `/rename`, points the user's invite token, if any, at the new `user_id`. */
+	private async moveInviteToken(from: string, to: string): Promise<void> {
+		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1, writes: 3 }, async () => {
+			const pointer = await this.ctx.storage.get<StoredBot>(INVITE_KEY_PREFIX + from);
+			if (pointer?.v !== 1 || typeof pointer.tokenKey !== "string") return;
+			await this.ctx.storage.put<StoredInviteToken>(pointer.tokenKey, { v: 1, userId: to });
+			await this.ctx.storage.put<StoredBot>(INVITE_KEY_PREFIX + to, pointer);
+			await this.ctx.storage.delete(INVITE_KEY_PREFIX + from);
+		}));
 	}
 
 	/** Whether a registered user may run the admin commands. */
@@ -1958,12 +2328,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * Logged records, sessions, and the user's bot keep the old `user_id`: a
 	 * session for it is `denied`, and the passkey signs in as the new one.
 	 */
-	private rename(socket: WebSocketConnection, request: RequestFrame, roomId: string, from: string, to: string): void {
+	private async rename(socket: WebSocketConnection, request: RequestFrame, roomId: string, from: string, to: string): Promise<void> {
 		if (from === ADMIN_USER_ID || to === ADMIN_USER_ID) throw { name: "invalid_params", message: "The admin user's user_id is fixed" } satisfies ProtocolError;
-		if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(to) || /^(guest|bot)(_|$)/i.test(to)) {
-			throw { name: "invalid_params", message: "A user_id is 1 to 64 letters, digits, _ or -, starting with a letter or digit, and not guest_ or bot_" } satisfies ProtocolError;
-		}
+		assertIssuableUserId(to);
 		const renamed = this.store.renameIdentity({ from, to, now: nowMs() });
+		await this.moveInviteToken(from, to);
 		for (const peer of this.connectionsOf(from)) {
 			const state = connectionAttachment(peer);
 			if (!state) continue;
@@ -2007,6 +2376,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 				`| SQL rows written | ${share(usage.sqlRowsWritten, daily.sqlRowsWritten)} |`,
 				`| Stored | ${mib(usage.storedBytes)} / ${mib(ACCOUNT_USAGE_POLICY.storedBytes)} |`,
 			);
+			const r2 = ACCOUNT_USAGE_POLICY.r2;
+			if (r2 && usage.r2) {
+				lines.push(
+					`| R2 Class A operations | ${share(usage.r2.classAOperations, r2.classAOperationsMonthly / 31)} |`,
+					`| R2 Class B operations | ${share(usage.r2.classBOperations, r2.classBOperationsMonthly / 31)} |`,
+					`| R2 stored | ${mib(usage.r2.storedBytes)} / ${mib(r2.storedBytes)} |`,
+				);
+			}
 			const monthly = ACCOUNT_USAGE_POLICY.monthly;
 			if (monthly && usage.month) {
 				const month = usage.month;
@@ -2022,6 +2399,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 					`| SQL rows written | ${share(month.sqlRowsWritten, monthly.sqlRowsWritten)} |`,
 					`| Log events | ${share(month.logEvents, monthly.logEvents)} |`,
 				);
+				if (r2 && month.r2) {
+					lines.push(
+						`| R2 Class A operations | ${share(month.r2.classAOperations, r2.classAOperationsMonthly)} |`,
+						`| R2 Class B operations | ${share(month.r2.classBOperations, r2.classBOperationsMonthly)} |`,
+					);
+				}
 			}
 		} else {
 			lines.push("**Cloudflare account**: no usage sample; set `ACCOUNT_ID` and `ACCOUNT_ANALYTICS_TOKEN` to read it.");
@@ -2108,7 +2491,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const members = new Map<string, PublicUser[]>();
 		for (const roomId of new Set(roomIds)) {
 			const users = new Map<string, PublicUser>();
-			for (const member of stored.get(roomId) ?? []) users.set(member.user_id, { user_id: member.user_id, name: member.name });
+			for (const member of stored.get(roomId) ?? []) users.set(member.user_id, member);
 			for (const member of connected.get(roomId) ?? []) if (!users.has(member.user_id)) users.set(member.user_id, member);
 			members.set(roomId, sortedUsers(users.values()));
 		}
@@ -2133,7 +2516,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const members = new Map<string, Map<string, PublicUser>>();
 		for (const peer of this.ctx.getWebSockets()) {
 			const state = connectionAttachment(peer as WebSocketConnection);
-			const identity = state && !state.closing ? publicIdentity(state) : null;
+			const identity = state && !state.closing ? currentUser(state) : null;
 			if (!identity) continue;
 			for (const roomId of state!.rooms ?? []) {
 				let listed = members.get(roomId);
@@ -2185,7 +2568,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * everyone else who shares one of `rooms` with the user. Joins and leaves
 	 * are memberships, never `user` notifications (§4.3.2).
 	 */
-	private announceUser(origin: WebSocketConnection | null, identity: { user_id: string; name?: string } | null, rooms: readonly string[], old?: { user_id: string; name?: string } | null): void {
+	private announceUser(origin: WebSocketConnection | null, identity: PublicUser | null, rooms: readonly string[], old?: { user_id: string; name?: string } | null): void {
 		if (!identity) return;
 		const shared = new Set(rooms);
 		for (const peer of this.ctx.getWebSockets()) {
@@ -2352,6 +2735,113 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * (§3.4): a moved message's snapshot reaches both rooms' members in one
 	 * frame, delivered once per connection (section 3.5).
 	 */
+	/**
+	 * A result with each new upload's `write_url` (§4.6.3) signed in place of
+	 * the `write` the store keeps, so a retry signs the same URL.
+	 */
+	private async withWriteUrls(result: Record<string, unknown>): Promise<Record<string, unknown>> {
+		const uploads = this.config.uploads;
+		if (!uploads || !Array.isArray(result.embeds)) return result;
+		const embeds = await Promise.all(result.embeds.map(async (embed: unknown) => {
+			if (!embed || typeof embed !== "object") return embed;
+			const { write, ...rest } = embed as Record<string, unknown>;
+			const grant = write as { key?: unknown; max_bytes?: unknown; expires_ms?: unknown } | undefined;
+			if (!grant || typeof grant.key !== "string" || typeof grant.max_bytes !== "number" || typeof grant.expires_ms !== "number") return embed;
+			const token = await signUploadToken(uploads.signingKey, { key: grant.key, maxBytes: grant.max_bytes, expiresMs: grant.expires_ms });
+			return { ...rest, write_url: `${uploads.publicOrigin}/w/${token}` };
+		}));
+		return { ...result, embeds };
+	}
+
+	/** Deletes the R2 objects an operation released and notes new write deadlines; returns whether any upload started. */
+	private afterUploads(result: Pick<StoreMutationResult, "uploads" | "deletedUploads">): boolean {
+		this.deleteMedia(result.deletedUploads ?? []);
+		let started = false;
+		for (const upload of result.uploads ?? []) {
+			const due = upload.writeExpiresMs + UPLOAD_WRITE_GRACE_MS;
+			this.uploadDeadline = this.uploadDeadline === undefined ? due : Math.min(this.uploadDeadline, due);
+			started = true;
+		}
+		return started;
+	}
+
+	/** Deletes R2 objects after the response; a failure leaves them to the bucket's lifecycle rules. */
+	private deleteMedia(keys: readonly string[]): void {
+		const media = this.runtimeEnv.MEDIA;
+		if (!media || !keys.length) return;
+		for (let start = 0; start < keys.length; start += 1_000) {
+			this.ctx.waitUntil(media.delete(keys.slice(start, start + 1_000)).catch(() => undefined));
+		}
+	}
+
+	/**
+	 * Writes a signed-in user's avatar again when it nears its expiry, which
+	 * restarts the bucket's lifecycle clock for it: an avatar lasts while its
+	 * owner keeps signing in. One whose object is already gone is removed.
+	 */
+	private refreshAvatar(userId: string): void {
+		const media = this.runtimeEnv.MEDIA;
+		if (!this.config.uploads || !media) return;
+		this.ctx.waitUntil((async () => {
+			const key = this.store.avatarRefreshDue(userId, nowMs());
+			if (!key) return;
+			const object = await media.get(key);
+			if (!object) {
+				const cleared = this.store.clearAvatar({ userId, now: nowMs() });
+				if (cleared.changed) this.announceAvatar(userId, "");
+				return;
+			}
+			await media.put(key, await object.arrayBuffer(), { httpMetadata: object.httpMetadata });
+			this.store.renewAvatar({ userId, key, now: nowMs() });
+		})().catch(() => undefined));
+	}
+
+	/**
+	 * A user's avatar changed (§4.6.6): their connections keep it, they get
+	 * `user` `you`, and those who share a room with them `user` `new`. An empty
+	 * `avatar` announces a removed one.
+	 */
+	private announceAvatar(userId: string, avatar: string): void {
+		const connections = this.connectionsOf(userId);
+		for (const peer of connections) {
+			const state = connectionAttachment(peer);
+			if (!state) continue;
+			setAvatar(state, avatar);
+			writeAttachment(peer, state);
+		}
+		const connected = connections.length ? connectionAttachment(connections[0]) : null;
+		const stored = connected ? null : this.store.getIdentity(userId);
+		const name = connected?.name ?? stored?.name;
+		const rooms = this.liveRoomsOf(userId) ?? stored?.rooms ?? [];
+		this.announceUser(null, { user_id: userId, ...(name ? { name } : {}), avatar }, rooms);
+	}
+
+	/**
+	 * Called by the entry Worker before it stores a write (§4.6.3): whether
+	 * this upload is waiting for one. Only one request may write it.
+	 */
+	async claimUpload(key: string): Promise<boolean> {
+		return !!this.config.uploads && this.store.claimUpload(key, nowMs());
+	}
+
+	/**
+	 * Called by the entry Worker when a claimed write finished or failed
+	 * (§4.6.3). A file's message gets its new snapshot; an avatar becomes its
+	 * owner's. Returns whether the write was accepted; if not, the Worker
+	 * deletes what it stored.
+	 */
+	async finishUpload(write: UploadWrite): Promise<boolean> {
+		if (!this.config.uploads) return false;
+		let finished: UploadFinish = { accepted: false, broadcasts: [], deletedUploads: [] };
+		await this.runMutation(async () => {
+			finished = this.store.finishUpload(write, nowMs());
+			for (const record of finished.broadcasts) this.broadcastRecord(record);
+		});
+		this.deleteMedia(finished.deletedUploads);
+		if (finished.avatar) this.announceAvatar(finished.avatar.userId, finished.avatar.url);
+		return finished.accepted;
+	}
+
 	private broadcastRecord(record: Broadcast): void {
 		this.deliver({ method: record.method, params: record.params }, record.rooms);
 	}
@@ -2400,6 +2890,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 					.filter((value): value is number => value !== undefined);
 				for (const value of due) deadline = deadline === undefined ? value : Math.min(deadline, value);
 			}
+			if (this.uploadDeadline !== undefined) deadline = deadline === undefined ? this.uploadDeadline : Math.min(deadline, this.uploadDeadline);
 			await this.store.scheduleAlarm(deadline, nowMs());
 			this.alarmKnown = true;
 		});

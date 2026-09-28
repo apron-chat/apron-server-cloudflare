@@ -19,6 +19,12 @@ bindings = [
 tag = "v1"
 new_sqlite_classes = ["ApronDemoServer"]
 
+# Uploads (src/budget.ts): images in R2, on only with MEDIA_ORIGIN,
+# PUBLIC_ORIGIN, and the UPLOAD_SIGNING_KEY secret set (tests set all three).
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "apron-media-dev"
+
 [vars]
 RP_ID = "localhost"
 RP_ORIGINS = "http://localhost:5173,http://localhost:8787"

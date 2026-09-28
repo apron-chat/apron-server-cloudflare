@@ -93,6 +93,12 @@ export const PAID_PLAN: Plan = Object.freeze({
 			logEvents: 20_000_000,
 		}),
 		monthlyStopRatio: 0.5,
+		// R2's free tier, which covers uploads (below): billed past it too.
+		r2: Object.freeze({
+			classAOperationsMonthly: 1_000_000,
+			classBOperationsMonthly: 10_000_000,
+			storedBytes: 10 * 1024 * 1024 * 1024,
+		}),
 	}),
 	edgeStop: Object.freeze({
 		// Legitimate traffic is a few hundred requests a day in all, so 20 a
@@ -105,6 +111,22 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// Long enough for analytics to show the flood, so the guard's daily or
 		// monthly stop takes over before the hold ends.
 		holdSeconds: 30 * 60,
+	}),
+	// Images kept in R2 and served from its public bucket domain. At most 500
+	// uploads a day are about 16,000 writes a month (1 million free), and the
+	// stored-bytes cap keeps storage at half the free 10 GB-month whatever the
+	// mix of sizes: 500 full-size images a day for a week would be 17.5 GB.
+	uploads: Object.freeze({
+		maxFileBytes: 5 * 1024 * 1024,
+		maxAvatarBytes: 256 * 1024,
+		uploadsPerDay: 500,
+		uploadsPerUserDay: 20,
+		writeWindowSeconds: 10 * 60,
+		fileRetentionSeconds: 7 * 24 * 60 * 60,
+		avatarRetentionSeconds: 30 * 24 * 60 * 60,
+		avatarRefreshSeconds: 7 * 24 * 60 * 60,
+		lifecycleLagSeconds: 24 * 60 * 60,
+		storedBytesCap: 5 * 1024 * 1024 * 1024,
 	}),
 	features: Object.freeze({
 		// Typing costs about 5 frames a typing minute, inside the frame budget.

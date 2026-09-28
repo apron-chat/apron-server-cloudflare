@@ -18,6 +18,9 @@ function usage(workerRequests = 1) {
 			monthWorkers: [{ sum: { requests: workerRequests, cpuTimeUs: 1 } }],
 			monthInvocations: [{ sum: { requests: 1 } }],
 			monthPeriodic: [{ sum: { duration: 1, rowsRead: 1, rowsWritten: 1 } }],
+			r2Operations: [],
+			r2Storage: [],
+			monthR2Operations: [],
 		}] } },
 	};
 }

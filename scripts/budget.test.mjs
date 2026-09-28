@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ADMISSION_BUDGET, DEFAULT_LIMITS } from '../src/budget.ts';
-import { renderBinding, renderEdgeRules, replaceBinding, validateAdmission, validateDeploymentConfiguration, validateEdgeStop } from './budget.mjs';
+import { mediaHostname, renderBinding, renderEdgeRules, replaceBinding, validateAdmission, validateDeploymentConfiguration, validateEdgeStop } from './budget.mjs';
 
 test('changed admission limits propagate to both Worker and optional edge policy', () => {
 	const changed = { ...ADMISSION_BUDGET, requestsPerIpMinute: 25, edgeRequestsPerIpWindow: 20 };
@@ -118,4 +118,32 @@ test('a plan with an edge stop also generates the sampled flood counter', () => 
 	assert.doesNotMatch(renderBinding('123'), /FLOOD_WATCH/);
 	assert.throws(() => validateEdgeStop({ ...edgeStop, floodSampleEvery: 7 }), /whole number/);
 	assert.throws(() => validateEdgeStop({ ...edgeStop, holdSeconds: 0 }));
+});
+
+test('with uploads, write URLs pass the invalid-request rule and the budget stop covers the media host', () => {
+	const plain = renderEdgeRules('chat.example.test');
+	assert.doesNotMatch(plain.custom.rules[0].expression, /\/w\//);
+	const edge = renderEdgeRules('chat.example.test', ADMISSION_BUDGET, 'media.example.test');
+	assert.match(edge.custom.rules[0].expression, /^\(http\.host eq "chat\.example\.test"\) and not \(http\.request\.method in \{"PUT" "OPTIONS"\} and starts_with\(http\.request\.uri\.path, "\/w\/"\)\) and /);
+	assert.equal(edge.custom.rules[1].expression, 'http.host eq "chat.example.test"');
+	assert.deepEqual(edge.custom.rules.map((rule) => rule.ref), ['apron_invalid_request', 'apron_admission_off', 'apron_media_invalid', 'apron_budget_stop']);
+	assert.match(edge.custom.rules[2].expression, /^\(http\.host eq "media\.example\.test"\) and \(not http\.request\.method in \{"GET" "HEAD"\} or http\.request\.uri\.query ne ""/);
+	assert.equal(edge.custom.rules[2].enabled, true);
+	assert.equal(edge.custom.rules[3].expression, 'http.host in {"chat.example.test" "media.example.test"}');
+	assert.equal(mediaHostname('MEDIA_ORIGIN = "https://media.example.test"\n'), 'media.example.test');
+	assert.equal(mediaHostname('MEDIA_ORIGIN = "http://media.example.test"\n'), undefined);
+});
+
+test('a plan with uploads requires the bucket binding and both origins', () => {
+	const packageJson = { scripts: { deploy: 'npm run budget:check && wrangler deploy --config wrangler.production.toml' } };
+	const workflow = '      - run: npm run deploy\n';
+	const development = 'name = "apron-cloudflare-demo-dev"\n';
+	const base = 'name = "apron-cloudflare-demo"\nworkers_dev = false\npreview_urls = false\nroutes = [{ pattern = "server.apron.chat", custom_domain = true }]\n';
+	const vars = '[vars]\nMEDIA_ORIGIN = "https://media.apron.chat"\nPUBLIC_ORIGIN = "https://server.apron.chat"\n';
+	const bucket = '[[r2_buckets]]\nbinding = "MEDIA"\nbucket_name = "apron-media"\n';
+	const check = (production) => validateDeploymentConfiguration({ development, production, packageJson, workflow, uploads: true });
+	assert.doesNotThrow(() => check(base + vars + bucket));
+	assert.throws(() => check(base + vars), /MEDIA bucket/);
+	assert.throws(() => check(base + bucket + '[vars]\nPUBLIC_ORIGIN = "https://server.apron.chat"\n'), /MEDIA_ORIGIN/);
+	assert.throws(() => check(base + bucket + '[vars]\nMEDIA_ORIGIN = "https://media.apron.chat"\n'), /PUBLIC_ORIGIN/);
 });

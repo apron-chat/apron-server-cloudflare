@@ -106,13 +106,16 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   the account-usage stop does (above).
 - While usage has reached 90% of any daily share, or `monthlyStopRatio` (one
   half) of any monthly allowance, it turns on the zone custom rule
-  `apron_budget_stop`, which blocks `server.apron.chat` at the edge. Blocked
+  `apron_budget_stop`, which blocks `server.apron.chat` (and, with uploads,
+  `media.apron.chat`) at the edge. Blocked
   requests never invoke the Worker and are not billed. It turns the rule off
   once usage is back under every allowance: at the next UTC day for a daily
   share, or the next month for a monthly one. It touches no other rule, so
   `apron_admission_off` stays yours to use by hand.
 - The monthly allowances are Worker requests, Worker CPU, Durable Object
-  requests and duration, SQL rows read and written, and Workers Logs events.
+  requests and duration, SQL rows read and written, and Workers Logs events,
+  plus R2's free tier for uploads: Class A and Class B operations (each day
+  also stopping at a 31st of the month) and 10 GB stored.
   A billing cycle overlaps at most two calendar months, so stopping each month
   at one half keeps any cycle inside the included usage.
 - If usage or the rule cannot be read, the rule keeps its state and the guard
@@ -172,8 +175,79 @@ What the guard cannot promise:
   Worker's usage but blocks only this server. Another Worker reachable on
   `workers.dev` or preview URLs, where zone WAF rules do not apply, can still
   run up the bill; turn those off for Workers that do not need them.
-- **Other products** on the account (R2, KV, Queues, and so on) are not
+- **The public bucket.** Upload views go straight to R2's public domain,
+  not through the Worker, so the flood trip does not see them. A flood of
+  requests for images not in Cloudflare's cache, such as made-up keys, is
+  billed as R2 Class B reads ($0.36 a million) past the free 10 million a
+  month, until the minute guard's analytics show it: about $2.60 at 10,000
+  requests a second, or about $26 at 100,000, for two six-minute windows.
+  `apron_media_invalid` blocks query strings, other methods, and paths
+  outside `f/` and `a/`, so cached images cannot be bypassed.
+- **Other products** on the account (KV, Queues, and so on) are not
   measured.
+
+## Uploads
+
+With the Workers Paid budgets, registered users attach images to messages
+and set avatars (protocol §4.6, cap `embed:upload`; see
+[SPEC section 4.3](../SPEC.md#43-uploads-and-avatars)). The plan's `uploads`
+in `src/plans/paid.ts` sets the limits:
+
+| Setting | Value |
+| --- | ---: |
+| `maxFileBytes` | 5 MB |
+| `maxAvatarBytes` | 256 KB |
+| `uploadsPerDay` (server-wide, avatars included) | 500 |
+| `uploadsPerUserDay` | 20 |
+| `writeWindowSeconds` | 10 minutes |
+| `fileRetentionSeconds` | 7 days |
+| `avatarRetentionSeconds` | 30 days |
+| `avatarRefreshSeconds` | 7 days |
+| `lifecycleLagSeconds` | 1 day |
+| `storedBytesCap` | 5 GB |
+
+Uploads are off until all of these are set:
+
+1. **Bucket.** Create an R2 bucket named `apron-media` (the `MEDIA` binding
+   in `wrangler.production.toml`). Deploying fails while it does not exist.
+2. **Lifecycle rules.** On the bucket, delete objects with prefix `f/` 7 days
+   after upload and prefix `a/` 30 days after upload. They must match
+   `fileRetentionSeconds` and `avatarRetentionSeconds`.
+3. **Public domain.** Connect the custom domain `media.apron.chat` to the
+   bucket (bucket Settings, Custom Domains), and keep its `r2.dev` URL
+   disabled, since WAF rules do not apply there.
+4. **Cache.** Add a Cache Rule for `media.apron.chat` marking requests
+   eligible for cache and respecting the origin's cache headers, and turn on
+   Smart Tiered Cache. Object keys have no file extension, which Cloudflare
+   does not cache by default; without the rule every view is a billed R2 read.
+5. **Signing key.** `openssl rand -base64 48 | npx wrangler secret put
+   UPLOAD_SIGNING_KEY --config wrangler.production.toml`. Rotating it
+   invalidates `write_url`s already issued, nothing else.
+6. **Edge rules.** Update `apron_invalid_request` and `apron_budget_stop`,
+   and create `apron_media_invalid`, from
+   [the generated definitions](edge-rules.generated.json). The old
+   `apron_invalid_request` blocks `write_url` requests.
+
+An admin can turn uploads off and on again with `/toggle uploads`, without a
+deploy: new connections stop being offered `embed:upload`, and new
+attachments and avatars are refused until it is turned back on.
+
+`MEDIA_ORIGIN` (`https://media.apron.chat`) and `PUBLIC_ORIGIN`
+(`https://server.apron.chat`, where `write_url`s point) are Wrangler vars;
+`npm run deploy` refuses a plan with uploads that lacks them or the bucket
+binding.
+
+**Cost bounds.** At the caps, uploads stay within R2's free tier:
+
+| Resource | Worst case | Free tier |
+| --- | --- | --- |
+| Storage | 5 GB (the byte cap, including a day of lifecycle lag) | 10 GB-month |
+| Class A (writes, avatar refreshes) | about 16,000 uploads and a few thousand refreshes a month | 1 million a month |
+| Class B (views that miss the cache) | about once per object per data center | 10 million a month |
+
+Upload writes and their claims use the Worker and Durable Object allowances
+above: two Durable Object requests and one Worker request each, at most
+500 a day. Deletes are free.
 
 ## Runtime overrides
 
@@ -244,9 +318,12 @@ and recalibrating its resource model.
 | `RP_ORIGINS` | Comma-separated exact WebAuthn origins; required explicitly with wildcard guest admission; never accepts wildcards |
 | `ALLOWED_ORIGINS` | Exact browser-origin allowlist, or standalone `*` to admit every guest origin (including opaque/missing Origin); cannot mix `*` with explicit origins; all clients remain subject to quotas |
 | `RP_NAME` | Bounded display name for browser passkey prompts |
-| `ACTIVITY` | `true` advertises and relays typing (cap `activity`, section 4.2 of the spec); `false` turns it off. Unset, the plan decides: on for Workers Paid, off for Free. Read cursors are never kept |
+| `ACTIVITY` | `true` advertises and relays typing (cap `activity`, section 4.2 of the spec); `false` turns it off. Unset, the plan decides: on for Workers Paid, off for Free. An admin's `/toggle activity` overrides it until toggled back. Read cursors are never kept |
 | `GUEST_POSTING` | `true` lets guests post, react, join and leave rooms, and create threads under the guest quotas; default off in both plans, so guests only list rooms and read history until they sign in with a passkey. Announced as `ext.demo.guest_posting` |
-| `APRON_ADMIN_TOKEN` | Optional fixed bearer token, 24 to 256 of `A-Z a-z 0-9 - _` and not starting `apron_bot_`: `auth` with `scheme: "token"` and this token signs in as the registered user `admin` ("Admin"), from any origin and without a passkey, created on first use (a registration against the usual caps). That user is always an admin and can run `/admin <user_id>`, `/kick <user_id>`, `/rename <old_user_id> <new_user_id>` and `/status` (see [SPEC section 5, Admins](../SPEC.md#admins)). Unset by default. Anyone holding it can act as the admin, so set it only as a secret, never a Wrangler var in source: `npx wrangler secret put APRON_ADMIN_TOKEN --config wrangler.production.toml`. It persists across deploys; delete it with `npx wrangler secret delete APRON_ADMIN_TOKEN --config wrangler.production.toml` to turn it off. A malformed value makes every request fail its configuration check. Locally, use `npx wrangler dev --var APRON_ADMIN_TOKEN:…` or `.dev.vars` |
+| `APRON_ADMIN_TOKEN` | Optional fixed bearer token, 24 to 256 of `A-Z a-z 0-9 - _` and not starting `apron_bot_` or `apron_invite_`: `auth` with `scheme: "token"` and this token signs in as the registered user `admin` ("Admin"), from any origin and without a passkey, created on first use (a registration against the usual caps). That user is always an admin and can run the admin commands (`/admin`, `/kick`, `/rename`, `/invite-token`, `/purge`, `/toggle` and `/status`; see [SPEC section 5, Admins](../SPEC.md#admins)). Unset by default. Anyone holding it can act as the admin, so set it only as a secret, never a Wrangler var in source: `npx wrangler secret put APRON_ADMIN_TOKEN --config wrangler.production.toml`. It persists across deploys; delete it with `npx wrangler secret delete APRON_ADMIN_TOKEN --config wrangler.production.toml` to turn it off. A malformed value makes every request fail its configuration check. Locally, use `npx wrangler dev --var APRON_ADMIN_TOKEN:…` or `.dev.vars` |
+| `MEDIA_ORIGIN` | Exact https origin where the upload bucket serves objects, such as `https://media.apron.chat`; with `PUBLIC_ORIGIN`, `UPLOAD_SIGNING_KEY` and the `MEDIA` binding, turns uploads on for a plan that has them |
+| `PUBLIC_ORIGIN` | This Worker's exact public origin, which `write_url`s point at |
+| `UPLOAD_SIGNING_KEY` | Secret of at least 32 characters that signs `write_url`s; set with `npx wrangler secret put UPLOAD_SIGNING_KEY --config wrangler.production.toml` |
 | `ADMISSION_OFF` | Operator admission switch; `true` rejects new sockets in the entry Worker before the limiter or DO call; existing sockets remain subject to DO budgets |
 | `ENVIRONMENT` | Set to `development` to enable local origin defaults when `ALLOWED_ORIGINS` and `RP_ORIGINS` are omitted |
 | `NODE_ENV` | Set to `test` to enable the same local origin defaults for tests; production-like deployments must configure origins explicitly |

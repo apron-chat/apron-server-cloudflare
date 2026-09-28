@@ -3,7 +3,8 @@
 The demo speaks Apron protocol **6**, advertising `history`, `edit`, `rooms`,
 `reactions`, and `command`, and `server.ping` (45 seconds). `activity`
 (typing) is on with the Workers Paid budgets and off with the Free ones;
-`ACTIVITY` overrides either (see [plans](configuration.md#plans)). History availability uses each room's `latest_log_id` and
+`ACTIVITY` overrides either (see [plans](configuration.md#plans)), and admins
+can turn it off and on with `/toggle activity`. History availability uses each room's `latest_log_id` and
 nullable `history_log_id`, without extension negotiation. See
 [history and recovery](https://github.com/shazow/apron/blob/main/PROTOCOL.md#41-history) and the
 [retention implementation specification](../SPEC.md#9-rolling-history-and-base-protocol-availability).
@@ -56,7 +57,18 @@ within it:
   neither kept nor relayed. `away` is accepted and ignored: the demo has no push.
 - Commands: `/help` replies with a `@private` notice listing the commands the
   sender may run; `/invite-bot` gives a registered user a bot token (below);
-  other commands are `invalid_params`.
+  `/avatar` sets one with an attached image (below); other commands are
+  `invalid_params`.
+- Uploads (cap `embed:upload`, Workers Paid budgets): registered users attach
+  images as `upload` embeds, written to the `write_url` in their result and
+  served from the media domain once finished (see
+  [SPEC section 4.3](../SPEC.md#43-uploads-and-avatars)). Only PNG, JPEG, GIF,
+  and WebP are kept, at most 5 MB each (avatars 256 KB), 20 a day per user and
+  500 a day in all. Images last a week and avatars a month; an avatar lasts
+  while its owner keeps signing in. Every embed gets an `embed_id`, and saves
+  keep embeds by it. Admins can turn uploads off and on with
+  `/toggle uploads`. Clients should resize images and strip their metadata
+  (such as location) before uploading: the server stores the bytes as sent.
 - Messages: a request without `room_id` is in `general`. A new message with
   empty text and no embeds is not logged and returns `{}`; an empty save is
   `invalid_params` (delete instead). `body.mentions` is stored as sent, and
@@ -82,8 +94,9 @@ within it:
   Free budgets). Past that,
   requests get `retry_after` and notifications are dropped; sockets stay open.
 - `me` renames registered users only; given fields replace, omitted ones stay,
-  and `name: ""` removes the name (announced as `name: ""`). `avatar` and `ext`
-  are ignored. A rename sends `user` notifications to the user's other
+  and `name: ""` removes the name (announced as `name: ""`). With uploads,
+  `avatar: ""` removes the avatar; other `avatar` values and `ext` are
+  ignored. A rename sends `user` notifications to the user's other
   connections and to users who share a room with them, as does signing in on
   a guest's connection (`new` with the retired guest as `old`). History pages
   carry no `users`: records keep the names they were logged with, and

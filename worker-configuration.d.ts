@@ -10,6 +10,10 @@ declare global {
 		ACCOUNT_ANALYTICS_TOKEN?: string;
 		ZONE_ID?: string;
 		EDGE_STOP_TOKEN?: string;
+		MEDIA?: R2Bucket;
+		MEDIA_ORIGIN?: string;
+		PUBLIC_ORIGIN?: string;
+		UPLOAD_SIGNING_KEY?: string;
 		ASSETS?: Fetcher;
 		ALLOWED_ORIGINS?: string;
 		RP_ID?: string;
@@ -28,6 +32,10 @@ declare global {
 			ACCOUNT_ANALYTICS_TOKEN?: string;
 			ZONE_ID?: string;
 			EDGE_STOP_TOKEN?: string;
+			MEDIA?: R2Bucket;
+			MEDIA_ORIGIN?: string;
+			PUBLIC_ORIGIN?: string;
+			UPLOAD_SIGNING_KEY?: string;
 			ASSETS?: Fetcher;
 			ALLOWED_ORIGINS?: string;
 			RP_ID?: string;

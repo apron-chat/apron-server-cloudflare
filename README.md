@@ -17,6 +17,9 @@ for a zero-overage deployment.
   reactions.
 - **Guests and passkeys.** Anyone can read as a guest; sign in with a passkey
   to post, and run `/invite-bot` to get a token for your own bot.
+- **Images and avatars.** Signed-in users attach images and set avatars
+  (`embed:upload`), stored in R2 within its free tier for a week (avatars a
+  month).
 - **Bring your own frontend.** Guest connections are accepted from any
   origin — even `localhost` or a browser console.
 - **Built to stay inside its plan.** Every operation is metered against
