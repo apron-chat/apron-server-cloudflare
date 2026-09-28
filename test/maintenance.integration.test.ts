@@ -54,7 +54,9 @@ it("keeps an early authentication alarm cheap while cleanup is not due", async (
 });
 
 it("keeps a full day of empty hourly cleanups below one deletion batch", async () => {
-	await withStore("idle-day", {}, (store, clock, state) => {
+	await withStore("idle-day", { cleanupIntervalMs: 3_600_000 }, (store, clock, state) => {
+		// The object seeded its first deadline with the plan's interval; start there.
+		clock.value = store.runCleanup(clock.value).next_due_ms - 3_600_000;
 		const before = store.storageAccounting();
 		// Stay inside the seeded general record's retention window: this test
 		// measures idle hours, not the one expiry of that bootstrap record.

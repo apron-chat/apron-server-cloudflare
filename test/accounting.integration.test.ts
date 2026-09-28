@@ -4,6 +4,9 @@ import { Store, StoreError, defaultStoreConfig } from '../src/store';
 import { DEFAULT_LIMITS } from '../src/budget';
 import { expectRetryAfter, messagesOf } from './helpers/store';
 
+// A day's retention with hourly cleanup, for tests that watch records expire.
+const ONE_DAY_RETENTION = { retentionMs: 86_400_000, cleanupIntervalMs: 3_600_000 };
+
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
@@ -156,7 +159,7 @@ describe('measured storage accounting', () => {
 		const stub = env.DEMO.getByName('accounting-three-days-v1');
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, defaultStoreConfig(), clock);
+			const store = new Store(state, defaultStoreConfig(ONE_DAY_RETENTION), clock);
 			store.initialize();
 			const base = clock.now();
 			const { costs: operationCosts, measure } = costLog(store);
@@ -603,6 +606,7 @@ describe('measured storage accounting', () => {
 			// particular mutation-cost constant.
 			foregroundReadsPerDay: 1_000,
 			foregroundWritesPerDay: 1_000,
+			...ONE_DAY_RETENTION,
 		});
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());

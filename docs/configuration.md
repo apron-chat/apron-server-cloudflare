@@ -16,7 +16,9 @@ The paid plan starts from the free one and raises only what Paid's included
 usage pays for, sized against its monthly allowances divided by 31 days with
 headroom. Paid includes 16 times the SQL rows written and 160 times the rows
 read, so the SQL ceilings rise tenfold, and posts, registrations, admissions,
-history pages, and member listings with them. It includes only a third of
+history pages, and member listings with them. History is kept 7 days instead
+of 24 hours, matching uploaded images, with daily cleanup; the database
+watermarks rise to 768 MiB (1 GiB hard), a fifth of the 5 GB-month included. It includes only a third of
 Free's Durable Object requests (1 million a month against 100,000 a day), so
 the frame budgets rise by half and connection limits stay. The header of
 `src/plans/paid.ts` gives the worst case of each allowance.
@@ -306,7 +308,7 @@ IP's minute), per-type throttles 60/minute, frame blocks
 20 frames (and one block per anonymous connection must fit the IP's frame
 minute), `room_list` registered members 200 per room, guest-number blocks
 10,000 numbers, SQL writes 800,000/day, SQL reads 30,000,000/day,
-database high-water 96 MiB and hard target 128 MiB, cleanup 100 records,
+database high-water 768 MiB and hard target 1 GiB, cleanup 100 records,
 thread rooms 100 with 2 KiB of client fields, reactions 64 users per message
 and 16 emoji per user, and credentials/challenges 16 KiB. Operators
 may lower these values but cannot raise them without changing the implementation
@@ -396,8 +398,8 @@ The numeric rows are grouped by their unit and enforcement scope:
 
 | Variable | Workers Paid default | Workers Free, where different |
 | --- | ---: | ---: |
-| `retentionSeconds` | 86400 |  |
-| `cleanupSeconds` | 3600 |  |
+| `retentionSeconds` | 604800 | 86400 |
+| `cleanupSeconds` | 86400 | 3600 |
 | `challengeTtlSeconds` | 120 |  |
 | `maxFrameBytes` | 16384 |  |
 | `maxTextBytes` | 4096 |  |
@@ -454,9 +456,9 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `maintenanceWritesPerDay` | 100000 | 20000 |
 | `foregroundReadsPerDay` | 25000000 | 2500000 |
 | `maintenanceReadsPerDay` | 5000000 | 500000 |
-| `databaseHighWaterBytes` | 100663296 |  |
-| `databaseHardTargetBytes` | 134217728 |  |
-| `databaseResumeLowWaterBytes` | 83886080 |  |
+| `databaseHighWaterBytes` | 805306368 | 100663296 |
+| `databaseHardTargetBytes` | 1073741824 | 134217728 |
+| `databaseResumeLowWaterBytes` | 671088640 | 83886080 |
 | `cleanupBatch` | 100 |  |
 | `threadLimit` | 100 |  |
 | `threadMetadataBytes` | 2048 |  |

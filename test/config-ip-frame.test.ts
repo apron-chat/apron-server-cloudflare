@@ -113,7 +113,7 @@ describe('configuration policy boundaries', () => {
 	});
 
 	it('rejects resource ceilings and per-scope counter inversions', () => {
-		expect(() => config({}, { databaseHighWaterBytes: 97 * 1024 * 1024 })).toThrow(ConfigError);
+		expect(() => config({}, { databaseHighWaterBytes: DEFAULT_LIMITS.databaseHighWaterBytes + 1 })).toThrow(ConfigError);
 		expect(() => config({}, { framesPerConnectionMinute: 61, framesPerIpMinute: 60 })).toThrow(ConfigError);
 		expect(() => config({}, { openConnections: 11, connectionsPerIp: 12 })).toThrow(ConfigError);
 		expect(() => config({}, { registrationsPerDay: DEFAULT_LIMITS.registrationsPerDay + 1 })).toThrow(ConfigError);

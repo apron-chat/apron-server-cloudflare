@@ -62,7 +62,9 @@ function pressureMessage(now: number, requestId: string) {
 
 it('stops growth near the hard target, reuses pages without VACUUM, and resumes below low-water after restart', async () => {
 	const stub = env.DEMO.getByName('storage-pressure-boundary-v1');
-	const config = defaultStoreConfig();
+	// The Free plan's watermarks: the mechanism, not the plan's size, is under
+	// test, and filling a larger database would take minutes.
+	const config = { ...defaultStoreConfig(), storageLowWaterBytes: 80 * MIB, storageHighWaterBytes: 96 * MIB, storageHardTargetBytes: 128 * MIB };
 	const result = await runInDurableObject(stub, async (_instance, state) => {
 		const sql = state.storage.sql as unknown as CalibrationSql;
 		const store = new Store(state, config, { now: () => Date.now() + 86_400_000 });
