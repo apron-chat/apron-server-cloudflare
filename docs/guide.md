@@ -170,7 +170,7 @@ The first invite counts as a registration. See [SPEC section 5](../SPEC.md#bots)
 This repository runs one: the [Announce workflow](../.github/workflows/announce.yml)
 posts each pull request merged into `main` to `general`, with a link preview
 (`og` title, description, and site name) built from the pull request, using
-[`scripts/announce-pr.mjs`](../scripts/announce-pr.mjs). Set the
+the [apron-pr-bot](https://github.com/apron-chat/apron-pr-bot) action. Set the
 `APRON_BOT_TOKEN` secret of the `announce` environment to a token from
 `/invite-bot` to turn it on; without the secret the job succeeds without
 posting. Set the environment's `APRON_ROOM_ID` variable to post in a room

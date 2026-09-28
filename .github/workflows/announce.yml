@@ -5,9 +5,9 @@ name: Announce
 # announce environment. Without that secret the job succeeds without posting.
 # The environment's optional APRON_ROOM_ID variable picks another room.
 #
-# pull_request_target runs this workflow and script as they are on main, with
-# secrets, even for pull requests from forks. It never checks out or runs the
-# pull request's head: the event's text reaches the script only as JSON data.
+# pull_request_target runs this workflow with secrets, even for pull requests
+# from forks. The apron-pr-bot action never checks out or runs the pull
+# request's head: the event's text reaches it only as JSON data.
 on:
   pull_request_target:
     types: [closed]
@@ -25,19 +25,9 @@ jobs:
     # name it can read.
     environment: announce
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: apron-chat/apron-pr-bot@main
         with:
-          ref: ${{ github.event.pull_request.base.ref }}
-          persist-credentials: false
-          sparse-checkout: |
-            .node-version
-            scripts/announce-pr.mjs
-          sparse-checkout-cone-mode: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
-        with:
-          node-version-file: .node-version
-      - run: node scripts/announce-pr.mjs
-        env:
-          APRON_BOT_TOKEN: ${{ secrets.APRON_BOT_TOKEN }}
+          server-url: wss://server.apron.chat/
+          token: ${{ secrets.APRON_BOT_TOKEN }}
           # Optional; the room to post in, `general` when unset.
-          APRON_ROOM_ID: ${{ vars.APRON_ROOM_ID }}
+          room-id: ${{ vars.APRON_ROOM_ID }}
