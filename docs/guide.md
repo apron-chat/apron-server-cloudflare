@@ -171,11 +171,10 @@ This repository runs one: the [Announce workflow](../.github/workflows/announce.
 posts each pull request merged into `main` to `general`, with a link preview
 (`og` title, description, and site name) built from the pull request, using
 [`scripts/announce-pr.mjs`](../scripts/announce-pr.mjs). Set the
-`APRON_BOT_TOKEN` secret of the `server.apron.chat` environment (or of the
-repository) to a token from `/invite-bot` to turn it
-on; without the secret the job succeeds without posting. Rerunning
-the job for the same pull request within the deduplication window does not
-post it twice.
+`APRON_BOT_TOKEN` secret of the `announce` environment to a token from
+`/invite-bot` to turn it on; without the secret the job succeeds without
+posting. Rerunning the job for the same pull request within the deduplication
+window does not post it twice.
 
 ## User-visible policies
 
