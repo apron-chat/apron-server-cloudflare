@@ -21,6 +21,11 @@ export function oneLine(text, max) {
 	return points.length > max ? `${points.slice(0, max - 1).join('').trimEnd()}…` : line;
 }
 
+/** `text` with the characters that could start inline markdown escaped. */
+export function escapeMarkdown(text) {
+	return text.replace(/[\\`*_[\]<>~|&!]/g, '\\$&');
+}
+
 /** The first paragraph of markdown `text` that is not only headings, or ''. */
 export function firstParagraph(text) {
 	const paragraphs = String(text ?? '').replace(/<!--[\s\S]*?-->/g, ' ').split(/\n\s*\n/);
@@ -41,8 +46,8 @@ export function announcement(pr, repo, roomId = DEFAULT_ROOM) {
 	return {
 		room_id: roomId,
 		body: {
-			text: `Merged into ${base}: ${oneLine(pr.title, 256)} (${repo}#${pr.number} by ${author})\n${pr.html_url}`,
-			format: 'plain',
+			text: `Merged into ${base}: **${escapeMarkdown(oneLine(pr.title, 256))}** by ${escapeMarkdown(author)}\n\n<${pr.html_url}>`,
+			format: 'markdown',
 			embeds: [{
 				kind: 'link',
 				url: pr.html_url,

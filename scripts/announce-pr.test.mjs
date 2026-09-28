@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { announcement, firstParagraph, oneLine } from './announce-pr.mjs';
+import { announcement, escapeMarkdown, firstParagraph, oneLine } from './announce-pr.mjs';
 
 const pr = {
 	number: 12,
@@ -19,8 +19,8 @@ const pr = {
 test('announces a merged pull request with a link preview', () => {
 	const params = announcement(pr, 'apron-chat/apron-server-cloudflare');
 	assert.equal(params.room_id, 'general');
-	assert.equal(params.body.format, 'plain');
-	assert.equal(params.body.text, `Merged into main: Announce merged pull requests (apron-chat/apron-server-cloudflare#12 by shazow)\n${pr.html_url}`);
+	assert.equal(params.body.format, 'markdown');
+	assert.equal(params.body.text, `Merged into main: **Announce merged pull requests** by shazow\n\n<${pr.html_url}>`);
 	assert.deepEqual(params.body.embeds, [{
 		kind: 'link',
 		url: pr.html_url,
@@ -52,4 +52,10 @@ test('describes a pull request by its first paragraph of text', () => {
 	assert.equal(firstParagraph('#hashtag start\n\nnext'), '#hashtag start');
 	assert.equal(oneLine(firstParagraph('## Summary\r\nFirst\r\nline.\r\n\r\nLater.'), 300), 'First line.');
 	assert.equal(firstParagraph(null), '');
+});
+
+test('escapes markdown in the title and author', () => {
+	assert.equal(escapeMarkdown('Fix *all* the `code_paths` [again] <b> a|b ~x~ & !'), 'Fix \\*all\\* the \\`code\\_paths\\` \\[again\\] \\<b\\> a\\|b \\~x\\~ \\& \\!');
+	const params = announcement({ ...pr, title: '**Bold** claims', user: { login: 'dependabot[bot]' } }, 'o/r');
+	assert.equal(params.body.text, `Merged into main: **\\*\\*Bold\\*\\* claims** by dependabot\\[bot\\]\n\n<${pr.html_url}>`);
 });
