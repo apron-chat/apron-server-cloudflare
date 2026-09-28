@@ -181,7 +181,7 @@ deduplication window does not post it twice.
 
 Only the last 7 days of records (messages, reactions, room changes, and
 registered users' memberships) are retained, 24 hours on Workers Free. Cleanup
-every 6 hours (hourly on Free) normally exposes 7 days to 7 days 6 hours; quota exhaustion may
+once a day (hourly on Free) normally exposes 7 to 8 days; quota exhaustion may
 delay physical deletion. The `general` room ID and the log head never rotate.
 Recent edits can keep old messages visible. Rooms keep their current record
 after its log entry expires; a thread room whose whole log has expired is

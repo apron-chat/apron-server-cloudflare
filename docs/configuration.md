@@ -17,7 +17,7 @@ usage pays for, sized against its monthly allowances divided by 31 days with
 headroom. Paid includes 16 times the SQL rows written and 160 times the rows
 read, so the SQL ceilings rise tenfold, and posts, registrations, admissions,
 history pages, and member listings with them. History is kept 7 days instead
-of 24 hours, matching uploaded images, with cleanup every 6 hours; the database
+of 24 hours, matching uploaded images, with daily cleanup; the database
 watermarks rise to 768 MiB (1 GiB hard), a fifth of the 5 GB-month included. It includes only a third of
 Free's Durable Object requests (1 million a month against 100,000 a day), so
 the frame budgets rise by half and connection limits stay. The header of
@@ -399,7 +399,7 @@ The numeric rows are grouped by their unit and enforcement scope:
 | Variable | Workers Paid default | Workers Free, where different |
 | --- | ---: | ---: |
 | `retentionSeconds` | 604800 | 86400 |
-| `cleanupSeconds` | 21600 | 3600 |
+| `cleanupSeconds` | 86400 | 3600 |
 | `challengeTtlSeconds` | 120 |  |
 | `maxFrameBytes` | 16384 |  |
 | `maxTextBytes` | 4096 |  |

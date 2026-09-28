@@ -380,7 +380,7 @@ it("finishes removing an expired thread room after a saturated batch", async () 
 	await withStore("thread-expiry-saturated", { ...ROOMY, retentionMs: 60_000, cleanupBatch: 2, maxThreads: 1 }, (store, clock) => {
 		const threadId = String(store.mutate(op(clock, "thread", "room_set", { parent_room_id: "general", title: "T" })).result.room_id);
 		// Past the first cleanup deadline; everything is older than retention.
-		clock.value += 7 * 60 * 60_000;
+		clock.value += 25 * 60 * 60_000;
 		const removed: string[] = [];
 		for (let run = 0; run < 8; run += 1) {
 			const result = store.runCleanup(clock.value);

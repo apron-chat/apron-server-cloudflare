@@ -23,8 +23,8 @@
 //   the 12,900 daily share, so duration cannot run over.
 // - Storage: history is kept 7 days, matching uploaded images, so the
 //   database watermarks rise to 768 MB (1 GB hard), a fifth of the 5 GB-month
-//   included. Cleanup runs every 6 hours; it removes the same rows a day as
-//   hourly would, in batches that continue until it is caught up.
+//   included. Cleanup runs daily; it removes the same rows a day as hourly
+//   would, in batches that continue until it is caught up.
 //
 // None of that bounds hostile traffic that never gets past the entry Worker,
 // which is billed per request. An edge block rule stops requests before they
@@ -40,7 +40,7 @@ export const PAID_PLAN: Plan = Object.freeze({
 	limits: Object.freeze({
 		...FREE_PLAN.limits,
 		retentionSeconds: 7 * 24 * 60 * 60,
-		cleanupSeconds: 6 * 60 * 60,
+		cleanupSeconds: 24 * 60 * 60,
 		historyRequestsPerUserMinute: 20,
 		historyRequestsPerIpMinute: 60,
 		anonymousPostsPerDay: 200,
