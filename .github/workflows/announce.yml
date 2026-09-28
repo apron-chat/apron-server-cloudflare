@@ -27,6 +27,7 @@ jobs:
     steps:
       - uses: apron-chat/apron-pr-bot@main
         with:
+          server-url: wss://server.apron.chat/
           token: ${{ secrets.APRON_BOT_TOKEN }}
           # Optional; the room to post in, `general` when unset.
           room-id: ${{ vars.APRON_ROOM_ID }}
