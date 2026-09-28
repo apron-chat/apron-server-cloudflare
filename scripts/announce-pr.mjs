@@ -1,7 +1,8 @@
 // Announces a merged pull request in an Apron room as a bot, with a link
 // preview (`og`) built from the pull request itself. Run by the Announce
 // workflow on `pull_request_target` `closed`; reads the event from
-// GITHUB_EVENT_PATH and the bot token from APRON_BOT_TOKEN.
+// GITHUB_EVENT_PATH and the bot token from APRON_BOT_TOKEN, and does nothing
+// when that is unset.
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
@@ -89,7 +90,11 @@ export function post(url, token, params, requestId) {
 
 async function main() {
 	const token = process.env.APRON_BOT_TOKEN;
-	if (!token) throw new Error('APRON_BOT_TOKEN is not set');
+	if (!token) {
+		// Announcing is opt-in: forks and repositories without the secret skip it.
+		console.log('::notice::APRON_BOT_TOKEN is not set; skipping the announcement.');
+		return;
+	}
 	const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
 	const pr = event.pull_request;
 	if (!pr?.merged) {
