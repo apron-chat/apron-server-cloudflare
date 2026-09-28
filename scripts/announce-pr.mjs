@@ -2,7 +2,7 @@
 // preview (`og`) built from the pull request itself. Run by the Announce
 // workflow on `pull_request_target` `closed`; reads the event from
 // GITHUB_EVENT_PATH and the bot token from APRON_BOT_TOKEN, and does nothing
-// when that is unset.
+// when that is unset. APRON_ROOM_ID picks the room (default `general`).
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
@@ -19,6 +19,11 @@ export function oneLine(text, max) {
 		.trim();
 	const points = [...line];
 	return points.length > max ? `${points.slice(0, max - 1).join('').trimEnd()}…` : line;
+}
+
+/** `text` with the characters that could start inline markdown escaped. */
+export function escapeMarkdown(text) {
+	return text.replace(/[\\`*_[\]<>~|&!]/g, '\\$&');
 }
 
 /** The first paragraph of markdown `text` that is not only headings, or ''. */
@@ -41,8 +46,8 @@ export function announcement(pr, repo, roomId = DEFAULT_ROOM) {
 	return {
 		room_id: roomId,
 		body: {
-			text: `Merged into ${base}: ${oneLine(pr.title, 256)} (${repo}#${pr.number} by ${author})\n${pr.html_url}`,
-			format: 'plain',
+			text: `Merged into ${base}: **${escapeMarkdown(oneLine(pr.title, 256))}** by ${escapeMarkdown(author)}\n\n<${pr.html_url}>`,
+			format: 'markdown',
 			embeds: [{
 				kind: 'link',
 				url: pr.html_url,
@@ -114,7 +119,7 @@ async function main() {
 	}
 	const repo = event.repository?.full_name ?? process.env.GITHUB_REPOSITORY;
 	const url = process.env.APRON_URL || DEFAULT_URL;
-	const params = announcement(pr, repo, process.env.APRON_ROOM || DEFAULT_ROOM);
+	const params = announcement(pr, repo, process.env.APRON_ROOM_ID || DEFAULT_ROOM);
 	const result = await post(url, token, params, `announce-pr-${repo}-${pr.number}`);
 	console.log(`Announced ${repo}#${pr.number} in ${params.room_id} on ${url}: ${JSON.stringify(result)}`);
 }
