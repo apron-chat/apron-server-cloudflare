@@ -2,7 +2,7 @@
 // preview (`og`) built from the pull request itself. Run by the Announce
 // workflow on `pull_request_target` `closed`; reads the event from
 // GITHUB_EVENT_PATH and the bot token from APRON_BOT_TOKEN, and does nothing
-// when that is unset.
+// when that is unset. APRON_ROOM_ID picks the room (default `general`).
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
@@ -119,7 +119,7 @@ async function main() {
 	}
 	const repo = event.repository?.full_name ?? process.env.GITHUB_REPOSITORY;
 	const url = process.env.APRON_URL || DEFAULT_URL;
-	const params = announcement(pr, repo, process.env.APRON_ROOM || DEFAULT_ROOM);
+	const params = announcement(pr, repo, process.env.APRON_ROOM_ID || DEFAULT_ROOM);
 	const result = await post(url, token, params, `announce-pr-${repo}-${pr.number}`);
 	console.log(`Announced ${repo}#${pr.number} in ${params.room_id} on ${url}: ${JSON.stringify(result)}`);
 }

@@ -173,8 +173,9 @@ posts each pull request merged into `main` to `general`, with a link preview
 [`scripts/announce-pr.mjs`](../scripts/announce-pr.mjs). Set the
 `APRON_BOT_TOKEN` secret of the `announce` environment to a token from
 `/invite-bot` to turn it on; without the secret the job succeeds without
-posting. Rerunning the job for the same pull request within the deduplication
-window does not post it twice.
+posting. Set the environment's `APRON_ROOM_ID` variable to post in a room
+other than `general`. Rerunning the job for the same pull request within the
+deduplication window does not post it twice.
 
 ## User-visible policies
 
