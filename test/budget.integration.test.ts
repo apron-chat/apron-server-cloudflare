@@ -55,8 +55,8 @@ it('persists an overrun stop across object eviction', async () => {
 		state.storage.transactionSync(() => {
 			for (let index = 1; index <= 100; index += 1) {
 				state.storage.sql.exec(
-					`INSERT INTO rooms (room_id, parent_room_id, created_log_id, record_log_id, latest_log_id, intro_message_id, fields_json, created_ms, updated_ms)
-					 VALUES (?, 'general', ?, ?, ?, NULL, ?, ?, ?)`,
+					`INSERT INTO rooms (room_id, parent_room_id, created_log_id, record_log_id, latest_log_id, fields_json, created_ms, updated_ms)
+					 VALUES (?, 'general', ?, ?, ?, ?, ?, ?)`,
 					`budget-thread-${index}`, index, index, index, JSON.stringify({ title: `Thread ${index}` }), now, now,
 				);
 			}

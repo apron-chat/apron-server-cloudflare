@@ -384,7 +384,7 @@ describe('uploads end to end', () => {
 		const admin = await connect(null);
 		await admin.next();
 		expect((await request(admin, 'auth', 'auth', { scheme: 'token', token: ADMIN_TOKEN })).result.you.user_id).toBe('admin');
-		const notice = (skipped: Frame[]) => skipped.find((frame) => frame.params?.from?.user_id === '@private')!.params.body.text;
+		const notice = (skipped: Frame[]) => skipped.find((frame) => frame.params?.from?.user_id === '~private')!.params.body.text;
 		const toggle = (id: string) => exchange(admin, id, 'command', { room_id: 'general', body: { text: '/toggle uploads' } });
 		try {
 			const off = await toggle('off');
@@ -411,7 +411,7 @@ describe('uploads end to end', () => {
 		const admin = await connect(null);
 		await admin.next();
 		expect((await request(admin, 'auth', 'auth', { scheme: 'token', token: ADMIN_TOKEN })).result.you.user_id).toBe('admin');
-		const notice = (skipped: Frame[]) => skipped.find((frame) => frame.params?.from?.user_id === '@private')!.params.body.text;
+		const notice = (skipped: Frame[]) => skipped.find((frame) => frame.params?.from?.user_id === '~private')!.params.body.text;
 		const toggle = (id: string) => exchange(admin, id, 'command', { room_id: 'general', body: { text: '/toggle activity' } });
 		const guests = async () => {
 			const alice = await connect();
@@ -454,7 +454,7 @@ describe('uploads end to end', () => {
 			const url = (await until(spammer, isMessage(frame.result.message_id))).frame.params.body.embeds[0].url;
 			const purged = await exchange(admin, 'purge', 'command', { room_id: 'general', body: { text: `/purge @${userId}` } });
 			expect(purged.frame.result).toEqual({});
-			expect(purged.skipped.find((candidate) => candidate.params?.from?.user_id === '@private')!.params.body.text).toBe(`Purged \`${userId}\`: 1 message, 0 reaction sets, 1 upload.`);
+			expect(purged.skipped.find((candidate) => candidate.params?.from?.user_id === '~private')!.params.body.text).toBe(`Purged \`${userId}\`: 1 message, 0 reaction sets, 1 upload.`);
 			await expect.poll(() => spammer.closed()?.code).toBe(1008);
 			await expect.poll(async () => await media().head(url.slice('https://media.test/'.length))).toBeNull();
 			const history = await request(admin, 'history', 'history', { room_id: 'general', limit: 50 });

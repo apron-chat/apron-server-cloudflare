@@ -44,7 +44,7 @@ const connect = ({ ip = `192.0.2.${nextIp++}`, ...options }: Partial<ConnectOpti
 
 async function authenticate(peer: Peer, scheme = 'guest', extraCaps: string[] = []) {
 	const { server } = await greeting(peer);
-	expect(server.params.protocol).toBe(6);
+	expect(server.params.protocol).toBe(7);
 	expect(server.params.caps).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload']);
 	expect(server.params.auth).toContain('webauthn');
 	expect(server.params.ping).toBe(45);
@@ -346,12 +346,13 @@ it('creates threads with room_set, delivers only to joined rooms, and moves mess
 
 		// Creating a thread joins its creator: `joined` before the result, and
 		// `updated` to the parent's other members, who are not joined.
-		alice.send({ id: 'thread', method: 'room_set', params: { parent_room_id: 'general', title: 'Deploy', intro_message: { message_id: messageId } } });
+		// A v6 `intro_message` is an unknown field now, and dropped.
+		alice.send({ id: 'thread', method: 'room_set', params: { parent_room_id: 'general', title: 'Deploy', description: 'Why the *4pm* deploy failed', intro_message: { message_id: messageId } } });
 		const created = await until(alice, (frame) => frame.id === 'thread');
 		const roomId = created.frame.result.room_id;
 		const room = {
 			room_id: roomId, log_id: roomId, parent_room_id: 'general', title: 'Deploy',
-			intro_message: original, latest_log_id: roomId, history_log_id: roomId,
+			description: 'Why the *4pm* deploy failed', latest_log_id: roomId, history_log_id: roomId,
 		};
 		// `joined` carries the members, bare, and their current objects in
 		// `users`; a guest's join is not logged, so no membership follows.
@@ -403,7 +404,7 @@ it('creates threads with room_set, delivers only to joined rooms, and moves mess
 
 		// Joining: `joined`, with the members after the join, before `{}`.
 		const members = [aliceId, bobId].sort((a, b) => a.user_id < b.user_id ? -1 : 1);
-		const joinedRoom = { ...room, intro_message: moved, latest_log_id: followed.log_id, members: members.map((member) => ({ user_id: member.user_id })) };
+		const joinedRoom = { ...room, latest_log_id: followed.log_id, members: members.map((member) => ({ user_id: member.user_id })) };
 		const joined = await exchange(bob, 'join', 'room_join', { room_id: roomId });
 		expect(joined.frame.result).toEqual({});
 		expect(joined.skipped).toEqual([{ method: 'room_update', params: { joined: [joinedRoom], users: members } }]);
@@ -417,8 +418,9 @@ it('creates threads with room_set, delivers only to joined rooms, and moves mess
 		const renamedReply = await until(bob, (frame) => frame.id === 'rename');
 		expect(renamedReply.frame.result).toEqual({ room_id: roomId });
 		const renamed = renamedReply.skipped.find((frame) => frame.method === 'room_update')!.params.updated[0];
+		// A save replaces every client field: the description is gone.
 		expect(renamed).toMatchObject({ room_id: roomId, parent_room_id: 'general', title: 'Deploys' });
-		expect(renamed.intro_message).toBeUndefined();
+		expect(renamed.description).toBeUndefined();
 		expect((await until(alice, (frame) => frame.method === 'room_update')).frame.params).toEqual({ updated: [renamed] });
 
 		// Now a member, Bob receives the thread's messages.
@@ -519,10 +521,10 @@ it('with ACTIVITY on, relays typing to room members, accepts away, throttles per
 		// Ten per minute in total: the first, then nine of the eleven.
 		expect(relayed.map((frame) => frame.params.typing)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8]);
 		const mine = await until(alice, (frame) => frame.id === 'after');
-		const notices = mine.skipped.filter((frame) => frame.method === 'message' && frame.params.from?.user_id === '@private');
+		const notices = mine.skipped.filter((frame) => frame.method === 'message' && frame.params.from?.user_id === '~private');
 		expect(notices).toHaveLength(1);
 		// A private notice is never logged: no message_id or log_id (Appendix A.1).
-		expect(notices[0].params).toEqual({ room_id: 'general', from: { user_id: '@private', name: 'System message to you' }, body: { text: expect.stringContaining('Typing'), format: 'plain' } });
+		expect(notices[0].params).toEqual({ room_id: 'general', from: { user_id: '~private', name: 'System message to you' }, body: { text: expect.stringContaining('Typing'), format: 'plain' } });
 		expect(mine.skipped.filter((frame) => frame.method === 'activity')).toEqual([]);
 		expect((await drain(carol)).filter((frame) => frame.method === 'activity')).toEqual([]);
 		const history = await request(alice, 'history', 'history', { room_id: 'general', limit: 50 });
@@ -541,7 +543,7 @@ it('answers /help with a private notice and rejects other commands without closi
 		const notices = [...help.skipped, ...(await drain(peer))].filter((frame) => frame.method === 'message');
 		expect(notices).toHaveLength(1);
 		expect(notices[0].params).toEqual({
-			room_id: 'general', from: { user_id: '@private', name: 'System message to you' },
+			room_id: 'general', from: { user_id: '~private', name: 'System message to you' },
 			body: { text: '- `/help`: list the commands you can use here', format: 'markdown' },
 		});
 		// Mistyped commands are ordinary errors, not policy violations.
@@ -725,6 +727,39 @@ it('advertises the demo policy hints', async () => {
 	} finally { peer.close(); }
 });
 
+it('speaks protocol v7: a sign-in welcome, no email sign-in, and ~private notices', async () => {
+	const withPasskeys = await connect();
+	const bot = await connect({ origin: null });
+	try {
+		const { server, welcome } = await greeting(withPasskeys);
+		expect(server.params).toMatchObject({ protocol: 7, name: 'apron-cloudflare-demo/7', auth: ['webauthn', 'token', 'guest'] });
+		// `server.welcome` is for the sign-in screen (§3.2), worded for this origin.
+		expect(server.params.welcome).toMatch(/Create a passkey/);
+		expect(server.params.welcome).toContain(`kept for ${Math.round(DEFAULT_LIMITS.retentionSeconds / 86_400)} days`);
+		expect(welcome.params.from).toEqual({ user_id: '~private', name: 'System message to you' });
+		const other = (await greeting(bot)).server.params;
+		expect(other.auth).toEqual(['token', 'guest']);
+		expect(other.welcome).toMatch(/Passkeys work on the demo's own site/);
+	} finally { withPasskeys.close(); bot.close(); }
+});
+
+it('rejects private rooms as unsupported, since every room here is visible to everyone', async () => {
+	const alice = await connect();
+	try {
+		await authenticate(alice);
+		const refused = await request(alice, 'private', 'room_set', { parent_room_id: 'general', title: 'Secret', private: true });
+		expect(refused.error.code).toBe(-32601);
+		// Nothing was created, and a room made without `private` carries none.
+		const created = await exchange(alice, 'public', 'room_set', { parent_room_id: 'general', title: 'Open', private: false });
+		expect(created.skipped.find((frame) => frame.method === 'room_update')!.params.joined[0]).not.toHaveProperty('private');
+		// A thread's description reaches its members and its parent's through room_update `updated`.
+		const roomId = created.frame.result.room_id;
+		const saved = await exchange(alice, 'describe', 'room_set', { room_id: roomId, title: 'Open', description: 'Now **described**' });
+		expect(saved.skipped.find((frame) => frame.method === 'room_update')!.params.updated[0]).toMatchObject({ room_id: roomId, description: 'Now **described**' });
+		expect(alice.closed()).toBeUndefined();
+	} finally { alice.close(); }
+});
+
 it('links message snapshots to the previous one with prev_log_id, and never reaction sets', async () => {
 	const alice = await connect();
 	try {
@@ -842,7 +877,7 @@ it('sends the notifications a request causes on its connection before its result
 		const join = await exchange(alice, 'join', 'room_join', { room_id: roomId });
 		expect(join.skipped.map((frame) => Object.keys(frame.params))).toEqual([['joined', 'users']]);
 		const help = await exchange(alice, 'help', 'command', { body: { text: '/help' } });
-		expect(help.skipped).toEqual([{ method: 'message', params: expect.objectContaining({ from: { user_id: '@private', name: 'System message to you' } }) }]);
+		expect(help.skipped).toEqual([{ method: 'message', params: expect.objectContaining({ from: { user_id: '~private', name: 'System message to you' } }) }]);
 	} finally { alice.close(); }
 });
 

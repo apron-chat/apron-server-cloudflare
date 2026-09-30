@@ -84,7 +84,7 @@ interface ConnectionAttachment {
 	frameTimes: number[];
 	/** Per-type throttle events from this connection, oldest first (budget.ts). */
 	throttles?: Partial<Record<ThrottledType, number[]>>;
-	/** When this connection last got a `@private` throttle notice, per type. */
+	/** When this connection last got a `~private` throttle notice, per type. */
 	notices?: Partial<Record<ThrottledType, number>>;
 	/** Frames this connection has already reserved and not yet spent, for one UTC day. */
 	frameLease?: { day: string; remaining: number };
@@ -107,8 +107,13 @@ interface ConnectionAttachment {
 type ThrottledType = "activity" | "room_list";
 const THROTTLED_TYPES: readonly ThrottledType[] = ["activity", "room_list"];
 const THROTTLE_WINDOW_MS = 60_000;
-/** The system identity for notices to one user only, never logged (Appendix A.1). */
-const PRIVATE_IDENTITY = { user_id: "@private", name: "System message to you" } as const;
+/**
+ * The system identity for notices to one connection only, never logged
+ * (Appendix A.1). Protocol v7 prefixes system identities with `~`; no user
+ * can hold such an id (guest, passkey, bot, and admin-issued ids all start
+ * with a letter or digit, and `auth` never honors a requested `user_id`).
+ */
+const PRIVATE_IDENTITY = { user_id: "~private", name: "System message to you" } as const;
 /**
  * The liveness ping clients send every `server.ping` seconds, byte for byte,
  * and its answer (§1). The runtime answers it without waking the object.
@@ -532,11 +537,17 @@ function identityOf(attachment: ConnectionAttachment): IdentityShape | null {
 	return { user_id: attachment.userId, ...(attachment.name ? { name: attachment.name } : {}), tier: attachment.tier };
 }
 
-/** A user object as this server sends it (§3.3): `user_id` and `name`. */
-type PublicUser = { user_id: string; name?: string; avatar?: string };
+/**
+ * A user object as this server sends it (§3.3): `user_id` and `name`, and in
+ * current objects `avatar` and `roles`.
+ */
+type PublicUser = { user_id: string; name?: string; avatar?: string; roles?: string[] };
 
-/** A room in a listing, with `members` when asked for (§4.3.1). */
-type ListedRoom = RoomRecord & { members?: Array<{ user_id: string }> };
+/**
+ * A room in a listing, with `members` when asked for (§4.3.1), and
+ * `member_count` when `members` leaves some out.
+ */
+type ListedRoom = RoomRecord & { members?: Array<{ user_id: string }>; member_count?: number };
 
 /** A `room_list` result (§4.3.1). */
 interface ListingResult {
@@ -741,6 +752,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private guestNext = 0;
 	private guestLimit = 0;
+	/**
+	 * The users `/admin` listed, read once per wake for `roles` and admin
+	 * checks, and kept current by `/admin`, `/rename`, and `/purge`, the only
+	 * changes to the list; undefined until read.
+	 */
+	private adminIds?: Set<string>;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -969,8 +986,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return {
 			method: "server",
 			params: {
-				protocol: 6,
-				name: "apron-cloudflare-demo/6",
+				protocol: 7,
+				name: "apron-cloudflare-demo/7",
 				caps: [
 					"history", "edit", "rooms", "reactions", "command",
 					...(this.activityOn() ? ["activity"] : []),
@@ -978,7 +995,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 				],
 				// Passkeys and their session tokens only where passkeys are offered;
 				// bot tokens (`/invite-bot`) from anywhere, since bots are not browsers.
-				auth: origin !== null && this.config.rpOrigins.includes(origin) ? ["webauthn", "token", "guest"] : ["token", "guest"],
+				// No `email`: the demo has no way to send mail.
+				auth: this.passkeysOffered(origin) ? ["webauthn", "token", "guest"] : ["token", "guest"],
+				// For the sign-in screen (§3.2); the `~private` welcome below goes in a room.
+				welcome: this.signInWelcome(origin),
 				// Answered by the runtime without waking the object (see PING_REQUEST).
 				ping: limits.pingSeconds,
 				ext: {
@@ -1006,13 +1026,30 @@ export class ApronDemoServer extends DurableObject<Env> {
 		};
 	}
 
-	/** The `@private` welcome for a server whose guests only read, worded for what this origin can sign in with. */
-	/** The `@private` welcome; where guests only read, it says so (Appendix B). */
+	/** Whether this origin is offered passkeys (§4.9) and their session tokens. */
+	private passkeysOffered(origin: string | null): boolean {
+		return origin !== null && this.config.rpOrigins.includes(origin);
+	}
+
+	/**
+	 * `server.welcome` (§3.2): how this demo's sign-in schemes fit together,
+	 * for the sign-in screen, worded for what this origin can sign in with.
+	 */
+	private signInWelcome(origin: string | null): string {
+		const days = Math.max(1, Math.round(this.config.limits.retentionSeconds / 86_400));
+		const history = `Messages are kept for ${days === 1 ? "a day" : `${days} days`}.`;
+		const guests = this.config.guestPosting ? "Guests can post under a new name each visit." : "Guests can read along.";
+		const signIn = this.passkeysOffered(origin)
+			? "**Create a passkey** to post, react, and start threads; it signs you in on your next visit too."
+			: "Passkeys work on the demo's own site; here, sign in with a bot token from `/invite-bot` there, or an invite token from an admin.";
+		return `**Apron public demo.** ${guests} ${signIn} Bots sign in with a token their owner gets from \`/invite-bot\`. ${history}`;
+	}
+
+	/** The `~private` welcome, after the `server` frame; where guests only read, it says so (Appendix B). */
 	private welcome(origin: string | null): Record<string, unknown> {
 		const lines = [`Welcome to Apron Chat. Server version: \`${this.serverVersion()}\``];
 		if (!this.config.guestPosting) {
-			const passkeys = origin !== null && this.config.rpOrigins.includes(origin);
-			lines.push(passkeys
+			lines.push(this.passkeysOffered(origin)
 				? "Guests can read. *Sign in with passkey* to participate."
 				: "Guests can read. *Sign in with passkey* on the demo's own site, or use a bot token from `/invite-bot` there, to participate.");
 		}
@@ -1237,7 +1274,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// A guest auth on an authenticated connection changes nothing: answer it
 		// without charging an attempt.
 		if (request.params.scheme === "guest" && (attachment.tier === "anonymous" || attachment.tier === "registered")) {
-			this.reply(socket, request, { you: currentUser(attachment) });
+			this.reply(socket, request, { you: this.current(attachment) });
 			return;
 		}
 		this.store.reserveAuthAttempt({ ipKey: attachment.ipKey, now: nowMs() });
@@ -1255,7 +1292,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			attachment.rooms = [...DEFAULT_JOINED_ROOMS];
 			delete attachment.listedJoined;
 			writeAttachment(socket, attachment);
-			this.reply(socket, request, { you: currentUser(attachment) });
+			this.reply(socket, request, { you: this.current(attachment) });
 			await this.rescheduleAlarm();
 			return;
 		}
@@ -1340,8 +1377,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.rooms = this.registeredRooms(socket, finished.identity.user_id);
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
-		this.reply(socket, request, { you: currentUser(attachment), token });
-		if (guest) this.announceUser(socket, currentUser(attachment), [...guestRooms, ...attachment.rooms], guest);
+		this.reply(socket, request, { you: this.current(attachment), token });
+		if (guest) this.announceUser(socket, this.current(attachment), [...guestRooms, ...attachment.rooms], guest);
 		this.refreshAvatar(finished.identity.user_id);
 		await this.rescheduleAlarm();
 	}
@@ -1440,8 +1477,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
-		this.reply(socket, request, { you: currentUser(attachment), token });
-		if (guest) this.announceUser(socket, currentUser(attachment), [...guestRooms, ...attachment.rooms], guest);
+		this.reply(socket, request, { you: this.current(attachment), token });
+		if (guest) this.announceUser(socket, this.current(attachment), [...guestRooms, ...attachment.rooms], guest);
 		this.refreshAvatar(identity.userId);
 		await this.rescheduleAlarm();
 	}
@@ -1517,8 +1554,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
-		this.reply(socket, request, { you: currentUser(attachment) });
-		if (guest) this.announceUser(socket, currentUser(attachment), [...guestRooms, ...attachment.rooms], guest);
+		this.reply(socket, request, { you: this.current(attachment) });
+		if (guest) this.announceUser(socket, this.current(attachment), [...guestRooms, ...attachment.rooms], guest);
 		this.refreshAvatar(identity.userId);
 		await this.rescheduleAlarm();
 	}
@@ -1667,7 +1704,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * users may change their name; `name: ""` removes it, so the user falls
 	 * back to `user_id`. With uploads, `avatar: ""` removes a registered user's
 	 * avatar; a new one comes only through `/avatar` (§4.6.6), so other values
-	 * are declined, as is `ext`.
+	 * are declined, as is `ext`. `roles` is not settable (§3.3) and is ignored.
 	 */
 	private async handleMe(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		const identity = identityOf(attachment);
@@ -1684,7 +1721,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (name === undefined) {
 			const current = connectionAttachment(socket) ?? attachment;
-			this.reply(socket, request, { you: removeAvatar ? { ...currentUser(current), avatar: "" } : currentUser(current) });
+			this.reply(socket, request, { you: removeAvatar ? { ...this.current(current), avatar: "" } : this.current(current) });
 			return;
 		}
 		if (attachment.tier !== "registered") {
@@ -1713,7 +1750,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const current = connectionAttachment(socket);
 			if (!current) return;
 			// A removed name is announced as its empty value (§3.3).
-			const you = current.name ? publicIdentity(current) : { user_id: identity.user_id, name: "" };
+			const you = this.withRoles(current.name ? publicIdentity(current)! : { user_id: identity.user_id, name: "" });
 			this.reply(socket, request, { you });
 			// Section 3.3: `you` to the user's other connections, `new` to those who share a room with the user.
 			if (!result.deduplicated) this.announceUser(socket, you, current.rooms ?? []);
@@ -1800,7 +1837,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (result.created) {
 					this.setRooms(identity.user_id, [...(this.liveRoomsOf(identity.user_id) ?? []), room.room_id]);
 					// A new room's only member is its creator: no storage to read.
-					const creator = currentUser(attachment)!;
+					const creator = this.current(attachment)!;
 					this.sendToUser(identity.user_id, this.joinedUpdate(room, [creator]));
 					if (result.membership) this.broadcastRecord(result.membership);
 					this.deliver(roomUpdate("updated", room), scope, (state) => state.userId !== identity.user_id);
@@ -1820,28 +1857,35 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * included. Then the user's connections get `room_update` `joined` with
 	 * the room's members, and then the result. A guest's join lives in its
 	 * connection and is not logged. Joining a room already joined logs
-	 * nothing and re-sends `joined` to this connection only.
+	 * nothing and re-sends `joined` to this connection only. With another
+	 * user's `user_id`, it adds that user (see addMember).
 	 */
 	private async handleRoomJoin(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		const identity = identityOf(attachment);
 		if (!identity) throw { name: "denied", message: "Authenticate before joining rooms" } satisfies ProtocolError;
 		this.assertMayWrite(attachment);
 		const roomId = requiredString(request.params, "room_id");
+		const target = optionalString(request.params, "user_id");
 		const known = this.store.getRoom(roomId, nowMs());
 		this.noteRoom(roomId, known !== null);
 		if (!known) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
+		if (target !== undefined && target !== identity.user_id) {
+			await this.addMember(socket, attachment, request, known, target);
+			return;
+		}
 		// The members before the join, read before anything commits.
-		const before = this.membersOf([roomId]);
-		const joiner = currentUser(attachment)!;
+		const totals = new Map<string, number>();
+		const before = this.membersOf([roomId], totals);
+		const joiner = this.current(attachment)!;
 		const current = attachment.rooms ?? [];
 		if (current.includes(roomId)) {
-			this.send(socket, this.joinedUpdate(known, before.get(roomId), joiner));
+			this.send(socket, this.joinedUpdate(known, before.get(roomId), joiner, totals.get(roomId)));
 			this.reply(socket, request, {});
 			return;
 		}
 		if (identity.tier !== "registered") {
 			this.setRooms(identity.user_id, [...current, roomId]);
-			this.sendToUser(identity.user_id, this.joinedUpdate(known, before.get(roomId), joiner));
+			this.sendToUser(identity.user_id, this.joinedUpdate(known, before.get(roomId), joiner, totals.get(roomId)));
 			this.reply(socket, request, {});
 			return;
 		}
@@ -1849,7 +1893,46 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const change = this.store.changeMembership({ userId: identity.user_id, ipKey: attachment.ipKey, roomId, join: true, now: nowMs() });
 			this.setRooms(identity.user_id, change.rooms);
 			if (change.membership) this.broadcastRecord(change.membership);
-			this.sendToUser(identity.user_id, this.joinedUpdate(change.room ?? known, before.get(roomId), joiner));
+			this.sendToUser(identity.user_id, this.joinedUpdate(change.room ?? known, before.get(roomId), joiner, totals.get(roomId)));
+			this.reply(socket, request, {});
+		});
+	}
+
+	/**
+	 * Whether this connection's user may add `userId` to a room or remove
+	 * them from one (§4.3.2): an admin may for anyone, and a registered user
+	 * for their own bot, say to have it keep a thread's `description` current.
+	 */
+	private assertMayManage(attachment: ConnectionAttachment, userId: string): void {
+		const owner = attachment.tier === "registered" && !isBot(attachment.userId);
+		if (owner && (userId === BOT_ID_PREFIX + attachment.userId || this.isAdmin(attachment.userId!))) return;
+		throw { name: "denied", message: "Only an admin, or a bot's owner, can add or remove someone else" } satisfies ProtocolError;
+	}
+
+	/**
+	 * `room_join` with another user's `user_id` (§4.3.2): an admin, or the
+	 * owner of the bot named, adds a registered user to the room as if they
+	 * had joined it. The join is stored and logged, charged to the adder's
+	 * posting limits, and its membership goes to the room's members; the
+	 * added user's connections then get `room_update` `joined`. Guests' rooms
+	 * live in their own connections, so they are not added. A user already
+	 * in the room changes nothing.
+	 */
+	private async addMember(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, room: RoomRecord, userId: string): Promise<void> {
+		this.assertMayManage(attachment, userId);
+		if (!this.store.identityExists(userId)) throw { name: "invalid_params", message: `${userId} is not a registered user`.slice(0, 200) } satisfies ProtocolError;
+		const totals = new Map<string, number>();
+		const before = this.membersOf([room.room_id], totals);
+		await this.runMutation(async () => {
+			const change = this.store.changeMembership({ userId, ipKey: attachment.ipKey, roomId: room.room_id, join: true, now: nowMs(), actorId: attachment.userId });
+			if (change.changed) {
+				this.setRooms(userId, change.rooms);
+				if (change.membership) this.broadcastRecord(change.membership);
+				const peer = this.connectionsOf(userId)[0];
+				const state = peer ? connectionAttachment(peer) : null;
+				const joiner = state ? this.current(state) : null;
+				if (joiner) this.sendToUser(userId, this.joinedUpdate(change.room ?? room, before.get(room.room_id), joiner, totals.get(room.room_id)));
+			}
 			this.reply(socket, request, {});
 		});
 	}
@@ -1860,14 +1943,25 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * included. Then the user's connections stop receiving the room's
 	 * deliveries and get `room_update` `left`, and then the result. The room
 	 * stays visible and can be joined again. Leaving a room not joined
-	 * changes nothing.
+	 * changes nothing. With another user's `user_id`, an admin or the bot's
+	 * owner removes that user, as `/kick` does but without its notice.
 	 */
 	private async handleRoomLeave(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		const identity = identityOf(attachment);
 		if (!identity) throw { name: "denied", message: "Authenticate before leaving rooms" } satisfies ProtocolError;
 		this.assertMayWrite(attachment);
 		const roomId = requiredString(request.params, "room_id");
+		const target = optionalString(request.params, "user_id");
 		if (!this.roomExists(roomId)) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
+		if (target !== undefined && target !== identity.user_id) {
+			this.assertMayManage(attachment, target);
+			if (!this.store.identityExists(target) && !this.connectionsOf(target).length) {
+				throw { name: "invalid_params", message: `No user has the user_id ${target}`.slice(0, 200) } satisfies ProtocolError;
+			}
+			await this.removeMember(attachment, roomId, target);
+			this.reply(socket, request, {});
+			return;
+		}
 		const current = attachment.rooms ?? [];
 		if (!current.includes(roomId)) {
 			this.reply(socket, request, {});
@@ -1895,7 +1989,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * dropped: the demo neither keeps nor relays them. `away` is accepted and
 	 * ignored, since the demo has no push; it is never delivered. At most
 	 * `activityBroadcastsPerUserMinute` relays per user; past that the update
-	 * is dropped and the sender gets one `@private` notice per minute.
+	 * is dropped and the sender gets one `~private` notice per minute.
 	 */
 	private async handleActivity(socket: WebSocketConnection, request: RequestFrame): Promise<void> {
 		const attachment = connectionAttachment(socket);
@@ -1993,11 +2087,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (withMembers) {
 			const listed = [...(result.joined ?? []), ...(result.not_joined ?? [])];
-			const members = this.membersOf(listed.map((room) => room.room_id));
+			const totals = new Map<string, number>();
+			const members = this.membersOf(listed.map((room) => room.room_id), totals);
 			const users = new Map<string, PublicUser>();
 			for (const room of listed) {
 				const list = members.get(room.room_id) ?? [];
 				room.members = list.map((member) => ({ user_id: member.user_id }));
+				const total = totals.get(room.room_id);
+				if (total !== undefined) room.member_count = total;
 				for (const member of list) users.set(member.user_id, member);
 			}
 			result.users = sortedUsers(users.values());
@@ -2007,29 +2104,25 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Keeps a listing within the history response cap: `joined` is never
-	 * truncated, so embedded intro snapshots become bare references first,
-	 * and then, for a listing no realistic room reaches, `members` and
+	 * truncated, and every room's client fields fit in 2 KiB, so for a
+	 * listing no realistic room reaches, `members`, `member_count`, and
 	 * `users` are left out.
 	 */
 	private boundedListing(result: ListingResult): ListingResult {
 		const limit = this.config.limits.historyMaxResponseBytes;
 		const fits = () => utf8Bytes(jsonString(result)) + 1_024 <= limit;
 		if (fits()) return result;
-		const rooms = [...(result.joined ?? []), ...(result.not_joined ?? [])];
-		for (const room of rooms) {
-			const intro = room.intro_message;
-			if (intro && typeof intro.message_id === "string") room.intro_message = { message_id: intro.message_id };
+		for (const room of [...(result.joined ?? []), ...(result.not_joined ?? [])]) {
+			delete room.members;
+			delete room.member_count;
 		}
-		if (!fits()) {
-			for (const room of rooms) delete room.members;
-			delete result.users;
-		}
+		delete result.users;
 		return result;
 	}
 
 	/**
 	 * `command` (§4.8): never logged, broadcast, or saved. The demo provides
-	 * `/help`, which replies with a `@private` notice listing the commands the
+	 * `/help`, which replies with a `~private` notice listing the commands the
 	 * sender may run, `/invite-bot` for registered users, and `/admin`,
 	 * `/kick`, `/rename` and `/status` for admins. An unknown
 	 * command is an error the client shows; it is not a policy violation,
@@ -2131,7 +2224,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * `/toggle <feature>`: turns `activity` (typing) or, where configured,
 	 * `uploads` off or on for everyone, and tells the sender which with a
-	 * `@private` notice before the result (§1). Kept across restarts; toggling
+	 * `~private` notice before the result (§1). Kept across restarts; toggling
 	 * back to the deployment's default forgets the override. New connections
 	 * are offered the cap only while it is on. With activity off, typing is
 	 * no longer relayed; with uploads off, new upload embeds and `/avatar` are
@@ -2183,7 +2276,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * and everything they posted, reacted, or uploaded (Store.purgeUsers),
 	 * silently: no records announce it, so clients showing their content keep
 	 * it until they load history again. They may register a new passkey. The
-	 * sender gets a `@private` notice before the result (§1).
+	 * sender gets a `~private` notice before the result (§1).
 	 */
 	private async purge(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, target: string): Promise<void> {
 		const userId = target.replace(/^@/, "");
@@ -2203,6 +2296,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		await this.runMutation(async () => {
 			purged = this.store.purgeUsers({ userIds, now: nowMs() });
 		});
+		for (const id of userIds) this.adminIds?.delete(id);
 		this.deleteMedia(purged.deletedUploads);
 		await this.forgetTokens(userIds);
 		const uploads = purged.deletedUploads.length;
@@ -2228,7 +2322,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * `/invite-token <user_id>` (a leading `@` is allowed): creates a
 	 * registered user with no passkey (Store.createInvitedIdentity), who signs
-	 * in with the bearer token the sender gets in a `@private` notice before
+	 * in with the bearer token the sender gets in a `~private` notice before
 	 * the result (§1). A taken `user_id` is `invalid_params`. The token does
 	 * not expire; `/purge` revokes it, and `/rename` moves it.
 	 */
@@ -2268,22 +2362,65 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** Whether a registered user may run the admin commands. */
 	private isAdmin(userId: string): boolean {
-		return userId === ADMIN_USER_ID || this.store.isAdmin(userId, nowMs());
+		if (userId === ADMIN_USER_ID) return true;
+		this.adminIds ??= new Set(this.store.admins(nowMs()));
+		return this.adminIds.has(userId);
 	}
 
-	/** Sends one connection a `@private` markdown notice in a room (Appendix A.1). */
+	/**
+	 * A user's `roles` (§3.3), for display only: `admin` for those who may run
+	 * the admin commands, `bot` for bots (`/invite-bot`). Guests have none,
+	 * and need no storage read.
+	 */
+	private rolesOf(userId: string): string[] {
+		if (isBot(userId)) return ["bot"];
+		if (userId.startsWith("guest_")) return [];
+		try {
+			return this.isAdmin(userId) ? ["admin"] : [];
+		} catch {
+			// Display only: a failed read (an exhausted budget) shows no role
+			// rather than failing the sign-in or listing it decorates.
+			return [];
+		}
+	}
+
+	/** A current user object (§3.3) with the user's `roles`, when any. */
+	private withRoles<T extends PublicUser>(user: T): T {
+		const { roles: _ignored, ...rest } = user;
+		void _ignored;
+		const roles = this.rolesOf(user.user_id);
+		return (roles.length ? { ...rest, roles } : rest) as T;
+	}
+
+	/** A connection's user as a current object: `you`, `new`, and room `users` (§3.3), with roles. */
+	private current(attachment: ConnectionAttachment): PublicUser | null {
+		const user = currentUser(attachment);
+		return user && attachment.tier === "registered" ? this.withRoles(user) : user;
+	}
+
+	/** Sends one connection a `~private` markdown notice in a room (Appendix A.1). */
 	private sendNotice(socket: WebSocketConnection, roomId: string, text: string): void {
 		this.send(socket, { method: "message", params: { room_id: roomId, from: { ...PRIVATE_IDENTITY }, body: { text, format: "markdown" } } });
 	}
 
 	/**
 	 * `/admin <user_id>`: lists a registered user (not a bot or guest) as an
-	 * admin. The sender gets a `@private` notice before the result (§1).
+	 * admin. The sender gets a `~private` notice before the result (§1).
 	 */
 	private grantAdmin(socket: WebSocketConnection, request: RequestFrame, roomId: string, userId: string): void {
 		if (userId === ADMIN_USER_ID) throw { name: "invalid_params", message: "The admin user is always an admin" } satisfies ProtocolError;
 		const granted = this.store.grantAdmin({ userId, now: nowMs() });
 		const who = `**${granted.name || userId}** (\`${userId}\`)`;
+		if (granted.added) {
+			this.adminIds?.add(userId);
+			// A role change is a profile change (§3.3): `user` `you` to the new
+			// admin's connections and `new` to those who share a room with them.
+			const connected = this.connectionsOf(userId)[0];
+			const state = connected ? connectionAttachment(connected) : null;
+			const stored = state ? null : this.store.getIdentity(userId);
+			const user = state ? currentUser(state) : stored ? { user_id: userId, ...(stored.name ? { name: stored.name } : {}), ...(stored.avatar ? { avatar: stored.avatar } : {}) } : null;
+			this.announceUser(null, user, state?.rooms ?? stored?.rooms ?? []);
+		}
 		this.sendNotice(socket, roomId, granted.added ? `${who} is now an admin.` : `${who} is already an admin.`);
 		this.reply(socket, request, {});
 	}
@@ -2294,36 +2431,44 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * logged, its membership going to the room's members, and a guest's
 	 * leaves its connections. Either way the user's connections get
 	 * `room_update` `left`; they may join again. The limits charged are the
-	 * admin's. The sender gets a `@private` notice before the result (§1).
+	 * admin's. The sender gets a `~private` notice before the result (§1).
 	 */
 	private async kick(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: string): Promise<void> {
 		if (userId === attachment.userId) throw { name: "invalid_params", message: "You can't kick yourself; leave the room instead" } satisfies ProtocolError;
-		const notMember = { name: "invalid_params", message: `${userId} is not in this room`.slice(0, 200) } satisfies ProtocolError;
-		const done = () => {
-			this.sendToUser(userId, roomUpdate("left", { room_id: roomId }));
-			this.sendNotice(socket, roomId, `Removed \`${userId}\` from this room.`);
-			this.reply(socket, request, {});
-		};
+		// Thrown after the mutation: runMutation treats any other error as fatal.
+		if (!await this.removeMember(attachment, roomId, userId)) throw { name: "invalid_params", message: `${userId} is not in this room`.slice(0, 200) } satisfies ProtocolError;
+		this.sendNotice(socket, roomId, `Removed \`${userId}\` from this room.`);
+		this.reply(socket, request, {});
+	}
+
+	/**
+	 * Removes another user from a room, as if they had left it (§4.3.2), for
+	 * `/kick` and `room_leave` with a `user_id`: a registered user's leave is
+	 * stored and logged, charged to the remover's posting limits, and its
+	 * membership goes to the room's members; a connected guest's leaves its
+	 * connections. Either way the user's connections get `room_update`
+	 * `left`. Returns whether the user was in the room.
+	 */
+	private async removeMember(attachment: ConnectionAttachment, roomId: string, userId: string): Promise<boolean> {
 		if (!this.store.identityExists(userId)) {
 			// A guest's rooms live in its connections only.
 			const rooms = this.liveRoomsOf(userId);
-			if (!rooms?.includes(roomId)) throw notMember;
+			if (!rooms?.includes(roomId)) return false;
 			this.setRooms(userId, rooms.filter((id) => id !== roomId));
-			done();
-			return;
+			this.sendToUser(userId, roomUpdate("left", { room_id: roomId }));
+			return true;
 		}
 		let changed = false;
 		await this.runMutation(async () => {
 			const change = this.store.changeMembership({ userId, ipKey: attachment.ipKey, roomId, join: false, now: nowMs(), actorId: attachment.userId });
-			// Thrown after the mutation: runMutation treats any other error as fatal.
 			if (!change.changed) return;
 			changed = true;
-			// Delivered while the kicked user is still a member.
+			// Delivered while the removed user is still a member.
 			if (change.membership) this.broadcastRecord(change.membership);
 			this.setRooms(userId, change.rooms);
-			done();
+			this.sendToUser(userId, roomUpdate("left", { room_id: roomId }));
 		});
-		if (!changed) throw notMember;
+		return changed;
 	}
 
 	/**
@@ -2338,6 +2483,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (from === ADMIN_USER_ID || to === ADMIN_USER_ID) throw { name: "invalid_params", message: "The admin user's user_id is fixed" } satisfies ProtocolError;
 		assertIssuableUserId(to);
 		const renamed = this.store.renameIdentity({ from, to, now: nowMs() });
+		if (this.adminIds?.delete(from)) this.adminIds.add(to);
 		await this.moveInviteToken(from, to);
 		for (const peer of this.connectionsOf(from)) {
 			const state = connectionAttachment(peer);
@@ -2353,7 +2499,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `/status`: a `@private` notice to the sender with today's Cloudflare
+	 * `/status`: a `~private` notice to the sender with today's Cloudflare
 	 * account usage against the Free plan's daily allowance (refreshed now
 	 * when account analytics are configured, at most once a minute), and the
 	 * object's own daily reservations against their budgets.
@@ -2439,7 +2585,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `/invite-bot`: creates the sender's bot, `bot_<user_id>` named after
 	 * the sender, or renames it after the sender's current name, and mints its
 	 * bearer token. The token replaces the last one, whose connections close.
-	 * It goes to this connection only, in a `@private` notice (Appendix A.1),
+	 * It goes to this connection only, in a `~private` notice (Appendix A.1),
 	 * before the result (§1).
 	 */
 	private async inviteBot(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string): Promise<void> {
@@ -2489,17 +2635,26 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * (§4.3.1), in `user_id` order with their current objects: the registered
 	 * members stored with the room, at most `roomListMembers` per room, and
 	 * every connected user who has joined it, guests included, whose
-	 * memberships live in their connections.
+	 * memberships live in their connections. `totals` gets each room's
+	 * `member_count` (§4.3.1) where that leaves members out.
 	 */
-	private membersOf(roomIds: readonly string[]): Map<string, PublicUser[]> {
-		const stored = this.store.roomMembers(roomIds, this.config.limits.roomListMembers, nowMs());
+	private membersOf(roomIds: readonly string[], totals?: Map<string, number>): Map<string, PublicUser[]> {
+		const counts = new Map<string, number>();
+		const stored = this.store.roomMembers(roomIds, this.config.limits.roomListMembers, nowMs(), counts);
 		const connected = this.connectedMembers();
 		const members = new Map<string, PublicUser[]>();
 		for (const roomId of new Set(roomIds)) {
 			const users = new Map<string, PublicUser>();
-			for (const member of stored.get(roomId) ?? []) users.set(member.user_id, member);
+			for (const member of stored.get(roomId) ?? []) users.set(member.user_id, this.withRoles(member));
 			for (const member of connected.get(roomId) ?? []) if (!users.has(member.user_id)) users.set(member.user_id, member);
 			members.set(roomId, sortedUsers(users.values()));
+			// A room past `roomListMembers` registered members lists only some of
+			// them: the total is every stored member and every connected guest.
+			const registered = counts.get(roomId);
+			if (totals && registered !== undefined) {
+				const guests = (connected.get(roomId) ?? []).filter((member) => member.user_id.startsWith("guest_")).length;
+				if (registered + guests > users.size) totals.set(roomId, registered + guests);
+			}
 		}
 		return members;
 	}
@@ -2507,13 +2662,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * A `room_update` `joined` for one room (§4.3.3): its record with its
 	 * `members` as bare `{user_id}`, and `users`, their current objects.
-	 * `joiner` is added to the members read before the join.
+	 * `joiner` is added to the members read before the join, and to `total`,
+	 * their `member_count` when those leave some out.
 	 */
-	private joinedUpdate(room: RoomRecord, members: readonly PublicUser[] = [], joiner?: PublicUser): Record<string, unknown> {
+	private joinedUpdate(room: RoomRecord, members: readonly PublicUser[] = [], joiner?: PublicUser, total?: number): Record<string, unknown> {
 		const users = new Map(members.map((member) => [member.user_id, member]));
+		const count = total === undefined ? undefined : total + (joiner && !users.has(joiner.user_id) ? 1 : 0);
 		if (joiner) users.set(joiner.user_id, joiner);
 		const sorted = sortedUsers(users.values());
-		return { method: "room_update", params: { joined: [{ ...room, members: sorted.map((member) => ({ user_id: member.user_id })) }], users: sorted } };
+		const listed: ListedRoom = { ...room, members: sorted.map((member) => ({ user_id: member.user_id })) };
+		if (count !== undefined && count > sorted.length) listed.member_count = count;
+		return { method: "room_update", params: { joined: [listed], users: sorted } };
 	}
 
 	/** Each room's members connected now: users who have joined it, one entry each. */
@@ -2522,7 +2681,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const members = new Map<string, Map<string, PublicUser>>();
 		for (const peer of this.ctx.getWebSockets()) {
 			const state = connectionAttachment(peer as WebSocketConnection);
-			const identity = state && !state.closing ? currentUser(state) : null;
+			const identity = state && !state.closing ? this.current(state) : null;
 			if (!identity) continue;
 			for (const roomId of state!.rooms ?? []) {
 				let listed = members.get(roomId);
@@ -2574,8 +2733,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * everyone else who shares one of `rooms` with the user. Joins and leaves
 	 * are memberships, never `user` notifications (§4.3.2).
 	 */
-	private announceUser(origin: WebSocketConnection | null, identity: PublicUser | null, rooms: readonly string[], old?: { user_id: string; name?: string } | null): void {
-		if (!identity) return;
+	private announceUser(origin: WebSocketConnection | null, user: PublicUser | null, rooms: readonly string[], old?: { user_id: string; name?: string } | null): void {
+		if (!user) return;
+		// A current object (§3.3): `roles` go with every identity change.
+		const identity = user.user_id.startsWith("guest_") ? user : this.withRoles(user);
 		const shared = new Set(rooms);
 		for (const peer of this.ctx.getWebSockets()) {
 			const socket = peer as WebSocketConnection;
@@ -2698,7 +2859,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Tells a throttled sender, once per window per user, with a `@private`
+	 * Tells a throttled sender, once per window per user, with a `~private`
 	 * notice (Appendix A.1) in the room they were active in. It goes to that
 	 * connection only, is never logged, and carries no message_id or log_id.
 	 */

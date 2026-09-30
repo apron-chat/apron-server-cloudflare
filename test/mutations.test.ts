@@ -181,7 +181,7 @@ it("validates bare reply_to references across rooms", async () => {
 	await withStore("replies", (store, clock) => {
 		const root = post(store, clock, "alice", "root", { body: { text: "root" } });
 		const rootId = String(root.result.message_id);
-		const threadId = thread(store, clock, "thread", { intro_message: { message_id: rootId } });
+		const threadId = thread(store, clock, "thread", { description: "About root" });
 
 		expect(errorCode(() => post(store, clock, "alice", "bad-reply", { body: { text: "bad" }, reply_to: { message_id: "404" } }))).toBe("invalid_params");
 		expect(errorCode(() => post(store, clock, "alice", "bare-string", { body: { text: "bad" }, reply_to: rootId }))).toBe("invalid_params");
@@ -220,16 +220,17 @@ it("keeps an unchanged reply reference editable after its target expires", async
 
 it("creates only thread rooms and replaces their client fields on save", async () => {
 	await withStore("rooms", (store, clock) => {
-		const intro = post(store, clock, "alice", "intro", { body: { text: "Deploy chatter" } });
-		const introId = String(intro.result.message_id);
-
 		expect(errorCode(() => store.mutate(op(clock, "alice", "top", "room_set", { title: "Top level" })))).toBe("denied");
 		expect(errorCode(() => store.mutate(op(clock, "alice", "orphan", "room_set", { parent_room_id: "missing", title: "x" })))).toBe("invalid_params");
 		expect(errorCode(() => store.mutate(op(clock, "alice", "bad-title", "room_set", { parent_room_id: "general", title: 7 })))).toBe("invalid_params");
-		expect(errorCode(() => store.mutate(op(clock, "alice", "bad-intro", "room_set", { parent_room_id: "general", intro_message: { message_id: "404" } })))).toBe("invalid_params");
+		expect(errorCode(() => store.mutate(op(clock, "alice", "bad-description", "room_set", { parent_room_id: "general", description: { text: "x" } })))).toBe("invalid_params");
+		expect(errorCode(() => store.mutate(op(clock, "alice", "long-description", "room_set", { parent_room_id: "general", description: "x".repeat(4096) })))).toBe("too_large");
+		// No room is private here, so asking for one is unsupported (§4.3.4).
+		expect(errorCode(() => store.mutate(op(clock, "alice", "private", "room_set", { parent_room_id: "general", private: true })))).toBe("unsupported");
+		expect(errorCode(() => store.mutate(op(clock, "alice", "bad-private", "room_set", { parent_room_id: "general", private: "yes" })))).toBe("invalid_params");
 
 		const created = store.mutate(op(clock, "bob", "create", "room_set", {
-			parent_room_id: "general", title: "Deploy", intro_message: { message_id: introId }, ext: { demo: { color: "blue" } },
+			parent_room_id: "general", title: "Deploy", description: "Deploy chatter: *incidents* too", private: false, ext: { demo: { color: "blue" } },
 		}));
 		const roomId = String(created.result.room_id);
 		// Room records are not broadcast; the runtime sends room_update.
@@ -237,19 +238,21 @@ it("creates only thread rooms and replaces their client fields on save", async (
 		expect(created.created).toBe(true);
 		expect(created.room).toEqual({
 			room_id: roomId, log_id: roomId, parent_room_id: "general", title: "Deploy",
-			intro_message: intro.message,
+			description: "Deploy chatter: *incidents* too",
 			ext: { demo: { color: "blue" } },
 			latest_log_id: roomId, history_log_id: roomId,
 		});
 		expect(errorCode(() => store.mutate(op(clock, "alice", "nested", "room_set", { parent_room_id: roomId, title: "Nested" })))).toBe("denied");
 
 		// Any participant may save a thread's metadata; omitted fields are
-		// cleared, the server supplies a title, and parent_room_id is fixed.
-		const saved = store.mutate(op(clock, "alice", "save", "room_set", { room_id: roomId, parent_room_id: "elsewhere" }));
+		// cleared, the server supplies a title, and parent_room_id and
+		// private are fixed.
+		const saved = store.mutate(op(clock, "alice", "save", "room_set", { room_id: roomId, parent_room_id: "elsewhere", private: true }));
 		expect(saved.result).toEqual({ room_id: roomId });
 		expect(saved.created).toBe(false);
 		expect(saved.room).toMatchObject({ room_id: roomId, parent_room_id: "general", title: "Thread" });
-		expect(saved.room?.intro_message).toBeUndefined();
+		expect(saved.room?.description).toBeUndefined();
+		expect(saved.room).not.toHaveProperty("private");
 		expect(saved.room?.ext).toBeUndefined();
 		expect(Number(saved.room?.log_id)).toBeGreaterThan(Number(roomId));
 		expect(saved.room?.latest_log_id).toBe(saved.room?.log_id);
@@ -261,7 +264,7 @@ it("creates only thread rooms and replaces their client fields on save", async (
 		// Room records are logged in their own room.
 		const history = store.historyPage({ roomId, after: "0", limit: 50, now: clock.value });
 		expect(history.rooms?.map((room) => room.log_id)).toEqual([roomId, saved.room?.log_id]);
-		expect(history.rooms?.[0]).toMatchObject({ title: "Deploy", intro_message: { message_id: introId } });
+		expect(history.rooms?.[0]).toMatchObject({ title: "Deploy", description: "Deploy chatter: *incidents* too" });
 		expect(history.messages).toBeUndefined();
 		expect(store.listRooms().map((room) => room.room_id)).toEqual(["general", roomId]);
 	});
