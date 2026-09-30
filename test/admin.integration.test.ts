@@ -218,7 +218,7 @@ it('/invite-token creates a user who signs in with the token, which /rename move
 
 		// The token signs in from any origin, as a registered user in general.
 		const first = await signIn(token);
-		expect(first.reply.result.you).toEqual({ user_id: userId, name: userId });
+		expect(first.reply.result.you).toEqual({ user_id: userId, name: userId, roles: [] });
 		expect((await request(first.peer, 'rename-self', 'me', { name: 'Newcomer' })).result.you.name).toBe('Newcomer');
 		first.peer.close();
 
@@ -291,7 +291,7 @@ it('room_join and room_leave with a user_id add and remove others: an admin anyo
 		expect(joined.frame.params.joined[0].members.map((member: { user_id: string }) => member.user_id)).toEqual(['admin', bobId].sort());
 		// `users` are current objects: the admin's carry its role (§3.3).
 		expect(joined.frame.params.users).toContainEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'] });
-		expect(joined.frame.params.users).toContainEqual({ user_id: bobId, name: `Name of ${bobId}` });
+		expect(joined.frame.params.users).toContainEqual({ user_id: bobId, name: `Name of ${bobId}`, roles: [] });
 		// Adding a member again changes nothing.
 		expect((await exchange(admin, 'add-bob-again', 'room_join', { room_id: roomId, user_id: bobId })).skipped.some((frame) => frame.method === 'membership')).toBe(false);
 
@@ -434,7 +434,7 @@ it('adds a passkey to the signed-in account (§4.9); a guest\'s registration mak
 		expect(told.frame.params.body.text).toMatch(/A passkey was added to your account/);
 		expect(added.begun.result.public_key.user.name).toBe(userId);
 		expect(added.begun.result.public_key.excludeCredentials.map((entry: { id: string }) => entry.id)).toEqual([`cred-${userId}`]);
-		expect(added.finished.result).toEqual({ you: { user_id: userId, name: `Name of ${userId}` } });
+		expect(added.finished.result).toEqual({ you: { user_id: userId, name: `Name of ${userId}`, roles: [] } });
 		const credentials = await runInDurableObject(stub(), (_instance, state) =>
 			state.storage.sql.exec<{ credential_id: string }>('SELECT credential_id FROM credentials WHERE user_id = ? ORDER BY created_ms', userId).toArray().map((row) => row.credential_id));
 		expect(credentials).toEqual([`cred-${userId}`, added.passkey.id]);
@@ -493,7 +493,7 @@ it('/invite mints a sign-up token that creates a user per use, each with its own
 		const ada = await fresh();
 		await request(ada, 'guest', 'auth', { scheme: 'guest' });
 		const signedUp = await request(ada, 'join', 'auth', { scheme: 'token', token: invite, name: 'Ada' });
-		expect(signedUp.result.you).toEqual({ user_id: expect.stringMatching(/^ada_\d{4}$/), name: 'Ada' });
+		expect(signedUp.result.you).toEqual({ user_id: expect.stringMatching(/^ada_\d{4}$/), name: 'Ada', roles: [] });
 		expect(signedUp.result.token).toMatch(/^apron_invite_/);
 		const adaId = signedUp.result.you.user_id;
 		// Posting works, and the saved token signs in again as the same user.
@@ -567,6 +567,10 @@ it('/admin remove takes the admin role away, announced with roles: [] (§3.3)', 
 		expect((await until(demoted, (frame) => frame.method === 'user')).frame.params).toEqual({ you: { user_id: userId, name: `Name of ${userId}`, roles: [] } });
 		expect((await until(mate, (frame) => frame.method === 'user' && frame.params.new?.user_id === userId)).frame.params.new.roles).toEqual([]);
 		expect((await command(demoted, 'status', '/status')).frame.error.code).toBe(-32001);
+		// A client that missed the notification clears the role from any current object, such as a listing's users.
+		const listed = await request(mate, 'list', 'room_list', { room_id: 'general', members: true });
+		expect(listed.result.users.find((user: { user_id: string }) => user.user_id === userId).roles).toEqual([]);
+		expect(listed.result.users.find((user: { user_id: string }) => user.user_id === 'admin').roles).toEqual(['admin']);
 		expect((await command(admin, 'again', `/admin remove ${userId}`)).notice!.params.body.text).toMatch(/was not an admin/);
 		expect((await command(admin, 'builtin', '/admin remove admin')).frame.error.code).toBe(-32602);
 	} finally { admin.close(); demoted.close(); mate.close(); }

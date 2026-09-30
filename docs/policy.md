@@ -54,7 +54,8 @@ within it:
   Free budgets, first by `user_id` rather than by recent activity, with
   `member_count` when that leaves some out) and their
   current objects in `users`, whose `roles` mark admins (`admin`) and bots
-  (`bot`); it ignores `latest_log_id` and always returns a
+  (`bot`), and are `[]` for other registered users, so a lost role clears
+  everywhere; it ignores `latest_log_id` and always returns a
   full listing, since guest memberships are not logged. A client that sends
   the `{"method":"ping"}` liveness ping every 45 seconds and then goes quiet
   for 150 is disconnected, so a peer that vanished without closing is not

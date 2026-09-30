@@ -192,23 +192,23 @@ it('updates a registered name with me, declines avatar and ext, and treats name 
 	expect(resumed.result.you.user_id).toBe('user_session_me');
 
 	peer.send({ id: 'rename', method: 'me', params: { name: 'Ada' } });
-	expect((await reply(peer, 'rename')).result).toEqual({ you: { user_id: 'user_session_me', name: 'Ada' } });
+	expect((await reply(peer, 'rename')).result).toEqual({ you: { user_id: 'user_session_me', name: 'Ada', roles: [] } });
 	// Omitted fields stay unchanged; the demo keeps no avatars or profile ext.
 	peer.send({ id: 'profile', method: 'me', params: { avatar: 'https://example.test/a.png', ext: { demo: true } } });
-	expect((await reply(peer, 'profile')).result).toEqual({ you: { user_id: 'user_session_me', name: 'Ada' } });
+	expect((await reply(peer, 'profile')).result).toEqual({ you: { user_id: 'user_session_me', name: 'Ada', roles: [] } });
 	peer.send({ id: 'bad-avatar', method: 'me', params: { avatar: 7 } });
 	expect((await reply(peer, 'bad-avatar')).error.code).toBe(-32602);
 	// An empty name removes it, so clients fall back to the user_id.
 	// It is announced as its empty value (§3.3).
 	peer.send({ id: 'clear', method: 'me', params: { name: '' } });
-	expect((await reply(peer, 'clear')).result).toEqual({ you: { user_id: 'user_session_me', name: '' } });
+	expect((await reply(peer, 'clear')).result).toEqual({ you: { user_id: 'user_session_me', name: '', roles: [] } });
 	peer.send({ id: 'unchanged', method: 'me', params: {} });
-	expect((await reply(peer, 'unchanged')).result).toEqual({ you: { user_id: 'user_session_me' } });
+	expect((await reply(peer, 'unchanged')).result).toEqual({ you: { user_id: 'user_session_me', roles: [] } });
 	peer.close();
 
 	// The removal is durable: a later resume carries no name either.
 	const again = await resume(token);
-	expect(again.reply.result.you).toEqual({ user_id: 'user_session_me' });
+	expect(again.reply.result.you).toEqual({ user_id: 'user_session_me', roles: [] });
 	again.peer.close();
 });
 
@@ -355,7 +355,8 @@ it('logs a registered user\'s joins and leaves as memberships, delivered around 
 		const [update] = created.skipped;
 		expect(Object.keys(update.params)).toEqual(['joined', 'membership', 'users']);
 		expect(update.params.joined[0]).toMatchObject({ room_id: threadId, log_id: threadId, members: [{ user_id: userId }] });
-		expect(update.params.users).toEqual([{ user_id: userId, name }]);
+		// Current objects carry the registered user's roles, [] when none (§3.3).
+		expect(update.params.users).toEqual([{ user_id: userId, name, roles: [] }]);
 		const joinedRecord = update.params.membership[0];
 		expect(joinedRecord).toEqual(record(threadId, true));
 		expect(update.params.joined[0].latest_log_id).toBe(joinedRecord.log_id);
@@ -371,7 +372,7 @@ it('logs a registered user\'s joins and leaves as memberships, delivered around 
 		expect(methods(guestJoin.skipped)).toEqual(['room_update']);
 		expect(guestJoin.skipped[0].params.membership).toBeUndefined();
 		expect(guestJoin.skipped[0].params.joined[0].members.map((member: { user_id: string }) => member.user_id)).toEqual([guest.user_id, userId].sort());
-		expect(guestJoin.skipped[0].params.users).toEqual([guest, { user_id: userId, name }].sort((a, b) => a.user_id < b.user_id ? -1 : 1));
+		expect(guestJoin.skipped[0].params.users).toEqual([guest, { user_id: userId, name, roles: [] }].sort((a, b) => a.user_id < b.user_id ? -1 : 1));
 
 		// Leaving: the leaver's connections get `left` with the membership in one
 		// frame, then the result; the room's other members get the membership alone.
@@ -404,7 +405,7 @@ it('logs a registered user\'s joins and leaves as memberships, delivered around 
 		expect(general.users).toBeUndefined();
 		// Listings carry the current name.
 		const listed = (await exchange(reader, 'members', 'room_list', { room_id: threadId, members: true })).frame.result;
-		expect(listed.users).toEqual(expect.arrayContaining([{ user_id: userId, name: 'Renamed later' }]));
+		expect(listed.users).toEqual(expect.arrayContaining([{ user_id: userId, name: 'Renamed later', roles: [] }]));
 	} finally { tab.close(); other.close(); reader.close(); }
 
 	// A later connection has the same rooms, until the user leaves general;

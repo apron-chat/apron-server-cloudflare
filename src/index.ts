@@ -2599,16 +2599,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** A current user object (§3.3) with the user's `roles`, when any. */
 	/**
-	 * `explicit`: carry `roles: []` when the user has none, so a client's kept
-	 * object drops a role the user lost (§3.3: an empty value means cleared).
-	 * Identity changes (`user` notifications) are explicit; listings leave an
-	 * empty `roles` out, since nothing there changes a role.
+	 * A registered user's current object with `roles`, `[]` when the user has
+	 * none (§3.3: an empty value means cleared), so any current object (`you`,
+	 * `user`, room `users`) clears a role the user lost, even for a client
+	 * that missed the `user` notification. Guests carry no `roles`.
 	 */
-	private withRoles<T extends PublicUser>(user: T, explicit = false): T {
+	private withRoles<T extends PublicUser>(user: T): T {
 		const { roles: _ignored, ...rest } = user;
 		void _ignored;
-		const roles = this.rolesOf(user.user_id);
-		return (roles.length || explicit ? { ...rest, roles } : rest) as T;
+		return { ...rest, roles: this.rolesOf(user.user_id) } as T;
 	}
 
 	/** A connection's user as a current object: `you`, `new`, and room `users` (§3.3), with roles. */
@@ -2960,7 +2959,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private announceUser(origin: WebSocketConnection | null, user: PublicUser | null, rooms: readonly string[], old?: { user_id: string; name?: string } | null): void {
 		if (!user) return;
 		// A current object (§3.3): `roles` go with every identity change.
-		const identity = user.user_id.startsWith("guest_") ? user : this.withRoles(user, true);
+		const identity = user.user_id.startsWith("guest_") ? user : this.withRoles(user);
 		const shared = new Set(rooms);
 		for (const peer of this.ctx.getWebSockets()) {
 			const socket = peer as WebSocketConnection;
