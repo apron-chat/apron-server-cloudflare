@@ -881,7 +881,7 @@ it('sends the notifications a request causes on its connection before its result
 	} finally { alice.close(); }
 });
 
-it('returns history in v6 shape: messages, first_log_id/last_log_id, and empty arrays omitted', async () => {
+it('returns history in v7 shape: messages, first_log_id/last_log_id, and empty arrays omitted', async () => {
 	const peer = await connect();
 	try {
 		await authenticate(peer);

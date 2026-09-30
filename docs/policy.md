@@ -1,6 +1,6 @@
 # Public demo authentication and policy
 
-The demo speaks Apron protocol **6**, advertising `history`, `edit`, `rooms`,
+The demo speaks Apron protocol **7**, advertising `history`, `edit`, `rooms`,
 `reactions`, and `command`, and `server.ping` (45 seconds). `activity`
 (typing) is on with the Workers Paid budgets and off with the Free ones;
 `ACTIVITY` overrides either (see [plans](configuration.md#plans)), and admins
@@ -14,7 +14,8 @@ advertised through `auth: ["webauthn", "token", "guest"]` only on connections wh
 origin is in `RP_ORIGINS`. Other connections advertise `auth: ["token", "guest"]`,
 where `token` takes only bot tokens (below), and reject WebAuthn requests. Guest user IDs are `guest_<n>` from a
 server-wide counter, with the name `Guest <n>`; a requested `user_id` or
-`name` is ignored. Numbers are reserved in blocks of `guestNumberBlock` (10)
+`name` is ignored. No user ever gets a `user_id` starting with `~`, which
+protocol 7 reserves for system identities such as `~private`. Numbers are reserved in blocks of `guestNumberBlock` (10)
 with one durable write per block, are never reissued (not across restarts,
 hibernation, or schema resets either), and skip the unused rest of a block
 after a restart or wake, so the latest number overstates the guest count by
@@ -34,10 +35,14 @@ within it:
   identity has joined `general`; posting to a room does not require joining it.
   Only thread rooms under `general` may be created with `room_set` (top-level
   rooms and nested threads are `denied`), which joins the creator; any
-  participant may save a thread's `title`, `intro_message`, and `ext`, while
-  `general` is fixed. Threads always carry a title (`Thread` by default).
-  `room_join` and `room_leave` work for `general` and threads, and changes
-  arrive as `room_update` before the result. A thread's messages go to its
+  participant may save a thread's `title`, `description` (Markdown by
+  convention), and `ext`, together at most 2 KiB, while `general` is fixed.
+  Threads always carry a title (`Thread` by default). No room is private:
+  creating one with `private: true` is `unsupported`. `room_join` and
+  `room_leave` work for `general` and threads, and changes arrive as
+  `room_update` before the result. With another user's `user_id`, an admin
+  adds or removes anyone, and a registered user their own bot; others are
+  `denied`. Only registered users can be added. A thread's messages go to its
   members only. A guest's rooms last for its connection and are not logged; a
   registered identity keeps its rooms across connections, its joins and leaves
   count as posts, and each is a logged `membership` record delivered to the
@@ -45,17 +50,18 @@ within it:
   leaves are never `user` notifications. `room_list` takes `filter`,
   `parent_room_id`, and `room_id`, and with `members: true` lists each room's
   members (every connected one and at most 200 registered ones, 100 with the
-  Free budgets) and their
-  current objects in `users`; it ignores `latest_log_id` and always returns a
+  Free budgets, with `member_count` when that leaves some out) and their
+  current objects in `users`, whose `roles` mark admins (`admin`) and bots
+  (`bot`); it ignores `latest_log_id` and always returns a
   full listing, since guest memberships are not logged. A client that sends
   the `{"method":"ping"}` liveness ping every 45 seconds and then goes quiet
   for 150 is disconnected, so a peer that vanished without closing is not
   listed.
 - Activity (where on): typing is relayed to the room's other
   members and never stored, at most 10 relays per user per minute; past that, updates are dropped and the
-  sender gets one `@private` notice a minute saying so. Read cursors are
+  sender gets one `~private` notice a minute saying so. Read cursors are
   neither kept nor relayed. `away` is accepted and ignored: the demo has no push.
-- Commands: `/help` replies with a `@private` notice listing the commands the
+- Commands: `/help` replies with a `~private` notice listing the commands the
   sender may run; `/invite-bot` gives a registered user a bot token (below);
   `/avatar` sets one with an attached image (below); other commands are
   `invalid_params`.
@@ -82,8 +88,8 @@ within it:
   an environment variable) keeps those with an absolute http(s) `url` and
   bounded `type`, `width`, `height`, and `alt`. Other `og` properties are
   dropped, and an `og` left empty is removed. The server
-  never fetches embed URLs. Author-only edit, delete, restore, and move. `reply_to` and
-  `intro_message` must name a retained message when set or changed; resubmitting
+  never fetches embed URLs. Author-only edit, delete, restore, and move. `reply_to`
+  must name a retained message when set or changed; resubmitting
   an unchanged reference stays valid after its target expires, and expiration
   never invalidates an accepted snapshot. The server keeps references bare.
 - Reactions: at most 8 distinct emoji (each at most 64 UTF-8 bytes, no control
@@ -95,8 +101,8 @@ within it:
   requests get `retry_after` and notifications are dropped; sockets stay open.
 - `me` renames registered users only; given fields replace, omitted ones stay,
   and `name: ""` removes the name (announced as `name: ""`). With uploads,
-  `avatar: ""` removes the avatar; other `avatar` values and `ext` are
-  ignored. A rename sends `user` notifications to the user's other
+  `avatar: ""` removes the avatar; other `avatar` values, `ext`, and `roles`
+  (which only the server assigns) are ignored. A rename sends `user` notifications to the user's other
   connections and to users who share a room with them, as does signing in on
   a guest's connection (`new` with the retired guest as `old`). History pages
   carry no `users`: records keep the names they were logged with, and
@@ -135,13 +141,15 @@ Guests only read unless the deployment sets `GUEST_POSTING=true`
 history without joining it, and run `/help`, and stay in `general`, where
 authentication put them. Posting, reacting, joining, leaving, and creating or
 editing threads are writes, `denied` ("Guests can only read here; sign in with
-a passkey to post or join rooms"). Every connection gets a `@private` welcome
+a passkey to post or join rooms"). Every connection gets a `~private` welcome
 saying so right after the `server` frame, before any `auth`, with no
-`room_id` (protocol Appendix B).
+`room_id` (protocol Appendix B). The `server` frame's `welcome` says the same
+for the sign-in screen: how guests, passkeys, and bot tokens fit together, and
+how long messages are kept. There is no email sign-in.
 
 A registered user's `/invite-bot` creates or renames their bot, `bot_<their
 user_id>` named "Bot of <their name>", and returns its bearer token in a
-`@private` notice to that connection only. The token signs the bot in with
+`~private` notice to that connection only. The token signs the bot in with
 `scheme: "token"` from any origin, or none; it does not expire, and the next
 `/invite-bot` replaces it and closes connections that used the old one. The
 first invite counts as a registration against the per-IP, daily, and identity

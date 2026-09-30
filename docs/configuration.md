@@ -342,7 +342,7 @@ them. Cleanup and deduplication run in bounded batches/records, while
 
 `threadLimit` counts thread rooms (rooms with a `parent_room_id`) and
 `threadMetadataBytes` bounds a room's serialized client fields (`title`,
-`intro_message` reference, `ext`). The `anonymous*` variables configure the
+`description`, `ext`). The `anonymous*` variables configure the
 guest tier (the `guest` auth scheme).
 
 Guests are numbered `guest_1`, `guest_2`, … from a server-wide counter. The
@@ -379,7 +379,8 @@ The numeric rows are grouped by their unit and enforcement scope:
   (seconds; the timeout must be at least twice the interval). `roomListMembers`
   is how many registered members each room lists in `members`, in `user_id`
   order, besides every connected member; each costs two indexed reads per
-  listed room. `guestNumberBlock` is how many guest numbers (`guest_<n>`) one
+  listed room. A room with more says how many members it has in
+  `member_count`. `guestNumberBlock` is how many guest numbers (`guest_<n>`) one
   durable write reserves; see below.
 - Rolling minute budgets: `historyRequestsPerUserMinute`,
   `historyRequestsPerIpMinute`, `anonymousPostsPerMinute`,
