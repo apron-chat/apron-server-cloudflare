@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { AuthError, AuthTooLargeError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
+import { AuthError, AuthTooLargeError, candidateUserIdFor, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, type RuntimeConfig } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, MAX_FRAME_LEASE, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, UPLOAD_POLICY } from "./budget";
 import { fetchAccountUsage, type AccountUsageSnapshot } from "./account-usage";
@@ -25,6 +25,7 @@ import {
 } from "./protocol";
 import {
 	DEFAULT_JOINED_ROOMS,
+	MAX_PASSKEYS_PER_USER,
 	ROOM_ID,
 	Store,
 	StoreError,
@@ -123,6 +124,17 @@ const PING_RESPONSE = '{"method":"pong"}';
 /** Joined room IDs a connection attachment may carry: every room, with slack for removals in flight. */
 const MAX_ATTACHED_ROOMS = 2 * (MAX_THREAD_LIMIT + 1);
 /**
+ * Sign-up invites (`/invite`, protocol Appendix B): one token that creates a
+ * new registered user on each use, up to its count. What they look like, the
+ * key of the one live invite by the token's SHA-256, and the pointer to it.
+ */
+const JOIN_TOKEN_PREFIX = "apron_join_";
+const JOIN_TOKEN_KEY_PREFIX = "join-token:";
+const JOIN_INVITE_KEY = "join-invite";
+/** Sign-ups one `/invite` may allow, and how long it lasts. */
+const MAX_JOIN_USES = 50;
+const JOIN_INVITE_TTL_MS = 7 * 86_400_000;
+/**
  * The commands this server provides (§4.8), as `/help` lists them to those
  * who may run them: `everyone`, `owners` (registered users other than bots),
  * or `admins` (the `APRON_ADMIN_TOKEN` user and those `/admin` made admins).
@@ -135,6 +147,7 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", audience: "admins" },
 	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
 	{ name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", audience: "admins" },
+	{ name: "invite", usage: "/invite <uses>", help: `get a token that signs up to <uses> new users (at most ${MAX_JOIN_USES}) for a week, replacing the last one; /invite 0 revokes it`, audience: "admins" },
 	{ name: "toggle", usage: "/toggle <activity|uploads>", help: "turn typing activity or uploads off or on for everyone", audience: "admins" },
 	{ name: "purge", usage: "/purge <user_id>", help: "disconnect a user and delete their account, bot, and everything they posted or uploaded", audience: "admins" },
 	{ name: "status", usage: "/status", help: "show today's Cloudflare usage and the demo's budgets", audience: "admins" },
@@ -206,6 +219,16 @@ interface StoredBot {
 interface StoredInviteToken {
 	v: 1;
 	userId: string;
+}
+
+/**
+ * The live sign-up invite (`/invite`), stored only under its token's SHA-256:
+ * how many sign-ups it has left and when it expires.
+ */
+interface StoredJoinInvite {
+	v: 1;
+	remaining: number;
+	expiresMs: number;
 }
 
 interface SessionExpiryEntry {
@@ -357,6 +380,7 @@ function challengeFromAttachment(value: unknown, connectionId: string): Challeng
 		if (key === "identityUserId" && candidate[key] === null) continue;
 		if (candidate[key] !== undefined && !boundedString(candidate[key])) return undefined;
 	}
+	if (candidate.adds !== undefined && candidate.adds !== true) return undefined;
 	return candidate as ChallengeRecord;
 }
 
@@ -997,6 +1021,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// bot tokens (`/invite-bot`) from anywhere, since bots are not browsers.
 				// No `email`: the demo has no way to send mail.
 				auth: this.passkeysOffered(origin) ? ["webauthn", "token", "guest"] : ["token", "guest"],
+				// Schemes that create an account (§3.2): a passkey registration, and
+				// a token only as an admin's sign-up invite (`/invite`); other tokens
+				// sign in to existing users. A guest is a throwaway identity for one
+				// connection, not an account, so `guest` is listed only in `auth`.
+				signup: this.passkeysOffered(origin) ? ["webauthn", "token"] : ["token"],
 				// For the sign-in screen (§3.2); the `~private` welcome below goes in a room.
 				welcome: this.signInWelcome(origin),
 				// Answered by the runtime without waking the object (see PING_REQUEST).
@@ -1042,7 +1071,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const signIn = this.passkeysOffered(origin)
 			? "**Create a passkey** to post, react, and start threads; it signs you in on your next visit too."
 			: "Passkeys work on the demo's own site; here, sign in with a bot token from `/invite-bot` there, or an invite token from an admin.";
-		return `**Apron public demo.** ${guests} ${signIn} Bots sign in with a token their owner gets from \`/invite-bot\`. ${history}`;
+		const invites = "An admin's invite token also creates an account; add a passkey once you're in, so you can sign in again without it.";
+		return `**Apron public demo.** ${guests} ${signIn} ${invites} Bots sign in with a token their owner gets from \`/invite-bot\`. ${history}`;
 	}
 
 	/** The `~private` welcome, after the `server` frame; where guests only read, it says so (Appendix B). */
@@ -1301,22 +1331,35 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (this.config.adminToken !== undefined && await sameToken(token, this.config.adminToken)) await this.handleAdminToken(socket, attachment, request);
 			else if (token.startsWith(BOT_TOKEN_PREFIX)) await this.handleBotToken(socket, attachment, request, token);
 			else if (token.startsWith(INVITE_TOKEN_PREFIX)) await this.handleInviteToken(socket, attachment, request, token);
+			else if (token.startsWith(JOIN_TOKEN_PREFIX)) await this.handleJoinToken(socket, attachment, request, token);
 			else await this.handleTokenResume(socket, attachment, request);
 			return;
 		}
 		if (scheme !== "webauthn") throw { name: "unsupported", message: "Unsupported authentication scheme" } satisfies ProtocolError;
-		if (attachment.tier === "registered") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
 		const action = requiredString(params, "action");
 		if (action !== "register" && action !== "login") throw { name: "invalid_params", message: "Unknown passkey action" } satisfies ProtocolError;
+		// A registration on a connection already signed in adds the passkey to
+		// that account (§4.9); signing in as someone else takes a reconnect, and
+		// a bot signs in with its token only.
+		const adding = attachment.tier === "registered";
+		if (adding && action !== "register") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
+		if (adding && isBot(attachment.userId)) throw { name: "denied", message: "A bot signs in with its token and takes no passkey" } satisfies ProtocolError;
 		const step = requiredString(params, "step");
 		const origin = this.requestOrigin(socket);
 		if (!origin || !this.config.rpOrigins.includes(origin)) throw { name: "denied", message: "Frontend origin is not configured for passkeys" } satisfies ProtocolError;
 		if (step === "begin") {
 			const identity = action === "register" ? identityOf(attachment) : undefined;
-			const name = action === "register" ? this.requestedName(params) : undefined;
-			const begun = await this.webAuthn.begin(action, origin, nowMs(), identity ?? undefined, [], attachment.connId, {
+			const name = action === "register" && !adding ? this.requestedName(params) : undefined;
+			// Adding: the account's passkeys are excluded, and its user handle reused.
+			const stored = adding ? this.store.getIdentity(attachment.userId!) : null;
+			if (adding && !stored) throw { name: "denied", message: "Only a registered user can add a passkey" } satisfies ProtocolError;
+			const existing = adding ? this.store.credentialIdsForUser(attachment.userId!) : [];
+			if (existing.length >= MAX_PASSKEYS_PER_USER) throw { name: "denied", message: `An account holds at most ${MAX_PASSKEYS_PER_USER} passkeys` } satisfies ProtocolError;
+			const handle = stored?.userHandle && /^[A-Za-z0-9_-]{16,64}$/.test(stored.userHandle) && stored.userHandle.length % 4 !== 1 ? stored.userHandle : undefined;
+			const begun = await this.webAuthn.begin(action, origin, nowMs(), identity ?? undefined, existing, attachment.connId, {
 				...(name !== undefined ? { name } : {}),
 				userIdTaken: (userId) => this.store.userIdTaken(userId),
+				...(adding ? { adds: handle ? { userHandle: handle } : {} } : {}),
 			});
 			if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
 			attachment.challenge = begun.challenge;
@@ -1348,6 +1391,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return identity ? { user_id: identity.userId, name: identity.name, tier: "registered" } : null;
 			},
 			registerCredential: (input) => {
+				if (input.adds) {
+					const added = this.store.addCredential({ userId: input.userId, userHandle: input.userHandle, credential: input.credential, now: input.now, ipKey: input.ipKey });
+					return { user_id: added.userId, name: added.name };
+				}
 				// A guest registering on its connection keeps the rooms it had joined.
 				const identity = this.store.registerIdentity({ ...input, ...(attachment.tier === "anonymous" && attachment.rooms ? { rooms: attachment.rooms } : {}) });
 				// Each starting room's logged join goes to the room's members, this
@@ -1365,6 +1412,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		});
 		const latest = connectionAttachment(socket);
 		if (!latest || latest.closing || !openSocket(socket)) return;
+		if (challenge.adds) {
+			// The connection stays signed in as it was, now with one more passkey.
+			this.reply(socket, request, { you: this.current(latest) });
+			await this.rescheduleAlarm();
+			return;
+		}
 		this.assertRegisteredCapacity(socket, finished.identity.user_id);
 		const token = await this.issueSession(finished.identity.user_id, origin, nowMs());
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
@@ -1542,7 +1595,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * (a bot or the admin user): the connection becomes the identity, and those
 	 * who shared a room with the guest it replaces hear of it.
 	 */
-	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[]; avatar?: string }): Promise<void> {
+	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[]; avatar?: string }, token?: string): Promise<void> {
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
 		this.assertRegisteredCapacity(socket, identity.userId);
 		const guest = attachment.tier === "anonymous" ? publicIdentity(attachment) : null;
@@ -1554,10 +1607,77 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
-		this.reply(socket, request, { you: this.current(attachment) });
+		this.reply(socket, request, { you: this.current(attachment), ...(token ? { token } : {}) });
 		if (guest) this.announceUser(socket, this.current(attachment), [...guestRooms, ...attachment.rooms], guest);
 		this.refreshAvatar(identity.userId);
 		await this.rescheduleAlarm();
+	}
+
+	/**
+	 * Signs up a new user with the live `/invite` token (protocol Appendix B):
+	 * each use creates a registered user with no passkey, named as `auth`
+	 * asks (else "Guest"), with a `user_id` picked from the name like a
+	 * passkey registration's, charged as a registration. The result carries
+	 * the new user's own invite token (`apron_invite_…`, as `/invite-token`
+	 * mints), so the shared invite is not needed again; they may add a
+	 * passkey once signed in (§4.9). A used-up, expired, or replaced invite is
+	 * `denied`.
+	 */
+	private async handleJoinToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, token: string): Promise<void> {
+		return this.withSessionLock(async () => {
+			if (attachment.tier === "registered") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
+			if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "invalid_params", message: "token is too long" } satisfies ProtocolError;
+			const name = this.requestedName(request.params) ?? "Guest";
+			const key = JOIN_TOKEN_KEY_PREFIX + await sha256Hex(token);
+			const invite = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredJoinInvite>(key));
+			if (!invite || invite.v !== 1 || !(invite.remaining > 0) || invite.expiresMs <= nowMs()) {
+				throw { name: "denied", message: "This invite is used up or has expired; ask an admin for a new one" } satisfies ProtocolError;
+			}
+			const userId = candidateUserIdFor(name, (candidate) => this.store.userIdTaken(candidate));
+			await this.runMutation(async () => {
+				const created = this.store.createInvitedIdentity({ userId, name, now: nowMs(), ipKey: attachment.ipKey });
+				for (const record of created.broadcasts) this.broadcastRecord(record);
+			});
+			const own = INVITE_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+			const ownKey = INVITE_TOKEN_KEY_PREFIX + await sha256Hex(own);
+			await this.store.withMeterAsync("foreground", { writes: 3 }, async () => {
+				if (invite.remaining > 1) await this.ctx.storage.put<StoredJoinInvite>(key, { ...invite, remaining: invite.remaining - 1 });
+				else await this.ctx.storage.delete(key);
+				await this.ctx.storage.put<StoredInviteToken>(ownKey, { v: 1, userId });
+				await this.ctx.storage.put<StoredBot>(INVITE_KEY_PREFIX + userId, { v: 1, tokenKey: ownKey });
+			});
+			const identity = this.store.getIdentity(userId);
+			if (!identity) throw { name: "internal_error", message: "Invited user is missing" } satisfies ProtocolError;
+			await this.signInKeyless(socket, attachment, request, identity, own);
+		});
+	}
+
+	/**
+	 * `/invite <uses>`: mints the sign-up invite (protocol Appendix B), a
+	 * token that signs up to `uses` new users within a week, and revokes the
+	 * last one; `/invite 0` only revokes. The token goes to this connection
+	 * only, in a `~private` notice, before the result (§1).
+	 */
+	private async invite(socket: WebSocketConnection, request: RequestFrame, roomId: string, count: string): Promise<void> {
+		const uses = /^\d{1,3}$/.test(count) ? Number(count) : -1;
+		if (uses < 0 || uses > MAX_JOIN_USES) throw { name: "invalid_params", message: `Usage: /invite <uses>, 0 to ${MAX_JOIN_USES}` } satisfies ProtocolError;
+		const token = JOIN_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+		const key = JOIN_TOKEN_KEY_PREFIX + await sha256Hex(token);
+		const expiresMs = nowMs() + JOIN_INVITE_TTL_MS;
+		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1, writes: 3 }, async () => {
+			const previous = await this.ctx.storage.get<StoredBot>(JOIN_INVITE_KEY);
+			// Revoke first: a failure between the writes leaves no invite, never two.
+			if (previous?.v === 1 && typeof previous.tokenKey === "string") await this.ctx.storage.delete(previous.tokenKey);
+			if (uses === 0) return void await this.ctx.storage.delete(JOIN_INVITE_KEY);
+			await this.ctx.storage.put<StoredJoinInvite>(key, { v: 1, remaining: uses, expiresMs });
+			await this.ctx.storage.put<StoredBot>(JOIN_INVITE_KEY, { v: 1, tokenKey: key });
+		}));
+		this.sendNotice(socket, roomId, uses === 0 ? "The sign-up invite is revoked." : [
+			`This invite signs up ${uses} new user${uses === 1 ? "" : "s"} until ${new Date(expiresMs).toISOString().slice(0, 16).replace("T", " ")} UTC, and replaces any earlier one. Each gets their own token to sign in again with, and can add a passkey after.`,
+			"```\n" + token + "\n```",
+			`To sign up, authenticate with the token scheme and a name: \`{"method": "auth", "params": {"scheme": "token", "token": "${token}", "name": "Ada"}}\``,
+		].join("\n\n"));
+		this.reply(socket, request, {});
 	}
 
 	/**
@@ -2163,7 +2283,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await this.startAvatar(socket, attachment, request, body);
 			return;
 		}
-		if (["admin", "kick", "rename", "purge", "toggle", "invite-token"].includes(command.name)) {
+		if (["admin", "kick", "rename", "purge", "toggle", "invite-token", "invite"].includes(command.name)) {
 			try {
 				const target = words[1];
 				const argumentCount = command.name === "rename" ? 2 : 1;
@@ -2173,6 +2293,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				else if (command.name === "purge") await this.purge(socket, attachment, request, roomId, target);
 				else if (command.name === "toggle") this.toggle(socket, request, roomId, target);
 				else if (command.name === "invite-token") await this.inviteToken(socket, attachment, request, roomId, target);
+				else if (command.name === "invite") await this.invite(socket, request, roomId, target);
 				else await this.rename(socket, request, roomId, target, words[2]);
 			} catch (error) {
 				// A mistyped or wrong user_id is an error to show, like an unknown

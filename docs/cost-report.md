@@ -133,6 +133,14 @@ Memberships:
   foreground reads a day allow about 120 times. A room whose page of
   registered members is full also reads its `member_count` (one row, within
   the per-room slack), so the listing can say how many it left out.
+- Adding a passkey while signed in (§4.9) is one reservation of 96 reads
+  and 48 writes, charged as a registration: the identity and credential
+  lookups, a count of the account's passkeys (at most 8), the credential row
+  with its indexes, and the registration limiter rows. The per-IP (5, Free 3)
+  and daily registration caps bound it like new registrations.
+- A sign-up with an `/invite` token is an `/invite-token` registration plus
+  one KV read and three KV writes (the invite's count and the new user's own
+  token), charged at their bound.
 - `roles` in current user objects need the admin list: one `_meta` read per
   object wake, kept in memory and updated by `/admin`, `/rename`, and
   `/purge`, the only changes to it. Guests and bots need no read.
@@ -346,8 +354,10 @@ transaction (`test/schema-reset.integration.test.ts`): it reads the capped
 rooms table with each room's intro message (one indexed read each), every
 stored record once to find the room records (records have no index by kind;
 the log holds at most the retention window, about 80,000 records at the
-Workers Paid post ceiling and a week's retention), and every membership row
-once to fill the member counts, and rewrites each room row and room record.
+Workers Paid post ceiling and a week's retention), every membership row
+once to fill the member counts, and every credential once to rebuild
+`credentials` without its one-passkey constraint (at most the 10,000-identity
+cap); it rewrites each room row and room record.
 The rows it measurably read and wrote are added to the day's maintenance
 counters without a capacity check, like the reset's passkey carry, so an
 exhausted budget cannot block it. The object is not wiped.

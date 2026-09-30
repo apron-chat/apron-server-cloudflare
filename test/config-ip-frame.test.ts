@@ -90,6 +90,7 @@ describe('configuration policy boundaries', () => {
 		expect(() => config({ APRON_ADMIN_TOKEN: 'too-short' })).toThrow(ConfigError);
 		expect(() => config({ APRON_ADMIN_TOKEN: 'has spaces in it 0123456789' })).toThrow(ConfigError);
 		expect(() => config({ APRON_ADMIN_TOKEN: 'apron_bot_0123456789abcdefghij' })).toThrow(ConfigError);
+		expect(() => config({ APRON_ADMIN_TOKEN: 'apron_join_0123456789abcdefghij' })).toThrow(ConfigError);
 	});
 
 	it('rejects unsafe payload, queue, history, and maintenance combinations', () => {

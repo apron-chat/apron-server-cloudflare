@@ -140,7 +140,10 @@ frontend origins does not give an IP a fresh allowance. Honor `retry_after`.
 
 The `server` frame's `welcome` is Markdown for your sign-in screen. The server
 advertises `token` (for bot tokens) and `guest` to custom frontends, and never
-`email`.
+`email`; `signup` names the schemes that create an account (`webauthn` on the
+demo's own site, and `token` for an admin's `/invite` sign-up token, whose
+`auth` result carries the new user's own token to save). A user who signed up
+with a token can add a passkey by registering one while signed in.
 `web.apron.chat` additionally receives `webauthn`, and its `token` also resumes
 passkey sessions; inspect each connection's `server.params.auth` rather than
 assuming passkeys are available everywhere.

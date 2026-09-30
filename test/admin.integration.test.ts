@@ -2,6 +2,7 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import { DEFAULT_LIMITS } from '../src/budget';
 import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
+import { softPasskey } from './helpers/webauthn';
 
 let nextIp = 1;
 const stub = () => env.DEMO.getByName('public-demo-v1');
@@ -384,4 +385,119 @@ it('sends a ~private notice to the one connection that asked, not the user\'s ot
 		const { skipped } = await exchange(second, 'probe', 'room_list', { filter: 'joined' });
 		expect(skipped.filter((frame) => frame.method === 'message' && frame.params.from?.user_id === '~private')).toEqual([]);
 	} finally { first.close(); second.close(); }
+});
+
+/** Registers a passkey over the wire on `peer`: begin, then finish with a software authenticator. */
+async function registerPasskey(peer: Peer, id: string, params: Record<string, unknown> = {}) {
+	const passkey = await softPasskey('http://localhost:5173');
+	const begun = await request(peer, `${id}-begin`, 'auth', { scheme: 'webauthn', action: 'register', step: 'begin', ...params });
+	if (begun.error) return { passkey, begun, finished: begun };
+	const credential = await passkey.register(begun.result.public_key);
+	const finished = await request(peer, `${id}-finish`, 'auth', { scheme: 'webauthn', action: 'register', step: 'finish', challenge_id: begun.result.challenge_id, credential });
+	return { passkey, begun, finished };
+}
+
+async function passkeyLogin(passkey: Awaited<ReturnType<typeof softPasskey>>): Promise<Frame> {
+	const peer = await connect();
+	try {
+		await peer.next();
+		const begun = await request(peer, 'login-begin', 'auth', { scheme: 'webauthn', action: 'login', step: 'begin' });
+		const credential = await passkey.assert(begun.result.public_key);
+		return await request(peer, 'login-finish', 'auth', { scheme: 'webauthn', action: 'login', step: 'finish', challenge_id: begun.result.challenge_id, credential });
+	} finally { peer.close(); }
+}
+
+it('adds a passkey to the signed-in account (§4.9); a guest\'s registration makes a new account', async () => {
+	const userId = unique('keys');
+	const user = await signedIn(userId);
+	const guest = await connect();
+	const admin = await signedInAdmin();
+	try {
+		// A registered user adds a second passkey: the connection stays that user, and the
+		// authenticator is told the account's user handle and existing passkey.
+		const added = await registerPasskey(user, 'add');
+		expect(added.begun.result.public_key.user.name).toBe(userId);
+		expect(added.begun.result.public_key.excludeCredentials.map((entry: { id: string }) => entry.id)).toEqual([`cred-${userId}`]);
+		expect(added.finished.result).toEqual({ you: { user_id: userId, name: `Name of ${userId}` } });
+		const credentials = await runInDurableObject(stub(), (_instance, state) =>
+			state.storage.sql.exec<{ credential_id: string }>('SELECT credential_id FROM credentials WHERE user_id = ? ORDER BY created_ms', userId).toArray().map((row) => row.credential_id));
+		expect(credentials).toEqual([`cred-${userId}`, added.passkey.id]);
+		// The new passkey signs in as the same account.
+		expect((await passkeyLogin(added.passkey)).result.you.user_id).toBe(userId);
+		// Signing in as someone else on a signed-in connection still takes a reconnect.
+		expect((await request(user, 'login', 'auth', { scheme: 'webauthn', action: 'login', step: 'begin' })).error.code).toBe(-32001);
+
+		// The admin user, signed in by token, can add a passkey too; a bot cannot.
+		const adminKey = await connect();
+		await adminKey.next();
+		expect((await request(adminKey, 'auth', 'auth', { scheme: 'token', token: ADMIN_TOKEN })).result.you.user_id).toBe('admin');
+		expect((await registerPasskey(adminKey, 'admin-add')).finished.result.you.user_id).toBe('admin');
+		adminKey.close();
+		const { frame, skipped } = await exchange(user, 'bot', 'command', { room_id: 'general', body: { text: '/invite-bot' } });
+		expect(frame.result).toEqual({});
+		const token = /apron_bot_[A-Za-z0-9_-]+/.exec(skipped.find((candidate) => candidate.params?.from?.user_id === '~private')!.params.body.text)![0];
+		const bot = await connect();
+		await bot.next();
+		expect((await request(bot, 'auth', 'auth', { scheme: 'token', token })).result.you.user_id).toBe(`bot_${userId}`);
+		expect((await registerPasskey(bot, 'bot-add')).finished.error.code).toBe(-32001);
+		bot.close();
+
+		// A guest has no account to add to: its registration creates one, which replaces the guest.
+		await guest.next();
+		const guestId = (await request(guest, 'auth', 'auth', { scheme: 'guest' })).result.you.user_id;
+		const created = await registerPasskey(guest, 'guest', { name: 'Newcomer' });
+		expect(created.finished.result.you.user_id).toMatch(/^newcomer_\d{4}$/);
+		expect(created.finished.result.you.user_id).not.toBe(guestId);
+		expect(created.finished.result.token).toEqual(expect.any(String));
+	} finally { user.close(); guest.close(); admin.close(); }
+});
+
+it('/invite mints a sign-up token that creates a user per use, each with its own token (Appendix B)', async () => {
+	const admin = await signedInAdmin();
+	const peers: Peer[] = [];
+	const fresh = async () => { const peer = await connect(); peers.push(peer); await peer.next(); return peer; };
+	try {
+		const minted = await command(admin, 'invite', '/invite 2');
+		expect(minted.frame.result).toEqual({});
+		const invite = /apron_join_[A-Za-z0-9_-]+/.exec(minted.notice!.params.body.text)![0];
+
+		// A guest signs up with it: a new registered user, named as asked, with its own token.
+		const ada = await fresh();
+		await request(ada, 'guest', 'auth', { scheme: 'guest' });
+		const signedUp = await request(ada, 'join', 'auth', { scheme: 'token', token: invite, name: 'Ada' });
+		expect(signedUp.result.you).toEqual({ user_id: expect.stringMatching(/^ada_\d{4}$/), name: 'Ada' });
+		expect(signedUp.result.token).toMatch(/^apron_invite_/);
+		const adaId = signedUp.result.you.user_id;
+		// Posting works, and the saved token signs in again as the same user.
+		expect((await request(ada, 'post', 'message', { room_id: 'general', body: { text: 'hi from an invite' } })).result.message_id).toBeDefined();
+		const again = await fresh();
+		expect((await request(again, 'auth', 'auth', { scheme: 'token', token: signedUp.result.token })).result.you.user_id).toBe(adaId);
+
+		// A second use makes another user; the third finds the invite used up.
+		const second = await fresh();
+		expect((await request(second, 'join', 'auth', { scheme: 'token', token: invite })).result.you).toMatchObject({ user_id: expect.stringMatching(/^u_/), name: 'Guest' });
+		const third = await fresh();
+		expect((await request(third, 'join', 'auth', { scheme: 'token', token: invite, name: 'Late' })).error.code).toBe(-32001);
+
+		// A new invite replaces the last; /invite 0 revokes it.
+		const replaced = /apron_join_[A-Za-z0-9_-]+/.exec((await command(admin, 'invite-2', '/invite 1')).notice!.params.body.text)![0];
+		expect((await command(admin, 'revoke', '/invite 0')).notice!.params.body.text).toMatch(/revoked/);
+		expect((await request(await fresh(), 'join', 'auth', { scheme: 'token', token: replaced })).error.code).toBe(-32001);
+		expect((await command(admin, 'too-many', '/invite 51')).frame.error.code).toBe(-32602);
+		// Only admins mint invites.
+		expect((await command(ada, 'not-admin', '/invite 1')).frame.error.code).toBe(-32001);
+	} finally { admin.close(); for (const peer of peers) peer.close(); }
+});
+
+it('advertises which schemes create accounts in server.signup (§3.2)', async () => {
+	const withPasskeys = await connect();
+	const plain = await connect(null);
+	try {
+		const server = (await withPasskeys.next()).params;
+		expect(server.auth).toEqual(['webauthn', 'token', 'guest']);
+		expect(server.signup).toEqual(['webauthn', 'token']);
+		expect(server.welcome).toMatch(/invite token/);
+		const other = (await plain.next()).params;
+		expect([other.auth, other.signup]).toEqual([['token', 'guest'], ['token']]);
+	} finally { withPasskeys.close(); plain.close(); }
 });

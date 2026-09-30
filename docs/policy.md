@@ -119,9 +119,20 @@ within it:
 ## Authentication policy
 
 An authenticated guest may begin registration while retaining guest rights.
-A new credential creates a separate registered identity; it does not transfer
-ownership of guest messages. A registered identity must reconnect before
-switching identities.
+A guest is not an account, so its new credential creates a separate
+registered identity; it does not transfer ownership of guest messages. A
+registration on a connection already signed in as a registered user (a
+passkey user, an invited user, or `admin`, but not a bot) instead adds the
+passkey to that account (protocol §4.9), at most 8 per account, each
+charged as a registration against the per-IP and daily caps. A registered
+identity must reconnect before signing in as another.
+
+`server.signup` lists the schemes that create accounts: `webauthn` where
+passkeys are offered, and `token`, which creates one only with an admin's
+sign-up invite (`/invite <uses>`, at most 50 sign-ups within 7 days, one
+live invite at a time). Each sign-up gets its own `apron_invite_` token in
+the `auth` result to sign in with afterwards. Other tokens only sign in, and
+`guest` is not an account.
 
 The canonical begin/finish exchange, JSON credential encoding, and verification
 rules are defined in protocol [§4.9](https://github.com/shazow/apron/blob/main/PROTOCOL.md#49-webauthn-authentication). This demo limits challenges to 120
@@ -145,8 +156,8 @@ editing threads are writes, `denied` ("Guests can only read here; sign in with
 a passkey to post or join rooms"). Every connection gets a `~private` welcome
 saying so right after the `server` frame, before any `auth`, with no
 `room_id` (protocol Appendix B). The `server` frame's `welcome` says the same
-for the sign-in screen: how guests, passkeys, and bot tokens fit together, and
-how long messages are kept. There is no email sign-in.
+for the sign-in screen: how guests, passkeys, invites, and bot tokens fit
+together, and how long messages are kept. There is no email sign-in.
 
 A registered user's `/invite-bot` creates or renames their bot, `bot_<their
 user_id>` named "Bot of <their name>", and returns its bearer token in a

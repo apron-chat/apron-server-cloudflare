@@ -24,6 +24,8 @@ export interface ChallengeRecord {
 	userId?: string;
 	userHandle?: string;
 	userName?: string;
+	/** A registration that adds a passkey to the signed-in identity (§4.9), which is `userId`. */
+	adds?: boolean;
 	expiresAt: number;
 }
 
@@ -37,6 +39,8 @@ export interface CredentialRepository {
 		credential: StoredCredential;
 		ipKey: string;
 		now: number;
+		/** Add the passkey to `userId`, the identity signed in on this connection, rather than create one (§4.9). */
+		adds?: boolean;
 	}): Identity | Promise<Identity>;
 	updateCredentialCounter(credentialId: string, counter: number): void | Promise<void>;
 }
@@ -110,7 +114,7 @@ function randomDigits(count: number): string {
  * A new registered `user_id`: `<slug>_<4 random digits>` for a requested name
  * (`Foo` → `foo_1234`), retried while taken, else `u_` plus 16 random bytes.
  */
-function candidateUserIdFor(name: string | undefined, taken: (userId: string) => boolean): string {
+export function candidateUserIdFor(name: string | undefined, taken: (userId: string) => boolean): string {
 	const slug = name === undefined ? "" : userIdSlug(name);
 	if (slug) {
 		for (let attempt = 0; attempt < USER_ID_SLUG_ATTEMPTS; attempt += 1) {
@@ -200,17 +204,25 @@ export class WebAuthnService {
 		identity?: Identity,
 		existingCredentialIds: string[] = [],
 		connectionId?: string,
-		registration: { name?: string; userIdTaken?: (userId: string) => boolean } = {},
+		/**
+		 * `adds`: the registration adds a passkey to `identity`, which is signed
+		 * in (§4.9), under its WebAuthn user handle when it has one, so an
+		 * authenticator replaces rather than duplicates its passkey for it.
+		 */
+		registration: { name?: string; userIdTaken?: (userId: string) => boolean; adds?: { userHandle?: string } } = {},
 	): Promise<BeginResult> {
 		if (!this.config.rpOrigins.includes(origin)) throw new Error("origin is not configured for passkeys");
-		if (action === "register" && identity?.tier === "registered") throw new Error("identity switching requires reconnect");
+		const adds = action === "register" && identity?.tier === "registered" && registration.adds !== undefined;
+		if (action === "register" && identity?.tier === "registered" && !adds) throw new Error("identity switching requires reconnect");
 		const challengeId = randomBase64Url(18);
 		const challenge = randomBase64Url(32);
-		const candidateUserId = action === "register" ? candidateUserIdFor(registration.name, registration.userIdTaken ?? (() => false)) : undefined;
-		const candidateUserHandle = action === "register" ? randomBase64Url(16) : undefined;
-		const candidateName = action === "register"
-			? (registration.name ?? identity?.name ?? `Guest ${randomBase64Url(4)}`.slice(0, Math.min(this.config.limits.maxNameCodePoints, this.config.limits.maxNameBytes)))
-			: undefined;
+		const candidateUserId = action !== "register" ? undefined
+			: adds ? identity!.user_id : candidateUserIdFor(registration.name, registration.userIdTaken ?? (() => false));
+		const candidateUserHandle = action !== "register" ? undefined
+			: adds && registration.adds?.userHandle ? registration.adds.userHandle : randomBase64Url(16);
+		const candidateName = action !== "register" ? undefined
+			: adds ? (identity!.name || identity!.user_id)
+			: (registration.name ?? identity?.name ?? `Guest ${randomBase64Url(4)}`.slice(0, Math.min(this.config.limits.maxNameCodePoints, this.config.limits.maxNameBytes)));
 		const options = action === "register"
 			? await generateRegistrationOptions({
 				rpName: this.config.rpName,
@@ -241,6 +253,7 @@ export class WebAuthnService {
 				...(connectionId ? { connectionId } : {}),
 				...(action === "register" ? { identityUserId: identity?.user_id ?? null } : {}),
 				...(candidateUserId ? { userId: candidateUserId, userHandle: candidateUserHandle, userName: candidateName } : {}),
+				...(adds ? { adds: true } : {}),
 				expiresAt: now + this.config.limits.challengeTtlSeconds * 1_000,
 			},
 			publicKey: options as unknown as Record<string, unknown>,
@@ -302,6 +315,7 @@ export class WebAuthnService {
 				},
 				ipKey: input.ipKey,
 				now: input.now,
+				...(challenge.adds ? { adds: true } : {}),
 			});
 			return { identity: identityWithTier(stored) };
 		}

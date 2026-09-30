@@ -39,7 +39,8 @@ export const ROOM_TITLE = "General";
  * `memberships` table of registered users' joined rooms, indexed both ways,
  * with each room's count of them, and the `uploads` held in R2 with each
  * identity's avatar. A room's `description` is one of its client fields
- * (schema 6; schema 5 pointed at an `intro_message` instead). Schema 5 is
+ * (schema 6; schema 5 pointed at an `intro_message` instead), and an
+ * identity may hold several passkeys (schema 5 allowed one). Schema 5 is
  * upgraded in place (see upgradeFromSchema5()); stored data from any other
  * schema version is not migrated: the object is wiped and started fresh (see
  * resetStorage()). Additive rows need no new version: the `_meta`
@@ -48,6 +49,8 @@ export const ROOM_TITLE = "General";
 export const SCHEMA_VERSION = 6;
 /** The one older schema upgraded in place rather than reset. */
 export const UPGRADABLE_SCHEMA_VERSION = 5;
+/** Passkeys one registered identity may hold (§4.9: a registration while signed in adds one). */
+export const MAX_PASSKEYS_PER_USER = 8;
 /** Rooms a new identity has joined: the permanent top-level room (§3.4). */
 export const DEFAULT_JOINED_ROOMS: readonly string[] = [ROOM_ID];
 /** Title the demo supplies for a thread room created or saved without one. */
@@ -1074,7 +1077,7 @@ const SCHEMA_DDL = `
   CREATE INDEX IF NOT EXISTS memberships_user_idx ON memberships (user_id);
   CREATE TABLE IF NOT EXISTS credentials (
     credential_id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL UNIQUE,
+    user_id TEXT NOT NULL,
     public_key_json TEXT NOT NULL,
     sign_count INTEGER NOT NULL,
     transports_json TEXT,
@@ -1297,6 +1300,8 @@ export class Store {
    *   This reads every stored record once (records have no index by kind);
    *   the log holds at most the retention window.
    * - Each room counts its stored registered members in `member_count`.
+   * - `credentials` is rebuilt without its UNIQUE `user_id`, so an identity
+   *   may add passkeys (§4.9).
    *
    * Nothing else changes: the demo never logged `@server` or `@room`
    * messages, and `@private` notices were never stored, so no sender needs
@@ -1347,6 +1352,24 @@ export class Store {
       this.rawExec("ALTER TABLE rooms ADD COLUMN member_count INTEGER NOT NULL DEFAULT 0");
       this.rawExec("UPDATE rooms SET member_count = (SELECT COUNT(*) FROM memberships m WHERE m.room_id = rooms.room_id)");
       this.rawExec("ALTER TABLE rooms DROP COLUMN intro_message_id");
+      // Schema 5 allowed one passkey per identity (a UNIQUE user_id), which
+      // SQLite can only drop by rebuilding the table.
+      this.rawScript(`
+        CREATE TABLE credentials_v6 (
+          credential_id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          public_key_json TEXT NOT NULL,
+          sign_count INTEGER NOT NULL,
+          transports_json TEXT,
+          created_ms INTEGER NOT NULL,
+          updated_ms INTEGER NOT NULL
+        );
+        INSERT INTO credentials_v6 (credential_id, user_id, public_key_json, sign_count, transports_json, created_ms, updated_ms)
+          SELECT credential_id, user_id, public_key_json, sign_count, transports_json, created_ms, updated_ms FROM credentials;
+        DROP TABLE credentials;
+        ALTER TABLE credentials_v6 RENAME TO credentials;
+        CREATE INDEX IF NOT EXISTS credentials_user_idx ON credentials (user_id);
+      `);
       this.rawExec("UPDATE _meta SET value = ? WHERE key = 'schema_version'", String(SCHEMA_VERSION));
       this.rawExec("UPDATE maintenance SET schema_version = ? WHERE id = 1", SCHEMA_VERSION);
       const cost = { reads: this.observed.reads - start.reads, writes: this.observed.writes - start.writes + 2 };
@@ -2913,6 +2936,63 @@ export class Store {
           rooms: joined,
           broadcasts,
         });
+      });
+    } finally {
+      this.settleReservation(reservation, beforeReads, beforeWrites);
+    }
+  }
+
+  /**
+   * Adds a passkey to a registered identity that is signed in (§4.9): a
+   * registration on a connection already signed in adds to that account.
+   * Bots sign in with their token and take none. At most
+   * MAX_PASSKEYS_PER_USER per identity; a credential already registered
+   * anywhere is `invalid_params`. Charged as a registration against the
+   * per-IP and daily caps, which bound the rows this can write, but not
+   * against the identity count. An identity without a passkey yet (an
+   * invited user, or `admin`) takes `userHandle` as its WebAuthn user handle.
+   */
+  addCredential(input: { userId: string; userHandle: string; credential: StoredCredential; now: number; ipKey: string }): { userId: string; name: string } {
+    this.ensureReady();
+    const { credential } = input;
+    const beforeReads = this.observed.reads;
+    const beforeWrites = this.observed.writes;
+    const reservation = this.reserveCost({ reads: 96, writes: 48, registrations: 1 }, false, input.now);
+    try {
+      ensureText(credential.credentialId, "credential_id", 16 * 1024);
+      ensureText(credential.publicKey, "public_key", 16 * 1024);
+      this.ensureGrowthCapacity(this.config.maxSnapshotBytes);
+      const effective = this.effectiveNow(input.now);
+      return this.transaction(() => {
+        const identity = this.identityRow(input.userId);
+        if (!identity || identity.tier !== "registered") throw new StoreError("denied", "Only a registered user can add a passkey");
+        if (this.credentialValue(credential.credentialId)) throw new StoreError("invalid_params", "credential is already registered");
+        const count = integerColumn(this.rawRows<{ count: number }>(
+          "SELECT COUNT(*) AS count FROM (SELECT 1 FROM credentials WHERE user_id = ? LIMIT ?)", input.userId, MAX_PASSKEYS_PER_USER,
+        )[0]?.count);
+        if (count >= MAX_PASSKEYS_PER_USER) throw new StoreError("denied", `An account holds at most ${MAX_PASSKEYS_PER_USER} passkeys`);
+        this.chargeRegistration(input.ipKey, effective);
+        this.rawExec(
+          `INSERT INTO credentials
+           (credential_id, user_id, public_key_json, sign_count, transports_json, created_ms, updated_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          credential.credentialId,
+          input.userId,
+          JSON.stringify({
+            publicKey: credential.publicKey,
+            ...(credential.transports ? { transports: credential.transports } : {}),
+            ...(credential.deviceType ? { deviceType: credential.deviceType } : {}),
+            ...(credential.backedUp !== undefined ? { backedUp: credential.backedUp } : {}),
+          }),
+          Math.max(0, Math.floor(credential.counter)),
+          credential.transports ? JSON.stringify(credential.transports) : null,
+          effective,
+          effective,
+        );
+        if (!identity.user_handle) this.rawExec("UPDATE identities SET user_handle = ?, updated_ms = ? WHERE user_id = ?", input.userHandle, effective, input.userId);
+        this.assertStorageTarget();
+        this.assertReservation(reservation, beforeReads, beforeWrites);
+        return { userId: identity.user_id, name: identity.name };
       });
     } finally {
       this.settleReservation(reservation, beforeReads, beforeWrites);

@@ -142,6 +142,13 @@ it(`upgrades a schema ${UPGRADABLE_SCHEMA_VERSION} store in place: intro message
 		const snapshotOf = (text: string, messageId: string) => ({ message_id: messageId, log_id: messageId, room_id: 'general', from: identity, body: { text, format: 'plain' } });
 		sql.exec('ALTER TABLE rooms ADD COLUMN intro_message_id TEXT');
 		sql.exec('ALTER TABLE rooms DROP COLUMN member_count');
+		// Schema 5 allowed one passkey per identity.
+		sql.exec('ALTER TABLE credentials RENAME TO credentials_old');
+		sql.exec('DROP INDEX credentials_user_idx');
+		sql.exec('CREATE TABLE credentials (credential_id TEXT PRIMARY KEY, user_id TEXT NOT NULL UNIQUE, public_key_json TEXT NOT NULL, sign_count INTEGER NOT NULL, transports_json TEXT, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL)');
+		sql.exec('CREATE INDEX credentials_user_idx ON credentials (user_id)');
+		sql.exec('INSERT INTO credentials SELECT * FROM credentials_old');
+		sql.exec('DROP TABLE credentials_old');
 		for (const [room, message] of [[thread, intro], [deletedThread, gone], [longThread, long], [plainThread, plain]]) {
 			sql.exec('UPDATE rooms SET intro_message_id = ? WHERE room_id = ?', message, room);
 		}
@@ -175,6 +182,10 @@ it(`upgrades a schema ${UPGRADABLE_SCHEMA_VERSION} store in place: intro message
 		// Nothing was wiped: the chat, the passkey, and its session remain.
 		expect(store.getRoomState().latest_log_id).toBe(fixture.head);
 		expect(store.getCredential('cred-upgrader')?.userId).toBe('upgrader');
+		// An identity may now hold several passkeys (§4.9).
+		store.addCredential({ userId: 'upgrader', userHandle: 'handle', now: Date.now(), ipKey: 'upgrade-ip-2', credential: { credentialId: 'cred-second', userId: 'upgrader', publicKey: 'BBBB', counter: 0 } });
+		expect(store.getIdentity('upgrader')?.credentialCount).toBe(2);
+		expect(sql.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'credentials'").toArray().map((row) => row.name)).toContain('credentials_user_idx');
 		expect(await state.storage.get('session:kept')).toMatchObject({ userId: 'upgrader' });
 
 		// Rooms take their intro message's current text as their description.
