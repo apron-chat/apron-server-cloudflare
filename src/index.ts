@@ -1019,9 +1019,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return {
 			method: "server",
 			params: {
-				protocol: 7,
-				name: "apron-cloudflare-demo/7",
-				caps: [
+				// The protocol version, the implementation string, and the
+				// capabilities (§3.1).
+				apron: 7,
+				agent: "apron-cloudflare-demo/7",
+				capabilities: [
 					"history", "edit", "rooms", "reactions", "command",
 					...(this.activityOn() ? ["activity"] : []),
 					...(this.uploadsOn() ? ["embed:upload"] : []),

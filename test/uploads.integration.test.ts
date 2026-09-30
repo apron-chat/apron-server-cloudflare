@@ -415,13 +415,13 @@ describe('uploads end to end', () => {
 			expect(refused.error.message).toBe('Uploads are turned off here');
 			expect((await request(user, 'avatar', 'command', { body: { text: '/avatar', embeds: [{ kind: 'upload' }] } })).error.code).toBe(-32602);
 			const late = await connect();
-			expect((await late.next()).params.caps).not.toContain('embed:upload');
+			expect((await late.next()).params.capabilities).not.toContain('embed:upload');
 			late.close();
 			const on = await toggle('on');
 			expect(notice(on.skipped)).toBe('Uploads are now **on**.');
 			expect((await request(user, 'post2', 'message', { body: { text: 'y', embeds: [{ kind: 'upload' }] } })).result.embeds).toHaveLength(1);
 			const fresh = await connect();
-			expect((await fresh.next()).params.caps).toContain('embed:upload');
+			expect((await fresh.next()).params.capabilities).toContain('embed:upload');
 			fresh.close();
 			expect((await request(user, 'nope', 'command', { body: { text: '/toggle uploads' } })).error.code).toBe(-32001);
 			expect((await request(admin, 'bad', 'command', { room_id: 'general', body: { text: '/toggle typing' } })).error.message).toBe('Usage: /toggle activity|uploads');
@@ -441,7 +441,7 @@ describe('uploads end to end', () => {
 			await bob.next();
 			await request(alice, 'auth', 'auth', { scheme: 'guest' });
 			await request(bob, 'auth', 'auth', { scheme: 'guest' });
-			return { alice, bob, caps: server.params.caps as string[] };
+			return { alice, bob, caps: server.params.capabilities as string[] };
 		};
 		try {
 			// Tests run with ACTIVITY=false: the first toggle turns it on.
