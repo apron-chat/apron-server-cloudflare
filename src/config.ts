@@ -42,7 +42,7 @@ export interface UploadConfig {
  */
 export function adminTokenError(token: string): string | null {
 	if (!/^[A-Za-z0-9_-]{24,256}$/.test(token)) return "APRON_ADMIN_TOKEN must be 24 to 256 letters, digits, - or _";
-	if (token.startsWith("apron_bot_") || token.startsWith("apron_invite_")) return "APRON_ADMIN_TOKEN must not start with apron_bot_ or apron_invite_";
+	if (["apron_bot_", "apron_invite_", "apron_join_"].some((prefix) => token.startsWith(prefix))) return "APRON_ADMIN_TOKEN must not start with apron_bot_, apron_invite_, or apron_join_";
 	return null;
 }
 

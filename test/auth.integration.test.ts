@@ -2,7 +2,7 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
 import { userIdSlug, WebAuthnService, type ChallengeRecord, type CredentialRepository } from '../src/auth';
 import { loadConfig } from '../src/config';
-import { Store } from '../src/store';
+import { MAX_PASSKEYS_PER_USER, Store } from '../src/store';
 
 const encode = (text: string) => new TextEncoder().encode(text);
 const join = (...parts: Uint8Array[]): Uint8Array<ArrayBuffer> => {
@@ -134,4 +134,30 @@ it('derives user_id slugs from requested names', () => {
 	expect(userIdSlug('Bot')).toBe('');
 	expect(userIdSlug('Guesthouse')).toBe('guesthouse');
 	expect(userIdSlug('Bottle')).toBe('bottle');
+});
+
+it(`adds passkeys to a registered identity, at most ${MAX_PASSKEYS_PER_USER}, never a bot or one already registered`, async () => {
+	await runInDurableObject(env.DEMO.getByName('auth-add-passkeys'), async (_instance, state) => {
+		const now = Date.now() + 1_000;
+		const store = new Store(state, { registrationsPerIpDay: 100 }, { now: () => now });
+		const credential = (id: string) => ({ credentialId: id, userId: 'keeper', publicKey: 'AAAA', counter: 0 });
+		store.registerIdentity({ userId: 'keeper', name: 'Keeper', userHandle: 'keeper-handle', now, ipKey: 'ip', credential: credential('key-0') });
+		for (let index = 1; index < MAX_PASSKEYS_PER_USER; index += 1) {
+			expect(store.addCredential({ userId: 'keeper', userHandle: 'ignored', now, ipKey: 'ip', credential: credential(`key-${index}`) })).toEqual({ userId: 'keeper', name: 'Keeper' });
+		}
+		expect(store.getIdentity('keeper')).toMatchObject({ credentialCount: MAX_PASSKEYS_PER_USER, userHandle: 'keeper-handle' });
+		expect(store.getCredential('key-3')?.userId).toBe('keeper');
+		const code = (fn: () => unknown) => { try { fn(); return 'ok'; } catch (error) { return (error as { code?: string }).code; } };
+		expect(code(() => store.addCredential({ userId: 'keeper', userHandle: 'x', now, ipKey: 'ip', credential: credential('key-extra') }))).toBe('denied');
+		store.registerIdentity({ userId: 'other', name: 'Other', userHandle: 'other-handle', now, ipKey: 'ip', credential: { ...credential('other-0'), userId: 'other' } });
+		expect(code(() => store.addCredential({ userId: 'other', userHandle: 'x', now, ipKey: 'ip', credential: credential('key-1') }))).toBe('denied');
+		state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES ('bot_keeper', '', 'Bot', 'bot', 1, 1)");
+		expect(code(() => store.addCredential({ userId: 'bot_keeper', userHandle: 'x', now, ipKey: 'ip', credential: credential('bot-key') }))).toBe('denied');
+		state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES ('admin', '', 'Admin', 'registered', 1, 1)");
+		expect(code(() => store.addCredential({ userId: 'admin', userHandle: 'x', now, ipKey: 'ip', credential: credential('admin-key') }))).toBe('denied');
+		// An identity without a passkey (an invited user) takes the handle of its first.
+		state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES ('invited', '', 'Invited', 'registered', 1, 1)");
+		store.addCredential({ userId: 'invited', userHandle: 'invited-handle', now, ipKey: 'ip', credential: credential('invited-key') });
+		expect(store.getIdentity('invited')).toMatchObject({ credentialCount: 1, userHandle: 'invited-handle' });
+	});
 });

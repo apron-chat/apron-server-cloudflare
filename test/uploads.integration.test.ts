@@ -36,6 +36,27 @@ type Write = { key: string; max_bytes: number; expires_ms: number };
 const writeOf = (result: Record<string, unknown>, index = 0) => (result.embeds as Array<{ embed_id: string; write: Write }>)[index];
 
 describe('store uploads', () => {
+	it('answers a retried post with the current state: the write grant only while the write is still open (§1.2)', async () => {
+		await withStore('uploads-retry', { uploads: UPLOADS }, (store, clock) => {
+			register(store, clock, 'rita');
+			const params = { body: { text: 'retried', embeds: [{ kind: 'upload', title: 'dot.png' }] } };
+			const send = () => store.commitMutation({ userId: 'rita', ipKey: 'ip-rita', requestId: 'retry-1', method: 'message', now: clock.value, params, identity: { user_id: 'rita', name: 'Name of rita' } });
+			const first = send();
+			const write = writeOf(first.result);
+			// Before the write, a retry gets the same grant, and nothing is executed again.
+			const early = send();
+			expect(early.deduplicated).toBe(true);
+			expect(early.broadcasts).toEqual([]);
+			expect(early.result).toEqual(first.result);
+			expect(store.claimUpload(write.write.key, clock.value)).toBe(true);
+			store.finishUpload({ key: write.write.key, ok: true, bytes: 64, contentType: 'image/png' }, clock.value);
+			// Once the write is done, the retry names the message and embed, without a grant.
+			const late = send();
+			expect(late.deduplicated).toBe(true);
+			expect(late.result).toEqual({ message_id: first.result.message_id, embeds: [{ embed_id: write.embed_id, kind: 'upload' }] });
+		});
+	});
+
 	it('gives every embed an id, starts pending uploads, and keeps what the server owns on a save', async () => {
 		await withStore('uploads-identity', { uploads: UPLOADS }, (store, clock) => {
 			register(store, clock, 'alice');
@@ -325,7 +346,7 @@ describe('uploads end to end', () => {
 			expect(embed.write_url).toMatch(/^https:\/\/demo\.test\/w\/a\./);
 			expect((await put(embed.write_url, png())).status).toBe(204);
 			const you = (await until(peer, (frame) => frame.method === 'user')).frame.params.you;
-			expect(you).toEqual({ user_id: userId, name: `Name of ${userId}`, avatar: expect.stringMatching(/^https:\/\/media\.test\/a\//) });
+			expect(you).toEqual({ user_id: userId, name: `Name of ${userId}`, avatar: expect.stringMatching(/^https:\/\/media\.test\/a\//), roles: [] });
 			expect((await request(peer, 'me', 'me', {})).result.you.avatar).toBe(you.avatar);
 			// A message's author is a recorded object, without the avatar.
 			const posted = await exchange(peer, 'post', 'message', { body: { text: 'hi' } });
@@ -384,7 +405,7 @@ describe('uploads end to end', () => {
 		const admin = await connect(null);
 		await admin.next();
 		expect((await request(admin, 'auth', 'auth', { scheme: 'token', token: ADMIN_TOKEN })).result.you.user_id).toBe('admin');
-		const notice = (skipped: Frame[]) => skipped.find((frame) => frame.params?.from?.user_id === '@private')!.params.body.text;
+		const notice = (skipped: Frame[]) => skipped.find((frame) => frame.params?.from?.user_id === '~private')!.params.body.text;
 		const toggle = (id: string) => exchange(admin, id, 'command', { room_id: 'general', body: { text: '/toggle uploads' } });
 		try {
 			const off = await toggle('off');
@@ -394,13 +415,13 @@ describe('uploads end to end', () => {
 			expect(refused.error.message).toBe('Uploads are turned off here');
 			expect((await request(user, 'avatar', 'command', { body: { text: '/avatar', embeds: [{ kind: 'upload' }] } })).error.code).toBe(-32602);
 			const late = await connect();
-			expect((await late.next()).params.caps).not.toContain('embed:upload');
+			expect((await late.next()).params.capabilities).not.toContain('embed:upload');
 			late.close();
 			const on = await toggle('on');
 			expect(notice(on.skipped)).toBe('Uploads are now **on**.');
 			expect((await request(user, 'post2', 'message', { body: { text: 'y', embeds: [{ kind: 'upload' }] } })).result.embeds).toHaveLength(1);
 			const fresh = await connect();
-			expect((await fresh.next()).params.caps).toContain('embed:upload');
+			expect((await fresh.next()).params.capabilities).toContain('embed:upload');
 			fresh.close();
 			expect((await request(user, 'nope', 'command', { body: { text: '/toggle uploads' } })).error.code).toBe(-32001);
 			expect((await request(admin, 'bad', 'command', { room_id: 'general', body: { text: '/toggle typing' } })).error.message).toBe('Usage: /toggle activity|uploads');
@@ -411,7 +432,7 @@ describe('uploads end to end', () => {
 		const admin = await connect(null);
 		await admin.next();
 		expect((await request(admin, 'auth', 'auth', { scheme: 'token', token: ADMIN_TOKEN })).result.you.user_id).toBe('admin');
-		const notice = (skipped: Frame[]) => skipped.find((frame) => frame.params?.from?.user_id === '@private')!.params.body.text;
+		const notice = (skipped: Frame[]) => skipped.find((frame) => frame.params?.from?.user_id === '~private')!.params.body.text;
 		const toggle = (id: string) => exchange(admin, id, 'command', { room_id: 'general', body: { text: '/toggle activity' } });
 		const guests = async () => {
 			const alice = await connect();
@@ -420,7 +441,7 @@ describe('uploads end to end', () => {
 			await bob.next();
 			await request(alice, 'auth', 'auth', { scheme: 'guest' });
 			await request(bob, 'auth', 'auth', { scheme: 'guest' });
-			return { alice, bob, caps: server.params.caps as string[] };
+			return { alice, bob, caps: server.params.capabilities as string[] };
 		};
 		try {
 			// Tests run with ACTIVITY=false: the first toggle turns it on.
@@ -454,7 +475,7 @@ describe('uploads end to end', () => {
 			const url = (await until(spammer, isMessage(frame.result.message_id))).frame.params.body.embeds[0].url;
 			const purged = await exchange(admin, 'purge', 'command', { room_id: 'general', body: { text: `/purge @${userId}` } });
 			expect(purged.frame.result).toEqual({});
-			expect(purged.skipped.find((candidate) => candidate.params?.from?.user_id === '@private')!.params.body.text).toBe(`Purged \`${userId}\`: 1 message, 0 reaction sets, 1 upload.`);
+			expect(purged.skipped.find((candidate) => candidate.params?.from?.user_id === '~private')!.params.body.text).toBe(`Purged \`${userId}\`: 1 message, 0 reaction sets, 1 upload.`);
 			await expect.poll(() => spammer.closed()?.code).toBe(1008);
 			await expect.poll(async () => await media().head(url.slice('https://media.test/'.length))).toBeNull();
 			const history = await request(admin, 'history', 'history', { room_id: 'general', limit: 50 });

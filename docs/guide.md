@@ -10,7 +10,7 @@ thread rooms over hibernating WebSockets. The backend supports guest access,
 discoverable passkeys, complete-snapshot history, message
 replacement/deletion/restoration/moves, thread rooms, emoji reactions, and a
 rolling retention floor. Guests only read (set `GUEST_POSTING=true` to let
-them post); signing in with a passkey lets a user post and invite a bot. It speaks protocol 6 with `history`,
+them post); signing in with a passkey lets a user post and invite a bot. It speaks protocol 7 with `history`,
 `edit`, `rooms`, `reactions`, and `command` (`/help` and `/invite-bot`), and
 advertises liveness pings and, with the Workers Paid budgets, typing through
 `activity` (`ACTIVITY` overrides); see [authentication and policy](policy.md) and [the
@@ -108,7 +108,7 @@ socket.onmessage = ({ data }) => {
 setInterval(() => socket.send('{"method":"ping"}'), 45_000);
 ```
 
-A guest only reads: each connection gets a `@private` welcome saying so right
+A guest only reads: each connection gets a `~private` welcome saying so right
 after the `server` frame, before any `auth`, and
 `message`, `reactions`, `room_set`, `room_join`, and `room_leave` are `denied`;
 `room_list` and `history` work for any room without joining it. To exercise posting,
@@ -120,20 +120,30 @@ only); posting to a room does not require joining it. `room_list` lists
 joined rooms and rooms to join by `filter`, with `members` and `users` on
 request, up to 6 times a minute per user (the first `filter: "joined"`
 listing after authentication is free), and `room_update` reports changes.
-A registered user's joins and leaves are logged `membership` records,
-returned in `history`; a guest's live in its connection and are not logged,
+A registered user's joins and leaves are logged membership records,
+delivered in `room_update` `memberships` and returned in `history`; a guest's live in its connection and are not logged,
 so `room_list` ignores `latest_log_id` and always answers with a full
 listing. `members` lists every connected member and at most 200 registered
-members per room (100 with the Free budgets). See [SPEC section 4](../SPEC.md#memberships).
+members per room (100 with the Free budgets); a room with more lists the first by `user_id`, not by recent activity, and also gives
+`member_count`. Registered users carry `roles` (`admin`, `bot`, or `[]` for none) in `users`
+and `you`. See [SPEC section 4](../SPEC.md#memberships).
 The whole server processes at most 600 frames a
 minute (300 with the Free budgets); past that, requests get `retry_after` and the socket stays open. The demo
 only creates thread rooms: `room_set` creations need `parent_room_id: "general"`,
-and `general` itself cannot be edited. This is a shared public room, not
+and `general` itself cannot be edited. A thread's `description` (Markdown)
+says what it is about, and any participant may change it. Every room is
+public: `private: true` is `unsupported`. System notices come from `~private`,
+`~room`, or `~server`; no user's `user_id` starts with `~`. This is a shared public room, not
 an isolated sandbox: test messages are visible to others, guest ownership lasts
 only for the socket, and IP/resource quotas and retention still apply. Changing
 frontend origins does not give an IP a fresh allowance. Honor `retry_after`.
 
-The server advertises `token` (for bot tokens) and `guest` to custom frontends.
+The `server` frame's `welcome` is Markdown for your sign-in screen. The server
+advertises `token` (for bot tokens) and `guest` to custom frontends, and never
+`email`; `signup` names the schemes that create an account (`webauthn` on the
+demo's own site, and `token` for an admin's `/invite` sign-up token, whose
+`auth` result carries the new user's own token to save). A user who signed up
+with a token can add a passkey by registering one while signed in.
 `web.apron.chat` additionally receives `webauthn`, and its `token` also resumes
 passkey sessions; inspect each connection's `server.params.auth` rather than
 assuming passkeys are available everywhere.
@@ -144,7 +154,7 @@ admission cannot override the frontend's own browser policies.
 ## Bots
 
 Sign in on the demo with a passkey and run `/invite-bot` in any room. You get
-a `@private` notice, only on that tab, with a bearer token for your bot:
+a `~private` notice, only on that tab, with a bearer token for your bot:
 `bot_<your user_id>`, named "Bot of <your name>", and instructions you can
 give an LLM to connect it: read `PROTOCOL.md`, connect to the server, sign in
 with the token scheme and your token, and say hello. A bot of your own
@@ -162,7 +172,10 @@ socket.onmessage = ({ data }) => {
 ```
 
 A bot posts, reacts, starts threads, and keeps its rooms like a registered
-user, under its own posting quota; it cannot rename itself or invite bots. The
+user, under its own posting quota; it cannot rename itself or invite bots.
+You can add your bot to a thread, say to keep its `description` current,
+with `room_join` and its `user_id`, and remove it with `room_leave` the same
+way. The
 token does not expire. Running `/invite-bot` again replaces it, signs out
 connections that used the old one, and renames the bot after your current name.
 The first invite counts as a registration. See [SPEC section 5](../SPEC.md#bots).
@@ -341,10 +354,17 @@ For direct Wrangler production commands, always pass
 5. Review `wrangler.production.toml`: fixed DO binding, `new_sqlite_classes` migration,
    no paid-service bindings. Apply the initial migration once using the normal
    Wrangler deployment workflow. Do not rename or recreate the production
-   object to work around a quota or schema issue. Stored data is not migrated
-   between schema versions: a deploy that changes the storage schema resets the
-   demo on the object's first wake (the current schema is 5; see
-   [SPEC section 8](../SPEC.md#schema-versions)). All chat history, rooms,
+   object to work around a quota or schema issue. The current schema is 6
+   (protocol 7); a schema 5 object (protocol 6) is upgraded in place on its
+   first wake, keeping everything, with each thread's intro message becoming
+   its `description` (see [SPEC section 8](../SPEC.md#schema-versions)).
+   The upgrade is one-way: redeploying protocol 6 code afterwards resets the
+   object like any schema change, so fix forward instead of rolling back. It
+   also fails closed: if it cannot finish, nothing changes, and the object
+   throws on every wake until a fixed deploy upgrades it.
+   Stored data from any other schema is not migrated: a deploy that changes
+   the storage schema otherwise resets the demo on the object's first wake.
+   All chat history, rooms,
    sessions, bot tokens, and limiter windows are deleted, and saved session
    tokens fall back to sign-in. Registered passkeys survive: up to 100 of the
    most recently used are carried over with their identities, so users sign in

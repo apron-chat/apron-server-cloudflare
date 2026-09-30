@@ -60,7 +60,7 @@ export interface Limits {
 	globalFramesPerMinute: number;
 	/**
 	 * Per-type throttles, counted per user across their connections. Activity
-	 * over its limit is dropped and the sender gets one `@private` notice per
+	 * over its limit is dropped and the sender gets one `~private` notice per
 	 * window; other requests over theirs are answered with `retry_after`.
 	 */
 	activityBroadcastsPerUserMinute: number;

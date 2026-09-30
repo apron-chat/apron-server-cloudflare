@@ -36,8 +36,10 @@ work. The first reservation after a wake or UTC-day handover also carries an
 eight-row handover allowance. Only a `message` mutation naming a `message_id`
 (an edit, which may be a move) has the conservative 256-write mutation floor;
 creates, reactions, rooms and renames, measured at most 37 writes, have a
-96-write floor. Request-ID mutations also do an 8/8 pre-duplicate lookup,
-which reserves 16/16 after control overhead, so a steady-state request-ID
+96-write floor. Request-ID mutations also do a pre-duplicate lookup of
+`8 + 4 × maxEmbeds` reads (24 at the default four embeds) and 8 writes, which
+reserves 32/16 after control overhead: a replay's result reflects the current
+state, so it reads each upload embed's write state (§1.2). So a steady-state request-ID
 create reserves 120 writes and a request-ID edit 280 (104 and 264 without a
 request ID). History pages reserve a 32-write floor. A cleanup run has a
 bounded due-check reservation (14 reads for its seven indexed existence
@@ -62,14 +64,14 @@ upper bounds can be compared with the measured worst case.
 | Identity count | 4 | 2 | 16 | 8 |
 | Credential IDs lookup | 4 | 2 | 40 | 8 |
 | Credential counter update | 5 | 3 | 16 | 16 |
-| Message create with request ID | 33 | 37 | 280 | 120 |
+| Message create with request ID | 33 | 37 | 296 | 120 |
 | Empty new message (not logged) | 4 | 2 | 16 | 8 |
-| Deduplicated mutation retry | 5 | 2 | 16 | 16 |
-| Reaction set | 27 | 27 | 280 | 120 |
-| Thread room create by a registered user (stores and logs the membership) | 31 | 35 | 280 | 120 |
-| Thread room save | 21 | 19 | 280 | 120 |
-| Message move with one reaction set | 27 | 32 | 280 | 280 |
-| Registered name mutation | 23 | 19 | 280 | 120 |
+| Deduplicated mutation retry | 5 | 2 | 32 | 16 |
+| Reaction set | 27 | 27 | 296 | 120 |
+| Thread room create by a registered user (stores and logs the membership) | 28 | 35 | 296 | 120 |
+| Thread room save | 21 | 19 | 296 | 120 |
+| Message move with one reaction set | 27 | 32 | 296 | 280 |
+| Registered name mutation | 23 | 19 | 296 | 120 |
 | Registered room leave (logs the membership) | 24 | 20 | 482 | 72 |
 | Registered room join (logs the membership) | 23 | 17 | 482 | 72 |
 | Registered room join at the 100-thread ceiling | 333 | 32 | 482 | 72 |
@@ -77,31 +79,32 @@ upper bounds can be compared with the measured worst case.
 | Room record lookup (`general`) | 5 | 2 | 24 | 8 |
 | Room join lookup | 5 | 2 | 24 | 8 |
 | Room listing (representative matrix) | 8 | 2 | 444 | 8 |
-| Room members, `general` and one thread | 8 | 2 | 424 | 8 |
-| Room members, 101 rooms with 100 registered members each | 20,203 | 2 | 20,620 | 8 |
+| Room members, `general` and one thread | 8 | 2 | 824 | 8 |
+| Room members, 101 rooms with 200 registered members each | 40,403 | 2 | 40,820 | 8 |
 | Admission snapshot | 6 | 2 | 40 | 24 |
 | Cleanup (matrix, one day later) | 128 | 51 | 1,070 | 1,058 |
 | Alarm scheduling | 8 | 4 | 24 | 12 |
 
 The matrix uses a fresh object and one representative operation for each
 boundary; every operation stayed within its reservation. The room-listing test
-separately populated the 100-thread policy ceiling, each thread with an intro
-message embedded from current message state; listing all 101 rooms measured
-307/2 against its 452/16 reservation, which is derived from that ceiling
-(`32 + 4 * 101` rows plus reservation control) because each room adds an
-indexed intro-message lookup. A 180-record fixture mixing room, message, and
+separately populated the 100-thread policy ceiling, each thread with a
+description; listing all 101 rooms measured 207/2 against its 452/16
+reservation, which is derived from that ceiling (`32 + 4 * 101` rows plus
+reservation control). Protocol 7 keeps a room's `description` in its own row;
+under protocol 6 each room also looked up its intro message (307/2), and the
+reservation was kept. A 180-record fixture mixing room, message, and
 reaction records returned a 50-record forward page (`more: true`,
 `first_log_id`/`last_log_id` spanning all kinds) at 61/6 against its 272/48
 reservation. The maximum snapshot test used a 4,096-byte text body plus an
 `ext` field and produced an 8,154-byte serialized snapshot. Its maximum
-observed accepted mutation was 34/37, below the 288/128 request-ID create
+observed accepted mutation was 34/37, below the 304/128 request-ID create
 reservation of the first operation after a handover.
 
 The worst move was measured at the calibrated reaction ceilings rather than
 the defaults: 64 reacting users, each with 16 distinct 64-byte emoji and a
 320-byte name. Each reaction set measured at most 93/32. Moving the message
 re-logged all 64 sets in one 92,693-byte reaction record and measured 216/158
-against its 280/280 reservation; the record still fit one history response.
+against its 296/280 reservation; the record still fit one history response.
 The per-message cap is what bounds this move: without it, the re-logged set
 count would be limited only by posting quotas.
 
@@ -109,7 +112,14 @@ Memberships:
 
 - A registered user's join or leave is one reservation that counts as a post.
   It stores or removes the membership row, appends one membership record, and
-  advances the room's head, within the 64-write floor. The read floor covers
+  advances the room's head, within the 64-write floor. The room's
+  `member_count` changes in that same head update, so it writes no extra row
+  (the matrix's join and leave measured the same before it). Protocol 7
+  delivers the record in `room_update` `memberships`, together with the
+  user's own `joined` or `left`: one frame fewer per connection of the
+  joining or leaving user, and the same rows. Adding or
+  removing another user (`room_join`/`room_leave` with `user_id`, `/kick`)
+  is the same operation, charged to the one who asked. The read floor covers
   the user's rooms, read by the user index and joined to `rooms`
   (`8 + 2 × (101 + 100)` rows for live rooms and removed rooms awaiting
   purge). A join or leave that changes nothing writes nothing.
@@ -120,12 +130,34 @@ Memberships:
   join reads the room record (24/8) and its members (below).
 - `members` (`room_list` with `members: true`, and `room_update` `joined`)
   read each listed room's registered members by primary-key range with one
-  identity lookup each, at most `roomListMembers` (100) per room: the
-  reservation is `8 + rooms × (4 + 2 × 100)` reads. Connected members come from
+  identity lookup each, at most `roomListMembers` (200 with the Workers Paid
+  budgets, 100 with the Free ones) per room: the reservation is
+  `8 + rooms × (4 + 2 × roomListMembers)` reads. Connected members come from
   connection attachments. A user in `general` and a few threads reads about
   two rows per registered member of those rooms; the worst case, a listing of
-  all 101 rooms each at the cap, measured 20,203 reads, which the 2,500,000
-  foreground reads a day allow about 120 times.
+  all 101 rooms each at the cap, measured 40,403 reads at 200, which the
+  25,000,000 foreground reads a day allow about 600 times (about 20,200 at
+  Free's 100, about 120 times its 2,500,000). A room whose page of
+  registered members is full also reads its `member_count` (one row, within
+  the per-room slack), so the listing can say how many it left out.
+- Adding a passkey while signed in (§4.9) is one reservation of 96 reads
+  and 48 writes, charged as a registration: the identity and credential
+  lookups, a count of the account's passkeys (at most 8), the credential row
+  with its indexes, and the registration limiter rows. The per-IP (5, Free 3)
+  and daily registration caps bound it like new registrations.
+- A sign-up with an `/invite` token is an `/invite-token` registration, plus
+  up to 8 `user_id` availability probes (8 reads each, reserved), the new
+  user's `getIdentity` read, and one KV read and three KV writes (the
+  invite's count and the new user's own token and pointer, in one put),
+  reserved at their bound before the account is created. `/invite` itself is
+  one KV read and three writes, and `/invite-token` two KV writes, each at
+  its bound.
+- `/passkeys` reads at most 8 credential rows; `/passkeys remove` adds one
+  delete with its index. Adding a passkey to an account without a WebAuthn
+  user handle writes it at `begin` (one conditional row update).
+- `roles` in current user objects need the admin list: one `_meta` read per
+  object wake, kept in memory and updated by `/admin`, `/rename`, and
+  `/purge`, the only changes to it. Guests and bots need no read.
 - History pages read membership records from the same room range as every
   other record, and look up no user objects.
 - Cleanup purges a removed thread's membership rows in the same bounded
@@ -133,21 +165,21 @@ Memberships:
   membership per removed room within the 1,032/1,032 batch reservation.
 - `room_list` ignores `latest_log_id`, so a reconnect's listing is always a
   full joined listing.
-- `@private` throttle notices and `/help` replies carry no `log_id`, so they
+- `~private` throttle notices and `/help` replies carry no `log_id`, so they
   need no SQL.
 
 For the three-day traffic sample, the operation rows were:
 
 | Operation | Observed reads/writes | Reserved reads/writes |
 | --- | ---: | ---: |
-| Day 0 create | 34 / 37 | 288 / 128 |
-| Day 1 create | 27 / 23 | 296 / 136 |
-| Day 2 edit of older message | 29 / 22 | 296 / 296 |
-| Day 2 create | 21 / 22 | 280 / 120 |
+| Day 0 create | 34 / 37 | 304 / 128 |
+| Day 1 create | 27 / 23 | 312 / 136 |
+| Day 2 edit of older message | 29 / 22 | 312 / 296 |
+| Day 2 create | 21 / 22 | 296 / 120 |
 | Cleanup | 61 / 18 | 1,070 / 1,058 |
 | History after cleanup | 8 / 2 | 264 / 40 |
 
-The native SQLite file reported `databaseSize = 147,456` bytes. These values
+The native SQLite file reported `databaseSize = 167,936` bytes. These values
 are a small schema/data sample and are not a per-message capacity estimate.
 
 ## Guest numbers
@@ -201,7 +233,7 @@ typing minute. Read-cursor updates, which the demo drops, cost the same per
 frame. The per-user relay limit (10 a minute) and the frame limits (60 per
 connection and 120 per IP a minute) bound a single sender.
 
-A throttled sender's `@private` notice is sent to that connection only, at
+A throttled sender's `~private` notice is sent to that connection only, at
 most once per user per minute, and needs no SQL. `room_list` reuses the
 room-listing reservation (444 reads, 8 writes) and adds no writes; with
 `members: true` it also reads each listed room's registered members (see
@@ -303,8 +335,7 @@ move re-logging reactions:
   SEARCH reaction_state USING INDEX sqlite_autoindex_reaction_state_1 (message_id=?)
   USE TEMP B-TREE FOR ORDER BY
 room listing:
-  SCAN r
-  SEARCH m USING INDEX sqlite_autoindex_message_state_1 (message_id=?) LEFT-JOIN
+  SCAN rooms
   USE TEMP B-TREE FOR ORDER BY
 dedup expiry:
   SEARCH accepted_requests USING INDEX accepted_requests_expiry_idx (expires_ms<?)
@@ -330,9 +361,22 @@ members are one primary-key range per room, already in `user_id` order, with a
 primary-key identity lookup per member; a user's rooms are one index range,
 sorted after joining the capped rooms table.
 
-## Schema reset
+## Schema upgrade and reset
 
-A stored schema version other than the current one resets the object with
+A schema 5 object (protocol 6) is upgraded to schema 6 in place, once, in one
+transaction (`test/schema-reset.integration.test.ts`): it reads the capped
+rooms table with each room's intro message (one indexed read each), every
+stored record once to find the room records (records have no index by kind;
+the log holds at most the retention window, about 80,000 records at the
+Workers Paid post ceiling and a week's retention), every membership row
+once to fill the member counts, and every credential once to rebuild
+`credentials` without its one-passkey constraint (at most the 10,000-identity
+cap); it rewrites each room row and room record.
+The rows it measurably read and wrote are added to the day's maintenance
+counters without a capacity check, like the reset's passkey carry, so an
+exhausted budget cannot block it. The object is not wiped.
+
+Any other stored schema version resets the object with
 `deleteAll()` and recreates the schema (`test/schema-reset.integration.test.ts`).
 The reset is charged the same one-time 512/512 bootstrap reservation as a new
 object, added to the carried-over current-day reservation row without a

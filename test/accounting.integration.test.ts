@@ -356,7 +356,7 @@ describe('measured storage accounting', () => {
 		expect(second.size).toBe(first.size);
 	});
 
-	it('measures room listing costs at the 100-thread policy ceiling with embedded intro messages', async () => {
+	it('measures room listing costs at the 100-thread policy ceiling with descriptions', async () => {
 		const stub = env.DEMO.getByName('accounting-room-list-v2');
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
@@ -364,17 +364,11 @@ describe('measured storage accounting', () => {
 			store.initialize();
 			state.storage.transactionSync(() => {
 				for (let index = 1; index <= 100; index += 1) {
-					const messageId = `${index}`;
-					const snapshot = JSON.stringify({ message_id: messageId, log_id: messageId, room_id: 'general', from: { user_id: 'lister' }, body: { text: `intro ${index}`, format: 'plain', embeds: [] } });
 					state.storage.sql.exec(
-						'INSERT INTO message_state (message_id, room_id, latest_log_id, snapshot_json, author_id) VALUES (?, ?, ?, ?, ?)',
-						messageId, 'general', clock.now() + index, snapshot, 'lister',
-					);
-					state.storage.sql.exec(
-						`INSERT INTO rooms (room_id, parent_room_id, created_log_id, record_log_id, latest_log_id, intro_message_id, fields_json, created_ms, updated_ms)
-						 VALUES (?, 'general', ?, ?, ?, ?, ?, ?, ?)`,
-						`thread-${index}`, clock.now() + 1_000 + index, clock.now() + 1_000 + index, clock.now() + 1_000 + index, messageId,
-						JSON.stringify({ title: `Thread ${index}` }), clock.now(), clock.now(),
+						`INSERT INTO rooms (room_id, parent_room_id, created_log_id, record_log_id, latest_log_id, fields_json, created_ms, updated_ms)
+						 VALUES (?, 'general', ?, ?, ?, ?, ?, ?)`,
+						`thread-${index}`, clock.now() + 1_000 + index, clock.now() + 1_000 + index, clock.now() + 1_000 + index,
+						JSON.stringify({ title: `Thread ${index}`, description: `description ${index}` }), clock.now(), clock.now(),
 					);
 				}
 			});
@@ -384,7 +378,7 @@ describe('measured storage accounting', () => {
 			const listing = costSince(store, beforeListing);
 			expect(rooms).toHaveLength(101);
 			expect(rooms[0].room_id).toBe('general');
-			expect(rooms[1].intro_message).toMatchObject({ message_id: '1', body: { text: 'intro 1' } });
+			expect(rooms[1].description).toBe('description 1');
 			expectWithinReserve(listing);
 
 			// A registration that starts in 100 rooms (a guest's, carried over)
@@ -702,7 +696,7 @@ describe('measured storage accounting', () => {
 			}));
 			const threadId = measure('thread room create', () => store.commitMutation({
 				userId: 'matrix-user', ipKey: 'matrix-thread-ip', requestId: 'matrix-thread', method: 'room_set', now: clock.now(),
-				params: { parent_room_id: 'general', title: 'Matrix thread', intro_message: { message_id: messageId } }, identity,
+				params: { parent_room_id: 'general', title: 'Matrix thread', description: 'What the matrix measures' }, identity,
 			})).result.room_id as string;
 			measure('thread room update', () => store.commitMutation({
 				userId: 'matrix-user', ipKey: 'matrix-thread-ip', requestId: 'matrix-thread-update', method: 'room_set', now: clock.now(),
@@ -769,8 +763,7 @@ describe('measured storage accounting', () => {
 				reactionExpiry: explain(sql, 'EXPLAIN QUERY PLAN SELECT message_id, user_id FROM reaction_state WHERE log_id < ? ORDER BY log_id LIMIT ?', 100, 100),
 				moveReactions: explain(sql, 'EXPLAIN QUERY PLAN SELECT message_id, user_id, log_id, from_json, emojis_json FROM reaction_state WHERE message_id = ? AND log_id >= ? ORDER BY log_id, user_id LIMIT ?', '1', 1, 32),
 				roomListing: explain(sql, `EXPLAIN QUERY PLAN
-					SELECT r.room_id, m.snapshot_json FROM rooms r LEFT JOIN message_state m ON m.message_id = r.intro_message_id
-					ORDER BY r.created_log_id ASC LIMIT ?`, 101),
+					SELECT room_id, fields_json FROM rooms ORDER BY created_log_id ASC LIMIT ?`, 101),
 				dedupExpiry: explain(sql, 'EXPLAIN QUERY PLAN SELECT user_id, request_id FROM accepted_requests WHERE expires_ms <= ? ORDER BY expires_ms ASC LIMIT ?', clock.now(), 100),
 				limiterExpiry: explain(sql, 'EXPLAIN QUERY PLAN SELECT scope, principal_key FROM principal_limits WHERE updated_ms < ? ORDER BY updated_ms ASC LIMIT ?', clock.now() - DAY, 100),
 				roomMembers: explain(sql, `EXPLAIN QUERY PLAN
@@ -790,7 +783,8 @@ describe('measured storage accounting', () => {
 		expect(result.plans.messageExpiry.some((detail) => /message_state_latest_idx/i.test(detail))).toBe(true);
 		expect(result.plans.reactionExpiry.some((detail) => /reaction_state_log_idx/i.test(detail))).toBe(true);
 		expect(result.plans.moveReactions.some((detail) => /SEARCH reaction_state USING/i.test(detail))).toBe(true);
-		expect(result.plans.roomListing.some((detail) => /SEARCH m USING/i.test(detail))).toBe(true);
+		// The rooms table is capped at the thread ceiling plus `general`, so the listing scans it.
+		expect(result.plans.roomListing.some((detail) => /SCAN rooms/i.test(detail))).toBe(true);
 		expect(result.plans.dedupExpiry.some((detail) => /accepted_requests.*expiry|expiry.*accepted_requests/i.test(detail))).toBe(true);
 		expect(result.plans.limiterExpiry.some((detail) => /principal_limits_updated_idx/i.test(detail))).toBe(true);
 		expect(result.plans.roomMembers.some((detail) => /SEARCH m USING .*autoindex_memberships/i.test(detail))).toBe(true);

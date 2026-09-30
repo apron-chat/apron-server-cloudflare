@@ -217,7 +217,7 @@ it("continues bounded cleanup while retaining recent edits and moves out of a th
 	await withStore("cleanup-continuation", { ...ROOMY, cleanupBatch: 2 }, (store, clock) => {
 		const root = store.mutate(messageInput(clock, "cleanup-root", { body: { format: "plain", text: "root-old" } }));
 		const rootId = String(root.result.message_id);
-		const thread = store.mutate(op(clock, "cleanup-thread", "room_set", { parent_room_id: "general", title: "Retained thread", intro_message: { message_id: rootId } }));
+		const thread = store.mutate(op(clock, "cleanup-thread", "room_set", { parent_room_id: "general", title: "Retained thread", description: "About the root" }));
 		const threadId = String(thread.result.room_id);
 		const reply = store.mutate(op(clock, "cleanup-reply", "message", { room_id: threadId, body: { format: "plain", text: "reply-old" } }));
 		const replyId = String(reply.result.message_id);
@@ -258,7 +258,7 @@ it("continues bounded cleanup while retaining recent edits and moves out of a th
 		// The thread keeps its room record: the move still touches its log.
 		const retained = store.getRoomState(threadId);
 		expect(retained).toMatchObject({ log_id: threadId, title: "Retained thread", latest_log_id: String(departureLog) });
-		expect(retained.intro_message).toMatchObject({ message_id: rootId, body: { text: "root-recent" } });
+		expect(retained.description).toBe("About the root");
 		expect(retained.history_log_id).toBe(room.history_log_id);
 		const threadHistory = store.history({ roomId: threadId, limit: 50, now: clock.value });
 		expect(messagesOf(threadHistory).map((entry) => BigInt(entry.log_id))).toEqual([departureLog]);
@@ -329,7 +329,7 @@ it("does not exceed the native cleanup reservation for a full bounded batch", as
 				"fixture", `limiter-${index}`, "1970-01-01", expiredAt,
 			);
 			sql.exec(
-				"INSERT INTO rooms (room_id, parent_room_id, created_log_id, record_log_id, latest_log_id, intro_message_id, fields_json, created_ms, updated_ms) VALUES (?, 'general', ?, ?, ?, NULL, '{}', ?, ?)",
+				"INSERT INTO rooms (room_id, parent_room_id, created_log_id, record_log_id, latest_log_id, fields_json, created_ms, updated_ms) VALUES (?, 'general', ?, ?, ?, '{}', ?, ?)",
 				`thread-${index}`, index, index, index, expiredAt, expiredAt,
 			);
 			sql.exec("INSERT INTO memberships (room_id, user_id) VALUES (?, ?)", `thread-${index}`, userId);
@@ -470,15 +470,15 @@ it("logs registered memberships in the room's log and returns them in history's 
 		const page = store.history({ roomId, after: 0n, limit: 50, now: clock.value });
 		expect(page.rooms?.map((room) => room.room_id)).toEqual([roomId]);
 		expect(page.messages).toBeUndefined();
-		expect(page.membership).toEqual([created.membership?.params, leave.membership?.params, rejoin.membership?.params]);
+		expect(page.memberships).toEqual([created.membership?.params, leave.membership?.params, rejoin.membership?.params]);
 		expect([page.first_log_id, page.last_log_id]).toEqual([roomId, rejoin.membership?.params.log_id]);
 		// A membership counts toward limit like any record, in log order.
 		const firstTwo = store.history({ roomId, after: 0n, limit: 2, now: clock.value });
 		expect(firstTwo.rooms).toHaveLength(1);
-		expect(firstTwo.membership).toEqual([created.membership?.params]);
+		expect(firstTwo.memberships).toEqual([created.membership?.params]);
 		expect(firstTwo.more).toBe(true);
 		const generalPage = store.history({ roomId: "general", after: BigInt(start), before: BigInt(start), now: clock.value });
-		expect(generalPage.membership).toEqual([identity.broadcasts[0].params]);
+		expect(generalPage.memberships).toEqual([identity.broadcasts[0].params]);
 
 		// Members are listed from storage, in user_id order, with current names.
 		register(store, clock, "reg_b", ["general", roomId, "no-such-room"]);

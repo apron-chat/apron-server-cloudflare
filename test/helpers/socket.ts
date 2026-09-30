@@ -44,14 +44,14 @@ export type Peer = Awaited<ReturnType<typeof connect>>;
 
 /**
  * Reads the frames every connection opens with: `server`, then the
- * `@private` welcome naming the server version (Appendix B).
+ * `~private` welcome naming the server version (Appendix B).
  */
 export async function greeting(peer: Peer): Promise<{ server: Frame; welcome: Frame }> {
 	const server = await peer.next();
 	expect(server.method).toBe("server");
 	const welcome = await peer.next();
 	expect(welcome.method).toBe("message");
-	expect(welcome.params.from.user_id).toBe("@private");
+	expect(welcome.params.from.user_id).toBe("~private");
 	expect(welcome.params.body.text).toMatch(/^Welcome to Apron Chat\. Server version: `[^`]+`/);
 	return { server, welcome };
 }
