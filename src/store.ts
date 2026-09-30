@@ -429,6 +429,7 @@ export type RecordKind = "room" | "message" | "reactions" | "membership";
  * members of `rooms`: its room, and for a move both rooms (§3.4, §4.1).
  */
 export interface Broadcast {
+  /** A membership record is delivered in `room_update` `membership` (§4.3.3), not as its own notification. */
   method: "message" | "reactions" | "membership";
   params: Record<string, unknown>;
   rooms: string[];
@@ -3281,6 +3282,24 @@ export class Store {
     }));
   }
 
+  /**
+   * Takes a user off the `/admin` list. `added` (named for grantAdmin's
+   * result) is whether they were on it.
+   */
+  revokeAdmin(input: { userId: string; now?: number }): { added: boolean; name: string } {
+    this.ensureReady();
+    return this.reserved({ reads: 8, writes: 4 }, false, input.now ?? this.clock.now(), () => this.transaction(() => {
+      const identity = this.identityRow(input.userId);
+      const admins = this.adminIds();
+      if (!admins.includes(input.userId)) {
+        if (!identity) throw new StoreError("invalid_params", "No registered user has that user_id");
+        return { added: false, name: identity.name };
+      }
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ADMINS, JSON.stringify(admins.filter((id) => id !== input.userId)));
+      return { added: true, name: identity?.name ?? "" };
+    }));
+  }
+
   private adminIds(): string[] {
     const raw = this.metaValue(META_ADMINS);
     if (!raw) return [];
@@ -4152,11 +4171,29 @@ export class Store {
     );
   }
 
-  private deduplicatedCommit(row: RawDedupRow, method: string, digest: string): StoreMutationResult {
+  /**
+   * An accepted retry (§1.2): not executed or broadcast again, and its result
+   * reflects the current state. The stored results name what the operation
+   * made (`message_id`, `room_id`), which stays true, except an upload's
+   * write grant: once its write has been claimed, finished, or has expired,
+   * the retry's result leaves the grant out, so no stale `write_url` is
+   * signed. One indexed read per upload embed (at most `maxEmbeds`).
+   */
+  private deduplicatedCommit(row: RawDedupRow, method: string, digest: string, now: number): StoreMutationResult {
     if (row.digest !== digest) throw new StoreError("invalid_params", "request ID was already used for a different operation");
     const stored = parseJson<Record<string, unknown>>(row.result_json, {});
     if (stored.__method !== undefined && stored.__method !== method) throw new StoreError("invalid_params", "request ID was already used for a different method");
     delete stored.__method;
+    if (Array.isArray(stored.embeds)) {
+      stored.embeds = stored.embeds.map((embed: unknown) => {
+        if (!isPlainObject(embed) || !isPlainObject(embed.write) || typeof embed.write.key !== "string") return embed;
+        const upload = this.uploadRow(embed.write.key);
+        if (upload && upload.state === "pending" && upload.write_expires_ms >= now) return embed;
+        const { write: _write, ...rest } = embed;
+        void _write;
+        return rest;
+      });
+    }
     return { result: stored, broadcasts: [], deduplicated: true };
   }
 
@@ -4194,15 +4231,13 @@ export class Store {
     // capacity is exhausted, while still paying their bounded SQL lookup.
     let effective = operationNow;
     if (input.requestId !== undefined) {
-      const lookup = this.reserved({ reads: 8, writes: 8 }, false, operationNow, () => {
+      const lookup = this.reserved({ reads: 8 + 4 * this.config.maxEmbeds, writes: 8 }, false, operationNow, () => {
         const lookupNow = this.effectiveNow(operationNow);
-        return {
-          now: lookupNow,
-          row: this.dedupRow(input.userId, input.requestId!, lookupNow),
-        };
+        const row = this.dedupRow(input.userId, input.requestId!, lookupNow);
+        return { now: lookupNow, row, replay: row ? this.deduplicatedCommit(row, method, digest, lookupNow) : null };
       });
       effective = lookup.now;
-      if (lookup.row) return this.deduplicatedCommit(lookup.row, method, digest);
+      if (lookup.replay) return lookup.replay;
     }
     // Conservative floors for the three posting limiter rows, dedup row,
     // records, current state, and room/log bookkeeping. An edit may be a move,

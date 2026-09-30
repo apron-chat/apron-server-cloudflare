@@ -283,14 +283,14 @@ it('sends user notifications for renames and for a guest signing in on its conne
 		// Signing in on a guest's connection retires the guest for everyone else.
 		tab.send({ id: 'resume', method: 'auth', params: { scheme: 'token', token } });
 		expect((await until(tab, (frame) => frame.id === 'resume')).frame.result.you.user_id).toBe('user_session_notify');
-		expect((await until(watcher, (frame) => frame.method === 'user')).frame.params).toEqual({ new: { user_id: 'user_session_notify', name: 'Name of user_session_notify' }, old: guest });
+		expect((await until(watcher, (frame) => frame.method === 'user')).frame.params).toEqual({ new: { user_id: 'user_session_notify', name: 'Name of user_session_notify', roles: [] }, old: guest });
 
 		second.send({ id: 'resume', method: 'auth', params: { scheme: 'token', token } });
 		await until(second, (frame) => frame.id === 'resume');
 		tab.send({ id: 'rename', method: 'me', params: { name: 'Notified' } });
 		await until(tab, (frame) => frame.id === 'rename');
-		expect((await until(second, (frame) => frame.method === 'user')).frame.params).toEqual({ you: { user_id: 'user_session_notify', name: 'Notified' } });
-		expect((await until(watcher, (frame) => frame.method === 'user')).frame.params).toEqual({ new: { user_id: 'user_session_notify', name: 'Notified' } });
+		expect((await until(second, (frame) => frame.method === 'user')).frame.params).toEqual({ you: { user_id: 'user_session_notify', name: 'Notified', roles: [] } });
+		expect((await until(watcher, (frame) => frame.method === 'user')).frame.params).toEqual({ new: { user_id: 'user_session_notify', name: 'Notified', roles: [] } });
 	} finally { watcher.close(); tab.close(); second.close(); }
 });
 
@@ -334,9 +334,11 @@ it('logs a registered user\'s joins and leaves as memberships, delivered around 
 	const joinedIds = async (peer: Peer) =>
 		(await request(peer, 'mine', 'room_list', { filter: 'joined' })).result.joined.map((room: { room_id: string }) => room.room_id);
 	const methods = (frames: Frame[]) => frames.map((frame) => frame.method);
-	const membership = (roomId: string, joined: boolean) => ({
-		method: 'membership', params: { log_id: expect.stringMatching(/^[1-9][0-9]*$/), room_id: roomId, members: [{ user: { user_id: userId, name }, joined }] },
+	// A logged membership record, as `room_update` `membership` carries it (§4.3.2).
+	const record = (roomId: string, joined: boolean) => ({
+		log_id: expect.stringMatching(/^[1-9][0-9]*$/), room_id: roomId, members: [{ user: { user_id: userId, name }, joined }],
 	});
+	const membershipOnly = (roomId: string, joined: boolean) => ({ method: 'room_update', params: { membership: [record(roomId, joined)] } });
 	const tab = await signIn();
 	const other = await signIn();
 	const reader = await connect();
@@ -344,52 +346,57 @@ it('logs a registered user\'s joins and leaves as memberships, delivered around 
 	try {
 		await greeting(reader);
 		const guest = (await exchange(reader, 'guest', 'auth', { scheme: 'guest' })).frame.result.you;
-		// Creating: `joined` with the creator as the only member, whose head is
-		// already the creator's logged membership, then that membership, then
-		// the result; on every connection of the user.
+		// Creating: one `room_update` with `joined` (the creator as the only
+		// member, whose head is already the creator's logged membership), that
+		// `membership`, and `users`, then the result; on every connection of the user.
 		const created = await exchange(tab, 'thread', 'room_set', { parent_room_id: 'general', title: 'Kept' });
 		threadId = created.frame.result.room_id;
-		expect(methods(created.skipped)).toEqual(['room_update', 'membership']);
-		const [update, joinedRecord] = created.skipped;
+		expect(methods(created.skipped)).toEqual(['room_update']);
+		const [update] = created.skipped;
+		expect(Object.keys(update.params)).toEqual(['joined', 'membership', 'users']);
 		expect(update.params.joined[0]).toMatchObject({ room_id: threadId, log_id: threadId, members: [{ user_id: userId }] });
 		expect(update.params.users).toEqual([{ user_id: userId, name }]);
-		expect(joinedRecord).toEqual(membership(threadId, true));
-		expect(update.params.joined[0].latest_log_id).toBe(joinedRecord.params.log_id);
-		expect(BigInt(joinedRecord.params.log_id)).toBeGreaterThan(BigInt(threadId));
-		const otherCreated = await until(other, (frame) => frame.method === 'membership');
-		expect(methods(otherCreated.skipped).filter((method) => method === 'room_update')).toHaveLength(1);
+		const joinedRecord = update.params.membership[0];
+		expect(joinedRecord).toEqual(record(threadId, true));
+		expect(update.params.joined[0].latest_log_id).toBe(joinedRecord.log_id);
+		expect(BigInt(joinedRecord.log_id)).toBeGreaterThan(BigInt(threadId));
+		const otherCreated = await until(other, (frame) => frame.method === 'room_update' && frame.params.joined?.[0]?.room_id === threadId);
+		expect(otherCreated.frame.params.membership).toEqual([record(threadId, true)]);
 		// The parent's other members get the new thread, but not its membership.
 		const announced = await until(reader, (frame) => frame.method === 'room_update');
-		expect(announced.frame.params.updated[0].room_id).toBe(threadId);
+		expect(announced.frame.params).toEqual({ updated: [expect.objectContaining({ room_id: threadId })] });
 
 		// A guest's join is not logged: `joined` alone, with every member.
 		const guestJoin = await exchange(reader, 'guest-join', 'room_join', { room_id: threadId });
 		expect(methods(guestJoin.skipped)).toEqual(['room_update']);
+		expect(guestJoin.skipped[0].params.membership).toBeUndefined();
 		expect(guestJoin.skipped[0].params.joined[0].members.map((member: { user_id: string }) => member.user_id)).toEqual([guest.user_id, userId].sort());
 		expect(guestJoin.skipped[0].params.users).toEqual([guest, { user_id: userId, name }].sort((a, b) => a.user_id < b.user_id ? -1 : 1));
 
-		// Leaving: the membership reaches the room's members before the change,
-		// the leaver's connections included, then `left`, then the result.
+		// Leaving: the leaver's connections get `left` with the membership in one
+		// frame, then the result; the room's other members get the membership alone.
 		const left = await exchange(tab, 'leave', 'room_leave', { room_id: threadId });
-		expect(left.skipped).toEqual([membership(threadId, false), { method: 'room_update', params: { left: [{ room_id: threadId }] } }]);
+		expect(left.skipped).toEqual([{ method: 'room_update', params: { left: [{ room_id: threadId }], membership: [record(threadId, false)] } }]);
 		const otherLeft = await until(other, (frame) => frame.method === 'room_update' && frame.params.left !== undefined);
-		expect(otherLeft.skipped).toEqual([membership(threadId, false)]);
-		expect((await until(reader, (frame) => frame.method === 'membership')).frame).toEqual(membership(threadId, false));
-		// Joining again: the membership reaches the members after the change.
+		expect(otherLeft.frame.params.membership).toEqual([record(threadId, false)]);
+		expect((await until(reader, (frame) => frame.method === 'room_update' && frame.params.membership)).frame).toEqual(membershipOnly(threadId, false));
+		// Joining again: the joiner's connections get `joined` with the membership;
+		// the room's other members the membership alone.
 		const rejoined = await exchange(other, 'join', 'room_join', { room_id: threadId });
-		expect(methods(rejoined.skipped)).toEqual(['membership', 'room_update']);
-		expect(rejoined.skipped[0]).toEqual(membership(threadId, true));
-		expect(rejoined.skipped[1].params.joined[0].latest_log_id).toBe(rejoined.skipped[0].params.log_id);
-		expect(methods((await until(tab, (frame) => frame.method === 'room_update')).skipped)).toEqual(['membership']);
-		expect((await until(reader, (frame) => frame.method === 'membership')).frame).toEqual(membership(threadId, true));
+		expect(methods(rejoined.skipped)).toEqual(['room_update']);
+		const rejoin = rejoined.skipped[0].params;
+		expect(rejoin.membership).toEqual([record(threadId, true)]);
+		expect(rejoin.joined[0].latest_log_id).toBe(rejoin.membership[0].log_id);
+		expect((await until(tab, (frame) => frame.method === 'room_update' && frame.params.joined)).frame.params.membership).toEqual([record(threadId, true)]);
+		expect((await until(reader, (frame) => frame.method === 'room_update' && frame.params.membership)).frame).toEqual(membershipOnly(threadId, true));
 
 		// History holds the logged memberships, and records keep the user
 		// objects they were logged with: no `users`.
 		const page = (await exchange(reader, 'history', 'history', { room_id: threadId })).frame.result;
 		expect(page.membership.map((record: { members: Array<{ joined: boolean }> }) => record.members[0].joined)).toEqual([true, false, true]);
-		expect(page.membership[0]).toEqual(joinedRecord.params);
+		expect(page.membership[0]).toEqual(joinedRecord);
 		expect(page.messages).toBeUndefined();
-		expect(page.last_log_id).toBe(rejoined.skipped[0].params.log_id);
+		expect(page.last_log_id).toBe(rejoin.membership[0].log_id);
 		const posted = await exchange(tab, 'post', 'message', { body: { text: 'before the rename' } });
 		await exchange(tab, 'rename', 'me', { name: 'Renamed later' });
 		const general = (await exchange(reader, 'general', 'history', { after: posted.frame.result.message_id })).frame.result;
@@ -433,7 +440,7 @@ it('sends a rename only to users who share a room with the renamed user', async 
 		await exchange(apart, 'guest', 'auth', { scheme: 'guest' });
 		await exchange(apart, 'leave', 'room_leave', { room_id: 'general' });
 		await exchange(tab, 'rename', 'me', { name: 'Scoped' });
-		expect((await until(sharing, (frame) => frame.method === 'user')).frame.params).toEqual({ new: { user_id: 'user_session_scope', name: 'Scoped' } });
+		expect((await until(sharing, (frame) => frame.method === 'user')).frame.params).toEqual({ new: { user_id: 'user_session_scope', name: 'Scoped', roles: [] } });
 		// Apart shares no room: a round trip shows no `user` came before it.
 		expect((await exchange(apart, 'sync', 'me', {})).skipped.filter((frame) => frame.method === 'user')).toEqual([]);
 	} finally { tab.close(); sharing.close(); apart.close(); }

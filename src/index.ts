@@ -147,7 +147,7 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "invite-bot", usage: "/invite-bot", help: "get a sign-in token for your bot; a new one replaces the last", audience: "owners" },
 	{ name: "avatar", usage: "/avatar", help: "set your avatar: send this command with one image attached", audience: "owners" },
 	{ name: "passkeys", usage: "/passkeys [remove <n>]", help: "list your account's passkeys, or remove one of them", audience: "owners" },
-	{ name: "admin", usage: "/admin <user_id>", help: "make a registered user an admin", audience: "admins" },
+	{ name: "admin", usage: "/admin [remove] <user_id>", help: "make a registered user an admin, or no longer one", audience: "admins" },
 	{ name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", audience: "admins" },
 	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
 	{ name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", audience: "admins" },
@@ -587,6 +587,11 @@ interface ListingResult {
 /** User objects once each, in `user_id` order. */
 function sortedUsers(users: Iterable<PublicUser>): PublicUser[] {
 	return [...users].sort((a, b) => a.user_id < b.user_id ? -1 : a.user_id > b.user_id ? 1 : 0);
+}
+
+/** `room_update` `left` for one room, with the logged membership that removed the user, if any (§4.3.2). */
+function leftUpdate(roomId: string, membership?: Broadcast): Record<string, unknown> {
+	return { method: "room_update", params: { left: [{ room_id: roomId }], ...(membership ? { membership: [membership.params] } : {}) } };
 }
 
 /** A `room_update` notification (§4.3.3) with one field. */
@@ -1998,8 +2003,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 					this.setRooms(identity.user_id, [...(this.liveRoomsOf(identity.user_id) ?? []), room.room_id]);
 					// A new room's only member is its creator: no storage to read.
 					const creator = this.current(attachment)!;
-					this.sendToUser(identity.user_id, this.joinedUpdate(room, [creator]));
-					if (result.membership) this.broadcastRecord(result.membership);
+					// The room with its members and a registered creator's membership, in one frame (§4.3.4).
+					this.sendToUser(identity.user_id, this.joinedUpdate(room, [creator], undefined, undefined, result.membership));
+					if (result.membership) this.broadcastRecord(result.membership, identity.user_id);
 					this.deliver(roomUpdate("updated", room), scope, (state) => state.userId !== identity.user_id);
 				} else {
 					this.deliver(roomUpdate("updated", room), scope, (state) => state.userId !== identity.user_id);
@@ -2052,8 +2058,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		await this.runMutation(async () => {
 			const change = this.store.changeMembership({ userId: identity.user_id, ipKey: attachment.ipKey, roomId, join: true, now: nowMs() });
 			this.setRooms(identity.user_id, change.rooms);
-			if (change.membership) this.broadcastRecord(change.membership);
-			this.sendToUser(identity.user_id, this.joinedUpdate(change.room ?? known, before.get(roomId), joiner, totals.get(roomId)));
+			// The room's other members get the membership; the joiner's connections
+			// get it with the room and its members (§4.3.2).
+			if (change.membership) this.broadcastRecord(change.membership, identity.user_id);
+			this.sendToUser(identity.user_id, this.joinedUpdate(change.room ?? known, before.get(roomId), joiner, totals.get(roomId), change.membership));
 			this.reply(socket, request, {});
 		});
 	}
@@ -2087,11 +2095,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const change = this.store.changeMembership({ userId, ipKey: attachment.ipKey, roomId: room.room_id, join: true, now: nowMs(), actorId: attachment.userId });
 			if (change.changed) {
 				this.setRooms(userId, change.rooms);
-				if (change.membership) this.broadcastRecord(change.membership);
+				if (change.membership) this.broadcastRecord(change.membership, userId);
 				const peer = this.connectionsOf(userId)[0];
 				const state = peer ? connectionAttachment(peer) : null;
 				const joiner = state ? this.current(state) : null;
-				if (joiner) this.sendToUser(userId, this.joinedUpdate(change.room ?? room, before.get(room.room_id), joiner, totals.get(room.room_id)));
+				if (joiner) this.sendToUser(userId, this.joinedUpdate(change.room ?? room, before.get(room.room_id), joiner, totals.get(room.room_id), change.membership));
 			}
 			this.reply(socket, request, {});
 		});
@@ -2135,10 +2143,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		await this.runMutation(async () => {
 			const change = this.store.changeMembership({ userId: identity.user_id, ipKey: attachment.ipKey, roomId, join: false, now: nowMs() });
-			// Delivered while the leaver is still a member.
-			if (change.membership) this.broadcastRecord(change.membership);
+			// The room's other members get the membership; the leaver's connections
+			// get it with `left` (§4.3.2).
+			if (change.membership) this.broadcastRecord(change.membership, identity.user_id);
 			this.setRooms(identity.user_id, change.rooms);
-			this.sendToUser(identity.user_id, roomUpdate("left", { room_id: roomId }));
+			this.sendToUser(identity.user_id, leftUpdate(roomId, change.membership));
 			this.reply(socket, request, {});
 		});
 	}
@@ -2335,10 +2344,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (["admin", "kick", "rename", "purge", "toggle", "invite-token", "invite"].includes(command.name)) {
 			try {
-				const target = words[1];
-				const argumentCount = command.name === "rename" ? 2 : 1;
+				// `/admin remove <user_id>` takes one more word than `/admin <user_id>`.
+				const revoke = command.name === "admin" && words[1] === "remove";
+				const target = revoke ? words[2] : words[1];
+				const argumentCount = command.name === "rename" || revoke ? 2 : 1;
 				if (!target || words.length !== argumentCount + 1) throw { name: "invalid_params", message: `Usage: ${command.usage}` } satisfies ProtocolError;
-				if (command.name === "admin") this.grantAdmin(socket, request, roomId, target);
+				if (command.name === "admin") this.grantAdmin(socket, request, roomId, target, revoke);
 				else if (command.name === "kick") await this.kick(socket, attachment, request, roomId, target);
 				else if (command.name === "purge") await this.purge(socket, attachment, request, roomId, target);
 				else if (command.name === "toggle") this.toggle(socket, request, roomId, target);
@@ -2587,11 +2598,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/** A current user object (§3.3) with the user's `roles`, when any. */
-	private withRoles<T extends PublicUser>(user: T): T {
+	/**
+	 * `explicit`: carry `roles: []` when the user has none, so a client's kept
+	 * object drops a role the user lost (§3.3: an empty value means cleared).
+	 * Identity changes (`user` notifications) are explicit; listings leave an
+	 * empty `roles` out, since nothing there changes a role.
+	 */
+	private withRoles<T extends PublicUser>(user: T, explicit = false): T {
 		const { roles: _ignored, ...rest } = user;
 		void _ignored;
 		const roles = this.rolesOf(user.user_id);
-		return (roles.length ? { ...rest, roles } : rest) as T;
+		return (roles.length || explicit ? { ...rest, roles } : rest) as T;
 	}
 
 	/** A connection's user as a current object: `you`, `new`, and room `users` (§3.3), with roles. */
@@ -2607,23 +2624,29 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * `/admin <user_id>`: lists a registered user (not a bot or guest) as an
-	 * admin. The sender gets a `~private` notice before the result (§1).
+	 * admin; `/admin remove <user_id>` takes that away (not from `admin`
+	 * itself). The sender gets a `~private` notice before the result (§1).
 	 */
-	private grantAdmin(socket: WebSocketConnection, request: RequestFrame, roomId: string, userId: string): void {
+	private grantAdmin(socket: WebSocketConnection, request: RequestFrame, roomId: string, userId: string, remove = false): void {
 		if (userId === ADMIN_USER_ID) throw { name: "invalid_params", message: "The admin user is always an admin" } satisfies ProtocolError;
-		const granted = this.store.grantAdmin({ userId, now: nowMs() });
-		const who = `**${granted.name || userId}** (\`${userId}\`)`;
-		if (granted.added) {
-			this.adminIds?.add(userId);
-			// A role change is a profile change (§3.3): `user` `you` to the new
-			// admin's connections and `new` to those who share a room with them.
+		const changed = remove ? this.store.revokeAdmin({ userId, now: nowMs() }) : this.store.grantAdmin({ userId, now: nowMs() });
+		const who = `**${changed.name || userId}** (\`${userId}\`)`;
+		if (changed.added) {
+			if (remove) this.adminIds?.delete(userId);
+			else this.adminIds?.add(userId);
+			// A role change is a profile change (§3.3): `user` `you` to the
+			// user's connections and `new` to those who share a room with them,
+			// with `roles: []` when the last role went.
 			const connected = this.connectionsOf(userId)[0];
 			const state = connected ? connectionAttachment(connected) : null;
 			const stored = state ? null : this.store.getIdentity(userId);
 			const user = state ? currentUser(state) : stored ? { user_id: userId, ...(stored.name ? { name: stored.name } : {}), ...(stored.avatar ? { avatar: stored.avatar } : {}) } : null;
 			this.announceUser(null, user, state?.rooms ?? stored?.rooms ?? []);
 		}
-		this.sendNotice(socket, roomId, granted.added ? `${who} is now an admin.` : `${who} is already an admin.`);
+		const text = remove
+			? (changed.added ? `${who} is no longer an admin.` : `${who} was not an admin.`)
+			: (changed.added ? `${who} is now an admin.` : `${who} is already an admin.`);
+		this.sendNotice(socket, roomId, text);
 		this.reply(socket, request, {});
 	}
 
@@ -2665,10 +2688,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const change = this.store.changeMembership({ userId, ipKey: attachment.ipKey, roomId, join: false, now: nowMs(), actorId: attachment.userId });
 			if (!change.changed) return;
 			changed = true;
-			// Delivered while the removed user is still a member.
-			if (change.membership) this.broadcastRecord(change.membership);
+			if (change.membership) this.broadcastRecord(change.membership, userId);
 			this.setRooms(userId, change.rooms);
-			this.sendToUser(userId, roomUpdate("left", { room_id: roomId }));
+			this.sendToUser(userId, leftUpdate(roomId, change.membership));
 		});
 		return changed;
 	}
@@ -2867,14 +2889,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `joiner` is added to the members read before the join, and to `total`,
 	 * their `member_count` when those leave some out.
 	 */
-	private joinedUpdate(room: RoomRecord, members: readonly PublicUser[] = [], joiner?: PublicUser, total?: number): Record<string, unknown> {
+	private joinedUpdate(room: RoomRecord, members: readonly PublicUser[] = [], joiner?: PublicUser, total?: number, membership?: Broadcast): Record<string, unknown> {
 		const users = new Map(members.map((member) => [member.user_id, member]));
 		const count = total === undefined ? undefined : total + (joiner && !users.has(joiner.user_id) ? 1 : 0);
 		if (joiner) users.set(joiner.user_id, joiner);
 		const sorted = sortedUsers(users.values());
 		const listed: ListedRoom = { ...room, members: sorted.map((member) => ({ user_id: member.user_id })) };
 		if (count !== undefined && count > sorted.length) listed.member_count = count;
-		return { method: "room_update", params: { joined: [listed], users: sorted } };
+		return { method: "room_update", params: { joined: [listed], ...(membership ? { membership: [membership.params] } : {}), users: sorted } };
 	}
 
 	/** Each room's members connected now: users who have joined it, one entry each. */
@@ -2938,7 +2960,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private announceUser(origin: WebSocketConnection | null, user: PublicUser | null, rooms: readonly string[], old?: { user_id: string; name?: string } | null): void {
 		if (!user) return;
 		// A current object (§3.3): `roles` go with every identity change.
-		const identity = user.user_id.startsWith("guest_") ? user : this.withRoles(user);
+		const identity = user.user_id.startsWith("guest_") ? user : this.withRoles(user, true);
 		const shared = new Set(rooms);
 		for (const peer of this.ctx.getWebSockets()) {
 			const socket = peer as WebSocketConnection;
@@ -3211,8 +3233,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return finished.accepted;
 	}
 
-	private broadcastRecord(record: Broadcast): void {
-		this.deliver({ method: record.method, params: record.params }, record.rooms);
+	/**
+	 * Delivers one committed record to the members of the rooms it belongs to.
+	 * A membership record goes in `room_update` `membership` (§4.3.3); with
+	 * `exceptUser`, not to that user's connections, which get it together with
+	 * their `joined` or `left`.
+	 */
+	private broadcastRecord(record: Broadcast, exceptUser?: string): void {
+		const frame = record.method === "membership"
+			? { method: "room_update", params: { membership: [record.params] } }
+			: { method: record.method, params: record.params };
+		this.deliver(frame, record.rooms, exceptUser === undefined ? undefined : (state) => state.userId !== exceptUser);
 	}
 
 	/**

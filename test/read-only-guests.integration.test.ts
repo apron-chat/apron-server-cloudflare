@@ -126,8 +126,8 @@ it('lets a registered user invite a bot that signs in from anywhere with its tok
 			'```',
 		].join('\n'));
 		// The new bot's logged join of general reaches its members, the owner among them.
-		const joined = skipped.find((frame) => frame.method === 'membership');
-		expect(joined?.params.members).toEqual([{ user: { user_id: 'bot_u_owner', name: 'Bot of Name of u_owner' }, joined: true }]);
+		const joined = skipped.find((frame) => frame.method === 'room_update' && frame.params.membership)?.params.membership[0];
+		expect(joined?.members).toEqual([{ user: { user_id: 'bot_u_owner', name: 'Bot of Name of u_owner' }, joined: true }]);
 
 		// A bot has no Origin: it is offered `token`, and its token needs none.
 		expect((await bot.next()).params.auth).toEqual(['token', 'guest']);

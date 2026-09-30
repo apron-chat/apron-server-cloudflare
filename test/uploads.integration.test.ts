@@ -36,6 +36,27 @@ type Write = { key: string; max_bytes: number; expires_ms: number };
 const writeOf = (result: Record<string, unknown>, index = 0) => (result.embeds as Array<{ embed_id: string; write: Write }>)[index];
 
 describe('store uploads', () => {
+	it('answers a retried post with the current state: the write grant only while the write is still open (§1.2)', async () => {
+		await withStore('uploads-retry', { uploads: UPLOADS }, (store, clock) => {
+			register(store, clock, 'rita');
+			const params = { body: { text: 'retried', embeds: [{ kind: 'upload', title: 'dot.png' }] } };
+			const send = () => store.commitMutation({ userId: 'rita', ipKey: 'ip-rita', requestId: 'retry-1', method: 'message', now: clock.value, params, identity: { user_id: 'rita', name: 'Name of rita' } });
+			const first = send();
+			const write = writeOf(first.result);
+			// Before the write, a retry gets the same grant, and nothing is executed again.
+			const early = send();
+			expect(early.deduplicated).toBe(true);
+			expect(early.broadcasts).toEqual([]);
+			expect(early.result).toEqual(first.result);
+			expect(store.claimUpload(write.write.key, clock.value)).toBe(true);
+			store.finishUpload({ key: write.write.key, ok: true, bytes: 64, contentType: 'image/png' }, clock.value);
+			// Once the write is done, the retry names the message and embed, without a grant.
+			const late = send();
+			expect(late.deduplicated).toBe(true);
+			expect(late.result).toEqual({ message_id: first.result.message_id, embeds: [{ embed_id: write.embed_id, kind: 'upload' }] });
+		});
+	});
+
 	it('gives every embed an id, starts pending uploads, and keeps what the server owns on a save', async () => {
 		await withStore('uploads-identity', { uploads: UPLOADS }, (store, clock) => {
 			register(store, clock, 'alice');
@@ -325,7 +346,7 @@ describe('uploads end to end', () => {
 			expect(embed.write_url).toMatch(/^https:\/\/demo\.test\/w\/a\./);
 			expect((await put(embed.write_url, png())).status).toBe(204);
 			const you = (await until(peer, (frame) => frame.method === 'user')).frame.params.you;
-			expect(you).toEqual({ user_id: userId, name: `Name of ${userId}`, avatar: expect.stringMatching(/^https:\/\/media\.test\/a\//) });
+			expect(you).toEqual({ user_id: userId, name: `Name of ${userId}`, avatar: expect.stringMatching(/^https:\/\/media\.test\/a\//), roles: [] });
 			expect((await request(peer, 'me', 'me', {})).result.you.avatar).toBe(you.avatar);
 			// A message's author is a recorded object, without the avatar.
 			const posted = await exchange(peer, 'post', 'message', { body: { text: 'hi' } });

@@ -902,3 +902,17 @@ it('returns history in v7 shape: messages, first_log_id/last_log_id, and empty a
 		expect(empty).toEqual({ more: false, latest_log_id: page.latest_log_id, history_log_id: roomId });
 	} finally { peer.close(); }
 });
+
+it('runs requests behind a failed auth with the authentication the connection already had (§3.2)', async () => {
+	const peer = await connect();
+	try {
+		const guest = await authenticate(peer);
+		// Pipelined: a failed token sign-in, then a post, which runs as the guest.
+		peer.send({ id: 'bad', method: 'auth', params: { scheme: 'token', token: 'not-a-session' } });
+		peer.send({ id: 'post', method: 'message', params: { body: { text: 'still a guest' } } });
+		expect((await reply(peer, 'bad')).error.code).toBe(-32001);
+		const posted = await until(peer, (frame) => frame.id === 'post');
+		expect(posted.frame.result.message_id).toBeDefined();
+		expect(posted.skipped.find((frame) => frame.method === 'message')?.params).toMatchObject({ from: { user_id: guest.user_id }, body: { text: 'still a guest' } });
+	} finally { peer.close(); }
+});

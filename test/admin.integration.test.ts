@@ -60,7 +60,7 @@ it('lists and runs the admin commands for admins only', async () => {
 	try {
 		const help = await command(admin, 'help', '/help');
 		expect(help.frame.result).toEqual({});
-		expect(help.notice!.params.body.text).toContain('/admin <user_id>');
+		expect(help.notice!.params.body.text).toContain('/admin [remove] <user_id>');
 		expect(help.notice!.params.body.text).toContain('/kick <user_id>');
 		expect(help.notice!.params.body.text).toContain('/status');
 		expect(help.notice!.params.body.text).toContain('/rename <old_user_id> <new_user_id>');
@@ -96,7 +96,7 @@ it('/admin makes a registered user an admin, but not a guest, bot, or unknown us
 		for (const target of [guestId, 'bot_nobody', 'nobody_123']) {
 			expect((await command(admin, `bad-${target}`, `/admin ${target}`)).frame.error.code).toBe(-32602);
 		}
-		expect((await command(admin, 'usage', '/admin')).frame.error.message).toBe('Usage: /admin <user_id>');
+		expect((await command(admin, 'usage', '/admin')).frame.error.message).toBe('Usage: /admin [remove] <user_id>');
 	} finally { admin.close(); carol.close(); guest.close(); }
 });
 
@@ -275,12 +275,18 @@ it('room_join and room_leave with a user_id add and remove others: an admin anyo
 		const guestId = (await request(guest, 'auth', 'auth', { scheme: 'guest' })).result.you.user_id;
 		const roomId = (await request(admin, unique('thread'), 'room_set', { parent_room_id: 'general', title: 'Invites' })).result.room_id;
 
-		// The admin adds Bob: a logged join for the room's members, then Bob's connections get `joined`.
+		// The admin adds Bob: the room's other members get the logged join in `room_update`
+		// `membership`, and Bob's connections get it with `joined` in one frame (§4.3.2).
 		const added = await exchange(admin, 'add-bob', 'room_join', { room_id: roomId, user_id: bobId });
 		expect(added.frame.result).toEqual({});
-		expect(added.skipped.find((frame) => frame.method === 'membership')?.params.members).toEqual([{ user: { user_id: bobId, name: `Name of ${bobId}` }, joined: true }]);
+		const bobJoin = [{ user: { user_id: bobId, name: `Name of ${bobId}` }, joined: true }];
+		const others = added.skipped.filter((frame) => frame.method === 'room_update' && frame.params.membership);
+		expect(others.map((frame) => Object.keys(frame.params))).toEqual([['membership']]);
+		expect(others[0].params.membership[0].members).toEqual(bobJoin);
 		const joined = await until(bob, (frame) => frame.method === 'room_update' && frame.params.joined !== undefined);
-		expect(joined.skipped.find((frame) => frame.method === 'membership')?.params.room_id).toBe(roomId);
+		expect(Object.keys(joined.frame.params)).toEqual(['joined', 'membership', 'users']);
+		expect(joined.frame.params.membership[0]).toMatchObject({ room_id: roomId, members: bobJoin });
+		expect(joined.frame.params.joined[0].latest_log_id).toBe(joined.frame.params.membership[0].log_id);
 		expect(joined.frame.params.joined[0]).toMatchObject({ room_id: roomId, title: 'Invites' });
 		expect(joined.frame.params.joined[0].members.map((member: { user_id: string }) => member.user_id)).toEqual(['admin', bobId].sort());
 		// `users` are current objects: the admin's carry its role (§3.3).
@@ -305,9 +311,11 @@ it('room_join and room_leave with a user_id add and remove others: an admin anyo
 		expect((await request(bob, 'remove-admin', 'room_leave', { room_id: roomId, user_id: 'admin' })).error.code).toBe(-32001);
 		const removed = await exchange(admin, 'remove-bob', 'room_leave', { room_id: roomId, user_id: bobId });
 		expect(removed.frame.result).toEqual({});
-		expect(removed.skipped.filter((frame) => frame.method === 'membership').at(-1)?.params.members).toEqual([{ user: { user_id: bobId, name: `Name of ${bobId}` }, joined: false }]);
+		expect(removed.skipped.filter((frame) => frame.params?.membership).at(-1)?.params.membership[0].members).toEqual([{ user: { user_id: bobId, name: `Name of ${bobId}` }, joined: false }]);
+		// The removed user's connections get `left` with the membership (§4.3.2, §4.8 /kick).
 		const left = await until(bob, (frame) => frame.method === 'room_update' && frame.params.left !== undefined);
 		expect(left.frame.params.left).toEqual([{ room_id: roomId }]);
+		expect(left.frame.params.membership[0].members).toEqual([{ user: { user_id: bobId, name: `Name of ${bobId}` }, joined: false }]);
 		// Removing someone not in the room changes nothing; an unknown user is invalid.
 		expect((await request(admin, 'remove-bob-again', 'room_leave', { room_id: roomId, user_id: bobId })).result).toEqual({});
 		expect((await request(admin, 'remove-nobody', 'room_leave', { room_id: roomId, user_id: 'nobody_123' })).error.code).toBe(-32602);
@@ -542,4 +550,24 @@ it('advertises which schemes create accounts in server.signup (§3.2)', async ()
 		const other = (await plain.next()).params;
 		expect([other.auth, other.signup]).toEqual([['token', 'guest'], ['token']]);
 	} finally { withPasskeys.close(); plain.close(); }
+});
+
+it('/admin remove takes the admin role away, announced with roles: [] (§3.3)', async () => {
+	const admin = await signedInAdmin();
+	const userId = unique('demoted');
+	const demoted = await signedIn(userId);
+	const mate = await signedIn(unique('mate'));
+	try {
+		await command(admin, 'grant', `/admin ${userId}`);
+		await until(demoted, (frame) => frame.method === 'user');
+		await until(mate, (frame) => frame.method === 'user' && frame.params.new?.user_id === userId);
+		const removed = await command(admin, 'demote', `/admin remove ${userId}`);
+		expect(removed.notice!.params.body.text).toMatch(/is no longer an admin/);
+		// An empty value means cleared: both the user and a room-mate drop the role.
+		expect((await until(demoted, (frame) => frame.method === 'user')).frame.params).toEqual({ you: { user_id: userId, name: `Name of ${userId}`, roles: [] } });
+		expect((await until(mate, (frame) => frame.method === 'user' && frame.params.new?.user_id === userId)).frame.params.new.roles).toEqual([]);
+		expect((await command(demoted, 'status', '/status')).frame.error.code).toBe(-32001);
+		expect((await command(admin, 'again', `/admin remove ${userId}`)).notice!.params.body.text).toMatch(/was not an admin/);
+		expect((await command(admin, 'builtin', '/admin remove admin')).frame.error.code).toBe(-32602);
+	} finally { admin.close(); demoted.close(); mate.close(); }
 });

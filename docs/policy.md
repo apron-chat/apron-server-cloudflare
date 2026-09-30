@@ -45,8 +45,9 @@ within it:
   `denied`. Only registered users can be added. A thread's messages go to its
   members only. A guest's rooms last for its connection and are not logged; a
   registered identity keeps its rooms across connections, its joins and leaves
-  count as posts, and each is a logged `membership` record delivered to the
-  room's members before the `room_update` and kept in history. Joins and
+  count as posts, and each is a logged membership record delivered in
+  `room_update` `membership` (with the user's own `joined` or `left`) and
+  kept in history. Joins and
   leaves are never `user` notifications. `room_list` takes `filter`,
   `parent_room_id`, and `room_id`, and with `members: true` lists each room's
   members (every connected one and at most 200 registered ones, 100 with the
