@@ -365,3 +365,23 @@ it('never gives out a ~ user_id, which protocol v7 reserves for system identitie
 		expect((await request(admin, 'me', 'me', { roles: ['moderator'] })).result.you).toEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'] });
 	} finally { admin.close(); guest.close(); }
 });
+
+it('sends a ~private notice to the one connection that asked, not the user\'s other connections', async () => {
+	const userId = unique('twin');
+	const first = await signedIn(userId);
+	const token = await runInDurableObject(stub(), (instance) =>
+		(instance as unknown as { issueSession(userId: string, origin: string, now: number): Promise<string> }).issueSession(userId, 'http://localhost:5173', Date.now()));
+	const second = await connect();
+	try {
+		await second.next();
+		expect((await request(second, 'auth', 'auth', { scheme: 'token', token })).result.you.user_id).toBe(userId);
+		const help = await command(first, 'help', '/help');
+		expect(help.notice!.params.from).toEqual({ user_id: '~private', name: 'System message to you' });
+		// The bot token is for the asking connection only (Appendix A.1).
+		const invited = await command(first, 'invite', '/invite-bot');
+		expect(invited.notice!.params.body.text).toContain('apron_bot_');
+		// A round trip on the other connection: everything sent to it so far arrives first.
+		const { skipped } = await exchange(second, 'probe', 'room_list', { filter: 'joined' });
+		expect(skipped.filter((frame) => frame.method === 'message' && frame.params.from?.user_id === '~private')).toEqual([]);
+	} finally { first.close(); second.close(); }
+});

@@ -946,11 +946,29 @@ function withCleanOg(embed: Record<string, unknown>, remoteMedia: boolean): Reco
   return Object.keys(clean).length ? { ...rest, og: clean } : rest;
 }
 
-/** A schema 5 intro message's text, which becomes its room's description; none when deleted or empty. */
+/**
+ * A schema 5 intro message's text, which becomes its room's description;
+ * none when deleted or empty. A description is Markdown by convention
+ * (§3.4), so a plain-text intro is escaped to read the same; a Markdown one
+ * is kept as written.
+ */
 function introText(snapshot: Record<string, unknown>): string | undefined {
   if (snapshot.deleted === true || !isPlainObject(snapshot.body)) return undefined;
   const text = snapshot.body.text;
-  return typeof text === "string" && text.trim() !== "" ? text : undefined;
+  if (typeof text !== "string" || text.trim() === "") return undefined;
+  return snapshot.body.format === "markdown" ? text : escapeMarkdown(text);
+}
+
+/**
+ * Plain text as Markdown that renders as the same text: inline markup
+ * characters are backslash-escaped everywhere, and block markers (headings,
+ * quotes, list items, rules) at the start of a line.
+ */
+export function escapeMarkdown(text: string): string {
+  return text
+    .replace(/[\\`*_[\]<>~|]/g, "\\$&")
+    .replace(/^([ \t]*)([#>+=-])/gm, "$1\\$2")
+    .replace(/^([ \t]*\d+)([.)])/gm, "$1\\$2");
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -1313,8 +1331,18 @@ export class Store {
         if (!("intro_message" in record)) continue;
         const { intro_message: intro, ...rest } = record;
         const room = current.get(row.room_id);
-        const text = room?.logId === row.log_id ? room.description : isPlainObject(intro) ? introText(intro) : undefined;
-        this.rewriteRecord(row, JSON.stringify(this.fitDescription(rest, text)));
+        // The room's current record is the same snapshot the rooms row lists
+        // (§2): it takes that description as is. An older record's text is cut
+        // against its own client fields, as the rooms row's was.
+        let upgraded: Record<string, unknown>;
+        if (room?.logId === row.log_id) upgraded = room.description === undefined ? rest : { ...rest, description: room.description };
+        else {
+          const text = isPlainObject(intro) ? introText(intro) : undefined;
+          const clientFields = Object.fromEntries(["title", "ext"].filter((key) => key in rest).map((key) => [key, rest[key]]));
+          const fitted = this.fitDescription(clientFields, text);
+          upgraded = typeof fitted.description === "string" ? { ...rest, description: fitted.description } : rest;
+        }
+        this.rewriteRecord(row, JSON.stringify(upgraded));
       }
       this.rawExec("ALTER TABLE rooms ADD COLUMN member_count INTEGER NOT NULL DEFAULT 0");
       this.rawExec("UPDATE rooms SET member_count = (SELECT COUNT(*) FROM memberships m WHERE m.room_id = rooms.room_id)");

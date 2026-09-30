@@ -124,10 +124,13 @@ it(`upgrades a schema ${UPGRADABLE_SCHEMA_VERSION} store in place: intro message
 		const intro = String(mutate('intro', 'message', { body: { text: 'Deploy chatter', format: 'markdown' } }).result.message_id);
 		const gone = String(mutate('gone', 'message', { body: { text: 'soon deleted' } }).result.message_id);
 		const long = String(mutate('long', 'message', { body: { text: 'é'.repeat(2_000) } }).result.message_id);
+		const plain = String(mutate('plain', 'message', { body: { text: 'Use *nix boxes_only_ for builds\n# not a heading', format: 'plain' } }).result.message_id);
 		const thread = String(mutate('thread', 'room_set', { parent_room_id: 'general', title: 'Deploy' }).result.room_id);
 		const saved = mutate('save', 'room_set', { room_id: thread, title: 'Deploys' }).room!.log_id;
 		const deletedThread = String(mutate('thread-2', 'room_set', { parent_room_id: 'general', title: 'Gone' }).result.room_id);
 		const longThread = String(mutate('thread-3', 'room_set', { parent_room_id: 'general', title: 'Long' }).result.room_id);
+		const longSaved = mutate('save-3', 'room_set', { room_id: longThread, title: 'Long', ext: { note: 'x'.repeat(40) } }).room!.log_id;
+		const plainThread = String(mutate('thread-4', 'room_set', { parent_room_id: 'general', title: 'Plain' }).result.room_id);
 		// The intro was edited after the room last embedded it, and one intro was deleted.
 		mutate('edit', 'message', { message_id: intro, body: { text: 'Deploy chatter, *edited*', format: 'markdown' } });
 		mutate('delete', 'message', { message_id: gone, deleted: true });
@@ -139,7 +142,7 @@ it(`upgrades a schema ${UPGRADABLE_SCHEMA_VERSION} store in place: intro message
 		const snapshotOf = (text: string, messageId: string) => ({ message_id: messageId, log_id: messageId, room_id: 'general', from: identity, body: { text, format: 'plain' } });
 		sql.exec('ALTER TABLE rooms ADD COLUMN intro_message_id TEXT');
 		sql.exec('ALTER TABLE rooms DROP COLUMN member_count');
-		for (const [room, message] of [[thread, intro], [deletedThread, gone], [longThread, long]]) {
+		for (const [room, message] of [[thread, intro], [deletedThread, gone], [longThread, long], [plainThread, plain]]) {
 			sql.exec('UPDATE rooms SET intro_message_id = ? WHERE room_id = ?', message, room);
 		}
 		const rewrite = (room: string, logId: string, text: string, messageId: string) => {
@@ -149,10 +152,13 @@ it(`upgrades a schema ${UPGRADABLE_SCHEMA_VERSION} store in place: intro message
 		rewrite(thread, thread, 'Old intro text', intro);
 		rewrite(thread, saved, 'Deploy chatter', intro);
 		rewrite(deletedThread, deletedThread, 'soon deleted', gone);
+		// The long thread's older and current records both embed the long intro.
+		rewrite(longThread, longThread, 'é'.repeat(2_000), long);
+		rewrite(longThread, longSaved, 'é'.repeat(2_000), long);
 		sql.exec("UPDATE _meta SET value = '5' WHERE key = 'schema_version'");
 		sql.exec('UPDATE maintenance SET schema_version = 5 WHERE id = 1');
 		const budget = sql.exec<{ maintenance_reads: number; maintenance_writes: number }>('SELECT maintenance_reads, maintenance_writes FROM resource_budgets WHERE day = ?', day).one();
-		return { thread, saved, deletedThread, longThread, budget, head };
+		return { thread, saved, deletedThread, longThread, longSaved, plainThread, budget, head };
 	});
 
 	await evictDurableObject(stub);
@@ -176,9 +182,20 @@ it(`upgrades a schema ${UPGRADABLE_SCHEMA_VERSION} store in place: intro message
 		expect(rooms.get(fixture.thread)).toMatchObject({ title: 'Deploys', description: 'Deploy chatter, *edited*' });
 		expect(rooms.get(fixture.deletedThread)).not.toHaveProperty('description');
 		const cut = rooms.get(fixture.longThread)!.description!;
+		const ext = { note: 'x'.repeat(40) };
+		const bytes = (fields: unknown) => new TextEncoder().encode(JSON.stringify(fields)).length;
 		expect(cut.endsWith('…')).toBe(true);
-		expect(new TextEncoder().encode(JSON.stringify({ title: 'Long', description: cut })).length).toBeLessThanOrEqual(2_048);
-		expect(new TextEncoder().encode(JSON.stringify({ title: 'Long', description: cut + 'é' })).length).toBeGreaterThan(2_048);
+		expect(bytes({ title: 'Long', description: cut, ext })).toBeLessThanOrEqual(2_048);
+		expect(bytes({ title: 'Long', description: cut + 'é', ext })).toBeGreaterThan(2_048);
+		// The room's current record at the same log_id says exactly what the listing does (§2);
+		// its older record is cut against its own client fields alone.
+		const longHistory = store.historyPage({ roomId: fixture.longThread, after: '0', limit: 50 }).rooms!;
+		expect(longHistory.map((room) => room.log_id)).toEqual([fixture.longThread, fixture.longSaved]);
+		expect(longHistory[1].description).toBe(cut);
+		expect(bytes({ title: 'Long', description: longHistory[0].description })).toBeLessThanOrEqual(2_048);
+		expect(bytes({ title: 'Long', description: longHistory[0].description + 'é' })).toBeGreaterThan(2_048);
+		// A plain-text intro is escaped, since a description is Markdown by convention.
+		expect(rooms.get(fixture.plainThread)!.description).toBe('Use \\*nix boxes\\_only\\_ for builds\n\\# not a heading');
 		for (const room of rooms.values()) expect(room).not.toHaveProperty('intro_message');
 
 		// History's room records lose intro_message: the current record takes
@@ -193,7 +210,7 @@ it(`upgrades a schema ${UPGRADABLE_SCHEMA_VERSION} store in place: intro message
 
 		// Each room counts its registered members: the upgrader joined general and made the threads.
 		const counts = Object.fromEntries(sql.exec<{ room_id: string; member_count: number }>('SELECT room_id, member_count FROM rooms').toArray().map((row) => [row.room_id, row.member_count]));
-		expect(counts).toEqual({ general: 1, [fixture.thread]: 1, [fixture.deletedThread]: 1, [fixture.longThread]: 1 });
+		expect(counts).toEqual({ general: 1, [fixture.thread]: 1, [fixture.deletedThread]: 1, [fixture.longThread]: 1, [fixture.plainThread]: 1 });
 
 		// The upgrade's rows are charged to the day's maintenance reservation.
 		const budget = sql.exec<{ maintenance_reads: number; maintenance_writes: number }>('SELECT maintenance_reads, maintenance_writes FROM resource_budgets WHERE day = ?', day).one();

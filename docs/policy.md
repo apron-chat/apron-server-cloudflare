@@ -50,7 +50,8 @@ within it:
   leaves are never `user` notifications. `room_list` takes `filter`,
   `parent_room_id`, and `room_id`, and with `members: true` lists each room's
   members (every connected one and at most 200 registered ones, 100 with the
-  Free budgets, with `member_count` when that leaves some out) and their
+  Free budgets, first by `user_id` rather than by recent activity, with
+  `member_count` when that leaves some out) and their
   current objects in `users`, whose `roles` mark admins (`admin`) and bots
   (`bot`); it ignores `latest_log_id` and always returns a
   full listing, since guest memberships are not logged. A client that sends

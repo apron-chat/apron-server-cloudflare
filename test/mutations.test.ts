@@ -48,7 +48,7 @@ it("allocates one strictly increasing log sequence across rooms, record kinds, a
 		expect(first.message?.message_id).toBe(first.message?.log_id);
 		const roomResult = store.mutate(op(clock, "alice", "s2", "room_set", { parent_room_id: "general", title: "Side" }));
 		const threadId = String(roomResult.result.room_id);
-		// Suggested convention: a room's ID is its creation log_id.
+		// This server uses a room's creation log_id as its room_id.
 		expect(roomResult.room?.log_id).toBe(threadId);
 		const inThread = store.mutate(op(clock, "alice", "s3", "message", { room_id: threadId, body: { text: "two" } }));
 		const reacted = store.mutate(op(clock, "bob", "s4", "reactions", { message_id: first.result.message_id, emojis: ["👍"] }));

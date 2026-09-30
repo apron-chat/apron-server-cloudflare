@@ -530,7 +530,8 @@ it('with ACTIVITY on, relays typing to room members, accepts away, throttles per
 		const history = await request(alice, 'history', 'history', { room_id: 'general', limit: 50 });
 		const entries: Array<{ message_id: string; from?: { user_id: string } }> = history.result.messages;
 		expect(entries.some((entry) => entry.message_id === mine.frame.result.message_id)).toBe(true);
-		expect(entries.some((entry) => entry.from?.user_id?.startsWith('@'))).toBe(false);
+		// No system notice is logged: neither v7 `~` nor legacy `@` senders.
+		expect(entries.some((entry) => entry.from?.user_id?.startsWith('~') || entry.from?.user_id?.startsWith('@'))).toBe(false);
 	} finally { alice.close(); bob.close(); carol.close(); await configure((config) => { config.activityEnabled = false; }); }
 });
 

@@ -124,7 +124,7 @@ A registered user's joins and leaves are logged `membership` records,
 returned in `history`; a guest's live in its connection and are not logged,
 so `room_list` ignores `latest_log_id` and always answers with a full
 listing. `members` lists every connected member and at most 200 registered
-members per room (100 with the Free budgets); a room with more also gives
+members per room (100 with the Free budgets); a room with more lists the first by `user_id`, not by recent activity, and also gives
 `member_count`. Admins and bots carry `roles` (`admin`, `bot`) in `users`
 and `you`. See [SPEC section 4](../SPEC.md#memberships).
 The whole server processes at most 600 frames a
@@ -355,6 +355,10 @@ For direct Wrangler production commands, always pass
    (protocol 7); a schema 5 object (protocol 6) is upgraded in place on its
    first wake, keeping everything, with each thread's intro message becoming
    its `description` (see [SPEC section 8](../SPEC.md#schema-versions)).
+   The upgrade is one-way: redeploying protocol 6 code afterwards resets the
+   object like any schema change, so fix forward instead of rolling back. It
+   also fails closed: if it cannot finish, nothing changes, and the object
+   throws on every wake until a fixed deploy upgrades it.
    Stored data from any other schema is not migrated: a deploy that changes
    the storage schema otherwise resets the demo on the object's first wake.
    All chat history, rooms,
