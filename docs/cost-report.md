@@ -138,9 +138,16 @@ Memberships:
   lookups, a count of the account's passkeys (at most 8), the credential row
   with its indexes, and the registration limiter rows. The per-IP (5, Free 3)
   and daily registration caps bound it like new registrations.
-- A sign-up with an `/invite` token is an `/invite-token` registration plus
-  one KV read and three KV writes (the invite's count and the new user's own
-  token), charged at their bound.
+- A sign-up with an `/invite` token is an `/invite-token` registration, plus
+  up to 8 `user_id` availability probes (8 reads each, reserved), the new
+  user's `getIdentity` read, and one KV read and three KV writes (the
+  invite's count and the new user's own token and pointer, in one put),
+  reserved at their bound before the account is created. `/invite` itself is
+  one KV read and three writes, and `/invite-token` two KV writes, each at
+  its bound.
+- `/passkeys` reads at most 8 credential rows; `/passkeys remove` adds one
+  delete with its index. Adding a passkey to an account without a WebAuthn
+  user handle writes it at `begin` (one conditional row update).
 - `roles` in current user objects need the admin list: one `_meta` read per
   object wake, kept in memory and updated by `/admin`, `/rename`, and
   `/purge`, the only changes to it. Guests and bots need no read.

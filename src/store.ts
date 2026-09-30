@@ -49,6 +49,11 @@ export const ROOM_TITLE = "General";
 export const SCHEMA_VERSION = 6;
 /** The one older schema upgraded in place rather than reset. */
 export const UPGRADABLE_SCHEMA_VERSION = 5;
+/**
+ * The registered user `APRON_ADMIN_TOKEN` signs in as, always an admin. It
+ * never holds a passkey, so deleting the token turns it off completely.
+ */
+export const ADMIN_USER_ID = "admin";
 /** Passkeys one registered identity may hold (§4.9: a registration while signed in adds one). */
 export const MAX_PASSKEYS_PER_USER = 8;
 /** Rooms a new identity has joined: the permanent top-level room (§3.4). */
@@ -1538,9 +1543,10 @@ export class Store {
             i.created_ms AS identity_created_ms, i.updated_ms AS identity_updated_ms,
             EXISTS (SELECT 1 FROM memberships m WHERE m.room_id = ? AND m.user_id = c.user_id) AS in_general
          FROM credentials c JOIN identities i ON i.user_id = c.user_id
-         WHERE i.tier = 'registered'
+         WHERE i.tier = 'registered' AND i.user_id <> ?
          ORDER BY c.updated_ms DESC, c.credential_id LIMIT ?`,
-        ROOM_ID, MAX_CARRIED_PASSKEYS,
+        // `admin` holds no passkey; should one exist, a reset does not carry it.
+        ROOM_ID, ADMIN_USER_ID, MAX_CARRIED_PASSKEYS,
       );
     } catch {
       return [];
@@ -2870,7 +2876,7 @@ export class Store {
       ensureText(credential.credentialId, "credential_id", 16 * 1024);
       ensureText(credential.publicKey, "public_key", 16 * 1024);
       if (this.identityRow(input.userId)) throw new StoreError("invalid_params", "identity already exists");
-      if (this.credentialValue(credential.credentialId)) throw new StoreError("invalid_params", "credential is already registered");
+      if (this.credentialValue(credential.credentialId)) throw new StoreError("denied", "credential is already registered");
       if (this.metaNumber("identity_count") >= this.config.registeredIdentityCount) {
         throw new StoreError("denied", "registration_closed");
       }
@@ -2885,7 +2891,7 @@ export class Store {
         // Recheck all persistent caps in the transaction immediately before the
         // credential is made usable; concurrent verification cannot overrun caps.
         if (this.idTaken(input.userId)) throw new StoreError("invalid_params", "identity already exists");
-        if (this.credentialValue(credential.credentialId)) throw new StoreError("invalid_params", "credential is already registered");
+        if (this.credentialValue(credential.credentialId)) throw new StoreError("denied", "credential is already registered");
         if (this.metaNumber("identity_count") >= this.config.registeredIdentityCount) throw new StoreError("denied", "registration_closed");
         this.chargeRegistration(input.ipKey, effective);
         const joined = this.existingRooms(input.rooms ?? DEFAULT_JOINED_ROOMS);
@@ -2966,7 +2972,8 @@ export class Store {
       return this.transaction(() => {
         const identity = this.identityRow(input.userId);
         if (!identity || identity.tier !== "registered") throw new StoreError("denied", "Only a registered user can add a passkey");
-        if (this.credentialValue(credential.credentialId)) throw new StoreError("invalid_params", "credential is already registered");
+        if (identity.user_id === ADMIN_USER_ID) throw new StoreError("denied", "The admin user signs in with APRON_ADMIN_TOKEN only");
+        if (this.credentialValue(credential.credentialId)) throw new StoreError("denied", "credential is already registered");
         const count = integerColumn(this.rawRows<{ count: number }>(
           "SELECT COUNT(*) AS count FROM (SELECT 1 FROM credentials WHERE user_id = ? LIMIT ?)", input.userId, MAX_PASSKEYS_PER_USER,
         )[0]?.count);
@@ -2997,6 +3004,50 @@ export class Store {
     } finally {
       this.settleReservation(reservation, beforeReads, beforeWrites);
     }
+  }
+
+  /**
+   * The WebAuthn user handle an identity's passkeys share: its stored one,
+   * or, for an identity with none yet (an invited user), `candidate`, stored
+   * now so concurrent ceremonies for it share one handle. One conditional
+   * write at most.
+   */
+  ensureUserHandle(userId: string, candidate: string, now = this.clock.now()): string | null {
+    this.ensureReady();
+    return this.reserved({ reads: 8, writes: 8 }, false, now, () => this.transaction(() => {
+      const identity = this.identityRow(userId);
+      if (!identity) return null;
+      if (identity.user_handle) return identity.user_handle;
+      this.rawExec("UPDATE identities SET user_handle = ?, updated_ms = ? WHERE user_id = ? AND user_handle = ''", candidate, this.effectiveNow(now), userId);
+      return candidate;
+    }));
+  }
+
+  /** An identity's passkeys, oldest first: at most MAX_PASSKEYS_PER_USER, for `/passkeys`. */
+  passkeys(userId: string, now = this.clock.now()): Array<{ credentialId: string; createdMs: number; usedMs: number }> {
+    this.ensureReady();
+    return this.reserved({ reads: 8 + 2 * MAX_PASSKEYS_PER_USER }, false, now, () => this.rawRows<{ credential_id: string; created_ms: number; updated_ms: number }>(
+      "SELECT credential_id, created_ms, updated_ms FROM credentials INDEXED BY credentials_user_idx WHERE user_id = ? ORDER BY created_ms, credential_id LIMIT ?",
+      userId, MAX_PASSKEYS_PER_USER,
+    ).map((row) => ({ credentialId: row.credential_id, createdMs: row.created_ms, usedMs: row.updated_ms })));
+  }
+
+  /**
+   * Removes one of an identity's passkeys, for `/passkeys remove`. Not the
+   * last one, which would leave a passkey user no way back in once their
+   * session ends. Returns whether it was removed.
+   */
+  removePasskey(input: { userId: string; credentialId: string; now?: number }): boolean {
+    this.ensureReady();
+    return this.reserved({ reads: 8 + 2 * MAX_PASSKEYS_PER_USER, writes: 16 }, false, input.now ?? this.clock.now(), () => this.transaction(() => {
+      const count = integerColumn(this.rawRows<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM (SELECT 1 FROM credentials WHERE user_id = ? LIMIT ?)", input.userId, MAX_PASSKEYS_PER_USER + 1,
+      )[0]?.count);
+      if (!this.rawRows("SELECT 1 FROM credentials WHERE credential_id = ? AND user_id = ? LIMIT 1", input.credentialId, input.userId).length) return false;
+      if (count <= 1) throw new StoreError("invalid_params", "You can't remove your only passkey");
+      this.rawExec("DELETE FROM credentials WHERE credential_id = ? AND user_id = ?", input.credentialId, input.userId);
+      return true;
+    }));
   }
 
   registerCredential(input: {

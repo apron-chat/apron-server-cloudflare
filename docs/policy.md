@@ -122,9 +122,11 @@ An authenticated guest may begin registration while retaining guest rights.
 A guest is not an account, so its new credential creates a separate
 registered identity; it does not transfer ownership of guest messages. A
 registration on a connection already signed in as a registered user (a
-passkey user, an invited user, or `admin`, but not a bot) instead adds the
-passkey to that account (protocol §4.9), at most 8 per account, each
-charged as a registration against the per-IP and daily caps. A registered
+passkey user or an invited user, but not a bot or the `admin` user) instead
+adds the passkey to that account (protocol §4.9), at most 8 per account,
+each charged as a registration against the per-IP and daily caps. The
+account's other connections are told, and `/passkeys` lists the account's
+passkeys and removes any but the last. A registered
 identity must reconnect before signing in as another.
 
 `server.signup` lists the schemes that create accounts: `webauthn` where

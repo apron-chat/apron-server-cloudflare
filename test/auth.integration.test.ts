@@ -150,9 +150,11 @@ it(`adds passkeys to a registered identity, at most ${MAX_PASSKEYS_PER_USER}, ne
 		const code = (fn: () => unknown) => { try { fn(); return 'ok'; } catch (error) { return (error as { code?: string }).code; } };
 		expect(code(() => store.addCredential({ userId: 'keeper', userHandle: 'x', now, ipKey: 'ip', credential: credential('key-extra') }))).toBe('denied');
 		store.registerIdentity({ userId: 'other', name: 'Other', userHandle: 'other-handle', now, ipKey: 'ip', credential: { ...credential('other-0'), userId: 'other' } });
-		expect(code(() => store.addCredential({ userId: 'other', userHandle: 'x', now, ipKey: 'ip', credential: credential('key-1') }))).toBe('invalid_params');
+		expect(code(() => store.addCredential({ userId: 'other', userHandle: 'x', now, ipKey: 'ip', credential: credential('key-1') }))).toBe('denied');
 		state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES ('bot_keeper', '', 'Bot', 'bot', 1, 1)");
 		expect(code(() => store.addCredential({ userId: 'bot_keeper', userHandle: 'x', now, ipKey: 'ip', credential: credential('bot-key') }))).toBe('denied');
+		state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES ('admin', '', 'Admin', 'registered', 1, 1)");
+		expect(code(() => store.addCredential({ userId: 'admin', userHandle: 'x', now, ipKey: 'ip', credential: credential('admin-key') }))).toBe('denied');
 		// An identity without a passkey (an invited user) takes the handle of its first.
 		state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES ('invited', '', 'Invited', 'registered', 1, 1)");
 		store.addCredential({ userId: 'invited', userHandle: 'invited-handle', now, ipKey: 'ip', credential: credential('invited-key') });

@@ -26,6 +26,9 @@ for (const storedVersion of [UPGRADABLE_SCHEMA_VERSION - 1, SCHEMA_VERSION + 1])
 				credential: { credentialId: 'cred-left', userId: 'user_left_general', publicKey: 'BBBB', counter: 7 },
 			});
 			state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES ('bot_x', '', 'Bot', 'bot', 1, 1)");
+			// Should `admin` ever hold a passkey, a reset does not carry it.
+			state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES ('admin', 'admin-handle', 'Admin', 'registered', 1, 1)");
+			state.storage.sql.exec("INSERT INTO credentials (credential_id, user_id, public_key_json, sign_count, transports_json, created_ms, updated_ms) VALUES ('cred-admin', 'admin', '{\"publicKey\":\"AAAA\"}', 0, NULL, ?, ?)", Date.now() + 5_000, Date.now() + 5_000);
 			state.storage.sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('admins', ?)", JSON.stringify(['user_before_reset', 'gone_user']));
 			await state.storage.put('session:stale', { v: 1, userId: 'user_before_reset', origin: 'http://localhost:5173', expiresMs: Date.now() + 60_000 });
 			state.storage.sql.exec("UPDATE _meta SET value = ? WHERE key = 'schema_version'", String(storedVersion));
@@ -47,6 +50,8 @@ for (const storedVersion of [UPGRADABLE_SCHEMA_VERSION - 1, SCHEMA_VERSION + 1])
 			expect(store.getCredential('cred-before')).toMatchObject({ credentialId: 'cred-before', userId: 'user_before_reset', publicKey: 'AAAA', counter: 0 });
 			expect(store.getCredential('cred-left')).toMatchObject({ userId: 'user_left_general', publicKey: 'BBBB', counter: 7 });
 			expect(store.getIdentity('bot_x')).toBeNull();
+			expect(store.getCredential('cred-admin')).toBeNull();
+			expect(store.getIdentity('admin')).toBeNull();
 			// Admins whose passkeys were carried stay admins.
 			expect(store.isAdmin('user_before_reset')).toBe(true);
 			expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'admins'").one().value).toBe('["user_before_reset"]');

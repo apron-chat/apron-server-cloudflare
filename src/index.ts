@@ -24,6 +24,7 @@ import {
 	type RequestFrame,
 } from "./protocol";
 import {
+	ADMIN_USER_ID,
 	DEFAULT_JOINED_ROOMS,
 	MAX_PASSKEYS_PER_USER,
 	ROOM_ID,
@@ -133,6 +134,8 @@ const JOIN_TOKEN_KEY_PREFIX = "join-token:";
 const JOIN_INVITE_KEY = "join-invite";
 /** Sign-ups one `/invite` may allow, and how long it lasts. */
 const MAX_JOIN_USES = 50;
+/** The name of a user who signs up with an invite and asks for none: not "Guest", which names guests. */
+const JOIN_DEFAULT_NAME = "Member";
 const JOIN_INVITE_TTL_MS = 7 * 86_400_000;
 /**
  * The commands this server provides (§4.8), as `/help` lists them to those
@@ -143,6 +146,7 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "help", usage: "/help", help: "list the commands you can use here", audience: "everyone" },
 	{ name: "invite-bot", usage: "/invite-bot", help: "get a sign-in token for your bot; a new one replaces the last", audience: "owners" },
 	{ name: "avatar", usage: "/avatar", help: "set your avatar: send this command with one image attached", audience: "owners" },
+	{ name: "passkeys", usage: "/passkeys [remove <n>]", help: "list your account's passkeys, or remove one of them", audience: "owners" },
 	{ name: "admin", usage: "/admin <user_id>", help: "make a registered user an admin", audience: "admins" },
 	{ name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", audience: "admins" },
 	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
@@ -163,10 +167,10 @@ const BOT_ID_PREFIX = "bot_";
 /** Features an admin can turn off and on with `/toggle`. */
 type ToggleFeature = "activity" | "uploads";
 /**
- * The registered user `APRON_ADMIN_TOKEN` signs in as, always an admin. Registered
- * users are `<name>_<digits>` or `u_…`, so no passkey user can take this id.
+ * The registered user `APRON_ADMIN_TOKEN` signs in as (ADMIN_USER_ID, `admin`)
+ * is always an admin. Registered users are `<name>_<digits>` or `u_…`, so no
+ * passkey user can take its id, and it never holds a passkey.
  */
-const ADMIN_USER_ID = "admin";
 const ADMIN_USER_NAME = "Admin";
 /** Bot tokens start with this, so `auth` tells them from passkey session tokens without a storage read. */
 const BOT_TOKEN_PREFIX = "apron_bot_";
@@ -1344,6 +1348,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const adding = attachment.tier === "registered";
 		if (adding && action !== "register") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
 		if (adding && isBot(attachment.userId)) throw { name: "denied", message: "A bot signs in with its token and takes no passkey" } satisfies ProtocolError;
+		// A passkey would outlive the token: deleting APRON_ADMIN_TOKEN must turn `admin` off.
+		if (adding && attachment.userId === ADMIN_USER_ID) {
+			throw { name: "denied", message: "The admin user signs in with APRON_ADMIN_TOKEN only; make your own account an admin with /admin" } satisfies ProtocolError;
+		}
 		const step = requiredString(params, "step");
 		const origin = this.requestOrigin(socket);
 		if (!origin || !this.config.rpOrigins.includes(origin)) throw { name: "denied", message: "Frontend origin is not configured for passkeys" } satisfies ProtocolError;
@@ -1355,7 +1363,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (adding && !stored) throw { name: "denied", message: "Only a registered user can add a passkey" } satisfies ProtocolError;
 			const existing = adding ? this.store.credentialIdsForUser(attachment.userId!) : [];
 			if (existing.length >= MAX_PASSKEYS_PER_USER) throw { name: "denied", message: `An account holds at most ${MAX_PASSKEYS_PER_USER} passkeys` } satisfies ProtocolError;
-			const handle = stored?.userHandle && /^[A-Za-z0-9_-]{16,64}$/.test(stored.userHandle) && stored.userHandle.length % 4 !== 1 ? stored.userHandle : undefined;
+			// An account without a handle yet (an invited user) gets one now, so
+			// concurrent ceremonies for it share it.
+			const shared = !stored ? null : stored.userHandle || this.store.ensureUserHandle(stored.userId, bytesToBase64Url(crypto.getRandomValues(new Uint8Array(16))), nowMs());
+			const handle = shared && /^[A-Za-z0-9_-]{16,64}$/.test(shared) && shared.length % 4 !== 1 ? shared : undefined;
 			const begun = await this.webAuthn.begin(action, origin, nowMs(), identity ?? undefined, existing, attachment.connId, {
 				...(name !== undefined ? { name } : {}),
 				userIdTaken: (userId) => this.store.userIdTaken(userId),
@@ -1414,6 +1425,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!latest || latest.closing || !openSocket(socket)) return;
 		if (challenge.adds) {
 			// The connection stays signed in as it was, now with one more passkey.
+			// The account's other connections are told, so an unexpected passkey
+			// can be spotted and removed with /passkeys.
+			for (const peer of this.connectionsOf(finished.identity.user_id, socket)) {
+				this.deliverTo(peer, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: {
+					text: "A passkey was added to your account from another connection. If it wasn't you, remove it with `/passkeys`.", format: "markdown",
+				} } });
+			}
 			this.reply(socket, request, { you: this.current(latest) });
 			await this.rescheduleAlarm();
 			return;
@@ -1627,27 +1645,44 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return this.withSessionLock(async () => {
 			if (attachment.tier === "registered") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
 			if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "invalid_params", message: "token is too long" } satisfies ProtocolError;
-			const name = this.requestedName(request.params) ?? "Guest";
+			const name = this.requestedName(request.params) ?? JOIN_DEFAULT_NAME;
 			const key = JOIN_TOKEN_KEY_PREFIX + await sha256Hex(token);
-			const invite = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredJoinInvite>(key));
-			if (!invite || invite.v !== 1 || !(invite.remaining > 0) || invite.expiresMs <= nowMs()) {
-				throw { name: "denied", message: "This invite is used up or has expired; ask an admin for a new one" } satisfies ProtocolError;
-			}
-			const userId = candidateUserIdFor(name, (candidate) => this.store.userIdTaken(candidate));
-			await this.runMutation(async () => {
-				const created = this.store.createInvitedIdentity({ userId, name, now: nowMs(), ipKey: attachment.ipKey });
-				for (const record of created.broadcasts) this.broadcastRecord(record);
-			});
 			const own = INVITE_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 			const ownKey = INVITE_TOKEN_KEY_PREFIX + await sha256Hex(own);
-			await this.store.withMeterAsync("foreground", { writes: 3 }, async () => {
-				if (invite.remaining > 1) await this.ctx.storage.put<StoredJoinInvite>(key, { ...invite, remaining: invite.remaining - 1 });
-				else await this.ctx.storage.delete(key);
-				await this.ctx.storage.put<StoredInviteToken>(ownKey, { v: 1, userId });
-				await this.ctx.storage.put<StoredBot>(INVITE_KEY_PREFIX + userId, { v: 1, tokenKey: ownKey });
+			const open = () => !connectionAttachment(socket)?.closing && openSocket(socket);
+			// The whole key-value cost (the invite read, then its count and the new
+			// user's token, or pruning a dead invite) is reserved before the
+			// account exists, so an exhausted budget cannot strand an account
+			// without its token or an invite not counted down.
+			const userId = await this.store.withMeterAsync("foreground", { reads: 1, writes: 3 }, async () => {
+				const invite = await this.ctx.storage.get<StoredJoinInvite>(key);
+				if (!invite || invite.v !== 1 || !(invite.remaining > 0) || invite.expiresMs <= nowMs()) {
+					// A used-up or expired invite is dropped when it is next tried.
+					if (invite) await this.ctx.storage.delete(key);
+					throw { name: "denied", message: "This invite is used up or has expired; ask an admin for a new one" } satisfies ProtocolError;
+				}
+				// A connection gone before the sign-up spends no use.
+				if (!open()) return null;
+				const userId = candidateUserIdFor(name, (candidate) => this.store.userIdTaken(candidate));
+				await this.runMutation(async () => {
+					const created = this.store.createInvitedIdentity({ userId, name, now: nowMs(), ipKey: attachment.ipKey });
+					for (const record of created.broadcasts) this.broadcastRecord(record);
+				});
+				// One put of three keys, with no await between creation and it: the
+				// new user's token and pointer, and the invite counted down (a
+				// used-up invite is pruned on its next try).
+				await this.ctx.storage.put({
+					[ownKey]: { v: 1, userId } satisfies StoredInviteToken,
+					[INVITE_KEY_PREFIX + userId]: { v: 1, tokenKey: ownKey } satisfies StoredBot,
+					[key]: { ...invite, remaining: invite.remaining - 1 } satisfies StoredJoinInvite,
+				});
+				return userId;
 			});
+			if (userId === null) return;
 			const identity = this.store.getIdentity(userId);
 			if (!identity) throw { name: "internal_error", message: "Invited user is missing" } satisfies ProtocolError;
+			// A reply lost after this point costs one use: the user exists, with a
+			// token nobody received, until an admin /purges them.
 			await this.signInKeyless(socket, attachment, request, identity, own);
 		});
 	}
@@ -1766,7 +1801,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		});
 	}
 
-	/** Serialize session KV decisions across fetches and alarms. */
+	/**
+	 * Serialize session KV decisions across fetches and alarms. Lock order:
+	 * a holder of this lock may take runMutation's (a sign-up invite creates
+	 * its user inside it), so a runMutation body must never wait for this
+	 * lock, or the two deadlock.
+	 */
 	private async withSessionLock<T>(fn: () => Promise<T>): Promise<T> {
 		const prior = this.sessionWorkTail;
 		let release!: () => void;
@@ -2283,6 +2323,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await this.startAvatar(socket, attachment, request, body);
 			return;
 		}
+		if (command.name === "passkeys") {
+			try {
+				this.passkeysCommand(socket, attachment, request, roomId, words.slice(1));
+			} catch (error) {
+				const protocol = errorToProtocol(error);
+				if (protocol.name !== "invalid_params") throw error;
+				this.fail(socket, request, protocol);
+			}
+			return;
+		}
 		if (["admin", "kick", "rename", "purge", "toggle", "invite-token", "invite"].includes(command.name)) {
 			try {
 				const target = words[1];
@@ -2371,6 +2421,37 @@ export class ApronDemoServer extends DurableObject<Env> {
 			],
 		};
 		this.sendNotice(socket, roomId, notices[chosen][on ? 0 : 1]);
+		this.reply(socket, request, {});
+	}
+
+	/**
+	 * `/passkeys`: lists the sender's passkeys, oldest first, numbered, with
+	 * when each was added and last used; `/passkeys remove <n>` removes one,
+	 * though never the last. Both answer with a `~private` notice before the
+	 * result, and a removal is also told to the account's other connections.
+	 * Sessions a removed passkey started stay valid until they expire.
+	 */
+	private passkeysCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, args: string[]): void {
+		const userId = attachment.userId!;
+		const usage = { name: "invalid_params", message: "Usage: /passkeys, or /passkeys remove <n>" } satisfies ProtocolError;
+		if (args.length !== 0 && (args.length !== 2 || args[0] !== "remove" || !/^\d{1,2}$/.test(args[1]))) throw usage;
+		const passkeys = this.store.passkeys(userId, nowMs());
+		const day = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+		if (args.length === 0) {
+			this.sendNotice(socket, roomId, passkeys.length
+				? ["Your passkeys:", ...passkeys.map((key, index) => `${index + 1}. \`${key.credentialId.slice(0, 8)}…\`, added ${day(key.createdMs)}, last used ${day(key.usedMs)}`)].join("\n")
+				: "Your account has no passkey. Register one while signed in to add it.");
+			this.reply(socket, request, {});
+			return;
+		}
+		const chosen = passkeys[Number(args[1]) - 1];
+		if (!chosen) throw { name: "invalid_params", message: `You have ${passkeys.length} passkey${passkeys.length === 1 ? "" : "s"}; see /passkeys` } satisfies ProtocolError;
+		if (!this.store.removePasskey({ userId, credentialId: chosen.credentialId, now: nowMs() })) throw usage;
+		const text = `Removed the passkey \`${chosen.credentialId.slice(0, 8)}…\` from your account.`;
+		for (const peer of this.connectionsOf(userId, socket)) {
+			this.deliverTo(peer, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text, format: "markdown" } } });
+		}
+		this.sendNotice(socket, roomId, text);
 		this.reply(socket, request, {});
 	}
 

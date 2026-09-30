@@ -414,8 +414,16 @@ it('adds a passkey to the signed-in account (§4.9); a guest\'s registration mak
 	const admin = await signedInAdmin();
 	try {
 		// A registered user adds a second passkey: the connection stays that user, and the
-		// authenticator is told the account's user handle and existing passkey.
+		// authenticator is told the account's user handle and existing passkey. The
+		// account's other connections are told.
+		const other = await connect();
+		await other.next();
+		const session = await runInDurableObject(stub(), (instance) =>
+			(instance as unknown as { issueSession(userId: string, origin: string, now: number): Promise<string> }).issueSession(userId, 'http://localhost:5173', Date.now()));
+		expect((await request(other, 'auth', 'auth', { scheme: 'token', token: session })).result.you.user_id).toBe(userId);
 		const added = await registerPasskey(user, 'add');
+		const told = await until(other, (frame) => frame.method === 'message' && frame.params.from?.user_id === '~private');
+		expect(told.frame.params.body.text).toMatch(/A passkey was added to your account/);
 		expect(added.begun.result.public_key.user.name).toBe(userId);
 		expect(added.begun.result.public_key.excludeCredentials.map((entry: { id: string }) => entry.id)).toEqual([`cred-${userId}`]);
 		expect(added.finished.result).toEqual({ you: { user_id: userId, name: `Name of ${userId}` } });
@@ -424,15 +432,27 @@ it('adds a passkey to the signed-in account (§4.9); a guest\'s registration mak
 		expect(credentials).toEqual([`cred-${userId}`, added.passkey.id]);
 		// The new passkey signs in as the same account.
 		expect((await passkeyLogin(added.passkey)).result.you.user_id).toBe(userId);
+		// /passkeys lists both; removing one tells the other connections, and the last cannot go.
+		const listed = await command(user, 'list', '/passkeys');
+		expect(listed.notice!.params.body.text).toMatch(/^Your passkeys:\n1\. .*\n2\. /);
+		const removed = await command(user, 'remove', '/passkeys remove 2');
+		expect(removed.frame.result).toEqual({});
+		expect((await until(other, (frame) => frame.method === 'message' && /Removed the passkey/.test(frame.params.body?.text ?? ''))).frame.params.from.user_id).toBe('~private');
+		expect((await passkeyLogin(added.passkey)).error.code).toBe(-32001);
+		expect((await command(user, 'remove-last', '/passkeys remove 1')).frame.error.message).toMatch(/only passkey/);
+		other.close();
 		// Signing in as someone else on a signed-in connection still takes a reconnect.
 		expect((await request(user, 'login', 'auth', { scheme: 'webauthn', action: 'login', step: 'begin' })).error.code).toBe(-32001);
 
-		// The admin user, signed in by token, can add a passkey too; a bot cannot.
+		// The admin user never takes a passkey, so deleting APRON_ADMIN_TOKEN turns it off; nor does a bot.
 		const adminKey = await connect();
 		await adminKey.next();
 		expect((await request(adminKey, 'auth', 'auth', { scheme: 'token', token: ADMIN_TOKEN })).result.you.user_id).toBe('admin');
-		expect((await registerPasskey(adminKey, 'admin-add')).finished.result.you.user_id).toBe('admin');
+		expect((await registerPasskey(adminKey, 'admin-add')).finished.error.code).toBe(-32001);
 		adminKey.close();
+		await runInDurableObject(stub(), (_instance, state) => {
+			expect(state.storage.sql.exec("SELECT 1 FROM credentials WHERE user_id = 'admin'").toArray()).toEqual([]);
+		});
 		const { frame, skipped } = await exchange(user, 'bot', 'command', { room_id: 'general', body: { text: '/invite-bot' } });
 		expect(frame.result).toEqual({});
 		const token = /apron_bot_[A-Za-z0-9_-]+/.exec(skipped.find((candidate) => candidate.params?.from?.user_id === '~private')!.params.body.text)![0];
@@ -475,9 +495,31 @@ it('/invite mints a sign-up token that creates a user per use, each with its own
 
 		// A second use makes another user; the third finds the invite used up.
 		const second = await fresh();
-		expect((await request(second, 'join', 'auth', { scheme: 'token', token: invite })).result.you).toMatchObject({ user_id: expect.stringMatching(/^u_/), name: 'Guest' });
+		// Without a name, a sign-up is a "Member" (not "Guest", which names guests).
+		expect((await request(second, 'join', 'auth', { scheme: 'token', token: invite })).result.you).toMatchObject({ user_id: expect.stringMatching(/^member_\d{4}$/), name: 'Member' });
 		const third = await fresh();
 		expect((await request(third, 'join', 'auth', { scheme: 'token', token: invite, name: 'Late' })).error.code).toBe(-32001);
+		// The used-up invite was dropped when it was tried.
+		expect(await runInDurableObject(stub(), async (_instance, state) => (await state.storage.list({ prefix: 'join-token:' })).size)).toBe(0);
+
+		// A budget failure before the sign-up leaves no account and spends no use.
+		const budgeted = /apron_join_[A-Za-z0-9_-]+/.exec((await command(admin, 'invite-budget', '/invite 1')).notice!.params.body.text)![0];
+		const identities = () => runInDurableObject(stub(), (_instance, state) => state.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM identities').one().n);
+		const before = await identities();
+		await runInDurableObject(stub(), (instance) => {
+			const store = (instance as unknown as { store: Record<string, unknown> }).store;
+			const original = store.withMeterAsync as (...args: unknown[]) => Promise<unknown>;
+			store.withMeterAsync = (kind: unknown, cost: { reads?: number; writes?: number }, ...rest: unknown[]) => {
+				if (cost.reads === 1 && cost.writes === 3) {
+					store.withMeterAsync = original;
+					throw Object.assign(new Error('Daily write budget exhausted'), { name: 'StoreError' });
+				}
+				return original.call(store, kind, cost, ...rest);
+			};
+		});
+		expect((await request(await fresh(), 'join', 'auth', { scheme: 'token', token: budgeted, name: 'Broke' })).error).toBeDefined();
+		expect(await identities()).toBe(before);
+		expect((await request(await fresh(), 'join', 'auth', { scheme: 'token', token: budgeted, name: 'Fine' })).result.you.name).toBe('Fine');
 
 		// A new invite replaces the last; /invite 0 revokes it.
 		const replaced = /apron_join_[A-Za-z0-9_-]+/.exec((await command(admin, 'invite-2', '/invite 1')).notice!.params.body.text)![0];
