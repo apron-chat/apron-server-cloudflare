@@ -338,7 +338,7 @@ it('logs a registered user\'s joins and leaves as memberships, delivered around 
 	const record = (roomId: string, joined: boolean) => ({
 		log_id: expect.stringMatching(/^[1-9][0-9]*$/), room_id: roomId, members: [{ user: { user_id: userId, name }, joined }],
 	});
-	const membershipOnly = (roomId: string, joined: boolean) => ({ method: 'room_update', params: { membership: [record(roomId, joined)] } });
+	const membershipOnly = (roomId: string, joined: boolean) => ({ method: 'room_update', params: { memberships: [record(roomId, joined)] } });
 	const tab = await signIn();
 	const other = await signIn();
 	const reader = await connect();
@@ -353,16 +353,16 @@ it('logs a registered user\'s joins and leaves as memberships, delivered around 
 		threadId = created.frame.result.room_id;
 		expect(methods(created.skipped)).toEqual(['room_update']);
 		const [update] = created.skipped;
-		expect(Object.keys(update.params)).toEqual(['joined', 'membership', 'users']);
+		expect(Object.keys(update.params)).toEqual(['joined', 'memberships', 'users']);
 		expect(update.params.joined[0]).toMatchObject({ room_id: threadId, log_id: threadId, members: [{ user_id: userId }] });
 		// Current objects carry the registered user's roles, [] when none (§3.3).
 		expect(update.params.users).toEqual([{ user_id: userId, name, roles: [] }]);
-		const joinedRecord = update.params.membership[0];
+		const joinedRecord = update.params.memberships[0];
 		expect(joinedRecord).toEqual(record(threadId, true));
 		expect(update.params.joined[0].latest_log_id).toBe(joinedRecord.log_id);
 		expect(BigInt(joinedRecord.log_id)).toBeGreaterThan(BigInt(threadId));
 		const otherCreated = await until(other, (frame) => frame.method === 'room_update' && frame.params.joined?.[0]?.room_id === threadId);
-		expect(otherCreated.frame.params.membership).toEqual([record(threadId, true)]);
+		expect(otherCreated.frame.params.memberships).toEqual([record(threadId, true)]);
 		// The parent's other members get the new thread, but not its membership.
 		const announced = await until(reader, (frame) => frame.method === 'room_update');
 		expect(announced.frame.params).toEqual({ updated: [expect.objectContaining({ room_id: threadId })] });
@@ -370,34 +370,34 @@ it('logs a registered user\'s joins and leaves as memberships, delivered around 
 		// A guest's join is not logged: `joined` alone, with every member.
 		const guestJoin = await exchange(reader, 'guest-join', 'room_join', { room_id: threadId });
 		expect(methods(guestJoin.skipped)).toEqual(['room_update']);
-		expect(guestJoin.skipped[0].params.membership).toBeUndefined();
+		expect(guestJoin.skipped[0].params.memberships).toBeUndefined();
 		expect(guestJoin.skipped[0].params.joined[0].members.map((member: { user_id: string }) => member.user_id)).toEqual([guest.user_id, userId].sort());
 		expect(guestJoin.skipped[0].params.users).toEqual([guest, { user_id: userId, name, roles: [] }].sort((a, b) => a.user_id < b.user_id ? -1 : 1));
 
 		// Leaving: the leaver's connections get `left` with the membership in one
 		// frame, then the result; the room's other members get the membership alone.
 		const left = await exchange(tab, 'leave', 'room_leave', { room_id: threadId });
-		expect(left.skipped).toEqual([{ method: 'room_update', params: { left: [{ room_id: threadId }], membership: [record(threadId, false)] } }]);
+		expect(left.skipped).toEqual([{ method: 'room_update', params: { left: [{ room_id: threadId }], memberships: [record(threadId, false)] } }]);
 		const otherLeft = await until(other, (frame) => frame.method === 'room_update' && frame.params.left !== undefined);
-		expect(otherLeft.frame.params.membership).toEqual([record(threadId, false)]);
-		expect((await until(reader, (frame) => frame.method === 'room_update' && frame.params.membership)).frame).toEqual(membershipOnly(threadId, false));
+		expect(otherLeft.frame.params.memberships).toEqual([record(threadId, false)]);
+		expect((await until(reader, (frame) => frame.method === 'room_update' && frame.params.memberships)).frame).toEqual(membershipOnly(threadId, false));
 		// Joining again: the joiner's connections get `joined` with the membership;
 		// the room's other members the membership alone.
 		const rejoined = await exchange(other, 'join', 'room_join', { room_id: threadId });
 		expect(methods(rejoined.skipped)).toEqual(['room_update']);
 		const rejoin = rejoined.skipped[0].params;
-		expect(rejoin.membership).toEqual([record(threadId, true)]);
-		expect(rejoin.joined[0].latest_log_id).toBe(rejoin.membership[0].log_id);
-		expect((await until(tab, (frame) => frame.method === 'room_update' && frame.params.joined)).frame.params.membership).toEqual([record(threadId, true)]);
-		expect((await until(reader, (frame) => frame.method === 'room_update' && frame.params.membership)).frame).toEqual(membershipOnly(threadId, true));
+		expect(rejoin.memberships).toEqual([record(threadId, true)]);
+		expect(rejoin.joined[0].latest_log_id).toBe(rejoin.memberships[0].log_id);
+		expect((await until(tab, (frame) => frame.method === 'room_update' && frame.params.joined)).frame.params.memberships).toEqual([record(threadId, true)]);
+		expect((await until(reader, (frame) => frame.method === 'room_update' && frame.params.memberships)).frame).toEqual(membershipOnly(threadId, true));
 
 		// History holds the logged memberships, and records keep the user
 		// objects they were logged with: no `users`.
 		const page = (await exchange(reader, 'history', 'history', { room_id: threadId })).frame.result;
-		expect(page.membership.map((record: { members: Array<{ joined: boolean }> }) => record.members[0].joined)).toEqual([true, false, true]);
-		expect(page.membership[0]).toEqual(joinedRecord);
+		expect(page.memberships.map((record: { members: Array<{ joined: boolean }> }) => record.members[0].joined)).toEqual([true, false, true]);
+		expect(page.memberships[0]).toEqual(joinedRecord);
 		expect(page.messages).toBeUndefined();
-		expect(page.last_log_id).toBe(rejoin.membership[0].log_id);
+		expect(page.last_log_id).toBe(rejoin.memberships[0].log_id);
 		const posted = await exchange(tab, 'post', 'message', { body: { text: 'before the rename' } });
 		await exchange(tab, 'rename', 'me', { name: 'Renamed later' });
 		const general = (await exchange(reader, 'general', 'history', { after: posted.frame.result.message_id })).frame.result;

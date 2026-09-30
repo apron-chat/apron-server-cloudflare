@@ -121,7 +121,7 @@ joined rooms and rooms to join by `filter`, with `members` and `users` on
 request, up to 6 times a minute per user (the first `filter: "joined"`
 listing after authentication is free), and `room_update` reports changes.
 A registered user's joins and leaves are logged membership records,
-delivered in `room_update` `membership` and returned in `history`; a guest's live in its connection and are not logged,
+delivered in `room_update` `memberships` and returned in `history`; a guest's live in its connection and are not logged,
 so `room_list` ignores `latest_log_id` and always answers with a full
 listing. `members` lists every connected member and at most 200 registered
 members per room (100 with the Free budgets); a room with more lists the first by `user_id`, not by recent activity, and also gives

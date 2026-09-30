@@ -389,7 +389,7 @@ it('creates threads with room_set, delivers only to joined rooms, and moves mess
 		expect(thread.rooms).toEqual([{ ...room, latest_log_id: followed.log_id }]);
 		expect(thread.messages).toEqual([inside, moved]);
 		expect(thread.reactions).toEqual([followed]);
-		expect(thread.membership).toBeUndefined();
+		expect(thread.memberships).toBeUndefined();
 		expect([thread.first_log_id, thread.last_log_id, thread.more]).toEqual([roomId, followed.log_id, false]);
 		expect([thread.latest_log_id, thread.history_log_id]).toEqual([followed.log_id, roomId]);
 		// The move snapshot names the room holding its earlier snapshot (§2),
@@ -670,7 +670,7 @@ it('lists only connected guests as members after others posted and left', async 
 			const page = (await until(fresh, (frame) => frame.id === 'history')).frame.result;
 			const senders = page.messages.map((entry: { from?: { user_id: string } }) => entry.from?.user_id);
 			expect(senders).toEqual(expect.arrayContaining(gone));
-			expect(page.membership).toBeUndefined();
+			expect(page.memberships).toBeUndefined();
 			const members = (await request(fresh, 'list', 'room_list', { room_id: 'general', members: true })).result.joined[0].members.map((member: { user_id: string }) => member.user_id);
 			expect(members).toEqual(expect.arrayContaining([aliceId.user_id, freshId.user_id]));
 			for (const id of gone) expect(members).not.toContain(id);

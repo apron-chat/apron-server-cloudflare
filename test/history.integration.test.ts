@@ -470,15 +470,15 @@ it("logs registered memberships in the room's log and returns them in history's 
 		const page = store.history({ roomId, after: 0n, limit: 50, now: clock.value });
 		expect(page.rooms?.map((room) => room.room_id)).toEqual([roomId]);
 		expect(page.messages).toBeUndefined();
-		expect(page.membership).toEqual([created.membership?.params, leave.membership?.params, rejoin.membership?.params]);
+		expect(page.memberships).toEqual([created.membership?.params, leave.membership?.params, rejoin.membership?.params]);
 		expect([page.first_log_id, page.last_log_id]).toEqual([roomId, rejoin.membership?.params.log_id]);
 		// A membership counts toward limit like any record, in log order.
 		const firstTwo = store.history({ roomId, after: 0n, limit: 2, now: clock.value });
 		expect(firstTwo.rooms).toHaveLength(1);
-		expect(firstTwo.membership).toEqual([created.membership?.params]);
+		expect(firstTwo.memberships).toEqual([created.membership?.params]);
 		expect(firstTwo.more).toBe(true);
 		const generalPage = store.history({ roomId: "general", after: BigInt(start), before: BigInt(start), now: clock.value });
-		expect(generalPage.membership).toEqual([identity.broadcasts[0].params]);
+		expect(generalPage.memberships).toEqual([identity.broadcasts[0].params]);
 
 		// Members are listed from storage, in user_id order, with current names.
 		register(store, clock, "reg_b", ["general", roomId, "no-such-room"]);

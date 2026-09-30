@@ -591,7 +591,7 @@ function sortedUsers(users: Iterable<PublicUser>): PublicUser[] {
 
 /** `room_update` `left` for one room, with the logged membership that removed the user, if any (§4.3.2). */
 function leftUpdate(roomId: string, membership?: Broadcast): Record<string, unknown> {
-	return { method: "room_update", params: { left: [{ room_id: roomId }], ...(membership ? { membership: [membership.params] } : {}) } };
+	return { method: "room_update", params: { left: [{ room_id: roomId }], ...(membership ? { memberships: [membership.params] } : {}) } };
 }
 
 /** A `room_update` notification (§4.3.3) with one field. */
@@ -2897,7 +2897,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const sorted = sortedUsers(users.values());
 		const listed: ListedRoom = { ...room, members: sorted.map((member) => ({ user_id: member.user_id })) };
 		if (count !== undefined && count > sorted.length) listed.member_count = count;
-		return { method: "room_update", params: { joined: [listed], ...(membership ? { membership: [membership.params] } : {}), users: sorted } };
+		return { method: "room_update", params: { joined: [listed], ...(membership ? { memberships: [membership.params] } : {}), users: sorted } };
 	}
 
 	/** Each room's members connected now: users who have joined it, one entry each. */
@@ -3236,13 +3236,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Delivers one committed record to the members of the rooms it belongs to.
-	 * A membership record goes in `room_update` `membership` (§4.3.3); with
+	 * A membership record goes in `room_update` `memberships` (§4.3.3); with
 	 * `exceptUser`, not to that user's connections, which get it together with
 	 * their `joined` or `left`.
 	 */
 	private broadcastRecord(record: Broadcast, exceptUser?: string): void {
 		const frame = record.method === "membership"
-			? { method: "room_update", params: { membership: [record.params] } }
+			? { method: "room_update", params: { memberships: [record.params] } }
 			: { method: record.method, params: record.params };
 		this.deliver(frame, record.rooms, exceptUser === undefined ? undefined : (state) => state.userId !== exceptUser);
 	}

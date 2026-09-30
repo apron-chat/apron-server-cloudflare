@@ -280,20 +280,20 @@ it('room_join and room_leave with a user_id add and remove others: an admin anyo
 		const added = await exchange(admin, 'add-bob', 'room_join', { room_id: roomId, user_id: bobId });
 		expect(added.frame.result).toEqual({});
 		const bobJoin = [{ user: { user_id: bobId, name: `Name of ${bobId}` }, joined: true }];
-		const others = added.skipped.filter((frame) => frame.method === 'room_update' && frame.params.membership);
-		expect(others.map((frame) => Object.keys(frame.params))).toEqual([['membership']]);
-		expect(others[0].params.membership[0].members).toEqual(bobJoin);
+		const others = added.skipped.filter((frame) => frame.method === 'room_update' && frame.params.memberships);
+		expect(others.map((frame) => Object.keys(frame.params))).toEqual([['memberships']]);
+		expect(others[0].params.memberships[0].members).toEqual(bobJoin);
 		const joined = await until(bob, (frame) => frame.method === 'room_update' && frame.params.joined !== undefined);
-		expect(Object.keys(joined.frame.params)).toEqual(['joined', 'membership', 'users']);
-		expect(joined.frame.params.membership[0]).toMatchObject({ room_id: roomId, members: bobJoin });
-		expect(joined.frame.params.joined[0].latest_log_id).toBe(joined.frame.params.membership[0].log_id);
+		expect(Object.keys(joined.frame.params)).toEqual(['joined', 'memberships', 'users']);
+		expect(joined.frame.params.memberships[0]).toMatchObject({ room_id: roomId, members: bobJoin });
+		expect(joined.frame.params.joined[0].latest_log_id).toBe(joined.frame.params.memberships[0].log_id);
 		expect(joined.frame.params.joined[0]).toMatchObject({ room_id: roomId, title: 'Invites' });
 		expect(joined.frame.params.joined[0].members.map((member: { user_id: string }) => member.user_id)).toEqual(['admin', bobId].sort());
 		// `users` are current objects: the admin's carry its role (§3.3).
 		expect(joined.frame.params.users).toContainEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'] });
 		expect(joined.frame.params.users).toContainEqual({ user_id: bobId, name: `Name of ${bobId}`, roles: [] });
 		// Adding a member again changes nothing.
-		expect((await exchange(admin, 'add-bob-again', 'room_join', { room_id: roomId, user_id: bobId })).skipped.some((frame) => frame.method === 'membership')).toBe(false);
+		expect((await exchange(admin, 'add-bob-again', 'room_join', { room_id: roomId, user_id: bobId })).skipped.some((frame) => frame.params?.memberships)).toBe(false);
 
 		// Bob may not add others, but may add his own bot.
 		const denied = await request(bob, 'add-carol', 'room_join', { room_id: roomId, user_id: carolId });
@@ -311,11 +311,11 @@ it('room_join and room_leave with a user_id add and remove others: an admin anyo
 		expect((await request(bob, 'remove-admin', 'room_leave', { room_id: roomId, user_id: 'admin' })).error.code).toBe(-32001);
 		const removed = await exchange(admin, 'remove-bob', 'room_leave', { room_id: roomId, user_id: bobId });
 		expect(removed.frame.result).toEqual({});
-		expect(removed.skipped.filter((frame) => frame.params?.membership).at(-1)?.params.membership[0].members).toEqual([{ user: { user_id: bobId, name: `Name of ${bobId}` }, joined: false }]);
+		expect(removed.skipped.filter((frame) => frame.params?.memberships).at(-1)?.params.memberships[0].members).toEqual([{ user: { user_id: bobId, name: `Name of ${bobId}` }, joined: false }]);
 		// The removed user's connections get `left` with the membership (§4.3.2, §4.8 /kick).
 		const left = await until(bob, (frame) => frame.method === 'room_update' && frame.params.left !== undefined);
 		expect(left.frame.params.left).toEqual([{ room_id: roomId }]);
-		expect(left.frame.params.membership[0].members).toEqual([{ user: { user_id: bobId, name: `Name of ${bobId}` }, joined: false }]);
+		expect(left.frame.params.memberships[0].members).toEqual([{ user: { user_id: bobId, name: `Name of ${bobId}` }, joined: false }]);
 		// Removing someone not in the room changes nothing; an unknown user is invalid.
 		expect((await request(admin, 'remove-bob-again', 'room_leave', { room_id: roomId, user_id: bobId })).result).toEqual({});
 		expect((await request(admin, 'remove-nobody', 'room_leave', { room_id: roomId, user_id: 'nobody_123' })).error.code).toBe(-32602);

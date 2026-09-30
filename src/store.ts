@@ -429,7 +429,7 @@ export type RecordKind = "room" | "message" | "reactions" | "membership";
  * members of `rooms`: its room, and for a move both rooms (§3.4, §4.1).
  */
 export interface Broadcast {
-  /** A membership record is delivered in `room_update` `membership` (§4.3.3), not as its own notification. */
+  /** A membership record is delivered in `room_update` `memberships` (§4.3.3), not as its own notification. */
   method: "message" | "reactions" | "membership";
   params: Record<string, unknown>;
   rooms: string[];
@@ -488,7 +488,7 @@ export interface StoreHistoryResult {
   rooms?: RoomRecord[];
   messages?: MessageSnapshot[];
   reactions?: ReactionsRecord[];
-  membership?: MembershipRecord[];
+  memberships?: MembershipRecord[];
   first_log_id?: string;
   last_log_id?: string;
   more: boolean;
@@ -4374,7 +4374,7 @@ export class Store {
     // A 128-byte request ID can require 768 JSON bytes when escaped.
     const responseOverhead = 1024;
     let bytes = utf8Bytes(JSON.stringify({
-      rooms: [], messages: [], reactions: [], membership: [], first_log_id: latestLogId, last_log_id: latestLogId,
+      rooms: [], messages: [], reactions: [], memberships: [], first_log_id: latestLogId, last_log_id: latestLogId,
       more: false, latest_log_id: latestLogId, history_log_id: historyLogId,
     }));
     let stoppedForBytes = false;
@@ -4411,7 +4411,7 @@ export class Store {
       ...(rooms.length ? { rooms } : {}),
       ...(messages.length ? { messages } : {}),
       ...(reactions.length ? { reactions } : {}),
-      ...(membership.length ? { membership } : {}),
+      ...(membership.length ? { memberships: membership } : {}),
       first_log_id: idString(selected[0].logId),
       last_log_id: idString(selected[selected.length - 1].logId),
       more,

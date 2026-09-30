@@ -126,7 +126,7 @@ it('lets a registered user invite a bot that signs in from anywhere with its tok
 			'```',
 		].join('\n'));
 		// The new bot's logged join of general reaches its members, the owner among them.
-		const joined = skipped.find((frame) => frame.method === 'room_update' && frame.params.membership)?.params.membership[0];
+		const joined = skipped.find((frame) => frame.method === 'room_update' && frame.params.memberships)?.params.memberships[0];
 		expect(joined?.members).toEqual([{ user: { user_id: 'bot_u_owner', name: 'Bot of Name of u_owner' }, joined: true }]);
 
 		// A bot has no Origin: it is offered `token`, and its token needs none.
@@ -164,7 +164,7 @@ it('replaces a bot token on a new invite, signing out the old one, and renames t
 		await request(owner, 'rename', 'me', { name: 'Rotated' });
 		const { token: newToken, skipped } = await inviteBot(owner, 'invite-2');
 		// No second join: the bot exists and only takes the owner's new name.
-		expect(skipped.some((frame) => frame.method === 'membership')).toBe(false);
+		expect(skipped.some((frame) => frame.params?.memberships)).toBe(false);
 		expect(newToken).not.toBe(oldToken);
 
 		// The connection that used the old token is closed, and the old token no longer signs in.

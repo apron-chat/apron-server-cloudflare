@@ -115,7 +115,7 @@ Memberships:
   advances the room's head, within the 64-write floor. The room's
   `member_count` changes in that same head update, so it writes no extra row
   (the matrix's join and leave measured the same before it). Protocol 7
-  delivers the record in `room_update` `membership`, together with the
+  delivers the record in `room_update` `memberships`, together with the
   user's own `joined` or `left`: one frame fewer per connection of the
   joining or leaving user, and the same rows. Adding or
   removing another user (`room_join`/`room_leave` with `user_id`, `/kick`)
