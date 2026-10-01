@@ -146,7 +146,7 @@ deadline. A matching finish attempt consumes the challenge even on failure.
 A verified login or registration returns a bearer `token` (protocol [§4.9](https://github.com/shazow/apron/blob/main/PROTOCOL.md#49-webauthn-authentication),
 session resume). Presenting it with `scheme: "token"` on a later connection from
 the same origin resumes the registered identity without a ceremony; once less
-than half of its 12 hours remain, the resume renews it for another 12. The token
+than half of its 30 days remain, the resume renews it for another 30. The token
 itself does not change. Sessions
 are stored hashed in the object and swept on expiry. Signing out is local to
 the client: it drops the stored token, and the connection returns as a fresh

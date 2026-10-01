@@ -469,4 +469,4 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `limiterRecordCap` | 10000 |  |
 | `maxCredentialBytes` | 16384 |  |
 | `maxChallengeBytes` | 16384 |  |
-| `sessionTtlSeconds` | 43200 |  |
+| `sessionTtlSeconds` | 2592000 |  |
