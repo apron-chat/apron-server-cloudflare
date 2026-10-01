@@ -64,6 +64,10 @@ upper bounds can be compared with the measured worst case.
 | Identity count | 4 | 2 | 16 | 8 |
 | Credential IDs lookup | 4 | 2 | 40 | 8 |
 | Credential counter update | 5 | 3 | 16 | 16 |
+| Push subscription register | 9 | 6 | 172 | 304 |
+| Push subscription register again, unchanged within a day | 6 | 2 | 172 | 304 |
+| Push wake claim (one user, one subscription) | 11 | 9 | 54 | 24 |
+| Gone push subscription forget | 4 | 3 | 20 | 20 |
 | Message create with request ID | 33 | 37 | 296 | 120 |
 | Empty new message (not logged) | 4 | 2 | 16 | 8 |
 | Deduplicated mutation retry | 5 | 2 | 32 | 16 |
@@ -277,6 +281,26 @@ and two groups of four edits separated by a minute. The resulting current-day
 limiter count was 13, demonstrating that the UTC reset and the two bursts are
 independent.
 
+## Push
+
+With Web Push on (protocol §4.7), `push_register` is one frame plus the
+subscription register above: about 6 writes the first time, and 2 for
+the reservation alone when a client registers the same subscription on
+its next connection within a day, which writes nothing. Its reservation is
+sized for evicting a user's whole index range under any valid policy (64
+subscriptions), which the credit-back returns. Choosing whom a new message
+wakes reads connection attachments only; the wake claim then reads each
+chosen user's subscriptions (at most `wakesPerMessage` users of
+`subscriptionsPerUser` each, 10 of 5 by default) and writes the day's push
+counter, about 9 writes whatever the number of pushes. A message that
+mentions no one away or gone does no push SQL. A push service's 404 or 410
+costs one delete per gone subscription. The pushes themselves are outbound
+requests from the Durable Object: no Worker or Durable Object request is
+billed for them, and the object is awake for the post anyway. `pushesPerDay`
+(5,000 on Paid, 1,000 on Free) bounds them; on Paid that is at most 45,000
+claim writes a day if every push were its own wake, under 7% of the
+foreground write ceiling.
+
 ## Retention, maintenance, and persistent state
 
 The three-day cleanup advanced the internal server-wide retention floor
@@ -380,7 +404,9 @@ exhausted budget cannot block it. The object is not wiped.
 A schema 6 object is upgraded to schema 7 the same way: it adds `roles_json`
 to `identities` and sets it for bots, `admin`, and schema 6's listed admins,
 reading and updating the identities once (at most the identity cap), and
-deletes the `_meta` `admins` row. A schema 5 object takes both upgrades.
+deletes the `_meta` `admins` row. A schema 7 object is upgraded to schema 8
+the same way, which only creates the empty `push_subscriptions` table and
+its index. A schema 5 object takes all three upgrades.
 
 Any other stored schema version resets the object with
 `deleteAll()` and recreates the schema (`test/schema-reset.integration.test.ts`).

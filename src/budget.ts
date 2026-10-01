@@ -222,6 +222,22 @@ export interface UploadPolicy {
 	storedBytesCap: number;
 }
 
+/**
+ * Web Push (protocol §4.7, push kind `webpush`): a message that mentions a
+ * registered user wakes them through their browsers' push services when
+ * none of their connections is attended.
+ */
+export interface PushPolicy {
+	/** Pushes the whole server sends a UTC day, one per subscription woken. */
+	pushesPerDay: number;
+	/** Users one message may wake; mentions past them are not pushed. */
+	wakesPerMessage: number;
+	/** Subscriptions one user may hold; another replaces the least recently registered. */
+	subscriptionsPerUser: number;
+	/** How long a push service keeps a push for an offline browser (the `TTL` header). */
+	ttlSeconds: number;
+}
+
 export interface Plan {
 	name: string;
 	limits: Readonly<Limits>;
@@ -230,6 +246,7 @@ export interface Plan {
 	features: Readonly<Features>;
 	edgeStop?: Readonly<EdgeStop>;
 	uploads?: Readonly<UploadPolicy>;
+	push?: Readonly<PushPolicy>;
 }
 
 // Match the account's Workers plan. To switch back to Free, import FREE_PLAN
@@ -239,6 +256,7 @@ export const PLAN: Plan = PAID_PLAN;
 export const DEFAULT_LIMITS: Readonly<Limits> = PLAN.limits;
 export const DEFAULT_FEATURES: Readonly<Features> = PLAN.features;
 export const UPLOAD_POLICY: Readonly<UploadPolicy> | undefined = PLAN.uploads;
+export const PUSH_POLICY: Readonly<PushPolicy> | undefined = PLAN.push;
 
 // Calibrated implementation bounds remain explicit: raising a payload or parser
 // bound requires rechecking its consumers. Resource ceilings below instead use
@@ -288,6 +306,9 @@ export const MAX_ROOM_LIST_MEMBERS = 200;
 // A guest-number block is one durable write, spent whether or not the object
 // hands its numbers out before it sleeps; this bounds how fast numbers climb.
 export const MAX_GUEST_NUMBER_BLOCK = 10_000;
+// One message's wake sends a push per subscription of each user it wakes,
+// each an outbound request from the one Durable Object invocation.
+export const MAX_PUSHES_PER_MESSAGE = 64;
 export const MAX_SQL_WRITES = DEFAULT_LIMITS.sqlWritesPerDay;
 export const MAX_SQL_READS = DEFAULT_LIMITS.sqlReadsPerDay;
 export const MAX_DATABASE_HIGH_WATER_BYTES = DEFAULT_LIMITS.databaseHighWaterBytes;

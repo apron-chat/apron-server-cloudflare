@@ -14,6 +14,9 @@ declare global {
 		MEDIA_ORIGIN?: string;
 		PUBLIC_ORIGIN?: string;
 		UPLOAD_SIGNING_KEY?: string;
+		VAPID_PUBLIC_KEY?: string;
+		VAPID_PRIVATE_KEY?: string;
+		VAPID_SUBJECT?: string;
 		ASSETS?: Fetcher;
 		ALLOWED_ORIGINS?: string;
 		RP_ID?: string;
@@ -36,6 +39,9 @@ declare global {
 			MEDIA_ORIGIN?: string;
 			PUBLIC_ORIGIN?: string;
 			UPLOAD_SIGNING_KEY?: string;
+			VAPID_PUBLIC_KEY?: string;
+			VAPID_PRIVATE_KEY?: string;
+			VAPID_SUBJECT?: string;
 			ASSETS?: Fetcher;
 			ALLOWED_ORIGINS?: string;
 			RP_ID?: string;

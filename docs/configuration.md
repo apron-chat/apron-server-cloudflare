@@ -251,6 +251,51 @@ Upload writes and their claims use the Worker and Durable Object allowances
 above: two Durable Object requests and one Worker request each, at most
 500 a day. Deletes are free.
 
+## Push
+
+Mentions wake registered users through Web Push (protocol §4.7, push kind
+`webpush`; see [SPEC section 4.4](../SPEC.md#44-push)). Both plans have a
+`push` policy, set in `src/plans/free.ts` with Paid's daily cap raised in
+`src/plans/paid.ts`:
+
+| Setting | Workers Paid | Workers Free |
+| --- | ---: | ---: |
+| `pushesPerDay` (server-wide, one per subscription woken) | 5,000 | 1,000 |
+| `wakesPerMessage` (users one message may wake) | 10 | 10 |
+| `subscriptionsPerUser` | 5 | 5 |
+| `ttlSeconds` (how long a push service keeps an undelivered push) | 1 day | 1 day |
+
+`wakesPerMessage` times `subscriptionsPerUser`, the pushes one message may
+send, is at most 64, and `ttlSeconds` at most four weeks; the configuration
+check fails otherwise.
+
+Push is off, and `server.push` absent, until a VAPID key pair
+([RFC 8292](https://www.rfc-editor.org/rfc/rfc8292)) and contact are set:
+
+1. **Keys.** `node scripts/vapid-keys.mjs` prints a new P-256 key pair as
+   `VAPID_PUBLIC_KEY=…` and `VAPID_PRIVATE_KEY=…`, unpadded base64url.
+2. **Public key and contact.** Add `VAPID_PUBLIC_KEY` and `VAPID_SUBJECT`
+   (a `mailto:` address or `https:` URL push services may use to reach the
+   operator) to `[vars]` in `wrangler.production.toml`. The public key is
+   advertised to every client as `server.push.webpush.key`.
+3. **Private key.** `npx wrangler secret put VAPID_PRIVATE_KEY --config
+   wrangler.production.toml`, pasting the private key. Never put it in
+   source.
+
+Locally, put the three in `.dev.vars`. A malformed key or subject makes every
+request fail its configuration check; that the private key matches the
+public one shows only when push services reject the signature
+(`push_delivery_failed` in the logs). Browsers subscribe with the public
+key, so replacing the pair strands every subscription: push services refuse
+pushes signed with the new key, and clients must subscribe again. The old
+rows stay until their users' newer registrations replace them. Deleting the
+secret turns push off; stored subscriptions stay, unused, until it is set
+again.
+
+Pushes are outbound requests from the Durable Object, which no Worker or
+Durable Object allowance counts and no edge rule needs to allow. Their SQL is
+in the [cost report](cost-report.md#push); `/status` shows the day's pushes.
+
 ## Runtime overrides
 
 Wrangler string variables use the exact names below. Numeric policy variables
@@ -326,6 +371,9 @@ and recalibrating its resource model.
 | `MEDIA_ORIGIN` | Exact https origin where the upload bucket serves objects, such as `https://media.apron.chat`; with `PUBLIC_ORIGIN`, `UPLOAD_SIGNING_KEY` and the `MEDIA` binding, turns uploads on for a plan that has them |
 | `PUBLIC_ORIGIN` | This Worker's exact public origin, which `write_url`s point at |
 | `UPLOAD_SIGNING_KEY` | Secret of at least 32 characters that signs `write_url`s; set with `npx wrangler secret put UPLOAD_SIGNING_KEY --config wrangler.production.toml` |
+| `VAPID_PUBLIC_KEY` | Uncompressed P-256 public key, unpadded base64url (`node scripts/vapid-keys.mjs`); with `VAPID_PRIVATE_KEY` and `VAPID_SUBJECT`, turns push on and is advertised as `server.push.webpush.key` |
+| `VAPID_PRIVATE_KEY` | Secret: the matching 32-byte private key, unpadded base64url; set with `npx wrangler secret put VAPID_PRIVATE_KEY --config wrangler.production.toml` |
+| `VAPID_SUBJECT` | `mailto:` address or `https:` URL sent to push services in each VAPID token as the operator's contact |
 | `ADMISSION_OFF` | Operator admission switch; `true` rejects new sockets in the entry Worker before the limiter or DO call; existing sockets remain subject to DO budgets |
 | `ENVIRONMENT` | Set to `development` to enable local origin defaults when `ALLOWED_ORIGINS` and `RP_ORIGINS` are omitted |
 | `NODE_ENV` | Set to `test` to enable the same local origin defaults for tests; production-like deployments must configure origins explicitly |

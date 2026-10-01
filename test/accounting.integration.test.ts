@@ -1,7 +1,7 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { Store, StoreError, defaultStoreConfig } from '../src/store';
-import { DEFAULT_LIMITS } from '../src/budget';
+import { DEFAULT_LIMITS, PUSH_POLICY } from '../src/budget';
 import { expectRetryAfter, messagesOf } from './helpers/store';
 
 // A day's retention with hourly cleanup, for tests that watch records expire.
@@ -653,7 +653,7 @@ describe('measured storage accounting', () => {
 
 	it('measures every Store reservation boundary used by runtime operations', async () => {
 		const stub = env.DEMO.getByName('accounting-operation-matrix-v1');
-		const config = defaultStoreConfig();
+		const config = defaultStoreConfig({ push: { ...PUSH_POLICY! } });
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
 			const store = new Store(state, config, clock);
@@ -679,6 +679,11 @@ describe('measured storage accounting', () => {
 			measure('identity count', () => store.countIdentities());
 			measure('credential IDs lookup', () => store.credentialIdsForUser('matrix-user'));
 			measure('credential counter update', () => store.updateCredentialCounter('matrix-credential', 1));
+			const subscription = { userId: 'matrix-user', url: 'https://push.example.net/matrix', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22) };
+			measure('push subscription register', () => store.registerPushSubscription({ ...subscription, now: clock.now() }));
+			measure('push subscription register again, unchanged', () => store.registerPushSubscription({ ...subscription, now: clock.now() }));
+			expect(measure('push wake claim', () => store.claimPushes({ userIds: ['matrix-user'], now: clock.now() })).subscriptions).toHaveLength(1);
+			measure('gone push subscription forget', () => store.forgetPushSubscriptions([subscription.url], clock.now()));
 
 			const identity = { user_id: 'matrix-user', name: 'Matrix user', tier: 'registered' as const };
 			const create = measure('message create', () => store.commitMutation({
@@ -728,7 +733,7 @@ describe('measured storage accounting', () => {
 			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
 			expect(create.result.message_id).toBeTruthy();
-			expect(costs).toHaveLength(30);
+			expect(costs).toHaveLength(34);
 			return { costs };
 		});
 		console.info('accounting-operation-matrix', JSON.stringify(result));

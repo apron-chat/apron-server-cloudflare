@@ -20,6 +20,9 @@ for a zero-overage deployment.
 - **Images and avatars.** Signed-in users attach images and set avatars
   (`embed:upload`), stored in R2 within its free tier for a week (avatars a
   month).
+- **Push for mentions.** With VAPID keys set, a mention wakes a signed-in
+  user whose every tab is away or closed, through their browser's Web Push
+  service (`server.push` kind `webpush`).
 - **Bring your own frontend.** Guest connections are accepted from any
   origin — even `localhost` or a browser console.
 - **Built to stay inside its plan.** Every operation is metered against

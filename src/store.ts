@@ -13,7 +13,9 @@ import {
   DEFAULT_LIMITS,
   MAINTENANCE_CONTROL_RESERVE,
   MAX_EMOJI_BYTES,
+  MAX_PUSHES_PER_MESSAGE,
   MAX_THREAD_LIMIT,
+  type PushPolicy,
   type UploadPolicy,
 } from "./budget";
 import type { AccountUsageSnapshot } from "./account-usage";
@@ -46,11 +48,12 @@ export const ROOM_TITLE = "General";
  * (see upgradeFromSchema5() and upgradeFromSchema6()); stored data from any other
  * schema version is not migrated: the object is wiped and started fresh (see
  * resetStorage()). Additive rows need no new version: the `_meta`
- * guest-number mark, absent in older objects, reads as zero.
+ * guest-number mark, absent in older objects, reads as zero. Schema 8 adds
+ * the `push_subscriptions` table (see upgradeFromSchema7()).
  */
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 /** The older schemas upgraded in place rather than reset, oldest first; each upgrades to the next. */
-export const UPGRADABLE_SCHEMA_VERSIONS: readonly number[] = [5, 6];
+export const UPGRADABLE_SCHEMA_VERSIONS: readonly number[] = [5, 6, 7];
 /**
  * The registered user `APRON_ADMIN_TOKEN` signs in as, always an admin. It
  * never holds a passkey, so deleting the token turns it off completely.
@@ -222,6 +225,8 @@ export interface StoreConfig {
    * the public origin its R2 objects are served from.
    */
   uploads: StoreUploadConfig | null;
+  /** Web Push (protocol §4.7), or null without it: the plan's push policy. */
+  push: PushPolicy | null;
 }
 
 export interface StoreUploadConfig extends UploadPolicy {
@@ -334,6 +339,7 @@ const DEFAULT_CONFIG: StoreConfig = {
   admissionEnabled: true,
   ogRemoteMedia: false,
   uploads: null,
+  push: null,
   // These bounds include the reservation row and worst-case indexed control
   // updates for one accepted operation; calibrated workloads may lower them
   // only after observing cursor counts.
@@ -757,6 +763,26 @@ export const UPLOAD_WRITE_GRACE_MS = 60_000;
 export const UPLOAD_SWEEP_BATCH = 32;
 /** Rows one upload's bookkeeping may write: its row and indexes, two limiter rows, and the byte count. */
 const UPLOAD_WRITES = 16;
+/**
+ * Most push subscriptions one user can hold under any valid policy: a
+ * policy's `subscriptionsPerUser` is at most MAX_PUSHES_PER_MESSAGE, and
+ * each registration evicts down to the policy in force. Reservations that
+ * touch a user's subscriptions are sized by it.
+ */
+const MAX_PUSH_SUBSCRIPTIONS_PER_USER = MAX_PUSHES_PER_MESSAGE;
+/** Longest push endpoint URL kept (protocol §4.7); browsers' are a few hundred bytes. */
+export const MAX_PUSH_URL_BYTES = 1024;
+/** A re-registration of an unchanged subscription younger than this writes nothing. */
+const PUSH_REFRESH_MS = 86_400_000;
+
+/** A Web Push subscription (protocol §4.7, kind `webpush`): its endpoint and the browser's keys. */
+export interface PushSubscriptionRecord {
+  url: string;
+  userId: string;
+  p256dh: string;
+  auth: string;
+}
+
 /** Rows one guest-number block reservation may read and write, before control overhead. */
 const GUEST_NUMBER_BLOCK_COST = { reads: 8, writes: 8 } as const;
 
@@ -1018,7 +1044,9 @@ function ensureText(value: unknown, field: string, maxBytes: number): string {
  * `member_count`. Guests' memberships live in their connection only, like the
  * guest identity itself, and are not logged. `uploads` lists the objects
  * written to R2 (protocol §4.6.3): attached files by message and embed, and
- * avatars, by owner, expiry, and pending write.
+ * avatars, by owner, expiry, and pending write. `push_subscriptions` holds
+ * registered users' Web Push endpoints (protocol §4.7), keyed by the endpoint
+ * and indexed by user, most recently registered last.
  */
 const SCHEMA_DDL = `
   CREATE TABLE IF NOT EXISTS _meta (
@@ -1113,6 +1141,15 @@ const SCHEMA_DDL = `
     updated_ms INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS credentials_user_idx ON credentials (user_id);
+  CREATE TABLE IF NOT EXISTS push_subscriptions (
+    url TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    p256dh TEXT NOT NULL,
+    auth TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS push_subscriptions_user_idx ON push_subscriptions (user_id, updated_ms);
   CREATE TABLE IF NOT EXISTS accepted_requests (
     user_id TEXT NOT NULL,
     request_id TEXT NOT NULL,
@@ -1226,6 +1263,10 @@ export class Store {
     }
     if (version === 6) {
       this.upgradeFromSchema6();
+      version = 7;
+    }
+    if (version === 7) {
+      this.upgradeFromSchema7();
       version = SCHEMA_VERSION;
     }
     if (version !== 0 && version !== SCHEMA_VERSION) throw new Error(`storage schema ${version} requires resetStorage()`);
@@ -1430,6 +1471,32 @@ export class Store {
       this.finishUpgrade(7, start, day);
     });
     console.warn(JSON.stringify({ event: "storage_schema_upgraded", from: 6, to: 7 }));
+  }
+
+  /**
+   * Upgrades a schema 7 object to schema 8 in place, once, in one
+   * transaction: it creates the empty `push_subscriptions` table and its
+   * index, and changes nothing else. Charged like upgradeFromSchema5's rows.
+   */
+  private upgradeFromSchema7(): void {
+    const start = { reads: this.observed.reads, writes: this.observed.writes };
+    const effective = Number(this.metaValue(META_EFFECTIVE_NOW));
+    const day = dayFor(Math.max(Number.isSafeInteger(effective) ? effective : 0, this.clock.now()));
+    this.transaction(() => {
+      this.rawScript(`
+        CREATE TABLE IF NOT EXISTS push_subscriptions (
+          url TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          p256dh TEXT NOT NULL,
+          auth TEXT NOT NULL,
+          created_ms INTEGER NOT NULL,
+          updated_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS push_subscriptions_user_idx ON push_subscriptions (user_id, updated_ms);
+      `);
+      this.finishUpgrade(8, start, day);
+    });
+    console.warn(JSON.stringify({ event: "storage_schema_upgraded", from: 7, to: 8 }));
   }
 
   /** Schema 6's `admins` list (META_LEGACY_ADMINS), or none when absent or unreadable. */
@@ -2437,8 +2504,8 @@ export class Store {
    * left under the old id to the new one: the `from` of their logged message
    * snapshots and current messages (so they can still edit them), their
    * reaction sets, logged and current, and their logged membership changes,
-   * keeping the recorded names; their uploads; their limiter windows; and
-   * their dedup rows. Nothing is announced: clients see the new id when they
+   * keeping the recorded names; their uploads; their push subscriptions;
+   * their limiter windows; and their dedup rows. Nothing is announced: clients see the new id when they
    * load history again. Other users' `body.mentions`, sessions and the user's
    * bot stay under the old id. The old `user_id` is retired, never reissued.
    * Returns the user's name, joined rooms, and roles. A bot's is fixed.
@@ -2452,7 +2519,7 @@ export class Store {
     const now = input.now ?? this.clock.now();
     const { from, to } = input;
     const records = this.retainedRecords(now);
-    const found = this.reserved({ reads: 64 + 8 * records }, false, now, () => {
+    const found = this.reserved({ reads: 64 + 8 * records + 2 * MAX_PUSH_SUBSCRIPTIONS_PER_USER }, false, now, () => {
       const identity = this.identityRow(from);
       if (!identity || identity.tier !== "registered") throw new StoreError("invalid_params", `No registered user has the user_id ${from}`.slice(0, 200));
       if (parseRoles(identity.roles_json).includes("bot")) throw new StoreError("invalid_params", "A bot's user_id is fixed");
@@ -2470,6 +2537,7 @@ export class Store {
         messages: this.rawRows<{ message_id: string; snapshot_json: string }>("SELECT message_id, snapshot_json FROM message_state WHERE author_id = ?", from),
         reactions: this.rawRows<{ message_id: string; from_json: string }>("SELECT message_id, from_json FROM reaction_state WHERE user_id = ?", from),
         uploads: count("SELECT COUNT(*) AS count FROM uploads INDEXED BY uploads_owner_idx WHERE owner_id = ?"),
+        pushes: count("SELECT COUNT(*) AS count FROM push_subscriptions INDEXED BY push_subscriptions_user_idx WHERE user_id = ?"),
         requests: count("SELECT COUNT(*) AS count FROM accepted_requests WHERE user_id = ?"),
       };
     });
@@ -2477,7 +2545,7 @@ export class Store {
     // Moving a row keyed or indexed by the user_id reads its index entry and
     // row and rewrites both (measured: about 2 reads and 3 writes each);
     // rewriting a record's JSON in place is one write.
-    const moved = membershipRows + found.reactions.length + found.uploads + found.requests + USER_LIMIT_SCOPES.length;
+    const moved = membershipRows + found.reactions.length + found.uploads + found.pushes + found.requests + USER_LIMIT_SCOPES.length;
     const rewritten = found.records.length + found.messages.length;
     const cost = { reads: 64 + 4 * moved + 2 * rewritten + this.userRoomsReads(), writes: 32 + 4 * moved + 2 * rewritten };
     return this.reserved(cost, false, now, () => this.transaction(() => {
@@ -2512,6 +2580,7 @@ export class Store {
         );
       }
       if (found.uploads) this.rawExec("UPDATE uploads SET owner_id = ? WHERE owner_id = ?", to, from);
+      if (found.pushes) this.rawExec("UPDATE push_subscriptions SET user_id = ? WHERE user_id = ?", to, from);
       if (found.requests) this.rawExec("UPDATE accepted_requests SET user_id = ? WHERE user_id = ?", to, from);
       for (const scope of USER_LIMIT_SCOPES) {
         this.rawExec("UPDATE principal_limits SET principal_key = ? WHERE scope = ? AND principal_key = ?", `user:${to}`, scope, `user:${from}`);
@@ -2538,7 +2607,7 @@ export class Store {
    * records: their message snapshots and current messages, with every
    * reaction set on those messages; their reaction sets elsewhere; their
    * memberships and membership records; their uploads; and their identity,
-   * passkey, limiter and dedup rows. A logged record that
+   * passkey, push subscription, limiter and dedup rows. A logged record that
    * lists them beside others (a move's reaction sets) is rewritten without
    * them. Rooms they created stay. Clients that already have their content
    * keep it until they load history again. Returns what went, and the R2
@@ -2557,9 +2626,10 @@ export class Store {
       ? policy.uploadsPerUserDay * (Math.ceil((policy.avatarRetentionSeconds + policy.lifecycleLagSeconds) / 86_400) + 1)
       : 0;
     // Per user: memberships (live and awaiting a room purge), a day's dedup
-    // rows, limiter rows, credential and identity; each deletion also updates
-    // its indexes.
-    const perUser = 64 + 4 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS) + 4 * this.config.registeredPostsPerDay + 4 * uploadsPerOwner;
+    // rows, limiter rows, push subscriptions, credential and identity; each
+    // deletion also updates its indexes.
+    const perUser = 64 + 4 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS) + 4 * this.config.registeredPostsPerDay + 4 * uploadsPerOwner +
+      4 * MAX_PUSH_SUBSCRIPTIONS_PER_USER;
     const cost = { reads: 64 + 5 * records + ids.length * perUser, writes: 64 + 4 * records + ids.length * perUser };
     return this.reserved(cost, false, now, () => this.transaction(() => {
       const messages = this.rawRows<{ message_id: string }>(`SELECT message_id FROM message_state WHERE author_id IN (${marks})`, ...ids)
@@ -2606,7 +2676,7 @@ export class Store {
          WHERE room_id IN (SELECT room_id FROM memberships INDEXED BY memberships_user_idx WHERE user_id IN (${marks}))`,
         ...ids, ...ids,
       );
-      for (const table of ["memberships", "credentials", "accepted_requests", "identities"]) {
+      for (const table of ["memberships", "credentials", "push_subscriptions", "accepted_requests", "identities"]) {
         this.rawExec(`DELETE FROM ${table} WHERE user_id IN (${marks})`, ...ids);
       }
       this.rawExec(`DELETE FROM principal_limits WHERE principal_key IN (${marks})`, ...ids.map((id) => `user:${id}`));
@@ -4093,6 +4163,126 @@ export class Store {
   }
 
   /** Normalize a reaction set: strings, duplicates collapsed, bounded. */
+  /**
+   * `push_register` (protocol §4.7, kind `webpush`): keeps a registered
+   * user's subscription under its endpoint `url`. Registering a `url` again
+   * replaces it, whoever held it: the endpoint belongs to one browser, and
+   * whoever presents it now is who that browser is signed in as. A user past
+   * `subscriptionsPerUser` loses the least recently registered of the others.
+   * Clients register on every connection, so an unchanged subscription
+   * registered again within a day writes nothing.
+   */
+  registerPushSubscription(input: { userId: string; url: string; p256dh: string; auth: string; now?: number }): void {
+    this.ensureReady();
+    const policy = this.config.push;
+    if (!policy) throw new StoreError("unsupported", "Push is not available here");
+    if (utf8Bytes(input.url) > MAX_PUSH_URL_BYTES) throw new StoreError("too_large", "url is too long");
+    const now = input.now ?? this.clock.now();
+    // The url's row and the user's index range; each eviction rewrites a row
+    // and its index entry.
+    const rows = MAX_PUSH_SUBSCRIPTIONS_PER_USER + 2;
+    this.reserved({ reads: 32 + 2 * rows, writes: 32 + 4 * rows }, false, now, () => this.transaction(() => {
+      const effective = this.effectiveNow(now);
+      if (!this.identityRow(input.userId)) throw new StoreError("denied", "Sign in to receive push notifications");
+      const existing = this.rawRows<{ user_id: string; p256dh: string; auth: string; updated_ms: number }>(
+        "SELECT user_id, p256dh, auth, updated_ms FROM push_subscriptions WHERE url = ? LIMIT 1",
+        input.url,
+      )[0];
+      if (existing && existing.user_id === input.userId && existing.p256dh === input.p256dh && existing.auth === input.auth &&
+          effective - integerColumn(existing.updated_ms) < PUSH_REFRESH_MS) return;
+      if (!existing) this.ensureGrowthCapacity(2 * MAX_PUSH_URL_BYTES);
+      this.rawExec(
+        `INSERT INTO push_subscriptions (url, user_id, p256dh, auth, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT (url) DO UPDATE SET user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth, updated_ms = excluded.updated_ms`,
+        input.url, input.userId, input.p256dh, input.auth, effective, effective,
+      );
+      // The new one never goes, even when it shares its millisecond with others.
+      this.rawExec(
+        `DELETE FROM push_subscriptions WHERE url IN (
+           SELECT url FROM push_subscriptions INDEXED BY push_subscriptions_user_idx
+           WHERE user_id = ? AND url <> ? ORDER BY updated_ms DESC LIMIT -1 OFFSET ?)`,
+        input.userId, input.url, policy.subscriptionsPerUser - 1,
+      );
+    }));
+  }
+
+  /** `push_unregister` (protocol §4.7): removes the user's own subscription under `url`, if any. */
+  removePushSubscription(input: { userId: string; url: string; now?: number }): void {
+    this.ensureReady();
+    const now = input.now ?? this.clock.now();
+    this.reserved({ reads: 16, writes: 16 }, false, now, () => {
+      this.rawExec("DELETE FROM push_subscriptions WHERE url = ? AND user_id = ?", input.url, input.userId);
+    });
+  }
+
+  /** A user's push subscriptions, most recently registered first. */
+  pushSubscriptionsOf(userId: string, now = this.clock.now()): PushSubscriptionRecord[] {
+    this.ensureReady();
+    return this.reserved({ reads: 8 + 2 * MAX_PUSH_SUBSCRIPTIONS_PER_USER }, false, now, () => this.rawRows<{ url: string; p256dh: string; auth: string }>(
+      `SELECT url, p256dh, auth FROM push_subscriptions INDEXED BY push_subscriptions_user_idx
+       WHERE user_id = ? ORDER BY updated_ms DESC LIMIT ?`,
+      userId, MAX_PUSH_SUBSCRIPTIONS_PER_USER,
+    ).map((row) => ({ url: row.url, userId, p256dh: row.p256dh, auth: row.auth })));
+  }
+
+  /**
+   * The subscriptions a message's wake pushes to (protocol §4.7): those of
+   * `userIds`, whom the caller chose, at most `wakesPerMessage` of them and
+   * `subscriptionsPerUser` each, most recently registered first. They are
+   * charged to the day's `pushesPerDay`; past it, the rest are `skipped`.
+   */
+  claimPushes(input: { userIds: readonly string[]; now?: number }): { subscriptions: PushSubscriptionRecord[]; skipped: number } {
+    this.ensureReady();
+    const policy = this.config.push;
+    const userIds = [...new Set(input.userIds)].slice(0, policy?.wakesPerMessage ?? 0);
+    if (!policy || !userIds.length) return { subscriptions: [], skipped: 0 };
+    const now = input.now ?? this.clock.now();
+    // Each user's index range, and the server's push counter.
+    return this.reserved({ reads: 32 + userIds.length * (4 + 2 * policy.subscriptionsPerUser), writes: 16 }, false, now, () => this.transaction(() => {
+      const effective = this.effectiveNow(now);
+      const found: PushSubscriptionRecord[] = [];
+      for (const userId of userIds) {
+        const rows = this.rawRows<{ url: string; p256dh: string; auth: string }>(
+          `SELECT url, p256dh, auth FROM push_subscriptions INDEXED BY push_subscriptions_user_idx
+           WHERE user_id = ? ORDER BY updated_ms DESC LIMIT ?`,
+          userId, policy.subscriptionsPerUser,
+        );
+        for (const row of rows) found.push({ url: row.url, userId, p256dh: row.p256dh, auth: row.auth });
+      }
+      if (!found.length) return { subscriptions: found, skipped: 0 };
+      // Reuse posts_day as the day's push count; the scope separates it.
+      const day = dayFor(effective);
+      const counter = this.limitRow("push", "global", effective);
+      const sent = counter.day === day ? integerColumn(counter.posts_day) : 0;
+      const subscriptions = found.slice(0, Math.max(0, policy.pushesPerDay - sent));
+      if (subscriptions.length) this.updateLimitRow(counter, { day, posts_day: sent + subscriptions.length }, effective);
+      return { subscriptions, skipped: found.length - subscriptions.length };
+    }));
+  }
+
+  /** Forgets subscriptions whose push service said they are gone (404 or 410), whoever holds them now. */
+  forgetPushSubscriptions(urls: readonly string[], now = this.clock.now()): void {
+    this.ensureReady();
+    const unique = [...new Set(urls)].slice(0, MAX_PUSHES_PER_MESSAGE);
+    if (!unique.length) return;
+    this.reserved({ reads: 8 + 4 * unique.length, writes: 8 + 4 * unique.length }, false, now, () => this.transaction(() => {
+      for (const url of unique) this.rawExec("DELETE FROM push_subscriptions WHERE url = ?", url);
+    }));
+  }
+
+  /** Pushes sent today, for `/status`. */
+  pushesToday(now = this.clock.now()): number {
+    this.ensureReady();
+    return this.reserved({ reads: 8 }, false, now, () => {
+      const rows = this.rawRows<{ day: string; posts_day: number }>(
+        "SELECT day, posts_day FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1",
+        "push",
+        "global",
+      );
+      return rows.length && rows[0].day === dayFor(this.effectiveNow(now)) ? integerColumn(rows[0].posts_day) : 0;
+    });
+  }
+
   private normalizedEmojis(value: unknown): string[] {
     if (!Array.isArray(value)) throw new StoreError("invalid_params", "emojis must be an array");
     const emojis: string[] = [];
