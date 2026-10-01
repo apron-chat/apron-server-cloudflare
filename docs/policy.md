@@ -82,15 +82,20 @@ within it:
   (such as location) before uploading: the server stores the bytes as sent.
 - Push (`server.push` kind `webpush`, where VAPID keys are set): registered
   users register a browser's push subscription with `push_register`
-  `{kind: "webpush", url, keys: {p256dh, auth}, tag?}` (its `PushSubscription`
-  JSON with `kind` and an optional tag of at most 64 bytes added), at most 5
-  each; guests cannot. Endpoints must be public
-  `https` hosts, not IP literals or internal names. A new message that
+  `{kind: "webpush", url, keys: {p256dh, auth}, push_id?}` (its
+  `PushSubscription` JSON with `kind` and an optional `push_id` of 1 to 64
+  letters, digits, `_` or `-` added), at most 5 each and 10 registrations a
+  minute; guests cannot. Registrations are each user's own, and lapse after
+  7 days without being registered again (clients register on every
+  connection). Endpoints must be public `https` hosts on an allowed push
+  service (by default the browsers' own), not IP literals or internal names. A new message that
   mentions a user wakes them by push only when none of their connections is
-  attended (every one away, stale, or closed), at most 10 users a message and
-  5,000 pushes a day in all (see
+  attended (every one away, stale, or closed): at most 10 users with
+  registrations a message, once a minute per user and room, 200 woken users a
+  day per sender, and 5,000 pushes a day in all. Guests' mentions wake no one
+  (see
   [SPEC section 4.4](../SPEC.md#44-push)). The push carries the message
-  without `log_id`, with the registration's tag, its text cut to 200
+  without `log_id`, with the registration's `push_id`, its text cut to 200
   characters, without format or embeds.
 - Messages: a request without `room_id` is in `general`. A new message with
   empty text and no embeds is not logged and returns `{}`; an empty save is

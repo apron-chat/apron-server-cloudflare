@@ -9,8 +9,8 @@ export default defineConfig({
 			// guests as convenient posters; test/read-only-guests turns this off to
 			// cover guests that only read. Suites that cover typing turn it on.
 			// Uploads are on, served from a stand-in media origin. Push is on with a
-			// test-only VAPID key pair; nothing is pushed unless a test registers a
-			// subscription and mentions its user.
+			// test-only VAPID key pair and a stand-in push service; nothing is pushed
+			// unless a test registers a subscription and mentions its user.
 			miniflare: {
 				bindings: {
 					GUEST_POSTING: "true",
@@ -21,6 +21,7 @@ export default defineConfig({
 					VAPID_PUBLIC_KEY: "BDiU8ZnLVhCayOIihLkro6Di0XjZW7iK59umfbY--JzLTzNbhd94tTuBsIzrhXljFDqw5xn8gLqahSsSPDCauDM",
 					VAPID_PRIVATE_KEY: "64gdTp6zfZqSbwXmh7xaMx-kTVi4S34yCZxCZ2QT954",
 					VAPID_SUBJECT: "mailto:push-test@example.com",
+					PUSH_HOSTS: "push.example.net",
 				},
 			},
 		}),

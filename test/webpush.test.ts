@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { PUSH_POLICY } from '../src/budget';
-import { ConfigError, loadConfig, validatePushPolicy } from '../src/config';
+import { ConfigError, DEFAULT_PUSH_HOSTS, loadConfig, pushHostAllowed, validatePushPolicy } from '../src/config';
 import { FREE_PLAN } from '../src/plans/free';
 import { PAID_PLAN } from '../src/plans/paid';
 import {
+	vapidKeysMatch,
 	base64UrlDecode,
 	base64UrlEncode,
 	encryptPushPayload,
@@ -121,9 +122,36 @@ describe('push configuration', () => {
 			{ VAPID_PRIVATE_KEY: vapid.VAPID_PUBLIC_KEY },
 			{ VAPID_SUBJECT: 'http://apron.chat' },
 			{ VAPID_SUBJECT: 'ops@apron.chat' },
+			// A well-formed private key from another pair: the self-test signs and fails to verify.
+			{ VAPID_PRIVATE_KEY: 'yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw' },
 		]) {
 			expect(() => loadConfig({ ...base, ...vapid, ...bad })).toThrow(ConfigError);
 		}
+	});
+
+	it('checks that the VAPID private key signs what the public key verifies', () => {
+		expect(vapidKeysMatch(vapid.VAPID_PUBLIC_KEY, vapid.VAPID_PRIVATE_KEY)).toBe(true);
+		expect(vapidKeysMatch(vapid.VAPID_PUBLIC_KEY, 'yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw')).toBe(false);
+		expect(vapidKeysMatch(vapid.VAPID_PUBLIC_KEY, 'short')).toBe(false);
+	});
+
+	it('allows the browsers\' push services by default, or the hosts PUSH_HOSTS lists', () => {
+		expect(loadConfig(base).pushHosts).toEqual(DEFAULT_PUSH_HOSTS);
+		expect(loadConfig({ ...base, PUSH_HOSTS: '' }).pushHosts).toEqual(DEFAULT_PUSH_HOSTS);
+		expect(loadConfig({ ...base, PUSH_HOSTS: '*' }).pushHosts).toBe('*');
+		expect(loadConfig({ ...base, PUSH_HOSTS: 'Push.Example.NET, *.relay.example' }).pushHosts).toEqual(['push.example.net', '*.relay.example']);
+		for (const bad of ['*, push.example.net', 'https://push.example.net', 'push', '*.', 'push.example.net/x']) {
+			expect(() => loadConfig({ ...base, PUSH_HOSTS: bad }), bad).toThrow(ConfigError);
+		}
+		const defaults = loadConfig(base).pushHosts;
+		for (const host of ['fcm.googleapis.com', 'updates.push.services.mozilla.com', 'web.push.apple.com', 'api.push.apple.com', 'wns2-par02p.notify.windows.com']) {
+			expect(pushHostAllowed(defaults, host), host).toBe(true);
+		}
+		// `*.` matches subdomains only, and no look-alike suffix.
+		for (const host of ['push.services.mozilla.com', 'evilpush.apple.com', 'fcm.googleapis.com.evil.example', 'push.example.net']) {
+			expect(pushHostAllowed(defaults, host), host).toBe(false);
+		}
+		expect(pushHostAllowed('*', 'anything.example')).toBe(true);
 	});
 
 	it('keeps both plans within the calibrated push bounds', () => {
@@ -132,5 +160,9 @@ describe('push configuration', () => {
 		expect(() => validatePushPolicy({ ...PUSH_POLICY!, wakesPerMessage: 20, subscriptionsPerUser: 5 })).toThrow(ConfigError);
 		expect(() => validatePushPolicy({ ...PUSH_POLICY!, pushesPerDay: 0 })).toThrow(ConfigError);
 		expect(() => validatePushPolicy({ ...PUSH_POLICY!, ttlSeconds: 29 * 86_400 })).toThrow(ConfigError);
+		expect(() => validatePushPolicy({ ...PUSH_POLICY!, wakesPerSenderDay: PUSH_POLICY!.pushesPerDay + 1 })).toThrow(ConfigError);
+		expect(() => validatePushPolicy({ ...PUSH_POLICY!, registersPerUserMinute: 61 })).toThrow(ConfigError);
+		expect(() => validatePushPolicy({ ...PUSH_POLICY!, coalesceSeconds: 86_401 })).toThrow(ConfigError);
+		expect(() => validatePushPolicy({ ...PUSH_POLICY!, pushExpiryDays: 1 })).toThrow(ConfigError);
 	});
 });

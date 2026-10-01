@@ -294,7 +294,7 @@ it('upgrades a schema 6 store in place: roles move into identities, and nothing 
 	});
 });
 
-it('upgrades a schema 7 store in place: it gains the push subscriptions table, and nothing else changes', async () => {
+it('upgrades a schema 7 store in place: it gains the push tables, and nothing else changes', async () => {
 	const stub = env.DEMO.getByName(`schema-upgrade-7-${crypto.randomUUID()}`);
 	const now = Date.now();
 	const head = await runInDurableObject(stub, async (instance, state) => {
@@ -308,8 +308,9 @@ it('upgrades a schema 7 store in place: it gains the push subscriptions table, a
 			userId: 'kept_user', ipKey: 'ip-kept_user', requestId: 'kept', method: 'message', now,
 			identity: { user_id: 'kept_user' }, params: { room_id: 'general', body: { text: 'kept' } },
 		});
-		// Schema 7 has no push subscriptions.
+		// Schema 7 has no push registrations or wake times.
 		sql.exec('DROP TABLE push_subscriptions');
+		sql.exec('DROP TABLE push_wakes');
 		sql.exec("UPDATE _meta SET value = '7' WHERE key = 'schema_version'");
 		sql.exec('UPDATE maintenance SET schema_version = 7 WHERE id = 1');
 		return store.getRoomState().latest_log_id;
@@ -322,7 +323,9 @@ it('upgrades a schema 7 store in place: it gains the push subscriptions table, a
 		expect(store.requiresReset()).toBe(false);
 		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
 		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(SCHEMA_VERSION);
-		expect(sql.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'push_subscriptions'").toArray().map((row) => row.name)).toContain('push_subscriptions_user_idx');
+		const indexes = (table: string) => sql.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?", table).toArray().map((row) => row.name);
+		expect(indexes('push_subscriptions')).toEqual(expect.arrayContaining(['push_subscriptions_user_idx', 'push_subscriptions_url_idx', 'push_subscriptions_updated_idx']));
+		expect(indexes('push_wakes')).toContain('push_wakes_woken_idx');
 		expect(store.getRoomState().latest_log_id).toBe(head);
 		expect(store.getIdentity('kept_user')?.name).toBe('Kept');
 		expect(store.pushSubscriptionsOf('kept_user')).toEqual([]);

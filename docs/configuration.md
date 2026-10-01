@@ -254,21 +254,41 @@ above: two Durable Object requests and one Worker request each, at most
 ## Push
 
 Mentions wake registered users through Web Push (protocol §4.7, push kind
-`webpush`, with the client's optional registration `tag` in each push; see
+`webpush`, with the client's optional registration `push_id` in each push; see
 [SPEC section 4.4](../SPEC.md#44-push)). Both plans have a
 `push` policy, set in `src/plans/free.ts` with Paid's daily cap raised in
 `src/plans/paid.ts`:
 
 | Setting | Workers Paid | Workers Free |
 | --- | ---: | ---: |
-| `pushesPerDay` (server-wide, one per subscription woken) | 5,000 | 1,000 |
-| `wakesPerMessage` (users one message may wake) | 10 | 10 |
+| `pushesPerDay` (server-wide, one per registration woken) | 5,000 | 1,000 |
+| `wakesPerMessage` (users with live registrations one message may wake) | 10 | 10 |
+| `wakesPerSenderDay` (users one sender's messages may wake) | 200 | 50 |
+| `coalesceSeconds` (a user is woken for a room at most once in this window) | 60 | 60 |
 | `subscriptionsPerUser` | 5 | 5 |
+| `pushExpiryDays` (a registration not renewed this long is skipped, then deleted) | 7 | 7 |
+| `registersPerUserMinute` (`push_register` requests per user) | 10 | 10 |
 | `ttlSeconds` (how long a push service keeps an undelivered push) | 1 day | 1 day |
 
 `wakesPerMessage` times `subscriptionsPerUser`, the pushes one message may
-send, is at most 64, and `ttlSeconds` at most four weeks; the configuration
-check fails otherwise.
+send, is at most 64; `wakesPerMessage` is at most 32, the mentioned users one
+message looks up; `wakesPerSenderDay` fits `pushesPerDay`;
+`registersPerUserMinute` is at most 60, the per-type throttle bound;
+`coalesceSeconds` is at most a day; `pushExpiryDays` is 2 to 90; and
+`ttlSeconds` is at most four weeks. The configuration check fails otherwise.
+
+**Allowed push services.** `PUSH_HOSTS` lists the hosts a registration's
+endpoint may name, comma-separated: an exact host such as
+`fcm.googleapis.com`, or `*.` and a host for its subdomains only
+(`*.push.apple.com` matches `api.push.apple.com`, not `push.apple.com`). A
+standalone `*` allows any public host. Unset or empty, it is the browsers'
+own push services: `fcm.googleapis.com` (Chrome, Edge on Android, and other
+Chromium browsers), `*.push.services.mozilla.com` (Firefox),
+`web.push.apple.com` and `*.push.apple.com` (Safari), and
+`*.notify.windows.com` (Edge on Windows). Any other endpoint is refused with
+`invalid_params` "push service not allowed here", after the checks that
+refuse IP literals, internal names, credentials and ports, which apply
+whatever the list says. A malformed list fails the configuration check.
 
 Push is off, and `server.push` absent, until a VAPID key pair
 ([RFC 8292](https://www.rfc-editor.org/rfc/rfc8292)) and contact are set:
@@ -284,9 +304,9 @@ Push is off, and `server.push` absent, until a VAPID key pair
    source.
 
 Locally, put the three in `.dev.vars`. A malformed key or subject makes every
-request fail its configuration check; that the private key matches the
-public one shows only when push services reject the signature
-(`push_delivery_failed` in the logs). Browsers subscribe with the public
+request fail its configuration check, and so does a private key that does
+not match the public one: the check signs with one and verifies with the
+other. Browsers subscribe with the public
 key, so replacing the pair strands every subscription: push services refuse
 pushes signed with the new key, and clients must subscribe again. The old
 rows stay until their users' newer registrations replace them. Deleting the
@@ -375,6 +395,7 @@ and recalibrating its resource model.
 | `VAPID_PUBLIC_KEY` | Uncompressed P-256 public key, unpadded base64url (`node scripts/vapid-keys.mjs`); with `VAPID_PRIVATE_KEY` and `VAPID_SUBJECT`, turns push on and is advertised as `server.push.webpush.key` |
 | `VAPID_PRIVATE_KEY` | Secret: the matching 32-byte private key, unpadded base64url; set with `npx wrangler secret put VAPID_PRIVATE_KEY --config wrangler.production.toml` |
 | `VAPID_SUBJECT` | `mailto:` address or `https:` URL sent to push services in each VAPID token as the operator's contact |
+| `PUSH_HOSTS` | Comma-separated push service hosts registrations may name, `*.host` for a host's subdomains, or a standalone `*` for any public host; unset, the browsers' own services (see [Push](#push)) |
 | `ADMISSION_OFF` | Operator admission switch; `true` rejects new sockets in the entry Worker before the limiter or DO call; existing sockets remain subject to DO budgets |
 | `ENVIRONMENT` | Set to `development` to enable local origin defaults when `ALLOWED_ORIGINS` and `RP_ORIGINS` are omitted |
 | `NODE_ENV` | Set to `test` to enable the same local origin defaults for tests; production-like deployments must configure origins explicitly |

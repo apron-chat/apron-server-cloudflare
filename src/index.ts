@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
-import { isAllowedOrigin, loadConfig, type RuntimeConfig } from "./config";
-import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, MAX_FRAME_LEASE, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
+import { isAllowedOrigin, loadConfig, pushHostAllowed, type RuntimeConfig } from "./config";
+import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, MAX_FRAME_LEASE, MAX_PUSH_CANDIDATES, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
 import { fetchAccountUsage, type AccountUsageSnapshot } from "./account-usage";
 import { runBudgetGuard, watchForFlood } from "./budget-guard";
 import { sniffImage } from "./image";
@@ -28,9 +28,9 @@ import {
 	ADMIN_USER_ID,
 	DEFAULT_JOINED_ROOMS,
 	MAX_PASSKEYS_PER_USER,
-	MAX_PUSH_TAG_BYTES,
 	MAX_PUSH_URL_BYTES,
 	MAX_ROLES_PER_USER,
+	PUSH_ID_PATTERN,
 	ROLE_PATTERN,
 	ROOM_ID,
 	Store,
@@ -125,8 +125,8 @@ interface ConnectionAttachment {
 }
 
 /** Message types with their own per-user rate (budget.ts). */
-type ThrottledType = "activity" | "room_list";
-const THROTTLED_TYPES: readonly ThrottledType[] = ["activity", "room_list"];
+type ThrottledType = "activity" | "room_list" | "push_register";
+const THROTTLED_TYPES: readonly ThrottledType[] = ["activity", "room_list", "push_register"];
 const THROTTLE_WINDOW_MS = 60_000;
 /**
  * The system identity for notices to one connection only, never logged
@@ -643,9 +643,10 @@ const INTERNAL_HOST_SUFFIXES = ["localhost", "localdomain", "local", "internal",
  * and internal suffixes such as `localhost`; and it refuses credentials and
  * ports other than https's own. A public name that resolves to a private
  * address is left to the platform, whose outbound fetch does not reach
- * private networks.
+ * private networks. Past those checks, the host must be one `PUSH_HOSTS`
+ * allows: by default, the browsers' own push services.
  */
-function pushEndpointError(value: string): string | null {
+function pushEndpointError(value: string, hosts: RuntimeConfig["pushHosts"]): string | null {
 	if (utf8Bytes(value) > MAX_PUSH_URL_BYTES) return `url is at most ${MAX_PUSH_URL_BYTES} bytes`;
 	let url: URL;
 	try {
@@ -662,6 +663,7 @@ function pushEndpointError(value: string): string | null {
 		INTERNAL_HOST_SUFFIXES.some((suffix) => host === suffix || host.endsWith(`.${suffix}`))) {
 		return "url must name a public push service";
 	}
+	if (!pushHostAllowed(hosts, host)) return "push service not allowed here";
 	return null;
 }
 
@@ -670,26 +672,29 @@ const PUSH_TEXT_CODE_POINTS = 200;
 
 /**
  * What a push carries (§4.7): the message without `log_id`, with the
- * registration's `tag`, its text cut to PUSH_TEXT_CODE_POINTS, and without
- * `format`, `embeds`, `ext`, or the server's `prev_*` links. `mentions` stay
- * while the whole fits one push; without them it always fits, since the tag,
- * names, ids and cut text are bounded well under it.
+ * registration's `push_id`, its text cut to PUSH_TEXT_CODE_POINTS (left out
+ * when empty), and without `format`, `embeds`, `ext`, or the server's
+ * `prev_*` links. `mentions` stay while the whole fits one push; without
+ * them it always fits, since the `push_id`, names, ids and cut text are
+ * bounded well under it.
  */
-function pushPayload(message: MessageSnapshot, tag?: string): string {
+function pushPayload(message: MessageSnapshot, pushId?: string): string {
 	const body = message.body ?? {};
 	const points = typeof body.text === "string" ? [...body.text] : [];
 	const text = points.length > PUSH_TEXT_CODE_POINTS ? points.slice(0, PUSH_TEXT_CODE_POINTS - 1).join("") + "…" : points.join("");
 	const base = {
 		message_id: message.message_id, room_id: message.room_id,
-		...(tag !== undefined ? { tag } : {}),
+		...(pushId !== undefined ? { push_id: pushId } : {}),
 		from: message.from,
 		...(message.reply_to ? { reply_to: message.reply_to } : {}),
 	};
+	const withBody = (fields: Record<string, unknown>) => jsonString(Object.keys(fields).length ? { ...base, body: fields } : base);
+	const textField = text ? { text } : {};
 	if (Array.isArray(body.mentions)) {
-		const full = jsonString({ ...base, body: { text, mentions: body.mentions } });
+		const full = withBody({ ...textField, mentions: body.mentions });
 		if (utf8Bytes(full) <= MAX_PUSH_PLAINTEXT_BYTES) return full;
 	}
-	return jsonString({ ...base, body: { text } });
+	return withBody(textField);
 }
 
 // Browsers hide failed WebSocket handshake responses. An explicit, read-only
@@ -2069,15 +2074,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// Only a new message wakes anyone: not an edit, move, or retry (§4.7).
 			if (method === "message" && !result.deduplicated && result.message?.prev_log_id === undefined) created = result.message;
 		});
-		if (created) this.wakeMentioned(created);
+		if (created && identity.tier === "registered") this.wakeMentioned(created);
 		// Pending writes that never come are failed by the alarm (§4.6.3).
 		if (started) await this.rescheduleAlarm();
 	}
 
 	private async handleMessage(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate before posting" } satisfies ProtocolError;
-		// A message from a connection ends its `away` (§4.4).
-		this.setAway(socket, false);
 		this.assertMayWrite(attachment);
 		// Without room_id a message goes to the default room (§3.5). Posting does
 		// not require joining; a poster who has not joined gets only the result.
@@ -2089,6 +2092,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (messageId === undefined && request.params.body === undefined) throw { name: "invalid_params", message: "Missing body" } satisfies ProtocolError;
 		if (request.params.body !== undefined) objectParam(request.params, "body");
 		await this.commitAndBroadcast(socket, attachment, request, "message", "posting");
+		// An accepted message from a connection ends its `away` (§4.4).
+		this.setAway(socket, false);
 	}
 
 	private async handleReactions(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
@@ -2282,6 +2287,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const attachment = connectionAttachment(socket);
 		const identity = attachment ? publicIdentity(attachment) : null;
 		if (!attachment || !identity) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
+		// `away` first, so it applies even when the rest of the update is refused.
+		const explicit = this.noteAway(socket, request.params);
 		const typing = request.params.typing;
 		if (typing !== undefined && (typeof typing !== "number" || !Number.isFinite(typing) || typing < 0)) {
 			throw { name: "invalid_params", message: "typing must be a non-negative number of seconds" } satisfies ProtocolError;
@@ -2290,7 +2297,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (typing !== undefined && (typeof roomId !== "string" || roomId.length === 0 || roomId.length > 64)) {
 			throw { name: "invalid_params", message: "room_id must be a room" } satisfies ProtocolError;
 		}
-		this.noteAttendance(socket, request.params);
+		if (!explicit && (typing !== undefined || request.params.read_message_id !== undefined)) this.setAway(socket, false);
 		if (request.id !== undefined) this.reply(socket, request, {});
 		// A guest who only reads has nothing to be typing.
 		if (attachment.tier === "anonymous" && !this.config.guestPosting) return;
@@ -2314,10 +2321,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * in the same update. Kept in the attachment, so it survives hibernation.
 	 */
 	private noteAttendance(socket: WebSocketConnection, params: Record<string, unknown>): void {
+		if (!this.noteAway(socket, params) && (params.typing !== undefined || params.read_message_id !== undefined)) this.setAway(socket, false);
+	}
+
+	/** Applies an update's explicit `away`, if any; whether it had one. */
+	private noteAway(socket: WebSocketConnection, params: Record<string, unknown>): boolean {
 		const away = params.away;
-		if (away !== undefined && typeof away !== "boolean") throw { name: "invalid_params", message: "away must be a boolean" } satisfies ProtocolError;
-		if (typeof away === "boolean") this.setAway(socket, away);
-		else if (params.typing !== undefined || params.read_message_id !== undefined) this.setAway(socket, false);
+		if (away === undefined) return false;
+		if (typeof away !== "boolean") throw { name: "invalid_params", message: "away must be a boolean" } satisfies ProtocolError;
+		this.setAway(socket, away);
+		return true;
 	}
 
 	/** Marks a connection away or attended (§4.4), writing its attachment only on a change. */
@@ -2336,24 +2349,33 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * `push_register` (§4.7) for push kind `webpush`: `{kind: "webpush", url,
-	 * keys: {p256dh, auth}, tag?}`, the browser's `PushSubscription.toJSON()`
-	 * with `kind` added (`expirationTime` is ignored). `tag`, at most 64 bytes,
-	 * goes into every push to this registration. Registered users only; a
+	 * keys: {p256dh, auth}, push_id?}`, the browser's `PushSubscription.toJSON()`
+	 * with `kind` added (`expirationTime` is ignored). `push_id`, 1 to 64
+	 * letters, digits, `_` or `-`, goes unchanged into every push to this
+	 * registration. At most `registersPerUserMinute` a user, across their
+	 * connections; past that, `retry_after`. Registered users only; a
 	 * guest's identity lasts one connection, so there is no one to wake. The
 	 * endpoint must be a public `https` URL (pushEndpointError), `p256dh` an
-	 * uncompressed P-256 point and `auth` 16 bytes, both base64url. Registering
-	 * a `url` again replaces it, even another user's (Store.registerPushSubscription).
+	 * uncompressed P-256 point and `auth` 16 bytes, both base64url. A user
+	 * registering a `url` again replaces their own registration of it
+	 * (Store.registerPushSubscription).
 	 */
 	private async handlePushRegister(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
 		if (attachment.tier !== "registered") throw { name: "denied", message: "Sign in to receive push notifications" } satisfies ProtocolError;
+		const now = nowMs();
+		const limit = PUSH_POLICY!.registersPerUserMinute;
+		const retry = this.throttleRetry(attachment.userId!, "push_register", limit, now);
+		if (retry !== undefined) throw { name: "retry_after", message: "Push registrations limited", data: { retry_after: retry } } satisfies ProtocolError;
+		// Counted before validation, so refused registrations count too.
+		this.takeThrottle(socket, attachment.userId!, "push_register", Number.MAX_SAFE_INTEGER, now);
 		const params = request.params;
 		const kind = requiredString(params, "kind");
 		if (kind !== "webpush") throw { name: "invalid_params", message: "Unknown push kind; this server offers webpush" } satisfies ProtocolError;
 		const url = requiredString(params, "url");
-		const tag = optionalString(params, "tag");
-		if (tag !== undefined && utf8Bytes(tag) > MAX_PUSH_TAG_BYTES) throw { name: "invalid_params", message: `tag is at most ${MAX_PUSH_TAG_BYTES} bytes` } satisfies ProtocolError;
-		const problem = pushEndpointError(url);
+		const pushId = optionalString(params, "push_id");
+		if (pushId !== undefined && !PUSH_ID_PATTERN.test(pushId)) throw { name: "invalid_params", message: "push_id must be 1 to 64 letters, digits, _ or -" } satisfies ProtocolError;
+		const problem = pushEndpointError(url, this.config.pushHosts);
 		if (problem) throw { name: "invalid_params", message: problem } satisfies ProtocolError;
 		const keys = objectParam(params, "keys")!;
 		const key = (name: string): Uint8Array | null => typeof keys[name] === "string" && keys[name].length <= 256 ? base64UrlDecode(keys[name]) : null;
@@ -2366,7 +2388,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// The key check awaited: register for the connection as it is now (a /rename may have moved it).
 		const current = connectionAttachment(socket);
 		if (!current || current.closing || current.tier !== "registered" || !current.userId) return;
-		this.store.registerPushSubscription({ userId: current.userId, url, p256dh: base64UrlEncode(p256dh), auth: base64UrlEncode(auth), ...(tag !== undefined ? { tag } : {}), now: nowMs() });
+		this.store.registerPushSubscription({ userId: current.userId, url, p256dh: base64UrlEncode(p256dh), auth: base64UrlEncode(auth), ...(pushId !== undefined ? { pushId } : {}), now: nowMs() });
 		this.reply(socket, request, {});
 	}
 
@@ -2381,11 +2403,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Wakes those a new message mentions (§4.7). In `body.mentions` order, up
-	 * to `wakesPerMessage` users other than the sender (and not guests) who
-	 * have no attended connection (see attended) are chosen without SQL; each of
-	 * their subscriptions gets the message by push, within the day's
-	 * `pushesPerDay`. Every room is visible to everyone, so a mention anywhere
+	 * Wakes those a registered user's new message mentions (§4.7); guests'
+	 * mentions wake no one. The candidates, chosen without SQL in
+	 * `body.mentions` order, are users other than the sender (and not guests)
+	 * with no attended connection (see attended), at most
+	 * MAX_PUSH_CANDIDATES. Store.claimPushes then wakes up to
+	 * `wakesPerMessage` of those with live registrations, at most once a
+	 * `coalesceSeconds` per room, within the sender's and the server's daily
+	 * allowances. Every room is visible to everyone, so a mention anywhere
 	 * counts, joined or not. Pushes go out after the result, kept alive with
 	 * waitUntil. A failure here is logged and never touches the post.
 	 */
@@ -2395,50 +2420,50 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const mentions = message.body?.mentions;
 		if (!vapid || !policy || !Array.isArray(mentions)) return;
 		const now = nowMs();
-		const chosen: string[] = [];
+		const candidates: string[] = [];
 		for (const userId of mentions) {
-			if (chosen.length >= policy.wakesPerMessage) break;
-			if (typeof userId !== "string" || userId === message.from.user_id || userId.startsWith("guest_") || chosen.includes(userId)) continue;
-			if (!this.attended(userId, now)) chosen.push(userId);
+			if (candidates.length >= MAX_PUSH_CANDIDATES) break;
+			if (typeof userId !== "string" || userId === message.from.user_id || userId.startsWith("guest_") || candidates.includes(userId)) continue;
+			if (!this.attended(userId, now)) candidates.push(userId);
 		}
-		if (!chosen.length) return;
+		if (!candidates.length) return;
 		let claimed: ReturnType<Store["claimPushes"]>;
 		try {
-			claimed = this.store.claimPushes({ userIds: chosen, now });
+			claimed = this.store.claimPushes({ senderId: message.from.user_id, roomId: message.room_id, candidates, now });
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "push_claim_failed", reason: errorToProtocol(error).message }));
 			return;
 		}
-		if (claimed.skipped) console.warn(JSON.stringify({ event: "push_daily_budget_reached", skipped: claimed.skipped }));
+		if (claimed.skipped) console.warn(JSON.stringify({ event: "push_allowance_reached", skipped: claimed.skipped }));
 		if (claimed.subscriptions.length) this.ctx.waitUntil(this.deliverPushes(claimed.subscriptions, message, vapid, policy.ttlSeconds));
 	}
 
 	/**
-	 * Pushes a message to each subscription at once, each payload carrying
-	 * that registration's `tag`, and forgets those whose push service says
-	 * they are gone (404 or 410). Other failures are only logged: the push is
-	 * lost, not retried.
+	 * Pushes a message to each registration at once, each payload carrying
+	 * that registration's `push_id`, and forgets those whose push service
+	 * says they are gone (404 or 410). Other failures are only logged: the
+	 * push is lost, not retried.
 	 */
 	private async deliverPushes(subscriptions: readonly PushSubscriptionRecord[], message: MessageSnapshot, vapid: VapidKeys, ttlSeconds: number): Promise<void> {
 		const payloads = new Map<string | undefined, string>();
-		const payloadFor = (tag: string | undefined): string => {
-			let payload = payloads.get(tag);
-			if (payload === undefined) payloads.set(tag, payload = pushPayload(message, tag));
+		const payloadFor = (pushId: string | undefined): string => {
+			let payload = payloads.get(pushId);
+			if (payload === undefined) payloads.set(pushId, payload = pushPayload(message, pushId));
 			return payload;
 		};
 		const outcomes = await Promise.allSettled(subscriptions.map((subscription) =>
-			sendWebPush(subscription, payloadFor(subscription.tag), vapid, { ttlSeconds, urgency: "normal", nowMs: nowMs() })));
-		const gone: string[] = [];
+			sendWebPush(subscription, payloadFor(subscription.pushId), vapid, { ttlSeconds, urgency: "normal", nowMs: nowMs() })));
+		const gone: Array<{ url: string; p256dh: string }> = [];
 		let failed = 0;
 		outcomes.forEach((outcome, index) => {
-			if (outcome.status === "fulfilled" && outcome.value.gone) gone.push(subscriptions[index].url);
+			if (outcome.status === "fulfilled" && outcome.value.gone) gone.push({ url: subscriptions[index].url, p256dh: subscriptions[index].p256dh });
 			else if (outcome.status === "rejected" || outcome.value.status < 200 || outcome.value.status >= 300) failed++;
 		});
 		if (failed) console.warn(JSON.stringify({ event: "push_delivery_failed", failed, sent: subscriptions.length }));
 		if (!gone.length) return;
 		try {
 			this.store.forgetPushSubscriptions(gone, nowMs());
-		} catch { /* the next push to a gone subscription tries again */ }
+		} catch { /* the next push to a gone registration tries again */ }
 	}
 
 	/**

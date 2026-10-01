@@ -1,6 +1,6 @@
 import * as budget from "./budget.ts";
-import { DEFAULT_FEATURES, DEFAULT_LIMITS, MAX_PUSHES_PER_MESSAGE, PUSH_POLICY, UPLOAD_POLICY, type Limits, type PushPolicy } from "./budget.ts";
-import { base64UrlDecode, P256_PRIVATE_KEY_BYTES, P256_PUBLIC_KEY_BYTES, type VapidKeys } from "./webpush.ts";
+import { DEFAULT_FEATURES, DEFAULT_LIMITS, MAX_PUSH_CANDIDATES, MAX_PUSHES_PER_MESSAGE, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits, type PushPolicy } from "./budget.ts";
+import { base64UrlDecode, P256_PRIVATE_KEY_BYTES, P256_PUBLIC_KEY_BYTES, vapidKeysMatch, type VapidKeys } from "./webpush.ts";
 export { DEFAULT_LIMITS, BOOTSTRAP_ROW_RESERVATION, type Limits } from "./budget.ts";
 
 export interface RuntimeConfig {
@@ -32,6 +32,26 @@ export interface RuntimeConfig {
 	 * and the `VAPID_PRIVATE_KEY` secret.
 	 */
 	push?: VapidKeys;
+	/**
+	 * The push services endpoints may name (`PUSH_HOSTS`): exact hosts, or
+	 * `*.host` for its subdomains; `"*"` allows any public host.
+	 */
+	pushHosts: readonly string[] | "*";
+}
+
+/** The browsers' own push services, allowed when `PUSH_HOSTS` is unset. */
+export const DEFAULT_PUSH_HOSTS: readonly string[] = [
+	"fcm.googleapis.com",
+	"*.push.services.mozilla.com",
+	"web.push.apple.com",
+	"*.push.apple.com",
+	"*.notify.windows.com",
+];
+
+/** Whether `PUSH_HOSTS` allows an endpoint host (lowercase, no trailing dot). */
+export function pushHostAllowed(hosts: RuntimeConfig["pushHosts"], host: string): boolean {
+	if (hosts === "*") return true;
+	return hosts.some((entry) => entry.startsWith("*.") ? host.endsWith(entry.slice(1)) : host === entry);
 }
 
 export interface UploadConfig {
@@ -76,6 +96,7 @@ type EnvLike = {
 	VAPID_PUBLIC_KEY?: string;
 	VAPID_PRIVATE_KEY?: string;
 	VAPID_SUBJECT?: string;
+	PUSH_HOSTS?: string;
 	ENVIRONMENT?: string;
 	NODE_ENV?: string;
 };
@@ -279,6 +300,7 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 	const uploads = loadUploads(env);
 	if (PUSH_POLICY) validatePushPolicy(PUSH_POLICY);
 	const push = loadPush(env);
+	const pushHosts = loadPushHosts(env.PUSH_HOSTS);
 	const rpName = String(env.RP_NAME ?? "Apron Demo");
 	if (!rpName.trim() || [...rpName].length > limits.maxNameCodePoints || new TextEncoder().encode(rpName).byteLength > limits.maxNameBytes) {
 		throw new ConfigError("RP_NAME exceeds the configured display-name policy");
@@ -295,6 +317,7 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 		...(adminToken !== undefined ? { adminToken } : {}),
 		...(uploads ? { uploads } : {}),
 		...(push ? { push } : {}),
+		pushHosts,
 	};
 }
 
@@ -320,6 +343,13 @@ export function validatePushPolicy(policy: PushPolicy): void {
 	}
 	// RFC 8030 lets a push service cap TTL; four weeks is past any it keeps.
 	if (policy.ttlSeconds > 28 * 86_400) throw new ConfigError("push.ttlSeconds must be at most four weeks");
+	if (policy.wakesPerMessage > MAX_PUSH_CANDIDATES) throw new ConfigError(`push.wakesPerMessage must be at most ${MAX_PUSH_CANDIDATES}`);
+	if (policy.wakesPerSenderDay > policy.pushesPerDay) throw new ConfigError("push.wakesPerSenderDay must fit pushesPerDay");
+	if (policy.registersPerUserMinute > MAX_TYPE_THROTTLE_PER_MINUTE) throw new ConfigError(`push.registersPerUserMinute must be at most ${MAX_TYPE_THROTTLE_PER_MINUTE}`);
+	// The coalescing rows are deleted by cleanup once a day at the latest.
+	if (policy.coalesceSeconds > 86_400) throw new ConfigError("push.coalesceSeconds must be at most a day");
+	// Registrations refresh at most daily, so a subscription needs a day at least.
+	if (policy.pushExpiryDays < 2 || policy.pushExpiryDays > 90) throw new ConfigError("push.pushExpiryDays must be 2 to 90");
 }
 
 /**
@@ -337,7 +367,20 @@ function loadPush(env: EnvLike): VapidKeys | undefined {
 	const scalar = /^[A-Za-z0-9_-]+$/.test(privateKey) ? base64UrlDecode(privateKey) : null;
 	if (scalar?.byteLength !== P256_PRIVATE_KEY_BYTES) throw new ConfigError("VAPID_PRIVATE_KEY must be a 32-byte P-256 private key, unpadded base64url");
 	if (!/^mailto:[^\s@]+@[^\s@]+$/.test(subject) && !validHttpsUrl(subject)) throw new ConfigError("VAPID_SUBJECT must be a mailto: address or an https: URL");
+	if (!vapidKeysMatch(publicKey, privateKey)) throw new ConfigError("VAPID_PRIVATE_KEY does not match VAPID_PUBLIC_KEY");
 	return { publicKey, privateKey, subject };
+}
+
+/** `PUSH_HOSTS`: comma-separated hosts or `*.` suffixes, or a standalone `*`; unset or empty, the browsers' services. */
+function loadPushHosts(raw: string | undefined): RuntimeConfig["pushHosts"] {
+	const hosts = splitList(raw === undefined || raw.trim() === "" ? undefined : raw.toLowerCase(), [...DEFAULT_PUSH_HOSTS]);
+	if (hosts.length === 1 && hosts[0] === "*") return "*";
+	for (const host of hosts) {
+		if (!/^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(host)) {
+			throw new ConfigError("PUSH_HOSTS must list host names, *.host suffixes, or a standalone *");
+		}
+	}
+	return hosts;
 }
 
 function validHttpsUrl(value: string): boolean {

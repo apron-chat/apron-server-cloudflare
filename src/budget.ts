@@ -230,10 +230,24 @@ export interface UploadPolicy {
 export interface PushPolicy {
 	/** Pushes the whole server sends a UTC day, one per subscription woken. */
 	pushesPerDay: number;
-	/** Users one message may wake; mentions past them are not pushed. */
+	/**
+	 * Users one message may wake, counting only those with live
+	 * subscriptions; mentions past them are not pushed.
+	 */
 	wakesPerMessage: number;
+	/** Users one sender's messages may wake a UTC day. */
+	wakesPerSenderDay: number;
+	/**
+	 * After a user is woken for a room, further messages in that room wake
+	 * them again only once this long has passed.
+	 */
+	coalesceSeconds: number;
 	/** Subscriptions one user may hold; another replaces the least recently registered. */
 	subscriptionsPerUser: number;
+	/** A subscription not registered again for this long is skipped, then deleted by cleanup. */
+	pushExpiryDays: number;
+	/** `push_register` requests one user may send a minute, across their connections. */
+	registersPerUserMinute: number;
 	/** How long a push service keeps a push for an offline browser (the `TTL` header). */
 	ttlSeconds: number;
 }
@@ -309,6 +323,9 @@ export const MAX_GUEST_NUMBER_BLOCK = 10_000;
 // One message's wake sends a push per subscription of each user it wakes,
 // each an outbound request from the one Durable Object invocation.
 export const MAX_PUSHES_PER_MESSAGE = 64;
+// Mentioned users one message's wake looks up subscriptions for, each one
+// bounded index read, before it stops looking for users to wake.
+export const MAX_PUSH_CANDIDATES = 32;
 export const MAX_SQL_WRITES = DEFAULT_LIMITS.sqlWritesPerDay;
 export const MAX_SQL_READS = DEFAULT_LIMITS.sqlReadsPerDay;
 export const MAX_DATABASE_HIGH_WATER_BYTES = DEFAULT_LIMITS.databaseHighWaterBytes;

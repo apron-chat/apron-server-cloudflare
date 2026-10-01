@@ -3,6 +3,10 @@
 // server's VAPID identification (RFC 8292), with WebCrypto only. Nothing here
 // reads storage or configuration; the Durable Object decides whom to wake.
 
+// @ts-expect-error Workers' nodejs_compat runtime supplies this module; the
+// worker type package intentionally omits Node's full module declarations.
+import { createPrivateKey, createPublicKey, sign, verify } from "node:crypto";
+
 /** One browser push subscription: its endpoint and the keys its `PushSubscription` gives. */
 export interface WebPushSubscription {
 	/** The push service endpoint, which also identifies the registration (§4.7). */
@@ -89,6 +93,25 @@ export async function validP256PublicKey(bytes: Uint8Array): Promise<boolean> {
 	try {
 		await crypto.subtle.importKey("raw", concat(bytes), { name: "ECDH", namedCurve: "P-256" }, false, []);
 		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Whether a VAPID private key signs what its public key verifies:
+ * synchronously, with Node's crypto, so the configuration check can refuse a
+ * mismatched pair before any push is sent. False for malformed keys.
+ */
+export function vapidKeysMatch(publicKey: string, privateKey: string): boolean {
+	const d = base64UrlDecode(privateKey);
+	const point = base64UrlDecode(publicKey);
+	if (d?.byteLength !== P256_PRIVATE_KEY_BYTES || point?.byteLength !== P256_PUBLIC_KEY_BYTES) return false;
+	try {
+		const jwk = p256PrivateJwk(d, point);
+		const data = encoder.encode("apron vapid self-test");
+		const signature = sign("sha256", data, createPrivateKey({ key: jwk, format: "jwk" }));
+		return verify("sha256", data, createPublicKey({ key: { kty: "EC", crv: "P-256", x: jwk.x, y: jwk.y }, format: "jwk" }), signature) === true;
 	} catch {
 		return false;
 	}

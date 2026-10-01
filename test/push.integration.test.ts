@@ -39,10 +39,10 @@ async function signedIn(userId: string, existing = false): Promise<Peer> {
 }
 
 /** A browser subscription for `push.example.net`, registered over `peer`. */
-async function subscribe(peer: Peer, name: string, tag?: string): Promise<{ url: string; browser: TestBrowser }> {
+async function subscribe(peer: Peer, name: string, pushId?: string): Promise<{ url: string; browser: TestBrowser }> {
 	const browser = await testBrowser();
 	const url = `https://push.example.net/send/${name}-${crypto.randomUUID()}`;
-	const reply = await request(peer, `subscribe-${name}`, 'push_register', { kind: 'webpush', url, keys: { p256dh: browser.p256dh, auth: browser.auth }, ...(tag !== undefined ? { tag } : {}) });
+	const reply = await request(peer, `subscribe-${name}`, 'push_register', { kind: 'webpush', url, keys: { p256dh: browser.p256dh, auth: browser.auth }, ...(pushId !== undefined ? { push_id: pushId } : {}) });
 	expect(reply.result).toEqual({});
 	return { url, browser };
 }
@@ -131,9 +131,11 @@ describe('push over the socket', () => {
 			['a p256dh off the curve', { kind: 'webpush', url: 'https://push.example.net/x', keys: { ...keys, p256dh: offCurve } }],
 			['a long auth', { kind: 'webpush', url: 'https://push.example.net/x', keys: { ...keys, auth: `${keys.auth}AAAA` } }],
 			['a non-base64url auth', { kind: 'webpush', url: 'https://push.example.net/x', keys: { ...keys, auth: 'a+b/c'.repeat(4) } }],
-			// 33 code points, but 66 UTF-8 bytes: past the 64-byte tag.
-			['a tag past 64 bytes', { kind: 'webpush', url: 'https://push.example.net/x', keys, tag: 'é'.repeat(33) }],
-			['a tag that is not a string', { kind: 'webpush', url: 'https://push.example.net/x', keys, tag: 7 }],
+			['a push service not in PUSH_HOSTS', { kind: 'webpush', url: 'https://push.other.example/x', keys }],
+			['a push_id past 64 characters', { kind: 'webpush', url: 'https://push.example.net/x', keys, push_id: 'x'.repeat(65) }],
+			['an empty push_id', { kind: 'webpush', url: 'https://push.example.net/x', keys, push_id: '' }],
+			['a push_id with other characters', { kind: 'webpush', url: 'https://push.example.net/x', keys, push_id: 'é' }],
+			['a push_id that is not a string', { kind: 'webpush', url: 'https://push.example.net/x', keys, push_id: 7 }],
 		];
 		// Two bad requests per connection, below the repeated-violation close.
 		for (let index = 0; index < cases.length; index += 2) {
@@ -142,6 +144,7 @@ describe('push over the socket', () => {
 				for (const [label, params] of cases.slice(index, index + 2)) {
 					const reply = await request(peer, `bad-${index}`, 'push_register', params);
 					expect(reply.error?.code, label).toBe(-32602);
+					if (label.includes('PUSH_HOSTS')) expect(reply.error.message).toBe('push service not allowed here');
 				}
 			} finally { peer.close(); }
 		}
@@ -149,8 +152,9 @@ describe('push over the socket', () => {
 		const userId = unique('rosa');
 		const peer = await signedIn(userId);
 		try {
-			const { url } = await subscribe(peer, 'rosa', 'é'.repeat(32));
-			expect((await subscriptionsOf(userId)).map((row) => [row.url, row.tag])).toEqual([[url, 'é'.repeat(32)]]);
+			const pushId = `A-z_0${'9'.repeat(59)}`;
+			const { url } = await subscribe(peer, 'rosa', pushId);
+			expect((await subscriptionsOf(userId)).map((row) => [row.url, row.pushId])).toEqual([[url, pushId]]);
 			// Unregistering removes it; an unknown url is already gone.
 			expect((await request(peer, 'unregister', 'push_unregister', { url })).result).toEqual({});
 			expect((await request(peer, 'unregister-again', 'push_unregister', { url })).result).toEqual({});
@@ -170,8 +174,9 @@ describe('push over the socket', () => {
 			// A request is still unsupported with activity off, and changes nothing.
 			expect((await request(peer, 'activity-request', 'activity', { away: false })).error.code).toBe(-32601);
 			expect((await awayOf(userId)).sort()).toEqual([false, true]);
-			// A history page does not end it; a message does.
+			// A history page does not end it, nor a refused message; an accepted one does.
 			await request(peer, 'history', 'history', { room_id: 'general' });
+			expect((await request(peer, 'refused', 'message', { room_id: 'no-such-room', body: { text: 'x' } })).error.code).toBe(-32602);
 			expect((await awayOf(userId)).sort()).toEqual([false, true]);
 			await post(peer, 'back', { body: { text: 'back' } });
 			expect(await awayOf(userId)).toEqual([false, false]);
@@ -199,6 +204,10 @@ describe('push over the socket', () => {
 			expect((await request(peer, 'away', 'activity', { away: true })).result).toEqual({});
 			expect(await awayOf(userId)).toEqual([true]);
 			expect((await request(peer, 'bad-away', 'activity', { away: 'yes' })).error.code).toBe(-32602);
+			// `away` applies even when the typing in the same update is refused.
+			expect((await request(peer, 'back', 'activity', { away: false })).result).toEqual({});
+			expect((await request(peer, 'bad-typing', 'activity', { away: true, typing: -1 })).error.code).toBe(-32602);
+			expect(await awayOf(userId)).toEqual([true]);
 			expect((await request(peer, 'typing', 'activity', { room_id: 'general', typing: 2 })).result).toEqual({});
 			expect(await awayOf(userId)).toEqual([false]);
 		} finally {
@@ -237,12 +246,12 @@ describe('push over the socket', () => {
 			// The message without log_id, format or embeds, its text cut to 200 code points.
 			const payload = JSON.parse((await decryptPush(carolPush.body, carolSub.browser)).plaintext);
 			expect(payload).toEqual({
-				message_id: first.result.message_id, room_id: 'general', tag: 'carol-phone', from: { user_id: aliceId, name: `Name of ${aliceId}` },
+				message_id: first.result.message_id, room_id: 'general', push_id: 'carol-phone', from: { user_id: aliceId, name: `Name of ${aliceId}` },
 				body: { text: `${'é'.repeat(199)}…`, mentions: [bobId, carolId, aliceId, daveId, 'guest_1'] },
 			});
-			// Dave registered without a tag: his payload has none.
+			// Dave registered without a push_id: his payload has none.
 			const davePush = pushes.find((push) => push.url === daveSub.url)!;
-			expect(JSON.parse((await decryptPush(davePush.body, daveSub.browser)).plaintext)).not.toHaveProperty('tag');
+			expect(JSON.parse((await decryptPush(davePush.body, daveSub.browser)).plaintext)).not.toHaveProperty('push_id');
 
 			// Edits, retries, and commands wake no one; a message from Carol ends her away.
 			pushes.length = 0;
@@ -296,7 +305,9 @@ describe('push over the socket', () => {
 			}
 		});
 		try {
-			await post(alice, 'many', { body: { text: 'everyone', mentions: mentioned } });
+			// Ten mentions with no registration first: they take no wake slots.
+			const unsubscribed = Array.from({ length: 10 }, (_, index) => unique(`none${index}`));
+			await post(alice, 'many', { body: { text: 'everyone', mentions: [...unsubscribed, ...mentioned] } });
 			await vi.waitFor(() => expect(pushes).toHaveLength(POLICY.wakesPerMessage), { timeout: 5_000 });
 			// In mention order: the last two are left out.
 			expect(pushes.map((push) => push.url).sort()).toEqual(mentioned.slice(0, POLICY.wakesPerMessage).map((userId) => `https://push.example.net/send/${userId}`).sort());
@@ -304,8 +315,47 @@ describe('push over the socket', () => {
 	});
 });
 
+describe('push limits over the socket', () => {
+	it('limits push_register to registersPerUserMinute a user', async () => {
+		const userId = unique('reg');
+		const peer = await signedIn(userId);
+		try {
+			const browser = await testBrowser();
+			const params = { kind: 'webpush', url: 'https://push.example.net/again', keys: { p256dh: browser.p256dh, auth: browser.auth } };
+			for (let index = 0; index < POLICY.registersPerUserMinute; index++) {
+				expect((await request(peer, `again-${index}`, 'push_register', params)).result).toEqual({});
+			}
+			const limited = await request(peer, 'over', 'push_register', params);
+			expect(limited.error.code).toBe(-32002);
+			expect(limited.error.data.retry_after).toBeGreaterThan(0);
+		} finally { peer.close(); }
+	});
+
+	it("wakes no one for a guest's mentions", async () => {
+		const pushes = capturePushes();
+		const [targetId, controlId, aliceId] = [unique('tara'), unique('cole'), unique('alice')];
+		for (const userId of [targetId, controlId]) {
+			const peer = await signedIn(userId);
+			await subscribe(peer, userId);
+			peer.close();
+			await vi.waitFor(async () => expect(await awayOf(userId)).toEqual([]));
+		}
+		const guest = await connect();
+		const alice = await signedIn(aliceId);
+		try {
+			await guest.next();
+			await request(guest, 'auth', 'auth', { scheme: 'guest' });
+			await post(guest, 'guest-mention', { body: { text: 'hey', mentions: [targetId] } });
+			await post(alice, 'control', { body: { text: 'hey', mentions: [controlId] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(pushes[0].url).toContain(`/${controlId}-`);
+		} finally { guest.close(); alice.close(); }
+	});
+});
+
 describe('push subscriptions in the store', () => {
 	const config = { push: { ...POLICY } };
+	const DAY = 86_400_000;
 	const browserKeys = async () => {
 		const browser = await testBrowser();
 		return { p256dh: browser.p256dh, auth: browser.auth };
@@ -316,8 +366,10 @@ describe('push subscriptions in the store', () => {
 			credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
 		});
 	}
+	const claim = (store: Store, clock: TestClock, candidates: string[], roomId = 'general', senderId = 'sender') =>
+		store.claimPushes({ senderId, roomId, candidates, now: clock.value });
 
-	it('keeps subscriptionsPerUser per user, replacing the least recently registered, and moves a url to whoever registers it', async () => {
+	it('keeps subscriptionsPerUser per user, replacing the least recently registered; registrations are per user', async () => {
 		const keys = await browserKeys();
 		await withStore('push-cap', config, (store, clock) => {
 			registerUser(store, clock, 'ann');
@@ -334,59 +386,119 @@ describe('push subscriptions in the store', () => {
 			expect(urls).toHaveLength(POLICY.subscriptionsPerUser);
 			expect(urls[0]).toBe(url(99));
 			expect(urls).not.toContain(url(0));
-			// A changed tag is a change, even within a day; an absent one removes it.
-			store.registerPushSubscription({ userId: 'ann', url: url(1), ...keys, tag: 'one', now: clock.value });
-			expect(store.pushSubscriptionsOf('ann').find((row) => row.url === url(1))?.tag).toBe('one');
-			store.registerPushSubscription({ userId: 'ann', url: url(1), ...keys, tag: 'two', now: clock.value });
-			expect(store.pushSubscriptionsOf('ann').find((row) => row.url === url(1))?.tag).toBe('two');
+			// A changed push_id is a change, even within a day; an absent one removes it.
+			const of = (userId: string, n: number) => store.pushSubscriptionsOf(userId).find((row) => row.url === url(n));
+			store.registerPushSubscription({ userId: 'ann', url: url(1), ...keys, pushId: 'one', now: clock.value });
+			expect(of('ann', 1)?.pushId).toBe('one');
+			store.registerPushSubscription({ userId: 'ann', url: url(1), ...keys, pushId: 'two', now: clock.value });
+			expect(of('ann', 1)?.pushId).toBe('two');
 			store.registerPushSubscription({ userId: 'ann', url: url(1), ...keys, now: clock.value });
-			expect(store.pushSubscriptionsOf('ann').find((row) => row.url === url(1))).not.toHaveProperty('tag');
-			expect(() => store.registerPushSubscription({ userId: 'ann', url: url(1), ...keys, tag: 'x'.repeat(65) })).toThrow(/tag/);
-			// Ben's browser presents Ann's endpoint: it is his now.
-			store.registerPushSubscription({ userId: 'ben', url: url(99), ...keys, now: clock.value });
+			expect(of('ann', 1)).not.toHaveProperty('pushId');
+			expect(() => store.registerPushSubscription({ userId: 'ann', url: url(1), ...keys, pushId: 'not ok' })).toThrow(/push_id/);
+			// Ben registers the same endpoint: both hold it, each their own.
+			store.registerPushSubscription({ userId: 'ben', url: url(99), ...keys, pushId: 'ben', now: clock.value });
 			expect(store.pushSubscriptionsOf('ben').map((row) => row.url)).toEqual([url(99)]);
-			expect(store.pushSubscriptionsOf('ann').map((row) => row.url)).not.toContain(url(99));
-			// Unregistering takes only the user's own.
+			expect(of('ann', 99)).toBeDefined();
+			// Unregistering takes only the caller's own.
 			store.removePushSubscription({ userId: 'ann', url: url(99) });
+			expect(of('ann', 99)).toBeUndefined();
 			expect(store.pushSubscriptionsOf('ben')).toHaveLength(1);
 			// No identity, no subscription.
 			expect(() => store.registerPushSubscription({ userId: 'guest_7', url: url(7), ...keys })).toThrow(/Sign in/);
 		});
 	});
 
-	it('charges pushes to pushesPerDay, skipping the rest until the next UTC day', async () => {
+	it('spends wake slots only on users with live registrations, and coalesces per user and room', async () => {
 		const keys = await browserKeys();
-		await withStore('push-daily', { push: { ...POLICY, pushesPerDay: 3 } }, (store, clock) => {
-			for (const userId of ['cy', 'di']) {
+		await withStore('push-slots', { push: { ...POLICY, wakesPerMessage: 2 } }, (store, clock) => {
+			for (const userId of ['fay', 'gus', 'hal']) {
 				registerUser(store, clock, userId);
-				for (const n of [1, 2]) store.registerPushSubscription({ userId, url: `https://push.example.net/${userId}/${n}`, ...keys, now: clock.value });
+				store.registerPushSubscription({ userId, url: `https://push.example.net/${userId}`, ...keys, now: clock.value });
 			}
-			expect(store.claimPushes({ userIds: [], now: clock.value })).toEqual({ subscriptions: [], skipped: 0 });
-			const first = store.claimPushes({ userIds: ['cy', 'di', 'nobody'], now: clock.value });
-			expect(first.subscriptions).toHaveLength(3);
-			expect(first.skipped).toBe(1);
-			expect(store.pushesToday(clock.value)).toBe(3);
-			expect(store.claimPushes({ userIds: ['cy'], now: clock.value })).toEqual({ subscriptions: [], skipped: 2 });
-			clock.value += 86_400_000;
-			expect(store.claimPushes({ userIds: ['cy'], now: clock.value }).subscriptions).toHaveLength(2);
-			expect(store.pushesToday(clock.value)).toBe(2);
-			// Gone subscriptions are forgotten, whoever holds them.
-			store.forgetPushSubscriptions(['https://push.example.net/cy/1', 'https://push.example.net/di/2'], clock.value);
-			expect(store.pushSubscriptionsOf('cy').map((row) => row.url)).toEqual(['https://push.example.net/cy/2']);
-			expect(store.pushSubscriptionsOf('di').map((row) => row.url)).toEqual(['https://push.example.net/di/1']);
+			const nobody = Array.from({ length: 10 }, (_, index) => `nobody_${index}`);
+			const first = claim(store, clock, [...nobody, 'fay', 'gus', 'hal']);
+			expect(first.subscriptions.map((row) => row.userId)).toEqual(['fay', 'gus']);
+			// Fay and Gus were just woken for general; Hal takes the slot. Another room wakes them again.
+			expect(claim(store, clock, ['fay', 'gus', 'hal']).subscriptions.map((row) => row.userId)).toEqual(['hal']);
+			expect(claim(store, clock, ['fay']).coalesced).toBe(1);
+			expect(claim(store, clock, ['fay'], 'thread').subscriptions.map((row) => row.userId)).toEqual(['fay']);
+			clock.value += POLICY.coalesceSeconds * 1_000;
+			expect(claim(store, clock, ['fay']).subscriptions.map((row) => row.userId)).toEqual(['fay']);
 		});
 	});
 
-	it('moves subscriptions with /rename, tags kept, and deletes them with /purge', async () => {
+	it('charges pushes to pushesPerDay and wakes to the sender, skipping the rest until the next UTC day', async () => {
+		const keys = await browserKeys();
+		await withStore('push-daily', { push: { ...POLICY, pushesPerDay: 3, wakesPerSenderDay: 3, coalesceSeconds: 1 } }, (store, clock) => {
+			for (const userId of ['cy', 'di', 'ed']) {
+				registerUser(store, clock, userId);
+				for (const n of [1, 2]) store.registerPushSubscription({ userId, url: `https://push.example.net/${userId}/${n}`, ...keys, now: clock.value });
+			}
+			expect(claim(store, clock, [])).toEqual({ subscriptions: [], coalesced: 0, skipped: 0 });
+			const first = claim(store, clock, ['cy', 'di', 'nobody']);
+			expect(first.subscriptions).toHaveLength(3);
+			expect(first.skipped).toBe(1);
+			expect(store.pushesToday(clock.value)).toBe(3);
+			clock.value += 1_000;
+			expect(claim(store, clock, ['cy'])).toEqual({ subscriptions: [], coalesced: 0, skipped: 2 });
+			clock.value += DAY;
+			expect(claim(store, clock, ['cy'], 'general', 'sal').subscriptions).toHaveLength(2);
+			expect(store.pushesToday(clock.value)).toBe(2);
+			// Sal's third woken user today is past wakesPerSenderDay; another sender still wakes.
+			clock.value += 1_000;
+			expect(claim(store, clock, ['di'], 'general', 'sal').subscriptions).toHaveLength(1);
+			clock.value += 1_000;
+			expect(claim(store, clock, ['ed'], 'general', 'sal')).toMatchObject({ subscriptions: [], skipped: 2 });
+		});
+	});
+
+	it('forgets a gone registration by endpoint and keys, keeping a fresh one', async () => {
+		const [old, fresh] = [await browserKeys(), await browserKeys()];
+		await withStore('push-gone', config, (store, clock) => {
+			registerUser(store, clock, 'ida');
+			registerUser(store, clock, 'jon');
+			const url = 'https://push.example.net/shared';
+			store.registerPushSubscription({ userId: 'ida', url, ...old, now: clock.value });
+			store.registerPushSubscription({ userId: 'jon', url, ...fresh, now: clock.value });
+			store.forgetPushSubscriptions([{ url, p256dh: old.p256dh }], clock.value);
+			expect(store.pushSubscriptionsOf('ida')).toEqual([]);
+			expect(store.pushSubscriptionsOf('jon').map((row) => row.p256dh)).toEqual([fresh.p256dh]);
+		});
+	});
+
+	it('skips registrations older than pushExpiryDays, refreshes them once a day, and cleanup deletes them', async () => {
+		const keys = await browserKeys();
+		await withStore('push-expiry', config, (store, clock) => {
+			registerUser(store, clock, 'kit');
+			registerUser(store, clock, 'lou');
+			store.registerPushSubscription({ userId: 'kit', url: 'https://push.example.net/kit', ...keys, now: clock.value });
+			store.registerPushSubscription({ userId: 'lou', url: 'https://push.example.net/lou', ...keys, now: clock.value });
+			clock.value += (POLICY.pushExpiryDays - 1) * DAY;
+			// Lou's browser connects again: more than a day on, the registration is refreshed.
+			store.registerPushSubscription({ userId: 'lou', url: 'https://push.example.net/lou', ...keys, now: clock.value });
+			clock.value += DAY + 1_000;
+			expect(claim(store, clock, ['kit', 'lou']).subscriptions.map((row) => row.userId)).toEqual(['lou']);
+			expect(store.pushSubscriptionsOf('kit')).toHaveLength(1);
+			for (let run = 0; run < 3; run++) {
+				store.runCleanup(clock.value);
+				clock.value += 2_000;
+			}
+			expect(store.pushSubscriptionsOf('kit')).toEqual([]);
+			expect(store.pushSubscriptionsOf('lou')).toHaveLength(1);
+		});
+	});
+
+	it('moves subscriptions with /rename, push_id kept, and deletes them with /purge', async () => {
 		const keys = await browserKeys();
 		await withStore('push-rename', config, (store, clock) => {
 			registerUser(store, clock, 'eve');
-			store.registerPushSubscription({ userId: 'eve', url: 'https://push.example.net/eve', ...keys, tag: 'eve-laptop', now: clock.value });
+			store.registerPushSubscription({ userId: 'eve', url: 'https://push.example.net/eve', ...keys, pushId: 'eve-laptop', now: clock.value });
+			expect(claim(store, clock, ['eve']).subscriptions).toHaveLength(1);
 			store.renameIdentity({ from: 'eve', to: 'eva', now: clock.value });
 			expect(store.pushSubscriptionsOf('eve')).toEqual([]);
-			// The tag stays with the registration.
-			expect(store.pushSubscriptionsOf('eva')).toEqual([{ url: 'https://push.example.net/eve', userId: 'eva', ...keys, tag: 'eve-laptop' }]);
-			expect(store.claimPushes({ userIds: ['eva'], now: clock.value }).subscriptions).toHaveLength(1);
+			expect(store.pushSubscriptionsOf('eva')).toEqual([{ url: 'https://push.example.net/eve', userId: 'eva', ...keys, pushId: 'eve-laptop' }]);
+			// The wake time moved too: Eva is still coalesced in general.
+			expect(claim(store, clock, ['eva']).coalesced).toBe(1);
 			store.purgeUsers({ userIds: ['eva'], now: clock.value });
 			expect(store.pushSubscriptionsOf('eva')).toEqual([]);
 		});

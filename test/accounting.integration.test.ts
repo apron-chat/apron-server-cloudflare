@@ -679,11 +679,13 @@ describe('measured storage accounting', () => {
 			measure('identity count', () => store.countIdentities());
 			measure('credential IDs lookup', () => store.credentialIdsForUser('matrix-user'));
 			measure('credential counter update', () => store.updateCredentialCounter('matrix-credential', 1));
-			const subscription = { userId: 'matrix-user', url: 'https://push.example.net/matrix', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), tag: 't'.repeat(64) };
+			const subscription = { userId: 'matrix-user', url: 'https://push.example.net/matrix', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), pushId: 'p'.repeat(64) };
 			measure('push subscription register', () => store.registerPushSubscription({ ...subscription, now: clock.now() }));
 			measure('push subscription register again, unchanged', () => store.registerPushSubscription({ ...subscription, now: clock.now() }));
-			expect(measure('push wake claim', () => store.claimPushes({ userIds: ['matrix-user'], now: clock.now() })).subscriptions).toHaveLength(1);
-			measure('gone push subscription forget', () => store.forgetPushSubscriptions([subscription.url], clock.now()));
+			expect(measure('push wake claim', () => store.claimPushes({ senderId: 'matrix-sender', roomId: 'general', candidates: ['matrix-user'], now: clock.now() })).subscriptions).toHaveLength(1);
+			const unsubscribed = Array.from({ length: 31 }, (_, index) => `matrix-unsubscribed-${index}`);
+			expect(measure('push wake claim, 31 unsubscribed candidates first', () => store.claimPushes({ senderId: 'matrix-sender', roomId: 'matrix-room', candidates: [...unsubscribed, 'matrix-user'], now: clock.now() })).subscriptions).toHaveLength(1);
+			measure('gone push subscription forget', () => store.forgetPushSubscriptions([{ url: subscription.url, p256dh: subscription.p256dh }], clock.now()));
 
 			const identity = { user_id: 'matrix-user', name: 'Matrix user', tier: 'registered' as const };
 			const create = measure('message create', () => store.commitMutation({
@@ -733,7 +735,7 @@ describe('measured storage accounting', () => {
 			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
 			expect(create.result.message_id).toBeTruthy();
-			expect(costs).toHaveLength(34);
+			expect(costs).toHaveLength(35);
 			return { costs };
 		});
 		console.info('accounting-operation-matrix', JSON.stringify(result));

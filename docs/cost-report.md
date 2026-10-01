@@ -42,8 +42,9 @@ reserves 32/16 after control overhead: a replay's result reflects the current
 state, so it reads each upload embed's write state (§1.2). So a steady-state request-ID
 create reserves 120 writes and a request-ID edit 280 (104 and 264 without a
 request ID). History pages reserve a 32-write floor. A cleanup run has a
-bounded due-check reservation (14 reads for its seven indexed existence
-probes, one of them the purge list) plus a 1,032/1,032 batch reservation.
+bounded due-check reservation (18 reads for its nine indexed existence
+probes, one of them the purge list and two for push registrations and wake
+times) plus a 1,032/1,032 batch reservation.
 
 The table below includes the reservation SQL in the observed cursor counts.
 Every operation in the runtime reservation matrix is listed so the claimed
@@ -64,10 +65,11 @@ upper bounds can be compared with the measured worst case.
 | Identity count | 4 | 2 | 16 | 8 |
 | Credential IDs lookup | 4 | 2 | 40 | 8 |
 | Credential counter update | 5 | 3 | 16 | 16 |
-| Push subscription register | 9 | 6 | 172 | 304 |
-| Push subscription register again, unchanged within a day | 6 | 2 | 172 | 304 |
-| Push wake claim (one user, one subscription) | 11 | 9 | 54 | 24 |
-| Gone push subscription forget | 4 | 3 | 20 | 20 |
+| Push subscription register | 9 | 8 | 172 | 370 |
+| Push subscription register again, unchanged within a day | 6 | 2 | 172 | 370 |
+| Push wake claim (one user, one subscription; creates both counters) | 18 | 19 | 74 | 80 |
+| Push wake claim, 31 unregistered candidates before one registered | 41 | 9 | 632 | 80 |
+| Gone push subscription forget | 4 | 3 | 24 | 24 |
 | Message create with request ID | 33 | 37 | 296 | 120 |
 | Empty new message (not logged) | 4 | 2 | 16 | 8 |
 | Deduplicated mutation retry | 5 | 2 | 32 | 16 |
@@ -86,7 +88,7 @@ upper bounds can be compared with the measured worst case.
 | Room members, `general` and one thread | 8 | 2 | 824 | 8 |
 | Room members, 101 rooms with 200 registered members each | 40,403 | 2 | 40,820 | 8 |
 | Admission snapshot | 6 | 2 | 40 | 24 |
-| Cleanup (matrix, one day later) | 128 | 51 | 1,070 | 1,058 |
+| Cleanup (matrix, one day later) | 128 | 51 | 1,074 | 1,058 |
 | Alarm scheduling | 8 | 4 | 24 | 12 |
 
 The matrix uses a fresh object and one representative operation for each
@@ -284,24 +286,37 @@ independent.
 ## Push
 
 With Web Push on (protocol §4.7), `push_register` is one frame plus the
-subscription register above: about 6 writes the first time, and 2 for
-the reservation alone when a client registers the same subscription (keys
-and tag) on its next connection within a day, which writes nothing. These
-were measured with a 64-byte `tag`, the longest allowed; a tag changes row
-bytes, not row counts. Its reservation is
-sized for evicting a user's whole index range under any valid policy (64
-subscriptions), which the credit-back returns. Choosing whom a new message
-wakes reads connection attachments only; the wake claim then reads each
-chosen user's subscriptions (at most `wakesPerMessage` users of
-`subscriptionsPerUser` each, 10 of 5 by default) and writes the day's push
-counter, about 9 writes whatever the number of pushes. A message that
-mentions no one away or gone does no push SQL. A push service's 404 or 410
-costs one delete per gone subscription. The pushes themselves are outbound
-requests from the Durable Object: no Worker or Durable Object request is
-billed for them, and the object is awake for the post anyway. `pushesPerDay`
-(5,000 on Paid, 1,000 on Free) bounds them; on Paid that is at most 45,000
-claim writes a day if every push were its own wake, under 7% of the
-foreground write ceiling.
+registration above: about 8 writes the first time (the row and its three
+indexes), and 2 for the reservation alone when a client registers the same
+subscription (keys and `push_id`) on its next connection within a day, which
+writes nothing; `registersPerUserMinute` (10) bounds the rest. These were
+measured with a 64-character `push_id`, the longest allowed; it changes row
+bytes, not row counts. The reservation is sized for evicting a user's whole
+index range under any valid policy (64 registrations), which the credit-back
+returns.
+
+Choosing whom a new message wakes reads connection attachments only. The
+wake claim then looks up the candidates in turn, at most 32: an unregistered
+one costs about one read of its live index range, and a registered one also
+reads its wake time for the room. A message that wakes someone writes each
+woken user's wake time and the server's and sender's counters: 19 writes for
+the day's first wake (both counter rows created), about 9 after. A message
+whose candidates have no live registrations, or are all coalesced, writes
+nothing; one that mentions no one away or gone does no push SQL. The
+reservation covers 32 candidates at 5 registrations each (632 reads) and
+`wakesPerMessage` wake rows (80 writes), mostly credited back. A push
+service's 404 or 410 costs one delete per gone registration.
+
+Cleanup deletes expired registrations (`pushExpiryDays`, 7) and wake times
+past `coalesceSeconds` within its existing batch, by their time indexes.
+Wake times number at most one per woken user and room a day, so at most
+`pushesPerDay` rows.
+
+The pushes themselves are outbound requests from the Durable Object: no
+Worker or Durable Object request is billed for them, and the object is
+awake for the post anyway. `pushesPerDay` (5,000 on Paid, 1,000 on Free)
+bounds them; on Paid that is at most about 50,000 claim writes a day if
+every push were its own wake, about 7% of the foreground write ceiling.
 
 ## Retention, maintenance, and persistent state
 

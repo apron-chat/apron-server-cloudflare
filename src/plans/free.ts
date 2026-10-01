@@ -111,7 +111,15 @@ export const FREE_PLAN: Plan = Object.freeze({
 	push: Object.freeze({
 		pushesPerDay: 1_000,
 		wakesPerMessage: 10,
+		// One sender's mentions cannot spend more than a twentieth of the day.
+		wakesPerSenderDay: 50,
+		// A busy conversation wakes an away user once a minute per room.
+		coalesceSeconds: 60,
 		subscriptionsPerUser: 5,
+		// Clients register on every connection, refreshing at most daily; a
+		// browser unused for a week is not pushed to.
+		pushExpiryDays: 7,
+		registersPerUserMinute: 10,
 		ttlSeconds: 24 * 60 * 60,
 	}),
 	features: Object.freeze({
