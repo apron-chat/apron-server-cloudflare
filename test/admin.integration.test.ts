@@ -89,7 +89,7 @@ it('/admin makes a registered user an admin, but not a guest, bot, or unknown us
 		const granted = await command(admin, 'grant', `/admin ${userId}`);
 		expect(granted.frame.result).toEqual({});
 		expect(granted.notice!.params.body.text).toBe(`**Name of ${userId}** (\`${userId}\`) is now an admin.`);
-		expect((await command(admin, 'again', `/admin ${userId}`)).notice!.params.body.text).toMatch(/is already an admin/);
+		expect((await command(admin, 'again', `/admin @${userId}`)).notice!.params.body.text).toMatch(/is already an admin/);
 		// The new admin can run the admin commands, /admin included.
 		expect((await command(carol, 'after', '/status')).frame.result).toEqual({});
 
@@ -109,7 +109,7 @@ it('/kick removes a registered user or a guest from the room of the command', as
 		await guest.next();
 		const guestId = (await request(guest, 'auth', 'auth', { scheme: 'guest' })).result.you.user_id;
 
-		const kicked = await command(admin, 'kick-bob', `/kick ${bobId}`);
+		const kicked = await command(admin, 'kick-bob', `/kick @${bobId}`);
 		expect(kicked.frame.result).toEqual({});
 		expect(kicked.notice!.params.body.text).toBe(`Removed \`${bobId}\` from this room.`);
 		const left = await until(bob, (frame) => frame.method === 'room_update' && frame.params.left !== undefined);
@@ -161,7 +161,8 @@ it('/rename moves a registered user, their passkey, rooms and admin status to a 
 		expect(granted.frame.params).toEqual({ you: { user_id: fromId, name: `Name of ${fromId}`, roles: ['admin'] } });
 		const seen = await until(erin, (frame) => frame.method === 'user' && frame.params.new?.user_id === fromId);
 		expect(seen.frame.params).toEqual({ new: { user_id: fromId, name: `Name of ${fromId}`, roles: ['admin'] } });
-		const renamed = await command(admin, 'rename', `/rename ${fromId} ${toId}`);
+		// Either user_id may be written `@user_id`, as a mention is sent.
+		const renamed = await command(admin, 'rename', `/rename @${fromId} @${toId}`);
 		expect(renamed.frame.result).toEqual({});
 		expect(renamed.notice!.params.body.text).toBe(`Renamed \`${fromId}\` to \`${toId}\`.`);
 		// The user's connection becomes the new identity; a room-mate learns of the change (§3.3).
@@ -561,7 +562,7 @@ it('/admin remove takes the admin role away, announced with roles: [] (§3.3)', 
 		await command(admin, 'grant', `/admin ${userId}`);
 		await until(demoted, (frame) => frame.method === 'user');
 		await until(mate, (frame) => frame.method === 'user' && frame.params.new?.user_id === userId);
-		const removed = await command(admin, 'demote', `/admin remove ${userId}`);
+		const removed = await command(admin, 'demote', `/admin remove @${userId}`);
 		expect(removed.notice!.params.body.text).toMatch(/is no longer an admin/);
 		// An empty value means cleared: both the user and a room-mate drop the role.
 		expect((await until(demoted, (frame) => frame.method === 'user')).frame.params).toEqual({ you: { user_id: userId, name: `Name of ${userId}`, roles: [] } });
