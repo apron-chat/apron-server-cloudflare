@@ -2745,8 +2745,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `user_id` (Store.renameIdentity), retiring the old one. The user's
 	 * connections become the new identity and get `user` `you`, and those who
 	 * share a room with the user get `user` `new` with `old` (protocol §3.3).
-	 * Logged records, sessions, and the user's bot keep the old `user_id`: a
-	 * session for it is `denied`, and the passkey signs in as the new one.
+	 * Their messages, reactions and membership changes are rewritten to the
+	 * new `user_id` without notifications, for clients that load history
+	 * again. Sessions and the user's bot keep the old `user_id`: a session for
+	 * it is `denied`, and the passkey signs in as the new one.
 	 */
 	private async rename(socket: WebSocketConnection, request: RequestFrame, roomId: string, from: string, to: string): Promise<void> {
 		if (from === ADMIN_USER_ID || to === ADMIN_USER_ID) throw { name: "invalid_params", message: "The admin user's user_id is fixed" } satisfies ProtocolError;

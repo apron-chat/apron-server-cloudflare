@@ -738,6 +738,9 @@ function parseRoles(json: string | null | undefined): string[] {
  * new one, so the retired `user_id` is never reissued (protocol §3.3).
  */
 const META_RENAMED_PREFIX = "renamed:";
+
+/** The limiter scopes keyed by a registered user (`user:<user_id>`), which `/rename` moves. */
+const USER_LIMIT_SCOPES = ["post", "history", "upload"] as const;
 /**
  * `_meta` key prefix for an admin's `/toggle`: `toggle:<feature>` holds `on`
  * or `off`, and is absent while the feature follows the deployment's default.
@@ -2430,28 +2433,104 @@ export class Store {
   /**
    * `/rename`: moves a registered user to a new `user_id`: the identity row,
    * its credential (so its passkey signs in as the new id), its stored
-   * memberships, and its roles (a column of the row). Nothing else is migrated: logged
-   * records keep the old `user_id` (protocol §3.3), and sessions, limiter
-   * windows, reactions and the user's bot stay under it. The old `user_id` is
-   * retired, never reissued. Returns the user's name, joined rooms, and roles. A bot's is fixed.
+   * memberships, and its roles (a column of the row), and rewrites what they
+   * left under the old id to the new one: the `from` of their logged message
+   * snapshots and current messages (so they can still edit them), their
+   * reaction sets, logged and current, and their logged membership changes,
+   * keeping the recorded names; their uploads; their limiter windows; and
+   * their dedup rows. Nothing is announced: clients see the new id when they
+   * load history again. Other users' `body.mentions`, sessions and the user's
+   * bot stay under the old id. The old `user_id` is retired, never reissued.
+   * Returns the user's name, joined rooms, and roles. A bot's is fixed.
+   *
+   * Finding the user's records scans the retained log, as `/purge` does; the
+   * rewrite is then charged by what was found. Both steps run without
+   * yielding, so nothing commits between them.
    */
   renameIdentity(input: { from: string; to: string; now?: number }): { name: string; rooms: string[]; roles: string[] } {
     this.ensureReady();
     const now = input.now ?? this.clock.now();
-    const membershipRows = MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS;
-    // Moving a membership row reads its index entry and row (measured: about
-    // 2 reads and 3 writes each), before the user's rooms are read back.
-    return this.reserved({ reads: 64 + 4 * membershipRows + this.userRoomsReads(), writes: 32 + 4 * membershipRows }, false, now, () => this.transaction(() => {
-      const identity = this.identityRow(input.from);
-      if (!identity || identity.tier !== "registered") throw new StoreError("invalid_params", `No registered user has the user_id ${input.from}`.slice(0, 200));
+    const { from, to } = input;
+    const records = this.retainedRecords(now);
+    const found = this.reserved({ reads: 64 + 8 * records }, false, now, () => {
+      const identity = this.identityRow(from);
+      if (!identity || identity.tier !== "registered") throw new StoreError("invalid_params", `No registered user has the user_id ${from}`.slice(0, 200));
       if (parseRoles(identity.roles_json).includes("bot")) throw new StoreError("invalid_params", "A bot's user_id is fixed");
-      if (this.idTaken(input.to)) throw new StoreError("invalid_params", `The user_id ${input.to} is taken`.slice(0, 200));
-      this.rawExec("UPDATE identities SET user_id = ?, updated_ms = ? WHERE user_id = ?", input.to, this.effectiveNow(now), input.from);
-      this.rawExec("UPDATE credentials SET user_id = ? WHERE user_id = ?", input.to, input.from);
-      this.rawExec("UPDATE memberships SET user_id = ? WHERE user_id = ?", input.to, input.from);
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_RENAMED_PREFIX + input.from, input.to);
-      return { name: identity.name, rooms: this.userRooms(input.to), roles: parseRoles(identity.roles_json) };
+      if (this.idTaken(to)) throw new StoreError("invalid_params", `The user_id ${to} is taken`.slice(0, 200));
+      const count = (sql: string) => integerColumn(this.rawRows<{ count: number }>(sql, from)[0]?.count);
+      return {
+        identity,
+        records: this.rawRows<{ room_id: string; log_id: number; kind: RecordKind; record_json: string }>(
+          `SELECT room_id, log_id, kind, record_json FROM records WHERE
+             (kind = 'message' AND json_extract(record_json, '$.from.user_id') = ?1)
+             OR (kind = 'reactions' AND EXISTS (SELECT 1 FROM json_each(record_json, '$.reactions') WHERE json_extract(value, '$.from.user_id') = ?1))
+             OR (kind = 'membership' AND EXISTS (SELECT 1 FROM json_each(record_json, '$.members') WHERE json_extract(value, '$.user.user_id') = ?1))`,
+          from,
+        ),
+        messages: this.rawRows<{ message_id: string; snapshot_json: string }>("SELECT message_id, snapshot_json FROM message_state WHERE author_id = ?", from),
+        reactions: this.rawRows<{ message_id: string; from_json: string }>("SELECT message_id, from_json FROM reaction_state WHERE user_id = ?", from),
+        uploads: count("SELECT COUNT(*) AS count FROM uploads INDEXED BY uploads_owner_idx WHERE owner_id = ?"),
+        requests: count("SELECT COUNT(*) AS count FROM accepted_requests WHERE user_id = ?"),
+      };
+    });
+    const membershipRows = MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS;
+    // Moving a row keyed or indexed by the user_id reads its index entry and
+    // row and rewrites both (measured: about 2 reads and 3 writes each);
+    // rewriting a record's JSON in place is one write.
+    const moved = membershipRows + found.reactions.length + found.uploads + found.requests + USER_LIMIT_SCOPES.length;
+    const rewritten = found.records.length + found.messages.length;
+    const cost = { reads: 64 + 4 * moved + 2 * rewritten + this.userRoomsReads(), writes: 32 + 4 * moved + 2 * rewritten };
+    return this.reserved(cost, false, now, () => this.transaction(() => {
+      const renamed = (user: Identity): Identity => user.user_id === from ? { ...user, user_id: to } : user;
+      this.rawExec("UPDATE identities SET user_id = ?, updated_ms = ? WHERE user_id = ?", to, this.effectiveNow(now), from);
+      this.rawExec("UPDATE credentials SET user_id = ? WHERE user_id = ?", to, from);
+      this.rawExec("UPDATE memberships SET user_id = ? WHERE user_id = ?", to, from);
+      for (const row of found.records) {
+        const record = parseJson<Record<string, unknown>>(row.record_json);
+        if (row.kind === "message") {
+          const message = record as unknown as MessageSnapshot;
+          this.rewriteRecord(row, JSON.stringify({ ...message, from: renamed(message.from) }));
+        } else if (row.kind === "reactions") {
+          const reactions = record as unknown as ReactionsRecord;
+          this.rewriteRecord(row, JSON.stringify({ ...reactions, reactions: reactions.reactions.map((set) => ({ ...set, from: renamed(set.from) })) }));
+        } else {
+          const membership = record as unknown as MembershipRecord;
+          this.rewriteRecord(row, JSON.stringify({ ...membership, members: membership.members.map((member) => ({ ...member, user: renamed(member.user) })) }));
+        }
+      }
+      for (const row of found.messages) {
+        const snapshot = parseJson<MessageSnapshot>(row.snapshot_json);
+        this.rawExec(
+          "UPDATE message_state SET author_id = ?, snapshot_json = ? WHERE message_id = ?",
+          to, JSON.stringify({ ...snapshot, from: renamed(snapshot.from) }), row.message_id,
+        );
+      }
+      for (const row of found.reactions) {
+        this.rawExec(
+          "UPDATE reaction_state SET user_id = ?, from_json = ? WHERE message_id = ? AND user_id = ?",
+          to, JSON.stringify(renamed(parseJson<Identity>(row.from_json))), row.message_id, from,
+        );
+      }
+      if (found.uploads) this.rawExec("UPDATE uploads SET owner_id = ? WHERE owner_id = ?", to, from);
+      if (found.requests) this.rawExec("UPDATE accepted_requests SET user_id = ? WHERE user_id = ?", to, from);
+      for (const scope of USER_LIMIT_SCOPES) {
+        this.rawExec("UPDATE principal_limits SET principal_key = ? WHERE scope = ? AND principal_key = ?", `user:${to}`, scope, `user:${from}`);
+      }
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_RENAMED_PREFIX + from, to);
+      return { name: found.identity.name, rooms: this.userRooms(to), roles: parseRoles(found.identity.roles_json) };
     }));
+  }
+
+  /**
+   * At most how many records are retained: every one has a log id from the
+   * oldest still stored to the newest, and a move stores one record twice.
+   * Scans of the log reserve reads by it.
+   */
+  private retainedRecords(now: number): number {
+    return this.reserved({ reads: 16 }, false, now, () => {
+      const low = this.rawRows<{ low: number | null }>("SELECT MIN(log_id) AS low FROM records INDEXED BY records_log_idx")[0]?.low;
+      return low === null || low === undefined ? 0 : 2 * (this.logState().last_log_id - low + 1);
+    });
   }
 
   /**
@@ -2471,13 +2550,8 @@ export class Store {
     const ids = [...new Set(input.userIds)].filter((id) => id.length > 0).slice(0, 4);
     if (!ids.length) return { messages: 0, reactions: 0, deletedUploads: [] };
     const marks = ids.map(() => "?").join(", ");
-    // Every retained record has a log id from the oldest still stored to the
-    // newest, and a move stores one record twice: the scans below read at
-    // most this many rows each.
-    const records = this.reserved({ reads: 16 }, false, now, () => {
-      const low = this.rawRows<{ low: number | null }>("SELECT MIN(log_id) AS low FROM records INDEXED BY records_log_idx")[0]?.low;
-      return low === null || low === undefined ? 0 : 2 * (this.logState().last_log_id - low + 1);
-    });
+    // The scans below read at most this many rows each.
+    const records = this.retainedRecords(now);
     const policy = this.config.uploads;
     const uploadsPerOwner = policy
       ? policy.uploadsPerUserDay * (Math.ceil((policy.avatarRetentionSeconds + policy.lifecycleLagSeconds) / 86_400) + 1)

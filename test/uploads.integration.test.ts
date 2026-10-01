@@ -233,6 +233,48 @@ describe('store uploads', () => {
 			expect(sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM memberships WHERE user_id = 'mallory'").one().count).toBe(0);
 		});
 	});
+
+	it('rewrites what a renamed user left to the new user_id, keeping recorded names', async () => {
+		await withStore('uploads-rename', { uploads: UPLOADS }, (store, clock, state) => {
+			register(store, clock, 'oscar');
+			register(store, clock, 'peggy');
+			const theirs = post(store, clock, 'oscar', { body: { text: 'mine', embeds: [{ kind: 'upload' }] } });
+			const messageId = theirs.result.message_id as string;
+			const embedId = (theirs.message!.body!.embeds as Array<{ embed_id: string }>)[0].embed_id;
+			post(store, clock, 'oscar', { message_id: messageId, body: { text: 'mine, edited', embeds: [{ embed_id: embedId, kind: 'upload' }] } });
+			const kept = post(store, clock, 'peggy', { body: { text: 'hello' } });
+			const react = (userId: string, id: string) => store.commitMutation({ userId, ipKey: `ip-${userId}`, method: 'reactions', now: clock.value, params: { message_id: id, emojis: ['👍'] }, identity: { user_id: userId, name: `Name of ${userId}` } });
+			react('oscar', kept.result.message_id as string);
+			react('peggy', kept.result.message_id as string);
+			react('peggy', messageId);
+			// A move re-logs every reaction set on the message in one record.
+			const thread = store.commitMutation({ userId: 'peggy', ipKey: 'ip-peggy', method: 'room_set', now: clock.value, params: { parent_room_id: 'general', title: 'T' }, identity: { user_id: 'peggy' } });
+			post(store, clock, 'peggy', { message_id: kept.result.message_id, room_id: thread.room!.room_id, body: { text: 'hello' } });
+
+			expect(store.renameIdentity({ from: 'oscar', to: 'oskar', now: clock.value }).name).toBe('Name of oscar');
+			expect(store.accountingStatus().unsafe).toBe(false);
+			const sql = state.storage.sql;
+			const dump = (table: string) => sql.exec(`SELECT * FROM ${table}`).toArray().map((row) => JSON.stringify(row)).join('\n');
+			for (const table of ['records', 'message_state', 'reaction_state', 'uploads', 'accepted_requests', 'principal_limits', 'memberships']) {
+				expect(dump(table)).not.toMatch(/"oscar"|user:oscar/);
+			}
+			const records = sql.exec<{ kind: string; record_json: string }>('SELECT kind, record_json FROM records').toArray().map((row) => ({ kind: row.kind, record: JSON.parse(row.record_json) }));
+			const messages = records.filter((row) => row.kind === 'message' && row.record.message_id === messageId);
+			expect(messages).toHaveLength(2);
+			for (const { record } of messages) expect(record.from).toEqual({ user_id: 'oskar', name: 'Name of oscar' });
+			const moved = records.find((row) => row.kind === 'reactions' && row.record.room_id === thread.room!.room_id && row.record.reactions.length > 1);
+			expect(moved!.record.reactions.map((set: { from: { user_id: string } }) => set.from.user_id).sort()).toEqual(['oskar', 'peggy']);
+			expect(records.some((row) => row.kind === 'membership' && row.record.members.some((member: { user: { user_id: string } }) => member.user.user_id === 'oskar'))).toBe(true);
+			expect(sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM uploads WHERE owner_id = 'oskar'").one().count).toBe(1);
+			expect(sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM principal_limits WHERE principal_key = 'user:oskar'").one().count).toBeGreaterThan(0);
+
+			// The message is still theirs to edit, and their reaction set theirs to change.
+			const edited = post(store, clock, 'oskar', { message_id: messageId, body: { text: 'edited after the rename', embeds: [{ embed_id: embedId, kind: 'upload' }] } });
+			expect(edited.message!.from.user_id).toBe('oskar');
+			expect(react('oskar', kept.result.message_id as string).result).toBeDefined();
+			expect(() => post(store, clock, 'peggy', { message_id: messageId, body: { text: 'not mine' } })).toThrow();
+		});
+	});
 });
 
 describe('upload tokens and image sniffing', () => {

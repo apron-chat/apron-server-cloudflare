@@ -161,6 +161,8 @@ it('/rename moves a registered user, their passkey, rooms and admin status to a 
 		expect(granted.frame.params).toEqual({ you: { user_id: fromId, name: `Name of ${fromId}`, roles: ['admin'] } });
 		const seen = await until(erin, (frame) => frame.method === 'user' && frame.params.new?.user_id === fromId);
 		expect(seen.frame.params).toEqual({ new: { user_id: fromId, name: `Name of ${fromId}`, roles: ['admin'] } });
+		const before = await exchange(dave, 'before', 'message', { room_id: 'general', body: { text: 'before the rename' } });
+		const earlier: string = before.frame.result.message_id;
 		// Either user_id may be written `@user_id`, as a mention is sent.
 		const renamed = await command(admin, 'rename', `/rename @${fromId} @${toId}`);
 		expect(renamed.frame.result).toEqual({});
@@ -172,6 +174,8 @@ it('/rename moves a registered user, their passkey, rooms and admin status to a 
 		expect(change.frame.params).toEqual({ new: { user_id: toId, name: `Name of ${fromId}`, roles: ['admin'] }, old: { user_id: fromId, name: `Name of ${fromId}` } });
 		const posted = await exchange(dave, 'post', 'message', { room_id: 'general', body: { text: 'renamed' } });
 		expect(posted.frame.result.message_id).toBeDefined();
+		// The earlier message was rewritten to the new id, so it is still theirs to edit.
+		expect((await exchange(dave, 'edit', 'message', { room_id: 'general', message_id: earlier, body: { text: 'edited after the rename' } })).frame.result.message_id).toBe(earlier);
 		// Still an admin under the new id.
 		expect((await command(dave, 'status', '/status')).frame.result).toEqual({});
 
@@ -185,6 +189,12 @@ it('/rename moves a registered user, their passkey, rooms and admin status to a 
 			expect(store.identityExists(fromId)).toBe(false);
 			// The old user_id is retired, never reissued.
 			expect(store.userIdTaken(fromId)).toBe(true);
+		});
+		await runInDurableObject(stub(), (_instance, state) => {
+			const froms = state.storage.sql.exec<{ record_json: string }>("SELECT record_json FROM records WHERE kind = 'message' AND json_extract(record_json, '$.message_id') = ?", earlier)
+				.toArray().map((row) => JSON.parse(row.record_json).from.user_id);
+			expect(froms.length).toBeGreaterThan(1);
+			expect(new Set(froms)).toEqual(new Set([toId]));
 		});
 
 		for (const [id, text] of [
