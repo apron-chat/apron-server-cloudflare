@@ -10,7 +10,7 @@ export const FREE_PLAN: Plan = Object.freeze({
 		retentionSeconds: 86_400,
 		cleanupSeconds: 3_600,
 		challengeTtlSeconds: 120,
-		sessionTtlSeconds: 12 * 60 * 60,
+		sessionTtlSeconds: 30 * 24 * 60 * 60,
 		maxFrameBytes: 16_384,
 		maxTextBytes: 4_096,
 		maxSnapshotBytes: 8_192,

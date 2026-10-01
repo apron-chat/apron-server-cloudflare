@@ -155,9 +155,10 @@ Memberships:
 - `/passkeys` reads at most 8 credential rows; `/passkeys remove` adds one
   delete with its index. Adding a passkey to an account without a WebAuthn
   user handle writes it at `begin` (one conditional row update).
-- `roles` in current user objects need the admin list: one `_meta` read per
-  object wake, kept in memory and updated by `/admin`, `/rename`, and
-  `/purge`, the only changes to it. Guests and bots need no read.
+- `roles` in current user objects, and the admin and bot checks, cost no
+  reads: roles are a column of the identity row, read at sign-in (and kept
+  on the connection) and in member listings with the name. `/role` and
+  `/admin` read and update the one row.
 - History pages read membership records from the same room range as every
   other record, and look up no user objects.
 - Cleanup purges a removed thread's membership rows in the same bounded
@@ -375,6 +376,11 @@ cap); it rewrites each room row and room record.
 The rows it measurably read and wrote are added to the day's maintenance
 counters without a capacity check, like the reset's passkey carry, so an
 exhausted budget cannot block it. The object is not wiped.
+
+A schema 6 object is upgraded to schema 7 the same way: it adds `roles_json`
+to `identities` and sets it for bots, `admin`, and schema 6's listed admins,
+reading and updating the identities once (at most the identity cap), and
+deletes the `_meta` `admins` row. A schema 5 object takes both upgrades.
 
 Any other stored schema version resets the object with
 `deleteAll()` and recreates the schema (`test/schema-reset.integration.test.ts`).

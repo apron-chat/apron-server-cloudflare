@@ -40,15 +40,17 @@ export const ROOM_TITLE = "General";
  * with each room's count of them, and the `uploads` held in R2 with each
  * identity's avatar. A room's `description` is one of its client fields
  * (schema 6; schema 5 pointed at an `intro_message` instead), and an
- * identity may hold several passkeys (schema 5 allowed one). Schema 5 is
- * upgraded in place (see upgradeFromSchema5()); stored data from any other
+ * identity may hold several passkeys (schema 5 allowed one). An identity's
+ * roles are a column of its row (schema 7; schema 6 listed admins in a
+ * `_meta` row and told bots by tier). Schemas 5 and 6 are upgraded in place
+ * (see upgradeFromSchema5() and upgradeFromSchema6()); stored data from any other
  * schema version is not migrated: the object is wiped and started fresh (see
  * resetStorage()). Additive rows need no new version: the `_meta`
  * guest-number mark, absent in older objects, reads as zero.
  */
-export const SCHEMA_VERSION = 6;
-/** The one older schema upgraded in place rather than reset. */
-export const UPGRADABLE_SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 7;
+/** The older schemas upgraded in place rather than reset, oldest first; each upgrades to the next. */
+export const UPGRADABLE_SCHEMA_VERSIONS: readonly number[] = [5, 6];
 /**
  * The registered user `APRON_ADMIN_TOKEN` signs in as, always an admin. It
  * never holds a passkey, so deleting the token turns it off completely.
@@ -635,6 +637,7 @@ interface CarriedPasskey extends RawCredentialRow {
   identity_created_ms: number;
   identity_updated_ms: number;
   in_general: number;
+  roles_json?: string;
 }
 
 interface RawIdentityRow {
@@ -646,6 +649,7 @@ interface RawIdentityRow {
   updated_ms: number;
   avatar_url: string;
   avatar_expires_ms: number;
+  roles_json: string;
 }
 
 interface RawUploadRow {
@@ -708,13 +712,27 @@ const META_GUEST_NUMBER_MARK = "guest_number_mark";
  */
 export const MAX_CARRIED_PASSKEYS = 100;
 /**
- * The registered users made admins with `/admin`, as a JSON list of
- * `user_id`s. Absent means none: the row is additive, so schema 4 objects need
- * no reset for it. The `APRON_ADMIN_TOKEN` user is an admin without being listed.
+ * Schema 6's list of the users `/admin` made admins, as a JSON list of
+ * `user_id`s: read only to upgrade them to `admin` roles (schema 7), or to
+ * carry those roles across a reset from an older schema.
  */
-const META_ADMINS = "admins";
-/** Most users `/admin` may list, so the list stays one small `_meta` row. */
-export const MAX_ADMINS = 32;
+const META_LEGACY_ADMINS = "admins";
+/** Most roles one user holds, so the column stays small. */
+export const MAX_ROLES_PER_USER = 8;
+/** A role name: lowercase letters, digits, `_` or `-`, starting with a letter. */
+export const ROLE_PATTERN = /^[a-z][a-z0-9_-]{0,23}$/;
+
+/** An identity row's `roles_json`, keeping only well-formed role names. */
+function parseRoles(json: string | null | undefined): string[] {
+  const parsed = parseJson<unknown>(json ?? "", []);
+  if (!Array.isArray(parsed)) return [];
+  const roles: string[] = [];
+  for (const role of parsed) {
+    if (typeof role === "string" && ROLE_PATTERN.test(role) && !roles.includes(role) && roles.length < MAX_ROLES_PER_USER) roles.push(role);
+  }
+  return roles;
+}
+
 /**
  * `_meta` key prefix recording a `/rename`: `renamed:<old user_id>` holds the
  * new one, so the retired `user_id` is never reissued (protocol §3.3).
@@ -1056,7 +1074,8 @@ const SCHEMA_DDL = `
     created_ms INTEGER NOT NULL,
     updated_ms INTEGER NOT NULL,
     avatar_url TEXT NOT NULL DEFAULT '',
-    avatar_expires_ms INTEGER NOT NULL DEFAULT 0
+    avatar_expires_ms INTEGER NOT NULL DEFAULT 0,
+    roles_json TEXT NOT NULL DEFAULT '[]'
   );
   CREATE TABLE IF NOT EXISTS uploads (
     upload_key TEXT PRIMARY KEY,
@@ -1198,8 +1217,12 @@ export class Store {
     // DDL is deliberately one initialization batch. The schema version marker
     // is checked before DDL so a wake/restart does not rewrite schema state.
     let version = this.readSchemaVersion();
-    if (version === UPGRADABLE_SCHEMA_VERSION) {
+    if (version === 5) {
       this.upgradeFromSchema5();
+      version = 6;
+    }
+    if (version === 6) {
+      this.upgradeFromSchema6();
       version = SCHEMA_VERSION;
     }
     if (version !== 0 && version !== SCHEMA_VERSION) throw new Error(`storage schema ${version} requires resetStorage()`);
@@ -1287,7 +1310,7 @@ export class Store {
   /** True when the object holds data from another schema version that is not upgraded in place. */
   requiresReset(): boolean {
     const version = this.readSchemaVersion();
-    return version !== 0 && version !== SCHEMA_VERSION && version !== UPGRADABLE_SCHEMA_VERSION;
+    return version !== 0 && version !== SCHEMA_VERSION && !UPGRADABLE_SCHEMA_VERSIONS.includes(version);
   }
 
   /**
@@ -1376,25 +1399,70 @@ export class Store {
         ALTER TABLE credentials_v6 RENAME TO credentials;
         CREATE INDEX IF NOT EXISTS credentials_user_idx ON credentials (user_id);
       `);
-      this.rawExec("UPDATE _meta SET value = ? WHERE key = 'schema_version'", String(SCHEMA_VERSION));
-      this.rawExec("UPDATE maintenance SET schema_version = ? WHERE id = 1", SCHEMA_VERSION);
-      const cost = { reads: this.observed.reads - start.reads, writes: this.observed.writes - start.writes + 2 };
-      this.rawExec(
-        `INSERT OR IGNORE INTO resource_budgets
-         (day, reads_reserved, writes_reserved, frames_reserved, admissions_reserved,
-          posts_reserved, registrations_reserved, foreground_reads, foreground_writes,
-          maintenance_reads, maintenance_writes)
-         VALUES (?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)`,
-        day,
-      );
-      this.rawExec(
-        "UPDATE resource_budgets SET reads_reserved = reads_reserved + ?, writes_reserved = writes_reserved + ?, maintenance_reads = maintenance_reads + ?, maintenance_writes = maintenance_writes + ? WHERE day = ?",
-        cost.reads, cost.writes, cost.reads, cost.writes, day,
-      );
-      this.observed.reservedReads += cost.reads;
-      this.observed.reservedWrites += cost.writes;
+      this.finishUpgrade(6, start, day);
     });
-    console.warn(JSON.stringify({ event: "storage_schema_upgraded", from: UPGRADABLE_SCHEMA_VERSION, to: SCHEMA_VERSION }));
+    console.warn(JSON.stringify({ event: "storage_schema_upgraded", from: 5, to: 6 }));
+  }
+
+  /**
+   * Upgrades a schema 6 object to schema 7 in place, once, in one
+   * transaction, keeping everything: identities get a `roles_json` column,
+   * `["bot"]` for bots (tier `bot`), `["admin"]` for the `admin` user and
+   * those the `_meta` `admins` row listed, and `[]` for the rest; the
+   * `admins` row is deleted. This reads every identity once (at most the
+   * identity cap), charged like upgradeFromSchema5's rows.
+   */
+  private upgradeFromSchema6(): void {
+    const start = { reads: this.observed.reads, writes: this.observed.writes };
+    const effective = Number(this.metaValue(META_EFFECTIVE_NOW));
+    const day = dayFor(Math.max(Number.isSafeInteger(effective) ? effective : 0, this.clock.now()));
+    this.transaction(() => {
+      const admins = this.legacyAdmins();
+      this.rawExec("ALTER TABLE identities ADD COLUMN roles_json TEXT NOT NULL DEFAULT '[]'");
+      this.rawExec("UPDATE identities SET roles_json = '[\"bot\"]' WHERE tier = 'bot'");
+      for (const userId of [ADMIN_USER_ID, ...admins]) {
+        this.rawExec("UPDATE identities SET roles_json = '[\"admin\"]' WHERE user_id = ? AND tier = 'registered'", userId);
+      }
+      this.rawExec("DELETE FROM _meta WHERE key = ?", META_LEGACY_ADMINS);
+      this.finishUpgrade(7, start, day);
+    });
+    console.warn(JSON.stringify({ event: "storage_schema_upgraded", from: 6, to: 7 }));
+  }
+
+  /** Schema 6's `admins` list (META_LEGACY_ADMINS), or none when absent or unreadable. */
+  private legacyAdmins(): string[] {
+    try {
+      const parsed = parseJson<unknown>(this.metaValue(META_LEGACY_ADMINS), []);
+      return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string") : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Ends an in-place upgrade's transaction: marks the new schema version and
+   * charges the rows it read and wrote (measured from `start`) to the day's
+   * maintenance reservation without a capacity check, like a reset's
+   * passkey carry, so an upgrade cannot be blocked by an exhausted budget.
+   */
+  private finishUpgrade(version: number, start: { reads: number; writes: number }, day: string): void {
+    this.rawExec("UPDATE _meta SET value = ? WHERE key = 'schema_version'", String(version));
+    this.rawExec("UPDATE maintenance SET schema_version = ? WHERE id = 1", version);
+    const cost = { reads: this.observed.reads - start.reads, writes: this.observed.writes - start.writes + 2 };
+    this.rawExec(
+      `INSERT OR IGNORE INTO resource_budgets
+       (day, reads_reserved, writes_reserved, frames_reserved, admissions_reserved,
+        posts_reserved, registrations_reserved, foreground_reads, foreground_writes,
+        maintenance_reads, maintenance_writes)
+       VALUES (?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)`,
+      day,
+    );
+    this.rawExec(
+      "UPDATE resource_budgets SET reads_reserved = reads_reserved + ?, writes_reserved = writes_reserved + ?, maintenance_reads = maintenance_reads + ?, maintenance_writes = maintenance_writes + ? WHERE day = ?",
+      cost.reads, cost.writes, cost.reads, cost.writes, day,
+    );
+    this.observed.reservedReads += cost.reads;
+    this.observed.reservedWrites += cost.writes;
   }
 
   /**
@@ -1429,8 +1497,8 @@ export class Store {
    * identities (same `user_id`, name, and WebAuthn user handle) and their
    * `general` membership, so users sign in again with the passkey they have
    * rather than deleting it and registering anew. The rows the carry reads
-   * and writes are charged to the day's maintenance reservation below, and those of them `/admin`
-   * listed stay admins. Older passkeys past the cap, bots, and every session
+   * and writes are charged to the day's maintenance reservation below, with their roles
+   * (but `bot`, which no passkey holder has). Older passkeys past the cap, bots, and every session
    * are dropped.
    *
    * The guest-number high-water mark is carried over, so a guest ID is never
@@ -1472,12 +1540,6 @@ export class Store {
     const carryStart = { reads: this.observed.reads, writes: this.observed.writes };
     const passkeys = this.readCarriedPasskeys();
     const carryReads = this.observed.reads - carryStart.reads;
-    let admins: string[] = [];
-    try {
-      admins = this.adminIds();
-    } catch {
-      // An unreadable old meta table carries no admins.
-    }
     await deleteAll.call(this.durableStorage);
     this.initialized = false;
     this.accountingUnsafe = false;
@@ -1493,10 +1555,6 @@ export class Store {
     }
     const writeStart = { reads: this.observed.reads, writes: this.observed.writes };
     if (passkeys.length) this.writeCarriedPasskeys(passkeys);
-    // Admins whose passkeys were carried stay admins: one control write.
-    const carriedIds = new Set(passkeys.map((row) => row.user_id));
-    const carriedAdmins = admins.filter((id) => carriedIds.has(id));
-    if (carriedAdmins.length) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ADMINS, JSON.stringify(carriedAdmins));
     const carryCost = {
       reads: carryReads + this.observed.reads - writeStart.reads,
       writes: this.observed.writes - writeStart.writes,
@@ -1537,21 +1595,30 @@ export class Store {
    * here or accept that the reset drops them; an unreadable table carries none.
    */
   private readCarriedPasskeys(): CarriedPasskey[] {
-    try {
-      return this.rawRows<CarriedPasskey>(
-        `SELECT c.credential_id, c.user_id, c.public_key_json, c.sign_count, c.transports_json,
-            c.created_ms, c.updated_ms, i.user_handle, i.name, i.tier,
-            i.created_ms AS identity_created_ms, i.updated_ms AS identity_updated_ms,
-            EXISTS (SELECT 1 FROM memberships m WHERE m.room_id = ? AND m.user_id = c.user_id) AS in_general
-         FROM credentials c JOIN identities i ON i.user_id = c.user_id
-         WHERE i.tier = 'registered' AND i.user_id <> ?
-         ORDER BY c.updated_ms DESC, c.credential_id LIMIT ?`,
-        // `admin` holds no passkey; should one exist, a reset does not carry it.
-        ROOM_ID, ADMIN_USER_ID, MAX_CARRIED_PASSKEYS,
-      );
-    } catch {
-      return [];
+    // Schemas before 7 have no `roles_json`: their admins are in a `_meta` list.
+    for (const roles of ["i.roles_json", "NULL"]) {
+      try {
+        const rows = this.rawRows<CarriedPasskey>(
+          `SELECT c.credential_id, c.user_id, c.public_key_json, c.sign_count, c.transports_json,
+              c.created_ms, c.updated_ms, i.user_handle, i.name, i.tier, ${roles} AS roles_json,
+              i.created_ms AS identity_created_ms, i.updated_ms AS identity_updated_ms,
+              EXISTS (SELECT 1 FROM memberships m WHERE m.room_id = ? AND m.user_id = c.user_id) AS in_general
+           FROM credentials c JOIN identities i ON i.user_id = c.user_id
+           WHERE i.tier = 'registered' AND i.user_id <> ?
+           ORDER BY c.updated_ms DESC, c.credential_id LIMIT ?`,
+          // `admin` holds no passkey; should one exist, a reset does not carry it.
+          ROOM_ID, ADMIN_USER_ID, MAX_CARRIED_PASSKEYS,
+        );
+        if (roles === "NULL") {
+          const admins = new Set(this.legacyAdmins());
+          for (const row of rows) row.roles_json = admins.has(row.user_id) ? '["admin"]' : "[]";
+        }
+        return rows;
+      } catch {
+        // Try the older shape, then give up: an unreadable old schema carries nothing.
+      }
     }
+    return [];
   }
 
   /**
@@ -1563,9 +1630,11 @@ export class Store {
   private writeCarriedPasskeys(passkeys: readonly CarriedPasskey[]): void {
     this.transaction(() => {
       for (const row of passkeys) {
+        // A passkey holder is never a bot, so a stray `bot` role is not carried.
+        const roles = parseRoles(row.roles_json).filter((role) => role !== "bot");
         this.rawExec(
-          "INSERT OR IGNORE INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES (?, ?, ?, 'registered', ?, ?)",
-          row.user_id, row.user_handle, row.name, row.identity_created_ms, row.identity_updated_ms,
+          "INSERT OR IGNORE INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES (?, ?, ?, 'registered', ?, ?, ?)",
+          row.user_id, row.user_handle, row.name, row.identity_created_ms, row.identity_updated_ms, JSON.stringify(roles),
         );
         this.rawExec(
           `INSERT OR IGNORE INTO credentials
@@ -2314,7 +2383,7 @@ export class Store {
 
   private identityRow(userId: string): RawIdentityRow | null {
     const rows = this.rawRows<RawIdentityRow>(
-      "SELECT user_id, user_handle, name, tier, created_ms, updated_ms, avatar_url, avatar_expires_ms FROM identities WHERE user_id = ? LIMIT 1",
+      "SELECT user_id, user_handle, name, tier, created_ms, updated_ms, avatar_url, avatar_expires_ms, roles_json FROM identities WHERE user_id = ? LIMIT 1",
       userId,
     );
     return rows[0] ?? null;
@@ -2361,12 +2430,12 @@ export class Store {
   /**
    * `/rename`: moves a registered user to a new `user_id`: the identity row,
    * its credential (so its passkey signs in as the new id), its stored
-   * memberships, and its admin listing. Nothing else is migrated: logged
+   * memberships, and its roles (a column of the row). Nothing else is migrated: logged
    * records keep the old `user_id` (protocol §3.3), and sessions, limiter
    * windows, reactions and the user's bot stay under it. The old `user_id` is
-   * retired, never reissued. Returns the user's name and joined rooms.
+   * retired, never reissued. Returns the user's name, joined rooms, and roles. A bot's is fixed.
    */
-  renameIdentity(input: { from: string; to: string; now?: number }): { name: string; rooms: string[] } {
+  renameIdentity(input: { from: string; to: string; now?: number }): { name: string; rooms: string[]; roles: string[] } {
     this.ensureReady();
     const now = input.now ?? this.clock.now();
     const membershipRows = MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS;
@@ -2375,16 +2444,13 @@ export class Store {
     return this.reserved({ reads: 64 + 4 * membershipRows + this.userRoomsReads(), writes: 32 + 4 * membershipRows }, false, now, () => this.transaction(() => {
       const identity = this.identityRow(input.from);
       if (!identity || identity.tier !== "registered") throw new StoreError("invalid_params", `No registered user has the user_id ${input.from}`.slice(0, 200));
+      if (parseRoles(identity.roles_json).includes("bot")) throw new StoreError("invalid_params", "A bot's user_id is fixed");
       if (this.idTaken(input.to)) throw new StoreError("invalid_params", `The user_id ${input.to} is taken`.slice(0, 200));
       this.rawExec("UPDATE identities SET user_id = ?, updated_ms = ? WHERE user_id = ?", input.to, this.effectiveNow(now), input.from);
       this.rawExec("UPDATE credentials SET user_id = ? WHERE user_id = ?", input.to, input.from);
       this.rawExec("UPDATE memberships SET user_id = ? WHERE user_id = ?", input.to, input.from);
       this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_RENAMED_PREFIX + input.from, input.to);
-      const admins = this.adminIds();
-      if (admins.includes(input.from)) {
-        this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ADMINS, JSON.stringify(admins.map((id) => (id === input.from ? input.to : id))));
-      }
-      return { name: identity.name, rooms: this.userRooms(input.to) };
+      return { name: identity.name, rooms: this.userRooms(input.to), roles: parseRoles(identity.roles_json) };
     }));
   }
 
@@ -2393,7 +2459,7 @@ export class Store {
    * records: their message snapshots and current messages, with every
    * reaction set on those messages; their reaction sets elsewhere; their
    * memberships and membership records; their uploads; and their identity,
-   * passkey, admin listing, limiter and dedup rows. A logged record that
+   * passkey, limiter and dedup rows. A logged record that
    * lists them beside others (a move's reaction sets) is rewritten without
    * them. Rooms they created stay. Clients that already have their content
    * keep it until they load history again. Returns what went, and the R2
@@ -2471,10 +2537,6 @@ export class Store {
       }
       this.rawExec(`DELETE FROM principal_limits WHERE principal_key IN (${marks})`, ...ids.map((id) => `user:${id}`));
       if (identities) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(Math.max(0, this.metaNumber("identity_count") - integerColumn(identities))));
-      const admins = this.adminIds();
-      if (admins.some((id) => ids.includes(id))) {
-        this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ADMINS, JSON.stringify(admins.filter((id) => !ids.includes(id))));
-      }
       return { messages: messages.length, reactions: integerColumn(reactions), deletedUploads };
     }));
   }
@@ -2499,6 +2561,7 @@ export class Store {
         userHandle: row.user_handle,
         credentialCount,
         rooms: this.userRooms(userId),
+        roles: parseRoles(row.roles_json),
         ...(avatar ? { avatar } : {}),
       };
     });
@@ -2506,7 +2569,7 @@ export class Store {
 
   /**
    * The registered members of each room (§4.3.1), as `user_id` with the
-   * current `name` (`""` when removed) and live `avatar`, in `user_id` order: at most `limit`
+   * current `name` (`""` when removed), live `avatar`, and `roles`, in `user_id` order: at most `limit`
    * per room, read from the room's primary-key range with one identity lookup
    * each. Guests' memberships are not stored; the caller adds connected ones.
    */
@@ -2514,23 +2577,23 @@ export class Store {
     roomIds: readonly string[], limit: number, now = this.clock.now(),
     /** Filled, for each room whose listing reached `limit`, with its count of registered members. */
     counts?: Map<string, number>,
-  ): Map<string, Array<{ user_id: string; name: string; avatar?: string }>> {
+  ): Map<string, Array<{ user_id: string; name: string; avatar?: string; roles: string[] }>> {
     this.ensureReady();
     const ids = [...new Set(roomIds)].slice(0, MAX_THREAD_LIMIT + 1);
     const perRoom = Math.max(0, Math.floor(limit));
-    const members = new Map<string, Array<{ user_id: string; name: string; avatar?: string }>>();
+    const members = new Map<string, Array<{ user_id: string; name: string; avatar?: string; roles: string[] }>>();
     if (!ids.length || perRoom === 0) return members;
     return this.reserved({ reads: 8 + ids.length * (4 + 2 * perRoom) }, false, now, () => {
       for (const roomId of ids) {
-        const rows = this.rawRows<{ user_id: string; name: string | null; avatar_url: string | null; avatar_expires_ms: number | null }>(
-          `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id
+        const rows = this.rawRows<{ user_id: string; name: string | null; avatar_url: string | null; avatar_expires_ms: number | null; roles_json: string | null }>(
+          `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id
            WHERE m.room_id = ? ORDER BY m.user_id LIMIT ?`,
           roomId, perRoom,
         );
         if (rows.length) {
           members.set(roomId, rows.map((row) => {
             const avatar = liveAvatar(row, now);
-            return { user_id: row.user_id, name: row.name ?? "", ...(avatar ? { avatar } : {}) };
+            return { user_id: row.user_id, name: row.name ?? "", ...(avatar ? { avatar } : {}), roles: parseRoles(row.roles_json) };
           }));
         }
         // A full page may be truncated: the room row's count, one read, says.
@@ -2941,6 +3004,7 @@ export class Store {
           userHandle: input.userHandle,
           credentialCount: 1,
           rooms: joined,
+          roles: [],
           broadcasts,
         });
       });
@@ -2972,7 +3036,7 @@ export class Store {
       const effective = this.effectiveNow(input.now);
       return this.transaction(() => {
         const identity = this.identityRow(input.userId);
-        if (!identity || identity.tier !== "registered") throw new StoreError("denied", "Only a registered user can add a passkey");
+        if (!identity || identity.tier !== "registered" || parseRoles(identity.roles_json).includes("bot")) throw new StoreError("denied", "Only a registered user can add a passkey");
         if (identity.user_id === ADMIN_USER_ID) throw new StoreError("denied", "The admin user signs in with APRON_ADMIN_TOKEN only");
         if (this.credentialValue(credential.credentialId)) throw new StoreError("denied", "credential is already registered");
         const count = integerColumn(this.rawRows<{ count: number }>(
@@ -3249,66 +3313,51 @@ export class Store {
       }
       return { userId: input.botId, name: input.name, created: false, renamed, broadcasts: [] };
     }
-    const created = this.createKeylessIdentity({ userId: input.botId, name: input.name, tier: "bot", now: input.now, ipKey: input.ipKey });
+    const created = this.createKeylessIdentity({ userId: input.botId, name: input.name, tier: "bot", roles: ["bot"], now: input.now, ipKey: input.ipKey });
     return { userId: input.botId, name: input.name, created: true, renamed: false, broadcasts: created.broadcasts };
   }
 
-  /** Whether `/admin` listed this user as an admin. One `_meta` read. */
-  isAdmin(userId: string, now = this.clock.now()): boolean {
-    this.ensureReady();
-    return this.reserved({ reads: 4 }, false, now, () => this.adminIds().includes(userId));
-  }
-
-  /** The users `/admin` listed (not the `admin` user, always one), one `_meta` read. */
-  admins(now = this.clock.now()): string[] {
-    this.ensureReady();
-    return this.reserved({ reads: 4 }, false, now, () => this.adminIds());
-  }
-
   /**
-   * Lists a registered user (not a bot or guest) as an admin, for `/admin`.
-   * `added` is false when the user already was one. At most MAX_ADMINS.
+   * Gives a user a role (`on`), takes it away, or with no `on` toggles it,
+   * for `/role` and `/admin`. `changed` is false when there was nothing to
+   * do. Roles are kept in the identity row, at most MAX_ROLES_PER_USER.
+   * Only registered users and bots have roles; a bot is never an admin; and
+   * `bot` is given to no admin and no user holding a passkey, since a bot
+   * signs in with a token only. The roles a user has by what they are,
+   * `admin` for the `admin` user and `bot` for an owner's bot (tier `bot`),
+   * are not taken away.
    */
-  grantAdmin(input: { userId: string; now?: number }): { added: boolean; name: string } {
+  setRole(input: { userId: string; role: string; on?: boolean; now?: number }): { changed: boolean; on: boolean; name: string; roles: string[] } {
     this.ensureReady();
-    return this.reserved({ reads: 8, writes: 4 }, false, input.now ?? this.clock.now(), () => this.transaction(() => {
+    if (!ROLE_PATTERN.test(input.role)) throw new StoreError("invalid_params", "A role is 1 to 24 lowercase letters, digits, _ or -, starting with a letter");
+    return this.reserved({ reads: 12, writes: 4 }, false, input.now ?? this.clock.now(), () => this.transaction(() => {
       const identity = this.identityRow(input.userId);
-      if (!identity || identity.tier !== "registered") throw new StoreError("invalid_params", "No registered user has that user_id");
-      const admins = this.adminIds();
-      if (admins.includes(input.userId)) return { added: false, name: identity.name };
-      if (admins.length >= MAX_ADMINS) throw new StoreError("denied", `There are already ${MAX_ADMINS} admins`);
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ADMINS, JSON.stringify([...admins, input.userId]));
-      return { added: true, name: identity.name };
-    }));
-  }
-
-  /**
-   * Takes a user off the `/admin` list. `added` (named for grantAdmin's
-   * result) is whether they were on it.
-   */
-  revokeAdmin(input: { userId: string; now?: number }): { added: boolean; name: string } {
-    this.ensureReady();
-    return this.reserved({ reads: 8, writes: 4 }, false, input.now ?? this.clock.now(), () => this.transaction(() => {
-      const identity = this.identityRow(input.userId);
-      const admins = this.adminIds();
-      if (!admins.includes(input.userId)) {
-        if (!identity) throw new StoreError("invalid_params", "No registered user has that user_id");
-        return { added: false, name: identity.name };
+      if (!identity || (identity.tier !== "registered" && identity.tier !== "bot")) throw new StoreError("invalid_params", "No registered user has that user_id");
+      const held = parseRoles(identity.roles_json);
+      const on = input.on ?? !held.includes(input.role);
+      const unchanged = { changed: false, on, name: identity.name, roles: held };
+      if (!on) {
+        if (!held.includes(input.role)) return unchanged;
+        if (input.role === "admin" && identity.user_id === ADMIN_USER_ID) throw new StoreError("invalid_params", "The admin user is always an admin");
+        if (input.role === "bot" && identity.tier === "bot") throw new StoreError("invalid_params", "An owner's bot is always a bot");
+        return this.writeRoles(identity, held.filter((role) => role !== input.role), on);
       }
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ADMINS, JSON.stringify(admins.filter((id) => id !== input.userId)));
-      return { added: true, name: identity?.name ?? "" };
+      if (held.includes(input.role)) return unchanged;
+      if (input.role === "admin" && held.includes("bot")) throw new StoreError("invalid_params", "A bot can't be an admin");
+      if (input.role === "bot") {
+        if (held.includes("admin")) throw new StoreError("invalid_params", "An admin can't be a bot; take away admin first");
+        if (this.rawRows("SELECT 1 FROM credentials WHERE user_id = ? LIMIT 1", input.userId).length) {
+          throw new StoreError("invalid_params", "A bot signs in with a token and holds no passkey; this user has one");
+        }
+      }
+      if (held.length >= MAX_ROLES_PER_USER) throw new StoreError("denied", `A user has at most ${MAX_ROLES_PER_USER} roles`);
+      return this.writeRoles(identity, [...held, input.role], on);
     }));
   }
 
-  private adminIds(): string[] {
-    const raw = this.metaValue(META_ADMINS);
-    if (!raw) return [];
-    try {
-      const parsed: unknown = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string").slice(0, MAX_ADMINS) : [];
-    } catch {
-      return [];
-    }
+  private writeRoles(identity: RawIdentityRow, roles: string[], on: boolean): { changed: boolean; on: boolean; name: string; roles: string[] } {
+    this.rawExec("UPDATE identities SET roles_json = ? WHERE user_id = ?", JSON.stringify(roles), identity.user_id);
+    return { changed: true, on, name: identity.name, roles };
   }
 
   /**
@@ -3323,7 +3372,7 @@ export class Store {
       if (existing.tier !== "registered") throw new StoreError("internal_error", "admin user identity is taken");
       return { created: false, broadcasts: [] };
     }
-    return { created: true, broadcasts: this.createKeylessIdentity({ ...input, tier: "registered" }).broadcasts };
+    return { created: true, broadcasts: this.createKeylessIdentity({ ...input, tier: "registered", roles: ["admin"] }).broadcasts };
   }
 
   /**
@@ -3345,7 +3394,7 @@ export class Store {
    * credential, charged as a registration, and starts it in `general` with a
    * logged membership (§4.3.2) returned in `broadcasts`.
    */
-  private createKeylessIdentity(input: { userId: string; name: string; tier: "bot" | "registered"; now: number; ipKey: string }): { broadcasts: Broadcast[] } {
+  private createKeylessIdentity(input: { userId: string; name: string; tier: "bot" | "registered"; roles?: string[]; now: number; ipKey: string }): { broadcasts: Broadcast[] } {
     ensureText(input.name, "name", this.config.maxNameBytes);
     if ([...input.name].length > this.config.maxNameCodePoints) throw new StoreError("too_large", "name is too long");
     const beforeReads = this.observed.reads;
@@ -3362,8 +3411,8 @@ export class Store {
         if (this.metaNumber("identity_count") >= this.config.registeredIdentityCount) throw new StoreError("denied", "registration_closed");
         this.chargeRegistration(input.ipKey, effective);
         this.rawExec(
-          "INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES (?, '', ?, ?, ?, ?)",
-          input.userId, input.name, input.tier, effective, effective,
+          "INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES (?, '', ?, ?, ?, ?, ?)",
+          input.userId, input.name, input.tier, effective, effective, JSON.stringify(input.roles ?? []),
         );
         this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(this.metaNumber("identity_count") + 1));
         const broadcasts: Broadcast[] = [];

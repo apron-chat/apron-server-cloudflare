@@ -125,7 +125,7 @@ delivered in `room_update` `memberships` and returned in `history`; a guest's li
 so `room_list` ignores `latest_log_id` and always answers with a full
 listing. `members` lists every connected member and at most 200 registered
 members per room (100 with the Free budgets); a room with more lists the first by `user_id`, not by recent activity, and also gives
-`member_count`. Registered users carry `roles` (`admin`, `bot`, or `[]` for none) in `users`
+`member_count`. Registered users carry `roles` (`admin`, `bot`, labels an admin gave with `/role`, or `[]` for none) in `users`
 and `you`. See [SPEC section 4](../SPEC.md#memberships).
 The whole server processes at most 600 frames a
 minute (300 with the Free budgets); past that, requests get `retry_after` and the socket stays open. The demo
@@ -354,10 +354,11 @@ For direct Wrangler production commands, always pass
 5. Review `wrangler.production.toml`: fixed DO binding, `new_sqlite_classes` migration,
    no paid-service bindings. Apply the initial migration once using the normal
    Wrangler deployment workflow. Do not rename or recreate the production
-   object to work around a quota or schema issue. The current schema is 6
-   (protocol 7); a schema 5 object (protocol 6) is upgraded in place on its
-   first wake, keeping everything, with each thread's intro message becoming
-   its `description` (see [SPEC section 8](../SPEC.md#schema-versions)).
+   object to work around a quota or schema issue. The current schema is 7
+   (protocol 7, roles kept with identities); schema 5 and 6 objects are
+   upgraded in place on their first wake, keeping everything: schema 5's
+   thread intro messages become their `description`, and schema 6's admins
+   and bots get their roles (see [SPEC section 8](../SPEC.md#schema-versions)).
    The upgrade is one-way: redeploying protocol 6 code afterwards resets the
    object like any schema change, so fix forward instead of rolling back. It
    also fails closed: if it cannot finish, nothing changes, and the object

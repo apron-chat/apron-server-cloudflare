@@ -27,6 +27,8 @@ import {
 	ADMIN_USER_ID,
 	DEFAULT_JOINED_ROOMS,
 	MAX_PASSKEYS_PER_USER,
+	MAX_ROLES_PER_USER,
+	ROLE_PATTERN,
 	ROOM_ID,
 	Store,
 	StoreError,
@@ -74,6 +76,12 @@ interface ConnectionAttachment {
 	name?: string;
 	/** The user's avatar (§4.6.6), for current user objects; never in `from`. */
 	avatar?: string;
+	/**
+	 * A registered user's roles (§3.3), read with the identity at sign-in and
+	 * kept current by `/role` and `/admin`: for current user objects, and for
+	 * the admin and bot checks, which need no storage read.
+	 */
+	roles?: string[];
 	origin?: string;
 	/** The WebSocket URL this connection reached, for instructions that name the server (`/invite-bot`). */
 	endpoint?: string;
@@ -140,7 +148,7 @@ const JOIN_INVITE_TTL_MS = 7 * 86_400_000;
 /**
  * The commands this server provides (§4.8), as `/help` lists them to those
  * who may run them: `everyone`, `owners` (registered users other than bots),
- * or `admins` (the `APRON_ADMIN_TOKEN` user and those `/admin` made admins).
+ * or `admins` (the `APRON_ADMIN_TOKEN` user and those given the `admin` role).
  */
 const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audience: "everyone" | "owners" | "admins" }> = [
 	{ name: "help", usage: "/help", help: "list the commands you can use here", audience: "everyone" },
@@ -148,6 +156,7 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "avatar", usage: "/avatar", help: "set your avatar: send this command with one image attached", audience: "owners" },
 	{ name: "passkeys", usage: "/passkeys [remove <n>]", help: "list your account's passkeys, or remove one of them", audience: "owners" },
 	{ name: "admin", usage: "/admin [remove] <user_id>", help: "make a registered user an admin, or no longer one", audience: "admins" },
+	{ name: "role", usage: "/role <user_id> [<role>]", help: "show a user's roles, or give or take away one (admin and bot act as such; others are labels)", audience: "admins" },
 	{ name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", audience: "admins" },
 	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
 	{ name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", audience: "admins" },
@@ -292,7 +301,8 @@ function assertIssuableUserId(userId: string): void {
 	}
 }
 
-function isBot(userId: string | undefined): boolean {
+/** Whether a `user_id` is an owner's bot's (`bot_<owner>`); a user may also be a bot by role (`isBot`). */
+function isBotId(userId: string | undefined): boolean {
 	return userId?.startsWith(BOT_ID_PREFIX) === true;
 }
 
@@ -403,6 +413,9 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			...(typeof attachment.userId === "string" ? { userId: attachment.userId } : {}),
 			...(typeof attachment.name === "string" ? { name: attachment.name } : {}),
 			...(typeof attachment.avatar === "string" && attachment.avatar.length <= MAX_AVATAR_CHARS ? { avatar: attachment.avatar } : {}),
+			...(Array.isArray(attachment.roles) ? {
+				roles: attachment.roles.filter((role): role is string => typeof role === "string" && ROLE_PATTERN.test(role)).slice(0, MAX_ROLES_PER_USER),
+			} : {}),
 			...(typeof attachment.origin === "string" ? { origin: attachment.origin } : {}),
 			...(typeof attachment.endpoint === "string" && attachment.endpoint.length <= MAX_ENDPOINT_CHARS ? { endpoint: attachment.endpoint } : {}),
 			...(challenge ? { challenge } : {}),
@@ -552,6 +565,11 @@ function publicIdentity(attachment: ConnectionAttachment): { user_id: string; na
 function currentUser(attachment: ConnectionAttachment): PublicUser | null {
 	const identity = publicIdentity(attachment);
 	return identity && attachment.avatar ? { ...identity, avatar: attachment.avatar } : identity;
+}
+
+/** Whether a connection's user is registered and has a role (§3.3), from its attachment. */
+function hasRole(attachment: ConnectionAttachment, role: string): boolean {
+	return attachment.tier === "registered" && (attachment.roles ?? []).includes(role);
 }
 
 /** Keeps a live avatar on a connection's attachment, or none; the caller writes the attachment. */
@@ -785,12 +803,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private guestNext = 0;
 	private guestLimit = 0;
-	/**
-	 * The users `/admin` listed, read once per wake for `roles` and admin
-	 * checks, and kept current by `/admin`, `/rename`, and `/purge`, the only
-	 * changes to the list; undefined until read.
-	 */
-	private adminIds?: Set<string>;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -1354,7 +1366,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// a bot signs in with its token only.
 		const adding = attachment.tier === "registered";
 		if (adding && action !== "register") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
-		if (adding && isBot(attachment.userId)) throw { name: "denied", message: "A bot signs in with its token and takes no passkey" } satisfies ProtocolError;
+		if (adding && hasRole(attachment, "bot")) throw { name: "denied", message: "A bot signs in with its token and takes no passkey" } satisfies ProtocolError;
 		// A passkey would outlive the token: deleting APRON_ADMIN_TOKEN must turn `admin` off.
 		if (adding && attachment.userId === ADMIN_USER_ID) {
 			throw { name: "denied", message: "The admin user signs in with APRON_ADMIN_TOKEN only; make your own account an admin with /admin" } satisfies ProtocolError;
@@ -1401,11 +1413,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const credential = passkeyCredentialParam(params, action);
 		// A signed-in user's avatar, for the connection's current object (§4.6.6).
 		let avatar: string | undefined;
+		let roles: string[] = [];
 		const repository: CredentialRepository = {
 			getCredential: (credentialId) => this.store.getCredential(credentialId),
 			getIdentity: (userId) => {
 				const identity = this.store.getIdentity(userId);
 				avatar = identity?.avatar;
+				roles = identity?.roles ?? [];
 				return identity ? { user_id: identity.userId, name: identity.name, tier: "registered" } : null;
 			},
 			registerCredential: (input) => {
@@ -1452,6 +1466,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.userId = finished.identity.user_id;
 		attachment.name = finished.identity.name;
 		setAvatar(attachment, avatar);
+		attachment.roles = roles;
 		attachment.rooms = this.registeredRooms(socket, finished.identity.user_id);
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
@@ -1552,6 +1567,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.userId = identity.userId;
 		attachment.name = identity.name;
 		setAvatar(attachment, identity.avatar);
+		attachment.roles = identity.roles;
 		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
@@ -1573,7 +1589,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const key = BOT_TOKEN_KEY_PREFIX + await sha256Hex(token);
 			const stored = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredBotToken>(key));
 			const invalid = { name: "denied", message: "Bot token is not valid; its owner can get a new one with /invite-bot" } satisfies ProtocolError;
-			if (!stored || stored.v !== 1 || !isBot(stored.botId)) throw invalid;
+			if (!stored || stored.v !== 1 || !isBotId(stored.botId)) throw invalid;
 			const identity = this.store.getIdentity(stored.botId);
 			if (!identity) throw invalid;
 			await this.signInKeyless(socket, attachment, request, identity);
@@ -1620,7 +1636,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * (a bot or the admin user): the connection becomes the identity, and those
 	 * who shared a room with the guest it replaces hear of it.
 	 */
-	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[]; avatar?: string }, token?: string): Promise<void> {
+	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[]; avatar?: string; roles: string[] }, token?: string): Promise<void> {
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
 		this.assertRegisteredCapacity(socket, identity.userId);
 		const guest = attachment.tier === "anonymous" ? publicIdentity(attachment) : null;
@@ -1629,6 +1645,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.userId = identity.userId;
 		attachment.name = identity.name;
 		setAvatar(attachment, identity.avatar);
+		attachment.roles = identity.roles;
 		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
@@ -1894,8 +1911,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (attachment.tier !== "registered") {
 			throw { name: "denied", message: "Only registered users may change their name" } satisfies ProtocolError;
 		}
-		if (isBot(identity.user_id)) {
-			throw { name: "denied", message: "A bot is named after its owner, who can rename it with /invite-bot" } satisfies ProtocolError;
+		if (hasRole(attachment, "bot")) {
+			throw { name: "denied", message: isBotId(identity.user_id) ? "A bot is named after its owner, who can rename it with /invite-bot" : "A bot can't change its name" } satisfies ProtocolError;
 		}
 		await this.runMutation(async () => {
 			const result = this.store.commitMutation({
@@ -1917,7 +1934,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const current = connectionAttachment(socket);
 			if (!current) return;
 			// A removed name is announced as its empty value (§3.3).
-			const you = this.withRoles(current.name ? publicIdentity(current)! : { user_id: identity.user_id, name: "" });
+			const you = { ...this.current(current)!, ...(current.name ? {} : { name: "" }) };
 			this.reply(socket, request, { you });
 			// Section 3.3: `you` to the user's other connections, `new` to those who share a room with the user.
 			if (!result.deduplicated) this.announceUser(socket, you, current.rooms ?? []);
@@ -2074,8 +2091,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * for their own bot, say to have it keep a thread's `description` current.
 	 */
 	private assertMayManage(attachment: ConnectionAttachment, userId: string): void {
-		const owner = attachment.tier === "registered" && !isBot(attachment.userId);
-		if (owner && (userId === BOT_ID_PREFIX + attachment.userId || this.isAdmin(attachment.userId!))) return;
+		const owner = attachment.tier === "registered" && !hasRole(attachment, "bot");
+		if (owner && (userId === BOT_ID_PREFIX + attachment.userId || hasRole(attachment, "admin"))) return;
 		throw { name: "denied", message: "Only an admin, or a bot's owner, can add or remove someone else" } satisfies ProtocolError;
 	}
 
@@ -2319,12 +2336,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.fail(socket, request, { name: "invalid_params", message: message.slice(0, 200) });
 			return;
 		}
-		const owner = attachment.tier === "registered" && !isBot(attachment.userId);
+		const owner = attachment.tier === "registered" && !hasRole(attachment, "bot");
 		if (command.audience === "owners" && !owner) {
-			throw { name: "denied", message: isBot(attachment.userId) ? `A bot can't use /${name}` : `Sign in with a passkey to use /${name}` } satisfies ProtocolError;
+			throw { name: "denied", message: hasRole(attachment, "bot") ? `A bot can't use /${name}` : `Sign in with a passkey to use /${name}` } satisfies ProtocolError;
 		}
-		// Admin status is read only for the commands that need it.
-		const admin = owner && (command.audience === "admins" || command.name === "help") && this.isAdmin(attachment.userId!);
+		const admin = owner && hasRole(attachment, "admin");
 		if (command.audience === "admins" && !admin) throw { name: "denied", message: `Only an admin can use /${name}` } satisfies ProtocolError;
 		if (command.name === "invite-bot") {
 			await this.inviteBot(socket, attachment, request, roomId);
@@ -2344,8 +2360,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 			return;
 		}
-		if (["admin", "kick", "rename", "purge", "toggle", "invite-token", "invite"].includes(command.name)) {
+		if (["admin", "role", "kick", "rename", "purge", "toggle", "invite-token", "invite"].includes(command.name)) {
 			try {
+				if (command.name === "role") {
+					if (words.length !== 2 && words.length !== 3) throw { name: "invalid_params", message: `Usage: ${command.usage}` } satisfies ProtocolError;
+					this.role(socket, request, roomId, words[1], words[2]);
+					return;
+				}
 				// `/admin remove <user_id>` takes one more word than `/admin <user_id>`.
 				const revoke = command.name === "admin" && words[1] === "remove";
 				const target = revoke ? words[2] : words[1];
@@ -2500,7 +2521,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!this.store.identityExists(userId) && !this.connectionsOf(userId).length) {
 			throw { name: "invalid_params", message: `No user has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
 		}
-		const userIds = isBot(userId) ? [userId] : [userId, BOT_ID_PREFIX + userId];
+		const userIds = isBotId(userId) ? [userId] : [userId, BOT_ID_PREFIX + userId];
 		for (const id of userIds) {
 			for (const peer of this.connectionsOf(id)) {
 				const state = connectionAttachment(peer);
@@ -2511,7 +2532,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 		await this.runMutation(async () => {
 			purged = this.store.purgeUsers({ userIds, now: nowMs() });
 		});
-		for (const id of userIds) this.adminIds?.delete(id);
 		this.deleteMedia(purged.deletedUploads);
 		await this.forgetTokens(userIds);
 		const uploads = purged.deletedUploads.length;
@@ -2575,47 +2595,35 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}));
 	}
 
-	/** Whether a registered user may run the admin commands. */
-	private isAdmin(userId: string): boolean {
-		if (userId === ADMIN_USER_ID) return true;
-		this.adminIds ??= new Set(this.store.admins(nowMs()));
-		return this.adminIds.has(userId);
-	}
-
 	/**
-	 * A user's `roles` (§3.3), for display only: `admin` for those who may run
-	 * the admin commands, `bot` for bots (`/invite-bot`). Guests have none,
-	 * and need no storage read.
+	 * A connection's user as a current object (§3.3): `you`, `new`, and room
+	 * `users`. A registered user's carries `roles`, `[]` when the user has none
+	 * (§3.3: an empty value means cleared), so any current object clears a
+	 * role the user lost, even for a client that missed the `user`
+	 * notification. Guests carry no `roles`.
 	 */
-	private rolesOf(userId: string): string[] {
-		if (isBot(userId)) return ["bot"];
-		if (userId.startsWith("guest_")) return [];
-		try {
-			return this.isAdmin(userId) ? ["admin"] : [];
-		} catch {
-			// Display only: a failed read (an exhausted budget) shows no role
-			// rather than failing the sign-in or listing it decorates.
-			return [];
-		}
-	}
-
-	/** A current user object (§3.3) with the user's `roles`, when any. */
-	/**
-	 * A registered user's current object with `roles`, `[]` when the user has
-	 * none (§3.3: an empty value means cleared), so any current object (`you`,
-	 * `user`, room `users`) clears a role the user lost, even for a client
-	 * that missed the `user` notification. Guests carry no `roles`.
-	 */
-	private withRoles<T extends PublicUser>(user: T): T {
-		const { roles: _ignored, ...rest } = user;
-		void _ignored;
-		return { ...rest, roles: this.rolesOf(user.user_id) } as T;
-	}
-
-	/** A connection's user as a current object: `you`, `new`, and room `users` (§3.3), with roles. */
 	private current(attachment: ConnectionAttachment): PublicUser | null {
 		const user = currentUser(attachment);
-		return user && attachment.tier === "registered" ? this.withRoles(user) : user;
+		return user && attachment.tier === "registered" ? { ...user, roles: attachment.roles ?? [] } : user;
+	}
+
+	/**
+	 * A registered user's current object (§3.3) whether or not they are
+	 * connected: from a live connection, else their stored identity (one
+	 * read). Null for an unknown user.
+	 */
+	private currentOf(userId: string): { user: PublicUser; rooms: string[] } | null {
+		for (const peer of this.connectionsOf(userId)) {
+			const state = connectionAttachment(peer);
+			const user = state && !state.closing ? this.current(state) : null;
+			if (user) return { user, rooms: this.liveRoomsOf(userId) ?? state!.rooms ?? [] };
+		}
+		const stored = this.store.getIdentity(userId);
+		if (!stored) return null;
+		return {
+			user: { user_id: userId, ...(stored.name ? { name: stored.name } : {}), ...(stored.avatar ? { avatar: stored.avatar } : {}), roles: stored.roles },
+			rooms: stored.rooms,
+		};
 	}
 
 	/** Sends one connection a `~private` markdown notice in a room (Appendix A.1). */
@@ -2624,31 +2632,66 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `/admin <user_id>`: lists a registered user (not a bot or guest) as an
-	 * admin; `/admin remove <user_id>` takes that away (not from `admin`
+	 * `/admin <user_id>`: gives a registered user (not a bot or guest) the
+	 * `admin` role; `/admin remove <user_id>` takes it away (not from `admin`
 	 * itself). The sender gets a `~private` notice before the result (§1).
 	 */
 	private grantAdmin(socket: WebSocketConnection, request: RequestFrame, roomId: string, userId: string, remove = false): void {
-		if (userId === ADMIN_USER_ID) throw { name: "invalid_params", message: "The admin user is always an admin" } satisfies ProtocolError;
-		const changed = remove ? this.store.revokeAdmin({ userId, now: nowMs() }) : this.store.grantAdmin({ userId, now: nowMs() });
-		const who = `**${changed.name || userId}** (\`${userId}\`)`;
-		if (changed.added) {
-			if (remove) this.adminIds?.delete(userId);
-			else this.adminIds?.add(userId);
-			// A role change is a profile change (§3.3): `user` `you` to the
-			// user's connections and `new` to those who share a room with them,
-			// with `roles: []` when the last role went.
-			const connected = this.connectionsOf(userId)[0];
-			const state = connected ? connectionAttachment(connected) : null;
-			const stored = state ? null : this.store.getIdentity(userId);
-			const user = state ? currentUser(state) : stored ? { user_id: userId, ...(stored.name ? { name: stored.name } : {}), ...(stored.avatar ? { avatar: stored.avatar } : {}) } : null;
-			this.announceUser(null, user, state?.rooms ?? stored?.rooms ?? []);
-		}
+		const { changed, who } = this.changeRole(userId, "admin", !remove);
 		const text = remove
-			? (changed.added ? `${who} is no longer an admin.` : `${who} was not an admin.`)
-			: (changed.added ? `${who} is now an admin.` : `${who} is already an admin.`);
+			? (changed ? `${who} is no longer an admin.` : `${who} was not an admin.`)
+			: (changed ? `${who} is now an admin.` : `${who} is already an admin.`);
 		this.sendNotice(socket, roomId, text);
 		this.reply(socket, request, {});
+	}
+
+	/**
+	 * `/role <user_id>`: tells the sender a user's roles. `/role <user_id>
+	 * <role>` gives them the role, or takes it away when they have it. Any
+	 * role name is a label shown in `roles` (§3.3); `admin` also lets them run
+	 * the admin commands, and `bot` makes them a bot. The sender gets a
+	 * `~private` notice before the result (§1).
+	 */
+	private role(socket: WebSocketConnection, request: RequestFrame, roomId: string, target: string, requested?: string): void {
+		const userId = target.replace(/^@/, "");
+		if (requested === undefined) {
+			const identity = userId.startsWith("guest_") ? null : this.store.getIdentity(userId);
+			if (!identity) throw { name: "invalid_params", message: `No registered user has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
+			const who = `**${identity.name || userId}** (\`${userId}\`)`;
+			this.sendNotice(socket, roomId, identity.roles.length ? `${who} has the roles ${identity.roles.map((role) => `\`${role}\``).join(", ")}.` : `${who} has no roles.`);
+			this.reply(socket, request, {});
+			return;
+		}
+		const role = requested.toLowerCase();
+		const { changed, on, who } = this.changeRole(userId, role);
+		const text = on
+			? (changed ? `${who} now has the role \`${role}\`.` : `${who} already has the role \`${role}\`.`)
+			: (changed ? `${who} no longer has the role \`${role}\`.` : `${who} did not have the role \`${role}\`.`);
+		this.sendNotice(socket, roomId, text);
+		this.reply(socket, request, {});
+	}
+
+	/**
+	 * Gives a user a role, takes it away, or toggles it (Store.setRole). On a
+	 * change the user's connections keep the new roles, and it is announced:
+	 * a role change is a profile change (§3.3), `user` `you` to the user's
+	 * connections and `new` to those who share a room with them, with
+	 * `roles: []` when the last role went.
+	 */
+	private changeRole(userId: string, role: string, on?: boolean): { changed: boolean; on: boolean; who: string } {
+		const result = this.store.setRole({ userId, role, on, now: nowMs() });
+		const who = `**${result.name || userId}** (\`${userId}\`)`;
+		if (result.changed) {
+			for (const peer of this.connectionsOf(userId)) {
+				const state = connectionAttachment(peer);
+				if (!state) continue;
+				state.roles = result.roles;
+				writeAttachment(peer, state);
+			}
+			const current = this.currentOf(userId);
+			if (current) this.announceUser(null, current.user, current.rooms);
+		}
+		return { changed: result.changed, on: result.on, who };
 	}
 
 	/**
@@ -2708,7 +2751,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (from === ADMIN_USER_ID || to === ADMIN_USER_ID) throw { name: "invalid_params", message: "The admin user's user_id is fixed" } satisfies ProtocolError;
 		assertIssuableUserId(to);
 		const renamed = this.store.renameIdentity({ from, to, now: nowMs() });
-		if (this.adminIds?.delete(from)) this.adminIds.add(to);
 		await this.moveInviteToken(from, to);
 		for (const peer of this.connectionsOf(from)) {
 			const state = connectionAttachment(peer);
@@ -2716,7 +2758,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			state.userId = to;
 			writeAttachment(peer, state);
 		}
-		const identity = { user_id: to, ...(renamed.name ? { name: renamed.name } : {}) };
+		const identity = { user_id: to, ...(renamed.name ? { name: renamed.name } : {}), roles: renamed.roles };
 		const old = { user_id: from, ...(renamed.name ? { name: renamed.name } : {}) };
 		this.announceUser(null, identity, this.liveRoomsOf(to) ?? renamed.rooms, old);
 		this.sendNotice(socket, roomId, `Renamed \`${from}\` to \`${to}\`.`);
@@ -2829,7 +2871,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (state) this.closePolicy(peer, state, 1008, "Bot token replaced; sign in with the new one");
 		}
 		// Those who share a room with the bot see its new name (§3.3).
-		if (bot.renamed) this.announceUser(socket, { user_id: botId, name }, this.store.getIdentity(botId)?.rooms ?? []);
+		if (bot.renamed) {
+			const stored = this.store.getIdentity(botId);
+			this.announceUser(socket, { user_id: botId, name, roles: stored?.roles ?? ["bot"] }, stored?.rooms ?? []);
+		}
 		const endpoint = connectionAttachment(socket)?.endpoint ?? attachment.endpoint ?? "this server's WebSocket URL";
 		this.send(socket, {
 			method: "message",
@@ -2870,7 +2915,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const members = new Map<string, PublicUser[]>();
 		for (const roomId of new Set(roomIds)) {
 			const users = new Map<string, PublicUser>();
-			for (const member of stored.get(roomId) ?? []) users.set(member.user_id, this.withRoles(member));
+			for (const member of stored.get(roomId) ?? []) users.set(member.user_id, member);
 			for (const member of connected.get(roomId) ?? []) if (!users.has(member.user_id)) users.set(member.user_id, member);
 			members.set(roomId, sortedUsers(users.values()));
 			// A room past `roomListMembers` registered members lists only some of
@@ -2953,15 +2998,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Sends an identity change (§3.3): `you` to the user's other connections,
+	 * Sends an identity change (§3.3), `user` a current object (with `roles`
+	 * for a registered user): `you` to the user's other connections,
 	 * and `new` (with `old` when the `user_id` changed) to the connections of
 	 * everyone else who shares one of `rooms` with the user. Joins and leaves
 	 * are memberships, never `user` notifications (§4.3.2).
 	 */
 	private announceUser(origin: WebSocketConnection | null, user: PublicUser | null, rooms: readonly string[], old?: { user_id: string; name?: string } | null): void {
 		if (!user) return;
-		// A current object (§3.3): `roles` go with every identity change.
-		const identity = user.user_id.startsWith("guest_") ? user : this.withRoles(user);
+		const identity = user;
 		const shared = new Set(rooms);
 		for (const peer of this.ctx.getWebSockets()) {
 			const socket = peer as WebSocketConnection;
@@ -3205,7 +3250,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const stored = connected ? null : this.store.getIdentity(userId);
 		const name = connected?.name ?? stored?.name;
 		const rooms = this.liveRoomsOf(userId) ?? stored?.rooms ?? [];
-		this.announceUser(null, { user_id: userId, ...(name ? { name } : {}), avatar }, rooms);
+		const roles = connected?.roles ?? stored?.roles ?? [];
+		this.announceUser(null, { user_id: userId, ...(name ? { name } : {}), avatar, roles }, rooms);
 	}
 
 	/**

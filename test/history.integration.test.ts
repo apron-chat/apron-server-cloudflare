@@ -484,7 +484,7 @@ it("logs registered memberships in the room's log and returns them in history's 
 		register(store, clock, "reg_b", ["general", roomId, "no-such-room"]);
 		expect(store.getIdentity("reg_b")?.rooms).toEqual(["general", roomId]);
 		const members = store.roomMembers(["general", roomId, guestRoom.room!.room_id], 100, clock.value);
-		expect(members.get("general")).toEqual([{ user_id: "reg_a", name: "Name of reg_a" }, { user_id: "reg_b", name: "Name of reg_b" }]);
+		expect(members.get("general")).toEqual([{ user_id: "reg_a", name: "Name of reg_a", roles: [] }, { user_id: "reg_b", name: "Name of reg_b", roles: [] }]);
 		expect(members.get(roomId)?.map((member) => member.user_id)).toEqual(["reg_a", "reg_b"]);
 		expect(members.has(guestRoom.room!.room_id)).toBe(false);
 		expect(store.roomMembers([roomId], 1, clock.value).get(roomId)?.map((member) => member.user_id)).toEqual(["reg_a"]);

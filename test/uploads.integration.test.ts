@@ -176,7 +176,7 @@ describe('store uploads', () => {
 			const first = setAvatar();
 			expect(first.finished).toMatchObject({ accepted: true, broadcasts: [], avatar: { userId: 'erin', url: `${MEDIA}/${first.upload.key}` }, deletedUploads: [] });
 			expect(store.getIdentity('erin')!.avatar).toBe(`${MEDIA}/${first.upload.key}`);
-			expect(store.roomMembers(['general'], 10, clock.value).get('general')).toContainEqual({ user_id: 'erin', name: 'Name of erin', avatar: `${MEDIA}/${first.upload.key}` });
+			expect(store.roomMembers(['general'], 10, clock.value).get('general')).toContainEqual({ user_id: 'erin', name: 'Name of erin', avatar: `${MEDIA}/${first.upload.key}`, roles: [] });
 			// A new avatar replaces the old one, whose object goes.
 			const second = setAvatar();
 			expect(second.finished.deletedUploads).toEqual([first.upload.key]);
@@ -214,13 +214,12 @@ describe('store uploads', () => {
 			// A move re-logs every reaction set on the message in one record.
 			const thread = store.commitMutation({ userId: 'trent', ipKey: 'ip-trent', method: 'room_set', now: clock.value, params: { parent_room_id: 'general', title: 'T' }, identity: { user_id: 'trent' } });
 			post(store, clock, 'trent', { message_id: kept.result.message_id, room_id: thread.room!.room_id, body: { text: 'hello' } });
-			store.grantAdmin({ userId: 'mallory', now: clock.value });
+			store.setRole({ userId: 'mallory', role: 'admin', on: true, now: clock.value });
 			const before = store.countIdentities();
 
 			const purged = store.purgeUsers({ userIds: ['mallory', 'bot_mallory'], now: clock.value });
 			expect(purged).toEqual({ messages: 1, reactions: 1, deletedUploads: [writeOf(theirs.result).write.key] });
 			expect(store.getIdentity('mallory')).toBeNull();
-			expect(store.isAdmin('mallory', clock.value)).toBe(false);
 			expect(store.countIdentities()).toBe(before - 1);
 			const sql = state.storage.sql;
 			const records = sql.exec<{ kind: string; record_json: string }>('SELECT kind, record_json FROM records').toArray();

@@ -575,3 +575,90 @@ it('/admin remove takes the admin role away, announced with roles: [] (§3.3)', 
 		expect((await command(admin, 'builtin', '/admin remove admin')).frame.error.code).toBe(-32602);
 	} finally { admin.close(); demoted.close(); mate.close(); }
 });
+
+it('/role shows a user\'s roles and toggles one, any name a label, admin also the admin commands', async () => {
+	const admin = await signedInAdmin();
+	const userId = unique('labeled');
+	const labeled = await signedIn(userId);
+	const mate = await signedIn(unique('mate'));
+	try {
+		expect((await command(admin, 'help', '/help')).notice!.params.body.text).toContain('/role <user_id> [<role>]');
+		const who = `**Name of ${userId}** (\`${userId}\`)`;
+		expect((await command(admin, 'show-none', `/role ${userId}`)).notice!.params.body.text).toBe(`${who} has no roles.`);
+
+		const given = await command(admin, 'give', `/role @${userId} Friend`);
+		expect(given.frame.result).toEqual({});
+		expect(given.notice!.params.body.text).toBe(`${who} now has the role \`friend\`.`);
+		expect((await until(labeled, (frame) => frame.method === 'user')).frame.params).toEqual({ you: { user_id: userId, name: `Name of ${userId}`, roles: ['friend'] } });
+		expect((await until(mate, (frame) => frame.method === 'user' && frame.params.new?.user_id === userId)).frame.params.new.roles).toEqual(['friend']);
+		// A label grants nothing.
+		expect((await command(labeled, 'status-label', '/status')).frame.error.code).toBe(-32001);
+
+		// `admin` given with /role is the same as /admin.
+		await command(admin, 'give-admin', `/role ${userId} admin`);
+		expect((await command(labeled, 'status-admin', '/status')).frame.result).toEqual({});
+		expect((await command(admin, 'show', `/role ${userId}`)).notice!.params.body.text).toBe(`${who} has the roles \`friend\`, \`admin\`.`);
+		expect((await command(admin, 'show-admin', '/role admin')).notice!.params.body.text).toMatch(/has the roles `admin`\.$/);
+
+		// Toggling a held role takes it away.
+		expect((await command(admin, 'take', `/role ${userId} friend`)).notice!.params.body.text).toBe(`${who} no longer has the role \`friend\`.`);
+		await command(admin, 'take-admin', `/role ${userId} admin`);
+		const cleared = await until(labeled, (frame) => frame.method === 'user' && frame.params.you.roles.length === 0);
+		expect(cleared.frame.params.you.roles).toEqual([]);
+		expect((await command(labeled, 'status-after', '/status')).frame.error.code).toBe(-32001);
+
+		for (const [id, text] of [
+			['bad-name', `/role ${userId} no!pe`],
+			['guest', '/role guest_1 friend'],
+			['unknown', '/role nobody_123 friend'],
+			['builtin-admin', '/role admin admin'],
+			['builtin-bot', '/role admin bot'],
+		]) {
+			expect((await command(admin, `role-${id}`, text)).frame.error.code).toBe(-32602);
+		}
+		expect((await command(admin, 'usage', '/role')).frame.error.message).toBe('Usage: /role <user_id> [<role>]');
+		expect((await command(labeled, 'denied', `/role ${userId} friend`)).frame.error.message).toMatch(/Only an admin/);
+		expect(admin.closed()).toBeUndefined();
+	} finally { admin.close(); labeled.close(); mate.close(); }
+});
+
+it('/role <user_id> bot makes a token user a bot in full, but not a passkey holder or an admin', async () => {
+	const admin = await signedInAdmin();
+	const userId = unique('announcer');
+	const passkeyId = unique('person');
+	const person = await signedIn(passkeyId);
+	try {
+		const invited = await command(admin, 'invite', `/invite-token ${userId}`);
+		const token = invited.notice!.params.body.text.match(/```\n(apron_invite_[A-Za-z0-9_-]{43})\n```/)![1];
+		const bot = await connect(null);
+		await bot.next();
+		expect((await request(bot, 'auth', 'auth', { scheme: 'token', token })).result.you.roles).toEqual([]);
+
+		expect((await command(admin, 'make-bot', `/role ${userId} bot`)).notice!.params.body.text).toMatch(/now has the role `bot`/);
+		expect((await until(bot, (frame) => frame.method === 'user')).frame.params.you.roles).toEqual(['bot']);
+		// It acts as a bot: no passkey, no commands for owners, a fixed name and user_id, and never an admin.
+		expect((await command(bot, 'invite-bot', '/invite-bot')).frame.error.message).toBe("A bot can't use /invite-bot");
+		expect((await request(bot, 'rename-self', 'me', { name: 'Other' })).error.code).toBe(-32001);
+		expect((await request(bot, 'passkey', 'auth', { scheme: 'webauthn', action: 'register', step: 'begin' })).error.code).toBe(-32001);
+		expect((await command(admin, 'bot-admin', `/admin ${userId}`)).frame.error.message).toBe("A bot can't be an admin");
+		expect((await command(admin, 'bot-rename', `/rename ${userId} ${unique('moved')}`)).frame.error.message).toBe("A bot's user_id is fixed");
+		const posted = await exchange(bot, 'post', 'message', { room_id: 'general', body: { text: 'beep' } });
+		expect(posted.frame.result.message_id).toBeDefined();
+
+		// A user who holds a passkey, or an admin, can't be made a bot.
+		expect((await command(admin, 'passkey-bot', `/role ${passkeyId} bot`)).frame.error.code).toBe(-32602);
+		await command(admin, 'invite-2', `/invite-token ${unique('second')}`);
+		const adminId = unique('boss');
+		await command(admin, 'invite-3', `/invite-token ${adminId}`);
+		await command(admin, 'boss', `/admin ${adminId}`);
+		expect((await command(admin, 'admin-bot', `/role ${adminId} bot`)).frame.error.code).toBe(-32602);
+		// An owner's bot is always one.
+		expect((await command(admin, 'owner-bot', '/role bot_nobody bot')).frame.error.code).toBe(-32602);
+
+		// Taking the role away makes it an ordinary user again.
+		await command(admin, 'unmake-bot', `/role ${userId} bot`);
+		expect((await until(bot, (frame) => frame.method === 'user' && frame.params.you !== undefined)).frame.params.you.roles).toEqual([]);
+		expect((await request(bot, 'rename-after', 'me', { name: 'Other' })).result.you.name).toBe('Other');
+		bot.close();
+	} finally { admin.close(); person.close(); }
+});
