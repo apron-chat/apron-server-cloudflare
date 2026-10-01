@@ -254,7 +254,8 @@ above: two Durable Object requests and one Worker request each, at most
 ## Push
 
 Mentions wake registered users through Web Push (protocol §4.7, push kind
-`webpush`; see [SPEC section 4.4](../SPEC.md#44-push)). Both plans have a
+`webpush`, with the client's optional registration `tag` in each push; see
+[SPEC section 4.4](../SPEC.md#44-push)). Both plans have a
 `push` policy, set in `src/plans/free.ts` with Paid's daily cap raised in
 `src/plans/paid.ts`:
 

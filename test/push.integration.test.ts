@@ -39,10 +39,10 @@ async function signedIn(userId: string, existing = false): Promise<Peer> {
 }
 
 /** A browser subscription for `push.example.net`, registered over `peer`. */
-async function subscribe(peer: Peer, name: string): Promise<{ url: string; browser: TestBrowser }> {
+async function subscribe(peer: Peer, name: string, tag?: string): Promise<{ url: string; browser: TestBrowser }> {
 	const browser = await testBrowser();
 	const url = `https://push.example.net/send/${name}-${crypto.randomUUID()}`;
-	const reply = await request(peer, `subscribe-${name}`, 'push_register', { kind: 'webpush', url, keys: { p256dh: browser.p256dh, auth: browser.auth } });
+	const reply = await request(peer, `subscribe-${name}`, 'push_register', { kind: 'webpush', url, keys: { p256dh: browser.p256dh, auth: browser.auth }, ...(tag !== undefined ? { tag } : {}) });
 	expect(reply.result).toEqual({});
 	return { url, browser };
 }
@@ -131,6 +131,9 @@ describe('push over the socket', () => {
 			['a p256dh off the curve', { kind: 'webpush', url: 'https://push.example.net/x', keys: { ...keys, p256dh: offCurve } }],
 			['a long auth', { kind: 'webpush', url: 'https://push.example.net/x', keys: { ...keys, auth: `${keys.auth}AAAA` } }],
 			['a non-base64url auth', { kind: 'webpush', url: 'https://push.example.net/x', keys: { ...keys, auth: 'a+b/c'.repeat(4) } }],
+			// 33 code points, but 66 UTF-8 bytes: past the 64-byte tag.
+			['a tag past 64 bytes', { kind: 'webpush', url: 'https://push.example.net/x', keys, tag: 'é'.repeat(33) }],
+			['a tag that is not a string', { kind: 'webpush', url: 'https://push.example.net/x', keys, tag: 7 }],
 		];
 		// Two bad requests per connection, below the repeated-violation close.
 		for (let index = 0; index < cases.length; index += 2) {
@@ -146,8 +149,8 @@ describe('push over the socket', () => {
 		const userId = unique('rosa');
 		const peer = await signedIn(userId);
 		try {
-			const { url } = await subscribe(peer, 'rosa');
-			expect((await subscriptionsOf(userId)).map((row) => row.url)).toEqual([url]);
+			const { url } = await subscribe(peer, 'rosa', 'é'.repeat(32));
+			expect((await subscriptionsOf(userId)).map((row) => [row.url, row.tag])).toEqual([[url, 'é'.repeat(32)]]);
 			// Unregistering removes it; an unknown url is already gone.
 			expect((await request(peer, 'unregister', 'push_unregister', { url })).result).toEqual({});
 			expect((await request(peer, 'unregister-again', 'push_unregister', { url })).result).toEqual({});
@@ -213,7 +216,7 @@ describe('push over the socket', () => {
 		const dave = await signedIn(daveId);
 		try {
 			const bobSub = await subscribe(bob, 'bob');
-			const carolSub = await subscribe(carol, 'carol');
+			const carolSub = await subscribe(carol, 'carol', 'carol-phone');
 			const daveSub = await subscribe(dave, 'dave');
 			// Alice's own subscription is never woken by her own mention.
 			await subscribe(alice, 'alice');
@@ -234,9 +237,12 @@ describe('push over the socket', () => {
 			// The message without log_id, format or embeds, its text cut to 200 code points.
 			const payload = JSON.parse((await decryptPush(carolPush.body, carolSub.browser)).plaintext);
 			expect(payload).toEqual({
-				message_id: first.result.message_id, room_id: 'general', from: { user_id: aliceId, name: `Name of ${aliceId}` },
+				message_id: first.result.message_id, room_id: 'general', tag: 'carol-phone', from: { user_id: aliceId, name: `Name of ${aliceId}` },
 				body: { text: `${'é'.repeat(199)}…`, mentions: [bobId, carolId, aliceId, daveId, 'guest_1'] },
 			});
+			// Dave registered without a tag: his payload has none.
+			const davePush = pushes.find((push) => push.url === daveSub.url)!;
+			expect(JSON.parse((await decryptPush(davePush.body, daveSub.browser)).plaintext)).not.toHaveProperty('tag');
 
 			// Edits, retries, and commands wake no one; a message from Carol ends her away.
 			pushes.length = 0;
@@ -328,6 +334,14 @@ describe('push subscriptions in the store', () => {
 			expect(urls).toHaveLength(POLICY.subscriptionsPerUser);
 			expect(urls[0]).toBe(url(99));
 			expect(urls).not.toContain(url(0));
+			// A changed tag is a change, even within a day; an absent one removes it.
+			store.registerPushSubscription({ userId: 'ann', url: url(1), ...keys, tag: 'one', now: clock.value });
+			expect(store.pushSubscriptionsOf('ann').find((row) => row.url === url(1))?.tag).toBe('one');
+			store.registerPushSubscription({ userId: 'ann', url: url(1), ...keys, tag: 'two', now: clock.value });
+			expect(store.pushSubscriptionsOf('ann').find((row) => row.url === url(1))?.tag).toBe('two');
+			store.registerPushSubscription({ userId: 'ann', url: url(1), ...keys, now: clock.value });
+			expect(store.pushSubscriptionsOf('ann').find((row) => row.url === url(1))).not.toHaveProperty('tag');
+			expect(() => store.registerPushSubscription({ userId: 'ann', url: url(1), ...keys, tag: 'x'.repeat(65) })).toThrow(/tag/);
 			// Ben's browser presents Ann's endpoint: it is his now.
 			store.registerPushSubscription({ userId: 'ben', url: url(99), ...keys, now: clock.value });
 			expect(store.pushSubscriptionsOf('ben').map((row) => row.url)).toEqual([url(99)]);
@@ -363,14 +377,15 @@ describe('push subscriptions in the store', () => {
 		});
 	});
 
-	it('moves subscriptions with /rename and deletes them with /purge', async () => {
+	it('moves subscriptions with /rename, tags kept, and deletes them with /purge', async () => {
 		const keys = await browserKeys();
 		await withStore('push-rename', config, (store, clock) => {
 			registerUser(store, clock, 'eve');
-			store.registerPushSubscription({ userId: 'eve', url: 'https://push.example.net/eve', ...keys, now: clock.value });
+			store.registerPushSubscription({ userId: 'eve', url: 'https://push.example.net/eve', ...keys, tag: 'eve-laptop', now: clock.value });
 			store.renameIdentity({ from: 'eve', to: 'eva', now: clock.value });
 			expect(store.pushSubscriptionsOf('eve')).toEqual([]);
-			expect(store.pushSubscriptionsOf('eva')).toEqual([{ url: 'https://push.example.net/eve', userId: 'eva', ...keys }]);
+			// The tag stays with the registration.
+			expect(store.pushSubscriptionsOf('eva')).toEqual([{ url: 'https://push.example.net/eve', userId: 'eva', ...keys, tag: 'eve-laptop' }]);
 			expect(store.claimPushes({ userIds: ['eva'], now: clock.value }).subscriptions).toHaveLength(1);
 			store.purgeUsers({ userIds: ['eva'], now: clock.value });
 			expect(store.pushSubscriptionsOf('eva')).toEqual([]);

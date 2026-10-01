@@ -285,8 +285,10 @@ independent.
 
 With Web Push on (protocol §4.7), `push_register` is one frame plus the
 subscription register above: about 6 writes the first time, and 2 for
-the reservation alone when a client registers the same subscription on
-its next connection within a day, which writes nothing. Its reservation is
+the reservation alone when a client registers the same subscription (keys
+and tag) on its next connection within a day, which writes nothing. These
+were measured with a 64-byte `tag`, the longest allowed; a tag changes row
+bytes, not row counts. Its reservation is
 sized for evicting a user's whole index range under any valid policy (64
 subscriptions), which the credit-back returns. Choosing whom a new message
 wakes reads connection attachments only; the wake claim then reads each

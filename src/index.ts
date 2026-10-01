@@ -28,6 +28,7 @@ import {
 	ADMIN_USER_ID,
 	DEFAULT_JOINED_ROOMS,
 	MAX_PASSKEYS_PER_USER,
+	MAX_PUSH_TAG_BYTES,
 	MAX_PUSH_URL_BYTES,
 	MAX_ROLES_PER_USER,
 	ROLE_PATTERN,
@@ -668,16 +669,20 @@ function pushEndpointError(value: string): string | null {
 const PUSH_TEXT_CODE_POINTS = 200;
 
 /**
- * What a push carries (§4.7): the message without `log_id`, with its text
- * cut to PUSH_TEXT_CODE_POINTS and without `format`, `embeds`, `ext`, or the
- * server's `prev_*` links. `mentions` stay while the whole fits one push.
+ * What a push carries (§4.7): the message without `log_id`, with the
+ * registration's `tag`, its text cut to PUSH_TEXT_CODE_POINTS, and without
+ * `format`, `embeds`, `ext`, or the server's `prev_*` links. `mentions` stay
+ * while the whole fits one push; without them it always fits, since the tag,
+ * names, ids and cut text are bounded well under it.
  */
-function pushPayload(message: MessageSnapshot): string {
+function pushPayload(message: MessageSnapshot, tag?: string): string {
 	const body = message.body ?? {};
 	const points = typeof body.text === "string" ? [...body.text] : [];
 	const text = points.length > PUSH_TEXT_CODE_POINTS ? points.slice(0, PUSH_TEXT_CODE_POINTS - 1).join("") + "…" : points.join("");
 	const base = {
-		message_id: message.message_id, room_id: message.room_id, from: message.from,
+		message_id: message.message_id, room_id: message.room_id,
+		...(tag !== undefined ? { tag } : {}),
+		from: message.from,
 		...(message.reply_to ? { reply_to: message.reply_to } : {}),
 	};
 	if (Array.isArray(body.mentions)) {
@@ -2331,8 +2336,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * `push_register` (§4.7) for push kind `webpush`: `{kind: "webpush", url,
-	 * keys: {p256dh, auth}}`, the browser's `PushSubscription.toJSON()` with
-	 * `kind` added (`expirationTime` is ignored). Registered users only; a
+	 * keys: {p256dh, auth}, tag?}`, the browser's `PushSubscription.toJSON()`
+	 * with `kind` added (`expirationTime` is ignored). `tag`, at most 64 bytes,
+	 * goes into every push to this registration. Registered users only; a
 	 * guest's identity lasts one connection, so there is no one to wake. The
 	 * endpoint must be a public `https` URL (pushEndpointError), `p256dh` an
 	 * uncompressed P-256 point and `auth` 16 bytes, both base64url. Registering
@@ -2345,6 +2351,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const kind = requiredString(params, "kind");
 		if (kind !== "webpush") throw { name: "invalid_params", message: "Unknown push kind; this server offers webpush" } satisfies ProtocolError;
 		const url = requiredString(params, "url");
+		const tag = optionalString(params, "tag");
+		if (tag !== undefined && utf8Bytes(tag) > MAX_PUSH_TAG_BYTES) throw { name: "invalid_params", message: `tag is at most ${MAX_PUSH_TAG_BYTES} bytes` } satisfies ProtocolError;
 		const problem = pushEndpointError(url);
 		if (problem) throw { name: "invalid_params", message: problem } satisfies ProtocolError;
 		const keys = objectParam(params, "keys")!;
@@ -2358,7 +2366,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// The key check awaited: register for the connection as it is now (a /rename may have moved it).
 		const current = connectionAttachment(socket);
 		if (!current || current.closing || current.tier !== "registered" || !current.userId) return;
-		this.store.registerPushSubscription({ userId: current.userId, url, p256dh: base64UrlEncode(p256dh), auth: base64UrlEncode(auth), now: nowMs() });
+		this.store.registerPushSubscription({ userId: current.userId, url, p256dh: base64UrlEncode(p256dh), auth: base64UrlEncode(auth), ...(tag !== undefined ? { tag } : {}), now: nowMs() });
 		this.reply(socket, request, {});
 	}
 
@@ -2402,16 +2410,24 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return;
 		}
 		if (claimed.skipped) console.warn(JSON.stringify({ event: "push_daily_budget_reached", skipped: claimed.skipped }));
-		if (claimed.subscriptions.length) this.ctx.waitUntil(this.deliverPushes(claimed.subscriptions, pushPayload(message), vapid, policy.ttlSeconds));
+		if (claimed.subscriptions.length) this.ctx.waitUntil(this.deliverPushes(claimed.subscriptions, message, vapid, policy.ttlSeconds));
 	}
 
 	/**
-	 * Sends one payload to each subscription at once, and forgets those whose
-	 * push service says they are gone (404 or 410). Other failures are only
-	 * logged: the push is lost, not retried.
+	 * Pushes a message to each subscription at once, each payload carrying
+	 * that registration's `tag`, and forgets those whose push service says
+	 * they are gone (404 or 410). Other failures are only logged: the push is
+	 * lost, not retried.
 	 */
-	private async deliverPushes(subscriptions: readonly PushSubscriptionRecord[], payload: string, vapid: VapidKeys, ttlSeconds: number): Promise<void> {
-		const outcomes = await Promise.allSettled(subscriptions.map((subscription) => sendWebPush(subscription, payload, vapid, { ttlSeconds, urgency: "normal", nowMs: nowMs() })));
+	private async deliverPushes(subscriptions: readonly PushSubscriptionRecord[], message: MessageSnapshot, vapid: VapidKeys, ttlSeconds: number): Promise<void> {
+		const payloads = new Map<string | undefined, string>();
+		const payloadFor = (tag: string | undefined): string => {
+			let payload = payloads.get(tag);
+			if (payload === undefined) payloads.set(tag, payload = pushPayload(message, tag));
+			return payload;
+		};
+		const outcomes = await Promise.allSettled(subscriptions.map((subscription) =>
+			sendWebPush(subscription, payloadFor(subscription.tag), vapid, { ttlSeconds, urgency: "normal", nowMs: nowMs() })));
 		const gone: string[] = [];
 		let failed = 0;
 		outcomes.forEach((outcome, index) => {

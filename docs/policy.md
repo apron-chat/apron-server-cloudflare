@@ -82,14 +82,16 @@ within it:
   (such as location) before uploading: the server stores the bytes as sent.
 - Push (`server.push` kind `webpush`, where VAPID keys are set): registered
   users register a browser's push subscription with `push_register`
-  `{kind: "webpush", url, keys: {p256dh, auth}}` (its `PushSubscription` JSON
-  with `kind` added), at most 5 each; guests cannot. Endpoints must be public
+  `{kind: "webpush", url, keys: {p256dh, auth}, tag?}` (its `PushSubscription`
+  JSON with `kind` and an optional tag of at most 64 bytes added), at most 5
+  each; guests cannot. Endpoints must be public
   `https` hosts, not IP literals or internal names. A new message that
   mentions a user wakes them by push only when none of their connections is
   attended (every one away, stale, or closed), at most 10 users a message and
   5,000 pushes a day in all (see
   [SPEC section 4.4](../SPEC.md#44-push)). The push carries the message
-  without `log_id`, its text cut to 200 characters, without format or embeds.
+  without `log_id`, with the registration's tag, its text cut to 200
+  characters, without format or embeds.
 - Messages: a request without `room_id` is in `general`. A new message with
   empty text and no embeds is not logged and returns `{}`; an empty save is
   `invalid_params` (delete instead). `body.mentions` is stored as sent, and

@@ -775,12 +775,23 @@ export const MAX_PUSH_URL_BYTES = 1024;
 /** A re-registration of an unchanged subscription younger than this writes nothing. */
 const PUSH_REFRESH_MS = 86_400_000;
 
-/** A Web Push subscription (protocol §4.7, kind `webpush`): its endpoint and the browser's keys. */
+/** Longest push `tag` a registration may carry (protocol §4.7). */
+export const MAX_PUSH_TAG_BYTES = 64;
+
+/**
+ * A Web Push subscription (protocol §4.7, kind `webpush`): its endpoint, the
+ * browser's keys, and the client's `tag`, which every push to it carries.
+ */
 export interface PushSubscriptionRecord {
   url: string;
   userId: string;
   p256dh: string;
   auth: string;
+  tag?: string;
+}
+
+function pushRecord(row: { url: string; p256dh: string; auth: string; tag: string | null }, userId: string): PushSubscriptionRecord {
+  return { url: row.url, userId, p256dh: row.p256dh, auth: row.auth, ...(row.tag !== null ? { tag: row.tag } : {}) };
 }
 
 /** Rows one guest-number block reservation may read and write, before control overhead. */
@@ -1045,7 +1056,7 @@ function ensureText(value: unknown, field: string, maxBytes: number): string {
  * guest identity itself, and are not logged. `uploads` lists the objects
  * written to R2 (protocol §4.6.3): attached files by message and embed, and
  * avatars, by owner, expiry, and pending write. `push_subscriptions` holds
- * registered users' Web Push endpoints (protocol §4.7), keyed by the endpoint
+ * registered users' Web Push endpoints and tags (protocol §4.7), keyed by the endpoint
  * and indexed by user, most recently registered last.
  */
 const SCHEMA_DDL = `
@@ -1146,6 +1157,7 @@ const SCHEMA_DDL = `
     user_id TEXT NOT NULL,
     p256dh TEXT NOT NULL,
     auth TEXT NOT NULL,
+    tag TEXT,
     created_ms INTEGER NOT NULL,
     updated_ms INTEGER NOT NULL
   );
@@ -1489,6 +1501,7 @@ export class Store {
           user_id TEXT NOT NULL,
           p256dh TEXT NOT NULL,
           auth TEXT NOT NULL,
+          tag TEXT,
           created_ms INTEGER NOT NULL,
           updated_ms INTEGER NOT NULL
         );
@@ -4169,14 +4182,16 @@ export class Store {
    * replaces it, whoever held it: the endpoint belongs to one browser, and
    * whoever presents it now is who that browser is signed in as. A user past
    * `subscriptionsPerUser` loses the least recently registered of the others.
-   * Clients register on every connection, so an unchanged subscription
-   * registered again within a day writes nothing.
+   * The registration's `tag` is replaced too, and removed when absent.
+   * Clients register on every connection, so an unchanged subscription (keys
+   * and tag) registered again within a day writes nothing.
    */
-  registerPushSubscription(input: { userId: string; url: string; p256dh: string; auth: string; now?: number }): void {
+  registerPushSubscription(input: { userId: string; url: string; p256dh: string; auth: string; tag?: string; now?: number }): void {
     this.ensureReady();
     const policy = this.config.push;
     if (!policy) throw new StoreError("unsupported", "Push is not available here");
     if (utf8Bytes(input.url) > MAX_PUSH_URL_BYTES) throw new StoreError("too_large", "url is too long");
+    if (input.tag !== undefined && utf8Bytes(input.tag) > MAX_PUSH_TAG_BYTES) throw new StoreError("invalid_params", `tag is at most ${MAX_PUSH_TAG_BYTES} bytes`);
     const now = input.now ?? this.clock.now();
     // The url's row and the user's index range; each eviction rewrites a row
     // and its index entry.
@@ -4184,17 +4199,18 @@ export class Store {
     this.reserved({ reads: 32 + 2 * rows, writes: 32 + 4 * rows }, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       if (!this.identityRow(input.userId)) throw new StoreError("denied", "Sign in to receive push notifications");
-      const existing = this.rawRows<{ user_id: string; p256dh: string; auth: string; updated_ms: number }>(
-        "SELECT user_id, p256dh, auth, updated_ms FROM push_subscriptions WHERE url = ? LIMIT 1",
+      const tag = input.tag ?? null;
+      const existing = this.rawRows<{ user_id: string; p256dh: string; auth: string; tag: string | null; updated_ms: number }>(
+        "SELECT user_id, p256dh, auth, tag, updated_ms FROM push_subscriptions WHERE url = ? LIMIT 1",
         input.url,
       )[0];
-      if (existing && existing.user_id === input.userId && existing.p256dh === input.p256dh && existing.auth === input.auth &&
+      if (existing && existing.user_id === input.userId && existing.p256dh === input.p256dh && existing.auth === input.auth && existing.tag === tag &&
           effective - integerColumn(existing.updated_ms) < PUSH_REFRESH_MS) return;
       if (!existing) this.ensureGrowthCapacity(2 * MAX_PUSH_URL_BYTES);
       this.rawExec(
-        `INSERT INTO push_subscriptions (url, user_id, p256dh, auth, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT (url) DO UPDATE SET user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth, updated_ms = excluded.updated_ms`,
-        input.url, input.userId, input.p256dh, input.auth, effective, effective,
+        `INSERT INTO push_subscriptions (url, user_id, p256dh, auth, tag, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (url) DO UPDATE SET user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth, tag = excluded.tag, updated_ms = excluded.updated_ms`,
+        input.url, input.userId, input.p256dh, input.auth, tag, effective, effective,
       );
       // The new one never goes, even when it shares its millisecond with others.
       this.rawExec(
@@ -4218,11 +4234,11 @@ export class Store {
   /** A user's push subscriptions, most recently registered first. */
   pushSubscriptionsOf(userId: string, now = this.clock.now()): PushSubscriptionRecord[] {
     this.ensureReady();
-    return this.reserved({ reads: 8 + 2 * MAX_PUSH_SUBSCRIPTIONS_PER_USER }, false, now, () => this.rawRows<{ url: string; p256dh: string; auth: string }>(
-      `SELECT url, p256dh, auth FROM push_subscriptions INDEXED BY push_subscriptions_user_idx
+    return this.reserved({ reads: 8 + 2 * MAX_PUSH_SUBSCRIPTIONS_PER_USER }, false, now, () => this.rawRows<{ url: string; p256dh: string; auth: string; tag: string | null }>(
+      `SELECT url, p256dh, auth, tag FROM push_subscriptions INDEXED BY push_subscriptions_user_idx
        WHERE user_id = ? ORDER BY updated_ms DESC LIMIT ?`,
       userId, MAX_PUSH_SUBSCRIPTIONS_PER_USER,
-    ).map((row) => ({ url: row.url, userId, p256dh: row.p256dh, auth: row.auth })));
+    ).map((row) => pushRecord(row, userId)));
   }
 
   /**
@@ -4242,12 +4258,12 @@ export class Store {
       const effective = this.effectiveNow(now);
       const found: PushSubscriptionRecord[] = [];
       for (const userId of userIds) {
-        const rows = this.rawRows<{ url: string; p256dh: string; auth: string }>(
-          `SELECT url, p256dh, auth FROM push_subscriptions INDEXED BY push_subscriptions_user_idx
+        const rows = this.rawRows<{ url: string; p256dh: string; auth: string; tag: string | null }>(
+          `SELECT url, p256dh, auth, tag FROM push_subscriptions INDEXED BY push_subscriptions_user_idx
            WHERE user_id = ? ORDER BY updated_ms DESC LIMIT ?`,
           userId, policy.subscriptionsPerUser,
         );
-        for (const row of rows) found.push({ url: row.url, userId, p256dh: row.p256dh, auth: row.auth });
+        for (const row of rows) found.push(pushRecord(row, userId));
       }
       if (!found.length) return { subscriptions: found, skipped: 0 };
       // Reuse posts_day as the day's push count; the scope separates it.
