@@ -2369,7 +2369,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 				}
 				// `/admin remove <user_id>` takes one more word than `/admin <user_id>`.
 				const revoke = command.name === "admin" && words[1] === "remove";
-				const target = revoke ? words[2] : words[1];
+				// A user may be written `@user_id`, as a client's mention sends it (Appendix A.3).
+				const target = (revoke ? words[2] : words[1])?.replace(/^@/, "");
 				const argumentCount = command.name === "rename" || revoke ? 2 : 1;
 				if (!target || words.length !== argumentCount + 1) throw { name: "invalid_params", message: `Usage: ${command.usage}` } satisfies ProtocolError;
 				if (command.name === "admin") this.grantAdmin(socket, request, roomId, target, revoke);
@@ -2378,7 +2379,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				else if (command.name === "toggle") this.toggle(socket, request, roomId, target);
 				else if (command.name === "invite-token") await this.inviteToken(socket, attachment, request, roomId, target);
 				else if (command.name === "invite") await this.invite(socket, request, roomId, target);
-				else await this.rename(socket, request, roomId, target, words[2]);
+				else await this.rename(socket, request, roomId, target, words[2].replace(/^@/, ""));
 			} catch (error) {
 				// A mistyped or wrong user_id is an error to show, like an unknown
 				// command, not a policy violation.
