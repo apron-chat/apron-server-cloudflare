@@ -28,6 +28,8 @@ export interface StoredIdentity {
 	rooms: string[];
 	/** The identity's avatar while it lasts (protocol §4.6.6). */
 	avatar?: string;
+	/** The identity's roles (protocol §3.3), kept in its row: `admin`, `bot`, or labels. */
+	roles: string[];
 }
 
 export interface DedupRecord {

@@ -1,12 +1,12 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
 import { BOOTSTRAP_ROW_RESERVATION } from '../src/budget';
-import { MAX_CARRIED_PASSKEYS, SCHEMA_VERSION, UPGRADABLE_SCHEMA_VERSION, type Store } from '../src/store';
+import { MAX_CARRIED_PASSKEYS, SCHEMA_VERSION, UPGRADABLE_SCHEMA_VERSIONS, type Store } from '../src/store';
 
 type Runtime = { store: Store };
 
-// Schema 5 is upgraded in place (below); older and newer schemas are reset.
-for (const storedVersion of [UPGRADABLE_SCHEMA_VERSION - 1, SCHEMA_VERSION + 1]) {
+// Schemas 5 and 6 are upgraded in place (below); older and newer schemas are reset.
+for (const storedVersion of [Math.min(...UPGRADABLE_SCHEMA_VERSIONS) - 1, SCHEMA_VERSION + 1]) {
 	it(`resets populated storage at schema ${storedVersion} to a fresh schema ${SCHEMA_VERSION} store`, async () => {
 		const stub = env.DEMO.getByName(`schema-reset-${storedVersion}-${crypto.randomUUID()}`);
 		const day = new Date().toISOString().slice(0, 10);
@@ -29,7 +29,13 @@ for (const storedVersion of [UPGRADABLE_SCHEMA_VERSION - 1, SCHEMA_VERSION + 1])
 			// Should `admin` ever hold a passkey, a reset does not carry it.
 			state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES ('admin', 'admin-handle', 'Admin', 'registered', 1, 1)");
 			state.storage.sql.exec("INSERT INTO credentials (credential_id, user_id, public_key_json, sign_count, transports_json, created_ms, updated_ms) VALUES ('cred-admin', 'admin', '{\"publicKey\":\"AAAA\"}', 0, NULL, ?, ?)", Date.now() + 5_000, Date.now() + 5_000);
-			state.storage.sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('admins', ?)", JSON.stringify(['user_before_reset', 'gone_user']));
+			if (storedVersion < SCHEMA_VERSION) {
+				// An older schema has no roles column, and lists its admins in `_meta`.
+				state.storage.sql.exec('ALTER TABLE identities DROP COLUMN roles_json');
+				state.storage.sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('admins', ?)", JSON.stringify(['user_before_reset', 'gone_user']));
+			} else {
+				state.storage.sql.exec(`UPDATE identities SET roles_json = '["admin","friend"]' WHERE user_id = 'user_before_reset'`);
+			}
 			await state.storage.put('session:stale', { v: 1, userId: 'user_before_reset', origin: 'http://localhost:5173', expiresMs: Date.now() + 60_000 });
 			state.storage.sql.exec("UPDATE _meta SET value = ? WHERE key = 'schema_version'", String(storedVersion));
 			state.storage.sql.exec("UPDATE _meta SET value = '1' WHERE key = 'accounting_unsafe'");
@@ -52,9 +58,9 @@ for (const storedVersion of [UPGRADABLE_SCHEMA_VERSION - 1, SCHEMA_VERSION + 1])
 			expect(store.getIdentity('bot_x')).toBeNull();
 			expect(store.getCredential('cred-admin')).toBeNull();
 			expect(store.getIdentity('admin')).toBeNull();
-			// Users whose passkeys were carried keep their roles; the old admin list becomes `admin` roles.
-			expect(store.roles().get('user_before_reset')).toEqual(['admin']);
-			expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'roles'").one().value).toBe('{"user_before_reset":["admin"]}');
+			// Users whose passkeys were carried keep their roles (an older schema's admin list as `admin`).
+			expect(store.getIdentity('user_before_reset')?.roles).toEqual(storedVersion < SCHEMA_VERSION ? ['admin'] : ['admin', 'friend']);
+			expect(store.getIdentity('user_left_general')?.roles).toEqual([]);
 			expect(sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM _meta WHERE key = 'admins'").one().n).toBe(0);
 			expect(sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM message_state').one().n).toBe(0);
 			expect((await state.storage.list({ prefix: 'session:' })).size).toBe(0);
@@ -63,6 +69,7 @@ for (const storedVersion of [UPGRADABLE_SCHEMA_VERSION - 1, SCHEMA_VERSION + 1])
 			expect(store.listRooms()).toEqual([general]);
 			expect(store.getIdentity('user_before_reset')).toEqual({
 				userId: 'user_before_reset', name: 'Before', userHandle: 'handle', credentialCount: 1, rooms: ['general'],
+				roles: storedVersion < SCHEMA_VERSION ? ['admin'] : ['admin', 'friend'],
 			});
 			expect(store.getIdentity('user_left_general')?.rooms).toEqual([]);
 			// The accounting latch does not survive, so the fresh store is usable.
@@ -112,7 +119,7 @@ it(`carries at most ${MAX_CARRIED_PASSKEYS} passkeys across a reset, most recent
 	});
 });
 
-it(`upgrades a schema ${UPGRADABLE_SCHEMA_VERSION} store in place: intro messages become descriptions, and nothing else is lost`, async () => {
+it('upgrades a schema 5 store in place: intro messages become descriptions, and nothing else is lost', async () => {
 	const stub = env.DEMO.getByName(`schema-upgrade-${crypto.randomUUID()}`);
 	const day = new Date().toISOString().slice(0, 10);
 	const now = Date.now();
@@ -147,6 +154,8 @@ it(`upgrades a schema ${UPGRADABLE_SCHEMA_VERSION} store in place: intro message
 		// member_count, and logged room records embed the intro's snapshot.
 		const snapshotOf = (text: string, messageId: string) => ({ message_id: messageId, log_id: messageId, room_id: 'general', from: identity, body: { text, format: 'plain' } });
 		sql.exec('ALTER TABLE rooms ADD COLUMN intro_message_id TEXT');
+		// Nor roles (schema 7).
+		sql.exec('ALTER TABLE identities DROP COLUMN roles_json');
 		sql.exec('ALTER TABLE rooms DROP COLUMN member_count');
 		// Schema 5 allowed one passkey per identity.
 		sql.exec('ALTER TABLE credentials RENAME TO credentials_old');
@@ -235,11 +244,52 @@ it(`upgrades a schema ${UPGRADABLE_SCHEMA_VERSION} store in place: intro message
 		expect(budget.maintenance_writes).toBeGreaterThan(fixture.budget.maintenance_writes);
 	});
 
-	// A later wake finds schema 6 and changes nothing.
+	// A later wake finds the current schema and changes nothing.
 	await evictDurableObject(stub);
 	await runInDurableObject(stub, (instance, state) => {
 		const { store } = instance as unknown as Runtime;
 		expect(store.requiresReset()).toBe(false);
 		expect(state.storage.sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
+	});
+});
+
+it('upgrades a schema 6 store in place: roles move into identities, and nothing else is lost', async () => {
+	const stub = env.DEMO.getByName(`schema-upgrade-6-${crypto.randomUUID()}`);
+	const now = Date.now();
+	const head = await runInDurableObject(stub, async (instance, state) => {
+		const { store } = instance as unknown as Runtime;
+		const sql = state.storage.sql;
+		for (const userId of ['listed_admin', 'plain_user']) {
+			store.registerIdentity({
+				userId, name: userId, userHandle: `handle-${userId}`, now, ipKey: `ip-${userId}`,
+				credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
+			});
+		}
+		store.mutate({
+			userId: 'plain_user', ipKey: 'ip-plain_user', requestId: 'kept', method: 'message', now,
+			identity: { user_id: 'plain_user' }, params: { room_id: 'general', body: { text: 'kept' } },
+		});
+		// Schema 6: no roles column; bots by tier, admins in a `_meta` list.
+		sql.exec('ALTER TABLE identities DROP COLUMN roles_json');
+		sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES ('bot_plain_user', '', 'Bot', 'bot', 1, 1)");
+		sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES ('admin', '', 'Admin', 'registered', 1, 1)");
+		sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('admins', ?)", JSON.stringify(['listed_admin', 'gone_user']));
+		sql.exec("UPDATE _meta SET value = '6' WHERE key = 'schema_version'");
+		sql.exec('UPDATE maintenance SET schema_version = 6 WHERE id = 1');
+		return store.getRoomState().latest_log_id;
+	});
+
+	await evictDurableObject(stub);
+	await runInDurableObject(stub, async (instance, state) => {
+		const { store } = instance as unknown as Runtime;
+		const sql = state.storage.sql;
+		expect(store.requiresReset()).toBe(false);
+		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
+		expect(store.getRoomState().latest_log_id).toBe(head);
+		expect(store.getIdentity('listed_admin')?.roles).toEqual(['admin']);
+		expect(store.getIdentity('plain_user')?.roles).toEqual([]);
+		expect(store.getIdentity('bot_plain_user')?.roles).toEqual(['bot']);
+		expect(store.getIdentity('admin')?.roles).toEqual(['admin']);
+		expect(sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM _meta WHERE key = 'admins'").one().n).toBe(0);
 	});
 });

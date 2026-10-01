@@ -176,7 +176,7 @@ describe('store uploads', () => {
 			const first = setAvatar();
 			expect(first.finished).toMatchObject({ accepted: true, broadcasts: [], avatar: { userId: 'erin', url: `${MEDIA}/${first.upload.key}` }, deletedUploads: [] });
 			expect(store.getIdentity('erin')!.avatar).toBe(`${MEDIA}/${first.upload.key}`);
-			expect(store.roomMembers(['general'], 10, clock.value).get('general')).toContainEqual({ user_id: 'erin', name: 'Name of erin', avatar: `${MEDIA}/${first.upload.key}` });
+			expect(store.roomMembers(['general'], 10, clock.value).get('general')).toContainEqual({ user_id: 'erin', name: 'Name of erin', avatar: `${MEDIA}/${first.upload.key}`, roles: [] });
 			// A new avatar replaces the old one, whose object goes.
 			const second = setAvatar();
 			expect(second.finished.deletedUploads).toEqual([first.upload.key]);
@@ -220,7 +220,6 @@ describe('store uploads', () => {
 			const purged = store.purgeUsers({ userIds: ['mallory', 'bot_mallory'], now: clock.value });
 			expect(purged).toEqual({ messages: 1, reactions: 1, deletedUploads: [writeOf(theirs.result).write.key] });
 			expect(store.getIdentity('mallory')).toBeNull();
-			expect(store.roles(clock.value).has('mallory')).toBe(false);
 			expect(store.countIdentities()).toBe(before - 1);
 			const sql = state.storage.sql;
 			const records = sql.exec<{ kind: string; record_json: string }>('SELECT kind, record_json FROM records').toArray();
