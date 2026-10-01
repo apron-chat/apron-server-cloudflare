@@ -155,9 +155,11 @@ Memberships:
 - `/passkeys` reads at most 8 credential rows; `/passkeys remove` adds one
   delete with its index. Adding a passkey to an account without a WebAuthn
   user handle writes it at `begin` (one conditional row update).
-- `roles` in current user objects need the admin list: one `_meta` read per
-  object wake, kept in memory and updated by `/admin`, `/rename`, and
-  `/purge`, the only changes to it. Guests and bots need no read.
+- `roles` in current user objects, and the admin and bot checks, need the
+  roles row (and the earlier `admins` row until the first role change
+  retires it): one or two `_meta` reads per object wake, kept in memory and
+  updated by `/role`, `/admin`, `/rename`, and `/purge`, the only changes to
+  it. Guests need no read.
 - History pages read membership records from the same room range as every
   other record, and look up no user objects.
 - Cleanup purges a removed thread's membership rows in the same bounded

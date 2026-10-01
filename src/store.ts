@@ -708,13 +708,25 @@ const META_GUEST_NUMBER_MARK = "guest_number_mark";
  */
 export const MAX_CARRIED_PASSKEYS = 100;
 /**
- * The registered users made admins with `/admin`, as a JSON list of
- * `user_id`s. Absent means none: the row is additive, so schema 4 objects need
- * no reset for it. The `APRON_ADMIN_TOKEN` user is an admin without being listed.
+ * The roles `/role` (and `/admin`, for `admin`) gave users, as a JSON object
+ * from `user_id` to a list of role names. Absent means none: the row is
+ * additive, so schema 4 objects need no reset for it. Roles a user has by
+ * their `user_id` (`admin` for the `APRON_ADMIN_TOKEN` user, `bot` for
+ * `bot_…`) are not listed.
+ */
+const META_ROLES = "roles";
+/**
+ * The admin list this replaced, a JSON list of `user_id`s: still read, as
+ * `admin` roles, and deleted by the next write of the roles row.
  */
 const META_ADMINS = "admins";
-/** Most users `/admin` may list, so the list stays one small `_meta` row. */
+/** Most admins `/admin` and `/role` may list. */
 export const MAX_ADMINS = 32;
+/** Most users with listed roles, and roles per user, so the map stays one small `_meta` row. */
+export const MAX_ROLE_USERS = 64;
+export const MAX_ROLES_PER_USER = 8;
+/** A role name: lowercase letters, digits, `_` or `-`, starting with a letter. */
+export const ROLE_PATTERN = /^[a-z][a-z0-9_-]{0,23}$/;
 /**
  * `_meta` key prefix recording a `/rename`: `renamed:<old user_id>` holds the
  * new one, so the retired `user_id` is never reissued (protocol §3.3).
@@ -1429,8 +1441,8 @@ export class Store {
    * identities (same `user_id`, name, and WebAuthn user handle) and their
    * `general` membership, so users sign in again with the passkey they have
    * rather than deleting it and registering anew. The rows the carry reads
-   * and writes are charged to the day's maintenance reservation below, and those of them `/admin`
-   * listed stay admins. Older passkeys past the cap, bots, and every session
+   * and writes are charged to the day's maintenance reservation below, and those of them
+   * with roles keep them. Older passkeys past the cap, bots, and every session
    * are dropped.
    *
    * The guest-number high-water mark is carried over, so a guest ID is never
@@ -1472,11 +1484,11 @@ export class Store {
     const carryStart = { reads: this.observed.reads, writes: this.observed.writes };
     const passkeys = this.readCarriedPasskeys();
     const carryReads = this.observed.reads - carryStart.reads;
-    let admins: string[] = [];
+    let roles = new Map<string, string[]>();
     try {
-      admins = this.adminIds();
+      roles = this.roleMap();
     } catch {
-      // An unreadable old meta table carries no admins.
+      // An unreadable old meta table carries no roles.
     }
     await deleteAll.call(this.durableStorage);
     this.initialized = false;
@@ -1493,10 +1505,10 @@ export class Store {
     }
     const writeStart = { reads: this.observed.reads, writes: this.observed.writes };
     if (passkeys.length) this.writeCarriedPasskeys(passkeys);
-    // Admins whose passkeys were carried stay admins: one control write.
+    // Users whose passkeys were carried keep their roles: one control write.
     const carriedIds = new Set(passkeys.map((row) => row.user_id));
-    const carriedAdmins = admins.filter((id) => carriedIds.has(id));
-    if (carriedAdmins.length) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ADMINS, JSON.stringify(carriedAdmins));
+    for (const id of roles.keys()) if (!carriedIds.has(id)) roles.delete(id);
+    if (roles.size) this.writeRoleMap(roles);
     const carryCost = {
       reads: carryReads + this.observed.reads - writeStart.reads,
       writes: this.observed.writes - writeStart.writes,
@@ -2361,7 +2373,7 @@ export class Store {
   /**
    * `/rename`: moves a registered user to a new `user_id`: the identity row,
    * its credential (so its passkey signs in as the new id), its stored
-   * memberships, and its admin listing. Nothing else is migrated: logged
+   * memberships, and its roles. Nothing else is migrated: logged
    * records keep the old `user_id` (protocol §3.3), and sessions, limiter
    * windows, reactions and the user's bot stay under it. The old `user_id` is
    * retired, never reissued. Returns the user's name and joined rooms.
@@ -2380,9 +2392,12 @@ export class Store {
       this.rawExec("UPDATE credentials SET user_id = ? WHERE user_id = ?", input.to, input.from);
       this.rawExec("UPDATE memberships SET user_id = ? WHERE user_id = ?", input.to, input.from);
       this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_RENAMED_PREFIX + input.from, input.to);
-      const admins = this.adminIds();
-      if (admins.includes(input.from)) {
-        this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ADMINS, JSON.stringify(admins.map((id) => (id === input.from ? input.to : id))));
+      const roles = this.roleMap();
+      const moved = roles.get(input.from);
+      if (moved) {
+        roles.delete(input.from);
+        roles.set(input.to, moved);
+        this.writeRoleMap(roles);
       }
       return { name: identity.name, rooms: this.userRooms(input.to) };
     }));
@@ -2471,10 +2486,8 @@ export class Store {
       }
       this.rawExec(`DELETE FROM principal_limits WHERE principal_key IN (${marks})`, ...ids.map((id) => `user:${id}`));
       if (identities) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(Math.max(0, this.metaNumber("identity_count") - integerColumn(identities))));
-      const admins = this.adminIds();
-      if (admins.some((id) => ids.includes(id))) {
-        this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ADMINS, JSON.stringify(admins.filter((id) => !ids.includes(id))));
-      }
+      const roles = this.roleMap();
+      if (ids.some((id) => roles.delete(id))) this.writeRoleMap(roles);
       return { messages: messages.length, reactions: integerColumn(reactions), deletedUploads };
     }));
   }
@@ -3253,62 +3266,91 @@ export class Store {
     return { userId: input.botId, name: input.name, created: true, renamed: false, broadcasts: created.broadcasts };
   }
 
-  /** Whether `/admin` listed this user as an admin. One `_meta` read. */
-  isAdmin(userId: string, now = this.clock.now()): boolean {
+  /** The roles `/role` and `/admin` listed, by `user_id`: one or two `_meta` reads. */
+  roles(now = this.clock.now()): Map<string, string[]> {
     this.ensureReady();
-    return this.reserved({ reads: 4 }, false, now, () => this.adminIds().includes(userId));
-  }
-
-  /** The users `/admin` listed (not the `admin` user, always one), one `_meta` read. */
-  admins(now = this.clock.now()): string[] {
-    this.ensureReady();
-    return this.reserved({ reads: 4 }, false, now, () => this.adminIds());
+    return this.reserved({ reads: 8 }, false, now, () => this.roleMap());
   }
 
   /**
-   * Lists a registered user (not a bot or guest) as an admin, for `/admin`.
-   * `added` is false when the user already was one. At most MAX_ADMINS.
+   * Gives a user a role (`on`) or takes it away, for `/role` and `/admin`.
+   * `changed` is false when the user already had it, or did not. Only
+   * registered users and bots get roles, at most MAX_ROLES_PER_USER each and
+   * MAX_ROLE_USERS in all. `admin` is not given to bots, at most MAX_ADMINS,
+   * and `bot` not to admins or users who hold a passkey, since a bot signs in
+   * with its token only. Taking a role away needs no identity, so a stale
+   * listing can always be cleared.
    */
-  grantAdmin(input: { userId: string; now?: number }): { added: boolean; name: string } {
+  setRole(input: { userId: string; role: string; on: boolean; now?: number }): { changed: boolean; name: string } {
     this.ensureReady();
-    return this.reserved({ reads: 8, writes: 4 }, false, input.now ?? this.clock.now(), () => this.transaction(() => {
+    return this.reserved({ reads: 16, writes: 4 }, false, input.now ?? this.clock.now(), () => this.transaction(() => {
       const identity = this.identityRow(input.userId);
-      if (!identity || identity.tier !== "registered") throw new StoreError("invalid_params", "No registered user has that user_id");
-      const admins = this.adminIds();
-      if (admins.includes(input.userId)) return { added: false, name: identity.name };
-      if (admins.length >= MAX_ADMINS) throw new StoreError("denied", `There are already ${MAX_ADMINS} admins`);
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ADMINS, JSON.stringify([...admins, input.userId]));
-      return { added: true, name: identity.name };
-    }));
-  }
-
-  /**
-   * Takes a user off the `/admin` list. `added` (named for grantAdmin's
-   * result) is whether they were on it.
-   */
-  revokeAdmin(input: { userId: string; now?: number }): { added: boolean; name: string } {
-    this.ensureReady();
-    return this.reserved({ reads: 8, writes: 4 }, false, input.now ?? this.clock.now(), () => this.transaction(() => {
-      const identity = this.identityRow(input.userId);
-      const admins = this.adminIds();
-      if (!admins.includes(input.userId)) {
-        if (!identity) throw new StoreError("invalid_params", "No registered user has that user_id");
-        return { added: false, name: identity.name };
+      const roles = this.roleMap();
+      const held = roles.get(input.userId) ?? [];
+      if (!input.on) {
+        if (!held.includes(input.role)) {
+          if (!identity) throw new StoreError("invalid_params", "No registered user has that user_id");
+          return { changed: false, name: identity.name };
+        }
+        const rest = held.filter((role) => role !== input.role);
+        if (rest.length) roles.set(input.userId, rest);
+        else roles.delete(input.userId);
+        this.writeRoleMap(roles);
+        return { changed: true, name: identity?.name ?? "" };
       }
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ADMINS, JSON.stringify(admins.filter((id) => id !== input.userId)));
-      return { added: true, name: identity?.name ?? "" };
+      if (!identity || (identity.tier !== "registered" && identity.tier !== "bot")) throw new StoreError("invalid_params", "No registered user has that user_id");
+      if (held.includes(input.role)) return { changed: false, name: identity.name };
+      const bot = identity.tier === "bot" || held.includes("bot");
+      if (input.role === "admin") {
+        if (bot) throw new StoreError("invalid_params", "A bot can't be an admin");
+        if ([...roles.values()].filter((list) => list.includes("admin")).length >= MAX_ADMINS) throw new StoreError("denied", `There are already ${MAX_ADMINS} admins`);
+      }
+      if (input.role === "bot") {
+        if (held.includes("admin")) throw new StoreError("invalid_params", "An admin can't be a bot; take away admin first");
+        if (this.rawRows("SELECT 1 FROM credentials WHERE user_id = ? LIMIT 1", input.userId).length) {
+          throw new StoreError("invalid_params", "A bot signs in with a token and holds no passkey; this user has one");
+        }
+      }
+      if (held.length >= MAX_ROLES_PER_USER) throw new StoreError("denied", `A user has at most ${MAX_ROLES_PER_USER} roles`);
+      if (!held.length && roles.size >= MAX_ROLE_USERS) throw new StoreError("denied", `At most ${MAX_ROLE_USERS} users have roles`);
+      roles.set(input.userId, [...held, input.role]);
+      this.writeRoleMap(roles);
+      return { changed: true, name: identity.name };
     }));
   }
 
-  private adminIds(): string[] {
-    const raw = this.metaValue(META_ADMINS);
-    if (!raw) return [];
-    try {
-      const parsed: unknown = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string").slice(0, MAX_ADMINS) : [];
-    } catch {
-      return [];
+  /** The roles row, with the old admin list's users as `admin`s. */
+  private roleMap(): Map<string, string[]> {
+    const roles = new Map<string, string[]>();
+    const add = (userId: string, role: string) => {
+      const held = roles.get(userId) ?? [];
+      if (ROLE_PATTERN.test(role) && !held.includes(role) && held.length < MAX_ROLES_PER_USER) roles.set(userId, [...held, role]);
+    };
+    const parse = (raw: string): unknown => {
+      try {
+        return raw ? JSON.parse(raw) : null;
+      } catch {
+        return null;
+      }
+    };
+    const listed = parse(this.metaValue(META_ROLES));
+    if (listed && typeof listed === "object" && !Array.isArray(listed)) {
+      for (const [userId, held] of Object.entries(listed).slice(0, MAX_ROLE_USERS)) {
+        if (Array.isArray(held)) for (const role of held) if (typeof role === "string") add(userId, role);
+      }
     }
+    const admins = parse(this.metaValue(META_ADMINS));
+    if (Array.isArray(admins)) {
+      for (const id of admins.slice(0, MAX_ADMINS)) if (typeof id === "string") add(id, "admin");
+    }
+    return roles;
+  }
+
+  /** Writes the roles row (deleted when empty), retiring the old admin list. */
+  private writeRoleMap(roles: Map<string, string[]>): void {
+    if (roles.size) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ROLES, JSON.stringify(Object.fromEntries(roles)));
+    else this.rawExec("DELETE FROM _meta WHERE key = ?", META_ROLES);
+    this.rawExec("DELETE FROM _meta WHERE key = ?", META_ADMINS);
   }
 
   /**

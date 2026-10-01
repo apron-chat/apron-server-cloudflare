@@ -52,9 +52,10 @@ for (const storedVersion of [UPGRADABLE_SCHEMA_VERSION - 1, SCHEMA_VERSION + 1])
 			expect(store.getIdentity('bot_x')).toBeNull();
 			expect(store.getCredential('cred-admin')).toBeNull();
 			expect(store.getIdentity('admin')).toBeNull();
-			// Admins whose passkeys were carried stay admins.
-			expect(store.isAdmin('user_before_reset')).toBe(true);
-			expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'admins'").one().value).toBe('["user_before_reset"]');
+			// Users whose passkeys were carried keep their roles; the old admin list becomes `admin` roles.
+			expect(store.roles().get('user_before_reset')).toEqual(['admin']);
+			expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'roles'").one().value).toBe('{"user_before_reset":["admin"]}');
+			expect(sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM _meta WHERE key = 'admins'").one().n).toBe(0);
 			expect(sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM message_state').one().n).toBe(0);
 			expect((await state.storage.list({ prefix: 'session:' })).size).toBe(0);
 			const general = store.getRoomState();
