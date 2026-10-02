@@ -694,23 +694,25 @@ const PUSH_TEXT_CODE_POINTS = 200;
 const MAX_PUSH_PAYLOAD_BYTES = 3072;
 
 /**
- * What a push carries (§4.7): the message without `log_id`, with the
- * registration's `push_id`, its text cut to PUSH_TEXT_CODE_POINTS (left out
- * when empty), and without `format`, `embeds`, `ext`, or the server's
- * `prev_*` links. Each fallback drops more until the payload fits
- * MAX_PUSH_PAYLOAD_BYTES: first `mentions`, then all of `from` but its
- * `user_id` and `name`, then `body`.
+ * What a push carries (§4.7): the envelope `{push_id?, message}`, with the
+ * registration's `push_id` when it has one (`unread` is not implemented,
+ * so never sent), and as `message` the message without `log_id`, its text
+ * cut to PUSH_TEXT_CODE_POINTS (left out when empty), and without `format`,
+ * `embeds`, `ext`, or the server's `prev_*` links. Each fallback drops more
+ * of `message` until the whole envelope fits MAX_PUSH_PAYLOAD_BYTES: first
+ * `mentions`, then all of `from` but its `user_id` and `name`, then `body`.
  */
 function pushPayload(message: MessageSnapshot, pushId?: string): string {
 	const body = message.body ?? {};
 	const points = typeof body.text === "string" ? [...body.text] : [];
 	const text = points.length > PUSH_TEXT_CODE_POINTS ? points.slice(0, PUSH_TEXT_CODE_POINTS - 1).join("") + "…" : points.join("");
-	const head = { message_id: message.message_id, room_id: message.room_id, ...(pushId !== undefined ? { push_id: pushId } : {}) };
 	const tail = message.reply_to ? { reply_to: message.reply_to } : {};
 	const shortFrom = { user_id: message.from.user_id, ...(typeof message.from.name === "string" ? { name: message.from.name } : {}) };
 	const textField = text ? { text } : {};
-	const payload = (from: unknown, fields: Record<string, unknown>) =>
-		jsonString({ ...head, from, ...tail, ...(Object.keys(fields).length ? { body: fields } : {}) });
+	const payload = (from: unknown, fields: Record<string, unknown>) => jsonString({
+		...(pushId !== undefined ? { push_id: pushId } : {}),
+		message: { message_id: message.message_id, room_id: message.room_id, from, ...tail, ...(Object.keys(fields).length ? { body: fields } : {}) },
+	});
 	const candidates = [
 		...(Array.isArray(body.mentions) ? [payload(message.from, { ...textField, mentions: body.mentions })] : []),
 		payload(message.from, textField),

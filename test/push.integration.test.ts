@@ -272,15 +272,21 @@ describe('push over the socket', () => {
 			expect(carolPush.headers.get('content-encoding')).toBe('aes128gcm');
 			expect(carolPush.headers.get('ttl')).toBe(String(POLICY.ttlSeconds));
 			expect(carolPush.headers.get('urgency')).toBe('normal');
-			// The message without log_id, format or embeds, its text cut to 200 code points.
+			// The envelope: the registration's push_id, no unread, and the message
+			// without log_id, format or embeds, its text cut to 200 code points.
 			const payload = JSON.parse((await decryptPush(carolPush.body, carolSub.browser)).plaintext);
 			expect(payload).toEqual({
-				message_id: first.result.message_id, room_id: 'general', push_id: 'carol-phone', from: { user_id: aliceId, name: `Name of ${aliceId}` },
-				body: { text: `${'é'.repeat(199)}…`, mentions: [bobId, carolId, aliceId, daveId, 'guest_1'] },
+				push_id: 'carol-phone',
+				message: {
+					message_id: first.result.message_id, room_id: 'general', from: { user_id: aliceId, name: `Name of ${aliceId}` },
+					body: { text: `${'é'.repeat(199)}…`, mentions: [bobId, carolId, aliceId, daveId, 'guest_1'] },
+				},
 			});
-			// Dave registered without a push_id: his payload has none.
+			// Dave registered without a push_id: his envelope has only the message.
 			const davePush = pushes.find((push) => push.url === daveSub.url)!;
-			expect(JSON.parse((await decryptPush(davePush.body, daveSub.browser)).plaintext)).not.toHaveProperty('push_id');
+			const davePayload = JSON.parse((await decryptPush(davePush.body, daveSub.browser)).plaintext);
+			expect(Object.keys(davePayload)).toEqual(['message']);
+			expect(davePayload.message.message_id).toBe(first.result.message_id);
 
 			// Edits, retries, and commands wake no one; a message from Carol ends her away.
 			pushes.length = 0;
@@ -293,7 +299,7 @@ describe('push over the socket', () => {
 			await post(alice, 'second', { body: { text: 'ping', mentions: [carolId, bobId] } });
 			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
 			expect(pushes[0].url).toBe(bobSub.url);
-			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).body).toEqual({ text: 'ping', mentions: [carolId, bobId] });
+			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.body).toEqual({ text: 'ping', mentions: [carolId, bobId] });
 		} finally { alice.close(); bob.close(); carol.close(); dave.close(); }
 	});
 
@@ -303,7 +309,7 @@ describe('push over the socket', () => {
 		const alice = await signedIn(aliceId);
 		const bob = await signedIn(bobId);
 		try {
-			const bobSub = await subscribe(bob, 'bob');
+			const bobSub = await subscribe(bob, 'bob', 'p'.repeat(64));
 			await setAway(bob, true);
 			// Far more mentions than fit one payload (§4.7).
 			const many = Array.from({ length: 60 }, (_, index) => `someone-${index}-${'x'.repeat(48)}`);
@@ -312,9 +318,12 @@ describe('push over the socket', () => {
 			const plaintext = (await decryptPush(pushes[0].body, bobSub.browser)).plaintext;
 			expect(new TextEncoder().encode(plaintext).byteLength).toBeLessThanOrEqual(3072);
 			const payload = JSON.parse(plaintext);
-			expect(payload.body).not.toHaveProperty('mentions');
-			expect(payload.body.text).toMatch(/^"quoted"/);
-			expect(payload.from).toEqual({ user_id: aliceId, name: `Name of ${aliceId}` });
+			// The bound covers the whole envelope; the fallbacks apply inside `message`.
+			expect(payload.push_id).toBe('p'.repeat(64));
+			expect(Object.keys(payload)).toEqual(['push_id', 'message']);
+			expect(payload.message.body).not.toHaveProperty('mentions');
+			expect(payload.message.body.text).toMatch(/^"quoted"/);
+			expect(payload.message.from).toEqual({ user_id: aliceId, name: `Name of ${aliceId}` });
 		} finally { alice.close(); bob.close(); }
 	});
 

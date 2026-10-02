@@ -101,9 +101,10 @@ within it:
   registrations a message, once a minute per user and room, 200 woken users a
   day per sender, and 5,000 pushes a day in all. Guests' messages wake no one
   (see
-  [SPEC section 4.4](../SPEC.md#44-push)). The push carries the message
-  without `log_id`, with the registration's `push_id`, its text cut to 200
-  characters, without format or embeds.
+  [SPEC section 4.4](../SPEC.md#44-push)). The push carries
+  `{push_id, message}`: the registration's `push_id` when it has one, and
+  the message without `log_id`, its text cut to 200 characters, without
+  format or embeds, in at most 3072 bytes.
 - Messages: a request without `room_id` is in `general`. A new message with
   empty text and no embeds is not logged and returns `{}`; an empty save is
   `invalid_params` (delete instead). `body.mentions` is stored as sent, and
