@@ -15,7 +15,7 @@ const POLICY = PUSH_POLICY!;
 type Runtime = {
 	store: Store;
 	issueSession(userId: string, origin: string, now: number): Promise<string>;
-	config: { activityEnabled: boolean };
+	config: { activityEnabled: boolean; push?: unknown };
 };
 
 /** Registers a passkey user straight into the store. */
@@ -47,9 +47,9 @@ async function subscribe(peer: Peer, name: string, pushId?: string, wake?: unkno
 	return { url, browser };
 }
 
-/** Sends `away` as the notification it is, then a request, so it is applied before the caller goes on. */
+/** Sends `push_away` as the notification it is, then a request, so it is applied before the caller goes on. */
 async function setAway(peer: Peer, away: boolean): Promise<void> {
-	peer.send({ method: 'activity', params: { away } });
+	peer.send({ method: 'push_away', params: { away } });
 	expect((await request(peer, `sync-${crypto.randomUUID()}`, 'me', {})).result.you).toBeTruthy();
 }
 
@@ -170,17 +170,16 @@ describe('push over the socket', () => {
 		} finally { peer.close(); }
 	});
 
-	it('tracks away per connection: away ends with away false, a read cursor, typing, or a message', async () => {
+	it('tracks push_away per connection: it ends with away false or an accepted message', async () => {
 		const userId = unique('aldo');
 		const peer = await signedIn(userId);
 		const other = await signedIn(userId, true);
 		try {
 			expect(await awayOf(userId)).toEqual([false, false]);
-			// Activity is off in these tests; a push server still notes away from a notification.
 			await setAway(peer, true);
 			expect((await awayOf(userId)).sort()).toEqual([false, true]);
-			// A request is still unsupported with activity off, and changes nothing.
-			expect((await request(peer, 'activity-request', 'activity', { away: false })).error.code).toBe(-32601);
+			// A notification only: a request gets the unsupported-method path and changes nothing.
+			expect((await request(peer, 'away-request', 'push_away', { away: false })).error.code).toBe(-32601);
 			expect((await awayOf(userId)).sort()).toEqual([false, true]);
 			// A history page does not end it, nor a refused message; an accepted one does.
 			await request(peer, 'history', 'history', { room_id: 'general' });
@@ -191,35 +190,57 @@ describe('push over the socket', () => {
 			await setAway(peer, true);
 			await setAway(peer, false);
 			expect(await awayOf(userId)).toEqual([false, false]);
-			for (const ending of [{ read_message_id: '1' }, { room_id: 'general', typing: 0 }]) {
-				await setAway(peer, true);
-				peer.send({ method: 'activity', params: ending });
-				await request(peer, `sync-${JSON.stringify(ending)}`, 'me', {});
-				expect(await awayOf(userId), JSON.stringify(ending)).toEqual([false, false]);
+			// `away` is required and a boolean; a malformed one changes nothing.
+			// (Another connection: each counts as a policy violation.)
+			await setAway(other, true);
+			for (const params of [{}, { away: 'no' }]) {
+				other.send({ method: 'push_away', params });
+				await request(other, `sync-${JSON.stringify(params)}`, 'me', {});
+				expect((await awayOf(userId)).sort(), JSON.stringify(params)).toEqual([false, true]);
 			}
-			// An explicit away wins over typing in the same update.
-			peer.send({ method: 'activity', params: { away: true, typing: 3 } });
-			await request(peer, 'sync-both', 'me', {});
-			expect((await awayOf(userId)).sort()).toEqual([false, true]);
 		} finally { peer.close(); other.close(); }
 	});
 
-	it('tracks away with activity on too, where typing ends it and is still relayed', async () => {
+	it('ignores push_away without push, and activity no longer sets or ends away', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId, carolId] = [unique('alice'), unique('bob'), unique('carol')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		const carol = await signedIn(carolId);
 		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).config.activityEnabled = true; });
-		const userId = unique('anya');
-		const peer = await signedIn(userId);
 		try {
-			expect((await request(peer, 'away', 'activity', { away: true })).result).toEqual({});
-			expect(await awayOf(userId)).toEqual([true]);
-			expect((await request(peer, 'bad-away', 'activity', { away: 'yes' })).error.code).toBe(-32602);
-			// `away` applies even when the typing in the same update is refused.
-			expect((await request(peer, 'back', 'activity', { away: false })).result).toEqual({});
-			expect((await request(peer, 'bad-typing', 'activity', { away: true, typing: -1 })).error.code).toBe(-32602);
-			expect(await awayOf(userId)).toEqual([true]);
-			expect((await request(peer, 'typing', 'activity', { room_id: 'general', typing: 2 })).result).toEqual({});
-			expect(await awayOf(userId)).toEqual([false]);
+			await subscribe(bob, 'bob');
+			const carolSub = await subscribe(carol, 'carol');
+			// Activity's `away` is not push_away: Bob stays attended.
+			expect((await request(bob, 'activity-away', 'activity', { away: true })).result).toEqual({});
+			expect(await awayOf(bobId)).toEqual([false]);
+			// Nor do typing or a read cursor end push_away.
+			await setAway(carol, true);
+			expect((await request(carol, 'typing', 'activity', { room_id: 'general', typing: 2 })).result).toEqual({});
+			carol.send({ method: 'activity', params: { room_id: 'general', read_message_id: '1' } });
+			expect(await awayOf(carolId)).toEqual([true]);
+			await post(alice, 'mention', { body: { text: 'hi', mentions: [bobId, carolId] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(pushes[0].url).toBe(carolSub.url);
+
+			// Without push, push_away is an unknown notification: ignored.
+			const saved = await runInDurableObject(stub(), (instance) => {
+				const runtime = instance as unknown as Runtime;
+				const push = runtime.config.push;
+				runtime.config = { ...runtime.config, push: undefined };
+				return push;
+			});
+			try {
+				await setAway(bob, true);
+				expect(await awayOf(bobId)).toEqual([false]);
+			} finally {
+				await runInDurableObject(stub(), (instance) => {
+					const runtime = instance as unknown as Runtime;
+					runtime.config = { ...runtime.config, push: saved };
+				});
+			}
 		} finally {
-			peer.close();
+			alice.close(); bob.close(); carol.close();
 			await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).config.activityEnabled = false; });
 		}
 	});

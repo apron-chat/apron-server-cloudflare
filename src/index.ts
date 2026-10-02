@@ -118,9 +118,9 @@ interface ConnectionAttachment {
 	 */
 	listedJoined?: boolean;
 	/**
-	 * The client said nobody is attending this connection (§4.4 `away`), so a
-	 * mention may wake its user by push (§4.7). Cleared by `away: false`,
-	 * typing, a read cursor, or a message from this connection.
+	 * The client said nobody is attending this connection (`push_away`, §4.7),
+	 * so a mention or reply may wake its user by push. Cleared by `push_away`
+	 * `{away: false}` or an accepted message from this connection.
 	 */
 	away?: boolean;
 	closing?: boolean;
@@ -1384,18 +1384,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 				await this.handleMe(socket, attachment, request);
 				return;
 			case "activity":
-				if (this.activityOn()) {
-					await this.handleActivity(socket, request);
-					return;
-				}
-				// Off unless the plan or `ACTIVITY` enables it: typing then gets the
-				// unsupported-method path. A push server still notes `away` from a
-				// notification (§4.4), since it decides pushes (§4.7).
-				if (this.config.push && request.id === undefined && identityOf(attachment)) {
-					this.noteAttendance(socket, request.params);
-					return;
-				}
-				break;
+				// Off unless the plan or `ACTIVITY` enables it: typing then gets the unsupported-method path.
+				if (!this.activityOn()) break;
+				await this.handleActivity(socket, request);
+				return;
+			case "push_away":
+				// A notification only, on a push server (§4.7); a request, like a
+				// `ping` request, gets the unsupported-method path.
+				if (!this.config.push || request.id !== undefined) break;
+				this.handlePushAway(socket, attachment, request);
+				return;
 			case "push_register":
 				if (!this.config.push) break;
 				await this.handlePushRegister(socket, attachment, request);
@@ -2114,7 +2112,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (messageId === undefined && request.params.body === undefined) throw { name: "invalid_params", message: "Missing body" } satisfies ProtocolError;
 		if (request.params.body !== undefined) objectParam(request.params, "body");
 		await this.commitAndBroadcast(socket, attachment, request, "message", "posting");
-		// An accepted message from a connection ends its `away` (§4.4).
+		// An accepted message from a connection ends its `push_away` (§4.7).
 		this.setAway(socket, false);
 	}
 
@@ -2300,8 +2298,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Activity (§4.4). Typing is relayed to the room's other members and never
 	 * stored; without room_id it is in the default room. Read cursors are
-	 * dropped: the demo neither keeps nor relays them. `away` is kept on the
-	 * connection to decide pushes (§4.7) and never delivered. At most
+	 * dropped: the demo neither keeps nor relays them. Neither touches the
+	 * connection's `push_away` (§4.7). At most
 	 * `activityBroadcastsPerUserMinute` relays per user; past that the update
 	 * is dropped and the sender gets one `~private` notice per minute.
 	 */
@@ -2309,8 +2307,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const attachment = connectionAttachment(socket);
 		const identity = attachment ? publicIdentity(attachment) : null;
 		if (!attachment || !identity) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
-		// `away` first, so it applies even when the rest of the update is refused.
-		const explicit = this.noteAway(socket, request.params);
 		const typing = request.params.typing;
 		if (typing !== undefined && (typeof typing !== "number" || !Number.isFinite(typing) || typing < 0)) {
 			throw { name: "invalid_params", message: "typing must be a non-negative number of seconds" } satisfies ProtocolError;
@@ -2319,7 +2315,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (typing !== undefined && (typeof roomId !== "string" || roomId.length === 0 || roomId.length > 64)) {
 			throw { name: "invalid_params", message: "room_id must be a room" } satisfies ProtocolError;
 		}
-		if (!explicit && (typing !== undefined || request.params.read_message_id !== undefined)) this.setAway(socket, false);
 		if (request.id !== undefined) this.reply(socket, request, {});
 		// A guest who only reads has nothing to be typing.
 		if (attachment.tier === "anonymous" && !this.config.guestPosting) return;
@@ -2337,25 +2332,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Applies an `activity` update's attendance to its connection (§4.4):
-	 * `away: true` marks it unattended; `away: false`, `typing`, or
-	 * `read_message_id` attended again. An explicit `away` wins over the others
-	 * in the same update. Kept in the attachment, so it survives hibernation.
+	 * `push_away` (§4.7), a notification: `{away: true}` marks this connection
+	 * unattended, `{away: false}` attended again. Kept in the attachment, so it
+	 * survives hibernation; an accepted message from the connection also ends
+	 * it, and closing removes the connection. Never delivered. Before
+	 * authentication it is ignored, like other notifications.
 	 */
-	private noteAttendance(socket: WebSocketConnection, params: Record<string, unknown>): void {
-		if (!this.noteAway(socket, params) && (params.typing !== undefined || params.read_message_id !== undefined)) this.setAway(socket, false);
-	}
-
-	/** Applies an update's explicit `away`, if any; whether it had one. */
-	private noteAway(socket: WebSocketConnection, params: Record<string, unknown>): boolean {
-		const away = params.away;
-		if (away === undefined) return false;
+	private handlePushAway(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): void {
+		if (!identityOf(attachment)) return;
+		const away = request.params.away;
 		if (typeof away !== "boolean") throw { name: "invalid_params", message: "away must be a boolean" } satisfies ProtocolError;
 		this.setAway(socket, away);
-		return true;
 	}
 
-	/** Marks a connection away or attended (§4.4), writing its attachment only on a change. */
+	/** Marks a connection away or attended (`push_away`, §4.7), writing its attachment only on a change. */
 	private setAway(socket: WebSocketConnection, away: boolean): void {
 		const state = connectionAttachment(socket);
 		if (!state || (state.away === true) === away) return;
@@ -2364,7 +2354,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		writeAttachment(socket, state);
 	}
 
-	/** Whether a user has a connection someone attends: authenticated as them, not stale, and not `away` (§4.4). */
+	/** Whether a user has a connection someone attends: authenticated as them, not stale, and not away (`push_away`, §4.7). */
 	private attended(userId: string, now: number): boolean {
 		return this.connectionsOf(userId).some((peer) => !this.isStale(peer, now) && !connectionAttachment(peer)?.away);
 	}

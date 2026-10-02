@@ -63,9 +63,8 @@ within it:
 - Activity (where on): typing is relayed to the room's other
   members and never stored, at most 10 relays per user per minute; past that, updates are dropped and the
   sender gets one `~private` notice a minute saying so. Read cursors are
-  neither kept nor relayed. `away` is never delivered; with push it marks the
-  connection unattended until `away: false`, typing, a read cursor, or a
-  message from it (and is read from notifications even with activity off).
+  neither kept nor relayed. Activity has no part in push: attendance is the
+  separate `push_away` notification (below).
 - Commands: `/help` replies with a `~private` notice listing the commands the
   sender may run; `/invite-bot` gives a registered user a bot token (below);
   `/avatar` sets one with an attached image (below); other commands are
@@ -80,6 +79,10 @@ within it:
   keep embeds by it. Admins can turn uploads off and on with
   `/toggle uploads`. Clients should resize images and strip their metadata
   (such as location) before uploading: the server stores the bytes as sent.
+- Push attendance: on a push server, a client sends the notification
+  `push_away` `{"away": true}` when nobody is attending a connection (an
+  unfocused tab, a backgrounded app) and `{"away": false}` when someone is
+  again. A message from the connection also ends it. It is never delivered.
 - Push (`server.push` kind `webpush`, where VAPID keys are set): registered
   users register a browser's push subscription with `push_register`
   `{kind: "webpush", url, keys: {p256dh, auth}, push_id?}` (its

@@ -492,7 +492,7 @@ it('limits the frames the whole server processes in a minute without closing soc
 	} finally { peer.close(); await configure((config) => { config.limits.globalFramesPerMinute = DEFAULT_LIMITS.globalFramesPerMinute; }); }
 });
 
-it('with ACTIVITY on, relays typing to room members, accepts away, throttles per user, and tells only the sender once', async () => {
+it('with ACTIVITY on, relays typing to room members, ignores away, throttles per user, and tells only the sender once', async () => {
 	await configure((config) => { config.activityEnabled = true; });
 	const alice = await connect();
 	const bob = await connect();
@@ -503,7 +503,7 @@ it('with ACTIVITY on, relays typing to room members, accepts away, throttles per
 		await authenticate(carol, 'guest', ['activity']);
 		// Carol has left general, so typing there is not relayed to her.
 		await request(carol, 'leave', 'room_leave', { room_id: 'general' });
-		// `away` is accepted and never delivered, with or without a room.
+		// An unknown field such as the former `away` is ignored and never delivered.
 		alice.send({ method: 'activity', params: { away: true } });
 		alice.send({ method: 'activity', params: { typing: 99 } });
 		const first = await until(bob, (frame) => frame.method === 'activity');
