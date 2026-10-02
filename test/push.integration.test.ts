@@ -276,6 +276,27 @@ describe('push over the socket', () => {
 		} finally { alice.close(); bob.close(); carol.close(); dave.close(); }
 	});
 
+	it('keeps every payload within 3072 bytes, dropping mentions first', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId] = [unique('alice'), unique('bob')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		try {
+			const bobSub = await subscribe(bob, 'bob');
+			await setAway(bob, true);
+			// Far more mentions than fit one payload (§4.7).
+			const many = Array.from({ length: 60 }, (_, index) => `someone-${index}-${'x'.repeat(48)}`);
+			await post(alice, 'crowd', { room_id: 'general', body: { text: '"quoted"\\'.repeat(40), mentions: [bobId, ...many] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			const plaintext = (await decryptPush(pushes[0].body, bobSub.browser)).plaintext;
+			expect(new TextEncoder().encode(plaintext).byteLength).toBeLessThanOrEqual(3072);
+			const payload = JSON.parse(plaintext);
+			expect(payload.body).not.toHaveProperty('mentions');
+			expect(payload.body.text).toMatch(/^"quoted"/);
+			expect(payload.from).toEqual({ user_id: aliceId, name: `Name of ${aliceId}` });
+		} finally { alice.close(); bob.close(); }
+	});
+
 	it('forgets a subscription its push service says is gone', async () => {
 		const pushes = capturePushes((url) => url.includes('/gone-') ? 410 : 201);
 		const [aliceId, erinId] = [unique('alice'), unique('erin')];

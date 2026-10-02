@@ -6,7 +6,7 @@ import { fetchAccountUsage, type AccountUsageSnapshot } from "./account-usage";
 import { runBudgetGuard, watchForFlood } from "./budget-guard";
 import { sniffImage } from "./image";
 import { signUploadToken, verifyUploadToken } from "./upload-token";
-import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, MAX_PUSH_PLAINTEXT_BYTES, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
+import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
 import { extractClientIp, hashIpKey, stripForwardingHeaders } from "./ip";
 import {
 	errorFromUnknown,
@@ -690,31 +690,33 @@ function wakeParam(value: unknown): number | undefined {
 /** Longest `body.text` a push carries, in code points; longer text is cut, ending in `…`. */
 const PUSH_TEXT_CODE_POINTS = 200;
 
+/** Largest push payload, in bytes of JSON (§4.7), leaving a relay room to wrap it for APNs or FCM. */
+const MAX_PUSH_PAYLOAD_BYTES = 3072;
+
 /**
  * What a push carries (§4.7): the message without `log_id`, with the
  * registration's `push_id`, its text cut to PUSH_TEXT_CODE_POINTS (left out
  * when empty), and without `format`, `embeds`, `ext`, or the server's
- * `prev_*` links. `mentions` stay while the whole fits one push; without
- * them it always fits, since the `push_id`, names, ids and cut text are
- * bounded well under it.
+ * `prev_*` links. Each fallback drops more until the payload fits
+ * MAX_PUSH_PAYLOAD_BYTES: first `mentions`, then all of `from` but its
+ * `user_id` and `name`, then `body`.
  */
 function pushPayload(message: MessageSnapshot, pushId?: string): string {
 	const body = message.body ?? {};
 	const points = typeof body.text === "string" ? [...body.text] : [];
 	const text = points.length > PUSH_TEXT_CODE_POINTS ? points.slice(0, PUSH_TEXT_CODE_POINTS - 1).join("") + "…" : points.join("");
-	const base = {
-		message_id: message.message_id, room_id: message.room_id,
-		...(pushId !== undefined ? { push_id: pushId } : {}),
-		from: message.from,
-		...(message.reply_to ? { reply_to: message.reply_to } : {}),
-	};
-	const withBody = (fields: Record<string, unknown>) => jsonString(Object.keys(fields).length ? { ...base, body: fields } : base);
+	const head = { message_id: message.message_id, room_id: message.room_id, ...(pushId !== undefined ? { push_id: pushId } : {}) };
+	const tail = message.reply_to ? { reply_to: message.reply_to } : {};
+	const shortFrom = { user_id: message.from.user_id, ...(typeof message.from.name === "string" ? { name: message.from.name } : {}) };
 	const textField = text ? { text } : {};
-	if (Array.isArray(body.mentions)) {
-		const full = withBody({ ...textField, mentions: body.mentions });
-		if (utf8Bytes(full) <= MAX_PUSH_PLAINTEXT_BYTES) return full;
-	}
-	return withBody(textField);
+	const payload = (from: unknown, fields: Record<string, unknown>) =>
+		jsonString({ ...head, from, ...tail, ...(Object.keys(fields).length ? { body: fields } : {}) });
+	const candidates = [
+		...(Array.isArray(body.mentions) ? [payload(message.from, { ...textField, mentions: body.mentions })] : []),
+		payload(message.from, textField),
+		payload(shortFrom, textField),
+	];
+	return candidates.find((candidate) => utf8Bytes(candidate) <= MAX_PUSH_PAYLOAD_BYTES) ?? payload(shortFrom, {});
 }
 
 // Browsers hide failed WebSocket handshake responses. An explicit, read-only
