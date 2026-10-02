@@ -67,11 +67,13 @@ upper bounds can be compared with the measured worst case.
 | Credential counter update | 5 | 3 | 16 | 16 |
 | Push subscription register | 9 | 8 | 172 | 370 |
 | Push subscription register again, unchanged within a day | 6 | 2 | 172 | 370 |
-| Push wake claim (one user, one subscription; creates both counters) | 18 | 19 | 74 | 80 |
-| Push wake claim, 31 unregistered candidates before one registered | 41 | 9 | 632 | 80 |
+| Push wake claim (one user, one subscription; creates both counters) | 19 | 19 | 78 | 80 |
+| Push wake claim, 31 unregistered candidates before one registered | 73 | 9 | 760 | 80 |
+| Mute set (`status` `mute`) | 6 | 4 | 24 | 24 |
+| Mute read (`you`) | 5 | 2 | 16 | 8 |
 | Gone push subscription forget | 4 | 3 | 24 | 24 |
 | Push reply author lookup | 5 | 2 | 16 | 8 |
-| Push wake claim for a reply (creates the sender's counter) | 14 | 14 | 74 | 80 |
+| Push wake claim for a reply (creates the sender's counter) | 15 | 14 | 78 | 80 |
 | Message create with request ID | 33 | 37 | 296 | 120 |
 | Empty new message (not logged) | 4 | 2 | 16 | 8 |
 | Deduplicated mutation retry | 5 | 2 | 32 | 16 |
@@ -300,16 +302,22 @@ returns.
 Choosing whom a new message wakes reads connection attachments, plus one
 indexed read of the replied-to message's current state when the message is
 a reply (5/2 with its reservation). Registrations carry their wake scopes
-in the same row, so filtering by scope costs no extra rows. The wake claim then looks up the candidates in turn, at most 32: an unregistered
-one costs about one read of its live index range, and a registered one also
+in the same row, so filtering by scope costs no extra rows. The wake claim then looks up the candidates in turn, at most 32: each costs
+one read of its mute, and an unregistered one about one more of its live
+index range, and a registered one also
 reads its wake time for the room. A message that wakes someone writes each
 woken user's wake time and the server's and sender's counters: 19 writes for
 the day's first wake (both counter rows created), about 9 after. A message
 whose candidates have no live registrations, or are all coalesced, writes
 nothing; one that mentions no one away or gone does no push SQL. The
-reservation covers 32 candidates at 5 registrations each (632 reads) and
+reservation covers 32 candidates at 5 registrations each (760 reads) and
 `wakesPerMessage` wake rows (80 writes), mostly credited back. A push
 service's 404 or 410 costs one delete per gone registration.
+
+A `status` `mute` change is one upsert or delete of the user's `mutes` row
+(about 4 writes), echoed in `you` with one indexed read; `auth` and `me`
+results for a registered user on a push server read it once each. An
+expired mute is read as none and never written back.
 
 Cleanup deletes expired registrations (`pushExpiryDays`, 7) and wake times
 past `coalesceSeconds` within its existing batch, by their time indexes.

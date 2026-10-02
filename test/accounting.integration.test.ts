@@ -685,6 +685,9 @@ describe('measured storage accounting', () => {
 			expect(measure('push wake claim', () => store.claimPushes({ senderId: 'matrix-sender', roomId: 'general', candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() })).subscriptions).toHaveLength(1);
 			const unsubscribed = Array.from({ length: 31 }, (_, index) => `matrix-unsubscribed-${index}`);
 			expect(measure('push wake claim, 31 unsubscribed candidates first', () => store.claimPushes({ senderId: 'matrix-sender', roomId: 'matrix-room', candidates: [...unsubscribed, 'matrix-user'].map((userId) => ({ userId, reasons: WAKE_SCOPES.mentions })), now: clock.now() })).subscriptions).toHaveLength(1);
+			measure('mute set', () => store.setMute({ userId: 'matrix-user', untilMs: clock.now() + 3_600_000, now: clock.now() }));
+			expect(measure('mute read', () => store.muteOf('matrix-user', clock.now()))).toBe(3_600);
+			store.setMute({ userId: 'matrix-user', untilMs: null, now: clock.now() });
 			measure('gone push subscription forget', () => store.forgetPushSubscriptions([{ url: subscription.url, p256dh: subscription.p256dh }], clock.now()));
 
 			const identity = { user_id: 'matrix-user', name: 'Matrix user', tier: 'registered' as const };
@@ -738,7 +741,7 @@ describe('measured storage accounting', () => {
 			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
 			expect(create.result.message_id).toBeTruthy();
-			expect(costs).toHaveLength(37);
+			expect(costs).toHaveLength(39);
 			return { costs };
 		});
 		console.info('accounting-operation-matrix', JSON.stringify(result));

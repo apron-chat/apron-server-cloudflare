@@ -794,6 +794,11 @@ export function wakeScopes(mask: number): WakeScope[] {
   return (Object.keys(WAKE_SCOPES) as WakeScope[]).filter((scope) => (mask & WAKE_SCOPES[scope]) !== 0);
 }
 
+/** A `mutes` row's `until_ms` for a mute that lasts until changed (`mute: true`). */
+export const MUTE_FOREVER = Number.MAX_SAFE_INTEGER;
+/** The longest timed mute: a year; longer ones are cut to it. */
+export const MAX_MUTE_SECONDS = 365 * 86_400;
+
 /** A user a message may wake, and why: a bitmask of WAKE_SCOPES. */
 export interface PushCandidate {
   userId: string;
@@ -827,6 +832,8 @@ export interface PushClaim {
   subscriptions: PushSubscriptionRecord[];
   /** Users skipped because they were woken for the room within `coalesceSeconds`. */
   coalesced: number;
+  /** Users skipped because they are muted (protocol §4.11). */
+  muted: number;
   /** Subscriptions left out by the daily server or sender allowance. */
   skipped: number;
 }
@@ -1096,7 +1103,8 @@ function ensureText(value: unknown, field: string, maxBytes: number): string {
  * registered users' Web Push registrations (protocol §4.7), keyed by user
  * and endpoint, indexed by user and registration time, by endpoint (for a
  * gone one), and by registration time (for expiry). `push_wakes` keeps when
- * each user was last woken for each room, for coalescing.
+ * each user was last woken for each room, for coalescing. `mutes` keeps
+ * until when each registered user is muted (protocol §4.11 `mute`).
  */
 const SCHEMA_DDL = `
   CREATE TABLE IF NOT EXISTS _meta (
@@ -1212,6 +1220,10 @@ const SCHEMA_DDL = `
     PRIMARY KEY (user_id, room_id)
   );
   CREATE INDEX IF NOT EXISTS push_wakes_woken_idx ON push_wakes (woken_ms);
+  CREATE TABLE IF NOT EXISTS mutes (
+    user_id TEXT PRIMARY KEY,
+    until_ms INTEGER NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS accepted_requests (
     user_id TEXT NOT NULL,
     request_id TEXT NOT NULL,
@@ -1537,8 +1549,8 @@ export class Store {
 
   /**
    * Upgrades a schema 7 object to schema 8 in place, once, in one
-   * transaction: it creates the empty `push_subscriptions` and `push_wakes`
-   * tables and their indexes, and changes nothing else. Charged like upgradeFromSchema5's rows.
+   * transaction: it creates the empty `push_subscriptions`, `push_wakes`
+   * and `mutes` tables and their indexes, and changes nothing else. Charged like upgradeFromSchema5's rows.
    */
   private upgradeFromSchema7(): void {
     const start = { reads: this.observed.reads, writes: this.observed.writes };
@@ -1567,6 +1579,10 @@ export class Store {
           PRIMARY KEY (user_id, room_id)
         );
         CREATE INDEX IF NOT EXISTS push_wakes_woken_idx ON push_wakes (woken_ms);
+        CREATE TABLE IF NOT EXISTS mutes (
+          user_id TEXT PRIMARY KEY,
+          until_ms INTEGER NOT NULL
+        );
       `);
       this.finishUpgrade(8, start, day);
     });
@@ -2578,7 +2594,7 @@ export class Store {
    * left under the old id to the new one: the `from` of their logged message
    * snapshots and current messages (so they can still edit them), their
    * reaction sets, logged and current, and their logged membership changes,
-   * keeping the recorded names; their uploads; their push subscriptions;
+   * keeping the recorded names; their uploads; their push subscriptions and mute;
    * their limiter windows; and their dedup rows. Nothing is announced: clients see the new id when they
    * load history again. Other users' `body.mentions`, sessions and the user's
    * bot stay under the old id. The old `user_id` is retired, never reissued.
@@ -2593,7 +2609,7 @@ export class Store {
     const now = input.now ?? this.clock.now();
     const { from, to } = input;
     const records = this.retainedRecords(now);
-    const found = this.reserved({ reads: 64 + 8 * records + 2 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_THREAD_LIMIT + 1) }, false, now, () => {
+    const found = this.reserved({ reads: 64 + 8 * records + 2 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_THREAD_LIMIT + 2) }, false, now, () => {
       const identity = this.identityRow(from);
       if (!identity || identity.tier !== "registered") throw new StoreError("invalid_params", `No registered user has the user_id ${from}`.slice(0, 200));
       if (parseRoles(identity.roles_json).includes("bot")) throw new StoreError("invalid_params", "A bot's user_id is fixed");
@@ -2612,7 +2628,8 @@ export class Store {
         reactions: this.rawRows<{ message_id: string; from_json: string }>("SELECT message_id, from_json FROM reaction_state WHERE user_id = ?", from),
         uploads: count("SELECT COUNT(*) AS count FROM uploads INDEXED BY uploads_owner_idx WHERE owner_id = ?"),
         pushes: count("SELECT COUNT(*) AS count FROM push_subscriptions INDEXED BY push_subscriptions_user_idx WHERE user_id = ?") +
-          count("SELECT COUNT(*) AS count FROM push_wakes WHERE user_id = ?"),
+          count("SELECT COUNT(*) AS count FROM push_wakes WHERE user_id = ?") +
+          count("SELECT COUNT(*) AS count FROM mutes WHERE user_id = ?"),
         requests: count("SELECT COUNT(*) AS count FROM accepted_requests WHERE user_id = ?"),
       };
     });
@@ -2658,6 +2675,7 @@ export class Store {
       if (found.pushes) {
         this.rawExec("UPDATE push_subscriptions SET user_id = ? WHERE user_id = ?", to, from);
         this.rawExec("UPDATE push_wakes SET user_id = ? WHERE user_id = ?", to, from);
+        this.rawExec("UPDATE mutes SET user_id = ? WHERE user_id = ?", to, from);
       }
       if (found.requests) this.rawExec("UPDATE accepted_requests SET user_id = ? WHERE user_id = ?", to, from);
       for (const scope of USER_LIMIT_SCOPES) {
@@ -2685,7 +2703,7 @@ export class Store {
    * records: their message snapshots and current messages, with every
    * reaction set on those messages; their reaction sets elsewhere; their
    * memberships and membership records; their uploads; and their identity,
-   * passkey, push subscription, limiter and dedup rows. A logged record that
+   * passkey, push subscription, mute, limiter and dedup rows. A logged record that
    * lists them beside others (a move's reaction sets) is rewritten without
    * them. Rooms they created stay. Clients that already have their content
    * keep it until they load history again. Returns what went, and the R2
@@ -2707,7 +2725,7 @@ export class Store {
     // rows, limiter rows, push subscriptions, credential and identity; each
     // deletion also updates its indexes.
     const perUser = 64 + 4 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS) + 4 * this.config.registeredPostsPerDay + 4 * uploadsPerOwner +
-      4 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_THREAD_LIMIT + 1);
+      4 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_THREAD_LIMIT + 2);
     const cost = { reads: 64 + 5 * records + ids.length * perUser, writes: 64 + 4 * records + ids.length * perUser };
     return this.reserved(cost, false, now, () => this.transaction(() => {
       const messages = this.rawRows<{ message_id: string }>(`SELECT message_id FROM message_state WHERE author_id IN (${marks})`, ...ids)
@@ -2754,7 +2772,7 @@ export class Store {
          WHERE room_id IN (SELECT room_id FROM memberships INDEXED BY memberships_user_idx WHERE user_id IN (${marks}))`,
         ...ids, ...ids,
       );
-      for (const table of ["memberships", "credentials", "push_subscriptions", "push_wakes", "accepted_requests", "identities"]) {
+      for (const table of ["memberships", "credentials", "push_subscriptions", "push_wakes", "mutes", "accepted_requests", "identities"]) {
         this.rawExec(`DELETE FROM ${table} WHERE user_id IN (${marks})`, ...ids);
       }
       this.rawExec(`DELETE FROM principal_limits WHERE principal_key IN (${marks})`, ...ids.map((id) => `user:${id}`));
@@ -4317,7 +4335,7 @@ export class Store {
    * at most MAX_PUSH_CANDIDATES. Each is looked up in turn: only its
    * unexpired registrations whose `wake` includes one of those scopes count,
    * and one with none is passed over without taking a wake; one woken for this room within `coalesceSeconds` is
-   * passed over too (`coalesced`); the rest are woken, up to
+   * passed over too (`coalesced`), and so is a muted one (`muted`); the rest are woken, up to
    * `wakesPerMessage` users, on each of their registrations (most recently
    * registered first). Wakes are charged to the sender's `wakesPerSenderDay`
    * and pushes to the server's `pushesPerDay`; past either, what is left is
@@ -4329,12 +4347,12 @@ export class Store {
     const reasons = new Map<string, number>();
     for (const candidate of input.candidates) reasons.set(candidate.userId, (reasons.get(candidate.userId) ?? 0) | candidate.reasons);
     const candidates = [...reasons.keys()].slice(0, MAX_PUSH_CANDIDATES);
-    const claim: PushClaim = { subscriptions: [], coalesced: 0, skipped: 0 };
+    const claim: PushClaim = { subscriptions: [], coalesced: 0, muted: 0, skipped: 0 };
     if (!policy || !candidates.length) return claim;
     const now = input.now ?? this.clock.now();
     // Each candidate's live index range and wake row, the two counters, and a
     // wake row written for each woken user.
-    const cost = { reads: 48 + candidates.length * (8 + 2 * policy.subscriptionsPerUser), writes: 32 + 4 * policy.wakesPerMessage };
+    const cost = { reads: 48 + candidates.length * (12 + 2 * policy.subscriptionsPerUser), writes: 32 + 4 * policy.wakesPerMessage };
     return this.reserved(cost, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       const day = dayFor(effective);
@@ -4343,6 +4361,12 @@ export class Store {
       let woken = 0;
       for (const userId of candidates) {
         if (woken >= policy.wakesPerMessage) break;
+        // A muted user gets no pushes (protocol §4.11) and takes no wake.
+        const mute = this.rawRows<{ until_ms: number }>("SELECT until_ms FROM mutes WHERE user_id = ? LIMIT 1", userId)[0];
+        if (mute && integerColumn(mute.until_ms) > effective) {
+          claim.muted += 1;
+          continue;
+        }
         // Filtered after the bounded read, so the read stays one index range of
         // at most `subscriptionsPerUser` rows whatever the scopes.
         const rows = this.rawRows<RawPushRow>(
@@ -4409,6 +4433,48 @@ export class Store {
   messageAuthor(messageId: string, now = this.clock.now()): string | null {
     this.ensureReady();
     return this.reserved({ reads: 8 }, false, now, () => this.currentMessage(messageId, this.logState().history_floor)?.author_id ?? null);
+  }
+
+  /**
+   * `status` `mute` (protocol §4.11) for a registered user: until when they
+   * are muted, MUTE_FOREVER for `mute: true`, or null to end it. Whether the
+   * stored mute changed. A mute is the user's, whichever connection set it.
+   */
+  setMute(input: { userId: string; untilMs: number | null; now?: number }): boolean {
+    this.ensureReady();
+    const now = input.now ?? this.clock.now();
+    return this.reserved({ reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
+      const effective = this.effectiveNow(now);
+      if (!this.identityRow(input.userId)) return false;
+      const existing = this.rawRows<{ until_ms: number }>("SELECT until_ms FROM mutes WHERE user_id = ? LIMIT 1", input.userId)[0];
+      const before = existing && integerColumn(existing.until_ms) > effective ? integerColumn(existing.until_ms) : null;
+      if (input.untilMs === null || input.untilMs <= effective) {
+        if (existing) this.rawExec("DELETE FROM mutes WHERE user_id = ?", input.userId);
+        return before !== null;
+      }
+      if (before === input.untilMs) return false;
+      this.rawExec(
+        "INSERT INTO mutes (user_id, until_ms) VALUES (?, ?) ON CONFLICT (user_id) DO UPDATE SET until_ms = excluded.until_ms",
+        input.userId, input.untilMs,
+      );
+      return true;
+    }));
+  }
+
+  /**
+   * A user's mute as `you` echoes it (protocol §4.11): `true` until changed,
+   * else the seconds left, rounded up; undefined when not muted. An expired
+   * mute reads as none and needs no write.
+   */
+  muteOf(userId: string, now = this.clock.now()): number | true | undefined {
+    this.ensureReady();
+    return this.reserved({ reads: 8 }, false, now, () => {
+      const effective = this.effectiveNow(now);
+      const row = this.rawRows<{ until_ms: number }>("SELECT until_ms FROM mutes WHERE user_id = ? LIMIT 1", userId)[0];
+      const until = row ? integerColumn(row.until_ms) : 0;
+      if (until <= effective) return undefined;
+      return until >= MUTE_FOREVER ? true : Math.ceil((until - effective) / 1_000);
+    });
   }
 
   /** Pushes sent today, for `/status`. */

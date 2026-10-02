@@ -1,8 +1,8 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PUSH_POLICY } from '../src/budget';
-import { WAKE_SCOPES, type PushSubscriptionRecord, type Store } from '../src/store';
-import { connect as open, request, until, type Frame, type Peer } from './helpers/socket';
+import { MUTE_FOREVER, WAKE_SCOPES, type PushSubscriptionRecord, type Store } from '../src/store';
+import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
 import { withStore, type TestClock } from './helpers/store';
 import { decryptPush, testBrowser, type TestBrowser } from './helpers/webpush';
 
@@ -47,9 +47,9 @@ async function subscribe(peer: Peer, name: string, pushId?: string, wake?: unkno
 	return { url, browser };
 }
 
-/** Sends `push_away` as the notification it is, then a request, so it is applied before the caller goes on. */
-async function setAway(peer: Peer, away: boolean): Promise<void> {
-	peer.send({ method: 'push_away', params: { away } });
+/** Sends `status` `idle` as the notification it is, then a request, so it is applied before the caller goes on. */
+async function setAway(peer: Peer, idle: boolean): Promise<void> {
+	peer.send({ method: 'status', params: { idle } });
 	expect((await request(peer, `sync-${crypto.randomUUID()}`, 'me', {})).result.you).toBeTruthy();
 }
 
@@ -170,7 +170,7 @@ describe('push over the socket', () => {
 		} finally { peer.close(); }
 	});
 
-	it('tracks push_away per connection: it ends with away false or an accepted message', async () => {
+	it('tracks status idle per connection: it ends with idle false or an accepted message', async () => {
 		const userId = unique('aldo');
 		const peer = await signedIn(userId);
 		const other = await signedIn(userId, true);
@@ -179,7 +179,10 @@ describe('push over the socket', () => {
 			await setAway(peer, true);
 			expect((await awayOf(userId)).sort()).toEqual([false, true]);
 			// A notification only: a request gets the unsupported-method path and changes nothing.
-			expect((await request(peer, 'away-request', 'push_away', { away: false })).error.code).toBe(-32601);
+			expect((await request(peer, 'idle-request', 'status', { idle: false })).error.code).toBe(-32601);
+			// A room's idle is not implemented: a scoped update is ignored.
+			peer.send({ method: 'status', params: { room_id: 'general', idle: false } });
+			await request(peer, 'sync-scoped', 'me', {});
 			expect((await awayOf(userId)).sort()).toEqual([false, true]);
 			// A history page does not end it, nor a refused message; an accepted one does.
 			await request(peer, 'history', 'history', { room_id: 'general' });
@@ -190,18 +193,18 @@ describe('push over the socket', () => {
 			await setAway(peer, true);
 			await setAway(peer, false);
 			expect(await awayOf(userId)).toEqual([false, false]);
-			// `away` is required and a boolean; a malformed one changes nothing.
-			// (Another connection: each counts as a policy violation.)
+			// A malformed idle changes nothing; nor do unknown fields or `invisible`.
+			// (Another connection: each malformed one counts as a policy violation.)
 			await setAway(other, true);
-			for (const params of [{}, { away: 'no' }]) {
-				other.send({ method: 'push_away', params });
+			for (const params of [{ idle: 'no' }, { idle: 1 }, { invisible: true, other: 1 }]) {
+				other.send({ method: 'status', params });
 				await request(other, `sync-${JSON.stringify(params)}`, 'me', {});
 				expect((await awayOf(userId)).sort(), JSON.stringify(params)).toEqual([false, true]);
 			}
 		} finally { peer.close(); other.close(); }
 	});
 
-	it('ignores push_away without push, and activity no longer sets or ends away', async () => {
+	it('ignores status without push, and activity does not set or end idle', async () => {
 		const pushes = capturePushes();
 		const [aliceId, bobId, carolId] = [unique('alice'), unique('bob'), unique('carol')];
 		const alice = await signedIn(aliceId);
@@ -211,10 +214,10 @@ describe('push over the socket', () => {
 		try {
 			await subscribe(bob, 'bob');
 			const carolSub = await subscribe(carol, 'carol');
-			// Activity's `away` is not push_away: Bob stays attended.
+			// Activity's `away` is not status: Bob stays attended.
 			expect((await request(bob, 'activity-away', 'activity', { away: true })).result).toEqual({});
 			expect(await awayOf(bobId)).toEqual([false]);
-			// Nor do typing or a read cursor end push_away.
+			// Nor do typing or a read cursor end idle.
 			await setAway(carol, true);
 			expect((await request(carol, 'typing', 'activity', { room_id: 'general', typing: 2 })).result).toEqual({});
 			carol.send({ method: 'activity', params: { room_id: 'general', read_message_id: '1' } });
@@ -223,7 +226,7 @@ describe('push over the socket', () => {
 			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
 			expect(pushes[0].url).toBe(carolSub.url);
 
-			// Without push, push_away is an unknown notification: ignored.
+			// Without push, status is an unknown notification: ignored.
 			const saved = await runInDurableObject(stub(), (instance) => {
 				const runtime = instance as unknown as Runtime;
 				const push = runtime.config.push;
@@ -438,6 +441,93 @@ describe('wake scopes', () => {
 	});
 });
 
+describe('status mute', () => {
+	/** Frames this peer receives until a reply to a `me` request, so earlier notifications are all in. */
+	async function drainTo(peer: Peer, id: string): Promise<Frame[]> {
+		return (await exchange(peer, id, 'me', {})).skipped;
+	}
+	const youOf = (frames: Frame[]) => frames.filter((frame) => frame.method === 'user' && frame.params.you).map((frame) => frame.params.you);
+
+	it('mutes a user\'s pushes for seconds or until changed, echoed in you to their connections', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId] = [unique('alice'), unique('bob')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		const bobToo = await signedIn(bobId, true);
+		try {
+			const bobSub = await subscribe(bob, 'bob');
+			await setAway(bob, true);
+			await setAway(bobToo, true);
+			bob.send({ method: 'status', params: { mute: 3600 } });
+			// Every connection of Bob's hears it, the one that set it included; never anyone else.
+			const echoed = youOf(await drainTo(bobToo, 'sync-too'));
+			expect(echoed).toHaveLength(1);
+			expect(echoed[0]).toMatchObject({ user_id: bobId, mute: expect.any(Number) });
+			expect(echoed[0].mute).toBeGreaterThan(3590);
+			expect(echoed[0].mute).toBeLessThanOrEqual(3600);
+			expect(youOf(await drainTo(bob, 'sync-bob'))).toHaveLength(1);
+			expect(youOf(await drainTo(alice, 'sync-alice'))).toEqual([]);
+			// `me` and a new sign-in echo it too.
+			expect((await request(bob, 'me', 'me', {})).result.you.mute).toBeGreaterThan(3590);
+			const later = await signedIn(bobId, true);
+			later.close();
+			// Muted: no push, and no wake slot taken.
+			await post(alice, 'muted', { body: { text: 'hi', mentions: [bobId] } });
+			// `true` mutes until changed.
+			bob.send({ method: 'status', params: { mute: true } });
+			expect(youOf(await drainTo(bobToo, 'sync-true'))[0].mute).toBe(true);
+			await post(alice, 'muted-forever', { body: { text: 'hi', mentions: [bobId] } });
+			// 0 ends it: `you` without mute, and pushes again (once Bob is idle again).
+			bob.send({ method: 'status', params: { mute: 0 } });
+			const ended = youOf(await drainTo(bobToo, 'sync-zero'));
+			expect(ended).toHaveLength(1);
+			expect(ended[0]).not.toHaveProperty('mute');
+			await setAway(bob, true);
+			await post(alice, 'unmuted', { body: { text: 'welcome back', mentions: [bobId] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(pushes[0].url).toBe(bobSub.url);
+			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.body.text).toBe('welcome back');
+			// Ending a mute that is not set changes nothing and echoes nothing.
+			bob.send({ method: 'status', params: { mute: 0 } });
+			expect(youOf(await drainTo(bobToo, 'sync-again'))).toEqual([]);
+		} finally { alice.close(); bob.close(); bobToo.close(); }
+	});
+
+	it('applies status sent before authentication once signed in', async () => {
+		const userId = unique('early');
+		const first = await signedIn(userId);
+		const token = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).issueSession(userId, 'http://localhost:5173', Date.now()));
+		const peer = await connect();
+		try {
+			await peer.next();
+			peer.send({ method: 'status', params: { idle: true, mute: true } });
+			const you = (await request(peer, 'auth', 'auth', { scheme: 'token', token })).result.you;
+			expect(you).toMatchObject({ user_id: userId, mute: true });
+			expect((await awayOf(userId)).sort()).toEqual([false, true]);
+			// The user's other connection hears of the mute.
+			expect(youOf(await drainTo(first, 'sync-first'))[0]).toMatchObject({ user_id: userId, mute: true });
+		} finally { first.close(); peer.close(); }
+	});
+
+	it('refuses malformed mutes and ignores guests\' mutes', async () => {
+		const userId = unique('mal');
+		for (const pair of [[-1, 1.5], ['3600', false]]) {
+			const peer = await signedIn(userId, pair[0] !== -1);
+			try {
+				for (const mute of pair) peer.send({ method: 'status', params: { mute } });
+				expect((await request(peer, 'me', 'me', {})).result.you).not.toHaveProperty('mute');
+			} finally { peer.close(); }
+		}
+		const guest = await connect();
+		try {
+			await guest.next();
+			await request(guest, 'auth', 'auth', { scheme: 'guest' });
+			guest.send({ method: 'status', params: { mute: true } });
+			expect((await request(guest, 'me', 'me', {})).result.you).not.toHaveProperty('mute');
+		} finally { guest.close(); }
+	});
+});
+
 describe('push limits over the socket', () => {
 	it('limits push_register to registersPerUserMinute a user', async () => {
 		const userId = unique('reg');
@@ -557,13 +647,13 @@ describe('push subscriptions in the store', () => {
 				registerUser(store, clock, userId);
 				for (const n of [1, 2]) store.registerPushSubscription({ userId, url: `https://push.example.net/${userId}/${n}`, ...keys, now: clock.value });
 			}
-			expect(claim(store, clock, [])).toEqual({ subscriptions: [], coalesced: 0, skipped: 0 });
+			expect(claim(store, clock, [])).toEqual({ subscriptions: [], coalesced: 0, muted: 0, skipped: 0 });
 			const first = claim(store, clock, ['cy', 'di', 'nobody']);
 			expect(first.subscriptions).toHaveLength(3);
 			expect(first.skipped).toBe(1);
 			expect(store.pushesToday(clock.value)).toBe(3);
 			clock.value += 1_000;
-			expect(claim(store, clock, ['cy'])).toEqual({ subscriptions: [], coalesced: 0, skipped: 2 });
+			expect(claim(store, clock, ['cy'])).toEqual({ subscriptions: [], coalesced: 0, muted: 0, skipped: 2 });
 			clock.value += DAY;
 			expect(claim(store, clock, ['cy'], 'general', 'sal').subscriptions).toHaveLength(2);
 			expect(store.pushesToday(clock.value)).toBe(2);
@@ -608,6 +698,38 @@ describe('push subscriptions in the store', () => {
 			}
 			expect(store.pushSubscriptionsOf('kit')).toEqual([]);
 			expect(store.pushSubscriptionsOf('lou')).toHaveLength(1);
+		});
+	});
+
+	it('mutes for seconds or until changed, skips muted users without a wake slot, and moves mutes with /rename', async () => {
+		const keys = await browserKeys();
+		await withStore('push-mute', { push: { ...POLICY, wakesPerMessage: 1 } }, (store, clock) => {
+			for (const userId of ['mo', 'ned']) {
+				registerUser(store, clock, userId);
+				store.registerPushSubscription({ userId, url: `https://push.example.net/${userId}`, ...keys, now: clock.value });
+			}
+			expect(store.setMute({ userId: 'mo', untilMs: clock.value + 90_500, now: clock.value })).toBe(true);
+			expect(store.muteOf('mo', clock.value)).toBe(91);
+			const first = claim(store, clock, ['mo', 'ned']);
+			expect(first.subscriptions.map((row) => row.userId)).toEqual(['ned']);
+			expect(first.muted).toBe(1);
+			// It ends by itself, with no write.
+			clock.value += 91_000;
+			expect(store.muteOf('mo', clock.value)).toBeUndefined();
+			expect(claim(store, clock, ['mo'], 'thread').subscriptions.map((row) => row.userId)).toEqual(['mo']);
+			expect(store.setMute({ userId: 'mo', untilMs: MUTE_FOREVER, now: clock.value })).toBe(true);
+			expect(store.setMute({ userId: 'mo', untilMs: MUTE_FOREVER, now: clock.value })).toBe(false);
+			clock.value += 400 * 86_400_000;
+			expect(store.muteOf('mo', clock.value)).toBe(true);
+			// No identity, no mute.
+			expect(store.setMute({ userId: 'guest_3', untilMs: MUTE_FOREVER, now: clock.value })).toBe(false);
+			store.renameIdentity({ from: 'mo', to: 'moe', now: clock.value });
+			expect(store.muteOf('mo', clock.value)).toBeUndefined();
+			expect(store.muteOf('moe', clock.value)).toBe(true);
+			store.purgeUsers({ userIds: ['moe'], now: clock.value });
+			registerUser(store, clock, 'moe');
+			expect(store.muteOf('moe', clock.value)).toBeUndefined();
+			expect(store.setMute({ userId: 'moe', untilMs: null, now: clock.value })).toBe(false);
 		});
 	});
 

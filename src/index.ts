@@ -30,6 +30,8 @@ import {
 	MAX_PASSKEYS_PER_USER,
 	MAX_PUSH_URL_BYTES,
 	MAX_ROLES_PER_USER,
+	MAX_MUTE_SECONDS,
+	MUTE_FOREVER,
 	PUSH_ID_PATTERN,
 	ROLE_PATTERN,
 	WAKE_SCOPES,
@@ -118,11 +120,18 @@ interface ConnectionAttachment {
 	 */
 	listedJoined?: boolean;
 	/**
-	 * The client said nobody is attending this connection (`push_away`, §4.7),
-	 * so a mention or reply may wake its user by push. Cleared by `push_away`
-	 * `{away: false}` or an accepted message from this connection.
+	 * The client said nobody is attending this connection (`status` `idle`,
+	 * §4.11), so a mention or reply may wake its user by push (§4.7). Cleared
+	 * by `idle: false` or an accepted message from this connection; kept
+	 * from before authentication.
 	 */
 	away?: boolean;
+	/**
+	 * A `status` `mute` sent before authentication (§4.11), as the `mutes`
+	 * row's `until_ms` it asks for (0 ends a mute), applied once the
+	 * connection signs in as a registered user.
+	 */
+	pendingMute?: number;
 	closing?: boolean;
 }
 
@@ -438,6 +447,7 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			} : {}),
 			...(attachment.listedJoined ? { listedJoined: true } : {}),
 			...(attachment.away === true ? { away: true } : {}),
+			...(Number.isSafeInteger(attachment.pendingMute) && attachment.pendingMute! >= 0 ? { pendingMute: attachment.pendingMute } : {}),
 			authDeadline: typeof attachment.authDeadline === "number" ? attachment.authDeadline : 0,
 			pendingFrames: typeof attachment.pendingFrames === "number" ? attachment.pendingFrames : 0,
 			pendingBytes: typeof attachment.pendingBytes === "number" ? attachment.pendingBytes : 0,
@@ -499,6 +509,8 @@ function writeSessionAttachment(socket: WebSocketConnection, attachment: Connect
 		attachment.closing = current.closing;
 		if (current.away) attachment.away = true;
 		else delete attachment.away;
+		if (current.pendingMute !== undefined) attachment.pendingMute = current.pendingMute;
+		else delete attachment.pendingMute;
 	}
 	writeAttachment(socket, attachment);
 }
@@ -604,7 +616,7 @@ function identityOf(attachment: ConnectionAttachment): IdentityShape | null {
  * A user object as this server sends it (§3.3): `user_id` and `name`, and in
  * current objects `avatar` and `roles`.
  */
-type PublicUser = { user_id: string; name?: string; avatar?: string; roles?: string[] };
+type PublicUser = { user_id: string; name?: string; avatar?: string; roles?: string[]; mute?: number | true };
 
 /**
  * A room in a listing, with `members` when asked for (§4.3.1), and
@@ -1143,6 +1155,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 					"history", "edit", "rooms", "reactions", "command",
 					...(this.activityOn() ? ["activity"] : []),
 					...(this.uploadsOn() ? ["embed:upload"] : []),
+					// Idle connections and mutes, which decide pushes (§4.7, §4.11).
+					...(this.config.push ? ["status"] : []),
 				],
 				// Passkeys and their session tokens only where passkeys are offered;
 				// bot tokens (`/invite-bot`) from anywhere, since bots are not browsers.
@@ -1390,11 +1404,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (!this.activityOn()) break;
 				await this.handleActivity(socket, request);
 				return;
-			case "push_away":
-				// A notification only, on a push server (§4.7); a request, like a
+			case "status":
+				// A notification only, on a push server (§4.11); a request, like a
 				// `ping` request, gets the unsupported-method path.
 				if (!this.config.push || request.id !== undefined) break;
-				this.handlePushAway(socket, attachment, request);
+				this.handleStatus(socket, attachment, request);
 				return;
 			case "push_register":
 				if (!this.config.push) break;
@@ -1447,7 +1461,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// A guest auth on an authenticated connection changes nothing: answer it
 		// without charging an attempt.
 		if (request.params.scheme === "guest" && (attachment.tier === "anonymous" || attachment.tier === "registered")) {
-			this.reply(socket, request, { you: this.current(attachment) });
+			this.reply(socket, request, { you: this.you(attachment) });
 			return;
 		}
 		this.store.reserveAuthAttempt({ ipKey: attachment.ipKey, now: nowMs() });
@@ -1573,7 +1587,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 					text: "A passkey was added to your account from another connection. If it wasn't you, remove it with `/passkeys`.", format: "markdown",
 				} } });
 			}
-			this.reply(socket, request, { you: this.current(latest) });
+			this.reply(socket, request, { you: this.you(latest) });
 			await this.rescheduleAlarm();
 			return;
 		}
@@ -1590,7 +1604,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.rooms = this.registeredRooms(socket, finished.identity.user_id);
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
-		this.reply(socket, request, { you: this.current(attachment), token });
+		this.applyPendingMute(socket);
+		this.reply(socket, request, { you: this.you(attachment), token });
 		if (guest) this.announceUser(socket, this.current(attachment), [...guestRooms, ...attachment.rooms], guest);
 		this.refreshAvatar(finished.identity.user_id);
 		await this.rescheduleAlarm();
@@ -1691,7 +1706,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
-		this.reply(socket, request, { you: this.current(attachment), token });
+		this.applyPendingMute(socket);
+		this.reply(socket, request, { you: this.you(attachment), token });
 		if (guest) this.announceUser(socket, this.current(attachment), [...guestRooms, ...attachment.rooms], guest);
 		this.refreshAvatar(identity.userId);
 		await this.rescheduleAlarm();
@@ -1769,7 +1785,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
-		this.reply(socket, request, { you: this.current(attachment), ...(token ? { token } : {}) });
+		this.applyPendingMute(socket);
+		this.reply(socket, request, { you: this.you(attachment), ...(token ? { token } : {}) });
 		if (guest) this.announceUser(socket, this.current(attachment), [...guestRooms, ...attachment.rooms], guest);
 		this.refreshAvatar(identity.userId);
 		await this.rescheduleAlarm();
@@ -2025,7 +2042,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (name === undefined) {
 			const current = connectionAttachment(socket) ?? attachment;
-			this.reply(socket, request, { you: removeAvatar ? { ...this.current(current), avatar: "" } : this.current(current) });
+			this.reply(socket, request, { you: removeAvatar ? { ...this.you(current), avatar: "" } : this.you(current) });
 			return;
 		}
 		if (attachment.tier !== "registered") {
@@ -2055,7 +2072,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!current) return;
 			// A removed name is announced as its empty value (§3.3).
 			const you = { ...this.current(current)!, ...(current.name ? {} : { name: "" }) };
-			this.reply(socket, request, { you });
+			const mute = this.you(current)?.mute;
+			this.reply(socket, request, { you: mute === undefined ? you : { ...you, mute } });
 			// Section 3.3: `you` to the user's other connections, `new` to those who share a room with the user.
 			if (!result.deduplicated) this.announceUser(socket, you, current.rooms ?? []);
 		});
@@ -2114,7 +2132,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (messageId === undefined && request.params.body === undefined) throw { name: "invalid_params", message: "Missing body" } satisfies ProtocolError;
 		if (request.params.body !== undefined) objectParam(request.params, "body");
 		await this.commitAndBroadcast(socket, attachment, request, "message", "posting");
-		// An accepted message from a connection ends its `push_away` (§4.7).
+		// An accepted message from a connection ends its `idle` (§4.11).
 		this.setAway(socket, false);
 	}
 
@@ -2301,7 +2319,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * Activity (§4.4). Typing is relayed to the room's other members and never
 	 * stored; without room_id it is in the default room. Read cursors are
 	 * dropped: the demo neither keeps nor relays them. Neither touches the
-	 * connection's `push_away` (§4.7). At most
+	 * connection's `status` `idle` (§4.11). At most
 	 * `activityBroadcastsPerUserMinute` relays per user; past that the update
 	 * is dropped and the sender gets one `~private` notice per minute.
 	 */
@@ -2334,20 +2352,82 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `push_away` (§4.7), a notification: `{away: true}` marks this connection
-	 * unattended, `{away: false}` attended again. Kept in the attachment, so it
-	 * survives hibernation; an accepted message from the connection also ends
-	 * it, and closing removes the connection. Never delivered. Before
-	 * authentication it is ignored, like other notifications.
+	 * `status` (§4.11), a notification, implemented in part: unscoped `idle`
+	 * and `mute`. `idle` marks this connection unattended (true) or attended
+	 * (false), kept in the attachment, so it survives hibernation; an
+	 * accepted message from the connection also ends it, and closing removes
+	 * the connection. `mute` is the user's: seconds to stay quiet (cut to
+	 * MAX_MUTE_SECONDS), `true` until changed, or `0` to end it; stored, so
+	 * it outlasts the connection, and echoed in `you` to the user's
+	 * connections when it changes. Guests get no pushes, so their mute is
+	 * ignored. Both may come before authentication, and apply once signed in.
+	 * A `room_id` scopes the fields to a room, which this server does not
+	 * implement, so a scoped update is ignored, as are `invisible` and
+	 * unknown fields. A malformed `idle` or `mute` is `invalid_params`, and
+	 * nothing in the update applies.
 	 */
-	private handlePushAway(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): void {
-		if (!identityOf(attachment)) return;
-		const away = request.params.away;
-		if (typeof away !== "boolean") throw { name: "invalid_params", message: "away must be a boolean" } satisfies ProtocolError;
-		this.setAway(socket, away);
+	private handleStatus(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): void {
+		const params = request.params;
+		if (params.room_id !== undefined) return;
+		const idle = params.idle;
+		if (idle !== undefined && typeof idle !== "boolean") throw { name: "invalid_params", message: "idle must be a boolean" } satisfies ProtocolError;
+		const mute = params.mute;
+		if (mute !== undefined && mute !== true && !(typeof mute === "number" && Number.isSafeInteger(mute) && mute >= 0)) {
+			throw { name: "invalid_params", message: "mute must be true or a whole number of seconds" } satisfies ProtocolError;
+		}
+		if (typeof idle === "boolean") this.setAway(socket, idle);
+		if (mute === undefined) return;
+		const now = nowMs();
+		const untilMs = mute === true ? MUTE_FOREVER : mute === 0 ? 0 : now + Math.min(mute, MAX_MUTE_SECONDS) * 1_000;
+		if (attachment.tier === "pending") {
+			const state = connectionAttachment(socket);
+			if (!state) return;
+			state.pendingMute = untilMs;
+			writeAttachment(socket, state);
+			return;
+		}
+		if (attachment.tier === "registered") this.changeMute(attachment.userId!, untilMs, now);
 	}
 
-	/** Marks a connection away or attended (`push_away`, §4.7), writing its attachment only on a change. */
+	/**
+	 * Stores a registered user's mute (0 ends it) and, on a change, sends
+	 * `user` `you` with it to every connection of theirs but `except` (§4.11).
+	 * Never shown to others.
+	 */
+	private changeMute(userId: string, untilMs: number, now: number, except?: WebSocketConnection): void {
+		if (!this.store.setMute({ userId, untilMs: untilMs > 0 ? untilMs : null, now })) return;
+		const mute = this.store.muteOf(userId, now);
+		for (const peer of this.connectionsOf(userId, except)) {
+			const state = connectionAttachment(peer);
+			const user = state ? this.current(state) : null;
+			if (user) this.deliverTo(peer, { method: "user", params: { you: { ...user, ...(mute !== undefined ? { mute } : {}) } } });
+		}
+	}
+
+	/** Applies a `status` `mute` sent before this connection signed in as a registered user. */
+	private applyPendingMute(socket: WebSocketConnection): void {
+		const state = connectionAttachment(socket);
+		if (!state || state.pendingMute === undefined) return;
+		const untilMs = state.pendingMute;
+		delete state.pendingMute;
+		writeAttachment(socket, state);
+		// This connection learns the mute from its auth result.
+		if (state.tier === "registered" && state.userId) this.changeMute(state.userId, untilMs, nowMs(), socket);
+	}
+
+	/**
+	 * A connection's own user object (`you`, §3.3): its current object and,
+	 * for a muted registered user, `mute`, the seconds left or `true` (§4.11),
+	 * which is never shown to others.
+	 */
+	private you(attachment: ConnectionAttachment): PublicUser | null {
+		const user = this.current(attachment);
+		if (!user || attachment.tier !== "registered" || !this.config.push) return user;
+		const mute = this.store.muteOf(user.user_id);
+		return mute === undefined ? user : { ...user, mute };
+	}
+
+	/** Marks a connection idle or attended (`status` `idle`, §4.11), writing its attachment only on a change. */
 	private setAway(socket: WebSocketConnection, away: boolean): void {
 		const state = connectionAttachment(socket);
 		if (!state || (state.away === true) === away) return;
@@ -2356,7 +2436,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		writeAttachment(socket, state);
 	}
 
-	/** Whether a user has a connection someone attends: authenticated as them, not stale, and not away (`push_away`, §4.7). */
+	/** Whether a user has a connection someone attends: authenticated as them, not stale, and not idle (§4.11). */
 	private attended(userId: string, now: number): boolean {
 		return this.connectionsOf(userId).some((peer) => !this.isStale(peer, now) && !connectionAttachment(peer)?.away);
 	}
