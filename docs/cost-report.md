@@ -70,6 +70,8 @@ upper bounds can be compared with the measured worst case.
 | Push wake claim (one user, one subscription; creates both counters) | 18 | 19 | 74 | 80 |
 | Push wake claim, 31 unregistered candidates before one registered | 41 | 9 | 632 | 80 |
 | Gone push subscription forget | 4 | 3 | 24 | 24 |
+| Push reply author lookup | 5 | 2 | 16 | 8 |
+| Push wake claim for a reply (creates the sender's counter) | 14 | 14 | 74 | 80 |
 | Message create with request ID | 33 | 37 | 296 | 120 |
 | Empty new message (not logged) | 4 | 2 | 16 | 8 |
 | Deduplicated mutation retry | 5 | 2 | 32 | 16 |
@@ -295,8 +297,10 @@ bytes, not row counts. The reservation is sized for evicting a user's whole
 index range under any valid policy (64 registrations), which the credit-back
 returns.
 
-Choosing whom a new message wakes reads connection attachments only. The
-wake claim then looks up the candidates in turn, at most 32: an unregistered
+Choosing whom a new message wakes reads connection attachments, plus one
+indexed read of the replied-to message's current state when the message is
+a reply (5/2 with its reservation). Registrations carry their wake scopes
+in the same row, so filtering by scope costs no extra rows. The wake claim then looks up the candidates in turn, at most 32: an unregistered
 one costs about one read of its live index range, and a registered one also
 reads its wake time for the room. A message that wakes someone writes each
 woken user's wake time and the server's and sender's counters: 19 writes for

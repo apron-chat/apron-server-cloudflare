@@ -780,6 +780,27 @@ const PUSH_REFRESH_MS = 86_400_000;
 export const PUSH_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
 /**
+ * The wake scopes this server implements (protocol §4.7), each a bit of a
+ * registration's `wake` column: `mentions` (messages whose `mentions` list
+ * the user) and `replies` (replies to the user's messages).
+ */
+export const WAKE_SCOPES = { mentions: 1, replies: 2 } as const;
+export type WakeScope = keyof typeof WAKE_SCOPES;
+/** Every scope, the default for a registration without `wake`. */
+export const DEFAULT_WAKE = WAKE_SCOPES.mentions | WAKE_SCOPES.replies;
+
+/** The scopes a `wake` bitmask names, in WAKE_SCOPES order. */
+export function wakeScopes(mask: number): WakeScope[] {
+  return (Object.keys(WAKE_SCOPES) as WakeScope[]).filter((scope) => (mask & WAKE_SCOPES[scope]) !== 0);
+}
+
+/** A user a message may wake, and why: a bitmask of WAKE_SCOPES. */
+export interface PushCandidate {
+  userId: string;
+  reasons: number;
+}
+
+/**
  * A user's Web Push registration (protocol §4.7, kind `webpush`): its
  * endpoint, the browser's keys, and the client's `push_id`, which every push
  * to it carries. A registration is the user's: two users may register the
@@ -791,10 +812,14 @@ export interface PushSubscriptionRecord {
   p256dh: string;
   auth: string;
   pushId?: string;
+  /** The scopes it wakes for (protocol §4.7). */
+  wake: WakeScope[];
 }
 
-function pushRecord(row: { url: string; p256dh: string; auth: string; push_id: string | null }, userId: string): PushSubscriptionRecord {
-  return { url: row.url, userId, p256dh: row.p256dh, auth: row.auth, ...(row.push_id !== null ? { pushId: row.push_id } : {}) };
+type RawPushRow = { url: string; p256dh: string; auth: string; push_id: string | null; wake: number };
+
+function pushRecord(row: RawPushRow, userId: string): PushSubscriptionRecord {
+  return { url: row.url, userId, p256dh: row.p256dh, auth: row.auth, ...(row.push_id !== null ? { pushId: row.push_id } : {}), wake: wakeScopes(integerColumn(row.wake)) };
 }
 
 /** What a message's wake claimed (Store.claimPushes). */
@@ -1172,6 +1197,7 @@ const SCHEMA_DDL = `
     p256dh TEXT NOT NULL,
     auth TEXT NOT NULL,
     push_id TEXT,
+    wake INTEGER NOT NULL DEFAULT 3,
     created_ms INTEGER NOT NULL,
     updated_ms INTEGER NOT NULL,
     PRIMARY KEY (user_id, url)
@@ -1526,6 +1552,7 @@ export class Store {
           p256dh TEXT NOT NULL,
           auth TEXT NOT NULL,
           push_id TEXT,
+          wake INTEGER NOT NULL DEFAULT 3,
           created_ms INTEGER NOT NULL,
           updated_ms INTEGER NOT NULL,
           PRIMARY KEY (user_id, url)
@@ -4215,21 +4242,25 @@ export class Store {
 
   /**
    * `push_register` (protocol §4.7, kind `webpush`): keeps a registered
-   * user's registration of the endpoint `url`, with its `push_id`.
-   * Registrations are the user's own: registering a `url` the user holds
-   * again replaces its keys and `push_id` (removing one now absent), and two
+   * user's registration of the endpoint `url`, with its `push_id` and the
+   * `wake` scopes it wakes for (a WAKE_SCOPES bitmask, DEFAULT_WAKE when not
+   * given). Registrations are the user's own: registering a `url` the user
+   * holds again replaces its keys, `push_id` (removing one now absent) and
+   * scopes, and two
    * users may register the same `url`. A user past `subscriptionsPerUser`
    * loses the least recently registered of the others. Clients register on
-   * every connection, so an unchanged registration (keys and `push_id`)
+   * every connection, so an unchanged registration (keys, `push_id`, scopes)
    * registered again within a day writes nothing; one not registered for
    * `pushExpiryDays` is skipped by wakes and deleted by cleanup.
    */
-  registerPushSubscription(input: { userId: string; url: string; p256dh: string; auth: string; pushId?: string; now?: number }): void {
+  registerPushSubscription(input: { userId: string; url: string; p256dh: string; auth: string; pushId?: string; wake?: number; now?: number }): void {
     this.ensureReady();
     const policy = this.config.push;
     if (!policy) throw new StoreError("unsupported", "Push is not available here");
     if (utf8Bytes(input.url) > MAX_PUSH_URL_BYTES) throw new StoreError("too_large", "url is too long");
     if (input.pushId !== undefined && !PUSH_ID_PATTERN.test(input.pushId)) throw new StoreError("invalid_params", "push_id must be 1 to 64 letters, digits, _ or -");
+    const wake = input.wake ?? DEFAULT_WAKE;
+    if (!Number.isInteger(wake) || wake < 0 || (wake & ~DEFAULT_WAKE) !== 0) throw new StoreError("invalid_params", "wake must name known scopes");
     const now = input.now ?? this.clock.now();
     // The row and the user's index range; each eviction rewrites a row and
     // its three index entries.
@@ -4238,17 +4269,17 @@ export class Store {
       const effective = this.effectiveNow(now);
       if (!this.identityRow(input.userId)) throw new StoreError("denied", "Sign in to receive push notifications");
       const pushId = input.pushId ?? null;
-      const existing = this.rawRows<{ p256dh: string; auth: string; push_id: string | null; updated_ms: number }>(
-        "SELECT p256dh, auth, push_id, updated_ms FROM push_subscriptions WHERE user_id = ? AND url = ? LIMIT 1",
+      const existing = this.rawRows<{ p256dh: string; auth: string; push_id: string | null; wake: number; updated_ms: number }>(
+        "SELECT p256dh, auth, push_id, wake, updated_ms FROM push_subscriptions WHERE user_id = ? AND url = ? LIMIT 1",
         input.userId, input.url,
       )[0];
-      if (existing && existing.p256dh === input.p256dh && existing.auth === input.auth && existing.push_id === pushId &&
+      if (existing && existing.p256dh === input.p256dh && existing.auth === input.auth && existing.push_id === pushId && integerColumn(existing.wake) === wake &&
           effective - integerColumn(existing.updated_ms) < PUSH_REFRESH_MS) return;
       if (!existing) this.ensureGrowthCapacity(2 * MAX_PUSH_URL_BYTES);
       this.rawExec(
-        `INSERT INTO push_subscriptions (user_id, url, p256dh, auth, push_id, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (user_id, url) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, push_id = excluded.push_id, updated_ms = excluded.updated_ms`,
-        input.userId, input.url, input.p256dh, input.auth, pushId, effective, effective,
+        `INSERT INTO push_subscriptions (user_id, url, p256dh, auth, push_id, wake, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (user_id, url) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, push_id = excluded.push_id, wake = excluded.wake, updated_ms = excluded.updated_ms`,
+        input.userId, input.url, input.p256dh, input.auth, pushId, wake, effective, effective,
       );
       // The new one never goes, even when it shares its millisecond with others.
       this.rawExec(
@@ -4272,8 +4303,8 @@ export class Store {
   /** A user's push registrations, expired ones included, most recently registered first. */
   pushSubscriptionsOf(userId: string, now = this.clock.now()): PushSubscriptionRecord[] {
     this.ensureReady();
-    return this.reserved({ reads: 8 + 2 * MAX_PUSH_SUBSCRIPTIONS_PER_USER }, false, now, () => this.rawRows<{ url: string; p256dh: string; auth: string; push_id: string | null }>(
-      `SELECT url, p256dh, auth, push_id FROM push_subscriptions INDEXED BY push_subscriptions_user_idx
+    return this.reserved({ reads: 8 + 2 * MAX_PUSH_SUBSCRIPTIONS_PER_USER }, false, now, () => this.rawRows<RawPushRow>(
+      `SELECT url, p256dh, auth, push_id, wake FROM push_subscriptions INDEXED BY push_subscriptions_user_idx
        WHERE user_id = ? ORDER BY updated_ms DESC LIMIT ?`,
       userId, MAX_PUSH_SUBSCRIPTIONS_PER_USER,
     ).map((row) => pushRecord(row, userId)));
@@ -4281,20 +4312,23 @@ export class Store {
 
   /**
    * The registrations a new message in `roomId` pushes to (protocol §4.7).
-   * `candidates` are the users the caller found unattended among those it
-   * mentions, in mention order, at most MAX_PUSH_CANDIDATES. Each is looked
-   * up in turn: one without an unexpired registration is passed over without
-   * taking a wake; one woken for this room within `coalesceSeconds` is
+   * `candidates` are the users the caller found unattended among those the
+   * message mentions or replies to, each with the scopes it qualifies under,
+   * at most MAX_PUSH_CANDIDATES. Each is looked up in turn: only its
+   * unexpired registrations whose `wake` includes one of those scopes count,
+   * and one with none is passed over without taking a wake; one woken for this room within `coalesceSeconds` is
    * passed over too (`coalesced`); the rest are woken, up to
    * `wakesPerMessage` users, on each of their registrations (most recently
    * registered first). Wakes are charged to the sender's `wakesPerSenderDay`
    * and pushes to the server's `pushesPerDay`; past either, what is left is
    * `skipped`. Each woken user's time for the room is kept for coalescing.
    */
-  claimPushes(input: { senderId: string; roomId: string; candidates: readonly string[]; now?: number }): PushClaim {
+  claimPushes(input: { senderId: string; roomId: string; candidates: readonly PushCandidate[]; now?: number }): PushClaim {
     this.ensureReady();
     const policy = this.config.push;
-    const candidates = [...new Set(input.candidates)].slice(0, MAX_PUSH_CANDIDATES);
+    const reasons = new Map<string, number>();
+    for (const candidate of input.candidates) reasons.set(candidate.userId, (reasons.get(candidate.userId) ?? 0) | candidate.reasons);
+    const candidates = [...reasons.keys()].slice(0, MAX_PUSH_CANDIDATES);
     const claim: PushClaim = { subscriptions: [], coalesced: 0, skipped: 0 };
     if (!policy || !candidates.length) return claim;
     const now = input.now ?? this.clock.now();
@@ -4309,11 +4343,13 @@ export class Store {
       let woken = 0;
       for (const userId of candidates) {
         if (woken >= policy.wakesPerMessage) break;
-        const rows = this.rawRows<{ url: string; p256dh: string; auth: string; push_id: string | null }>(
-          `SELECT url, p256dh, auth, push_id FROM push_subscriptions INDEXED BY push_subscriptions_user_idx
+        // Filtered after the bounded read, so the read stays one index range of
+        // at most `subscriptionsPerUser` rows whatever the scopes.
+        const rows = this.rawRows<RawPushRow>(
+          `SELECT url, p256dh, auth, push_id, wake FROM push_subscriptions INDEXED BY push_subscriptions_user_idx
            WHERE user_id = ? AND updated_ms >= ? ORDER BY updated_ms DESC LIMIT ?`,
           userId, live, policy.subscriptionsPerUser,
-        );
+        ).filter((row) => (integerColumn(row.wake) & reasons.get(userId)!) !== 0);
         if (!rows.length) continue;
         const last = this.rawRows<{ woken_ms: number }>("SELECT woken_ms FROM push_wakes WHERE user_id = ? AND room_id = ? LIMIT 1", userId, input.roomId)[0];
         if (last && effective - integerColumn(last.woken_ms) < policy.coalesceSeconds * 1_000) {
@@ -4363,6 +4399,16 @@ export class Store {
         this.rawExec("DELETE FROM push_subscriptions WHERE url = ? AND p256dh = ?", row.url, row.p256dh);
       }
     }));
+  }
+
+  /**
+   * The author of a retained message, for waking the user a reply answers
+   * (protocol §4.7 `replies`): one indexed read of its current state. Null
+   * for an unknown or expired message.
+   */
+  messageAuthor(messageId: string, now = this.clock.now()): string | null {
+    this.ensureReady();
+    return this.reserved({ reads: 8 }, false, now, () => this.currentMessage(messageId, this.logState().history_floor)?.author_id ?? null);
   }
 
   /** Pushes sent today, for `/status`. */

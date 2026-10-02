@@ -1,7 +1,7 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PUSH_POLICY } from '../src/budget';
-import type { PushSubscriptionRecord, Store } from '../src/store';
+import { WAKE_SCOPES, type PushSubscriptionRecord, type Store } from '../src/store';
 import { connect as open, request, until, type Frame, type Peer } from './helpers/socket';
 import { withStore, type TestClock } from './helpers/store';
 import { decryptPush, testBrowser, type TestBrowser } from './helpers/webpush';
@@ -39,10 +39,10 @@ async function signedIn(userId: string, existing = false): Promise<Peer> {
 }
 
 /** A browser subscription for `push.example.net`, registered over `peer`. */
-async function subscribe(peer: Peer, name: string, pushId?: string): Promise<{ url: string; browser: TestBrowser }> {
+async function subscribe(peer: Peer, name: string, pushId?: string, wake?: unknown): Promise<{ url: string; browser: TestBrowser }> {
 	const browser = await testBrowser();
 	const url = `https://push.example.net/send/${name}-${crypto.randomUUID()}`;
-	const reply = await request(peer, `subscribe-${name}`, 'push_register', { kind: 'webpush', url, keys: { p256dh: browser.p256dh, auth: browser.auth }, ...(pushId !== undefined ? { push_id: pushId } : {}) });
+	const reply = await request(peer, `subscribe-${name}`, 'push_register', { kind: 'webpush', url, keys: { p256dh: browser.p256dh, auth: browser.auth }, ...(pushId !== undefined ? { push_id: pushId } : {}), ...(wake !== undefined ? { wake } : {}) });
 	expect(reply.result).toEqual({});
 	return { url, browser };
 }
@@ -92,7 +92,7 @@ describe('push over the socket', () => {
 		const peer = await connect();
 		try {
 			const server = await peer.next();
-			expect(server.params.push).toEqual({ webpush: { key: env.VAPID_PUBLIC_KEY } });
+			expect(server.params.push).toEqual({ webpush: { key: env.VAPID_PUBLIC_KEY }, wake: ['mentions', 'replies'] });
 		} finally { peer.close(); }
 	});
 
@@ -136,6 +136,10 @@ describe('push over the socket', () => {
 			['an empty push_id', { kind: 'webpush', url: 'https://push.example.net/x', keys, push_id: '' }],
 			['a push_id with other characters', { kind: 'webpush', url: 'https://push.example.net/x', keys, push_id: 'é' }],
 			['a push_id that is not a string', { kind: 'webpush', url: 'https://push.example.net/x', keys, push_id: 7 }],
+			['a wake that is not an array', { kind: 'webpush', url: 'https://push.example.net/x', keys, wake: 'mentions' }],
+			['a wake entry that is not a string', { kind: 'webpush', url: 'https://push.example.net/x', keys, wake: ['mentions', 2] }],
+			['a wake past 16 entries', { kind: 'webpush', url: 'https://push.example.net/x', keys, wake: Array.from({ length: 17 }, (_, index) => `ext:s${index}`) }],
+			['a wake entry past 64 characters', { kind: 'webpush', url: 'https://push.example.net/x', keys, wake: ['x'.repeat(65)] }],
 		];
 		// Two bad requests per connection, below the repeated-violation close.
 		for (let index = 0; index < cases.length; index += 2) {
@@ -154,7 +158,11 @@ describe('push over the socket', () => {
 		try {
 			const pushId = `A-z_0${'9'.repeat(59)}`;
 			const { url } = await subscribe(peer, 'rosa', pushId);
-			expect((await subscriptionsOf(userId)).map((row) => [row.url, row.pushId])).toEqual([[url, pushId]]);
+			// Without `wake`, a registration wakes for mentions and replies.
+			expect((await subscriptionsOf(userId)).map((row) => [row.url, row.pushId, row.wake])).toEqual([[url, pushId, ['mentions', 'replies']]]);
+			// Unknown scopes are ignored, and a changed wake is written at once.
+			await request(peer, 'wake-scopes', 'push_register', { kind: 'webpush', url, push_id: pushId, keys: (await subscriptionsOf(userId)).map((row) => ({ p256dh: row.p256dh, auth: row.auth }))[0], wake: ['replies', 'private', 'ext:x'] });
+			expect((await subscriptionsOf(userId))[0].wake).toEqual(['replies']);
 			// Unregistering removes it; an unknown url is already gone.
 			expect((await request(peer, 'unregister', 'push_unregister', { url })).result).toEqual({});
 			expect((await request(peer, 'unregister-again', 'push_unregister', { url })).result).toEqual({});
@@ -315,6 +323,70 @@ describe('push over the socket', () => {
 	});
 });
 
+describe('wake scopes', () => {
+	/** A message by `userId` in general, straight into the store; its message_id. */
+	async function authored(userId: string, text: string): Promise<string> {
+		return runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.mutate({
+			userId, ipKey: `ip-${userId}`, method: 'message', now: Date.now(), identity: { user_id: userId }, params: { body: { text } },
+		}).result.message_id as string);
+	}
+
+	/** A registered user with one registration and no connection; their subscription url. */
+	async function away(name: string, wake?: unknown): Promise<string> {
+		const userId = unique(name);
+		const peer = await signedIn(userId);
+		const { url } = await subscribe(peer, userId, undefined, wake);
+		peer.close();
+		await vi.waitFor(async () => expect(await awayOf(userId)).toEqual([]));
+		return url;
+	}
+	const userOf = (url: string) => url.slice('https://push.example.net/send/'.length).replace(/-[0-9a-f-]{36}$/, '');
+
+	it('wakes each user only on registrations whose wake includes why they qualify', async () => {
+		const pushes = capturePushes();
+		const urls = {
+			mentionsOnlyMentioned: await away('mm', ['mentions']),
+			mentionsOnlyRepliedTo: await away('mr', ['mentions']),
+			repliesOnlyRepliedTo: await away('rr', ['replies']),
+			repliesOnlyMentioned: await away('rm', ['replies']),
+			nothing: await away('none', []),
+			both: await away('both'),
+			attended: '',
+			control: await away('ctrl'),
+		};
+		const attendedId = unique('here');
+		const here = await signedIn(attendedId);
+		urls.attended = (await subscribe(here, attendedId)).url;
+		const senderId = unique('sender');
+		const sender = await signedIn(senderId);
+		try {
+			const user = (key: keyof typeof urls) => userOf(urls[key]);
+			const reply = async (id: string, key: keyof typeof urls, mentions: string[] = []) => post(sender, id, {
+				body: { text: `re ${id}`, ...(mentions.length ? { mentions } : {}) }, reply_to: { message_id: await authored(user(key), `by ${key}`) },
+			});
+			await post(sender, 'm1', { body: { text: 'hi', mentions: [user('mentionsOnlyMentioned'), user('repliesOnlyMentioned')] } });
+			await reply('r1', 'mentionsOnlyRepliedTo');
+			await reply('r2', 'repliesOnlyRepliedTo');
+			await reply('r3', 'nothing', [user('nothing')]);
+			// Mentioned and replied to in one message: pushed once.
+			await reply('r4', 'both', [user('both')]);
+			// An attended author is not woken by a reply.
+			await reply('r5', 'attended');
+			await vi.waitFor(() => expect(pushes.map((push) => push.url).sort()).toEqual([urls.mentionsOnlyMentioned, urls.repliesOnlyRepliedTo, urls.both].sort()), { timeout: 5_000 });
+			// Replying to one's own message wakes no one: the sender is never a candidate.
+			await runInDurableObject(stub(), async (instance) => {
+				const runtime = instance as unknown as { wakeFor(message: unknown): void };
+				const own = await authored(user('control'), 'mine');
+				runtime.wakeFor({ message_id: '1', room_id: 'general', from: { user_id: user('control') }, reply_to: { message_id: own }, body: { text: 'me again', mentions: [user('control')] } });
+			});
+			await post(sender, 'control', { body: { text: 'control' }, reply_to: { message_id: await authored(user('control'), 'control') } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(4), { timeout: 5_000 });
+			expect(pushes[3].url).toBe(urls.control);
+			expect(pushes.filter((push) => push.url === urls.control)).toHaveLength(1);
+		} finally { sender.close(); here.close(); }
+	});
+});
+
 describe('push limits over the socket', () => {
 	it('limits push_register to registersPerUserMinute a user', async () => {
 		const userId = unique('reg');
@@ -367,7 +439,7 @@ describe('push subscriptions in the store', () => {
 		});
 	}
 	const claim = (store: Store, clock: TestClock, candidates: string[], roomId = 'general', senderId = 'sender') =>
-		store.claimPushes({ senderId, roomId, candidates, now: clock.value });
+		store.claimPushes({ senderId, roomId, candidates: candidates.map((userId) => ({ userId, reasons: WAKE_SCOPES.mentions })), now: clock.value });
 
 	it('keeps subscriptionsPerUser per user, replacing the least recently registered; registrations are per user', async () => {
 		const keys = await browserKeys();
@@ -496,7 +568,7 @@ describe('push subscriptions in the store', () => {
 			expect(claim(store, clock, ['eve']).subscriptions).toHaveLength(1);
 			store.renameIdentity({ from: 'eve', to: 'eva', now: clock.value });
 			expect(store.pushSubscriptionsOf('eve')).toEqual([]);
-			expect(store.pushSubscriptionsOf('eva')).toEqual([{ url: 'https://push.example.net/eve', userId: 'eva', ...keys, pushId: 'eve-laptop' }]);
+			expect(store.pushSubscriptionsOf('eva')).toEqual([{ url: 'https://push.example.net/eve', userId: 'eva', ...keys, pushId: 'eve-laptop', wake: ['mentions', 'replies'] }]);
 			// The wake time moved too: Eva is still coalesced in general.
 			expect(claim(store, clock, ['eva']).coalesced).toBe(1);
 			store.purgeUsers({ userIds: ['eva'], now: clock.value });

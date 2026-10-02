@@ -32,6 +32,7 @@ import {
 	MAX_ROLES_PER_USER,
 	PUSH_ID_PATTERN,
 	ROLE_PATTERN,
+	WAKE_SCOPES,
 	ROOM_ID,
 	Store,
 	StoreError,
@@ -40,6 +41,7 @@ import {
 	uploadResultEmbed,
 	type Broadcast,
 	type MessageSnapshot,
+	type PushCandidate,
 	type PushSubscriptionRecord,
 	type RoomRecord,
 	type StoreConfig,
@@ -667,6 +669,24 @@ function pushEndpointError(value: string, hosts: RuntimeConfig["pushHosts"]): st
 	return null;
 }
 
+/** Entries a `push_register` `wake` may list, known or not. */
+const MAX_WAKE_ENTRIES = 16;
+
+/**
+ * A `push_register` `wake` (§4.7) as a WAKE_SCOPES bitmask, undefined when
+ * absent. Unknown scopes are ignored, as the protocol asks; an array that is
+ * too long, or entries that are not short strings, are `invalid_params`.
+ */
+function wakeParam(value: unknown): number | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value) || value.length > MAX_WAKE_ENTRIES || value.some((entry) => typeof entry !== "string" || entry.length > 64)) {
+		throw { name: "invalid_params", message: `wake must be an array of at most ${MAX_WAKE_ENTRIES} scope names` } satisfies ProtocolError;
+	}
+	let mask = 0;
+	for (const entry of value as string[]) if (Object.hasOwn(WAKE_SCOPES, entry)) mask |= WAKE_SCOPES[entry as keyof typeof WAKE_SCOPES];
+	return mask;
+}
+
 /** Longest `body.text` a push carries, in code points; longer text is cut, ending in `…`. */
 const PUSH_TEXT_CODE_POINTS = 200;
 
@@ -1133,8 +1153,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 				welcome: this.signInWelcome(origin),
 				// Answered by the runtime without waking the object (see PING_REQUEST).
 				ping: limits.pingSeconds,
-				// Web Push for mentions (§4.7), with the VAPID key browsers subscribe with.
-				...(this.config.push ? { push: { webpush: { key: this.config.push.publicKey } } } : {}),
+				// Web Push (§4.7), with the VAPID key browsers subscribe with and the wake scopes.
+				...(this.config.push ? { push: { webpush: { key: this.config.push.publicKey }, wake: Object.keys(WAKE_SCOPES) } } : {}),
 				ext: {
 					demo: {
 						retention_seconds: limits.retentionSeconds,
@@ -2074,7 +2094,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// Only a new message wakes anyone: not an edit, move, or retry (§4.7).
 			if (method === "message" && !result.deduplicated && result.message?.prev_log_id === undefined) created = result.message;
 		});
-		if (created && identity.tier === "registered") this.wakeMentioned(created);
+		if (created && identity.tier === "registered") this.wakeFor(created);
 		// Pending writes that never come are failed by the alarm (§4.6.3).
 		if (started) await this.rescheduleAlarm();
 	}
@@ -2352,7 +2372,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * keys: {p256dh, auth}, push_id?}`, the browser's `PushSubscription.toJSON()`
 	 * with `kind` added (`expirationTime` is ignored). `push_id`, 1 to 64
 	 * letters, digits, `_` or `-`, goes unchanged into every push to this
-	 * registration. At most `registersPerUserMinute` a user, across their
+	 * registration. `wake` lists the scopes it wakes for (§4.7): at most
+	 * MAX_WAKE_ENTRIES strings of at most 64 characters; scopes this server
+	 * does not implement are ignored, `[]` wakes for nothing, and without it
+	 * the registration wakes for `mentions` and `replies`. At most
+	 * `registersPerUserMinute` a user, across their
 	 * connections; past that, `retry_after`. Registered users only; a
 	 * guest's identity lasts one connection, so there is no one to wake. The
 	 * endpoint must be a public `https` URL (pushEndpointError), `p256dh` an
@@ -2373,6 +2397,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const kind = requiredString(params, "kind");
 		if (kind !== "webpush") throw { name: "invalid_params", message: "Unknown push kind; this server offers webpush" } satisfies ProtocolError;
 		const url = requiredString(params, "url");
+		const wake = wakeParam(params.wake);
 		const pushId = optionalString(params, "push_id");
 		if (pushId !== undefined && !PUSH_ID_PATTERN.test(pushId)) throw { name: "invalid_params", message: "push_id must be 1 to 64 letters, digits, _ or -" } satisfies ProtocolError;
 		const problem = pushEndpointError(url, this.config.pushHosts);
@@ -2388,7 +2413,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// The key check awaited: register for the connection as it is now (a /rename may have moved it).
 		const current = connectionAttachment(socket);
 		if (!current || current.closing || current.tier !== "registered" || !current.userId) return;
-		this.store.registerPushSubscription({ userId: current.userId, url, p256dh: base64UrlEncode(p256dh), auth: base64UrlEncode(auth), ...(pushId !== undefined ? { pushId } : {}), now: nowMs() });
+		this.store.registerPushSubscription({ userId: current.userId, url, p256dh: base64UrlEncode(p256dh), auth: base64UrlEncode(auth), ...(pushId !== undefined ? { pushId } : {}), ...(wake !== undefined ? { wake } : {}), now: nowMs() });
 		this.reply(socket, request, {});
 	}
 
@@ -2403,33 +2428,49 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Wakes those a registered user's new message mentions (§4.7); guests'
-	 * mentions wake no one. The candidates, chosen without SQL in
-	 * `body.mentions` order, are users other than the sender (and not guests)
-	 * with no attended connection (see attended), at most
+	 * Wakes those a registered user's new message concerns (§4.7): the users
+	 * its `body.mentions` lists (scope `mentions`) and the author of the
+	 * message it replies to (scope `replies`, one metered lookup); guests'
+	 * messages wake no one. The candidates, the replied-to author first so
+	 * mentions cannot crowd them out, then mentions in order, deduplicated
+	 * with their reasons combined, are users other than the sender (and not
+	 * guests) with no attended connection (see attended), at most
 	 * MAX_PUSH_CANDIDATES. Store.claimPushes then wakes up to
-	 * `wakesPerMessage` of those with live registrations, at most once a
-	 * `coalesceSeconds` per room, within the sender's and the server's daily
-	 * allowances. Every room is visible to everyone, so a mention anywhere
-	 * counts, joined or not. Pushes go out after the result, kept alive with
-	 * waitUntil. A failure here is logged and never touches the post.
+	 * `wakesPerMessage` of those with live registrations for one of their
+	 * reasons, at most once a `coalesceSeconds` per room, within the sender's
+	 * and the server's daily allowances. Every room is visible to everyone,
+	 * so a mention or reply anywhere counts, joined or not. Pushes go out
+	 * after the result, kept alive with waitUntil. A failure here is logged
+	 * and never touches the post.
 	 */
-	private wakeMentioned(message: MessageSnapshot): void {
+	private wakeFor(message: MessageSnapshot): void {
 		const vapid = this.config.push;
 		const policy = PUSH_POLICY;
-		const mentions = message.body?.mentions;
-		if (!vapid || !policy || !Array.isArray(mentions)) return;
+		if (!vapid || !policy) return;
 		const now = nowMs();
-		const candidates: string[] = [];
-		for (const userId of mentions) {
-			if (candidates.length >= MAX_PUSH_CANDIDATES) break;
-			if (typeof userId !== "string" || userId === message.from.user_id || userId.startsWith("guest_") || candidates.includes(userId)) continue;
-			if (!this.attended(userId, now)) candidates.push(userId);
+		const sender = message.from.user_id;
+		const reasons = new Map<string, number>();
+		const consider = (userId: unknown, reason: number) => {
+			if (typeof userId !== "string" || userId === sender || userId.startsWith("guest_")) return;
+			const known = reasons.get(userId);
+			if (known !== undefined) reasons.set(userId, known | reason);
+			else if (reasons.size < MAX_PUSH_CANDIDATES && !this.attended(userId, now)) reasons.set(userId, reason);
+		};
+		const replyTo = message.reply_to?.message_id;
+		if (replyTo !== undefined) {
+			try {
+				consider(this.store.messageAuthor(replyTo, now), WAKE_SCOPES.replies);
+			} catch (error) {
+				console.warn(JSON.stringify({ event: "push_reply_lookup_failed", reason: errorToProtocol(error).message }));
+			}
 		}
-		if (!candidates.length) return;
+		const mentions = message.body?.mentions;
+		if (Array.isArray(mentions)) for (const userId of mentions) consider(userId, WAKE_SCOPES.mentions);
+		if (!reasons.size) return;
+		const candidates: PushCandidate[] = [...reasons].map(([userId, reason]) => ({ userId, reasons: reason }));
 		let claimed: ReturnType<Store["claimPushes"]>;
 		try {
-			claimed = this.store.claimPushes({ senderId: message.from.user_id, roomId: message.room_id, candidates, now });
+			claimed = this.store.claimPushes({ senderId: sender, roomId: message.room_id, candidates, now });
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "push_claim_failed", reason: errorToProtocol(error).message }));
 			return;
