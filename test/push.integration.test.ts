@@ -665,17 +665,43 @@ describe('push subscriptions in the store', () => {
 		});
 	});
 
-	it('forgets a gone registration by endpoint and keys, keeping a fresh one', async () => {
+	it('forgets a gone registration by user, endpoint and keys, keeping a fresh one and other users\' own', async () => {
 		const [old, fresh] = [await browserKeys(), await browserKeys()];
 		await withStore('push-gone', config, (store, clock) => {
 			registerUser(store, clock, 'ida');
 			registerUser(store, clock, 'jon');
 			const url = 'https://push.example.net/shared';
 			store.registerPushSubscription({ userId: 'ida', url, ...old, now: clock.value });
-			store.registerPushSubscription({ userId: 'jon', url, ...fresh, now: clock.value });
-			store.forgetPushSubscriptions([{ url, p256dh: old.p256dh }], clock.value);
+			store.registerPushSubscription({ userId: 'jon', url, ...old, now: clock.value });
+			// Ida's push came back gone: only her registration goes.
+			store.forgetPushSubscriptions([{ userId: 'ida', url, p256dh: old.p256dh }], clock.value);
 			expect(store.pushSubscriptionsOf('ida')).toEqual([]);
+			expect(store.pushSubscriptionsOf('jon')).toHaveLength(1);
+			// Jon registered again with new keys before his gone push came back: the fresh one stays.
+			store.registerPushSubscription({ userId: 'jon', url, ...fresh, now: clock.value });
+			store.forgetPushSubscriptions([{ userId: 'jon', url, p256dh: old.p256dh }], clock.value);
 			expect(store.pushSubscriptionsOf('jon').map((row) => row.p256dh)).toEqual([fresh.p256dh]);
+		});
+	});
+
+	it('keeps accounting safe when many users register one endpoint and it goes', async () => {
+		const keys = await browserKeys();
+		await withStore('push-shared-endpoint', config, (store, clock) => {
+			const url = 'https://push.example.net/everyone';
+			const users = Array.from({ length: 50 }, (_, index) => `many_${index}`);
+			for (const userId of users) {
+				registerUser(store, clock, userId);
+				store.registerPushSubscription({ userId, url, ...keys, now: clock.value });
+			}
+			// Every user's 410 forgets that user's row alone, within its reservation.
+			const claimed = claim(store, clock, users.slice(0, 32));
+			expect(claimed.subscriptions).toHaveLength(POLICY.wakesPerMessage);
+			store.forgetPushSubscriptions(claimed.subscriptions, clock.value);
+			store.forgetPushSubscriptions([{ userId: users[49], url, p256dh: keys.p256dh }], clock.value);
+			expect(store.accountingStatus().unsafe).toBe(false);
+			expect(users.filter((userId) => store.pushSubscriptionsOf(userId).length)).toHaveLength(50 - POLICY.wakesPerMessage - 1);
+			// The store still takes work.
+			expect(() => store.registerPushSubscription({ userId: users[0], url, ...keys, now: clock.value })).not.toThrow();
 		});
 	});
 

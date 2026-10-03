@@ -324,7 +324,7 @@ it('upgrades a schema 7 store in place: it gains the push tables, and nothing el
 		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
 		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(SCHEMA_VERSION);
 		const indexes = (table: string) => sql.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?", table).toArray().map((row) => row.name);
-		expect(indexes('push_subscriptions')).toEqual(expect.arrayContaining(['push_subscriptions_user_idx', 'push_subscriptions_url_idx', 'push_subscriptions_updated_idx']));
+		expect(indexes('push_subscriptions')).toEqual(expect.arrayContaining(['push_subscriptions_user_idx', 'push_subscriptions_updated_idx']));
 		expect(indexes('push_wakes')).toContain('push_wakes_woken_idx');
 		expect(store.getRoomState().latest_log_id).toBe(head);
 		expect(store.getIdentity('kept_user')?.name).toBe('Kept');

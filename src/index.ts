@@ -2568,10 +2568,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		};
 		const outcomes = await Promise.allSettled(subscriptions.map((subscription) =>
 			sendWebPush(subscription, payloadFor(subscription.pushId), vapid, { ttlSeconds, urgency: "normal", nowMs: nowMs() })));
-		const gone: Array<{ url: string; p256dh: string }> = [];
+		const gone: Array<{ userId: string; url: string; p256dh: string }> = [];
 		let failed = 0;
 		outcomes.forEach((outcome, index) => {
-			if (outcome.status === "fulfilled" && outcome.value.gone) gone.push({ url: subscriptions[index].url, p256dh: subscriptions[index].p256dh });
+			const { userId, url, p256dh } = subscriptions[index];
+			if (outcome.status === "fulfilled" && outcome.value.gone) gone.push({ userId, url, p256dh });
 			else if (outcome.status === "rejected" || outcome.value.status < 200 || outcome.value.status >= 300) failed++;
 		});
 		if (failed) console.warn(JSON.stringify({ event: "push_delivery_failed", failed, sent: subscriptions.length }));

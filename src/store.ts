@@ -771,6 +771,13 @@ const UPLOAD_WRITES = 16;
  * touch a user's subscriptions are sized by it.
  */
 const MAX_PUSH_SUBSCRIPTIONS_PER_USER = MAX_PUSHES_PER_MESSAGE;
+/**
+ * Most `push_wakes` rows one user can hold: one per room they were woken
+ * for, and wakes come only for messages in existing rooms (at most the
+ * thread ceiling and `general`); rows of rooms removed since cleanup last
+ * ran, at most the purge list, wait for it.
+ */
+const MAX_PUSH_WAKES_PER_USER = MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS;
 /** Longest push endpoint URL kept (protocol §4.7); browsers' are a few hundred bytes. */
 export const MAX_PUSH_URL_BYTES = 1024;
 /** A re-registration of an unchanged subscription younger than this writes nothing. */
@@ -1101,8 +1108,8 @@ function ensureText(value: unknown, field: string, maxBytes: number): string {
  * written to R2 (protocol §4.6.3): attached files by message and embed, and
  * avatars, by owner, expiry, and pending write. `push_subscriptions` holds
  * registered users' Web Push registrations (protocol §4.7), keyed by user
- * and endpoint, indexed by user and registration time, by endpoint (for a
- * gone one), and by registration time (for expiry). `push_wakes` keeps when
+ * and endpoint, indexed by user and registration time and by registration
+ * time (for expiry). `push_wakes` keeps when
  * each user was last woken for each room, for coalescing. `mutes` keeps
  * until when each registered user is muted (protocol §4.11 `mute`).
  */
@@ -1211,7 +1218,6 @@ const SCHEMA_DDL = `
     PRIMARY KEY (user_id, url)
   );
   CREATE INDEX IF NOT EXISTS push_subscriptions_user_idx ON push_subscriptions (user_id, updated_ms);
-  CREATE INDEX IF NOT EXISTS push_subscriptions_url_idx ON push_subscriptions (url);
   CREATE INDEX IF NOT EXISTS push_subscriptions_updated_idx ON push_subscriptions (updated_ms);
   CREATE TABLE IF NOT EXISTS push_wakes (
     user_id TEXT NOT NULL,
@@ -1570,7 +1576,6 @@ export class Store {
           PRIMARY KEY (user_id, url)
         );
         CREATE INDEX IF NOT EXISTS push_subscriptions_user_idx ON push_subscriptions (user_id, updated_ms);
-        CREATE INDEX IF NOT EXISTS push_subscriptions_url_idx ON push_subscriptions (url);
         CREATE INDEX IF NOT EXISTS push_subscriptions_updated_idx ON push_subscriptions (updated_ms);
         CREATE TABLE IF NOT EXISTS push_wakes (
           user_id TEXT NOT NULL,
@@ -2609,7 +2614,7 @@ export class Store {
     const now = input.now ?? this.clock.now();
     const { from, to } = input;
     const records = this.retainedRecords(now);
-    const found = this.reserved({ reads: 64 + 8 * records + 2 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_THREAD_LIMIT + 2) }, false, now, () => {
+    const found = this.reserved({ reads: 64 + 8 * records + 2 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1) }, false, now, () => {
       const identity = this.identityRow(from);
       if (!identity || identity.tier !== "registered") throw new StoreError("invalid_params", `No registered user has the user_id ${from}`.slice(0, 200));
       if (parseRoles(identity.roles_json).includes("bot")) throw new StoreError("invalid_params", "A bot's user_id is fixed");
@@ -2725,7 +2730,7 @@ export class Store {
     // rows, limiter rows, push subscriptions, credential and identity; each
     // deletion also updates its indexes.
     const perUser = 64 + 4 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS) + 4 * this.config.registeredPostsPerDay + 4 * uploadsPerOwner +
-      4 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_THREAD_LIMIT + 2);
+      4 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1);
     const cost = { reads: 64 + 5 * records + ids.length * perUser, writes: 64 + 4 * records + ids.length * perUser };
     return this.reserved(cost, false, now, () => this.transaction(() => {
       const messages = this.rawRows<{ message_id: string }>(`SELECT message_id FROM message_state WHERE author_id IN (${marks})`, ...ids)
@@ -4409,18 +4414,22 @@ export class Store {
   }
 
   /**
-   * Forgets registrations whose push service said they are gone (404 or
-   * 410): those of the endpoint with the keys that were pushed to, so a
-   * fresh registration of the same endpoint stays.
+   * Forgets the registrations whose push service said they are gone (404
+   * or 410): each the user's registration of the endpoint, if it still has
+   * the keys that were pushed to, so a fresh registration of it stays.
+   * Other users' registrations of the same endpoint are left to their own
+   * pushes and to expiry.
    */
-  forgetPushSubscriptions(gone: ReadonlyArray<{ url: string; p256dh: string }>, now = this.clock.now()): void {
+  forgetPushSubscriptions(gone: ReadonlyArray<{ userId: string; url: string; p256dh: string }>, now = this.clock.now()): void {
     this.ensureReady();
     const rows = gone.slice(0, MAX_PUSHES_PER_MESSAGE);
     if (!rows.length) return;
-    // An endpoint index range each, which a user holds at most once.
-    this.reserved({ reads: 8 + 8 * rows.length, writes: 8 + 8 * rows.length }, false, now, () => this.transaction(() => {
+    // One primary-key row each, whatever other users hold the same endpoint:
+    // a delete by endpoint alone would touch every user's row for it, which
+    // anyone can multiply by registering one endpoint from many accounts.
+    this.reserved({ reads: 8 + 4 * rows.length, writes: 8 + 6 * rows.length }, false, now, () => this.transaction(() => {
       for (const row of rows) {
-        this.rawExec("DELETE FROM push_subscriptions WHERE url = ? AND p256dh = ?", row.url, row.p256dh);
+        this.rawExec("DELETE FROM push_subscriptions WHERE user_id = ? AND url = ? AND p256dh = ?", row.userId, row.url, row.p256dh);
       }
     }));
   }

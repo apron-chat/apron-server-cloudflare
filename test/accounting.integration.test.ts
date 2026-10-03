@@ -688,7 +688,7 @@ describe('measured storage accounting', () => {
 			measure('mute set', () => store.setMute({ userId: 'matrix-user', untilMs: clock.now() + 3_600_000, now: clock.now() }));
 			expect(measure('mute read', () => store.muteOf('matrix-user', clock.now()))).toBe(3_600);
 			store.setMute({ userId: 'matrix-user', untilMs: null, now: clock.now() });
-			measure('gone push subscription forget', () => store.forgetPushSubscriptions([{ url: subscription.url, p256dh: subscription.p256dh }], clock.now()));
+			measure('gone push subscription forget', () => store.forgetPushSubscriptions([{ userId: subscription.userId, url: subscription.url, p256dh: subscription.p256dh }], clock.now()));
 
 			const identity = { user_id: 'matrix-user', name: 'Matrix user', tier: 'registered' as const };
 			const create = measure('message create', () => store.commitMutation({
