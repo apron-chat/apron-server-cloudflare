@@ -136,6 +136,13 @@ export const PAID_PLAN: Plan = Object.freeze({
 		lifecycleLagSeconds: 24 * 60 * 60,
 		storedBytesCap: 5 * 1024 * 1024 * 1024,
 	}),
+	// Mentions and replies wake users through Web Push (VAPID keys required): enough for
+	// half the day's posts to each wake one browser.
+	push: Object.freeze({
+		...FREE_PLAN.push!,
+		pushesPerDay: 5_000,
+		pushesPerSenderDay: 200,
+	}),
 	features: Object.freeze({
 		// Typing costs about 5 frames a typing minute, inside the frame budget.
 		activity: true,

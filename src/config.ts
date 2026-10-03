@@ -1,5 +1,6 @@
 import * as budget from "./budget.ts";
-import { DEFAULT_FEATURES, DEFAULT_LIMITS, UPLOAD_POLICY, type Limits } from "./budget.ts";
+import { DEFAULT_FEATURES, DEFAULT_LIMITS, MAX_PUSH_CANDIDATES, MAX_PUSHES_PER_MESSAGE, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits, type PushPolicy } from "./budget.ts";
+import { base64UrlDecode, P256_PRIVATE_KEY_BYTES, P256_PUBLIC_KEY_BYTES, vapidKeysMatch, type VapidKeys } from "./webpush.ts";
 export { DEFAULT_LIMITS, BOOTSTRAP_ROW_RESERVATION, type Limits } from "./budget.ts";
 
 export interface RuntimeConfig {
@@ -25,6 +26,32 @@ export interface RuntimeConfig {
 	 * the `UPLOAD_SIGNING_KEY` secret, and the `MEDIA` R2 binding.
 	 */
 	uploads?: UploadConfig;
+	/**
+	 * Web Push (protocol §4.7, push kind `webpush`), on when the plan has a
+	 * push policy and the deployment sets `VAPID_PUBLIC_KEY`, `VAPID_SUBJECT`,
+	 * and the `VAPID_PRIVATE_KEY` secret.
+	 */
+	push?: VapidKeys;
+	/**
+	 * The push services endpoints may name (`PUSH_HOSTS`): exact hosts, or
+	 * `*.host` for its subdomains; `"*"` allows any public host.
+	 */
+	pushHosts: readonly string[] | "*";
+}
+
+/** The browsers' own push services, allowed when `PUSH_HOSTS` is unset. */
+export const DEFAULT_PUSH_HOSTS: readonly string[] = [
+	"fcm.googleapis.com",
+	"*.push.services.mozilla.com",
+	"web.push.apple.com",
+	"*.push.apple.com",
+	"*.notify.windows.com",
+];
+
+/** Whether `PUSH_HOSTS` allows an endpoint host (lowercase, no trailing dot). */
+export function pushHostAllowed(hosts: RuntimeConfig["pushHosts"], host: string): boolean {
+	if (hosts === "*") return true;
+	return hosts.some((entry) => entry.startsWith("*.") ? host.endsWith(entry.slice(1)) : host === entry);
 }
 
 export interface UploadConfig {
@@ -66,6 +93,10 @@ type EnvLike = {
 	PUBLIC_ORIGIN?: string;
 	UPLOAD_SIGNING_KEY?: string;
 	MEDIA?: unknown;
+	VAPID_PUBLIC_KEY?: string;
+	VAPID_PRIVATE_KEY?: string;
+	VAPID_SUBJECT?: string;
+	PUSH_HOSTS?: string;
 	ENVIRONMENT?: string;
 	NODE_ENV?: string;
 };
@@ -267,6 +298,9 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 	const adminTokenProblem = adminToken === undefined ? null : adminTokenError(adminToken);
 	if (adminTokenProblem) throw new ConfigError(adminTokenProblem);
 	const uploads = loadUploads(env);
+	if (PUSH_POLICY) validatePushPolicy(PUSH_POLICY);
+	const push = loadPush(env);
+	const pushHosts = loadPushHosts(env.PUSH_HOSTS);
 	const rpName = String(env.RP_NAME ?? "Apron Demo");
 	if (!rpName.trim() || [...rpName].length > limits.maxNameCodePoints || new TextEncoder().encode(rpName).byteLength > limits.maxNameBytes) {
 		throw new ConfigError("RP_NAME exceeds the configured display-name policy");
@@ -282,6 +316,8 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 		guestPosting,
 		...(adminToken !== undefined ? { adminToken } : {}),
 		...(uploads ? { uploads } : {}),
+		...(push ? { push } : {}),
+		pushHosts,
 	};
 }
 
@@ -295,6 +331,66 @@ function loadUploads(env: EnvLike): UploadConfig | undefined {
 	if (!validOrigin(publicOrigin)) throw new ConfigError("PUBLIC_ORIGIN must be an exact HTTP(S) origin");
 	if (signingKey.length < 32) throw new ConfigError("UPLOAD_SIGNING_KEY must be at least 32 characters");
 	return { mediaOrigin, publicOrigin, signingKey };
+}
+
+/** Throws unless the plan's push policy is within its calibrated bounds. */
+export function validatePushPolicy(policy: PushPolicy): void {
+	for (const [key, value] of Object.entries(policy)) {
+		if (!Number.isSafeInteger(value) || value <= 0) throw new ConfigError(`push.${key} must be a positive safe integer`);
+	}
+	if (policy.wakesPerMessage * policy.subscriptionsPerUser > MAX_PUSHES_PER_MESSAGE) {
+		throw new ConfigError(`one message may send at most ${MAX_PUSHES_PER_MESSAGE} pushes (wakesPerMessage times subscriptionsPerUser)`);
+	}
+	// RFC 8030 lets a push service cap TTL; four weeks is past any it keeps.
+	if (policy.ttlSeconds > 28 * 86_400) throw new ConfigError("push.ttlSeconds must be at most four weeks");
+	if (policy.wakesPerMessage > MAX_PUSH_CANDIDATES) throw new ConfigError(`push.wakesPerMessage must be at most ${MAX_PUSH_CANDIDATES}`);
+	if (policy.pushesPerSenderDay > policy.pushesPerDay) throw new ConfigError("push.pushesPerSenderDay must fit pushesPerDay");
+	if (policy.pushesPerRecipientDay > policy.pushesPerDay) throw new ConfigError("push.pushesPerRecipientDay must fit pushesPerDay");
+	if (policy.mutesPerUserMinute > MAX_TYPE_THROTTLE_PER_MINUTE) throw new ConfigError(`push.mutesPerUserMinute must be at most ${MAX_TYPE_THROTTLE_PER_MINUTE}`);
+	if (policy.registersPerUserMinute > MAX_TYPE_THROTTLE_PER_MINUTE) throw new ConfigError(`push.registersPerUserMinute must be at most ${MAX_TYPE_THROTTLE_PER_MINUTE}`);
+	// The coalescing rows are deleted by cleanup once a day at the latest.
+	if (policy.coalesceSeconds > 86_400) throw new ConfigError("push.coalesceSeconds must be at most a day");
+	// Registrations refresh at most daily, so a subscription needs a day at least.
+	if (policy.pushExpiryDays < 2 || policy.pushExpiryDays > 90) throw new ConfigError("push.pushExpiryDays must be 2 to 90");
+}
+
+/**
+ * VAPID keys, when the plan has push and the deployment sets all three;
+ * malformed ones fail the configuration check. That the private key matches
+ * the public one shows only when a push service rejects the signature.
+ */
+function loadPush(env: EnvLike): VapidKeys | undefined {
+	const publicKey = env.VAPID_PUBLIC_KEY?.trim() ?? "";
+	const privateKey = env.VAPID_PRIVATE_KEY?.trim() ?? "";
+	const subject = env.VAPID_SUBJECT?.trim() ?? "";
+	if (!PUSH_POLICY || !publicKey || !privateKey || !subject) return undefined;
+	const point = /^[A-Za-z0-9_-]+$/.test(publicKey) ? base64UrlDecode(publicKey) : null;
+	if (point?.byteLength !== P256_PUBLIC_KEY_BYTES || point[0] !== 0x04) throw new ConfigError("VAPID_PUBLIC_KEY must be an uncompressed P-256 public key, unpadded base64url");
+	const scalar = /^[A-Za-z0-9_-]+$/.test(privateKey) ? base64UrlDecode(privateKey) : null;
+	if (scalar?.byteLength !== P256_PRIVATE_KEY_BYTES) throw new ConfigError("VAPID_PRIVATE_KEY must be a 32-byte P-256 private key, unpadded base64url");
+	if (!/^mailto:[^\s@]+@[^\s@]+$/.test(subject) && !validHttpsUrl(subject)) throw new ConfigError("VAPID_SUBJECT must be a mailto: address or an https: URL");
+	if (!vapidKeysMatch(publicKey, privateKey)) throw new ConfigError("VAPID_PRIVATE_KEY does not match VAPID_PUBLIC_KEY");
+	return { publicKey, privateKey, subject };
+}
+
+/** `PUSH_HOSTS`: comma-separated hosts or `*.` suffixes, or a standalone `*`; unset or empty, the browsers' services. */
+function loadPushHosts(raw: string | undefined): RuntimeConfig["pushHosts"] {
+	const hosts = splitList(raw === undefined || raw.trim() === "" ? undefined : raw.toLowerCase(), [...DEFAULT_PUSH_HOSTS]);
+	if (hosts.length === 1 && hosts[0] === "*") return "*";
+	for (const host of hosts) {
+		if (!/^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(host)) {
+			throw new ConfigError("PUSH_HOSTS must list host names, *.host suffixes, or a standalone *");
+		}
+	}
+	return hosts;
+}
+
+function validHttpsUrl(value: string): boolean {
+	try {
+		return new URL(value).protocol === "https:";
+	} catch {
+		return false;
+	}
 }
 
 export function isAllowedOrigin(config: RuntimeConfig, origin: string | null): boolean {

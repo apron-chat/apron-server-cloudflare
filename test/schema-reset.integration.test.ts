@@ -5,7 +5,7 @@ import { MAX_CARRIED_PASSKEYS, SCHEMA_VERSION, UPGRADABLE_SCHEMA_VERSIONS, type 
 
 type Runtime = { store: Store };
 
-// Schemas 5 and 6 are upgraded in place (below); older and newer schemas are reset.
+// Schemas 5, 6 and 7 are upgraded in place (below); older and newer schemas are reset.
 for (const storedVersion of [Math.min(...UPGRADABLE_SCHEMA_VERSIONS) - 1, SCHEMA_VERSION + 1]) {
 	it(`resets populated storage at schema ${storedVersion} to a fresh schema ${SCHEMA_VERSION} store`, async () => {
 		const stub = env.DEMO.getByName(`schema-reset-${storedVersion}-${crypto.randomUUID()}`);
@@ -291,5 +291,43 @@ it('upgrades a schema 6 store in place: roles move into identities, and nothing 
 		expect(store.getIdentity('bot_plain_user')?.roles).toEqual(['bot']);
 		expect(store.getIdentity('admin')?.roles).toEqual(['admin']);
 		expect(sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM _meta WHERE key = 'admins'").one().n).toBe(0);
+	});
+});
+
+it('upgrades a schema 7 store in place: it gains the push tables, and nothing else changes', async () => {
+	const stub = env.DEMO.getByName(`schema-upgrade-7-${crypto.randomUUID()}`);
+	const now = Date.now();
+	const head = await runInDurableObject(stub, async (instance, state) => {
+		const { store } = instance as unknown as Runtime;
+		const sql = state.storage.sql;
+		store.registerIdentity({
+			userId: 'kept_user', name: 'Kept', userHandle: 'handle-kept_user', now, ipKey: 'ip-kept_user',
+			credential: { credentialId: 'cred-kept_user', userId: 'kept_user', publicKey: 'AAAA', counter: 0 },
+		});
+		store.mutate({
+			userId: 'kept_user', ipKey: 'ip-kept_user', requestId: 'kept', method: 'message', now,
+			identity: { user_id: 'kept_user' }, params: { room_id: 'general', body: { text: 'kept' } },
+		});
+		// Schema 7 has no push registrations or wake times.
+		sql.exec('DROP TABLE push_subscriptions');
+		sql.exec('DROP TABLE push_wakes');
+		sql.exec("UPDATE _meta SET value = '7' WHERE key = 'schema_version'");
+		sql.exec('UPDATE maintenance SET schema_version = 7 WHERE id = 1');
+		return store.getRoomState().latest_log_id;
+	});
+
+	await evictDurableObject(stub);
+	await runInDurableObject(stub, async (instance, state) => {
+		const { store } = instance as unknown as Runtime;
+		const sql = state.storage.sql;
+		expect(store.requiresReset()).toBe(false);
+		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
+		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(SCHEMA_VERSION);
+		const indexes = (table: string) => sql.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?", table).toArray().map((row) => row.name);
+		expect(indexes('push_subscriptions')).toEqual(expect.arrayContaining(['push_subscriptions_user_idx', 'push_subscriptions_updated_idx']));
+		expect(indexes('push_wakes')).toContain('push_wakes_woken_idx');
+		expect(store.getRoomState().latest_log_id).toBe(head);
+		expect(store.getIdentity('kept_user')?.name).toBe('Kept');
+		expect(store.pushSubscriptionsOf('kept_user')).toEqual([]);
 	});
 });

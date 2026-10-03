@@ -1,11 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
-import { isAllowedOrigin, loadConfig, type RuntimeConfig } from "./config";
-import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, MAX_FRAME_LEASE, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, UPLOAD_POLICY } from "./budget";
+import { isAllowedOrigin, loadConfig, pushHostAllowed, type RuntimeConfig } from "./config";
+import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, MAX_FRAME_LEASE, MAX_PUSH_CANDIDATES, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
 import { fetchAccountUsage, type AccountUsageSnapshot } from "./account-usage";
 import { runBudgetGuard, watchForFlood } from "./budget-guard";
 import { sniffImage } from "./image";
 import { signUploadToken, verifyUploadToken } from "./upload-token";
+import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
 import { extractClientIp, hashIpKey, stripForwardingHeaders } from "./ip";
 import {
 	errorFromUnknown,
@@ -27,8 +28,13 @@ import {
 	ADMIN_USER_ID,
 	DEFAULT_JOINED_ROOMS,
 	MAX_PASSKEYS_PER_USER,
+	MAX_PUSH_URL_BYTES,
 	MAX_ROLES_PER_USER,
+	MAX_MUTE_SECONDS,
+	MUTE_FOREVER,
+	PUSH_ID_PATTERN,
 	ROLE_PATTERN,
+	WAKE_SCOPES,
 	ROOM_ID,
 	Store,
 	StoreError,
@@ -36,6 +42,9 @@ import {
 	UPLOAD_WRITE_GRACE_MS,
 	uploadResultEmbed,
 	type Broadcast,
+	type MessageSnapshot,
+	type PushCandidate,
+	type PushSubscriptionRecord,
 	type RoomRecord,
 	type StoreConfig,
 	type StoreMutationInput,
@@ -110,12 +119,63 @@ interface ConnectionAttachment {
 	 * learns its rooms.
 	 */
 	listedJoined?: boolean;
+	/**
+	 * The client said nobody is attending this connection (`status` `idle`,
+	 * §4.11), so a mention or reply may wake its user by push (§4.7). Cleared
+	 * only by `idle: false`; kept from before authentication.
+	 */
+	idle?: boolean;
+	/**
+	 * A `status` `mute` sent before authentication (§4.11), as sent: seconds
+	 * (0 ends a mute) or `true`. Applied, timed from then, once the
+	 * connection signs in as a registered user; dropped on a guest sign-in.
+	 */
+	pendingMute?: number | true;
+	/**
+	 * The client has sent `status` (§4.11), so it reports `idle` itself; a
+	 * connection that never has is idle once it sends nothing for a while
+	 * (SILENT_IDLE_MS).
+	 */
+	statusSeen?: boolean;
 	closing?: boolean;
 }
 
 /** Message types with their own per-user rate (budget.ts). */
 type ThrottledType = "activity" | "room_list";
 const THROTTLED_TYPES: readonly ThrottledType[] = ["activity", "room_list"];
+
+/**
+ * A per-user event count in a rolling minute, kept on the object rather
+ * than in connection attachments, so closing and reopening connections does
+ * not reset it. It is lost when the object hibernates, which takes a quiet
+ * object; a burst that keeps it awake stays counted. At most
+ * USER_RATE_LIMIT_USERS users are tracked; the least recently counted go
+ * first.
+ */
+class UserRateLimit {
+	private readonly events = new Map<string, number[]>();
+
+	constructor(private readonly limit: number) {}
+
+	/** Seconds until `userId` may act again, or undefined when they may now. */
+	retry(userId: string, now: number): number | undefined {
+		const recent = (this.events.get(userId) ?? []).filter((at) => at > now - THROTTLE_WINDOW_MS);
+		if (recent.length < this.limit) return undefined;
+		return Math.max(1, Math.ceil((recent[recent.length - this.limit] + THROTTLE_WINDOW_MS - now) / 1_000));
+	}
+
+	/** Counts one event for `userId` if the limit allows it; whether it did. */
+	take(userId: string, now: number): boolean {
+		const recent = (this.events.get(userId) ?? []).filter((at) => at > now - THROTTLE_WINDOW_MS);
+		if (recent.length >= this.limit) return false;
+		this.events.delete(userId);
+		this.events.set(userId, [...recent, now]);
+		if (this.events.size > USER_RATE_LIMIT_USERS) this.events.delete(this.events.keys().next().value!);
+		return true;
+	}
+}
+
+const USER_RATE_LIMIT_USERS = 10_000;
 const THROTTLE_WINDOW_MS = 60_000;
 /**
  * The system identity for notices to one connection only, never logged
@@ -130,6 +190,12 @@ const PRIVATE_IDENTITY = { user_id: "~private", name: "System message to you" } 
  */
 const PING_REQUEST = '{"method":"ping"}';
 const PING_RESPONSE = '{"method":"pong"}';
+/**
+ * Methods the protocol defines only as notifications: one sent with an `id`
+ * is handled as the notification and gets no reply (§1). The liveness ping
+ * is answered with `pong`, a notification, not a reply.
+ */
+const NOTIFICATION_METHODS: ReadonlySet<string> = new Set(["ping", "activity", "status"]);
 /** Joined room IDs a connection attachment may carry: every room, with slack for removals in flight. */
 const MAX_ATTACHED_ROOMS = 2 * (MAX_THREAD_LIMIT + 1);
 /**
@@ -368,6 +434,7 @@ function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		storageLowWaterBytes: limits.databaseResumeLowWaterBytes,
 		admissionEnabled: !config.admissionOff,
 		uploads: config.uploads && UPLOAD_POLICY ? { ...UPLOAD_POLICY, mediaOrigin: config.uploads.mediaOrigin } : null,
+		push: config.push && PUSH_POLICY ? { ...PUSH_POLICY } : null,
 		processedFramesPerDay: limits.processedFramesPerDay,
 		framesPerIpMinute: limits.framesPerIpMinute,
 		connectionAdmissionsPerIpMinute: limits.connectionAdmissionsPerIpMinute,
@@ -423,6 +490,9 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 				rooms: attachment.rooms.filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 64).slice(0, MAX_ATTACHED_ROOMS),
 			} : {}),
 			...(attachment.listedJoined ? { listedJoined: true } : {}),
+			...(attachment.idle === true ? { idle: true } : {}),
+			...(attachment.pendingMute === true || (Number.isSafeInteger(attachment.pendingMute) && (attachment.pendingMute as number) >= 0) ? { pendingMute: attachment.pendingMute } : {}),
+			...(attachment.statusSeen === true ? { statusSeen: true } : {}),
 			authDeadline: typeof attachment.authDeadline === "number" ? attachment.authDeadline : 0,
 			pendingFrames: typeof attachment.pendingFrames === "number" ? attachment.pendingFrames : 0,
 			pendingBytes: typeof attachment.pendingBytes === "number" ? attachment.pendingBytes : 0,
@@ -482,6 +552,12 @@ function writeSessionAttachment(socket: WebSocketConnection, attachment: Connect
 		attachment.notices = current.notices;
 		attachment.frameLease = current.frameLease;
 		attachment.closing = current.closing;
+		if (current.idle) attachment.idle = true;
+		else delete attachment.idle;
+		if (current.pendingMute !== undefined) attachment.pendingMute = current.pendingMute;
+		else delete attachment.pendingMute;
+		if (current.statusSeen) attachment.statusSeen = true;
+		else delete attachment.statusSeen;
 	}
 	writeAttachment(socket, attachment);
 }
@@ -587,7 +663,7 @@ function identityOf(attachment: ConnectionAttachment): IdentityShape | null {
  * A user object as this server sends it (§3.3): `user_id` and `name`, and in
  * current objects `avatar` and `roles`.
  */
-type PublicUser = { user_id: string; name?: string; avatar?: string; roles?: string[] };
+type PublicUser = { user_id: string; name?: string; avatar?: string; roles?: string[]; mute?: number | true };
 
 /**
  * A room in a listing, with `members` when asked for (§4.3.1), and
@@ -615,6 +691,102 @@ function leftUpdate(roomId: string, membership?: Broadcast): Record<string, unkn
 /** A `room_update` notification (§4.3.3) with one field. */
 function roomUpdate(field: "joined" | "updated" | "left", ...records: unknown[]): Record<string, unknown> {
 	return { method: "room_update", params: { [field]: records } };
+}
+
+/** Host names that resolve only inside a network, never to a public push service. */
+const INTERNAL_HOST_SUFFIXES = ["localhost", "localdomain", "local", "internal", "intranet", "lan", "home.arpa", "corp", "private"];
+
+/**
+ * Why a push endpoint is refused, or null when it is taken (§4.7: `https`
+ * endpoints that resolve to non-internal addresses). The Worker cannot
+ * resolve names before it fetches, so it refuses endpoints that name an
+ * address or an internal network outright: IP literals, single-label hosts,
+ * and internal suffixes such as `localhost`; and it refuses credentials and
+ * ports other than https's own. A public name that resolves to a private
+ * address is left to the platform, whose outbound fetch does not reach
+ * private networks. Past those checks, the host must be one `PUSH_HOSTS`
+ * allows: by default, the browsers' own push services.
+ */
+function pushEndpointError(value: string, hosts: RuntimeConfig["pushHosts"]): string | null {
+	if (utf8Bytes(value) > MAX_PUSH_URL_BYTES) return `url is at most ${MAX_PUSH_URL_BYTES} bytes`;
+	let url: URL;
+	try {
+		url = new URL(value);
+	} catch {
+		return "url must be an https URL";
+	}
+	if (url.protocol !== "https:") return "url must be an https URL";
+	if (url.username || url.password || url.port) return "url must not carry credentials or a port";
+	// A trailing dot would store one endpoint under a second spelling.
+	if (url.hostname.endsWith(".")) return "url must not end its host with a dot";
+	const host = url.hostname.toLowerCase();
+	// The URL parser has already turned every IPv4 spelling (hex, octal, a
+	// bare number) into dotted decimal, and IPv6 into brackets.
+	if (host.startsWith("[") || /^[0-9.]+$/.test(host) || !host.includes(".") ||
+		INTERNAL_HOST_SUFFIXES.some((suffix) => host === suffix || host.endsWith(`.${suffix}`))) {
+		return "url must name a public push service";
+	}
+	if (!pushHostAllowed(hosts, host)) return "push service not allowed here";
+	return null;
+}
+
+/** Entries a `push_register` `wake` may list, known or not. */
+const MAX_WAKE_ENTRIES = 16;
+
+/**
+ * A `push_register` `wake` (§4.7) as a WAKE_SCOPES bitmask, undefined when
+ * absent. Unknown scopes are ignored, as the protocol asks; an array that is
+ * too long, or entries that are not short strings, are `invalid_params`.
+ */
+function wakeParam(value: unknown): number | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value) || value.length > MAX_WAKE_ENTRIES || value.some((entry) => typeof entry !== "string" || entry.length > 64)) {
+		throw { name: "invalid_params", message: `wake must be an array of at most ${MAX_WAKE_ENTRIES} scope names` } satisfies ProtocolError;
+	}
+	let mask = 0;
+	for (const entry of value as string[]) if (Object.hasOwn(WAKE_SCOPES, entry)) mask |= WAKE_SCOPES[entry as keyof typeof WAKE_SCOPES];
+	return mask;
+}
+
+/**
+ * A connection whose client never sent `status` (§4.11) counts as idle for
+ * pushes once it has sent no frame for this long. Clients that send `status`
+ * report idle themselves; pings never reach the object, so they do not count.
+ */
+const SILENT_IDLE_MS = 10 * 60_000;
+
+/** Longest `body.text` a push carries, in code points; longer text is cut, ending in `…`. */
+const PUSH_TEXT_CODE_POINTS = 200;
+
+/** Largest push payload, in bytes of JSON (§4.7), leaving a relay room to wrap it for APNs or FCM. */
+const MAX_PUSH_PAYLOAD_BYTES = 2048;
+
+/**
+ * What a push carries (§4.7): the envelope `{push_id?, message}`, with the
+ * registration's `push_id` when it has one (`unread` is not implemented,
+ * so never sent), and as `message` the message without `log_id`, its text
+ * cut to PUSH_TEXT_CODE_POINTS (left out when empty), and without `format`,
+ * `embeds`, `ext`, or the server's `prev_*` links. Each fallback drops more
+ * of `message` until the whole envelope fits MAX_PUSH_PAYLOAD_BYTES: first
+ * `mentions`, then all of `from` but its `user_id` and `name`, then `body`.
+ */
+function pushPayload(message: MessageSnapshot, pushId?: string): string {
+	const body = message.body ?? {};
+	const points = typeof body.text === "string" ? [...body.text] : [];
+	const text = points.length > PUSH_TEXT_CODE_POINTS ? points.slice(0, PUSH_TEXT_CODE_POINTS - 1).join("") + "…" : points.join("");
+	const tail = message.reply_to ? { reply_to: message.reply_to } : {};
+	const shortFrom = { user_id: message.from.user_id, ...(typeof message.from.name === "string" ? { name: message.from.name } : {}) };
+	const textField = text ? { text } : {};
+	const payload = (from: unknown, fields: Record<string, unknown>) => jsonString({
+		...(pushId !== undefined ? { push_id: pushId } : {}),
+		message: { message_id: message.message_id, room_id: message.room_id, from, ...tail, ...(Object.keys(fields).length ? { body: fields } : {}) },
+	});
+	const candidates = [
+		...(Array.isArray(body.mentions) ? [payload(message.from, { ...textField, mentions: body.mentions })] : []),
+		payload(message.from, textField),
+		payload(shortFrom, textField),
+	];
+	return candidates.find((candidate) => utf8Bytes(candidate) <= MAX_PUSH_PAYLOAD_BYTES) ?? payload(shortFrom, {});
 }
 
 // Browsers hide failed WebSocket handshake responses. An explicit, read-only
@@ -803,6 +975,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private guestNext = 0;
 	private guestLimit = 0;
+	/** `push_register` requests per user (`registersPerUserMinute`), counted across reconnects. */
+	private readonly pushRegisters = new UserRateLimit(PUSH_POLICY?.registersPerUserMinute ?? 1);
+	/** `status` `mute` changes per user (`mutesPerUserMinute`), counted across reconnects. */
+	private readonly muteChanges = new UserRateLimit(PUSH_POLICY?.mutesPerUserMinute ?? 1);
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -1039,6 +1215,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 					"history", "edit", "rooms", "reactions", "command",
 					...(this.activityOn() ? ["activity"] : []),
 					...(this.uploadsOn() ? ["embed:upload"] : []),
+					// Idle connections and mutes, which decide pushes (§4.7, §4.11).
+					...(this.config.push ? ["status"] : []),
 				],
 				// Passkeys and their session tokens only where passkeys are offered;
 				// bot tokens (`/invite-bot`) from anywhere, since bots are not browsers.
@@ -1053,6 +1231,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 				welcome: this.signInWelcome(origin),
 				// Answered by the runtime without waking the object (see PING_REQUEST).
 				ping: limits.pingSeconds,
+				// Web Push (§4.7), with the VAPID key browsers subscribe with and the wake scopes.
+				...(this.config.push ? { push: { webpush: { key: this.config.push.publicKey }, wake: Object.keys(WAKE_SCOPES) } } : {}),
 				ext: {
 					demo: {
 						retention_seconds: limits.retentionSeconds,
@@ -1197,7 +1377,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 			throw error;
 		}
-		const request = parsed.request;
+		// A method that is only a notification ignores an `id`, and is never
+		// answered with a result or an error (§1).
+		const request = NOTIFICATION_METHODS.has(parsed.request.method) && parsed.request.id !== undefined
+			? { ...parsed.request, id: undefined } : parsed.request;
 		try {
 			await this.dispatch(socket, current, request);
 		} catch (error) {
@@ -1284,6 +1467,18 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (!this.activityOn()) break;
 				await this.handleActivity(socket, request);
 				return;
+			case "status":
+				if (!this.config.push) break;
+				this.handleStatus(socket, attachment, request);
+				return;
+			case "push_register":
+				if (!this.config.push) break;
+				await this.handlePushRegister(socket, attachment, request);
+				return;
+			case "push_unregister":
+				if (!this.config.push) break;
+				this.handlePushUnregister(socket, attachment, request);
+				return;
 			case "room_list":
 				await this.handleRoomList(socket, attachment, request);
 				return;
@@ -1292,8 +1487,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return;
 			case "ping":
 				// The exact ping bytes are answered by the runtime; a ping with other
-				// spacing reaches here and is answered too, before auth as well (§1).
-				if (request.id !== undefined) break;
+				// spacing, or with an `id` (ignored), reaches here and is answered with
+				// `pong` too, before auth as well (§1).
 				this.send(socket, JSON.parse(PING_RESPONSE));
 				return;
 		}
@@ -1327,7 +1522,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// A guest auth on an authenticated connection changes nothing: answer it
 		// without charging an attempt.
 		if (request.params.scheme === "guest" && (attachment.tier === "anonymous" || attachment.tier === "registered")) {
-			this.reply(socket, request, { you: this.current(attachment) });
+			this.reply(socket, request, { you: this.you(attachment) });
 			return;
 		}
 		this.store.reserveAuthAttempt({ ipKey: attachment.ipKey, now: nowMs() });
@@ -1344,6 +1539,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// A new guest has joined the default room (§3.4).
 			attachment.rooms = [...DEFAULT_JOINED_ROOMS];
 			delete attachment.listedJoined;
+			// A guest gets no pushes, so a mute sent before signing in is dropped.
+			delete attachment.pendingMute;
 			writeAttachment(socket, attachment);
 			this.reply(socket, request, { you: this.current(attachment) });
 			await this.rescheduleAlarm();
@@ -1453,7 +1650,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 					text: "A passkey was added to your account from another connection. If it wasn't you, remove it with `/passkeys`.", format: "markdown",
 				} } });
 			}
-			this.reply(socket, request, { you: this.current(latest) });
+			this.reply(socket, request, { you: this.you(latest) });
 			await this.rescheduleAlarm();
 			return;
 		}
@@ -1470,7 +1667,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.rooms = this.registeredRooms(socket, finished.identity.user_id);
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
-		this.reply(socket, request, { you: this.current(attachment), token });
+		this.applyPendingMute(socket);
+		this.reply(socket, request, { you: this.you(attachment), token });
 		if (guest) this.announceUser(socket, this.current(attachment), [...guestRooms, ...attachment.rooms], guest);
 		this.refreshAvatar(finished.identity.user_id);
 		await this.rescheduleAlarm();
@@ -1571,7 +1769,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
-		this.reply(socket, request, { you: this.current(attachment), token });
+		this.applyPendingMute(socket);
+		this.reply(socket, request, { you: this.you(attachment), token });
 		if (guest) this.announceUser(socket, this.current(attachment), [...guestRooms, ...attachment.rooms], guest);
 		this.refreshAvatar(identity.userId);
 		await this.rescheduleAlarm();
@@ -1649,7 +1848,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
-		this.reply(socket, request, { you: this.current(attachment), ...(token ? { token } : {}) });
+		this.applyPendingMute(socket);
+		this.reply(socket, request, { you: this.you(attachment), ...(token ? { token } : {}) });
 		if (guest) this.announceUser(socket, this.current(attachment), [...guestRooms, ...attachment.rooms], guest);
 		this.refreshAvatar(identity.userId);
 		await this.rescheduleAlarm();
@@ -1905,7 +2105,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (name === undefined) {
 			const current = connectionAttachment(socket) ?? attachment;
-			this.reply(socket, request, { you: removeAvatar ? { ...this.current(current), avatar: "" } : this.current(current) });
+			this.reply(socket, request, { you: removeAvatar ? { ...this.you(current), avatar: "" } : this.you(current) });
 			return;
 		}
 		if (attachment.tier !== "registered") {
@@ -1935,7 +2135,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!current) return;
 			// A removed name is announced as its empty value (§3.3).
 			const you = { ...this.current(current)!, ...(current.name ? {} : { name: "" }) };
-			this.reply(socket, request, { you });
+			const mute = this.you(current)?.mute;
+			this.reply(socket, request, { you: mute === undefined ? you : { ...you, mute } });
 			// Section 3.3: `you` to the user's other connections, `new` to those who share a room with the user.
 			if (!result.deduplicated) this.announceUser(socket, you, current.rooms ?? []);
 		});
@@ -1965,6 +2166,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			identity,
 		};
 		let started = false;
+		let created: MessageSnapshot | undefined;
 		await this.runMutation(async () => {
 			const result = this.store.mutate(input);
 			// A deduplicated retry carries no records and is never rebroadcast.
@@ -1972,7 +2174,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			for (const record of result.broadcasts) this.broadcastRecord(record);
 			this.reply(socket, request, await this.withWriteUrls(result.result));
 			started = this.afterUploads(result);
+			// Only a new message wakes anyone: not an edit, move, or retry (§4.7).
+			if (method === "message" && !result.deduplicated && result.message?.prev_log_id === undefined) created = result.message;
 		});
+		if (created && identity.tier === "registered") this.wakeFor(created);
 		// Pending writes that never come are failed by the alarm (§4.6.3).
 		if (started) await this.rescheduleAlarm();
 	}
@@ -2174,8 +2379,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Activity (§4.4). Typing is relayed to the room's other members and never
 	 * stored; without room_id it is in the default room. Read cursors are
-	 * dropped: the demo neither keeps nor relays them. `away` is accepted and
-	 * ignored, since the demo has no push; it is never delivered. At most
+	 * dropped: the demo neither keeps nor relays them. Neither touches the
+	 * connection's `status` `idle` (§4.11). At most
 	 * `activityBroadcastsPerUserMinute` relays per user; past that the update
 	 * is dropped and the sender gets one `~private` notice per minute.
 	 */
@@ -2191,7 +2396,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (typing !== undefined && (typeof roomId !== "string" || roomId.length === 0 || roomId.length > 64)) {
 			throw { name: "invalid_params", message: "room_id must be a room" } satisfies ProtocolError;
 		}
-		if (request.id !== undefined) this.reply(socket, request, {});
 		// A guest who only reads has nothing to be typing.
 		if (attachment.tier === "anonymous" && !this.config.guestPosting) return;
 		if (typing === undefined || typeof roomId !== "string" || !this.roomExists(roomId)) return;
@@ -2205,6 +2409,305 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const seconds = Math.min(Math.floor(typing), this.config.limits.activityMaxTypingSeconds);
 		const frame = { method: "activity", params: { room_id: roomId, from: identity, typing: seconds } };
 		this.deliver(frame, [roomId], undefined, socket);
+	}
+
+	/**
+	 * `status` (§4.11), a notification, implemented in part: unscoped `idle`
+	 * and `mute`. `idle` marks this connection unattended (true) or attended
+	 * (false), kept in the attachment, so it survives hibernation; only
+	 * `idle: false` ends it, and closing removes the connection. `mute` is
+	 * the user's: seconds to stay quiet (cut to MAX_MUTE_SECONDS), `true`
+	 * until changed, or `0` to end it; stored, so it outlasts the connection,
+	 * and echoed in `you` to the user's connections when it changes. Guests
+	 * get no pushes, so their mute is ignored. Both may come before
+	 * authentication: `idle` applies at once, and `mute` once the connection
+	 * signs in as a registered user. With `room_id`, `mute` is the room's,
+	 * which this server does not implement, and a scoped `idle` or
+	 * `invisible` is ignored, so such an update changes nothing. `invisible`,
+	 * unknown fields, and invalid values are ignored, each on its own.
+	 */
+	private handleStatus(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): void {
+		const params = request.params;
+		if (params.room_id !== undefined) return;
+		// Each field applies on its own; an invalid one is ignored (§4.11).
+		const idle = params.idle;
+		if (typeof idle === "boolean") {
+			// A client that sends `idle` reports it itself (see attended); one that
+			// only mutes may not, so it stays under the silent-connection rule.
+			const state = connectionAttachment(socket);
+			if (state && !state.statusSeen) {
+				state.statusSeen = true;
+				writeAttachment(socket, state);
+			}
+			this.setIdle(socket, idle);
+		}
+		const mute = params.mute;
+		if (mute !== true && !(typeof mute === "number" && Number.isSafeInteger(mute) && mute >= 0)) return;
+		if (attachment.tier === "pending") {
+			const state = connectionAttachment(socket);
+			if (!state) return;
+			state.pendingMute = mute as number | true;
+			writeAttachment(socket, state);
+			return;
+		}
+		if (attachment.tier !== "registered") return;
+		// Each change writes rows: past `mutesPerUserMinute` a user's changes
+		// are dropped, quietly, as invalid fields are.
+		const now = nowMs();
+		if (!this.muteChanges.take(attachment.userId!, now)) return;
+		this.changeMute(attachment.userId!, mute as number | true, now);
+	}
+
+	/**
+	 * Stores a registered user's mute, as `status` sends it (seconds, cut to
+	 * MAX_MUTE_SECONDS, from `now`; `true`; or 0 to end it) and, on a change,
+	 * sends `user` `you` with the result to every connection of theirs but
+	 * `except` (§4.11): the seconds left, `true`, or `0` once ended. Never
+	 * shown to others.
+	 */
+	private changeMute(userId: string, mute: number | true, now: number, except?: WebSocketConnection): void {
+		const untilMs = mute === true ? MUTE_FOREVER : mute === 0 ? null : now + Math.min(mute, MAX_MUTE_SECONDS) * 1_000;
+		const result = this.store.setMute({ userId, untilMs, now });
+		if (!result.changed) return;
+		// A change that ended the mute is echoed as `mute: 0` (§4.11).
+		const field = { mute: result.mute ?? 0 };
+		for (const peer of this.connectionsOf(userId, except)) {
+			const state = connectionAttachment(peer);
+			const user = state ? this.current(state) : null;
+			if (user) this.deliverTo(peer, { method: "user", params: { you: { ...user, ...field } } });
+		}
+	}
+
+	/**
+	 * Applies a `status` `mute` sent before this connection signed in, now
+	 * that it is a registered user's, timed from now. A failure leaves the
+	 * sign-in as it was: the mute is dropped, and the client can send it again.
+	 */
+	private applyPendingMute(socket: WebSocketConnection): void {
+		const state = connectionAttachment(socket);
+		if (!state || state.pendingMute === undefined) return;
+		const mute = state.pendingMute;
+		delete state.pendingMute;
+		writeAttachment(socket, state);
+		if (state.tier !== "registered" || !state.userId) return;
+		try {
+			// This connection learns the mute from its auth result.
+			this.changeMute(state.userId, mute, nowMs(), socket);
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "pending_mute_failed", reason: errorToProtocol(error).message }));
+		}
+	}
+
+	/**
+	 * A registered user's `mute` as `you` carries it on a push server
+	 * (§4.11): the seconds left or `true`, left out when not muted. Empty
+	 * without push, or when it cannot be read: a reply never fails on it.
+	 */
+	private muteField(userId: string, now = nowMs()): { mute?: number | true } {
+		if (!this.config.push) return {};
+		try {
+			const mute = this.store.muteOf(userId, now);
+			return mute !== undefined ? { mute } : {};
+		} catch {
+			return {};
+		}
+	}
+
+	/**
+	 * A connection's own user object (`you`, §3.3): its current object and,
+	 * for a registered user on a push server, `mute` (see muteField), which
+	 * is never shown to others.
+	 */
+	private you(attachment: ConnectionAttachment): PublicUser | null {
+		const user = this.current(attachment);
+		if (!user || attachment.tier !== "registered") return user;
+		return { ...user, ...this.muteField(user.user_id) };
+	}
+
+	/** Marks a connection idle or attended (`status` `idle`, §4.11), writing its attachment only on a change. */
+	private setIdle(socket: WebSocketConnection, idle: boolean): void {
+		const state = connectionAttachment(socket);
+		if (!state || (state.idle === true) === idle) return;
+		if (idle) state.idle = true;
+		else delete state.idle;
+		writeAttachment(socket, state);
+	}
+
+	/**
+	 * Whether a user has a connection someone attends: authenticated as them,
+	 * not stale, and not idle (§4.11). A connection whose client has never
+	 * sent `status` counts as idle once it has sent no frame for
+	 * SILENT_IDLE_MS (pings are answered by the runtime, so they do not
+	 * count); one whose client sends `status` is idle only when it says so.
+	 */
+	private attended(userId: string, now: number): boolean {
+		return this.connectionsOf(userId).some((peer) => {
+			const state = connectionAttachment(peer);
+			if (!state || state.idle || this.isStale(peer, now)) return false;
+			if (state.statusSeen) return true;
+			const last = state.frameTimes[state.frameTimes.length - 1] ?? 0;
+			return now - last < SILENT_IDLE_MS;
+		});
+	}
+
+	/**
+	 * `push_register` (§4.7) for push kind `webpush`: `{kind: "webpush", url,
+	 * keys: {p256dh, auth}, push_id?}`, the browser's `PushSubscription.toJSON()`
+	 * with `kind` added (`expirationTime` is ignored). `push_id`, 1 to 64
+	 * letters, digits, `_` or `-`, goes unchanged into every push to this
+	 * registration. `wake` lists the scopes it wakes for (§4.7): at most
+	 * MAX_WAKE_ENTRIES strings of at most 64 characters; scopes this server
+	 * does not implement are ignored, `[]` wakes for nothing, and without it
+	 * the registration wakes for `mentions` and `replies`. At most
+	 * `registersPerUserMinute` a user, across their
+	 * connections; past that, `retry_after`. Registered users only; a
+	 * guest's identity lasts one connection, so there is no one to wake. The
+	 * endpoint must be a public `https` URL (pushEndpointError), `p256dh` an
+	 * uncompressed P-256 point and `auth` 16 bytes, both base64url. A user
+	 * registering a `url` again replaces their own registration of it
+	 * (Store.registerPushSubscription).
+	 */
+	private async handlePushRegister(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
+		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
+		if (attachment.tier !== "registered") throw { name: "denied", message: "Sign in to receive push notifications" } satisfies ProtocolError;
+		const now = nowMs();
+		// Counted before validation, so refused registrations count too.
+		if (!this.pushRegisters.take(attachment.userId!, now)) {
+			throw { name: "retry_after", message: "Push registrations limited", data: { retry_after: this.pushRegisters.retry(attachment.userId!, now) ?? 1 } } satisfies ProtocolError;
+		}
+		const params = request.params;
+		const kind = requiredString(params, "kind");
+		if (kind !== "webpush") throw { name: "invalid_params", message: "Unknown push kind; this server offers webpush" } satisfies ProtocolError;
+		const sent = requiredString(params, "url");
+		const wake = wakeParam(params.wake);
+		const pushId = optionalString(params, "push_id");
+		if (pushId !== undefined && !PUSH_ID_PATTERN.test(pushId)) throw { name: "invalid_params", message: "push_id must be 1 to 64 letters, digits, _ or -" } satisfies ProtocolError;
+		const problem = pushEndpointError(sent, this.config.pushHosts);
+		if (problem) throw { name: "invalid_params", message: problem } satisfies ProtocolError;
+		// Stored as the URL parser spells it, so one endpoint has one key.
+		const url = new URL(sent).href;
+		if (utf8Bytes(url) > MAX_PUSH_URL_BYTES) throw { name: "invalid_params", message: `url is at most ${MAX_PUSH_URL_BYTES} bytes` } satisfies ProtocolError;
+		const keys = objectParam(params, "keys")!;
+		const key = (name: string): Uint8Array | null => typeof keys[name] === "string" && keys[name].length <= 256 ? base64UrlDecode(keys[name]) : null;
+		const p256dh = key("p256dh");
+		if (!p256dh || !await validP256PublicKey(p256dh)) {
+			throw { name: "invalid_params", message: "keys.p256dh must be an uncompressed P-256 public key in base64url" } satisfies ProtocolError;
+		}
+		const auth = key("auth");
+		if (auth?.byteLength !== AUTH_SECRET_BYTES) throw { name: "invalid_params", message: `keys.auth must be ${AUTH_SECRET_BYTES} bytes in base64url` } satisfies ProtocolError;
+		// The key check awaited: register for the connection as it is now (a /rename may have moved it).
+		const current = connectionAttachment(socket);
+		if (!current || current.closing || current.tier !== "registered" || !current.userId) return;
+		this.store.registerPushSubscription({ userId: current.userId, url, p256dh: base64UrlEncode(p256dh), auth: base64UrlEncode(auth), ...(pushId !== undefined ? { pushId } : {}), ...(wake !== undefined ? { wake } : {}), now: nowMs() });
+		this.reply(socket, request, {});
+	}
+
+	/** `push_unregister` (§4.7): removes the user's own registration of `url`; an unknown one is already gone. */
+	private handlePushUnregister(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): void {
+		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
+		if (attachment.tier !== "registered") throw { name: "denied", message: "Sign in to receive push notifications" } satisfies ProtocolError;
+		const sent = requiredString(request.params, "url");
+		if (utf8Bytes(sent) > MAX_PUSH_URL_BYTES) throw { name: "invalid_params", message: `url is at most ${MAX_PUSH_URL_BYTES} bytes` } satisfies ProtocolError;
+		// As registration stores it; an unparsable url was never registered.
+		let url = sent;
+		try { url = new URL(sent).href; } catch { /* removes nothing */ }
+		this.store.removePushSubscription({ userId: attachment.userId!, url, now: nowMs() });
+		this.reply(socket, request, {});
+	}
+
+	/**
+	 * Wakes those a registered user's new message concerns (§4.7): the users
+	 * its `body.mentions` lists (scope `mentions`) and the author of the
+	 * message it replies to (scope `replies`, one metered lookup); guests'
+	 * messages wake no one. The candidates, the replied-to author first so
+	 * mentions cannot crowd them out, then mentions in order, deduplicated
+	 * with their reasons combined, are users other than the sender (and not
+	 * guests) with no attended connection (see attended), at most
+	 * MAX_PUSH_CANDIDATES. Store.claimPushes then wakes up to
+	 * `wakesPerMessage` of those with live registrations for one of their
+	 * reasons, at most once a `coalesceSeconds` per room, within the sender's
+	 * and the server's daily allowances. Every room is visible to everyone,
+	 * so a mention or reply anywhere counts, joined or not. Pushes go out
+	 * after the result, kept alive with waitUntil. A failure here is logged
+	 * and never touches the post.
+	 */
+	private wakeFor(message: MessageSnapshot): void {
+		const vapid = this.config.push;
+		const policy = PUSH_POLICY;
+		if (!vapid || !policy) return;
+		const now = nowMs();
+		const sender = message.from.user_id;
+		const reasons = new Map<string, number>();
+		const consider = (userId: unknown, reason: number) => {
+			if (typeof userId !== "string" || userId === sender || userId.startsWith("guest_")) return;
+			const known = reasons.get(userId);
+			if (known !== undefined) reasons.set(userId, known | reason);
+			else if (reasons.size < MAX_PUSH_CANDIDATES && !this.attended(userId, now)) reasons.set(userId, reason);
+		};
+		const replyTo = message.reply_to?.message_id;
+		if (replyTo !== undefined) {
+			try {
+				consider(this.store.messageAuthor(replyTo, now), WAKE_SCOPES.replies);
+			} catch (error) {
+				console.warn(JSON.stringify({ event: "push_reply_lookup_failed", reason: errorToProtocol(error).message }));
+			}
+		}
+		const mentions = message.body?.mentions;
+		if (Array.isArray(mentions)) for (const userId of mentions) consider(userId, WAKE_SCOPES.mentions);
+		if (!reasons.size) return;
+		const candidates: PushCandidate[] = [...reasons].map(([userId, reason]) => ({ userId, reasons: reason }));
+		let claimed: ReturnType<Store["claimPushes"]>;
+		try {
+			// PUSH_HOSTS as configured now: a registration made under a wider list
+			// is passed over before it takes a wake or a push.
+			const hosts = this.config.pushHosts;
+			claimed = this.store.claimPushes({ senderId: sender, roomId: message.room_id, candidates, allowed: (url) => pushEndpointError(url, hosts) === null, now });
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "push_claim_failed", reason: errorToProtocol(error).message }));
+			return;
+		}
+		if (claimed.skipped) console.warn(JSON.stringify({ event: "push_allowance_reached", skipped: claimed.skipped }));
+		if (claimed.subscriptions.length) this.ctx.waitUntil(this.deliverPushes(claimed.subscriptions, message, vapid, policy.ttlSeconds, sender));
+	}
+
+	/**
+	 * Pushes a message to each registration at once, each payload carrying
+	 * that registration's `push_id`; charges the sender for those delivered;
+	 * and forgets those whose push service says they are gone (404 or 410) or
+	 * refuses this server's key (403). Other failures are only logged: the
+	 * push is lost, not retried.
+	 */
+	private async deliverPushes(subscriptions: readonly PushSubscriptionRecord[], message: MessageSnapshot, vapid: VapidKeys, ttlSeconds: number, senderId: string): Promise<void> {
+		const payloads = new Map<string | undefined, string>();
+		const payloadFor = (pushId: string | undefined): string => {
+			let payload = payloads.get(pushId);
+			if (payload === undefined) payloads.set(pushId, payload = pushPayload(message, pushId));
+			return payload;
+		};
+		// Mentions and replies are messages for this user, so `high` (§4.7).
+		const outcomes = await Promise.allSettled(subscriptions.map((subscription) =>
+			sendWebPush(subscription, payloadFor(subscription.pushId), vapid, { ttlSeconds, urgency: "high", nowMs: nowMs() })));
+		const gone: Array<{ userId: string; url: string; p256dh: string }> = [];
+		let failed = 0;
+		let delivered = 0;
+		outcomes.forEach((outcome, index) => {
+			const { userId, url, p256dh } = subscriptions[index];
+			const status = outcome.status === "fulfilled" ? outcome.value.status : 0;
+			if (status >= 200 && status < 300) delivered++;
+			// 404 and 410: the subscription is gone (RFC 8030). 403: the push
+			// service refuses this server's VAPID key for it, so it was made with
+			// another one; the configuration check proves the key pair matches, so
+			// no push to it will ever succeed. The client registers again on its
+			// next connection, with a subscription for the current key.
+			else if (outcome.status === "fulfilled" && (outcome.value.gone || status === 403)) gone.push({ userId, url, p256dh });
+			else failed++;
+		});
+		if (failed) console.warn(JSON.stringify({ event: "push_delivery_failed", failed, sent: subscriptions.length }));
+		try {
+			// The sender pays for delivered pushes only (`pushesPerSenderDay`).
+			this.store.chargePushSender(senderId, delivered, nowMs());
+			if (gone.length) this.store.forgetPushSubscriptions(gone, nowMs());
+		} catch { /* a failed charge or delete is retried by nothing: the next push tries again */ }
 	}
 
 	/**
@@ -2482,6 +2985,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const chosen = passkeys[Number(args[1]) - 1];
 		if (!chosen) throw { name: "invalid_params", message: `You have ${passkeys.length} passkey${passkeys.length === 1 ? "" : "s"}; see /passkeys` } satisfies ProtocolError;
 		if (!this.store.removePasskey({ userId, credentialId: chosen.credentialId, now: nowMs() })) throw usage;
+		// A device that held the removed passkey must not keep getting the
+		// user's messages by push; the user's other devices register again on
+		// their next connection.
+		if (this.config.push) this.store.clearPushSubscriptions(userId, nowMs());
 		const text = `Removed the passkey \`${chosen.credentialId.slice(0, 8)}…\` from your account.`;
 		for (const peer of this.connectionsOf(userId, socket)) {
 			this.deliverTo(peer, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text, format: "markdown" } } });
@@ -2843,6 +3350,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			`| Connection admissions | ${share(budget.admissions, limits.connectionAdmissionsPerDay)} |`,
 			`| Posts | ${share(budget.posts, limits.globalPostsPerDay)} |`,
 			`| Registrations | ${share(budget.registrations, limits.registrationsPerDay)} |`,
+			...(this.config.push && PUSH_POLICY ? [`| Pushes | ${share(this.store.pushesToday(now), PUSH_POLICY.pushesPerDay)} |`] : []),
 			`| Registered users | ${share(identities, limits.registeredIdentityCount)} |`,
 			`| Open connections | ${share(this.ctx.getWebSockets().length, limits.openConnections)} |`,
 			`| Database | ${databaseBytes === null ? "unknown" : mib(databaseBytes)} / ${mib(limits.databaseHardTargetBytes)} |`,
@@ -2869,6 +3377,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			for (const record of bot.broadcasts) this.broadcastRecord(record);
 		});
 		const token = await this.issueBotToken(botId, ownerId);
+		// The old token is revoked: whatever ran with it loses the bot's pushes too.
+		if (this.config.push) this.store.clearPushSubscriptions(botId, nowMs());
 		for (const peer of this.connectionsOf(botId)) {
 			const state = connectionAttachment(peer);
 			if (state) this.closePolicy(peer, state, 1008, "Bot token replaced; sign in with the new one");
@@ -3011,12 +3521,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!user) return;
 		const identity = user;
 		const shared = new Set(rooms);
+		// The user's own connections get `you`, with their mute (§4.11), read once.
+		let own: PublicUser | undefined;
 		for (const peer of this.ctx.getWebSockets()) {
 			const socket = peer as WebSocketConnection;
 			if (socket === origin) continue;
 			const state = connectionAttachment(socket);
 			if (!state) continue;
-			if (state.userId === identity.user_id) this.deliverTo(socket, { method: "user", params: { you: identity } });
+			if (state.userId === identity.user_id) {
+				own ??= state.tier === "registered" ? { ...identity, ...this.muteField(identity.user_id) } : identity;
+				this.deliverTo(socket, { method: "user", params: { you: own } });
+			}
 			else if (state.rooms?.some((id) => shared.has(id))) this.deliverTo(socket, { method: "user", params: { new: identity, ...(old ? { old } : {}) } });
 		}
 	}

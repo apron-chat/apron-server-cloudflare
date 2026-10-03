@@ -344,7 +344,8 @@ For direct Wrangler production commands, always pass
    `ACCOUNT_ID` with `ACCOUNT_ANALYTICS_TOKEN`. Keep a Cloudflare budget alert
    as a second signal. For uploads, create the bucket, its lifecycle rules,
    domain, cache rule and signing key first ([uploads](configuration.md#uploads));
-   deploying fails without the bucket.
+   deploying fails without the bucket. For push, set the VAPID keys and
+   contact ([push](configuration.md#push)); without them push stays off.
 3. Set `ALLOWED_ORIGINS = "*"` for the public reference server. Keep the
    passkey RP ID `apron.chat` and the explicit, exact `RP_ORIGINS` allowlist;
    wildcard guest admission never enables wildcard passkey verification.
@@ -354,11 +355,12 @@ For direct Wrangler production commands, always pass
 5. Review `wrangler.production.toml`: fixed DO binding, `new_sqlite_classes` migration,
    no paid-service bindings. Apply the initial migration once using the normal
    Wrangler deployment workflow. Do not rename or recreate the production
-   object to work around a quota or schema issue. The current schema is 7
-   (protocol 7, roles kept with identities); schema 5 and 6 objects are
+   object to work around a quota or schema issue. The current schema is 8
+   (protocol 7, with push subscriptions); schema 5, 6 and 7 objects are
    upgraded in place on their first wake, keeping everything: schema 5's
-   thread intro messages become their `description`, and schema 6's admins
-   and bots get their roles (see [SPEC section 8](../SPEC.md#schema-versions)).
+   thread intro messages become their `description`, schema 6's admins
+   and bots get their roles, and schema 7 gains the empty push tables
+   (`push_subscriptions`, `push_wakes`, `mutes`; see [SPEC section 8](../SPEC.md#schema-versions)).
    The upgrade is one-way: redeploying protocol 6 code afterwards resets the
    object like any schema change, so fix forward instead of rolling back. It
    also fails closed: if it cannot finish, nothing changes, and the object

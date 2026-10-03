@@ -42,8 +42,9 @@ reserves 32/16 after control overhead: a replay's result reflects the current
 state, so it reads each upload embed's write state (§1.2). So a steady-state request-ID
 create reserves 120 writes and a request-ID edit 280 (104 and 264 without a
 request ID). History pages reserve a 32-write floor. A cleanup run has a
-bounded due-check reservation (14 reads for its seven indexed existence
-probes, one of them the purge list) plus a 1,032/1,032 batch reservation.
+bounded due-check reservation (18 reads for its nine indexed existence
+probes, one of them the purge list and two for push registrations and wake
+times) plus a 1,032/1,032 batch reservation.
 
 The table below includes the reservation SQL in the observed cursor counts.
 Every operation in the runtime reservation matrix is listed so the claimed
@@ -64,6 +65,17 @@ upper bounds can be compared with the measured worst case.
 | Identity count | 4 | 2 | 16 | 8 |
 | Credential IDs lookup | 4 | 2 | 40 | 8 |
 | Credential counter update | 5 | 3 | 16 | 16 |
+| Push subscription register | 9 | 7 | 172 | 370 |
+| Push subscription register again, unchanged within a day | 6 | 2 | 172 | 370 |
+| Push wake claim (one user, one subscription; creates the server and recipient counters) | 21 | 19 | 82 | 160 |
+| Push wake claim, 31 unregistered candidates before one registered | 75 | 9 | 888 | 160 |
+| Push sender charge (delivered pushes; creates the sender counter) | 10 | 9 | 24 | 24 |
+| Push registrations clear (`/passkeys remove`, a new bot token) | 3 | 3 | 144 | 400 |
+| Mute set (`status` `mute`) | 6 | 4 | 24 | 24 |
+| Mute read (`you`) | 5 | 2 | 16 | 8 |
+| Gone push subscription forget (one primary-key row) | 4 | 3 | 20 | 22 |
+| Push reply author lookup | 5 | 2 | 16 | 8 |
+| Push wake claim for a reply (creates the recipient counter) | 13 | 9 | 82 | 160 |
 | Message create with request ID | 33 | 37 | 296 | 120 |
 | Empty new message (not logged) | 4 | 2 | 16 | 8 |
 | Deduplicated mutation retry | 5 | 2 | 32 | 16 |
@@ -82,7 +94,7 @@ upper bounds can be compared with the measured worst case.
 | Room members, `general` and one thread | 8 | 2 | 824 | 8 |
 | Room members, 101 rooms with 200 registered members each | 40,403 | 2 | 40,820 | 8 |
 | Admission snapshot | 6 | 2 | 40 | 24 |
-| Cleanup (matrix, one day later) | 128 | 51 | 1,070 | 1,058 |
+| Cleanup (matrix, one day later) | 128 | 51 | 1,074 | 1,058 |
 | Alarm scheduling | 8 | 4 | 24 | 12 |
 
 The matrix uses a fresh object and one representative operation for each
@@ -277,6 +289,61 @@ and two groups of four edits separated by a minute. The resulting current-day
 limiter count was 13, demonstrating that the UTC reset and the two bursts are
 independent.
 
+## Push
+
+With Web Push on (protocol §4.7), `push_register` is one frame plus the
+registration above: about 7 writes the first time (the row and its two
+indexes), and 2 for the reservation alone when a client registers the same
+subscription (keys and `push_id`) on its next connection within a day, which
+writes nothing; `registersPerUserMinute` (10) bounds the rest. These were
+measured with a 64-character `push_id`, the longest allowed; it changes row
+bytes, not row counts. The reservation is sized for evicting a user's whole
+index range under any valid policy (64 registrations), which the credit-back
+returns.
+
+Choosing whom a new message wakes reads connection attachments, plus one
+indexed read of the replied-to message's current state when the message is
+a reply (5/2 with its reservation). Registrations carry their wake scopes
+in the same row, so filtering by scope costs no extra rows. The wake claim then looks up the candidates in turn, at most 32: each costs
+one read of its mute, and an unregistered one about one more of its live
+index range, and a registered one also
+reads its wake time for the room and its recipient counter, and the
+sender's counter once. A message that wakes someone writes each woken user's
+wake time and recipient counter, and the server's counter: 19 writes for the
+day's first wake (counter rows created), about 9 after. The sender's counter
+is written after delivery, once per message with delivered pushes (9 writes
+the first time a day, fewer after). A message whose candidates have no live
+registrations, or are all coalesced, writes nothing; one that mentions no
+one idle or gone does no push SQL. The reservation covers 32 candidates at
+5 registrations each (888 reads) and `wakesPerMessage` wake rows and
+recipient counters (160 writes), mostly credited back. A push service's
+404, 410 or 403 costs one primary-key delete per gone registration,
+whatever other accounts share the endpoint: deleting by endpoint alone
+would read and write every account's row for it, which an attacker can
+multiply by registering one endpoint from many accounts, and would overrun
+the reservation and latch accounting unsafe. Many accounts sharing one
+endpoint otherwise cost what as many separate registrations do: a wake
+claims at most `wakesPerMessage` users of `subscriptionsPerUser` each.
+
+A `status` `mute` change is one upsert or delete of the user's `mutes` row
+(about 4 writes, 6/4 with the reservation), echoed in `you` from the same
+operation; `auth` and `me` results for a registered user on a push server
+read it once each. `mutesPerUserMinute` (6) bounds the changes, counted per
+user across reconnects, so flipping a mute cannot drain the write budget:
+at most about 35 written rows a user a minute. An
+expired mute is read as none and never written back.
+
+Cleanup deletes expired registrations (`pushExpiryDays`, 7) and wake times
+past `coalesceSeconds` within its existing batch, by their time indexes.
+Wake times number at most one per woken user and room a day, so at most
+`pushesPerDay` rows.
+
+The pushes themselves are outbound requests from the Durable Object: no
+Worker or Durable Object request is billed for them, and the object is
+awake for the post anyway. `pushesPerDay` (5,000 on Paid, 1,000 on Free)
+bounds them; on Paid that is at most about 50,000 claim writes a day if
+every push were its own wake, about 7% of the foreground write ceiling.
+
 ## Retention, maintenance, and persistent state
 
 The three-day cleanup advanced the internal server-wide retention floor
@@ -380,7 +447,12 @@ exhausted budget cannot block it. The object is not wiped.
 A schema 6 object is upgraded to schema 7 the same way: it adds `roles_json`
 to `identities` and sets it for bots, `admin`, and schema 6's listed admins,
 reading and updating the identities once (at most the identity cap), and
-deletes the `_meta` `admins` row. A schema 5 object takes both upgrades.
+deletes the `_meta` `admins` row. A schema 7 object is upgraded to schema 8
+the same way, which only creates three empty tables, `push_subscriptions`
+(with indexes by user and registration time, and by registration time),
+`push_wakes` (with an index by wake time) and `mutes`: three tables and
+three indexes besides their primary keys. A schema 5 object takes all three
+upgrades.
 
 Any other stored schema version resets the object with
 `deleteAll()` and recreates the schema (`test/schema-reset.integration.test.ts`).

@@ -63,7 +63,8 @@ within it:
 - Activity (where on): typing is relayed to the room's other
   members and never stored, at most 10 relays per user per minute; past that, updates are dropped and the
   sender gets one `~private` notice a minute saying so. Read cursors are
-  neither kept nor relayed. `away` is accepted and ignored: the demo has no push.
+  neither kept nor relayed. Activity has no part in push: attendance is the
+  separate `status` notification (below).
 - Commands: `/help` replies with a `~private` notice listing the commands the
   sender may run; `/invite-bot` gives a registered user a bot token (below);
   `/avatar` sets one with an attached image (below); other commands are
@@ -78,6 +79,40 @@ within it:
   keep embeds by it. Admins can turn uploads off and on with
   `/toggle uploads`. Clients should resize images and strip their metadata
   (such as location) before uploading: the server stores the bytes as sent.
+- Status (cap `status`, with push): a client sends the notification
+  `status` `{"idle": true}` when nobody is attending a connection (an
+  unfocused tab, a backgrounded app) and `{"idle": false}` when someone is
+  again; only that ends it. A client that never sends `status` counts as
+  idle after ten minutes without a frame. `{"mute": 3600}` (or `true`, until
+  changed) stops a signed-in user's pushes; `{"mute": 0}` ends it. The mute
+  shows in the user's own `you` while set, and each change is echoed to all
+  their connections (an ended mute as `mute: 0`); it is never shown to
+  others. Room-scoped status, `invisible`, and invalid values are ignored,
+  and a `status` with an `id` gets no reply. Status may be sent before
+  signing in.
+- Push (`server.push` kind `webpush`, where VAPID keys are set): registered
+  users register a browser's push subscription with `push_register`
+  `{kind: "webpush", url, keys: {p256dh, auth}, push_id?}` (its
+  `PushSubscription` JSON with `kind` and an optional `push_id` of 1 to 64
+  letters, digits, `_` or `-`, and an optional `wake` list of scopes, of which
+  `mentions` and `replies` are implemented and the default), at most 5 each
+  and 10 registrations a
+  minute; guests cannot. Registrations are each user's own, and lapse after
+  7 days without being registered again (clients register on every
+  connection). Endpoints must be public `https` hosts on an allowed push
+  service (by default the browsers' own), not IP literals or internal names. A new message that
+  mentions a user, or replies to their message, wakes them by push (on the
+  registrations whose `wake` includes that scope) only when none of their
+  connections is
+  attended (every one idle, stale, or closed): at most 10 users with
+  registrations a message, once a minute per user and room, 100 pushes a day
+  per recipient, 200 delivered pushes a day per sender, and 5,000 pushes a
+  day in all. Guests' messages wake no one
+  (see
+  [SPEC section 4.4](../SPEC.md#44-push)). The push carries
+  `{push_id, message}`: the registration's `push_id` when it has one, and
+  the message without `log_id`, its text cut to 200 characters, without
+  format or embeds, in at most 2048 bytes.
 - Messages: a request without `room_id` is in `general`. A new message with
   empty text and no embeds is not logged and returns `{}`; an empty save is
   `invalid_params` (delete instead). `body.mentions` is stored as sent, and

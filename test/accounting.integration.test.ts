@@ -1,7 +1,7 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
-import { Store, StoreError, defaultStoreConfig } from '../src/store';
-import { DEFAULT_LIMITS } from '../src/budget';
+import { Store, StoreError, WAKE_SCOPES, defaultStoreConfig } from '../src/store';
+import { DEFAULT_LIMITS, PUSH_POLICY } from '../src/budget';
 import { expectRetryAfter, messagesOf } from './helpers/store';
 
 // A day's retention with hourly cleanup, for tests that watch records expire.
@@ -653,7 +653,7 @@ describe('measured storage accounting', () => {
 
 	it('measures every Store reservation boundary used by runtime operations', async () => {
 		const stub = env.DEMO.getByName('accounting-operation-matrix-v1');
-		const config = defaultStoreConfig();
+		const config = defaultStoreConfig({ push: { ...PUSH_POLICY! } });
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
 			const store = new Store(state, config, clock);
@@ -679,6 +679,18 @@ describe('measured storage accounting', () => {
 			measure('identity count', () => store.countIdentities());
 			measure('credential IDs lookup', () => store.credentialIdsForUser('matrix-user'));
 			measure('credential counter update', () => store.updateCredentialCounter('matrix-credential', 1));
+			const subscription = { userId: 'matrix-user', url: 'https://push.example.net/matrix', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), pushId: 'p'.repeat(64) };
+			measure('push subscription register', () => store.registerPushSubscription({ ...subscription, now: clock.now() }));
+			measure('push subscription register again, unchanged', () => store.registerPushSubscription({ ...subscription, now: clock.now() }));
+			expect(measure('push wake claim', () => store.claimPushes({ senderId: 'matrix-sender', roomId: 'general', candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() })).subscriptions).toHaveLength(1);
+			const unsubscribed = Array.from({ length: 31 }, (_, index) => `matrix-unsubscribed-${index}`);
+			expect(measure('push wake claim, 31 unsubscribed candidates first', () => store.claimPushes({ senderId: 'matrix-sender', roomId: 'matrix-room', candidates: [...unsubscribed, 'matrix-user'].map((userId) => ({ userId, reasons: WAKE_SCOPES.mentions })), now: clock.now() })).subscriptions).toHaveLength(1);
+			measure('mute set', () => store.setMute({ userId: 'matrix-user', untilMs: clock.now() + 3_600_000, now: clock.now() }));
+			expect(measure('mute read', () => store.muteOf('matrix-user', clock.now()))).toBe(3_600);
+			store.setMute({ userId: 'matrix-user', untilMs: null, now: clock.now() });
+			measure('push sender charge', () => store.chargePushSender('matrix-sender', 2, clock.now()));
+			measure('push registrations clear', () => store.clearPushSubscriptions('matrix-other', clock.now()));
+			measure('gone push subscription forget', () => store.forgetPushSubscriptions([{ userId: subscription.userId, url: subscription.url, p256dh: subscription.p256dh }], clock.now()));
 
 			const identity = { user_id: 'matrix-user', name: 'Matrix user', tier: 'registered' as const };
 			const create = measure('message create', () => store.commitMutation({
@@ -690,6 +702,9 @@ describe('measured storage accounting', () => {
 				params: { room_id: 'general', body: { text: 'matrix message', format: 'plain' } }, identity,
 			}));
 			const messageId = create.result.message_id as string;
+			expect(measure('push reply author lookup', () => store.messageAuthor(messageId, clock.now()))).toBe('matrix-user');
+			store.registerPushSubscription({ ...subscription, now: clock.now() });
+			expect(measure('push wake claim for a reply', () => store.claimPushes({ senderId: 'matrix-replier', roomId: 'matrix-reply-room', candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.replies }], now: clock.now() })).subscriptions).toHaveLength(1);
 			measure('reaction set', () => store.commitMutation({
 				userId: 'matrix-user', ipKey: 'matrix-react-ip', requestId: 'matrix-react', method: 'reactions', now: clock.now(),
 				params: { message_id: messageId, emojis: ['👍', '🎉'] }, identity,
@@ -728,7 +743,7 @@ describe('measured storage accounting', () => {
 			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
 			expect(create.result.message_id).toBeTruthy();
-			expect(costs).toHaveLength(30);
+			expect(costs).toHaveLength(41);
 			return { costs };
 		});
 		console.info('accounting-operation-matrix', JSON.stringify(result));

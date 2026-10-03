@@ -498,7 +498,9 @@ describe('uploads end to end', () => {
 			expect(notice(off.skipped)).toBe('Activity is now **off**: typing is no longer relayed, and new connections are not offered it.');
 			const quiet = await guests();
 			expect(quiet.caps).not.toContain('activity');
-			expect((await request(quiet.alice, 'typing', 'activity', { room_id: 'general', typing: 5 })).error.code).toBe(-32601);
+			// Only a notification: with an `id` it gets no reply either way (§1).
+			quiet.alice.send({ id: 'typing', method: 'activity', params: { room_id: 'general', typing: 5 } });
+			expect((await exchange(quiet.alice, 'after-typing', 'me', {})).skipped.filter((frame) => frame.id === 'typing')).toEqual([]);
 			quiet.alice.close(); quiet.bob.close();
 			expect(await runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.toggle('activity'))).toBeUndefined();
 		} finally { admin.close(); }

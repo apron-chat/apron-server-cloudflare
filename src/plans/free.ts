@@ -104,6 +104,29 @@ export const FREE_PLAN: Plan = Object.freeze({
 		// analytics report them.
 		webSocketMessagesPerRequest: 1,
 	}),
+	// Web Push for mentions and replies, on once VAPID keys are set. A wake
+	// costs a subscription read and a counter write, and each push is an outbound
+	// request from the Durable Object, which needs no request allowance; the
+	// daily cap bounds what the push services see from the demo.
+	push: Object.freeze({
+		pushesPerDay: 1_000,
+		wakesPerMessage: 10,
+		// One sender's delivered pushes cannot spend more than a twentieth of
+		// the day, and one recipient gets at most a tenth of it, so a few
+		// sybils cannot use up everyone's pushes or flood one person.
+		pushesPerSenderDay: 50,
+		pushesPerRecipientDay: 100,
+		// Each mute change costs a few written rows.
+		mutesPerUserMinute: 6,
+		// A busy conversation wakes an away user once a minute per room.
+		coalesceSeconds: 60,
+		subscriptionsPerUser: 5,
+		// Clients register on every connection, refreshing at most daily; a
+		// browser unused for a week is not pushed to.
+		pushExpiryDays: 7,
+		registersPerUserMinute: 10,
+		ttlSeconds: 24 * 60 * 60,
+	}),
 	features: Object.freeze({
 		activity: false,
 		guestPosting: false,

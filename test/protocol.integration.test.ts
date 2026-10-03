@@ -1,5 +1,5 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import { DEFAULT_LIMITS } from '../src/budget';
 import { canonicalizeIp, hashIpKey } from '../src/ip';
 import { connect as open, exchange, greeting, reply, request, until, type ConnectOptions, type Frame, type Peer } from './helpers/socket';
@@ -45,7 +45,7 @@ const connect = ({ ip = `192.0.2.${nextIp++}`, ...options }: Partial<ConnectOpti
 async function authenticate(peer: Peer, scheme = 'guest', extraCaps: string[] = []) {
 	const { server } = await greeting(peer);
 	expect(server.params.apron).toBe(7);
-	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload']);
+	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'status']);
 	expect(server.params.auth).toContain('webauthn');
 	expect(server.params.ping).toBe(45);
 	// Demo hints live under the standard ext object, not a top-level key.
@@ -173,9 +173,10 @@ it('answers the liveness ping before and after authentication', async () => {
 		// Other spacing reaches the handler, which answers it as well.
 		peer.socket.send('{ "method": "ping" }');
 		expect(await peer.next()).toEqual({ method: 'pong' });
-		// A ping request is not the liveness ping: before auth it is denied.
+		// `ping` is only a notification: an `id` is ignored, so it gets `pong`
+		// and no reply, before auth too (§1).
 		peer.send({ id: 'ping-request', method: 'ping' });
-		expect((await peer.next()).error.code).toBe(-32001);
+		expect(await peer.next()).toEqual({ method: 'pong' });
 		peer.send({ id: 'auth', method: 'auth', params: { scheme: 'guest' } });
 		expect((await peer.next()).result.you.user_id).toMatch(/^guest_/);
 		peer.socket.send('{"method":"ping"}');
@@ -467,8 +468,9 @@ it('leaves activity off when ACTIVITY is false: not advertised, and typing is no
 		await authenticate(alice);
 		await authenticate(bob);
 		alice.send({ method: 'activity', params: { room_id: 'general', typing: 5 } });
+		// `activity` is only a notification: one with an `id` gets no reply, even with activity off (§1).
 		alice.send({ id: 'typing-request', method: 'activity', params: { room_id: 'general', typing: 5 } });
-		expect((await until(alice, (frame) => frame.id === 'typing-request')).frame.error.code).toBe(-32601);
+		expect((await exchange(alice, 'after-typing', 'me', {})).skipped.filter((frame) => frame.id === 'typing-request')).toEqual([]);
 		alice.send({ id: 'after', method: 'message', params: { room_id: 'general', body: { text: 'no typing relayed' } } });
 		const done = await until(bob, (frame) => frame.method === 'message' && frame.params.body?.text === 'no typing relayed');
 		expect(done.skipped.filter((frame) => frame.method === 'activity')).toEqual([]);
@@ -492,7 +494,7 @@ it('limits the frames the whole server processes in a minute without closing soc
 	} finally { peer.close(); await configure((config) => { config.limits.globalFramesPerMinute = DEFAULT_LIMITS.globalFramesPerMinute; }); }
 });
 
-it('with ACTIVITY on, relays typing to room members, accepts away, throttles per user, and tells only the sender once', async () => {
+it('with ACTIVITY on, relays typing to room members, ignores away, throttles per user, and tells only the sender once', async () => {
 	await configure((config) => { config.activityEnabled = true; });
 	const alice = await connect();
 	const bob = await connect();
@@ -503,7 +505,7 @@ it('with ACTIVITY on, relays typing to room members, accepts away, throttles per
 		await authenticate(carol, 'guest', ['activity']);
 		// Carol has left general, so typing there is not relayed to her.
 		await request(carol, 'leave', 'room_leave', { room_id: 'general' });
-		// `away` is accepted and never delivered, with or without a room.
+		// An unknown field such as the former `away` is ignored and never delivered.
 		alice.send({ method: 'activity', params: { away: true } });
 		alice.send({ method: 'activity', params: { typing: 99 } });
 		const first = await until(bob, (frame) => frame.method === 'activity');
@@ -660,7 +662,14 @@ it('lists only connected guests as members after others posted and left', async 
 			await until(peer, (frame) => frame.id === `post-${index}`);
 			peer.close();
 		}
-		await new Promise((resolve) => setTimeout(resolve, 200));
+		// Wait for the server to process each close, rather than a fixed time.
+		await vi.waitFor(() => runInDurableObject(env.DEMO.getByName('public-demo-v1'), (_instance, state) => {
+			const open = state.getWebSockets().filter((socket) => {
+				const attachment = socket.deserializeAttachment() as { userId?: string; closing?: boolean };
+				return gone.includes(attachment.userId ?? '') && !attachment.closing && socket.readyState === 1;
+			});
+			expect(open).toHaveLength(0);
+		}), { timeout: 5_000 });
 		// A fresh connection sees their messages in history, but not them as
 		// members: a guest's membership ends with its connection, unlogged.
 		const fresh = await connect();
@@ -691,19 +700,30 @@ it('drops a connection that pinged and went quiet from room_list members and clo
 		// The runtime answers the ping itself; it never reaches the handler.
 		bob.socket.send('{"method":"ping"}');
 		expect(await until(bob, (frame) => frame.method === 'pong')).toMatchObject({ frame: { method: 'pong' } });
-		carol.socket.send('{"method":"ping"}');
-		await until(carol, (frame) => frame.method === 'pong');
 		await new Promise((resolve) => setTimeout(resolve, 700));
 		// Carol keeps talking; Bob's peer has gone quiet.
 		carol.socket.send('{"method":"ping"}');
 		await until(carol, (frame) => frame.method === 'pong');
-		await new Promise((resolve) => setTimeout(resolve, 500));
+		// Judge staleness at a fixed moment, half the timeout after Carol's
+		// ping, rather than whenever a loaded machine gets to the listing:
+		// Carol (0.5 s quiet) is live and Bob (at least 1.2 s quiet) is stale.
+		const pinged = await runInDurableObject(env.DEMO.getByName('public-demo-v1'), (_instance, state) => {
+			const times = new Map<string, number>();
+			for (const socket of state.getWebSockets()) {
+				const attachment = socket.deserializeAttachment() as { userId?: string };
+				const at = state.getWebSocketAutoResponseTimestamp(socket)?.getTime();
+				if (attachment.userId && at !== undefined) times.set(attachment.userId, at);
+			}
+			return Object.fromEntries(times);
+		});
+		expect(pinged[carolId.user_id] - pinged[bobId.user_id]).toBeGreaterThanOrEqual(700);
+		vi.spyOn(Date, 'now').mockReturnValue(pinged[carolId.user_id] + 500);
 
 		const listed = (await request(alice, 'list', 'room_list', { room_id: 'general', members: true })).result.joined[0].members.map((member: { user_id: string }) => member.user_id);
 		expect(listed).toContain(carolId.user_id);
 		expect(listed).not.toContain(bobId.user_id);
 		expect(await closed).toBe(1001);
-	} finally { alice.close(); bob.close(); carol.close(); await configure((config) => { config.limits.pingTimeoutSeconds = 150; }); }
+	} finally { vi.restoreAllMocks(); alice.close(); bob.close(); carol.close(); await configure((config) => { config.limits.pingTimeoutSeconds = 150; }); }
 });
 
 it('advertises the demo policy hints', async () => {
