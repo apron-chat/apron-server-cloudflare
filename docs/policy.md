@@ -82,10 +82,13 @@ within it:
 - Status (cap `status`, with push): a client sends the notification
   `status` `{"idle": true}` when nobody is attending a connection (an
   unfocused tab, a backgrounded app) and `{"idle": false}` when someone is
-  again; a message from the connection also ends it. `{"mute": 3600}` (or
-  `true`, until changed) stops a signed-in user's pushes; `{"mute": 0}` ends
-  it. The remaining mute shows in the user's own `you`, never to others.
-  Room-scoped status and `invisible` are ignored. Status may be sent before
+  again; only that ends it. A client that never sends `status` counts as
+  idle after ten minutes without a frame. `{"mute": 3600}` (or `true`, until
+  changed) stops a signed-in user's pushes; `{"mute": 0}` ends it. The mute
+  shows in the user's own `you` while set, and each change is echoed to all
+  their connections (an ended mute as `mute: 0`); it is never shown to
+  others. Room-scoped status, `invisible`, and invalid values are ignored,
+  and a `status` with an `id` gets no reply. Status may be sent before
   signing in.
 - Push (`server.push` kind `webpush`, where VAPID keys are set): registered
   users register a browser's push subscription with `push_register`
@@ -101,14 +104,14 @@ within it:
   mentions a user, or replies to their message, wakes them by push (on the
   registrations whose `wake` includes that scope) only when none of their
   connections is
-  attended (every one away, stale, or closed): at most 10 users with
+  attended (every one idle, stale, or closed): at most 10 users with
   registrations a message, once a minute per user and room, 200 woken users a
   day per sender, and 5,000 pushes a day in all. Guests' messages wake no one
   (see
   [SPEC section 4.4](../SPEC.md#44-push)). The push carries
   `{push_id, message}`: the registration's `push_id` when it has one, and
   the message without `log_id`, its text cut to 200 characters, without
-  format or embeds, in at most 3072 bytes.
+  format or embeds, in at most 2048 bytes.
 - Messages: a request without `room_id` is in `general`. A new message with
   empty text and no embeds is not logged and returns `{}`; an empty save is
   `invalid_params` (delete instead). `body.mentions` is stored as sent, and

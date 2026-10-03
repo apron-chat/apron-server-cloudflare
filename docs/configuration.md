@@ -290,6 +290,8 @@ Chromium browsers), `*.push.services.mozilla.com` (Firefox),
 `invalid_params` "push service not allowed here", after the checks that
 refuse IP literals, internal names, credentials and ports, which apply
 whatever the list says. A malformed list fails the configuration check.
+The list is checked again before each push, so narrowing it stops pushes to
+registrations made under the wider one.
 
 Push is off, and `server.push` absent, until a VAPID key pair
 ([RFC 8292](https://www.rfc-editor.org/rfc/rfc8292)) and contact are set:

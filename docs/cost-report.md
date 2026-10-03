@@ -65,13 +65,13 @@ upper bounds can be compared with the measured worst case.
 | Identity count | 4 | 2 | 16 | 8 |
 | Credential IDs lookup | 4 | 2 | 40 | 8 |
 | Credential counter update | 5 | 3 | 16 | 16 |
-| Push subscription register | 9 | 8 | 172 | 370 |
+| Push subscription register | 9 | 7 | 172 | 370 |
 | Push subscription register again, unchanged within a day | 6 | 2 | 172 | 370 |
 | Push wake claim (one user, one subscription; creates both counters) | 19 | 19 | 78 | 80 |
 | Push wake claim, 31 unregistered candidates before one registered | 73 | 9 | 760 | 80 |
 | Mute set (`status` `mute`) | 6 | 4 | 24 | 24 |
 | Mute read (`you`) | 5 | 2 | 16 | 8 |
-| Gone push subscription forget | 4 | 3 | 24 | 24 |
+| Gone push subscription forget (one primary-key row) | 4 | 3 | 20 | 22 |
 | Push reply author lookup | 5 | 2 | 16 | 8 |
 | Push wake claim for a reply (creates the sender's counter) | 15 | 14 | 78 | 80 |
 | Message create with request ID | 33 | 37 | 296 | 120 |
@@ -290,7 +290,7 @@ independent.
 ## Push
 
 With Web Push on (protocol §4.7), `push_register` is one frame plus the
-registration above: about 8 writes the first time (the row and its three
+registration above: about 7 writes the first time (the row and its two
 indexes), and 2 for the reservation alone when a client registers the same
 subscription (keys and `push_id`) on its next connection within a day, which
 writes nothing; `registersPerUserMinute` (10) bounds the rest. These were
@@ -309,10 +309,16 @@ reads its wake time for the room. A message that wakes someone writes each
 woken user's wake time and the server's and sender's counters: 19 writes for
 the day's first wake (both counter rows created), about 9 after. A message
 whose candidates have no live registrations, or are all coalesced, writes
-nothing; one that mentions no one away or gone does no push SQL. The
+nothing; one that mentions no one idle or gone does no push SQL. The
 reservation covers 32 candidates at 5 registrations each (760 reads) and
 `wakesPerMessage` wake rows (80 writes), mostly credited back. A push
-service's 404 or 410 costs one delete per gone registration.
+service's 404 or 410 costs one primary-key delete per gone registration,
+whatever other accounts share the endpoint: deleting by endpoint alone
+would read and write every account's row for it, which an attacker can
+multiply by registering one endpoint from many accounts, and would overrun
+the reservation and latch accounting unsafe. Many accounts sharing one
+endpoint otherwise cost what as many separate registrations do: a wake
+claims at most `wakesPerMessage` users of `subscriptionsPerUser` each.
 
 A `status` `mute` change is one upsert or delete of the user's `mutes` row
 (about 4 writes), echoed in `you` with one indexed read; `auth` and `me`
@@ -434,8 +440,11 @@ A schema 6 object is upgraded to schema 7 the same way: it adds `roles_json`
 to `identities` and sets it for bots, `admin`, and schema 6's listed admins,
 reading and updating the identities once (at most the identity cap), and
 deletes the `_meta` `admins` row. A schema 7 object is upgraded to schema 8
-the same way, which only creates the empty `push_subscriptions` table and
-its index. A schema 5 object takes all three upgrades.
+the same way, which only creates three empty tables, `push_subscriptions`
+(with indexes by user and registration time, and by registration time),
+`push_wakes` (with an index by wake time) and `mutes`: three tables and
+three indexes besides their primary keys. A schema 5 object takes all three
+upgrades.
 
 Any other stored schema version resets the object with
 `deleteAll()` and recreates the schema (`test/schema-reset.integration.test.ts`).

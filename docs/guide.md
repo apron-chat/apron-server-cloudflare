@@ -359,8 +359,8 @@ For direct Wrangler production commands, always pass
    (protocol 7, with push subscriptions); schema 5, 6 and 7 objects are
    upgraded in place on their first wake, keeping everything: schema 5's
    thread intro messages become their `description`, schema 6's admins
-   and bots get their roles, and schema 7 gains the empty push subscriptions
-   table (see [SPEC section 8](../SPEC.md#schema-versions)).
+   and bots get their roles, and schema 7 gains the empty push tables
+   (`push_subscriptions`, `push_wakes`, `mutes`; see [SPEC section 8](../SPEC.md#schema-versions)).
    The upgrade is one-way: redeploying protocol 6 code afterwards resets the
    object like any schema change, so fix forward instead of rolling back. It
    also fails closed: if it cannot finish, nothing changes, and the object

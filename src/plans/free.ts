@@ -104,8 +104,8 @@ export const FREE_PLAN: Plan = Object.freeze({
 		// analytics report them.
 		webSocketMessagesPerRequest: 1,
 	}),
-	// Web Push for mentions, on once VAPID keys are set. A wake costs a
-	// subscription read and a counter write, and each push is an outbound
+	// Web Push for mentions and replies, on once VAPID keys are set. A wake
+	// costs a subscription read and a counter write, and each push is an outbound
 	// request from the Durable Object, which needs no request allowance; the
 	// daily cap bounds what the push services see from the demo.
 	push: Object.freeze({

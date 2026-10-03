@@ -17,6 +17,7 @@ declare global {
 		VAPID_PUBLIC_KEY?: string;
 		VAPID_PRIVATE_KEY?: string;
 		VAPID_SUBJECT?: string;
+		PUSH_HOSTS?: string;
 		ASSETS?: Fetcher;
 		ALLOWED_ORIGINS?: string;
 		RP_ID?: string;
@@ -42,6 +43,7 @@ declare global {
 			VAPID_PUBLIC_KEY?: string;
 			VAPID_PRIVATE_KEY?: string;
 			VAPID_SUBJECT?: string;
+			PUSH_HOSTS?: string;
 			ASSETS?: Fetcher;
 			ALLOWED_ORIGINS?: string;
 			RP_ID?: string;

@@ -224,15 +224,16 @@ export interface UploadPolicy {
 
 /**
  * Web Push (protocol §4.7, push kind `webpush`): a message that mentions a
- * registered user wakes them through their browsers' push services when
- * none of their connections is attended.
+ * registered user, or replies to their message, wakes them through their
+ * browsers' push services when none of their connections is attended and
+ * they have not muted (§4.11 `status`).
  */
 export interface PushPolicy {
 	/** Pushes the whole server sends a UTC day, one per subscription woken. */
 	pushesPerDay: number;
 	/**
 	 * Users one message may wake, counting only those with live
-	 * subscriptions; mentions past them are not pushed.
+	 * subscriptions; users past them are not pushed.
 	 */
 	wakesPerMessage: number;
 	/** Users one sender's messages may wake a UTC day. */
