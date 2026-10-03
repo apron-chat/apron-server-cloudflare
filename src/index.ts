@@ -122,10 +122,9 @@ interface ConnectionAttachment {
 	/**
 	 * The client said nobody is attending this connection (`status` `idle`,
 	 * §4.11), so a mention or reply may wake its user by push (§4.7). Cleared
-	 * by `idle: false` or an accepted message from this connection; kept
-	 * from before authentication.
+	 * only by `idle: false`; kept from before authentication.
 	 */
-	away?: boolean;
+	idle?: boolean;
 	/**
 	 * A `status` `mute` sent before authentication (§4.11), as sent: seconds
 	 * (0 ends a mute) or `true`. Applied, timed from then, once the
@@ -452,7 +451,7 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 				rooms: attachment.rooms.filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 64).slice(0, MAX_ATTACHED_ROOMS),
 			} : {}),
 			...(attachment.listedJoined ? { listedJoined: true } : {}),
-			...(attachment.away === true ? { away: true } : {}),
+			...(attachment.idle === true ? { idle: true } : {}),
 			...(attachment.pendingMute === true || (Number.isSafeInteger(attachment.pendingMute) && (attachment.pendingMute as number) >= 0) ? { pendingMute: attachment.pendingMute } : {}),
 			...(attachment.statusSeen === true ? { statusSeen: true } : {}),
 			authDeadline: typeof attachment.authDeadline === "number" ? attachment.authDeadline : 0,
@@ -514,8 +513,8 @@ function writeSessionAttachment(socket: WebSocketConnection, attachment: Connect
 		attachment.notices = current.notices;
 		attachment.frameLease = current.frameLease;
 		attachment.closing = current.closing;
-		if (current.away) attachment.away = true;
-		else delete attachment.away;
+		if (current.idle) attachment.idle = true;
+		else delete attachment.idle;
 		if (current.pendingMute !== undefined) attachment.pendingMute = current.pendingMute;
 		else delete attachment.pendingMute;
 		if (current.statusSeen) attachment.statusSeen = true;
@@ -2155,8 +2154,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (messageId === undefined && request.params.body === undefined) throw { name: "invalid_params", message: "Missing body" } satisfies ProtocolError;
 		if (request.params.body !== undefined) objectParam(request.params, "body");
 		await this.commitAndBroadcast(socket, attachment, request, "message", "posting");
-		// An accepted message from a connection ends its `idle` (§4.11).
-		this.setAway(socket, false);
 	}
 
 	private async handleReactions(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
@@ -2377,18 +2374,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * `status` (§4.11), a notification, implemented in part: unscoped `idle`
 	 * and `mute`. `idle` marks this connection unattended (true) or attended
-	 * (false), kept in the attachment, so it survives hibernation; an
-	 * accepted message from the connection also ends it, and closing removes
-	 * the connection. `mute` is the user's: seconds to stay quiet (cut to
-	 * MAX_MUTE_SECONDS), `true` until changed, or `0` to end it; stored, so
-	 * it outlasts the connection, and echoed in `you` to the user's
-	 * connections when it changes. Guests get no pushes, so their mute is
-	 * ignored. Both may come before authentication: `idle` applies at once,
-	 * and `mute` once the connection signs in as a registered user. With
-	 * `room_id`, every field is scoped to that room; this server implements
-	 * no room scopes, so such an update changes nothing and is not checked.
-	 * `invisible` and unknown fields are ignored. A malformed `idle` or `mute`
-	 * is `invalid_params`, and nothing in the update applies.
+	 * (false), kept in the attachment, so it survives hibernation; only
+	 * `idle: false` ends it, and closing removes the connection. `mute` is
+	 * the user's: seconds to stay quiet (cut to MAX_MUTE_SECONDS), `true`
+	 * until changed, or `0` to end it; stored, so it outlasts the connection,
+	 * and echoed in `you` to the user's connections when it changes. Guests
+	 * get no pushes, so their mute is ignored. Both may come before
+	 * authentication: `idle` applies at once, and `mute` once the connection
+	 * signs in as a registered user. With `room_id`, `mute` is the room's,
+	 * which this server does not implement, and a scoped `idle` or
+	 * `invisible` is ignored, so such an update changes nothing. `invisible`,
+	 * unknown fields, and invalid values are ignored, each on its own.
 	 */
 	private handleStatus(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): void {
 		const params = request.params;
@@ -2401,14 +2397,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 		}
 		if (params.room_id !== undefined) return;
+		// Each field applies on its own; an invalid one is ignored (§4.11).
 		const idle = params.idle;
-		if (idle !== undefined && typeof idle !== "boolean") throw { name: "invalid_params", message: "idle must be a boolean" } satisfies ProtocolError;
+		if (typeof idle === "boolean") this.setIdle(socket, idle);
 		const mute = params.mute;
-		if (mute !== undefined && mute !== true && !(typeof mute === "number" && Number.isSafeInteger(mute) && mute >= 0)) {
-			throw { name: "invalid_params", message: "mute must be true or a whole number of seconds" } satisfies ProtocolError;
-		}
-		if (typeof idle === "boolean") this.setAway(socket, idle);
-		if (mute === undefined) return;
+		if (mute !== true && !(typeof mute === "number" && Number.isSafeInteger(mute) && mute >= 0)) return;
 		if (attachment.tier === "pending") {
 			const state = connectionAttachment(socket);
 			if (!state) return;
@@ -2486,11 +2479,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/** Marks a connection idle or attended (`status` `idle`, §4.11), writing its attachment only on a change. */
-	private setAway(socket: WebSocketConnection, away: boolean): void {
+	private setIdle(socket: WebSocketConnection, idle: boolean): void {
 		const state = connectionAttachment(socket);
-		if (!state || (state.away === true) === away) return;
-		if (away) state.away = true;
-		else delete state.away;
+		if (!state || (state.idle === true) === idle) return;
+		if (idle) state.idle = true;
+		else delete state.idle;
 		writeAttachment(socket, state);
 	}
 
@@ -2504,7 +2497,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private attended(userId: string, now: number): boolean {
 		return this.connectionsOf(userId).some((peer) => {
 			const state = connectionAttachment(peer);
-			if (!state || state.away || this.isStale(peer, now)) return false;
+			if (!state || state.idle || this.isStale(peer, now)) return false;
 			if (state.statusSeen) return true;
 			const last = state.frameTimes[state.frameTimes.length - 1] ?? 0;
 			return now - last < SILENT_IDLE_MS;

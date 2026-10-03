@@ -48,17 +48,17 @@ async function subscribe(peer: Peer, name: string, pushId?: string, wake?: unkno
 }
 
 /** Sends `status` `idle` as the notification it is, then a request, so it is applied before the caller goes on. */
-async function setAway(peer: Peer, idle: boolean): Promise<void> {
+async function setIdle(peer: Peer, idle: boolean): Promise<void> {
 	peer.send({ method: 'status', params: { idle } });
 	expect((await request(peer, `sync-${crypto.randomUUID()}`, 'me', {})).result.you).toBeTruthy();
 }
 
-/** Each live connection's `away`, for one user. */
-function awayOf(userId: string): Promise<boolean[]> {
+/** Each live connection's `idle`, for one user. */
+function idleOf(userId: string): Promise<boolean[]> {
 	return runInDurableObject(stub(), (_instance, state) => state.getWebSockets()
-		.map((socket) => socket.deserializeAttachment() as { userId?: string; away?: boolean; closing?: boolean })
+		.map((socket) => socket.deserializeAttachment() as { userId?: string; idle?: boolean; closing?: boolean })
 		.filter((attachment) => attachment.userId === userId && !attachment.closing)
-		.map((attachment) => attachment.away === true));
+		.map((attachment) => attachment.idle === true));
 }
 
 function subscriptionsOf(userId: string): Promise<PushSubscriptionRecord[]> {
@@ -170,41 +170,37 @@ describe('push over the socket', () => {
 		} finally { peer.close(); }
 	}, 20_000);
 
-	it('tracks status idle per connection: it ends with idle false or an accepted message', async () => {
+	it('tracks status idle per connection: only idle false ends it', async () => {
 		const userId = unique('aldo');
 		const peer = await signedIn(userId);
 		const other = await signedIn(userId, true);
 		try {
-			expect(await awayOf(userId)).toEqual([false, false]);
-			await setAway(peer, true);
-			expect((await awayOf(userId)).sort()).toEqual([false, true]);
-			// A notification only: a request gets the unsupported-method path and changes nothing.
+			expect(await idleOf(userId)).toEqual([false, false]);
+			await setIdle(peer, true);
+			expect((await idleOf(userId)).sort()).toEqual([false, true]);
 			// Sent with an `id`, it is still a notification: processed, never answered.
 			peer.send({ id: 'idle-request', method: 'status', params: { idle: false } });
 			const answered = await exchange(peer, 'sync-request', 'me', {});
 			expect(answered.skipped.filter((frame) => frame.id === 'idle-request')).toEqual([]);
-			expect(await awayOf(userId)).toEqual([false, false]);
-			await setAway(peer, true);
+			expect(await idleOf(userId)).toEqual([false, false]);
+			await setIdle(peer, true);
 			// A room's idle is not implemented: a scoped update is ignored.
 			peer.send({ method: 'status', params: { room_id: 'general', idle: false } });
 			await request(peer, 'sync-scoped', 'me', {});
-			expect((await awayOf(userId)).sort()).toEqual([false, true]);
-			// A history page does not end it, nor a refused message; an accepted one does.
+			expect((await idleOf(userId)).sort()).toEqual([false, true]);
+			// Neither a history page nor a message ends it (§4.11): only idle false.
 			await request(peer, 'history', 'history', { room_id: 'general' });
-			expect((await request(peer, 'refused', 'message', { room_id: 'no-such-room', body: { text: 'x' } })).error.code).toBe(-32602);
-			expect((await awayOf(userId)).sort()).toEqual([false, true]);
-			await post(peer, 'back', { body: { text: 'back' } });
-			expect(await awayOf(userId)).toEqual([false, false]);
-			await setAway(peer, true);
-			await setAway(peer, false);
-			expect(await awayOf(userId)).toEqual([false, false]);
+			await post(peer, 'still-idle', { body: { text: 'posted while idle' } });
+			expect((await idleOf(userId)).sort()).toEqual([false, true]);
+			await setIdle(peer, false);
+			expect(await idleOf(userId)).toEqual([false, false]);
 			// A malformed idle changes nothing; nor do unknown fields or `invisible`.
-			// (Another connection: each malformed one counts as a policy violation.)
-			await setAway(other, true);
-			for (const params of [{ idle: 'no' }, { idle: 1 }, { invisible: true, other: 1 }]) {
+			// None is a policy violation, so the connection stays open.
+			await setIdle(other, true);
+			for (const params of [{ idle: 'no' }, { idle: 1 }, { invisible: true, other: 1 }, { idle: null }, { idle: 'false' }]) {
 				other.send({ method: 'status', params });
 				await request(other, `sync-${JSON.stringify(params)}`, 'me', {});
-				expect((await awayOf(userId)).sort(), JSON.stringify(params)).toEqual([false, true]);
+				expect((await idleOf(userId)).sort(), JSON.stringify(params)).toEqual([false, true]);
 			}
 		} finally { peer.close(); other.close(); }
 	});
@@ -221,12 +217,12 @@ describe('push over the socket', () => {
 			const carolSub = await subscribe(carol, 'carol');
 			// Activity's `away` is not status: Bob stays attended.
 			expect((await request(bob, 'activity-away', 'activity', { away: true })).result).toEqual({});
-			expect(await awayOf(bobId)).toEqual([false]);
+			expect(await idleOf(bobId)).toEqual([false]);
 			// Nor do typing or a read cursor end idle.
-			await setAway(carol, true);
+			await setIdle(carol, true);
 			expect((await request(carol, 'typing', 'activity', { room_id: 'general', typing: 2 })).result).toEqual({});
 			carol.send({ method: 'activity', params: { room_id: 'general', read_message_id: '1' } });
-			expect(await awayOf(carolId)).toEqual([true]);
+			expect(await idleOf(carolId)).toEqual([true]);
 			await post(alice, 'mention', { body: { text: 'hi', mentions: [bobId, carolId] } });
 			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
 			expect(pushes[0].url).toBe(carolSub.url);
@@ -239,8 +235,8 @@ describe('push over the socket', () => {
 				return push;
 			});
 			try {
-				await setAway(bob, true);
-				expect(await awayOf(bobId)).toEqual([false]);
+				await setIdle(bob, true);
+				expect(await idleOf(bobId)).toEqual([false]);
 			} finally {
 				await runInDurableObject(stub(), (instance) => {
 					const runtime = instance as unknown as Runtime;
@@ -253,7 +249,7 @@ describe('push over the socket', () => {
 		}
 	});
 
-	it('wakes mentioned users whose every connection is away or gone, with the message in the push', async () => {
+	it('wakes mentioned users whose every connection is idle or gone, with the message in the push', async () => {
 		const pushes = capturePushes();
 		const [aliceId, bobId, carolId, daveId] = [unique('alice'), unique('bob'), unique('carol'), unique('dave')];
 		const alice = await signedIn(aliceId);
@@ -266,10 +262,10 @@ describe('push over the socket', () => {
 			const daveSub = await subscribe(dave, 'dave');
 			// Alice's own subscription is never woken by her own mention.
 			await subscribe(alice, 'alice');
-			// Carol is away; Bob is attended; Dave has gone.
-			await setAway(carol, true);
+			// Carol is idle; Bob is attended; Dave has gone.
+			await setIdle(carol, true);
 			dave.close();
-			await vi.waitFor(async () => expect(await awayOf(daveId)).toEqual([]));
+			await vi.waitFor(async () => expect(await idleOf(daveId)).toEqual([]));
 
 			const long = 'é'.repeat(250);
 			const first = await post(alice, 'first', { room_id: 'general', body: { text: long, format: 'markdown', mentions: [bobId, carolId, aliceId, daveId, 'guest_1'], embeds: [{ kind: 'link', url: 'https://example.com' }] } });
@@ -296,14 +292,14 @@ describe('push over the socket', () => {
 			expect(Object.keys(davePayload)).toEqual(['message']);
 			expect(davePayload.message.message_id).toBe(first.result.message_id);
 
-			// Edits, retries, and commands wake no one; a message from Carol ends her away.
+			// Edits, retries, and commands wake no one. Carol is attended again.
 			pushes.length = 0;
 			await post(alice, 'edit', { message_id: first.result.message_id, body: { text: 'edited', mentions: [carolId] } });
 			await post(alice, 'first', { room_id: 'general', body: { text: long, format: 'markdown', mentions: [bobId, carolId, aliceId, daveId, 'guest_1'], embeds: [{ kind: 'link', url: 'https://example.com' }] } });
 			await request(alice, 'command', 'command', { body: { text: '/help', mentions: [carolId] } });
-			await post(carol, 'carol-back', { body: { text: 'here' } });
-			// Bob goes away: the next mention wakes him, not Carol.
-			await setAway(bob, true);
+			await setIdle(carol, false);
+			// Bob goes idle: the next mention wakes him, not Carol.
+			await setIdle(bob, true);
 			await post(alice, 'second', { body: { text: 'ping', mentions: [carolId, bobId] } });
 			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
 			expect(pushes[0].url).toBe(bobSub.url);
@@ -318,7 +314,7 @@ describe('push over the socket', () => {
 		const bob = await signedIn(bobId);
 		try {
 			const bobSub = await subscribe(bob, 'bob', 'p'.repeat(64));
-			await setAway(bob, true);
+			await setIdle(bob, true);
 			// Far more mentions than fit one payload (§4.7).
 			const many = Array.from({ length: 60 }, (_, index) => `someone-${index}-${'x'.repeat(48)}`);
 			await post(alice, 'crowd', { room_id: 'general', body: { text: '"quoted"\\'.repeat(40), mentions: [bobId, ...many] } });
@@ -347,7 +343,7 @@ describe('push over the socket', () => {
 			expect(await subscriptionsOf(erinId)).toHaveLength(2);
 			expect(gone.url).toContain('/gone-');
 		} finally { erin.close(); }
-		await vi.waitFor(async () => expect(await awayOf(erinId)).toEqual([]));
+		await vi.waitFor(async () => expect(await idleOf(erinId)).toEqual([]));
 		try {
 			await post(alice, 'mention', { body: { text: 'hi', mentions: [erinId] } });
 			await vi.waitFor(() => expect(pushes).toHaveLength(2), { timeout: 5_000 });
@@ -391,12 +387,12 @@ describe('wake scopes', () => {
 	}
 
 	/** A registered user with one registration and no connection; their subscription url. */
-	async function away(name: string, wake?: unknown): Promise<string> {
+	async function gone(name: string, wake?: unknown): Promise<string> {
 		const userId = unique(name);
 		const peer = await signedIn(userId);
 		const { url } = await subscribe(peer, userId, undefined, wake);
 		peer.close();
-		await vi.waitFor(async () => expect(await awayOf(userId)).toEqual([]));
+		await vi.waitFor(async () => expect(await idleOf(userId)).toEqual([]));
 		return url;
 	}
 	const userOf = (url: string) => url.slice('https://push.example.net/send/'.length).replace(/-[0-9a-f-]{36}$/, '');
@@ -404,14 +400,14 @@ describe('wake scopes', () => {
 	it('wakes each user only on registrations whose wake includes why they qualify', async () => {
 		const pushes = capturePushes();
 		const urls = {
-			mentionsOnlyMentioned: await away('mm', ['mentions']),
-			mentionsOnlyRepliedTo: await away('mr', ['mentions']),
-			repliesOnlyRepliedTo: await away('rr', ['replies']),
-			repliesOnlyMentioned: await away('rm', ['replies']),
-			nothing: await away('none', []),
-			both: await away('both'),
+			mentionsOnlyMentioned: await gone('mm', ['mentions']),
+			mentionsOnlyRepliedTo: await gone('mr', ['mentions']),
+			repliesOnlyRepliedTo: await gone('rr', ['replies']),
+			repliesOnlyMentioned: await gone('rm', ['replies']),
+			nothing: await gone('none', []),
+			both: await gone('both'),
 			attended: '',
-			control: await away('ctrl'),
+			control: await gone('ctrl'),
 		};
 		const attendedId = unique('here');
 		const here = await signedIn(attendedId);
@@ -461,8 +457,8 @@ describe('status mute', () => {
 		const bobToo = await signedIn(bobId, true);
 		try {
 			const bobSub = await subscribe(bob, 'bob');
-			await setAway(bob, true);
-			await setAway(bobToo, true);
+			await setIdle(bob, true);
+			await setIdle(bobToo, true);
 			bob.send({ method: 'status', params: { mute: 3600 } });
 			// Every connection of Bob's hears it, the one that set it included; never anyone else.
 			const echoed = youOf(await drainTo(bobToo, 'sync-too'));
@@ -489,7 +485,7 @@ describe('status mute', () => {
 			expect(ended[0].mute).toBe(0);
 			// Not muted, `me` leaves it out.
 			expect((await request(bobToo, 'me-unmuted', 'me', {})).result.you).not.toHaveProperty('mute');
-			await setAway(bob, true);
+			await setIdle(bob, true);
 			await post(alice, 'unmuted', { body: { text: 'welcome back', mentions: [bobId] } });
 			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
 			expect(pushes[0].url).toBe(bobSub.url);
@@ -510,21 +506,27 @@ describe('status mute', () => {
 			peer.send({ method: 'status', params: { idle: true, mute: true } });
 			const you = (await request(peer, 'auth', 'auth', { scheme: 'token', token })).result.you;
 			expect(you).toMatchObject({ user_id: userId, mute: true });
-			expect((await awayOf(userId)).sort()).toEqual([false, true]);
+			expect((await idleOf(userId)).sort()).toEqual([false, true]);
 			// The user's other connection hears of the mute.
 			expect(youOf(await drainTo(first, 'sync-first'))[0]).toMatchObject({ user_id: userId, mute: true });
 		} finally { first.close(); peer.close(); }
 	});
 
-	it('refuses malformed mutes and ignores guests\' mutes', async () => {
+	it('ignores invalid status fields one by one, without counting them, and guests\' mutes', async () => {
 		const userId = unique('mal');
-		for (const pair of [[-1, 1.5], ['3600', false]]) {
-			const peer = await signedIn(userId, pair[0] !== -1);
-			try {
-				for (const mute of pair) peer.send({ method: 'status', params: { mute } });
-				expect((await request(peer, 'me', 'me', {})).result.you).not.toHaveProperty('mute');
-			} finally { peer.close(); }
-		}
+		const peer = await signedIn(userId);
+		try {
+			// Each invalid mute is ignored on its own; none is a policy violation.
+			for (const mute of [-1, 1.5, '3600', false, null, {}]) peer.send({ method: 'status', params: { mute } });
+			expect((await request(peer, 'me', 'me', {})).result.you).not.toHaveProperty('mute');
+			// A valid field in the same update still applies.
+			peer.send({ method: 'status', params: { idle: true, mute: false } });
+			peer.send({ method: 'status', params: { idle: 'yes', mute: 60 } });
+			const you = (await request(peer, 'me-after', 'me', {})).result.you;
+			expect(you.mute).toBeGreaterThan(55);
+			expect(await idleOf(userId)).toEqual([true]);
+			expect(peer.closed()).toBeUndefined();
+		} finally { peer.close(); }
 		const guest = await connect();
 		try {
 			await guest.next();
@@ -578,7 +580,7 @@ describe('push review fixes', () => {
 		});
 		try {
 			const bobSub = await subscribe(bob, 'bob');
-			await setAway(bob, true);
+			await setIdle(bob, true);
 			await setHosts(['push.elsewhere.example']);
 			await post(alice, 'narrowed', { room_id: 'general', body: { text: 'not sent', mentions: [bobId] } });
 			await setHosts(['push.example.net']);
@@ -600,6 +602,8 @@ describe('push review fixes', () => {
 			expect(attachments.filter((attachment) => attachment.pendingMute !== undefined && attachment.tier !== 'pending')).toEqual([]);
 			// Scoped fields this server does not implement: ignored, not violations.
 			for (let index = 0; index < 4; index++) guest.send({ method: 'status', params: { room_id: 'general', mute: 'x', idle: 7, invisible: true } });
+			// A room the user cannot see is ignored entirely too, not taken as unscoped.
+			guest.send({ method: 'status', params: { room_id: 'no-such-room', mute: true } });
 			expect((await request(guest, 'still-open', 'me', {})).result.you).toBeTruthy();
 			expect(guest.closed()).toBeUndefined();
 		} finally { guest.close(); }
@@ -644,7 +648,7 @@ describe('push limits over the socket', () => {
 			const peer = await signedIn(userId);
 			await subscribe(peer, userId);
 			peer.close();
-			await vi.waitFor(async () => expect(await awayOf(userId)).toEqual([]));
+			await vi.waitFor(async () => expect(await idleOf(userId)).toEqual([]));
 		}
 		const guest = await connect();
 		const alice = await signedIn(aliceId);
