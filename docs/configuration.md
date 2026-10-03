@@ -264,17 +264,20 @@ with the client's optional registration `push_id` in each push; see
 | --- | ---: | ---: |
 | `pushesPerDay` (server-wide, one per registration woken) | 5,000 | 1,000 |
 | `wakesPerMessage` (users with live registrations one message may wake) | 10 | 10 |
-| `wakesPerSenderDay` (users one sender's messages may wake) | 200 | 50 |
+| `pushesPerSenderDay` (pushes one sender's messages may get delivered, 2xx only) | 200 | 50 |
+| `pushesPerRecipientDay` (pushes one user may receive) | 100 | 100 |
 | `coalesceSeconds` (a user is woken for a room at most once in this window) | 60 | 60 |
 | `subscriptionsPerUser` | 5 | 5 |
 | `pushExpiryDays` (a registration not renewed this long is skipped, then deleted) | 7 | 7 |
-| `registersPerUserMinute` (`push_register` requests per user) | 10 | 10 |
+| `registersPerUserMinute` (`push_register` requests per user, across reconnects) | 10 | 10 |
+| `mutesPerUserMinute` (`status` `mute` changes per user; extras are dropped) | 6 | 6 |
 | `ttlSeconds` (how long a push service keeps an undelivered push) | 1 day | 1 day |
 
 `wakesPerMessage` times `subscriptionsPerUser`, the pushes one message may
 send, is at most 64; `wakesPerMessage` is at most 32, the mentioned users one
-message looks up; `wakesPerSenderDay` fits `pushesPerDay`;
-`registersPerUserMinute` is at most 60, the per-type throttle bound;
+message looks up; `pushesPerSenderDay` and `pushesPerRecipientDay` fit
+`pushesPerDay`; `registersPerUserMinute` and `mutesPerUserMinute` are at
+most 60, the per-type throttle bound;
 `coalesceSeconds` is at most a day; `pushExpiryDays` is 2 to 90; and
 `ttlSeconds` is at most four weeks. The configuration check fails otherwise.
 

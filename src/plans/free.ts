@@ -111,8 +111,13 @@ export const FREE_PLAN: Plan = Object.freeze({
 	push: Object.freeze({
 		pushesPerDay: 1_000,
 		wakesPerMessage: 10,
-		// One sender's mentions cannot spend more than a twentieth of the day.
-		wakesPerSenderDay: 50,
+		// One sender's delivered pushes cannot spend more than a twentieth of
+		// the day, and one recipient gets at most a tenth of it, so a few
+		// sybils cannot use up everyone's pushes or flood one person.
+		pushesPerSenderDay: 50,
+		pushesPerRecipientDay: 100,
+		// Each mute change costs a few written rows.
+		mutesPerUserMinute: 6,
 		// A busy conversation wakes an away user once a minute per room.
 		coalesceSeconds: 60,
 		subscriptionsPerUser: 5,

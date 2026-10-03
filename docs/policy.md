@@ -105,8 +105,9 @@ within it:
   registrations whose `wake` includes that scope) only when none of their
   connections is
   attended (every one idle, stale, or closed): at most 10 users with
-  registrations a message, once a minute per user and room, 200 woken users a
-  day per sender, and 5,000 pushes a day in all. Guests' messages wake no one
+  registrations a message, once a minute per user and room, 100 pushes a day
+  per recipient, 200 delivered pushes a day per sender, and 5,000 pushes a
+  day in all. Guests' messages wake no one
   (see
   [SPEC section 4.4](../SPEC.md#44-push)). The push carries
   `{push_id, message}`: the registration's `push_id` when it has one, and

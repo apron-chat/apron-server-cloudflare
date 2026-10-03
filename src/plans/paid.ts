@@ -141,7 +141,7 @@ export const PAID_PLAN: Plan = Object.freeze({
 	push: Object.freeze({
 		...FREE_PLAN.push!,
 		pushesPerDay: 5_000,
-		wakesPerSenderDay: 200,
+		pushesPerSenderDay: 200,
 	}),
 	features: Object.freeze({
 		// Typing costs about 5 frames a typing minute, inside the frame budget.

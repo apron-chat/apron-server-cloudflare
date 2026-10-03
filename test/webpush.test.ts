@@ -160,8 +160,10 @@ describe('push configuration', () => {
 		expect(() => validatePushPolicy({ ...PUSH_POLICY!, wakesPerMessage: 20, subscriptionsPerUser: 5 })).toThrow(ConfigError);
 		expect(() => validatePushPolicy({ ...PUSH_POLICY!, pushesPerDay: 0 })).toThrow(ConfigError);
 		expect(() => validatePushPolicy({ ...PUSH_POLICY!, ttlSeconds: 29 * 86_400 })).toThrow(ConfigError);
-		expect(() => validatePushPolicy({ ...PUSH_POLICY!, wakesPerSenderDay: PUSH_POLICY!.pushesPerDay + 1 })).toThrow(ConfigError);
+		expect(() => validatePushPolicy({ ...PUSH_POLICY!, pushesPerSenderDay: PUSH_POLICY!.pushesPerDay + 1 })).toThrow(ConfigError);
 		expect(() => validatePushPolicy({ ...PUSH_POLICY!, registersPerUserMinute: 61 })).toThrow(ConfigError);
+		expect(() => validatePushPolicy({ ...PUSH_POLICY!, pushesPerRecipientDay: PUSH_POLICY!.pushesPerDay + 1 })).toThrow(ConfigError);
+		expect(() => validatePushPolicy({ ...PUSH_POLICY!, mutesPerUserMinute: 61 })).toThrow(ConfigError);
 		expect(() => validatePushPolicy({ ...PUSH_POLICY!, coalesceSeconds: 86_401 })).toThrow(ConfigError);
 		expect(() => validatePushPolicy({ ...PUSH_POLICY!, pushExpiryDays: 1 })).toThrow(ConfigError);
 	});

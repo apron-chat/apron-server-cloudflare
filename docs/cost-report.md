@@ -67,13 +67,15 @@ upper bounds can be compared with the measured worst case.
 | Credential counter update | 5 | 3 | 16 | 16 |
 | Push subscription register | 9 | 7 | 172 | 370 |
 | Push subscription register again, unchanged within a day | 6 | 2 | 172 | 370 |
-| Push wake claim (one user, one subscription; creates both counters) | 19 | 19 | 78 | 80 |
-| Push wake claim, 31 unregistered candidates before one registered | 73 | 9 | 760 | 80 |
+| Push wake claim (one user, one subscription; creates the server and recipient counters) | 21 | 19 | 82 | 160 |
+| Push wake claim, 31 unregistered candidates before one registered | 75 | 9 | 888 | 160 |
+| Push sender charge (delivered pushes; creates the sender counter) | 10 | 9 | 24 | 24 |
+| Push registrations clear (`/passkeys remove`, a new bot token) | 3 | 3 | 144 | 400 |
 | Mute set (`status` `mute`) | 6 | 4 | 24 | 24 |
 | Mute read (`you`) | 5 | 2 | 16 | 8 |
 | Gone push subscription forget (one primary-key row) | 4 | 3 | 20 | 22 |
 | Push reply author lookup | 5 | 2 | 16 | 8 |
-| Push wake claim for a reply (creates the sender's counter) | 15 | 14 | 78 | 80 |
+| Push wake claim for a reply (creates the recipient counter) | 13 | 9 | 82 | 160 |
 | Message create with request ID | 33 | 37 | 296 | 120 |
 | Empty new message (not logged) | 4 | 2 | 16 | 8 |
 | Deduplicated mutation retry | 5 | 2 | 32 | 16 |
@@ -305,14 +307,17 @@ a reply (5/2 with its reservation). Registrations carry their wake scopes
 in the same row, so filtering by scope costs no extra rows. The wake claim then looks up the candidates in turn, at most 32: each costs
 one read of its mute, and an unregistered one about one more of its live
 index range, and a registered one also
-reads its wake time for the room. A message that wakes someone writes each
-woken user's wake time and the server's and sender's counters: 19 writes for
-the day's first wake (both counter rows created), about 9 after. A message
-whose candidates have no live registrations, or are all coalesced, writes
-nothing; one that mentions no one idle or gone does no push SQL. The
-reservation covers 32 candidates at 5 registrations each (760 reads) and
-`wakesPerMessage` wake rows (80 writes), mostly credited back. A push
-service's 404 or 410 costs one primary-key delete per gone registration,
+reads its wake time for the room and its recipient counter, and the
+sender's counter once. A message that wakes someone writes each woken user's
+wake time and recipient counter, and the server's counter: 19 writes for the
+day's first wake (counter rows created), about 9 after. The sender's counter
+is written after delivery, once per message with delivered pushes (9 writes
+the first time a day, fewer after). A message whose candidates have no live
+registrations, or are all coalesced, writes nothing; one that mentions no
+one idle or gone does no push SQL. The reservation covers 32 candidates at
+5 registrations each (888 reads) and `wakesPerMessage` wake rows and
+recipient counters (160 writes), mostly credited back. A push service's
+404, 410 or 403 costs one primary-key delete per gone registration,
 whatever other accounts share the endpoint: deleting by endpoint alone
 would read and write every account's row for it, which an attacker can
 multiply by registering one endpoint from many accounts, and would overrun
@@ -321,8 +326,11 @@ endpoint otherwise cost what as many separate registrations do: a wake
 claims at most `wakesPerMessage` users of `subscriptionsPerUser` each.
 
 A `status` `mute` change is one upsert or delete of the user's `mutes` row
-(about 4 writes), echoed in `you` with one indexed read; `auth` and `me`
-results for a registered user on a push server read it once each. An
+(about 4 writes, 6/4 with the reservation), echoed in `you` from the same
+operation; `auth` and `me` results for a registered user on a push server
+read it once each. `mutesPerUserMinute` (6) bounds the changes, counted per
+user across reconnects, so flipping a mute cannot drain the write budget:
+at most about 35 written rows a user a minute. An
 expired mute is read as none and never written back.
 
 Cleanup deletes expired registrations (`pushExpiryDays`, 7) and wake times

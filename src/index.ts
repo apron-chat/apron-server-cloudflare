@@ -141,8 +141,41 @@ interface ConnectionAttachment {
 }
 
 /** Message types with their own per-user rate (budget.ts). */
-type ThrottledType = "activity" | "room_list" | "push_register";
-const THROTTLED_TYPES: readonly ThrottledType[] = ["activity", "room_list", "push_register"];
+type ThrottledType = "activity" | "room_list";
+const THROTTLED_TYPES: readonly ThrottledType[] = ["activity", "room_list"];
+
+/**
+ * A per-user event count in a rolling minute, kept on the object rather
+ * than in connection attachments, so closing and reopening connections does
+ * not reset it. It is lost when the object hibernates, which takes a quiet
+ * object; a burst that keeps it awake stays counted. At most
+ * USER_RATE_LIMIT_USERS users are tracked; the least recently counted go
+ * first.
+ */
+class UserRateLimit {
+	private readonly events = new Map<string, number[]>();
+
+	constructor(private readonly limit: number) {}
+
+	/** Seconds until `userId` may act again, or undefined when they may now. */
+	retry(userId: string, now: number): number | undefined {
+		const recent = (this.events.get(userId) ?? []).filter((at) => at > now - THROTTLE_WINDOW_MS);
+		if (recent.length < this.limit) return undefined;
+		return Math.max(1, Math.ceil((recent[recent.length - this.limit] + THROTTLE_WINDOW_MS - now) / 1_000));
+	}
+
+	/** Counts one event for `userId` if the limit allows it; whether it did. */
+	take(userId: string, now: number): boolean {
+		const recent = (this.events.get(userId) ?? []).filter((at) => at > now - THROTTLE_WINDOW_MS);
+		if (recent.length >= this.limit) return false;
+		this.events.delete(userId);
+		this.events.set(userId, [...recent, now]);
+		if (this.events.size > USER_RATE_LIMIT_USERS) this.events.delete(this.events.keys().next().value!);
+		return true;
+	}
+}
+
+const USER_RATE_LIMIT_USERS = 10_000;
 const THROTTLE_WINDOW_MS = 60_000;
 /**
  * The system identity for notices to one connection only, never logged
@@ -684,7 +717,9 @@ function pushEndpointError(value: string, hosts: RuntimeConfig["pushHosts"]): st
 	}
 	if (url.protocol !== "https:") return "url must be an https URL";
 	if (url.username || url.password || url.port) return "url must not carry credentials or a port";
-	const host = url.hostname.toLowerCase().replace(/\.$/, "");
+	// A trailing dot would store one endpoint under a second spelling.
+	if (url.hostname.endsWith(".")) return "url must not end its host with a dot";
+	const host = url.hostname.toLowerCase();
 	// The URL parser has already turned every IPv4 spelling (hex, octal, a
 	// bare number) into dotted decimal, and IPv6 into brackets.
 	if (host.startsWith("[") || /^[0-9.]+$/.test(host) || !host.includes(".") ||
@@ -940,6 +975,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private guestNext = 0;
 	private guestLimit = 0;
+	/** `push_register` requests per user (`registersPerUserMinute`), counted across reconnects. */
+	private readonly pushRegisters = new UserRateLimit(PUSH_POLICY?.registersPerUserMinute ?? 1);
+	/** `status` `mute` changes per user (`mutesPerUserMinute`), counted across reconnects. */
+	private readonly muteChanges = new UserRateLimit(PUSH_POLICY?.mutesPerUserMinute ?? 1);
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -2389,18 +2428,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private handleStatus(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): void {
 		const params = request.params;
-		// Whatever it says, the client reports idle itself (see attended).
-		if (!attachment.statusSeen) {
+		if (params.room_id !== undefined) return;
+		// Each field applies on its own; an invalid one is ignored (§4.11).
+		const idle = params.idle;
+		if (typeof idle === "boolean") {
+			// A client that sends `idle` reports it itself (see attended); one that
+			// only mutes may not, so it stays under the silent-connection rule.
 			const state = connectionAttachment(socket);
 			if (state && !state.statusSeen) {
 				state.statusSeen = true;
 				writeAttachment(socket, state);
 			}
+			this.setIdle(socket, idle);
 		}
-		if (params.room_id !== undefined) return;
-		// Each field applies on its own; an invalid one is ignored (§4.11).
-		const idle = params.idle;
-		if (typeof idle === "boolean") this.setIdle(socket, idle);
 		const mute = params.mute;
 		if (mute !== true && !(typeof mute === "number" && Number.isSafeInteger(mute) && mute >= 0)) return;
 		if (attachment.tier === "pending") {
@@ -2410,7 +2450,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 			writeAttachment(socket, state);
 			return;
 		}
-		if (attachment.tier === "registered") this.changeMute(attachment.userId!, mute as number | true, nowMs());
+		if (attachment.tier !== "registered") return;
+		// Each change writes rows: past `mutesPerUserMinute` a user's changes
+		// are dropped, quietly, as invalid fields are.
+		const now = nowMs();
+		if (!this.muteChanges.take(attachment.userId!, now)) return;
+		this.changeMute(attachment.userId!, mute as number | true, now);
 	}
 
 	/**
@@ -2422,9 +2467,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private changeMute(userId: string, mute: number | true, now: number, except?: WebSocketConnection): void {
 		const untilMs = mute === true ? MUTE_FOREVER : mute === 0 ? null : now + Math.min(mute, MAX_MUTE_SECONDS) * 1_000;
-		if (!this.store.setMute({ userId, untilMs, now })) return;
+		const result = this.store.setMute({ userId, untilMs, now });
+		if (!result.changed) return;
 		// A change that ended the mute is echoed as `mute: 0` (§4.11).
-		const field = this.muteField(userId, now, true);
+		const field = { mute: result.mute ?? 0 };
 		for (const peer of this.connectionsOf(userId, except)) {
 			const state = connectionAttachment(peer);
 			const user = state ? this.current(state) : null;
@@ -2454,15 +2500,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * A registered user's `mute` as `you` carries it on a push server
-	 * (§4.11): the seconds left or `true`. Not muted, it is left out, except
-	 * as `0` with `ended`, for the echo of a change that ended it. Empty
+	 * (§4.11): the seconds left or `true`, left out when not muted. Empty
 	 * without push, or when it cannot be read: a reply never fails on it.
 	 */
-	private muteField(userId: string, now = nowMs(), ended = false): { mute?: number | true } {
+	private muteField(userId: string, now = nowMs()): { mute?: number | true } {
 		if (!this.config.push) return {};
 		try {
 			const mute = this.store.muteOf(userId, now);
-			return mute !== undefined ? { mute } : ended ? { mute: 0 } : {};
+			return mute !== undefined ? { mute } : {};
 		} catch {
 			return {};
 		}
@@ -2526,20 +2571,22 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
 		if (attachment.tier !== "registered") throw { name: "denied", message: "Sign in to receive push notifications" } satisfies ProtocolError;
 		const now = nowMs();
-		const limit = PUSH_POLICY!.registersPerUserMinute;
-		const retry = this.throttleRetry(attachment.userId!, "push_register", limit, now);
-		if (retry !== undefined) throw { name: "retry_after", message: "Push registrations limited", data: { retry_after: retry } } satisfies ProtocolError;
 		// Counted before validation, so refused registrations count too.
-		this.takeThrottle(socket, attachment.userId!, "push_register", Number.MAX_SAFE_INTEGER, now);
+		if (!this.pushRegisters.take(attachment.userId!, now)) {
+			throw { name: "retry_after", message: "Push registrations limited", data: { retry_after: this.pushRegisters.retry(attachment.userId!, now) ?? 1 } } satisfies ProtocolError;
+		}
 		const params = request.params;
 		const kind = requiredString(params, "kind");
 		if (kind !== "webpush") throw { name: "invalid_params", message: "Unknown push kind; this server offers webpush" } satisfies ProtocolError;
-		const url = requiredString(params, "url");
+		const sent = requiredString(params, "url");
 		const wake = wakeParam(params.wake);
 		const pushId = optionalString(params, "push_id");
 		if (pushId !== undefined && !PUSH_ID_PATTERN.test(pushId)) throw { name: "invalid_params", message: "push_id must be 1 to 64 letters, digits, _ or -" } satisfies ProtocolError;
-		const problem = pushEndpointError(url, this.config.pushHosts);
+		const problem = pushEndpointError(sent, this.config.pushHosts);
 		if (problem) throw { name: "invalid_params", message: problem } satisfies ProtocolError;
+		// Stored as the URL parser spells it, so one endpoint has one key.
+		const url = new URL(sent).href;
+		if (utf8Bytes(url) > MAX_PUSH_URL_BYTES) throw { name: "invalid_params", message: `url is at most ${MAX_PUSH_URL_BYTES} bytes` } satisfies ProtocolError;
 		const keys = objectParam(params, "keys")!;
 		const key = (name: string): Uint8Array | null => typeof keys[name] === "string" && keys[name].length <= 256 ? base64UrlDecode(keys[name]) : null;
 		const p256dh = key("p256dh");
@@ -2559,8 +2606,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private handlePushUnregister(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): void {
 		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
 		if (attachment.tier !== "registered") throw { name: "denied", message: "Sign in to receive push notifications" } satisfies ProtocolError;
-		const url = requiredString(request.params, "url");
-		if (utf8Bytes(url) > MAX_PUSH_URL_BYTES) throw { name: "invalid_params", message: `url is at most ${MAX_PUSH_URL_BYTES} bytes` } satisfies ProtocolError;
+		const sent = requiredString(request.params, "url");
+		if (utf8Bytes(sent) > MAX_PUSH_URL_BYTES) throw { name: "invalid_params", message: `url is at most ${MAX_PUSH_URL_BYTES} bytes` } satisfies ProtocolError;
+		// As registration stores it; an unparsable url was never registered.
+		let url = sent;
+		try { url = new URL(sent).href; } catch { /* removes nothing */ }
 		this.store.removePushSubscription({ userId: attachment.userId!, url, now: nowMs() });
 		this.reply(socket, request, {});
 	}
@@ -2608,47 +2658,56 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const candidates: PushCandidate[] = [...reasons].map(([userId, reason]) => ({ userId, reasons: reason }));
 		let claimed: ReturnType<Store["claimPushes"]>;
 		try {
-			claimed = this.store.claimPushes({ senderId: sender, roomId: message.room_id, candidates, now });
+			// PUSH_HOSTS as configured now: a registration made under a wider list
+			// is passed over before it takes a wake or a push.
+			const hosts = this.config.pushHosts;
+			claimed = this.store.claimPushes({ senderId: sender, roomId: message.room_id, candidates, allowed: (url) => pushEndpointError(url, hosts) === null, now });
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "push_claim_failed", reason: errorToProtocol(error).message }));
 			return;
 		}
 		if (claimed.skipped) console.warn(JSON.stringify({ event: "push_allowance_reached", skipped: claimed.skipped }));
-		if (claimed.subscriptions.length) this.ctx.waitUntil(this.deliverPushes(claimed.subscriptions, message, vapid, policy.ttlSeconds));
+		if (claimed.subscriptions.length) this.ctx.waitUntil(this.deliverPushes(claimed.subscriptions, message, vapid, policy.ttlSeconds, sender));
 	}
 
 	/**
 	 * Pushes a message to each registration at once, each payload carrying
-	 * that registration's `push_id`, and forgets those whose push service
-	 * says they are gone (404 or 410). Other failures are only logged: the
+	 * that registration's `push_id`; charges the sender for those delivered;
+	 * and forgets those whose push service says they are gone (404 or 410) or
+	 * refuses this server's key (403). Other failures are only logged: the
 	 * push is lost, not retried.
 	 */
-	private async deliverPushes(subscriptions: readonly PushSubscriptionRecord[], message: MessageSnapshot, vapid: VapidKeys, ttlSeconds: number): Promise<void> {
+	private async deliverPushes(subscriptions: readonly PushSubscriptionRecord[], message: MessageSnapshot, vapid: VapidKeys, ttlSeconds: number, senderId: string): Promise<void> {
 		const payloads = new Map<string | undefined, string>();
 		const payloadFor = (pushId: string | undefined): string => {
 			let payload = payloads.get(pushId);
 			if (payload === undefined) payloads.set(pushId, payload = pushPayload(message, pushId));
 			return payload;
 		};
-		// The endpoint is checked again, against PUSH_HOSTS as configured now: a
-		// registration may predate a narrowed list.
-		const allowed = subscriptions.filter((subscription) => pushEndpointError(subscription.url, this.config.pushHosts) === null);
-		if (allowed.length < subscriptions.length) console.warn(JSON.stringify({ event: "push_host_not_allowed", skipped: subscriptions.length - allowed.length }));
 		// Mentions and replies are messages for this user, so `high` (§4.7).
-		const outcomes = await Promise.allSettled(allowed.map((subscription) =>
+		const outcomes = await Promise.allSettled(subscriptions.map((subscription) =>
 			sendWebPush(subscription, payloadFor(subscription.pushId), vapid, { ttlSeconds, urgency: "high", nowMs: nowMs() })));
 		const gone: Array<{ userId: string; url: string; p256dh: string }> = [];
 		let failed = 0;
+		let delivered = 0;
 		outcomes.forEach((outcome, index) => {
-			const { userId, url, p256dh } = allowed[index];
-			if (outcome.status === "fulfilled" && outcome.value.gone) gone.push({ userId, url, p256dh });
-			else if (outcome.status === "rejected" || outcome.value.status < 200 || outcome.value.status >= 300) failed++;
+			const { userId, url, p256dh } = subscriptions[index];
+			const status = outcome.status === "fulfilled" ? outcome.value.status : 0;
+			if (status >= 200 && status < 300) delivered++;
+			// 404 and 410: the subscription is gone (RFC 8030). 403: the push
+			// service refuses this server's VAPID key for it, so it was made with
+			// another one; the configuration check proves the key pair matches, so
+			// no push to it will ever succeed. The client registers again on its
+			// next connection, with a subscription for the current key.
+			else if (outcome.status === "fulfilled" && (outcome.value.gone || status === 403)) gone.push({ userId, url, p256dh });
+			else failed++;
 		});
-		if (failed) console.warn(JSON.stringify({ event: "push_delivery_failed", failed, sent: allowed.length }));
-		if (!gone.length) return;
+		if (failed) console.warn(JSON.stringify({ event: "push_delivery_failed", failed, sent: subscriptions.length }));
 		try {
-			this.store.forgetPushSubscriptions(gone, nowMs());
-		} catch { /* the next push to a gone registration tries again */ }
+			// The sender pays for delivered pushes only (`pushesPerSenderDay`).
+			this.store.chargePushSender(senderId, delivered, nowMs());
+			if (gone.length) this.store.forgetPushSubscriptions(gone, nowMs());
+		} catch { /* a failed charge or delete is retried by nothing: the next push tries again */ }
 	}
 
 	/**
@@ -2926,6 +2985,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const chosen = passkeys[Number(args[1]) - 1];
 		if (!chosen) throw { name: "invalid_params", message: `You have ${passkeys.length} passkey${passkeys.length === 1 ? "" : "s"}; see /passkeys` } satisfies ProtocolError;
 		if (!this.store.removePasskey({ userId, credentialId: chosen.credentialId, now: nowMs() })) throw usage;
+		// A device that held the removed passkey must not keep getting the
+		// user's messages by push; the user's other devices register again on
+		// their next connection.
+		if (this.config.push) this.store.clearPushSubscriptions(userId, nowMs());
 		const text = `Removed the passkey \`${chosen.credentialId.slice(0, 8)}…\` from your account.`;
 		for (const peer of this.connectionsOf(userId, socket)) {
 			this.deliverTo(peer, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text, format: "markdown" } } });
@@ -3314,6 +3377,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			for (const record of bot.broadcasts) this.broadcastRecord(record);
 		});
 		const token = await this.issueBotToken(botId, ownerId);
+		// The old token is revoked: whatever ran with it loses the bot's pushes too.
+		if (this.config.push) this.store.clearPushSubscriptions(botId, nowMs());
 		for (const peer of this.connectionsOf(botId)) {
 			const state = connectionAttachment(peer);
 			if (state) this.closePolicy(peer, state, 1008, "Bot token replaced; sign in with the new one");

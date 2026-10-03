@@ -747,7 +747,7 @@ function parseRoles(json: string | null | undefined): string[] {
 const META_RENAMED_PREFIX = "renamed:";
 
 /** The limiter scopes keyed by a registered user (`user:<user_id>`), which `/rename` moves. */
-const USER_LIMIT_SCOPES = ["post", "history", "upload", "push"] as const;
+const USER_LIMIT_SCOPES = ["post", "history", "upload", "push", "push_recipient"] as const;
 /**
  * `_meta` key prefix for an admin's `/toggle`: `toggle:<feature>` holds `on`
  * or `off`, and is absent while the feature follows the deployment's default.
@@ -778,8 +778,12 @@ const MAX_PUSH_SUBSCRIPTIONS_PER_USER = MAX_PUSHES_PER_MESSAGE;
  * ran, at most the purge list, wait for it.
  */
 const MAX_PUSH_WAKES_PER_USER = MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS;
-/** Longest push endpoint URL kept (protocol §4.7); browsers' are a few hundred bytes. */
-export const MAX_PUSH_URL_BYTES = 1024;
+/**
+ * Longest push endpoint URL kept (protocol §4.7). Browsers' are a few
+ * hundred bytes; a tighter bound keeps each row small, so sybil accounts
+ * cannot fill storage with registrations.
+ */
+export const MAX_PUSH_URL_BYTES = 512;
 /** A re-registration of an unchanged subscription younger than this writes nothing. */
 const PUSH_REFRESH_MS = 86_400_000;
 
@@ -4342,11 +4346,14 @@ export class Store {
    * and one with none is passed over without taking a wake; one woken for this room within `coalesceSeconds` is
    * passed over too (`coalesced`), and so is a muted one (`muted`); the rest are woken, up to
    * `wakesPerMessage` users, on each of their registrations (most recently
-   * registered first). Wakes are charged to the sender's `wakesPerSenderDay`
-   * and pushes to the server's `pushesPerDay`; past either, what is left is
-   * `skipped`. Each woken user's time for the room is kept for coalescing.
+   * registered first). Pushes are checked against the sender's
+   * `pushesPerSenderDay` (charged once delivered, chargePushSender), charged
+   * to the recipient's `pushesPerRecipientDay` and to the server's
+   * `pushesPerDay`; past any of them, what is left is `skipped`. With
+   * `allowed`, a registration whose endpoint it refuses (PUSH_HOSTS) is
+   * passed over before it counts. Each woken user's time for the room is kept for coalescing.
    */
-  claimPushes(input: { senderId: string; roomId: string; candidates: readonly PushCandidate[]; now?: number }): PushClaim {
+  claimPushes(input: { senderId: string; roomId: string; candidates: readonly PushCandidate[]; allowed?: (url: string) => boolean; now?: number }): PushClaim {
     this.ensureReady();
     const policy = this.config.push;
     const reasons = new Map<string, number>();
@@ -4355,14 +4362,15 @@ export class Store {
     const claim: PushClaim = { subscriptions: [], coalesced: 0, muted: 0, skipped: 0 };
     if (!policy || !candidates.length) return claim;
     const now = input.now ?? this.clock.now();
-    // Each candidate's live index range and wake row, the two counters, and a
-    // wake row written for each woken user.
-    const cost = { reads: 48 + candidates.length * (12 + 2 * policy.subscriptionsPerUser), writes: 32 + 4 * policy.wakesPerMessage };
+    // Each candidate's mute, live index range, wake row and recipient counter;
+    // the server's and sender's counters; and for each woken user a wake row
+    // and the recipient counter, created on a user's first push of the day.
+    const cost = { reads: 48 + candidates.length * (16 + 2 * policy.subscriptionsPerUser), writes: 32 + 12 * policy.wakesPerMessage };
     return this.reserved(cost, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       const day = dayFor(effective);
       const live = effective - policy.pushExpiryDays * 86_400_000;
-      let counters: { server: RawLimitRow; sender: RawLimitRow; sent: number; wakes: number } | undefined;
+      let counters: { server: RawLimitRow; sent: number; delivered: number } | undefined;
       let woken = 0;
       for (const userId of candidates) {
         if (woken >= policy.wakesPerMessage) break;
@@ -4378,7 +4386,7 @@ export class Store {
           `SELECT url, p256dh, auth, push_id, wake FROM push_subscriptions INDEXED BY push_subscriptions_user_idx
            WHERE user_id = ? AND updated_ms >= ? ORDER BY updated_ms DESC LIMIT ?`,
           userId, live, policy.subscriptionsPerUser,
-        ).filter((row) => (integerColumn(row.wake) & reasons.get(userId)!) !== 0);
+        ).filter((row) => (integerColumn(row.wake) & reasons.get(userId)!) !== 0 && (input.allowed?.(row.url) ?? true));
         if (!rows.length) continue;
         const last = this.rawRows<{ woken_ms: number }>("SELECT woken_ms FROM push_wakes WHERE user_id = ? AND room_id = ? LIMIT 1", userId, input.roomId)[0];
         if (last && effective - integerColumn(last.woken_ms) < policy.coalesceSeconds * 1_000) {
@@ -4388,29 +4396,69 @@ export class Store {
         // The counters are read once a user is found to wake, so a message
         // that wakes no one writes nothing. Reuse posts_day as the counts; the
         // scope separates them.
+        // The sender's pushes are charged once delivered (chargePushSender);
+        // here they are only checked, so failed pushes cost the sender nothing.
         if (!counters) {
           const server = this.limitRow("push", "global", effective);
-          const sender = this.limitRow("push", `user:${input.senderId}`, effective);
-          counters = { server, sender, sent: server.day === day ? integerColumn(server.posts_day) : 0, wakes: sender.day === day ? integerColumn(sender.posts_day) : 0 };
+          const sender = this.rawRows<{ day: string; posts_day: number }>(
+            "SELECT day, posts_day FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1", "push", `user:${input.senderId}`,
+          )[0];
+          counters = {
+            server, sent: server.day === day ? integerColumn(server.posts_day) : 0,
+            delivered: sender?.day === day ? integerColumn(sender.posts_day) : 0,
+          };
         }
-        const allowed = counters.wakes >= policy.wakesPerSenderDay ? 0 : Math.max(0, Math.min(rows.length, policy.pushesPerDay - counters.sent));
+        const recipient = this.rawRows<{ day: string; posts_day: number }>(
+          "SELECT day, posts_day FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1", "push_recipient", `user:${userId}`,
+        )[0];
+        const received = recipient?.day === day ? integerColumn(recipient.posts_day) : 0;
+        const allowed = Math.max(0, Math.min(
+          rows.length,
+          policy.pushesPerDay - counters.sent,
+          policy.pushesPerRecipientDay - received,
+          policy.pushesPerSenderDay - counters.delivered - claim.subscriptions.length,
+        ));
         claim.skipped += rows.length - allowed;
         if (!allowed) continue;
         for (const row of rows.slice(0, allowed)) claim.subscriptions.push(pushRecord(row, userId));
         counters.sent += allowed;
-        counters.wakes += 1;
         woken += 1;
+        this.updateLimitRow(this.limitRow("push_recipient", `user:${userId}`, effective), { day, posts_day: received + allowed }, effective);
         this.rawExec(
           "INSERT INTO push_wakes (user_id, room_id, woken_ms) VALUES (?, ?, ?) ON CONFLICT (user_id, room_id) DO UPDATE SET woken_ms = excluded.woken_ms",
           userId, input.roomId, effective,
         );
       }
-      if (counters && woken) {
-        this.updateLimitRow(counters.server, { day, posts_day: counters.sent }, effective);
-        this.updateLimitRow(counters.sender, { day, posts_day: counters.wakes }, effective);
-      }
+      if (counters && woken) this.updateLimitRow(counters.server, { day, posts_day: counters.sent }, effective);
       return claim;
     }));
+  }
+
+  /**
+   * Charges a sender's daily allowance (`pushesPerSenderDay`) with the
+   * pushes their message got delivered (2xx from the push service).
+   */
+  chargePushSender(senderId: string, delivered: number, now = this.clock.now()): void {
+    this.ensureReady();
+    if (delivered <= 0) return;
+    this.reserved({ reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
+      const effective = this.effectiveNow(now);
+      const day = dayFor(effective);
+      const row = this.limitRow("push", `user:${senderId}`, effective);
+      this.updateLimitRow(row, { day, posts_day: (row.day === day ? integerColumn(row.posts_day) : 0) + delivered }, effective);
+    }));
+  }
+
+  /**
+   * Removes all of a user's push registrations, when what they signed in
+   * with is revoked (`/passkeys remove`, a bot's new token): a device that
+   * held it should not keep getting their messages.
+   */
+  clearPushSubscriptions(userId: string, now = this.clock.now()): void {
+    this.ensureReady();
+    this.reserved({ reads: 8 + 2 * MAX_PUSH_SUBSCRIPTIONS_PER_USER, writes: 8 + 6 * MAX_PUSH_SUBSCRIPTIONS_PER_USER }, false, now, () => {
+      this.rawExec("DELETE FROM push_subscriptions WHERE user_id = ?", userId);
+    });
   }
 
   /**
@@ -4447,26 +4495,29 @@ export class Store {
   /**
    * `status` `mute` (protocol §4.11) for a registered user: until when they
    * are muted, MUTE_FOREVER for `mute: true`, or null to end it. Whether the
-   * stored mute changed. A mute is the user's, whichever connection set it.
+   * stored mute changed, and the mute it leaves as `you` carries it (see
+   * muteOf), absent when none. A mute is the user's, whichever connection
+   * set it.
    */
-  setMute(input: { userId: string; untilMs: number | null; now?: number }): boolean {
+  setMute(input: { userId: string; untilMs: number | null; now?: number }): { changed: boolean; mute?: number | true } {
     this.ensureReady();
     const now = input.now ?? this.clock.now();
     return this.reserved({ reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
-      if (!this.identityRow(input.userId)) return false;
+      if (!this.identityRow(input.userId)) return { changed: false };
       const existing = this.rawRows<{ until_ms: number }>("SELECT until_ms FROM mutes WHERE user_id = ? LIMIT 1", input.userId)[0];
       const before = existing && integerColumn(existing.until_ms) > effective ? integerColumn(existing.until_ms) : null;
       if (input.untilMs === null || input.untilMs <= effective) {
         if (existing) this.rawExec("DELETE FROM mutes WHERE user_id = ?", input.userId);
-        return before !== null;
+        return { changed: before !== null };
       }
-      if (before === input.untilMs) return false;
+      const mute = input.untilMs >= MUTE_FOREVER ? true as const : Math.ceil((input.untilMs - effective) / 1_000);
+      if (before === input.untilMs) return { changed: false, mute };
       this.rawExec(
         "INSERT INTO mutes (user_id, until_ms) VALUES (?, ?) ON CONFLICT (user_id) DO UPDATE SET until_ms = excluded.until_ms",
         input.userId, input.untilMs,
       );
-      return true;
+      return { changed: true, mute };
     }));
   }
 

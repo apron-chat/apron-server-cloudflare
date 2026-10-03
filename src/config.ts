@@ -344,7 +344,9 @@ export function validatePushPolicy(policy: PushPolicy): void {
 	// RFC 8030 lets a push service cap TTL; four weeks is past any it keeps.
 	if (policy.ttlSeconds > 28 * 86_400) throw new ConfigError("push.ttlSeconds must be at most four weeks");
 	if (policy.wakesPerMessage > MAX_PUSH_CANDIDATES) throw new ConfigError(`push.wakesPerMessage must be at most ${MAX_PUSH_CANDIDATES}`);
-	if (policy.wakesPerSenderDay > policy.pushesPerDay) throw new ConfigError("push.wakesPerSenderDay must fit pushesPerDay");
+	if (policy.pushesPerSenderDay > policy.pushesPerDay) throw new ConfigError("push.pushesPerSenderDay must fit pushesPerDay");
+	if (policy.pushesPerRecipientDay > policy.pushesPerDay) throw new ConfigError("push.pushesPerRecipientDay must fit pushesPerDay");
+	if (policy.mutesPerUserMinute > MAX_TYPE_THROTTLE_PER_MINUTE) throw new ConfigError(`push.mutesPerUserMinute must be at most ${MAX_TYPE_THROTTLE_PER_MINUTE}`);
 	if (policy.registersPerUserMinute > MAX_TYPE_THROTTLE_PER_MINUTE) throw new ConfigError(`push.registersPerUserMinute must be at most ${MAX_TYPE_THROTTLE_PER_MINUTE}`);
 	// The coalescing rows are deleted by cleanup once a day at the latest.
 	if (policy.coalesceSeconds > 86_400) throw new ConfigError("push.coalesceSeconds must be at most a day");

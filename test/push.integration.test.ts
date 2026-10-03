@@ -626,6 +626,154 @@ describe('push review fixes', () => {
 	});
 });
 
+describe('security review fixes', () => {
+	const senderCharged = (userId: string) => runInDurableObject(stub(), (_instance, state) =>
+		state.storage.sql.exec<{ posts_day: number }>("SELECT posts_day FROM principal_limits WHERE scope = 'push' AND principal_key = ?", `user:${userId}`).toArray()[0]?.posts_day ?? 0);
+
+	it('drops mute changes past mutesPerUserMinute, counted per user across reconnects', async () => {
+		const userId = unique('flip');
+		const peer = await signedIn(userId);
+		const watcher = await signedIn(userId, true);
+		try {
+			for (let index = 0; index < POLICY.mutesPerUserMinute + 2; index++) peer.send({ method: 'status', params: { mute: index % 2 ? 0 : 60 } });
+			await request(peer, 'sync-peer', 'me', {});
+			const echoes = (await exchange(watcher, 'sync', 'me', {})).skipped.filter((frame) => frame.method === 'user');
+			expect(echoes).toHaveLength(POLICY.mutesPerUserMinute);
+			// A new connection does not reset the count.
+			peer.close();
+			const again = await signedIn(userId, true);
+			try {
+				again.send({ method: 'status', params: { mute: true } });
+				await request(again, 'sync-again-peer', 'me', {});
+				const later = (await exchange(watcher, 'sync-again', 'me', {})).skipped.filter((frame) => frame.method === 'user');
+				expect(later).toEqual([]);
+				expect(again.closed()).toBeUndefined();
+			} finally { again.close(); }
+		} finally { peer.close(); watcher.close(); }
+	});
+
+	it('limits push_register per user across reconnects', async () => {
+		const userId = unique('regs');
+		const browser = await testBrowser();
+		const params = { kind: 'webpush', url: 'https://push.example.net/again', keys: { p256dh: browser.p256dh, auth: browser.auth } };
+		const first = await signedIn(userId);
+		for (let index = 0; index < POLICY.registersPerUserMinute; index++) {
+			expect((await request(first, `reg-${index}`, 'push_register', params)).result).toEqual({});
+		}
+		first.close();
+		const second = await signedIn(userId, true);
+		try {
+			expect((await request(second, 'over', 'push_register', params)).error.code).toBe(-32002);
+		} finally { second.close(); }
+	});
+
+	it('stores one spelling of an endpoint, refuses a trailing-dot host, and caps urls at 512 bytes', async () => {
+		const userId = unique('norm');
+		const peer = await signedIn(userId);
+		try {
+			const browser = await testBrowser();
+			const keys = { p256dh: browser.p256dh, auth: browser.auth };
+			expect((await request(peer, 'spelled', 'push_register', { kind: 'webpush', url: 'https://PUSH.example.net:443/a/../b', keys })).result).toEqual({});
+			expect((await request(peer, 'plain', 'push_register', { kind: 'webpush', url: 'https://push.example.net/b', keys })).result).toEqual({});
+			expect((await subscriptionsOf(userId)).map((row) => row.url)).toEqual(['https://push.example.net/b']);
+			expect((await request(peer, 'dot', 'push_register', { kind: 'webpush', url: 'https://push.example.net./c', keys })).error.code).toBe(-32602);
+			expect((await request(peer, 'long', 'push_register', { kind: 'webpush', url: `https://push.example.net/${'x'.repeat(500)}`, keys })).error.code).toBe(-32602);
+			// Unregistering by another spelling removes it too.
+			expect((await request(peer, 'unregister', 'push_unregister', { url: 'https://PUSH.example.net/b' })).result).toEqual({});
+			expect(await subscriptionsOf(userId)).toEqual([]);
+		} finally { peer.close(); }
+	});
+
+	it('forgets a registration its push service refuses with 403, and charges the sender only for delivered pushes', async () => {
+		const pushes = capturePushes((url) => url.includes('/refused-') ? 403 : url.includes('/failing-') ? 500 : 201);
+		const [aliceId, bobId, carolId] = [unique('alice'), unique('bob'), unique('carol')];
+		const alice = await signedIn(aliceId);
+		try {
+			for (const [userId, name] of [[bobId, 'refused'], [carolId, 'failing']] as const) {
+				const peer = await signedIn(userId);
+				await subscribe(peer, name);
+				peer.close();
+				await vi.waitFor(async () => expect(await idleOf(userId)).toEqual([]), { timeout: 5_000 });
+			}
+			await post(alice, 'mention', { body: { text: 'hi', mentions: [bobId, carolId] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(2), { timeout: 5_000 });
+			await vi.waitFor(async () => expect(await subscriptionsOf(bobId)).toEqual([]), { timeout: 5_000 });
+			expect(await subscriptionsOf(carolId)).toHaveLength(1);
+			// Neither push was delivered, so Alice was charged nothing.
+			expect(await senderCharged(aliceId)).toBe(0);
+		} finally { alice.close(); }
+	});
+
+	it('passes over registrations PUSH_HOSTS no longer allows before they take a wake', async () => {
+		const keys = { p256dh: (await testBrowser()).p256dh, auth: 'a'.repeat(22) };
+		await withStore('push-hosts-claim', { push: { ...POLICY, wakesPerMessage: 1 } }, (store, clock) => {
+			for (const userId of ['old', 'new']) {
+				store.registerIdentity({
+					userId, name: userId, userHandle: `handle-${userId}`, now: clock.value, ipKey: `ip-${userId}`,
+					credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
+				});
+			}
+			store.registerPushSubscription({ userId: 'old', url: 'https://push.retired.example/x', ...keys, now: clock.value });
+			store.registerPushSubscription({ userId: 'new', url: 'https://push.example.net/y', ...keys, now: clock.value });
+			const claimed = store.claimPushes({
+				senderId: 'sender', roomId: 'general', now: clock.value,
+				candidates: [{ userId: 'old', reasons: WAKE_SCOPES.mentions }, { userId: 'new', reasons: WAKE_SCOPES.mentions }],
+				allowed: (url) => url.startsWith('https://push.example.net/'),
+			});
+			expect(claimed.subscriptions.map((row) => row.userId)).toEqual(['new']);
+			expect(store.pushesToday(clock.value)).toBe(1);
+		});
+	});
+
+	it("clears a user's push registrations on /passkeys remove, and a bot's on a new token", async () => {
+		const userId = unique('keys');
+		await register(userId);
+		await runInDurableObject(stub(), (instance) => {
+			(instance as unknown as Runtime).store.addCredential({
+				userId, userHandle: `handle-${userId}`, now: Date.now(), ipKey: `ip-${userId}`,
+				credential: { credentialId: `cred2-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
+			});
+		});
+		const peer = await signedIn(userId, true);
+		try {
+			await subscribe(peer, 'phone');
+			expect((await request(peer, 'remove', 'command', { body: { text: '/passkeys remove 2' } })).result).toEqual({});
+			expect(await subscriptionsOf(userId)).toEqual([]);
+			// The bot's token is replaced: its registrations go with the old one.
+			const botId = `bot_${userId}`;
+			expect((await request(peer, 'bot', 'command', { body: { text: '/invite-bot' } })).result).toEqual({});
+			await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.registerPushSubscription({
+				userId: botId, url: 'https://push.example.net/bot', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22),
+			}));
+			expect(await subscriptionsOf(botId)).toHaveLength(1);
+			expect((await request(peer, 'bot-again', 'command', { body: { text: '/invite-bot' } })).result).toEqual({});
+			expect(await subscriptionsOf(botId)).toEqual([]);
+		} finally { peer.close(); }
+	});
+
+	it('keeps a connection that only mutes under the silent-idle rule', async () => {
+		const pushes = capturePushes();
+		const [aliceId, quietId] = [unique('alice'), unique('quiet')];
+		const alice = await signedIn(aliceId);
+		const quiet = await signedIn(quietId);
+		try {
+			const quietSub = await subscribe(quiet, 'quiet');
+			// `mute` alone does not say the client reports idle.
+			quiet.send({ method: 'status', params: { mute: 0, invisible: false } });
+			await request(quiet, 'sync', 'me', {});
+			await runInDurableObject(stub(), (_instance, state) => {
+				for (const socket of state.getWebSockets()) {
+					const attachment = socket.deserializeAttachment() as { userId?: string; frameTimes: number[] };
+					if (attachment.userId === quietId) socket.serializeAttachment({ ...attachment, frameTimes: [Date.now() - 11 * 60_000] });
+				}
+			});
+			await post(alice, 'quiet', { body: { text: 'still there?', mentions: [quietId] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(pushes[0].url).toBe(quietSub.url);
+		} finally { alice.close(); quiet.close(); }
+	});
+});
+
 describe('push limits over the socket', () => {
 	it('limits push_register to registersPerUserMinute a user', async () => {
 		const userId = unique('reg');
@@ -738,9 +886,9 @@ describe('push subscriptions in the store', () => {
 		});
 	});
 
-	it('charges pushes to pushesPerDay and wakes to the sender, skipping the rest until the next UTC day', async () => {
+	it('charges pushes to pushesPerDay and each recipient, skipping the rest until the next UTC day', async () => {
 		const keys = await browserKeys();
-		await withStore('push-daily', { push: { ...POLICY, pushesPerDay: 3, wakesPerSenderDay: 3, coalesceSeconds: 1 } }, (store, clock) => {
+		await withStore('push-daily', { push: { ...POLICY, pushesPerDay: 3, coalesceSeconds: 1 } }, (store, clock) => {
 			for (const userId of ['cy', 'di', 'ed']) {
 				registerUser(store, clock, userId);
 				for (const n of [1, 2]) store.registerPushSubscription({ userId, url: `https://push.example.net/${userId}/${n}`, ...keys, now: clock.value });
@@ -755,11 +903,32 @@ describe('push subscriptions in the store', () => {
 			clock.value += DAY;
 			expect(claim(store, clock, ['cy'], 'general', 'sal').subscriptions).toHaveLength(2);
 			expect(store.pushesToday(clock.value)).toBe(2);
-			// Sal's third woken user today is past wakesPerSenderDay; another sender still wakes.
-			clock.value += 1_000;
-			expect(claim(store, clock, ['di'], 'general', 'sal').subscriptions).toHaveLength(1);
-			clock.value += 1_000;
-			expect(claim(store, clock, ['ed'], 'general', 'sal')).toMatchObject({ subscriptions: [], skipped: 2 });
+		});
+	});
+
+	it('charges senders only for delivered pushes, and caps what one recipient gets a day', async () => {
+		const keys = await browserKeys();
+		await withStore('push-sender', { push: { ...POLICY, pushesPerSenderDay: 3, pushesPerRecipientDay: 3, coalesceSeconds: 1 } }, (store, clock) => {
+			for (const userId of ['fi', 'gil', 'hu']) {
+				registerUser(store, clock, userId);
+				for (const n of [1, 2]) store.registerPushSubscription({ userId, url: `https://push.example.net/${userId}/${n}`, ...keys, now: clock.value });
+			}
+			// Claims alone, never delivered, cost the sender nothing: Sam's 3 pushes
+			// to Fi are all claimed, the third cut by Fi's recipient cap of 3.
+			expect(claim(store, clock, ['fi'], 'room-0', 'sam').subscriptions).toHaveLength(2);
+			clock.value += 2_000;
+			expect(claim(store, clock, ['fi'], 'room-1', 'sam')).toMatchObject({ subscriptions: [expect.anything()], skipped: 1 });
+			clock.value += 2_000;
+			// Fi has had 3 pushes today: no more, from anyone.
+			expect(claim(store, clock, ['fi'], 'room-2', 'tess')).toMatchObject({ subscriptions: [], skipped: 2 });
+			// Sam's delivered pushes reach the sender cap: Sam wakes no one more today.
+			store.chargePushSender('sam', 3, clock.value);
+			expect(claim(store, clock, ['gil'], 'general', 'sam')).toMatchObject({ subscriptions: [], skipped: 2 });
+			expect(claim(store, clock, ['gil'], 'general', 'tess').subscriptions).toHaveLength(2);
+			// A message cannot claim past the sender's allowance either.
+			store.chargePushSender('uma', 2, clock.value);
+			expect(claim(store, clock, ['hu'], 'general', 'uma').subscriptions).toHaveLength(1);
+			expect(store.accountingStatus().unsafe).toBe(false);
 		});
 	});
 
@@ -832,7 +1001,7 @@ describe('push subscriptions in the store', () => {
 				registerUser(store, clock, userId);
 				store.registerPushSubscription({ userId, url: `https://push.example.net/${userId}`, ...keys, now: clock.value });
 			}
-			expect(store.setMute({ userId: 'mo', untilMs: clock.value + 90_500, now: clock.value })).toBe(true);
+			expect(store.setMute({ userId: 'mo', untilMs: clock.value + 90_500, now: clock.value })).toEqual({ changed: true, mute: 91 });
 			expect(store.muteOf('mo', clock.value)).toBe(91);
 			const first = claim(store, clock, ['mo', 'ned']);
 			expect(first.subscriptions.map((row) => row.userId)).toEqual(['ned']);
@@ -841,19 +1010,19 @@ describe('push subscriptions in the store', () => {
 			clock.value += 91_000;
 			expect(store.muteOf('mo', clock.value)).toBeUndefined();
 			expect(claim(store, clock, ['mo'], 'thread').subscriptions.map((row) => row.userId)).toEqual(['mo']);
-			expect(store.setMute({ userId: 'mo', untilMs: MUTE_FOREVER, now: clock.value })).toBe(true);
-			expect(store.setMute({ userId: 'mo', untilMs: MUTE_FOREVER, now: clock.value })).toBe(false);
+			expect(store.setMute({ userId: 'mo', untilMs: MUTE_FOREVER, now: clock.value })).toEqual({ changed: true, mute: true });
+			expect(store.setMute({ userId: 'mo', untilMs: MUTE_FOREVER, now: clock.value })).toEqual({ changed: false, mute: true });
 			clock.value += 400 * 86_400_000;
 			expect(store.muteOf('mo', clock.value)).toBe(true);
 			// No identity, no mute.
-			expect(store.setMute({ userId: 'guest_3', untilMs: MUTE_FOREVER, now: clock.value })).toBe(false);
+			expect(store.setMute({ userId: 'guest_3', untilMs: MUTE_FOREVER, now: clock.value })).toEqual({ changed: false });
 			store.renameIdentity({ from: 'mo', to: 'moe', now: clock.value });
 			expect(store.muteOf('mo', clock.value)).toBeUndefined();
 			expect(store.muteOf('moe', clock.value)).toBe(true);
 			store.purgeUsers({ userIds: ['moe'], now: clock.value });
 			registerUser(store, clock, 'moe');
 			expect(store.muteOf('moe', clock.value)).toBeUndefined();
-			expect(store.setMute({ userId: 'moe', untilMs: null, now: clock.value })).toBe(false);
+			expect(store.setMute({ userId: 'moe', untilMs: null, now: clock.value })).toEqual({ changed: false });
 		});
 	});
 

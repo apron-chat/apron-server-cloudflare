@@ -688,6 +688,8 @@ describe('measured storage accounting', () => {
 			measure('mute set', () => store.setMute({ userId: 'matrix-user', untilMs: clock.now() + 3_600_000, now: clock.now() }));
 			expect(measure('mute read', () => store.muteOf('matrix-user', clock.now()))).toBe(3_600);
 			store.setMute({ userId: 'matrix-user', untilMs: null, now: clock.now() });
+			measure('push sender charge', () => store.chargePushSender('matrix-sender', 2, clock.now()));
+			measure('push registrations clear', () => store.clearPushSubscriptions('matrix-other', clock.now()));
 			measure('gone push subscription forget', () => store.forgetPushSubscriptions([{ userId: subscription.userId, url: subscription.url, p256dh: subscription.p256dh }], clock.now()));
 
 			const identity = { user_id: 'matrix-user', name: 'Matrix user', tier: 'registered' as const };
@@ -741,7 +743,7 @@ describe('measured storage accounting', () => {
 			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
 			expect(create.result.message_id).toBeTruthy();
-			expect(costs).toHaveLength(39);
+			expect(costs).toHaveLength(41);
 			return { costs };
 		});
 		console.info('accounting-operation-matrix', JSON.stringify(result));

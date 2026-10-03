@@ -236,8 +236,18 @@ export interface PushPolicy {
 	 * subscriptions; users past them are not pushed.
 	 */
 	wakesPerMessage: number;
-	/** Users one sender's messages may wake a UTC day. */
-	wakesPerSenderDay: number;
+	/**
+	 * Pushes one sender's messages may get delivered a UTC day, counting only
+	 * those the push service accepted (2xx), so a sender pays for real pushes.
+	 */
+	pushesPerSenderDay: number;
+	/** Pushes one user may receive a UTC day, from all senders together. */
+	pushesPerRecipientDay: number;
+	/**
+	 * `status` `mute` changes one user may make a minute, across their
+	 * connections and reconnects; past it, further ones are dropped.
+	 */
+	mutesPerUserMinute: number;
 	/**
 	 * After a user is woken for a room, further messages in that room wake
 	 * them again only once this long has passed.
@@ -247,7 +257,7 @@ export interface PushPolicy {
 	subscriptionsPerUser: number;
 	/** A subscription not registered again for this long is skipped, then deleted by cleanup. */
 	pushExpiryDays: number;
-	/** `push_register` requests one user may send a minute, across their connections. */
+	/** `push_register` requests one user may send a minute, across their connections and reconnects. */
 	registersPerUserMinute: number;
 	/** How long a push service keeps a push for an offline browser (the `TTL` header). */
 	ttlSeconds: number;
