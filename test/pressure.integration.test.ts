@@ -152,4 +152,5 @@ it('stops growth near the hard target, reuses pages without VACUUM, and resumes 
 	});
 	console.info('storage-pressure-low-resume', JSON.stringify(resumed));
 	expect(resumed.databaseSize).toBeLessThan(config.storageLowWaterBytes);
-});
+// It writes over 120 MiB of SQLite: about 2 s alone, past 5 s on a loaded machine.
+}, 30_000);

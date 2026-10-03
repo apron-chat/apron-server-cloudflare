@@ -1,5 +1,5 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import { DEFAULT_LIMITS } from '../src/budget';
 import { canonicalizeIp, hashIpKey } from '../src/ip';
 import { connect as open, exchange, greeting, reply, request, until, type ConnectOptions, type Frame, type Peer } from './helpers/socket';
@@ -662,7 +662,14 @@ it('lists only connected guests as members after others posted and left', async 
 			await until(peer, (frame) => frame.id === `post-${index}`);
 			peer.close();
 		}
-		await new Promise((resolve) => setTimeout(resolve, 200));
+		// Wait for the server to process each close, rather than a fixed time.
+		await vi.waitFor(() => runInDurableObject(env.DEMO.getByName('public-demo-v1'), (_instance, state) => {
+			const open = state.getWebSockets().filter((socket) => {
+				const attachment = socket.deserializeAttachment() as { userId?: string; closing?: boolean };
+				return gone.includes(attachment.userId ?? '') && !attachment.closing && socket.readyState === 1;
+			});
+			expect(open).toHaveLength(0);
+		}), { timeout: 5_000 });
 		// A fresh connection sees their messages in history, but not them as
 		// members: a guest's membership ends with its connection, unlogged.
 		const fresh = await connect();
@@ -693,19 +700,30 @@ it('drops a connection that pinged and went quiet from room_list members and clo
 		// The runtime answers the ping itself; it never reaches the handler.
 		bob.socket.send('{"method":"ping"}');
 		expect(await until(bob, (frame) => frame.method === 'pong')).toMatchObject({ frame: { method: 'pong' } });
-		carol.socket.send('{"method":"ping"}');
-		await until(carol, (frame) => frame.method === 'pong');
 		await new Promise((resolve) => setTimeout(resolve, 700));
 		// Carol keeps talking; Bob's peer has gone quiet.
 		carol.socket.send('{"method":"ping"}');
 		await until(carol, (frame) => frame.method === 'pong');
-		await new Promise((resolve) => setTimeout(resolve, 500));
+		// Judge staleness at a fixed moment, half the timeout after Carol's
+		// ping, rather than whenever a loaded machine gets to the listing:
+		// Carol (0.5 s quiet) is live and Bob (at least 1.2 s quiet) is stale.
+		const pinged = await runInDurableObject(env.DEMO.getByName('public-demo-v1'), (_instance, state) => {
+			const times = new Map<string, number>();
+			for (const socket of state.getWebSockets()) {
+				const attachment = socket.deserializeAttachment() as { userId?: string };
+				const at = state.getWebSocketAutoResponseTimestamp(socket)?.getTime();
+				if (attachment.userId && at !== undefined) times.set(attachment.userId, at);
+			}
+			return Object.fromEntries(times);
+		});
+		expect(pinged[carolId.user_id] - pinged[bobId.user_id]).toBeGreaterThanOrEqual(700);
+		vi.spyOn(Date, 'now').mockReturnValue(pinged[carolId.user_id] + 500);
 
 		const listed = (await request(alice, 'list', 'room_list', { room_id: 'general', members: true })).result.joined[0].members.map((member: { user_id: string }) => member.user_id);
 		expect(listed).toContain(carolId.user_id);
 		expect(listed).not.toContain(bobId.user_id);
 		expect(await closed).toBe(1001);
-	} finally { alice.close(); bob.close(); carol.close(); await configure((config) => { config.limits.pingTimeoutSeconds = 150; }); }
+	} finally { vi.restoreAllMocks(); alice.close(); bob.close(); carol.close(); await configure((config) => { config.limits.pingTimeoutSeconds = 150; }); }
 });
 
 it('advertises the demo policy hints', async () => {

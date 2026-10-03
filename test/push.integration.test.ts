@@ -266,7 +266,7 @@ describe('push over the socket', () => {
 			// Carol is idle; Bob is attended; Dave has gone.
 			await setIdle(carol, true);
 			dave.close();
-			await vi.waitFor(async () => expect(await idleOf(daveId)).toEqual([]));
+			await vi.waitFor(async () => expect(await idleOf(daveId)).toEqual([]), { timeout: 5_000 });
 
 			const long = 'é'.repeat(250);
 			const first = await post(alice, 'first', { room_id: 'general', body: { text: long, format: 'markdown', mentions: [bobId, carolId, aliceId, daveId, 'guest_1'], embeds: [{ kind: 'link', url: 'https://example.com' }] } });
@@ -344,7 +344,7 @@ describe('push over the socket', () => {
 			expect(await subscriptionsOf(erinId)).toHaveLength(2);
 			expect(gone.url).toContain('/gone-');
 		} finally { erin.close(); }
-		await vi.waitFor(async () => expect(await idleOf(erinId)).toEqual([]));
+		await vi.waitFor(async () => expect(await idleOf(erinId)).toEqual([]), { timeout: 5_000 });
 		try {
 			await post(alice, 'mention', { body: { text: 'hi', mentions: [erinId] } });
 			await vi.waitFor(() => expect(pushes).toHaveLength(2), { timeout: 5_000 });
@@ -393,7 +393,7 @@ describe('wake scopes', () => {
 		const peer = await signedIn(userId);
 		const { url } = await subscribe(peer, userId, undefined, wake);
 		peer.close();
-		await vi.waitFor(async () => expect(await idleOf(userId)).toEqual([]));
+		await vi.waitFor(async () => expect(await idleOf(userId)).toEqual([]), { timeout: 5_000 });
 		return url;
 	}
 	const userOf = (url: string) => url.slice('https://push.example.net/send/'.length).replace(/-[0-9a-f-]{36}$/, '');
@@ -649,7 +649,7 @@ describe('push limits over the socket', () => {
 			const peer = await signedIn(userId);
 			await subscribe(peer, userId);
 			peer.close();
-			await vi.waitFor(async () => expect(await idleOf(userId)).toEqual([]));
+			await vi.waitFor(async () => expect(await idleOf(userId)).toEqual([]), { timeout: 5_000 });
 		}
 		const guest = await connect();
 		const alice = await signedIn(aliceId);
