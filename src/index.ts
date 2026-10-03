@@ -127,11 +127,17 @@ interface ConnectionAttachment {
 	 */
 	away?: boolean;
 	/**
-	 * A `status` `mute` sent before authentication (§4.11), as the `mutes`
-	 * row's `until_ms` it asks for (0 ends a mute), applied once the
-	 * connection signs in as a registered user.
+	 * A `status` `mute` sent before authentication (§4.11), as sent: seconds
+	 * (0 ends a mute) or `true`. Applied, timed from then, once the
+	 * connection signs in as a registered user; dropped on a guest sign-in.
 	 */
-	pendingMute?: number;
+	pendingMute?: number | true;
+	/**
+	 * The client has sent `status` (§4.11), so it reports `idle` itself; a
+	 * connection that never has is idle once it sends nothing for a while
+	 * (SILENT_IDLE_MS).
+	 */
+	statusSeen?: boolean;
 	closing?: boolean;
 }
 
@@ -447,7 +453,8 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			} : {}),
 			...(attachment.listedJoined ? { listedJoined: true } : {}),
 			...(attachment.away === true ? { away: true } : {}),
-			...(Number.isSafeInteger(attachment.pendingMute) && attachment.pendingMute! >= 0 ? { pendingMute: attachment.pendingMute } : {}),
+			...(attachment.pendingMute === true || (Number.isSafeInteger(attachment.pendingMute) && (attachment.pendingMute as number) >= 0) ? { pendingMute: attachment.pendingMute } : {}),
+			...(attachment.statusSeen === true ? { statusSeen: true } : {}),
 			authDeadline: typeof attachment.authDeadline === "number" ? attachment.authDeadline : 0,
 			pendingFrames: typeof attachment.pendingFrames === "number" ? attachment.pendingFrames : 0,
 			pendingBytes: typeof attachment.pendingBytes === "number" ? attachment.pendingBytes : 0,
@@ -511,6 +518,8 @@ function writeSessionAttachment(socket: WebSocketConnection, attachment: Connect
 		else delete attachment.away;
 		if (current.pendingMute !== undefined) attachment.pendingMute = current.pendingMute;
 		else delete attachment.pendingMute;
+		if (current.statusSeen) attachment.statusSeen = true;
+		else delete attachment.statusSeen;
 	}
 	writeAttachment(socket, attachment);
 }
@@ -699,11 +708,18 @@ function wakeParam(value: unknown): number | undefined {
 	return mask;
 }
 
+/**
+ * A connection whose client never sent `status` (§4.11) counts as idle for
+ * pushes once it has sent no frame for this long. Clients that send `status`
+ * report idle themselves; pings never reach the object, so they do not count.
+ */
+const SILENT_IDLE_MS = 10 * 60_000;
+
 /** Longest `body.text` a push carries, in code points; longer text is cut, ending in `…`. */
 const PUSH_TEXT_CODE_POINTS = 200;
 
 /** Largest push payload, in bytes of JSON (§4.7), leaving a relay room to wrap it for APNs or FCM. */
-const MAX_PUSH_PAYLOAD_BYTES = 3072;
+const MAX_PUSH_PAYLOAD_BYTES = 2048;
 
 /**
  * What a push carries (§4.7): the envelope `{push_id?, message}`, with the
@@ -1405,10 +1421,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 				await this.handleActivity(socket, request);
 				return;
 			case "status":
-				// A notification only, on a push server (§4.11); a request, like a
-				// `ping` request, gets the unsupported-method path.
-				if (!this.config.push || request.id !== undefined) break;
-				this.handleStatus(socket, attachment, request);
+				if (!this.config.push) break;
+				// A notification (§4.11): one sent with an `id` is processed the same
+				// way and never answered. A malformed value is never answered either,
+				// but counts as a policy violation.
+				try {
+					this.handleStatus(socket, attachment, request);
+				} catch (error) {
+					this.recordViolation(socket, errorToProtocol(error));
+				}
 				return;
 			case "push_register":
 				if (!this.config.push) break;
@@ -1478,6 +1499,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// A new guest has joined the default room (§3.4).
 			attachment.rooms = [...DEFAULT_JOINED_ROOMS];
 			delete attachment.listedJoined;
+			// A guest gets no pushes, so a mute sent before signing in is dropped.
+			delete attachment.pendingMute;
 			writeAttachment(socket, attachment);
 			this.reply(socket, request, { you: this.current(attachment) });
 			await this.rescheduleAlarm();
@@ -2360,14 +2383,23 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * MAX_MUTE_SECONDS), `true` until changed, or `0` to end it; stored, so
 	 * it outlasts the connection, and echoed in `you` to the user's
 	 * connections when it changes. Guests get no pushes, so their mute is
-	 * ignored. Both may come before authentication, and apply once signed in.
-	 * A `room_id` scopes the fields to a room, which this server does not
-	 * implement, so a scoped update is ignored, as are `invisible` and
-	 * unknown fields. A malformed `idle` or `mute` is `invalid_params`, and
-	 * nothing in the update applies.
+	 * ignored. Both may come before authentication: `idle` applies at once,
+	 * and `mute` once the connection signs in as a registered user. With
+	 * `room_id`, every field is scoped to that room; this server implements
+	 * no room scopes, so such an update changes nothing and is not checked.
+	 * `invisible` and unknown fields are ignored. A malformed `idle` or `mute`
+	 * is `invalid_params`, and nothing in the update applies.
 	 */
 	private handleStatus(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): void {
 		const params = request.params;
+		// Whatever it says, the client reports idle itself (see attended).
+		if (!attachment.statusSeen) {
+			const state = connectionAttachment(socket);
+			if (state && !state.statusSeen) {
+				state.statusSeen = true;
+				writeAttachment(socket, state);
+			}
+		}
 		if (params.room_id !== undefined) return;
 		const idle = params.idle;
 		if (idle !== undefined && typeof idle !== "boolean") throw { name: "invalid_params", message: "idle must be a boolean" } satisfies ProtocolError;
@@ -2377,54 +2409,80 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (typeof idle === "boolean") this.setAway(socket, idle);
 		if (mute === undefined) return;
-		const now = nowMs();
-		const untilMs = mute === true ? MUTE_FOREVER : mute === 0 ? 0 : now + Math.min(mute, MAX_MUTE_SECONDS) * 1_000;
 		if (attachment.tier === "pending") {
 			const state = connectionAttachment(socket);
 			if (!state) return;
-			state.pendingMute = untilMs;
+			state.pendingMute = mute as number | true;
 			writeAttachment(socket, state);
 			return;
 		}
-		if (attachment.tier === "registered") this.changeMute(attachment.userId!, untilMs, now);
+		if (attachment.tier === "registered") this.changeMute(attachment.userId!, mute as number | true, nowMs());
 	}
 
 	/**
-	 * Stores a registered user's mute (0 ends it) and, on a change, sends
-	 * `user` `you` with it to every connection of theirs but `except` (§4.11).
-	 * Never shown to others.
+	 * Stores a registered user's mute, as `status` sends it (seconds, cut to
+	 * MAX_MUTE_SECONDS, from `now`; `true`; or 0 to end it) and, on a change,
+	 * sends `user` `you` with the result to every connection of theirs but
+	 * `except` (§4.11): the seconds left, `true`, or `0` once ended. Never
+	 * shown to others.
 	 */
-	private changeMute(userId: string, untilMs: number, now: number, except?: WebSocketConnection): void {
-		if (!this.store.setMute({ userId, untilMs: untilMs > 0 ? untilMs : null, now })) return;
-		const mute = this.store.muteOf(userId, now);
+	private changeMute(userId: string, mute: number | true, now: number, except?: WebSocketConnection): void {
+		const untilMs = mute === true ? MUTE_FOREVER : mute === 0 ? null : now + Math.min(mute, MAX_MUTE_SECONDS) * 1_000;
+		if (!this.store.setMute({ userId, untilMs, now })) return;
+		// A change that ended the mute is echoed as `mute: 0` (§4.11).
+		const field = this.muteField(userId, now, true);
 		for (const peer of this.connectionsOf(userId, except)) {
 			const state = connectionAttachment(peer);
 			const user = state ? this.current(state) : null;
-			if (user) this.deliverTo(peer, { method: "user", params: { you: { ...user, ...(mute !== undefined ? { mute } : {}) } } });
+			if (user) this.deliverTo(peer, { method: "user", params: { you: { ...user, ...field } } });
 		}
 	}
 
-	/** Applies a `status` `mute` sent before this connection signed in as a registered user. */
+	/**
+	 * Applies a `status` `mute` sent before this connection signed in, now
+	 * that it is a registered user's, timed from now. A failure leaves the
+	 * sign-in as it was: the mute is dropped, and the client can send it again.
+	 */
 	private applyPendingMute(socket: WebSocketConnection): void {
 		const state = connectionAttachment(socket);
 		if (!state || state.pendingMute === undefined) return;
-		const untilMs = state.pendingMute;
+		const mute = state.pendingMute;
 		delete state.pendingMute;
 		writeAttachment(socket, state);
-		// This connection learns the mute from its auth result.
-		if (state.tier === "registered" && state.userId) this.changeMute(state.userId, untilMs, nowMs(), socket);
+		if (state.tier !== "registered" || !state.userId) return;
+		try {
+			// This connection learns the mute from its auth result.
+			this.changeMute(state.userId, mute, nowMs(), socket);
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "pending_mute_failed", reason: errorToProtocol(error).message }));
+		}
+	}
+
+	/**
+	 * A registered user's `mute` as `you` carries it on a push server
+	 * (§4.11): the seconds left or `true`. Not muted, it is left out, except
+	 * as `0` with `ended`, for the echo of a change that ended it. Empty
+	 * without push, or when it cannot be read: a reply never fails on it.
+	 */
+	private muteField(userId: string, now = nowMs(), ended = false): { mute?: number | true } {
+		if (!this.config.push) return {};
+		try {
+			const mute = this.store.muteOf(userId, now);
+			return mute !== undefined ? { mute } : ended ? { mute: 0 } : {};
+		} catch {
+			return {};
+		}
 	}
 
 	/**
 	 * A connection's own user object (`you`, §3.3): its current object and,
-	 * for a muted registered user, `mute`, the seconds left or `true` (§4.11),
-	 * which is never shown to others.
+	 * for a registered user on a push server, `mute` (see muteField), which
+	 * is never shown to others.
 	 */
 	private you(attachment: ConnectionAttachment): PublicUser | null {
 		const user = this.current(attachment);
-		if (!user || attachment.tier !== "registered" || !this.config.push) return user;
-		const mute = this.store.muteOf(user.user_id);
-		return mute === undefined ? user : { ...user, mute };
+		if (!user || attachment.tier !== "registered") return user;
+		return { ...user, ...this.muteField(user.user_id) };
 	}
 
 	/** Marks a connection idle or attended (`status` `idle`, §4.11), writing its attachment only on a change. */
@@ -2436,9 +2494,21 @@ export class ApronDemoServer extends DurableObject<Env> {
 		writeAttachment(socket, state);
 	}
 
-	/** Whether a user has a connection someone attends: authenticated as them, not stale, and not idle (§4.11). */
+	/**
+	 * Whether a user has a connection someone attends: authenticated as them,
+	 * not stale, and not idle (§4.11). A connection whose client has never
+	 * sent `status` counts as idle once it has sent no frame for
+	 * SILENT_IDLE_MS (pings are answered by the runtime, so they do not
+	 * count); one whose client sends `status` is idle only when it says so.
+	 */
 	private attended(userId: string, now: number): boolean {
-		return this.connectionsOf(userId).some((peer) => !this.isStale(peer, now) && !connectionAttachment(peer)?.away);
+		return this.connectionsOf(userId).some((peer) => {
+			const state = connectionAttachment(peer);
+			if (!state || state.away || this.isStale(peer, now)) return false;
+			if (state.statusSeen) return true;
+			const last = state.frameTimes[state.frameTimes.length - 1] ?? 0;
+			return now - last < SILENT_IDLE_MS;
+		});
 	}
 
 	/**
@@ -2566,16 +2636,21 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (payload === undefined) payloads.set(pushId, payload = pushPayload(message, pushId));
 			return payload;
 		};
-		const outcomes = await Promise.allSettled(subscriptions.map((subscription) =>
-			sendWebPush(subscription, payloadFor(subscription.pushId), vapid, { ttlSeconds, urgency: "normal", nowMs: nowMs() })));
+		// The endpoint is checked again, against PUSH_HOSTS as configured now: a
+		// registration may predate a narrowed list.
+		const allowed = subscriptions.filter((subscription) => pushEndpointError(subscription.url, this.config.pushHosts) === null);
+		if (allowed.length < subscriptions.length) console.warn(JSON.stringify({ event: "push_host_not_allowed", skipped: subscriptions.length - allowed.length }));
+		// Mentions and replies are messages for this user, so `high` (§4.7).
+		const outcomes = await Promise.allSettled(allowed.map((subscription) =>
+			sendWebPush(subscription, payloadFor(subscription.pushId), vapid, { ttlSeconds, urgency: "high", nowMs: nowMs() })));
 		const gone: Array<{ userId: string; url: string; p256dh: string }> = [];
 		let failed = 0;
 		outcomes.forEach((outcome, index) => {
-			const { userId, url, p256dh } = subscriptions[index];
+			const { userId, url, p256dh } = allowed[index];
 			if (outcome.status === "fulfilled" && outcome.value.gone) gone.push({ userId, url, p256dh });
 			else if (outcome.status === "rejected" || outcome.value.status < 200 || outcome.value.status >= 300) failed++;
 		});
-		if (failed) console.warn(JSON.stringify({ event: "push_delivery_failed", failed, sent: subscriptions.length }));
+		if (failed) console.warn(JSON.stringify({ event: "push_delivery_failed", failed, sent: allowed.length }));
 		if (!gone.length) return;
 		try {
 			this.store.forgetPushSubscriptions(gone, nowMs());
@@ -3387,12 +3462,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!user) return;
 		const identity = user;
 		const shared = new Set(rooms);
+		// The user's own connections get `you`, with their mute (§4.11), read once.
+		let own: PublicUser | undefined;
 		for (const peer of this.ctx.getWebSockets()) {
 			const socket = peer as WebSocketConnection;
 			if (socket === origin) continue;
 			const state = connectionAttachment(socket);
 			if (!state) continue;
-			if (state.userId === identity.user_id) this.deliverTo(socket, { method: "user", params: { you: identity } });
+			if (state.userId === identity.user_id) {
+				own ??= state.tier === "registered" ? { ...identity, ...this.muteField(identity.user_id) } : identity;
+				this.deliverTo(socket, { method: "user", params: { you: own } });
+			}
 			else if (state.rooms?.some((id) => shared.has(id))) this.deliverTo(socket, { method: "user", params: { new: identity, ...(old ? { old } : {}) } });
 		}
 	}
