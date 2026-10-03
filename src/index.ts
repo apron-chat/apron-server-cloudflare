@@ -157,6 +157,12 @@ const PRIVATE_IDENTITY = { user_id: "~private", name: "System message to you" } 
  */
 const PING_REQUEST = '{"method":"ping"}';
 const PING_RESPONSE = '{"method":"pong"}';
+/**
+ * Methods the protocol defines only as notifications: one sent with an `id`
+ * is handled as the notification and gets no reply (§1). The liveness ping
+ * is answered with `pong`, a notification, not a reply.
+ */
+const NOTIFICATION_METHODS: ReadonlySet<string> = new Set(["ping", "activity", "status"]);
 /** Joined room IDs a connection attachment may carry: every room, with slack for removals in flight. */
 const MAX_ATTACHED_ROOMS = 2 * (MAX_THREAD_LIMIT + 1);
 /**
@@ -1332,7 +1338,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 			throw error;
 		}
-		const request = parsed.request;
+		// A method that is only a notification ignores an `id`, and is never
+		// answered with a result or an error (§1).
+		const request = NOTIFICATION_METHODS.has(parsed.request.method) && parsed.request.id !== undefined
+			? { ...parsed.request, id: undefined } : parsed.request;
 		try {
 			await this.dispatch(socket, current, request);
 		} catch (error) {
@@ -1421,14 +1430,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return;
 			case "status":
 				if (!this.config.push) break;
-				// A notification (§4.11): one sent with an `id` is processed the same
-				// way and never answered. A malformed value is never answered either,
-				// but counts as a policy violation.
-				try {
-					this.handleStatus(socket, attachment, request);
-				} catch (error) {
-					this.recordViolation(socket, errorToProtocol(error));
-				}
+				this.handleStatus(socket, attachment, request);
 				return;
 			case "push_register":
 				if (!this.config.push) break;
@@ -1446,8 +1448,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return;
 			case "ping":
 				// The exact ping bytes are answered by the runtime; a ping with other
-				// spacing reaches here and is answered too, before auth as well (§1).
-				if (request.id !== undefined) break;
+				// spacing, or with an `id` (ignored), reaches here and is answered with
+				// `pong` too, before auth as well (§1).
 				this.send(socket, JSON.parse(PING_RESPONSE));
 				return;
 		}
@@ -2355,7 +2357,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (typing !== undefined && (typeof roomId !== "string" || roomId.length === 0 || roomId.length > 64)) {
 			throw { name: "invalid_params", message: "room_id must be a room" } satisfies ProtocolError;
 		}
-		if (request.id !== undefined) this.reply(socket, request, {});
 		// A guest who only reads has nothing to be typing.
 		if (attachment.tier === "anonymous" && !this.config.guestPosting) return;
 		if (typing === undefined || typeof roomId !== "string" || !this.roomExists(roomId)) return;

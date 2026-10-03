@@ -216,11 +216,12 @@ describe('push over the socket', () => {
 			await subscribe(bob, 'bob');
 			const carolSub = await subscribe(carol, 'carol');
 			// Activity's `away` is not status: Bob stays attended.
-			expect((await request(bob, 'activity-away', 'activity', { away: true })).result).toEqual({});
+			bob.send({ method: 'activity', params: { away: true } });
+			await request(bob, 'sync-activity', 'me', {});
 			expect(await idleOf(bobId)).toEqual([false]);
 			// Nor do typing or a read cursor end idle.
 			await setIdle(carol, true);
-			expect((await request(carol, 'typing', 'activity', { room_id: 'general', typing: 2 })).result).toEqual({});
+			carol.send({ method: 'activity', params: { room_id: 'general', typing: 2 } });
 			carol.send({ method: 'activity', params: { room_id: 'general', read_message_id: '1' } });
 			expect(await idleOf(carolId)).toEqual([true]);
 			await post(alice, 'mention', { body: { text: 'hi', mentions: [bobId, carolId] } });

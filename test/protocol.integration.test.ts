@@ -173,9 +173,10 @@ it('answers the liveness ping before and after authentication', async () => {
 		// Other spacing reaches the handler, which answers it as well.
 		peer.socket.send('{ "method": "ping" }');
 		expect(await peer.next()).toEqual({ method: 'pong' });
-		// A ping request is not the liveness ping: before auth it is denied.
+		// `ping` is only a notification: an `id` is ignored, so it gets `pong`
+		// and no reply, before auth too (§1).
 		peer.send({ id: 'ping-request', method: 'ping' });
-		expect((await peer.next()).error.code).toBe(-32001);
+		expect(await peer.next()).toEqual({ method: 'pong' });
 		peer.send({ id: 'auth', method: 'auth', params: { scheme: 'guest' } });
 		expect((await peer.next()).result.you.user_id).toMatch(/^guest_/);
 		peer.socket.send('{"method":"ping"}');
@@ -467,8 +468,9 @@ it('leaves activity off when ACTIVITY is false: not advertised, and typing is no
 		await authenticate(alice);
 		await authenticate(bob);
 		alice.send({ method: 'activity', params: { room_id: 'general', typing: 5 } });
+		// `activity` is only a notification: one with an `id` gets no reply, even with activity off (§1).
 		alice.send({ id: 'typing-request', method: 'activity', params: { room_id: 'general', typing: 5 } });
-		expect((await until(alice, (frame) => frame.id === 'typing-request')).frame.error.code).toBe(-32601);
+		expect((await exchange(alice, 'after-typing', 'me', {})).skipped.filter((frame) => frame.id === 'typing-request')).toEqual([]);
 		alice.send({ id: 'after', method: 'message', params: { room_id: 'general', body: { text: 'no typing relayed' } } });
 		const done = await until(bob, (frame) => frame.method === 'message' && frame.params.body?.text === 'no typing relayed');
 		expect(done.skipped.filter((frame) => frame.method === 'activity')).toEqual([]);
