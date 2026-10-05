@@ -1005,7 +1005,7 @@ describe('push subscriptions in the store', () => {
 				registerUser(store, clock, userId);
 				store.registerPushSubscription({ userId, url: `https://push.example.net/${userId}`, ...keys, now: clock.value });
 			}
-			expect(store.setMute({ userId: 'mo', untilMs: clock.value + 90_500, now: clock.value })).toEqual({ changed: true, mute: 91 });
+			expect(store.setMute({ userId: 'mo', untilMs: clock.value + 90_500, now: clock.value })).toEqual({ changed: true, mute: 91, untilMs: clock.value + 90_500 });
 			expect(store.muteOf('mo', clock.value)).toBe(91);
 			const first = claim(store, clock, ['mo', 'ned']);
 			expect(first.subscriptions.map((row) => row.userId)).toEqual(['ned']);
@@ -1014,8 +1014,8 @@ describe('push subscriptions in the store', () => {
 			clock.value += 91_000;
 			expect(store.muteOf('mo', clock.value)).toBeUndefined();
 			expect(claim(store, clock, ['mo'], 'thread').subscriptions.map((row) => row.userId)).toEqual(['mo']);
-			expect(store.setMute({ userId: 'mo', untilMs: MUTE_FOREVER, now: clock.value })).toEqual({ changed: true, mute: true });
-			expect(store.setMute({ userId: 'mo', untilMs: MUTE_FOREVER, now: clock.value })).toEqual({ changed: false, mute: true });
+			expect(store.setMute({ userId: 'mo', untilMs: MUTE_FOREVER, now: clock.value })).toEqual({ changed: true, mute: true, untilMs: MUTE_FOREVER });
+			expect(store.setMute({ userId: 'mo', untilMs: MUTE_FOREVER, now: clock.value })).toEqual({ changed: false, mute: true, untilMs: MUTE_FOREVER });
 			clock.value += 400 * 86_400_000;
 			expect(store.muteOf('mo', clock.value)).toBe(true);
 			// No identity, no mute.

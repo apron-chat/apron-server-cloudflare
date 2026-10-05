@@ -294,7 +294,7 @@ it('upgrades a schema 6 store in place: roles move into identities, and nothing 
 	});
 });
 
-it('upgrades a schema 7 store in place: it gains the push tables, and nothing else changes', async () => {
+it('upgrades a schema 7 store in place: it gains the push and user status tables, and nothing else changes', async () => {
 	const stub = env.DEMO.getByName(`schema-upgrade-7-${crypto.randomUUID()}`);
 	const now = Date.now();
 	const head = await runInDurableObject(stub, async (instance, state) => {
@@ -308,9 +308,10 @@ it('upgrades a schema 7 store in place: it gains the push tables, and nothing el
 			userId: 'kept_user', ipKey: 'ip-kept_user', requestId: 'kept', method: 'message', now,
 			identity: { user_id: 'kept_user' }, params: { room_id: 'general', body: { text: 'kept' } },
 		});
-		// Schema 7 has no push registrations or wake times.
+		// Schema 7 has no push registrations, wake times, or user status.
 		sql.exec('DROP TABLE push_subscriptions');
 		sql.exec('DROP TABLE push_wakes');
+		sql.exec('DROP TABLE user_status');
 		sql.exec("UPDATE _meta SET value = '7' WHERE key = 'schema_version'");
 		sql.exec('UPDATE maintenance SET schema_version = 7 WHERE id = 1');
 		return store.getRoomState().latest_log_id;
@@ -324,10 +325,15 @@ it('upgrades a schema 7 store in place: it gains the push tables, and nothing el
 		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
 		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(SCHEMA_VERSION);
 		const indexes = (table: string) => sql.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?", table).toArray().map((row) => row.name);
-		expect(indexes('push_subscriptions')).toEqual(expect.arrayContaining(['push_subscriptions_user_idx', 'push_subscriptions_updated_idx']));
+		expect(indexes('push_subscriptions')).toEqual(expect.arrayContaining(['push_subscriptions_user_idx', 'push_subscriptions_updated_idx', 'push_subscriptions_waking_idx']));
+		// The waking-registration index is partial: registrations that wake for nothing are not in it.
+		expect(sql.exec<{ sql: string }>("SELECT sql FROM sqlite_master WHERE name = 'push_subscriptions_waking_idx'").one().sql).toMatch(/WHERE wake != 0$/);
 		expect(indexes('push_wakes')).toContain('push_wakes_woken_idx');
+		expect(sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('user_status') ORDER BY cid").toArray().map((row) => row.name)).toEqual(['user_id', 'mute_until_ms', 'invisible']);
+		expect(sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mutes'").toArray()).toEqual([]);
 		expect(store.getRoomState().latest_log_id).toBe(head);
 		expect(store.getIdentity('kept_user')?.name).toBe('Kept');
 		expect(store.pushSubscriptionsOf('kept_user')).toEqual([]);
+		expect(store.statusInputs('kept_user', true)).toEqual({ invisible: false });
 	});
 });

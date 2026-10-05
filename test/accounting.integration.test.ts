@@ -360,7 +360,7 @@ describe('measured storage accounting', () => {
 		const stub = env.DEMO.getByName('accounting-room-list-v2');
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, defaultStoreConfig(), clock);
+			const store = new Store(state, defaultStoreConfig({ push: { ...PUSH_POLICY! } }), clock);
 			store.initialize();
 			state.storage.transactionSync(() => {
 				for (let index = 1; index <= 100; index += 1) {
@@ -413,9 +413,124 @@ describe('measured storage accounting', () => {
 			const memberListing = costSince(store, beforeMembers);
 			expect([...members.values()].every((list) => list.length === DEFAULT_LIMITS.roomListMembers)).toBe(true);
 			expectWithinReserve(memberListing);
-			return { rooms: rooms.length, ...listing, registration, join, memberListing };
+			// With status (full presence), at its worst: every member muted and
+			// invisible, with as many registrations as a user may hold, the latest
+			// waking for messages and the rest for nothing.
+			state.storage.transactionSync(() => {
+				for (let index = 1; index <= DEFAULT_LIMITS.roomListMembers; index += 1) {
+					state.storage.sql.exec('INSERT INTO user_status (user_id, mute_until_ms, invisible) VALUES (?, ?, 1)', `member-${index}`, clock.now() + HOUR);
+					for (let registration = 0; registration < PUSH_POLICY!.subscriptionsPerUser; registration += 1) {
+						state.storage.sql.exec(
+							'INSERT INTO push_subscriptions (user_id, url, p256dh, auth, wake, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?)',
+							`member-${index}`, `https://push.example.net/member-${index}/${registration}`, 'p', 'a', registration === 0 ? 3 : 0, clock.now() - registration, clock.now() - registration,
+						);
+					}
+				}
+			});
+			const beforeStatus = snapshot(store);
+			const withStatus = store.roomMembers(rooms.map((room) => room.room_id), DEFAULT_LIMITS.roomListMembers, clock.now(), undefined, true);
+			const statusListing = costSince(store, beforeStatus);
+			expect(withStatus.get('general')?.find((member) => member.user_id === 'member-1')?.status).toEqual({ muteUntil: clock.now() + HOUR, invisible: true, pushUntil: clock.now() + PUSH_POLICY!.pushExpiryDays * DAY });
+			expectWithinReserve(statusListing);
+			expect(store.accountingStatus().unsafe).toBe(false);
+			return { rooms: rooms.length, ...listing, registration, join, memberListing, statusListing };
 		});
 		console.info('accounting-room-list', JSON.stringify(result));
+	});
+
+	it('measures member listings with status by population, and reuses a listing until a write', async () => {
+		const stub = env.DEMO.getByName('accounting-member-status-v1');
+		const result = await runInDurableObject(stub, async (_instance, state) => {
+			const clock = new FakeClock(futureUtcNoon());
+			const store = new Store(state, defaultStoreConfig({ push: { ...PUSH_POLICY! }, memberCacheMs: MINUTE }), clock);
+			store.initialize();
+			const members = DEFAULT_LIMITS.roomListMembers;
+			// Four rooms of `members` registered members each: none with status
+			// state; each with two live waking registrations; a mix (a third with
+			// push, a tenth muted, one in thirty invisible); and the worst case,
+			// every member muted and invisible with a full set of registrations,
+			// only the latest waking for messages.
+			const populations = ['none', 'push', 'mixed', 'worst'] as const;
+			state.storage.transactionSync(() => {
+				for (const population of populations) {
+					for (let index = 0; index < members; index += 1) {
+						const userId = `${population}-${String(index).padStart(3, '0')}`;
+						state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES (?, ?, ?, 'registered', 0, 0)", userId, `handle-${userId}`, userId);
+						state.storage.sql.exec('INSERT INTO memberships (room_id, user_id) VALUES (?, ?)', population, userId);
+						const register = (count: number, wake: (registration: number) => number) => {
+							for (let registration = 0; registration < count; registration += 1) {
+								state.storage.sql.exec(
+									'INSERT INTO push_subscriptions (user_id, url, p256dh, auth, wake, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?)',
+									userId, `https://push.example.net/${userId}/${registration}`, 'p', 'a', wake(registration), clock.now() - registration, clock.now() - registration,
+								);
+							}
+						};
+						if (population === 'push') register(2, () => 3);
+						if (population === 'mixed' && index % 3 === 0) register(2, () => 3);
+						if (population === 'mixed' && (index % 10 === 0 || index % 30 === 1)) {
+							state.storage.sql.exec('INSERT INTO user_status (user_id, mute_until_ms, invisible) VALUES (?, ?, ?)', userId, index % 10 === 0 ? clock.now() + HOUR : null, index % 30 === 1 ? 1 : 0);
+						}
+						if (population === 'worst') {
+							state.storage.sql.exec('INSERT INTO user_status (user_id, mute_until_ms, invisible) VALUES (?, ?, 1)', userId, clock.now() + HOUR);
+							register(PUSH_POLICY!.subscriptionsPerUser, (registration) => registration === 0 ? 3 : 0);
+						}
+					}
+				}
+			});
+			// Rows written behind the store's back: start from nothing kept.
+			(store as unknown as { memberCache: Map<string, unknown> }).memberCache.clear();
+			const listing: Record<string, { plain: Cost; status: Cost; perMember: number }> = {};
+			for (const population of populations) {
+				(store as unknown as { memberCache: Map<string, unknown> }).memberCache.clear();
+				const beforePlain = snapshot(store);
+				store.roomMembers([population], members, clock.now());
+				const plain = costSince(store, beforePlain);
+				(store as unknown as { memberCache: Map<string, unknown> }).memberCache.clear();
+				const beforeStatus = snapshot(store);
+				store.roomMembers([population], members, clock.now(), undefined, true);
+				const status = costSince(store, beforeStatus);
+				expectWithinReserve(plain);
+				expectWithinReserve(status);
+				listing[population] = { plain, status, perMember: (status.observed.reads - plain.observed.reads) / members };
+			}
+			// Status adds about one read per member, two at worst, against the two each costs already.
+			expect(listing.none.perMember).toBeLessThanOrEqual(1.1);
+			expect(listing.worst.perMember).toBeLessThanOrEqual(2.1);
+
+			// A listing again within memberCacheMs reads nothing and reserves nothing.
+			store.roomMembers(['mixed'], members, clock.now(), undefined, true);
+			const beforeReuse = snapshot(store);
+			const reused = store.roomMembers(['mixed'], members, clock.now(), undefined, true);
+			const reuse = costSince(store, beforeReuse);
+			expect(reuse.observed).toEqual({ reads: 0, writes: 0, operations: 0 });
+			expect(reuse.reserved.reads).toBe(0);
+			// Kept rows are judged against the time of each call: a mute ends without a read.
+			const muted = reused.get('mixed')!.find((member) => member.user_id === 'mixed-000')!;
+			expect(muted.status?.muteUntil).toBe(clock.now() + HOUR);
+			clock.set(clock.now() + HOUR);
+			const later = store.roomMembers(['mixed'], members, clock.now() - HOUR + MINUTE - 1, undefined, true);
+			expect(later.get('mixed')!.find((member) => member.user_id === 'mixed-000')!.status?.muteUntil).toBe(clock.now());
+			// A different variant is a different listing.
+			const beforePlainAgain = snapshot(store);
+			store.roomMembers(['mixed'], members, clock.now() - HOUR, undefined, false);
+			expect(costSince(store, beforePlainAgain).observed.reads).toBeGreaterThan(0);
+			// Any write to what a listing read ends the reuse.
+			store.registerIdentity({
+				userId: 'writer', name: 'Writer', userHandle: 'writer-handle', now: clock.now(), ipKey: 'writer-ip',
+				credential: { credentialId: 'writer-credential', userId: 'writer', publicKey: 'key', counter: 0 },
+			});
+			const beforeWrite = snapshot(store);
+			store.roomMembers(['mixed'], members, clock.now(), undefined, true);
+			const afterWrite = costSince(store, beforeWrite);
+			expect(afterWrite.observed.reads).toBeGreaterThan(2 * members);
+			// And so does time: past memberCacheMs it is read again.
+			const beforeExpiry = snapshot(store);
+			store.roomMembers(['mixed'], members, clock.now() + MINUTE, undefined, true);
+			expect(costSince(store, beforeExpiry).observed.reads).toBeGreaterThan(2 * members);
+			expect(store.accountingStatus().unsafe).toBe(false);
+			return { listing, reuse };
+		});
+		console.info('accounting-member-status', JSON.stringify(result));
 	});
 
 	it('keeps a 50-record history page across record kinds within its reservation', async () => {
@@ -687,6 +802,10 @@ describe('measured storage accounting', () => {
 			expect(measure('push wake claim, 31 unsubscribed candidates first', () => store.claimPushes({ senderId: 'matrix-sender', roomId: 'matrix-room', candidates: [...unsubscribed, 'matrix-user'].map((userId) => ({ userId, reasons: WAKE_SCOPES.mentions })), now: clock.now() })).subscriptions).toHaveLength(1);
 			measure('mute set', () => store.setMute({ userId: 'matrix-user', untilMs: clock.now() + 3_600_000, now: clock.now() }));
 			expect(measure('mute read', () => store.muteOf('matrix-user', clock.now()))).toBe(3_600);
+			measure('invisible set', () => store.setInvisible({ userId: 'matrix-user', invisible: true, now: clock.now() }));
+			expect(measure('status inputs at sign-in (full)', () => store.statusInputs('matrix-user', true, clock.now()))).toEqual({ muteUntil: clock.now() + 3_600_000, invisible: true, pushUntil: expect.any(Number) });
+			expect(measure('status inputs at sign-in (connected)', () => store.statusInputs('matrix-user', false, clock.now()))).toEqual({ muteUntil: clock.now() + 3_600_000, invisible: true });
+			store.setInvisible({ userId: 'matrix-user', invisible: false, now: clock.now() });
 			store.setMute({ userId: 'matrix-user', untilMs: null, now: clock.now() });
 			measure('push sender charge', () => store.chargePushSender('matrix-sender', 2, clock.now()));
 			measure('push registrations clear', () => store.clearPushSubscriptions('matrix-other', clock.now()));
@@ -737,13 +856,15 @@ describe('measured storage accounting', () => {
 			measure('room join lookup', () => store.getRoom(threadId));
 			measure('room listing', () => store.listRooms(clock.now()));
 			measure('room members (general and one thread)', () => store.roomMembers(['general', threadId], DEFAULT_LIMITS.roomListMembers, clock.now()));
+			measure('room members with status (general and one thread)', () => store.roomMembers(['general', threadId], DEFAULT_LIMITS.roomListMembers, clock.now(), undefined, true));
 			measure('admission snapshot', () => store.admission());
 			clock.set(clock.now() + DAY + HOUR + 1);
 			measure('cleanup', () => store.runCleanup(clock.now()));
 			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
 			expect(create.result.message_id).toBeTruthy();
-			expect(costs).toHaveLength(41);
+			expect(costs).toHaveLength(45);
+			expect(store.accountingStatus().unsafe).toBe(false);
 			return { costs };
 		});
 		console.info('accounting-operation-matrix', JSON.stringify(result));
@@ -784,6 +905,11 @@ describe('measured storage accounting', () => {
 				roomMembers: explain(sql, `EXPLAIN QUERY PLAN
 					SELECT m.user_id, i.name FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id
 					WHERE m.room_id = ? ORDER BY m.user_id LIMIT ?`, 'general', 100),
+				roomMembersWithStatus: explain(sql, `EXPLAIN QUERY PLAN
+					SELECT m.user_id, i.name, s.mute_until_ms, s.invisible,
+					  (SELECT MAX(p.updated_ms) FROM push_subscriptions p INDEXED BY push_subscriptions_waking_idx WHERE p.user_id = m.user_id AND p.wake != 0) AS push_latest
+					FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id LEFT JOIN user_status s ON s.user_id = m.user_id
+					WHERE m.room_id = ? ORDER BY m.user_id LIMIT ?`, 'general', 100),
 				userRooms: explain(sql, `EXPLAIN QUERY PLAN
 					SELECT m.room_id FROM memberships m INDEXED BY memberships_user_idx
 					JOIN rooms r ON r.room_id = m.room_id
@@ -805,5 +931,9 @@ describe('measured storage accounting', () => {
 		expect(result.plans.roomMembers.some((detail) => /SEARCH m USING .*autoindex_memberships/i.test(detail))).toBe(true);
 		expect(result.plans.roomMembers.some((detail) => /TEMP B-TREE/i.test(detail))).toBe(false);
 		expect(result.plans.userRooms.some((detail) => /memberships_user_idx/i.test(detail))).toBe(true);
+		// Status adds a primary-key lookup and one probe of the partial index of waking registrations.
+		expect(result.plans.roomMembersWithStatus.some((detail) => /SEARCH s USING INDEX sqlite_autoindex_user_status_1/i.test(detail))).toBe(true);
+		expect(result.plans.roomMembersWithStatus.some((detail) => /push_subscriptions_waking_idx/i.test(detail))).toBe(true);
+		expect(result.plans.roomMembersWithStatus.some((detail) => /TEMP B-TREE/i.test(detail))).toBe(false);
 	});
 });
