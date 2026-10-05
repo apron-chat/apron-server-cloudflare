@@ -2536,20 +2536,24 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * `status` (§4.11), a notification: unscoped `idle`, `mute` and
-	 * `invisible`, the last kept with presence off too. `idle` marks this connection unattended (true)
-	 * or attended (false), kept in the attachment, so it survives
-	 * hibernation; only `idle: false` ends it, and closing removes the
-	 * connection. `mute` is the user's: seconds to stay quiet (cut to
-	 * MAX_MUTE_SECONDS), `true` until changed, or `0` to end it. `invisible`
-	 * is the user's too: others see them `offline`, and connected member
-	 * listings leave them out, presence on or off. Both are stored, so they
-	 * outlast the connection, and echoed in `you` to the user's connections
-	 * when they change. Guests get no pushes and appear only while connected,
-	 * so their `mute` and `invisible` are ignored. All may come before
-	 * authentication: `idle` applies at once, `mute` and `invisible` once the
-	 * connection signs in as a registered user. With `room_id`, `mute` is the
-	 * room's, which this server does not implement, and a scoped `idle` or
-	 * `invisible` is ignored, so such an update changes nothing. Unknown
+	 * `invisible`, the last kept with presence off too. `idle` marks this
+	 * connection unattended (true) or attended (false), kept in the
+	 * attachment, so it survives hibernation; only `idle: false` ends it,
+	 * and closing removes the connection. `mute` is the user's: seconds to
+	 * stay quiet (cut to MAX_MUTE_SECONDS), `true` until changed, or `0` to
+	 * end it. `invisible` is the user's too: others see them `offline`, and
+	 * connected member listings leave them out, presence on or off. Both are
+	 * stored, so they outlast the connection, and each change is echoed in
+	 * `you` to the user's other connections; the sending connection gets the
+	 * resulting values after every unscoped `mute` or `invisible`, changed
+	 * or not (echoResult). Guests get no pushes and appear only while
+	 * connected, so their `mute` and `invisible` are ignored (§4.11 lets a
+	 * server ignore them). All may come before authentication: `idle`
+	 * applies at once, `mute` and `invisible` once the connection signs in
+	 * as a registered user, whose auth result carries them. With `room_id`,
+	 * `mute` is the room's, which this server ignores (§4.11: servers MAY
+	 * ignore a `mute`), and a scoped `idle` or `invisible` is ignored by
+	 * rule, so such an update changes nothing and is not echoed. Unknown
 	 * fields and invalid values are ignored, each on its own.
 	 */
 	private handleStatus(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): void {
@@ -2583,12 +2587,38 @@ export class ApronDemoServer extends DurableObject<Env> {
 			writeAttachment(socket, state);
 			return;
 		}
-		if (attachment.tier !== "registered") return;
-		// Each change writes rows: past `mutesPerUserMinute` a user's changes
-		// (mute and invisible together) are dropped, quietly, as invalid fields are.
 		const now = nowMs();
-		if (validMute && this.muteChanges.take(attachment.userId!, now)) this.changeMute(attachment.userId!, mute as number | true, now);
-		if (invisible !== undefined && this.muteChanges.take(attachment.userId!, now)) this.changeInvisible(attachment.userId!, invisible, now);
+		if (attachment.tier === "registered") {
+			// Each change writes rows: past `mutesPerUserMinute` a user's changes
+			// (mute and invisible together) are dropped, as invalid fields are.
+			// Each change is echoed to the user's other connections here.
+			let changed = false;
+			if (validMute && this.muteChanges.take(attachment.userId!, now)) changed = this.changeMute(attachment.userId!, mute as number | true, now, socket) || changed;
+			if (invisible !== undefined && this.muteChanges.take(attachment.userId!, now)) changed = this.changeInvisible(attachment.userId!, invisible, now, socket) || changed;
+			this.echoResult(socket, now, changed);
+		} else if (attachment.tier === "anonymous") {
+			// A guest's are ignored: the echo tells the client so.
+			this.echoResult(socket, now, false);
+		}
+	}
+
+	/**
+	 * After a `status` that carries an unscoped `mute` or `invisible`, tells
+	 * the sending connection the resulting values, changed or not (§4.11):
+	 * `user` `you` with `mute` (seconds left, `true`, or `0`) and `invisible`
+	 * (`false` when not set), so a change dropped by `mutesPerUserMinute`,
+	 * a mute cut to MAX_MUTE_SECONDS, or a guest's ignored change is not
+	 * left for the client to guess. `changed`: the user's own `status` is
+	 * included with presence on, as the echo to their other connections
+	 * carried it; otherwise it is left out, which leaves it unchanged.
+	 */
+	private echoResult(socket: WebSocketConnection, now: number, changed: boolean): void {
+		const state = connectionAttachment(socket);
+		const user = state && !state.closing ? this.current(state) : null;
+		if (!state || !user) return;
+		const own = state.tier === "registered" ? this.ownStatusFields(state) : {};
+		const status = changed && this.presenceMode() ? this.deriveConnected(this.liveStatesOf(user.user_id), now).self : undefined;
+		this.deliverTo(socket, { method: "user", params: { you: { ...user, ...(status ? { status } : {}), mute: own.mute ?? 0, invisible: own.invisible === true } } });
 	}
 
 	/**
@@ -2597,18 +2627,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * of their connections and, on a change, sends `user` `you` with the
 	 * result to every connection of theirs but `except` (§4.11): the seconds
 	 * left, `true`, or `0` once ended, with their `status`. Others see only
-	 * `dnd` (announceStatus).
+	 * `dnd` (announceStatus). Whether it changed anything.
 	 */
-	private changeMute(userId: string, mute: number | true, now: number, except?: WebSocketConnection): void {
+	private changeMute(userId: string, mute: number | true, now: number, except?: WebSocketConnection): boolean {
 		const untilMs = mute === true ? MUTE_FOREVER : mute === 0 ? null : now + Math.min(mute, MAX_MUTE_SECONDS) * 1_000;
 		const result = this.store.setMute({ userId, untilMs, now });
-		if (!result.changed) return;
+		if (!result.changed) return false;
 		this.cacheStatusInputs(userId, (state) => {
 			if (result.untilMs !== undefined) state.muteUntil = result.untilMs;
 			else delete state.muteUntil;
 		});
 		// A change that ended the mute is echoed as `mute: 0` (§4.11).
 		this.echoStatus(userId, { mute: result.mute ?? 0 }, now, except);
+		return true;
 	}
 
 	/**
@@ -2617,14 +2648,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * connection of theirs but `except`, with their `status`. Others see the
 	 * user `offline`: turning it on is announced at once, without waiting
 	 * for `statusCoalesceSeconds`, so nobody keeps seeing them online.
+	 * Whether it changed anything.
 	 */
-	private changeInvisible(userId: string, invisible: boolean, now: number, except?: WebSocketConnection): void {
-		if (!this.store.setInvisible({ userId, invisible, now }).changed) return;
+	private changeInvisible(userId: string, invisible: boolean, now: number, except?: WebSocketConnection): boolean {
+		if (!this.store.setInvisible({ userId, invisible, now }).changed) return false;
 		this.cacheStatusInputs(userId, (state) => {
 			if (invisible) state.invisible = true;
 			else delete state.invisible;
 		});
 		this.echoStatus(userId, { invisible }, now, except, invisible);
+		return true;
 	}
 
 	/** Applies `change` to the cached status inputs on each of a user's connections. */

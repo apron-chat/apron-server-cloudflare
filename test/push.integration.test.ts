@@ -1,7 +1,7 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PUSH_POLICY } from '../src/budget';
-import { MUTE_FOREVER, WAKE_SCOPES, type PushSubscriptionRecord, type Store } from '../src/store';
+import { MAX_MUTE_SECONDS, MUTE_FOREVER, WAKE_SCOPES, type PushSubscriptionRecord, type Store } from '../src/store';
 import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
 import { withStore, type TestClock } from './helpers/store';
 import { decryptPush, testBrowser, type TestBrowser } from './helpers/webpush';
@@ -621,6 +621,47 @@ describe('push review fixes', () => {
 			expect((await request(guest, 'still-open', 'me', {})).result.you).toBeTruthy();
 			expect(guest.closed()).toBeUndefined();
 		} finally { guest.close(); }
+	});
+
+	it('echoes the resulting mute and invisible to the sending connection after each, changed or not (§4.11)', async () => {
+		const drainTo = async (peer: Peer, id: string) => (await exchange(peer, id, 'me', {})).skipped;
+		const youOf = (frames: Frame[]) => frames.filter((frame) => frame.method === 'user' && frame.params.you).map((frame) => frame.params.you);
+		const userId = unique('echo');
+		const peer = await signedIn(userId);
+		const other = await signedIn(userId, true);
+		const guest = await connect();
+		try {
+			await guest.next();
+			await request(guest, 'guest', 'auth', { scheme: 'guest' });
+			// Cut to a year: the sender learns the mute it got.
+			peer.send({ method: 'status', params: { mute: 10 * MAX_MUTE_SECONDS } });
+			const capped = youOf(await drainTo(peer, 'sync-cap'));
+			expect(capped).toHaveLength(1);
+			expect(capped[0]).toMatchObject({ user_id: userId, invisible: false });
+			expect(capped[0].mute).toBeLessThanOrEqual(MAX_MUTE_SECONDS);
+			expect(capped[0].mute).toBeGreaterThan(MAX_MUTE_SECONDS - 10);
+			// The other connection hears the change alone.
+			const heard = youOf(await drainTo(other, 'sync-other-cap'));
+			expect(heard).toHaveLength(1);
+			expect(heard[0]).not.toHaveProperty('invisible');
+			// No change: the sender is still told the values; nobody else hears anything.
+			peer.send({ method: 'status', params: { invisible: false } });
+			const unchanged = youOf(await drainTo(peer, 'sync-same'));
+			expect(unchanged).toHaveLength(1);
+			expect(unchanged[0]).toMatchObject({ invisible: false, mute: expect.any(Number) });
+			expect(youOf(await drainTo(other, 'sync-other-same'))).toEqual([]);
+			// Both at once: one echo to the sender with both results; each change to the others.
+			peer.send({ method: 'status', params: { mute: 0, invisible: true } });
+			expect(youOf(await drainTo(peer, 'sync-both'))).toEqual([expect.objectContaining({ mute: 0, invisible: true })]);
+			expect(youOf(await drainTo(other, 'sync-other-both'))).toEqual([expect.objectContaining({ mute: 0 }), expect.objectContaining({ invisible: true })]);
+			// idle alone and a scoped mute are not echoed.
+			peer.send({ method: 'status', params: { idle: true } });
+			peer.send({ method: 'status', params: { room_id: 'general', mute: true } });
+			expect(youOf(await drainTo(peer, 'sync-idle'))).toEqual([]);
+			// A guest's are ignored, and the echo says so.
+			guest.send({ method: 'status', params: { mute: true, invisible: true } });
+			expect(youOf(await drainTo(guest, 'sync-guest'))).toEqual([expect.objectContaining({ mute: 0, invisible: false })]);
+		} finally { peer.close(); other.close(); guest.close(); }
 	});
 
 	it('times a mute sent before sign-in from when it applies', async () => {

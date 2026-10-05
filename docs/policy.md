@@ -88,7 +88,9 @@ within it:
   idle after ten minutes without a frame. `{"mute": 3600}` (or `true`, until
   changed) stops a signed-in user's pushes; `{"mute": 0}` ends it. The mute
   shows in the user's own `you` while set, and each change is echoed to all
-  their connections (an ended mute as `mute: 0`); it is never shown to
+  their connections (an ended mute as `mute: 0`); the connection that sent
+  it is told the resulting mute and invisible every time, even when nothing
+  changed (a guest's, or one past the limit); it is never shown to
   others. Room-scoped status and invalid values are ignored, and a `status`
   with an `id` gets no reply. Status may be sent before signing in.
 - User status (presence, with push): others see each user's `status`

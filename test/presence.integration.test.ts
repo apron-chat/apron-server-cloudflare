@@ -457,22 +457,35 @@ describe('user status shown to others (full presence)', () => {
 			expect(told(await drain(watcher), userId)).toEqual([]);
 			expect(await listed(watcher, userId)).toMatchObject({ status: 'offline' });
 			// A guest's invisible is ignored: guests are seen only while connected.
+			// The echo says so, with the resulting values (§4.11).
 			const ignored = await status(visitor, { invisible: true });
-			expect(ignored.filter((frame) => frame.method === 'user')).toEqual([]);
+			expect(ignored.filter((frame) => frame.method === 'user').map((frame) => frame.params)).toEqual([
+				{ you: { user_id: visitorId, name: expect.any(String), mute: 0, invisible: false } },
+			]);
 			expect((await request(visitor, 'me', 'me', {})).result.you).not.toHaveProperty('invisible');
 			// A scoped invisible changes nothing.
 			await status(early, { room_id: 'general', invisible: false });
 			expect((await request(early, 'me', 'me', {})).result.you.invisible).toBe(true);
-			// Mute and invisible changes share mutesPerUserMinute; past it, both are dropped.
-			let echoes = 0;
+			// Mute and invisible changes share mutesPerUserMinute; past it, both
+			// are dropped. The sender is told the resulting values after each,
+			// changed or not, with its status only after a change (§4.11).
+			const echoes: Array<Record<string, unknown>> = [];
 			for (let index = 0; index < PUSH_POLICY!.mutesPerUserMinute; index++) {
 				const frames = await status(early, index % 2 ? { mute: index } : { invisible: index % 4 === 0 });
-				echoes += frames.filter((frame) => frame.method === 'user' && frame.params.you).length;
+				echoes.push(...frames.filter((frame) => frame.method === 'user' && frame.params.you).map((frame) => frame.params.you));
 			}
+			expect(echoes).toHaveLength(PUSH_POLICY!.mutesPerUserMinute);
+			// The first was a no-op (already invisible): its echo has no status.
+			expect(echoes[0]).toMatchObject({ invisible: true, mute: 0 });
+			expect(echoes[0]).not.toHaveProperty('status');
+			expect(echoes[1]).toMatchObject({ invisible: true, mute: 1, status: 'dnd' });
 			const dropped = await status(early, { mute: 0, invisible: true });
-			expect(dropped.filter((frame) => frame.method === 'user' && frame.params.you)).toEqual([]);
-			// The first was a no-op (already invisible), so one fewer echo than changes.
-			expect(echoes).toBe(PUSH_POLICY!.mutesPerUserMinute - 1);
+			const last = echoes[echoes.length - 1];
+			const kept = dropped.filter((frame) => frame.method === 'user' && frame.params.you).map((frame) => frame.params.you);
+			expect(kept).toEqual([{ user_id: userId, name: `Name of ${userId}`, roles: [], mute: expect.any(Number), invisible: last.invisible }]);
+			// The dropped mute: 0 left the mute running.
+			expect(kept[0].mute).toBeGreaterThan(0);
+			expect(kept[0].mute).toBeLessThanOrEqual(last.mute as number);
 			expect(told(await drain(visitor), visitorId)).toEqual([]);
 		} finally { watcher.close(); early.close(); visitor.close(); }
 	});
