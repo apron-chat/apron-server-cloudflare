@@ -9,10 +9,23 @@ export type ConnectOptions = {
 	origin?: string | null;
 	path?: string;
 	host?: string;
+	/**
+	 * Keep the frames that only tell another user's `status` (§4.11): `user`
+	 * `{"new": {"user_id", "status"}}`, which every connection gets as others
+	 * sign in, change, and leave. Left out by default, for tests about
+	 * anything else.
+	 */
+	statuses?: boolean;
 };
 
+/** Whether a frame only tells another user's `status` (§4.11). */
+export function statusOnly(frame: Frame): boolean {
+	const user = frame.method === "user" && !frame.params?.old ? frame.params?.new : undefined;
+	return !!user && Object.keys(frame.params).length === 1 && Object.keys(user).sort().join() === "status,user_id";
+}
+
 /** Opens a WebSocket to the Worker and queues its frames for `next()`. */
-export async function connect({ ip, origin = "http://localhost:5173", path = "/ws", host = "demo.test" }: ConnectOptions) {
+export async function connect({ ip, origin = "http://localhost:5173", path = "/ws", host = "demo.test", statuses = false }: ConnectOptions) {
 	const response = await SELF.fetch(`https://${host}${path}`, { headers: {
 		Upgrade: "websocket", ...(origin === null ? {} : { Origin: origin }), "CF-Connecting-IP": ip,
 	} });
@@ -23,6 +36,7 @@ export async function connect({ ip, origin = "http://localhost:5173", path = "/w
 	let closed: { code: number; reason: string } | undefined;
 	socket.addEventListener("message", (event) => {
 		const frame = JSON.parse(String(event.data));
+		if (!statuses && statusOnly(frame)) return;
 		const waiter = waiters.shift();
 		if (waiter) waiter(frame); else frames.push(frame);
 	});

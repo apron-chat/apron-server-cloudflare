@@ -157,9 +157,9 @@ it('/rename moves a registered user, their passkey, rooms and admin status to a 
 	try {
 		expect((await command(admin, 'grant', `/admin ${fromId}`)).frame.result).toEqual({});
 		// A role change is a profile change (§3.3): the new admin and a room-mate hear of it.
-		const granted = await until(dave, (frame) => frame.method === 'user');
-		expect(granted.frame.params).toEqual({ you: { user_id: fromId, name: `Name of ${fromId}`, roles: ['admin'] } });
-		const seen = await until(erin, (frame) => frame.method === 'user' && frame.params.new?.user_id === fromId);
+		const granted = await until(dave, (frame) => frame.method === 'user' && frame.params.you !== undefined);
+		expect(granted.frame.params).toEqual({ you: { user_id: fromId, name: `Name of ${fromId}`, roles: ['admin'], status: 'online' } });
+		const seen = await until(erin, (frame) => frame.method === 'user' && frame.params.new?.user_id === fromId && frame.params.new.roles !== undefined);
 		expect(seen.frame.params).toEqual({ new: { user_id: fromId, name: `Name of ${fromId}`, roles: ['admin'] } });
 		const before = await exchange(dave, 'before', 'message', { room_id: 'general', body: { text: 'before the rename' } });
 		const earlier: string = before.frame.result.message_id;
@@ -168,8 +168,8 @@ it('/rename moves a registered user, their passkey, rooms and admin status to a 
 		expect(renamed.frame.result).toEqual({});
 		expect(renamed.notice!.params.body.text).toBe(`Renamed \`${fromId}\` to \`${toId}\`.`);
 		// The user's connection becomes the new identity; a room-mate learns of the change (§3.3).
-		const you = await until(dave, (frame) => frame.method === 'user');
-		expect(you.frame.params).toEqual({ you: { user_id: toId, name: `Name of ${fromId}`, roles: ['admin'] } });
+		const you = await until(dave, (frame) => frame.method === 'user' && frame.params.you !== undefined);
+		expect(you.frame.params).toEqual({ you: { user_id: toId, name: `Name of ${fromId}`, roles: ['admin'], status: 'online' } });
 		const change = await until(erin, (frame) => frame.method === 'user' && frame.params.old?.user_id === fromId);
 		// The new user_id carries the status others were shown under the old one (§4.11).
 		expect(change.frame.params).toEqual({ new: { user_id: toId, name: `Name of ${fromId}`, roles: ['admin'], status: 'online' }, old: { user_id: fromId, name: `Name of ${fromId}` } });
@@ -573,13 +573,13 @@ it('/admin remove takes the admin role away, announced with roles: [] (§3.3)', 
 	const mate = await signedIn(unique('mate'));
 	try {
 		await command(admin, 'grant', `/admin ${userId}`);
-		await until(demoted, (frame) => frame.method === 'user');
-		await until(mate, (frame) => frame.method === 'user' && frame.params.new?.user_id === userId);
+		await until(demoted, (frame) => frame.method === 'user' && frame.params.you !== undefined);
+		await until(mate, (frame) => frame.method === 'user' && frame.params.new?.user_id === userId && frame.params.new.roles !== undefined);
 		const removed = await command(admin, 'demote', `/admin remove @${userId}`);
 		expect(removed.notice!.params.body.text).toMatch(/is no longer an admin/);
 		// An empty value means cleared: both the user and a room-mate drop the role.
-		expect((await until(demoted, (frame) => frame.method === 'user')).frame.params).toEqual({ you: { user_id: userId, name: `Name of ${userId}`, roles: [] } });
-		expect((await until(mate, (frame) => frame.method === 'user' && frame.params.new?.user_id === userId)).frame.params.new.roles).toEqual([]);
+		expect((await until(demoted, (frame) => frame.method === 'user' && frame.params.you !== undefined)).frame.params).toEqual({ you: { user_id: userId, name: `Name of ${userId}`, roles: [], status: 'online' } });
+		expect((await until(mate, (frame) => frame.method === 'user' && frame.params.new?.user_id === userId && frame.params.new.roles !== undefined)).frame.params.new.roles).toEqual([]);
 		expect((await command(demoted, 'status', '/status')).frame.error.code).toBe(-32001);
 		// A client that missed the notification clears the role from any current object, such as a listing's users.
 		const listed = await request(mate, 'list', 'room_list', { room_id: 'general', members: true });
@@ -603,8 +603,8 @@ it('/role shows a user\'s roles and toggles one, any name a label, admin also th
 		const given = await command(admin, 'give', `/role @${userId} Friend`);
 		expect(given.frame.result).toEqual({});
 		expect(given.notice!.params.body.text).toBe(`${who} now has the role \`friend\`.`);
-		expect((await until(labeled, (frame) => frame.method === 'user')).frame.params).toEqual({ you: { user_id: userId, name: `Name of ${userId}`, roles: ['friend'] } });
-		expect((await until(mate, (frame) => frame.method === 'user' && frame.params.new?.user_id === userId)).frame.params.new.roles).toEqual(['friend']);
+		expect((await until(labeled, (frame) => frame.method === 'user' && frame.params.you !== undefined)).frame.params).toEqual({ you: { user_id: userId, name: `Name of ${userId}`, roles: ['friend'], status: 'online' } });
+		expect((await until(mate, (frame) => frame.method === 'user' && frame.params.new?.user_id === userId && frame.params.new.roles !== undefined)).frame.params.new.roles).toEqual(['friend']);
 		// A label grants nothing.
 		expect((await command(labeled, 'status-label', '/status')).frame.error.code).toBe(-32001);
 
@@ -617,7 +617,7 @@ it('/role shows a user\'s roles and toggles one, any name a label, admin also th
 		// Toggling a held role takes it away.
 		expect((await command(admin, 'take', `/role ${userId} friend`)).notice!.params.body.text).toBe(`${who} no longer has the role \`friend\`.`);
 		await command(admin, 'take-admin', `/role ${userId} admin`);
-		const cleared = await until(labeled, (frame) => frame.method === 'user' && frame.params.you.roles.length === 0);
+		const cleared = await until(labeled, (frame) => frame.method === 'user' && frame.params.you?.roles?.length === 0);
 		expect(cleared.frame.params.you.roles).toEqual([]);
 		expect((await command(labeled, 'status-after', '/status')).frame.error.code).toBe(-32001);
 
@@ -649,7 +649,7 @@ it('/role <user_id> bot makes a token user a bot in full, but not a passkey hold
 		expect((await request(bot, 'auth', 'auth', { scheme: 'token', token })).result.you.roles).toEqual([]);
 
 		expect((await command(admin, 'make-bot', `/role ${userId} bot`)).notice!.params.body.text).toMatch(/now has the role `bot`/);
-		expect((await until(bot, (frame) => frame.method === 'user')).frame.params.you.roles).toEqual(['bot']);
+		expect((await until(bot, (frame) => frame.method === 'user' && frame.params.you !== undefined)).frame.params.you.roles).toEqual(['bot']);
 		// It acts as a bot: no passkey, no commands for owners, a fixed name and user_id, and never an admin.
 		expect((await command(bot, 'invite-bot', '/invite-bot')).frame.error.message).toBe("A bot can't use /invite-bot");
 		expect((await request(bot, 'rename-self', 'me', { name: 'Other' })).error.code).toBe(-32001);

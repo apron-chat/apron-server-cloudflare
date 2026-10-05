@@ -1,47 +1,54 @@
-// A user's `status` (protocol §4.11), derived from what the server knows
-// about them. Pure: the Durable Object gathers the inputs from connection
-// attachments and, for users without a connection, from storage.
+// A user's `status` (protocol §4.11): the value they choose with `me`, and
+// what others see of it. Pure: the Durable Object gathers the inputs from
+// connection attachments, and for users without a connection from storage.
 
-export type Status = "online" | "idle" | "dnd" | "offline";
+/** The `status` values a user may choose with `me` (§4.11): `online` is the default, `""` none. */
+export type StatusChoice = "online" | "" | "dnd" | "invisible";
 
-export const STATUSES: readonly Status[] = ["online", "idle", "dnd", "offline"];
+/** The `status` others see (§4.11). */
+export type Status = "online" | "idle" | "dnd" | "offline" | "";
+
+export const STATUS_CHOICES: readonly StatusChoice[] = ["online", "", "dnd", "invisible"];
+export const STATUSES: readonly Status[] = ["online", "idle", "dnd", "offline", ""];
+
+export function isStatusChoice(value: unknown): value is StatusChoice {
+	return typeof value === "string" && (STATUS_CHOICES as readonly string[]).includes(value);
+}
 
 export function isStatus(value: unknown): value is Status {
 	return typeof value === "string" && (STATUSES as readonly string[]).includes(value);
 }
 
+/**
+ * The choice a `me` `status` string makes: itself when this server supports
+ * it, else `""`, which servers set for a value they don't support (§4.11).
+ */
+export function statusChoice(value: string): StatusChoice {
+	return isStatusChoice(value) ? value : "";
+}
+
 export interface StatusInputs {
-	/** The user is `invisible`. */
-	invisible: boolean;
-	/** The unscoped `mute` is set (and not yet run out). */
-	muted: boolean;
+	/** What the user chose with `me`. */
+	choice: StatusChoice;
 	/** The user has a connection (authenticated, open, not stale). */
 	connected: boolean;
 	/** One of the user's connections is attended. */
 	attended: boolean;
-	/**
-	 * The user has a push registration that wakes for messages (§4.7). Only
-	 * decides a user without a connection; unknown counts as none.
-	 */
-	push: boolean;
 }
 
 /**
- * The first of these that applies (§4.11), for others or, with `forSelf`,
- * for the user's own `you`, which ignores `invisible`:
+ * What others see of a user (§4.11):
  *
- * 1. `offline`: the user is invisible;
- * 2. `dnd`: the unscoped mute is set and the user has a connection;
- * 3. `online`: a connection is attended;
- * 4. `idle`: a connection is idle, or the mute is not set and the user has
- *    a push registration that wakes for messages;
- * 5. `offline`.
+ * - `""` (none) whatever their connections, so it never tells whether they
+ *   are connected;
+ * - `invisible`: `offline`;
+ * - `dnd`: `dnd` while they have a connection, else `offline`;
+ * - `online`: `online` when a connection is attended, `idle` when connected
+ *   with none attended, `offline` with no connection.
  */
-export function deriveStatus(inputs: StatusInputs, forSelf = false): Status {
-	if (inputs.invisible && !forSelf) return "offline";
-	if (inputs.muted && inputs.connected) return "dnd";
-	if (inputs.connected && inputs.attended) return "online";
-	// Every connection of a connected user that is not attended is idle.
-	if (inputs.connected || (!inputs.muted && inputs.push)) return "idle";
-	return "offline";
+export function shownStatus(inputs: StatusInputs): Status {
+	if (inputs.choice === "") return "";
+	if (inputs.choice === "invisible" || !inputs.connected) return "offline";
+	if (inputs.choice === "dnd") return "dnd";
+	return inputs.attended ? "online" : "idle";
 }

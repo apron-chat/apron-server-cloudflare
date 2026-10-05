@@ -308,10 +308,11 @@ it('upgrades a schema 7 store in place: it gains the push and user status tables
 			userId: 'kept_user', ipKey: 'ip-kept_user', requestId: 'kept', method: 'message', now,
 			identity: { user_id: 'kept_user' }, params: { room_id: 'general', body: { text: 'kept' } },
 		});
-		// Schema 7 has no push registrations, wake times, or user status.
+		// Schema 7 has no push registrations, wake times, user status or room mutes.
 		sql.exec('DROP TABLE push_subscriptions');
 		sql.exec('DROP TABLE push_wakes');
 		sql.exec('DROP TABLE user_status');
+		sql.exec('DROP TABLE room_mutes');
 		sql.exec("UPDATE _meta SET value = '7' WHERE key = 'schema_version'");
 		sql.exec('UPDATE maintenance SET schema_version = 7 WHERE id = 1');
 		return store.getRoomState().latest_log_id;
@@ -329,11 +330,12 @@ it('upgrades a schema 7 store in place: it gains the push and user status tables
 		// The waking-registration index is partial: registrations that wake for nothing are not in it.
 		expect(sql.exec<{ sql: string }>("SELECT sql FROM sqlite_master WHERE name = 'push_subscriptions_waking_idx'").one().sql).toMatch(/WHERE wake != 0$/);
 		expect(indexes('push_wakes')).toContain('push_wakes_woken_idx');
-		expect(sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('user_status') ORDER BY cid").toArray().map((row) => row.name)).toEqual(['user_id', 'mute_until_ms', 'invisible']);
+		expect(sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('user_status') ORDER BY cid").toArray().map((row) => row.name)).toEqual(['user_id', 'status', 'mute_until_ms']);
+		expect(sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('room_mutes') ORDER BY cid").toArray().map((row) => row.name)).toEqual(['user_id', 'room_id', 'mute_until_ms']);
 		expect(sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mutes'").toArray()).toEqual([]);
 		expect(store.getRoomState().latest_log_id).toBe(head);
 		expect(store.getIdentity('kept_user')?.name).toBe('Kept');
 		expect(store.pushSubscriptionsOf('kept_user')).toEqual([]);
-		expect(store.statusInputs('kept_user', true)).toEqual({ invisible: false });
+		expect(store.statusInputs('kept_user')).toEqual({ choice: 'online', roomMutes: [] });
 	});
 });

@@ -387,7 +387,7 @@ describe('uploads end to end', () => {
 			expect(embed.write_url).toMatch(/^https:\/\/demo\.test\/w\/a\./);
 			expect((await put(embed.write_url, png())).status).toBe(204);
 			const you = (await until(peer, (frame) => frame.method === 'user')).frame.params.you;
-			expect(you).toEqual({ user_id: userId, name: `Name of ${userId}`, avatar: expect.stringMatching(/^https:\/\/media\.test\/a\//), roles: [] });
+			expect(you).toEqual({ user_id: userId, name: `Name of ${userId}`, avatar: expect.stringMatching(/^https:\/\/media\.test\/a\//), roles: [], status: 'online' });
 			expect((await request(peer, 'me', 'me', {})).result.you.avatar).toBe(you.avatar);
 			// A message's author is a recorded object, without the avatar.
 			const posted = await exchange(peer, 'post', 'message', { body: { text: 'hi' } });

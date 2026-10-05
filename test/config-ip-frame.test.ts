@@ -154,13 +154,14 @@ describe('configuration policy boundaries', () => {
 		expect(() => config({ GUEST_POSTING: '1' })).toThrow(ConfigError);
 	});
 
-	it('takes the presence variant from the plan unless PRESENCE says otherwise, and bounds status delays', () => {
+	it('takes presence from the plan unless PRESENCE says otherwise, and bounds status delays', () => {
 		expect(config().presence).toBe(DEFAULT_FEATURES.presence);
 		expect(config({ PRESENCE: '' }).presence).toBe(DEFAULT_FEATURES.presence);
-		expect(config({ PRESENCE: 'connected' }).presence).toBe('connected');
-		expect(config({ PRESENCE: 'FULL' }).presence).toBe('full');
 		expect(config({ PRESENCE: 'false' }).presence).toBe(false);
-		expect(config({ PRESENCE: 'true' }).presence).toBe(DEFAULT_FEATURES.presence || 'connected');
+		expect(config({ PRESENCE: 'TRUE' }).presence).toBe(true);
+		// The variants are gone: status no longer differs by plan.
+		expect(() => config({ PRESENCE: 'full' })).toThrow(ConfigError);
+		expect(() => config({ PRESENCE: 'connected' })).toThrow(ConfigError);
 		expect(() => config({ PRESENCE: 'on' })).toThrow(ConfigError);
 		expect(config({ LIMIT_STATUS_COALESCE_SECONDS: '10' }).limits.statusCoalesceSeconds).toBe(10);
 		expect(() => config({}, { statusCoalesceSeconds: 61 })).toThrow(ConfigError);
@@ -168,8 +169,8 @@ describe('configuration policy boundaries', () => {
 	});
 
 	it('keeps the free plan as it was and valid, and the paid plan inside its allowances', () => {
-		expect(FREE_PLAN.features).toEqual({ activity: false, guestPosting: false, presence: 'connected' });
-		expect(PAID_PLAN.features.presence).toBe('full');
+		expect(FREE_PLAN.features).toEqual({ activity: false, guestPosting: false, presence: true });
+		expect(PAID_PLAN.features.presence).toBe(true);
 		expect(FREE_PLAN.limits).toMatchObject({ globalFramesPerMinute: 300, processedFramesPerDay: 100_000, globalPostsPerDay: 5_000, registrationsPerDay: 100, sqlWritesPerDay: 80_000, sqlReadsPerDay: 3_000_000 });
 		expect(FREE_PLAN.account.daily.sqlRowsWritten).toBe(100_000);
 		// The calibrated ceilings follow the selected plan, and Free fits under any.

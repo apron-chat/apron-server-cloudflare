@@ -188,25 +188,16 @@ export interface MonthlyAllowance {
 	logEvents: number;
 }
 
-/**
- * How much of a user's `status` (protocol §4.11) others see:
- *
- * - `full`: every user, connected or not. A member listing also reads each
- *   listed registered member's stored mute, `invisible`, and latest push
- *   registration that wakes for messages, so a disconnected user with one
- *   shows `idle`. About one more indexed read per listed member.
- * - `connected`: users with a connection, from their connection
- *   attachments; every user without one shows `offline` (§4.11 allows it).
- *   No SQL beyond what listings and sign-ins read already.
- */
-export type PresenceVariant = "full" | "connected";
-
 /** Defaults for the feature switches; `ACTIVITY`, `GUEST_POSTING` and `PRESENCE` override them. */
 export interface Features {
 	activity: boolean;
 	guestPosting: boolean;
-	/** User `status` shown to others, and `invisible` (§4.11); needs push, like capability `status`. */
-	presence: PresenceVariant | false;
+	/**
+	 * User `status` shown to others (§4.11): connected users' from their
+	 * connection attachments, and listed members' from the `status` they
+	 * chose. Needs push, like capability `status`.
+	 */
+	presence: boolean;
 }
 
 /**
@@ -254,7 +245,7 @@ export interface UploadPolicy {
  * Web Push (protocol §4.7, push kind `webpush`): a message that mentions a
  * registered user, or replies to their message, wakes them through their
  * browsers' push services when none of their connections is attended and
- * they have not muted (§4.11 `status`).
+ * neither a mute nor a `dnd` status silences them (§4.11 `status`).
  */
 export interface PushPolicy {
 	/** Pushes the whole server sends a UTC day, one per subscription woken. */
@@ -272,8 +263,10 @@ export interface PushPolicy {
 	/** Pushes one user may receive a UTC day, from all senders together. */
 	pushesPerRecipientDay: number;
 	/**
-	 * `status` `mute` changes one user may make a minute, across their
-	 * connections and reconnects; past it, further ones are dropped.
+	 * `status` `mute` and `me` `status` changes one user may make a minute,
+	 * together, across their connections and reconnects; past it, further
+	 * mutes are declined (the sender is told the mute in effect) and a `me`
+	 * `status` is `retry_after`.
 	 */
 	mutesPerUserMinute: number;
 	/**

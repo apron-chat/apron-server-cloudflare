@@ -780,7 +780,7 @@ it('advertises the demo policy hints', async () => {
 			// Registered members listed per room in `members`, besides connected ones.
 			room_list_members: DEFAULT_LIMITS.roomListMembers,
 			read_cursors: false,
-			// User status for everyone with the selected (Paid) plan; a change waits at most a minute.
+			// User status shown to others; a change waits at most a minute.
 			presence: DEFAULT_FEATURES.presence,
 			status_delay_seconds: Math.max(DEFAULT_LIMITS.statusCoalesceSeconds, DEFAULT_LIMITS.offlineGraceSeconds),
 		});

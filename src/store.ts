@@ -20,6 +20,7 @@ import {
   type UploadPolicy,
 } from "./budget";
 import type { AccountUsageSnapshot } from "./account-usage";
+import { isStatusChoice, type StatusChoice } from "./presence";
 import type {
   AdmissionSnapshot,
   AuthTier,
@@ -50,8 +51,8 @@ export const ROOM_TITLE = "General";
  * schema version is not migrated: the object is wiped and started fresh (see
  * resetStorage()). Additive rows need no new version: the `_meta`
  * guest-number mark, absent in older objects, reads as zero. Schema 8 adds
- * the `push_subscriptions`, `push_wakes` and `user_status` tables (see
- * upgradeFromSchema7()).
+ * the `push_subscriptions`, `push_wakes`, `user_status` and `room_mutes`
+ * tables (see upgradeFromSchema7()).
  */
 export const SCHEMA_VERSION = 8;
 /** The older schemas upgraded in place rather than reset, oldest first; each upgrades to the next. */
@@ -778,7 +779,7 @@ const UPLOAD_WRITES = 16;
  */
 const MAX_PUSH_SUBSCRIPTIONS_PER_USER = MAX_PUSHES_PER_MESSAGE;
 /** The tables a member listing reads (Store.roomMembers); a write to one invalidates reused listings. */
-const MEMBER_TABLES = /\b(identities|memberships|user_status|push_subscriptions)\b/;
+const MEMBER_TABLES = /\b(identities|memberships|user_status)\b/;
 /**
  * Most `push_wakes` rows one user can hold: one per room they were woken
  * for, and wakes come only for messages in existing rooms (at most the
@@ -813,49 +814,69 @@ export function wakeScopes(mask: number): WakeScope[] {
   return (Object.keys(WAKE_SCOPES) as WakeScope[]).filter((scope) => (mask & WAKE_SCOPES[scope]) !== 0);
 }
 
-/** A `user_status` row's `mute_until_ms` for a mute that lasts until changed (`mute: true`). */
+/** A `user_status` or `room_mutes` row's `mute_until_ms` for a mute that lasts until changed (`mute: true`). */
 export const MUTE_FOREVER = Number.MAX_SAFE_INTEGER;
 /** The longest timed mute: a year; longer ones are cut to it. */
 export const MAX_MUTE_SECONDS = 365 * 86_400;
+/**
+ * Most room mutes one user keeps (protocol §4.11 `status` with `room_id`):
+ * past it, a mute of another room is declined. It bounds what a sign-in
+ * reads to tell the mutes in effect, and what a wake claim's probes can find.
+ */
+export const MAX_ROOM_MUTES_PER_USER = 100;
+
+/** One of a user's room mutes: the room, and until when (MUTE_FOREVER for `true`). */
+export interface RoomMute {
+  roomId: string;
+  untilMs: number;
+}
 
 /**
- * What a user's `status` (protocol §4.11) is derived from in storage: until
- * when their unscoped mute lasts (absent when not muted), whether they are
- * `invisible`, and until when their latest push registration that wakes for
- * messages stays live (absent when none, or not read).
+ * A user's stored `status` state (protocol §4.11), read once at sign-in:
+ * the `status` they chose with `me`, until when their unscoped mute lasts
+ * (absent when not muted), and their room mutes in effect, in `room_id`
+ * order.
  */
 export interface StatusInputRecord {
+  choice: StatusChoice;
   muteUntil?: number;
-  invisible: boolean;
-  pushUntil?: number;
+  roomMutes: RoomMute[];
 }
 
-/** A `user_status` row, with the latest waking registration when read. */
-interface RawStatusRow {
-  mute_until_ms: number | null;
-  invisible: number | null;
-  push_latest: number | null;
-}
-
-/** A registered room member as listings carry it, with its `status` inputs when asked for. */
+/** A registered room member as listings carry it, with the `status` they chose when asked for. */
 export interface RoomMember {
   user_id: string;
   name: string;
   avatar?: string;
   roles: string[];
-  status?: StatusInputRecord;
+  choice?: StatusChoice;
 }
 
-/** One `roomMembers` row, with the status columns when asked for. */
+/** One `roomMembers` row, with the chosen status when asked for. */
 interface RawMemberRow {
   user_id: string;
   name: string | null;
   avatar_url: string | null;
   avatar_expires_ms: number | null;
   roles_json: string | null;
-  mute_until_ms?: number | null;
-  invisible?: number | null;
-  push_latest?: number | null;
+  status?: string | null;
+}
+
+/** A stored `status` choice: `online` when there is no row, and `""` for a value this server no longer knows. */
+function choiceColumn(value: unknown): StatusChoice {
+  if (value === null || value === undefined) return "online";
+  return isStatusChoice(value) ? value : "";
+}
+
+/** A room mute's stored end as `status` `mute` carries it (§4.11): `true`, else the seconds left, rounded up. */
+export function muteValue(untilMs: number, effective: number): number | true {
+  return untilMs >= MUTE_FOREVER ? true : Math.max(1, Math.ceil((untilMs - effective) / 1_000));
+}
+
+/** When the first of `mutes` that is timed runs out, as `{next}`, or `{}` when none is. */
+export function nextRoomMuteEnd(mutes: readonly RoomMute[]): { next?: number } {
+  const timed = mutes.filter((mute) => mute.untilMs < MUTE_FOREVER).map((mute) => mute.untilMs);
+  return timed.length ? { next: Math.min(...timed) } : {};
 }
 
 /** A room's member rows as read, kept for reuse (Store.roomMembers). */
@@ -903,7 +924,7 @@ export interface PushClaim {
   subscriptions: PushSubscriptionRecord[];
   /** Users skipped because they were woken for the room within `coalesceSeconds`. */
   coalesced: number;
-  /** Users skipped because they are muted (protocol §4.11). */
+  /** Users skipped because a mute or a `dnd` status silences them (protocol §4.7, §4.11). */
   muted: number;
   /** Subscriptions left out by the daily server or sender allowance. */
   skipped: number;
@@ -1174,11 +1195,13 @@ function ensureText(value: unknown, field: string, maxBytes: number): string {
  * registered users' Web Push registrations (protocol §4.7), keyed by user
  * and endpoint, indexed by user and registration time and by registration
  * time (for expiry), and by user and registration time for those that wake
- * for messages (a partial index, for a user's `status`). `push_wakes` keeps
- * when each user was last woken for each room, for coalescing. `user_status`
- * keeps each registered user's `status` state (protocol §4.11): until when
- * they are muted and whether they are `invisible`, one row while either is
- * set.
+ * for messages (a partial index, so a wake reads only those). `push_wakes`
+ * keeps when each user was last woken for each room, for coalescing.
+ * `user_status` keeps each registered user's `status` state (protocol
+ * §4.11): the `status` they chose with `me` and until when their unscoped
+ * mute lasts, one row while either differs from the default (`online`, not
+ * muted). `room_mutes` keeps their room mutes, keyed by user and room, at
+ * most MAX_ROOM_MUTES_PER_USER a user.
  */
 const SCHEMA_DDL = `
   CREATE TABLE IF NOT EXISTS _meta (
@@ -1296,8 +1319,14 @@ const SCHEMA_DDL = `
   CREATE INDEX IF NOT EXISTS push_wakes_woken_idx ON push_wakes (woken_ms);
   CREATE TABLE IF NOT EXISTS user_status (
     user_id TEXT PRIMARY KEY,
-    mute_until_ms INTEGER,
-    invisible INTEGER NOT NULL DEFAULT 0
+    status TEXT NOT NULL DEFAULT 'online',
+    mute_until_ms INTEGER
+  );
+  CREATE TABLE IF NOT EXISTS room_mutes (
+    user_id TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    mute_until_ms INTEGER NOT NULL,
+    PRIMARY KEY (user_id, room_id)
   );
   CREATE TABLE IF NOT EXISTS accepted_requests (
     user_id TEXT NOT NULL,
@@ -1630,8 +1659,9 @@ export class Store {
 
   /**
    * Upgrades a schema 7 object to schema 8 in place, once, in one
-   * transaction: it creates the empty `push_subscriptions`, `push_wakes`
-   * and `user_status` tables and their indexes, and changes nothing else.
+   * transaction: it creates the empty `push_subscriptions`, `push_wakes`,
+   * `user_status` and `room_mutes` tables and their indexes, and changes
+   * nothing else.
    * Charged like upgradeFromSchema5's rows.
    */
   private upgradeFromSchema7(): void {
@@ -1663,8 +1693,14 @@ export class Store {
         CREATE INDEX IF NOT EXISTS push_wakes_woken_idx ON push_wakes (woken_ms);
         CREATE TABLE IF NOT EXISTS user_status (
           user_id TEXT PRIMARY KEY,
-          mute_until_ms INTEGER,
-          invisible INTEGER NOT NULL DEFAULT 0
+          status TEXT NOT NULL DEFAULT 'online',
+          mute_until_ms INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS room_mutes (
+          user_id TEXT NOT NULL,
+          room_id TEXT NOT NULL,
+          mute_until_ms INTEGER NOT NULL,
+          PRIMARY KEY (user_id, room_id)
         );
       `);
       this.finishUpgrade(8, start, day);
@@ -2681,7 +2717,7 @@ export class Store {
    * left under the old id to the new one: the `from` of their logged message
    * snapshots and current messages (so they can still edit them), their
    * reaction sets, logged and current, and their logged membership changes,
-   * keeping the recorded names; their uploads; their push subscriptions and mute;
+   * keeping the recorded names; their uploads; their push subscriptions, status and mutes;
    * their limiter windows; and their dedup rows. Nothing is announced: clients see the new id when they
    * load history again. Other users' `body.mentions`, sessions and the user's
    * bot stay under the old id. The old `user_id` is retired, never reissued.
@@ -2696,7 +2732,7 @@ export class Store {
     const now = input.now ?? this.clock.now();
     const { from, to } = input;
     const records = this.retainedRecords(now);
-    const found = this.reserved({ reads: 64 + 8 * records + 2 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1) }, false, now, () => {
+    const found = this.reserved({ reads: 64 + 8 * records + 2 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER) }, false, now, () => {
       const identity = this.identityRow(from);
       if (!identity || identity.tier !== "registered") throw new StoreError("invalid_params", `No registered user has the user_id ${from}`.slice(0, 200));
       if (parseRoles(identity.roles_json).includes("bot")) throw new StoreError("invalid_params", "A bot's user_id is fixed");
@@ -2716,7 +2752,8 @@ export class Store {
         uploads: count("SELECT COUNT(*) AS count FROM uploads INDEXED BY uploads_owner_idx WHERE owner_id = ?"),
         pushes: count("SELECT COUNT(*) AS count FROM push_subscriptions INDEXED BY push_subscriptions_user_idx WHERE user_id = ?") +
           count("SELECT COUNT(*) AS count FROM push_wakes WHERE user_id = ?") +
-          count("SELECT COUNT(*) AS count FROM user_status WHERE user_id = ?"),
+          count("SELECT COUNT(*) AS count FROM user_status WHERE user_id = ?") +
+          count("SELECT COUNT(*) AS count FROM room_mutes WHERE user_id = ?"),
         requests: count("SELECT COUNT(*) AS count FROM accepted_requests WHERE user_id = ?"),
       };
     });
@@ -2763,6 +2800,7 @@ export class Store {
         this.rawExec("UPDATE push_subscriptions SET user_id = ? WHERE user_id = ?", to, from);
         this.rawExec("UPDATE push_wakes SET user_id = ? WHERE user_id = ?", to, from);
         this.rawExec("UPDATE user_status SET user_id = ? WHERE user_id = ?", to, from);
+        this.rawExec("UPDATE room_mutes SET user_id = ? WHERE user_id = ?", to, from);
       }
       if (found.requests) this.rawExec("UPDATE accepted_requests SET user_id = ? WHERE user_id = ?", to, from);
       for (const scope of USER_LIMIT_SCOPES) {
@@ -2790,7 +2828,7 @@ export class Store {
    * records: their message snapshots and current messages, with every
    * reaction set on those messages; their reaction sets elsewhere; their
    * memberships and membership records; their uploads; and their identity,
-   * passkey, push subscription, mute, limiter and dedup rows. A logged record that
+   * passkey, push subscription, status, mute, limiter and dedup rows. A logged record that
    * lists them beside others (a move's reaction sets) is rewritten without
    * them. Rooms they created stay. Clients that already have their content
    * keep it until they load history again. Returns what went, and the R2
@@ -2812,7 +2850,7 @@ export class Store {
     // rows, limiter rows, push subscriptions, credential and identity; each
     // deletion also updates its indexes.
     const perUser = 64 + 4 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS) + 4 * this.config.registeredPostsPerDay + 4 * uploadsPerOwner +
-      4 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1);
+      4 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER);
     const cost = { reads: 64 + 5 * records + ids.length * perUser, writes: 64 + 4 * records + ids.length * perUser };
     return this.reserved(cost, false, now, () => this.transaction(() => {
       const messages = this.rawRows<{ message_id: string }>(`SELECT message_id FROM message_state WHERE author_id IN (${marks})`, ...ids)
@@ -2859,7 +2897,7 @@ export class Store {
          WHERE room_id IN (SELECT room_id FROM memberships INDEXED BY memberships_user_idx WHERE user_id IN (${marks}))`,
         ...ids, ...ids,
       );
-      for (const table of ["memberships", "credentials", "push_subscriptions", "push_wakes", "user_status", "accepted_requests", "identities"]) {
+      for (const table of ["memberships", "credentials", "push_subscriptions", "push_wakes", "user_status", "room_mutes", "accepted_requests", "identities"]) {
         this.rawExec(`DELETE FROM ${table} WHERE user_id IN (${marks})`, ...ids);
       }
       this.rawExec(`DELETE FROM principal_limits WHERE principal_key IN (${marks})`, ...ids.map((id) => `user:${id}`));
@@ -2899,16 +2937,15 @@ export class Store {
    * current `name` (`""` when removed), live `avatar`, and `roles`, in
    * `user_id` order: at most `limit` per room, read from the room's
    * primary-key range with one identity lookup each. With `withStatus`, each
-   * also carries its `status` inputs (statusInputs): its `user_status` row,
-   * joined by primary key, and its latest registration that wakes for
-   * messages, from the partial index. Guests' memberships are not stored; the
-   * caller adds connected ones.
+   * also carries the `status` it chose (`choice`), from its `user_status`
+   * row, joined by primary key: a member without one costs nothing more.
+   * Guests' memberships are not stored; the caller adds connected ones.
    *
    * With `memberCacheMs`, a room's rows are kept in memory that long and
    * reused, with no SQL and no reservation, until a write to `identities`,
-   * `memberships`, `user_status` or `push_subscriptions` (see rawExec).
-   * Avatars and status inputs are judged against `now` on every call, so a
-   * reused row is never more out of date than a fresh read.
+   * `memberships` or `user_status` (see rawExec). Avatars are judged against
+   * `now` on every call, so a reused row is never more out of date than a
+   * fresh read.
    */
   roomMembers(
     roomIds: readonly string[], limit: number, now = this.clock.now(),
@@ -2929,16 +2966,15 @@ export class Store {
     };
     const missing = ids.filter((roomId) => !cached(roomId));
     if (missing.length) {
-      // Each member's status adds its `user_status` row and one partial-index
-      // probe: measured at one more read a member, two at worst.
-      this.reserved({ reads: 8 + missing.length * (4 + (withStatus ? 4 : 2) * perRoom) }, false, now, () => {
+      // Each member's status adds its `user_status` row, when it has one:
+      // measured at one more read a member at worst.
+      this.reserved({ reads: 8 + missing.length * (4 + (withStatus ? 3 : 2) * perRoom) }, false, now, () => {
         const generation = this.memberGeneration;
         if (this.memberCache.size > 2 * (MAX_THREAD_LIMIT + 1)) this.memberCache.clear();
         for (const roomId of missing) {
           const rows = this.rawRows<RawMemberRow>(
             withStatus
-              ? `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, s.mute_until_ms, s.invisible,
-                   (SELECT MAX(p.updated_ms) FROM push_subscriptions p INDEXED BY push_subscriptions_waking_idx WHERE p.user_id = m.user_id AND p.wake != 0) AS push_latest
+              ? `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, s.status
                  FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id LEFT JOIN user_status s ON s.user_id = m.user_id
                  WHERE m.room_id = ? ORDER BY m.user_id LIMIT ?`
               : `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id
@@ -2957,7 +2993,6 @@ export class Store {
         }
       });
     }
-    const effective = Math.max(now, this.lastEffectiveMs);
     for (const roomId of ids) {
       const entry = cached(roomId) ?? this.uncachedMembers.get(roomId);
       if (!entry) continue;
@@ -2966,7 +3001,7 @@ export class Store {
           const avatar = liveAvatar(row, now);
           return {
             user_id: row.user_id, name: row.name ?? "", ...(avatar ? { avatar } : {}), roles: parseRoles(row.roles_json),
-            ...(withStatus ? { status: this.statusRecord(row, effective, true) } : {}),
+            ...(withStatus ? { choice: choiceColumn(row.status) } : {}),
           };
         }));
       }
@@ -4466,8 +4501,12 @@ export class Store {
    * message mentions or replies to, each with the scopes it qualifies under,
    * at most MAX_PUSH_CANDIDATES. Each is looked up in turn: only its
    * unexpired registrations whose `wake` includes one of those scopes count,
-   * and one with none is passed over without taking a wake; one woken for this room within `coalesceSeconds` is
-   * passed over too (`coalesced`), and so is a muted one (`muted`); the rest are woken, up to
+   * and one with none is passed over without taking a wake; so is one that a
+   * mute or a `dnd` status silences (`muted`, protocol §4.7: a silenced push
+   * goes only to `badge` registrations, which this server does not have):
+   * its unscoped mute, or its mute of the room or, for a thread, of the
+   * thread's parent; one woken for this room within `coalesceSeconds` is
+   * passed over too (`coalesced`); the rest are woken, up to
    * `wakesPerMessage` users, on each of their registrations (most recently
    * registered first). Pushes are checked against the sender's
    * `pushesPerSenderDay` (charged once delivered, chargePushSender), charged
@@ -4485,21 +4524,25 @@ export class Store {
     const claim: PushClaim = { subscriptions: [], coalesced: 0, muted: 0, skipped: 0 };
     if (!policy || !candidates.length) return claim;
     const now = input.now ?? this.clock.now();
-    // Each candidate's mute, live index range, wake row and recipient counter;
-    // the server's and sender's counters; and for each woken user a wake row
-    // and the recipient counter, created on a user's first push of the day.
-    const cost = { reads: 48 + candidates.length * (16 + 2 * policy.subscriptionsPerUser), writes: 32 + 12 * policy.wakesPerMessage };
+    // Each candidate's status row, live index range, two room mute probes,
+    // wake row and recipient counter; the room's parent, read once; the
+    // server's and sender's counters; and for each woken user a wake row and
+    // the recipient counter, created on a user's first push of the day.
+    const cost = { reads: 56 + candidates.length * (20 + 2 * policy.subscriptionsPerUser), writes: 32 + 12 * policy.wakesPerMessage };
     return this.reserved(cost, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       const day = dayFor(effective);
       const live = effective - policy.pushExpiryDays * 86_400_000;
       let counters: { server: RawLimitRow; sent: number; delivered: number } | undefined;
+      // The rooms a room mute silences this message by: its room and, for a
+      // thread, the parent (protocol §4.11), read once a candidate needs it.
+      let scopes: string[] | undefined;
       let woken = 0;
       for (const userId of candidates) {
         if (woken >= policy.wakesPerMessage) break;
-        // A muted user gets no pushes (protocol §4.11) and takes no wake.
-        const mute = this.rawRows<{ mute_until_ms: number | null }>("SELECT mute_until_ms FROM user_status WHERE user_id = ? LIMIT 1", userId)[0];
-        if (mute?.mute_until_ms != null && integerColumn(mute.mute_until_ms) > effective) {
+        // A muted or `dnd` user gets no pushes (protocol §4.7, §4.11) and takes no wake.
+        const status = this.rawRows<{ status: string; mute_until_ms: number | null }>("SELECT status, mute_until_ms FROM user_status WHERE user_id = ? LIMIT 1", userId)[0];
+        if (status && (status.status === "dnd" || (status.mute_until_ms != null && integerColumn(status.mute_until_ms) > effective))) {
           claim.muted += 1;
           continue;
         }
@@ -4512,6 +4555,16 @@ export class Store {
           userId, live, policy.subscriptionsPerUser,
         ).filter((row) => (integerColumn(row.wake) & reasons.get(userId)!) !== 0 && (input.allowed?.(row.url) ?? true));
         if (!rows.length) continue;
+        scopes ??= [input.roomId, ...this.rawRows<{ parent_room_id: string | null }>("SELECT parent_room_id FROM rooms WHERE room_id = ? LIMIT 1", input.roomId)
+          .flatMap((row) => row.parent_room_id === null ? [] : [row.parent_room_id])];
+        const roomMuted = this.rawRows<{ mute_until_ms: number }>(
+          `SELECT mute_until_ms FROM room_mutes WHERE user_id = ? AND room_id IN (${scopes.map(() => "?").join(", ")}) AND mute_until_ms > ? LIMIT 1`,
+          userId, ...scopes, effective,
+        );
+        if (roomMuted.length) {
+          claim.muted += 1;
+          continue;
+        }
         const last = this.rawRows<{ woken_ms: number }>("SELECT woken_ms FROM push_wakes WHERE user_id = ? AND room_id = ? LIMIT 1", userId, input.roomId)[0];
         if (last && effective - integerColumn(last.woken_ms) < policy.coalesceSeconds * 1_000) {
           claim.coalesced += 1;
@@ -4617,15 +4670,14 @@ export class Store {
   }
 
   /**
-   * `status` `mute` (protocol §4.11) for a registered user: until when they
-   * are muted, MUTE_FOREVER for `mute: true`, or null to end it. Whether the
-   * stored mute changed, and the mute it leaves as `you` carries it (see
-   * muteOf), absent when none; `untilMs` is the stored end, absent when not
-   * muted. A mute is the user's, whichever connection set it. It is kept in
-   * the user's `user_status` row, which goes once neither it nor `invisible`
-   * is set.
+   * `status` `mute` without `room_id` (protocol §4.11) for a registered user:
+   * until when they are muted, MUTE_FOREVER for `true`, or null to end it.
+   * Whether the stored mute changed, and `untilMs`, the end it leaves,
+   * absent when not muted. A mute is the user's, whichever connection set
+   * it. It is kept in the user's `user_status` row, which goes once it holds
+   * only defaults.
    */
-  setMute(input: { userId: string; untilMs: number | null; now?: number }): { changed: boolean; mute?: number | true; untilMs?: number } {
+  setMute(input: { userId: string; untilMs: number | null; now?: number }): { changed: boolean; untilMs?: number } {
     this.ensureReady();
     const now = input.now ?? this.clock.now();
     return this.reserved({ reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
@@ -4638,101 +4690,137 @@ export class Store {
         if (stored !== null) this.writeUserStatus(input.userId, existing, { mute_until_ms: null });
         return { changed: before !== null };
       }
-      const mute = input.untilMs >= MUTE_FOREVER ? true as const : Math.ceil((input.untilMs - effective) / 1_000);
-      if (before === input.untilMs) return { changed: false, mute, untilMs: input.untilMs };
+      if (before === input.untilMs) return { changed: false, untilMs: input.untilMs };
       this.writeUserStatus(input.userId, existing, { mute_until_ms: input.untilMs });
-      return { changed: true, mute, untilMs: input.untilMs };
+      return { changed: true, untilMs: input.untilMs };
     }));
   }
 
   /**
-   * `status` `invisible` (protocol §4.11) for a registered user: others see
-   * them `offline`. Kept in their `user_status` row with the mute; whether it
-   * changed.
+   * `me` `status` (protocol §4.11) for a registered user: the value they
+   * chose, kept in their `user_status` row with the mute. Whether it changed.
    */
-  setInvisible(input: { userId: string; invisible: boolean; now?: number }): { changed: boolean } {
+  setStatus(input: { userId: string; choice: StatusChoice; now?: number }): { changed: boolean } {
     this.ensureReady();
     const now = input.now ?? this.clock.now();
     return this.reserved({ reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
       this.effectiveNow(now);
       if (!this.identityRow(input.userId)) return { changed: false };
       const existing = this.userStatusRow(input.userId);
-      if ((existing?.invisible === 1) === input.invisible) return { changed: false };
-      this.writeUserStatus(input.userId, existing, { invisible: input.invisible ? 1 : 0 });
+      if ((existing?.status ?? "online") === input.choice) return { changed: false };
+      this.writeUserStatus(input.userId, existing, { status: input.choice });
       return { changed: true };
     }));
   }
 
   /** A user's `user_status` row, if any, with an expired mute left as stored. */
-  private userStatusRow(userId: string): { mute_until_ms: number | null; invisible: 0 | 1 } | undefined {
-    const row = this.rawRows<{ mute_until_ms: number | null; invisible: number }>(
-      "SELECT mute_until_ms, invisible FROM user_status WHERE user_id = ? LIMIT 1", userId,
+  private userStatusRow(userId: string): { status: StatusChoice; mute_until_ms: number | null } | undefined {
+    const row = this.rawRows<{ status: string; mute_until_ms: number | null }>(
+      "SELECT status, mute_until_ms FROM user_status WHERE user_id = ? LIMIT 1", userId,
     )[0];
-    return row ? { mute_until_ms: row.mute_until_ms === null ? null : integerColumn(row.mute_until_ms), invisible: integerColumn(row.invisible) === 1 ? 1 : 0 } : undefined;
+    return row ? { status: choiceColumn(row.status), mute_until_ms: row.mute_until_ms === null ? null : integerColumn(row.mute_until_ms) } : undefined;
   }
 
-  /** Writes a user's `user_status` row with `change` applied, deleting it once nothing is set. */
-  private writeUserStatus(userId: string, existing: { mute_until_ms: number | null; invisible: 0 | 1 } | undefined, change: { mute_until_ms?: number | null; invisible?: 0 | 1 }): void {
-    const next = { mute_until_ms: existing?.mute_until_ms ?? null, invisible: existing?.invisible ?? 0, ...change };
-    if (next.mute_until_ms === null && next.invisible === 0) {
+  /** Writes a user's `user_status` row with `change` applied, deleting it once it holds only defaults. */
+  private writeUserStatus(userId: string, existing: { status: StatusChoice; mute_until_ms: number | null } | undefined, change: { status?: StatusChoice; mute_until_ms?: number | null }): void {
+    const next = { status: existing?.status ?? "online", mute_until_ms: existing?.mute_until_ms ?? null, ...change };
+    if (next.mute_until_ms === null && next.status === "online") {
       if (existing) this.rawExec("DELETE FROM user_status WHERE user_id = ?", userId);
       return;
     }
     this.rawExec(
-      `INSERT INTO user_status (user_id, mute_until_ms, invisible) VALUES (?, ?, ?)
-       ON CONFLICT (user_id) DO UPDATE SET mute_until_ms = excluded.mute_until_ms, invisible = excluded.invisible`,
-      userId, next.mute_until_ms, next.invisible,
+      `INSERT INTO user_status (user_id, status, mute_until_ms) VALUES (?, ?, ?)
+       ON CONFLICT (user_id) DO UPDATE SET status = excluded.status, mute_until_ms = excluded.mute_until_ms`,
+      userId, next.status, next.mute_until_ms,
     );
   }
 
   /**
-   * A user's mute as `you` echoes it (protocol §4.11): `true` until changed,
-   * else the seconds left, rounded up; undefined when not muted. An expired
-   * mute reads as none and needs no write.
+   * `status` `mute` with `room_id` (protocol §4.11) for a registered user:
+   * until when `roomId` and its threads are muted, MUTE_FOREVER for `true`,
+   * or null to end it. Kept in `room_mutes`, one row a room, at most
+   * MAX_ROOM_MUTES_PER_USER a user: a mute of another room past that first
+   * deletes the user's mutes that ran out, and is `refused` if that frees
+   * none. Whether it changed anything, and `untilMs`, the end it leaves,
+   * absent when not muted. A mute that ran out is deleted with no change.
    */
-  muteOf(userId: string, now = this.clock.now()): number | true | undefined {
+  setRoomMute(input: { userId: string; roomId: string; untilMs: number | null; now?: number }): { changed: boolean; untilMs?: number; refused?: true } {
     this.ensureReady();
-    return this.reserved({ reads: 8 }, false, now, () => {
+    const now = input.now ?? this.clock.now();
+    // The row and its key; at the cap, two counts of the user's mutes and a
+    // delete of those that ran out (a row and its key each), each at most
+    // the cap.
+    const cost = { reads: 24 + 4 * MAX_ROOM_MUTES_PER_USER, writes: 16 + 4 * MAX_ROOM_MUTES_PER_USER };
+    return this.reserved(cost, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
-      const until = this.userStatusRow(userId)?.mute_until_ms ?? 0;
-      if (until <= effective) return undefined;
-      return until >= MUTE_FOREVER ? true : Math.ceil((until - effective) / 1_000);
-    });
+      const row = this.rawRows<{ mute_until_ms: number }>("SELECT mute_until_ms FROM room_mutes WHERE user_id = ? AND room_id = ? LIMIT 1", input.userId, input.roomId)[0];
+      const stored = row ? integerColumn(row.mute_until_ms) : null;
+      const before = stored !== null && stored > effective ? stored : null;
+      if (input.untilMs === null || input.untilMs <= effective) {
+        if (stored !== null) this.rawExec("DELETE FROM room_mutes WHERE user_id = ? AND room_id = ?", input.userId, input.roomId);
+        return { changed: before !== null };
+      }
+      if (before === input.untilMs) return { changed: false, untilMs: input.untilMs };
+      if (stored === null) {
+        if (!this.identityRow(input.userId)) return { changed: false };
+        const count = () => integerColumn(this.rawRows<{ count: number }>("SELECT COUNT(*) AS count FROM room_mutes WHERE user_id = ?", input.userId)[0]?.count);
+        if (count() >= MAX_ROOM_MUTES_PER_USER) {
+          this.rawExec("DELETE FROM room_mutes WHERE user_id = ? AND mute_until_ms <= ?", input.userId, effective);
+          if (count() >= MAX_ROOM_MUTES_PER_USER) return { changed: false, refused: true };
+        }
+      }
+      this.rawExec(
+        `INSERT INTO room_mutes (user_id, room_id, mute_until_ms) VALUES (?, ?, ?)
+         ON CONFLICT (user_id, room_id) DO UPDATE SET mute_until_ms = excluded.mute_until_ms`,
+        input.userId, input.roomId, input.untilMs,
+      );
+      return { changed: true, untilMs: input.untilMs };
+    }));
   }
 
   /**
-   * What a user's `status` (protocol §4.11) is derived from, besides their
-   * connections, read once at sign-in: the stored mute's end (absent when
-   * not muted, MUTE_FOREVER for `true`), `invisible`, and, with `withPush`,
-   * when their latest registration that wakes for messages lapses
-   * (`pushExpiryDays` after it was registered; absent when none). One
-   * primary-key read, and with `withPush` one more of the partial index.
+   * The room mutes of a user that ran out by `now` (protocol §4.11), deleted
+   * here, so each is told once: their rooms, and when the next of those left
+   * runs out (absent when none is timed). One range of the user's rows, at
+   * most MAX_ROOM_MUTES_PER_USER, and a delete of the expired ones.
    */
-  statusInputs(userId: string, withPush: boolean, now = this.clock.now()): StatusInputRecord {
+  expireRoomMutes(userId: string, now = this.clock.now()): { expired: string[]; next?: number } {
     this.ensureReady();
-    return this.reserved({ reads: withPush ? 16 : 8 }, false, now, () => {
+    return this.reserved({ reads: 16 + 2 * MAX_ROOM_MUTES_PER_USER, writes: 8 + 4 * MAX_ROOM_MUTES_PER_USER }, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
-      const row = this.rawRows<RawStatusRow>(
-        withPush
-          ? `SELECT s.mute_until_ms, s.invisible, (SELECT MAX(p.updated_ms) FROM push_subscriptions p INDEXED BY push_subscriptions_waking_idx WHERE p.user_id = u.user_id AND p.wake != 0) AS push_latest
-             FROM (SELECT ? AS user_id) u LEFT JOIN user_status s ON s.user_id = u.user_id`
-          : "SELECT mute_until_ms, invisible, NULL AS push_latest FROM user_status WHERE user_id = ? LIMIT 1",
-        userId,
-      )[0];
-      return this.statusRecord(row, effective, withPush);
-    });
+      const rows = this.roomMuteRows(userId);
+      const expired = rows.filter((row) => row.untilMs <= effective).map((row) => row.roomId);
+      if (expired.length) this.rawExec("DELETE FROM room_mutes WHERE user_id = ? AND mute_until_ms <= ?", userId, effective);
+      return { expired, ...nextRoomMuteEnd(rows.filter((row) => row.untilMs > effective)) };
+    }));
   }
 
-  /** A stored row's `status` inputs as of `effective` (see statusInputs). */
-  private statusRecord(row: Partial<RawStatusRow> | undefined, effective: number, withPush: boolean): StatusInputRecord {
-    const until = row?.mute_until_ms == null ? 0 : integerColumn(row.mute_until_ms);
-    const latest = row?.push_latest == null ? 0 : integerColumn(row.push_latest);
-    const pushUntil = withPush && latest > 0 && this.config.push ? latest + this.config.push.pushExpiryDays * 86_400_000 : 0;
-    return {
-      ...(until > effective ? { muteUntil: until } : {}),
-      invisible: integerColumn(row?.invisible ?? 0) === 1,
-      ...(pushUntil > effective ? { pushUntil } : {}),
-    };
+  /** A user's room mutes as stored, expired ones included, in `room_id` order. */
+  private roomMuteRows(userId: string): RoomMute[] {
+    return this.rawRows<{ room_id: string; mute_until_ms: number }>(
+      "SELECT room_id, mute_until_ms FROM room_mutes WHERE user_id = ? ORDER BY room_id LIMIT ?", userId, MAX_ROOM_MUTES_PER_USER,
+    ).map((row) => ({ roomId: row.room_id, untilMs: integerColumn(row.mute_until_ms) }));
+  }
+
+  /**
+   * A registered user's stored `status` state (protocol §4.11), read once at
+   * sign-in: the `status` they chose, their unscoped mute's end (absent when
+   * not muted, MUTE_FOREVER for `true`) and their room mutes in effect. One
+   * primary-key read and one range of the user's room mutes, at most
+   * MAX_ROOM_MUTES_PER_USER rows; a missing row or range costs nothing.
+   */
+  statusInputs(userId: string, now = this.clock.now()): StatusInputRecord {
+    this.ensureReady();
+    return this.reserved({ reads: 16 + 2 * MAX_ROOM_MUTES_PER_USER }, false, now, () => {
+      const effective = this.effectiveNow(now);
+      const row = this.userStatusRow(userId);
+      const until = row?.mute_until_ms ?? 0;
+      return {
+        choice: row?.status ?? "online",
+        ...(until > effective ? { muteUntil: until } : {}),
+        roomMutes: this.roomMuteRows(userId).filter((mute) => mute.untilMs > effective),
+      };
+    });
   }
 
   /** Pushes sent today, for `/status`. */

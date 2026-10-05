@@ -290,7 +290,7 @@ it('sends user notifications for renames and for a guest signing in on its conne
 		await until(second, (frame) => frame.id === 'resume');
 		tab.send({ id: 'rename', method: 'me', params: { name: 'Notified' } });
 		await until(tab, (frame) => frame.id === 'rename');
-		expect((await until(second, (frame) => frame.method === 'user')).frame.params).toEqual({ you: { user_id: 'user_session_notify', name: 'Notified', roles: [] } });
+		expect((await until(second, (frame) => frame.method === 'user')).frame.params).toEqual({ you: { user_id: 'user_session_notify', name: 'Notified', roles: [], status: 'online' } });
 		expect((await until(watcher, (frame) => frame.method === 'user')).frame.params).toEqual({ new: { user_id: 'user_session_notify', name: 'Notified', roles: [] } });
 	} finally { watcher.close(); tab.close(); second.close(); }
 });

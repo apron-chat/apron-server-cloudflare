@@ -122,7 +122,7 @@ export const FREE_PLAN: Plan = Object.freeze({
 		// sybils cannot use up everyone's pushes or flood one person.
 		pushesPerSenderDay: 50,
 		pushesPerRecipientDay: 100,
-		// Each mute change costs a few written rows.
+		// Each mute or status change costs a few written rows.
 		mutesPerUserMinute: 6,
 		// A busy conversation wakes an away user once a minute per room.
 		coalesceSeconds: 60,
@@ -136,11 +136,11 @@ export const FREE_PLAN: Plan = Object.freeze({
 	features: Object.freeze({
 		activity: false,
 		guestPosting: false,
-		// User status from connections only: a user with none shows offline,
-		// so listings read exactly what they read without it (measured). Mute
-		// and `invisible` are one row read at sign-in, as the mute alone was,
-		// and kept on the connection. Requests are already this plan's
-		// scarcest allowance after SQL writes; status adds none.
-		presence: "connected",
+		// User status: connected users' from their connection attachments,
+		// with no SQL; a listing reads each listed member's chosen status
+		// with them, nothing for members who never chose one or muted
+		// (measured). Requests are already this plan's scarcest allowance
+		// after SQL writes; status adds none.
+		presence: true,
 	}),
 });

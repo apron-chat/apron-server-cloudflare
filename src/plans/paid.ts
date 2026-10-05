@@ -150,12 +150,10 @@ export const PAID_PLAN: Plan = Object.freeze({
 		activity: true,
 		// Guests only read, as on Free: a moderation choice, not a budget one.
 		guestPosting: false,
-		// User status for everyone: a member listing also reads each listed
-		// registered member's mute, `invisible`, and latest waking push
-		// registration, so a disconnected user who can be pushed shows idle.
-		// Measured: nothing more for members with nothing stored, one read for
-		// one with registrations, two at worst; 0.7-1.5% of the foreground
-		// reads at a thousand admissions a day, 6% at the 4,000 cap.
-		presence: "full",
+		// User status, as on Free: connected users' from their connection
+		// attachments, and a listed member's chosen status read with them
+		// (nothing for members who never chose one or muted, one read at
+		// worst).
+		presence: true,
 	}),
 });
