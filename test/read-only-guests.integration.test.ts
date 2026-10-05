@@ -132,7 +132,7 @@ it('lets a registered user invite a bot that signs in from anywhere with its tok
 		// A bot has no Origin: it is offered `token`, and its token needs none.
 		expect((await bot.next()).params.auth).toEqual(['token', 'guest']);
 		const auth = await request(bot, 'auth', 'auth', { scheme: 'token', token });
-		expect(auth.result).toEqual({ you: { user_id: 'bot_u_owner', name: 'Bot of Name of u_owner', roles: ['bot'] } });
+		expect(auth.result).toEqual({ you: { user_id: 'bot_u_owner', name: 'Bot of Name of u_owner', roles: ['bot'], status: 'online' } });
 		expect(auth.result.token).toBeUndefined();
 		expect((await request(bot, 'rooms', 'room_list', { filter: 'joined' })).result.joined.map((room: { room_id: string }) => room.room_id)).toEqual(['general']);
 
@@ -172,7 +172,7 @@ it('replaces a bot token on a new invite, signing out the old one, and renames t
 		await stale.next();
 		expect((await request(stale, 'auth', 'auth', { scheme: 'token', token: oldToken })).error.code).toBe(-32001);
 		await fresh.next();
-		expect((await request(fresh, 'auth', 'auth', { scheme: 'token', token: newToken })).result.you).toEqual({ user_id: 'bot_u_rotating', name: 'Bot of Rotated', roles: ['bot'] });
+		expect((await request(fresh, 'auth', 'auth', { scheme: 'token', token: newToken })).result.you).toEqual({ user_id: 'bot_u_rotating', name: 'Bot of Rotated', roles: ['bot'], status: 'online' });
 	} finally { owner.close(); first.close(); stale.close(); fresh.close(); }
 });
 
@@ -225,7 +225,7 @@ it('signs in as the admin user with APRON_ADMIN_TOKEN from anywhere, once it is 
 	try {
 		await first.next();
 		const auth = await request(first, 'auth', 'auth', { scheme: 'token', token: adminToken });
-		expect(auth.result).toEqual({ you: { user_id: 'admin', name: 'Admin', roles: ['admin'] } });
+		expect(auth.result).toEqual({ you: { user_id: 'admin', name: 'Admin', roles: ['admin'], status: 'online' } });
 		// Created on first use, it starts in general.
 		expect((await request(first, 'rooms', 'room_list', { filter: 'joined' })).result.joined.map((room: { room_id: string }) => room.room_id)).toEqual(['general']);
 		const posted = await request(first, 'post', 'message', { room_id: 'general', body: { text: 'testing' } });
@@ -235,7 +235,7 @@ it('signs in as the admin user with APRON_ADMIN_TOKEN from anywhere, once it is 
 
 		// The same token signs in again, as the same user, from a browser too.
 		await second.next();
-		expect((await request(second, 'auth', 'auth', { scheme: 'token', token: adminToken })).result.you).toEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'] });
+		expect((await request(second, 'auth', 'auth', { scheme: 'token', token: adminToken })).result.you).toEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'], status: 'online' });
 	} finally { first.close(); second.close(); await withAdminToken(undefined); }
 });
 

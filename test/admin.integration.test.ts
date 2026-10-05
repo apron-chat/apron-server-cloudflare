@@ -171,7 +171,8 @@ it('/rename moves a registered user, their passkey, rooms and admin status to a 
 		const you = await until(dave, (frame) => frame.method === 'user');
 		expect(you.frame.params).toEqual({ you: { user_id: toId, name: `Name of ${fromId}`, roles: ['admin'] } });
 		const change = await until(erin, (frame) => frame.method === 'user' && frame.params.old?.user_id === fromId);
-		expect(change.frame.params).toEqual({ new: { user_id: toId, name: `Name of ${fromId}`, roles: ['admin'] }, old: { user_id: fromId, name: `Name of ${fromId}` } });
+		// The new user_id carries the status others were shown under the old one (§4.11).
+		expect(change.frame.params).toEqual({ new: { user_id: toId, name: `Name of ${fromId}`, roles: ['admin'], status: 'online' }, old: { user_id: fromId, name: `Name of ${fromId}` } });
 		const posted = await exchange(dave, 'post', 'message', { room_id: 'general', body: { text: 'renamed' } });
 		expect(posted.frame.result.message_id).toBeDefined();
 		// The earlier message was rewritten to the new id, so it is still theirs to edit.
@@ -229,7 +230,7 @@ it('/invite-token creates a user who signs in with the token, which /rename move
 
 		// The token signs in from any origin, as a registered user in general.
 		const first = await signIn(token);
-		expect(first.reply.result.you).toEqual({ user_id: userId, name: userId, roles: [] });
+		expect(first.reply.result.you).toEqual({ user_id: userId, name: userId, roles: [], status: 'online' });
 		expect((await request(first.peer, 'rename-self', 'me', { name: 'Newcomer' })).result.you.name).toBe('Newcomer');
 		first.peer.close();
 
@@ -300,9 +301,11 @@ it('room_join and room_leave with a user_id add and remove others: an admin anyo
 		expect(joined.frame.params.joined[0].latest_log_id).toBe(joined.frame.params.memberships[0].log_id);
 		expect(joined.frame.params.joined[0]).toMatchObject({ room_id: roomId, title: 'Invites' });
 		expect(joined.frame.params.joined[0].members.map((member: { user_id: string }) => member.user_id)).toEqual(['admin', bobId].sort());
-		// `users` are current objects: the admin's carry its role (§3.3).
-		expect(joined.frame.params.users).toContainEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'] });
-		expect(joined.frame.params.users).toContainEqual({ user_id: bobId, name: `Name of ${bobId}`, roles: [] });
+		// `users` are current objects: the admin's carry its role (§3.3), and each
+		// their status (§4.11). The admin signed in earlier in this file, so what
+		// others were last told of them may still be waiting out a minute.
+		expect(joined.frame.params.users).toContainEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'], status: expect.stringMatching(/^(online|offline)$/) });
+		expect(joined.frame.params.users).toContainEqual({ user_id: bobId, name: `Name of ${bobId}`, roles: [], status: 'online' });
 		// Adding a member again changes nothing.
 		expect((await exchange(admin, 'add-bob-again', 'room_join', { room_id: roomId, user_id: bobId })).skipped.some((frame) => frame.params?.memberships)).toBe(false);
 
@@ -382,7 +385,7 @@ it('never gives out a ~ user_id, which protocol v7 reserves for system identitie
 			expect((await command(admin, text, text)).frame.error.code).toBe(-32602);
 		}
 		// `roles` are the server's to assign: `me` ignores them.
-		expect((await request(admin, 'me', 'me', { roles: ['moderator'] })).result.you).toEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'] });
+		expect((await request(admin, 'me', 'me', { roles: ['moderator'] })).result.you).toEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'], status: 'online' });
 	} finally { admin.close(); guest.close(); }
 });
 
@@ -445,7 +448,7 @@ it('adds a passkey to the signed-in account (§4.9); a guest\'s registration mak
 		expect(told.frame.params.body.text).toMatch(/A passkey was added to your account/);
 		expect(added.begun.result.public_key.user.name).toBe(userId);
 		expect(added.begun.result.public_key.excludeCredentials.map((entry: { id: string }) => entry.id)).toEqual([`cred-${userId}`]);
-		expect(added.finished.result).toEqual({ you: { user_id: userId, name: `Name of ${userId}`, roles: [] } });
+		expect(added.finished.result).toEqual({ you: { user_id: userId, name: `Name of ${userId}`, roles: [], status: 'online' } });
 		const credentials = await runInDurableObject(stub(), (_instance, state) =>
 			state.storage.sql.exec<{ credential_id: string }>('SELECT credential_id FROM credentials WHERE user_id = ? ORDER BY created_ms', userId).toArray().map((row) => row.credential_id));
 		expect(credentials).toEqual([`cred-${userId}`, added.passkey.id]);
@@ -504,7 +507,7 @@ it('/invite mints a sign-up token that creates a user per use, each with its own
 		const ada = await fresh();
 		await request(ada, 'guest', 'auth', { scheme: 'guest' });
 		const signedUp = await request(ada, 'join', 'auth', { scheme: 'token', token: invite, name: 'Ada' });
-		expect(signedUp.result.you).toEqual({ user_id: expect.stringMatching(/^ada_\d{4}$/), name: 'Ada', roles: [] });
+		expect(signedUp.result.you).toEqual({ user_id: expect.stringMatching(/^ada_\d{4}$/), name: 'Ada', roles: [], status: 'online' });
 		expect(signedUp.result.token).toMatch(/^apron_invite_/);
 		const adaId = signedUp.result.you.user_id;
 		// Posting works, and the saved token signs in again as the same user.

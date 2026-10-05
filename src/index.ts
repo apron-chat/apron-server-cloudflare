@@ -1,7 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, pushHostAllowed, type RuntimeConfig } from "./config";
-import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, MAX_FRAME_LEASE, MAX_PUSH_CANDIDATES, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
+import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, DEFAULT_FEATURES, PLAN, MAX_FRAME_LEASE, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type PresenceVariant } from "./budget";
+import { deriveStatus, isStatus, type Status } from "./presence";
 import { fetchAccountUsage, type AccountUsageSnapshot } from "./account-usage";
 import { runBudgetGuard, watchForFlood } from "./budget-guard";
 import { sniffImage } from "./image";
@@ -46,6 +47,7 @@ import {
 	type PushCandidate,
 	type PushSubscriptionRecord,
 	type RoomRecord,
+	type StatusInputRecord,
 	type StoreConfig,
 	type StoreMutationInput,
 	type StoreMutationResult,
@@ -137,8 +139,52 @@ interface ConnectionAttachment {
 	 * (SILENT_IDLE_MS).
 	 */
 	statusSeen?: boolean;
+	/**
+	 * The user's `status` state (§4.11), read at sign-in and kept equal on
+	 * all their connections, so deriving their status needs no SQL: until
+	 * when their unscoped mute lasts (MUTE_FOREVER for `true`), whether they
+	 * are `invisible`, and (`full` presence) until when their latest push
+	 * registration that wakes for messages stays live.
+	 */
+	muteUntil?: number;
+	invisible?: true;
+	pushUntil?: number;
+	/** A `status` `invisible` sent before authentication, applied at a registered sign-in. */
+	pendingInvisible?: boolean;
+	/**
+	 * What the user's status was last announced as (PresenceRecord), kept
+	 * equal on all their connections, so a change waiting to be announced
+	 * survives hibernation.
+	 */
+	pres?: PresenceRecord;
+	/**
+	 * Status changes of users who have no connection left that this
+	 * connection still has to be told, once each is due: `[user_id, status
+	 * last told, status now, when due]`. Kept here, with the connection that
+	 * needs them, so they survive hibernation; at most MAX_OWED.
+	 */
+	owed?: OwedStatus[];
 	closing?: boolean;
 }
+
+/**
+ * A user's announced `status` (§4.11): `s`, what others who share a room
+ * were last told; `y`, what the user's own connections were (`you` ignores
+ * `invisible`); `a`, when (coalescing); `h`, until when a change a closed
+ * connection caused waits (offline grace).
+ */
+interface PresenceRecord {
+	s: Status;
+	y: Status;
+	a: number;
+	h?: number;
+}
+
+/** A pending status change of a user without a connection: `[user_id, status last told, status now, when due]`. */
+type OwedStatus = [string, Status, Status, number];
+
+/** Pending status changes one connection may hold; more are delivered at once. */
+const MAX_OWED = 32;
 
 /** Message types with their own per-user rate (budget.ts). */
 type ThrottledType = "activity" | "room_list";
@@ -227,7 +273,7 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
 	{ name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", audience: "admins" },
 	{ name: "invite", usage: "/invite <uses>", help: `get a token that signs up to <uses> new users (at most ${MAX_JOIN_USES}) for a week, replacing the last one; /invite 0 revokes it`, audience: "admins" },
-	{ name: "toggle", usage: "/toggle <activity|uploads>", help: "turn typing activity or uploads off or on for everyone", audience: "admins" },
+	{ name: "toggle", usage: "/toggle <activity|uploads|presence>", help: "turn typing activity, uploads, or user status (presence) off or on for everyone", audience: "admins" },
 	{ name: "purge", usage: "/purge <user_id>", help: "disconnect a user and delete their account, bot, and everything they posted or uploaded", audience: "admins" },
 	{ name: "status", usage: "/status", help: "show today's Cloudflare usage and the demo's budgets", audience: "admins" },
 ];
@@ -240,7 +286,7 @@ const GUEST_READ_ONLY = "Guests can only read here; sign in with a passkey to po
  */
 const BOT_ID_PREFIX = "bot_";
 /** Features an admin can turn off and on with `/toggle`. */
-type ToggleFeature = "activity" | "uploads";
+type ToggleFeature = "activity" | "uploads" | "presence";
 /**
  * The registered user `APRON_ADMIN_TOKEN` signs in as (ADMIN_USER_ID, `admin`)
  * is always an admin. Registered users are `<name>_<digits>` or `u_…`, so no
@@ -435,6 +481,9 @@ function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		admissionEnabled: !config.admissionOff,
 		uploads: config.uploads && UPLOAD_POLICY ? { ...UPLOAD_POLICY, mediaOrigin: config.uploads.mediaOrigin } : null,
 		push: config.push && PUSH_POLICY ? { ...PUSH_POLICY } : null,
+		// A member listing is reused until anything it read is written, and
+		// never longer than a status change may wait.
+		memberCacheMs: limits.statusCoalesceSeconds * 1_000,
 		processedFramesPerDay: limits.processedFramesPerDay,
 		framesPerIpMinute: limits.framesPerIpMinute,
 		connectionAdmissionsPerIpMinute: limits.connectionAdmissionsPerIpMinute,
@@ -493,6 +542,11 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			...(attachment.idle === true ? { idle: true } : {}),
 			...(attachment.pendingMute === true || (Number.isSafeInteger(attachment.pendingMute) && (attachment.pendingMute as number) >= 0) ? { pendingMute: attachment.pendingMute } : {}),
 			...(attachment.statusSeen === true ? { statusSeen: true } : {}),
+			...(Number.isSafeInteger(attachment.muteUntil) && (attachment.muteUntil as number) > 0 ? { muteUntil: attachment.muteUntil } : {}),
+			...(attachment.invisible === true ? { invisible: true } : {}),
+			...(Number.isSafeInteger(attachment.pushUntil) && (attachment.pushUntil as number) > 0 ? { pushUntil: attachment.pushUntil } : {}),
+			...(typeof attachment.pendingInvisible === "boolean" ? { pendingInvisible: attachment.pendingInvisible } : {}),
+			...presenceState(attachment),
 			authDeadline: typeof attachment.authDeadline === "number" ? attachment.authDeadline : 0,
 			pendingFrames: typeof attachment.pendingFrames === "number" ? attachment.pendingFrames : 0,
 			pendingBytes: typeof attachment.pendingBytes === "number" ? attachment.pendingBytes : 0,
@@ -505,6 +559,31 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 	} catch {
 		return null;
 	}
+}
+
+/** The presence fields of a stored attachment (`pres`, `owed`), type-checked and bounded. */
+function presenceState(attachment: Partial<ConnectionAttachment>): Pick<ConnectionAttachment, "pres" | "owed"> {
+	const out: Pick<ConnectionAttachment, "pres" | "owed"> = {};
+	const pres = attachment.pres;
+	if (pres && typeof pres === "object" && isStatus(pres.s) && isStatus(pres.y) && Number.isSafeInteger(pres.a)) {
+		out.pres = { s: pres.s, y: pres.y, a: pres.a, ...(Number.isSafeInteger(pres.h) ? { h: pres.h } : {}) };
+	}
+	if (Array.isArray(attachment.owed)) {
+		const owed = attachment.owed.filter((entry): entry is OwedStatus => Array.isArray(entry) && entry.length === 4 &&
+			typeof entry[0] === "string" && entry[0].length > 0 && entry[0].length <= 128 && isStatus(entry[1]) && isStatus(entry[2]) && Number.isSafeInteger(entry[3])).slice(0, MAX_OWED);
+		if (owed.length) out.owed = owed.map((entry) => [...entry] as OwedStatus);
+	}
+	return out;
+}
+
+/** Keeps a user's stored `status` inputs (Store.statusInputs) on one of their connections. */
+function applyStatusInputs(state: ConnectionAttachment, stored: StatusInputRecord): void {
+	if (stored.muteUntil !== undefined) state.muteUntil = stored.muteUntil;
+	else delete state.muteUntil;
+	if (stored.invisible) state.invisible = true;
+	else delete state.invisible;
+	if (stored.pushUntil !== undefined) state.pushUntil = stored.pushUntil;
+	else delete state.pushUntil;
 }
 
 /** The throttle fields of a stored attachment, bounded and type-checked. */
@@ -558,6 +637,11 @@ function writeSessionAttachment(socket: WebSocketConnection, attachment: Connect
 		else delete attachment.pendingMute;
 		if (current.statusSeen) attachment.statusSeen = true;
 		else delete attachment.statusSeen;
+		// Kept current by other connections' events meanwhile.
+		for (const key of ["muteUntil", "invisible", "pushUntil", "pendingInvisible", "pres", "owed"] as const) {
+			if (current[key] !== undefined) (attachment as unknown as Record<string, unknown>)[key] = current[key];
+			else delete attachment[key];
+		}
 	}
 	writeAttachment(socket, attachment);
 }
@@ -663,7 +747,7 @@ function identityOf(attachment: ConnectionAttachment): IdentityShape | null {
  * A user object as this server sends it (§3.3): `user_id` and `name`, and in
  * current objects `avatar` and `roles`.
  */
-type PublicUser = { user_id: string; name?: string; avatar?: string; roles?: string[]; mute?: number | true };
+type PublicUser = { user_id: string; name?: string; avatar?: string; roles?: string[]; status?: Status; mute?: number | true; invisible?: boolean };
 
 /**
  * A room in a listing, with `members` when asked for (§4.3.1), and
@@ -977,8 +1061,29 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private guestLimit = 0;
 	/** `push_register` requests per user (`registersPerUserMinute`), counted across reconnects. */
 	private readonly pushRegisters = new UserRateLimit(PUSH_POLICY?.registersPerUserMinute ?? 1);
-	/** `status` `mute` changes per user (`mutesPerUserMinute`), counted across reconnects. */
+	/** `status` `mute` and `invisible` changes per user (`mutesPerUserMinute`), counted across reconnects. */
 	private readonly muteChanges = new UserRateLimit(PUSH_POLICY?.mutesPerUserMinute ?? 1);
+	/**
+	 * When each user's status was last announced, for `statusCoalesceSeconds`;
+	 * at most USER_RATE_LIMIT_USERS, the least recently announced go first.
+	 * Also kept in each connection's `pres.a`, so a wake loses only users who
+	 * have no connection, whose next announcement may then come sooner.
+	 */
+	private readonly announcedAt = new Map<string, number>();
+	/** The one timer that announces waiting status changes, and when it fires. */
+	private presenceTimer: ReturnType<typeof setTimeout> | undefined;
+	private presenceTimerAt = Number.POSITIVE_INFINITY;
+	/**
+	 * When the next waiting status change is due, timer or not: with no
+	 * connection that is told of changes, nothing needs it on time, so no
+	 * timer keeps the object awake for it, and the next event sweeps it.
+	 */
+	private presenceDueAt = Number.POSITIVE_INFINITY;
+	/** When attachments were last swept for status changes; 0 after a wake, so the first event sweeps. */
+	private presenceSweptAt = 0;
+	/** Status work runs one at a time; what a delivery failure starts meanwhile waits here. */
+	private presenceBusy = false;
+	private readonly presenceQueue: Array<() => void> = [];
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -1010,6 +1115,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const ipKey = trustedIpKey(request);
 		if (!ipKey) return responseError(403, "Trusted client address unavailable");
 		if (this.config.admissionOff) return responseError(503, "Demo admission is closed");
+		this.sweepPresence();
 		this.noteAccountUsageActivity(this.runtimeEnv);
 		if (this.accountUsageBlocked(nowMs())) return responseError(503, "Demo account capacity reached", 300_000);
 		const origin = request.headers.get("Origin");
@@ -1065,6 +1171,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
 		const socket = ws as WebSocketConnection;
+		// Before the attachment is read: the sweep may write it.
+		this.sweepPresence();
 		const attachment = connectionAttachment(socket);
 		if (!attachment || attachment.closing) return Promise.resolve();
 		this.noteAccountUsageActivity(this.runtimeEnv);
@@ -1110,27 +1218,34 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	async webSocketClose(ws: WebSocket, code = 1000): Promise<void> {
 		const socket = ws as WebSocketConnection;
+		this.sweepPresence();
 		const attachment = connectionAttachment(socket);
 		if (!attachment) return;
+		const closed = attachment.closing === true;
 		attachment.closing = true;
 		writeAttachment(socket, attachment);
 		try { socket.close(code === 1005 || code === 1006 ? 1000 : code); } catch { /* already closed */ }
+		if (!closed) this.connectionGone(attachment);
 		await this.rescheduleAlarm();
 	}
 
 	async webSocketError(ws: WebSocket): Promise<void> {
 		const socket = ws as WebSocketConnection;
+		this.sweepPresence();
 		const attachment = connectionAttachment(socket);
 		if (!attachment) return;
+		const closed = attachment.closing === true;
 		attachment.closing = true;
 		writeAttachment(socket, attachment);
 		try { socket.close(1011, "Connection failed"); } catch { /* already closed */ }
+		if (!closed) this.connectionGone(attachment);
 		await this.rescheduleAlarm();
 	}
 
 	async alarm(): Promise<void> {
 		this.alarmKnown = false;
 		const now = nowMs();
+		this.sweepPresence(now);
 		await this.refreshAccountUsage(this.runtimeEnv, now, false);
 		for (const ws of this.ctx.getWebSockets()) {
 			const socket = ws as WebSocketConnection;
@@ -1204,6 +1319,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	private serverAnnouncement(origin: string | null): Record<string, unknown> {
 		const limits = this.config.limits;
+		const presence = this.presenceMode();
 		return {
 			method: "server",
 			params: {
@@ -1252,6 +1368,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 						read_cursors: false,
 						// With `activity`, typing is relayed; read cursors are neither kept nor relayed.
 						...(this.activityOn() ? { activity_per_minute: limits.activityBroadcastsPerUserMinute } : {}),
+						// User `status` (§4.11): `full`, or `connected` (users without a
+						// connection show offline); a change may wait this long.
+						...(presence ? { presence, status_delay_seconds: Math.max(limits.statusCoalesceSeconds, limits.offlineGraceSeconds) } : {}),
 					},
 				},
 			},
@@ -1317,10 +1436,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	private closePolicy(socket: WebSocketConnection, attachment: ConnectionAttachment, code: number, reason: string): void {
+		const closed = attachment.closing === true || connectionAttachment(socket)?.closing === true;
 		attachment.policyViolations = [...attachment.policyViolations.filter((at) => at > nowMs() - 60_000), nowMs()];
 		attachment.closing = true;
 		writeAttachment(socket, attachment);
 		try { socket.close(code, reason.slice(0, 120)); } catch { /* already closed */ }
+		if (!closed) this.connectionGone(attachment);
 	}
 
 	private handleFrameFailure(socket: WebSocketConnection, error: unknown): void {
@@ -1539,10 +1660,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// A new guest has joined the default room (§3.4).
 			attachment.rooms = [...DEFAULT_JOINED_ROOMS];
 			delete attachment.listedJoined;
-			// A guest gets no pushes, so a mute sent before signing in is dropped.
-			delete attachment.pendingMute;
 			writeAttachment(socket, attachment);
-			this.reply(socket, request, { you: this.current(attachment) });
+			// A guest gets no pushes, so a mute sent before signing in is dropped.
+			this.prepareStatus(socket);
+			this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment) });
+			this.presenceSignedIn(socket);
 			await this.rescheduleAlarm();
 			return;
 		}
@@ -1667,9 +1789,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.rooms = this.registeredRooms(socket, finished.identity.user_id);
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
-		this.applyPendingMute(socket);
-		this.reply(socket, request, { you: this.you(attachment), token });
+		this.prepareStatus(socket);
+		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), token });
 		if (guest) this.announceUser(socket, this.current(attachment), [...guestRooms, ...attachment.rooms], guest);
+		this.presenceSignedIn(socket);
 		this.refreshAvatar(finished.identity.user_id);
 		await this.rescheduleAlarm();
 	}
@@ -1769,9 +1892,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
-		this.applyPendingMute(socket);
-		this.reply(socket, request, { you: this.you(attachment), token });
+		this.prepareStatus(socket);
+		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), token });
 		if (guest) this.announceUser(socket, this.current(attachment), [...guestRooms, ...attachment.rooms], guest);
+		this.presenceSignedIn(socket);
 		this.refreshAvatar(identity.userId);
 		await this.rescheduleAlarm();
 	}
@@ -1848,9 +1972,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
-		this.applyPendingMute(socket);
-		this.reply(socket, request, { you: this.you(attachment), ...(token ? { token } : {}) });
+		this.prepareStatus(socket);
+		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), ...(token ? { token } : {}) });
 		if (guest) this.announceUser(socket, this.current(attachment), [...guestRooms, ...attachment.rooms], guest);
+		this.presenceSignedIn(socket);
 		this.refreshAvatar(identity.userId);
 		await this.rescheduleAlarm();
 	}
@@ -2135,8 +2260,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!current) return;
 			// A removed name is announced as its empty value (§3.3).
 			const you = { ...this.current(current)!, ...(current.name ? {} : { name: "" }) };
-			const mute = this.you(current)?.mute;
-			this.reply(socket, request, { you: mute === undefined ? you : { ...you, mute } });
+			this.reply(socket, request, { you: { ...this.you(current), ...(current.name ? {} : { name: "" }) } });
 			// Section 3.3: `you` to the user's other connections, `new` to those who share a room with the user.
 			if (!result.deduplicated) this.announceUser(socket, you, current.rooms ?? []);
 		});
@@ -2276,6 +2400,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (identity.tier !== "registered") {
 			this.setRooms(identity.user_id, [...current, roomId]);
 			this.sendToUser(identity.user_id, this.joinedUpdate(known, before.get(roomId), joiner, totals.get(roomId)));
+			this.announceJoiner(identity.user_id, roomId);
 			this.reply(socket, request, {});
 			return;
 		}
@@ -2286,6 +2411,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// get it with the room and its members (§4.3.2).
 			if (change.membership) this.broadcastRecord(change.membership, identity.user_id);
 			this.sendToUser(identity.user_id, this.joinedUpdate(change.room ?? known, before.get(roomId), joiner, totals.get(roomId), change.membership));
+			if (change.changed) this.announceJoiner(identity.user_id, roomId);
 			this.reply(socket, request, {});
 		});
 	}
@@ -2324,6 +2450,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				const state = peer ? connectionAttachment(peer) : null;
 				const joiner = state ? this.current(state) : null;
 				if (joiner) this.sendToUser(userId, this.joinedUpdate(change.room ?? room, before.get(room.room_id), joiner, totals.get(room.room_id), change.membership));
+				this.announceJoiner(userId, room.room_id);
 			}
 			this.reply(socket, request, {});
 		});
@@ -2412,19 +2539,21 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `status` (§4.11), a notification, implemented in part: unscoped `idle`
-	 * and `mute`. `idle` marks this connection unattended (true) or attended
-	 * (false), kept in the attachment, so it survives hibernation; only
-	 * `idle: false` ends it, and closing removes the connection. `mute` is
-	 * the user's: seconds to stay quiet (cut to MAX_MUTE_SECONDS), `true`
-	 * until changed, or `0` to end it; stored, so it outlasts the connection,
-	 * and echoed in `you` to the user's connections when it changes. Guests
-	 * get no pushes, so their mute is ignored. Both may come before
-	 * authentication: `idle` applies at once, and `mute` once the connection
-	 * signs in as a registered user. With `room_id`, `mute` is the room's,
-	 * which this server does not implement, and a scoped `idle` or
-	 * `invisible` is ignored, so such an update changes nothing. `invisible`,
-	 * unknown fields, and invalid values are ignored, each on its own.
+	 * `status` (§4.11), a notification: unscoped `idle`, `mute` and, with
+	 * presence on, `invisible`. `idle` marks this connection unattended (true)
+	 * or attended (false), kept in the attachment, so it survives
+	 * hibernation; only `idle: false` ends it, and closing removes the
+	 * connection. `mute` is the user's: seconds to stay quiet (cut to
+	 * MAX_MUTE_SECONDS), `true` until changed, or `0` to end it. `invisible`
+	 * is the user's too: others see them `offline`. Both are stored, so they
+	 * outlast the connection, and echoed in `you` to the user's connections
+	 * when they change. Guests get no pushes and appear only while connected,
+	 * so their `mute` and `invisible` are ignored. All may come before
+	 * authentication: `idle` applies at once, `mute` and `invisible` once the
+	 * connection signs in as a registered user. With `room_id`, `mute` is the
+	 * room's, which this server does not implement, and a scoped `idle` or
+	 * `invisible` is ignored, so such an update changes nothing. Unknown
+	 * fields and invalid values are ignored, each on its own.
 	 */
 	private handleStatus(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): void {
 		const params = request.params;
@@ -2438,90 +2567,184 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (state && !state.statusSeen) {
 				state.statusSeen = true;
 				writeAttachment(socket, state);
+				// Now someone may be told of changes: one waiting needs the timer.
+				this.armPresence(this.presenceDueAt);
 			}
 			this.setIdle(socket, idle);
 		}
 		const mute = params.mute;
-		if (mute !== true && !(typeof mute === "number" && Number.isSafeInteger(mute) && mute >= 0)) return;
+		const validMute = mute === true || (typeof mute === "number" && Number.isSafeInteger(mute) && mute >= 0);
+		// Without presence, `invisible` is not implemented and ignored.
+		const invisible = typeof params.invisible === "boolean" && this.presenceMode() ? params.invisible : undefined;
+		if (!validMute && invisible === undefined) return;
 		if (attachment.tier === "pending") {
 			const state = connectionAttachment(socket);
 			if (!state) return;
-			state.pendingMute = mute as number | true;
+			if (validMute) state.pendingMute = mute as number | true;
+			if (invisible !== undefined) state.pendingInvisible = invisible;
 			writeAttachment(socket, state);
 			return;
 		}
 		if (attachment.tier !== "registered") return;
 		// Each change writes rows: past `mutesPerUserMinute` a user's changes
-		// are dropped, quietly, as invalid fields are.
+		// (mute and invisible together) are dropped, quietly, as invalid fields are.
 		const now = nowMs();
-		if (!this.muteChanges.take(attachment.userId!, now)) return;
-		this.changeMute(attachment.userId!, mute as number | true, now);
+		if (validMute && this.muteChanges.take(attachment.userId!, now)) this.changeMute(attachment.userId!, mute as number | true, now);
+		if (invisible !== undefined && this.muteChanges.take(attachment.userId!, now)) this.changeInvisible(attachment.userId!, invisible, now);
 	}
 
 	/**
 	 * Stores a registered user's mute, as `status` sends it (seconds, cut to
-	 * MAX_MUTE_SECONDS, from `now`; `true`; or 0 to end it) and, on a change,
-	 * sends `user` `you` with the result to every connection of theirs but
-	 * `except` (§4.11): the seconds left, `true`, or `0` once ended. Never
-	 * shown to others.
+	 * MAX_MUTE_SECONDS, from `now`; `true`; or 0 to end it), keeps it on each
+	 * of their connections and, on a change, sends `user` `you` with the
+	 * result to every connection of theirs but `except` (§4.11): the seconds
+	 * left, `true`, or `0` once ended, with their `status`. Others see only
+	 * `dnd` (announceStatus).
 	 */
 	private changeMute(userId: string, mute: number | true, now: number, except?: WebSocketConnection): void {
 		const untilMs = mute === true ? MUTE_FOREVER : mute === 0 ? null : now + Math.min(mute, MAX_MUTE_SECONDS) * 1_000;
 		const result = this.store.setMute({ userId, untilMs, now });
 		if (!result.changed) return;
+		this.cacheStatusInputs(userId, (state) => {
+			if (result.untilMs !== undefined) state.muteUntil = result.untilMs;
+			else delete state.muteUntil;
+		});
 		// A change that ended the mute is echoed as `mute: 0` (§4.11).
-		const field = { mute: result.mute ?? 0 };
+		this.echoStatus(userId, { mute: result.mute ?? 0 }, now, except);
+	}
+
+	/**
+	 * Stores whether a registered user is `invisible` (§4.11), keeps it on
+	 * each of their connections, and on a change echoes it in `you` to every
+	 * connection of theirs but `except`, with their `status`. Others see the
+	 * user `offline`: turning it on is announced at once, without waiting
+	 * for `statusCoalesceSeconds`, so nobody keeps seeing them online.
+	 */
+	private changeInvisible(userId: string, invisible: boolean, now: number, except?: WebSocketConnection): void {
+		if (!this.store.setInvisible({ userId, invisible, now }).changed) return;
+		this.cacheStatusInputs(userId, (state) => {
+			if (invisible) state.invisible = true;
+			else delete state.invisible;
+		});
+		this.echoStatus(userId, { invisible }, now, except, invisible);
+	}
+
+	/** Applies `change` to the cached status inputs on each of a user's connections. */
+	private cacheStatusInputs(userId: string, change: (state: ConnectionAttachment) => void): void {
+		for (const peer of this.connectionsOf(userId)) {
+			const state = connectionAttachment(peer);
+			if (!state) continue;
+			change(state);
+			writeAttachment(peer, state);
+		}
+	}
+
+	/**
+	 * The echo of a `mute` or `invisible` change (§4.11): `user` `you` with
+	 * `field` and, with presence on, the user's own `status`, to each of
+	 * their connections but `except`; then whatever others are owed of it.
+	 */
+	private echoStatus(userId: string, field: { mute?: number | true; invisible?: boolean }, now: number, except?: WebSocketConnection, immediate = false): void {
+		const mode = this.presenceMode();
+		const self = mode ? this.deriveConnected(this.liveStatesOf(userId), now).self : undefined;
 		for (const peer of this.connectionsOf(userId, except)) {
 			const state = connectionAttachment(peer);
 			const user = state ? this.current(state) : null;
-			if (user) this.deliverTo(peer, { method: "user", params: { you: { ...user, ...field } } });
+			if (user) this.deliverTo(peer, { method: "user", params: { you: { ...user, ...(self ? { status: self } : {}), ...field } } });
 		}
+		if (!mode || !self) return;
+		// The echo told the user's connections their status: record it, so it
+		// is not sent again, then tell others what they are owed.
+		for (const { socket: peer, state } of this.liveStatesOf(userId)) {
+			if (!state.pres) continue;
+			state.pres = { ...state.pres, y: self };
+			writeAttachment(peer, state);
+		}
+		this.touchPresence(userId, now, { immediate });
 	}
 
 	/**
-	 * Applies a `status` `mute` sent before this connection signed in, now
-	 * that it is a registered user's, timed from now. A failure leaves the
-	 * sign-in as it was: the mute is dropped, and the client can send it again.
+	 * Applies a `status` `mute` and `invisible` sent before this connection
+	 * signed in, now that it is a registered user's, timed from now. A
+	 * failure leaves the sign-in as it was: the change is dropped, and the
+	 * client can send it again.
 	 */
-	private applyPendingMute(socket: WebSocketConnection): void {
+	private applyPendingStatus(socket: WebSocketConnection): void {
 		const state = connectionAttachment(socket);
-		if (!state || state.pendingMute === undefined) return;
+		if (!state || (state.pendingMute === undefined && state.pendingInvisible === undefined)) return;
 		const mute = state.pendingMute;
+		const invisible = state.pendingInvisible;
 		delete state.pendingMute;
+		delete state.pendingInvisible;
 		writeAttachment(socket, state);
 		if (state.tier !== "registered" || !state.userId) return;
 		try {
-			// This connection learns the mute from its auth result.
-			this.changeMute(state.userId, mute, nowMs(), socket);
+			// This connection learns the change from its auth result.
+			if (mute !== undefined) this.changeMute(state.userId, mute, nowMs(), socket);
+			if (invisible !== undefined && this.presenceMode()) this.changeInvisible(state.userId, invisible, nowMs(), socket);
 		} catch (error) {
-			console.warn(JSON.stringify({ event: "pending_mute_failed", reason: errorToProtocol(error).message }));
+			console.warn(JSON.stringify({ event: "pending_status_failed", reason: errorToProtocol(error).message }));
 		}
 	}
 
 	/**
-	 * A registered user's `mute` as `you` carries it on a push server
-	 * (§4.11): the seconds left or `true`, left out when not muted. Empty
-	 * without push, or when it cannot be read: a reply never fails on it.
+	 * Readies a connection that just signed in for its user's `status`:
+	 * forgets what it held for an identity it had before, reads a registered
+	 * user's stored mute, `invisible` and (`full` presence) latest waking
+	 * registration once, keeping them on the connection (see
+	 * ConnectionAttachment.muteUntil), then applies what it sent before
+	 * signing in. Call before replying with `you`; presenceSignedIn after.
 	 */
-	private muteField(userId: string, now = nowMs()): { mute?: number | true } {
-		if (!this.config.push) return {};
-		try {
-			const mute = this.store.muteOf(userId, now);
-			return mute !== undefined ? { mute } : {};
-		} catch {
-			return {};
+	private prepareStatus(socket: WebSocketConnection): void {
+		const state = connectionAttachment(socket);
+		if (!state) return;
+		for (const key of ["muteUntil", "invisible", "pushUntil", "pres"] as const) delete state[key];
+		if (state.tier === "anonymous") {
+			// A guest gets no pushes and is seen only while connected.
+			delete state.pendingMute;
+			delete state.pendingInvisible;
 		}
+		if (state.tier === "registered" && state.userId && this.config.push) {
+			try {
+				const stored = this.store.statusInputs(state.userId, this.presenceMode() === "full", nowMs());
+				applyStatusInputs(state, stored);
+			} catch (error) {
+				// The reply never fails on it: `you` leaves the mute out, as unread.
+				console.warn(JSON.stringify({ event: "status_inputs_failed", reason: errorToProtocol(error).message }));
+			}
+		}
+		writeAttachment(socket, state);
+		this.applyPendingStatus(socket);
 	}
 
 	/**
 	 * A connection's own user object (`you`, §3.3): its current object and,
-	 * for a registered user on a push server, `mute` (see muteField), which
-	 * is never shown to others.
+	 * for a registered user on a push server, `mute` (seconds left, or
+	 * `true`), with presence on, `invisible` while set and their `status`,
+	 * which here ignores `invisible` (§4.11). None of these is ever shown to
+	 * others.
 	 */
 	private you(attachment: ConnectionAttachment): PublicUser | null {
 		const user = this.current(attachment);
-		if (!user || attachment.tier !== "registered") return user;
-		return { ...user, ...this.muteField(user.user_id) };
+		if (!user) return user;
+		const now = nowMs();
+		const mode = this.presenceMode();
+		return {
+			...user,
+			...(mode ? { status: this.deriveConnected(this.liveStatesOf(user.user_id), now).self } : {}),
+			...this.ownStatusFields(attachment),
+		};
+	}
+
+	/** A registered user's `mute` and, with presence on, `invisible`, as their own `you` carries them (see you). */
+	private ownStatusFields(attachment: ConnectionAttachment): { mute?: number | true; invisible?: boolean } {
+		if (attachment.tier !== "registered" || !this.config.push) return {};
+		const now = nowMs();
+		const until = attachment.muteUntil ?? 0;
+		return {
+			...(until > now ? { mute: until >= MUTE_FOREVER ? true as const : Math.ceil((until - now) / 1_000) } : {}),
+			...(attachment.invisible && this.presenceMode() ? { invisible: true } : {}),
+		};
 	}
 
 	/** Marks a connection idle or attended (`status` `idle`, §4.11), writing its attachment only on a change. */
@@ -2531,6 +2754,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (idle) state.idle = true;
 		else delete state.idle;
 		writeAttachment(socket, state);
+		if (state.tier === "anonymous" || state.tier === "registered") this.touchPresence(state.userId);
 	}
 
 	/**
@@ -2541,13 +2765,505 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * count); one whose client sends `status` is idle only when it says so.
 	 */
 	private attended(userId: string, now: number): boolean {
-		return this.connectionsOf(userId).some((peer) => {
-			const state = connectionAttachment(peer);
-			if (!state || state.idle || this.isStale(peer, now)) return false;
-			if (state.statusSeen) return true;
-			const last = state.frameTimes[state.frameTimes.length - 1] ?? 0;
-			return now - last < SILENT_IDLE_MS;
+		return this.connectionsOf(userId).some((peer) => this.attendedConnection(peer, connectionAttachment(peer), now));
+	}
+
+	/** Whether one connection is attended (see attended). */
+	private attendedConnection(socket: WebSocketConnection, state: ConnectionAttachment | null, now: number): boolean {
+		if (!state || state.idle || this.isStale(socket, now)) return false;
+		if (state.statusSeen) return true;
+		const last = state.frameTimes[state.frameTimes.length - 1] ?? 0;
+		return now - last < SILENT_IDLE_MS;
+	}
+
+	// User `status` shown to others (§4.11). A user's status is derived from
+	// their connections' attachments (attended or idle, and the mute and
+	// `invisible` cached there) and, for a user without one, from storage
+	// (`full`) or as `offline` (`connected`). What others were last told is
+	// kept on the user's connections (`pres`), and for a user whose last
+	// connection closed, on each connection still owed the change (`owed`),
+	// so a change waiting to be announced survives hibernation. A change
+	// goes out at most once a `statusCoalesceSeconds` per user, the latest
+	// winning, and one a closed connection caused waits `offlineGraceSeconds`
+	// first, so a reload or a reconnect shows nothing. One in-memory timer
+	// announces what is due, and so keeps the object awake until then (at
+	// most MAX_STATUS_DELAY_SECONDS); events sweep too. Changes go only to
+	// connections that have sent `status` (§4.11 allows it), as `user` `new`
+	// to others who share a room and `you` to the user's own.
+
+	/** Presence as configured and toggled: off without push, which capability `status` needs. */
+	private presenceMode(): PresenceVariant | false {
+		if (!this.config.push) return false;
+		let toggled: boolean | undefined;
+		try {
+			toggled = this.toggled("presence");
+		} catch {
+			// The toggle is read once per wake; if it cannot be, the default applies.
+			toggled = undefined;
+		}
+		if (!(toggled ?? this.config.presence !== false)) return false;
+		return this.config.presence || DEFAULT_FEATURES.presence || "connected";
+	}
+
+	/** Forgets every announced status and pending change (`/toggle presence`). */
+	private resetPresence(): void {
+		if (this.presenceTimer !== undefined) clearTimeout(this.presenceTimer);
+		this.presenceTimer = undefined;
+		this.presenceTimerAt = Number.POSITIVE_INFINITY;
+		this.presenceDueAt = Number.POSITIVE_INFINITY;
+		this.announcedAt.clear();
+		for (const ws of this.ctx.getWebSockets()) {
+			const socket = ws as WebSocketConnection;
+			const state = connectionAttachment(socket);
+			if (!state || (state.pres === undefined && state.owed === undefined)) continue;
+			delete state.pres;
+			delete state.owed;
+			writeAttachment(socket, state);
+		}
+	}
+
+	/**
+	 * Connections the runtime already reports closing or closed whose close
+	 * this object has not yet handled: handled now, so their users' status
+	 * waits out the grace like any close rather than changing at once.
+	 */
+	private noteClosedSockets(): void {
+		for (const ws of this.ctx.getWebSockets()) {
+			const socket = ws as WebSocketConnection;
+			if (openSocket(socket) || socket.readyState === 0) continue;
+			const state = connectionAttachment(socket);
+			if (!state || state.closing) continue;
+			state.closing = true;
+			writeAttachment(socket, state);
+			this.connectionGone(state);
+		}
+	}
+
+	/** A user's authenticated, open connections with their attachments. */
+	private liveStatesOf(userId: string): Array<{ socket: WebSocketConnection; state: ConnectionAttachment }> {
+		const states: Array<{ socket: WebSocketConnection; state: ConnectionAttachment }> = [];
+		for (const socket of this.connectionsOf(userId)) {
+			const state = connectionAttachment(socket);
+			if (state) states.push({ socket, state });
+		}
+		return states;
+	}
+
+	/** A connected user's status, for others and for their own `you`, from their connections. */
+	private deriveConnected(states: ReadonlyArray<{ socket: WebSocketConnection; state: ConnectionAttachment }>, now: number): { others: Status; self: Status } {
+		const registered = states.some(({ state }) => state.tier === "registered");
+		const inputs = {
+			invisible: registered && states.some(({ state }) => state.invisible),
+			muted: registered && states.some(({ state }) => (state.muteUntil ?? 0) > now),
+			connected: states.length > 0,
+			attended: states.some(({ socket, state }) => this.attendedConnection(socket, state, now)),
+			push: false,
+		};
+		return { others: deriveStatus(inputs), self: deriveStatus(inputs, true) };
+	}
+
+	/**
+	 * A user's status with no connection (§4.11): `offline` when invisible or
+	 * muted (dnd needs a connection), `idle` with a live waking registration
+	 * under `full` presence, else `offline` (`connected` shows everyone without
+	 * a connection `offline`).
+	 */
+	private deriveDisconnected(inputs: StatusInputRecord | Pick<ConnectionAttachment, "muteUntil" | "invisible" | "pushUntil">, now: number, mode: PresenceVariant): Status {
+		return deriveStatus({
+			invisible: inputs.invisible === true,
+			muted: (inputs.muteUntil ?? 0) > now,
+			connected: false,
+			attended: false,
+			push: mode === "full" && (inputs.pushUntil ?? 0) > now,
 		});
+	}
+
+	/** Writes a user's announced status onto each of their connections. */
+	private writePresence(states: ReadonlyArray<{ socket: WebSocketConnection }>, pres: PresenceRecord): void {
+		for (const { socket } of states) {
+			const state = connectionAttachment(socket);
+			if (!state) continue;
+			state.pres = { ...pres };
+			if (pres.h === undefined) delete state.pres.h;
+			writeAttachment(socket, state);
+		}
+	}
+
+	/** When a user's status was last announced, as far as this object knows. */
+	private lastAnnounced(userId: string, pres?: PresenceRecord): number {
+		return Math.max(this.announcedAt.get(userId) ?? 0, pres?.a ?? 0);
+	}
+
+	private noteAnnounced(userId: string, now: number): void {
+		this.announcedAt.delete(userId);
+		this.announcedAt.set(userId, now);
+		if (this.announcedAt.size > USER_RATE_LIMIT_USERS) this.announcedAt.delete(this.announcedAt.keys().next().value!);
+	}
+
+	/**
+	 * Runs status work one piece at a time: a delivery that fails closes its
+	 * connection, whose own status work then waits for this to finish.
+	 */
+	private presenceWork(work: () => void): void {
+		if (this.presenceBusy) {
+			this.presenceQueue.push(work);
+			return;
+		}
+		this.presenceBusy = true;
+		try {
+			work();
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "presence_failed", reason: errorToProtocol(error).message }));
+		} finally {
+			this.presenceBusy = false;
+		}
+		const queued = this.presenceQueue.splice(0);
+		for (const next of queued) this.presenceWork(next);
+	}
+
+	/**
+	 * Re-derives one user's status after something that may have changed it,
+	 * and announces it, or schedules it when due (see the section comment).
+	 * `hold`: a connection closed, so the change waits `offlineGraceSeconds`.
+	 * `closing`: that connection's attachment, which tells, when it was the
+	 * last, what others were told and what they are owed now.
+	 * `immediate`: announce now, whatever the coalescing (invisible).
+	 */
+	private touchPresence(userId: string | undefined, now = nowMs(), options: { hold?: boolean; closing?: ConnectionAttachment; immediate?: boolean } = {}): void {
+		if (!userId) return;
+		const mode = this.presenceMode();
+		if (!mode) return;
+		if (!this.presenceBusy) this.noteClosedSockets();
+		this.presenceWork(() => {
+			const limits = this.config.limits;
+			const coalesceMs = limits.statusCoalesceSeconds * 1_000;
+			const graceMs = limits.offlineGraceSeconds * 1_000;
+			const states = this.liveStatesOf(userId);
+			if (states.length) {
+				const derived = this.deriveConnected(states, now);
+				const pres = states.find(({ state }) => state.pres)?.state.pres;
+				if (!pres) {
+					// Nothing was announced for them on this object: start from now.
+					this.writePresence(states, { s: derived.others, y: derived.self, a: this.lastAnnounced(userId) });
+					return;
+				}
+				if (derived.others === pres.s && derived.self === pres.y) {
+					// Back to what others were told (a reconnect within the grace): nothing to send.
+					if (pres.h !== undefined) this.writePresence(states, { s: pres.s, y: pres.y, a: pres.a });
+					return;
+				}
+				const hold = Math.max(pres.h ?? 0, options.hold ? now + graceMs : 0);
+				const due = options.immediate ? now : Math.max(this.lastAnnounced(userId, pres) + coalesceMs, hold);
+				if (due <= now) {
+					this.announceStatus(userId, states, derived, pres, now);
+					return;
+				}
+				if (hold > now && hold !== pres.h) this.writePresence(states, { ...pres, h: hold });
+				this.armPresence(due);
+				return;
+			}
+			// Their last connection closed: whoever shares a room is owed the change.
+			const closing = options.closing;
+			if (!closing?.pres) return;
+			const told = closing.pres.s;
+			const status = this.deriveDisconnected(closing, now, mode);
+			const due = options.immediate ? now : Math.max(this.lastAnnounced(userId, closing.pres) + coalesceMs, options.hold ? now + graceMs : 0);
+			this.oweStatus(userId, closing.rooms ?? [], told, status, due, now);
+		});
+	}
+
+	/**
+	 * Tells those who share one of `rooms` with a user who has no connection
+	 * that their status is now `status`, once `due`: at once if due, else as
+	 * an `owed` entry on each connection, sent when due (flushPresence) or
+	 * dropped if the user comes back first (presenceSignedIn).
+	 */
+	private oweStatus(userId: string, rooms: readonly string[], told: Status, status: Status, due: number, now: number): void {
+		const shared = new Set(rooms);
+		let owing = false;
+		const toldNow: WebSocketConnection[] = [];
+		for (const ws of this.ctx.getWebSockets()) {
+			const socket = ws as WebSocketConnection;
+			if (!openSocket(socket)) continue;
+			const state = connectionAttachment(socket);
+			if (!state || state.closing || state.userId === userId || (state.tier !== "anonymous" && state.tier !== "registered")) continue;
+			if (!state.rooms?.some((id) => shared.has(id))) continue;
+			const owed = (state.owed ?? []).filter(([id]) => id !== userId);
+			if (told !== status) {
+				if (due <= now || owed.length >= MAX_OWED) {
+					if (state.statusSeen) toldNow.push(socket);
+				} else {
+					owed.push([userId, told, status, due]);
+					owing = true;
+				}
+			}
+			if (owed.length === (state.owed?.length ?? 0) && owed.every((entry, index) => entry === state.owed![index])) continue;
+			if (owed.length) state.owed = owed;
+			else delete state.owed;
+			writeAttachment(socket, state);
+		}
+		// Sent after the attachments are written: a failed send closes its connection.
+		for (const socket of toldNow) this.deliverTo(socket, { method: "user", params: { new: { user_id: userId, status } } });
+		if (told === status) return;
+		if (owing) this.armPresence(due);
+		else this.noteAnnounced(userId, now);
+	}
+
+	/**
+	 * Announces a connected user's status: `user` `new` to the connections
+	 * of others who share a room with them, and `you` to their own, each only
+	 * where it changed and only to connections that have sent `status`.
+	 */
+	private announceStatus(userId: string, states: ReadonlyArray<{ socket: WebSocketConnection; state: ConnectionAttachment }>, derived: { others: Status; self: Status }, pres: PresenceRecord, now: number): void {
+		const rooms = [...new Set(states.flatMap(({ state }) => state.rooms ?? []))];
+		this.writePresence(states, { s: derived.others, y: derived.self, a: now });
+		this.noteAnnounced(userId, now);
+		if (derived.others !== pres.s) {
+			this.deliver({ method: "user", params: { new: { user_id: userId, status: derived.others } } }, rooms, (state) => state.statusSeen === true && state.userId !== userId);
+		}
+		if (derived.self !== pres.y) {
+			for (const { socket, state } of states) {
+				if (state.statusSeen) this.deliverTo(socket, { method: "user", params: { you: { user_id: userId, status: derived.self } } });
+			}
+		}
+	}
+
+	/**
+	 * Notes that a status change is due at `due`, and arms the timer for it,
+	 * unless it already fires sooner. The timer keeps the object awake until
+	 * then, so it is armed only while a connection would be told: one that
+	 * has sent `status`. Without one, the next event sweeps (sweepPresence);
+	 * one that sends `status` later arms it then (handleStatus).
+	 */
+	private armPresence(due: number): void {
+		if (!Number.isFinite(due)) return;
+		this.presenceDueAt = Math.min(this.presenceDueAt, due);
+		if (due >= this.presenceTimerAt || !this.anyStatusAware()) return;
+		if (this.presenceTimer !== undefined) clearTimeout(this.presenceTimer);
+		this.presenceTimerAt = due;
+		this.presenceTimer = setTimeout(() => {
+			this.presenceTimer = undefined;
+			this.presenceTimerAt = Number.POSITIVE_INFINITY;
+			this.flushPresence(nowMs());
+		}, Math.max(0, due - nowMs()) + 25);
+	}
+
+	/**
+	 * Sweeps for status work at the start of an event: after a wake (the
+	 * timer was lost with the instance), when the timer is overdue, or once
+	 * every half `statusCoalesceSeconds`, for changes nothing announces (a
+	 * mute running out, a connection idle after SILENT_IDLE_MS, a peer gone
+	 * stale).
+	 */
+	private sweepPresence(now = nowMs()): void {
+		if (this.presenceSweptAt !== 0 && now < this.presenceDueAt && now - this.presenceSweptAt < this.config.limits.statusCoalesceSeconds * 500) return;
+		this.flushPresence(now);
+	}
+
+	/** Whether any open, signed-in connection has sent `status`, and so is told of changes. */
+	private anyStatusAware(): boolean {
+		return this.ctx.getWebSockets().some((ws) => {
+			if (!openSocket(ws)) return false;
+			const state = connectionAttachment(ws as WebSocketConnection);
+			return !!state?.statusSeen && !state.closing && (state.tier === "anonymous" || state.tier === "registered");
+		});
+	}
+
+	/**
+	 * Announces every status change that is due, from attachments alone (no
+	 * SQL): each connected user whose status differs from what was announced
+	 * and whose wait is over, and each `owed` entry that is due. Re-arms the
+	 * timer for the next one.
+	 */
+	flushPresence(now = nowMs()): void {
+		this.presenceSweptAt = now;
+		if (this.presenceTimer !== undefined) clearTimeout(this.presenceTimer);
+		this.presenceTimer = undefined;
+		this.presenceTimerAt = Number.POSITIVE_INFINITY;
+		this.presenceDueAt = Number.POSITIVE_INFINITY;
+		const mode = this.presenceMode();
+		if (!mode) return;
+		// A vanished or closed peer's close starts its own grace (connectionGone).
+		this.closeStale(now);
+		this.noteClosedSockets();
+		this.presenceWork(() => {
+			const coalesceMs = this.config.limits.statusCoalesceSeconds * 1_000;
+			const users = new Map<string, Array<{ socket: WebSocketConnection; state: ConnectionAttachment }>>();
+			const holders: Array<{ socket: WebSocketConnection; state: ConnectionAttachment }> = [];
+			for (const ws of this.ctx.getWebSockets()) {
+				const socket = ws as WebSocketConnection;
+				if (!openSocket(socket)) continue;
+				const state = connectionAttachment(socket);
+				if (!state || state.closing || !state.userId || (state.tier !== "anonymous" && state.tier !== "registered")) continue;
+				let list = users.get(state.userId);
+				if (!list) users.set(state.userId, list = []);
+				list.push({ socket, state });
+				if (state.owed?.length) holders.push({ socket, state });
+			}
+			let next = Number.POSITIVE_INFINITY;
+			for (const [userId, states] of users) {
+				const derived = this.deriveConnected(states, now);
+				const pres = states.find(({ state }) => state.pres)?.state.pres;
+				if (!pres) {
+					this.writePresence(states, { s: derived.others, y: derived.self, a: this.lastAnnounced(userId) });
+					continue;
+				}
+				if (derived.others === pres.s && derived.self === pres.y) {
+					if (pres.h !== undefined) this.writePresence(states, { s: pres.s, y: pres.y, a: pres.a });
+				} else {
+					const due = Math.max(this.lastAnnounced(userId, pres) + coalesceMs, pres.h ?? 0);
+					if (due <= now) this.announceStatus(userId, states, derived, pres, now);
+					else next = Math.min(next, due);
+				}
+				// A mute running out soon is announced on time; a later one when an event sweeps.
+				const until = Math.min(...states.map(({ state }) => state.muteUntil ?? Number.POSITIVE_INFINITY));
+				if (until > now && until - now <= MAX_STATUS_DELAY_SECONDS * 1_000) next = Math.min(next, until);
+			}
+			for (const { socket } of holders) {
+				const state = connectionAttachment(socket);
+				if (!state?.owed?.length) continue;
+				const owed: OwedStatus[] = [];
+				for (const entry of state.owed) {
+					const [userId, told, status, due] = entry;
+					// Back before it was due: their connection carries on from what was told.
+					if (users.has(userId)) continue;
+					if (due > now) {
+						owed.push(entry);
+						next = Math.min(next, due);
+						continue;
+					}
+					if (told !== status && state.statusSeen) this.deliverTo(socket, { method: "user", params: { new: { user_id: userId, status } } });
+					this.noteAnnounced(userId, now);
+				}
+				const latest = connectionAttachment(socket);
+				if (!latest || latest.closing) continue;
+				if (owed.length) latest.owed = owed;
+				else delete latest.owed;
+				writeAttachment(socket, latest);
+			}
+			this.armPresence(next);
+		});
+	}
+
+	/**
+	 * A connection that just signed in (after its auth result): it carries on
+	 * from what others were last told of its user, from their other
+	 * connections, or from what those owed a change were told, or else from
+	 * what a listing showed them without a connection; then any change is
+	 * announced (touchPresence).
+	 */
+	private presenceSignedIn(socket: WebSocketConnection): void {
+		const mode = this.presenceMode();
+		const state = connectionAttachment(socket);
+		if (!mode || !state?.userId || (state.tier !== "anonymous" && state.tier !== "registered")) return;
+		const userId = state.userId;
+		const now = nowMs();
+		this.presenceWork(() => {
+			const others = this.liveStatesOf(userId).filter((entry) => entry.socket !== socket);
+			let pres = others.find((entry) => entry.state.pres)?.state.pres;
+			if (!pres) {
+				let told: Status | undefined;
+				for (const ws of this.ctx.getWebSockets()) {
+					const holder = connectionAttachment(ws as WebSocketConnection);
+					const entry = holder?.owed?.find(([id]) => id === userId);
+					if (!holder || !entry) continue;
+					told ??= entry[1];
+					holder.owed = holder.owed!.filter(([id]) => id !== userId);
+					if (!holder.owed.length) delete holder.owed;
+					writeAttachment(ws as WebSocketConnection, holder);
+				}
+				const self = this.deriveConnected(this.liveStatesOf(userId), now).self;
+				pres = { s: told ?? (state.tier === "registered" ? this.deriveDisconnected(state, now, mode) : "offline"), y: self, a: this.lastAnnounced(userId) };
+			}
+			const latest = connectionAttachment(socket);
+			if (!latest) return;
+			latest.pres = { ...pres };
+			writeAttachment(socket, latest);
+		});
+		this.touchPresence(userId, now);
+		// A connection that sent `status` before signing in is told from now on.
+		this.armPresence(this.presenceDueAt);
+	}
+
+	/**
+	 * A connection stopped counting as its user's (it is closing): their
+	 * status may change, once `offlineGraceSeconds` pass without them back.
+	 */
+	private connectionGone(attachment: ConnectionAttachment | null): void {
+		if (!attachment?.userId || (attachment.tier !== "anonymous" && attachment.tier !== "registered")) return;
+		this.touchPresence(attachment.userId, nowMs(), { hold: true, closing: attachment });
+	}
+
+	/**
+	 * The status every connected user and every user owed a change is shown
+	 * with in a snapshot (a listing, `room_update` `joined`): what others
+	 * were last told, so the changes still to come apply to it.
+	 */
+	private presenceSnapshot(now: number): { shown: Map<string, Status>; owed: Map<string, OwedStatus> } {
+		const shown = new Map<string, Status>();
+		const owed = new Map<string, OwedStatus>();
+		const users = new Map<string, Array<{ socket: WebSocketConnection; state: ConnectionAttachment }>>();
+		for (const ws of this.ctx.getWebSockets()) {
+			const socket = ws as WebSocketConnection;
+			if (!openSocket(socket)) continue;
+			const state = connectionAttachment(socket);
+			if (!state || state.closing || !state.userId || (state.tier !== "anonymous" && state.tier !== "registered")) continue;
+			for (const entry of state.owed ?? []) if (!owed.has(entry[0])) owed.set(entry[0], entry);
+			let list = users.get(state.userId);
+			if (!list) users.set(state.userId, list = []);
+			list.push({ socket, state });
+		}
+		for (const [userId, states] of users) {
+			shown.set(userId, states.find(({ state }) => state.pres)?.state.pres?.s ?? this.deriveConnected(states, now).others);
+			owed.delete(userId);
+		}
+		return { shown, owed };
+	}
+
+	/**
+	 * Tells a room's status-aware members the status of a connected user who
+	 * just joined it, which a membership record (a recorded object) does not
+	 * carry: they may share no other room with them. No SQL.
+	 */
+	private announceJoiner(userId: string, roomId: string): void {
+		if (!this.presenceMode()) return;
+		const status = this.presenceSnapshot(nowMs()).shown.get(userId);
+		if (!status) return;
+		this.deliver({ method: "user", params: { new: { user_id: userId, status } } }, [roomId], (state) => state.statusSeen === true && state.userId !== userId);
+	}
+
+	/**
+	 * Adds each listed user's `status` (§4.11) to a snapshot's current user
+	 * objects: as presenceSnapshot shows them, else from their stored inputs
+	 * (`full`) or `offline`. A `lister` is made owed the changes still due for
+	 * the users without a connection it was shown, so what it was shown does
+	 * not go stale.
+	 */
+	private withStatus<T extends PublicUser>(users: T[], stored: ReadonlyMap<string, StatusInputRecord>, lister?: WebSocketConnection): T[] {
+		const mode = this.presenceMode();
+		if (!mode) return users;
+		const now = nowMs();
+		const { shown, owed } = this.presenceSnapshot(now);
+		const owing: OwedStatus[] = [];
+		const out = users.map((user) => {
+			const pending = owed.get(user.user_id);
+			if (pending) owing.push(pending);
+			const inputs = stored.get(user.user_id);
+			const status = shown.get(user.user_id) ?? pending?.[1] ?? (inputs ? this.deriveDisconnected(inputs, now, mode) : "offline");
+			return { ...user, status };
+		});
+		if (lister && owing.length) {
+			const state = connectionAttachment(lister);
+			if (state && !state.closing) {
+				const held = new Map((state.owed ?? []).map((entry) => [entry[0], entry]));
+				for (const entry of owing) if (!held.has(entry[0]) && held.size < MAX_OWED) held.set(entry[0], [...entry] as OwedStatus);
+				if (held.size !== (state.owed?.length ?? 0)) {
+					state.owed = [...held.values()];
+					writeAttachment(lister, state);
+				}
+			}
+		}
+		return out;
 	}
 
 	/**
@@ -2598,8 +3314,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// The key check awaited: register for the connection as it is now (a /rename may have moved it).
 		const current = connectionAttachment(socket);
 		if (!current || current.closing || current.tier !== "registered" || !current.userId) return;
-		this.store.registerPushSubscription({ userId: current.userId, url, p256dh: base64UrlEncode(p256dh), auth: base64UrlEncode(auth), ...(pushId !== undefined ? { pushId } : {}), ...(wake !== undefined ? { wake } : {}), now: nowMs() });
+		const registered = this.store.registerPushSubscription({ userId: current.userId, url, p256dh: base64UrlEncode(p256dh), auth: base64UrlEncode(auth), ...(pushId !== undefined ? { pushId } : {}), ...(wake !== undefined ? { wake } : {}), now: nowMs() });
 		this.reply(socket, request, {});
+		this.notePushChange(current.userId, registered.wake !== 0 ? registered.updatedMs : undefined);
 	}
 
 	/** `push_unregister` (§4.7): removes the user's own registration of `url`; an unknown one is already gone. */
@@ -2613,6 +3330,31 @@ export class ApronDemoServer extends DurableObject<Env> {
 		try { url = new URL(sent).href; } catch { /* removes nothing */ }
 		this.store.removePushSubscription({ userId: attachment.userId!, url, now: nowMs() });
 		this.reply(socket, request, {});
+		this.notePushChange(attachment.userId!);
+	}
+
+	/**
+	 * Keeps a connected user's `pushUntil` (`full` presence) current after
+	 * their registrations changed: a waking registration registered at
+	 * `registeredMs` lasts `pushExpiryDays` from then; otherwise (one
+	 * removed, or made to wake for nothing) the latest is read again, one
+	 * indexed read. It decides what they show once their last connection
+	 * closes; a user without a connection is shown from storage.
+	 */
+	private notePushChange(userId: string, registeredMs?: number, cleared = false): void {
+		if (this.presenceMode() !== "full" || !PUSH_POLICY || !this.connectionsOf(userId).length) return;
+		try {
+			const known = cleared ? { invisible: false } : registeredMs !== undefined ? undefined : this.store.statusInputs(userId, true, nowMs());
+			const until = registeredMs === undefined ? undefined : registeredMs + PUSH_POLICY.pushExpiryDays * 86_400_000;
+			this.cacheStatusInputs(userId, (state) => {
+				if (known) {
+					if (known.pushUntil !== undefined) state.pushUntil = known.pushUntil;
+					else delete state.pushUntil;
+				} else if (until !== undefined && until > (state.pushUntil ?? 0)) state.pushUntil = until;
+			});
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "push_status_failed", reason: errorToProtocol(error).message }));
+		}
 	}
 
 	/**
@@ -2706,7 +3448,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		try {
 			// The sender pays for delivered pushes only (`pushesPerSenderDay`).
 			this.store.chargePushSender(senderId, delivered, nowMs());
-			if (gone.length) this.store.forgetPushSubscriptions(gone, nowMs());
+			if (gone.length) {
+				this.store.forgetPushSubscriptions(gone, nowMs());
+				for (const userId of new Set(gone.map((entry) => entry.userId))) this.notePushChange(userId);
+			}
 		} catch { /* a failed charge or delete is retried by nothing: the next push tries again */ }
 	}
 
@@ -2779,7 +3524,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (withMembers) {
 			const listed = [...(result.joined ?? []), ...(result.not_joined ?? [])];
 			const totals = new Map<string, number>();
-			const members = this.membersOf(listed.map((room) => room.room_id), totals);
+			const members = this.membersOf(listed.map((room) => room.room_id), totals, socket);
 			const users = new Map<string, PublicUser>();
 			for (const room of listed) {
 				const list = members.get(room.room_id) ?? [];
@@ -2932,23 +3677,37 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * `/toggle <feature>`: turns `activity` (typing) or, where configured,
-	 * `uploads` off or on for everyone, and tells the sender which with a
-	 * `~private` notice before the result (§1). Kept across restarts; toggling
-	 * back to the deployment's default forgets the override. New connections
-	 * are offered the cap only while it is on. With activity off, typing is
-	 * no longer relayed; with uploads off, new upload embeds and `/avatar` are
-	 * `denied`, and writes already started still finish.
+	 * `uploads` or `presence` (user status, which needs push) off or on for
+	 * everyone, and tells the sender which with a `~private` notice before
+	 * the result (§1). Kept across restarts; toggling back to the
+	 * deployment's default forgets the override. New connections are offered
+	 * the cap only while it is on. With activity off, typing is no longer
+	 * relayed; with uploads off, new upload embeds and `/avatar` are
+	 * `denied`, and writes already started still finish. With presence off,
+	 * no `status` is sent and `invisible` is ignored; turned on, it is the
+	 * deployment's variant (`PRESENCE`, else the plan's, else `connected`),
+	 * and starts from each user's status then, announcing nothing.
 	 */
 	private toggle(socket: WebSocketConnection, request: RequestFrame, roomId: string, feature: string): void {
-		const features: ToggleFeature[] = this.config.uploads ? ["activity", "uploads"] : ["activity"];
+		const features: ToggleFeature[] = ["activity", ...(this.config.uploads ? ["uploads" as const] : []), ...(this.config.push ? ["presence" as const] : [])];
 		const chosen = features.find((candidate) => candidate === feature);
 		if (!chosen) throw { name: "invalid_params", message: `Usage: /toggle ${features.join("|")}` } satisfies ProtocolError;
-		const on = !(chosen === "uploads" ? this.uploadsOn() : this.activityOn());
-		const fallback = chosen === "uploads" ? true : this.config.activityEnabled;
+		const on = !(chosen === "uploads" ? this.uploadsOn() : chosen === "presence" ? this.presenceMode() !== false : this.activityOn());
+		const fallback = chosen === "uploads" ? true : chosen === "presence" ? this.config.presence !== false : this.config.activityEnabled;
 		const override = on === fallback ? undefined : on;
 		this.store.setToggle(chosen, override, nowMs());
 		this.toggles.set(chosen, override);
+		// What was announced before is forgotten: it starts again from each
+		// connected user's status now (flushPresence records it).
+		if (chosen === "presence") {
+			this.resetPresence();
+			if (on) this.flushPresence();
+		}
 		const notices: Record<ToggleFeature, [string, string]> = {
+			presence: [
+				"Status is now **on**: others see who is online, idle, busy or offline, and `invisible` hides you.",
+				"Status is now **off**: no one's status is shown, and clients keep the last one they were sent until they list rooms again.",
+			],
 			activity: [
 				"Activity is now **on**: typing is relayed, and new connections are offered it.",
 				"Activity is now **off**: typing is no longer relayed, and new connections are not offered it.",
@@ -2988,7 +3747,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// A device that held the removed passkey must not keep getting the
 		// user's messages by push; the user's other devices register again on
 		// their next connection.
-		if (this.config.push) this.store.clearPushSubscriptions(userId, nowMs());
+		if (this.config.push) {
+			this.store.clearPushSubscriptions(userId, nowMs());
+			this.notePushChange(userId, undefined, true);
+		}
 		const text = `Removed the passkey \`${chosen.credentialId.slice(0, 8)}…\` from your account.`;
 		for (const peer of this.connectionsOf(userId, socket)) {
 			this.deliverTo(peer, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text, format: "markdown" } } });
@@ -3268,6 +4030,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 			state.userId = to;
 			writeAttachment(peer, state);
 		}
+		// Their status moves with them: when it was announced, and changes others are owed.
+		const announced = this.announcedAt.get(from);
+		this.announcedAt.delete(from);
+		if (announced !== undefined) this.noteAnnounced(to, announced);
+		for (const ws of this.ctx.getWebSockets()) {
+			const state = connectionAttachment(ws as WebSocketConnection);
+			if (!state?.owed?.some(([id]) => id === from)) continue;
+			state.owed = state.owed.map((entry) => entry[0] === from ? [to, entry[1], entry[2], entry[3]] as OwedStatus : entry);
+			writeAttachment(ws as WebSocketConnection, state);
+		}
 		const identity = { user_id: to, ...(renamed.name ? { name: renamed.name } : {}), roles: renamed.roles };
 		const old = { user_id: from, ...(renamed.name ? { name: renamed.name } : {}) };
 		this.announceUser(null, identity, this.liveRoomsOf(to) ?? renamed.rooms, old);
@@ -3378,7 +4150,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		});
 		const token = await this.issueBotToken(botId, ownerId);
 		// The old token is revoked: whatever ran with it loses the bot's pushes too.
-		if (this.config.push) this.store.clearPushSubscriptions(botId, nowMs());
+		if (this.config.push) {
+			this.store.clearPushSubscriptions(botId, nowMs());
+			this.notePushChange(botId, undefined, true);
+		}
 		for (const peer of this.connectionsOf(botId)) {
 			const state = connectionAttachment(peer);
 			if (state) this.closePolicy(peer, state, 1008, "Bot token replaced; sign in with the new one");
@@ -3419,16 +4194,24 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * members stored with the room, at most `roomListMembers` per room, and
 	 * every connected user who has joined it, guests included, whose
 	 * memberships live in their connections. `totals` gets each room's
-	 * `member_count` (§4.3.1) where that leaves members out.
+	 * `member_count` (§4.3.1) where that leaves members out. With presence
+	 * on, each carries its `status` (withStatus); `full` presence reads the
+	 * stored members' status inputs with them. `lister`: the connection
+	 * the listing is for (see withStatus).
 	 */
-	private membersOf(roomIds: readonly string[], totals?: Map<string, number>): Map<string, PublicUser[]> {
+	private membersOf(roomIds: readonly string[], totals?: Map<string, number>, lister?: WebSocketConnection): Map<string, PublicUser[]> {
 		const counts = new Map<string, number>();
-		const stored = this.store.roomMembers(roomIds, this.config.limits.roomListMembers, nowMs(), counts);
+		const mode = this.presenceMode();
+		const stored = this.store.roomMembers(roomIds, this.config.limits.roomListMembers, nowMs(), counts, mode === "full");
 		const connected = this.connectedMembers();
 		const members = new Map<string, PublicUser[]>();
+		const inputs = new Map<string, StatusInputRecord>();
 		for (const roomId of new Set(roomIds)) {
 			const users = new Map<string, PublicUser>();
-			for (const member of stored.get(roomId) ?? []) users.set(member.user_id, member);
+			for (const { status, ...member } of stored.get(roomId) ?? []) {
+				users.set(member.user_id, member);
+				if (status) inputs.set(member.user_id, status);
+			}
 			for (const member of connected.get(roomId) ?? []) if (!users.has(member.user_id)) users.set(member.user_id, member);
 			members.set(roomId, sortedUsers(users.values()));
 			// A room past `roomListMembers` registered members lists only some of
@@ -3439,6 +4222,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (registered + guests > users.size) totals.set(roomId, registered + guests);
 			}
 		}
+		if (!mode) return members;
+		// Each listed user once, with the status every room shows them with.
+		const unique = new Map<string, PublicUser>();
+		for (const list of members.values()) for (const user of list) unique.set(user.user_id, user);
+		const statuses = new Map(this.withStatus([...unique.values()], inputs, lister).map((user) => [user.user_id, user]));
+		for (const [roomId, list] of members) members.set(roomId, list.map((user) => statuses.get(user.user_id) ?? user));
 		return members;
 	}
 
@@ -3452,6 +4241,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const users = new Map(members.map((member) => [member.user_id, member]));
 		const count = total === undefined ? undefined : total + (joiner && !users.has(joiner.user_id) ? 1 : 0);
 		if (joiner) users.set(joiner.user_id, joiner);
+		// Members not listed by membersOf (the joiner, a thread's creator) are
+		// connected: their status is what others were told.
+		const unlisted = [...users.values()].filter((user) => user.status === undefined);
+		for (const user of this.withStatus(unlisted, new Map())) users.set(user.user_id, user);
 		const sorted = sortedUsers(users.values());
 		const listed: ListedRoom = { ...room, members: sorted.map((member) => ({ user_id: member.user_id })) };
 		if (count !== undefined && count > sorted.length) listed.member_count = count;
@@ -3461,11 +4254,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** Each room's members connected now: users who have joined it, one entry each. */
 	private connectedMembers(): Map<string, PublicUser[]> {
 		this.closeStale(nowMs());
+		const invisibleHidden = this.presenceMode() !== false;
 		const members = new Map<string, Map<string, PublicUser>>();
 		for (const peer of this.ctx.getWebSockets()) {
 			const state = connectionAttachment(peer as WebSocketConnection);
 			const identity = state && !state.closing ? this.current(state) : null;
 			if (!identity) continue;
+			// Listed past the page of stored members only because connected, an
+			// invisible user would show they are; they are listed as stored.
+			if (state!.invisible && state!.tier === "registered" && invisibleHidden) continue;
 			for (const roomId of state!.rooms ?? []) {
 				let listed = members.get(roomId);
 				if (!listed) members.set(roomId, listed = new Map());
@@ -3504,6 +4301,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			attachment.closing = true;
 			writeAttachment(socket, attachment);
 			try { socket.close(1001, "Connection idle; reconnect to recover"); } catch { /* already closed */ }
+			this.connectionGone(attachment);
 			closed++;
 		}
 		// Shows in Workers Logs whether vanished peers are being found.
@@ -3521,18 +4319,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!user) return;
 		const identity = user;
 		const shared = new Set(rooms);
-		// The user's own connections get `you`, with their mute (§4.11), read once.
-		let own: PublicUser | undefined;
+		// A new `user_id` (/rename) is a user others have not seen: it carries
+		// the status they were shown under the old one. A profile change leaves
+		// `status` out, so clients keep theirs (§4.11).
+		const renamed = old && old.user_id !== identity.user_id && this.presenceMode()
+			? this.presenceSnapshot(nowMs()).shown.get(identity.user_id) : undefined;
+		const others = renamed ? { ...identity, status: renamed } : identity;
 		for (const peer of this.ctx.getWebSockets()) {
 			const socket = peer as WebSocketConnection;
 			if (socket === origin) continue;
 			const state = connectionAttachment(socket);
 			if (!state) continue;
-			if (state.userId === identity.user_id) {
-				own ??= state.tier === "registered" ? { ...identity, ...this.muteField(identity.user_id) } : identity;
-				this.deliverTo(socket, { method: "user", params: { you: own } });
-			}
-			else if (state.rooms?.some((id) => shared.has(id))) this.deliverTo(socket, { method: "user", params: { new: identity, ...(old ? { old } : {}) } });
+			// The user's own connections get `you`, with their mute and `invisible` (§4.11).
+			if (state.userId === identity.user_id) this.deliverTo(socket, { method: "user", params: { you: { ...identity, ...this.ownStatusFields(state) } } });
+			else if (state.rooms?.some((id) => shared.has(id))) this.deliverTo(socket, { method: "user", params: { new: others, ...(old ? { old } : {}) } });
 		}
 	}
 
@@ -3830,9 +4630,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const attachment = connectionAttachment(socket);
 		if (!attachment || attachment.closing || (attachment.tier !== "anonymous" && attachment.tier !== "registered")) return;
 		if (!this.send(socket, value)) {
-			attachment.closing = true;
-			writeAttachment(socket, attachment);
+			const latest = connectionAttachment(socket) ?? attachment;
+			if (latest.closing) return;
+			latest.closing = true;
+			writeAttachment(socket, latest);
 			try { socket.close(1011, "Delivery failed; reconnect to recover"); } catch { /* closed */ }
+			this.connectionGone(latest);
 		}
 	}
 

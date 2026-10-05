@@ -1,6 +1,6 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { expect, it, vi } from 'vitest';
-import { DEFAULT_LIMITS } from '../src/budget';
+import { DEFAULT_FEATURES, DEFAULT_LIMITS } from '../src/budget';
 import { canonicalizeIp, hashIpKey } from '../src/ip';
 import { connect as open, exchange, greeting, reply, request, until, type ConnectOptions, type Frame, type Peer } from './helpers/socket';
 
@@ -53,7 +53,10 @@ async function authenticate(peer: Peer, scheme = 'guest', extraCaps: string[] = 
 	peer.send({ method: 'auth', id: 'auth', params: { scheme } });
 	const auth = await peer.next();
 	expect(auth.result.you.user_id).toMatch(/^guest_/);
-	return auth.result.you;
+	// `you` carries the user's own `status` (§4.11), which recorded objects such as `from` never do.
+	expect(auth.result.you.status).toBe('online');
+	const { status: _status, ...identity } = auth.result.you;
+	return identity;
 }
 
 type ServerInternals = { config: { limits: Record<string, number>; activityEnabled: boolean }; recentFrames: number[] };
@@ -357,7 +360,7 @@ it('creates threads with room_set, delivers only to joined rooms, and moves mess
 		};
 		// `joined` carries the members, bare, and their current objects in
 		// `users`; a guest's join is not logged, so no membership follows.
-		expect(created.skipped).toEqual([{ method: 'room_update', params: { joined: [{ ...room, members: [{ user_id: aliceId.user_id }] }], users: [aliceId] } }]);
+		expect(created.skipped).toEqual([{ method: 'room_update', params: { joined: [{ ...room, members: [{ user_id: aliceId.user_id }] }], users: [{ ...aliceId, status: 'online' }] } }]);
 		expect((await until(bob, (frame) => frame.method === 'room_update')).frame).toEqual({ method: 'room_update', params: { updated: [room] } });
 
 		// Posting does not require joining, and a poster who has not joined
@@ -406,12 +409,14 @@ it('creates threads with room_set, delivers only to joined rooms, and moves mess
 		// Joining: `joined`, with the members after the join, before `{}`.
 		const members = [aliceId, bobId].sort((a, b) => a.user_id < b.user_id ? -1 : 1);
 		const joinedRoom = { ...room, latest_log_id: followed.log_id, members: members.map((member) => ({ user_id: member.user_id })) };
+		// `users` are current objects, with each one's status (§4.11).
+		const online = members.map((member) => ({ ...member, status: 'online' }));
 		const joined = await exchange(bob, 'join', 'room_join', { room_id: roomId });
 		expect(joined.frame.result).toEqual({});
-		expect(joined.skipped).toEqual([{ method: 'room_update', params: { joined: [joinedRoom], users: members } }]);
+		expect(joined.skipped).toEqual([{ method: 'room_update', params: { joined: [joinedRoom], users: online } }]);
 		// A second join logs nothing and re-sends `joined` to that connection only.
 		const again = await exchange(bob, 'join-again', 'room_join', { room_id: roomId });
-		expect(again.skipped).toEqual([{ method: 'room_update', params: { joined: [joinedRoom], users: members } }]);
+		expect(again.skipped).toEqual([{ method: 'room_update', params: { joined: [joinedRoom], users: online } }]);
 
 		// Any participant may save a thread; `updated` reaches the room's and
 		// the parent's members, and the result follows it.
@@ -591,7 +596,7 @@ it('lists rooms by filter, most recently active first, with members on request, 
 		expect(generalIds).toEqual([...generalIds].sort());
 		for (const member of general.members) expect(Object.keys(member)).toEqual(['user_id']);
 		expect(mine.joined.find((room: { room_id: string }) => room.room_id === older).members).toEqual([{ user_id: aliceId.user_id }]);
-		expect(mine.users).toEqual(expect.arrayContaining([aliceId, bobId]));
+		expect(mine.users).toEqual(expect.arrayContaining([{ ...aliceId, status: 'online' }, { ...bobId, status: 'online' }]));
 		const userIds = mine.users.map((user: { user_id: string }) => user.user_id);
 		expect(userIds).toEqual([...new Set(userIds)].sort());
 		expect(general.member_count).toBeUndefined();
@@ -614,7 +619,7 @@ it('lists rooms by filter, most recently active first, with members on request, 
 		expect(ids(one.not_joined)).toEqual([older]);
 		expect(one.joined).toEqual([]);
 		expect(one.not_joined[0].members).toEqual([{ user_id: aliceId.user_id }]);
-		expect(one.users).toEqual([aliceId]);
+		expect(one.users).toEqual([{ ...aliceId, status: 'online' }]);
 		// `latest_log_id` is ignored, since guests' memberships are not logged:
 		// the result is a full listing, without `left`.
 		const since = (await request(alice, 'since', 'room_list', { filter: 'joined', latest_log_id: one.not_joined[0].latest_log_id })).result;
@@ -744,6 +749,9 @@ it('advertises the demo policy hints', async () => {
 			// Registered members listed per room in `members`, besides connected ones.
 			room_list_members: DEFAULT_LIMITS.roomListMembers,
 			read_cursors: false,
+			// User status for everyone with the selected (Paid) plan; a change waits at most a minute.
+			presence: DEFAULT_FEATURES.presence,
+			status_delay_seconds: Math.max(DEFAULT_LIMITS.statusCoalesceSeconds, DEFAULT_LIMITS.offlineGraceSeconds),
 		});
 	} finally { peer.close(); }
 });
