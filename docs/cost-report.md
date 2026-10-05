@@ -419,7 +419,7 @@ designs measured or costed for announcing it on time:
 
 | Design | Durable Object requests | SQL rows | Duration | Verdict |
 | --- | --- | --- | --- | --- |
-| One-shot in-memory `setTimeout` for the earliest due change, armed only while a connection that sent `status` is open (chosen) | 0 (no alarm is set: measured) | 0 (measured) | keeps the object awake at most 60 s after its last event, against about 10 s before it would hibernate: at most 50 s × 0.125 GB = 6.25 GB-s per change that lands in a quiet period, 0.05% of either plan's daily duration | chosen |
+| One-shot in-memory `setTimeout` for the earliest due change, armed only while a connection that sent `idle` is open (chosen) | 0 (no alarm is set: measured) | 0 (measured) | keeps the object awake at most 60 s after its last event, against about 10 s before it would hibernate: at most 50 s × 0.125 GB = 6.25 GB-s per change that lands in a quiet period, 0.05% of either plan's daily duration | chosen |
 | An alarm per due change | 1 per wake: 2% of Free's requests, 12.5% of Paid's at 4,000 a day | alarm scheduling (8/4) and an alarm run (about 14 written rows): about 36,000 maintenance writes a day at Free's 2,000 admissions, 180% of its 20,000 | about 1.25 GB-s per wake | rejected: Free fails closed |
 | Announce only on the next event | 0 | 0 | 0 | rejected: in a quiet room a change waits for the next event, however long, so peers keep seeing "online" |
 
@@ -444,7 +444,7 @@ the application's foreground ceiling.
 | SQL rows read (foreground) | 0% / 0% (listings and sign-ins read the same; `me` reads less) | 0.7–1.5% / 2.8–6% (worst, every member at +2: 12%) |
 | SQL rows read (account) | 0% / 0% | under 0.05% / under 0.4% |
 | SQL rows written (foreground) | at most one per changed registration and about 3 per `invisible` change: ≤ 0.9% / ≤ 3.4% | ≤ 0.15% / ≤ 0.6% |
-| Frames | none from the server; a client that sends `status` sends what push already asked for | same |
+| Frames | no incoming frame beyond what push already asked for (a client that sends `idle`); outgoing only: announcements, one `user` frame per connected user sharing a room on a connection's first `idle`, and one per user told of on `/toggle presence` off, none of which an allowance counts or SQL serves | same |
 
 Duration has a hard bound whatever the design: one object awake all day is
 10,800 GB-s, 83% of Free's 13,000 and 84% of Paid's daily 12,900 (334,800
@@ -453,7 +453,7 @@ run either plan over; it spends the one allowance that cannot run out
 instead of requests and maintenance writes, which fail closed. The duration
 rows assume the worst, that every last disconnect leaves the object
 otherwise idle; sessions that end during others' activity add nothing, and
-with no connection that sent `status` open no timer is armed at all.
+with no connection that sent `idle` open no timer is armed at all.
 `offlineGraceSeconds` and `statusCoalesceSeconds` trade staleness for
 duration: at 30 seconds each the duration rows halve.
 

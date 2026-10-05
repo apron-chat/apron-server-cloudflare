@@ -136,9 +136,11 @@ interface ConnectionAttachment {
 	 */
 	pendingMute?: number | true;
 	/**
-	 * The client has sent `status` (§4.11), so it reports `idle` itself; a
+	 * The client has sent `idle` (§4.11), so it reports `idle` itself; a
 	 * connection that never has is idle once it sends nothing for a while
-	 * (SILENT_IDLE_MS).
+	 * (SILENT_IDLE_MS). Only `idle` sets it, not `mute` or `invisible`:
+	 * status changes go only to connections that have sent `idle` (§4.11),
+	 * and the first sends the statuses others were told (sendShownStatus).
 	 */
 	statusSeen?: boolean;
 	/**
@@ -829,8 +831,8 @@ function wakeParam(value: unknown): number | undefined {
 }
 
 /**
- * A connection whose client never sent `status` (§4.11) counts as idle for
- * pushes once it has sent no frame for this long. Clients that send `status`
+ * A connection whose client never sent `idle` (§4.11) counts as idle for
+ * pushes once it has sent no frame for this long. Clients that send `idle`
  * report idle themselves; pings never reach the object, so they do not count.
  */
 const SILENT_IDLE_MS = 10 * 60_000;
@@ -2564,10 +2566,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (typeof idle === "boolean") {
 			// A client that sends `idle` reports it itself (see attended); one that
 			// only mutes may not, so it stays under the silent-connection rule.
+			// Only `idle` sets statusSeen: status changes go to connections that
+			// have sent `idle` (§4.11).
 			const state = connectionAttachment(socket);
 			if (state && !state.statusSeen) {
 				state.statusSeen = true;
 				writeAttachment(socket, state);
+				// It is told of changes from now on: first, of what others were told.
+				this.sendShownStatus(socket);
 				// Now someone may be told of changes: one waiting needs the timer.
 				this.armPresence(this.presenceDueAt);
 			}
@@ -2791,9 +2797,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Whether a user has a connection someone attends: authenticated as them,
 	 * not stale, and not idle (§4.11). A connection whose client has never
-	 * sent `status` counts as idle once it has sent no frame for
+	 * sent `idle` counts as idle once it has sent no frame for
 	 * SILENT_IDLE_MS (pings are answered by the runtime, so they do not
-	 * count); one whose client sends `status` is idle only when it says so.
+	 * count); one whose client sends `idle` is idle only when it says so.
 	 */
 	private attended(userId: string, now: number): boolean {
 		return this.connectionsOf(userId).some((peer) => this.attendedConnection(peer, connectionAttachment(peer), now));
@@ -2819,7 +2825,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	// first, so a reload or a reconnect shows nothing. One in-memory timer
 	// announces what is due, and so keeps the object awake until then (at
 	// most MAX_STATUS_DELAY_SECONDS); events sweep too. Changes go only to
-	// connections that have sent `status` (§4.11 allows it), as `user` `new`
+	// connections that have sent `idle` (§4.11 allows it), as `user` `new`
 	// to others who share a room and `you` to the user's own.
 
 	/** Presence as configured and toggled: off without push, which capability `status` needs. */
@@ -3078,7 +3084,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Announces a connected user's status: `user` `new` to the connections
 	 * of others who share a room with them, and `you` to their own, each only
-	 * where it changed and only to connections that have sent `status`.
+	 * where it changed and only to connections that have sent `idle`.
 	 */
 	private announceStatus(userId: string, states: ReadonlyArray<{ socket: WebSocketConnection; state: ConnectionAttachment }>, derived: { others: Status; self: Status }, pres: PresenceRecord, now: number): void {
 		const rooms = [...new Set(states.flatMap(({ state }) => state.rooms ?? []))];
@@ -3098,8 +3104,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * Notes that a status change is due at `due`, and arms the timer for it,
 	 * unless it already fires sooner. The timer keeps the object awake until
 	 * then, so it is armed only while a connection would be told: one that
-	 * has sent `status`. Without one, the next event sweeps (sweepPresence);
-	 * one that sends `status` later arms it then (handleStatus).
+	 * has sent `idle`. Without one, the next event sweeps (sweepPresence);
+	 * one that sends `idle` later arms it then (handleStatus).
 	 */
 	private armPresence(due: number): void {
 		if (!Number.isFinite(due)) return;
@@ -3126,7 +3132,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.flushPresence(now);
 	}
 
-	/** Whether any open, signed-in connection has sent `status`, and so is told of changes. */
+	/** Whether any open, signed-in connection has sent `idle`, and so is told of changes. */
 	private anyStatusAware(): boolean {
 		return this.ctx.getWebSockets().some((ws) => {
 			if (!openSocket(ws)) return false;
@@ -3247,7 +3253,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			writeAttachment(socket, latest);
 		});
 		this.touchPresence(userId, now);
-		// A connection that sent `status` before signing in is told from now on.
+		// A connection that sent `idle` before signing in is told from now on.
 		this.armPresence(this.presenceDueAt);
 	}
 
@@ -3265,9 +3271,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * with in a snapshot (a listing, `room_update` `joined`): what others
 	 * were last told, so the changes still to come apply to it.
 	 */
-	private presenceSnapshot(now: number): { shown: Map<string, Status>; owed: Map<string, OwedStatus> } {
+	private presenceSnapshot(now: number): { shown: Map<string, Status>; owed: Map<string, OwedStatus>; rooms: Map<string, Set<string>> } {
 		const shown = new Map<string, Status>();
 		const owed = new Map<string, OwedStatus>();
+		const rooms = new Map<string, Set<string>>();
 		const users = new Map<string, Array<{ socket: WebSocketConnection; state: ConnectionAttachment }>>();
 		for (const ws of this.ctx.getWebSockets()) {
 			const socket = ws as WebSocketConnection;
@@ -3281,9 +3288,37 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		for (const [userId, states] of users) {
 			shown.set(userId, states.find(({ state }) => state.pres)?.state.pres?.s ?? this.deriveConnected(states, now).others);
+			rooms.set(userId, new Set(states.flatMap(({ state }) => state.rooms ?? [])));
 			owed.delete(userId);
 		}
-		return { shown, owed };
+		return { shown, owed, rooms };
+	}
+
+	/**
+	 * A connection that just sent its first `idle` (§4.11): sends it, as
+	 * `user` `new`, the status of each user with a connection who shares a
+	 * room with it, as others were last told it (presenceSnapshot), so a
+	 * change still waiting on the coalescing minute is not told early.
+	 * Users shown `offline` (invisible, or just made visible and not yet
+	 * announced) are left out, as users without a connection are, so the
+	 * frames never tell an invisible user is connected; connected member
+	 * listings leave them out too. Its own user is left out: `you` carries
+	 * theirs. Attachments only, no SQL. A connection that sends `idle` before
+	 * signing in shares no room yet, so it is sent nothing; its listings
+	 * carry the statuses.
+	 */
+	private sendShownStatus(socket: WebSocketConnection): void {
+		if (!this.presenceMode()) return;
+		const state = connectionAttachment(socket);
+		if (!state?.rooms?.length || state.closing || (state.tier !== "anonymous" && state.tier !== "registered")) return;
+		const own = state.rooms;
+		const { shown, rooms } = this.presenceSnapshot(nowMs());
+		for (const [userId, status] of shown) {
+			if (userId === state.userId || status === "offline") continue;
+			const theirs = rooms.get(userId);
+			if (!theirs || !own.some((roomId) => theirs.has(roomId))) continue;
+			this.deliverTo(socket, { method: "user", params: { new: { user_id: userId, status } } });
+		}
 	}
 
 	/**

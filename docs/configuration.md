@@ -355,7 +355,7 @@ a minute behind:
   this long, so a reload or a phone reconnecting shows nothing.
 
 Waiting changes are announced by one in-memory timer, armed only while a
-connection that sent `status` is open, which keeps the object awake for at
+connection that sent `idle` is open, which keeps the object awake for at
 most a minute after its last event; it uses no SQL and no alarm, so no
 Durable Object request. See the [cost report](cost-report.md#user-status).
 

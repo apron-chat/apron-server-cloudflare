@@ -46,7 +46,7 @@ async function register(userId: string): Promise<void> {
 
 /**
  * A connection signed in as a registered user (registered here unless
- * `existing`). `aware`: it sends `status` first, so it is told of changes
+ * `existing`). `aware`: it sends `idle` first, so it is told of changes
  * (§4.11 lets the server tell only those).
  */
 async function signedIn(userId: string, { existing = false, aware = true } = {}): Promise<Peer> {
@@ -232,7 +232,7 @@ describe('user status shown to others (full presence)', () => {
 			frames = await drain(alice);
 			expect(told(frames, bobId)).toEqual(['offline']);
 			expect(await listed(alice, bobId)).toMatchObject({ status: 'offline' });
-			// Carol never sent `status`: she is told nothing, and lists the same statuses.
+			// Carol never sent `idle`: she is told nothing, and lists the same statuses.
 			const carolFrames = await drain(carol);
 			expect(told(carolFrames, bobId)).toEqual([]);
 			expectPrivate([...frames, ...carolFrames], bobId);
@@ -488,6 +488,69 @@ describe('user status shown to others (full presence)', () => {
 			expect(kept[0].mute).toBeLessThanOrEqual(last.mute as number);
 			expect(told(await drain(visitor), visitorId)).toEqual([]);
 		} finally { watcher.close(); early.close(); visitor.close(); }
+	});
+
+	it('sends a connection\'s first idle the status others were told of each connected user it shares a room with, from attachments only', async () => {
+		const aliceId = unique('alice');
+		const bobId = unique('bob');
+		const shyId = unique('shy');
+		const lateId = unique('late');
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		const shy = await signedIn(shyId);
+		const late = await signedIn(lateId, { aware: false });
+		/** Has the object take `late`'s `status` `idle` as sent, measuring the SQL it runs. */
+		const firstIdle = () => runInDurableObject(stub(), (instance, state) => {
+			const runtime = instance as unknown as Runtime & { handleStatus(socket: WebSocket, attachment: unknown, request: unknown): void };
+			const socket = state.getWebSockets().find((ws) => (ws.deserializeAttachment() as Attachment).userId === lateId && !(ws.deserializeAttachment() as Attachment).closing)!;
+			const before = runtime.store.storageAccounting();
+			const sql = statements(state, /./, () => runtime.handleStatus(socket, socket.deserializeAttachment(), { method: 'status', params: { idle: false }, full: false }));
+			const after = runtime.store.storageAccounting();
+			return { ...sql, rowsRead: after.reads - before.reads, rowsWritten: after.writes - before.writes };
+		});
+		try {
+			await status(shy, { invisible: true });
+			// Bob goes idle within the minute after his sign-in was announced: others were told online, and still are.
+			expect(told(await drain(alice), bobId)).toEqual(['online']);
+			await status(bob, { idle: true });
+			expect(told(await drain(alice), bobId)).toEqual([]);
+			await drain(late);
+			for (const variant of ['full', 'connected'] as const) {
+				await runInDurableObject(stub(), (instance) => {
+					const runtime = instance as unknown as Runtime & { toggles: Map<string, unknown> };
+					runtime.config = { ...runtime.config, presence: variant };
+				});
+				if (variant === 'connected') {
+					// A fresh connection for the second variant: the first idle is per connection.
+					late.close();
+				}
+				const peer = variant === 'full' ? late : await signedIn(lateId, { existing: true, aware: false });
+				try {
+					await drain(peer);
+					const measured = await firstIdle();
+					// No SQL at all: no statement, no row read or written.
+					expect(measured).toEqual({ queries: [], reads: 0, rowsRead: 0, rowsWritten: 0 });
+					const frames = await drain(peer);
+					expect(told(frames, aliceId), variant).toEqual(['online']);
+					// What others were told, not the change still waiting on the minute.
+					expect(told(frames, bobId), variant).toEqual(['online']);
+					// Invisible: left out, as a user without a connection is.
+					expect(told(frames, shyId), variant).toEqual([]);
+					expect(frames.filter((frame) => frame.method === 'user' && (frame.params.you || frame.params.new?.user_id === lateId))).toEqual([]);
+					expect(frames.filter((frame) => frame.method === 'user').every((frame) => Object.keys(frame.params.new).sort().join() === 'status,user_id')).toBe(true);
+					// Only the first idle: later ones send nothing more.
+					peer.send({ method: 'status', params: { idle: true } });
+					peer.send({ method: 'status', params: { idle: false } });
+					expect(told(await drain(peer), aliceId)).toEqual([]);
+				} finally { if (variant === 'connected') peer.close(); }
+			}
+		} finally {
+			await runInDurableObject(stub(), (instance) => {
+				const runtime = instance as unknown as Runtime;
+				runtime.config = { ...runtime.config, presence: 'full' };
+			});
+			alice.close(); bob.close(); shy.close(); late.close();
+		}
 	});
 
 	it('tells a room\'s members the status of a user who joins it', async () => {

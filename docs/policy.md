@@ -84,7 +84,7 @@ within it:
 - Status (cap `status`, with push): a client sends the notification
   `status` `{"idle": true}` when nobody is attending a connection (an
   unfocused tab, a backgrounded app) and `{"idle": false}` when someone is
-  again; only that ends it. A client that never sends `status` counts as
+  again; only that ends it. A client that never sends `idle` counts as
   idle after ten minutes without a frame. `{"mute": 3600}` (or `true`, until
   changed) stops a signed-in user's pushes; `{"mute": 0}` ends it. The mute
   shows in the user's own `you` while set, and each change is echoed to all
