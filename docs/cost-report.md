@@ -395,7 +395,8 @@ and the 101-room ceiling),
 [`test/presence.integration.test.ts`](../test/presence.integration.test.ts)
 and [`test/push.integration.test.ts`](../test/push.integration.test.ts), and
 re-measured the same day for the rewritten design (protocol §4.11 at
-shazow/apron 9825e38; [SPEC section 4.4](../SPEC.md#44-push), Chosen status,
+shazow/apron 9825e38, whose clarifications at 48af29b, `server.status` and
+what follows only a sign-in, change no cost; [SPEC section 4.4](../SPEC.md#44-push), Chosen status,
 Mute and User status). Users choose a status with `me`; others see `online`
 as online, idle or offline from the user's connections, `dnd` as dnd while
 connected, `invisible` as offline, and `""` as `""`. A push registration no

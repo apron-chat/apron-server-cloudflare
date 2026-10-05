@@ -84,7 +84,9 @@ within it:
 - Status (cap `status`, with push): a user chooses a status with `me`
   `{"status": …}`: `online` (the default), `dnd` (busy: no pushes),
   `invisible` (appear `offline` to everyone), or `""` (none: show no
-  status at all). Any other value is taken as `""`. Their own `you` shows
+  status at all). Any other value is taken as `""`. With presence on, the
+  `server` frame lists `server.status: ["dnd", "invisible"]`, so clients
+  offer them; with it off the list is left out. Their own `you` shows
   the choice; it lasts until changed, on every device, and is kept while
   status is turned off too. Guests may choose one for their connection.
   A client sends the notification `status` `{"idle": true}` when nobody is
@@ -96,7 +98,9 @@ within it:
   room and its threads, mentions and replies included, at most 100 rooms a
   user. A mute is private: each change is sent to all the user's own
   connections as `status`, and `mute: false` when it ends, is cleared or
-  runs out; after signing in, a connection is sent each mute in effect.
+  runs out; after signing in, a connection is sent each mute in effect,
+  after the `auth` result (adding a passkey to a signed-in connection is
+  not a sign-in, and sends none). `room_id` scopes only `mute`.
   Invalid values are ignored, a `status` with an `id` gets no reply, and
   status may be sent before signing in. Guests' mutes are ignored, since
   guests get no pushes. Mute and status changes together are limited to 6 a
@@ -106,8 +110,9 @@ within it:
   attends one of their connections, `idle` when connected and nobody does,
   `offline` with no connection, `dnd` while a busy user is connected,
   `offline` for an invisible user, and `""` for one who chose none,
-  connected or not. After signing in, a connection is told the status of
-  each connected user it shares a room with. Changes are coalesced to at
+  connected or not. After signing in, and after the `auth` result, a
+  connection is told the status of each user it shares a room with, other
+  than those shown `offline` or `""`. Changes are coalesced to at
   most one a minute per user, the latest winning, and a user who closes a
   connection is shown offline (or idle) only after a minute without them,
   so a reload or a phone reconnecting shows nothing: what others see may be

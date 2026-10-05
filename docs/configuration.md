@@ -333,13 +333,15 @@ presence on, others see each user's `status`: `online`, `idle` or `offline`
 from their connections when they chose `online`, `dnd` while connected,
 `offline` when invisible, and `""` when they chose none (see
 [SPEC section 4.4](../SPEC.md#44-push), Chosen status, Mute and User
-status). The plan's `features.presence` turns it on, and `PRESENCE`
+status). The `server` frame then lists `server.status: ["dnd",
+"invisible"]` (protocol §3.1), the optional values clients may offer; with
+presence off it is left out. The plan's `features.presence` turns it on, and `PRESENCE`
 overrides it:
 
 | `PRESENCE` | What others see | Extra SQL |
 | --- | --- | --- |
 | `true` (both plans' default) | each user's status, from their connections, or `offline` (`""` for none) without one | a listing reads each listed member's chosen status, a read only for members who chose one or muted |
-| `false` | no `status`; the chosen status is still kept and in the user's own `you`, mutes still work, and invisible users and those who chose none are still left out of connected member listings | none |
+| `false` | no `status`, and no `server.status`; the chosen status is still kept and in the user's own `you`, mutes still work, and invisible users and those who chose none are still left out of connected member listings | none |
 
 Without push there is no `status` capability, so presence is off whatever
 it says. An admin's `/toggle presence` turns it off and on again without a
