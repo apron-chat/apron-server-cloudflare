@@ -3315,12 +3315,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.notePushChange(current.userId, registered.wake !== 0 ? registered.updatedMs : undefined);
 	}
 
-	/** `push_unregister` (§4.7): removes the user's own registration of `url`; an unknown one is already gone. */
+	/**
+	 * `push_unregister` (§4.7): removes the user's own registration of `url`;
+	 * an unknown one is already gone, as is one too long to have been
+	 * registered, which is answered without SQL.
+	 */
 	private handlePushUnregister(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): void {
 		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
 		if (attachment.tier !== "registered") throw { name: "denied", message: "Sign in to receive push notifications" } satisfies ProtocolError;
 		const sent = requiredString(request.params, "url");
-		if (utf8Bytes(sent) > MAX_PUSH_URL_BYTES) throw { name: "invalid_params", message: `url is at most ${MAX_PUSH_URL_BYTES} bytes` } satisfies ProtocolError;
+		// A url longer than registration takes was never registered: unregistering an unknown url succeeds (§4.7).
+		if (utf8Bytes(sent) > MAX_PUSH_URL_BYTES) {
+			this.reply(socket, request, {});
+			return;
+		}
 		// As registration stores it; an unparsable url was never registered.
 		let url = sent;
 		try { url = new URL(sent).href; } catch { /* removes nothing */ }

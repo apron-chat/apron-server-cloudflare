@@ -166,6 +166,19 @@ describe('push over the socket', () => {
 			// Unregistering removes it; an unknown url is already gone.
 			expect((await request(peer, 'unregister', 'push_unregister', { url })).result).toEqual({});
 			expect((await request(peer, 'unregister-again', 'push_unregister', { url })).result).toEqual({});
+			// A url too long to have been registered is unknown too: it succeeds, reading nothing (§4.7).
+			const long = `https://push.example.net/${'x'.repeat(600)}`;
+			const removed = await runInDurableObject(stub(), (instance) => {
+				const runtime = instance as unknown as Runtime;
+				const spy = vi.spyOn(runtime.store, 'removePushSubscription');
+				return { spy, restore: () => spy.mockRestore() };
+			});
+			try {
+				expect((await request(peer, 'unregister-long', 'push_unregister', { url: long })).result).toEqual({});
+				expect(removed.spy).not.toHaveBeenCalled();
+			} finally { removed.restore(); }
+			// A missing url is still invalid.
+			expect((await request(peer, 'unregister-none', 'push_unregister', {})).error.code).toBe(-32602);
 			expect(await subscriptionsOf(userId)).toEqual([]);
 		} finally { peer.close(); }
 	}, 20_000);
