@@ -4,7 +4,9 @@ The demo speaks Apron protocol **7**, advertising `history`, `edit`, `rooms`,
 `reactions`, and `command`, and `server.ping` (45 seconds). `activity`
 (typing) is on with the Workers Paid budgets and off with the Free ones;
 `ACTIVITY` overrides either (see [plans](configuration.md#plans)), and admins
-can turn it off and on with `/toggle activity`. History availability uses each room's `latest_log_id` and
+can turn it off and on with `/toggle activity`. With push configured it
+also advertises `status`, and shows each user's status to others
+(presence, below; `/toggle presence`). History availability uses each room's `latest_log_id` and
 nullable `history_log_id`, without extension negotiation. See
 [history and recovery](https://github.com/shazow/apron/blob/main/PROTOCOL.md#41-history) and the
 [retention implementation specification](../SPEC.md#9-rolling-history-and-base-protocol-availability).
@@ -87,9 +89,25 @@ within it:
   changed) stops a signed-in user's pushes; `{"mute": 0}` ends it. The mute
   shows in the user's own `you` while set, and each change is echoed to all
   their connections (an ended mute as `mute: 0`); it is never shown to
-  others. Room-scoped status, `invisible`, and invalid values are ignored,
-  and a `status` with an `id` gets no reply. Status may be sent before
-  signing in.
+  others. Room-scoped status and invalid values are ignored, and a `status`
+  with an `id` gets no reply. Status may be sent before signing in.
+- User status (presence, with push): others see each user's `status`
+  (`online`, `idle`, `dnd` or `offline`) in room listings' `users` and in
+  `user` notifications, which go only to connections that have sent
+  `status`. A signed-in user may set `{"invisible": true}` to appear
+  `offline` to everyone; it lasts until they turn it off, on every device.
+  Mute and invisible changes together are limited to 6 a minute. A muted
+  user shows as `dnd` while connected and `offline` once gone. With the
+  Workers Paid budgets, a user who is gone but can be reached by push
+  shows `idle`; with the Free ones, everyone without a connection shows
+  `offline`. Changes are coalesced to at most one a minute per user, the
+  latest winning, and a user who closes a connection is shown offline (or
+  idle) only after a minute without them, so a reload or a phone
+  reconnecting shows nothing: what others see may be up to about a minute
+  behind. `PRESENCE` (`full`, `connected` or `false`) overrides the plan,
+  and admins can turn it off and on with `/toggle presence`. Invisibility
+  hides presence only: posts, reactions, typing and room joins still show.
+  Guests are seen only while connected, so they cannot be invisible.
 - Push (`server.push` kind `webpush`, where VAPID keys are set): registered
   users register a browser's push subscription with `push_register`
   `{kind: "webpush", url, keys: {p256dh, auth}, push_id?}` (its

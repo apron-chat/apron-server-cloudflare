@@ -7,7 +7,8 @@ memberships, plus a `memberships` table of registered users' rooms, keyed by
 room with an index by user) and the Workers test runtime; it does not claim a
 deployed account billing rate or a free-plan capacity.
 
-The figures were measured on 2026-09-26 with the repository's workerd
+The figures were measured on 2026-09-26, and re-measured on 2026-10-05 with
+user status (below), with the repository's workerd
 launcher:
 
 ```sh
@@ -58,21 +59,23 @@ upper bounds can be compared with the measured worst case.
 | Frame block (10 frames) | 12 | 11 | 64 | 24 |
 | Guest number block | 4 | 4 | 16 | 16 |
 | Connection admission reservation | 17 | 16 | 72 | 40 |
-| Identity registration (starts in `general`, logs that membership) | 29 | 33 | 338 | 880 |
-| Identity registration starting in 100 rooms | 228 | 825 | 338 | 880 |
+| Identity registration (starts in `general`, logs that membership) | 30 | 32 | 338 | 880 |
+| Identity registration starting in 100 rooms | 229 | 824 | 338 | 880 |
 | Credential lookup | 4 | 2 | 16 | 8 |
 | Identity lookup (with the user's rooms) | 8 | 2 | 434 | 8 |
 | Identity count | 4 | 2 | 16 | 8 |
-| Credential IDs lookup | 4 | 2 | 40 | 8 |
+| Credential IDs lookup | 5 | 2 | 40 | 8 |
 | Credential counter update | 5 | 3 | 16 | 16 |
-| Push subscription register | 9 | 7 | 172 | 370 |
+| Push subscription register | 9 | 8 | 172 | 370 |
 | Push subscription register again, unchanged within a day | 6 | 2 | 172 | 370 |
 | Push wake claim (one user, one subscription; creates the server and recipient counters) | 21 | 19 | 82 | 160 |
 | Push wake claim, 31 unregistered candidates before one registered | 75 | 9 | 888 | 160 |
 | Push sender charge (delivered pushes; creates the sender counter) | 10 | 9 | 24 | 24 |
 | Push registrations clear (`/passkeys remove`, a new bot token) | 3 | 3 | 144 | 400 |
 | Mute set (`status` `mute`) | 6 | 4 | 24 | 24 |
-| Mute read (`you`) | 5 | 2 | 16 | 8 |
+| Invisible set (`status` `invisible`) | 7 | 3 | 24 | 24 |
+| Status inputs at sign-in, `connected` (mute and `invisible`; was the mute read) | 5 | 2 | 16 | 8 |
+| Status inputs at sign-in, `full` (also the latest waking registration) | 6 | 2 | 24 | 8 |
 | Gone push subscription forget (one primary-key row) | 4 | 3 | 20 | 22 |
 | Push reply author lookup | 5 | 2 | 16 | 8 |
 | Push wake claim for a reply (creates the recipient counter) | 13 | 9 | 82 | 160 |
@@ -86,15 +89,17 @@ upper bounds can be compared with the measured worst case.
 | Registered name mutation | 23 | 19 | 296 | 120 |
 | Registered room leave (logs the membership) | 24 | 20 | 482 | 72 |
 | Registered room join (logs the membership) | 23 | 17 | 482 | 72 |
-| Registered room join at the 100-thread ceiling | 333 | 32 | 482 | 72 |
+| Registered room join at the 100-thread ceiling | 332 | 32 | 482 | 72 |
 | History page | 12 | 2 | 264 | 40 |
 | Room record lookup (`general`) | 5 | 2 | 24 | 8 |
 | Room join lookup | 5 | 2 | 24 | 8 |
 | Room listing (representative matrix) | 8 | 2 | 444 | 8 |
 | Room members, `general` and one thread | 8 | 2 | 824 | 8 |
+| Room members with status (`full`), `general` and one thread | 10 | 2 | 1,624 | 8 |
 | Room members, 101 rooms with 200 registered members each | 40,403 | 2 | 40,820 | 8 |
+| Room members with status (`full`), 101 rooms of 200, each muted, invisible and fully registered | 80,601 | 2 | 81,220 | 8 |
 | Admission snapshot | 6 | 2 | 40 | 24 |
-| Cleanup (matrix, one day later) | 128 | 51 | 1,074 | 1,058 |
+| Cleanup (matrix, one day later) | 105 | 38 | 1,074 | 1,058 |
 | Alarm scheduling | 8 | 4 | 24 | 12 |
 
 The matrix uses a fresh object and one representative operation for each
@@ -144,7 +149,9 @@ Memberships:
   read each listed room's registered members by primary-key range with one
   identity lookup each, at most `roomListMembers` (200 with the Workers Paid
   budgets, 100 with the Free ones) per room: the reservation is
-  `8 + rooms × (4 + 2 × roomListMembers)` reads. Connected members come from
+  `8 + rooms × (4 + 2 × roomListMembers)` reads, and
+  `8 + rooms × (4 + 4 × roomListMembers)` with `full` user status
+  ([below](#user-status)). Connected members come from
   connection attachments. A user in `general` and a few threads reads about
   two rows per registered member of those rooms; the worst case, a listing of
   all 101 rooms each at the cap, measured 40,403 reads at 200, which the
@@ -325,13 +332,19 @@ the reservation and latch accounting unsafe. Many accounts sharing one
 endpoint otherwise cost what as many separate registrations do: a wake
 claims at most `wakesPerMessage` users of `subscriptionsPerUser` each.
 
-A `status` `mute` change is one upsert or delete of the user's `mutes` row
-(about 4 writes, 6/4 with the reservation), echoed in `you` from the same
-operation; `auth` and `me` results for a registered user on a push server
-read it once each. `mutesPerUserMinute` (6) bounds the changes, counted per
-user across reconnects, so flipping a mute cannot drain the write budget:
-at most about 35 written rows a user a minute. An
-expired mute is read as none and never written back.
+A `status` `mute` or `invisible` change is one upsert or delete of the
+user's `user_status` row (about 4 writes, 6/4 and 7/3 with the
+reservation), echoed in `you` from the same operation. A registered sign-in
+on a push server reads the row once (5/2, what reading the mute alone cost)
+and keeps it on the connection, so `me` results and later `you` objects read
+nothing (each `me` read it before). `mutesPerUserMinute` (6) bounds mute and
+`invisible` changes together, counted per user across reconnects, so
+flipping them cannot drain the write budget: at most about 35 written rows
+a user a minute. An expired mute is read as none and never written back.
+A registration now also writes its entry in the partial index of waking
+registrations (9/8 against 9/7), and the wake claim reads live waking
+registrations through that index, so registrations that wake for nothing
+are not read.
 
 Cleanup deletes expired registrations (`pushExpiryDays`, 7) and wake times
 past `coalesceSeconds` within its existing batch, by their time indexes.
@@ -343,6 +356,106 @@ Worker or Durable Object request is billed for them, and the object is
 awake for the post anyway. `pushesPerDay` (5,000 on Paid, 1,000 on Free)
 bounds them; on Paid that is at most about 50,000 claim writes a day if
 every push were its own wake, about 7% of the foreground write ceiling.
+
+## User status
+
+Measured on 2026-10-05 with
+[`test/accounting.integration.test.ts`](../test/accounting.integration.test.ts)
+("measures member listings with status by population", the operation matrix,
+and the 101-room ceiling) and
+[`test/presence.integration.test.ts`](../test/presence.integration.test.ts).
+User status (protocol §4.11; [SPEC section 4.4](../SPEC.md#44-push), User
+status) has two variants: `full` (Workers Paid) also shows users without a
+connection from storage, and `connected` (Workers Free) shows them
+`offline`.
+
+**Listings.** `full` reads each listed registered member's `user_status`
+row by primary key and probes the partial index of their waking
+registrations for the latest (`MAX(updated_ms)`, one index entry). One room
+of 200 registered members, by what the members have stored:
+
+| Members (200 in one room) | Reads without status | Reads with status (`full`) | Added per member |
+| --- | ---: | ---: | ---: |
+| none muted, invisible, or registered | 404 | 403 | 0 |
+| each with two live waking registrations | 404 | 604 | 1.0 |
+| mixed: a third registered, a tenth muted, one in 30 invisible | 404 | 498 | 0.47 |
+| worst: each muted and invisible, with 5 registrations, the latest waking | 404 | 804 | 2.0 |
+| reserved | 420 | 820 | |
+
+A `user_status` row or index entry that is not there costs nothing, so
+status adds a read only for members that have something stored. A
+registration that wakes for nothing is not in the partial index: without
+it, the same worst case read every registration (the 2026-10-04 budget
+prototype measured +7 a member). The reservation per room grows from
+`4 + 2 × roomListMembers` to `4 + 4 × roomListMembers`; all 101 rooms at
+the cap, every member at the worst case, read 80,601 rows against the
+81,220 reserved (40,403 without status). The `connected` variant issues
+the same query as no status at all: the presence tests assert equal cursor
+counts for a listing with `connected` and with presence off, and equal
+reads for its sign-in and the former mute read.
+
+**Reuse.** The store keeps each room's member rows in memory for
+`statusCoalesceSeconds` (60) and serves a listing again with no SQL and no
+reservation (measured 0/0) until any write to `identities`, `memberships`,
+`user_status` or `push_subscriptions`. Avatars and status inputs are judged
+against the time of each call, so a mute that runs out shows without a read.
+A reconnect wave of 100 clients listing `general` with 200 members reads
+it once instead of 100 times (about 40,000 rows saved at two a member). It
+is lost on hibernation; the figures below assume no reuse.
+
+**Sign-in and changes.** A registered sign-in reads the `user_status` row
+(5/2, as the mute read did) and, under `full`, the latest waking
+registration (6/2); the result stays on the connection, and `me` reads
+nothing. An `invisible` change is 7/3. Deriving and announcing statuses
+reads connection attachments only: the test that lets a grace run out and
+announces it measures 0 rows read and written and the alarm unchanged.
+Fan-out is one `user` frame per status-aware connection that shares a room
+(about 2 ms of CPU for 100 sockets, from the budget prototype), at most once
+a minute per user; outgoing frames are not billed.
+
+**Timers, requests, and duration.** A change waits for the coalescing
+minute and, when a closed connection caused it, the 60-second grace. The
+designs measured or costed for announcing it on time:
+
+| Design | Durable Object requests | SQL rows | Duration | Verdict |
+| --- | --- | --- | --- | --- |
+| One-shot in-memory `setTimeout` for the earliest due change, armed only while a connection that sent `status` is open (chosen) | 0 (no alarm is set: measured) | 0 (measured) | keeps the object awake at most 60 s after its last event, against about 10 s before it would hibernate: at most 50 s × 0.125 GB = 6.25 GB-s per change that lands in a quiet period, 0.05% of either plan's daily duration | chosen |
+| An alarm per due change | 1 per wake: 2% of Free's requests, 12.5% of Paid's at 4,000 a day | alarm scheduling (8/4) and an alarm run (about 14 written rows): about 36,000 maintenance writes a day at Free's 2,000 admissions, 180% of its 20,000 | about 1.25 GB-s per wake | rejected: Free fails closed |
+| Announce only on the next event | 0 | 0 | 0 | rejected: in a quiet room a change waits for the next event, however long, so peers keep seeing "online" |
+
+Nothing waiting is lost when the object is evicted: what others were told
+is on the user's connections (`pres`), and a change owed to others for a
+user with no connection left is on each connection owed it (`owed`). The
+first event after a wake sweeps the attachments and announces what is due
+(tested by evicting the object with changes waiting). A pending timer also
+keeps the object from hibernating, so it is lost only to an eviction.
+
+**Daily budget.** Added by user status at the load models of the budget
+analysis: R (realistic) and K (the admission caps), with 1.5 member listings
+per admission, 150 (Free) or 250 (Paid) listed registered members each, and
+one last disconnect per admission. Shares are of each plan's daily
+allowance (Paid: its monthly included usage over 31 days), and for SQL of
+the application's foreground ceiling.
+
+| Added per day | Free `connected`, R / K | Paid `full`, R / K |
+| --- | --- | --- |
+| Durable Object requests | 0% / 0% | 0% / 0% |
+| Durable Object duration, if every session ends in an otherwise quiet minute | ≤ 3,125 GB-s (24%) / bound by the whole day | ≤ 6,250 GB-s (48%) / bound by the whole day |
+| SQL rows read (foreground) | 0% / 0% (listings and sign-ins read the same; `me` reads less) | 0.7–1.5% / 2.8–6% (worst, every member at +2: 12%) |
+| SQL rows read (account) | 0% / 0% | under 0.05% / under 0.4% |
+| SQL rows written (foreground) | at most one per changed registration and about 3 per `invisible` change: ≤ 0.9% / ≤ 3.4% | ≤ 0.15% / ≤ 0.6% |
+| Frames | none from the server; a client that sends `status` sends what push already asked for | same |
+
+Duration has a hard bound whatever the design: one object awake all day is
+10,800 GB-s, 83% of Free's 13,000 and 84% of Paid's daily 12,900 (334,800
+GB-s in a 31-day month, under Paid's 400,000 included), so the timer cannot
+run either plan over; it spends the one allowance that cannot run out
+instead of requests and maintenance writes, which fail closed. The duration
+rows assume the worst, that every last disconnect leaves the object
+otherwise idle; sessions that end during others' activity add nothing, and
+with no connection that sent `status` open no timer is armed at all.
+`offlineGraceSeconds` and `statusCoalesceSeconds` trade staleness for
+duration: at 30 seconds each the duration rows halve.
 
 ## Retention, maintenance, and persistent state
 
@@ -412,6 +525,12 @@ limiter expiry:
 room members:
   SEARCH m USING COVERING INDEX sqlite_autoindex_memberships_1 (room_id=?)
   SEARCH i USING INDEX sqlite_autoindex_identities_1 (user_id=?) LEFT-JOIN
+room members with status (`full` presence):
+  SEARCH m USING COVERING INDEX sqlite_autoindex_memberships_1 (room_id=?)
+  SEARCH i USING INDEX sqlite_autoindex_identities_1 (user_id=?) LEFT-JOIN
+  SEARCH s USING INDEX sqlite_autoindex_user_status_1 (user_id=?) LEFT-JOIN
+  CORRELATED SCALAR SUBQUERY 1
+  SEARCH p USING INDEX push_subscriptions_waking_idx (user_id=?)
 a user's rooms:
   SEARCH m USING INDEX memberships_user_idx (user_id=?)
   SEARCH r USING INDEX sqlite_autoindex_rooms_1 (room_id=?)
@@ -449,9 +568,10 @@ to `identities` and sets it for bots, `admin`, and schema 6's listed admins,
 reading and updating the identities once (at most the identity cap), and
 deletes the `_meta` `admins` row. A schema 7 object is upgraded to schema 8
 the same way, which only creates three empty tables, `push_subscriptions`
-(with indexes by user and registration time, and by registration time),
-`push_wakes` (with an index by wake time) and `mutes`: three tables and
-three indexes besides their primary keys. A schema 5 object takes all three
+(with indexes by user and registration time, by registration time, and a
+partial one by user and registration time of those that wake for
+messages), `push_wakes` (with an index by wake time) and `user_status`:
+three tables and four indexes besides their primary keys. A schema 5 object takes all three
 upgrades.
 
 Any other stored schema version resets the object with

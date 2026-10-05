@@ -9,8 +9,8 @@ one, and must match the account's plan.
 
 | File | Plan | Features on by default |
 | --- | --- | --- |
-| [`src/plans/paid.ts`](../src/plans/paid.ts) (selected) | Workers Paid, $5/month | `activity` (typing) |
-| [`src/plans/free.ts`](../src/plans/free.ts) | Workers Free | none |
+| [`src/plans/paid.ts`](../src/plans/paid.ts) (selected) | Workers Paid, $5/month | `activity` (typing), presence `full` (user status, with push) |
+| [`src/plans/free.ts`](../src/plans/free.ts) | Workers Free | presence `connected` (user status of connected users, with push) |
 
 The paid plan starts from the free one and raises only what Paid's included
 usage pays for, sized against its monthly allowances divided by 31 days with
@@ -270,7 +270,7 @@ with the client's optional registration `push_id` in each push; see
 | `subscriptionsPerUser` | 5 | 5 |
 | `pushExpiryDays` (a registration not renewed this long is skipped, then deleted) | 7 | 7 |
 | `registersPerUserMinute` (`push_register` requests per user, across reconnects) | 10 | 10 |
-| `mutesPerUserMinute` (`status` `mute` changes per user; extras are dropped) | 6 | 6 |
+| `mutesPerUserMinute` (`status` `mute` and `invisible` changes per user, together; extras are dropped) | 6 | 6 |
 | `ttlSeconds` (how long a push service keeps an undelivered push) | 1 day | 1 day |
 
 `wakesPerMessage` times `subscriptionsPerUser`, the pushes one message may
@@ -322,6 +322,41 @@ again.
 Pushes are outbound requests from the Durable Object, which no Worker or
 Durable Object allowance counts and no edge rule needs to allow. Their SQL is
 in the [cost report](cost-report.md#push); `/status` shows the day's pushes.
+
+## User status (presence)
+
+With push on, the server can show each user's `status` (`online`, `idle`,
+`dnd`, `offline`; protocol §4.11) to others, and takes `invisible` (see
+[SPEC section 4.4](../SPEC.md#44-push), User status). The plan's
+`features.presence` picks the variant, and `PRESENCE` overrides it:
+
+| `PRESENCE` | Users with a connection | Users without one | Extra SQL |
+| --- | --- | --- | --- |
+| `full` (Workers Paid default) | from their connections | `idle` with a live push registration that wakes for messages and no mute, else `offline` | about one read per listed member that has registrations (none without, two at worst), one at sign-in |
+| `connected` (Workers Free default) | from their connections | `offline` | none |
+| `false` | no `status` sent, `invisible` ignored | | none |
+
+`true` means the plan's variant (else `connected`). Without push there is no
+`status` capability, so presence is off whatever it says. An admin's
+`/toggle presence` turns it off and on again without a deploy; on, it is the
+variant above. An `invisible` change writes about 4 rows, like a mute, and the
+two share `mutesPerUserMinute`.
+
+Two limits shape how fast changes are announced, both in seconds and at most
+60 (`MAX_STATUS_DELAY_SECONDS`), so what others see is never more than about
+a minute behind:
+
+- `statusCoalesceSeconds` (60): a user's status is announced at most once in
+  this long; changes in between wait, and only the latest goes out. Member
+  listings are also reused for up to this long, until something they read
+  is written.
+- `offlineGraceSeconds` (60): a change caused by a closed connection waits
+  this long, so a reload or a phone reconnecting shows nothing.
+
+Waiting changes are announced by one in-memory timer, armed only while a
+connection that sent `status` is open, which keeps the object awake for at
+most a minute after its last event; it uses no SQL and no alarm, so no
+Durable Object request. See the [cost report](cost-report.md#user-status).
 
 ## Runtime overrides
 
@@ -393,6 +428,7 @@ and recalibrating its resource model.
 | `ALLOWED_ORIGINS` | Exact browser-origin allowlist, or standalone `*` to admit every guest origin (including opaque/missing Origin); cannot mix `*` with explicit origins; all clients remain subject to quotas |
 | `RP_NAME` | Bounded display name for browser passkey prompts |
 | `ACTIVITY` | `true` advertises and relays typing (cap `activity`, section 4.2 of the spec); `false` turns it off. Unset, the plan decides: on for Workers Paid, off for Free. An admin's `/toggle activity` overrides it until toggled back. Read cursors are never kept |
+| `PRESENCE` | `full`, `connected`, `true` (the plan's variant) or `false`: how much of each user's `status` others see (protocol §4.11), and whether `invisible` is taken; needs push. Unset, the plan decides: `full` for Workers Paid, `connected` for Free. An admin's `/toggle presence` overrides it until toggled back. See [User status](#user-status-presence) |
 | `GUEST_POSTING` | `true` lets guests post, react, join and leave rooms, and create threads under the guest quotas; default off in both plans, so guests only list rooms and read history until they sign in with a passkey. Announced as `ext.demo.guest_posting` |
 | `APRON_ADMIN_TOKEN` | Optional fixed bearer token, 24 to 256 of `A-Z a-z 0-9 - _` and not starting `apron_bot_`, `apron_invite_`, or `apron_join_`: `auth` with `scheme: "token"` and this token signs in as the registered user `admin` ("Admin"), from any origin and without a passkey, created on first use (a registration against the usual caps). That user is always an admin and can run the admin commands (`/admin`, `/kick`, `/rename`, `/invite-token`, `/invite`, `/purge`, `/toggle` and `/status`; see [SPEC section 5, Admins](../SPEC.md#admins)). Unset by default. Anyone holding it can act as the admin, so set it only as a secret, never a Wrangler var in source: `npx wrangler secret put APRON_ADMIN_TOKEN --config wrangler.production.toml`. It persists across deploys; delete it with `npx wrangler secret delete APRON_ADMIN_TOKEN --config wrangler.production.toml` to turn it off (the `admin` user never holds a passkey, so nothing else signs in as it). A malformed value makes every request fail its configuration check. Locally, use `npx wrangler dev --var APRON_ADMIN_TOKEN:…` or `.dev.vars` |
 | `MEDIA_ORIGIN` | Exact https origin where the upload bucket serves objects, such as `https://media.apron.chat`; with `PUBLIC_ORIGIN`, `UPLOAD_SIGNING_KEY` and the `MEDIA` binding, turns uploads on for a plan that has them |
@@ -437,7 +473,9 @@ about 60 rows each guest connection already writes). Raise it only for a deploym
 The numeric rows are grouped by their unit and enforcement scope:
 
 - Durations: `retentionSeconds`, `cleanupSeconds`, `challengeTtlSeconds`,
-  `unauthenticatedTimeoutSeconds`, `dedupTtlSeconds`.
+  `unauthenticatedTimeoutSeconds`, `dedupTtlSeconds`, and
+  `statusCoalesceSeconds` and `offlineGraceSeconds` (each at most 60; see
+  [User status](#user-status-presence)).
 - Payload/storage bytes: `maxFrameBytes`, `maxTextBytes`, `maxSnapshotBytes`,
   `maxRequestIdBytes`, `maxNameBytes`, `historyMaxResponseBytes`, `pendingBytesPerConnection`,
   `databaseHighWaterBytes`, `databaseHardTargetBytes`,
@@ -527,6 +565,8 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `pingSeconds` | 45 |  |
 | `pingTimeoutSeconds` | 150 |  |
 | `guestNumberBlock` | 10 |  |
+| `statusCoalesceSeconds` | 60 |  |
+| `offlineGraceSeconds` | 60 |  |
 | `sqlWritesPerDay` | 800000 | 80000 |
 | `sqlReadsPerDay` | 30000000 | 3000000 |
 | `foregroundWritesPerDay` | 700000 | 60000 |
