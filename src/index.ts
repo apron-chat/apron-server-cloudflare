@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, pushHostAllowed, type RuntimeConfig } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, DEFAULT_FEATURES, PLAN, MAX_FRAME_LEASE, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
-import { isStatus, isStatusChoice, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
+import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
 import { fetchAccountUsage, type AccountUsageSnapshot } from "./account-usage";
 import { runBudgetGuard, watchForFlood } from "./budget-guard";
 import { sniffImage } from "./image";
@@ -1376,6 +1376,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 				ping: limits.pingSeconds,
 				// Web Push (§4.7), with the VAPID key browsers subscribe with and the wake scopes.
 				...(this.config.push ? { push: { webpush: { key: this.config.push.publicKey }, wake: Object.keys(WAKE_SCOPES) } } : {}),
+				// The optional `status` values `me` accepts (§3.1, §4.11), only while
+				// others are shown them: with presence off a choice is still kept,
+				// but nobody sees `dnd` or `invisible`, so clients offer neither.
+				...(presence ? { status: [...OPTIONAL_STATUS_CHOICES] } : {}),
 				ext: {
 					demo: {
 						retention_seconds: limits.retentionSeconds,
@@ -2758,7 +2762,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * After an `auth` result that signed a connection in (§4.11): sends it
 	 * one `status` for each of its user's mutes in effect, then carries on
 	 * its user's status (presenceSignedIn) and sends it the status of each
-	 * connected user who shares a room with it (sendShownStatus).
+	 * connected user who shares a room with it (sendShownStatus). Every
+	 * sign-in path calls it after its reply; an `auth` that only adds a
+	 * passkey to a signed-in connection, or a guest `auth` on one, is not a
+	 * sign-in and does not.
 	 */
 	private afterSignIn(socket: WebSocketConnection, stored?: StatusInputRecord): void {
 		this.sendMutesInEffect(socket, stored);
@@ -2767,10 +2774,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * After `auth`, one `status` for each mute in effect (§4.11), with the
-	 * seconds left or `true`: the unscoped one from the attachment, and the
-	 * room mutes read at sign-in. Any scope not sent is unmuted. A guest has
-	 * none.
+	 * After a sign-in's `auth` result, one `status` for each mute in effect
+	 * (§4.11), with the seconds left or `true`: the unscoped one from the
+	 * attachment, and the room mutes read at sign-in. Any scope not sent is
+	 * unmuted. A guest has none.
 	 */
 	private sendMutesInEffect(socket: WebSocketConnection, stored?: StatusInputRecord): void {
 		const state = connectionAttachment(socket);
@@ -3347,14 +3354,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * After `auth` (§4.11): sends the connection, as `user` `new`, the status
-	 * of each other connected user who shares a room with it, as others were
-	 * last told it (presenceSnapshot), so a change still waiting on the
-	 * coalescing minute is not told early. Users shown `offline` (invisible,
-	 * or just made visible and not yet announced) or `""` (none) are left
-	 * out, as users without a connection are, so the frames never tell that
-	 * a user who hides it is connected; listings carry their status.
-	 * Attachments only, no SQL.
+	 * After a sign-in's `auth` result (§4.11): sends the connection, as
+	 * `user` `new`, the status of each other connected user who shares a
+	 * room with it, as others were last told it (presenceSnapshot), so a
+	 * change still waiting on the coalescing minute is not told early.
+	 * Users shown `offline` (invisible, or just made visible and not yet
+	 * announced) or `""` (none) are left out, as §4.11 has it and as users
+	 * without a connection are, so the frames never tell that a user who
+	 * hides it is connected; listings carry their status. Attachments only,
+	 * no SQL.
 	 */
 	private sendShownStatus(socket: WebSocketConnection): void {
 		if (!this.presenceMode()) return;

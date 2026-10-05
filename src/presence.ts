@@ -9,6 +9,8 @@ export type StatusChoice = "online" | "" | "dnd" | "invisible";
 export type Status = "online" | "idle" | "dnd" | "offline" | "";
 
 export const STATUS_CHOICES: readonly StatusChoice[] = ["online", "", "dnd", "invisible"];
+/** The optional choices (§4.11), listed in `server.status`; `online` and `""` are always accepted and never listed. */
+export const OPTIONAL_STATUS_CHOICES: readonly StatusChoice[] = ["dnd", "invisible"];
 export const STATUSES: readonly Status[] = ["online", "idle", "dnd", "offline", ""];
 
 export function isStatusChoice(value: unknown): value is StatusChoice {

@@ -2,7 +2,8 @@ import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_LIMITS, PUSH_POLICY } from '../src/budget';
 import { MUTE_FOREVER, type Store } from '../src/store';
-import { connect as open, exchange, request, type Frame, type Peer } from './helpers/socket';
+import { connect as open, exchange, request, statusOnly, type Frame, type Peer } from './helpers/socket';
+import { softPasskey } from './helpers/webauthn';
 import { withStore } from './helpers/store';
 
 let nextIp = 1;
@@ -737,5 +738,221 @@ describe('user status timing', () => {
 			await choose(watcher, 'online');
 			expect(told(await drain(admin), watcherId)).toEqual(['online']);
 		} finally { admin.close(); watcher.close(); }
+	});
+});
+
+/** The frames among `frames` that §4.11 sends after a sign-in: mutes in effect (`status`) and others' statuses. */
+function signInSends(frames: Frame[]): Frame[] {
+	return frames.filter((frame) => frame.method === 'status' || statusOnly(frame));
+}
+
+/** Registers a passkey over the wire on `peer`: begin, then finish with a software authenticator; the finish exchange. */
+async function registerPasskey(peer: Peer, id: string): Promise<{ passkey: Awaited<ReturnType<typeof softPasskey>>; finished: { frame: Frame; skipped: Frame[] } }> {
+	const passkey = await softPasskey('http://localhost:5173');
+	const begun = await request(peer, `${id}-begin`, 'auth', { scheme: 'webauthn', action: 'register', step: 'begin' });
+	expect(begun.error).toBeUndefined();
+	const credential = await passkey.register(begun.result.public_key);
+	const finished = await exchange(peer, `${id}-finish`, 'auth', { scheme: 'webauthn', action: 'register', step: 'finish', challenge_id: begun.result.challenge_id, credential });
+	expect(finished.frame.error).toBeUndefined();
+	return { passkey, finished };
+}
+
+/** A fresh connection past its greeting. */
+async function opened(): Promise<Peer> {
+	const peer = await connect();
+	await peer.next();
+	await peer.next();
+	return peer;
+}
+
+async function sha256Hex(text: string): Promise<string> {
+	const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)));
+	return Array.from(digest, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+/** Stores a mute everywhere and one in general for `userId`, as an earlier connection would have. */
+async function storeMutes(userId: string): Promise<void> {
+	await runInDurableObject(stub(), (instance) => {
+		const { store } = instance as unknown as Runtime;
+		const now = Date.now();
+		store.setMute({ userId, untilMs: now + 3_600_000, now });
+		(store as unknown as { setRoomMute(input: { userId: string; roomId: string; untilMs: number | null; now?: number }): unknown })
+			.setRoomMute({ userId, roomId: 'general', untilMs: MUTE_FOREVER, now });
+	});
+}
+
+describe('server.status and what follows a sign-in (§3.1, §4.11)', () => {
+	beforeEach(forgetAnnouncements);
+
+	it('advertises the optional statuses in server.status with presence on, and leaves it out with presence off', async () => {
+		const on = await connect();
+		try {
+			const server = (await on.next()).params;
+			expect(server.capabilities).toContain('status');
+			expect(server.status).toEqual(['dnd', 'invisible']);
+		} finally { on.close(); }
+		await runInDurableObject(stub(), (instance) => {
+			(instance as unknown as { presenceMode(): boolean }).presenceMode = () => false;
+		});
+		try {
+			const off = await connect();
+			try {
+				const server = (await off.next()).params;
+				// Capability `status` stays (idle and mutes still work); only the list goes.
+				expect(server.capabilities).toContain('status');
+				expect(server).not.toHaveProperty('status');
+			} finally { off.close(); }
+		} finally {
+			await runInDurableObject(stub(), (instance) => { delete (instance as unknown as { presenceMode?: unknown }).presenceMode; });
+		}
+		const again = await connect();
+		try { expect((await again.next()).params.status).toEqual(['dnd', 'invisible']); } finally { again.close(); }
+	});
+
+	it('sends the mutes in effect and others\' statuses only after the auth result, on every sign-in path', async () => {
+		const busyId = unique('busy');
+		const busy = await signedIn(busyId);
+		const peers: Peer[] = [busy];
+		/** Checks one sign-in's exchange: nothing before its result, then the mutes and Busy's dnd after it. */
+		const check = async (path: string, peer: Peer, exchanged: { frame: Frame; skipped: Frame[] }, mutes: unknown[]) => {
+			expect(exchanged.frame.error, path).toBeUndefined();
+			expect(signInSends(exchanged.skipped), path).toEqual([]);
+			const after = await drain(peer);
+			expect(after.filter((frame) => frame.method === 'status').map((frame) => frame.params), path).toEqual(mutes);
+			expect(told(after, busyId), path).toEqual(['dnd']);
+			// Mutes first, then statuses.
+			if (mutes.length) expect(after.findIndex((frame) => frame.method === 'status'), path).toBeLessThan(after.findIndex(statusOnly));
+		};
+		const stored = [{ mute: expect.any(Number) }, { room_id: 'general', mute: true }];
+		try {
+			await choose(busy, 'dnd');
+
+			// Token resume (a passkey's session token).
+			const resumedId = unique('resumed');
+			await register(resumedId);
+			await storeMutes(resumedId);
+			const token = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).issueSession(resumedId, 'http://localhost:5173', Date.now()));
+			const resumed = await opened();
+			peers.push(resumed);
+			await check('token resume', resumed, await exchange(resumed, 'auth', 'auth', { scheme: 'token', token }), stored);
+
+			// Keyless: an invite token (`/invite-token`), as bots and the admin token sign in.
+			const invitedId = unique('invited');
+			await register(invitedId);
+			await storeMutes(invitedId);
+			const invite = `apron_invite_${crypto.randomUUID().replaceAll('-', '')}`;
+			const inviteKey = `invite-token:${await sha256Hex(invite)}`;
+			await runInDurableObject(stub(), (_instance, state) => state.storage.put(inviteKey, { v: 1, userId: invitedId }));
+			const invited = await opened();
+			peers.push(invited);
+			await check('keyless token', invited, await exchange(invited, 'auth', 'auth', { scheme: 'token', token: invite }), stored);
+
+			// Guest: no mutes, the statuses after the result.
+			const visitor = await opened();
+			peers.push(visitor);
+			await check('guest', visitor, await exchange(visitor, 'auth', 'auth', { scheme: 'guest' }), []);
+
+			// Passkey registration, a new account: the mutes sent before signing in are in effect after it.
+			const fresh = await opened();
+			peers.push(fresh);
+			fresh.send({ method: 'status', params: { idle: false, mute: 600 } });
+			fresh.send({ method: 'status', params: { room_id: 'general', mute: true } });
+			const { passkey, finished } = await registerPasskey(fresh, 'signup');
+			await check('passkey registration', fresh, finished, [{ mute: 600 }, { room_id: 'general', mute: true }]);
+			const newId = finished.frame.result.you.user_id;
+
+			// Passkey login: the new account's stored mutes, after the result.
+			const login = await opened();
+			peers.push(login);
+			const begun = await request(login, 'login-begin', 'auth', { scheme: 'webauthn', action: 'login', step: 'begin' });
+			const credential = await passkey.assert(begun.result.public_key);
+			const loggedIn = await exchange(login, 'login-finish', 'auth', { scheme: 'webauthn', action: 'login', step: 'finish', challenge_id: begun.result.challenge_id, credential });
+			expect(loggedIn.frame.result?.you.user_id).toBe(newId);
+			await check('passkey login', login, loggedIn, [{ mute: expect.any(Number) }, { room_id: 'general', mute: true }]);
+		} finally { for (const peer of peers) peer.close(); }
+	}, 20_000);
+
+	it('sends nothing after an auth that adds a passkey to a signed-in connection, nor after a repeated guest auth', async () => {
+		const busyId = unique('busy');
+		const busy = await signedIn(busyId);
+		const userId = unique('adder');
+		await register(userId);
+		await storeMutes(userId);
+		const user = await signedIn(userId, { existing: true });
+		const { peer: visitor } = await guest();
+		try {
+			await choose(busy, 'dnd');
+			await drain(user);
+			await drain(visitor);
+			// Adding a passkey is an auth, but not a sign-in.
+			const { finished } = await registerPasskey(user, 'add');
+			expect(finished.frame.result.you.user_id).toBe(userId);
+			expect(signInSends([...finished.skipped, ...await drain(user)])).toEqual([]);
+			// Nor is a guest auth on a connection already signed in.
+			const repeated = await exchange(visitor, 'again', 'auth', { scheme: 'guest' });
+			expect(repeated.frame.error).toBeUndefined();
+			expect(signInSends([...repeated.skipped, ...await drain(visitor)])).toEqual([]);
+		} finally { busy.close(); user.close(); visitor.close(); }
+	});
+
+	it('shows dnd only while connected, and leaves users shown offline or "" out after a sign-in', async () => {
+		const ids = { dnd: unique('dnd'), gone: unique('gone'), none: unique('none'), hidden: unique('hidden'), here: unique('here') };
+		const peers = new Map<string, Peer>();
+		for (const id of Object.values(ids)) peers.set(id, await signedIn(id));
+		try {
+			await choose(peers.get(ids.dnd)!, 'dnd');
+			await choose(peers.get(ids.none)!, '');
+			await choose(peers.get(ids.hidden)!, 'invisible');
+			// While connected, dnd is sent after a sign-in.
+			const first = await signIn(unique('first'));
+			expect(told(first.afterAuth, ids.dnd)).toEqual(['dnd']);
+			expect(told(first.afterAuth, ids.here)).toEqual(['online']);
+			first.peer.close();
+			// Gone, the dnd user is offline to others: told so, listed so, and not sent after a sign-in.
+			const watcher = await signedIn(unique('watcher'));
+			try {
+				await drain(watcher);
+				await hangUp(peers.get(ids.dnd)!, ids.dnd);
+				await hangUp(peers.get(ids.gone)!, ids.gone);
+				await advance(Math.max(COALESCE, GRACE) + 1_000);
+				const seen = await drain(watcher);
+				expect(told(seen, ids.dnd)).toEqual(['offline']);
+				expect(told(seen, ids.gone)).toEqual(['offline']);
+				expect(await listed(watcher, ids.dnd)).toMatchObject({ status: 'offline' });
+			} finally { watcher.close(); }
+			const later = await signIn(unique('later'));
+			try {
+				// offline (gone, dnd without a connection, invisible) and "" are left out.
+				for (const id of [ids.dnd, ids.gone, ids.hidden, ids.none]) expect(told(later.afterAuth, id), id).toEqual([]);
+				expect(told(later.afterAuth, ids.here)).toEqual(['online']);
+				expect(later.afterAuth.filter(statusOnly).map((frame) => frame.params.new.status)).not.toContain('offline');
+				expect(later.afterAuth.filter(statusOnly).map((frame) => frame.params.new.status)).not.toContain('');
+			} finally { later.peer.close(); }
+		} finally { for (const peer of peers.values()) peer.close(); }
+	}, 20_000);
+
+	it('scopes only mute with room_id: idle stays the connection\'s, and is never echoed', async () => {
+		const userId = unique('scoped');
+		const peer = await signedIn(userId);
+		const other = await signedIn(userId, { existing: true });
+		const idleOf = () => runInDurableObject(stub(), (_instance, state) => state.getWebSockets()
+			.map((socket) => socket.deserializeAttachment() as Attachment & { idle?: boolean })
+			.filter((attachment) => attachment.userId === userId && !attachment.closing)
+			.map((attachment) => attachment.idle === true).sort());
+		try {
+			await drain(other);
+			// idle and mute with room_id: the room is muted, not everywhere, and the sending connection is idle.
+			const sent = await status(peer, { room_id: 'general', idle: true, mute: true });
+			expect(sent.filter((frame) => frame.method === 'status').map((frame) => frame.params)).toEqual([{ room_id: 'general', mute: true }]);
+			expect((await drain(other)).filter((frame) => frame.method === 'status').map((frame) => frame.params)).toEqual([{ room_id: 'general', mute: true }]);
+			expect(await idleOf()).toEqual([false, true]);
+			const stored = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.statusInputs(userId, Date.now()));
+			expect(stored).toEqual({ choice: 'online', roomMutes: [{ roomId: 'general', untilMs: MUTE_FOREVER }] });
+			// idle with a room_id alone, even one that names no room: the connection's, no mute, nothing sent.
+			const back = await status(peer, { room_id: 'nowhere', idle: false });
+			expect(signInSends(back)).toEqual([]);
+			expect(await idleOf()).toEqual([false, false]);
+			expect((await drain(other)).filter((frame) => frame.method === 'status')).toEqual([]);
+		} finally { peer.close(); other.close(); }
 	});
 });
