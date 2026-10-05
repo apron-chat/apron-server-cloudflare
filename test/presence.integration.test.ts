@@ -527,6 +527,11 @@ describe('user status shown to others (full presence)', () => {
 				const peer = variant === 'full' ? late : await signedIn(lateId, { existing: true, aware: false });
 				try {
 					await drain(peer);
+					// `mute` or `invisible` alone is not `idle`: the connection is not yet told of statuses (§4.11).
+					const echo = await status(peer, { invisible: false });
+					expect(echo.filter((frame) => frame.method === 'user' && frame.params.new)).toEqual([]);
+					const seen = (await attachments()).filter((attachment) => attachment.userId === lateId && !attachment.closing) as Array<Attachment & { statusSeen?: boolean }>;
+					expect(seen.map((attachment) => attachment.statusSeen ?? false)).toEqual([false]);
 					const measured = await firstIdle();
 					// No SQL at all: no statement, no row read or written.
 					expect(measured).toEqual({ queries: [], reads: 0, rowsRead: 0, rowsWritten: 0 });
