@@ -91,7 +91,8 @@ within it:
   their connections (an ended mute as `mute: 0`); the connection that sent
   it is told the resulting mute and invisible every time, even when nothing
   changed (a guest's, or one past the limit); it is never shown to
-  others. Room-scoped status and invalid values are ignored, and a `status`
+  others. Room-scoped status (room mutes, which the protocol lets a server
+  ignore) and invalid values are ignored, and a `status`
   with an `id` gets no reply. Status may be sent before signing in.
 - User status (presence, with push): others see each user's `status`
   (`online`, `idle`, `dnd` or `offline`) in room listings' `users` and in
