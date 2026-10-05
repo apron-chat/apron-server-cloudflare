@@ -81,38 +81,41 @@ within it:
   keep embeds by it. Admins can turn uploads off and on with
   `/toggle uploads`. Clients should resize images and strip their metadata
   (such as location) before uploading: the server stores the bytes as sent.
-- Status (cap `status`, with push): a client sends the notification
-  `status` `{"idle": true}` when nobody is attending a connection (an
-  unfocused tab, a backgrounded app) and `{"idle": false}` when someone is
-  again; only that ends it. A client that never sends `idle` counts as
-  idle after ten minutes without a frame. `{"mute": 3600}` (or `true`, until
-  changed) stops a signed-in user's pushes; `{"mute": 0}` ends it. The mute
-  shows in the user's own `you` while set, and each change is echoed to all
-  their connections (an ended mute as `mute: 0`); the connection that sent
-  it is told the resulting mute and invisible every time, even when nothing
-  changed (a guest's, or one past the limit); it is never shown to
-  others. Room-scoped status (room mutes, which the protocol lets a server
-  ignore) and invalid values are ignored, and a `status`
-  with an `id` gets no reply. Status may be sent before signing in.
-- User status (presence, with push): others see each user's `status`
-  (`online`, `idle`, `dnd` or `offline`) in room listings' `users` and in
-  `user` notifications, which go only to connections that have sent
-  `status`. A signed-in user may set `{"invisible": true}` to appear
-  `offline` to everyone; it lasts until they turn it off, on every device,
-  and is kept while status is turned off too.
-  Mute and invisible changes together are limited to 6 a minute. A muted
-  user shows as `dnd` while connected and `offline` once gone. With the
-  Workers Paid budgets, a user who is gone but can be reached by push
-  shows `idle`; with the Free ones, everyone without a connection shows
-  `offline`. Changes are coalesced to at most one a minute per user, the
-  latest winning, and a user who closes a connection is shown offline (or
-  idle) only after a minute without them, so a reload or a phone
-  reconnecting shows nothing: what others see may be up to about a minute
-  behind. `PRESENCE` (`full`, `connected` or `false`) overrides the plan,
-  and admins can turn it off and on with `/toggle presence`; turning it
-  off tells connected clients to clear the statuses they were shown. Invisibility
-  hides presence only: posts, reactions, typing and room joins still show.
-  Guests are seen only while connected, so they cannot be invisible.
+- Status (cap `status`, with push): a user chooses a status with `me`
+  `{"status": …}`: `online` (the default), `dnd` (busy: no pushes),
+  `invisible` (appear `offline` to everyone), or `""` (none: show no
+  status at all). Any other value is taken as `""`. Their own `you` shows
+  the choice; it lasts until changed, on every device, and is kept while
+  status is turned off too. Guests may choose one for their connection.
+  A client sends the notification `status` `{"idle": true}` when nobody is
+  attending a connection (an unfocused tab, a backgrounded app) and
+  `{"idle": false}` when someone is again; only that ends it. A client that
+  never sends `idle` counts as idle after ten minutes without a frame.
+  `{"mute": 3600}` (or `true`, until changed) stops a signed-in user's
+  pushes; `{"mute": false}` (or `0`) ends it. With `room_id`, it mutes that
+  room and its threads, mentions and replies included, at most 100 rooms a
+  user. A mute is private: each change is sent to all the user's own
+  connections as `status`, and `mute: false` when it ends, is cleared or
+  runs out; after signing in, a connection is sent each mute in effect.
+  Invalid values are ignored, a `status` with an `id` gets no reply, and
+  status may be sent before signing in. Guests' mutes are ignored, since
+  guests get no pushes. Mute and status changes together are limited to 6 a
+  minute.
+- User status (presence, with push): others see each user's `status` in
+  room listings' `users` and in `user` notifications: `online` when someone
+  attends one of their connections, `idle` when connected and nobody does,
+  `offline` with no connection, `dnd` while a busy user is connected,
+  `offline` for an invisible user, and `""` for one who chose none,
+  connected or not. After signing in, a connection is told the status of
+  each connected user it shares a room with. Changes are coalesced to at
+  most one a minute per user, the latest winning, and a user who closes a
+  connection is shown offline (or idle) only after a minute without them,
+  so a reload or a phone reconnecting shows nothing: what others see may be
+  up to about a minute behind. A status a user chooses is shown at once.
+  `PRESENCE` (`true` or `false`) overrides the plan, and admins can turn it
+  off and on with `/toggle presence`; turning it off tells connected
+  clients to clear the statuses they were shown. Invisibility hides
+  presence only: posts, reactions, typing and room joins still show.
 - Push (`server.push` kind `webpush`, where VAPID keys are set): registered
   users register a browser's push subscription with `push_register`
   `{kind: "webpush", url, keys: {p256dh, auth}, push_id?}` (its
@@ -127,7 +130,8 @@ within it:
   mentions a user, or replies to their message, wakes them by push (on the
   registrations whose `wake` includes that scope) only when none of their
   connections is
-  attended (every one idle, stale, or closed): at most 10 users with
+  attended (every one idle, stale, or closed) and neither a mute of
+  theirs nor a `dnd` status silences it: at most 10 users with
   registrations a message, once a minute per user and room, 100 pushes a day
   per recipient, 200 delivered pushes a day per sender, and 5,000 pushes a
   day in all. Guests' messages wake no one

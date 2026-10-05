@@ -23,12 +23,11 @@ for a zero-overage deployment.
 - **Push for mentions and replies.** With VAPID keys set, a mention or a
   reply wakes a signed-in user whose every tab is idle or closed, through
   their browser's Web Push service (`server.push` kind `webpush`), unless
-  they muted with `status`.
+  they muted it with `status`, everywhere or in that room, or chose `dnd`.
 - **Who's around.** With push on, member lists show each user as online,
-  idle, busy (muted), or offline, and a signed-in user can go `invisible`.
-  Changes reach clients within about a minute, with no SQL or alarms of
-  their own; users without a connection show from storage on Workers Paid
-  and as offline on Free.
+  idle, busy (`dnd`), or offline, and a user can choose `dnd`, `invisible`,
+  or no status at all with `me`. Changes reach clients within about a
+  minute, with no SQL or alarms of their own.
 - **Bring your own frontend.** Guest connections are accepted from any
   origin — even `localhost` or a browser console.
 - **Built to stay inside its plan.** Every operation is metered against
