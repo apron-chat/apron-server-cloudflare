@@ -12,7 +12,9 @@ import { extractClientIp, hashIpKey, stripForwardingHeaders } from "./ip";
 import {
 	errorFromUnknown,
 	FrameError,
+	isNotification,
 	jsonString,
+	notificationOnly,
 	objectParam,
 	optionalString,
 	parseFrame,
@@ -236,12 +238,6 @@ const PRIVATE_IDENTITY = { user_id: "~private", name: "System message to you" } 
  */
 const PING_REQUEST = '{"method":"ping"}';
 const PING_RESPONSE = '{"method":"pong"}';
-/**
- * Methods the protocol defines only as notifications: one sent with an `id`
- * is handled as the notification and gets no reply (§1). The liveness ping
- * is answered with `pong`, a notification, not a reply.
- */
-const NOTIFICATION_METHODS: ReadonlySet<string> = new Set(["ping", "activity", "status"]);
 /** Joined room IDs a connection attachment may carry: every room, with slack for removals in flight. */
 const MAX_ATTACHED_ROOMS = 2 * (MAX_THREAD_LIMIT + 1);
 /**
@@ -1476,7 +1472,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// gets retry_after and a notification is dropped; the socket stays open.
 		const busy = this.takeServerFrame(nowMs());
 		if (busy !== undefined) {
-			if (parsed && parsed.request.id !== undefined) {
+			if (parsed && !isNotification(parsed.request.method, parsed.request.id)) {
 				this.fail(socket, parsed.request, { name: "retry_after", message: "Demo is busy; try again shortly", data: { retry_after: busy } });
 			}
 			return;
@@ -1500,7 +1496,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		// A method that is only a notification ignores an `id`, and is never
 		// answered with a result or an error (§1).
-		const request = NOTIFICATION_METHODS.has(parsed.request.method) && parsed.request.id !== undefined
+		const request = notificationOnly(parsed.request.method) && parsed.request.id !== undefined
 			? { ...parsed.request, id: undefined } : parsed.request;
 		try {
 			await this.dispatch(socket, current, request);

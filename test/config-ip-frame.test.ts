@@ -58,6 +58,28 @@ describe('frame policy boundaries', () => {
 		expect(() => parseFrame('"' + 'é'.repeat(8192) + '"')).toThrow(FrameError);
 		expect(() => parseFrame(new ArrayBuffer(0))).toThrow(expect.objectContaining({ closeCode: 1003 }));
 	});
+	it('marks failures of notification-only methods as notifications, whatever their id (§1)', () => {
+		const failure = (raw: string) => {
+			try {
+				parseFrame(raw, { ...DEFAULT_PARSE_OPTIONS, maxJsonDepth: 3 });
+			} catch (error) {
+				return error as FrameError;
+			}
+			throw new Error(`expected ${raw} to fail`);
+		};
+		for (const method of ['ping', 'activity', 'status']) {
+			expect(failure(`{"id":"a","method":"${method}","params":"x"}`).notification, method).toBe(true);
+			expect(failure(`{"id":"a","method":"${method}","params":{"a":{"b":{"c":{}}}}}`).notification, method).toBe(true);
+			expect(failure(`{"id":7,"method":"${method}"}`).notification, method).toBe(true);
+			expect(failure(`{"jsonrpc":"1.0","id":"a","method":"${method}"}`).notification, method).toBe(true);
+		}
+		// Requests are answered; so is an invalid envelope, with or without an id.
+		expect(failure('{"id":"a","method":"me","params":"x"}').notification).toBe(false);
+		expect(failure('{"method":"me","params":"x"}').notification).toBe(true);
+		expect(failure('{"id":7,"method":"me"}').notification).toBe(false);
+		expect(failure('{"jsonrpc":"1.0","method":"me"}').notification).toBe(false);
+		expect(failure('{"params":{}}').notification).toBe(false);
+	});
 	it('accepts empty string IDs and both envelopes without treating unknown fields as operations', () => {
 		expect(parseFrame('{"id":"","method":"auth","params":{},"ignored":42}').request.id).toBe('');
 		expect(parseFrame('{"jsonrpc":"2.0","id":"a","method":"auth"}').request.full).toBe(true);

@@ -92,6 +92,24 @@ export const DEFAULT_PARSE_OPTIONS: ParseOptions = {
 	maxRequestIdBytes: DEFAULT_LIMITS.maxRequestIdBytes,
 };
 
+/**
+ * Methods the protocol defines only as notifications: one sent with an `id`
+ * is handled as the notification and gets no reply, not even an error for
+ * invalid params (§1). The liveness ping is answered with `pong`, a
+ * notification, not a reply.
+ */
+export const NOTIFICATION_METHODS: ReadonlySet<string> = new Set(["ping", "activity", "status"]);
+
+/** Whether `method` is one the protocol defines only as a notification (§1). */
+export function notificationOnly(method: unknown): boolean {
+	return typeof method === "string" && NOTIFICATION_METHODS.has(method);
+}
+
+/** Whether a frame gets no reply: it has no `id`, or its method is only a notification (§1). */
+export function isNotification(method: unknown, id: string | undefined): boolean {
+	return id === undefined || notificationOnly(method);
+}
+
 /** Parse one application frame after applying the byte gate. */
 export function parseFrame(data: string | ArrayBuffer | ArrayBufferView, options: ParseOptions = DEFAULT_PARSE_OPTIONS): ParsedFrame {
 	if (typeof data !== "string") {
@@ -114,27 +132,34 @@ export function parseFrame(data: string | ArrayBuffer | ArrayBufferView, options
 	let id: string | undefined;
 	if (Object.hasOwn(value, "id")) {
 		if (typeof value.id !== "string" || utf8Bytes(value.id) > options.maxRequestIdBytes) {
-			throw new FrameError({ name: "invalid_request", message: "Request id must be a bounded string" }, { full });
+			// A notification-only method is never answered, whatever its `id` (§1).
+			throw new FrameError({ name: "invalid_request", message: "Request id must be a bounded string" }, { full, notification: notificationOnly(value.method) });
 		}
 		id = value.id;
 	}
-	if (full && value.jsonrpc !== "2.0") throw new FrameError({ name: "invalid_request", message: "Invalid JSON-RPC version" }, { id: id ?? null, full });
-	if (typeof value.method !== "string" || value.method.length === 0) throw new FrameError({ name: "invalid_request", message: "Method must be a non-empty string" }, { id: id ?? null, full });
+	// Decided from the method, which is known before any params check, so no
+	// error below answers a notification-only method sent with an `id` (§1).
+	const notification = isNotification(value.method, id);
+	const failure = { id: id ?? null, full, notification };
+	// An invalid envelope is answered, even without an `id`, unless its method is only a notification.
+	const envelope = { id: id ?? null, full, notification: notificationOnly(value.method) };
+	if (full && value.jsonrpc !== "2.0") throw new FrameError({ name: "invalid_request", message: "Invalid JSON-RPC version" }, envelope);
+	if (typeof value.method !== "string" || value.method.length === 0) throw new FrameError({ name: "invalid_request", message: "Method must be a non-empty string" }, envelope);
 	try {
 		walkJson(value, state);
 	} catch (error) {
-		if (error instanceof FrameError) throw new FrameError(error.protocol, { id: id ?? null, full, notification: id === undefined });
-		throw new FrameError({ name: "too_large", message: "JSON structure is too large" }, { id: id ?? null, full, notification: id === undefined });
+		if (error instanceof FrameError) throw new FrameError(error.protocol, failure);
+		throw new FrameError({ name: "too_large", message: "JSON structure is too large" }, failure);
 	}
 	let params: Record<string, unknown> = {};
 	if (Object.hasOwn(value, "params")) {
-		if (!isObject(value.params)) throw new FrameError({ name: "invalid_params", message: "Params must be an object" }, { id: id ?? null, full, notification: id === undefined });
+		if (!isObject(value.params)) throw new FrameError({ name: "invalid_params", message: "Params must be an object" }, failure);
 		params = value.params;
 	}
 	// The parsed root is already bounded. Re-check the configured depth here so
 	// tests and callers can use a lower policy than the guard's hard ceiling.
 	const configuredDepth = state.maxDepth;
-	if (configuredDepth > options.maxJsonDepth) throw new FrameError({ name: "too_large", message: "JSON nesting is too deep" }, { id: id ?? null, full, notification: id === undefined });
+	if (configuredDepth > options.maxJsonDepth) throw new FrameError({ name: "too_large", message: "JSON nesting is too deep" }, failure);
 	return { request: { method: value.method, params, ...(id === undefined ? {} : { id }), full }, bytes };
 }
 
