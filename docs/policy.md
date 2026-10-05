@@ -108,7 +108,8 @@ within it:
   idle) only after a minute without them, so a reload or a phone
   reconnecting shows nothing: what others see may be up to about a minute
   behind. `PRESENCE` (`full`, `connected` or `false`) overrides the plan,
-  and admins can turn it off and on with `/toggle presence`. Invisibility
+  and admins can turn it off and on with `/toggle presence`; turning it
+  off tells connected clients to clear the statuses they were shown. Invisibility
   hides presence only: posts, reactions, typing and room joins still show.
   Guests are seen only while connected, so they cannot be invisible.
 - Push (`server.push` kind `webpush`, where VAPID keys are set): registered

@@ -2836,6 +2836,41 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return this.config.presence || DEFAULT_FEATURES.presence || "connected";
 	}
 
+	/**
+	 * Presence turned off (`/toggle presence`): tells each connection that
+	 * has sent `idle` to drop the statuses it was told, with an empty
+	 * `status`, which clears a kept value (§4.11): its own user's in `you`,
+	 * and each user it was told of in `user` `new`, those with a connection
+	 * who share a room with it and those it is owed a change for. Users
+	 * without a connection shown only in an earlier listing are not known
+	 * here; clients drop those when they reconnect after a while (§4.11).
+	 * Attachments only: no SQL.
+	 */
+	private clearShownStatus(): void {
+		const users = new Map<string, Set<string>>();
+		const aware: Array<{ socket: WebSocketConnection; state: ConnectionAttachment }> = [];
+		for (const ws of this.ctx.getWebSockets()) {
+			const socket = ws as WebSocketConnection;
+			if (!openSocket(socket)) continue;
+			const state = connectionAttachment(socket);
+			if (!state || state.closing || !state.userId || (state.tier !== "anonymous" && state.tier !== "registered")) continue;
+			let rooms = users.get(state.userId);
+			if (!rooms) users.set(state.userId, rooms = new Set());
+			for (const roomId of state.rooms ?? []) rooms.add(roomId);
+			if (state.statusSeen) aware.push({ socket, state });
+		}
+		for (const { socket, state } of aware) {
+			const told = new Set<string>();
+			const shared = state.rooms ?? [];
+			for (const [userId, rooms] of users) {
+				if (userId !== state.userId && shared.some((roomId) => rooms.has(roomId))) told.add(userId);
+			}
+			for (const [userId] of state.owed ?? []) told.add(userId);
+			this.deliverTo(socket, { method: "user", params: { you: { user_id: state.userId!, status: "" } } });
+			for (const userId of told) this.deliverTo(socket, { method: "user", params: { new: { user_id: userId, status: "" } } });
+		}
+	}
+
 	/** Forgets every announced status and pending change (`/toggle presence`). */
 	private resetPresence(): void {
 		if (this.presenceTimer !== undefined) clearTimeout(this.presenceTimer);
@@ -3740,13 +3775,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// What was announced before is forgotten: it starts again from each
 		// connected user's status now (flushPresence records it).
 		if (chosen === "presence") {
+			if (!on) this.clearShownStatus();
 			this.resetPresence();
 			if (on) this.flushPresence();
 		}
 		const notices: Record<ToggleFeature, [string, string]> = {
 			presence: [
 				"Status is now **on**: others see who is online, idle, busy or offline, and `invisible` hides you.",
-				"Status is now **off**: no one's status is shown, and clients keep the last one they were sent until they list rooms again.",
+				"Status is now **off**: no one's status is shown, and connected clients were told to clear the ones they were shown.",
 			],
 			activity: [
 				"Activity is now **on**: typing is relayed, and new connections are offered it.",

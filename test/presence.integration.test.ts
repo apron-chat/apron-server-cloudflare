@@ -542,9 +542,35 @@ describe('user status shown to others (full presence)', () => {
 		try {
 			// Only admins may toggle.
 			expect((await request(watcher, 'nope', 'command', { room_id: 'general', body: { text: '/toggle presence' } })).error.code).toBe(-32001);
+			const quiet = await signedIn(unique('quiet'), { aware: false });
+			await drain(admin);
+			await drain(watcher);
+			await drain(quiet);
 			const off = await toggle('off');
 			expect(off.frame.result).toEqual({});
 			expect(off.skipped.find((frame) => frame.params?.from?.user_id === '~private')?.params.body.text).toMatch(/^Status is now \*\*off\*\*/);
+			// Off clears what status-aware connections were shown, with an empty
+			// status (§4.11): their own in `you`, and each user they share a room with.
+			expect(own(off.skipped)).toEqual(['']);
+			expect(told(off.skipped, watcherId)).toEqual(['']);
+			const cleared = await drain(watcher);
+			expect(own(cleared)).toEqual(['']);
+			expect(told(cleared, adminId)).toEqual(['']);
+			expect(cleared.filter((frame) => frame.method === 'user').every((frame) => Object.keys(frame.params.you ?? frame.params.new).sort().join() === 'status,user_id')).toBe(true);
+			// A connection that never sent `idle` was never told any, so it gets nothing.
+			expect((await drain(quiet)).filter((frame) => frame.method === 'user')).toEqual([]);
+			quiet.close();
+			// Clearing reads and writes no storage.
+			const clearing = await runInDurableObject(stub(), (instance) => {
+				const runtime = instance as unknown as Runtime & { clearShownStatus(): void };
+				const before = runtime.store.storageAccounting();
+				runtime.clearShownStatus();
+				const after = runtime.store.storageAccounting();
+				return { reads: after.reads - before.reads, writes: after.writes - before.writes };
+			});
+			expect(clearing).toEqual({ reads: 0, writes: 0 });
+			await drain(admin);
+			await drain(watcher);
 			// Off: no status anywhere, but invisible is still kept and echoed, as `status` is still advertised.
 			expect((await request(watcher, 'me-off', 'me', {})).result.you).not.toHaveProperty('status');
 			expect(await listed(watcher, watcherId)).not.toHaveProperty('status');
