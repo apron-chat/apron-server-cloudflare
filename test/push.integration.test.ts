@@ -815,6 +815,8 @@ describe('push limits over the socket', () => {
 describe('push subscriptions in the store', () => {
 	const config = { push: { ...POLICY } };
 	const DAY = 86_400_000;
+	/** Moves the clock to the next UTC midday, so a test that counts per day can't cross midnight. */
+	const atMidday = (clock: TestClock) => { clock.value = (Math.floor(clock.value / DAY) + 1) * DAY + DAY / 2; };
 	const browserKeys = async () => {
 		const browser = await testBrowser();
 		return { p256dh: browser.p256dh, auth: browser.auth };
@@ -889,6 +891,7 @@ describe('push subscriptions in the store', () => {
 	it('charges pushes to pushesPerDay and each recipient, skipping the rest until the next UTC day', async () => {
 		const keys = await browserKeys();
 		await withStore('push-daily', { push: { ...POLICY, pushesPerDay: 3, coalesceSeconds: 1 } }, (store, clock) => {
+			atMidday(clock);
 			for (const userId of ['cy', 'di', 'ed']) {
 				registerUser(store, clock, userId);
 				for (const n of [1, 2]) store.registerPushSubscription({ userId, url: `https://push.example.net/${userId}/${n}`, ...keys, now: clock.value });
@@ -909,6 +912,7 @@ describe('push subscriptions in the store', () => {
 	it('charges senders only for delivered pushes, and caps what one recipient gets a day', async () => {
 		const keys = await browserKeys();
 		await withStore('push-sender', { push: { ...POLICY, pushesPerSenderDay: 3, pushesPerRecipientDay: 3, coalesceSeconds: 1 } }, (store, clock) => {
+			atMidday(clock);
 			for (const userId of ['fi', 'gil', 'hu']) {
 				registerUser(store, clock, userId);
 				for (const n of [1, 2]) store.registerPushSubscription({ userId, url: `https://push.example.net/${userId}/${n}`, ...keys, now: clock.value });
