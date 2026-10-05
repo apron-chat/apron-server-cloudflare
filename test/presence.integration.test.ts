@@ -558,6 +558,40 @@ describe('user status shown to others (full presence)', () => {
 		}
 	});
 
+	it('fails a sign-in whose stored mute and invisible cannot be read, leaving the connection as it was', async () => {
+		const userId = unique('unread');
+		const watcherId = unique('watcher');
+		const watcher = await signedIn(watcherId);
+		const first = await signedIn(userId);
+		const token = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).issueSession(userId, 'http://localhost:5173', Date.now()));
+		const peer = await connect();
+		try {
+			await status(first, { invisible: true, mute: 3600 });
+			first.close();
+			await drain(watcher);
+			await peer.next();
+			await peer.next();
+			peer.send({ method: 'status', params: { idle: false } });
+			await runInDurableObject(stub(), (instance) => {
+				vi.spyOn((instance as unknown as Runtime).store, 'statusInputs').mockImplementationOnce(() => { throw new Error('storage unavailable'); });
+			});
+			// Signing in without them would show an invisible user as connected: the sign-in fails instead.
+			const failed = await request(peer, 'auth-failed', 'auth', { scheme: 'token', token });
+			expect(failed.error.code).toBe(-32603);
+			expect(failed.error.message).toMatch(/sign in again/);
+			// The connection is as it was: not signed in, and nobody was told of it.
+			expect((await request(peer, 'me-failed', 'me', {})).error.code).toBe(-32001);
+			expect((await attachments()).filter((attachment) => attachment.userId === userId && !attachment.closing)).toEqual([]);
+			await advance(COALESCE);
+			expect(told(await drain(watcher), userId)).toEqual([]);
+			// Tried again, it signs in with both.
+			const auth = await request(peer, 'auth-again', 'auth', { scheme: 'token', token });
+			expect(auth.result.you).toMatchObject({ user_id: userId, invisible: true, mute: expect.any(Number) });
+			await advance(COALESCE);
+			expect(told(await drain(watcher), userId)).toEqual([]);
+		} finally { watcher.close(); first.close(); peer.close(); }
+	});
+
 	it('tells a room\'s members the status of a user who joins it', async () => {
 		const ownerId = unique('owner');
 		const joinerId = unique('joiner');

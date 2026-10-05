@@ -1777,6 +1777,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.assertRegisteredCapacity(socket, finished.identity.user_id);
 		const token = await this.issueSession(finished.identity.user_id, origin, nowMs());
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
+		// Read before the connection changes, with no await after, so a failure leaves it as it was.
+		const stored = this.readStatusInputs(finished.identity.user_id);
 		const guest = attachment.tier === "anonymous" ? publicIdentity(attachment) : null;
 		const guestRooms = attachment.rooms ?? [];
 		attachment.tier = "registered";
@@ -1787,7 +1789,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.rooms = this.registeredRooms(socket, finished.identity.user_id);
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
-		this.prepareStatus(socket);
+		this.prepareStatus(socket, stored);
 		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), token });
 		if (guest) this.announceUser(socket, this.current(attachment), [...guestRooms, ...attachment.rooms], guest);
 		this.presenceSignedIn(socket);
@@ -1880,6 +1882,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			});
 		}
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
+		// Read before the connection changes, with no await after, so a failure leaves it as it was.
+		const stored = this.readStatusInputs(identity.userId);
 		const guest = attachment.tier === "anonymous" ? publicIdentity(attachment) : null;
 		const guestRooms = attachment.rooms ?? [];
 		attachment.tier = "registered";
@@ -1890,7 +1894,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
-		this.prepareStatus(socket);
+		this.prepareStatus(socket, stored);
 		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), token });
 		if (guest) this.announceUser(socket, this.current(attachment), [...guestRooms, ...attachment.rooms], guest);
 		this.presenceSignedIn(socket);
@@ -1960,6 +1964,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[]; avatar?: string; roles: string[] }, token?: string): Promise<void> {
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
 		this.assertRegisteredCapacity(socket, identity.userId);
+		// Read before the connection changes, so a failure leaves it as it was.
+		const stored = this.readStatusInputs(identity.userId);
 		const guest = attachment.tier === "anonymous" ? publicIdentity(attachment) : null;
 		const guestRooms = attachment.rooms ?? [];
 		attachment.tier = "registered";
@@ -1970,7 +1976,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
-		this.prepareStatus(socket);
+		this.prepareStatus(socket, stored);
 		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), ...(token ? { token } : {}) });
 		if (guest) this.announceUser(socket, this.current(attachment), [...guestRooms, ...attachment.rooms], guest);
 		this.presenceSignedIn(socket);
@@ -2725,14 +2731,35 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
+	 * A registered user's stored mute, `invisible` and (`full` presence)
+	 * latest waking registration, read once as they sign in (one
+	 * primary-key read, two under `full`), or undefined without push. Called
+	 * before the connection becomes theirs: if the read fails, the sign-in
+	 * fails, with the connection as it was. Signing in without them would
+	 * show an invisible user to others as connected and tell the client it
+	 * is not muted, both until the next sign-in; a failed sign-in can be
+	 * tried again at once.
+	 */
+	private readStatusInputs(userId: string): StatusInputRecord | undefined {
+		if (!this.config.push) return undefined;
+		try {
+			return this.store.statusInputs(userId, this.presenceMode() === "full", nowMs());
+		} catch (error) {
+			const failure = errorToProtocol(error);
+			console.warn(JSON.stringify({ event: "status_inputs_failed", reason: failure.message }));
+			if (failure.name !== "internal_error") throw failure;
+			throw { name: "internal_error", message: "Could not read your mute and invisible settings; sign in again" } satisfies ProtocolError;
+		}
+	}
+
+	/**
 	 * Readies a connection that just signed in for its user's `status`:
-	 * forgets what it held for an identity it had before, reads a registered
-	 * user's stored mute, `invisible` and (`full` presence) latest waking
-	 * registration once, keeping them on the connection (see
-	 * ConnectionAttachment.muteUntil), then applies what it sent before
+	 * forgets what it held for an identity it had before, keeps a
+	 * registered user's `stored` inputs (readStatusInputs) on the connection
+	 * (see ConnectionAttachment.muteUntil), then applies what it sent before
 	 * signing in. Call before replying with `you`; presenceSignedIn after.
 	 */
-	private prepareStatus(socket: WebSocketConnection): void {
+	private prepareStatus(socket: WebSocketConnection, stored?: StatusInputRecord): void {
 		const state = connectionAttachment(socket);
 		if (!state) return;
 		for (const key of ["muteUntil", "invisible", "pushUntil", "pres"] as const) delete state[key];
@@ -2741,15 +2768,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			delete state.pendingMute;
 			delete state.pendingInvisible;
 		}
-		if (state.tier === "registered" && state.userId && this.config.push) {
-			try {
-				const stored = this.store.statusInputs(state.userId, this.presenceMode() === "full", nowMs());
-				applyStatusInputs(state, stored);
-			} catch (error) {
-				// The reply never fails on it: `you` leaves the mute out, as unread.
-				console.warn(JSON.stringify({ event: "status_inputs_failed", reason: errorToProtocol(error).message }));
-			}
-		}
+		if (state.tier === "registered" && stored) applyStatusInputs(state, stored);
 		writeAttachment(socket, state);
 		this.applyPendingStatus(socket);
 	}
