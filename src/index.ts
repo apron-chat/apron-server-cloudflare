@@ -2535,13 +2535,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `status` (§4.11), a notification: unscoped `idle`, `mute` and, with
-	 * presence on, `invisible`. `idle` marks this connection unattended (true)
+	 * `status` (§4.11), a notification: unscoped `idle`, `mute` and
+	 * `invisible`, the last kept with presence off too. `idle` marks this connection unattended (true)
 	 * or attended (false), kept in the attachment, so it survives
 	 * hibernation; only `idle: false` ends it, and closing removes the
 	 * connection. `mute` is the user's: seconds to stay quiet (cut to
 	 * MAX_MUTE_SECONDS), `true` until changed, or `0` to end it. `invisible`
-	 * is the user's too: others see them `offline`. Both are stored, so they
+	 * is the user's too: others see them `offline`, and connected member
+	 * listings leave them out, presence on or off. Both are stored, so they
 	 * outlast the connection, and echoed in `you` to the user's connections
 	 * when they change. Guests get no pushes and appear only while connected,
 	 * so their `mute` and `invisible` are ignored. All may come before
@@ -2570,8 +2571,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		const mute = params.mute;
 		const validMute = mute === true || (typeof mute === "number" && Number.isSafeInteger(mute) && mute >= 0);
-		// Without presence, `invisible` is not implemented and ignored.
-		const invisible = typeof params.invisible === "boolean" && this.presenceMode() ? params.invisible : undefined;
+		// Kept whenever `status` is advertised, presence off included, so it
+		// holds when presence is turned on again.
+		const invisible = typeof params.invisible === "boolean" ? params.invisible : undefined;
 		if (!validMute && invisible === undefined) return;
 		if (attachment.tier === "pending") {
 			const state = connectionAttachment(socket);
@@ -2677,7 +2679,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		try {
 			// This connection learns the change from its auth result.
 			if (mute !== undefined) this.changeMute(state.userId, mute, nowMs(), socket);
-			if (invisible !== undefined && this.presenceMode()) this.changeInvisible(state.userId, invisible, nowMs(), socket);
+			if (invisible !== undefined) this.changeInvisible(state.userId, invisible, nowMs(), socket);
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "pending_status_failed", reason: errorToProtocol(error).message }));
 		}
@@ -2716,8 +2718,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * A connection's own user object (`you`, §3.3): its current object and,
 	 * for a registered user on a push server, `mute` (seconds left, or
-	 * `true`), with presence on, `invisible` while set and their `status`,
-	 * which here ignores `invisible` (§4.11). None of these is ever shown to
+	 * `true`) and `invisible` while set, and with presence on their
+	 * `status`, which here ignores `invisible` (§4.11). None of these is ever shown to
 	 * others.
 	 */
 	private you(attachment: ConnectionAttachment): PublicUser | null {
@@ -2732,14 +2734,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		};
 	}
 
-	/** A registered user's `mute` and, with presence on, `invisible`, as their own `you` carries them (see you). */
+	/** A registered user's `mute` and `invisible`, as their own `you` carries them while set (see you). */
 	private ownStatusFields(attachment: ConnectionAttachment): { mute?: number | true; invisible?: boolean } {
 		if (attachment.tier !== "registered" || !this.config.push) return {};
 		const now = nowMs();
 		const until = attachment.muteUntil ?? 0;
 		return {
 			...(until > now ? { mute: until >= MUTE_FOREVER ? true as const : Math.ceil((until - now) / 1_000) } : {}),
-			...(attachment.invisible && this.presenceMode() ? { invisible: true } : {}),
+			...(attachment.invisible ? { invisible: true } : {}),
 		};
 	}
 
@@ -3688,7 +3690,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * the cap only while it is on. With activity off, typing is no longer
 	 * relayed; with uploads off, new upload embeds and `/avatar` are
 	 * `denied`, and writes already started still finish. With presence off,
-	 * no `status` is sent and `invisible` is ignored; turned on, it is the
+	 * no `status` is sent (`invisible` is still kept, and still hides the
+	 * user from connected member listings); turned on, it is the
 	 * deployment's variant (`PRESENCE`, else the plan's, else `connected`),
 	 * and starts from each user's status then, announcing nothing.
 	 */
@@ -4258,7 +4261,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** Each room's members connected now: users who have joined it, one entry each. */
 	private connectedMembers(): Map<string, PublicUser[]> {
 		this.closeStale(nowMs());
-		const invisibleHidden = this.presenceMode() !== false;
+		// Kept whenever `status` is advertised, `invisible` hides them with presence off too.
+		const invisibleHidden = !!this.config.push;
 		const members = new Map<string, Map<string, PublicUser>>();
 		for (const peer of this.ctx.getWebSockets()) {
 			const state = connectionAttachment(peer as WebSocketConnection);

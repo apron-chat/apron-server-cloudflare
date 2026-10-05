@@ -95,7 +95,8 @@ within it:
   (`online`, `idle`, `dnd` or `offline`) in room listings' `users` and in
   `user` notifications, which go only to connections that have sent
   `status`. A signed-in user may set `{"invisible": true}` to appear
-  `offline` to everyone; it lasts until they turn it off, on every device.
+  `offline` to everyone; it lasts until they turn it off, on every device,
+  and is kept while status is turned off too.
   Mute and invisible changes together are limited to 6 a minute. A muted
   user shows as `dnd` while connected and `offline` once gone. With the
   Workers Paid budgets, a user who is gone but can be reached by push

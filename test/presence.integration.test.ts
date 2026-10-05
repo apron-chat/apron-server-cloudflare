@@ -518,7 +518,7 @@ describe('user status shown to others (full presence)', () => {
 		});
 	});
 
-	it('/toggle presence turns status off and on for everyone', async () => {
+	it('/toggle presence turns status off and on for everyone, keeping invisible while off', async () => {
 		const adminId = unique('admin');
 		await register(adminId);
 		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.setRole({ userId: adminId, role: 'admin', on: true }); });
@@ -532,22 +532,33 @@ describe('user status shown to others (full presence)', () => {
 			const off = await toggle('off');
 			expect(off.frame.result).toEqual({});
 			expect(off.skipped.find((frame) => frame.params?.from?.user_id === '~private')?.params.body.text).toMatch(/^Status is now \*\*off\*\*/);
-			// Off: no status anywhere, and invisible is ignored.
+			// Off: no status anywhere, but invisible is still kept and echoed, as `status` is still advertised.
 			expect((await request(watcher, 'me-off', 'me', {})).result.you).not.toHaveProperty('status');
 			expect(await listed(watcher, watcherId)).not.toHaveProperty('status');
-			expect((await status(watcher, { invisible: true })).filter((frame) => frame.method === 'user')).toEqual([]);
+			const hidden = (await status(watcher, { invisible: true })).filter((frame) => frame.method === 'user');
+			expect(hidden.map((frame) => frame.params.you)).toEqual([expect.objectContaining({ user_id: watcherId, invisible: true })]);
+			expect(hidden[0].params.you).not.toHaveProperty('status');
+			expect((await request(watcher, 'me-off-invisible', 'me', {})).result.you).toMatchObject({ invisible: true });
+			// A new connection of theirs learns it from its auth result.
+			const second = await signedIn(watcherId, { existing: true, aware: false });
+			expect((await request(second, 'me-second', 'me', {})).result.you).toMatchObject({ invisible: true });
+			second.close();
+			// Invisible users are left out of connected member listings with presence off too.
+			const members = await runInDurableObject(stub(), (instance) => (instance as unknown as { connectedMembers(): Map<string, Array<{ user_id: string }>> }).connectedMembers());
+			expect((members.get('general') ?? []).map((user) => user.user_id)).not.toContain(watcherId);
 			await status(watcher, { idle: true });
 			await advance(COALESCE);
 			expect(told(await drain(admin), watcherId)).toEqual([]);
 			const on = await toggle('on');
 			expect(on.skipped.find((frame) => frame.params?.from?.user_id === '~private')?.params.body.text).toMatch(/^Status is now \*\*on\*\*/);
-			// On again, it starts from each user's status now, announcing nothing for it.
-			expect((await request(watcher, 'me-on', 'me', {})).result.you).toMatchObject({ status: 'idle' });
-			expect((await request(watcher, 'me-on-again', 'me', {})).result.you).not.toHaveProperty('invisible');
-			expect(await listed(admin, watcherId)).toMatchObject({ status: 'idle' });
-			await status(watcher, { idle: false });
+			// On again, it starts from each user's status now, announcing nothing
+			// for it; the invisible set while off holds, so others see offline.
+			expect((await request(watcher, 'me-on', 'me', {})).result.you).toMatchObject({ status: 'idle', invisible: true });
+			expect(await listed(admin, watcherId)).toMatchObject({ status: 'offline' });
+			await status(watcher, { invisible: false, idle: false });
 			await advance(COALESCE);
 			expect(told(await drain(admin), watcherId)).toEqual(['online']);
+			expect((await request(watcher, 'me-on-again', 'me', {})).result.you).not.toHaveProperty('invisible');
 		} finally { admin.close(); watcher.close(); }
 	});
 });
