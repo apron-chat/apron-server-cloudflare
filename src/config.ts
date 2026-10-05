@@ -1,5 +1,5 @@
 import * as budget from "./budget.ts";
-import { DEFAULT_FEATURES, DEFAULT_LIMITS, MAX_PUSH_CANDIDATES, MAX_PUSHES_PER_MESSAGE, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits, type PushPolicy } from "./budget.ts";
+import { DEFAULT_FEATURES, DEFAULT_LIMITS, MAX_PUSH_CANDIDATES, MAX_PUSHES_PER_MESSAGE, MAX_STATUS_DELAY_SECONDS, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits, type PresenceVariant, type PushPolicy } from "./budget.ts";
 import { base64UrlDecode, P256_PRIVATE_KEY_BYTES, P256_PUBLIC_KEY_BYTES, vapidKeysMatch, type VapidKeys } from "./webpush.ts";
 export { DEFAULT_LIMITS, BOOTSTRAP_ROW_RESERVATION, type Limits } from "./budget.ts";
 
@@ -14,6 +14,13 @@ export interface RuntimeConfig {
 	activityEnabled: boolean;
 	/** Let guests post, react, join and leave rooms, and create threads; `GUEST_POSTING` overrides the plan's default. Off, guests only read. */
 	guestPosting: boolean;
+	/**
+	 * User `status` shown to others and `invisible` (§4.11): `full`,
+	 * `connected` (users without a connection show offline), or off.
+	 * `PRESENCE` overrides the plan's default. It needs push, as capability
+	 * `status` does.
+	 */
+	presence: PresenceVariant | false;
 	/**
 	 * A fixed bearer token that signs in as the admin user
 	 * (`APRON_ADMIN_TOKEN`), who can run the admin commands. Set it as a
@@ -88,6 +95,7 @@ type EnvLike = {
 	ADMISSION_OFF?: string;
 	ACTIVITY?: string;
 	GUEST_POSTING?: string;
+	PRESENCE?: string;
 	APRON_ADMIN_TOKEN?: string;
 	MEDIA_ORIGIN?: string;
 	PUBLIC_ORIGIN?: string;
@@ -137,6 +145,19 @@ function parseSwitch(raw: string | undefined, name: string, fallback: boolean): 
 	const value = String(raw).toLowerCase();
 	if (value !== "true" && value !== "false") throw new ConfigError(`${name} must be true or false`);
 	return value === "true";
+}
+
+/**
+ * `PRESENCE`: `full`, `connected`, `false` (off), or `true` (the plan's
+ * variant, else `connected`); unset or empty, the plan's default.
+ */
+function parsePresence(raw: string | undefined, fallback: PresenceVariant | false): PresenceVariant | false {
+	if (raw === undefined || raw === "") return fallback;
+	const value = String(raw).trim().toLowerCase();
+	if (value === "full" || value === "connected") return value;
+	if (value === "false") return false;
+	if (value === "true") return fallback || "connected";
+	throw new ConfigError("PRESENCE must be full, connected, true or false");
 }
 
 function validateLimits(limits: Limits): void {
@@ -209,6 +230,9 @@ function validateLimits(limits: Limits): void {
 	}
 	if (limits.roomListMembers > budget.MAX_ROOM_LIST_MEMBERS) {
 		fail("room_list members exceed the calibrated bound");
+	}
+	if (limits.statusCoalesceSeconds > MAX_STATUS_DELAY_SECONDS || limits.offlineGraceSeconds > MAX_STATUS_DELAY_SECONDS) {
+		fail(`status changes may wait at most ${MAX_STATUS_DELAY_SECONDS} seconds`);
 	}
 	if (limits.guestNumberBlock > budget.MAX_GUEST_NUMBER_BLOCK) {
 		fail("guest number blocks exceed the calibrated bound");
@@ -294,6 +318,7 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 	const admissionOff = String(env.ADMISSION_OFF ?? "").toLowerCase() === "true";
 	const activityEnabled = parseSwitch(env.ACTIVITY, "ACTIVITY", DEFAULT_FEATURES.activity);
 	const guestPosting = parseSwitch(env.GUEST_POSTING, "GUEST_POSTING", DEFAULT_FEATURES.guestPosting);
+	const presence = parsePresence(env.PRESENCE, DEFAULT_FEATURES.presence);
 	const adminToken = env.APRON_ADMIN_TOKEN === undefined || env.APRON_ADMIN_TOKEN === "" ? undefined : String(env.APRON_ADMIN_TOKEN);
 	const adminTokenProblem = adminToken === undefined ? null : adminTokenError(adminToken);
 	if (adminTokenProblem) throw new ConfigError(adminTokenProblem);
@@ -314,6 +339,7 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 		admissionOff,
 		activityEnabled,
 		guestPosting,
+		presence,
 		...(adminToken !== undefined ? { adminToken } : {}),
 		...(uploads ? { uploads } : {}),
 		...(push ? { push } : {}),

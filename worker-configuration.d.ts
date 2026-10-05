@@ -24,6 +24,9 @@ declare global {
 		RP_ORIGINS?: string;
 		RP_NAME?: string;
 		ADMISSION_OFF?: string;
+		ACTIVITY?: string;
+		GUEST_POSTING?: string;
+		PRESENCE?: string;
 		ENVIRONMENT?: string;
 	}
 	namespace Cloudflare {
@@ -50,6 +53,9 @@ declare global {
 			RP_ORIGINS?: string;
 			RP_NAME?: string;
 			ADMISSION_OFF?: string;
+			ACTIVITY?: string;
+			GUEST_POSTING?: string;
+			PRESENCE?: string;
 			ENVIRONMENT?: string;
 		}
 	}

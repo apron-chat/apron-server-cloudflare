@@ -103,6 +103,19 @@ export interface Limits {
 	 * the latest number closer to the count of guests.
 	 */
 	guestNumberBlock: number;
+	/**
+	 * User `status` shown to others (protocol §4.11): a user's announced
+	 * status changes at most once in this many seconds; changes in between
+	 * wait, and the latest one wins. Also bounds how long a member listing
+	 * may be reused.
+	 */
+	statusCoalesceSeconds: number;
+	/**
+	 * How long a change caused by a closed connection (a user going offline,
+	 * or idle when their attended tab closes) waits before it is announced, so
+	 * a reload or a mobile reconnect within it shows nothing.
+	 */
+	offlineGraceSeconds: number;
 	sqlWritesPerDay: number;
 	sqlReadsPerDay: number;
 	foregroundWritesPerDay: number;
@@ -175,10 +188,25 @@ export interface MonthlyAllowance {
 	logEvents: number;
 }
 
-/** Defaults for the feature switches; `ACTIVITY` and `GUEST_POSTING` override them. */
+/**
+ * How much of a user's `status` (protocol §4.11) others see:
+ *
+ * - `full`: every user, connected or not. A member listing also reads each
+ *   listed registered member's stored mute, `invisible`, and latest push
+ *   registration that wakes for messages, so a disconnected user with one
+ *   shows `idle`. About one more indexed read per listed member.
+ * - `connected`: users with a connection, from their connection
+ *   attachments; every user without one shows `offline` (§4.11 allows it).
+ *   No SQL beyond what listings and sign-ins read already.
+ */
+export type PresenceVariant = "full" | "connected";
+
+/** Defaults for the feature switches; `ACTIVITY`, `GUEST_POSTING` and `PRESENCE` override them. */
 export interface Features {
 	activity: boolean;
 	guestPosting: boolean;
+	/** User `status` shown to others, and `invisible` (§4.11); needs push, like capability `status`. */
+	presence: PresenceVariant | false;
 }
 
 /**
@@ -328,6 +356,9 @@ export const MAX_FRAME_LEASE = 20;
 // listing's reads and response by the thread ceiling (listings past the
 // response cap leave members out).
 export const MAX_ROOM_LIST_MEMBERS = 200;
+// Status changes wait at most this long (coalescing, offline grace), so what
+// others see is never more than about a minute behind.
+export const MAX_STATUS_DELAY_SECONDS = 60;
 // A guest-number block is one durable write, spent whether or not the object
 // hands its numbers out before it sleeps; this bounds how fast numbers climb.
 export const MAX_GUEST_NUMBER_BLOCK = 10_000;

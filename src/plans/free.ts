@@ -60,6 +60,12 @@ export const FREE_PLAN: Plan = Object.freeze({
 		pingSeconds: 45,
 		pingTimeoutSeconds: 150,
 		guestNumberBlock: 10,
+		// Status changes are announced at most once a minute per user, and a
+		// closed connection's change waits a minute, so a reload or a mobile
+		// reconnect shows nothing. Both run on one in-memory timer: no SQL, no
+		// alarm, no Durable Object request.
+		statusCoalesceSeconds: 60,
+		offlineGraceSeconds: 60,
 		sqlWritesPerDay: 80_000,
 		sqlReadsPerDay: 3_000_000,
 		foregroundWritesPerDay: 60_000,
@@ -130,5 +136,11 @@ export const FREE_PLAN: Plan = Object.freeze({
 	features: Object.freeze({
 		activity: false,
 		guestPosting: false,
+		// User status from connections only: a user with none shows offline,
+		// so listings read exactly what they read without it (measured). Mute
+		// and `invisible` are one row read at sign-in, as the mute alone was,
+		// and kept on the connection. Requests are already this plan's
+		// scarcest allowance after SQL writes; status adds none.
+		presence: "connected",
 	}),
 });
