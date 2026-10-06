@@ -3533,12 +3533,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * and the server's daily allowances. Every room is visible to everyone,
 	 * so a mention or reply anywhere counts, joined or not. Pushes go out
 	 * after the result, kept alive with waitUntil. A failure here is logged
-	 * and never touches the post.
+	 * and never touches the post. Only logged messages wake anyone: a
+	 * transient notice (no `message_id`, such as a `~private` command reply)
+	 * is never pushed (§4.9), and never reaches here.
 	 */
 	private wakeFor(message: MessageSnapshot): void {
 		const vapid = this.config.push;
 		const policy = PUSH_POLICY;
-		if (!vapid || !policy) return;
+		if (!vapid || !policy || !message.message_id || !message.log_id) return;
 		const now = nowMs();
 		const sender = message.from.user_id;
 		const reasons = new Map<string, number>();
