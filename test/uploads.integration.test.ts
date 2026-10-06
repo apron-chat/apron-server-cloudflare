@@ -196,6 +196,12 @@ describe('store uploads', () => {
 			setAvatar();
 			expect(store.clearAvatar({ userId: 'erin', now: clock.value }).changed).toBe(true);
 			expect(store.clearAvatar({ userId: 'erin', now: clock.value })).toEqual({ changed: false, deletedUploads: [] });
+			// A new user_id is a user clients keep nothing for: /rename gets every
+			// profile field to announce (§3.3), the live avatar included.
+			const third = setAvatar();
+			expect(store.renameIdentity({ from: 'erin', to: 'erin_2', now: clock.value })).toMatchObject({
+				name: 'Name of erin', avatar: `${MEDIA}/${third.upload.key}`, roles: [],
+			});
 		});
 	});
 

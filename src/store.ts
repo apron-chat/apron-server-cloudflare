@@ -2737,7 +2737,7 @@ export class Store {
    * rewrite is then charged by what was found. Both steps run without
    * yielding, so nothing commits between them.
    */
-  renameIdentity(input: { from: string; to: string; now?: number }): { name: string; rooms: string[]; roles: string[] } {
+  renameIdentity(input: { from: string; to: string; now?: number }): { name: string; avatar?: string; rooms: string[]; roles: string[] } {
     this.ensureReady();
     const now = input.now ?? this.clock.now();
     const { from, to } = input;
@@ -2817,7 +2817,8 @@ export class Store {
         this.rawExec("UPDATE principal_limits SET principal_key = ? WHERE scope = ? AND principal_key = ?", `user:${to}`, scope, `user:${from}`);
       }
       this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_RENAMED_PREFIX + from, to);
-      return { name: found.identity.name, rooms: this.userRooms(to), roles: parseRoles(found.identity.roles_json) };
+      const avatar = liveAvatar(found.identity, now);
+      return { name: found.identity.name, ...(avatar ? { avatar } : {}), rooms: this.userRooms(to), roles: parseRoles(found.identity.roles_json) };
     }));
   }
 

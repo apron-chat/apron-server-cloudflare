@@ -2322,7 +2322,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!current) return;
 			// A removed name is announced as its empty value (§3.3).
 			const you = { ...this.current(current)!, ...(current.name ? {} : { name: "" }) };
-			this.reply(socket, request, { you: { ...this.you(current), ...(current.name ? {} : { name: "" }) } });
+			this.reply(socket, request, { you: { ...this.you(current), ...(current.name ? {} : { name: "" }), ...(removeAvatar ? { avatar: "" } : {}) } });
 			// Section 3.3: `you` to the user's other connections, `new` to those who share a room with the user.
 			if (!result.deduplicated) this.announceUser(socket, you, current.rooms ?? []);
 		});
@@ -4172,7 +4172,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 			state.owed = state.owed.map((entry) => entry[0] === from ? [to, entry[1], entry[2], entry[3]] as OwedStatus : entry);
 			writeAttachment(ws as WebSocketConnection, state);
 		}
-		const identity = { user_id: to, ...(renamed.name ? { name: renamed.name } : {}), roles: renamed.roles };
+		// Clients keep nothing yet for the new `user_id`, so the object carries
+		// every profile field (§3.3), not only the one that changed.
+		const identity = { user_id: to, ...(renamed.name ? { name: renamed.name } : {}), ...(renamed.avatar ? { avatar: renamed.avatar } : {}), roles: renamed.roles };
 		const old = { user_id: from, ...(renamed.name ? { name: renamed.name } : {}) };
 		this.announceUser(null, identity, this.liveRoomsOf(to) ?? renamed.rooms, old);
 		this.sendNotice(socket, roomId, `Renamed \`${from}\` to \`${to}\`.`);
