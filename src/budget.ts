@@ -264,9 +264,9 @@ export interface PushPolicy {
 	pushesPerRecipientDay: number;
 	/**
 	 * `status` `mute` and `me` `status` changes one user may make a minute,
-	 * together, across their connections and reconnects; past it, further
-	 * mutes are declined (the sender is told the mute in effect) and a `me`
-	 * `status` is `retry_after`.
+	 * together, across their connections and reconnects; past it, a `status`
+	 * request with `mute` and a `me` with a changed `status` are
+	 * `retry_after`, and nothing changes.
 	 */
 	mutesPerUserMinute: number;
 	/**
@@ -352,6 +352,14 @@ export const MAX_ROOM_LIST_MEMBERS = 200;
 // Status changes wait at most this long (coalescing, offline grace), so what
 // others see is never more than about a minute behind.
 export const MAX_STATUS_DELAY_SECONDS = 60;
+// `status` `idle` changes one connection may make a minute (protocol §4.11
+// allows rate limiting `status`); past it, `retry_after` and nothing
+// changes. A client sends one when attention starts or ends, so a few a
+// minute is plenty; the cap keeps a flipping client from making the object
+// re-derive and announce its user's status at frame rate. Counted in memory
+// by connection, with no SQL; a repeat of the current value is not a change
+// and is not counted.
+export const IDLE_CHANGES_PER_CONNECTION_MINUTE = 12;
 // A guest-number block is one durable write, spent whether or not the object
 // hands its numbers out before it sleeps; this bounds how fast numbers climb.
 export const MAX_GUEST_NUMBER_BLOCK = 10_000;

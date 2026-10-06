@@ -91,6 +91,14 @@ export async function exchange(peer: Peer, id: string, method: string, params: u
 	return until(peer, (frame) => frame.id === id);
 }
 
+/**
+ * Sends a `status` request (§4.11) and waits for its reply; the reply and
+ * the notifications before it, which include the user's mute changes.
+ */
+export async function status(peer: Peer, params: Record<string, unknown>): Promise<{ frame: Frame; skipped: Frame[] }> {
+	return exchange(peer, `status-${crypto.randomUUID()}`, "status", params);
+}
+
 /** Sends a request and returns its reply, skipping notifications before it. */
 export async function request(peer: Peer, id: string, method: string, params: unknown): Promise<Frame> {
 	return (await exchange(peer, id, method, params)).frame;

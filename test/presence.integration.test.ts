@@ -2,7 +2,7 @@ import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_LIMITS, PUSH_POLICY } from '../src/budget';
 import { MUTE_FOREVER, type Store } from '../src/store';
-import { connect as open, exchange, request, statusOnly, type Frame, type Peer } from './helpers/socket';
+import { connect as open, exchange, request, status as statusRequest, statusOnly, type Frame, type Peer } from './helpers/socket';
 import { softPasskey } from './helpers/webauthn';
 import { withStore } from './helpers/store';
 
@@ -56,23 +56,25 @@ async function signIn(userId: string, { existing = false } = {}): Promise<{ peer
 	const peer = await connect();
 	await peer.next();
 	await peer.next();
-	peer.send({ method: 'status', params: { idle: false } });
 	const auth = await request(peer, 'auth', 'auth', { scheme: 'token', token });
 	expect(auth.result.you.user_id).toBe(userId);
-	return { peer, auth, afterAuth: await drain(peer) };
+	const afterAuth = await drain(peer);
+	await status(peer, { idle: false });
+	return { peer, auth, afterAuth };
 }
 
 async function signedIn(userId: string, options: { existing?: boolean } = {}): Promise<Peer> {
 	return (await signIn(userId, options)).peer;
 }
 
-async function guest(): Promise<{ peer: Peer; userId: string }> {
+async function guest(): Promise<{ peer: Peer; userId: string; afterAuth: Frame[] }> {
 	const peer = await connect();
 	await peer.next();
 	await peer.next();
-	peer.send({ method: 'status', params: { idle: false } });
 	const auth = await request(peer, 'auth', 'auth', { scheme: 'guest' });
-	return { peer, userId: auth.result.you.user_id };
+	const afterAuth = await drain(peer);
+	await status(peer, { idle: false });
+	return { peer, userId: auth.result.you.user_id, afterAuth };
 }
 
 /** The frames `peer` got before the reply to a request sent now: everything the object sent it so far. */
@@ -91,10 +93,11 @@ function own(frames: Frame[]): string[] {
 	return frames.filter((frame) => frame.method === 'user' && frame.params?.you?.status !== undefined).map((frame) => frame.params.you.status);
 }
 
-/** Sends `status` and waits until the object has taken it. */
+/** Sends a `status` request; the frames before its `{}` reply. */
 async function status(peer: Peer, params: Record<string, unknown>): Promise<Frame[]> {
-	peer.send({ method: 'status', params });
-	return drain(peer);
+	const { frame, skipped } = await statusRequest(peer, params);
+	expect(frame.result, JSON.stringify(frame.error)).toEqual({});
+	return skipped;
 }
 
 /** Sets the status `peer`'s user chooses with `me`; the reply. */
@@ -406,7 +409,7 @@ describe('the status a user chooses (§4.11)', () => {
 			// A guest has no mutes: none are sent; the statuses are.
 			const other = await guest();
 			try {
-				const sent = await drain(other.peer);
+				const sent = other.afterAuth;
 				expect(sent.filter((frame) => frame.method === 'status')).toEqual([]);
 				expect(told(sent, aliceId)).toEqual(['online']);
 			} finally { other.peer.close(); }
@@ -426,7 +429,7 @@ describe('the status a user chooses (§4.11)', () => {
 			offset += COALESCE;
 			const idle = await measured((runtime, state) => {
 				const socket = state.getWebSockets().find((ws) => (ws.deserializeAttachment() as Attachment).userId === ids[0])!;
-				runtime.handleStatus(socket, socket.deserializeAttachment(), { method: 'status', params: { idle: true } });
+				runtime.handleStatus(socket, { method: 'status', id: 'idle', params: { idle: true }, full: false });
 			});
 			expect(idle).toEqual({ queries: [], reads: 0, writes: 0 });
 			const sweep = await measured((runtime) => runtime.flushPresence());
@@ -852,14 +855,17 @@ describe('server.status and what follows a sign-in (§3.1, §4.11)', () => {
 			peers.push(visitor);
 			await check('guest', visitor, await exchange(visitor, 'auth', 'auth', { scheme: 'guest' }), []);
 
-			// Passkey registration, a new account: the mutes sent before signing in are in effect after it.
+			// Passkey registration, a new account: `status` before signing in is
+			// denied and changes nothing, so it has no mutes in effect after it.
 			const fresh = await opened();
 			peers.push(fresh);
-			fresh.send({ method: 'status', params: { idle: false, mute: 600 } });
-			fresh.send({ method: 'status', params: { room_id: 'general', mute: true } });
+			expect((await statusRequest(fresh, { idle: false, mute: 600 })).frame.error.code).toBe(-32001);
+			expect((await statusRequest(fresh, { room_id: 'general', mute: true })).frame.error.code).toBe(-32001);
 			const { passkey, finished } = await registerPasskey(fresh, 'signup');
-			await check('passkey registration', fresh, finished, [{ mute: 600 }, { room_id: 'general', mute: true }]);
+			await check('passkey registration', fresh, finished, []);
 			const newId = finished.frame.result.you.user_id;
+			expect(await status(fresh, { mute: 600 })).toEqual([{ method: 'status', params: { mute: 600 } }]);
+			await status(fresh, { room_id: 'general', mute: true });
 
 			// Passkey login: the new account's stored mutes, after the result.
 			const login = await opened();

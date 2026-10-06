@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, pushHostAllowed, type RuntimeConfig } from "./config";
-import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, DEFAULT_FEATURES, PLAN, MAX_FRAME_LEASE, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
+import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, DEFAULT_FEATURES, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
 import { fetchAccountUsage, type AccountUsageSnapshot } from "./account-usage";
 import { runBudgetGuard, watchForFlood } from "./budget-guard";
@@ -40,6 +40,7 @@ import {
 	PUSH_ID_PATTERN,
 	ROLE_PATTERN,
 	WAKE_SCOPES,
+	MAX_ROOM_MUTES_PER_USER,
 	ROOM_ID,
 	Store,
 	StoreError,
@@ -128,21 +129,16 @@ interface ConnectionAttachment {
 	/**
 	 * The client said nobody is attending this connection (`status` `idle`,
 	 * §4.11), so a mention or reply may wake its user by push (§4.7). Cleared
-	 * only by `idle: false`; kept from before authentication.
+	 * only by `idle: false`. A connection starts attended: it is never set
+	 * before sign-in (`status` then gets `denied`), and nothing carries over
+	 * from an earlier connection.
 	 */
 	idle?: boolean;
 	/**
-	 * The `status` mutes sent before authentication (§4.11), as sent, the
-	 * latest per scope (`""` for the unscoped one), at most
-	 * MAX_PENDING_MUTES: seconds, `true` or `false`. Applied, timed from
-	 * then, once the connection signs in as a registered user; dropped on a
-	 * guest sign-in.
-	 */
-	pendingMutes?: PendingMute[];
-	/**
 	 * The client has sent `idle` (§4.11), so it reports `idle` itself; a
 	 * connection that never has is idle once it sends nothing for a while
-	 * (SILENT_IDLE_MS). Only `idle` sets it, not `mute`.
+	 * (SILENT_IDLE_MS), as §4.11 lets servers do. Only `idle` sets it, not
+	 * `mute`.
 	 */
 	idleSeen?: boolean;
 	/**
@@ -183,13 +179,7 @@ interface PresenceRecord {
 	h?: number;
 }
 
-/** A mute sent before authentication: its scope (`""` unscoped, else the `room_id`) and value. */
-type PendingMute = [string, number | boolean];
-
-/** Pending mutes one connection keeps before it signs in; older scopes are dropped. */
-const MAX_PENDING_MUTES = 8;
-
-/** A `status` notification `mute` (§4.11): `true`, `false`, or whole seconds, `0` being `false`; undefined when invalid. */
+/** A `status` request `mute` (§4.11): `true`, `false`, or whole seconds, `0` being `false`; undefined when invalid. */
 function muteParam(value: unknown): number | boolean | undefined {
 	if (typeof value === "boolean") return value;
 	if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return value === 0 ? false : value;
@@ -560,7 +550,6 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			} : {}),
 			...(attachment.listedJoined ? { listedJoined: true } : {}),
 			...(attachment.idle === true ? { idle: true } : {}),
-			...pendingMutesState(attachment.pendingMutes),
 			...(attachment.idleSeen === true ? { idleSeen: true } : {}),
 			...(isStatusChoice(attachment.choice) && attachment.choice !== "online" ? { choice: attachment.choice } : {}),
 			...(Number.isSafeInteger(attachment.muteUntil) && (attachment.muteUntil as number) > 0 ? { muteUntil: attachment.muteUntil } : {}),
@@ -593,14 +582,6 @@ function presenceState(attachment: Partial<ConnectionAttachment>): Pick<Connecti
 		if (owed.length) out.owed = owed.map((entry) => [...entry] as OwedStatus);
 	}
 	return out;
-}
-
-/** The pending mutes of a stored attachment, type-checked and bounded. */
-function pendingMutesState(value: unknown): Pick<ConnectionAttachment, "pendingMutes"> {
-	if (!Array.isArray(value)) return {};
-	const pending = value.filter((entry): entry is PendingMute => Array.isArray(entry) && entry.length === 2 &&
-		typeof entry[0] === "string" && (entry[0] === "" || validRoomId(entry[0])) && muteParam(entry[1]) !== undefined).slice(-MAX_PENDING_MUTES);
-	return pending.length ? { pendingMutes: pending.map(([scope, mute]) => [scope, mute] as PendingMute) } : {};
 }
 
 /** Keeps a user's stored `status` state (Store.statusInputs) on one of their connections. */
@@ -664,7 +645,7 @@ function writeSessionAttachment(socket: WebSocketConnection, attachment: Connect
 		if (current.idleSeen) attachment.idleSeen = true;
 		else delete attachment.idleSeen;
 		// Kept current by this connection's and other connections' events meanwhile.
-		for (const key of ["pendingMutes", "choice", "muteUntil", "roomMuteNext", "pres", "owed"] as const) {
+		for (const key of ["choice", "muteUntil", "roomMuteNext", "pres", "owed"] as const) {
 			if (current[key] !== undefined) (attachment as unknown as Record<string, unknown>)[key] = current[key];
 			else delete attachment[key];
 		}
@@ -859,8 +840,9 @@ function wakeParam(value: unknown): number | undefined {
 }
 
 /**
- * A connection whose client never sent `idle` (§4.11) counts as idle for
- * pushes once it has sent no frame for this long. Clients that send `idle`
+ * A connection whose client never sent `idle` counts as idle, for pushes and
+ * for the status others see, once it has sent no frame for this long: the
+ * server-defined period §4.11 lets servers choose. Clients that send `idle`
  * report idle themselves; pings never reach the object, so they do not count.
  */
 const SILENT_IDLE_MS = 10 * 60_000;
@@ -1089,6 +1071,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly pushRegisters = new UserRateLimit(PUSH_POLICY?.registersPerUserMinute ?? 1);
 	/** `status` `mute` and `me` `status` changes per user (`mutesPerUserMinute`), counted across reconnects. */
 	private readonly muteChanges = new UserRateLimit(PUSH_POLICY?.mutesPerUserMinute ?? 1);
+	/** `status` `idle` changes per connection (IDLE_CHANGES_PER_CONNECTION_MINUTE), by `connId`, in memory. */
+	private readonly idleChanges = new UserRateLimit(IDLE_CHANGES_PER_CONNECTION_MINUTE);
 	/**
 	 * When each user's status was last announced, for `statusCoalesceSeconds`;
 	 * at most USER_RATE_LIMIT_USERS, the least recently announced go first.
@@ -1620,7 +1604,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return;
 			case "status":
 				if (!this.config.push) break;
-				this.handleStatus(socket, attachment, request);
+				// Clients send `status` only as a request (§4.11): one without an
+				// `id` is a notification this server does not define, so it is
+				// ignored like any unknown notification (§1), changing nothing.
+				if (request.id === undefined) return;
+				this.handleStatus(socket, request);
 				return;
 			case "push_register":
 				if (!this.config.push) break;
@@ -2581,85 +2569,83 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `status` (§4.11), a notification: `idle` for the sending connection, and
+	 * `status` (§4.11), a request: `idle` for the sending connection, and
 	 * the user's `mute`, everywhere or, with `room_id`, in one room and its
-	 * threads. `idle` marks this connection unattended (true) or attended
-	 * (false), kept in the attachment, so it survives hibernation; only
-	 * `idle: false` ends it, and closing removes the connection; `room_id`
-	 * does not scope it. `mute` is `true`, `false`, or seconds (cut to
+	 * threads. Replies `{}` once the change is applied; on an error nothing
+	 * changes. Before sign-in it gets `denied`. `idle` marks this connection
+	 * unattended (true) or attended (false), kept in the attachment, so it
+	 * survives hibernation; only `idle: false` ends it, and closing removes
+	 * the connection; `room_id` does not scope it. At most
+	 * IDLE_CHANGES_PER_CONNECTION_MINUTE changes of `idle` a connection, past
+	 * which `retry_after`. `mute` is `true`, `false`, or seconds (cut to
 	 * MAX_MUTE_SECONDS; `0` is `false`), stored for a registered user, so it
 	 * outlasts the connection (changeMute). Guests get no pushes, so there is
-	 * nothing for their mutes to silence: they are ignored. All may come
-	 * before authentication: `idle` applies at once, mutes are kept on the
-	 * connection and apply once it signs in as a registered user. Unknown
-	 * fields and invalid values are ignored, each on its own; a mute with an
-	 * invalid `room_id` is ignored.
+	 * nothing for their mutes to silence: a guest's mute is accepted and
+	 * changes nothing. An invalid `idle`, `mute` or `room_id` is
+	 * `invalid_params`; unknown fields are ignored. Every check that can fail
+	 * comes before any change, and the mute, the only part that can fail in
+	 * storage, is applied before `idle`.
 	 */
-	private handleStatus(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): void {
+	private handleStatus(socket: WebSocketConnection, request: RequestFrame): void {
+		const state = connectionAttachment(socket);
+		if (!state || !identityOf(state)) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
 		const params = request.params;
 		const idle = params.idle;
-		if (typeof idle === "boolean") {
-			// A client that sends `idle` reports it itself (see attended); one that
-			// only mutes may not, so it stays under the silent-connection rule.
-			const state = connectionAttachment(socket);
-			const first = !!state && !state.idleSeen;
-			if (state && first) {
-				state.idleSeen = true;
-				writeAttachment(socket, state);
-			}
-			this.setIdle(socket, idle, first);
-		}
+		if (idle !== undefined && typeof idle !== "boolean") throw { name: "invalid_params", message: "idle must be a boolean" } satisfies ProtocolError;
 		const mute = muteParam(params.mute);
-		const roomId = params.room_id;
-		if (mute === undefined || (roomId !== undefined && !validRoomId(roomId))) return;
-		const scope = roomId ?? "";
-		if (attachment.tier === "pending") {
-			const state = connectionAttachment(socket);
-			if (!state) return;
-			const pending = (state.pendingMutes ?? []).filter(([id]) => id !== scope);
-			pending.push([scope, mute]);
-			state.pendingMutes = pending.slice(-MAX_PENDING_MUTES);
-			writeAttachment(socket, state);
-			return;
+		if (params.mute !== undefined && mute === undefined) {
+			throw { name: "invalid_params", message: "mute must be true, false, or a whole number of seconds" } satisfies ProtocolError;
 		}
-		if (attachment.tier !== "registered" || !attachment.userId) return;
-		this.changeMute(attachment.userId, scope || null, mute, nowMs(), { sender: socket });
+		const roomId = params.room_id;
+		if (roomId !== undefined && !validRoomId(roomId)) throw { name: "invalid_params", message: "room_id must be a room" } satisfies ProtocolError;
+		const now = nowMs();
+		// The connection's first `idle` ends the silent-connection rule
+		// (attendedConnection), so it counts as a change even when it repeats.
+		const first = idle !== undefined && !state.idleSeen;
+		const idleChange = idle !== undefined && (first || (state.idle === true) !== idle);
+		if (idleChange) {
+			const wait = this.idleChanges.retry(state.connId, now);
+			if (wait !== undefined) throw { name: "retry_after", message: "Idle changes limited", data: { retry_after: wait } } satisfies ProtocolError;
+		}
+		if (mute !== undefined && state.tier === "registered" && state.userId) {
+			this.changeMute(state.userId, roomId ?? null, mute, now);
+		}
+		if (idleChange) {
+			this.idleChanges.take(state.connId, now);
+			const latest = connectionAttachment(socket) ?? state;
+			if (first) latest.idleSeen = true;
+			this.setIdle(socket, latest, idle!);
+		}
+		this.reply(socket, request, {});
 	}
 
 	/**
-	 * Changes a registered user's mute (§4.11): the unscoped one (`roomId`
-	 * null, in `user_status`) or a room's (`room_mutes`): seconds from `now`
-	 * (cut to MAX_MUTE_SECONDS), `true` until changed, or `false` to end it.
-	 * Each change is cached on all the user's connections (the unscoped end,
-	 * and when the next room mute runs out) and sent to each of them, but
-	 * `except`, as `status` with the resulting `mute`: the seconds left,
-	 * `true`, or `false` once it ends. A change declined (past
-	 * `mutesPerUserMinute`, a mute of a room that does not exist, a room mute
-	 * past MAX_ROOM_MUTES_PER_USER) is not a change: the `sender` is told the
-	 * mute in effect where that is known without SQL. Returns the store's
-	 * result, or undefined when declined before it.
+	 * Changes a registered user's mute (§4.11) for a `status` request: the unscoped one (`roomId` null, in `user_status`) or a
+	 * room's (`room_mutes`): seconds from `now` (cut to MAX_MUTE_SECONDS),
+	 * `true` until changed, or `false` to end it. Each change is cached on
+	 * all the user's connections (the unscoped end, and when the next room
+	 * mute runs out) and sent to each of them, the sender too, before its
+	 * result, as `status` with the resulting `mute`: the seconds left,
+	 * `true`, or `false` once it ends. Throws, changing nothing, past
+	 * `mutesPerUserMinute` (`retry_after`), for a mute of a room that does
+	 * not exist (`invalid_params`), and for a room mute past
+	 * MAX_ROOM_MUTES_PER_USER (`denied`).
 	 */
-	private changeMute(userId: string, roomId: string | null, mute: number | boolean, now: number, options: { sender?: WebSocketConnection; except?: WebSocketConnection } = {}): { changed: boolean; untilMs?: number } | undefined {
+	private changeMute(userId: string, roomId: string | null, mute: number | boolean, now: number): void {
 		const untilMs = mute === true ? MUTE_FOREVER : mute === false ? null : now + Math.min(mute, MAX_MUTE_SECONDS) * 1_000;
-		const decline = (value: number | boolean | undefined) => {
-			if (options.sender && value !== undefined) this.deliverTo(options.sender, statusFrame(roomId, value));
-		};
 		// Clearing a room's mute needs no room: one that was removed can still be unmuted.
 		if (roomId !== null && untilMs !== null && !this.roomExists(roomId)) {
-			decline(false);
-			return undefined;
+			throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
 		}
-		// Each change writes rows: past `mutesPerUserMinute` a user's changes are declined.
+		// Each change writes rows: past `mutesPerUserMinute` a user's changes are refused.
 		if (!this.muteChanges.take(userId, now)) {
-			decline(roomId === null && options.sender ? this.unscopedMute(connectionAttachment(options.sender), now) : undefined);
-			return undefined;
+			throw { name: "retry_after", message: "Mute changes limited", data: { retry_after: this.muteChanges.retry(userId, now) ?? 1 } } satisfies ProtocolError;
 		}
 		const result = roomId === null ? this.store.setMute({ userId, untilMs, now }) : this.store.setRoomMute({ userId, roomId, untilMs, now });
 		if ("refused" in result && result.refused) {
-			decline(false);
-			return result;
+			throw { name: "denied", message: `At most ${MAX_ROOM_MUTES_PER_USER} rooms can be muted; unmute one first` } satisfies ProtocolError;
 		}
-		if (!result.changed) return result;
+		if (!result.changed) return;
 		this.cacheStatusState(userId, (state) => {
 			if (roomId === null) {
 				if (result.untilMs !== undefined) state.muteUntil = result.untilMs;
@@ -2669,16 +2655,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 		});
 		const frame = statusFrame(roomId, result.untilMs === undefined ? false : muteValue(result.untilMs, now));
-		for (const peer of this.connectionsOf(userId, options.except)) this.deliverTo(peer, frame);
+		for (const peer of this.connectionsOf(userId)) this.deliverTo(peer, frame);
 		// A timed mute that runs out within the minute is told on time (flushPresence).
 		if (result.untilMs !== undefined && result.untilMs - now <= MAX_STATUS_DELAY_SECONDS * 1_000) this.armPresence(result.untilMs);
-		return result;
-	}
-
-	/** A registered connection's unscoped mute as `status` carries it (§4.11), from its attachment. */
-	private unscopedMute(state: ConnectionAttachment | null, now: number): number | boolean {
-		const until = state?.muteUntil ?? 0;
-		return until > now ? muteValue(until, now) : false;
 	}
 
 	/** Applies `change` to the cached status state on each of a user's connections. */
@@ -2688,33 +2667,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!state) continue;
 			change(state);
 			writeAttachment(peer, state);
-		}
-	}
-
-	/**
-	 * Applies the mutes this connection sent before it signed in, now that it
-	 * is a registered user's, timed from now, and keeps `stored`'s room mutes
-	 * as they leave them. Each change goes to the user's other connections;
-	 * this one is told the mutes in effect after its auth result
-	 * (sendMutesInEffect). A failure leaves the sign-in as it was: the change
-	 * is dropped, and the client can send it again.
-	 */
-	private applyPendingMutes(socket: WebSocketConnection, stored?: StatusInputRecord): void {
-		const state = connectionAttachment(socket);
-		if (!state?.pendingMutes) return;
-		const pending = state.pendingMutes;
-		delete state.pendingMutes;
-		writeAttachment(socket, state);
-		if (state.tier !== "registered" || !state.userId) return;
-		try {
-			for (const [scope, mute] of pending) {
-				const result = this.changeMute(state.userId, scope || null, mute, nowMs(), { except: socket });
-				if (!scope || !result || !stored) continue;
-				stored.roomMutes = stored.roomMutes.filter((entry) => entry.roomId !== scope);
-				if (result.untilMs !== undefined) stored.roomMutes.push({ roomId: scope, untilMs: result.untilMs });
-			}
-		} catch (error) {
-			console.warn(JSON.stringify({ event: "pending_status_failed", reason: errorToProtocol(error).message }));
 		}
 	}
 
@@ -2743,19 +2695,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Readies a connection that just signed in for its user's `status`:
 	 * forgets what it held for an identity it had before, keeps a registered
-	 * user's `stored` state (readStatusInputs) on the connection, then
-	 * applies the mutes it sent before signing in. Call before replying with
-	 * `you`; afterSignIn after.
+	 * user's `stored` state (readStatusInputs) on the connection. Its `idle`
+	 * is its own and stays. Call before replying with `you`; afterSignIn
+	 * after.
 	 */
 	private prepareStatus(socket: WebSocketConnection, stored?: StatusInputRecord): void {
 		const state = connectionAttachment(socket);
 		if (!state) return;
 		for (const key of ["choice", "muteUntil", "roomMuteNext", "pres"] as const) delete state[key];
-		// A guest gets no pushes, so mutes sent before signing in are dropped.
-		if (state.tier === "anonymous") delete state.pendingMutes;
 		if (state.tier === "registered" && stored) applyStatusInputs(state, stored);
 		writeAttachment(socket, state);
-		this.applyPendingMutes(socket, stored);
 	}
 
 	/**
@@ -2833,20 +2782,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Marks a connection idle or attended (`status` `idle`, §4.11), writing
-	 * its attachment only on a change. `first`: the connection's first
-	 * `idle`, which ends the silent-connection rule (attendedConnection), so
-	 * its status may change even when `idle` does not.
+	 * Marks a signed-in connection idle or attended (`status` `idle`,
+	 * §4.11) and re-derives its user's status. handleStatus calls it only
+	 * for a change, which includes the connection's first `idle` (it ends
+	 * the silent-connection rule, attendedConnection, so the status may
+	 * change even when `idle` does not).
 	 */
-	private setIdle(socket: WebSocketConnection, idle: boolean, first = false): void {
-		const state = connectionAttachment(socket);
-		if (!state) return;
-		if ((state.idle === true) !== idle) {
-			if (idle) state.idle = true;
-			else delete state.idle;
-			writeAttachment(socket, state);
-		} else if (!first) return;
-		if (state.tier === "anonymous" || state.tier === "registered") this.touchPresence(state.userId);
+	private setIdle(socket: WebSocketConnection, state: ConnectionAttachment, idle: boolean): void {
+		if (idle) state.idle = true;
+		else delete state.idle;
+		writeAttachment(socket, state);
+		this.touchPresence(state.userId);
 	}
 
 	/**

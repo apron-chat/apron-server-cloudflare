@@ -194,20 +194,20 @@ it('never answers a notification-only method sent with an id, even with invalid 
 	try {
 		await authenticate(first);
 		await authenticate(second);
-		first.send({ id: 'status-params', method: 'status', params: 'idle' });
+		first.send({ id: 'ping-string', method: 'ping', params: 'idle' });
 		first.send({ id: 'activity-params', method: 'activity', params: [] });
 		expect(await drain(first)).toEqual([]);
 		second.send({ id: 'ping-params', method: 'ping', params: 5 });
 		let deep: unknown = { idle: true };
 		for (let index = 0; index < DEFAULT_LIMITS.maxJsonDepth + 2; index++) deep = { nested: deep };
-		second.send({ id: 'status-deep', method: 'status', params: deep });
+		second.send({ id: 'activity-deep', method: 'activity', params: deep });
 		expect(await drain(second)).toEqual([]);
 		// An ordinary request with the same faults is still answered.
 		expect((await request(second, 'me-params', 'me', 'x')).error.code).toBe(-32602);
 		// Over the server-wide frame limit a request gets retry_after; a notification-only method, nothing.
 		await configure((config) => { config.limits.globalFramesPerMinute = 1; });
 		expect((await request(first, 'me-last', 'me', {})).result.you).toBeTruthy();
-		first.send({ id: 'status-busy', method: 'status', params: { idle: false } });
+		first.send({ id: 'activity-busy', method: 'activity', params: { typing: 3 } });
 		expect((await request(first, 'me-busy', 'me', {})).error.code).toBe(-32002);
 		await configure((config) => { config.limits.globalFramesPerMinute = DEFAULT_LIMITS.globalFramesPerMinute; });
 		expect((await exchange(first, 'me-again', 'me', {})).skipped).toEqual([]);
