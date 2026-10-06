@@ -116,7 +116,7 @@ Like any `server` frame field, a later frame replaces it in full; this server se
 
 ### Framing, ordering, and errors
 
-- Accept the minimal and JSON-RPC 2.0 envelopes. One text message contains exactly one object, not a batch array. Reject binary application messages.
+- Frames are the protocol's envelope ([PROTOCOL.md §1](https://github.com/shazow/apron/blob/main/PROTOCOL.md#1-transport--framing)): JSON-RPC 2.0 shapes without `jsonrpc`, which, like any unknown key, is ignored and never sent. One text message contains exactly one object, not a batch array. Reject binary application messages.
 - IDs on the wire are strings. Errors not tied to a request (parse errors, invalid envelopes whose `id` cannot be determined) omit `id`.
 - Unknown request methods receive `unsupported`; unknown notifications are ignored. Valid notifications never receive result or error replies. A request method sent without an `id` (any method in the client request column of [PROTOCOL.md §1.1](https://github.com/shazow/apron/blob/main/PROTOCOL.md#11-envelope-and-replies): `auth`, `me`, `message`, `command`, `history`, `room_list`, `room_join`, `room_leave`, `room_set`, `reactions`, `status`, `push_register`, `push_unregister`) is ignored, as §1.1 lets a server: it changes nothing, causes no broadcast, gets no reply, and is not a policy violation, though it is charged as a frame. A change is made only where its result can say whether it was, so a client can never believe an unanswered change applied. apron-web sends every request with an `id` and only `activity` and `ping` without one.
 - Clients send `ping` and `activity` as notifications, without an `id`, and every other client method as a request, with one ([PROTOCOL.md §1.1](https://github.com/shazow/apron/blob/main/PROTOCOL.md#11-envelope-and-replies)). §1.1 lets a server ignore a notification method sent with an `id`, and this server does: an `id` on `ping` or `activity` is ignored: it is handled as the notification and never answered with a result or an error, even when its params are invalid (not an object, or past the JSON depth or node limits), its `id` is not a bounded string, or the server-wide frame limit drops it. The method decides this, so it is known before any params check. Each such fault still counts as a policy violation. A `ping` with an `id` still gets its `pong`, a notification.
@@ -475,7 +475,7 @@ Other stored data is not migrated: when the constructor finds any other schema v
 
 ### Deduplication
 
-Deduplicate accepted mutating requests by `(user_id, request_id)` for 24 hours after acceptance. Canonicalize method and params recursively with stable object-key ordering, preserving arrays/types; ignore envelope `jsonrpc`. Store a cryptographic digest rather than a full duplicate message payload where practical. Same key/same operation is not executed or broadcast again, and returns a result reflecting the current state ([PROTOCOL.md §1.2](https://github.com/shazow/apron/blob/main/PROTOCOL.md#12-retries-and-deduplication)): the stored result names what the operation made (`message_id`, `room_id`), which stays true, and an upload's write grant is left out once its write was claimed, finished, or expired (one indexed read per upload embed); `me` answers with the current `you`. Same key/different operation returns invalid_params. Concurrent copies cause one effect and one broadcast. Dedup responses still spend their bounded lookup/frame costs.
+Deduplicate accepted mutating requests by `(user_id, request_id)` for 24 hours after acceptance. Canonicalize method and params recursively with stable object-key ordering, preserving arrays/types; other envelope keys are not part of the operation. Store a cryptographic digest rather than a full duplicate message payload where practical. Same key/same operation is not executed or broadcast again, and returns a result reflecting the current state ([PROTOCOL.md §1.2](https://github.com/shazow/apron/blob/main/PROTOCOL.md#12-retries-and-deduplication)): the stored result names what the operation made (`message_id`, `room_id`), which stays true, and an upload's write grant is left out once its write was claimed, finished, or expired (one indexed read per upload embed); `me` answers with the current `you`. Same key/different operation returns invalid_params. Concurrent copies cause one effect and one broadcast. Dedup responses still spend their bounded lookup/frame costs.
 
 Check an unexpired duplicate before applying new-post quotas or deciding an old message has expired; a previously accepted result remains valid through the dedup window. Expired records are logically absent even if physical cleanup is pending. Failed/limited operations are not recorded as accepted. Notifications have no dedup guarantee. After the documented TTL, replaying an old request ID may execute again; the client must not retry stale queued operations indefinitely.
 
@@ -589,12 +589,12 @@ Use unit tests for pure logic and Cloudflare's Workers/Vitest integration for ru
 
 ### Protocol and sequencing
 
-- Minimal/JSON-RPC envelopes; valid/invalid IDs; parse failures; notifications without replies; unknown method/field behavior.
+- The envelope; valid/invalid IDs; parse failures; notifications without replies; unknown method/field behavior.
 - Server precedes auth; pipelined slow auth then message cannot overtake authentication; a result reflects every notification sent before it (a `room_update` precedes the result of the request that caused it).
 - Equal-millisecond and backward-clock creates/edits strictly increase IDs; head survives empty-log cleanup/restart.
 - Concurrent sockets mutating the same room produce one ordered stream. Author spoofing fails. Edit/delete/restore follow replacement semantics and ownership.
 - Message extensions, embeds, tombstones, and immutable fields survive storage/replay correctly.
-- Same-ID retries with reordered object keys or different jsonrpc presence have one effect and broadcast; conflicting params are rejected. Parallel duplicates, lost reply, and restart recovery are covered.
+- Same-ID retries with reordered object keys have one effect and broadcast; conflicting params are rejected. Parallel duplicates, lost reply, and restart recovery are covered.
 - A retained accepted retry returns its current-state result despite a newly exhausted posting quota or expired message. Auth is never skipped by dedup.
 - Inject failures before commit, after commit/before reply, and during fan-out. No broadcast of uncommitted data or silent stream gaps.
 

@@ -71,7 +71,6 @@ describe('frame policy boundaries', () => {
 			expect(failure(`{"id":"a","method":"${method}","params":"x"}`).notification, method).toBe(true);
 			expect(failure(`{"id":"a","method":"${method}","params":{"a":{"b":{"c":{}}}}}`).notification, method).toBe(true);
 			expect(failure(`{"id":7,"method":"${method}"}`).notification, method).toBe(true);
-			expect(failure(`{"jsonrpc":"1.0","id":"a","method":"${method}"}`).notification, method).toBe(true);
 		}
 		// A client's status is a request (§4.5): its failures are answered.
 		expect(failure('{"id":"a","method":"status","params":"x"}').notification).toBe(false);
@@ -80,12 +79,12 @@ describe('frame policy boundaries', () => {
 		expect(failure('{"id":"a","method":"me","params":"x"}').notification).toBe(false);
 		expect(failure('{"method":"me","params":"x"}').notification).toBe(true);
 		expect(failure('{"id":7,"method":"me"}').notification).toBe(false);
-		expect(failure('{"jsonrpc":"1.0","method":"me"}').notification).toBe(false);
 		expect(failure('{"params":{}}').notification).toBe(false);
 	});
-	it('accepts empty string IDs and both envelopes without treating unknown fields as operations', () => {
+	it('accepts empty string IDs without treating unknown fields as operations', () => {
 		expect(parseFrame('{"id":"","method":"auth","params":{},"ignored":42}').request.id).toBe('');
-		expect(parseFrame('{"jsonrpc":"2.0","id":"a","method":"auth"}').request.full).toBe(true);
+		// Frames omit `jsonrpc` (§1); one that carries it is an unknown key, ignored.
+		expect(parseFrame('{"jsonrpc":"1.0","id":"a","method":"auth"}').request).toEqual({ method: 'auth', params: {}, id: 'a' });
 		expect(parseFrame('{"method":"unknown"}').request.id).toBeUndefined();
 	});
 });

@@ -246,7 +246,7 @@ it('commits once for canonical retries, passes ext through, and sends no reply t
 	const peer = await connect();
 	try {
 		const you = await authenticate(peer);
-		peer.send({ jsonrpc: '2.0', id: '', method: 'message', params: {
+		peer.send({ id: '', method: 'message', params: {
 			room_id: 'general', body: { text: 'hello' }, ext: { z: 1, a: 2 }, from: { user_id: 'spoof' }, stray: true,
 		} });
 		// The broadcast comes before the result on the sender's connection (§1).

@@ -23,7 +23,6 @@ export interface RequestFrame {
 	method: string;
 	params: Record<string, unknown>;
 	id?: string;
-	full: boolean;
 }
 
 export interface ParsedFrame {
@@ -35,15 +34,13 @@ export class FrameError extends Error {
 	readonly protocol: ProtocolError;
 	readonly closeCode?: number;
 	readonly id: string | null;
-	readonly full: boolean;
 	readonly notification: boolean;
 
-	constructor(protocol: ProtocolError, options: { id?: string | null; full?: boolean; notification?: boolean; closeCode?: number } = {}) {
+	constructor(protocol: ProtocolError, options: { id?: string | null; notification?: boolean; closeCode?: number } = {}) {
 		super(protocol.message);
 		this.name = "FrameError";
 		this.protocol = protocol;
 		this.id = options.id ?? null;
-		this.full = options.full ?? false;
 		this.notification = options.notification ?? false;
 		this.closeCode = options.closeCode;
 	}
@@ -142,22 +139,20 @@ export function parseFrame(data: string | ArrayBuffer | ArrayBufferView, options
 	}
 	const state = { nodes: 0, maxDepth: 0, maxNodes: options.maxJsonNodes };
 	if (!isObject(value)) throw new FrameError({ name: "invalid_request", message: "Request must be an object" });
-	const full = Object.hasOwn(value, "jsonrpc");
 	let id: string | undefined;
 	if (Object.hasOwn(value, "id")) {
 		if (typeof value.id !== "string" || utf8Bytes(value.id) > options.maxRequestIdBytes) {
 			// A notification-only method is never answered, whatever its `id` (NOTIFICATION_METHODS).
-			throw new FrameError({ name: "invalid_request", message: "Request id must be a bounded string" }, { full, notification: notificationOnly(value.method) });
+			throw new FrameError({ name: "invalid_request", message: "Request id must be a bounded string" }, { notification: notificationOnly(value.method) });
 		}
 		id = value.id;
 	}
 	// Decided from the method, which is known before any params check, so no
 	// error below answers a notification-only method sent with an `id` (NOTIFICATION_METHODS).
 	const notification = isNotification(value.method, id);
-	const failure = { id: id ?? null, full, notification };
+	const failure = { id: id ?? null, notification };
 	// An invalid envelope is answered, even without an `id`, unless its method is only a notification.
-	const envelope = { id: id ?? null, full, notification: notificationOnly(value.method) };
-	if (full && value.jsonrpc !== "2.0") throw new FrameError({ name: "invalid_request", message: "Invalid JSON-RPC version" }, envelope);
+	const envelope = { id: id ?? null, notification: notificationOnly(value.method) };
 	if (typeof value.method !== "string" || value.method.length === 0) throw new FrameError({ name: "invalid_request", message: "Method must be a non-empty string" }, envelope);
 	try {
 		walkJson(value, state);
@@ -174,17 +169,16 @@ export function parseFrame(data: string | ArrayBuffer | ArrayBufferView, options
 	// tests and callers can use a lower policy than the guard's hard ceiling.
 	const configuredDepth = state.maxDepth;
 	if (configuredDepth > options.maxJsonDepth) throw new FrameError({ name: "too_large", message: "JSON nesting is too deep" }, failure);
-	return { request: { method: value.method, params, ...(id === undefined ? {} : { id }), full }, bytes };
+	return { request: { method: value.method, params, ...(id === undefined ? {} : { id }) }, bytes };
 }
 
-export function protocolReply(id: string, result: unknown, full = false): Record<string, unknown> {
-	return { ...(full ? { jsonrpc: "2.0" } : {}), id, result };
+export function protocolReply(id: string, result: unknown): Record<string, unknown> {
+	return { id, result };
 }
 
 /** Errors not tied to a request (no known `id`) omit `id` entirely. */
-export function protocolError(id: string | null | undefined, error: ProtocolError, full = false): Record<string, unknown> {
+export function protocolError(id: string | null | undefined, error: ProtocolError): Record<string, unknown> {
 	return {
-		...(full ? { jsonrpc: "2.0" } : {}),
 		...(id == null ? {} : { id }),
 		error: { code: ERROR_CODES[error.name], message: error.message, ...(error.data ? { data: error.data } : {}) },
 	};

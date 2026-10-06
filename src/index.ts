@@ -1462,12 +1462,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	private reply(socket: WebSocketConnection, request: RequestFrame, result: unknown): void {
-		if (request.id !== undefined) this.send(socket, protocolReply(request.id, result, request.full));
+		if (request.id !== undefined) this.send(socket, protocolReply(request.id, result));
 	}
 
 	private fail(socket: WebSocketConnection, request: RequestFrame | null, error: ProtocolError): void {
 		if (request && request.id === undefined) return;
-		this.send(socket, protocolError(request?.id, error, request?.full ?? false));
+		this.send(socket, protocolError(request?.id, error));
 	}
 
 	private closePolicy(socket: WebSocketConnection, attachment: ConnectionAttachment, code: number, reason: string): void {
@@ -1522,7 +1522,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!parsed) {
 			const error = parseFailure;
 			if (error instanceof FrameError) {
-				const request = error.id === null ? null : { method: "", params: {}, id: error.id, full: error.full };
+				const request = error.id === null ? null : { method: "", params: {}, id: error.id };
 				if (!error.notification) this.fail(socket, request, error.protocol);
 				this.recordViolation(socket, error.protocol);
 				if (error.closeCode !== undefined) {
