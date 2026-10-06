@@ -356,12 +356,12 @@ For direct Wrangler production commands, always pass
    no paid-service bindings. Apply the initial migration once using the normal
    Wrangler deployment workflow. Do not rename or recreate the production
    object to work around a quota or schema issue. The current schema is 8
-   (protocol 8, with push subscriptions); schema 5, 6 and 7 objects are
-   upgraded in place on their first wake, keeping everything: schema 5's
-   thread intro messages become their `description`, schema 6's admins
-   and bots get their roles, and schema 7 gains the empty push tables
-   (`push_subscriptions`, `push_wakes`, `user_status`, `room_mutes`; see [SPEC section 8](../SPEC.md#schema-versions)).
-   The upgrade is one-way: redeploying protocol 6 code afterwards resets the
+   (protocol 8, with push subscriptions, user status, and users' `ext`); a
+   schema 7 object, which the deployed demo holds, is upgraded in place on its
+   first wake, keeping everything: it gains the empty push and status tables
+   (`push_subscriptions`, `push_wakes`, `user_status`, `room_mutes`) and the
+   identities' empty `ext_json` column (see [SPEC section 8](../SPEC.md#schema-versions)).
+   The upgrade is one-way: redeploying schema 7 code afterwards resets the
    object like any schema change, so fix forward instead of rolling back. It
    also fails closed: if it cannot finish, nothing changes, and the object
    throws on every wake until a fixed deploy upgrades it.

@@ -405,8 +405,7 @@ it('creates threads with room_set, delivers only to joined rooms, and moves mess
 
 		// Creating a thread joins its creator: `joined` before the result, and
 		// `updated` to the parent's other members, who are not joined.
-		// A v6 `intro_message` is an unknown field now, and dropped.
-		alice.send({ id: 'thread', method: 'room_set', params: { parent_room_id: 'general', title: 'Deploy', description: 'Why the *4pm* deploy failed', intro_message: { message_id: messageId } } });
+		alice.send({ id: 'thread', method: 'room_set', params: { parent_room_id: 'general', title: 'Deploy', description: 'Why the *4pm* deploy failed' } });
 		const created = await until(alice, (frame) => frame.id === 'thread');
 		const roomId = created.frame.result.room_id;
 		const room = {

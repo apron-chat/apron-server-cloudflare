@@ -38,25 +38,21 @@ import { createHash } from "node:crypto";
 export const ROOM_ID = "general";
 export const ROOM_TITLE = "General";
 /**
- * Schema 6 stores the protocol v7 server-wide log (room records, flat message
+ * Schema 8 stores the server-wide log (room records, flat message
  * snapshots, reaction sets, and registered users' memberships), a
  * `memberships` table of registered users' joined rooms, indexed both ways,
- * with each room's count of them, and the `uploads` held in R2 with each
- * identity's avatar. A room's `description` is one of its client fields
- * (schema 6; schema 5 pointed at an `intro_message` instead), and an
- * identity may hold several passkeys (schema 5 allowed one). An identity's
- * roles are a column of its row (schema 7; schema 6 listed admins in a
- * `_meta` row and told bots by tier). Schemas 5 and 6 are upgraded in place
- * (see upgradeFromSchema5() and upgradeFromSchema6()); stored data from any other
- * schema version is not migrated: the object is wiped and started fresh (see
- * resetStorage()). Additive rows need no new version: the `_meta`
- * guest-number mark, absent in older objects, reads as zero. Schema 8 adds
- * the `push_subscriptions`, `push_wakes`, `user_status` and `room_mutes`
- * tables (see upgradeFromSchema7()).
+ * with each room's count of them, the `uploads` held in R2 with each
+ * identity's avatar, each identity's roles and `ext` in its row, and the
+ * `push_subscriptions`, `push_wakes`, `user_status` and `room_mutes` tables.
+ * Schema 7, which the deployed object holds, is upgraded in place (see
+ * upgradeFromSchema7()); stored data from any other schema version is not
+ * migrated: the object is wiped and started fresh (see resetStorage()).
+ * Additive rows need no new version: an absent `_meta` row reads as its
+ * initial value.
  */
 export const SCHEMA_VERSION = 8;
-/** The older schemas upgraded in place rather than reset, oldest first; each upgrades to the next. */
-export const UPGRADABLE_SCHEMA_VERSIONS: readonly number[] = [5, 6, 7];
+/** The older schema upgraded in place rather than reset. */
+export const UPGRADABLE_SCHEMA_VERSION = 7;
 /**
  * The registered user `APRON_ADMIN_TOKEN` signs in as, always an admin. It
  * never holds a passkey, so deleting the token turns it off completely.
@@ -653,7 +649,7 @@ interface CarriedPasskey extends RawCredentialRow {
   identity_created_ms: number;
   identity_updated_ms: number;
   in_general: number;
-  roles_json?: string;
+  roles_json: string;
 }
 
 interface RawIdentityRow {
@@ -716,10 +712,7 @@ const META_PURGE_ROOMS = "purge_rooms";
 const MAX_PURGE_ROOMS = MAX_THREAD_LIMIT;
 const META_ACCOUNTING_UNSAFE = "accounting_unsafe";
 const META_ACCOUNT_USAGE = "account_usage_snapshot";
-/**
- * The highest guest number ever reserved (see reserveGuestNumbers). Absent
- * means none: the row is additive, so schema 4 objects need no reset for it.
- */
+/** The highest guest number ever reserved (see reserveGuestNumbers); absent means none. */
 const META_GUEST_NUMBER_MARK = "guest_number_mark";
 /**
  * Most passkeys a schema reset carries over (see resetStorage), most recently
@@ -728,12 +721,6 @@ const META_GUEST_NUMBER_MARK = "guest_number_mark";
  * writes, and so the identities that can survive a wipe.
  */
 export const MAX_CARRIED_PASSKEYS = 100;
-/**
- * Schema 6's list of the users `/admin` made admins, as a JSON list of
- * `user_id`s: read only to upgrade them to `admin` roles (schema 7), or to
- * carry those roles across a reset from an older schema.
- */
-const META_LEGACY_ADMINS = "admins";
 /** Most roles one user holds, so the column stays small. */
 export const MAX_ROLES_PER_USER = 8;
 /**
@@ -1197,31 +1184,6 @@ function withCleanOg(embed: Record<string, unknown>, remoteMedia: boolean): Reco
   return Object.keys(clean).length ? { ...rest, og: clean } : rest;
 }
 
-/**
- * A schema 5 intro message's text, which becomes its room's description;
- * none when deleted or empty. A description is CommonMark by convention
- * (§3.4), so a plain-text intro is escaped to read the same; a CommonMark one
- * is kept as written.
- */
-function introText(snapshot: Record<string, unknown>): string | undefined {
-  if (snapshot.deleted === true || !isPlainObject(snapshot.body)) return undefined;
-  const text = snapshot.body.text;
-  if (typeof text !== "string" || text.trim() === "") return undefined;
-  return snapshot.body.format === "markdown" ? text : escapeMarkdown(text);
-}
-
-/**
- * Plain text as Markdown that renders as the same text: inline markup
- * characters are backslash-escaped everywhere, and block markers (headings,
- * quotes, list items, rules) at the start of a line.
- */
-export function escapeMarkdown(text: string): string {
-  return text
-    .replace(/[\\`*_[\]<>~|]/g, "\\$&")
-    .replace(/^([ \t]*)([#>+=-])/gm, "$1\\$2")
-    .replace(/^([ \t]*\d+)([.)])/gm, "$1\\$2");
-}
-
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
@@ -1233,7 +1195,7 @@ function ensureText(value: unknown, field: string, maxBytes: number): string {
 }
 
 /**
- * Schema 6: the server-wide log with membership records, and each registered
+ * Schema 8: the server-wide log with membership records, and each registered
  * identity's joined rooms as `memberships` rows, by room (the primary key, for
  * member listings) and by user (for a user's rooms), counted in each room's
  * `member_count`. Guests' memberships live in their connection only, like the
@@ -1490,15 +1452,7 @@ export class Store {
     // DDL is deliberately one initialization batch. The schema version marker
     // is checked before DDL so a wake/restart does not rewrite schema state.
     let version = this.readSchemaVersion();
-    if (version === 5) {
-      this.upgradeFromSchema5();
-      version = 6;
-    }
-    if (version === 6) {
-      this.upgradeFromSchema6();
-      version = 7;
-    }
-    if (version === 7) {
+    if (version === UPGRADABLE_SCHEMA_VERSION) {
       this.upgradeFromSchema7();
       version = SCHEMA_VERSION;
     }
@@ -1587,131 +1541,16 @@ export class Store {
   /** True when the object holds data from another schema version that is not upgraded in place. */
   requiresReset(): boolean {
     const version = this.readSchemaVersion();
-    return version !== 0 && version !== SCHEMA_VERSION && !UPGRADABLE_SCHEMA_VERSIONS.includes(version);
-  }
-
-  /**
-   * Upgrades a schema 5 object (protocol v6) to schema 6 (protocol v7) in
-   * place, once, in one transaction, keeping chat, rooms, identities,
-   * sessions, and tokens:
-   *
-   * - A room's `intro_message` becomes its `description` (§3.4): the text of
-   *   the intro message's current retained snapshot, cut by whole code points
-   *   (ending in `…`) where the room's client fields would pass
-   *   maxThreadMetadataBytes; a deleted, expired, or empty intro leaves none.
-   *   The `intro_message_id` column is dropped.
-   * - Logged room records get the same change, so history carries no
-   *   `intro_message`: a room's current record takes the room's new
-   *   description, and an older one the text of the snapshot it embedded.
-   *   This reads every stored record once (records have no index by kind);
-   *   the log holds at most the retention window.
-   * - Each room counts its stored registered members in `member_count`.
-   * - `credentials` is rebuilt without its UNIQUE `user_id`, so an identity
-   *   may add passkeys (§4.10).
-   *
-   * Nothing else changes: the demo never logged `@server` or `@room`
-   * messages, and `@private` notices were never stored, so no sender needs
-   * the protocol v7 `~` identities. The rows read and written are measured
-   * and charged to the day's maintenance reservation without a capacity
-   * check, like a reset's passkey carry, so the upgrade cannot be blocked by
-   * an exhausted budget.
-   */
-  private upgradeFromSchema5(): void {
-    const start = { reads: this.observed.reads, writes: this.observed.writes };
-    const effective = Number(this.metaValue(META_EFFECTIVE_NOW));
-    const day = dayFor(Math.max(Number.isSafeInteger(effective) ? effective : 0, this.clock.now()));
-    this.transaction(() => {
-      const floor = this.logState().history_floor;
-      const rooms = this.rawRows<{ room_id: string; record_log_id: number; intro_message_id: string | null; fields_json: string }>(
-        "SELECT room_id, record_log_id, intro_message_id, fields_json FROM rooms",
-      );
-      const current = new Map<string, { logId: number; description?: string }>();
-      for (const room of rooms) {
-        const fields = parseJson<Record<string, unknown>>(room.fields_json, {});
-        const intro = room.intro_message_id === null ? null : this.currentMessage(room.intro_message_id, floor);
-        const text = intro ? introText(parseJson<Record<string, unknown>>(intro.snapshot_json, {})) : undefined;
-        const upgraded = this.fitDescription(fields, text);
-        current.set(room.room_id, { logId: room.record_log_id, ...(typeof upgraded.description === "string" ? { description: upgraded.description } : {}) });
-        if (upgraded !== fields) this.rawExec("UPDATE rooms SET fields_json = ? WHERE room_id = ?", JSON.stringify(upgraded), room.room_id);
-      }
-      const records = this.rawRows<{ room_id: string; log_id: number; record_json: string }>(
-        "SELECT room_id, log_id, record_json FROM records WHERE kind = 'room'",
-      );
-      for (const row of records) {
-        const record = parseJson<Record<string, unknown>>(row.record_json, {});
-        if (!("intro_message" in record)) continue;
-        const { intro_message: intro, ...rest } = record;
-        const room = current.get(row.room_id);
-        // The room's current record is the same snapshot the rooms row lists
-        // (§2): it takes that description as is. An older record's text is cut
-        // against its own client fields, as the rooms row's was.
-        let upgraded: Record<string, unknown>;
-        if (room?.logId === row.log_id) upgraded = room.description === undefined ? rest : { ...rest, description: room.description };
-        else {
-          const text = isPlainObject(intro) ? introText(intro) : undefined;
-          const clientFields = Object.fromEntries(["title", "ext"].filter((key) => key in rest).map((key) => [key, rest[key]]));
-          const fitted = this.fitDescription(clientFields, text);
-          upgraded = typeof fitted.description === "string" ? { ...rest, description: fitted.description } : rest;
-        }
-        this.rewriteRecord(row, JSON.stringify(upgraded));
-      }
-      this.rawExec("ALTER TABLE rooms ADD COLUMN member_count INTEGER NOT NULL DEFAULT 0");
-      this.rawExec("UPDATE rooms SET member_count = (SELECT COUNT(*) FROM memberships m WHERE m.room_id = rooms.room_id)");
-      this.rawExec("ALTER TABLE rooms DROP COLUMN intro_message_id");
-      // Schema 5 allowed one passkey per identity (a UNIQUE user_id), which
-      // SQLite can only drop by rebuilding the table.
-      this.rawScript(`
-        CREATE TABLE credentials_v6 (
-          credential_id TEXT PRIMARY KEY,
-          user_id TEXT NOT NULL,
-          public_key_json TEXT NOT NULL,
-          sign_count INTEGER NOT NULL,
-          transports_json TEXT,
-          created_ms INTEGER NOT NULL,
-          updated_ms INTEGER NOT NULL
-        );
-        INSERT INTO credentials_v6 (credential_id, user_id, public_key_json, sign_count, transports_json, created_ms, updated_ms)
-          SELECT credential_id, user_id, public_key_json, sign_count, transports_json, created_ms, updated_ms FROM credentials;
-        DROP TABLE credentials;
-        ALTER TABLE credentials_v6 RENAME TO credentials;
-        CREATE INDEX IF NOT EXISTS credentials_user_idx ON credentials (user_id);
-      `);
-      this.finishUpgrade(6, start, day);
-    });
-    console.warn(JSON.stringify({ event: "storage_schema_upgraded", from: 5, to: 6 }));
-  }
-
-  /**
-   * Upgrades a schema 6 object to schema 7 in place, once, in one
-   * transaction, keeping everything: identities get a `roles_json` column,
-   * `["bot"]` for bots (tier `bot`), `["admin"]` for the `admin` user and
-   * those the `_meta` `admins` row listed, and `[]` for the rest; the
-   * `admins` row is deleted. This reads every identity once (at most the
-   * identity cap), charged like upgradeFromSchema5's rows.
-   */
-  private upgradeFromSchema6(): void {
-    const start = { reads: this.observed.reads, writes: this.observed.writes };
-    const effective = Number(this.metaValue(META_EFFECTIVE_NOW));
-    const day = dayFor(Math.max(Number.isSafeInteger(effective) ? effective : 0, this.clock.now()));
-    this.transaction(() => {
-      const admins = this.legacyAdmins();
-      this.rawExec("ALTER TABLE identities ADD COLUMN roles_json TEXT NOT NULL DEFAULT '[]'");
-      this.rawExec("UPDATE identities SET roles_json = '[\"bot\"]' WHERE tier = 'bot'");
-      for (const userId of [ADMIN_USER_ID, ...admins]) {
-        this.rawExec("UPDATE identities SET roles_json = '[\"admin\"]' WHERE user_id = ? AND tier = 'registered'", userId);
-      }
-      this.rawExec("DELETE FROM _meta WHERE key = ?", META_LEGACY_ADMINS);
-      this.finishUpgrade(7, start, day);
-    });
-    console.warn(JSON.stringify({ event: "storage_schema_upgraded", from: 6, to: 7 }));
+    return version !== 0 && version !== SCHEMA_VERSION && version !== UPGRADABLE_SCHEMA_VERSION;
   }
 
   /**
    * Upgrades a schema 7 object to schema 8 in place, once, in one
    * transaction: it creates the empty `push_subscriptions`, `push_wakes`,
    * `user_status` and `room_mutes` tables and their indexes, adds the
-   * identities' empty `ext_json` column, and changes nothing else.
-   * Charged like upgradeFromSchema5's rows.
+   * identities' empty `ext_json` column, and changes nothing else. The rows
+   * it reads and writes are measured and charged to the day's maintenance
+   * reservation without a capacity check (finishUpgrade).
    */
   private upgradeFromSchema7(): void {
     const start = { reads: this.observed.reads, writes: this.observed.writes };
@@ -1758,16 +1597,6 @@ export class Store {
     console.warn(JSON.stringify({ event: "storage_schema_upgraded", from: 7, to: 8 }));
   }
 
-  /** Schema 6's `admins` list (META_LEGACY_ADMINS), or none when absent or unreadable. */
-  private legacyAdmins(): string[] {
-    try {
-      const parsed = parseJson<unknown>(this.metaValue(META_LEGACY_ADMINS), []);
-      return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string") : [];
-    } catch {
-      return [];
-    }
-  }
-
   /**
    * Ends an in-place upgrade's transaction: marks the new schema version and
    * charges the rows it read and wrote (measured from `start`) to the day's
@@ -1792,27 +1621,6 @@ export class Store {
     );
     this.observed.reservedReads += cost.reads;
     this.observed.reservedWrites += cost.writes;
-  }
-
-  /**
-   * Room client fields with `description` set to `text`, cut by whole code
-   * points (ending in `…`) so the fields fit maxThreadMetadataBytes; the
-   * same object when there is no text to add.
-   */
-  private fitDescription(fields: Record<string, unknown>, text: string | undefined): Record<string, unknown> {
-    if (text === undefined) return fields;
-    const points = [...text];
-    const withText = (count: number) => ({ ...fields, description: count >= points.length ? text : points.slice(0, count).join("").trimEnd() + "…" });
-    const fits = (count: number) => utf8Bytes(JSON.stringify(withText(count))) <= this.config.maxThreadMetadataBytes;
-    if (fits(points.length)) return withText(points.length);
-    let low = 0;
-    let high = points.length - 1;
-    while (low < high) {
-      const middle = Math.ceil((low + high) / 2);
-      if (fits(middle)) low = middle;
-      else high = middle - 1;
-    }
-    return low > 0 && fits(low) ? withText(low) : fields;
   }
 
   /**
@@ -1926,30 +1734,22 @@ export class Store {
    * here or accept that the reset drops them; an unreadable table carries none.
    */
   private readCarriedPasskeys(): CarriedPasskey[] {
-    // Schemas before 7 have no `roles_json`: their admins are in a `_meta` list.
-    for (const roles of ["i.roles_json", "NULL"]) {
-      try {
-        const rows = this.rawRows<CarriedPasskey>(
-          `SELECT c.credential_id, c.user_id, c.public_key_json, c.sign_count, c.transports_json,
-              c.created_ms, c.updated_ms, i.user_handle, i.name, i.tier, ${roles} AS roles_json,
-              i.created_ms AS identity_created_ms, i.updated_ms AS identity_updated_ms,
-              EXISTS (SELECT 1 FROM memberships m WHERE m.room_id = ? AND m.user_id = c.user_id) AS in_general
-           FROM credentials c JOIN identities i ON i.user_id = c.user_id
-           WHERE i.tier = 'registered' AND i.user_id <> ?
-           ORDER BY c.updated_ms DESC, c.credential_id LIMIT ?`,
-          // `admin` holds no passkey; should one exist, a reset does not carry it.
-          ROOM_ID, ADMIN_USER_ID, MAX_CARRIED_PASSKEYS,
-        );
-        if (roles === "NULL") {
-          const admins = new Set(this.legacyAdmins());
-          for (const row of rows) row.roles_json = admins.has(row.user_id) ? '["admin"]' : "[]";
-        }
-        return rows;
-      } catch {
-        // Try the older shape, then give up: an unreadable old schema carries nothing.
-      }
+    try {
+      return this.rawRows<CarriedPasskey>(
+        `SELECT c.credential_id, c.user_id, c.public_key_json, c.sign_count, c.transports_json,
+            c.created_ms, c.updated_ms, i.user_handle, i.name, i.tier, i.roles_json,
+            i.created_ms AS identity_created_ms, i.updated_ms AS identity_updated_ms,
+            EXISTS (SELECT 1 FROM memberships m WHERE m.room_id = ? AND m.user_id = c.user_id) AS in_general
+         FROM credentials c JOIN identities i ON i.user_id = c.user_id
+         WHERE i.tier = 'registered' AND i.user_id <> ?
+         ORDER BY c.updated_ms DESC, c.credential_id LIMIT ?`,
+        // `admin` holds no passkey; should one exist, a reset does not carry it.
+        ROOM_ID, ADMIN_USER_ID, MAX_CARRIED_PASSKEYS,
+      );
+    } catch {
+      // An unreadable old schema carries nothing.
+      return [];
     }
-    return [];
   }
 
   /**
@@ -2659,9 +2459,8 @@ export class Store {
 
   /** Reads reserved for listing every room, bounded by the calibrated thread cap. */
   private roomListingReads(): number {
-    // One room row per room, with slack for index pages (schema 5 also looked
-    // up each room's intro message); test/accounting.integration.test.ts
-    // measures the cap.
+    // One room row per room, with slack for index pages;
+    // test/accounting.integration.test.ts measures the cap.
     return 32 + 4 * (MAX_THREAD_LIMIT + 1);
   }
 

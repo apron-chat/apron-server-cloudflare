@@ -647,29 +647,16 @@ one index range, sorted after joining the capped rooms table.
 
 ## Schema upgrade and reset
 
-A schema 5 object (protocol 6) is upgraded to schema 6 in place, once, in one
-transaction (`test/schema-reset.integration.test.ts`): it reads the capped
-rooms table with each room's intro message (one indexed read each), every
-stored record once to find the room records (records have no index by kind;
-the log holds at most the retention window, about 80,000 records at the
-Workers Paid post ceiling and a week's retention), every membership row
-once to fill the member counts, and every credential once to rebuild
-`credentials` without its one-passkey constraint (at most the 10,000-identity
-cap); it rewrites each room row and room record.
-The rows it measurably read and wrote are added to the day's maintenance
-counters without a capacity check, like the reset's passkey carry, so an
-exhausted budget cannot block it. The object is not wiped.
-
-A schema 6 object is upgraded to schema 7 the same way: it adds `roles_json`
-to `identities` and sets it for bots, `admin`, and schema 6's listed admins,
-reading and updating the identities once (at most the identity cap), and
-deletes the `_meta` `admins` row. A schema 7 object is upgraded to schema 8
-the same way, which only creates four empty tables, `push_subscriptions`
-(with indexes by user and registration time, by registration time, and a
-partial one by user and registration time of those that wake for
-messages), `push_wakes` (with an index by wake time), `user_status` and
-`room_mutes`: four tables and four indexes besides their primary keys. A schema 5 object takes all three
-upgrades.
+A schema 7 object, which the deployed demo holds, is upgraded to schema 8 in
+place, once, in one transaction (`test/schema-reset.integration.test.ts`): it
+creates four empty tables, `push_subscriptions` (with indexes by user and
+registration time, by registration time, and a partial one by user and
+registration time of those that wake for messages), `push_wakes` (with an
+index by wake time), `user_status` and `room_mutes`, four indexes besides
+their primary keys, and adds the identities' empty `ext_json` column. The rows
+it measurably read and wrote are added to the day's maintenance counters
+without a capacity check, like the reset's passkey carry, so an exhausted
+budget cannot block it. The object is not wiped.
 
 Any other stored schema version resets the object with
 `deleteAll()` and recreates the schema (`test/schema-reset.integration.test.ts`).
