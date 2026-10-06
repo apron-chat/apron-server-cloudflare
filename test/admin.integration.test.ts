@@ -562,7 +562,8 @@ it('/invite mints a sign-up token that creates a user per use, each with its own
 		const replaced = /apron_join_[A-Za-z0-9_-]+/.exec((await command(admin, 'invite-2', '/invite 1')).notice!.params.body.text)![0];
 		expect((await command(admin, 'revoke', '/invite 0')).notice!.params.body.text).toMatch(/revoked/);
 		expect((await request(await fresh(), 'join', 'auth', { scheme: 'token', token: replaced })).error.code).toBe(-32001);
-		expect((await command(admin, 'too-many', '/invite 51')).frame.error.code).toBe(-32602);
+		// Past the server's count limit: denied (§1.1).
+		expect((await command(admin, 'too-many', '/invite 51')).frame.error.code).toBe(-32001);
 		// Only admins mint invites.
 		expect((await command(ada, 'not-admin', '/invite 1')).frame.error.code).toBe(-32001);
 	} finally { admin.close(); for (const peer of peers) peer.close(); }
@@ -671,7 +672,8 @@ it('/role <user_id> bot makes a token user a bot in full, but not a passkey hold
 		// It acts as a bot: no passkey, no commands for owners, a fixed name and user_id, and never an admin.
 		expect((await command(bot, 'invite-bot', '/invite-bot')).frame.error.message).toBe("A bot can't use /invite-bot");
 		expect((await request(bot, 'rename-self', 'me', { name: 'Other' })).error.code).toBe(-32001);
-		expect((await request(bot, 'passkey', 'auth', { scheme: 'webauthn', action: 'register', step: 'begin' })).error.code).toBe(-32001);
+		// Its connection has no Origin, so passkeys are not offered to it at all: unsupported (§3.2).
+		expect((await request(bot, 'passkey', 'auth', { scheme: 'webauthn', action: 'register', step: 'begin' })).error.code).toBe(-32601);
 		expect((await command(admin, 'bot-admin', `/admin ${userId}`)).frame.error.message).toBe("A bot can't be an admin");
 		expect((await command(admin, 'bot-rename', `/rename ${userId} ${unique('moved')}`)).frame.error.message).toBe("A bot's user_id is fixed");
 		const posted = await exchange(bot, 'post', 'message', { room_id: 'general', body: { text: 'beep' } });

@@ -92,8 +92,11 @@ it('admits clients without Origin as guests without advertising or allowing pass
 		expect((await greeting(peer)).server.params.auth).toEqual(['token', 'guest']);
 		peer.send({ id: 'auth', method: 'auth', params: { scheme: 'guest' } });
 		expect((await peer.next()).result.you.user_id).toMatch(/^guest_/);
+		// A scheme the server defines but does not offer this connection is unsupported (§3.2), as is email.
 		peer.send({ id: 'passkey', method: 'auth', params: { scheme: 'webauthn', action: 'register', step: 'begin' } });
-		expect((await peer.next()).error.code).toBe(-32001);
+		expect((await peer.next()).error.code).toBe(-32601);
+		peer.send({ id: 'email', method: 'auth', params: { scheme: 'email', email: 'ada@example.com' } });
+		expect((await peer.next()).error.code).toBe(-32601);
 	} finally { peer.close(); }
 });
 
@@ -216,6 +219,27 @@ it('never answers a notification-only method sent with an id, even with invalid 
 		second.close();
 		await configure((config) => { config.limits.globalFramesPerMinute = DEFAULT_LIMITS.globalFramesPerMinute; });
 	}
+});
+
+it('ignores a request method sent without an id: nothing changes and nothing is sent (§1.1)', async () => {
+	const sender = await connect();
+	const watcher = await connect();
+	try {
+		await authenticate(sender);
+		await authenticate(watcher);
+		sender.send({ method: 'message', params: { room_id: 'general', body: { text: 'sent without an id' } } });
+		sender.send({ method: 'me', params: { status: 'dnd' } });
+		sender.send({ method: 'room_set', params: { parent_room_id: 'general', title: 'No id' } });
+		sender.send({ method: 'auth', params: { scheme: 'guest' } });
+		expect(await drain(sender)).toEqual([]);
+		// Nobody else was told of a message or a room either.
+		expect((await drain(watcher)).filter((frame) => frame.method === 'message' || frame.method === 'room_update')).toEqual([]);
+		expect((await request(sender, 'me', 'me', {})).result.you.status).toBe('online');
+		const page = await request(sender, 'history', 'history', { room_id: 'general', limit: 20 });
+		expect(JSON.stringify(page.result)).not.toContain('sent without an id');
+		// Ignoring is not a policy violation: the connection stays open.
+		expect(sender.closed()).toBeUndefined();
+	} finally { sender.close(); watcher.close(); }
 });
 
 it('commits once for canonical retries, passes ext through, and sends no reply to notifications', async () => {

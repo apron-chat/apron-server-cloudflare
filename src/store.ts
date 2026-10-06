@@ -3671,7 +3671,8 @@ export class Store {
     if (format !== "plain" && format !== "markdown") throw new StoreError("invalid_params", "body.format is invalid");
     const embeds = body.embeds === undefined ? [] : body.embeds;
     if (!Array.isArray(embeds)) throw new StoreError("invalid_params", "body.embeds must be an array");
-    if (embeds.length > this.config.maxEmbeds) throw new StoreError("too_large", "too many embeds");
+    // A count limit this server sets: denied (§1.1).
+    if (embeds.length > this.config.maxEmbeds) throw new StoreError("denied", `A message has at most ${this.config.maxEmbeds} embeds`);
     for (const embed of embeds) {
       if (!isPlainObject(embed) || typeof embed.kind !== "string" || embed.kind.length === 0) {
         throw new StoreError("invalid_params", "body.embeds must be objects with a kind");
@@ -3684,9 +3685,10 @@ export class Store {
       if (!Array.isArray(body.mentions)) throw new StoreError("invalid_params", "body.mentions must be an array of user_id strings");
       const unique = new Set<string>();
       for (const item of body.mentions) {
-        if (typeof item !== "string" || item.length === 0 || utf8Bytes(item) > 256) {
+        if (typeof item !== "string" || item.length === 0) {
           throw new StoreError("invalid_params", "body.mentions must be an array of user_id strings");
         }
+        if (utf8Bytes(item) > 256) throw new StoreError("too_large", "a mentioned user_id is too long");
         unique.add(item);
       }
       mentions = [...unique];
@@ -4014,7 +4016,8 @@ export class Store {
       body = this.normalizedBody(params.body);
       if (body.text === "" && (body.embeds as unknown[]).length === 0) throw new StoreError("invalid_params", "message cannot be empty");
     }
-    // A save merges `ext` into the current snapshot's (§3.5); a tombstone carries none (§4.6).
+    // A save merges `ext` into the current snapshot's (§3.5); a tombstone carries none (§4.4),
+    // so a creation, or a save of a tombstone, merges into an empty `ext`.
     const write = this.optionalExt(params.ext);
     const ext = deleted ? undefined : mergeExt(previous?.ext, write);
     const from = previous ? previous.from : this.identityForMessage(input);
@@ -4835,12 +4838,12 @@ export class Store {
     for (const item of value) {
       if (typeof item !== "string" || item.length === 0) throw new StoreError("invalid_params", "each emoji must be a non-empty string");
       // eslint-disable-next-line no-control-regex
-      if (utf8Bytes(item) > MAX_EMOJI_BYTES || /[\u0000-\u001f\u007f]/.test(item)) {
-        throw new StoreError("invalid_params", "emoji is not a single bounded sequence");
-      }
+      if (utf8Bytes(item) > MAX_EMOJI_BYTES) throw new StoreError("too_large", "emoji is too long");
+      if (/[\u0000-\u001f\u007f]/.test(item)) throw new StoreError("invalid_params", "emoji is not a single sequence");
       if (!emojis.includes(item)) emojis.push(item);
     }
-    if (emojis.length > this.config.reactionEmojisPerUser) throw new StoreError("invalid_params", "too many distinct emoji in one reaction set");
+    // A count limit this server sets: denied (§1.1).
+    if (emojis.length > this.config.reactionEmojisPerUser) throw new StoreError("denied", `A reaction set holds at most ${this.config.reactionEmojisPerUser} emoji`);
     return emojis;
   }
 

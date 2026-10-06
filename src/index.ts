@@ -15,6 +15,7 @@ import {
 	isNotification,
 	jsonString,
 	notificationOnly,
+	REQUEST_METHODS,
 	objectParam,
 	optionalString,
 	parseFrame,
@@ -832,9 +833,12 @@ const MAX_WAKE_ENTRIES = 16;
  */
 function wakeParam(value: unknown): number | undefined {
 	if (value === undefined) return undefined;
-	if (!Array.isArray(value) || value.length > MAX_WAKE_ENTRIES || value.some((entry) => typeof entry !== "string" || entry.length > 64)) {
-		throw { name: "invalid_params", message: `wake must be an array of at most ${MAX_WAKE_ENTRIES} scope names` } satisfies ProtocolError;
+	if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+		throw { name: "invalid_params", message: "wake must be an array of scope names" } satisfies ProtocolError;
 	}
+	// Past the server's count limit, denied; an entry past its size, too_large (§1.1).
+	if (value.length > MAX_WAKE_ENTRIES) throw { name: "denied", message: `wake lists at most ${MAX_WAKE_ENTRIES} scope names` } satisfies ProtocolError;
+	if (value.some((entry) => entry.length > 64)) throw { name: "too_large", message: "a wake scope name is at most 64 characters" } satisfies ProtocolError;
 	let mask = 0;
 	for (const entry of value as string[]) if (Object.hasOwn(WAKE_SCOPES, entry)) mask |= WAKE_SCOPES[entry as keyof typeof WAKE_SCOPES];
 	return mask;
@@ -1582,6 +1586,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	private async dispatch(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
+		// A request method sent without an `id` is ignored, as §1.1 lets a
+		// server (REQUEST_METHODS): no change, and no reply.
+		if (request.id === undefined && REQUEST_METHODS.has(request.method)) return;
 		switch (request.method) {
 			case "auth":
 				await this.handleAuth(socket, attachment, request);
@@ -1614,10 +1621,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return;
 			case "status":
 				if (!this.config.push) break;
-				// Clients send `status` only as a request (§4.5): one without an
-				// `id` is a notification this server does not define, so it is
-				// ignored like any unknown notification (§1), changing nothing.
-				if (request.id === undefined) return;
 				this.handleStatus(socket, request);
 				return;
 			case "push_register":
@@ -1673,6 +1676,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (request.params.scheme === "guest" && (attachment.tier === "anonymous" || attachment.tier === "registered")) {
 			this.reply(socket, request, { you: this.you(attachment) });
 			return;
+		}
+		// A scheme this server does not offer the connection, `email` (no mail
+		// here) or `webauthn` from an origin not configured for passkeys, is
+		// `unsupported` (§3.2), before an attempt is charged.
+		const offered = request.params.scheme;
+		if (typeof offered === "string" && offered !== "guest" && offered !== "token" && (offered !== "webauthn" || !this.passkeysOffered(this.requestOrigin(socket)))) {
+			throw { name: "unsupported", message: offered === "webauthn" ? "Passkeys are not offered to this origin" : "Unsupported authentication scheme" } satisfies ProtocolError;
 		}
 		this.store.reserveAuthAttempt({ ipKey: attachment.ipKey, now: nowMs() });
 		const params = request.params;
@@ -1916,7 +1926,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const origin = this.requestOrigin(socket);
 		if (!origin || !this.config.rpOrigins.includes(origin)) throw { name: "denied", message: "Frontend origin is not configured for passkeys" } satisfies ProtocolError;
 		const token = requiredString(request.params, "token");
-		if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "invalid_params", message: "token is too long" } satisfies ProtocolError;
+		if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "too_large", message: "token is too long" } satisfies ProtocolError;
 		const key = await sessionKey(token);
 		const session = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredSession>(key));
 		const now = nowMs();
@@ -1977,7 +1987,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async handleBotToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, token: string): Promise<void> {
 		return this.withSessionLock(async () => {
 			if (attachment.tier === "registered") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
-			if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "invalid_params", message: "token is too long" } satisfies ProtocolError;
+			if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "too_large", message: "token is too long" } satisfies ProtocolError;
 			const key = BOT_TOKEN_KEY_PREFIX + await sha256Hex(token);
 			const stored = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredBotToken>(key));
 			const invalid = { name: "denied", message: "Bot token is not valid; its owner can get a new one with /invite-bot" } satisfies ProtocolError;
@@ -1995,7 +2005,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async handleInviteToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, token: string): Promise<void> {
 		return this.withSessionLock(async () => {
 			if (attachment.tier === "registered") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
-			if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "invalid_params", message: "token is too long" } satisfies ProtocolError;
+			if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "too_large", message: "token is too long" } satisfies ProtocolError;
 			const key = INVITE_TOKEN_KEY_PREFIX + await sha256Hex(token);
 			const stored = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredInviteToken>(key));
 			const invalid = { name: "denied", message: "This invite token is not valid; ask an admin for a new one" } satisfies ProtocolError;
@@ -2068,7 +2078,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async handleJoinToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, token: string): Promise<void> {
 		return this.withSessionLock(async () => {
 			if (attachment.tier === "registered") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
-			if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "invalid_params", message: "token is too long" } satisfies ProtocolError;
+			if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "too_large", message: "token is too long" } satisfies ProtocolError;
 			const name = this.requestedName(request.params) ?? JOIN_DEFAULT_NAME;
 			const key = JOIN_TOKEN_KEY_PREFIX + await sha256Hex(token);
 			const own = INVITE_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
@@ -2122,7 +2132,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async invite(socket: WebSocketConnection, request: RequestFrame, roomId: string, count: string): Promise<void> {
 		const uses = /^\d{1,3}$/.test(count) ? Number(count) : -1;
-		if (uses < 0 || uses > MAX_JOIN_USES) throw { name: "invalid_params", message: `Usage: /invite <uses>, 0 to ${MAX_JOIN_USES}` } satisfies ProtocolError;
+		if (uses < 0) throw { name: "invalid_params", message: `Usage: /invite <uses>, 0 to ${MAX_JOIN_USES}` } satisfies ProtocolError;
+		// More uses than the server allows is a count limit: denied (§1.1).
+		if (uses > MAX_JOIN_USES) throw { name: "denied", message: `An invite signs up at most ${MAX_JOIN_USES} users` } satisfies ProtocolError;
 		const token = JOIN_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 		const key = JOIN_TOKEN_KEY_PREFIX + await sha256Hex(token);
 		const expiresMs = nowMs() + JOIN_INVITE_TTL_MS;
@@ -3478,11 +3490,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const wake = wakeParam(params.wake);
 		const pushId = optionalString(params, "push_id");
 		if (pushId !== undefined && !PUSH_ID_PATTERN.test(pushId)) throw { name: "invalid_params", message: "push_id must be 1 to 64 letters, digits, _ or -" } satisfies ProtocolError;
+		// A url past the size limit is too_large (§1.1); other endpoint problems are invalid_params.
+		if (utf8Bytes(sent) > MAX_PUSH_URL_BYTES) throw { name: "too_large", message: `url is at most ${MAX_PUSH_URL_BYTES} bytes` } satisfies ProtocolError;
 		const problem = pushEndpointError(sent, this.config.pushHosts);
 		if (problem) throw { name: "invalid_params", message: problem } satisfies ProtocolError;
 		// Stored as the URL parser spells it, so one endpoint has one key.
 		const url = new URL(sent).href;
-		if (utf8Bytes(url) > MAX_PUSH_URL_BYTES) throw { name: "invalid_params", message: `url is at most ${MAX_PUSH_URL_BYTES} bytes` } satisfies ProtocolError;
+		if (utf8Bytes(url) > MAX_PUSH_URL_BYTES) throw { name: "too_large", message: `url is at most ${MAX_PUSH_URL_BYTES} bytes` } satisfies ProtocolError;
 		const keys = objectParam(params, "keys")!;
 		const key = (name: string): Uint8Array | null => typeof keys[name] === "string" && keys[name].length <= 256 ? base64UrlDecode(keys[name]) : null;
 		const p256dh = key("p256dh");

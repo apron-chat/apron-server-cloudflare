@@ -283,6 +283,13 @@ The demo's 16 KiB frame policy is an explicit exception to the base protocol's
 advisory 256 KiB recommendation. Payload lengths count UTF-8 bytes. Errors use
 the base protocol codes; `retry_after` includes `data.retry_after`, whole
 seconds rounded up. Permanent identity/thread-room ceilings return `denied`, not a fabricated replenishment time.
+Every count limit the server sets (embeds per message, emoji per reaction set,
+reacting users per message, push `wake` entries, invite uses, passkeys, roles,
+room mutes, threads) is `denied`; a value past its size limit is `too_large`;
+other rejected values are `invalid_params`. A request method sent without an
+`id`, and an `id` on `activity` or `ping`, are ignored. An `auth` scheme the
+server does not offer the connection (`email` always, `webauthn` from an
+origin not configured for passkeys) is `unsupported`.
 
 Guest posting allowances (with `GUEST_POSTING=true`) are shared across a normalized IP; native IPv6
 addresses share a /64 bucket. Registered users also share the aggregate IP

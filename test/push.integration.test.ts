@@ -152,7 +152,9 @@ describe('push over the socket', () => {
 			try {
 				for (const [label, params] of cases.slice(index, index + 2)) {
 					const reply = await request(peer, `bad-${index}`, 'push_register', params);
-					expect(reply.error?.code, label).toBe(-32602);
+					// Sizes are too_large and the server's count limit denied (§1.1); the rest invalid_params.
+					const code = ['a long url', 'a wake entry past 64 characters'].includes(label) ? -32003 : label === 'a wake past 16 entries' ? -32001 : -32602;
+					expect(reply.error?.code, label).toBe(code);
 					if (label.includes('PUSH_HOSTS')) expect(reply.error.message).toBe('push service not allowed here');
 				}
 			} finally { peer.close(); }
@@ -1019,7 +1021,7 @@ describe('security review fixes', () => {
 			expect((await request(peer, 'plain', 'push_register', { kind: 'webpush', url: 'https://push.example.net/b', keys })).result).toEqual({});
 			expect((await subscriptionsOf(userId)).map((row) => row.url)).toEqual(['https://push.example.net/b']);
 			expect((await request(peer, 'dot', 'push_register', { kind: 'webpush', url: 'https://push.example.net./c', keys })).error.code).toBe(-32602);
-			expect((await request(peer, 'long', 'push_register', { kind: 'webpush', url: `https://push.example.net/${'x'.repeat(500)}`, keys })).error.code).toBe(-32602);
+			expect((await request(peer, 'long', 'push_register', { kind: 'webpush', url: `https://push.example.net/${'x'.repeat(500)}`, keys })).error.code).toBe(-32003);
 			// Unregistering by another spelling removes it too.
 			expect((await request(peer, 'unregister', 'push_unregister', { url: 'https://PUSH.example.net/b' })).result).toEqual({});
 			expect(await subscriptionsOf(userId)).toEqual([]);

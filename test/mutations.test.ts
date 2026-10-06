@@ -170,7 +170,7 @@ it("broadcasts flat self-describing snapshots and enforces replacement semantics
 		const deleted = post(store, clock, "alice", "m3", { message_id: messageId, deleted: true, body: { text: "ignored" }, ext: { keep: true } });
 		expect(deleted.message?.deleted).toBe(true);
 		expect(deleted.message?.body).toBeUndefined();
-		// A tombstone carries no body and no ext (§4.6), whatever the save sent.
+		// A tombstone carries no body and no ext (§4.4), whatever the save sent.
 		expect(deleted.message).not.toHaveProperty("ext");
 
 		const restored = post(store, clock, "alice", "m4", { message_id: messageId, deleted: false, body: { text: "restored" } });
@@ -426,10 +426,10 @@ it("sets, clears, collapses, and deduplicates reactions", async () => {
 		expect(errorCode(() => store.mutate(op(clock, "bob", "not-array", "reactions", { message_id: messageId, emojis: "👍" })))).toBe("invalid_params");
 		expect(errorCode(() => store.mutate(op(clock, "bob", "not-string", "reactions", { message_id: messageId, emojis: [1] })))).toBe("invalid_params");
 		expect(errorCode(() => store.mutate(op(clock, "bob", "empty", "reactions", { message_id: messageId, emojis: [""] })))).toBe("invalid_params");
-		expect(errorCode(() => store.mutate(op(clock, "bob", "long", "reactions", { message_id: messageId, emojis: ["x".repeat(65)] })))).toBe("invalid_params");
+		expect(errorCode(() => store.mutate(op(clock, "bob", "long", "reactions", { message_id: messageId, emojis: ["x".repeat(65)] })))).toBe("too_large");
 		expect(errorCode(() => store.mutate(op(clock, "bob", "many", "reactions", {
 			message_id: messageId, emojis: Array.from({ length: 9 }, (_, index) => `e${index}`),
-		})))).toBe("invalid_params");
+		})))).toBe("denied");
 
 		const history = store.historyPage({ roomId: "general", after: target.message!.log_id, limit: 50, now: clock.value });
 		expect(messagesOf(history).map((entry) => entry.message_id)).toEqual([messageId]);
@@ -528,4 +528,15 @@ it("deduplicates canonical retries before quotas, survives restart, and expires 
 		expect(afterExpiry.deduplicated).not.toBe(true);
 		expect(afterExpiry.result.message_id).not.toBe(first.result.message_id);
 	}, DEDUP_CONFIG);
+});
+
+it("answers count limits with denied and size limits with too_large (§1.1)", async () => {
+	await withStore("limit-codes", (store, clock) => {
+		const embeds = Array.from({ length: 5 }, () => ({ kind: "link", url: "https://example.com" }));
+		expect(errorCode(() => post(store, clock, "alice", "embeds", { body: { text: "x", embeds } }))).toBe("denied");
+		expect(errorCode(() => post(store, clock, "alice", "mention", { body: { text: "x", mentions: ["u".repeat(257)] } }))).toBe("too_large");
+		expect(errorCode(() => post(store, clock, "alice", "text", { body: { text: "x".repeat(5_000) } }))).toBe("too_large");
+		expect(errorCode(() => post(store, clock, "alice", "snapshot", { body: { text: "x" }, ext: { big: "y".repeat(9_000) } }))).toBe("too_large");
+		expect(errorCode(() => store.mutate(op(clock, "alice", "room", "room_set", { parent_room_id: "general", title: "T", ext: { big: "y".repeat(2_100) } })))).toBe("too_large");
+	});
 });
