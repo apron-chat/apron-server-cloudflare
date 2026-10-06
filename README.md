@@ -34,8 +34,9 @@ for a zero-overage deployment.
 - **Bring your own frontend.** Guest connections are accepted from any
   origin — even `localhost` or a browser console.
 - **Built to stay inside its plan.** Every operation is metered against
-  budgets sized under the plan's included usage, with rolling one-day
-  retention and graceful read-only degradation when budgets run out.
+  budgets sized under the plan's included usage, with rolling retention
+  (7 days on Workers Paid, which production runs, and one day on Workers
+  Free) and graceful read-only degradation when budgets run out.
 
 ## Quick start
 
@@ -44,8 +45,10 @@ npm ci
 npx wrangler dev --port 8080
 ```
 
-Then run the web client from [shazow/apron](https://github.com/shazow/apron)
-(`make dev-web`) and open <http://localhost:5173>. Check your work with:
+Then run the web client from
+[apron-chat/apron-web](https://github.com/apron-chat/apron-web) with
+`npm run dev` (see its README); its dev server proxies `/ws` to port 8080.
+Open <http://localhost:5173>. Check your work with:
 
 ```sh
 npm run typecheck

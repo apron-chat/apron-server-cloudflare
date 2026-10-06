@@ -11,9 +11,11 @@ discoverable passkeys, complete-snapshot history, message
 replacement/deletion/restoration/moves, thread rooms, emoji reactions, and a
 rolling retention floor. Guests only read (set `GUEST_POSTING=true` to let
 them post); signing in with a passkey lets a user post and invite a bot. It speaks protocol 8 with `history`,
-`edit`, `rooms`, `reactions`, and `command` (`/help` and `/invite-bot`), and
-advertises liveness pings and, with the Workers Paid budgets, typing through
-`activity` (`ACTIVITY` overrides); see [authentication and policy](policy.md) and [the
+`edit`, `rooms`, `reactions`, `command` (`/help`, `/invite-bot`, and admin
+commands), and `ext` with its own extension `ext:settings`; `embed:upload`
+when uploads are configured; `status` and push when VAPID keys are set; and
+liveness pings and, with the Workers Paid budgets, typing through `activity`
+(`ACTIVITY` overrides); see [authentication and policy](policy.md) and [the
 implementation specification](../SPEC.md).
 
 ## Budgets, sessions, and analytics
@@ -63,9 +65,9 @@ with local limits alone; configure the optional analytics secret above to enable
 the delayed account-wide safety stop.
 
 `npx wrangler dev --port 8080` serves the development Worker. To use it with the
-web client, run the frontend from [shazow/apron](https://github.com/shazow/apron)
-(`make dev-web`) in another terminal and open `http://localhost:5173`; its dev
-proxy connects to port 8080. Use **localhost**, matching the development passkey
+web client, check out [apron-chat/apron-web](https://github.com/apron-chat/apron-web),
+follow its README (`npm ci`, then `npm run dev`) in another terminal, and open
+`http://localhost:5173`; its dev proxy connects `/ws` to port 8080. Use **localhost**, matching the development passkey
 RP ID and origin. Wrangler persists local SQLite state between runs. Do not
 delete its state while investigating restart-safe quotas or identity recovery.
 
@@ -74,11 +76,13 @@ npm run typecheck
 npm test
 ```
 
-`npm test` runs pure-policy and actual Workers runtime tests. The end-to-end
-browser test, which drives the web client against this Worker with Chromium's
-virtual authenticator and the real verifier, lives with the web client in
-[shazow/apron](https://github.com/shazow/apron). Tests use local resources,
-never production account quotas.
+`npm test` runs pure-policy and actual Workers runtime tests. Tests use local
+resources, never production account quotas. There is no browser test against
+this Worker: the browser interoperability tests, which drive the web client
+with Chromium (and its virtual authenticator), run against the Go reference
+server in [apron-chat/apron-server-go](https://github.com/apron-chat/apron-server-go)
+(`tests/interop`). Check passkey and client changes against this Worker by
+hand with the web client, as above.
 
 On NixOS, enter `devenv shell` before running Wrangler or Workers tests. The
 repository sets `MINIFLARE_WORKERD_PATH` to a launcher using Nix's ELF loader
@@ -294,7 +298,8 @@ persist across deploys.
 
 The production backend at `wss://server.apron.chat/` uses
 `wrangler.production.toml`. The frontend is deployed separately at
-`https://web.apron.chat` using `clients/web/wrangler.toml`; `apron.chat` is
+`https://web.apron.chat` from [apron-chat/apron-web](https://github.com/apron-chat/apron-web)
+using its `wrangler.toml`; `apron.chat` is
 reserved for static documentation. The production backend has no static assets.
 WebSocket upgrades use `/` or `/ws`.
 The default development Worker is `apron-cloudflare-demo-dev`; it is separate
@@ -312,9 +317,10 @@ local storage is origin-specific, so saved names and server preferences do not
 move from the apex automatically.
 
 Merging to `main` deploys the backend (see
-[continuous deployment](#continuous-deployment)). The frontend is deployed from
-[shazow/apron](https://github.com/shazow/apron) with `make deploy-web`, which
-builds it with `wss://server.apron.chat/` as its default server. For manual
+[continuous deployment](#continuous-deployment)). The frontend deploys from
+[apron-chat/apron-web](https://github.com/apron-chat/apron-web): Cloudflare
+Workers Builds deploys it on a merge to its `main`, built with
+`wss://server.apron.chat/` as its default server (see its README). For manual
 Wrangler commands, authenticate from `devenv shell`:
 
 ```sh
@@ -350,8 +356,8 @@ For direct Wrangler production commands, always pass
    passkey RP ID `apron.chat` and the explicit, exact `RP_ORIGINS` allowlist;
    wildcard guest admission never enables wildcard passkey verification.
    RP changes can make previously registered credentials unusable.
-4. Build the frontend, check the static-asset output, and run all checks plus
-   the browser test in shazow/apron. Review the lockfile and compatibility date together.
+4. Run all checks here, and check the matching frontend in apron-chat/apron-web
+   (its CI runs `npm run check`, `npm test` and `npm run build`). Review the lockfile and compatibility date together.
 5. Review `wrangler.production.toml`: fixed DO binding, `new_sqlite_classes` migration,
    no paid-service bindings. Apply the initial migration once using the normal
    Wrangler deployment workflow. Do not rename or recreate the production
@@ -369,14 +375,15 @@ For direct Wrangler production commands, always pass
    the storage schema otherwise resets the demo on the object's first wake.
    All chat history, rooms,
    sessions, bot tokens, and limiter windows are deleted, and saved session
-   tokens fall back to sign-in. Registered passkeys survive: up to 100 of the
+   tokens fall back to sign-in. Registered passkeys survive a reset from
+   schema 7 or later (an older object carries none): up to 100 of the
    most recently used are carried over with their identities, so users sign in
    with the passkey they already have; older ones past that cap must be
    registered again. Besides those, only the current day's resource
    reservations and the guest-number mark are carried over. Deploy the matching
    frontend together with this backend.
 6. When deployment is authorized, merge to `main` (or run the Deploy workflow)
-   and deploy the matching frontend from shazow/apron. Verify guest access, passkey registration/login, edits, threads, reactions, history,
+   and merge the matching frontend in apron-chat/apron-web, which deploys it. Verify guest access, passkey registration/login, edits, threads, reactions, history,
    duplicate retries, custom-origin guest access, and rejection of passkey
    requests from unapproved origins against the deployed endpoint.
 7. Exercise idle **hibernation and wake**, then a real redeploy/reconnect. Check
