@@ -143,9 +143,11 @@ it('/status sends the caller the Cloudflare usage and the demo budgets', async (
 		expect(status.notice!.params.body.format).toBe('markdown');
 		// Tests configure no account analytics, so only the object's budgets show.
 		expect(text).toContain('no usage sample');
-		expect(text).toMatch(new RegExp(`\\| SQL rows written \\| [\\d,]+ / ${DEFAULT_LIMITS.sqlWritesPerDay.toLocaleString('en-US')} \\(\\d+%\\) \\|`));
-		expect(text).toMatch(/\| Registered users \| [\d,]+ \/ 10,000/);
-		expect(text).toContain('| Database |');
+		// Lists, not GFM tables, so strict CommonMark clients render it.
+		expect(text).not.toContain('|');
+		expect(text).toMatch(new RegExp(`^- SQL rows written: [\\d,]+ / ${DEFAULT_LIMITS.sqlWritesPerDay.toLocaleString('en-US')} \\(\\d+%\\)$`, 'm'));
+		expect(text).toMatch(/^- Registered users: [\d,]+ \/ 10,000/m);
+		expect(text).toMatch(/^- Database: /m);
 	} finally { admin.close(); }
 });
 

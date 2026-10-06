@@ -4219,7 +4219,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `/status`: a `~private` notice to the sender with today's Cloudflare
+	 * `/status`: a `~private` notice to the sender, in CommonMark lists (no
+	 * tables, which strict CommonMark clients do not render), with today's Cloudflare
 	 * account usage against the Free plan's daily allowance (refreshed now
 	 * when account analytics are configured, at most once a minute), and the
 	 * object's own daily reservations against their budgets.
@@ -4239,21 +4240,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 			lines.push(
 				`**Cloudflare account, ${usage.day}** (sampled ${new Date(usage.sampledAt).toISOString().slice(11, 16)} UTC${usage.stop ? ", **stopped**: over " + Math.round(ACCOUNT_USAGE_POLICY.stopRatio * 100) + "% of a limit" : ""})`,
 				"",
-				`| | Used / ${PLAN.name} daily |`,
-				"|---|---|",
-				`| Worker requests | ${share(usage.workerRequests, daily.workerRequests)} |`,
-				`| Durable Object requests | ${share(usage.durableObjectRequests, daily.durableObjectRequests)} |`,
-				`| Durable Object duration (GB-s) | ${share(usage.durableObjectDurationGbSeconds, daily.durableObjectDurationGbSeconds)} |`,
-				`| SQL rows read | ${share(usage.sqlRowsRead, daily.sqlRowsRead)} |`,
-				`| SQL rows written | ${share(usage.sqlRowsWritten, daily.sqlRowsWritten)} |`,
-				`| Stored | ${mib(usage.storedBytes)} / ${mib(ACCOUNT_USAGE_POLICY.storedBytes)} |`,
+				`Used / ${PLAN.name} daily allowance:`,
+				`- Worker requests: ${share(usage.workerRequests, daily.workerRequests)}`,
+				`- Durable Object requests: ${share(usage.durableObjectRequests, daily.durableObjectRequests)}`,
+				`- Durable Object duration (GB-s): ${share(usage.durableObjectDurationGbSeconds, daily.durableObjectDurationGbSeconds)}`,
+				`- SQL rows read: ${share(usage.sqlRowsRead, daily.sqlRowsRead)}`,
+				`- SQL rows written: ${share(usage.sqlRowsWritten, daily.sqlRowsWritten)}`,
+				`- Stored: ${mib(usage.storedBytes)} / ${mib(ACCOUNT_USAGE_POLICY.storedBytes)}`,
 			);
 			const r2 = ACCOUNT_USAGE_POLICY.r2;
 			if (r2 && usage.r2) {
 				lines.push(
-					`| R2 Class A operations | ${share(usage.r2.classAOperations, r2.classAOperationsMonthly / 31)} |`,
-					`| R2 Class B operations | ${share(usage.r2.classBOperations, r2.classBOperationsMonthly / 31)} |`,
-					`| R2 stored | ${mib(usage.r2.storedBytes)} / ${mib(r2.storedBytes)} |`,
+					`- R2 Class A operations: ${share(usage.r2.classAOperations, r2.classAOperationsMonthly / 31)}`,
+					`- R2 Class B operations: ${share(usage.r2.classBOperations, r2.classBOperationsMonthly / 31)}`,
+					`- R2 stored: ${mib(usage.r2.storedBytes)} / ${mib(r2.storedBytes)}`,
 				);
 			}
 			const monthly = ACCOUNT_USAGE_POLICY.monthly;
@@ -4261,20 +4261,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 				const month = usage.month;
 				lines.push(
 					"",
-					`| ${month.month} | Used / ${PLAN.name} monthly (stops at ${Math.round((ACCOUNT_USAGE_POLICY.monthlyStopRatio ?? ACCOUNT_USAGE_POLICY.stopRatio) * 100)}%) |`,
-					"|---|---|",
-					`| Worker requests | ${share(month.workerRequests, monthly.workerRequests)} |`,
-					`| Worker CPU (ms) | ${share(month.workerCpuMs, monthly.workerCpuMs)} |`,
-					`| Durable Object requests | ${share(month.durableObjectRequests, monthly.durableObjectRequests)} |`,
-					`| Durable Object duration (GB-s) | ${share(month.durableObjectDurationGbSeconds, monthly.durableObjectDurationGbSeconds)} |`,
-					`| SQL rows read | ${share(month.sqlRowsRead, monthly.sqlRowsRead)} |`,
-					`| SQL rows written | ${share(month.sqlRowsWritten, monthly.sqlRowsWritten)} |`,
-					`| Log events | ${share(month.logEvents, monthly.logEvents)} |`,
+					`**${month.month}**, used / ${PLAN.name} monthly allowance (stops at ${Math.round((ACCOUNT_USAGE_POLICY.monthlyStopRatio ?? ACCOUNT_USAGE_POLICY.stopRatio) * 100)}%):`,
+					`- Worker requests: ${share(month.workerRequests, monthly.workerRequests)}`,
+					`- Worker CPU (ms): ${share(month.workerCpuMs, monthly.workerCpuMs)}`,
+					`- Durable Object requests: ${share(month.durableObjectRequests, monthly.durableObjectRequests)}`,
+					`- Durable Object duration (GB-s): ${share(month.durableObjectDurationGbSeconds, monthly.durableObjectDurationGbSeconds)}`,
+					`- SQL rows read: ${share(month.sqlRowsRead, monthly.sqlRowsRead)}`,
+					`- SQL rows written: ${share(month.sqlRowsWritten, monthly.sqlRowsWritten)}`,
+					`- Log events: ${share(month.logEvents, monthly.logEvents)}`,
 				);
 				if (r2 && month.r2) {
 					lines.push(
-						`| R2 Class A operations | ${share(month.r2.classAOperations, r2.classAOperationsMonthly)} |`,
-						`| R2 Class B operations | ${share(month.r2.classBOperations, r2.classBOperationsMonthly)} |`,
+						`- R2 Class A operations: ${share(month.r2.classAOperations, r2.classAOperationsMonthly)}`,
+						`- R2 Class B operations: ${share(month.r2.classBOperations, r2.classBOperationsMonthly)}`,
 					);
 				}
 			}
@@ -4285,18 +4284,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 			"",
 			`**Demo budgets, ${budget.day}** (reserved by this object)`,
 			"",
-			"| | Reserved / Budget |",
-			"|---|---|",
-			`| SQL rows read | ${share(budget.reads, limits.sqlReadsPerDay)} |`,
-			`| SQL rows written | ${share(budget.writes, limits.sqlWritesPerDay)} |`,
-			`| Frames | ${share(budget.frames, limits.processedFramesPerDay)} |`,
-			`| Connection admissions | ${share(budget.admissions, limits.connectionAdmissionsPerDay)} |`,
-			`| Posts | ${share(budget.posts, limits.globalPostsPerDay)} |`,
-			`| Registrations | ${share(budget.registrations, limits.registrationsPerDay)} |`,
-			...(this.config.push && PUSH_POLICY ? [`| Pushes | ${share(this.store.pushesToday(now), PUSH_POLICY.pushesPerDay)} |`] : []),
-			`| Registered users | ${share(identities, limits.registeredIdentityCount)} |`,
-			`| Open connections | ${share(this.ctx.getWebSockets().length, limits.openConnections)} |`,
-			`| Database | ${databaseBytes === null ? "unknown" : mib(databaseBytes)} / ${mib(limits.databaseHardTargetBytes)} |`,
+			"Reserved / budget:",
+			`- SQL rows read: ${share(budget.reads, limits.sqlReadsPerDay)}`,
+			`- SQL rows written: ${share(budget.writes, limits.sqlWritesPerDay)}`,
+			`- Frames: ${share(budget.frames, limits.processedFramesPerDay)}`,
+			`- Connection admissions: ${share(budget.admissions, limits.connectionAdmissionsPerDay)}`,
+			`- Posts: ${share(budget.posts, limits.globalPostsPerDay)}`,
+			`- Registrations: ${share(budget.registrations, limits.registrationsPerDay)}`,
+			...(this.config.push && PUSH_POLICY ? [`- Pushes: ${share(this.store.pushesToday(now), PUSH_POLICY.pushesPerDay)}`] : []),
+			`- Registered users: ${share(identities, limits.registeredIdentityCount)}`,
+			`- Open connections: ${share(this.ctx.getWebSockets().length, limits.openConnections)}`,
+			`- Database: ${databaseBytes === null ? "unknown" : mib(databaseBytes)} / ${mib(limits.databaseHardTargetBytes)}`,
 		);
 		this.sendNotice(socket, roomId, lines.join("\n"));
 		this.reply(socket, request, {});
