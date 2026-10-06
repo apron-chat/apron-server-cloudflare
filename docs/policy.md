@@ -37,8 +37,12 @@ within it:
   identity has joined `general`; posting to a room does not require joining it.
   Only thread rooms under `general` may be created with `room_set` (top-level
   rooms and nested threads are `denied`), which joins the creator; any
-  participant may save a thread's `title`, `description` (Markdown by
+  participant may save a thread's `title`, `description` (CommonMark by
   convention), and `ext`, together at most 2 KiB, while `general` is fixed.
+  Saves of messages and rooms merge `ext` one level deep: each key sent
+  replaces its value, an empty one (`""`, `[]`, `{}`) removes it, and keys
+  left out stay; the size limits apply to the merged result. A deleted
+  message keeps no `ext`.
   Threads always carry a title (`Thread` by default). No room is private:
   creating one with `private: true` is `unsupported`. `room_join` and
   `room_leave` work for `general` and threads, and changes arrive as

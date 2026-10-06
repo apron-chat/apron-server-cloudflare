@@ -963,6 +963,28 @@ function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
+/** An empty value (`""`, `[]`, `{}`), which clears a key in a merge (protocol §3.3). */
+function emptyValue(value: unknown): boolean {
+  return value === "" || (Array.isArray(value) && value.length === 0) || (isPlainObject(value) && Object.keys(value).length === 0);
+}
+
+/**
+ * Merges a write's `ext` into the stored one, one level deep (protocol §3.5):
+ * each key the write carries replaces the stored value whole, a key whose
+ * value is empty (`""`, `[]`, `{}`) is removed, and keys it leaves out stay.
+ * `null` is an ordinary value. Without a write, or with `{}`, the stored
+ * `ext` is unchanged. Undefined when nothing is left. Built from entries, so
+ * a `"__proto__"` key is an ordinary own key, never a prototype.
+ */
+function mergeExt(stored: unknown, write: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  const merged = new Map<string, unknown>(isPlainObject(stored) ? Object.entries(stored) : []);
+  for (const [key, value] of Object.entries(write ?? {})) {
+    if (emptyValue(value)) merged.delete(key);
+    else merged.set(key, value);
+  }
+  return merged.size ? clone(Object.fromEntries(merged)) : undefined;
+}
+
 function dayFor(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10);
 }
@@ -3991,7 +4013,9 @@ export class Store {
       body = this.normalizedBody(params.body);
       if (body.text === "" && (body.embeds as unknown[]).length === 0) throw new StoreError("invalid_params", "message cannot be empty");
     }
-    const ext = this.optionalExt(params.ext);
+    // A save merges `ext` into the current snapshot's (§3.5); a tombstone carries none (§4.4).
+    const write = this.optionalExt(params.ext);
+    const ext = deleted ? undefined : mergeExt(previous?.ext, write);
     const from = previous ? previous.from : this.identityForMessage(input);
     if (!from || typeof from.user_id !== "string") throw new StoreError("internal_error", "message author is missing");
 
@@ -4005,14 +4029,14 @@ export class Store {
       uploads = identified.uploads;
       deletedUploads = this.releaseUploadRows(this.messageUploads(messageId, identified.removed));
     }
-    // Deletion omits the body from the tombstone; the other client fields keep
-    // replacement semantics, so omitted fields are removed.
+    // Deletion omits the body and ext from the tombstone; the other client
+    // fields keep replacement semantics, so omitted fields are removed.
     const snapshot: MessageSnapshot = { message_id: messageId, log_id: idString(logId), room_id: roomId, from: clone(from) };
     if (body) snapshot.body = body;
     if (replyId !== undefined) snapshot.reply_to = { message_id: replyId };
     if (deleted) snapshot.deleted = true;
     if (ext) snapshot.ext = ext;
-    // The size policy bounds client content; the server's prev_log_id and
+    // The size policy bounds client content, the merged ext included; the server's prev_log_id and
     // prev_room_id links are added after it.
     if (utf8Bytes(JSON.stringify(snapshot)) > this.config.maxSnapshotBytes) throw new StoreError("too_large", "message snapshot is too large");
     const moved = current !== null && current.room_id !== roomId;
@@ -4871,7 +4895,8 @@ export class Store {
   }
 
   /**
-   * `room_set`: create a thread room or replace a thread room's client fields (§4.3.4).
+   * `room_set`: create a thread room or replace a thread room's client fields (§4.3.4),
+   * merging `ext` into the current one (§3.5).
    * Demo policy: only threads under a top-level room may be created, and only
    * thread rooms may be edited; the permanent `general` room is fixed. Rooms
    * are never private here: every room is visible to everyone, so a creation
@@ -4888,12 +4913,16 @@ export class Store {
     if (titleParam !== undefined && typeof titleParam !== "string") throw new StoreError("invalid_params", "title must be a string");
     const descriptionParam = params.description;
     if (descriptionParam !== undefined && typeof descriptionParam !== "string") throw new StoreError("invalid_params", "description must be a string");
-    const ext = this.optionalExt(params.ext);
+    const write = this.optionalExt(params.ext);
     // Threads always carry a title so clients that ignore parent_room_id
     // still render them (section 3.4). An empty description is no description.
     const title = typeof titleParam === "string" && titleParam.trim() !== "" ? titleParam : DEFAULT_THREAD_TITLE;
     const description = typeof descriptionParam === "string" && descriptionParam.trim() !== "" ? descriptionParam : undefined;
-    const fields: Record<string, unknown> = { title, ...(description !== undefined ? { description } : {}), ...(ext ? { ext } : {}) };
+    // `ext` merges into the room's current one (§3.5, §4.3.4); the size check runs on the result.
+    const roomFields = (stored: unknown): Record<string, unknown> => {
+      const ext = mergeExt(stored, write);
+      return { title, ...(description !== undefined ? { description } : {}), ...(ext ? { ext } : {}) };
+    };
 
     let row: RawRoomRow;
     let logId: number;
@@ -4905,6 +4934,7 @@ export class Store {
       if (!parent) throw new StoreError("invalid_params", "unknown parent_room_id");
       if (parent.parent_room_id !== null) throw new StoreError("denied", "Threads cannot be nested on this demo");
       if (this.metaNumber("thread_count") >= this.config.maxThreads) throw new StoreError("denied", "thread_limit");
+      const fields = roomFields(undefined);
       this.checkRoomFields(fields);
       logId = this.allocateLogId(context);
       const roomId = idString(logId);
@@ -4923,6 +4953,7 @@ export class Store {
       if (!existing) throw new StoreError("invalid_params", "unknown room");
       if (existing.parent_room_id === null) throw new StoreError("denied", "Top-level rooms cannot be edited on this demo");
       // parent_room_id is fixed at creation; a submitted value is ignored.
+      const fields = roomFields(parseJson<{ ext?: unknown }>(existing.fields_json, {}).ext);
       this.checkRoomFields(fields);
       logId = this.allocateLogId(context);
       const fieldsJson = JSON.stringify(fields);

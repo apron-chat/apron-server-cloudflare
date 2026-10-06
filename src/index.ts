@@ -2258,7 +2258,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * users may change their name; `name: ""` removes it, so the user falls
 	 * back to `user_id`. With uploads, `avatar: ""` removes a registered user's
 	 * avatar; a new one comes only through `/avatar` (§4.6.6), so other values
-	 * are declined, as is `ext`. `roles` is not settable (§3.3) and is ignored.
+	 * are declined. `ext` is type-checked and ignored: this server keeps no
+	 * user `ext`, a normalization §1.1 allows, so `you` carries none. `roles`
+	 * is not settable (§3.3) and is ignored.
 	 * Where capability `status` is advertised, `status` sets the status the
 	 * user chooses (§4.11, changeChoice), guests included; elsewhere it is
 	 * ignored. A `status` that is not a string is `invalid_params`.
