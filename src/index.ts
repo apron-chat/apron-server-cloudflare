@@ -10,6 +10,7 @@ import { signUploadToken, verifyUploadToken } from "./upload-token";
 import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
 import { extractClientIp, hashIpKey, stripForwardingHeaders } from "./ip";
 import {
+	DEFINED_AUTH_SCHEMES,
 	errorFromUnknown,
 	FrameError,
 	isNotification,
@@ -1676,21 +1677,22 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	private async handleAuth(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
-		// Authentication ceremonies are request/response exchanges. Ignore auth
-		// notifications before reserving any attempt or changing attachment state.
-		if (request.id === undefined && request.params.scheme === "webauthn") return;
 		// A guest auth on an authenticated connection changes nothing: answer it
 		// without charging an attempt.
 		if (request.params.scheme === "guest" && (attachment.tier === "anonymous" || attachment.tier === "registered")) {
 			this.reply(socket, request, { you: this.you(attachment) });
 			return;
 		}
-		// A scheme this server does not offer the connection, `email` (no mail
-		// here) or `webauthn` from an origin not configured for passkeys, is
-		// `unsupported` (§3.2), before an attempt is charged.
+		// Before an attempt is charged: a scheme the spec does not define (such
+		// as an `ext:` name) is `invalid_params` (§1), and one it defines that
+		// this server does not offer the connection, `email` (no mail here) or
+		// `webauthn` from an origin not configured for passkeys, is
+		// `unsupported` (§3.2).
 		const offered = request.params.scheme;
-		if (typeof offered === "string" && offered !== "guest" && offered !== "token" && (offered !== "webauthn" || !this.passkeysOffered(this.requestOrigin(socket)))) {
-			throw { name: "unsupported", message: offered === "webauthn" ? "Passkeys are not offered to this origin" : "Unsupported authentication scheme" } satisfies ProtocolError;
+		if (typeof offered === "string") {
+			if (!DEFINED_AUTH_SCHEMES.has(offered)) throw { name: "invalid_params", message: "Unknown authentication scheme" } satisfies ProtocolError;
+			if (offered === "email") throw { name: "unsupported", message: "Email sign-in is not offered" } satisfies ProtocolError;
+			if (offered === "webauthn" && !this.passkeysOffered(this.requestOrigin(socket))) throw { name: "unsupported", message: "Passkeys are not offered to this origin" } satisfies ProtocolError;
 		}
 		this.store.reserveAuthAttempt({ ipKey: attachment.ipKey, now: nowMs() });
 		const params = request.params;
@@ -1724,7 +1726,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			else await this.handleTokenResume(socket, attachment, request);
 			return;
 		}
-		if (scheme !== "webauthn") throw { name: "unsupported", message: "Unsupported authentication scheme" } satisfies ProtocolError;
+		if (scheme !== "webauthn") throw { name: "invalid_params", message: "Unknown authentication scheme" } satisfies ProtocolError;
 		const action = requiredString(params, "action");
 		if (action !== "register" && action !== "login") throw { name: "invalid_params", message: "Unknown passkey action" } satisfies ProtocolError;
 		// A registration on a connection already signed in adds the passkey to

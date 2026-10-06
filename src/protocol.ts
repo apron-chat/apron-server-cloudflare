@@ -111,6 +111,13 @@ export const REQUEST_METHODS: ReadonlySet<string> = new Set([
 	"room_set", "reactions", "status", "push_register", "push_unregister",
 ]);
 
+/**
+ * Auth schemes the spec defines (§3.2). Any other is an unknown name, so an
+ * `auth` with it is `invalid_params` (§1); a defined one that the server does
+ * not offer is `unsupported`.
+ */
+export const DEFINED_AUTH_SCHEMES: ReadonlySet<string> = new Set(["guest", "token", "webauthn", "email"]);
+
 /** Whether `method` is one clients send only as a notification (§1.1). */
 export function notificationOnly(method: unknown): boolean {
 	return typeof method === "string" && NOTIFICATION_METHODS.has(method);

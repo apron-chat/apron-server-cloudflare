@@ -100,6 +100,23 @@ it('admits clients without Origin as guests without advertising or allowing pass
 	} finally { peer.close(); }
 });
 
+it('rejects an auth scheme the spec does not define as invalid_params, and email as unsupported', async () => {
+	const peer = await connect({ path: '/' });
+	try {
+		await greeting(peer);
+		// An unknown name that the request depends on is invalid_params (§1), before and after sign-in.
+		peer.send({ id: 'ext', method: 'auth', params: { scheme: 'ext:foo' } });
+		expect((await peer.next()).error.code).toBe(-32602);
+		// `email` is defined, but not offered here: unsupported (§3.2).
+		peer.send({ id: 'email', method: 'auth', params: { scheme: 'email', email: 'ada@example.com' } });
+		expect((await peer.next()).error.code).toBe(-32601);
+		peer.send({ id: 'auth', method: 'auth', params: { scheme: 'guest' } });
+		expect((await peer.next()).result.you.user_id).toMatch(/^guest_/);
+		peer.send({ id: 'ext2', method: 'auth', params: { scheme: 'ext:foo' } });
+		expect((await peer.next()).error.code).toBe(-32602);
+	} finally { peer.close(); }
+});
+
 it('keeps server-owned state out of public protocol frames', async () => {
 	const ip = `198.51.100.${nextIp++}`;
 	const ipHash = await hashIpKey(canonicalizeIp(ip)!);
