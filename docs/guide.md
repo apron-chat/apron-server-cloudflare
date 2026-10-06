@@ -10,7 +10,7 @@ thread rooms over hibernating WebSockets. The backend supports guest access,
 discoverable passkeys, complete-snapshot history, message
 replacement/deletion/restoration/moves, thread rooms, emoji reactions, and a
 rolling retention floor. Guests only read (set `GUEST_POSTING=true` to let
-them post); signing in with a passkey lets a user post and invite a bot. It speaks protocol 7 with `history`,
+them post); signing in with a passkey lets a user post and invite a bot. It speaks protocol 8 with `history`,
 `edit`, `rooms`, `reactions`, and `command` (`/help` and `/invite-bot`), and
 advertises liveness pings and, with the Workers Paid budgets, typing through
 `activity` (`ACTIVITY` overrides); see [authentication and policy](policy.md) and [the
@@ -356,7 +356,7 @@ For direct Wrangler production commands, always pass
    no paid-service bindings. Apply the initial migration once using the normal
    Wrangler deployment workflow. Do not rename or recreate the production
    object to work around a quota or schema issue. The current schema is 8
-   (protocol 7, with push subscriptions); schema 5, 6 and 7 objects are
+   (protocol 8, with push subscriptions); schema 5, 6 and 7 objects are
    upgraded in place on their first wake, keeping everything: schema 5's
    thread intro messages become their `description`, schema 6's admins
    and bots get their roles, and schema 7 gains the empty push tables

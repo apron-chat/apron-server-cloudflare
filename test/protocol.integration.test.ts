@@ -44,7 +44,7 @@ const connect = ({ ip = `192.0.2.${nextIp++}`, ...options }: Partial<ConnectOpti
 
 async function authenticate(peer: Peer, scheme = 'guest', extraCaps: string[] = []) {
 	const { server } = await greeting(peer);
-	expect(server.params.apron).toBe(7);
+	expect(server.params.apron).toBe(8);
 	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'status']);
 	expect(server.params.auth).toContain('webauthn');
 	expect(server.params.ping).toBe(45);
@@ -813,12 +813,12 @@ it('advertises the demo policy hints', async () => {
 	} finally { peer.close(); }
 });
 
-it('speaks protocol v7: a sign-in welcome, no email sign-in, and ~private notices', async () => {
+it('speaks protocol v8: a sign-in welcome, no email sign-in, and ~private notices', async () => {
 	const withPasskeys = await connect();
 	const bot = await connect({ origin: null });
 	try {
 		const { server, welcome } = await greeting(withPasskeys);
-		expect(server.params).toMatchObject({ apron: 7, agent: 'apron-cloudflare-demo/7', auth: ['webauthn', 'token', 'guest'] });
+		expect(server.params).toMatchObject({ apron: 8, agent: 'apron-cloudflare-demo/8', auth: ['webauthn', 'token', 'guest'] });
 		// Only the protocol's current names (0bf4a27): no `protocol`, `caps`, or `name`.
 		for (const legacy of ['protocol', 'caps', 'name']) expect(server.params).not.toHaveProperty(legacy);
 		// `server.welcome` is for the sign-in screen (§3.2), worded for this origin.
