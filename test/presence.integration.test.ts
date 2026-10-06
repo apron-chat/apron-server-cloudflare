@@ -1136,3 +1136,129 @@ describe('sign-ins, listings and attendance (apron 35c5631)', () => {
 		} finally { fresh.close(); login.close(); }
 	});
 });
+
+describe('a guest connection signing in (§3.3, apron 121cc1d)', () => {
+	beforeEach(forgetAnnouncements);
+
+	/** The `user` frames among `frames` that link an `old` identity. */
+	const links = (frames: Frame[]) => frames.filter((frame) => frame.method === 'user' && frame.params?.old !== undefined);
+
+	/** A guest whose `online` the watcher has been told. */
+	async function toldGuest(watcher: Peer): Promise<{ peer: Peer; userId: string; frames: Frame[] }> {
+		const visitor = await guest();
+		const frames = await drain(watcher);
+		expect(told(frames, visitor.userId)).toEqual(['online']);
+		return { ...visitor, frames };
+	}
+
+	it('links the guest to a new account with old: passkey registration and invite sign-up', async () => {
+		const watcherId = unique('watcher');
+		const watcher = await signedIn(watcherId);
+		const peers: Peer[] = [watcher];
+		try {
+			// Passkey registration: the same person under a new user_id.
+			const registering = await toldGuest(watcher);
+			peers.push(registering.peer);
+			const { finished } = await registerPasskey(registering.peer, 'new-account');
+			const accountId = finished.frame.result.you.user_id;
+			const linked = links(await drain(watcher));
+			expect(linked).toHaveLength(1);
+			expect(linked[0].params.old.user_id).toBe(registering.userId);
+			expect(linked[0].params.new.user_id).toBe(accountId);
+
+			// Sign-up invite: a new account too.
+			await forgetAnnouncements();
+			const joining = await toldGuest(watcher);
+			peers.push(joining.peer);
+			const invite = `apron_join_${crypto.randomUUID().replaceAll('-', '')}`;
+			const inviteKey = `join-token:${await sha256Hex(invite)}`;
+			await runInDurableObject(stub(), (_instance, state) => state.storage.put(inviteKey, { v: 1, remaining: 1, expiresMs: Date.now() + 3_600_000 }));
+			const joined = await request(joining.peer, 'join', 'auth', { scheme: 'token', token: invite, name: 'Joiner' });
+			expect(joined.error, JSON.stringify(joined.error)).toBeUndefined();
+			const joinedLinks = links(await drain(watcher));
+			expect(joinedLinks).toHaveLength(1);
+			expect(joinedLinks[0].params.old.user_id).toBe(joining.userId);
+			expect(joinedLinks[0].params.new.user_id).toBe(joined.result.you.user_id);
+		} finally { for (const peer of peers) peer.close(); }
+	}, 20_000);
+
+	it('lets the guest depart when it signs in to an existing account: no old link, offline after the grace', async () => {
+		const watcherId = unique('watcher');
+		const watcher = await signedIn(watcherId);
+		const accountId = unique('account');
+		await register(accountId);
+		const token = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).issueSession(accountId, 'http://localhost:5173', Date.now()));
+		const visitor = await toldGuest(watcher);
+		try {
+			const resumed = await exchange(visitor.peer, 'resume', 'auth', { scheme: 'token', token });
+			expect(resumed.frame.result.you.user_id).toBe(accountId);
+			const after = await drain(watcher);
+			expect(links(after)).toEqual([]);
+			// The account shows through its status, as any sign-in does.
+			expect(told(after, accountId)).toEqual(['online']);
+			// The guest departs like a guest that disconnects: offline, after the grace.
+			expect(told(after, visitor.userId)).toEqual([]);
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			expect(told(await drain(watcher), visitor.userId)).toEqual(['offline']);
+			// And is gone from connected members, with nothing left of it on the connection.
+			const members = await listing(watcher);
+			expect(members.has(visitor.userId)).toBe(false);
+			expect(members.get(accountId)).toMatchObject({ status: 'online' });
+		} finally { watcher.close(); visitor.peer.close(); }
+	});
+
+	it('never tells others that an invisible existing account connected: passkey login and invite token', async () => {
+		const watcherId = unique('watcher');
+		const watcher = await signedIn(watcherId);
+		const peers: Peer[] = [watcher];
+		try {
+			// An invisible account made with a passkey, signed out again.
+			const maker = await opened();
+			peers.push(maker);
+			const { passkey, finished } = await registerPasskey(maker, 'hidden');
+			const hiddenId = finished.frame.result.you.user_id;
+			expect((await choose(maker, 'invisible')).result.you.status).toBe('invisible');
+			await hangUp(maker, hiddenId);
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			await drain(watcher);
+			// An invisible account an invite token signs in to.
+			const invitedId = unique('invited');
+			await register(invitedId);
+			await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.setStatus({ userId: invitedId, choice: 'invisible', now: Date.now() }));
+			const invite = `apron_invite_${crypto.randomUUID().replaceAll('-', '')}`;
+			await runInDurableObject(stub(), async (_instance, state) => state.storage.put(`invite-token:${await sha256Hex(invite)}`, { v: 1, userId: invitedId }));
+
+			const seen: Frame[] = [];
+			// Passkey login on a guest's connection.
+			await forgetAnnouncements();
+			const loginGuest = await toldGuest(watcher);
+			peers.push(loginGuest.peer);
+			const begun = await request(loginGuest.peer, 'login-begin', 'auth', { scheme: 'webauthn', action: 'login', step: 'begin' });
+			const credential = await passkey.assert(begun.result.public_key);
+			const loggedIn = await request(loginGuest.peer, 'login-finish', 'auth', { scheme: 'webauthn', action: 'login', step: 'finish', challenge_id: begun.result.challenge_id, credential });
+			expect(loggedIn.result.you).toMatchObject({ user_id: hiddenId, status: 'invisible' });
+			seen.push(...await drain(watcher));
+			// An invite token on another guest's connection.
+			await forgetAnnouncements();
+			const inviteGuest = await toldGuest(watcher);
+			peers.push(inviteGuest.peer);
+			seen.push(...inviteGuest.frames);
+			const invited = await request(inviteGuest.peer, 'invited', 'auth', { scheme: 'token', token: invite });
+			expect(invited.result.you).toMatchObject({ user_id: invitedId, status: 'invisible' });
+			seen.push(...await drain(watcher));
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			seen.push(...await drain(watcher));
+
+			// No link, nothing about either account; each guest just went offline.
+			expect(links(seen)).toEqual([]);
+			expect(JSON.stringify(seen)).not.toContain(hiddenId);
+			expect(JSON.stringify(seen)).not.toContain(invitedId);
+			expect(told(seen, loginGuest.userId)).toEqual(['offline']);
+			// (`seen` holds the invite guest's own `online` from before it signed in.)
+			expect(told(seen, inviteGuest.userId)).toEqual(['online', 'offline']);
+			const members = await listing(watcher);
+			for (const id of [hiddenId, invitedId]) expect(members.get(id) ?? { status: 'offline' }, id).toMatchObject({ status: 'offline' });
+			expect(members.has(loginGuest.userId)).toBe(false);
+		} finally { for (const peer of peers) peer.close(); }
+	}, 20_000);
+});

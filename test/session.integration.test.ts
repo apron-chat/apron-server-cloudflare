@@ -268,7 +268,7 @@ it('keeps concurrent async reservations isolated from unrelated SQL work', async
 	});
 });
 
-it('sends user notifications for renames and for a guest signing in on its connection', async () => {
+it('sends user notifications for renames, and no old link for a guest signing in to an existing account', async () => {
 	await registerIdentity('user_session_notify', 'session-notify-ip');
 	const token = await issueSession('user_session_notify', 'http://localhost:5173');
 	const watcher = await connect();
@@ -281,17 +281,22 @@ it('sends user notifications for renames and for a guest signing in on its conne
 		tab.send({ id: 'guest', method: 'auth', params: { scheme: 'guest' } });
 		const { status: guestStatus, ...guest } = (await until(tab, (frame) => frame.id === 'guest')).frame.result.you;
 		expect(guestStatus).toBe('online');
-		// Signing in on a guest's connection retires the guest for everyone else.
+		// Signing in to an existing account on a guest's connection is not the
+		// same account under a new user_id (§3.3): others get no `old` link,
+		// and the account shows only through its status.
 		tab.send({ id: 'resume', method: 'auth', params: { scheme: 'token', token } });
 		expect((await until(tab, (frame) => frame.id === 'resume')).frame.result.you.user_id).toBe('user_session_notify');
-		expect((await until(watcher, (frame) => frame.method === 'user')).frame.params).toEqual({ new: { user_id: 'user_session_notify', name: 'Name of user_session_notify', roles: [], status: 'online' }, old: guest });
+		const seen = (await exchange(watcher, 'sync-resume', 'me', {})).skipped.filter((frame) => frame.method === 'user');
+		expect(seen.filter((frame) => frame.params.old !== undefined)).toEqual([]);
+		expect(seen.filter((frame) => frame.params.new?.user_id === guest.user_id && frame.params.new.name !== undefined)).toEqual([]);
+		for (const frame of seen) expect(Object.keys(frame.params.new).sort()).toEqual(['status', 'user_id']);
 
 		second.send({ id: 'resume', method: 'auth', params: { scheme: 'token', token } });
 		await until(second, (frame) => frame.id === 'resume');
 		tab.send({ id: 'rename', method: 'me', params: { name: 'Notified' } });
 		await until(tab, (frame) => frame.id === 'rename');
 		expect((await until(second, (frame) => frame.method === 'user')).frame.params).toEqual({ you: { user_id: 'user_session_notify', name: 'Notified', roles: [], status: 'online' } });
-		expect((await until(watcher, (frame) => frame.method === 'user')).frame.params).toEqual({ new: { user_id: 'user_session_notify', name: 'Notified', roles: [] } });
+		expect((await until(watcher, (frame) => frame.method === 'user' && frame.params.new?.name !== undefined)).frame.params).toEqual({ new: { user_id: 'user_session_notify', name: 'Notified', roles: [] } });
 	} finally { watcher.close(); tab.close(); second.close(); }
 });
 

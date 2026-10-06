@@ -186,8 +186,12 @@ within it:
   and `name: ""` removes the name (announced as `name: ""`). With uploads,
   `avatar: ""` removes the avatar; other `avatar` values, `ext`, and `roles`
   (which only the server assigns) are ignored. A rename sends `user` notifications to the user's other
-  connections and to users who share a room with them, as does signing in on
-  a guest's connection (`new` with the retired guest as `old`). History pages
+  connections and to users who share a room with them, as does a guest's
+  connection creating a new account (passkey registration or sign-up
+  invite: `new` with the retired guest as `old`). A guest's connection that
+  signs in to an existing account sends no such link: the guest simply
+  departs (offline after a minute's grace), and the account shows only
+  through its status, so an invisible one stays unseen. History pages
   carry no `users`: records keep the names they were logged with, and
   listings carry current ones. A `user_id` or `name` requested in `auth` is
   not honored.

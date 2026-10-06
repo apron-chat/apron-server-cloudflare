@@ -1793,8 +1793,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const stored = this.readStatusInputs(finished.identity.user_id);
 		const token = await this.issueSession(finished.identity.user_id, origin, nowMs());
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
-		const guest = attachment.tier === "anonymous" ? publicIdentity(attachment) : null;
-		const guestRooms = attachment.rooms ?? [];
+		const previous = this.guestBefore(socket, attachment);
 		attachment.tier = "registered";
 		attachment.userId = finished.identity.user_id;
 		attachment.name = finished.identity.name;
@@ -1805,7 +1804,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		writeSessionAttachment(socket, attachment);
 		this.prepareStatus(socket, stored);
 		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), token });
-		if (guest) this.announceUser(socket, this.current(attachment), [...guestRooms, ...attachment.rooms], guest);
+		this.guestLeaves(socket, attachment, previous, challenge.action === "register");
 		this.afterSignIn(socket, stored);
 		this.refreshAvatar(finished.identity.user_id);
 		await this.rescheduleAlarm();
@@ -1823,6 +1822,35 @@ export class ApronDemoServer extends DurableObject<Env> {
 			throw { name: "too_large", message: "name is too long" } satisfies ProtocolError;
 		}
 		return name;
+	}
+
+	/**
+	 * The guest a sign-in is about to replace on `socket`, as its attachment
+	 * holds it now (its rooms, chosen status, and what others were told of it),
+	 * or null when the connection is not a guest's. Read before the connection
+	 * changes, for guestLeaves.
+	 */
+	private guestBefore(socket: WebSocketConnection, attachment: ConnectionAttachment): ConnectionAttachment | null {
+		if (attachment.tier !== "anonymous") return null;
+		const current = connectionAttachment(socket) ?? attachment;
+		return { ...current, rooms: [...(current.rooms ?? attachment.rooms ?? [])] };
+	}
+
+	/**
+	 * After a guest connection signs in (§3.3): a `newAccount` (passkey
+	 * registration, sign-up invite) is the same person under a new
+	 * `user_id`, so those who shared a room with the guest or share one with
+	 * the account get `user` `new` with `old`. Signing in to an existing
+	 * account is not that: the guest departs as a guest that disconnects does
+	 * (its connected memberships go with it, and its status turns `offline`
+	 * after the offline grace, if others were told one), with no `old` link,
+	 * and the account shows only through the usual paths, so an `invisible`
+	 * or `""` account tells others nothing.
+	 */
+	private guestLeaves(socket: WebSocketConnection, attachment: ConnectionAttachment, previous: ConnectionAttachment | null, newAccount: boolean): void {
+		if (!previous?.userId) return;
+		if (newAccount) this.announceUser(socket, this.current(attachment), [...(previous.rooms ?? []), ...(attachment.rooms ?? [])], publicIdentity(previous));
+		else this.connectionGone(previous);
 	}
 
 	/**
@@ -1898,8 +1926,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
 		// Read before the connection changes, with no await after, so a failure leaves it as it was.
 		const stored = this.readStatusInputs(identity.userId);
-		const guest = attachment.tier === "anonymous" ? publicIdentity(attachment) : null;
-		const guestRooms = attachment.rooms ?? [];
+		const previous = this.guestBefore(socket, attachment);
 		attachment.tier = "registered";
 		attachment.userId = identity.userId;
 		attachment.name = identity.name;
@@ -1910,7 +1937,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		writeSessionAttachment(socket, attachment);
 		this.prepareStatus(socket, stored);
 		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), token });
-		if (guest) this.announceUser(socket, this.current(attachment), [...guestRooms, ...attachment.rooms], guest);
+		this.guestLeaves(socket, attachment, previous, false);
 		this.afterSignIn(socket, stored);
 		this.refreshAvatar(identity.userId);
 		await this.rescheduleAlarm();
@@ -1972,16 +1999,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Finishes a bearer-token sign-in that has no passkey session behind it
-	 * (a bot or the admin user): the connection becomes the identity, and those
-	 * who shared a room with the guest it replaces hear of it.
+	 * (a bot, the admin user, an invited user, or one `created` by a sign-up
+	 * invite): the connection becomes the identity, and the guest it replaces
+	 * leaves as guestLeaves has it.
 	 */
-	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[]; avatar?: string; roles: string[] }, token?: string): Promise<void> {
+	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[]; avatar?: string; roles: string[] }, token?: string, created = false): Promise<void> {
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
 		this.assertRegisteredCapacity(socket, identity.userId);
 		// Read before the connection changes, so a failure leaves it as it was.
 		const stored = this.readStatusInputs(identity.userId);
-		const guest = attachment.tier === "anonymous" ? publicIdentity(attachment) : null;
-		const guestRooms = attachment.rooms ?? [];
+		const previous = this.guestBefore(socket, attachment);
 		attachment.tier = "registered";
 		attachment.userId = identity.userId;
 		attachment.name = identity.name;
@@ -1992,7 +2019,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		writeSessionAttachment(socket, attachment);
 		this.prepareStatus(socket, stored);
 		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), ...(token ? { token } : {}) });
-		if (guest) this.announceUser(socket, this.current(attachment), [...guestRooms, ...attachment.rooms], guest);
+		this.guestLeaves(socket, attachment, previous, created);
 		this.afterSignIn(socket, stored);
 		this.refreshAvatar(identity.userId);
 		await this.rescheduleAlarm();
@@ -2050,7 +2077,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!identity) throw { name: "internal_error", message: "Invited user is missing" } satisfies ProtocolError;
 			// A reply lost after this point costs one use: the user exists, with a
 			// token nobody received, until an admin /purges them.
-			await this.signInKeyless(socket, attachment, request, identity, own);
+			await this.signInKeyless(socket, attachment, request, identity, own, true);
 		});
 	}
 
