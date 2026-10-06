@@ -224,9 +224,14 @@ it('signs in as the admin user with APRON_ADMIN_TOKEN from anywhere, once it is 
 	const second = await connect();
 	try {
 		await first.next();
-		const auth = await request(first, 'auth', 'auth', { scheme: 'token', token: adminToken });
+		const exchanged = await exchange(first, 'auth', 'auth', { scheme: 'token', token: adminToken });
+		const auth = exchanged.frame;
 		expect(auth.result).toEqual({ you: { user_id: 'admin', name: 'Admin', roles: ['admin'], status: 'online' } });
-		// Created on first use, it starts in general.
+		// Created on first use, it starts in general: its logged join reaches
+		// this connection after the auth result (§3.2), not before.
+		const adminJoin = (frame: { method?: string; params?: any }) => frame.method === 'room_update' && frame.params?.memberships?.[0]?.members?.[0]?.user?.user_id === 'admin';
+		expect(exchanged.skipped.some(adminJoin)).toBe(false);
+		expect((await until(first, adminJoin)).frame.params.memberships[0]).toMatchObject({ room_id: 'general', members: [{ user: { user_id: 'admin' }, joined: true }] });
 		expect((await request(first, 'rooms', 'room_list', { filter: 'joined' })).result.joined.map((room: { room_id: string }) => room.room_id)).toEqual(['general']);
 		const posted = await request(first, 'post', 'message', { room_id: 'general', body: { text: 'testing' } });
 		expect(posted.result.message_id).toBeDefined();

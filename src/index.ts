@@ -248,6 +248,8 @@ const PING_REQUEST = '{"method":"ping"}';
 const PING_RESPONSE = '{"method":"pong"}';
 /** Joined room IDs a connection attachment may carry: every room, with slack for removals in flight. */
 const MAX_ATTACHED_ROOMS = 2 * (MAX_THREAD_LIMIT + 1);
+/** At most how many frames a connection's sign-in holds for it (holdDeliveries). */
+const MAX_HELD_FRAMES = 256;
 /**
  * Sign-up invites (`/invite`, protocol Appendix B): one token that creates a
  * new registered user on each use, up to its count. What they look like, the
@@ -771,6 +773,13 @@ function leftUpdate(roomId: string, membership?: Broadcast): Record<string, unkn
 }
 
 /** A `room_update` notification (§4.3.3) with one field. */
+/** The frame that delivers a committed record: a membership goes in `room_update` `memberships` (§4.3.3). */
+function recordFrame(record: Broadcast): Record<string, unknown> {
+	return record.method === "membership"
+		? { method: "room_update", params: { memberships: [record.params] } }
+		: { method: record.method, params: record.params };
+}
+
 function roomUpdate(field: "joined" | "updated" | "left", ...records: unknown[]): Record<string, unknown> {
 	return { method: "room_update", params: { [field]: records } };
 }
@@ -1037,6 +1046,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private accountUsageRefresh?: Promise<void>;
 	private accountUsageSnapshot: AccountUsageSnapshot | null = null;
 	private readonly queues = new WeakMap<WebSocketConnection, Promise<void>>();
+	/**
+	 * Frames held for a connection while a sign-in that commits records is in
+	 * flight (holdDeliveries), sent in order after its `auth` result. In
+	 * memory: the object cannot hibernate while the handler awaits.
+	 */
+	private readonly held = new Map<WebSocketConnection, unknown[]>();
 	/**
 	 * Room IDs known to exist (true) or not (false), so relaying activity needs
 	 * no storage read. Lost on hibernation and refilled from listings, record
@@ -1514,6 +1529,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.fail(socket, request, failure);
 			this.recordViolation(socket, failure);
 		}
+		// A sign-in that failed after holding deliveries sends them after its error.
+		this.releaseDeliveries(socket);
 		if (!this.alarmKnown) await this.rescheduleAlarm();
 	}
 
@@ -1739,6 +1756,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (!challenge || !matchingChallenge || challenge.action !== action) throw { name: "denied", message: "Passkey challenge is missing or expired" } satisfies ProtocolError;
 		const credential = passkeyCredentialParam(params, action);
+		// A registration's logged joins, and anything else for this connection,
+		// wait for the `auth` result (§3.2). processFrame releases them if the
+		// step fails.
+		this.holdDeliveries(socket);
 		// A signed-in user's avatar, for the connection's current object (§4.8.6).
 		let avatar: string | undefined;
 		let roles: string[] = [];
@@ -1757,9 +1778,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 				}
 				// A guest registering on its connection keeps the rooms it had joined.
 				const identity = this.store.registerIdentity({ ...input, ...(attachment.tier === "anonymous" && attachment.rooms ? { rooms: attachment.rooms } : {}) });
-				// Each starting room's logged join goes to the room's members, this
-				// connection among them, before anything else can commit (§4.3.2).
-				for (const record of identity.broadcasts) this.broadcastRecord(record);
+				// Each starting room's logged join goes to the room's other members
+				// before anything else can commit (§4.3.2), and to this connection
+				// after its `auth` result (§3.2).
+				for (const record of identity.broadcasts) this.broadcastHeld(socket, record);
 				return { user_id: identity.userId, name: identity.name, tier: "registered" };
 			},
 			updateCredentialCounter: (credentialId, counter) => this.store.updateCredentialCounter(credentialId, counter),
@@ -1782,6 +1804,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				} } });
 			}
 			this.reply(socket, request, { you: this.you(latest) });
+			this.releaseDeliveries(socket);
 			await this.rescheduleAlarm();
 			return;
 		}
@@ -1804,6 +1827,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		writeSessionAttachment(socket, attachment);
 		this.prepareStatus(socket, stored);
 		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), token });
+		this.releaseDeliveries(socket);
 		this.guestLeaves(socket, attachment, previous, challenge.action === "register");
 		this.afterSignIn(socket, stored);
 		this.refreshAvatar(finished.identity.user_id);
@@ -1989,8 +2013,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async handleAdminToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		return this.withSessionLock(async () => {
 			if (attachment.tier === "registered") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
+			// On first use, the admin's logged join reaches this connection after
+			// its `auth` result (§3.2); signInKeyless releases it.
+			this.holdDeliveries(socket);
 			const created = this.store.ensureAdminUser({ userId: ADMIN_USER_ID, name: ADMIN_USER_NAME, now: nowMs(), ipKey: attachment.ipKey });
-			for (const record of created.broadcasts) this.broadcastRecord(record);
+			for (const record of created.broadcasts) this.broadcastHeld(socket, record);
 			const identity = this.store.getIdentity(ADMIN_USER_ID);
 			if (!identity) throw { name: "internal_error", message: "Admin user is missing" } satisfies ProtocolError;
 			await this.signInKeyless(socket, attachment, request, identity);
@@ -2019,6 +2046,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		writeSessionAttachment(socket, attachment);
 		this.prepareStatus(socket, stored);
 		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), ...(token ? { token } : {}) });
+		this.releaseDeliveries(socket);
 		this.guestLeaves(socket, attachment, previous, created);
 		this.afterSignIn(socket, stored);
 		this.refreshAvatar(identity.userId);
@@ -2058,9 +2086,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// A connection gone before the sign-up spends no use.
 				if (!open()) return null;
 				const userId = candidateUserIdFor(name, (candidate) => this.store.userIdTaken(candidate));
+				// The new user's logged joins reach this connection after its
+				// `auth` result (§3.2); signInKeyless releases them.
+				this.holdDeliveries(socket);
 				await this.runMutation(async () => {
 					const created = this.store.createInvitedIdentity({ userId, name, now: nowMs(), ipKey: attachment.ipKey });
-					for (const record of created.broadcasts) this.broadcastRecord(record);
+					for (const record of created.broadcasts) this.broadcastHeld(socket, record);
 				});
 				// One put of three keys, with no await between creation and it: the
 				// new user's token and pointer, and the invite counted down (a
@@ -4755,10 +4786,37 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * their `joined` or `left`.
 	 */
 	private broadcastRecord(record: Broadcast, exceptUser?: string): void {
-		const frame = record.method === "membership"
-			? { method: "room_update", params: { memberships: [record.params] } }
-			: { method: record.method, params: record.params };
-		this.deliver(frame, record.rooms, exceptUser === undefined ? undefined : (state) => state.userId !== exceptUser);
+		this.deliver(recordFrame(record), record.rooms, exceptUser === undefined ? undefined : (state) => state.userId !== exceptUser);
+	}
+
+	/**
+	 * A record a sign-in on `socket` committed, such as the new identity's
+	 * logged join: the room's other members get it now, and `socket` after
+	 * its `auth` result (§3.2), whether or not it was a member before.
+	 */
+	private broadcastHeld(socket: WebSocketConnection, record: Broadcast): void {
+		const frame = recordFrame(record);
+		this.deliver(frame, record.rooms, undefined, socket);
+		const held = this.held.get(socket);
+		if (held) held.push(frame);
+		else this.deliverTo(socket, frame);
+	}
+
+	/**
+	 * Holds what is delivered to `socket` until releaseDeliveries, so a
+	 * sign-in's notifications follow its `auth` result (§3.2) while the
+	 * connection's order is kept.
+	 */
+	private holdDeliveries(socket: WebSocketConnection): void {
+		if (!this.held.has(socket)) this.held.set(socket, []);
+	}
+
+	/** Sends what holdDeliveries held, in order, to the connection as it is now. */
+	private releaseDeliveries(socket: WebSocketConnection): void {
+		const held = this.held.get(socket);
+		if (!held) return;
+		this.held.delete(socket);
+		for (const frame of held) this.deliverTo(socket, frame);
 	}
 
 	/**
@@ -4778,7 +4836,22 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** Sends to one connection if it is authenticated; a failed send closes it so its client recovers. */
 	private deliverTo(socket: WebSocketConnection, value: unknown): void {
 		const attachment = connectionAttachment(socket);
-		if (!attachment || attachment.closing || (attachment.tier !== "anonymous" && attachment.tier !== "registered")) return;
+		if (!attachment || attachment.closing) return;
+		const held = this.held.get(socket);
+		if (held) {
+			// Bounded: a sign-in holds for one verification or key-value round
+			// trip. Past the bound the connection recovers by reconnecting.
+			if (held.length < MAX_HELD_FRAMES) held.push(value);
+			else {
+				this.held.delete(socket);
+				attachment.closing = true;
+				writeAttachment(socket, attachment);
+				try { socket.close(1011, "Delivery interrupted; reconnect to recover"); } catch { /* closed */ }
+				this.connectionGone(attachment);
+			}
+			return;
+		}
+		if (attachment.tier !== "anonymous" && attachment.tier !== "registered") return;
 		if (!this.send(socket, value)) {
 			const latest = connectionAttachment(socket) ?? attachment;
 			if (latest.closing) return;

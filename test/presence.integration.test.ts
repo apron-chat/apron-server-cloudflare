@@ -1262,3 +1262,31 @@ describe('a guest connection signing in (§3.3, apron 121cc1d)', () => {
 		} finally { for (const peer of peers) peer.close(); }
 	}, 20_000);
 });
+
+describe('a sign-in that logs joins', () => {
+	/** The `room_update` frames carrying a logged membership of `userId`. */
+	const joins = (frames: Frame[], userId: string) => frames.filter((frame) => frame.method === 'room_update' &&
+		frame.params.memberships?.some((record: { members: Array<{ user: { user_id: string } }> }) => record.members.some((entry) => entry.user.user_id === userId)));
+
+	it('sends a new account\'s logged joins to its own connection after the auth result, and to other members at once (§3.2)', async () => {
+		const watcher = await guest();
+		const fresh = await opened();
+		const { peer: visitor } = await guest();
+		try {
+			// A connection not signed in yet gets the join after its result.
+			const { finished } = await registerPasskey(fresh, 'fresh');
+			const freshId = finished.frame.result.you.user_id;
+			expect(joins(finished.skipped, freshId)).toEqual([]);
+			expect(joins(await drain(fresh), freshId)).toHaveLength(1);
+			// So does a guest's connection, though it was in general already.
+			const { finished: upgraded } = await registerPasskey(visitor, 'visitor');
+			const upgradedId = upgraded.frame.result.you.user_id;
+			expect(joins(upgraded.skipped, upgradedId)).toEqual([]);
+			expect(joins(await drain(visitor), upgradedId)).toHaveLength(1);
+			// Other members of general got each one.
+			const seen = await drain(watcher.peer);
+			expect(joins(seen, freshId)).toHaveLength(1);
+			expect(joins(seen, upgradedId)).toHaveLength(1);
+		} finally { watcher.peer.close(); fresh.close(); visitor.close(); }
+	});
+});

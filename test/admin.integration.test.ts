@@ -506,10 +506,16 @@ it('/invite mints a sign-up token that creates a user per use, each with its own
 		// A guest signs up with it: a new registered user, named as asked, with its own token.
 		const ada = await fresh();
 		await request(ada, 'guest', 'auth', { scheme: 'guest' });
-		const signedUp = await request(ada, 'join', 'auth', { scheme: 'token', token: invite, name: 'Ada' });
+		const joined = await exchange(ada, 'join', 'auth', { scheme: 'token', token: invite, name: 'Ada' });
+		const signedUp = joined.frame;
 		expect(signedUp.result.you).toEqual({ user_id: expect.stringMatching(/^ada_\d{4}$/), name: 'Ada', roles: [], status: 'online' });
 		expect(signedUp.result.token).toMatch(/^apron_invite_/);
 		const adaId = signedUp.result.you.user_id;
+		// The new user's logged join of general reaches the guest's connection,
+		// already in general, after the auth result (§3.2), not before.
+		const joinOf = (userId: string) => (frame: Frame) => frame.method === 'room_update' && frame.params?.memberships?.[0]?.members?.[0]?.user?.user_id === userId;
+		expect(joined.skipped.some(joinOf(adaId))).toBe(false);
+		expect((await until(ada, joinOf(adaId))).frame.params.memberships[0]).toMatchObject({ room_id: 'general', members: [{ joined: true }] });
 		// Posting works, and the saved token signs in again as the same user.
 		expect((await request(ada, 'post', 'message', { room_id: 'general', body: { text: 'hi from an invite' } })).result.message_id).toBeDefined();
 		const again = await fresh();
@@ -518,7 +524,11 @@ it('/invite mints a sign-up token that creates a user per use, each with its own
 		// A second use makes another user; the third finds the invite used up.
 		const second = await fresh();
 		// Without a name, a sign-up is a "Member" (not "Guest", which names guests).
-		expect((await request(second, 'join', 'auth', { scheme: 'token', token: invite })).result.you).toMatchObject({ user_id: expect.stringMatching(/^member_\d{4}$/), name: 'Member' });
+		const member = await exchange(second, 'join', 'auth', { scheme: 'token', token: invite });
+		expect(member.frame.result.you).toMatchObject({ user_id: expect.stringMatching(/^member_\d{4}$/), name: 'Member' });
+		// A connection that was not signed in gets the join after the result too.
+		expect(member.skipped.some(joinOf(member.frame.result.you.user_id))).toBe(false);
+		await until(second, joinOf(member.frame.result.you.user_id));
 		const third = await fresh();
 		expect((await request(third, 'join', 'auth', { scheme: 'token', token: invite, name: 'Late' })).error.code).toBe(-32001);
 		// The used-up invite was dropped when it was tried.
