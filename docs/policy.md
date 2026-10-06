@@ -248,7 +248,7 @@ the client: it drops the stored token, and the connection returns as a fresh
 guest.
 
 Guests only read unless the deployment sets `GUEST_POSTING=true`
-(`ext.demo.guest_posting` says which): they can list rooms, read any room's
+(`ext.settings.guest_posting` says which): they can list rooms, read any room's
 history without joining it, and run `/help`, and stay in `general`, where
 authentication put them. Posting, reacting, joining, leaving, and creating or
 editing threads are writes, `denied` ("Guests can only read here; sign in with
@@ -275,14 +275,15 @@ with IDs are deduplicated per identity for 24 hours; clients must not retry
 older operations indefinitely. Matching retries do not consume posting quota,
 but do consume frame and lookup resources.
 
-## Demo policy metadata
+## Server settings
 
-`server.params.ext.demo` describes retention and selected payload/posting policies,
-and what the demo does not keep: `read_cursors: false` (read markers are
-dropped), so clients can skip sending them. The ping interval is the standard
-`server.params.ping`. `demo` is this implementation's extension name: under
-the protocol's extension naming rule, extension `ext:demo` keeps its data in
-`ext.demo`, and it defines no other names.
+The `server` frame advertises `ext:settings`, this implementation's
+extension, and carries its data in `server.params.ext.settings`, as the
+protocol's extension naming rule has it: two booleans, which a client takes
+as `true` when absent. `guest_posting` says whether guests may post, react,
+join and leave rooms, and create threads (`GUEST_POSTING`), and
+`read_cursors: false` says read markers are dropped, so clients can skip
+sending them. The ping interval is the standard `server.params.ping`.
 The demo's 16 KiB frame policy is an explicit exception to the base protocol's
 advisory 256 KiB recommendation. Payload lengths count UTF-8 bytes. Errors use
 the base protocol codes; `retry_after` includes `data.retry_after`, whole

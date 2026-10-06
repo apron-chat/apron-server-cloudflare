@@ -53,7 +53,7 @@ it('tells a guest it only reads, then denies its writes, joins and leaves includ
 	const guest = await connect();
 	try {
 		const { server, welcome } = await greeting(guest);
-		expect(server.params.ext.demo.guest_posting).toBe(false);
+		expect(server.params.ext.settings.guest_posting).toBe(false);
 		// The welcome follows the server frame, before any auth (Appendix B):
 		// transient (§3.5), with no room_id since the client knows no rooms yet.
 		// Where guests only read, it says so after the server version.

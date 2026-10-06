@@ -1379,6 +1379,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 					// The `ext` clients write on users, messages, and rooms is kept,
 					// and writes merge it one level deep (§4.12).
 					"ext",
+					// This server's extension: `ext.settings` below.
+					"ext:settings",
 				],
 				// Passkeys and their session tokens only where passkeys are offered;
 				// bot tokens (`/invite-bot`) from anywhere, since bots are not browsers.
@@ -1399,29 +1401,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// others are shown them: with presence off a choice is still kept,
 				// but nobody sees `dnd` or `invisible`, so clients offer neither.
 				...(presence ? { status: [...OPTIONAL_STATUS_CHOICES] } : {}),
-				ext: {
-					demo: {
-						retention_seconds: limits.retentionSeconds,
-						cleanup_seconds: limits.cleanupSeconds,
-						max_frame_bytes: limits.maxFrameBytes,
-						max_message_text_bytes: limits.maxTextBytes,
-						max_snapshot_bytes: limits.maxSnapshotBytes,
-						guest_posts_per_minute: limits.anonymousPostsPerMinute,
-						registered_posts_per_minute: limits.registeredPostsPerMinute,
-						// `false`: guests only read; posting, reacting, and room changes need a sign-in.
-						guest_posting: this.config.guestPosting,
-						server_frames_per_minute: limits.globalFramesPerMinute,
-						room_list_per_minute: limits.roomListRequestsPerUserMinute,
-						// Registered members listed per room in `members`; connected ones are always listed.
-						room_list_members: limits.roomListMembers,
-						// `read_message_id` in `activity` is dropped: no read cursors are kept.
-						read_cursors: false,
-						// With `activity`, typing is relayed; read cursors are neither kept nor relayed.
-						...(this.activityOn() ? { activity_per_minute: limits.activityBroadcastsPerUserMinute } : {}),
-						// User `status` shown to others (§4.5); a change may wait this long.
-						...(presence ? { presence, status_delay_seconds: Math.max(limits.statusCoalesceSeconds, limits.offlineGraceSeconds) } : {}),
-					},
-				},
+				// Extension `ext:settings`, this server's own: what clients can do
+				// here beyond the capabilities. Each key is a boolean, and a client
+				// takes an absent one as true. `guest_posting`: guests may post,
+				// react, join and leave rooms, and create threads; `false` here
+				// unless GUEST_POSTING is on. `read_cursors`: an `activity`
+				// `read_message_id` is kept or relayed; always `false` here.
+				ext: { settings: { guest_posting: this.config.guestPosting, read_cursors: false } },
 			},
 		};
 	}

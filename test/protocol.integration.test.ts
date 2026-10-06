@@ -1,6 +1,6 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { expect, it, vi } from 'vitest';
-import { DEFAULT_FEATURES, DEFAULT_LIMITS } from '../src/budget';
+import { DEFAULT_LIMITS } from '../src/budget';
 import { canonicalizeIp, hashIpKey } from '../src/ip';
 import { connect as open, exchange, greeting, reply, request, until, type ConnectOptions, type Frame, type Peer } from './helpers/socket';
 
@@ -45,11 +45,11 @@ const connect = ({ ip = `192.0.2.${nextIp++}`, ...options }: Partial<ConnectOpti
 async function authenticate(peer: Peer, scheme = 'guest', extraCaps: string[] = []) {
 	const { server } = await greeting(peer);
 	expect(server.params.apron).toBe(8);
-	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'status', 'ext']);
+	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'status', 'ext', 'ext:settings']);
 	expect(server.params.auth).toContain('webauthn');
 	expect(server.params.ping).toBe(45);
-	// Demo hints live under the standard ext object, not a top-level key.
-	expect(server.params.ext.demo.retention_seconds).toBeGreaterThan(0);
+	// The extension `ext:settings` keeps its data under its name in ext (§1, §4.12).
+	expect(Object.keys(server.params.ext)).toEqual(['settings']);
 	peer.send({ method: 'auth', id: 'auth', params: { scheme } });
 	const auth = await peer.next();
 	expect(auth.result.you.user_id).toMatch(/^guest_/);
@@ -812,28 +812,17 @@ it('never closes the connection whose frame starts a sweep as stale, though it l
 	} finally { vi.restoreAllMocks(); alice.close(); bob.close(); await configure((config) => { config.limits.pingTimeoutSeconds = 150; }); }
 });
 
-it('advertises the demo policy hints', async () => {
+it('advertises the extension ext:settings', async () => {
 	const peer = await connect();
 	try {
-		expect((await peer.next()).params.ext.demo).toEqual({
-			retention_seconds: DEFAULT_LIMITS.retentionSeconds,
-			cleanup_seconds: DEFAULT_LIMITS.cleanupSeconds,
-			max_frame_bytes: 16_384,
-			max_message_text_bytes: 4_096,
-			max_snapshot_bytes: 8_192,
-			guest_posts_per_minute: 5,
-			registered_posts_per_minute: 20,
+		const server = (await peer.next()).params;
+		expect(server.capabilities).toContain('ext:settings');
+		// Both booleans, always sent; clients take an absent one as true.
+		expect(server.ext).toEqual({ settings: {
 			// vitest.config.ts turns guest posting on.
 			guest_posting: true,
-			server_frames_per_minute: DEFAULT_LIMITS.globalFramesPerMinute,
-			room_list_per_minute: 6,
-			// Registered members listed per room in `members`, besides connected ones.
-			room_list_members: DEFAULT_LIMITS.roomListMembers,
 			read_cursors: false,
-			// User status shown to others; a change waits at most a minute.
-			presence: DEFAULT_FEATURES.presence,
-			status_delay_seconds: Math.max(DEFAULT_LIMITS.statusCoalesceSeconds, DEFAULT_LIMITS.offlineGraceSeconds),
-		});
+		} });
 	} finally { peer.close(); }
 });
 
