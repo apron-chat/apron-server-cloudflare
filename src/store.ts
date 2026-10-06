@@ -2745,7 +2745,7 @@ export class Store {
     const found = this.reserved({ reads: 64 + 8 * records + 2 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER) }, false, now, () => {
       const identity = this.identityRow(from);
       if (!identity || identity.tier !== "registered") throw new StoreError("invalid_params", `No registered user has the user_id ${from}`.slice(0, 200));
-      if (parseRoles(identity.roles_json).includes("bot")) throw new StoreError("invalid_params", "A bot's user_id is fixed");
+      if (parseRoles(identity.roles_json).includes("bot")) throw new StoreError("denied", "A bot's user_id is fixed");
       if (this.idTaken(to)) throw new StoreError("invalid_params", `The user_id ${to} is taken`.slice(0, 200));
       const count = (sql: string) => integerColumn(this.rawRows<{ count: number }>(sql, from)[0]?.count);
       return {
@@ -3525,7 +3525,7 @@ export class Store {
         "SELECT COUNT(*) AS count FROM (SELECT 1 FROM credentials WHERE user_id = ? LIMIT ?)", input.userId, MAX_PASSKEYS_PER_USER + 1,
       )[0]?.count);
       if (!this.rawRows("SELECT 1 FROM credentials WHERE credential_id = ? AND user_id = ? LIMIT 1", input.credentialId, input.userId).length) return false;
-      if (count <= 1) throw new StoreError("invalid_params", "You can't remove your only passkey");
+      if (count <= 1) throw new StoreError("denied", "You can't remove your only passkey");
       this.rawExec("DELETE FROM credentials WHERE credential_id = ? AND user_id = ?", input.credentialId, input.userId);
       return true;
     }));
@@ -3754,16 +3754,16 @@ export class Store {
       const unchanged = { changed: false, on, name: identity.name, roles: held };
       if (!on) {
         if (!held.includes(input.role)) return unchanged;
-        if (input.role === "admin" && identity.user_id === ADMIN_USER_ID) throw new StoreError("invalid_params", "The admin user is always an admin");
-        if (input.role === "bot" && identity.tier === "bot") throw new StoreError("invalid_params", "An owner's bot is always a bot");
+        if (input.role === "admin" && identity.user_id === ADMIN_USER_ID) throw new StoreError("denied", "The admin user is always an admin");
+        if (input.role === "bot" && identity.tier === "bot") throw new StoreError("denied", "An owner's bot is always a bot");
         return this.writeRoles(identity, held.filter((role) => role !== input.role), on);
       }
       if (held.includes(input.role)) return unchanged;
-      if (input.role === "admin" && held.includes("bot")) throw new StoreError("invalid_params", "A bot can't be an admin");
+      if (input.role === "admin" && held.includes("bot")) throw new StoreError("denied", "A bot can't be an admin");
       if (input.role === "bot") {
-        if (held.includes("admin")) throw new StoreError("invalid_params", "An admin can't be a bot; take away admin first");
+        if (held.includes("admin")) throw new StoreError("denied", "An admin can't be a bot; take away admin first");
         if (this.rawRows("SELECT 1 FROM credentials WHERE user_id = ? LIMIT 1", input.userId).length) {
-          throw new StoreError("invalid_params", "A bot signs in with a token and holds no passkey; this user has one");
+          throw new StoreError("denied", "A bot signs in with a token and holds no passkey; this user has one");
         }
       }
       if (held.length >= MAX_ROLES_PER_USER) throw new StoreError("denied", `A user has at most ${MAX_ROLES_PER_USER} roles`);
@@ -4854,7 +4854,7 @@ export class Store {
     if (!message) throw new StoreError("invalid_params", "unknown or expired message");
     const snapshot = parseJson<MessageSnapshot>(message.snapshot_json);
     // Clients hide a tombstone's reactions; the demo stores no new ones.
-    if (snapshot.deleted === true && emojis.length) throw new StoreError("invalid_params", "cannot react to a deleted message");
+    if (snapshot.deleted === true && emojis.length) throw new StoreError("denied", "cannot react to a deleted message");
     const existing = this.rawRows<RawReactionRow>(
       "SELECT message_id, user_id, log_id, from_json, emojis_json FROM reaction_state WHERE message_id = ? AND user_id = ? LIMIT 1",
       message.message_id, input.userId,
@@ -4871,7 +4871,7 @@ export class Store {
         "SELECT COUNT(*) AS count FROM (SELECT 1 FROM reaction_state WHERE message_id = ? LIMIT ?)",
         message.message_id, this.config.reactionUsersPerMessage,
       )[0]?.count);
-      if (count >= this.config.reactionUsersPerMessage) throw new StoreError("invalid_params", "reaction limit reached for this message");
+      if (count >= this.config.reactionUsersPerMessage) throw new StoreError("denied", "reaction limit reached for this message");
     }
     const logId = this.allocateLogId(context);
     const from = this.identityForMessage(input);

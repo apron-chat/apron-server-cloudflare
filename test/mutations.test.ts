@@ -443,12 +443,13 @@ it("rejects new reactions on tombstones and caps reacting users per message", as
 		const messageId = String(target.result.message_id);
 		store.mutate(op(clock, "alice", "a", "reactions", { message_id: messageId, emojis: ["👍"] }));
 		store.mutate(op(clock, "bob", "b", "reactions", { message_id: messageId, emojis: ["👍"] }));
-		expect(errorCode(() => store.mutate(op(clock, "carol", "c", "reactions", { message_id: messageId, emojis: ["👍"] })))).toBe("invalid_params");
+		// A well-formed request the cap refuses is denied (§1.1).
+		expect(errorCode(() => store.mutate(op(clock, "carol", "c", "reactions", { message_id: messageId, emojis: ["👍"] })))).toBe("denied");
 		// Existing reactors may still change their own set.
 		expect(store.mutate(op(clock, "bob", "b2", "reactions", { message_id: messageId, emojis: ["🎉"] })).broadcasts).toHaveLength(1);
 
 		post(store, clock, "alice", "delete", { message_id: messageId, deleted: true });
-		expect(errorCode(() => store.mutate(op(clock, "bob", "b3", "reactions", { message_id: messageId, emojis: ["👀"] })))).toBe("invalid_params");
+		expect(errorCode(() => store.mutate(op(clock, "bob", "b3", "reactions", { message_id: messageId, emojis: ["👀"] })))).toBe("denied");
 		// Clearing a set on a tombstone is still allowed.
 		expect(store.mutate(op(clock, "bob", "b4", "reactions", { message_id: messageId, emojis: [] })).broadcasts).toHaveLength(1);
 	}, { ...ROOMY, reactionUsersPerMessage: 2 });

@@ -3950,8 +3950,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async purge(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, target: string): Promise<void> {
 		const userId = target.replace(/^@/, "");
-		if (userId === attachment.userId) throw { name: "invalid_params", message: "You can't purge yourself" } satisfies ProtocolError;
-		if (userId === ADMIN_USER_ID) throw { name: "invalid_params", message: "The admin user can't be purged" } satisfies ProtocolError;
+		if (userId === attachment.userId) throw { name: "denied", message: "You can't purge yourself" } satisfies ProtocolError;
+		if (userId === ADMIN_USER_ID) throw { name: "denied", message: "The admin user can't be purged" } satisfies ProtocolError;
 		if (!this.store.identityExists(userId) && !this.connectionsOf(userId).length) {
 			throw { name: "invalid_params", message: `No user has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
 		}
@@ -4137,7 +4137,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * admin's. The sender gets a `~private` notice before the result (§1).
 	 */
 	private async kick(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: string): Promise<void> {
-		if (userId === attachment.userId) throw { name: "invalid_params", message: "You can't kick yourself; leave the room instead" } satisfies ProtocolError;
+		if (userId === attachment.userId) throw { name: "denied", message: "You can't kick yourself; leave the room instead" } satisfies ProtocolError;
 		// Thrown after the mutation: runMutation treats any other error as fatal.
 		if (!await this.removeMember(attachment, roomId, userId)) throw { name: "invalid_params", message: `${userId} is not in this room`.slice(0, 200) } satisfies ProtocolError;
 		this.sendNotice(socket, roomId, `Removed \`${userId}\` from this room.`);
@@ -4184,7 +4184,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * it is `denied`, and the passkey signs in as the new one.
 	 */
 	private async rename(socket: WebSocketConnection, request: RequestFrame, roomId: string, from: string, to: string): Promise<void> {
-		if (from === ADMIN_USER_ID || to === ADMIN_USER_ID) throw { name: "invalid_params", message: "The admin user's user_id is fixed" } satisfies ProtocolError;
+		if (from === ADMIN_USER_ID) throw { name: "denied", message: "The admin user's user_id is fixed" } satisfies ProtocolError;
+		if (to === ADMIN_USER_ID) throw { name: "invalid_params", message: `The user_id ${to} is taken` } satisfies ProtocolError;
 		assertIssuableUserId(to);
 		const renamed = this.store.renameIdentity({ from, to, now: nowMs() });
 		await this.moveInviteToken(from, to);

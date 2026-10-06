@@ -125,7 +125,8 @@ it('/kick removes a registered user or a guest from the room of the command', as
 		const guestLeft = await until(guest, (frame) => frame.method === 'room_update' && frame.params.left !== undefined);
 		expect(guestLeft.frame.params.left).toEqual([{ room_id: 'general' }]);
 
-		expect((await command(admin, 'kick-self', '/kick admin')).frame.error.code).toBe(-32602);
+		// Kicking yourself is well formed but not allowed: denied (§1.1).
+		expect((await command(admin, 'kick-self', '/kick admin')).frame.error.code).toBe(-32001);
 		expect((await command(admin, 'kick-nobody', '/kick nobody_123')).frame.error.code).toBe(-32602);
 		// Mistakes are shown, not counted as policy violations: the socket stays open.
 		expect((await command(admin, 'kick-usage', '/kick')).frame.error.message).toBe('Usage: /kick <user_id>');
@@ -203,11 +204,13 @@ it('/rename moves a registered user, their passkey, rooms and admin status to a 
 			['guest', `/rename ${toId} guest_77`],
 			['bot', `/rename ${toId} bot_x`],
 			['bad-chars', `/rename ${toId} no@pe`],
-			['admin', `/rename admin somebody_else`],
+			['to-admin', `/rename ${toId} admin`],
 			['unknown', `/rename nobody_123 somebody_else`],
 		]) {
 			expect((await command(admin, `rename-${id}`, text)).frame.error.code).toBe(-32602);
 		}
+		// The admin user's own user_id is fixed by policy: denied (§1.1).
+		expect((await command(admin, 'rename-admin', '/rename admin somebody_else')).frame.error.code).toBe(-32001);
 		expect((await command(admin, 'rename-usage', `/rename ${toId}`)).frame.error.message).toBe('Usage: /rename <old_user_id> <new_user_id>');
 		expect(admin.closed()).toBeUndefined();
 	} finally { admin.close(); dave.close(); erin.close(); }
@@ -461,7 +464,7 @@ it('adds a passkey to the signed-in account (§4.10); a guest\'s registration ma
 		expect(removed.frame.result).toEqual({});
 		expect((await until(other, (frame) => frame.method === 'message' && /Removed the passkey/.test(frame.params.body?.text ?? ''))).frame.params.from.user_id).toBe('~private');
 		expect((await passkeyLogin(added.passkey)).error.code).toBe(-32001);
-		expect((await command(user, 'remove-last', '/passkeys remove 1')).frame.error.message).toMatch(/only passkey/);
+		expect((await command(user, 'remove-last', '/passkeys remove 1')).frame.error).toMatchObject({ code: -32001, message: expect.stringMatching(/only passkey/) });
 		other.close();
 		// Signing in as someone else on a signed-in connection still takes a reconnect.
 		expect((await request(user, 'login', 'auth', { scheme: 'webauthn', action: 'login', step: 'begin' })).error.code).toBe(-32001);
@@ -596,7 +599,7 @@ it('/admin remove takes the admin role away, announced with roles: [] (§3.3)', 
 		expect(listed.result.users.find((user: { user_id: string }) => user.user_id === userId).roles).toEqual([]);
 		expect(listed.result.users.find((user: { user_id: string }) => user.user_id === 'admin').roles).toEqual(['admin']);
 		expect((await command(admin, 'again', `/admin remove ${userId}`)).notice!.params.body.text).toMatch(/was not an admin/);
-		expect((await command(admin, 'builtin', '/admin remove admin')).frame.error.code).toBe(-32602);
+		expect((await command(admin, 'builtin', '/admin remove admin')).frame.error.code).toBe(-32001);
 	} finally { admin.close(); demoted.close(); mate.close(); }
 });
 
@@ -635,10 +638,13 @@ it('/role shows a user\'s roles and toggles one, any name a label, admin also th
 			['bad-name', `/role ${userId} no!pe`],
 			['guest', '/role guest_1 friend'],
 			['unknown', '/role nobody_123 friend'],
-			['builtin-admin', '/role admin admin'],
-			['builtin-bot', '/role admin bot'],
 		]) {
 			expect((await command(admin, `role-${id}`, text)).frame.error.code).toBe(-32602);
+		}
+		// Role changes the server never allows are denied (§1.1): the admin user
+		// stays an admin, and an admin can't be a bot.
+		for (const [id, text] of [['builtin-admin', '/role admin admin'], ['builtin-bot', '/role admin bot']]) {
+			expect((await command(admin, `role-${id}`, text)).frame.error.code).toBe(-32001);
 		}
 		expect((await command(admin, 'usage', '/role')).frame.error.message).toBe('Usage: /role <user_id> [<role>]');
 		expect((await command(labeled, 'denied', `/role ${userId} friend`)).frame.error.message).toMatch(/Only an admin/);
@@ -670,13 +676,13 @@ it('/role <user_id> bot makes a token user a bot in full, but not a passkey hold
 		expect(posted.frame.result.message_id).toBeDefined();
 
 		// A user who holds a passkey, or an admin, can't be made a bot.
-		expect((await command(admin, 'passkey-bot', `/role ${passkeyId} bot`)).frame.error.code).toBe(-32602);
+		expect((await command(admin, 'passkey-bot', `/role ${passkeyId} bot`)).frame.error.code).toBe(-32001);
 		await command(admin, 'invite-2', `/invite-token ${unique('second')}`);
 		const adminId = unique('boss');
 		await command(admin, 'invite-3', `/invite-token ${adminId}`);
 		await command(admin, 'boss', `/admin ${adminId}`);
-		expect((await command(admin, 'admin-bot', `/role ${adminId} bot`)).frame.error.code).toBe(-32602);
-		// An owner's bot is always one.
+		expect((await command(admin, 'admin-bot', `/role ${adminId} bot`)).frame.error.code).toBe(-32001);
+		// An owner's bot is always one (an unknown bot_ user_id is still invalid_params).
 		expect((await command(admin, 'owner-bot', '/role bot_nobody bot')).frame.error.code).toBe(-32602);
 
 		// Taking the role away makes it an ordinary user again.

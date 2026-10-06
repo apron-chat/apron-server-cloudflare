@@ -556,7 +556,7 @@ describe('uploads end to end', () => {
 			const history = await request(admin, 'history', 'history', { room_id: 'general', limit: 50 });
 			expect(JSON.stringify(history.result)).not.toContain(userId);
 			expect((await request(admin, 'again', 'command', { room_id: 'general', body: { text: `/purge ${userId}` } })).error.code).toBe(-32602);
-			expect((await request(admin, 'self', 'command', { room_id: 'general', body: { text: '/purge admin' } })).error.code).toBe(-32602);
+			expect((await request(admin, 'self', 'command', { room_id: 'general', body: { text: '/purge admin' } })).error.code).toBe(-32001);
 		} finally { spammer.close(); admin.close(); }
 	});
 });
