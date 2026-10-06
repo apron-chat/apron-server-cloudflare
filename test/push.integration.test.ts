@@ -683,7 +683,7 @@ describe('status mute', () => {
 		} finally { alice.close(); bob.close(); }
 	});
 
-	it('answers invalid status params with invalid_params, changing nothing, and changes nothing for a guest\'s mutes', async () => {
+	it('answers invalid status params with invalid_params, changing nothing, and denied for a guest\'s mutes', async () => {
 		const userId = unique('mal');
 		const peer = await signedIn(userId);
 		/** Forgets the connection's policy violations, so the next invalid request does not close it. */
@@ -726,13 +726,20 @@ describe('status mute', () => {
 		try {
 			await guest.next();
 			expect((await status(guest, { mute: true })).frame.error.code).toBe(-32001);
-			await request(guest, 'auth', 'auth', { scheme: 'guest' });
-			// A guest gets no pushes: its mutes are accepted, but not kept or sent.
-			for (const params of [{ mute: true }, { room_id: 'general', mute: true }]) {
+			const guestId = (await request(guest, 'auth', 'auth', { scheme: 'guest' })).result.you.user_id;
+			// A guest gets no pushes, so a mute could change nothing: denied, nothing kept or sent.
+			for (const params of [{ mute: true }, { room_id: 'general', mute: true }, { mute: false }]) {
 				const reply = await status(guest, params);
-				expect(reply.frame.result).toEqual({});
+				expect(reply.frame.error?.code, JSON.stringify(params)).toBe(-32001);
 				expect(mutesOf(reply.skipped)).toEqual([]);
 			}
+			// With `idle` in the same request, neither applies.
+			const both = await status(guest, { idle: true, mute: true });
+			expect(both.frame.error.code).toBe(-32001);
+			expect(await idleOf(guestId)).toEqual([false]);
+			// A guest's `idle` alone applies, answered `{}`.
+			expect((await status(guest, { idle: true })).frame.result).toEqual({});
+			expect(await idleOf(guestId)).toEqual([true]);
 			const attachments = await runInDurableObject(stub(), (_instance, state) => state.getWebSockets().map((socket) => socket.deserializeAttachment() as { muteUntil?: unknown; tier: string }));
 			expect(attachments.filter((attachment) => attachment.tier === 'anonymous' && attachment.muteUntil !== undefined)).toEqual([]);
 			expect(guest.closed()).toBeUndefined();

@@ -107,9 +107,9 @@ within it:
   The server replies `{}` once it applies a `status`; on an error, such as
   `invalid_params` for an invalid value or an unknown room, or
   `retry_after` past a limit, nothing changes. A `status` before signing
-  in is `denied`, and one without an `id` is ignored. Guests' mutes are
-  accepted and change nothing, since guests get no pushes. Mute and status
-  changes together are limited to 6 a minute.
+  in is `denied`, and one without an `id` is ignored. A guest's `mute`
+  is `denied`, since guests get no pushes; a guest's `idle` alone
+  applies. Mute and status changes together are limited to 6 a minute.
 - User status (presence, with push): others see each user's `status` in
   room listings' `users` and in `user` notifications: `online` when someone
   attends one of their connections, `idle` when connected and nobody does,

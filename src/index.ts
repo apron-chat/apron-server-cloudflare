@@ -2580,8 +2580,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * which `retry_after`. `mute` is `true`, `false`, or seconds (cut to
 	 * MAX_MUTE_SECONDS; `0` is `false`), stored for a registered user, so it
 	 * outlasts the connection (changeMute). Guests get no pushes, so there is
-	 * nothing for their mutes to silence: a guest's mute is accepted and
-	 * changes nothing. An invalid `idle`, `mute` or `room_id` is
+	 * nothing for their mutes to silence: a guest's `mute` is `denied`, and
+	 * with it the whole request; a guest's `idle` alone applies. An invalid `idle`, `mute` or `room_id` is
 	 * `invalid_params`; unknown fields are ignored. Every check that can fail
 	 * comes before any change, and the mute, the only part that can fail in
 	 * storage, is applied before `idle`.
@@ -2598,6 +2598,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		const roomId = params.room_id;
 		if (roomId !== undefined && !validRoomId(roomId)) throw { name: "invalid_params", message: "room_id must be a room" } satisfies ProtocolError;
+		// Guests get no pushes, so a mute could change nothing: denied, and
+		// the whole request with it, `idle` included.
+		if (mute !== undefined && (state.tier !== "registered" || !state.userId)) {
+			throw { name: "denied", message: "Only registered users can mute" } satisfies ProtocolError;
+		}
 		const now = nowMs();
 		// The connection's first `idle` ends the silent-connection rule
 		// (attendedConnection), so it counts as a change even when it repeats.
@@ -2607,8 +2612,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const wait = this.idleChanges.retry(state.connId, now);
 			if (wait !== undefined) throw { name: "retry_after", message: "Idle changes limited", data: { retry_after: wait } } satisfies ProtocolError;
 		}
-		if (mute !== undefined && state.tier === "registered" && state.userId) {
-			this.changeMute(state.userId, roomId ?? null, mute, now);
+		if (mute !== undefined) {
+			this.changeMute(state.userId!, roomId ?? null, mute, now);
 		}
 		if (idleChange) {
 			this.idleChanges.take(state.connId, now);
