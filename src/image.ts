@@ -2,7 +2,7 @@
 // sender, so the public bucket serves nothing a browser would run as a
 // document. Dimensions go in `og.image` when the header gives them cheaply.
 
-export interface ImageInfo {
+interface ImageInfo {
 	type: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
 	width?: number;
 	height?: number;

@@ -44,7 +44,6 @@ import {
 	MAX_ROOM_MUTES_PER_USER,
 	ROOM_ID,
 	MAX_USER_EXT_BYTES,
-	changedExt,
 	mergeExt,
 	userExtFits,
 	Store,
@@ -184,7 +183,6 @@ interface PresenceRecord {
 	h?: number;
 }
 
-/** A `status` request `mute` (§4.5): `true`, `false`, or whole seconds, `0` being `false`; undefined when invalid. */
 /** A `status` `mute` (§4.5): `true`, `false`, or a positive integer number of seconds; undefined for anything else. */
 function muteParam(value: unknown): number | boolean | undefined {
 	if (typeof value === "boolean") return value;
@@ -247,9 +245,9 @@ const RATE_LIMIT_KEYS = 10_000;
 const THROTTLE_WINDOW_MS = 60_000;
 /**
  * The system identity for notices to one connection only, never logged
- * (Appendix A.1). Protocol v7 prefixes system identities with `~`; no user
- * can hold such an id (guest, passkey, bot, and admin-issued ids all start
- * with a letter or digit, and `auth` never honors a requested `user_id`).
+ * (Appendix A.1). System identities start with `~`; no user can hold such
+ * an id (guest, passkey, bot, and admin-issued ids all start with a letter
+ * or digit, and `auth` never honors a requested `user_id`).
  */
 const PRIVATE_IDENTITY = { user_id: "~private", name: "System message to you" } as const;
 /**
@@ -795,7 +793,6 @@ function leftUpdate(roomId: string, membership?: Broadcast): Record<string, unkn
 	return { method: "room_update", params: { left: [{ room_id: roomId }], ...(membership ? { memberships: [membership.params] } : {}) } };
 }
 
-/** A `room_update` notification (§4.3.3) with one field. */
 /** The frame that delivers a committed record: a membership goes in `room_update` `memberships` (§4.3.3). */
 function recordFrame(record: Broadcast): Record<string, unknown> {
 	return record.method === "membership"
@@ -803,6 +800,7 @@ function recordFrame(record: Broadcast): Record<string, unknown> {
 		: { method: record.method, params: record.params };
 }
 
+/** A `room_update` notification (§4.3.3) with one field. */
 function roomUpdate(field: "joined" | "updated" | "left", ...records: unknown[]): Record<string, unknown> {
 	return { method: "room_update", params: { [field]: records } };
 }
@@ -1177,7 +1175,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// This is advisory; the real upgrade still checks all admission gates.
 				return Response.json({ available: true });
 			}
-			this.store.reserveConnection({ ipKey, tier: "pending", now: nowMs() });
+			this.store.reserveConnection({ ipKey, now: nowMs() });
 		} catch (error) {
 			return this.storeResponseError(error);
 		}
@@ -2204,8 +2202,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return token;
 	}
 
-	/** Drops expired session records from a bounded, ordered expiry index. */
-	/** Whether it processed a full batch, so more may be due. */
+	/** Drops expired session records from a bounded, ordered expiry index; whether it processed a full batch, so more may be due. */
 	private async sweepSessions(now: number): Promise<boolean> {
 		return this.withSessionLock(() => this.sweepSessionsLocked(now));
 	}
@@ -4715,11 +4712,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Delivers one committed record to the members of the rooms it belongs to
-	 * (§3.4): a moved message's snapshot reaches both rooms' members in one
-	 * frame, delivered once per connection (section 3.5).
-	 */
-	/**
 	 * A result with each new upload's `write_url` (§4.8.3) signed in place of
 	 * the `write` the store keeps, so a retry signs the same URL.
 	 */
@@ -4841,10 +4833,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Delivers one committed record to the members of the rooms it belongs to.
-	 * A membership record goes in `room_update` `memberships` (§4.3.3); with
-	 * `exceptUser`, not to that user's connections, which get it together with
-	 * their `joined` or `left`.
+	 * Delivers one committed record to the members of the rooms it belongs to
+	 * (§3.4): a moved message's snapshot reaches both rooms' members in one
+	 * frame, once per connection. A membership record goes in `room_update`
+	 * `memberships` (§4.3.3); with `exceptUser`, not to that user's
+	 * connections, which get it together with their `joined` or `left`.
 	 */
 	private broadcastRecord(record: Broadcast, exceptUser?: string): void {
 		this.deliver(recordFrame(record), record.rooms, exceptUser === undefined ? undefined : (state) => state.userId !== exceptUser);

@@ -8,7 +8,7 @@
 import { createPrivateKey, createPublicKey, sign, verify } from "node:crypto";
 
 /** One browser push subscription: its endpoint and the keys its `PushSubscription` gives. */
-export interface WebPushSubscription {
+interface WebPushSubscription {
 	/** The push service endpoint, which also identifies the registration (§4.9). */
 	url: string;
 	/** The browser's P-256 public key, uncompressed, unpadded base64url (65 bytes). */
@@ -124,7 +124,7 @@ async function hkdf(salt: Uint8Array, ikm: Uint8Array, info: Uint8Array, bytes: 
 }
 
 /** The application server's ephemeral ECDH key pair for one message (RFC 8291 section 3.1). */
-export interface LocalKeys {
+interface LocalKeys {
 	privateKey: CryptoKey;
 	/** Uncompressed, 65 bytes. */
 	publicKey: Uint8Array;
@@ -200,7 +200,7 @@ export async function vapidAuthorization(endpoint: string, vapid: VapidKeys, now
 }
 
 /** What the push service said about one push. */
-export interface PushOutcome {
+interface PushOutcome {
 	status: number;
 	/** 404 or 410: the subscription is gone and should be forgotten (RFC 8030 section 7.3). */
 	gone: boolean;

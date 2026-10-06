@@ -1,6 +1,6 @@
 /** Trusted client address handling. Raw addresses never leave this module. */
 
-export type CanonicalIp =
+type CanonicalIp =
 	| { kind: "ipv4"; key: string; address: string }
 	| { kind: "ipv6"; key: string; address: string };
 

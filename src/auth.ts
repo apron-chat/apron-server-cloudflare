@@ -10,7 +10,7 @@ import {
 import type { RuntimeConfig } from "./config";
 import type { Identity, StoredCredential } from "./domain";
 
-export type WebAuthnAction = "register" | "login";
+type WebAuthnAction = "register" | "login";
 
 export interface ChallengeRecord {
 	challengeId: string;
@@ -45,16 +45,16 @@ export interface CredentialRepository {
 	updateCredentialCounter(credentialId: string, counter: number): void | Promise<void>;
 }
 
-export interface AuthIdentity extends Identity {
+interface AuthIdentity extends Identity {
 	tier: "registered";
 }
 
-export interface BeginResult {
+interface BeginResult {
 	challenge: ChallengeRecord;
 	publicKey: Record<string, unknown>;
 }
 
-export interface FinishResult {
+interface FinishResult {
 	identity: AuthIdentity;
 	credential?: StoredCredential;
 }

@@ -1,6 +1,6 @@
 import { DEFAULT_LIMITS } from "./budget";
 
-export const ERROR_CODES = Object.freeze({
+const ERROR_CODES = Object.freeze({
 	parse_error: -32700,
 	invalid_request: -32600,
 	unsupported: -32601,
@@ -11,7 +11,7 @@ export const ERROR_CODES = Object.freeze({
 	too_large: -32003,
 } as const);
 
-export type ErrorName = keyof typeof ERROR_CODES;
+type ErrorName = keyof typeof ERROR_CODES;
 
 export interface ProtocolError {
 	name: ErrorName;
@@ -25,7 +25,7 @@ export interface RequestFrame {
 	id?: string;
 }
 
-export interface ParsedFrame {
+interface ParsedFrame {
 	request: RequestFrame;
 	bytes: number;
 }
@@ -75,7 +75,7 @@ function walkJson(value: unknown, state: { nodes: number; maxDepth: number; maxN
 	}
 }
 
-export interface ParseOptions {
+interface ParseOptions {
 	maxFrameBytes: number;
 	maxJsonDepth: number;
 	maxJsonNodes: number;
@@ -202,27 +202,6 @@ export function jsonString(value: unknown): string {
 	const result = JSON.stringify(value);
 	if (result === undefined) throw new Error("cannot serialize protocol value");
 	return result;
-}
-
-/** Stable recursive representation used for request deduplication. */
-export function canonicalize(value: unknown): string {
-	if (value === null) return "null";
-	if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
-	if (typeof value === "number") {
-		if (!Number.isFinite(value)) throw new TypeError("non-finite JSON number");
-		return JSON.stringify(value);
-	}
-	if (Array.isArray(value)) return `[${value.map(canonicalize).join(",")}]`;
-	if (isObject(value)) {
-		return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalize(value[key])}`).join(",")}}`;
-	}
-	throw new TypeError("unsupported JSON value");
-}
-
-export async function digestRequest(method: string, params: Record<string, unknown>): Promise<string> {
-	const bytes = new TextEncoder().encode(canonicalize({ method, params }));
-	const digest = await crypto.subtle.digest("SHA-256", bytes);
-	return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 export function requiredString(params: Record<string, unknown>, name: string): string {

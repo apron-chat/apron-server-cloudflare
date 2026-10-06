@@ -781,11 +781,10 @@ describe('measured storage accounting', () => {
 			const { costs, measure, measureAsync } = costLog(store);
 
 			measure('auth attempt reservation', () => store.reserveAuthAttempt({ ipKey: 'matrix-auth', now: clock.now() }));
-			measure('history quota reservation', () => store.reserveHistory({ userId: 'matrix-history-user', ipKey: 'matrix-history-ip', now: clock.now() }));
 			measure('frame reservation', () => store.reserveFrames({ ipKey: 'matrix-frame-ip', now: clock.now(), count: 1 }));
 			measure('frame block', () => store.reserveFrames({ ipKey: 'matrix-block-ip', now: clock.now(), count: DEFAULT_LIMITS.frameLease }));
 			measure('guest number block', () => store.reserveGuestNumbers(DEFAULT_LIMITS.guestNumberBlock, clock.now()));
-			measure('connection admission reservation', () => store.reserveConnection({ ipKey: 'matrix-connection-ip', tier: 'pending', now: clock.now() }));
+			measure('connection admission reservation', () => store.reserveConnection({ ipKey: 'matrix-connection-ip', now: clock.now() }));
 			measure('identity registration', () => store.registerIdentity({
 				userId: 'matrix-user',
 				name: 'Matrix user',
@@ -878,13 +877,12 @@ describe('measured storage accounting', () => {
 			expect(measure('room mute expiry, 50 of 100 ran out', () => store.expireRoomMutes('matrix-user', clock.now())).expired).toHaveLength(MAX_ROOM_MUTES_PER_USER / 2);
 			measure('room mute clear', () => store.setRoomMute({ userId: 'matrix-user', roomId: 'muted-001', untilMs: null, now: clock.now() }));
 			state.storage.sql.exec("DELETE FROM room_mutes WHERE user_id = 'matrix-user'");
-			measure('admission snapshot', () => store.admission());
 			clock.set(clock.now() + DAY + HOUR + 1);
 			measure('cleanup', () => store.runCleanup(clock.now()));
 			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
 			expect(create.result.message_id).toBeTruthy();
-			expect(costs).toHaveLength(51);
+			expect(costs).toHaveLength(49);
 			expect(store.accountingStatus().unsafe).toBe(false);
 			return { costs };
 		});

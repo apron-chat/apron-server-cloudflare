@@ -12,7 +12,7 @@ export const EDGE_STOP_RULE_REF = "apron_budget_stop";
 /** How long an isolate waits after tripping the stop before it may try again. */
 const FLOOD_RETRY_MS = 60_000;
 
-export interface BudgetGuardEnvironment extends AccountUsageEnvironment {
+interface BudgetGuardEnvironment extends AccountUsageEnvironment {
 	ZONE_ID?: string;
 	/** An API token with Zone WAF edit permission on `ZONE_ID`. */
 	EDGE_STOP_TOKEN?: string;
@@ -20,9 +20,9 @@ export interface BudgetGuardEnvironment extends AccountUsageEnvironment {
 	FLOOD_WATCH?: RateLimit;
 }
 
-export type EdgeStopOutcome = "rule_failed" | "rule_missing" | "unchanged" | "held" | "changed";
+type EdgeStopOutcome = "rule_failed" | "rule_missing" | "unchanged" | "held" | "changed";
 
-export type BudgetGuardResult =
+type BudgetGuardResult =
 	| { outcome: "unconfigured" | "usage_failed" | "rule_failed" | "rule_missing" }
 	| { outcome: "unchanged" | "held" | "changed"; stop: boolean; exceeded: string[] };
 

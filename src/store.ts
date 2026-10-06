@@ -21,22 +21,14 @@ import {
 } from "./budget";
 import type { AccountUsageSnapshot } from "./account-usage";
 import { isStatusChoice, type StatusChoice } from "./presence";
-import type {
-  AdmissionSnapshot,
-  AuthTier,
-  CleanupResult as DomainCleanupResult,
-  DedupRecord,
-  Identity as DomainIdentity,
-  StoredCredential,
-  StoredIdentity,
-} from "./domain.js";
+import type { StoredCredential, StoredIdentity } from "./domain.js";
 // @ts-expect-error Workers' nodejs_compat runtime supplies this module; the
 // worker type package intentionally omits Node's full module declarations.
 import { createHash } from "node:crypto";
 
 /** The seeded, permanent top-level room. */
 export const ROOM_ID = "general";
-export const ROOM_TITLE = "General";
+const ROOM_TITLE = "General";
 /**
  * Schema 8 stores the server-wide log (room records, flat message
  * snapshots, reaction sets, and registered users' memberships), a
@@ -63,11 +55,11 @@ export const MAX_PASSKEYS_PER_USER = 8;
 /** Rooms a new identity has joined: the permanent top-level room (§3.4). */
 export const DEFAULT_JOINED_ROOMS: readonly string[] = [ROOM_ID];
 /** Title the demo supplies for a thread room created or saved without one. */
-export const DEFAULT_THREAD_TITLE = "Thread";
-export const MAX_SAFE_ID = Number.MAX_SAFE_INTEGER;
+const DEFAULT_THREAD_TITLE = "Thread";
+const MAX_SAFE_ID = Number.MAX_SAFE_INTEGER;
 export const RETENTION_MS = DEFAULT_LIMITS.retentionSeconds * 1000;
-export const DEDUP_TTL_MS = DEFAULT_LIMITS.dedupTtlSeconds * 1000;
-export const POST_WINDOW_MS = 60 * 1000;
+const DEDUP_TTL_MS = DEFAULT_LIMITS.dedupTtlSeconds * 1000;
+const POST_WINDOW_MS = 60 * 1000;
 
 // Keep a small durable control reserve inside the maintenance allocation.
 // When a batch cannot be admitted, these rows are still enough to move the
@@ -85,9 +77,9 @@ const BUDGET_PRUNE_RESERVATION_READS = 8;
 const BUDGET_PRUNE_RESERVATION_WRITES = 8;
 const BUDGET_PRUNE_BATCH = 4;
 
-export type Tier = "anonymous" | "registered";
+type Tier = "anonymous" | "registered";
 
-export type ErrorCode =
+type ErrorCode =
   | "parse_error"
   | "invalid_request"
   | "unsupported"
@@ -117,7 +109,7 @@ export class StoreError extends Error {
   }
 }
 
-export interface SqlCursorLike<T = Record<string, unknown>> {
+interface SqlCursorLike<T = Record<string, unknown>> {
   toArray?: () => T[];
   one?: () => T;
   raw?: () => unknown[];
@@ -126,11 +118,11 @@ export interface SqlCursorLike<T = Record<string, unknown>> {
   [Symbol.iterator]?: () => Iterator<T>;
 }
 
-export interface SqlStorageLike {
+interface SqlStorageLike {
   exec<T = Record<string, unknown>>(query: string, ...bindings: unknown[]): SqlCursorLike<T>;
 }
 
-export interface DurableStorageLike {
+interface DurableStorageLike {
   sql: SqlStorageLike;
   transactionSync?: <T>(closure: () => T) => T;
   setAlarm?: (time: number | Date) => Promise<void>;
@@ -138,13 +130,13 @@ export interface DurableStorageLike {
   getAlarm?: () => Promise<number | null>;
 }
 
-export interface DurableStateLike {
+interface DurableStateLike {
   storage: DurableStorageLike;
 }
 
-export type DurableSqlStorageLike = DurableStorageLike;
+type DurableSqlStorageLike = DurableStorageLike;
 
-export interface StoreClock {
+interface StoreClock {
   now(): number;
 }
 
@@ -181,13 +173,8 @@ export interface StoreConfig {
   registrationsPerDay: number;
   registeredIdentityCount: number;
   authAttemptsPerIpMinute: number;
-  framesPerConnectionMinute: number;
   framesPerIpMinute: number;
   processedFramesPerDay: number;
-  openConnections: number;
-  anonymousConnectionsPerIp: number;
-  registeredConnectionsPerUser: number;
-  connectionsPerIp: number;
   connectionAdmissionsPerIpMinute: number;
   connectionAdmissionsPerDay: number;
   principalLimitCap: number;
@@ -233,13 +220,13 @@ export interface StoreConfig {
   push: PushPolicy | null;
 }
 
-export interface StoreUploadConfig extends UploadPolicy {
+interface StoreUploadConfig extends UploadPolicy {
   /** Where the bucket serves objects, such as `https://media.apron.chat`; no trailing slash. */
   mediaOrigin: string;
 }
 
 /** An upload waiting for its write (protocol §4.8.3): what its `write_url` signs. */
-export interface PendingUpload {
+interface PendingUpload {
   /** The R2 object key: `f/<id>` for an attached file, `a/<id>` for an avatar. */
   key: string;
   purpose: UploadPurpose;
@@ -248,7 +235,7 @@ export interface PendingUpload {
   writeExpiresMs: number;
 }
 
-export type UploadPurpose = "file" | "avatar";
+type UploadPurpose = "file" | "avatar";
 
 /** What finishUpload did: the snapshot to broadcast, or the avatar set, and R2 objects to delete. */
 export interface UploadFinish {
@@ -281,7 +268,7 @@ export interface UploadWrite {
   height?: number;
 }
 
-export interface CostEstimate {
+interface CostEstimate {
   reads?: number;
   writes?: number;
   frames?: number;
@@ -321,13 +308,8 @@ const DEFAULT_CONFIG: StoreConfig = {
   registrationsPerDay: DEFAULT_LIMITS.registrationsPerDay,
   registeredIdentityCount: DEFAULT_LIMITS.registeredIdentityCount,
   authAttemptsPerIpMinute: DEFAULT_LIMITS.authAttemptsPerIpMinute,
-  framesPerConnectionMinute: DEFAULT_LIMITS.framesPerConnectionMinute,
   framesPerIpMinute: DEFAULT_LIMITS.framesPerIpMinute,
   processedFramesPerDay: DEFAULT_LIMITS.processedFramesPerDay,
-  openConnections: DEFAULT_LIMITS.openConnections,
-  anonymousConnectionsPerIp: DEFAULT_LIMITS.anonymousConnectionsPerIp,
-  registeredConnectionsPerUser: DEFAULT_LIMITS.registeredConnectionsPerUser,
-  connectionsPerIp: DEFAULT_LIMITS.connectionsPerIp,
   connectionAdmissionsPerIpMinute: DEFAULT_LIMITS.connectionAdmissionsPerIpMinute,
   connectionAdmissionsPerDay: DEFAULT_LIMITS.connectionAdmissionsPerDay,
   principalLimitCap: DEFAULT_LIMITS.limiterRecordCap,
@@ -420,7 +402,7 @@ export interface RoomRecord {
 }
 
 /** One logged reaction change (protocol v7 §4.5). */
-export interface ReactionsRecord {
+interface ReactionsRecord {
   log_id: string;
   message_id: string;
   room_id: string;
@@ -428,13 +410,13 @@ export interface ReactionsRecord {
 }
 
 /** One logged membership change of a registered user (protocol v7 §4.3.2). */
-export interface MembershipRecord {
+interface MembershipRecord {
   log_id: string;
   room_id: string;
   members: Array<{ user: Identity; joined: boolean }>;
 }
 
-export type RecordKind = "room" | "message" | "reactions" | "membership";
+type RecordKind = "room" | "message" | "reactions" | "membership";
 
 /**
  * A committed record, in log order, ready to deliver as a notification to the
@@ -447,7 +429,7 @@ export interface Broadcast {
   rooms: string[];
 }
 
-export type MutationMethod = "message" | "room_set" | "reactions" | "me";
+type MutationMethod = "message" | "room_set" | "reactions" | "me";
 
 export interface StoreMutationInput {
   userId: string;
@@ -484,7 +466,7 @@ export interface StoreMutationResult {
   profile?: { ext?: Record<string, unknown>; changed?: Record<string, unknown> };
 }
 
-export interface StoreHistoryQuery {
+interface StoreHistoryQuery {
   /** Omitted, the default room (§4.2). */
   roomId?: string;
   after?: string | bigint;
@@ -498,7 +480,7 @@ export interface StoreHistoryQuery {
 }
 
 /** A history page (§4.2): each array is omitted when empty, and the bounds with it. */
-export interface StoreHistoryResult {
+interface StoreHistoryResult {
   rooms?: RoomRecord[];
   messages?: MessageSnapshot[];
   reactions?: ReactionsRecord[];
@@ -510,7 +492,7 @@ export interface StoreHistoryResult {
   history_log_id: string | null;
 }
 
-export interface StoreCleanupResult {
+interface StoreCleanupResult {
   /** The internal server-wide retention floor F after this run. */
   history_floor: string;
   /** F before this run; rooms' history_log_id changed when these differ. */
@@ -534,7 +516,7 @@ export interface StoreCleanupResult {
 const REFUND_READS = 1;
 const REFUND_WRITES = 1;
 
-export interface BudgetCost {
+interface BudgetCost {
   reads: number;
   writes: number;
   frames: number;
@@ -546,7 +528,7 @@ export interface BudgetCost {
   maintenance?: boolean;
 }
 
-export interface BudgetSnapshot extends BudgetCost {
+interface BudgetSnapshot extends BudgetCost {
   day: string;
   foreground_reads: number;
   foreground_writes: number;
@@ -803,7 +785,7 @@ export const PUSH_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
  */
 export const WAKE_SCOPES = { mentions: 1, replies: 2 } as const;
 /** Every scope, the default for a registration without `wake`. */
-export const DEFAULT_WAKE = WAKE_SCOPES.mentions | WAKE_SCOPES.replies;
+const DEFAULT_WAKE = WAKE_SCOPES.mentions | WAKE_SCOPES.replies;
 
 /** A `user_status` or `room_mutes` row's `mute_until_ms` for a mute that lasts until changed (`mute: true`). */
 export const MUTE_FOREVER = Number.MAX_SAFE_INTEGER;
@@ -817,7 +799,7 @@ export const MAX_MUTE_SECONDS = 365 * 86_400;
 export const MAX_ROOM_MUTES_PER_USER = 100;
 
 /** One of a user's room mutes: the room, and until when (MUTE_FOREVER for `true`). */
-export interface RoomMute {
+interface RoomMute {
   roomId: string;
   untilMs: number;
 }
@@ -835,7 +817,7 @@ export interface StatusInputRecord {
 }
 
 /** A registered room member as listings carry it, with the `status` they chose when asked for. */
-export interface RoomMember {
+interface RoomMember {
   user_id: string;
   name: string;
   avatar?: string;
@@ -911,7 +893,7 @@ function pushRecord(row: RawPushRow, userId: string): PushSubscriptionRecord {
 }
 
 /** What a message's wake claimed (Store.claimPushes). */
-export interface PushClaim {
+interface PushClaim {
   subscriptions: PushSubscriptionRecord[];
   /** Subscriptions left out by the daily server or sender allowance. */
   skipped: number;
@@ -989,7 +971,7 @@ export function mergeExt(stored: unknown, write: Record<string, unknown> | undef
  * `user` notification carries them: each new or replaced value, and `""`
  * for each key it cleared. Undefined when nothing changed.
  */
-export function changedExt(before: Record<string, unknown> | undefined, after: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+function changedExt(before: Record<string, unknown> | undefined, after: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
   const changed = new Map<string, unknown>();
   for (const [key, value] of Object.entries(after ?? {})) {
     if (!before || !Object.hasOwn(before, key) || canonicalize(before[key]) !== canonicalize(value)) changed.set(key, value);
@@ -1031,11 +1013,10 @@ function jsonObject(value: unknown, field: string): Record<string, unknown> {
 
 /**
  * Canonical JSON used by mutation deduplication.  Object keys are sorted at
- * every level, arrays retain order, and JSON types remain distinct.  The
- * envelope's `jsonrpc` field is intentionally outside this function: callers
- * pass only method and params.
+ * every level, arrays retain order, and JSON types remain distinct.  Callers
+ * pass only method and params: other envelope keys are not the operation.
  */
-export function canonicalize(value: unknown): string {
+function canonicalize(value: unknown): string {
   if (value === null) return "null";
   if (typeof value === "string") return JSON.stringify(value);
   if (typeof value === "boolean") return value ? "true" : "false";
@@ -1054,7 +1035,7 @@ export function canonicalize(value: unknown): string {
 }
 
 
-export function digestOperation(method: string, params: unknown): string {
+function digestOperation(method: string, params: unknown): string {
   return createHash("sha256").update(canonicalize({ method, params }), "utf8").digest("hex");
 }
 
@@ -1413,7 +1394,6 @@ export class Store {
   private budgetPruneDay: string | null = null;
   private accountingUnsafe = false;
   private accountingUnsafePersisted = false;
-  private accountingUnsafePending = false;
   private deferredCleanupUntil = 0;
   private scheduledAlarmAt?: number;
   /** Bumped by every write to a table member listings read (MEMBER_TABLES). */
@@ -1683,7 +1663,6 @@ export class Store {
     this.initialized = false;
     this.accountingUnsafe = false;
     this.accountingUnsafePersisted = false;
-    this.accountingUnsafePending = false;
     this.lastEffectiveMs = 0;
     this.scheduledAlarmAt = undefined;
     this.initialize();
@@ -1906,19 +1885,16 @@ export class Store {
         "1",
       );
       this.accountingUnsafePersisted = true;
-      this.accountingUnsafePending = false;
     } catch {
       // The in-memory latch remains closed. A native storage failure may also
       // prevent the marker write; callers still fail closed for this object,
       // and the runtime will force a fresh recovery attempt rather than reuse
       // uncertain accounting.
-      this.accountingUnsafePending = true;
     }
   }
 
   private markAccountingUnsafe(): void {
     this.accountingUnsafe = true;
-    this.accountingUnsafePending = true;
     this.persistAccountingUnsafeMarker();
   }
 
@@ -2895,32 +2871,6 @@ export class Store {
     return this.reserved({ reads: 8 }, false, this.clock.now(), () => this.metaNumber("identity_count"));
   }
 
-  findDedup(userId: string, requestId: string, now: number): DedupRecord | null {
-    this.ensureReady();
-    return this.reserved({ reads: 8 }, false, now, () => {
-      const effective = this.effectiveNow(now);
-      const rows = this.rawRows<RawDedupRow>(
-        "SELECT user_id, request_id, digest, result_json, expires_ms FROM accepted_requests WHERE user_id = ? AND request_id = ? AND expires_ms > ? LIMIT 1",
-        userId,
-        requestId,
-        effective,
-      );
-      if (!rows.length) return null;
-      const row = rows[0];
-      const result = parseJson<Record<string, unknown>>(row.result_json, {});
-      const method = typeof result.__method === "string" ? result.__method : "message";
-      delete result.__method;
-      return {
-        userId: row.user_id,
-        requestId: row.request_id,
-        digest: row.digest,
-        method,
-        result,
-        expiresAt: row.expires_ms,
-      };
-    });
-  }
-
   private dedupRow(userId: string, requestId: string, now: number): RawDedupRow | null {
     const rows = this.rawRows<RawDedupRow>(
       "SELECT user_id, request_id, digest, result_json, transition_json, expires_ms FROM accepted_requests WHERE user_id = ? AND request_id = ? AND expires_ms > ? LIMIT 1",
@@ -3109,17 +3059,6 @@ export class Store {
       this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_GUEST_NUMBER_MARK, String(mark + count));
       return { first: mark + 1, limit: mark + count + 1 };
     }));
-  }
-
-  reserveHistory(input: { userId: string; ipKey: string; now: number }): void {
-    this.ensureReady();
-    this.reserved({ ...this.config.historyCost, reads: Math.max(32, this.config.historyCost.reads ?? 0), writes: Math.max(16, this.config.historyCost.writes ?? 0) }, false, input.now, () => {
-      const effective = this.effectiveNow(input.now);
-      this.transaction(() => {
-        this.chargeEvent("history", `user:${input.userId}`, "history", effective, this.config.historyRequestsPerUserMinute, "History request limit reached");
-        this.chargeEvent("history", `ip:${input.ipKey}`, "history", effective, this.config.historyRequestsPerIpMinute, "History request limit reached");
-      });
-    });
   }
 
   reserveFrames(input: { ipKey: string; now: number; count?: number }): void {
@@ -3375,19 +3314,6 @@ export class Store {
     }));
   }
 
-  registerCredential(input: {
-    userId: string;
-    name: string;
-    userHandle: string;
-    credential: StoredCredential;
-    now: number;
-    ipKey: string;
-    rooms?: readonly string[];
-  }): DomainIdentity {
-    const stored = this.registerIdentity(input);
-    return { user_id: stored.userId, name: stored.name };
-  }
-
   credentialIdsForUser(userId: string): string[] {
     this.ensureReady();
     return this.reserved({ reads: 32 }, false, this.clock.now(), () => {
@@ -3411,7 +3337,7 @@ export class Store {
     });
   }
 
-  reserveConnection(input: { ipKey: string; tier: AuthTier; now: number; userId?: string }): void {
+  reserveConnection(input: { ipKey: string; now: number }): void {
     this.ensureReady();
     if (!this.config.admissionEnabled) throw new StoreError("denied", "Demo admission is closed");
     this.reserved({ reads: 64, writes: 32, admissions: 1 }, false, input.now, () => {
@@ -3440,40 +3366,6 @@ export class Store {
     });
   }
 
-  releaseConnection(input: { ipKey: string; tier: AuthTier; userId?: string }): void {
-    // Intentionally no-op: live sockets are counted from the runtime's
-    // authoritative getWebSockets() view.  A close callback can be lost or
-    // arrive after a redeploy, so a durable decrement would be less correct
-    // than doing no durable open-counter accounting at all.
-    void input;
-  }
-
-  reserveAdmission(input: { ipKey: string; now: number }): void {
-    this.reserveConnection({ ...input, tier: "pending" });
-  }
-
-  releaseAdmission(input: { ipKey: string; tier: AuthTier; userId?: string }): void {
-    this.releaseConnection(input);
-  }
-
-  admission(): AdmissionSnapshot {
-    this.ensureReady();
-    return this.reserved({ reads: 32, writes: 16 }, false, this.clock.now(), () => {
-      const now = this.effectiveNow(this.clock.now());
-      const day = dayFor(now);
-      const frameRows = this.rawRows<{ day: string; posts_day: number }>(
-        "SELECT day, posts_day FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1",
-        "frames",
-        "global",
-      );
-      const frames = frameRows.length && frameRows[0].day === day ? integerColumn(frameRows[0].posts_day) : 0;
-      return {
-        globalFrames: frames,
-        globalPosts: this.limitEventCount("post", "global", "post", now),
-      };
-    });
-  }
-
   private metaNumber(key: string): number {
     const rows = this.rawRows<{ value: string }>("SELECT value FROM _meta WHERE key = ? LIMIT 1", key);
     return rows.length && /^\d+$/.test(rows[0].value) ? Number(rows[0].value) : 0;
@@ -3485,11 +3377,6 @@ export class Store {
     );
     if (!rows.length) throw new StoreError("internal_error", "maintenance state is missing");
     return rows[0];
-  }
-
-  private limitEventCount(scope: string, principalKey: string, field: "post" | "auth" | "history" | "admission", now: number): number {
-    const rows = this.rawRows<RawLimitRow>("SELECT post_events_json, auth_events_json, history_events_json, admission_events_json, scope, principal_key, day, posts_day, registrations_day, updated_ms FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1", scope, principalKey);
-    return rows.length ? this.currentEvents(rows[0], field, now).length : 0;
   }
 
   private currentMessage(messageId: string, floor?: number): RawMessageRow | null {
@@ -4874,12 +4761,10 @@ export class Store {
     userId: string,
     requestId: string | undefined,
     digest: string,
-    method: string,
     result: Record<string, unknown>,
     expiresAt: number,
   ): void {
     if (requestId === undefined) return;
-    const storedResult = { ...result, __method: method };
     this.rawExec(
       `INSERT INTO accepted_requests
        (user_id, request_id, digest, result_json, transition_json, expires_ms)
@@ -4893,7 +4778,7 @@ export class Store {
       userId,
       requestId,
       digest,
-      JSON.stringify(storedResult),
+      JSON.stringify(result),
       // The original result is sufficient for a retry response: retries are
       // never rebroadcast, so no record copy is retained here.
       null,
@@ -4910,10 +4795,11 @@ export class Store {
    * the retry's result leaves the grant out, so no stale `write_url` is
    * signed. One indexed read per upload embed (at most `maxEmbeds`).
    */
-  private deduplicatedCommit(row: RawDedupRow, method: string, digest: string, now: number): StoreMutationResult {
+  private deduplicatedCommit(row: RawDedupRow, digest: string, now: number): StoreMutationResult {
+    // The digest covers the method and params, so a matching row is the same operation.
     if (row.digest !== digest) throw new StoreError("invalid_params", "request ID was already used for a different operation");
     const stored = parseJson<Record<string, unknown>>(row.result_json, {});
-    if (stored.__method !== undefined && stored.__method !== method) throw new StoreError("invalid_params", "request ID was already used for a different method");
+    // Rows stored before this version name their method; they expire within the dedup TTL.
     delete stored.__method;
     if (Array.isArray(stored.embeds)) {
       stored.embeds = stored.embeds.map((embed: unknown) => {
@@ -4965,7 +4851,7 @@ export class Store {
       const lookup = this.reserved({ reads: 8 + 4 * this.config.maxEmbeds, writes: 8 }, false, operationNow, () => {
         const lookupNow = this.effectiveNow(operationNow);
         const row = this.dedupRow(input.userId, input.requestId!, lookupNow);
-        return { now: lookupNow, row, replay: row ? this.deduplicatedCommit(row, method, digest, lookupNow) : null };
+        return { now: lookupNow, row, replay: row ? this.deduplicatedCommit(row, digest, lookupNow) : null };
       });
       effective = lookup.now;
       if (lookup.replay) return lookup.replay;
@@ -5013,7 +4899,7 @@ export class Store {
             : this.commitReactions(input, context, floor);
           this.finishCommit(context, startLogId);
         }
-        this.commitStoredResult(input.userId, input.requestId, digest, method, committed.result, effective + this.config.dedupTtlMs);
+        this.commitStoredResult(input.userId, input.requestId, digest, committed.result, effective + this.config.dedupTtlMs);
         return beforeCommit(committed);
       });
     } finally {
@@ -5097,8 +4983,8 @@ export class Store {
       room.room_id, lower, upper, limit + 1,
     );
     if (rows.length === 0) return empty();
-    // The runtime wraps this result in a JSON-RPC response.  Reserve a fixed
-    // envelope allowance for jsonrpc/id/result keys, decimal IDs, commas and
+    // The runtime wraps this result in a reply.  Reserve a fixed
+    // envelope allowance for id/result keys, decimal IDs, commas and
     // first/last/more fields.  An empty page is always valid even when a
     // caller supplies a tiny maxBytes value, so apply this allowance only
     // while considering a non-empty entry.
@@ -5361,14 +5247,6 @@ export class Store {
     // Refunded after the transaction commits, so a rollback cannot leave a credit behind.
     this.refundUnused(reserved, this.observed.reads - beforeReads, this.observed.writes - beforeWrites);
     return result;
-  }
-
-  cleanup(now: number): DomainCleanupResult {
-    const result = this.runCleanup(now);
-    return {
-      changed: result.did_work,
-      nextAt: result.next_due_ms,
-    };
   }
 
   /**

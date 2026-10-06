@@ -16,12 +16,12 @@ export interface AccountUsageSnapshot {
 	stop: boolean;
 }
 
-export interface R2Usage {
+interface R2Usage {
 	classAOperations: number;
 	classBOperations: number;
 }
 
-export interface AccountUsageMonth {
+interface AccountUsageMonth {
 	/** The month, `YYYY-MM`. */
 	month: string;
 	workerRequests: number;
@@ -64,7 +64,7 @@ export interface AccountUsageEnvironment {
 	ACCOUNT_ANALYTICS_TOKEN?: string;
 }
 
-export class AccountUsageError extends Error {
+class AccountUsageError extends Error {
 	constructor(message: string) {
 		super(message);
 		this.name = "AccountUsageError";

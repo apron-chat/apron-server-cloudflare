@@ -1,7 +1,5 @@
 /** The durable/runtime boundary shared by the WebSocket server and SQLite store. */
 
-export type AuthTier = "pending" | "anonymous" | "registered";
-
 export interface Identity {
 	user_id: string;
 	name?: string;
@@ -32,41 +30,4 @@ export interface StoredIdentity {
 	roles: string[];
 	/** The identity's `ext` (protocol §4.12), kept in its row; absent when empty. */
 	ext?: Record<string, unknown>;
-}
-
-export interface DedupRecord {
-	userId: string;
-	requestId: string;
-	digest: string;
-	method: string;
-	result: Record<string, unknown>;
-	expiresAt: number;
-}
-
-export interface AdmissionSnapshot {
-	globalFrames: number;
-	globalPosts: number;
-}
-
-export interface CleanupResult {
-	changed: boolean;
-	/** The next alarm deadline, if maintenance still has bounded work. */
-	nextAt?: number;
-}
-
-export interface AuthStore {
-	getCredential(credentialId: string): StoredCredential | null;
-	identityExists(userId: string): boolean;
-	getIdentity(userId: string): StoredIdentity | null;
-	registerIdentity(input: {
-		userId: string;
-		name: string;
-		userHandle: string;
-		credential: StoredCredential;
-		now: number;
-		ipKey: string;
-		rooms?: readonly string[];
-	}): StoredIdentity;
-	updateCredentialCounter(credentialId: string, counter: number): void;
-	countIdentities(): number;
 }

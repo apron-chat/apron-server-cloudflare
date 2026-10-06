@@ -1,7 +1,7 @@
 import * as budget from "./budget.ts";
 import { DEFAULT_FEATURES, DEFAULT_LIMITS, MAX_PUSH_CANDIDATES, MAX_PUSHES_PER_MESSAGE, MAX_STATUS_DELAY_SECONDS, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits, type PushPolicy } from "./budget.ts";
 import { base64UrlDecode, P256_PRIVATE_KEY_BYTES, P256_PUBLIC_KEY_BYTES, vapidKeysMatch, type VapidKeys } from "./webpush.ts";
-export { DEFAULT_LIMITS, BOOTSTRAP_ROW_RESERVATION, type Limits } from "./budget.ts";
+export { DEFAULT_LIMITS } from "./budget.ts";
 
 export interface RuntimeConfig {
 	limits: Limits;
@@ -59,7 +59,7 @@ export function pushHostAllowed(hosts: RuntimeConfig["pushHosts"], host: string)
 	return hosts.some((entry) => entry.startsWith("*.") ? host.endsWith(entry.slice(1)) : host === entry);
 }
 
-export interface UploadConfig {
+interface UploadConfig {
 	/** Where the bucket serves objects, such as `https://media.apron.chat`. */
 	mediaOrigin: string;
 	/** This Worker's public origin, where `write_url`s point. */
@@ -72,7 +72,7 @@ export interface UploadConfig {
  * Why a value cannot be `APRON_ADMIN_TOKEN`, or null when it can: 24 to 256
  * letters, digits, - or _, and not a bot or invite token.
  */
-export function adminTokenError(token: string): string | null {
+function adminTokenError(token: string): string | null {
 	if (!/^[A-Za-z0-9_-]{24,256}$/.test(token)) return "APRON_ADMIN_TOKEN must be 24 to 256 letters, digits, - or _";
 	if (["apron_bot_", "apron_invite_", "apron_join_"].some((prefix) => token.startsWith(prefix))) return "APRON_ADMIN_TOKEN must not start with apron_bot_, apron_invite_, or apron_join_";
 	return null;

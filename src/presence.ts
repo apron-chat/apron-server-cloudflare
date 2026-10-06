@@ -29,7 +29,7 @@ export function statusChoice(value: string): StatusChoice {
 	return isStatusChoice(value) ? value : "";
 }
 
-export interface StatusInputs {
+interface StatusInputs {
 	/** What the user chose with `me`. */
 	choice: StatusChoice;
 	/** The user has a connection (authenticated, open, not stale). */

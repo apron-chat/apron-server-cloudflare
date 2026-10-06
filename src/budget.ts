@@ -138,7 +138,7 @@ export interface Limits {
 	maxChallengeBytes: number;
 }
 
-export interface AdmissionBudget {
+interface AdmissionBudget {
 	requestsPerIpMinute: number;
 	workerWindowSeconds: number;
 	edgeRequestsPerIpWindow: number;
@@ -147,7 +147,7 @@ export interface AdmissionBudget {
 }
 
 /** A plan's included usage per UTC day, which the account-usage stop compares against. */
-export interface AccountAllowance {
+interface AccountAllowance {
 	daily: Readonly<{
 		workerRequests: number;
 		durableObjectRequests: number;
@@ -172,13 +172,13 @@ export interface AccountAllowance {
 	r2?: Readonly<R2Allowance>;
 }
 
-export interface R2Allowance {
+interface R2Allowance {
 	classAOperationsMonthly: number;
 	classBOperationsMonthly: number;
 	storedBytes: number;
 }
 
-export interface MonthlyAllowance {
+interface MonthlyAllowance {
 	workerRequests: number;
 	workerCpuMs: number;
 	durableObjectRequests: number;
@@ -204,7 +204,7 @@ export interface Features {
  * The edge stop for a plan that bills past its included usage. The Worker
  * trips it on a flood; the budget guard holds and lifts it.
  */
-export interface EdgeStop {
+interface EdgeStop {
 	/** Requests one Cloudflare location may pass to the Worker in a minute before the Worker trips the stop. */
 	floodRequestsPerColoMinute: number;
 	/** The Worker counts one request in this many, chosen at random, against that limit. */
