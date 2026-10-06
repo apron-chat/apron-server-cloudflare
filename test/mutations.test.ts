@@ -150,7 +150,7 @@ it("broadcasts flat self-describing snapshots and enforces replacement semantics
 		const edited = post(store, clock, "alice", "m2", { message_id: messageId, body: { text: "replacement", format: "markdown" } });
 		expect(edited.message).toMatchObject({ message_id: messageId, room_id: "general", from: { user_id: "alice" } });
 		expect(Number(edited.message?.log_id)).toBeGreaterThan(Number(messageId));
-		// A save that leaves `ext` out keeps it: writes merge `ext` (§3.5).
+		// A save that leaves `ext` out keeps it: writes merge `ext` (§4.12).
 		expect(edited.message?.ext).toEqual({ irc: { nick: "ada_" } });
 		expect(edited.message?.body).toEqual({ text: "replacement", format: "markdown", embeds: [] });
 
@@ -181,7 +181,7 @@ it("broadcasts flat self-describing snapshots and enforces replacement semantics
 	});
 });
 
-it("merges ext one level deep on message saves and room_set (§3.5)", async () => {
+it("merges ext one level deep on message saves and room_set (§4.12)", async () => {
 	await withStore("ext-merge", (store, clock) => {
 		const created = post(store, clock, "alice", "e1", {
 			body: { text: "x" },
@@ -303,7 +303,7 @@ it("creates only thread rooms and replaces their client fields on save", async (
 		expect(errorCode(() => store.mutate(op(clock, "alice", "nested", "room_set", { parent_room_id: roomId, title: "Nested" })))).toBe("denied");
 
 		// Any participant may save a thread's metadata; omitted fields are
-		// cleared but `ext`, which merges (§3.5), the server supplies a title,
+		// cleared but `ext`, which merges (§4.12), the server supplies a title,
 		// and parent_room_id and private are fixed.
 		const saved = store.mutate(op(clock, "alice", "save", "room_set", { room_id: roomId, parent_room_id: "elsewhere", private: true }));
 		expect(saved.result).toEqual({ room_id: roomId });
