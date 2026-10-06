@@ -174,9 +174,10 @@ interface PresenceRecord {
 }
 
 /** A `status` request `mute` (§4.5): `true`, `false`, or whole seconds, `0` being `false`; undefined when invalid. */
+/** A `status` `mute` (§4.5): `true`, `false`, or a positive integer number of seconds; undefined for anything else. */
 function muteParam(value: unknown): number | boolean | undefined {
 	if (typeof value === "boolean") return value;
-	if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return value === 0 ? false : value;
+	if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) return value;
 	return undefined;
 }
 
@@ -2640,15 +2641,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * unattended (true) or attended (false), kept in the attachment, so it
 	 * survives hibernation; only `idle: false` ends it, and closing removes
 	 * the connection. `room_id` scopes only `mute`: without `mute` it is
-	 * neither checked nor used. At most IDLE_CHANGES_PER_CONNECTION_MINUTE
+	 * `invalid_params`. At most IDLE_CHANGES_PER_CONNECTION_MINUTE
 	 * changes to `idle: true` a connection, past which `retry_after`;
 	 * `idle: false` is never refused, so a client coming back is always
-	 * shown attended. `mute` is `true`, `false`, or seconds (cut to
-	 * MAX_MUTE_SECONDS; `0` is `false`), stored for a registered user, so it
+	 * shown attended. `mute` is `true`, `false`, or a positive integer
+	 * number of seconds (cut to MAX_MUTE_SECONDS), stored for a registered user, so it
 	 * outlasts the connection (changeMute). Guests get no pushes, so there is
 	 * nothing for their mutes to silence: a guest's `mute` is `denied`, and
 	 * with it the whole request; a guest's `idle` alone applies. An invalid
-	 * `idle` or `mute`, or with `mute` an invalid `room_id`, is
+	 * `idle` or `mute`, a `room_id` without `mute`, or an invalid `room_id`, is
 	 * `invalid_params`; unknown fields are ignored. Every check that can fail
 	 * comes before any change, and the mute, the only part that can fail in
 	 * storage, is applied before `idle`.
@@ -2661,10 +2662,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (idle !== undefined && typeof idle !== "boolean") throw { name: "invalid_params", message: "idle must be a boolean" } satisfies ProtocolError;
 		const mute = muteParam(params.mute);
 		if (params.mute !== undefined && mute === undefined) {
-			throw { name: "invalid_params", message: "mute must be true, false, or a whole number of seconds" } satisfies ProtocolError;
+			throw { name: "invalid_params", message: "mute must be true, false, or a positive whole number of seconds" } satisfies ProtocolError;
 		}
-		// `room_id` scopes only `mute`; `idle` ignores it.
-		const roomId = mute !== undefined ? params.room_id : undefined;
+		// `room_id` scopes only `mute`, so one without `mute` is invalid (§4.5).
+		const roomId = params.room_id;
+		if (roomId !== undefined && mute === undefined) throw { name: "invalid_params", message: "room_id scopes a mute; send it with mute" } satisfies ProtocolError;
 		if (roomId !== undefined && !validRoomId(roomId)) throw { name: "invalid_params", message: "room_id must be a room" } satisfies ProtocolError;
 		// Guests get no pushes, so a mute could change nothing: denied, and
 		// the whole request with it, `idle` included.

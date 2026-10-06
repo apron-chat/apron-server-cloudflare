@@ -102,14 +102,15 @@ within it:
   past that `{"idle": true}` gets `retry_after`. `{"idle": false}` is never
   refused.
   `{"mute": 3600}` (or `true`, until changed) stops a signed-in user's
-  pushes; `{"mute": false}` (or `0`) ends it. With `room_id`, it mutes that
+  pushes; `{"mute": false}` ends it (seconds are a positive integer, so `0`
+  is `invalid_params`). With `room_id`, it mutes that
   room and its threads, mentions and replies included, at most 100 rooms a
   user. A mute is private: each change is sent to all the user's own
   connections as `status`, and `mute: false` when it ends, is cleared or
   runs out; after signing in, a connection is sent each mute in effect,
   after the `auth` result (adding a passkey to a signed-in connection, or
   a repeat `auth` as the same user, is not a sign-in, and sends none).
-  `room_id` scopes only `mute`, and is not checked without it.
+  `room_id` scopes only `mute`; one without `mute` is `invalid_params`.
   The server replies `{}` once it applies a `status`; on an error, such as
   `invalid_params` for an invalid value or an unknown room, or
   `retry_after` past a limit, nothing changes. A `status` before signing

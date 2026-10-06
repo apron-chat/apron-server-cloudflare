@@ -209,10 +209,10 @@ describe('push over the socket', () => {
 			expect(answered.skipped).toEqual([]);
 			expect(await idleOf(userId)).toEqual([false, false]);
 			await setIdle(peer, true);
-			// `room_id` scopes only `mute`: idle is the connection's whatever room it names.
-			expect((await request(peer, 'scoped', 'status', { room_id: 'general', idle: false })).result).toEqual({});
-			expect(await idleOf(userId)).toEqual([false, false]);
-			await setIdle(peer, true);
+			// `room_id` scopes only `mute`: without one it is invalid_params, and
+			// nothing in the request changes, `idle` included (§4.5).
+			expect((await request(peer, 'scoped', 'status', { room_id: 'general', idle: false })).error.code).toBe(-32602);
+			expect((await idleOf(userId)).sort()).toEqual([false, true]);
 			// Neither a history page nor a message ends it (§4.5): only idle false.
 			await request(peer, 'history', 'history', { room_id: 'general' });
 			await post(peer, 'still-idle', { body: { text: 'posted while idle' } });
@@ -228,15 +228,17 @@ describe('push over the socket', () => {
 			}
 			expect((await request(other, 'unknown-fields', 'status', { other: 1, extra: 'x' })).result).toEqual({});
 			expect((await idleOf(userId)).sort()).toEqual([false, true]);
-			// `room_id` is checked only with `mute` (B8): `idle` ignores it, valid or not.
-			for (const room_id of ['', 7, 'x'.repeat(65), null]) {
-				expect((await request(other, `idle-room-${JSON.stringify(room_id)}`, 'status', { room_id, idle: false })).result, JSON.stringify(room_id)).toEqual({});
-				expect(await idleOf(userId)).toEqual([false, false]);
-				await setIdle(other, true);
-			}
-			expect((await request(other, 'room-only', 'status', { room_id: 7 })).result).toEqual({});
-			expect((await idleOf(userId)).sort()).toEqual([false, true]);
 			expect(other.closed()).toBeUndefined();
+			// A `room_id` without `mute` is invalid_params whatever it names, and
+			// changes nothing (§4.5); on a third connection, since each is a
+			// policy violation.
+			const third = await signedIn(userId, true);
+			try {
+				for (const params of [{ room_id: 'x'.repeat(65), idle: true }, { room_id: 7 }]) {
+					expect((await request(third, `room-without-mute-${JSON.stringify(params)}`, 'status', params)).error.code, JSON.stringify(params)).toBe(-32602);
+				}
+				expect((await idleOf(userId)).sort()).toEqual([false, false, true]);
+			} finally { third.close(); }
 		} finally { peer.close(); other.close(); }
 	});
 
@@ -536,8 +538,8 @@ describe('status mute', () => {
 			expect(mutesOf(await drainTo(bobToo, 'sync-true'))).toEqual([{ mute: true }]);
 			expect(mutesOf(await drainTo(bob, 'sync-true-bob'))).toEqual([{ mute: true }]);
 			await post(alice, 'muted-forever', { body: { text: 'hi', mentions: [bobId] } });
-			// `false` ends it, sent as `mute: false` to every connection; `0` is `false`.
-			bobToo.send({ id: statusId(), method: 'status', params: { mute: 0 } });
+			// `false` ends it, sent as `mute: false` to every connection.
+			bobToo.send({ id: statusId(), method: 'status', params: { mute: false } });
 			expect(mutesOf(await drainTo(bob, 'sync-zero'))).toEqual([{ mute: false }]);
 			expect(mutesOf(await drainTo(bobToo, 'sync-zero-too'))).toEqual([{ mute: false }]);
 			await setIdle(bob, true);
@@ -726,8 +728,12 @@ describe('status mute', () => {
 		});
 		try {
 			const invalid = [
-				...[-1, 1.5, '3600', null, {}].map((mute) => ({ mute })),
+				// Seconds are a positive integer (§4.5): `0` is not `false`.
+				...[0, -1, 1.5, '3600', null, {}].map((mute) => ({ mute })),
 				...['', 7, 'x'.repeat(65)].map((room_id) => ({ room_id, mute: true })),
+				// `room_id` scopes only `mute`: without it, invalid.
+				{ room_id: 'general' },
+				{ room_id: 'general', idle: true },
 				// One invalid field fails the whole request: the valid one is not applied either.
 				{ idle: true, mute: 'no' },
 				{ idle: 'yes', mute: 60 },

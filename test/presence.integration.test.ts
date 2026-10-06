@@ -964,8 +964,12 @@ describe('server.status and what follows a sign-in (§3.1, §4.5)', () => {
 			expect(await idleOf()).toEqual([false, true]);
 			const stored = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.statusInputs(userId, Date.now()));
 			expect(stored).toEqual({ choice: 'online', roomMutes: [{ roomId: 'general', untilMs: MUTE_FOREVER }] });
-			// idle with a room_id alone, even one that names no room: the connection's, no mute, nothing sent.
-			const back = await status(peer, { room_id: 'nowhere', idle: false });
+			// idle with a room_id and no mute is invalid_params (§4.5): nothing changes, nothing is sent.
+			const refused = await statusRequest(peer, { room_id: 'nowhere', idle: false });
+			expect(refused.frame.error.code).toBe(-32602);
+			expect(signInSends(refused.skipped)).toEqual([]);
+			expect(await idleOf()).toEqual([false, true]);
+			const back = await status(peer, { idle: false });
 			expect(signInSends(back)).toEqual([]);
 			expect(await idleOf()).toEqual([false, false]);
 			expect((await drain(other)).filter((frame) => frame.method === 'status')).toEqual([]);
