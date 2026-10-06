@@ -484,6 +484,8 @@ export interface StoreMutationResult {
   membership?: Broadcast;
   /** An accepted retry: the original result, with no new records. */
   deduplicated?: boolean;
+  /** For `me`: the user's `ext` after the write, and the keys it changed (§4.12). */
+  profile?: { ext?: Record<string, unknown>; changed?: Record<string, unknown> };
 }
 
 export interface StoreHistoryQuery {
@@ -664,6 +666,7 @@ interface RawIdentityRow {
   avatar_url: string;
   avatar_expires_ms: number;
   roles_json: string;
+  ext_json: string;
 }
 
 interface RawUploadRow {
@@ -733,6 +736,13 @@ export const MAX_CARRIED_PASSKEYS = 100;
 const META_LEGACY_ADMINS = "admins";
 /** Most roles one user holds, so the column stays small. */
 export const MAX_ROLES_PER_USER = 8;
+/**
+ * Largest serialized `ext` a user keeps (protocol §4.12), after a write's
+ * merge: room for an extension's few fields, such as a bridge's nick or a
+ * time zone. Every connection of the user carries it in its attachment, and
+ * every listing that shows the user carries it in `users`.
+ */
+export const MAX_USER_EXT_BYTES = 512;
 /** A role name: lowercase letters, digits, `_` or `-`, starting with a letter. */
 export const ROLE_PATTERN = /^[a-z][a-z0-9_-]{0,23}$/;
 
@@ -843,6 +853,7 @@ export interface RoomMember {
   name: string;
   avatar?: string;
   roles: string[];
+  ext?: Record<string, unknown>;
   choice?: StatusChoice;
 }
 
@@ -853,6 +864,7 @@ interface RawMemberRow {
   avatar_url: string | null;
   avatar_expires_ms: number | null;
   roles_json: string | null;
+  ext_json: string | null;
   status?: string | null;
 }
 
@@ -963,26 +975,52 @@ function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-/** An empty value (`""`, `[]`, `{}`), which clears a key in a merge (protocol §3.3). */
+/** An empty value (`""`, `[]`, `{}`), which clears a key in a merge (protocol §3.3, §4.12). */
 function emptyValue(value: unknown): boolean {
   return value === "" || (Array.isArray(value) && value.length === 0) || (isPlainObject(value) && Object.keys(value).length === 0);
 }
 
 /**
- * Merges a write's `ext` into the stored one, one level deep (protocol §3.5):
+ * Merges a write's `ext` into the stored one, one level deep (protocol §4.12):
  * each key the write carries replaces the stored value whole, a key whose
  * value is empty (`""`, `[]`, `{}`) is removed, and keys it leaves out stay.
  * `null` is an ordinary value. Without a write, or with `{}`, the stored
  * `ext` is unchanged. Undefined when nothing is left. Built from entries, so
  * a `"__proto__"` key is an ordinary own key, never a prototype.
  */
-function mergeExt(stored: unknown, write: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+export function mergeExt(stored: unknown, write: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
   const merged = new Map<string, unknown>(isPlainObject(stored) ? Object.entries(stored) : []);
   for (const [key, value] of Object.entries(write ?? {})) {
     if (emptyValue(value)) merged.delete(key);
     else merged.set(key, value);
   }
   return merged.size ? clone(Object.fromEntries(merged)) : undefined;
+}
+
+/**
+ * The keys of a user's `ext` that a write changed (protocol §4.12), as a
+ * `user` notification carries them: each new or replaced value, and `""`
+ * for each key it cleared. Undefined when nothing changed.
+ */
+export function changedExt(before: Record<string, unknown> | undefined, after: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  const changed = new Map<string, unknown>();
+  for (const [key, value] of Object.entries(after ?? {})) {
+    if (!before || !Object.hasOwn(before, key) || canonicalize(before[key]) !== canonicalize(value)) changed.set(key, value);
+  }
+  for (const key of Object.keys(before ?? {})) if (!after || !Object.hasOwn(after, key)) changed.set(key, "");
+  return changed.size ? Object.fromEntries(changed) : undefined;
+}
+
+/** An identity row's `ext_json`: its object, or undefined when empty or unreadable. */
+function parseUserExt(json: string | null | undefined): Record<string, unknown> | undefined {
+  if (!json) return undefined;
+  const parsed = parseJson<unknown>(json, null);
+  return isPlainObject(parsed) && Object.keys(parsed).length ? parsed : undefined;
+}
+
+/** Whether a user's merged `ext` fits MAX_USER_EXT_BYTES. */
+export function userExtFits(ext: Record<string, unknown> | undefined): boolean {
+  return ext === undefined || utf8Bytes(JSON.stringify(ext)) <= MAX_USER_EXT_BYTES;
 }
 
 function dayFor(ms: number): string {
@@ -1271,7 +1309,8 @@ const SCHEMA_DDL = `
     updated_ms INTEGER NOT NULL,
     avatar_url TEXT NOT NULL DEFAULT '',
     avatar_expires_ms INTEGER NOT NULL DEFAULT 0,
-    roles_json TEXT NOT NULL DEFAULT '[]'
+    roles_json TEXT NOT NULL DEFAULT '[]',
+    ext_json TEXT NOT NULL DEFAULT ''
   );
   CREATE TABLE IF NOT EXISTS uploads (
     upload_key TEXT PRIMARY KEY,
@@ -1670,8 +1709,8 @@ export class Store {
   /**
    * Upgrades a schema 7 object to schema 8 in place, once, in one
    * transaction: it creates the empty `push_subscriptions`, `push_wakes`,
-   * `user_status` and `room_mutes` tables and their indexes, and changes
-   * nothing else.
+   * `user_status` and `room_mutes` tables and their indexes, adds the
+   * identities' empty `ext_json` column, and changes nothing else.
    * Charged like upgradeFromSchema5's rows.
    */
   private upgradeFromSchema7(): void {
@@ -1712,6 +1751,7 @@ export class Store {
           mute_until_ms INTEGER NOT NULL,
           PRIMARY KEY (user_id, room_id)
         );
+        ALTER TABLE identities ADD COLUMN ext_json TEXT NOT NULL DEFAULT ''
       `);
       this.finishUpgrade(8, start, day);
     });
@@ -2676,7 +2716,7 @@ export class Store {
 
   private identityRow(userId: string): RawIdentityRow | null {
     const rows = this.rawRows<RawIdentityRow>(
-      "SELECT user_id, user_handle, name, tier, created_ms, updated_ms, avatar_url, avatar_expires_ms, roles_json FROM identities WHERE user_id = ? LIMIT 1",
+      "SELECT user_id, user_handle, name, tier, created_ms, updated_ms, avatar_url, avatar_expires_ms, roles_json, ext_json FROM identities WHERE user_id = ? LIMIT 1",
       userId,
     );
     return rows[0] ?? null;
@@ -2737,7 +2777,7 @@ export class Store {
    * rewrite is then charged by what was found. Both steps run without
    * yielding, so nothing commits between them.
    */
-  renameIdentity(input: { from: string; to: string; now?: number }): { name: string; avatar?: string; rooms: string[]; roles: string[] } {
+  renameIdentity(input: { from: string; to: string; now?: number }): { name: string; avatar?: string; ext?: Record<string, unknown>; rooms: string[]; roles: string[] } {
     this.ensureReady();
     const now = input.now ?? this.clock.now();
     const { from, to } = input;
@@ -2818,7 +2858,8 @@ export class Store {
       }
       this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_RENAMED_PREFIX + from, to);
       const avatar = liveAvatar(found.identity, now);
-      return { name: found.identity.name, ...(avatar ? { avatar } : {}), rooms: this.userRooms(to), roles: parseRoles(found.identity.roles_json) };
+      const ext = parseUserExt(found.identity.ext_json);
+      return { name: found.identity.name, ...(avatar ? { avatar } : {}), ...(ext ? { ext } : {}), rooms: this.userRooms(to), roles: parseRoles(found.identity.roles_json) };
     }));
   }
 
@@ -2931,6 +2972,7 @@ export class Store {
       const count = this.rawRows<{ count: number }>("SELECT COUNT(*) AS count FROM credentials WHERE user_id = ? LIMIT 1", userId)[0];
       const credentialCount = integerColumn(count?.count);
       const avatar = liveAvatar(row, this.clock.now());
+      const ext = parseUserExt(row.ext_json);
       return {
         userId: row.user_id,
         name: row.name,
@@ -2939,6 +2981,7 @@ export class Store {
         rooms: this.userRooms(userId),
         roles: parseRoles(row.roles_json),
         ...(avatar ? { avatar } : {}),
+        ...(ext ? { ext } : {}),
       };
     });
   }
@@ -2985,10 +3028,10 @@ export class Store {
         for (const roomId of missing) {
           const rows = this.rawRows<RawMemberRow>(
             withStatus
-              ? `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, s.status
+              ? `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json, s.status
                  FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id LEFT JOIN user_status s ON s.user_id = m.user_id
                  WHERE m.room_id = ? ORDER BY m.user_id LIMIT ?`
-              : `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id
+              : `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id
                  WHERE m.room_id = ? ORDER BY m.user_id LIMIT ?`,
             roomId, perRoom,
           );
@@ -3010,8 +3053,10 @@ export class Store {
       if (entry.rows.length) {
         members.set(roomId, entry.rows.map((row) => {
           const avatar = liveAvatar(row, now);
+          const ext = parseUserExt(row.ext_json);
           return {
             user_id: row.user_id, name: row.name ?? "", ...(avatar ? { avatar } : {}), roles: parseRoles(row.roles_json),
+            ...(ext ? { ext } : {}),
             ...(withStatus ? { choice: choiceColumn(row.status) } : {}),
           };
         }));
@@ -4016,7 +4061,7 @@ export class Store {
       body = this.normalizedBody(params.body);
       if (body.text === "" && (body.embeds as unknown[]).length === 0) throw new StoreError("invalid_params", "message cannot be empty");
     }
-    // A save merges `ext` into the current snapshot's (§3.5); a tombstone carries none (§4.4),
+    // A save merges `ext` into the current snapshot's (§4.12); a tombstone carries none (§4.4),
     // so a creation, or a save of a tombstone, merges into an empty `ext`.
     const write = this.optionalExt(params.ext);
     const ext = deleted ? undefined : mergeExt(previous?.ext, write);
@@ -4900,7 +4945,7 @@ export class Store {
 
   /**
    * `room_set`: create a thread room or replace a thread room's client fields (§4.3.4),
-   * merging `ext` into the current one (§3.5).
+   * merging `ext` into the current one (§4.12).
    * Demo policy: only threads under a top-level room may be created, and only
    * thread rooms may be edited; the permanent `general` room is fixed. Rooms
    * are never private here: every room is visible to everyone, so a creation
@@ -4922,7 +4967,7 @@ export class Store {
     // still render them (section 3.4). An empty description is no description.
     const title = typeof titleParam === "string" && titleParam.trim() !== "" ? titleParam : DEFAULT_THREAD_TITLE;
     const description = typeof descriptionParam === "string" && descriptionParam.trim() !== "" ? descriptionParam : undefined;
-    // `ext` merges into the room's current one (§3.5, §4.3.4); the size check runs on the result.
+    // `ext` merges into the room's current one (§4.12, §4.3.4); the size check runs on the result.
     const roomFields = (stored: unknown): Record<string, unknown> => {
       const ext = mergeExt(stored, write);
       return { title, ...(description !== undefined ? { description } : {}), ...(ext ? { ext } : {}) };
@@ -4996,16 +5041,34 @@ export class Store {
     if (utf8Bytes(JSON.stringify(fields)) > this.config.maxThreadMetadataBytes) throw new StoreError("too_large", "room metadata is too large");
   }
 
-  /** A `me` name change; `""` removes the name. Avatars and ext are not stored. */
+  /**
+   * A `me` profile write (§3.3) of a registered user: `name`, where `""`
+   * removes it, and `ext`, merged into the stored one (§4.12) and at most
+   * MAX_USER_EXT_BYTES after the merge. One identity row update, or none
+   * when neither changes. `profile` has the user's whole `ext` after the
+   * write and the keys it changed (changedExt).
+   */
   private commitMeMutation(input: StoreMutationInput, now: number): StoreMutationResult {
     const name = input.params.name;
-    if (typeof name !== "string") throw new StoreError("invalid_params", "name must be a string");
-    ensureText(name, "name", this.config.maxNameBytes);
-    if ([...name].length > this.config.maxNameCodePoints) throw new StoreError("too_large", "name is too long");
+    if (name !== undefined) {
+      if (typeof name !== "string") throw new StoreError("invalid_params", "name must be a string");
+      ensureText(name, "name", this.config.maxNameBytes);
+      if ([...name].length > this.config.maxNameCodePoints) throw new StoreError("too_large", "name is too long");
+    }
+    const write = this.optionalExt(input.params.ext);
     const existing = this.identityRow(input.userId);
-    if (!existing) throw new StoreError("denied", "Only registered users may change their name");
-    this.rawExec("UPDATE identities SET name = ?, updated_ms = ? WHERE user_id = ?", name, now, input.userId);
-    return { result: { name }, broadcasts: [] };
+    if (!existing) throw new StoreError("denied", "Only registered users may change their profile");
+    const before = parseUserExt(existing.ext_json);
+    const ext = mergeExt(before, write);
+    if (!userExtFits(ext)) throw new StoreError("too_large", `ext is at most ${MAX_USER_EXT_BYTES} bytes`);
+    const changed = changedExt(before, ext);
+    if (name !== undefined || changed) {
+      this.rawExec(
+        "UPDATE identities SET name = ?, ext_json = ?, updated_ms = ? WHERE user_id = ?",
+        name ?? existing.name, ext ? JSON.stringify(ext) : "", now, input.userId,
+      );
+    }
+    return { result: {}, broadcasts: [], profile: { ...(ext ? { ext } : {}), ...(changed ? { changed } : {}) } };
   }
 
   private commitStoredResult(

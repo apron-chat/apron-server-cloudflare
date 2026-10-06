@@ -155,8 +155,9 @@ it('upgrades a schema 5 store in place: intro messages become descriptions, and 
 		// member_count, and logged room records embed the intro's snapshot.
 		const snapshotOf = (text: string, messageId: string) => ({ message_id: messageId, log_id: messageId, room_id: 'general', from: identity, body: { text, format: 'plain' } });
 		sql.exec('ALTER TABLE rooms ADD COLUMN intro_message_id TEXT');
-		// Nor roles (schema 7).
+		// Nor roles (schema 7), nor ext (schema 8).
 		sql.exec('ALTER TABLE identities DROP COLUMN roles_json');
+		sql.exec('ALTER TABLE identities DROP COLUMN ext_json');
 		sql.exec('ALTER TABLE rooms DROP COLUMN member_count');
 		// Schema 5 allowed one passkey per identity.
 		sql.exec('ALTER TABLE credentials RENAME TO credentials_old');
@@ -272,6 +273,7 @@ it('upgrades a schema 6 store in place: roles move into identities, and nothing 
 		});
 		// Schema 6: no roles column; bots by tier, admins in a `_meta` list.
 		sql.exec('ALTER TABLE identities DROP COLUMN roles_json');
+		sql.exec('ALTER TABLE identities DROP COLUMN ext_json');
 		sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES ('bot_plain_user', '', 'Bot', 'bot', 1, 1)");
 		sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES ('admin', '', 'Admin', 'registered', 1, 1)");
 		sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('admins', ?)", JSON.stringify(['listed_admin', 'gone_user']));
@@ -295,7 +297,7 @@ it('upgrades a schema 6 store in place: roles move into identities, and nothing 
 	});
 });
 
-it('upgrades a schema 7 store in place: it gains the push and user status tables, and nothing else changes', async () => {
+it('upgrades a schema 7 store in place: it gains the push and user status tables and user ext, and nothing else changes', async () => {
 	const stub = env.DEMO.getByName(`schema-upgrade-7-${crypto.randomUUID()}`);
 	const now = Date.now();
 	const head = await runInDurableObject(stub, async (instance, state) => {
@@ -309,7 +311,8 @@ it('upgrades a schema 7 store in place: it gains the push and user status tables
 			userId: 'kept_user', ipKey: 'ip-kept_user', requestId: 'kept', method: 'message', now,
 			identity: { user_id: 'kept_user' }, params: { room_id: 'general', body: { text: 'kept' } },
 		});
-		// Schema 7 has no push registrations, wake times, user status or room mutes.
+		// Schema 7 has no push registrations, wake times, user status or room mutes, nor user ext.
+		sql.exec('ALTER TABLE identities DROP COLUMN ext_json');
 		sql.exec('DROP TABLE push_subscriptions');
 		sql.exec('DROP TABLE push_wakes');
 		sql.exec('DROP TABLE user_status');
@@ -338,5 +341,8 @@ it('upgrades a schema 7 store in place: it gains the push and user status tables
 		expect(store.getIdentity('kept_user')?.name).toBe('Kept');
 		expect(pushSubscriptionsOf(state, 'kept_user')).toEqual([]);
 		expect(store.statusInputs('kept_user')).toEqual({ choice: 'online', roomMutes: [] });
+		// Identities gain an empty ext.
+		expect(sql.exec<{ ext_json: string }>("SELECT ext_json FROM identities WHERE user_id = 'kept_user'").one().ext_json).toBe('');
+		expect(store.getIdentity('kept_user')).not.toHaveProperty('ext');
 	});
 });

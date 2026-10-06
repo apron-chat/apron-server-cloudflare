@@ -39,10 +39,10 @@ within it:
   rooms and nested threads are `denied`), which joins the creator; any
   participant may save a thread's `title`, `description` (CommonMark by
   convention), and `ext`, together at most 2 KiB, while `general` is fixed.
-  Saves of messages and rooms merge `ext` one level deep: each key sent
-  replaces its value, an empty one (`""`, `[]`, `{}`) removes it, and keys
-  left out stay; the size limits apply to the merged result. A deleted
-  message keeps no `ext`.
+  The server advertises capability `ext`: `me`, and saves of messages and
+  rooms, merge `ext` one level deep: each key sent replaces its value, an
+  empty one (`""`, `[]`, `{}`) removes it, and keys left out stay; the size
+  limits apply to the merged result. A deleted message keeps no `ext`.
   Threads always carry a title (`Thread` by default). No room is private:
   creating one with `private: true` is `unsupported`. `room_join` and
   `room_leave` work for `general` and threads, and changes arrive as
@@ -188,9 +188,13 @@ within it:
   Free budgets). Past that,
   requests get `retry_after` and notifications are dropped; sockets stay open.
 - `me` renames registered users only; given fields replace, omitted ones stay,
-  and `name: ""` removes the name (announced as `name: ""`). With uploads,
-  `avatar: ""` removes the avatar; other `avatar` values, `ext`, and `roles`
-  (which only the server assigns) are ignored. A rename sends `user` notifications to the user's other
+  and `name: ""` removes the name (announced as `name: ""`). Registered
+  users, bots included, keep an `ext` of at most 512 bytes, merged as above;
+  complete user objects carry it whole, and `user` notifications only the
+  keys that changed (a cleared one as `""`). A guest's `ext` is `denied`.
+  With uploads, `avatar: ""` removes the avatar; other `avatar` values and
+  `roles` (which only the server assigns) are ignored. A rename or an `ext`
+  change sends `user` notifications to the user's other
   connections and to users who share a room with them, as does a guest's
   connection creating a new account (passkey registration or sign-up
   invite: `new` with the retired guest as `old`). A guest's connection that

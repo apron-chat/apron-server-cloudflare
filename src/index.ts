@@ -43,6 +43,10 @@ import {
 	WAKE_SCOPES,
 	MAX_ROOM_MUTES_PER_USER,
 	ROOM_ID,
+	MAX_USER_EXT_BYTES,
+	changedExt,
+	mergeExt,
+	userExtFits,
 	Store,
 	StoreError,
 	UPLOAD_SWEEP_BATCH,
@@ -99,6 +103,12 @@ interface ConnectionAttachment {
 	 * the admin and bot checks, which need no storage read.
 	 */
 	roles?: string[];
+	/**
+	 * The user's `ext` (§4.12), read with the identity at sign-in and kept
+	 * equal across their connections by `me`: for complete user objects,
+	 * which then need no storage read. Guests have none.
+	 */
+	ext?: Record<string, unknown>;
 	origin?: string;
 	/** The WebSocket URL this connection reached, for instructions that name the server (`/invite-bot`). */
 	endpoint?: string;
@@ -540,6 +550,7 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			...(Array.isArray(attachment.roles) ? {
 				roles: attachment.roles.filter((role): role is string => typeof role === "string" && ROLE_PATTERN.test(role)).slice(0, MAX_ROLES_PER_USER),
 			} : {}),
+			...(isObject(attachment.ext) && userExtFits(attachment.ext) ? { ext: attachment.ext } : {}),
 			...(typeof attachment.origin === "string" ? { origin: attachment.origin } : {}),
 			...(typeof attachment.endpoint === "string" && attachment.endpoint.length <= MAX_ENDPOINT_CHARS ? { endpoint: attachment.endpoint } : {}),
 			...(challenge ? { challenge } : {}),
@@ -740,6 +751,16 @@ function setAvatar(attachment: ConnectionAttachment, avatar: string | undefined)
 	else delete attachment.avatar;
 }
 
+/** Keeps a user's `ext` (§4.12) on a connection's attachment, or none; the caller writes the attachment. */
+function setExt(attachment: ConnectionAttachment, ext: Record<string, unknown> | undefined): void {
+	if (ext && Object.keys(ext).length) attachment.ext = ext;
+	else delete attachment.ext;
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
 function identityOf(attachment: ConnectionAttachment): IdentityShape | null {
 	if (!attachment.userId || (attachment.tier !== "anonymous" && attachment.tier !== "registered")) return null;
 	return { user_id: attachment.userId, ...(attachment.name ? { name: attachment.name } : {}), tier: attachment.tier };
@@ -747,9 +768,9 @@ function identityOf(attachment: ConnectionAttachment): IdentityShape | null {
 
 /**
  * A user object as this server sends it (§3.3): `user_id` and `name`, and in
- * current objects `avatar` and `roles`.
+ * current objects `avatar`, `roles`, `ext` (complete objects only) and `status`.
  */
-type PublicUser = { user_id: string; name?: string; avatar?: string; roles?: string[]; status?: Status | StatusChoice };
+type PublicUser = { user_id: string; name?: string; avatar?: string; roles?: string[]; ext?: Record<string, unknown>; status?: Status | StatusChoice };
 
 /**
  * A room in a listing, with `members` when asked for (§4.3.1), and
@@ -1355,6 +1376,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 					// The user `status` chosen with `me`, idle connections and mutes,
 					// which decide pushes (§4.9, §4.5).
 					...(this.config.push ? ["status"] : []),
+					// The `ext` clients write on users, messages, and rooms is kept,
+					// and writes merge it one level deep (§4.12).
+					"ext",
 				],
 				// Passkeys and their session tokens only where passkeys are offered;
 				// bot tokens (`/invite-bot`) from anywhere, since bots are not browsers.
@@ -1695,6 +1719,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			attachment.tier = "anonymous";
 			attachment.userId = `guest_${number}`;
 			attachment.name = `Guest ${number}`.slice(0, Math.min(this.config.limits.maxNameCodePoints, this.config.limits.maxNameBytes));
+			delete attachment.ext;
 			// A new guest has joined the default room (§3.4).
 			attachment.rooms = [...DEFAULT_JOINED_ROOMS];
 			delete attachment.listedJoined;
@@ -1772,15 +1797,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// wait for the `auth` result (§3.2). processFrame releases them if the
 		// step fails.
 		this.holdDeliveries(socket);
-		// A signed-in user's avatar, for the connection's current object (§4.8.6).
+		// A signed-in user's avatar, roles and ext, for the connection's current object (§3.3).
 		let avatar: string | undefined;
 		let roles: string[] = [];
+		let ext: Record<string, unknown> | undefined;
 		const repository: CredentialRepository = {
 			getCredential: (credentialId) => this.store.getCredential(credentialId),
 			getIdentity: (userId) => {
 				const identity = this.store.getIdentity(userId);
 				avatar = identity?.avatar;
 				roles = identity?.roles ?? [];
+				ext = identity?.ext;
 				return identity ? { user_id: identity.userId, name: identity.name, tier: "registered" } : null;
 			},
 			registerCredential: (input) => {
@@ -1834,6 +1861,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.name = finished.identity.name;
 		setAvatar(attachment, avatar);
 		attachment.roles = roles;
+		setExt(attachment, ext);
 		attachment.rooms = this.registeredRooms(socket, finished.identity.user_id);
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
@@ -1968,6 +1996,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.name = identity.name;
 		setAvatar(attachment, identity.avatar);
 		attachment.roles = identity.roles;
+		setExt(attachment, identity.ext);
 		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
@@ -2042,7 +2071,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * invite): the connection becomes the identity, and the guest it replaces
 	 * leaves as guestLeaves has it.
 	 */
-	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[]; avatar?: string; roles: string[] }, token?: string, created = false): Promise<void> {
+	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[]; avatar?: string; roles: string[]; ext?: Record<string, unknown> }, token?: string, created = false): Promise<void> {
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
 		this.assertRegisteredCapacity(socket, identity.userId);
 		// Read before the connection changes, so a failure leaves it as it was.
@@ -2053,6 +2082,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.name = identity.name;
 		setAvatar(attachment, identity.avatar);
 		attachment.roles = identity.roles;
+		setExt(attachment, identity.ext);
 		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
 		delete attachment.listedJoined;
 		writeSessionAttachment(socket, attachment);
@@ -2298,17 +2328,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Profile update (section 3.3): a given field replaces its value, an
-	 * omitted one is unchanged, and an empty one removes it. Only registered
-	 * users may change their name; `name: ""` removes it, so the user falls
-	 * back to `user_id`. With uploads, `avatar: ""` removes a registered user's
+	 * Profile update (§3.3): a given field replaces its value, an omitted one
+	 * is unchanged, and an empty one removes it. Only registered users may
+	 * change their name; `name: ""` removes it, so the user falls back to
+	 * `user_id`. With uploads, `avatar: ""` removes a registered user's
 	 * avatar; a new one comes only through `/avatar` (§4.8.6), so other values
-	 * are declined. `ext` is type-checked and ignored: this server keeps no
-	 * user `ext`, a normalization §1.1 allows, so `you` carries none. `roles`
-	 * is not settable (§3.3) and is ignored.
-	 * Where capability `status` is advertised, `status` sets the status the
-	 * user chooses (§4.5, changeChoice), guests included; elsewhere it is
-	 * ignored. A `status` that is not a string is `invalid_params`.
+	 * are declined. `ext` (§4.12) merges one level deep into the user's kept
+	 * one, at most MAX_USER_EXT_BYTES after the merge (else `too_large`); only
+	 * registered users keep one, so a guest's `ext` with keys is `denied`, and
+	 * `"ext": {}` changes nothing. `roles` is not settable (§3.3) and is
+	 * ignored. Where capability `status` is advertised, `status` sets the
+	 * status the user chooses (§4.5, changeChoice), guests included;
+	 * elsewhere it is ignored. A `status` that is not a string is
+	 * `invalid_params`. A `name` or `ext` write is one identity row update,
+	 * not logged, and deduplicated and charged as a post like any mutation.
 	 */
 	private async handleMe(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		const identity = identityOf(attachment);
@@ -2316,21 +2349,28 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const name = optionalString(request.params, "name");
 		const avatar = optionalString(request.params, "avatar");
 		const status = optionalString(request.params, "status");
-		objectParam(request.params, "ext", false);
+		const ext = objectParam(request.params, "ext", false);
+		const writesExt = ext !== undefined && Object.keys(ext).length > 0;
 		if (name !== undefined && attachment.tier !== "registered") {
 			throw { name: "denied", message: "Only registered users may change their name" } satisfies ProtocolError;
 		}
 		if (name !== undefined && hasRole(attachment, "bot")) {
 			throw { name: "denied", message: isBotId(identity.user_id) ? "A bot is named after its owner, who can rename it with /invite-bot" : "A bot can't change its name" } satisfies ProtocolError;
 		}
+		if (writesExt && attachment.tier !== "registered") {
+			throw { name: "denied", message: "Only registered users keep ext" } satisfies ProtocolError;
+		}
 		// Every check comes before any change, so an invalid `me` changes
-		// nothing (§3.3): the name's limits, as the store checks them, and
-		// the status's rate. `avatar` is checked above (a string); a value
-		// other than `""` is declined by being ignored.
+		// nothing (§3.3): the name's limits and the merged ext's size, as the
+		// store checks them, and the status's rate. `avatar` is checked above
+		// (a string); a value other than `""` is declined by being ignored.
 		if (name !== undefined) {
 			const { maxNameCodePoints, maxNameBytes } = this.config.limits;
 			if (utf8Bytes(name) > maxNameBytes) throw { name: "too_large", message: "name is too large" } satisfies ProtocolError;
 			if ([...name].length > maxNameCodePoints) throw { name: "too_large", message: "name is too long" } satisfies ProtocolError;
+		}
+		if (writesExt && !userExtFits(mergeExt(attachment.ext, ext))) {
+			throw { name: "too_large", message: `ext is at most ${MAX_USER_EXT_BYTES} bytes` } satisfies ProtocolError;
 		}
 		// changeChoice checks the rate before it changes anything.
 		if (status !== undefined && this.config.push) this.changeChoice(socket, attachment, statusChoice(status));
@@ -2341,7 +2381,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// Announced as its empty value (§3.3), before the result.
 			if (cleared.changed) this.announceAvatar(identity.user_id, "");
 		}
-		if (name === undefined) {
+		if (name === undefined && !writesExt) {
 			const current = connectionAttachment(socket) ?? attachment;
 			this.reply(socket, request, { you: removeAvatar ? { ...this.you(current), avatar: "" } : this.you(current) });
 			return;
@@ -2352,24 +2392,30 @@ export class ApronDemoServer extends DurableObject<Env> {
 				requestId: request.id, method: "me", now: nowMs(),
 				params: request.params, identity,
 			});
+			const changed = result.profile?.changed;
 			// Persist first, then refresh every live attachment for this identity so
-			// subsequent messages from other tabs carry the same name. An accepted
-			// retry must not roll back a newer name change.
+			// subsequent messages from other tabs carry the same name, and every
+			// complete object the same ext. An accepted retry must not roll back a
+			// newer change.
 			if (!result.deduplicated) {
-				for (const peer of this.ctx.getWebSockets()) {
+				for (const peer of this.connectionsOf(identity.user_id)) {
 					const state = connectionAttachment(peer);
-					if (state?.userId !== identity.user_id) continue;
-					state.name = name;
+					if (!state) continue;
+					if (name !== undefined) state.name = name;
+					setExt(state, result.profile?.ext);
 					writeAttachment(peer, state);
 				}
 			}
 			const current = connectionAttachment(socket);
 			if (!current) return;
 			// A removed name is announced as its empty value (§3.3).
-			const you = { ...this.current(current)!, ...(current.name ? {} : { name: "" }) };
-			this.reply(socket, request, { you: { ...this.you(current), ...(current.name ? {} : { name: "" }), ...(removeAvatar ? { avatar: "" } : {}) } });
-			// Section 3.3: `you` to the user's other connections, `new` to those who share a room with the user.
-			if (!result.deduplicated) this.announceUser(socket, you, current.rooms ?? []);
+			const cleared = { ...(current.name ? {} : { name: "" }), ...(removeAvatar ? { avatar: "" } : {}) };
+			this.reply(socket, request, { you: { ...this.you(current), ...cleared } });
+			if (result.deduplicated || (name === undefined && !changed)) return;
+			// §3.3: `you` to the user's other connections, `new` to those who share
+			// a room with the user, with the ext keys that changed (§4.12).
+			const user = { ...this.current(current)!, ...(current.name ? {} : { name: "" }), ...(changed ? { ext: changed } : {}) };
+			this.announceUser(socket, user, current.rooms ?? []);
 		});
 	}
 
@@ -2457,7 +2503,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (result.created) {
 					this.setRooms(identity.user_id, [...(this.liveRoomsOf(identity.user_id) ?? []), room.room_id]);
 					// A new room's only member is its creator: no storage to read.
-					const creator = this.current(attachment)!;
+					const creator = this.complete(attachment)!;
 					// The room with its members and a registered creator's membership, in one frame (§4.3.4).
 					this.sendToUser(identity.user_id, this.joinedUpdate(room, [creator], undefined, undefined, result.membership));
 					if (result.membership) this.broadcastRecord(result.membership, identity.user_id);
@@ -2497,7 +2543,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// The members before the join, read before anything commits.
 		const totals = new Map<string, number>();
 		const before = this.membersOf([roomId], totals);
-		const joiner = this.current(attachment)!;
+		const joiner = this.complete(attachment)!;
 		const current = attachment.rooms ?? [];
 		if (current.includes(roomId)) {
 			this.send(socket, this.joinedUpdate(known, before.get(roomId), joiner, totals.get(roomId)));
@@ -2555,7 +2601,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (change.membership) this.broadcastRecord(change.membership, userId);
 				const peer = this.connectionsOf(userId)[0];
 				const state = peer ? connectionAttachment(peer) : null;
-				const joiner = state ? this.current(state) : null;
+				const joiner = state ? this.complete(state) : null;
 				if (joiner) this.sendToUser(userId, this.joinedUpdate(change.room ?? room, before.get(room.room_id), joiner, totals.get(room.room_id), change.membership));
 				this.announceJoiner(userId, room.room_id);
 			}
@@ -2860,7 +2906,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * makes of it.
 	 */
 	private you(attachment: ConnectionAttachment): PublicUser | null {
-		const user = this.current(attachment);
+		const user = this.complete(attachment);
 		if (!user) return user;
 		return { ...user, ...this.ownStatus(attachment) };
 	}
@@ -4060,6 +4106,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
+	 * A connection's user as a complete object (§3.3), as `you` in results
+	 * and room `users` carry it: its current object with the user's whole
+	 * `ext` (§4.12), from the attachment. Notifications of a change carry
+	 * only the `ext` keys it changed, so they use current.
+	 */
+	private complete(attachment: ConnectionAttachment): PublicUser | null {
+		const user = this.current(attachment);
+		return user && attachment.ext ? { ...user, ext: attachment.ext } : user;
+	}
+
+	/**
 	 * A registered user's current object (§3.3) whether or not they are
 	 * connected: from a live connection, else their stored identity (one
 	 * read). Null for an unknown user.
@@ -4225,7 +4282,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		// Clients keep nothing yet for the new `user_id`, so the object carries
 		// every profile field (§3.3), not only the one that changed.
-		const identity = { user_id: to, ...(renamed.name ? { name: renamed.name } : {}), ...(renamed.avatar ? { avatar: renamed.avatar } : {}), roles: renamed.roles };
+		const identity = { user_id: to, ...(renamed.name ? { name: renamed.name } : {}), ...(renamed.avatar ? { avatar: renamed.avatar } : {}), roles: renamed.roles, ...(renamed.ext ? { ext: renamed.ext } : {}) };
 		const old = { user_id: from, ...(renamed.name ? { name: renamed.name } : {}) };
 		this.announceUser(null, identity, this.liveRoomsOf(to) ?? renamed.rooms, old);
 		this.sendNotice(socket, roomId, `Renamed \`${from}\` to \`${to}\`.`);
@@ -4440,7 +4497,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const members = new Map<string, Map<string, PublicUser>>();
 		for (const peer of this.ctx.getWebSockets()) {
 			const state = connectionAttachment(peer as WebSocketConnection);
-			const identity = state && !state.closing ? this.current(state) : null;
+			const identity = state && !state.closing ? this.complete(state) : null;
 			if (!identity) continue;
 			// Listed past the page of stored members only because connected, a
 			// user whose status hides it would show they are: a registered one is

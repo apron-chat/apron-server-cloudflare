@@ -45,7 +45,7 @@ const connect = ({ ip = `192.0.2.${nextIp++}`, ...options }: Partial<ConnectOpti
 async function authenticate(peer: Peer, scheme = 'guest', extraCaps: string[] = []) {
 	const { server } = await greeting(peer);
 	expect(server.params.apron).toBe(8);
-	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'status']);
+	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'status', 'ext']);
 	expect(server.params.auth).toContain('webauthn');
 	expect(server.params.ping).toBe(45);
 	// Demo hints live under the standard ext object, not a top-level key.

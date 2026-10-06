@@ -185,7 +185,7 @@ it('denies a session token whose identity no longer exists without recreating it
 	expect(after).toEqual({ identity: null, session: false });
 });
 
-it('updates a registered name with me, declines avatar and ext, and treats name as unknown', async () => {
+it('updates a registered name and ext with me, declines avatar, and treats name as unknown', async () => {
 	await registerIdentity('user_session_me');
 	const token = await issueSession('user_session_me', 'http://localhost:5173');
 	const { peer, reply: resumed } = await resume(token);
@@ -193,9 +193,11 @@ it('updates a registered name with me, declines avatar and ext, and treats name 
 
 	peer.send({ id: 'rename', method: 'me', params: { name: 'Ada' } });
 	expect((await reply(peer, 'rename')).result).toEqual({ you: { user_id: 'user_session_me', name: 'Ada', roles: [], status: 'online' } });
-	// Omitted fields stay unchanged; the demo keeps no avatars or profile ext.
+	// Omitted fields stay unchanged; avatars come only from uploads, and ext is kept (§4.12).
 	peer.send({ id: 'profile', method: 'me', params: { avatar: 'https://example.test/a.png', ext: { demo: true } } });
-	expect((await reply(peer, 'profile')).result).toEqual({ you: { user_id: 'user_session_me', name: 'Ada', roles: [], status: 'online' } });
+	expect((await reply(peer, 'profile')).result).toEqual({ you: { user_id: 'user_session_me', name: 'Ada', roles: [], ext: { demo: true }, status: 'online' } });
+	peer.send({ id: 'no-ext', method: 'me', params: { ext: { demo: '' } } });
+	expect((await reply(peer, 'no-ext')).result).toEqual({ you: { user_id: 'user_session_me', name: 'Ada', roles: [], status: 'online' } });
 	peer.send({ id: 'bad-avatar', method: 'me', params: { avatar: 7 } });
 	expect((await reply(peer, 'bad-avatar')).error.code).toBe(-32602);
 	// An empty name removes it, so clients fall back to the user_id.

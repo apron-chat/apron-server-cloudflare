@@ -189,6 +189,16 @@ Memberships:
   reads: roles are a column of the identity row, read at sign-in (and kept
   on the connection) and in member listings with the name. `/role` and
   `/admin` read and update the one row.
+- A user's `ext` (capability `ext`) is a column of the same identity row,
+  `ext_json`, so complete user objects carry it at no extra read: `you` from
+  the connection's attachment, where sign-in keeps it, and listing `users`
+  from the member row already read for the name. A `me` that changes it
+  writes the one row, inside the `me` mutation's reservation like a name
+  change, and nothing when no key changes. The costs are bytes, not rows: up
+  to 512 more per identity row, per connection attachment, per cached
+  member row, and per user in a listing's `users`, which stays under the
+  256 KiB listing cap as before (past it, `members` and `users` are left
+  out).
 - History pages read membership records from the same room range as every
   other record, and look up no user objects.
 - Cleanup purges a removed thread's membership rows in the same bounded
