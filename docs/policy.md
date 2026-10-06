@@ -66,7 +66,7 @@ within it:
   members and never stored, at most 10 relays per user per minute; past that, updates are dropped and the
   sender gets one `~private` notice a minute saying so. Read cursors are
   neither kept nor relayed. Activity has no part in push: attendance is the
-  separate `status` notification (below).
+  separate `status` request (below).
 - Commands: `/help` replies with a `~private` notice listing the commands the
   sender may run; `/invite-bot` gives a registered user a bot token (below);
   `/avatar` sets one with an attached image (below); other commands are
@@ -89,10 +89,13 @@ within it:
   offer them; with it off the list is left out. Their own `you` shows
   the choice; it lasts until changed, on every device, and is kept while
   status is turned off too. Guests may choose one for their connection.
-  A client sends the notification `status` `{"idle": true}` when nobody is
-  attending a connection (an unfocused tab, a backgrounded app) and
-  `{"idle": false}` when someone is again; only that ends it. A client that
-  never sends `idle` counts as idle after ten minutes without a frame.
+  A signed-in client sends the request `status` `{"idle": true}` when
+  nobody is attending a connection (an unfocused tab, a backgrounded app)
+  and `{"idle": false}` when someone is again; only that ends it. A
+  connection starts attended, with nothing kept from earlier ones. A client
+  that never sends `idle` counts as idle after ten minutes without a frame.
+  A connection may change `idle` 12 times a minute; past that it gets
+  `retry_after`.
   `{"mute": 3600}` (or `true`, until changed) stops a signed-in user's
   pushes; `{"mute": false}` (or `0`) ends it. With `room_id`, it mutes that
   room and its threads, mentions and replies included, at most 100 rooms a
@@ -101,10 +104,12 @@ within it:
   runs out; after signing in, a connection is sent each mute in effect,
   after the `auth` result (adding a passkey to a signed-in connection is
   not a sign-in, and sends none). `room_id` scopes only `mute`.
-  Invalid values are ignored, a `status` with an `id` gets no reply, and
-  status may be sent before signing in. Guests' mutes are ignored, since
-  guests get no pushes. Mute and status changes together are limited to 6 a
-  minute.
+  The server replies `{}` once it applies a `status`; on an error, such as
+  `invalid_params` for an invalid value or an unknown room, or
+  `retry_after` past a limit, nothing changes. A `status` before signing
+  in is `denied`, and one without an `id` is ignored. Guests' mutes are
+  accepted and change nothing, since guests get no pushes. Mute and status
+  changes together are limited to 6 a minute.
 - User status (presence, with push): others see each user's `status` in
   room listings' `users` and in `user` notifications: `online` when someone
   attends one of their connections, `idle` when connected and nobody does,

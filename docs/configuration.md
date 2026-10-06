@@ -270,7 +270,7 @@ with the client's optional registration `push_id` in each push; see
 | `subscriptionsPerUser` | 5 | 5 |
 | `pushExpiryDays` (a registration not renewed this long is skipped, then deleted) | 7 | 7 |
 | `registersPerUserMinute` (`push_register` requests per user, across reconnects) | 10 | 10 |
-| `mutesPerUserMinute` (`status` `mute` and `me` `status` changes per user, together; past it a mute is declined and a `me` `status` is `retry_after`) | 6 | 6 |
+| `mutesPerUserMinute` (`status` `mute` and `me` `status` changes per user, together; past it either is `retry_after` and nothing changes) | 6 | 6 |
 | `ttlSeconds` (how long a push service keeps an undelivered push) | 1 day | 1 day |
 
 `wakesPerMessage` times `subscriptionsPerUser`, the pushes one message may

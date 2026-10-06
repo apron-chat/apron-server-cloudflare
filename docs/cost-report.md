@@ -9,8 +9,9 @@ deployed account billing rate or a free-plan capacity.
 
 The figures were measured on 2026-09-26, and re-measured on 2026-10-05 with
 user status (below) and again the same day for the rewritten status design
-(the status chosen with `me`, room mutes and the mute echo), with the
-repository's workerd launcher:
+(the status chosen with `me`, room mutes and the mute echo), and checked on
+2026-10-06 for `status` as a request (shazow/apron 6bda48b), which changes
+no SQL cost, with the repository's workerd launcher:
 
 ```sh
 devenv shell -- npm test -- \
@@ -454,6 +455,20 @@ most once a minute per user for changes the connections cause, and one
 `status` frame per mute change to each of the user's connections; outgoing
 frames are not billed. Connections no longer need to send `idle` to be told
 of changes, so a client that never does gets the frames too.
+
+**`status` as a request (shazow/apron 6bda48b).** A client's `status` is
+now a request: it is answered `{}`, or with an error that changes nothing.
+The SQL is as above: a refusal costs what the declined change it replaces
+did (`invalid_params` and `retry_after` past `mutesPerUserMinute` or the
+idle limit run no statement; an unknown room at most the one bounded room
+lookup; a room mute at the cap of 100 the same 306/3). The
+reply is one outgoing frame, not billed. `status` before sign-in is
+`denied`, so a sign-in no longer applies mutes kept on the connection: it
+writes nothing for them. An `idle` change still reads attachments only (0
+rows, measured, limited or not); a connection may make 12 a minute
+(IDLE_CHANGES_PER_CONNECTION_MINUTE), counted in memory, so a client
+flipping it cannot make the object re-derive its user's status at frame
+rate.
 
 **Room mute on Free.** Room mutes are on for both plans. Against Free's
 allowances: a sign-in reads one row more (the empty range), under 0.1% of
