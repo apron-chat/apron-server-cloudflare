@@ -1,17 +1,19 @@
 # Cloudflare Worker storage cost report
 
 This report records local native SQLite measurements used for the storage
-accounting review. It describes the current schema (schema 4: one server-wide
+accounting review. It describes the current schema (schema 8: one server-wide
 record log of room records, message snapshots, reaction sets, and
-memberships, plus a `memberships` table of registered users' rooms, keyed by
-room with an index by user) and the Workers test runtime; it does not claim a
+memberships; a `memberships` table of registered users' rooms, keyed by
+room with an index by user; and the upload, push registration, user status
+and room mute tables measured below) and the Workers test runtime; it does not claim a
 deployed account billing rate or a free-plan capacity.
 
 The figures were measured on 2026-09-26, and re-measured on 2026-10-05 with
 user status (below) and again the same day for the rewritten status design
 (the status chosen with `me`, room mutes and the mute echo), and checked on
-2026-10-06 for `status` as a request (shazow/apron 6bda48b), which changes
-no SQL cost, with the repository's workerd launcher:
+2026-10-06 for `status` as a request (shazow/apron 6bda48b) and for
+shazow/apron 35c5631 (statuses in every listing, no inferred idle), neither of
+which changes any SQL cost, with the repository's workerd launcher:
 
 ```sh
 devenv shell -- npm test -- \
@@ -106,7 +108,7 @@ upper bounds can be compared with the measured worst case.
 | Room members, `general` and one thread | 8 | 2 | 824 | 8 |
 | Room members with status, `general` and one thread | 8 | 2 | 1,224 | 8 |
 | Room members, 101 rooms with 200 registered members each | 40,403 | 2 | 40,820 | 8 |
-| Room members with status, 101 rooms of 200, each with a status row, full registrations and room mutes | 60,502 | 2 | 61,020 | 8 |
+| Room members with status, 101 rooms of 200, each member with a status row and the most push registrations and room mutes a user may hold (neither read) | 60,502 | 2 | 61,020 | 8 |
 | Admission snapshot | 6 | 2 | 40 | 24 |
 | Cleanup (matrix, one day later) | 105 | 38 | 1,074 | 1,058 |
 | Alarm scheduling | 8 | 4 | 24 | 12 |
@@ -400,10 +402,10 @@ shazow/apron 9825e38, whose clarifications at 48af29b, `server.status` and
 what follows only a sign-in, change no cost; [SPEC section 4.4](../SPEC.md#44-push), Chosen status,
 Mute and User status). Users choose a status with `me`; others see `online`
 as online, idle or offline from the user's connections, `dnd` as dnd while
-connected, `invisible` as offline, and `""` as `""`. A push registration no
-longer makes a user without a connection `idle`, so the two variants this
-server had (`full`, which read each listed member's latest waking
-registration, and `connected`) are one, the same on both plans.
+connected, `invisible` as offline, and `""` as `""`, the same on both
+plans. Every current user object in a listing carries `status`, `offline`
+and `""` included; with presence off it is `""` for everyone, read from
+nothing.
 
 **Listings.** A listing reads each listed registered member's chosen status
 with them, by a primary-key probe of `user_status`, so a member without a
@@ -421,23 +423,21 @@ One room of 200 registered members, by what the members have stored:
 | reserved | 420 | 620 | |
 
 The reservation per room grows from `4 + 2 × roomListMembers` to
-`4 + 3 × roomListMembers` (it was `4 + 4 ×` under `full`); all 101 rooms
-at the cap, every member with a status row, read 60,502 rows against the
-61,020 reserved (40,403 without status; 80,601 under `full`).
+`4 + 3 × roomListMembers`; all 101 rooms at the cap, every member with a
+status row, read 60,502 rows against the 61,020 reserved (40,403 without
+status).
 
 **Reuse.** The store keeps each room's member rows, chosen statuses
 included, in memory for `statusCoalesceSeconds` (60) and serves a listing
 again with no SQL and no reservation (measured 0/0) until any write to
-`identities`, `memberships` or `user_status` (no longer
-`push_subscriptions`). A reconnect wave of 100 clients listing `general`
+`identities`, `memberships` or `user_status`. A reconnect wave of 100 clients listing `general`
 with 200 members reads it once instead of 100 times (about 40,000 rows
 saved at two a member). It is lost on hibernation; the figures below assume
 no reuse.
 
 **Sign-in and changes.** A registered sign-in reads the `user_status` row
 and one key range of the user's room mutes, in `room_id` order (6/2 with
-none or one, against 5/2 for the row alone before; 105/2 with the 100 a
-user may hold), and keeps the chosen status and the mute ends on the
+none or one; 105/2 with the 100 a user may hold), and keeps the chosen status and the mute ends on the
 connection; `me` reads nothing. The mutes in effect are sent after the
 `auth` result from that read, and the statuses of connected users who
 share a room from attachments: the test that resends them measures no SQL
@@ -453,8 +453,9 @@ once). Fan-out is one `user` frame per connection that shares a room with
 the user (about 2 ms of CPU for 100 sockets, from the budget prototype), at
 most once a minute per user for changes the connections cause, and one
 `status` frame per mute change to each of the user's connections; outgoing
-frames are not billed. Connections no longer need to send `idle` to be told
-of changes, so a client that never does gets the frames too.
+frames are not billed. A connection that never sends `idle` is told of
+changes too, and stays attended: idleness is never inferred, so no sweep
+reads frame times for it.
 
 **`status` as a request (shazow/apron 6bda48b).** A client's `status` is
 now a request: it is answered `{}`, or with an error that changes nothing.
@@ -463,10 +464,11 @@ did (`invalid_params` and `retry_after` past `mutesPerUserMinute` or the
 idle limit run no statement; an unknown room at most the one bounded room
 lookup; a room mute at the cap of 100 the same 306/3). The
 reply is one outgoing frame, not billed. `status` before sign-in is
-`denied`, so a sign-in no longer applies mutes kept on the connection: it
-writes nothing for them. An `idle` change still reads attachments only (0
-rows, measured, limited or not); a connection may make 12 a minute
-(IDLE_CHANGES_PER_CONNECTION_MINUTE), counted in memory, so a client
+`denied`, so a sign-in applies no mutes kept on the connection: it writes
+nothing for them. An `idle` change still reads attachments only (0
+rows, measured, limited or not); a connection may go idle 12 times a minute
+(IDLE_CHANGES_PER_CONNECTION_MINUTE; `idle: false` is never refused, and
+each going idle needs one to repeat), counted in memory, so a client
 flipping it cannot make the object re-derive its user's status at frame
 rate.
 
@@ -517,13 +519,12 @@ are of each plan's daily allowance (Paid: its monthly included usage over
 | --- | --- | --- |
 | Durable Object requests | 0% / 0% | 0% / 0% |
 | Durable Object duration, if every session ends in an otherwise quiet minute | ≤ 3,125 GB-s (24%) / bound by the whole day | ≤ 6,250 GB-s (48%) / bound by the whole day |
-| SQL rows read (foreground) | 1.4% / 2.7% (worst, every member with a status row: 9% / 18%); sign-ins +0.04% / +0.08% | 0.2% / 0.9% (worst: 1.5% / 6%, half the former `full` worst) |
+| SQL rows read (foreground) | 1.4% / 2.7% (worst, every member with a status row: 9% / 18%); sign-ins +0.04% / +0.08% | 0.2% / 0.9% (worst: 1.5% / 6%) |
 | SQL rows read (account) | under 0.1% / under 0.2% | under 0.05% / under 0.2% |
 | SQL rows written (foreground) | about 3 per status change and 4 per mute: ≤ 0.9% / ≤ 3.4% | ≤ 0.15% / ≤ 0.6% |
-| Frames | no incoming frame beyond what push already asked for; outgoing only: announcements, the statuses and mutes in effect after each `auth`, one `status` per mute change to the user's connections, and one `user` frame per user told of on `/toggle presence` off, none of which an allowance counts or SQL serves | same |
+| Frames | no incoming frame beyond what push already asked for; outgoing only: announcements, the statuses and mutes in effect after each sign-in, one `status` per mute change to the user's connections, and one `user` frame per user told of on `/toggle presence` off or on, none of which an allowance counts or SQL serves | same |
 
-Free's listings read a little more than under `connected`, which read
-nothing for status: the price of showing a user who chose none as `""`
+Free's listings read a little more than they would without status: the price of showing a user who chose none as `""`
 while away, rather than revealing that they left. The worst case needs
 every listed member to have chosen a status or muted; the reuse above cuts
 it further at reconnect waves.

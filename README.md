@@ -26,8 +26,11 @@ for a zero-overage deployment.
   they muted it with `status`, everywhere or in that room, or chose `dnd`.
 - **Who's around.** With push on, member lists show each user as online,
   idle, busy (`dnd`), or offline, and a user can choose `dnd`, `invisible`,
-  or no status at all with `me`. Changes reach clients within about a
-  minute, with no SQL or alarms of their own.
+  or no status at all with `me`. A chosen status shows at once; changes
+  the connections cause are coalesced to one a minute per user, a closed
+  tab counts after a minute's grace, and a peer that vanishes without
+  closing only once it is found stale (150 seconds without a ping), all
+  with no SQL or alarms of their own.
 - **Bring your own frontend.** Guest connections are accepted from any
   origin — even `localhost` or a browser console.
 - **Built to stay inside its plan.** Every operation is metered against

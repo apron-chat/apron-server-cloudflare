@@ -92,26 +92,30 @@ within it:
   A signed-in client sends the request `status` `{"idle": true}` when
   nobody is attending a connection (an unfocused tab, a backgrounded app)
   and `{"idle": false}` when someone is again; only that ends it. A
-  connection starts attended, with nothing kept from earlier ones. A client
-  that never sends `idle` counts as idle after ten minutes without a frame.
-  A connection may change `idle` 12 times a minute; past that it gets
-  `retry_after`.
+  connection starts attended, with nothing kept from earlier ones, and
+  stays attended until it sends `{"idle": true}`, however quiet it is:
+  the server never guesses. A connection may go idle 12 times a minute;
+  past that `{"idle": true}` gets `retry_after`. `{"idle": false}` is never
+  refused.
   `{"mute": 3600}` (or `true`, until changed) stops a signed-in user's
   pushes; `{"mute": false}` (or `0`) ends it. With `room_id`, it mutes that
   room and its threads, mentions and replies included, at most 100 rooms a
   user. A mute is private: each change is sent to all the user's own
   connections as `status`, and `mute: false` when it ends, is cleared or
   runs out; after signing in, a connection is sent each mute in effect,
-  after the `auth` result (adding a passkey to a signed-in connection is
-  not a sign-in, and sends none). `room_id` scopes only `mute`.
+  after the `auth` result (adding a passkey to a signed-in connection, or
+  a repeat `auth` as the same user, is not a sign-in, and sends none).
+  `room_id` scopes only `mute`, and is not checked without it.
   The server replies `{}` once it applies a `status`; on an error, such as
   `invalid_params` for an invalid value or an unknown room, or
   `retry_after` past a limit, nothing changes. A `status` before signing
   in is `denied`, and one without an `id` is ignored. A guest's `mute`
   is `denied`, since guests get no pushes; a guest's `idle` alone
-  applies. Mute and status changes together are limited to 6 a minute.
+  applies. Mute and status changes together are limited to 6 a minute;
+  only changes that apply count.
 - User status (presence, with push): others see each user's `status` in
-  room listings' `users` and in `user` notifications: `online` when someone
+  room listings' `users` (every user carries one, `offline` and `""`
+  included) and in `user` notifications: `online` when someone
   attends one of their connections, `idle` when connected and nobody does,
   `offline` with no connection, `dnd` while a busy user is connected,
   `offline` for an invisible user, and `""` for one who chose none,
@@ -120,11 +124,15 @@ within it:
   than those shown `offline` or `""`. Changes are coalesced to at
   most one a minute per user, the latest winning, and a user who closes a
   connection is shown offline (or idle) only after a minute without them,
-  so a reload or a phone reconnecting shows nothing: what others see may be
-  up to about a minute behind. A status a user chooses is shown at once.
+  so a reload or a phone reconnecting shows nothing. A peer that vanishes
+  without closing (a sleeping laptop) counts as gone only once it is found
+  stale, 150 seconds after its last ping, and then waits the same minute.
+  A status a user chooses is shown at once.
   `PRESENCE` (`true` or `false`) overrides the plan, and admins can turn it
   off and on with `/toggle presence`; turning it off tells connected
-  clients to clear the statuses they were shown. Invisibility hides
+  clients to clear the statuses they were shown, and listings then show
+  `""` for everyone; turning it on sends each connected client the
+  statuses others see, as after signing in. Invisibility hides
   presence only: posts, reactions, typing and room joins still show.
 - Push (`server.push` kind `webpush`, where VAPID keys are set): registered
   users register a browser's push subscription with `push_register`
