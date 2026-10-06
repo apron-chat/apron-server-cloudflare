@@ -762,6 +762,32 @@ it('drops a connection that pinged and went quiet from room_list members and clo
 	} finally { vi.restoreAllMocks(); alice.close(); bob.close(); carol.close(); await configure((config) => { config.limits.pingTimeoutSeconds = 150; }); }
 });
 
+it('never closes the connection whose frame starts a sweep as stale, though it last pinged long ago (B4)', async () => {
+	const alice = await connect();
+	const bob = await connect();
+	try {
+		await authenticate(alice);
+		const bobId = await authenticate(bob);
+		await configure((config) => { config.limits.pingTimeoutSeconds = 1; });
+		bob.socket.send('{"method":"ping"}');
+		await until(bob, (frame) => frame.method === 'pong');
+		const pinged = await runInDurableObject(env.DEMO.getByName('public-demo-v1'), (instance, state) => {
+			// The next event sweeps, as the first one after a wake does.
+			(instance as unknown as { presenceSweptAt: number }).presenceSweptAt = 0;
+			const socket = state.getWebSockets().find((ws) => (ws.deserializeAttachment() as { userId?: string }).userId === bobId.user_id)!;
+			return state.getWebSocketAutoResponseTimestamp(socket)!.getTime();
+		});
+		// Long after Bob's ping and his last frame, a frame arrives from him:
+		// the sweep it starts must not close the socket it came in on.
+		vi.spyOn(Date, 'now').mockReturnValue(pinged + 10_000);
+		const reply = await request(bob, 'still-here', 'me', {});
+		expect(reply.result.you.user_id).toBe(bobId.user_id);
+		expect(bob.closed()).toBeUndefined();
+		// Alice, who neither pinged nor is sending, is never judged stale either.
+		expect((await request(alice, 'alice', 'me', {})).result).toBeDefined();
+	} finally { vi.restoreAllMocks(); alice.close(); bob.close(); await configure((config) => { config.limits.pingTimeoutSeconds = 150; }); }
+});
+
 it('advertises the demo policy hints', async () => {
 	const peer = await connect();
 	try {

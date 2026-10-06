@@ -716,8 +716,13 @@ describe('user status timing', () => {
 			expect(clearing).toEqual({ queries: [], reads: 0, writes: 0 });
 			await drain(admin);
 			await drain(watcher);
-			// Off: no status shown to others, nor sent after auth; the chosen one is kept and in `you`.
-			expect(await listed(watcher, watcherId)).not.toHaveProperty('status');
+			// Off: no status shown to others, nor sent after auth; the chosen one
+			// is kept and in `you`. Listings still carry `status`, as §4.11 has
+			// every listing do, and it is `""` (none) for everyone, as off told.
+			const offList = await listing(watcher);
+			expect(offList.get(watcherId)).toMatchObject({ status: '' });
+			expect(offList.get(adminId)).toMatchObject({ status: '' });
+			expect([...offList.values()].every((user) => user.status === '')).toBe(true);
 			expect((await choose(watcher, 'invisible')).result.you).toMatchObject({ user_id: watcherId, status: 'invisible' });
 			expect(told(await drain(admin), watcherId)).toEqual([]);
 			const second = await signIn(watcherId, { existing: true });
@@ -734,6 +739,11 @@ describe('user status timing', () => {
 			expect((members.get('general') ?? []).map((user) => user.user_id)).not.toContain(watcherId);
 			const on = await toggle('on');
 			expect(on.skipped.find((frame) => frame.params?.from?.user_id === '~private')?.params.body.text).toMatch(/^Status is now \*\*on\*\*/);
+			// Each signed-in connection is sent the statuses others see, as after
+			// a sign-in: the watcher learns the admin is online again; the admin
+			// is told nothing of the invisible watcher.
+			expect(told(on.skipped, watcherId)).toEqual([]);
+			expect(told(await drain(watcher), adminId)).toEqual(['online']);
 			// On again, it starts from each user's status now, announcing nothing
 			// for it; the invisible chosen while off holds, so others see offline.
 			expect(await listed(admin, watcherId)).toMatchObject({ status: 'offline' });
@@ -960,5 +970,169 @@ describe('server.status and what follows a sign-in (§3.1, §4.11)', () => {
 			expect(await idleOf()).toEqual([false, false]);
 			expect((await drain(other)).filter((frame) => frame.method === 'status')).toEqual([]);
 		} finally { peer.close(); other.close(); }
+	});
+});
+
+describe('sign-ins, listings and attendance (apron 35c5631)', () => {
+	beforeEach(forgetAnnouncements);
+
+	it('sends nothing after a repeat auth as the same user on the same connection, token or guest', async () => {
+		const busyId = unique('busy');
+		const busy = await signedIn(busyId);
+		const userId = unique('repeat');
+		await register(userId);
+		await storeMutes(userId);
+		const token = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).issueSession(userId, 'http://localhost:5173', Date.now()));
+		const peer = await opened();
+		try {
+			await choose(busy, 'dnd');
+			const first = await exchange(peer, 'auth', 'auth', { scheme: 'token', token });
+			expect(first.frame.result.you.user_id).toBe(userId);
+			// The sign-in sends the mutes and Busy's status.
+			const after = await drain(peer);
+			expect(after.filter((frame) => frame.method === 'status')).toHaveLength(2);
+			expect(told(after, busyId)).toEqual(['dnd']);
+			// The same token again on the same connection is not a sign-in: no
+			// mutes, no statuses, whatever its answer.
+			const again = await exchange(peer, 'auth-again', 'auth', { scheme: 'token', token });
+			expect(signInSends([...again.skipped, ...await drain(peer)])).toEqual([]);
+			// Nor is a guest auth on it.
+			const asGuest = await exchange(peer, 'auth-guest', 'auth', { scheme: 'guest' });
+			expect(asGuest.frame.result.you.user_id).toBe(userId);
+			expect(signInSends([...asGuest.skipped, ...await drain(peer)])).toEqual([]);
+			// A guest's own repeat is the same.
+			const { peer: visitor, userId: guestId } = await guest();
+			try {
+				const repeated = await exchange(visitor, 'again', 'auth', { scheme: 'guest' });
+				expect(repeated.frame.result.you.user_id).toBe(guestId);
+				expect(signInSends([...repeated.skipped, ...await drain(visitor)])).toEqual([]);
+			} finally { visitor.close(); }
+		} finally { busy.close(); peer.close(); }
+	});
+
+	it('carries status on every current user object in room_list and room_update, offline and "" included, and "" for all with presence off', async () => {
+		const observerId = unique('observer');
+		const ids = { gone: unique('gone'), none: unique('none'), dnd: unique('dnd') };
+		for (const id of Object.values(ids)) await register(id);
+		await runInDurableObject(stub(), (instance) => {
+			const { store } = instance as unknown as Runtime;
+			store.setStatus({ userId: ids.none, choice: '', now: Date.now() });
+			store.setStatus({ userId: ids.dnd, choice: 'dnd', now: Date.now() });
+		});
+		const observer = await signedIn(observerId);
+		const dnd = await signedIn(ids.dnd, { existing: true });
+		const setPresence = (presence: boolean) => runInDurableObject(stub(), (instance) => {
+			const runtime = instance as unknown as Runtime;
+			runtime.config = { ...runtime.config, presence };
+		});
+		/** The users of a `room_update` `joined` for general, as a repeated join sends it. */
+		const joined = async (id: string): Promise<Map<string, Record<string, unknown>>> => {
+			await runInDurableObject(stub(), (instance) => (instance as unknown as { store: { memberCache: Map<string, unknown> } }).store.memberCache.clear());
+			const { skipped } = await exchange(observer, id, 'room_join', { room_id: 'general' });
+			const update = skipped.find((frame) => frame.method === 'room_update' && frame.params.joined);
+			expect(update, id).toBeDefined();
+			return new Map(update!.params.users.map((user: { user_id: string }) => [user.user_id, user]));
+		};
+		try {
+			for (const users of [await listing(observer), await joined('join-on')]) {
+				expect([...users.values()].every((user) => typeof user.status === 'string')).toBe(true);
+				expect(users.get(ids.gone)).toMatchObject({ status: 'offline' });
+				expect(users.get(ids.none)).toMatchObject({ status: '' });
+				expect(users.get(ids.dnd)).toMatchObject({ status: 'dnd' });
+				expect(users.get(observerId)).toMatchObject({ status: 'online' });
+			}
+			// Presence off, capability `status` still advertised: `status` is
+			// still on every object, and it is `""` (none), as off told clients.
+			await setPresence(false);
+			try {
+				for (const users of [await listing(observer), await joined('join-off')]) {
+					expect(users.size).toBeGreaterThanOrEqual(4);
+					expect([...users.values()].every((user) => user.status === '')).toBe(true);
+				}
+			} finally { await setPresence(true); }
+		} finally { observer.close(); dnd.close(); }
+	});
+
+	it('never infers idle: a connection that never sent idle stays online to others however long it is quiet', async () => {
+		const watcherId = unique('watcher');
+		const watcher = await signedIn(watcherId);
+		const userId = unique('quiet');
+		await register(userId);
+		const token = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).issueSession(userId, 'http://localhost:5173', Date.now()));
+		const quiet = await opened();
+		try {
+			// Signed in, it never sends `status`.
+			expect((await request(quiet, 'auth', 'auth', { scheme: 'token', token })).result.you.user_id).toBe(userId);
+			await advance(COALESCE);
+			expect(told(await drain(watcher), userId)).toEqual(['online']);
+			// An hour without a frame from it: still attended, so nothing changes.
+			await advance(60 * 60_000);
+			await advance(COALESCE);
+			expect(told(await drain(watcher), userId)).toEqual([]);
+			expect(await listed(watcher, userId)).toMatchObject({ status: 'online' });
+			const attended = await runInDurableObject(stub(), (instance) => (instance as unknown as { attended(userId: string, now: number): boolean }).attended(userId, Date.now()));
+			expect(attended).toBe(true);
+			// Only `idle: true` makes it idle.
+			await status(quiet, { idle: true });
+			await advance(COALESCE);
+			expect(told(await drain(watcher), userId)).toEqual(['idle']);
+		} finally { watcher.close(); quiet.close(); }
+	});
+
+	it('changes nothing for an invalid me: the name is checked before the status applies (B3)', async () => {
+		const watcherId = unique('watcher');
+		const watcher = await signedIn(watcherId);
+		const userId = unique('atomic');
+		const peer = await signedIn(userId);
+		try {
+			await drain(watcher);
+			for (const params of [
+				{ name: 'n'.repeat(DEFAULT_LIMITS.maxNameCodePoints + 1), status: 'dnd' },
+				{ name: '€'.repeat(Math.ceil(DEFAULT_LIMITS.maxNameBytes / 3) + 1), status: 'dnd' },
+				{ name: 7, status: 'dnd' },
+				{ avatar: 7, status: 'dnd' },
+			]) {
+				const reply = await request(peer, `bad-${crypto.randomUUID()}`, 'me', params);
+				expect(reply.error, JSON.stringify(params)).toBeDefined();
+				expect((await request(peer, `still-${crypto.randomUUID()}`, 'me', {})).result.you.status, JSON.stringify(params)).toBe('online');
+				// Each is a policy violation: forgiven, so the connection stays open.
+				await runInDurableObject(stub(), (_instance, state) => {
+					for (const socket of state.getWebSockets()) socket.serializeAttachment({ ...(socket.deserializeAttachment() as object), policyViolations: [] });
+				});
+			}
+			expect(told(await drain(watcher), userId)).toEqual([]);
+			const stored = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.statusInputs(userId, Date.now()));
+			expect(stored.choice).toBe('online');
+			// None of them spent the status limit: the limit's worth of changes still applies.
+			for (let index = 0; index < PUSH_POLICY!.mutesPerUserMinute; index++) {
+				expect((await choose(peer, index % 2 ? 'online' : 'dnd')).error).toBeUndefined();
+			}
+		} finally { watcher.close(); peer.close(); }
+	});
+
+	it('reads the status and mutes before issuing a passkey session, so a failed read leaves no session', async () => {
+		const fresh = await opened();
+		const login = await opened();
+		try {
+			const { passkey, finished } = await registerPasskey(fresh, 'orphan');
+			const userId = finished.frame.result.you.user_id;
+			const sessions = () => runInDurableObject(stub(), async (_instance, state) => (await state.storage.list({ prefix: 'session:' })).size);
+			const before = await sessions();
+			const order: string[] = [];
+			await runInDurableObject(stub(), (instance) => {
+				const runtime = instance as unknown as Runtime & { issueSession: Runtime['issueSession'] };
+				vi.spyOn(runtime.store, 'statusInputs').mockImplementationOnce(() => { order.push('read'); throw new Error('storage unavailable'); });
+				const issue = runtime.issueSession.bind(runtime);
+				vi.spyOn(runtime, 'issueSession').mockImplementation((...args) => { order.push('issue'); return issue(...args); });
+			});
+			const begun = await request(login, 'login-begin', 'auth', { scheme: 'webauthn', action: 'login', step: 'begin' });
+			const credential = await passkey.assert(begun.result.public_key);
+			const failed = await request(login, 'login-finish', 'auth', { scheme: 'webauthn', action: 'login', step: 'finish', challenge_id: begun.result.challenge_id, credential });
+			expect(failed.error.code).toBe(-32603);
+			expect(failed.error.message).toMatch(/sign in again/);
+			expect(order).toEqual(['read']);
+			expect(await sessions()).toBe(before);
+			expect((await attachments()).filter((attachment) => attachment.userId === userId && !attachment.closing)).toHaveLength(1);
+		} finally { fresh.close(); login.close(); }
 	});
 });

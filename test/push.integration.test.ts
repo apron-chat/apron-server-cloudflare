@@ -1,6 +1,7 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IDLE_CHANGES_PER_CONNECTION_MINUTE, PUSH_POLICY } from '../src/budget';
+import { pushPayload } from '../src/index';
 import { MAX_MUTE_SECONDS, MAX_ROOM_MUTES_PER_USER, MUTE_FOREVER, WAKE_SCOPES, type Store } from '../src/store';
 
 const integer = (value: unknown) => Number(value);
@@ -219,14 +220,21 @@ describe('push over the socket', () => {
 			await setIdle(peer, false);
 			expect(await idleOf(userId)).toEqual([false, false]);
 			// A malformed idle is invalid_params and changes nothing; unknown
-			// fields, and `invisible`, which is not a field any more, are
-			// ignored. Two violations leave the connection open.
+			// fields are ignored. Two violations leave the connection open.
 			await setIdle(other, true);
 			for (const params of [{ idle: 'false' }, { idle: null }]) {
 				expect((await request(other, `bad-${JSON.stringify(params)}`, 'status', params)).error.code, JSON.stringify(params)).toBe(-32602);
 				expect((await idleOf(userId)).sort(), JSON.stringify(params)).toEqual([false, true]);
 			}
-			expect((await request(other, 'unknown-fields', 'status', { invisible: true, other: 1 })).result).toEqual({});
+			expect((await request(other, 'unknown-fields', 'status', { other: 1, extra: 'x' })).result).toEqual({});
+			expect((await idleOf(userId)).sort()).toEqual([false, true]);
+			// `room_id` is checked only with `mute` (B8): `idle` ignores it, valid or not.
+			for (const room_id of ['', 7, 'x'.repeat(65), null]) {
+				expect((await request(other, `idle-room-${JSON.stringify(room_id)}`, 'status', { room_id, idle: false })).result, JSON.stringify(room_id)).toEqual({});
+				expect(await idleOf(userId)).toEqual([false, false]);
+				await setIdle(other, true);
+			}
+			expect((await request(other, 'room-only', 'status', { room_id: 7 })).result).toEqual({});
 			expect((await idleOf(userId)).sort()).toEqual([false, true]);
 			expect(other.closed()).toBeUndefined();
 		} finally { peer.close(); other.close(); }
@@ -333,6 +341,27 @@ describe('push over the socket', () => {
 			expect(pushes[0].url).toBe(bobSub.url);
 			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.body).toEqual({ text: 'ping', mentions: [carolId, bobId] });
 		} finally { alice.close(); bob.close(); carol.close(); dave.close(); }
+	});
+
+	it('falls back last to message_id, room_id and from.user_id, within 2048 bytes (B12)', () => {
+		const bytes = (text: string) => new TextEncoder().encode(text).byteLength;
+		const message = {
+			message_id: 'm'.repeat(64), log_id: '1', room_id: 'r'.repeat(64),
+			from: { user_id: 'u'.repeat(64), name: 'n'.repeat(3_000) },
+			body: { text: 'hello', mentions: ['a'] },
+			reply_to: { message_id: 'x'.repeat(64) },
+		};
+		// Even `from` cut to its `user_id` and `name` does not fit: only what names the message is left.
+		const minimal = pushPayload(message as never, 'p'.repeat(64));
+		expect(bytes(minimal)).toBeLessThanOrEqual(2048);
+		expect(JSON.parse(minimal)).toEqual({ push_id: 'p'.repeat(64), message: { message_id: message.message_id, room_id: message.room_id, from: { user_id: message.from.user_id } } });
+		// A long reply id alone forces it too.
+		const replying = pushPayload({ ...message, from: { user_id: 'u' }, reply_to: { message_id: 'x'.repeat(3_000) } } as never);
+		expect(JSON.parse(replying)).toEqual({ message: { message_id: message.message_id, room_id: message.room_id, from: { user_id: 'u' } } });
+		// Before that, the body goes first, keeping `from`'s name and the reply.
+		const bodyless = pushPayload({ ...message, from: { user_id: 'u', name: 'n'.repeat(1_200) }, body: { text: '😀'.repeat(200) } } as never);
+		expect(bytes(bodyless)).toBeLessThanOrEqual(2048);
+		expect(JSON.parse(bodyless).message).toEqual({ message_id: message.message_id, room_id: message.room_id, from: { user_id: 'u', name: 'n'.repeat(1_200) }, reply_to: message.reply_to });
 	});
 
 	it('keeps every payload within 2048 bytes, dropping mentions first', async () => {
@@ -746,23 +775,32 @@ describe('status mute', () => {
 		} finally { guest.close(); }
 	});
 
-	it('limits idle changes per connection with retry_after, changing nothing past the limit, and no SQL', async () => {
+	it('limits going idle per connection with retry_after, never refusing idle false, changing nothing past the limit, and no SQL', async () => {
 		const userId = unique('flipper');
 		const peer = await signedIn(userId);
 		const other = await signedIn(userId, true);
 		try {
-			// The first idle is a change even when it repeats the current value.
-			for (let index = 0; index < IDLE_CHANGES_PER_CONNECTION_MINUTE; index++) await setIdle(peer, index % 2 === 1);
-			const before = await idleOf(userId);
+			// Only changes to `idle: true` count: the limit's worth, with a
+			// coming back between each, leaves the connection idle.
+			for (let index = 0; index < IDLE_CHANGES_PER_CONNECTION_MINUTE; index++) {
+				if (index > 0) await setIdle(peer, false);
+				await setIdle(peer, true);
+			}
+			expect((await idleOf(userId)).sort()).toEqual([false, true]);
 			// A repeat of the current value is not a change, and is not counted.
-			await setIdle(peer, IDLE_CHANGES_PER_CONNECTION_MINUTE % 2 === 0);
-			const limited = await status(peer, { idle: IDLE_CHANGES_PER_CONNECTION_MINUTE % 2 === 1 });
+			await setIdle(peer, true);
+			// Coming back is never refused (B7), past the limit included.
+			await setIdle(peer, false);
+			expect(await idleOf(userId)).toEqual([false, false]);
+			await setIdle(peer, false);
+			// Going idle again is limited.
+			const limited = await status(peer, { idle: true });
 			expect(limited.frame.error.code).toBe(-32002);
 			expect(limited.frame.error.data.retry_after).toBeGreaterThan(0);
 			expect(limited.frame.error.data.retry_after).toBeLessThanOrEqual(60);
-			expect(await idleOf(userId)).toEqual(before);
+			expect(await idleOf(userId)).toEqual([false, false]);
 			// A limited idle fails the whole request: a mute with it is not applied.
-			const both = await status(peer, { idle: IDLE_CHANGES_PER_CONNECTION_MINUTE % 2 === 1, mute: true });
+			const both = await status(peer, { idle: true, mute: true });
 			expect(both.frame.error.code).toBe(-32002);
 			expect(mutesOf(both.skipped)).toEqual([]);
 			const stored = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.statusInputs(userId, Date.now()));
@@ -781,7 +819,7 @@ describe('status mute', () => {
 				try {
 					for (const socket of sockets) {
 						try {
-							runtime.handleStatus(socket, { method: 'status', id: 'cost', params: { idle: false }, full: false });
+							runtime.handleStatus(socket, { method: 'status', id: 'cost', params: { idle: true }, full: false });
 						} catch (error) { errors.push((error as { name: string }).name); }
 					}
 				} finally { sql.exec = exec; }
@@ -805,24 +843,31 @@ describe('push review fixes', () => {
 		});
 	}
 
-	it('treats a connection that never sent status as idle once it has been quiet for ten minutes', async () => {
+	it('never treats a quiet connection as idle: only idle true makes it so, so its user gets no push', async () => {
 		const pushes = capturePushes();
-		const [aliceId, silentId, reportingId] = [unique('alice'), unique('silent'), unique('reporting')];
+		const [aliceId, silentId, muterId, idleId] = [unique('alice'), unique('silent'), unique('muter'), unique('idle')];
 		const alice = await signedIn(aliceId);
 		const silent = await signedIn(silentId);
-		const reporting = await signedIn(reportingId);
+		const muter = await signedIn(muterId);
+		const idle = await signedIn(idleId);
 		try {
-			const silentSub = await subscribe(silent, 'silent');
-			await subscribe(reporting, 'reporting');
-			// This client reports status, and is attending: quiet or not, it is attended.
-			reporting.send({ id: statusId(), method: 'status', params: { idle: false } });
-			await request(reporting, 'sync', 'me', {});
-			await quietSince(silentId, Date.now() - 11 * 60_000);
-			await quietSince(reportingId, Date.now() - 11 * 60_000);
-			await post(alice, 'quiet', { body: { text: 'anyone?', mentions: [silentId, reportingId] } });
+			await subscribe(silent, 'silent');
+			await subscribe(muter, 'muter');
+			const idleSub = await subscribe(idle, 'idle');
+			// One never sends `status`; one sends only `mute`; one says it is idle.
+			expect((await status(muter, { mute: false })).frame.result).toEqual({});
+			await setIdle(idle, true);
+			// Quiet for far longer than any period a server once could pick: the
+			// two that never sent `idle: true` are still attended (§4.11).
+			await quietSince(silentId, Date.now() - 60 * 60_000);
+			await quietSince(muterId, Date.now() - 60 * 60_000);
+			await quietSince(idleId, Date.now() - 60 * 60_000);
+			await post(alice, 'quiet', { body: { text: 'anyone?', mentions: [silentId, muterId, idleId] } });
 			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
-			expect(pushes[0].url).toBe(silentSub.url);
-		} finally { alice.close(); silent.close(); reporting.close(); }
+			expect(pushes[0].url).toBe(idleSub.url);
+			await request(alice, 'sync', 'me', {});
+			expect(pushes).toHaveLength(1);
+		} finally { alice.close(); silent.close(); muter.close(); idle.close(); }
 	});
 
 	it('checks PUSH_HOSTS again before each push', async () => {
@@ -896,6 +941,51 @@ describe('security review fixes', () => {
 				expect(again.closed()).toBeUndefined();
 			} finally { again.close(); }
 		} finally { peer.close(); watcher.close(); }
+	});
+
+	it('spends mutesPerUserMinute only on applied changes: refused and failed mutes and statuses count nothing (B9)', async () => {
+		const userId = unique('spent');
+		const peer = await signedIn(userId);
+		const mutes = (frames: Frame[]) => frames.filter((frame) => frame.method === 'status').map((frame) => frame.params);
+		const forgive = () => runInDurableObject(stub(), (_instance, state) => {
+			for (const socket of state.getWebSockets()) socket.serializeAttachment({ ...(socket.deserializeAttachment() as object), policyViolations: [] });
+		});
+		type Patched = { store: Record<'setMute' | 'setRoomMute' | 'setStatus', (...args: unknown[]) => unknown> };
+		const fail = (on: boolean) => runInDurableObject(stub(), (instance) => {
+			const store = (instance as unknown as Patched).store;
+			for (const name of ['setMute', 'setRoomMute', 'setStatus'] as const) {
+				if (on) store[name] = () => { throw new Error('injected storage failure'); };
+				else delete (store as Record<string, unknown>)[name];
+			}
+		});
+		try {
+			// Refused: a mute of a room that does not exist, more times than the limit.
+			for (let index = 0; index < POLICY.mutesPerUserMinute + 1; index++) {
+				const refused = await status(peer, { room_id: `missing-${index}`, mute: true });
+				expect(refused.frame.error.code).toBe(-32602);
+				await forgive();
+			}
+			// Failed in storage: mutes and `me` statuses, more times than the limit.
+			await fail(true);
+			try {
+				for (let index = 0; index < POLICY.mutesPerUserMinute + 1; index++) {
+					const failed = await status(peer, index % 2 ? { mute: 60 } : { room_id: 'general', mute: 60 });
+					expect(failed.frame.error).toBeDefined();
+					expect(failed.frame.error.code).not.toBe(-32002);
+					expect(mutes(failed.skipped)).toEqual([]);
+					const chosen = await request(peer, `dnd-${index}`, 'me', { status: 'dnd' });
+					expect(chosen.error).toBeDefined();
+					expect(chosen.error.code).not.toBe(-32002);
+				}
+			} finally { await fail(false); }
+			expect((await request(peer, 'still-online', 'me', {})).result.you.status).toBe('online');
+			// The whole minute is still there: the limit's worth of changes applies, and only then retry_after.
+			for (let index = 0; index < POLICY.mutesPerUserMinute; index++) {
+				const applied = index === 0 ? await request(peer, 'dnd', 'me', { status: 'dnd' }) : (await status(peer, { mute: index % 2 ? 60 : false })).frame;
+				expect(applied.error, JSON.stringify(applied.error)).toBeUndefined();
+			}
+			expect((await status(peer, { mute: true })).frame.error.code).toBe(-32002);
+		} finally { peer.close(); }
 	});
 
 	it('limits push_register per user across reconnects', async () => {
@@ -995,28 +1085,6 @@ describe('security review fixes', () => {
 			expect((await request(peer, 'bot-again', 'command', { body: { text: '/invite-bot' } })).result).toEqual({});
 			expect(await subscriptionsOf(botId)).toEqual([]);
 		} finally { peer.close(); }
-	});
-
-	it('keeps a connection that only mutes under the silent-idle rule', async () => {
-		const pushes = capturePushes();
-		const [aliceId, quietId] = [unique('alice'), unique('quiet')];
-		const alice = await signedIn(aliceId);
-		const quiet = await signedIn(quietId);
-		try {
-			const quietSub = await subscribe(quiet, 'quiet');
-			// `mute` alone does not say the client reports idle.
-			quiet.send({ id: statusId(), method: 'status', params: { mute: false } });
-			await request(quiet, 'sync', 'me', {});
-			await runInDurableObject(stub(), (_instance, state) => {
-				for (const socket of state.getWebSockets()) {
-					const attachment = socket.deserializeAttachment() as { userId?: string; frameTimes: number[] };
-					if (attachment.userId === quietId) socket.serializeAttachment({ ...attachment, frameTimes: [Date.now() - 11 * 60_000] });
-				}
-			});
-			await post(alice, 'quiet', { body: { text: 'still there?', mentions: [quietId] } });
-			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
-			expect(pushes[0].url).toBe(quietSub.url);
-		} finally { alice.close(); quiet.close(); }
 	});
 });
 

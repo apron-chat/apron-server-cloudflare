@@ -131,16 +131,10 @@ interface ConnectionAttachment {
 	 * §4.11), so a mention or reply may wake its user by push (§4.7). Cleared
 	 * only by `idle: false`. A connection starts attended: it is never set
 	 * before sign-in (`status` then gets `denied`), and nothing carries over
-	 * from an earlier connection.
+	 * from an earlier connection. A connection that never sends `idle` stays
+	 * attended for as long as it is open and not stale (§4.11).
 	 */
 	idle?: boolean;
-	/**
-	 * The client has sent `idle` (§4.11), so it reports `idle` itself; a
-	 * connection that never has is idle once it sends nothing for a while
-	 * (SILENT_IDLE_MS), as §4.11 lets servers do. Only `idle` sets it, not
-	 * `mute`.
-	 */
-	idleSeen?: boolean;
 	/**
 	 * The user's `status` state (§4.11), read at sign-in and kept equal on
 	 * all their connections, so deriving their status and telling them of a
@@ -207,37 +201,37 @@ type ThrottledType = "activity" | "room_list";
 const THROTTLED_TYPES: readonly ThrottledType[] = ["activity", "room_list"];
 
 /**
- * A per-user event count in a rolling minute, kept on the object rather
- * than in connection attachments, so closing and reopening connections does
- * not reset it. It is lost when the object hibernates, which takes a quiet
- * object; a burst that keeps it awake stays counted. At most
- * USER_RATE_LIMIT_USERS users are tracked; the least recently counted go
- * first.
+ * An event count per key (a user, or a connection) in a rolling minute,
+ * kept on the object rather than in connection attachments, so closing and
+ * reopening connections does not reset a user's. It is lost when the object
+ * hibernates, which takes a quiet object; a burst that keeps it awake stays
+ * counted. At most RATE_LIMIT_KEYS keys are tracked; the least recently
+ * counted go first.
  */
-class UserRateLimit {
+class MinuteRateLimit {
 	private readonly events = new Map<string, number[]>();
 
 	constructor(private readonly limit: number) {}
 
-	/** Seconds until `userId` may act again, or undefined when they may now. */
-	retry(userId: string, now: number): number | undefined {
-		const recent = (this.events.get(userId) ?? []).filter((at) => at > now - THROTTLE_WINDOW_MS);
+	/** Seconds until `key` may act again, or undefined when it may now. */
+	retry(key: string, now: number): number | undefined {
+		const recent = (this.events.get(key) ?? []).filter((at) => at > now - THROTTLE_WINDOW_MS);
 		if (recent.length < this.limit) return undefined;
 		return Math.max(1, Math.ceil((recent[recent.length - this.limit] + THROTTLE_WINDOW_MS - now) / 1_000));
 	}
 
-	/** Counts one event for `userId` if the limit allows it; whether it did. */
-	take(userId: string, now: number): boolean {
-		const recent = (this.events.get(userId) ?? []).filter((at) => at > now - THROTTLE_WINDOW_MS);
+	/** Counts one event for `key` if the limit allows it; whether it did. */
+	take(key: string, now: number): boolean {
+		const recent = (this.events.get(key) ?? []).filter((at) => at > now - THROTTLE_WINDOW_MS);
 		if (recent.length >= this.limit) return false;
-		this.events.delete(userId);
-		this.events.set(userId, [...recent, now]);
-		if (this.events.size > USER_RATE_LIMIT_USERS) this.events.delete(this.events.keys().next().value!);
+		this.events.delete(key);
+		this.events.set(key, [...recent, now]);
+		if (this.events.size > RATE_LIMIT_KEYS) this.events.delete(this.events.keys().next().value!);
 		return true;
 	}
 }
 
-const USER_RATE_LIMIT_USERS = 10_000;
+const RATE_LIMIT_KEYS = 10_000;
 const THROTTLE_WINDOW_MS = 60_000;
 /**
  * The system identity for notices to one connection only, never logged
@@ -550,7 +544,6 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			} : {}),
 			...(attachment.listedJoined ? { listedJoined: true } : {}),
 			...(attachment.idle === true ? { idle: true } : {}),
-			...(attachment.idleSeen === true ? { idleSeen: true } : {}),
 			...(isStatusChoice(attachment.choice) && attachment.choice !== "online" ? { choice: attachment.choice } : {}),
 			...(Number.isSafeInteger(attachment.muteUntil) && (attachment.muteUntil as number) > 0 ? { muteUntil: attachment.muteUntil } : {}),
 			...(Number.isSafeInteger(attachment.roomMuteNext) && (attachment.roomMuteNext as number) > 0 ? { roomMuteNext: attachment.roomMuteNext } : {}),
@@ -642,8 +635,6 @@ function writeSessionAttachment(socket: WebSocketConnection, attachment: Connect
 		attachment.closing = current.closing;
 		if (current.idle) attachment.idle = true;
 		else delete attachment.idle;
-		if (current.idleSeen) attachment.idleSeen = true;
-		else delete attachment.idleSeen;
 		// Kept current by this connection's and other connections' events meanwhile.
 		for (const key of ["choice", "muteUntil", "roomMuteNext", "pres", "owed"] as const) {
 			if (current[key] !== undefined) (attachment as unknown as Record<string, unknown>)[key] = current[key];
@@ -839,14 +830,6 @@ function wakeParam(value: unknown): number | undefined {
 	return mask;
 }
 
-/**
- * A connection whose client never sent `idle` counts as idle, for pushes and
- * for the status others see, once it has sent no frame for this long: the
- * server-defined period §4.11 lets servers choose. Clients that send `idle`
- * report idle themselves; pings never reach the object, so they do not count.
- */
-const SILENT_IDLE_MS = 10 * 60_000;
-
 /** Longest `body.text` a push carries, in code points; longer text is cut, ending in `…`. */
 const PUSH_TEXT_CODE_POINTS = 200;
 
@@ -860,25 +843,32 @@ const MAX_PUSH_PAYLOAD_BYTES = 2048;
  * cut to PUSH_TEXT_CODE_POINTS (left out when empty), and without `format`,
  * `embeds`, `ext`, or the server's `prev_*` links. Each fallback drops more
  * of `message` until the whole envelope fits MAX_PUSH_PAYLOAD_BYTES: first
- * `mentions`, then all of `from` but its `user_id` and `name`, then `body`.
+ * `mentions`, then all of `from` but its `user_id` and `name`, then `body`,
+ * and last everything but `message_id`, `room_id`, and `from.user_id`.
  */
-function pushPayload(message: MessageSnapshot, pushId?: string): string {
+export function pushPayload(message: MessageSnapshot, pushId?: string): string {
 	const body = message.body ?? {};
 	const points = typeof body.text === "string" ? [...body.text] : [];
 	const text = points.length > PUSH_TEXT_CODE_POINTS ? points.slice(0, PUSH_TEXT_CODE_POINTS - 1).join("") + "…" : points.join("");
 	const tail = message.reply_to ? { reply_to: message.reply_to } : {};
 	const shortFrom = { user_id: message.from.user_id, ...(typeof message.from.name === "string" ? { name: message.from.name } : {}) };
 	const textField = text ? { text } : {};
-	const payload = (from: unknown, fields: Record<string, unknown>) => jsonString({
-		...(pushId !== undefined ? { push_id: pushId } : {}),
-		message: { message_id: message.message_id, room_id: message.room_id, from, ...tail, ...(Object.keys(fields).length ? { body: fields } : {}) },
-	});
+	const envelope = (inner: Record<string, unknown>) => jsonString({ ...(pushId !== undefined ? { push_id: pushId } : {}), message: inner });
+	const payload = (from: unknown, fields: Record<string, unknown>) =>
+		envelope({ message_id: message.message_id, room_id: message.room_id, from, ...tail, ...(Object.keys(fields).length ? { body: fields } : {}) });
 	const candidates = [
 		...(Array.isArray(body.mentions) ? [payload(message.from, { ...textField, mentions: body.mentions })] : []),
 		payload(message.from, textField),
 		payload(shortFrom, textField),
+		payload(shortFrom, {}),
 	];
-	return candidates.find((candidate) => utf8Bytes(candidate) <= MAX_PUSH_PAYLOAD_BYTES) ?? payload(shortFrom, {});
+	const fitting = candidates.find((candidate) => utf8Bytes(candidate) <= MAX_PUSH_PAYLOAD_BYTES);
+	if (fitting !== undefined) return fitting;
+	// The last resort: only what names the message. Its ids and the `push_id`
+	// are bounded, so it always fits; the assertion keeps that true.
+	const minimal = envelope({ message_id: message.message_id, room_id: message.room_id, from: { user_id: message.from.user_id } });
+	if (utf8Bytes(minimal) > MAX_PUSH_PAYLOAD_BYTES) throw new Error("push payload exceeds MAX_PUSH_PAYLOAD_BYTES");
+	return minimal;
 }
 
 // Browsers hide failed WebSocket handshake responses. An explicit, read-only
@@ -1068,14 +1058,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private guestNext = 0;
 	private guestLimit = 0;
 	/** `push_register` requests per user (`registersPerUserMinute`), counted across reconnects. */
-	private readonly pushRegisters = new UserRateLimit(PUSH_POLICY?.registersPerUserMinute ?? 1);
+	private readonly pushRegisters = new MinuteRateLimit(PUSH_POLICY?.registersPerUserMinute ?? 1);
 	/** `status` `mute` and `me` `status` changes per user (`mutesPerUserMinute`), counted across reconnects. */
-	private readonly muteChanges = new UserRateLimit(PUSH_POLICY?.mutesPerUserMinute ?? 1);
-	/** `status` `idle` changes per connection (IDLE_CHANGES_PER_CONNECTION_MINUTE), by `connId`, in memory. */
-	private readonly idleChanges = new UserRateLimit(IDLE_CHANGES_PER_CONNECTION_MINUTE);
+	private readonly statusChanges = new MinuteRateLimit(PUSH_POLICY?.mutesPerUserMinute ?? 1);
+	/** `status` changes to `idle: true` per connection (IDLE_CHANGES_PER_CONNECTION_MINUTE), by `connId`, in memory. */
+	private readonly idleChanges = new MinuteRateLimit(IDLE_CHANGES_PER_CONNECTION_MINUTE);
 	/**
 	 * When each user's status was last announced, for `statusCoalesceSeconds`;
-	 * at most USER_RATE_LIMIT_USERS, the least recently announced go first.
+	 * at most RATE_LIMIT_KEYS, the least recently announced go first.
 	 * Also kept in each connection's `pres.a`, so a wake loses only users who
 	 * have no connection, whose next announcement may then come sooner.
 	 */
@@ -1181,8 +1171,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
 		const socket = ws as WebSocketConnection;
-		// Before the attachment is read: the sweep may write it.
-		this.sweepPresence();
+		// Before the attachment is read: the sweep may write it. The sending
+		// socket has just been heard, so the sweep never judges it stale.
+		this.sweepPresence(nowMs(), socket);
 		const attachment = connectionAttachment(socket);
 		if (!attachment || attachment.closing) return Promise.resolve();
 		this.noteAccountUsageActivity(this.runtimeEnv);
@@ -1679,7 +1670,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			attachment.rooms = [...DEFAULT_JOINED_ROOMS];
 			delete attachment.listedJoined;
 			writeAttachment(socket, attachment);
-			// A guest gets no pushes, so a mute sent before signing in is dropped.
+			// A guest has no stored status or mutes: its choice lives on this connection.
 			this.prepareStatus(socket);
 			this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment) });
 			this.afterSignIn(socket);
@@ -1795,10 +1786,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return;
 		}
 		this.assertRegisteredCapacity(socket, finished.identity.user_id);
+		// Read before the session is issued and before the connection changes,
+		// so a failure leaves neither an orphan session nor a changed
+		// connection. The storage writes awaited in between hold the input
+		// gate, so no other event changes the user's status or mutes meanwhile.
+		const stored = this.readStatusInputs(finished.identity.user_id);
 		const token = await this.issueSession(finished.identity.user_id, origin, nowMs());
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
-		// Read before the connection changes, with no await after, so a failure leaves it as it was.
-		const stored = this.readStatusInputs(finished.identity.user_id);
 		const guest = attachment.tier === "anonymous" ? publicIdentity(attachment) : null;
 		const guestRooms = attachment.rooms ?? [];
 		attachment.tier = "registered";
@@ -2255,7 +2249,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (name !== undefined && hasRole(attachment, "bot")) {
 			throw { name: "denied", message: isBotId(identity.user_id) ? "A bot is named after its owner, who can rename it with /invite-bot" : "A bot can't change its name" } satisfies ProtocolError;
 		}
-		// Before the other changes: a `retry_after` leaves them all undone.
+		// Every check comes before any change, so an invalid `me` changes
+		// nothing (§3.3): the name's limits, as the store checks them, and
+		// the status's rate. `avatar` is checked above (a string); a value
+		// other than `""` is declined by being ignored.
+		if (name !== undefined) {
+			const { maxNameCodePoints, maxNameBytes } = this.config.limits;
+			if (utf8Bytes(name) > maxNameBytes) throw { name: "too_large", message: "name is too large" } satisfies ProtocolError;
+			if ([...name].length > maxNameCodePoints) throw { name: "too_large", message: "name is too long" } satisfies ProtocolError;
+		}
+		// changeChoice checks the rate before it changes anything.
 		if (status !== undefined && this.config.push) this.changeChoice(socket, attachment, statusChoice(status));
 		const removeAvatar = avatar === "" && attachment.tier === "registered" && !!this.config.uploads;
 		if (removeAvatar) {
@@ -2575,13 +2578,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * changes. Before sign-in it gets `denied`. `idle` marks this connection
 	 * unattended (true) or attended (false), kept in the attachment, so it
 	 * survives hibernation; only `idle: false` ends it, and closing removes
-	 * the connection; `room_id` does not scope it. At most
-	 * IDLE_CHANGES_PER_CONNECTION_MINUTE changes of `idle` a connection, past
-	 * which `retry_after`. `mute` is `true`, `false`, or seconds (cut to
+	 * the connection. `room_id` scopes only `mute`: without `mute` it is
+	 * neither checked nor used. At most IDLE_CHANGES_PER_CONNECTION_MINUTE
+	 * changes to `idle: true` a connection, past which `retry_after`;
+	 * `idle: false` is never refused, so a client coming back is always
+	 * shown attended. `mute` is `true`, `false`, or seconds (cut to
 	 * MAX_MUTE_SECONDS; `0` is `false`), stored for a registered user, so it
 	 * outlasts the connection (changeMute). Guests get no pushes, so there is
 	 * nothing for their mutes to silence: a guest's `mute` is `denied`, and
-	 * with it the whole request; a guest's `idle` alone applies. An invalid `idle`, `mute` or `room_id` is
+	 * with it the whole request; a guest's `idle` alone applies. An invalid
+	 * `idle` or `mute`, or with `mute` an invalid `room_id`, is
 	 * `invalid_params`; unknown fields are ignored. Every check that can fail
 	 * comes before any change, and the mute, the only part that can fail in
 	 * storage, is applied before `idle`.
@@ -2596,7 +2602,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (params.mute !== undefined && mute === undefined) {
 			throw { name: "invalid_params", message: "mute must be true, false, or a whole number of seconds" } satisfies ProtocolError;
 		}
-		const roomId = params.room_id;
+		// `room_id` scopes only `mute`; `idle` ignores it.
+		const roomId = mute !== undefined ? params.room_id : undefined;
 		if (roomId !== undefined && !validRoomId(roomId)) throw { name: "invalid_params", message: "room_id must be a room" } satisfies ProtocolError;
 		// Guests get no pushes, so a mute could change nothing: denied, and
 		// the whole request with it, `idle` included.
@@ -2604,11 +2611,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			throw { name: "denied", message: "Only registered users can mute" } satisfies ProtocolError;
 		}
 		const now = nowMs();
-		// The connection's first `idle` ends the silent-connection rule
-		// (attendedConnection), so it counts as a change even when it repeats.
-		const first = idle !== undefined && !state.idleSeen;
-		const idleChange = idle !== undefined && (first || (state.idle === true) !== idle);
-		if (idleChange) {
+		const idleChange = idle !== undefined && (state.idle === true) !== idle;
+		// Only going idle is limited: each one takes a coming back to repeat,
+		// so this bounds both, and a client coming back is never refused.
+		const limited = idleChange && idle === true;
+		if (limited) {
 			const wait = this.idleChanges.retry(state.connId, now);
 			if (wait !== undefined) throw { name: "retry_after", message: "Idle changes limited", data: { retry_after: wait } } satisfies ProtocolError;
 		}
@@ -2616,10 +2623,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.changeMute(state.userId!, roomId ?? null, mute, now);
 		}
 		if (idleChange) {
-			this.idleChanges.take(state.connId, now);
-			const latest = connectionAttachment(socket) ?? state;
-			if (first) latest.idleSeen = true;
-			this.setIdle(socket, latest, idle!);
+			if (limited) this.idleChanges.take(state.connId, now);
+			this.setIdle(socket, connectionAttachment(socket) ?? state, idle!);
 		}
 		this.reply(socket, request, {});
 	}
@@ -2634,7 +2639,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `true`, or `false` once it ends. Throws, changing nothing, past
 	 * `mutesPerUserMinute` (`retry_after`), for a mute of a room that does
 	 * not exist (`invalid_params`), and for a room mute past
-	 * MAX_ROOM_MUTES_PER_USER (`denied`).
+	 * MAX_ROOM_MUTES_PER_USER (`denied`); only a change that the store
+	 * accepted counts against `mutesPerUserMinute`.
 	 */
 	private changeMute(userId: string, roomId: string | null, mute: number | boolean, now: number): void {
 		const untilMs = mute === true ? MUTE_FOREVER : mute === false ? null : now + Math.min(mute, MAX_MUTE_SECONDS) * 1_000;
@@ -2642,14 +2648,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (roomId !== null && untilMs !== null && !this.roomExists(roomId)) {
 			throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
 		}
-		// Each change writes rows: past `mutesPerUserMinute` a user's changes are refused.
-		if (!this.muteChanges.take(userId, now)) {
-			throw { name: "retry_after", message: "Mute changes limited", data: { retry_after: this.muteChanges.retry(userId, now) ?? 1 } } satisfies ProtocolError;
-		}
+		// Each change writes rows: past `mutesPerUserMinute` a user's changes
+		// are refused. Only an applied change counts: a refused or failed one
+		// spends nothing.
+		const wait = this.statusChanges.retry(userId, now);
+		if (wait !== undefined) throw { name: "retry_after", message: "Mute changes limited", data: { retry_after: wait } } satisfies ProtocolError;
 		const result = roomId === null ? this.store.setMute({ userId, untilMs, now }) : this.store.setRoomMute({ userId, roomId, untilMs, now });
 		if ("refused" in result && result.refused) {
 			throw { name: "denied", message: `At most ${MAX_ROOM_MUTES_PER_USER} rooms can be muted; unmute one first` } satisfies ProtocolError;
 		}
+		this.statusChanges.take(userId, now);
 		if (!result.changed) return;
 		this.cacheStatusState(userId, (state) => {
 			if (roomId === null) {
@@ -2748,8 +2756,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * value this server does not support (statusChoice). A registered user's
 	 * is stored; a guest's lives on their connection, as their identity
 	 * does. Kept on all the user's connections, so deriving what others see
-	 * needs no SQL. A change counts against `mutesPerUserMinute` with mutes;
-	 * past it, `retry_after`. Each change is sent to the user's other
+	 * needs no SQL. A change counts against `mutesPerUserMinute` with mutes,
+	 * once stored; past it, `retry_after`, before anything changes. Each
+	 * change is sent to the user's other
 	 * connections in `you`, and to others who share a room at once, without
 	 * waiting out the coalescing minute (touchPresence).
 	 */
@@ -2757,10 +2766,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const userId = attachment.userId!;
 		if ((connectionAttachment(socket)?.choice ?? "online") === choice) return;
 		const now = nowMs();
-		if (!this.muteChanges.take(userId, now)) {
-			throw { name: "retry_after", message: "Status changes limited", data: { retry_after: this.muteChanges.retry(userId, now) ?? 1 } } satisfies ProtocolError;
-		}
+		const wait = this.statusChanges.retry(userId, now);
+		if (wait !== undefined) throw { name: "retry_after", message: "Status changes limited", data: { retry_after: wait } } satisfies ProtocolError;
 		if (attachment.tier === "registered") this.store.setStatus({ userId, choice, now });
+		this.statusChanges.take(userId, now);
 		this.cacheStatusState(userId, (state) => {
 			if (choice === "online") delete state.choice;
 			else state.choice = choice;
@@ -2789,9 +2798,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Marks a signed-in connection idle or attended (`status` `idle`,
 	 * §4.11) and re-derives its user's status. handleStatus calls it only
-	 * for a change, which includes the connection's first `idle` (it ends
-	 * the silent-connection rule, attendedConnection, so the status may
-	 * change even when `idle` does not).
+	 * for a change.
 	 */
 	private setIdle(socket: WebSocketConnection, state: ConnectionAttachment, idle: boolean): void {
 		if (idle) state.idle = true;
@@ -2802,10 +2809,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Whether a user has a connection someone attends: authenticated as them,
-	 * not stale, and not idle (§4.11). A connection whose client has never
-	 * sent `idle` counts as idle once it has sent no frame for
-	 * SILENT_IDLE_MS (pings are answered by the runtime, so they do not
-	 * count); one whose client sends `idle` is idle only when it says so.
+	 * not stale, and not idle (§4.11). A connection is attended from sign-in
+	 * until its client sends `idle: true`, however long it stays silent: the
+	 * server never infers idleness.
 	 */
 	private attended(userId: string, now: number): boolean {
 		return this.connectionsOf(userId).some((peer) => this.attendedConnection(peer, connectionAttachment(peer), now));
@@ -2813,10 +2819,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** Whether one connection is attended (see attended). */
 	private attendedConnection(socket: WebSocketConnection, state: ConnectionAttachment | null, now: number): boolean {
-		if (!state || state.idle || this.isStale(socket, now)) return false;
-		if (state.idleSeen) return true;
-		const last = state.frameTimes[state.frameTimes.length - 1] ?? 0;
-		return now - last < SILENT_IDLE_MS;
+		return !!state && !state.idle && !this.isStale(socket, now);
 	}
 
 	// User `status` shown to others (§4.11). What others see of a user is
@@ -2954,7 +2957,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private noteAnnounced(userId: string, now: number): void {
 		this.announcedAt.delete(userId);
 		this.announcedAt.set(userId, now);
-		if (this.announcedAt.size > USER_RATE_LIMIT_USERS) this.announcedAt.delete(this.announcedAt.keys().next().value!);
+		if (this.announcedAt.size > RATE_LIMIT_KEYS) this.announcedAt.delete(this.announcedAt.keys().next().value!);
 	}
 
 	/**
@@ -3095,12 +3098,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * Sweeps for status work at the start of an event: after a wake (the
 	 * timer was lost with the instance), when the timer is overdue, or once
 	 * every half `statusCoalesceSeconds`, for changes nothing announces (a
-	 * mute running out, a connection idle after SILENT_IDLE_MS, a peer gone
-	 * stale).
+	 * mute running out, a peer gone stale).
 	 */
-	private sweepPresence(now = nowMs()): void {
+	private sweepPresence(now = nowMs(), live?: WebSocket): void {
 		if (this.presenceSweptAt !== 0 && now < this.presenceDueAt && now - this.presenceSweptAt < this.config.limits.statusCoalesceSeconds * 500) return;
-		this.flushPresence(now);
+		this.flushPresence(now, live);
 	}
 
 	/** Whether any open connection is signed in, and so may be told of changes. */
@@ -3123,7 +3125,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * status differs from what was announced and whose wait is over, and each
 	 * `owed` entry that is due.
 	 */
-	flushPresence(now = nowMs()): void {
+	flushPresence(now = nowMs(), live?: WebSocket): void {
 		this.presenceSweptAt = now;
 		if (this.presenceTimer !== undefined) clearTimeout(this.presenceTimer);
 		this.presenceTimer = undefined;
@@ -3132,7 +3134,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!this.config.push) return;
 		const mode = this.presenceMode();
 		// A vanished or closed peer's close starts its own grace (connectionGone).
-		this.closeStale(now);
+		this.closeStale(now, live);
 		this.noteClosedSockets();
 		this.presenceWork(() => {
 			const coalesceMs = this.config.limits.statusCoalesceSeconds * 1_000;
@@ -3343,14 +3345,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Adds each listed user's `status` (§4.11) to a snapshot's current user
-	 * objects: as presenceSnapshot shows them, else from the status they
+	 * objects, which §4.11 has every listing carry, `offline` and `""`
+	 * included: as presenceSnapshot shows them, else from the status they
 	 * chose (`choices`, read with the listing) as a user without a
 	 * connection, else `offline`. A `lister` is made owed the changes still
 	 * due for the users without a connection it was shown, so what it was
-	 * shown does not go stale.
+	 * shown does not go stale. With presence off (capability `status` is
+	 * still advertised) every user is `""`, none, as /toggle presence off
+	 * told connected clients (clearShownStatus): a listing then shows no
+	 * one's status, and replaces any a client kept. Without push there is
+	 * no capability `status`, and no `status`.
 	 */
 	private withStatus<T extends PublicUser>(users: T[], choices: ReadonlyMap<string, StatusChoice>, lister?: WebSocketConnection): T[] {
-		if (!this.presenceMode()) return users;
+		if (!this.config.push) return users;
+		if (!this.presenceMode()) return users.map((user) => ({ ...user, status: "" as Status }));
 		const now = nowMs();
 		const { shown, owed } = this.presenceSnapshot(now);
 		const owing: OwedStatus[] = [];
@@ -3776,7 +3784,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * drop the ones they were shown (clearShownStatus); `me` `status` is
 	 * still kept, in `you`, and `invisible` and `""` still hide the user from
 	 * connected member listings, and mutes and `dnd` still silence pushes.
-	 * Turned on, it starts from each user's status then, announcing nothing.
+	 * Turned on, it starts from each user's status then, and each signed-in
+	 * connection is sent the statuses others see as after a sign-in
+	 * (sendShownStatus).
 	 */
 	private toggle(socket: WebSocketConnection, request: RequestFrame, roomId: string, feature: string): void {
 		const features: ToggleFeature[] = ["activity", ...(this.config.uploads ? ["uploads" as const] : []), ...(this.config.push ? ["presence" as const] : [])];
@@ -3792,7 +3802,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (chosen === "presence") {
 			if (!on) this.clearShownStatus();
 			this.resetPresence();
-			if (on) this.flushPresence();
+			if (on) {
+				this.flushPresence();
+				// Each signed-in connection was told `""` for everyone when presence
+				// went off: it gets the statuses others see now, as after a sign-in.
+				for (const ws of this.ctx.getWebSockets()) this.sendShownStatus(ws as WebSocketConnection);
+			}
 		}
 		const notices: Record<ToggleFeature, [string, string]> = {
 			presence: [
@@ -4279,9 +4294,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * members stored with the room, at most `roomListMembers` per room, and
 	 * every connected user who has joined it, guests included, whose
 	 * memberships live in their connections. `totals` gets each room's
-	 * `member_count` (§4.3.1) where that leaves members out. With presence
-	 * on, each carries its `status` (withStatus), and the stored members are
-	 * read with the status they chose. `lister`: the connection the listing
+	 * `member_count` (§4.3.1) where that leaves members out. Where capability
+	 * `status` is advertised, each carries its `status` (withStatus); with
+	 * presence on, the stored members are read with the status they chose. `lister`: the connection the listing
 	 * is for (see withStatus).
 	 */
 	private membersOf(roomIds: readonly string[], totals?: Map<string, number>, lister?: WebSocketConnection): Map<string, PublicUser[]> {
@@ -4307,7 +4322,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (registered + guests > users.size) totals.set(roomId, registered + guests);
 			}
 		}
-		if (!mode) return members;
+		if (!this.config.push) return members;
 		// Each listed user once, with the status every room shows them with.
 		const unique = new Map<string, PublicUser>();
 		for (const list of members.values()) for (const user of list) unique.set(user.user_id, user);
@@ -4378,11 +4393,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Closes stale connections. Nothing schedules this: it runs where a stale
 	 * peer would be seen, before `members` are listed and before admission.
+	 * `live`, a socket whose frame is being handled, has just been heard from
+	 * though its frame time is not recorded yet, so it is never closed.
 	 */
-	private closeStale(now: number): void {
+	private closeStale(now: number, live?: WebSocket): void {
 		const sockets = this.ctx.getWebSockets();
 		let closed = 0;
 		for (const ws of sockets) {
+			if (ws === live) continue;
 			const socket = ws as WebSocketConnection;
 			const attachment = connectionAttachment(socket);
 			if (!attachment || attachment.closing || !this.isStale(socket, now)) continue;
