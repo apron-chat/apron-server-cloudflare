@@ -441,6 +441,32 @@ describe('uploads end to end', () => {
 		} finally { third.close(); }
 	});
 
+	it('drops an invisible user\'s missing avatar at sign-in without telling others they connected', async () => {
+		const userId = unique('hidden');
+		const first = await signedIn(userId);
+		const started = await request(first, 'avatar', 'command', { body: { text: '/avatar', embeds: [{ kind: 'upload' }] } });
+		expect((await put(started.result.embeds[0].write_url, png())).status).toBe(204);
+		await until(first, (frame) => frame.method === 'user');
+		expect((await request(first, 'invisible', 'me', { status: 'invisible' })).result.you.status).toBe('invisible');
+		first.close();
+		const watcher = await signedIn(unique('watcher'));
+		try {
+			await exchange(watcher, 'sync-before', 'me', {});
+			// The bucket already deleted it: signing in removes the avatar.
+			const url = await nearExpiry(userId);
+			await media().delete(url.slice('https://media.test/'.length));
+			const back = await resume(userId);
+			try {
+				await expect.poll(async () => (await avatarExpiry(userId)).avatar_url).toBe('');
+				// The user's own connection is told; others are not, since an
+				// invisible user's sign-in must not show.
+				expect((await until(back, (frame) => frame.method === 'user')).frame.params.you).toMatchObject({ user_id: userId, avatar: '', status: 'invisible' });
+				const seen = (await exchange(watcher, 'sync-after', 'me', {})).skipped;
+				expect(JSON.stringify(seen)).not.toContain(userId);
+			} finally { back.close(); }
+		} finally { watcher.close(); }
+	});
+
 	it('/toggle uploads turns uploads off and on for admins, saying which', async () => {
 		const user = await signedIn(unique('toggler'));
 		const admin = await connect(null);

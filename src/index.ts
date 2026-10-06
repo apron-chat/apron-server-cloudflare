@@ -4676,7 +4676,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const object = await media.get(key);
 			if (!object) {
 				const cleared = this.store.clearAvatar({ userId, now: nowMs() });
-				if (cleared.changed) this.announceAvatar(userId, "");
+				// This runs at sign-in: telling others of an invisible user's
+				// avatar would tell them the user just connected (§4.11). Their
+				// own connections still get `you`; others see the removal in
+				// their next listing.
+				const hidden = this.connectionsOf(userId).some((peer) => connectionAttachment(peer)?.choice === "invisible");
+				if (cleared.changed) this.announceAvatar(userId, "", !hidden);
 				return;
 			}
 			await media.put(key, await object.arrayBuffer(), { httpMetadata: object.httpMetadata });
@@ -4689,13 +4694,21 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `user` `you`, and those who share a room with them `user` `new`. An empty
 	 * `avatar` announces a removed one.
 	 */
-	private announceAvatar(userId: string, avatar: string): void {
+	private announceAvatar(userId: string, avatar: string, others = true): void {
 		const connections = this.connectionsOf(userId);
 		for (const peer of connections) {
 			const state = connectionAttachment(peer);
 			if (!state) continue;
 			setAvatar(state, avatar);
 			writeAttachment(peer, state);
+		}
+		if (!others) {
+			for (const peer of connections) {
+				const state = connectionAttachment(peer);
+				const you = state ? this.you(state) : null;
+				if (you) this.deliverTo(peer, { method: "user", params: { you: { ...you, avatar } } });
+			}
+			return;
 		}
 		const connected = connections.length ? connectionAttachment(connections[0]) : null;
 		const stored = connected ? null : this.store.getIdentity(userId);
