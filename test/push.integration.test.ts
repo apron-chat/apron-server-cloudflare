@@ -1,11 +1,11 @@
 import { env, runInDurableObject } from 'cloudflare:test';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IDLE_CHANGES_PER_CONNECTION_MINUTE, PUSH_POLICY } from '../src/budget';
-import { MAX_MUTE_SECONDS, MAX_ROOM_MUTES_PER_USER, MUTE_FOREVER, WAKE_SCOPES, type PushSubscriptionRecord, type Store } from '../src/store';
+import { MAX_MUTE_SECONDS, MAX_ROOM_MUTES_PER_USER, MUTE_FOREVER, WAKE_SCOPES, type Store } from '../src/store';
 
 const integer = (value: unknown) => Number(value);
-import { connect as open, exchange, request, status, until, type Frame, type Peer } from './helpers/socket';
-import { withStore, type TestClock } from './helpers/store';
+import { connect as open, exchange, request, status, type Frame, type Peer } from './helpers/socket';
+import { pushSubscriptionsOf, withStore, type StoredPushSubscription, type TestClock } from './helpers/store';
 import { decryptPush, testBrowser, type TestBrowser } from './helpers/webpush';
 
 let nextIp = 1;
@@ -65,8 +65,8 @@ function idleOf(userId: string): Promise<boolean[]> {
 		.map((attachment) => attachment.idle === true));
 }
 
-function subscriptionsOf(userId: string): Promise<PushSubscriptionRecord[]> {
-	return runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.pushSubscriptionsOf(userId));
+function subscriptionsOf(userId: string): Promise<StoredPushSubscription[]> {
+	return runInDurableObject(stub(), (_instance, state) => pushSubscriptionsOf(state, userId));
 }
 
 type Push = { url: string; headers: Headers; body: Uint8Array };
@@ -952,7 +952,7 @@ describe('security review fixes', () => {
 
 	it('passes over registrations PUSH_HOSTS no longer allows before they take a wake', async () => {
 		const keys = { p256dh: (await testBrowser()).p256dh, auth: 'a'.repeat(22) };
-		await withStore('push-hosts-claim', { push: { ...POLICY, wakesPerMessage: 1 } }, (store, clock) => {
+		await withStore('push-hosts-claim', { push: { ...POLICY, wakesPerMessage: 1 } }, (store, clock, state) => {
 			for (const userId of ['old', 'new']) {
 				store.registerIdentity({
 					userId, name: userId, userHandle: `handle-${userId}`, now: clock.value, ipKey: `ip-${userId}`,
@@ -1078,7 +1078,7 @@ describe('push subscriptions in the store', () => {
 
 	it('keeps subscriptionsPerUser per user, replacing the least recently registered; registrations are per user', async () => {
 		const keys = await browserKeys();
-		await withStore('push-cap', config, (store, clock) => {
+		await withStore('push-cap', config, (store, clock, state) => {
 			registerUser(store, clock, 'ann');
 			registerUser(store, clock, 'ben');
 			const url = (n: number) => `https://push.example.net/${n}`;
@@ -1089,12 +1089,12 @@ describe('push subscriptions in the store', () => {
 			// Registering the oldest again, unchanged within a day, writes nothing: it stays the oldest.
 			store.registerPushSubscription({ userId: 'ann', url: url(0), ...keys, now: clock.value });
 			store.registerPushSubscription({ userId: 'ann', url: url(99), ...keys, now: clock.value });
-			const urls = store.pushSubscriptionsOf('ann').map((row) => row.url);
+			const urls = pushSubscriptionsOf(state, 'ann').map((row) => row.url);
 			expect(urls).toHaveLength(POLICY.subscriptionsPerUser);
 			expect(urls[0]).toBe(url(99));
 			expect(urls).not.toContain(url(0));
 			// A changed push_id is a change, even within a day; an absent one removes it.
-			const of = (userId: string, n: number) => store.pushSubscriptionsOf(userId).find((row) => row.url === url(n));
+			const of = (userId: string, n: number) => pushSubscriptionsOf(state, userId).find((row) => row.url === url(n));
 			store.registerPushSubscription({ userId: 'ann', url: url(1), ...keys, pushId: 'one', now: clock.value });
 			expect(of('ann', 1)?.pushId).toBe('one');
 			store.registerPushSubscription({ userId: 'ann', url: url(1), ...keys, pushId: 'two', now: clock.value });
@@ -1104,12 +1104,12 @@ describe('push subscriptions in the store', () => {
 			expect(() => store.registerPushSubscription({ userId: 'ann', url: url(1), ...keys, pushId: 'not ok' })).toThrow(/push_id/);
 			// Ben registers the same endpoint: both hold it, each their own.
 			store.registerPushSubscription({ userId: 'ben', url: url(99), ...keys, pushId: 'ben', now: clock.value });
-			expect(store.pushSubscriptionsOf('ben').map((row) => row.url)).toEqual([url(99)]);
+			expect(pushSubscriptionsOf(state, 'ben').map((row) => row.url)).toEqual([url(99)]);
 			expect(of('ann', 99)).toBeDefined();
 			// Unregistering takes only the caller's own.
 			store.removePushSubscription({ userId: 'ann', url: url(99) });
 			expect(of('ann', 99)).toBeUndefined();
-			expect(store.pushSubscriptionsOf('ben')).toHaveLength(1);
+			expect(pushSubscriptionsOf(state, 'ben')).toHaveLength(1);
 			// No identity, no subscription.
 			expect(() => store.registerPushSubscription({ userId: 'guest_7', url: url(7), ...keys })).toThrow(/Sign in/);
 		});
@@ -1117,7 +1117,7 @@ describe('push subscriptions in the store', () => {
 
 	it('spends wake slots only on users with live registrations, and coalesces per user and room', async () => {
 		const keys = await browserKeys();
-		await withStore('push-slots', { push: { ...POLICY, wakesPerMessage: 2 } }, (store, clock) => {
+		await withStore('push-slots', { push: { ...POLICY, wakesPerMessage: 2 } }, (store, clock, state) => {
 			for (const userId of ['fay', 'gus', 'hal']) {
 				registerUser(store, clock, userId);
 				store.registerPushSubscription({ userId, url: `https://push.example.net/${userId}`, ...keys, now: clock.value });
@@ -1127,7 +1127,7 @@ describe('push subscriptions in the store', () => {
 			expect(first.subscriptions.map((row) => row.userId)).toEqual(['fay', 'gus']);
 			// Fay and Gus were just woken for general; Hal takes the slot. Another room wakes them again.
 			expect(claim(store, clock, ['fay', 'gus', 'hal']).subscriptions.map((row) => row.userId)).toEqual(['hal']);
-			expect(claim(store, clock, ['fay']).coalesced).toBe(1);
+			expect(claim(store, clock, ['fay'])).toEqual({ subscriptions: [], skipped: 0 });
 			expect(claim(store, clock, ['fay'], 'thread').subscriptions.map((row) => row.userId)).toEqual(['fay']);
 			clock.value += POLICY.coalesceSeconds * 1_000;
 			expect(claim(store, clock, ['fay']).subscriptions.map((row) => row.userId)).toEqual(['fay']);
@@ -1136,19 +1136,19 @@ describe('push subscriptions in the store', () => {
 
 	it('charges pushes to pushesPerDay and each recipient, skipping the rest until the next UTC day', async () => {
 		const keys = await browserKeys();
-		await withStore('push-daily', { push: { ...POLICY, pushesPerDay: 3, coalesceSeconds: 1 } }, (store, clock) => {
+		await withStore('push-daily', { push: { ...POLICY, pushesPerDay: 3, coalesceSeconds: 1 } }, (store, clock, state) => {
 			atMidday(clock);
 			for (const userId of ['cy', 'di', 'ed']) {
 				registerUser(store, clock, userId);
 				for (const n of [1, 2]) store.registerPushSubscription({ userId, url: `https://push.example.net/${userId}/${n}`, ...keys, now: clock.value });
 			}
-			expect(claim(store, clock, [])).toEqual({ subscriptions: [], coalesced: 0, muted: 0, skipped: 0 });
+			expect(claim(store, clock, [])).toEqual({ subscriptions: [], skipped: 0 });
 			const first = claim(store, clock, ['cy', 'di', 'nobody']);
 			expect(first.subscriptions).toHaveLength(3);
 			expect(first.skipped).toBe(1);
 			expect(store.pushesToday(clock.value)).toBe(3);
 			clock.value += 1_000;
-			expect(claim(store, clock, ['cy'])).toEqual({ subscriptions: [], coalesced: 0, muted: 0, skipped: 2 });
+			expect(claim(store, clock, ['cy'])).toEqual({ subscriptions: [], skipped: 2 });
 			clock.value += DAY;
 			expect(claim(store, clock, ['cy'], 'general', 'sal').subscriptions).toHaveLength(2);
 			expect(store.pushesToday(clock.value)).toBe(2);
@@ -1157,7 +1157,7 @@ describe('push subscriptions in the store', () => {
 
 	it('charges senders only for delivered pushes, and caps what one recipient gets a day', async () => {
 		const keys = await browserKeys();
-		await withStore('push-sender', { push: { ...POLICY, pushesPerSenderDay: 3, pushesPerRecipientDay: 3, coalesceSeconds: 1 } }, (store, clock) => {
+		await withStore('push-sender', { push: { ...POLICY, pushesPerSenderDay: 3, pushesPerRecipientDay: 3, coalesceSeconds: 1 } }, (store, clock, state) => {
 			atMidday(clock);
 			for (const userId of ['fi', 'gil', 'hu']) {
 				registerUser(store, clock, userId);
@@ -1184,7 +1184,7 @@ describe('push subscriptions in the store', () => {
 
 	it('forgets a gone registration by user, endpoint and keys, keeping a fresh one and other users\' own', async () => {
 		const [old, fresh] = [await browserKeys(), await browserKeys()];
-		await withStore('push-gone', config, (store, clock) => {
+		await withStore('push-gone', config, (store, clock, state) => {
 			registerUser(store, clock, 'ida');
 			registerUser(store, clock, 'jon');
 			const url = 'https://push.example.net/shared';
@@ -1192,18 +1192,18 @@ describe('push subscriptions in the store', () => {
 			store.registerPushSubscription({ userId: 'jon', url, ...old, now: clock.value });
 			// Ida's push came back gone: only her registration goes.
 			store.forgetPushSubscriptions([{ userId: 'ida', url, p256dh: old.p256dh }], clock.value);
-			expect(store.pushSubscriptionsOf('ida')).toEqual([]);
-			expect(store.pushSubscriptionsOf('jon')).toHaveLength(1);
+			expect(pushSubscriptionsOf(state, 'ida')).toEqual([]);
+			expect(pushSubscriptionsOf(state, 'jon')).toHaveLength(1);
 			// Jon registered again with new keys before his gone push came back: the fresh one stays.
 			store.registerPushSubscription({ userId: 'jon', url, ...fresh, now: clock.value });
 			store.forgetPushSubscriptions([{ userId: 'jon', url, p256dh: old.p256dh }], clock.value);
-			expect(store.pushSubscriptionsOf('jon').map((row) => row.p256dh)).toEqual([fresh.p256dh]);
+			expect(pushSubscriptionsOf(state, 'jon').map((row) => row.p256dh)).toEqual([fresh.p256dh]);
 		});
 	});
 
 	it('keeps accounting safe when many users register one endpoint and it goes', async () => {
 		const keys = await browserKeys();
-		await withStore('push-shared-endpoint', config, (store, clock) => {
+		await withStore('push-shared-endpoint', config, (store, clock, state) => {
 			const url = 'https://push.example.net/everyone';
 			const users = Array.from({ length: 50 }, (_, index) => `many_${index}`);
 			for (const userId of users) {
@@ -1216,7 +1216,7 @@ describe('push subscriptions in the store', () => {
 			store.forgetPushSubscriptions(claimed.subscriptions, clock.value);
 			store.forgetPushSubscriptions([{ userId: users[49], url, p256dh: keys.p256dh }], clock.value);
 			expect(store.accountingStatus().unsafe).toBe(false);
-			expect(users.filter((userId) => store.pushSubscriptionsOf(userId).length)).toHaveLength(50 - POLICY.wakesPerMessage - 1);
+			expect(users.filter((userId) => pushSubscriptionsOf(state, userId).length)).toHaveLength(50 - POLICY.wakesPerMessage - 1);
 			// The store still takes work.
 			expect(() => store.registerPushSubscription({ userId: users[0], url, ...keys, now: clock.value })).not.toThrow();
 		});
@@ -1224,7 +1224,7 @@ describe('push subscriptions in the store', () => {
 
 	it('skips registrations older than pushExpiryDays, refreshes them once a day, and cleanup deletes them', async () => {
 		const keys = await browserKeys();
-		await withStore('push-expiry', config, (store, clock) => {
+		await withStore('push-expiry', config, (store, clock, state) => {
 			registerUser(store, clock, 'kit');
 			registerUser(store, clock, 'lou');
 			store.registerPushSubscription({ userId: 'kit', url: 'https://push.example.net/kit', ...keys, now: clock.value });
@@ -1234,19 +1234,19 @@ describe('push subscriptions in the store', () => {
 			store.registerPushSubscription({ userId: 'lou', url: 'https://push.example.net/lou', ...keys, now: clock.value });
 			clock.value += DAY + 1_000;
 			expect(claim(store, clock, ['kit', 'lou']).subscriptions.map((row) => row.userId)).toEqual(['lou']);
-			expect(store.pushSubscriptionsOf('kit')).toHaveLength(1);
+			expect(pushSubscriptionsOf(state, 'kit')).toHaveLength(1);
 			for (let run = 0; run < 3; run++) {
 				store.runCleanup(clock.value);
 				clock.value += 2_000;
 			}
-			expect(store.pushSubscriptionsOf('kit')).toEqual([]);
-			expect(store.pushSubscriptionsOf('lou')).toHaveLength(1);
+			expect(pushSubscriptionsOf(state, 'kit')).toEqual([]);
+			expect(pushSubscriptionsOf(state, 'lou')).toHaveLength(1);
 		});
 	});
 
 	it('mutes for seconds or until changed, skips muted and dnd users without a wake slot, and moves mutes with /rename', async () => {
 		const keys = await browserKeys();
-		await withStore('push-mute', { push: { ...POLICY, wakesPerMessage: 1 } }, (store, clock) => {
+		await withStore('push-mute', { push: { ...POLICY, wakesPerMessage: 1 } }, (store, clock, state) => {
 			for (const userId of ['mo', 'ned', 'dee']) {
 				registerUser(store, clock, userId);
 				store.registerPushSubscription({ userId, url: `https://push.example.net/${userId}`, ...keys, now: clock.value });
@@ -1258,7 +1258,8 @@ describe('push subscriptions in the store', () => {
 			expect(store.setStatus({ userId: 'dee', choice: 'dnd', now: clock.value })).toEqual({ changed: false });
 			const first = claim(store, clock, ['mo', 'dee', 'ned']);
 			expect(first.subscriptions.map((row) => row.userId)).toEqual(['ned']);
-			expect(first.muted).toBe(2);
+			// Neither took the one wake slot, and nothing was skipped for an allowance.
+			expect(first.skipped).toBe(0);
 			// It ends by itself, with no write; dnd lasts until changed.
 			clock.value += 91_000;
 			expect(muteOf('mo')).toBeUndefined();
@@ -1295,7 +1296,7 @@ describe('push subscriptions in the store', () => {
 			}).result.room_id as string;
 			expect(store.setRoomMute({ userId: 'rho', roomId: 'general', untilMs: clock.value + 10_000, now: clock.value })).toEqual({ changed: true, untilMs: clock.value + 10_000 });
 			// The parent's mute silences the thread.
-			expect(claim(store, clock, ['rho'], thread).muted).toBe(1);
+			expect(claim(store, clock, ['rho'], thread)).toEqual({ subscriptions: [], skipped: 0 });
 			expect(store.setRoomMute({ userId: 'rho', roomId: 'general', untilMs: null, now: clock.value })).toEqual({ changed: true });
 			expect(store.setRoomMute({ userId: 'rho', roomId: 'general', untilMs: null, now: clock.value })).toEqual({ changed: false });
 			expect(claim(store, clock, ['rho'], thread).subscriptions).toHaveLength(1);
@@ -1322,17 +1323,17 @@ describe('push subscriptions in the store', () => {
 
 	it('moves subscriptions with /rename, push_id kept, and deletes them with /purge', async () => {
 		const keys = await browserKeys();
-		await withStore('push-rename', config, (store, clock) => {
+		await withStore('push-rename', config, (store, clock, state) => {
 			registerUser(store, clock, 'eve');
 			store.registerPushSubscription({ userId: 'eve', url: 'https://push.example.net/eve', ...keys, pushId: 'eve-laptop', now: clock.value });
 			expect(claim(store, clock, ['eve']).subscriptions).toHaveLength(1);
 			store.renameIdentity({ from: 'eve', to: 'eva', now: clock.value });
-			expect(store.pushSubscriptionsOf('eve')).toEqual([]);
-			expect(store.pushSubscriptionsOf('eva')).toEqual([{ url: 'https://push.example.net/eve', userId: 'eva', ...keys, pushId: 'eve-laptop', wake: ['mentions', 'replies'] }]);
+			expect(pushSubscriptionsOf(state, 'eve')).toEqual([]);
+			expect(pushSubscriptionsOf(state, 'eva')).toEqual([{ url: 'https://push.example.net/eve', userId: 'eva', ...keys, pushId: 'eve-laptop', wake: ['mentions', 'replies'] }]);
 			// The wake time moved too: Eva is still coalesced in general.
-			expect(claim(store, clock, ['eva']).coalesced).toBe(1);
+			expect(claim(store, clock, ['eva'])).toEqual({ subscriptions: [], skipped: 0 });
 			store.purgeUsers({ userIds: ['eva'], now: clock.value });
-			expect(store.pushSubscriptionsOf('eva')).toEqual([]);
+			expect(pushSubscriptionsOf(state, 'eva')).toEqual([]);
 		});
 	});
 });

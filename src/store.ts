@@ -805,14 +805,8 @@ export const PUSH_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
  * the user) and `replies` (replies to the user's messages).
  */
 export const WAKE_SCOPES = { mentions: 1, replies: 2 } as const;
-export type WakeScope = keyof typeof WAKE_SCOPES;
 /** Every scope, the default for a registration without `wake`. */
 export const DEFAULT_WAKE = WAKE_SCOPES.mentions | WAKE_SCOPES.replies;
-
-/** The scopes a `wake` bitmask names, in WAKE_SCOPES order. */
-export function wakeScopes(mask: number): WakeScope[] {
-  return (Object.keys(WAKE_SCOPES) as WakeScope[]).filter((scope) => (mask & WAKE_SCOPES[scope]) !== 0);
-}
 
 /** A `user_status` or `room_mutes` row's `mute_until_ms` for a mute that lasts until changed (`mute: true`). */
 export const MUTE_FOREVER = Number.MAX_SAFE_INTEGER;
@@ -909,23 +903,17 @@ export interface PushSubscriptionRecord {
   p256dh: string;
   auth: string;
   pushId?: string;
-  /** The scopes it wakes for (protocol §4.7). */
-  wake: WakeScope[];
 }
 
 type RawPushRow = { url: string; p256dh: string; auth: string; push_id: string | null; wake: number };
 
 function pushRecord(row: RawPushRow, userId: string): PushSubscriptionRecord {
-  return { url: row.url, userId, p256dh: row.p256dh, auth: row.auth, ...(row.push_id !== null ? { pushId: row.push_id } : {}), wake: wakeScopes(integerColumn(row.wake)) };
+  return { url: row.url, userId, p256dh: row.p256dh, auth: row.auth, ...(row.push_id !== null ? { pushId: row.push_id } : {}) };
 }
 
 /** What a message's wake claimed (Store.claimPushes). */
 export interface PushClaim {
   subscriptions: PushSubscriptionRecord[];
-  /** Users skipped because they were woken for the room within `coalesceSeconds`. */
-  coalesced: number;
-  /** Users skipped because a mute or a `dnd` status silences them (protocol §4.7, §4.11). */
-  muted: number;
   /** Subscriptions left out by the daily server or sender allowance. */
   skipped: number;
 }
@@ -4434,10 +4422,9 @@ export class Store {
    * loses the least recently registered of the others. Clients register on
    * every connection, so an unchanged registration (keys, `push_id`, scopes)
    * registered again within a day writes nothing; one not registered for
-   * `pushExpiryDays` is skipped by wakes and deleted by cleanup. Returns
-   * when the registration was last registered, as stored, and its scopes.
+   * `pushExpiryDays` is skipped by wakes and deleted by cleanup.
    */
-  registerPushSubscription(input: { userId: string; url: string; p256dh: string; auth: string; pushId?: string; wake?: number; now?: number }): { updatedMs: number; wake: number } {
+  registerPushSubscription(input: { userId: string; url: string; p256dh: string; auth: string; pushId?: string; wake?: number; now?: number }): void {
     this.ensureReady();
     const policy = this.config.push;
     if (!policy) throw new StoreError("unsupported", "Push is not available here");
@@ -4458,7 +4445,7 @@ export class Store {
         input.userId, input.url,
       )[0];
       if (existing && existing.p256dh === input.p256dh && existing.auth === input.auth && existing.push_id === pushId && integerColumn(existing.wake) === wake &&
-          effective - integerColumn(existing.updated_ms) < PUSH_REFRESH_MS) return { updatedMs: integerColumn(existing.updated_ms), wake };
+          effective - integerColumn(existing.updated_ms) < PUSH_REFRESH_MS) return;
       if (!existing) this.ensureGrowthCapacity(2 * MAX_PUSH_URL_BYTES);
       this.rawExec(
         `INSERT INTO push_subscriptions (user_id, url, p256dh, auth, push_id, wake, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -4472,7 +4459,6 @@ export class Store {
            WHERE user_id = ? AND url <> ? ORDER BY updated_ms DESC LIMIT -1 OFFSET ?)`,
         input.userId, input.userId, input.url, policy.subscriptionsPerUser - 1,
       );
-      return { updatedMs: effective, wake };
     }));
   }
 
@@ -4485,16 +4471,6 @@ export class Store {
     });
   }
 
-  /** A user's push registrations, expired ones included, most recently registered first. */
-  pushSubscriptionsOf(userId: string, now = this.clock.now()): PushSubscriptionRecord[] {
-    this.ensureReady();
-    return this.reserved({ reads: 8 + 2 * MAX_PUSH_SUBSCRIPTIONS_PER_USER }, false, now, () => this.rawRows<RawPushRow>(
-      `SELECT url, p256dh, auth, push_id, wake FROM push_subscriptions INDEXED BY push_subscriptions_user_idx
-       WHERE user_id = ? ORDER BY updated_ms DESC LIMIT ?`,
-      userId, MAX_PUSH_SUBSCRIPTIONS_PER_USER,
-    ).map((row) => pushRecord(row, userId)));
-  }
-
   /**
    * The registrations a new message in `roomId` pushes to (protocol §4.7).
    * `candidates` are the users the caller found unattended among those the
@@ -4502,11 +4478,11 @@ export class Store {
    * at most MAX_PUSH_CANDIDATES. Each is looked up in turn: only its
    * unexpired registrations whose `wake` includes one of those scopes count,
    * and one with none is passed over without taking a wake; so is one that a
-   * mute or a `dnd` status silences (`muted`, protocol §4.7: a silenced push
+   * mute or a `dnd` status silences (protocol §4.7: a silenced push
    * goes only to `badge` registrations, which this server does not have):
    * its unscoped mute, or its mute of the room or, for a thread, of the
    * thread's parent; one woken for this room within `coalesceSeconds` is
-   * passed over too (`coalesced`); the rest are woken, up to
+   * passed over too; the rest are woken, up to
    * `wakesPerMessage` users, on each of their registrations (most recently
    * registered first). Pushes are checked against the sender's
    * `pushesPerSenderDay` (charged once delivered, chargePushSender), charged
@@ -4521,7 +4497,7 @@ export class Store {
     const reasons = new Map<string, number>();
     for (const candidate of input.candidates) reasons.set(candidate.userId, (reasons.get(candidate.userId) ?? 0) | candidate.reasons);
     const candidates = [...reasons.keys()].slice(0, MAX_PUSH_CANDIDATES);
-    const claim: PushClaim = { subscriptions: [], coalesced: 0, muted: 0, skipped: 0 };
+    const claim: PushClaim = { subscriptions: [], skipped: 0 };
     if (!policy || !candidates.length) return claim;
     const now = input.now ?? this.clock.now();
     // Each candidate's status row, live index range, two room mute probes,
@@ -4542,10 +4518,7 @@ export class Store {
         if (woken >= policy.wakesPerMessage) break;
         // A muted or `dnd` user gets no pushes (protocol §4.7, §4.11) and takes no wake.
         const status = this.rawRows<{ status: string; mute_until_ms: number | null }>("SELECT status, mute_until_ms FROM user_status WHERE user_id = ? LIMIT 1", userId)[0];
-        if (status && (status.status === "dnd" || (status.mute_until_ms != null && integerColumn(status.mute_until_ms) > effective))) {
-          claim.muted += 1;
-          continue;
-        }
+        if (status && (status.status === "dnd" || (status.mute_until_ms != null && integerColumn(status.mute_until_ms) > effective))) continue;
         // Filtered after the bounded read, so the read stays one index range of
         // at most `subscriptionsPerUser` rows whatever the scopes; the partial
         // index leaves out registrations that wake for nothing.
@@ -4561,15 +4534,9 @@ export class Store {
           `SELECT mute_until_ms FROM room_mutes WHERE user_id = ? AND room_id IN (${scopes.map(() => "?").join(", ")}) AND mute_until_ms > ? LIMIT 1`,
           userId, ...scopes, effective,
         );
-        if (roomMuted.length) {
-          claim.muted += 1;
-          continue;
-        }
+        if (roomMuted.length) continue;
         const last = this.rawRows<{ woken_ms: number }>("SELECT woken_ms FROM push_wakes WHERE user_id = ? AND room_id = ? LIMIT 1", userId, input.roomId)[0];
-        if (last && effective - integerColumn(last.woken_ms) < policy.coalesceSeconds * 1_000) {
-          claim.coalesced += 1;
-          continue;
-        }
+        if (last && effective - integerColumn(last.woken_ms) < policy.coalesceSeconds * 1_000) continue;
         // The counters are read once a user is found to wake, so a message
         // that wakes no one writes nothing. Reuse posts_day as the counts; the
         // scope separates them.

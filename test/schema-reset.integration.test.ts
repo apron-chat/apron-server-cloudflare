@@ -2,6 +2,7 @@ import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
 import { BOOTSTRAP_ROW_RESERVATION } from '../src/budget';
 import { MAX_CARRIED_PASSKEYS, SCHEMA_VERSION, UPGRADABLE_SCHEMA_VERSIONS, type Store } from '../src/store';
+import { pushSubscriptionsOf } from './helpers/store';
 
 type Runtime = { store: Store };
 
@@ -335,7 +336,7 @@ it('upgrades a schema 7 store in place: it gains the push and user status tables
 		expect(sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mutes'").toArray()).toEqual([]);
 		expect(store.getRoomState().latest_log_id).toBe(head);
 		expect(store.getIdentity('kept_user')?.name).toBe('Kept');
-		expect(store.pushSubscriptionsOf('kept_user')).toEqual([]);
+		expect(pushSubscriptionsOf(state, 'kept_user')).toEqual([]);
 		expect(store.statusInputs('kept_user')).toEqual({ choice: 'online', roomMutes: [] });
 	});
 });

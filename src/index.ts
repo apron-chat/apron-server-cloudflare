@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, pushHostAllowed, type RuntimeConfig } from "./config";
-import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, DEFAULT_FEATURES, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
+import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
 import { fetchAccountUsage, type AccountUsageSnapshot } from "./account-usage";
 import { runBudgetGuard, watchForFlood } from "./budget-guard";

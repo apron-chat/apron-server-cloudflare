@@ -858,13 +858,13 @@ describe('measured storage accounting', () => {
 			expect(measure('status inputs at sign-in, nothing stored', () => store.statusInputs('matrix-user', clock.now()))).toEqual({ choice: 'online', roomMutes: [] });
 			measure('mute set', () => store.setMute({ userId: 'matrix-user', untilMs: clock.now() + 3_600_000, now: clock.now() }));
 			measure('status set', () => store.setStatus({ userId: 'matrix-user', choice: 'dnd', now: clock.now() }));
-			expect(measure('push wake claim, dnd and muted', () => store.claimPushes({ senderId: 'matrix-sender', roomId: threadId, candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() })).muted).toBe(1);
+			expect(measure('push wake claim, dnd and muted', () => store.claimPushes({ senderId: 'matrix-sender', roomId: threadId, candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() }))).toEqual({ subscriptions: [], skipped: 0 });
 			measure('room mute set', () => store.setRoomMute({ userId: 'matrix-user', roomId: 'general', untilMs: clock.now() + 60_000, now: clock.now() }));
 			expect(measure('status inputs at sign-in, status, mute and one room mute', () => store.statusInputs('matrix-user', clock.now()))).toEqual({ choice: 'dnd', muteUntil: clock.now() + 3_600_000, roomMutes: [{ roomId: 'general', untilMs: clock.now() + 60_000 }] });
 			store.setStatus({ userId: 'matrix-user', choice: 'online', now: clock.now() });
 			store.setMute({ userId: 'matrix-user', untilMs: null, now: clock.now() });
 			// The thread's parent is muted: a wake for the thread is silenced by it.
-			expect(measure('push wake claim, the thread\'s parent muted', () => store.claimPushes({ senderId: 'matrix-sender', roomId: threadId, candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() })).muted).toBe(1);
+			expect(measure('push wake claim, the thread\'s parent muted', () => store.claimPushes({ senderId: 'matrix-sender', roomId: threadId, candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() }))).toEqual({ subscriptions: [], skipped: 0 });
 			// The most room mutes a user may hold: the sign-in reads them all.
 			state.storage.transactionSync(() => {
 				for (let index = 1; index < MAX_ROOM_MUTES_PER_USER; index += 1) {
