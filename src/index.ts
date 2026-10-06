@@ -1518,8 +1518,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 			throw error;
 		}
-		// A method that is only a notification ignores an `id`, and is never
-		// answered with a result or an error (§1).
+		// A method clients send only as a notification (§1.1) ignores an `id`,
+		// and is never answered with a result or an error: this server's
+		// policy (NOTIFICATION_METHODS).
 		const request = notificationOnly(parsed.request.method) && parsed.request.id !== undefined
 			? { ...parsed.request, id: undefined } : parsed.request;
 		try {

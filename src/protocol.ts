@@ -93,20 +93,22 @@ export const DEFAULT_PARSE_OPTIONS: ParseOptions = {
 };
 
 /**
- * Methods the protocol defines only as notifications: one sent with an `id`
- * is handled as the notification and gets no reply, not even an error for
- * invalid params (§1). The liveness ping is answered with `pong`, a
- * notification, not a reply. A client's `status` is a request (§4.5),
+ * Methods clients send as notifications, without an `id` (the table in
+ * §1.1). By this server's policy, not the protocol's, one sent with an `id`
+ * anyway is handled as the notification and gets no reply, not even an
+ * error for invalid params: answering it would make a notification look
+ * like a request. The liveness ping is answered with `pong`, a
+ * notification, not a reply. A client's `status` is a request (§1.1, §4.5),
  * not one of these.
  */
 export const NOTIFICATION_METHODS: ReadonlySet<string> = new Set(["ping", "activity"]);
 
-/** Whether `method` is one the protocol defines only as a notification (§1). */
+/** Whether `method` is one clients send only as a notification (§1.1). */
 export function notificationOnly(method: unknown): boolean {
 	return typeof method === "string" && NOTIFICATION_METHODS.has(method);
 }
 
-/** Whether a frame gets no reply: it has no `id`, or its method is only a notification (§1). */
+/** Whether a frame gets no reply: it has no `id`, or its method is only a notification (NOTIFICATION_METHODS). */
 export function isNotification(method: unknown, id: string | undefined): boolean {
 	return id === undefined || notificationOnly(method);
 }
@@ -133,13 +135,13 @@ export function parseFrame(data: string | ArrayBuffer | ArrayBufferView, options
 	let id: string | undefined;
 	if (Object.hasOwn(value, "id")) {
 		if (typeof value.id !== "string" || utf8Bytes(value.id) > options.maxRequestIdBytes) {
-			// A notification-only method is never answered, whatever its `id` (§1).
+			// A notification-only method is never answered, whatever its `id` (NOTIFICATION_METHODS).
 			throw new FrameError({ name: "invalid_request", message: "Request id must be a bounded string" }, { full, notification: notificationOnly(value.method) });
 		}
 		id = value.id;
 	}
 	// Decided from the method, which is known before any params check, so no
-	// error below answers a notification-only method sent with an `id` (§1).
+	// error below answers a notification-only method sent with an `id` (NOTIFICATION_METHODS).
 	const notification = isNotification(value.method, id);
 	const failure = { id: id ?? null, full, notification };
 	// An invalid envelope is answered, even without an `id`, unless its method is only a notification.

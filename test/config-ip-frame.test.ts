@@ -58,7 +58,7 @@ describe('frame policy boundaries', () => {
 		expect(() => parseFrame('"' + 'é'.repeat(8192) + '"')).toThrow(FrameError);
 		expect(() => parseFrame(new ArrayBuffer(0))).toThrow(expect.objectContaining({ closeCode: 1003 }));
 	});
-	it('marks failures of notification-only methods as notifications, whatever their id (§1)', () => {
+	it('marks failures of notification-only methods as notifications, whatever their id (server policy; §1.1 lists them)', () => {
 		const failure = (raw: string) => {
 			try {
 				parseFrame(raw, { ...DEFAULT_PARSE_OPTIONS, maxJsonDepth: 3 });

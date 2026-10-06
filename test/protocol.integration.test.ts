@@ -176,7 +176,7 @@ it('answers the liveness ping before and after authentication', async () => {
 		// Other spacing reaches the handler, which answers it as well.
 		peer.socket.send('{ "method": "ping" }');
 		expect(await peer.next()).toEqual({ method: 'pong' });
-		// `ping` is only a notification: an `id` is ignored, so it gets `pong`
+		// Clients send `ping` as a notification (§1.1): by server policy an `id` is ignored, so it gets `pong`
 		// and no reply, before auth too (§1).
 		peer.send({ id: 'ping-request', method: 'ping' });
 		expect(await peer.next()).toEqual({ method: 'pong' });
@@ -187,7 +187,7 @@ it('answers the liveness ping before and after authentication', async () => {
 	} finally { peer.close(); }
 });
 
-it('never answers a notification-only method sent with an id, even with invalid params or while busy (§1)', async () => {
+it('never answers a notification-only method sent with an id, even with invalid params or while busy (server policy; §1.1)', async () => {
 	// Two frames a connection, as each counts as a policy violation and three close it.
 	const first = await connect();
 	const second = await connect();
@@ -504,7 +504,7 @@ it('leaves activity off when ACTIVITY is false: not advertised, and typing is no
 		await authenticate(alice);
 		await authenticate(bob);
 		alice.send({ method: 'activity', params: { room_id: 'general', typing: 5 } });
-		// `activity` is only a notification: one with an `id` gets no reply, even with activity off (§1).
+		// Clients send `activity` as a notification (§1.1): by server policy one with an `id` gets no reply, even with activity off.
 		alice.send({ id: 'typing-request', method: 'activity', params: { room_id: 'general', typing: 5 } });
 		expect((await exchange(alice, 'after-typing', 'me', {})).skipped.filter((frame) => frame.id === 'typing-request')).toEqual([]);
 		alice.send({ id: 'after', method: 'message', params: { room_id: 'general', body: { text: 'no typing relayed' } } });

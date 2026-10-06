@@ -204,7 +204,9 @@ within it:
   memberships carry neither. Deletion does not redact earlier snapshots; they
   expire with the retention window.
 - Ordering: `auth` finishes before any later frame on its connection, and the
-  notifications a request causes on its connection come before its result.
+  notifications a request causes on its connection come before its result,
+  except a sign-in's: those come after the `auth` result, including a new
+  account's logged joins and the statuses and mutes that follow a sign-in.
 
 ## Authentication policy
 
