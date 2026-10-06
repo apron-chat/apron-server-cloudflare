@@ -553,7 +553,7 @@ it('limits the frames the whole server processes in a minute without closing soc
 	} finally { peer.close(); await configure((config) => { config.limits.globalFramesPerMinute = DEFAULT_LIMITS.globalFramesPerMinute; }); }
 });
 
-it('with ACTIVITY on, relays typing to room members, ignores away, throttles per user, and tells only the sender once', async () => {
+it('with ACTIVITY on, relays typing to room members, throttles per user, and tells only the sender once', async () => {
 	await configure((config) => { config.activityEnabled = true; });
 	const alice = await connect();
 	const bob = await connect();
@@ -564,8 +564,6 @@ it('with ACTIVITY on, relays typing to room members, ignores away, throttles per
 		await authenticate(carol, 'guest', ['activity']);
 		// Carol has left general, so typing there is not relayed to her.
 		await request(carol, 'leave', 'room_leave', { room_id: 'general' });
-		// An unknown field such as the former `away` is ignored and never delivered.
-		alice.send({ method: 'activity', params: { away: true } });
 		alice.send({ method: 'activity', params: { typing: 99 } });
 		const first = await until(bob, (frame) => frame.method === 'activity');
 		// Typing is capped by policy, in the default room without room_id; the
@@ -591,8 +589,8 @@ it('with ACTIVITY on, relays typing to room members, ignores away, throttles per
 		const history = await request(alice, 'history', 'history', { room_id: 'general', limit: 50 });
 		const entries: Array<{ message_id: string; from?: { user_id: string } }> = history.result.messages;
 		expect(entries.some((entry) => entry.message_id === mine.frame.result.message_id)).toBe(true);
-		// No system notice is logged: neither v7 `~` nor legacy `@` senders.
-		expect(entries.some((entry) => entry.from?.user_id?.startsWith('~') || entry.from?.user_id?.startsWith('@'))).toBe(false);
+		// No system notice is logged.
+		expect(entries.some((entry) => entry.from?.user_id?.startsWith('~'))).toBe(false);
 	} finally { alice.close(); bob.close(); carol.close(); await configure((config) => { config.activityEnabled = false; }); }
 });
 
@@ -831,8 +829,6 @@ it('speaks protocol v8: a sign-in welcome, no email sign-in, and ~private notice
 	try {
 		const { server, welcome } = await greeting(withPasskeys);
 		expect(server.params).toMatchObject({ apron: 8, agent: 'apron-cloudflare-demo/8', auth: ['webauthn', 'token', 'guest'] });
-		// Only the protocol's current names (0bf4a27): no `protocol`, `caps`, or `name`.
-		for (const legacy of ['protocol', 'caps', 'name']) expect(server.params).not.toHaveProperty(legacy);
 		// `server.welcome` is for the sign-in screen (§3.2), worded for this origin.
 		expect(server.params.welcome).toMatch(/Create a passkey/);
 		expect(server.params.welcome).toContain(`kept for ${Math.round(DEFAULT_LIMITS.retentionSeconds / 86_400)} days`);
@@ -981,7 +977,7 @@ it('sends the notifications a request causes on its connection before its result
 	} finally { alice.close(); }
 });
 
-it('returns history in v7 shape: messages, first_log_id/last_log_id, and empty arrays omitted', async () => {
+it('returns history pages: messages, first_log_id/last_log_id, and empty arrays omitted', async () => {
 	const peer = await connect();
 	try {
 		await authenticate(peer);

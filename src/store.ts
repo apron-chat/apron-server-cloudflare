@@ -372,7 +372,7 @@ export interface Identity {
   tier?: Tier;
 }
 
-/** A flat, self-describing message snapshot (protocol v7 section 3.5). */
+/** A flat, self-describing message snapshot (protocol §3.5). */
 export interface MessageSnapshot {
   message_id: string;
   log_id: string;
@@ -388,7 +388,7 @@ export interface MessageSnapshot {
   prev_room_id?: string;
 }
 
-/** A room record plus this server's delivery fields (protocol v7 section 3.4). */
+/** A room record plus this server's delivery fields (protocol §3.4). */
 export interface RoomRecord {
   room_id: string;
   log_id: string;
@@ -401,7 +401,7 @@ export interface RoomRecord {
   history_log_id: string | null;
 }
 
-/** One logged reaction change (protocol v7 §4.5). */
+/** One logged reaction change (protocol §4.7). */
 interface ReactionsRecord {
   log_id: string;
   message_id: string;
@@ -409,7 +409,7 @@ interface ReactionsRecord {
   reactions: Array<{ from: Identity; emojis: string[] }>;
 }
 
-/** One logged membership change of a registered user (protocol v7 §4.3.2). */
+/** One logged membership change of a registered user (protocol §4.3.2). */
 interface MembershipRecord {
   log_id: string;
   room_id: string;

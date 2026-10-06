@@ -9,11 +9,11 @@ and room mute tables measured below) and the Workers test runtime; it does not c
 deployed account billing rate or a free-plan capacity.
 
 The figures were measured on 2026-09-26, and re-measured on 2026-10-05 with
-user status (below) and again the same day for the rewritten status design
+user status (below) and again the same day for the current status design
 (the status chosen with `me`, room mutes and the mute echo), and checked on
-2026-10-06 for `status` as a request (shazow/apron 6bda48b) and for
-shazow/apron 35c5631 (statuses in every listing, no inferred idle), neither of
-which changes any SQL cost, with the repository's workerd launcher:
+2026-10-06 for `status` as a request, statuses in every listing, and users'
+`ext`, none of which changes a row count, with the repository's workerd
+launcher:
 
 ```sh
 devenv shell -- npm test -- \
@@ -118,9 +118,7 @@ boundary; every operation stayed within its reservation. The room-listing test
 separately populated the 100-thread policy ceiling, each thread with a
 description; listing all 101 rooms measured 207/2 against its 452/16
 reservation, which is derived from that ceiling (`32 + 4 * 101` rows plus
-reservation control). Protocol 7 keeps a room's `description` in its own row;
-under protocol 6 each room also looked up its intro message (307/2), and the
-reservation was kept. A 180-record fixture mixing room, message, and
+reservation control); a room's `description` is in its own row. A 180-record fixture mixing room, message, and
 reaction records returned a 50-record forward page (`more: true`,
 `first_log_id`/`last_log_id` spanning all kinds) at 61/6 against its 272/48
 reservation. The maximum snapshot test used a 4,096-byte text body plus an
@@ -142,10 +140,9 @@ Memberships:
   It stores or removes the membership row, appends one membership record, and
   advances the room's head, within the 64-write floor. The room's
   `member_count` changes in that same head update, so it writes no extra row
-  (the matrix's join and leave measured the same before it). Protocol 7
-  delivers the record in `room_update` `memberships`, together with the
-  user's own `joined` or `left`: one frame fewer per connection of the
-  joining or leaving user, and the same rows. Adding or
+  (the matrix's join and leave measured the same before it). The record goes
+  in `room_update` `memberships`, together with the user's own `joined` or
+  `left`, in one frame per connection of the joining or leaving user. Adding or
   removing another user (`room_join`/`room_leave` with `user_id`, `/kick`)
   is the same operation, charged to the one who asked. The read floor covers
   the user's rooms, read by the user index and joined to `rooms`
@@ -407,9 +404,7 @@ Measured on 2026-10-05 with
 and the 101-room ceiling),
 [`test/presence.integration.test.ts`](../test/presence.integration.test.ts)
 and [`test/push.integration.test.ts`](../test/push.integration.test.ts), and
-re-measured the same day for the rewritten design (protocol §4.5 at
-shazow/apron 9825e38, whose clarifications at 48af29b, `server.status` and
-what follows only a sign-in, change no cost; [SPEC section 4.4](../SPEC.md#44-push), Chosen status,
+re-measured the same day for the current design ([SPEC section 4.4](../SPEC.md#44-push), Chosen status,
 Mute and User status). Users choose a status with `me`; others see `online`
 as online, idle or offline from the user's connections, `dnd` as dnd while
 connected, `invisible` as offline, and `""` as `""`, the same on both
@@ -467,10 +462,9 @@ frames are not billed. A connection that never sends `idle` is told of
 changes too, and stays attended: idleness is never inferred, so no sweep
 reads frame times for it.
 
-**`status` as a request (shazow/apron 6bda48b).** A client's `status` is
-now a request: it is answered `{}`, or with an error that changes nothing.
-The SQL is as above: a refusal costs what the declined change it replaces
-did (`invalid_params` and `retry_after` past `mutesPerUserMinute` or the
+**`status` as a request.** A client's `status` is a request: it is
+answered `{}`, or with an error that changes nothing. A refusal costs no
+more than the change it declines (`invalid_params` and `retry_after` past `mutesPerUserMinute` or the
 idle limit run no statement; an unknown room at most the one bounded room
 lookup; a room mute at the cap of 100 the same 306/3). The
 reply is one outgoing frame, not billed. `status` before sign-in is

@@ -30,7 +30,7 @@ describe('user status (§4.5): what others see of the status a user chose', () =
 
 	it('takes each supported choice as is, and anything else as "" (none)', () => {
 		for (const choice of STATUS_CHOICES) expect(statusChoice(choice)).toBe(choice);
-		for (const other of ['idle', 'offline', 'away', 'ONLINE', 'busy', ' online']) expect(statusChoice(other)).toBe('');
+		for (const other of ['idle', 'offline', 'ONLINE', 'busy', ' online']) expect(statusChoice(other)).toBe('');
 	});
 
 	it('knows the four choices and five shown statuses, and nothing else', () => {

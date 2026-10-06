@@ -254,8 +254,8 @@ describe('push over the socket', () => {
 		try {
 			await subscribe(bob, 'bob');
 			const carolSub = await subscribe(carol, 'carol');
-			// Activity's `away` is not status: Bob stays attended.
-			bob.send({ method: 'activity', params: { away: true } });
+			// Activity is not status: Bob's typing leaves him attended.
+			bob.send({ method: 'activity', params: { typing: 5 } });
 			await request(bob, 'sync-activity', 'me', {});
 			expect(await idleOf(bobId)).toEqual([false]);
 			// Nor do typing or a read cursor end idle.

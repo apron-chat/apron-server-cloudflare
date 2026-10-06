@@ -17,7 +17,7 @@ origin is in `RP_ORIGINS`. Other connections advertise `auth: ["token", "guest"]
 where `token` takes only bot tokens (below), and reject WebAuthn requests. Guest user IDs are `guest_<n>` from a
 server-wide counter, with the name `Guest <n>`; a requested `user_id` or
 `name` is ignored. No user ever gets a `user_id` starting with `~`, which
-the protocol (since version 7) reserves for system identities such as `~private`. Numbers are reserved in blocks of `guestNumberBlock` (10)
+the protocol reserves for system identities such as `~private`. Numbers are reserved in blocks of `guestNumberBlock` (10)
 with one durable write per block, are never reissued (not across restarts,
 hibernation, or schema resets either), and skip the unused rest of a block
 after a restart or wake, so the latest number overstates the guest count by

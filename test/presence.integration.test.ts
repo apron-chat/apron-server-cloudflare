@@ -240,7 +240,7 @@ describe('the status a user chooses (§4.5)', () => {
 			expect((await choose(bob, 'online')).result.you.status).toBe('online');
 			expect(told(await drain(alice), bobId)).toEqual(['idle']);
 			// A value this server does not support is "" (§4.5), and so is shown.
-			for (const unsupported of ['away', 'idle', 'offline', 'DND']) {
+			for (const unsupported of ['busy', 'idle', 'offline', 'DND']) {
 				await forgetAnnouncements();
 				await choose(bob, 'online');
 				const reply = await choose(bob, unsupported);
@@ -280,7 +280,7 @@ describe('the status a user chooses (§4.5)', () => {
 			store.setStatus({ userId: ids.hidden, choice: 'invisible', now });
 			store.setStatus({ userId: ids.none, choice: '', now });
 			store.setMute({ userId: ids.muted, untilMs: now + 3_600_000, now });
-			// A registration that wakes for messages no longer makes anyone idle.
+			// A registration that wakes for messages never makes anyone idle.
 			store.registerPushSubscription({ userId: ids.pushed, url: `https://push.example.net/${ids.pushed}`, p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), now });
 		});
 		const observer = await signedIn(observerId);
@@ -977,7 +977,7 @@ describe('server.status and what follows a sign-in (§3.1, §4.5)', () => {
 	});
 });
 
-describe('sign-ins, listings and attendance (apron 35c5631)', () => {
+describe('sign-ins, listings and attendance', () => {
 	beforeEach(forgetAnnouncements);
 
 	it('sends nothing after a repeat auth as the same user on the same connection, token or guest', async () => {
@@ -1141,7 +1141,7 @@ describe('sign-ins, listings and attendance (apron 35c5631)', () => {
 	});
 });
 
-describe('a guest connection signing in (§3.3, apron 121cc1d)', () => {
+describe('a guest connection signing in (§3.3)', () => {
 	beforeEach(forgetAnnouncements);
 
 	/** The `user` frames among `frames` that link an `old` identity. */

@@ -380,7 +380,7 @@ it('gives member_count where members leaves registered members out, and keeps th
 	} finally { await setRoomListMembers(DEFAULT_LIMITS.roomListMembers); admin.close(); }
 });
 
-it('never gives out a ~ user_id, which protocol v7 reserves for system identities', async () => {
+it('never gives out a ~ user_id, which the protocol reserves for system identities', async () => {
 	const admin = await signedInAdmin();
 	const guest = await connect();
 	try {

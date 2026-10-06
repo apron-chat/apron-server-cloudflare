@@ -2961,7 +2961,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * in `user` `new` for each user it was told of: those with a connection
 	 * who share a room with it and those it is owed a change for. Users
 	 * without a connection shown only in an earlier listing are not known
-	 * here; clients drop those when they reconnect after a while (§4.5).
+	 * here; the next listing clears them, or clients drop them at their next
+	 * sign-in (§4.5).
 	 * Attachments only: no SQL. Each user's own `you` keeps the status they
 	 * chose, which stays theirs while presence is off.
 	 */

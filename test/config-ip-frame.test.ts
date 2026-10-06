@@ -161,7 +161,7 @@ describe('configuration policy boundaries', () => {
 		expect(config({ PRESENCE: '' }).presence).toBe(DEFAULT_FEATURES.presence);
 		expect(config({ PRESENCE: 'false' }).presence).toBe(false);
 		expect(config({ PRESENCE: 'TRUE' }).presence).toBe(true);
-		// The variants are gone: status no longer differs by plan.
+		// Anything but true or false is a configuration error.
 		expect(() => config({ PRESENCE: 'full' })).toThrow(ConfigError);
 		expect(() => config({ PRESENCE: 'connected' })).toThrow(ConfigError);
 		expect(() => config({ PRESENCE: 'on' })).toThrow(ConfigError);
