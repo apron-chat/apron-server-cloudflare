@@ -171,7 +171,7 @@ describe('push over the socket', () => {
 			// Unregistering removes it; an unknown url is already gone.
 			expect((await request(peer, 'unregister', 'push_unregister', { url })).result).toEqual({});
 			expect((await request(peer, 'unregister-again', 'push_unregister', { url })).result).toEqual({});
-			// A url too long to have been registered is unknown too: it succeeds, reading nothing (§4.7).
+			// A url too long to have been registered is unknown too: it succeeds, reading nothing (§4.9).
 			const long = `https://push.example.net/${'x'.repeat(600)}`;
 			const removed = await runInDurableObject(stub(), (instance) => {
 				const runtime = instance as unknown as Runtime;
@@ -196,7 +196,7 @@ describe('push over the socket', () => {
 			expect(await idleOf(userId)).toEqual([false, false]);
 			await setIdle(peer, true);
 			expect((await idleOf(userId)).sort()).toEqual([false, true]);
-			// `status` is a request (§4.11): sent without an `id`, it is a
+			// `status` is a request (§4.5): sent without an `id`, it is a
 			// notification this server does not define, so it is ignored (§1):
 			// no reply, and nothing changes.
 			peer.send({ method: 'status', params: { idle: false } });
@@ -213,7 +213,7 @@ describe('push over the socket', () => {
 			expect((await request(peer, 'scoped', 'status', { room_id: 'general', idle: false })).result).toEqual({});
 			expect(await idleOf(userId)).toEqual([false, false]);
 			await setIdle(peer, true);
-			// Neither a history page nor a message ends it (§4.11): only idle false.
+			// Neither a history page nor a message ends it (§4.5): only idle false.
 			await request(peer, 'history', 'history', { room_id: 'general' });
 			await post(peer, 'still-idle', { body: { text: 'posted while idle' } });
 			expect((await idleOf(userId)).sort()).toEqual([false, true]);
@@ -372,7 +372,7 @@ describe('push over the socket', () => {
 		try {
 			const bobSub = await subscribe(bob, 'bob', 'p'.repeat(64));
 			await setIdle(bob, true);
-			// Far more mentions than fit one payload (§4.7).
+			// Far more mentions than fit one payload (§4.9).
 			const many = Array.from({ length: 60 }, (_, index) => `someone-${index}-${'x'.repeat(48)}`);
 			await post(alice, 'crowd', { room_id: 'general', body: { text: '"quoted"\\'.repeat(40), mentions: [bobId, ...many] } });
 			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
@@ -564,7 +564,7 @@ describe('status mute', () => {
 		const peer = await connect();
 		try {
 			await peer.next();
-			// Clients don't send status before sign-in (§3.2, §4.11): denied, and nothing is kept.
+			// Clients don't send status before sign-in (§3.2, §4.5): denied, and nothing is kept.
 			const early = await status(peer, { idle: true, mute: true });
 			expect(early.frame.error.code).toBe(-32001);
 			expect(mutesOf(early.skipped)).toEqual([]);
@@ -858,7 +858,7 @@ describe('push review fixes', () => {
 			expect((await status(muter, { mute: false })).frame.result).toEqual({});
 			await setIdle(idle, true);
 			// Quiet for far longer than any period a server once could pick: the
-			// two that never sent `idle: true` are still attended (§4.11).
+			// two that never sent `idle: true` are still attended (§4.5).
 			await quietSince(silentId, Date.now() - 60 * 60_000);
 			await quietSince(muterId, Date.now() - 60 * 60_000);
 			await quietSince(idleId, Date.now() - 60 * 60_000);

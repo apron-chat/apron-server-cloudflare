@@ -73,7 +73,7 @@ describe('frame policy boundaries', () => {
 			expect(failure(`{"id":7,"method":"${method}"}`).notification, method).toBe(true);
 			expect(failure(`{"jsonrpc":"1.0","id":"a","method":"${method}"}`).notification, method).toBe(true);
 		}
-		// A client's status is a request (§4.11): its failures are answered.
+		// A client's status is a request (§4.5): its failures are answered.
 		expect(failure('{"id":"a","method":"status","params":"x"}').notification).toBe(false);
 		expect(failure('{"method":"status","params":"x"}').notification).toBe(true);
 		// Requests are answered; so is an invalid envelope, with or without an id.

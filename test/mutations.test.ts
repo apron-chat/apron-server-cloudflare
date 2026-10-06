@@ -170,7 +170,7 @@ it("broadcasts flat self-describing snapshots and enforces replacement semantics
 		const deleted = post(store, clock, "alice", "m3", { message_id: messageId, deleted: true, body: { text: "ignored" }, ext: { keep: true } });
 		expect(deleted.message?.deleted).toBe(true);
 		expect(deleted.message?.body).toBeUndefined();
-		// A tombstone carries no body and no ext (§4.4), whatever the save sent.
+		// A tombstone carries no body and no ext (§4.6), whatever the save sent.
 		expect(deleted.message).not.toHaveProperty("ext");
 
 		const restored = post(store, clock, "alice", "m4", { message_id: messageId, deleted: false, body: { text: "restored" } });

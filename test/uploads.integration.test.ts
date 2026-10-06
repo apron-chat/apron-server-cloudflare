@@ -63,7 +63,7 @@ describe('store uploads', () => {
 			const created = post(store, clock, 'alice', { body: { text: 'look', embeds: [{ kind: 'link', url: 'https://example.com' }, { kind: 'upload', title: 'dot.png', url: 'https://evil.example/x', og: { image: { url: 'https://evil.example/x' } } }] } });
 			const embeds = created.message!.body!.embeds as Array<Record<string, unknown>>;
 			expect(embeds.map((embed) => embed.embed_id)).toEqual([expect.stringMatching(/^embed_/), expect.stringMatching(/^embed_/)]);
-			// A new upload keeps only its title until the write finishes (§4.6.4).
+			// A new upload keeps only its title until the write finishes (§4.8.4).
 			expect(embeds[1]).toEqual({ embed_id: embeds[1].embed_id, kind: 'upload', title: 'dot.png' });
 			const write = writeOf(created.result);
 			expect(write.embed_id).toBe(embeds[1].embed_id);
@@ -100,7 +100,7 @@ describe('store uploads', () => {
 			register(store, clock, 'bob');
 			const withText = post(store, clock, 'bob', { body: { text: 'caption', embeds: [{ kind: 'upload' }] } });
 			const alone = post(store, clock, 'bob', { body: { embeds: [{ kind: 'upload' }] } });
-			// A failed write publishes the message without the embed (§4.6.3).
+			// A failed write publishes the message without the embed (§4.8.3).
 			const failedKey = writeOf(withText.result).write.key;
 			expect(store.claimUpload(failedKey, clock.value)).toBe(true);
 			const failed = store.finishUpload({ key: failedKey, ok: false }, clock.value);

@@ -90,7 +90,7 @@ interface ConnectionAttachment {
 	tier: "pending" | "anonymous" | "registered";
 	userId?: string;
 	name?: string;
-	/** The user's avatar (§4.6.6), for current user objects; never in `from`. */
+	/** The user's avatar (§4.8.6), for current user objects; never in `from`. */
 	avatar?: string;
 	/**
 	 * A registered user's roles (§3.3), read with the identity at sign-in and
@@ -128,15 +128,15 @@ interface ConnectionAttachment {
 	listedJoined?: boolean;
 	/**
 	 * The client said nobody is attending this connection (`status` `idle`,
-	 * §4.11), so a mention or reply may wake its user by push (§4.7). Cleared
+	 * §4.5), so a mention or reply may wake its user by push (§4.9). Cleared
 	 * only by `idle: false`. A connection starts attended: it is never set
 	 * before sign-in (`status` then gets `denied`), and nothing carries over
 	 * from an earlier connection. A connection that never sends `idle` stays
-	 * attended for as long as it is open and not stale (§4.11).
+	 * attended for as long as it is open and not stale (§4.5).
 	 */
 	idle?: boolean;
 	/**
-	 * The user's `status` state (§4.11), read at sign-in and kept equal on
+	 * The user's `status` state (§4.5), read at sign-in and kept equal on
 	 * all their connections, so deriving their status and telling them of a
 	 * mute that ran out need no SQL: the status they chose with `me` (absent
 	 * for `online`; a guest's lives only here), until when their unscoped
@@ -163,7 +163,7 @@ interface ConnectionAttachment {
 }
 
 /**
- * A user's announced `status` (§4.11): `s`, what others who share a room
+ * A user's announced `status` (§4.5): `s`, what others who share a room
  * were last told; `a`, when (coalescing); `h`, until when a change a closed
  * connection caused waits (offline grace).
  */
@@ -173,7 +173,7 @@ interface PresenceRecord {
 	h?: number;
 }
 
-/** A `status` request `mute` (§4.11): `true`, `false`, or whole seconds, `0` being `false`; undefined when invalid. */
+/** A `status` request `mute` (§4.5): `true`, `false`, or whole seconds, `0` being `false`; undefined when invalid. */
 function muteParam(value: unknown): number | boolean | undefined {
 	if (typeof value === "boolean") return value;
 	if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return value === 0 ? false : value;
@@ -185,7 +185,7 @@ function validRoomId(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0 && value.length <= 64;
 }
 
-/** A `status` notification from the server (§4.11): one of the user's mutes, unscoped when `roomId` is null. */
+/** A `status` notification from the server (§4.5): one of the user's mutes, unscoped when `roomId` is null. */
 function statusFrame(roomId: string | null, mute: number | boolean): Record<string, unknown> {
 	return { method: "status", params: { ...(roomId !== null ? { room_id: roomId } : {}), mute } };
 }
@@ -262,7 +262,7 @@ const MAX_JOIN_USES = 50;
 const JOIN_DEFAULT_NAME = "Member";
 const JOIN_INVITE_TTL_MS = 7 * 86_400_000;
 /**
- * The commands this server provides (§4.8), as `/help` lists them to those
+ * The commands this server provides (§4.1), as `/help` lists them to those
  * who may run them: `everyone`, `owners` (registered users other than bots),
  * or `admins` (the `APRON_ADMIN_TOKEN` user and those given the `admin` role).
  */
@@ -311,7 +311,7 @@ const INVITE_KEY_PREFIX = "invite:";
 const PROTOCOL_URL = "https://github.com/shazow/apron/blob/main/PROTOCOL.md";
 
 /**
- * A bearer session minted by a verified passkey login (protocol §4.9,
+ * A bearer session minted by a verified passkey login (protocol §4.10,
  * session resume). Stored under a SHA-256 key so the plaintext token never
  * rests in storage. Kept in key-value storage rather than the SQL store: it is
  * throwaway state with its own expiry and needs no schema migration.
@@ -717,7 +717,7 @@ function publicIdentity(attachment: ConnectionAttachment): { user_id: string; na
 
 /**
  * A connection's user as a current object (§3.3): `you`, `new`, and room
- * `members` and `users`, which carry `avatar` (§4.6.6). Recorded objects,
+ * `members` and `users`, which carry `avatar` (§4.8.6). Recorded objects,
  * such as a message's `from`, use publicIdentity and never do.
  */
 function currentUser(attachment: ConnectionAttachment): PublicUser | null {
@@ -779,7 +779,7 @@ function roomUpdate(field: "joined" | "updated" | "left", ...records: unknown[])
 const INTERNAL_HOST_SUFFIXES = ["localhost", "localdomain", "local", "internal", "intranet", "lan", "home.arpa", "corp", "private"];
 
 /**
- * Why a push endpoint is refused, or null when it is taken (§4.7: `https`
+ * Why a push endpoint is refused, or null when it is taken (§4.9: `https`
  * endpoints that resolve to non-internal addresses). The Worker cannot
  * resolve names before it fetches, so it refuses endpoints that name an
  * address or an internal network outright: IP literals, single-label hosts,
@@ -816,7 +816,7 @@ function pushEndpointError(value: string, hosts: RuntimeConfig["pushHosts"]): st
 const MAX_WAKE_ENTRIES = 16;
 
 /**
- * A `push_register` `wake` (§4.7) as a WAKE_SCOPES bitmask, undefined when
+ * A `push_register` `wake` (§4.9) as a WAKE_SCOPES bitmask, undefined when
  * absent. Unknown scopes are ignored, as the protocol asks; an array that is
  * too long, or entries that are not short strings, are `invalid_params`.
  */
@@ -833,11 +833,11 @@ function wakeParam(value: unknown): number | undefined {
 /** Longest `body.text` a push carries, in code points; longer text is cut, ending in `…`. */
 const PUSH_TEXT_CODE_POINTS = 200;
 
-/** Largest push payload, in bytes of JSON (§4.7), leaving a relay room to wrap it for APNs or FCM. */
+/** Largest push payload, in bytes of JSON (§4.9), leaving a relay room to wrap it for APNs or FCM. */
 const MAX_PUSH_PAYLOAD_BYTES = 2048;
 
 /**
- * What a push carries (§4.7): the envelope `{push_id?, message}`, with the
+ * What a push carries (§4.9): the envelope `{push_id?, message}`, with the
  * registration's `push_id` when it has one (`unread` is not implemented,
  * so never sent), and as `message` the message without `log_id`, its text
  * cut to PUSH_TEXT_CODE_POINTS (left out when empty), and without `format`,
@@ -890,7 +890,7 @@ export async function fetchEntry(request: Request, env: Env, ctx?: ExecutionCont
 }
 
 /**
- * `PUT /w/<token>`: a `write_url` (§4.6.3). The token's signature is checked
+ * `PUT /w/<token>`: a `write_url` (§4.8.3). The token's signature is checked
  * before the body is read, the Durable Object claims the upload so a URL
  * writes once, and the bytes must be a PNG, JPEG, GIF, or WebP image within
  * the token's size. The object is stored in R2 with the type its bytes
@@ -1028,7 +1028,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private nextSessionSweepAt = 0;
 	/** Admins' `/toggle`s, once read: a feature absent here has not been read yet. */
 	private readonly toggles = new Map<ToggleFeature, boolean | undefined>();
-	/** When the earliest pending upload's write window closes, if one is known (§4.6.3). */
+	/** When the earliest pending upload's write window closes, if one is known (§4.8.3). */
 	private uploadDeadline: number | undefined;
 	private accountUsageEvents = 0;
 	private accountUsageRetryAt = 0;
@@ -1333,7 +1333,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 					...(this.activityOn() ? ["activity"] : []),
 					...(this.uploadsOn() ? ["embed:upload"] : []),
 					// The user `status` chosen with `me`, idle connections and mutes,
-					// which decide pushes (§4.7, §4.11).
+					// which decide pushes (§4.9, §4.5).
 					...(this.config.push ? ["status"] : []),
 				],
 				// Passkeys and their session tokens only where passkeys are offered;
@@ -1349,9 +1349,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 				welcome: this.signInWelcome(origin),
 				// Answered by the runtime without waking the object (see PING_REQUEST).
 				ping: limits.pingSeconds,
-				// Web Push (§4.7), with the VAPID key browsers subscribe with and the wake scopes.
+				// Web Push (§4.9), with the VAPID key browsers subscribe with and the wake scopes.
 				...(this.config.push ? { push: { webpush: { key: this.config.push.publicKey }, wake: Object.keys(WAKE_SCOPES) } } : {}),
-				// The optional `status` values `me` accepts (§3.1, §4.11), only while
+				// The optional `status` values `me` accepts (§3.1, §4.5), only while
 				// others are shown them: with presence off a choice is still kept,
 				// but nobody sees `dnd` or `invisible`, so clients offer neither.
 				...(presence ? { status: [...OPTIONAL_STATUS_CHOICES] } : {}),
@@ -1374,7 +1374,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 						read_cursors: false,
 						// With `activity`, typing is relayed; read cursors are neither kept nor relayed.
 						...(this.activityOn() ? { activity_per_minute: limits.activityBroadcastsPerUserMinute } : {}),
-						// User `status` shown to others (§4.11); a change may wait this long.
+						// User `status` shown to others (§4.5); a change may wait this long.
 						...(presence ? { presence, status_delay_seconds: Math.max(limits.statusCoalesceSeconds, limits.offlineGraceSeconds) } : {}),
 					},
 				},
@@ -1382,7 +1382,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		};
 	}
 
-	/** Whether this origin is offered passkeys (§4.9) and their session tokens. */
+	/** Whether this origin is offered passkeys (§4.10) and their session tokens. */
 	private passkeysOffered(origin: string | null): boolean {
 		return origin !== null && this.config.rpOrigins.includes(origin);
 	}
@@ -1595,7 +1595,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return;
 			case "status":
 				if (!this.config.push) break;
-				// Clients send `status` only as a request (§4.11): one without an
+				// Clients send `status` only as a request (§4.5): one without an
 				// `id` is a notification this server does not define, so it is
 				// ignored like any unknown notification (§1), changing nothing.
 				if (request.id === undefined) return;
@@ -1690,7 +1690,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const action = requiredString(params, "action");
 		if (action !== "register" && action !== "login") throw { name: "invalid_params", message: "Unknown passkey action" } satisfies ProtocolError;
 		// A registration on a connection already signed in adds the passkey to
-		// that account (§4.9); signing in as someone else takes a reconnect, and
+		// that account (§4.10); signing in as someone else takes a reconnect, and
 		// a bot signs in with its token only.
 		const adding = attachment.tier === "registered";
 		if (adding && action !== "register") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
@@ -1739,7 +1739,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (!challenge || !matchingChallenge || challenge.action !== action) throw { name: "denied", message: "Passkey challenge is missing or expired" } satisfies ProtocolError;
 		const credential = passkeyCredentialParam(params, action);
-		// A signed-in user's avatar, for the connection's current object (§4.6.6).
+		// A signed-in user's avatar, for the connection's current object (§4.8.6).
 		let avatar: string | undefined;
 		let roles: string[] = [];
 		const repository: CredentialRepository = {
@@ -2032,7 +2032,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * passkey registration's, charged as a registration. The result carries
 	 * the new user's own invite token (`apron_invite_…`, as `/invite-token`
 	 * mints), so the shared invite is not needed again; they may add a
-	 * passkey once signed in (§4.9). A used-up, expired, or replaced invite is
+	 * passkey once signed in (§4.10). A used-up, expired, or replaced invite is
 	 * `denied`.
 	 */
 	private async handleJoinToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, token: string): Promise<void> {
@@ -2223,7 +2223,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate before loading history" } satisfies ProtocolError;
 		if (attachment.historyInFlight >= this.config.limits.concurrentHistoryPerConnection) throw { name: "retry_after", message: "History request already in progress", data: { retry_after: 1 } } satisfies ProtocolError;
 		const params = request.params;
-		// Without room_id, history pages the default room (§4.1). Every room is
+		// Without room_id, history pages the default room (§4.2). Every room is
 		// visible, so any room's history may be read without joining it.
 		const roomId = optionalString(params, "room_id");
 		const after = asDecimalId(params.after, "after");
@@ -2257,12 +2257,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * omitted one is unchanged, and an empty one removes it. Only registered
 	 * users may change their name; `name: ""` removes it, so the user falls
 	 * back to `user_id`. With uploads, `avatar: ""` removes a registered user's
-	 * avatar; a new one comes only through `/avatar` (§4.6.6), so other values
+	 * avatar; a new one comes only through `/avatar` (§4.8.6), so other values
 	 * are declined. `ext` is type-checked and ignored: this server keeps no
 	 * user `ext`, a normalization §1.1 allows, so `you` carries none. `roles`
 	 * is not settable (§3.3) and is ignored.
 	 * Where capability `status` is advertised, `status` sets the status the
-	 * user chooses (§4.11, changeChoice), guests included; elsewhere it is
+	 * user chooses (§4.5, changeChoice), guests included; elsewhere it is
 	 * ignored. A `status` that is not a string is `invalid_params`.
 	 */
 	private async handleMe(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
@@ -2360,11 +2360,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			for (const record of result.broadcasts) this.broadcastRecord(record);
 			this.reply(socket, request, await this.withWriteUrls(result.result));
 			started = this.afterUploads(result);
-			// Only a new message wakes anyone: not an edit, move, or retry (§4.7).
+			// Only a new message wakes anyone: not an edit, move, or retry (§4.9).
 			if (method === "message" && !result.deduplicated && result.message?.prev_log_id === undefined) created = result.message;
 		});
 		if (created && identity.tier === "registered") this.wakeFor(created);
-		// Pending writes that never come are failed by the alarm (§4.6.3).
+		// Pending writes that never come are failed by the alarm (§4.8.3).
 		if (started) await this.rescheduleAlarm();
 	}
 
@@ -2566,10 +2566,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Activity (§4.4). Typing is relayed to the room's other members and never
+	 * Activity (§4.6). Typing is relayed to the room's other members and never
 	 * stored; without room_id it is in the default room. Read cursors are
 	 * dropped: the demo neither keeps nor relays them. Neither touches the
-	 * connection's `status` `idle` (§4.11). At most
+	 * connection's `status` `idle` (§4.5). At most
 	 * `activityBroadcastsPerUserMinute` relays per user; past that the update
 	 * is dropped and the sender gets one `~private` notice per minute.
 	 */
@@ -2601,7 +2601,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `status` (§4.11), a request: `idle` for the sending connection, and
+	 * `status` (§4.5), a request: `idle` for the sending connection, and
 	 * the user's `mute`, everywhere or, with `room_id`, in one room and its
 	 * threads. Replies `{}` once the change is applied; on an error nothing
 	 * changes. Before sign-in it gets `denied`. `idle` marks this connection
@@ -2659,7 +2659,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Changes a registered user's mute (§4.11) for a `status` request: the unscoped one (`roomId` null, in `user_status`) or a
+	 * Changes a registered user's mute (§4.5) for a `status` request: the unscoped one (`roomId` null, in `user_status`) or a
 	 * room's (`room_mutes`): seconds from `now` (cut to MAX_MUTE_SECONDS),
 	 * `true` until changed, or `false` to end it. Each change is cached on
 	 * all the user's connections (the unscoped end, and when the next room
@@ -2750,7 +2750,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * After an `auth` result that signed a connection in (§4.11): sends it
+	 * After an `auth` result that signed a connection in (§4.5): sends it
 	 * one `status` for each of its user's mutes in effect, then carries on
 	 * its user's status (presenceSignedIn) and sends it the status of each
 	 * connected user who shares a room with it (sendShownStatus). Every
@@ -2766,7 +2766,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * After a sign-in's `auth` result, one `status` for each mute in effect
-	 * (§4.11), with the seconds left or `true`: the unscoped one from the
+	 * (§4.5), with the seconds left or `true`: the unscoped one from the
 	 * attachment, and the room mutes read at sign-in. Any scope not sent is
 	 * unmuted. A guest has none.
 	 */
@@ -2781,7 +2781,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `me` `status` (§3.3, §4.11): the status the user chooses, `""` for a
+	 * `me` `status` (§3.3, §4.5): the status the user chooses, `""` for a
 	 * value this server does not support (statusChoice). A registered user's
 	 * is stored; a guest's lives on their connection, as their identity
 	 * does. Kept on all the user's connections, so deriving what others see
@@ -2810,7 +2810,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * A connection's own user object (`you`, §3.3): its current object and,
 	 * where capability `status` is advertised, the `status` its user chose
-	 * (§4.11), which only `you` shows as chosen: others see what shownStatus
+	 * (§4.5), which only `you` shows as chosen: others see what shownStatus
 	 * makes of it.
 	 */
 	private you(attachment: ConnectionAttachment): PublicUser | null {
@@ -2826,7 +2826,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Marks a signed-in connection idle or attended (`status` `idle`,
-	 * §4.11) and re-derives its user's status. handleStatus calls it only
+	 * §4.5) and re-derives its user's status. handleStatus calls it only
 	 * for a change.
 	 */
 	private setIdle(socket: WebSocketConnection, state: ConnectionAttachment, idle: boolean): void {
@@ -2838,7 +2838,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Whether a user has a connection someone attends: authenticated as them,
-	 * not stale, and not idle (§4.11). A connection is attended from sign-in
+	 * not stale, and not idle (§4.5). A connection is attended from sign-in
 	 * until its client sends `idle: true`, however long it stays silent: the
 	 * server never infers idleness.
 	 */
@@ -2851,7 +2851,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return !!state && !state.idle && !this.isStale(socket, now);
 	}
 
-	// User `status` shown to others (§4.11). What others see of a user is
+	// User `status` shown to others (§4.5). What others see of a user is
 	// derived (shownStatus) from the status they chose, cached on their
 	// connections, and whether one of those is attended: no SQL. A user
 	// without a connection is `offline`, or `""` when they chose none, read
@@ -2882,11 +2882,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Presence turned off (`/toggle presence`): tells each connection to drop
-	 * the statuses it was told, with `status: ""`, which means none (§4.11),
+	 * the statuses it was told, with `status: ""`, which means none (§4.5),
 	 * in `user` `new` for each user it was told of: those with a connection
 	 * who share a room with it and those it is owed a change for. Users
 	 * without a connection shown only in an earlier listing are not known
-	 * here; clients drop those when they reconnect after a while (§4.11).
+	 * here; clients drop those when they reconnect after a while (§4.5).
 	 * Attachments only: no SQL. Each user's own `you` keeps the status they
 	 * chose, which stays theirs while presence is off.
 	 */
@@ -3145,7 +3145,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Does every piece of status work that is due, then re-arms the timer for
-	 * the next one. Mutes that ran out (§4.11), presence on or off: an
+	 * the next one. Mutes that ran out (§4.5), presence on or off: an
 	 * unscoped one, from attachments, is sent as `status` `mute: false` to
 	 * each of the user's connections; room mutes, once the attachments say
 	 * one ran out, are read and deleted (Store.expireRoomMutes), each sent the
@@ -3336,12 +3336,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * After a sign-in's `auth` result (§4.11): sends the connection, as
+	 * After a sign-in's `auth` result (§4.5): sends the connection, as
 	 * `user` `new`, the status of each other connected user who shares a
 	 * room with it, as others were last told it (presenceSnapshot), so a
 	 * change still waiting on the coalescing minute is not told early.
 	 * Users shown `offline` (invisible, or just made visible and not yet
-	 * announced) or `""` (none) are left out, as §4.11 has it and as users
+	 * announced) or `""` (none) are left out, as §4.5 has it and as users
 	 * without a connection are, so the frames never tell that a user who
 	 * hides it is connected; listings carry their status. Attachments only,
 	 * no SQL.
@@ -3373,8 +3373,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Adds each listed user's `status` (§4.11) to a snapshot's current user
-	 * objects, which §4.11 has every listing carry, `offline` and `""`
+	 * Adds each listed user's `status` (§4.5) to a snapshot's current user
+	 * objects, which §4.5 has every listing carry, `offline` and `""`
 	 * included: as presenceSnapshot shows them, else from the status they
 	 * chose (`choices`, read with the listing) as a user without a
 	 * connection, else `offline`. A `lister` is made owed the changes still
@@ -3413,11 +3413,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `push_register` (§4.7) for push kind `webpush`: `{kind: "webpush", url,
+	 * `push_register` (§4.9) for push kind `webpush`: `{kind: "webpush", url,
 	 * keys: {p256dh, auth}, push_id?}`, the browser's `PushSubscription.toJSON()`
 	 * with `kind` added (`expirationTime` is ignored). `push_id`, 1 to 64
 	 * letters, digits, `_` or `-`, goes unchanged into every push to this
-	 * registration. `wake` lists the scopes it wakes for (§4.7): at most
+	 * registration. `wake` lists the scopes it wakes for (§4.9): at most
 	 * MAX_WAKE_ENTRIES strings of at most 64 characters; scopes this server
 	 * does not implement are ignored, `[]` wakes for nothing, and without it
 	 * the registration wakes for `mentions` and `replies`. At most
@@ -3465,7 +3465,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `push_unregister` (§4.7): removes the user's own registration of `url`;
+	 * `push_unregister` (§4.9): removes the user's own registration of `url`;
 	 * an unknown one is already gone, as is one too long to have been
 	 * registered, which is answered without SQL.
 	 */
@@ -3473,7 +3473,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
 		if (attachment.tier !== "registered") throw { name: "denied", message: "Sign in to receive push notifications" } satisfies ProtocolError;
 		const sent = requiredString(request.params, "url");
-		// A url longer than registration takes was never registered: unregistering an unknown url succeeds (§4.7).
+		// A url longer than registration takes was never registered: unregistering an unknown url succeeds (§4.9).
 		if (utf8Bytes(sent) > MAX_PUSH_URL_BYTES) {
 			this.reply(socket, request, {});
 			return;
@@ -3486,7 +3486,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Wakes those a registered user's new message concerns (§4.7): the users
+	 * Wakes those a registered user's new message concerns (§4.9): the users
 	 * its `body.mentions` lists (scope `mentions`) and the author of the
 	 * message it replies to (scope `replies`, one metered lookup); guests'
 	 * messages wake no one. The candidates, the replied-to author first so
@@ -3554,7 +3554,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (payload === undefined) payloads.set(pushId, payload = pushPayload(message, pushId));
 			return payload;
 		};
-		// Mentions and replies are messages for this user, so `high` (§4.7).
+		// Mentions and replies are messages for this user, so `high` (§4.9).
 		const outcomes = await Promise.allSettled(subscriptions.map((subscription) =>
 			sendWebPush(subscription, payloadFor(subscription.pushId), vapid, { ttlSeconds, urgency: "high", nowMs: nowMs() })));
 		const gone: Array<{ userId: string; url: string; p256dh: string }> = [];
@@ -3682,7 +3682,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `command` (§4.8): never logged, broadcast, or saved. The demo provides
+	 * `command` (§4.1): never logged, broadcast, or saved. The demo provides
 	 * `/help`, which replies with a `~private` notice listing the commands the
 	 * sender may run, `/invite-bot` for registered users, and `/admin`,
 	 * `/kick`, `/rename` and `/status` for admins. An unknown
@@ -3892,7 +3892,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `/avatar` with one `upload` embed (§4.6.6): the result carries the
+	 * `/avatar` with one `upload` embed (§4.8.6): the result carries the
 	 * embed's `write_url`, and the image becomes the sender's avatar when the
 	 * write finishes (finishUpload).
 	 */
@@ -4458,7 +4458,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const shared = new Set(rooms);
 		// A new `user_id` (/rename) is a user others have not seen: it carries
 		// the status they were shown under the old one. A profile change leaves
-		// `status` out, so clients keep theirs (§4.11).
+		// `status` out, so clients keep theirs (§4.5).
 		const renamed = old && old.user_id !== identity.user_id && this.presenceMode()
 			? this.presenceSnapshot(nowMs()).shown.get(identity.user_id) : undefined;
 		const others = renamed !== undefined ? { ...identity, status: renamed } : identity;
@@ -4467,7 +4467,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (socket === origin) continue;
 			const state = connectionAttachment(socket);
 			if (!state) continue;
-			// The user's own connections get `you`, with the status they chose (§4.11).
+			// The user's own connections get `you`, with the status they chose (§4.5).
 			if (state.userId === identity.user_id) this.deliverTo(socket, { method: "user", params: { you: { ...identity, ...this.ownStatus(state) } } });
 			else if (state.rooms?.some((id) => shared.has(id))) this.deliverTo(socket, { method: "user", params: { new: others, ...(old ? { old } : {}) } });
 		}
@@ -4628,7 +4628,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * frame, delivered once per connection (section 3.5).
 	 */
 	/**
-	 * A result with each new upload's `write_url` (§4.6.3) signed in place of
+	 * A result with each new upload's `write_url` (§4.8.3) signed in place of
 	 * the `write` the store keeps, so a retry signs the same URL.
 	 */
 	private async withWriteUrls(result: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -4681,7 +4681,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!object) {
 				const cleared = this.store.clearAvatar({ userId, now: nowMs() });
 				// This runs at sign-in: telling others of an invisible user's
-				// avatar would tell them the user just connected (§4.11). Their
+				// avatar would tell them the user just connected (§4.5). Their
 				// own connections still get `you`; others see the removal in
 				// their next listing.
 				const hidden = this.connectionsOf(userId).some((peer) => connectionAttachment(peer)?.choice === "invisible");
@@ -4694,7 +4694,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * A user's avatar changed (§4.6.6): their connections keep it, they get
+	 * A user's avatar changed (§4.8.6): their connections keep it, they get
 	 * `user` `you`, and those who share a room with them `user` `new`. An empty
 	 * `avatar` announces a removed one.
 	 */
@@ -4723,7 +4723,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Called by the entry Worker before it stores a write (§4.6.3): whether
+	 * Called by the entry Worker before it stores a write (§4.8.3): whether
 	 * this upload is waiting for one. Only one request may write it.
 	 */
 	async claimUpload(key: string): Promise<boolean> {
@@ -4732,7 +4732,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Called by the entry Worker when a claimed write finished or failed
-	 * (§4.6.3). A file's message gets its new snapshot; an avatar becomes its
+	 * (§4.8.3). A file's message gets its new snapshot; an avatar becomes its
 	 * owner's. Returns whether the write was accepted; if not, the Worker
 	 * deletes what it stored.
 	 */

@@ -130,7 +130,7 @@ and `you`. See [SPEC section 4](../SPEC.md#memberships).
 The whole server processes at most 600 frames a
 minute (300 with the Free budgets); past that, requests get `retry_after` and the socket stays open. The demo
 only creates thread rooms: `room_set` creations need `parent_room_id: "general"`,
-and `general` itself cannot be edited. A thread's `description` (Markdown)
+and `general` itself cannot be edited. A thread's `description` (CommonMark)
 says what it is about, and any participant may change it. Every room is
 public: `private: true` is `unsupported`. System notices come from `~private`,
 `~room`, or `~server`; no user's `user_id` starts with `~`. This is a shared public room, not
@@ -138,7 +138,7 @@ an isolated sandbox: test messages are visible to others, guest ownership lasts
 only for the socket, and IP/resource quotas and retention still apply. Changing
 frontend origins does not give an IP a fresh allowance. Honor `retry_after`.
 
-The `server` frame's `welcome` is Markdown for your sign-in screen. The server
+The `server` frame's `welcome` is CommonMark for your sign-in screen. The server
 advertises `token` (for bot tokens) and `guest` to custom frontends, and never
 `email`; `signup` names the schemes that create an account (`webauthn` on the
 demo's own site, and `token` for an admin's `/invite` sign-up token, whose

@@ -124,7 +124,7 @@ export const FREE_PLAN: Plan = Object.freeze({
 		pushesPerRecipientDay: 100,
 		// Each mute or status change costs a few written rows.
 		mutesPerUserMinute: 6,
-		// A busy conversation wakes an unattended user (no connection attended, §4.11) at most once a minute per room.
+		// A busy conversation wakes an unattended user (no connection attended, §4.5) at most once a minute per room.
 		coalesceSeconds: 60,
 		subscriptionsPerUser: 5,
 		// Clients register on every connection, refreshing at most daily; a

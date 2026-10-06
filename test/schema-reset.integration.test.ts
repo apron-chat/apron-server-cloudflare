@@ -198,7 +198,7 @@ it('upgrades a schema 5 store in place: intro messages become descriptions, and 
 		// Nothing was wiped: the chat, the passkey, and its session remain.
 		expect(store.getRoomState().latest_log_id).toBe(fixture.head);
 		expect(store.getCredential('cred-upgrader')?.userId).toBe('upgrader');
-		// An identity may now hold several passkeys (§4.9).
+		// An identity may now hold several passkeys (§4.10).
 		store.addCredential({ userId: 'upgrader', userHandle: 'handle', now: Date.now(), ipKey: 'upgrade-ip-2', credential: { credentialId: 'cred-second', userId: 'upgrader', publicKey: 'BBBB', counter: 0 } });
 		expect(store.getIdentity('upgrader')?.credentialCount).toBe(2);
 		expect(sql.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'credentials'").toArray().map((row) => row.name)).toContain('credentials_user_idx');
@@ -221,7 +221,7 @@ it('upgrades a schema 5 store in place: intro messages become descriptions, and 
 		expect(longHistory[1].description).toBe(cut);
 		expect(bytes({ title: 'Long', description: longHistory[0].description })).toBeLessThanOrEqual(2_048);
 		expect(bytes({ title: 'Long', description: longHistory[0].description + 'é' })).toBeGreaterThan(2_048);
-		// A plain-text intro is escaped, since a description is Markdown by convention.
+		// A plain-text intro is escaped, since a description is CommonMark by convention.
 		expect(rooms.get(fixture.plainThread)!.description).toBe('Use \\*nix boxes\\_only\\_ for builds\n\\# not a heading');
 		for (const room of rooms.values()) expect(room).not.toHaveProperty('intro_message');
 

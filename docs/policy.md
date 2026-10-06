@@ -8,10 +8,10 @@ can turn it off and on with `/toggle activity`. With push configured it
 also advertises `status`, and shows each user's status to others
 (presence, below; `/toggle presence`). History availability uses each room's `latest_log_id` and
 nullable `history_log_id`, without extension negotiation. See
-[history and recovery](https://github.com/shazow/apron/blob/main/PROTOCOL.md#41-history) and the
+[history and recovery](https://github.com/shazow/apron/blob/main/PROTOCOL.md#42-history) and the
 [retention implementation specification](../SPEC.md#9-rolling-history-and-base-protocol-availability).
 
-WebAuthn uses the canonical [optional authentication scheme](https://github.com/shazow/apron/blob/main/PROTOCOL.md#49-webauthn-authentication),
+WebAuthn uses the canonical [optional authentication scheme](https://github.com/shazow/apron/blob/main/PROTOCOL.md#410-webauthn-authentication),
 advertised through `auth: ["webauthn", "token", "guest"]` only on connections whose
 origin is in `RP_ORIGINS`. Other connections advertise `auth: ["token", "guest"]`,
 where `token` takes only bot tokens (below), and reject WebAuthn requests. Guest user IDs are `guest_<n>` from a
@@ -213,7 +213,7 @@ A guest is not an account, so its new credential creates a separate
 registered identity; it does not transfer ownership of guest messages. A
 registration on a connection already signed in as a registered user (a
 passkey user or an invited user, but not a bot or the `admin` user) instead
-adds the passkey to that account (protocol §4.9), at most 8 per account,
+adds the passkey to that account (protocol §4.10), at most 8 per account,
 each charged as a registration against the per-IP and daily caps. The
 account's other connections are told, and `/passkeys` lists the account's
 passkeys and removes any but the last. A registered
@@ -227,11 +227,11 @@ the `auth` result to sign in with afterwards. Other tokens only sign in, and
 `guest` is not an account.
 
 The canonical begin/finish exchange, JSON credential encoding, and verification
-rules are defined in protocol [§4.9](https://github.com/shazow/apron/blob/main/PROTOCOL.md#49-webauthn-authentication). This demo limits challenges to 120
+rules are defined in protocol [§4.10](https://github.com/shazow/apron/blob/main/PROTOCOL.md#410-webauthn-authentication). This demo limits challenges to 120
 seconds and requires user presence and verification. A new begin replaces the
 pending challenge without extending the initial 30-second authentication
 deadline. A matching finish attempt consumes the challenge even on failure.
-A verified login or registration returns a bearer `token` (protocol [§4.9](https://github.com/shazow/apron/blob/main/PROTOCOL.md#49-webauthn-authentication),
+A verified login or registration returns a bearer `token` (protocol [§4.10](https://github.com/shazow/apron/blob/main/PROTOCOL.md#410-webauthn-authentication),
 session resume). Presenting it with `scheme: "token"` on a later connection from
 the same origin resumes the registered identity without a ceremony; once less
 than half of its 30 days remain, the resume renews it for another 30. The token

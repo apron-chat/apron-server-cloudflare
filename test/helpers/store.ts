@@ -2,7 +2,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { expect } from "vitest";
 import { Store, StoreError, WAKE_SCOPES, type StoreConfig } from "../../src/store";
 
-/** A history page's messages; the array is omitted when empty (§4.1). */
+/** A history page's messages; the array is omitted when empty (§4.2). */
 export function messagesOf(page: { messages?: Array<{ log_id: string; message_id: string; room_id?: string; body?: Record<string, unknown> & { text?: string } }> }) {
 	return page.messages ?? [];
 }

@@ -104,7 +104,7 @@ export interface Limits {
 	 */
 	guestNumberBlock: number;
 	/**
-	 * User `status` shown to others (protocol §4.11): a user's announced
+	 * User `status` shown to others (protocol §4.5): a user's announced
 	 * status changes at most once in this many seconds; changes in between
 	 * wait, and the latest one wins. Also bounds how long a member listing
 	 * may be reused.
@@ -193,7 +193,7 @@ export interface Features {
 	activity: boolean;
 	guestPosting: boolean;
 	/**
-	 * User `status` shown to others (§4.11): connected users' from their
+	 * User `status` shown to others (§4.5): connected users' from their
 	 * connection attachments, and listed members' from the `status` they
 	 * chose. Needs push, like capability `status`.
 	 */
@@ -214,7 +214,7 @@ export interface EdgeStop {
 }
 
 /**
- * Uploads (protocol §4.6.3, cap `embed:upload`): images registered users
+ * Uploads (protocol §4.8.3, cap `embed:upload`): images registered users
  * attach to messages or set as avatars, stored in R2 and served from its
  * public bucket domain.
  */
@@ -242,10 +242,10 @@ export interface UploadPolicy {
 }
 
 /**
- * Web Push (protocol §4.7, push kind `webpush`): a message that mentions a
+ * Web Push (protocol §4.9, push kind `webpush`): a message that mentions a
  * registered user, or replies to their message, wakes them through their
  * browsers' push services when none of their connections is attended and
- * neither a mute nor a `dnd` status silences them (§4.11 `status`).
+ * neither a mute nor a `dnd` status silences them (§4.5 `status`).
  */
 export interface PushPolicy {
 	/** Pushes the whole server sends a UTC day, one per subscription woken. */
@@ -352,7 +352,7 @@ export const MAX_ROOM_LIST_MEMBERS = 200;
 // Status changes wait at most this long (coalescing, offline grace), so what
 // others see is never more than about a minute behind.
 export const MAX_STATUS_DELAY_SECONDS = 60;
-// `status` `idle` changes one connection may make a minute (protocol §4.11
+// `status` `idle` changes one connection may make a minute (protocol §4.5
 // allows rate limiting `status`); past it, `retry_after` and nothing
 // changes. A client sends one when attention starts or ends, so a few a
 // minute is plenty; the cap keeps a flipping client from making the object

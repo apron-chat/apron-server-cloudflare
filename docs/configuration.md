@@ -191,7 +191,7 @@ What the guard cannot promise:
 ## Uploads
 
 With the Workers Paid budgets, registered users attach images to messages
-and set avatars (protocol §4.6, cap `embed:upload`; see
+and set avatars (protocol §4.8, cap `embed:upload`; see
 [SPEC section 4.3](../SPEC.md#43-uploads-and-avatars)). The plan's `uploads`
 in `src/plans/paid.ts` sets the limits:
 
@@ -253,7 +253,7 @@ above: two Durable Object requests and one Worker request each, at most
 
 ## Push
 
-Mentions and replies wake registered users through Web Push (protocol §4.7,
+Mentions and replies wake registered users through Web Push (protocol §4.9,
 push kind `webpush`, advertising the wake scopes `mentions` and `replies`,
 with the client's optional registration `push_id` in each push; see
 [SPEC section 4.4](../SPEC.md#44-push)). Both plans have a
@@ -326,7 +326,7 @@ in the [cost report](cost-report.md#push); `/status` shows the day's pushes.
 
 ## User status (presence)
 
-With push on, the server advertises capability `status` (protocol §4.11):
+With push on, the server advertises capability `status` (protocol §4.5):
 users choose a `status` with `me` (`online`, `""` for none, `dnd`,
 `invisible`), connections report `idle`, and users mute their pushes
 everywhere or in a room and its threads (at most 100 rooms a user). With
@@ -438,7 +438,7 @@ and recalibrating its resource model.
 | `ALLOWED_ORIGINS` | Exact browser-origin allowlist, or standalone `*` to admit every guest origin (including opaque/missing Origin); cannot mix `*` with explicit origins; all clients remain subject to quotas |
 | `RP_NAME` | Bounded display name for browser passkey prompts |
 | `ACTIVITY` | `true` advertises and relays typing (cap `activity`, section 4.2 of the spec); `false` turns it off. Unset, the plan decides: on for Workers Paid, off for Free. An admin's `/toggle activity` overrides it until toggled back. Read cursors are never kept |
-| `PRESENCE` | `true` or `false`: whether others see each user's `status` (protocol §4.11); needs push. The status users choose with `me` and their mutes are taken whatever it says. Unset, the plan decides: on for both. An admin's `/toggle presence` overrides it until toggled back. See [User status](#user-status-presence) |
+| `PRESENCE` | `true` or `false`: whether others see each user's `status` (protocol §4.5); needs push. The status users choose with `me` and their mutes are taken whatever it says. Unset, the plan decides: on for both. An admin's `/toggle presence` overrides it until toggled back. See [User status](#user-status-presence) |
 | `GUEST_POSTING` | `true` lets guests post, react, join and leave rooms, and create threads under the guest quotas; default off in both plans, so guests only list rooms and read history until they sign in with a passkey. Announced as `ext.demo.guest_posting` |
 | `APRON_ADMIN_TOKEN` | Optional fixed bearer token, 24 to 256 of `A-Z a-z 0-9 - _` and not starting `apron_bot_`, `apron_invite_`, or `apron_join_`: `auth` with `scheme: "token"` and this token signs in as the registered user `admin` ("Admin"), from any origin and without a passkey, created on first use (a registration against the usual caps). That user is always an admin and can run the admin commands (`/admin`, `/kick`, `/rename`, `/invite-token`, `/invite`, `/purge`, `/toggle` and `/status`; see [SPEC section 5, Admins](../SPEC.md#admins)). Unset by default. Anyone holding it can act as the admin, so set it only as a secret, never a Wrangler var in source: `npx wrangler secret put APRON_ADMIN_TOKEN --config wrangler.production.toml`. It persists across deploys; delete it with `npx wrangler secret delete APRON_ADMIN_TOKEN --config wrangler.production.toml` to turn it off (the `admin` user never holds a passkey, so nothing else signs in as it). A malformed value makes every request fail its configuration check. Locally, use `npx wrangler dev --var APRON_ADMIN_TOKEN:…` or `.dev.vars` |
 | `MEDIA_ORIGIN` | Exact https origin where the upload bucket serves objects, such as `https://media.apron.chat`; with `PUBLIC_ORIGIN`, `UPLOAD_SIGNING_KEY` and the `MEDIA` binding, turns uploads on for a plan that has them |

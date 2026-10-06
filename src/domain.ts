@@ -26,7 +26,7 @@ export interface StoredIdentity {
 	credentialCount: number;
 	/** Rooms the identity has joined (protocol §4.3.2), kept across connections. */
 	rooms: string[];
-	/** The identity's avatar while it lasts (protocol §4.6.6). */
+	/** The identity's avatar while it lasts (protocol §4.8.6). */
 	avatar?: string;
 	/** The identity's roles (protocol §3.3), kept in its row: `admin`, `bot`, or labels. */
 	roles: string[];

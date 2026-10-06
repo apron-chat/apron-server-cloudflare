@@ -201,7 +201,7 @@ async function forgetAnnouncements(): Promise<void> {
 	await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).announcedAt.clear());
 }
 
-describe('the status a user chooses (§4.11)', () => {
+describe('the status a user chooses (§4.5)', () => {
 	beforeEach(forgetAnnouncements);
 
 	it('shows each status as others see it: chosen ones at once, derived changes coalesced to one a minute', async () => {
@@ -239,7 +239,7 @@ describe('the status a user chooses (§4.11)', () => {
 			// online again: what his connections say, idle.
 			expect((await choose(bob, 'online')).result.you.status).toBe('online');
 			expect(told(await drain(alice), bobId)).toEqual(['idle']);
-			// A value this server does not support is "" (§4.11), and so is shown.
+			// A value this server does not support is "" (§4.5), and so is shown.
 			for (const unsupported of ['away', 'idle', 'offline', 'DND']) {
 				await forgetAnnouncements();
 				await choose(bob, 'online');
@@ -705,7 +705,7 @@ describe('user status timing', () => {
 			expect(off.frame.result).toEqual({});
 			expect(off.skipped.find((frame) => frame.params?.from?.user_id === '~private')?.params.body.text).toMatch(/^Status is now \*\*off\*\*/);
 			// Off clears what every connection was shown with `status: ""`, none
-			// (§4.11), for each user it shares a room with; `you` keeps the choice.
+			// (§4.5), for each user it shares a room with; `you` keeps the choice.
 			expect(told(off.skipped, watcherId)).toEqual(['']);
 			expect(own(off.skipped)).toEqual([]);
 			const cleared = await drain(watcher);
@@ -717,7 +717,7 @@ describe('user status timing', () => {
 			await drain(admin);
 			await drain(watcher);
 			// Off: no status shown to others, nor sent after auth; the chosen one
-			// is kept and in `you`. Listings still carry `status`, as §4.11 has
+			// is kept and in `you`. Listings still carry `status`, as §4.5 has
 			// every listing do, and it is `""` (none) for everyone, as off told.
 			const offList = await listing(watcher);
 			expect(offList.get(watcherId)).toMatchObject({ status: '' });
@@ -754,7 +754,7 @@ describe('user status timing', () => {
 	});
 });
 
-/** The frames among `frames` that §4.11 sends after a sign-in: mutes in effect (`status`) and others' statuses. */
+/** The frames among `frames` that §4.5 sends after a sign-in: mutes in effect (`status`) and others' statuses. */
 function signInSends(frames: Frame[]): Frame[] {
 	return frames.filter((frame) => frame.method === 'status' || statusOnly(frame));
 }
@@ -794,7 +794,7 @@ async function storeMutes(userId: string): Promise<void> {
 	});
 }
 
-describe('server.status and what follows a sign-in (§3.1, §4.11)', () => {
+describe('server.status and what follows a sign-in (§3.1, §4.5)', () => {
 	beforeEach(forgetAnnouncements);
 
 	it('advertises the optional statuses in server.status with presence on, and leaves it out with presence off', async () => {

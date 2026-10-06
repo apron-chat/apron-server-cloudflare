@@ -1,4 +1,4 @@
-// Web Push (protocol §4.7, push kind `webpush`): message encryption for the
+// Web Push (protocol §4.9, push kind `webpush`): message encryption for the
 // browser's push service (RFC 8291, `aes128gcm` from RFC 8188) and the
 // server's VAPID identification (RFC 8292), with WebCrypto only. Nothing here
 // reads storage or configuration; the Durable Object decides whom to wake.
@@ -9,7 +9,7 @@ import { createPrivateKey, createPublicKey, sign, verify } from "node:crypto";
 
 /** One browser push subscription: its endpoint and the keys its `PushSubscription` gives. */
 export interface WebPushSubscription {
-	/** The push service endpoint, which also identifies the registration (§4.7). */
+	/** The push service endpoint, which also identifies the registration (§4.9). */
 	url: string;
 	/** The browser's P-256 public key, uncompressed, unpadded base64url (65 bytes). */
 	p256dh: string;

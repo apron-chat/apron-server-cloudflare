@@ -171,7 +171,7 @@ it('/rename moves a registered user, their passkey, rooms and admin status to a 
 		const you = await until(dave, (frame) => frame.method === 'user' && frame.params.you !== undefined);
 		expect(you.frame.params).toEqual({ you: { user_id: toId, name: `Name of ${fromId}`, roles: ['admin'], status: 'online' } });
 		const change = await until(erin, (frame) => frame.method === 'user' && frame.params.old?.user_id === fromId);
-		// The new user_id carries the status others were shown under the old one (§4.11).
+		// The new user_id carries the status others were shown under the old one (§4.5).
 		expect(change.frame.params).toEqual({ new: { user_id: toId, name: `Name of ${fromId}`, roles: ['admin'], status: 'online' }, old: { user_id: fromId, name: `Name of ${fromId}` } });
 		const posted = await exchange(dave, 'post', 'message', { room_id: 'general', body: { text: 'renamed' } });
 		expect(posted.frame.result.message_id).toBeDefined();
@@ -302,7 +302,7 @@ it('room_join and room_leave with a user_id add and remove others: an admin anyo
 		expect(joined.frame.params.joined[0]).toMatchObject({ room_id: roomId, title: 'Invites' });
 		expect(joined.frame.params.joined[0].members.map((member: { user_id: string }) => member.user_id)).toEqual(['admin', bobId].sort());
 		// `users` are current objects: the admin's carry its role (§3.3), and each
-		// their status (§4.11). The admin signed in earlier in this file, so what
+		// their status (§4.5). The admin signed in earlier in this file, so what
 		// others were last told of them may still be waiting out a minute.
 		expect(joined.frame.params.users).toContainEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'], status: expect.stringMatching(/^(online|offline)$/) });
 		expect(joined.frame.params.users).toContainEqual({ user_id: bobId, name: `Name of ${bobId}`, roles: [], status: 'online' });
@@ -326,7 +326,7 @@ it('room_join and room_leave with a user_id add and remove others: an admin anyo
 		const removed = await exchange(admin, 'remove-bob', 'room_leave', { room_id: roomId, user_id: bobId });
 		expect(removed.frame.result).toEqual({});
 		expect(removed.skipped.filter((frame) => frame.params?.memberships).at(-1)?.params.memberships[0].members).toEqual([{ user: { user_id: bobId, name: `Name of ${bobId}` }, joined: false }]);
-		// The removed user's connections get `left` with the membership (§4.3.2, §4.8 /kick).
+		// The removed user's connections get `left` with the membership (§4.3.2, §4.1 /kick).
 		const left = await until(bob, (frame) => frame.method === 'room_update' && frame.params.left !== undefined);
 		expect(left.frame.params.left).toEqual([{ room_id: roomId }]);
 		expect(left.frame.params.memberships[0].members).toEqual([{ user: { user_id: bobId, name: `Name of ${bobId}` }, joined: false }]);
@@ -429,7 +429,7 @@ async function passkeyLogin(passkey: Awaited<ReturnType<typeof softPasskey>>): P
 	} finally { peer.close(); }
 }
 
-it('adds a passkey to the signed-in account (§4.9); a guest\'s registration makes a new account', async () => {
+it('adds a passkey to the signed-in account (§4.10); a guest\'s registration makes a new account', async () => {
 	const userId = unique('keys');
 	const user = await signedIn(userId);
 	const guest = await connect();

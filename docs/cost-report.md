@@ -170,7 +170,7 @@ Memberships:
   Free's 100, about 120 times its 2,500,000). A room whose page of
   registered members is full also reads its `member_count` (one row, within
   the per-room slack), so the listing can say how many it left out.
-- Adding a passkey while signed in (§4.9) is one reservation of 96 reads
+- Adding a passkey while signed in (§4.10) is one reservation of 96 reads
   and 48 writes, charged as a registration: the identity and credential
   lookups, a count of the account's passkeys (at most 8), the credential row
   with its indexes, and the registration limiter rows. The per-IP (5, Free 3)
@@ -309,7 +309,7 @@ independent.
 
 ## Push
 
-With Web Push on (protocol §4.7), `push_register` is one frame plus the
+With Web Push on (protocol §4.9), `push_register` is one frame plus the
 registration above: about 7 writes the first time (the row and its two
 indexes), and 2 for the reservation alone when a client registers the same
 subscription (keys and `push_id`) on its next connection within a day, which
@@ -344,7 +344,7 @@ endpoint otherwise cost what as many separate registrations do: a wake
 claims at most `wakesPerMessage` users of `subscriptionsPerUser` each.
 
 A wake claim also passes over a candidate that a mute or a `dnd` status
-silences (§4.7: such a push would go only to `badge` registrations, which
+silences (§4.9: such a push would go only to `badge` registrations, which
 this server does not have). The unscoped mute and `dnd` are in the
 `user_status` row the claim reads first (5/2 for a passed-over candidate
 with the reservation). Room mutes are checked only for a candidate with
@@ -397,7 +397,7 @@ Measured on 2026-10-05 with
 and the 101-room ceiling),
 [`test/presence.integration.test.ts`](../test/presence.integration.test.ts)
 and [`test/push.integration.test.ts`](../test/push.integration.test.ts), and
-re-measured the same day for the rewritten design (protocol §4.11 at
+re-measured the same day for the rewritten design (protocol §4.5 at
 shazow/apron 9825e38, whose clarifications at 48af29b, `server.status` and
 what follows only a sign-in, change no cost; [SPEC section 4.4](../SPEC.md#44-push), Chosen status,
 Mute and User status). Users choose a status with `me`; others see `online`

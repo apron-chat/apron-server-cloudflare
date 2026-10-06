@@ -1,15 +1,15 @@
-// A user's `status` (protocol §4.11): the value they choose with `me`, and
+// A user's `status` (protocol §4.5): the value they choose with `me`, and
 // what others see of it. Pure: the Durable Object gathers the inputs from
 // connection attachments, and for users without a connection from storage.
 
-/** The `status` values a user may choose with `me` (§4.11): `online` is the default, `""` none. */
+/** The `status` values a user may choose with `me` (§4.5): `online` is the default, `""` none. */
 export type StatusChoice = "online" | "" | "dnd" | "invisible";
 
-/** The `status` others see (§4.11). */
+/** The `status` others see (§4.5). */
 export type Status = "online" | "idle" | "dnd" | "offline" | "";
 
 export const STATUS_CHOICES: readonly StatusChoice[] = ["online", "", "dnd", "invisible"];
-/** The optional choices (§4.11), listed in `server.status`; `online` and `""` are always accepted and never listed. */
+/** The optional choices (§4.5), listed in `server.status`; `online` and `""` are always accepted and never listed. */
 export const OPTIONAL_STATUS_CHOICES: readonly StatusChoice[] = ["dnd", "invisible"];
 export const STATUSES: readonly Status[] = ["online", "idle", "dnd", "offline", ""];
 
@@ -23,7 +23,7 @@ export function isStatus(value: unknown): value is Status {
 
 /**
  * The choice a `me` `status` string makes: itself when this server supports
- * it, else `""`, which servers set for a value they don't support (§4.11).
+ * it, else `""`, which servers set for a value they don't support (§4.5).
  */
 export function statusChoice(value: string): StatusChoice {
 	return isStatusChoice(value) ? value : "";
@@ -39,7 +39,7 @@ export interface StatusInputs {
 }
 
 /**
- * What others see of a user (§4.11):
+ * What others see of a user (§4.5):
  *
  * - `""` (none) whatever their connections, so it never tells whether they
  *   are connected;

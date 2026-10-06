@@ -3,7 +3,7 @@ import { STATUSES, STATUS_CHOICES, isStatus, isStatusChoice, shownStatus, status
 
 const seen = (choice: StatusChoice, connected: boolean, attended = false) => shownStatus({ choice, connected, attended });
 
-describe('user status (§4.11): what others see of the status a user chose', () => {
+describe('user status (§4.5): what others see of the status a user chose', () => {
 	it('online: online when a connection is attended, idle when connected with none attended, offline without one', () => {
 		expect(seen('online', true, true)).toBe('online');
 		expect(seen('online', true, false)).toBe('idle');

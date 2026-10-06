@@ -15,7 +15,7 @@ export interface RuntimeConfig {
 	/** Let guests post, react, join and leave rooms, and create threads; `GUEST_POSTING` overrides the plan's default. Off, guests only read. */
 	guestPosting: boolean;
 	/**
-	 * User `status` shown to others (§4.11). `PRESENCE` overrides the plan's
+	 * User `status` shown to others (§4.5). `PRESENCE` overrides the plan's
 	 * default. It needs push, as capability `status` does.
 	 */
 	presence: boolean;
@@ -26,13 +26,13 @@ export interface RuntimeConfig {
 	 */
 	adminToken?: string;
 	/**
-	 * Uploads (protocol §4.6.3, cap `embed:upload`), on when the plan has an
+	 * Uploads (protocol §4.8.3, cap `embed:upload`), on when the plan has an
 	 * upload policy and the deployment sets `MEDIA_ORIGIN`, `PUBLIC_ORIGIN`,
 	 * the `UPLOAD_SIGNING_KEY` secret, and the `MEDIA` R2 binding.
 	 */
 	uploads?: UploadConfig;
 	/**
-	 * Web Push (protocol §4.7, push kind `webpush`), on when the plan has a
+	 * Web Push (protocol §4.9, push kind `webpush`), on when the plan has a
 	 * push policy and the deployment sets `VAPID_PUBLIC_KEY`, `VAPID_SUBJECT`,
 	 * and the `VAPID_PRIVATE_KEY` secret.
 	 */

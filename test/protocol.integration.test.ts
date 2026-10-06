@@ -53,7 +53,7 @@ async function authenticate(peer: Peer, scheme = 'guest', extraCaps: string[] = 
 	peer.send({ method: 'auth', id: 'auth', params: { scheme } });
 	const auth = await peer.next();
 	expect(auth.result.you.user_id).toMatch(/^guest_/);
-	// `you` carries the user's own `status` (§4.11), which recorded objects such as `from` never do.
+	// `you` carries the user's own `status` (§4.5), which recorded objects such as `from` never do.
 	expect(auth.result.you.status).toBe('online');
 	const { status: _status, ...identity } = auth.result.you;
 	return identity;
@@ -440,7 +440,7 @@ it('creates threads with room_set, delivers only to joined rooms, and moves mess
 		// Joining: `joined`, with the members after the join, before `{}`.
 		const members = [aliceId, bobId].sort((a, b) => a.user_id < b.user_id ? -1 : 1);
 		const joinedRoom = { ...room, latest_log_id: followed.log_id, members: members.map((member) => ({ user_id: member.user_id })) };
-		// `users` are current objects, with each one's status (§4.11).
+		// `users` are current objects, with each one's status (§4.5).
 		const online = members.map((member) => ({ ...member, status: 'online' }));
 		const joined = await exchange(bob, 'join', 'room_join', { room_id: roomId });
 		expect(joined.frame.result).toEqual({});

@@ -62,7 +62,7 @@ export const UPGRADABLE_SCHEMA_VERSIONS: readonly number[] = [5, 6, 7];
  * never holds a passkey, so deleting the token turns it off completely.
  */
 export const ADMIN_USER_ID = "admin";
-/** Passkeys one registered identity may hold (§4.9: a registration while signed in adds one). */
+/** Passkeys one registered identity may hold (§4.10: a registration while signed in adds one). */
 export const MAX_PASSKEYS_PER_USER = 8;
 /** Rooms a new identity has joined: the permanent top-level room (§3.4). */
 export const DEFAULT_JOINED_ROOMS: readonly string[] = [ROOM_ID];
@@ -212,7 +212,7 @@ export interface StoreConfig {
   /**
    * Keep `og` media (`image`, `video`, `audio`) that point at other servers.
    * Off: every viewer's client would load a URL the sender chose, and this
-   * server hosts and proxies no media of its own (§4.6.1).
+   * server hosts and proxies no media of its own (§4.8.1).
    */
   ogRemoteMedia: boolean;
   /**
@@ -229,11 +229,11 @@ export interface StoreConfig {
   /** Conservative row-cost estimate for one maintenance batch. */
   cleanupCost: CostEstimate;
   /**
-   * Uploads (protocol §4.6.3), or null without them: the plan's policy and
+   * Uploads (protocol §4.8.3), or null without them: the plan's policy and
    * the public origin its R2 objects are served from.
    */
   uploads: StoreUploadConfig | null;
-  /** Web Push (protocol §4.7), or null without it: the plan's push policy. */
+  /** Web Push (protocol §4.9), or null without it: the plan's push policy. */
   push: PushPolicy | null;
 }
 
@@ -242,7 +242,7 @@ export interface StoreUploadConfig extends UploadPolicy {
   mediaOrigin: string;
 }
 
-/** An upload waiting for its write (protocol §4.6.3): what its `write_url` signs. */
+/** An upload waiting for its write (protocol §4.8.3): what its `write_url` signs. */
 export interface PendingUpload {
   /** The R2 object key: `f/<id>` for an attached file, `a/<id>` for an avatar. */
   key: string;
@@ -263,7 +263,7 @@ export interface UploadFinish {
 }
 
 /**
- * A new upload as a result lists it (§4.6.3), with `write` in place of the
+ * A new upload as a result lists it (§4.8.3), with `write` in place of the
  * `write_url` the runtime signs from it. Kept in the stored result, so a
  * retry signs the same URL.
  */
@@ -416,7 +416,7 @@ export interface RoomRecord {
   log_id: string;
   parent_room_id?: string;
   title?: string;
-  /** What the room is about, Markdown by convention (§3.4). */
+  /** What the room is about, CommonMark by convention (§3.4). */
   description?: string;
   ext?: Record<string, unknown>;
   latest_log_id: string;
@@ -442,7 +442,7 @@ export type RecordKind = "room" | "message" | "reactions" | "membership";
 
 /**
  * A committed record, in log order, ready to deliver as a notification to the
- * members of `rooms`: its room, and for a move both rooms (§3.4, §4.1).
+ * members of `rooms`: its room, and for a move both rooms (§3.4, §4.2).
  */
 export interface Broadcast {
   /** A membership record is delivered in `room_update` `memberships` (§4.3.3), not as its own notification. */
@@ -474,7 +474,7 @@ export interface StoreMutationResult {
   message?: MessageSnapshot;
   /** The saved room record, for `room_set`. */
   room?: RoomRecord;
-  /** Uploads this operation started; their `write_url`s go in the result (§4.6.3). */
+  /** Uploads this operation started; their `write_url`s go in the result (§4.8.3). */
   uploads?: PendingUpload[];
   /** R2 objects to delete: uploads whose embed or message this operation removed. */
   deletedUploads?: string[];
@@ -487,7 +487,7 @@ export interface StoreMutationResult {
 }
 
 export interface StoreHistoryQuery {
-  /** Omitted, the default room (§4.1). */
+  /** Omitted, the default room (§4.2). */
   roomId?: string;
   after?: string | bigint;
   before?: string | bigint;
@@ -499,7 +499,7 @@ export interface StoreHistoryQuery {
   maxBytes?: number;
 }
 
-/** A history page (§4.1): each array is omitted when empty, and the bounds with it. */
+/** A history page (§4.2): each array is omitted when empty, and the bounds with it. */
 export interface StoreHistoryResult {
   rooms?: RoomRecord[];
   messages?: MessageSnapshot[];
@@ -788,7 +788,7 @@ const MEMBER_TABLES = /\b(identities|memberships|user_status)\b/;
  */
 const MAX_PUSH_WAKES_PER_USER = MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS;
 /**
- * Longest push endpoint URL kept (protocol §4.7). Browsers' are a few
+ * Longest push endpoint URL kept (protocol §4.9). Browsers' are a few
  * hundred bytes; a tighter bound keeps each row small, so sybil accounts
  * cannot fill storage with registrations.
  */
@@ -796,11 +796,11 @@ export const MAX_PUSH_URL_BYTES = 512;
 /** A re-registration of an unchanged subscription younger than this writes nothing. */
 const PUSH_REFRESH_MS = 86_400_000;
 
-/** A registration's `push_id` (protocol §4.7): 1 to 64 letters, digits, `_` or `-`. */
+/** A registration's `push_id` (protocol §4.9): 1 to 64 letters, digits, `_` or `-`. */
 export const PUSH_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
 /**
- * The wake scopes this server implements (protocol §4.7), each a bit of a
+ * The wake scopes this server implements (protocol §4.9), each a bit of a
  * registration's `wake` column: `mentions` (messages whose `mentions` list
  * the user) and `replies` (replies to the user's messages).
  */
@@ -813,7 +813,7 @@ export const MUTE_FOREVER = Number.MAX_SAFE_INTEGER;
 /** The longest timed mute: a year; longer ones are cut to it. */
 export const MAX_MUTE_SECONDS = 365 * 86_400;
 /**
- * Most room mutes one user keeps (protocol §4.11 `status` with `room_id`):
+ * Most room mutes one user keeps (protocol §4.5 `status` with `room_id`):
  * past it, a mute of another room is declined. It bounds what a sign-in
  * reads to tell the mutes in effect, and what a wake claim's probes can find.
  */
@@ -826,7 +826,7 @@ export interface RoomMute {
 }
 
 /**
- * A user's stored `status` state (protocol §4.11), read once at sign-in:
+ * A user's stored `status` state (protocol §4.5), read once at sign-in:
  * the `status` they chose with `me`, until when their unscoped mute lasts
  * (absent when not muted), and their room mutes in effect, in `room_id`
  * order.
@@ -862,7 +862,7 @@ function choiceColumn(value: unknown): StatusChoice {
   return isStatusChoice(value) ? value : "";
 }
 
-/** A room mute's stored end as `status` `mute` carries it (§4.11): `true`, else the seconds left, rounded up. */
+/** A room mute's stored end as `status` `mute` carries it (§4.5): `true`, else the seconds left, rounded up. */
 export function muteValue(untilMs: number, effective: number): number | true {
   return untilMs >= MUTE_FOREVER ? true : Math.max(1, Math.ceil((untilMs - effective) / 1_000));
 }
@@ -892,7 +892,7 @@ export interface PushCandidate {
 }
 
 /**
- * A user's Web Push registration (protocol §4.7, kind `webpush`): its
+ * A user's Web Push registration (protocol §4.9, kind `webpush`): its
  * endpoint, the browser's keys, and the client's `push_id`, which every push
  * to it carries. A registration is the user's: two users may register the
  * same endpoint.
@@ -1077,7 +1077,7 @@ function recordedUser(userId: string, name: string | null | undefined): Identity
 /**
  * The text an embed's `og` may carry, with its longest kept length in code
  * points. Clients build `og` themselves (such as link previews), and the
- * server has the last word on it (§4.6.1): it keeps these fields as one line
+ * server has the last word on it (§4.8.1): it keeps these fields as one line
  * of plain text and drops the rest. Media are kept only with `ogRemoteMedia`.
  */
 const OG_TEXT_FIELDS: Record<string, number> = { title: 256, description: 512, site_name: 128 };
@@ -1091,7 +1091,7 @@ const OG_MEDIA_MAX_DIMENSION = 16_384;
 const OG_UNSAFE_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
 
 /** `value` as one line of plain text of at most `max` code points, or undefined when empty. */
-/** An identity's avatar while it has not expired (protocol §4.6.6). */
+/** An identity's avatar while it has not expired (protocol §4.8.6). */
 function liveAvatar(row: { avatar_url: string | null; avatar_expires_ms: number | null }, now: number): string | undefined {
   return row.avatar_url && (row.avatar_expires_ms ?? 0) > now ? row.avatar_url : undefined;
 }
@@ -1101,7 +1101,7 @@ function uploadTitle(value: unknown): string | undefined {
   return ogLine(value, OG_TEXT_FIELDS.title);
 }
 
-/** An unguessable object key segment (protocol §4.6.2): 128 random bits, base64url. */
+/** An unguessable object key segment (protocol §4.8.2): 128 random bits, base64url. */
 function randomKey(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -1161,8 +1161,8 @@ function withCleanOg(embed: Record<string, unknown>, remoteMedia: boolean): Reco
 
 /**
  * A schema 5 intro message's text, which becomes its room's description;
- * none when deleted or empty. A description is Markdown by convention
- * (§3.4), so a plain-text intro is escaped to read the same; a Markdown one
+ * none when deleted or empty. A description is CommonMark by convention
+ * (§3.4), so a plain-text intro is escaped to read the same; a CommonMark one
  * is kept as written.
  */
 function introText(snapshot: Record<string, unknown>): string | undefined {
@@ -1200,15 +1200,15 @@ function ensureText(value: unknown, field: string, maxBytes: number): string {
  * member listings) and by user (for a user's rooms), counted in each room's
  * `member_count`. Guests' memberships live in their connection only, like the
  * guest identity itself, and are not logged. `uploads` lists the objects
- * written to R2 (protocol §4.6.3): attached files by message and embed, and
+ * written to R2 (protocol §4.8.3): attached files by message and embed, and
  * avatars, by owner, expiry, and pending write. `push_subscriptions` holds
- * registered users' Web Push registrations (protocol §4.7), keyed by user
+ * registered users' Web Push registrations (protocol §4.9), keyed by user
  * and endpoint, indexed by user and registration time and by registration
  * time (for expiry), and by user and registration time for those that wake
  * for messages (a partial index, so a wake reads only those). `push_wakes`
  * keeps when each user was last woken for each room, for coalescing.
  * `user_status` keeps each registered user's `status` state (protocol
- * §4.11): the `status` they chose with `me` and until when their unscoped
+ * §4.5): the `status` they chose with `me` and until when their unscoped
  * mute lasts, one row while either differs from the default (`online`, not
  * muted). `room_mutes` keeps their room mutes, keyed by user and room, at
  * most MAX_ROOM_MUTES_PER_USER a user.
@@ -1568,7 +1568,7 @@ export class Store {
    *   the log holds at most the retention window.
    * - Each room counts its stored registered members in `member_count`.
    * - `credentials` is rebuilt without its UNIQUE `user_id`, so an identity
-   *   may add passkeys (§4.9).
+   *   may add passkeys (§4.10).
    *
    * Nothing else changes: the demo never logged `@server` or `@room`
    * messages, and `@private` notices were never stored, so no sender needs
@@ -3430,7 +3430,7 @@ export class Store {
   }
 
   /**
-   * Adds a passkey to a registered identity that is signed in (§4.9): a
+   * Adds a passkey to a registered identity that is signed in (§4.10): a
    * registration on a connection already signed in adds to that account.
    * Bots sign in with their token and take none. At most
    * MAX_PASSKEYS_PER_USER per identity; a credential already registered
@@ -3987,7 +3987,7 @@ export class Store {
     );
   }
 
-  /** Create, save, delete, restore, or move a message (section 3.5, §4.2). */
+  /** Create, save, delete, restore, or move a message (section 3.5, §4.4). */
   private commitMessage(input: StoreMutationInput, context: CommitContext, floor: number): StoreMutationResult {
     const params = input.params;
     if (params.log_id !== undefined) throw new StoreError("invalid_params", "log_id is server assigned");
@@ -4014,7 +4014,7 @@ export class Store {
       body = this.normalizedBody(params.body);
       if (body.text === "" && (body.embeds as unknown[]).length === 0) throw new StoreError("invalid_params", "message cannot be empty");
     }
-    // A save merges `ext` into the current snapshot's (§3.5); a tombstone carries none (§4.4).
+    // A save merges `ext` into the current snapshot's (§3.5); a tombstone carries none (§4.6).
     const write = this.optionalExt(params.ext);
     const ext = deleted ? undefined : mergeExt(previous?.ext, write);
     const from = previous ? previous.from : this.identityForMessage(input);
@@ -4046,7 +4046,7 @@ export class Store {
     if (moved) snapshot.prev_room_id = current.room_id;
     const json = JSON.stringify(snapshot);
 
-    // A move belongs to the source and destination logs (§4.1).
+    // A move belongs to the source and destination logs (§4.2).
     this.appendRecord(context, moved ? [current.room_id, roomId] : [roomId], "message", logId, json);
     this.rawExec(
       `INSERT INTO message_state (message_id, room_id, latest_log_id, snapshot_json, author_id)
@@ -4082,7 +4082,7 @@ export class Store {
         broadcasts.push({ method: "reactions", params: clone(record) as unknown as Record<string, unknown>, rooms: [roomId] });
       }
     }
-    // New uploads' writes go in the result, in request order (§4.6.3); the
+    // New uploads' writes go in the result, in request order (§4.8.3); the
     // runtime signs each into a `write_url`, so a retry gets the same URLs.
     const result: Record<string, unknown> = { message_id: messageId };
     if (uploads.length) result.embeds = uploads.map(uploadResultEmbed);
@@ -4090,7 +4090,7 @@ export class Store {
   }
 
   /**
-   * Embed identity (protocol §4.6.2) on a server with `embed:upload`: every
+   * Embed identity (protocol §4.8.2) on a server with `embed:upload`: every
    * embed gets an `embed_id`. One sent back with its `embed_id` keeps what the
    * server owns from the previous snapshot: an upload keeps its `url` and
    * `og` and takes only a new `title`. One without is new, and a new `upload`
@@ -4135,7 +4135,7 @@ export class Store {
   }
 
   /**
-   * Starts an upload (protocol §4.6.3) for a registered user: charges the
+   * Starts an upload (protocol §4.8.3) for a registered user: charges the
    * user's and the server's daily upload counts, and reserves the largest
    * size against the stored-bytes cap until the write reports its size.
    */
@@ -4232,7 +4232,7 @@ export class Store {
   }
 
   /**
-   * Starts an avatar upload (protocol §4.6.6): `/avatar` with one `upload`
+   * Starts an avatar upload (protocol §4.8.6): `/avatar` with one `upload`
    * embed. The avatar is set when the write finishes (finishUpload).
    */
   startAvatarUpload(input: { userId: string; now?: number }): PendingUpload {
@@ -4245,7 +4245,7 @@ export class Store {
   }
 
   /**
-   * Finishes a write exactly once (protocol §4.6.3). A file's message gets a
+   * Finishes a write exactly once (protocol §4.8.3). A file's message gets a
    * new snapshot, with the embed completed (`url`, and `og.image` describing
    * it) or, for a failed write, without it; an avatar becomes its owner's.
    * A write that is not pending, came too late, or whose embed or message is
@@ -4331,7 +4331,7 @@ export class Store {
   }
 
   /**
-   * Fails pending uploads whose write never came (protocol §4.6.3): their
+   * Fails pending uploads whose write never came (protocol §4.8.3): their
    * messages get a snapshot without the embed. Maintenance work, a bounded
    * batch per call; `next` is when the next one falls due.
    */
@@ -4437,7 +4437,7 @@ export class Store {
   }
 
   /**
-   * `push_register` (protocol §4.7, kind `webpush`): keeps a registered
+   * `push_register` (protocol §4.9, kind `webpush`): keeps a registered
    * user's registration of the endpoint `url`, with its `push_id` and the
    * `wake` scopes it wakes for (a WAKE_SCOPES bitmask, DEFAULT_WAKE when not
    * given). Registrations are the user's own: registering a `url` the user
@@ -4487,7 +4487,7 @@ export class Store {
     }));
   }
 
-  /** `push_unregister` (protocol §4.7): removes the user's own registration of `url`, if any. */
+  /** `push_unregister` (protocol §4.9): removes the user's own registration of `url`, if any. */
   removePushSubscription(input: { userId: string; url: string; now?: number }): void {
     this.ensureReady();
     const now = input.now ?? this.clock.now();
@@ -4497,13 +4497,13 @@ export class Store {
   }
 
   /**
-   * The registrations a new message in `roomId` pushes to (protocol §4.7).
+   * The registrations a new message in `roomId` pushes to (protocol §4.9).
    * `candidates` are the users the caller found unattended among those the
    * message mentions or replies to, each with the scopes it qualifies under,
    * at most MAX_PUSH_CANDIDATES. Each is looked up in turn: only its
    * unexpired registrations whose `wake` includes one of those scopes count,
    * and one with none is passed over without taking a wake; so is one that a
-   * mute or a `dnd` status silences (protocol §4.7: a silenced push
+   * mute or a `dnd` status silences (protocol §4.9: a silenced push
    * goes only to `badge` registrations, which this server does not have):
    * its unscoped mute, or its mute of the room or, for a thread, of the
    * thread's parent; one woken for this room within `coalesceSeconds` is
@@ -4536,12 +4536,12 @@ export class Store {
       const live = effective - policy.pushExpiryDays * 86_400_000;
       let counters: { server: RawLimitRow; sent: number; delivered: number } | undefined;
       // The rooms a room mute silences this message by: its room and, for a
-      // thread, the parent (protocol §4.11), read once a candidate needs it.
+      // thread, the parent (protocol §4.5), read once a candidate needs it.
       let scopes: string[] | undefined;
       let woken = 0;
       for (const userId of candidates) {
         if (woken >= policy.wakesPerMessage) break;
-        // A muted or `dnd` user gets no pushes (protocol §4.7, §4.11) and takes no wake.
+        // A muted or `dnd` user gets no pushes (protocol §4.9, §4.5) and takes no wake.
         const status = this.rawRows<{ status: string; mute_until_ms: number | null }>("SELECT status, mute_until_ms FROM user_status WHERE user_id = ? LIMIT 1", userId)[0];
         if (status && (status.status === "dnd" || (status.mute_until_ms != null && integerColumn(status.mute_until_ms) > effective))) continue;
         // Filtered after the bounded read, so the read stays one index range of
@@ -4653,7 +4653,7 @@ export class Store {
 
   /**
    * The author of a retained message, for waking the user a reply answers
-   * (protocol §4.7 `replies`): one indexed read of its current state. Null
+   * (protocol §4.9 `replies`): one indexed read of its current state. Null
    * for an unknown or expired message.
    */
   messageAuthor(messageId: string, now = this.clock.now()): string | null {
@@ -4662,7 +4662,7 @@ export class Store {
   }
 
   /**
-   * `status` `mute` without `room_id` (protocol §4.11) for a registered user:
+   * `status` `mute` without `room_id` (protocol §4.5) for a registered user:
    * until when they are muted, MUTE_FOREVER for `true`, or null to end it.
    * Whether the stored mute changed, and `untilMs`, the end it leaves,
    * absent when not muted. A mute is the user's, whichever connection set
@@ -4689,7 +4689,7 @@ export class Store {
   }
 
   /**
-   * `me` `status` (protocol §4.11) for a registered user: the value they
+   * `me` `status` (protocol §4.5) for a registered user: the value they
    * chose, kept in their `user_status` row with the mute. Whether it changed.
    */
   setStatus(input: { userId: string; choice: StatusChoice; now?: number }): { changed: boolean } {
@@ -4728,7 +4728,7 @@ export class Store {
   }
 
   /**
-   * `status` `mute` with `room_id` (protocol §4.11) for a registered user:
+   * `status` `mute` with `room_id` (protocol §4.5) for a registered user:
    * until when `roomId` and its threads are muted, MUTE_FOREVER for `true`,
    * or null to end it. Kept in `room_mutes`, one row a room, at most
    * MAX_ROOM_MUTES_PER_USER a user: a mute of another room past that first
@@ -4771,7 +4771,7 @@ export class Store {
   }
 
   /**
-   * The room mutes of a user that ran out by `now` (protocol §4.11), deleted
+   * The room mutes of a user that ran out by `now` (protocol §4.5), deleted
    * here, so each is told once: their rooms, and when the next of those left
    * runs out (absent when none is timed). One range of the user's rows, at
    * most MAX_ROOM_MUTES_PER_USER, and a delete of the expired ones.
@@ -4795,7 +4795,7 @@ export class Store {
   }
 
   /**
-   * A registered user's stored `status` state (protocol §4.11), read once at
+   * A registered user's stored `status` state (protocol §4.5), read once at
    * sign-in: the `status` they chose, their unscoped mute's end (absent when
    * not muted, MUTE_FOREVER for `true`) and their room mutes in effect. One
    * primary-key read and one range of the user's room mutes, at most
@@ -4844,7 +4844,7 @@ export class Store {
     return emojis;
   }
 
-  /** Replace the caller's reaction set on one message (§4.5). */
+  /** Replace the caller's reaction set on one message (§4.7). */
   private commitReactions(input: StoreMutationInput, context: CommitContext, floor: number): StoreMutationResult {
     const params = input.params;
     const messageIdParam = params.message_id;
@@ -4860,7 +4860,7 @@ export class Store {
       message.message_id, input.userId,
     )[0];
     const currentSet = existing && existing.log_id >= floor ? parseJson<string[]>(existing.emojis_json, []) : [];
-    // An unchanged set produces no record (§4.5 permits no change).
+    // An unchanged set produces no record (§4.7 permits no change).
     if (currentSet.length === emojis.length && emojis.every((emoji) => currentSet.includes(emoji))) {
       return { result: {}, broadcasts: [] };
     }
@@ -5111,7 +5111,7 @@ export class Store {
     // writes); every other mutation measured at most 37. Unused rows are
     // credited back, so the floor only decides admission near the ceiling.
     const mayMove = method === "message" && typeof input.params.message_id === "string";
-    // Each embed may start or release an upload (§4.6.3).
+    // Each embed may start or release an upload (§4.8.3).
     const uploadWrites = this.config.uploads && method === "message" ? this.config.maxEmbeds * UPLOAD_WRITES : 0;
     const mutationCost = {
       ...this.config.mutationCost,
@@ -5161,7 +5161,7 @@ export class Store {
     return this.commitMutation({ ...input, params: clone(input.params) });
   }
 
-  /** History with the per-user/IP history quota charged (§4.1). */
+  /** History with the per-user/IP history quota charged (§4.2). */
   history(query: StoreHistoryQuery): StoreHistoryResult {
     this.ensureReady();
     const operationNow = query.now ?? this.clock.now();
@@ -5218,11 +5218,11 @@ export class Store {
     const maxBytes = Math.min(query.maxBytes ?? this.config.maxHistoryResponseBytes, this.config.maxHistoryResponseBytes);
     const latestLogId = idString(head);
     const historyLogId = roomHistoryLogId(room, floor);
-    // An empty slice has neither bound and omits every array (§4.1).
+    // An empty slice has neither bound and omits every array (§4.2).
     const empty = (): StoreHistoryResult => ({ more: false, latest_log_id: latestLogId, history_log_id: historyLogId });
     const forward = after !== undefined;
     // One contiguous slice of the room's log across every record kind; the
-    // limit counts records of any kind (§4.1). A window bounded to one log_id
+    // limit counts records of any kind (§4.2). A window bounded to one log_id
     // (after == before) is that record in this room's log only: a moved
     // message's earlier snapshot is fetched from the room its prev_room_id names.
     const rows = lower > upper || historyLogId === null ? [] : this.rawRows<RawRecordRow>(
@@ -5467,7 +5467,7 @@ export class Store {
       for (const row of limiters) this.rawExec("DELETE FROM principal_limits WHERE scope = ? AND principal_key = ?", row.scope, row.principal_key);
       if (limiters.length) this.rawExec("UPDATE _meta SET value = ? WHERE key = 'principal_limit_count'", String(Math.max(0, this.metaNumber("principal_limit_count") - limiters.length)));
       remaining -= limiters.length;
-      // Expired push registrations and wake times past coalescing (protocol §4.7).
+      // Expired push registrations and wake times past coalescing (protocol §4.9).
       const pushCutoffs = this.pushCutoffs(effective);
       const subscriptions = remaining > 0 ? this.rawRows<{ user_id: string; url: string }>(
         "SELECT user_id, url FROM push_subscriptions INDEXED BY push_subscriptions_updated_idx WHERE updated_ms < ? ORDER BY updated_ms LIMIT ?", pushCutoffs.subscriptions, remaining,

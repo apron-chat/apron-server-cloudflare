@@ -96,7 +96,7 @@ export const DEFAULT_PARSE_OPTIONS: ParseOptions = {
  * Methods the protocol defines only as notifications: one sent with an `id`
  * is handled as the notification and gets no reply, not even an error for
  * invalid params (§1). The liveness ping is answered with `pong`, a
- * notification, not a reply. A client's `status` is a request (§4.11),
+ * notification, not a reply. A client's `status` is a request (§4.5),
  * not one of these.
  */
 export const NOTIFICATION_METHODS: ReadonlySet<string> = new Set(["ping", "activity"]);
