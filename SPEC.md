@@ -4,7 +4,7 @@ Date: 2026-09-20
 Status: Implementation specification
 Target: https://github.com/shazow/apron
 Protocol: https://github.com/shazow/apron/blob/main/PROTOCOL.md
-Protocol reference reviewed: protocol version 8 (shazow/apron c9c6856), the repository's `PROTOCOL.md`. The `server` frame announces `apron: 8`. This document cites the version 8 section numbers: §4.1 `command`, §4.2 `history`, §4.3 `rooms`, §4.4 `edit`, §4.5 `status`, §4.6 `activity`, §4.7 `reactions`, §4.8 embeds and avatars, §4.9 push, §4.10 WebAuthn, §4.11 email, and §4.12 `ext`, the capability that keeps the `ext` clients write on users, messages, and rooms and merges it one level deep (section 4, Framing, ordering, and errors). Without it a server may drop `ext`; an extension such as this server's `ext:settings` keeps its own data under its name in `ext` with only its own capability (section 4, Extension `ext:settings`).
+Protocol reference reviewed: protocol version 8 (shazow/apron 25c4f46), the repository's `PROTOCOL.md`. The `server` frame announces `apron: 8`. This document cites the version 8 section numbers: §4.1 `command`, §4.2 `history`, §4.3 `rooms`, §4.4 `edit`, §4.5 `status`, §4.6 `activity`, §4.7 `reactions`, §4.8 embeds and avatars, §4.9 push, §4.10 WebAuthn, §4.11 email, and §4.12 `ext`, the capability that keeps the `ext` clients write on users, messages, and rooms and merges it one level deep (section 4, Framing, ordering, and errors). Without it a server may drop `ext`; an extension such as this server's `ext:settings` keeps its own data under its name in `ext` with only its own capability (section 4, Extension `ext:settings`).
 
 ## 1. Objective and instructions to the coding harness
 
