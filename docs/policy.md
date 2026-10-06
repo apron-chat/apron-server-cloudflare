@@ -276,7 +276,9 @@ but do consume frame and lookup resources.
 `server.params.ext.demo` describes retention and selected payload/posting policies,
 and what the demo does not keep: `read_cursors: false` (read markers are
 dropped), so clients can skip sending them. The ping interval is the standard
-`server.params.ping`.
+`server.params.ping`. `demo` is this implementation's extension name: under
+the protocol's extension naming rule, extension `ext:demo` keeps its data in
+`ext.demo`, and it defines no other names.
 The demo's 16 KiB frame policy is an explicit exception to the base protocol's
 advisory 256 KiB recommendation. Payload lengths count UTF-8 bytes. Errors use
 the base protocol codes; `retry_after` includes `data.retry_after`, whole
