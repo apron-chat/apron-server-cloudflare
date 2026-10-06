@@ -4276,7 +4276,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * `/status`: a `~private` notice to the sender, in CommonMark lists (no
 	 * tables, which strict CommonMark clients do not render), with today's Cloudflare
-	 * account usage against the Free plan's daily allowance (refreshed now
+	 * account usage against the selected plan's daily allowance (refreshed now
 	 * when account analytics are configured, at most once a minute), and the
 	 * object's own daily reservations against their budgets.
 	 */

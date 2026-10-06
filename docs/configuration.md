@@ -464,8 +464,10 @@ them. Cleanup and deduplication run in bounded batches/records, while
 
 `threadLimit` counts thread rooms (rooms with a `parent_room_id`) and
 `threadMetadataBytes` bounds a room's serialized client fields (`title`,
-`description`, `ext`). The `anonymous*` variables configure the
-guest tier (the `guest` auth scheme).
+`description`, `ext`). A user's `ext` is at most 512 bytes serialized
+(`MAX_USER_EXT_BYTES` in `src/store.ts`, not configurable: every connection
+of the user carries it in its attachment). The `anonymous*` variables
+configure the guest tier (the `guest` auth scheme).
 
 Guests are numbered `guest_1`, `guest_2`, … from a server-wide counter. The
 object reserves `guestNumberBlock` numbers at a time by advancing a stored
