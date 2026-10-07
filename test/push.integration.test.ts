@@ -903,6 +903,193 @@ describe('push review fixes', () => {
 
 });
 
+describe('push delay', () => {
+	/** Sets how long a wake waits before it pushes (`pushDelaySeconds`), as `PUSH_DELAY_SECONDS` would. */
+	const setDelay = (seconds: number) => runInDurableObject(stub(), (instance) => {
+		const runtime = instance as unknown as { config: { pushDelaySeconds: number } };
+		runtime.config = { ...runtime.config, pushDelaySeconds: seconds };
+	});
+	/** Waits out a one-second delay, with room to spare, so a push that was due has been sent. */
+	const waitOut = () => new Promise((resolve) => setTimeout(resolve, 2_000));
+
+	it('pushes after the wait to users still unattended, and not to those who came back or posted in the room', async () => {
+		const pushes = capturePushes();
+		const [aliceId, stayId, backId, postId, otherId, joinId] = [unique('alice'), unique('stay'), unique('back'), unique('post'), unique('other'), unique('join')];
+		const alice = await signedIn(aliceId);
+		const stay = await signedIn(stayId);
+		const back = await signedIn(backId);
+		const poster = await signedIn(postId);
+		const other = await signedIn(otherId);
+		const joiner = await signedIn(joinId);
+		let again: Peer | undefined;
+		try {
+			const staySub = await subscribe(stay, 'stay');
+			await subscribe(back, 'back');
+			await subscribe(poster, 'post');
+			const otherSub = await subscribe(other, 'other');
+			await subscribe(joiner, 'join');
+			for (const peer of [stay, back, poster, other, joiner]) await setIdle(peer, true);
+			await setDelay(1);
+			const thread = (await request(alice, 'thread', 'room_set', { parent_room_id: 'general', title: 'Delay' })).result.room_id;
+			await post(alice, 'mention', { room_id: 'general', body: { text: 'around?', mentions: [stayId, backId, postId, joinId] } });
+			await post(alice, 'elsewhere', { room_id: thread, body: { text: 'and you?', mentions: [otherId, postId] } });
+			// Nothing goes before the wait is over.
+			expect(pushes).toEqual([]);
+			// One comes back, one posts in general, and one signs in again, attended.
+			await setIdle(back, false);
+			await post(poster, 'reply', { room_id: 'general', body: { text: 'here' } });
+			again = await signedIn(joinId, true);
+			await waitOut();
+			// Only general's wake is dropped for the poster: their mention in the thread still pushes.
+			await vi.waitFor(() => expect(pushes).toHaveLength(3), { timeout: 5_000 });
+			const urls = pushes.map((push) => push.url);
+			expect(urls).toContain(staySub.url);
+			expect(urls).toContain(otherSub.url);
+			expect(urls.filter((url) => url.includes('/post-'))).toHaveLength(1);
+			// Nothing more comes.
+			await waitOut();
+			expect(pushes).toHaveLength(3);
+		} finally {
+			await setDelay(0);
+			alice.close(); stay.close(); back.close(); poster.close(); other.close(); joiner.close(); again?.close();
+		}
+	});
+
+	it('spends no wake slot or coalescing on a wake dropped while it waited', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId] = [unique('alice'), unique('bob')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		try {
+			const bobSub = await subscribe(bob, 'bob');
+			await setIdle(bob, true);
+			await setDelay(1);
+			await post(alice, 'first', { room_id: 'general', body: { text: 'one', mentions: [bobId] } });
+			// Back, then away again before the wait is over: he was there, so the wake is gone.
+			await setIdle(bob, false);
+			await setIdle(bob, true);
+			await waitOut();
+			expect(pushes).toEqual([]);
+			// The next mention in the same room is pushed, not coalesced away.
+			await post(alice, 'second', { room_id: 'general', body: { text: 'two', mentions: [bobId] } });
+			await waitOut();
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(pushes[0].url).toBe(bobSub.url);
+			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.body.text).toBe('two');
+		} finally {
+			await setDelay(0);
+			alice.close(); bob.close();
+		}
+	});
+});
+
+describe('held wakes', () => {
+	/** Waits long enough that a push that was going to go has gone. */
+	const settleFor = () => new Promise((resolve) => setTimeout(resolve, 500));
+	/** Reports idle with how long nobody has attended the connection, as a client does. */
+	async function idleFor(peer: Peer, seconds: number | true): Promise<void> {
+		expect((await status(peer, { idle: seconds })).frame.result).toEqual({});
+	}
+
+	it('pushes what an attended user was mentioned in once they go idle, if it came after they were last attended', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId, carolId, daveId] = [unique('alice'), unique('bob'), unique('carol'), unique('dave')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		const carol = await signedIn(carolId);
+		const dave = await signedIn(daveId);
+		try {
+			const bobSub = await subscribe(bob, 'bob');
+			await subscribe(carol, 'carol');
+			await subscribe(dave, 'dave');
+			// All three are attended: nothing goes.
+			const first = await post(alice, 'held', { room_id: 'general', body: { text: 'look', mentions: [bobId, carolId, daveId] } });
+			await settleFor();
+			expect(pushes).toEqual([]);
+			// Bob was last attended a minute ago, before it came: it is pushed now.
+			await idleFor(bob, 60);
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(pushes[0].url).toBe(bobSub.url);
+			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.message_id).toBe(first.result.message_id);
+			// Carol was attended after it came; Dave says only that he is idle: neither is pushed.
+			await idleFor(carol, 0);
+			await idleFor(dave, true);
+			await settleFor();
+			expect(pushes).toHaveLength(1);
+			// Released once: back and idle again pushes nothing more.
+			await setIdle(bob, false);
+			await idleFor(bob, 120);
+			await settleFor();
+			expect(pushes).toHaveLength(1);
+		} finally { alice.close(); bob.close(); carol.close(); dave.close(); }
+	});
+
+	it('holds nothing for a room the user posted in since, and waits for their last attended connection', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId] = [unique('alice'), unique('bob')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		const phone = await signedIn(bobId, true);
+		try {
+			const bobSub = await subscribe(bob, 'bob');
+			const thread = (await request(alice, 'thread', 'room_set', { parent_room_id: 'general', title: 'Held' })).result.room_id;
+			await post(alice, 'general', { room_id: 'general', body: { text: 'here', mentions: [bobId] } });
+			await post(alice, 'in-thread', { room_id: thread, body: { text: 'and here', mentions: [bobId] } });
+			// Bob answers in general: he saw that one.
+			await post(bob, 'answer', { room_id: 'general', body: { text: 'yes' } });
+			// One connection goes idle while the other is attended: nothing yet.
+			await idleFor(bob, 60);
+			await settleFor();
+			expect(pushes).toEqual([]);
+			await idleFor(phone, 60);
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(pushes[0].url).toBe(bobSub.url);
+			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.room_id).toBe(thread);
+			await settleFor();
+			expect(pushes).toHaveLength(1);
+		} finally { alice.close(); bob.close(); phone.close(); }
+	});
+	it('sends one push for all a user missed: the newest that wakes them', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId] = [unique('alice'), unique('bob')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		try {
+			const bobSub = await subscribe(bob, 'bob');
+			const threads = [];
+			for (const title of ['One', 'Two', 'Three']) threads.push((await request(alice, `thread-${title}`, 'room_set', { parent_room_id: 'general', title })).result.room_id);
+			await post(alice, 'first', { room_id: threads[0], body: { text: 'first', mentions: [bobId] } });
+			await post(alice, 'second', { room_id: threads[1], body: { text: 'second', mentions: [bobId] } });
+			const third = await post(alice, 'third', { room_id: threads[2], body: { text: 'third', mentions: [bobId] } });
+			// The newest is deleted: the next newest stands for them.
+			await post(alice, 'delete', { message_id: third.result.message_id, deleted: true });
+			// Bob muted the second's room: the one before stands in for it.
+			expect((await status(bob, { room_id: threads[1], mute: true })).frame.result).toEqual({});
+			await idleFor(bob, 60);
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			const payload = JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext);
+			expect(payload.message.body.text).toBe('first');
+			expect(payload).not.toHaveProperty('ext');
+			await settleFor();
+			expect(pushes).toHaveLength(1);
+		} finally { alice.close(); bob.close(); }
+	});
+
+	it('takes idle as whole seconds, and nothing else but a boolean', async () => {
+		const userId = unique('seconds');
+		const peer = await signedIn(userId);
+		try {
+			// Two violations leave the connection open.
+			for (const params of [{ idle: -1 }, { idle: 1.5 }]) {
+				expect((await request(peer, `bad-${JSON.stringify(params)}`, 'status', params)).error.code, JSON.stringify(params)).toBe(-32602);
+			}
+			expect(await idleOf(userId)).toEqual([false]);
+			await idleFor(peer, 0);
+			expect(await idleOf(userId)).toEqual([true]);
+		} finally { peer.close(); }
+	});
+});
+
 describe('security review fixes', () => {
 	const senderCharged = (userId: string) => runInDurableObject(stub(), (_instance, state) =>
 		state.storage.sql.exec<{ posts_day: number }>("SELECT posts_day FROM principal_limits WHERE scope = 'push' AND principal_key = ?", `user:${userId}`).toArray()[0]?.posts_day ?? 0);
