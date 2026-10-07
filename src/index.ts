@@ -32,6 +32,7 @@ import {
 import {
 	ADMIN_USER_ID,
 	DEFAULT_JOINED_ROOMS,
+	durationPhrase,
 	MAX_PASSKEYS_PER_USER,
 	MAX_PUSH_URL_BYTES,
 	MAX_ROLES_PER_USER,
@@ -1482,8 +1483,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * for the sign-in screen, worded for what this origin can sign in with.
 	 */
 	private signInWelcome(origin: string | null): string {
-		const days = Math.max(1, Math.round(this.config.limits.retentionSeconds / 86_400));
-		const history = `Messages are kept for ${days === 1 ? "a day" : `${days} days`}.`;
+		const history = `Messages are kept for ${durationPhrase(this.config.limits.retentionSeconds)}.`;
 		const guests = this.config.guestPosting ? "Guests can post under a new name each visit." : "Guests can read along.";
 		const signIn = this.passkeysOffered(origin)
 			? "**Create a passkey** to post, react, and start threads; it signs you in on your next visit too."

@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import { RETENTION_MS, Store, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
+import { durationPhrase, RETENTION_MS, Store, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
 import { errorCode, messagesOf, withStore as withNamedStore, type TestClock } from "./helpers/store";
 
 const withStore = <T>(name: string, config: Partial<StoreConfig>, fn: Parameters<typeof withNamedStore<T>>[2]) =>
@@ -333,6 +333,36 @@ it("opens the page reaching an expired start with a `~room` notice outside the p
 		// The notice is not a record: a window on its ID is empty.
 		expect(store.history({ roomId: "general", after: BigInt(notice.log_id!), before: BigInt(notice.log_id!), now: clock.value }).messages).toBeUndefined();
 		expect(old).toBeLessThan(threadLog);
+	});
+});
+
+it("words the retention in the largest whole unit", () => {
+	expect(durationPhrase(7 * 86_400)).toBe("7 days");
+	expect(durationPhrase(86_400)).toBe("a day");
+	expect(durationPhrase(36 * 3_600)).toBe("36 hours");
+	expect(durationPhrase(3_600)).toBe("an hour");
+	expect(durationPhrase(90 * 60)).toBe("90 minutes");
+	expect(durationPhrase(60)).toBe("a minute");
+	expect(durationPhrase(45)).toBe("45 seconds");
+	expect(durationPhrase(1)).toBe("a second");
+	expect(durationPhrase(0.2)).toBe("a second");
+});
+
+it("states the configured retention in the expiry notice", async () => {
+	const retentionMs = 36 * 3_600_000;
+	await withStore("expiry-notice-retention", { ...ROOMY, retentionMs, cleanupIntervalMs: 60_000 }, (store, clock) => {
+		store.mutate(messageInput(clock, "retention-old", { body: { format: "plain", text: "old" } }));
+		clock.value += retentionMs - 1_000;
+		const kept = logId(store.mutate(messageInput(clock, "retention-kept", { body: { format: "plain", text: "kept" } })));
+		clock.value += 2_000;
+		for (let runs = 0; runs < 12; runs += 1) {
+			const result = store.runCleanup(clock.value);
+			if (!result.did_work && result.next_due_ms > clock.value) break;
+			clock.value = result.next_due_ms + 1;
+		}
+		const page = store.history({ roomId: "general", after: 0n, limit: 50, now: clock.value });
+		expect(page.messages?.map((entry) => entry.log_id)).toEqual([page.history_log_id, String(kept)]);
+		expect(page.messages?.[0].body).toEqual({ text: "Messages before this have expired. Messages are kept for 36 hours." });
 	});
 });
 

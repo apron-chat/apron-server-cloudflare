@@ -933,6 +933,21 @@ function numericBigInt(value: bigint, field = "id"): string {
   return value.toString();
 }
 
+const DURATION_UNITS: ReadonlyArray<readonly [seconds: number, one: string, many: string]> = [
+  [86_400, "a day", "days"], [3_600, "an hour", "hours"], [60, "a minute", "minutes"], [1, "a second", "seconds"],
+];
+
+/**
+ * A duration in the largest unit that holds it whole, for people to read:
+ * "7 days", "a day", "36 hours", "90 minutes". Seconds round to whole ones.
+ */
+export function durationPhrase(seconds: number): string {
+  const whole = Math.max(1, Math.round(seconds));
+  const [unit, one, many] = DURATION_UNITS.find(([size]) => whole % size === 0)!;
+  const count = whole / unit;
+  return count === 1 ? one : `${count} ${many}`;
+}
+
 function idString(value: number): string {
   if (!Number.isSafeInteger(value) || value < 0 || value > MAX_SAFE_ID) {
     throw new StoreError("internal_error", "identifier range exhausted");
@@ -5111,12 +5126,11 @@ export class Store {
    */
   private expiryNotice(room: RawRoomRow, bound: number): MessageSnapshot {
     const title = parseJson<{ title?: unknown }>(room.fields_json, {}).title;
-    const days = Math.max(1, Math.round(this.config.retentionMs / 86_400_000));
     const id = idString(bound);
     return {
       message_id: id, log_id: id, room_id: room.room_id,
       from: { user_id: "~room", ...(typeof title === "string" && title ? { name: title } : {}) },
-      body: { text: `Messages before this have expired. Messages are kept for ${days === 1 ? "a day" : `${days} days`}.` },
+      body: { text: `Messages before this have expired. Messages are kept for ${durationPhrase(this.config.retentionMs / 1_000)}.` },
     };
   }
 

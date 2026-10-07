@@ -2,6 +2,7 @@ import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { expect, it, vi } from 'vitest';
 import { DEFAULT_LIMITS } from '../src/budget';
 import { canonicalizeIp, hashIpKey } from '../src/ip';
+import { durationPhrase } from '../src/store';
 import { connect as open, exchange, greeting, reply, request, until, type ConnectOptions, type Frame, type Peer } from './helpers/socket';
 
 let nextIp = 1;
@@ -848,7 +849,7 @@ it('speaks protocol v8: a sign-in welcome, no email sign-in, and ~private notice
 		expect(server.params).toMatchObject({ apron: 8, agent: 'apron-cloudflare-demo/8', auth: ['webauthn', 'token', 'guest'] });
 		// `server.welcome` is for the sign-in screen (§3.2), worded for this origin.
 		expect(server.params.welcome).toMatch(/Create a passkey/);
-		expect(server.params.welcome).toContain(`kept for ${Math.round(DEFAULT_LIMITS.retentionSeconds / 86_400)} days`);
+		expect(server.params.welcome).toContain(`kept for ${durationPhrase(DEFAULT_LIMITS.retentionSeconds)}.`);
 		expect(welcome.params.from).toEqual({ user_id: '~private', name: 'System message to you' });
 		const other = (await greeting(bot)).server.params;
 		expect(other.auth).toEqual(['token', 'guest']);
