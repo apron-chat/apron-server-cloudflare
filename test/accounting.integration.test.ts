@@ -187,7 +187,9 @@ describe('measured storage accounting', () => {
 			// create expire; the day-0 message survives through its day-2 edit.
 			expect(cleanup.deleted_records).toBe(3);
 			expect(cleanup.deleted_messages).toBe(1);
-			expect(messagesOf(history)).toHaveLength(2);
+			// The retained message and day-2 create, after the `~room` expiry notice.
+			expect(messagesOf(history)).toHaveLength(3);
+			expect(messagesOf(history)[0]).toMatchObject({ message_id: history.history_log_id, from: { user_id: '~room' } });
 			expect(messagesOf(history).some((entry) => entry.message_id === firstMessageId)).toBe(true);
 			expect(messagesOf(history).every((entry) => BigInt(entry.log_id) >= BigInt(history.history_log_id!))).toBe(true);
 			expect(room.history_log_id).toBe(cleanup.history_floor);

@@ -5050,6 +5050,12 @@ export class Store {
       rooms: [], messages: [], reactions: [], memberships: [], first_log_id: latestLogId, last_log_id: latestLogId,
       more: false, latest_log_id: latestLogId, history_log_id: historyLogId,
     }));
+    // A page that reaches the room's start, once retention has discarded it,
+    // opens with a `~room` notice saying earlier messages expired. It is not
+    // a logged record: it takes the room's bound as its ID, and only when no
+    // record holds that ID, and stays out of the limit and the page's bounds.
+    const expiry = lower === lowerBound && floor > room.created_log_id ? this.expiryNotice(room, lowerBound) : undefined;
+    if (expiry) bytes += utf8Bytes(JSON.stringify(expiry)) + 1;
     let stoppedForBytes = false;
     const selected: Array<{ logId: number; kind: string; value: Record<string, unknown> }> = [];
     for (const row of rows.slice(0, limit + 1)) {
@@ -5073,6 +5079,11 @@ export class Store {
     const messages: MessageSnapshot[] = [];
     const reactions: ReactionsRecord[] = [];
     const membership: MembershipRecord[] = [];
+    // A backward page reaches the start only once nothing older is left.
+    if (expiry && (forward || !more) && selected[0].logId > lowerBound &&
+      !this.rawRows("SELECT 1 FROM records WHERE log_id = ? LIMIT 1", lowerBound).length) {
+      messages.push(expiry);
+    }
     for (const record of selected) {
       if (record.kind === "room") rooms.push(record.value as unknown as RoomRecord);
       else if (record.kind === "reactions") reactions.push(record.value as unknown as ReactionsRecord);
@@ -5090,6 +5101,22 @@ export class Store {
       more,
       latest_log_id: latestLogId,
       history_log_id: historyLogId,
+    };
+  }
+
+  /**
+   * The `~room` notice that opens a room's history once its start has
+   * expired, at `log_id` `bound`: the room's `history_log_id`, which clients
+   * keep, and which no retained record of any room holds when it is sent.
+   */
+  private expiryNotice(room: RawRoomRow, bound: number): MessageSnapshot {
+    const title = parseJson<{ title?: unknown }>(room.fields_json, {}).title;
+    const days = Math.max(1, Math.round(this.config.retentionMs / 86_400_000));
+    const id = idString(bound);
+    return {
+      message_id: id, log_id: id, room_id: room.room_id,
+      from: { user_id: "~room", ...(typeof title === "string" && title ? { name: title } : {}) },
+      body: { text: `Messages before this have expired. Messages are kept for ${days === 1 ? "a day" : `${days} days`}.` },
     };
   }
 

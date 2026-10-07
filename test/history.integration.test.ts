@@ -247,9 +247,12 @@ it("continues bounded cleanup while retaining recent edits and moves out of a th
 		expect(BigInt(room.latest_log_id)).toBe(departureLog);
 		const history = store.history({ roomId: "general", after: 0n, limit: 50, now: clock.value });
 		expect(history.history_log_id).toBe(room.history_log_id);
-		expect(messagesOf(history).map((entry) => BigInt(entry.log_id))).toEqual([recentRootLog, departureLog]);
-		expect(messagesOf(history)[0].body?.text).toBe("root-recent");
-		expect(messagesOf(history)[1]).toMatchObject({ room_id: "general", body: { text: "reply-departed" } });
+		// The page reaching the expired start opens with the `~room` expiry notice.
+		const floor = BigInt(room.history_log_id!);
+		expect(messagesOf(history).map((entry) => BigInt(entry.log_id))).toEqual([floor, recentRootLog, departureLog]);
+		expect(messagesOf(history)[0]).toMatchObject({ message_id: room.history_log_id, from: { user_id: "~room", name: "General" } });
+		expect(messagesOf(history)[1].body?.text).toBe("root-recent");
+		expect(messagesOf(history)[2]).toMatchObject({ room_id: "general", body: { text: "reply-departed" } });
 		// General's expired creation record leaves the log, but the room stays
 		// listed from the current-state table with its original log_id.
 		expect(history.rooms).toBeUndefined();
@@ -261,8 +264,75 @@ it("continues bounded cleanup while retaining recent edits and moves out of a th
 		expect(retained.description).toBe("About the root");
 		expect(retained.history_log_id).toBe(room.history_log_id);
 		const threadHistory = store.history({ roomId: threadId, limit: 50, now: clock.value });
-		expect(messagesOf(threadHistory).map((entry) => BigInt(entry.log_id))).toEqual([departureLog]);
+		expect(messagesOf(threadHistory).map((entry) => BigInt(entry.log_id))).toEqual([floor, departureLog]);
+		expect(threadHistory.messages?.[0].from).toEqual({ user_id: "~room", name: "Retained thread" });
 		expect(threadHistory.rooms).toBeUndefined();
+	});
+});
+
+it("opens the page reaching an expired start with a `~room` notice outside the page bounds", async () => {
+	await withStore("expiry-notice", { ...ROOMY, cleanupBatch: 1 }, (store, clock) => {
+		const old = logId(store.mutate(messageInput(clock, "notice-old", { body: { format: "plain", text: "old" } })));
+		clock.value += 1;
+		const threadLog = logId(store.mutate(op(clock, "notice-thread", "room_set", { parent_room_id: "general", title: "Notice thread" })));
+		clock.value += 1;
+		const expiring = logId(store.mutate(messageInput(clock, "notice-expiring", { body: { format: "plain", text: "expiring" } })));
+		const notices = (page: ReturnType<Store["history"]>) => (page.messages ?? []).filter((entry) => entry.from.user_id === "~room");
+
+		// Nothing has expired yet: no notice, even on the oldest page.
+		expect(notices(store.history({ roomId: "general", after: 0n, limit: 50, now: clock.value }))).toEqual([]);
+
+		clock.value += RETENTION_MS - 1_000;
+		const kept = [] as bigint[];
+		for (let index = 0; index < 3; index += 1) {
+			kept.push(logId(store.mutate(messageInput(clock, `notice-kept-${index}`, { body: { format: "plain", text: `kept ${index}` } }))));
+			clock.value += 1;
+		}
+		clock.value += 2_000;
+
+		// One record a batch: the floor passes through the thread's creation ID,
+		// held by a retained record of another room, where no notice may use it.
+		let sawCollision = false;
+		for (let runs = 0; runs < 12; runs += 1) {
+			const result = store.runCleanup(clock.value);
+			const floor = BigInt(result.history_floor);
+			const page = store.history({ roomId: "general", after: 0n, limit: 50, now: clock.value });
+			const general = store.getRoomState();
+			// A record still at the floor, here or in another room, holds its ID.
+			const held = floor === threadLog || page.first_log_id === general.history_log_id;
+			if (floor === threadLog) sawCollision = true;
+			if (held || floor <= BigInt(general.log_id)) expect(notices(page)).toEqual([]);
+			else expect(notices(page).map((entry) => entry.message_id)).toEqual([general.history_log_id]);
+			if (!result.did_work && result.next_due_ms > clock.value) break;
+			clock.value = result.next_due_ms + 1;
+		}
+		expect(sawCollision).toBe(true);
+
+		const general = store.getRoomState();
+		expect(BigInt(general.history_log_id!)).toBe(expiring + 1n);
+		const notice = {
+			message_id: general.history_log_id, log_id: general.history_log_id, room_id: "general",
+			from: { user_id: "~room", name: "General" },
+			body: { text: "Messages before this have expired. Messages are kept for 7 days." },
+		};
+
+		// Forward from the start: the notice comes first, outside limit and bounds.
+		const forward = store.history({ roomId: "general", after: 0n, limit: 2, now: clock.value });
+		expect(forward.messages).toEqual([notice, expect.objectContaining({ log_id: String(kept[0]) }), expect.objectContaining({ log_id: String(kept[1]) })]);
+		expect(forward).toMatchObject({ first_log_id: String(kept[0]), last_log_id: String(kept[1]), more: true });
+		// A forward page starting past the start has none.
+		expect(notices(store.history({ roomId: "general", after: kept[1], limit: 2, now: clock.value }))).toEqual([]);
+
+		// Backward: only the page with nothing older left carries it.
+		const newest = store.history({ roomId: "general", limit: 2, now: clock.value });
+		expect(newest.more).toBe(true);
+		expect(notices(newest)).toEqual([]);
+		const oldest = store.history({ roomId: "general", before: BigInt(newest.first_log_id!) - 1n, limit: 2, now: clock.value });
+		expect(oldest).toMatchObject({ more: false, first_log_id: String(kept[0]), last_log_id: String(kept[0]) });
+		expect(oldest.messages?.[0]).toEqual(notice);
+		// The notice is not a record: a window on its ID is empty.
+		expect(store.history({ roomId: "general", after: BigInt(notice.log_id!), before: BigInt(notice.log_id!), now: clock.value }).messages).toBeUndefined();
+		expect(old).toBeLessThan(threadLog);
 	});
 });
 
