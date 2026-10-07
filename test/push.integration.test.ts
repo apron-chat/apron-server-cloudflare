@@ -983,6 +983,87 @@ describe('push delay', () => {
 	});
 });
 
+describe('held wakes', () => {
+	/** Waits long enough that a push that was going to go has gone. */
+	const settleFor = () => new Promise((resolve) => setTimeout(resolve, 500));
+	/** Reports idle with how long nobody has attended the connection, as a client does. */
+	async function idleFor(peer: Peer, seconds: number | true): Promise<void> {
+		expect((await status(peer, { idle: seconds })).frame.result).toEqual({});
+	}
+
+	it('pushes what an attended user was mentioned in once they go idle, if it came after they were last attended', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId, carolId, daveId] = [unique('alice'), unique('bob'), unique('carol'), unique('dave')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		const carol = await signedIn(carolId);
+		const dave = await signedIn(daveId);
+		try {
+			const bobSub = await subscribe(bob, 'bob');
+			await subscribe(carol, 'carol');
+			await subscribe(dave, 'dave');
+			// All three are attended: nothing goes.
+			const first = await post(alice, 'held', { room_id: 'general', body: { text: 'look', mentions: [bobId, carolId, daveId] } });
+			await settleFor();
+			expect(pushes).toEqual([]);
+			// Bob was last attended a minute ago, before it came: it is pushed now.
+			await idleFor(bob, 60);
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(pushes[0].url).toBe(bobSub.url);
+			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.message_id).toBe(first.result.message_id);
+			// Carol was attended after it came; Dave says only that he is idle: neither is pushed.
+			await idleFor(carol, 0);
+			await idleFor(dave, true);
+			await settleFor();
+			expect(pushes).toHaveLength(1);
+			// Released once: back and idle again pushes nothing more.
+			await setIdle(bob, false);
+			await idleFor(bob, 120);
+			await settleFor();
+			expect(pushes).toHaveLength(1);
+		} finally { alice.close(); bob.close(); carol.close(); dave.close(); }
+	});
+
+	it('holds nothing for a room the user posted in since, and waits for their last attended connection', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId] = [unique('alice'), unique('bob')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		const phone = await signedIn(bobId, true);
+		try {
+			const bobSub = await subscribe(bob, 'bob');
+			const thread = (await request(alice, 'thread', 'room_set', { parent_room_id: 'general', title: 'Held' })).result.room_id;
+			await post(alice, 'general', { room_id: 'general', body: { text: 'here', mentions: [bobId] } });
+			await post(alice, 'in-thread', { room_id: thread, body: { text: 'and here', mentions: [bobId] } });
+			// Bob answers in general: he saw that one.
+			await post(bob, 'answer', { room_id: 'general', body: { text: 'yes' } });
+			// One connection goes idle while the other is attended: nothing yet.
+			await idleFor(bob, 60);
+			await settleFor();
+			expect(pushes).toEqual([]);
+			await idleFor(phone, 60);
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(pushes[0].url).toBe(bobSub.url);
+			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.room_id).toBe(thread);
+			await settleFor();
+			expect(pushes).toHaveLength(1);
+		} finally { alice.close(); bob.close(); phone.close(); }
+	});
+	it('takes idle as whole seconds, and nothing else but a boolean', async () => {
+		const userId = unique('seconds');
+		const peer = await signedIn(userId);
+		try {
+			// Two violations leave the connection open.
+			for (const params of [{ idle: -1 }, { idle: 1.5 }]) {
+				expect((await request(peer, `bad-${JSON.stringify(params)}`, 'status', params)).error.code, JSON.stringify(params)).toBe(-32602);
+			}
+			expect(await idleOf(userId)).toEqual([false]);
+			await idleFor(peer, 0);
+			expect(await idleOf(userId)).toEqual([true]);
+		} finally { peer.close(); }
+	});
+});
+
 describe('security review fixes', () => {
 	const senderCharged = (userId: string) => runInDurableObject(stub(), (_instance, state) =>
 		state.storage.sql.exec<{ posts_day: number }>("SELECT posts_day FROM principal_limits WHERE scope = 'push' AND principal_key = ?", `user:${userId}`).toArray()[0]?.posts_day ?? 0);

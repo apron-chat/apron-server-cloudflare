@@ -4396,6 +4396,18 @@ export class Store {
   }
 
   /**
+   * A message as it is now, for a push held until its user went idle
+   * (protocol §4.9): null when unknown or expired. One metered lookup.
+   */
+  pushedMessage(messageId: string, now = this.clock.now()): MessageSnapshot | null {
+    this.ensureReady();
+    return this.reserved({ reads: 8 }, false, now, () => {
+      const row = this.currentMessage(messageId, this.logState().history_floor);
+      return row ? parseJson<MessageSnapshot>(row.snapshot_json) : null;
+    });
+  }
+
+  /**
    * `status` `mute` without `room_id` (protocol §4.5) for a registered user:
    * until when they are muted, MUTE_FOREVER for `true`, or null to end it.
    * Whether the stored mute changed, and `untilMs`, the end it leaves,

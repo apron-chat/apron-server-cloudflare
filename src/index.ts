@@ -147,6 +147,18 @@ interface ConnectionAttachment {
 	 */
 	idle?: boolean;
 	/**
+	 * Since when nobody has attended this connection, epoch milliseconds:
+	 * when `idle` was set, less the seconds a numeric `idle` said (at most
+	 * HELD_WAKE_SECONDS). Set and cleared with `idle`.
+	 */
+	idleAt?: number;
+	/**
+	 * Wakes its user was passed over for while attended (see holdWake),
+	 * oldest first, at most MAX_HELD_WAKES: pushed when they go idle if they
+	 * came after the user was last attended (releaseHeld).
+	 */
+	held?: HeldWake[];
+	/**
 	 * The user's `status` state (§4.5), read at sign-in and kept equal on
 	 * all their connections, so deriving their status and telling them of a
 	 * mute that ran out need no SQL: the status they chose with `me` (absent
@@ -203,6 +215,21 @@ function statusFrame(roomId: string | null, mute: number | boolean): Record<stri
 
 /** A pending status change of a user without a connection: `[user_id, status last told, status now, when due]`. */
 type OwedStatus = [string, Status, Status, number];
+
+/**
+ * A wake held for an attended user (ConnectionAttachment.held):
+ * `[message_id, room_id, wake reasons, when it came (epoch ms)]`.
+ */
+type HeldWake = [string, string, number, number];
+
+/** Held wakes one connection keeps; the oldest go first. Small, so the attachment stays within its budget. */
+const MAX_HELD_WAKES = 8;
+
+/**
+ * How far back a held wake may be pushed when its user goes idle: twice the
+ * five minutes clients wait without input before they report it.
+ */
+const HELD_WAKE_SECONDS = 10 * 60;
 
 /** A message's wake waiting `pushDelaySeconds` to push: the users still to consider, with their wake reasons. */
 interface PendingWake {
@@ -565,6 +592,8 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			} : {}),
 			...(attachment.listedJoined ? { listedJoined: true } : {}),
 			...(attachment.idle === true ? { idle: true } : {}),
+			...(attachment.idle === true && Number.isSafeInteger(attachment.idleAt) && (attachment.idleAt as number) > 0 ? { idleAt: attachment.idleAt } : {}),
+			...heldState(attachment),
 			...(isStatusChoice(attachment.choice) && attachment.choice !== "online" ? { choice: attachment.choice } : {}),
 			...(Number.isSafeInteger(attachment.muteUntil) && (attachment.muteUntil as number) > 0 ? { muteUntil: attachment.muteUntil } : {}),
 			...(Number.isSafeInteger(attachment.roomMuteNext) && (attachment.roomMuteNext as number) > 0 ? { roomMuteNext: attachment.roomMuteNext } : {}),
@@ -581,6 +610,15 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 	} catch {
 		return null;
 	}
+}
+
+/** The held wakes of a stored attachment, type-checked and bounded. */
+function heldState(attachment: Partial<ConnectionAttachment>): Pick<ConnectionAttachment, "held"> {
+	if (!Array.isArray(attachment.held)) return {};
+	const held = attachment.held.filter((entry): entry is HeldWake => Array.isArray(entry) && entry.length === 4 &&
+		typeof entry[0] === "string" && entry[0].length > 0 && entry[0].length <= 64 && typeof entry[1] === "string" && entry[1].length > 0 && entry[1].length <= 64 &&
+		Number.isSafeInteger(entry[2]) && Number.isSafeInteger(entry[3])).slice(-MAX_HELD_WAKES);
+	return held.length ? { held: held.map((entry) => [...entry] as HeldWake) } : {};
 }
 
 /** The presence fields of a stored attachment (`pres`, `owed`), type-checked and bounded. */
@@ -657,7 +695,7 @@ function writeSessionAttachment(socket: WebSocketConnection, attachment: Connect
 		if (current.idle) attachment.idle = true;
 		else delete attachment.idle;
 		// Kept current by this connection's and other connections' events meanwhile.
-		for (const key of ["choice", "muteUntil", "roomMuteNext", "pres", "owed"] as const) {
+		for (const key of ["idleAt", "held", "choice", "muteUntil", "roomMuteNext", "pres", "owed"] as const) {
 			if (current[key] !== undefined) (attachment as unknown as Record<string, unknown>)[key] = current[key];
 			else delete attachment[key];
 		}
@@ -2455,8 +2493,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (method === "message" && !result.deduplicated && result.message?.prev_log_id === undefined) created = result.message;
 		});
 		if (created) {
-			// Posting in a room shows its poster saw it: their waiting wakes for it go.
+			// Posting in a room shows its poster saw it: their waiting and held wakes for it go.
 			this.dropWakes(identity.user_id, created.room_id);
+			this.dropHeld(identity.user_id, created.room_id);
 			if (identity.tier === "registered") this.wakeFor(created);
 		}
 		// Pending writes that never come are failed by the alarm (§4.8.3).
@@ -2720,8 +2759,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const state = connectionAttachment(socket);
 		if (!state || !identityOf(state)) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
 		const params = request.params;
-		const idle = params.idle;
-		if (idle !== undefined && typeof idle !== "boolean") throw { name: "invalid_params", message: "idle must be a boolean" } satisfies ProtocolError;
+		// `idle` is a boolean, or the whole seconds nobody has attended the connection, which is idle.
+		const idleParam = params.idle;
+		if (idleParam !== undefined && typeof idleParam !== "boolean" && !(Number.isSafeInteger(idleParam) && (idleParam as number) >= 0)) {
+			throw { name: "invalid_params", message: "idle must be a boolean or a whole number of seconds" } satisfies ProtocolError;
+		}
+		const idle = idleParam === undefined ? undefined : idleParam !== false;
+		const idleSeconds = typeof idleParam === "number" ? idleParam : 0;
 		const mute = muteParam(params.mute);
 		if (params.mute !== undefined && mute === undefined) {
 			throw { name: "invalid_params", message: "mute must be true, false, or a positive whole number of seconds" } satisfies ProtocolError;
@@ -2749,7 +2793,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (idleChange) {
 			if (limited) this.idleChanges.take(state.connId, now);
-			this.setIdle(socket, connectionAttachment(socket) ?? state, idle!);
+			this.setIdle(socket, connectionAttachment(socket) ?? state, idle!, now, idleSeconds);
 		}
 		this.reply(socket, request, {});
 	}
@@ -2840,7 +2884,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private prepareStatus(socket: WebSocketConnection, stored?: StatusInputRecord): void {
 		const state = connectionAttachment(socket);
 		if (!state) return;
-		for (const key of ["choice", "muteUntil", "roomMuteNext", "pres"] as const) delete state[key];
+		for (const key of ["choice", "muteUntil", "roomMuteNext", "pres", "held"] as const) delete state[key];
 		if (state.tier === "registered" && stored) applyStatusInputs(state, stored);
 		writeAttachment(socket, state);
 	}
@@ -2925,12 +2969,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * §4.5) and re-derives its user's status. handleStatus calls it only
 	 * for a change.
 	 */
-	private setIdle(socket: WebSocketConnection, state: ConnectionAttachment, idle: boolean): void {
-		if (idle) state.idle = true;
-		else delete state.idle;
+	private setIdle(socket: WebSocketConnection, state: ConnectionAttachment, idle: boolean, now = nowMs(), seconds = 0): void {
+		if (idle) {
+			state.idle = true;
+			state.idleAt = now - Math.min(seconds, HELD_WAKE_SECONDS) * 1_000;
+		} else {
+			delete state.idle;
+			delete state.idleAt;
+		}
 		writeAttachment(socket, state);
 		// Back: a push still waiting for them is not needed.
 		if (!idle && state.userId) this.dropWakes(state.userId);
+		// Gone: what they were passed over for since they were last attended is pushed.
+		if (idle && state.userId) this.releaseHeld(state.userId, now);
 		this.touchPresence(state.userId);
 	}
 
@@ -3611,11 +3662,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const now = nowMs();
 		const sender = message.from.user_id;
 		const reasons = new Map<string, number>();
+		// Attended users are held instead: pushed if they go idle without having been back since (holdWake).
+		const held = new Map<string, number>();
 		const consider = (userId: unknown, reason: number) => {
 			if (typeof userId !== "string" || userId === sender || userId.startsWith("guest_")) return;
-			const known = reasons.get(userId);
-			if (known !== undefined) reasons.set(userId, known | reason);
-			else if (reasons.size < MAX_PUSH_CANDIDATES && !this.attended(userId, now)) reasons.set(userId, reason);
+			for (const map of [reasons, held]) {
+				const known = map.get(userId);
+				if (known !== undefined) return void map.set(userId, known | reason);
+			}
+			if (!this.attended(userId, now)) {
+				if (reasons.size < MAX_PUSH_CANDIDATES) reasons.set(userId, reason);
+			} else if (held.size < MAX_PUSH_CANDIDATES) held.set(userId, reason);
 		};
 		const replyTo = message.reply_to?.message_id;
 		if (replyTo !== undefined) {
@@ -3627,7 +3684,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		const mentions = message.body?.mentions;
 		if (Array.isArray(mentions)) for (const userId of mentions) consider(userId, WAKE_SCOPES.mentions);
-		if (!reasons.size) return;
+		for (const [userId, reason] of held) this.holdWake(userId, message, reason, now);
+		if (reasons.size) this.scheduleWake(message, reasons);
+	}
+
+	/**
+	 * Pushes a message's wake for `reasons` once `pushDelaySeconds` is over
+	 * (see pendingWakes), or at once without a wait.
+	 */
+	private scheduleWake(message: MessageSnapshot, reasons: Map<string, number>): void {
 		const delay = this.config.pushDelaySeconds * 1_000;
 		// Past the bound, a wake goes at once, as it would with no wait.
 		if (delay === 0 || this.pendingWakes.size >= MAX_PENDING_WAKES) {
@@ -3654,6 +3719,75 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!wake.reasons.delete(userId) || wake.reasons.size) continue;
 			clearTimeout(wake.timer);
 			this.pendingWakes.delete(wake);
+		}
+	}
+
+	/**
+	 * Keeps a wake an attended user was passed over for on each of their
+	 * connections (`held`), so that if they go idle without having been back
+	 * since it came, it is pushed then (releaseHeld), as chat apps push what
+	 * arrived after you left. Attachments only, no SQL.
+	 */
+	private holdWake(userId: string, message: MessageSnapshot, reasons: number, now: number): void {
+		for (const peer of this.connectionsOf(userId)) {
+			const state = connectionAttachment(peer);
+			if (!state) continue;
+			const kept = (state.held ?? []).filter(([messageId, , , at]) => messageId !== message.message_id && at > now - HELD_WAKE_SECONDS * 1_000);
+			state.held = [...kept, [message.message_id, message.room_id, reasons, now] as HeldWake].slice(-MAX_HELD_WAKES);
+			try {
+				writeAttachment(peer, state);
+			} catch {
+				// Past the attachment's budget: the connection holds none rather than fail.
+				delete state.held;
+				writeAttachment(peer, state);
+			}
+		}
+	}
+
+	/**
+	 * Forgets a user's held wakes (holdWake): `roomId`'s when they post there,
+	 * which shows they saw it, or all of them.
+	 */
+	private dropHeld(userId: string, roomId?: string): void {
+		for (const peer of this.connectionsOf(userId)) {
+			const state = connectionAttachment(peer);
+			if (!state?.held) continue;
+			const kept = roomId === undefined ? [] : state.held.filter((entry) => entry[1] !== roomId);
+			if (kept.length === state.held.length) continue;
+			if (kept.length) state.held = kept;
+			else delete state.held;
+			writeAttachment(peer, state);
+		}
+	}
+
+	/**
+	 * When a user's last attended connection goes idle, pushes the wakes they
+	 * were held for (holdWake) that came after they were last attended: the
+	 * latest `idleAt` of their connections, which a numeric `idle` dates back
+	 * (§4.5), and no further back than HELD_WAKE_SECONDS. A plain `idle: true`
+	 * dates it to now, so it pushes none of them. Each goes through the usual
+	 * wait and claim (scheduleWake), with the message as it is now; one since
+	 * deleted or expired is not pushed. Their held wakes are then forgotten.
+	 */
+	private releaseHeld(userId: string, now: number): void {
+		const states = this.liveStatesOf(userId);
+		if (!states.some(({ state }) => state.held?.length)) return;
+		if (states.some(({ socket, state }) => this.attendedConnection(socket, state, now))) return;
+		const attendedUntil = Math.max(now - HELD_WAKE_SECONDS * 1_000, ...states.map(({ state }) => state.idleAt ?? state.frameTimes[state.frameTimes.length - 1] ?? 0));
+		const due = new Map<string, number>();
+		for (const { state } of states) {
+			for (const [messageId, , reasons, at] of state.held ?? []) if (at > attendedUntil) due.set(messageId, (due.get(messageId) ?? 0) | reasons);
+		}
+		this.dropHeld(userId);
+		for (const [messageId, reasons] of due) {
+			let message: MessageSnapshot | null;
+			try {
+				message = this.store.pushedMessage(messageId, now);
+			} catch (error) {
+				console.warn(JSON.stringify({ event: "push_held_lookup_failed", reason: errorToProtocol(error).message }));
+				continue;
+			}
+			if (message && !message.deleted) this.scheduleWake(message, new Map([[userId, reasons]]));
 		}
 	}
 
