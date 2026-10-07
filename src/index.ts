@@ -236,6 +236,12 @@ interface PendingWake {
 	message: MessageSnapshot;
 	reasons: Map<string, number>;
 	timer?: ReturnType<typeof setTimeout>;
+	/**
+	 * For held wakes released together as one push (releaseHeld): the older
+	 * messages, newest first, to push instead when `message` wakes no one
+	 * (its room muted, or woken for already).
+	 */
+	others?: string[];
 }
 
 /** Pending status changes one connection may hold; more are delivered at once. */
@@ -3692,21 +3698,36 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * Pushes a message's wake for `reasons` once `pushDelaySeconds` is over
 	 * (see pendingWakes), or at once without a wait.
 	 */
-	private scheduleWake(message: MessageSnapshot, reasons: Map<string, number>): void {
+	private scheduleWake(message: MessageSnapshot, reasons: Map<string, number>, others?: string[]): void {
+		const wake: PendingWake = { message, reasons, ...(others ? { others } : {}) };
 		const delay = this.config.pushDelaySeconds * 1_000;
 		// Past the bound, a wake goes at once, as it would with no wait.
 		if (delay === 0 || this.pendingWakes.size >= MAX_PENDING_WAKES) {
-			this.pushWake(message, reasons);
+			this.sendWake(wake);
 			return;
 		}
-		const wake: PendingWake = { message, reasons };
 		wake.timer = setTimeout(() => {
 			this.pendingWakes.delete(wake);
 			const now = nowMs();
 			for (const userId of [...wake.reasons.keys()]) if (this.attended(userId, now)) wake.reasons.delete(userId);
-			if (wake.reasons.size) this.pushWake(message, wake.reasons);
+			if (wake.reasons.size) this.sendWake(wake);
 		}, delay);
 		this.pendingWakes.add(wake);
+	}
+
+	/**
+	 * Pushes a wake; for held wakes released together, one whose message
+	 * wakes no one (its room muted, or woken for within `coalesceSeconds`)
+	 * falls back to the next newest of `others`.
+	 */
+	private sendWake(wake: PendingWake): void {
+		let message: MessageSnapshot | null = wake.message;
+		const others = [...(wake.others ?? [])];
+		while (message) {
+			if (this.pushWake(message, wake.reasons) || !others.length) return;
+			message = null;
+			while (!message && others.length) message = this.heldMessage(others.shift()!, nowMs());
+		}
 	}
 
 	/**
@@ -3775,27 +3796,46 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (states.some(({ socket, state }) => this.attendedConnection(socket, state, now))) return;
 		const attendedUntil = Math.max(now - HELD_WAKE_SECONDS * 1_000, ...states.map(({ state }) => state.idleAt ?? state.frameTimes[state.frameTimes.length - 1] ?? 0));
 		const due = new Map<string, number>();
+		let reasons = 0;
 		for (const { state } of states) {
-			for (const [messageId, , reasons, at] of state.held ?? []) if (at > attendedUntil) due.set(messageId, (due.get(messageId) ?? 0) | reasons);
+			for (const [messageId, , why, at] of state.held ?? []) {
+				if (at <= attendedUntil) continue;
+				due.set(messageId, Math.max(due.get(messageId) ?? 0, at));
+				reasons |= why;
+			}
 		}
 		this.dropHeld(userId);
-		for (const [messageId, reasons] of due) {
-			let message: MessageSnapshot | null;
-			try {
-				message = this.store.pushedMessage(messageId, now);
-			} catch (error) {
-				console.warn(JSON.stringify({ event: "push_held_lookup_failed", reason: errorToProtocol(error).message }));
-				continue;
-			}
-			if (message && !message.deleted) this.scheduleWake(message, new Map([[userId, reasons]]));
+		// One push for them all, as each push costs: the newest; the rest stand by in case it wakes no one.
+		// At most MAX_HELD_WAKES of them, so the lookups and claims a release may try stay bounded.
+		const ids = [...due].sort((a, b) => b[1] - a[1]).slice(0, MAX_HELD_WAKES).map(([messageId]) => messageId);
+		while (ids.length) {
+			const message = this.heldMessage(ids.shift()!, now);
+			if (!message) continue;
+			this.scheduleWake(message, new Map([[userId, reasons]]), ids);
+			return;
 		}
 	}
 
-	/** Claims and sends one message's wake for `reasons` (see wakeFor). */
-	private pushWake(message: MessageSnapshot, reasons: ReadonlyMap<string, number>): void {
+	/** A held wake's message as it is now (one metered lookup), or null when gone, deleted, or unreadable. */
+	private heldMessage(messageId: string, now: number): MessageSnapshot | null {
+		try {
+			const message = this.store.pushedMessage(messageId, now);
+			return message && !message.deleted ? message : null;
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "push_held_lookup_failed", reason: errorToProtocol(error).message }));
+			return null;
+		}
+	}
+
+	/**
+	 * Claims and sends one message's wake for `reasons` (see wakeFor).
+	 * Whether that settled it: something was claimed, or an allowance is
+	 * spent, so another message would not do.
+	 */
+	private pushWake(message: MessageSnapshot, reasons: ReadonlyMap<string, number>): boolean {
 		const vapid = this.config.push;
 		const policy = PUSH_POLICY;
-		if (!vapid || !policy) return;
+		if (!vapid || !policy) return true;
 		const now = nowMs();
 		const sender = message.from.user_id;
 		const candidates: PushCandidate[] = [...reasons].map(([userId, reason]) => ({ userId, reasons: reason }));
@@ -3807,10 +3847,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			claimed = this.store.claimPushes({ senderId: sender, roomId: message.room_id, candidates, allowed: (url) => pushEndpointError(url, hosts) === null, now });
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "push_claim_failed", reason: errorToProtocol(error).message }));
-			return;
+			return true;
 		}
 		if (claimed.skipped) console.warn(JSON.stringify({ event: "push_allowance_reached", skipped: claimed.skipped }));
 		if (claimed.subscriptions.length) this.ctx.waitUntil(this.deliverPushes(claimed.subscriptions, message, vapid, policy.ttlSeconds, sender));
+		return claimed.subscriptions.length > 0 || claimed.skipped > 0;
 	}
 
 	/**

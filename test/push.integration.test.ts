@@ -1049,6 +1049,32 @@ describe('held wakes', () => {
 			expect(pushes).toHaveLength(1);
 		} finally { alice.close(); bob.close(); phone.close(); }
 	});
+	it('sends one push for all a user missed: the newest that wakes them', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId] = [unique('alice'), unique('bob')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		try {
+			const bobSub = await subscribe(bob, 'bob');
+			const threads = [];
+			for (const title of ['One', 'Two', 'Three']) threads.push((await request(alice, `thread-${title}`, 'room_set', { parent_room_id: 'general', title })).result.room_id);
+			await post(alice, 'first', { room_id: threads[0], body: { text: 'first', mentions: [bobId] } });
+			await post(alice, 'second', { room_id: threads[1], body: { text: 'second', mentions: [bobId] } });
+			const third = await post(alice, 'third', { room_id: threads[2], body: { text: 'third', mentions: [bobId] } });
+			// The newest is deleted: the next newest stands for them.
+			await post(alice, 'delete', { message_id: third.result.message_id, deleted: true });
+			// Bob muted the second's room: the one before stands in for it.
+			expect((await status(bob, { room_id: threads[1], mute: true })).frame.result).toEqual({});
+			await idleFor(bob, 60);
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			const payload = JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext);
+			expect(payload.message.body.text).toBe('first');
+			expect(payload).not.toHaveProperty('ext');
+			await settleFor();
+			expect(pushes).toHaveLength(1);
+		} finally { alice.close(); bob.close(); }
+	});
+
 	it('takes idle as whole seconds, and nothing else but a boolean', async () => {
 		const userId = unique('seconds');
 		const peer = await signedIn(userId);
