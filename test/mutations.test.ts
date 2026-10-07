@@ -540,3 +540,62 @@ it("answers count limits with denied and size limits with too_large (§1.1)", as
 		expect(errorCode(() => store.mutate(op(clock, "alice", "room", "room_set", { parent_room_id: "general", title: "T", ext: { big: "y".repeat(2_100) } })))).toBe("too_large");
 	});
 });
+
+it("lets an admin or a mod move someone else's message into a thread and back, but not change it", async () => {
+	await withStore("mover-roles", (store, clock) => {
+		const invite = (userId: string) => store.createInvitedIdentity({ userId, name: userId, now: clock.value, ipKey: "ip-test" });
+		for (const userId of ["mia", "ada", "rob"]) invite(userId);
+		store.setRole({ userId: "mia", role: "mod", on: true, now: clock.value });
+		store.setRole({ userId: "ada", role: "admin", on: true, now: clock.value });
+		store.setRole({ userId: "rob", role: "helper", on: true, now: clock.value });
+		const first = post(store, clock, "alice", "first", { body: { text: "start" }, ext: { irc: { nick: "ada_" } } });
+		const firstId = String(first.result.message_id);
+		const reply = post(store, clock, "alice", "reply", { body: { text: "more", format: "markdown" }, reply_to: { message_id: firstId } });
+		const replyId = String(reply.result.message_id);
+		const threadId = thread(store, clock, "thread");
+		// A save as the client sends it: the stored client fields, with a new room_id.
+		const resubmit = (message: StoreMutationResult["message"], roomId: string) => ({
+			message_id: message!.message_id, room_id: roomId,
+			...(message!.deleted ? { deleted: true } : { body: message!.body }),
+			...(message!.reply_to ? { reply_to: message!.reply_to } : {}),
+		});
+
+		// Another role, or none, is not enough.
+		expect(errorCode(() => store.mutate(op(clock, "rob", "rob-move", "message", resubmit(first.message, threadId))))).toBe("denied");
+		expect(errorCode(() => store.mutate(op(clock, "bob", "bob-move", "message", resubmit(first.message, threadId))))).toBe("denied");
+
+		// A mod moves it into the thread; it stays the author's, content and all.
+		const moved = store.mutate(op(clock, "mia", "mia-move", "message", resubmit(first.message, threadId)));
+		expect(moved.message).toMatchObject({
+			message_id: firstId, room_id: threadId, prev_room_id: "general",
+			from: { user_id: "alice", name: "Alice" }, body: first.message!.body, ext: { irc: { nick: "ada_" } },
+		});
+		expect(moved.broadcasts[0].rooms).toEqual(["general", threadId]);
+		const movedReply = store.mutate(op(clock, "mia", "mia-move-reply", "message", resubmit(reply.message, threadId)));
+		expect(movedReply.message).toMatchObject({ room_id: threadId, reply_to: { message_id: firstId }, body: reply.message!.body });
+
+		// Out of the thread, back to the room it came from.
+		const back = store.mutate(op(clock, "mia", "mia-unthread", "message", resubmit(moved.message, "general")));
+		expect(back.message).toMatchObject({ room_id: "general", prev_room_id: threadId, from: { user_id: "alice" } });
+		expect(messagesOf(store.historyPage({ roomId: threadId, after: "0", limit: 50, now: clock.value })).map((entry) => entry.room_id))
+			.toEqual([threadId, threadId, "general"]);
+
+		// A mover may only move: not edit in place, not edit while moving, not touch ext or reply_to, not delete.
+		const current = back.message!;
+		expect(errorCode(() => store.mutate(op(clock, "mia", "edit-in-place", "message", { ...resubmit(current, "general"), body: { text: "mod edit" } })))).toBe("denied");
+		expect(errorCode(() => store.mutate(op(clock, "mia", "edit-while-moving", "message", { ...resubmit(current, threadId), body: { text: "mod edit" } })))).toBe("denied");
+		expect(errorCode(() => store.mutate(op(clock, "mia", "ext-while-moving", "message", { ...resubmit(current, threadId), ext: { mod: true } })))).toBe("denied");
+		expect(errorCode(() => store.mutate(op(clock, "mia", "reply-while-moving", "message", { ...resubmit(current, threadId), reply_to: { message_id: replyId } })))).toBe("denied");
+		expect(errorCode(() => store.mutate(op(clock, "mia", "delete-while-moving", "message", { ...resubmit(current, threadId), deleted: true })))).toBe("denied");
+		expect(store.historyPage({ roomId: "general", after: back.message!.log_id, limit: 50, now: clock.value }).messages?.at(-1)?.log_id).toBe(back.message!.log_id);
+
+		// An admin moves a tombstone, and the author can still edit what was moved for them.
+		const deleted = post(store, clock, "alice", "delete-reply", { message_id: replyId, room_id: threadId, deleted: true });
+		expect(store.mutate(op(clock, "ada", "ada-move", "message", resubmit(deleted.message, "general"))).message).toMatchObject({ room_id: "general", deleted: true });
+		expect(post(store, clock, "alice", "author-edit", { message_id: firstId, body: { text: "still mine" } }).message?.body?.text).toBe("still mine");
+
+		// A role taken away takes the permission with it.
+		store.setRole({ userId: "mia", role: "mod", on: false, now: clock.value });
+		expect(errorCode(() => store.mutate(op(clock, "mia", "mia-after", "message", resubmit(back.message, threadId))))).toBe("denied");
+	});
+});

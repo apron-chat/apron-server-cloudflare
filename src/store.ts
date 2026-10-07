@@ -703,6 +703,12 @@ const META_GUEST_NUMBER_MARK = "guest_number_mark";
  * writes, and so the identities that can survive a wipe.
  */
 export const MAX_CARRIED_PASSKEYS = 100;
+/**
+ * Roles whose registered holders may move other users' messages (§4.4): a
+ * `message` save of someone else's message that changes only its `room_id`,
+ * such as into a thread or back out to its parent room.
+ */
+export const MOVER_ROLES: readonly string[] = ["admin", "mod"];
 /** Most roles one user holds, so the column stays small. */
 export const MAX_ROLES_PER_USER = 8;
 /**
@@ -1034,6 +1040,11 @@ function canonicalize(value: unknown): string {
   throw new StoreError("invalid_params", "unsupported value in request");
 }
 
+
+/** A snapshot's content, which only its author changes: what a save keeps besides `room_id` and the server's links. */
+function messageContent(snapshot: MessageSnapshot): Record<string, unknown> {
+  return { body: snapshot.body, reply_to: snapshot.reply_to, deleted: snapshot.deleted === true, ext: snapshot.ext };
+}
 
 function digestOperation(method: string, params: unknown): string {
   return createHash("sha256").update(canonicalize({ method, params }), "utf8").digest("hex");
@@ -3389,6 +3400,12 @@ export class Store {
     return rows[0];
   }
 
+  /** Whether a registered user holds a role that may move other users' messages (MOVER_ROLES). */
+  private mayMoveOthers(userId: string): boolean {
+    const identity = this.identityRow(userId);
+    return identity?.tier === "registered" && parseRoles(identity.roles_json).some((role) => MOVER_ROLES.includes(role));
+  }
+
   private identityForMessage(input: StoreMutationInput): Identity {
     const name = typeof input.identity.name === "string" ? input.identity.name : undefined;
     return { user_id: input.identity.user_id, ...(name ? { name } : {}) };
@@ -3731,7 +3748,9 @@ export class Store {
     if (messageIdParam !== undefined && typeof messageIdParam !== "string") throw new StoreError("invalid_params", "message_id must be a string");
     const current = messageIdParam === undefined ? null : this.currentMessage(ensureText(messageIdParam, "message_id", 256), floor);
     if (messageIdParam !== undefined && !current) throw new StoreError("invalid_params", "unknown or expired message");
-    if (current && current.author_id !== input.userId) throw new StoreError("denied", "Only the original author may edit this message");
+    // Someone else's message may only be moved, and only by a mover (MOVER_ROLES).
+    const moving = current !== null && current.author_id !== input.userId;
+    if (moving && (current.room_id === roomId || !this.mayMoveOthers(input.userId))) throw new StoreError("denied", "Only the original author may edit this message");
     if (!this.roomRow(roomId)) throw new StoreError("invalid_params", "unknown room");
     const deleted = params.deleted === undefined ? false : params.deleted;
     if (typeof deleted !== "boolean") throw new StoreError("invalid_params", "deleted must be boolean");
@@ -3771,6 +3790,11 @@ export class Store {
     if (replyId !== undefined) snapshot.reply_to = { message_id: replyId };
     if (deleted) snapshot.deleted = true;
     if (ext) snapshot.ext = ext;
+    // A mover's save keeps the author's content as it was: the client fields
+    // the client resubmits, and an `ext` it merges into nothing new.
+    if (moving && canonicalize(messageContent(snapshot)) !== canonicalize(messageContent(previous!))) {
+      throw new StoreError("denied", "An admin or mod may move someone else's message but not change it");
+    }
     // The size policy bounds client content, the merged ext included; the server's prev_log_id and
     // prev_room_id links are added after it.
     if (utf8Bytes(JSON.stringify(snapshot)) > this.config.maxSnapshotBytes) throw new StoreError("too_large", "message snapshot is too large");
