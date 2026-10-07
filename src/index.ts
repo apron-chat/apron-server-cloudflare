@@ -330,7 +330,7 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
 	{ name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", audience: "admins" },
 	{ name: "invite", usage: "/invite <uses>", help: `get a token that signs up to <uses> new users (at most ${MAX_JOIN_USES}) for a week, replacing the last one; /invite 0 revokes it`, audience: "admins" },
-	{ name: "toggle", usage: "/toggle <activity|uploads|presence>", help: "turn typing activity, uploads, or user status (presence) off or on for everyone", audience: "admins" },
+	{ name: "toggle", usage: "/toggle <activity|uploads|presence|addmember>", help: "turn typing activity, uploads, user status (presence), or users adding others to rooms (addmember) off or on for everyone", audience: "admins" },
 	{ name: "purge", usage: "/purge <user_id>", help: "disconnect a user and delete their account, bot, and everything they posted or uploaded", audience: "admins" },
 	{ name: "status", usage: "/status", help: "show today's Cloudflare usage and the demo's budgets", audience: "admins" },
 ];
@@ -343,7 +343,7 @@ const GUEST_READ_ONLY = "Guests can only read here; sign in with a passkey to po
  */
 const BOT_ID_PREFIX = "bot_";
 /** Features an admin can turn off and on with `/toggle`. */
-type ToggleFeature = "activity" | "uploads" | "presence";
+type ToggleFeature = "activity" | "uploads" | "presence" | "addmember";
 /**
  * The registered user `APRON_ADMIN_TOKEN` signs in as (ADMIN_USER_ID, `admin`)
  * is always an admin. Registered users are `<name>_<digits>` or `u_…`, so no
@@ -1467,7 +1467,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// react, join and leave rooms, and create threads; `false` here
 				// unless GUEST_POSTING is on. `read_cursors`: an `activity`
 				// `read_message_id` is kept or relayed; always `false` here.
-				ext: { settings: { guest_posting: this.config.guestPosting, read_cursors: false } },
+				// `add_members`: registered users may add others to rooms with
+				// `room_join` and a `user_id`; `/toggle addmember` turns it off.
+				ext: { settings: { guest_posting: this.config.guestPosting, read_cursors: false, add_members: this.addMemberOn() } },
 			},
 		};
 	}
@@ -2624,16 +2626,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * Whether this connection's user may add `userId` to a room or remove
 	 * them from one (§4.3.2): an admin may for anyone, and a registered user
 	 * for their own bot, say to have it keep a thread's `description` current.
+	 * While `addmember` is on (the default), any registered user may also add
+	 * anyone; removing someone else stays with admins and bot owners.
 	 */
-	private assertMayManage(attachment: ConnectionAttachment, userId: string): void {
+	private assertMayManage(attachment: ConnectionAttachment, userId: string, adding = false): void {
 		const owner = attachment.tier === "registered" && !hasRole(attachment, "bot");
 		if (owner && (userId === BOT_ID_PREFIX + attachment.userId || hasRole(attachment, "admin"))) return;
-		throw { name: "denied", message: "Only an admin, or a bot's owner, can add or remove someone else" } satisfies ProtocolError;
+		if (owner && adding && this.addMemberOn()) return;
+		throw { name: "denied", message: adding ? "Only an admin, or a bot's owner, can add someone else here" : "Only an admin, or a bot's owner, can remove someone else" } satisfies ProtocolError;
 	}
 
 	/**
-	 * `room_join` with another user's `user_id` (§4.3.2): an admin, or the
-	 * owner of the bot named, adds a registered user to the room as if they
+	 * `room_join` with another user's `user_id` (§4.3.2): an admin, the owner
+	 * of the bot named, or while `addmember` is on any registered user (not a
+	 * bot), adds a registered user to the room as if they
 	 * had joined it. The join is stored and logged, charged to the adder's
 	 * posting limits, and its membership goes to the room's members; the
 	 * added user's connections then get `room_update` `joined`. Guests' rooms
@@ -2641,7 +2647,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * in the room changes nothing.
 	 */
 	private async addMember(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, room: RoomRecord, userId: string): Promise<void> {
-		this.assertMayManage(attachment, userId);
+		this.assertMayManage(attachment, userId, true);
 		if (!this.store.identityExists(userId)) throw { name: "invalid_params", message: `${userId} is not a registered user`.slice(0, 200) } satisfies ProtocolError;
 		const totals = new Map<string, number>();
 		const before = this.membersOf([room.room_id], totals);
@@ -4116,11 +4122,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return this.toggled("activity") ?? this.config.activityEnabled;
 	}
 
+	/** Registered users adding others to rooms (`room_join` with a `user_id`): on unless an admin turned it off. */
+	private addMemberOn(): boolean {
+		return this.toggled("addmember") ?? true;
+	}
+
 	/**
-	 * `/toggle <feature>`: turns `activity` (typing) or, where configured,
-	 * `uploads` or `presence` (user status, which needs push) off or on for
-	 * everyone, and tells the sender which with a `~private` notice before
-	 * the result (§1). Kept across restarts; toggling back to the
+	 * `/toggle <feature>`: turns `activity` (typing), `addmember` (registered
+	 * users adding others to rooms) or, where configured, `uploads` or
+	 * `presence` (user status, which needs push) off or on for everyone, and
+	 * tells the sender which with a `~private` notice before the result (§1). Kept across restarts; toggling back to the
 	 * deployment's default forgets the override. New connections are offered
 	 * the cap only while it is on. With activity off, typing is no longer
 	 * relayed; with uploads off, new upload embeds and `/avatar` are
@@ -4134,11 +4145,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * (sendShownStatus).
 	 */
 	private toggle(socket: WebSocketConnection, request: RequestFrame, roomId: string, feature: string): void {
-		const features: ToggleFeature[] = ["activity", ...(this.config.uploads ? ["uploads" as const] : []), ...(this.config.push ? ["presence" as const] : [])];
+		const features: ToggleFeature[] = ["activity", ...(this.config.uploads ? ["uploads" as const] : []), ...(this.config.push ? ["presence" as const] : []), "addmember"];
 		const chosen = features.find((candidate) => candidate === feature);
 		if (!chosen) throw { name: "invalid_params", message: `Usage: /toggle ${features.join("|")}` } satisfies ProtocolError;
-		const on = !(chosen === "uploads" ? this.uploadsOn() : chosen === "presence" ? this.presenceMode() : this.activityOn());
-		const fallback = chosen === "uploads" ? true : chosen === "presence" ? this.config.presence : this.config.activityEnabled;
+		const on = !(chosen === "uploads" ? this.uploadsOn() : chosen === "presence" ? this.presenceMode() : chosen === "addmember" ? this.addMemberOn() : this.activityOn());
+		const fallback = chosen === "uploads" || chosen === "addmember" ? true : chosen === "presence" ? this.config.presence : this.config.activityEnabled;
 		const override = on === fallback ? undefined : on;
 		this.store.setToggle(chosen, override, nowMs());
 		this.toggles.set(chosen, override);
@@ -4162,6 +4173,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			activity: [
 				"Activity is now **on**: typing is relayed, and new connections are offered it.",
 				"Activity is now **off**: typing is no longer relayed, and new connections are not offered it.",
+			],
+			addmember: [
+				"Adding members is now **on**: any registered user can add another to a room.",
+				"Adding members is now **off**: only admins can add others to a room, and owners their bots.",
 			],
 			uploads: [
 				"Uploads are now **on**.",

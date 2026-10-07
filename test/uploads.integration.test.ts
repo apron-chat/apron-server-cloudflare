@@ -497,7 +497,7 @@ describe('uploads end to end', () => {
 			expect((await fresh.next()).params.capabilities).toContain('embed:upload');
 			fresh.close();
 			expect((await request(user, 'nope', 'command', { body: { text: '/toggle uploads' } })).error.code).toBe(-32001);
-			expect((await request(admin, 'bad', 'command', { room_id: 'general', body: { text: '/toggle typing' } })).error.message).toBe('Usage: /toggle activity|uploads|presence');
+			expect((await request(admin, 'bad', 'command', { room_id: 'general', body: { text: '/toggle typing' } })).error.message).toBe('Usage: /toggle activity|uploads|presence|addmember');
 		} finally { user.close(); admin.close(); }
 	});
 
