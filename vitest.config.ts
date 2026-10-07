@@ -22,6 +22,8 @@ export default defineConfig({
 					VAPID_PRIVATE_KEY: "64gdTp6zfZqSbwXmh7xaMx-kTVi4S34yCZxCZ2QT954",
 					VAPID_SUBJECT: "mailto:push-test@example.com",
 					PUSH_HOSTS: "push.example.net",
+					// Wakes push at once; the suites that cover the wait set one.
+					PUSH_DELAY_SECONDS: "0",
 				},
 			},
 		}),

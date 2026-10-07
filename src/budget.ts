@@ -274,6 +274,13 @@ export interface PushPolicy {
 	 * them again only once this long has passed.
 	 */
 	coalesceSeconds: number;
+	/**
+	 * How long a message's wake waits before it pushes (§4.9's suggested
+	 * convention), so a user who comes back meanwhile (`idle: false`) or
+	 * posts in the room is not pushed. The wait is in memory and keeps the
+	 * object awake, so it is at most MAX_STATUS_DELAY_SECONDS.
+	 */
+	delaySeconds: number;
 	/** Subscriptions one user may hold; another replaces the least recently registered. */
 	subscriptionsPerUser: number;
 	/** A subscription not registered again for this long is skipped, then deleted by cleanup. */
@@ -369,6 +376,10 @@ export const MAX_PUSHES_PER_MESSAGE = 64;
 // Mentioned users one message's wake looks up subscriptions for, each one
 // bounded index read, before it stops looking for users to wake.
 export const MAX_PUSH_CANDIDATES = 32;
+// Messages whose wakes may wait `push.delaySeconds` at once, each holding
+// its snapshot in memory; past it a wake pushes without waiting. Posts are
+// limited server-wide well below this in any `delaySeconds`.
+export const MAX_PENDING_WAKES = 256;
 export const MAX_SQL_WRITES = DEFAULT_LIMITS.sqlWritesPerDay;
 export const MAX_SQL_READS = DEFAULT_LIMITS.sqlReadsPerDay;
 export const MAX_DATABASE_HIGH_WATER_BYTES = DEFAULT_LIMITS.databaseHighWaterBytes;

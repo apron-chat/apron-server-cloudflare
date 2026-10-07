@@ -903,6 +903,86 @@ describe('push review fixes', () => {
 
 });
 
+describe('push delay', () => {
+	/** Sets how long a wake waits before it pushes (`pushDelaySeconds`), as `PUSH_DELAY_SECONDS` would. */
+	const setDelay = (seconds: number) => runInDurableObject(stub(), (instance) => {
+		const runtime = instance as unknown as { config: { pushDelaySeconds: number } };
+		runtime.config = { ...runtime.config, pushDelaySeconds: seconds };
+	});
+	/** Waits out a one-second delay, with room to spare, so a push that was due has been sent. */
+	const waitOut = () => new Promise((resolve) => setTimeout(resolve, 2_000));
+
+	it('pushes after the wait to users still unattended, and not to those who came back or posted in the room', async () => {
+		const pushes = capturePushes();
+		const [aliceId, stayId, backId, postId, otherId, joinId] = [unique('alice'), unique('stay'), unique('back'), unique('post'), unique('other'), unique('join')];
+		const alice = await signedIn(aliceId);
+		const stay = await signedIn(stayId);
+		const back = await signedIn(backId);
+		const poster = await signedIn(postId);
+		const other = await signedIn(otherId);
+		const joiner = await signedIn(joinId);
+		let again: Peer | undefined;
+		try {
+			const staySub = await subscribe(stay, 'stay');
+			await subscribe(back, 'back');
+			await subscribe(poster, 'post');
+			const otherSub = await subscribe(other, 'other');
+			await subscribe(joiner, 'join');
+			for (const peer of [stay, back, poster, other, joiner]) await setIdle(peer, true);
+			await setDelay(1);
+			const thread = (await request(alice, 'thread', 'room_set', { parent_room_id: 'general', title: 'Delay' })).result.room_id;
+			await post(alice, 'mention', { room_id: 'general', body: { text: 'around?', mentions: [stayId, backId, postId, joinId] } });
+			await post(alice, 'elsewhere', { room_id: thread, body: { text: 'and you?', mentions: [otherId, postId] } });
+			// Nothing goes before the wait is over.
+			expect(pushes).toEqual([]);
+			// One comes back, one posts in general, and one signs in again, attended.
+			await setIdle(back, false);
+			await post(poster, 'reply', { room_id: 'general', body: { text: 'here' } });
+			again = await signedIn(joinId, true);
+			await waitOut();
+			// Only general's wake is dropped for the poster: their mention in the thread still pushes.
+			await vi.waitFor(() => expect(pushes).toHaveLength(3), { timeout: 5_000 });
+			const urls = pushes.map((push) => push.url);
+			expect(urls).toContain(staySub.url);
+			expect(urls).toContain(otherSub.url);
+			expect(urls.filter((url) => url.includes('/post-'))).toHaveLength(1);
+			// Nothing more comes.
+			await waitOut();
+			expect(pushes).toHaveLength(3);
+		} finally {
+			await setDelay(0);
+			alice.close(); stay.close(); back.close(); poster.close(); other.close(); joiner.close(); again?.close();
+		}
+	});
+
+	it('spends no wake slot or coalescing on a wake dropped while it waited', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId] = [unique('alice'), unique('bob')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		try {
+			const bobSub = await subscribe(bob, 'bob');
+			await setIdle(bob, true);
+			await setDelay(1);
+			await post(alice, 'first', { room_id: 'general', body: { text: 'one', mentions: [bobId] } });
+			// Back, then away again before the wait is over: he was there, so the wake is gone.
+			await setIdle(bob, false);
+			await setIdle(bob, true);
+			await waitOut();
+			expect(pushes).toEqual([]);
+			// The next mention in the same room is pushed, not coalesced away.
+			await post(alice, 'second', { room_id: 'general', body: { text: 'two', mentions: [bobId] } });
+			await waitOut();
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(pushes[0].url).toBe(bobSub.url);
+			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.body.text).toBe('two');
+		} finally {
+			await setDelay(0);
+			alice.close(); bob.close();
+		}
+	});
+});
+
 describe('security review fixes', () => {
 	const senderCharged = (userId: string) => runInDurableObject(stub(), (_instance, state) =>
 		state.storage.sql.exec<{ posts_day: number }>("SELECT posts_day FROM principal_limits WHERE scope = 'push' AND principal_key = ?", `user:${userId}`).toArray()[0]?.posts_day ?? 0);

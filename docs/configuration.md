@@ -267,6 +267,7 @@ with the client's optional registration `push_id` in each push; see
 | `pushesPerSenderDay` (pushes one sender's messages may get delivered, 2xx only) | 200 | 50 |
 | `pushesPerRecipientDay` (pushes one user may receive) | 100 | 100 |
 | `coalesceSeconds` (a user is woken for a room at most once in this window) | 60 | 60 |
+| `delaySeconds` (how long a message's wake waits before it pushes; a user who sends `idle: false` or posts in the room meanwhile, or is attended when it ends, is not pushed) | 30 | 30 |
 | `subscriptionsPerUser` | 5 | 5 |
 | `pushExpiryDays` (a registration not renewed this long is skipped, then deleted) | 7 | 7 |
 | `registersPerUserMinute` (`push_register` requests per user, across reconnects) | 10 | 10 |
@@ -278,7 +279,8 @@ send, is at most 64; `wakesPerMessage` is at most 32, the mentioned users one
 message looks up; `pushesPerSenderDay` and `pushesPerRecipientDay` fit
 `pushesPerDay`; `registersPerUserMinute` and `mutesPerUserMinute` are at
 most 60, the per-type throttle bound;
-`coalesceSeconds` is at most a day; `pushExpiryDays` is 2 to 90; and
+`coalesceSeconds` is at most a day; `delaySeconds` is at most 60, since its
+wait keeps the object awake; `pushExpiryDays` is 2 to 90; and
 `ttlSeconds` is at most four weeks. The configuration check fails otherwise.
 
 **Allowed push services.** `PUSH_HOSTS` lists the hosts a registration's
@@ -448,6 +450,7 @@ and recalibrating its resource model.
 | `VAPID_PRIVATE_KEY` | Secret: the matching 32-byte private key, unpadded base64url; set with `npx wrangler secret put VAPID_PRIVATE_KEY --config wrangler.production.toml` |
 | `VAPID_SUBJECT` | `mailto:` address or `https:` URL sent to push services in each VAPID token as the operator's contact |
 | `PUSH_HOSTS` | Comma-separated push service hosts registrations may name, `*.host` for a host's subdomains, or a standalone `*` for any public host; unset, the browsers' own services (see [Push](#push)) |
+| `PUSH_DELAY_SECONDS` | Whole seconds, 0 to 60, a message's wake waits before it pushes; unset, the plan's `push.delaySeconds`; `0` pushes at once |
 | `ADMISSION_OFF` | Operator admission switch; `true` rejects new sockets in the entry Worker before the limiter or DO call; existing sockets remain subject to DO budgets |
 | `ENVIRONMENT` | Set to `development` to enable local origin defaults when `ALLOWED_ORIGINS` and `RP_ORIGINS` are omitted |
 | `NODE_ENV` | Set to `test` to enable the same local origin defaults for tests; production-like deployments must configure origins explicitly |

@@ -154,6 +154,16 @@ describe('push configuration', () => {
 		expect(pushHostAllowed('*', 'anything.example')).toBe(true);
 	});
 
+	it('waits the plan\'s push.delaySeconds before a wake pushes, or PUSH_DELAY_SECONDS from 0 to 60', () => {
+		expect(loadConfig(base).pushDelaySeconds).toBe(PUSH_POLICY!.delaySeconds);
+		expect(loadConfig({ ...base, PUSH_DELAY_SECONDS: '' }).pushDelaySeconds).toBe(PUSH_POLICY!.delaySeconds);
+		expect(loadConfig({ ...base, PUSH_DELAY_SECONDS: '0' }).pushDelaySeconds).toBe(0);
+		expect(loadConfig({ ...base, PUSH_DELAY_SECONDS: ' 60 ' }).pushDelaySeconds).toBe(60);
+		for (const bad of ['61', '-1', '1.5', 'soon', '1e1']) {
+			expect(() => loadConfig({ ...base, PUSH_DELAY_SECONDS: bad }), bad).toThrow(ConfigError);
+		}
+	});
+
 	it('keeps both plans within the calibrated push bounds', () => {
 		expect(PUSH_POLICY).toBeDefined();
 		for (const plan of [FREE_PLAN, PAID_PLAN]) expect(() => validatePushPolicy(plan.push!)).not.toThrow();
@@ -165,6 +175,7 @@ describe('push configuration', () => {
 		expect(() => validatePushPolicy({ ...PUSH_POLICY!, pushesPerRecipientDay: PUSH_POLICY!.pushesPerDay + 1 })).toThrow(ConfigError);
 		expect(() => validatePushPolicy({ ...PUSH_POLICY!, mutesPerUserMinute: 61 })).toThrow(ConfigError);
 		expect(() => validatePushPolicy({ ...PUSH_POLICY!, coalesceSeconds: 86_401 })).toThrow(ConfigError);
+		expect(() => validatePushPolicy({ ...PUSH_POLICY!, delaySeconds: 61 })).toThrow(ConfigError);
 		expect(() => validatePushPolicy({ ...PUSH_POLICY!, pushExpiryDays: 1 })).toThrow(ConfigError);
 	});
 });

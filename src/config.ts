@@ -42,6 +42,11 @@ export interface RuntimeConfig {
 	 * `*.host` for its subdomains; `"*"` allows any public host.
 	 */
 	pushHosts: readonly string[] | "*";
+	/**
+	 * How long a message's wake waits before it pushes, in seconds: the
+	 * plan's `push.delaySeconds`, or `PUSH_DELAY_SECONDS` (0 pushes at once).
+	 */
+	pushDelaySeconds: number;
 }
 
 /** The browsers' own push services, allowed when `PUSH_HOSTS` is unset. */
@@ -103,6 +108,7 @@ type EnvLike = {
 	VAPID_PRIVATE_KEY?: string;
 	VAPID_SUBJECT?: string;
 	PUSH_HOSTS?: string;
+	PUSH_DELAY_SECONDS?: string;
 	ENVIRONMENT?: string;
 	NODE_ENV?: string;
 };
@@ -311,6 +317,7 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 	if (PUSH_POLICY) validatePushPolicy(PUSH_POLICY);
 	const push = loadPush(env);
 	const pushHosts = loadPushHosts(env.PUSH_HOSTS);
+	const pushDelaySeconds = loadPushDelay(env.PUSH_DELAY_SECONDS);
 	const rpName = String(env.RP_NAME ?? "Apron Demo");
 	if (!rpName.trim() || [...rpName].length > limits.maxNameCodePoints || new TextEncoder().encode(rpName).byteLength > limits.maxNameBytes) {
 		throw new ConfigError("RP_NAME exceeds the configured display-name policy");
@@ -329,6 +336,7 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 		...(uploads ? { uploads } : {}),
 		...(push ? { push } : {}),
 		pushHosts,
+		pushDelaySeconds,
 	};
 }
 
@@ -361,6 +369,8 @@ export function validatePushPolicy(policy: PushPolicy): void {
 	if (policy.registersPerUserMinute > MAX_TYPE_THROTTLE_PER_MINUTE) throw new ConfigError(`push.registersPerUserMinute must be at most ${MAX_TYPE_THROTTLE_PER_MINUTE}`);
 	// The coalescing rows are deleted by cleanup once a day at the latest.
 	if (policy.coalesceSeconds > 86_400) throw new ConfigError("push.coalesceSeconds must be at most a day");
+	// The wait is an in-memory timer that keeps the object awake.
+	if (policy.delaySeconds > MAX_STATUS_DELAY_SECONDS) throw new ConfigError(`push.delaySeconds must be at most ${MAX_STATUS_DELAY_SECONDS}`);
 	// Registrations refresh at most daily, so a subscription needs a day at least.
 	if (policy.pushExpiryDays < 2 || policy.pushExpiryDays > 90) throw new ConfigError("push.pushExpiryDays must be 2 to 90");
 }
@@ -394,6 +404,16 @@ function loadPushHosts(raw: string | undefined): RuntimeConfig["pushHosts"] {
 		}
 	}
 	return hosts;
+}
+
+/** `PUSH_DELAY_SECONDS`: whole seconds from 0 to MAX_STATUS_DELAY_SECONDS; unset or empty, the plan's `push.delaySeconds`. */
+function loadPushDelay(raw: string | undefined): number {
+	const value = raw?.trim() ?? "";
+	if (value === "") return PUSH_POLICY?.delaySeconds ?? 0;
+	if (!/^\d+$/.test(value) || Number(value) > MAX_STATUS_DELAY_SECONDS) {
+		throw new ConfigError(`PUSH_DELAY_SECONDS must be a whole number of seconds from 0 to ${MAX_STATUS_DELAY_SECONDS}`);
+	}
+	return Number(value);
 }
 
 function validHttpsUrl(value: string): boolean {

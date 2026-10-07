@@ -24,6 +24,8 @@ for a zero-overage deployment.
   reply wakes a signed-in user whose every tab is idle or closed, through
   their browser's Web Push service (`server.push` kind `webpush`), unless
   they muted it with `status`, everywhere or in that room, or chose `dnd`.
+  The push waits 30 seconds first, and doesn't go if they come back or
+  post in that room meanwhile.
 - **Who's around.** With push on, member lists show each user as online,
   idle, busy (`dnd`), or offline, and a user can choose `dnd`, `invisible`,
   or no status at all with `me`. A chosen status shows at once; changes

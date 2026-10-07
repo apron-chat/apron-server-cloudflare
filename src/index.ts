@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, pushHostAllowed, type RuntimeConfig } from "./config";
-import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
+import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
 import { fetchAccountUsage, type AccountUsageSnapshot } from "./account-usage";
 import { runBudgetGuard, watchForFlood } from "./budget-guard";
@@ -203,6 +203,13 @@ function statusFrame(roomId: string | null, mute: number | boolean): Record<stri
 
 /** A pending status change of a user without a connection: `[user_id, status last told, status now, when due]`. */
 type OwedStatus = [string, Status, Status, number];
+
+/** A message's wake waiting `pushDelaySeconds` to push: the users still to consider, with their wake reasons. */
+interface PendingWake {
+	message: MessageSnapshot;
+	reasons: Map<string, number>;
+	timer?: ReturnType<typeof setTimeout>;
+}
 
 /** Pending status changes one connection may hold; more are delivered at once. */
 const MAX_OWED = 32;
@@ -1110,6 +1117,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * have no connection, whose next announcement may then come sooner.
 	 */
 	private readonly announcedAt = new Map<string, number>();
+	/**
+	 * Wakes waiting `pushDelaySeconds` before they push (§4.9's suggested
+	 * convention), in memory: a user who comes back (`idle: false`) or posts
+	 * in the room meanwhile is dropped, and one attended when the wait ends
+	 * is passed over. Each timer keeps the object awake until it fires; a
+	 * wake lost with the instance is not pushed. At most MAX_PENDING_WAKES.
+	 */
+	private readonly pendingWakes = new Set<PendingWake>();
 	/** The one timer that announces waiting status changes, and when it fires. */
 	private presenceTimer: ReturnType<typeof setTimeout> | undefined;
 	private presenceTimerAt = Number.POSITIVE_INFINITY;
@@ -2439,7 +2454,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// Only a new message wakes anyone: not an edit, move, or retry (§4.9).
 			if (method === "message" && !result.deduplicated && result.message?.prev_log_id === undefined) created = result.message;
 		});
-		if (created && identity.tier === "registered") this.wakeFor(created);
+		if (created) {
+			// Posting in a room shows its poster saw it: their waiting wakes for it go.
+			this.dropWakes(identity.user_id, created.room_id);
+			if (identity.tier === "registered") this.wakeFor(created);
+		}
 		// Pending writes that never come are failed by the alarm (§4.8.3).
 		if (started) await this.rescheduleAlarm();
 	}
@@ -2910,6 +2929,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (idle) state.idle = true;
 		else delete state.idle;
 		writeAttachment(socket, state);
+		// Back: a push still waiting for them is not needed.
+		if (!idle && state.userId) this.dropWakes(state.userId);
 		this.touchPresence(state.userId);
 	}
 
@@ -3577,16 +3598,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `wakesPerMessage` of those with live registrations for one of their
 	 * reasons, at most once a `coalesceSeconds` per room, within the sender's
 	 * and the server's daily allowances. Every room is visible to everyone,
-	 * so a mention or reply anywhere counts, joined or not. Pushes go out
+	 * so a mention or reply anywhere counts, joined or not. The candidates
+	 * first wait `pushDelaySeconds` (§4.9's suggested convention, see
+	 * pendingWakes); those still unattended then are pushed. Pushes go out
 	 * after the result, kept alive with waitUntil. A failure here is logged
 	 * and never touches the post. Only logged messages wake anyone: a
 	 * transient notice (no `message_id`, such as a `~private` command reply)
 	 * is never pushed (§4.9), and never reaches here.
 	 */
 	private wakeFor(message: MessageSnapshot): void {
-		const vapid = this.config.push;
-		const policy = PUSH_POLICY;
-		if (!vapid || !policy || !message.message_id || !message.log_id) return;
+		if (!this.config.push || !PUSH_POLICY || !message.message_id || !message.log_id) return;
 		const now = nowMs();
 		const sender = message.from.user_id;
 		const reasons = new Map<string, number>();
@@ -3607,6 +3628,42 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const mentions = message.body?.mentions;
 		if (Array.isArray(mentions)) for (const userId of mentions) consider(userId, WAKE_SCOPES.mentions);
 		if (!reasons.size) return;
+		const delay = this.config.pushDelaySeconds * 1_000;
+		// Past the bound, a wake goes at once, as it would with no wait.
+		if (delay === 0 || this.pendingWakes.size >= MAX_PENDING_WAKES) {
+			this.pushWake(message, reasons);
+			return;
+		}
+		const wake: PendingWake = { message, reasons };
+		wake.timer = setTimeout(() => {
+			this.pendingWakes.delete(wake);
+			const now = nowMs();
+			for (const userId of [...wake.reasons.keys()]) if (this.attended(userId, now)) wake.reasons.delete(userId);
+			if (wake.reasons.size) this.pushWake(message, wake.reasons);
+		}, delay);
+		this.pendingWakes.add(wake);
+	}
+
+	/**
+	 * Drops a user from the wakes waiting to push (pendingWakes): all of them
+	 * when they come back (`idle: false`), or `roomId`'s when they post there.
+	 */
+	private dropWakes(userId: string, roomId?: string): void {
+		for (const wake of this.pendingWakes) {
+			if (roomId !== undefined && wake.message.room_id !== roomId) continue;
+			if (!wake.reasons.delete(userId) || wake.reasons.size) continue;
+			clearTimeout(wake.timer);
+			this.pendingWakes.delete(wake);
+		}
+	}
+
+	/** Claims and sends one message's wake for `reasons` (see wakeFor). */
+	private pushWake(message: MessageSnapshot, reasons: ReadonlyMap<string, number>): void {
+		const vapid = this.config.push;
+		const policy = PUSH_POLICY;
+		if (!vapid || !policy) return;
+		const now = nowMs();
+		const sender = message.from.user_id;
 		const candidates: PushCandidate[] = [...reasons].map(([userId, reason]) => ({ userId, reasons: reason }));
 		let claimed: ReturnType<Store["claimPushes"]>;
 		try {
