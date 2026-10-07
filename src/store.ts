@@ -165,6 +165,9 @@ export interface StoreConfig {
   anonymousPostsPerDay: number;
   registeredPostsPerMinute: number;
   registeredPostsPerDay: number;
+  /** A moderator's (MODERATOR_ROLES) posts, in place of the registered limits; also their IP's allowance, when larger. */
+  moderatorPostsPerMinute: number;
+  moderatorPostsPerDay: number;
   ipPostsPerMinute: number;
   ipPostsPerDay: number;
   globalPostsPerMinute: number;
@@ -300,6 +303,8 @@ const DEFAULT_CONFIG: StoreConfig = {
   anonymousPostsPerDay: DEFAULT_LIMITS.anonymousPostsPerDay,
   registeredPostsPerMinute: DEFAULT_LIMITS.registeredPostsPerMinute,
   registeredPostsPerDay: DEFAULT_LIMITS.registeredPostsPerDay,
+  moderatorPostsPerMinute: DEFAULT_LIMITS.moderatorPostsPerMinute,
+  moderatorPostsPerDay: DEFAULT_LIMITS.moderatorPostsPerDay,
   ipPostsPerMinute: DEFAULT_LIMITS.ipPostsPerMinute,
   ipPostsPerDay: DEFAULT_LIMITS.ipPostsPerDay,
   globalPostsPerMinute: DEFAULT_LIMITS.globalPostsPerMinute,
@@ -703,6 +708,14 @@ const META_GUEST_NUMBER_MARK = "guest_number_mark";
  * writes, and so the identities that can survive a wipe.
  */
 export const MAX_CARRIED_PASSKEYS = 100;
+/**
+ * Moderator roles. A registered user holding one may move other users'
+ * messages (§4.4): a `message` save of someone else's message that changes
+ * only its `room_id`, such as into a thread or back out to its parent room.
+ * Their posts count against the moderator posting limits, not the
+ * registered ones (chargePosting).
+ */
+export const MODERATOR_ROLES: readonly string[] = ["admin", "mod"];
 /** Most roles one user holds, so the column stays small. */
 export const MAX_ROLES_PER_USER = 8;
 /**
@@ -1034,6 +1047,11 @@ function canonicalize(value: unknown): string {
   throw new StoreError("invalid_params", "unsupported value in request");
 }
 
+
+/** A snapshot's content, which only its author changes: what a save keeps besides `room_id` and the server's links. */
+function messageContent(snapshot: MessageSnapshot): Record<string, unknown> {
+  return { body: snapshot.body, reply_to: snapshot.reply_to, deleted: snapshot.deleted === true, ext: snapshot.ext };
+}
 
 function digestOperation(method: string, params: unknown): string {
   return createHash("sha256").update(canonicalize({ method, params }), "utf8").digest("hex");
@@ -2676,7 +2694,7 @@ export class Store {
     // Per user: memberships (live and awaiting a room purge), a day's dedup
     // rows, limiter rows, push subscriptions, credential and identity; each
     // deletion also updates its indexes.
-    const perUser = 64 + 4 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS) + 4 * this.config.registeredPostsPerDay + 4 * uploadsPerOwner +
+    const perUser = 64 + 4 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS) + 4 * Math.max(this.config.registeredPostsPerDay, this.config.moderatorPostsPerDay) + 4 * uploadsPerOwner +
       4 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER);
     const cost = { reads: 64 + 5 * records + ids.length * perUser, writes: 64 + 4 * records + ids.length * perUser };
     return this.reserved(cost, false, now, () => this.transaction(() => {
@@ -2963,8 +2981,25 @@ export class Store {
     }
   }
 
+  /**
+   * Charges one post to the poster's, the IP's and the global windows. A
+   * registered moderator (MODERATOR_ROLES, one identity read) is held to the
+   * moderator limits instead of the registered ones, and their IP to the
+   * larger of its own and those, so the IP's limits don't undercut them
+   * (moving a long conversation into a thread is one post per message).
+   * The global limits hold for everyone.
+   */
   private chargePosting(input: { userId: string; tier: Tier; ipKey: string; now: number }): void {
     const { userId, tier, ipKey, now } = input;
+    const moderator = tier === "registered" && this.isModerator(userId);
+    const perUser = moderator
+      ? { minute: this.config.moderatorPostsPerMinute, day: this.config.moderatorPostsPerDay }
+      : tier === "registered"
+        ? { minute: this.config.registeredPostsPerMinute, day: this.config.registeredPostsPerDay }
+        : { minute: this.config.anonymousPostsPerMinute, day: this.config.anonymousPostsPerDay };
+    const perIp = moderator
+      ? { minute: Math.max(this.config.ipPostsPerMinute, this.config.moderatorPostsPerMinute), day: Math.max(this.config.ipPostsPerDay, this.config.moderatorPostsPerDay) }
+      : { minute: this.config.ipPostsPerMinute, day: this.config.ipPostsPerDay };
     const principal = tier === "registered" ? `user:${userId}` : `anonymous:${ipKey}`;
     const rows = [
       this.limitRow("post", principal, now),
@@ -2978,12 +3013,8 @@ export class Store {
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index];
       const previousEvents = events[index];
-      const allowance = index === 0
-        ? (tier === "registered" ? this.config.registeredPostsPerMinute : this.config.anonymousPostsPerMinute)
-        : index === 1 ? this.config.ipPostsPerMinute : this.config.globalPostsPerMinute;
-      const dailyAllowance = index === 0
-        ? (tier === "registered" ? this.config.registeredPostsPerDay : this.config.anonymousPostsPerDay)
-        : index === 1 ? this.config.ipPostsPerDay : this.config.globalPostsPerDay;
+      const allowance = index === 0 ? perUser.minute : index === 1 ? perIp.minute : this.config.globalPostsPerMinute;
+      const dailyAllowance = index === 0 ? perUser.day : index === 1 ? perIp.day : this.config.globalPostsPerDay;
       if (previousEvents.length >= allowance) {
         const retry = Math.max(1, previousEvents[previousEvents.length - allowance] + POST_WINDOW_MS - now);
         if (retry > retryAfterMs) {
@@ -3389,6 +3420,12 @@ export class Store {
     return rows[0];
   }
 
+  /** Whether a registered user holds a moderator role (MODERATOR_ROLES), from the identity row. */
+  private isModerator(userId: string): boolean {
+    const identity = this.identityRow(userId);
+    return identity?.tier === "registered" && parseRoles(identity.roles_json).some((role) => MODERATOR_ROLES.includes(role));
+  }
+
   private identityForMessage(input: StoreMutationInput): Identity {
     const name = typeof input.identity.name === "string" ? input.identity.name : undefined;
     return { user_id: input.identity.user_id, ...(name ? { name } : {}) };
@@ -3731,7 +3768,9 @@ export class Store {
     if (messageIdParam !== undefined && typeof messageIdParam !== "string") throw new StoreError("invalid_params", "message_id must be a string");
     const current = messageIdParam === undefined ? null : this.currentMessage(ensureText(messageIdParam, "message_id", 256), floor);
     if (messageIdParam !== undefined && !current) throw new StoreError("invalid_params", "unknown or expired message");
-    if (current && current.author_id !== input.userId) throw new StoreError("denied", "Only the original author may edit this message");
+    // Someone else's message may only be moved, and only by a moderator (MODERATOR_ROLES).
+    const moving = current !== null && current.author_id !== input.userId;
+    if (moving && (current.room_id === roomId || !this.isModerator(input.userId))) throw new StoreError("denied", "Only the original author may edit this message");
     if (!this.roomRow(roomId)) throw new StoreError("invalid_params", "unknown room");
     const deleted = params.deleted === undefined ? false : params.deleted;
     if (typeof deleted !== "boolean") throw new StoreError("invalid_params", "deleted must be boolean");
@@ -3771,6 +3810,11 @@ export class Store {
     if (replyId !== undefined) snapshot.reply_to = { message_id: replyId };
     if (deleted) snapshot.deleted = true;
     if (ext) snapshot.ext = ext;
+    // A moderator's save keeps the author's content as it was: the client fields
+    // the client resubmits, and an `ext` it merges into nothing new.
+    if (moving && canonicalize(messageContent(snapshot)) !== canonicalize(messageContent(previous!))) {
+      throw new StoreError("denied", "An admin or mod may move someone else's message but not change it");
+    }
     // The size policy bounds client content, the merged ext included; the server's prev_log_id and
     // prev_room_id links are added after it.
     if (utf8Bytes(JSON.stringify(snapshot)) > this.config.maxSnapshotBytes) throw new StoreError("too_large", "message snapshot is too large");

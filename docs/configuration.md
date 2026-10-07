@@ -513,13 +513,13 @@ The numeric rows are grouped by their unit and enforcement scope:
   durable write reserves; see below.
 - Rolling minute budgets: `historyRequestsPerUserMinute`,
   `historyRequestsPerIpMinute`, `anonymousPostsPerMinute`,
-  `registeredPostsPerMinute`, `ipPostsPerMinute`, `globalPostsPerMinute`,
+  `registeredPostsPerMinute`, `moderatorPostsPerMinute`, `ipPostsPerMinute`, `globalPostsPerMinute`,
   `authAttemptsPerIpMinute`, `framesPerConnectionMinute`,
   `framesPerIpMinute`, `connectionAdmissionsPerIpMinute`,
   `globalFramesPerMinute` (server-wide, in memory),
   `roomListRequestsPerUserMinute` and `activityBroadcastsPerUserMinute` (per
   user across their connections).
-- UTC-day budgets: `anonymousPostsPerDay`, `registeredPostsPerDay`,
+- UTC-day budgets: `anonymousPostsPerDay`, `registeredPostsPerDay`, `moderatorPostsPerDay`,
   `ipPostsPerDay`, `globalPostsPerDay`, `registrationsPerIpDay`,
   `registrationsPerDay`, `connectionAdmissionsPerDay`,
   `processedFramesPerDay`, `sqlWritesPerDay`, `sqlReadsPerDay`,
@@ -550,6 +550,8 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `anonymousPostsPerDay` | 200 | 100 |
 | `registeredPostsPerMinute` | 20 |  |
 | `registeredPostsPerDay` | 1000 | 500 |
+| `moderatorPostsPerMinute` | 50 |  |
+| `moderatorPostsPerDay` | 4000 | 2000 |
 | `ipPostsPerMinute` | 30 |  |
 | `ipPostsPerDay` | 2000 | 1000 |
 | `globalPostsPerMinute` | 120 | 60 |
