@@ -39,6 +39,10 @@ ZONE_ID = "d7467571c212da5b57bbc92afeb967b7"
 # off until the UPLOAD_SIGNING_KEY secret is set too.
 MEDIA_ORIGIN = "https://media.apron.chat"
 PUBLIC_ORIGIN = "https://server.apron.chat"
+# Push (src/webpush.ts): on only with the VAPID_PRIVATE_KEY secret set too.
+# The private key must match this public key.
+VAPID_PUBLIC_KEY = "BF-ztm22-yk6-AvyxkBGWzxaiA_CnO1c9vDAe1-RMg0WJ_EuNgmPhxxTyUq6J0nhaFxNxmcFsAc6KVfWLkdDl0M"
+VAPID_SUBJECT = "https://server.apron.chat"
 
 # Uploaded images (src/budget.ts). The bucket needs lifecycle rules deleting
 # f/ after 7 days and a/ after 30, and a custom domain for MEDIA_ORIGIN.
