@@ -243,7 +243,8 @@ it("ignores WebAuthn notifications and consumes matching malformed finishes", as
 	const peer = await pendingSocket();
 	try {
 		peer.socket.send(JSON.stringify({ id: "unknown-scheme", method: "auth", params: { scheme: "password", action: "login", step: "begin" } }));
-		expect((await peer.next()).error?.code).toBe(-32601);
+		// A scheme the spec does not define is an unknown name: invalid_params (§1).
+		expect((await peer.next()).error?.code).toBe(-32602);
 		peer.socket.send(JSON.stringify({ method: "auth", params: { scheme: "webauthn", action: "register", step: "begin" } }));
 		peer.socket.send(JSON.stringify({ id: "notification-barrier", method: "lifecycle-noop" }));
 		expect((await peer.next()).error?.code).toBe(-32001);

@@ -125,7 +125,8 @@ it('/kick removes a registered user or a guest from the room of the command', as
 		const guestLeft = await until(guest, (frame) => frame.method === 'room_update' && frame.params.left !== undefined);
 		expect(guestLeft.frame.params.left).toEqual([{ room_id: 'general' }]);
 
-		expect((await command(admin, 'kick-self', '/kick admin')).frame.error.code).toBe(-32602);
+		// Kicking yourself is well formed but not allowed: denied (§1.1).
+		expect((await command(admin, 'kick-self', '/kick admin')).frame.error.code).toBe(-32001);
 		expect((await command(admin, 'kick-nobody', '/kick nobody_123')).frame.error.code).toBe(-32602);
 		// Mistakes are shown, not counted as policy violations: the socket stays open.
 		expect((await command(admin, 'kick-usage', '/kick')).frame.error.message).toBe('Usage: /kick <user_id>');
@@ -142,9 +143,11 @@ it('/status sends the caller the Cloudflare usage and the demo budgets', async (
 		expect(status.notice!.params.body.format).toBe('markdown');
 		// Tests configure no account analytics, so only the object's budgets show.
 		expect(text).toContain('no usage sample');
-		expect(text).toMatch(new RegExp(`\\| SQL rows written \\| [\\d,]+ / ${DEFAULT_LIMITS.sqlWritesPerDay.toLocaleString('en-US')} \\(\\d+%\\) \\|`));
-		expect(text).toMatch(/\| Registered users \| [\d,]+ \/ 10,000/);
-		expect(text).toContain('| Database |');
+		// Lists, not GFM tables, so strict CommonMark clients render it.
+		expect(text).not.toContain('|');
+		expect(text).toMatch(new RegExp(`^- SQL rows written: [\\d,]+ / ${DEFAULT_LIMITS.sqlWritesPerDay.toLocaleString('en-US')} \\(\\d+%\\)$`, 'm'));
+		expect(text).toMatch(/^- Registered users: [\d,]+ \/ 10,000/m);
+		expect(text).toMatch(/^- Database: /m);
 	} finally { admin.close(); }
 });
 
@@ -157,9 +160,9 @@ it('/rename moves a registered user, their passkey, rooms and admin status to a 
 	try {
 		expect((await command(admin, 'grant', `/admin ${fromId}`)).frame.result).toEqual({});
 		// A role change is a profile change (§3.3): the new admin and a room-mate hear of it.
-		const granted = await until(dave, (frame) => frame.method === 'user');
-		expect(granted.frame.params).toEqual({ you: { user_id: fromId, name: `Name of ${fromId}`, roles: ['admin'] } });
-		const seen = await until(erin, (frame) => frame.method === 'user' && frame.params.new?.user_id === fromId);
+		const granted = await until(dave, (frame) => frame.method === 'user' && frame.params.you !== undefined);
+		expect(granted.frame.params).toEqual({ you: { user_id: fromId, name: `Name of ${fromId}`, roles: ['admin'], status: 'online' } });
+		const seen = await until(erin, (frame) => frame.method === 'user' && frame.params.new?.user_id === fromId && frame.params.new.roles !== undefined);
 		expect(seen.frame.params).toEqual({ new: { user_id: fromId, name: `Name of ${fromId}`, roles: ['admin'] } });
 		const before = await exchange(dave, 'before', 'message', { room_id: 'general', body: { text: 'before the rename' } });
 		const earlier: string = before.frame.result.message_id;
@@ -168,10 +171,11 @@ it('/rename moves a registered user, their passkey, rooms and admin status to a 
 		expect(renamed.frame.result).toEqual({});
 		expect(renamed.notice!.params.body.text).toBe(`Renamed \`${fromId}\` to \`${toId}\`.`);
 		// The user's connection becomes the new identity; a room-mate learns of the change (§3.3).
-		const you = await until(dave, (frame) => frame.method === 'user');
-		expect(you.frame.params).toEqual({ you: { user_id: toId, name: `Name of ${fromId}`, roles: ['admin'] } });
+		const you = await until(dave, (frame) => frame.method === 'user' && frame.params.you !== undefined);
+		expect(you.frame.params).toEqual({ you: { user_id: toId, name: `Name of ${fromId}`, roles: ['admin'], status: 'online' } });
 		const change = await until(erin, (frame) => frame.method === 'user' && frame.params.old?.user_id === fromId);
-		expect(change.frame.params).toEqual({ new: { user_id: toId, name: `Name of ${fromId}`, roles: ['admin'] }, old: { user_id: fromId, name: `Name of ${fromId}` } });
+		// The new user_id carries the status others were shown under the old one (§4.5).
+		expect(change.frame.params).toEqual({ new: { user_id: toId, name: `Name of ${fromId}`, roles: ['admin'], status: 'online' }, old: { user_id: fromId, name: `Name of ${fromId}` } });
 		const posted = await exchange(dave, 'post', 'message', { room_id: 'general', body: { text: 'renamed' } });
 		expect(posted.frame.result.message_id).toBeDefined();
 		// The earlier message was rewritten to the new id, so it is still theirs to edit.
@@ -202,11 +206,13 @@ it('/rename moves a registered user, their passkey, rooms and admin status to a 
 			['guest', `/rename ${toId} guest_77`],
 			['bot', `/rename ${toId} bot_x`],
 			['bad-chars', `/rename ${toId} no@pe`],
-			['admin', `/rename admin somebody_else`],
+			['to-admin', `/rename ${toId} admin`],
 			['unknown', `/rename nobody_123 somebody_else`],
 		]) {
 			expect((await command(admin, `rename-${id}`, text)).frame.error.code).toBe(-32602);
 		}
+		// The admin user's own user_id is fixed by policy: denied (§1.1).
+		expect((await command(admin, 'rename-admin', '/rename admin somebody_else')).frame.error.code).toBe(-32001);
 		expect((await command(admin, 'rename-usage', `/rename ${toId}`)).frame.error.message).toBe('Usage: /rename <old_user_id> <new_user_id>');
 		expect(admin.closed()).toBeUndefined();
 	} finally { admin.close(); dave.close(); erin.close(); }
@@ -229,7 +235,7 @@ it('/invite-token creates a user who signs in with the token, which /rename move
 
 		// The token signs in from any origin, as a registered user in general.
 		const first = await signIn(token);
-		expect(first.reply.result.you).toEqual({ user_id: userId, name: userId, roles: [] });
+		expect(first.reply.result.you).toEqual({ user_id: userId, name: userId, roles: [], status: 'online' });
 		expect((await request(first.peer, 'rename-self', 'me', { name: 'Newcomer' })).result.you.name).toBe('Newcomer');
 		first.peer.close();
 
@@ -300,9 +306,11 @@ it('room_join and room_leave with a user_id add and remove others: an admin anyo
 		expect(joined.frame.params.joined[0].latest_log_id).toBe(joined.frame.params.memberships[0].log_id);
 		expect(joined.frame.params.joined[0]).toMatchObject({ room_id: roomId, title: 'Invites' });
 		expect(joined.frame.params.joined[0].members.map((member: { user_id: string }) => member.user_id)).toEqual(['admin', bobId].sort());
-		// `users` are current objects: the admin's carry its role (§3.3).
-		expect(joined.frame.params.users).toContainEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'] });
-		expect(joined.frame.params.users).toContainEqual({ user_id: bobId, name: `Name of ${bobId}`, roles: [] });
+		// `users` are current objects: the admin's carry its role (§3.3), and each
+		// their status (§4.5). The admin signed in earlier in this file, so what
+		// others were last told of them may still be waiting out a minute.
+		expect(joined.frame.params.users).toContainEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'], status: expect.stringMatching(/^(online|offline)$/) });
+		expect(joined.frame.params.users).toContainEqual({ user_id: bobId, name: `Name of ${bobId}`, roles: [], status: 'online' });
 		// Adding a member again changes nothing.
 		expect((await exchange(admin, 'add-bob-again', 'room_join', { room_id: roomId, user_id: bobId })).skipped.some((frame) => frame.params?.memberships)).toBe(false);
 
@@ -323,7 +331,7 @@ it('room_join and room_leave with a user_id add and remove others: an admin anyo
 		const removed = await exchange(admin, 'remove-bob', 'room_leave', { room_id: roomId, user_id: bobId });
 		expect(removed.frame.result).toEqual({});
 		expect(removed.skipped.filter((frame) => frame.params?.memberships).at(-1)?.params.memberships[0].members).toEqual([{ user: { user_id: bobId, name: `Name of ${bobId}` }, joined: false }]);
-		// The removed user's connections get `left` with the membership (§4.3.2, §4.8 /kick).
+		// The removed user's connections get `left` with the membership (§4.3.2, §4.1 /kick).
 		const left = await until(bob, (frame) => frame.method === 'room_update' && frame.params.left !== undefined);
 		expect(left.frame.params.left).toEqual([{ room_id: roomId }]);
 		expect(left.frame.params.memberships[0].members).toEqual([{ user: { user_id: bobId, name: `Name of ${bobId}` }, joined: false }]);
@@ -372,7 +380,7 @@ it('gives member_count where members leaves registered members out, and keeps th
 	} finally { await setRoomListMembers(DEFAULT_LIMITS.roomListMembers); admin.close(); }
 });
 
-it('never gives out a ~ user_id, which protocol v7 reserves for system identities', async () => {
+it('never gives out a ~ user_id, which the protocol reserves for system identities', async () => {
 	const admin = await signedInAdmin();
 	const guest = await connect();
 	try {
@@ -382,7 +390,7 @@ it('never gives out a ~ user_id, which protocol v7 reserves for system identitie
 			expect((await command(admin, text, text)).frame.error.code).toBe(-32602);
 		}
 		// `roles` are the server's to assign: `me` ignores them.
-		expect((await request(admin, 'me', 'me', { roles: ['moderator'] })).result.you).toEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'] });
+		expect((await request(admin, 'me', 'me', { roles: ['moderator'] })).result.you).toEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'], status: 'online' });
 	} finally { admin.close(); guest.close(); }
 });
 
@@ -426,7 +434,7 @@ async function passkeyLogin(passkey: Awaited<ReturnType<typeof softPasskey>>): P
 	} finally { peer.close(); }
 }
 
-it('adds a passkey to the signed-in account (§4.9); a guest\'s registration makes a new account', async () => {
+it('adds a passkey to the signed-in account (§4.10); a guest\'s registration makes a new account', async () => {
 	const userId = unique('keys');
 	const user = await signedIn(userId);
 	const guest = await connect();
@@ -445,7 +453,7 @@ it('adds a passkey to the signed-in account (§4.9); a guest\'s registration mak
 		expect(told.frame.params.body.text).toMatch(/A passkey was added to your account/);
 		expect(added.begun.result.public_key.user.name).toBe(userId);
 		expect(added.begun.result.public_key.excludeCredentials.map((entry: { id: string }) => entry.id)).toEqual([`cred-${userId}`]);
-		expect(added.finished.result).toEqual({ you: { user_id: userId, name: `Name of ${userId}`, roles: [] } });
+		expect(added.finished.result).toEqual({ you: { user_id: userId, name: `Name of ${userId}`, roles: [], status: 'online' } });
 		const credentials = await runInDurableObject(stub(), (_instance, state) =>
 			state.storage.sql.exec<{ credential_id: string }>('SELECT credential_id FROM credentials WHERE user_id = ? ORDER BY created_ms', userId).toArray().map((row) => row.credential_id));
 		expect(credentials).toEqual([`cred-${userId}`, added.passkey.id]);
@@ -458,7 +466,7 @@ it('adds a passkey to the signed-in account (§4.9); a guest\'s registration mak
 		expect(removed.frame.result).toEqual({});
 		expect((await until(other, (frame) => frame.method === 'message' && /Removed the passkey/.test(frame.params.body?.text ?? ''))).frame.params.from.user_id).toBe('~private');
 		expect((await passkeyLogin(added.passkey)).error.code).toBe(-32001);
-		expect((await command(user, 'remove-last', '/passkeys remove 1')).frame.error.message).toMatch(/only passkey/);
+		expect((await command(user, 'remove-last', '/passkeys remove 1')).frame.error).toMatchObject({ code: -32001, message: expect.stringMatching(/only passkey/) });
 		other.close();
 		// Signing in as someone else on a signed-in connection still takes a reconnect.
 		expect((await request(user, 'login', 'auth', { scheme: 'webauthn', action: 'login', step: 'begin' })).error.code).toBe(-32001);
@@ -503,10 +511,16 @@ it('/invite mints a sign-up token that creates a user per use, each with its own
 		// A guest signs up with it: a new registered user, named as asked, with its own token.
 		const ada = await fresh();
 		await request(ada, 'guest', 'auth', { scheme: 'guest' });
-		const signedUp = await request(ada, 'join', 'auth', { scheme: 'token', token: invite, name: 'Ada' });
-		expect(signedUp.result.you).toEqual({ user_id: expect.stringMatching(/^ada_\d{4}$/), name: 'Ada', roles: [] });
+		const joined = await exchange(ada, 'join', 'auth', { scheme: 'token', token: invite, name: 'Ada' });
+		const signedUp = joined.frame;
+		expect(signedUp.result.you).toEqual({ user_id: expect.stringMatching(/^ada_\d{4}$/), name: 'Ada', roles: [], status: 'online' });
 		expect(signedUp.result.token).toMatch(/^apron_invite_/);
 		const adaId = signedUp.result.you.user_id;
+		// The new user's logged join of general reaches the guest's connection,
+		// already in general, after the auth result (§3.2), not before.
+		const joinOf = (userId: string) => (frame: Frame) => frame.method === 'room_update' && frame.params?.memberships?.[0]?.members?.[0]?.user?.user_id === userId;
+		expect(joined.skipped.some(joinOf(adaId))).toBe(false);
+		expect((await until(ada, joinOf(adaId))).frame.params.memberships[0]).toMatchObject({ room_id: 'general', members: [{ joined: true }] });
 		// Posting works, and the saved token signs in again as the same user.
 		expect((await request(ada, 'post', 'message', { room_id: 'general', body: { text: 'hi from an invite' } })).result.message_id).toBeDefined();
 		const again = await fresh();
@@ -515,7 +529,11 @@ it('/invite mints a sign-up token that creates a user per use, each with its own
 		// A second use makes another user; the third finds the invite used up.
 		const second = await fresh();
 		// Without a name, a sign-up is a "Member" (not "Guest", which names guests).
-		expect((await request(second, 'join', 'auth', { scheme: 'token', token: invite })).result.you).toMatchObject({ user_id: expect.stringMatching(/^member_\d{4}$/), name: 'Member' });
+		const member = await exchange(second, 'join', 'auth', { scheme: 'token', token: invite });
+		expect(member.frame.result.you).toMatchObject({ user_id: expect.stringMatching(/^member_\d{4}$/), name: 'Member' });
+		// A connection that was not signed in gets the join after the result too.
+		expect(member.skipped.some(joinOf(member.frame.result.you.user_id))).toBe(false);
+		await until(second, joinOf(member.frame.result.you.user_id));
 		const third = await fresh();
 		expect((await request(third, 'join', 'auth', { scheme: 'token', token: invite, name: 'Late' })).error.code).toBe(-32001);
 		// The used-up invite was dropped when it was tried.
@@ -544,7 +562,8 @@ it('/invite mints a sign-up token that creates a user per use, each with its own
 		const replaced = /apron_join_[A-Za-z0-9_-]+/.exec((await command(admin, 'invite-2', '/invite 1')).notice!.params.body.text)![0];
 		expect((await command(admin, 'revoke', '/invite 0')).notice!.params.body.text).toMatch(/revoked/);
 		expect((await request(await fresh(), 'join', 'auth', { scheme: 'token', token: replaced })).error.code).toBe(-32001);
-		expect((await command(admin, 'too-many', '/invite 51')).frame.error.code).toBe(-32602);
+		// Past the server's count limit: denied (§1.1).
+		expect((await command(admin, 'too-many', '/invite 51')).frame.error.code).toBe(-32001);
 		// Only admins mint invites.
 		expect((await command(ada, 'not-admin', '/invite 1')).frame.error.code).toBe(-32001);
 	} finally { admin.close(); for (const peer of peers) peer.close(); }
@@ -570,20 +589,20 @@ it('/admin remove takes the admin role away, announced with roles: [] (§3.3)', 
 	const mate = await signedIn(unique('mate'));
 	try {
 		await command(admin, 'grant', `/admin ${userId}`);
-		await until(demoted, (frame) => frame.method === 'user');
-		await until(mate, (frame) => frame.method === 'user' && frame.params.new?.user_id === userId);
+		await until(demoted, (frame) => frame.method === 'user' && frame.params.you !== undefined);
+		await until(mate, (frame) => frame.method === 'user' && frame.params.new?.user_id === userId && frame.params.new.roles !== undefined);
 		const removed = await command(admin, 'demote', `/admin remove @${userId}`);
 		expect(removed.notice!.params.body.text).toMatch(/is no longer an admin/);
 		// An empty value means cleared: both the user and a room-mate drop the role.
-		expect((await until(demoted, (frame) => frame.method === 'user')).frame.params).toEqual({ you: { user_id: userId, name: `Name of ${userId}`, roles: [] } });
-		expect((await until(mate, (frame) => frame.method === 'user' && frame.params.new?.user_id === userId)).frame.params.new.roles).toEqual([]);
+		expect((await until(demoted, (frame) => frame.method === 'user' && frame.params.you !== undefined)).frame.params).toEqual({ you: { user_id: userId, name: `Name of ${userId}`, roles: [], status: 'online' } });
+		expect((await until(mate, (frame) => frame.method === 'user' && frame.params.new?.user_id === userId && frame.params.new.roles !== undefined)).frame.params.new.roles).toEqual([]);
 		expect((await command(demoted, 'status', '/status')).frame.error.code).toBe(-32001);
 		// A client that missed the notification clears the role from any current object, such as a listing's users.
 		const listed = await request(mate, 'list', 'room_list', { room_id: 'general', members: true });
 		expect(listed.result.users.find((user: { user_id: string }) => user.user_id === userId).roles).toEqual([]);
 		expect(listed.result.users.find((user: { user_id: string }) => user.user_id === 'admin').roles).toEqual(['admin']);
 		expect((await command(admin, 'again', `/admin remove ${userId}`)).notice!.params.body.text).toMatch(/was not an admin/);
-		expect((await command(admin, 'builtin', '/admin remove admin')).frame.error.code).toBe(-32602);
+		expect((await command(admin, 'builtin', '/admin remove admin')).frame.error.code).toBe(-32001);
 	} finally { admin.close(); demoted.close(); mate.close(); }
 });
 
@@ -600,8 +619,8 @@ it('/role shows a user\'s roles and toggles one, any name a label, admin also th
 		const given = await command(admin, 'give', `/role @${userId} Friend`);
 		expect(given.frame.result).toEqual({});
 		expect(given.notice!.params.body.text).toBe(`${who} now has the role \`friend\`.`);
-		expect((await until(labeled, (frame) => frame.method === 'user')).frame.params).toEqual({ you: { user_id: userId, name: `Name of ${userId}`, roles: ['friend'] } });
-		expect((await until(mate, (frame) => frame.method === 'user' && frame.params.new?.user_id === userId)).frame.params.new.roles).toEqual(['friend']);
+		expect((await until(labeled, (frame) => frame.method === 'user' && frame.params.you !== undefined)).frame.params).toEqual({ you: { user_id: userId, name: `Name of ${userId}`, roles: ['friend'], status: 'online' } });
+		expect((await until(mate, (frame) => frame.method === 'user' && frame.params.new?.user_id === userId && frame.params.new.roles !== undefined)).frame.params.new.roles).toEqual(['friend']);
 		// A label grants nothing.
 		expect((await command(labeled, 'status-label', '/status')).frame.error.code).toBe(-32001);
 
@@ -614,7 +633,7 @@ it('/role shows a user\'s roles and toggles one, any name a label, admin also th
 		// Toggling a held role takes it away.
 		expect((await command(admin, 'take', `/role ${userId} friend`)).notice!.params.body.text).toBe(`${who} no longer has the role \`friend\`.`);
 		await command(admin, 'take-admin', `/role ${userId} admin`);
-		const cleared = await until(labeled, (frame) => frame.method === 'user' && frame.params.you.roles.length === 0);
+		const cleared = await until(labeled, (frame) => frame.method === 'user' && frame.params.you?.roles?.length === 0);
 		expect(cleared.frame.params.you.roles).toEqual([]);
 		expect((await command(labeled, 'status-after', '/status')).frame.error.code).toBe(-32001);
 
@@ -622,10 +641,13 @@ it('/role shows a user\'s roles and toggles one, any name a label, admin also th
 			['bad-name', `/role ${userId} no!pe`],
 			['guest', '/role guest_1 friend'],
 			['unknown', '/role nobody_123 friend'],
-			['builtin-admin', '/role admin admin'],
-			['builtin-bot', '/role admin bot'],
 		]) {
 			expect((await command(admin, `role-${id}`, text)).frame.error.code).toBe(-32602);
+		}
+		// Role changes the server never allows are denied (§1.1): the admin user
+		// stays an admin, and an admin can't be a bot.
+		for (const [id, text] of [['builtin-admin', '/role admin admin'], ['builtin-bot', '/role admin bot']]) {
+			expect((await command(admin, `role-${id}`, text)).frame.error.code).toBe(-32001);
 		}
 		expect((await command(admin, 'usage', '/role')).frame.error.message).toBe('Usage: /role <user_id> [<role>]');
 		expect((await command(labeled, 'denied', `/role ${userId} friend`)).frame.error.message).toMatch(/Only an admin/);
@@ -646,24 +668,25 @@ it('/role <user_id> bot makes a token user a bot in full, but not a passkey hold
 		expect((await request(bot, 'auth', 'auth', { scheme: 'token', token })).result.you.roles).toEqual([]);
 
 		expect((await command(admin, 'make-bot', `/role ${userId} bot`)).notice!.params.body.text).toMatch(/now has the role `bot`/);
-		expect((await until(bot, (frame) => frame.method === 'user')).frame.params.you.roles).toEqual(['bot']);
+		expect((await until(bot, (frame) => frame.method === 'user' && frame.params.you !== undefined)).frame.params.you.roles).toEqual(['bot']);
 		// It acts as a bot: no passkey, no commands for owners, a fixed name and user_id, and never an admin.
 		expect((await command(bot, 'invite-bot', '/invite-bot')).frame.error.message).toBe("A bot can't use /invite-bot");
 		expect((await request(bot, 'rename-self', 'me', { name: 'Other' })).error.code).toBe(-32001);
-		expect((await request(bot, 'passkey', 'auth', { scheme: 'webauthn', action: 'register', step: 'begin' })).error.code).toBe(-32001);
+		// Its connection has no Origin, so passkeys are not offered to it at all: unsupported (§3.2).
+		expect((await request(bot, 'passkey', 'auth', { scheme: 'webauthn', action: 'register', step: 'begin' })).error.code).toBe(-32601);
 		expect((await command(admin, 'bot-admin', `/admin ${userId}`)).frame.error.message).toBe("A bot can't be an admin");
 		expect((await command(admin, 'bot-rename', `/rename ${userId} ${unique('moved')}`)).frame.error.message).toBe("A bot's user_id is fixed");
 		const posted = await exchange(bot, 'post', 'message', { room_id: 'general', body: { text: 'beep' } });
 		expect(posted.frame.result.message_id).toBeDefined();
 
 		// A user who holds a passkey, or an admin, can't be made a bot.
-		expect((await command(admin, 'passkey-bot', `/role ${passkeyId} bot`)).frame.error.code).toBe(-32602);
+		expect((await command(admin, 'passkey-bot', `/role ${passkeyId} bot`)).frame.error.code).toBe(-32001);
 		await command(admin, 'invite-2', `/invite-token ${unique('second')}`);
 		const adminId = unique('boss');
 		await command(admin, 'invite-3', `/invite-token ${adminId}`);
 		await command(admin, 'boss', `/admin ${adminId}`);
-		expect((await command(admin, 'admin-bot', `/role ${adminId} bot`)).frame.error.code).toBe(-32602);
-		// An owner's bot is always one.
+		expect((await command(admin, 'admin-bot', `/role ${adminId} bot`)).frame.error.code).toBe(-32001);
+		// An owner's bot is always one (an unknown bot_ user_id is still invalid_params).
 		expect((await command(admin, 'owner-bot', '/role bot_nobody bot')).frame.error.code).toBe(-32602);
 
 		// Taking the role away makes it an ordinary user again.

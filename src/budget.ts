@@ -103,6 +103,19 @@ export interface Limits {
 	 * the latest number closer to the count of guests.
 	 */
 	guestNumberBlock: number;
+	/**
+	 * User `status` shown to others (protocol §4.5): a user's announced
+	 * status changes at most once in this many seconds; changes in between
+	 * wait, and the latest one wins. Also bounds how long a member listing
+	 * may be reused.
+	 */
+	statusCoalesceSeconds: number;
+	/**
+	 * How long a change caused by a closed connection (a user going offline,
+	 * or idle when their attended tab closes) waits before it is announced, so
+	 * a reload or a mobile reconnect within it shows nothing.
+	 */
+	offlineGraceSeconds: number;
 	sqlWritesPerDay: number;
 	sqlReadsPerDay: number;
 	foregroundWritesPerDay: number;
@@ -125,7 +138,7 @@ export interface Limits {
 	maxChallengeBytes: number;
 }
 
-export interface AdmissionBudget {
+interface AdmissionBudget {
 	requestsPerIpMinute: number;
 	workerWindowSeconds: number;
 	edgeRequestsPerIpWindow: number;
@@ -134,7 +147,7 @@ export interface AdmissionBudget {
 }
 
 /** A plan's included usage per UTC day, which the account-usage stop compares against. */
-export interface AccountAllowance {
+interface AccountAllowance {
 	daily: Readonly<{
 		workerRequests: number;
 		durableObjectRequests: number;
@@ -159,13 +172,13 @@ export interface AccountAllowance {
 	r2?: Readonly<R2Allowance>;
 }
 
-export interface R2Allowance {
+interface R2Allowance {
 	classAOperationsMonthly: number;
 	classBOperationsMonthly: number;
 	storedBytes: number;
 }
 
-export interface MonthlyAllowance {
+interface MonthlyAllowance {
 	workerRequests: number;
 	workerCpuMs: number;
 	durableObjectRequests: number;
@@ -175,17 +188,23 @@ export interface MonthlyAllowance {
 	logEvents: number;
 }
 
-/** Defaults for the feature switches; `ACTIVITY` and `GUEST_POSTING` override them. */
+/** Defaults for the feature switches; `ACTIVITY`, `GUEST_POSTING` and `PRESENCE` override them. */
 export interface Features {
 	activity: boolean;
 	guestPosting: boolean;
+	/**
+	 * User `status` shown to others (§4.5): connected users' from their
+	 * connection attachments, and listed members' from the `status` they
+	 * chose. Needs push, like capability `status`.
+	 */
+	presence: boolean;
 }
 
 /**
  * The edge stop for a plan that bills past its included usage. The Worker
  * trips it on a flood; the budget guard holds and lifts it.
  */
-export interface EdgeStop {
+interface EdgeStop {
 	/** Requests one Cloudflare location may pass to the Worker in a minute before the Worker trips the stop. */
 	floodRequestsPerColoMinute: number;
 	/** The Worker counts one request in this many, chosen at random, against that limit. */
@@ -195,7 +214,7 @@ export interface EdgeStop {
 }
 
 /**
- * Uploads (protocol §4.6.3, cap `embed:upload`): images registered users
+ * Uploads (protocol §4.8.3, cap `embed:upload`): images registered users
  * attach to messages or set as avatars, stored in R2 and served from its
  * public bucket domain.
  */
@@ -222,6 +241,49 @@ export interface UploadPolicy {
 	storedBytesCap: number;
 }
 
+/**
+ * Web Push (protocol §4.9, push kind `webpush`): a message that mentions a
+ * registered user, or replies to their message, wakes them through their
+ * browsers' push services when none of their connections is attended and
+ * neither a mute nor a `dnd` status silences them (§4.5 `status`).
+ */
+export interface PushPolicy {
+	/** Pushes the whole server sends a UTC day, one per subscription woken. */
+	pushesPerDay: number;
+	/**
+	 * Users one message may wake, counting only those with live
+	 * subscriptions; users past them are not pushed.
+	 */
+	wakesPerMessage: number;
+	/**
+	 * Pushes one sender's messages may get delivered a UTC day, counting only
+	 * those the push service accepted (2xx), so a sender pays for real pushes.
+	 */
+	pushesPerSenderDay: number;
+	/** Pushes one user may receive a UTC day, from all senders together. */
+	pushesPerRecipientDay: number;
+	/**
+	 * `status` `mute` and `me` `status` changes one user may make a minute,
+	 * together, across their connections and reconnects; past it, a `status`
+	 * request with `mute` and a `me` with a changed `status` are
+	 * `retry_after`, and nothing changes.
+	 */
+	mutesPerUserMinute: number;
+	/**
+	 * After a user is woken for a room, further messages in that room wake
+	 * them again only once this long has passed.
+	 */
+	coalesceSeconds: number;
+	/** Subscriptions one user may hold; another replaces the least recently registered. */
+	subscriptionsPerUser: number;
+	/** A subscription not registered again for this long is skipped, then deleted by cleanup. */
+	pushExpiryDays: number;
+	/** `push_register` requests one user may send a minute, across their connections and reconnects. */
+	registersPerUserMinute: number;
+	/** How long a push service keeps a push for an offline browser (the `TTL` header). */
+	ttlSeconds: number;
+}
+
 export interface Plan {
 	name: string;
 	limits: Readonly<Limits>;
@@ -230,6 +292,7 @@ export interface Plan {
 	features: Readonly<Features>;
 	edgeStop?: Readonly<EdgeStop>;
 	uploads?: Readonly<UploadPolicy>;
+	push?: Readonly<PushPolicy>;
 }
 
 // Match the account's Workers plan. To switch back to Free, import FREE_PLAN
@@ -239,6 +302,7 @@ export const PLAN: Plan = PAID_PLAN;
 export const DEFAULT_LIMITS: Readonly<Limits> = PLAN.limits;
 export const DEFAULT_FEATURES: Readonly<Features> = PLAN.features;
 export const UPLOAD_POLICY: Readonly<UploadPolicy> | undefined = PLAN.uploads;
+export const PUSH_POLICY: Readonly<PushPolicy> | undefined = PLAN.push;
 
 // Calibrated implementation bounds remain explicit: raising a payload or parser
 // bound requires rechecking its consumers. Resource ceilings below instead use
@@ -285,9 +349,26 @@ export const MAX_FRAME_LEASE = 20;
 // listing's reads and response by the thread ceiling (listings past the
 // response cap leave members out).
 export const MAX_ROOM_LIST_MEMBERS = 200;
+// Status changes wait at most this long (coalescing, offline grace), so what
+// others see is never more than about a minute behind.
+export const MAX_STATUS_DELAY_SECONDS = 60;
+// `status` `idle` changes one connection may make a minute (protocol §4.5
+// allows rate limiting `status`); past it, `retry_after` and nothing
+// changes. A client sends one when attention starts or ends, so a few a
+// minute is plenty; the cap keeps a flipping client from making the object
+// re-derive and announce its user's status at frame rate. Counted in memory
+// by connection, with no SQL; a repeat of the current value is not a change
+// and is not counted.
+export const IDLE_CHANGES_PER_CONNECTION_MINUTE = 12;
 // A guest-number block is one durable write, spent whether or not the object
 // hands its numbers out before it sleeps; this bounds how fast numbers climb.
 export const MAX_GUEST_NUMBER_BLOCK = 10_000;
+// One message's wake sends a push per subscription of each user it wakes,
+// each an outbound request from the one Durable Object invocation.
+export const MAX_PUSHES_PER_MESSAGE = 64;
+// Mentioned users one message's wake looks up subscriptions for, each one
+// bounded index read, before it stops looking for users to wake.
+export const MAX_PUSH_CANDIDATES = 32;
 export const MAX_SQL_WRITES = DEFAULT_LIMITS.sqlWritesPerDay;
 export const MAX_SQL_READS = DEFAULT_LIMITS.sqlReadsPerDay;
 export const MAX_DATABASE_HIGH_WATER_BYTES = DEFAULT_LIMITS.databaseHighWaterBytes;

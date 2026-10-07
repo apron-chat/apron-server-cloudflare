@@ -1,0 +1,1415 @@
+import { env, runInDurableObject } from 'cloudflare:test';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { IDLE_CHANGES_PER_CONNECTION_MINUTE, PUSH_POLICY } from '../src/budget';
+import { pushPayload } from '../src/index';
+import { MAX_MUTE_SECONDS, MAX_ROOM_MUTES_PER_USER, MUTE_FOREVER, WAKE_SCOPES, type Store } from '../src/store';
+
+const integer = (value: unknown) => Number(value);
+import { connect as open, exchange, request, status, type Frame, type Peer } from './helpers/socket';
+import { pushSubscriptionsOf, withStore, type StoredPushSubscription, type TestClock } from './helpers/store';
+import { decryptPush, testBrowser, type TestBrowser } from './helpers/webpush';
+
+let nextIp = 1;
+const stub = () => env.DEMO.getByName('public-demo-v1');
+const connect = () => open({ ip: `203.0.113.${nextIp++}` });
+const unique = (prefix: string) => `${prefix}_${crypto.randomUUID().slice(0, 8)}`;
+const POLICY = PUSH_POLICY!;
+
+type Runtime = {
+	store: Store;
+	issueSession(userId: string, origin: string, now: number): Promise<string>;
+	config: { activityEnabled: boolean; push?: unknown };
+};
+
+/** Registers a passkey user straight into the store. */
+async function register(userId: string): Promise<void> {
+	await runInDurableObject(stub(), (instance) => {
+		(instance as unknown as Runtime).store.registerIdentity({
+			userId, name: `Name of ${userId}`, userHandle: `handle-${userId}`, now: Date.now(), ipKey: `ip-${userId}`,
+			credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
+		});
+	});
+}
+
+/** A new connection signed in as a registered user (registered here unless `existing`). */
+async function signedIn(userId: string, existing = false): Promise<Peer> {
+	if (!existing) await register(userId);
+	const token = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).issueSession(userId, 'http://localhost:5173', Date.now()));
+	const peer = await connect();
+	await peer.next();
+	expect((await request(peer, 'auth', 'auth', { scheme: 'token', token })).result.you.user_id).toBe(userId);
+	return peer;
+}
+
+/** A browser subscription for `push.example.net`, registered over `peer`. */
+async function subscribe(peer: Peer, name: string, pushId?: string, wake?: unknown): Promise<{ url: string; browser: TestBrowser }> {
+	const browser = await testBrowser();
+	const url = `https://push.example.net/send/${name}-${crypto.randomUUID()}`;
+	const reply = await request(peer, `subscribe-${name}`, 'push_register', { kind: 'webpush', url, keys: { p256dh: browser.p256dh, auth: browser.auth }, ...(pushId !== undefined ? { push_id: pushId } : {}), ...(wake !== undefined ? { wake } : {}) });
+	expect(reply.result).toEqual({});
+	return { url, browser };
+}
+
+/** A fresh `id` for a `status` request whose reply the test reads, if at all, among other frames. */
+const statusId = () => `status-${crypto.randomUUID()}`;
+
+/** Sends a `status` request with `idle`, applied once it replies `{}`. */
+async function setIdle(peer: Peer, idle: boolean): Promise<void> {
+	expect((await status(peer, { idle })).frame.result).toEqual({});
+}
+
+/** Each live connection's `idle`, for one user. */
+function idleOf(userId: string): Promise<boolean[]> {
+	return runInDurableObject(stub(), (_instance, state) => state.getWebSockets()
+		.map((socket) => socket.deserializeAttachment() as { userId?: string; idle?: boolean; closing?: boolean })
+		.filter((attachment) => attachment.userId === userId && !attachment.closing)
+		.map((attachment) => attachment.idle === true));
+}
+
+function subscriptionsOf(userId: string): Promise<StoredPushSubscription[]> {
+	return runInDurableObject(stub(), (_instance, state) => pushSubscriptionsOf(state, userId));
+}
+
+type Push = { url: string; headers: Headers; body: Uint8Array };
+
+/** Captures every outbound fetch the object makes, answering with `status(url)`. */
+function capturePushes(status: (url: string) => number = () => 201) {
+	const pushes: Push[] = [];
+	vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+		const request = new Request(input as RequestInfo, init as RequestInit);
+		const url = request.url;
+		pushes.push({ url, headers: request.headers, body: new Uint8Array(await request.arrayBuffer()) });
+		return new Response(null, { status: status(url) });
+	});
+	return pushes;
+}
+
+async function post(peer: Peer, id: string, params: Record<string, unknown>): Promise<Frame> {
+	const reply = await request(peer, id, 'message', params);
+	expect(reply.error).toBeUndefined();
+	return reply;
+}
+
+afterEach(() => { vi.restoreAllMocks(); });
+
+describe('push over the socket', () => {
+	it('advertises webpush with the VAPID public key', async () => {
+		const peer = await connect();
+		try {
+			const server = await peer.next();
+			expect(server.params.push).toEqual({ webpush: { key: env.VAPID_PUBLIC_KEY }, wake: ['mentions', 'replies'] });
+		} finally { peer.close(); }
+	});
+
+	it('takes registrations from registered users only, with a public https endpoint and valid keys', async () => {
+		const guest = await connect();
+		try {
+			await guest.next();
+			await request(guest, 'auth', 'auth', { scheme: 'guest' });
+			const browser = await testBrowser();
+			const denied = await request(guest, 'register', 'push_register', { kind: 'webpush', url: 'https://push.example.net/x', keys: { p256dh: browser.p256dh, auth: browser.auth } });
+			expect(denied.error.code).toBe(-32001);
+			expect((await request(guest, 'unregister', 'push_unregister', { url: 'https://push.example.net/x' })).error.code).toBe(-32001);
+		} finally { guest.close(); }
+
+		const browser = await testBrowser();
+		const keys = { p256dh: browser.p256dh, auth: browser.auth };
+		const offCurve = (() => {
+			const bytes = Uint8Array.from(atob(browser.p256dh.replaceAll('-', '+').replaceAll('_', '/') + '='), (c) => c.charCodeAt(0));
+			bytes[64] ^= 1;
+			return btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+		})();
+		const cases: Array<[string, Record<string, unknown>]> = [
+			['an unknown kind', { kind: 'relay', url: 'https://push.example.net/x', token: 't' }],
+			['plain http', { kind: 'webpush', url: 'http://push.example.net/x', keys }],
+			['an IPv4 literal', { kind: 'webpush', url: 'https://10.0.0.1/x', keys }],
+			['an IPv4 spelled as a number', { kind: 'webpush', url: 'https://2130706433/x', keys }],
+			['an IPv6 literal', { kind: 'webpush', url: 'https://[::1]/x', keys }],
+			['localhost', { kind: 'webpush', url: 'https://push.localhost/x', keys }],
+			['a single-label host', { kind: 'webpush', url: 'https://metadata/x', keys }],
+			['an internal suffix', { kind: 'webpush', url: 'https://push.corp.internal/x', keys }],
+			['a port', { kind: 'webpush', url: 'https://push.example.net:8443/x', keys }],
+			['credentials', { kind: 'webpush', url: 'https://user:pw@push.example.net/x', keys }],
+			['a long url', { kind: 'webpush', url: `https://push.example.net/${'x'.repeat(1024)}`, keys }],
+			['no keys', { kind: 'webpush', url: 'https://push.example.net/x' }],
+			['a short p256dh', { kind: 'webpush', url: 'https://push.example.net/x', keys: { ...keys, p256dh: keys.p256dh.slice(0, 40) } }],
+			['a p256dh off the curve', { kind: 'webpush', url: 'https://push.example.net/x', keys: { ...keys, p256dh: offCurve } }],
+			['a long auth', { kind: 'webpush', url: 'https://push.example.net/x', keys: { ...keys, auth: `${keys.auth}AAAA` } }],
+			['a non-base64url auth', { kind: 'webpush', url: 'https://push.example.net/x', keys: { ...keys, auth: 'a+b/c'.repeat(4) } }],
+			['a push service not in PUSH_HOSTS', { kind: 'webpush', url: 'https://push.other.example/x', keys }],
+			['a push_id past 64 characters', { kind: 'webpush', url: 'https://push.example.net/x', keys, push_id: 'x'.repeat(65) }],
+			['an empty push_id', { kind: 'webpush', url: 'https://push.example.net/x', keys, push_id: '' }],
+			['a push_id with other characters', { kind: 'webpush', url: 'https://push.example.net/x', keys, push_id: 'é' }],
+			['a push_id that is not a string', { kind: 'webpush', url: 'https://push.example.net/x', keys, push_id: 7 }],
+			['a wake that is not an array', { kind: 'webpush', url: 'https://push.example.net/x', keys, wake: 'mentions' }],
+			['a wake entry that is not a string', { kind: 'webpush', url: 'https://push.example.net/x', keys, wake: ['mentions', 2] }],
+			['a wake past 16 entries', { kind: 'webpush', url: 'https://push.example.net/x', keys, wake: Array.from({ length: 17 }, (_, index) => `ext:s${index}`) }],
+			['a wake entry past 64 characters', { kind: 'webpush', url: 'https://push.example.net/x', keys, wake: ['x'.repeat(65)] }],
+		];
+		// Two bad requests per connection, below the repeated-violation close.
+		for (let index = 0; index < cases.length; index += 2) {
+			const peer = await signedIn(unique('vera'));
+			try {
+				for (const [label, params] of cases.slice(index, index + 2)) {
+					const reply = await request(peer, `bad-${index}`, 'push_register', params);
+					// Sizes are too_large and the server's count limit denied (§1.1); the rest invalid_params.
+					const code = ['a long url', 'a wake entry past 64 characters'].includes(label) ? -32003 : label === 'a wake past 16 entries' ? -32001 : -32602;
+					expect(reply.error?.code, label).toBe(code);
+					if (label.includes('PUSH_HOSTS')) expect(reply.error.message).toBe('push service not allowed here');
+				}
+			} finally { peer.close(); }
+		}
+
+		const userId = unique('rosa');
+		const peer = await signedIn(userId);
+		try {
+			const pushId = `A-z_0${'9'.repeat(59)}`;
+			const { url } = await subscribe(peer, 'rosa', pushId);
+			// Without `wake`, a registration wakes for mentions and replies.
+			expect((await subscriptionsOf(userId)).map((row) => [row.url, row.pushId, row.wake])).toEqual([[url, pushId, ['mentions', 'replies']]]);
+			// Unknown scopes are ignored, and a changed wake is written at once.
+			await request(peer, 'wake-scopes', 'push_register', { kind: 'webpush', url, push_id: pushId, keys: (await subscriptionsOf(userId)).map((row) => ({ p256dh: row.p256dh, auth: row.auth }))[0], wake: ['replies', 'private', 'ext:x'] });
+			expect((await subscriptionsOf(userId))[0].wake).toEqual(['replies']);
+			// Unregistering removes it; an unknown url is already gone.
+			expect((await request(peer, 'unregister', 'push_unregister', { url })).result).toEqual({});
+			expect((await request(peer, 'unregister-again', 'push_unregister', { url })).result).toEqual({});
+			// A url too long to have been registered is unknown too: it succeeds, reading nothing (§4.9).
+			const long = `https://push.example.net/${'x'.repeat(600)}`;
+			const removed = await runInDurableObject(stub(), (instance) => {
+				const runtime = instance as unknown as Runtime;
+				const spy = vi.spyOn(runtime.store, 'removePushSubscription');
+				return { spy, restore: () => spy.mockRestore() };
+			});
+			try {
+				expect((await request(peer, 'unregister-long', 'push_unregister', { url: long })).result).toEqual({});
+				expect(removed.spy).not.toHaveBeenCalled();
+			} finally { removed.restore(); }
+			// A missing url is still invalid.
+			expect((await request(peer, 'unregister-none', 'push_unregister', {})).error.code).toBe(-32602);
+			expect(await subscriptionsOf(userId)).toEqual([]);
+		} finally { peer.close(); }
+	}, 20_000);
+
+	it('tracks status idle per connection: only idle false ends it', async () => {
+		const userId = unique('aldo');
+		const peer = await signedIn(userId);
+		const other = await signedIn(userId, true);
+		try {
+			expect(await idleOf(userId)).toEqual([false, false]);
+			await setIdle(peer, true);
+			expect((await idleOf(userId)).sort()).toEqual([false, true]);
+			// `status` is a request (§4.5): sent without an `id`, it is a
+			// notification this server does not define, so it is ignored (§1):
+			// no reply, and nothing changes.
+			peer.send({ method: 'status', params: { idle: false } });
+			const ignored = await exchange(peer, 'sync-notification', 'me', {});
+			expect(ignored.skipped).toEqual([]);
+			expect((await idleOf(userId)).sort()).toEqual([false, true]);
+			// Sent with an `id`, it is applied, then answered with `{}`.
+			const answered = await exchange(peer, 'idle-request', 'status', { idle: false });
+			expect(answered.frame).toEqual({ id: 'idle-request', result: {} });
+			expect(answered.skipped).toEqual([]);
+			expect(await idleOf(userId)).toEqual([false, false]);
+			await setIdle(peer, true);
+			// `room_id` scopes only `mute`: without one it is invalid_params, and
+			// nothing in the request changes, `idle` included (§4.5).
+			expect((await request(peer, 'scoped', 'status', { room_id: 'general', idle: false })).error.code).toBe(-32602);
+			expect((await idleOf(userId)).sort()).toEqual([false, true]);
+			// Neither a history page nor a message ends it (§4.5): only idle false.
+			await request(peer, 'history', 'history', { room_id: 'general' });
+			await post(peer, 'still-idle', { body: { text: 'posted while idle' } });
+			expect((await idleOf(userId)).sort()).toEqual([false, true]);
+			await setIdle(peer, false);
+			expect(await idleOf(userId)).toEqual([false, false]);
+			// A malformed idle is invalid_params and changes nothing; unknown
+			// fields are ignored. Two violations leave the connection open.
+			await setIdle(other, true);
+			for (const params of [{ idle: 'false' }, { idle: null }]) {
+				expect((await request(other, `bad-${JSON.stringify(params)}`, 'status', params)).error.code, JSON.stringify(params)).toBe(-32602);
+				expect((await idleOf(userId)).sort(), JSON.stringify(params)).toEqual([false, true]);
+			}
+			expect((await request(other, 'unknown-fields', 'status', { other: 1, extra: 'x' })).result).toEqual({});
+			expect((await idleOf(userId)).sort()).toEqual([false, true]);
+			expect(other.closed()).toBeUndefined();
+			// A `room_id` without `mute` is invalid_params whatever it names, and
+			// changes nothing (§4.5); on a third connection, since each is a
+			// policy violation.
+			const third = await signedIn(userId, true);
+			try {
+				for (const params of [{ room_id: 'x'.repeat(65), idle: true }, { room_id: 7 }]) {
+					expect((await request(third, `room-without-mute-${JSON.stringify(params)}`, 'status', params)).error.code, JSON.stringify(params)).toBe(-32602);
+				}
+				expect((await idleOf(userId)).sort()).toEqual([false, false, true]);
+			} finally { third.close(); }
+		} finally { peer.close(); other.close(); }
+	});
+
+	it('ignores status without push, and activity does not set or end idle', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId, carolId] = [unique('alice'), unique('bob'), unique('carol')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		const carol = await signedIn(carolId);
+		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).config.activityEnabled = true; });
+		try {
+			await subscribe(bob, 'bob');
+			const carolSub = await subscribe(carol, 'carol');
+			// Activity is not status: Bob's typing leaves him attended.
+			bob.send({ method: 'activity', params: { typing: 5 } });
+			await request(bob, 'sync-activity', 'me', {});
+			expect(await idleOf(bobId)).toEqual([false]);
+			// Nor do typing or a read cursor end idle.
+			await setIdle(carol, true);
+			carol.send({ method: 'activity', params: { room_id: 'general', typing: 2 } });
+			carol.send({ method: 'activity', params: { room_id: 'general', read_message_id: '1' } });
+			expect(await idleOf(carolId)).toEqual([true]);
+			await post(alice, 'mention', { body: { text: 'hi', mentions: [bobId, carolId] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(pushes[0].url).toBe(carolSub.url);
+
+			// Without push, status is an unknown method: unsupported, and nothing changes.
+			const saved = await runInDurableObject(stub(), (instance) => {
+				const runtime = instance as unknown as Runtime;
+				const push = runtime.config.push;
+				runtime.config = { ...runtime.config, push: undefined };
+				return push;
+			});
+			try {
+				expect((await status(bob, { idle: true })).frame.error.code).toBe(-32601);
+				expect(await idleOf(bobId)).toEqual([false]);
+			} finally {
+				await runInDurableObject(stub(), (instance) => {
+					const runtime = instance as unknown as Runtime;
+					runtime.config = { ...runtime.config, push: saved };
+				});
+			}
+		} finally {
+			alice.close(); bob.close(); carol.close();
+			await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).config.activityEnabled = false; });
+		}
+	});
+
+	it('wakes mentioned users whose every connection is idle or gone, with the message in the push', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId, carolId, daveId] = [unique('alice'), unique('bob'), unique('carol'), unique('dave')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		const carol = await signedIn(carolId);
+		const dave = await signedIn(daveId);
+		try {
+			const bobSub = await subscribe(bob, 'bob');
+			const carolSub = await subscribe(carol, 'carol', 'carol-phone');
+			const daveSub = await subscribe(dave, 'dave');
+			// Alice's own subscription is never woken by her own mention.
+			await subscribe(alice, 'alice');
+			// Carol is idle; Bob is attended; Dave has gone.
+			await setIdle(carol, true);
+			dave.close();
+			await vi.waitFor(async () => expect(await idleOf(daveId)).toEqual([]), { timeout: 5_000 });
+
+			const long = 'é'.repeat(250);
+			const first = await post(alice, 'first', { room_id: 'general', body: { text: long, format: 'markdown', mentions: [bobId, carolId, aliceId, daveId, 'guest_1'], embeds: [{ kind: 'link', url: 'https://example.com' }] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(2), { timeout: 5_000 });
+			expect(pushes.map((push) => push.url).sort()).toEqual([carolSub.url, daveSub.url].sort());
+			const carolPush = pushes.find((push) => push.url === carolSub.url)!;
+			expect(carolPush.headers.get('authorization')).toMatch(new RegExp(`^vapid t=[\\w-]+\\.[\\w-]+\\.[\\w-]+, k=${env.VAPID_PUBLIC_KEY}$`));
+			expect(carolPush.headers.get('content-encoding')).toBe('aes128gcm');
+			expect(carolPush.headers.get('ttl')).toBe(String(POLICY.ttlSeconds));
+			expect(carolPush.headers.get('urgency')).toBe('high');
+			// The envelope: the registration's push_id, no unread, and the message
+			// without log_id, format or embeds, its text cut to 200 code points.
+			const payload = JSON.parse((await decryptPush(carolPush.body, carolSub.browser)).plaintext);
+			expect(payload).toEqual({
+				push_id: 'carol-phone',
+				message: {
+					message_id: first.result.message_id, room_id: 'general', from: { user_id: aliceId, name: `Name of ${aliceId}` },
+					body: { text: `${'é'.repeat(199)}…`, mentions: [bobId, carolId, aliceId, daveId, 'guest_1'] },
+				},
+			});
+			// Dave registered without a push_id: his envelope has only the message.
+			const davePush = pushes.find((push) => push.url === daveSub.url)!;
+			const davePayload = JSON.parse((await decryptPush(davePush.body, daveSub.browser)).plaintext);
+			expect(Object.keys(davePayload)).toEqual(['message']);
+			expect(davePayload.message.message_id).toBe(first.result.message_id);
+
+			// Edits, retries, and commands wake no one. Carol is attended again.
+			pushes.length = 0;
+			await post(alice, 'edit', { message_id: first.result.message_id, body: { text: 'edited', mentions: [carolId] } });
+			await post(alice, 'first', { room_id: 'general', body: { text: long, format: 'markdown', mentions: [bobId, carolId, aliceId, daveId, 'guest_1'], embeds: [{ kind: 'link', url: 'https://example.com' }] } });
+			await request(alice, 'command', 'command', { body: { text: '/help', mentions: [carolId] } });
+			await setIdle(carol, false);
+			// Bob goes idle: the next mention wakes him, not Carol.
+			await setIdle(bob, true);
+			await post(alice, 'second', { body: { text: 'ping', mentions: [carolId, bobId] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(pushes[0].url).toBe(bobSub.url);
+			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.body).toEqual({ text: 'ping', mentions: [carolId, bobId] });
+		} finally { alice.close(); bob.close(); carol.close(); dave.close(); }
+	});
+
+	it('falls back last to message_id, room_id and from.user_id, within 2048 bytes (B12)', () => {
+		const bytes = (text: string) => new TextEncoder().encode(text).byteLength;
+		const message = {
+			message_id: 'm'.repeat(64), log_id: '1', room_id: 'r'.repeat(64),
+			from: { user_id: 'u'.repeat(64), name: 'n'.repeat(3_000) },
+			body: { text: 'hello', mentions: ['a'] },
+			reply_to: { message_id: 'x'.repeat(64) },
+		};
+		// Even `from` cut to its `user_id` and `name` does not fit: only what names the message is left.
+		const minimal = pushPayload(message as never, 'p'.repeat(64));
+		expect(bytes(minimal)).toBeLessThanOrEqual(2048);
+		expect(JSON.parse(minimal)).toEqual({ push_id: 'p'.repeat(64), message: { message_id: message.message_id, room_id: message.room_id, from: { user_id: message.from.user_id } } });
+		// A long reply id alone forces it too.
+		const replying = pushPayload({ ...message, from: { user_id: 'u' }, reply_to: { message_id: 'x'.repeat(3_000) } } as never);
+		expect(JSON.parse(replying)).toEqual({ message: { message_id: message.message_id, room_id: message.room_id, from: { user_id: 'u' } } });
+		// Before that, the body goes first, keeping `from`'s name and the reply.
+		const bodyless = pushPayload({ ...message, from: { user_id: 'u', name: 'n'.repeat(1_200) }, body: { text: '😀'.repeat(200) } } as never);
+		expect(bytes(bodyless)).toBeLessThanOrEqual(2048);
+		expect(JSON.parse(bodyless).message).toEqual({ message_id: message.message_id, room_id: message.room_id, from: { user_id: 'u', name: 'n'.repeat(1_200) }, reply_to: message.reply_to });
+	});
+
+	it('keeps every payload within 2048 bytes, dropping mentions first', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId] = [unique('alice'), unique('bob')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		try {
+			const bobSub = await subscribe(bob, 'bob', 'p'.repeat(64));
+			await setIdle(bob, true);
+			// Far more mentions than fit one payload (§4.9).
+			const many = Array.from({ length: 60 }, (_, index) => `someone-${index}-${'x'.repeat(48)}`);
+			await post(alice, 'crowd', { room_id: 'general', body: { text: '"quoted"\\'.repeat(40), mentions: [bobId, ...many] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			const plaintext = (await decryptPush(pushes[0].body, bobSub.browser)).plaintext;
+			expect(new TextEncoder().encode(plaintext).byteLength).toBeLessThanOrEqual(2048);
+			const payload = JSON.parse(plaintext);
+			// The bound covers the whole envelope; the fallbacks apply inside `message`.
+			expect(payload.push_id).toBe('p'.repeat(64));
+			expect(Object.keys(payload)).toEqual(['push_id', 'message']);
+			expect(payload.message.body).not.toHaveProperty('mentions');
+			expect(payload.message.body.text).toMatch(/^"quoted"/);
+			expect(payload.message.from).toEqual({ user_id: aliceId, name: `Name of ${aliceId}` });
+		} finally { alice.close(); bob.close(); }
+	});
+
+	it('forgets a subscription its push service says is gone', async () => {
+		const pushes = capturePushes((url) => url.includes('/gone-') ? 410 : 201);
+		const [aliceId, erinId] = [unique('alice'), unique('erin')];
+		const alice = await signedIn(aliceId);
+		const erin = await signedIn(erinId);
+		let kept: string;
+		try {
+			const gone = await subscribe(erin, 'gone');
+			kept = (await subscribe(erin, 'kept')).url;
+			expect(await subscriptionsOf(erinId)).toHaveLength(2);
+			expect(gone.url).toContain('/gone-');
+		} finally { erin.close(); }
+		await vi.waitFor(async () => expect(await idleOf(erinId)).toEqual([]), { timeout: 5_000 });
+		try {
+			await post(alice, 'mention', { body: { text: 'hi', mentions: [erinId] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(2), { timeout: 5_000 });
+			await vi.waitFor(async () => expect((await subscriptionsOf(erinId)).map((row) => row.url)).toEqual([kept]), { timeout: 5_000 });
+		} finally { alice.close(); }
+	});
+
+	it('wakes at most wakesPerMessage users for one message', async () => {
+		const pushes = capturePushes();
+		const aliceId = unique('alice');
+		const alice = await signedIn(aliceId);
+		const mentioned = Array.from({ length: POLICY.wakesPerMessage + 2 }, (_, index) => unique(`m${index}`));
+		await runInDurableObject(stub(), async (instance) => {
+			const { store } = instance as unknown as Runtime;
+			for (const userId of mentioned) {
+				store.registerIdentity({
+					userId, name: userId, userHandle: `handle-${userId}`, now: Date.now(), ipKey: `ip-${userId}`,
+					credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
+				});
+				const browser = await testBrowser();
+				store.registerPushSubscription({ userId, url: `https://push.example.net/send/${userId}`, p256dh: browser.p256dh, auth: browser.auth });
+			}
+		});
+		try {
+			// Ten mentions with no registration first: they take no wake slots.
+			const unsubscribed = Array.from({ length: 10 }, (_, index) => unique(`none${index}`));
+			await post(alice, 'many', { body: { text: 'everyone', mentions: [...unsubscribed, ...mentioned] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(POLICY.wakesPerMessage), { timeout: 5_000 });
+			// In mention order: the last two are left out.
+			expect(pushes.map((push) => push.url).sort()).toEqual(mentioned.slice(0, POLICY.wakesPerMessage).map((userId) => `https://push.example.net/send/${userId}`).sort());
+		} finally { alice.close(); }
+	});
+});
+
+describe('wake scopes', () => {
+	/** A message by `userId` in general, straight into the store; its message_id. */
+	async function authored(userId: string, text: string): Promise<string> {
+		return runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.mutate({
+			userId, ipKey: `ip-${userId}`, method: 'message', now: Date.now(), identity: { user_id: userId }, params: { body: { text } },
+		}).result.message_id as string);
+	}
+
+	/** A registered user with one registration and no connection; their subscription url. */
+	async function gone(name: string, wake?: unknown): Promise<string> {
+		const userId = unique(name);
+		const peer = await signedIn(userId);
+		const { url } = await subscribe(peer, userId, undefined, wake);
+		peer.close();
+		await vi.waitFor(async () => expect(await idleOf(userId)).toEqual([]), { timeout: 5_000 });
+		return url;
+	}
+	const userOf = (url: string) => url.slice('https://push.example.net/send/'.length).replace(/-[0-9a-f-]{36}$/, '');
+
+	it('wakes each user only on registrations whose wake includes why they qualify', async () => {
+		const pushes = capturePushes();
+		const urls = {
+			mentionsOnlyMentioned: await gone('mm', ['mentions']),
+			mentionsOnlyRepliedTo: await gone('mr', ['mentions']),
+			repliesOnlyRepliedTo: await gone('rr', ['replies']),
+			repliesOnlyMentioned: await gone('rm', ['replies']),
+			nothing: await gone('none', []),
+			both: await gone('both'),
+			attended: '',
+			control: await gone('ctrl'),
+		};
+		const attendedId = unique('here');
+		const here = await signedIn(attendedId);
+		urls.attended = (await subscribe(here, attendedId)).url;
+		const senderId = unique('sender');
+		const sender = await signedIn(senderId);
+		try {
+			const user = (key: keyof typeof urls) => userOf(urls[key]);
+			const reply = async (id: string, key: keyof typeof urls, mentions: string[] = []) => post(sender, id, {
+				body: { text: `re ${id}`, ...(mentions.length ? { mentions } : {}) }, reply_to: { message_id: await authored(user(key), `by ${key}`) },
+			});
+			await post(sender, 'm1', { body: { text: 'hi', mentions: [user('mentionsOnlyMentioned'), user('repliesOnlyMentioned')] } });
+			await reply('r1', 'mentionsOnlyRepliedTo');
+			await reply('r2', 'repliesOnlyRepliedTo');
+			await reply('r3', 'nothing', [user('nothing')]);
+			// Mentioned and replied to in one message: pushed once.
+			await reply('r4', 'both', [user('both')]);
+			// An attended author is not woken by a reply.
+			await reply('r5', 'attended');
+			await vi.waitFor(() => expect(pushes.map((push) => push.url).sort()).toEqual([urls.mentionsOnlyMentioned, urls.repliesOnlyRepliedTo, urls.both].sort()), { timeout: 5_000 });
+			// Replying to one's own message wakes no one: the sender is never a candidate.
+			await runInDurableObject(stub(), async (instance) => {
+				const runtime = instance as unknown as { wakeFor(message: unknown): void };
+				const own = await authored(user('control'), 'mine');
+				runtime.wakeFor({ message_id: '1', room_id: 'general', from: { user_id: user('control') }, reply_to: { message_id: own }, body: { text: 'me again', mentions: [user('control')] } });
+			});
+			await post(sender, 'control', { body: { text: 'control' }, reply_to: { message_id: await authored(user('control'), 'control') } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(4), { timeout: 5_000 });
+			expect(pushes[3].url).toBe(urls.control);
+			expect(pushes.filter((push) => push.url === urls.control)).toHaveLength(1);
+		} finally { sender.close(); here.close(); }
+	});
+});
+
+describe('status mute', () => {
+	/** Frames this peer receives until a reply to a `me` request, so earlier notifications are all in. */
+	async function drainTo(peer: Peer, id: string): Promise<Frame[]> {
+		return (await exchange(peer, id, 'me', {})).skipped;
+	}
+	/** The mutes the server sent: `status` notifications' params. */
+	const mutesOf = (frames: Frame[]) => frames.filter((frame) => frame.method === 'status').map((frame) => frame.params);
+
+	it('mutes a user\'s pushes for seconds or until changed, sending each change to all their connections', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId] = [unique('alice'), unique('bob')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		const bobToo = await signedIn(bobId, true);
+		try {
+			const bobSub = await subscribe(bob, 'bob');
+			await setIdle(bob, true);
+			await setIdle(bobToo, true);
+			bob.send({ id: statusId(), method: 'status', params: { mute: 3600 } });
+			// Every connection of Bob's hears it as `status`, the one that set it included; never anyone else.
+			for (const [peer, id] of [[bobToo, 'sync-too'], [bob, 'sync-bob']] as const) {
+				const echoed = mutesOf(await drainTo(peer, id));
+				expect(echoed).toHaveLength(1);
+				expect(Object.keys(echoed[0])).toEqual(['mute']);
+				expect(echoed[0].mute).toBeGreaterThan(3590);
+				expect(echoed[0].mute).toBeLessThanOrEqual(3600);
+			}
+			expect(mutesOf(await drainTo(alice, 'sync-alice'))).toEqual([]);
+			// The mute is never in a user object, `you` included.
+			expect((await request(bob, 'me', 'me', {})).result.you).not.toHaveProperty('mute');
+			// Muted: no push, and no wake slot taken.
+			await post(alice, 'muted', { body: { text: 'hi', mentions: [bobId] } });
+			// `true` mutes until changed.
+			bob.send({ id: statusId(), method: 'status', params: { mute: true } });
+			expect(mutesOf(await drainTo(bobToo, 'sync-true'))).toEqual([{ mute: true }]);
+			expect(mutesOf(await drainTo(bob, 'sync-true-bob'))).toEqual([{ mute: true }]);
+			await post(alice, 'muted-forever', { body: { text: 'hi', mentions: [bobId] } });
+			// `false` ends it, sent as `mute: false` to every connection.
+			bobToo.send({ id: statusId(), method: 'status', params: { mute: false } });
+			expect(mutesOf(await drainTo(bob, 'sync-zero'))).toEqual([{ mute: false }]);
+			expect(mutesOf(await drainTo(bobToo, 'sync-zero-too'))).toEqual([{ mute: false }]);
+			await setIdle(bob, true);
+			await post(alice, 'unmuted', { body: { text: 'welcome back', mentions: [bobId] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(pushes[0].url).toBe(bobSub.url);
+			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.body.text).toBe('welcome back');
+			// Ending a mute that is not set changes nothing, and sends nothing.
+			bob.send({ id: statusId(), method: 'status', params: { mute: false } });
+			expect(mutesOf(await drainTo(bobToo, 'sync-again'))).toEqual([]);
+			expect(mutesOf(await drainTo(bob, 'sync-again-bob'))).toEqual([]);
+			// Cut to a year: every connection learns the mute it got.
+			bob.send({ id: statusId(), method: 'status', params: { mute: 10 * MAX_MUTE_SECONDS } });
+			const capped = mutesOf(await drainTo(bobToo, 'sync-cap'));
+			expect(capped[0].mute).toBeLessThanOrEqual(MAX_MUTE_SECONDS);
+			expect(capped[0].mute).toBeGreaterThan(MAX_MUTE_SECONDS - 10);
+		} finally { alice.close(); bob.close(); bobToo.close(); }
+	});
+
+	it('denies status before sign-in, changing nothing, and sends the mutes in effect after each auth', async () => {
+		const userId = unique('early');
+		const first = await signedIn(userId);
+		const token = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).issueSession(userId, 'http://localhost:5173', Date.now()));
+		const peer = await connect();
+		try {
+			await peer.next();
+			// Clients don't send status before sign-in (§3.2, §4.5): denied, and nothing is kept.
+			const early = await status(peer, { idle: true, mute: true });
+			expect(early.frame.error.code).toBe(-32001);
+			expect(mutesOf(early.skipped)).toEqual([]);
+			expect((await status(peer, { room_id: 'general', mute: 120 })).frame.error.code).toBe(-32001);
+			// Without an id it is ignored, before sign-in too.
+			peer.send({ method: 'status', params: { mute: true } });
+			const { frame: auth, skipped: before } = await exchange(peer, 'auth', 'auth', { scheme: 'token', token });
+			expect(auth.result.you).not.toHaveProperty('mute');
+			expect(before.filter((frame) => frame.method === 'status' || frame.error)).toEqual([]);
+			// No mutes in effect, and the connection starts attended.
+			expect(mutesOf(await drainTo(peer, 'sync-peer'))).toEqual([]);
+			expect(await idleOf(userId)).toEqual([false, false]);
+			expect(mutesOf(await drainTo(first, 'sync-first'))).toEqual([]);
+			// Signed in, the same requests apply: each change goes to every connection, then `{}`.
+			const set = await status(peer, { mute: true });
+			expect(set.frame.result).toEqual({});
+			expect(mutesOf(set.skipped)).toEqual([{ mute: true }]);
+			expect((await status(peer, { room_id: 'general', mute: 120 })).frame.result).toEqual({});
+			expect(mutesOf(await drainTo(first, 'sync-first-again'))).toEqual([{ mute: true }, { room_id: 'general', mute: expect.any(Number) }]);
+			// A later sign-in is told the mutes in effect, after its result; a scope not sent is unmuted.
+			const third = await signedIn(userId, true);
+			try {
+				const told = mutesOf(await drainTo(third, 'sync-third'));
+				expect(told).toEqual([{ mute: true }, { room_id: 'general', mute: expect.any(Number) }]);
+				expect(told[1].mute).toBeGreaterThan(115);
+				expect(told[1].mute).toBeLessThanOrEqual(120);
+				// Nothing kept from earlier connections: the new one starts attended.
+				expect(await idleOf(userId)).toEqual([false, false, false]);
+			} finally { third.close(); }
+			// Unmuted, a sign-in is sent none.
+			expect((await status(first, { mute: false })).frame.result).toEqual({});
+			expect((await status(first, { room_id: 'general', mute: false })).frame.result).toEqual({});
+			const fourth = await signedIn(userId, true);
+			try {
+				expect(mutesOf(await drainTo(fourth, 'sync-fourth'))).toEqual([]);
+			} finally { fourth.close(); }
+		} finally { first.close(); peer.close(); }
+	});
+
+	it('tells every connection when a mute runs out, the unscoped one with no SQL', async () => {
+		const realNow = Date.now.bind(Date);
+		let offset = 0;
+		vi.spyOn(Date, 'now').mockImplementation(() => realNow() + offset);
+		const userId = unique('timed');
+		const peer = await signedIn(userId);
+		const other = await signedIn(userId, true);
+		const flush = () => runInDurableObject(stub(), (instance) => {
+			const runtime = instance as unknown as Runtime & { flushPresence(): void; store: Store };
+			const before = runtime.store.storageAccounting();
+			runtime.flushPresence();
+			const after = runtime.store.storageAccounting();
+			return { reads: after.reads - before.reads, writes: after.writes - before.writes };
+		});
+		try {
+			peer.send({ id: statusId(), method: 'status', params: { mute: 30 } });
+			peer.send({ id: statusId(), method: 'status', params: { room_id: 'general', mute: 45 } });
+			await drainTo(peer, 'sync-set');
+			await drainTo(other, 'sync-set-other');
+			// A mute that runs out within the minute arms the one timer.
+			expect(await runInDurableObject(stub(), (instance) => (instance as unknown as { presenceTimerAt: number }).presenceTimerAt - Date.now())).toBeLessThanOrEqual(30_100);
+			offset += 31_000;
+			// The unscoped mute ran out: told from attachments, no SQL.
+			expect(await flush()).toEqual({ reads: 0, writes: 0 });
+			expect(mutesOf(await drainTo(peer, 'sync-unscoped'))).toEqual([{ mute: false }]);
+			expect(mutesOf(await drainTo(other, 'sync-unscoped-other'))).toEqual([{ mute: false }]);
+			// Nothing else ran out: a sweep now reads nothing and tells nothing.
+			expect(await flush()).toEqual({ reads: 0, writes: 0 });
+			expect(mutesOf(await drainTo(peer, 'sync-nothing'))).toEqual([]);
+			offset += 15_000;
+			// The room mute ran out: read, deleted, and told once.
+			const expiry = await flush();
+			expect(expiry.reads).toBeGreaterThan(0);
+			expect(mutesOf(await drainTo(peer, 'sync-room'))).toEqual([{ room_id: 'general', mute: false }]);
+			expect(mutesOf(await drainTo(other, 'sync-room-other'))).toEqual([{ room_id: 'general', mute: false }]);
+			expect(await flush()).toEqual({ reads: 0, writes: 0 });
+			const rows = await runInDurableObject(stub(), (_instance, state) => state.storage.sql.exec('SELECT * FROM room_mutes WHERE user_id = ?', userId).toArray());
+			expect(rows).toEqual([]);
+			expect(await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.accountingStatus().unsafe)).toBe(false);
+		} finally { peer.close(); other.close(); }
+	});
+
+	it('silences a room and its threads, mentions and replies included, and nothing else', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId] = [unique('alice'), unique('bob')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		try {
+			const bobSub = await subscribe(bob, 'bob');
+			const thread = (await request(alice, 'thread', 'room_set', { parent_room_id: 'general', title: 'Muted thread' })).result.room_id;
+			const other = (await request(alice, 'other', 'room_set', { parent_room_id: 'general', title: 'Other thread' })).result.room_id;
+			const bobsMessage = await post(bob, 'bobs', { room_id: thread, body: { text: 'reply to me' } });
+			await setIdle(bob, true);
+			// The thread is muted: a mention and a reply there wake no one.
+			bob.send({ id: statusId(), method: 'status', params: { room_id: thread, mute: true } });
+			expect(mutesOf(await drainTo(bob, 'sync-thread'))).toEqual([{ room_id: thread, mute: true }]);
+			await post(alice, 'mention-thread', { room_id: thread, body: { text: 'hi', mentions: [bobId] } });
+			await post(alice, 'reply-thread', { room_id: thread, reply_to: { message_id: bobsMessage.result.message_id }, body: { text: 'answer' } });
+			// Another thread is not muted.
+			await post(alice, 'mention-other', { room_id: other, body: { text: 'over here', mentions: [bobId] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.body.text).toBe('over here');
+			// Muting the parent silences its threads too, and the parent itself.
+			pushes.length = 0;
+			bob.send({ id: statusId(), method: 'status', params: { room_id: thread, mute: false } });
+			bob.send({ id: statusId(), method: 'status', params: { room_id: 'general', mute: 600 } });
+			await drainTo(bob, 'sync-general');
+			const third = (await request(alice, 'third', 'room_set', { parent_room_id: 'general', title: 'Third thread' })).result.room_id;
+			await post(alice, 'mention-third', { room_id: third, body: { text: 'in a thread', mentions: [bobId] } });
+			await post(alice, 'mention-general', { room_id: 'general', body: { text: 'in general', mentions: [bobId] } });
+			await post(alice, 'mention-thread-again', { room_id: thread, body: { text: 'in the first thread', mentions: [bobId] } });
+			// A room that does not exist cannot be muted: invalid_params, and nothing is sent.
+			const unknown = await status(bob, { room_id: 'no-such-room', mute: true });
+			expect(unknown.frame.error.code).toBe(-32602);
+			expect(mutesOf(unknown.skipped)).toEqual([]);
+			bob.send({ id: statusId(), method: 'status', params: { room_id: 'general', mute: false } });
+			await drainTo(bob, 'sync-unmuted');
+			const fourth = (await request(alice, 'fourth', 'room_set', { parent_room_id: 'general', title: 'Fourth thread' })).result.room_id;
+			await post(alice, 'mention-fourth', { room_id: fourth, body: { text: 'unmuted', mentions: [bobId] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.body.text).toBe('unmuted');
+		} finally { alice.close(); bob.close(); }
+	});
+
+	it('sends no push to a user whose status is dnd, connected or not', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId] = [unique('alice'), unique('bob')];
+		const alice = await signedIn(aliceId);
+		let bob = await signedIn(bobId);
+		try {
+			const bobSub = await subscribe(bob, 'bob');
+			expect((await request(bob, 'dnd', 'me', { status: 'dnd' })).result.you.status).toBe('dnd');
+			await setIdle(bob, true);
+			await post(alice, 'connected', { body: { text: 'busy?', mentions: [bobId] } });
+			bob.close();
+			await vi.waitFor(async () => expect(await idleOf(bobId)).toEqual([]), { timeout: 5_000 });
+			const thread = (await request(alice, 'thread', 'room_set', { parent_room_id: 'general', title: 'Dnd' })).result.room_id;
+			await post(alice, 'gone', { room_id: thread, body: { text: 'still busy?', mentions: [bobId] } });
+			bob = await signedIn(bobId, true);
+			expect((await request(bob, 'online', 'me', { status: 'online' })).result.you.status).toBe('online');
+			await setIdle(bob, true);
+			const another = (await request(alice, 'another', 'room_set', { parent_room_id: 'general', title: 'Online' })).result.room_id;
+			await post(alice, 'back', { room_id: another, body: { text: 'back', mentions: [bobId] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.body.text).toBe('back');
+		} finally { alice.close(); bob.close(); }
+	});
+
+	it('answers invalid status params with invalid_params, changing nothing, and denied for a guest\'s mutes', async () => {
+		const userId = unique('mal');
+		const peer = await signedIn(userId);
+		/** Forgets the connection's policy violations, so the next invalid request does not close it. */
+		const forgive = () => runInDurableObject(stub(), (_instance, state) => {
+			for (const socket of state.getWebSockets()) {
+				const attachment = socket.deserializeAttachment() as { userId?: string; policyViolations: number[] };
+				if (attachment.userId !== userId) continue;
+				attachment.policyViolations = [];
+				socket.serializeAttachment(attachment);
+			}
+		});
+		try {
+			const invalid = [
+				// Seconds are a positive integer (§4.5): `0` is not `false`.
+				...[0, -1, 1.5, '3600', null, {}].map((mute) => ({ mute })),
+				...['', 7, 'x'.repeat(65)].map((room_id) => ({ room_id, mute: true })),
+				// `room_id` scopes only `mute`: without it, invalid.
+				{ room_id: 'general' },
+				{ room_id: 'general', idle: true },
+				// One invalid field fails the whole request: the valid one is not applied either.
+				{ idle: true, mute: 'no' },
+				{ idle: 'yes', mute: 60 },
+			];
+			for (const params of invalid) {
+				const reply = await status(peer, params);
+				expect(reply.frame.error?.code, JSON.stringify(params)).toBe(-32602);
+				expect(mutesOf(reply.skipped), JSON.stringify(params)).toEqual([]);
+				await forgive();
+			}
+			expect(mutesOf(await drainTo(peer, 'sync-invalid'))).toEqual([]);
+			expect(await idleOf(userId)).toEqual([false]);
+			const stored = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.statusInputs(userId, Date.now()));
+			expect(stored.muteUntil).toBeUndefined();
+			expect(stored.roomMutes).toEqual([]);
+			// The same fields, valid, apply together.
+			const valid = await status(peer, { idle: true, mute: 60 });
+			expect(valid.frame.result).toEqual({});
+			expect(mutesOf(valid.skipped)).toHaveLength(1);
+			expect(mutesOf(valid.skipped)[0].mute).toBeGreaterThan(55);
+			expect(await idleOf(userId)).toEqual([true]);
+			expect(peer.closed()).toBeUndefined();
+		} finally { peer.close(); }
+		const guest = await connect();
+		try {
+			await guest.next();
+			expect((await status(guest, { mute: true })).frame.error.code).toBe(-32001);
+			const guestId = (await request(guest, 'auth', 'auth', { scheme: 'guest' })).result.you.user_id;
+			// A guest gets no pushes, so a mute could change nothing: denied, nothing kept or sent.
+			for (const params of [{ mute: true }, { room_id: 'general', mute: true }, { mute: false }]) {
+				const reply = await status(guest, params);
+				expect(reply.frame.error?.code, JSON.stringify(params)).toBe(-32001);
+				expect(mutesOf(reply.skipped)).toEqual([]);
+			}
+			// With `idle` in the same request, neither applies.
+			const both = await status(guest, { idle: true, mute: true });
+			expect(both.frame.error.code).toBe(-32001);
+			expect(await idleOf(guestId)).toEqual([false]);
+			// A guest's `idle` alone applies, answered `{}`.
+			expect((await status(guest, { idle: true })).frame.result).toEqual({});
+			expect(await idleOf(guestId)).toEqual([true]);
+			const attachments = await runInDurableObject(stub(), (_instance, state) => state.getWebSockets().map((socket) => socket.deserializeAttachment() as { muteUntil?: unknown; tier: string }));
+			expect(attachments.filter((attachment) => attachment.tier === 'anonymous' && attachment.muteUntil !== undefined)).toEqual([]);
+			expect(guest.closed()).toBeUndefined();
+		} finally { guest.close(); }
+	});
+
+	it('limits going idle per connection with retry_after, never refusing idle false, changing nothing past the limit, and no SQL', async () => {
+		const userId = unique('flipper');
+		const peer = await signedIn(userId);
+		const other = await signedIn(userId, true);
+		try {
+			// Only changes to `idle: true` count: the limit's worth, with a
+			// coming back between each, leaves the connection idle.
+			for (let index = 0; index < IDLE_CHANGES_PER_CONNECTION_MINUTE; index++) {
+				if (index > 0) await setIdle(peer, false);
+				await setIdle(peer, true);
+			}
+			expect((await idleOf(userId)).sort()).toEqual([false, true]);
+			// A repeat of the current value is not a change, and is not counted.
+			await setIdle(peer, true);
+			// Coming back is never refused (B7), past the limit included.
+			await setIdle(peer, false);
+			expect(await idleOf(userId)).toEqual([false, false]);
+			await setIdle(peer, false);
+			// Going idle again is limited.
+			const limited = await status(peer, { idle: true });
+			expect(limited.frame.error.code).toBe(-32002);
+			expect(limited.frame.error.data.retry_after).toBeGreaterThan(0);
+			expect(limited.frame.error.data.retry_after).toBeLessThanOrEqual(60);
+			expect(await idleOf(userId)).toEqual([false, false]);
+			// A limited idle fails the whole request: a mute with it is not applied.
+			const both = await status(peer, { idle: true, mute: true });
+			expect(both.frame.error.code).toBe(-32002);
+			expect(mutesOf(both.skipped)).toEqual([]);
+			const stored = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.statusInputs(userId, Date.now()));
+			expect(stored.muteUntil).toBeUndefined();
+			// The limit is the connection's: the user's other connection still changes.
+			await setIdle(other, true);
+			// Limited or not, an idle request reads and writes no SQL.
+			const cost = await runInDurableObject(stub(), (instance, state) => {
+				const runtime = instance as unknown as Runtime & { handleStatus(socket: WebSocket, request: unknown): void };
+				const sockets = state.getWebSockets().filter((ws) => (ws.deserializeAttachment() as { userId?: string }).userId === userId);
+				const sql = state.storage.sql as unknown as { exec: (...args: unknown[]) => unknown };
+				const exec = sql.exec.bind(sql);
+				let queries = 0;
+				const errors: string[] = [];
+				sql.exec = (...args: unknown[]) => { queries++; return exec(...args); };
+				try {
+					for (const socket of sockets) {
+						try {
+							runtime.handleStatus(socket, { method: 'status', id: 'cost', params: { idle: true }, full: false });
+						} catch (error) { errors.push((error as { name: string }).name); }
+					}
+				} finally { sql.exec = exec; }
+				expect(errors).toEqual(['retry_after']);
+				return queries;
+			});
+			expect(cost).toBe(0);
+		} finally { peer.close(); other.close(); }
+	});
+});
+
+describe('push review fixes', () => {
+	/** Sets the time of a user's connections' last frame, as if they had been quiet since. */
+	function quietSince(userId: string, at: number): Promise<void> {
+		return runInDurableObject(stub(), (_instance, state) => {
+			for (const socket of state.getWebSockets()) {
+				const attachment = socket.deserializeAttachment() as { userId?: string; frameTimes: number[] };
+				if (attachment.userId !== userId) continue;
+				socket.serializeAttachment({ ...attachment, frameTimes: [at] });
+			}
+		});
+	}
+
+	it('never treats a quiet connection as idle: only idle true makes it so, so its user gets no push', async () => {
+		const pushes = capturePushes();
+		const [aliceId, silentId, muterId, idleId] = [unique('alice'), unique('silent'), unique('muter'), unique('idle')];
+		const alice = await signedIn(aliceId);
+		const silent = await signedIn(silentId);
+		const muter = await signedIn(muterId);
+		const idle = await signedIn(idleId);
+		try {
+			await subscribe(silent, 'silent');
+			await subscribe(muter, 'muter');
+			const idleSub = await subscribe(idle, 'idle');
+			// One never sends `status`; one sends only `mute`; one says it is idle.
+			expect((await status(muter, { mute: false })).frame.result).toEqual({});
+			await setIdle(idle, true);
+			// Quiet for far longer than any period a server once could pick: the
+			// two that never sent `idle: true` are still attended (§4.5).
+			await quietSince(silentId, Date.now() - 60 * 60_000);
+			await quietSince(muterId, Date.now() - 60 * 60_000);
+			await quietSince(idleId, Date.now() - 60 * 60_000);
+			await post(alice, 'quiet', { body: { text: 'anyone?', mentions: [silentId, muterId, idleId] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(pushes[0].url).toBe(idleSub.url);
+			await request(alice, 'sync', 'me', {});
+			expect(pushes).toHaveLength(1);
+		} finally { alice.close(); silent.close(); muter.close(); idle.close(); }
+	});
+
+	it('checks PUSH_HOSTS again before each push', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId] = [unique('alice'), unique('bob')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		const setHosts = (hosts: readonly string[] | '*') => runInDurableObject(stub(), (instance) => {
+			const runtime = instance as unknown as { config: { pushHosts: readonly string[] | '*' } };
+			runtime.config = { ...runtime.config, pushHosts: hosts };
+		});
+		try {
+			const bobSub = await subscribe(bob, 'bob');
+			await setIdle(bob, true);
+			await setHosts(['push.elsewhere.example']);
+			await post(alice, 'narrowed', { room_id: 'general', body: { text: 'not sent', mentions: [bobId] } });
+			await setHosts(['push.example.net']);
+			// Another room: the first wake still coalesces general.
+			const thread = (await request(alice, 'thread', 'room_set', { parent_room_id: 'general', title: 'Hosts' })).result.room_id;
+			await post(alice, 'restored', { room_id: thread, body: { text: 'sent', mentions: [bobId] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.body.text).toBe('sent');
+		} finally { alice.close(); bob.close(); await setHosts(['push.example.net']); }
+	});
+
+});
+
+describe('security review fixes', () => {
+	const senderCharged = (userId: string) => runInDurableObject(stub(), (_instance, state) =>
+		state.storage.sql.exec<{ posts_day: number }>("SELECT posts_day FROM principal_limits WHERE scope = 'push' AND principal_key = ?", `user:${userId}`).toArray()[0]?.posts_day ?? 0);
+
+	it('answers mute and status changes past mutesPerUserMinute with retry_after, changing nothing, counted per user across reconnects', async () => {
+		const userId = unique('flip');
+		const peer = await signedIn(userId);
+		const watcher = await signedIn(userId, true);
+		const mutes = (frames: Frame[]) => frames.filter((frame) => frame.method === 'status').map((frame) => frame.params);
+		try {
+			// One `me` status change and the mutes share the minute.
+			expect((await request(peer, 'dnd', 'me', { status: 'dnd' })).result.you.status).toBe('dnd');
+			const replies: Frame[] = [];
+			const sender: Frame[] = [];
+			for (let index = 0; index < POLICY.mutesPerUserMinute + 1; index++) {
+				const { frame, skipped } = await status(peer, { mute: index % 2 ? false : 60 });
+				replies.push(frame);
+				sender.push(...mutes(skipped));
+			}
+			const echoes = mutes((await exchange(watcher, 'sync', 'me', {})).skipped);
+			expect(echoes).toHaveLength(POLICY.mutesPerUserMinute - 1);
+			expect(sender).toEqual(echoes);
+			// Past the limit, `retry_after`: nothing changes, and nothing is echoed.
+			expect(replies.slice(0, -2).map((frame) => frame.result)).toEqual(Array(POLICY.mutesPerUserMinute - 1).fill({}));
+			for (const frame of replies.slice(-2)) {
+				expect(frame.error.code).toBe(-32002);
+				expect(frame.error.data.retry_after).toBeGreaterThan(0);
+			}
+			const stored = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.statusInputs(userId, Date.now()));
+			expect(stored.muteUntil !== undefined).toBe(echoes[echoes.length - 1].mute !== false);
+			// A new connection does not reset the count; past it, a `me` status is retry_after.
+			peer.close();
+			const again = await signedIn(userId, true);
+			try {
+				// After its sign-in, the mutes in effect: the last that applied.
+				expect(mutes((await exchange(again, 'sync-again-peer', 'me', {})).skipped)).toEqual(echoes[echoes.length - 1].mute === false ? [] : [{ mute: expect.any(Number) }]);
+				const room = await status(again, { room_id: 'general', mute: true });
+				expect(room.frame.error.code).toBe(-32002);
+				expect(mutes(room.skipped)).toEqual([]);
+				expect(mutes((await exchange(watcher, 'sync-again', 'me', {})).skipped)).toEqual([]);
+				const limited = await request(again, 'online', 'me', { status: 'online' });
+				expect(limited.error.data.retry_after).toBeGreaterThan(0);
+				expect((await request(again, 'still', 'me', {})).result.you.status).toBe('dnd');
+				expect(again.closed()).toBeUndefined();
+			} finally { again.close(); }
+		} finally { peer.close(); watcher.close(); }
+	});
+
+	it('spends mutesPerUserMinute only on applied changes: refused and failed mutes and statuses count nothing (B9)', async () => {
+		const userId = unique('spent');
+		const peer = await signedIn(userId);
+		const mutes = (frames: Frame[]) => frames.filter((frame) => frame.method === 'status').map((frame) => frame.params);
+		const forgive = () => runInDurableObject(stub(), (_instance, state) => {
+			for (const socket of state.getWebSockets()) socket.serializeAttachment({ ...(socket.deserializeAttachment() as object), policyViolations: [] });
+		});
+		type Patched = { store: Record<'setMute' | 'setRoomMute' | 'setStatus', (...args: unknown[]) => unknown> };
+		const fail = (on: boolean) => runInDurableObject(stub(), (instance) => {
+			const store = (instance as unknown as Patched).store;
+			for (const name of ['setMute', 'setRoomMute', 'setStatus'] as const) {
+				if (on) store[name] = () => { throw new Error('injected storage failure'); };
+				else delete (store as Record<string, unknown>)[name];
+			}
+		});
+		try {
+			// Refused: a mute of a room that does not exist, more times than the limit.
+			for (let index = 0; index < POLICY.mutesPerUserMinute + 1; index++) {
+				const refused = await status(peer, { room_id: `missing-${index}`, mute: true });
+				expect(refused.frame.error.code).toBe(-32602);
+				await forgive();
+			}
+			// Failed in storage: mutes and `me` statuses, more times than the limit.
+			await fail(true);
+			try {
+				for (let index = 0; index < POLICY.mutesPerUserMinute + 1; index++) {
+					const failed = await status(peer, index % 2 ? { mute: 60 } : { room_id: 'general', mute: 60 });
+					expect(failed.frame.error).toBeDefined();
+					expect(failed.frame.error.code).not.toBe(-32002);
+					expect(mutes(failed.skipped)).toEqual([]);
+					const chosen = await request(peer, `dnd-${index}`, 'me', { status: 'dnd' });
+					expect(chosen.error).toBeDefined();
+					expect(chosen.error.code).not.toBe(-32002);
+				}
+			} finally { await fail(false); }
+			expect((await request(peer, 'still-online', 'me', {})).result.you.status).toBe('online');
+			// The whole minute is still there: the limit's worth of changes applies, and only then retry_after.
+			for (let index = 0; index < POLICY.mutesPerUserMinute; index++) {
+				const applied = index === 0 ? await request(peer, 'dnd', 'me', { status: 'dnd' }) : (await status(peer, { mute: index % 2 ? 60 : false })).frame;
+				expect(applied.error, JSON.stringify(applied.error)).toBeUndefined();
+			}
+			expect((await status(peer, { mute: true })).frame.error.code).toBe(-32002);
+		} finally { peer.close(); }
+	});
+
+	it('limits push_register per user across reconnects', async () => {
+		const userId = unique('regs');
+		const browser = await testBrowser();
+		const params = { kind: 'webpush', url: 'https://push.example.net/again', keys: { p256dh: browser.p256dh, auth: browser.auth } };
+		const first = await signedIn(userId);
+		for (let index = 0; index < POLICY.registersPerUserMinute; index++) {
+			expect((await request(first, `reg-${index}`, 'push_register', params)).result).toEqual({});
+		}
+		first.close();
+		const second = await signedIn(userId, true);
+		try {
+			expect((await request(second, 'over', 'push_register', params)).error.code).toBe(-32002);
+		} finally { second.close(); }
+	});
+
+	it('stores one spelling of an endpoint, refuses a trailing-dot host, and caps urls at 512 bytes', async () => {
+		const userId = unique('norm');
+		const peer = await signedIn(userId);
+		try {
+			const browser = await testBrowser();
+			const keys = { p256dh: browser.p256dh, auth: browser.auth };
+			expect((await request(peer, 'spelled', 'push_register', { kind: 'webpush', url: 'https://PUSH.example.net:443/a/../b', keys })).result).toEqual({});
+			expect((await request(peer, 'plain', 'push_register', { kind: 'webpush', url: 'https://push.example.net/b', keys })).result).toEqual({});
+			expect((await subscriptionsOf(userId)).map((row) => row.url)).toEqual(['https://push.example.net/b']);
+			expect((await request(peer, 'dot', 'push_register', { kind: 'webpush', url: 'https://push.example.net./c', keys })).error.code).toBe(-32602);
+			expect((await request(peer, 'long', 'push_register', { kind: 'webpush', url: `https://push.example.net/${'x'.repeat(500)}`, keys })).error.code).toBe(-32003);
+			// Unregistering by another spelling removes it too.
+			expect((await request(peer, 'unregister', 'push_unregister', { url: 'https://PUSH.example.net/b' })).result).toEqual({});
+			expect(await subscriptionsOf(userId)).toEqual([]);
+		} finally { peer.close(); }
+	});
+
+	it('forgets a registration its push service refuses with 403, and charges the sender only for delivered pushes', async () => {
+		const pushes = capturePushes((url) => url.includes('/refused-') ? 403 : url.includes('/failing-') ? 500 : 201);
+		const [aliceId, bobId, carolId] = [unique('alice'), unique('bob'), unique('carol')];
+		const alice = await signedIn(aliceId);
+		try {
+			for (const [userId, name] of [[bobId, 'refused'], [carolId, 'failing']] as const) {
+				const peer = await signedIn(userId);
+				await subscribe(peer, name);
+				peer.close();
+				await vi.waitFor(async () => expect(await idleOf(userId)).toEqual([]), { timeout: 5_000 });
+			}
+			await post(alice, 'mention', { body: { text: 'hi', mentions: [bobId, carolId] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(2), { timeout: 5_000 });
+			await vi.waitFor(async () => expect(await subscriptionsOf(bobId)).toEqual([]), { timeout: 5_000 });
+			expect(await subscriptionsOf(carolId)).toHaveLength(1);
+			// Neither push was delivered, so Alice was charged nothing.
+			expect(await senderCharged(aliceId)).toBe(0);
+		} finally { alice.close(); }
+	});
+
+	it('passes over registrations PUSH_HOSTS no longer allows before they take a wake', async () => {
+		const keys = { p256dh: (await testBrowser()).p256dh, auth: 'a'.repeat(22) };
+		await withStore('push-hosts-claim', { push: { ...POLICY, wakesPerMessage: 1 } }, (store, clock, state) => {
+			for (const userId of ['old', 'new']) {
+				store.registerIdentity({
+					userId, name: userId, userHandle: `handle-${userId}`, now: clock.value, ipKey: `ip-${userId}`,
+					credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
+				});
+			}
+			store.registerPushSubscription({ userId: 'old', url: 'https://push.retired.example/x', ...keys, now: clock.value });
+			store.registerPushSubscription({ userId: 'new', url: 'https://push.example.net/y', ...keys, now: clock.value });
+			const claimed = store.claimPushes({
+				senderId: 'sender', roomId: 'general', now: clock.value,
+				candidates: [{ userId: 'old', reasons: WAKE_SCOPES.mentions }, { userId: 'new', reasons: WAKE_SCOPES.mentions }],
+				allowed: (url) => url.startsWith('https://push.example.net/'),
+			});
+			expect(claimed.subscriptions.map((row) => row.userId)).toEqual(['new']);
+			expect(store.pushesToday(clock.value)).toBe(1);
+		});
+	});
+
+	it("clears a user's push registrations on /passkeys remove, and a bot's on a new token", async () => {
+		const userId = unique('keys');
+		await register(userId);
+		await runInDurableObject(stub(), (instance) => {
+			(instance as unknown as Runtime).store.addCredential({
+				userId, userHandle: `handle-${userId}`, now: Date.now(), ipKey: `ip-${userId}`,
+				credential: { credentialId: `cred2-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
+			});
+		});
+		const peer = await signedIn(userId, true);
+		try {
+			await subscribe(peer, 'phone');
+			expect((await request(peer, 'remove', 'command', { body: { text: '/passkeys remove 2' } })).result).toEqual({});
+			expect(await subscriptionsOf(userId)).toEqual([]);
+			// The bot's token is replaced: its registrations go with the old one.
+			const botId = `bot_${userId}`;
+			expect((await request(peer, 'bot', 'command', { body: { text: '/invite-bot' } })).result).toEqual({});
+			await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.registerPushSubscription({
+				userId: botId, url: 'https://push.example.net/bot', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22),
+			}));
+			expect(await subscriptionsOf(botId)).toHaveLength(1);
+			expect((await request(peer, 'bot-again', 'command', { body: { text: '/invite-bot' } })).result).toEqual({});
+			expect(await subscriptionsOf(botId)).toEqual([]);
+		} finally { peer.close(); }
+	});
+});
+
+describe('push limits over the socket', () => {
+	it('limits push_register to registersPerUserMinute a user', async () => {
+		const userId = unique('reg');
+		const peer = await signedIn(userId);
+		try {
+			const browser = await testBrowser();
+			const params = { kind: 'webpush', url: 'https://push.example.net/again', keys: { p256dh: browser.p256dh, auth: browser.auth } };
+			for (let index = 0; index < POLICY.registersPerUserMinute; index++) {
+				expect((await request(peer, `again-${index}`, 'push_register', params)).result).toEqual({});
+			}
+			const limited = await request(peer, 'over', 'push_register', params);
+			expect(limited.error.code).toBe(-32002);
+			expect(limited.error.data.retry_after).toBeGreaterThan(0);
+		} finally { peer.close(); }
+	});
+
+	it("wakes no one for a guest's mentions", async () => {
+		const pushes = capturePushes();
+		const [targetId, controlId, aliceId] = [unique('tara'), unique('cole'), unique('alice')];
+		for (const userId of [targetId, controlId]) {
+			const peer = await signedIn(userId);
+			await subscribe(peer, userId);
+			peer.close();
+			await vi.waitFor(async () => expect(await idleOf(userId)).toEqual([]), { timeout: 5_000 });
+		}
+		const guest = await connect();
+		const alice = await signedIn(aliceId);
+		try {
+			await guest.next();
+			await request(guest, 'auth', 'auth', { scheme: 'guest' });
+			await post(guest, 'guest-mention', { body: { text: 'hey', mentions: [targetId] } });
+			await post(alice, 'control', { body: { text: 'hey', mentions: [controlId] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(pushes[0].url).toContain(`/${controlId}-`);
+		} finally { guest.close(); alice.close(); }
+	});
+});
+
+describe('push subscriptions in the store', () => {
+	const config = { push: { ...POLICY } };
+	const DAY = 86_400_000;
+	/** Moves the clock to the next UTC midday, so a test that counts per day can't cross midnight. */
+	const atMidday = (clock: TestClock) => { clock.value = (Math.floor(clock.value / DAY) + 1) * DAY + DAY / 2; };
+	const browserKeys = async () => {
+		const browser = await testBrowser();
+		return { p256dh: browser.p256dh, auth: browser.auth };
+	};
+	function registerUser(store: Store, clock: TestClock, userId: string): void {
+		store.registerIdentity({
+			userId, name: userId, userHandle: `handle-${userId}`, now: clock.value, ipKey: `ip-${userId}`,
+			credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
+		});
+	}
+	const claim = (store: Store, clock: TestClock, candidates: string[], roomId = 'general', senderId = 'sender') =>
+		store.claimPushes({ senderId, roomId, candidates: candidates.map((userId) => ({ userId, reasons: WAKE_SCOPES.mentions })), now: clock.value });
+
+	it('keeps subscriptionsPerUser per user, replacing the least recently registered; registrations are per user', async () => {
+		const keys = await browserKeys();
+		await withStore('push-cap', config, (store, clock, state) => {
+			registerUser(store, clock, 'ann');
+			registerUser(store, clock, 'ben');
+			const url = (n: number) => `https://push.example.net/${n}`;
+			for (let n = 0; n < POLICY.subscriptionsPerUser; n++) {
+				store.registerPushSubscription({ userId: 'ann', url: url(n), ...keys, now: clock.value });
+				clock.value += 1_000;
+			}
+			// Registering the oldest again, unchanged within a day, writes nothing: it stays the oldest.
+			store.registerPushSubscription({ userId: 'ann', url: url(0), ...keys, now: clock.value });
+			store.registerPushSubscription({ userId: 'ann', url: url(99), ...keys, now: clock.value });
+			const urls = pushSubscriptionsOf(state, 'ann').map((row) => row.url);
+			expect(urls).toHaveLength(POLICY.subscriptionsPerUser);
+			expect(urls[0]).toBe(url(99));
+			expect(urls).not.toContain(url(0));
+			// A changed push_id is a change, even within a day; an absent one removes it.
+			const of = (userId: string, n: number) => pushSubscriptionsOf(state, userId).find((row) => row.url === url(n));
+			store.registerPushSubscription({ userId: 'ann', url: url(1), ...keys, pushId: 'one', now: clock.value });
+			expect(of('ann', 1)?.pushId).toBe('one');
+			store.registerPushSubscription({ userId: 'ann', url: url(1), ...keys, pushId: 'two', now: clock.value });
+			expect(of('ann', 1)?.pushId).toBe('two');
+			store.registerPushSubscription({ userId: 'ann', url: url(1), ...keys, now: clock.value });
+			expect(of('ann', 1)).not.toHaveProperty('pushId');
+			expect(() => store.registerPushSubscription({ userId: 'ann', url: url(1), ...keys, pushId: 'not ok' })).toThrow(/push_id/);
+			// Ben registers the same endpoint: both hold it, each their own.
+			store.registerPushSubscription({ userId: 'ben', url: url(99), ...keys, pushId: 'ben', now: clock.value });
+			expect(pushSubscriptionsOf(state, 'ben').map((row) => row.url)).toEqual([url(99)]);
+			expect(of('ann', 99)).toBeDefined();
+			// Unregistering takes only the caller's own.
+			store.removePushSubscription({ userId: 'ann', url: url(99) });
+			expect(of('ann', 99)).toBeUndefined();
+			expect(pushSubscriptionsOf(state, 'ben')).toHaveLength(1);
+			// No identity, no subscription.
+			expect(() => store.registerPushSubscription({ userId: 'guest_7', url: url(7), ...keys })).toThrow(/Sign in/);
+		});
+	});
+
+	it('spends wake slots only on users with live registrations, and coalesces per user and room', async () => {
+		const keys = await browserKeys();
+		await withStore('push-slots', { push: { ...POLICY, wakesPerMessage: 2 } }, (store, clock, state) => {
+			for (const userId of ['fay', 'gus', 'hal']) {
+				registerUser(store, clock, userId);
+				store.registerPushSubscription({ userId, url: `https://push.example.net/${userId}`, ...keys, now: clock.value });
+			}
+			const nobody = Array.from({ length: 10 }, (_, index) => `nobody_${index}`);
+			const first = claim(store, clock, [...nobody, 'fay', 'gus', 'hal']);
+			expect(first.subscriptions.map((row) => row.userId)).toEqual(['fay', 'gus']);
+			// Fay and Gus were just woken for general; Hal takes the slot. Another room wakes them again.
+			expect(claim(store, clock, ['fay', 'gus', 'hal']).subscriptions.map((row) => row.userId)).toEqual(['hal']);
+			expect(claim(store, clock, ['fay'])).toEqual({ subscriptions: [], skipped: 0 });
+			expect(claim(store, clock, ['fay'], 'thread').subscriptions.map((row) => row.userId)).toEqual(['fay']);
+			clock.value += POLICY.coalesceSeconds * 1_000;
+			expect(claim(store, clock, ['fay']).subscriptions.map((row) => row.userId)).toEqual(['fay']);
+		});
+	});
+
+	it('charges pushes to pushesPerDay and each recipient, skipping the rest until the next UTC day', async () => {
+		const keys = await browserKeys();
+		await withStore('push-daily', { push: { ...POLICY, pushesPerDay: 3, coalesceSeconds: 1 } }, (store, clock, state) => {
+			atMidday(clock);
+			for (const userId of ['cy', 'di', 'ed']) {
+				registerUser(store, clock, userId);
+				for (const n of [1, 2]) store.registerPushSubscription({ userId, url: `https://push.example.net/${userId}/${n}`, ...keys, now: clock.value });
+			}
+			expect(claim(store, clock, [])).toEqual({ subscriptions: [], skipped: 0 });
+			const first = claim(store, clock, ['cy', 'di', 'nobody']);
+			expect(first.subscriptions).toHaveLength(3);
+			expect(first.skipped).toBe(1);
+			expect(store.pushesToday(clock.value)).toBe(3);
+			clock.value += 1_000;
+			expect(claim(store, clock, ['cy'])).toEqual({ subscriptions: [], skipped: 2 });
+			clock.value += DAY;
+			expect(claim(store, clock, ['cy'], 'general', 'sal').subscriptions).toHaveLength(2);
+			expect(store.pushesToday(clock.value)).toBe(2);
+		});
+	});
+
+	it('charges senders only for delivered pushes, and caps what one recipient gets a day', async () => {
+		const keys = await browserKeys();
+		await withStore('push-sender', { push: { ...POLICY, pushesPerSenderDay: 3, pushesPerRecipientDay: 3, coalesceSeconds: 1 } }, (store, clock, state) => {
+			atMidday(clock);
+			for (const userId of ['fi', 'gil', 'hu']) {
+				registerUser(store, clock, userId);
+				for (const n of [1, 2]) store.registerPushSubscription({ userId, url: `https://push.example.net/${userId}/${n}`, ...keys, now: clock.value });
+			}
+			// Claims alone, never delivered, cost the sender nothing: Sam's 3 pushes
+			// to Fi are all claimed, the third cut by Fi's recipient cap of 3.
+			expect(claim(store, clock, ['fi'], 'room-0', 'sam').subscriptions).toHaveLength(2);
+			clock.value += 2_000;
+			expect(claim(store, clock, ['fi'], 'room-1', 'sam')).toMatchObject({ subscriptions: [expect.anything()], skipped: 1 });
+			clock.value += 2_000;
+			// Fi has had 3 pushes today: no more, from anyone.
+			expect(claim(store, clock, ['fi'], 'room-2', 'tess')).toMatchObject({ subscriptions: [], skipped: 2 });
+			// Sam's delivered pushes reach the sender cap: Sam wakes no one more today.
+			store.chargePushSender('sam', 3, clock.value);
+			expect(claim(store, clock, ['gil'], 'general', 'sam')).toMatchObject({ subscriptions: [], skipped: 2 });
+			expect(claim(store, clock, ['gil'], 'general', 'tess').subscriptions).toHaveLength(2);
+			// A message cannot claim past the sender's allowance either.
+			store.chargePushSender('uma', 2, clock.value);
+			expect(claim(store, clock, ['hu'], 'general', 'uma').subscriptions).toHaveLength(1);
+			expect(store.accountingStatus().unsafe).toBe(false);
+		});
+	});
+
+	it('forgets a gone registration by user, endpoint and keys, keeping a fresh one and other users\' own', async () => {
+		const [old, fresh] = [await browserKeys(), await browserKeys()];
+		await withStore('push-gone', config, (store, clock, state) => {
+			registerUser(store, clock, 'ida');
+			registerUser(store, clock, 'jon');
+			const url = 'https://push.example.net/shared';
+			store.registerPushSubscription({ userId: 'ida', url, ...old, now: clock.value });
+			store.registerPushSubscription({ userId: 'jon', url, ...old, now: clock.value });
+			// Ida's push came back gone: only her registration goes.
+			store.forgetPushSubscriptions([{ userId: 'ida', url, p256dh: old.p256dh }], clock.value);
+			expect(pushSubscriptionsOf(state, 'ida')).toEqual([]);
+			expect(pushSubscriptionsOf(state, 'jon')).toHaveLength(1);
+			// Jon registered again with new keys before his gone push came back: the fresh one stays.
+			store.registerPushSubscription({ userId: 'jon', url, ...fresh, now: clock.value });
+			store.forgetPushSubscriptions([{ userId: 'jon', url, p256dh: old.p256dh }], clock.value);
+			expect(pushSubscriptionsOf(state, 'jon').map((row) => row.p256dh)).toEqual([fresh.p256dh]);
+		});
+	});
+
+	it('keeps accounting safe when many users register one endpoint and it goes', async () => {
+		const keys = await browserKeys();
+		await withStore('push-shared-endpoint', config, (store, clock, state) => {
+			const url = 'https://push.example.net/everyone';
+			const users = Array.from({ length: 50 }, (_, index) => `many_${index}`);
+			for (const userId of users) {
+				registerUser(store, clock, userId);
+				store.registerPushSubscription({ userId, url, ...keys, now: clock.value });
+			}
+			// Every user's 410 forgets that user's row alone, within its reservation.
+			const claimed = claim(store, clock, users.slice(0, 32));
+			expect(claimed.subscriptions).toHaveLength(POLICY.wakesPerMessage);
+			store.forgetPushSubscriptions(claimed.subscriptions, clock.value);
+			store.forgetPushSubscriptions([{ userId: users[49], url, p256dh: keys.p256dh }], clock.value);
+			expect(store.accountingStatus().unsafe).toBe(false);
+			expect(users.filter((userId) => pushSubscriptionsOf(state, userId).length)).toHaveLength(50 - POLICY.wakesPerMessage - 1);
+			// The store still takes work.
+			expect(() => store.registerPushSubscription({ userId: users[0], url, ...keys, now: clock.value })).not.toThrow();
+		});
+	});
+
+	it('skips registrations older than pushExpiryDays, refreshes them once a day, and cleanup deletes them', async () => {
+		const keys = await browserKeys();
+		await withStore('push-expiry', config, (store, clock, state) => {
+			registerUser(store, clock, 'kit');
+			registerUser(store, clock, 'lou');
+			store.registerPushSubscription({ userId: 'kit', url: 'https://push.example.net/kit', ...keys, now: clock.value });
+			store.registerPushSubscription({ userId: 'lou', url: 'https://push.example.net/lou', ...keys, now: clock.value });
+			clock.value += (POLICY.pushExpiryDays - 1) * DAY;
+			// Lou's browser connects again: more than a day on, the registration is refreshed.
+			store.registerPushSubscription({ userId: 'lou', url: 'https://push.example.net/lou', ...keys, now: clock.value });
+			clock.value += DAY + 1_000;
+			expect(claim(store, clock, ['kit', 'lou']).subscriptions.map((row) => row.userId)).toEqual(['lou']);
+			expect(pushSubscriptionsOf(state, 'kit')).toHaveLength(1);
+			for (let run = 0; run < 3; run++) {
+				store.runCleanup(clock.value);
+				clock.value += 2_000;
+			}
+			expect(pushSubscriptionsOf(state, 'kit')).toEqual([]);
+			expect(pushSubscriptionsOf(state, 'lou')).toHaveLength(1);
+		});
+	});
+
+	it('mutes for seconds or until changed, skips muted and dnd users without a wake slot, and moves mutes with /rename', async () => {
+		const keys = await browserKeys();
+		await withStore('push-mute', { push: { ...POLICY, wakesPerMessage: 1 } }, (store, clock, state) => {
+			for (const userId of ['mo', 'ned', 'dee']) {
+				registerUser(store, clock, userId);
+				store.registerPushSubscription({ userId, url: `https://push.example.net/${userId}`, ...keys, now: clock.value });
+			}
+			const muteOf = (userId: string) => store.statusInputs(userId, clock.value).muteUntil;
+			expect(store.setMute({ userId: 'mo', untilMs: clock.value + 90_500, now: clock.value })).toEqual({ changed: true, untilMs: clock.value + 90_500 });
+			expect(muteOf('mo')).toBe(clock.value + 90_500);
+			expect(store.setStatus({ userId: 'dee', choice: 'dnd', now: clock.value })).toEqual({ changed: true });
+			expect(store.setStatus({ userId: 'dee', choice: 'dnd', now: clock.value })).toEqual({ changed: false });
+			const first = claim(store, clock, ['mo', 'dee', 'ned']);
+			expect(first.subscriptions.map((row) => row.userId)).toEqual(['ned']);
+			// Neither took the one wake slot, and nothing was skipped for an allowance.
+			expect(first.skipped).toBe(0);
+			// It ends by itself, with no write; dnd lasts until changed.
+			clock.value += 91_000;
+			expect(muteOf('mo')).toBeUndefined();
+			expect(claim(store, clock, ['dee', 'mo'], 'thread').subscriptions.map((row) => row.userId)).toEqual(['mo']);
+			expect(store.setMute({ userId: 'mo', untilMs: MUTE_FOREVER, now: clock.value })).toEqual({ changed: true, untilMs: MUTE_FOREVER });
+			expect(store.setMute({ userId: 'mo', untilMs: MUTE_FOREVER, now: clock.value })).toEqual({ changed: false, untilMs: MUTE_FOREVER });
+			clock.value += 400 * 86_400_000;
+			expect(muteOf('mo')).toBe(MUTE_FOREVER);
+			// No identity, no mute and no status.
+			expect(store.setMute({ userId: 'guest_3', untilMs: MUTE_FOREVER, now: clock.value })).toEqual({ changed: false });
+			expect(store.setStatus({ userId: 'guest_3', choice: 'dnd', now: clock.value })).toEqual({ changed: false });
+			store.setStatus({ userId: 'mo', choice: 'invisible', now: clock.value });
+			store.setRoomMute({ userId: 'mo', roomId: 'general', untilMs: MUTE_FOREVER, now: clock.value });
+			store.renameIdentity({ from: 'mo', to: 'moe', now: clock.value });
+			expect(store.statusInputs('mo', clock.value)).toEqual({ choice: 'online', roomMutes: [] });
+			expect(store.statusInputs('moe', clock.value)).toEqual({ choice: 'invisible', muteUntil: MUTE_FOREVER, roomMutes: [{ roomId: 'general', untilMs: MUTE_FOREVER }] });
+			store.purgeUsers({ userIds: ['moe'], now: clock.value });
+			registerUser(store, clock, 'moe');
+			expect(store.statusInputs('moe', clock.value)).toEqual({ choice: 'online', roomMutes: [] });
+			expect(store.setMute({ userId: 'moe', untilMs: null, now: clock.value })).toEqual({ changed: false });
+			// Back to the defaults, the row goes.
+			store.setStatus({ userId: 'dee', choice: 'online', now: clock.value });
+		});
+	});
+
+	it('keeps room mutes per user and room, capped, expiring, and checked for a thread\'s parent', async () => {
+		const keys = await browserKeys();
+		await withStore('push-room-mute', { push: { ...POLICY } }, (store, clock, state) => {
+			registerUser(store, clock, 'rho');
+			store.registerPushSubscription({ userId: 'rho', url: 'https://push.example.net/rho', ...keys, now: clock.value });
+			const thread = store.mutate({
+				userId: 'rho', ipKey: 'ip-rho', requestId: 'thread', method: 'room_set', now: clock.value,
+				identity: { user_id: 'rho' }, params: { parent_room_id: 'general', title: 'A thread' },
+			}).result.room_id as string;
+			expect(store.setRoomMute({ userId: 'rho', roomId: 'general', untilMs: clock.value + 10_000, now: clock.value })).toEqual({ changed: true, untilMs: clock.value + 10_000 });
+			// The parent's mute silences the thread.
+			expect(claim(store, clock, ['rho'], thread)).toEqual({ subscriptions: [], skipped: 0 });
+			expect(store.setRoomMute({ userId: 'rho', roomId: 'general', untilMs: null, now: clock.value })).toEqual({ changed: true });
+			expect(store.setRoomMute({ userId: 'rho', roomId: 'general', untilMs: null, now: clock.value })).toEqual({ changed: false });
+			expect(claim(store, clock, ['rho'], thread).subscriptions).toHaveLength(1);
+			// Up to the cap; past it, refused unless one ran out.
+			for (let index = 0; index < MAX_ROOM_MUTES_PER_USER; index += 1) {
+				expect(store.setRoomMute({ userId: 'rho', roomId: `room-${index}`, untilMs: index === 0 ? clock.value + 1_000 : MUTE_FOREVER, now: clock.value }).changed).toBe(true);
+			}
+			expect(store.setRoomMute({ userId: 'rho', roomId: 'extra', untilMs: MUTE_FOREVER, now: clock.value })).toEqual({ changed: false, refused: true });
+			// Changing one held is no new row: allowed at the cap.
+			expect(store.setRoomMute({ userId: 'rho', roomId: 'room-1', untilMs: clock.value + 5_000, now: clock.value }).changed).toBe(true);
+			expect(store.expireRoomMutes('rho', clock.value)).toEqual({ expired: [], next: clock.value + 1_000 });
+			clock.value += 2_000;
+			expect(store.setRoomMute({ userId: 'rho', roomId: 'extra', untilMs: MUTE_FOREVER, now: clock.value }).changed).toBe(true);
+			expect(store.statusInputs('rho', clock.value).roomMutes).toHaveLength(MAX_ROOM_MUTES_PER_USER);
+			clock.value += 5_000;
+			expect(store.expireRoomMutes('rho', clock.value)).toEqual({ expired: ['room-1'] });
+			expect(store.expireRoomMutes('rho', clock.value)).toEqual({ expired: [] });
+			expect(integer(state.storage.sql.exec("SELECT COUNT(*) AS count FROM room_mutes WHERE user_id = 'rho'").one().count)).toBe(MAX_ROOM_MUTES_PER_USER - 1);
+			// Unmuting a room that no longer exists still works.
+			expect(store.setRoomMute({ userId: 'rho', roomId: 'room-5', untilMs: null, now: clock.value })).toEqual({ changed: true });
+			expect(store.accountingStatus().unsafe).toBe(false);
+		});
+	});
+
+	it('moves subscriptions with /rename, push_id kept, and deletes them with /purge', async () => {
+		const keys = await browserKeys();
+		await withStore('push-rename', config, (store, clock, state) => {
+			registerUser(store, clock, 'eve');
+			store.registerPushSubscription({ userId: 'eve', url: 'https://push.example.net/eve', ...keys, pushId: 'eve-laptop', now: clock.value });
+			expect(claim(store, clock, ['eve']).subscriptions).toHaveLength(1);
+			store.renameIdentity({ from: 'eve', to: 'eva', now: clock.value });
+			expect(pushSubscriptionsOf(state, 'eve')).toEqual([]);
+			expect(pushSubscriptionsOf(state, 'eva')).toEqual([{ url: 'https://push.example.net/eve', userId: 'eva', ...keys, pushId: 'eve-laptop', wake: ['mentions', 'replies'] }]);
+			// The wake time moved too: Eva is still coalesced in general.
+			expect(claim(store, clock, ['eva'])).toEqual({ subscriptions: [], skipped: 0 });
+			store.purgeUsers({ userIds: ['eva'], now: clock.value });
+			expect(pushSubscriptionsOf(state, 'eva')).toEqual([]);
+		});
+	});
+});

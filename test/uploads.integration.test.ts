@@ -63,7 +63,7 @@ describe('store uploads', () => {
 			const created = post(store, clock, 'alice', { body: { text: 'look', embeds: [{ kind: 'link', url: 'https://example.com' }, { kind: 'upload', title: 'dot.png', url: 'https://evil.example/x', og: { image: { url: 'https://evil.example/x' } } }] } });
 			const embeds = created.message!.body!.embeds as Array<Record<string, unknown>>;
 			expect(embeds.map((embed) => embed.embed_id)).toEqual([expect.stringMatching(/^embed_/), expect.stringMatching(/^embed_/)]);
-			// A new upload keeps only its title until the write finishes (§4.6.4).
+			// A new upload keeps only its title until the write finishes (§4.8.4).
 			expect(embeds[1]).toEqual({ embed_id: embeds[1].embed_id, kind: 'upload', title: 'dot.png' });
 			const write = writeOf(created.result);
 			expect(write.embed_id).toBe(embeds[1].embed_id);
@@ -100,7 +100,7 @@ describe('store uploads', () => {
 			register(store, clock, 'bob');
 			const withText = post(store, clock, 'bob', { body: { text: 'caption', embeds: [{ kind: 'upload' }] } });
 			const alone = post(store, clock, 'bob', { body: { embeds: [{ kind: 'upload' }] } });
-			// A failed write publishes the message without the embed (§4.6.3).
+			// A failed write publishes the message without the embed (§4.8.3).
 			const failedKey = writeOf(withText.result).write.key;
 			expect(store.claimUpload(failedKey, clock.value)).toBe(true);
 			const failed = store.finishUpload({ key: failedKey, ok: false }, clock.value);
@@ -196,6 +196,12 @@ describe('store uploads', () => {
 			setAvatar();
 			expect(store.clearAvatar({ userId: 'erin', now: clock.value }).changed).toBe(true);
 			expect(store.clearAvatar({ userId: 'erin', now: clock.value })).toEqual({ changed: false, deletedUploads: [] });
+			// A new user_id is a user clients keep nothing for: /rename gets every
+			// profile field to announce (§3.3), the live avatar included.
+			const third = setAvatar();
+			expect(store.renameIdentity({ from: 'erin', to: 'erin_2', now: clock.value })).toMatchObject({
+				name: 'Name of erin', avatar: `${MEDIA}/${third.upload.key}`, roles: [],
+			});
 		});
 	});
 
@@ -387,7 +393,7 @@ describe('uploads end to end', () => {
 			expect(embed.write_url).toMatch(/^https:\/\/demo\.test\/w\/a\./);
 			expect((await put(embed.write_url, png())).status).toBe(204);
 			const you = (await until(peer, (frame) => frame.method === 'user')).frame.params.you;
-			expect(you).toEqual({ user_id: userId, name: `Name of ${userId}`, avatar: expect.stringMatching(/^https:\/\/media\.test\/a\//), roles: [] });
+			expect(you).toEqual({ user_id: userId, name: `Name of ${userId}`, avatar: expect.stringMatching(/^https:\/\/media\.test\/a\//), roles: [], status: 'online' });
 			expect((await request(peer, 'me', 'me', {})).result.you.avatar).toBe(you.avatar);
 			// A message's author is a recorded object, without the avatar.
 			const posted = await exchange(peer, 'post', 'message', { body: { text: 'hi' } });
@@ -441,6 +447,32 @@ describe('uploads end to end', () => {
 		} finally { third.close(); }
 	});
 
+	it('drops an invisible user\'s missing avatar at sign-in without telling others they connected', async () => {
+		const userId = unique('hidden');
+		const first = await signedIn(userId);
+		const started = await request(first, 'avatar', 'command', { body: { text: '/avatar', embeds: [{ kind: 'upload' }] } });
+		expect((await put(started.result.embeds[0].write_url, png())).status).toBe(204);
+		await until(first, (frame) => frame.method === 'user');
+		expect((await request(first, 'invisible', 'me', { status: 'invisible' })).result.you.status).toBe('invisible');
+		first.close();
+		const watcher = await signedIn(unique('watcher'));
+		try {
+			await exchange(watcher, 'sync-before', 'me', {});
+			// The bucket already deleted it: signing in removes the avatar.
+			const url = await nearExpiry(userId);
+			await media().delete(url.slice('https://media.test/'.length));
+			const back = await resume(userId);
+			try {
+				await expect.poll(async () => (await avatarExpiry(userId)).avatar_url).toBe('');
+				// The user's own connection is told; others are not, since an
+				// invisible user's sign-in must not show.
+				expect((await until(back, (frame) => frame.method === 'user')).frame.params.you).toMatchObject({ user_id: userId, avatar: '', status: 'invisible' });
+				const seen = (await exchange(watcher, 'sync-after', 'me', {})).skipped;
+				expect(JSON.stringify(seen)).not.toContain(userId);
+			} finally { back.close(); }
+		} finally { watcher.close(); }
+	});
+
 	it('/toggle uploads turns uploads off and on for admins, saying which', async () => {
 		const user = await signedIn(unique('toggler'));
 		const admin = await connect(null);
@@ -465,7 +497,7 @@ describe('uploads end to end', () => {
 			expect((await fresh.next()).params.capabilities).toContain('embed:upload');
 			fresh.close();
 			expect((await request(user, 'nope', 'command', { body: { text: '/toggle uploads' } })).error.code).toBe(-32001);
-			expect((await request(admin, 'bad', 'command', { room_id: 'general', body: { text: '/toggle typing' } })).error.message).toBe('Usage: /toggle activity|uploads');
+			expect((await request(admin, 'bad', 'command', { room_id: 'general', body: { text: '/toggle typing' } })).error.message).toBe('Usage: /toggle activity|uploads|presence');
 		} finally { user.close(); admin.close(); }
 	});
 
@@ -498,7 +530,9 @@ describe('uploads end to end', () => {
 			expect(notice(off.skipped)).toBe('Activity is now **off**: typing is no longer relayed, and new connections are not offered it.');
 			const quiet = await guests();
 			expect(quiet.caps).not.toContain('activity');
-			expect((await request(quiet.alice, 'typing', 'activity', { room_id: 'general', typing: 5 })).error.code).toBe(-32601);
+			// Only a notification: with an `id` it gets no reply either way (§1).
+			quiet.alice.send({ id: 'typing', method: 'activity', params: { room_id: 'general', typing: 5 } });
+			expect((await exchange(quiet.alice, 'after-typing', 'me', {})).skipped.filter((frame) => frame.id === 'typing')).toEqual([]);
 			quiet.alice.close(); quiet.bob.close();
 			expect(await runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.toggle('activity'))).toBeUndefined();
 		} finally { admin.close(); }
@@ -522,7 +556,7 @@ describe('uploads end to end', () => {
 			const history = await request(admin, 'history', 'history', { room_id: 'general', limit: 50 });
 			expect(JSON.stringify(history.result)).not.toContain(userId);
 			expect((await request(admin, 'again', 'command', { room_id: 'general', body: { text: `/purge ${userId}` } })).error.code).toBe(-32602);
-			expect((await request(admin, 'self', 'command', { room_id: 'general', body: { text: '/purge admin' } })).error.code).toBe(-32602);
+			expect((await request(admin, 'self', 'command', { room_id: 'general', body: { text: '/purge admin' } })).error.code).toBe(-32001);
 		} finally { spammer.close(); admin.close(); }
 	});
 });

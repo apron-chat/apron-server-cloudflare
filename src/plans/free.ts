@@ -60,6 +60,12 @@ export const FREE_PLAN: Plan = Object.freeze({
 		pingSeconds: 45,
 		pingTimeoutSeconds: 150,
 		guestNumberBlock: 10,
+		// Status changes are announced at most once a minute per user, and a
+		// closed connection's change waits a minute, so a reload or a mobile
+		// reconnect shows nothing. Both run on one in-memory timer: no SQL, no
+		// alarm, no Durable Object request.
+		statusCoalesceSeconds: 60,
+		offlineGraceSeconds: 60,
 		sqlWritesPerDay: 80_000,
 		sqlReadsPerDay: 3_000_000,
 		foregroundWritesPerDay: 60_000,
@@ -104,8 +110,37 @@ export const FREE_PLAN: Plan = Object.freeze({
 		// analytics report them.
 		webSocketMessagesPerRequest: 1,
 	}),
+	// Web Push for mentions and replies, on once VAPID keys are set. A wake
+	// costs a subscription read and a counter write, and each push is an outbound
+	// request from the Durable Object, which needs no request allowance; the
+	// daily cap bounds what the push services see from the demo.
+	push: Object.freeze({
+		pushesPerDay: 1_000,
+		wakesPerMessage: 10,
+		// One sender's delivered pushes cannot spend more than a twentieth of
+		// the day, and one recipient gets at most a tenth of it, so a few
+		// sybils cannot use up everyone's pushes or flood one person.
+		pushesPerSenderDay: 50,
+		pushesPerRecipientDay: 100,
+		// Each mute or status change costs a few written rows.
+		mutesPerUserMinute: 6,
+		// A busy conversation wakes an unattended user (no connection attended, §4.5) at most once a minute per room.
+		coalesceSeconds: 60,
+		subscriptionsPerUser: 5,
+		// Clients register on every connection, refreshing at most daily; a
+		// browser unused for a week is not pushed to.
+		pushExpiryDays: 7,
+		registersPerUserMinute: 10,
+		ttlSeconds: 24 * 60 * 60,
+	}),
 	features: Object.freeze({
 		activity: false,
 		guestPosting: false,
+		// User status: connected users' from their connection attachments,
+		// with no SQL; a listing reads each listed member's chosen status
+		// with them, nothing for members who never chose one or muted
+		// (measured). Requests are already this plan's scarcest allowance
+		// after SQL writes; status adds none.
+		presence: true,
 	}),
 });

@@ -58,9 +58,33 @@ describe('frame policy boundaries', () => {
 		expect(() => parseFrame('"' + 'é'.repeat(8192) + '"')).toThrow(FrameError);
 		expect(() => parseFrame(new ArrayBuffer(0))).toThrow(expect.objectContaining({ closeCode: 1003 }));
 	});
-	it('accepts empty string IDs and both envelopes without treating unknown fields as operations', () => {
+	it('marks failures of notification-only methods as notifications, whatever their id (server policy; §1.1 lists them)', () => {
+		const failure = (raw: string) => {
+			try {
+				parseFrame(raw, { ...DEFAULT_PARSE_OPTIONS, maxJsonDepth: 3 });
+			} catch (error) {
+				return error as FrameError;
+			}
+			throw new Error(`expected ${raw} to fail`);
+		};
+		for (const method of ['ping', 'activity']) {
+			expect(failure(`{"id":"a","method":"${method}","params":"x"}`).notification, method).toBe(true);
+			expect(failure(`{"id":"a","method":"${method}","params":{"a":{"b":{"c":{}}}}}`).notification, method).toBe(true);
+			expect(failure(`{"id":7,"method":"${method}"}`).notification, method).toBe(true);
+		}
+		// A client's status is a request (§4.5): its failures are answered.
+		expect(failure('{"id":"a","method":"status","params":"x"}').notification).toBe(false);
+		expect(failure('{"method":"status","params":"x"}').notification).toBe(true);
+		// Requests are answered; so is an invalid envelope, with or without an id.
+		expect(failure('{"id":"a","method":"me","params":"x"}').notification).toBe(false);
+		expect(failure('{"method":"me","params":"x"}').notification).toBe(true);
+		expect(failure('{"id":7,"method":"me"}').notification).toBe(false);
+		expect(failure('{"params":{}}').notification).toBe(false);
+	});
+	it('accepts empty string IDs without treating unknown fields as operations', () => {
 		expect(parseFrame('{"id":"","method":"auth","params":{},"ignored":42}').request.id).toBe('');
-		expect(parseFrame('{"jsonrpc":"2.0","id":"a","method":"auth"}').request.full).toBe(true);
+		// Frames omit `jsonrpc` (§1); one that carries it is an unknown key, ignored.
+		expect(parseFrame('{"jsonrpc":"1.0","id":"a","method":"auth"}').request).toEqual({ method: 'auth', params: {}, id: 'a' });
 		expect(parseFrame('{"method":"unknown"}').request.id).toBeUndefined();
 	});
 });
@@ -132,8 +156,23 @@ describe('configuration policy boundaries', () => {
 		expect(() => config({ GUEST_POSTING: '1' })).toThrow(ConfigError);
 	});
 
+	it('takes presence from the plan unless PRESENCE says otherwise, and bounds status delays', () => {
+		expect(config().presence).toBe(DEFAULT_FEATURES.presence);
+		expect(config({ PRESENCE: '' }).presence).toBe(DEFAULT_FEATURES.presence);
+		expect(config({ PRESENCE: 'false' }).presence).toBe(false);
+		expect(config({ PRESENCE: 'TRUE' }).presence).toBe(true);
+		// Anything but true or false is a configuration error.
+		expect(() => config({ PRESENCE: 'full' })).toThrow(ConfigError);
+		expect(() => config({ PRESENCE: 'connected' })).toThrow(ConfigError);
+		expect(() => config({ PRESENCE: 'on' })).toThrow(ConfigError);
+		expect(config({ LIMIT_STATUS_COALESCE_SECONDS: '10' }).limits.statusCoalesceSeconds).toBe(10);
+		expect(() => config({}, { statusCoalesceSeconds: 61 })).toThrow(ConfigError);
+		expect(() => config({}, { offlineGraceSeconds: 61 })).toThrow(ConfigError);
+	});
+
 	it('keeps the free plan as it was and valid, and the paid plan inside its allowances', () => {
-		expect(FREE_PLAN.features).toEqual({ activity: false, guestPosting: false });
+		expect(FREE_PLAN.features).toEqual({ activity: false, guestPosting: false, presence: true });
+		expect(PAID_PLAN.features.presence).toBe(true);
 		expect(FREE_PLAN.limits).toMatchObject({ globalFramesPerMinute: 300, processedFramesPerDay: 100_000, globalPostsPerDay: 5_000, registrationsPerDay: 100, sqlWritesPerDay: 80_000, sqlReadsPerDay: 3_000_000 });
 		expect(FREE_PLAN.account.daily.sqlRowsWritten).toBe(100_000);
 		// The calibrated ceilings follow the selected plan, and Free fits under any.

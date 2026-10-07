@@ -150,7 +150,8 @@ it("broadcasts flat self-describing snapshots and enforces replacement semantics
 		const edited = post(store, clock, "alice", "m2", { message_id: messageId, body: { text: "replacement", format: "markdown" } });
 		expect(edited.message).toMatchObject({ message_id: messageId, room_id: "general", from: { user_id: "alice" } });
 		expect(Number(edited.message?.log_id)).toBeGreaterThan(Number(messageId));
-		expect(edited.message?.ext).toBeUndefined();
+		// A save that leaves `ext` out keeps it: writes merge `ext` (§4.12).
+		expect(edited.message?.ext).toEqual({ irc: { nick: "ada_" } });
 		expect(edited.message?.body).toEqual({ text: "replacement", format: "markdown", embeds: [] });
 
 		expect(errorCode(() => post(store, clock, "bob", "spoof", { message_id: messageId, body: { text: "spoofed" } }))).toBe("denied");
@@ -169,11 +170,68 @@ it("broadcasts flat self-describing snapshots and enforces replacement semantics
 		const deleted = post(store, clock, "alice", "m3", { message_id: messageId, deleted: true, body: { text: "ignored" }, ext: { keep: true } });
 		expect(deleted.message?.deleted).toBe(true);
 		expect(deleted.message?.body).toBeUndefined();
-		expect(deleted.message?.ext).toEqual({ keep: true });
+		// A tombstone carries no body and no ext (§4.4), whatever the save sent.
+		expect(deleted.message).not.toHaveProperty("ext");
 
 		const restored = post(store, clock, "alice", "m4", { message_id: messageId, deleted: false, body: { text: "restored" } });
 		expect(restored.message?.deleted).toBeUndefined();
 		expect(restored.message?.body?.text).toBe("restored");
+		// The tombstone kept none, so there is nothing to merge into.
+		expect(restored.message).not.toHaveProperty("ext");
+	});
+});
+
+it("merges ext one level deep on message saves and room_set (§4.12)", async () => {
+	await withStore("ext-merge", (store, clock) => {
+		const created = post(store, clock, "alice", "e1", {
+			body: { text: "x" },
+			// An empty value on creation stores nothing; `null` is an ordinary value.
+			ext: { irc: { nick: "ada_" }, bridge: { id: 1 }, gone: "", none: null },
+		});
+		const messageId = String(created.result.message_id);
+		expect(created.message?.ext).toEqual({ irc: { nick: "ada_" }, bridge: { id: 1 }, none: null });
+
+		// Each key carried replaces the stored value whole; an empty one clears it; others stay.
+		const merged = post(store, clock, "alice", "e2", {
+			message_id: messageId, body: { text: "x" },
+			ext: { irc: { channel: "#ops" }, bridge: {}, none: [], added: false },
+		});
+		expect(merged.message?.ext).toEqual({ irc: { channel: "#ops" }, added: false });
+
+		// `"ext": {}` changes nothing.
+		const unchanged = post(store, clock, "alice", "e3", { message_id: messageId, body: { text: "y" }, ext: {} });
+		expect(unchanged.message?.ext).toEqual({ irc: { channel: "#ops" }, added: false });
+
+		// Clearing every key leaves no ext at all.
+		const cleared = post(store, clock, "alice", "e4", { message_id: messageId, body: { text: "y" }, ext: { irc: "", added: [] } });
+		expect(cleared.message).not.toHaveProperty("ext");
+
+		// A "__proto__" key is ordinary data, never a prototype.
+		const proto = JSON.parse('{"__proto__": {"polluted": true}, "safe": 1}') as Record<string, unknown>;
+		const hostile = post(store, clock, "alice", "e5", { message_id: messageId, body: { text: "y" }, ext: proto });
+		expect(Object.hasOwn(hostile.message!.ext!, "__proto__")).toBe(true);
+		expect(JSON.parse(JSON.stringify(hostile.message!.ext))).toEqual(JSON.parse('{"__proto__": {"polluted": true}, "safe": 1}'));
+		expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+		const kept = post(store, clock, "alice", "e6", { message_id: messageId, body: { text: "z" }, ext: { safe: 2 } });
+		expect(JSON.parse(JSON.stringify(kept.message!.ext))).toEqual(JSON.parse('{"__proto__": {"polluted": true}, "safe": 2}'));
+
+		// The size check runs on the merged snapshot: a write that fits alone fails merged.
+		const half = "x".repeat(3_000);
+		post(store, clock, "alice", "e7", { message_id: messageId, body: { text: "z" }, ext: { a: half } });
+		post(store, clock, "alice", "e8", { message_id: messageId, body: { text: "z" }, ext: { a: "", b: half } });
+		expect(errorCode(() => post(store, clock, "alice", "e9", { message_id: messageId, body: { text: "z" }, ext: { a: half, c: half } }))).toBe("too_large");
+
+		// room_set merges the same way, and checks the merged fields' size.
+		const roomId = thread(store, clock, "r1", { ext: { demo: { color: "blue" }, other: 1 } });
+		const saved = store.mutate(op(clock, "alice", "r2", "room_set", { room_id: roomId, title: "T", ext: { other: "", more: true } }));
+		expect(saved.room?.ext).toEqual({ demo: { color: "blue" }, more: true });
+		const keptRoom = store.mutate(op(clock, "alice", "r3", "room_set", { room_id: roomId, title: "T" }));
+		expect(keptRoom.room?.ext).toEqual({ demo: { color: "blue" }, more: true });
+		const big = "y".repeat(1_200);
+		store.mutate(op(clock, "alice", "r4", "room_set", { room_id: roomId, title: "T", ext: { big } }));
+		expect(errorCode(() => store.mutate(op(clock, "alice", "r5", "room_set", { room_id: roomId, title: "T", ext: { bigger: big } })))).toBe("too_large");
+		const emptied = store.mutate(op(clock, "alice", "r6", "room_set", { room_id: roomId, title: "T", ext: { demo: {}, more: "", big: "" } }));
+		expect(emptied.room).not.toHaveProperty("ext");
 	});
 });
 
@@ -245,15 +303,15 @@ it("creates only thread rooms and replaces their client fields on save", async (
 		expect(errorCode(() => store.mutate(op(clock, "alice", "nested", "room_set", { parent_room_id: roomId, title: "Nested" })))).toBe("denied");
 
 		// Any participant may save a thread's metadata; omitted fields are
-		// cleared, the server supplies a title, and parent_room_id and
-		// private are fixed.
+		// cleared but `ext`, which merges (§4.12), the server supplies a title,
+		// and parent_room_id and private are fixed.
 		const saved = store.mutate(op(clock, "alice", "save", "room_set", { room_id: roomId, parent_room_id: "elsewhere", private: true }));
 		expect(saved.result).toEqual({ room_id: roomId });
 		expect(saved.created).toBe(false);
 		expect(saved.room).toMatchObject({ room_id: roomId, parent_room_id: "general", title: "Thread" });
 		expect(saved.room?.description).toBeUndefined();
 		expect(saved.room).not.toHaveProperty("private");
-		expect(saved.room?.ext).toBeUndefined();
+		expect(saved.room?.ext).toEqual({ demo: { color: "blue" } });
 		expect(Number(saved.room?.log_id)).toBeGreaterThan(Number(roomId));
 		expect(saved.room?.latest_log_id).toBe(saved.room?.log_id);
 		expect(saved.room?.history_log_id).toBe(roomId);
@@ -368,10 +426,10 @@ it("sets, clears, collapses, and deduplicates reactions", async () => {
 		expect(errorCode(() => store.mutate(op(clock, "bob", "not-array", "reactions", { message_id: messageId, emojis: "👍" })))).toBe("invalid_params");
 		expect(errorCode(() => store.mutate(op(clock, "bob", "not-string", "reactions", { message_id: messageId, emojis: [1] })))).toBe("invalid_params");
 		expect(errorCode(() => store.mutate(op(clock, "bob", "empty", "reactions", { message_id: messageId, emojis: [""] })))).toBe("invalid_params");
-		expect(errorCode(() => store.mutate(op(clock, "bob", "long", "reactions", { message_id: messageId, emojis: ["x".repeat(65)] })))).toBe("invalid_params");
+		expect(errorCode(() => store.mutate(op(clock, "bob", "long", "reactions", { message_id: messageId, emojis: ["x".repeat(65)] })))).toBe("too_large");
 		expect(errorCode(() => store.mutate(op(clock, "bob", "many", "reactions", {
 			message_id: messageId, emojis: Array.from({ length: 9 }, (_, index) => `e${index}`),
-		})))).toBe("invalid_params");
+		})))).toBe("denied");
 
 		const history = store.historyPage({ roomId: "general", after: target.message!.log_id, limit: 50, now: clock.value });
 		expect(messagesOf(history).map((entry) => entry.message_id)).toEqual([messageId]);
@@ -385,12 +443,13 @@ it("rejects new reactions on tombstones and caps reacting users per message", as
 		const messageId = String(target.result.message_id);
 		store.mutate(op(clock, "alice", "a", "reactions", { message_id: messageId, emojis: ["👍"] }));
 		store.mutate(op(clock, "bob", "b", "reactions", { message_id: messageId, emojis: ["👍"] }));
-		expect(errorCode(() => store.mutate(op(clock, "carol", "c", "reactions", { message_id: messageId, emojis: ["👍"] })))).toBe("invalid_params");
+		// A well-formed request the cap refuses is denied (§1.1).
+		expect(errorCode(() => store.mutate(op(clock, "carol", "c", "reactions", { message_id: messageId, emojis: ["👍"] })))).toBe("denied");
 		// Existing reactors may still change their own set.
 		expect(store.mutate(op(clock, "bob", "b2", "reactions", { message_id: messageId, emojis: ["🎉"] })).broadcasts).toHaveLength(1);
 
 		post(store, clock, "alice", "delete", { message_id: messageId, deleted: true });
-		expect(errorCode(() => store.mutate(op(clock, "bob", "b3", "reactions", { message_id: messageId, emojis: ["👀"] })))).toBe("invalid_params");
+		expect(errorCode(() => store.mutate(op(clock, "bob", "b3", "reactions", { message_id: messageId, emojis: ["👀"] })))).toBe("denied");
 		// Clearing a set on a tombstone is still allowed.
 		expect(store.mutate(op(clock, "bob", "b4", "reactions", { message_id: messageId, emojis: [] })).broadcasts).toHaveLength(1);
 	}, { ...ROOMY, reactionUsersPerMessage: 2 });
@@ -469,4 +528,15 @@ it("deduplicates canonical retries before quotas, survives restart, and expires 
 		expect(afterExpiry.deduplicated).not.toBe(true);
 		expect(afterExpiry.result.message_id).not.toBe(first.result.message_id);
 	}, DEDUP_CONFIG);
+});
+
+it("answers count limits with denied and size limits with too_large (§1.1)", async () => {
+	await withStore("limit-codes", (store, clock) => {
+		const embeds = Array.from({ length: 5 }, () => ({ kind: "link", url: "https://example.com" }));
+		expect(errorCode(() => post(store, clock, "alice", "embeds", { body: { text: "x", embeds } }))).toBe("denied");
+		expect(errorCode(() => post(store, clock, "alice", "mention", { body: { text: "x", mentions: ["u".repeat(257)] } }))).toBe("too_large");
+		expect(errorCode(() => post(store, clock, "alice", "text", { body: { text: "x".repeat(5_000) } }))).toBe("too_large");
+		expect(errorCode(() => post(store, clock, "alice", "snapshot", { body: { text: "x" }, ext: { big: "y".repeat(9_000) } }))).toBe("too_large");
+		expect(errorCode(() => store.mutate(op(clock, "alice", "room", "room_set", { parent_room_id: "general", title: "T", ext: { big: "y".repeat(2_100) } })))).toBe("too_large");
+	});
 });

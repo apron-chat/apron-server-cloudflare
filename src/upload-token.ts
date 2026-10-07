@@ -1,9 +1,9 @@
-// A `write_url` (protocol §4.6.3) is a credential: its token names the R2
+// A `write_url` (protocol §4.8.3) is a credential: its token names the R2
 // object, the largest body it accepts, and when it expires, signed with
 // `UPLOAD_SIGNING_KEY`. The entry Worker checks the signature before it reads
 // a byte, so a guessed or altered URL never reaches R2 or the Durable Object.
 
-export interface UploadGrant {
+interface UploadGrant {
 	/** The R2 object key, `f/<id>` or `a/<id>`. */
 	key: string;
 	maxBytes: number;

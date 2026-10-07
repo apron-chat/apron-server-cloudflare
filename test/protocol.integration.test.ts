@@ -1,5 +1,5 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import { DEFAULT_LIMITS } from '../src/budget';
 import { canonicalizeIp, hashIpKey } from '../src/ip';
 import { connect as open, exchange, greeting, reply, request, until, type ConnectOptions, type Frame, type Peer } from './helpers/socket';
@@ -44,16 +44,19 @@ const connect = ({ ip = `192.0.2.${nextIp++}`, ...options }: Partial<ConnectOpti
 
 async function authenticate(peer: Peer, scheme = 'guest', extraCaps: string[] = []) {
 	const { server } = await greeting(peer);
-	expect(server.params.apron).toBe(7);
-	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload']);
+	expect(server.params.apron).toBe(8);
+	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'status', 'ext', 'ext:settings']);
 	expect(server.params.auth).toContain('webauthn');
 	expect(server.params.ping).toBe(45);
-	// Demo hints live under the standard ext object, not a top-level key.
-	expect(server.params.ext.demo.retention_seconds).toBeGreaterThan(0);
+	// The extension `ext:settings` keeps its data under its name in ext (§1, §4.12).
+	expect(Object.keys(server.params.ext)).toEqual(['settings']);
 	peer.send({ method: 'auth', id: 'auth', params: { scheme } });
 	const auth = await peer.next();
 	expect(auth.result.you.user_id).toMatch(/^guest_/);
-	return auth.result.you;
+	// `you` carries the user's own `status` (§4.5), which recorded objects such as `from` never do.
+	expect(auth.result.you.status).toBe('online');
+	const { status: _status, ...identity } = auth.result.you;
+	return identity;
 }
 
 type ServerInternals = { config: { limits: Record<string, number>; activityEnabled: boolean }; recentFrames: number[] };
@@ -89,8 +92,28 @@ it('admits clients without Origin as guests without advertising or allowing pass
 		expect((await greeting(peer)).server.params.auth).toEqual(['token', 'guest']);
 		peer.send({ id: 'auth', method: 'auth', params: { scheme: 'guest' } });
 		expect((await peer.next()).result.you.user_id).toMatch(/^guest_/);
+		// A scheme the server defines but does not offer this connection is unsupported (§3.2), as is email.
 		peer.send({ id: 'passkey', method: 'auth', params: { scheme: 'webauthn', action: 'register', step: 'begin' } });
-		expect((await peer.next()).error.code).toBe(-32001);
+		expect((await peer.next()).error.code).toBe(-32601);
+		peer.send({ id: 'email', method: 'auth', params: { scheme: 'email', email: 'ada@example.com' } });
+		expect((await peer.next()).error.code).toBe(-32601);
+	} finally { peer.close(); }
+});
+
+it('rejects an auth scheme the spec does not define as invalid_params, and email as unsupported', async () => {
+	const peer = await connect({ path: '/' });
+	try {
+		await greeting(peer);
+		// An unknown name that the request depends on is invalid_params (§1), before and after sign-in.
+		peer.send({ id: 'ext', method: 'auth', params: { scheme: 'ext:foo' } });
+		expect((await peer.next()).error.code).toBe(-32602);
+		// `email` is defined, but not offered here: unsupported (§3.2).
+		peer.send({ id: 'email', method: 'auth', params: { scheme: 'email', email: 'ada@example.com' } });
+		expect((await peer.next()).error.code).toBe(-32601);
+		peer.send({ id: 'auth', method: 'auth', params: { scheme: 'guest' } });
+		expect((await peer.next()).result.you.user_id).toMatch(/^guest_/);
+		peer.send({ id: 'ext2', method: 'auth', params: { scheme: 'ext:foo' } });
+		expect((await peer.next()).error.code).toBe(-32602);
 	} finally { peer.close(); }
 });
 
@@ -173,9 +196,10 @@ it('answers the liveness ping before and after authentication', async () => {
 		// Other spacing reaches the handler, which answers it as well.
 		peer.socket.send('{ "method": "ping" }');
 		expect(await peer.next()).toEqual({ method: 'pong' });
-		// A ping request is not the liveness ping: before auth it is denied.
+		// Clients send `ping` as a notification (§1.1): by server policy an `id` is ignored, so it gets `pong`
+		// and no reply, before auth too (§1).
 		peer.send({ id: 'ping-request', method: 'ping' });
-		expect((await peer.next()).error.code).toBe(-32001);
+		expect(await peer.next()).toEqual({ method: 'pong' });
 		peer.send({ id: 'auth', method: 'auth', params: { scheme: 'guest' } });
 		expect((await peer.next()).result.you.user_id).toMatch(/^guest_/);
 		peer.socket.send('{"method":"ping"}');
@@ -183,11 +207,63 @@ it('answers the liveness ping before and after authentication', async () => {
 	} finally { peer.close(); }
 });
 
+it('never answers a notification-only method sent with an id, even with invalid params or while busy (server policy; §1.1)', async () => {
+	// Two frames a connection, as each counts as a policy violation and three close it.
+	const first = await connect();
+	const second = await connect();
+	try {
+		await authenticate(first);
+		await authenticate(second);
+		first.send({ id: 'ping-string', method: 'ping', params: 'idle' });
+		first.send({ id: 'activity-params', method: 'activity', params: [] });
+		expect(await drain(first)).toEqual([]);
+		second.send({ id: 'ping-params', method: 'ping', params: 5 });
+		let deep: unknown = { idle: true };
+		for (let index = 0; index < DEFAULT_LIMITS.maxJsonDepth + 2; index++) deep = { nested: deep };
+		second.send({ id: 'activity-deep', method: 'activity', params: deep });
+		expect(await drain(second)).toEqual([]);
+		// An ordinary request with the same faults is still answered.
+		expect((await request(second, 'me-params', 'me', 'x')).error.code).toBe(-32602);
+		// Over the server-wide frame limit a request gets retry_after; a notification-only method, nothing.
+		await configure((config) => { config.limits.globalFramesPerMinute = 1; });
+		expect((await request(first, 'me-last', 'me', {})).result.you).toBeTruthy();
+		first.send({ id: 'activity-busy', method: 'activity', params: { typing: 3 } });
+		expect((await request(first, 'me-busy', 'me', {})).error.code).toBe(-32002);
+		await configure((config) => { config.limits.globalFramesPerMinute = DEFAULT_LIMITS.globalFramesPerMinute; });
+		expect((await exchange(first, 'me-again', 'me', {})).skipped).toEqual([]);
+	} finally {
+		first.close();
+		second.close();
+		await configure((config) => { config.limits.globalFramesPerMinute = DEFAULT_LIMITS.globalFramesPerMinute; });
+	}
+});
+
+it('ignores a request method sent without an id: nothing changes and nothing is sent (§1.1)', async () => {
+	const sender = await connect();
+	const watcher = await connect();
+	try {
+		await authenticate(sender);
+		await authenticate(watcher);
+		sender.send({ method: 'message', params: { room_id: 'general', body: { text: 'sent without an id' } } });
+		sender.send({ method: 'me', params: { status: 'dnd' } });
+		sender.send({ method: 'room_set', params: { parent_room_id: 'general', title: 'No id' } });
+		sender.send({ method: 'auth', params: { scheme: 'guest' } });
+		expect(await drain(sender)).toEqual([]);
+		// Nobody else was told of a message or a room either.
+		expect((await drain(watcher)).filter((frame) => frame.method === 'message' || frame.method === 'room_update')).toEqual([]);
+		expect((await request(sender, 'me', 'me', {})).result.you.status).toBe('online');
+		const page = await request(sender, 'history', 'history', { room_id: 'general', limit: 20 });
+		expect(JSON.stringify(page.result)).not.toContain('sent without an id');
+		// Ignoring is not a policy violation: the connection stays open.
+		expect(sender.closed()).toBeUndefined();
+	} finally { sender.close(); watcher.close(); }
+});
+
 it('commits once for canonical retries, passes ext through, and sends no reply to notifications', async () => {
 	const peer = await connect();
 	try {
 		const you = await authenticate(peer);
-		peer.send({ jsonrpc: '2.0', id: '', method: 'message', params: {
+		peer.send({ id: '', method: 'message', params: {
 			room_id: 'general', body: { text: 'hello' }, ext: { z: 1, a: 2 }, from: { user_id: 'spoof' }, stray: true,
 		} });
 		// The broadcast comes before the result on the sender's connection (§1).
@@ -346,8 +422,7 @@ it('creates threads with room_set, delivers only to joined rooms, and moves mess
 
 		// Creating a thread joins its creator: `joined` before the result, and
 		// `updated` to the parent's other members, who are not joined.
-		// A v6 `intro_message` is an unknown field now, and dropped.
-		alice.send({ id: 'thread', method: 'room_set', params: { parent_room_id: 'general', title: 'Deploy', description: 'Why the *4pm* deploy failed', intro_message: { message_id: messageId } } });
+		alice.send({ id: 'thread', method: 'room_set', params: { parent_room_id: 'general', title: 'Deploy', description: 'Why the *4pm* deploy failed' } });
 		const created = await until(alice, (frame) => frame.id === 'thread');
 		const roomId = created.frame.result.room_id;
 		const room = {
@@ -356,7 +431,7 @@ it('creates threads with room_set, delivers only to joined rooms, and moves mess
 		};
 		// `joined` carries the members, bare, and their current objects in
 		// `users`; a guest's join is not logged, so no membership follows.
-		expect(created.skipped).toEqual([{ method: 'room_update', params: { joined: [{ ...room, members: [{ user_id: aliceId.user_id }] }], users: [aliceId] } }]);
+		expect(created.skipped).toEqual([{ method: 'room_update', params: { joined: [{ ...room, members: [{ user_id: aliceId.user_id }] }], users: [{ ...aliceId, status: 'online' }] } }]);
 		expect((await until(bob, (frame) => frame.method === 'room_update')).frame).toEqual({ method: 'room_update', params: { updated: [room] } });
 
 		// Posting does not require joining, and a poster who has not joined
@@ -405,12 +480,14 @@ it('creates threads with room_set, delivers only to joined rooms, and moves mess
 		// Joining: `joined`, with the members after the join, before `{}`.
 		const members = [aliceId, bobId].sort((a, b) => a.user_id < b.user_id ? -1 : 1);
 		const joinedRoom = { ...room, latest_log_id: followed.log_id, members: members.map((member) => ({ user_id: member.user_id })) };
+		// `users` are current objects, with each one's status (§4.5).
+		const online = members.map((member) => ({ ...member, status: 'online' }));
 		const joined = await exchange(bob, 'join', 'room_join', { room_id: roomId });
 		expect(joined.frame.result).toEqual({});
-		expect(joined.skipped).toEqual([{ method: 'room_update', params: { joined: [joinedRoom], users: members } }]);
+		expect(joined.skipped).toEqual([{ method: 'room_update', params: { joined: [joinedRoom], users: online } }]);
 		// A second join logs nothing and re-sends `joined` to that connection only.
 		const again = await exchange(bob, 'join-again', 'room_join', { room_id: roomId });
-		expect(again.skipped).toEqual([{ method: 'room_update', params: { joined: [joinedRoom], users: members } }]);
+		expect(again.skipped).toEqual([{ method: 'room_update', params: { joined: [joinedRoom], users: online } }]);
 
 		// Any participant may save a thread; `updated` reaches the room's and
 		// the parent's members, and the result follows it.
@@ -467,8 +544,9 @@ it('leaves activity off when ACTIVITY is false: not advertised, and typing is no
 		await authenticate(alice);
 		await authenticate(bob);
 		alice.send({ method: 'activity', params: { room_id: 'general', typing: 5 } });
+		// Clients send `activity` as a notification (§1.1): by server policy one with an `id` gets no reply, even with activity off.
 		alice.send({ id: 'typing-request', method: 'activity', params: { room_id: 'general', typing: 5 } });
-		expect((await until(alice, (frame) => frame.id === 'typing-request')).frame.error.code).toBe(-32601);
+		expect((await exchange(alice, 'after-typing', 'me', {})).skipped.filter((frame) => frame.id === 'typing-request')).toEqual([]);
 		alice.send({ id: 'after', method: 'message', params: { room_id: 'general', body: { text: 'no typing relayed' } } });
 		const done = await until(bob, (frame) => frame.method === 'message' && frame.params.body?.text === 'no typing relayed');
 		expect(done.skipped.filter((frame) => frame.method === 'activity')).toEqual([]);
@@ -492,7 +570,7 @@ it('limits the frames the whole server processes in a minute without closing soc
 	} finally { peer.close(); await configure((config) => { config.limits.globalFramesPerMinute = DEFAULT_LIMITS.globalFramesPerMinute; }); }
 });
 
-it('with ACTIVITY on, relays typing to room members, accepts away, throttles per user, and tells only the sender once', async () => {
+it('with ACTIVITY on, relays typing to room members, throttles per user, and tells only the sender once', async () => {
 	await configure((config) => { config.activityEnabled = true; });
 	const alice = await connect();
 	const bob = await connect();
@@ -503,8 +581,6 @@ it('with ACTIVITY on, relays typing to room members, accepts away, throttles per
 		await authenticate(carol, 'guest', ['activity']);
 		// Carol has left general, so typing there is not relayed to her.
 		await request(carol, 'leave', 'room_leave', { room_id: 'general' });
-		// `away` is accepted and never delivered, with or without a room.
-		alice.send({ method: 'activity', params: { away: true } });
 		alice.send({ method: 'activity', params: { typing: 99 } });
 		const first = await until(bob, (frame) => frame.method === 'activity');
 		// Typing is capped by policy, in the default room without room_id; the
@@ -530,8 +606,8 @@ it('with ACTIVITY on, relays typing to room members, accepts away, throttles per
 		const history = await request(alice, 'history', 'history', { room_id: 'general', limit: 50 });
 		const entries: Array<{ message_id: string; from?: { user_id: string } }> = history.result.messages;
 		expect(entries.some((entry) => entry.message_id === mine.frame.result.message_id)).toBe(true);
-		// No system notice is logged: neither v7 `~` nor legacy `@` senders.
-		expect(entries.some((entry) => entry.from?.user_id?.startsWith('~') || entry.from?.user_id?.startsWith('@'))).toBe(false);
+		// No system notice is logged.
+		expect(entries.some((entry) => entry.from?.user_id?.startsWith('~'))).toBe(false);
 	} finally { alice.close(); bob.close(); carol.close(); await configure((config) => { config.activityEnabled = false; }); }
 });
 
@@ -589,7 +665,7 @@ it('lists rooms by filter, most recently active first, with members on request, 
 		expect(generalIds).toEqual([...generalIds].sort());
 		for (const member of general.members) expect(Object.keys(member)).toEqual(['user_id']);
 		expect(mine.joined.find((room: { room_id: string }) => room.room_id === older).members).toEqual([{ user_id: aliceId.user_id }]);
-		expect(mine.users).toEqual(expect.arrayContaining([aliceId, bobId]));
+		expect(mine.users).toEqual(expect.arrayContaining([{ ...aliceId, status: 'online' }, { ...bobId, status: 'online' }]));
 		const userIds = mine.users.map((user: { user_id: string }) => user.user_id);
 		expect(userIds).toEqual([...new Set(userIds)].sort());
 		expect(general.member_count).toBeUndefined();
@@ -612,7 +688,7 @@ it('lists rooms by filter, most recently active first, with members on request, 
 		expect(ids(one.not_joined)).toEqual([older]);
 		expect(one.joined).toEqual([]);
 		expect(one.not_joined[0].members).toEqual([{ user_id: aliceId.user_id }]);
-		expect(one.users).toEqual([aliceId]);
+		expect(one.users).toEqual([{ ...aliceId, status: 'online' }]);
 		// `latest_log_id` is ignored, since guests' memberships are not logged:
 		// the result is a full listing, without `left`.
 		const since = (await request(alice, 'since', 'room_list', { filter: 'joined', latest_log_id: one.not_joined[0].latest_log_id })).result;
@@ -660,7 +736,14 @@ it('lists only connected guests as members after others posted and left', async 
 			await until(peer, (frame) => frame.id === `post-${index}`);
 			peer.close();
 		}
-		await new Promise((resolve) => setTimeout(resolve, 200));
+		// Wait for the server to process each close, rather than a fixed time.
+		await vi.waitFor(() => runInDurableObject(env.DEMO.getByName('public-demo-v1'), (_instance, state) => {
+			const open = state.getWebSockets().filter((socket) => {
+				const attachment = socket.deserializeAttachment() as { userId?: string; closing?: boolean };
+				return gone.includes(attachment.userId ?? '') && !attachment.closing && socket.readyState === 1;
+			});
+			expect(open).toHaveLength(0);
+		}), { timeout: 5_000 });
 		// A fresh connection sees their messages in history, but not them as
 		// members: a guest's membership ends with its connection, unlogged.
 		const fresh = await connect();
@@ -691,51 +774,78 @@ it('drops a connection that pinged and went quiet from room_list members and clo
 		// The runtime answers the ping itself; it never reaches the handler.
 		bob.socket.send('{"method":"ping"}');
 		expect(await until(bob, (frame) => frame.method === 'pong')).toMatchObject({ frame: { method: 'pong' } });
-		carol.socket.send('{"method":"ping"}');
-		await until(carol, (frame) => frame.method === 'pong');
 		await new Promise((resolve) => setTimeout(resolve, 700));
 		// Carol keeps talking; Bob's peer has gone quiet.
 		carol.socket.send('{"method":"ping"}');
 		await until(carol, (frame) => frame.method === 'pong');
-		await new Promise((resolve) => setTimeout(resolve, 500));
+		// Judge staleness at a fixed moment, half the timeout after Carol's
+		// ping, rather than whenever a loaded machine gets to the listing:
+		// Carol (0.5 s quiet) is live and Bob (at least 1.2 s quiet) is stale.
+		const pinged = await runInDurableObject(env.DEMO.getByName('public-demo-v1'), (_instance, state) => {
+			const times = new Map<string, number>();
+			for (const socket of state.getWebSockets()) {
+				const attachment = socket.deserializeAttachment() as { userId?: string };
+				const at = state.getWebSocketAutoResponseTimestamp(socket)?.getTime();
+				if (attachment.userId && at !== undefined) times.set(attachment.userId, at);
+			}
+			return Object.fromEntries(times);
+		});
+		expect(pinged[carolId.user_id] - pinged[bobId.user_id]).toBeGreaterThanOrEqual(700);
+		vi.spyOn(Date, 'now').mockReturnValue(pinged[carolId.user_id] + 500);
 
 		const listed = (await request(alice, 'list', 'room_list', { room_id: 'general', members: true })).result.joined[0].members.map((member: { user_id: string }) => member.user_id);
 		expect(listed).toContain(carolId.user_id);
 		expect(listed).not.toContain(bobId.user_id);
 		expect(await closed).toBe(1001);
-	} finally { alice.close(); bob.close(); carol.close(); await configure((config) => { config.limits.pingTimeoutSeconds = 150; }); }
+	} finally { vi.restoreAllMocks(); alice.close(); bob.close(); carol.close(); await configure((config) => { config.limits.pingTimeoutSeconds = 150; }); }
 });
 
-it('advertises the demo policy hints', async () => {
+it('never closes the connection whose frame starts a sweep as stale, though it last pinged long ago (B4)', async () => {
+	const alice = await connect();
+	const bob = await connect();
+	try {
+		await authenticate(alice);
+		const bobId = await authenticate(bob);
+		await configure((config) => { config.limits.pingTimeoutSeconds = 1; });
+		bob.socket.send('{"method":"ping"}');
+		await until(bob, (frame) => frame.method === 'pong');
+		const pinged = await runInDurableObject(env.DEMO.getByName('public-demo-v1'), (instance, state) => {
+			// The next event sweeps, as the first one after a wake does.
+			(instance as unknown as { presenceSweptAt: number }).presenceSweptAt = 0;
+			const socket = state.getWebSockets().find((ws) => (ws.deserializeAttachment() as { userId?: string }).userId === bobId.user_id)!;
+			return state.getWebSocketAutoResponseTimestamp(socket)!.getTime();
+		});
+		// Long after Bob's ping and his last frame, a frame arrives from him:
+		// the sweep it starts must not close the socket it came in on.
+		vi.spyOn(Date, 'now').mockReturnValue(pinged + 10_000);
+		const reply = await request(bob, 'still-here', 'me', {});
+		expect(reply.result.you.user_id).toBe(bobId.user_id);
+		expect(bob.closed()).toBeUndefined();
+		// Alice, who neither pinged nor is sending, is never judged stale either.
+		expect((await request(alice, 'alice', 'me', {})).result).toBeDefined();
+	} finally { vi.restoreAllMocks(); alice.close(); bob.close(); await configure((config) => { config.limits.pingTimeoutSeconds = 150; }); }
+});
+
+it('advertises the extension ext:settings', async () => {
 	const peer = await connect();
 	try {
-		expect((await peer.next()).params.ext.demo).toEqual({
-			retention_seconds: DEFAULT_LIMITS.retentionSeconds,
-			cleanup_seconds: DEFAULT_LIMITS.cleanupSeconds,
-			max_frame_bytes: 16_384,
-			max_message_text_bytes: 4_096,
-			max_snapshot_bytes: 8_192,
-			guest_posts_per_minute: 5,
-			registered_posts_per_minute: 20,
+		const server = (await peer.next()).params;
+		expect(server.capabilities).toContain('ext:settings');
+		// Both booleans, always sent; clients take an absent one as true.
+		expect(server.ext).toEqual({ settings: {
 			// vitest.config.ts turns guest posting on.
 			guest_posting: true,
-			server_frames_per_minute: DEFAULT_LIMITS.globalFramesPerMinute,
-			room_list_per_minute: 6,
-			// Registered members listed per room in `members`, besides connected ones.
-			room_list_members: DEFAULT_LIMITS.roomListMembers,
 			read_cursors: false,
-		});
+		} });
 	} finally { peer.close(); }
 });
 
-it('speaks protocol v7: a sign-in welcome, no email sign-in, and ~private notices', async () => {
+it('speaks protocol v8: a sign-in welcome, no email sign-in, and ~private notices', async () => {
 	const withPasskeys = await connect();
 	const bot = await connect({ origin: null });
 	try {
 		const { server, welcome } = await greeting(withPasskeys);
-		expect(server.params).toMatchObject({ apron: 7, agent: 'apron-cloudflare-demo/7', auth: ['webauthn', 'token', 'guest'] });
-		// Only the protocol's current names (0bf4a27): no `protocol`, `caps`, or `name`.
-		for (const legacy of ['protocol', 'caps', 'name']) expect(server.params).not.toHaveProperty(legacy);
+		expect(server.params).toMatchObject({ apron: 8, agent: 'apron-cloudflare-demo/8', auth: ['webauthn', 'token', 'guest'] });
 		// `server.welcome` is for the sign-in screen (§3.2), worded for this origin.
 		expect(server.params.welcome).toMatch(/Create a passkey/);
 		expect(server.params.welcome).toContain(`kept for ${Math.round(DEFAULT_LIMITS.retentionSeconds / 86_400)} days`);
@@ -884,7 +994,7 @@ it('sends the notifications a request causes on its connection before its result
 	} finally { alice.close(); }
 });
 
-it('returns history in v7 shape: messages, first_log_id/last_log_id, and empty arrays omitted', async () => {
+it('returns history pages: messages, first_log_id/last_log_id, and empty arrays omitted', async () => {
 	const peer = await connect();
 	try {
 		await authenticate(peer);

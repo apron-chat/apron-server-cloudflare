@@ -1,6 +1,6 @@
 import { DEFAULT_LIMITS } from "./budget";
 
-export const ERROR_CODES = Object.freeze({
+const ERROR_CODES = Object.freeze({
 	parse_error: -32700,
 	invalid_request: -32600,
 	unsupported: -32601,
@@ -11,7 +11,7 @@ export const ERROR_CODES = Object.freeze({
 	too_large: -32003,
 } as const);
 
-export type ErrorName = keyof typeof ERROR_CODES;
+type ErrorName = keyof typeof ERROR_CODES;
 
 export interface ProtocolError {
 	name: ErrorName;
@@ -23,10 +23,9 @@ export interface RequestFrame {
 	method: string;
 	params: Record<string, unknown>;
 	id?: string;
-	full: boolean;
 }
 
-export interface ParsedFrame {
+interface ParsedFrame {
 	request: RequestFrame;
 	bytes: number;
 }
@@ -35,15 +34,13 @@ export class FrameError extends Error {
 	readonly protocol: ProtocolError;
 	readonly closeCode?: number;
 	readonly id: string | null;
-	readonly full: boolean;
 	readonly notification: boolean;
 
-	constructor(protocol: ProtocolError, options: { id?: string | null; full?: boolean; notification?: boolean; closeCode?: number } = {}) {
+	constructor(protocol: ProtocolError, options: { id?: string | null; notification?: boolean; closeCode?: number } = {}) {
 		super(protocol.message);
 		this.name = "FrameError";
 		this.protocol = protocol;
 		this.id = options.id ?? null;
-		this.full = options.full ?? false;
 		this.notification = options.notification ?? false;
 		this.closeCode = options.closeCode;
 	}
@@ -78,7 +75,7 @@ function walkJson(value: unknown, state: { nodes: number; maxDepth: number; maxN
 	}
 }
 
-export interface ParseOptions {
+interface ParseOptions {
 	maxFrameBytes: number;
 	maxJsonDepth: number;
 	maxJsonNodes: number;
@@ -91,6 +88,45 @@ export const DEFAULT_PARSE_OPTIONS: ParseOptions = {
 	maxJsonNodes: DEFAULT_LIMITS.maxJsonNodes,
 	maxRequestIdBytes: DEFAULT_LIMITS.maxRequestIdBytes,
 };
+
+/**
+ * Methods clients send as notifications, without an `id` (the table in
+ * §1.1). By this server's policy, not the protocol's, one sent with an `id`
+ * anyway is handled as the notification and gets no reply, not even an
+ * error for invalid params: answering it would make a notification look
+ * like a request. The liveness ping is answered with `pong`, a
+ * notification, not a reply. A client's `status` is a request (§1.1, §4.5),
+ * not one of these.
+ */
+export const NOTIFICATION_METHODS: ReadonlySet<string> = new Set(["ping", "activity"]);
+
+/**
+ * Methods clients send as requests, with an `id` (the table in §1.1). One
+ * sent without an `id` is ignored, as §1.1 lets a server: it changes
+ * nothing and gets no reply, so a client can never believe an unanswered
+ * change was applied.
+ */
+export const REQUEST_METHODS: ReadonlySet<string> = new Set([
+	"auth", "me", "message", "command", "history", "room_list", "room_join", "room_leave",
+	"room_set", "reactions", "status", "push_register", "push_unregister",
+]);
+
+/**
+ * Auth schemes the spec defines (§3.2). Any other is an unknown name, so an
+ * `auth` with it is `invalid_params` (§1); a defined one that the server does
+ * not offer is `unsupported`.
+ */
+export const DEFINED_AUTH_SCHEMES: ReadonlySet<string> = new Set(["guest", "token", "webauthn", "email"]);
+
+/** Whether `method` is one clients send only as a notification (§1.1). */
+export function notificationOnly(method: unknown): boolean {
+	return typeof method === "string" && NOTIFICATION_METHODS.has(method);
+}
+
+/** Whether a frame gets no reply: it has no `id`, or its method is only a notification (NOTIFICATION_METHODS). */
+export function isNotification(method: unknown, id: string | undefined): boolean {
+	return id === undefined || notificationOnly(method);
+}
 
 /** Parse one application frame after applying the byte gate. */
 export function parseFrame(data: string | ArrayBuffer | ArrayBufferView, options: ParseOptions = DEFAULT_PARSE_OPTIONS): ParsedFrame {
@@ -110,42 +146,46 @@ export function parseFrame(data: string | ArrayBuffer | ArrayBufferView, options
 	}
 	const state = { nodes: 0, maxDepth: 0, maxNodes: options.maxJsonNodes };
 	if (!isObject(value)) throw new FrameError({ name: "invalid_request", message: "Request must be an object" });
-	const full = Object.hasOwn(value, "jsonrpc");
 	let id: string | undefined;
 	if (Object.hasOwn(value, "id")) {
 		if (typeof value.id !== "string" || utf8Bytes(value.id) > options.maxRequestIdBytes) {
-			throw new FrameError({ name: "invalid_request", message: "Request id must be a bounded string" }, { full });
+			// A notification-only method is never answered, whatever its `id` (NOTIFICATION_METHODS).
+			throw new FrameError({ name: "invalid_request", message: "Request id must be a bounded string" }, { notification: notificationOnly(value.method) });
 		}
 		id = value.id;
 	}
-	if (full && value.jsonrpc !== "2.0") throw new FrameError({ name: "invalid_request", message: "Invalid JSON-RPC version" }, { id: id ?? null, full });
-	if (typeof value.method !== "string" || value.method.length === 0) throw new FrameError({ name: "invalid_request", message: "Method must be a non-empty string" }, { id: id ?? null, full });
+	// Decided from the method, which is known before any params check, so no
+	// error below answers a notification-only method sent with an `id` (NOTIFICATION_METHODS).
+	const notification = isNotification(value.method, id);
+	const failure = { id: id ?? null, notification };
+	// An invalid envelope is answered, even without an `id`, unless its method is only a notification.
+	const envelope = { id: id ?? null, notification: notificationOnly(value.method) };
+	if (typeof value.method !== "string" || value.method.length === 0) throw new FrameError({ name: "invalid_request", message: "Method must be a non-empty string" }, envelope);
 	try {
 		walkJson(value, state);
 	} catch (error) {
-		if (error instanceof FrameError) throw new FrameError(error.protocol, { id: id ?? null, full, notification: id === undefined });
-		throw new FrameError({ name: "too_large", message: "JSON structure is too large" }, { id: id ?? null, full, notification: id === undefined });
+		if (error instanceof FrameError) throw new FrameError(error.protocol, failure);
+		throw new FrameError({ name: "too_large", message: "JSON structure is too large" }, failure);
 	}
 	let params: Record<string, unknown> = {};
 	if (Object.hasOwn(value, "params")) {
-		if (!isObject(value.params)) throw new FrameError({ name: "invalid_params", message: "Params must be an object" }, { id: id ?? null, full, notification: id === undefined });
+		if (!isObject(value.params)) throw new FrameError({ name: "invalid_params", message: "Params must be an object" }, failure);
 		params = value.params;
 	}
 	// The parsed root is already bounded. Re-check the configured depth here so
 	// tests and callers can use a lower policy than the guard's hard ceiling.
 	const configuredDepth = state.maxDepth;
-	if (configuredDepth > options.maxJsonDepth) throw new FrameError({ name: "too_large", message: "JSON nesting is too deep" }, { id: id ?? null, full, notification: id === undefined });
-	return { request: { method: value.method, params, ...(id === undefined ? {} : { id }), full }, bytes };
+	if (configuredDepth > options.maxJsonDepth) throw new FrameError({ name: "too_large", message: "JSON nesting is too deep" }, failure);
+	return { request: { method: value.method, params, ...(id === undefined ? {} : { id }) }, bytes };
 }
 
-export function protocolReply(id: string, result: unknown, full = false): Record<string, unknown> {
-	return { ...(full ? { jsonrpc: "2.0" } : {}), id, result };
+export function protocolReply(id: string, result: unknown): Record<string, unknown> {
+	return { id, result };
 }
 
 /** Errors not tied to a request (no known `id`) omit `id` entirely. */
-export function protocolError(id: string | null | undefined, error: ProtocolError, full = false): Record<string, unknown> {
+export function protocolError(id: string | null | undefined, error: ProtocolError): Record<string, unknown> {
 	return {
-		...(full ? { jsonrpc: "2.0" } : {}),
 		...(id == null ? {} : { id }),
 		error: { code: ERROR_CODES[error.name], message: error.message, ...(error.data ? { data: error.data } : {}) },
 	};
@@ -169,27 +209,6 @@ export function jsonString(value: unknown): string {
 	const result = JSON.stringify(value);
 	if (result === undefined) throw new Error("cannot serialize protocol value");
 	return result;
-}
-
-/** Stable recursive representation used for request deduplication. */
-export function canonicalize(value: unknown): string {
-	if (value === null) return "null";
-	if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
-	if (typeof value === "number") {
-		if (!Number.isFinite(value)) throw new TypeError("non-finite JSON number");
-		return JSON.stringify(value);
-	}
-	if (Array.isArray(value)) return `[${value.map(canonicalize).join(",")}]`;
-	if (isObject(value)) {
-		return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalize(value[key])}`).join(",")}}`;
-	}
-	throw new TypeError("unsupported JSON value");
-}
-
-export async function digestRequest(method: string, params: Record<string, unknown>): Promise<string> {
-	const bytes = new TextEncoder().encode(canonicalize({ method, params }));
-	const digest = await crypto.subtle.digest("SHA-256", bytes);
-	return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 export function requiredString(params: Record<string, unknown>, name: string): string {

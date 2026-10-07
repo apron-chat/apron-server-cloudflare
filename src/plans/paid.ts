@@ -20,7 +20,9 @@
 //   alarms. Rejected connection attempts also reach the object; the
 //   account-usage stop at 90% covers them.
 // - Durable Object duration: one object awake all day is 10,800 GB-s, under
-//   the 12,900 daily share, so duration cannot run over.
+//   the 12,900 daily share, so duration cannot run over. User status spends
+//   it rather than requests: one timer keeps the object awake up to a minute
+//   after its last event while a status change waits to be announced.
 // - Storage: history is kept 7 days, matching uploaded images, so the
 //   database watermarks rise to 768 MB (1 GB hard), a fifth of the 5 GB-month
 //   included. Cleanup runs daily; it removes the same rows a day as hourly
@@ -136,10 +138,22 @@ export const PAID_PLAN: Plan = Object.freeze({
 		lifecycleLagSeconds: 24 * 60 * 60,
 		storedBytesCap: 5 * 1024 * 1024 * 1024,
 	}),
+	// Mentions and replies wake users through Web Push (VAPID keys required): enough for
+	// half the day's posts to each wake one browser.
+	push: Object.freeze({
+		...FREE_PLAN.push!,
+		pushesPerDay: 5_000,
+		pushesPerSenderDay: 200,
+	}),
 	features: Object.freeze({
 		// Typing costs about 5 frames a typing minute, inside the frame budget.
 		activity: true,
 		// Guests only read, as on Free: a moderation choice, not a budget one.
 		guestPosting: false,
+		// User status, as on Free: connected users' from their connection
+		// attachments, and a listed member's chosen status read with them
+		// (nothing for members who never chose one or muted, one read at
+		// worst).
+		presence: true,
 	}),
 });

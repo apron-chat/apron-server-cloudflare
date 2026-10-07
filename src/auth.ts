@@ -10,7 +10,7 @@ import {
 import type { RuntimeConfig } from "./config";
 import type { Identity, StoredCredential } from "./domain";
 
-export type WebAuthnAction = "register" | "login";
+type WebAuthnAction = "register" | "login";
 
 export interface ChallengeRecord {
 	challengeId: string;
@@ -24,7 +24,7 @@ export interface ChallengeRecord {
 	userId?: string;
 	userHandle?: string;
 	userName?: string;
-	/** A registration that adds a passkey to the signed-in identity (§4.9), which is `userId`. */
+	/** A registration that adds a passkey to the signed-in identity (§4.10), which is `userId`. */
 	adds?: boolean;
 	expiresAt: number;
 }
@@ -39,22 +39,22 @@ export interface CredentialRepository {
 		credential: StoredCredential;
 		ipKey: string;
 		now: number;
-		/** Add the passkey to `userId`, the identity signed in on this connection, rather than create one (§4.9). */
+		/** Add the passkey to `userId`, the identity signed in on this connection, rather than create one (§4.10). */
 		adds?: boolean;
 	}): Identity | Promise<Identity>;
 	updateCredentialCounter(credentialId: string, counter: number): void | Promise<void>;
 }
 
-export interface AuthIdentity extends Identity {
+interface AuthIdentity extends Identity {
 	tier: "registered";
 }
 
-export interface BeginResult {
+interface BeginResult {
 	challenge: ChallengeRecord;
 	publicKey: Record<string, unknown>;
 }
 
-export interface FinishResult {
+interface FinishResult {
 	identity: AuthIdentity;
 	credential?: StoredCredential;
 }
@@ -206,7 +206,7 @@ export class WebAuthnService {
 		connectionId?: string,
 		/**
 		 * `adds`: the registration adds a passkey to `identity`, which is signed
-		 * in (§4.9), under its WebAuthn user handle when it has one, so an
+		 * in (§4.10), under its WebAuthn user handle when it has one, so an
 		 * authenticator replaces rather than duplicates its passkey for it.
 		 */
 		registration: { name?: string; userIdTaken?: (userId: string) => boolean; adds?: { userHandle?: string } } = {},

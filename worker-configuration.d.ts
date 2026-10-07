@@ -14,12 +14,19 @@ declare global {
 		MEDIA_ORIGIN?: string;
 		PUBLIC_ORIGIN?: string;
 		UPLOAD_SIGNING_KEY?: string;
+		VAPID_PUBLIC_KEY?: string;
+		VAPID_PRIVATE_KEY?: string;
+		VAPID_SUBJECT?: string;
+		PUSH_HOSTS?: string;
 		ASSETS?: Fetcher;
 		ALLOWED_ORIGINS?: string;
 		RP_ID?: string;
 		RP_ORIGINS?: string;
 		RP_NAME?: string;
 		ADMISSION_OFF?: string;
+		ACTIVITY?: string;
+		GUEST_POSTING?: string;
+		PRESENCE?: string;
 		ENVIRONMENT?: string;
 	}
 	namespace Cloudflare {
@@ -36,12 +43,19 @@ declare global {
 			MEDIA_ORIGIN?: string;
 			PUBLIC_ORIGIN?: string;
 			UPLOAD_SIGNING_KEY?: string;
+			VAPID_PUBLIC_KEY?: string;
+			VAPID_PRIVATE_KEY?: string;
+			VAPID_SUBJECT?: string;
+			PUSH_HOSTS?: string;
 			ASSETS?: Fetcher;
 			ALLOWED_ORIGINS?: string;
 			RP_ID?: string;
 			RP_ORIGINS?: string;
 			RP_NAME?: string;
 			ADMISSION_OFF?: string;
+			ACTIVITY?: string;
+			GUEST_POSTING?: string;
+			PRESENCE?: string;
 			ENVIRONMENT?: string;
 		}
 	}

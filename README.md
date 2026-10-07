@@ -20,11 +20,23 @@ for a zero-overage deployment.
 - **Images and avatars.** Signed-in users attach images and set avatars
   (`embed:upload`), stored in R2 within its free tier for a week (avatars a
   month).
+- **Push for mentions and replies.** With VAPID keys set, a mention or a
+  reply wakes a signed-in user whose every tab is idle or closed, through
+  their browser's Web Push service (`server.push` kind `webpush`), unless
+  they muted it with `status`, everywhere or in that room, or chose `dnd`.
+- **Who's around.** With push on, member lists show each user as online,
+  idle, busy (`dnd`), or offline, and a user can choose `dnd`, `invisible`,
+  or no status at all with `me`. A chosen status shows at once; changes
+  the connections cause are coalesced to one a minute per user, a closed
+  tab counts after a minute's grace, and a peer that vanishes without
+  closing only once it is found stale (150 seconds without a ping), all
+  with no SQL or alarms of their own.
 - **Bring your own frontend.** Guest connections are accepted from any
   origin — even `localhost` or a browser console.
 - **Built to stay inside its plan.** Every operation is metered against
-  budgets sized under the plan's included usage, with rolling one-day
-  retention and graceful read-only degradation when budgets run out.
+  budgets sized under the plan's included usage, with rolling retention
+  (7 days on Workers Paid, which production runs, and one day on Workers
+  Free) and graceful read-only degradation when budgets run out.
 
 ## Quick start
 
@@ -33,8 +45,10 @@ npm ci
 npx wrangler dev --port 8080
 ```
 
-Then run the web client from [shazow/apron](https://github.com/shazow/apron)
-(`make dev-web`) and open <http://localhost:5173>. Check your work with:
+Then run the web client from
+[apron-chat/apron-web](https://github.com/apron-chat/apron-web) with
+`npm run dev` (see its README); its dev server proxies `/ws` to port 8080.
+Open <http://localhost:5173>. Check your work with:
 
 ```sh
 npm run typecheck

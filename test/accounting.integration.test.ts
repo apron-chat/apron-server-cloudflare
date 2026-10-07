@@ -1,7 +1,7 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
-import { Store, StoreError, defaultStoreConfig } from '../src/store';
-import { DEFAULT_LIMITS } from '../src/budget';
+import { MAX_ROOM_MUTES_PER_USER, MUTE_FOREVER, Store, StoreError, WAKE_SCOPES, defaultStoreConfig } from '../src/store';
+import { DEFAULT_LIMITS, PUSH_POLICY } from '../src/budget';
 import { expectRetryAfter, messagesOf } from './helpers/store';
 
 // A day's retention with hourly cleanup, for tests that watch records expire.
@@ -360,7 +360,7 @@ describe('measured storage accounting', () => {
 		const stub = env.DEMO.getByName('accounting-room-list-v2');
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
-			const store = new Store(state, defaultStoreConfig(), clock);
+			const store = new Store(state, defaultStoreConfig({ push: { ...PUSH_POLICY! } }), clock);
 			store.initialize();
 			state.storage.transactionSync(() => {
 				for (let index = 1; index <= 100; index += 1) {
@@ -413,9 +413,129 @@ describe('measured storage accounting', () => {
 			const memberListing = costSince(store, beforeMembers);
 			expect([...members.values()].every((list) => list.length === DEFAULT_LIMITS.roomListMembers)).toBe(true);
 			expectWithinReserve(memberListing);
-			return { rooms: rooms.length, ...listing, registration, join, memberListing };
+			// With status, at its worst: every member has a `user_status` row (a
+			// chosen status and a mute), with as many registrations and room mutes
+			// as a user may hold, which a listing does not read.
+			state.storage.transactionSync(() => {
+				for (let index = 1; index <= DEFAULT_LIMITS.roomListMembers; index += 1) {
+					state.storage.sql.exec("INSERT INTO user_status (user_id, status, mute_until_ms) VALUES (?, 'dnd', ?)", `member-${index}`, clock.now() + HOUR);
+					for (let registration = 0; registration < PUSH_POLICY!.subscriptionsPerUser; registration += 1) {
+						state.storage.sql.exec(
+							'INSERT INTO push_subscriptions (user_id, url, p256dh, auth, wake, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?)',
+							`member-${index}`, `https://push.example.net/member-${index}/${registration}`, 'p', 'a', registration === 0 ? 3 : 0, clock.now() - registration, clock.now() - registration,
+						);
+					}
+					for (const room of rooms) state.storage.sql.exec('INSERT INTO room_mutes (user_id, room_id, mute_until_ms) VALUES (?, ?, ?)', `member-${index}`, room.room_id, clock.now() + HOUR);
+				}
+			});
+			const beforeStatus = snapshot(store);
+			const withStatus = store.roomMembers(rooms.map((room) => room.room_id), DEFAULT_LIMITS.roomListMembers, clock.now(), undefined, true);
+			const statusListing = costSince(store, beforeStatus);
+			expect(withStatus.get('general')?.find((member) => member.user_id === 'member-1')?.choice).toBe('dnd');
+			expectWithinReserve(statusListing);
+			expect(store.accountingStatus().unsafe).toBe(false);
+			return { rooms: rooms.length, ...listing, registration, join, memberListing, statusListing };
 		});
 		console.info('accounting-room-list', JSON.stringify(result));
+	});
+
+	it('measures member listings with status by population, and reuses a listing until a write', async () => {
+		const stub = env.DEMO.getByName('accounting-member-status-v1');
+		const result = await runInDurableObject(stub, async (_instance, state) => {
+			const clock = new FakeClock(futureUtcNoon());
+			const store = new Store(state, defaultStoreConfig({ push: { ...PUSH_POLICY! }, memberCacheMs: MINUTE }), clock);
+			store.initialize();
+			const members = DEFAULT_LIMITS.roomListMembers;
+			// Four rooms of `members` registered members each: none with status
+			// state; each with two live waking registrations and a room mute
+			// (neither read by a listing); a mix (a third with push, a tenth
+			// muted, one in thirty invisible, one in fifty with no status); and
+			// the worst case, every member with a chosen status and a mute and a
+			// full set of registrations.
+			const populations = ['none', 'push', 'mixed', 'worst'] as const;
+			state.storage.transactionSync(() => {
+				for (const population of populations) {
+					for (let index = 0; index < members; index += 1) {
+						const userId = `${population}-${String(index).padStart(3, '0')}`;
+						state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES (?, ?, ?, 'registered', 0, 0)", userId, `handle-${userId}`, userId);
+						state.storage.sql.exec('INSERT INTO memberships (room_id, user_id) VALUES (?, ?)', population, userId);
+						const register = (count: number, wake: (registration: number) => number) => {
+							for (let registration = 0; registration < count; registration += 1) {
+								state.storage.sql.exec(
+									'INSERT INTO push_subscriptions (user_id, url, p256dh, auth, wake, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?)',
+									userId, `https://push.example.net/${userId}/${registration}`, 'p', 'a', wake(registration), clock.now() - registration, clock.now() - registration,
+								);
+							}
+						};
+						if (population === 'push') {
+							register(2, () => 3);
+							state.storage.sql.exec('INSERT INTO room_mutes (user_id, room_id, mute_until_ms) VALUES (?, ?, ?)', userId, population, clock.now() + HOUR);
+						}
+						if (population === 'mixed' && index % 3 === 0) register(2, () => 3);
+						if (population === 'mixed' && (index % 10 === 0 || index % 30 === 1 || index % 50 === 7)) {
+							const status = index % 30 === 1 ? 'invisible' : index % 50 === 7 ? '' : 'online';
+							state.storage.sql.exec('INSERT INTO user_status (user_id, status, mute_until_ms) VALUES (?, ?, ?)', userId, status, index % 10 === 0 ? clock.now() + HOUR : null);
+						}
+						if (population === 'worst') {
+							state.storage.sql.exec("INSERT INTO user_status (user_id, status, mute_until_ms) VALUES (?, 'dnd', ?)", userId, clock.now() + HOUR);
+							register(PUSH_POLICY!.subscriptionsPerUser, (registration) => registration === 0 ? 3 : 0);
+						}
+					}
+				}
+			});
+			// Rows written behind the store's back: start from nothing kept.
+			(store as unknown as { memberCache: Map<string, unknown> }).memberCache.clear();
+			const listing: Record<string, { plain: Cost; status: Cost; perMember: number }> = {};
+			for (const population of populations) {
+				(store as unknown as { memberCache: Map<string, unknown> }).memberCache.clear();
+				const beforePlain = snapshot(store);
+				store.roomMembers([population], members, clock.now());
+				const plain = costSince(store, beforePlain);
+				(store as unknown as { memberCache: Map<string, unknown> }).memberCache.clear();
+				const beforeStatus = snapshot(store);
+				store.roomMembers([population], members, clock.now(), undefined, true);
+				const status = costSince(store, beforeStatus);
+				expectWithinReserve(plain);
+				expectWithinReserve(status);
+				listing[population] = { plain, status, perMember: (status.observed.reads - plain.observed.reads) / members };
+			}
+			// Status adds nothing for members without a `user_status` row, whatever
+			// else they hold, and one read at worst, against the two each costs already.
+			expect(listing.none.perMember).toBeLessThanOrEqual(0.05);
+			expect(listing.push.perMember).toBeLessThanOrEqual(0.05);
+			expect(listing.worst.perMember).toBeLessThanOrEqual(1.05);
+
+			// A listing again within memberCacheMs reads nothing and reserves nothing.
+			store.roomMembers(['mixed'], members, clock.now(), undefined, true);
+			const beforeReuse = snapshot(store);
+			const reused = store.roomMembers(['mixed'], members, clock.now(), undefined, true);
+			const reuse = costSince(store, beforeReuse);
+			expect(reuse.observed).toEqual({ reads: 0, writes: 0, operations: 0 });
+			expect(reuse.reserved.reads).toBe(0);
+			// Each member carries the status they chose: `online` without a row.
+			const chosen = (userId: string) => reused.get('mixed')!.find((member) => member.user_id === userId)!.choice;
+			expect([chosen('mixed-000'), chosen('mixed-001'), chosen('mixed-002'), chosen('mixed-007')]).toEqual(['online', 'invisible', 'online', '']);
+			// Without status, a different listing.
+			const beforePlainAgain = snapshot(store);
+			store.roomMembers(['mixed'], members, clock.now(), undefined, false);
+			expect(costSince(store, beforePlainAgain).observed.reads).toBeGreaterThan(0);
+			// Any write to what a listing read ends the reuse.
+			store.registerIdentity({
+				userId: 'writer', name: 'Writer', userHandle: 'writer-handle', now: clock.now(), ipKey: 'writer-ip',
+				credential: { credentialId: 'writer-credential', userId: 'writer', publicKey: 'key', counter: 0 },
+			});
+			const beforeWrite = snapshot(store);
+			store.roomMembers(['mixed'], members, clock.now(), undefined, true);
+			const afterWrite = costSince(store, beforeWrite);
+			expect(afterWrite.observed.reads).toBeGreaterThan(2 * members);
+			// And so does time: past memberCacheMs it is read again.
+			const beforeExpiry = snapshot(store);
+			store.roomMembers(['mixed'], members, clock.now() + MINUTE, undefined, true);
+			expect(costSince(store, beforeExpiry).observed.reads).toBeGreaterThan(2 * members);
+			expect(store.accountingStatus().unsafe).toBe(false);
+			return { listing, reuse };
+		});
+		console.info('accounting-member-status', JSON.stringify(result));
 	});
 
 	it('keeps a 50-record history page across record kinds within its reservation', async () => {
@@ -653,7 +773,7 @@ describe('measured storage accounting', () => {
 
 	it('measures every Store reservation boundary used by runtime operations', async () => {
 		const stub = env.DEMO.getByName('accounting-operation-matrix-v1');
-		const config = defaultStoreConfig();
+		const config = defaultStoreConfig({ push: { ...PUSH_POLICY! } });
 		const result = await runInDurableObject(stub, async (_instance, state) => {
 			const clock = new FakeClock(futureUtcNoon());
 			const store = new Store(state, config, clock);
@@ -661,11 +781,10 @@ describe('measured storage accounting', () => {
 			const { costs, measure, measureAsync } = costLog(store);
 
 			measure('auth attempt reservation', () => store.reserveAuthAttempt({ ipKey: 'matrix-auth', now: clock.now() }));
-			measure('history quota reservation', () => store.reserveHistory({ userId: 'matrix-history-user', ipKey: 'matrix-history-ip', now: clock.now() }));
 			measure('frame reservation', () => store.reserveFrames({ ipKey: 'matrix-frame-ip', now: clock.now(), count: 1 }));
 			measure('frame block', () => store.reserveFrames({ ipKey: 'matrix-block-ip', now: clock.now(), count: DEFAULT_LIMITS.frameLease }));
 			measure('guest number block', () => store.reserveGuestNumbers(DEFAULT_LIMITS.guestNumberBlock, clock.now()));
-			measure('connection admission reservation', () => store.reserveConnection({ ipKey: 'matrix-connection-ip', tier: 'pending', now: clock.now() }));
+			measure('connection admission reservation', () => store.reserveConnection({ ipKey: 'matrix-connection-ip', now: clock.now() }));
 			measure('identity registration', () => store.registerIdentity({
 				userId: 'matrix-user',
 				name: 'Matrix user',
@@ -679,6 +798,15 @@ describe('measured storage accounting', () => {
 			measure('identity count', () => store.countIdentities());
 			measure('credential IDs lookup', () => store.credentialIdsForUser('matrix-user'));
 			measure('credential counter update', () => store.updateCredentialCounter('matrix-credential', 1));
+			const subscription = { userId: 'matrix-user', url: 'https://push.example.net/matrix', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), pushId: 'p'.repeat(64) };
+			measure('push subscription register', () => store.registerPushSubscription({ ...subscription, now: clock.now() }));
+			measure('push subscription register again, unchanged', () => store.registerPushSubscription({ ...subscription, now: clock.now() }));
+			expect(measure('push wake claim', () => store.claimPushes({ senderId: 'matrix-sender', roomId: 'general', candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() })).subscriptions).toHaveLength(1);
+			const unsubscribed = Array.from({ length: 31 }, (_, index) => `matrix-unsubscribed-${index}`);
+			expect(measure('push wake claim, 31 unsubscribed candidates first', () => store.claimPushes({ senderId: 'matrix-sender', roomId: 'matrix-room', candidates: [...unsubscribed, 'matrix-user'].map((userId) => ({ userId, reasons: WAKE_SCOPES.mentions })), now: clock.now() })).subscriptions).toHaveLength(1);
+			measure('push sender charge', () => store.chargePushSender('matrix-sender', 2, clock.now()));
+			measure('push registrations clear', () => store.clearPushSubscriptions('matrix-other', clock.now()));
+			measure('gone push subscription forget', () => store.forgetPushSubscriptions([{ userId: subscription.userId, url: subscription.url, p256dh: subscription.p256dh }], clock.now()));
 
 			const identity = { user_id: 'matrix-user', name: 'Matrix user', tier: 'registered' as const };
 			const create = measure('message create', () => store.commitMutation({
@@ -690,6 +818,9 @@ describe('measured storage accounting', () => {
 				params: { room_id: 'general', body: { text: 'matrix message', format: 'plain' } }, identity,
 			}));
 			const messageId = create.result.message_id as string;
+			expect(measure('push reply author lookup', () => store.messageAuthor(messageId, clock.now()))).toBe('matrix-user');
+			store.registerPushSubscription({ ...subscription, now: clock.now() });
+			expect(measure('push wake claim for a reply', () => store.claimPushes({ senderId: 'matrix-replier', roomId: 'matrix-reply-room', candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.replies }], now: clock.now() })).subscriptions).toHaveLength(1);
 			measure('reaction set', () => store.commitMutation({
 				userId: 'matrix-user', ipKey: 'matrix-react-ip', requestId: 'matrix-react', method: 'reactions', now: clock.now(),
 				params: { message_id: messageId, emojis: ['👍', '🎉'] }, identity,
@@ -722,13 +853,37 @@ describe('measured storage accounting', () => {
 			measure('room join lookup', () => store.getRoom(threadId));
 			measure('room listing', () => store.listRooms(clock.now()));
 			measure('room members (general and one thread)', () => store.roomMembers(['general', threadId], DEFAULT_LIMITS.roomListMembers, clock.now()));
-			measure('admission snapshot', () => store.admission());
+			measure('room members with status (general and one thread)', () => store.roomMembers(['general', threadId], DEFAULT_LIMITS.roomListMembers, clock.now(), undefined, true));
+			expect(measure('status inputs at sign-in, nothing stored', () => store.statusInputs('matrix-user', clock.now()))).toEqual({ choice: 'online', roomMutes: [] });
+			measure('mute set', () => store.setMute({ userId: 'matrix-user', untilMs: clock.now() + 3_600_000, now: clock.now() }));
+			measure('status set', () => store.setStatus({ userId: 'matrix-user', choice: 'dnd', now: clock.now() }));
+			expect(measure('push wake claim, dnd and muted', () => store.claimPushes({ senderId: 'matrix-sender', roomId: threadId, candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() }))).toEqual({ subscriptions: [], skipped: 0 });
+			measure('room mute set', () => store.setRoomMute({ userId: 'matrix-user', roomId: 'general', untilMs: clock.now() + 60_000, now: clock.now() }));
+			expect(measure('status inputs at sign-in, status, mute and one room mute', () => store.statusInputs('matrix-user', clock.now()))).toEqual({ choice: 'dnd', muteUntil: clock.now() + 3_600_000, roomMutes: [{ roomId: 'general', untilMs: clock.now() + 60_000 }] });
+			store.setStatus({ userId: 'matrix-user', choice: 'online', now: clock.now() });
+			store.setMute({ userId: 'matrix-user', untilMs: null, now: clock.now() });
+			// The thread's parent is muted: a wake for the thread is silenced by it.
+			expect(measure('push wake claim, the thread\'s parent muted', () => store.claimPushes({ senderId: 'matrix-sender', roomId: threadId, candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() }))).toEqual({ subscriptions: [], skipped: 0 });
+			// The most room mutes a user may hold: the sign-in reads them all.
+			state.storage.transactionSync(() => {
+				for (let index = 1; index < MAX_ROOM_MUTES_PER_USER; index += 1) {
+					state.storage.sql.exec('INSERT INTO room_mutes (user_id, room_id, mute_until_ms) VALUES (?, ?, ?)', 'matrix-user', `muted-${String(index).padStart(3, '0')}`, index % 2 ? MUTE_FOREVER : clock.now() + 30_000);
+				}
+			});
+			expect(measure('status inputs at sign-in, 100 room mutes', () => store.statusInputs('matrix-user', clock.now())).roomMutes).toHaveLength(MAX_ROOM_MUTES_PER_USER);
+			expect(measure('room mute set past the cap, refused', () => store.setRoomMute({ userId: 'matrix-user', roomId: 'one-too-many', untilMs: MUTE_FOREVER, now: clock.now() }))).toEqual({ changed: false, refused: true });
+			clock.set(clock.now() + 60_001);
+			// Half the mutes ran out: they go, and their place is free.
+			expect(measure('room mute expiry, 50 of 100 ran out', () => store.expireRoomMutes('matrix-user', clock.now())).expired).toHaveLength(MAX_ROOM_MUTES_PER_USER / 2);
+			measure('room mute clear', () => store.setRoomMute({ userId: 'matrix-user', roomId: 'muted-001', untilMs: null, now: clock.now() }));
+			state.storage.sql.exec("DELETE FROM room_mutes WHERE user_id = 'matrix-user'");
 			clock.set(clock.now() + DAY + HOUR + 1);
 			measure('cleanup', () => store.runCleanup(clock.now()));
 			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
 			expect(create.result.message_id).toBeTruthy();
-			expect(costs).toHaveLength(30);
+			expect(costs).toHaveLength(49);
+			expect(store.accountingStatus().unsafe).toBe(false);
 			return { costs };
 		});
 		console.info('accounting-operation-matrix', JSON.stringify(result));
@@ -769,6 +924,12 @@ describe('measured storage accounting', () => {
 				roomMembers: explain(sql, `EXPLAIN QUERY PLAN
 					SELECT m.user_id, i.name FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id
 					WHERE m.room_id = ? ORDER BY m.user_id LIMIT ?`, 'general', 100),
+				roomMembersWithStatus: explain(sql, `EXPLAIN QUERY PLAN
+					SELECT m.user_id, i.name, s.status
+					FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id LEFT JOIN user_status s ON s.user_id = m.user_id
+					WHERE m.room_id = ? ORDER BY m.user_id LIMIT ?`, 'general', 100),
+				roomMuteProbe: explain(sql, 'EXPLAIN QUERY PLAN SELECT mute_until_ms FROM room_mutes WHERE user_id = ? AND room_id IN (?, ?) AND mute_until_ms > ? LIMIT 1', 'plan-user', 'general', 'thread', 0),
+				roomMuteRange: explain(sql, 'EXPLAIN QUERY PLAN SELECT room_id, mute_until_ms FROM room_mutes WHERE user_id = ? ORDER BY room_id LIMIT ?', 'plan-user', 100),
 				userRooms: explain(sql, `EXPLAIN QUERY PLAN
 					SELECT m.room_id FROM memberships m INDEXED BY memberships_user_idx
 					JOIN rooms r ON r.room_id = m.room_id
@@ -790,5 +951,13 @@ describe('measured storage accounting', () => {
 		expect(result.plans.roomMembers.some((detail) => /SEARCH m USING .*autoindex_memberships/i.test(detail))).toBe(true);
 		expect(result.plans.roomMembers.some((detail) => /TEMP B-TREE/i.test(detail))).toBe(false);
 		expect(result.plans.userRooms.some((detail) => /memberships_user_idx/i.test(detail))).toBe(true);
+		// Status adds one primary-key lookup of `user_status`, and nothing of push registrations.
+		expect(result.plans.roomMembersWithStatus.some((detail) => /SEARCH s USING INDEX sqlite_autoindex_user_status_1/i.test(detail))).toBe(true);
+		expect(result.plans.roomMembersWithStatus.some((detail) => /push_subscriptions/i.test(detail))).toBe(false);
+		expect(result.plans.roomMembersWithStatus.some((detail) => /TEMP B-TREE/i.test(detail))).toBe(false);
+		// A wake's room mute check is two primary-key probes; a sign-in's read is one key range, in order.
+		expect(result.plans.roomMuteProbe.some((detail) => /SEARCH room_mutes USING INDEX sqlite_autoindex_room_mutes_1 \(user_id=\? AND room_id=\?\)/i.test(detail))).toBe(true);
+		expect(result.plans.roomMuteRange.some((detail) => /SEARCH room_mutes USING INDEX sqlite_autoindex_room_mutes_1 \(user_id=\?\)/i.test(detail))).toBe(true);
+		expect(result.plans.roomMuteRange.some((detail) => /TEMP B-TREE/i.test(detail))).toBe(false);
 	});
 });

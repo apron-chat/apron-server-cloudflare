@@ -13,59 +13,53 @@ import {
   DEFAULT_LIMITS,
   MAINTENANCE_CONTROL_RESERVE,
   MAX_EMOJI_BYTES,
+  MAX_PUSH_CANDIDATES,
+  MAX_PUSHES_PER_MESSAGE,
   MAX_THREAD_LIMIT,
+  type PushPolicy,
   type UploadPolicy,
 } from "./budget";
 import type { AccountUsageSnapshot } from "./account-usage";
-import type {
-  AdmissionSnapshot,
-  AuthTier,
-  CleanupResult as DomainCleanupResult,
-  DedupRecord,
-  Identity as DomainIdentity,
-  StoredCredential,
-  StoredIdentity,
-} from "./domain.js";
+import { isStatusChoice, type StatusChoice } from "./presence";
+import type { StoredCredential, StoredIdentity } from "./domain.js";
 // @ts-expect-error Workers' nodejs_compat runtime supplies this module; the
 // worker type package intentionally omits Node's full module declarations.
 import { createHash } from "node:crypto";
 
 /** The seeded, permanent top-level room. */
 export const ROOM_ID = "general";
-export const ROOM_TITLE = "General";
+const ROOM_TITLE = "General";
 /**
- * Schema 6 stores the protocol v7 server-wide log (room records, flat message
+ * Schema 8 stores the server-wide log (room records, flat message
  * snapshots, reaction sets, and registered users' memberships), a
  * `memberships` table of registered users' joined rooms, indexed both ways,
- * with each room's count of them, and the `uploads` held in R2 with each
- * identity's avatar. A room's `description` is one of its client fields
- * (schema 6; schema 5 pointed at an `intro_message` instead), and an
- * identity may hold several passkeys (schema 5 allowed one). An identity's
- * roles are a column of its row (schema 7; schema 6 listed admins in a
- * `_meta` row and told bots by tier). Schemas 5 and 6 are upgraded in place
- * (see upgradeFromSchema5() and upgradeFromSchema6()); stored data from any other
- * schema version is not migrated: the object is wiped and started fresh (see
- * resetStorage()). Additive rows need no new version: the `_meta`
- * guest-number mark, absent in older objects, reads as zero.
+ * with each room's count of them, the `uploads` held in R2 with each
+ * identity's avatar, each identity's roles and `ext` in its row, and the
+ * `push_subscriptions`, `push_wakes`, `user_status` and `room_mutes` tables.
+ * Schema 7, which the deployed object holds, is upgraded in place (see
+ * upgradeFromSchema7()); stored data from any other schema version is not
+ * migrated: the object is wiped and started fresh (see resetStorage()).
+ * Additive rows need no new version: an absent `_meta` row reads as its
+ * initial value.
  */
-export const SCHEMA_VERSION = 7;
-/** The older schemas upgraded in place rather than reset, oldest first; each upgrades to the next. */
-export const UPGRADABLE_SCHEMA_VERSIONS: readonly number[] = [5, 6];
+export const SCHEMA_VERSION = 8;
+/** The older schema upgraded in place rather than reset. */
+export const UPGRADABLE_SCHEMA_VERSION = 7;
 /**
  * The registered user `APRON_ADMIN_TOKEN` signs in as, always an admin. It
  * never holds a passkey, so deleting the token turns it off completely.
  */
 export const ADMIN_USER_ID = "admin";
-/** Passkeys one registered identity may hold (§4.9: a registration while signed in adds one). */
+/** Passkeys one registered identity may hold (§4.10: a registration while signed in adds one). */
 export const MAX_PASSKEYS_PER_USER = 8;
 /** Rooms a new identity has joined: the permanent top-level room (§3.4). */
 export const DEFAULT_JOINED_ROOMS: readonly string[] = [ROOM_ID];
 /** Title the demo supplies for a thread room created or saved without one. */
-export const DEFAULT_THREAD_TITLE = "Thread";
-export const MAX_SAFE_ID = Number.MAX_SAFE_INTEGER;
+const DEFAULT_THREAD_TITLE = "Thread";
+const MAX_SAFE_ID = Number.MAX_SAFE_INTEGER;
 export const RETENTION_MS = DEFAULT_LIMITS.retentionSeconds * 1000;
-export const DEDUP_TTL_MS = DEFAULT_LIMITS.dedupTtlSeconds * 1000;
-export const POST_WINDOW_MS = 60 * 1000;
+const DEDUP_TTL_MS = DEFAULT_LIMITS.dedupTtlSeconds * 1000;
+const POST_WINDOW_MS = 60 * 1000;
 
 // Keep a small durable control reserve inside the maintenance allocation.
 // When a batch cannot be admitted, these rows are still enough to move the
@@ -83,9 +77,9 @@ const BUDGET_PRUNE_RESERVATION_READS = 8;
 const BUDGET_PRUNE_RESERVATION_WRITES = 8;
 const BUDGET_PRUNE_BATCH = 4;
 
-export type Tier = "anonymous" | "registered";
+type Tier = "anonymous" | "registered";
 
-export type ErrorCode =
+type ErrorCode =
   | "parse_error"
   | "invalid_request"
   | "unsupported"
@@ -115,7 +109,7 @@ export class StoreError extends Error {
   }
 }
 
-export interface SqlCursorLike<T = Record<string, unknown>> {
+interface SqlCursorLike<T = Record<string, unknown>> {
   toArray?: () => T[];
   one?: () => T;
   raw?: () => unknown[];
@@ -124,11 +118,11 @@ export interface SqlCursorLike<T = Record<string, unknown>> {
   [Symbol.iterator]?: () => Iterator<T>;
 }
 
-export interface SqlStorageLike {
+interface SqlStorageLike {
   exec<T = Record<string, unknown>>(query: string, ...bindings: unknown[]): SqlCursorLike<T>;
 }
 
-export interface DurableStorageLike {
+interface DurableStorageLike {
   sql: SqlStorageLike;
   transactionSync?: <T>(closure: () => T) => T;
   setAlarm?: (time: number | Date) => Promise<void>;
@@ -136,13 +130,13 @@ export interface DurableStorageLike {
   getAlarm?: () => Promise<number | null>;
 }
 
-export interface DurableStateLike {
+interface DurableStateLike {
   storage: DurableStorageLike;
 }
 
-export type DurableSqlStorageLike = DurableStorageLike;
+type DurableSqlStorageLike = DurableStorageLike;
 
-export interface StoreClock {
+interface StoreClock {
   now(): number;
 }
 
@@ -179,13 +173,8 @@ export interface StoreConfig {
   registrationsPerDay: number;
   registeredIdentityCount: number;
   authAttemptsPerIpMinute: number;
-  framesPerConnectionMinute: number;
   framesPerIpMinute: number;
   processedFramesPerDay: number;
-  openConnections: number;
-  anonymousConnectionsPerIp: number;
-  registeredConnectionsPerUser: number;
-  connectionsPerIp: number;
   connectionAdmissionsPerIpMinute: number;
   connectionAdmissionsPerDay: number;
   principalLimitCap: number;
@@ -206,9 +195,14 @@ export interface StoreConfig {
   /**
    * Keep `og` media (`image`, `video`, `audio`) that point at other servers.
    * Off: every viewer's client would load a URL the sender chose, and this
-   * server hosts and proxies no media of its own (§4.6.1).
+   * server hosts and proxies no media of its own (§4.8.1).
    */
   ogRemoteMedia: boolean;
+  /**
+   * How long a room's member rows may be reused (roomMembers); any write to
+   * what they were read from ends it sooner. 0 or absent: never reused.
+   */
+  memberCacheMs?: number;
   /** Conservative row-cost estimate for one foreground mutation. */
   mutationCost: CostEstimate;
   /** Conservative row-cost estimate for one history read. */
@@ -218,19 +212,21 @@ export interface StoreConfig {
   /** Conservative row-cost estimate for one maintenance batch. */
   cleanupCost: CostEstimate;
   /**
-   * Uploads (protocol §4.6.3), or null without them: the plan's policy and
+   * Uploads (protocol §4.8.3), or null without them: the plan's policy and
    * the public origin its R2 objects are served from.
    */
   uploads: StoreUploadConfig | null;
+  /** Web Push (protocol §4.9), or null without it: the plan's push policy. */
+  push: PushPolicy | null;
 }
 
-export interface StoreUploadConfig extends UploadPolicy {
+interface StoreUploadConfig extends UploadPolicy {
   /** Where the bucket serves objects, such as `https://media.apron.chat`; no trailing slash. */
   mediaOrigin: string;
 }
 
-/** An upload waiting for its write (protocol §4.6.3): what its `write_url` signs. */
-export interface PendingUpload {
+/** An upload waiting for its write (protocol §4.8.3): what its `write_url` signs. */
+interface PendingUpload {
   /** The R2 object key: `f/<id>` for an attached file, `a/<id>` for an avatar. */
   key: string;
   purpose: UploadPurpose;
@@ -239,7 +235,7 @@ export interface PendingUpload {
   writeExpiresMs: number;
 }
 
-export type UploadPurpose = "file" | "avatar";
+type UploadPurpose = "file" | "avatar";
 
 /** What finishUpload did: the snapshot to broadcast, or the avatar set, and R2 objects to delete. */
 export interface UploadFinish {
@@ -250,7 +246,7 @@ export interface UploadFinish {
 }
 
 /**
- * A new upload as a result lists it (§4.6.3), with `write` in place of the
+ * A new upload as a result lists it (§4.8.3), with `write` in place of the
  * `write_url` the runtime signs from it. Kept in the stored result, so a
  * retry signs the same URL.
  */
@@ -272,7 +268,7 @@ export interface UploadWrite {
   height?: number;
 }
 
-export interface CostEstimate {
+interface CostEstimate {
   reads?: number;
   writes?: number;
   frames?: number;
@@ -312,13 +308,8 @@ const DEFAULT_CONFIG: StoreConfig = {
   registrationsPerDay: DEFAULT_LIMITS.registrationsPerDay,
   registeredIdentityCount: DEFAULT_LIMITS.registeredIdentityCount,
   authAttemptsPerIpMinute: DEFAULT_LIMITS.authAttemptsPerIpMinute,
-  framesPerConnectionMinute: DEFAULT_LIMITS.framesPerConnectionMinute,
   framesPerIpMinute: DEFAULT_LIMITS.framesPerIpMinute,
   processedFramesPerDay: DEFAULT_LIMITS.processedFramesPerDay,
-  openConnections: DEFAULT_LIMITS.openConnections,
-  anonymousConnectionsPerIp: DEFAULT_LIMITS.anonymousConnectionsPerIp,
-  registeredConnectionsPerUser: DEFAULT_LIMITS.registeredConnectionsPerUser,
-  connectionsPerIp: DEFAULT_LIMITS.connectionsPerIp,
   connectionAdmissionsPerIpMinute: DEFAULT_LIMITS.connectionAdmissionsPerIpMinute,
   connectionAdmissionsPerDay: DEFAULT_LIMITS.connectionAdmissionsPerDay,
   principalLimitCap: DEFAULT_LIMITS.limiterRecordCap,
@@ -334,6 +325,7 @@ const DEFAULT_CONFIG: StoreConfig = {
   admissionEnabled: true,
   ogRemoteMedia: false,
   uploads: null,
+  push: null,
   // These bounds include the reservation row and worst-case indexed control
   // updates for one accepted operation; calibrated workloads may lower them
   // only after observing cursor counts.
@@ -380,7 +372,7 @@ export interface Identity {
   tier?: Tier;
 }
 
-/** A flat, self-describing message snapshot (protocol v7 section 3.5). */
+/** A flat, self-describing message snapshot (protocol §3.5). */
 export interface MessageSnapshot {
   message_id: string;
   log_id: string;
@@ -396,39 +388,39 @@ export interface MessageSnapshot {
   prev_room_id?: string;
 }
 
-/** A room record plus this server's delivery fields (protocol v7 section 3.4). */
+/** A room record plus this server's delivery fields (protocol §3.4). */
 export interface RoomRecord {
   room_id: string;
   log_id: string;
   parent_room_id?: string;
   title?: string;
-  /** What the room is about, Markdown by convention (§3.4). */
+  /** What the room is about, CommonMark by convention (§3.4). */
   description?: string;
   ext?: Record<string, unknown>;
   latest_log_id: string;
   history_log_id: string | null;
 }
 
-/** One logged reaction change (protocol v7 §4.5). */
-export interface ReactionsRecord {
+/** One logged reaction change (protocol §4.7). */
+interface ReactionsRecord {
   log_id: string;
   message_id: string;
   room_id: string;
   reactions: Array<{ from: Identity; emojis: string[] }>;
 }
 
-/** One logged membership change of a registered user (protocol v7 §4.3.2). */
-export interface MembershipRecord {
+/** One logged membership change of a registered user (protocol §4.3.2). */
+interface MembershipRecord {
   log_id: string;
   room_id: string;
   members: Array<{ user: Identity; joined: boolean }>;
 }
 
-export type RecordKind = "room" | "message" | "reactions" | "membership";
+type RecordKind = "room" | "message" | "reactions" | "membership";
 
 /**
  * A committed record, in log order, ready to deliver as a notification to the
- * members of `rooms`: its room, and for a move both rooms (§3.4, §4.1).
+ * members of `rooms`: its room, and for a move both rooms (§3.4, §4.2).
  */
 export interface Broadcast {
   /** A membership record is delivered in `room_update` `memberships` (§4.3.3), not as its own notification. */
@@ -437,7 +429,7 @@ export interface Broadcast {
   rooms: string[];
 }
 
-export type MutationMethod = "message" | "room_set" | "reactions" | "me";
+type MutationMethod = "message" | "room_set" | "reactions" | "me";
 
 export interface StoreMutationInput {
   userId: string;
@@ -460,7 +452,7 @@ export interface StoreMutationResult {
   message?: MessageSnapshot;
   /** The saved room record, for `room_set`. */
   room?: RoomRecord;
-  /** Uploads this operation started; their `write_url`s go in the result (§4.6.3). */
+  /** Uploads this operation started; their `write_url`s go in the result (§4.8.3). */
   uploads?: PendingUpload[];
   /** R2 objects to delete: uploads whose embed or message this operation removed. */
   deletedUploads?: string[];
@@ -470,10 +462,12 @@ export interface StoreMutationResult {
   membership?: Broadcast;
   /** An accepted retry: the original result, with no new records. */
   deduplicated?: boolean;
+  /** For `me`: the user's `ext` after the write, and the keys it changed (§4.12). */
+  profile?: { ext?: Record<string, unknown>; changed?: Record<string, unknown> };
 }
 
-export interface StoreHistoryQuery {
-  /** Omitted, the default room (§4.1). */
+interface StoreHistoryQuery {
+  /** Omitted, the default room (§4.2). */
   roomId?: string;
   after?: string | bigint;
   before?: string | bigint;
@@ -485,8 +479,8 @@ export interface StoreHistoryQuery {
   maxBytes?: number;
 }
 
-/** A history page (§4.1): each array is omitted when empty, and the bounds with it. */
-export interface StoreHistoryResult {
+/** A history page (§4.2): each array is omitted when empty, and the bounds with it. */
+interface StoreHistoryResult {
   rooms?: RoomRecord[];
   messages?: MessageSnapshot[];
   reactions?: ReactionsRecord[];
@@ -498,7 +492,7 @@ export interface StoreHistoryResult {
   history_log_id: string | null;
 }
 
-export interface StoreCleanupResult {
+interface StoreCleanupResult {
   /** The internal server-wide retention floor F after this run. */
   history_floor: string;
   /** F before this run; rooms' history_log_id changed when these differ. */
@@ -522,7 +516,7 @@ export interface StoreCleanupResult {
 const REFUND_READS = 1;
 const REFUND_WRITES = 1;
 
-export interface BudgetCost {
+interface BudgetCost {
   reads: number;
   writes: number;
   frames: number;
@@ -534,7 +528,7 @@ export interface BudgetCost {
   maintenance?: boolean;
 }
 
-export interface BudgetSnapshot extends BudgetCost {
+interface BudgetSnapshot extends BudgetCost {
   day: string;
   foreground_reads: number;
   foreground_writes: number;
@@ -637,7 +631,7 @@ interface CarriedPasskey extends RawCredentialRow {
   identity_created_ms: number;
   identity_updated_ms: number;
   in_general: number;
-  roles_json?: string;
+  roles_json: string;
 }
 
 interface RawIdentityRow {
@@ -650,6 +644,7 @@ interface RawIdentityRow {
   avatar_url: string;
   avatar_expires_ms: number;
   roles_json: string;
+  ext_json: string;
 }
 
 interface RawUploadRow {
@@ -699,10 +694,7 @@ const META_PURGE_ROOMS = "purge_rooms";
 const MAX_PURGE_ROOMS = MAX_THREAD_LIMIT;
 const META_ACCOUNTING_UNSAFE = "accounting_unsafe";
 const META_ACCOUNT_USAGE = "account_usage_snapshot";
-/**
- * The highest guest number ever reserved (see reserveGuestNumbers). Absent
- * means none: the row is additive, so schema 4 objects need no reset for it.
- */
+/** The highest guest number ever reserved (see reserveGuestNumbers); absent means none. */
 const META_GUEST_NUMBER_MARK = "guest_number_mark";
 /**
  * Most passkeys a schema reset carries over (see resetStorage), most recently
@@ -711,14 +703,15 @@ const META_GUEST_NUMBER_MARK = "guest_number_mark";
  * writes, and so the identities that can survive a wipe.
  */
 export const MAX_CARRIED_PASSKEYS = 100;
-/**
- * Schema 6's list of the users `/admin` made admins, as a JSON list of
- * `user_id`s: read only to upgrade them to `admin` roles (schema 7), or to
- * carry those roles across a reset from an older schema.
- */
-const META_LEGACY_ADMINS = "admins";
 /** Most roles one user holds, so the column stays small. */
 export const MAX_ROLES_PER_USER = 8;
+/**
+ * Largest serialized `ext` a user keeps (protocol §4.12), after a write's
+ * merge: room for an extension's few fields, such as a bridge's nick or a
+ * time zone. Every connection of the user carries it in its attachment, and
+ * every listing that shows the user carries it in `users`.
+ */
+export const MAX_USER_EXT_BYTES = 512;
 /** A role name: lowercase letters, digits, `_` or `-`, starting with a letter. */
 export const ROLE_PATTERN = /^[a-z][a-z0-9_-]{0,23}$/;
 
@@ -740,7 +733,7 @@ function parseRoles(json: string | null | undefined): string[] {
 const META_RENAMED_PREFIX = "renamed:";
 
 /** The limiter scopes keyed by a registered user (`user:<user_id>`), which `/rename` moves. */
-const USER_LIMIT_SCOPES = ["post", "history", "upload"] as const;
+const USER_LIMIT_SCOPES = ["post", "history", "upload", "push", "push_recipient"] as const;
 /**
  * `_meta` key prefix for an admin's `/toggle`: `toggle:<feature>` holds `on`
  * or `off`, and is absent while the feature follows the deployment's default.
@@ -757,6 +750,155 @@ export const UPLOAD_WRITE_GRACE_MS = 60_000;
 export const UPLOAD_SWEEP_BATCH = 32;
 /** Rows one upload's bookkeeping may write: its row and indexes, two limiter rows, and the byte count. */
 const UPLOAD_WRITES = 16;
+/**
+ * Most push subscriptions one user can hold under any valid policy: a
+ * policy's `subscriptionsPerUser` is at most MAX_PUSHES_PER_MESSAGE, and
+ * each registration evicts down to the policy in force. Reservations that
+ * touch a user's subscriptions are sized by it.
+ */
+const MAX_PUSH_SUBSCRIPTIONS_PER_USER = MAX_PUSHES_PER_MESSAGE;
+/** The tables a member listing reads (Store.roomMembers); a write to one invalidates reused listings. */
+const MEMBER_TABLES = /\b(identities|memberships|user_status)\b/;
+/**
+ * Most `push_wakes` rows one user can hold: one per room they were woken
+ * for, and wakes come only for messages in existing rooms (at most the
+ * thread ceiling and `general`); rows of rooms removed since cleanup last
+ * ran, at most the purge list, wait for it.
+ */
+const MAX_PUSH_WAKES_PER_USER = MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS;
+/**
+ * Longest push endpoint URL kept (protocol §4.9). Browsers' are a few
+ * hundred bytes; a tighter bound keeps each row small, so sybil accounts
+ * cannot fill storage with registrations.
+ */
+export const MAX_PUSH_URL_BYTES = 512;
+/** A re-registration of an unchanged subscription younger than this writes nothing. */
+const PUSH_REFRESH_MS = 86_400_000;
+
+/** A registration's `push_id` (protocol §4.9): 1 to 64 letters, digits, `_` or `-`. */
+export const PUSH_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+/**
+ * The wake scopes this server implements (protocol §4.9), each a bit of a
+ * registration's `wake` column: `mentions` (messages whose `mentions` list
+ * the user) and `replies` (replies to the user's messages).
+ */
+export const WAKE_SCOPES = { mentions: 1, replies: 2 } as const;
+/** Every scope, the default for a registration without `wake`. */
+const DEFAULT_WAKE = WAKE_SCOPES.mentions | WAKE_SCOPES.replies;
+
+/** A `user_status` or `room_mutes` row's `mute_until_ms` for a mute that lasts until changed (`mute: true`). */
+export const MUTE_FOREVER = Number.MAX_SAFE_INTEGER;
+/** The longest timed mute: a year; longer ones are cut to it. */
+export const MAX_MUTE_SECONDS = 365 * 86_400;
+/**
+ * Most room mutes one user keeps (protocol §4.5 `status` with `room_id`):
+ * past it, a mute of another room is declined. It bounds what a sign-in
+ * reads to tell the mutes in effect, and what a wake claim's probes can find.
+ */
+export const MAX_ROOM_MUTES_PER_USER = 100;
+
+/** One of a user's room mutes: the room, and until when (MUTE_FOREVER for `true`). */
+interface RoomMute {
+  roomId: string;
+  untilMs: number;
+}
+
+/**
+ * A user's stored `status` state (protocol §4.5), read once at sign-in:
+ * the `status` they chose with `me`, until when their unscoped mute lasts
+ * (absent when not muted), and their room mutes in effect, in `room_id`
+ * order.
+ */
+export interface StatusInputRecord {
+  choice: StatusChoice;
+  muteUntil?: number;
+  roomMutes: RoomMute[];
+}
+
+/** A registered room member as listings carry it, with the `status` they chose when asked for. */
+interface RoomMember {
+  user_id: string;
+  name: string;
+  avatar?: string;
+  roles: string[];
+  ext?: Record<string, unknown>;
+  choice?: StatusChoice;
+}
+
+/** One `roomMembers` row, with the chosen status when asked for. */
+interface RawMemberRow {
+  user_id: string;
+  name: string | null;
+  avatar_url: string | null;
+  avatar_expires_ms: number | null;
+  roles_json: string | null;
+  ext_json: string | null;
+  status?: string | null;
+}
+
+/** A stored `status` choice: `online` when there is no row, and `""` for a value this server no longer knows. */
+function choiceColumn(value: unknown): StatusChoice {
+  if (value === null || value === undefined) return "online";
+  return isStatusChoice(value) ? value : "";
+}
+
+/** A room mute's stored end as `status` `mute` carries it (§4.5): `true`, else the seconds left, rounded up. */
+export function muteValue(untilMs: number, effective: number): number | true {
+  return untilMs >= MUTE_FOREVER ? true : Math.max(1, Math.ceil((untilMs - effective) / 1_000));
+}
+
+/** When the first of `mutes` that is timed runs out, as `{next}`, or `{}` when none is. */
+export function nextRoomMuteEnd(mutes: readonly RoomMute[]): { next?: number } {
+  const timed = mutes.filter((mute) => mute.untilMs < MUTE_FOREVER).map((mute) => mute.untilMs);
+  return timed.length ? { next: Math.min(...timed) } : {};
+}
+
+/** A room's member rows as read, kept for reuse (Store.roomMembers). */
+interface MemberCacheEntry {
+  at: number;
+  generation: number;
+  perRoom: number;
+  withStatus: boolean;
+  rows: RawMemberRow[];
+  /** Whether `count` was read for a full page (asked for with `counts`). */
+  counted: boolean;
+  count?: number;
+}
+
+/** A user a message may wake, and why: a bitmask of WAKE_SCOPES. */
+export interface PushCandidate {
+  userId: string;
+  reasons: number;
+}
+
+/**
+ * A user's Web Push registration (protocol §4.9, kind `webpush`): its
+ * endpoint, the browser's keys, and the client's `push_id`, which every push
+ * to it carries. A registration is the user's: two users may register the
+ * same endpoint.
+ */
+export interface PushSubscriptionRecord {
+  url: string;
+  userId: string;
+  p256dh: string;
+  auth: string;
+  pushId?: string;
+}
+
+type RawPushRow = { url: string; p256dh: string; auth: string; push_id: string | null; wake: number };
+
+function pushRecord(row: RawPushRow, userId: string): PushSubscriptionRecord {
+  return { url: row.url, userId, p256dh: row.p256dh, auth: row.auth, ...(row.push_id !== null ? { pushId: row.push_id } : {}) };
+}
+
+/** What a message's wake claimed (Store.claimPushes). */
+interface PushClaim {
+  subscriptions: PushSubscriptionRecord[];
+  /** Subscriptions left out by the daily server or sender allowance. */
+  skipped: number;
+}
+
 /** Rows one guest-number block reservation may read and write, before control overhead. */
 const GUEST_NUMBER_BLOCK_COST = { reads: 8, writes: 8 } as const;
 
@@ -802,6 +944,54 @@ function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
+/** An empty value (`""`, `[]`, `{}`), which clears a key in a merge (protocol §3.3, §4.12). */
+function emptyValue(value: unknown): boolean {
+  return value === "" || (Array.isArray(value) && value.length === 0) || (isPlainObject(value) && Object.keys(value).length === 0);
+}
+
+/**
+ * Merges a write's `ext` into the stored one, one level deep (protocol §4.12):
+ * each key the write carries replaces the stored value whole, a key whose
+ * value is empty (`""`, `[]`, `{}`) is removed, and keys it leaves out stay.
+ * `null` is an ordinary value. Without a write, or with `{}`, the stored
+ * `ext` is unchanged. Undefined when nothing is left. Built from entries, so
+ * a `"__proto__"` key is an ordinary own key, never a prototype.
+ */
+export function mergeExt(stored: unknown, write: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  const merged = new Map<string, unknown>(isPlainObject(stored) ? Object.entries(stored) : []);
+  for (const [key, value] of Object.entries(write ?? {})) {
+    if (emptyValue(value)) merged.delete(key);
+    else merged.set(key, value);
+  }
+  return merged.size ? clone(Object.fromEntries(merged)) : undefined;
+}
+
+/**
+ * The keys of a user's `ext` that a write changed (protocol §4.12), as a
+ * `user` notification carries them: each new or replaced value, and `""`
+ * for each key it cleared. Undefined when nothing changed.
+ */
+function changedExt(before: Record<string, unknown> | undefined, after: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  const changed = new Map<string, unknown>();
+  for (const [key, value] of Object.entries(after ?? {})) {
+    if (!before || !Object.hasOwn(before, key) || canonicalize(before[key]) !== canonicalize(value)) changed.set(key, value);
+  }
+  for (const key of Object.keys(before ?? {})) if (!after || !Object.hasOwn(after, key)) changed.set(key, "");
+  return changed.size ? Object.fromEntries(changed) : undefined;
+}
+
+/** An identity row's `ext_json`: its object, or undefined when empty or unreadable. */
+function parseUserExt(json: string | null | undefined): Record<string, unknown> | undefined {
+  if (!json) return undefined;
+  const parsed = parseJson<unknown>(json, null);
+  return isPlainObject(parsed) && Object.keys(parsed).length ? parsed : undefined;
+}
+
+/** Whether a user's merged `ext` fits MAX_USER_EXT_BYTES. */
+export function userExtFits(ext: Record<string, unknown> | undefined): boolean {
+  return ext === undefined || utf8Bytes(JSON.stringify(ext)) <= MAX_USER_EXT_BYTES;
+}
+
 function dayFor(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10);
 }
@@ -823,11 +1013,10 @@ function jsonObject(value: unknown, field: string): Record<string, unknown> {
 
 /**
  * Canonical JSON used by mutation deduplication.  Object keys are sorted at
- * every level, arrays retain order, and JSON types remain distinct.  The
- * envelope's `jsonrpc` field is intentionally outside this function: callers
- * pass only method and params.
+ * every level, arrays retain order, and JSON types remain distinct.  Callers
+ * pass only method and params: other envelope keys are not the operation.
  */
-export function canonicalize(value: unknown): string {
+function canonicalize(value: unknown): string {
   if (value === null) return "null";
   if (typeof value === "string") return JSON.stringify(value);
   if (typeof value === "boolean") return value ? "true" : "false";
@@ -846,7 +1035,7 @@ export function canonicalize(value: unknown): string {
 }
 
 
-export function digestOperation(method: string, params: unknown): string {
+function digestOperation(method: string, params: unknown): string {
   return createHash("sha256").update(canonicalize({ method, params }), "utf8").digest("hex");
 }
 
@@ -894,7 +1083,7 @@ function recordedUser(userId: string, name: string | null | undefined): Identity
 /**
  * The text an embed's `og` may carry, with its longest kept length in code
  * points. Clients build `og` themselves (such as link previews), and the
- * server has the last word on it (§4.6.1): it keeps these fields as one line
+ * server has the last word on it (§4.8.1): it keeps these fields as one line
  * of plain text and drops the rest. Media are kept only with `ogRemoteMedia`.
  */
 const OG_TEXT_FIELDS: Record<string, number> = { title: 256, description: 512, site_name: 128 };
@@ -908,7 +1097,7 @@ const OG_MEDIA_MAX_DIMENSION = 16_384;
 const OG_UNSAFE_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
 
 /** `value` as one line of plain text of at most `max` code points, or undefined when empty. */
-/** An identity's avatar while it has not expired (protocol §4.6.6). */
+/** An identity's avatar while it has not expired (protocol §4.8.6). */
 function liveAvatar(row: { avatar_url: string | null; avatar_expires_ms: number | null }, now: number): string | undefined {
   return row.avatar_url && (row.avatar_expires_ms ?? 0) > now ? row.avatar_url : undefined;
 }
@@ -918,7 +1107,7 @@ function uploadTitle(value: unknown): string | undefined {
   return ogLine(value, OG_TEXT_FIELDS.title);
 }
 
-/** An unguessable object key segment (protocol §4.6.2): 128 random bits, base64url. */
+/** An unguessable object key segment (protocol §4.8.2): 128 random bits, base64url. */
 function randomKey(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -976,31 +1165,6 @@ function withCleanOg(embed: Record<string, unknown>, remoteMedia: boolean): Reco
   return Object.keys(clean).length ? { ...rest, og: clean } : rest;
 }
 
-/**
- * A schema 5 intro message's text, which becomes its room's description;
- * none when deleted or empty. A description is Markdown by convention
- * (§3.4), so a plain-text intro is escaped to read the same; a Markdown one
- * is kept as written.
- */
-function introText(snapshot: Record<string, unknown>): string | undefined {
-  if (snapshot.deleted === true || !isPlainObject(snapshot.body)) return undefined;
-  const text = snapshot.body.text;
-  if (typeof text !== "string" || text.trim() === "") return undefined;
-  return snapshot.body.format === "markdown" ? text : escapeMarkdown(text);
-}
-
-/**
- * Plain text as Markdown that renders as the same text: inline markup
- * characters are backslash-escaped everywhere, and block markers (headings,
- * quotes, list items, rules) at the start of a line.
- */
-export function escapeMarkdown(text: string): string {
-  return text
-    .replace(/[\\`*_[\]<>~|]/g, "\\$&")
-    .replace(/^([ \t]*)([#>+=-])/gm, "$1\\$2")
-    .replace(/^([ \t]*\d+)([.)])/gm, "$1\\$2");
-}
-
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
@@ -1012,13 +1176,23 @@ function ensureText(value: unknown, field: string, maxBytes: number): string {
 }
 
 /**
- * Schema 6: the server-wide log with membership records, and each registered
+ * Schema 8: the server-wide log with membership records, and each registered
  * identity's joined rooms as `memberships` rows, by room (the primary key, for
  * member listings) and by user (for a user's rooms), counted in each room's
  * `member_count`. Guests' memberships live in their connection only, like the
  * guest identity itself, and are not logged. `uploads` lists the objects
- * written to R2 (protocol §4.6.3): attached files by message and embed, and
- * avatars, by owner, expiry, and pending write.
+ * written to R2 (protocol §4.8.3): attached files by message and embed, and
+ * avatars, by owner, expiry, and pending write. `push_subscriptions` holds
+ * registered users' Web Push registrations (protocol §4.9), keyed by user
+ * and endpoint, indexed by user and registration time and by registration
+ * time (for expiry), and by user and registration time for those that wake
+ * for messages (a partial index, so a wake reads only those). `push_wakes`
+ * keeps when each user was last woken for each room, for coalescing.
+ * `user_status` keeps each registered user's `status` state (protocol
+ * §4.5): the `status` they chose with `me` and until when their unscoped
+ * mute lasts, one row while either differs from the default (`online`, not
+ * muted). `room_mutes` keeps their room mutes, keyed by user and room, at
+ * most MAX_ROOM_MUTES_PER_USER a user.
  */
 const SCHEMA_DDL = `
   CREATE TABLE IF NOT EXISTS _meta (
@@ -1078,7 +1252,8 @@ const SCHEMA_DDL = `
     updated_ms INTEGER NOT NULL,
     avatar_url TEXT NOT NULL DEFAULT '',
     avatar_expires_ms INTEGER NOT NULL DEFAULT 0,
-    roles_json TEXT NOT NULL DEFAULT '[]'
+    roles_json TEXT NOT NULL DEFAULT '[]',
+    ext_json TEXT NOT NULL DEFAULT ''
   );
   CREATE TABLE IF NOT EXISTS uploads (
     upload_key TEXT PRIMARY KEY,
@@ -1113,6 +1288,38 @@ const SCHEMA_DDL = `
     updated_ms INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS credentials_user_idx ON credentials (user_id);
+  CREATE TABLE IF NOT EXISTS push_subscriptions (
+    user_id TEXT NOT NULL,
+    url TEXT NOT NULL,
+    p256dh TEXT NOT NULL,
+    auth TEXT NOT NULL,
+    push_id TEXT,
+    wake INTEGER NOT NULL DEFAULT 3,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (user_id, url)
+  );
+  CREATE INDEX IF NOT EXISTS push_subscriptions_user_idx ON push_subscriptions (user_id, updated_ms);
+  CREATE INDEX IF NOT EXISTS push_subscriptions_updated_idx ON push_subscriptions (updated_ms);
+  CREATE INDEX IF NOT EXISTS push_subscriptions_waking_idx ON push_subscriptions (user_id, updated_ms) WHERE wake != 0;
+  CREATE TABLE IF NOT EXISTS push_wakes (
+    user_id TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    woken_ms INTEGER NOT NULL,
+    PRIMARY KEY (user_id, room_id)
+  );
+  CREATE INDEX IF NOT EXISTS push_wakes_woken_idx ON push_wakes (woken_ms);
+  CREATE TABLE IF NOT EXISTS user_status (
+    user_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'online',
+    mute_until_ms INTEGER
+  );
+  CREATE TABLE IF NOT EXISTS room_mutes (
+    user_id TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    mute_until_ms INTEGER NOT NULL,
+    PRIMARY KEY (user_id, room_id)
+  );
   CREATE TABLE IF NOT EXISTS accepted_requests (
     user_id TEXT NOT NULL,
     request_id TEXT NOT NULL,
@@ -1187,9 +1394,14 @@ export class Store {
   private budgetPruneDay: string | null = null;
   private accountingUnsafe = false;
   private accountingUnsafePersisted = false;
-  private accountingUnsafePending = false;
   private deferredCleanupUntil = 0;
   private scheduledAlarmAt?: number;
+  /** Bumped by every write to a table member listings read (MEMBER_TABLES). */
+  private memberGeneration = 0;
+  /** Member listings kept for reuse, by room (roomMembers, `memberCacheMs`). */
+  private readonly memberCache = new Map<string, MemberCacheEntry>();
+  /** The rooms one roomMembers call read, when nothing is kept. */
+  private readonly uncachedMembers = new Map<string, MemberCacheEntry>();
 
   constructor(
     storageOrState: unknown,
@@ -1220,12 +1432,8 @@ export class Store {
     // DDL is deliberately one initialization batch. The schema version marker
     // is checked before DDL so a wake/restart does not rewrite schema state.
     let version = this.readSchemaVersion();
-    if (version === 5) {
-      this.upgradeFromSchema5();
-      version = 6;
-    }
-    if (version === 6) {
-      this.upgradeFromSchema6();
+    if (version === UPGRADABLE_SCHEMA_VERSION) {
+      this.upgradeFromSchema7();
       version = SCHEMA_VERSION;
     }
     if (version !== 0 && version !== SCHEMA_VERSION) throw new Error(`storage schema ${version} requires resetStorage()`);
@@ -1313,133 +1521,60 @@ export class Store {
   /** True when the object holds data from another schema version that is not upgraded in place. */
   requiresReset(): boolean {
     const version = this.readSchemaVersion();
-    return version !== 0 && version !== SCHEMA_VERSION && !UPGRADABLE_SCHEMA_VERSIONS.includes(version);
+    return version !== 0 && version !== SCHEMA_VERSION && version !== UPGRADABLE_SCHEMA_VERSION;
   }
 
   /**
-   * Upgrades a schema 5 object (protocol v6) to schema 6 (protocol v7) in
-   * place, once, in one transaction, keeping chat, rooms, identities,
-   * sessions, and tokens:
-   *
-   * - A room's `intro_message` becomes its `description` (§3.4): the text of
-   *   the intro message's current retained snapshot, cut by whole code points
-   *   (ending in `…`) where the room's client fields would pass
-   *   maxThreadMetadataBytes; a deleted, expired, or empty intro leaves none.
-   *   The `intro_message_id` column is dropped.
-   * - Logged room records get the same change, so history carries no
-   *   `intro_message`: a room's current record takes the room's new
-   *   description, and an older one the text of the snapshot it embedded.
-   *   This reads every stored record once (records have no index by kind);
-   *   the log holds at most the retention window.
-   * - Each room counts its stored registered members in `member_count`.
-   * - `credentials` is rebuilt without its UNIQUE `user_id`, so an identity
-   *   may add passkeys (§4.9).
-   *
-   * Nothing else changes: the demo never logged `@server` or `@room`
-   * messages, and `@private` notices were never stored, so no sender needs
-   * the protocol v7 `~` identities. The rows read and written are measured
-   * and charged to the day's maintenance reservation without a capacity
-   * check, like a reset's passkey carry, so the upgrade cannot be blocked by
-   * an exhausted budget.
+   * Upgrades a schema 7 object to schema 8 in place, once, in one
+   * transaction: it creates the empty `push_subscriptions`, `push_wakes`,
+   * `user_status` and `room_mutes` tables and their indexes, adds the
+   * identities' empty `ext_json` column, and changes nothing else. The rows
+   * it reads and writes are measured and charged to the day's maintenance
+   * reservation without a capacity check (finishUpgrade).
    */
-  private upgradeFromSchema5(): void {
+  private upgradeFromSchema7(): void {
     const start = { reads: this.observed.reads, writes: this.observed.writes };
     const effective = Number(this.metaValue(META_EFFECTIVE_NOW));
     const day = dayFor(Math.max(Number.isSafeInteger(effective) ? effective : 0, this.clock.now()));
     this.transaction(() => {
-      const floor = this.logState().history_floor;
-      const rooms = this.rawRows<{ room_id: string; record_log_id: number; intro_message_id: string | null; fields_json: string }>(
-        "SELECT room_id, record_log_id, intro_message_id, fields_json FROM rooms",
-      );
-      const current = new Map<string, { logId: number; description?: string }>();
-      for (const room of rooms) {
-        const fields = parseJson<Record<string, unknown>>(room.fields_json, {});
-        const intro = room.intro_message_id === null ? null : this.currentMessage(room.intro_message_id, floor);
-        const text = intro ? introText(parseJson<Record<string, unknown>>(intro.snapshot_json, {})) : undefined;
-        const upgraded = this.fitDescription(fields, text);
-        current.set(room.room_id, { logId: room.record_log_id, ...(typeof upgraded.description === "string" ? { description: upgraded.description } : {}) });
-        if (upgraded !== fields) this.rawExec("UPDATE rooms SET fields_json = ? WHERE room_id = ?", JSON.stringify(upgraded), room.room_id);
-      }
-      const records = this.rawRows<{ room_id: string; log_id: number; record_json: string }>(
-        "SELECT room_id, log_id, record_json FROM records WHERE kind = 'room'",
-      );
-      for (const row of records) {
-        const record = parseJson<Record<string, unknown>>(row.record_json, {});
-        if (!("intro_message" in record)) continue;
-        const { intro_message: intro, ...rest } = record;
-        const room = current.get(row.room_id);
-        // The room's current record is the same snapshot the rooms row lists
-        // (§2): it takes that description as is. An older record's text is cut
-        // against its own client fields, as the rooms row's was.
-        let upgraded: Record<string, unknown>;
-        if (room?.logId === row.log_id) upgraded = room.description === undefined ? rest : { ...rest, description: room.description };
-        else {
-          const text = isPlainObject(intro) ? introText(intro) : undefined;
-          const clientFields = Object.fromEntries(["title", "ext"].filter((key) => key in rest).map((key) => [key, rest[key]]));
-          const fitted = this.fitDescription(clientFields, text);
-          upgraded = typeof fitted.description === "string" ? { ...rest, description: fitted.description } : rest;
-        }
-        this.rewriteRecord(row, JSON.stringify(upgraded));
-      }
-      this.rawExec("ALTER TABLE rooms ADD COLUMN member_count INTEGER NOT NULL DEFAULT 0");
-      this.rawExec("UPDATE rooms SET member_count = (SELECT COUNT(*) FROM memberships m WHERE m.room_id = rooms.room_id)");
-      this.rawExec("ALTER TABLE rooms DROP COLUMN intro_message_id");
-      // Schema 5 allowed one passkey per identity (a UNIQUE user_id), which
-      // SQLite can only drop by rebuilding the table.
       this.rawScript(`
-        CREATE TABLE credentials_v6 (
-          credential_id TEXT PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS push_subscriptions (
           user_id TEXT NOT NULL,
-          public_key_json TEXT NOT NULL,
-          sign_count INTEGER NOT NULL,
-          transports_json TEXT,
+          url TEXT NOT NULL,
+          p256dh TEXT NOT NULL,
+          auth TEXT NOT NULL,
+          push_id TEXT,
+          wake INTEGER NOT NULL DEFAULT 3,
           created_ms INTEGER NOT NULL,
-          updated_ms INTEGER NOT NULL
+          updated_ms INTEGER NOT NULL,
+          PRIMARY KEY (user_id, url)
         );
-        INSERT INTO credentials_v6 (credential_id, user_id, public_key_json, sign_count, transports_json, created_ms, updated_ms)
-          SELECT credential_id, user_id, public_key_json, sign_count, transports_json, created_ms, updated_ms FROM credentials;
-        DROP TABLE credentials;
-        ALTER TABLE credentials_v6 RENAME TO credentials;
-        CREATE INDEX IF NOT EXISTS credentials_user_idx ON credentials (user_id);
+        CREATE INDEX IF NOT EXISTS push_subscriptions_user_idx ON push_subscriptions (user_id, updated_ms);
+        CREATE INDEX IF NOT EXISTS push_subscriptions_updated_idx ON push_subscriptions (updated_ms);
+        CREATE INDEX IF NOT EXISTS push_subscriptions_waking_idx ON push_subscriptions (user_id, updated_ms) WHERE wake != 0;
+        CREATE TABLE IF NOT EXISTS push_wakes (
+          user_id TEXT NOT NULL,
+          room_id TEXT NOT NULL,
+          woken_ms INTEGER NOT NULL,
+          PRIMARY KEY (user_id, room_id)
+        );
+        CREATE INDEX IF NOT EXISTS push_wakes_woken_idx ON push_wakes (woken_ms);
+        CREATE TABLE IF NOT EXISTS user_status (
+          user_id TEXT PRIMARY KEY,
+          status TEXT NOT NULL DEFAULT 'online',
+          mute_until_ms INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS room_mutes (
+          user_id TEXT NOT NULL,
+          room_id TEXT NOT NULL,
+          mute_until_ms INTEGER NOT NULL,
+          PRIMARY KEY (user_id, room_id)
+        );
+        ALTER TABLE identities ADD COLUMN ext_json TEXT NOT NULL DEFAULT ''
       `);
-      this.finishUpgrade(6, start, day);
+      this.finishUpgrade(8, start, day);
     });
-    console.warn(JSON.stringify({ event: "storage_schema_upgraded", from: 5, to: 6 }));
-  }
-
-  /**
-   * Upgrades a schema 6 object to schema 7 in place, once, in one
-   * transaction, keeping everything: identities get a `roles_json` column,
-   * `["bot"]` for bots (tier `bot`), `["admin"]` for the `admin` user and
-   * those the `_meta` `admins` row listed, and `[]` for the rest; the
-   * `admins` row is deleted. This reads every identity once (at most the
-   * identity cap), charged like upgradeFromSchema5's rows.
-   */
-  private upgradeFromSchema6(): void {
-    const start = { reads: this.observed.reads, writes: this.observed.writes };
-    const effective = Number(this.metaValue(META_EFFECTIVE_NOW));
-    const day = dayFor(Math.max(Number.isSafeInteger(effective) ? effective : 0, this.clock.now()));
-    this.transaction(() => {
-      const admins = this.legacyAdmins();
-      this.rawExec("ALTER TABLE identities ADD COLUMN roles_json TEXT NOT NULL DEFAULT '[]'");
-      this.rawExec("UPDATE identities SET roles_json = '[\"bot\"]' WHERE tier = 'bot'");
-      for (const userId of [ADMIN_USER_ID, ...admins]) {
-        this.rawExec("UPDATE identities SET roles_json = '[\"admin\"]' WHERE user_id = ? AND tier = 'registered'", userId);
-      }
-      this.rawExec("DELETE FROM _meta WHERE key = ?", META_LEGACY_ADMINS);
-      this.finishUpgrade(7, start, day);
-    });
-    console.warn(JSON.stringify({ event: "storage_schema_upgraded", from: 6, to: 7 }));
-  }
-
-  /** Schema 6's `admins` list (META_LEGACY_ADMINS), or none when absent or unreadable. */
-  private legacyAdmins(): string[] {
-    try {
-      const parsed = parseJson<unknown>(this.metaValue(META_LEGACY_ADMINS), []);
-      return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string") : [];
-    } catch {
-      return [];
-    }
+    console.warn(JSON.stringify({ event: "storage_schema_upgraded", from: 7, to: 8 }));
   }
 
   /**
@@ -1466,27 +1601,6 @@ export class Store {
     );
     this.observed.reservedReads += cost.reads;
     this.observed.reservedWrites += cost.writes;
-  }
-
-  /**
-   * Room client fields with `description` set to `text`, cut by whole code
-   * points (ending in `…`) so the fields fit maxThreadMetadataBytes; the
-   * same object when there is no text to add.
-   */
-  private fitDescription(fields: Record<string, unknown>, text: string | undefined): Record<string, unknown> {
-    if (text === undefined) return fields;
-    const points = [...text];
-    const withText = (count: number) => ({ ...fields, description: count >= points.length ? text : points.slice(0, count).join("").trimEnd() + "…" });
-    const fits = (count: number) => utf8Bytes(JSON.stringify(withText(count))) <= this.config.maxThreadMetadataBytes;
-    if (fits(points.length)) return withText(points.length);
-    let low = 0;
-    let high = points.length - 1;
-    while (low < high) {
-      const middle = Math.ceil((low + high) / 2);
-      if (fits(middle)) low = middle;
-      else high = middle - 1;
-    }
-    return low > 0 && fits(low) ? withText(low) : fields;
   }
 
   /**
@@ -1544,10 +1658,11 @@ export class Store {
     const passkeys = this.readCarriedPasskeys();
     const carryReads = this.observed.reads - carryStart.reads;
     await deleteAll.call(this.durableStorage);
+    this.memberGeneration += 1;
+    this.memberCache.clear();
     this.initialized = false;
     this.accountingUnsafe = false;
     this.accountingUnsafePersisted = false;
-    this.accountingUnsafePending = false;
     this.lastEffectiveMs = 0;
     this.scheduledAlarmAt = undefined;
     this.initialize();
@@ -1598,30 +1713,22 @@ export class Store {
    * here or accept that the reset drops them; an unreadable table carries none.
    */
   private readCarriedPasskeys(): CarriedPasskey[] {
-    // Schemas before 7 have no `roles_json`: their admins are in a `_meta` list.
-    for (const roles of ["i.roles_json", "NULL"]) {
-      try {
-        const rows = this.rawRows<CarriedPasskey>(
-          `SELECT c.credential_id, c.user_id, c.public_key_json, c.sign_count, c.transports_json,
-              c.created_ms, c.updated_ms, i.user_handle, i.name, i.tier, ${roles} AS roles_json,
-              i.created_ms AS identity_created_ms, i.updated_ms AS identity_updated_ms,
-              EXISTS (SELECT 1 FROM memberships m WHERE m.room_id = ? AND m.user_id = c.user_id) AS in_general
-           FROM credentials c JOIN identities i ON i.user_id = c.user_id
-           WHERE i.tier = 'registered' AND i.user_id <> ?
-           ORDER BY c.updated_ms DESC, c.credential_id LIMIT ?`,
-          // `admin` holds no passkey; should one exist, a reset does not carry it.
-          ROOM_ID, ADMIN_USER_ID, MAX_CARRIED_PASSKEYS,
-        );
-        if (roles === "NULL") {
-          const admins = new Set(this.legacyAdmins());
-          for (const row of rows) row.roles_json = admins.has(row.user_id) ? '["admin"]' : "[]";
-        }
-        return rows;
-      } catch {
-        // Try the older shape, then give up: an unreadable old schema carries nothing.
-      }
+    try {
+      return this.rawRows<CarriedPasskey>(
+        `SELECT c.credential_id, c.user_id, c.public_key_json, c.sign_count, c.transports_json,
+            c.created_ms, c.updated_ms, i.user_handle, i.name, i.tier, i.roles_json,
+            i.created_ms AS identity_created_ms, i.updated_ms AS identity_updated_ms,
+            EXISTS (SELECT 1 FROM memberships m WHERE m.room_id = ? AND m.user_id = c.user_id) AS in_general
+         FROM credentials c JOIN identities i ON i.user_id = c.user_id
+         WHERE i.tier = 'registered' AND i.user_id <> ?
+         ORDER BY c.updated_ms DESC, c.credential_id LIMIT ?`,
+        // `admin` holds no passkey; should one exist, a reset does not carry it.
+        ROOM_ID, ADMIN_USER_ID, MAX_CARRIED_PASSKEYS,
+      );
+    } catch {
+      // An unreadable old schema carries nothing.
+      return [];
     }
-    return [];
   }
 
   /**
@@ -1706,6 +1813,8 @@ export class Store {
     } else {
       this.observed.reads += Math.max(0, cursor.rowsRead ?? 0);
       this.observed.writes += Math.max(1, cursor.rowsWritten ?? 1);
+      // Reused member listings are stale once anything they read is written.
+      if (MEMBER_TABLES.test(lower)) this.memberGeneration += 1;
     }
     return cursor;
   }
@@ -1776,19 +1885,16 @@ export class Store {
         "1",
       );
       this.accountingUnsafePersisted = true;
-      this.accountingUnsafePending = false;
     } catch {
       // The in-memory latch remains closed. A native storage failure may also
       // prevent the marker write; callers still fail closed for this object,
       // and the runtime will force a fresh recovery attempt rather than reuse
       // uncertain accounting.
-      this.accountingUnsafePending = true;
     }
   }
 
   private markAccountingUnsafe(): void {
     this.accountingUnsafe = true;
-    this.accountingUnsafePending = true;
     this.persistAccountingUnsafeMarker();
   }
 
@@ -2329,9 +2435,8 @@ export class Store {
 
   /** Reads reserved for listing every room, bounded by the calibrated thread cap. */
   private roomListingReads(): number {
-    // One room row per room, with slack for index pages (schema 5 also looked
-    // up each room's intro message); test/accounting.integration.test.ts
-    // measures the cap.
+    // One room row per room, with slack for index pages;
+    // test/accounting.integration.test.ts measures the cap.
     return 32 + 4 * (MAX_THREAD_LIMIT + 1);
   }
 
@@ -2386,7 +2491,7 @@ export class Store {
 
   private identityRow(userId: string): RawIdentityRow | null {
     const rows = this.rawRows<RawIdentityRow>(
-      "SELECT user_id, user_handle, name, tier, created_ms, updated_ms, avatar_url, avatar_expires_ms, roles_json FROM identities WHERE user_id = ? LIMIT 1",
+      "SELECT user_id, user_handle, name, tier, created_ms, updated_ms, avatar_url, avatar_expires_ms, roles_json, ext_json FROM identities WHERE user_id = ? LIMIT 1",
       userId,
     );
     return rows[0] ?? null;
@@ -2437,8 +2542,8 @@ export class Store {
    * left under the old id to the new one: the `from` of their logged message
    * snapshots and current messages (so they can still edit them), their
    * reaction sets, logged and current, and their logged membership changes,
-   * keeping the recorded names; their uploads; their limiter windows; and
-   * their dedup rows. Nothing is announced: clients see the new id when they
+   * keeping the recorded names; their uploads; their push subscriptions, status and mutes;
+   * their limiter windows; and their dedup rows. Nothing is announced: clients see the new id when they
    * load history again. Other users' `body.mentions`, sessions and the user's
    * bot stay under the old id. The old `user_id` is retired, never reissued.
    * Returns the user's name, joined rooms, and roles. A bot's is fixed.
@@ -2447,15 +2552,15 @@ export class Store {
    * rewrite is then charged by what was found. Both steps run without
    * yielding, so nothing commits between them.
    */
-  renameIdentity(input: { from: string; to: string; now?: number }): { name: string; rooms: string[]; roles: string[] } {
+  renameIdentity(input: { from: string; to: string; now?: number }): { name: string; avatar?: string; ext?: Record<string, unknown>; rooms: string[]; roles: string[] } {
     this.ensureReady();
     const now = input.now ?? this.clock.now();
     const { from, to } = input;
     const records = this.retainedRecords(now);
-    const found = this.reserved({ reads: 64 + 8 * records }, false, now, () => {
+    const found = this.reserved({ reads: 64 + 8 * records + 2 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER) }, false, now, () => {
       const identity = this.identityRow(from);
       if (!identity || identity.tier !== "registered") throw new StoreError("invalid_params", `No registered user has the user_id ${from}`.slice(0, 200));
-      if (parseRoles(identity.roles_json).includes("bot")) throw new StoreError("invalid_params", "A bot's user_id is fixed");
+      if (parseRoles(identity.roles_json).includes("bot")) throw new StoreError("denied", "A bot's user_id is fixed");
       if (this.idTaken(to)) throw new StoreError("invalid_params", `The user_id ${to} is taken`.slice(0, 200));
       const count = (sql: string) => integerColumn(this.rawRows<{ count: number }>(sql, from)[0]?.count);
       return {
@@ -2470,6 +2575,10 @@ export class Store {
         messages: this.rawRows<{ message_id: string; snapshot_json: string }>("SELECT message_id, snapshot_json FROM message_state WHERE author_id = ?", from),
         reactions: this.rawRows<{ message_id: string; from_json: string }>("SELECT message_id, from_json FROM reaction_state WHERE user_id = ?", from),
         uploads: count("SELECT COUNT(*) AS count FROM uploads INDEXED BY uploads_owner_idx WHERE owner_id = ?"),
+        pushes: count("SELECT COUNT(*) AS count FROM push_subscriptions INDEXED BY push_subscriptions_user_idx WHERE user_id = ?") +
+          count("SELECT COUNT(*) AS count FROM push_wakes WHERE user_id = ?") +
+          count("SELECT COUNT(*) AS count FROM user_status WHERE user_id = ?") +
+          count("SELECT COUNT(*) AS count FROM room_mutes WHERE user_id = ?"),
         requests: count("SELECT COUNT(*) AS count FROM accepted_requests WHERE user_id = ?"),
       };
     });
@@ -2477,7 +2586,7 @@ export class Store {
     // Moving a row keyed or indexed by the user_id reads its index entry and
     // row and rewrites both (measured: about 2 reads and 3 writes each);
     // rewriting a record's JSON in place is one write.
-    const moved = membershipRows + found.reactions.length + found.uploads + found.requests + USER_LIMIT_SCOPES.length;
+    const moved = membershipRows + found.reactions.length + found.uploads + found.pushes + found.requests + USER_LIMIT_SCOPES.length;
     const rewritten = found.records.length + found.messages.length;
     const cost = { reads: 64 + 4 * moved + 2 * rewritten + this.userRoomsReads(), writes: 32 + 4 * moved + 2 * rewritten };
     return this.reserved(cost, false, now, () => this.transaction(() => {
@@ -2512,12 +2621,20 @@ export class Store {
         );
       }
       if (found.uploads) this.rawExec("UPDATE uploads SET owner_id = ? WHERE owner_id = ?", to, from);
+      if (found.pushes) {
+        this.rawExec("UPDATE push_subscriptions SET user_id = ? WHERE user_id = ?", to, from);
+        this.rawExec("UPDATE push_wakes SET user_id = ? WHERE user_id = ?", to, from);
+        this.rawExec("UPDATE user_status SET user_id = ? WHERE user_id = ?", to, from);
+        this.rawExec("UPDATE room_mutes SET user_id = ? WHERE user_id = ?", to, from);
+      }
       if (found.requests) this.rawExec("UPDATE accepted_requests SET user_id = ? WHERE user_id = ?", to, from);
       for (const scope of USER_LIMIT_SCOPES) {
         this.rawExec("UPDATE principal_limits SET principal_key = ? WHERE scope = ? AND principal_key = ?", `user:${to}`, scope, `user:${from}`);
       }
       this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_RENAMED_PREFIX + from, to);
-      return { name: found.identity.name, rooms: this.userRooms(to), roles: parseRoles(found.identity.roles_json) };
+      const avatar = liveAvatar(found.identity, now);
+      const ext = parseUserExt(found.identity.ext_json);
+      return { name: found.identity.name, ...(avatar ? { avatar } : {}), ...(ext ? { ext } : {}), rooms: this.userRooms(to), roles: parseRoles(found.identity.roles_json) };
     }));
   }
 
@@ -2538,7 +2655,7 @@ export class Store {
    * records: their message snapshots and current messages, with every
    * reaction set on those messages; their reaction sets elsewhere; their
    * memberships and membership records; their uploads; and their identity,
-   * passkey, limiter and dedup rows. A logged record that
+   * passkey, push subscription, status, mute, limiter and dedup rows. A logged record that
    * lists them beside others (a move's reaction sets) is rewritten without
    * them. Rooms they created stay. Clients that already have their content
    * keep it until they load history again. Returns what went, and the R2
@@ -2557,9 +2674,10 @@ export class Store {
       ? policy.uploadsPerUserDay * (Math.ceil((policy.avatarRetentionSeconds + policy.lifecycleLagSeconds) / 86_400) + 1)
       : 0;
     // Per user: memberships (live and awaiting a room purge), a day's dedup
-    // rows, limiter rows, credential and identity; each deletion also updates
-    // its indexes.
-    const perUser = 64 + 4 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS) + 4 * this.config.registeredPostsPerDay + 4 * uploadsPerOwner;
+    // rows, limiter rows, push subscriptions, credential and identity; each
+    // deletion also updates its indexes.
+    const perUser = 64 + 4 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS) + 4 * this.config.registeredPostsPerDay + 4 * uploadsPerOwner +
+      4 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER);
     const cost = { reads: 64 + 5 * records + ids.length * perUser, writes: 64 + 4 * records + ids.length * perUser };
     return this.reserved(cost, false, now, () => this.transaction(() => {
       const messages = this.rawRows<{ message_id: string }>(`SELECT message_id FROM message_state WHERE author_id IN (${marks})`, ...ids)
@@ -2606,7 +2724,7 @@ export class Store {
          WHERE room_id IN (SELECT room_id FROM memberships INDEXED BY memberships_user_idx WHERE user_id IN (${marks}))`,
         ...ids, ...ids,
       );
-      for (const table of ["memberships", "credentials", "accepted_requests", "identities"]) {
+      for (const table of ["memberships", "credentials", "push_subscriptions", "push_wakes", "user_status", "room_mutes", "accepted_requests", "identities"]) {
         this.rawExec(`DELETE FROM ${table} WHERE user_id IN (${marks})`, ...ids);
       }
       this.rawExec(`DELETE FROM principal_limits WHERE principal_key IN (${marks})`, ...ids.map((id) => `user:${id}`));
@@ -2629,6 +2747,7 @@ export class Store {
       const count = this.rawRows<{ count: number }>("SELECT COUNT(*) AS count FROM credentials WHERE user_id = ? LIMIT 1", userId)[0];
       const credentialCount = integerColumn(count?.count);
       const avatar = liveAvatar(row, this.clock.now());
+      const ext = parseUserExt(row.ext_json);
       return {
         userId: row.user_id,
         name: row.name,
@@ -2637,47 +2756,90 @@ export class Store {
         rooms: this.userRooms(userId),
         roles: parseRoles(row.roles_json),
         ...(avatar ? { avatar } : {}),
+        ...(ext ? { ext } : {}),
       };
     });
   }
 
   /**
    * The registered members of each room (§4.3.1), as `user_id` with the
-   * current `name` (`""` when removed), live `avatar`, and `roles`, in `user_id` order: at most `limit`
-   * per room, read from the room's primary-key range with one identity lookup
-   * each. Guests' memberships are not stored; the caller adds connected ones.
+   * current `name` (`""` when removed), live `avatar`, and `roles`, in
+   * `user_id` order: at most `limit` per room, read from the room's
+   * primary-key range with one identity lookup each. With `withStatus`, each
+   * also carries the `status` it chose (`choice`), from its `user_status`
+   * row, joined by primary key: a member without one costs nothing more.
+   * Guests' memberships are not stored; the caller adds connected ones.
+   *
+   * With `memberCacheMs`, a room's rows are kept in memory that long and
+   * reused, with no SQL and no reservation, until a write to `identities`,
+   * `memberships` or `user_status` (see rawExec). Avatars are judged against
+   * `now` on every call, so a reused row is never more out of date than a
+   * fresh read.
    */
   roomMembers(
     roomIds: readonly string[], limit: number, now = this.clock.now(),
     /** Filled, for each room whose listing reached `limit`, with its count of registered members. */
     counts?: Map<string, number>,
-  ): Map<string, Array<{ user_id: string; name: string; avatar?: string; roles: string[] }>> {
+    withStatus = false,
+  ): Map<string, RoomMember[]> {
     this.ensureReady();
     const ids = [...new Set(roomIds)].slice(0, MAX_THREAD_LIMIT + 1);
     const perRoom = Math.max(0, Math.floor(limit));
-    const members = new Map<string, Array<{ user_id: string; name: string; avatar?: string; roles: string[] }>>();
+    const members = new Map<string, RoomMember[]>();
     if (!ids.length || perRoom === 0) return members;
-    return this.reserved({ reads: 8 + ids.length * (4 + 2 * perRoom) }, false, now, () => {
-      for (const roomId of ids) {
-        const rows = this.rawRows<{ user_id: string; name: string | null; avatar_url: string | null; avatar_expires_ms: number | null; roles_json: string | null }>(
-          `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id
-           WHERE m.room_id = ? ORDER BY m.user_id LIMIT ?`,
-          roomId, perRoom,
-        );
-        if (rows.length) {
-          members.set(roomId, rows.map((row) => {
-            const avatar = liveAvatar(row, now);
-            return { user_id: row.user_id, name: row.name ?? "", ...(avatar ? { avatar } : {}), roles: parseRoles(row.roles_json) };
-          }));
+    const ttl = this.config.memberCacheMs ?? 0;
+    const cached = (roomId: string) => {
+      const entry = this.memberCache.get(roomId);
+      return entry && entry.generation === this.memberGeneration && entry.perRoom === perRoom && entry.withStatus === withStatus &&
+        (entry.counted || !counts) && now >= entry.at && now - entry.at < ttl ? entry : undefined;
+    };
+    const missing = ids.filter((roomId) => !cached(roomId));
+    if (missing.length) {
+      // Each member's status adds its `user_status` row, when it has one:
+      // measured at one more read a member at worst.
+      this.reserved({ reads: 8 + missing.length * (4 + (withStatus ? 3 : 2) * perRoom) }, false, now, () => {
+        const generation = this.memberGeneration;
+        if (this.memberCache.size > 2 * (MAX_THREAD_LIMIT + 1)) this.memberCache.clear();
+        for (const roomId of missing) {
+          const rows = this.rawRows<RawMemberRow>(
+            withStatus
+              ? `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json, s.status
+                 FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id LEFT JOIN user_status s ON s.user_id = m.user_id
+                 WHERE m.room_id = ? ORDER BY m.user_id LIMIT ?`
+              : `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id
+                 WHERE m.room_id = ? ORDER BY m.user_id LIMIT ?`,
+            roomId, perRoom,
+          );
+          // A full page may be truncated: the room row's count, one read, says.
+          let count: number | undefined;
+          if (counts && rows.length >= perRoom) {
+            const row = this.rawRows<{ member_count: number }>("SELECT member_count FROM rooms WHERE room_id = ? LIMIT 1", roomId)[0];
+            if (row) count = Math.max(rows.length, integerColumn(row.member_count));
+          }
+          const entry = { at: now, generation, perRoom, withStatus, rows, counted: counts !== undefined, ...(count !== undefined ? { count } : {}) };
+          if (ttl > 0) this.memberCache.set(roomId, entry);
+          else this.uncachedMembers.set(roomId, entry);
         }
-        // A full page may be truncated: the room row's count, one read, says.
-        if (counts && rows.length >= perRoom) {
-          const count = this.rawRows<{ member_count: number }>("SELECT member_count FROM rooms WHERE room_id = ? LIMIT 1", roomId)[0];
-          if (count) counts.set(roomId, Math.max(rows.length, integerColumn(count.member_count)));
-        }
+      });
+    }
+    for (const roomId of ids) {
+      const entry = cached(roomId) ?? this.uncachedMembers.get(roomId);
+      if (!entry) continue;
+      if (entry.rows.length) {
+        members.set(roomId, entry.rows.map((row) => {
+          const avatar = liveAvatar(row, now);
+          const ext = parseUserExt(row.ext_json);
+          return {
+            user_id: row.user_id, name: row.name ?? "", ...(avatar ? { avatar } : {}), roles: parseRoles(row.roles_json),
+            ...(ext ? { ext } : {}),
+            ...(withStatus ? { choice: choiceColumn(row.status) } : {}),
+          };
+        }));
       }
-      return members;
-    });
+      if (counts && entry.count !== undefined) counts.set(roomId, entry.count);
+    }
+    this.uncachedMembers.clear();
+    return members;
   }
 
   getCredential(credentialId: string): StoredCredential | null {
@@ -2707,32 +2869,6 @@ export class Store {
   countIdentities(): number {
     this.ensureReady();
     return this.reserved({ reads: 8 }, false, this.clock.now(), () => this.metaNumber("identity_count"));
-  }
-
-  findDedup(userId: string, requestId: string, now: number): DedupRecord | null {
-    this.ensureReady();
-    return this.reserved({ reads: 8 }, false, now, () => {
-      const effective = this.effectiveNow(now);
-      const rows = this.rawRows<RawDedupRow>(
-        "SELECT user_id, request_id, digest, result_json, expires_ms FROM accepted_requests WHERE user_id = ? AND request_id = ? AND expires_ms > ? LIMIT 1",
-        userId,
-        requestId,
-        effective,
-      );
-      if (!rows.length) return null;
-      const row = rows[0];
-      const result = parseJson<Record<string, unknown>>(row.result_json, {});
-      const method = typeof result.__method === "string" ? result.__method : "message";
-      delete result.__method;
-      return {
-        userId: row.user_id,
-        requestId: row.request_id,
-        digest: row.digest,
-        method,
-        result,
-        expiresAt: row.expires_ms,
-      };
-    });
   }
 
   private dedupRow(userId: string, requestId: string, now: number): RawDedupRow | null {
@@ -2925,17 +3061,6 @@ export class Store {
     }));
   }
 
-  reserveHistory(input: { userId: string; ipKey: string; now: number }): void {
-    this.ensureReady();
-    this.reserved({ ...this.config.historyCost, reads: Math.max(32, this.config.historyCost.reads ?? 0), writes: Math.max(16, this.config.historyCost.writes ?? 0) }, false, input.now, () => {
-      const effective = this.effectiveNow(input.now);
-      this.transaction(() => {
-        this.chargeEvent("history", `user:${input.userId}`, "history", effective, this.config.historyRequestsPerUserMinute, "History request limit reached");
-        this.chargeEvent("history", `ip:${input.ipKey}`, "history", effective, this.config.historyRequestsPerIpMinute, "History request limit reached");
-      });
-    });
-  }
-
   reserveFrames(input: { ipKey: string; now: number; count?: number }): void {
     this.ensureReady();
     const count = Math.max(1, Math.floor(input.count ?? 1));
@@ -3088,7 +3213,7 @@ export class Store {
   }
 
   /**
-   * Adds a passkey to a registered identity that is signed in (§4.9): a
+   * Adds a passkey to a registered identity that is signed in (§4.10): a
    * registration on a connection already signed in adds to that account.
    * Bots sign in with their token and take none. At most
    * MAX_PASSKEYS_PER_USER per identity; a credential already registered
@@ -3183,23 +3308,10 @@ export class Store {
         "SELECT COUNT(*) AS count FROM (SELECT 1 FROM credentials WHERE user_id = ? LIMIT ?)", input.userId, MAX_PASSKEYS_PER_USER + 1,
       )[0]?.count);
       if (!this.rawRows("SELECT 1 FROM credentials WHERE credential_id = ? AND user_id = ? LIMIT 1", input.credentialId, input.userId).length) return false;
-      if (count <= 1) throw new StoreError("invalid_params", "You can't remove your only passkey");
+      if (count <= 1) throw new StoreError("denied", "You can't remove your only passkey");
       this.rawExec("DELETE FROM credentials WHERE credential_id = ? AND user_id = ?", input.credentialId, input.userId);
       return true;
     }));
-  }
-
-  registerCredential(input: {
-    userId: string;
-    name: string;
-    userHandle: string;
-    credential: StoredCredential;
-    now: number;
-    ipKey: string;
-    rooms?: readonly string[];
-  }): DomainIdentity {
-    const stored = this.registerIdentity(input);
-    return { user_id: stored.userId, name: stored.name };
   }
 
   credentialIdsForUser(userId: string): string[] {
@@ -3225,7 +3337,7 @@ export class Store {
     });
   }
 
-  reserveConnection(input: { ipKey: string; tier: AuthTier; now: number; userId?: string }): void {
+  reserveConnection(input: { ipKey: string; now: number }): void {
     this.ensureReady();
     if (!this.config.admissionEnabled) throw new StoreError("denied", "Demo admission is closed");
     this.reserved({ reads: 64, writes: 32, admissions: 1 }, false, input.now, () => {
@@ -3254,40 +3366,6 @@ export class Store {
     });
   }
 
-  releaseConnection(input: { ipKey: string; tier: AuthTier; userId?: string }): void {
-    // Intentionally no-op: live sockets are counted from the runtime's
-    // authoritative getWebSockets() view.  A close callback can be lost or
-    // arrive after a redeploy, so a durable decrement would be less correct
-    // than doing no durable open-counter accounting at all.
-    void input;
-  }
-
-  reserveAdmission(input: { ipKey: string; now: number }): void {
-    this.reserveConnection({ ...input, tier: "pending" });
-  }
-
-  releaseAdmission(input: { ipKey: string; tier: AuthTier; userId?: string }): void {
-    this.releaseConnection(input);
-  }
-
-  admission(): AdmissionSnapshot {
-    this.ensureReady();
-    return this.reserved({ reads: 32, writes: 16 }, false, this.clock.now(), () => {
-      const now = this.effectiveNow(this.clock.now());
-      const day = dayFor(now);
-      const frameRows = this.rawRows<{ day: string; posts_day: number }>(
-        "SELECT day, posts_day FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1",
-        "frames",
-        "global",
-      );
-      const frames = frameRows.length && frameRows[0].day === day ? integerColumn(frameRows[0].posts_day) : 0;
-      return {
-        globalFrames: frames,
-        globalPosts: this.limitEventCount("post", "global", "post", now),
-      };
-    });
-  }
-
   private metaNumber(key: string): number {
     const rows = this.rawRows<{ value: string }>("SELECT value FROM _meta WHERE key = ? LIMIT 1", key);
     return rows.length && /^\d+$/.test(rows[0].value) ? Number(rows[0].value) : 0;
@@ -3299,11 +3377,6 @@ export class Store {
     );
     if (!rows.length) throw new StoreError("internal_error", "maintenance state is missing");
     return rows[0];
-  }
-
-  private limitEventCount(scope: string, principalKey: string, field: "post" | "auth" | "history" | "admission", now: number): number {
-    const rows = this.rawRows<RawLimitRow>("SELECT post_events_json, auth_events_json, history_events_json, admission_events_json, scope, principal_key, day, posts_day, registrations_day, updated_ms FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1", scope, principalKey);
-    return rows.length ? this.currentEvents(rows[0], field, now).length : 0;
   }
 
   private currentMessage(messageId: string, floor?: number): RawMessageRow | null {
@@ -3329,7 +3402,8 @@ export class Store {
     if (format !== "plain" && format !== "markdown") throw new StoreError("invalid_params", "body.format is invalid");
     const embeds = body.embeds === undefined ? [] : body.embeds;
     if (!Array.isArray(embeds)) throw new StoreError("invalid_params", "body.embeds must be an array");
-    if (embeds.length > this.config.maxEmbeds) throw new StoreError("too_large", "too many embeds");
+    // A count limit this server sets: denied (§1.1).
+    if (embeds.length > this.config.maxEmbeds) throw new StoreError("denied", `A message has at most ${this.config.maxEmbeds} embeds`);
     for (const embed of embeds) {
       if (!isPlainObject(embed) || typeof embed.kind !== "string" || embed.kind.length === 0) {
         throw new StoreError("invalid_params", "body.embeds must be objects with a kind");
@@ -3342,9 +3416,10 @@ export class Store {
       if (!Array.isArray(body.mentions)) throw new StoreError("invalid_params", "body.mentions must be an array of user_id strings");
       const unique = new Set<string>();
       for (const item of body.mentions) {
-        if (typeof item !== "string" || item.length === 0 || utf8Bytes(item) > 256) {
+        if (typeof item !== "string" || item.length === 0) {
           throw new StoreError("invalid_params", "body.mentions must be an array of user_id strings");
         }
+        if (utf8Bytes(item) > 256) throw new StoreError("too_large", "a mentioned user_id is too long");
         unique.add(item);
       }
       mentions = [...unique];
@@ -3412,16 +3487,16 @@ export class Store {
       const unchanged = { changed: false, on, name: identity.name, roles: held };
       if (!on) {
         if (!held.includes(input.role)) return unchanged;
-        if (input.role === "admin" && identity.user_id === ADMIN_USER_ID) throw new StoreError("invalid_params", "The admin user is always an admin");
-        if (input.role === "bot" && identity.tier === "bot") throw new StoreError("invalid_params", "An owner's bot is always a bot");
+        if (input.role === "admin" && identity.user_id === ADMIN_USER_ID) throw new StoreError("denied", "The admin user is always an admin");
+        if (input.role === "bot" && identity.tier === "bot") throw new StoreError("denied", "An owner's bot is always a bot");
         return this.writeRoles(identity, held.filter((role) => role !== input.role), on);
       }
       if (held.includes(input.role)) return unchanged;
-      if (input.role === "admin" && held.includes("bot")) throw new StoreError("invalid_params", "A bot can't be an admin");
+      if (input.role === "admin" && held.includes("bot")) throw new StoreError("denied", "A bot can't be an admin");
       if (input.role === "bot") {
-        if (held.includes("admin")) throw new StoreError("invalid_params", "An admin can't be a bot; take away admin first");
+        if (held.includes("admin")) throw new StoreError("denied", "An admin can't be a bot; take away admin first");
         if (this.rawRows("SELECT 1 FROM credentials WHERE user_id = ? LIMIT 1", input.userId).length) {
-          throw new StoreError("invalid_params", "A bot signs in with a token and holds no passkey; this user has one");
+          throw new StoreError("denied", "A bot signs in with a token and holds no passkey; this user has one");
         }
       }
       if (held.length >= MAX_ROLES_PER_USER) throw new StoreError("denied", `A user has at most ${MAX_ROLES_PER_USER} roles`);
@@ -3645,7 +3720,7 @@ export class Store {
     );
   }
 
-  /** Create, save, delete, restore, or move a message (section 3.5, §4.2). */
+  /** Create, save, delete, restore, or move a message (section 3.5, §4.4). */
   private commitMessage(input: StoreMutationInput, context: CommitContext, floor: number): StoreMutationResult {
     const params = input.params;
     if (params.log_id !== undefined) throw new StoreError("invalid_params", "log_id is server assigned");
@@ -3672,7 +3747,10 @@ export class Store {
       body = this.normalizedBody(params.body);
       if (body.text === "" && (body.embeds as unknown[]).length === 0) throw new StoreError("invalid_params", "message cannot be empty");
     }
-    const ext = this.optionalExt(params.ext);
+    // A save merges `ext` into the current snapshot's (§4.12); a tombstone carries none (§4.4),
+    // so a creation, or a save of a tombstone, merges into an empty `ext`.
+    const write = this.optionalExt(params.ext);
+    const ext = deleted ? undefined : mergeExt(previous?.ext, write);
     const from = previous ? previous.from : this.identityForMessage(input);
     if (!from || typeof from.user_id !== "string") throw new StoreError("internal_error", "message author is missing");
 
@@ -3686,14 +3764,14 @@ export class Store {
       uploads = identified.uploads;
       deletedUploads = this.releaseUploadRows(this.messageUploads(messageId, identified.removed));
     }
-    // Deletion omits the body from the tombstone; the other client fields keep
-    // replacement semantics, so omitted fields are removed.
+    // Deletion omits the body and ext from the tombstone; the other client
+    // fields keep replacement semantics, so omitted fields are removed.
     const snapshot: MessageSnapshot = { message_id: messageId, log_id: idString(logId), room_id: roomId, from: clone(from) };
     if (body) snapshot.body = body;
     if (replyId !== undefined) snapshot.reply_to = { message_id: replyId };
     if (deleted) snapshot.deleted = true;
     if (ext) snapshot.ext = ext;
-    // The size policy bounds client content; the server's prev_log_id and
+    // The size policy bounds client content, the merged ext included; the server's prev_log_id and
     // prev_room_id links are added after it.
     if (utf8Bytes(JSON.stringify(snapshot)) > this.config.maxSnapshotBytes) throw new StoreError("too_large", "message snapshot is too large");
     const moved = current !== null && current.room_id !== roomId;
@@ -3702,7 +3780,7 @@ export class Store {
     if (moved) snapshot.prev_room_id = current.room_id;
     const json = JSON.stringify(snapshot);
 
-    // A move belongs to the source and destination logs (§4.1).
+    // A move belongs to the source and destination logs (§4.2).
     this.appendRecord(context, moved ? [current.room_id, roomId] : [roomId], "message", logId, json);
     this.rawExec(
       `INSERT INTO message_state (message_id, room_id, latest_log_id, snapshot_json, author_id)
@@ -3738,7 +3816,7 @@ export class Store {
         broadcasts.push({ method: "reactions", params: clone(record) as unknown as Record<string, unknown>, rooms: [roomId] });
       }
     }
-    // New uploads' writes go in the result, in request order (§4.6.3); the
+    // New uploads' writes go in the result, in request order (§4.8.3); the
     // runtime signs each into a `write_url`, so a retry gets the same URLs.
     const result: Record<string, unknown> = { message_id: messageId };
     if (uploads.length) result.embeds = uploads.map(uploadResultEmbed);
@@ -3746,7 +3824,7 @@ export class Store {
   }
 
   /**
-   * Embed identity (protocol §4.6.2) on a server with `embed:upload`: every
+   * Embed identity (protocol §4.8.2) on a server with `embed:upload`: every
    * embed gets an `embed_id`. One sent back with its `embed_id` keeps what the
    * server owns from the previous snapshot: an upload keeps its `url` and
    * `og` and takes only a new `title`. One without is new, and a new `upload`
@@ -3791,7 +3869,7 @@ export class Store {
   }
 
   /**
-   * Starts an upload (protocol §4.6.3) for a registered user: charges the
+   * Starts an upload (protocol §4.8.3) for a registered user: charges the
    * user's and the server's daily upload counts, and reserves the largest
    * size against the stored-bytes cap until the write reports its size.
    */
@@ -3888,7 +3966,7 @@ export class Store {
   }
 
   /**
-   * Starts an avatar upload (protocol §4.6.6): `/avatar` with one `upload`
+   * Starts an avatar upload (protocol §4.8.6): `/avatar` with one `upload`
    * embed. The avatar is set when the write finishes (finishUpload).
    */
   startAvatarUpload(input: { userId: string; now?: number }): PendingUpload {
@@ -3901,7 +3979,7 @@ export class Store {
   }
 
   /**
-   * Finishes a write exactly once (protocol §4.6.3). A file's message gets a
+   * Finishes a write exactly once (protocol §4.8.3). A file's message gets a
    * new snapshot, with the embed completed (`url`, and `og.image` describing
    * it) or, for a failed write, without it; an avatar becomes its owner's.
    * A write that is not pending, came too late, or whose embed or message is
@@ -3987,7 +4065,7 @@ export class Store {
   }
 
   /**
-   * Fails pending uploads whose write never came (protocol §4.6.3): their
+   * Fails pending uploads whose write never came (protocol §4.8.3): their
    * messages get a snapshot without the embed. Maintenance work, a bounded
    * batch per call; `next` is when the next one falls due.
    */
@@ -4092,6 +4170,398 @@ export class Store {
     }));
   }
 
+  /**
+   * `push_register` (protocol §4.9, kind `webpush`): keeps a registered
+   * user's registration of the endpoint `url`, with its `push_id` and the
+   * `wake` scopes it wakes for (a WAKE_SCOPES bitmask, DEFAULT_WAKE when not
+   * given). Registrations are the user's own: registering a `url` the user
+   * holds again replaces its keys, `push_id` (removing one now absent) and
+   * scopes, and two
+   * users may register the same `url`. A user past `subscriptionsPerUser`
+   * loses the least recently registered of the others. Clients register on
+   * every connection, so an unchanged registration (keys, `push_id`, scopes)
+   * registered again within a day writes nothing; one not registered for
+   * `pushExpiryDays` is skipped by wakes and deleted by cleanup.
+   */
+  registerPushSubscription(input: { userId: string; url: string; p256dh: string; auth: string; pushId?: string; wake?: number; now?: number }): void {
+    this.ensureReady();
+    const policy = this.config.push;
+    if (!policy) throw new StoreError("unsupported", "Push is not available here");
+    if (utf8Bytes(input.url) > MAX_PUSH_URL_BYTES) throw new StoreError("too_large", "url is too long");
+    if (input.pushId !== undefined && !PUSH_ID_PATTERN.test(input.pushId)) throw new StoreError("invalid_params", "push_id must be 1 to 64 letters, digits, _ or -");
+    const wake = input.wake ?? DEFAULT_WAKE;
+    if (!Number.isInteger(wake) || wake < 0 || (wake & ~DEFAULT_WAKE) !== 0) throw new StoreError("invalid_params", "wake must name known scopes");
+    const now = input.now ?? this.clock.now();
+    // The row and the user's index range; each eviction rewrites a row and
+    // its three index entries.
+    const rows = MAX_PUSH_SUBSCRIPTIONS_PER_USER + 2;
+    return this.reserved({ reads: 32 + 2 * rows, writes: 32 + 5 * rows }, false, now, () => this.transaction(() => {
+      const effective = this.effectiveNow(now);
+      if (!this.identityRow(input.userId)) throw new StoreError("denied", "Sign in to receive push notifications");
+      const pushId = input.pushId ?? null;
+      const existing = this.rawRows<{ p256dh: string; auth: string; push_id: string | null; wake: number; updated_ms: number }>(
+        "SELECT p256dh, auth, push_id, wake, updated_ms FROM push_subscriptions WHERE user_id = ? AND url = ? LIMIT 1",
+        input.userId, input.url,
+      )[0];
+      if (existing && existing.p256dh === input.p256dh && existing.auth === input.auth && existing.push_id === pushId && integerColumn(existing.wake) === wake &&
+          effective - integerColumn(existing.updated_ms) < PUSH_REFRESH_MS) return;
+      if (!existing) this.ensureGrowthCapacity(2 * MAX_PUSH_URL_BYTES);
+      this.rawExec(
+        `INSERT INTO push_subscriptions (user_id, url, p256dh, auth, push_id, wake, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (user_id, url) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, push_id = excluded.push_id, wake = excluded.wake, updated_ms = excluded.updated_ms`,
+        input.userId, input.url, input.p256dh, input.auth, pushId, wake, effective, effective,
+      );
+      // The new one never goes, even when it shares its millisecond with others.
+      this.rawExec(
+        `DELETE FROM push_subscriptions WHERE user_id = ? AND url IN (
+           SELECT url FROM push_subscriptions INDEXED BY push_subscriptions_user_idx
+           WHERE user_id = ? AND url <> ? ORDER BY updated_ms DESC LIMIT -1 OFFSET ?)`,
+        input.userId, input.userId, input.url, policy.subscriptionsPerUser - 1,
+      );
+    }));
+  }
+
+  /** `push_unregister` (protocol §4.9): removes the user's own registration of `url`, if any. */
+  removePushSubscription(input: { userId: string; url: string; now?: number }): void {
+    this.ensureReady();
+    const now = input.now ?? this.clock.now();
+    this.reserved({ reads: 16, writes: 16 }, false, now, () => {
+      this.rawExec("DELETE FROM push_subscriptions WHERE user_id = ? AND url = ?", input.userId, input.url);
+    });
+  }
+
+  /**
+   * The registrations a new message in `roomId` pushes to (protocol §4.9).
+   * `candidates` are the users the caller found unattended among those the
+   * message mentions or replies to, each with the scopes it qualifies under,
+   * at most MAX_PUSH_CANDIDATES. Each is looked up in turn: only its
+   * unexpired registrations whose `wake` includes one of those scopes count,
+   * and one with none is passed over without taking a wake; so is one that a
+   * mute or a `dnd` status silences (protocol §4.9: a silenced push
+   * goes only to `badge` registrations, which this server does not have):
+   * its unscoped mute, or its mute of the room or, for a thread, of the
+   * thread's parent; one woken for this room within `coalesceSeconds` is
+   * passed over too; the rest are woken, up to
+   * `wakesPerMessage` users, on each of their registrations (most recently
+   * registered first). Pushes are checked against the sender's
+   * `pushesPerSenderDay` (charged once delivered, chargePushSender), charged
+   * to the recipient's `pushesPerRecipientDay` and to the server's
+   * `pushesPerDay`; past any of them, what is left is `skipped`. With
+   * `allowed`, a registration whose endpoint it refuses (PUSH_HOSTS) is
+   * passed over before it counts. Each woken user's time for the room is kept for coalescing.
+   */
+  claimPushes(input: { senderId: string; roomId: string; candidates: readonly PushCandidate[]; allowed?: (url: string) => boolean; now?: number }): PushClaim {
+    this.ensureReady();
+    const policy = this.config.push;
+    const reasons = new Map<string, number>();
+    for (const candidate of input.candidates) reasons.set(candidate.userId, (reasons.get(candidate.userId) ?? 0) | candidate.reasons);
+    const candidates = [...reasons.keys()].slice(0, MAX_PUSH_CANDIDATES);
+    const claim: PushClaim = { subscriptions: [], skipped: 0 };
+    if (!policy || !candidates.length) return claim;
+    const now = input.now ?? this.clock.now();
+    // Each candidate's status row, live index range, two room mute probes,
+    // wake row and recipient counter; the room's parent, read once; the
+    // server's and sender's counters; and for each woken user a wake row and
+    // the recipient counter, created on a user's first push of the day.
+    const cost = { reads: 56 + candidates.length * (20 + 2 * policy.subscriptionsPerUser), writes: 32 + 12 * policy.wakesPerMessage };
+    return this.reserved(cost, false, now, () => this.transaction(() => {
+      const effective = this.effectiveNow(now);
+      const day = dayFor(effective);
+      const live = effective - policy.pushExpiryDays * 86_400_000;
+      let counters: { server: RawLimitRow; sent: number; delivered: number } | undefined;
+      // The rooms a room mute silences this message by: its room and, for a
+      // thread, the parent (protocol §4.5), read once a candidate needs it.
+      let scopes: string[] | undefined;
+      let woken = 0;
+      for (const userId of candidates) {
+        if (woken >= policy.wakesPerMessage) break;
+        // A muted or `dnd` user gets no pushes (protocol §4.9, §4.5) and takes no wake.
+        const status = this.rawRows<{ status: string; mute_until_ms: number | null }>("SELECT status, mute_until_ms FROM user_status WHERE user_id = ? LIMIT 1", userId)[0];
+        if (status && (status.status === "dnd" || (status.mute_until_ms != null && integerColumn(status.mute_until_ms) > effective))) continue;
+        // Filtered after the bounded read, so the read stays one index range of
+        // at most `subscriptionsPerUser` rows whatever the scopes; the partial
+        // index leaves out registrations that wake for nothing.
+        const rows = this.rawRows<RawPushRow>(
+          `SELECT url, p256dh, auth, push_id, wake FROM push_subscriptions INDEXED BY push_subscriptions_waking_idx
+           WHERE user_id = ? AND wake != 0 AND updated_ms >= ? ORDER BY updated_ms DESC LIMIT ?`,
+          userId, live, policy.subscriptionsPerUser,
+        ).filter((row) => (integerColumn(row.wake) & reasons.get(userId)!) !== 0 && (input.allowed?.(row.url) ?? true));
+        if (!rows.length) continue;
+        scopes ??= [input.roomId, ...this.rawRows<{ parent_room_id: string | null }>("SELECT parent_room_id FROM rooms WHERE room_id = ? LIMIT 1", input.roomId)
+          .flatMap((row) => row.parent_room_id === null ? [] : [row.parent_room_id])];
+        const roomMuted = this.rawRows<{ mute_until_ms: number }>(
+          `SELECT mute_until_ms FROM room_mutes WHERE user_id = ? AND room_id IN (${scopes.map(() => "?").join(", ")}) AND mute_until_ms > ? LIMIT 1`,
+          userId, ...scopes, effective,
+        );
+        if (roomMuted.length) continue;
+        const last = this.rawRows<{ woken_ms: number }>("SELECT woken_ms FROM push_wakes WHERE user_id = ? AND room_id = ? LIMIT 1", userId, input.roomId)[0];
+        if (last && effective - integerColumn(last.woken_ms) < policy.coalesceSeconds * 1_000) continue;
+        // The counters are read once a user is found to wake, so a message
+        // that wakes no one writes nothing. Reuse posts_day as the counts; the
+        // scope separates them.
+        // The sender's pushes are charged once delivered (chargePushSender);
+        // here they are only checked, so failed pushes cost the sender nothing.
+        if (!counters) {
+          const server = this.limitRow("push", "global", effective);
+          const sender = this.rawRows<{ day: string; posts_day: number }>(
+            "SELECT day, posts_day FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1", "push", `user:${input.senderId}`,
+          )[0];
+          counters = {
+            server, sent: server.day === day ? integerColumn(server.posts_day) : 0,
+            delivered: sender?.day === day ? integerColumn(sender.posts_day) : 0,
+          };
+        }
+        const recipient = this.rawRows<{ day: string; posts_day: number }>(
+          "SELECT day, posts_day FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1", "push_recipient", `user:${userId}`,
+        )[0];
+        const received = recipient?.day === day ? integerColumn(recipient.posts_day) : 0;
+        const allowed = Math.max(0, Math.min(
+          rows.length,
+          policy.pushesPerDay - counters.sent,
+          policy.pushesPerRecipientDay - received,
+          policy.pushesPerSenderDay - counters.delivered - claim.subscriptions.length,
+        ));
+        claim.skipped += rows.length - allowed;
+        if (!allowed) continue;
+        for (const row of rows.slice(0, allowed)) claim.subscriptions.push(pushRecord(row, userId));
+        counters.sent += allowed;
+        woken += 1;
+        this.updateLimitRow(this.limitRow("push_recipient", `user:${userId}`, effective), { day, posts_day: received + allowed }, effective);
+        this.rawExec(
+          "INSERT INTO push_wakes (user_id, room_id, woken_ms) VALUES (?, ?, ?) ON CONFLICT (user_id, room_id) DO UPDATE SET woken_ms = excluded.woken_ms",
+          userId, input.roomId, effective,
+        );
+      }
+      if (counters && woken) this.updateLimitRow(counters.server, { day, posts_day: counters.sent }, effective);
+      return claim;
+    }));
+  }
+
+  /**
+   * Charges a sender's daily allowance (`pushesPerSenderDay`) with the
+   * pushes their message got delivered (2xx from the push service).
+   */
+  chargePushSender(senderId: string, delivered: number, now = this.clock.now()): void {
+    this.ensureReady();
+    if (delivered <= 0) return;
+    this.reserved({ reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
+      const effective = this.effectiveNow(now);
+      const day = dayFor(effective);
+      const row = this.limitRow("push", `user:${senderId}`, effective);
+      this.updateLimitRow(row, { day, posts_day: (row.day === day ? integerColumn(row.posts_day) : 0) + delivered }, effective);
+    }));
+  }
+
+  /**
+   * Removes all of a user's push registrations, when what they signed in
+   * with is revoked (`/passkeys remove`, a bot's new token): a device that
+   * held it should not keep getting their messages.
+   */
+  clearPushSubscriptions(userId: string, now = this.clock.now()): void {
+    this.ensureReady();
+    this.reserved({ reads: 8 + 2 * MAX_PUSH_SUBSCRIPTIONS_PER_USER, writes: 8 + 6 * MAX_PUSH_SUBSCRIPTIONS_PER_USER }, false, now, () => {
+      this.rawExec("DELETE FROM push_subscriptions WHERE user_id = ?", userId);
+    });
+  }
+
+  /**
+   * Forgets the registrations whose push service said they are gone (404
+   * or 410): each the user's registration of the endpoint, if it still has
+   * the keys that were pushed to, so a fresh registration of it stays.
+   * Other users' registrations of the same endpoint are left to their own
+   * pushes and to expiry.
+   */
+  forgetPushSubscriptions(gone: ReadonlyArray<{ userId: string; url: string; p256dh: string }>, now = this.clock.now()): void {
+    this.ensureReady();
+    const rows = gone.slice(0, MAX_PUSHES_PER_MESSAGE);
+    if (!rows.length) return;
+    // One primary-key row each, whatever other users hold the same endpoint:
+    // a delete by endpoint alone would touch every user's row for it, which
+    // anyone can multiply by registering one endpoint from many accounts.
+    this.reserved({ reads: 8 + 4 * rows.length, writes: 8 + 6 * rows.length }, false, now, () => this.transaction(() => {
+      for (const row of rows) {
+        this.rawExec("DELETE FROM push_subscriptions WHERE user_id = ? AND url = ? AND p256dh = ?", row.userId, row.url, row.p256dh);
+      }
+    }));
+  }
+
+  /**
+   * The author of a retained message, for waking the user a reply answers
+   * (protocol §4.9 `replies`): one indexed read of its current state. Null
+   * for an unknown or expired message.
+   */
+  messageAuthor(messageId: string, now = this.clock.now()): string | null {
+    this.ensureReady();
+    return this.reserved({ reads: 8 }, false, now, () => this.currentMessage(messageId, this.logState().history_floor)?.author_id ?? null);
+  }
+
+  /**
+   * `status` `mute` without `room_id` (protocol §4.5) for a registered user:
+   * until when they are muted, MUTE_FOREVER for `true`, or null to end it.
+   * Whether the stored mute changed, and `untilMs`, the end it leaves,
+   * absent when not muted. A mute is the user's, whichever connection set
+   * it. It is kept in the user's `user_status` row, which goes once it holds
+   * only defaults.
+   */
+  setMute(input: { userId: string; untilMs: number | null; now?: number }): { changed: boolean; untilMs?: number } {
+    this.ensureReady();
+    const now = input.now ?? this.clock.now();
+    return this.reserved({ reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
+      const effective = this.effectiveNow(now);
+      if (!this.identityRow(input.userId)) return { changed: false };
+      const existing = this.userStatusRow(input.userId);
+      const stored = existing?.mute_until_ms ?? null;
+      const before = stored !== null && stored > effective ? stored : null;
+      if (input.untilMs === null || input.untilMs <= effective) {
+        if (stored !== null) this.writeUserStatus(input.userId, existing, { mute_until_ms: null });
+        return { changed: before !== null };
+      }
+      if (before === input.untilMs) return { changed: false, untilMs: input.untilMs };
+      this.writeUserStatus(input.userId, existing, { mute_until_ms: input.untilMs });
+      return { changed: true, untilMs: input.untilMs };
+    }));
+  }
+
+  /**
+   * `me` `status` (protocol §4.5) for a registered user: the value they
+   * chose, kept in their `user_status` row with the mute. Whether it changed.
+   */
+  setStatus(input: { userId: string; choice: StatusChoice; now?: number }): { changed: boolean } {
+    this.ensureReady();
+    const now = input.now ?? this.clock.now();
+    return this.reserved({ reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
+      this.effectiveNow(now);
+      if (!this.identityRow(input.userId)) return { changed: false };
+      const existing = this.userStatusRow(input.userId);
+      if ((existing?.status ?? "online") === input.choice) return { changed: false };
+      this.writeUserStatus(input.userId, existing, { status: input.choice });
+      return { changed: true };
+    }));
+  }
+
+  /** A user's `user_status` row, if any, with an expired mute left as stored. */
+  private userStatusRow(userId: string): { status: StatusChoice; mute_until_ms: number | null } | undefined {
+    const row = this.rawRows<{ status: string; mute_until_ms: number | null }>(
+      "SELECT status, mute_until_ms FROM user_status WHERE user_id = ? LIMIT 1", userId,
+    )[0];
+    return row ? { status: choiceColumn(row.status), mute_until_ms: row.mute_until_ms === null ? null : integerColumn(row.mute_until_ms) } : undefined;
+  }
+
+  /** Writes a user's `user_status` row with `change` applied, deleting it once it holds only defaults. */
+  private writeUserStatus(userId: string, existing: { status: StatusChoice; mute_until_ms: number | null } | undefined, change: { status?: StatusChoice; mute_until_ms?: number | null }): void {
+    const next = { status: existing?.status ?? "online", mute_until_ms: existing?.mute_until_ms ?? null, ...change };
+    if (next.mute_until_ms === null && next.status === "online") {
+      if (existing) this.rawExec("DELETE FROM user_status WHERE user_id = ?", userId);
+      return;
+    }
+    this.rawExec(
+      `INSERT INTO user_status (user_id, status, mute_until_ms) VALUES (?, ?, ?)
+       ON CONFLICT (user_id) DO UPDATE SET status = excluded.status, mute_until_ms = excluded.mute_until_ms`,
+      userId, next.status, next.mute_until_ms,
+    );
+  }
+
+  /**
+   * `status` `mute` with `room_id` (protocol §4.5) for a registered user:
+   * until when `roomId` and its threads are muted, MUTE_FOREVER for `true`,
+   * or null to end it. Kept in `room_mutes`, one row a room, at most
+   * MAX_ROOM_MUTES_PER_USER a user: a mute of another room past that first
+   * deletes the user's mutes that ran out, and is `refused` if that frees
+   * none. Whether it changed anything, and `untilMs`, the end it leaves,
+   * absent when not muted. A mute that ran out is deleted with no change.
+   */
+  setRoomMute(input: { userId: string; roomId: string; untilMs: number | null; now?: number }): { changed: boolean; untilMs?: number; refused?: true } {
+    this.ensureReady();
+    const now = input.now ?? this.clock.now();
+    // The row and its key; at the cap, two counts of the user's mutes and a
+    // delete of those that ran out (a row and its key each), each at most
+    // the cap.
+    const cost = { reads: 24 + 4 * MAX_ROOM_MUTES_PER_USER, writes: 16 + 4 * MAX_ROOM_MUTES_PER_USER };
+    return this.reserved(cost, false, now, () => this.transaction(() => {
+      const effective = this.effectiveNow(now);
+      const row = this.rawRows<{ mute_until_ms: number }>("SELECT mute_until_ms FROM room_mutes WHERE user_id = ? AND room_id = ? LIMIT 1", input.userId, input.roomId)[0];
+      const stored = row ? integerColumn(row.mute_until_ms) : null;
+      const before = stored !== null && stored > effective ? stored : null;
+      if (input.untilMs === null || input.untilMs <= effective) {
+        if (stored !== null) this.rawExec("DELETE FROM room_mutes WHERE user_id = ? AND room_id = ?", input.userId, input.roomId);
+        return { changed: before !== null };
+      }
+      if (before === input.untilMs) return { changed: false, untilMs: input.untilMs };
+      if (stored === null) {
+        if (!this.identityRow(input.userId)) return { changed: false };
+        const count = () => integerColumn(this.rawRows<{ count: number }>("SELECT COUNT(*) AS count FROM room_mutes WHERE user_id = ?", input.userId)[0]?.count);
+        if (count() >= MAX_ROOM_MUTES_PER_USER) {
+          this.rawExec("DELETE FROM room_mutes WHERE user_id = ? AND mute_until_ms <= ?", input.userId, effective);
+          if (count() >= MAX_ROOM_MUTES_PER_USER) return { changed: false, refused: true };
+        }
+      }
+      this.rawExec(
+        `INSERT INTO room_mutes (user_id, room_id, mute_until_ms) VALUES (?, ?, ?)
+         ON CONFLICT (user_id, room_id) DO UPDATE SET mute_until_ms = excluded.mute_until_ms`,
+        input.userId, input.roomId, input.untilMs,
+      );
+      return { changed: true, untilMs: input.untilMs };
+    }));
+  }
+
+  /**
+   * The room mutes of a user that ran out by `now` (protocol §4.5), deleted
+   * here, so each is told once: their rooms, and when the next of those left
+   * runs out (absent when none is timed). One range of the user's rows, at
+   * most MAX_ROOM_MUTES_PER_USER, and a delete of the expired ones.
+   */
+  expireRoomMutes(userId: string, now = this.clock.now()): { expired: string[]; next?: number } {
+    this.ensureReady();
+    return this.reserved({ reads: 16 + 2 * MAX_ROOM_MUTES_PER_USER, writes: 8 + 4 * MAX_ROOM_MUTES_PER_USER }, false, now, () => this.transaction(() => {
+      const effective = this.effectiveNow(now);
+      const rows = this.roomMuteRows(userId);
+      const expired = rows.filter((row) => row.untilMs <= effective).map((row) => row.roomId);
+      if (expired.length) this.rawExec("DELETE FROM room_mutes WHERE user_id = ? AND mute_until_ms <= ?", userId, effective);
+      return { expired, ...nextRoomMuteEnd(rows.filter((row) => row.untilMs > effective)) };
+    }));
+  }
+
+  /** A user's room mutes as stored, expired ones included, in `room_id` order. */
+  private roomMuteRows(userId: string): RoomMute[] {
+    return this.rawRows<{ room_id: string; mute_until_ms: number }>(
+      "SELECT room_id, mute_until_ms FROM room_mutes WHERE user_id = ? ORDER BY room_id LIMIT ?", userId, MAX_ROOM_MUTES_PER_USER,
+    ).map((row) => ({ roomId: row.room_id, untilMs: integerColumn(row.mute_until_ms) }));
+  }
+
+  /**
+   * A registered user's stored `status` state (protocol §4.5), read once at
+   * sign-in: the `status` they chose, their unscoped mute's end (absent when
+   * not muted, MUTE_FOREVER for `true`) and their room mutes in effect. One
+   * primary-key read and one range of the user's room mutes, at most
+   * MAX_ROOM_MUTES_PER_USER rows; a missing row or range costs nothing.
+   */
+  statusInputs(userId: string, now = this.clock.now()): StatusInputRecord {
+    this.ensureReady();
+    return this.reserved({ reads: 16 + 2 * MAX_ROOM_MUTES_PER_USER }, false, now, () => {
+      const effective = this.effectiveNow(now);
+      const row = this.userStatusRow(userId);
+      const until = row?.mute_until_ms ?? 0;
+      return {
+        choice: row?.status ?? "online",
+        ...(until > effective ? { muteUntil: until } : {}),
+        roomMutes: this.roomMuteRows(userId).filter((mute) => mute.untilMs > effective),
+      };
+    });
+  }
+
+  /** Pushes sent today, for `/status`. */
+  pushesToday(now = this.clock.now()): number {
+    this.ensureReady();
+    return this.reserved({ reads: 8 }, false, now, () => {
+      const rows = this.rawRows<{ day: string; posts_day: number }>(
+        "SELECT day, posts_day FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1",
+        "push",
+        "global",
+      );
+      return rows.length && rows[0].day === dayFor(this.effectiveNow(now)) ? integerColumn(rows[0].posts_day) : 0;
+    });
+  }
+
   /** Normalize a reaction set: strings, duplicates collapsed, bounded. */
   private normalizedEmojis(value: unknown): string[] {
     if (!Array.isArray(value)) throw new StoreError("invalid_params", "emojis must be an array");
@@ -4099,16 +4569,16 @@ export class Store {
     for (const item of value) {
       if (typeof item !== "string" || item.length === 0) throw new StoreError("invalid_params", "each emoji must be a non-empty string");
       // eslint-disable-next-line no-control-regex
-      if (utf8Bytes(item) > MAX_EMOJI_BYTES || /[\u0000-\u001f\u007f]/.test(item)) {
-        throw new StoreError("invalid_params", "emoji is not a single bounded sequence");
-      }
+      if (utf8Bytes(item) > MAX_EMOJI_BYTES) throw new StoreError("too_large", "emoji is too long");
+      if (/[\u0000-\u001f\u007f]/.test(item)) throw new StoreError("invalid_params", "emoji is not a single sequence");
       if (!emojis.includes(item)) emojis.push(item);
     }
-    if (emojis.length > this.config.reactionEmojisPerUser) throw new StoreError("invalid_params", "too many distinct emoji in one reaction set");
+    // A count limit this server sets: denied (§1.1).
+    if (emojis.length > this.config.reactionEmojisPerUser) throw new StoreError("denied", `A reaction set holds at most ${this.config.reactionEmojisPerUser} emoji`);
     return emojis;
   }
 
-  /** Replace the caller's reaction set on one message (§4.5). */
+  /** Replace the caller's reaction set on one message (§4.7). */
   private commitReactions(input: StoreMutationInput, context: CommitContext, floor: number): StoreMutationResult {
     const params = input.params;
     const messageIdParam = params.message_id;
@@ -4118,13 +4588,13 @@ export class Store {
     if (!message) throw new StoreError("invalid_params", "unknown or expired message");
     const snapshot = parseJson<MessageSnapshot>(message.snapshot_json);
     // Clients hide a tombstone's reactions; the demo stores no new ones.
-    if (snapshot.deleted === true && emojis.length) throw new StoreError("invalid_params", "cannot react to a deleted message");
+    if (snapshot.deleted === true && emojis.length) throw new StoreError("denied", "cannot react to a deleted message");
     const existing = this.rawRows<RawReactionRow>(
       "SELECT message_id, user_id, log_id, from_json, emojis_json FROM reaction_state WHERE message_id = ? AND user_id = ? LIMIT 1",
       message.message_id, input.userId,
     )[0];
     const currentSet = existing && existing.log_id >= floor ? parseJson<string[]>(existing.emojis_json, []) : [];
-    // An unchanged set produces no record (§4.5 permits no change).
+    // An unchanged set produces no record (§4.7 permits no change).
     if (currentSet.length === emojis.length && emojis.every((emoji) => currentSet.includes(emoji))) {
       return { result: {}, broadcasts: [] };
     }
@@ -4135,7 +4605,7 @@ export class Store {
         "SELECT COUNT(*) AS count FROM (SELECT 1 FROM reaction_state WHERE message_id = ? LIMIT ?)",
         message.message_id, this.config.reactionUsersPerMessage,
       )[0]?.count);
-      if (count >= this.config.reactionUsersPerMessage) throw new StoreError("invalid_params", "reaction limit reached for this message");
+      if (count >= this.config.reactionUsersPerMessage) throw new StoreError("denied", "reaction limit reached for this message");
     }
     const logId = this.allocateLogId(context);
     const from = this.identityForMessage(input);
@@ -4160,7 +4630,8 @@ export class Store {
   }
 
   /**
-   * `room_set`: create a thread room or replace a thread room's client fields (§4.3.4).
+   * `room_set`: create a thread room or replace a thread room's client fields (§4.3.4),
+   * merging `ext` into the current one (§4.12).
    * Demo policy: only threads under a top-level room may be created, and only
    * thread rooms may be edited; the permanent `general` room is fixed. Rooms
    * are never private here: every room is visible to everyone, so a creation
@@ -4177,12 +4648,16 @@ export class Store {
     if (titleParam !== undefined && typeof titleParam !== "string") throw new StoreError("invalid_params", "title must be a string");
     const descriptionParam = params.description;
     if (descriptionParam !== undefined && typeof descriptionParam !== "string") throw new StoreError("invalid_params", "description must be a string");
-    const ext = this.optionalExt(params.ext);
+    const write = this.optionalExt(params.ext);
     // Threads always carry a title so clients that ignore parent_room_id
     // still render them (section 3.4). An empty description is no description.
     const title = typeof titleParam === "string" && titleParam.trim() !== "" ? titleParam : DEFAULT_THREAD_TITLE;
     const description = typeof descriptionParam === "string" && descriptionParam.trim() !== "" ? descriptionParam : undefined;
-    const fields: Record<string, unknown> = { title, ...(description !== undefined ? { description } : {}), ...(ext ? { ext } : {}) };
+    // `ext` merges into the room's current one (§4.12, §4.3.4); the size check runs on the result.
+    const roomFields = (stored: unknown): Record<string, unknown> => {
+      const ext = mergeExt(stored, write);
+      return { title, ...(description !== undefined ? { description } : {}), ...(ext ? { ext } : {}) };
+    };
 
     let row: RawRoomRow;
     let logId: number;
@@ -4194,6 +4669,7 @@ export class Store {
       if (!parent) throw new StoreError("invalid_params", "unknown parent_room_id");
       if (parent.parent_room_id !== null) throw new StoreError("denied", "Threads cannot be nested on this demo");
       if (this.metaNumber("thread_count") >= this.config.maxThreads) throw new StoreError("denied", "thread_limit");
+      const fields = roomFields(undefined);
       this.checkRoomFields(fields);
       logId = this.allocateLogId(context);
       const roomId = idString(logId);
@@ -4212,6 +4688,7 @@ export class Store {
       if (!existing) throw new StoreError("invalid_params", "unknown room");
       if (existing.parent_room_id === null) throw new StoreError("denied", "Top-level rooms cannot be edited on this demo");
       // parent_room_id is fixed at creation; a submitted value is ignored.
+      const fields = roomFields(parseJson<{ ext?: unknown }>(existing.fields_json, {}).ext);
       this.checkRoomFields(fields);
       logId = this.allocateLogId(context);
       const fieldsJson = JSON.stringify(fields);
@@ -4250,28 +4727,44 @@ export class Store {
     if (utf8Bytes(JSON.stringify(fields)) > this.config.maxThreadMetadataBytes) throw new StoreError("too_large", "room metadata is too large");
   }
 
-  /** A `me` name change; `""` removes the name. Avatars and ext are not stored. */
+  /**
+   * A `me` profile write (§3.3) of a registered user: `name`, where `""`
+   * removes it, and `ext`, merged into the stored one (§4.12) and at most
+   * MAX_USER_EXT_BYTES after the merge. One identity row update, or none
+   * when neither changes. `profile` has the user's whole `ext` after the
+   * write and the keys it changed (changedExt).
+   */
   private commitMeMutation(input: StoreMutationInput, now: number): StoreMutationResult {
     const name = input.params.name;
-    if (typeof name !== "string") throw new StoreError("invalid_params", "name must be a string");
-    ensureText(name, "name", this.config.maxNameBytes);
-    if ([...name].length > this.config.maxNameCodePoints) throw new StoreError("too_large", "name is too long");
+    if (name !== undefined) {
+      if (typeof name !== "string") throw new StoreError("invalid_params", "name must be a string");
+      ensureText(name, "name", this.config.maxNameBytes);
+      if ([...name].length > this.config.maxNameCodePoints) throw new StoreError("too_large", "name is too long");
+    }
+    const write = this.optionalExt(input.params.ext);
     const existing = this.identityRow(input.userId);
-    if (!existing) throw new StoreError("denied", "Only registered users may change their name");
-    this.rawExec("UPDATE identities SET name = ?, updated_ms = ? WHERE user_id = ?", name, now, input.userId);
-    return { result: { name }, broadcasts: [] };
+    if (!existing) throw new StoreError("denied", "Only registered users may change their profile");
+    const before = parseUserExt(existing.ext_json);
+    const ext = mergeExt(before, write);
+    if (!userExtFits(ext)) throw new StoreError("too_large", `ext is at most ${MAX_USER_EXT_BYTES} bytes`);
+    const changed = changedExt(before, ext);
+    if (name !== undefined || changed) {
+      this.rawExec(
+        "UPDATE identities SET name = ?, ext_json = ?, updated_ms = ? WHERE user_id = ?",
+        name ?? existing.name, ext ? JSON.stringify(ext) : "", now, input.userId,
+      );
+    }
+    return { result: {}, broadcasts: [], profile: { ...(ext ? { ext } : {}), ...(changed ? { changed } : {}) } };
   }
 
   private commitStoredResult(
     userId: string,
     requestId: string | undefined,
     digest: string,
-    method: string,
     result: Record<string, unknown>,
     expiresAt: number,
   ): void {
     if (requestId === undefined) return;
-    const storedResult = { ...result, __method: method };
     this.rawExec(
       `INSERT INTO accepted_requests
        (user_id, request_id, digest, result_json, transition_json, expires_ms)
@@ -4285,7 +4778,7 @@ export class Store {
       userId,
       requestId,
       digest,
-      JSON.stringify(storedResult),
+      JSON.stringify(result),
       // The original result is sufficient for a retry response: retries are
       // never rebroadcast, so no record copy is retained here.
       null,
@@ -4302,10 +4795,11 @@ export class Store {
    * the retry's result leaves the grant out, so no stale `write_url` is
    * signed. One indexed read per upload embed (at most `maxEmbeds`).
    */
-  private deduplicatedCommit(row: RawDedupRow, method: string, digest: string, now: number): StoreMutationResult {
+  private deduplicatedCommit(row: RawDedupRow, digest: string, now: number): StoreMutationResult {
+    // The digest covers the method and params, so a matching row is the same operation.
     if (row.digest !== digest) throw new StoreError("invalid_params", "request ID was already used for a different operation");
     const stored = parseJson<Record<string, unknown>>(row.result_json, {});
-    if (stored.__method !== undefined && stored.__method !== method) throw new StoreError("invalid_params", "request ID was already used for a different method");
+    // Rows stored before this version name their method; they expire within the dedup TTL.
     delete stored.__method;
     if (Array.isArray(stored.embeds)) {
       stored.embeds = stored.embeds.map((embed: unknown) => {
@@ -4357,7 +4851,7 @@ export class Store {
       const lookup = this.reserved({ reads: 8 + 4 * this.config.maxEmbeds, writes: 8 }, false, operationNow, () => {
         const lookupNow = this.effectiveNow(operationNow);
         const row = this.dedupRow(input.userId, input.requestId!, lookupNow);
-        return { now: lookupNow, row, replay: row ? this.deduplicatedCommit(row, method, digest, lookupNow) : null };
+        return { now: lookupNow, row, replay: row ? this.deduplicatedCommit(row, digest, lookupNow) : null };
       });
       effective = lookup.now;
       if (lookup.replay) return lookup.replay;
@@ -4368,7 +4862,7 @@ export class Store {
     // writes); every other mutation measured at most 37. Unused rows are
     // credited back, so the floor only decides admission near the ceiling.
     const mayMove = method === "message" && typeof input.params.message_id === "string";
-    // Each embed may start or release an upload (§4.6.3).
+    // Each embed may start or release an upload (§4.8.3).
     const uploadWrites = this.config.uploads && method === "message" ? this.config.maxEmbeds * UPLOAD_WRITES : 0;
     const mutationCost = {
       ...this.config.mutationCost,
@@ -4405,7 +4899,7 @@ export class Store {
             : this.commitReactions(input, context, floor);
           this.finishCommit(context, startLogId);
         }
-        this.commitStoredResult(input.userId, input.requestId, digest, method, committed.result, effective + this.config.dedupTtlMs);
+        this.commitStoredResult(input.userId, input.requestId, digest, committed.result, effective + this.config.dedupTtlMs);
         return beforeCommit(committed);
       });
     } finally {
@@ -4418,7 +4912,7 @@ export class Store {
     return this.commitMutation({ ...input, params: clone(input.params) });
   }
 
-  /** History with the per-user/IP history quota charged (§4.1). */
+  /** History with the per-user/IP history quota charged (§4.2). */
   history(query: StoreHistoryQuery): StoreHistoryResult {
     this.ensureReady();
     const operationNow = query.now ?? this.clock.now();
@@ -4475,11 +4969,11 @@ export class Store {
     const maxBytes = Math.min(query.maxBytes ?? this.config.maxHistoryResponseBytes, this.config.maxHistoryResponseBytes);
     const latestLogId = idString(head);
     const historyLogId = roomHistoryLogId(room, floor);
-    // An empty slice has neither bound and omits every array (§4.1).
+    // An empty slice has neither bound and omits every array (§4.2).
     const empty = (): StoreHistoryResult => ({ more: false, latest_log_id: latestLogId, history_log_id: historyLogId });
     const forward = after !== undefined;
     // One contiguous slice of the room's log across every record kind; the
-    // limit counts records of any kind (§4.1). A window bounded to one log_id
+    // limit counts records of any kind (§4.2). A window bounded to one log_id
     // (after == before) is that record in this room's log only: a moved
     // message's earlier snapshot is fetched from the room its prev_room_id names.
     const rows = lower > upper || historyLogId === null ? [] : this.rawRows<RawRecordRow>(
@@ -4489,8 +4983,8 @@ export class Store {
       room.room_id, lower, upper, limit + 1,
     );
     if (rows.length === 0) return empty();
-    // The runtime wraps this result in a JSON-RPC response.  Reserve a fixed
-    // envelope allowance for jsonrpc/id/result keys, decimal IDs, commas and
+    // The runtime wraps this result in a reply.  Reserve a fixed
+    // envelope allowance for id/result keys, decimal IDs, commas and
     // first/last/more fields.  An empty page is always valid even when a
     // caller supplies a tiny maxBytes value, so apply this allowance only
     // while considering a non-empty entry.
@@ -4568,7 +5062,22 @@ export class Store {
       this.rawRows("SELECT message_id FROM message_state WHERE latest_log_id < ? ORDER BY latest_log_id LIMIT 1", floor).length > 0 ||
       this.rawRows("SELECT message_id FROM reaction_state WHERE log_id < ? ORDER BY log_id LIMIT 1", floor).length > 0 ||
       this.rawRows("SELECT user_id FROM accepted_requests WHERE expires_ms <= ? ORDER BY expires_ms LIMIT 1", effective).length > 0 ||
-      this.rawRows("SELECT scope FROM principal_limits WHERE updated_ms < ? ORDER BY updated_ms LIMIT 1", limiterCutoff).length > 0;
+      this.rawRows("SELECT scope FROM principal_limits WHERE updated_ms < ? ORDER BY updated_ms LIMIT 1", limiterCutoff).length > 0 ||
+      this.rawRows("SELECT user_id FROM push_subscriptions INDEXED BY push_subscriptions_updated_idx WHERE updated_ms < ? ORDER BY updated_ms LIMIT 1", this.pushCutoffs(effective).subscriptions).length > 0 ||
+      this.rawRows("SELECT user_id FROM push_wakes INDEXED BY push_wakes_woken_idx WHERE woken_ms < ? ORDER BY woken_ms LIMIT 1", this.pushCutoffs(effective).wakes).length > 0;
+  }
+
+  /**
+   * Before when push registrations have expired (not registered again for
+   * `pushExpiryDays`) and wake times no longer coalesce anything. Without
+   * push, registrations are kept for when it returns, and wake times all go.
+   */
+  private pushCutoffs(effective: number): { subscriptions: number; wakes: number } {
+    const policy = this.config.push;
+    return {
+      subscriptions: policy ? effective - policy.pushExpiryDays * 86_400_000 : 0,
+      wakes: effective - (policy ? policy.coalesceSeconds * 1_000 : 0),
+    };
   }
 
   private limiterCutoff(effective: number): number {
@@ -4585,7 +5094,7 @@ export class Store {
     // not consume the reservation for a complete deletion batch.
     let gate: { maintenance: RawMaintenanceRow; state: RawLogState; effective: number };
     try {
-      gate = this.reserved({ reads: 14, writes: 2 }, true, now, () => {
+      gate = this.reserved({ reads: 18, writes: 2 }, true, now, () => {
         const maintenance = this.maintenanceRow();
         const state = this.logState();
         const effective = this.effectiveNow(now);
@@ -4708,12 +5217,24 @@ export class Store {
       ) : [];
       for (const row of limiters) this.rawExec("DELETE FROM principal_limits WHERE scope = ? AND principal_key = ?", row.scope, row.principal_key);
       if (limiters.length) this.rawExec("UPDATE _meta SET value = ? WHERE key = 'principal_limit_count'", String(Math.max(0, this.metaNumber("principal_limit_count") - limiters.length)));
+      remaining -= limiters.length;
+      // Expired push registrations and wake times past coalescing (protocol §4.9).
+      const pushCutoffs = this.pushCutoffs(effective);
+      const subscriptions = remaining > 0 ? this.rawRows<{ user_id: string; url: string }>(
+        "SELECT user_id, url FROM push_subscriptions INDEXED BY push_subscriptions_updated_idx WHERE updated_ms < ? ORDER BY updated_ms LIMIT ?", pushCutoffs.subscriptions, remaining,
+      ) : [];
+      for (const row of subscriptions) this.rawExec("DELETE FROM push_subscriptions WHERE user_id = ? AND url = ?", row.user_id, row.url);
+      remaining -= subscriptions.length;
+      const wakes = remaining > 0 ? this.rawRows<{ user_id: string; room_id: string }>(
+        "SELECT user_id, room_id FROM push_wakes INDEXED BY push_wakes_woken_idx WHERE woken_ms < ? ORDER BY woken_ms LIMIT ?", pushCutoffs.wakes, remaining,
+      ) : [];
+      for (const row of wakes) this.rawExec("DELETE FROM push_wakes WHERE user_id = ? AND room_id = ?", row.user_id, row.room_id);
       const hasMore = this.cleanupHasWork(floor, cutoff, effective, limiterCutoff) ||
         this.rawRows("SELECT room_id FROM rooms WHERE parent_room_id IS NOT NULL AND latest_log_id < ? LIMIT 1", floor).length > 0;
       const nextDue = effective + (hasMore ? 1000 : this.config.cleanupIntervalMs);
       this.rawExec("UPDATE maintenance SET next_cleanup_ms = ?, cleanup_cutoff_ms = ?, cleanup_cursor = ? WHERE id = 1", nextDue, hasMore ? cutoff : null, hasMore ? floor : null);
       this.assertReservation(reserved, beforeReads, beforeWrites);
-      const deleted = records.length + messages.length + reactions.length + rooms.length + memberships + requests.length + limiters.length;
+      const deleted = records.length + messages.length + reactions.length + rooms.length + memberships + requests.length + limiters.length + subscriptions.length + wakes.length;
       return {
         history_floor: idString(floor), previous_floor: idString(previousFloor), latest_id: idString(state.last_log_id),
         deleted_records: records.length, deleted_messages: messages.length, deleted_reactions: reactions.length,
@@ -4726,14 +5247,6 @@ export class Store {
     // Refunded after the transaction commits, so a rollback cannot leave a credit behind.
     this.refundUnused(reserved, this.observed.reads - beforeReads, this.observed.writes - beforeWrites);
     return result;
-  }
-
-  cleanup(now: number): DomainCleanupResult {
-    const result = this.runCleanup(now);
-    return {
-      changed: result.did_work,
-      nextAt: result.next_due_ms,
-    };
   }
 
   /**

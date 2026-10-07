@@ -53,7 +53,7 @@ it('tells a guest it only reads, then denies its writes, joins and leaves includ
 	const guest = await connect();
 	try {
 		const { server, welcome } = await greeting(guest);
-		expect(server.params.ext.demo.guest_posting).toBe(false);
+		expect(server.params.ext.settings.guest_posting).toBe(false);
 		// The welcome follows the server frame, before any auth (Appendix B):
 		// transient (§3.5), with no room_id since the client knows no rooms yet.
 		// Where guests only read, it says so after the server version.
@@ -132,7 +132,7 @@ it('lets a registered user invite a bot that signs in from anywhere with its tok
 		// A bot has no Origin: it is offered `token`, and its token needs none.
 		expect((await bot.next()).params.auth).toEqual(['token', 'guest']);
 		const auth = await request(bot, 'auth', 'auth', { scheme: 'token', token });
-		expect(auth.result).toEqual({ you: { user_id: 'bot_u_owner', name: 'Bot of Name of u_owner', roles: ['bot'] } });
+		expect(auth.result).toEqual({ you: { user_id: 'bot_u_owner', name: 'Bot of Name of u_owner', roles: ['bot'], status: 'online' } });
 		expect(auth.result.token).toBeUndefined();
 		expect((await request(bot, 'rooms', 'room_list', { filter: 'joined' })).result.joined.map((room: { room_id: string }) => room.room_id)).toEqual(['general']);
 
@@ -172,7 +172,7 @@ it('replaces a bot token on a new invite, signing out the old one, and renames t
 		await stale.next();
 		expect((await request(stale, 'auth', 'auth', { scheme: 'token', token: oldToken })).error.code).toBe(-32001);
 		await fresh.next();
-		expect((await request(fresh, 'auth', 'auth', { scheme: 'token', token: newToken })).result.you).toEqual({ user_id: 'bot_u_rotating', name: 'Bot of Rotated', roles: ['bot'] });
+		expect((await request(fresh, 'auth', 'auth', { scheme: 'token', token: newToken })).result.you).toEqual({ user_id: 'bot_u_rotating', name: 'Bot of Rotated', roles: ['bot'], status: 'online' });
 	} finally { owner.close(); first.close(); stale.close(); fresh.close(); }
 });
 
@@ -224,9 +224,14 @@ it('signs in as the admin user with APRON_ADMIN_TOKEN from anywhere, once it is 
 	const second = await connect();
 	try {
 		await first.next();
-		const auth = await request(first, 'auth', 'auth', { scheme: 'token', token: adminToken });
-		expect(auth.result).toEqual({ you: { user_id: 'admin', name: 'Admin', roles: ['admin'] } });
-		// Created on first use, it starts in general.
+		const exchanged = await exchange(first, 'auth', 'auth', { scheme: 'token', token: adminToken });
+		const auth = exchanged.frame;
+		expect(auth.result).toEqual({ you: { user_id: 'admin', name: 'Admin', roles: ['admin'], status: 'online' } });
+		// Created on first use, it starts in general: its logged join reaches
+		// this connection after the auth result (§3.2), not before.
+		const adminJoin = (frame: { method?: string; params?: any }) => frame.method === 'room_update' && frame.params?.memberships?.[0]?.members?.[0]?.user?.user_id === 'admin';
+		expect(exchanged.skipped.some(adminJoin)).toBe(false);
+		expect((await until(first, adminJoin)).frame.params.memberships[0]).toMatchObject({ room_id: 'general', members: [{ user: { user_id: 'admin' }, joined: true }] });
 		expect((await request(first, 'rooms', 'room_list', { filter: 'joined' })).result.joined.map((room: { room_id: string }) => room.room_id)).toEqual(['general']);
 		const posted = await request(first, 'post', 'message', { room_id: 'general', body: { text: 'testing' } });
 		expect(posted.result.message_id).toBeDefined();
@@ -235,7 +240,7 @@ it('signs in as the admin user with APRON_ADMIN_TOKEN from anywhere, once it is 
 
 		// The same token signs in again, as the same user, from a browser too.
 		await second.next();
-		expect((await request(second, 'auth', 'auth', { scheme: 'token', token: adminToken })).result.you).toEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'] });
+		expect((await request(second, 'auth', 'auth', { scheme: 'token', token: adminToken })).result.you).toEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'], status: 'online' });
 	} finally { first.close(); second.close(); await withAdminToken(undefined); }
 });
 

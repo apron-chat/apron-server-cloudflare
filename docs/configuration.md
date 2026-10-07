@@ -9,8 +9,8 @@ one, and must match the account's plan.
 
 | File | Plan | Features on by default |
 | --- | --- | --- |
-| [`src/plans/paid.ts`](../src/plans/paid.ts) (selected) | Workers Paid, $5/month | `activity` (typing) |
-| [`src/plans/free.ts`](../src/plans/free.ts) | Workers Free | none |
+| [`src/plans/paid.ts`](../src/plans/paid.ts) (selected) | Workers Paid, $5/month | `activity` (typing), presence (user status, with push) |
+| [`src/plans/free.ts`](../src/plans/free.ts) | Workers Free | presence (user status, with push) |
 
 The paid plan starts from the free one and raises only what Paid's included
 usage pays for, sized against its monthly allowances divided by 31 days with
@@ -191,7 +191,7 @@ What the guard cannot promise:
 ## Uploads
 
 With the Workers Paid budgets, registered users attach images to messages
-and set avatars (protocol §4.6, cap `embed:upload`; see
+and set avatars (protocol §4.8, cap `embed:upload`; see
 [SPEC section 4.3](../SPEC.md#43-uploads-and-avatars)). The plan's `uploads`
 in `src/plans/paid.ts` sets the limits:
 
@@ -250,6 +250,123 @@ binding.
 Upload writes and their claims use the Worker and Durable Object allowances
 above: two Durable Object requests and one Worker request each, at most
 500 a day. Deletes are free.
+
+## Push
+
+Mentions and replies wake registered users through Web Push (protocol §4.9,
+push kind `webpush`, advertising the wake scopes `mentions` and `replies`,
+with the client's optional registration `push_id` in each push; see
+[SPEC section 4.4](../SPEC.md#44-push)). Both plans have a
+`push` policy, set in `src/plans/free.ts` with Paid's daily cap raised in
+`src/plans/paid.ts`:
+
+| Setting | Workers Paid | Workers Free |
+| --- | ---: | ---: |
+| `pushesPerDay` (server-wide, one per registration woken) | 5,000 | 1,000 |
+| `wakesPerMessage` (users with live registrations one message may wake) | 10 | 10 |
+| `pushesPerSenderDay` (pushes one sender's messages may get delivered, 2xx only) | 200 | 50 |
+| `pushesPerRecipientDay` (pushes one user may receive) | 100 | 100 |
+| `coalesceSeconds` (a user is woken for a room at most once in this window) | 60 | 60 |
+| `subscriptionsPerUser` | 5 | 5 |
+| `pushExpiryDays` (a registration not renewed this long is skipped, then deleted) | 7 | 7 |
+| `registersPerUserMinute` (`push_register` requests per user, across reconnects) | 10 | 10 |
+| `mutesPerUserMinute` (`status` `mute` and `me` `status` changes per user, together; past it either is `retry_after` and nothing changes) | 6 | 6 |
+| `ttlSeconds` (how long a push service keeps an undelivered push) | 1 day | 1 day |
+
+`wakesPerMessage` times `subscriptionsPerUser`, the pushes one message may
+send, is at most 64; `wakesPerMessage` is at most 32, the mentioned users one
+message looks up; `pushesPerSenderDay` and `pushesPerRecipientDay` fit
+`pushesPerDay`; `registersPerUserMinute` and `mutesPerUserMinute` are at
+most 60, the per-type throttle bound;
+`coalesceSeconds` is at most a day; `pushExpiryDays` is 2 to 90; and
+`ttlSeconds` is at most four weeks. The configuration check fails otherwise.
+
+**Allowed push services.** `PUSH_HOSTS` lists the hosts a registration's
+endpoint may name, comma-separated: an exact host such as
+`fcm.googleapis.com`, or `*.` and a host for its subdomains only
+(`*.push.apple.com` matches `api.push.apple.com`, not `push.apple.com`). A
+standalone `*` allows any public host. Unset or empty, it is the browsers'
+own push services: `fcm.googleapis.com` (Chrome, Edge on Android, and other
+Chromium browsers), `*.push.services.mozilla.com` (Firefox),
+`web.push.apple.com` and `*.push.apple.com` (Safari), and
+`*.notify.windows.com` (Edge on Windows). Any other endpoint is refused with
+`invalid_params` "push service not allowed here", after the checks that
+refuse IP literals, internal names, credentials and ports, which apply
+whatever the list says. A malformed list fails the configuration check.
+The list is checked again before each push, so narrowing it stops pushes to
+registrations made under the wider one.
+
+Push is off, and `server.push` absent, until a VAPID key pair
+([RFC 8292](https://www.rfc-editor.org/rfc/rfc8292)) and contact are set:
+
+1. **Keys.** `node scripts/vapid-keys.mjs` prints a new P-256 key pair as
+   `VAPID_PUBLIC_KEY=…` and `VAPID_PRIVATE_KEY=…`, unpadded base64url.
+2. **Public key and contact.** Add `VAPID_PUBLIC_KEY` and `VAPID_SUBJECT`
+   (a `mailto:` address or `https:` URL push services may use to reach the
+   operator) to `[vars]` in `wrangler.production.toml`. The public key is
+   advertised to every client as `server.push.webpush.key`.
+3. **Private key.** `npx wrangler secret put VAPID_PRIVATE_KEY --config
+   wrangler.production.toml`, pasting the private key. Never put it in
+   source.
+
+Locally, put the three in `.dev.vars`. A malformed key or subject makes every
+request fail its configuration check, and so does a private key that does
+not match the public one: the check signs with one and verifies with the
+other. Browsers subscribe with the public
+key, so replacing the pair strands every subscription: push services refuse
+pushes signed with the new key (with 403), and clients must subscribe again.
+An old row goes at the first push its service refuses with 403, or when its
+user's newer registration replaces it or it expires, whichever comes first. Deleting the
+secret turns push off; stored subscriptions stay, unused, until it is set
+again.
+
+Pushes are outbound requests from the Durable Object, which no Worker or
+Durable Object allowance counts and no edge rule needs to allow. Their SQL is
+in the [cost report](cost-report.md#push); `/status` shows the day's pushes.
+
+## User status (presence)
+
+With push on, the server advertises capability `status` (protocol §4.5):
+users choose a `status` with `me` (`online`, `""` for none, `dnd`,
+`invisible`), connections report `idle`, and users mute their pushes
+everywhere or in a room and its threads (at most 100 rooms a user). With
+presence on, others see each user's `status`: `online`, `idle` or `offline`
+from their connections when they chose `online`, `dnd` while connected,
+`offline` when invisible, and `""` when they chose none (see
+[SPEC section 4.4](../SPEC.md#44-push), Chosen status, Mute and User
+status). The `server` frame then lists `server.status: ["dnd",
+"invisible"]` (protocol §3.1), the optional values clients may offer; with
+presence off it is left out, though `me` still accepts and keeps `dnd` and
+`invisible` (a server choice, so a choice holds across `/toggle presence`). The plan's `features.presence` turns it on, and `PRESENCE`
+overrides it:
+
+| `PRESENCE` | What others see | Extra SQL |
+| --- | --- | --- |
+| `true` (both plans' default) | each user's status, from their connections, or `offline` (`""` for none) without one | a listing reads each listed member's chosen status, a read only for members who chose one or muted |
+| `false` | `status` is `""` (none) for everyone in listings, and no `server.status`; the chosen status is still kept and in the user's own `you`, mutes still work, and invisible users and those who chose none are still left out of connected member listings | none |
+
+Without push there is no `status` capability, so presence is off whatever
+it says. An admin's `/toggle presence` turns it off and on again without a
+deploy. A status or mute change writes about 3 or 4 rows, and the two share
+`mutesPerUserMinute`. A push registration never makes anyone `idle`.
+
+Two limits shape how fast changes are announced, both in seconds and at most
+60 (`MAX_STATUS_DELAY_SECONDS`), so what others see is never more than about
+a minute behind:
+
+- `statusCoalesceSeconds` (60): a user's status is announced at most once in
+  this long; changes in between wait, and only the latest goes out. Member
+  listings are also reused for up to this long, until something they read
+  is written.
+- `offlineGraceSeconds` (60): a change caused by a closed connection waits
+  this long, so a reload or a phone reconnecting shows nothing.
+
+Waiting changes, and mutes that run out within the minute, are handled by
+one in-memory timer, armed only while a signed-in connection is open, which
+keeps the object awake for at most a minute after its last event; it uses no
+SQL (but to read a room mute that ran out) and no alarm, so no Durable
+Object request. A mute that runs out later is told at the next event. See
+the [cost report](cost-report.md#user-status).
 
 ## Runtime overrides
 
@@ -321,11 +438,16 @@ and recalibrating its resource model.
 | `ALLOWED_ORIGINS` | Exact browser-origin allowlist, or standalone `*` to admit every guest origin (including opaque/missing Origin); cannot mix `*` with explicit origins; all clients remain subject to quotas |
 | `RP_NAME` | Bounded display name for browser passkey prompts |
 | `ACTIVITY` | `true` advertises and relays typing (cap `activity`, section 4.2 of the spec); `false` turns it off. Unset, the plan decides: on for Workers Paid, off for Free. An admin's `/toggle activity` overrides it until toggled back. Read cursors are never kept |
-| `GUEST_POSTING` | `true` lets guests post, react, join and leave rooms, and create threads under the guest quotas; default off in both plans, so guests only list rooms and read history until they sign in with a passkey. Announced as `ext.demo.guest_posting` |
+| `PRESENCE` | `true` or `false`: whether others see each user's `status` (protocol §4.5); needs push. The status users choose with `me` and their mutes are taken whatever it says. Unset, the plan decides: on for both. An admin's `/toggle presence` overrides it until toggled back. See [User status](#user-status-presence) |
+| `GUEST_POSTING` | `true` lets guests post, react, join and leave rooms, and create threads under the guest quotas; default off in both plans, so guests only list rooms and read history until they sign in with a passkey. Announced as `ext.settings.guest_posting` (extension `ext:settings`) |
 | `APRON_ADMIN_TOKEN` | Optional fixed bearer token, 24 to 256 of `A-Z a-z 0-9 - _` and not starting `apron_bot_`, `apron_invite_`, or `apron_join_`: `auth` with `scheme: "token"` and this token signs in as the registered user `admin` ("Admin"), from any origin and without a passkey, created on first use (a registration against the usual caps). That user is always an admin and can run the admin commands (`/admin`, `/kick`, `/rename`, `/invite-token`, `/invite`, `/purge`, `/toggle` and `/status`; see [SPEC section 5, Admins](../SPEC.md#admins)). Unset by default. Anyone holding it can act as the admin, so set it only as a secret, never a Wrangler var in source: `npx wrangler secret put APRON_ADMIN_TOKEN --config wrangler.production.toml`. It persists across deploys; delete it with `npx wrangler secret delete APRON_ADMIN_TOKEN --config wrangler.production.toml` to turn it off (the `admin` user never holds a passkey, so nothing else signs in as it). A malformed value makes every request fail its configuration check. Locally, use `npx wrangler dev --var APRON_ADMIN_TOKEN:…` or `.dev.vars` |
 | `MEDIA_ORIGIN` | Exact https origin where the upload bucket serves objects, such as `https://media.apron.chat`; with `PUBLIC_ORIGIN`, `UPLOAD_SIGNING_KEY` and the `MEDIA` binding, turns uploads on for a plan that has them |
 | `PUBLIC_ORIGIN` | This Worker's exact public origin, which `write_url`s point at |
 | `UPLOAD_SIGNING_KEY` | Secret of at least 32 characters that signs `write_url`s; set with `npx wrangler secret put UPLOAD_SIGNING_KEY --config wrangler.production.toml` |
+| `VAPID_PUBLIC_KEY` | Uncompressed P-256 public key, unpadded base64url (`node scripts/vapid-keys.mjs`); with `VAPID_PRIVATE_KEY` and `VAPID_SUBJECT`, turns push on and is advertised as `server.push.webpush.key` |
+| `VAPID_PRIVATE_KEY` | Secret: the matching 32-byte private key, unpadded base64url; set with `npx wrangler secret put VAPID_PRIVATE_KEY --config wrangler.production.toml` |
+| `VAPID_SUBJECT` | `mailto:` address or `https:` URL sent to push services in each VAPID token as the operator's contact |
+| `PUSH_HOSTS` | Comma-separated push service hosts registrations may name, `*.host` for a host's subdomains, or a standalone `*` for any public host; unset, the browsers' own services (see [Push](#push)) |
 | `ADMISSION_OFF` | Operator admission switch; `true` rejects new sockets in the entry Worker before the limiter or DO call; existing sockets remain subject to DO budgets |
 | `ENVIRONMENT` | Set to `development` to enable local origin defaults when `ALLOWED_ORIGINS` and `RP_ORIGINS` are omitted |
 | `NODE_ENV` | Set to `test` to enable the same local origin defaults for tests; production-like deployments must configure origins explicitly |
@@ -342,8 +464,10 @@ them. Cleanup and deduplication run in bounded batches/records, while
 
 `threadLimit` counts thread rooms (rooms with a `parent_room_id`) and
 `threadMetadataBytes` bounds a room's serialized client fields (`title`,
-`description`, `ext`). The `anonymous*` variables configure the
-guest tier (the `guest` auth scheme).
+`description`, `ext`). A user's `ext` is at most 512 bytes serialized
+(`MAX_USER_EXT_BYTES` in `src/store.ts`, not configurable: every connection
+of the user carries it in its attachment). The `anonymous*` variables
+configure the guest tier (the `guest` auth scheme).
 
 Guests are numbered `guest_1`, `guest_2`, … from a server-wide counter. The
 object reserves `guestNumberBlock` numbers at a time by advancing a stored
@@ -361,7 +485,9 @@ about 60 rows each guest connection already writes). Raise it only for a deploym
 The numeric rows are grouped by their unit and enforcement scope:
 
 - Durations: `retentionSeconds`, `cleanupSeconds`, `challengeTtlSeconds`,
-  `unauthenticatedTimeoutSeconds`, `dedupTtlSeconds`.
+  `unauthenticatedTimeoutSeconds`, `dedupTtlSeconds`, and
+  `statusCoalesceSeconds` and `offlineGraceSeconds` (each at most 60; see
+  [User status](#user-status-presence)).
 - Payload/storage bytes: `maxFrameBytes`, `maxTextBytes`, `maxSnapshotBytes`,
   `maxRequestIdBytes`, `maxNameBytes`, `historyMaxResponseBytes`, `pendingBytesPerConnection`,
   `databaseHighWaterBytes`, `databaseHardTargetBytes`,
@@ -451,6 +577,8 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `pingSeconds` | 45 |  |
 | `pingTimeoutSeconds` | 150 |  |
 | `guestNumberBlock` | 10 |  |
+| `statusCoalesceSeconds` | 60 |  |
+| `offlineGraceSeconds` | 60 |  |
 | `sqlWritesPerDay` | 800000 | 80000 |
 | `sqlReadsPerDay` | 30000000 | 3000000 |
 | `foregroundWritesPerDay` | 700000 | 60000 |
