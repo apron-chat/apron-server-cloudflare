@@ -318,6 +318,8 @@ All applicable limits compose: passing one does not bypass another. Time means s
 | anonymous_posts_per_day | 200 (Free: 100) | Normalized IP |
 | registered_posts_per_minute | 20 | Verified user ID, all sockets |
 | registered_posts_per_day | 1,000 (Free: 500) | Verified user ID |
+| moderator_posts_per_minute | 50 | Verified user ID with `admin` or `mod`, in place of `registered_posts_per_minute`; also their IP's minute limit when larger |
+| moderator_posts_per_day | 4,000 (Free: 2,000) | Same, in place of `registered_posts_per_day`; also their IP's daily limit when larger |
 | ip_posts_per_minute | 30 | IP across guest/registered identities |
 | ip_posts_per_day | 2,000 (Free: 1,000) | IP across identities |
 | global_posts_per_minute | 120 (Free: 60) | Entire demo |
@@ -327,7 +329,7 @@ All applicable limits compose: passing one does not bypass another. Time means s
 | registered_identity_count | 10,000 | Persistent total |
 | auth_attempts_per_ip_minute | 10 | Begin/finish/guest/failed attempts |
 
-Posting includes message creates, edits, deletes, restores, moves, reaction changes, thread room creation and saves, name changes, and registered users' room joins and leaves (a guest's live in its connection and cost no posts). The `anonymous_*` rows apply to guest identities. Count only newly accepted operations against posting quotas; matching deduplicated retries do not post again. Invalid requests and rejected attempts still spend frame/read/verification budgets. Notifications receive no exemption.
+Posting includes message creates, edits, deletes, restores, moves, reaction changes, thread room creation and saves, name changes, and registered users' room joins and leaves (a guest's live in its connection and cost no posts). The `anonymous_*` rows apply to guest identities. The `moderator_*` rows apply to registered users holding `admin` or `mod` (read with the identity row as each post is charged), since moving a conversation into a thread or back out is one post per message; the global rows still apply to them, and so do the IP rows, raised to the moderator ones for their posts. Count only newly accepted operations against posting quotas; matching deduplicated retries do not post again. Invalid requests and rejected attempts still spend frame/read/verification budgets. Notifications receive no exemption.
 
 ### Payload and query bounds
 

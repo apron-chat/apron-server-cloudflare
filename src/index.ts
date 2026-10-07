@@ -517,6 +517,8 @@ function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		anonymousPostsPerDay: limits.anonymousPostsPerDay,
 		registeredPostsPerMinute: limits.registeredPostsPerMinute,
 		registeredPostsPerDay: limits.registeredPostsPerDay,
+		moderatorPostsPerMinute: limits.moderatorPostsPerMinute,
+		moderatorPostsPerDay: limits.moderatorPostsPerDay,
 		ipPostsPerMinute: limits.ipPostsPerMinute,
 		ipPostsPerDay: limits.ipPostsPerDay,
 		globalPostsPerMinute: limits.globalPostsPerMinute,

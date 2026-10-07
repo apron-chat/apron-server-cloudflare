@@ -234,8 +234,11 @@ function validateLimits(limits: Limits): void {
 	if (limits.globalPostsPerMinute > budget.MAX_GLOBAL_POSTS_PER_MINUTE || limits.globalPostsPerDay > budget.MAX_GLOBAL_POSTS_PER_DAY || limits.globalPostsPerMinute > limits.globalPostsPerDay) {
 		fail("global posting policy exceeds the demo ceiling");
 	}
-	if (limits.anonymousPostsPerMinute > limits.anonymousPostsPerDay || limits.registeredPostsPerMinute > limits.registeredPostsPerDay || limits.ipPostsPerMinute > limits.ipPostsPerDay) {
+	if (limits.anonymousPostsPerMinute > limits.anonymousPostsPerDay || limits.registeredPostsPerMinute > limits.registeredPostsPerDay || limits.ipPostsPerMinute > limits.ipPostsPerDay || limits.moderatorPostsPerMinute > limits.moderatorPostsPerDay) {
 		fail("posting minute limit exceeds its daily limit");
+	}
+	if (limits.moderatorPostsPerMinute < limits.registeredPostsPerMinute || limits.moderatorPostsPerDay < limits.registeredPostsPerDay) {
+		fail("moderator posting limits must be at least the registered ones");
 	}
 	if (limits.registrationsPerIpDay > limits.registrationsPerDay || limits.registrationsPerDay > budget.MAX_REGISTRATIONS_PER_DAY) {
 		fail("registration policy exceeds the demo ceiling");

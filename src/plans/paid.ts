@@ -47,6 +47,7 @@ export const PAID_PLAN: Plan = Object.freeze({
 		historyRequestsPerIpMinute: 60,
 		anonymousPostsPerDay: 200,
 		registeredPostsPerDay: 1_000,
+		moderatorPostsPerDay: 4_000,
 		ipPostsPerDay: 2_000,
 		globalPostsPerMinute: 120,
 		globalPostsPerDay: 10_000,
