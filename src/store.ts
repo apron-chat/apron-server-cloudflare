@@ -703,11 +703,6 @@ const META_EFFECTIVE_NOW = "effective_now_ms";
 const META_PURGE_ROOMS = "purge_rooms";
 /** Most removed rooms awaiting purge; cleanup removes no further room past it. */
 const MAX_PURGE_ROOMS = MAX_THREAD_LIMIT;
-/**
- * Most of a thread's records removeEmptyThread reads to find whether any of
- * its messages still shows; a thread with more is kept until its log expires.
- */
-const EMPTY_THREAD_SCAN = 128;
 const META_ACCOUNTING_UNSAFE = "accounting_unsafe";
 const META_ACCOUNT_USAGE = "account_usage_snapshot";
 /** The highest guest number ever reserved (see reserveGuestNumbers); absent means none. */
@@ -3444,8 +3439,10 @@ export class Store {
   }
 
   private currentMessage(messageId: string, floor?: number): RawMessageRow | null {
+    // A message in a thread removed while it was still retained (removeEmptyThread) is gone with it.
     const rows = this.rawRows<RawMessageRow>(
-      "SELECT message_id, room_id, latest_log_id, snapshot_json, author_id FROM message_state WHERE message_id = ? LIMIT 1",
+      `SELECT m.message_id, m.room_id, m.latest_log_id, m.snapshot_json, m.author_id
+       FROM message_state m JOIN rooms r ON r.room_id = m.room_id WHERE m.message_id = ? LIMIT 1`,
       messageId,
     );
     if (!rows.length) return null;
@@ -3733,35 +3730,19 @@ export class Store {
 
   /**
    * Removes a thread room that has emptied (§4.3.2): no registered member is
-   * left in it, and none of its messages shows, each having been deleted or
-   * moved out, so the last to leave frees its slot instead of leaving it
-   * until its log expires. The caller checks that no connection, a guest's
-   * included, is still in it. Its records and tombstones stay until they
-   * expire, as a room removed at cleanup's do. A thread with more than
-   * EMPTY_THREAD_SCAN records is kept, which bounds the reads. Returns
-   * whether the room was removed.
+   * left in it, so the last to leave frees its slot instead of leaving it
+   * until its log expires, whatever messages it holds. The caller checks
+   * that no connection, a guest's included, is still in it. Its records and
+   * messages stay until they expire, but currentMessage no longer finds the
+   * messages, so they cannot be edited, moved, reacted to or replied to.
+   * Returns whether the room was removed.
    */
   removeEmptyThread(roomId: string, now = this.clock.now()): boolean {
     this.ensureReady();
-    // The room, membership, floor and count rows, the thread's records, and
-    // each of its messages' current state.
-    return this.reserved({ reads: 32 + 2 * (EMPTY_THREAD_SCAN + 1), writes: 8 }, false, now, () => this.transaction(() => {
+    return this.reserved({ reads: 16, writes: 8 }, false, now, () => this.transaction(() => {
       const room = this.roomRow(roomId);
       if (!room || room.parent_room_id === null) return false;
       if (this.rawRows("SELECT user_id FROM memberships WHERE room_id = ? LIMIT 1", roomId).length) return false;
-      const records = this.rawRows<{ kind: string; record_json: string }>(
-        "SELECT kind, record_json FROM records WHERE room_id = ? ORDER BY log_id DESC LIMIT ?", roomId, EMPTY_THREAD_SCAN + 1,
-      );
-      if (records.length > EMPTY_THREAD_SCAN) return false;
-      // A message's latest record is in the log of the room it is in now.
-      const floor = this.logState().history_floor;
-      const messageIds = new Set(records.filter((row) => row.kind === "message")
-        .map((row) => parseJson<{ message_id?: unknown }>(row.record_json, {}).message_id)
-        .filter((id): id is string => typeof id === "string"));
-      for (const messageId of messageIds) {
-        const current = this.currentMessage(messageId, floor);
-        if (current?.room_id === roomId && parseJson<{ deleted?: unknown }>(current.snapshot_json, {}).deleted !== true) return false;
-      }
       this.rawExec("DELETE FROM rooms WHERE room_id = ? AND parent_room_id IS NOT NULL", roomId);
       this.rawExec("UPDATE _meta SET value = ? WHERE key = 'thread_count'", String(Math.max(0, this.metaNumber("thread_count") - 1)));
       return true;

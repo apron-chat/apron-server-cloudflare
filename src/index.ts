@@ -2673,8 +2673,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * included. Then the user's connections stop receiving the room's
 	 * deliveries and get `room_update` `left`, and then the result. The room
 	 * stays visible and can be joined again, unless it is a thread that
-	 * nobody is left in and none of whose messages shows, which is removed
-	 * (removeIfEmpty). Leaving a room not joined
+	 * nobody is left in, which is removed (removeIfEmpty). Leaving a room not joined
 	 * changes nothing. With another user's `user_id`, an admin, the room's
 	 * creator, or the bot's owner removes that user, as `/kick` does but
 	 * without its notice.
@@ -4858,12 +4857,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * After a leave, removes the thread when nobody is in it any more and none
-	 * of its messages shows (Store.removeEmptyThread): no connection has it
-	 * among its rooms, a guest's included, and no registered member is stored.
+	 * After a leave, removes the thread when nobody is in it any more, whatever
+	 * messages it holds (Store.removeEmptyThread): no connection has it among
+	 * its rooms, a guest's included, and no registered member is stored.
 	 * Everyone has left it, so nobody is told. The leave stands whatever
-	 * happens here: a thread the store keeps, or cannot read for now, expires
-	 * with its log as before.
+	 * happens here: a thread the store cannot remove for now expires with its
+	 * log as before.
 	 */
 	private removeIfEmpty(roomId: string): void {
 		if (roomId === ROOM_ID) return;

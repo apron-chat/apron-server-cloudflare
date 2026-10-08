@@ -404,7 +404,7 @@ it('a room\'s creator may remove anyone from it, across saves and /rename, until
 	} finally { admin.close(); bob.close(); carol.close(); dan.close(); }
 });
 
-it('removes a thread when the last one in it leaves and none of its messages shows', async () => {
+it('removes a thread when the last one in it leaves, with any messages in it', async () => {
 	const bobId = unique('bob');
 	const bob = await signedIn(bobId);
 	const carolId = unique('carol');
@@ -431,22 +431,17 @@ it('removes a thread when the last one in it leaves and none of its messages sho
 		// It is gone: joining it is invalid_params.
 		expect((await request(bob, 'join-unused', 'room_join', { room_id: unused })).error.code).toBe(-32602);
 
-		// A message showing keeps it; once deleted, the last leave removes it.
+		// Messages in it do not keep it: they go with it, and can no longer be
+		// edited, reacted to, moved out, or replied to.
 		const written = await thread('Written');
 		const message = (await request(bob, 'post', 'message', { room_id: written, body: { text: 'hello' } })).result.message_id;
 		expect((await request(bob, 'leave-written', 'room_leave', { room_id: written })).result).toEqual({});
-		expect(await exists(written)).toBe(true);
-		expect((await request(bob, 'rejoin-written', 'room_join', { room_id: written })).result).toEqual({});
-		expect((await request(bob, 'delete', 'message', { message_id: message, room_id: written, deleted: true })).result).toBeDefined();
-		expect((await request(bob, 'leave-deleted', 'room_leave', { room_id: written })).result).toEqual({});
 		expect(await exists(written)).toBe(false);
-
-		// So does moving its messages out.
-		const moved = await thread('Moved');
-		const movedId = (await request(bob, 'post-moved', 'message', { room_id: moved, body: { text: 'wrong room' } })).result.message_id;
-		expect((await request(bob, 'move', 'message', { message_id: movedId, room_id: 'general', body: { text: 'wrong room' } })).result).toBeDefined();
-		expect((await request(bob, 'leave-moved', 'room_leave', { room_id: moved })).result).toEqual({});
-		expect(await exists(moved)).toBe(false);
+		// Split between connections: three invalid requests a minute close one.
+		expect((await request(bob, 'move-gone', 'message', { message_id: message, room_id: 'general', body: { text: 'hello' } })).error.code).toBe(-32602);
+		expect((await request(guest, 'react-gone', 'reactions', { message_id: message, emojis: ['👍'] })).error.code).toBe(-32602);
+		expect((await request(guest, 'reply-gone', 'message', { body: { text: 're' }, reply_to: { message_id: message } })).error.code).toBe(-32602);
+		expect(await runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.messageAuthor(message))).toBeNull();
 
 		// A registered member who is not connected keeps it; the creator
 		// removing them, from outside it, empties it.
