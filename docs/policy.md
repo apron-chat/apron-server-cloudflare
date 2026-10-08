@@ -51,7 +51,8 @@ within it:
   `/toggle addmember` is on (the default), any registered user may also add
   anyone, and a thread's creator may remove anyone from it. Others are
   `denied`. Only registered users can be added. A thread's messages go to its
-  members only. A guest's rooms last for its connection and are not logged; a
+  members only. A thread that the last one in it leaves while none of its
+  messages shows (all deleted or moved out, or never written) is removed. A guest's rooms last for its connection and are not logged; a
   registered identity keeps its rooms across connections, its joins and leaves
   count as posts, and each is a logged membership record delivered in
   `room_update` `memberships` (with the user's own `joined` or `left`) and

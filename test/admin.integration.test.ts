@@ -404,6 +404,75 @@ it('a room\'s creator may remove anyone from it, across saves and /rename, until
 	} finally { admin.close(); bob.close(); carol.close(); dan.close(); }
 });
 
+it('removes a thread when the last one in it leaves and none of its messages shows', async () => {
+	const bobId = unique('bob');
+	const bob = await signedIn(bobId);
+	const carolId = unique('carol');
+	await registered(carolId);
+	const guest = await connect();
+	const threadCount = () => runInDurableObject(stub(), (_instance, state) =>
+		Number(state.storage.sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'thread_count'").one().value));
+	// Asked of the store: a request for a room that is gone is invalid_params, and repeated errors close the socket.
+	const exists = (roomId: string) => runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.getRoom(roomId) !== null);
+	const thread = async (title: string) => (await request(bob, unique('thread'), 'room_set', { parent_room_id: 'general', title })).result.room_id as string;
+	try {
+		await guest.next();
+		await request(guest, 'auth', 'auth', { scheme: 'guest' });
+		const before = await threadCount();
+
+		// A thread nobody wrote in goes with its last member, freeing its slot.
+		const unused = await thread('Unused');
+		expect(await threadCount()).toBe(before + 1);
+		const left = await exchange(bob, 'leave-unused', 'room_leave', { room_id: unused });
+		expect(left.frame.result).toEqual({});
+		expect(left.skipped.find((frame) => frame.method === 'room_update')?.params.left).toEqual([{ room_id: unused }]);
+		expect(await exists(unused)).toBe(false);
+		expect(await threadCount()).toBe(before);
+		// It is gone: joining it is invalid_params.
+		expect((await request(bob, 'join-unused', 'room_join', { room_id: unused })).error.code).toBe(-32602);
+
+		// A message showing keeps it; once deleted, the last leave removes it.
+		const written = await thread('Written');
+		const message = (await request(bob, 'post', 'message', { room_id: written, body: { text: 'hello' } })).result.message_id;
+		expect((await request(bob, 'leave-written', 'room_leave', { room_id: written })).result).toEqual({});
+		expect(await exists(written)).toBe(true);
+		expect((await request(bob, 'rejoin-written', 'room_join', { room_id: written })).result).toEqual({});
+		expect((await request(bob, 'delete', 'message', { message_id: message, room_id: written, deleted: true })).result).toBeDefined();
+		expect((await request(bob, 'leave-deleted', 'room_leave', { room_id: written })).result).toEqual({});
+		expect(await exists(written)).toBe(false);
+
+		// So does moving its messages out.
+		const moved = await thread('Moved');
+		const movedId = (await request(bob, 'post-moved', 'message', { room_id: moved, body: { text: 'wrong room' } })).result.message_id;
+		expect((await request(bob, 'move', 'message', { message_id: movedId, room_id: 'general', body: { text: 'wrong room' } })).result).toBeDefined();
+		expect((await request(bob, 'leave-moved', 'room_leave', { room_id: moved })).result).toEqual({});
+		expect(await exists(moved)).toBe(false);
+
+		// A registered member who is not connected keeps it; the creator
+		// removing them, from outside it, empties it.
+		const offline = await thread('Offline');
+		expect((await request(bob, 'add-carol', 'room_join', { room_id: offline, user_id: carolId })).result).toEqual({});
+		expect((await request(bob, 'leave-offline', 'room_leave', { room_id: offline })).result).toEqual({});
+		expect(await exists(offline)).toBe(true);
+		expect((await request(bob, 'remove-carol', 'room_leave', { room_id: offline, user_id: carolId })).result).toEqual({});
+		expect(await exists(offline)).toBe(false);
+
+		// A connected guest keeps it until the guest leaves too.
+		const guests = await thread('Guests');
+		expect((await request(guest, 'guest-join', 'room_join', { room_id: guests })).result).toEqual({});
+		expect((await request(bob, 'leave-guests', 'room_leave', { room_id: guests })).result).toEqual({});
+		expect(await exists(guests)).toBe(true);
+		expect((await request(guest, 'guest-leave', 'room_leave', { room_id: guests })).result).toEqual({});
+		expect(await exists(guests)).toBe(false);
+
+		// Leaving general removes nothing.
+		expect((await request(bob, 'leave-general', 'room_leave', { room_id: 'general' })).result).toEqual({});
+		expect(await exists('general')).toBe(true);
+		expect(await threadCount()).toBe(before);
+		expect((await request(bob, 'rejoin-general', 'room_join', { room_id: 'general' })).result).toEqual({});
+	} finally { bob.close(); guest.close(); }
+});
+
 it('gives member_count where members leaves registered members out, and keeps the stored count current', async () => {
 	const admin = await signedInAdmin();
 	const [carolId, danId] = [unique('carol'), unique('dan')];

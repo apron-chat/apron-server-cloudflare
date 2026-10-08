@@ -203,7 +203,9 @@ delay physical deletion. The `general` room ID and the log head never rotate.
 Recent edits can keep old messages visible. Rooms keep their current record
 after its log entry expires; a thread room whose whole log has expired is
 removed (its members get `room_update` `left`), which frees its slot under the
-100-thread ceiling.
+100-thread ceiling. A thread also goes, and frees its slot, as soon as the last
+one in it leaves (or is removed) while none of its messages shows, because it
+was never written in or each message was deleted or moved out.
 This is not secure erasure, and says nothing about provider backups or copies
 on clients.
 
