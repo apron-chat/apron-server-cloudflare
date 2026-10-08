@@ -49,7 +49,8 @@ within it:
   `room_update` before the result. With another user's `user_id`, an admin
   adds or removes anyone, and a registered user their own bot; while
   `/toggle addmember` is on (the default), any registered user may also add
-  anyone, but not remove them. Others are `denied`. Only registered users can be added. A thread's messages go to its
+  anyone, and a thread's creator may remove anyone from it. Others are
+  `denied`. Only registered users can be added. A thread's messages go to its
   members only. A guest's rooms last for its connection and are not logged; a
   registered identity keeps its rooms across connections, its joins and leaves
   count as posts, and each is a logged membership record delivered in

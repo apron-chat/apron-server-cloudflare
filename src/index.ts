@@ -2627,13 +2627,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * them from one (§4.3.2): an admin may for anyone, and a registered user
 	 * for their own bot, say to have it keep a thread's `description` current.
 	 * While `addmember` is on (the default), any registered user may also add
-	 * anyone; removing someone else stays with admins and bot owners.
+	 * anyone. The room's creator may remove anyone from it; others may not.
 	 */
-	private assertMayManage(attachment: ConnectionAttachment, userId: string, adding = false): void {
+	private assertMayManage(attachment: ConnectionAttachment, userId: string, roomId: string, adding: boolean): void {
 		const owner = attachment.tier === "registered" && !hasRole(attachment, "bot");
 		if (owner && (userId === BOT_ID_PREFIX + attachment.userId || hasRole(attachment, "admin"))) return;
 		if (owner && adding && this.addMemberOn()) return;
-		throw { name: "denied", message: adding ? "Only an admin, or a bot's owner, can add someone else here" : "Only an admin, or a bot's owner, can remove someone else" } satisfies ProtocolError;
+		if (owner && !adding && this.store.roomCreator(roomId, nowMs()) === attachment.userId) return;
+		throw { name: "denied", message: adding ? "Only an admin, or a bot's owner, can add someone else here" : "Only an admin, the room's creator, or a bot's owner, can remove someone else" } satisfies ProtocolError;
 	}
 
 	/**
@@ -2647,7 +2648,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * in the room changes nothing.
 	 */
 	private async addMember(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, room: RoomRecord, userId: string): Promise<void> {
-		this.assertMayManage(attachment, userId, true);
+		this.assertMayManage(attachment, userId, room.room_id, true);
 		if (!this.store.identityExists(userId)) throw { name: "invalid_params", message: `${userId} is not a registered user`.slice(0, 200) } satisfies ProtocolError;
 		const totals = new Map<string, number>();
 		const before = this.membersOf([room.room_id], totals);
@@ -2672,8 +2673,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * included. Then the user's connections stop receiving the room's
 	 * deliveries and get `room_update` `left`, and then the result. The room
 	 * stays visible and can be joined again. Leaving a room not joined
-	 * changes nothing. With another user's `user_id`, an admin or the bot's
-	 * owner removes that user, as `/kick` does but without its notice.
+	 * changes nothing. With another user's `user_id`, an admin, the room's
+	 * creator, or the bot's owner removes that user, as `/kick` does but
+	 * without its notice.
 	 */
 	private async handleRoomLeave(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		const identity = identityOf(attachment);
@@ -2683,7 +2685,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const target = optionalString(request.params, "user_id");
 		if (!this.roomExists(roomId)) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
 		if (target !== undefined && target !== identity.user_id) {
-			this.assertMayManage(attachment, target);
+			this.assertMayManage(attachment, target, roomId, false);
 			if (!this.store.identityExists(target) && !this.connectionsOf(target).length) {
 				throw { name: "invalid_params", message: `No user has the user_id ${target}`.slice(0, 200) } satisfies ProtocolError;
 			}
