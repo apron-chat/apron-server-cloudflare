@@ -3439,8 +3439,10 @@ export class Store {
   }
 
   private currentMessage(messageId: string, floor?: number): RawMessageRow | null {
+    // A message in a thread removed while it was still retained (removeEmptyThread) is gone with it.
     const rows = this.rawRows<RawMessageRow>(
-      "SELECT message_id, room_id, latest_log_id, snapshot_json, author_id FROM message_state WHERE message_id = ? LIMIT 1",
+      `SELECT m.message_id, m.room_id, m.latest_log_id, m.snapshot_json, m.author_id
+       FROM message_state m JOIN rooms r ON r.room_id = m.room_id WHERE m.message_id = ? LIMIT 1`,
       messageId,
     );
     if (!rows.length) return null;
@@ -3724,6 +3726,27 @@ export class Store {
     } finally {
       this.settleReservation(reserved, beforeReads, beforeWrites);
     }
+  }
+
+  /**
+   * Removes a thread room that has emptied (§4.3.2): no registered member is
+   * left in it, so the last to leave frees its slot instead of leaving it
+   * until its log expires, whatever messages it holds. The caller checks
+   * that no connection, a guest's included, is still in it. Its records and
+   * messages stay until they expire, but currentMessage no longer finds the
+   * messages, so they cannot be edited, moved, reacted to or replied to.
+   * Returns whether the room was removed.
+   */
+  removeEmptyThread(roomId: string, now = this.clock.now()): boolean {
+    this.ensureReady();
+    return this.reserved({ reads: 16, writes: 8 }, false, now, () => this.transaction(() => {
+      const room = this.roomRow(roomId);
+      if (!room || room.parent_room_id === null) return false;
+      if (this.rawRows("SELECT user_id FROM memberships WHERE room_id = ? LIMIT 1", roomId).length) return false;
+      this.rawExec("DELETE FROM rooms WHERE room_id = ? AND parent_room_id IS NOT NULL", roomId);
+      this.rawExec("UPDATE _meta SET value = ? WHERE key = 'thread_count'", String(Math.max(0, this.metaNumber("thread_count") - 1)));
+      return true;
+    }));
   }
 
   private optionalExt(value: unknown, field = "ext"): Record<string, unknown> | undefined {

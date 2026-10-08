@@ -987,9 +987,10 @@ it('sends the notifications a request causes on its connection before its result
 		const roomId = thread.frame.result.room_id;
 		const posted = await exchange(alice, 'in-thread', 'message', { room_id: roomId, body: { text: 'thread members only' } });
 		expect(posted.skipped.map((frame) => frame.params.room_id)).toEqual([roomId]);
-		const leave = await exchange(alice, 'leave', 'room_leave', { room_id: roomId });
-		expect(leave.skipped).toEqual([{ method: 'room_update', params: { left: [{ room_id: roomId }] } }]);
-		const join = await exchange(alice, 'join', 'room_join', { room_id: roomId });
+		// Leaving the thread would remove it, its last member gone; general stays.
+		const leave = await exchange(alice, 'leave', 'room_leave', { room_id: 'general' });
+		expect(leave.skipped).toEqual([{ method: 'room_update', params: { left: [{ room_id: 'general' }] } }]);
+		const join = await exchange(alice, 'join', 'room_join', { room_id: 'general' });
 		expect(join.skipped.map((frame) => Object.keys(frame.params))).toEqual([['joined', 'users']]);
 		const help = await exchange(alice, 'help', 'command', { body: { text: '/help' } });
 		expect(help.skipped).toEqual([{ method: 'message', params: expect.objectContaining({ from: { user_id: '~private', name: 'System message to you' } }) }]);

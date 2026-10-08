@@ -2672,7 +2672,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * and its membership goes to the room's members, the leaver's connections
 	 * included. Then the user's connections stop receiving the room's
 	 * deliveries and get `room_update` `left`, and then the result. The room
-	 * stays visible and can be joined again. Leaving a room not joined
+	 * stays visible and can be joined again, unless it is a thread that
+	 * nobody is left in, which is removed (removeIfEmpty). Leaving a room not joined
 	 * changes nothing. With another user's `user_id`, an admin, the room's
 	 * creator, or the bot's owner removes that user, as `/kick` does but
 	 * without its notice.
@@ -2701,6 +2702,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (identity.tier !== "registered") {
 			this.setRooms(identity.user_id, current.filter((id) => id !== roomId));
 			this.sendToUser(identity.user_id, roomUpdate("left", { room_id: roomId }));
+			this.removeIfEmpty(roomId);
 			this.reply(socket, request, {});
 			return;
 		}
@@ -2711,6 +2713,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (change.membership) this.broadcastRecord(change.membership, identity.user_id);
 			this.setRooms(identity.user_id, change.rooms);
 			this.sendToUser(identity.user_id, leftUpdate(roomId, change.membership));
+			if (change.changed) this.removeIfEmpty(roomId);
 			this.reply(socket, request, {});
 		});
 	}
@@ -4472,6 +4475,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!rooms?.includes(roomId)) return false;
 			this.setRooms(userId, rooms.filter((id) => id !== roomId));
 			this.sendToUser(userId, roomUpdate("left", { room_id: roomId }));
+			this.removeIfEmpty(roomId);
 			return true;
 		}
 		let changed = false;
@@ -4482,6 +4486,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (change.membership) this.broadcastRecord(change.membership, userId);
 			this.setRooms(userId, change.rooms);
 			this.sendToUser(userId, leftUpdate(roomId, change.membership));
+			this.removeIfEmpty(roomId);
 		});
 		return changed;
 	}
@@ -4849,6 +4854,22 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** Sends a frame to every connection of one user. */
 	private sendToUser(userId: string, value: unknown): void {
 		for (const peer of this.connectionsOf(userId)) this.deliverTo(peer, value);
+	}
+
+	/**
+	 * After a leave, removes the thread when nobody is in it any more, whatever
+	 * messages it holds (Store.removeEmptyThread): no connection has it among
+	 * its rooms, a guest's included, and no registered member is stored.
+	 * Everyone has left it, so nobody is told. The leave stands whatever
+	 * happens here: a thread the store cannot remove for now expires with its
+	 * log as before.
+	 */
+	private removeIfEmpty(roomId: string): void {
+		if (roomId === ROOM_ID) return;
+		if (this.ctx.getWebSockets().some((ws) => connectionAttachment(ws as WebSocketConnection)?.rooms?.includes(roomId))) return;
+		try {
+			if (this.store.removeEmptyThread(roomId, nowMs())) this.noteRoom(roomId, false);
+		} catch { /* kept until its log expires */ }
 	}
 
 	/**
