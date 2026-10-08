@@ -47,7 +47,9 @@ within it:
   creating one with `private: true` is `unsupported`. `room_join` and
   `room_leave` work for `general` and threads, and changes arrive as
   `room_update` before the result. With another user's `user_id`, an admin
-  adds or removes anyone, and a registered user their own bot; others are
+  adds or removes anyone, and a registered user their own bot; while
+  `/toggle addmember` is on (the default), any registered user may also add
+  anyone, and a thread's creator may remove anyone from it. Others are
   `denied`. Only registered users can be added. A thread's messages go to its
   members only. A guest's rooms last for its connection and are not logged; a
   registered identity keeps its rooms across connections, its joins and leaves
@@ -281,11 +283,12 @@ but do consume frame and lookup resources.
 
 The `server` frame advertises `ext:settings`, this implementation's
 extension, and carries its data in `server.params.ext.settings`, as the
-protocol's extension naming rule has it: two booleans, which a client takes
+protocol's extension naming rule has it: three booleans, which a client takes
 as `true` when absent. `guest_posting` says whether guests may post, react,
-join and leave rooms, and create threads (`GUEST_POSTING`), and
+join and leave rooms, and create threads (`GUEST_POSTING`),
 `read_cursors: false` says read markers are dropped, so clients can skip
-sending them. The ping interval is the standard `server.params.ping`.
+sending them, and `add_members` says whether registered users may add others
+to rooms (`/toggle addmember`). The ping interval is the standard `server.params.ping`.
 The demo's 16 KiB frame policy is an explicit exception to the base protocol's
 advisory 256 KiB recommendation. Payload lengths count UTF-8 bytes. Errors use
 the base protocol codes; `retry_after` includes `data.retry_after`, whole

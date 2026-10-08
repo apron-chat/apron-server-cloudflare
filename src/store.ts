@@ -414,6 +414,12 @@ interface ReactionsRecord {
   reactions: Array<{ from: Identity; emojis: string[] }>;
 }
 
+/** The `creator_id` kept in a room row's `fields_json`, if any (Store.roomCreator). */
+function storedCreator(fieldsJson: string): string | undefined {
+  const creator = parseJson<{ creator_id?: unknown }>(fieldsJson, {}).creator_id;
+  return typeof creator === "string" ? creator : undefined;
+}
+
 /** One logged membership change of a registered user (protocol §4.3.2). */
 interface MembershipRecord {
   log_id: string;
@@ -2491,6 +2497,19 @@ export class Store {
     });
   }
 
+  /**
+   * The registered user who created a room with `room_set`, kept beside the
+   * room's client fields (`creator_id` in `fields_json`) but never in its
+   * record, or undefined for `general`, a guest's room, or an unknown room.
+   */
+  roomCreator(roomId: string, now = this.clock.now()): string | undefined {
+    this.ensureReady();
+    return this.reserved({ reads: 16 }, false, now, () => {
+      const row = this.roomRow(roomId);
+      return row ? storedCreator(row.fields_json) : undefined;
+    });
+  }
+
   /** The room record for `general` (or another room); throws when missing. */
   getRoomState(roomId = ROOM_ID): RoomRecord {
     const room = this.getRoom(roomId);
@@ -2560,7 +2579,7 @@ export class Store {
    * left under the old id to the new one: the `from` of their logged message
    * snapshots and current messages (so they can still edit them), their
    * reaction sets, logged and current, and their logged membership changes,
-   * keeping the recorded names; their uploads; their push subscriptions, status and mutes;
+   * keeping the recorded names; the rooms they created; their uploads; their push subscriptions, status and mutes;
    * their limiter windows; and their dedup rows. Nothing is announced: clients see the new id when they
    * load history again. Other users' `body.mentions`, sessions and the user's
    * bot stay under the old id. The old `user_id` is retired, never reissued.
@@ -2575,7 +2594,7 @@ export class Store {
     const now = input.now ?? this.clock.now();
     const { from, to } = input;
     const records = this.retainedRecords(now);
-    const found = this.reserved({ reads: 64 + 8 * records + 2 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER) }, false, now, () => {
+    const found = this.reserved({ reads: 64 + 8 * records + 2 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER) + 2 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS) }, false, now, () => {
       const identity = this.identityRow(from);
       if (!identity || identity.tier !== "registered") throw new StoreError("invalid_params", `No registered user has the user_id ${from}`.slice(0, 200));
       if (parseRoles(identity.roles_json).includes("bot")) throw new StoreError("denied", "A bot's user_id is fixed");
@@ -2592,6 +2611,8 @@ export class Store {
         ),
         messages: this.rawRows<{ message_id: string; snapshot_json: string }>("SELECT message_id, snapshot_json FROM message_state WHERE author_id = ?", from),
         reactions: this.rawRows<{ message_id: string; from_json: string }>("SELECT message_id, from_json FROM reaction_state WHERE user_id = ?", from),
+        // Every room row is read: the creator is kept in its JSON, unindexed.
+        created: this.rawRows<{ room_id: string; fields_json: string }>("SELECT room_id, fields_json FROM rooms WHERE json_extract(fields_json, '$.creator_id') = ?", from),
         uploads: count("SELECT COUNT(*) AS count FROM uploads INDEXED BY uploads_owner_idx WHERE owner_id = ?"),
         pushes: count("SELECT COUNT(*) AS count FROM push_subscriptions INDEXED BY push_subscriptions_user_idx WHERE user_id = ?") +
           count("SELECT COUNT(*) AS count FROM push_wakes WHERE user_id = ?") +
@@ -2605,13 +2626,16 @@ export class Store {
     // row and rewrites both (measured: about 2 reads and 3 writes each);
     // rewriting a record's JSON in place is one write.
     const moved = membershipRows + found.reactions.length + found.uploads + found.pushes + found.requests + USER_LIMIT_SCOPES.length;
-    const rewritten = found.records.length + found.messages.length;
+    const rewritten = found.records.length + found.messages.length + found.created.length;
     const cost = { reads: 64 + 4 * moved + 2 * rewritten + this.userRoomsReads(), writes: 32 + 4 * moved + 2 * rewritten };
     return this.reserved(cost, false, now, () => this.transaction(() => {
       const renamed = (user: Identity): Identity => user.user_id === from ? { ...user, user_id: to } : user;
       this.rawExec("UPDATE identities SET user_id = ?, updated_ms = ? WHERE user_id = ?", to, this.effectiveNow(now), from);
       this.rawExec("UPDATE credentials SET user_id = ? WHERE user_id = ?", to, from);
       this.rawExec("UPDATE memberships SET user_id = ? WHERE user_id = ?", to, from);
+      for (const row of found.created) {
+        this.rawExec("UPDATE rooms SET fields_json = ? WHERE room_id = ?", JSON.stringify({ ...parseJson<Record<string, unknown>>(row.fields_json, {}), creator_id: to }), row.room_id);
+      }
       for (const row of found.records) {
         const record = parseJson<Record<string, unknown>>(row.record_json);
         if (row.kind === "message") {
@@ -2675,7 +2699,8 @@ export class Store {
    * memberships and membership records; their uploads; and their identity,
    * passkey, push subscription, status, mute, limiter and dedup rows. A logged record that
    * lists them beside others (a move's reaction sets) is rewritten without
-   * them. Rooms they created stay. Clients that already have their content
+   * them. Rooms they created stay, without a creator, so a user later given
+   * the same `user_id` cannot remove their members. Clients that already have their content
    * keep it until they load history again. Returns what went, and the R2
    * objects the caller deletes.
    */
@@ -2696,7 +2721,9 @@ export class Store {
     // deletion also updates its indexes.
     const perUser = 64 + 4 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS) + 4 * Math.max(this.config.registeredPostsPerDay, this.config.moderatorPostsPerDay) + 4 * uploadsPerOwner +
       4 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER);
-    const cost = { reads: 64 + 5 * records + ids.length * perUser, writes: 64 + 4 * records + ids.length * perUser };
+    // Every room row is read for its creator, and each one theirs rewritten.
+    const roomRows = MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS;
+    const cost = { reads: 64 + 5 * records + 2 * roomRows + ids.length * perUser, writes: 64 + 4 * records + 2 * roomRows + ids.length * perUser };
     return this.reserved(cost, false, now, () => this.transaction(() => {
       const messages = this.rawRows<{ message_id: string }>(`SELECT message_id FROM message_state WHERE author_id IN (${marks})`, ...ids)
         .map((row) => row.message_id);
@@ -2742,6 +2769,7 @@ export class Store {
          WHERE room_id IN (SELECT room_id FROM memberships INDEXED BY memberships_user_idx WHERE user_id IN (${marks}))`,
         ...ids, ...ids,
       );
+      this.rawExec(`UPDATE rooms SET fields_json = json_remove(fields_json, '$.creator_id') WHERE json_extract(fields_json, '$.creator_id') IN (${marks})`, ...ids);
       for (const table of ["memberships", "credentials", "push_subscriptions", "push_wakes", "user_status", "room_mutes", "accepted_requests", "identities"]) {
         this.rawExec(`DELETE FROM ${table} WHERE user_id IN (${marks})`, ...ids);
       }
@@ -4729,7 +4757,9 @@ export class Store {
       this.checkRoomFields(fields);
       logId = this.allocateLogId(context);
       const roomId = idString(logId);
-      const fieldsJson = JSON.stringify(fields);
+      // A registered creator is kept with the fields, outside the client's
+      // size limit and the room record, so they can remove members (§4.3.2).
+      const fieldsJson = JSON.stringify(registered ? { ...fields, creator_id: input.userId } : fields);
       this.rawExec(
         `INSERT INTO rooms (${ROOM_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
         roomId, parentId, logId, logId, logId, fieldsJson, context.commitMs, context.commitMs,
@@ -4747,7 +4777,9 @@ export class Store {
       const fields = roomFields(parseJson<{ ext?: unknown }>(existing.fields_json, {}).ext);
       this.checkRoomFields(fields);
       logId = this.allocateLogId(context);
-      const fieldsJson = JSON.stringify(fields);
+      // A save replaces the client fields; the creator stays.
+      const creator = storedCreator(existing.fields_json);
+      const fieldsJson = JSON.stringify(creator === undefined ? fields : { ...fields, creator_id: creator });
       this.rawExec(
         "UPDATE rooms SET record_log_id = ?, latest_log_id = ?, fields_json = ?, updated_ms = ? WHERE room_id = ?",
         logId, logId, fieldsJson, context.commitMs, existing.room_id,

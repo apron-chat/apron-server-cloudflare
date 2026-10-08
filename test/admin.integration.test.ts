@@ -1,6 +1,7 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import { DEFAULT_LIMITS } from '../src/budget';
+import type { Store } from '../src/store';
 import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
 import { softPasskey } from './helpers/webauthn';
 
@@ -280,7 +281,7 @@ async function setRoomListMembers(value: number): Promise<void> {
 	});
 }
 
-it('room_join and room_leave with a user_id add and remove others: an admin anyone, an owner their bot', async () => {
+it('room_join and room_leave with a user_id add and remove others: an admin anyone, an owner their bot, and with addmember on anyone adds', async () => {
 	const admin = await signedInAdmin();
 	const bobId = unique('bob');
 	const bob = await signedIn(bobId);
@@ -314,18 +315,32 @@ it('room_join and room_leave with a user_id add and remove others: an admin anyo
 		// Adding a member again changes nothing.
 		expect((await exchange(admin, 'add-bob-again', 'room_join', { room_id: roomId, user_id: bobId })).skipped.some((frame) => frame.params?.memberships)).toBe(false);
 
-		// Bob may not add others, but may add his own bot.
-		const denied = await request(bob, 'add-carol', 'room_join', { room_id: roomId, user_id: carolId });
-		expect(denied.error.code).toBe(-32001);
-		expect((await exchange(bob, 'bot', 'command', { room_id: 'general', body: { text: '/invite-bot' } })).frame.result).toEqual({});
-		expect((await request(bob, 'add-bot', 'room_join', { room_id: roomId, user_id: `bot_${bobId}` })).result).toEqual({});
+		// With `/toggle addmember` off, Bob may not add others, but may add his own bot.
+		const off = await exchange(admin, 'addmember-off', 'command', { room_id: 'general', body: { text: '/toggle addmember' } });
+		expect(off.skipped.find((frame) => frame.params?.from?.user_id === '~private')?.params.body.text).toMatch(/^Adding members is now \*\*off\*\*/);
+		try {
+			const denied = await request(bob, 'add-carol', 'room_join', { room_id: roomId, user_id: carolId });
+			expect(denied.error.code).toBe(-32001);
+			expect((await exchange(bob, 'bot', 'command', { room_id: 'general', body: { text: '/invite-bot' } })).frame.result).toEqual({});
+			expect((await request(bob, 'add-bot', 'room_join', { room_id: roomId, user_id: `bot_${bobId}` })).result).toEqual({});
+			// Only admins may toggle it.
+			expect((await request(bob, 'bob-toggle', 'command', { room_id: 'general', body: { text: '/toggle addmember' } })).error.code).toBe(-32001);
+		} finally {
+			const on = await exchange(admin, 'addmember-on', 'command', { room_id: 'general', body: { text: '/toggle addmember' } });
+			expect(on.skipped.find((frame) => frame.params?.from?.user_id === '~private')?.params.body.text).toMatch(/^Adding members is now \*\*on\*\*/);
+		}
+		// Back on (the default, so the override is forgotten), Bob adds Carol,
+		// but his bot may not add anyone.
+		expect(await runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.toggle('addmember'))).toBeUndefined();
+		expect((await request(bob, 'add-carol-on', 'room_join', { room_id: roomId, user_id: carolId })).result).toEqual({});
 
 		// Only registered users can be added, by a string user_id. (Each
 		// invalid_params counts toward the socket's policy violations.)
 		expect((await request(admin, 'add-guest', 'room_join', { room_id: roomId, user_id: guestId })).error.code).toBe(-32602);
 		expect((await request(bob, 'add-typed', 'room_join', { room_id: roomId, user_id: 7 })).error.code).toBe(-32602);
 
-		// Bob may remove his bot but nobody else; the admin removes Bob.
+		// Bob may remove his bot but nobody else, even someone he added; the admin removes Bob.
+		expect((await request(bob, 'remove-carol', 'room_leave', { room_id: roomId, user_id: carolId })).error.code).toBe(-32001);
 		expect((await request(bob, 'remove-bot', 'room_leave', { room_id: roomId, user_id: `bot_${bobId}` })).result).toEqual({});
 		expect((await request(bob, 'remove-admin', 'room_leave', { room_id: roomId, user_id: 'admin' })).error.code).toBe(-32001);
 		const removed = await exchange(admin, 'remove-bob', 'room_leave', { room_id: roomId, user_id: bobId });
@@ -343,6 +358,50 @@ it('room_join and room_leave with a user_id add and remove others: an admin anyo
 		expect((await until(guest, (frame) => frame.method === 'room_update' && frame.params.left !== undefined)).frame.params.left).toEqual([{ room_id: 'general' }]);
 		expect(admin.closed()).toBeUndefined();
 	} finally { admin.close(); bob.close(); guest.close(); }
+});
+
+it('a room\'s creator may remove anyone from it, across saves and /rename, until /purge', async () => {
+	const admin = await signedInAdmin();
+	const bobId = unique('bob');
+	const bob = await signedIn(bobId);
+	const carolId = unique('carol');
+	const carol = await signedIn(carolId);
+	const danId = unique('dan');
+	const dan = await signedIn(danId);
+	const creatorOf = (roomId: string) => runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.roomCreator(roomId));
+	try {
+		const roomId = (await request(bob, unique('thread'), 'room_set', { parent_room_id: 'general', title: 'Bob\'s' })).result.room_id;
+		expect(await creatorOf(roomId)).toBe(bobId);
+		// The creator is kept out of the room record.
+		const listed = (await request(bob, 'list', 'room_list', { room_id: roomId })).result.joined[0];
+		expect(JSON.stringify(listed)).not.toContain('creator');
+		for (const userId of [carolId, danId]) expect((await request(bob, `add-${userId}`, 'room_join', { room_id: roomId, user_id: userId })).result).toEqual({});
+
+		// Dan did not create the room: he may not remove Carol, nor may she remove Bob.
+		const denied = await request(dan, 'dan-removes', 'room_leave', { room_id: roomId, user_id: carolId });
+		expect(denied.error.code).toBe(-32001);
+		expect(denied.error.message).toBe('Only an admin, the room\'s creator, or a bot\'s owner, can remove someone else');
+		expect((await request(carol, 'carol-removes', 'room_leave', { room_id: roomId, user_id: bobId })).error.code).toBe(-32001);
+		// Nor in general, which nobody created.
+		expect((await request(bob, 'general-removes', 'room_leave', { room_id: 'general', user_id: carolId })).error.code).toBe(-32001);
+
+		// Carol saves the room's fields; Bob stays its creator and removes her.
+		expect((await request(carol, 'save', 'room_set', { room_id: roomId, title: 'Renamed', ext: { x: 1 } })).result).toBeDefined();
+		expect(await creatorOf(roomId)).toBe(bobId);
+		expect((await request(bob, 'remove-carol', 'room_leave', { room_id: roomId, user_id: carolId })).result).toEqual({});
+		expect((await until(carol, (frame) => frame.method === 'room_update' && frame.params.left !== undefined)).frame.params.left).toEqual([{ room_id: roomId }]);
+
+		// /rename moves the room to Bob's new user_id.
+		const newBobId = unique('robert');
+		expect((await command(admin, 'rename', `/rename ${bobId} ${newBobId}`)).frame.result).toEqual({});
+		await until(bob, (frame) => frame.method === 'user' && frame.params.you?.user_id === newBobId);
+		expect(await creatorOf(roomId)).toBe(newBobId);
+		expect((await request(bob, 'remove-dan', 'room_leave', { room_id: roomId, user_id: danId })).result).toEqual({});
+
+		// /purge leaves the room without a creator, so a later user given the id gains nothing.
+		expect((await command(admin, 'purge', `/purge ${newBobId}`)).frame.result).toEqual({});
+		expect(await creatorOf(roomId)).toBeUndefined();
+	} finally { admin.close(); bob.close(); carol.close(); dan.close(); }
 });
 
 it('gives member_count where members leaves registered members out, and keeps the stored count current', async () => {

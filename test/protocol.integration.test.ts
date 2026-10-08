@@ -831,11 +831,13 @@ it('advertises the extension ext:settings', async () => {
 	try {
 		const server = (await peer.next()).params;
 		expect(server.capabilities).toContain('ext:settings');
-		// Both booleans, always sent; clients take an absent one as true.
+		// Each boolean always sent; clients take an absent one as true.
 		expect(server.ext).toEqual({ settings: {
 			// vitest.config.ts turns guest posting on.
 			guest_posting: true,
 			read_cursors: false,
+			// No admin has turned `/toggle addmember` off.
+			add_members: true,
 		} });
 	} finally { peer.close(); }
 });
