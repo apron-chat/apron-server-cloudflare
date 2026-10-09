@@ -35,17 +35,21 @@ within it:
 - Rooms: every room is visible to every client, and a connection receives
   deliveries only for the rooms its user has joined. A new guest or passkey
   identity has joined `general`; posting to a room does not require joining it.
-  Only thread rooms under `general` may be created with `room_set` (top-level
-  rooms and nested threads are `denied`), which joins the creator; any
-  participant may save a thread's `title`, `description` (CommonMark by
-  convention), and `ext`, together at most 2 KiB, while `general` is fixed.
+  Anyone may create a thread under a top-level room with `room_set`, and an
+  `admin` or `mod` may also create a top-level room (others' are `denied`, as
+  are nested threads); creating joins the creator. Any participant may save a
+  thread's `title`, `description` (CommonMark by convention), and `ext`,
+  together at most 2 KiB, and an `admin` or `mod` a created top-level room's,
+  while `general` is fixed. Created top-level rooms are permanent like
+  `general`; at most 16 are created, and they count against the 100-thread
+  ceiling.
   The server advertises capability `ext`: `me`, and saves of messages and
   rooms, merge `ext` one level deep: each key sent replaces its value, an
   empty one (`""`, `[]`, `{}`) removes it, and keys left out stay; the size
   limits apply to the merged result. A deleted message keeps no `ext`.
-  Threads always carry a title (`Thread` by default). No room is private:
+  Threads and rooms always carry a title (`Thread` or `Room` by default). No room is private:
   creating one with `private: true` is `unsupported`. `room_join` and
-  `room_leave` work for `general` and threads, and changes arrive as
+  `room_leave` work for every room, and changes arrive as
   `room_update` before the result. With another user's `user_id`, an admin
   adds or removes anyone, and a registered user their own bot; while
   `/toggle addmember` is on (the default), any registered user may also add
@@ -180,7 +184,7 @@ within it:
   bounded `type`, `width`, `height`, and `alt`. Other `og` properties are
   dropped, and an `og` left empty is removed. The server
   never fetches embed URLs. Author-only edit, delete, restore, and move, except
-  that an `admin` or `mod` may move anyone's message (into a thread or back
+  that an `admin`, `mod` or `threader` may move anyone's message (into a thread or back
   out) with a save that changes nothing but its room. `reply_to`
   must name a retained message when set or changed; resubmitting
   an unchanged reference stays valid after its target expires, and expiration

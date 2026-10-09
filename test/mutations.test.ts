@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import { RETENTION_MS, Store, StoreError, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
+import { MAX_CREATED_ROOMS, RETENTION_MS, Store, StoreError, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
 import { errorCode, expectRetryAfter, messagesOf, withStore as withNamedStore, type TestClock } from "./helpers/store";
 
 // Semantics tests use roomy posting windows; quota tests below use tiny ones.
@@ -597,5 +597,94 @@ it("lets an admin or a mod move someone else's message into a thread and back, b
 		// A role taken away takes the permission with it.
 		store.setRole({ userId: "mia", role: "mod", on: false, now: clock.value });
 		expect(errorCode(() => store.mutate(op(clock, "mia", "mia-after", "message", resubmit(back.message, threadId))))).toBe("denied");
+	});
+});
+
+it("lets a threader move anyone's messages in and out of threads, create threads and save any thread's title and description", async () => {
+	await withStore("threader-role", (store, clock) => {
+		store.createInvitedIdentity({ userId: "tia", name: "tia", now: clock.value, ipKey: "ip-test" });
+		store.setRole({ userId: "tia", role: "threader", on: true, now: clock.value });
+		const first = post(store, clock, "alice", "first", { body: { text: "start" } });
+		const second = post(store, clock, "bob", "second", { body: { text: "more" } });
+		const resubmit = (message: StoreMutationResult["message"], roomId: string) => ({ message_id: message!.message_id, room_id: roomId, body: message!.body });
+
+		// A thread of the threader's own, and someone else's thread retitled and described.
+		const created = store.mutate(op(clock, "tia", "tia-thread", "room_set", { parent_room_id: "general", title: "Tidy" }));
+		const threadId = String(created.result.room_id);
+		const othersId = thread(store, clock, "alice-thread");
+		expect(store.mutate(op(clock, "tia", "tia-save", "room_set", { room_id: othersId, title: "Renamed", description: "What it's about" })).room)
+			.toMatchObject({ room_id: othersId, title: "Renamed", description: "What it's about" });
+
+		// Anyone's messages into the thread and back out, still theirs.
+		const moved = store.mutate(op(clock, "tia", "in-1", "message", resubmit(first.message, threadId)));
+		expect(moved.message).toMatchObject({ room_id: threadId, prev_room_id: "general", from: { user_id: "alice" }, body: first.message!.body });
+		expect(store.mutate(op(clock, "tia", "in-2", "message", resubmit(second.message, threadId))).message)
+			.toMatchObject({ room_id: threadId, from: { user_id: "bob" } });
+		expect(store.mutate(op(clock, "tia", "out-1", "message", resubmit(moved.message, "general"))).message)
+			.toMatchObject({ room_id: "general", prev_room_id: threadId, from: { user_id: "alice" } });
+
+		// Moving only: no edits to someone else's message.
+		expect(errorCode(() => store.mutate(op(clock, "tia", "edit", "message", { ...resubmit(second.message, threadId), body: { text: "threader edit" } })))).toBe("denied");
+		expect(errorCode(() => store.mutate(op(clock, "tia", "delete", "message", { message_id: second.message!.message_id, room_id: threadId, deleted: true })))).toBe("denied");
+
+		// Without the role, no moves.
+		store.setRole({ userId: "tia", role: "threader", on: false, now: clock.value });
+		expect(errorCode(() => store.mutate(op(clock, "tia", "after", "message", resubmit(second.message, "general"))))).toBe("denied");
+	});
+});
+
+it("lets an admin or a mod create and edit top-level rooms, which hold threads and count against the thread ceiling", async () => {
+	await withStore("room-creators", (store, clock) => {
+		const invite = (userId: string) => store.createInvitedIdentity({ userId, name: userId, now: clock.value, ipKey: "ip-test" });
+		for (const userId of ["mia", "ada", "tia", "reg"]) invite(userId);
+		store.setRole({ userId: "mia", role: "mod", on: true, now: clock.value });
+		store.setRole({ userId: "ada", role: "admin", on: true, now: clock.value });
+		store.setRole({ userId: "tia", role: "threader", on: true, now: clock.value });
+		const create = (userId: string, requestId: string, params: Record<string, unknown> = {}) => store.mutate(op(clock, userId, requestId, "room_set", params));
+
+		// A guest, a registered user, and a threader create threads, not rooms.
+		for (const userId of ["alice", "reg", "tia"]) expect(errorCode(() => create(userId, `${userId}-room`, { title: "Mine" }))).toBe("denied");
+
+		// A mod's room is top-level, joins its creator, and gets a title when given none.
+		const made = create("mia", "mia-room", { title: "Random", description: "Off topic" });
+		expect(made.created).toBe(true);
+		expect(made.room).toMatchObject({ title: "Random", description: "Off topic" });
+		expect(made.room?.parent_room_id).toBeUndefined();
+		expect(made.membership?.params).toMatchObject({ room_id: made.room!.room_id });
+		const roomId = String(made.result.room_id);
+		expect(create("ada", "ada-room").room).toMatchObject({ title: "Room" });
+		expect(store.topLevelRoomIds()).toEqual(["general", roomId, expect.any(String)]);
+
+		// Anyone may start a thread in it; only an admin or mod may edit it, and general stays fixed.
+		const threadId = String(create("alice", "alice-thread", { parent_room_id: roomId, title: "Side" }).result.room_id);
+		expect(store.getRoom(threadId)?.parent_room_id).toBe(roomId);
+		expect(errorCode(() => create("alice", "nested", { parent_room_id: threadId }))).toBe("denied");
+		for (const userId of ["alice", "reg", "tia"]) expect(errorCode(() => create(userId, `${userId}-edit`, { room_id: roomId, title: "Taken" }))).toBe("denied");
+		expect(create("ada", "ada-edit", { room_id: roomId, title: "Random chat" }).room).toMatchObject({ room_id: roomId, title: "Random chat" });
+		expect(errorCode(() => create("ada", "general-edit", { room_id: "general", title: "Lobby" }))).toBe("denied");
+
+		// A role taken away takes the permission with it.
+		store.setRole({ userId: "mia", role: "mod", on: false, now: clock.value });
+		expect(errorCode(() => create("mia", "mia-after", { title: "Again" }))).toBe("denied");
+		expect(errorCode(() => create("mia", "mia-edit-after", { room_id: roomId, title: "Again" }))).toBe("denied");
+	});
+	// Rooms and threads share the ceiling, and rooms have their own cap within it.
+	await withStore("room-ceiling", (store, clock) => {
+		store.createInvitedIdentity({ userId: "ada", name: "ada", now: clock.value, ipKey: "ip-test" });
+		store.setRole({ userId: "ada", role: "admin", on: true, now: clock.value });
+		store.mutate(op(clock, "ada", "room", "room_set", { title: "Only" }));
+		expect(errorCode(() => thread(store, clock, "thread"))).toBe("denied");
+	}, { ...ROOMY, maxThreads: 1 });
+	await withStore("room-cap", (store, clock) => {
+		store.createInvitedIdentity({ userId: "ada", name: "ada", now: clock.value, ipKey: "ip-test" });
+		store.setRole({ userId: "ada", role: "admin", on: true, now: clock.value });
+		for (let index = 0; index < MAX_CREATED_ROOMS; index += 1) store.mutate(op(clock, "ada", `room-${index}`, "room_set", { title: `Room ${index}` }));
+		try {
+			store.mutate(op(clock, "ada", "one-more", "room_set", { title: "One more" }));
+			expect.unreachable();
+		} catch (error) {
+			expect((error as StoreError).message).toBe("room_limit");
+		}
+		thread(store, clock, "thread-still");
 	});
 });

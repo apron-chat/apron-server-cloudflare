@@ -819,3 +819,33 @@ it('/role <user_id> bot makes a token user a bot in full, but not a passkey hold
 		bot.close();
 	} finally { admin.close(); person.close(); }
 });
+
+it('an admin creates a top-level room that others find with room_list and join, and that stays when emptied', async () => {
+	const admin = await signedInAdmin();
+	const guest = await connect();
+	try {
+		await guest.next();
+		await request(guest, 'auth', 'auth', { scheme: 'guest' });
+		expect((await request(guest, 'guest-room', 'room_set', { title: 'Mine' })).error.code).toBe(-32001);
+
+		const created = await exchange(admin, 'room', 'room_set', { title: 'Random', description: 'Off topic' });
+		const roomId = created.frame.result.room_id as string;
+		const joined = created.skipped.find((frame) => frame.method === 'room_update')!.params.joined[0];
+		expect(joined).toMatchObject({ room_id: roomId, title: 'Random', description: 'Off topic', members: [{ user_id: 'admin' }] });
+		expect(joined.parent_room_id).toBeUndefined();
+
+		// The guest, in general only, now has a top-level room to join.
+		const browse = (await request(guest, 'browse', 'room_list', { filter: 'not_joined' })).result;
+		expect(browse.not_joined.map((room: { room_id: string }) => room.room_id)).toContain(roomId);
+		expect((await request(guest, 'join', 'room_join', { room_id: roomId })).result).toEqual({});
+		expect((await request(guest, 'browse-again', 'room_list', { filter: 'not_joined' })).result).toEqual({ not_joined: [] });
+
+		// A thread may start in it, and when everyone leaves the room stays.
+		const thread = (await request(guest, 'thread', 'room_set', { parent_room_id: roomId, title: 'Side' })).result.room_id;
+		expect(thread).toEqual(expect.any(String));
+		await request(guest, 'leave', 'room_leave', { room_id: roomId });
+		await request(admin, 'leave', 'room_leave', { room_id: roomId });
+		const exists = await runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.getRoom(roomId) !== null);
+		expect(exists).toBe(true);
+	} finally { admin.close(); guest.close(); }
+});

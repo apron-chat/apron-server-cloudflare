@@ -325,7 +325,7 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "avatar", usage: "/avatar", help: "set your avatar: send this command with one image attached", audience: "owners" },
 	{ name: "passkeys", usage: "/passkeys [remove <n>]", help: "list your account's passkeys, or remove one of them", audience: "owners" },
 	{ name: "admin", usage: "/admin [remove] <user_id>", help: "make a registered user an admin, or no longer one", audience: "admins" },
-	{ name: "role", usage: "/role <user_id> [<role>]", help: "show a user's roles, or give or take away one (admin, mod and bot act as such; others are labels)", audience: "admins" },
+	{ name: "role", usage: "/role <user_id> [<role>]", help: "show a user's roles, or give or take away one (admin, mod, threader and bot act as such; others are labels)", audience: "admins" },
 	{ name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", audience: "admins" },
 	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
 	{ name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", audience: "admins" },
@@ -1136,6 +1136,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * broadcasts, and one lookup per unknown ID; bounded like the rooms table.
 	 */
 	private readonly knownRooms = new Map<string, boolean>();
+	/** The top-level rooms' IDs, once read; kept current by room_set, and such rooms are never removed. */
+	private topLevelRooms: string[] | undefined;
 	/**
 	 * When each frame the server processed in the last minute arrived, oldest
 	 * first, for `globalFramesPerMinute`. In memory: a hibernating object has
@@ -2533,8 +2535,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `room_set` (§4.3.4): creates a thread under `general`, which joins its
-	 * creator, or replaces a thread's client fields. Creating sends the
+	 * `room_set` (§4.3.4): creates a thread under a top-level room, or for an
+	 * admin or mod a top-level room, which joins its creator, or replaces a
+	 * room's client fields (Store.commitRoom has who may). Creating sends the
 	 * creator's connections `room_update` `joined` with the room's members,
 	 * then a registered creator's logged membership, and the parent's other
 	 * members `updated`. A save sends `updated` to the members of the room and
@@ -2554,6 +2557,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				this.noteRoom(room.room_id, true);
 				const scope = [room.room_id, ...(room.parent_room_id !== undefined ? [room.parent_room_id] : [])];
 				if (result.created) {
+					if (room.parent_room_id === undefined) this.topLevelRooms?.push(room.room_id);
 					this.setRooms(identity.user_id, [...(this.liveRoomsOf(identity.user_id) ?? []), room.room_id]);
 					// A new room's only member is its creator: no storage to read.
 					const creator = this.complete(attachment)!;
@@ -3937,14 +3941,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const result: ListingResult = {};
 		if (filter !== "not_joined") result.joined = [];
 		if (filter !== "joined") result.not_joined = [];
-		// Unjoined top-level rooms: `general` is the only one, so a user in it
-		// has none, and the answer needs no storage or listing allowance.
-		if (filter === "not_joined" && parent === undefined && roomId === undefined && joinedIds.has(ROOM_ID)) {
+		const now = nowMs();
+		// Unjoined top-level rooms: a user in every one has none, and the
+		// answer needs no listing or listing allowance.
+		if (filter === "not_joined" && parent === undefined && roomId === undefined && this.topLevelRoomIds(now).every((id) => joinedIds.has(id))) {
 			if (withMembers) result.users = [];
 			this.reply(socket, request, result);
 			return;
 		}
-		const now = nowMs();
 		const exempt = filter === "joined" && !attachment.listedJoined && parent === undefined && roomId === undefined;
 		if (exempt) {
 			attachment.listedJoined = true;
@@ -4398,8 +4402,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `/role <user_id>`: tells the sender a user's roles. `/role <user_id>
 	 * <role>` gives them the role, or takes it away when they have it. Any
 	 * role name is a label shown in `roles` (§3.3); `admin` also lets them run
-	 * the admin commands, `mod` lets them move other users' messages (as
-	 * `admin` does), and `bot` makes them a bot. The sender gets a
+	 * the admin commands, `mod` and `threader` let them move other users'
+	 * messages (as `admin` does), `admin` and `mod` let them create top-level
+	 * rooms, and `bot` makes them a bot. The sender gets a
 	 * `~private` notice before the result (§1).
 	 */
 	private role(socket: WebSocketConnection, request: RequestFrame, roomId: string, target: string, requested?: string): void {
@@ -4901,6 +4906,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const relevant = rooms.filter((room) => joined.has(room.room_id) || (room.parent_room_id !== undefined && joined.has(room.parent_room_id)));
 			if (relevant.length) this.deliverTo(socket, { method: "room_update", params: { updated: relevant } });
 		}
+	}
+
+	/** The top-level rooms' IDs: `general` and those an admin or mod created, read once (Store.topLevelRoomIds). */
+	private topLevelRoomIds(now: number): readonly string[] {
+		return this.topLevelRooms ??= this.store.topLevelRoomIds(now);
 	}
 
 	private noteRoom(roomId: string, exists: boolean): void {

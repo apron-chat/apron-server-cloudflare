@@ -5,8 +5,9 @@ the protocol contract and design, see the [implementation specification](../SPEC
 
 ## Overview
 
-A single SQLite Durable Object serves the permanent `general` room and its
-thread rooms over hibernating WebSockets. The backend supports guest access,
+A single SQLite Durable Object serves the permanent `general` room, the
+top-level rooms admins and mods create, and their thread rooms over
+hibernating WebSockets. The backend supports guest access,
 discoverable passkeys, complete-snapshot history, message
 replacement/deletion/restoration/moves, thread rooms, emoji reactions, and a
 rolling retention floor. Guests only read (set `GUEST_POSTING=true` to let
@@ -129,12 +130,14 @@ delivered in `room_update` `memberships` and returned in `history`; a guest's li
 so `room_list` ignores `latest_log_id` and always answers with a full
 listing. `members` lists every connected member and at most 200 registered
 members per room (100 with the Free budgets); a room with more lists the first by `user_id`, not by recent activity, and also gives
-`member_count`. Registered users carry `roles` (`admin`, `mod`, `bot`, labels an admin gave with `/role`, or `[]` for none) in `users`
+`member_count`. Registered users carry `roles` (`admin`, `mod`, `threader`, `bot`, labels an admin gave with `/role`, or `[]` for none) in `users`
 and `you`. See [SPEC section 4](../SPEC.md#memberships).
 The whole server processes at most 600 frames a
-minute (300 with the Free budgets); past that, requests get `retry_after` and the socket stays open. The demo
-only creates thread rooms: `room_set` creations need `parent_room_id: "general"`,
-and `general` itself cannot be edited. A thread's `description` (CommonMark)
+minute (300 with the Free budgets); past that, requests get `retry_after` and the socket stays open. Anyone
+may create a thread (`room_set` with the `parent_room_id` of a top-level room);
+only an `admin` or `mod` may create a top-level room (`room_set` without
+`parent_room_id`, at most 16, kept for good) or edit one, and `general` itself
+cannot be edited. A thread's `description` (CommonMark)
 says what it is about, and any participant may change it. Every room is
 public: `private: true` is `unsupported`. System notices come from `~private`,
 `~room`, or `~server`; no user's `user_id` starts with `~`. This is a shared public room, not
@@ -199,7 +202,8 @@ deduplication window does not post it twice.
 Only the last 7 days of records (messages, reactions, room changes, and
 registered users' memberships) are retained, 24 hours on Workers Free. Cleanup
 once a day (hourly on Free) normally exposes 7 to 8 days; quota exhaustion may
-delay physical deletion. The `general` room ID and the log head never rotate.
+delay physical deletion. The `general` room ID, the top-level rooms admins and mods create, and the log
+head never rotate.
 Recent edits can keep old messages visible. Rooms keep their current record
 after its log entry expires; a thread room whose whole log has expired is
 removed (its members get `room_update` `left`), which frees its slot under the

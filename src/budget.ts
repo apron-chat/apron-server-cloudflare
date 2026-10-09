@@ -29,7 +29,8 @@ export interface Limits {
 	registeredPostsPerMinute: number;
 	registeredPostsPerDay: number;
 	/**
-	 * Posts by a registered user with a moderator role (`admin` or `mod`), in
+	 * Posts by a registered user with a moderator role (`admin`, `mod` or
+	 * `threader`), in
 	 * place of the registered limits: rethreading a conversation is one post
 	 * per moved message. Also their IP's allowance where it is larger than
 	 * the IP limits; the global limits still hold.
