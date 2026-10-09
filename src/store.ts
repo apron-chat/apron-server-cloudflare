@@ -56,6 +56,8 @@ export const MAX_PASSKEYS_PER_USER = 8;
 export const DEFAULT_JOINED_ROOMS: readonly string[] = [ROOM_ID];
 /** Title the demo supplies for a thread room created or saved without one. */
 const DEFAULT_THREAD_TITLE = "Thread";
+/** Title the demo supplies for a top-level room created or saved without one. */
+const DEFAULT_ROOM_TITLE = "Room";
 const MAX_SAFE_ID = Number.MAX_SAFE_INTEGER;
 export const RETENTION_MS = DEFAULT_LIMITS.retentionSeconds * 1000;
 const DEDUP_TTL_MS = DEFAULT_LIMITS.dedupTtlSeconds * 1000;
@@ -725,6 +727,18 @@ export const MAX_CARRIED_PASSKEYS = 100;
  * (chargePosting), since a move is one post per message.
  */
 export const MODERATOR_ROLES: readonly string[] = ["admin", "mod", "threader"];
+/**
+ * Roles whose registered holders may create top-level rooms beside
+ * `general`, and save their client fields (§4.3.4). Such rooms are
+ * permanent, as `general` is: they neither expire nor go when emptied.
+ */
+export const ROOM_CREATOR_ROLES: readonly string[] = ["admin", "mod"];
+/**
+ * Most top-level rooms created besides `general`. They also count against
+ * the thread ceiling (`maxThreads`), which bounds the rooms table, and,
+ * being permanent, this keeps them from taking all of its slots.
+ */
+export const MAX_CREATED_ROOMS = 16;
 /** Most roles one user holds, so the column stays small. */
 export const MAX_ROLES_PER_USER = 8;
 /**
@@ -2477,8 +2491,9 @@ export class Store {
     this.ensureReady();
     return this.reserved({ reads: this.roomListingReads() }, options.maintenance === true, now, () => {
       const floor = this.logState().history_floor;
-      // The rooms table is capped at one top-level room plus the calibrated
-      // thread ceiling, so this ordered scan is bounded by that cap.
+      // The rooms table is capped at `general` plus the calibrated thread
+      // ceiling, which created top-level rooms count against too, so this
+      // ordered scan is bounded by that cap.
       const rows = this.rawRows<RawRoomRow>(
         `SELECT ${ROOM_COLUMNS} FROM rooms ORDER BY created_log_id ASC LIMIT ?`,
         MAX_THREAD_LIMIT + 1,
@@ -3455,8 +3470,24 @@ export class Store {
 
   /** Whether a registered user holds a moderator role (MODERATOR_ROLES), from the identity row. */
   private isModerator(userId: string): boolean {
+    return this.holdsRole(userId, MODERATOR_ROLES);
+  }
+
+  /** Whether a registered user holds one of `roles`, from the identity row. */
+  private holdsRole(userId: string, roles: readonly string[]): boolean {
     const identity = this.identityRow(userId);
-    return identity?.tier === "registered" && parseRoles(identity.roles_json).some((role) => MODERATOR_ROLES.includes(role));
+    return identity?.tier === "registered" && parseRoles(identity.roles_json).some((role) => roles.includes(role));
+  }
+
+  /**
+   * The top-level rooms' IDs, `general` first, for `room_list`'s shortcut.
+   * At most MAX_CREATED_ROOMS + 1, and they are never removed.
+   */
+  topLevelRoomIds(now = this.clock.now()): string[] {
+    this.ensureReady();
+    return this.reserved({ reads: 4 + MAX_CREATED_ROOMS }, false, now, () => this.rawRows<{ room_id: string }>(
+      "SELECT room_id FROM rooms WHERE parent_room_id IS NULL ORDER BY created_log_id ASC LIMIT ?", MAX_CREATED_ROOMS + 1,
+    ).map((row) => row.room_id));
   }
 
   private identityForMessage(input: StoreMutationInput): Identity {
@@ -4740,12 +4771,15 @@ export class Store {
   }
 
   /**
-   * `room_set`: create a thread room or replace a thread room's client fields (§4.3.4),
+   * `room_set`: create a room or thread, or replace one's client fields (§4.3.4),
    * merging `ext` into the current one (§4.12).
-   * Demo policy: only threads under a top-level room may be created, and only
-   * thread rooms may be edited; the permanent `general` room is fixed. Rooms
-   * are never private here: every room is visible to everyone, so a creation
-   * with `private: true` is `unsupported`, as §4.3.4 requires.
+   * Demo policy: anyone may create a thread under a top-level room and save
+   * any thread; only an admin or mod (ROOM_CREATOR_ROLES) may create a
+   * top-level room or save one. Threads cannot be nested, and the permanent
+   * `general` room is fixed. Every created room counts against maxThreads,
+   * which bounds the rooms table. Rooms are never private here: every room
+   * is visible to everyone, so a creation with `private: true` is
+   * `unsupported`, as §4.3.4 requires.
    */
   private commitRoom(input: StoreMutationInput, context: CommitContext, floor: number, registered: boolean): StoreMutationResult {
     const params = input.params;
@@ -4759,9 +4793,12 @@ export class Store {
     const descriptionParam = params.description;
     if (descriptionParam !== undefined && typeof descriptionParam !== "string") throw new StoreError("invalid_params", "description must be a string");
     const write = this.optionalExt(params.ext);
+    const existing = roomIdParam === undefined ? undefined : this.roomRow(roomIdParam);
     // Threads always carry a title so clients that ignore parent_room_id
-    // still render them (section 3.4). An empty description is no description.
-    const title = typeof titleParam === "string" && titleParam.trim() !== "" ? titleParam : DEFAULT_THREAD_TITLE;
+    // still render them (section 3.4), and so do top-level rooms. An empty
+    // description is no description.
+    const topLevel = existing === undefined ? params.parent_room_id === undefined : existing?.parent_room_id === null;
+    const title = typeof titleParam === "string" && titleParam.trim() !== "" ? titleParam : topLevel ? DEFAULT_ROOM_TITLE : DEFAULT_THREAD_TITLE;
     const description = typeof descriptionParam === "string" && descriptionParam.trim() !== "" ? descriptionParam : undefined;
     // `ext` merges into the room's current one (§4.12, §4.3.4); the size check runs on the result.
     const roomFields = (stored: unknown): Record<string, unknown> => {
@@ -4773,11 +4810,18 @@ export class Store {
     let logId: number;
     if (roomIdParam === undefined) {
       const parentId = params.parent_room_id;
-      if (parentId === undefined) throw new StoreError("denied", "Only threads may be created on this demo");
-      if (typeof parentId !== "string" || parentId.length === 0) throw new StoreError("invalid_params", "parent_room_id must be a non-empty string");
-      const parent = this.roomRow(parentId);
-      if (!parent) throw new StoreError("invalid_params", "unknown parent_room_id");
-      if (parent.parent_room_id !== null) throw new StoreError("denied", "Threads cannot be nested on this demo");
+      let parentRoomId: string | null = null;
+      if (parentId === undefined) {
+        if (!registered || !this.holdsRole(input.userId, ROOM_CREATOR_ROLES)) throw new StoreError("denied", "Only an admin or mod may create a room; others may create threads");
+        const rooms = this.rawRows("SELECT room_id FROM rooms WHERE parent_room_id IS NULL LIMIT ?", MAX_CREATED_ROOMS + 1).length;
+        if (rooms > MAX_CREATED_ROOMS) throw new StoreError("denied", "room_limit");
+      } else {
+        if (typeof parentId !== "string" || parentId.length === 0) throw new StoreError("invalid_params", "parent_room_id must be a non-empty string");
+        const parent = this.roomRow(parentId);
+        if (!parent) throw new StoreError("invalid_params", "unknown parent_room_id");
+        if (parent.parent_room_id !== null) throw new StoreError("denied", "Threads cannot be nested on this demo");
+        parentRoomId = parentId;
+      }
       if (this.metaNumber("thread_count") >= this.config.maxThreads) throw new StoreError("denied", "thread_limit");
       const fields = roomFields(undefined);
       this.checkRoomFields(fields);
@@ -4788,17 +4832,19 @@ export class Store {
       const fieldsJson = JSON.stringify(registered ? { ...fields, creator_id: input.userId } : fields);
       this.rawExec(
         `INSERT INTO rooms (${ROOM_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
-        roomId, parentId, logId, logId, logId, fieldsJson, context.commitMs, context.commitMs,
+        roomId, parentRoomId, logId, logId, logId, fieldsJson, context.commitMs, context.commitMs,
       );
       this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('thread_count', ?)", String(this.metaNumber("thread_count") + 1));
       row = {
-        room_id: roomId, parent_room_id: parentId, created_log_id: logId, record_log_id: logId, latest_log_id: logId,
+        room_id: roomId, parent_room_id: parentRoomId, created_log_id: logId, record_log_id: logId, latest_log_id: logId,
         fields_json: fieldsJson, created_ms: context.commitMs, updated_ms: context.commitMs, member_count: 0,
       };
     } else {
-      const existing = this.roomRow(roomIdParam);
       if (!existing) throw new StoreError("invalid_params", "unknown room");
-      if (existing.parent_room_id === null) throw new StoreError("denied", "Top-level rooms cannot be edited on this demo");
+      if (existing.room_id === ROOM_ID) throw new StoreError("denied", "The general room cannot be edited on this demo");
+      if (existing.parent_room_id === null && (!registered || !this.holdsRole(input.userId, ROOM_CREATOR_ROLES))) {
+        throw new StoreError("denied", "Only an admin or mod may edit a room; anyone may edit a thread");
+      }
       // parent_room_id is fixed at creation; a submitted value is ignored.
       const fields = roomFields(parseJson<{ ext?: unknown }>(existing.fields_json, {}).ext);
       this.checkRoomFields(fields);

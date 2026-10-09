@@ -465,7 +465,8 @@ monotonic time and UTC calendar date; a backward wall-clock jump cannot reset
 them. Cleanup and deduplication run in bounded batches/records, while
 `foreground*` and `maintenance*` are daily SQL operation budgets.
 
-`threadLimit` counts thread rooms (rooms with a `parent_room_id`) and
+`threadLimit` counts thread rooms (rooms with a `parent_room_id`) and the
+top-level rooms admins and mods create (at most 16 of them), and
 `threadMetadataBytes` bounds a room's serialized client fields (`title`,
 `description`, `ext`). A user's `ext` is at most 512 bytes serialized
 (`MAX_USER_EXT_BYTES` in `src/store.ts`, not configurable: every connection
