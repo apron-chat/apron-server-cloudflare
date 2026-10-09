@@ -180,7 +180,7 @@ within it:
   bounded `type`, `width`, `height`, and `alt`. Other `og` properties are
   dropped, and an `og` left empty is removed. The server
   never fetches embed URLs. Author-only edit, delete, restore, and move, except
-  that an `admin` or `mod` may move anyone's message (into a thread or back
+  that an `admin`, `mod` or `threader` may move anyone's message (into a thread or back
   out) with a save that changes nothing but its room. `reply_to`
   must name a retained message when set or changed; resubmitting
   an unchanged reference stays valid after its target expires, and expiration

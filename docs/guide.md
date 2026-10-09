@@ -129,7 +129,7 @@ delivered in `room_update` `memberships` and returned in `history`; a guest's li
 so `room_list` ignores `latest_log_id` and always answers with a full
 listing. `members` lists every connected member and at most 200 registered
 members per room (100 with the Free budgets); a room with more lists the first by `user_id`, not by recent activity, and also gives
-`member_count`. Registered users carry `roles` (`admin`, `mod`, `bot`, labels an admin gave with `/role`, or `[]` for none) in `users`
+`member_count`. Registered users carry `roles` (`admin`, `mod`, `threader`, `bot`, labels an admin gave with `/role`, or `[]` for none) in `users`
 and `you`. See [SPEC section 4](../SPEC.md#memberships).
 The whole server processes at most 600 frames a
 minute (300 with the Free budgets); past that, requests get `retry_after` and the socket stays open. The demo

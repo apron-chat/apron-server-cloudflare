@@ -599,3 +599,36 @@ it("lets an admin or a mod move someone else's message into a thread and back, b
 		expect(errorCode(() => store.mutate(op(clock, "mia", "mia-after", "message", resubmit(back.message, threadId))))).toBe("denied");
 	});
 });
+
+it("lets a threader move anyone's messages in and out of threads, create threads and save any thread's title and description", async () => {
+	await withStore("threader-role", (store, clock) => {
+		store.createInvitedIdentity({ userId: "tia", name: "tia", now: clock.value, ipKey: "ip-test" });
+		store.setRole({ userId: "tia", role: "threader", on: true, now: clock.value });
+		const first = post(store, clock, "alice", "first", { body: { text: "start" } });
+		const second = post(store, clock, "bob", "second", { body: { text: "more" } });
+		const resubmit = (message: StoreMutationResult["message"], roomId: string) => ({ message_id: message!.message_id, room_id: roomId, body: message!.body });
+
+		// A thread of the threader's own, and someone else's thread retitled and described.
+		const created = store.mutate(op(clock, "tia", "tia-thread", "room_set", { parent_room_id: "general", title: "Tidy" }));
+		const threadId = String(created.result.room_id);
+		const othersId = thread(store, clock, "alice-thread");
+		expect(store.mutate(op(clock, "tia", "tia-save", "room_set", { room_id: othersId, title: "Renamed", description: "What it's about" })).room)
+			.toMatchObject({ room_id: othersId, title: "Renamed", description: "What it's about" });
+
+		// Anyone's messages into the thread and back out, still theirs.
+		const moved = store.mutate(op(clock, "tia", "in-1", "message", resubmit(first.message, threadId)));
+		expect(moved.message).toMatchObject({ room_id: threadId, prev_room_id: "general", from: { user_id: "alice" }, body: first.message!.body });
+		expect(store.mutate(op(clock, "tia", "in-2", "message", resubmit(second.message, threadId))).message)
+			.toMatchObject({ room_id: threadId, from: { user_id: "bob" } });
+		expect(store.mutate(op(clock, "tia", "out-1", "message", resubmit(moved.message, "general"))).message)
+			.toMatchObject({ room_id: "general", prev_room_id: threadId, from: { user_id: "alice" } });
+
+		// Moving only: no edits to someone else's message.
+		expect(errorCode(() => store.mutate(op(clock, "tia", "edit", "message", { ...resubmit(second.message, threadId), body: { text: "threader edit" } })))).toBe("denied");
+		expect(errorCode(() => store.mutate(op(clock, "tia", "delete", "message", { message_id: second.message!.message_id, room_id: threadId, deleted: true })))).toBe("denied");
+
+		// Without the role, no moves.
+		store.setRole({ userId: "tia", role: "threader", on: false, now: clock.value });
+		expect(errorCode(() => store.mutate(op(clock, "tia", "after", "message", resubmit(second.message, "general"))))).toBe("denied");
+	});
+});

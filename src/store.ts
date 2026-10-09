@@ -718,10 +718,13 @@ export const MAX_CARRIED_PASSKEYS = 100;
  * Moderator roles. A registered user holding one may move other users'
  * messages (§4.4): a `message` save of someone else's message that changes
  * only its `room_id`, such as into a thread or back out to its parent room.
- * Their posts count against the moderator posting limits, not the
- * registered ones (chargePosting).
+ * `threader` grants that alone, for someone who tidies conversations into
+ * threads; creating threads and saving any thread's title and description
+ * are open to every participant already (commitRoom). Their posts count
+ * against the moderator posting limits, not the registered ones
+ * (chargePosting), since a move is one post per message.
  */
-export const MODERATOR_ROLES: readonly string[] = ["admin", "mod"];
+export const MODERATOR_ROLES: readonly string[] = ["admin", "mod", "threader"];
 /** Most roles one user holds, so the column stays small. */
 export const MAX_ROLES_PER_USER = 8;
 /**
@@ -3864,7 +3867,7 @@ export class Store {
     // A moderator's save keeps the author's content as it was: the client fields
     // the client resubmits, and an `ext` it merges into nothing new.
     if (moving && canonicalize(messageContent(snapshot)) !== canonicalize(messageContent(previous!))) {
-      throw new StoreError("denied", "An admin or mod may move someone else's message but not change it");
+      throw new StoreError("denied", "An admin, mod or threader may move someone else's message but not change it");
     }
     // The size policy bounds client content, the merged ext included; the server's prev_log_id and
     // prev_room_id links are added after it.

@@ -39,23 +39,26 @@ it('uses durable registered identities for twenty posts while preserving the agg
 	});
 });
 
-it('gives admins and mods the moderator posting limits, for their IP too, under the global ones', async () => {
+it('gives admins, mods and threaders the moderator posting limits, for their IP too, under the global ones', async () => {
 	await runInDurableObject(env.DEMO.getByName('quota-moderator'), (_instance, state) => {
 		const now = (Math.floor(Date.now() / DAY) + 1) * DAY + 43_200_000;
-		// Free's global minute limit, which a moderator's 50 nearly fills.
-		const store = new Store(state, { globalPostsPerMinute: 60 }, { now: () => now });
-		for (const userId of ['mod', 'admin-user', 'member']) store.registerIdentity({
+		// A global minute limit that two moderators' 50 each nearly fill.
+		const store = new Store(state, { globalPostsPerMinute: 110 }, { now: () => now });
+		for (const userId of ['mod', 'threader', 'admin-user', 'member']) store.registerIdentity({
 			userId, name: userId, userHandle: userId, ipKey: `${userId}-ip`, now,
 			credential: { credentialId: userId, userId, publicKey: 'fixture-policy-only', counter: 0 },
 		});
 		store.setRole({ userId: 'mod', role: 'mod', on: true, now });
+		store.setRole({ userId: 'threader', role: 'threader', on: true, now });
 		store.setRole({ userId: 'admin-user', role: 'admin', on: true, now });
 		const post = (userId: string, ipKey = `${userId}-ip`) => store.mutate({ userId, ipKey, method: 'message', now,
 			identity: { user_id: userId }, params: { room_id: 'general', body: { text: 'bounded' } } });
 		// Past the registered 20 and the IP's 30, up to the moderator 50.
 		for (let index = 0; index < 50; index++) post('mod');
 		expect(() => post('mod')).toThrow('Posting limit reached');
-		// The global 60 still holds: the admin gets the 10 left.
+		for (let index = 0; index < 50; index++) post('threader');
+		expect(() => post('threader')).toThrow('Posting limit reached');
+		// The global 110 still holds: the admin gets the 10 left.
 		for (let index = 0; index < 10; index++) post('admin-user');
 		expect(() => post('admin-user')).toThrow('Posting limit reached');
 	});
