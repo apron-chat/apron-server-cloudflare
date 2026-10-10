@@ -169,9 +169,9 @@ export interface StoreConfig {
   anonymousPostsPerDay: number;
   registeredPostsPerMinute: number;
   registeredPostsPerDay: number;
-  /** A moderator's (MODERATOR_ROLES) posts, in place of the registered limits; also their IP's allowance, when larger. */
-  moderatorPostsPerMinute: number;
-  moderatorPostsPerDay: number;
+  /** A trusted user's posts (a registered user holding any role, which only an admin gives), in place of the registered limits; also their IP's allowance, when larger. */
+  trustedPostsPerMinute: number;
+  trustedPostsPerDay: number;
   ipPostsPerMinute: number;
   ipPostsPerDay: number;
   globalPostsPerMinute: number;
@@ -308,8 +308,8 @@ const DEFAULT_CONFIG: StoreConfig = {
   anonymousPostsPerDay: DEFAULT_LIMITS.anonymousPostsPerDay,
   registeredPostsPerMinute: DEFAULT_LIMITS.registeredPostsPerMinute,
   registeredPostsPerDay: DEFAULT_LIMITS.registeredPostsPerDay,
-  moderatorPostsPerMinute: DEFAULT_LIMITS.moderatorPostsPerMinute,
-  moderatorPostsPerDay: DEFAULT_LIMITS.moderatorPostsPerDay,
+  trustedPostsPerMinute: DEFAULT_LIMITS.trustedPostsPerMinute,
+  trustedPostsPerDay: DEFAULT_LIMITS.trustedPostsPerDay,
   ipPostsPerMinute: DEFAULT_LIMITS.ipPostsPerMinute,
   ipPostsPerDay: DEFAULT_LIMITS.ipPostsPerDay,
   globalPostsPerMinute: DEFAULT_LIMITS.globalPostsPerMinute,
@@ -737,7 +737,7 @@ export const MAX_CARRIED_PASSKEYS = 100;
  * `threader` grants that alone, for someone who tidies conversations into
  * threads; creating threads and saving any thread's title and description
  * are open to every participant already (commitRoom). Their posts count
- * against the moderator posting limits, not the registered ones
+ * against the trusted posting limits, not the registered ones
  * (chargePosting), since a move is one post per message.
  */
 export const MODERATOR_ROLES: readonly string[] = ["admin", "mod", "threader"];
@@ -2760,7 +2760,7 @@ export class Store {
     // Per user: memberships (live and awaiting a room purge), a day's dedup
     // rows, limiter rows, push subscriptions, credential and identity; each
     // deletion also updates its indexes.
-    const perUser = 64 + 4 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS) + 4 * Math.max(this.config.registeredPostsPerDay, this.config.moderatorPostsPerDay) + 4 * uploadsPerOwner +
+    const perUser = 64 + 4 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS) + 4 * Math.max(this.config.registeredPostsPerDay, this.config.trustedPostsPerDay) + 4 * uploadsPerOwner +
       4 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER);
     // Every room row is read for its creator, and each one theirs rewritten.
     const roomRows = MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS;
@@ -3055,24 +3055,26 @@ export class Store {
   /**
    * Charges `weight` posts (one by default) to the poster's, the IP's and
    * the global windows, or none when any of them lacks room for all of
-   * them. A registered moderator (MODERATOR_ROLES, one identity read) is
-   * held to the moderator limits instead of the registered ones, and their
-   * IP to the larger of its own and those, so the IP's limits don't undercut
-   * them (moving a long conversation into a thread is one post per message,
-   * and more for one with many reactors: MOVE_REACTION_SETS_PER_POST).
-   * The global limits hold for everyone.
+   * them. A trusted user, registered and holding any role (`friend`,
+   * MODERATOR_ROLES, or any label: only an admin gives roles; one identity
+   * read), is held to the trusted limits instead of the registered ones,
+   * and their IP to the larger of its own and those, so the IP's limits
+   * don't undercut them (moving a long conversation into a thread is one
+   * post per message, and more for one with many reactors:
+   * MOVE_REACTION_SETS_PER_POST). An owner's bot (tier `bot`) is never
+   * trusted. The global limits hold for everyone.
    */
   private chargePosting(input: { userId: string; tier: Tier; ipKey: string; now: number; weight?: number }): void {
     const { userId, tier, ipKey, now } = input;
     const weight = Math.max(1, input.weight ?? 1);
-    const moderator = tier === "registered" && this.isModerator(userId);
-    const perUser = moderator
-      ? { minute: this.config.moderatorPostsPerMinute, day: this.config.moderatorPostsPerDay }
+    const trusted = tier === "registered" && this.holdsAnyRole(userId);
+    const perUser = trusted
+      ? { minute: this.config.trustedPostsPerMinute, day: this.config.trustedPostsPerDay }
       : tier === "registered"
         ? { minute: this.config.registeredPostsPerMinute, day: this.config.registeredPostsPerDay }
         : { minute: this.config.anonymousPostsPerMinute, day: this.config.anonymousPostsPerDay };
-    const perIp = moderator
-      ? { minute: Math.max(this.config.ipPostsPerMinute, this.config.moderatorPostsPerMinute), day: Math.max(this.config.ipPostsPerDay, this.config.moderatorPostsPerDay) }
+    const perIp = trusted
+      ? { minute: Math.max(this.config.ipPostsPerMinute, this.config.trustedPostsPerMinute), day: Math.max(this.config.ipPostsPerDay, this.config.trustedPostsPerDay) }
       : { minute: this.config.ipPostsPerMinute, day: this.config.ipPostsPerDay };
     const principal = tier === "registered" ? `user:${userId}` : `anonymous:${ipKey}`;
     const rows = [
@@ -3502,6 +3504,18 @@ export class Store {
   /** Whether a registered user holds a moderator role (MODERATOR_ROLES), from the identity row. */
   private isModerator(userId: string): boolean {
     return this.holdsRole(userId, MODERATOR_ROLES);
+  }
+
+  /**
+   * Whether a registered user holds any role, from the identity row: only an
+   * admin gives roles, so this is who posts under the trusted limits
+   * (chargePosting). `friend` is the role that grants that alone, for
+   * someone an admin trusts without moderating powers. An owner's bot (tier
+   * `bot`) never counts.
+   */
+  private holdsAnyRole(userId: string): boolean {
+    const identity = this.identityRow(userId);
+    return identity?.tier === "registered" && parseRoles(identity.roles_json).length > 0;
   }
 
   /** Whether a registered user holds one of `roles`, from the identity row. */

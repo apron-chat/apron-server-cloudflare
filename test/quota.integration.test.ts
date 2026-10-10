@@ -39,10 +39,10 @@ it('uses durable registered identities for twenty posts while preserving the agg
 	});
 });
 
-it('gives admins, mods and threaders the moderator posting limits, for their IP too, under the global ones', async () => {
+it('gives users with any role the trusted posting limits, for their IP too, under the global ones', async () => {
 	await runInDurableObject(env.DEMO.getByName('quota-moderator'), (_instance, state) => {
 		const now = (Math.floor(Date.now() / DAY) + 1) * DAY + 43_200_000;
-		// A global minute limit that two moderators' 50 each nearly fill.
+		// A global minute limit that two trusted users' 50 each nearly fill.
 		const store = new Store(state, { globalPostsPerMinute: 110 }, { now: () => now });
 		for (const userId of ['mod', 'threader', 'admin-user', 'member']) store.registerIdentity({
 			userId, name: userId, userHandle: userId, ipKey: `${userId}-ip`, now,
@@ -53,7 +53,7 @@ it('gives admins, mods and threaders the moderator posting limits, for their IP 
 		store.setRole({ userId: 'admin-user', role: 'admin', on: true, now });
 		const post = (userId: string, ipKey = `${userId}-ip`) => store.mutate({ userId, ipKey, method: 'message', now,
 			identity: { user_id: userId }, params: { room_id: 'general', body: { text: 'bounded' } } });
-		// Past the registered 20 and the IP's 30, up to the moderator 50.
+		// Past the registered 20 and the IP's 30, up to the trusted 50.
 		for (let index = 0; index < 50; index++) post('mod');
 		expect(() => post('mod')).toThrow('Posting limit reached');
 		for (let index = 0; index < 50; index++) post('threader');
@@ -61,6 +61,28 @@ it('gives admins, mods and threaders the moderator posting limits, for their IP 
 		// The global 110 still holds: the admin gets the 10 left.
 		for (let index = 0; index < 10; index++) post('admin-user');
 		expect(() => post('admin-user')).toThrow('Posting limit reached');
+	});
+	await runInDurableObject(env.DEMO.getByName('quota-trusted-friend'), (_instance, state) => {
+		const now = (Math.floor(Date.now() / DAY) + 1) * DAY + 43_200_000;
+		const store = new Store(state, { globalPostsPerMinute: 1_000 }, { now: () => now });
+		for (const userId of ['pal', 'artist', 'owner']) store.registerIdentity({
+			userId, name: userId, userHandle: userId, ipKey: `${userId}-ip`, now,
+			credential: { credentialId: userId, userId, publicKey: 'fixture-policy-only', counter: 0 },
+		});
+		// `friend` grants only trust; any other label an admin gives does too.
+		store.setRole({ userId: 'pal', role: 'friend', on: true, now });
+		store.setRole({ userId: 'artist', role: 'artist', on: true, now });
+		store.registerBot({ ownerId: 'owner', botId: 'bot_owner', name: 'owner', now, ipKey: 'owner-ip' });
+		const post = (userId: string) => store.mutate({ userId, ipKey: `${userId}-ip`, method: 'message', now,
+			identity: { user_id: userId }, params: { room_id: 'general', body: { text: 'bounded' } } });
+		for (const userId of ['pal', 'artist']) {
+			for (let index = 0; index < 50; index++) post(userId);
+			expect(() => post(userId)).toThrow('Posting limit reached');
+		}
+		// An owner's bot holds the role `bot` by what it is, not by an admin's grant: registered limits.
+		expect(store.getIdentity('bot_owner')!.roles).toEqual(['bot']);
+		for (let index = 0; index < 20; index++) post('bot_owner');
+		expect(() => post('bot_owner')).toThrow('Posting limit reached');
 	});
 	await runInDurableObject(env.DEMO.getByName('quota-moderator-role-removed'), (_instance, state) => {
 		const now = (Math.floor(Date.now() / DAY) + 1) * DAY + 43_200_000;

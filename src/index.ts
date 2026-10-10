@@ -325,7 +325,7 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "avatar", usage: "/avatar", help: "set your avatar: send this command with one image attached", audience: "owners" },
 	{ name: "passkeys", usage: "/passkeys [remove <n>]", help: "list your account's passkeys, or remove one of them", audience: "owners" },
 	{ name: "admin", usage: "/admin [remove] <user_id>", help: "make a registered user an admin, or no longer one", audience: "admins" },
-	{ name: "role", usage: "/role <user_id> [<role>]", help: "show a user's roles, or give or take away one (admin, mod, threader and bot act as such; others are labels)", audience: "admins" },
+	{ name: "role", usage: "/role <user_id> [<role>]", help: "show a user's roles, or give or take away one (admin, mod, threader and bot act as such; friend, like any role, raises their posting limits)", audience: "admins" },
 	{ name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", audience: "admins" },
 	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
 	{ name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", audience: "admins" },
@@ -518,8 +518,8 @@ function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		anonymousPostsPerDay: limits.anonymousPostsPerDay,
 		registeredPostsPerMinute: limits.registeredPostsPerMinute,
 		registeredPostsPerDay: limits.registeredPostsPerDay,
-		moderatorPostsPerMinute: limits.moderatorPostsPerMinute,
-		moderatorPostsPerDay: limits.moderatorPostsPerDay,
+		trustedPostsPerMinute: limits.trustedPostsPerMinute,
+		trustedPostsPerDay: limits.trustedPostsPerDay,
 		ipPostsPerMinute: limits.ipPostsPerMinute,
 		ipPostsPerDay: limits.ipPostsPerDay,
 		globalPostsPerMinute: limits.globalPostsPerMinute,
@@ -4431,7 +4431,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * role name is a label shown in `roles` (§3.3); `admin` also lets them run
 	 * the admin commands, `mod` and `threader` let them move other users'
 	 * messages (as `admin` does), `admin` and `mod` let them create top-level
-	 * rooms, and `bot` makes them a bot. The sender gets a
+	 * rooms, and `bot` makes them a bot. Any role, `friend` the one that
+	 * grants nothing else, puts their posts under the trusted limits. The sender gets a
 	 * `~private` notice before the result (§1).
 	 */
 	private role(socket: WebSocketConnection, request: RequestFrame, roomId: string, target: string, requested?: string): void {
