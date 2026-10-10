@@ -128,10 +128,12 @@ reservation of the first operation after a handover.
 The worst move was measured at the calibrated reaction ceilings rather than
 the defaults: 64 reacting users, each with 16 distinct 64-byte emoji and a
 320-byte name. Each reaction set measured at most 93/32. Moving the message
-re-logged all 64 sets in one 92,693-byte reaction record and measured 216/158
-against its 296/280 reservation; the record still fit one history response.
-The per-message cap is what bounds this move: without it, the re-logged set
-count would be limited only by posting quotas.
+re-logged all 64 sets in one 92,693-byte reaction record and measured 223/164
+against its 296/280 reservation, charging its posting limits 9 posts (one, and
+one more per 8 sets); the record still fit one history response.
+The per-message cap is what bounds this move, and its extra posts what bound
+repeating it: at the 32-set default a move is charged 5 posts, so the posting
+limits allow a fifth as many such moves as plain posts.
 
 Memberships:
 

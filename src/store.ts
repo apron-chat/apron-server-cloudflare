@@ -616,7 +616,18 @@ interface CommitContext {
   touched: Map<string, number>;
   /** Registered members each room gained (or, negative, lost) in this commit's memberships. */
   members?: Map<string, number>;
+  /** Posts this commit costs past the one every mutation is charged: a move's re-logged reaction sets (MOVE_REACTION_SETS_PER_POST). */
+  extraPosts?: number;
 }
+
+/**
+ * A move re-logs the moved message's reaction sets and rewrites each one's
+ * state row, about 4 written rows a set, so moving a message with many
+ * reactors costs several posts' worth of writes. Each this many sets add
+ * one post to the move's charge: a message with fewer reactors moves for one
+ * post, and the most reacted-to (32 sets) for five.
+ */
+export const MOVE_REACTION_SETS_PER_POST = 8;
 
 const ROOM_COLUMNS = "room_id, parent_room_id, created_log_id, record_log_id, latest_log_id, fields_json, created_ms, updated_ms, member_count";
 
@@ -3042,15 +3053,18 @@ export class Store {
   }
 
   /**
-   * Charges one post to the poster's, the IP's and the global windows. A
-   * registered moderator (MODERATOR_ROLES, one identity read) is held to the
-   * moderator limits instead of the registered ones, and their IP to the
-   * larger of its own and those, so the IP's limits don't undercut them
-   * (moving a long conversation into a thread is one post per message).
+   * Charges `weight` posts (one by default) to the poster's, the IP's and
+   * the global windows, or none when any of them lacks room for all of
+   * them. A registered moderator (MODERATOR_ROLES, one identity read) is
+   * held to the moderator limits instead of the registered ones, and their
+   * IP to the larger of its own and those, so the IP's limits don't undercut
+   * them (moving a long conversation into a thread is one post per message,
+   * and more for one with many reactors: MOVE_REACTION_SETS_PER_POST).
    * The global limits hold for everyone.
    */
-  private chargePosting(input: { userId: string; tier: Tier; ipKey: string; now: number }): void {
+  private chargePosting(input: { userId: string; tier: Tier; ipKey: string; now: number; weight?: number }): void {
     const { userId, tier, ipKey, now } = input;
+    const weight = Math.max(1, input.weight ?? 1);
     const moderator = tier === "registered" && this.isModerator(userId);
     const perUser = moderator
       ? { minute: this.config.moderatorPostsPerMinute, day: this.config.moderatorPostsPerDay }
@@ -3075,15 +3089,18 @@ export class Store {
       const previousEvents = events[index];
       const allowance = index === 0 ? perUser.minute : index === 1 ? perIp.minute : this.config.globalPostsPerMinute;
       const dailyAllowance = index === 0 ? perUser.day : index === 1 ? perIp.day : this.config.globalPostsPerDay;
-      if (previousEvents.length >= allowance) {
-        const retry = Math.max(1, previousEvents[previousEvents.length - allowance] + POST_WINDOW_MS - now);
+      // Room for `weight` more once enough of the window's events age out; a
+      // weight past the whole allowance waits for the window to empty.
+      const room = Math.max(0, allowance - weight);
+      if (previousEvents.length > room) {
+        const retry = Math.max(1, previousEvents[previousEvents.length - room - 1] + POST_WINDOW_MS - now);
         if (retry > retryAfterMs) {
           retryAfterMs = retry;
           reason = index === 0 && tier === "anonymous" ? "Guest posting limit reached" : "Posting limit reached";
         }
       }
       const count = row.day === daily ? row.posts_day : 0;
-      if (count >= dailyAllowance) {
+      if (count + weight > dailyAllowance) {
         const retry = Math.max(1, 86_400_000 - now % 86_400_000);
         if (retry > retryAfterMs) {
           retryAfterMs = retry;
@@ -3094,8 +3111,8 @@ export class Store {
     if (retryAfterMs > 0) throw new StoreError("retry_after", reason, { retryAfterMs });
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index];
-      const nextEvents = [...events[index], now];
-      const dailyCount = row.day === daily ? row.posts_day + 1 : 1;
+      const nextEvents = [...events[index], ...new Array<number>(weight).fill(now)];
+      const dailyCount = (row.day === daily ? row.posts_day : 0) + weight;
       this.updateLimitRow(row, {
         post_events_json: JSON.stringify(nextEvents),
         day: daily,
@@ -3946,6 +3963,7 @@ export class Store {
         messageId, floor, this.config.reactionUsersPerMessage,
       );
       if (rows.length) {
+        context.extraPosts = Math.floor(rows.length / MOVE_REACTION_SETS_PER_POST);
         const reactionLogId = this.allocateLogId(context);
         const record: ReactionsRecord = {
           log_id: idString(reactionLogId),
@@ -5091,6 +5109,8 @@ export class Store {
           committed = method === "message" ? this.commitMessage(input, context, floor)
             : method === "room_set" ? this.commitRoom(input, context, floor, tier === "registered")
             : this.commitReactions(input, context, floor);
+          // Within the transaction: a move its sender cannot pay for is refused whole.
+          if (context.extraPosts) this.chargePosting({ userId: input.userId, tier, ipKey: input.ipKey, now: effective, weight: context.extraPosts });
           this.finishCommit(context, startLogId);
         }
         this.commitStoredResult(input.userId, input.requestId, digest, committed.result, effective + this.config.dedupTtlMs);
