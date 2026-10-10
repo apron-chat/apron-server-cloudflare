@@ -804,7 +804,6 @@ describe('measured storage accounting', () => {
 			expect(measure('push wake claim', () => store.claimPushes({ senderId: 'matrix-sender', roomId: 'general', candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() })).subscriptions).toHaveLength(1);
 			const unsubscribed = Array.from({ length: 31 }, (_, index) => `matrix-unsubscribed-${index}`);
 			expect(measure('push wake claim, 31 unsubscribed candidates first', () => store.claimPushes({ senderId: 'matrix-sender', roomId: 'matrix-room', candidates: [...unsubscribed, 'matrix-user'].map((userId) => ({ userId, reasons: WAKE_SCOPES.mentions })), now: clock.now() })).subscriptions).toHaveLength(1);
-			measure('push sender charge', () => store.chargePushSender('matrix-sender', 2, clock.now()));
 			measure('push registrations clear', () => store.clearPushSubscriptions('matrix-other', clock.now()));
 			measure('gone push subscription forget', () => store.forgetPushSubscriptions([{ userId: subscription.userId, url: subscription.url, p256dh: subscription.p256dh }], clock.now()));
 
@@ -882,7 +881,7 @@ describe('measured storage accounting', () => {
 			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
 			expect(create.result.message_id).toBeTruthy();
-			expect(costs).toHaveLength(49);
+			expect(costs).toHaveLength(48);
 			expect(store.accountingStatus().unsafe).toBe(false);
 			return { costs };
 		});

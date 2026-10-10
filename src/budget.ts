@@ -136,6 +136,8 @@ export interface Limits {
 	databaseResumeLowWaterBytes: number;
 	cleanupBatch: number;
 	threadLimit: number;
+	/** Live threads one registered user may have created; removed and expired ones do not count. */
+	threadsPerUser: number;
 	threadMetadataBytes: number;
 	/** Distinct users whose reaction sets one message may carry. */
 	reactionUsersPerMessage: number;

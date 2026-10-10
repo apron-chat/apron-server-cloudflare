@@ -342,6 +342,38 @@ it("denies thread creation beyond the thread ceiling", async () => {
 	}, { ...ROOMY, maxThreads: 1 });
 });
 
+it("caps the live threads one registered user created; removed and expired ones stop counting", async () => {
+	await withStore("thread-per-user", (store, clock) => {
+		for (const userId of ["alice", "bob"]) {
+			store.registerIdentity({
+				userId, name: userId, userHandle: `handle-${userId}`, now: clock.value, ipKey: `ip-${userId}`,
+				credential: { credentialId: `cred-${userId}`, userId, publicKey: "AAAA", counter: 0 },
+			});
+		}
+		const first = thread(store, clock, "first");
+		thread(store, clock, "second");
+		let error: unknown;
+		try { thread(store, clock, "third"); } catch (caught) { error = caught; }
+		expect((error as StoreError).code).toBe("denied");
+		expect((error as StoreError).message).toMatch(/at most 2 threads/);
+		// Each user has their own allowance, and a guest's threads (no creator) count only against the ceiling.
+		store.mutate(op(clock, "bob", "bobs", "room_set", { parent_room_id: "general", title: "Bob's" }));
+		for (const n of [1, 2, 3]) store.mutate(op(clock, "guest_1", `guest-${n}`, "room_set", { parent_room_id: "general", title: "Guest's" }));
+		// A thread removed when its last member leaves stops counting.
+		store.changeMembership({ userId: "alice", ipKey: "ip-alice", roomId: first, join: false, now: clock.value });
+		expect(store.removeEmptyThread(first, clock.value)).toBe(true);
+		thread(store, clock, "after-removal");
+		expect(errorCode(() => thread(store, clock, "full-again"))).toBe("denied");
+		// So do threads whose history expired, once cleanup removes them.
+		clock.value += 25 * 60 * 60_000;
+		for (let run = 0; run < 8 && store.listRooms().length > 1; run += 1) clock.value = Math.max(clock.value, store.runCleanup(clock.value).next_due_ms) + 1;
+		expect(store.listRooms().map((room) => room.room_id)).toEqual(["general"]);
+		thread(store, clock, "after-expiry-1");
+		thread(store, clock, "after-expiry-2");
+		expect(errorCode(() => thread(store, clock, "after-expiry-3"))).toBe("denied");
+	}, { ...ROOMY, retentionMs: 60_000, maxThreadsPerUser: 2 });
+});
+
 it("moves a message into both rooms' logs and re-logs its reactions in the destination", async () => {
 	await withStore("moves", (store, clock) => {
 		const original = post(store, clock, "alice", "original", { body: { text: "misplaced" } });

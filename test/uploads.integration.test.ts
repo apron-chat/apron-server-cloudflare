@@ -128,16 +128,23 @@ describe('store uploads', () => {
 	});
 
 	it('charges daily upload counts and the stored-bytes cap', async () => {
-		await withStore('uploads-quota', { uploads: { ...UPLOADS, uploadsPerUserDay: 2, uploadsPerDay: 3, storedBytesCap: 3 * UPLOADS.maxFileBytes + UPLOADS.maxAvatarBytes } }, (store, clock) => {
+		await withStore('uploads-quota', { uploads: { ...UPLOADS, uploadsPerUserDay: 2, uploadsPerDay: 3, storedBytesCap: 4 * UPLOADS.maxFileBytes + UPLOADS.maxAvatarBytes } }, (store, clock) => {
 			register(store, clock, 'carol');
 			register(store, clock, 'dave');
-			post(store, clock, 'carol', { body: { embeds: [{ kind: 'upload' }, { kind: 'upload' }] } });
+			register(store, clock, 'erin');
+			const keys = (result: Record<string, unknown>) => [0, 1].map((index) => writeOf(result, index).write.key);
+			const carols = keys(post(store, clock, 'carol', { body: { embeds: [{ kind: 'upload' }, { kind: 'upload' }] } }).result);
 			let error: unknown;
 			try { post(store, clock, 'carol', { body: { embeds: [{ kind: 'upload' }] } }); } catch (caught) { error = caught; }
 			expectRetryAfter(error);
 			expect((error as Error).message).toBe('Daily upload limit reached');
-			post(store, clock, 'dave', { body: { embeds: [{ kind: 'upload' }] } });
-			try { post(store, clock, 'dave', { body: { embeds: [{ kind: 'upload' }] } }); } catch (caught) { error = caught; }
+			// The server's count is charged by writes claimed, not uploads started:
+			// Carol's two and Dave's two started, none written, leave it open.
+			const daves = keys(post(store, clock, 'dave', { body: { embeds: [{ kind: 'upload' }, { kind: 'upload' }] } }).result);
+			for (const key of [...carols, daves[0]]) expect(store.claimUpload(key, clock.value)).toBe(true);
+			// Three claimed: Dave's other write is refused until the reset, and no upload starts.
+			expect(store.claimUpload(daves[1], clock.value)).toBe('closed');
+			try { post(store, clock, 'erin', { body: { embeds: [{ kind: 'upload' }] } }); } catch (caught) { error = caught; }
 			expect((error as Error).message).toBe('Uploads are closed until the daily reset');
 			// A new day resets the counts, but the bytes still held count against the cap.
 			clock.value += 86_400_000;
@@ -371,6 +378,35 @@ describe('uploads end to end', () => {
 			await request(peer, 'delete', 'message', { message_id: messageId, deleted: true });
 			await expect.poll(async () => await media().head(key)).toBeNull();
 		} finally { peer.close(); }
+	});
+
+	it('refuses a write with 429 while the day\'s uploads are spent, leaving it pending to write after', async () => {
+		const peer = await signedIn(unique('uploader'));
+		// The server's daily count, as claimed writes charge it.
+		const setGlobal = (count: number | null) => runInDurableObject(stub(), (_instance, state) => {
+			if (count === null) return void state.storage.sql.exec("DELETE FROM principal_limits WHERE scope = 'upload' AND principal_key = 'global'");
+			state.storage.sql.exec(
+				`INSERT INTO principal_limits (scope, principal_key, day, uploads_day, updated_ms) VALUES ('upload', 'global', ?, ?, ?)
+				 ON CONFLICT (scope, principal_key) DO UPDATE SET day = excluded.day, uploads_day = excluded.uploads_day`,
+				new Date().toISOString().slice(0, 10), count, Date.now(),
+			);
+		});
+		const before = await runInDurableObject(stub(), (_instance, state) =>
+			state.storage.sql.exec<{ uploads_day: number }>("SELECT uploads_day FROM principal_limits WHERE scope = 'upload' AND principal_key = 'global'").toArray()[0]?.uploads_day ?? null);
+		try {
+			const { frame } = await exchange(peer, 'post', 'message', { body: { text: 'later', embeds: [{ kind: 'upload' }] } });
+			await setGlobal(UPLOAD_POLICY!.uploadsPerDay);
+			const closed = await put(frame.result.embeds[0].write_url, png());
+			expect(closed.status).toBe(429);
+			expect(Number(closed.headers.get('Retry-After'))).toBeGreaterThan(0);
+			expect(closed.headers.get('Access-Control-Expose-Headers')).toContain('Retry-After');
+			// Not used up: once the count allows it, the same write_url writes.
+			await setGlobal(0);
+			expect((await put(frame.result.embeds[0].write_url, png())).status).toBe(204);
+		} finally {
+			await setGlobal(before);
+			peer.close();
+		}
 	});
 
 	it('refuses what is not an image and publishes the message without it', async () => {

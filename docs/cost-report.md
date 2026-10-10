@@ -63,7 +63,7 @@ upper bounds can be compared with the measured worst case.
 | Frame block (10 frames) | 12 | 11 | 64 | 24 |
 | Guest number block | 4 | 4 | 16 | 16 |
 | Connection admission reservation | 17 | 16 | 72 | 40 |
-| Identity registration (starts in `general`, logs that membership) | 30 | 32 | 338 | 880 |
+| Identity registration (starts in `general`, logs that membership) | 31 | 32 | 338 | 880 |
 | Identity registration starting in 100 rooms | 229 | 824 | 338 | 880 |
 | Credential lookup | 4 | 2 | 16 | 8 |
 | Identity lookup (with the user's rooms) | 8 | 2 | 434 | 8 |
@@ -72,9 +72,8 @@ upper bounds can be compared with the measured worst case.
 | Credential counter update | 5 | 3 | 16 | 16 |
 | Push subscription register | 9 | 8 | 172 | 370 |
 | Push subscription register again, unchanged within a day | 6 | 2 | 172 | 370 |
-| Push wake claim (one user, one subscription; creates the server and recipient counters) | 23 | 19 | 94 | 160 |
-| Push wake claim, 31 unregistered candidates before one registered | 77 | 9 | 1,024 | 160 |
-| Push sender charge (delivered pushes; creates the sender counter) | 10 | 9 | 24 | 24 |
+| Push wake claim (one user, one subscription; creates the server, sender and recipient counters) | 28 | 26 | 94 | 160 |
+| Push wake claim, 31 unregistered candidates before one registered | 78 | 11 | 1,024 | 160 |
 | Push registrations clear (`/passkeys remove`, a new bot token) | 3 | 3 | 144 | 400 |
 | Mute set (`status` `mute`, unscoped) | 6 | 4 | 24 | 24 |
 | Status set (`me` `status`) | 7 | 3 | 24 | 24 |
@@ -89,12 +88,12 @@ upper bounds can be compared with the measured worst case.
 | Push wake claim, the thread's parent muted (passed over) | 10 | 2 | 94 | 160 |
 | Gone push subscription forget (one primary-key row) | 4 | 3 | 20 | 22 |
 | Push reply author lookup | 5 | 2 | 16 | 8 |
-| Push wake claim for a reply (creates the recipient counter) | 15 | 9 | 94 | 160 |
+| Push wake claim for a reply (creates the recipient counter) | 20 | 16 | 94 | 160 |
 | Message create with request ID | 33 | 37 | 296 | 120 |
 | Empty new message (not logged) | 4 | 2 | 16 | 8 |
 | Deduplicated mutation retry | 5 | 2 | 32 | 16 |
 | Reaction set | 27 | 27 | 296 | 120 |
-| Thread room create by a registered user (stores and logs the membership) | 28 | 35 | 296 | 120 |
+| Thread room create by a registered user (counts the creator's live threads; stores and logs the membership) | 30 | 35 | 414 | 120 |
 | Thread room save | 21 | 19 | 296 | 120 |
 | Message move with one reaction set | 27 | 32 | 296 | 280 |
 | Registered name mutation | 23 | 19 | 296 | 120 |
@@ -333,11 +332,10 @@ in the same row, so filtering by scope costs no extra rows. The wake claim then 
 one read of its mute, and an unregistered one about one more of its live
 index range, and a registered one also
 reads its wake time for the room and its recipient counter, and the
-sender's counter once. A message that wakes someone writes each woken user's
-wake time and recipient counter, and the server's counter: 19 writes for the
-day's first wake (counter rows created), about 9 after. The sender's counter
-is written after delivery, once per message with delivered pushes (9 writes
-the first time a day, fewer after). A message whose candidates have no live
+server's and sender's counters once. A message that wakes someone writes
+each woken user's wake time and recipient counter, and the server's and the
+sender's counters, charged as the pushes are claimed, delivered or not: 26
+writes for the day's first wake (counter rows created), about 11 after. A message whose candidates have no live
 registrations, or are all coalesced, writes nothing; one that mentions no
 one idle or gone does no push SQL. The reservation covers 32 candidates at
 5 registrations each (888 reads) and `wakesPerMessage` wake rows and

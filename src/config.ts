@@ -257,6 +257,9 @@ function validateLimits(limits: Limits): void {
 	if (limits.cleanupBatch > budget.MAX_CLEANUP_BATCH || limits.threadLimit > budget.MAX_THREAD_LIMIT || limits.threadMetadataBytes > budget.MAX_THREAD_METADATA_BYTES) {
 		fail("metadata or cleanup exceeds calibrated bounds");
 	}
+	if (!Number.isSafeInteger(limits.threadsPerUser) || limits.threadsPerUser < 1 || limits.threadsPerUser > limits.threadLimit) {
+		fail("threadsPerUser must be between 1 and threadLimit");
+	}
 	if (limits.reactionUsersPerMessage > budget.MAX_REACTION_USERS_PER_MESSAGE || limits.reactionEmojisPerUser > budget.MAX_REACTION_EMOJIS_PER_USER) {
 		fail("reaction policy exceeds calibrated bounds");
 	}

@@ -79,6 +79,8 @@ export const FREE_PLAN: Plan = Object.freeze({
 		databaseResumeLowWaterBytes: 80 * 1024 * 1024,
 		cleanupBatch: 100,
 		threadLimit: 100,
+		// So one account cannot take every thread slot: a quarter of them.
+		threadsPerUser: 25,
 		threadMetadataBytes: 2 * 1024,
 		reactionUsersPerMessage: 32,
 		reactionEmojisPerUser: 8,

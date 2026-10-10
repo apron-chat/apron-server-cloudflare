@@ -505,6 +505,7 @@ function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		maxNameCodePoints: limits.maxNameCodePoints,
 		maxEmbeds: limits.maxEmbeds,
 		maxThreads: limits.threadLimit,
+		maxThreadsPerUser: limits.threadsPerUser,
 		maxThreadMetadataBytes: limits.threadMetadataBytes,
 		reactionUsersPerMessage: limits.reactionUsersPerMessage,
 		reactionEmojisPerUser: limits.reactionEmojisPerUser,
@@ -986,9 +987,9 @@ export async function fetchEntry(request: Request, env: Env, ctx?: ExecutionCont
  */
 async function handleUploadWrite(request: Request, env: Env, token: string): Promise<Response> {
 	// Any origin may write: the token is the credential, and no cookie is sent.
-	const cors = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "PUT, OPTIONS", "Access-Control-Allow-Headers": "Content-Type", "Access-Control-Max-Age": "86400" };
-	const answer = (status: number, message?: string): Response => {
-		const response = message === undefined ? new Response(null, { status }) : responseError(status, message);
+	const cors = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "PUT, OPTIONS", "Access-Control-Allow-Headers": "Content-Type", "Access-Control-Expose-Headers": "Retry-After", "Access-Control-Max-Age": "86400" };
+	const answer = (status: number, message?: string, retryAfter?: number): Response => {
+		const response = message === undefined ? new Response(null, { status }) : responseError(status, message, retryAfter);
 		const headers = new Headers(response.headers);
 		for (const [name, value] of Object.entries(cors)) headers.set(name, value);
 		return new Response(response.body, { status: response.status, headers });
@@ -1011,7 +1012,9 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 	if (length > grant.maxBytes) return answer(413, `An upload here is at most ${grant.maxBytes} bytes`);
 	const stub = env.DEMO.getByName(OBJECT_NAME);
 	try {
-		if (!await stub.claimUpload(grant.key)) return answer(409, "This write_url was already used or has expired");
+		const claimed = await stub.claimUpload(grant.key);
+		if (claimed === "closed") return answer(429, "Uploads are closed until the daily reset", 86_400_000 - Date.now() % 86_400_000);
+		if (!claimed) return answer(409, "This write_url was already used or has expired");
 	} catch {
 		return answer(503, "Demo capacity reached");
 	}
@@ -3713,7 +3716,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Pushes a message's wake for `reasons` once `pushDelaySeconds` is over
-	 * (see pendingWakes), or at once without a wait.
+	 * (see pendingWakes), with the message as it is then (keepReasons), or at
+	 * once without a wait.
 	 */
 	private scheduleWake(message: MessageSnapshot, reasons: Map<string, number>, others?: string[]): void {
 		const wake: PendingWake = { message, reasons, ...(others ? { others } : {}) };
@@ -3727,9 +3731,30 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.pendingWakes.delete(wake);
 			const now = nowMs();
 			for (const userId of [...wake.reasons.keys()]) if (this.attended(userId, now)) wake.reasons.delete(userId);
-			if (wake.reasons.size) this.sendWake(wake);
+			if (!wake.reasons.size) return;
+			// The message as it is now: one deleted, expired, or gone with its
+			// room during the wait is not pushed, and an edit is pushed as edited.
+			const current = this.heldMessage(message.message_id, now);
+			if (!current) return;
+			if (current.log_id !== message.log_id && !wake.others) this.keepReasons(wake.reasons, message, current);
+			if (wake.reasons.size) this.sendWake({ ...wake, message: current });
 		}, delay);
 		this.pendingWakes.add(wake);
+	}
+
+	/**
+	 * Narrows a wake's reasons to what an edit made during the wait left: a
+	 * mention only for a user it still mentions, a reply only while it still
+	 * replies to the same message. Users left with no reason are dropped.
+	 */
+	private keepReasons(reasons: Map<string, number>, before: MessageSnapshot, after: MessageSnapshot): void {
+		const mentions = new Set(Array.isArray(after.body?.mentions) ? after.body.mentions : []);
+		const sameReply = after.reply_to?.message_id === before.reply_to?.message_id;
+		for (const [userId, reason] of reasons) {
+			const kept = (mentions.has(userId) ? reason & WAKE_SCOPES.mentions : 0) | (sameReply ? reason & WAKE_SCOPES.replies : 0);
+			if (kept) reasons.set(userId, kept);
+			else reasons.delete(userId);
+		}
 	}
 
 	/**
@@ -3867,18 +3892,18 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return true;
 		}
 		if (claimed.skipped) console.warn(JSON.stringify({ event: "push_allowance_reached", skipped: claimed.skipped }));
-		if (claimed.subscriptions.length) this.ctx.waitUntil(this.deliverPushes(claimed.subscriptions, message, vapid, policy.ttlSeconds, sender));
+		if (claimed.subscriptions.length) this.ctx.waitUntil(this.deliverPushes(claimed.subscriptions, message, vapid, policy.ttlSeconds));
 		return claimed.subscriptions.length > 0 || claimed.skipped > 0;
 	}
 
 	/**
 	 * Pushes a message to each registration at once, each payload carrying
-	 * that registration's `push_id`; charges the sender for those delivered;
-	 * and forgets those whose push service says they are gone (404 or 410) or
-	 * refuses this server's key (403). Other failures are only logged: the
+	 * that registration's `push_id` (the sender was charged for each when it
+	 * was claimed), and forgets those whose push service says they are gone
+	 * (404 or 410) or refuses this server's key (403). Other failures are only logged: the
 	 * push is lost, not retried.
 	 */
-	private async deliverPushes(subscriptions: readonly PushSubscriptionRecord[], message: MessageSnapshot, vapid: VapidKeys, ttlSeconds: number, senderId: string): Promise<void> {
+	private async deliverPushes(subscriptions: readonly PushSubscriptionRecord[], message: MessageSnapshot, vapid: VapidKeys, ttlSeconds: number): Promise<void> {
 		const payloads = new Map<string | undefined, string>();
 		const payloadFor = (pushId: string | undefined): string => {
 			let payload = payloads.get(pushId);
@@ -3890,25 +3915,22 @@ export class ApronDemoServer extends DurableObject<Env> {
 			sendWebPush(subscription, payloadFor(subscription.pushId), vapid, { ttlSeconds, urgency: "high", nowMs: nowMs() })));
 		const gone: Array<{ userId: string; url: string; p256dh: string }> = [];
 		let failed = 0;
-		let delivered = 0;
 		outcomes.forEach((outcome, index) => {
 			const { userId, url, p256dh } = subscriptions[index];
 			const status = outcome.status === "fulfilled" ? outcome.value.status : 0;
-			if (status >= 200 && status < 300) delivered++;
+			if (status >= 200 && status < 300) return;
 			// 404 and 410: the subscription is gone (RFC 8030). 403: the push
 			// service refuses this server's VAPID key for it, so it was made with
 			// another one; the configuration check proves the key pair matches, so
 			// no push to it will ever succeed. The client registers again on its
 			// next connection, with a subscription for the current key.
-			else if (outcome.status === "fulfilled" && (outcome.value.gone || status === 403)) gone.push({ userId, url, p256dh });
+			if (outcome.status === "fulfilled" && (outcome.value.gone || status === 403)) gone.push({ userId, url, p256dh });
 			else failed++;
 		});
 		if (failed) console.warn(JSON.stringify({ event: "push_delivery_failed", failed, sent: subscriptions.length }));
 		try {
-			// The sender pays for delivered pushes only (`pushesPerSenderDay`).
-			this.store.chargePushSender(senderId, delivered, nowMs());
 			if (gone.length) this.store.forgetPushSubscriptions(gone, nowMs());
-		} catch { /* a failed charge or delete is retried by nothing: the next push tries again */ }
+		} catch { /* a failed delete is retried by nothing: the next push tries again */ }
 	}
 
 	/**
@@ -4264,6 +4286,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			throw { name: "invalid_params", message: `No user has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
 		}
 		const userIds = isBotId(userId) ? [userId] : [userId, BOT_ID_PREFIX + userId];
+		// The rooms they are in, stored or on their connections, read before
+		// those close: a thread the purge leaves nobody in is removed after it.
+		const rooms = new Set<string>();
+		for (const id of userIds) for (const roomId of [...(this.liveRoomsOf(id) ?? []), ...(this.store.getIdentity(id)?.rooms ?? [])]) rooms.add(roomId);
 		for (const id of userIds) {
 			for (const peer of this.connectionsOf(id)) {
 				const state = connectionAttachment(peer);
@@ -4274,6 +4300,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		await this.runMutation(async () => {
 			purged = this.store.purgeUsers({ userIds, now: nowMs() });
 		});
+		for (const roomId of rooms) this.removeIfEmpty(roomId);
 		this.deleteMedia(purged.deletedUploads);
 		await this.forgetTokens(userIds);
 		const uploads = purged.deletedUploads.length;
@@ -4862,16 +4889,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * After a leave, removes the thread when nobody is in it any more, whatever
-	 * messages it holds (Store.removeEmptyThread): no connection has it among
-	 * its rooms, a guest's included, and no registered member is stored.
-	 * Everyone has left it, so nobody is told. The leave stands whatever
-	 * happens here: a thread the store cannot remove for now expires with its
-	 * log as before.
+	 * After a leave or a `/purge`, removes the thread when nobody is in it any
+	 * more, whatever messages it holds (Store.removeEmptyThread): no open
+	 * connection has it among its rooms, a guest's included (one closing, as
+	 * a purged user's are, counts for nothing), and no registered member is
+	 * stored. Everyone has left it, so nobody is told. The leave stands
+	 * whatever happens here: a thread the store cannot remove for now expires
+	 * with its log as before.
 	 */
 	private removeIfEmpty(roomId: string): void {
 		if (roomId === ROOM_ID) return;
-		if (this.ctx.getWebSockets().some((ws) => connectionAttachment(ws as WebSocketConnection)?.rooms?.includes(roomId))) return;
+		if (this.ctx.getWebSockets().some((ws) => {
+			const state = connectionAttachment(ws as WebSocketConnection);
+			return !!state && !state.closing && !!state.rooms?.includes(roomId);
+		})) return;
 		try {
 			if (this.store.removeEmptyThread(roomId, nowMs())) this.noteRoom(roomId, false);
 		} catch { /* kept until its log expires */ }
@@ -5096,7 +5127,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * Called by the entry Worker before it stores a write (§4.8.3): whether
 	 * this upload is waiting for one. Only one request may write it.
 	 */
-	async claimUpload(key: string): Promise<boolean> {
+	async claimUpload(key: string): Promise<boolean | "closed"> {
 		return !!this.config.uploads && this.store.claimUpload(key, nowMs());
 	}
 

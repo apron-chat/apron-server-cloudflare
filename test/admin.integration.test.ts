@@ -404,6 +404,38 @@ it('a room\'s creator may remove anyone from it, across saves and /rename, until
 	} finally { admin.close(); bob.close(); carol.close(); dan.close(); }
 });
 
+it('/purge removes the threads it leaves empty, and retires the user_id so a session for it never signs in again', async () => {
+	const admin = await signedInAdmin();
+	const bobId = unique('bob');
+	const bob = await signedIn(bobId);
+	const carolId = unique('carol');
+	const carol = await signedIn(carolId);
+	const exists = (roomId: string) => runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.getRoom(roomId) !== null);
+	// A second session Bob keeps on another device.
+	const token = await runInDurableObject(stub(), (instance) =>
+		(instance as unknown as { issueSession(userId: string, origin: string, now: number): Promise<string> }).issueSession(bobId, 'http://localhost:5173', Date.now()));
+	try {
+		const alone = (await request(bob, 'alone', 'room_set', { parent_room_id: 'general', title: 'Alone' })).result.room_id;
+		const shared = (await request(bob, 'shared', 'room_set', { parent_room_id: 'general', title: 'Shared' })).result.room_id;
+		expect((await request(carol, 'join-shared', 'room_join', { room_id: shared })).result).toEqual({});
+
+		expect((await command(admin, 'purge', `/purge ${bobId}`)).frame.result).toEqual({});
+		// The thread only Bob was in goes with him; the one Carol is in stays.
+		expect(await exists(alone)).toBe(false);
+		expect(await exists(shared)).toBe(true);
+
+		// The user_id is never issued again, so the session cannot sign in as anyone.
+		const reissued = await command(admin, 'reissue', `/invite-token ${bobId}`);
+		expect(reissued.frame.error.code).toBe(-32602);
+		expect(reissued.frame.error.message).toContain('is taken');
+		const device = await connect();
+		try {
+			await device.next();
+			expect((await request(device, 'resume', 'auth', { scheme: 'token', token })).error.code).toBe(-32001);
+		} finally { device.close(); }
+	} finally { admin.close(); bob.close(); carol.close(); }
+});
+
 it('removes a thread when the last one in it leaves, with any messages in it', async () => {
 	const bobId = unique('bob');
 	const bob = await signedIn(bobId);

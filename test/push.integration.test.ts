@@ -981,6 +981,37 @@ describe('push delay', () => {
 			alice.close(); bob.close();
 		}
 	});
+
+	it('pushes a message as it is when the wait ends: not at all once deleted, and an edit only to those it still mentions', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId, carolId] = [unique('alice'), unique('bob'), unique('carol')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		const carol = await signedIn(carolId);
+		try {
+			const bobSub = await subscribe(bob, 'bob');
+			await subscribe(carol, 'carol');
+			for (const peer of [bob, carol]) await setIdle(peer, true);
+			await setDelay(1);
+			// Deleted within the wait: the text it had is never pushed.
+			const secret = (await post(alice, 'secret', { room_id: 'general', body: { text: 'oops, a secret', mentions: [bobId] } })).result.message_id;
+			await post(alice, 'delete', { message_id: secret, room_id: 'general', deleted: true });
+			await waitOut();
+			expect(pushes).toEqual([]);
+			// Edited within the wait: pushed as edited, to Bob, whom it still mentions, and not to Carol.
+			const typo = (await post(alice, 'typo', { room_id: 'general', body: { text: 'hi bob and carol', mentions: [bobId, carolId] } })).result.message_id;
+			await post(alice, 'edit', { message_id: typo, room_id: 'general', body: { text: 'hi bob', mentions: [bobId] } });
+			await waitOut();
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(pushes[0].url).toBe(bobSub.url);
+			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.body.text).toBe('hi bob');
+			await waitOut();
+			expect(pushes).toHaveLength(1);
+		} finally {
+			await setDelay(0);
+			alice.close(); bob.close(); carol.close();
+		}
+	}, 15_000);
 });
 
 describe('held wakes', () => {
@@ -1215,7 +1246,7 @@ describe('security review fixes', () => {
 		} finally { peer.close(); }
 	});
 
-	it('forgets a registration its push service refuses with 403, and charges the sender only for delivered pushes', async () => {
+	it('forgets a registration its push service refuses with 403, and charges the sender for pushes that fail too', async () => {
 		const pushes = capturePushes((url) => url.includes('/refused-') ? 403 : url.includes('/failing-') ? 500 : 201);
 		const [aliceId, bobId, carolId] = [unique('alice'), unique('bob'), unique('carol')];
 		const alice = await signedIn(aliceId);
@@ -1230,8 +1261,10 @@ describe('security review fixes', () => {
 			await vi.waitFor(() => expect(pushes).toHaveLength(2), { timeout: 5_000 });
 			await vi.waitFor(async () => expect(await subscriptionsOf(bobId)).toEqual([]), { timeout: 5_000 });
 			expect(await subscriptionsOf(carolId)).toHaveLength(1);
-			// Neither push was delivered, so Alice was charged nothing.
-			expect(await senderCharged(aliceId)).toBe(0);
+			// Neither push was delivered, but both were claimed, so Alice was
+			// charged for both: failing registrations cannot spend the server's
+			// pushes at no cost to the sender.
+			expect(await senderCharged(aliceId)).toBe(2);
 		} finally { alice.close(); }
 	});
 
@@ -1418,7 +1451,7 @@ describe('push subscriptions in the store', () => {
 		});
 	});
 
-	it('charges senders only for delivered pushes, and caps what one recipient gets a day', async () => {
+	it('charges senders for every push claimed, delivered or not, and caps what one recipient gets a day', async () => {
 		const keys = await browserKeys();
 		await withStore('push-sender', { push: { ...POLICY, pushesPerSenderDay: 3, pushesPerRecipientDay: 3, coalesceSeconds: 1 } }, (store, clock, state) => {
 			atMidday(clock);
@@ -1426,21 +1459,24 @@ describe('push subscriptions in the store', () => {
 				registerUser(store, clock, userId);
 				for (const n of [1, 2]) store.registerPushSubscription({ userId, url: `https://push.example.net/${userId}/${n}`, ...keys, now: clock.value });
 			}
-			// Claims alone, never delivered, cost the sender nothing: Sam's 3 pushes
-			// to Fi are all claimed, the third cut by Fi's recipient cap of 3.
+			// Claims are charged whether or not they are ever delivered, so
+			// registrations that always fail cannot spend the server's day for a
+			// sender: Sam's 3 pushes to Fi use up Sam's allowance and Fi's.
 			expect(claim(store, clock, ['fi'], 'room-0', 'sam').subscriptions).toHaveLength(2);
 			clock.value += 2_000;
 			expect(claim(store, clock, ['fi'], 'room-1', 'sam')).toMatchObject({ subscriptions: [expect.anything()], skipped: 1 });
 			clock.value += 2_000;
 			// Fi has had 3 pushes today: no more, from anyone.
 			expect(claim(store, clock, ['fi'], 'room-2', 'tess')).toMatchObject({ subscriptions: [], skipped: 2 });
-			// Sam's delivered pushes reach the sender cap: Sam wakes no one more today.
-			store.chargePushSender('sam', 3, clock.value);
+			// Sam's claims reached the sender cap: Sam wakes no one more today.
 			expect(claim(store, clock, ['gil'], 'general', 'sam')).toMatchObject({ subscriptions: [], skipped: 2 });
 			expect(claim(store, clock, ['gil'], 'general', 'tess').subscriptions).toHaveLength(2);
-			// A message cannot claim past the sender's allowance either.
-			store.chargePushSender('uma', 2, clock.value);
-			expect(claim(store, clock, ['hu'], 'general', 'uma').subscriptions).toHaveLength(1);
+			// One message cannot claim past the sender's allowance either: Hu's
+			// two, then one of Gil's, and Uma's 3 are spent.
+			expect(claim(store, clock, ['hu', 'gil'], 'room-3', 'uma')).toMatchObject({ subscriptions: [expect.anything(), expect.anything(), expect.anything()], skipped: 1 });
+			// A new day restores both.
+			clock.value += DAY;
+			expect(claim(store, clock, ['fi'], 'room-0', 'sam').subscriptions).toHaveLength(2);
 			expect(store.accountingStatus().unsafe).toBe(false);
 		});
 	});
@@ -1540,7 +1576,8 @@ describe('push subscriptions in the store', () => {
 			expect(store.statusInputs('mo', clock.value)).toEqual({ choice: 'online', roomMutes: [] });
 			expect(store.statusInputs('moe', clock.value)).toEqual({ choice: 'invisible', muteUntil: MUTE_FOREVER, roomMutes: [{ roomId: 'general', untilMs: MUTE_FOREVER }] });
 			store.purgeUsers({ userIds: ['moe'], now: clock.value });
-			registerUser(store, clock, 'moe');
+			// The purged user_id is retired, and nothing of theirs is left.
+			expect(() => registerUser(store, clock, 'moe')).toThrow('identity already exists');
 			expect(store.statusInputs('moe', clock.value)).toEqual({ choice: 'online', roomMutes: [] });
 			expect(store.setMute({ userId: 'moe', untilMs: null, now: clock.value })).toEqual({ changed: false });
 			// Back to the defaults, the row goes.
