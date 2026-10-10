@@ -234,11 +234,11 @@ function validateLimits(limits: Limits): void {
 	if (limits.globalPostsPerMinute > budget.MAX_GLOBAL_POSTS_PER_MINUTE || limits.globalPostsPerDay > budget.MAX_GLOBAL_POSTS_PER_DAY || limits.globalPostsPerMinute > limits.globalPostsPerDay) {
 		fail("global posting policy exceeds the demo ceiling");
 	}
-	if (limits.anonymousPostsPerMinute > limits.anonymousPostsPerDay || limits.registeredPostsPerMinute > limits.registeredPostsPerDay || limits.ipPostsPerMinute > limits.ipPostsPerDay || limits.moderatorPostsPerMinute > limits.moderatorPostsPerDay) {
+	if (limits.anonymousPostsPerMinute > limits.anonymousPostsPerDay || limits.registeredPostsPerMinute > limits.registeredPostsPerDay || limits.ipPostsPerMinute > limits.ipPostsPerDay || limits.trustedPostsPerMinute > limits.trustedPostsPerDay) {
 		fail("posting minute limit exceeds its daily limit");
 	}
-	if (limits.moderatorPostsPerMinute < limits.registeredPostsPerMinute || limits.moderatorPostsPerDay < limits.registeredPostsPerDay) {
-		fail("moderator posting limits must be at least the registered ones");
+	if (limits.trustedPostsPerMinute < limits.registeredPostsPerMinute || limits.trustedPostsPerDay < limits.registeredPostsPerDay) {
+		fail("trusted posting limits must be at least the registered ones");
 	}
 	if (limits.registrationsPerIpDay > limits.registrationsPerDay || limits.registrationsPerDay > budget.MAX_REGISTRATIONS_PER_DAY) {
 		fail("registration policy exceeds the demo ceiling");
@@ -256,6 +256,9 @@ function validateLimits(limits: Limits): void {
 	}
 	if (limits.cleanupBatch > budget.MAX_CLEANUP_BATCH || limits.threadLimit > budget.MAX_THREAD_LIMIT || limits.threadMetadataBytes > budget.MAX_THREAD_METADATA_BYTES) {
 		fail("metadata or cleanup exceeds calibrated bounds");
+	}
+	if (!Number.isSafeInteger(limits.threadsPerUser) || limits.threadsPerUser < 1 || limits.threadsPerUser > limits.threadLimit) {
+		fail("threadsPerUser must be between 1 and threadLimit");
 	}
 	if (limits.reactionUsersPerMessage > budget.MAX_REACTION_USERS_PER_MESSAGE || limits.reactionEmojisPerUser > budget.MAX_REACTION_EMOJIS_PER_USER) {
 		fail("reaction policy exceeds calibrated bounds");

@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import { MAX_CREATED_ROOMS, RETENTION_MS, Store, StoreError, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
+import { MAX_CREATED_ROOMS, MOVE_REACTION_SETS_PER_POST, RETENTION_MS, Store, StoreError, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
 import { errorCode, expectRetryAfter, messagesOf, withStore as withNamedStore, type TestClock } from "./helpers/store";
 
 // Semantics tests use roomy posting windows; quota tests below use tiny ones.
@@ -340,6 +340,74 @@ it("denies thread creation beyond the thread ceiling", async () => {
 			expect((error as StoreError).message).toBe("thread_limit");
 		}
 	}, { ...ROOMY, maxThreads: 1 });
+});
+
+it("caps the live threads one registered user created; removed and expired ones stop counting", async () => {
+	await withStore("thread-per-user", (store, clock) => {
+		for (const userId of ["alice", "bob"]) {
+			store.registerIdentity({
+				userId, name: userId, userHandle: `handle-${userId}`, now: clock.value, ipKey: `ip-${userId}`,
+				credential: { credentialId: `cred-${userId}`, userId, publicKey: "AAAA", counter: 0 },
+			});
+		}
+		const first = thread(store, clock, "first");
+		thread(store, clock, "second");
+		let error: unknown;
+		try { thread(store, clock, "third"); } catch (caught) { error = caught; }
+		expect((error as StoreError).code).toBe("denied");
+		expect((error as StoreError).message).toMatch(/at most 2 threads/);
+		// Each user has their own allowance, and a guest's threads (no creator) count only against the ceiling.
+		store.mutate(op(clock, "bob", "bobs", "room_set", { parent_room_id: "general", title: "Bob's" }));
+		for (const n of [1, 2, 3]) store.mutate(op(clock, "guest_1", `guest-${n}`, "room_set", { parent_room_id: "general", title: "Guest's" }));
+		// A thread removed when its last member leaves stops counting.
+		store.changeMembership({ userId: "alice", ipKey: "ip-alice", roomId: first, join: false, now: clock.value });
+		expect(store.removeEmptyThread(first, clock.value)).toBe(true);
+		thread(store, clock, "after-removal");
+		expect(errorCode(() => thread(store, clock, "full-again"))).toBe("denied");
+		// So do threads whose history expired, once cleanup removes them.
+		clock.value += 25 * 60 * 60_000;
+		for (let run = 0; run < 8 && store.listRooms().length > 1; run += 1) clock.value = Math.max(clock.value, store.runCleanup(clock.value).next_due_ms) + 1;
+		expect(store.listRooms().map((room) => room.room_id)).toEqual(["general"]);
+		thread(store, clock, "after-expiry-1");
+		thread(store, clock, "after-expiry-2");
+		expect(errorCode(() => thread(store, clock, "after-expiry-3"))).toBe("denied");
+	}, { ...ROOMY, retentionMs: 60_000, maxThreadsPerUser: 2 });
+});
+
+it("charges a move one more post per MOVE_REACTION_SETS_PER_POST reaction sets it re-logs, refusing it whole past a limit", async () => {
+	await withStore("move-charge", (store, clock, state) => {
+		store.registerIdentity({
+			userId: "alice", name: "Alice", userHandle: "handle-alice", now: clock.value, ipKey: "ip-alice",
+			credential: { credentialId: "cred-alice", userId: "alice", publicKey: "AAAA", counter: 0 },
+		});
+		const posted = () => Number(state.storage.sql.exec<{ posts_day: number }>("SELECT posts_day FROM principal_limits WHERE scope = 'post' AND principal_key = 'user:alice'").one().posts_day);
+		const reactedBy = (messageId: string, count: number) => {
+			for (let n = 0; n < count; n += 1) store.mutate(op(clock, `guest_${messageId}_${n}`, `react-${messageId}-${n}`, "reactions", { message_id: messageId, emojis: ["👍"] }));
+		};
+		const few = String(post(store, clock, "alice", "few", { body: { text: "a few reactors" } }).result.message_id);
+		const many = String(post(store, clock, "alice", "many", { body: { text: "many reactors" } }).result.message_id);
+		reactedBy(few, MOVE_REACTION_SETS_PER_POST - 1);
+		reactedBy(many, 2 * MOVE_REACTION_SETS_PER_POST);
+		const threadId = thread(store, clock, "thread");
+		expect(posted()).toBe(3);
+		// Fewer sets than MOVE_REACTION_SETS_PER_POST: one post, as any edit.
+		post(store, clock, "alice", "move-few", { message_id: few, room_id: threadId, body: { text: "a few reactors" } });
+		expect(posted()).toBe(4);
+		// Twice as many: two more.
+		post(store, clock, "alice", "move-many", { message_id: many, room_id: threadId, body: { text: "many reactors" } });
+		expect(posted()).toBe(7);
+		// Moving it back would take Alice past her 9 a minute: refused whole, it stays where it is.
+		const head = store.logBounds().latest_log_id;
+		let error: unknown;
+		try { post(store, clock, "alice", "move-back", { message_id: many, room_id: "general", body: { text: "many reactors" } }); } catch (caught) { error = caught; }
+		expectRetryAfter(error);
+		expect(posted()).toBe(7);
+		expect(store.logBounds().latest_log_id).toBe(head);
+		// A minute later it moves.
+		clock.value += 60_001;
+		post(store, clock, "alice", "move-back-later", { message_id: many, room_id: "general", body: { text: "many reactors" } });
+		expect(posted()).toBe(10);
+	}, { ...ROOMY, registeredPostsPerMinute: 9 });
 });
 
 it("moves a message into both rooms' logs and re-logs its reactions in the destination", async () => {

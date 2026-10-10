@@ -163,7 +163,7 @@ within it:
   attended (every one idle, stale, or closed) and neither a mute of
   theirs nor a `dnd` status silences it: at most 10 users with
   registrations a message, once a minute per user and room, 100 pushes a day
-  per recipient, 200 delivered pushes a day per sender, and 5,000 pushes a
+  per recipient, 200 pushes a day per sender (delivered or not), and 5,000 pushes a
   day in all. Guests' messages wake no one
   (see
   [SPEC section 4.4](../SPEC.md#44-push)). The push carries

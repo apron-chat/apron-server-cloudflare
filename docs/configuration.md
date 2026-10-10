@@ -199,8 +199,8 @@ in `src/plans/paid.ts` sets the limits:
 | --- | ---: |
 | `maxFileBytes` | 5 MB |
 | `maxAvatarBytes` | 256 KB |
-| `uploadsPerDay` (server-wide, avatars included) | 500 |
-| `uploadsPerUserDay` | 20 |
+| `uploadsPerDay` (server-wide, avatars included; counted when a write is claimed) | 500 |
+| `uploadsPerUserDay` (counted when an upload starts) | 20 |
 | `writeWindowSeconds` | 10 minutes |
 | `fileRetentionSeconds` | 7 days |
 | `avatarRetentionSeconds` | 30 days |
@@ -264,7 +264,7 @@ with the client's optional registration `push_id` in each push; see
 | --- | ---: | ---: |
 | `pushesPerDay` (server-wide, one per registration woken) | 5,000 | 1,000 |
 | `wakesPerMessage` (users with live registrations one message may wake) | 10 | 10 |
-| `pushesPerSenderDay` (pushes one sender's messages may get delivered, 2xx only) | 200 | 50 |
+| `pushesPerSenderDay` (pushes one sender's messages may claim, delivered or not) | 200 | 50 |
 | `pushesPerRecipientDay` (pushes one user may receive) | 100 | 100 |
 | `coalesceSeconds` (a user is woken for a room at most once in this window) | 60 | 60 |
 | `delaySeconds` (how long a message's wake waits before it pushes; a user who sends `idle: false` or posts in the room meanwhile, or is attended when it ends, is not pushed) | 30 | 30 |
@@ -466,7 +466,9 @@ them. Cleanup and deduplication run in bounded batches/records, while
 `foreground*` and `maintenance*` are daily SQL operation budgets.
 
 `threadLimit` counts thread rooms (rooms with a `parent_room_id`) and the
-top-level rooms admins and mods create (at most 16 of them), and
+top-level rooms admins and mods create (at most 16 of them);
+`threadsPerUser` (at most `threadLimit`) caps the live threads one
+registered user has created, so one account cannot take every slot; and
 `threadMetadataBytes` bounds a room's serialized client fields (`title`,
 `description`, `ext`). A user's `ext` is at most 512 bytes serialized
 (`MAX_USER_EXT_BYTES` in `src/store.ts`, not configurable: every connection
@@ -503,7 +505,7 @@ The numeric rows are grouped by their unit and enforcement scope:
   `registeredIdentityCount`, `openConnections`, `anonymousConnectionsPerIp`,
   `registeredConnectionsPerUser`, `connectionsPerIp`,
   `pendingFramesPerConnection`, `repeatedPolicyViolations`, `cleanupBatch`,
-  `threadLimit`, `reactionUsersPerMessage`, `reactionEmojisPerUser`,
+  `threadLimit`, `threadsPerUser`, `reactionUsersPerMessage`, `reactionEmojisPerUser`,
   `limiterRecordCap`, `frameLease`, `roomListMembers`, `guestNumberBlock`,
   `activityMaxTypingSeconds`, `pingSeconds` (advertised as `server.ping`), `pingTimeoutSeconds`
   (seconds; the timeout must be at least twice the interval). `roomListMembers`
@@ -514,13 +516,13 @@ The numeric rows are grouped by their unit and enforcement scope:
   durable write reserves; see below.
 - Rolling minute budgets: `historyRequestsPerUserMinute`,
   `historyRequestsPerIpMinute`, `anonymousPostsPerMinute`,
-  `registeredPostsPerMinute`, `moderatorPostsPerMinute`, `ipPostsPerMinute`, `globalPostsPerMinute`,
+  `registeredPostsPerMinute`, `trustedPostsPerMinute`, `ipPostsPerMinute`, `globalPostsPerMinute`,
   `authAttemptsPerIpMinute`, `framesPerConnectionMinute`,
   `framesPerIpMinute`, `connectionAdmissionsPerIpMinute`,
   `globalFramesPerMinute` (server-wide, in memory),
   `roomListRequestsPerUserMinute` and `activityBroadcastsPerUserMinute` (per
   user across their connections).
-- UTC-day budgets: `anonymousPostsPerDay`, `registeredPostsPerDay`, `moderatorPostsPerDay`,
+- UTC-day budgets: `anonymousPostsPerDay`, `registeredPostsPerDay`, `trustedPostsPerDay`,
   `ipPostsPerDay`, `globalPostsPerDay`, `registrationsPerIpDay`,
   `registrationsPerDay`, `connectionAdmissionsPerDay`,
   `processedFramesPerDay`, `sqlWritesPerDay`, `sqlReadsPerDay`,
@@ -551,8 +553,8 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `anonymousPostsPerDay` | 200 | 100 |
 | `registeredPostsPerMinute` | 20 |  |
 | `registeredPostsPerDay` | 1000 | 500 |
-| `moderatorPostsPerMinute` | 50 |  |
-| `moderatorPostsPerDay` | 4000 | 2000 |
+| `trustedPostsPerMinute` | 50 |  |
+| `trustedPostsPerDay` | 4000 | 2000 |
 | `ipPostsPerMinute` | 30 |  |
 | `ipPostsPerDay` | 2000 | 1000 |
 | `globalPostsPerMinute` | 120 | 60 |
@@ -596,6 +598,7 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `databaseResumeLowWaterBytes` | 671088640 | 83886080 |
 | `cleanupBatch` | 100 |  |
 | `threadLimit` | 100 |  |
+| `threadsPerUser` | 25 |  |
 | `threadMetadataBytes` | 2048 |  |
 | `reactionUsersPerMessage` | 32 |  |
 | `reactionEmojisPerUser` | 8 |  |

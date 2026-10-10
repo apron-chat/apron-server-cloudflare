@@ -154,6 +154,8 @@ export interface StoreConfig {
   maxEmbeds: number;
   /** Thread rooms (rooms with a parent) that may exist at once. */
   maxThreads: number;
+  /** Live thread rooms one registered user may have created (`creator_id`) at once. */
+  maxThreadsPerUser: number;
   /** Serialized client fields of one room record. */
   maxThreadMetadataBytes: number;
   reactionUsersPerMessage: number;
@@ -167,9 +169,9 @@ export interface StoreConfig {
   anonymousPostsPerDay: number;
   registeredPostsPerMinute: number;
   registeredPostsPerDay: number;
-  /** A moderator's (MODERATOR_ROLES) posts, in place of the registered limits; also their IP's allowance, when larger. */
-  moderatorPostsPerMinute: number;
-  moderatorPostsPerDay: number;
+  /** A trusted user's posts (a registered user holding any role, which only an admin gives), in place of the registered limits; also their IP's allowance, when larger. */
+  trustedPostsPerMinute: number;
+  trustedPostsPerDay: number;
   ipPostsPerMinute: number;
   ipPostsPerDay: number;
   globalPostsPerMinute: number;
@@ -293,6 +295,7 @@ const DEFAULT_CONFIG: StoreConfig = {
   maxNameCodePoints: DEFAULT_LIMITS.maxNameCodePoints,
   maxEmbeds: DEFAULT_LIMITS.maxEmbeds,
   maxThreads: DEFAULT_LIMITS.threadLimit,
+  maxThreadsPerUser: DEFAULT_LIMITS.threadsPerUser,
   maxThreadMetadataBytes: DEFAULT_LIMITS.threadMetadataBytes,
   reactionUsersPerMessage: DEFAULT_LIMITS.reactionUsersPerMessage,
   reactionEmojisPerUser: DEFAULT_LIMITS.reactionEmojisPerUser,
@@ -305,8 +308,8 @@ const DEFAULT_CONFIG: StoreConfig = {
   anonymousPostsPerDay: DEFAULT_LIMITS.anonymousPostsPerDay,
   registeredPostsPerMinute: DEFAULT_LIMITS.registeredPostsPerMinute,
   registeredPostsPerDay: DEFAULT_LIMITS.registeredPostsPerDay,
-  moderatorPostsPerMinute: DEFAULT_LIMITS.moderatorPostsPerMinute,
-  moderatorPostsPerDay: DEFAULT_LIMITS.moderatorPostsPerDay,
+  trustedPostsPerMinute: DEFAULT_LIMITS.trustedPostsPerMinute,
+  trustedPostsPerDay: DEFAULT_LIMITS.trustedPostsPerDay,
   ipPostsPerMinute: DEFAULT_LIMITS.ipPostsPerMinute,
   ipPostsPerDay: DEFAULT_LIMITS.ipPostsPerDay,
   globalPostsPerMinute: DEFAULT_LIMITS.globalPostsPerMinute,
@@ -613,7 +616,18 @@ interface CommitContext {
   touched: Map<string, number>;
   /** Registered members each room gained (or, negative, lost) in this commit's memberships. */
   members?: Map<string, number>;
+  /** Posts this commit costs past the one every mutation is charged: a move's re-logged reaction sets (MOVE_REACTION_SETS_PER_POST). */
+  extraPosts?: number;
 }
+
+/**
+ * A move re-logs the moved message's reaction sets and rewrites each one's
+ * state row, about 4 written rows a set, so moving a message with many
+ * reactors costs several posts' worth of writes. Each this many sets add
+ * one post to the move's charge: a message with fewer reactors moves for one
+ * post, and the most reacted-to (32 sets) for five.
+ */
+export const MOVE_REACTION_SETS_PER_POST = 8;
 
 const ROOM_COLUMNS = "room_id, parent_room_id, created_log_id, record_log_id, latest_log_id, fields_json, created_ms, updated_ms, member_count";
 
@@ -723,7 +737,7 @@ export const MAX_CARRIED_PASSKEYS = 100;
  * `threader` grants that alone, for someone who tidies conversations into
  * threads; creating threads and saving any thread's title and description
  * are open to every participant already (commitRoom). Their posts count
- * against the moderator posting limits, not the registered ones
+ * against the trusted posting limits, not the registered ones
  * (chargePosting), since a move is one post per message.
  */
 export const MODERATOR_ROLES: readonly string[] = ["admin", "mod", "threader"];
@@ -767,6 +781,12 @@ function parseRoles(json: string | null | undefined): string[] {
  * new one, so the retired `user_id` is never reissued (protocol §3.3).
  */
 const META_RENAMED_PREFIX = "renamed:";
+/**
+ * `_meta` key prefix recording a `/purge`: `purged:<user_id>` retires the
+ * id, never reissued, so a passkey session still held for it (sessions are
+ * found by token, not by user) can never sign in as a later user given it.
+ */
+const META_PURGED_PREFIX = "purged:";
 
 /** The limiter scopes keyed by a registered user (`user:<user_id>`), which `/rename` moves. */
 const USER_LIMIT_SCOPES = ["post", "history", "upload", "push", "push_recipient"] as const;
@@ -2579,7 +2599,7 @@ export class Store {
 
   /**
    * Whether a `user_id` may not be issued: an identity has it, or `/rename`
-   * retired it. Registration picks ids with it.
+   * or `/purge` retired it. Registration picks ids with it.
    */
   userIdTaken(userId: string): boolean {
     this.ensureReady();
@@ -2587,7 +2607,7 @@ export class Store {
   }
 
   private idTaken(userId: string): boolean {
-    return this.identityRow(userId) !== null || this.metaValue(META_RENAMED_PREFIX + userId) !== "";
+    return this.identityRow(userId) !== null || this.metaValue(META_RENAMED_PREFIX + userId) !== "" || this.metaValue(META_PURGED_PREFIX + userId) !== "";
   }
 
   /**
@@ -2717,8 +2737,11 @@ export class Store {
    * memberships and membership records; their uploads; and their identity,
    * passkey, push subscription, status, mute, limiter and dedup rows. A logged record that
    * lists them beside others (a move's reaction sets) is rewritten without
-   * them. Rooms they created stay, without a creator, so a user later given
-   * the same `user_id` cannot remove their members. Clients that already have their content
+   * them. Rooms they created stay, without a creator. Each purged identity's
+   * `user_id` is retired (META_PURGED_PREFIX), never reissued, so neither a
+   * session still held for it nor a room it created carries over to anyone.
+   * Removing the threads it leaves empty is the caller's (removeIfEmpty), as
+   * it knows the connections still in them. Clients that already have their content
    * keep it until they load history again. Returns what went, and the R2
    * objects the caller deletes.
    */
@@ -2737,7 +2760,7 @@ export class Store {
     // Per user: memberships (live and awaiting a room purge), a day's dedup
     // rows, limiter rows, push subscriptions, credential and identity; each
     // deletion also updates its indexes.
-    const perUser = 64 + 4 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS) + 4 * Math.max(this.config.registeredPostsPerDay, this.config.moderatorPostsPerDay) + 4 * uploadsPerOwner +
+    const perUser = 64 + 4 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS) + 4 * Math.max(this.config.registeredPostsPerDay, this.config.trustedPostsPerDay) + 4 * uploadsPerOwner +
       4 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER);
     // Every room row is read for its creator, and each one theirs rewritten.
     const roomRows = MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS;
@@ -2780,7 +2803,8 @@ export class Store {
         ...ids,
       );
       const deletedUploads = this.releaseUploadRows(uploads);
-      const identities = this.rawRows<{ count: number }>(`SELECT COUNT(*) AS count FROM identities WHERE user_id IN (${marks})`, ...ids)[0]?.count ?? 0;
+      const retired = this.rawRows<{ user_id: string }>(`SELECT user_id FROM identities WHERE user_id IN (${marks})`, ...ids).map((row) => row.user_id);
+      const identities = retired.length;
       // Their rooms' member counts drop by the memberships deleted below.
       this.rawExec(
         `UPDATE rooms SET member_count = MAX(0, member_count - (SELECT COUNT(*) FROM memberships m WHERE m.room_id = rooms.room_id AND m.user_id IN (${marks})))
@@ -2792,7 +2816,8 @@ export class Store {
         this.rawExec(`DELETE FROM ${table} WHERE user_id IN (${marks})`, ...ids);
       }
       this.rawExec(`DELETE FROM principal_limits WHERE principal_key IN (${marks})`, ...ids.map((id) => `user:${id}`));
-      if (identities) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(Math.max(0, this.metaNumber("identity_count") - integerColumn(identities))));
+      for (const userId of retired) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, '1')", META_PURGED_PREFIX + userId);
+      if (identities) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(Math.max(0, this.metaNumber("identity_count") - identities)));
       return { messages: messages.length, reactions: integerColumn(reactions), deletedUploads };
     }));
   }
@@ -3028,23 +3053,28 @@ export class Store {
   }
 
   /**
-   * Charges one post to the poster's, the IP's and the global windows. A
-   * registered moderator (MODERATOR_ROLES, one identity read) is held to the
-   * moderator limits instead of the registered ones, and their IP to the
-   * larger of its own and those, so the IP's limits don't undercut them
-   * (moving a long conversation into a thread is one post per message).
-   * The global limits hold for everyone.
+   * Charges `weight` posts (one by default) to the poster's, the IP's and
+   * the global windows, or none when any of them lacks room for all of
+   * them. A trusted user, registered and holding any role (`friend`,
+   * MODERATOR_ROLES, or any label: only an admin gives roles; one identity
+   * read), is held to the trusted limits instead of the registered ones,
+   * and their IP to the larger of its own and those, so the IP's limits
+   * don't undercut them (moving a long conversation into a thread is one
+   * post per message, and more for one with many reactors:
+   * MOVE_REACTION_SETS_PER_POST). An owner's bot (tier `bot`) is never
+   * trusted. The global limits hold for everyone.
    */
-  private chargePosting(input: { userId: string; tier: Tier; ipKey: string; now: number }): void {
+  private chargePosting(input: { userId: string; tier: Tier; ipKey: string; now: number; weight?: number }): void {
     const { userId, tier, ipKey, now } = input;
-    const moderator = tier === "registered" && this.isModerator(userId);
-    const perUser = moderator
-      ? { minute: this.config.moderatorPostsPerMinute, day: this.config.moderatorPostsPerDay }
+    const weight = Math.max(1, input.weight ?? 1);
+    const trusted = tier === "registered" && this.holdsAnyRole(userId);
+    const perUser = trusted
+      ? { minute: this.config.trustedPostsPerMinute, day: this.config.trustedPostsPerDay }
       : tier === "registered"
         ? { minute: this.config.registeredPostsPerMinute, day: this.config.registeredPostsPerDay }
         : { minute: this.config.anonymousPostsPerMinute, day: this.config.anonymousPostsPerDay };
-    const perIp = moderator
-      ? { minute: Math.max(this.config.ipPostsPerMinute, this.config.moderatorPostsPerMinute), day: Math.max(this.config.ipPostsPerDay, this.config.moderatorPostsPerDay) }
+    const perIp = trusted
+      ? { minute: Math.max(this.config.ipPostsPerMinute, this.config.trustedPostsPerMinute), day: Math.max(this.config.ipPostsPerDay, this.config.trustedPostsPerDay) }
       : { minute: this.config.ipPostsPerMinute, day: this.config.ipPostsPerDay };
     const principal = tier === "registered" ? `user:${userId}` : `anonymous:${ipKey}`;
     const rows = [
@@ -3061,15 +3091,18 @@ export class Store {
       const previousEvents = events[index];
       const allowance = index === 0 ? perUser.minute : index === 1 ? perIp.minute : this.config.globalPostsPerMinute;
       const dailyAllowance = index === 0 ? perUser.day : index === 1 ? perIp.day : this.config.globalPostsPerDay;
-      if (previousEvents.length >= allowance) {
-        const retry = Math.max(1, previousEvents[previousEvents.length - allowance] + POST_WINDOW_MS - now);
+      // Room for `weight` more once enough of the window's events age out; a
+      // weight past the whole allowance waits for the window to empty.
+      const room = Math.max(0, allowance - weight);
+      if (previousEvents.length > room) {
+        const retry = Math.max(1, previousEvents[previousEvents.length - room - 1] + POST_WINDOW_MS - now);
         if (retry > retryAfterMs) {
           retryAfterMs = retry;
           reason = index === 0 && tier === "anonymous" ? "Guest posting limit reached" : "Posting limit reached";
         }
       }
       const count = row.day === daily ? row.posts_day : 0;
-      if (count >= dailyAllowance) {
+      if (count + weight > dailyAllowance) {
         const retry = Math.max(1, 86_400_000 - now % 86_400_000);
         if (retry > retryAfterMs) {
           retryAfterMs = retry;
@@ -3080,8 +3113,8 @@ export class Store {
     if (retryAfterMs > 0) throw new StoreError("retry_after", reason, { retryAfterMs });
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index];
-      const nextEvents = [...events[index], now];
-      const dailyCount = row.day === daily ? row.posts_day + 1 : 1;
+      const nextEvents = [...events[index], ...new Array<number>(weight).fill(now)];
+      const dailyCount = (row.day === daily ? row.posts_day : 0) + weight;
       this.updateLimitRow(row, {
         post_events_json: JSON.stringify(nextEvents),
         day: daily,
@@ -3471,6 +3504,18 @@ export class Store {
   /** Whether a registered user holds a moderator role (MODERATOR_ROLES), from the identity row. */
   private isModerator(userId: string): boolean {
     return this.holdsRole(userId, MODERATOR_ROLES);
+  }
+
+  /**
+   * Whether a registered user holds any role, from the identity row: only an
+   * admin gives roles, so this is who posts under the trusted limits
+   * (chargePosting). `friend` is the role that grants that alone, for
+   * someone an admin trusts without moderating powers. An owner's bot (tier
+   * `bot`) never counts.
+   */
+  private holdsAnyRole(userId: string): boolean {
+    const identity = this.identityRow(userId);
+    return identity?.tier === "registered" && parseRoles(identity.roles_json).length > 0;
   }
 
   /** Whether a registered user holds one of `roles`, from the identity row. */
@@ -3932,6 +3977,7 @@ export class Store {
         messageId, floor, this.config.reactionUsersPerMessage,
       );
       if (rows.length) {
+        context.extraPosts = Math.floor(rows.length / MOVE_REACTION_SETS_PER_POST);
         const reactionLogId = this.allocateLogId(context);
         const record: ReactionsRecord = {
           log_id: idString(reactionLogId),
@@ -3999,8 +4045,11 @@ export class Store {
 
   /**
    * Starts an upload (protocol §4.8.3) for a registered user: charges the
-   * user's and the server's daily upload counts, and reserves the largest
-   * size against the stored-bytes cap until the write reports its size.
+   * user's daily upload count, and reserves the largest size against the
+   * stored-bytes cap until the write reports its size. The server's daily
+   * count is only checked here: it is charged when a write is claimed
+   * (claimUpload), so uploads started and never written cannot close
+   * uploads for everyone.
    */
   private startUpload(purpose: UploadPurpose, userId: string, now: number, link: { messageId?: string; embedId: string }): PendingUpload {
     const policy = this.config.uploads;
@@ -4018,7 +4067,7 @@ export class Store {
     if (stored + maxBytes > policy.storedBytesCap) {
       throw new StoreError("retry_after", "Upload storage is full; try again later", { retryAfterMs: 3_600_000 });
     }
-    rows.forEach((row, index) => this.updateLimitRow(row, { day, uploads_day: counts[index] + 1 }, now));
+    this.updateLimitRow(rows[0], { day, uploads_day: counts[0] + 1 }, now);
     this.setUploadBytes(stored + maxBytes);
     const key = `${purpose === "file" ? "f" : "a"}/${randomKey()}`;
     const writeExpiresMs = now + policy.writeWindowSeconds * 1_000;
@@ -4129,13 +4178,25 @@ export class Store {
   /**
    * Claims a pending upload's write for the one request that arrived in its
    * window, before any byte reaches R2: a `write_url` used again is refused,
-   * so it cannot overwrite a finished upload.
+   * so it cannot overwrite a finished upload. The claim is charged to the
+   * server's daily upload count (`uploadsPerDay`); past it, `"closed"`, and
+   * the upload stays pending until it is written after the daily reset or
+   * its window closes.
    */
-  claimUpload(key: string, now = this.clock.now()): boolean {
+  claimUpload(key: string, now = this.clock.now()): boolean | "closed" {
     this.ensureReady();
-    return this.reserved({ reads: 8, writes: 8 }, false, now, () => this.transaction(() => {
+    return this.reserved({ reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
+      const effective = this.effectiveNow(now);
       const row = this.uploadRow(key);
-      if (!row || row.state !== "pending" || this.effectiveNow(now) > row.write_expires_ms) return false;
+      if (!row || row.state !== "pending" || effective > row.write_expires_ms) return false;
+      const policy = this.config.uploads;
+      if (policy) {
+        const day = dayFor(effective);
+        const global = this.limitRow("upload", "global", effective);
+        const count = global.day === day ? global.uploads_day : 0;
+        if (count >= policy.uploadsPerDay) return "closed";
+        this.updateLimitRow(global, { day, uploads_day: count + 1 }, effective);
+      }
       this.rawExec("UPDATE uploads SET state = 'writing' WHERE upload_key = ?", key);
       return true;
     }));
@@ -4372,10 +4433,12 @@ export class Store {
    * thread's parent; one woken for this room within `coalesceSeconds` is
    * passed over too; the rest are woken, up to
    * `wakesPerMessage` users, on each of their registrations (most recently
-   * registered first). Pushes are checked against the sender's
-   * `pushesPerSenderDay` (charged once delivered, chargePushSender), charged
-   * to the recipient's `pushesPerRecipientDay` and to the server's
-   * `pushesPerDay`; past any of them, what is left is `skipped`. With
+   * registered first). Pushes are charged as they are claimed, delivered
+   * or not, to the sender's `pushesPerSenderDay`, the recipient's
+   * `pushesPerRecipientDay` and the server's `pushesPerDay`; past any of
+   * them, what is left is `skipped`. A sender is charged for a push that
+   * fails too, so registrations that always fail cannot let one sender
+   * spend the server's day. With
    * `allowed`, a registration whose endpoint it refuses (PUSH_HOSTS) is
    * passed over before it counts. Each woken user's time for the room is kept for coalescing.
    */
@@ -4397,7 +4460,7 @@ export class Store {
       const effective = this.effectiveNow(now);
       const day = dayFor(effective);
       const live = effective - policy.pushExpiryDays * 86_400_000;
-      let counters: { server: RawLimitRow; sent: number; delivered: number } | undefined;
+      let counters: { server: RawLimitRow; sender: RawLimitRow; sent: number; charged: number } | undefined;
       // The rooms a room mute silences this message by: its room and, for a
       // thread, the parent (protocol §4.5), read once a candidate needs it.
       let scopes: string[] | undefined;
@@ -4428,16 +4491,12 @@ export class Store {
         // The counters are read once a user is found to wake, so a message
         // that wakes no one writes nothing. Reuse posts_day as the counts; the
         // scope separates them.
-        // The sender's pushes are charged once delivered (chargePushSender);
-        // here they are only checked, so failed pushes cost the sender nothing.
         if (!counters) {
           const server = this.limitRow("push", "global", effective);
-          const sender = this.rawRows<{ day: string; posts_day: number }>(
-            "SELECT day, posts_day FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1", "push", `user:${input.senderId}`,
-          )[0];
+          const sender = this.limitRow("push", `user:${input.senderId}`, effective);
           counters = {
-            server, sent: server.day === day ? integerColumn(server.posts_day) : 0,
-            delivered: sender?.day === day ? integerColumn(sender.posts_day) : 0,
+            server, sender, sent: server.day === day ? integerColumn(server.posts_day) : 0,
+            charged: sender.day === day ? integerColumn(sender.posts_day) : 0,
           };
         }
         const recipient = this.rawRows<{ day: string; posts_day: number }>(
@@ -4448,12 +4507,13 @@ export class Store {
           rows.length,
           policy.pushesPerDay - counters.sent,
           policy.pushesPerRecipientDay - received,
-          policy.pushesPerSenderDay - counters.delivered - claim.subscriptions.length,
+          policy.pushesPerSenderDay - counters.charged,
         ));
         claim.skipped += rows.length - allowed;
         if (!allowed) continue;
         for (const row of rows.slice(0, allowed)) claim.subscriptions.push(pushRecord(row, userId));
         counters.sent += allowed;
+        counters.charged += allowed;
         woken += 1;
         this.updateLimitRow(this.limitRow("push_recipient", `user:${userId}`, effective), { day, posts_day: received + allowed }, effective);
         this.rawExec(
@@ -4461,23 +4521,11 @@ export class Store {
           userId, input.roomId, effective,
         );
       }
-      if (counters && woken) this.updateLimitRow(counters.server, { day, posts_day: counters.sent }, effective);
+      if (counters && woken) {
+        this.updateLimitRow(counters.server, { day, posts_day: counters.sent }, effective);
+        this.updateLimitRow(counters.sender, { day, posts_day: counters.charged }, effective);
+      }
       return claim;
-    }));
-  }
-
-  /**
-   * Charges a sender's daily allowance (`pushesPerSenderDay`) with the
-   * pushes their message got delivered (2xx from the push service).
-   */
-  chargePushSender(senderId: string, delivered: number, now = this.clock.now()): void {
-    this.ensureReady();
-    if (delivered <= 0) return;
-    this.reserved({ reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
-      const effective = this.effectiveNow(now);
-      const day = dayFor(effective);
-      const row = this.limitRow("push", `user:${senderId}`, effective);
-      this.updateLimitRow(row, { day, posts_day: (row.day === day ? integerColumn(row.posts_day) : 0) + delivered }, effective);
     }));
   }
 
@@ -4821,6 +4869,13 @@ export class Store {
         if (!parent) throw new StoreError("invalid_params", "unknown parent_room_id");
         if (parent.parent_room_id !== null) throw new StoreError("denied", "Threads cannot be nested on this demo");
         parentRoomId = parentId;
+        // So one account cannot take every slot: the threads a registered user
+        // created that are still live, read from the capped rooms table. A
+        // thread removed when emptied, or whose log expired (still a row until
+        // cleanup), no longer counts.
+        if (registered && this.liveThreadsCreatedBy(input.userId, floor) >= this.config.maxThreadsPerUser) {
+          throw new StoreError("denied", `You can have at most ${this.config.maxThreadsPerUser} threads at once; one stops counting when everyone has left it or its history expires`);
+        }
       }
       if (this.metaNumber("thread_count") >= this.config.maxThreads) throw new StoreError("denied", "thread_limit");
       const fields = roomFields(undefined);
@@ -4880,6 +4935,14 @@ export class Store {
     const record = this.roomRecord(row, floor);
     // Room records are not broadcast: the caller sends room_update (§4.3.3).
     return { result: { room_id: row.room_id }, broadcasts: [], room: record, created, ...(membership ? { membership } : {}) };
+  }
+
+  /** Thread rooms `userId` created that are still live: not removed, and with a retained log. One scan of the capped rooms table. */
+  private liveThreadsCreatedBy(userId: string, floor: number): number {
+    return integerColumn(this.rawRows<{ count: number }>(
+      "SELECT COUNT(*) AS count FROM rooms WHERE parent_room_id IS NOT NULL AND latest_log_id >= ? AND json_extract(fields_json, '$.creator_id') = ?",
+      floor, userId,
+    )[0]?.count);
   }
 
   /** A room's client fields (`title`, `description`, `ext`) fit maxThreadMetadataBytes serialized. */
@@ -5024,9 +5087,12 @@ export class Store {
     const mayMove = method === "message" && typeof input.params.message_id === "string";
     // Each embed may start or release an upload (§4.8.3).
     const uploadWrites = this.config.uploads && method === "message" ? this.config.maxEmbeds * UPLOAD_WRITES : 0;
+    // A thread's creation counts its creator's live threads: a scan of the
+    // rooms table, capped at the thread ceiling and the created rooms.
+    const roomScan = method === "room_set" && input.params.room_id === undefined ? MAX_THREAD_LIMIT + MAX_CREATED_ROOMS + 2 : 0;
     const mutationCost = {
       ...this.config.mutationCost,
-      reads: Math.max(256, this.config.mutationCost.reads ?? 0),
+      reads: Math.max(256, this.config.mutationCost.reads ?? 0) + roomScan,
       writes: Math.max(mayMove ? 256 : 96, this.config.mutationCost.writes ?? 0) + uploadWrites,
     };
     const beforeReads = this.observed.reads;
@@ -5057,6 +5123,8 @@ export class Store {
           committed = method === "message" ? this.commitMessage(input, context, floor)
             : method === "room_set" ? this.commitRoom(input, context, floor, tier === "registered")
             : this.commitReactions(input, context, floor);
+          // Within the transaction: a move its sender cannot pay for is refused whole.
+          if (context.extraPosts) this.chargePosting({ userId: input.userId, tier, ipKey: input.ipKey, now: effective, weight: context.extraPosts });
           this.finishCommit(context, startLogId);
         }
         this.commitStoredResult(input.userId, input.requestId, digest, committed.result, effective + this.config.dedupTtlMs);
