@@ -719,6 +719,13 @@ const META_EFFECTIVE_NOW = "effective_now_ms";
 const META_PURGE_ROOMS = "purge_rooms";
 /** Most removed rooms awaiting purge; cleanup removes no further room past it. */
 const MAX_PURGE_ROOMS = MAX_THREAD_LIMIT;
+/**
+ * Most retained records a budget-checked log scan (`/rename`) reserves for:
+ * above a week of the paid plan's posts, and a small share of the day's
+ * foreground reads. Counting reads one index entry per record, refunded past
+ * what is found.
+ */
+const RETAINED_SCAN_CAP = 100_000;
 const META_ACCOUNTING_UNSAFE = "accounting_unsafe";
 const META_ACCOUNT_USAGE = "account_usage_snapshot";
 /** The highest guest number ever reserved (see reserveGuestNumbers); absent means none. */
@@ -2116,7 +2123,7 @@ export class Store {
     this.checkBudgetCost(this.reservationCost({ reads: 64, writes: 32, admissions: 1 }, day), false, candidateTime);
   }
 
-  private reserveCost(costInput: CostEstimate, maintenance = false, now = this.clock.now()): BudgetCost {
+  private reserveCost(costInput: CostEstimate, maintenance = false, now = this.clock.now(), unchecked = false): BudgetCost {
     this.ensureReady();
     if (this.accountingUnsafe) {
       throw new StoreError("internal_error", "storage accounting is unsafe; admission is closed");
@@ -2133,7 +2140,8 @@ export class Store {
       }
       const pruning = this.budgetPruneDay !== candidateDay;
     const cost = this.reservationCost(costInput, candidateDay);
-    this.checkBudgetCost(cost, maintenance, candidateTime);
+    // An admin command is charged but not refused: it may take the day past its ceilings.
+    if (!unchecked) this.checkBudgetCost(cost, maintenance, candidateTime);
     const row = this.budgetCache!;
     const reservationCursor = this.rawExec(
       `UPDATE resource_budgets SET
@@ -2352,10 +2360,10 @@ export class Store {
     });
   }
 
-  private reserved<T>(cost: CostEstimate, maintenance: boolean, now: number, fn: () => T): T {
+  private reserved<T>(cost: CostEstimate, maintenance: boolean, now: number, fn: () => T, unchecked = false): T {
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
-    const reservation = this.reserveCost(cost, maintenance, now);
+    const reservation = this.reserveCost(cost, maintenance, now, unchecked);
     try {
       return fn();
     } finally {
@@ -2719,15 +2727,25 @@ export class Store {
   }
 
   /**
-   * At most how many records are retained: every one has a log id from the
-   * oldest still stored to the newest, and a move stores one record twice.
-   * Scans of the log reserve reads by it.
+   * How many records are retained, counted on the log index. Scans of the
+   * log reserve reads by it. A log id is a commit time, not a sequence, so
+   * the id range says nothing about the count. Past RETAINED_SCAN_CAP rows
+   * the scan is refused rather than reserved. `unchecked` (an admin command
+   * not held to the day's budget) counts up to what the database can hold.
    */
-  private retainedRecords(now: number): number {
-    return this.reserved({ reads: 16 }, false, now, () => {
-      const low = this.rawRows<{ low: number | null }>("SELECT MIN(log_id) AS low FROM records INDEXED BY records_log_idx")[0]?.low;
-      return low === null || low === undefined ? 0 : 2 * (this.logState().last_log_id - low + 1);
-    });
+  private retainedRecords(now: number, unchecked = false): number {
+    // Each record is a row and an index entry, well over 64 bytes.
+    const cap = unchecked ? Math.ceil(this.config.storageHardTargetBytes / 64) : RETAINED_SCAN_CAP;
+    return this.reserved({ reads: 16 + cap + 1 }, false, now, () => {
+      const count = integerColumn(this.rawRows<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM (SELECT 1 FROM records INDEXED BY records_log_idx LIMIT ?)",
+        cap + 1,
+      )[0]?.count);
+      if (count > cap) {
+        throw new StoreError("retry_after", "History is too large to scan; try after cleanup", { retryAfterMs: this.config.cleanupIntervalMs });
+      }
+      return count;
+    }, unchecked);
   }
 
   /**
@@ -2751,8 +2769,9 @@ export class Store {
     const ids = [...new Set(input.userIds)].filter((id) => id.length > 0).slice(0, 4);
     if (!ids.length) return { messages: 0, reactions: 0, deletedUploads: [] };
     const marks = ids.map(() => "?").join(", ");
-    // The scans below read at most this many rows each.
-    const records = this.retainedRecords(now);
+    // The scans below read at most this many rows each. Only an admin can
+    // purge, so it is charged to the day's budget but never refused by it.
+    const records = this.retainedRecords(now, true);
     const policy = this.config.uploads;
     const uploadsPerOwner = policy
       ? policy.uploadsPerUserDay * (Math.ceil((policy.avatarRetentionSeconds + policy.lifecycleLagSeconds) / 86_400) + 1)
@@ -2819,7 +2838,7 @@ export class Store {
       for (const userId of retired) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, '1')", META_PURGED_PREFIX + userId);
       if (identities) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(Math.max(0, this.metaNumber("identity_count") - identities)));
       return { messages: messages.length, reactions: integerColumn(reactions), deletedUploads };
-    }));
+    }), true);
   }
 
   /** Replaces one logged record's JSON, or deletes the record when `json` is null. */
