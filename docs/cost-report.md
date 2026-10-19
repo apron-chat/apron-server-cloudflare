@@ -179,7 +179,8 @@ Memberships:
   invite's count and the new user's own token and pointer, in one put),
   reserved at their bound before the account is created. `/invite` itself is
   one KV read and three writes, and `/invite-token` two KV writes, each at
-  its bound.
+  its bound. `/invite-device` is one KV read and three writes, and signing
+  in with its token one KV read, like a bot token.
 - `/passkeys` reads at most 8 credential rows; `/passkeys remove` adds one
   delete with its index. Adding a passkey to an account without a WebAuthn
   user handle writes it at `begin` (one conditional row update).
