@@ -21,7 +21,7 @@ import {
 } from "./budget";
 import type { AccountUsageSnapshot } from "./account-usage";
 import { isStatusChoice, type StatusChoice } from "./presence";
-import type { StoredCredential, StoredIdentity } from "./domain.js";
+import { isProtocolId, type StoredCredential, type StoredIdentity } from "./domain.js";
 // @ts-expect-error Workers' nodejs_compat runtime supplies this module; the
 // worker type package intentionally omits Node's full module declarations.
 import { createHash } from "node:crypto";
@@ -398,13 +398,13 @@ export interface MessageSnapshot {
   prev_room_id?: string;
 }
 
-/** A room record plus this server's delivery fields (protocol §3.4). */
+/** A room record plus this server's delivery fields (protocol §4.2). */
 export interface RoomRecord {
   room_id: string;
   log_id: string;
   parent_room_id?: string;
   title?: string;
-  /** What the room is about, CommonMark by convention (§3.4). */
+  /** What the room is about, CommonMark by convention (§4.2). */
   description?: string;
   ext?: Record<string, unknown>;
   latest_log_id: string;
@@ -425,7 +425,7 @@ function storedCreator(fieldsJson: string): string | undefined {
   return typeof creator === "string" ? creator : undefined;
 }
 
-/** One logged membership change of a registered user (protocol §4.3.2). */
+/** One logged membership change of a registered user (protocol §4.2.2). */
 interface MembershipRecord {
   log_id: string;
   room_id: string;
@@ -436,10 +436,10 @@ type RecordKind = "room" | "message" | "reactions" | "membership";
 
 /**
  * A committed record, in log order, ready to deliver as a notification to the
- * members of `rooms`: its room, and for a move both rooms (§3.4, §4.2).
+ * members of `rooms`: its room, and for a move both rooms (§3.4, §4.3.1).
  */
 export interface Broadcast {
-  /** A membership record is delivered in `room_update` `memberships` (§4.3.3), not as its own notification. */
+  /** A membership record is delivered in `room_update` `memberships` (§4.2.3), not as its own notification. */
   method: "message" | "reactions" | "membership";
   params: Record<string, unknown>;
   rooms: string[];
@@ -472,9 +472,9 @@ export interface StoreMutationResult {
   uploads?: PendingUpload[];
   /** R2 objects to delete: uploads whose embed or message this operation removed. */
   deletedUploads?: string[];
-  /** Whether `room_set` created the room, which joins its creator (§4.3.4). */
+  /** Whether `room_set` created the room, which joins its creator (§4.2.4). */
   created?: boolean;
-  /** The creator's logged membership, for a registered creator (§4.3.4). */
+  /** The creator's logged membership, for a registered creator (§4.2.4). */
   membership?: Broadcast;
   /** An accepted retry: the original result, with no new records. */
   deduplicated?: boolean;
@@ -483,7 +483,7 @@ export interface StoreMutationResult {
 }
 
 interface StoreHistoryQuery {
-  /** Omitted, the default room (§4.2). */
+  /** Omitted, the default room (§4.3). */
   roomId?: string;
   after?: string | bigint;
   before?: string | bigint;
@@ -495,7 +495,7 @@ interface StoreHistoryQuery {
   maxBytes?: number;
 }
 
-/** A history page (§4.2): each array is omitted when empty, and the bounds with it. */
+/** A history page (§4.3): each array is omitted when empty, and the bounds with it. */
 interface StoreHistoryResult {
   rooms?: RoomRecord[];
   messages?: MessageSnapshot[];
@@ -750,7 +750,7 @@ export const MAX_CARRIED_PASSKEYS = 100;
 export const MODERATOR_ROLES: readonly string[] = ["admin", "mod", "threader"];
 /**
  * Roles whose registered holders may create top-level rooms beside
- * `general`, and save their client fields (§4.3.4). Such rooms are
+ * `general`, and save their client fields (§4.2.4). Such rooms are
  * permanent, as `general` is: they neither expire nor go when emptied.
  */
 export const ROOM_CREATOR_ROLES: readonly string[] = ["admin", "mod"];
@@ -2870,7 +2870,7 @@ export class Store {
   }
 
   /**
-   * The registered members of each room (§4.3.1), as `user_id` with the
+   * The registered members of each room (§4.2.1), as `user_id` with the
    * current `name` (`""` when removed), live `avatar`, and `roles`, in
    * `user_id` order: at most `limit` per room, read from the room's
    * primary-key range with one identity lookup each. With `withStatus`, each
@@ -3240,7 +3240,7 @@ export class Store {
   /**
    * Registers an identity and its credential. The identity starts in the
    * given rooms that still exist (the guest's it replaces, or `general`), and
-   * each start is a logged membership (§4.3.2), returned in `broadcasts` for
+   * each start is a logged membership (§4.2.2), returned in `broadcasts` for
    * the caller to deliver to the rooms' members.
    */
   registerIdentity(input: {
@@ -3581,7 +3581,9 @@ export class Store {
       if (!Array.isArray(body.mentions)) throw new StoreError("invalid_params", "body.mentions must be an array of user_id strings");
       const unique = new Set<string>();
       for (const item of body.mentions) {
-        if (typeof item !== "string" || item.length === 0) {
+        // Mentions are user_ids (§2.4): a string that cannot be one makes the
+        // whole message, new or edited, invalid.
+        if (!isProtocolId(item)) {
           throw new StoreError("invalid_params", "body.mentions must be an array of user_id strings");
         }
         if (utf8Bytes(item) > 256) throw new StoreError("too_large", "a mentioned user_id is too long");
@@ -3604,7 +3606,7 @@ export class Store {
    * with no credential, which signs in only with the bearer token the caller
    * keeps. A new bot counts as a registration against the same daily and
    * identity caps as a passkey, and starts in `general`, a logged membership
-   * (§4.3.2) returned in `broadcasts`. An existing bot only takes the new name.
+   * (§4.2.2) returned in `broadcasts`. An existing bot only takes the new name.
    */
   registerBot(input: { ownerId: string; botId: string; name: string; now: number; ipKey: string }): {
     userId: string; name: string; created: boolean; renamed: boolean; broadcasts: Broadcast[];
@@ -3706,7 +3708,7 @@ export class Store {
   /**
    * Inserts an identity that signs in by bearer token rather than a
    * credential, charged as a registration, and starts it in `general` with a
-   * logged membership (§4.3.2) returned in `broadcasts`.
+   * logged membership (§4.2.2) returned in `broadcasts`.
    */
   private createKeylessIdentity(input: { userId: string; name: string; tier: "bot" | "registered"; roles?: string[]; now: number; ipKey: string }): { broadcasts: Broadcast[] } {
     ensureText(input.name, "name", this.config.maxNameBytes);
@@ -3757,7 +3759,7 @@ export class Store {
   }
 
   /**
-   * Logs one registered user's membership change in a room (§4.3.2): a live
+   * Logs one registered user's membership change in a room (§4.2.2): a live
    * record carries one entry, with the user as a recorded object. It advances
    * the room's head like any record. Returns it for delivery to the room's
    * members before and after the change.
@@ -3775,7 +3777,7 @@ export class Store {
 
   /**
    * Joins or leaves one room for a registered identity, whose rooms last
-   * across connections (§4.3.2). Guests' rooms live in their connection and
+   * across connections (§4.2.2). Guests' rooms live in their connection and
    * are not logged. A change is one `memberships` row and one logged
    * membership record, and counts as a post; joining or leaving where nothing
    * would change writes nothing. Returns the identity's rooms, the logged
@@ -3827,7 +3829,7 @@ export class Store {
   }
 
   /**
-   * Removes a thread room that has emptied (§4.3.2): no registered member is
+   * Removes a thread room that has emptied (§4.2.2): no registered member is
    * left in it, so the last to leave frees its slot instead of leaving it
    * until its log expires, whatever messages it holds. The caller checks
    * that no connection, a guest's included, is still in it. Its records and
@@ -3969,11 +3971,11 @@ export class Store {
     if (utf8Bytes(JSON.stringify(snapshot)) > this.config.maxSnapshotBytes) throw new StoreError("too_large", "message snapshot is too large");
     const moved = current !== null && current.room_id !== roomId;
     if (current) snapshot.prev_log_id = idString(current.latest_log_id);
-    // After a move the previous snapshot is in the source room's log (§2).
+    // After a move the previous snapshot is in the source room's log (§4.3.1).
     if (moved) snapshot.prev_room_id = current.room_id;
     const json = JSON.stringify(snapshot);
 
-    // A move belongs to the source and destination logs (§4.2).
+    // A move belongs to the source and destination logs (§4.3.1).
     this.appendRecord(context, moved ? [current.room_id, roomId] : [roomId], "message", logId, json);
     this.rawExec(
       `INSERT INTO message_state (message_id, room_id, latest_log_id, snapshot_json, author_id)
@@ -4838,7 +4840,7 @@ export class Store {
   }
 
   /**
-   * `room_set`: create a room or thread, or replace one's client fields (§4.3.4),
+   * `room_set`: create a room or thread, or replace one's client fields (§4.2.4),
    * merging `ext` into the current one (§4.12).
    * Demo policy: anyone may create a thread under a top-level room and save
    * any thread; only an admin or mod (ROOM_CREATOR_ROLES) may create a
@@ -4846,7 +4848,7 @@ export class Store {
    * `general` room is fixed. Every created room counts against maxThreads,
    * which bounds the rooms table. Rooms are never private here: every room
    * is visible to everyone, so a creation with `private: true` is
-   * `unsupported`, as §4.3.4 requires.
+   * `unsupported`, as §4.2.4 requires.
    */
   private commitRoom(input: StoreMutationInput, context: CommitContext, floor: number, registered: boolean): StoreMutationResult {
     const params = input.params;
@@ -4862,12 +4864,12 @@ export class Store {
     const write = this.optionalExt(params.ext);
     const existing = roomIdParam === undefined ? undefined : this.roomRow(roomIdParam);
     // Threads always carry a title so clients that ignore parent_room_id
-    // still render them (section 3.4), and so do top-level rooms. An empty
+    // still render them (§4.2), and so do top-level rooms. An empty
     // description is no description.
     const topLevel = existing === undefined ? params.parent_room_id === undefined : existing?.parent_room_id === null;
     const title = typeof titleParam === "string" && titleParam.trim() !== "" ? titleParam : topLevel ? DEFAULT_ROOM_TITLE : DEFAULT_THREAD_TITLE;
     const description = typeof descriptionParam === "string" && descriptionParam.trim() !== "" ? descriptionParam : undefined;
-    // `ext` merges into the room's current one (§4.12, §4.3.4); the size check runs on the result.
+    // `ext` merges into the room's current one (§4.12, §4.2.4); the size check runs on the result.
     const roomFields = (stored: unknown): Record<string, unknown> => {
       const ext = mergeExt(stored, write);
       return { title, ...(description !== undefined ? { description } : {}), ...(ext ? { ext } : {}) };
@@ -4902,7 +4904,7 @@ export class Store {
       logId = this.allocateLogId(context);
       const roomId = idString(logId);
       // A registered creator is kept with the fields, outside the client's
-      // size limit and the room record, so they can remove members (§4.3.2).
+      // size limit and the room record, so they can remove members (§4.2.2).
       const fieldsJson = JSON.stringify(registered ? { ...fields, creator_id: input.userId } : fields);
       this.rawExec(
         `INSERT INTO rooms (${ROOM_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
@@ -4940,7 +4942,7 @@ export class Store {
       "INSERT INTO records (room_id, log_id, commit_ms, kind, record_json) VALUES (?, ?, ?, 'room', ?)",
       row.room_id, logId, context.commitMs, JSON.stringify(logged),
     );
-    // Creating a room joins its creator (§4.3.4). A registered creator keeps
+    // Creating a room joins its creator (§4.2.4). A registered creator keeps
     // the room, and the join is logged after the room record; a guest's lives
     // in its connection.
     let membership: Broadcast | undefined;
@@ -4952,7 +4954,7 @@ export class Store {
       context.touched.set(row.room_id, row.latest_log_id);
     }
     const record = this.roomRecord(row, floor);
-    // Room records are not broadcast: the caller sends room_update (§4.3.3).
+    // Room records are not broadcast: the caller sends room_update (§4.2.3).
     return { result: { room_id: row.room_id }, broadcasts: [], room: record, created, ...(membership ? { membership } : {}) };
   }
 
@@ -5159,7 +5161,7 @@ export class Store {
     return this.commitMutation({ ...input, params: clone(input.params) });
   }
 
-  /** History with the per-user/IP history quota charged (§4.2). */
+  /** History with the per-user/IP history quota charged (§4.3). */
   history(query: StoreHistoryQuery): StoreHistoryResult {
     this.ensureReady();
     const operationNow = query.now ?? this.clock.now();
@@ -5216,11 +5218,11 @@ export class Store {
     const maxBytes = Math.min(query.maxBytes ?? this.config.maxHistoryResponseBytes, this.config.maxHistoryResponseBytes);
     const latestLogId = idString(head);
     const historyLogId = roomHistoryLogId(room, floor);
-    // An empty slice has neither bound and omits every array (§4.2).
+    // An empty slice has neither bound and omits every array (§4.3.2).
     const empty = (): StoreHistoryResult => ({ more: false, latest_log_id: latestLogId, history_log_id: historyLogId });
     const forward = after !== undefined;
     // One contiguous slice of the room's log across every record kind; the
-    // limit counts records of any kind (§4.2). A window bounded to one log_id
+    // limit counts records of any kind (§4.3.2). A window bounded to one log_id
     // (after == before) is that record in this room's log only: a moved
     // message's earlier snapshot is fetched from the room its prev_room_id names.
     const rows = lower > upper || historyLogId === null ? [] : this.rawRows<RawRecordRow>(

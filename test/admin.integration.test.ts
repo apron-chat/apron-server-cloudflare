@@ -207,6 +207,8 @@ it('/rename moves a registered user, their passkey, rooms and admin status to a 
 			['guest', `/rename ${toId} guest_77`],
 			['bot', `/rename ${toId} bot_x`],
 			['bad-chars', `/rename ${toId} no@pe`],
+			// It would not end a mention in text (Appendix A.3).
+			['dash-end', `/rename ${toId} nope-`],
 			['to-admin', `/rename ${toId} admin`],
 			['unknown', `/rename nobody_123 somebody_else`],
 		]) {
@@ -294,7 +296,7 @@ it('room_join and room_leave with a user_id add and remove others: an admin anyo
 		const roomId = (await request(admin, unique('thread'), 'room_set', { parent_room_id: 'general', title: 'Invites' })).result.room_id;
 
 		// The admin adds Bob: the room's other members get the logged join in `room_update`
-		// `membership`, and Bob's connections get it with `joined` in one frame (§4.3.2).
+		// `membership`, and Bob's connections get it with `joined` in one frame (§4.2.2).
 		const added = await exchange(admin, 'add-bob', 'room_join', { room_id: roomId, user_id: bobId });
 		expect(added.frame.result).toEqual({});
 		const bobJoin = [{ user: { user_id: bobId, name: `Name of ${bobId}` }, joined: true }];
@@ -346,7 +348,7 @@ it('room_join and room_leave with a user_id add and remove others: an admin anyo
 		const removed = await exchange(admin, 'remove-bob', 'room_leave', { room_id: roomId, user_id: bobId });
 		expect(removed.frame.result).toEqual({});
 		expect(removed.skipped.filter((frame) => frame.params?.memberships).at(-1)?.params.memberships[0].members).toEqual([{ user: { user_id: bobId, name: `Name of ${bobId}` }, joined: false }]);
-		// The removed user's connections get `left` with the membership (§4.3.2, §4.1 /kick).
+		// The removed user's connections get `left` with the membership (§4.2.2, §4.1 /kick).
 		const left = await until(bob, (frame) => frame.method === 'room_update' && frame.params.left !== undefined);
 		expect(left.frame.params.left).toEqual([{ room_id: roomId }]);
 		expect(left.frame.params.memberships[0].members).toEqual([{ user: { user_id: bobId, name: `Name of ${bobId}` }, joined: false }]);
@@ -358,6 +360,25 @@ it('room_join and room_leave with a user_id add and remove others: an admin anyo
 		expect((await until(guest, (frame) => frame.method === 'room_update' && frame.params.left !== undefined)).frame.params.left).toEqual([{ room_id: 'general' }]);
 		expect(admin.closed()).toBeUndefined();
 	} finally { admin.close(); bob.close(); guest.close(); }
+});
+
+it('room_join and room_leave reject a user_id that cannot be one: empty, or with whitespace or control characters', async () => {
+	// A user_id is never empty and has no whitespace or control characters (§2.4),
+	// so these are invalid_params before any permission check. Each socket sends
+	// at most two, under the policy-violation limit.
+	for (const bad of ['', ' ', 'bo b', 'bob\n', 'bo\u0000b']) {
+		const bob = await signedIn(unique('bob'));
+		const guest = await connect();
+		try {
+			await guest.next();
+			await request(guest, 'auth', 'auth', { scheme: 'guest' });
+			const label = JSON.stringify(bad);
+			expect((await request(bob, 'join', 'room_join', { room_id: 'general', user_id: bad })).error.code, label).toBe(-32602);
+			expect((await request(bob, 'leave', 'room_leave', { room_id: 'general', user_id: bad })).error.code, label).toBe(-32602);
+			expect((await request(guest, 'join', 'room_join', { room_id: 'general', user_id: bad })).error.code, label).toBe(-32602);
+			expect((await request(guest, 'leave', 'room_leave', { room_id: 'general', user_id: bad })).error.code, label).toBe(-32602);
+		} finally { bob.close(); guest.close(); }
+	}
 });
 
 it('a room\'s creator may remove anyone from it, across saves and /rename, until /purge', async () => {

@@ -53,9 +53,9 @@ async function subscribe(peer: Peer, name: string, pushId?: string, wake?: unkno
 /** A fresh `id` for a `status` request whose reply the test reads, if at all, among other frames. */
 const statusId = () => `status-${crypto.randomUUID()}`;
 
-/** Sends a `status` request with `idle`, applied once it replies `{}`. */
+/** Sends a `status` request with `idle` (`idle: 0` for idle), applied once it replies `{}`. */
 async function setIdle(peer: Peer, idle: boolean): Promise<void> {
-	expect((await status(peer, { idle })).frame.result).toEqual({});
+	expect((await status(peer, { idle: idle ? 0 : false })).frame.result).toEqual({});
 }
 
 /** Each live connection's `idle`, for one user. */
@@ -236,7 +236,7 @@ describe('push over the socket', () => {
 			// policy violation.
 			const third = await signedIn(userId, true);
 			try {
-				for (const params of [{ room_id: 'x'.repeat(65), idle: true }, { room_id: 7 }]) {
+				for (const params of [{ room_id: 'x'.repeat(65), idle: 0 }, { room_id: 7 }]) {
 					expect((await request(third, `room-without-mute-${JSON.stringify(params)}`, 'status', params)).error.code, JSON.stringify(params)).toBe(-32602);
 				}
 				expect((await idleOf(userId)).sort()).toEqual([false, false, true]);
@@ -275,7 +275,7 @@ describe('push over the socket', () => {
 				return push;
 			});
 			try {
-				expect((await status(bob, { idle: true })).frame.error.code).toBe(-32601);
+				expect((await status(bob, { idle: 0 })).frame.error.code).toBe(-32601);
 				expect(await idleOf(bobId)).toEqual([false]);
 			} finally {
 				await runInDurableObject(stub(), (instance) => {
@@ -569,7 +569,7 @@ describe('status mute', () => {
 		try {
 			await peer.next();
 			// Clients don't send status before sign-in (§3.2, §4.5): denied, and nothing is kept.
-			const early = await status(peer, { idle: true, mute: true });
+			const early = await status(peer, { idle: 0, mute: true });
 			expect(early.frame.error.code).toBe(-32001);
 			expect(mutesOf(early.skipped)).toEqual([]);
 			expect((await status(peer, { room_id: 'general', mute: 120 })).frame.error.code).toBe(-32001);
@@ -735,9 +735,11 @@ describe('status mute', () => {
 				...['', 7, 'x'.repeat(65)].map((room_id) => ({ room_id, mute: true })),
 				// `room_id` scopes only `mute`: without it, invalid.
 				{ room_id: 'general' },
-				{ room_id: 'general', idle: true },
+				{ room_id: 'general', idle: 0 },
+				// `idle` is `false` or whole seconds (§4.5.3): never `true`.
+				...[true, -1, 1.5, '300', null].map((idle) => ({ idle })),
 				// One invalid field fails the whole request: the valid one is not applied either.
-				{ idle: true, mute: 'no' },
+				{ idle: 0, mute: 'no' },
 				{ idle: 'yes', mute: 60 },
 			];
 			for (const params of invalid) {
@@ -752,7 +754,7 @@ describe('status mute', () => {
 			expect(stored.muteUntil).toBeUndefined();
 			expect(stored.roomMutes).toEqual([]);
 			// The same fields, valid, apply together.
-			const valid = await status(peer, { idle: true, mute: 60 });
+			const valid = await status(peer, { idle: 0, mute: 60 });
 			expect(valid.frame.result).toEqual({});
 			expect(mutesOf(valid.skipped)).toHaveLength(1);
 			expect(mutesOf(valid.skipped)[0].mute).toBeGreaterThan(55);
@@ -771,11 +773,11 @@ describe('status mute', () => {
 				expect(mutesOf(reply.skipped)).toEqual([]);
 			}
 			// With `idle` in the same request, neither applies.
-			const both = await status(guest, { idle: true, mute: true });
+			const both = await status(guest, { idle: 0, mute: true });
 			expect(both.frame.error.code).toBe(-32001);
 			expect(await idleOf(guestId)).toEqual([false]);
 			// A guest's `idle` alone applies, answered `{}`.
-			expect((await status(guest, { idle: true })).frame.result).toEqual({});
+			expect((await status(guest, { idle: 0 })).frame.result).toEqual({});
 			expect(await idleOf(guestId)).toEqual([true]);
 			const attachments = await runInDurableObject(stub(), (_instance, state) => state.getWebSockets().map((socket) => socket.deserializeAttachment() as { muteUntil?: unknown; tier: string }));
 			expect(attachments.filter((attachment) => attachment.tier === 'anonymous' && attachment.muteUntil !== undefined)).toEqual([]);
@@ -788,7 +790,7 @@ describe('status mute', () => {
 		const peer = await signedIn(userId);
 		const other = await signedIn(userId, true);
 		try {
-			// Only changes to `idle: true` count: the limit's worth, with a
+			// Only changes to idle count: the limit's worth, with a
 			// coming back between each, leaves the connection idle.
 			for (let index = 0; index < IDLE_CHANGES_PER_CONNECTION_MINUTE; index++) {
 				if (index > 0) await setIdle(peer, false);
@@ -802,13 +804,13 @@ describe('status mute', () => {
 			expect(await idleOf(userId)).toEqual([false, false]);
 			await setIdle(peer, false);
 			// Going idle again is limited.
-			const limited = await status(peer, { idle: true });
+			const limited = await status(peer, { idle: 0 });
 			expect(limited.frame.error.code).toBe(-32002);
 			expect(limited.frame.error.data.retry_after).toBeGreaterThan(0);
 			expect(limited.frame.error.data.retry_after).toBeLessThanOrEqual(60);
 			expect(await idleOf(userId)).toEqual([false, false]);
 			// A limited idle fails the whole request: a mute with it is not applied.
-			const both = await status(peer, { idle: true, mute: true });
+			const both = await status(peer, { idle: 0, mute: true });
 			expect(both.frame.error.code).toBe(-32002);
 			expect(mutesOf(both.skipped)).toEqual([]);
 			const stored = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.statusInputs(userId, Date.now()));
@@ -827,7 +829,7 @@ describe('status mute', () => {
 				try {
 					for (const socket of sockets) {
 						try {
-							runtime.handleStatus(socket, { method: 'status', id: 'cost', params: { idle: true }, full: false });
+							runtime.handleStatus(socket, { method: 'status', id: 'cost', params: { idle: 0 }, full: false });
 						} catch (error) { errors.push((error as { name: string }).name); }
 					}
 				} finally { sql.exec = exec; }
@@ -851,7 +853,7 @@ describe('push review fixes', () => {
 		});
 	}
 
-	it('never treats a quiet connection as idle: only idle true makes it so, so its user gets no push', async () => {
+	it('never treats a quiet connection as idle: only idle with seconds makes it so, so its user gets no push', async () => {
 		const pushes = capturePushes();
 		const [aliceId, silentId, muterId, idleId] = [unique('alice'), unique('silent'), unique('muter'), unique('idle')];
 		const alice = await signedIn(aliceId);
@@ -866,7 +868,7 @@ describe('push review fixes', () => {
 			expect((await status(muter, { mute: false })).frame.result).toEqual({});
 			await setIdle(idle, true);
 			// Quiet for far longer than any period a server once could pick: the
-			// two that never sent `idle: true` are still attended (§4.5).
+			// two that never sent `idle` are still attended (§4.5).
 			await quietSince(silentId, Date.now() - 60 * 60_000);
 			await quietSince(muterId, Date.now() - 60 * 60_000);
 			await quietSince(idleId, Date.now() - 60 * 60_000);
@@ -1018,7 +1020,7 @@ describe('held wakes', () => {
 	/** Waits long enough that a push that was going to go has gone. */
 	const settleFor = () => new Promise((resolve) => setTimeout(resolve, 500));
 	/** Reports idle with how long nobody has attended the connection, as a client does. */
-	async function idleFor(peer: Peer, seconds: number | true): Promise<void> {
+	async function idleFor(peer: Peer, seconds: number): Promise<void> {
 		expect((await status(peer, { idle: seconds })).frame.result).toEqual({});
 	}
 
@@ -1042,9 +1044,9 @@ describe('held wakes', () => {
 			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
 			expect(pushes[0].url).toBe(bobSub.url);
 			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.message_id).toBe(first.result.message_id);
-			// Carol was attended after it came; Dave says only that he is idle: neither is pushed.
+			// Carol and Dave were attended until now, after it came: neither is pushed.
 			await idleFor(carol, 0);
-			await idleFor(dave, true);
+			await idleFor(dave, 0);
 			await settleFor();
 			expect(pushes).toHaveLength(1);
 			// Released once: back and idle again pushes nothing more.

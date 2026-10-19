@@ -342,7 +342,7 @@ it('logs a registered user\'s joins and leaves as memberships, delivered around 
 	const joinedIds = async (peer: Peer) =>
 		(await request(peer, 'mine', 'room_list', { filter: 'joined' })).result.joined.map((room: { room_id: string }) => room.room_id);
 	const methods = (frames: Frame[]) => frames.map((frame) => frame.method);
-	// A logged membership record, as `room_update` `membership` carries it (§4.3.2).
+	// A logged membership record, as `room_update` `membership` carries it (§4.2.2).
 	const record = (roomId: string, joined: boolean) => ({
 		log_id: expect.stringMatching(/^[1-9][0-9]*$/), room_id: roomId, members: [{ user: { user_id: userId, name }, joined }],
 	});

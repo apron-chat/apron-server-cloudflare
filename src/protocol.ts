@@ -116,7 +116,7 @@ export const REQUEST_METHODS: ReadonlySet<string> = new Set([
  * `auth` with it is `invalid_params` (§1); a defined one that the server does
  * not offer is `unsupported`.
  */
-export const DEFINED_AUTH_SCHEMES: ReadonlySet<string> = new Set(["guest", "token", "webauthn", "email"]);
+export const DEFINED_AUTH_SCHEMES: ReadonlySet<string> = new Set(["guest", "token", "webauthn", "email", "external"]);
 
 /** Whether `method` is one clients send only as a notification (§1.1). */
 export function notificationOnly(method: unknown): boolean {
