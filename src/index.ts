@@ -4767,6 +4767,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const key = DEVICE_TOKEN_KEY_PREFIX + await sha256Hex(token);
 		const pointerKey = DEVICES_KEY_PREFIX + userId;
 		const replaced = await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1, writes: 3 }, async () => {
+			// A `/rename` or `/purge` of the user may have run since this command
+			// began; a token for the old `user_id` would never sign in, and the
+			// connections it replaces would not be found under it.
+			if (!this.store.identityExists(userId)) throw { name: "denied", message: "Your account changed; reconnect and try again" } satisfies ProtocolError;
 			const devices = storedDevices(await this.ctx.storage.get<StoredDevices>(pointerKey));
 			const previous = devices.find((device) => device.name === name);
 			if (!previous && devices.length >= MAX_DEVICE_TOKENS) {
@@ -4781,12 +4785,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}));
 		if (replaced) {
 			// Whatever ran with the old token loses its connections, and the user's pushes too:
-			// their other devices register again on their next connection.
-			if (this.config.push) this.store.clearPushSubscriptions(userId, nowMs());
+			// their other devices register again on their next connection. The
+			// connections close first, so a push clear refused by the budget
+			// cannot leave them open.
 			for (const peer of this.connectionsOf(userId, socket)) {
 				const state = connectionAttachment(peer);
 				if (state?.device === name) this.closePolicy(peer, state, 1008, "Device token replaced; sign in with the new one");
 			}
+			if (this.config.push) this.store.clearPushSubscriptions(userId, nowMs());
 		}
 		this.sendNotice(socket, roomId, [
 			`This token signs in as you (\`${userId}\`) on your device **${name}**${replaced ? ", and replaces its earlier token" : ""}. It does not expire, and anyone who has it can sign in as you, so keep it secret. \`/invite-device ${name}\` again replaces it.`,
@@ -4814,12 +4820,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 			for (const record of bot.broadcasts) this.broadcastRecord(record);
 		});
 		const token = await this.issueBotToken(botId, ownerId);
-		// The old token is revoked: whatever ran with it loses the bot's pushes too.
-		if (this.config.push) this.store.clearPushSubscriptions(botId, nowMs());
+		// The old token is revoked: whatever ran with it loses its connections,
+		// then the bot's pushes too, so a push clear refused by the budget
+		// cannot leave them open.
 		for (const peer of this.connectionsOf(botId)) {
 			const state = connectionAttachment(peer);
 			if (state) this.closePolicy(peer, state, 1008, "Bot token replaced; sign in with the new one");
 		}
+		if (this.config.push) this.store.clearPushSubscriptions(botId, nowMs());
 		// Those who share a room with the bot see its new name (§3.3).
 		if (bot.renamed) {
 			const stored = this.store.getIdentity(botId);

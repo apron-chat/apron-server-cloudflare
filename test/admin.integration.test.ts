@@ -344,6 +344,48 @@ it('/invite-device mints up to three named tokens that sign in as the user, a na
 	}
 });
 
+it('/invite-device closes what used a replaced token even when clearing pushes fails', async () => {
+	const owner = await signedIn(unique('owner'));
+	let phone: Peer | undefined;
+	type Patchable = { store: { clearPushSubscriptions: (...args: unknown[]) => void } };
+	try {
+		const token = (await command(owner, 'device-phone', '/invite-device phone')).notice!.params.body.text.match(/apron_device_[A-Za-z0-9_-]{43}/)![0];
+		phone = await connect(null);
+		await phone.next();
+		expect((await request(phone, 'auth', 'auth', { scheme: 'token', token })).result.you).toBeDefined();
+		// As when the day's budget refuses the push clear's reservation.
+		await runInDurableObject(stub(), (instance) => {
+			const store = (instance as unknown as Patchable).store;
+			store.clearPushSubscriptions = () => { throw new Error('budget refused'); };
+		});
+		expect((await command(owner, 'device-phone-again', '/invite-device phone')).frame.error).toBeDefined();
+		await vi.waitFor(() => expect(phone!.closed()?.code).toBe(1008));
+		expect(owner.closed()).toBeUndefined();
+	} finally {
+		await runInDurableObject(stub(), (instance) => {
+			const store = (instance as unknown as Patchable).store;
+			delete (store as Partial<Patchable['store']>).clearPushSubscriptions;
+		});
+		phone?.close(); owner.close();
+	}
+});
+
+it('/invite-device refuses a user renamed while the command was on its way', async () => {
+	const userId = unique('owner');
+	const owner = await signedIn(userId);
+	try {
+		// The store has the new user_id, but the connection does not yet: the
+		// state /rename leaves while it moves the user's tokens.
+		await runInDurableObject(stub(), (instance) => {
+			(instance as unknown as { store: Store }).store.renameIdentity({ from: userId, to: unique('renamed'), now: Date.now() });
+		});
+		const refused = await command(owner, 'device', '/invite-device laptop');
+		expect(refused.frame.error.message).toBe('Your account changed; reconnect and try again');
+		expect(refused.notice).toBeUndefined();
+		expect(await runInDurableObject(stub(), (_instance, state) => state.storage.get(`devices:${userId}`))).toBeUndefined();
+	} finally { owner.close(); }
+});
+
 /** Registers a passkey user straight into the store without connecting them. */
 async function registered(userId: string): Promise<void> {
 	await runInDurableObject(stub(), (instance) => {
