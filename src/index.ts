@@ -113,6 +113,8 @@ interface ConnectionAttachment {
 	origin?: string;
 	/** The WebSocket URL this connection reached, for instructions that name the server (`/invite-bot`). */
 	endpoint?: string;
+	/** The device name of the `/invite-device` token this connection signed in with, so a new token for it closes the connection. */
+	device?: string;
 	challenge?: ChallengeRecord;
 	authDeadline: number;
 	pendingFrames: number;
@@ -322,6 +324,8 @@ const MAX_JOIN_USES = 50;
 /** The name of a user who signs up with an invite and asks for none: not "Guest", which names guests. */
 const JOIN_DEFAULT_NAME = "Member";
 const JOIN_INVITE_TTL_MS = 7 * 86_400_000;
+/** Device tokens one user may hold at once, each under its own name. */
+const MAX_DEVICE_TOKENS = 3;
 /**
  * The commands this server provides (§4.1), as `/help` lists them to those
  * who may run them: `everyone`, `owners` (registered users other than bots),
@@ -330,6 +334,7 @@ const JOIN_INVITE_TTL_MS = 7 * 86_400_000;
 const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audience: "everyone" | "owners" | "admins" }> = [
 	{ name: "help", usage: "/help", help: "list the commands you can use here", audience: "everyone" },
 	{ name: "invite-bot", usage: "/invite-bot", help: "get a sign-in token for your bot; a new one replaces the last", audience: "owners" },
+	{ name: "invite-device", usage: "/invite-device <name>", help: `get a token that signs in as you on another device, named <name>; at most ${MAX_DEVICE_TOKENS} names, and a name again replaces its token`, audience: "owners" },
 	{ name: "avatar", usage: "/avatar", help: "set your avatar: send this command with one image attached", audience: "owners" },
 	{ name: "passkeys", usage: "/passkeys [remove <n>]", help: "list your account's passkeys, or remove one of them", audience: "owners" },
 	{ name: "admin", usage: "/admin [remove] <user_id>", help: "make a registered user an admin, or no longer one", audience: "admins" },
@@ -368,6 +373,12 @@ const BOT_KEY_PREFIX = "bot:";
 const INVITE_TOKEN_PREFIX = "apron_invite_";
 const INVITE_TOKEN_KEY_PREFIX = "invite-token:";
 const INVITE_KEY_PREFIX = "invite:";
+/** Device tokens (`/invite-device`): what they look like, their hashed keys, and each user's pointer to theirs. */
+const DEVICE_TOKEN_PREFIX = "apron_device_";
+const DEVICE_TOKEN_KEY_PREFIX = "device-token:";
+const DEVICES_KEY_PREFIX = "devices:";
+/** A device name: 1 to 32 letters, digits, `_`, `.` or `-`, starting with a letter or digit. */
+const DEVICE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$/;
 /** The protocol a bot's instructions point it at (`/invite-bot`). */
 const PROTOCOL_URL = "https://github.com/shazow/apron/blob/main/PROTOCOL.md";
 
@@ -409,6 +420,27 @@ interface StoredBot {
 interface StoredInviteToken {
 	v: 1;
 	userId: string;
+}
+
+/**
+ * A device token (`/invite-device`), stored only as its SHA-256 under
+ * DEVICE_TOKEN_KEY_PREFIX: the registered user it signs in as, and the
+ * device name it was minted under.
+ */
+interface StoredDeviceToken {
+	v: 1;
+	userId: string;
+	device: string;
+}
+
+/**
+ * A user's device tokens, under DEVICES_KEY_PREFIX: each device name with
+ * its token's key, oldest first, so a name again can revoke its token. A
+ * list, not an object keyed by name, so no name can be `__proto__`.
+ */
+interface StoredDevices {
+	v: 1;
+	devices: Array<{ name: string; tokenKey: string }>;
 }
 
 /**
@@ -455,6 +487,12 @@ async function sameToken(presented: string, configured: string): Promise<boolean
 
 async function sessionKey(token: string): Promise<string> {
 	return SESSION_KEY_PREFIX + await sha256Hex(token);
+}
+
+/** A user's device tokens as stored (StoredDevices), dropping anything malformed. */
+function storedDevices(stored: StoredDevices | undefined): StoredDevices["devices"] {
+	if (stored?.v !== 1 || !Array.isArray(stored.devices)) return [];
+	return stored.devices.filter((device) => typeof device?.name === "string" && typeof device.tokenKey === "string");
 }
 
 /** Longest connection endpoint an attachment keeps. */
@@ -604,6 +642,7 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			...(isObject(attachment.ext) && userExtFits(attachment.ext) ? { ext: attachment.ext } : {}),
 			...(typeof attachment.origin === "string" ? { origin: attachment.origin } : {}),
 			...(typeof attachment.endpoint === "string" && attachment.endpoint.length <= MAX_ENDPOINT_CHARS ? { endpoint: attachment.endpoint } : {}),
+			...(typeof attachment.device === "string" && DEVICE_NAME_PATTERN.test(attachment.device) ? { device: attachment.device } : {}),
 			...(challenge ? { challenge } : {}),
 			...(Array.isArray(attachment.rooms) ? {
 				rooms: attachment.rooms.filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 64).slice(0, MAX_ATTACHED_ROOMS),
@@ -1801,6 +1840,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (this.config.adminToken !== undefined && await sameToken(token, this.config.adminToken)) await this.handleAdminToken(socket, attachment, request);
 			else if (token.startsWith(BOT_TOKEN_PREFIX)) await this.handleBotToken(socket, attachment, request, token);
 			else if (token.startsWith(INVITE_TOKEN_PREFIX)) await this.handleInviteToken(socket, attachment, request, token);
+			else if (token.startsWith(DEVICE_TOKEN_PREFIX)) await this.handleDeviceToken(socket, attachment, request, token);
 			else if (token.startsWith(JOIN_TOKEN_PREFIX)) await this.handleJoinToken(socket, attachment, request, token);
 			else await this.handleTokenResume(socket, attachment, request);
 			return;
@@ -2111,6 +2151,26 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
+	 * Signs a user in with a token they made for another device
+	 * (`/invite-device`), through the `token` scheme (§3.2), from any origin
+	 * like an invite token. The connection keeps the device name, so the
+	 * next token for that name closes it.
+	 */
+	private async handleDeviceToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, token: string): Promise<void> {
+		return this.withSessionLock(async () => {
+			if (attachment.tier === "registered") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
+			if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "too_large", message: "token is too long" } satisfies ProtocolError;
+			const key = DEVICE_TOKEN_KEY_PREFIX + await sha256Hex(token);
+			const stored = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredDeviceToken>(key));
+			const invalid = { name: "denied", message: "This device token is not valid; get a new one with /invite-device on a signed-in device" } satisfies ProtocolError;
+			if (!stored || stored.v !== 1 || typeof stored.userId !== "string" || typeof stored.device !== "string") throw invalid;
+			const identity = this.store.getIdentity(stored.userId);
+			if (!identity) throw invalid;
+			await this.signInKeyless(socket, attachment, request, identity, undefined, false, stored.device);
+		});
+	}
+
+	/**
 	 * Signs in as the admin user with `APRON_ADMIN_TOKEN`, without a passkey. Like a
 	 * bot token it is taken from any origin; the user is a registered one,
 	 * created on first use, that can post, run `/invite-bot`, and run the admin
@@ -2132,11 +2192,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Finishes a bearer-token sign-in that has no passkey session behind it
-	 * (a bot, the admin user, an invited user, or one `created` by a sign-up
-	 * invite): the connection becomes the identity, and the guest it replaces
-	 * leaves as guestLeaves has it.
+	 * (a bot, the admin user, an invited user, one `created` by a sign-up
+	 * invite, or a user's other `device`): the connection becomes the
+	 * identity, and the guest it replaces leaves as guestLeaves has it.
 	 */
-	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[]; avatar?: string; roles: string[]; ext?: Record<string, unknown> }, token?: string, created = false): Promise<void> {
+	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[]; avatar?: string; roles: string[]; ext?: Record<string, unknown> }, token?: string, created = false, device?: string): Promise<void> {
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
 		this.assertRegisteredCapacity(socket, identity.userId);
 		// Read before the connection changes, so a failure leaves it as it was.
@@ -2150,6 +2210,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		setExt(attachment, identity.ext);
 		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
 		delete attachment.listedJoined;
+		if (device !== undefined) attachment.device = device;
 		writeSessionAttachment(socket, attachment);
 		this.prepareStatus(socket, stored);
 		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), ...(token ? { token } : {}) });
@@ -4083,6 +4144,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await this.inviteBot(socket, attachment, request, roomId);
 			return;
 		}
+		if (command.name === "invite-device") {
+			try {
+				if (words.length !== 2) throw { name: "invalid_params", message: `Usage: ${command.usage}` } satisfies ProtocolError;
+				await this.inviteDevice(socket, attachment, request, roomId, words[1]);
+			} catch (error) {
+				const protocol = errorToProtocol(error);
+				if (protocol.name !== "invalid_params") throw error;
+				this.fail(socket, request, protocol);
+			}
+			return;
+		}
 		if (command.name === "avatar") {
 			await this.startAvatar(socket, attachment, request, body);
 			return;
@@ -4319,10 +4391,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.reply(socket, request, {});
 	}
 
-	/** Revokes bot and invite tokens, so purged users cannot sign in again. */
+	/** Revokes bot, invite and device tokens, so purged users cannot sign in again. */
 	private async forgetTokens(userIds: readonly string[]): Promise<void> {
 		if (!userIds.length) return;
-		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 2 * userIds.length, writes: 4 * userIds.length }, async () => {
+		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 3 * userIds.length, writes: (5 + MAX_DEVICE_TOKENS) * userIds.length }, async () => {
 			for (const userId of userIds) {
 				for (const pointer of [BOT_KEY_PREFIX + userId, INVITE_KEY_PREFIX + userId]) {
 					const stored = await this.ctx.storage.get<StoredBot>(pointer);
@@ -4330,6 +4402,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 					await this.ctx.storage.delete(stored.tokenKey);
 					await this.ctx.storage.delete(pointer);
 				}
+				const devices = storedDevices(await this.ctx.storage.get<StoredDevices>(DEVICES_KEY_PREFIX + userId));
+				if (!devices.length) continue;
+				await this.ctx.storage.delete(devices.map((device) => device.tokenKey));
+				await this.ctx.storage.delete(DEVICES_KEY_PREFIX + userId);
 			}
 		}));
 	}
@@ -4372,6 +4448,18 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await this.ctx.storage.put<StoredInviteToken>(pointer.tokenKey, { v: 1, userId: to });
 			await this.ctx.storage.put<StoredBot>(INVITE_KEY_PREFIX + to, pointer);
 			await this.ctx.storage.delete(INVITE_KEY_PREFIX + from);
+		}));
+	}
+
+	/** After `/rename`, points the user's device tokens, if any, at the new `user_id`. */
+	private async moveDeviceTokens(from: string, to: string): Promise<void> {
+		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1, writes: MAX_DEVICE_TOKENS + 2 }, async () => {
+			const pointer = await this.ctx.storage.get<StoredDevices>(DEVICES_KEY_PREFIX + from);
+			const devices = storedDevices(pointer);
+			if (!devices.length) return;
+			await this.ctx.storage.put(Object.fromEntries(devices.map((device) => [device.tokenKey, { v: 1, userId: to, device: device.name } satisfies StoredDeviceToken])));
+			await this.ctx.storage.put<StoredDevices>(DEVICES_KEY_PREFIX + to, { v: 1, devices });
+			await this.ctx.storage.delete(DEVICES_KEY_PREFIX + from);
 		}));
 	}
 
@@ -4551,6 +4639,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		assertIssuableUserId(to);
 		const renamed = this.store.renameIdentity({ from, to, now: nowMs() });
 		await this.moveInviteToken(from, to);
+		await this.moveDeviceTokens(from, to);
 		for (const peer of this.connectionsOf(from)) {
 			const state = connectionAttachment(peer);
 			if (!state) continue;
@@ -4655,6 +4744,55 @@ export class ApronDemoServer extends DurableObject<Env> {
 			`- Database: ${databaseBytes === null ? "unknown" : mib(databaseBytes)} / ${mib(limits.databaseHardTargetBytes)}`,
 		);
 		this.sendNotice(socket, roomId, lines.join("\n"));
+		this.reply(socket, request, {});
+	}
+
+	/**
+	 * `/invite-device <name>`: mints a bearer token that signs in as the
+	 * sender from another device, from any origin, kept under `name`. A user
+	 * holds at most MAX_DEVICE_TOKENS; the same name again replaces its token,
+	 * and the user's other connections that signed in with the old one close.
+	 * The token goes to this connection only, in a `~private` notice before
+	 * the result (§1). It does not expire; `/purge` revokes it, and `/rename`
+	 * moves it.
+	 */
+	private async inviteDevice(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, name: string): Promise<void> {
+		const userId = attachment.userId!;
+		// A token would outlive APRON_ADMIN_TOKEN, as a passkey would.
+		if (userId === ADMIN_USER_ID) throw { name: "denied", message: "The admin user signs in with APRON_ADMIN_TOKEN only; make your own account an admin with /admin" } satisfies ProtocolError;
+		if (!DEVICE_NAME_PATTERN.test(name)) {
+			throw { name: "invalid_params", message: "A device name is 1 to 32 letters, digits, _, . or -, starting with a letter or digit" } satisfies ProtocolError;
+		}
+		const token = DEVICE_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+		const key = DEVICE_TOKEN_KEY_PREFIX + await sha256Hex(token);
+		const pointerKey = DEVICES_KEY_PREFIX + userId;
+		const replaced = await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1, writes: 3 }, async () => {
+			const devices = storedDevices(await this.ctx.storage.get<StoredDevices>(pointerKey));
+			const previous = devices.find((device) => device.name === name);
+			if (!previous && devices.length >= MAX_DEVICE_TOKENS) {
+				const names = devices.map((device) => `\`${device.name}\``).join(", ");
+				throw { name: "denied", message: `You have ${MAX_DEVICE_TOKENS} device tokens (${names}); run /invite-device with one of those names to replace its token` } satisfies ProtocolError;
+			}
+			// Revoke first: a failure between the writes leaves no token, never two.
+			if (previous) await this.ctx.storage.delete(previous.tokenKey);
+			await this.ctx.storage.put<StoredDeviceToken>(key, { v: 1, userId, device: name });
+			await this.ctx.storage.put<StoredDevices>(pointerKey, { v: 1, devices: [...devices.filter((device) => device !== previous), { name, tokenKey: key }] });
+			return !!previous;
+		}));
+		if (replaced) {
+			// Whatever ran with the old token loses its connections, and the user's pushes too:
+			// their other devices register again on their next connection.
+			if (this.config.push) this.store.clearPushSubscriptions(userId, nowMs());
+			for (const peer of this.connectionsOf(userId, socket)) {
+				const state = connectionAttachment(peer);
+				if (state?.device === name) this.closePolicy(peer, state, 1008, "Device token replaced; sign in with the new one");
+			}
+		}
+		this.sendNotice(socket, roomId, [
+			`This token signs in as you (\`${userId}\`) on your device **${name}**${replaced ? ", and replaces its earlier token" : ""}. It does not expire, and anyone who has it can sign in as you, so keep it secret. \`/invite-device ${name}\` again replaces it.`,
+			"```\n" + token + "\n```",
+			`To sign in, authenticate with the token scheme: \`{"method": "auth", "params": {"scheme": "token", "token": "${token}"}}\``,
+		].join("\n\n"));
 		this.reply(socket, request, {});
 	}
 

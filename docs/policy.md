@@ -80,6 +80,7 @@ within it:
   separate `status` request (below).
 - Commands: `/help` replies with a `~private` notice listing the commands the
   sender may run; `/invite-bot` gives a registered user a bot token (below);
+  `/invite-device <name>` gives them a token for another device (below);
   `/avatar` sets one with an attached image (below); other commands are
   `invalid_params`.
 - Uploads (cap `embed:upload`, Workers Paid budgets): registered users attach
@@ -275,6 +276,15 @@ user_id>` named "Bot of <their name>", and returns its bearer token in a
 first invite counts as a registration against the per-IP, daily, and identity
 caps. A bot posts under the registered quotas, keeps its rooms, cannot rename
 itself with `me`, and cannot invite bots. See [SPEC section 5](../SPEC.md#bots).
+
+A registered user's `/invite-device <name>` (not a bot's or the `admin`
+user's) returns a bearer token that signs in as them on another device, in a
+`~private` notice to that connection only. It signs in with `scheme: "token"`
+from any origin, or none, and does not expire. A user holds at most 3, each
+under its own name (1 to 32 letters, digits, `_`, `.` or `-`); the same name
+again replaces its token, closes the user's other connections that used the
+old one, and drops the user's push registrations. `/rename` moves the tokens
+and `/purge` revokes them. See [SPEC section 5](../SPEC.md#devices).
 
 Guest identities last for a socket, including hibernation. Repeated guest
 authentication on that socket preserves the identity. Reconnecting creates a

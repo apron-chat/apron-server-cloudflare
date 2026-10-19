@@ -188,6 +188,16 @@ token does not expire. Running `/invite-bot` again replaces it, signs out
 connections that used the old one, and renames the bot after your current name.
 The first invite counts as a registration. See [SPEC section 5](../SPEC.md#bots).
 
+## Other devices
+
+To sign in as yourself where your passkey isn't, such as another browser, a
+command-line client, or another origin, run `/invite-device <name>` (say
+`/invite-device laptop`). The `~private` notice holds a token that signs in
+as you with the token scheme, from any origin; it does not expire, so keep it
+secret. You can hold 3, each under its own name. Running `/invite-device`
+again with the same name replaces that token and signs out connections that
+used the old one. See [SPEC section 5](../SPEC.md#devices).
+
 This repository runs one: the [Announce workflow](../.github/workflows/announce.yml)
 posts each pull request merged into `main` to `general`, with a link preview
 (`og` title, description, and site name) built from the pull request, using
