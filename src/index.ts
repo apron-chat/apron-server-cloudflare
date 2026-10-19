@@ -209,6 +209,13 @@ function validRoomId(value: unknown): value is string {
 	return isProtocolId(value) && value.length <= 64;
 }
 
+/** An optional `user_id` param, which must be an ID (§2.4): not empty, with no whitespace or control characters. */
+function optionalUserId(params: Record<string, unknown>): string | undefined {
+	const value = optionalString(params, "user_id");
+	if (value !== undefined && !isProtocolId(value)) throw { name: "invalid_params", message: "user_id must be non-empty, with no whitespace or control characters" } satisfies ProtocolError;
+	return value;
+}
+
 /** A `status` notification from the server (§4.5): one of the user's mutes, unscoped when `roomId` is null. */
 function statusFrame(roomId: string | null, mute: number | boolean): Record<string, unknown> {
 	return { method: "status", params: { ...(roomId !== null ? { room_id: roomId } : {}), mute } };
@@ -2596,7 +2603,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!identity) throw { name: "denied", message: "Authenticate before joining rooms" } satisfies ProtocolError;
 		this.assertMayWrite(attachment);
 		const roomId = requiredString(request.params, "room_id");
-		const target = optionalString(request.params, "user_id");
+		const target = optionalUserId(request.params);
 		const known = this.store.getRoom(roomId, nowMs());
 		this.noteRoom(roomId, known !== null);
 		if (!known) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
@@ -2694,7 +2701,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!identity) throw { name: "denied", message: "Authenticate before leaving rooms" } satisfies ProtocolError;
 		this.assertMayWrite(attachment);
 		const roomId = requiredString(request.params, "room_id");
-		const target = optionalString(request.params, "user_id");
+		const target = optionalUserId(request.params);
 		if (!this.roomExists(roomId)) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
 		if (target !== undefined && target !== identity.user_id) {
 			this.assertMayManage(attachment, target, roomId, false);

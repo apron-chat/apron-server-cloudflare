@@ -398,6 +398,9 @@ it('rejects a mention that cannot be a user_id: empty, or with whitespace or con
 		try {
 			await authenticate(peer);
 			expect((await request(peer, 'bad-mention', 'message', { body: { text: 'x', mentions: ['bob', bad] } })).error.code, JSON.stringify(bad)).toBe(-32602);
+			// An edit carrying one is invalid too.
+			const posted = await exchange(peer, 'post', 'message', { body: { text: 'x', mentions: ['bob'] } });
+			expect((await request(peer, 'bad-edit', 'message', { message_id: posted.frame.result.message_id, body: { text: 'y', mentions: [bad] } })).error.code, JSON.stringify(bad)).toBe(-32602);
 		} finally { peer.close(); }
 	}
 });

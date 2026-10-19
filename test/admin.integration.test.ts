@@ -362,6 +362,25 @@ it('room_join and room_leave with a user_id add and remove others: an admin anyo
 	} finally { admin.close(); bob.close(); guest.close(); }
 });
 
+it('room_join and room_leave reject a user_id that cannot be one: empty, or with whitespace or control characters', async () => {
+	// A user_id is never empty and has no whitespace or control characters (§2.4),
+	// so these are invalid_params before any permission check. Each socket sends
+	// at most two, under the policy-violation limit.
+	for (const bad of ['', ' ', 'bo b', 'bob\n', 'bo\u0000b']) {
+		const bob = await signedIn(unique('bob'));
+		const guest = await connect();
+		try {
+			await guest.next();
+			await request(guest, 'auth', 'auth', { scheme: 'guest' });
+			const label = JSON.stringify(bad);
+			expect((await request(bob, 'join', 'room_join', { room_id: 'general', user_id: bad })).error.code, label).toBe(-32602);
+			expect((await request(bob, 'leave', 'room_leave', { room_id: 'general', user_id: bad })).error.code, label).toBe(-32602);
+			expect((await request(guest, 'join', 'room_join', { room_id: 'general', user_id: bad })).error.code, label).toBe(-32602);
+			expect((await request(guest, 'leave', 'room_leave', { room_id: 'general', user_id: bad })).error.code, label).toBe(-32602);
+		} finally { bob.close(); guest.close(); }
+	}
+});
+
 it('a room\'s creator may remove anyone from it, across saves and /rename, until /purge', async () => {
 	const admin = await signedInAdmin();
 	const bobId = unique('bob');

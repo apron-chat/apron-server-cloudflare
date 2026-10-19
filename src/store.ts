@@ -3581,7 +3581,8 @@ export class Store {
       if (!Array.isArray(body.mentions)) throw new StoreError("invalid_params", "body.mentions must be an array of user_id strings");
       const unique = new Set<string>();
       for (const item of body.mentions) {
-        // A string that cannot be a user_id mentions no one (§2.4).
+        // Mentions are user_ids (§2.4): a string that cannot be one makes the
+        // whole message, new or edited, invalid.
         if (!isProtocolId(item)) {
           throw new StoreError("invalid_params", "body.mentions must be an array of user_id strings");
         }
