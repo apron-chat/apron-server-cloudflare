@@ -214,8 +214,8 @@ describe('the status a user chooses (§4.5)', () => {
 			// Bob signing in is announced at once: nothing was announced for him this minute.
 			expect(told(await drain(alice), bobId)).toEqual(['online']);
 			// online, the default: idle once no connection is attended, after the minute.
-			await status(bob, { idle: true });
-			await status(bobToo, { idle: true });
+			await status(bob, { idle: 0 });
+			await status(bobToo, { idle: 0 });
 			expect(told(await drain(alice), bobId)).toEqual([]);
 			await advance(COALESCE / 2);
 			expect(told(await drain(alice), bobId)).toEqual([]);
@@ -378,7 +378,7 @@ describe('the status a user chooses (§4.5)', () => {
 			// Bob goes idle within the minute after his sign-in was announced:
 			// others were told online, and still are.
 			expect(told(await drain(alice), bobId)).toEqual(['online']);
-			await status(bob, { idle: true });
+			await status(bob, { idle: 0 });
 			await drain(lateFirst);
 			// Late's second connection signs in: measure what its auth does past
 			// the reads that sign it in.
@@ -429,7 +429,7 @@ describe('the status a user chooses (§4.5)', () => {
 			offset += COALESCE;
 			const idle = await measured((runtime, state) => {
 				const socket = state.getWebSockets().find((ws) => (ws.deserializeAttachment() as Attachment).userId === ids[0])!;
-				runtime.handleStatus(socket, { method: 'status', id: 'idle', params: { idle: true }, full: false });
+				runtime.handleStatus(socket, { method: 'status', id: 'idle', params: { idle: 0 }, full: false });
 			});
 			expect(idle).toEqual({ queries: [], reads: 0, writes: 0 });
 			const sweep = await measured((runtime) => runtime.flushPresence());
@@ -480,14 +480,14 @@ describe('user status timing', () => {
 		try {
 			expect(told(await drain(watcher), flipperId)).toEqual(['online']);
 			const mine: Frame[] = [...await drain(second)];
-			for (const idle of [true, false, true, false, true]) await status(flipper, { idle });
-			mine.push(...await status(second, { idle: true }));
+			for (const idle of [0, false, 0, false, 0]) await status(flipper, { idle });
+			mine.push(...await status(second, { idle: 0 }));
 			// Five changes, then a sixth, in the minute: only the latest goes out, once.
 			await advance(COALESCE);
 			expect(told(await drain(watcher), flipperId)).toEqual(['idle']);
 			// Back and forth within the next minute, ending where it was told: nothing.
 			mine.push(...await status(second, { idle: false }));
-			mine.push(...await status(second, { idle: true }));
+			mine.push(...await status(second, { idle: 0 }));
 			await advance(COALESCE);
 			expect(told(await drain(watcher), flipperId)).toEqual([]);
 			await status(flipper, { idle: false });
@@ -518,7 +518,7 @@ describe('user status timing', () => {
 			expect((await attachments()).some((state) => state.owed?.some(([id]) => id === mobileId))).toBe(false);
 			// A desktop tab closed while an idle phone stays: idle, after the grace too.
 			const desktop = await signedIn(mobileId, { existing: true });
-			await status(mobile, { idle: true });
+			await status(mobile, { idle: 0 });
 			await advance(COALESCE);
 			expect(told(await drain(watcher), mobileId)).toEqual([]);
 			await hangUp(desktop, mobileId);
@@ -546,7 +546,7 @@ describe('user status timing', () => {
 			const signedInFrames = await drain(watcher);
 			expect([...told(signedInFrames, leaverId), ...told(signedInFrames, stayerId)]).toEqual(['online', 'online']);
 			// One user goes idle within the minute, another leaves: both wait.
-			await status(stayer, { idle: true });
+			await status(stayer, { idle: 0 });
 			await hangUp(leaver, leaverId);
 			await advance(1_000);
 			const held = await attachments();
@@ -652,7 +652,7 @@ describe('user status timing', () => {
 		const joiner = await signedIn(joinerId);
 		try {
 			const roomId = (await request(owner, 'thread', 'room_set', { parent_room_id: 'general', title: 'Status join' })).result.room_id;
-			await status(joiner, { idle: true });
+			await status(joiner, { idle: 0 });
 			await drain(owner);
 			await request(joiner, 'join', 'room_join', { room_id: roomId });
 			// The membership record carries no status; the joiner's status follows it, as others were told it.
@@ -958,7 +958,7 @@ describe('server.status and what follows a sign-in (§3.1, §4.5)', () => {
 		try {
 			await drain(other);
 			// idle and mute with room_id: the room is muted, not everywhere, and the sending connection is idle.
-			const sent = await status(peer, { room_id: 'general', idle: true, mute: true });
+			const sent = await status(peer, { room_id: 'general', idle: 0, mute: true });
 			expect(sent.filter((frame) => frame.method === 'status').map((frame) => frame.params)).toEqual([{ room_id: 'general', mute: true }]);
 			expect((await drain(other)).filter((frame) => frame.method === 'status').map((frame) => frame.params)).toEqual([{ room_id: 'general', mute: true }]);
 			expect(await idleOf()).toEqual([false, true]);
@@ -1076,8 +1076,8 @@ describe('sign-ins, listings and attendance', () => {
 			expect(await listed(watcher, userId)).toMatchObject({ status: 'online' });
 			const attended = await runInDurableObject(stub(), (instance) => (instance as unknown as { attended(userId: string, now: number): boolean }).attended(userId, Date.now()));
 			expect(attended).toBe(true);
-			// Only `idle: true` makes it idle.
-			await status(quiet, { idle: true });
+			// Only `idle` with seconds makes it idle.
+			await status(quiet, { idle: 0 });
 			await advance(COALESCE);
 			expect(told(await drain(watcher), userId)).toEqual(['idle']);
 		} finally { watcher.close(); quiet.close(); }

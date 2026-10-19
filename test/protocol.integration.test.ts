@@ -44,11 +44,11 @@ const connect = ({ ip = `192.0.2.${nextIp++}`, ...options }: Partial<ConnectOpti
 
 async function authenticate(peer: Peer, scheme = 'guest', extraCaps: string[] = []) {
 	const { server } = await greeting(peer);
-	expect(server.params.apron).toBe(8);
+	expect(server.params.apron).toBe(9);
 	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'status', 'ext', 'ext:settings']);
 	expect(server.params.auth).toContain('webauthn');
 	expect(server.params.ping).toBe(45);
-	// The extension `ext:settings` keeps its data under its name in ext (§1, §4.12).
+	// The extension `ext:settings` keeps its data under its name in ext (§4, §4.12).
 	expect(Object.keys(server.params.ext)).toEqual(['settings']);
 	peer.send({ method: 'auth', id: 'auth', params: { scheme } });
 	const auth = await peer.next();
@@ -92,28 +92,42 @@ it('admits clients without Origin as guests without advertising or allowing pass
 		expect((await greeting(peer)).server.params.auth).toEqual(['token', 'guest']);
 		peer.send({ id: 'auth', method: 'auth', params: { scheme: 'guest' } });
 		expect((await peer.next()).result.you.user_id).toMatch(/^guest_/);
-		// A scheme the server defines but does not offer this connection is unsupported (§3.2), as is email.
+		// A scheme the server defines but does not offer this connection is unsupported (§3.2), as are email and external.
 		peer.send({ id: 'passkey', method: 'auth', params: { scheme: 'webauthn', action: 'register', step: 'begin' } });
 		expect((await peer.next()).error.code).toBe(-32601);
 		peer.send({ id: 'email', method: 'auth', params: { scheme: 'email', email: 'ada@example.com' } });
 		expect((await peer.next()).error.code).toBe(-32601);
+		peer.send({ id: 'external', method: 'auth', params: { scheme: 'external' } });
+		expect((await peer.next()).error.code).toBe(-32601);
 	} finally { peer.close(); }
 });
 
-it('rejects an auth scheme the spec does not define as invalid_params, and email as unsupported', async () => {
+it('rejects an auth scheme the spec does not define as invalid_params, and email and external as unsupported', async () => {
 	const peer = await connect({ path: '/' });
 	try {
-		await greeting(peer);
+		const { auth } = (await greeting(peer)).server.params;
+		expect(auth).not.toContain('email');
+		expect(auth).not.toContain('external');
 		// An unknown name that the request depends on is invalid_params (§1), before and after sign-in.
 		peer.send({ id: 'ext', method: 'auth', params: { scheme: 'ext:foo' } });
 		expect((await peer.next()).error.code).toBe(-32602);
-		// `email` is defined, but not offered here: unsupported (§3.2).
-		peer.send({ id: 'email', method: 'auth', params: { scheme: 'email', email: 'ada@example.com' } });
+		// `email` and `external` are defined, but not offered here: unsupported (§3.2),
+		// proposals and approvals alike.
+		peer.send({ id: 'email', method: 'auth', params: { scheme: 'email', email: 'ada@example.com', state: 'q8Rz' } });
+		expect((await peer.next()).error.code).toBe(-32601);
+		peer.send({ id: 'email-token', method: 'auth', params: { scheme: 'email', token: 'Hk41x9' } });
+		expect((await peer.next()).error.code).toBe(-32601);
+		peer.send({ id: 'external', method: 'auth', params: { scheme: 'external', return_url: 'https://web.apron.chat/', state: 'q8Rz' } });
+		expect((await peer.next()).error.code).toBe(-32601);
+		peer.send({ id: 'external-token', method: 'auth', params: { scheme: 'external', token: 'Hk41x9' } });
 		expect((await peer.next()).error.code).toBe(-32601);
 		peer.send({ id: 'auth', method: 'auth', params: { scheme: 'guest' } });
 		expect((await peer.next()).result.you.user_id).toMatch(/^guest_/);
 		peer.send({ id: 'ext2', method: 'auth', params: { scheme: 'ext:foo' } });
 		expect((await peer.next()).error.code).toBe(-32602);
+		// Still unsupported once signed in, where a proposal would be an addition (§4.11.1).
+		peer.send({ id: 'external2', method: 'auth', params: { scheme: 'external' } });
+		expect((await peer.next()).error.code).toBe(-32601);
 	} finally { peer.close(); }
 });
 
@@ -218,7 +232,7 @@ it('never answers a notification-only method sent with an id, even with invalid 
 		first.send({ id: 'activity-params', method: 'activity', params: [] });
 		expect(await drain(first)).toEqual([]);
 		second.send({ id: 'ping-params', method: 'ping', params: 5 });
-		let deep: unknown = { idle: true };
+		let deep: unknown = { idle: 0 };
 		for (let index = 0; index < DEFAULT_LIMITS.maxJsonDepth + 2; index++) deep = { nested: deep };
 		second.send({ id: 'activity-deep', method: 'activity', params: deep });
 		expect(await drain(second)).toEqual([]);
@@ -377,6 +391,17 @@ it('stores body.mentions as sent and never reads mentions out of text', async ()
 	} finally { peer.close(); }
 });
 
+it('rejects a mention that cannot be a user_id: empty, or with whitespace or control characters', async () => {
+	// A user_id is never empty and has no whitespace or control characters (§2.4).
+	for (const bad of ['', 'bo b', 'bob\n', 'bo\u0000b']) {
+		const peer = await connect();
+		try {
+			await authenticate(peer);
+			expect((await request(peer, 'bad-mention', 'message', { body: { text: 'x', mentions: ['bob', bad] } })).error.code, JSON.stringify(bad)).toBe(-32602);
+		} finally { peer.close(); }
+	}
+});
+
 it('rejects operations guests may not perform', async () => {
 	// Three invalid requests within a minute close a socket, so spread them.
 	const peer = await connect();
@@ -467,7 +492,7 @@ it('creates threads with room_set, delivers only to joined rooms, and moves mess
 		expect(thread.memberships).toBeUndefined();
 		expect([thread.first_log_id, thread.last_log_id, thread.more]).toEqual([roomId, followed.log_id, false]);
 		expect([thread.latest_log_id, thread.history_log_id]).toEqual([followed.log_id, roomId]);
-		// The move snapshot names the room holding its earlier snapshot (§2),
+		// The move snapshot names the room holding its earlier snapshot (§4.3.1),
 		// and a window bounded to one log_id reads that room's log only.
 		expect(moved.prev_log_id).toBe(original.log_id);
 		expect(moved.prev_room_id).toBe('general');
@@ -842,12 +867,12 @@ it('advertises the extension ext:settings', async () => {
 	} finally { peer.close(); }
 });
 
-it('speaks protocol v8: a sign-in welcome, no email sign-in, and ~private notices', async () => {
+it('speaks protocol v9: a sign-in welcome, no email sign-in, and ~private notices', async () => {
 	const withPasskeys = await connect();
 	const bot = await connect({ origin: null });
 	try {
 		const { server, welcome } = await greeting(withPasskeys);
-		expect(server.params).toMatchObject({ apron: 8, agent: 'apron-cloudflare-demo/8', auth: ['webauthn', 'token', 'guest'] });
+		expect(server.params).toMatchObject({ apron: 9, agent: 'apron-cloudflare-demo/9', auth: ['webauthn', 'token', 'guest'] });
 		// `server.welcome` is for the sign-in screen (§3.2), worded for this origin.
 		expect(server.params.welcome).toMatch(/Create a passkey/);
 		expect(server.params.welcome).toContain(`kept for ${Math.round(DEFAULT_LIMITS.retentionSeconds / 86_400)} days`);
@@ -891,7 +916,7 @@ it('links message snapshots to the previous one with prev_log_id, and never reac
 		expect(reacted.frame.params.prev_log_id).toBeUndefined();
 		alice.send({ id: 'react-again', method: 'reactions', params: { message_id: messageId, emojis: ['👍', '🎉'] } });
 		const again = await until(alice, (frame) => frame.method === 'reactions');
-		// Only room records and message snapshots carry prev_log_id (§2).
+		// Only room records and message snapshots carry prev_log_id (§4.3.1).
 		expect(again.frame.params.prev_log_id).toBeUndefined();
 		// Walking back: a window bounded to prev_log_id returns that snapshot.
 		const previous = await request(alice, 'previous', 'history', { after: edited.frame.params.prev_log_id, before: edited.frame.params.prev_log_id });

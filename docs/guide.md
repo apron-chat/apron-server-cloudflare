@@ -11,7 +11,7 @@ hibernating WebSockets. The backend supports guest access,
 discoverable passkeys, complete-snapshot history, message
 replacement/deletion/restoration/moves, thread rooms, emoji reactions, and a
 rolling retention floor. Guests only read (set `GUEST_POSTING=true` to let
-them post); signing in with a passkey lets a user post and invite a bot. It speaks protocol 8 with `history`,
+them post); signing in with a passkey lets a user post and invite a bot. It speaks protocol 9 with `history`,
 `edit`, `rooms`, `reactions`, `command` (`/help`, `/invite-bot`, and admin
 commands), and `ext` with its own extension `ext:settings`; `embed:upload`
 when uploads are configured; `status` and push when VAPID keys are set; and
@@ -147,10 +147,11 @@ frontend origins does not give an IP a fresh allowance. Honor `retry_after`.
 
 The `server` frame's `welcome` is CommonMark for your sign-in screen. The server
 advertises `token` (for bot tokens) and `guest` to custom frontends, and never
-`email`; `signup` names the schemes that create an account (`webauthn` on the
-demo's own site, and `token` for an admin's `/invite` sign-up token, whose
-`auth` result carries the new user's own token to save). A user who signed up
-with a token can add a passkey by registering one while signed in.
+`email` or `external`; `signup` names the schemes that create an account
+(`webauthn` on the demo's own site, and `token` for an admin's `/invite`
+sign-up token, whose `auth` result carries the new user's own token to save).
+A user who signed up with a token can add a passkey by registering one while
+signed in.
 `web.apron.chat` additionally receives `webauthn`, and its `token` also resumes
 passkey sessions; inspect each connection's `server.params.auth` rather than
 assuming passkeys are available everywhere.
@@ -368,7 +369,7 @@ For direct Wrangler production commands, always pass
    no paid-service bindings. Apply the initial migration once using the normal
    Wrangler deployment workflow. Do not rename or recreate the production
    object to work around a quota or schema issue. The current schema is 8
-   (protocol 8, with push subscriptions, user status, and users' `ext`); a
+   (with push subscriptions, user status, and users' `ext`); a
    schema 7 object, which the deployed demo holds, is upgraded in place on its
    first wake, keeping everything: it gains the empty push and status tables
    (`push_subscriptions`, `push_wakes`, `user_status`, `room_mutes`) and the

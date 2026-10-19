@@ -22,7 +22,7 @@ export interface StoredIdentity {
 	name: string;
 	userHandle: string;
 	credentialCount: number;
-	/** Rooms the identity has joined (protocol §4.3.2), kept across connections. */
+	/** Rooms the identity has joined (protocol §4.2.2), kept across connections. */
 	rooms: string[];
 	/** The identity's avatar while it lasts (protocol §4.8.6). */
 	avatar?: string;
@@ -30,4 +30,12 @@ export interface StoredIdentity {
 	roles: string[];
 	/** The identity's `ext` (protocol §4.12), kept in its row; absent when empty. */
 	ext?: Record<string, unknown>;
+}
+
+/**
+ * Whether `value` can be a `user_id` or `room_id` (protocol §2.4): a string
+ * that is not empty and has no whitespace or control characters.
+ */
+export function isProtocolId(value: unknown): value is string {
+	return typeof value === "string" && /^[^\s\p{Cc}]+$/u.test(value);
 }

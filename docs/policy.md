@@ -8,7 +8,7 @@ can turn it off and on with `/toggle activity`. With push configured it
 also advertises `status`, and shows each user's status to others
 (presence, below; `/toggle presence`). History availability uses each room's `latest_log_id` and
 nullable `history_log_id`, without extension negotiation. See
-[history and recovery](https://github.com/shazow/apron/blob/main/PROTOCOL.md#42-history) and the
+[history and recovery](https://github.com/shazow/apron/blob/main/PROTOCOL.md#43-history) and the
 [retention implementation specification](../SPEC.md#9-rolling-history-and-base-protocol-availability).
 
 WebAuthn uses the canonical [optional authentication scheme](https://github.com/shazow/apron/blob/main/PROTOCOL.md#410-webauthn-authentication),
@@ -100,14 +100,14 @@ within it:
   offer them; with it off the list is left out. Their own `you` shows
   the choice; it lasts until changed, on every device, and is kept while
   status is turned off too. Guests may choose one for their connection.
-  A signed-in client sends the request `status` `{"idle": true}` when
-  nobody is attending a connection (an unfocused tab, a backgrounded app)
-  and `{"idle": false}` when someone is again; only that ends it. A
-  connection starts attended, with nothing kept from earlier ones, and
-  stays attended until it sends `{"idle": true}`, however quiet it is:
-  the server never guesses. A connection may go idle 12 times a minute;
-  past that `{"idle": true}` gets `retry_after`. `{"idle": false}` is never
-  refused.
+  A signed-in client sends the request `status` `{"idle": 300}`, the
+  seconds since anyone attended it, when nobody is attending a connection
+  (an unfocused tab, a backgrounded app) and `{"idle": false}` when someone
+  is again; only that ends it. A connection starts attended, with nothing
+  kept from earlier ones, and stays attended until it sends `idle` with
+  seconds, however quiet it is: the server never guesses. A connection may
+  go idle 12 times a minute; past that `idle` gets `retry_after`.
+  `{"idle": false}` is never refused.
   `{"mute": 3600}` (or `true`, until changed) stops a signed-in user's
   pushes; `{"mute": false}` ends it (seconds are a positive integer, so `0`
   is `invalid_params`). With `room_id`, it mutes that
@@ -265,7 +265,7 @@ a passkey to post or join rooms"). Every connection gets a `~private` welcome
 saying so right after the `server` frame, before any `auth`, with no
 `room_id` (protocol Appendix B). The `server` frame's `welcome` says the same
 for the sign-in screen: how guests, passkeys, invites, and bot tokens fit
-together, and how long messages are kept. There is no email sign-in.
+together, and how long messages are kept. There is no email or external sign-in.
 
 A registered user's `/invite-bot` creates or renames their bot, `bot_<their
 user_id>` named "Bot of <their name>", and returns its bearer token in a
@@ -303,8 +303,8 @@ reacting users per message, push `wake` entries, invite uses, passkeys, roles,
 room mutes, threads) is `denied`; a value past its size limit is `too_large`;
 other rejected values are `invalid_params`. A request method sent without an
 `id`, and an `id` on `activity` or `ping`, are ignored. An `auth` scheme the
-server does not offer the connection (`email` always, `webauthn` from an
-origin not configured for passkeys) is `unsupported`.
+server does not offer the connection (`email` and `external` always,
+`webauthn` from an origin not configured for passkeys) is `unsupported`.
 
 Guest posting allowances (with `GUEST_POSTING=true`) are shared across a normalized IP; native IPv6
 addresses share a /64 bucket. Registered users also share the aggregate IP
