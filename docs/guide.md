@@ -136,8 +136,8 @@ The whole server processes at most 600 frames a
 minute (300 with the Free budgets); past that, requests get `retry_after` and the socket stays open. Anyone
 may create a thread (`room_set` with the `parent_room_id` of a top-level room);
 only an `admin` or `mod` may create a top-level room (`room_set` without
-`parent_room_id`, at most 16, kept for good) or edit one, and `general` itself
-cannot be edited. A thread's `description` (CommonMark)
+`parent_room_id`, at most 16, kept for good) or edit one, and only an `admin`
+may edit `general` itself. A thread's `description` (CommonMark)
 says what it is about, and any participant may change it. Every room is
 public: `private: true` is `unsupported`. System notices come from `~private`,
 `~room`, or `~server`; no user's `user_id` starts with `~`. This is a shared public room, not
