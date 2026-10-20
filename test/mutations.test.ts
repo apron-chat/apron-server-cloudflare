@@ -723,13 +723,18 @@ it("lets an admin or a mod create and edit top-level rooms, which hold threads a
 		expect(create("ada", "ada-room").room).toMatchObject({ title: "Room" });
 		expect(store.topLevelRoomIds()).toEqual(["general", roomId, expect.any(String)]);
 
-		// Anyone may start a thread in it; only an admin or mod may edit it, and general stays fixed.
+		// Anyone may start a thread in it; only an admin or mod may edit it, and only an admin general.
 		const threadId = String(create("alice", "alice-thread", { parent_room_id: roomId, title: "Side" }).result.room_id);
 		expect(store.getRoom(threadId)?.parent_room_id).toBe(roomId);
 		expect(errorCode(() => create("alice", "nested", { parent_room_id: threadId }))).toBe("denied");
 		for (const userId of ["alice", "reg", "tia"]) expect(errorCode(() => create(userId, `${userId}-edit`, { room_id: roomId, title: "Taken" }))).toBe("denied");
 		expect(create("ada", "ada-edit", { room_id: roomId, title: "Random chat" }).room).toMatchObject({ room_id: roomId, title: "Random chat" });
-		expect(errorCode(() => create("ada", "general-edit", { room_id: "general", title: "Lobby" }))).toBe("denied");
+		for (const userId of ["alice", "reg", "tia", "mia"]) expect(errorCode(() => create(userId, `${userId}-general`, { room_id: "general", title: "Taken" }))).toBe("denied");
+		expect(create("ada", "general-edit", { room_id: "general", title: "Lobby", description: "Say hi" }).room)
+			.toMatchObject({ room_id: "general", title: "Lobby", description: "Say hi" });
+		expect(store.getRoom("general")).toMatchObject({ title: "Lobby", description: "Say hi" });
+		// A blank title falls back to general's own.
+		expect(create("ada", "general-reset", { room_id: "general", title: " " }).room).toMatchObject({ title: "General" });
 
 		// A role taken away takes the permission with it.
 		store.setRole({ userId: "mia", role: "mod", on: false, now: clock.value });

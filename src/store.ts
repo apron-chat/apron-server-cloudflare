@@ -750,7 +750,8 @@ export const MAX_CARRIED_PASSKEYS = 100;
 export const MODERATOR_ROLES: readonly string[] = ["admin", "mod", "threader"];
 /**
  * Roles whose registered holders may create top-level rooms beside
- * `general`, and save their client fields (§4.2.4). Such rooms are
+ * `general`, and save their client fields (§4.2.4); only `admin` may save
+ * `general`'s. Such rooms are
  * permanent, as `general` is: they neither expire nor go when emptied.
  */
 export const ROOM_CREATOR_ROLES: readonly string[] = ["admin", "mod"];
@@ -4867,7 +4868,8 @@ export class Store {
     // still render them (§4.2), and so do top-level rooms. An empty
     // description is no description.
     const topLevel = existing === undefined ? params.parent_room_id === undefined : existing?.parent_room_id === null;
-    const title = typeof titleParam === "string" && titleParam.trim() !== "" ? titleParam : topLevel ? DEFAULT_ROOM_TITLE : DEFAULT_THREAD_TITLE;
+    const fallbackTitle = existing?.room_id === ROOM_ID ? ROOM_TITLE : topLevel ? DEFAULT_ROOM_TITLE : DEFAULT_THREAD_TITLE;
+    const title = typeof titleParam === "string" && titleParam.trim() !== "" ? titleParam : fallbackTitle;
     const description = typeof descriptionParam === "string" && descriptionParam.trim() !== "" ? descriptionParam : undefined;
     // `ext` merges into the room's current one (§4.12, §4.2.4); the size check runs on the result.
     const roomFields = (stored: unknown): Record<string, unknown> => {
@@ -4917,8 +4919,9 @@ export class Store {
       };
     } else {
       if (!existing) throw new StoreError("invalid_params", "unknown room");
-      if (existing.room_id === ROOM_ID) throw new StoreError("denied", "The general room cannot be edited on this demo");
-      if (existing.parent_room_id === null && (!registered || !this.holdsRole(input.userId, ROOM_CREATOR_ROLES))) {
+      if (existing.room_id === ROOM_ID) {
+        if (!registered || !this.holdsRole(input.userId, ["admin"])) throw new StoreError("denied", "Only an admin may edit the general room");
+      } else if (existing.parent_room_id === null && (!registered || !this.holdsRole(input.userId, ROOM_CREATOR_ROLES))) {
         throw new StoreError("denied", "Only an admin or mod may edit a room; anyone may edit a thread");
       }
       // parent_room_id is fixed at creation; a submitted value is ignored.
