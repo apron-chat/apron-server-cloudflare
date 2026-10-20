@@ -5,6 +5,7 @@ import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTI
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
 import { fetchAccountUsage, type AccountUsageSnapshot } from "./account-usage";
 import { runBudgetGuard, watchForFlood } from "./budget-guard";
+import { sniffAudio } from "./audio";
 import { sniffImage } from "./image";
 import { signUploadToken, verifyUploadToken } from "./upload-token";
 import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
@@ -1028,8 +1029,9 @@ export async function fetchEntry(request: Request, env: Env, ctx?: ExecutionCont
 /**
  * `PUT /w/<token>`: a `write_url` (§4.8.3). The token's signature is checked
  * before the body is read, the Durable Object claims the upload so a URL
- * writes once, and the bytes must be a PNG, JPEG, GIF, or WebP image within
- * the token's size. The object is stored in R2 with the type its bytes
+ * writes once, and the bytes must be a PNG, JPEG, GIF, or WebP image, or for
+ * an attachment (not an avatar) WebM, Ogg, or MP4 audio, within the token's
+ * size. The object is stored in R2 with the type its bytes
  * show, then the Durable Object finishes the write; one it no longer wants
  * is deleted again.
  */
@@ -1077,14 +1079,15 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 		return fail(400, "The upload was interrupted");
 	}
 	if (body.byteLength !== length || body.byteLength > grant.maxBytes) return fail(400, "The body does not match its Content-Length");
-	const image = sniffImage(body);
-	if (!image) return fail(415, "Only PNG, JPEG, GIF, and WebP images can be uploaded");
+	const attachment = grant.key.startsWith("f/");
+	const sniffed = sniffImage(body) ?? (attachment ? sniffAudio(body) : null);
+	if (!sniffed) return fail(415, attachment ? "Only PNG, JPEG, GIF, and WebP images and WebM, Ogg, and MP4 audio can be uploaded" : "Only PNG, JPEG, GIF, and WebP images can be avatars");
 	try {
 		await media.put(grant.key, body, {
 			httpMetadata: {
-				contentType: image.type,
-				// Attached images never change; an avatar key is rewritten when refreshed.
-				cacheControl: grant.key.startsWith("f/") ? "public, max-age=604800, immutable" : "public, max-age=86400",
+				contentType: sniffed.type,
+				// Attachments never change; an avatar key is rewritten when refreshed.
+				cacheControl: attachment ? "public, max-age=604800, immutable" : "public, max-age=86400",
 			},
 		});
 	} catch {
@@ -1092,7 +1095,7 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 	}
 	let accepted = false;
 	try {
-		accepted = await stub.finishUpload({ key: grant.key, ok: true, bytes: body.byteLength, contentType: image.type, ...(image.width && image.height ? { width: image.width, height: image.height } : {}) });
+		accepted = await stub.finishUpload({ key: grant.key, ok: true, bytes: body.byteLength, contentType: sniffed.type, ...("width" in sniffed && sniffed.width && sniffed.height ? { width: sniffed.width, height: sniffed.height } : {}) });
 	} catch { /* not accepted */ }
 	if (!accepted) {
 		await media.delete(grant.key).catch(() => undefined);

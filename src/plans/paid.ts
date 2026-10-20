@@ -123,10 +123,11 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// monthly stop takes over before the hold ends.
 		holdSeconds: 30 * 60,
 	}),
-	// Images kept in R2 and served from its public bucket domain. At most 500
-	// uploads a day are about 16,000 writes a month (1 million free), and the
-	// stored-bytes cap keeps storage at half the free 10 GB-month whatever the
-	// mix of sizes: 500 full-size images a day for a week would be 17.5 GB.
+	// Images and voice clips kept in R2 and served from its public bucket
+	// domain, counted together. At most 500 uploads a day are about 16,000
+	// writes a month (1 million free), and the stored-bytes cap keeps storage
+	// at half the free 10 GB-month whatever the mix of types and sizes: 500
+	// full-size files a day for a week would be 17.5 GB.
 	uploads: Object.freeze({
 		maxFileBytes: 5 * 1024 * 1024,
 		maxAvatarBytes: 256 * 1024,

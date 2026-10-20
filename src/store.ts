@@ -4180,8 +4180,8 @@ export class Store {
 
   /**
    * Finishes a write exactly once (protocol §4.8.3). A file's message gets a
-   * new snapshot, with the embed completed (`url`, and `og.image` describing
-   * it) or, for a failed write, without it; an avatar becomes its owner's.
+   * new snapshot, with the embed completed (`url`, and `og.image` or, for a
+   * voice clip, `og.audio` describing it) or, for a failed write, without it; an avatar becomes its owner's.
    * A write that is not pending, came too late, or whose embed or message is
    * gone is not accepted, and its object is the caller's to delete.
    */
@@ -4229,7 +4229,7 @@ export class Store {
     const url = `${this.config.uploads?.mediaOrigin ?? ""}/${row.upload_key}`;
     if (row.purpose === "avatar") {
       const identity = this.identityRow(row.owner_id);
-      if (!ok || !identity) return { accepted: false, broadcasts: [], deletedUploads: this.releaseUploadRows([row]) };
+      if (!ok || !identity || !write.contentType!.startsWith("image/")) return { accepted: false, broadcasts: [], deletedUploads: this.releaseUploadRows([row]) };
       this.completeUploadRow(row, write.bytes!, write.contentType!);
       const replaced = this.rawRows<RawUploadRow>(
         `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
@@ -4249,7 +4249,8 @@ export class Store {
     if (ok) {
       this.completeUploadRow(row, write.bytes!, write.contentType!);
       const size = write.width && write.height ? { width: write.width, height: write.height } : {};
-      replacement = { ...embed, url, og: { ...(typeof embed.title === "string" ? { title: embed.title } : {}), image: { url, type: write.contentType, ...size } } };
+      const media = write.contentType!.startsWith("audio/") ? { audio: { url, type: write.contentType } } : { image: { url, type: write.contentType, ...size } };
+      replacement = { ...embed, url, og: { ...(typeof embed.title === "string" ? { title: embed.title } : {}), ...media } };
     } else deletedUploads = this.releaseUploadRows([row]);
     return { accepted: ok, broadcasts: this.rewriteEmbed(message, snapshot, row.embed_id!, replacement, now), deletedUploads };
   }
