@@ -1,6 +1,7 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { UPLOAD_POLICY } from '../src/budget';
+import { sniffAudio } from '../src/audio';
 import { sniffImage } from '../src/image';
 import { signUploadToken, verifyUploadToken } from '../src/upload-token';
 import { UPLOAD_WRITE_GRACE_MS, type Store } from '../src/store';
@@ -18,6 +19,13 @@ function png(width = 1, height = 1, bytes = 64): Uint8Array {
 	data.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]);
 	new DataView(data.buffer).setUint32(16, width);
 	new DataView(data.buffer).setUint32(20, height);
+	return data;
+}
+
+/** A WebM header as MediaRecorder writes it: EBML with DocType "webm". */
+function webm(bytes = 64): Uint8Array {
+	const data = new Uint8Array(bytes);
+	data.set([0x1a, 0x45, 0xdf, 0xa3, 0x9f, 0x42, 0x86, 0x81, 0x01, 0x42, 0x82, 0x84, ...new TextEncoder().encode('webm')]);
 	return data;
 }
 
@@ -92,6 +100,24 @@ describe('store uploads', () => {
 			expect(removed.deletedUploads).toEqual([write.write.key]);
 			// Guests cannot upload.
 			expect(errorCode(() => post(store, clock, 'guest_1', { body: { embeds: [{ kind: 'upload' }] } }))).toBe('denied');
+		});
+	});
+
+	it('completes a voice clip with og.audio, and keeps audio off avatars', async () => {
+		await withStore('uploads-audio', { uploads: UPLOADS }, (store, clock) => {
+			register(store, clock, 'vera');
+			const created = post(store, clock, 'vera', { body: { embeds: [{ kind: 'upload', title: 'voice-message.webm' }] } });
+			const write = writeOf(created.result);
+			expect(store.claimUpload(write.write.key, clock.value)).toBe(true);
+			const finished = store.finishUpload({ key: write.write.key, ok: true, bytes: 64, contentType: 'audio/webm' }, clock.value);
+			expect(finished.accepted).toBe(true);
+			const url = `${MEDIA}/${write.write.key}`;
+			expect((finished.broadcasts[0].params.body as { embeds: unknown[] }).embeds[0]).toEqual({ embed_id: write.embed_id, kind: 'upload', title: 'voice-message.webm', url, og: { title: 'voice-message.webm', audio: { url, type: 'audio/webm' } } });
+
+			const avatar = store.startAvatarUpload({ userId: 'vera', now: clock.value });
+			expect(store.claimUpload(avatar.key, clock.value)).toBe(true);
+			const refused = store.finishUpload({ key: avatar.key, ok: true, bytes: 64, contentType: 'audio/webm' }, clock.value);
+			expect(refused).toMatchObject({ accepted: false, deletedUploads: [avatar.key] });
 		});
 	});
 
@@ -314,6 +340,33 @@ describe('upload tokens and image sniffing', () => {
 		expect(sniffImage(webp)).toEqual({ type: 'image/webp', width: 100, height: 50 });
 		expect(sniffImage(new TextEncoder().encode('<html><script>alert(1)</script>'))).toBeNull();
 		expect(sniffImage(new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg"/>'))).toBeNull();
+		expect(sniffImage(webm())).toBeNull();
+	});
+
+	it('knows voice clips by their containers: WebM, Ogg, and MP4', () => {
+		const encode = (text: string) => new TextEncoder().encode(text);
+		expect(sniffAudio(webm())).toEqual({ type: 'audio/webm' });
+		const matroska = webm();
+		matroska.set(encode('mkv '), 12);
+		expect(sniffAudio(matroska)).toBeNull();
+		const ogg = (codec: string) => {
+			const data = new Uint8Array(64);
+			data.set(encode('OggS'), 0);
+			data[26] = 1;
+			data[27] = 19;
+			data.set(encode(codec), 28);
+			return data;
+		};
+		expect(sniffAudio(ogg('OpusHead'))).toEqual({ type: 'audio/ogg' });
+		expect(sniffAudio(ogg('\x01vorbis'))).toEqual({ type: 'audio/ogg' });
+		expect(sniffAudio(ogg('\x80theora'))).toBeNull();
+		const mp4 = (brand: string) => new Uint8Array([0, 0, 0, 24, ...encode('ftyp'), ...encode(brand), 0, 0, 0, 0]);
+		expect(sniffAudio(mp4('iso5'))).toEqual({ type: 'audio/mp4' });
+		expect(sniffAudio(mp4('M4A '))).toEqual({ type: 'audio/mp4' });
+		expect(sniffAudio(mp4('heic'))).toBeNull();
+		expect(sniffAudio(mp4('avif'))).toBeNull();
+		expect(sniffAudio(png())).toBeNull();
+		expect(sniffAudio(encode('<html><script>alert(1)</script>'))).toBeNull();
 	});
 });
 
@@ -377,6 +430,21 @@ describe('uploads end to end', () => {
 			// Deleting the message deletes its image.
 			await request(peer, 'delete', 'message', { message_id: messageId, deleted: true });
 			await expect.poll(async () => await media().head(key)).toBeNull();
+		} finally { peer.close(); }
+	});
+
+	it('writes a voice clip and publishes it as og.audio; an avatar refuses audio', async () => {
+		const peer = await signedIn(unique('speaker'));
+		try {
+			const { frame } = await exchange(peer, 'post', 'message', { body: { embeds: [{ kind: 'upload', title: 'voice-message.webm' }] } });
+			const messageId = frame.result.message_id;
+			expect((await put(frame.result.embeds[0].write_url, webm())).status).toBe(204);
+			const completed = (await until(peer, isMessage(messageId))).frame.params.body.embeds[0];
+			expect(completed).toEqual({ embed_id: frame.result.embeds[0].embed_id, kind: 'upload', title: 'voice-message.webm', url: expect.stringMatching(/^https:\/\/media\.test\/f\//), og: { title: 'voice-message.webm', audio: { url: completed.url, type: 'audio/webm' } } });
+			expect((await media().get(completed.url.slice('https://media.test/'.length)))?.httpMetadata?.contentType).toBe('audio/webm');
+
+			const avatar = await request(peer, 'avatar', 'command', { body: { text: '/avatar', embeds: [{ kind: 'upload' }] } });
+			expect((await put(avatar.result.embeds[0].write_url, webm())).status).toBe(415);
 		} finally { peer.close(); }
 	});
 

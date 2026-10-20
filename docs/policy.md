@@ -84,11 +84,12 @@ within it:
   `/avatar` sets one with an attached image (below); other commands are
   `invalid_params`.
 - Uploads (cap `embed:upload`, Workers Paid budgets): registered users attach
-  images as `upload` embeds, written to the `write_url` in their result and
+  images and voice clips as `upload` embeds, written to the `write_url` in their result and
   served from the media domain once finished (see
   [SPEC section 4.3](../SPEC.md#43-uploads-and-avatars)). Only PNG, JPEG, GIF,
-  and WebP are kept, at most 5 MB each (avatars 256 KB), 20 a day per user and
-  500 a day in all. Images last a week and avatars a month; an avatar lasts
+  and WebP images and WebM, Ogg, and MP4 audio are kept (avatars are images
+  only), at most 5 MB each (avatars 256 KB), 20 a day per user and 500 a day
+  in all, images and audio together. Attachments last a week and avatars a month; an avatar lasts
   while its owner keeps signing in. Every embed gets an `embed_id`, and saves
   keep embeds by it. Admins can turn uploads off and on with
   `/toggle uploads`. Clients should resize images and strip their metadata
