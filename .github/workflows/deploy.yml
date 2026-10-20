@@ -56,3 +56,21 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  # Reacts to the Announce workflow's posts of the pull requests this
+  # deploy shipped, as the same bot. It is its own job because the bot token
+  # is a secret of the announce environment; without it the job succeeds
+  # without reacting.
+  deployed:
+    needs: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: announce
+    steps:
+      - uses: apron-chat/apron-pr-bot/deployed@main
+        with:
+          server-url: wss://server.apron.chat/
+          token: ${{ secrets.APRON_BOT_TOKEN }}
+          # Optional; the room the announcements are in, `general` when unset.
+          room-id: ${{ vars.APRON_ROOM_ID }}
+          reaction: ✅
