@@ -57,7 +57,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
-  # Reacts ✅ to the Announce workflow's posts of the pull requests this
+  # Reacts to the Announce workflow's posts of the pull requests this
   # deploy shipped, as the same bot. It is its own job because the bot token
   # is a secret of the announce environment; without it the job succeeds
   # without reacting.
@@ -73,3 +73,4 @@ jobs:
           token: ${{ secrets.APRON_BOT_TOKEN }}
           # Optional; the room the announcements are in, `general` when unset.
           room-id: ${{ vars.APRON_ROOM_ID }}
+          reaction: ✅
