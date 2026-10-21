@@ -15,6 +15,12 @@ export function validateAdmission(admission = ADMISSION_BUDGET, limits = DEFAULT
 	if (admission.requestsPerIpMinute < limits.connectionAdmissionsPerIpMinute) {
 		throw new Error('Attempt budget must allow the configured per-IP connection admissions');
 	}
+	if (admission.requestsPerIpv6PrefixMinute < admission.requestsPerIpMinute) {
+		throw new Error('An IPv6 /48 must be allowed at least one address\'s attempts');
+	}
+	if (admission.objectRequestsPerLocationMinute < Math.max(admission.requestsPerIpv6PrefixMinute, limits.openConnections)) {
+		throw new Error('A location must be allowed a /48\'s attempts and a reconnect of every open connection');
+	}
 	if (admission.edgeWindowSeconds !== 10 || admission.edgeBlockSeconds !== 10) {
 		throw new Error('Free WAF supports only 10-second counting and mitigation windows');
 	}
@@ -30,11 +36,24 @@ export function validateEdgeStop(edgeStop) {
 }
 
 /**
- * The generated rate-limiter bindings. `flood`, for a plan with an edge stop,
- * adds the sampled per-location counter the Worker trips the stop on.
+ * The generated rate-limiter bindings. `shared` adds the attempt limits
+ * shared by an IPv6 /48 and by a whole location; `flood`, for a plan with an
+ * edge stop, adds the sampled per-location counter the Worker trips the stop on.
  */
-export function renderBinding(namespace, admission = ADMISSION_BUDGET, flood = undefined) {
+export function renderBinding(namespace, admission = ADMISSION_BUDGET, flood = undefined, shared = undefined) {
 	validateAdmission(admission);
+	let sharedBindings = '';
+	if (shared) {
+		sharedBindings = `
+[[ratelimits]]
+name = "PREFIX_ATTEMPTS"
+namespace_id = "${shared.prefixNamespace}"
+simple = { limit = ${admission.requestsPerIpv6PrefixMinute}, period = ${admission.workerWindowSeconds} }
+[[ratelimits]]
+name = "LOCATION_ATTEMPTS"
+namespace_id = "${shared.locationNamespace}"
+simple = { limit = ${admission.objectRequestsPerLocationMinute}, period = ${admission.workerWindowSeconds} }`;
+	}
 	let floodBinding = '';
 	if (flood) {
 		validateEdgeStop(flood.edgeStop);
@@ -49,7 +68,7 @@ simple = { limit = ${flood.edgeStop.floodRequestsPerColoMinute / flood.edgeStop.
 [[ratelimits]]
 name = "CONNECTION_ATTEMPTS"
 namespace_id = "${namespace}"
-simple = { limit = ${admission.requestsPerIpMinute}, period = ${admission.workerWindowSeconds} }${floodBinding}
+simple = { limit = ${admission.requestsPerIpMinute}, period = ${admission.workerWindowSeconds} }${sharedBindings}${floodBinding}
 ${end}`;
 }
 
@@ -197,10 +216,13 @@ function main() {
 	const workflow = readFileSync(new URL('.github/workflows/deploy.yml', root), 'utf8');
 	validateDeploymentConfiguration({ development, production, packageJson, workflow, budgetGuard: Boolean(ACCOUNT_USAGE_POLICY.monthly), uploads: Boolean(PLAN.uploads) });
 	const outputs = [];
-	for (const [file, namespace, floodNamespace] of [['wrangler.toml', '73001', '73003'], ['wrangler.production.toml', '73002', '73004']]) {
+	for (const [file, namespace, floodNamespace, prefixNamespace, locationNamespace] of [
+		['wrangler.toml', '73001', '73003', '73005', '73007'],
+		['wrangler.production.toml', '73002', '73004', '73006', '73008'],
+	]) {
 		const source = readFileSync(new URL(file, root), 'utf8');
 		const flood = PLAN.edgeStop ? { namespace: floodNamespace, edgeStop: PLAN.edgeStop } : undefined;
-		outputs.push([file, replaceBinding(source, renderBinding(namespace, ADMISSION_BUDGET, flood))]);
+		outputs.push([file, replaceBinding(source, renderBinding(namespace, ADMISSION_BUDGET, flood, { prefixNamespace, locationNamespace }))]);
 	}
 	const hosts = [...production.matchAll(/pattern\s*=\s*"([a-z0-9.-]+)"\s*,\s*custom_domain\s*=\s*true/g)];
 	if (hosts.length !== 1) throw new Error('Expected exactly one production custom domain');

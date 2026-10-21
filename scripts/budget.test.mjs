@@ -120,6 +120,16 @@ test('a plan with an edge stop also generates the sampled flood counter', () => 
 	assert.throws(() => validateEdgeStop({ ...edgeStop, holdSeconds: 0 }));
 });
 
+test('the /48 and location attempt limits are generated from the plan and kept consistent', () => {
+	const binding = renderBinding('123', ADMISSION_BUDGET, undefined, { prefixNamespace: '124', locationNamespace: '125' });
+	assert.match(binding, new RegExp(`name = "PREFIX_ATTEMPTS"\nnamespace_id = "124"\nsimple = \\{ limit = ${ADMISSION_BUDGET.requestsPerIpv6PrefixMinute}, period = 60 \\}`));
+	assert.match(binding, new RegExp(`name = "LOCATION_ATTEMPTS"\nnamespace_id = "125"\nsimple = \\{ limit = ${ADMISSION_BUDGET.objectRequestsPerLocationMinute}, period = 60 \\}`));
+	assert.doesNotMatch(renderBinding('123'), /PREFIX_ATTEMPTS|LOCATION_ATTEMPTS/);
+	assert.throws(() => validateAdmission({ ...ADMISSION_BUDGET, requestsPerIpv6PrefixMinute: ADMISSION_BUDGET.requestsPerIpMinute - 1 }), /48/);
+	assert.throws(() => validateAdmission({ ...ADMISSION_BUDGET, objectRequestsPerLocationMinute: DEFAULT_LIMITS.openConnections - 1 }), /location/);
+	assert.throws(() => validateAdmission({ ...ADMISSION_BUDGET, objectRequestsPerLocationMinute: 0 }));
+});
+
 test('with uploads, write URLs pass the invalid-request rule and the budget stop covers the media host', () => {
 	const plain = renderEdgeRules('chat.example.test');
 	assert.doesNotMatch(plain.custom.rules[0].expression, /\/w\//);

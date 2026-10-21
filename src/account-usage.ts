@@ -136,6 +136,19 @@ export function exceededAllowances(usage: Omit<AccountUsageSnapshot, "stop">): s
 	return exceeded;
 }
 
+/**
+ * Whether a snapshot still stops the server at `now`: through its UTC day,
+ * or, when it reached a monthly allowance, through its calendar month, so a
+ * monthly stop does not lift at midnight while the next reading is pending
+ * or failing.
+ */
+export function accountUsageStops(snapshot: AccountUsageSnapshot | null, now: number): boolean {
+	if (!snapshot?.stop) return false;
+	const today = dayFor(now);
+	if (snapshot.day === today) return true;
+	return snapshot.day.slice(0, 7) === today.slice(0, 7) && exceededAllowances(snapshot).some((name) => name.startsWith("monthly."));
+}
+
 export function accountUsageSnapshotFromResult(result: unknown, sampledAt: number): AccountUsageSnapshot {
 	if (!result || typeof result !== "object") throw new AccountUsageError("analytics result is missing");
 	const data = (result as { data?: unknown; errors?: unknown[] }).data;

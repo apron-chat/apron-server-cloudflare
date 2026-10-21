@@ -281,8 +281,8 @@ batches. Budget authority, credentials, and the room head are independent of
 retention. SQLite frees pages for reuse without necessarily shrinking the file.
 The inspected [workerd implementation](https://github.com/cloudflare/workerd/blob/main/src/workerd/api/sql.c++)
 reports occupied pages through `databaseSize`, excluding freelist pages. Pressure
-stops growth at 96 MiB and resumes only below 80 MiB; transactions also check the
-128 MiB hard target before committing. Recheck this runtime assumption on upgrades.
+stops growth at 768 MiB and resumes only below 640 MiB; transactions also check the
+1 GiB hard target before committing (96, 80 and 128 MiB with the Free budgets). Recheck this runtime assumption on upgrades.
 Do not delete the database or run unmetered VACUUM as a space-recovery measure.
 
 ## Continuous deployment
@@ -423,7 +423,8 @@ or `/ws` URL with `?apron_connection_status=1`. The response exposes `Retry-Afte
 through CORS and disables caching. It checks live connection capacity and the
 cached daily SQL budget without reserving SQL work or opening a socket; it is
 advisory, and the real upgrade still enforces every admission gate. The native
-per-IP attempt limiter also applies to these probes.
+attempt limiters (per address, per IPv6 /48, and per location) also apply to
+these probes.
 
 When the daily SQL guard stops work, a `daily_budget_exhausted` log records the
 reserved counters and limits once per object instance/day. Each operation reserves

@@ -3,7 +3,7 @@ import { createExecutionContext, createScheduledController, env as testEnv, wait
 import worker from "../src/index";
 import * as guard from "../src/budget-guard";
 import { ACCOUNT_USAGE_POLICY as POLICY, PLAN } from "../src/budget";
-import { EDGE_STOP_RULE_REF, resetFloodWatch, runBudgetGuard, watchForFlood } from "../src/budget-guard";
+import { EDGE_STOP_RULE_REF, readEdgeStop, resetFloodWatch, runBudgetGuard, watchForFlood } from "../src/budget-guard";
 
 const env = { ACCOUNT_ID: "account", ACCOUNT_ANALYTICS_TOKEN: "analytics", ZONE_ID: "zone", EDGE_STOP_TOKEN: "edge" };
 const rule = { id: "rule-1", ref: EDGE_STOP_RULE_REF, action: "block", expression: 'http.host eq "server.apron.chat"', description: "Apron: budget stop" };
@@ -112,6 +112,27 @@ describe("budget guard", () => {
 			// Tests configure no zone or tokens.
 			await expect(run.mock.results[0].value).resolves.toEqual({ outcome: "unconfigured" });
 		} finally { run.mockRestore(); }
+	});
+});
+
+describe("edge stop reading", () => {
+	it("reports the rule's state without changing it", async () => {
+		const on = api({ rules: [{ ...rule, enabled: true, last_updated: "2026-09-27T12:00:00Z" }] });
+		await expect(readEdgeStop(env, on.fetcher)).resolves.toEqual({ state: "on", updatedAt: "2026-09-27T12:00:00Z" });
+		const off = api({ enabled: false });
+		await expect(readEdgeStop(env, off.fetcher)).resolves.toEqual({ state: "off" });
+		expect([...on.updates, ...off.updates]).toEqual([]);
+		expect(off.calls.every(([, init]) => (init?.method ?? "GET") === "GET")).toBe(true);
+	});
+
+	it("tells why the guard cannot work", async () => {
+		const { fetcher, calls } = api();
+		await expect(readEdgeStop({ ...env, EDGE_STOP_TOKEN: undefined }, fetcher)).resolves.toEqual({ state: "unconfigured" });
+		await expect(readEdgeStop({ ...env, ZONE_ID: undefined }, fetcher)).resolves.toEqual({ state: "unconfigured" });
+		expect(calls).toHaveLength(0);
+		await expect(readEdgeStop(env, api({ rules: [] }).fetcher)).resolves.toEqual({ state: "rule_missing" });
+		const denied = vi.fn(async () => new Response("", { status: 403 })) as unknown as typeof fetch;
+		await expect(readEdgeStop(env, denied)).resolves.toEqual({ state: "unreadable", message: "ruleset HTTP 403" });
 	});
 });
 

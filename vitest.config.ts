@@ -12,6 +12,12 @@ export default defineConfig({
 			// test-only VAPID key pair and a stand-in push service; nothing is pushed
 			// unless a test registers a subscription and mentions its user.
 			miniflare: {
+				// Every suite's sockets reach the Worker from one location, so the
+				// shared location limit would couple unrelated tests. Raise it here;
+				// test/admission.integration.test.ts covers it with a stand-in.
+				ratelimits: {
+					LOCATION_ATTEMPTS: { namespace_id: "73007", simple: { limit: 1_000_000, period: 60 } },
+				},
 				bindings: {
 					GUEST_POSTING: "true",
 					ACTIVITY: "false",

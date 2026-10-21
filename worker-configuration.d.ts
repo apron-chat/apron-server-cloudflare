@@ -4,6 +4,8 @@ declare global {
 	interface Env {
 		DEMO: DurableObjectNamespace<ApronDemoServer>;
 		CONNECTION_ATTEMPTS: RateLimit;
+		PREFIX_ATTEMPTS: RateLimit;
+		LOCATION_ATTEMPTS: RateLimit;
 		FLOOD_WATCH?: RateLimit;
 		CF_VERSION_METADATA?: WorkerVersionMetadata;
 		ACCOUNT_ID?: string;
@@ -34,6 +36,8 @@ declare global {
 		interface Env {
 			DEMO: DurableObjectNamespace<ApronDemoServer>;
 			CONNECTION_ATTEMPTS: RateLimit;
+			PREFIX_ATTEMPTS: RateLimit;
+			LOCATION_ATTEMPTS: RateLimit;
 			FLOOD_WATCH?: RateLimit;
 			CF_VERSION_METADATA?: WorkerVersionMetadata;
 			ACCOUNT_ID?: string;

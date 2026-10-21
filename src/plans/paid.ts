@@ -17,8 +17,9 @@
 // - Durable Object requests: about 21,000 of the 32,000 daily share, from
 //   150,000 frames at 20 incoming WebSocket messages a request (7,500), a full
 //   100 connections pinging every 45 seconds (9,600), 4,000 admissions, and
-//   alarms. Rejected connection attempts also reach the object; the
-//   account-usage stop at 90% covers them.
+//   alarms. Rejected connection attempts also reach the object, at most
+//   `objectRequestsPerLocationMinute` a minute from each location; the
+//   account-usage stop at 90% covers the rest.
 // - Durable Object duration: one object awake all day is 10,800 GB-s, under
 //   the 12,900 daily share, so duration cannot run over. User status spends
 //   it rather than requests: one timer keeps the object awake up to a minute
@@ -69,8 +70,8 @@ export const PAID_PLAN: Plan = Object.freeze({
 		databaseHardTargetBytes: 1024 * 1024 * 1024,
 		databaseResumeLowWaterBytes: 640 * 1024 * 1024,
 	}),
-	// The per-IP attempt limiter still guards Durable Object requests, which
-	// Paid includes fewer of than Free.
+	// The attempt limiters still guard Durable Object requests, which Paid
+	// includes fewer of than Free.
 	admission: FREE_PLAN.admission,
 	// Monthly included usage divided by 31 days, rounded down, so stopping
 	// under the daily share every day keeps the month inside what $5 covers.

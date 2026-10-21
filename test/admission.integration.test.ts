@@ -50,10 +50,46 @@ it('groups IPv6 attempts by /64, ignoring supplied internal keys', async () => {
 	expect(await (await fetchEntry(upgrade('2001:db8:feed:1235::1'), withoutObject())).text()).toContain('Demo capacity unavailable');
 });
 
-it('fails closed when the limiter binding is missing', async () => {
-	const response = await fetchEntry(upgrade('198.18.1.4'), withoutObject({ CONNECTION_ATTEMPTS: undefined }));
-	expect(response.status).toBe(503);
-	expect(await response.text()).toContain('Demo admission unavailable');
+it('limits a native IPv6 /48 across its /64s', async () => {
+	const perAddress = ADMISSION_BUDGET.requestsPerIpMinute;
+	const perPrefix = ADMISSION_BUDGET.requestsPerIpv6PrefixMinute;
+	let sent = 0;
+	for (let subnet = 0; sent < perPrefix; subnet++) {
+		for (let i = 0; i < perAddress && sent < perPrefix; i++, sent++) {
+			const response = await fetchEntry(upgrade(`2001:db8:cafe:${subnet.toString(16)}::${i + 1}`), withoutObject());
+			expect(await response.text()).toContain('Demo capacity unavailable');
+		}
+	}
+	const denied = await fetchEntry(upgrade('2001:db8:cafe:ffff::1'), withoutObject());
+	expect(denied.status).toBe(429);
+	expect(denied.headers.get('Retry-After')).toBe(String(ADMISSION_BUDGET.workerWindowSeconds));
+	expect(await (await fetchEntry(upgrade('2001:db8:cafd::1'), withoutObject())).text()).toContain('Demo capacity unavailable');
+});
+
+it('stops passing attempts to the Durable Object past the location limit', async () => {
+	// A stand-in for the location's limiter, so the suite's other attempts
+	// in this minute do not count against it.
+	let count = 0;
+	const LOCATION_ATTEMPTS = { limit: async ({ key }: { key: string }) => {
+		expect(key).toBe('location');
+		return { success: ++count <= ADMISSION_BUDGET.objectRequestsPerLocationMinute };
+	} } as unknown as RateLimit;
+	for (let i = 0; i < ADMISSION_BUDGET.objectRequestsPerLocationMinute; i++) {
+		const response = await fetchEntry(upgrade(`198.19.${Math.floor(i / 250)}.${(i % 250) + 1}`), withoutObject({ LOCATION_ATTEMPTS }));
+		expect(await response.text()).toContain('Demo capacity unavailable');
+	}
+	const busy = await fetchEntry(upgrade('198.19.200.1'), withoutObject({ LOCATION_ATTEMPTS }));
+	expect(busy.status).toBe(503);
+	expect(busy.headers.get('Retry-After')).toBe(String(ADMISSION_BUDGET.workerWindowSeconds));
+	expect(await busy.text()).toContain('Demo is busy');
+});
+
+it('fails closed when a limiter binding is missing', async () => {
+	for (const missing of ['CONNECTION_ATTEMPTS', 'PREFIX_ATTEMPTS', 'LOCATION_ATTEMPTS']) {
+		const response = await fetchEntry(upgrade('198.18.1.4'), withoutObject({ [missing]: undefined }));
+		expect(response.status).toBe(503);
+		expect(await response.text()).toContain('Demo admission unavailable');
+	}
 });
 
 it('rejects malformed upgrades without consuming valid connection attempts', async () => {

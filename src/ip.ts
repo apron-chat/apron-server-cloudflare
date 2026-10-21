@@ -2,7 +2,8 @@
 
 type CanonicalIp =
 	| { kind: "ipv4"; key: string; address: string }
-	| { kind: "ipv6"; key: string; address: string };
+	/** `prefixKey` is the address's /48, which one host or site may hold whole. */
+	| { kind: "ipv6"; key: string; prefixKey: string; address: string };
 
 function parseIpv4(value: string): number[] | null {
 	const parts = value.split(".");
@@ -110,7 +111,8 @@ export function canonicalizeIp(value: string): CanonicalIp | null {
 	// A /64 key deliberately discards the interface identifier. Keep the full
 	// canonical address only for internal tests; it is never logged or persisted.
 	const prefix = wordsToIpv6(words.slice(0, 4).concat([0, 0, 0, 0]));
-	return { kind: "ipv6", key: `v6:${prefix}/64`, address: wordsToIpv6(words) };
+	const site = wordsToIpv6(words.slice(0, 3).concat([0, 0, 0, 0, 0]));
+	return { kind: "ipv6", key: `v6:${prefix}/64`, prefixKey: `v6:${site}/48`, address: wordsToIpv6(words) };
 }
 
 function isPseudoIpv4(value: string): boolean {
@@ -149,7 +151,16 @@ function bytesToBase64Url(bytes: ArrayBuffer): string {
 
 /** Compact, deterministic rate-limit key. This unkeyed hash is not anonymization. */
 export async function hashIpKey(canonical: CanonicalIp): Promise<string> {
-	const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical.key));
+	return hashKey(canonical.key);
+}
+
+/** The rate-limit key of a native IPv6 address's /48, hashed like `hashIpKey`; none for IPv4. */
+export async function hashIpv6PrefixKey(canonical: CanonicalIp): Promise<string | null> {
+	return canonical.kind === "ipv6" ? hashKey(canonical.prefixKey) : null;
+}
+
+async function hashKey(key: string): Promise<string> {
+	const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(key));
 	return bytesToBase64Url(digest.slice(0, 16));
 }
 

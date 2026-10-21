@@ -3214,7 +3214,7 @@ export class Store {
         const day = dayFor(effective);
         const globalCount = global.day === day ? global.posts_day : 0;
         if (globalCount + count > this.config.processedFramesPerDay) {
-          throw new StoreError("retry_after", "Daily frame budget exhausted", { retryAfterMs: 86_400_000 });
+          throw new StoreError("retry_after", "Daily frame budget exhausted", { retryAfterMs: 86_400_000, data: { reason: "frame_budget" } });
         }
         this.updateLimitRow(global, { day, posts_day: globalCount + count }, effective);
       });
@@ -3490,7 +3490,7 @@ export class Store {
         const frames = this.limitRow("frames", "global", now);
         const frameCount = frames.day === day ? frames.posts_day : 0;
         if (frameCount >= this.config.processedFramesPerDay) {
-          throw new StoreError("retry_after", "Daily frame budget exhausted", { retryAfterMs: 86_400_000 });
+          throw new StoreError("retry_after", "Daily frame budget exhausted", { retryAfterMs: 86_400_000, data: { reason: "frame_budget" } });
         }
       });
     });

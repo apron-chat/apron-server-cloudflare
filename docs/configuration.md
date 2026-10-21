@@ -63,6 +63,20 @@ The binding is approximate and local to each Cloudflare location, not a global
 daily counter. NAT users share this limit. Development and production use distinct
 limiter namespaces; additional deployments must use distinct namespace IDs too.
 
+Two more limits, counted only for attempts their address's own limit let
+through, stop the per-address limit from being multiplied:
+
+- `requestsPerIpv6PrefixMinute` (30) is shared by a native IPv6 /48 at one
+  location, across all its /64s. One host can hold a whole /48, which would
+  otherwise give it 65,536 address limits. Past it, attempts get 429.
+- `objectRequestsPerLocationMinute` (200) is shared by every address at one
+  location: at most that many attempts a minute pass from there to the Durable
+  Object. Each costs a Durable Object request, the allowance Paid includes the
+  fewest of (32,000 a day), while a rejection before it costs only a Worker
+  request (320,000 a day). It is twice a reconnect of every open connection,
+  so a deploy or a wake does not reach it. Past it, attempts there get 503 and
+  `Retry-After` for the rest of the minute, while other locations go on.
+
 `ACCOUNT_USAGE_POLICY` in `src/budget.ts` defines the lightweight account-usage
 stop. The Durable Object refreshes after about 1,000 incoming events, no more
 often than once per minute, and treats a snapshot older than five minutes as
@@ -81,8 +95,9 @@ what the plan includes. Incoming WebSocket messages, which analytics report as
 bills them, and as a whole one on Free. On Paid it also reads usage since the
 start of the calendar month against the plan's `monthly` allowances. At 90% of
 any daily allowance, or `monthlyStopRatio` of a monthly one, the object
-persists a stop for that UTC day, rejects new connections,
-and closes live sockets. This is an early-stop signal, not an exact remaining-
+persists a stop, rejects new connections, and closes live sockets. A daily
+stop holds for that UTC day, and a monthly one for that calendar month, even
+while a refresh in the new day is pending or failing. This is an early-stop signal, not an exact remaining-
 quota meter: analytics lag, sampling, and other account workloads can still cause
 an earlier or later platform limit.
 
@@ -151,8 +166,12 @@ Set it up once per deployment:
 
 `npm run deploy` refuses a plan with monthly allowances unless the production
 config has the minute cron trigger and `ZONE_ID`. It cannot see secrets or the
-live rule; check the Worker's logs for `budget_guard_unconfigured` or
-`budget_guard_rule_missing` after deploying.
+live rule, and the guard only logs when it cannot work, so check after
+deploying: an admin's `/status` reads the rule with the guard's own zone and
+token and shows **Edge stop** as on, off, or **not working** with the reason
+(a missing var or secret, a missing rule, or the API's refusal). The Worker's
+logs record the same as `budget_guard_unconfigured`, `budget_guard_rule_missing`
+and `budget_guard_rule_failed`, one in ten of them with log sampling.
 
 What the guard cannot promise:
 

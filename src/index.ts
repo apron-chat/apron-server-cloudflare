@@ -3,13 +3,13 @@ import { AuthError, AuthTooLargeError, candidateUserIdFor, WebAuthnService, type
 import { isAllowedOrigin, loadConfig, pushHostAllowed, type RuntimeConfig } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
-import { fetchAccountUsage, type AccountUsageSnapshot } from "./account-usage";
-import { runBudgetGuard, watchForFlood } from "./budget-guard";
+import { accountUsageStops, fetchAccountUsage, type AccountUsageSnapshot } from "./account-usage";
+import { EDGE_STOP_RULE_REF, readEdgeStop, runBudgetGuard, watchForFlood } from "./budget-guard";
 import { sniffAudio } from "./audio";
 import { sniffImage } from "./image";
 import { signUploadToken, verifyUploadToken } from "./upload-token";
 import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
-import { extractClientIp, hashIpKey, stripForwardingHeaders } from "./ip";
+import { extractClientIp, hashIpKey, hashIpv6PrefixKey, stripForwardingHeaders } from "./ip";
 import {
 	DEFINED_AUTH_SCHEMES,
 	errorFromUnknown,
@@ -1129,12 +1129,19 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 	if (!clientIp) return responseError(403, "Trusted client address unavailable");
 	if (config.admissionOff) return responseError(503, "Demo admission is closed");
 	const key = await hashIpKey(clientIp);
+	const prefixKey = await hashIpv6PrefixKey(clientIp);
 	// This counts attempts, including connections subsequently rejected by the DO.
-	// Fail closed if the binding is absent or unavailable; never bypass admission.
+	// Fail closed if a binding is absent or unavailable; never bypass admission.
+	// The address is counted first, so an address over its own limit spends
+	// nothing its /48 or its location share; then the /48, then the location,
+	// which bounds the Durable Object requests every address there spends.
 	try {
-		if (!env.CONNECTION_ATTEMPTS) return responseError(503, "Demo admission unavailable");
-		const { success } = await env.CONNECTION_ATTEMPTS.limit({ key });
-		if (!success) return responseError(429, "Connection attempts exceeded", ADMISSION_BUDGET.workerWindowSeconds * 1_000);
+		const { CONNECTION_ATTEMPTS, PREFIX_ATTEMPTS, LOCATION_ATTEMPTS } = env;
+		if (!CONNECTION_ATTEMPTS || !PREFIX_ATTEMPTS || !LOCATION_ATTEMPTS) return responseError(503, "Demo admission unavailable");
+		const window = ADMISSION_BUDGET.workerWindowSeconds * 1_000;
+		if (!(await CONNECTION_ATTEMPTS.limit({ key })).success) return responseError(429, "Connection attempts exceeded", window);
+		if (prefixKey && !(await PREFIX_ATTEMPTS.limit({ key: prefixKey })).success) return responseError(429, "Connection attempts exceeded", window);
+		if (!(await LOCATION_ATTEMPTS.limit({ key: "location" })).success) return responseError(503, "Demo is busy; try again shortly", window);
 	} catch {
 		return responseError(503, "Demo admission unavailable");
 	}
@@ -1704,7 +1711,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return true;
 		} catch (error) {
 			const failure = errorToProtocol(error);
-			if (failure.message.includes("Daily frame budget")) {
+			if (failure.data?.reason === "frame_budget") {
 				for (const peer of this.ctx.getWebSockets()) {
 					const state = connectionAttachment(peer);
 					if (state) this.closePolicy(peer, state, 1013, "Demo capacity reached; try after daily reset");
@@ -4730,6 +4737,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		} else {
 			lines.push("**Cloudflare account**: no usage sample; set `ACCOUNT_ID` and `ACCOUNT_ANALYTICS_TOKEN` to read it.");
 		}
+		// A plan that bills past its allowances relies on the budget guard.
+		if (ACCOUNT_USAGE_POLICY.monthly) lines.push("", await this.edgeStopLine());
 		lines.push(
 			"",
 			`**Demo budgets, ${budget.day}** (reserved by this object)`,
@@ -4748,6 +4757,32 @@ export class ApronDemoServer extends DurableObject<Env> {
 		);
 		this.sendNotice(socket, roomId, lines.join("\n"));
 		this.reply(socket, request, {});
+	}
+
+	/**
+	 * `/status`'s line on the budget guard's edge stop rule, read (never
+	 * changed) with the guard's own zone and token, so a guard that cannot
+	 * work shows here rather than only in sampled logs.
+	 */
+	private async edgeStopLine(): Promise<string> {
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), 5_000);
+		try {
+			const edge = await readEdgeStop(this.runtimeEnv, fetch, controller.signal);
+			const rule = `**Edge stop** (\`${EDGE_STOP_RULE_REF}\`)`;
+			switch (edge.state) {
+				case "on": {
+					const since = Date.parse(edge.updatedAt ?? "");
+					return `${rule}: **on**, blocking new requests${Number.isFinite(since) ? ` since ${new Date(since).toISOString().slice(0, 16).replace("T", " ")} UTC` : ""}`;
+				}
+				case "off": return `${rule}: off; the guard's token can reach it`;
+				case "unconfigured": return `${rule}: **not working**: \`ZONE_ID\` or \`EDGE_STOP_TOKEN\` is not set, so nothing stops billed traffic at the edge`;
+				case "rule_missing": return `${rule}: **not working**: the zone has no such rule`;
+				case "unreadable": return `${rule}: **not working**: it can't be read (${edge.message})`;
+			}
+		} finally {
+			clearTimeout(timeout);
+		}
 	}
 
 	/**
@@ -5427,7 +5462,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	private accountUsageBlocked(now: number): boolean {
-		return this.accountUsageSnapshot?.day === new Date(now).toISOString().slice(0, 10) && this.accountUsageSnapshot.stop;
+		return accountUsageStops(this.accountUsageSnapshot, now);
 	}
 
 	private noteAccountUsageActivity(env: Env): void {

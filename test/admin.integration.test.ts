@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { DEFAULT_LIMITS } from '../src/budget';
+import { ACCOUNT_USAGE_POLICY, DEFAULT_LIMITS } from '../src/budget';
 import type { Store } from '../src/store';
 import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
 import { softPasskey } from './helpers/webauthn';
@@ -149,6 +149,9 @@ it('/status sends the caller the Cloudflare usage and the demo budgets', async (
 		expect(text).toMatch(new RegExp(`^- SQL rows written: [\\d,]+ / ${DEFAULT_LIMITS.sqlWritesPerDay.toLocaleString('en-US')} \\(\\d+%\\)$`, 'm'));
 		expect(text).toMatch(/^- Registered users: [\d,]+ \/ 10,000/m);
 		expect(text).toMatch(/^- Database: /m);
+		// Nor the budget guard's zone and token: a plan that relies on the guard says it can't work.
+		if (ACCOUNT_USAGE_POLICY.monthly) expect(text).toMatch(/^\*\*Edge stop\*\* \(`apron_budget_stop`\): \*\*not working\*\*: `ZONE_ID` or `EDGE_STOP_TOKEN` is not set/m);
+		else expect(text).not.toContain('Edge stop');
 	} finally { admin.close(); }
 });
 

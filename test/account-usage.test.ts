@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ACCOUNT_USAGE_POLICY } from "../src/budget";
-import { accountUsageSnapshotFromResult, exceededAllowances, fetchAccountUsage } from "../src/account-usage";
+import { accountUsageSnapshotFromResult, accountUsageStops, exceededAllowances, fetchAccountUsage } from "../src/account-usage";
 import { env, runInDurableObject } from "cloudflare:test";
 import { Store } from "../src/store";
 
@@ -154,6 +154,26 @@ describe("account usage snapshots", () => {
 		expect(() => accountUsageSnapshotFromResult(result({
 			durableObjectsPeriodicGroups: [{ sum: { duration: "unknown", rowsRead: 1, rowsWritten: 1 } }],
 		}), Date.now())).toThrow();
+	});
+
+	it("keeps a daily stop for its UTC day, and a monthly one for its month", () => {
+		const sampled = Date.parse("2026-09-21T23:50:00Z");
+		const nextDay = Date.parse("2026-09-22T00:10:00Z");
+		const nextMonth = Date.parse("2026-10-01T00:10:00Z");
+		expect(accountUsageStops(null, sampled)).toBe(false);
+		expect(accountUsageStops(accountUsageSnapshotFromResult(result(), sampled), sampled)).toBe(false);
+		const overDay = accountUsageSnapshotFromResult(result({
+			workersInvocationsAdaptive: [{ sum: { requests: ACCOUNT_USAGE_POLICY.daily.workerRequests } }],
+		}), sampled);
+		expect(accountUsageStops(overDay, sampled)).toBe(true);
+		expect(accountUsageStops(overDay, nextDay)).toBe(false);
+		const { monthly, monthlyStopRatio: ratio } = ACCOUNT_USAGE_POLICY;
+		if (!monthly || !ratio) return;
+		const overMonth = accountUsageSnapshotFromResult(result({
+			monthWorkers: [{ sum: { requests: 1, cpuTimeUs: monthly.workerCpuMs * ratio * 1_000 } }],
+		}), sampled);
+		expect(accountUsageStops(overMonth, nextDay)).toBe(true);
+		expect(accountUsageStops(overMonth, nextMonth)).toBe(false);
 	});
 
 	it("persists the snapshot in existing Durable Object metadata", async () => {

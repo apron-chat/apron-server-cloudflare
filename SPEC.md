@@ -309,7 +309,7 @@ Implementation reference: [WebAuthn verification](https://www.w3.org/TR/webauthn
 
 Extract Cloudflare's client address in the public entry Worker. Strip any incoming copy of the private forwarding field before setting trusted metadata for the DO. Do not trust `X-Forwarded-For`, client JSON, or a public query parameter. Account for documented Worker-subrequest and Pseudo IPv4 behavior; a missing/unusable trusted IP fails admission rather than creating a fresh unlimited bucket.
 
-Canonicalize IPv4 and IPv4-mapped IPv6 to the same IPv4 key; group native IPv6 by /64. Store the first 128 bits of SHA-256 of the canonical key, encoded as unpadded base64url. This requires no server secret and is a compact internal identifier, not anonymization. Keep the hash format stable across daily rollover and deployments to preserve active rolling windows. Public users behind NAT share IP limits; explain this tradeoff in the demo help text.
+Canonicalize IPv4 and IPv4-mapped IPv6 to the same IPv4 key; group native IPv6 by /64. The entry Worker also limits a native IPv6 /48's attempts together, since one host can hold a whole /48. Store the first 128 bits of SHA-256 of the canonical key, encoded as unpadded base64url. This requires no server secret and is a compact internal identifier, not anonymization. Keep the hash format stable across daily rollover and deployments to preserve active rolling windows. Public users behind NAT share IP limits; explain this tradeoff in the demo help text.
 
 Reference: [Cloudflare request headers](https://developers.cloudflare.com/fundamentals/reference/http-headers/).
 
@@ -412,9 +412,9 @@ DO incoming WebSocket messages have a 20:1 request-metering ratio; handshakes/RP
 | --- | ---: | --- |
 | SQL writes/day | 800,000 (Free: 80,000) | Up to 700,000 foreground; 100,000 reserved maintenance/control (Free: 60,000 and 20,000) |
 | SQL reads/day | 30,000,000 (Free: 3,000,000) | Up to 25,000,000 foreground; 5,000,000 reserved maintenance/control (Free: 2,500,000 and 500,000) |
-| Database operational high-water | 96 MiB | Suspend growth and prioritize expired-data cleanup |
-| Database hard target | 128 MiB | Includes indexes, control/auth state, and cleanup headroom |
-| Resume growth low-water | 80 MiB effective occupied storage | Avoid oscillating admission |
+| Database operational high-water | 768 MiB (Free: 96 MiB) | Suspend growth and prioritize expired-data cleanup |
+| Database hard target | 1 GiB (Free: 128 MiB) | Includes indexes, control/auth state, and cleanup headroom |
+| Resume growth low-water | 640 MiB (Free: 80 MiB) effective occupied storage | Avoid oscillating admission |
 | Cleanup batch | At most 100 source records | Further limited by measured reads/writes and available reserve |
 
 The daily post ceiling (10,000; Free: 5,000) is a maximum, not a promise. If the measured schema/traffic exhausts resources earlier, refuse work earlier. Do not claim capacity from a guess of one write per message. Include snapshot/log/index/dedup writes, limiter state, credential counters, alarms, failed work, expired-data deletion, migrations, and bookkeeping. Cleanup's workload includes yesterday's records while accepting today's. Avoid indexing every metadata column or enabling FTS.
@@ -425,13 +425,13 @@ Durable block reservation is allowed to avoid a SQL write on every incoming/reje
 
 Posting window timestamps and counters must survive reconnection/hibernation and concurrent sockets. Keep bounded persistent limiter keys for admitted principals, expire them after their applicable windows, and bound any additional in-memory negative cache. Never create one durable record per attacker-supplied request ID, failed credential, or rejected IP. Proposed limiter-record cap: 10,000, with old expired entries reclaimable in metered batches; new principals are denied when the cap is reached.
 
-The DO is the authoritative limiter. Cloudflare's edge Rate Limiting binding is optional preliminary filtering and cannot serve as an exact global budget: [documented locality/accuracy](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/).
+The DO is the authoritative limiter. Cloudflare's edge Rate Limiting binding is optional preliminary filtering and cannot serve as an exact global budget. The entry Worker uses it per address, per IPv6 /48, and per location; the per-location limit bounds the DO requests that rejected attempts spend, since a rejection in the Worker costs only a Worker request: [documented locality/accuracy](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/).
 
 ### Storage pressure
 
 Measure physical database bytes and bounded logical payload totals. Reject growth with enough margin for the largest admitted operation, indexes, and control updates; check again after commits. Deletions may free SQLite pages for reuse without shrinking `databaseSize`. A file staying large must not be mistaken for still-occupied data, and delete/reinsert churn must not make it grow without bound. Determine actual supported freelist/page instrumentation and page reuse in tests. Do not assume VACUUM is available or free, and do not put it on a request path.
 
-At pressure thresholds, purge only already-expired data and stop growth if that is insufficient. Do not silently shorten the advertised retention window to accept another message. A 128 MiB target does not guarantee a day's ceiling of maximum-size messages plus all ancillary data; size admission takes precedence. Never delete the whole database to reclaim chat space because it contains credential and quota authority.
+At pressure thresholds, purge only already-expired data and stop growth if that is insufficient. Do not silently shorten the advertised retention window to accept another message. The hard target does not guarantee a day's ceiling of maximum-size messages plus all ancillary data; size admission takes precedence. Never delete the whole database to reclaim chat space because it contains credential and quota authority.
 
 ### What can and cannot be guaranteed
 
