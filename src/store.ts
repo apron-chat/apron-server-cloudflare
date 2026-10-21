@@ -11,7 +11,6 @@
 import {
   BOOTSTRAP_ROW_RESERVATION,
   DEFAULT_LIMITS,
-  MAINTENANCE_CONTROL_RESERVE,
   MAX_EMOJI_BYTES,
   MAX_PUSH_CANDIDATES,
   MAX_PUSHES_PER_MESSAGE,
@@ -20,6 +19,18 @@ import {
   type UploadPolicy,
 } from "./budget";
 import type { AccountUsageSnapshot } from "./account-usage";
+import {
+  BudgetLedger,
+  MAINTENANCE_CONTROL_READS,
+  MAINTENANCE_CONTROL_WRITES,
+  BUDGET_COLUMNS,
+  type BudgetCost,
+  type BudgetDelta,
+  type BudgetSnapshot,
+  type CostEstimate,
+  type RawBudgetRow,
+} from "./budget-ledger";
+import { StoreError } from "./store-error";
 import { isStatusChoice, type StatusChoice } from "./presence";
 import { isProtocolId, type StoredCredential, type StoredIdentity } from "./domain.js";
 // @ts-expect-error Workers' nodejs_compat runtime supplies this module; the
@@ -63,53 +74,9 @@ export const RETENTION_MS = DEFAULT_LIMITS.retentionSeconds * 1000;
 const DEDUP_TTL_MS = DEFAULT_LIMITS.dedupTtlSeconds * 1000;
 const POST_WINDOW_MS = 60 * 1000;
 
-// Keep a small durable control reserve inside the maintenance allocation.
-// When a batch cannot be admitted, these rows are still enough to move the
-// persisted cleanup deadline to the next UTC budget reset.  Without this gap,
-// an exhausted maintenance budget would leave a due timestamp behind and an
-// alarm would wake the object continuously.
-const MAINTENANCE_CONTROL_READS = MAINTENANCE_CONTROL_RESERVE;
-const MAINTENANCE_CONTROL_WRITES = MAINTENANCE_CONTROL_RESERVE;
-
-// A budget row is retained for the active UTC day only.  Rollover pruning is
-// deliberately a tiny bounded operation: old rows are bookkeeping, and a
-// busy object may have accumulated more than one day while it was asleep.
-// Keep enough reservation headroom for the bounded DELETE and its index work.
-const BUDGET_PRUNE_RESERVATION_READS = 8;
-const BUDGET_PRUNE_RESERVATION_WRITES = 8;
-const BUDGET_PRUNE_BATCH = 4;
-
 type Tier = "anonymous" | "registered";
 
-type ErrorCode =
-  | "parse_error"
-  | "invalid_request"
-  | "unsupported"
-  | "invalid_params"
-  | "internal_error"
-  | "denied"
-  | "retry_after"
-  | "too_large";
-
-export class StoreError extends Error {
-  readonly code: ErrorCode;
-  /** Delay the socket layer reports as `data.retry_after`, in whole seconds. */
-  readonly retryAfterMs?: number;
-  /** Extra error `data` keys, such as `reason`. */
-  readonly data?: Record<string, unknown>;
-
-  constructor(
-    code: ErrorCode,
-    message: string,
-    options: { retryAfterMs?: number; data?: Record<string, unknown> } = {},
-  ) {
-    super(message);
-    this.name = "StoreError";
-    this.code = code;
-    this.retryAfterMs = options.retryAfterMs;
-    this.data = options.data;
-  }
-}
+export { StoreError };
 
 interface SqlCursorLike<T = Record<string, unknown>> {
   toArray?: () => T[];
@@ -273,15 +240,6 @@ export interface UploadWrite {
   contentType?: string;
   width?: number;
   height?: number;
-}
-
-interface CostEstimate {
-  reads?: number;
-  writes?: number;
-  frames?: number;
-  admissions?: number;
-  posts?: number;
-  registrations?: number;
 }
 
 const DEFAULT_CONFIG: StoreConfig = {
@@ -526,44 +484,6 @@ interface StoreCleanupResult {
   removed_rooms: string[];
   next_due_ms: number;
   did_work: boolean;
-}
-
-/** What crediting back a reservation's unused part costs: one indexed row update. */
-const REFUND_READS = 1;
-const REFUND_WRITES = 1;
-
-interface BudgetCost {
-  reads: number;
-  writes: number;
-  frames: number;
-  admissions: number;
-  posts: number;
-  registrations: number;
-  /** Set on a reservation charged to a day's budget row, so its unused part can be refunded. */
-  day?: string;
-  maintenance?: boolean;
-}
-
-interface BudgetSnapshot extends BudgetCost {
-  day: string;
-  foreground_reads: number;
-  foreground_writes: number;
-  maintenance_reads: number;
-  maintenance_writes: number;
-}
-
-interface RawBudgetRow {
-  day: string;
-  reads_reserved: number;
-  writes_reserved: number;
-  frames_reserved: number;
-  admissions_reserved: number;
-  posts_reserved: number;
-  registrations_reserved: number;
-  foreground_reads: number;
-  foreground_writes: number;
-  maintenance_reads: number;
-  maintenance_writes: number;
 }
 
 interface RawLogState {
@@ -1060,6 +980,11 @@ function dayFor(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10);
 }
 
+/** Uncharged maintenance work's addition to a day's budget row. */
+function maintenanceDelta(cost: { reads: number; writes: number }): BudgetDelta {
+  return { reads_reserved: cost.reads, writes_reserved: cost.writes, maintenance_reads: cost.reads, maintenance_writes: cost.writes };
+}
+
 function positiveLimit(value: number | undefined, defaultValue: number, max: number): number {
   if (value === undefined) return defaultValue;
   if (!Number.isInteger(value) || value <= 0) {
@@ -1454,13 +1379,8 @@ export class Store {
     reservedWrites: 0,
   };
   private lastEffectiveMs = 0;
-  private budgetCacheDay: string | null = null;
-  private budgetCache: RawBudgetRow | null = null;
-  private budgetStopLoggedDay: string | null = null;
-  private budgetHandoverPending = false;
-
-  /** UTC day for which this object has already attempted bounded row pruning. */
-  private budgetPruneDay: string | null = null;
+  /** The daily budget rows and today's cached copy (budget-ledger.ts), over this store's metered SQL. */
+  private readonly ledger: BudgetLedger;
   private accountingUnsafe = false;
   private accountingUnsafePersisted = false;
   private deferredCleanupUntil = 0;
@@ -1493,6 +1413,12 @@ export class Store {
     this.transactionSync = this.durableStorage?.transactionSync?.bind(this.durableStorage);
     this.config = defaultStoreConfig(config);
     this.clock = typeof clock === "function" ? { now: clock } : clock;
+    this.ledger = new BudgetLedger({
+      exec: (query, ...bindings) => this.rawExec(query, ...bindings),
+      rows: <T>(query: string, ...bindings: unknown[]) => this.rawRows<T>(query, ...bindings),
+      advanceClock: (now) => { this.effectiveNow(now); },
+      markUnsafe: () => this.markAccountingUnsafe(),
+    }, this.config);
   }
 
   /** Initializes schema once. Calling this on every hibernation wake is safe. */
@@ -1514,25 +1440,9 @@ export class Store {
         this.accountingUnsafe = true;
         this.accountingUnsafePersisted = true;
       }
-      const startupDay = dayFor(Math.max(this.lastEffectiveMs, this.clock.now()));
-      const startupRows = this.rawRows<RawBudgetRow>(
-        `SELECT day, reads_reserved, writes_reserved, frames_reserved,
-            admissions_reserved, posts_reserved, registrations_reserved,
-            foreground_reads, foreground_writes, maintenance_reads, maintenance_writes
-         FROM resource_budgets WHERE day = ? LIMIT 1`,
-        startupDay,
-      );
-      if (startupRows.length) {
-        this.budgetCacheDay = startupDay;
-        this.budgetCache = { ...startupRows[0] };
-      }
       // Schema/effective-clock handover reads are charged to the first
       // durable reservation after a wake. No schema rows are rewritten here.
-      this.budgetHandoverPending = true;
-      // The current row was loaded from durable state on this wake. Defer
-      // pruning until a later UTC rollover so constructor reads remain the
-      // only recurring work performed during a hibernation wake.
-      this.budgetPruneDay = startupDay;
+      this.ledger.wake(dayFor(Math.max(this.lastEffectiveMs, this.clock.now())));
       this.initialized = true;
       return;
     }
@@ -1544,31 +1454,12 @@ export class Store {
       // This marker is written only during a schema-version transition, never
       // on hibernation wakes or ordinary constructor calls.
       const startupCost = { reads: BOOTSTRAP_ROW_RESERVATION, writes: BOOTSTRAP_ROW_RESERVATION };
-      const startupDay = dayFor(now);
-      this.rawExec(
-        `INSERT OR IGNORE INTO resource_budgets
-         (day, reads_reserved, writes_reserved, frames_reserved, admissions_reserved,
-          posts_reserved, registrations_reserved, foreground_reads, foreground_writes,
-          maintenance_reads, maintenance_writes)
-         VALUES (?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)`,
-        startupDay,
-      );
-      this.rawExec(
-        "UPDATE resource_budgets SET reads_reserved = reads_reserved + ?, writes_reserved = writes_reserved + ?, maintenance_reads = maintenance_reads + ?, maintenance_writes = maintenance_writes + ? WHERE day = ?",
-        startupCost.reads,
-        startupCost.writes,
-        startupCost.reads,
-        startupCost.writes,
-        startupDay,
-      );
+      this.ledger.addUnchecked(dayFor(now), maintenanceDelta(startupCost));
       this.observed.reservedReads += startupCost.reads;
       this.observed.reservedWrites += startupCost.writes;
       return now;
     });
-    this.budgetCacheDay = null;
-    this.budgetCache = null;
-    this.budgetHandoverPending = true;
-    this.budgetPruneDay = dayFor(Math.max(this.lastEffectiveMs, now, this.clock.now()));
+    this.ledger.start(dayFor(Math.max(this.lastEffectiveMs, now, this.clock.now())));
     this.initialized = true;
   }
 
@@ -1656,18 +1547,7 @@ export class Store {
     this.rawExec("UPDATE _meta SET value = ? WHERE key = 'schema_version'", String(version));
     this.rawExec("UPDATE maintenance SET schema_version = ? WHERE id = 1", version);
     const cost = { reads: this.observed.reads - start.reads, writes: this.observed.writes - start.writes + 2 };
-    this.rawExec(
-      `INSERT OR IGNORE INTO resource_budgets
-       (day, reads_reserved, writes_reserved, frames_reserved, admissions_reserved,
-        posts_reserved, registrations_reserved, foreground_reads, foreground_writes,
-        maintenance_reads, maintenance_writes)
-       VALUES (?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)`,
-      day,
-    );
-    this.rawExec(
-      "UPDATE resource_budgets SET reads_reserved = reads_reserved + ?, writes_reserved = writes_reserved + ?, maintenance_reads = maintenance_reads + ?, maintenance_writes = maintenance_writes + ? WHERE day = ?",
-      cost.reads, cost.writes, cost.reads, cost.writes, day,
-    );
+    this.ledger.addUnchecked(day, maintenanceDelta(cost));
     this.observed.reservedReads += cost.reads;
     this.observed.reservedWrites += cost.writes;
   }
@@ -1705,13 +1585,7 @@ export class Store {
     const day = dayFor(Math.max(this.clock.now(), this.lastEffectiveMs));
     let carried: RawBudgetRow | null = null;
     try {
-      carried = this.rawRows<RawBudgetRow>(
-        `SELECT day, reads_reserved, writes_reserved, frames_reserved,
-            admissions_reserved, posts_reserved, registrations_reserved,
-            foreground_reads, foreground_writes, maintenance_reads, maintenance_writes
-         FROM resource_budgets WHERE day = ? LIMIT 1`,
-        day,
-      )[0] ?? null;
+      carried = this.ledger.readRow(day);
     } catch {
       // An unreadable old budget table carries nothing.
     }
@@ -1747,31 +1621,16 @@ export class Store {
       writes: this.observed.writes - writeStart.writes,
     };
     if (!carried && !carryCost.reads && !carryCost.writes) return;
-    const columns = ["reads_reserved", "writes_reserved", "frames_reserved", "admissions_reserved", "posts_reserved",
-      "registrations_reserved", "foreground_reads", "foreground_writes", "maintenance_reads", "maintenance_writes"] as const;
-    const values = columns.map((column) => {
-      const value = carried ? Math.max(0, integerColumn(carried[column])) : 0;
-      // The carry is maintenance work, charged like the bootstrap: added
-      // without a capacity check, so it cannot block the reset.
-      if (column === "reads_reserved" || column === "maintenance_reads") return value + carryCost.reads;
-      if (column === "writes_reserved" || column === "maintenance_writes") return value + carryCost.writes;
-      return value;
-    });
+    // The carry is maintenance work, charged like the bootstrap: added
+    // without a capacity check, so it cannot block the reset.
+    const charge = maintenanceDelta(carryCost);
+    const delta: BudgetDelta = {};
+    for (const column of BUDGET_COLUMNS) {
+      delta[column] = (carried ? Math.max(0, integerColumn(carried[column])) : 0) + (charge[column] ?? 0);
+    }
     this.observed.reservedReads += carryCost.reads;
     this.observed.reservedWrites += carryCost.writes;
-    this.transaction(() => {
-      this.rawExec(
-        `INSERT OR IGNORE INTO resource_budgets (day, ${columns.join(", ")}) VALUES (?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)`,
-        day,
-      );
-      this.rawExec(
-        `UPDATE resource_budgets SET ${columns.map((column) => `${column} = ${column} + ?`).join(", ")} WHERE day = ?`,
-        ...values,
-        day,
-      );
-    });
-    this.budgetCacheDay = null;
-    this.budgetCache = null;
+    this.transaction(() => this.ledger.addUnchecked(day, delta));
   }
 
   /**
@@ -1989,275 +1848,42 @@ export class Store {
     return effective;
   }
 
-  private normalizeCost(cost: CostEstimate = {}): BudgetCost {
-    return {
-      reads: Math.max(0, Math.ceil(cost.reads ?? 0)),
-      writes: Math.max(0, Math.ceil(cost.writes ?? 0)),
-      frames: Math.max(0, Math.ceil(cost.frames ?? 0)),
-      admissions: Math.max(0, Math.ceil(cost.admissions ?? 0)),
-      posts: Math.max(0, Math.ceil(cost.posts ?? 0)),
-      registrations: Math.max(0, Math.ceil(cost.registrations ?? 0)),
-    };
-  }
-
-  private budgetRow(day: string): RawBudgetRow {
-    const rows = this.rawRows<RawBudgetRow>(
-      `SELECT day, reads_reserved, writes_reserved, frames_reserved,
-          admissions_reserved, posts_reserved, registrations_reserved,
-          foreground_reads, foreground_writes, maintenance_reads, maintenance_writes
-       FROM resource_budgets WHERE day = ? LIMIT 1`,
-      day,
-    );
-    if (rows.length) return rows[0];
-    this.rawExec(
-      `INSERT INTO resource_budgets
-       (day, reads_reserved, writes_reserved, frames_reserved, admissions_reserved,
-        posts_reserved, registrations_reserved, foreground_reads, foreground_writes,
-        maintenance_reads, maintenance_writes)
-       VALUES (?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)`,
-      day,
-    );
-    return {
-      day,
-      reads_reserved: 0,
-      writes_reserved: 0,
-      frames_reserved: 0,
-      admissions_reserved: 0,
-      posts_reserved: 0,
-      registrations_reserved: 0,
-      foreground_reads: 0,
-      foreground_writes: 0,
-      maintenance_reads: 0,
-      maintenance_writes: 0,
-    };
-  }
-
-  private installBudgetCache(day: string, row: RawBudgetRow): RawBudgetRow {
-    this.budgetCacheDay = day;
-    this.budgetCache = { ...row };
-    return this.budgetCache;
-  }
-
-  /** Remove a bounded prefix of stale UTC budget rows after day rollover. */
-  private pruneBudgetRows(activeDay: string): void {
-    if (this.budgetPruneDay === activeDay) return;
-    // Mark the attempt before issuing SQL. A platform error must not make
-    // every subsequent request repeat the same maintenance work; the durable
-    // reservation remains charged and a later object/day can retry it.
-    this.budgetPruneDay = activeDay;
-    // Retain the immediately previous day for bounded operator inspection and
-    // crash/restart diagnostics. It cannot replenish the active day's lease,
-    // because reserveCost always keys authority by the current UTC day.
-    const activeStart = Date.parse(`${activeDay}T00:00:00.000Z`);
-    const pruneBefore = Number.isFinite(activeStart)
-      ? new Date(activeStart - 86_400_000).toISOString().slice(0, 10)
-      : activeDay;
-    this.rawExec(
-      `DELETE FROM resource_budgets
-       WHERE day IN (
-         SELECT day FROM resource_budgets
-         WHERE day < ? ORDER BY day ASC LIMIT ?
-       )`,
-      pruneBefore,
-      BUDGET_PRUNE_BATCH,
-    );
-  }
-
-  private reservationCost(costInput: CostEstimate, day: string): BudgetCost {
-    const cost = this.normalizeCost(costInput);
-    // A reservation includes its own bounded control work: effective-clock
-    // read/write, budget-row lookup/creation, and the durable counter update.
-    // Keep fixed headroom in every class so read-only callers still pay for
-    // the bookkeeping writes they cause.
-    cost.reads = Math.max(1, cost.reads + 8);
-    cost.writes = Math.max(1, cost.writes + 8);
-    if (this.budgetHandoverPending) {
-      cost.reads += 8;
-      cost.writes += 8;
-    }
-    if (this.budgetPruneDay !== day) {
-      cost.reads += BUDGET_PRUNE_RESERVATION_READS;
-      cost.writes += BUDGET_PRUNE_RESERVATION_WRITES;
-    }
-    return cost;
-  }
-
-  private checkBudgetCost(cost: BudgetCost, maintenance: boolean, candidateTime: number): void {
-    const row = this.budgetCache!;
-    const readCeiling = maintenance ? this.config.sqlReadsPerDay : this.config.foregroundReadsPerDay;
-    const writeCeiling = maintenance ? this.config.sqlWritesPerDay : this.config.foregroundWritesPerDay;
-    const readUsed = row.reads_reserved + cost.reads;
-    const writeUsed = row.writes_reserved + cost.writes;
-    const reserveReads = maintenance ? this.config.maintenanceReadsPerDay - MAINTENANCE_CONTROL_READS : 0;
-    const reserveWrites = maintenance ? this.config.maintenanceWritesPerDay - MAINTENANCE_CONTROL_WRITES : 0;
-    if (readUsed > this.config.sqlReadsPerDay || (!maintenance && row.foreground_reads + cost.reads > readCeiling) ||
-        (maintenance && row.maintenance_reads + cost.reads > reserveReads) ||
-        writeUsed > this.config.sqlWritesPerDay || (!maintenance && row.foreground_writes + cost.writes > writeCeiling) ||
-        (maintenance && row.maintenance_writes + cost.writes > reserveWrites)) {
-      const next = Math.max(1000, 86_400_000 - (candidateTime % 86_400_000));
-      const day = dayFor(candidateTime);
-      if (this.budgetStopLoggedDay !== day) {
-        this.budgetStopLoggedDay = day;
-        console.warn(JSON.stringify({ event: "daily_budget_exhausted", ...row,
-          requested_reads: cost.reads, requested_writes: cost.writes, maintenance,
-          foreground_read_limit: this.config.foregroundReadsPerDay,
-          foreground_write_limit: this.config.foregroundWritesPerDay,
-          total_read_limit: this.config.sqlReadsPerDay, total_write_limit: this.config.sqlWritesPerDay }));
-      }
-      throw new StoreError("retry_after", maintenance ? "Maintenance budget exhausted" : "Demo capacity reached", {
-        retryAfterMs: next,
-        data: { reason: "daily_budget" },
-      });
-    }
-  }
-
   /** Advisory capacity check: no SQL, reservations, or durable clock updates. */
   checkConnectionBudget(now = this.clock.now()): void {
     this.ensureReady();
     if (this.accountingUnsafe) throw new StoreError("internal_error", "storage accounting is unsafe; admission is closed");
     if (!this.config.admissionEnabled) throw new StoreError("denied", "Demo admission is closed");
-    const candidateTime = Math.max(Math.trunc(now), this.lastEffectiveMs);
-    const day = dayFor(candidateTime);
-    // The next real admission initializes a new day's budget. Never carry a
-    // previous day's exhausted allowance into a new day's diagnostic response.
-    if (!this.budgetCache || this.budgetCacheDay !== day) return;
-    this.checkBudgetCost(this.reservationCost({ reads: 64, writes: 32, admissions: 1 }, day), false, candidateTime);
+    this.ledger.checkConnection(Math.max(Math.trunc(now), this.lastEffectiveMs));
   }
 
+  /**
+   * Reserves an operation's bounded cost from today's budget before it runs
+   * (budget-ledger.ts), refusing it with `retry_after` past a ceiling. An
+   * admin command passes `unchecked`: it is charged but not refused.
+   */
   private reserveCost(costInput: CostEstimate, maintenance = false, now = this.clock.now(), unchecked = false): BudgetCost {
     this.ensureReady();
     if (this.accountingUnsafe) {
       throw new StoreError("internal_error", "storage accounting is unsafe; admission is closed");
     }
-    const candidateTime = Math.max(Math.trunc(now), this.lastEffectiveMs);
-    const candidateDay = dayFor(candidateTime);
-    try {
-      if (this.budgetCacheDay !== candidateDay || !this.budgetCache) {
-        // This is the one bounded wake/day rollover read. Once loaded, the
-        // synchronous DO serialization makes the cache authoritative until
-        // the next day, so repeated denied work performs no SQL at all.
-        this.installBudgetCache(candidateDay, this.budgetRow(candidateDay));
-        this.budgetHandoverPending = true;
-      }
-      const pruning = this.budgetPruneDay !== candidateDay;
-    const cost = this.reservationCost(costInput, candidateDay);
-    // An admin command is charged but not refused: it may take the day past its ceilings.
-    if (!unchecked) this.checkBudgetCost(cost, maintenance, candidateTime);
-    const row = this.budgetCache!;
-    const reservationCursor = this.rawExec(
-      `UPDATE resource_budgets SET
-        reads_reserved = reads_reserved + ?, writes_reserved = writes_reserved + ?,
-        frames_reserved = frames_reserved + ?, admissions_reserved = admissions_reserved + ?,
-        posts_reserved = posts_reserved + ?, registrations_reserved = registrations_reserved + ?,
-        foreground_reads = foreground_reads + ?, foreground_writes = foreground_writes + ?,
-        maintenance_reads = maintenance_reads + ?, maintenance_writes = maintenance_writes + ?
-       WHERE day = ?`,
-      cost.reads,
-      cost.writes,
-      cost.frames,
-      cost.admissions,
-      cost.posts,
-      cost.registrations,
-      maintenance ? 0 : cost.reads,
-      maintenance ? 0 : cost.writes,
-      maintenance ? cost.reads : 0,
-      maintenance ? cost.writes : 0,
-      candidateDay,
-    );
-    if (reservationCursor.rowsWritten !== undefined && reservationCursor.rowsWritten < 1) {
-      throw new StoreError("internal_error", "budget reservation did not update durable state");
-    }
-    const nextRow: RawBudgetRow = {
-      ...row,
-      day: candidateDay,
-      reads_reserved: row.reads_reserved + cost.reads,
-      writes_reserved: row.writes_reserved + cost.writes,
-      frames_reserved: row.frames_reserved + cost.frames,
-      admissions_reserved: row.admissions_reserved + cost.admissions,
-      posts_reserved: row.posts_reserved + cost.posts,
-      registrations_reserved: row.registrations_reserved + cost.registrations,
-      foreground_reads: row.foreground_reads + (maintenance ? 0 : cost.reads),
-      foreground_writes: row.foreground_writes + (maintenance ? 0 : cost.writes),
-      maintenance_reads: row.maintenance_reads + (maintenance ? cost.reads : 0),
-      maintenance_writes: row.maintenance_writes + (maintenance ? cost.writes : 0),
-    };
-    this.installBudgetCache(candidateDay, nextRow);
-    this.budgetHandoverPending = false;
-    // Persist the monotonic effective clock only after the cached capacity
-    // check has accepted the reservation; rejected floods therefore do not
-    // issue an uncharged meta write.
-    this.effectiveNow(now);
-    if (pruning) this.pruneBudgetRows(candidateDay);
-    this.observed.operations += 1;
-    this.observed.reservedReads += cost.reads;
-    this.observed.reservedWrites += cost.writes;
-    return { ...cost, day: candidateDay, maintenance };
-    } catch (error) {
-      // A reservation SQL failure is itself an accounting uncertainty. Do not
-      // leave a stale cache that could grant the same allowance on retry.
-      if (!(error instanceof StoreError) || error.code !== "retry_after") this.markAccountingUnsafe();
-      throw error;
-    }
+    const cost = this.ledger.reserve(costInput, Math.max(Math.trunc(now), this.lastEffectiveMs), now, maintenance, unchecked);
+    this.countReservation(cost);
+    return cost;
   }
 
   /** Spend the maintenance control gap when ordinary work is exhausted. */
   private reserveMaintenanceControl(costInput: CostEstimate, now: number): BudgetCost {
     this.ensureReady();
     if (this.accountingUnsafe) throw new StoreError("internal_error", "storage accounting is unsafe; admission is closed");
-    const candidateTime = Math.max(Math.trunc(now), this.lastEffectiveMs);
-    const day = dayFor(candidateTime);
-    try {
-      if (this.budgetCacheDay !== day || !this.budgetCache) {
-        this.installBudgetCache(day, this.budgetRow(day));
-        this.budgetHandoverPending = true;
-      }
-    } catch (error) {
-      this.markAccountingUnsafe();
-      throw error;
-    }
-    const cost = this.normalizeCost(costInput);
-    const reads = Math.max(1, cost.reads);
-    const writes = Math.max(1, cost.writes);
-    const row = this.budgetCache!;
-    if (row.maintenance_reads + reads > this.config.maintenanceReadsPerDay ||
-        row.maintenance_writes + writes > this.config.maintenanceWritesPerDay ||
-        row.reads_reserved + reads > this.config.sqlReadsPerDay ||
-        row.writes_reserved + writes > this.config.sqlWritesPerDay) {
-      throw new StoreError("retry_after", "Maintenance control budget exhausted", { retryAfterMs: Math.max(1000, 86_400_000 - (candidateTime % 86_400_000)) });
-    }
-    let reservationCursor: SqlCursorLike;
-    try {
-      reservationCursor = this.rawExec(
-        `UPDATE resource_budgets SET
-          reads_reserved = reads_reserved + ?, writes_reserved = writes_reserved + ?,
-          maintenance_reads = maintenance_reads + ?, maintenance_writes = maintenance_writes + ?
-         WHERE day = ?`,
-        reads,
-        writes,
-        reads,
-        writes,
-        day,
-      );
-    } catch (error) {
-      this.markAccountingUnsafe();
-      throw error;
-    }
-    if (reservationCursor.rowsWritten !== undefined && reservationCursor.rowsWritten < 1) {
-      this.markAccountingUnsafe();
-      throw new StoreError("internal_error", "maintenance reservation did not update durable state");
-    }
-    this.installBudgetCache(day, {
-      ...row,
-      reads_reserved: row.reads_reserved + reads,
-      writes_reserved: row.writes_reserved + writes,
-      maintenance_reads: row.maintenance_reads + reads,
-      maintenance_writes: row.maintenance_writes + writes,
-    });
-    this.budgetHandoverPending = false;
+    const cost = this.ledger.reserveControl(costInput, Math.max(Math.trunc(now), this.lastEffectiveMs));
+    this.countReservation(cost);
+    return cost;
+  }
+
+  private countReservation(cost: BudgetCost): void {
     this.observed.operations += 1;
-    this.observed.reservedReads += reads;
-    this.observed.reservedWrites += writes;
-    return { reads, writes, frames: cost.frames, admissions: cost.admissions, posts: cost.posts, registrations: cost.registrations };
+    this.observed.reservedReads += cost.reads;
+    this.observed.reservedWrites += cost.writes;
   }
 
   /** Explicit boundary for runtime operations that do their own SQL. */
@@ -2312,53 +1938,7 @@ export class Store {
   /** The final check on a finished operation: assert it stayed within its reservation, then refund the rest. */
   private settleReservation(reserved: BudgetCost, beforeReads: number, beforeWrites: number): void {
     this.assertReservation(reserved, beforeReads, beforeWrites);
-    this.refundUnused(reserved, this.observed.reads - beforeReads, this.observed.writes - beforeWrites);
-  }
-
-  /**
-   * Credits back what a finished reservation did not use, so the day's budget
-   * counts the SQL actually done. The reservation still gated the work up
-   * front, so no request can exceed what the ceiling allowed it. The credit is
-   * one row update, paid from the reservation it returns: an operation is
-   * charged its observed rows plus that one.
-   */
-  private refundUnused(reserved: BudgetCost, actualReads: number, actualWrites: number): void {
-    const row = this.budgetCache;
-    if (!reserved.day || !row || this.budgetCacheDay !== reserved.day) return;
-    const reads = reserved.reads - actualReads - REFUND_READS;
-    const writes = reserved.writes - actualWrites - REFUND_WRITES;
-    if (reads <= 0 && writes <= 0) return;
-    const creditReads = Math.max(0, reads);
-    const creditWrites = Math.max(0, writes);
-    const maintenance = reserved.maintenance === true;
-    try {
-      this.rawExec(
-        `UPDATE resource_budgets SET
-          reads_reserved = reads_reserved - ?, writes_reserved = writes_reserved - ?,
-          foreground_reads = foreground_reads - ?, foreground_writes = foreground_writes - ?,
-          maintenance_reads = maintenance_reads - ?, maintenance_writes = maintenance_writes - ?
-         WHERE day = ?`,
-        creditReads,
-        creditWrites,
-        maintenance ? 0 : creditReads,
-        maintenance ? 0 : creditWrites,
-        maintenance ? creditReads : 0,
-        maintenance ? creditWrites : 0,
-        reserved.day,
-      );
-    } catch {
-      // A failed credit only leaves the day over-charged, which is safe.
-      return;
-    }
-    this.installBudgetCache(reserved.day, {
-      ...row,
-      reads_reserved: row.reads_reserved - creditReads,
-      writes_reserved: row.writes_reserved - creditWrites,
-      foreground_reads: row.foreground_reads - (maintenance ? 0 : creditReads),
-      foreground_writes: row.foreground_writes - (maintenance ? 0 : creditWrites),
-      maintenance_reads: row.maintenance_reads - (maintenance ? creditReads : 0),
-      maintenance_writes: row.maintenance_writes - (maintenance ? creditWrites : 0),
-    });
+    this.ledger.refund(reserved, this.observed.reads - beforeReads, this.observed.writes - beforeWrites);
   }
 
   private reserved<T>(cost: CostEstimate, maintenance: boolean, now: number, fn: () => T, unchecked = false): T {
@@ -2417,21 +1997,7 @@ export class Store {
   }
 
   private budgetValue(now: number): BudgetSnapshot {
-    const day = dayFor(this.effectiveNow(now));
-    const row = this.budgetRow(day);
-    return {
-      day,
-      reads: row.reads_reserved,
-      writes: row.writes_reserved,
-      frames: row.frames_reserved,
-      admissions: row.admissions_reserved,
-      posts: row.posts_reserved,
-      registrations: row.registrations_reserved,
-      foreground_reads: row.foreground_reads,
-      foreground_writes: row.foreground_writes,
-      maintenance_reads: row.maintenance_reads,
-      maintenance_writes: row.maintenance_writes,
-    };
+    return this.ledger.snapshot(dayFor(this.effectiveNow(now)));
   }
 
   storageAccounting(): {
@@ -5498,7 +5064,7 @@ export class Store {
       };
     });
     // Refunded after the transaction commits, so a rollback cannot leave a credit behind.
-    this.refundUnused(reserved, this.observed.reads - beforeReads, this.observed.writes - beforeWrites);
+    this.ledger.refund(reserved, this.observed.reads - beforeReads, this.observed.writes - beforeWrites);
     return result;
   }
 

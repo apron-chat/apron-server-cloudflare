@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ACCOUNT_USAGE_POLICY } from "../src/budget";
-import { accountUsageSnapshotFromResult, accountUsageStops, exceededAllowances, fetchAccountUsage } from "../src/account-usage";
+import { AccountUsageMonitor, accountUsageSnapshotFromResult, accountUsageStops, exceededAllowances, fetchAccountUsage } from "../src/account-usage";
 import { env, runInDurableObject } from "cloudflare:test";
 import { Store } from "../src/store";
 
@@ -186,5 +186,84 @@ describe("account usage snapshots", () => {
 			restarted.initialize();
 			expect(restarted.accountUsageSnapshot()).toEqual(snapshot);
 		});
+	});
+});
+
+describe("account usage monitor", () => {
+	const credentials = { ACCOUNT_ID: "test-account", ACCOUNT_ANALYTICS_TOKEN: "test-token" };
+	const start = Date.parse("2026-09-21T12:00:00Z");
+
+	function monitor(options: { env?: object; status?: number; overrides?: Record<string, unknown> } = {}) {
+		const fetcher = vi.fn(async () => options.status ? new Response("", { status: options.status }) : Response.json(result(options.overrides)));
+		const persisted: unknown[] = [];
+		const pending: Promise<unknown>[] = [];
+		const onStop = vi.fn();
+		const usage = new AccountUsageMonitor({
+			env: options.env ?? credentials,
+			persist: (snapshot) => { persisted.push(snapshot); },
+			waitUntil: (promise) => { pending.push(promise); },
+			onStop,
+			fetcher: fetcher as unknown as typeof fetch,
+		});
+		return { usage, fetcher, persisted, pending, onStop };
+	}
+
+	it("reads nothing without its account and token", async () => {
+		const { usage, fetcher, pending } = monitor({ env: {} });
+		for (let i = 0; i < ACCOUNT_USAGE_POLICY.refreshEveryEvents; i++) usage.noteActivity(start);
+		await usage.refresh(start, true);
+		expect(pending).toEqual([]);
+		expect(fetcher).not.toHaveBeenCalled();
+		expect(usage.snapshot).toBeNull();
+	});
+
+	it("reads once stale, then again only after refreshEveryEvents events and a minute", async () => {
+		const { usage, fetcher, persisted, pending } = monitor();
+		usage.noteActivity(start);
+		await Promise.all(pending);
+		expect(fetcher).toHaveBeenCalledOnce();
+		expect(persisted).toHaveLength(1);
+		expect(usage.snapshot?.sampledAt).toBe(start);
+		for (let i = 0; i < ACCOUNT_USAGE_POLICY.refreshEveryEvents; i++) usage.noteActivity(start + 1_000);
+		await Promise.all(pending);
+		expect(fetcher).toHaveBeenCalledOnce();
+		const later = start + ACCOUNT_USAGE_POLICY.minimumRefreshIntervalMs;
+		for (let i = 0; i < ACCOUNT_USAGE_POLICY.refreshEveryEvents; i++) usage.noteActivity(later);
+		await Promise.all(pending);
+		expect(fetcher).toHaveBeenCalledTimes(2);
+	});
+
+	it("stops on a reading past an allowance, and closes what is open", async () => {
+		const { usage, onStop } = monitor({
+			overrides: { workersInvocationsAdaptive: [{ sum: { requests: ACCOUNT_USAGE_POLICY.daily.workerRequests } }] },
+		});
+		expect(usage.stops(start)).toBe(false);
+		await usage.refresh(start, false);
+		expect(usage.stops(start)).toBe(true);
+		expect(onStop).toHaveBeenCalledOnce();
+	});
+
+	it("keeps the last snapshot on a failure and backs off, unless forced", async () => {
+		const { usage, fetcher } = monitor({ status: 503 });
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			await usage.refresh(start, false);
+			expect(fetcher).toHaveBeenCalledOnce();
+			expect(usage.snapshot).toBeNull();
+			await usage.refresh(start + ACCOUNT_USAGE_POLICY.initialRetryMs - 1, false);
+			expect(fetcher).toHaveBeenCalledOnce();
+			await usage.refresh(start + 1, true);
+			expect(fetcher).toHaveBeenCalledTimes(2);
+			await usage.refresh(start + 1 + 2 * ACCOUNT_USAGE_POLICY.initialRetryMs, false);
+			expect(fetcher).toHaveBeenCalledTimes(3);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("shares a reading under way", async () => {
+		const { usage, fetcher } = monitor();
+		await Promise.all([usage.refresh(start, true), usage.refresh(start, true)]);
+		expect(fetcher).toHaveBeenCalledOnce();
 	});
 });
