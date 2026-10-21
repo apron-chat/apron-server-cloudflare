@@ -162,7 +162,7 @@ interface AdmissionBudget {
 	 * minute, from every address together. Each one costs a Durable Object
 	 * request, while a rejection before it costs only the Worker request, an
 	 * allowance Paid includes ten times as many of. Past it, attempts there
-	 * get `Retry-After` for the rest of the minute.
+	 * get 503 with a `Retry-After` of `workerWindowSeconds`.
 	 */
 	objectRequestsPerLocationMinute: number;
 	workerWindowSeconds: number;

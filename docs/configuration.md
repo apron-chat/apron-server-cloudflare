@@ -74,8 +74,8 @@ through, stop the per-address limit from being multiplied:
   Object. Each costs a Durable Object request, the allowance Paid includes the
   fewest of (32,000 a day), while a rejection before it costs only a Worker
   request (320,000 a day). It is twice a reconnect of every open connection,
-  so a deploy or a wake does not reach it. Past it, attempts there get 503 and
-  `Retry-After` for the rest of the minute, while other locations go on.
+  so a deploy or a wake does not reach it. Past it, attempts there get 503 with
+  `Retry-After: 60`, while other locations go on.
 
 `ACCOUNT_USAGE_POLICY` in `src/budget.ts` defines the lightweight account-usage
 stop. The Durable Object refreshes after about 1,000 incoming events, no more
