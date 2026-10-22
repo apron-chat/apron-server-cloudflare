@@ -40,23 +40,25 @@ it('rejects excess attempts before requiring a DO binding and shares the two pat
 	expect(await other.text()).toContain('Demo capacity unavailable');
 });
 
-it('groups IPv6 attempts by /64, ignoring supplied internal keys', async () => {
+it('groups IPv6 attempts by /56, ignoring supplied internal keys', async () => {
 	for (let i = 0; i < ADMISSION_BUDGET.requestsPerIpMinute; i++) {
 		const request = upgrade(`2001:db8:feed:1234::${i + 1}`);
 		request.headers.set('X-Apron-Trusted-IP-Key', `forged-${i}`);
 		expect(await (await fetchEntry(request, withoutObject())).text()).toContain('Demo capacity unavailable');
 	}
 	expect((await fetchEntry(upgrade('2001:db8:feed:1234::ffff'), withoutObject())).status).toBe(429);
-	expect(await (await fetchEntry(upgrade('2001:db8:feed:1235::1'), withoutObject())).text()).toContain('Demo capacity unavailable');
+	// Another /64 of the same /56 shares the limit; another /56 does not.
+	expect((await fetchEntry(upgrade('2001:db8:feed:12ff::1'), withoutObject())).status).toBe(429);
+	expect(await (await fetchEntry(upgrade('2001:db8:feed:1334::1'), withoutObject())).text()).toContain('Demo capacity unavailable');
 });
 
-it('limits a native IPv6 /48 across its /64s', async () => {
+it('limits a native IPv6 /48 across its /56s', async () => {
 	const perAddress = ADMISSION_BUDGET.requestsPerIpMinute;
 	const perPrefix = ADMISSION_BUDGET.requestsPerIpv6PrefixMinute;
 	let sent = 0;
 	for (let subnet = 0; sent < perPrefix; subnet++) {
 		for (let i = 0; i < perAddress && sent < perPrefix; i++, sent++) {
-			const response = await fetchEntry(upgrade(`2001:db8:cafe:${subnet.toString(16)}::${i + 1}`), withoutObject());
+			const response = await fetchEntry(upgrade(`2001:db8:cafe:${(subnet * 0x100).toString(16)}::${i + 1}`), withoutObject());
 			expect(await response.text()).toContain('Demo capacity unavailable');
 		}
 	}

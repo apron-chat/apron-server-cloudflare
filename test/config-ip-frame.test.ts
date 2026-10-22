@@ -20,7 +20,11 @@ describe('trusted IP boundaries', () => {
 		expect(canonicalizeIp('::ffff:192.0.2.10')?.key).toBe(key);
 		expect(canonicalizeIp('0:0:0:0:0:ffff:c000:020a')?.key).toBe(key);
 		expect(canonicalizeIp('2001:db8:1:2::1')?.key).toBe(canonicalizeIp('2001:0db8:0001:0002:abcd::5')?.key);
-		expect(canonicalizeIp('2001:db8:1:3::1')?.key).not.toBe(canonicalizeIp('2001:db8:1:2::1')?.key);
+		// Grouped by /56: another /64 of it shares the key, another /56 does not.
+		expect(canonicalizeIp('2001:db8:1:ff::1')?.key).toBe(canonicalizeIp('2001:db8:1:2::1')?.key);
+		expect(canonicalizeIp('2001:db8:1:102::1')?.key).not.toBe(canonicalizeIp('2001:db8:1:2::1')?.key);
+		expect(canonicalizeIp('2001:db8:1:2::1')?.key).toBe('v6:2001:db8:1::/56');
+		expect(canonicalizeIp('2001:db8:1:abcd::1')?.key).toBe('v6:2001:db8:1:ab00::/56');
 	});
 	it('groups native IPv6 by /48 for the shared limit, and leaves IPv4 to its address limit', async () => {
 		const site = await hashIpv6PrefixKey(canonicalizeIp('2001:db8:1:2::1')!);

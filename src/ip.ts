@@ -108,11 +108,16 @@ export function canonicalizeIp(value: string): CanonicalIp | null {
 		const address = ipv4String(mapped);
 		return { kind: "ipv4", key: `v4:${address}`, address };
 	}
-	// A /64 key deliberately discards the interface identifier. Keep the full
-	// canonical address only for internal tests; it is never logged or persisted.
-	const prefix = wordsToIpv6(words.slice(0, 4).concat([0, 0, 0, 0]));
+	// A /56 key: the size ISPs most often delegate to a home or site, so one
+	// subscriber is one principal however many /64s it routes, and a /48
+	// holds 256 of them rather than 65,536. It deliberately discards the
+	// subnet and interface identifier. A carrier that gives each device its
+	// own /64 may put several subscribers in one /56; they then share limits,
+	// as NAT users do. Keep the full canonical address only for internal
+	// tests; it is never logged or persisted.
+	const prefix = wordsToIpv6([...words.slice(0, 3), words[3] & 0xff00, 0, 0, 0, 0]);
 	const site = wordsToIpv6(words.slice(0, 3).concat([0, 0, 0, 0, 0]));
-	return { kind: "ipv6", key: `v6:${prefix}/64`, prefixKey: `v6:${site}/48`, address: wordsToIpv6(words) };
+	return { kind: "ipv6", key: `v6:${prefix}/56`, prefixKey: `v6:${site}/48`, address: wordsToIpv6(words) };
 }
 
 function isPseudoIpv4(value: string): boolean {

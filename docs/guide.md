@@ -240,7 +240,7 @@ Passkeys require authentication on each new connection and do not prevent
 multiple registrations by one person.
 
 Guests only read by default. With `GUEST_POSTING=true`, guest posting is
-shared by IP (native IPv6 grouped by /64): five accepted
+shared by IP (native IPv6 grouped by /56): five accepted
 mutations per rolling minute and 200 per UTC day (100 with the Free budgets).
 Registered users receive 20/minute and 1,000/day (500), subject to the common IP and global limits. NAT users
 share allowances. Creates, edits, deletion, restoration, moves, reaction
@@ -262,7 +262,9 @@ and rejects new admissions until replenishment.
 
 IP rate limits use the first 128 bits of SHA-256 of the canonical address key,
 encoded as 22 base64url characters. IPv4-mapped IPv6 shares its IPv4 key; native
-IPv6 is grouped by /64. No IP secret or backup is needed. These internal hashes
+IPv6 is grouped by /56, the size ISPs most often delegate to one home or site,
+so a subscriber cannot multiply its limits across the /64s it routes. No IP
+secret or backup is needed. These internal hashes
 are compact identifiers, not anonymization: candidate IPs can be hashed to
 recover a match. Neither raw IPs nor these keys are sent to chat clients.
 

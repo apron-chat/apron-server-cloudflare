@@ -318,6 +318,6 @@ server does not offer the connection (`email` and `external` always,
 `webauthn` from an origin not configured for passkeys) is `unsupported`.
 
 Guest posting allowances (with `GUEST_POSTING=true`) are shared across a normalized IP; native IPv6
-addresses share a /64 bucket. Registered users also share the aggregate IP
+addresses share a /56 bucket. Registered users also share the aggregate IP
 limit. NAT users can therefore limit one another. Passkeys do not provide
 one-person-one-account or prevent Sybil attacks.

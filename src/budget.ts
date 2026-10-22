@@ -153,8 +153,8 @@ interface AdmissionBudget {
 	requestsPerIpMinute: number;
 	/**
 	 * Attempts one native IPv6 /48 may make a minute at one Cloudflare
-	 * location, across all its /64s. One host can hold a whole /48, so the
-	 * per-address limit alone would let it make 65,536 times as many.
+	 * location, across all its /56s. One host can hold a whole /48, so the
+	 * per-address limit (per /56) alone would let it make 256 times as many.
 	 */
 	requestsPerIpv6PrefixMinute: number;
 	/**

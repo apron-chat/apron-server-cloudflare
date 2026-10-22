@@ -309,7 +309,7 @@ Implementation reference: [WebAuthn verification](https://www.w3.org/TR/webauthn
 
 Extract Cloudflare's client address in the public entry Worker. Strip any incoming copy of the private forwarding field before setting trusted metadata for the DO. Do not trust `X-Forwarded-For`, client JSON, or a public query parameter. Account for documented Worker-subrequest and Pseudo IPv4 behavior; a missing/unusable trusted IP fails admission rather than creating a fresh unlimited bucket.
 
-Canonicalize IPv4 and IPv4-mapped IPv6 to the same IPv4 key; group native IPv6 by /64. The entry Worker also limits a native IPv6 /48's attempts together, since one host can hold a whole /48. Store the first 128 bits of SHA-256 of the canonical key, encoded as unpadded base64url. This requires no server secret and is a compact internal identifier, not anonymization. Keep the hash format stable across daily rollover and deployments to preserve active rolling windows. Public users behind NAT share IP limits; explain this tradeoff in the demo help text.
+Canonicalize IPv4 and IPv4-mapped IPv6 to the same IPv4 key; group native IPv6 by /56, the size ISPs most often delegate to one home or site, so one subscriber cannot multiply its per-IP limits across its /64s (a carrier that gives each device a /64 may put several subscribers in one /56; they share limits, as NAT users do). The entry Worker also limits a native IPv6 /48's attempts together, since one host can hold a whole /48. Store the first 128 bits of SHA-256 of the canonical key, encoded as unpadded base64url. This requires no server secret and is a compact internal identifier, not anonymization. Keep the hash format stable across daily rollover and deployments to preserve active rolling windows. Public users behind NAT share IP limits; explain this tradeoff in the demo help text.
 
 Reference: [Cloudflare request headers](https://developers.cloudflare.com/fundamentals/reference/http-headers/).
 
@@ -621,7 +621,7 @@ Use unit tests for pure logic and Cloudflare's Workers/Vitest integration for ru
 
 - Guest sixth mutation within 60 seconds fails across tabs/reconnects; five can be accepted when timestamps permit. Test the calendar-minute boundary explicitly.
 - Registered twenty-first mutation fails; several credentials at one IP cannot exceed aggregate IP limits. Failed/unverified WebAuthn cannot raise a tier.
-- IPv4, mapped IPv6, equivalent textual forms, /64 rotation, spoofed forwarding fields, and missing trusted metadata behave as specified.
+- IPv4, mapped IPv6, equivalent textual forms, /64 and /56 rotation, spoofed forwarding fields, and missing trusted metadata behave as specified.
 - WebAuthn wrong challenge, replay, expired challenge, wrong connection/action/origin/RP, bad signature, missing UV, duplicate credential, and unsupported oversized metadata are rejected.
 - Registration races enforce global/IP/count limits; existing passkey login works when registration is full. Real browser or virtual-authenticator end-to-end registration/login complements verifier unit fixtures.
 - Frame, connection, auth, history, registration, global posting, and byte/depth limits are independent and survive hibernation/restart as applicable.

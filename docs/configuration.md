@@ -57,7 +57,7 @@ copy. Use Node.js 24, as in the repository development environment.
 `ADMISSION_BUDGET.requestsPerIpMinute` defaults to 10 attempted handshakes per
 minute, before calling the DO. This leaves retry headroom over the five accepted
 connections per IP per minute. `/` and `/ws` share a bucket. IPv4-mapped addresses
-share their IPv4 bucket; native IPv6 shares a /64. Missing or failed limiter
+share their IPv4 bucket; native IPv6 shares a /56. Missing or failed limiter
 bindings reject admission with 503. Exhaustion returns 429 and `Retry-After`.
 The binding is approximate and local to each Cloudflare location, not a global
 daily counter. NAT users share this limit. Development and production use distinct
@@ -67,8 +67,8 @@ Two more limits, counted only for attempts their address's own limit let
 through, stop the per-address limit from being multiplied:
 
 - `requestsPerIpv6PrefixMinute` (30) is shared by a native IPv6 /48 at one
-  location, across all its /64s. One host can hold a whole /48, which would
-  otherwise give it 65,536 address limits. Past it, attempts get 429.
+  location, across all its /56s. One host can hold a whole /48, which would
+  otherwise give it 256 address limits. Past it, attempts get 429.
 - `objectRequestsPerLocationMinute` (200) is shared by every address at one
   location: at most that many attempts a minute pass from there to the Durable
   Object. Each costs a Durable Object request, the allowance Paid includes the
