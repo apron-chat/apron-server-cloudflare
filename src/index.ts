@@ -81,6 +81,17 @@ const SESSION_CLEANUP_BATCH = 16;
  * it runs at most this often; a resume rejects an expired session on its own.
  */
 const SESSION_SWEEP_INTERVAL_MS = 60 * 60_000;
+/**
+ * An account whose only role is `bot` that neither signs in nor posts for
+ * this long is signed out for good (expireBot), by a sweep run on the alarm
+ * at most daily (Store.idleBots).
+ */
+const BOT_IDLE_MS = 7 * 24 * 60 * 60_000;
+const BOT_SWEEP_INTERVAL_MS = 24 * 60 * 60_000;
+/** A bot's activity is written at most this often (noteBotActive). */
+const BOT_ACTIVE_WRITE_MS = 60 * 60_000;
+/** The limiter key the idle bot sweep's room leaves are charged to, as an admin's `/kick` is to the admin's IP. */
+const BOT_SWEEP_KEY = "bot-sweep";
 const MAX_SESSION_TOKEN_CHARS = 256;
 /** Longest avatar URL a connection keeps: the media origin and an object key. */
 const MAX_AVATAR_CHARS = 512;
@@ -1174,6 +1185,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private alarmKnown = false;
 	/** When the next alarm may sweep sessions; in memory, so a wake sweeps once. */
 	private nextSessionSweepAt = 0;
+	/** When each bot's activity was last written (noteBotActive). */
+	private readonly botActiveAt = new Map<string, number>();
 	/** Admins' `/toggle`s, once read: a feature absent here has not been read yet. */
 	private readonly toggles = new Map<ToggleFeature, boolean | undefined>();
 	/** When the earliest pending upload's write window closes, if one is known (§4.8.3). */
@@ -1439,6 +1452,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 				this.nextSessionSweepAt = full ? 0 : now + SESSION_SWEEP_INTERVAL_MS;
 			} catch { /* retried on the next alarm */ }
 		}
+		try {
+			for (const userId of this.store.idleBots({ now, before: now - BOT_IDLE_MS, limit: 4, intervalMs: BOT_SWEEP_INTERVAL_MS, graceMs: BOT_IDLE_MS }) ?? []) {
+				await this.expireBot(userId);
+			}
+		} catch { /* a bot not yet signed out is found again by the next sweep */ }
 		let result: ReturnType<Store["runCleanup"]> | undefined;
 		try {
 			result = this.store.runCleanup(now);
@@ -2235,6 +2253,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.guestLeaves(socket, attachment, previous, created);
 		this.afterSignIn(socket, stored);
 		this.refreshAvatar(identity.userId);
+		this.noteBotActive(identity.userId, identity.roles);
 		await this.rescheduleAlarm();
 	}
 
@@ -2596,6 +2615,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// Only a new message wakes anyone: not an edit, move, or retry (§4.9).
 			if (method === "message" && !result.deduplicated && result.message?.prev_log_id === undefined) created = result.message;
 		});
+		this.noteBotActive(identity.user_id, attachment.roles ?? []);
 		if (created) {
 			// Posting in a room shows its poster saw it: their waiting and held wakes for it go.
 			this.dropWakes(identity.user_id, created.room_id);
@@ -4615,9 +4635,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * stored and logged, charged to the remover's posting limits, and its
 	 * membership goes to the room's members; a connected guest's leaves its
 	 * connections. Either way the user's connections get `room_update`
-	 * `left`. Returns whether the user was in the room.
+	 * `left`. Returns whether the user was in the room. `attachment` is the
+	 * remover's connection, or for the idle bot sweep a limiter key alone.
 	 */
-	private async removeMember(attachment: ConnectionAttachment, roomId: string, userId: string): Promise<boolean> {
+	private async removeMember(attachment: { ipKey: string; userId?: string }, roomId: string, userId: string): Promise<boolean> {
 		if (!this.store.identityExists(userId)) {
 			// A guest's rooms live in its connections only.
 			const rooms = this.liveRoomsOf(userId);
@@ -4638,6 +4659,34 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.removeIfEmpty(roomId);
 		});
 		return changed;
+	}
+
+	/** Marks an account whose only role is `bot` active (Store.markBotActive), at most every BOT_ACTIVE_WRITE_MS. */
+	private noteBotActive(userId: string, roles: readonly string[]): void {
+		if (roles.length !== 1 || roles[0] !== "bot") return;
+		const now = nowMs();
+		if (now - (this.botActiveAt.get(userId) ?? 0) < BOT_ACTIVE_WRITE_MS) return;
+		try {
+			this.store.markBotActive(userId, now);
+			this.botActiveAt.set(userId, now);
+		} catch { /* the next sign-in or post tries again */ }
+	}
+
+	/**
+	 * Signs out an idle bot (Store.idleBots) for good: closes its
+	 * connections, takes it out of each of its rooms as if it left them, and
+	 * revokes its tokens. Its account and everything it posted stay. Marked
+	 * signed out last, so a failure part way is finished by the next sweep.
+	 */
+	private async expireBot(userId: string): Promise<void> {
+		for (const peer of this.connectionsOf(userId)) {
+			const state = connectionAttachment(peer);
+			if (state) this.closePolicy(peer, state, 1008, "Signed out after a week without signing in or posting");
+		}
+		for (const roomId of this.store.getIdentity(userId)?.rooms ?? []) await this.removeMember({ ipKey: BOT_SWEEP_KEY }, roomId, userId);
+		await this.forgetTokens([userId]);
+		this.store.markBotSignedOut(userId);
+		console.log(JSON.stringify({ event: "idle_bot_signed_out", user_id: userId }));
 	}
 
 	/**

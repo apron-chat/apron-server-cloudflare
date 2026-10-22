@@ -276,7 +276,10 @@ user_id>` named "Bot of <their name>", and returns its bearer token in a
 `/invite-bot` replaces it and closes connections that used the old one. The
 first invite counts as a registration against the per-IP, daily, and identity
 caps. A bot posts under the registered quotas, keeps its rooms, cannot rename
-itself with `me`, and cannot invite bots. See [SPEC section 5](../SPEC.md#bots).
+itself with `me`, and cannot invite bots. An account whose only role is
+`bot` that neither signs in nor posts for 7 days is signed out: its tokens
+are revoked and it leaves its rooms, while its account and posts stay. See
+[SPEC section 5](../SPEC.md#bots).
 
 A registered user's `/invite-device <name>` (not a bot's or the `admin`
 user's) returns a bearer token that signs in as them on another device, in a

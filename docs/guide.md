@@ -186,7 +186,9 @@ with `room_join` and its `user_id`, and remove it with `room_leave` the same
 way. The
 token does not expire. Running `/invite-bot` again replaces it, signs out
 connections that used the old one, and renames the bot after your current name.
-The first invite counts as a registration. See [SPEC section 5](../SPEC.md#bots).
+The first invite counts as a registration. A bot that neither signs in nor
+posts for a week is signed out and taken out of its rooms (what it posted
+stays); run `/invite-bot` again for a new token. See [SPEC section 5](../SPEC.md#bots).
 
 ## Other devices
 

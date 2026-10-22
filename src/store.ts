@@ -715,6 +715,8 @@ const META_RENAMED_PREFIX = "renamed:";
  * found by token, not by user) can never sign in as a later user given it.
  */
 const META_PURGED_PREFIX = "purged:";
+/** `_meta` key: when the daily idle bot sweep (idleBots) is next due. */
+const META_BOT_SWEEP = "bot_sweep_ms";
 
 /** The limiter scopes keyed by a registered user (`user:<user_id>`), which `/rename` moves. */
 const USER_LIMIT_SCOPES = ["post", "history", "upload", "push", "push_recipient"] as const;
@@ -3239,8 +3241,60 @@ export class Store {
   }
 
   private writeRoles(identity: RawIdentityRow, roles: string[], on: boolean): { changed: boolean; on: boolean; name: string; roles: string[] } {
-    this.rawExec("UPDATE identities SET roles_json = ? WHERE user_id = ?", JSON.stringify(roles), identity.user_id);
+    // `updated_ms` too, so a user just made a bot is not idle (idleBots).
+    this.rawExec("UPDATE identities SET roles_json = ?, updated_ms = ? WHERE user_id = ?", JSON.stringify(roles), this.effectiveNow(this.clock.now()), identity.user_id);
     return { changed: true, on, name: identity.name, roles };
+  }
+
+  /**
+   * Marks an account whose only role is `bot` active, when it signs in or
+   * posts: its identity's `updated_ms`, which idleBots reads. Anyone else is
+   * left as is.
+   */
+  markBotActive(userId: string, now = this.clock.now()): void {
+    this.ensureReady();
+    this.reserved({ reads: 4, writes: 4 }, false, now, () => {
+      this.rawExec(`UPDATE identities SET updated_ms = ? WHERE user_id = ? AND roles_json = '["bot"]'`, this.effectiveNow(now), userId);
+    });
+  }
+
+  /**
+   * Marks an idle bot signed out (idleBots), once its rooms and tokens are
+   * gone: `updated_ms` 0, a time nothing else writes, so the sweep skips it
+   * until it is active again.
+   */
+  markBotSignedOut(userId: string, now = this.clock.now()): void {
+    this.ensureReady();
+    this.reserved({ reads: 4, writes: 4 }, true, now, () => {
+      this.rawExec(`UPDATE identities SET updated_ms = 0 WHERE user_id = ? AND roles_json = '["bot"]'`, userId);
+    });
+  }
+
+  /**
+   * The daily idle bot sweep, once its `_meta` due time has passed: up to
+   * `limit` accounts whose only role is `bot` and that have not been active
+   * (markBotActive) since `before`, oldest first, and are not yet signed out
+   * (markBotSignedOut), for the caller to sign out.
+   * The next sweep is due `intervalMs` later, or at once after a full batch.
+   * The first call only sets the first sweep `graceMs` out, so bots active
+   * before this was recorded are not taken for idle. Null when not due.
+   */
+  idleBots(input: { now: number; before: number; limit: number; intervalMs: number; graceMs: number }): string[] | null {
+    this.ensureReady();
+    const { due, identities } = this.reserved({ reads: 4 }, true, input.now, () => ({
+      due: this.metaValue(META_BOT_SWEEP), identities: this.metaNumber("identity_count"),
+    }));
+    if (due !== "" && this.effectiveNow(input.now) < Number(due)) return null;
+    // A scan of every identity row, and the next due time.
+    return this.reserved({ reads: 16 + identities, writes: 4 }, true, input.now, () => {
+      const effective = this.effectiveNow(input.now);
+      const idle = due === "" ? [] : this.rawRows<{ user_id: string }>(
+        `SELECT user_id FROM identities WHERE roles_json = '["bot"]' AND updated_ms > 0 AND updated_ms < ? ORDER BY updated_ms LIMIT ?`, input.before, input.limit,
+      ).map((row) => row.user_id);
+      const next = due === "" ? effective + input.graceMs : idle.length >= input.limit ? effective : effective + input.intervalMs;
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_BOT_SWEEP, String(next));
+      return idle;
+    });
   }
 
   /**
