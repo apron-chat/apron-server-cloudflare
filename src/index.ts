@@ -3,13 +3,13 @@ import { AuthError, AuthTooLargeError, candidateUserIdFor, WebAuthnService, type
 import { isAllowedOrigin, loadConfig, pushHostAllowed, type RuntimeConfig } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
-import { fetchAccountUsage, type AccountUsageSnapshot } from "./account-usage";
-import { runBudgetGuard, watchForFlood } from "./budget-guard";
+import { AccountUsageMonitor } from "./account-usage";
+import { EDGE_STOP_RULE_REF, readEdgeStop, runBudgetGuard, watchForFlood } from "./budget-guard";
 import { sniffAudio } from "./audio";
 import { sniffImage } from "./image";
 import { signUploadToken, verifyUploadToken } from "./upload-token";
 import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
-import { extractClientIp, hashIpKey, stripForwardingHeaders } from "./ip";
+import { extractClientIp, hashIpKey, hashIpv6PrefixKey, stripForwardingHeaders } from "./ip";
 import {
 	DEFINED_AUTH_SCHEMES,
 	errorFromUnknown,
@@ -1129,12 +1129,19 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 	if (!clientIp) return responseError(403, "Trusted client address unavailable");
 	if (config.admissionOff) return responseError(503, "Demo admission is closed");
 	const key = await hashIpKey(clientIp);
+	const prefixKey = await hashIpv6PrefixKey(clientIp);
 	// This counts attempts, including connections subsequently rejected by the DO.
-	// Fail closed if the binding is absent or unavailable; never bypass admission.
+	// Fail closed if a binding is absent or unavailable; never bypass admission.
+	// The address is counted first, so an address over its own limit spends
+	// nothing its /48 or its location share; then the /48, then the location,
+	// which bounds the Durable Object requests every address there spends.
 	try {
-		if (!env.CONNECTION_ATTEMPTS) return responseError(503, "Demo admission unavailable");
-		const { success } = await env.CONNECTION_ATTEMPTS.limit({ key });
-		if (!success) return responseError(429, "Connection attempts exceeded", ADMISSION_BUDGET.workerWindowSeconds * 1_000);
+		const { CONNECTION_ATTEMPTS, PREFIX_ATTEMPTS, LOCATION_ATTEMPTS } = env;
+		if (!CONNECTION_ATTEMPTS || !PREFIX_ATTEMPTS || !LOCATION_ATTEMPTS) return responseError(503, "Demo admission unavailable");
+		const window = ADMISSION_BUDGET.workerWindowSeconds * 1_000;
+		if (!(await CONNECTION_ATTEMPTS.limit({ key })).success) return responseError(429, "Connection attempts exceeded", window);
+		if (prefixKey && !(await PREFIX_ATTEMPTS.limit({ key: prefixKey })).success) return responseError(429, "Connection attempts exceeded", window);
+		if (!(await LOCATION_ATTEMPTS.limit({ key: "location" })).success) return responseError(503, "Demo is busy; try again shortly", window);
 	} catch {
 		return responseError(503, "Demo admission unavailable");
 	}
@@ -1171,12 +1178,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly toggles = new Map<ToggleFeature, boolean | undefined>();
 	/** When the earliest pending upload's write window closes, if one is known (§4.8.3). */
 	private uploadDeadline: number | undefined;
-	private accountUsageEvents = 0;
-	private accountUsageRetryAt = 0;
-	private accountUsageFailureCount = 0;
-	private accountUsageVerified = false;
-	private accountUsageRefresh?: Promise<void>;
-	private accountUsageSnapshot: AccountUsageSnapshot | null = null;
+	/** The account-usage stop: the latest Cloudflare usage snapshot, and when to read the next. */
+	private readonly accountUsage: AccountUsageMonitor;
 	private readonly queues = new WeakMap<WebSocketConnection, Promise<void>>();
 	/**
 	 * Frames held for a connection while a sign-in that commits records is in
@@ -1247,6 +1250,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.runtimeEnv = env;
 		this.config = loadConfig(env);
 		this.store = new Store(ctx as unknown as ConstructorParameters<typeof Store>[0], asStoreConfig(this.config));
+		this.accountUsage = new AccountUsageMonitor({
+			env,
+			persist: (snapshot, now) => this.store.persistAccountUsageSnapshot(snapshot, now),
+			waitUntil: (promise) => ctx.waitUntil(promise),
+			onStop: () => {
+				for (const peer of this.ctx.getWebSockets()) {
+					const state = connectionAttachment(peer);
+					if (state) this.closePolicy(peer as WebSocketConnection, state, 1013, "Demo account capacity reached; try later");
+				}
+			},
+		});
 		this.webAuthn = new WebAuthnService(this.config);
 		// Answered by the runtime without waking the object or reaching
 		// webSocketMessage; the time of the last answer tells a live peer from
@@ -1257,12 +1271,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// input gate holds every event until the fresh schema exists.
 			void ctx.blockConcurrencyWhile(async () => {
 				await this.store.resetStorage();
-				this.accountUsageSnapshot = this.store.accountUsageSnapshot();
+				this.accountUsage.restore(this.store.accountUsageSnapshot());
 				console.warn(JSON.stringify({ event: "storage_schema_reset" }));
 			});
 		} else {
 			this.store.initialize();
-			this.accountUsageSnapshot = this.store.accountUsageSnapshot();
+			this.accountUsage.restore(this.store.accountUsageSnapshot());
 		}
 	}
 
@@ -1273,8 +1287,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!ipKey) return responseError(403, "Trusted client address unavailable");
 		if (this.config.admissionOff) return responseError(503, "Demo admission is closed");
 		this.sweepPresence();
-		this.noteAccountUsageActivity(this.runtimeEnv);
-		if (this.accountUsageBlocked(nowMs())) return responseError(503, "Demo account capacity reached", 300_000);
+		this.accountUsage.noteActivity(nowMs());
+		if (this.accountUsage.stops(nowMs())) return responseError(503, "Demo account capacity reached", 300_000);
 		const origin = request.headers.get("Origin");
 		if (!isAllowedOrigin(this.config, origin)) return responseError(403, "Origin not allowed");
 		try {
@@ -1333,8 +1347,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.sweepPresence(nowMs(), socket);
 		const attachment = connectionAttachment(socket);
 		if (!attachment || attachment.closing) return Promise.resolve();
-		this.noteAccountUsageActivity(this.runtimeEnv);
-		if (this.accountUsageBlocked(nowMs())) {
+		this.accountUsage.noteActivity(nowMs());
+		if (this.accountUsage.stops(nowMs())) {
 			this.closePolicy(socket, attachment, 1013, "Demo account capacity reached; try later");
 			return Promise.resolve();
 		}
@@ -1404,7 +1418,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.alarmKnown = false;
 		const now = nowMs();
 		this.sweepPresence(now);
-		await this.refreshAccountUsage(this.runtimeEnv, now, false);
+		await this.accountUsage.refresh(now, false);
 		for (const ws of this.ctx.getWebSockets()) {
 			const socket = ws as WebSocketConnection;
 			const attachment = connectionAttachment(socket);
@@ -1704,7 +1718,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return true;
 		} catch (error) {
 			const failure = errorToProtocol(error);
-			if (failure.message.includes("Daily frame budget")) {
+			if (failure.data?.reason === "frame_budget") {
 				for (const peer of this.ctx.getWebSockets()) {
 					const state = connectionAttachment(peer);
 					if (state) this.closePolicy(peer, state, 1013, "Demo capacity reached; try after daily reset");
@@ -4677,14 +4691,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async sendStatus(socket: WebSocketConnection, request: RequestFrame, roomId: string): Promise<void> {
 		const now = nowMs();
-		await this.refreshAccountUsage(this.runtimeEnv, now, true);
+		await this.accountUsage.refresh(now, true);
 		const { budget, identities, databaseBytes } = this.store.status(now);
 		const limits = this.config.limits;
 		const count = (value: number) => Math.round(value).toLocaleString("en-US");
 		const share = (used: number, limit: number) => `${count(used)} / ${count(limit)} (${limit > 0 ? Math.round((100 * used) / limit) : 0}%)`;
 		const mib = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 		const lines: string[] = [];
-		const usage = this.accountUsageSnapshot;
+		const usage = this.accountUsage.snapshot;
 		const daily = ACCOUNT_USAGE_POLICY.daily;
 		if (usage) {
 			lines.push(
@@ -4730,6 +4744,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		} else {
 			lines.push("**Cloudflare account**: no usage sample; set `ACCOUNT_ID` and `ACCOUNT_ANALYTICS_TOKEN` to read it.");
 		}
+		// A plan that bills past its allowances relies on the budget guard.
+		if (ACCOUNT_USAGE_POLICY.monthly) lines.push("", await this.edgeStopLine());
 		lines.push(
 			"",
 			`**Demo budgets, ${budget.day}** (reserved by this object)`,
@@ -4748,6 +4764,32 @@ export class ApronDemoServer extends DurableObject<Env> {
 		);
 		this.sendNotice(socket, roomId, lines.join("\n"));
 		this.reply(socket, request, {});
+	}
+
+	/**
+	 * `/status`'s line on the budget guard's edge stop rule, read (never
+	 * changed) with the guard's own zone and token, so a guard that cannot
+	 * work shows here rather than only in sampled logs.
+	 */
+	private async edgeStopLine(): Promise<string> {
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), 5_000);
+		try {
+			const edge = await readEdgeStop(this.runtimeEnv, fetch, controller.signal);
+			const rule = `**Edge stop** (\`${EDGE_STOP_RULE_REF}\`)`;
+			switch (edge.state) {
+				case "on": {
+					const since = Date.parse(edge.updatedAt ?? "");
+					return `${rule}: **on**, blocking new requests${Number.isFinite(since) ? ` since ${new Date(since).toISOString().slice(0, 16).replace("T", " ")} UTC` : ""}`;
+				}
+				case "off": return `${rule}: off; the guard's token can reach it`;
+				case "unconfigured": return `${rule}: **not working**: \`ZONE_ID\` or \`EDGE_STOP_TOKEN\` is not set, so nothing stops billed traffic at the edge`;
+				case "rule_missing": return `${rule}: **not working**: the zone has no such rule`;
+				case "unreadable": return `${rule}: **not working**: it can't be read (${edge.message})`;
+			}
+		} finally {
+			clearTimeout(timeout);
+		}
 	}
 
 	/**
@@ -5424,60 +5466,5 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.alarmFailures++;
 			if ((this.alarmFailures & (this.alarmFailures - 1)) === 0) console.warn(JSON.stringify({ event: "alarm_setup_failed", count: this.alarmFailures }));
 		});
-	}
-
-	private accountUsageBlocked(now: number): boolean {
-		return this.accountUsageSnapshot?.day === new Date(now).toISOString().slice(0, 10) && this.accountUsageSnapshot.stop;
-	}
-
-	private noteAccountUsageActivity(env: Env): void {
-		if (!env.ACCOUNT_ID || !env.ACCOUNT_ANALYTICS_TOKEN) return;
-		this.accountUsageEvents += 1;
-		const now = nowMs();
-		const stale = !this.accountUsageSnapshot || now - this.accountUsageSnapshot.sampledAt >= ACCOUNT_USAGE_POLICY.staleAfterMs;
-		if (this.accountUsageEvents < ACCOUNT_USAGE_POLICY.refreshEveryEvents && !stale) return;
-		// Keep the refresh alive after the request returns without adding its latency
-		// to the admitted WebSocket attempt.
-		this.ctx.waitUntil(this.refreshAccountUsage(env, now, false));
-	}
-
-	private async refreshAccountUsage(env: Env, now: number, forced: boolean): Promise<void> {
-		if (!env.ACCOUNT_ID || !env.ACCOUNT_ANALYTICS_TOKEN) return;
-		if (this.accountUsageRefresh) return this.accountUsageRefresh;
-		if (!forced && now < this.accountUsageRetryAt) return;
-		if (this.accountUsageSnapshot && now - this.accountUsageSnapshot.sampledAt < ACCOUNT_USAGE_POLICY.minimumRefreshIntervalMs) return;
-		this.accountUsageEvents = 0;
-		const task = (async () => {
-			const controller = new AbortController();
-			const timeout = setTimeout(() => controller.abort(), 5_000);
-			try {
-				const snapshot = await fetchAccountUsage(env, now, controller.signal);
-				// Bounded confirmation per instance and after recovery; no sensitive data.
-				if (!this.accountUsageVerified || this.accountUsageFailureCount > 0) {
-					console.info(JSON.stringify({ event: "account_usage_refresh_succeeded", sampledAt: snapshot.sampledAt, stop: snapshot.stop }));
-				}
-				this.accountUsageVerified = true;
-				try { this.store.persistAccountUsageSnapshot(snapshot, now); } catch { /* retain the in-memory safety stop */ }
-				this.accountUsageSnapshot = snapshot;
-				this.accountUsageFailureCount = 0;
-				this.accountUsageRetryAt = 0;
-				if (snapshot.stop) {
-					for (const peer of this.ctx.getWebSockets()) {
-						const state = connectionAttachment(peer);
-						if (state) this.closePolicy(peer as WebSocketConnection, state, 1013, "Demo account capacity reached; try later");
-					}
-				}
-			} catch {
-				this.accountUsageFailureCount += 1;
-				const delay = Math.min(ACCOUNT_USAGE_POLICY.maxRetryMs, ACCOUNT_USAGE_POLICY.initialRetryMs * 2 ** Math.min(this.accountUsageFailureCount - 1, 4));
-				this.accountUsageRetryAt = now + delay;
-				if ((this.accountUsageFailureCount & (this.accountUsageFailureCount - 1)) === 0) console.warn(JSON.stringify({ event: "account_usage_refresh_failed", count: this.accountUsageFailureCount }));
-			} finally {
-				clearTimeout(timeout);
-			}
-		})();
-		this.accountUsageRefresh = task;
-		await task;
-		this.accountUsageRefresh = undefined;
 	}
 }

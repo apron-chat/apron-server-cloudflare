@@ -15,6 +15,12 @@ export function validateAdmission(admission = ADMISSION_BUDGET, limits = DEFAULT
 	if (admission.requestsPerIpMinute < limits.connectionAdmissionsPerIpMinute) {
 		throw new Error('Attempt budget must allow the configured per-IP connection admissions');
 	}
+	if (admission.requestsPerIpv6PrefixMinute < admission.requestsPerIpMinute) {
+		throw new Error('An IPv6 /48 must be allowed at least one address\'s attempts');
+	}
+	if (admission.objectRequestsPerLocationMinute < Math.max(admission.requestsPerIpv6PrefixMinute, limits.openConnections)) {
+		throw new Error('A location must be allowed a /48\'s attempts and a reconnect of every open connection');
+	}
 	if (admission.edgeWindowSeconds !== 10 || admission.edgeBlockSeconds !== 10) {
 		throw new Error('Free WAF supports only 10-second counting and mitigation windows');
 	}
@@ -30,11 +36,18 @@ export function validateEdgeStop(edgeStop) {
 }
 
 /**
- * The generated rate-limiter bindings. `flood`, for a plan with an edge stop,
- * adds the sampled per-location counter the Worker trips the stop on.
+ * The generated rate-limiter bindings: the attempt limits per address
+ * (`namespaces.attempts`), per IPv6 /48 (`prefix`) and per location
+ * (`location`), all three always, since the Worker refuses every connection
+ * without any of them. `flood`, for a plan with an edge stop, adds the sampled
+ * per-location counter the Worker trips the stop on.
  */
-export function renderBinding(namespace, admission = ADMISSION_BUDGET, flood = undefined) {
+export function renderBinding(namespaces, admission = ADMISSION_BUDGET, flood = undefined) {
 	validateAdmission(admission);
+	const ids = [namespaces?.attempts, namespaces?.prefix, namespaces?.location];
+	if (!ids.every((id) => typeof id === 'string' && /^[1-9]\d*$/.test(id)) || new Set(ids).size !== ids.length) {
+		throw new Error('The attempt limits need three distinct integer namespace IDs');
+	}
 	let floodBinding = '';
 	if (flood) {
 		validateEdgeStop(flood.edgeStop);
@@ -48,8 +61,16 @@ simple = { limit = ${flood.edgeStop.floodRequestsPerColoMinute / flood.edgeStop.
 # Edit src/budget.ts, then run npm run budget:generate.
 [[ratelimits]]
 name = "CONNECTION_ATTEMPTS"
-namespace_id = "${namespace}"
-simple = { limit = ${admission.requestsPerIpMinute}, period = ${admission.workerWindowSeconds} }${floodBinding}
+namespace_id = "${namespaces.attempts}"
+simple = { limit = ${admission.requestsPerIpMinute}, period = ${admission.workerWindowSeconds} }
+[[ratelimits]]
+name = "PREFIX_ATTEMPTS"
+namespace_id = "${namespaces.prefix}"
+simple = { limit = ${admission.requestsPerIpv6PrefixMinute}, period = ${admission.workerWindowSeconds} }
+[[ratelimits]]
+name = "LOCATION_ATTEMPTS"
+namespace_id = "${namespaces.location}"
+simple = { limit = ${admission.objectRequestsPerLocationMinute}, period = ${admission.workerWindowSeconds} }${floodBinding}
 ${end}`;
 }
 
@@ -197,10 +218,13 @@ function main() {
 	const workflow = readFileSync(new URL('.github/workflows/deploy.yml', root), 'utf8');
 	validateDeploymentConfiguration({ development, production, packageJson, workflow, budgetGuard: Boolean(ACCOUNT_USAGE_POLICY.monthly), uploads: Boolean(PLAN.uploads) });
 	const outputs = [];
-	for (const [file, namespace, floodNamespace] of [['wrangler.toml', '73001', '73003'], ['wrangler.production.toml', '73002', '73004']]) {
+	for (const [file, attempts, floodNamespace, prefix, location] of [
+		['wrangler.toml', '73001', '73003', '73005', '73007'],
+		['wrangler.production.toml', '73002', '73004', '73006', '73008'],
+	]) {
 		const source = readFileSync(new URL(file, root), 'utf8');
 		const flood = PLAN.edgeStop ? { namespace: floodNamespace, edgeStop: PLAN.edgeStop } : undefined;
-		outputs.push([file, replaceBinding(source, renderBinding(namespace, ADMISSION_BUDGET, flood))]);
+		outputs.push([file, replaceBinding(source, renderBinding({ attempts, prefix, location }, ADMISSION_BUDGET, flood))]);
 	}
 	const hosts = [...production.matchAll(/pattern\s*=\s*"([a-z0-9.-]+)"\s*,\s*custom_domain\s*=\s*true/g)];
 	if (hosts.length !== 1) throw new Error('Expected exactly one production custom domain');

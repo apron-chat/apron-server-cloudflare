@@ -136,6 +136,19 @@ export function exceededAllowances(usage: Omit<AccountUsageSnapshot, "stop">): s
 	return exceeded;
 }
 
+/**
+ * Whether a snapshot still stops the server at `now`: through its UTC day,
+ * or, when it reached a monthly allowance, through its calendar month, so a
+ * monthly stop does not lift at midnight while the next reading is pending
+ * or failing.
+ */
+export function accountUsageStops(snapshot: AccountUsageSnapshot | null, now: number): boolean {
+	if (!snapshot?.stop) return false;
+	const today = dayFor(now);
+	if (snapshot.day === today) return true;
+	return snapshot.day.slice(0, 7) === today.slice(0, 7) && exceededAllowances(snapshot).some((name) => name.startsWith("monthly."));
+}
+
 export function accountUsageSnapshotFromResult(result: unknown, sampledAt: number): AccountUsageSnapshot {
 	if (!result || typeof result !== "object") throw new AccountUsageError("analytics result is missing");
 	const data = (result as { data?: unknown; errors?: unknown[] }).data;
@@ -208,4 +221,106 @@ export async function fetchAccountUsage(env: AccountUsageEnvironment, sampledAt 
 	});
 	if (!response.ok) throw new AccountUsageError(`analytics HTTP ${response.status}`);
 	return accountUsageSnapshotFromResult(await response.json(), sampledAt);
+}
+
+interface AccountUsageMonitorOptions {
+	env: AccountUsageEnvironment;
+	/** Saves a fresh snapshot, so a wake starts from it; a failure keeps the in-memory one. */
+	persist(snapshot: AccountUsageSnapshot, now: number): void;
+	/** Keeps a refresh an event started alive after the event's response. */
+	waitUntil(promise: Promise<unknown>): void;
+	/** Called when a fresh snapshot stops the server, to close what is open. */
+	onStop(): void;
+	fetcher?: typeof fetch;
+}
+
+/**
+ * The Durable Object's account-usage stop: the latest snapshot, and when to
+ * read the next one. Events count toward a refresh every
+ * `refreshEveryEvents`, or as soon as the snapshot is `staleAfterMs` old, at
+ * most once per `minimumRefreshIntervalMs`; a failed reading keeps the last
+ * snapshot and retries with backoff. Without `ACCOUNT_ID` and
+ * `ACCOUNT_ANALYTICS_TOKEN` it never reads, and only a restored snapshot can
+ * stop the server.
+ */
+export class AccountUsageMonitor {
+	private events = 0;
+	private retryAt = 0;
+	private failures = 0;
+	private verified = false;
+	private pending?: Promise<void>;
+
+	constructor(private readonly options: AccountUsageMonitorOptions, private current: AccountUsageSnapshot | null = null) {}
+
+	/** The latest snapshot, read now or restored from storage. */
+	get snapshot(): AccountUsageSnapshot | null {
+		return this.current;
+	}
+
+	/** Starts from a snapshot read back from storage. */
+	restore(snapshot: AccountUsageSnapshot | null): void {
+		this.current = snapshot;
+	}
+
+	/** Whether the latest snapshot stops the server at `now` (accountUsageStops). */
+	stops(now: number): boolean {
+		return accountUsageStops(this.current, now);
+	}
+
+	/** Counts one event, and starts a refresh in the background when one is due. */
+	noteActivity(now = Date.now()): void {
+		if (!this.configured()) return;
+		this.events += 1;
+		const stale = !this.current || now - this.current.sampledAt >= ACCOUNT_USAGE_POLICY.staleAfterMs;
+		if (this.events < ACCOUNT_USAGE_POLICY.refreshEveryEvents && !stale) return;
+		// Keep the refresh alive after the request returns without adding its latency
+		// to the admitted WebSocket attempt.
+		this.options.waitUntil(this.refresh(now, false));
+	}
+
+	/**
+	 * Reads usage now unless a reading is under way (it waits for that one),
+	 * the last is under a minute old, or, unless `forced`, a failure's backoff
+	 * has not passed.
+	 */
+	async refresh(now: number, forced: boolean): Promise<void> {
+		if (!this.configured()) return;
+		if (this.pending) return this.pending;
+		if (!forced && now < this.retryAt) return;
+		if (this.current && now - this.current.sampledAt < ACCOUNT_USAGE_POLICY.minimumRefreshIntervalMs) return;
+		this.events = 0;
+		const task = this.read(now);
+		this.pending = task;
+		await task;
+		this.pending = undefined;
+	}
+
+	private configured(): boolean {
+		return !!this.options.env.ACCOUNT_ID && !!this.options.env.ACCOUNT_ANALYTICS_TOKEN;
+	}
+
+	private async read(now: number): Promise<void> {
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), 5_000);
+		try {
+			const snapshot = await fetchAccountUsage(this.options.env, now, controller.signal, this.options.fetcher ?? fetch);
+			// Bounded confirmation per instance and after recovery; no sensitive data.
+			if (!this.verified || this.failures > 0) {
+				console.info(JSON.stringify({ event: "account_usage_refresh_succeeded", sampledAt: snapshot.sampledAt, stop: snapshot.stop }));
+			}
+			this.verified = true;
+			try { this.options.persist(snapshot, now); } catch { /* retain the in-memory safety stop */ }
+			this.current = snapshot;
+			this.failures = 0;
+			this.retryAt = 0;
+			if (snapshot.stop) this.options.onStop();
+		} catch {
+			this.failures += 1;
+			const delay = Math.min(ACCOUNT_USAGE_POLICY.maxRetryMs, ACCOUNT_USAGE_POLICY.initialRetryMs * 2 ** Math.min(this.failures - 1, 4));
+			this.retryAt = now + delay;
+			if ((this.failures & (this.failures - 1)) === 0) console.warn(JSON.stringify({ event: "account_usage_refresh_failed", count: this.failures }));
+		} finally {
+			clearTimeout(timeout);
+		}
+	}
 }

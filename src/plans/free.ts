@@ -94,6 +94,14 @@ export const FREE_PLAN: Plan = Object.freeze({
 	// billing cap.
 	admission: Object.freeze({
 		requestsPerIpMinute: 10,
+		// Three busy /56s' worth: a site's networks share it, an attacker's
+		// /48 does not multiply the address limit.
+		requestsPerIpv6PrefixMinute: 30,
+		// Twice a full reconnect of the 100 open connections, so a deploy or a
+		// wake never reaches it, while an attack from one location that stays
+		// under the flood trip spends a sixth of the Durable Object requests
+		// it could before.
+		objectRequestsPerLocationMinute: 200,
 		workerWindowSeconds: 60,
 		// Free WAF supports only 10-second windows; this optional rule is zone-wide.
 		edgeRequestsPerIpWindow: 10,

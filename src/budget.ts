@@ -151,6 +151,20 @@ export interface Limits {
 
 interface AdmissionBudget {
 	requestsPerIpMinute: number;
+	/**
+	 * Attempts one native IPv6 /48 may make a minute at one Cloudflare
+	 * location, across all its /56s. One host can hold a whole /48, so the
+	 * per-address limit (per /56) alone would let it make 256 times as many.
+	 */
+	requestsPerIpv6PrefixMinute: number;
+	/**
+	 * Attempts one Cloudflare location may pass to the Durable Object a
+	 * minute, from every address together. Each one costs a Durable Object
+	 * request, while a rejection before it costs only the Worker request, an
+	 * allowance Paid includes ten times as many of. Past it, attempts there
+	 * get 503 with a `Retry-After` of `workerWindowSeconds`.
+	 */
+	objectRequestsPerLocationMinute: number;
 	workerWindowSeconds: number;
 	edgeRequestsPerIpWindow: number;
 	edgeWindowSeconds: number;

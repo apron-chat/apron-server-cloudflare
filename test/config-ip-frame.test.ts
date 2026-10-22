@@ -3,7 +3,9 @@ import { ConfigError, DEFAULT_LIMITS, isAllowedOrigin, loadConfig } from '../src
 import { ACCOUNT_USAGE_POLICY, DEFAULT_FEATURES, PLAN } from '../src/budget';
 import { FREE_PLAN } from '../src/plans/free';
 import { PAID_PLAN } from '../src/plans/paid';
-import { canonicalizeIp, extractClientIp, hashIpKey } from '../src/ip';
+import { canonicalizeIp, extractClientIp, hashIpKey, hashIpv6PrefixKey } from '../src/ip';
+import { withStore } from './helpers/store';
+import { StoreError } from '../src/store';
 import { DEFAULT_PARSE_OPTIONS, FrameError, parseFrame } from '../src/protocol';
 
 // Independent boundary cases from the implementation specification.
@@ -18,7 +20,19 @@ describe('trusted IP boundaries', () => {
 		expect(canonicalizeIp('::ffff:192.0.2.10')?.key).toBe(key);
 		expect(canonicalizeIp('0:0:0:0:0:ffff:c000:020a')?.key).toBe(key);
 		expect(canonicalizeIp('2001:db8:1:2::1')?.key).toBe(canonicalizeIp('2001:0db8:0001:0002:abcd::5')?.key);
-		expect(canonicalizeIp('2001:db8:1:3::1')?.key).not.toBe(canonicalizeIp('2001:db8:1:2::1')?.key);
+		// Grouped by /56: another /64 of it shares the key, another /56 does not.
+		expect(canonicalizeIp('2001:db8:1:ff::1')?.key).toBe(canonicalizeIp('2001:db8:1:2::1')?.key);
+		expect(canonicalizeIp('2001:db8:1:102::1')?.key).not.toBe(canonicalizeIp('2001:db8:1:2::1')?.key);
+		expect(canonicalizeIp('2001:db8:1:2::1')?.key).toBe('v6:2001:db8:1::/56');
+		expect(canonicalizeIp('2001:db8:1:abcd::1')?.key).toBe('v6:2001:db8:1:ab00::/56');
+	});
+	it('groups native IPv6 by /48 for the shared limit, and leaves IPv4 to its address limit', async () => {
+		const site = await hashIpv6PrefixKey(canonicalizeIp('2001:db8:1:2::1')!);
+		expect(site).not.toBeNull();
+		expect(await hashIpv6PrefixKey(canonicalizeIp('2001:db8:1:ffff:abcd::5')!)).toBe(site);
+		expect(await hashIpv6PrefixKey(canonicalizeIp('2001:db8:2:2::1')!)).not.toBe(site);
+		expect(await hashIpv6PrefixKey(canonicalizeIp('192.0.2.10')!)).toBeNull();
+		expect(await hashIpv6PrefixKey(canonicalizeIp('::ffff:192.0.2.10')!)).toBeNull();
 	});
 	it('does not let an unrelated IPv6 header change a real IPv4 principal', () => {
 		const headers = new Headers({ 'CF-Connecting-IP': '192.0.2.10', 'CF-Connecting-IPv6': '2001:db8::1' });
@@ -192,6 +206,16 @@ describe('configuration policy boundaries', () => {
 		}
 	});
 
+	it('marks the daily frame budget so the object closes every socket on it', async () => {
+		await withStore('frame-budget-reason', { processedFramesPerDay: 10 }, (store, clock) => {
+			store.reserveFrames({ ipKey: 'frame-budget-ip', now: clock.value, count: 10 });
+			let error: unknown;
+			try { store.reserveFrames({ ipKey: 'frame-budget-other-ip', now: clock.value, count: 1 }); }
+			catch (caught) { error = caught; }
+			expect(error).toBeInstanceOf(StoreError);
+			expect((error as StoreError).data).toEqual({ reason: 'frame_budget' });
+		});
+	});
 	it('bounds the server-wide frame minute', () => {
 		expect(() => config({}, { globalFramesPerMinute: DEFAULT_LIMITS.framesPerIpMinute - 1 })).toThrow(ConfigError);
 		expect(() => config({}, { globalFramesPerMinute: 1_001 })).toThrow(ConfigError);

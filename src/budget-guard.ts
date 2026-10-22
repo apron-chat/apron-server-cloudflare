@@ -44,29 +44,47 @@ function message(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+type StopRuleEnvironment = BudgetGuardEnvironment & { ZONE_ID: string; EDGE_STOP_TOKEN: string };
+
+function rulesetsApi(env: StopRuleEnvironment): { api: string; headers: Record<string, string> } {
+	return {
+		api: `https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(env.ZONE_ID)}/rulesets`,
+		headers: { Authorization: `Bearer ${env.EDGE_STOP_TOKEN}`, "Content-Type": "application/json" },
+	};
+}
+
+/** The zone's custom-rule entrypoint and the edge stop rule in it, if any; throws when it cannot be read. */
+async function readStopRule(env: StopRuleEnvironment, fetcher: typeof fetch, signal?: AbortSignal): Promise<{ rulesetId?: string; rule?: RulesetRule }> {
+	const { api, headers } = rulesetsApi(env);
+	const response = await fetcher(`${api}/phases/http_request_firewall_custom/entrypoint`, { headers, signal });
+	if (!response.ok) throw new Error(`ruleset HTTP ${response.status}`);
+	const ruleset = (await response.json() as { result?: { id?: string; rules?: RulesetRule[] } }).result;
+	return { rulesetId: ruleset?.id, rule: ruleset?.rules?.find((candidate) => candidate.ref === EDGE_STOP_RULE_REF) };
+}
+
+/** The Rulesets API treats a rule without `enabled` as enabled. */
+function ruleEnabled(rule: RulesetRule): boolean {
+	return rule.enabled !== false;
+}
+
 /**
  * Turns the edge stop rule on or off, changing nothing if it is already so.
  * A rule turned on less than the plan's `holdSeconds` ago is not turned off.
  */
-async function setEdgeStop(env: BudgetGuardEnvironment & { ZONE_ID: string; EDGE_STOP_TOKEN: string }, stop: boolean, exceeded: string[], now: number, fetcher: typeof fetch): Promise<EdgeStopOutcome> {
-	const api = `https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(env.ZONE_ID)}/rulesets`;
-	const headers = { Authorization: `Bearer ${env.EDGE_STOP_TOKEN}`, "Content-Type": "application/json" };
+async function setEdgeStop(env: StopRuleEnvironment, stop: boolean, exceeded: string[], now: number, fetcher: typeof fetch): Promise<EdgeStopOutcome> {
+	const { api, headers } = rulesetsApi(env);
 	try {
-		const response = await fetcher(`${api}/phases/http_request_firewall_custom/entrypoint`, { headers });
-		if (!response.ok) throw new Error(`ruleset HTTP ${response.status}`);
-		const ruleset = (await response.json() as { result?: { id?: string; rules?: RulesetRule[] } }).result;
-		const rule = ruleset?.rules?.find((candidate) => candidate.ref === EDGE_STOP_RULE_REF);
-		if (!ruleset?.id || !rule) {
+		const { rulesetId, rule } = await readStopRule(env, fetcher);
+		if (!rulesetId || !rule) {
 			log("budget_guard_rule_missing", { ref: EDGE_STOP_RULE_REF, stop, exceeded }, "error");
 			return "rule_missing";
 		}
-		// The Rulesets API treats a rule without `enabled` as enabled.
-		const enabled = rule.enabled !== false;
+		const enabled = ruleEnabled(rule);
 		if (enabled === stop) return "unchanged";
 		const holdMs = (PLAN.edgeStop?.holdSeconds ?? 0) * 1_000;
 		const updatedAt = Date.parse(rule.last_updated ?? "");
 		if (!stop && now - updatedAt < holdMs) return "held";
-		const update = await fetcher(`${api}/${encodeURIComponent(ruleset.id)}/rules/${encodeURIComponent(rule.id)}`, {
+		const update = await fetcher(`${api}/${encodeURIComponent(rulesetId)}/rules/${encodeURIComponent(rule.id)}`, {
 			method: "PATCH",
 			headers,
 			body: JSON.stringify({ ref: rule.ref, action: rule.action, expression: rule.expression, description: rule.description, enabled: stop }),
@@ -103,6 +121,28 @@ export async function runBudgetGuard(env: BudgetGuardEnvironment, now = Date.now
 	const outcome = await setEdgeStop({ ...env, ZONE_ID, EDGE_STOP_TOKEN }, stop, exceeded, now, fetcher);
 	if (outcome === "rule_failed" || outcome === "rule_missing") return { outcome };
 	return { outcome, stop, exceeded };
+}
+
+export type EdgeStopState =
+	| { state: "unconfigured" | "rule_missing" }
+	| { state: "unreadable"; message: string }
+	| { state: "on" | "off"; updatedAt?: string };
+
+/**
+ * Reads the edge stop rule without changing it, for `/status`: whether the
+ * guard's zone, token, and rule work, and whether the stop is on. A guard
+ * that cannot reach the rule only logs, so this is where it shows.
+ */
+export async function readEdgeStop(env: BudgetGuardEnvironment, fetcher: typeof fetch = fetch, signal?: AbortSignal): Promise<EdgeStopState> {
+	const { ZONE_ID, EDGE_STOP_TOKEN } = env;
+	if (!ZONE_ID || !EDGE_STOP_TOKEN) return { state: "unconfigured" };
+	try {
+		const { rulesetId, rule } = await readStopRule({ ...env, ZONE_ID, EDGE_STOP_TOKEN }, fetcher, signal);
+		if (!rulesetId || !rule) return { state: "rule_missing" };
+		return { state: ruleEnabled(rule) ? "on" : "off", ...(rule.last_updated ? { updatedAt: rule.last_updated } : {}) };
+	} catch (error) {
+		return { state: "unreadable", message: message(error) };
+	}
 }
 
 let floodTrippedAt = -Infinity;

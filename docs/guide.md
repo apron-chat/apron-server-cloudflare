@@ -240,7 +240,7 @@ Passkeys require authentication on each new connection and do not prevent
 multiple registrations by one person.
 
 Guests only read by default. With `GUEST_POSTING=true`, guest posting is
-shared by IP (native IPv6 grouped by /64): five accepted
+shared by IP (native IPv6 grouped by /56): five accepted
 mutations per rolling minute and 200 per UTC day (100 with the Free budgets).
 Registered users receive 20/minute and 1,000/day (500), subject to the common IP and global limits. NAT users
 share allowances. Creates, edits, deletion, restoration, moves, reaction
@@ -262,7 +262,9 @@ and rejects new admissions until replenishment.
 
 IP rate limits use the first 128 bits of SHA-256 of the canonical address key,
 encoded as 22 base64url characters. IPv4-mapped IPv6 shares its IPv4 key; native
-IPv6 is grouped by /64. No IP secret or backup is needed. These internal hashes
+IPv6 is grouped by /56, the size ISPs most often delegate to one home or site,
+so a subscriber cannot multiply its limits across the /64s it routes. No IP
+secret or backup is needed. These internal hashes
 are compact identifiers, not anonymization: candidate IPs can be hashed to
 recover a match. Neither raw IPs nor these keys are sent to chat clients.
 
@@ -281,8 +283,8 @@ batches. Budget authority, credentials, and the room head are independent of
 retention. SQLite frees pages for reuse without necessarily shrinking the file.
 The inspected [workerd implementation](https://github.com/cloudflare/workerd/blob/main/src/workerd/api/sql.c++)
 reports occupied pages through `databaseSize`, excluding freelist pages. Pressure
-stops growth at 96 MiB and resumes only below 80 MiB; transactions also check the
-128 MiB hard target before committing. Recheck this runtime assumption on upgrades.
+stops growth at 768 MiB and resumes only below 640 MiB; transactions also check the
+1 GiB hard target before committing (96, 80 and 128 MiB with the Free budgets). Recheck this runtime assumption on upgrades.
 Do not delete the database or run unmetered VACUUM as a space-recovery measure.
 
 ## Continuous deployment
@@ -423,7 +425,8 @@ or `/ws` URL with `?apron_connection_status=1`. The response exposes `Retry-Afte
 through CORS and disables caching. It checks live connection capacity and the
 cached daily SQL budget without reserving SQL work or opening a socket; it is
 advisory, and the real upgrade still enforces every admission gate. The native
-per-IP attempt limiter also applies to these probes.
+attempt limiters (per address, per IPv6 /48, and per location) also apply to
+these probes.
 
 When the daily SQL guard stops work, a `daily_budget_exhausted` log records the
 reserved counters and limits once per object instance/day. Each operation reserves

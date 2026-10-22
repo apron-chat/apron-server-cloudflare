@@ -3,9 +3,11 @@ import { test } from 'node:test';
 import { ADMISSION_BUDGET, DEFAULT_LIMITS } from '../src/budget.ts';
 import { mediaHostname, renderBinding, renderEdgeRules, replaceBinding, validateAdmission, validateDeploymentConfiguration, validateEdgeStop } from './budget.mjs';
 
+const namespaces = { attempts: '123', prefix: '124', location: '125' };
+
 test('changed admission limits propagate to both Worker and optional edge policy', () => {
 	const changed = { ...ADMISSION_BUDGET, requestsPerIpMinute: 25, edgeRequestsPerIpWindow: 20 };
-	assert.match(renderBinding('123', changed), /limit = 25, period = 60/);
+	assert.match(renderBinding(namespaces, changed), /limit = 25, period = 60/);
 	const edge = renderEdgeRules('chat.example.test', changed);
 	assert.equal(edge.optionalZoneRateLimit.rules[0].ratelimit.requests_per_period, 20);
 	assert.equal(edge.optionalZoneRateLimit.rules[0].enabled, false);
@@ -18,9 +20,9 @@ test('changed admission limits propagate to both Worker and optional edge policy
 
 test('generation is idempotent and preserves unrelated Wrangler settings', () => {
 	const original = 'name = "example"\n[vars]\nADMISSION_OFF = "true"\n';
-	const initial = replaceBinding(original, renderBinding('123'));
-	assert.equal(replaceBinding(initial, renderBinding('123')), initial);
-	const changed = replaceBinding(initial, renderBinding('456'));
+	const initial = replaceBinding(original, renderBinding(namespaces));
+	assert.equal(replaceBinding(initial, renderBinding(namespaces)), initial);
+	const changed = replaceBinding(initial, renderBinding({ attempts: '456', prefix: '457', location: '458' }));
 	assert.ok(changed.startsWith(original));
 	assert.match(changed, /namespace_id = "456"/);
 	assert.doesNotMatch(changed, /namespace_id = "123"/);
@@ -39,7 +41,7 @@ test('invalid windows and inconsistent attempt budgets cannot be generated', () 
 });
 
 test('malformed generated sections fail without rewriting configuration', () => {
-	assert.throws(() => replaceBinding('# BEGIN GENERATED ADMISSION BUDGET\n', renderBinding('123')));
+	assert.throws(() => replaceBinding('# BEGIN GENERATED ADMISSION BUDGET\n', renderBinding(namespaces)));
 });
 
 test('deployment configuration isolates development and protects production selection', () => {
@@ -112,12 +114,27 @@ test('a plan that bills past its included usage requires the budget guard cron a
 
 test('a plan with an edge stop also generates the sampled flood counter', () => {
 	const edgeStop = { floodRequestsPerColoMinute: 1200, floodSampleEvery: 20, holdSeconds: 1800 };
-	const binding = renderBinding('123', ADMISSION_BUDGET, { namespace: '456', edgeStop });
+	const binding = renderBinding(namespaces, ADMISSION_BUDGET, { namespace: '456', edgeStop });
 	assert.match(binding, /name = "CONNECTION_ATTEMPTS"\nnamespace_id = "123"/);
 	assert.match(binding, /name = "FLOOD_WATCH"\nnamespace_id = "456"\nsimple = \{ limit = 60, period = 60 \}/);
-	assert.doesNotMatch(renderBinding('123'), /FLOOD_WATCH/);
+	assert.doesNotMatch(renderBinding(namespaces), /FLOOD_WATCH/);
 	assert.throws(() => validateEdgeStop({ ...edgeStop, floodSampleEvery: 7 }), /whole number/);
 	assert.throws(() => validateEdgeStop({ ...edgeStop, holdSeconds: 0 }));
+});
+
+test('the /48 and location attempt limits are generated from the plan and kept consistent', () => {
+	const binding = renderBinding(namespaces);
+	assert.match(binding, new RegExp(`name = "PREFIX_ATTEMPTS"\nnamespace_id = "124"\nsimple = \\{ limit = ${ADMISSION_BUDGET.requestsPerIpv6PrefixMinute}, period = 60 \\}`));
+	assert.match(binding, new RegExp(`name = "LOCATION_ATTEMPTS"\nnamespace_id = "125"\nsimple = \\{ limit = ${ADMISSION_BUDGET.objectRequestsPerLocationMinute}, period = 60 \\}`));
+	// Always all three: the Worker refuses every connection without any of them.
+	for (const missing of ['attempts', 'prefix', 'location']) {
+		assert.throws(() => renderBinding({ ...namespaces, [missing]: undefined }), /namespace IDs/);
+	}
+	assert.throws(() => renderBinding('123'), /namespace IDs/);
+	assert.throws(() => renderBinding({ ...namespaces, location: '123' }), /distinct/);
+	assert.throws(() => validateAdmission({ ...ADMISSION_BUDGET, requestsPerIpv6PrefixMinute: ADMISSION_BUDGET.requestsPerIpMinute - 1 }), /48/);
+	assert.throws(() => validateAdmission({ ...ADMISSION_BUDGET, objectRequestsPerLocationMinute: DEFAULT_LIMITS.openConnections - 1 }), /location/);
+	assert.throws(() => validateAdmission({ ...ADMISSION_BUDGET, objectRequestsPerLocationMinute: 0 }));
 });
 
 test('with uploads, write URLs pass the invalid-request rule and the budget stop covers the media host', () => {
