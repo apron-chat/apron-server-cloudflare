@@ -54,6 +54,16 @@ export const PAID_PLAN: Plan = Object.freeze({
 		globalPostsPerDay: 10_000,
 		registrationsPerIpDay: 5,
 		registrationsPerDay: 300,
+		// Room for two browsers on one address, such as a second account in a
+		// private window: each has a guest connection while signed out, a
+		// sign-in opens one more beside it, and a reload's replacement is
+		// unauthenticated until it resumes. Free's 2 refused the second
+		// browser's sign-in. These are fairness limits; openConnections and
+		// the daily admissions below bound what they can spend.
+		anonymousConnectionsPerIp: 6,
+		// A sign-in costs three admissions (guest, sign-in connection, the
+		// signed-in reconnect), so Free's 5 a minute ran out on two browsers.
+		connectionAdmissionsPerIpMinute: 12,
 		connectionAdmissionsPerDay: 4_000,
 		processedFramesPerDay: 150_000,
 		// Twice Free's spike: 20 active users among 50 connected.
@@ -71,8 +81,16 @@ export const PAID_PLAN: Plan = Object.freeze({
 		databaseResumeLowWaterBytes: 640 * 1024 * 1024,
 	}),
 	// The attempt limiters still guard Durable Object requests, which Paid
-	// includes fewer of than Free.
-	admission: FREE_PLAN.admission,
+	// includes fewer of than Free, so only the per-address ones move: enough
+	// over the 12 admissions for a refused upgrade's status probe and retry.
+	// One address at its limit all day is 28,800 Durable Object requests,
+	// still under the per-location limit that bounds them.
+	admission: Object.freeze({
+		...FREE_PLAN.admission,
+		requestsPerIpMinute: 20,
+		// Three busy /56s' worth, as on Free.
+		requestsPerIpv6PrefixMinute: 60,
+	}),
 	// Monthly included usage divided by 31 days, rounded down, so stopping
 	// under the daily share every day keeps the month inside what $5 covers.
 	account: Object.freeze({
