@@ -723,12 +723,12 @@ async function registerPasskey(peer: Peer, id: string, params: Record<string, un
 	return { passkey, begun, finished };
 }
 
-async function passkeyLogin(passkey: Awaited<ReturnType<typeof softPasskey>>): Promise<Frame> {
+async function passkeyLogin(passkey: Awaited<ReturnType<typeof softPasskey>>, edit = (credential: Record<string, unknown>) => credential, counter = 1): Promise<Frame> {
 	const peer = await connect();
 	try {
 		await peer.next();
 		const begun = await request(peer, 'login-begin', 'auth', { scheme: 'webauthn', action: 'login', step: 'begin' });
-		const credential = await passkey.assert(begun.result.public_key);
+		const credential = edit(await passkey.assert(begun.result.public_key, counter));
 		return await request(peer, 'login-finish', 'auth', { scheme: 'webauthn', action: 'login', step: 'finish', challenge_id: begun.result.challenge_id, credential });
 	} finally { peer.close(); }
 }
@@ -758,6 +758,10 @@ it('adds a passkey to the signed-in account (§4.10); a guest\'s registration ma
 		expect(credentials).toEqual([`cred-${userId}`, added.passkey.id]);
 		// The new passkey signs in as the same account.
 		expect((await passkeyLogin(added.passkey)).result.you.user_id).toBe(userId);
+		// Also when a password manager leaves out the extension results, or sends null.
+		expect((await passkeyLogin(added.passkey, ({ clientExtensionResults: _, ...rest }) => rest, 2)).result.you.user_id).toBe(userId);
+		expect((await passkeyLogin(added.passkey, (credential) => ({ ...credential, clientExtensionResults: null }), 3)).result.you.user_id).toBe(userId);
+		expect((await passkeyLogin(added.passkey, (credential) => ({ ...credential, clientExtensionResults: [] }), 4)).error.message).toBe('clientExtensionResults must be an object');
 		// /passkeys lists both; removing one tells the other connections, and the last cannot go.
 		const listed = await command(user, 'list', '/passkeys');
 		expect(listed.notice!.params.body.text).toMatch(/^Your passkeys:\n1\. .*\n2\. /);
