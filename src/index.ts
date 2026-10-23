@@ -833,6 +833,10 @@ function passkeyCredentialParam(params: Record<string, unknown>, action: "regist
 		requiredCredentialString(response.signature, "response.signature");
 		if (response.userHandle !== undefined) requiredCredentialString(response.userHandle, "response.userHandle");
 	}
+	// Required in WebAuthn JSON, but some password managers (1Password in Chrome
+	// on macOS) leave it out or send null. Verification never reads it, and a
+	// registration's `credProps` is optional anyway, so none counts as `{}`.
+	if (credential.clientExtensionResults === undefined || credential.clientExtensionResults === null) return { ...credential, clientExtensionResults: {} };
 	objectParam(credential, "clientExtensionResults");
 	return credential;
 }
