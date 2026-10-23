@@ -885,6 +885,27 @@ it('advertises which schemes create accounts in server.signup (§3.2)', async ()
 	} finally { withPasskeys.close(); plain.close(); }
 });
 
+it("shows general's description as server.welcome while it has one", async () => {
+	const admin = await signedInAdmin();
+	const description = 'Say hi in **general**.';
+	try {
+		expect((await exchange(admin, 'describe', 'room_set', { room_id: 'general', title: 'General', description })).frame.result).toEqual({ room_id: 'general' });
+		const greeted = await connect();
+		const plain = await connect(null);
+		try {
+			// The same text whatever the origin can sign in with.
+			expect((await greeted.next()).params.welcome).toBe(description);
+			expect((await plain.next()).params.welcome).toBe(description);
+		} finally { greeted.close(); plain.close(); }
+	} finally {
+		// Without a description, the generated sign-in welcome comes back.
+		expect((await exchange(admin, 'undescribe', 'room_set', { room_id: 'general', title: 'General' })).frame.result).toEqual({ room_id: 'general' });
+		admin.close();
+	}
+	const after = await connect();
+	try { expect((await after.next()).params.welcome).toMatch(/Apron public demo/); } finally { after.close(); }
+});
+
 it('/admin remove takes the admin role away, announced with roles: [] (§3.3)', async () => {
 	const admin = await signedInAdmin();
 	const userId = unique('demoted');

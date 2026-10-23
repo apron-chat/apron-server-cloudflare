@@ -54,9 +54,10 @@ typechecking, and both supported deployment commands reject stale generated
 configuration. Application defaults are imported directly and need no generated
 copy. Use Node.js 24, as in the repository development environment.
 
-`ADMISSION_BUDGET.requestsPerIpMinute` defaults to 10 attempted handshakes per
-minute, before calling the DO. This leaves retry headroom over the five accepted
-connections per IP per minute. `/` and `/ws` share a bucket. IPv4-mapped addresses
+`ADMISSION_BUDGET.requestsPerIpMinute` defaults to 20 attempted handshakes per
+minute (10 with the Free budgets), before calling the DO. This leaves retry
+headroom over the 12 accepted connections per IP per minute (5), since a refused
+upgrade is followed by a status probe. `/` and `/ws` share a bucket. IPv4-mapped addresses
 share their IPv4 bucket; native IPv6 shares a /56. Missing or failed limiter
 bindings reject admission with 503. Exhaustion returns 429 and `Retry-After`.
 The binding is approximate and local to each Cloudflare location, not a global
@@ -66,7 +67,7 @@ limiter namespaces; additional deployments must use distinct namespace IDs too.
 Two more limits, counted only for attempts their address's own limit let
 through, stop the per-address limit from being multiplied:
 
-- `requestsPerIpv6PrefixMinute` (30) is shared by a native IPv6 /48 at one
+- `requestsPerIpv6PrefixMinute` (60; Free: 30) is shared by a native IPv6 /48 at one
   location, across all its /56s. One host can hold a whole /48, which would
   otherwise give it 256 address limits. Past it, attempts get 429.
 - `objectRequestsPerLocationMinute` (200) is shared by every address at one
@@ -583,10 +584,10 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `registeredIdentityCount` | 10000 |  |
 | `authAttemptsPerIpMinute` | 10 |  |
 | `openConnections` | 100 |  |
-| `anonymousConnectionsPerIp` | 2 |  |
+| `anonymousConnectionsPerIp` | 6 | 2 |
 | `registeredConnectionsPerUser` | 3 |  |
 | `connectionsPerIp` | 10 |  |
-| `connectionAdmissionsPerIpMinute` | 5 |  |
+| `connectionAdmissionsPerIpMinute` | 12 | 5 |
 | `connectionAdmissionsPerDay` | 4000 | 2000 |
 | `unauthenticatedTimeoutSeconds` | 30 |  |
 | `pendingFramesPerConnection` | 8 |  |

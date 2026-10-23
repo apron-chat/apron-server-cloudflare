@@ -1545,7 +1545,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// connection, not an account, so `guest` is listed only in `auth`.
 				signup: this.passkeysOffered(origin) ? ["webauthn", "token"] : ["token"],
 				// For the sign-in screen (§3.2); the `~private` welcome below goes in a room.
-				welcome: this.signInWelcome(origin),
+				welcome: this.generalDescription() ?? this.signInWelcome(origin),
 				// Answered by the runtime without waking the object (see PING_REQUEST).
 				ping: limits.pingSeconds,
 				// Web Push (§4.9), with the VAPID key browsers subscribe with and the wake scopes.
@@ -1573,8 +1573,22 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `server.welcome` (§3.2): how this demo's sign-in schemes fit together,
-	 * for the sign-in screen, worded for what this origin can sign in with.
+	 * `general`'s description, which `server.welcome` shows when set, so the
+	 * sign-in screen says what the room's members chose. Undefined when it has
+	 * none or its read cannot be afforded.
+	 */
+	private generalDescription(): string | undefined {
+		try {
+			return this.store.getRoom(ROOM_ID, nowMs())?.description;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * `server.welcome` (§3.2) while `general` has no description: how this
+	 * demo's sign-in schemes fit together, for the sign-in screen, worded for
+	 * what this origin can sign in with.
 	 */
 	private signInWelcome(origin: string | null): string {
 		const days = Math.max(1, Math.round(this.config.limits.retentionSeconds / 86_400));

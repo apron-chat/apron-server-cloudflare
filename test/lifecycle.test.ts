@@ -6,6 +6,7 @@ import {
 	runInDurableObject,
 } from "cloudflare:test";
 import { expect, it } from "vitest";
+import { DEFAULT_LIMITS } from "../src/budget";
 import { connect as open, greeting } from "./helpers/socket";
 
 let nextIpOctet = 1;
@@ -104,8 +105,13 @@ it("restores hibernated socket attachment state without re-announcing the sessio
 
 it("enforces the per-IP anonymous connection cap (pending and guest sockets) and releases it only after close", async () => {
 	const ip = testIp();
-	const first = await pendingSocket(ip);
-	const second = await pendingSocket(ip);
+	// Two browsers on one address, such as a second account in a private
+	// window: each has a guest connection and a sign-in connection beside it,
+	// and one is reloading. All fit under the cap.
+	expect(DEFAULT_LIMITS.anonymousConnectionsPerIp).toBeGreaterThanOrEqual(5);
+	const first = await guestSocket(ip);
+	const others = [await pendingSocket(ip), await guestSocket(ip), await pendingSocket(ip), await pendingSocket(ip)];
+	while (others.length < DEFAULT_LIMITS.anonymousConnectionsPerIp - 1) others.push(await pendingSocket(ip));
 	try {
 		const rejected = await SELF.fetch("https://lifecycle.test/ws", {
 			headers: {
@@ -120,7 +126,7 @@ it("enforces the per-IP anonymous connection cap (pending and guest sockets) and
 		const admitted = await pendingSocket(ip);
 		await admitted.close();
 	} finally {
-		await second.close();
+		for (const peer of others) await peer.close();
 	}
 });
 
