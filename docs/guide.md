@@ -425,10 +425,13 @@ hostile traffic: rejected HTTP requests and incoming frames still cost platform
 resources. Local calibration is not proof of production billing or availability.
 
 Failed WebSocket handshakes can be diagnosed with an HTTP GET to the same `/`
-or `/ws` URL with `?apron_connection_status=1`. The response exposes `Retry-After`
-through CORS and disables caching. It checks live connection capacity and the
-cached daily SQL budget without reserving SQL work or opening a socket; it is
-advisory, and the real upgrade still enforces every admission gate. The native
+or `/ws` URL with `?apron_connection_status=1`. The response carries
+`Apron-Connection-Status: 1`, which marks it as the probe's own answer (clients
+ignore a reply without it, such as an edge's or a proxy's), exposes it and
+`Retry-After` through CORS, and disables caching. It checks live connection
+capacity and the cached daily SQL budget without reserving SQL work or opening
+a socket; it is advisory, and the real upgrade still enforces every admission
+gate. The native
 attempt limiters (per address, per IPv6 /48, and per location) also apply to
 these probes.
 

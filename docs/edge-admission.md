@@ -59,7 +59,8 @@ After applying rules, use a handful of requests, not a quota-exhaustion load tes
 - Confirm plain HTTP GET, POST, and invalid paths on the server hostname are
   blocked at the edge; check the matching rule in Security Events.
 - Confirm `GET /ws?apron_connection_status=1` reaches the Worker and exposes
-  capacity errors and `Retry-After` to the frontend through CORS.
+  capacity errors, `Retry-After`, and the `Apron-Connection-Status: 1` marker to
+  the frontend through CORS.
 - Confirm the web and documentation hosts are unaffected by the custom rules.
 - Review aggregate Worker/DO metrics and active edge definitions against the
   generated policy. Local tests verify admission behavior, not live WAF billing.

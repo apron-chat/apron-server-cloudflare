@@ -1042,8 +1042,12 @@ export async function fetchEntry(request: Request, env: Env, ctx?: ExecutionCont
 	if (!isConnectionStatus(request)) return response;
 	const headers = new Headers(response.headers);
 	headers.set("Access-Control-Allow-Origin", "*");
-	headers.set("Access-Control-Expose-Headers", "Retry-After");
+	headers.set("Access-Control-Expose-Headers", "Retry-After, Apron-Connection-Status");
 	headers.set("Cache-Control", "no-store");
+	// Marks the probe's own answers, on the WebSocket URLs, so a client can
+	// tell them from an edge's, a proxy's, or the assets' for other paths.
+	const { pathname } = new URL(request.url);
+	if (pathname === "/" || pathname === "/ws") headers.set("Apron-Connection-Status", "1");
 	return new Response(response.body, { status: response.status, headers });
 }
 
