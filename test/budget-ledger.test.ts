@@ -16,7 +16,7 @@ const limits: LedgerLimits = {
 function host() {
 	const table = new Map<string, RawBudgetRow>();
 	const statements: string[] = [];
-	const state = { unsafe: false, clock: 0, failUpdates: false };
+	const state = { unsafe: false, clock: 0, failUpdates: false, inTransaction: false };
 	const ledgerHost = {
 		exec(query: string, ...bindings: unknown[]) {
 			statements.push(query);
@@ -41,6 +41,8 @@ function host() {
 			return (row ? [{ ...row }] : []) as T[];
 		},
 		advanceClock(now: number) { state.clock = now; },
+		clock() { return state.clock; },
+		inTransaction() { return state.inTransaction; },
 		markUnsafe() { state.unsafe = true; },
 	};
 	return { ledgerHost, table, statements, state };
@@ -55,11 +57,11 @@ describe('budget ledger', () => {
 		ledger.start('2026-09-21');
 		const first = ledger.reserve({ reads: 10, writes: 10, history: 1 }, noon, noon, false, false);
 		ledger.refund(first, 1, 1);
-		const refused = ledger.reserve({ reads: 10, writes: 10, history: 1 }, noon, noon, false, false);
-		expect(table.get('2026-09-21')?.history_reserved).toBe(2);
+		expect(table.get('2026-09-21')?.history_reserved).toBe(1);
 		const updates = statements.length;
+		const refused = ledger.reserve({ reads: 10, writes: 10, history: 1 }, noon, noon, false, false);
 		ledger.refund(refused, 1, 1, { history: 1 });
-		// The give-back rides the refund's one update.
+		// The reservation, its refund and the give-back are one update, and cancel out.
 		expect(statements.length).toBe(updates + 1);
 		expect(table.get('2026-09-21')?.history_reserved).toBe(1);
 		const second = ledger.reserve({ reads: 10, writes: 10, history: 1 }, noon, noon, false, false);
@@ -74,19 +76,36 @@ describe('budget ledger', () => {
 		expect(() => ledger.reserve({ reads: 10, writes: 10 }, noon, noon, false, false)).not.toThrow();
 	});
 
-	it('charges a reservation to its day, then refunds what the work did not use', () => {
-		const { ledgerHost, table, state } = host();
+	it('charges a reservation to its day, then writes it with what the work did not use refunded, in one update', () => {
+		const { ledgerHost, table, state, statements } = host();
 		const ledger = new BudgetLedger(ledgerHost, limits);
 		ledger.start('2026-09-21');
 		const reserved = ledger.reserve({ reads: 40, writes: 20, posts: 1 }, noon, noon, false, false);
 		// Bookkeeping overhead (8) and the first reservation's handover (8).
 		expect(reserved).toMatchObject({ reads: 56, writes: 36, posts: 1, day: '2026-09-21', maintenance: false });
-		expect(table.get('2026-09-21')).toMatchObject({ reads_reserved: 56, writes_reserved: 36, foreground_writes: 36, posts_reserved: 1, maintenance_writes: 0 });
+		// Staged: checked against the cached copy, written when settled.
+		expect(table.get('2026-09-21')).toMatchObject({ reads_reserved: 0, writes_reserved: 0, posts_reserved: 0 });
 		expect(state.clock).toBe(noon);
 		ledger.refund(reserved, 10, 5);
 		// Credited down to the rows used plus the refund's own row.
-		expect(table.get('2026-09-21')).toMatchObject({ reads_reserved: 11, writes_reserved: 6, foreground_reads: 11, foreground_writes: 6 });
+		expect(table.get('2026-09-21')).toMatchObject({ reads_reserved: 11, writes_reserved: 6, foreground_reads: 11, foreground_writes: 6, posts_reserved: 1 });
+		expect(statements.filter((query) => query.startsWith('UPDATE'))).toHaveLength(1);
+		// With the effective clock.
+		expect(statements.find((query) => query.startsWith('UPDATE'))).toMatch(/effective_ms = MAX\(effective_ms, \?\)/);
 		expect(ledger.snapshot('2026-09-21')).toMatchObject({ reads: 11, writes: 6, posts: 1 });
+	});
+
+	it('holds a settling write back inside a transaction, which could roll it back, until the next one outside', () => {
+		const { ledgerHost, table, state } = host();
+		const ledger = new BudgetLedger(ledgerHost, limits);
+		ledger.start('2026-09-21');
+		state.inTransaction = true;
+		ledger.refund(ledger.reserve({ reads: 10, writes: 10 }, noon, noon, false, false), 1, 1);
+		expect(table.get('2026-09-21')).toMatchObject({ reads_reserved: 0 });
+		state.inTransaction = false;
+		ledger.refund(ledger.reserve({ reads: 10, writes: 10 }, noon, noon, false, false), 1, 1);
+		// Both operations' rows, written together.
+		expect(table.get('2026-09-21')).toMatchObject({ reads_reserved: 4, writes_reserved: 4 });
 	});
 
 	it('refuses from the cached row without running SQL', () => {
@@ -117,13 +136,17 @@ describe('budget ledger', () => {
 		expect(table.get('2026-09-21')).toMatchObject({ maintenance_reads: 2, maintenance_writes: 2, foreground_writes: 0 });
 	});
 
-	it('latches accounting unsafe when a reservation cannot be written', () => {
-		const { ledgerHost, state } = host();
+	it('latches accounting unsafe when a reservation cannot be written, and keeps it for the next write', () => {
+		const { ledgerHost, state, table } = host();
 		const ledger = new BudgetLedger(ledgerHost, limits);
 		ledger.start('2026-09-21');
 		state.failUpdates = true;
-		expect(() => ledger.reserve({ writes: 1 }, noon, noon, false, false)).toThrow('storage failure');
+		const reserved = ledger.reserve({ writes: 1 }, noon, noon, false, false);
+		ledger.refund(reserved, 0, 1);
 		expect(state.unsafe).toBe(true);
+		state.failUpdates = false;
+		ledger.flush();
+		expect(table.get('2026-09-21')?.writes_reserved).toBeGreaterThan(0);
 	});
 
 	it('loads a new day once, and prunes old rows once a day', () => {

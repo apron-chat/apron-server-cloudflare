@@ -5,8 +5,11 @@
  *
  * The copy is authoritative until the day ends: a Durable Object runs one
  * synchronous operation at a time, so a reservation checks the copy and a
- * refused one runs no SQL at all. Every change goes to the row first and the
- * copy after, through `apply`.
+ * refused one runs no SQL at all. A reservation changes the copy and is
+ * staged; the refund that settles it writes what is staged, with the
+ * effective clock, in one row update (`flush`). So an operation writes the
+ * row once, and an eviction between the two loses at most the operation in
+ * flight: the day's totals stay within one operation of exact.
  */
 
 import { MAINTENANCE_CONTROL_RESERVE } from "./budget";
@@ -72,8 +75,12 @@ export interface LedgerLimits {
 export interface LedgerHost {
   exec(query: string, ...bindings: unknown[]): { rowsWritten?: number };
   rows<T>(query: string, ...bindings: unknown[]): T[];
-  /** Persists the monotonic effective clock once a reservation is accepted. */
+  /** Advances the monotonic effective clock once a reservation is accepted. */
   advanceClock(now: number): void;
+  /** The effective clock to persist with the row (as `effective_ms`, the greatest written). */
+  clock(): number;
+  /** True inside a storage transaction, which may yet roll back: staged changes wait for the next flush outside one. */
+  inTransaction(): boolean;
   /** Latches accounting unsafe after a failure that leaves the ledger uncertain. */
   markUnsafe(): void;
 }
@@ -134,6 +141,9 @@ export class BudgetLedger {
   private handoverPending = false;
   /** UTC day for which this object has already attempted bounded row pruning. */
   private prunedDay: string | null = null;
+  /** Changes made to the cached copy and not yet written, all for `stagedDay`. */
+  private staged: BudgetDelta = {};
+  private stagedDay: string | null = null;
 
   constructor(private readonly host: LedgerHost, private readonly limits: LedgerLimits) {}
 
@@ -175,15 +185,17 @@ export class BudgetLedger {
    * the row again.
    */
   addUnchecked(day: string, delta: BudgetDelta): void {
+    this.flush();
     // Every counter defaults to 0, so a new row names only its day: the same
     // statement serves the schema an in-place upgrade starts from.
     this.host.exec("INSERT OR IGNORE INTO resource_budgets (day) VALUES (?)", day);
-    this.update(day, delta);
+    this.update(day, delta, false);
     this.forget();
   }
 
   /** A day's counters, creating its row if it has none. */
   snapshot(day: string): BudgetSnapshot {
+    this.flush();
     const row = this.rowFor(day);
     return {
       day,
@@ -227,7 +239,7 @@ export class BudgetLedger {
       const pruning = this.prunedDay !== day;
       const cost = this.reservationCost(input, day);
       if (!unchecked) this.check(cost, maintenance, at);
-      this.apply(day, row, {
+      this.stage(day, row, {
         reads_reserved: cost.reads,
         writes_reserved: cost.writes,
         frames_reserved: cost.frames,
@@ -239,11 +251,10 @@ export class BudgetLedger {
         foreground_writes: maintenance ? 0 : cost.writes,
         maintenance_reads: maintenance ? cost.reads : 0,
         maintenance_writes: maintenance ? cost.writes : 0,
-      }, "budget reservation did not update durable state");
+      });
       this.handoverPending = false;
-      // Persist the monotonic effective clock only after the cached capacity
-      // check has accepted the reservation; rejected floods therefore do not
-      // issue an uncharged meta write.
+      // Advance the monotonic effective clock only after the cached capacity
+      // check has accepted the reservation; the settling flush persists it.
       this.host.advanceClock(now);
       if (pruning) this.prune(day);
       return { ...cost, day, maintenance };
@@ -271,12 +282,14 @@ export class BudgetLedger {
           row.writes_reserved + writes > this.limits.sqlWritesPerDay) {
         throw new StoreError("retry_after", "Maintenance control budget exhausted", { retryAfterMs: untilNextDay(at) });
       }
-      this.apply(day, row, {
+      this.stage(day, row, {
         reads_reserved: reads,
         writes_reserved: writes,
         maintenance_reads: reads,
         maintenance_writes: writes,
-      }, "maintenance reservation did not update durable state");
+      });
+      // Nothing refunds a control reservation: write it now.
+      this.flush();
       this.handoverPending = false;
       return { reads, writes, frames: cost.frames, admissions: cost.admissions, posts: cost.posts, registrations: cost.registrations, history: cost.history };
     } catch (error) {
@@ -288,23 +301,26 @@ export class BudgetLedger {
   /**
    * Credits back what a finished reservation did not use, so the day's budget
    * counts the SQL actually done. The reservation still gated the work up
-   * front, so no request can exceed what the ceiling allowed it. The credit is
-   * one row update, paid from the reservation it returns: an operation is
-   * charged its observed rows plus that one. `unused` gives back history
-   * pages a refused request reserved, in the same update.
+   * front, so no request can exceed what the ceiling allowed it. The credit
+   * and the reservation it settles are one row update (`flush`), paid from
+   * the reservation: an operation is charged its observed rows plus that
+   * one. `unused` gives back history pages a refused request reserved, in the
+   * same update.
    */
   refund(reserved: BudgetCost, actualReads: number, actualWrites: number, unused?: { history: number }): void {
     const row = this.cached;
-    if (!reserved.day || !row || this.cachedDay !== reserved.day) return;
+    if (!reserved.day || !row || this.cachedDay !== reserved.day) {
+      this.flush();
+      return;
+    }
     const reads = reserved.reads - actualReads - REFUND_READS;
     const writes = reserved.writes - actualWrites - REFUND_WRITES;
     const history = Math.min(reserved.history, Math.max(0, unused?.history ?? 0));
-    if (reads <= 0 && writes <= 0 && history === 0) return;
     const creditReads = Math.max(0, reads);
     const creditWrites = Math.max(0, writes);
     const maintenance = reserved.maintenance === true;
-    try {
-      this.apply(reserved.day, row, {
+    if (creditReads > 0 || creditWrites > 0 || history > 0) {
+      this.stage(reserved.day, row, {
         ...(history ? { history_reserved: -history } : {}),
         reads_reserved: -creditReads,
         writes_reserved: -creditWrites,
@@ -313,13 +329,38 @@ export class BudgetLedger {
         maintenance_reads: maintenance ? -creditReads : 0,
         maintenance_writes: maintenance ? -creditWrites : 0,
       });
+    }
+    this.flush();
+  }
+
+  /**
+   * Writes what is staged, and the effective clock, in one row update. Inside
+   * a transaction it waits: a rollback would undo the write but not the
+   * copy. A failed write keeps what is staged for the next flush and latches
+   * accounting unsafe, as any uncertain ledger state does.
+   */
+  flush(): void {
+    const day = this.stagedDay;
+    if (day === null || this.host.inTransaction()) return;
+    const delta = this.staged;
+    try {
+      let cursor = this.update(day, delta, true);
+      if (cursor.rowsWritten !== undefined && cursor.rowsWritten < 1) {
+        // Removed underneath the copy (an operator, a test): write it back.
+        this.host.exec("INSERT OR IGNORE INTO resource_budgets (day) VALUES (?)", day);
+        cursor = this.update(day, delta, true);
+        if (cursor.rowsWritten !== undefined && cursor.rowsWritten < 1) throw new StoreError("internal_error", "budget reservation did not update durable state");
+      }
+      this.staged = {};
+      this.stagedDay = null;
     } catch {
-      // A failed credit only leaves the day over-charged, which is safe.
+      this.host.markUnsafe();
     }
   }
 
-  /** Forgets the cached row; the next reservation reads it again. */
+  /** Forgets the cached row, after writing what is staged; the next reservation reads it again. */
   forget(): void {
+    this.flush();
     this.cachedDay = null;
     this.cached = null;
   }
@@ -348,28 +389,36 @@ export class BudgetLedger {
     this.cached = { ...row };
   }
 
-  /** Adds `delta` to `day`'s row, then to the cached copy of it, `row`. */
-  private apply(day: string, row: RawBudgetRow, delta: BudgetDelta, failure?: string): void {
-    const cursor = this.update(day, delta);
-    if (failure !== undefined && cursor.rowsWritten !== undefined && cursor.rowsWritten < 1) {
-      throw new StoreError("internal_error", failure);
-    }
+  /** Adds `delta` to the cached copy of `day`'s row, `row`, and to what the next flush writes. */
+  private stage(day: string, row: RawBudgetRow, delta: BudgetDelta): void {
+    // What is staged is one day's: a new day's change writes the old day's first.
+    if (this.stagedDay !== null && this.stagedDay !== day) this.flush();
     const next: RawBudgetRow = { ...row, day };
-    for (const [column, amount] of Object.entries(delta) as [BudgetColumn, number][]) next[column] += amount;
+    for (const [column, amount] of Object.entries(delta) as [BudgetColumn, number][]) {
+      next[column] += amount;
+      if (amount) this.staged[column] = (this.staged[column] ?? 0) + amount;
+    }
+    this.stagedDay = day;
     this.install(day, next);
   }
 
-  /** The one statement that changes a day's counters: one indexed row update, naming only the counters that change. */
-  private update(day: string, delta: BudgetDelta): { rowsWritten?: number } {
-    const changed = (Object.keys(delta) as BudgetColumn[]).filter((column) => delta[column]);
-    // A delta of all zeros still touches the row, so `apply` can confirm it exists.
-    const columns = changed.length ? changed : ["reads_reserved" as const];
-    return this.host.exec(
-      `UPDATE resource_budgets SET ${columns.map((column) => `${column} = ${column} + ?`).join(", ")} WHERE day = ?`,
-      // `|| 0` binds a zero credit (-0) as the integer 0.
-      ...columns.map((column) => delta[column] || 0),
-      day,
-    );
+  /**
+   * The one statement that changes a day's counters: one indexed row update,
+   * naming only the counters that change, and with `clock` the effective
+   * clock (`effective_ms`, which only grows).
+   */
+  private update(day: string, delta: BudgetDelta, clock: boolean): { rowsWritten?: number } {
+    const columns = (Object.keys(delta) as BudgetColumn[]).filter((column) => delta[column]);
+    const sets = columns.map((column) => `${column} = ${column} + ?`);
+    // `|| 0` binds a zero credit (-0) as the integer 0.
+    const bindings: unknown[] = columns.map((column) => delta[column] || 0);
+    if (clock) {
+      sets.push("effective_ms = MAX(effective_ms, ?)");
+      bindings.push(Math.trunc(this.host.clock()));
+    }
+    // A change of nothing still touches the row, so a flush can confirm it exists.
+    if (!sets.length) sets.push("reads_reserved = reads_reserved");
+    return this.host.exec(`UPDATE resource_budgets SET ${sets.join(", ")} WHERE day = ?`, ...bindings, day);
   }
 
   private reservationCost(input: CostEstimate, day: string): BudgetCost {

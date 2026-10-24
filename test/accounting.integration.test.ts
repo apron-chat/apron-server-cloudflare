@@ -681,10 +681,8 @@ describe('measured storage accounting', () => {
 			}
 
 			const history = store.historyPage({ roomId: 'general', limit: 50, now: clock.now() });
-			const limiter = state.storage.sql.exec<{ day: string; posts_day: number }>(
-				"SELECT day, posts_day FROM principal_limits WHERE scope = 'post' AND principal_key = ? LIMIT 1",
-				'anonymous:audit-ip',
-			).one();
+			// As the store holds it: a principal's row is written at most once a minute.
+			const limiter = store.limiterDay('post', 'anonymous:audit-ip', clock.now());
 			expect(messagesOf(history)).toHaveLength(18);
 			expect(limiter.posts_day).toBe(13);
 			expect(limiter.day).toBe(new Date(clock.now()).toISOString().slice(0, 10));
@@ -748,7 +746,17 @@ describe('measured storage accounting', () => {
 			expectRetryAfter(error);
 			const beforeCleanup = store.storageAccounting();
 			clock.set(clock.now() + DAY + HOUR + 1);
+			// One run deletes what its reservation covers; posts cost few enough rows that more were accepted than that.
 			const cleanup = store.runCleanup(clock.now());
+			for (let run = 0; run < 10; run += 1) {
+				// The next batch is due a moment after the last.
+				clock.set(clock.now() + MINUTE);
+				const next = store.runCleanup(clock.now());
+				if (!next.deleted_records && !next.deleted_messages) break;
+				cleanup.deleted_records += next.deleted_records;
+				cleanup.deleted_messages += next.deleted_messages;
+				cleanup.history_floor = next.history_floor;
+			}
 			const afterCleanup = store.storageAccounting();
 			const maintenanceDay = new Date(clock.now()).toISOString().slice(0, 10);
 			const budgetRows = state.storage.sql.exec<{

@@ -1,4 +1,4 @@
-import { env, runInDurableObject } from 'cloudflare:test';
+import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { Store, StoreError } from '../src/store';
 import { expectRetryAfter } from './helpers/store';
@@ -196,27 +196,53 @@ describe('history quota', () => {
 		});
 	});
 
-	it('charges four written rows a page once its limiter rows exist: the two limiter rows, the clock and the refund', async () => {
+	it('charges one written row a page, the budget row with the clock, and the limiter rows once a minute', async () => {
 		await runInDurableObject(env.DEMO.getByName('quota-history-cost'), (_instance, state) => {
 			let now = noon();
 			const store = new Store(state, {}, { now: () => now });
 			const page = () => store.history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' });
 			page();
+			const charged = (fn: () => unknown) => {
+				const before = store.budget(now).writes;
+				fn();
+				return store.budget(now).writes - before;
+			};
 			const writes: number[] = [];
 			for (let index = 0; index < 5; index++) {
 				now += 1_000;
-				const before = store.budget(now).writes;
-				page();
-				writes.push(store.budget(now).writes - before);
+				writes.push(charged(page));
 			}
-			// The refund's own update is charged too.
-			expect(writes).toEqual([4, 4, 4, 4, 4]);
-			// A refused page is charged only its bookkeeping.
+			expect(writes).toEqual([1, 1, 1, 1, 1]);
+			// A minute on, the user's and the IP's limiter rows are written (each with its index entry).
+			now += 60_000;
+			expect(charged(page)).toBe(5);
+			// A refused page is charged only the budget row.
 			const limited = new Store(state, { historyBurstPerUser: 1, historyRequestsPerUserMinute: 1 }, { now: () => now });
 			limited.history({ roomId: 'general', limit: 1, now, userId: 'limited', ipKey: 'home' });
-			const before = limited.budget(now).writes;
-			refusal(() => limited.history({ roomId: 'general', limit: 1, now, userId: 'limited', ipKey: 'home' }));
-			expect(limited.budget(now).writes - before).toBe(2);
+			expect(charged(() => refusal(() => limited.history({ roomId: 'general', limit: 1, now, userId: 'limited', ipKey: 'home' })))).toBe(1);
+		});
+	});
+
+	it('keeps a principal\'s first charge and anything a minute old through an eviction, and forgets at most the last minute', async () => {
+		const stub = env.DEMO.getByName('quota-history-eviction');
+		let now = noon();
+		const config = { historyRequestsPerUserDay: 3 };
+		await runInDurableObject(stub, (_instance, state) => {
+			const store = new Store(state, config, { now: () => now });
+			store.history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' });
+			now += 61_000;
+			store.history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' });
+			now += 1_000;
+			// Held in memory: lost to the eviction below.
+			store.history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' });
+			expect(store.limiterDay('history', 'user:reader', now).posts_day).toBe(3);
+		});
+		await evictDurableObject(stub);
+		await runInDurableObject(stub, (_instance, state) => {
+			const store = new Store(state, config, { now: () => now });
+			expect(store.limiterDay('history', 'user:reader', now).posts_day).toBe(2);
+			store.history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' });
+			expect(refusal(() => store.history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' })).message).toBe('Daily history limit reached');
 		});
 	});
 });

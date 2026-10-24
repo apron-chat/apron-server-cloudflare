@@ -121,6 +121,7 @@ function toSchema8(sql: SqlStorage): void {
 		sql.exec(`ALTER TABLE principal_limits ADD COLUMN ${lane}_events_json TEXT NOT NULL DEFAULT '[]'`);
 	}
 	sql.exec('ALTER TABLE resource_budgets DROP COLUMN history_reserved');
+	sql.exec('ALTER TABLE resource_budgets DROP COLUMN effective_ms');
 	sql.exec("UPDATE _meta SET value = '8' WHERE key = 'schema_version'");
 	sql.exec('UPDATE maintenance SET schema_version = 8 WHERE id = 1');
 }
@@ -139,10 +140,12 @@ it('upgrades a schema 8 store in place: limiter rows trade their timestamp lists
 			userId: 'kept_user', ipKey: 'ip-kept_user', requestId: 'kept', method: 'message', now,
 			identity: { user_id: 'kept_user' }, params: { room_id: 'general', body: { text: 'kept' } },
 		});
+		const head = store.getRoomState().latest_log_id;
+		// Last: the current code never runs against schema 8's tables.
 		toSchema8(sql);
 		sql.exec(`UPDATE principal_limits SET post_events_json = ? WHERE scope = 'post'`, JSON.stringify([now]));
 		return {
-			head: store.getRoomState().latest_log_id,
+			head,
 			posts: sql.exec<{ posts_day: number }>("SELECT posts_day FROM principal_limits WHERE scope = 'post' AND principal_key = 'user:kept_user'").one().posts_day,
 			writes: sql.exec<{ writes_reserved: number }>('SELECT writes_reserved FROM resource_budgets ORDER BY day DESC LIMIT 1').one().writes_reserved,
 		};
@@ -187,7 +190,8 @@ it('upgrades a schema 7 store in place: it gains the push and user status tables
 			userId: 'kept_user', ipKey: 'ip-kept_user', requestId: 'kept', method: 'message', now,
 			identity: { user_id: 'kept_user' }, params: { room_id: 'general', body: { text: 'kept' } },
 		});
-		// Schema 7 has schema 8's limiter rows, no push registrations, wake times, user status or room mutes, nor user ext.
+		const head = store.getRoomState().latest_log_id;
+		// Last: schema 7 has schema 8's limiter rows, no push registrations, wake times, user status or room mutes, nor user ext.
 		toSchema8(sql);
 		sql.exec('ALTER TABLE identities DROP COLUMN ext_json');
 		sql.exec('DROP TABLE push_subscriptions');
@@ -196,7 +200,7 @@ it('upgrades a schema 7 store in place: it gains the push and user status tables
 		sql.exec('DROP TABLE room_mutes');
 		sql.exec("UPDATE _meta SET value = '7' WHERE key = 'schema_version'");
 		sql.exec('UPDATE maintenance SET schema_version = 7 WHERE id = 1');
-		return store.getRoomState().latest_log_id;
+		return head;
 	});
 
 	await evictDurableObject(stub);

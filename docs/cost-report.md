@@ -26,42 +26,46 @@ The traffic tests start at a future UTC noon, cross three UTC posting days,
 run cleanup a day and a half later, and evict/reinitialize one object to check
 persisted limiter state.
 
-## Schema 9: token-bucket limiters and the clock write (2026-10-24)
+## Schema 9: token-bucket limiters, cached limiter rows, one budget write (2026-10-24)
 
 Measured with [`test/quota.integration.test.ts`](../test/quota.integration.test.ts)
-(`writes three charged rows a page…`) and a per-statement cursor log of one
-history page. The tables below this section predate it: every operation that
-advances the effective clock now writes one row fewer, and every limiter
-charge one or two fewer.
+(`charges one written row a page…`) and a per-statement cursor log of one
+history page and two posts. The tables below this section predate it.
 
-- The effective clock is persisted with `UPDATE _meta` (one written row)
-  instead of `INSERT OR REPLACE` (a delete and an insert: two), and read from
-  memory after the first operation instead of from `_meta` (two reads an
-  operation fewer). A rolled-back transaction forgets the remembered value.
+The trade: totals that protect the deployment stay exact; a principal's own
+limits may forget up to a minute of its charges when the object is evicted.
+
 - Each limiter row keeps a token bucket (`level`, `level_ms`: limiter.ts) in
-  place of four JSON timestamp lists. A charge is the same one-row read and
-  one-row update; nothing is parsed or re-serialized.
-- A limiter row's `updated_ms`, which cleanup finds idle rows by through
-  `principal_limits_updated_idx`, moves at most once a minute and on a new UTC
-  day, so the update leaves its index entry alone otherwise. Cleanup keeps
-  rows touched within the last hour (`LIMITER_IDLE_MS`), and every limiter
-  must drain within it.
-- The server-wide daily history count is a column of the day's budget row,
-  changed by the reservation update every operation already makes. A page the
-  user's or IP's limits refuse gives its count back in the refund's one update.
+  place of four JSON timestamp lists; nothing is parsed or re-serialized.
+- A user's or IP's row in a minute-limited scope (posts, history, auth,
+  admissions, frames) is cached in memory (at most 256 rows) and written at
+  most once a minute, on a new UTC day, and on its first charge. Server-wide
+  rows (`global`), registrations, uploads and pushes are written through.
+  An eviction forgets at most the last minute of one principal's charges.
+- A reservation is staged on the cached budget row and written once, when
+  the operation settles, with the effective clock (`effective_ms`, which
+  replaces the per-operation `_meta` write). An eviction between the two
+  loses at most the operation in flight.
+- A limiter row's `updated_ms`, which cleanup finds idle rows by, moves only
+  when the row is written, so its index entry is rewritten at most once a
+  minute. Cleanup keeps rows touched within the last hour (`LIMITER_IDLE_MS`),
+  and every limiter must drain within it.
+- The server-wide daily history count is a column of the day's budget row. A
+  page the user's or IP's limits refuse gives its count back in the same
+  write.
 
 | History page (once its limiter rows exist) | Observed writes | Charged writes |
 | --- | ---: | ---: |
 | Before (schema 8) | 8 | 6 |
-| Schema 9 | 5 | 4 |
-| Schema 9, a limiter row's `updated_ms` moving (once a minute) | 7 | 6 |
-| Refused by the user's or IP's limit | 2 | 2 |
+| Schema 9 | 1 | 1 |
+| Schema 9, once a minute (both limiter rows, with their index entries) | 5 | 5 |
+| Refused by the user's or IP's limit | 1 | 1 |
 
-The five observed writes are the reservation, the clock, the user's and the
-IP's limiter rows, and the refund. At Paid's daily per-IP count (6,000
-pages) one IP is charged about 24,000 written rows, 3.4% of the 700,000
-foreground writes; the server-wide count (40,000) bounds history at about
-160,000 (23%) and 40,000 frames (27%).
+A post after the first in a minute writes its message rows, the server-wide
+post row and the budget row; the poster's and the IP's rows wait. At Paid's
+daily per-IP history count (6,000 pages) one IP is charged about 6,500
+written rows, under 1% of the 700,000 foreground writes; the server-wide
+count (40,000) bounds history at about 45,000 (6%) and 40,000 frames (27%).
 
 ## Reservation accounting
 
