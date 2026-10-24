@@ -161,6 +161,8 @@ upper bounds can be compared with the measured worst case.
 | Registered room leave (logs the membership; the user's fourth post since its limiter row was written, which writes it) | 21 | 17 | 482 | 72 |
 | Registered room join (logs the membership) | 17 | 11 | 482 | 72 |
 | Registered room join at the 100-thread ceiling | 330 | 27 | 482 | 72 |
+| Guest room join or leave (the guest's first: creates its and its IP's posting limiter rows) | 15 | 14 | 40 | 40 |
+| Guest room join or leave (its limiter rows cached; writes the global row) | 3 | 2 | 40 | 40 |
 | History page | 9 | 1 | 264 | 40 |
 | History page with its quota, a new user and IP (creates both limiter rows) | 21 | 13 | 264 | 40 |
 | History page with its quota, again within a minute | 9 | 1 | 264 | 40 |
@@ -221,7 +223,12 @@ Memberships:
   rooms), so its write floor is `64 + 8 × 101`. Registrations are capped at
   100 a day; the credit-back returns the unused part.
 - A guest's joins and leaves live in its connection and are not logged; a
-  join reads the room record (24/8) and its members (below).
+  join reads the room record (24/8) and its members (below). Where guests may
+  post, one that changes something is charged as a post: a 32/32 reservation
+  (40/40 with control overhead) for the guest's, the IP's and the global
+  posting limiter rows, which writes only the global row while the other two
+  are cached (3/2). A join of a room already joined, or a leave of one not
+  joined, is not charged and reserves nothing.
 - `members` (`room_list` with `members: true`, and `room_update` `joined`)
   read each listed room's registered members by primary-key range with one
   identity lookup each, at most `roomListMembers` (200 with the Workers Paid

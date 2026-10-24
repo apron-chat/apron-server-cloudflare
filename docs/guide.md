@@ -246,8 +246,8 @@ shared by IP (native IPv6 grouped by /56): five accepted
 mutations per rolling minute and 200 per UTC day (100 with the Free budgets).
 Registered users receive 20/minute and 1,000/day (500), subject to the common IP and global limits. NAT users
 share allowances. Creates, edits, deletion, restoration, moves, reaction
-changes, thread room creation or edits, and a registered user's room joins and
-leaves all consume posting quota.
+changes, thread room creation or edits, and room joins and leaves (a guest's
+included; one that changes nothing is free) all consume posting quota.
 Matching accepted request retries consume lookup and frame resources, but do
 not post again. Request deduplication lasts 24 hours.
 

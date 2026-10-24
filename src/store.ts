@@ -3494,7 +3494,8 @@ export class Store {
   /**
    * Joins or leaves one room for a registered identity, whose rooms last
    * across connections (§4.2.2). Guests' rooms live in their connection and
-   * are not logged. A change is one `memberships` row and one logged
+   * are not logged; a guest's change counts as a post too
+   * (chargeGuestMembership). A change is one `memberships` row and one logged
    * membership record, and counts as a post; joining or leaving where nothing
    * would change writes nothing. Returns the identity's rooms, the logged
    * record, and the room's record after it.
@@ -3542,6 +3543,25 @@ export class Store {
     } finally {
       this.settleReservation(reserved, beforeReads, beforeWrites);
     }
+  }
+
+  /**
+   * Charges a guest's join or leave that changes something as one post, to
+   * the guest's (`anonymous:<ip>`), the IP's and the global posting limits
+   * (chargePosting), so a posting refusal holds back every write (§6,
+   * `ext:limits` `write`). A guest's rooms live in its connection, so
+   * nothing else is stored; the caller changes them only once this returns.
+   * The reservation covers the three limiter rows, each inserted on first
+   * use, and is mostly credited back while the guest's and IP's rows are
+   * cached (limiter-cache.ts).
+   */
+  chargeGuestMembership(input: { ipKey: string; now?: number }): void {
+    this.ensureReady();
+    const operationNow = input.now ?? this.clock.now();
+    this.reserved({ reads: 32, writes: 32, posts: 1 }, false, operationNow, () => {
+      const effective = this.effectiveNow(operationNow);
+      this.transaction(() => this.chargePosting({ userId: "", tier: "anonymous", ipKey: input.ipKey, now: effective }));
+    });
   }
 
   /**

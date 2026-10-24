@@ -154,6 +154,10 @@ it('names every posting refusal `write` (ext:limits), memberships and reactions 
 		const guest = refusal(() => post('guest'));
 		expect(guest.message).toBe('Guest posting limit reached');
 		expect(guest.data).toEqual(write);
+		// A guest's join or leave is charged to the same guest limit, `anonymous:<ip>`.
+		const membership = refusal(() => store.chargeGuestMembership({ ipKey: 'guest-ip', now }));
+		expect(membership.message).toBe('Guest posting limit reached');
+		expect(membership.data).toEqual(write);
 		// The day's, the poster's and then the server's.
 		now += 60_000;
 		post('poster');

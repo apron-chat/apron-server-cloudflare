@@ -843,6 +843,10 @@ describe('measured storage accounting', () => {
 			const membership = (join: boolean) => store.changeMembership({ userId: 'matrix-user', ipKey: 'matrix-member-ip', roomId: threadId, join, now: clock.now() });
 			expect(measure('registered room leave', () => membership(false)).changed).toBe(true);
 			expect(measure('registered room join', () => membership(true)).rooms).toEqual(['general', threadId]);
+			// A guest's join or leave stores nothing but is charged as a post: the first creates its limiter rows, the next finds them cached.
+			const guestMembership = () => store.chargeGuestMembership({ ipKey: 'matrix-guest-ip', now: clock.now() });
+			measure('guest room join (creates its limiter rows)', guestMembership);
+			measure('guest room leave (limiter rows cached)', guestMembership);
 			expect(measure('empty new message', () => store.commitMutation({
 				userId: 'matrix-user', ipKey: 'matrix-post-ip', requestId: 'matrix-empty', method: 'message', now: clock.now(),
 				params: { body: { text: '' } }, identity,
@@ -893,7 +897,7 @@ describe('measured storage accounting', () => {
 			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
 			expect(create.result.message_id).toBeTruthy();
-			expect(costs).toHaveLength(50);
+			expect(costs).toHaveLength(52);
 			expect(store.accountingStatus().unsafe).toBe(false);
 			return { costs };
 		});

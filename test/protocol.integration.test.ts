@@ -71,6 +71,21 @@ async function configure(update: (config: ServerInternals['config']) => void): P
 	});
 }
 
+/**
+ * Sets the guests' posting limit a minute on the running demo object's store
+ * and returns the one it replaces, for a test whose guest makes more changes
+ * than the default allows (joins and leaves count as posts); callers restore
+ * it in their own `finally`.
+ */
+async function guestPostsPerMinute(value: number): Promise<number> {
+	return runInDurableObject(env.DEMO.getByName('public-demo-v1'), (instance) => {
+		const store = (instance as unknown as { store: { config: { anonymousPostsPerMinute: number } } }).store;
+		const previous = store.config.anonymousPostsPerMinute;
+		store.config.anonymousPostsPerMinute = value;
+		return previous;
+	});
+}
+
 let syncCounter = 0;
 /**
  * The notifications a peer received before a round trip made now: a `me`
@@ -337,6 +352,44 @@ it('counts guest posting across sockets and returns retained retries after posti
 	} finally { first.close(); second.close(); }
 });
 
+it("charges a guest's joins and leaves that change something as posts, and nothing else outside the write category", async () => {
+	const guest = await connect({ ip: `198.51.100.${nextIp++}` });
+	const creator = await connect({ ip: `198.51.100.${nextIp++}` });
+	try {
+		await authenticate(guest);
+		await authenticate(creator);
+		const thread = await request(creator, 'thread', 'room_set', { parent_room_id: 'general', title: 'Open to guests' });
+		const threadId = thread.result.room_id;
+		expect(threadId).toBeTruthy();
+		// Four posts and a join spend the guest's five a minute.
+		for (let i = 0; i < 4; i++) {
+			expect((await request(guest, `post-${i}`, 'message', { room_id: 'general', body: { text: `post-${i}` } })).result.message_id).toBeTruthy();
+		}
+		expect((await request(guest, 'join', 'room_join', { room_id: threadId })).result).toEqual({});
+		const write = (frame: Frame) => {
+			expect(frame.error.code).toBe(-32002);
+			expect(frame.error.message).toBe('Guest posting limit reached');
+			expect(frame.error.data.ext).toEqual({ limits: 'write' });
+		};
+		write(await request(guest, 'post-5', 'message', { room_id: 'general', body: { text: 'limited' } }));
+		// A join or leave that would change something is refused like a post, and changes nothing.
+		write(await request(guest, 'leave', 'room_leave', { room_id: threadId }));
+		write(await request(guest, 'leave-general', 'room_leave', { room_id: 'general' }));
+		// Joining a room already joined (general, from auth, and the thread) changes nothing, so is not charged.
+		const rejoin = await exchange(guest, 'rejoin', 'room_join', { room_id: threadId });
+		expect(rejoin.frame.result).toEqual({});
+		expect(rejoin.skipped.some((frame) => frame.method === 'room_update' && frame.params.joined?.some((room: any) => room.room_id === threadId))).toBe(true);
+		expect((await request(guest, 'rejoin-general', 'room_join', { room_id: 'general' })).result).toEqual({});
+		// `me` and commands are not in the category: a spent posting limit refuses neither.
+		const me = await request(guest, 'me', 'me', { status: 'dnd' });
+		expect(me.error).toBeUndefined();
+		expect(me.result.you.user_id).toMatch(/^guest_/);
+		const help = await request(guest, 'help', 'command', { room_id: 'general', body: { text: '/help' } });
+		expect(help.error).toBeUndefined();
+		expect(help.result).toEqual({});
+	} finally { guest.close(); creator.close(); }
+});
+
 it('pipelined guest auth precedes mutation and errors preserve identifiable IDs', async () => {
 	const peer = await connect();
 	try {
@@ -425,6 +478,8 @@ it('rejects operations guests may not perform', async () => {
 });
 
 it('creates threads with room_set, delivers only to joined rooms, and moves messages with their reactions', async () => {
+	// Bob's joins and leaves count as posts, past the guests' five a minute.
+	const limit = await guestPostsPerMinute(20);
 	const alice = await connect();
 	const bob = await connect();
 	try {
@@ -553,7 +608,7 @@ it('creates threads with room_set, delivers only to joined rooms, and moves mess
 		expect(ids(unjoined.not_joined)).toEqual(['general']);
 		expect(unjoined.joined).toBeUndefined();
 		expect((await request(bob, 'rejoin', 'room_join', { room_id: 'general' })).result).toEqual({});
-	} finally { alice.close(); bob.close(); }
+	} finally { alice.close(); bob.close(); await guestPostsPerMinute(limit); }
 
 	// A later session has joined only general and finds the thread by listing.
 	const late = await connect();
@@ -1021,6 +1076,8 @@ it('finishes auth before later frames: pipelined requests run as the new identit
 });
 
 it('sends the notifications a request causes on its connection before its result', async () => {
+	// A leave and a join count as posts: six changes, past the guests' five a minute.
+	const limit = await guestPostsPerMinute(20);
 	const alice = await connect();
 	try {
 		const you = await authenticate(alice);
@@ -1042,7 +1099,7 @@ it('sends the notifications a request causes on its connection before its result
 		expect(join.skipped.map((frame) => Object.keys(frame.params))).toEqual([['joined', 'users']]);
 		const help = await exchange(alice, 'help', 'command', { body: { text: '/help' } });
 		expect(help.skipped).toEqual([{ method: 'message', params: expect.objectContaining({ from: { user_id: '~private', name: 'System message to you' } }) }]);
-	} finally { alice.close(); }
+	} finally { alice.close(); await guestPostsPerMinute(limit); }
 });
 
 it('returns history pages: messages, first_log_id/last_log_id, and empty arrays omitted', async () => {

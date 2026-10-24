@@ -2717,7 +2717,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * its membership goes to the room's members, the joiner's connections
 	 * included. Then the user's connections get `room_update` `joined` with
 	 * the room's members, and then the result. A guest's join lives in its
-	 * connection and is not logged. Joining a room already joined logs
+	 * connection and is not logged, but is charged as a post like a
+	 * registered user's (Store.chargeGuestMembership). Joining a room already joined logs
 	 * nothing and re-sends `joined` to this connection only. With another
 	 * user's `user_id`, it adds that user (see addMember).
 	 */
@@ -2745,6 +2746,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return;
 		}
 		if (identity.tier !== "registered") {
+			// A guest's join counts as a post (§6), charged before it changes anything.
+			this.store.chargeGuestMembership({ ipKey: attachment.ipKey, now: nowMs() });
 			this.setRooms(identity.user_id, [...current, roomId]);
 			this.sendToUser(identity.user_id, this.joinedUpdate(known, before.get(roomId), joiner, totals.get(roomId)));
 			this.announceJoiner(identity.user_id, roomId);
@@ -2814,8 +2817,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * included. Then the user's connections stop receiving the room's
 	 * deliveries and get `room_update` `left`, and then the result. The room
 	 * stays visible and can be joined again, unless it is a thread that
-	 * nobody is left in, which is removed (removeIfEmpty). Leaving a room not joined
-	 * changes nothing. With another user's `user_id`, an admin, the room's
+	 * nobody is left in, which is removed (removeIfEmpty). A guest's leave
+	 * lives in its connection and is charged as a post
+	 * (Store.chargeGuestMembership). Leaving a room not joined changes nothing
+	 * and is not charged. With another user's `user_id`, an admin, the room's
 	 * creator, or the bot's owner removes that user, as `/kick` does but
 	 * without its notice.
 	 */
@@ -2841,6 +2846,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return;
 		}
 		if (identity.tier !== "registered") {
+			// A guest's leave counts as a post (§6), charged before it changes anything.
+			this.store.chargeGuestMembership({ ipKey: attachment.ipKey, now: nowMs() });
 			this.setRooms(identity.user_id, current.filter((id) => id !== roomId));
 			this.sendToUser(identity.user_id, roomUpdate("left", { room_id: roomId }));
 			this.removeIfEmpty(roomId);
