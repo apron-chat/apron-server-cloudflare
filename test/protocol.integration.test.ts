@@ -329,6 +329,8 @@ it('counts guest posting across sockets and returns retained retries after posti
 		expect(limited.error.code).toBe(-32002);
 		expect(Number.isInteger(limited.error.data.retry_after)).toBe(true);
 		expect(limited.error.data.retry_after).toBeGreaterThanOrEqual(1);
+		// Which limit refused it, for clients to tell limits apart.
+		expect(limited.error.data.limit).toBe('post');
 		first.send({ id: 'post-0', method: 'message', params: { room_id: 'general', body: { text: 'post-0' } } });
 		expect((await first.next()).result).toEqual(accepted);
 	} finally { first.close(); second.close(); }

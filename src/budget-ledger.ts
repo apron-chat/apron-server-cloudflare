@@ -445,7 +445,7 @@ export class BudgetLedger {
     const limits = this.limits;
     if (cost.history > 0 && row.history_reserved + cost.history > limits.historyRequestsPerDay) {
       // A refusal like any other: no SQL, and the SQL budget stays for everything else.
-      throw new StoreError("retry_after", "History is busy until the daily reset", { retryAfterMs: untilNextDay(at) });
+      throw new StoreError("retry_after", "History is busy until the daily reset", { retryAfterMs: untilNextDay(at), data: { limit: "history" } });
     }
     const readCeiling = maintenance ? limits.sqlReadsPerDay : limits.foregroundReadsPerDay;
     const writeCeiling = maintenance ? limits.sqlWritesPerDay : limits.foregroundWritesPerDay;

@@ -138,6 +138,8 @@ describe('history quota', () => {
 			for (let index = 0; index < 6; index++) page('reader');
 			const refused = refusal(() => page('reader'));
 			expect(refused.message).toBe('History request limit reached');
+			// Named for clients, which tell limits apart by it (data.limit).
+			expect(refused.data).toEqual({ limit: 'history' });
 			// Two a minute: one every 30 s.
 			expect(refused.retryAfterMs).toBe(30_000);
 			// Another user on the same address has the IP's 2 left.
@@ -157,10 +159,13 @@ describe('history quota', () => {
 			for (let index = 0; index < 3; index++) page('reader');
 			const daily = refusal(() => page('reader'));
 			expect(daily.message).toBe('Daily history limit reached');
+			expect(daily.data).toEqual({ limit: 'history' });
 			expect(daily.retryAfterMs).toBe(DAY / 2);
 			page('neighbour');
 			page('neighbour');
-			expect(refusal(() => page('neighbour')).message).toBe('Daily history limit reached for this network');
+			const network = refusal(() => page('neighbour'));
+			expect(network.message).toBe('Daily history limit reached for this network');
+			expect(network.data).toEqual({ limit: 'history' });
 			// Elsewhere the reader is still at their own daily count.
 			expect(refusal(() => page('reader', 'office')).message).toBe('Daily history limit reached');
 			now += DAY / 2;
@@ -182,6 +187,7 @@ describe('history quota', () => {
 			page('other');
 			const busy = refusal(() => page('third'));
 			expect(busy.message).toBe('History is busy until the daily reset');
+			expect(busy.data).toEqual({ limit: 'history' });
 			expect(busy.retryAfterMs).toBe(DAY / 2);
 			// Everything else goes on.
 			store.registerIdentity({

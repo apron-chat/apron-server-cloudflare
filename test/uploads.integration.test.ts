@@ -4,7 +4,7 @@ import { UPLOAD_POLICY } from '../src/budget';
 import { sniffAudio } from '../src/audio';
 import { sniffImage } from '../src/image';
 import { signUploadToken, verifyUploadToken } from '../src/upload-token';
-import { UPLOAD_WRITE_GRACE_MS, type Store } from '../src/store';
+import { UPLOAD_WRITE_GRACE_MS, type Store, type StoreError } from '../src/store';
 import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
 import { errorCode, expectRetryAfter, withStore, type TestClock } from './helpers/store';
 
@@ -164,6 +164,8 @@ describe('store uploads', () => {
 			try { post(store, clock, 'carol', { body: { embeds: [{ kind: 'upload' }] } }); } catch (caught) { error = caught; }
 			expectRetryAfter(error);
 			expect((error as Error).message).toBe('Daily upload limit reached');
+			// Named for clients, which tell limits apart by it (data.limit).
+			expect(error.data).toEqual({ limit: 'upload' });
 			// The server's count is charged by writes claimed, not uploads started:
 			// Carol's two and Dave's two started, none written, leave it open.
 			const daves = keys(post(store, clock, 'dave', { body: { embeds: [{ kind: 'upload' }, { kind: 'upload' }] } }).result);
@@ -172,10 +174,12 @@ describe('store uploads', () => {
 			expect(store.claimUpload(daves[1], clock.value)).toBe('closed');
 			try { post(store, clock, 'erin', { body: { embeds: [{ kind: 'upload' }] } }); } catch (caught) { error = caught; }
 			expect((error as Error).message).toBe('Uploads are closed until the daily reset');
+			expect((error as StoreError).data).toEqual({ limit: 'upload' });
 			// A new day resets the counts, but the bytes still held count against the cap.
 			clock.value += 86_400_000;
 			try { post(store, clock, 'dave', { body: { embeds: [{ kind: 'upload' }] } }); } catch (caught) { error = caught; }
 			expect((error as Error).message).toBe('Upload storage is full; try again later');
+			expect((error as StoreError).data).toEqual({ limit: 'upload' });
 			store.startAvatarUpload({ userId: 'dave', now: clock.value });
 		});
 	});

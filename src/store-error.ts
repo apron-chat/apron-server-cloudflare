@@ -14,7 +14,7 @@ export class StoreError extends Error {
   readonly code: ErrorCode;
   /** Delay the socket layer reports as `data.retry_after`, in whole seconds. */
   readonly retryAfterMs?: number;
-  /** Extra error `data` keys, such as `reason`. */
+  /** Extra error `data` keys, such as `reason`, and `limit`: the name of the limit a `retry_after` comes from. */
   readonly data?: Record<string, unknown>;
 
   constructor(
