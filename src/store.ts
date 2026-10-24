@@ -4882,9 +4882,10 @@ export class Store {
    * History with the history quota charged (§4.3): the user's and the IP's
    * limiters (a burst, then a rate a minute, and a count a day, one row each)
    * and the server's count a day, kept on the day's budget row, which every
-   * reservation updates anyway. A page the user's or IP's limits refuse
-   * gives its server count back, so refused requests cannot use up everyone's
-   * history for the day.
+   * reservation updates anyway. A request that serves no page (refused by the
+   * user's or IP's limits, or an unknown room or bad bounds, whose rollback
+   * undoes their charges) gives its server count back, so such requests
+   * cannot use up everyone's history for the day.
    */
   history(query: StoreHistoryQuery): StoreHistoryResult {
     this.ensureReady();
@@ -4898,10 +4899,10 @@ export class Store {
       writes: Math.max(32, this.config.historyCost.writes ?? 0),
       history: charged ? 1 : 0,
     }, false, operationNow, (unused) => {
-      const now = this.effectiveNow(operationNow);
-      return this.transaction(() => {
-        if (charged) {
-          try {
+      try {
+        const now = this.effectiveNow(operationNow);
+        return this.transaction(() => {
+          if (charged) {
             this.chargeEvent("history", `user:${query.userId}`, now,
               { perMinute: this.config.historyRequestsPerUserMinute, burst: this.config.historyBurstPerUser },
               "History request limit reached",
@@ -4910,14 +4911,14 @@ export class Store {
               { perMinute: this.config.historyRequestsPerIpMinute, burst: this.config.historyBurstPerIp },
               "History request limit reached",
               { limit: this.config.historyRequestsPerIpDay, message: "Daily history limit reached for this network" });
-          } catch (error) {
-            // Refused by the user's or the IP's limits: the server-wide count goes back.
-            if (error instanceof StoreError && error.code === "retry_after") unused.history = 1;
-            throw error;
           }
-        }
-        return this.historyPageInternal({ ...query, now });
-      });
+          return this.historyPageInternal({ ...query, now });
+        });
+      } catch (error) {
+        // No page was served, and the rollback undid the user's and IP's charges: the server-wide count goes back too.
+        unused.history = 1;
+        throw error;
+      }
     });
   }
 

@@ -54,8 +54,8 @@ limits may forget up to a minute of its charges when the object is evicted.
   minute. Cleanup keeps rows touched within the last hour (`LIMITER_IDLE_MS`),
   and every limiter must drain within it.
 - The server-wide daily history count is a column of the day's budget row. A
-  page the user's or IP's limits refuse gives its count back in the same
-  write.
+  request that serves no page (refused by the user's or IP's limits, or an
+  unknown room) gives its count back in the same write.
 
 | History page (once its limiter rows exist) | Observed writes | Charged writes |
 | --- | ---: | ---: |

@@ -202,6 +202,25 @@ describe('history quota', () => {
 		});
 	});
 
+	it('gives the server-wide count back for a request that serves no page, an unknown room or bad bounds', async () => {
+		await runInDurableObject(env.DEMO.getByName('quota-history-invalid'), (_instance, state) => {
+			const now = noon();
+			const store = new Store(state, { historyRequestsPerDay: 4, historyBurstPerUser: 2, historyRequestsPerUserDay: 2 }, { now: () => now });
+			const invalid = (query: { roomId?: string; after?: string }) => {
+				try { store.history({ roomId: 'general', limit: 1, now, userId: 'prober', ipKey: 'prober-ip', ...query }); expect.unreachable(); }
+				catch (error) { expect(error).toBeInstanceOf(StoreError); expect((error as StoreError).code).toBe('invalid_params'); }
+			};
+			for (let index = 0; index < 6; index++) invalid({ roomId: 'no-such-room' });
+			invalid({ after: 'not-a-log-id' });
+			expect(store.budget(now).history).toBe(0);
+			// The prober's own limits were rolled back with the page: they still read their two.
+			store.history({ roomId: 'general', limit: 1, now, userId: 'prober', ipKey: 'prober-ip' });
+			store.history({ roomId: 'general', limit: 1, now, userId: 'prober', ipKey: 'prober-ip' });
+			expect(store.history({ roomId: 'general', limit: 1, now, userId: 'other', ipKey: 'other-ip' }).latest_log_id).toBeTruthy();
+			expect(store.budget(now).history).toBe(3);
+		});
+	});
+
 	it('charges one written row a page, the budget row with the clock, and the limiter rows once a minute', async () => {
 		await runInDurableObject(env.DEMO.getByName('quota-history-cost'), (_instance, state) => {
 			let now = noon();
