@@ -328,7 +328,7 @@ describe('measured storage accounting', () => {
 			const store = new Store(state, config, clock);
 			store.initialize();
 			store.commitMutation(messageInput(clock, 'persistent-user', 'only daily post', 'persistent'));
-			const limits = state.storage.sql.exec('SELECT scope, principal_key, post_events_json, day, posts_day FROM principal_limits').toArray();
+			const limits = state.storage.sql.exec('SELECT scope, principal_key, level, level_ms, day, posts_day FROM principal_limits').toArray();
 			return { size: store.databaseSize(), budget: store.budget(), limits };
 		});
 		await evictDurableObject(stub);
@@ -345,7 +345,7 @@ describe('measured storage accounting', () => {
 				error = candidate;
 			}
 			expectRetryAfter(error);
-			const limits = state.storage.sql.exec('SELECT scope, principal_key, post_events_json, day, posts_day FROM principal_limits').toArray();
+			const limits = state.storage.sql.exec('SELECT scope, principal_key, level, level_ms, day, posts_day FROM principal_limits').toArray();
 			const transitions = state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM records WHERE kind = 'message'").one().count;
 			return { afterInit, budget: store.budget(), size: store.databaseSize(), limits, transitions: Number(transitions) };
 		});

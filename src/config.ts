@@ -186,6 +186,10 @@ function validateLimits(limits: Limits): void {
 	if (limits.concurrentHistoryPerConnection > budget.MAX_CONCURRENT_HISTORY) {
 		fail("concurrent history is limited to one request per connection");
 	}
+	if (limits.historyBurstPerUser > limits.historyBurstPerIp || limits.historyRequestsPerUserMinute > limits.historyRequestsPerIpMinute ||
+			limits.historyRequestsPerUserDay > limits.historyRequestsPerIpDay || limits.historyRequestsPerIpDay > limits.historyRequestsPerDay) {
+		fail("a user's history allowance cannot exceed its IP's, nor an IP's the server's");
+	}
 
 	if (limits.pendingFramesPerConnection > budget.MAX_PENDING_FRAMES || limits.pendingBytesPerConnection > budget.MAX_PENDING_BYTES) {
 		fail("socket pending-work policy exceeds calibrated bounds");

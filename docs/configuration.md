@@ -480,7 +480,9 @@ UTF-8 bytes, `CodePoints` count Unicode code points, and values named `Seconds`
 are durations. `Limit`, `Embeds`, `Connections`, `Records`, and `Identities`
 are item/count caps. `Bytes` on storage watermarks means effective occupied
 SQLite bytes. Posting, history, authentication, frame, and admission `Minute`
-limits are rolling 60-second windows. `Day` limits use the server's effective
+limits are token buckets (`src/limiter.ts`): a principal may spend a burst at
+once (a minute's worth, or `historyBurstPer*` for history) and then the rate
+a minute, and a refused request learns its exact wait. `Day` limits use the server's effective
 monotonic time and UTC calendar date; a backward wall-clock jump cannot reset
 them. Cleanup and deduplication run in bounded batches/records, while
 `foreground*` and `maintenance*` are daily SQL operation budgets.
@@ -534,15 +536,20 @@ The numeric rows are grouped by their unit and enforcement scope:
   listed room. A room with more says how many members it has in
   `member_count`. `guestNumberBlock` is how many guest numbers (`guest_<n>`) one
   durable write reserves; see below.
-- Rolling minute budgets: `historyRequestsPerUserMinute`,
-  `historyRequestsPerIpMinute`, `anonymousPostsPerMinute`,
+- Minute budgets: `historyRequestsPerUserMinute` and
+  `historyRequestsPerIpMinute` (after bursts of `historyBurstPerUser` and
+  `historyBurstPerIp`, which must drain within the hour cleanup keeps an idle
+  limiter row), `anonymousPostsPerMinute`,
   `registeredPostsPerMinute`, `trustedPostsPerMinute`, `ipPostsPerMinute`, `globalPostsPerMinute`,
   `authAttemptsPerIpMinute`, `framesPerConnectionMinute`,
   `framesPerIpMinute`, `connectionAdmissionsPerIpMinute`,
   `globalFramesPerMinute` (server-wide, in memory),
   `roomListRequestsPerUserMinute` and `activityBroadcastsPerUserMinute` (per
   user across their connections).
-- UTC-day budgets: `anonymousPostsPerDay`, `registeredPostsPerDay`, `trustedPostsPerDay`,
+- UTC-day budgets: `historyRequestsPerUserDay`, `historyRequestsPerIpDay`,
+  `historyRequestsPerDay` (server-wide, on the day's budget row; past it,
+  history waits for the reset and everything else goes on; a page a user's
+  or IP's limits refuse is not counted), `anonymousPostsPerDay`, `registeredPostsPerDay`, `trustedPostsPerDay`,
   `ipPostsPerDay`, `globalPostsPerDay`, `registrationsPerIpDay`,
   `registrationsPerDay`, `connectionAdmissionsPerDay`,
   `processedFramesPerDay`, `sqlWritesPerDay`, `sqlReadsPerDay`,
@@ -568,6 +575,11 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `historyMaxResponseBytes` | 262144 |  |
 | `historyRequestsPerUserMinute` | 20 | 10 |
 | `historyRequestsPerIpMinute` | 60 | 30 |
+| `historyBurstPerUser` | 60 | 30 |
+| `historyBurstPerIp` | 120 | 60 |
+| `historyRequestsPerUserDay` | 3000 | 1000 |
+| `historyRequestsPerIpDay` | 6000 | 2000 |
+| `historyRequestsPerDay` | 40000 | 5000 |
 | `concurrentHistoryPerConnection` | 1 |  |
 | `anonymousPostsPerMinute` | 5 |  |
 | `anonymousPostsPerDay` | 200 | 100 |

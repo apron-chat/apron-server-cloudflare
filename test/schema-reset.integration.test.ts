@@ -113,6 +113,66 @@ it(`carries at most ${MAX_CARRIED_PASSKEYS} passkeys across a reset, most recent
 	});
 });
 
+/** Turns a fresh store's tables back into schema 8's: timestamp lists on limiter rows, no history count on budget rows. */
+function toSchema8(sql: SqlStorage): void {
+	sql.exec('ALTER TABLE principal_limits DROP COLUMN level');
+	sql.exec('ALTER TABLE principal_limits DROP COLUMN level_ms');
+	for (const lane of ['post', 'auth', 'history', 'admission']) {
+		sql.exec(`ALTER TABLE principal_limits ADD COLUMN ${lane}_events_json TEXT NOT NULL DEFAULT '[]'`);
+	}
+	sql.exec('ALTER TABLE resource_budgets DROP COLUMN history_reserved');
+	sql.exec("UPDATE _meta SET value = '8' WHERE key = 'schema_version'");
+	sql.exec('UPDATE maintenance SET schema_version = 8 WHERE id = 1');
+}
+
+it('upgrades a schema 8 store in place: limiter rows trade their timestamp lists for a token bucket and keep their day counts', async () => {
+	const stub = env.DEMO.getByName(`schema-upgrade-8-${crypto.randomUUID()}`);
+	const now = Date.now();
+	const before = await runInDurableObject(stub, async (instance, state) => {
+		const { store } = instance as unknown as Runtime;
+		const sql = state.storage.sql;
+		store.registerIdentity({
+			userId: 'kept_user', name: 'Kept', userHandle: 'handle-kept_user', now, ipKey: 'ip-kept_user',
+			credential: { credentialId: 'cred-kept_user', userId: 'kept_user', publicKey: 'AAAA', counter: 0 },
+		});
+		store.mutate({
+			userId: 'kept_user', ipKey: 'ip-kept_user', requestId: 'kept', method: 'message', now,
+			identity: { user_id: 'kept_user' }, params: { room_id: 'general', body: { text: 'kept' } },
+		});
+		toSchema8(sql);
+		sql.exec(`UPDATE principal_limits SET post_events_json = ? WHERE scope = 'post'`, JSON.stringify([now]));
+		return {
+			head: store.getRoomState().latest_log_id,
+			posts: sql.exec<{ posts_day: number }>("SELECT posts_day FROM principal_limits WHERE scope = 'post' AND principal_key = 'user:kept_user'").one().posts_day,
+			writes: sql.exec<{ writes_reserved: number }>('SELECT writes_reserved FROM resource_budgets ORDER BY day DESC LIMIT 1').one().writes_reserved,
+		};
+	});
+
+	await evictDurableObject(stub);
+	await runInDurableObject(stub, async (instance, state) => {
+		const { store } = instance as unknown as Runtime;
+		const sql = state.storage.sql;
+		expect(store.requiresReset()).toBe(false);
+		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
+		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(SCHEMA_VERSION);
+		const columns = (table: string) => sql.exec<{ name: string }>("SELECT name FROM pragma_table_info(?) ORDER BY cid", table).toArray().map((row) => row.name);
+		expect(columns('principal_limits')).toEqual(['scope', 'principal_key', 'day', 'posts_day', 'registrations_day', 'uploads_day', 'updated_ms', 'level', 'level_ms']);
+		expect(columns('resource_budgets')).toContain('history_reserved');
+		const row = sql.exec<{ level: number; posts_day: number }>("SELECT level, posts_day FROM principal_limits WHERE scope = 'post' AND principal_key = 'user:kept_user'").one();
+		// The rolling minute starts over; the day's count stays.
+		expect(row).toEqual({ level: 0, posts_day: before.posts });
+		const budget = sql.exec<{ writes_reserved: number; history_reserved: number }>('SELECT writes_reserved, history_reserved FROM resource_budgets ORDER BY day DESC LIMIT 1').one();
+		// The upgrade's own rows are charged on top of the day's.
+		expect(budget.history_reserved).toBe(0);
+		expect(budget.writes_reserved).toBeGreaterThan(before.writes);
+		expect(store.getRoomState().latest_log_id).toBe(before.head);
+		expect(store.getIdentity('kept_user')?.name).toBe('Kept');
+		// The upgraded limiters work: a page is charged to the new bucket.
+		store.history({ roomId: 'general', limit: 1, now: Date.now(), userId: 'kept_user', ipKey: 'ip-kept_user' });
+		expect(sql.exec<{ level: number }>("SELECT level FROM principal_limits WHERE scope = 'history' AND principal_key = 'user:kept_user'").one().level).toBe(1);
+	});
+});
+
 it('upgrades a schema 7 store in place: it gains the push and user status tables and user ext, and nothing else changes', async () => {
 	const stub = env.DEMO.getByName(`schema-upgrade-7-${crypto.randomUUID()}`);
 	const now = Date.now();
@@ -127,7 +187,8 @@ it('upgrades a schema 7 store in place: it gains the push and user status tables
 			userId: 'kept_user', ipKey: 'ip-kept_user', requestId: 'kept', method: 'message', now,
 			identity: { user_id: 'kept_user' }, params: { room_id: 'general', body: { text: 'kept' } },
 		});
-		// Schema 7 has no push registrations, wake times, user status or room mutes, nor user ext.
+		// Schema 7 has schema 8's limiter rows, no push registrations, wake times, user status or room mutes, nor user ext.
+		toSchema8(sql);
 		sql.exec('ALTER TABLE identities DROP COLUMN ext_json');
 		sql.exec('DROP TABLE push_subscriptions');
 		sql.exec('DROP TABLE push_wakes');

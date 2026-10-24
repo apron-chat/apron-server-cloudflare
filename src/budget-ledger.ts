@@ -1,6 +1,6 @@
 /*
  * The daily budget ledger: one `resource_budgets` row per UTC day, counting
- * the SQL rows (and frames, admissions, posts, registrations) reserved that
+ * the SQL rows (and frames, admissions, posts, registrations, history pages) reserved that
  * day, and an in-memory copy of today's row.
  *
  * The copy is authoritative until the day ends: a Durable Object runs one
@@ -19,6 +19,8 @@ export interface CostEstimate {
   admissions?: number;
   posts?: number;
   registrations?: number;
+  /** History pages, counted against `historyRequestsPerDay`. */
+  history?: number;
 }
 
 export interface BudgetCost {
@@ -28,6 +30,7 @@ export interface BudgetCost {
   admissions: number;
   posts: number;
   registrations: number;
+  history: number;
   /** Set on a reservation charged to a day's budget row, so its unused part can be refunded. */
   day?: string;
   maintenance?: boolean;
@@ -43,7 +46,7 @@ export interface BudgetSnapshot extends BudgetCost {
 
 export const BUDGET_COLUMNS = [
   "reads_reserved", "writes_reserved", "frames_reserved", "admissions_reserved", "posts_reserved",
-  "registrations_reserved", "foreground_reads", "foreground_writes", "maintenance_reads", "maintenance_writes",
+  "registrations_reserved", "history_reserved", "foreground_reads", "foreground_writes", "maintenance_reads", "maintenance_writes",
 ] as const;
 
 export type BudgetColumn = typeof BUDGET_COLUMNS[number];
@@ -61,6 +64,8 @@ export interface LedgerLimits {
   foregroundWritesPerDay: number;
   maintenanceReadsPerDay: number;
   maintenanceWritesPerDay: number;
+  /** History pages the whole server serves a day. */
+  historyRequestsPerDay: number;
 }
 
 /** What the ledger needs from the store: its metered SQL, its effective clock, and its accounting latch. */
@@ -94,6 +99,8 @@ const REFUND_READS = 1;
 const REFUND_WRITES = 1;
 
 const SELECT_ROW = `SELECT day, ${BUDGET_COLUMNS.join(", ")} FROM resource_budgets WHERE day = ? LIMIT 1`;
+/** A row from before schema 9, which a reset carries: no history count yet. */
+const SELECT_ROW_BEFORE_HISTORY = `SELECT day, ${BUDGET_COLUMNS.map((column) => column === "history_reserved" ? "0 AS history_reserved" : column).join(", ")} FROM resource_budgets WHERE day = ? LIMIT 1`;
 
 function dayFor(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10);
@@ -115,6 +122,7 @@ export function normalizeCost(cost: CostEstimate = {}): BudgetCost {
     admissions: Math.max(0, Math.ceil(cost.admissions ?? 0)),
     posts: Math.max(0, Math.ceil(cost.posts ?? 0)),
     registrations: Math.max(0, Math.ceil(cost.registrations ?? 0)),
+    history: Math.max(0, Math.ceil(cost.history ?? 0)),
   };
 }
 
@@ -131,7 +139,13 @@ export class BudgetLedger {
 
   /** A day's row, or null when it has none; never creates one. */
   readRow(day: string): RawBudgetRow | null {
-    const rows = this.host.rows<RawBudgetRow>(SELECT_ROW, day);
+    let rows: RawBudgetRow[];
+    try {
+      rows = this.host.rows<RawBudgetRow>(SELECT_ROW, day);
+    } catch (error) {
+      if (!/no such column/i.test(error instanceof Error ? error.message : String(error))) throw error;
+      rows = this.host.rows<RawBudgetRow>(SELECT_ROW_BEFORE_HISTORY, day);
+    }
     return rows.length ? { ...rows[0] } : null;
   }
 
@@ -161,10 +175,9 @@ export class BudgetLedger {
    * the row again.
    */
   addUnchecked(day: string, delta: BudgetDelta): void {
-    this.host.exec(
-      `INSERT OR IGNORE INTO resource_budgets (day, ${BUDGET_COLUMNS.join(", ")}) VALUES (?, ${BUDGET_COLUMNS.map(() => "0").join(", ")})`,
-      day,
-    );
+    // Every counter defaults to 0, so a new row names only its day: the same
+    // statement serves the schema an in-place upgrade starts from.
+    this.host.exec("INSERT OR IGNORE INTO resource_budgets (day) VALUES (?)", day);
     this.update(day, delta);
     this.forget();
   }
@@ -180,6 +193,7 @@ export class BudgetLedger {
       admissions: row.admissions_reserved,
       posts: row.posts_reserved,
       registrations: row.registrations_reserved,
+      history: row.history_reserved,
       foreground_reads: row.foreground_reads,
       foreground_writes: row.foreground_writes,
       maintenance_reads: row.maintenance_reads,
@@ -220,6 +234,7 @@ export class BudgetLedger {
         admissions_reserved: cost.admissions,
         posts_reserved: cost.posts,
         registrations_reserved: cost.registrations,
+        history_reserved: cost.history,
         foreground_reads: maintenance ? 0 : cost.reads,
         foreground_writes: maintenance ? 0 : cost.writes,
         maintenance_reads: maintenance ? cost.reads : 0,
@@ -263,7 +278,7 @@ export class BudgetLedger {
         maintenance_writes: writes,
       }, "maintenance reservation did not update durable state");
       this.handoverPending = false;
-      return { reads, writes, frames: cost.frames, admissions: cost.admissions, posts: cost.posts, registrations: cost.registrations };
+      return { reads, writes, frames: cost.frames, admissions: cost.admissions, posts: cost.posts, registrations: cost.registrations, history: cost.history };
     } catch (error) {
       if (!isRetryAfter(error)) this.host.markUnsafe();
       throw error;
@@ -275,19 +290,22 @@ export class BudgetLedger {
    * counts the SQL actually done. The reservation still gated the work up
    * front, so no request can exceed what the ceiling allowed it. The credit is
    * one row update, paid from the reservation it returns: an operation is
-   * charged its observed rows plus that one.
+   * charged its observed rows plus that one. `unused` gives back history
+   * pages a refused request reserved, in the same update.
    */
-  refund(reserved: BudgetCost, actualReads: number, actualWrites: number): void {
+  refund(reserved: BudgetCost, actualReads: number, actualWrites: number, unused?: { history: number }): void {
     const row = this.cached;
     if (!reserved.day || !row || this.cachedDay !== reserved.day) return;
     const reads = reserved.reads - actualReads - REFUND_READS;
     const writes = reserved.writes - actualWrites - REFUND_WRITES;
-    if (reads <= 0 && writes <= 0) return;
+    const history = Math.min(reserved.history, Math.max(0, unused?.history ?? 0));
+    if (reads <= 0 && writes <= 0 && history === 0) return;
     const creditReads = Math.max(0, reads);
     const creditWrites = Math.max(0, writes);
     const maintenance = reserved.maintenance === true;
     try {
       this.apply(reserved.day, row, {
+        ...(history ? { history_reserved: -history } : {}),
         reads_reserved: -creditReads,
         writes_reserved: -creditWrites,
         foreground_reads: maintenance ? 0 : -creditReads,
@@ -321,10 +339,7 @@ export class BudgetLedger {
   private rowFor(day: string): RawBudgetRow {
     const row = this.readRow(day);
     if (row) return row;
-    this.host.exec(
-      `INSERT INTO resource_budgets (day, ${BUDGET_COLUMNS.join(", ")}) VALUES (?, ${BUDGET_COLUMNS.map(() => "0").join(", ")})`,
-      day,
-    );
+    this.host.exec("INSERT INTO resource_budgets (day) VALUES (?)", day);
     return { day, ...Object.fromEntries(BUDGET_COLUMNS.map((column) => [column, 0])) } as RawBudgetRow;
   }
 
@@ -344,9 +359,11 @@ export class BudgetLedger {
     this.install(day, next);
   }
 
-  /** The one statement that changes a day's counters: one indexed row update. */
+  /** The one statement that changes a day's counters: one indexed row update, naming only the counters that change. */
   private update(day: string, delta: BudgetDelta): { rowsWritten?: number } {
-    const columns = Object.keys(delta) as BudgetColumn[];
+    const changed = (Object.keys(delta) as BudgetColumn[]).filter((column) => delta[column]);
+    // A delta of all zeros still touches the row, so `apply` can confirm it exists.
+    const columns = changed.length ? changed : ["reads_reserved" as const];
     return this.host.exec(
       `UPDATE resource_budgets SET ${columns.map((column) => `${column} = ${column} + ?`).join(", ")} WHERE day = ?`,
       // `|| 0` binds a zero credit (-0) as the integer 0.
@@ -377,6 +394,10 @@ export class BudgetLedger {
   private check(cost: BudgetCost, maintenance: boolean, at: number): void {
     const row = this.cached!;
     const limits = this.limits;
+    if (cost.history > 0 && row.history_reserved + cost.history > limits.historyRequestsPerDay) {
+      // A refusal like any other: no SQL, and the SQL budget stays for everything else.
+      throw new StoreError("retry_after", "History is busy until the daily reset", { retryAfterMs: untilNextDay(at) });
+    }
     const readCeiling = maintenance ? limits.sqlReadsPerDay : limits.foregroundReadsPerDay;
     const writeCeiling = maintenance ? limits.sqlWritesPerDay : limits.foregroundWritesPerDay;
     const reserveReads = maintenance ? limits.maintenanceReadsPerDay - MAINTENANCE_CONTROL_READS : 0;

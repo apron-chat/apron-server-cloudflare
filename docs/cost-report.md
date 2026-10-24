@@ -1,7 +1,7 @@
 # Cloudflare Worker storage cost report
 
 This report records local native SQLite measurements used for the storage
-accounting review. It describes the current schema (schema 8: one server-wide
+accounting review. It describes the current schema (schema 9: one server-wide
 record log of room records, message snapshots, reaction sets, and
 memberships; a `memberships` table of registered users' rooms, keyed by
 room with an index by user; and the upload, push registration, user status
@@ -25,6 +25,43 @@ constructs a `Store` over each object's native SQLite state with a fake clock.
 The traffic tests start at a future UTC noon, cross three UTC posting days,
 run cleanup a day and a half later, and evict/reinitialize one object to check
 persisted limiter state.
+
+## Schema 9: token-bucket limiters and the clock write (2026-10-24)
+
+Measured with [`test/quota.integration.test.ts`](../test/quota.integration.test.ts)
+(`writes three charged rows a page…`) and a per-statement cursor log of one
+history page. The tables below this section predate it: every operation that
+advances the effective clock now writes one row fewer, and every limiter
+charge one or two fewer.
+
+- The effective clock is persisted with `UPDATE _meta` (one written row)
+  instead of `INSERT OR REPLACE` (a delete and an insert: two), and read from
+  memory after the first operation instead of from `_meta` (two reads an
+  operation fewer). A rolled-back transaction forgets the remembered value.
+- Each limiter row keeps a token bucket (`level`, `level_ms`: limiter.ts) in
+  place of four JSON timestamp lists. A charge is the same one-row read and
+  one-row update; nothing is parsed or re-serialized.
+- A limiter row's `updated_ms`, which cleanup finds idle rows by through
+  `principal_limits_updated_idx`, moves at most once a minute and on a new UTC
+  day, so the update leaves its index entry alone otherwise. Cleanup keeps
+  rows touched within the last hour (`LIMITER_IDLE_MS`), and every limiter
+  must drain within it.
+- The server-wide daily history count is a column of the day's budget row,
+  changed by the reservation update every operation already makes. A page the
+  user's or IP's limits refuse gives its count back in the refund's one update.
+
+| History page (once its limiter rows exist) | Observed writes | Charged writes |
+| --- | ---: | ---: |
+| Before (schema 8) | 8 | 6 |
+| Schema 9 | 5 | 4 |
+| Schema 9, a limiter row's `updated_ms` moving (once a minute) | 7 | 6 |
+| Refused by the user's or IP's limit | 2 | 2 |
+
+The five observed writes are the reservation, the clock, the user's and the
+IP's limiter rows, and the refund. At Paid's daily per-IP count (6,000
+pages) one IP is charged about 24,000 written rows, 3.4% of the 700,000
+foreground writes; the server-wide count (40,000) bounds history at about
+160,000 (23%) and 40,000 frames (27%).
 
 ## Reservation accounting
 

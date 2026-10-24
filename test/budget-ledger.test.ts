@@ -9,6 +9,7 @@ const limits: LedgerLimits = {
 	foregroundWritesPerDay: 800,
 	maintenanceReadsPerDay: 200,
 	maintenanceWritesPerDay: 200,
+	historyRequestsPerDay: 2,
 };
 
 /** A stand-in for the store's metered SQL over one in-memory table of day rows. */
@@ -48,6 +49,31 @@ function host() {
 const noon = Date.parse('2026-09-21T12:00:00Z');
 
 describe('budget ledger', () => {
+	it('counts history pages against their own ceiling, and a refused page gives its count back in the refund', () => {
+		const { ledgerHost, table, statements } = host();
+		const ledger = new BudgetLedger(ledgerHost, limits);
+		ledger.start('2026-09-21');
+		const first = ledger.reserve({ reads: 10, writes: 10, history: 1 }, noon, noon, false, false);
+		ledger.refund(first, 1, 1);
+		const refused = ledger.reserve({ reads: 10, writes: 10, history: 1 }, noon, noon, false, false);
+		expect(table.get('2026-09-21')?.history_reserved).toBe(2);
+		const updates = statements.length;
+		ledger.refund(refused, 1, 1, { history: 1 });
+		// The give-back rides the refund's one update.
+		expect(statements.length).toBe(updates + 1);
+		expect(table.get('2026-09-21')?.history_reserved).toBe(1);
+		const second = ledger.reserve({ reads: 10, writes: 10, history: 1 }, noon, noon, false, false);
+		ledger.refund(second, 1, 1);
+		const before = statements.length;
+		let error: unknown;
+		try { ledger.reserve({ reads: 10, writes: 10, history: 1 }, noon, noon, false, false); } catch (caught) { error = caught; }
+		expect(error).toBeInstanceOf(StoreError);
+		expect((error as StoreError).code).toBe('retry_after');
+		// Refused from the cached row: no SQL, and SQL reservations still fit.
+		expect(statements.length).toBe(before);
+		expect(() => ledger.reserve({ reads: 10, writes: 10 }, noon, noon, false, false)).not.toThrow();
+	});
+
 	it('charges a reservation to its day, then refunds what the work did not use', () => {
 		const { ledgerHost, table, state } = host();
 		const ledger = new BudgetLedger(ledgerHost, limits);

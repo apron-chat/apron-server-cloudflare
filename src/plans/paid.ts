@@ -44,8 +44,19 @@ export const PAID_PLAN: Plan = Object.freeze({
 		...FREE_PLAN.limits,
 		retentionSeconds: 7 * 24 * 60 * 60,
 		cleanupSeconds: 24 * 60 * 60,
+		// A first visit opens every joined room's newest page at once: room
+		// for 60 in a burst, then 20 a minute. A page is charged about 4
+		// written rows (two limiter rows, the clock and the refund), so an IP
+		// at its daily count writes 24,000 (3.4% of the foreground writes),
+		// and the server-wide count 160,000 (23%) and 40,000 frames (27%) at
+		// most.
 		historyRequestsPerUserMinute: 20,
 		historyRequestsPerIpMinute: 60,
+		historyBurstPerUser: 60,
+		historyBurstPerIp: 120,
+		historyRequestsPerUserDay: 3_000,
+		historyRequestsPerIpDay: 6_000,
+		historyRequestsPerDay: 40_000,
 		anonymousPostsPerDay: 200,
 		registeredPostsPerDay: 1_000,
 		trustedPostsPerDay: 4_000,
