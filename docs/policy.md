@@ -308,7 +308,10 @@ as `true` when absent. `guest_posting` says whether guests may post, react,
 join and leave rooms, and create threads (`GUEST_POSTING`),
 `read_cursors: false` says read markers are dropped, so clients can skip
 sending them, and `add_members` says whether registered users may add others
-to rooms (`/toggle addmember`). The ping interval is the standard `server.params.ping`.
+to rooms (`/toggle addmember`). Where uploads are configured, `ext:media`
+(defined in apron-web's EXT.md) carries `server.params.ext.media`: the media
+origin when it is not the server's, and each type an attachment or avatar
+upload keeps with its largest size. The ping interval is the standard `server.params.ping`.
 The demo's 16 KiB frame policy is an explicit exception to the base protocol's
 advisory 256 KiB recommendation. Payload lengths count UTF-8 bytes. Errors use
 the base protocol codes; `retry_after` includes `data.retry_after`, whole

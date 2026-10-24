@@ -13,8 +13,9 @@ replacement/deletion/restoration/moves, thread rooms, emoji reactions, and a
 rolling retention floor. Guests only read (set `GUEST_POSTING=true` to let
 them post); signing in with a passkey lets a user post and invite a bot. It speaks protocol 9 with `history`,
 `edit`, `rooms`, `reactions`, `command` (`/help`, `/invite-bot`, and admin
-commands), and `ext` with its own extension `ext:settings`, and `ext:limits`; `embed:upload`
-when uploads are configured; `status` and push when VAPID keys are set; and
+commands), and `ext` with its own extension `ext:settings`, and `ext:limits`;
+`embed:upload` and `ext:media` when uploads are configured; `status` and push
+when VAPID keys are set; and
 liveness pings and, with the Workers Paid budgets, typing through `activity`
 (`ACTIVITY` overrides); see [authentication and policy](policy.md) and [the
 implementation specification](../SPEC.md).

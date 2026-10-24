@@ -4,8 +4,11 @@
 // container is checked, so a WebM or MP4 holding video is kept too; it is
 // served as audio, within the same size and count limits as an image.
 
+/** The audio types sniffAudio recognizes, and so the only ones kept. */
+export const AUDIO_TYPES = ["audio/webm", "audio/ogg", "audio/mp4"] as const;
+
 interface AudioInfo {
-	type: "audio/webm" | "audio/ogg" | "audio/mp4";
+	type: typeof AUDIO_TYPES[number];
 }
 
 /** ISO base media brands that are images (HEIF, AVIF), not audio. */

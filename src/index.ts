@@ -5,8 +5,8 @@ import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTI
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor } from "./account-usage";
 import { EDGE_STOP_RULE_REF, readEdgeStop, runBudgetGuard, watchForFlood } from "./budget-guard";
-import { sniffAudio } from "./audio";
-import { sniffImage } from "./image";
+import { AUDIO_TYPES, sniffAudio } from "./audio";
+import { IMAGE_TYPES, sniffImage } from "./image";
 import { limitData } from "./store-error";
 import { signUploadToken, verifyUploadToken } from "./upload-token";
 import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
@@ -1541,9 +1541,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 					// The `ext` clients write on users, messages, and rooms is kept,
 					// and writes merge it one level deep (§4.12).
 					"ext",
-					// This server's extensions: `ext.settings` below, and
-					// `ext.limits` on `retry_after` errors (limitData).
+					// This server's extensions: `ext.settings` below, `ext.limits`
+					// on `retry_after` errors (limitData), and `ext.media` below
+					// where uploads are configured.
 					"ext:settings", "ext:limits",
+					...(this.config.uploads ? ["ext:media"] : []),
 				],
 				// Passkeys and their session tokens only where passkeys are offered;
 				// bot tokens (`/invite-bot`) from anywhere, since bots are not browsers.
@@ -1573,8 +1575,28 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// `read_message_id` is kept or relayed; always `false` here.
 				// `add_members`: registered users may add others to rooms with
 				// `room_join` and a `user_id`; `/toggle addmember` turns it off.
-				ext: { settings: { guest_posting: this.config.guestPosting, read_cursors: false, add_members: this.addMemberOn() } },
+				ext: {
+					settings: { guest_posting: this.config.guestPosting, read_cursors: false, add_members: this.addMemberOn() },
+					...(this.config.uploads ? { media: this.mediaSettings(this.config.uploads) } : {}),
+				},
 			},
+		};
+	}
+
+	/**
+	 * Extension `ext:media`, from apron-web's EXT.md: the origin uploads are
+	 * served from, where it is not this server's own, and while uploads are
+	 * on, the types a write keeps (sniffImage and, for attachments,
+	 * sniffAudio), each with its largest size. No image side is limited.
+	 */
+	private mediaSettings(uploads: NonNullable<RuntimeConfig["uploads"]>): Record<string, unknown> {
+		const sized = (types: readonly string[], maxBytes: number) => Object.fromEntries(types.map((type) => [type, { max_bytes: maxBytes }]));
+		return {
+			...(uploads.mediaOrigin !== uploads.publicOrigin ? { origins: [uploads.mediaOrigin] } : {}),
+			...(this.uploadsOn() && UPLOAD_POLICY ? {
+				upload: sized([...IMAGE_TYPES, ...AUDIO_TYPES], UPLOAD_POLICY.maxFileBytes),
+				avatar: sized(IMAGE_TYPES, UPLOAD_POLICY.maxAvatarBytes),
+			} : {}),
 		};
 	}
 
