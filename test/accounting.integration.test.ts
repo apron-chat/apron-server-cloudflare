@@ -856,6 +856,10 @@ describe('measured storage accounting', () => {
 				params: { name: 'Matrix renamed' }, identity,
 			}));
 			measure('history page', () => store.historyPage({ roomId: 'general', limit: 50, now: clock.now() }));
+			// With the quota: the first page creates the user's and the IP's limiter rows; the next, within a minute, writes neither.
+			const charged = () => store.history({ roomId: 'general', limit: 50, now: clock.now(), userId: 'matrix-reader', ipKey: 'matrix-reader-ip' });
+			measure('charged history page, a new user and IP', charged);
+			measure('charged history page, again within a minute', charged);
 			measure('room record lookup', () => store.getRoomState());
 			measure('room join lookup', () => store.getRoom(threadId));
 			measure('room listing', () => store.listRooms(clock.now()));
@@ -889,7 +893,7 @@ describe('measured storage accounting', () => {
 			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
 			expect(create.result.message_id).toBeTruthy();
-			expect(costs).toHaveLength(48);
+			expect(costs).toHaveLength(50);
 			expect(store.accountingStatus().unsafe).toBe(false);
 			return { costs };
 		});
