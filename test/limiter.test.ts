@@ -51,6 +51,11 @@ describe('token bucket limiter', () => {
 	it('ignores a clock that went back, and bounds how long a charge matters', () => {
 		const state = bucket(chargeBucket(empty, 10_000, { perMinute: 1 }));
 		expect(chargeBucket(state, 5_000, { perMinute: 1 })).toEqual({ retryAfterMs: 60_000 });
+		// A charge that fits while the clock is behind keeps the later time, so it drains nothing twice.
+		const rate = { perMinute: 60, burst: 2 };
+		const behind = bucket(chargeBucket(bucket(chargeBucket(empty, 10_000, rate)), 5_000, rate));
+		expect(behind).toEqual({ level: 2, at: 10_000 });
+		expect(chargeBucket(behind, 10_000, rate)).toEqual({ retryAfterMs: 1_000 });
 		expect(bucketHorizonMs({ perMinute: 20, burst: 60 })).toBe(180_000);
 		expect(bucketHorizonMs({ perMinute: 30 })).toBe(60_000);
 	});

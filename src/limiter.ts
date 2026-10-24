@@ -39,7 +39,8 @@ export function chargeBucket(bucket: Bucket, now: number, rate: Rate, weight = 1
 	const burst = rate.burst ?? rate.perMinute;
 	const level = Math.max(0, bucket.level - Math.max(0, now - bucket.at) * perMs);
 	// The same float noise must not refuse an event that drains exactly in time.
-	if (level + weight <= burst + 1e-9 || level === 0) return { bucket: { level: level + weight, at: now } };
+	// Measured as of the later time: a clock that went back must not drain the same span again.
+	if (level + weight <= burst + 1e-9 || level === 0) return { bucket: { level: level + weight, at: Math.max(now, bucket.at) } };
 	// Rounded up to the ms, less float noise (a whole 10,999 computes as 10,999.000001).
 	return { retryAfterMs: Math.ceil((weight > burst ? level : level + weight - burst) / perMs - 1e-6) };
 }
