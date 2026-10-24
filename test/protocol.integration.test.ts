@@ -45,7 +45,7 @@ const connect = ({ ip = `192.0.2.${nextIp++}`, ...options }: Partial<ConnectOpti
 async function authenticate(peer: Peer, scheme = 'guest', extraCaps: string[] = []) {
 	const { server } = await greeting(peer);
 	expect(server.params.apron).toBe(9);
-	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'status', 'ext', 'ext:settings']);
+	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'status', 'ext', 'ext:settings', 'ext:limits']);
 	expect(server.params.auth).toContain('webauthn');
 	expect(server.params.ping).toBe(45);
 	// The extension `ext:settings` keeps its data under its name in ext (§4, §4.12).
@@ -68,6 +68,21 @@ async function configure(update: (config: ServerInternals['config']) => void): P
 		server.config = { ...server.config, limits: { ...server.config.limits } };
 		update(server.config);
 		server.recentFrames.length = 0;
+	});
+}
+
+/**
+ * Sets the guests' posting limit a minute on the running demo object's store
+ * and returns the one it replaces, for a test whose guest makes more changes
+ * than the default allows (joins and leaves count as posts); callers restore
+ * it in their own `finally`.
+ */
+async function guestPostsPerMinute(value: number): Promise<number> {
+	return runInDurableObject(env.DEMO.getByName('public-demo-v1'), (instance) => {
+		const store = (instance as unknown as { store: { config: { anonymousPostsPerMinute: number } } }).store;
+		const previous = store.config.anonymousPostsPerMinute;
+		store.config.anonymousPostsPerMinute = value;
+		return previous;
 	});
 }
 
@@ -329,9 +344,50 @@ it('counts guest posting across sockets and returns retained retries after posti
 		expect(limited.error.code).toBe(-32002);
 		expect(Number.isInteger(limited.error.data.retry_after)).toBe(true);
 		expect(limited.error.data.retry_after).toBeGreaterThanOrEqual(1);
+		// Its category (`ext:limits`): a posting limit holds back every write.
+		expect(limited.error.data.ext).toEqual({ limits: 'write' });
+		expect(limited.error.data.limit).toBeUndefined();
 		first.send({ id: 'post-0', method: 'message', params: { room_id: 'general', body: { text: 'post-0' } } });
 		expect((await first.next()).result).toEqual(accepted);
 	} finally { first.close(); second.close(); }
+});
+
+it("charges a guest's joins and leaves that change something as posts, and nothing else outside the write category", async () => {
+	const guest = await connect({ ip: `198.51.100.${nextIp++}` });
+	const creator = await connect({ ip: `198.51.100.${nextIp++}` });
+	try {
+		await authenticate(guest);
+		await authenticate(creator);
+		const thread = await request(creator, 'thread', 'room_set', { parent_room_id: 'general', title: 'Open to guests' });
+		const threadId = thread.result.room_id;
+		expect(threadId).toBeTruthy();
+		// Four posts and a join spend the guest's five a minute.
+		for (let i = 0; i < 4; i++) {
+			expect((await request(guest, `post-${i}`, 'message', { room_id: 'general', body: { text: `post-${i}` } })).result.message_id).toBeTruthy();
+		}
+		expect((await request(guest, 'join', 'room_join', { room_id: threadId })).result).toEqual({});
+		const write = (frame: Frame) => {
+			expect(frame.error.code).toBe(-32002);
+			expect(frame.error.message).toBe('Guest posting limit reached');
+			expect(frame.error.data.ext).toEqual({ limits: 'write' });
+		};
+		write(await request(guest, 'post-5', 'message', { room_id: 'general', body: { text: 'limited' } }));
+		// A join or leave that would change something is refused like a post, and changes nothing.
+		write(await request(guest, 'leave', 'room_leave', { room_id: threadId }));
+		write(await request(guest, 'leave-general', 'room_leave', { room_id: 'general' }));
+		// Joining a room already joined (general, from auth, and the thread) changes nothing, so is not charged.
+		const rejoin = await exchange(guest, 'rejoin', 'room_join', { room_id: threadId });
+		expect(rejoin.frame.result).toEqual({});
+		expect(rejoin.skipped.some((frame) => frame.method === 'room_update' && frame.params.joined?.some((room: any) => room.room_id === threadId))).toBe(true);
+		expect((await request(guest, 'rejoin-general', 'room_join', { room_id: 'general' })).result).toEqual({});
+		// `me` and commands are not in the category: a spent posting limit refuses neither.
+		const me = await request(guest, 'me', 'me', { status: 'dnd' });
+		expect(me.error).toBeUndefined();
+		expect(me.result.you.user_id).toMatch(/^guest_/);
+		const help = await request(guest, 'help', 'command', { room_id: 'general', body: { text: '/help' } });
+		expect(help.error).toBeUndefined();
+		expect(help.result).toEqual({});
+	} finally { guest.close(); creator.close(); }
 });
 
 it('pipelined guest auth precedes mutation and errors preserve identifiable IDs', async () => {
@@ -422,6 +478,8 @@ it('rejects operations guests may not perform', async () => {
 });
 
 it('creates threads with room_set, delivers only to joined rooms, and moves messages with their reactions', async () => {
+	// Bob's joins and leaves count as posts, past the guests' five a minute.
+	const limit = await guestPostsPerMinute(20);
 	const alice = await connect();
 	const bob = await connect();
 	try {
@@ -550,7 +608,7 @@ it('creates threads with room_set, delivers only to joined rooms, and moves mess
 		expect(ids(unjoined.not_joined)).toEqual(['general']);
 		expect(unjoined.joined).toBeUndefined();
 		expect((await request(bob, 'rejoin', 'room_join', { room_id: 'general' })).result).toEqual({});
-	} finally { alice.close(); bob.close(); }
+	} finally { alice.close(); bob.close(); await guestPostsPerMinute(limit); }
 
 	// A later session has joined only general and finds the thread by listing.
 	const late = await connect();
@@ -581,6 +639,17 @@ it('leaves activity off when ACTIVITY is false: not advertised, and typing is no
 	} finally { alice.close(); bob.close(); }
 });
 
+it('names a history refusal `read` (ext:limits), with no amount or delay in its message', async () => {
+	// No page may be in flight: every history request is the one refused.
+	await configure((config) => { config.limits.concurrentHistoryPerConnection = 0; });
+	const peer = await connect();
+	try {
+		await authenticate(peer);
+		const refused = (await request(peer, 'busy-history', 'history', { room_id: 'general' })).error;
+		expect(refused).toEqual({ code: -32002, message: 'History request already in progress', data: { retry_after: 1, ext: { limits: 'read' } } });
+	} finally { peer.close(); await configure((config) => { config.limits.concurrentHistoryPerConnection = DEFAULT_LIMITS.concurrentHistoryPerConnection; }); }
+});
+
 it('limits the frames the whole server processes in a minute without closing sockets', async () => {
 	await configure((config) => { config.limits.globalFramesPerMinute = 4; });
 	const peer = await connect();
@@ -591,6 +660,9 @@ it('limits the frames the whole server processes in a minute without closing soc
 		}
 		const busy = (await request(peer, 'busy', 'me', {})).error;
 		expect(busy.code).toBe(-32002);
+		expect(busy.message).toBe('Demo is busy with too many requests');
+		// A frame limit holds back everything, so it names no category (`ext:limits`).
+		expect(busy.data).toEqual({ retry_after: busy.data.retry_after });
 		expect(busy.data.retry_after).toBeGreaterThan(0);
 		// The socket stays open and is served again once the limit allows it.
 		await configure((config) => { config.limits.globalFramesPerMinute = DEFAULT_LIMITS.globalFramesPerMinute; });
@@ -734,6 +806,8 @@ it('lists rooms by filter, most recently active first, with members on request, 
 		const limited = (await request(alice, 'limited', 'room_list', { filter: 'joined' })).error;
 		expect(limited.code).toBe(-32002);
 		expect(limited.data.retry_after).toBeGreaterThan(0);
+		// Its category (`ext:limits`): only room_list is held back.
+		expect(limited.data.ext).toEqual({ limits: 'read' });
 		// Browsing top-level rooms from general needs no listing and is not limited.
 		expect((await request(alice, 'browse', 'room_list', { filter: 'not_joined' })).result).toEqual({ not_joined: [] });
 		expect((await request(alice, 'browse-members', 'room_list', { filter: 'not_joined', members: true })).result).toEqual({ not_joined: [], users: [] });
@@ -854,11 +928,12 @@ it('never closes the connection whose frame starts a sweep as stale, though it l
 	} finally { vi.restoreAllMocks(); alice.close(); bob.close(); await configure((config) => { config.limits.pingTimeoutSeconds = 150; }); }
 });
 
-it('advertises the extension ext:settings', async () => {
+it('advertises the extensions ext:settings and ext:limits', async () => {
 	const peer = await connect();
 	try {
 		const server = (await peer.next()).params;
 		expect(server.capabilities).toContain('ext:settings');
+		expect(server.capabilities).toContain('ext:limits');
 		// Each boolean always sent; clients take an absent one as true.
 		expect(server.ext).toEqual({ settings: {
 			// vitest.config.ts turns guest posting on.
@@ -1001,6 +1076,8 @@ it('finishes auth before later frames: pipelined requests run as the new identit
 });
 
 it('sends the notifications a request causes on its connection before its result', async () => {
+	// A leave and a join count as posts: six changes, past the guests' five a minute.
+	const limit = await guestPostsPerMinute(20);
 	const alice = await connect();
 	try {
 		const you = await authenticate(alice);
@@ -1022,7 +1099,7 @@ it('sends the notifications a request causes on its connection before its result
 		expect(join.skipped.map((frame) => Object.keys(frame.params))).toEqual([['joined', 'users']]);
 		const help = await exchange(alice, 'help', 'command', { body: { text: '/help' } });
 		expect(help.skipped).toEqual([{ method: 'message', params: expect.objectContaining({ from: { user_id: '~private', name: 'System message to you' } }) }]);
-	} finally { alice.close(); }
+	} finally { alice.close(); await guestPostsPerMinute(limit); }
 });
 
 it('returns history pages: messages, first_log_id/last_log_id, and empty arrays omitted', async () => {

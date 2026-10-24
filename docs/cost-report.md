@@ -1,7 +1,7 @@
 # Cloudflare Worker storage cost report
 
 This report records local native SQLite measurements used for the storage
-accounting review. It describes the current schema (schema 8: one server-wide
+accounting review. It describes the current schema (schema 9: one server-wide
 record log of room records, message snapshots, reaction sets, and
 memberships; a `memberships` table of registered users' rooms, keyed by
 room with an index by user; and the upload, push registration, user status
@@ -12,8 +12,8 @@ The figures were measured on 2026-09-26, and re-measured on 2026-10-05 with
 user status (below) and again the same day for the current status design
 (the status chosen with `me`, room mutes and the mute echo), and checked on
 2026-10-06 for `status` as a request, statuses in every listing, and users'
-`ext`, none of which changes a row count, with the repository's workerd
-launcher:
+`ext`, none of which changes a row count, and re-measured on 2026-10-24 for
+schema 9 (below), with the repository's workerd launcher:
 
 ```sh
 devenv shell -- npm test -- \
@@ -26,21 +26,83 @@ The traffic tests start at a future UTC noon, cross three UTC posting days,
 run cleanup a day and a half later, and evict/reinitialize one object to check
 persisted limiter state.
 
+## Schema 9: token-bucket limiters, cached limiter rows, one budget write (2026-10-24)
+
+Measured with [`test/quota.integration.test.ts`](../test/quota.integration.test.ts)
+(`charges one written row a page…`) and a per-statement cursor log of one
+history page and two posts. The tables and figures below were re-measured
+with it from [`test/accounting.integration.test.ts`](../test/accounting.integration.test.ts)
+on the same day, except where a section names another test or an earlier
+date.
+
+The trade: totals that protect the deployment stay exact; a principal's own
+limits may forget a few of its charges when the object is evicted.
+
+- Each limiter row keeps a token bucket (`level`, `level_ms`: limiter.ts) in
+  place of four JSON timestamp lists; nothing is parsed or re-serialized.
+- A user's or IP's row in a minute-limited scope (posts, history, auth,
+  admissions, frames) is cached in memory (at most 256 rows) and written on
+  its first charge since it was read or inserted, once a minute, on a new UTC
+  day, and once it holds four charges unwritten (`LIMITER_UNWRITTEN_EVENTS`;
+  a post or frame block counts its weight). Server-wide rows (`global`),
+  registrations, uploads and pushes are written through. An eviction (Durable
+  Objects hibernate seconds after their last event, sockets open or not)
+  forgets at most three events of each row, and each wake that charges a row
+  writes its first charge, so a daily cap of N admits at most N + 6 to a
+  principal that runs to it between evictions, and never more than 4N
+  (limiter-cache.ts).
+- A reservation is staged on the cached budget row and written once, when
+  the operation settles, with the effective clock (`effective_ms`, which
+  replaces the per-operation `_meta` write). An eviction between the two
+  loses at most the operation in flight.
+- A limiter row's `updated_ms`, which cleanup finds idle rows by, moves only
+  when the row is written, so its index entry is rewritten at most once a
+  minute. Cleanup keeps rows touched within the last hour (`LIMITER_IDLE_MS`),
+  and every limiter must drain within it.
+- The server-wide daily history count is a column of the day's budget row. A
+  request that serves no page (refused by the user's or IP's limits, or an
+  unknown room) gives its count back in the same write.
+
+| History page (once its limiter rows exist) | Observed writes | Charged writes |
+| --- | ---: | ---: |
+| Before (schema 8) | 8 | 6 |
+| Schema 9, holding its limiter rows | 1 | 1 |
+| Schema 9, writing them (the first page after a wake, every fourth page, once a minute: both rows, with their index entries) | 5 | 5 |
+| Schema 9, on average, one user paging every 1 to 10 s | 2 | 2 |
+| Schema 9, on average, one user paging every 20 s | 2.3 | 2.3 |
+| Schema 9, a wake and one page, every 15 s | 5 | 5 |
+| Refused by the user's or IP's limit | 1 | 1 |
+
+Measured with a per-page budget log on 2026-10-24. Writing the rows every
+fourth page, which bounds what an eviction forgets, takes a steady reader's
+page from 1 written row to 2 on average (a reader paging every 20 s or
+slower was already charged the minute's write: 2.3 either way), and the
+first page after each wake from 1 to 5.
+
+A post writes its message rows, the server-wide post row and the budget row;
+the poster's and the IP's rows are written with the first post after a
+wake, every fourth, and a minute on. At Paid's daily per-IP history count
+(6,000 pages) one IP is charged about 12,000 written rows, under 2% of the
+700,000 foreground writes; the server-wide count (40,000) bounds history at
+about 80,000 (11%) and 40,000 frames (27%).
+
 ## Reservation accounting
 
 The reservations below gate work before it runs. The unused part of each
 finished SQL reservation, measured from its cursors, is credited back in one
 budget-row update, so the daily counters are charged about the rows actually
-used plus one. A guest reconnect (admission, auth, one history page, room
-listing) is charged about 61 writes, a post about 39, and an idle alarm run
-about 14. The reservation sizes still matter: they decide whether an operation
-is admitted near the ceiling.
+used plus one. A guest reconnect from a new address (admission, auth, a
+frame block, one history page with its quota, room listing, each creating
+its limiter row) is charged about 41 writes; a post about 15 while its
+limiter rows wait, 21 when they are written, and 31 for a poster's first; and an idle alarm run about 14 (not re-measured). The
+reservation sizes still matter: they decide whether an operation is admitted
+near the ceiling.
 
 `reserveCost` adds eight read and eight write rows for its bounded control
 work. The first reservation after a wake or UTC-day handover also carries an
 eight-row handover allowance. Only a `message` mutation naming a `message_id`
 (an edit, which may be a move) has the conservative 256-write mutation floor;
-creates, reactions, rooms and renames, measured at most 37 writes, have a
+creates, reactions, rooms and renames, measured at most 31 writes, have a
 96-write floor. Request-ID mutations also do a pre-duplicate lookup of
 `8 + 4 × maxEmbeds` reads (24 at the default four embeds) and 8 writes, which
 reserves 32/16 after control overhead: a replay's result reflects the current
@@ -57,80 +119,88 @@ upper bounds can be compared with the measured worst case.
 
 | Operation | Observed reads | Observed writes | Reserved reads | Reserved writes |
 | --- | ---: | ---: | ---: | ---: |
-| Auth attempt reservation | 11 | 9 | 48 | 32 |
-| History quota reservation | 16 | 16 | 72 | 24 |
-| Frame reservation (one frame) | 16 | 16 | 28 | 24 |
-| Frame block (10 frames) | 12 | 11 | 64 | 24 |
-| Guest number block | 4 | 4 | 16 | 16 |
-| Connection admission reservation | 17 | 16 | 72 | 40 |
-| Identity registration (starts in `general`, logs that membership) | 31 | 32 | 338 | 880 |
-| Identity registration starting in 100 rooms | 229 | 824 | 338 | 880 |
-| Credential lookup | 4 | 2 | 16 | 8 |
-| Identity lookup (with the user's rooms) | 8 | 2 | 434 | 8 |
-| Identity count | 4 | 2 | 16 | 8 |
-| Credential IDs lookup | 5 | 2 | 40 | 8 |
-| Credential counter update | 5 | 3 | 16 | 16 |
-| Push subscription register | 9 | 8 | 172 | 370 |
-| Push subscription register again, unchanged within a day | 6 | 2 | 172 | 370 |
-| Push wake claim (one user, one subscription; creates the server, sender and recipient counters) | 28 | 26 | 94 | 160 |
-| Push wake claim, 31 unregistered candidates before one registered | 78 | 11 | 1,024 | 160 |
-| Push registrations clear (`/passkeys remove`, a new bot token) | 3 | 3 | 144 | 400 |
-| Mute set (`status` `mute`, unscoped) | 6 | 4 | 24 | 24 |
-| Status set (`me` `status`) | 7 | 3 | 24 | 24 |
-| Room mute set (`status` `mute` with `room_id`) | 7 | 4 | 432 | 424 |
-| Room mute set past 100, refused (two counts and a delete of none ran out) | 306 | 3 | 432 | 424 |
-| Room mute clear | 6 | 3 | 432 | 424 |
-| Room mute expiry, 50 of 100 ran out (read, delete) | 204 | 52 | 224 | 416 |
-| Status inputs at sign-in, nothing stored | 6 | 2 | 224 | 8 |
-| Status inputs at sign-in, a status, a mute and one room mute | 6 | 2 | 224 | 8 |
-| Status inputs at sign-in, 100 room mutes | 105 | 2 | 224 | 8 |
-| Push wake claim, `dnd` and muted (passed over) | 5 | 2 | 94 | 160 |
-| Push wake claim, the thread's parent muted (passed over) | 10 | 2 | 94 | 160 |
-| Gone push subscription forget (one primary-key row) | 4 | 3 | 20 | 22 |
-| Push reply author lookup | 5 | 2 | 16 | 8 |
-| Push wake claim for a reply (creates the recipient counter) | 20 | 16 | 94 | 160 |
-| Message create with request ID | 33 | 37 | 296 | 120 |
-| Empty new message (not logged) | 4 | 2 | 16 | 8 |
-| Deduplicated mutation retry | 5 | 2 | 32 | 16 |
-| Reaction set | 27 | 27 | 296 | 120 |
-| Thread room create by a registered user (counts the creator's live threads; stores and logs the membership) | 30 | 35 | 414 | 120 |
-| Thread room save | 21 | 19 | 296 | 120 |
-| Message move with one reaction set | 27 | 32 | 296 | 280 |
-| Registered name mutation | 23 | 19 | 296 | 120 |
-| Registered room leave (logs the membership) | 24 | 20 | 482 | 72 |
-| Registered room join (logs the membership) | 23 | 17 | 482 | 72 |
-| Registered room join at the 100-thread ceiling | 332 | 32 | 482 | 72 |
-| History page | 12 | 2 | 264 | 40 |
-| Room record lookup (`general`) | 5 | 2 | 24 | 8 |
-| Room join lookup | 5 | 2 | 24 | 8 |
-| Room listing (representative matrix) | 8 | 2 | 444 | 8 |
-| Room members, `general` and one thread | 8 | 2 | 824 | 8 |
-| Room members with status, `general` and one thread | 8 | 2 | 1,224 | 8 |
-| Room members, 101 rooms with 200 registered members each | 40,403 | 2 | 40,820 | 8 |
-| Room members with status, 101 rooms of 200, each member with a status row and the most push registrations and room mutes a user may hold (neither read) | 60,502 | 2 | 61,020 | 8 |
-| Admission snapshot | 6 | 2 | 40 | 24 |
-| Cleanup (matrix, one day later) | 105 | 38 | 1,074 | 1,058 |
-| Alarm scheduling | 8 | 4 | 24 | 12 |
+| Auth attempt reservation | 8 | 7 | 48 | 32 |
+| Frame reservation (one frame) | 13 | 12 | 28 | 24 |
+| Frame block (10 frames) | 9 | 8 | 64 | 24 |
+| Guest number block | 2 | 3 | 16 | 16 |
+| Connection admission reservation | 14 | 12 | 72 | 40 |
+| Identity registration (starts in `general`, logs that membership) | 28 | 27 | 338 | 880 |
+| Identity registration starting in 100 rooms | 227 | 819 | 338 | 880 |
+| Credential lookup | 2 | 1 | 16 | 8 |
+| Identity lookup (with the user's rooms) | 6 | 1 | 434 | 8 |
+| Identity count | 2 | 1 | 16 | 8 |
+| Credential IDs lookup | 3 | 1 | 40 | 8 |
+| Credential counter update | 2 | 2 | 16 | 16 |
+| Push subscription register | 6 | 7 | 172 | 370 |
+| Push subscription register again, unchanged within a day | 3 | 1 | 172 | 370 |
+| Push wake claim (one user, one subscription; creates the server, sender and recipient counters) | 25 | 19 | 94 | 160 |
+| Push wake claim, 31 unregistered candidates before one registered | 75 | 7 | 1,024 | 160 |
+| Push registrations clear (`/passkeys remove`, a new bot token) | 1 | 2 | 144 | 400 |
+| Mute set (`status` `mute`, unscoped) | 3 | 3 | 24 | 24 |
+| Status set (`me` `status`) | 4 | 2 | 24 | 24 |
+| Room mute set (`status` `mute` with `room_id`) | 4 | 3 | 432 | 424 |
+| Room mute set past 100, refused (two counts and a delete of none ran out) | 303 | 2 | 432 | 424 |
+| Room mute clear | 3 | 2 | 432 | 424 |
+| Room mute expiry, 50 of 100 ran out (read, delete) | 201 | 51 | 224 | 416 |
+| Status inputs at sign-in, nothing stored | 3 | 1 | 224 | 8 |
+| Status inputs at sign-in, a status, a mute and one room mute | 3 | 1 | 224 | 8 |
+| Status inputs at sign-in, 100 room mutes | 102 | 1 | 224 | 8 |
+| Push wake claim, `dnd` and muted (passed over) | 2 | 1 | 94 | 160 |
+| Push wake claim, the thread's parent muted (passed over) | 7 | 1 | 94 | 160 |
+| Gone push subscription forget (one primary-key row) | 2 | 2 | 20 | 22 |
+| Push reply author lookup | 4 | 1 | 16 | 8 |
+| Push wake claim for a reply (creates the recipient counter) | 17 | 11 | 94 | 160 |
+| Message create with request ID (the poster's first: creates its limiter rows) | 28 | 31 | 296 | 120 |
+| Empty new message (not logged) | 2 | 1 | 16 | 8 |
+| Deduplicated mutation retry | 2 | 1 | 32 | 16 |
+| Reaction set | 21 | 21 | 296 | 120 |
+| Thread room create by a registered user (counts the creator's live threads; stores and logs the membership) | 22 | 29 | 414 | 120 |
+| Thread room save | 12 | 12 | 296 | 120 |
+| Message move with one reaction set | 19 | 25 | 296 | 280 |
+| Registered name mutation | 16 | 13 | 296 | 120 |
+| Registered room leave (logs the membership; the user's fourth post since its limiter row was written, which writes it) | 21 | 17 | 482 | 72 |
+| Registered room join (logs the membership) | 17 | 11 | 482 | 72 |
+| Registered room join at the 100-thread ceiling | 330 | 27 | 482 | 72 |
+| Guest room join or leave (the guest's first: creates its and its IP's posting limiter rows) | 15 | 14 | 40 | 40 |
+| Guest room join or leave (its limiter rows cached; writes the global row) | 3 | 2 | 40 | 40 |
+| History page | 9 | 1 | 264 | 40 |
+| History page with its quota, a new user and IP (creates both limiter rows) | 21 | 13 | 264 | 40 |
+| History page with its quota, again within a minute | 9 | 1 | 264 | 40 |
+| Room record lookup (`general`) | 3 | 1 | 24 | 8 |
+| Room join lookup | 3 | 1 | 24 | 8 |
+| Room listing (representative matrix) | 6 | 1 | 444 | 8 |
+| Room members, `general` and one thread | 6 | 1 | 824 | 8 |
+| Room members with status, `general` and one thread | 6 | 1 | 1,224 | 8 |
+| Room members, 101 rooms with 200 registered members each | 40,401 | 1 | 40,820 | 8 |
+| Room members with status, 101 rooms of 200, each member with a status row and the most push registrations and room mutes a user may hold (neither read) | 60,500 | 1 | 61,020 | 8 |
+| Cleanup (matrix, one day later) | 98 | 35 | 1,074 | 1,058 |
+| Alarm scheduling | 6 | 3 | 24 | 12 |
 
 The matrix uses a fresh object and one representative operation for each
-boundary; every operation stayed within its reservation. The room-listing test
+boundary; every operation stayed within its reservation. The history quota's
+own reservation and the admission snapshot are gone: the quota is charged
+inside the history page's reservation, and admission reads no snapshot.
+Most operations' bookkeeping is now one written row, the budget row with
+the effective clock, where it was the reservation, the clock and the
+refund. The room-listing test
 separately populated the 100-thread policy ceiling, each thread with a
-description; listing all 101 rooms measured 207/2 against its 452/16
+description; listing all 101 rooms measured 205/1 against its 452/16
 reservation, which is derived from that ceiling (`32 + 4 * 101` rows plus
 reservation control); a room's `description` is in its own row. A 180-record fixture mixing room, message, and
 reaction records returned a 50-record forward page (`more: true`,
-`first_log_id`/`last_log_id` spanning all kinds) at 61/6 against its 272/48
+`first_log_id`/`last_log_id` spanning all kinds) at 55/1 against its 272/48
 reservation. The maximum snapshot test used a 4,096-byte text body plus an
 `ext` field and produced an 8,154-byte serialized snapshot. Its maximum
-observed accepted mutation was 34/37, below the 304/128 request-ID create
+observed accepted mutation was 28/31, below the 304/128 request-ID create
 reservation of the first operation after a handover.
 
 The worst move was measured at the calibrated reaction ceilings rather than
 the defaults: 64 reacting users, each with 16 distinct 64-byte emoji and a
-320-byte name. Each reaction set measured at most 93/32. Moving the message
-re-logged all 64 sets in one 92,693-byte reaction record and measured 223/164
+320-byte name. Each reaction set measured at most 88/27. Moving the message
+re-logged all 64 sets in one 92,693-byte reaction record and measured 211/156
 against its 296/280 reservation, charging its posting limits 9 posts (one, and
-one more per 8 sets); the record still fit one history response.
+one more per 8 sets), which writes the mover's and the IP's limiter rows;
+the record still fit one history response.
 The per-message cap is what bounds this move, and its extra posts what bound
 repeating it: at the 32-set default a move is charged 5 posts, so the posting
 limits allow a fifth as many such moves as plain posts.
@@ -153,7 +223,12 @@ Memberships:
   rooms), so its write floor is `64 + 8 × 101`. Registrations are capped at
   100 a day; the credit-back returns the unused part.
 - A guest's joins and leaves live in its connection and are not logged; a
-  join reads the room record (24/8) and its members (below).
+  join reads the room record (24/8) and its members (below). Where guests may
+  post, one that changes something is charged as a post: a 32/32 reservation
+  (40/40 with control overhead) for the guest's, the IP's and the global
+  posting limiter rows, which writes only the global row while the other two
+  are cached (3/2). A join of a room already joined, or a leave of one not
+  joined, is not charged and reserves nothing.
 - `members` (`room_list` with `members: true`, and `room_update` `joined`)
   read each listed room's registered members by primary-key range with one
   identity lookup each, at most `roomListMembers` (200 with the Workers Paid
@@ -163,7 +238,7 @@ Memberships:
   ([below](#user-status)). Connected members come from
   connection attachments. A user in `general` and a few threads reads about
   two rows per registered member of those rooms; the worst case, a listing of
-  all 101 rooms each at the cap, measured 40,403 reads at 200, which the
+  all 101 rooms each at the cap, measured 40,401 reads at 200, which the
   25,000,000 foreground reads a day allow about 600 times (about 20,200 at
   Free's 100, about 120 times its 2,500,000). A room whose page of
   registered members is full also reads its `member_count` (one row, within
@@ -212,20 +287,23 @@ For the three-day traffic sample, the operation rows were:
 
 | Operation | Observed reads/writes | Reserved reads/writes |
 | --- | ---: | ---: |
-| Day 0 create | 34 / 37 | 304 / 128 |
-| Day 1 create | 27 / 23 | 312 / 136 |
-| Day 2 edit of older message | 29 / 22 | 312 / 296 |
-| Day 2 create | 21 / 22 | 296 / 120 |
-| Cleanup | 61 / 18 | 1,070 / 1,058 |
-| History after cleanup | 8 / 2 | 264 / 40 |
+| Day 0 create | 28 / 31 | 304 / 128 |
+| Day 1 create | 19 / 21 | 312 / 136 |
+| Day 2 edit of older message | 22 / 20 | 312 / 296 |
+| Day 2 create | 11 / 15 | 296 / 120 |
+| Cleanup | 60 / 16 | 1,074 / 1,058 |
+| History after cleanup | 5 / 1 | 264 / 40 |
 
-The native SQLite file reported `databaseSize = 167,936` bytes. These values
+A day's first post writes its poster's and IP's limiter rows through (a new
+UTC day); the day 2 create, within a minute of the edit, leaves them in
+memory. The native SQLite file reported `databaseSize = 217,088` bytes. These values
 are a small schema/data sample and are not a per-message capacity estimate.
 
 ## Guest numbers
 
 Measured on 2026-09-26 with the operation matrix above and
-[`test/guest-numbers.integration.test.ts`](../test/guest-numbers.integration.test.ts).
+[`test/guest-numbers.integration.test.ts`](../test/guest-numbers.integration.test.ts),
+and the steady-state block re-measured with the matrix on 2026-10-24.
 Guests are numbered `guest_<n>` from a counter reserved in blocks of
 `guestNumberBlock` (10): one reservation advances the stored high-water mark
 (a `_meta` row; no schema change) and the object serves the block from
@@ -233,21 +311,21 @@ memory. Guest auth still stores no identity row.
 
 | Operation | Observed reads | Observed writes | Reserved reads | Reserved writes |
 | --- | ---: | ---: | ---: | ---: |
-| Guest number block (steady state) | 4 | 4 | 16 | 16 |
+| Guest number block (steady state) | 2 | 3 | 16 | 16 |
 | Guest number block (first reservation after a wake) | 6 | 6 | 24 | 24 |
 | Guest number served from the block | 0 | 0 | 0 | 0 |
 
-- The written rows are the mark and the reservation's own bookkeeping (the
-  budget-row update and credit-back, and the effective clock when it
-  advances); the first reservation after a wake also loads the day's budget
-  row under the handover allowance. The reservation is foreground work and
+- The written rows are the mark and the reservation's own bookkeeping (one
+  budget-row update, which carries the effective clock); the first
+  reservation after a wake also loads the day's budget row under the
+  handover allowance. The reservation is foreground work and
   counts no frame or post.
 - Every start, eviction, or hibernation wake that authenticates a guest
   reserves a fresh block, since the in-memory block is lost; the unused numbers
-  are skipped. The cost is therefore about four rows per block of guests or
-  per waking visit, whichever is more: at most about 800 rows a day at the
-  Free plan's 2,000 guest admissions a day (1,600 at Paid's 4,000), against about 61 charged writes for each guest
-  reconnect (admission, auth, history, listing).
+  are skipped. The cost is therefore about three rows per block of guests or
+  per waking visit, whichever is more: at most about 600 rows a day at the
+  Free plan's 2,000 guest admissions a day (1,200 at Paid's 4,000), against about 41 charged writes for each guest
+  reconnect from a new address (admission, auth, frames, history, listing).
 - A schema reset reads the mark before the wipe and writes it back afterwards,
   one uncharged control row like the carried budget row, so guest IDs are
   never reissued.
@@ -264,7 +342,8 @@ what a single frame cost before.
 
 Blocks change what frames without SQL work of their own cost (`room_join`
 lookups aside, notifications, rejected frames). A post is one frame plus its
-mutation, which is charged about 39 writes after the credit-back.
+mutation, which is charged about 15 to 21 writes after the credit-back (31
+for a poster's first).
 
 `activity` is off by default (`ACTIVITY=true` enables it). When it is on, the
 web client sends a typing update when typing starts, every 12 seconds while it
@@ -291,7 +370,7 @@ the demo; a client flooding them can spend that allowance, which the
 account-usage stop bounds, and on Free also the platform's own limits.
 
 The Free plan's foreground write ceiling is 60,000 rows per UTC day. Charged
-at about 39 writes each, that is roughly 1,500 posts a day before other
+at about 15 to 21 writes each, that is roughly 3,000 to 4,000 posts a day before other
 foreground operations consume the same daily budget (the Paid plan's 700,000
 leaves the 10,000-post ceiling reachable); near the ceiling a post
 is admitted only while its full reservation (120 writes with a request ID, 280
@@ -320,7 +399,7 @@ independent.
 
 With Web Push on (protocol §4.9), `push_register` is one frame plus the
 registration above: about 7 writes the first time (the row and its two
-indexes), and 2 for the reservation alone when a client registers the same
+indexes), and 1 for the reservation alone when a client registers the same
 subscription (keys and `push_id`) on its next connection within a day, which
 writes nothing; `registersPerUserMinute` (10) bounds the rest. These were
 measured with a 64-character `push_id`, the longest allowed; it changes row
@@ -330,15 +409,15 @@ returns.
 
 Choosing whom a new message wakes reads connection attachments, plus one
 indexed read of the replied-to message's current state when the message is
-a reply (5/2 with its reservation). Registrations carry their wake scopes
+a reply (4/1 with its reservation). Registrations carry their wake scopes
 in the same row, so filtering by scope costs no extra rows. The wake claim then looks up the candidates in turn, at most 32: each costs
 one read of its mute, and an unregistered one about one more of its live
 index range, and a registered one also
 reads its wake time for the room and its recipient counter, and the
 server's and sender's counters once. A message that wakes someone writes
 each woken user's wake time and recipient counter, and the server's and the
-sender's counters, charged as the pushes are claimed, delivered or not: 26
-writes for the day's first wake (counter rows created), about 11 after. A message whose candidates have no live
+sender's counters, charged as the pushes are claimed, delivered or not: 19
+writes for the day's first wake (counter rows created), about 7 after. A message whose candidates have no live
 registrations, or are all coalesced, writes nothing; one that mentions no
 one idle or gone does no push SQL. The reservation covers 32 candidates at
 5 registrations each (888 reads) and `wakesPerMessage` wake rows and
@@ -354,7 +433,7 @@ claims at most `wakesPerMessage` users of `subscriptionsPerUser` each.
 A wake claim also passes over a candidate that a mute or a `dnd` status
 silences (§4.9: such a push would go only to `badge` registrations, which
 this server does not have). The unscoped mute and `dnd` are in the
-`user_status` row the claim reads first (5/2 for a passed-over candidate
+`user_status` row the claim reads first (2/1 for a passed-over candidate
 with the reservation). Room mutes are checked only for a candidate with
 live registrations: two primary-key probes of `room_mutes`, for the
 message's room and, for a thread, its parent, which is read once a message
@@ -363,21 +442,21 @@ message's room and, for a thread, its parent, which is read once a message
 once (94 against 82; 1,024 against 888 for 32 candidates).
 
 A `status` `mute` change is one upsert or delete of the user's
-`user_status` row (6/4 with the reservation) or `room_mutes` row (7/4),
-and a `me` `status` change one of the `user_status` row (7/3). Each is sent
+`user_status` row (3/3 with the reservation) or `room_mutes` row (4/3),
+and a `me` `status` change one of the `user_status` row (4/2). Each is sent
 to the user's connections as `status` or `user` from the same operation,
 with no SQL. A room mute past the 100 a user may hold counts the user's
-room mutes and deletes those that ran out (306/3 when none did); its
+room mutes and deletes those that ran out (303/2 when none did); its
 reservation covers deleting all 100 (432/424). A registered sign-in on a
 push server reads the `user_status` row and one key range of the user's
-room mutes (6/2 with none or one, 105/2 with 100) and keeps the status and
+room mutes (3/1 with none or one, 102/1 with 100) and keeps the status and
 mute ends on the connection, so `me` results and later `you` objects read
 nothing. `mutesPerUserMinute` (6) bounds mute and status changes together,
 counted per user across reconnects, so flipping them cannot drain the write
 budget: at most about 35 written rows a user a minute. An expired unscoped
 mute is read as none and never written back; a room mute that runs out
 while its user is connected is read and deleted once (Store.expireRoomMutes:
-204/52 for 50 of 100), and one that runs out while they are away waits, at
+201/51 for 50 of 100), and one that runs out while they are away waits, at
 most 100 a user, until they next mute a room at the cap. Room mutes number
 at most 100 per registered user, about 60 bytes each.
 
@@ -422,15 +501,15 @@ One room of 200 registered members, by what the members have stored:
 
 | Members (200 in one room) | Reads without status | Reads with status | Added per member |
 | --- | ---: | ---: | ---: |
-| none with a status row | 404 | 403 | 0 |
-| each with two live waking registrations and a room mute | 403 | 403 | 0 |
-| mixed: a tenth muted, one in 30 invisible, one in 50 `""` | 403 | 434 | 0.15 |
-| worst: each with a status row (`dnd` and a mute) | 403 | 603 | 1.0 |
+| none with a status row | 402 | 401 | 0 |
+| each with two live waking registrations and a room mute | 401 | 401 | 0 |
+| mixed: a tenth muted, one in 30 invisible, one in 50 `""` | 401 | 432 | 0.15 |
+| worst: each with a status row (`dnd` and a mute) | 401 | 601 | 1.0 |
 | reserved | 420 | 620 | |
 
 The reservation per room grows from `4 + 2 × roomListMembers` to
 `4 + 3 × roomListMembers`; all 101 rooms at the cap, every member with a
-status row, read 60,502 rows against the 61,020 reserved (40,403 without
+status row, read 60,500 rows against the 61,020 reserved (40,401 without
 status).
 
 **Reuse.** The store keeps each room's member rows, chosen statuses
@@ -442,19 +521,19 @@ saved at two a member). It is lost on hibernation; the figures below assume
 no reuse.
 
 **Sign-in and changes.** A registered sign-in reads the `user_status` row
-and one key range of the user's room mutes, in `room_id` order (6/2 with
-none or one; 105/2 with the 100 a user may hold), and keeps the chosen status and the mute ends on the
+and one key range of the user's room mutes, in `room_id` order (3/1 with
+none or one; 102/1 with the 100 a user may hold), and keeps the chosen status and the mute ends on the
 connection; `me` reads nothing. The mutes in effect are sent after the
 `auth` result from that read, and the statuses of connected users who
 share a room from attachments: the test that resends them measures no SQL
-statement at all. A `me` `status` change is 7/3, an unscoped mute 6/4, a
-room mute 7/4. Deriving and announcing statuses reads connection
+statement at all. A `me` `status` change is 4/2, an unscoped mute 3/3, a
+room mute 4/3. Deriving and announcing statuses reads connection
 attachments only: the tests measure 0 rows read and written, and no
 statement, for an `idle` change, a sweep, a closed connection's change after
 its grace, and a status snapshot, and the alarm unchanged. A mute that runs
 out is told from attachments for the unscoped one (0 rows, measured); a
 room mute that runs out while its user is connected costs one key range of
-their room mutes and a delete of those that ran out (204/52 for 50 of 100,
+their room mutes and a delete of those that ran out (201/51 for 50 of 100,
 once). Fan-out is one `user` frame per connection that shares a room with
 the user (about 2 ms of CPU for 100 sockets, from the budget prototype), at
 most once a minute per user for changes the connections cause, and one
@@ -467,7 +546,7 @@ reads frame times for it.
 answered `{}`, or with an error that changes nothing. A refusal costs no
 more than the change it declines (`invalid_params` and `retry_after` past `mutesPerUserMinute` or the
 idle limit run no statement; an unknown room at most the one bounded room
-lookup; a room mute at the cap of 100 the same 306/3). The
+lookup; a room mute at the cap of 100 the same 303/2). The
 reply is one outgoing frame, not billed. `status` before sign-in is
 `denied`, so a sign-in applies no mutes kept on the connection: it writes
 nothing for them. An `idle` change still reads attachments only (0
@@ -481,7 +560,7 @@ rate.
 allowances: a sign-in reads one row more (the empty range), under 0.1% of
 the foreground reads at its 2,000 admissions; a claim reads two rows more
 per candidate with registrations, bounded by `pushesPerDay` (1,000 on Free):
-at most about 3,000 reads a day; a room mute change writes about 4 rows,
+at most about 3,000 reads a day; a room mute change writes about 3 rows,
 bounded with status changes by `mutesPerUserMinute` (6), the same bound the
 unscoped mute and `invisible` had; storage is at most 100 rows a registered
 user. None of it uses requests, the plan's scarcest allowance after SQL
@@ -496,7 +575,7 @@ costed for announcing it on time:
 | Design | Durable Object requests | SQL rows | Duration | Verdict |
 | --- | --- | --- | --- | --- |
 | One-shot in-memory `setTimeout` for the earliest due change or mute ending within a minute, armed only while a signed-in connection is open (chosen) | 0 (no alarm is set: measured) | 0 (measured), but for a room mute that ran out | keeps the object awake at most 60 s after its last event, against about 10 s before it would hibernate: at most 50 s × 0.125 GB = 6.25 GB-s per change that lands in a quiet period, 0.05% of either plan's daily duration | chosen |
-| An alarm per due change | 1 per wake: 2% of Free's requests, 12.5% of Paid's at 4,000 a day | alarm scheduling (8/4) and an alarm run (about 14 written rows): about 36,000 maintenance writes a day at Free's 2,000 admissions, 180% of its 20,000 | about 1.25 GB-s per wake | rejected: Free fails closed |
+| An alarm per due change | 1 per wake: 2% of Free's requests, 12.5% of Paid's at 4,000 a day | alarm scheduling (6/3) and an alarm run (about 14 written rows): about 34,000 maintenance writes a day at Free's 2,000 admissions, 170% of its 20,000 | about 1.25 GB-s per wake | rejected: Free fails closed |
 | Announce only on the next event | 0 | 0 | 0 | rejected: in a quiet room a change waits for the next event, however long, so peers keep seeing "online" |
 
 A mute that runs out more than a minute after the last event is told at the
@@ -526,7 +605,7 @@ are of each plan's daily allowance (Paid: its monthly included usage over
 | Durable Object duration, if every session ends in an otherwise quiet minute | ≤ 3,125 GB-s (24%) / bound by the whole day | ≤ 6,250 GB-s (48%) / bound by the whole day |
 | SQL rows read (foreground) | 1.4% / 2.7% (worst, every member with a status row: 9% / 18%); sign-ins +0.04% / +0.08% | 0.2% / 0.9% (worst: 1.5% / 6%) |
 | SQL rows read (account) | under 0.1% / under 0.2% | under 0.05% / under 0.2% |
-| SQL rows written (foreground) | about 3 per status change and 4 per mute: ≤ 0.9% / ≤ 3.4% | ≤ 0.15% / ≤ 0.6% |
+| SQL rows written (foreground) | about 2 per status change and 3 per mute: ≤ 0.9% / ≤ 3.4% | ≤ 0.15% / ≤ 0.6% |
 | Frames | no incoming frame beyond what push already asked for; outgoing only: announcements, the statuses and mutes in effect after each sign-in, one `status` per mute change to the user's connections, and one `user` frame per user told of on `/toggle presence` off or on, none of which an allowance counts or SQL serves | same |
 
 Free's listings read a little more than they would without status: the price of showing a user who chose none as `""`
@@ -553,19 +632,21 @@ record and two creates), removed the unreferenced old current message, and kept
 the edited message whose latest record was still inside the retention window. It also removed two expired accepted-request rows without changing
 the room head.
 
-The maintenance-reserve test accepted 35 mutations under an explicit
-1,000/1,000 foreground ceiling, rejected the next mutation, then ran cleanup
-the next UTC day. The previous day's foreground counter was 793 while the new
-day's cleanup was charged 112 maintenance writes (269/112 observed) and
-removed 36 records (the creates and the seeded room record), 35 messages, and
-29 request rows. The current budget row must be read by day; calling `budget()` after midnight
+The maintenance-reserve test accepted 56 mutations under an explicit
+1,000/1,000 foreground ceiling (59 before every fourth post wrote its limiter
+rows), rejected the next mutation, then ran cleanup the next UTC day. The
+previous day's foreground counter was 912 while the new day's cleanup, run
+until it found nothing (one run deletes what its reservation covers), was
+charged 187 maintenance writes (454/187 observed, over five reservations)
+and removed 57 records (the creates and the seeded room record) and 56
+messages. The current budget row must be read by day; calling `budget()` after midnight
 correctly returns the new day's foreground counters rather than the exhausted
 previous day.
 
 After `evictDurableObject`, a fresh Store instance observed a bounded set of
 schema, effective-clock, and budget-cache reads and zero schema writes. The persisted principal-limit rows retained the
 original daily post count and the second mutation was rejected by that daily
-limit. The SQLite file remained 147,456 bytes across eviction.
+limit. The SQLite file remained 217,088 bytes across eviction.
 
 ## Storage pressure and page reuse
 
@@ -652,6 +733,14 @@ their primary keys, and adds the identities' empty `ext_json` column. The rows
 it measurably read and wrote are added to the day's maintenance counters
 without a capacity check, like the reset's passkey carry, so an exhausted
 budget cannot block it. The object is not wiped.
+
+A schema 8 object is upgraded to schema 9 the same way: it adds the limiter
+rows' two bucket columns and the budget rows' two, and keeps the limiter
+rows' four timestamp-list columns, unread. Adding a column rewrites no row,
+so the upgrade was charged 8 written rows over 503 limiter rows (measured on
+2026-10-24); dropping the four lists as well measured 2,168, about 4.3 a
+row, so about 43,000 at the 10,000-row limiter cap, more than Free's whole
+maintenance allocation.
 
 Any other stored schema version resets the object with
 `deleteAll()` and recreates the schema (`test/schema-reset.integration.test.ts`).

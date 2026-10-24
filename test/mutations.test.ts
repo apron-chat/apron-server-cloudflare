@@ -380,7 +380,7 @@ it("charges a move one more post per MOVE_REACTION_SETS_PER_POST reaction sets i
 			userId: "alice", name: "Alice", userHandle: "handle-alice", now: clock.value, ipKey: "ip-alice",
 			credential: { credentialId: "cred-alice", userId: "alice", publicKey: "AAAA", counter: 0 },
 		});
-		const posted = () => Number(state.storage.sql.exec<{ posts_day: number }>("SELECT posts_day FROM principal_limits WHERE scope = 'post' AND principal_key = 'user:alice'").one().posts_day);
+		const posted = () => store.limiterDay("post", "user:alice", clock.value).posts_day;
 		const reactedBy = (messageId: string, count: number) => {
 			for (let n = 0; n < count; n += 1) store.mutate(op(clock, `guest_${messageId}_${n}`, `react-${messageId}-${n}`, "reactions", { message_id: messageId, emojis: ["👍"] }));
 		};

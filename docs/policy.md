@@ -56,9 +56,10 @@ within it:
   anyone, and a thread's creator may remove anyone from it. Others are
   `denied`. Only registered users can be added. A thread's messages go to its
   members only. A thread is removed, with its messages, when the last one in
-  it leaves. A guest's rooms last for its connection and are not logged; a
-  registered identity keeps its rooms across connections, its joins and leaves
-  count as posts, and each is a logged membership record delivered in
+  it leaves. Joins and leaves that change something count as posts, a
+  guest's included. A guest's rooms last for its connection and are not
+  logged; a registered identity keeps its rooms across connections, and each
+  of its joins and leaves is a logged membership record delivered in
   `room_update` `memberships` (with the user's own `joined` or `left`) and
   kept in history. Joins and
   leaves are never `user` notifications. `room_list` takes `filter`,
@@ -311,7 +312,11 @@ to rooms (`/toggle addmember`). The ping interval is the standard `server.params
 The demo's 16 KiB frame policy is an explicit exception to the base protocol's
 advisory 256 KiB recommendation. Payload lengths count UTF-8 bytes. Errors use
 the base protocol codes; `retry_after` includes `data.retry_after`, whole
-seconds rounded up. Permanent identity/thread-room ceilings return `denied`, not a fabricated replenishment time.
+seconds rounded up, and, when a reading, posting or upload limit refused the
+request, `data.ext.limits`: `read`, `write` or `upload` (extension
+`ext:limits`, advertised in `capabilities` and defined in apron-web's EXT.md;
+SPEC section 6), which tells clients what to hold back; they ignore a value
+they do not know. Messages name the limit, never its amount or delay. Permanent identity/thread-room ceilings return `denied`, not a fabricated replenishment time.
 Every count limit the server sets (embeds per message, emoji per reaction set,
 reacting users per message, push `wake` entries, invite uses, passkeys, roles,
 room mutes, threads) is `denied`; a value past its size limit is `too_large`;

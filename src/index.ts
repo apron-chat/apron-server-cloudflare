@@ -7,6 +7,7 @@ import { AccountUsageMonitor } from "./account-usage";
 import { EDGE_STOP_RULE_REF, readEdgeStop, runBudgetGuard, watchForFlood } from "./budget-guard";
 import { sniffAudio } from "./audio";
 import { sniffImage } from "./image";
+import { limitData } from "./store-error";
 import { signUploadToken, verifyUploadToken } from "./upload-token";
 import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
 import { extractClientIp, hashIpKey, hashIpv6PrefixKey, stripForwardingHeaders } from "./ip";
@@ -573,6 +574,11 @@ function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		maxHistoryResponseBytes: limits.historyMaxResponseBytes,
 		historyRequestsPerUserMinute: limits.historyRequestsPerUserMinute,
 		historyRequestsPerIpMinute: limits.historyRequestsPerIpMinute,
+		historyBurstPerUser: limits.historyBurstPerUser,
+		historyBurstPerIp: limits.historyBurstPerIp,
+		historyRequestsPerUserDay: limits.historyRequestsPerUserDay,
+		historyRequestsPerIpDay: limits.historyRequestsPerIpDay,
+		historyRequestsPerDay: limits.historyRequestsPerDay,
 		anonymousPostsPerMinute: limits.anonymousPostsPerMinute,
 		anonymousPostsPerDay: limits.anonymousPostsPerDay,
 		registeredPostsPerMinute: limits.registeredPostsPerMinute,
@@ -1078,7 +1084,7 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 	const stub = env.DEMO.getByName(OBJECT_NAME);
 	try {
 		const claimed = await stub.claimUpload(grant.key);
-		if (claimed === "closed") return answer(429, "Uploads are closed until the daily reset", 86_400_000 - Date.now() % 86_400_000);
+		if (claimed === "closed") return answer(429, "Daily upload limit reached for the server", 86_400_000 - Date.now() % 86_400_000);
 		if (!claimed) return answer(409, "This write_url was already used or has expired");
 	} catch {
 		return answer(503, "Demo capacity reached");
@@ -1531,8 +1537,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 					// The `ext` clients write on users, messages, and rooms is kept,
 					// and writes merge it one level deep (§4.12).
 					"ext",
-					// This server's extension: `ext.settings` below.
-					"ext:settings",
+					// This server's extensions: `ext.settings` below, and
+					// `ext.limits` on `retry_after` errors (limitData).
+					"ext:settings", "ext:limits",
 				],
 				// Passkeys and their session tokens only where passkeys are offered;
 				// bot tokens (`/invite-bot`) from anywhere, since bots are not browsers.
@@ -1681,7 +1688,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const busy = this.takeServerFrame(nowMs());
 		if (busy !== undefined) {
 			if (parsed && !isNotification(parsed.request.method, parsed.request.id)) {
-				this.fail(socket, parsed.request, { name: "retry_after", message: "Demo is busy; try again shortly", data: { retry_after: busy } });
+				this.fail(socket, parsed.request, { name: "retry_after", message: "Demo is busy with too many requests", data: { retry_after: busy } });
 			}
 			return;
 		}
@@ -2092,7 +2099,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const state = connectionAttachment(peer);
 			return !!state && !state.closing && state.userId === userId;
 		}).length;
-		if (activeForUser >= this.config.limits.registeredConnectionsPerUser) throw { name: "retry_after", message: "Demo capacity reached", data: { retry_after: 60 } } satisfies ProtocolError;
+		if (activeForUser >= this.config.limits.registeredConnectionsPerUser) throw { name: "retry_after", message: "Connection limit reached for this account", data: { retry_after: 60 } } satisfies ProtocolError;
 	}
 
 	/**
@@ -2475,7 +2482,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	private async handleHistory(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate before loading history" } satisfies ProtocolError;
-		if (attachment.historyInFlight >= this.config.limits.concurrentHistoryPerConnection) throw { name: "retry_after", message: "History request already in progress", data: { retry_after: 1 } } satisfies ProtocolError;
+		if (attachment.historyInFlight >= this.config.limits.concurrentHistoryPerConnection) throw { name: "retry_after", message: "History request already in progress", data: { retry_after: 1, ...limitData("read") } } satisfies ProtocolError;
 		const params = request.params;
 		// Without room_id, history pages the default room (§4.3). Every room is
 		// visible, so any room's history may be read without joining it.
@@ -2710,7 +2717,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * its membership goes to the room's members, the joiner's connections
 	 * included. Then the user's connections get `room_update` `joined` with
 	 * the room's members, and then the result. A guest's join lives in its
-	 * connection and is not logged. Joining a room already joined logs
+	 * connection and is not logged, but is charged as a post like a
+	 * registered user's (Store.chargeGuestMembership). Joining a room already joined logs
 	 * nothing and re-sends `joined` to this connection only. With another
 	 * user's `user_id`, it adds that user (see addMember).
 	 */
@@ -2738,6 +2746,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return;
 		}
 		if (identity.tier !== "registered") {
+			// A guest's join counts as a post (§6), charged before it changes anything.
+			this.store.chargeGuestMembership({ ipKey: attachment.ipKey, now: nowMs() });
 			this.setRooms(identity.user_id, [...current, roomId]);
 			this.sendToUser(identity.user_id, this.joinedUpdate(known, before.get(roomId), joiner, totals.get(roomId)));
 			this.announceJoiner(identity.user_id, roomId);
@@ -2807,8 +2817,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * included. Then the user's connections stop receiving the room's
 	 * deliveries and get `room_update` `left`, and then the result. The room
 	 * stays visible and can be joined again, unless it is a thread that
-	 * nobody is left in, which is removed (removeIfEmpty). Leaving a room not joined
-	 * changes nothing. With another user's `user_id`, an admin, the room's
+	 * nobody is left in, which is removed (removeIfEmpty). A guest's leave
+	 * lives in its connection and is charged as a post
+	 * (Store.chargeGuestMembership). Leaving a room not joined changes nothing
+	 * and is not charged. With another user's `user_id`, an admin, the room's
 	 * creator, or the bot's owner removes that user, as `/kick` does but
 	 * without its notice.
 	 */
@@ -2834,6 +2846,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return;
 		}
 		if (identity.tier !== "registered") {
+			// A guest's leave counts as a post (§6), charged before it changes anything.
+			this.store.chargeGuestMembership({ ipKey: attachment.ipKey, now: nowMs() });
 			this.setRooms(identity.user_id, current.filter((id) => id !== roomId));
 			this.sendToUser(identity.user_id, roomUpdate("left", { room_id: roomId }));
 			this.removeIfEmpty(roomId);
@@ -4104,7 +4118,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			writeAttachment(socket, attachment);
 		} else {
 			const retry = this.throttleRetry(identity.user_id, "room_list", this.config.limits.roomListRequestsPerUserMinute, now);
-			if (retry !== undefined) throw { name: "retry_after", message: "Room listing limited", data: { retry_after: retry } } satisfies ProtocolError;
+			if (retry !== undefined) throw { name: "retry_after", message: "Room listing limited", data: { retry_after: retry, ...limitData("read") } } satisfies ProtocolError;
 			// Counted before the storage read, so a listing of an unknown room counts too.
 			this.takeThrottle(socket, identity.user_id, "room_list", Number.MAX_SAFE_INTEGER, now);
 		}
