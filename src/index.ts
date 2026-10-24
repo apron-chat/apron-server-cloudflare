@@ -7,6 +7,7 @@ import { AccountUsageMonitor } from "./account-usage";
 import { EDGE_STOP_RULE_REF, readEdgeStop, runBudgetGuard, watchForFlood } from "./budget-guard";
 import { sniffAudio } from "./audio";
 import { sniffImage } from "./image";
+import { limitData } from "./store-error";
 import { signUploadToken, verifyUploadToken } from "./upload-token";
 import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
 import { extractClientIp, hashIpKey, hashIpv6PrefixKey, stripForwardingHeaders } from "./ip";
@@ -1083,7 +1084,7 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 	const stub = env.DEMO.getByName(OBJECT_NAME);
 	try {
 		const claimed = await stub.claimUpload(grant.key);
-		if (claimed === "closed") return answer(429, "Uploads are closed until the daily reset", 86_400_000 - Date.now() % 86_400_000);
+		if (claimed === "closed") return answer(429, "Daily upload limit reached for the server", 86_400_000 - Date.now() % 86_400_000);
 		if (!claimed) return answer(409, "This write_url was already used or has expired");
 	} catch {
 		return answer(503, "Demo capacity reached");
@@ -1536,8 +1537,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 					// The `ext` clients write on users, messages, and rooms is kept,
 					// and writes merge it one level deep (§4.12).
 					"ext",
-					// This server's extension: `ext.settings` below.
-					"ext:settings",
+					// This server's extensions: `ext.settings` below, and
+					// `ext.limits` on `retry_after` errors (limitData).
+					"ext:settings", "ext:limits",
 				],
 				// Passkeys and their session tokens only where passkeys are offered;
 				// bot tokens (`/invite-bot`) from anywhere, since bots are not browsers.
@@ -1686,7 +1688,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const busy = this.takeServerFrame(nowMs());
 		if (busy !== undefined) {
 			if (parsed && !isNotification(parsed.request.method, parsed.request.id)) {
-				this.fail(socket, parsed.request, { name: "retry_after", message: "Demo is busy; try again shortly", data: { retry_after: busy, limit: "frames" } });
+				this.fail(socket, parsed.request, { name: "retry_after", message: "Demo is busy with too many requests", data: { retry_after: busy } });
 			}
 			return;
 		}
@@ -2097,7 +2099,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const state = connectionAttachment(peer);
 			return !!state && !state.closing && state.userId === userId;
 		}).length;
-		if (activeForUser >= this.config.limits.registeredConnectionsPerUser) throw { name: "retry_after", message: "Demo capacity reached", data: { retry_after: 60, limit: "connections" } } satisfies ProtocolError;
+		if (activeForUser >= this.config.limits.registeredConnectionsPerUser) throw { name: "retry_after", message: "Connection limit reached for this account", data: { retry_after: 60 } } satisfies ProtocolError;
 	}
 
 	/**
@@ -2480,7 +2482,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	private async handleHistory(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate before loading history" } satisfies ProtocolError;
-		if (attachment.historyInFlight >= this.config.limits.concurrentHistoryPerConnection) throw { name: "retry_after", message: "History request already in progress", data: { retry_after: 1, limit: "history" } } satisfies ProtocolError;
+		if (attachment.historyInFlight >= this.config.limits.concurrentHistoryPerConnection) throw { name: "retry_after", message: "History request already in progress", data: { retry_after: 1, ...limitData("read") } } satisfies ProtocolError;
 		const params = request.params;
 		// Without room_id, history pages the default room (§4.3). Every room is
 		// visible, so any room's history may be read without joining it.
@@ -2944,7 +2946,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const limited = idleChange && idle === true;
 		if (limited) {
 			const wait = this.idleChanges.retry(state.connId, now);
-			if (wait !== undefined) throw { name: "retry_after", message: "Idle changes limited", data: { retry_after: wait, limit: "idle" } } satisfies ProtocolError;
+			if (wait !== undefined) throw { name: "retry_after", message: "Idle changes limited", data: { retry_after: wait } } satisfies ProtocolError;
 		}
 		if (mute !== undefined) {
 			this.changeMute(state.userId!, roomId ?? null, mute, now);
@@ -2979,7 +2981,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// are refused. Only an applied change counts: a refused or failed one
 		// spends nothing.
 		const wait = this.statusChanges.retry(userId, now);
-		if (wait !== undefined) throw { name: "retry_after", message: "Mute changes limited", data: { retry_after: wait, limit: "status" } } satisfies ProtocolError;
+		if (wait !== undefined) throw { name: "retry_after", message: "Mute changes limited", data: { retry_after: wait } } satisfies ProtocolError;
 		const result = roomId === null ? this.store.setMute({ userId, untilMs, now }) : this.store.setRoomMute({ userId, roomId, untilMs, now });
 		if ("refused" in result && result.refused) {
 			throw { name: "denied", message: `At most ${MAX_ROOM_MUTES_PER_USER} rooms can be muted; unmute one first` } satisfies ProtocolError;
@@ -3094,7 +3096,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if ((connectionAttachment(socket)?.choice ?? "online") === choice) return;
 		const now = nowMs();
 		const wait = this.statusChanges.retry(userId, now);
-		if (wait !== undefined) throw { name: "retry_after", message: "Status changes limited", data: { retry_after: wait, limit: "status" } } satisfies ProtocolError;
+		if (wait !== undefined) throw { name: "retry_after", message: "Status changes limited", data: { retry_after: wait } } satisfies ProtocolError;
 		if (attachment.tier === "registered") this.store.setStatus({ userId, choice, now });
 		this.statusChanges.take(userId, now);
 		this.cacheStatusState(userId, (state) => {
@@ -3743,7 +3745,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const now = nowMs();
 		// Counted before validation, so refused registrations count too.
 		if (!this.pushRegisters.take(attachment.userId!, now)) {
-			throw { name: "retry_after", message: "Push registrations limited", data: { retry_after: this.pushRegisters.retry(attachment.userId!, now) ?? 1, limit: "push_register" } } satisfies ProtocolError;
+			throw { name: "retry_after", message: "Push registrations limited", data: { retry_after: this.pushRegisters.retry(attachment.userId!, now) ?? 1 } } satisfies ProtocolError;
 		}
 		const params = request.params;
 		const kind = requiredString(params, "kind");
@@ -4109,7 +4111,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			writeAttachment(socket, attachment);
 		} else {
 			const retry = this.throttleRetry(identity.user_id, "room_list", this.config.limits.roomListRequestsPerUserMinute, now);
-			if (retry !== undefined) throw { name: "retry_after", message: "Room listing limited", data: { retry_after: retry, limit: "room_list" } } satisfies ProtocolError;
+			if (retry !== undefined) throw { name: "retry_after", message: "Room listing limited", data: { retry_after: retry, ...limitData("read") } } satisfies ProtocolError;
 			// Counted before the storage read, so a listing of an unknown room counts too.
 			this.takeThrottle(socket, identity.user_id, "room_list", Number.MAX_SAFE_INTEGER, now);
 		}

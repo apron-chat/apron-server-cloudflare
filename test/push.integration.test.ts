@@ -808,6 +808,8 @@ describe('status mute', () => {
 			expect(limited.frame.error.code).toBe(-32002);
 			expect(limited.frame.error.data.retry_after).toBeGreaterThan(0);
 			expect(limited.frame.error.data.retry_after).toBeLessThanOrEqual(60);
+			// Not a read, write or upload limit: no category (`ext:limits`).
+			expect(Object.keys(limited.frame.error.data)).toEqual(['retry_after']);
 			expect(await idleOf(userId)).toEqual([false, false]);
 			// A limited idle fails the whole request: a mute with it is not applied.
 			const both = await status(peer, { idle: 0, mute: true });
@@ -1212,7 +1214,9 @@ describe('security review fixes', () => {
 				const applied = index === 0 ? await request(peer, 'dnd', 'me', { status: 'dnd' }) : (await status(peer, { mute: index % 2 ? 60 : false })).frame;
 				expect(applied.error, JSON.stringify(applied.error)).toBeUndefined();
 			}
-			expect((await status(peer, { mute: true })).frame.error.code).toBe(-32002);
+			const muted = (await status(peer, { mute: true })).frame.error;
+			expect(muted.code).toBe(-32002);
+			expect(Object.keys(muted.data)).toEqual(['retry_after']);
 		} finally { peer.close(); }
 	});
 
@@ -1227,7 +1231,9 @@ describe('security review fixes', () => {
 		first.close();
 		const second = await signedIn(userId, true);
 		try {
-			expect((await request(second, 'over', 'push_register', params)).error.code).toBe(-32002);
+			const over = (await request(second, 'over', 'push_register', params)).error;
+			expect(over.code).toBe(-32002);
+			expect(Object.keys(over.data)).toEqual(['retry_after']);
 		} finally { second.close(); }
 	});
 

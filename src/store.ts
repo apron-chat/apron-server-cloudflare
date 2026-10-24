@@ -30,7 +30,7 @@ import {
   type CostEstimate,
   type RawBudgetRow,
 } from "./budget-ledger";
-import { StoreError } from "./store-error";
+import { StoreError, limitData, type LimitCategory } from "./store-error";
 import { bucketHorizonMs, chargeBucket, type Bucket, type Rate } from "./limiter";
 import { LimiterCache, type RawLimitRow } from "./limiter-cache";
 import { isStatusChoice, type StatusChoice } from "./presence";
@@ -2794,11 +2794,11 @@ export class Store {
         const retry = Math.max(1, 86_400_000 - now % 86_400_000);
         if (retry > retryAfterMs) {
           retryAfterMs = retry;
-          reason = index === 2 ? "Demo is read-only until daily reset" : "Daily posting limit reached";
+          reason = index === 2 ? "Daily posting limit reached for the server" : "Daily posting limit reached";
         }
       }
     }
-    if (retryAfterMs > 0) throw new StoreError("retry_after", reason, { retryAfterMs, data: { limit: "post" } });
+    if (retryAfterMs > 0) throw new StoreError("retry_after", reason, { retryAfterMs, data: limitData("write") });
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index];
       const dailyCount = (row.day === daily ? row.posts_day : 0) + weight;
@@ -2809,17 +2809,19 @@ export class Store {
   /**
    * Charges one event to a principal's `scope` limiter at `rate`, and, with
    * `perDay`, to its count for the UTC day (kept in `posts_day`; the scope
-   * separates it from posts), or neither when either is full.
+   * separates it from posts), or neither when either is full. A refusal
+   * names `category`, if any, as `ext.limits` (limitData).
    */
-  private chargeEvent(scope: string, principalKey: string, now: number, rate: Rate, message: string, perDay?: { limit: number; message: string }): void {
+  private chargeEvent(scope: string, principalKey: string, now: number, rate: Rate, message: string, perDay?: { limit: number; message: string }, category?: LimitCategory): void {
+    const data = category ? limitData(category) : undefined;
     const row = this.limitRow(scope, principalKey, now);
     const day = dayFor(now);
     const count = row.day === day ? row.posts_day : 0;
     if (perDay && count >= perDay.limit) {
-      throw new StoreError("retry_after", perDay.message, { retryAfterMs: Math.max(1000, 86_400_000 - now % 86_400_000), data: { limit: scope } });
+      throw new StoreError("retry_after", perDay.message, { retryAfterMs: Math.max(1000, 86_400_000 - now % 86_400_000), data });
     }
     const charged = chargeBucket(bucketOf(row), now, rate);
-    if ("retryAfterMs" in charged) throw new StoreError("retry_after", message, { retryAfterMs: Math.max(1000, charged.retryAfterMs), data: { limit: scope } });
+    if ("retryAfterMs" in charged) throw new StoreError("retry_after", message, { retryAfterMs: Math.max(1000, charged.retryAfterMs), data });
     this.updateLimitRow(row, perDay ? { ...bucketRow(charged.bucket), day, posts_day: count + 1 } : bucketRow(charged.bucket), now);
   }
 
@@ -2868,14 +2870,14 @@ export class Store {
         const row = this.limitRow("frames", `ip:${input.ipKey}`, effective);
         const charged = chargeBucket(bucketOf(row), effective, { perMinute: this.config.framesPerIpMinute }, count);
         if ("retryAfterMs" in charged) {
-          throw new StoreError("retry_after", "Frame rate limit reached", { retryAfterMs: Math.max(1000, charged.retryAfterMs), data: { limit: "frames" } });
+          throw new StoreError("retry_after", "Frame rate limit reached", { retryAfterMs: Math.max(1000, charged.retryAfterMs) });
         }
         this.updateLimitRow(row, bucketRow(charged.bucket), effective, count);
         const global = this.limitRow("frames", "global", effective);
         const day = dayFor(effective);
         const globalCount = global.day === day ? global.posts_day : 0;
         if (globalCount + count > this.config.processedFramesPerDay) {
-          throw new StoreError("retry_after", "Daily frame budget exhausted", { retryAfterMs: 86_400_000, data: { reason: "frame_budget", limit: "frames" } });
+          throw new StoreError("retry_after", "Daily frame budget exhausted", { retryAfterMs: 86_400_000, data: { reason: "frame_budget" } });
         }
         this.updateLimitRow(global, { day, posts_day: globalCount + count }, effective);
       });
@@ -2890,10 +2892,10 @@ export class Store {
     const globalCount = global.day === day ? global.registrations_day : 0;
     const retryAfterMs = Math.max(1, 86_400_000 - now % 86_400_000);
     if (ipCount >= this.config.registrationsPerIpDay) {
-      throw new StoreError("retry_after", "Registration limit reached for this network", { retryAfterMs, data: { limit: "registration" } });
+      throw new StoreError("retry_after", "Registration limit reached for this network", { retryAfterMs });
     }
     if (globalCount >= this.config.registrationsPerDay) {
-      throw new StoreError("retry_after", "Registration limit reached", { retryAfterMs, data: { limit: "registration" } });
+      throw new StoreError("retry_after", "Registration limit reached", { retryAfterMs });
     }
     this.updateLimitRow(ip, { day, registrations_day: ipCount + 1 }, now);
     this.updateLimitRow(global, { day, registrations_day: globalCount + 1 }, now);
@@ -3141,7 +3143,7 @@ export class Store {
         // IP permanently consume global capacity independently.
         const global = this.limitRow("admission", "global", now);
         const admissions = global.day === day ? global.posts_day : 0;
-        if (admissions >= this.config.connectionAdmissionsPerDay) throw new StoreError("retry_after", "Connection admission limit reached", { retryAfterMs: 86_400_000, data: { limit: "admission" } });
+        if (admissions >= this.config.connectionAdmissionsPerDay) throw new StoreError("retry_after", "Connection admission limit reached", { retryAfterMs: 86_400_000 });
         this.updateLimitRow(global, { day, posts_day: admissions + 1 }, now);
         // Live connection caps are authoritative in ctx.getWebSockets(), which
         // includes closing sockets and survives object hibernation.  Durable
@@ -3151,7 +3153,7 @@ export class Store {
         const frames = this.limitRow("frames", "global", now);
         const frameCount = frames.day === day ? frames.posts_day : 0;
         if (frameCount >= this.config.processedFramesPerDay) {
-          throw new StoreError("retry_after", "Daily frame budget exhausted", { retryAfterMs: 86_400_000, data: { reason: "frame_budget", limit: "frames" } });
+          throw new StoreError("retry_after", "Daily frame budget exhausted", { retryAfterMs: 86_400_000, data: { reason: "frame_budget" } });
         }
       });
     });
@@ -3796,11 +3798,11 @@ export class Store {
     const rows = [this.limitRow("upload", `user:${userId}`, now), this.limitRow("upload", "global", now)];
     const counts = rows.map((row) => (row.day === day ? row.uploads_day : 0));
     const untilReset = Math.max(1, 86_400_000 - now % 86_400_000);
-    if (counts[1] >= policy.uploadsPerDay) throw new StoreError("retry_after", "Uploads are closed until the daily reset", { retryAfterMs: untilReset, data: { limit: "upload" } });
-    if (counts[0] >= policy.uploadsPerUserDay) throw new StoreError("retry_after", "Daily upload limit reached", { retryAfterMs: untilReset, data: { limit: "upload" } });
+    if (counts[1] >= policy.uploadsPerDay) throw new StoreError("retry_after", "Daily upload limit reached for the server", { retryAfterMs: untilReset, data: limitData("upload") });
+    if (counts[0] >= policy.uploadsPerUserDay) throw new StoreError("retry_after", "Daily upload limit reached", { retryAfterMs: untilReset, data: limitData("upload") });
     const stored = this.metaNumber(META_UPLOAD_BYTES);
     if (stored + maxBytes > policy.storedBytesCap) {
-      throw new StoreError("retry_after", "Upload storage is full; try again later", { retryAfterMs: 3_600_000, data: { limit: "upload" } });
+      throw new StoreError("retry_after", "Upload storage is full", { retryAfterMs: 3_600_000, data: limitData("upload") });
     }
     this.updateLimitRow(rows[0], { day, uploads_day: counts[0] + 1 }, now);
     this.setUploadBytes(stored + maxBytes);
@@ -4921,11 +4923,11 @@ export class Store {
             this.chargeEvent("history", `user:${query.userId}`, now,
               { perMinute: this.config.historyRequestsPerUserMinute, burst: this.config.historyBurstPerUser },
               "History request limit reached",
-              { limit: this.config.historyRequestsPerUserDay, message: "Daily history limit reached" });
+              { limit: this.config.historyRequestsPerUserDay, message: "Daily history limit reached" }, "read");
             this.chargeEvent("history", `ip:${query.ipKey}`, now,
               { perMinute: this.config.historyRequestsPerIpMinute, burst: this.config.historyBurstPerIp },
               "History request limit reached",
-              { limit: this.config.historyRequestsPerIpDay, message: "Daily history limit reached for this network" });
+              { limit: this.config.historyRequestsPerIpDay, message: "Daily history limit reached for this network" }, "read");
           }
           return this.historyPageInternal({ ...query, now });
         });

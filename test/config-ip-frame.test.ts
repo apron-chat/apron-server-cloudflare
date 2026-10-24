@@ -213,7 +213,7 @@ describe('configuration policy boundaries', () => {
 			try { store.reserveFrames({ ipKey: 'frame-budget-other-ip', now: clock.value, count: 1 }); }
 			catch (caught) { error = caught; }
 			expect(error).toBeInstanceOf(StoreError);
-			expect((error as StoreError).data).toEqual({ reason: 'frame_budget', limit: 'frames' });
+			expect((error as StoreError).data).toEqual({ reason: 'frame_budget' });
 		});
 	});
 	it('bounds the server-wide frame minute', () => {

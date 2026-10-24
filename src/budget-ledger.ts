@@ -13,7 +13,7 @@
  */
 
 import { MAINTENANCE_CONTROL_RESERVE } from "./budget";
-import { StoreError } from "./store-error";
+import { StoreError, limitData } from "./store-error";
 
 export interface CostEstimate {
   reads?: number;
@@ -450,7 +450,7 @@ export class BudgetLedger {
     const limits = this.limits;
     if (cost.history > 0 && row.history_reserved + cost.history > limits.historyRequestsPerDay) {
       // A refusal like any other: no SQL, and the SQL budget stays for everything else.
-      throw new StoreError("retry_after", "History is busy until the daily reset", { retryAfterMs: untilNextDay(at), data: { limit: "history" } });
+      throw new StoreError("retry_after", "Daily history limit reached for the server", { retryAfterMs: untilNextDay(at), data: limitData("read") });
     }
     const readCeiling = maintenance ? limits.sqlReadsPerDay : limits.foregroundReadsPerDay;
     const writeCeiling = maintenance ? limits.sqlWritesPerDay : limits.foregroundWritesPerDay;

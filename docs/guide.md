@@ -13,7 +13,7 @@ replacement/deletion/restoration/moves, thread rooms, emoji reactions, and a
 rolling retention floor. Guests only read (set `GUEST_POSTING=true` to let
 them post); signing in with a passkey lets a user post and invite a bot. It speaks protocol 9 with `history`,
 `edit`, `rooms`, `reactions`, `command` (`/help`, `/invite-bot`, and admin
-commands), and `ext` with its own extension `ext:settings`; `embed:upload`
+commands), and `ext` with its own extension `ext:settings`, and `ext:limits`; `embed:upload`
 when uploads are configured; `status` and push when VAPID keys are set; and
 liveness pings and, with the Workers Paid budgets, typing through `activity`
 (`ACTIVITY` overrides); see [authentication and policy](policy.md) and [the
@@ -252,8 +252,9 @@ Matching accepted request retries consume lookup and frame resources, but do
 not post again. Request deduplication lasts 24 hours.
 
 Temporary limits return `retry_after` with `data.retry_after` (whole
-seconds) and `data.limit`, the limit's name (`history`, `post`, `upload`, …:
-SPEC section 6); clients back off. Daily
+seconds) and, for a reading, posting or upload limit, `data.ext.limits`
+(`read`, `write` or `upload`: extension `ext:limits`, defined in apron-web's
+EXT.md; SPEC section 6), which says what to hold back; clients back off. Daily
 posting/write exhaustion makes the demo read-only while affordable reads remain
 available. History exhaustion returns an error. Registration caps do not revoke
 existing passkeys. Permanent identity/thread-room caps return `denied`. Storage

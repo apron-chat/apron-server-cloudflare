@@ -123,6 +123,77 @@ it('returns the longest applicable retry window and never replenishes on a backw
 	});
 });
 
+it('names every posting refusal `write` (ext:limits), memberships and reactions included', async () => {
+	await runInDurableObject(env.DEMO.getByName('quota-limits-write'), (_instance, state) => {
+		let now = (Math.floor(Date.now() / DAY) + 1) * DAY + 43_200_000;
+		const store = new Store(state, { registeredPostsPerMinute: 2, registeredPostsPerDay: 3, anonymousPostsPerMinute: 1, globalPostsPerDay: 5 }, { now: () => now });
+		const refusal = (fn: () => unknown): StoreError => {
+			try { fn(); } catch (error) { expectRetryAfter(error); return error; }
+			throw new Error('expected a refusal');
+		};
+		for (const userId of ['poster', 'other']) store.registerIdentity({
+			userId, name: userId, userHandle: userId, ipKey: `${userId}-ip`, now,
+			credential: { credentialId: userId, userId, publicKey: 'fixture-policy-only', counter: 0 },
+		});
+		const write = { ext: { limits: 'write' } };
+		const post = (userId: string) => store.mutate({ userId, ipKey: `${userId}-ip`, method: 'message', now,
+			identity: { user_id: userId }, params: { room_id: 'general', body: { text: 'bounded' } } });
+		const first = post('poster');
+		post('poster');
+		// The minute's limit, for a post, a reaction, a leave, and a profile change alike.
+		const minute = refusal(() => post('poster'));
+		expect(minute.message).toBe('Posting limit reached');
+		expect(minute.data).toEqual(write);
+		expect(refusal(() => store.mutate({ userId: 'poster', ipKey: 'poster-ip', method: 'reactions', now, identity: { user_id: 'poster' },
+			params: { message_id: first.result.message_id, reactions: ['👍'] } })).data).toEqual(write);
+		expect(refusal(() => store.changeMembership({ userId: 'poster', ipKey: 'poster-ip', roomId: 'general', join: false, now })).data).toEqual(write);
+		expect(refusal(() => store.mutate({ userId: 'poster', ipKey: 'poster-ip', method: 'me', now, identity: { user_id: 'poster' },
+			params: { name: 'Renamed' } })).data).toEqual(write);
+		// A guest's own.
+		post('guest');
+		const guest = refusal(() => post('guest'));
+		expect(guest.message).toBe('Guest posting limit reached');
+		expect(guest.data).toEqual(write);
+		// The day's, the poster's and then the server's.
+		now += 60_000;
+		post('poster');
+		const daily = refusal(() => post('poster'));
+		expect(daily.message).toBe('Daily posting limit reached');
+		expect(daily.data).toEqual(write);
+		post('other');
+		const server = refusal(() => post('other'));
+		expect(server.message).toBe('Daily posting limit reached for the server');
+		expect(server.data).toEqual(write);
+	});
+});
+
+it('names no category for refusals that are not posting, reading or upload limits', async () => {
+	await runInDurableObject(env.DEMO.getByName('quota-limits-none'), (_instance, state) => {
+		const now = (Math.floor(Date.now() / DAY) + 1) * DAY + 43_200_000;
+		const store = new Store(state, { authAttemptsPerIpMinute: 1, connectionAdmissionsPerIpMinute: 1, framesPerIpMinute: 1, registrationsPerIpDay: 1 }, { now: () => now });
+		const refusal = (fn: () => unknown): StoreError => {
+			try { fn(); } catch (error) { expectRetryAfter(error); return error; }
+			throw new Error('expected a refusal');
+		};
+		store.reserveAuthAttempt({ ipKey: 'ip', now });
+		const auth = refusal(() => store.reserveAuthAttempt({ ipKey: 'ip', now }));
+		expect(auth.message).toBe('Authentication attempts limited');
+		expect(auth.data).toBeUndefined();
+		store.reserveConnection({ ipKey: 'ip', now });
+		expect(refusal(() => store.reserveConnection({ ipKey: 'ip', now })).data).toBeUndefined();
+		store.reserveFrames({ ipKey: 'ip', now });
+		expect(refusal(() => store.reserveFrames({ ipKey: 'ip', now })).data).toBeUndefined();
+		const register = (userId: string) => store.registerIdentity({
+			userId, name: userId, userHandle: userId, ipKey: 'ip', now,
+			credential: { credentialId: userId, userId, publicKey: 'fixture-policy-only', counter: 0 },
+		});
+		register('first');
+		const registration = refusal(() => register('second'));
+		expect(registration.message).toBe('Registration limit reached for this network');
+		expect(registration.data).toBeUndefined();
+	});
+});
+
 describe('history quota', () => {
 	const noon = () => (Math.floor(Date.now() / DAY) + 1) * DAY + 43_200_000;
 	const refusal = (fn: () => unknown): StoreError => {
@@ -138,8 +209,8 @@ describe('history quota', () => {
 			for (let index = 0; index < 6; index++) page('reader');
 			const refused = refusal(() => page('reader'));
 			expect(refused.message).toBe('History request limit reached');
-			// Named for clients, which tell limits apart by it (data.limit).
-			expect(refused.data).toEqual({ limit: 'history' });
+			// Its category for clients (`ext:limits`): only history is held back.
+			expect(refused.data).toEqual({ ext: { limits: 'read' } });
 			// Two a minute: one every 30 s.
 			expect(refused.retryAfterMs).toBe(30_000);
 			// Another user on the same address has the IP's 2 left.
@@ -159,13 +230,13 @@ describe('history quota', () => {
 			for (let index = 0; index < 3; index++) page('reader');
 			const daily = refusal(() => page('reader'));
 			expect(daily.message).toBe('Daily history limit reached');
-			expect(daily.data).toEqual({ limit: 'history' });
+			expect(daily.data).toEqual({ ext: { limits: 'read' } });
 			expect(daily.retryAfterMs).toBe(DAY / 2);
 			page('neighbour');
 			page('neighbour');
 			const network = refusal(() => page('neighbour'));
 			expect(network.message).toBe('Daily history limit reached for this network');
-			expect(network.data).toEqual({ limit: 'history' });
+			expect(network.data).toEqual({ ext: { limits: 'read' } });
 			// Elsewhere the reader is still at their own daily count.
 			expect(refusal(() => page('reader', 'office')).message).toBe('Daily history limit reached');
 			now += DAY / 2;
@@ -186,8 +257,8 @@ describe('history quota', () => {
 			page('other');
 			page('other');
 			const busy = refusal(() => page('third'));
-			expect(busy.message).toBe('History is busy until the daily reset');
-			expect(busy.data).toEqual({ limit: 'history' });
+			expect(busy.message).toBe('Daily history limit reached for the server');
+			expect(busy.data).toEqual({ ext: { limits: 'read' } });
 			expect(busy.retryAfterMs).toBe(DAY / 2);
 			// Everything else goes on.
 			store.registerIdentity({

@@ -45,7 +45,7 @@ const connect = ({ ip = `192.0.2.${nextIp++}`, ...options }: Partial<ConnectOpti
 async function authenticate(peer: Peer, scheme = 'guest', extraCaps: string[] = []) {
 	const { server } = await greeting(peer);
 	expect(server.params.apron).toBe(9);
-	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'status', 'ext', 'ext:settings']);
+	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'status', 'ext', 'ext:settings', 'ext:limits']);
 	expect(server.params.auth).toContain('webauthn');
 	expect(server.params.ping).toBe(45);
 	// The extension `ext:settings` keeps its data under its name in ext (§4, §4.12).
@@ -329,8 +329,9 @@ it('counts guest posting across sockets and returns retained retries after posti
 		expect(limited.error.code).toBe(-32002);
 		expect(Number.isInteger(limited.error.data.retry_after)).toBe(true);
 		expect(limited.error.data.retry_after).toBeGreaterThanOrEqual(1);
-		// Which limit refused it, for clients to tell limits apart.
-		expect(limited.error.data.limit).toBe('post');
+		// Its category (`ext:limits`): a posting limit holds back every write.
+		expect(limited.error.data.ext).toEqual({ limits: 'write' });
+		expect(limited.error.data.limit).toBeUndefined();
 		first.send({ id: 'post-0', method: 'message', params: { room_id: 'general', body: { text: 'post-0' } } });
 		expect((await first.next()).result).toEqual(accepted);
 	} finally { first.close(); second.close(); }
@@ -583,6 +584,17 @@ it('leaves activity off when ACTIVITY is false: not advertised, and typing is no
 	} finally { alice.close(); bob.close(); }
 });
 
+it('names a history refusal `read` (ext:limits), with no amount or delay in its message', async () => {
+	// No page may be in flight: every history request is the one refused.
+	await configure((config) => { config.limits.concurrentHistoryPerConnection = 0; });
+	const peer = await connect();
+	try {
+		await authenticate(peer);
+		const refused = (await request(peer, 'busy-history', 'history', { room_id: 'general' })).error;
+		expect(refused).toEqual({ code: -32002, message: 'History request already in progress', data: { retry_after: 1, ext: { limits: 'read' } } });
+	} finally { peer.close(); await configure((config) => { config.limits.concurrentHistoryPerConnection = DEFAULT_LIMITS.concurrentHistoryPerConnection; }); }
+});
+
 it('limits the frames the whole server processes in a minute without closing sockets', async () => {
 	await configure((config) => { config.limits.globalFramesPerMinute = 4; });
 	const peer = await connect();
@@ -593,6 +605,9 @@ it('limits the frames the whole server processes in a minute without closing soc
 		}
 		const busy = (await request(peer, 'busy', 'me', {})).error;
 		expect(busy.code).toBe(-32002);
+		expect(busy.message).toBe('Demo is busy with too many requests');
+		// A frame limit holds back everything, so it names no category (`ext:limits`).
+		expect(busy.data).toEqual({ retry_after: busy.data.retry_after });
 		expect(busy.data.retry_after).toBeGreaterThan(0);
 		// The socket stays open and is served again once the limit allows it.
 		await configure((config) => { config.limits.globalFramesPerMinute = DEFAULT_LIMITS.globalFramesPerMinute; });
@@ -736,6 +751,8 @@ it('lists rooms by filter, most recently active first, with members on request, 
 		const limited = (await request(alice, 'limited', 'room_list', { filter: 'joined' })).error;
 		expect(limited.code).toBe(-32002);
 		expect(limited.data.retry_after).toBeGreaterThan(0);
+		// Its category (`ext:limits`): only room_list is held back.
+		expect(limited.data.ext).toEqual({ limits: 'read' });
 		// Browsing top-level rooms from general needs no listing and is not limited.
 		expect((await request(alice, 'browse', 'room_list', { filter: 'not_joined' })).result).toEqual({ not_joined: [] });
 		expect((await request(alice, 'browse-members', 'room_list', { filter: 'not_joined', members: true })).result).toEqual({ not_joined: [], users: [] });
@@ -856,11 +873,12 @@ it('never closes the connection whose frame starts a sweep as stale, though it l
 	} finally { vi.restoreAllMocks(); alice.close(); bob.close(); await configure((config) => { config.limits.pingTimeoutSeconds = 150; }); }
 });
 
-it('advertises the extension ext:settings', async () => {
+it('advertises the extensions ext:settings and ext:limits', async () => {
 	const peer = await connect();
 	try {
 		const server = (await peer.next()).params;
 		expect(server.capabilities).toContain('ext:settings');
+		expect(server.capabilities).toContain('ext:limits');
 		// Each boolean always sent; clients take an absent one as true.
 		expect(server.ext).toEqual({ settings: {
 			// vitest.config.ts turns guest posting on.

@@ -164,8 +164,8 @@ describe('store uploads', () => {
 			try { post(store, clock, 'carol', { body: { embeds: [{ kind: 'upload' }] } }); } catch (caught) { error = caught; }
 			expectRetryAfter(error);
 			expect((error as Error).message).toBe('Daily upload limit reached');
-			// Named for clients, which tell limits apart by it (data.limit).
-			expect(error.data).toEqual({ limit: 'upload' });
+			// Its category for clients (`ext:limits`): only requests with uploads are held back.
+			expect(error.data).toEqual({ ext: { limits: 'upload' } });
 			// The server's count is charged by writes claimed, not uploads started:
 			// Carol's two and Dave's two started, none written, leave it open.
 			const daves = keys(post(store, clock, 'dave', { body: { embeds: [{ kind: 'upload' }, { kind: 'upload' }] } }).result);
@@ -173,13 +173,13 @@ describe('store uploads', () => {
 			// Three claimed: Dave's other write is refused until the reset, and no upload starts.
 			expect(store.claimUpload(daves[1], clock.value)).toBe('closed');
 			try { post(store, clock, 'erin', { body: { embeds: [{ kind: 'upload' }] } }); } catch (caught) { error = caught; }
-			expect((error as Error).message).toBe('Uploads are closed until the daily reset');
-			expect((error as StoreError).data).toEqual({ limit: 'upload' });
+			expect((error as Error).message).toBe('Daily upload limit reached for the server');
+			expect((error as StoreError).data).toEqual({ ext: { limits: 'upload' } });
 			// A new day resets the counts, but the bytes still held count against the cap.
 			clock.value += 86_400_000;
 			try { post(store, clock, 'dave', { body: { embeds: [{ kind: 'upload' }] } }); } catch (caught) { error = caught; }
-			expect((error as Error).message).toBe('Upload storage is full; try again later');
-			expect((error as StoreError).data).toEqual({ limit: 'upload' });
+			expect((error as Error).message).toBe('Upload storage is full');
+			expect((error as StoreError).data).toEqual({ ext: { limits: 'upload' } });
 			store.startAvatarUpload({ userId: 'dave', now: clock.value });
 		});
 	});

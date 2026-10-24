@@ -313,7 +313,7 @@ it('does not count a closing connection against the per-user limit on resume', a
 		open.push(peer);
 	}
 	const refused = await resume(token, 'four');
-	expect(refused.reply.error).toEqual(expect.objectContaining({ code: -32002, message: 'Demo capacity reached' }));
+	expect(refused.reply.error).toEqual(expect.objectContaining({ code: -32002, message: 'Connection limit reached for this account', data: { retry_after: 60 } }));
 	refused.peer.close();
 
 	// One of them dropped and its close is on the way: its replacement resumes.
