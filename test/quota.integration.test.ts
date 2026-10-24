@@ -221,7 +221,7 @@ describe('history quota', () => {
 		});
 	});
 
-	it('charges one written row a page, the budget row with the clock, and the limiter rows once a minute', async () => {
+	it('charges one written row a page, the budget row with the clock, and the limiter rows every fourth page and once a minute', async () => {
 		await runInDurableObject(env.DEMO.getByName('quota-history-cost'), (_instance, state) => {
 			let now = noon();
 			const store = new Store(state, {}, { now: () => now });
@@ -237,14 +237,69 @@ describe('history quota', () => {
 				now += 1_000;
 				writes.push(charged(page));
 			}
-			expect(writes).toEqual([1, 1, 1, 1, 1]);
-			// A minute on, the user's and the IP's limiter rows are written (each with its index entry).
+			// The first page wrote both limiter rows; the fourth after it holds LIMITER_UNWRITTEN_EVENTS
+			// unwritten, so the user's and the IP's rows are written (each with its index entry).
+			expect(writes).toEqual([1, 1, 1, 5, 1]);
+			// A minute on, they are written whatever they hold.
 			now += 60_000;
 			expect(charged(page)).toBe(5);
 			// A refused page is charged only the budget row.
 			const limited = new Store(state, { historyBurstPerUser: 1, historyRequestsPerUserMinute: 1 }, { now: () => now });
 			limited.history({ roomId: 'general', limit: 1, now, userId: 'limited', ipKey: 'home' });
 			expect(charged(() => refusal(() => limited.history({ roomId: 'general', limit: 1, now, userId: 'limited', ipKey: 'home' })))).toBe(1);
+		});
+	});
+
+	it('holds a daily cap within a few pages however often the object is evicted', async () => {
+		await runInDurableObject(env.DEMO.getByName('quota-history-eviction-cycles'), (_instance, state) => {
+			let now = noon();
+			// Durable Objects hibernate ten seconds after their last event, sockets open or not:
+			// each cycle is a fresh Store over the same storage, 15 s after the last.
+			const cycles = (config: Record<string, number>, page: (store: Store, index: number) => unknown) => {
+				let served = 0;
+				for (let cycle = 0; cycle < 10; cycle++) {
+					now += 15_000;
+					const store = new Store(state, config, { now: () => now });
+					for (let index = 0; index < 5; index++) {
+						try { page(store, index); served += 1; } catch (error) { expectRetryAfter(error); }
+						now += 1_000;
+					}
+				}
+				return served;
+			};
+			// One user, five pages a wake, against a daily cap of 3: 21 were served when a wake
+			// forgot every charge since the row's last write. Each wake writes its first charge:
+			// now 3, then 2, then 1 (within the cap plus 6, limiter-cache.ts).
+			const user = cycles({ historyRequestsPerUserDay: 3 }, (store) => store.history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'reader-ip' }));
+			expect(user).toBe(6);
+			expect(new Store(state, {}, { now: () => now }).limiterDay('history', 'user:reader', now).posts_day).toBe(3);
+			// The IP's cap, which keeps one network from using up the server's count, the same way.
+			const network = cycles({ historyRequestsPerIpDay: 3 }, (store, index) => store.history({ roomId: 'general', limit: 1, now, userId: `neighbour-${now}-${index}`, ipKey: 'shared-ip' }));
+			expect(network).toBe(6);
+			expect(new Store(state, {}, { now: () => now }).limiterDay('history', 'ip:shared-ip', now).posts_day).toBe(3);
+		});
+	});
+
+	it('keeps, written, a limiter row that cleanup finds idle in SQL while its cached copy holds charges', async () => {
+		await runInDurableObject(env.DEMO.getByName('quota-history-cleanup'), (_instance, state) => {
+			let now = noon() + 10 * 3_600_000;
+			const config = { historyRequestsPerUserDay: 2 };
+			const page = (store: Store) => store.history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' });
+			page(new Store(state, config, { now: () => now }));
+			// 00:30 the next day, after an eviction: the first page is written, the second held.
+			const lastWritten = now;
+			now += 2.5 * 3_600_000;
+			const store = new Store(state, config, { now: () => now });
+			page(store);
+			now += 1_000;
+			page(store);
+			// As if the held copy's row had last been written before today: cleanup finds it idle.
+			state.storage.sql.exec("UPDATE principal_limits SET updated_ms = ? WHERE principal_key = 'user:reader'", lastWritten);
+			now += 1_000;
+			store.runCleanup(now);
+			expect(state.storage.sql.exec("SELECT posts_day FROM principal_limits WHERE scope = 'history' AND principal_key = 'user:reader'").toArray()).toEqual([{ posts_day: 2 }]);
+			expect(refusal(() => page(store)).message).toBe('Daily history limit reached');
+			expect(refusal(() => page(new Store(state, config, { now: () => now }))).message).toBe('Daily history limit reached');
 		});
 	});
 

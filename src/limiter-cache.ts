@@ -1,19 +1,29 @@
 /*
  * The limiter-row cache: a user's or an IP's `principal_limits` row in a
- * minute-limited scope (CACHED_LIMIT_SCOPES), kept in memory and written at
- * most once a minute.
+ * minute-limited scope (CACHED_LIMIT_SCOPES), kept in memory and written
+ * every few charges.
  *
  * Server-wide totals keep the deployment's bill bounded and stay written
- * through; a principal's own limits may be approximate. So a cached row
- * changes in memory and is written once LIMITER_FLUSH_MS has passed since it
- * last was, on a new UTC day, and on its first charge; past
+ * through; a principal's own limits may be approximate, within a bound. So a
+ * cached row changes in memory and is written on its first charge since it
+ * was read or inserted, once LIMITER_FLUSH_MS has passed since it last was,
+ * on a new UTC day, and once it holds LIMITER_UNWRITTEN_EVENTS events it has
+ * not written (a post or frame block counting its weight); past
  * LIMITER_CACHE_ROWS the least recently used row is written (if it must be)
- * and dropped. An eviction forgets at most the last minute of one
- * principal's charges. Inside a storage transaction every entry changed is
- * journaled first, so a rollback restores the cache with the rows.
+ * and dropped. Inside a storage transaction every entry changed is journaled
+ * first, so a rollback restores the cache with the rows.
+ *
+ * The bound: an eviction (Durable Objects hibernate seconds after their last
+ * event, sockets open or not) forgets at most LIMITER_UNWRITTEN_EVENTS - 1
+ * events of each row, of its bucket and its day count alike. As the first
+ * charge after every wake is written, each wake that charges a row moves its
+ * stored count on by at least one for at most three forgotten: a principal
+ * that runs to a daily cap of N between evictions is admitted at most N + 6
+ * (3, then 2, then 1 forgotten), and none more than LIMITER_UNWRITTEN_EVENTS
+ * × N, however its charges and the evictions interleave.
  *
  * The store keeps the SQL: it reads and inserts rows and hands them over
- * (`loaded`, `created`), and the cache writes through its host.
+ * (`loaded`), and the cache writes through its host.
  */
 
 const MINUTE_MS = 60 * 1000;
@@ -29,6 +39,8 @@ export const CACHED_LIMIT_SCOPES: ReadonlySet<string> = new Set(["post", "histor
 export const LIMITER_FLUSH_MS = MINUTE_MS;
 /** Cached limiter rows at most; past it the least recently used one is written (if it must be) and dropped. */
 export const LIMITER_CACHE_ROWS = 256;
+/** Events a cached row may hold unwritten, less one: the one that reaches it is written with the rest. */
+export const LIMITER_UNWRITTEN_EVENTS = 4;
 
 export interface RawLimitRow {
   scope: string;
@@ -49,11 +61,17 @@ export interface LimiterCacheHost {
   write(row: RawLimitRow, now: number): void;
 }
 
-/** A row as cached: `dirty` when it holds changes not yet written, last written at `writtenMs`. */
+/**
+ * A row as cached: `dirty` when it holds changes not yet written, `unwritten`
+ * events of them, the last at `changedMs`; last written by this instance at
+ * `writtenMs`, -Infinity when not since it was read or inserted.
+ */
 interface Entry {
   row: RawLimitRow;
   writtenMs: number;
   dirty: boolean;
+  unwritten: number;
+  changedMs: number;
 }
 
 function idOf(scope: string, principalKey: string): string {
@@ -93,42 +111,59 @@ export class LimiterCache {
     return hit ? { ...hit.row } : undefined;
   }
 
-  /** Caches a row just read from storage, as written at `now`. */
+  /**
+   * Caches a row just read from storage or inserted, as not written since:
+   * its first charge is written, so a wake (which reads it again) never
+   * starts it over from what the previous instance last wrote.
+   */
   loaded(row: RawLimitRow, now: number): void {
     if (!this.covers(row.scope, row.principal_key)) return;
-    this.set(idOf(row.scope, row.principal_key), { row: { ...row }, writtenMs: now, dirty: false }, now);
-  }
-
-  /** Caches a row just inserted. Never written since: its first charge writes through, so it survives an eviction. */
-  created(row: RawLimitRow, now: number): void {
-    if (!this.covers(row.scope, row.principal_key)) return;
-    this.set(idOf(row.scope, row.principal_key), { row: { ...row }, writtenMs: -Infinity, dirty: false }, now);
+    this.set(idOf(row.scope, row.principal_key), { row: { ...row }, writtenMs: -Infinity, dirty: false, unwritten: 0, changedMs: -Infinity }, now);
   }
 
   /**
-   * Takes a covered row's new counters. They stay in memory while the row
-   * was last written within LIMITER_FLUSH_MS and the same UTC day; otherwise
-   * they are written now, `updated_ms` with them.
+   * Takes a covered row's new counters, charging `weight` events. They stay
+   * in memory while this instance wrote the row within LIMITER_FLUSH_MS and
+   * the same UTC day, and it holds fewer than LIMITER_UNWRITTEN_EVENTS events
+   * unwritten with them; otherwise they are written now, `updated_ms` with them.
    */
-  change(next: RawLimitRow, now: number): void {
+  change(next: RawLimitRow, now: number, weight = 1): void {
     const id = idOf(next.scope, next.principal_key);
     const entry = this.entries.get(id);
     const dayStart = Math.floor(now / DAY_MS) * DAY_MS;
-    if (entry && now - entry.writtenMs < LIMITER_FLUSH_MS && entry.writtenMs >= dayStart) {
-      this.set(id, { row: { ...next }, writtenMs: entry.writtenMs, dirty: true }, now);
+    const unwritten = (entry?.unwritten ?? 0) + weight;
+    if (entry && now - entry.writtenMs < LIMITER_FLUSH_MS && entry.writtenMs >= dayStart && unwritten < LIMITER_UNWRITTEN_EVENTS) {
+      this.set(id, { row: { ...next }, writtenMs: entry.writtenMs, dirty: true, unwritten, changedMs: now }, now);
       return;
     }
     this.host.write(next, now);
-    this.set(id, { row: { ...next, updated_ms: now }, writtenMs: now, dirty: false }, now);
+    this.set(id, { row: { ...next, updated_ms: now }, writtenMs: now, dirty: false, unwritten: 0, changedMs: -Infinity }, now);
   }
 
-  /** Writes what a cached row holds and has not written, and uncaches it: the store is about to change it in SQL. */
-  writeOut(scope: string, principalKey: string, now: number): void {
+  /**
+   * Writes what a cached row holds and has not written, and uncaches it: the
+   * store is about to change it in SQL. True when it wrote.
+   */
+  writeOut(scope: string, principalKey: string, now: number): boolean {
     const id = idOf(scope, principalKey);
     const entry = this.entries.get(id);
-    if (!entry) return;
+    if (!entry) return false;
     if (entry.dirty) this.host.write(entry.row, now);
     this.remove(id);
+    return entry.dirty;
+  }
+
+  /**
+   * Before cleanup deletes a row idle in storage since before `cutoff`: when
+   * the cached copy holds changes made since then, which may still count,
+   * writes it (making it recent again) and returns true, for the store to
+   * keep it; otherwise uncaches it unwritten.
+   */
+  keepIfChanged(scope: string, principalKey: string, cutoff: number, now: number): boolean {
+    const entry = this.entries.get(idOf(scope, principalKey));
+    if (entry?.dirty && entry.changedMs >= cutoff) return this.writeOut(scope, principalKey, now);
+    this.drop(scope, principalKey);
+    return false;
   }
 
   /** Uncaches a row unwritten: the store deleted it. */

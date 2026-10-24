@@ -78,10 +78,11 @@ export const RETENTION_MS = DEFAULT_LIMITS.retentionSeconds * 1000;
 const DEDUP_TTL_MS = DEFAULT_LIMITS.dedupTtlSeconds * 1000;
 const MINUTE_MS = 60 * 1000;
 /**
- * A limiter row's `updated_ms` moves at most once a minute (and on a new UTC
- * day), so a busy principal rewrites its index entry once a minute rather
- * than on every charge. Cleanup keeps rows touched within this long, which
- * must outlast any limiter's horizon (bucketHorizonMs) plus that minute.
+ * A limiter row's `updated_ms` moves only when a cached row is written
+ * (limiter-cache.ts: every few charges), or another is a minute old or from
+ * an earlier UTC day, so a busy principal rewrites its index entry rarely
+ * rather than on every charge. Cleanup keeps rows touched within this long,
+ * which must outlast any limiter's horizon (bucketHorizonMs) plus a minute.
  */
 const LIMITER_IDLE_MS = 60 * MINUTE_MS;
 
@@ -1405,7 +1406,7 @@ export class Store {
     reservedWrites: 0,
   };
   private lastEffectiveMs = 0;
-  /** Principals' limiter rows, written at most once a minute (limiter-cache.ts). */
+  /** Principals' limiter rows, written every few charges (limiter-cache.ts). */
   private readonly limiters = new LimiterCache({ write: (row, now) => this.writeLimitRow(row, now, true) });
   /** The daily budget rows and today's cached copy (budget-ledger.ts), over this store's metered SQL. */
   private readonly ledger: BudgetLedger;
@@ -2689,7 +2690,7 @@ export class Store {
       uploads_day: 0,
       updated_ms: now,
     };
-    this.limiters.created(row, now);
+    this.limiters.loaded(row, now);
     return row;
   }
 
@@ -2710,16 +2711,17 @@ export class Store {
   }
 
   /**
-   * Changes a limiter row's counters. A cached row (limiter-cache.ts) changes
-   * in memory and is written at most once a minute. Another is written now;
+   * Changes a limiter row's counters, charging `weight` events. A cached row
+   * (limiter-cache.ts) changes in memory and is written once a minute or
+   * every few events. Another is written now;
    * its `updated_ms`, which cleanup finds idle rows by, moves only when it is
    * a minute old or from an earlier UTC day, sparing its index entry
    * otherwise (LIMITER_IDLE_MS).
    */
-  private updateLimitRow(row: RawLimitRow, updates: Partial<RawLimitRow>, now: number): void {
+  private updateLimitRow(row: RawLimitRow, updates: Partial<RawLimitRow>, now: number, weight = 1): void {
     const next = { ...row, ...updates };
     if (this.limiters.covers(row.scope, row.principal_key)) {
-      this.limiters.change(next, now);
+      this.limiters.change(next, now, weight);
       return;
     }
     const dayStart = Math.floor(now / 86_400_000) * 86_400_000;
@@ -2787,7 +2789,7 @@ export class Store {
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index];
       const dailyCount = (row.day === daily ? row.posts_day : 0) + weight;
-      this.updateLimitRow(row, { ...bucketRow(charged[index]), day: daily, posts_day: dailyCount }, now);
+      this.updateLimitRow(row, { ...bucketRow(charged[index]), day: daily, posts_day: dailyCount }, now, weight);
     }
   }
 
@@ -2855,7 +2857,7 @@ export class Store {
         if ("retryAfterMs" in charged) {
           throw new StoreError("retry_after", "Frame rate limit reached", { retryAfterMs: Math.max(1000, charged.retryAfterMs), data: { limit: "frames" } });
         }
-        this.updateLimitRow(row, bucketRow(charged.bucket), effective);
+        this.updateLimitRow(row, bucketRow(charged.bucket), effective, count);
         const global = this.limitRow("frames", "global", effective);
         const day = dayFor(effective);
         const globalCount = global.day === day ? global.posts_day : 0;
@@ -5203,12 +5205,18 @@ export class Store {
       const limiters = remaining > 0 ? this.rawRows<{ scope: string; principal_key: string }>(
         "SELECT scope, principal_key FROM principal_limits WHERE updated_ms < ? ORDER BY updated_ms LIMIT ?", limiterCutoff, remaining,
       ) : [];
-      // A cached copy of a removed row holds nothing that still counts: it was last written before today and over an hour ago.
+      // A cached copy of a row idle in SQL may hold changes it has not
+      // written. The cache writes a row's first change after reading it, so
+      // they came within a minute of its `updated_ms`, on that day, and no
+      // longer count; one made since the cutoff might, and is written instead
+      // of deleted (limiter-cache.ts: keepIfChanged).
+      let deletedLimiters = 0;
       for (const row of limiters) {
+        if (this.limiters.keepIfChanged(row.scope, row.principal_key, limiterCutoff, effective)) continue;
         this.rawExec("DELETE FROM principal_limits WHERE scope = ? AND principal_key = ?", row.scope, row.principal_key);
-        this.limiters.drop(row.scope, row.principal_key);
+        deletedLimiters += 1;
       }
-      if (limiters.length) this.rawExec("UPDATE _meta SET value = ? WHERE key = 'principal_limit_count'", String(Math.max(0, this.metaNumber("principal_limit_count") - limiters.length)));
+      if (deletedLimiters) this.rawExec("UPDATE _meta SET value = ? WHERE key = 'principal_limit_count'", String(Math.max(0, this.metaNumber("principal_limit_count") - deletedLimiters)));
       remaining -= limiters.length;
       // Expired push registrations and wake times past coalescing (protocol §4.9).
       const pushCutoffs = this.pushCutoffs(effective);
@@ -5230,7 +5238,7 @@ export class Store {
       return {
         history_floor: idString(floor), previous_floor: idString(previousFloor), latest_id: idString(state.last_log_id),
         deleted_records: records.length, deleted_messages: messages.length, deleted_reactions: reactions.length,
-        deleted_memberships: memberships, deleted_requests: requests.length, deleted_limiters: limiters.length,
+        deleted_memberships: memberships, deleted_requests: requests.length, deleted_limiters: deletedLimiters,
         removed_rooms: rooms.map((row) => row.room_id),
         next_due_ms: nextDue,
         did_work: floor !== previousFloor || deleted > 0,

@@ -36,15 +36,21 @@ on the same day, except where a section names another test or an earlier
 date.
 
 The trade: totals that protect the deployment stay exact; a principal's own
-limits may forget up to a minute of its charges when the object is evicted.
+limits may forget a few of its charges when the object is evicted.
 
 - Each limiter row keeps a token bucket (`level`, `level_ms`: limiter.ts) in
   place of four JSON timestamp lists; nothing is parsed or re-serialized.
 - A user's or IP's row in a minute-limited scope (posts, history, auth,
-  admissions, frames) is cached in memory (at most 256 rows) and written at
-  most once a minute, on a new UTC day, and on its first charge. Server-wide
-  rows (`global`), registrations, uploads and pushes are written through.
-  An eviction forgets at most the last minute of one principal's charges.
+  admissions, frames) is cached in memory (at most 256 rows) and written on
+  its first charge since it was read or inserted, once a minute, on a new UTC
+  day, and once it holds four charges unwritten (`LIMITER_UNWRITTEN_EVENTS`;
+  a post or frame block counts its weight). Server-wide rows (`global`),
+  registrations, uploads and pushes are written through. An eviction (Durable
+  Objects hibernate seconds after their last event, sockets open or not)
+  forgets at most three events of each row, and each wake that charges a row
+  writes its first charge, so a daily cap of N admits at most N + 6 to a
+  principal that runs to it between evictions, and never more than 4N
+  (limiter-cache.ts).
 - A reservation is staged on the cached budget row and written once, when
   the operation settles, with the effective clock (`effective_ms`, which
   replaces the per-operation `_meta` write). An eviction between the two
@@ -60,15 +66,25 @@ limits may forget up to a minute of its charges when the object is evicted.
 | History page (once its limiter rows exist) | Observed writes | Charged writes |
 | --- | ---: | ---: |
 | Before (schema 8) | 8 | 6 |
-| Schema 9 | 1 | 1 |
-| Schema 9, once a minute (both limiter rows, with their index entries) | 5 | 5 |
+| Schema 9, holding its limiter rows | 1 | 1 |
+| Schema 9, writing them (the first page after a wake, every fourth page, once a minute: both rows, with their index entries) | 5 | 5 |
+| Schema 9, on average, one user paging every 1 to 10 s | 2 | 2 |
+| Schema 9, on average, one user paging every 20 s | 2.3 | 2.3 |
+| Schema 9, a wake and one page, every 15 s | 5 | 5 |
 | Refused by the user's or IP's limit | 1 | 1 |
 
-A post after the first in a minute writes its message rows, the server-wide
-post row and the budget row; the poster's and the IP's rows wait. At Paid's
-daily per-IP history count (6,000 pages) one IP is charged about 6,500
-written rows, under 1% of the 700,000 foreground writes; the server-wide
-count (40,000) bounds history at about 45,000 (6%) and 40,000 frames (27%).
+Measured with a per-page budget log on 2026-10-24. Writing the rows every
+fourth page, which bounds what an eviction forgets, takes a steady reader's
+page from 1 written row to 2 on average (a reader paging every 20 s or
+slower was already charged the minute's write: 2.3 either way), and the
+first page after each wake from 1 to 5.
+
+A post writes its message rows, the server-wide post row and the budget row;
+the poster's and the IP's rows are written with the first post after a
+wake, every fourth, and a minute on. At Paid's daily per-IP history count
+(6,000 pages) one IP is charged about 12,000 written rows, under 2% of the
+700,000 foreground writes; the server-wide count (40,000) bounds history at
+about 80,000 (11%) and 40,000 frames (27%).
 
 ## Reservation accounting
 
@@ -77,9 +93,8 @@ finished SQL reservation, measured from its cursors, is credited back in one
 budget-row update, so the daily counters are charged about the rows actually
 used plus one. A guest reconnect from a new address (admission, auth, a
 frame block, one history page with its quota, room listing, each creating
-its limiter row) is charged about 41 writes; a post about 15 within a minute
-of the poster's last, 21 when its limiter rows are written, and 31 for a
-poster's first; and an idle alarm run about 14 (not re-measured). The
+its limiter row) is charged about 41 writes; a post about 15 while its
+limiter rows wait, 21 when they are written, and 31 for a poster's first; and an idle alarm run about 14 (not re-measured). The
 reservation sizes still matter: they decide whether an operation is admitted
 near the ceiling.
 
@@ -143,7 +158,7 @@ upper bounds can be compared with the measured worst case.
 | Thread room save | 12 | 12 | 296 | 120 |
 | Message move with one reaction set | 19 | 25 | 296 | 280 |
 | Registered name mutation | 16 | 13 | 296 | 120 |
-| Registered room leave (logs the membership) | 20 | 15 | 482 | 72 |
+| Registered room leave (logs the membership; the user's fourth post since its limiter row was written, which writes it) | 21 | 17 | 482 | 72 |
 | Registered room join (logs the membership) | 17 | 11 | 482 | 72 |
 | Registered room join at the 100-thread ceiling | 330 | 27 | 482 | 72 |
 | History page | 9 | 1 | 264 | 40 |
