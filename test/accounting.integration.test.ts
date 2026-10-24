@@ -328,7 +328,7 @@ describe('measured storage accounting', () => {
 			const store = new Store(state, config, clock);
 			store.initialize();
 			store.commitMutation(messageInput(clock, 'persistent-user', 'only daily post', 'persistent'));
-			const limits = state.storage.sql.exec('SELECT scope, principal_key, post_events_json, day, posts_day FROM principal_limits').toArray();
+			const limits = state.storage.sql.exec('SELECT scope, principal_key, level, level_ms, day, posts_day FROM principal_limits').toArray();
 			return { size: store.databaseSize(), budget: store.budget(), limits };
 		});
 		await evictDurableObject(stub);
@@ -345,7 +345,7 @@ describe('measured storage accounting', () => {
 				error = candidate;
 			}
 			expectRetryAfter(error);
-			const limits = state.storage.sql.exec('SELECT scope, principal_key, post_events_json, day, posts_day FROM principal_limits').toArray();
+			const limits = state.storage.sql.exec('SELECT scope, principal_key, level, level_ms, day, posts_day FROM principal_limits').toArray();
 			const transitions = state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM records WHERE kind = 'message'").one().count;
 			return { afterInit, budget: store.budget(), size: store.databaseSize(), limits, transitions: Number(transitions) };
 		});
@@ -681,10 +681,8 @@ describe('measured storage accounting', () => {
 			}
 
 			const history = store.historyPage({ roomId: 'general', limit: 50, now: clock.now() });
-			const limiter = state.storage.sql.exec<{ day: string; posts_day: number }>(
-				"SELECT day, posts_day FROM principal_limits WHERE scope = 'post' AND principal_key = ? LIMIT 1",
-				'anonymous:audit-ip',
-			).one();
+			// As the store holds it: a principal's row is written at most once a minute.
+			const limiter = store.limiterDay('post', 'anonymous:audit-ip', clock.now());
 			expect(messagesOf(history)).toHaveLength(18);
 			expect(limiter.posts_day).toBe(13);
 			expect(limiter.day).toBe(new Date(clock.now()).toISOString().slice(0, 10));
@@ -748,7 +746,17 @@ describe('measured storage accounting', () => {
 			expectRetryAfter(error);
 			const beforeCleanup = store.storageAccounting();
 			clock.set(clock.now() + DAY + HOUR + 1);
+			// One run deletes what its reservation covers; posts cost few enough rows that more were accepted than that.
 			const cleanup = store.runCleanup(clock.now());
+			for (let run = 0; run < 10; run += 1) {
+				// The next batch is due a moment after the last.
+				clock.set(clock.now() + MINUTE);
+				const next = store.runCleanup(clock.now());
+				if (!next.deleted_records && !next.deleted_messages) break;
+				cleanup.deleted_records += next.deleted_records;
+				cleanup.deleted_messages += next.deleted_messages;
+				cleanup.history_floor = next.history_floor;
+			}
 			const afterCleanup = store.storageAccounting();
 			const maintenanceDay = new Date(clock.now()).toISOString().slice(0, 10);
 			const budgetRows = state.storage.sql.exec<{
@@ -848,6 +856,10 @@ describe('measured storage accounting', () => {
 				params: { name: 'Matrix renamed' }, identity,
 			}));
 			measure('history page', () => store.historyPage({ roomId: 'general', limit: 50, now: clock.now() }));
+			// With the quota: the first page creates the user's and the IP's limiter rows; the next, within a minute, writes neither.
+			const charged = () => store.history({ roomId: 'general', limit: 50, now: clock.now(), userId: 'matrix-reader', ipKey: 'matrix-reader-ip' });
+			measure('charged history page, a new user and IP', charged);
+			measure('charged history page, again within a minute', charged);
 			measure('room record lookup', () => store.getRoomState());
 			measure('room join lookup', () => store.getRoom(threadId));
 			measure('room listing', () => store.listRooms(clock.now()));
@@ -881,7 +893,7 @@ describe('measured storage accounting', () => {
 			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
 			expect(create.result.message_id).toBeTruthy();
-			expect(costs).toHaveLength(48);
+			expect(costs).toHaveLength(50);
 			expect(store.accountingStatus().unsafe).toBe(false);
 			return { costs };
 		});

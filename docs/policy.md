@@ -311,7 +311,9 @@ to rooms (`/toggle addmember`). The ping interval is the standard `server.params
 The demo's 16 KiB frame policy is an explicit exception to the base protocol's
 advisory 256 KiB recommendation. Payload lengths count UTF-8 bytes. Errors use
 the base protocol codes; `retry_after` includes `data.retry_after`, whole
-seconds rounded up. Permanent identity/thread-room ceilings return `denied`, not a fabricated replenishment time.
+seconds rounded up, and, when a limit refused the request, `data.limit`: its
+short name (`history`, `post`, `upload`, and others; SPEC section 6), which
+clients use to tell limits apart and ignore when unknown. Permanent identity/thread-room ceilings return `denied`, not a fabricated replenishment time.
 Every count limit the server sets (embeds per message, emoji per reaction set,
 reacting users per message, push `wake` entries, invite uses, passkeys, roles,
 room mutes, threads) is `denied`; a value past its size limit is `too_large`;

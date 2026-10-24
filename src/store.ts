@@ -31,6 +31,8 @@ import {
   type RawBudgetRow,
 } from "./budget-ledger";
 import { StoreError } from "./store-error";
+import { bucketHorizonMs, chargeBucket, type Bucket, type Rate } from "./limiter";
+import { LimiterCache, type RawLimitRow } from "./limiter-cache";
 import { isStatusChoice, type StatusChoice } from "./presence";
 import { isProtocolId, type StoredCredential, type StoredIdentity } from "./domain.js";
 // @ts-expect-error Workers' nodejs_compat runtime supplies this module; the
@@ -41,20 +43,22 @@ import { createHash } from "node:crypto";
 export const ROOM_ID = "general";
 const ROOM_TITLE = "General";
 /**
- * Schema 8 stores the server-wide log (room records, flat message
+ * Schema 9 stores the server-wide log (room records, flat message
  * snapshots, reaction sets, and registered users' memberships), a
  * `memberships` table of registered users' joined rooms, indexed both ways,
  * with each room's count of them, the `uploads` held in R2 with each
  * identity's avatar, each identity's roles and `ext` in its row, and the
- * `push_subscriptions`, `push_wakes`, `user_status` and `room_mutes` tables.
- * Schema 7, which the deployed object holds, is upgraded in place (see
+ * `push_subscriptions`, `push_wakes`, `user_status` and `room_mutes` tables,
+ * with each limiter row's token bucket (limiter.ts) and each day's count of
+ * history pages. Schema 8, which the deployed object holds, is upgraded in
+ * place (see upgradeFromSchema8()), as is schema 7 on the way to it (see
  * upgradeFromSchema7()); stored data from any other schema version is not
  * migrated: the object is wiped and started fresh (see resetStorage()).
  * Additive rows need no new version: an absent `_meta` row reads as its
  * initial value.
  */
-export const SCHEMA_VERSION = 8;
-/** The older schema upgraded in place rather than reset. */
+export const SCHEMA_VERSION = 9;
+/** The oldest schema upgraded in place rather than reset; each one from it up to SCHEMA_VERSION is. */
 export const UPGRADABLE_SCHEMA_VERSION = 7;
 /**
  * The registered user `APRON_ADMIN_TOKEN` signs in as, always an admin. It
@@ -72,7 +76,15 @@ const DEFAULT_ROOM_TITLE = "Room";
 const MAX_SAFE_ID = Number.MAX_SAFE_INTEGER;
 export const RETENTION_MS = DEFAULT_LIMITS.retentionSeconds * 1000;
 const DEDUP_TTL_MS = DEFAULT_LIMITS.dedupTtlSeconds * 1000;
-const POST_WINDOW_MS = 60 * 1000;
+const MINUTE_MS = 60 * 1000;
+/**
+ * A limiter row's `updated_ms` moves only when a cached row is written
+ * (limiter-cache.ts: every few charges), or another is a minute old or from
+ * an earlier UTC day, so a busy principal rewrites its index entry rarely
+ * rather than on every charge. Cleanup keeps rows touched within this long,
+ * which must outlast any limiter's horizon (bucketHorizonMs) plus a minute.
+ */
+const LIMITER_IDLE_MS = 60 * MINUTE_MS;
 
 type Tier = "anonymous" | "registered";
 
@@ -132,6 +144,11 @@ export interface StoreConfig {
   maxHistoryResponseBytes: number;
   historyRequestsPerUserMinute: number;
   historyRequestsPerIpMinute: number;
+  historyBurstPerUser: number;
+  historyBurstPerIp: number;
+  historyRequestsPerUserDay: number;
+  historyRequestsPerIpDay: number;
+  historyRequestsPerDay: number;
   anonymousPostsPerMinute: number;
   anonymousPostsPerDay: number;
   registeredPostsPerMinute: number;
@@ -262,6 +279,11 @@ const DEFAULT_CONFIG: StoreConfig = {
   maxHistoryResponseBytes: DEFAULT_LIMITS.historyMaxResponseBytes,
   historyRequestsPerUserMinute: DEFAULT_LIMITS.historyRequestsPerUserMinute,
   historyRequestsPerIpMinute: DEFAULT_LIMITS.historyRequestsPerIpMinute,
+  historyBurstPerUser: DEFAULT_LIMITS.historyBurstPerUser,
+  historyBurstPerIp: DEFAULT_LIMITS.historyBurstPerIp,
+  historyRequestsPerUserDay: DEFAULT_LIMITS.historyRequestsPerUserDay,
+  historyRequestsPerIpDay: DEFAULT_LIMITS.historyRequestsPerIpDay,
+  historyRequestsPerDay: DEFAULT_LIMITS.historyRequestsPerDay,
   anonymousPostsPerMinute: DEFAULT_LIMITS.anonymousPostsPerMinute,
   anonymousPostsPerDay: DEFAULT_LIMITS.anonymousPostsPerDay,
   registeredPostsPerMinute: DEFAULT_LIMITS.registeredPostsPerMinute,
@@ -313,6 +335,14 @@ export function defaultStoreConfig(overrides: Partial<StoreConfig> = {}): StoreC
   }
   if (merged.historyDefaultLimit <= 0 || merged.maxHistoryLimit < merged.historyDefaultLimit) {
     throw new Error("history limits are inconsistent");
+  }
+  // A limiter row idle for LIMITER_IDLE_MS is removed, so no limiter may still matter by then.
+  const rates: Rate[] = [
+    { perMinute: merged.historyRequestsPerUserMinute, burst: merged.historyBurstPerUser },
+    { perMinute: merged.historyRequestsPerIpMinute, burst: merged.historyBurstPerIp },
+  ];
+  if (rates.some((rate) => !(rate.perMinute > 0) || !((rate.burst ?? 0) >= 1) || bucketHorizonMs(rate) > LIMITER_IDLE_MS - MINUTE_MS)) {
+    throw new Error("history bursts must be at least one request and spent within the limiter idle time");
   }
   if (merged.storageLowWaterBytes >= merged.storageHighWaterBytes ||
       merged.storageHighWaterBytes >= merged.storageHardTargetBytes) {
@@ -607,18 +637,13 @@ interface RawUploadRow {
   expires_ms: number;
 }
 
-interface RawLimitRow {
-  scope: string;
-  principal_key: string;
-  post_events_json: string;
-  auth_events_json: string;
-  history_events_json: string;
-  admission_events_json: string;
-  day: string;
-  posts_day: number;
-  registrations_day: number;
-  uploads_day: number;
-  updated_ms: number;
+/** A limiter row's token bucket (limiter.ts). */
+function bucketOf(row: RawLimitRow): Bucket {
+  return { level: Number(row.level) || 0, at: integerColumn(row.level_ms) };
+}
+
+function bucketRow(bucket: Bucket): Pick<RawLimitRow, "level" | "level_ms"> {
+  return { level: bucket.level, level_ms: bucket.at };
 }
 
 interface RawMaintenanceRow {
@@ -1335,6 +1360,8 @@ const SCHEMA_DDL = `
     admissions_reserved INTEGER NOT NULL DEFAULT 0,
     posts_reserved INTEGER NOT NULL DEFAULT 0,
     registrations_reserved INTEGER NOT NULL DEFAULT 0,
+    history_reserved INTEGER NOT NULL DEFAULT 0,
+    effective_ms INTEGER NOT NULL DEFAULT 0,
     foreground_reads INTEGER NOT NULL DEFAULT 0,
     foreground_writes INTEGER NOT NULL DEFAULT 0,
     maintenance_reads INTEGER NOT NULL DEFAULT 0,
@@ -1343,10 +1370,8 @@ const SCHEMA_DDL = `
   CREATE TABLE IF NOT EXISTS principal_limits (
     scope TEXT NOT NULL,
     principal_key TEXT NOT NULL,
-    post_events_json TEXT NOT NULL DEFAULT '[]',
-    auth_events_json TEXT NOT NULL DEFAULT '[]',
-    history_events_json TEXT NOT NULL DEFAULT '[]',
-    admission_events_json TEXT NOT NULL DEFAULT '[]',
+    level REAL NOT NULL DEFAULT 0,
+    level_ms INTEGER NOT NULL DEFAULT 0,
     day TEXT NOT NULL,
     posts_day INTEGER NOT NULL DEFAULT 0,
     registrations_day INTEGER NOT NULL DEFAULT 0,
@@ -1381,6 +1406,8 @@ export class Store {
     reservedWrites: 0,
   };
   private lastEffectiveMs = 0;
+  /** Principals' limiter rows, written every few charges (limiter-cache.ts). */
+  private readonly limiters = new LimiterCache({ write: (row, now) => this.writeLimitRow(row, now, true) });
   /** The daily budget rows and today's cached copy (budget-ledger.ts), over this store's metered SQL. */
   private readonly ledger: BudgetLedger;
   private accountingUnsafe = false;
@@ -1419,6 +1446,8 @@ export class Store {
       exec: (query, ...bindings) => this.rawExec(query, ...bindings),
       rows: <T>(query: string, ...bindings: unknown[]) => this.rawRows<T>(query, ...bindings),
       advanceClock: (now) => { this.effectiveNow(now); },
+      clock: () => this.lastEffectiveMs,
+      inTransaction: () => this.inTransaction,
       markUnsafe: () => this.markAccountingUnsafe(),
     }, this.config);
   }
@@ -1429,14 +1458,17 @@ export class Store {
     // DDL is deliberately one initialization batch. The schema version marker
     // is checked before DDL so a wake/restart does not rewrite schema state.
     let version = this.readSchemaVersion();
-    if (version === UPGRADABLE_SCHEMA_VERSION) {
+    if (version === 7) {
       this.upgradeFromSchema7();
+      version = 8;
+    }
+    if (version === 8) {
+      this.upgradeFromSchema8();
       version = SCHEMA_VERSION;
     }
     if (version !== 0 && version !== SCHEMA_VERSION) throw new Error(`storage schema ${version} requires resetStorage()`);
     if (version === SCHEMA_VERSION) {
-      const persistedEffective = Number(this.metaValue(META_EFFECTIVE_NOW));
-      if (Number.isSafeInteger(persistedEffective) && persistedEffective >= 0) this.lastEffectiveMs = persistedEffective;
+      this.lastEffectiveMs = Math.max(this.lastEffectiveMs, this.storedEffectiveMs());
       const unsafeMarker = this.metaValue(META_ACCOUNTING_UNSAFE).trim().toLowerCase();
       if (unsafeMarker === "1" || unsafeMarker === "true") {
         this.accountingUnsafe = true;
@@ -1483,7 +1515,7 @@ export class Store {
   /** True when the object holds data from another schema version that is not upgraded in place. */
   requiresReset(): boolean {
     const version = this.readSchemaVersion();
-    return version !== 0 && version !== SCHEMA_VERSION && version !== UPGRADABLE_SCHEMA_VERSION;
+    return version !== 0 && (version < UPGRADABLE_SCHEMA_VERSION || version > SCHEMA_VERSION);
   }
 
   /**
@@ -1537,6 +1569,33 @@ export class Store {
       this.finishUpgrade(8, start, day);
     });
     console.warn(JSON.stringify({ event: "storage_schema_upgraded", from: 7, to: 8 }));
+  }
+
+  /**
+   * Upgrades a schema 8 object to schema 9 in place, once, in one
+   * transaction: each limiter row gains one token bucket, starting empty, so
+   * every rolling minute starts over once; its day counts are kept. Its four
+   * timestamp lists (`*_events_json`, defaulting to '[]') stay, never read
+   * again, as every insert names its columns: dropping a column rewrites the
+   * whole table, four times up to `principalLimitCap` rows, where adding one
+   * rewrites none. Each day's budget row gains its count of history pages, 0,
+   * and the effective clock it now carries (budget-ledger.ts: flush), 0 until
+   * its next write. Charged like upgradeFromSchema7 (finishUpgrade).
+   */
+  private upgradeFromSchema8(): void {
+    const start = { reads: this.observed.reads, writes: this.observed.writes };
+    const effective = Number(this.metaValue(META_EFFECTIVE_NOW));
+    const day = dayFor(Math.max(Number.isSafeInteger(effective) ? effective : 0, this.clock.now()));
+    this.transaction(() => {
+      this.rawScript(`
+        ALTER TABLE principal_limits ADD COLUMN level REAL NOT NULL DEFAULT 0;
+        ALTER TABLE principal_limits ADD COLUMN level_ms INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE resource_budgets ADD COLUMN history_reserved INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE resource_budgets ADD COLUMN effective_ms INTEGER NOT NULL DEFAULT 0
+      `);
+      this.finishUpgrade(9, start, day);
+    });
+    console.warn(JSON.stringify({ event: "storage_schema_upgraded", from: 8, to: 9 }));
   }
 
   /**
@@ -1609,6 +1668,7 @@ export class Store {
     this.accountingUnsafe = false;
     this.accountingUnsafePersisted = false;
     this.lastEffectiveMs = 0;
+    this.limiters.clear();
     this.scheduledAlarmAt = undefined;
     this.initialize();
     if (guestNumberMark > 0) {
@@ -1767,6 +1827,21 @@ export class Store {
   }
 
   private transaction<T>(fn: () => T): T {
+    // A nested call is refused by transactionInner, and must not disturb the outer journal.
+    if (this.inTransaction) return this.transactionInner(fn);
+    this.limiters.begin();
+    try {
+      const result = this.transactionInner(fn);
+      this.limiters.commit();
+      return result;
+    } catch (error) {
+      // The rows the transaction wrote are rolled back: so are the cached ones it changed.
+      this.limiters.rollback();
+      throw error;
+    }
+  }
+
+  private transactionInner<T>(fn: () => T): T {
     if (this.transactionSync && !this.inTransaction) {
       // Track the native transaction explicitly.  An accounting assertion can
       // fire before the callback returns; its marker must be written only
@@ -1828,26 +1903,30 @@ export class Store {
     this.persistAccountingUnsafeMarker();
   }
 
-  /** Return the monotonic effective clock used for retention and quotas. */
+  /**
+   * Return the monotonic effective clock used for retention and quotas: never
+   * less than any value it returned before, here or (through what the store
+   * loaded on wake) before the last eviction. It is written with the budget
+   * row each operation settles (budget-ledger.ts: flush), not on its own, so
+   * an eviction can lose only the operation in flight's advance; commit times
+   * stay nondecreasing through the log's own `last_commit_ms` regardless.
+   */
   private effectiveNow(candidate: number): number {
     if (!Number.isFinite(candidate) || candidate < 0) throw new StoreError("internal_error", "invalid server clock");
-    let previous = 0;
+    this.lastEffectiveMs = Math.max(this.lastEffectiveMs, Math.trunc(candidate));
+    return this.lastEffectiveMs;
+  }
+
+  /** The effective clock as stored: the `_meta` value schemas before 9 wrote, or the greatest a budget row carries. */
+  private storedEffectiveMs(): number {
+    const meta = Number(this.metaValue(META_EFFECTIVE_NOW));
+    let budget = 0;
     try {
-      const rows = this.rawRows<{ value: string }>("SELECT value FROM _meta WHERE key = ? LIMIT 1", META_EFFECTIVE_NOW);
-      previous = rows.length ? Number(rows[0].value) : 0;
-    } catch (error) {
-      // During the initial schema batch _meta has just been created but the
-      // marker is not inserted yet. Other SQLite failures are real failures.
-      const message = error instanceof Error ? error.message : String(error);
-      if (!/no such table/i.test(message)) throw error;
+      budget = integerColumn(this.rawRows<{ effective: number | null }>("SELECT MAX(effective_ms) AS effective FROM resource_budgets")[0]?.effective);
+    } catch {
+      // Before the upgrade adds the column.
     }
-    if (!Number.isFinite(previous) || previous < 0) previous = 0;
-    const effective = Math.max(Math.trunc(candidate), Math.trunc(previous));
-    this.lastEffectiveMs = Math.max(this.lastEffectiveMs, effective);
-    if (effective > previous) {
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_EFFECTIVE_NOW, String(effective));
-    }
-    return effective;
+    return Math.max(Number.isSafeInteger(meta) && meta >= 0 ? meta : 0, budget);
   }
 
   /** Advisory capacity check: no SQL, reservations, or durable clock updates. */
@@ -1914,7 +1993,10 @@ export class Store {
     // The callback may yield while another input-gated operation performs
     // SQLite work. Do not compare shared observed counters across the await:
     // this reservation already charges the complete bounded external work.
+    // Nothing settles it, so it is written now (its bookkeeping rows pay for
+    // that), not left staged for a later operation an eviction may not reach.
     this.reserveCost(cost, kind === "maintenance", now);
+    this.ledger.flush();
     return await fn();
   }
 
@@ -1938,19 +2020,25 @@ export class Store {
   }
 
   /** The final check on a finished operation: assert it stayed within its reservation, then refund the rest. */
-  private settleReservation(reserved: BudgetCost, beforeReads: number, beforeWrites: number): void {
+  private settleReservation(reserved: BudgetCost, beforeReads: number, beforeWrites: number, unused?: { history: number }): void {
     this.assertReservation(reserved, beforeReads, beforeWrites);
-    this.ledger.refund(reserved, this.observed.reads - beforeReads, this.observed.writes - beforeWrites);
+    this.ledger.refund(reserved, this.observed.reads - beforeReads, this.observed.writes - beforeWrites, unused);
   }
 
-  private reserved<T>(cost: CostEstimate, maintenance: boolean, now: number, fn: () => T, unchecked = false): T {
+  /**
+   * Runs `fn` under a reservation of `cost`, then settles it. `fn` may set
+   * `unused.history` to give back history pages it reserved and did not
+   * serve, whether it returns or throws.
+   */
+  private reserved<T>(cost: CostEstimate, maintenance: boolean, now: number, fn: (unused: { history: number }) => T, unchecked = false): T {
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
     const reservation = this.reserveCost(cost, maintenance, now, unchecked);
+    const unused = { history: 0 };
     try {
-      return fn();
+      return fn(unused);
     } finally {
-      this.settleReservation(reservation, beforeReads, beforeWrites);
+      this.settleReservation(reservation, beforeReads, beforeWrites, unused);
     }
   }
 
@@ -2285,6 +2373,8 @@ export class Store {
         this.rawExec("UPDATE room_mutes SET user_id = ? WHERE user_id = ?", to, from);
       }
       if (found.requests) this.rawExec("UPDATE accepted_requests SET user_id = ? WHERE user_id = ?", to, from);
+      // The rows move in SQL: write what their cached copies hold first, and uncache them.
+      for (const scope of USER_LIMIT_SCOPES) this.limiters.writeOut(scope, `user:${from}`, now);
       for (const scope of USER_LIMIT_SCOPES) {
         this.rawExec("UPDATE principal_limits SET principal_key = ? WHERE scope = ? AND principal_key = ?", `user:${to}`, scope, `user:${from}`);
       }
@@ -2403,7 +2493,15 @@ export class Store {
       for (const table of ["memberships", "credentials", "push_subscriptions", "push_wakes", "user_status", "room_mutes", "accepted_requests", "identities"]) {
         this.rawExec(`DELETE FROM ${table} WHERE user_id IN (${marks})`, ...ids);
       }
-      this.rawExec(`DELETE FROM principal_limits WHERE principal_key IN (${marks})`, ...ids.map((id) => `user:${id}`));
+      // Their limiter rows, by primary key, and the count the cap reads lowered by as many.
+      const limiterWhere = `scope IN (${USER_LIMIT_SCOPES.map(() => "?").join(", ")}) AND principal_key IN (${marks})`;
+      const limiterKeys = [...USER_LIMIT_SCOPES, ...ids.map((id) => `user:${id}`)];
+      const limiters = integerColumn(this.rawRows<{ count: number }>(`SELECT COUNT(*) AS count FROM principal_limits WHERE ${limiterWhere}`, ...limiterKeys)[0]?.count);
+      if (limiters) {
+        this.rawExec(`DELETE FROM principal_limits WHERE ${limiterWhere}`, ...limiterKeys);
+        this.rawExec("UPDATE _meta SET value = ? WHERE key = 'principal_limit_count'", String(Math.max(0, this.metaNumber("principal_limit_count") - limiters)));
+      }
+      for (const id of ids) this.limiters.dropPrincipal(`user:${id}`);
       for (const userId of retired) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, '1')", META_PURGED_PREFIX + userId);
       if (identities) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(Math.max(0, this.metaNumber("identity_count") - identities)));
       return { messages: messages.length, reactions: integerColumn(reactions), deletedUploads };
@@ -2564,80 +2662,83 @@ export class Store {
   }
 
   private limitRow(scope: string, principalKey: string, now: number): RawLimitRow {
+    const hit = this.limiters.get(scope, principalKey);
+    if (hit) return hit;
     const rows = this.rawRows<RawLimitRow>(
-      `SELECT scope, principal_key, post_events_json, auth_events_json,
-          history_events_json, admission_events_json, day, posts_day,
-          registrations_day, uploads_day, updated_ms
+      `SELECT scope, principal_key, level, level_ms, day, posts_day, registrations_day, uploads_day, updated_ms
        FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1`,
       scope,
       principalKey,
     );
-    if (rows.length) return rows[0];
+    if (rows.length) {
+      this.limiters.loaded(rows[0], now);
+      return rows[0];
+    }
     if (this.metaNumber("principal_limit_count") >= this.config.principalLimitCap) {
       throw new StoreError("retry_after", "Demo capacity reached", { retryAfterMs: 60_000 });
     }
     this.ensureGrowthCapacity(4096);
     const day = dayFor(now);
     this.rawExec(
-      `INSERT INTO principal_limits
-       (scope, principal_key, post_events_json, auth_events_json, history_events_json,
-        admission_events_json, day, posts_day, registrations_day, updated_ms)
-       VALUES (?, ?, '[]', '[]', '[]', '[]', ?, 0, 0, ?)`,
+      `INSERT INTO principal_limits (scope, principal_key, level, level_ms, day, posts_day, registrations_day, updated_ms)
+       VALUES (?, ?, 0, 0, ?, 0, 0, ?)`,
       scope,
       principalKey,
       day,
       now,
     );
-    this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('principal_limit_count', ?)", String(this.metaNumber("principal_limit_count") + 1));
-    return {
+    const count = String(this.metaNumber("principal_limit_count") + 1);
+    // Every schema seeds the count; one missing (an operator's edit) is written back, so the cap still applies.
+    if (this.rawExec("UPDATE _meta SET value = ? WHERE key = 'principal_limit_count'", count).rowsWritten === 0) {
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('principal_limit_count', ?)", count);
+    }
+    const row: RawLimitRow = {
       scope,
       principal_key: principalKey,
-      post_events_json: "[]",
-      auth_events_json: "[]",
-      history_events_json: "[]",
-      admission_events_json: "[]",
+      level: 0,
+      level_ms: 0,
       day,
       posts_day: 0,
       registrations_day: 0,
       uploads_day: 0,
       updated_ms: now,
     };
+    this.limiters.loaded(row, now);
+    return row;
   }
 
-  private updateLimitRow(row: RawLimitRow, updates: Partial<RawLimitRow>, now: number): void {
-    const next = { ...row, ...updates, updated_ms: now };
+  private writeLimitRow(next: RawLimitRow, now: number, touch: boolean): void {
     this.rawExec(
-      `UPDATE principal_limits SET post_events_json = ?, auth_events_json = ?,
-        history_events_json = ?, admission_events_json = ?, day = ?,
-        posts_day = ?, registrations_day = ?, uploads_day = ?, updated_ms = ?
+      `UPDATE principal_limits SET level = ?, level_ms = ?, day = ?, posts_day = ?, registrations_day = ?, uploads_day = ?${touch ? ", updated_ms = ?" : ""}
        WHERE scope = ? AND principal_key = ?`,
-      next.post_events_json,
-      next.auth_events_json,
-      next.history_events_json,
-      next.admission_events_json,
+      next.level,
+      next.level_ms,
       next.day,
       next.posts_day,
       next.registrations_day,
       next.uploads_day,
-      next.updated_ms,
+      ...(touch ? [now] : []),
       next.scope,
       next.principal_key,
     );
   }
 
-  private currentEvents(row: RawLimitRow, field: "post" | "auth" | "history" | "admission", now: number): number[] {
-    const key = `${field}_events_json` as keyof RawLimitRow;
-    const events = this.parseEventList(typeof row[key] === "string" ? row[key] as string : "[]");
-    const cutoff = now - POST_WINDOW_MS;
-    return events.filter((event) => event > cutoff && event <= now);
-  }
-
-  private checkWindow(events: number[], allowance: number, now: number, message: string): void {
-    if (events.length >= allowance) {
-      const oldest = Math.min(...events);
-      const retry = Math.max(1000, oldest + POST_WINDOW_MS - now);
-      throw new StoreError("retry_after", message, { retryAfterMs: retry });
+  /**
+   * Changes a limiter row's counters, charging `weight` events. A cached row
+   * (limiter-cache.ts) changes in memory and is written once a minute or
+   * every few events. Another is written now;
+   * its `updated_ms`, which cleanup finds idle rows by, moves only when it is
+   * a minute old or from an earlier UTC day, sparing its index entry
+   * otherwise (LIMITER_IDLE_MS).
+   */
+  private updateLimitRow(row: RawLimitRow, updates: Partial<RawLimitRow>, now: number, weight = 1): void {
+    const next = { ...row, ...updates };
+    if (this.limiters.covers(row.scope, row.principal_key)) {
+      this.limiters.change(next, now, weight);
+      return;
     }
+    const dayStart = Math.floor(now / 86_400_000) * 86_400_000;
+    this.writeLimitRow(next, now, row.updated_ms < now - MINUTE_MS || row.updated_ms < dayStart);
   }
 
   /**
@@ -2670,24 +2771,23 @@ export class Store {
       this.limitRow("post", `ip:${ipKey}`, now),
       this.limitRow("post", "global", now),
     ];
-    const events = rows.map((row) => this.currentEvents(row, "post", now));
     const daily = dayFor(now);
     let retryAfterMs = 0;
     let reason = "Posting limit reached";
+    const charged: Bucket[] = [];
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index];
-      const previousEvents = events[index];
       const allowance = index === 0 ? perUser.minute : index === 1 ? perIp.minute : this.config.globalPostsPerMinute;
       const dailyAllowance = index === 0 ? perUser.day : index === 1 ? perIp.day : this.config.globalPostsPerDay;
-      // Room for `weight` more once enough of the window's events age out; a
-      // weight past the whole allowance waits for the window to empty.
-      const room = Math.max(0, allowance - weight);
-      if (previousEvents.length > room) {
-        const retry = Math.max(1, previousEvents[previousEvents.length - room - 1] + POST_WINDOW_MS - now);
+      const minute = chargeBucket(bucketOf(row), now, { perMinute: allowance }, weight);
+      if ("retryAfterMs" in minute) {
+        const retry = Math.max(1, minute.retryAfterMs);
         if (retry > retryAfterMs) {
           retryAfterMs = retry;
           reason = index === 0 && tier === "anonymous" ? "Guest posting limit reached" : "Posting limit reached";
         }
+      } else {
+        charged.push(minute.bucket);
       }
       const count = row.day === daily ? row.posts_day : 0;
       if (count + weight > dailyAllowance) {
@@ -2698,32 +2798,29 @@ export class Store {
         }
       }
     }
-    if (retryAfterMs > 0) throw new StoreError("retry_after", reason, { retryAfterMs });
+    if (retryAfterMs > 0) throw new StoreError("retry_after", reason, { retryAfterMs, data: { limit: "post" } });
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index];
-      const nextEvents = [...events[index], ...new Array<number>(weight).fill(now)];
       const dailyCount = (row.day === daily ? row.posts_day : 0) + weight;
-      this.updateLimitRow(row, {
-        post_events_json: JSON.stringify(nextEvents),
-        day: daily,
-        posts_day: dailyCount,
-      }, now);
+      this.updateLimitRow(row, { ...bucketRow(charged[index]), day: daily, posts_day: dailyCount }, now, weight);
     }
   }
 
-  private chargeEvent(
-    scope: string,
-    principalKey: string,
-    field: "auth" | "history" | "admission",
-    now: number,
-    allowance: number,
-    message: string,
-  ): void {
+  /**
+   * Charges one event to a principal's `scope` limiter at `rate`, and, with
+   * `perDay`, to its count for the UTC day (kept in `posts_day`; the scope
+   * separates it from posts), or neither when either is full.
+   */
+  private chargeEvent(scope: string, principalKey: string, now: number, rate: Rate, message: string, perDay?: { limit: number; message: string }): void {
     const row = this.limitRow(scope, principalKey, now);
-    const events = this.currentEvents(row, field, now);
-    this.checkWindow(events, allowance, now, message);
-    const key = `${field}_events_json` as keyof RawLimitRow;
-    this.updateLimitRow(row, { [key]: JSON.stringify([...events, now]) } as Partial<RawLimitRow>, now);
+    const day = dayFor(now);
+    const count = row.day === day ? row.posts_day : 0;
+    if (perDay && count >= perDay.limit) {
+      throw new StoreError("retry_after", perDay.message, { retryAfterMs: Math.max(1000, 86_400_000 - now % 86_400_000), data: { limit: scope } });
+    }
+    const charged = chargeBucket(bucketOf(row), now, rate);
+    if ("retryAfterMs" in charged) throw new StoreError("retry_after", message, { retryAfterMs: Math.max(1000, charged.retryAfterMs), data: { limit: scope } });
+    this.updateLimitRow(row, perDay ? { ...bucketRow(charged.bucket), day, posts_day: count + 1 } : bucketRow(charged.bucket), now);
   }
 
   reserveAuthAttempt(input: { ipKey: string; now: number }): void {
@@ -2734,7 +2831,7 @@ export class Store {
     this.reserved({ ...this.config.authCost, frames: 0, reads: Math.max(32, this.config.authCost.reads ?? 0), writes: Math.max(16, this.config.authCost.writes ?? 0) }, false, input.now, () => {
       const effective = this.effectiveNow(input.now);
       this.transaction(() => {
-        this.chargeEvent("auth", `ip:${input.ipKey}`, "auth", effective, this.config.authAttemptsPerIpMinute, "Authentication attempts limited");
+        this.chargeEvent("auth", `ip:${input.ipKey}`, effective, { perMinute: this.config.authAttemptsPerIpMinute }, "Authentication attempts limited");
       });
     });
   }
@@ -2769,20 +2866,16 @@ export class Store {
       const effective = this.effectiveNow(input.now);
       this.transaction(() => {
         const row = this.limitRow("frames", `ip:${input.ipKey}`, effective);
-        const events = this.currentEvents(row, "auth", effective);
-        if (events.length + count > this.config.framesPerIpMinute) {
-          const oldest = Math.min(...events);
-          const retry = Math.max(1000, oldest + POST_WINDOW_MS - effective);
-          throw new StoreError("retry_after", "Frame rate limit reached", { retryAfterMs: retry });
+        const charged = chargeBucket(bucketOf(row), effective, { perMinute: this.config.framesPerIpMinute }, count);
+        if ("retryAfterMs" in charged) {
+          throw new StoreError("retry_after", "Frame rate limit reached", { retryAfterMs: Math.max(1000, charged.retryAfterMs), data: { limit: "frames" } });
         }
-        // Reuse auth_events_json as a bounded generic frame-event lane; the
-        // scope separates it from authentication rows.
-        this.updateLimitRow(row, { auth_events_json: JSON.stringify([...events, ...Array.from({ length: count }, () => effective)]) }, effective);
+        this.updateLimitRow(row, bucketRow(charged.bucket), effective, count);
         const global = this.limitRow("frames", "global", effective);
         const day = dayFor(effective);
         const globalCount = global.day === day ? global.posts_day : 0;
         if (globalCount + count > this.config.processedFramesPerDay) {
-          throw new StoreError("retry_after", "Daily frame budget exhausted", { retryAfterMs: 86_400_000, data: { reason: "frame_budget" } });
+          throw new StoreError("retry_after", "Daily frame budget exhausted", { retryAfterMs: 86_400_000, data: { reason: "frame_budget", limit: "frames" } });
         }
         this.updateLimitRow(global, { day, posts_day: globalCount + count }, effective);
       });
@@ -2797,10 +2890,10 @@ export class Store {
     const globalCount = global.day === day ? global.registrations_day : 0;
     const retryAfterMs = Math.max(1, 86_400_000 - now % 86_400_000);
     if (ipCount >= this.config.registrationsPerIpDay) {
-      throw new StoreError("retry_after", "Registration limit reached for this network", { retryAfterMs });
+      throw new StoreError("retry_after", "Registration limit reached for this network", { retryAfterMs, data: { limit: "registration" } });
     }
     if (globalCount >= this.config.registrationsPerDay) {
-      throw new StoreError("retry_after", "Registration limit reached", { retryAfterMs });
+      throw new StoreError("retry_after", "Registration limit reached", { retryAfterMs, data: { limit: "registration" } });
     }
     this.updateLimitRow(ip, { day, registrations_day: ipCount + 1 }, now);
     this.updateLimitRow(global, { day, registrations_day: globalCount + 1 }, now);
@@ -3041,14 +3134,14 @@ export class Store {
     this.reserved({ reads: 64, writes: 32, admissions: 1 }, false, input.now, () => {
       const now = this.effectiveNow(input.now);
       this.transaction(() => {
-        this.chargeEvent("admission", `ip:${input.ipKey}`, "admission", now, this.config.connectionAdmissionsPerIpMinute, "Connection admission limit reached");
+        this.chargeEvent("admission", `ip:${input.ipKey}`, now, { perMinute: this.config.connectionAdmissionsPerIpMinute }, "Connection admission limit reached");
         const day = dayFor(now);
         // The daily admission ceiling is global. The per-IP control above is a
         // rolling minute gate; using it as a daily counter would make a quiet
         // IP permanently consume global capacity independently.
         const global = this.limitRow("admission", "global", now);
         const admissions = global.day === day ? global.posts_day : 0;
-        if (admissions >= this.config.connectionAdmissionsPerDay) throw new StoreError("retry_after", "Connection admission limit reached", { retryAfterMs: 86_400_000 });
+        if (admissions >= this.config.connectionAdmissionsPerDay) throw new StoreError("retry_after", "Connection admission limit reached", { retryAfterMs: 86_400_000, data: { limit: "admission" } });
         this.updateLimitRow(global, { day, posts_day: admissions + 1 }, now);
         // Live connection caps are authoritative in ctx.getWebSockets(), which
         // includes closing sockets and survives object hibernation.  Durable
@@ -3058,7 +3151,7 @@ export class Store {
         const frames = this.limitRow("frames", "global", now);
         const frameCount = frames.day === day ? frames.posts_day : 0;
         if (frameCount >= this.config.processedFramesPerDay) {
-          throw new StoreError("retry_after", "Daily frame budget exhausted", { retryAfterMs: 86_400_000, data: { reason: "frame_budget" } });
+          throw new StoreError("retry_after", "Daily frame budget exhausted", { retryAfterMs: 86_400_000, data: { reason: "frame_budget", limit: "frames" } });
         }
       });
     });
@@ -3703,11 +3796,11 @@ export class Store {
     const rows = [this.limitRow("upload", `user:${userId}`, now), this.limitRow("upload", "global", now)];
     const counts = rows.map((row) => (row.day === day ? row.uploads_day : 0));
     const untilReset = Math.max(1, 86_400_000 - now % 86_400_000);
-    if (counts[1] >= policy.uploadsPerDay) throw new StoreError("retry_after", "Uploads are closed until the daily reset", { retryAfterMs: untilReset });
-    if (counts[0] >= policy.uploadsPerUserDay) throw new StoreError("retry_after", "Daily upload limit reached", { retryAfterMs: untilReset });
+    if (counts[1] >= policy.uploadsPerDay) throw new StoreError("retry_after", "Uploads are closed until the daily reset", { retryAfterMs: untilReset, data: { limit: "upload" } });
+    if (counts[0] >= policy.uploadsPerUserDay) throw new StoreError("retry_after", "Daily upload limit reached", { retryAfterMs: untilReset, data: { limit: "upload" } });
     const stored = this.metaNumber(META_UPLOAD_BYTES);
     if (stored + maxBytes > policy.storedBytesCap) {
-      throw new StoreError("retry_after", "Upload storage is full; try again later", { retryAfterMs: 3_600_000 });
+      throw new StoreError("retry_after", "Upload storage is full; try again later", { retryAfterMs: 3_600_000, data: { limit: "upload" } });
     }
     this.updateLimitRow(rows[0], { day, uploads_day: counts[0] + 1 }, now);
     this.setUploadBytes(stored + maxBytes);
@@ -4381,6 +4474,21 @@ export class Store {
     });
   }
 
+  /**
+   * A principal's count for its UTC day in a limiter scope (`posts_day`, which
+   * scopes other than posts reuse), as the store holds it: a cached row
+   * (limiter-cache.ts) may not be written yet. Zero for none.
+   */
+  limiterDay(scope: string, principalKey: string, now = this.clock.now()): { day: string; posts_day: number } {
+    this.ensureReady();
+    return this.reserved({ reads: 8 }, false, now, () => {
+      const row = this.limiters.peek(scope, principalKey) ?? this.rawRows<{ day: string; posts_day: number }>(
+        "SELECT day, posts_day FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1", scope, principalKey,
+      )[0];
+      return { day: row?.day ?? dayFor(this.effectiveNow(now)), posts_day: integerColumn(row?.posts_day) };
+    });
+  }
+
   /** Pushes sent today, for `/status`. */
   pushesToday(now = this.clock.now()): number {
     this.ensureReady();
@@ -4785,25 +4893,47 @@ export class Store {
     return this.commitMutation({ ...input, params: clone(input.params) });
   }
 
-  /** History with the per-user/IP history quota charged (§4.3). */
+  /**
+   * History with the history quota charged (§4.3): the user's and the IP's
+   * limiters (a burst, then a rate a minute, and a count a day, one row each)
+   * and the server's count a day, kept on the day's budget row, which every
+   * reservation updates anyway. A request that serves no page (refused by the
+   * user's or IP's limits, or an unknown room or bad bounds, whose rollback
+   * undoes their charges) gives its server count back, so such requests
+   * cannot use up everyone's history for the day.
+   */
   history(query: StoreHistoryQuery): StoreHistoryResult {
     this.ensureReady();
     const operationNow = query.now ?? this.clock.now();
+    const charged = Boolean(query.userId && query.ipKey);
     return this.reserved({
       ...this.config.historyCost,
       reads: Math.max(256, this.config.historyCost.reads ?? 0),
       // A page writes only its two limiter rows and the budget row: about 20
       // rows for a first request, which creates both limiter rows.
       writes: Math.max(32, this.config.historyCost.writes ?? 0),
-    }, false, operationNow, () => {
-      const now = this.effectiveNow(operationNow);
-      return this.transaction(() => {
-        if (query.userId && query.ipKey) {
-          this.chargeEvent("history", `user:${query.userId}`, "history", now, this.config.historyRequestsPerUserMinute, "History request limit reached");
-          this.chargeEvent("history", `ip:${query.ipKey}`, "history", now, this.config.historyRequestsPerIpMinute, "History request limit reached");
-        }
-        return this.historyPageInternal({ ...query, now });
-      });
+      history: charged ? 1 : 0,
+    }, false, operationNow, (unused) => {
+      try {
+        const now = this.effectiveNow(operationNow);
+        return this.transaction(() => {
+          if (charged) {
+            this.chargeEvent("history", `user:${query.userId}`, now,
+              { perMinute: this.config.historyRequestsPerUserMinute, burst: this.config.historyBurstPerUser },
+              "History request limit reached",
+              { limit: this.config.historyRequestsPerUserDay, message: "Daily history limit reached" });
+            this.chargeEvent("history", `ip:${query.ipKey}`, now,
+              { perMinute: this.config.historyRequestsPerIpMinute, burst: this.config.historyBurstPerIp },
+              "History request limit reached",
+              { limit: this.config.historyRequestsPerIpDay, message: "Daily history limit reached for this network" });
+          }
+          return this.historyPageInternal({ ...query, now });
+        });
+      } catch (error) {
+        // No page was served, and the rollback undid the user's and IP's charges: the server-wide count goes back too.
+        unused.history = 1;
+        throw error;
+      }
     });
   }
 
@@ -4955,8 +5085,8 @@ export class Store {
 
   private limiterCutoff(effective: number): number {
     // Principal authority is independent of chat retention: keep the current
-    // UTC day's counters and every still-live rolling-minute event.
-    return Math.min(Math.floor(effective / 86_400_000) * 86_400_000, effective - POST_WINDOW_MS);
+    // UTC day's counters and every limiter still within its horizon.
+    return Math.min(Math.floor(effective / 86_400_000) * 86_400_000, effective - LIMITER_IDLE_MS);
   }
 
   runCleanup(now = this.clock.now()): StoreCleanupResult {
@@ -5088,8 +5218,18 @@ export class Store {
       const limiters = remaining > 0 ? this.rawRows<{ scope: string; principal_key: string }>(
         "SELECT scope, principal_key FROM principal_limits WHERE updated_ms < ? ORDER BY updated_ms LIMIT ?", limiterCutoff, remaining,
       ) : [];
-      for (const row of limiters) this.rawExec("DELETE FROM principal_limits WHERE scope = ? AND principal_key = ?", row.scope, row.principal_key);
-      if (limiters.length) this.rawExec("UPDATE _meta SET value = ? WHERE key = 'principal_limit_count'", String(Math.max(0, this.metaNumber("principal_limit_count") - limiters.length)));
+      // A cached copy of a row idle in SQL may hold changes it has not
+      // written. The cache writes a row's first change after reading it, so
+      // they came within a minute of its `updated_ms`, on that day, and no
+      // longer count; one made since the cutoff might, and is written instead
+      // of deleted (limiter-cache.ts: keepIfChanged).
+      let deletedLimiters = 0;
+      for (const row of limiters) {
+        if (this.limiters.keepIfChanged(row.scope, row.principal_key, limiterCutoff, effective)) continue;
+        this.rawExec("DELETE FROM principal_limits WHERE scope = ? AND principal_key = ?", row.scope, row.principal_key);
+        deletedLimiters += 1;
+      }
+      if (deletedLimiters) this.rawExec("UPDATE _meta SET value = ? WHERE key = 'principal_limit_count'", String(Math.max(0, this.metaNumber("principal_limit_count") - deletedLimiters)));
       remaining -= limiters.length;
       // Expired push registrations and wake times past coalescing (protocol §4.9).
       const pushCutoffs = this.pushCutoffs(effective);
@@ -5111,7 +5251,7 @@ export class Store {
       return {
         history_floor: idString(floor), previous_floor: idString(previousFloor), latest_id: idString(state.last_log_id),
         deleted_records: records.length, deleted_messages: messages.length, deleted_reactions: reactions.length,
-        deleted_memberships: memberships, deleted_requests: requests.length, deleted_limiters: limiters.length,
+        deleted_memberships: memberships, deleted_requests: requests.length, deleted_limiters: deletedLimiters,
         removed_rooms: rooms.map((row) => row.room_id),
         next_due_ms: nextDue,
         did_work: floor !== previousFloor || deleted > 0,

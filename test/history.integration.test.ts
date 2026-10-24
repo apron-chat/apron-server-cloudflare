@@ -325,7 +325,7 @@ it("does not exceed the native cleanup reservation for a full bounded batch", as
 				userId, `request-${index}`, `digest-${index}`, JSON.stringify({ message_id: messageId }), expiredAt,
 			);
 			sql.exec(
-				"INSERT INTO principal_limits (scope, principal_key, post_events_json, auth_events_json, history_events_json, admission_events_json, day, posts_day, registrations_day, updated_ms) VALUES (?, ?, '[]', '[]', '[]', '[]', ?, 0, 0, ?)",
+				"INSERT INTO principal_limits (scope, principal_key, level, level_ms, day, posts_day, registrations_day, updated_ms) VALUES (?, ?, 0, 0, ?, 0, 0, ?)",
 				"fixture", `limiter-${index}`, "1970-01-01", expiredAt,
 			);
 			sql.exec(

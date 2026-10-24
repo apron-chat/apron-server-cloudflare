@@ -25,6 +25,13 @@ export const FREE_PLAN: Plan = Object.freeze({
 		historyMaxResponseBytes: 262_144,
 		historyRequestsPerUserMinute: 10,
 		historyRequestsPerIpMinute: 30,
+		historyBurstPerUser: 30,
+		historyBurstPerIp: 60,
+		historyRequestsPerUserDay: 1_000,
+		historyRequestsPerIpDay: 2_000,
+		// About one charged written row a page: about 6,000 rows, a tenth of
+		// the foreground writes, and 5% of the frames, at most.
+		historyRequestsPerDay: 5_000,
 		concurrentHistoryPerConnection: 1,
 		anonymousPostsPerMinute: 5,
 		anonymousPostsPerDay: 100,

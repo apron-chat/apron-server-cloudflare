@@ -252,7 +252,8 @@ Matching accepted request retries consume lookup and frame resources, but do
 not post again. Request deduplication lasts 24 hours.
 
 Temporary limits return `retry_after` with `data.retry_after` (whole
-seconds); clients back off. Daily
+seconds) and `data.limit`, the limit's name (`history`, `post`, `upload`, …:
+SPEC section 6); clients back off. Daily
 posting/write exhaustion makes the demo read-only while affordable reads remain
 available. History exhaustion returns an error. Registration caps do not revoke
 existing passkeys. Permanent identity/thread-room caps return `denied`. Storage

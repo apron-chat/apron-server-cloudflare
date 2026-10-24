@@ -2,7 +2,7 @@ import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
 import { Store, StoreError } from '../src/store';
 
-it('persists an accounting stop when a durable budget reservation fails', async () => {
+it('persists an accounting stop when an operation\'s budget write fails', async () => {
 	const stub = env.DEMO.getByName('budget-reservation-failure');
 	const now = Date.now() + 1_000;
 	await runInDurableObject(stub, (_instance, state) => {
@@ -15,10 +15,10 @@ it('persists an accounting stop when a durable budget reservation fails', async 
 			BEFORE UPDATE OF reads_reserved ON resource_budgets
 			BEGIN SELECT RAISE(ABORT, 'injected budget reservation failure'); END`);
 
-		// The failed UPDATE cannot grant a lease. The marker itself is written
-		// outside that failed SQL statement so this object cannot retry with an
-		// uncharged cache entry.
-		expect(() => store.getRoomState()).toThrow('injected budget reservation failure');
+		// The reservation is staged; the write that settles it fails after the
+		// operation. That latches accounting unsafe, the marker written outside
+		// the failed statement, so nothing else runs on uncertain accounting.
+		store.getRoomState();
 		const marker = state.storage.sql.exec<{ value: string }>(
 			"SELECT value FROM _meta WHERE key = 'accounting_unsafe' LIMIT 1",
 		).one();
@@ -75,5 +75,24 @@ it('persists an overrun stop across object eviction', async () => {
 		const restarted = new Store(state, {}, { now: () => now });
 		restarted.initialize();
 		expect(restarted.accountingStatus().unsafe).toBe(true);
+	});
+});
+
+it('writes an async operation\'s reservation before it awaits, and status writes the budget row once', async () => {
+	await runInDurableObject(env.DEMO.getByName('budget-async-and-status'), async (_instance, state) => {
+		const now = Date.now() + 1_000;
+		const store = new Store(state, {}, { now: () => now });
+		store.initialize();
+		const reserved = () => state.storage.sql.exec<{ writes_reserved: number }>(
+			'SELECT writes_reserved FROM resource_budgets ORDER BY day DESC LIMIT 1',
+		).one().writes_reserved;
+		store.getRoomState();
+		const before = reserved();
+		// Nothing settles it: an eviction during the await must not lose it.
+		const during = await store.withMeterAsync('foreground', { writes: 100 }, async () => reserved(), now);
+		expect(during).toBeGreaterThanOrEqual(before + 100);
+		const writes = store.storageAccounting().writes;
+		store.status(now);
+		expect(store.storageAccounting().writes - writes).toBe(1);
 	});
 });

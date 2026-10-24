@@ -21,8 +21,19 @@ export interface Limits {
 	historyDefaultLimit: number;
 	historyMaxLimit: number;
 	historyMaxResponseBytes: number;
+	/**
+	 * History pages are limited per user and per IP, each with a rate a minute
+	 * after a burst (limiter.ts: a quiet visitor may open `historyBurstPer*`
+	 * rooms at once) and a count a UTC day; and server-wide by a count a day,
+	 * past which history waits for the reset but everything else goes on.
+	 */
 	historyRequestsPerUserMinute: number;
 	historyRequestsPerIpMinute: number;
+	historyBurstPerUser: number;
+	historyBurstPerIp: number;
+	historyRequestsPerUserDay: number;
+	historyRequestsPerIpDay: number;
+	historyRequestsPerDay: number;
 	concurrentHistoryPerConnection: number;
 	anonymousPostsPerMinute: number;
 	anonymousPostsPerDay: number;
