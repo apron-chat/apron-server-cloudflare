@@ -144,6 +144,10 @@ it('upgrades a schema 8 store in place: limiter rows trade their timestamp lists
 		// Last: the current code never runs against schema 8's tables.
 		toSchema8(sql);
 		sql.exec(`UPDATE principal_limits SET post_events_json = ? WHERE scope = 'post'`, JSON.stringify([now]));
+		// A table of limiter rows: the upgrade's cost must not grow with it.
+		for (let index = 0; index < 500; index++) {
+			sql.exec("INSERT INTO principal_limits (scope, principal_key, day, posts_day, registrations_day, updated_ms) VALUES ('post', ?, '', 0, 0, ?)", `ip:filler-${index}`, now);
+		}
 		return {
 			head,
 			posts: sql.exec<{ posts_day: number }>("SELECT posts_day FROM principal_limits WHERE scope = 'post' AND principal_key = 'user:kept_user'").one().posts_day,
@@ -159,15 +163,18 @@ it('upgrades a schema 8 store in place: limiter rows trade their timestamp lists
 		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
 		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(SCHEMA_VERSION);
 		const columns = (table: string) => sql.exec<{ name: string }>("SELECT name FROM pragma_table_info(?) ORDER BY cid", table).toArray().map((row) => row.name);
-		expect(columns('principal_limits')).toEqual(['scope', 'principal_key', 'day', 'posts_day', 'registrations_day', 'uploads_day', 'updated_ms', 'level', 'level_ms']);
+		// Schema 8's timestamp lists stay, unread: dropping them would rewrite the table four times.
+		expect(columns('principal_limits')).toEqual(['scope', 'principal_key', 'day', 'posts_day', 'registrations_day', 'uploads_day', 'updated_ms',
+			'post_events_json', 'auth_events_json', 'history_events_json', 'admission_events_json', 'level', 'level_ms']);
 		expect(columns('resource_budgets')).toContain('history_reserved');
 		const row = sql.exec<{ level: number; posts_day: number }>("SELECT level, posts_day FROM principal_limits WHERE scope = 'post' AND principal_key = 'user:kept_user'").one();
 		// The rolling minute starts over; the day's count stays.
 		expect(row).toEqual({ level: 0, posts_day: before.posts });
 		const budget = sql.exec<{ writes_reserved: number; history_reserved: number }>('SELECT writes_reserved, history_reserved FROM resource_budgets ORDER BY day DESC LIMIT 1').one();
-		// The upgrade's own rows are charged on top of the day's.
+		// The upgrade's own rows are charged on top of the day's: a few, however many limiter rows there are.
 		expect(budget.history_reserved).toBe(0);
 		expect(budget.writes_reserved).toBeGreaterThan(before.writes);
+		expect(budget.writes_reserved - before.writes).toBeLessThan(64);
 		expect(store.getRoomState().latest_log_id).toBe(before.head);
 		expect(store.getIdentity('kept_user')?.name).toBe('Kept');
 		// The upgraded limiters work: a page is charged to the new bucket.

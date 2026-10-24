@@ -1573,11 +1573,14 @@ export class Store {
 
   /**
    * Upgrades a schema 8 object to schema 9 in place, once, in one
-   * transaction: each limiter row trades its four timestamp lists for one
-   * token bucket, starting empty, so every rolling minute starts over once;
-   * its day counts are kept. Each day's budget row gains its count of history
-   * pages, 0, and the effective clock it now carries (budget-ledger.ts:
-   * flush), 0 until its next write. Charged like upgradeFromSchema7 (finishUpgrade).
+   * transaction: each limiter row gains one token bucket, starting empty, so
+   * every rolling minute starts over once; its day counts are kept. Its four
+   * timestamp lists (`*_events_json`, defaulting to '[]') stay, never read
+   * again, as every insert names its columns: dropping a column rewrites the
+   * whole table, four times up to `principalLimitCap` rows, where adding one
+   * rewrites none. Each day's budget row gains its count of history pages, 0,
+   * and the effective clock it now carries (budget-ledger.ts: flush), 0 until
+   * its next write. Charged like upgradeFromSchema7 (finishUpgrade).
    */
   private upgradeFromSchema8(): void {
     const start = { reads: this.observed.reads, writes: this.observed.writes };
@@ -1587,10 +1590,6 @@ export class Store {
       this.rawScript(`
         ALTER TABLE principal_limits ADD COLUMN level REAL NOT NULL DEFAULT 0;
         ALTER TABLE principal_limits ADD COLUMN level_ms INTEGER NOT NULL DEFAULT 0;
-        ALTER TABLE principal_limits DROP COLUMN post_events_json;
-        ALTER TABLE principal_limits DROP COLUMN auth_events_json;
-        ALTER TABLE principal_limits DROP COLUMN history_events_json;
-        ALTER TABLE principal_limits DROP COLUMN admission_events_json;
         ALTER TABLE resource_budgets ADD COLUMN history_reserved INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE resource_budgets ADD COLUMN effective_ms INTEGER NOT NULL DEFAULT 0
       `);

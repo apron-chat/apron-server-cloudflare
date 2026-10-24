@@ -725,6 +725,14 @@ it measurably read and wrote are added to the day's maintenance counters
 without a capacity check, like the reset's passkey carry, so an exhausted
 budget cannot block it. The object is not wiped.
 
+A schema 8 object is upgraded to schema 9 the same way: it adds the limiter
+rows' two bucket columns and the budget rows' two, and keeps the limiter
+rows' four timestamp-list columns, unread. Adding a column rewrites no row,
+so the upgrade was charged 8 written rows over 503 limiter rows (measured on
+2026-10-24); dropping the four lists as well measured 2,168, about 4.3 a
+row, so about 43,000 at the 10,000-row limiter cap, more than Free's whole
+maintenance allocation.
+
 Any other stored schema version resets the object with
 `deleteAll()` and recreates the schema (`test/schema-reset.integration.test.ts`).
 The reset is charged the same one-time 512/512 bootstrap reservation as a new
