@@ -326,3 +326,34 @@ describe('history quota', () => {
 		});
 	});
 });
+
+describe('limiter row count', () => {
+	const noon = () => (Math.floor(Date.now() / DAY) + 1) * DAY + 43_200_000;
+	const count = (state: DurableObjectState) => state.storage.sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'principal_limit_count'").toArray().map((row) => Number(row.value));
+	const rows = (state: DurableObjectState) => state.storage.sql.exec<{ count: number }>('SELECT COUNT(*) AS count FROM principal_limits').one().count;
+
+	it('lowers the count by the limiter rows a purge deletes', async () => {
+		await runInDurableObject(env.DEMO.getByName('quota-limiter-count-purge'), (_instance, state) => {
+			const now = noon();
+			const store = new Store(state, {}, { now: () => now });
+			store.history({ roomId: 'general', limit: 1, now, userId: 'leaver', ipKey: 'home' });
+			store.history({ roomId: 'general', limit: 1, now, userId: 'stayer', ipKey: 'home' });
+			expect(count(state)).toEqual([3]);
+			store.purgeUsers({ userIds: ['leaver', 'nobody'], now });
+			expect(rows(state)).toBe(2);
+			expect(count(state)).toEqual([2]);
+		});
+	});
+
+	it('writes a missing count back, so the cap still applies', async () => {
+		await runInDurableObject(env.DEMO.getByName('quota-limiter-count-missing'), (_instance, state) => {
+			const now = noon();
+			const store = new Store(state, { principalLimitCap: 3 }, { now: () => now });
+			state.storage.sql.exec("DELETE FROM _meta WHERE key = 'principal_limit_count'");
+			store.history({ roomId: 'general', limit: 1, now, userId: 'first', ipKey: 'home' });
+			expect(count(state)).toEqual([2]);
+			store.history({ roomId: 'general', limit: 1, now, userId: 'second', ipKey: 'home' });
+			expect(() => store.history({ roomId: 'general', limit: 1, now, userId: 'third', ipKey: 'home' })).toThrow('Demo capacity reached');
+		});
+	});
+});

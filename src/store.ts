@@ -2491,7 +2491,14 @@ export class Store {
       for (const table of ["memberships", "credentials", "push_subscriptions", "push_wakes", "user_status", "room_mutes", "accepted_requests", "identities"]) {
         this.rawExec(`DELETE FROM ${table} WHERE user_id IN (${marks})`, ...ids);
       }
-      this.rawExec(`DELETE FROM principal_limits WHERE principal_key IN (${marks})`, ...ids.map((id) => `user:${id}`));
+      // Their limiter rows, by primary key, and the count the cap reads lowered by as many.
+      const limiterWhere = `scope IN (${USER_LIMIT_SCOPES.map(() => "?").join(", ")}) AND principal_key IN (${marks})`;
+      const limiterKeys = [...USER_LIMIT_SCOPES, ...ids.map((id) => `user:${id}`)];
+      const limiters = integerColumn(this.rawRows<{ count: number }>(`SELECT COUNT(*) AS count FROM principal_limits WHERE ${limiterWhere}`, ...limiterKeys)[0]?.count);
+      if (limiters) {
+        this.rawExec(`DELETE FROM principal_limits WHERE ${limiterWhere}`, ...limiterKeys);
+        this.rawExec("UPDATE _meta SET value = ? WHERE key = 'principal_limit_count'", String(Math.max(0, this.metaNumber("principal_limit_count") - limiters)));
+      }
       for (const id of ids) this.limiters.dropPrincipal(`user:${id}`);
       for (const userId of retired) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, '1')", META_PURGED_PREFIX + userId);
       if (identities) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(Math.max(0, this.metaNumber("identity_count") - identities)));
@@ -2678,7 +2685,11 @@ export class Store {
       day,
       now,
     );
-    this.rawExec("UPDATE _meta SET value = ? WHERE key = 'principal_limit_count'", String(this.metaNumber("principal_limit_count") + 1));
+    const count = String(this.metaNumber("principal_limit_count") + 1);
+    // Every schema seeds the count; one missing (an operator's edit) is written back, so the cap still applies.
+    if (this.rawExec("UPDATE _meta SET value = ? WHERE key = 'principal_limit_count'", count).rowsWritten === 0) {
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('principal_limit_count', ?)", count);
+    }
     const row: RawLimitRow = {
       scope,
       principal_key: principalKey,
