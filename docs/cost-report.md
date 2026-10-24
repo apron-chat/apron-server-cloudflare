@@ -195,9 +195,10 @@ reservation of the first operation after a handover.
 The worst move was measured at the calibrated reaction ceilings rather than
 the defaults: 64 reacting users, each with 16 distinct 64-byte emoji and a
 320-byte name. Each reaction set measured at most 88/27. Moving the message
-re-logged all 64 sets in one 92,693-byte reaction record and measured 209/152
+re-logged all 64 sets in one 92,693-byte reaction record and measured 211/156
 against its 296/280 reservation, charging its posting limits 9 posts (one, and
-one more per 8 sets); the record still fit one history response.
+one more per 8 sets), which writes the mover's and the IP's limiter rows;
+the record still fit one history response.
 The per-message cap is what bounds this move, and its extra posts what bound
 repeating it: at the 32-set default a move is charged 5 posts, so the posting
 limits allow a fifth as many such moves as plain posts.
@@ -624,13 +625,14 @@ record and two creates), removed the unreferenced old current message, and kept
 the edited message whose latest record was still inside the retention window. It also removed two expired accepted-request rows without changing
 the room head.
 
-The maintenance-reserve test accepted 59 mutations under an explicit
-1,000/1,000 foreground ceiling, rejected the next mutation, then ran cleanup
-the next UTC day. The previous day's foreground counter was 905 while the new
-day's cleanup, run until it found nothing (one run deletes what its
-reservation covers), was charged 196 maintenance writes (475/196 observed,
-over five reservations) and removed 60 records (the creates and the seeded
-room record) and 59 messages. The current budget row must be read by day; calling `budget()` after midnight
+The maintenance-reserve test accepted 56 mutations under an explicit
+1,000/1,000 foreground ceiling (59 before every fourth post wrote its limiter
+rows), rejected the next mutation, then ran cleanup the next UTC day. The
+previous day's foreground counter was 912 while the new day's cleanup, run
+until it found nothing (one run deletes what its reservation covers), was
+charged 187 maintenance writes (454/187 observed, over five reservations)
+and removed 57 records (the creates and the seeded room record) and 56
+messages. The current budget row must be read by day; calling `budget()` after midnight
 correctly returns the new day's foreground counters rather than the exhausted
 previous day.
 
