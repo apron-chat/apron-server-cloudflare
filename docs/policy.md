@@ -311,7 +311,11 @@ sending them, and `add_members` says whether registered users may add others
 to rooms (`/toggle addmember`). Where uploads are configured, `ext:media`
 (defined in apron-web's EXT.md) carries `server.params.ext.media`: the media
 origin when it is not the server's, and each type an attachment or avatar
-upload keeps with its largest size. The ping interval is the standard `server.params.ping`.
+upload keeps with its largest size. `ext:permissions` (also from EXT.md) puts
+`ext.permissions` on the user's own `you` only: `move_any` for a registered
+user with `admin`, `mod` or `threader` (not an owner's bot), and `add_members`
+for an admin, or any registered user but a bot while `addmember` is on. It is
+the server's: `me` ignores an `ext.permissions` it writes. The ping interval is the standard `server.params.ping`.
 The demo's 16 KiB frame policy is an explicit exception to the base protocol's
 advisory 256 KiB recommendation. Payload lengths count UTF-8 bytes. Errors use
 the base protocol codes; `retry_after` includes `data.retry_after`, whole

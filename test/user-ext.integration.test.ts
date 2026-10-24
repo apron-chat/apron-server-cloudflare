@@ -56,43 +56,45 @@ it('merges a user ext one level deep, sends it whole in complete objects, and on
 	const other = await signIn(aliceToken);
 	const bob = await signIn(await register(bobId));
 	try {
-		expect(alice.you).not.toHaveProperty('ext');
+		// Only what the server keeps for her own `you` (ext:permissions).
+		const own = { permissions: ['add_members'] };
+		expect(alice.you.ext).toEqual(own);
 		await userFrames(bob.peer);
 		await userFrames(other.peer);
 
 		const set = await request(alice.peer, 'set', 'me', { ext: { irc: { nick: 'ada_' }, tz: 'Europe/Oslo', flag: null } });
-		expect(set.result.you.ext).toEqual({ irc: { nick: 'ada_' }, tz: 'Europe/Oslo', flag: null });
+		expect(set.result.you.ext).toEqual({ irc: { nick: 'ada_' }, tz: 'Europe/Oslo', flag: null, ...own });
 		// Others get the keys that changed; the user's other connections get `you`.
 		const told = (await userFrames(bob.peer)).filter((frame) => frame.params.new?.user_id === aliceId);
 		expect(told.map((frame) => frame.params.new.ext)).toEqual([{ irc: { nick: 'ada_' }, tz: 'Europe/Oslo', flag: null }]);
-		expect((await userFrames(other.peer)).map((frame) => frame.params.you?.ext)).toEqual([{ irc: { nick: 'ada_' }, tz: 'Europe/Oslo', flag: null }]);
+		expect((await userFrames(other.peer)).map((frame) => frame.params.you?.ext)).toEqual([{ irc: { nick: 'ada_' }, tz: 'Europe/Oslo', flag: null, ...own }]);
 
 		// A key it leaves out stays; the value under a key is replaced whole.
 		const tz = await request(alice.peer, 'tz', 'me', { ext: { tz: 'America/Toronto', irc: { nick: 'ada_' } } });
-		expect(tz.result.you.ext).toEqual({ irc: { nick: 'ada_' }, tz: 'America/Toronto', flag: null });
+		expect(tz.result.you.ext).toEqual({ irc: { nick: 'ada_' }, tz: 'America/Toronto', flag: null, ...own });
 		expect((await userFrames(bob.peer)).map((frame) => frame.params.new.ext)).toEqual([{ tz: 'America/Toronto' }]);
 
 		// An empty value clears a key, announced as `""`.
 		const cleared = await request(alice.peer, 'clear', 'me', { ext: { irc: '', flag: [] } });
-		expect(cleared.result.you.ext).toEqual({ tz: 'America/Toronto' });
+		expect(cleared.result.you.ext).toEqual({ tz: 'America/Toronto', ...own });
 		expect((await userFrames(bob.peer)).map((frame) => frame.params.new.ext)).toEqual([{ irc: '', flag: '' }]);
 
 		// `"ext": {}`, and a write that changes no key, change nothing and tell no one.
-		expect((await request(alice.peer, 'empty', 'me', { ext: {} })).result.you.ext).toEqual({ tz: 'America/Toronto' });
-		expect((await request(alice.peer, 'same', 'me', { ext: { tz: 'America/Toronto' } })).result.you.ext).toEqual({ tz: 'America/Toronto' });
+		expect((await request(alice.peer, 'empty', 'me', { ext: {} })).result.you.ext).toEqual({ tz: 'America/Toronto', ...own });
+		expect((await request(alice.peer, 'same', 'me', { ext: { tz: 'America/Toronto' } })).result.you.ext).toEqual({ tz: 'America/Toronto', ...own });
 		expect(await userFrames(bob.peer)).toEqual([]);
 
 		// A merged ext past the limit is too_large, and nothing changes.
 		const big = await request(alice.peer, 'big', 'me', { ext: { big: 'x'.repeat(MAX_USER_EXT_BYTES) } });
 		expect(big.error.code).toBe(-32003);
-		expect((await request(alice.peer, 'after-big', 'me', {})).result.you.ext).toEqual({ tz: 'America/Toronto' });
+		expect((await request(alice.peer, 'after-big', 'me', {})).result.you.ext).toEqual({ tz: 'America/Toronto', ...own });
 		// An ext that is not an object is invalid.
 		expect((await request(alice.peer, 'bad', 'me', { ext: 'x' })).error.code).toBe(-32602);
 
 		// A retry gets the current `you` and announces nothing again.
 		await request(alice.peer, 'retry', 'me', { ext: { lang: 'nb' } });
 		await userFrames(bob.peer);
-		expect((await request(alice.peer, 'retry', 'me', { ext: { lang: 'nb' } })).result.you.ext).toEqual({ tz: 'America/Toronto', lang: 'nb' });
+		expect((await request(alice.peer, 'retry', 'me', { ext: { lang: 'nb' } })).result.you.ext).toEqual({ tz: 'America/Toronto', lang: 'nb', ...own });
 		expect(await userFrames(bob.peer)).toEqual([]);
 
 		// Listing `users` are complete: they carry the whole ext, as stored.
@@ -100,13 +102,39 @@ it('merges a user ext one level deep, sends it whole in complete objects, and on
 		expect(listed.result.users.find((user: { user_id: string }) => user.user_id === aliceId).ext).toEqual({ tz: 'America/Toronto', lang: 'nb' });
 		// A later sign-in reads it with the identity.
 		const again = await signIn(aliceToken);
-		expect(again.you.ext).toEqual({ tz: 'America/Toronto', lang: 'nb' });
+		expect(again.you.ext).toEqual({ tz: 'America/Toronto', lang: 'nb', ...own });
 		again.peer.close();
 		// Recorded objects never carry it.
 		const { skipped } = await exchange(alice.peer, 'post', 'message', { body: { text: 'hi' } });
 		const posted = skipped.find((frame) => frame.method === 'message');
 		expect(posted!.params.from).toEqual({ user_id: aliceId, name: aliceId });
 	} finally { alice.peer.close(); other.peer.close(); bob.peer.close(); }
+});
+
+it('keeps ext.permissions the server\'s: `me` cannot set or clear it, and only the user\'s own `you` carries it (ext:permissions)', async () => {
+	const aliceId = unique('alice');
+	const aliceToken = await register(aliceId);
+	const alice = await signIn(aliceToken);
+	const bob = await signIn(await register(unique('bob')));
+	const own = { permissions: ['add_members'] };
+	try {
+		await userFrames(bob.peer);
+		// A write of it is ignored, like `roles`; the rest of the write is kept.
+		const spoofed = await request(alice.peer, 'spoof', 'me', { ext: { permissions: ['move_any'], tz: 'Europe/Oslo' } });
+		expect(spoofed.result.you.ext).toEqual({ tz: 'Europe/Oslo', ...own });
+		expect((await userFrames(bob.peer)).map((frame) => frame.params.new.ext)).toEqual([{ tz: 'Europe/Oslo' }]);
+		expect((await request(alice.peer, 'clear', 'me', { ext: { permissions: [] } })).result.you.ext).toEqual({ tz: 'Europe/Oslo', ...own });
+		expect(await userFrames(bob.peer)).toEqual([]);
+		// One stored before is never read: not in her `you`, nor in others' objects for her.
+		await runInDurableObject(stub(), (_instance, state) => {
+			state.storage.sql.exec('UPDATE identities SET ext_json = ? WHERE user_id = ?', JSON.stringify({ tz: 'Europe/Oslo', permissions: ['move_any'] }), aliceId);
+		});
+		const again = await signIn(aliceToken);
+		expect(again.you.ext).toEqual({ tz: 'Europe/Oslo', ...own });
+		again.peer.close();
+		const listed = await request(bob.peer, 'list', 'room_list', { filter: 'joined', members: true });
+		expect(listed.result.users.find((user: { user_id: string }) => user.user_id === aliceId).ext).toEqual({ tz: 'Europe/Oslo' });
+	} finally { alice.peer.close(); bob.peer.close(); }
 });
 
 it('keeps no ext for guests', async () => {
