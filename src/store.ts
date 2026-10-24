@@ -2022,14 +2022,20 @@ export class Store {
     this.ledger.refund(reserved, this.observed.reads - beforeReads, this.observed.writes - beforeWrites, unused);
   }
 
-  private reserved<T>(cost: CostEstimate, maintenance: boolean, now: number, fn: () => T, unchecked = false): T {
+  /**
+   * Runs `fn` under a reservation of `cost`, then settles it. `fn` may set
+   * `unused.history` to give back history pages it reserved and did not
+   * serve, whether it returns or throws.
+   */
+  private reserved<T>(cost: CostEstimate, maintenance: boolean, now: number, fn: (unused: { history: number }) => T, unchecked = false): T {
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
     const reservation = this.reserveCost(cost, maintenance, now, unchecked);
+    const unused = { history: 0 };
     try {
-      return fn();
+      return fn(unused);
     } finally {
-      this.settleReservation(reservation, beforeReads, beforeWrites);
+      this.settleReservation(reservation, beforeReads, beforeWrites, unused);
     }
   }
 
@@ -4884,18 +4890,14 @@ export class Store {
     this.ensureReady();
     const operationNow = query.now ?? this.clock.now();
     const charged = Boolean(query.userId && query.ipKey);
-    const beforeReads = this.observed.reads;
-    const beforeWrites = this.observed.writes;
-    const reservation = this.reserveCost({
+    return this.reserved({
       ...this.config.historyCost,
       reads: Math.max(256, this.config.historyCost.reads ?? 0),
       // A page writes only its two limiter rows and the budget row: about 20
       // rows for a first request, which creates both limiter rows.
       writes: Math.max(32, this.config.historyCost.writes ?? 0),
       history: charged ? 1 : 0,
-    }, false, operationNow);
-    let refused = false;
-    try {
+    }, false, operationNow, (unused) => {
       const now = this.effectiveNow(operationNow);
       return this.transaction(() => {
         if (charged) {
@@ -4909,15 +4911,14 @@ export class Store {
               "History request limit reached",
               { limit: this.config.historyRequestsPerIpDay, message: "Daily history limit reached for this network" });
           } catch (error) {
-            refused = error instanceof StoreError && error.code === "retry_after";
+            // Refused by the user's or the IP's limits: the server-wide count goes back.
+            if (error instanceof StoreError && error.code === "retry_after") unused.history = 1;
             throw error;
           }
         }
         return this.historyPageInternal({ ...query, now });
       });
-    } finally {
-      this.settleReservation(reservation, beforeReads, beforeWrites, refused ? { history: reservation.history } : undefined);
-    }
+    });
   }
 
   /** History without quota bookkeeping, for internal and calibration use. */
