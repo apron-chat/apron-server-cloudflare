@@ -108,6 +108,27 @@ describe('budget ledger', () => {
 		expect(table.get('2026-09-21')).toMatchObject({ reads_reserved: 4, writes_reserved: 4 });
 	});
 
+	it('writes each day\'s staged change to its own row when one is held back across UTC midnight', () => {
+		const { ledgerHost, table, state } = host();
+		const ledger = new BudgetLedger(ledgerHost, limits);
+		ledger.start('2026-09-21');
+		const lastSecond = Date.parse('2026-09-21T23:59:59Z');
+		state.inTransaction = true;
+		ledger.refund(ledger.reserve({ reads: 10, writes: 10 }, lastSecond, lastSecond, false, false), 1, 1);
+		ledger.refund(ledger.reserve({ reads: 10, writes: 10 }, lastSecond + 2_000, lastSecond + 2_000, false, false), 1, 1);
+		state.inTransaction = false;
+		ledger.flush();
+		expect(table.get('2026-09-21')).toMatchObject({ reads_reserved: 2, writes_reserved: 2 });
+		expect(table.get('2026-09-22')).toMatchObject({ reads_reserved: 2, writes_reserved: 2 });
+		// A failed write is held back the same way.
+		state.failUpdates = true;
+		ledger.refund(ledger.reserve({ reads: 10, writes: 10 }, lastSecond + 3_000, lastSecond + 3_000, false, false), 1, 1);
+		state.failUpdates = false;
+		ledger.refund(ledger.reserve({ reads: 10, writes: 10 }, lastSecond + 86_400_000 + 2_000, lastSecond + 86_400_000 + 2_000, false, false), 1, 1);
+		expect(table.get('2026-09-22')).toMatchObject({ reads_reserved: 4, writes_reserved: 4 });
+		expect(table.get('2026-09-23')).toMatchObject({ reads_reserved: 2, writes_reserved: 2 });
+	});
+
 	it('refuses from the cached row without running SQL', () => {
 		const { ledgerHost, statements, state } = host();
 		const ledger = new BudgetLedger(ledgerHost, limits);

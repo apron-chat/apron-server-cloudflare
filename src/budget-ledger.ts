@@ -141,9 +141,12 @@ export class BudgetLedger {
   private handoverPending = false;
   /** UTC day for which this object has already attempted bounded row pruning. */
   private prunedDay: string | null = null;
-  /** Changes made to the cached copy and not yet written, all for `stagedDay`. */
-  private staged: BudgetDelta = {};
-  private stagedDay: string | null = null;
+  /**
+   * Changes made to the cached copy and not yet written, by day: one held
+   * back (inside a transaction, or by a failed write) when the day ends is
+   * still written to its own row, never merged into the next day's.
+   */
+  private readonly staged = new Map<string, BudgetDelta>();
 
   constructor(private readonly host: LedgerHost, private readonly limits: LedgerLimits) {}
 
@@ -193,10 +196,13 @@ export class BudgetLedger {
     this.forget();
   }
 
-  /** A day's counters, creating its row if it has none. */
+  /** A day's counters, creating its row if it has none. The cached copy, which holds what is staged, needs no SQL. */
   snapshot(day: string): BudgetSnapshot {
-    this.flush();
-    const row = this.rowFor(day);
+    let row = this.cachedDay === day ? this.cached : null;
+    if (!row) {
+      this.flush();
+      row = this.rowFor(day);
+    }
     return {
       day,
       reads: row.reads_reserved,
@@ -334,27 +340,27 @@ export class BudgetLedger {
   }
 
   /**
-   * Writes what is staged, and the effective clock, in one row update. Inside
-   * a transaction it waits: a rollback would undo the write but not the
-   * copy. A failed write keeps what is staged for the next flush and latches
-   * accounting unsafe, as any uncertain ledger state does.
+   * Writes what is staged, and the effective clock, in one row update for
+   * each day staged (one but across a UTC midnight). Inside a transaction it
+   * waits: a rollback would undo the write but not the copy. A failed write
+   * keeps what is staged for the next flush and latches accounting unsafe, as
+   * any uncertain ledger state does.
    */
   flush(): void {
-    const day = this.stagedDay;
-    if (day === null || this.host.inTransaction()) return;
-    const delta = this.staged;
-    try {
-      let cursor = this.update(day, delta, true);
-      if (cursor.rowsWritten !== undefined && cursor.rowsWritten < 1) {
-        // Removed underneath the copy (an operator, a test): write it back.
-        this.host.exec("INSERT OR IGNORE INTO resource_budgets (day) VALUES (?)", day);
-        cursor = this.update(day, delta, true);
-        if (cursor.rowsWritten !== undefined && cursor.rowsWritten < 1) throw new StoreError("internal_error", "budget reservation did not update durable state");
+    if (!this.staged.size || this.host.inTransaction()) return;
+    for (const [day, delta] of [...this.staged]) {
+      try {
+        let cursor = this.update(day, delta, true);
+        if (cursor.rowsWritten !== undefined && cursor.rowsWritten < 1) {
+          // Removed underneath the copy (an operator, a test): write it back.
+          this.host.exec("INSERT OR IGNORE INTO resource_budgets (day) VALUES (?)", day);
+          cursor = this.update(day, delta, true);
+          if (cursor.rowsWritten !== undefined && cursor.rowsWritten < 1) throw new StoreError("internal_error", "budget reservation did not update durable state");
+        }
+        this.staged.delete(day);
+      } catch {
+        this.host.markUnsafe();
       }
-      this.staged = {};
-      this.stagedDay = null;
-    } catch {
-      this.host.markUnsafe();
     }
   }
 
@@ -391,14 +397,13 @@ export class BudgetLedger {
 
   /** Adds `delta` to the cached copy of `day`'s row, `row`, and to what the next flush writes. */
   private stage(day: string, row: RawBudgetRow, delta: BudgetDelta): void {
-    // What is staged is one day's: a new day's change writes the old day's first.
-    if (this.stagedDay !== null && this.stagedDay !== day) this.flush();
     const next: RawBudgetRow = { ...row, day };
+    const staged = this.staged.get(day) ?? {};
     for (const [column, amount] of Object.entries(delta) as [BudgetColumn, number][]) {
       next[column] += amount;
-      if (amount) this.staged[column] = (this.staged[column] ?? 0) + amount;
+      if (amount) staged[column] = (staged[column] ?? 0) + amount;
     }
-    this.stagedDay = day;
+    this.staged.set(day, staged);
     this.install(day, next);
   }
 

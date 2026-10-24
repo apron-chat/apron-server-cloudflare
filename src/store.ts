@@ -1993,7 +1993,10 @@ export class Store {
     // The callback may yield while another input-gated operation performs
     // SQLite work. Do not compare shared observed counters across the await:
     // this reservation already charges the complete bounded external work.
+    // Nothing settles it, so it is written now (its bookkeeping rows pay for
+    // that), not left staged for a later operation an eviction may not reach.
     this.reserveCost(cost, kind === "maintenance", now);
+    this.ledger.flush();
     return await fn();
   }
 

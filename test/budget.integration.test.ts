@@ -77,3 +77,22 @@ it('persists an overrun stop across object eviction', async () => {
 		expect(restarted.accountingStatus().unsafe).toBe(true);
 	});
 });
+
+it('writes an async operation\'s reservation before it awaits, and status writes the budget row once', async () => {
+	await runInDurableObject(env.DEMO.getByName('budget-async-and-status'), async (_instance, state) => {
+		const now = Date.now() + 1_000;
+		const store = new Store(state, {}, { now: () => now });
+		store.initialize();
+		const reserved = () => state.storage.sql.exec<{ writes_reserved: number }>(
+			'SELECT writes_reserved FROM resource_budgets ORDER BY day DESC LIMIT 1',
+		).one().writes_reserved;
+		store.getRoomState();
+		const before = reserved();
+		// Nothing settles it: an eviction during the await must not lose it.
+		const during = await store.withMeterAsync('foreground', { writes: 100 }, async () => reserved(), now);
+		expect(during).toBeGreaterThanOrEqual(before + 100);
+		const writes = store.storageAccounting().writes;
+		store.status(now);
+		expect(store.storageAccounting().writes - writes).toBe(1);
+	});
+});

@@ -227,10 +227,10 @@ describe('history quota', () => {
 			const store = new Store(state, {}, { now: () => now });
 			const page = () => store.history({ roomId: 'general', limit: 1, now, userId: 'reader', ipKey: 'home' });
 			page();
-			const charged = (fn: () => unknown) => {
-				const before = store.budget(now).writes;
+			const charged = (fn: () => unknown, by = store) => {
+				const before = by.budget(now).writes;
 				fn();
-				return store.budget(now).writes - before;
+				return by.budget(now).writes - before;
 			};
 			const writes: number[] = [];
 			for (let index = 0; index < 5; index++) {
@@ -246,7 +246,7 @@ describe('history quota', () => {
 			// A refused page is charged only the budget row.
 			const limited = new Store(state, { historyBurstPerUser: 1, historyRequestsPerUserMinute: 1 }, { now: () => now });
 			limited.history({ roomId: 'general', limit: 1, now, userId: 'limited', ipKey: 'home' });
-			expect(charged(() => refusal(() => limited.history({ roomId: 'general', limit: 1, now, userId: 'limited', ipKey: 'home' })))).toBe(1);
+			expect(charged(() => refusal(() => limited.history({ roomId: 'general', limit: 1, now, userId: 'limited', ipKey: 'home' })), limited)).toBe(1);
 		});
 	});
 
