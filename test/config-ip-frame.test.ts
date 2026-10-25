@@ -6,7 +6,7 @@ import { PAID_PLAN } from '../src/plans/paid';
 import { canonicalizeIp, extractClientIp, hashIpKey, hashIpv6PrefixKey } from '../src/ip';
 import { withStore } from './helpers/store';
 import { StoreError } from '../src/store';
-import { DEFAULT_PARSE_OPTIONS, FrameError, parseFrame } from '../src/protocol';
+import { apronLink, DEFAULT_PARSE_OPTIONS, FrameError, parseFrame } from '../src/protocol';
 
 // Independent boundary cases from the implementation specification.
 describe('trusted IP boundaries', () => {
@@ -100,6 +100,13 @@ describe('frame policy boundaries', () => {
 		// Frames omit `jsonrpc` (§1); one that carries it is an unknown key, ignored.
 		expect(parseFrame('{"jsonrpc":"1.0","id":"a","method":"auth"}').request).toEqual({ method: 'auth', params: {}, id: 'a' });
 		expect(parseFrame('{"method":"unknown"}').request.id).toBeUndefined();
+	});
+});
+
+describe('links (Appendix A.4)', () => {
+	it('puts the server first in the fragment, leaving the URL readable and encoding the rest', () => {
+		expect(apronLink('wss://chat.example/ws', { token: 'apron_invite_x-1' })).toBe('https://link.apron.chat/#server=wss://chat.example/ws&token=apron_invite_x-1');
+		expect(apronLink('wss://chat.example/a b?c=d&e+f#g', { "it's": '100%' })).toBe('https://link.apron.chat/#server=wss://chat.example/a%20b%3Fc%3Dd%26e%2Bf%23g&it%27s=100%25');
 	});
 });
 

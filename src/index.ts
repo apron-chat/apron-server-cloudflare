@@ -12,6 +12,7 @@ import { signUploadToken, verifyUploadToken } from "./upload-token";
 import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
 import { extractClientIp, hashIpKey, hashIpv6PrefixKey, stripForwardingHeaders } from "./ip";
 import {
+	apronLink,
 	DEFINED_AUTH_SCHEMES,
 	errorFromUnknown,
 	FrameError,
@@ -2396,6 +2397,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.sendNotice(socket, roomId, uses === 0 ? "The sign-up invite is revoked." : [
 			`This invite signs up ${uses} new user${uses === 1 ? "" : "s"} until ${new Date(expiresMs).toISOString().slice(0, 16).replace("T", " ")} UTC, and replaces any earlier one. Each gets their own token to sign in again with, and can add a passkey after.`,
 			"```\n" + token + "\n```",
+			...this.tokenLink(socket, token, "Or send this link, which signs each of them up with any Apron app"),
 			`To sign up, authenticate with the token scheme and a name: \`{"method": "auth", "params": {"scheme": "token", "token": "${token}", "name": "Ada"}}\``,
 		].join("\n\n"));
 		this.reply(socket, request, {});
@@ -4138,7 +4140,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * recently active first. `filter` (`joined`, `not_joined`, or `all`, the
 	 * default) leaves out the other array; one it asks for is present even
 	 * when empty. With `members: true`, each room carries its `members` and
-	 * the result `users` (see membersOf). `latest_log_id` is validated and
+	 * the result `users` (see membersOf); `user_id` then lists only that
+	 * user, if they are a member (memberOf). `latest_log_id` is validated and
 	 * ignored: guests' memberships are not logged, so a delta could miss their
 	 * joins and leaves, and a result without `left` is a full listing. At most
 	 * `roomListRequestsPerUserMinute` listings per user, except the first
@@ -4156,6 +4159,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const withMembers = params.members === true;
 		const parent = optionalString(params, "parent_room_id");
 		const roomId = optionalString(params, "room_id");
+		const userId = optionalString(params, "user_id");
 		asDecimalId(params.latest_log_id, "latest_log_id");
 		const joinedIds = new Set(attachment.rooms ?? []);
 		const result: ListingResult = {};
@@ -4197,7 +4201,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// Without parent_room_id, unjoined threads are left to their parent's listing.
 			else if (roomId !== undefined || parent !== undefined || room.parent_room_id === undefined) result.not_joined?.push({ ...room });
 		}
-		if (withMembers) {
+		if (withMembers && userId !== undefined) {
+			const users = new Map<string, PublicUser>();
+			for (const room of [...(result.joined ?? []), ...(result.not_joined ?? [])]) {
+				const member = this.memberOf(room.room_id, userId, socket);
+				room.members = member ? [{ user_id: member.user_id }] : [];
+				if (member) users.set(member.user_id, member);
+			}
+			result.users = [...users.values()];
+		} else if (withMembers) {
 			const listed = [...(result.joined ?? []), ...(result.not_joined ?? [])];
 			const totals = new Map<string, number>();
 			const members = this.membersOf(listed.map((room) => room.room_id), totals, socket);
@@ -4552,8 +4564,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `/invite-token <user_id>` (a leading `@` is allowed): creates a
 	 * registered user with no passkey (Store.createInvitedIdentity), who signs
 	 * in with the bearer token the sender gets in a `~private` notice before
-	 * the result (§1). A taken `user_id` is `invalid_params`. The token does
-	 * not expire; `/purge` revokes it, and `/rename` moves it.
+	 * the result (§1), as is and in a link that any Apron app opens (Appendix
+	 * A.4). A taken `user_id` is `invalid_params`. The token does not expire;
+	 * `/purge` revokes it, and `/rename` moves it.
 	 */
 	private async inviteToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, target: string): Promise<void> {
 		const userId = target.replace(/^@/, "");
@@ -4573,9 +4586,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.sendNotice(socket, roomId, [
 			`Created \`${userId}\`, who signs in with this token instead of a passkey. It does not expire, and anyone who has it signs in as \`${userId}\`, so hand it over privately. \`/purge ${userId}\` removes them and the token.`,
 			"```\n" + token + "\n```",
+			...this.tokenLink(socket, token, "Or send them this link, which signs them in with any Apron app", attachment.endpoint),
 			`To sign in, authenticate with the token scheme: \`{"method": "auth", "params": {"scheme": "token", "token": "${token}"}}\``,
 		].join("\n\n"));
 		this.reply(socket, request, {});
+	}
+
+	/**
+	 * `lead` and a link that brings `token` to any Apron app (Appendix A.4),
+	 * for the WebSocket URL this connection reached, as one line of a notice;
+	 * none when that URL isn't known.
+	 */
+	private tokenLink(socket: WebSocketConnection, token: string, lead: string, fallback?: string): string[] {
+		const endpoint = connectionAttachment(socket)?.endpoint ?? fallback;
+		return endpoint ? [`${lead}: <${apronLink(endpoint, { token })}>`] : [];
 	}
 
 	/** After `/rename`, points the user's invite token, if any, at the new `user_id`. */
@@ -4992,6 +5016,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.sendNotice(socket, roomId, [
 			`This token signs in as you (\`${userId}\`) on your device **${name}**${replaced ? ", and replaces its earlier token" : ""}. It does not expire, and anyone who has it can sign in as you, so keep it secret. \`/invite-device ${name}\` again replaces it.`,
 			"```\n" + token + "\n```",
+			...this.tokenLink(socket, token, `Or open this link on **${name}**, which signs you in there with any Apron app`),
 			`To sign in, authenticate with the token scheme: \`{"method": "auth", "params": {"scheme": "token", "token": "${token}"}}\``,
 		].join("\n\n"));
 		this.reply(socket, request, {});
@@ -5094,6 +5119,25 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const statuses = new Map(this.withStatus([...unique.values()], choices, lister).map((user) => [user.user_id, user]));
 		for (const [roomId, list] of members) members.set(roomId, list.map((user) => statuses.get(user.user_id) ?? user));
 		return members;
+	}
+
+	/**
+	 * One member of a room, as membersOf lists them, for `room_list` with
+	 * `user_id` (§4.2.1): a registered member stored with the room, or a
+	 * connected one, guests included. Undefined when they aren't a member.
+	 */
+	private memberOf(roomId: string, userId: string, lister?: WebSocketConnection): PublicUser | undefined {
+		const stored = this.store.roomMember(roomId, userId, nowMs(), this.presenceMode());
+		const choices = new Map<string, StatusChoice>();
+		let member: PublicUser | undefined;
+		if (stored) {
+			const { choice, ...user } = stored;
+			member = user;
+			if (choice !== undefined) choices.set(user.user_id, choice);
+		} else {
+			member = this.connectedMembers().get(roomId)?.find((user) => user.user_id === userId);
+		}
+		return member && this.withStatus([member], choices, lister)[0];
 	}
 
 	/**
