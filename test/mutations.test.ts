@@ -1,5 +1,6 @@
 import { expect, it } from "vitest";
-import { MAX_CREATED_ROOMS, MOVE_REACTION_SETS_PER_POST, RETENTION_MS, Store, StoreError, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
+import { ADMIN_USER_ID, MAX_CREATED_ROOMS, MOVE_REACTION_SETS_PER_POST, RETENTION_MS, Store, StoreError, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
+import { UPLOAD_POLICY } from "../src/budget";
 import { errorCode, expectRetryAfter, messagesOf, withStore as withNamedStore, type TestClock } from "./helpers/store";
 
 // Semantics tests use roomy posting windows; quota tests below use tiny ones.
@@ -699,6 +700,45 @@ it("lets a threader move anyone's messages in and out of threads, create threads
 		store.setRole({ userId: "tia", role: "threader", on: false, now: clock.value });
 		expect(errorCode(() => store.mutate(op(clock, "tia", "after", "message", resubmit(second.message, "general"))))).toBe("denied");
 	});
+});
+
+it("lets every moderator role, the built-in admin included, move anyone's message with embeds, an upload and ext, thread to thread", async () => {
+	await withStore("move-any-content", (store, clock) => {
+		store.createInvitedIdentity({ userId: "mia", name: "mia", now: clock.value, ipKey: "ip-test" });
+		store.createInvitedIdentity({ userId: "tia", name: "tia", now: clock.value, ipKey: "ip-test" });
+		store.createInvitedIdentity({ userId: "ada", name: "ada", now: clock.value, ipKey: "ip-test" });
+		store.setRole({ userId: "mia", role: "mod", on: true, now: clock.value });
+		store.setRole({ userId: "tia", role: "threader", on: true, now: clock.value });
+		store.setRole({ userId: "ada", role: "admin", on: true, now: clock.value });
+		store.ensureAdminUser({ userId: ADMIN_USER_ID, name: "Admin", now: clock.value, ipKey: "ip-test" });
+		store.registerIdentity({
+			userId: "rita", name: "rita", userHandle: "handle-rita", now: clock.value, ipKey: "ip-test",
+			credential: { credentialId: "cred-rita", userId: "rita", publicKey: "AAAA", counter: 0 },
+		});
+		const created = post(store, clock, "rita", "rich", {
+			body: { text: "look https://example.com", format: "markdown", mentions: ["tia"], embeds: [{ kind: "link", url: "https://example.com", og: { title: "Example" } }, { kind: "upload", title: "dot.png" }] },
+			ext: { irc: { nick: "rita_" } },
+		});
+		const key = (created.result.embeds as Array<{ write: { key: string } }>)[0].write.key;
+		expect(store.claimUpload(key, clock.value)).toBe(true);
+		const finished = store.finishUpload({ key, ok: true, bytes: 64, contentType: "image/png", width: 1, height: 1 }, clock.value);
+		const guest = post(store, clock, "guest_7", "guest", { body: { text: "a guest's" } });
+		const first = thread(store, clock, "first");
+		const second = thread(store, clock, "second");
+		// The stored client fields as a client received them, with a new room_id.
+		const resubmit = (message: Record<string, unknown>, roomId: string) => ({ message_id: message.message_id, room_id: roomId, body: message.body, ext: message.ext });
+
+		for (const mover of ["tia", "mia", "ada", ADMIN_USER_ID]) {
+			let current = finished.broadcasts[0].params;
+			for (const roomId of [first, second, "general"]) {
+				current = store.mutate(op(clock, mover, `${mover}-${roomId}`, "message", resubmit(current, roomId))).message as unknown as Record<string, unknown>;
+				expect(current).toMatchObject({ room_id: roomId, from: { user_id: "rita" }, body: finished.broadcasts[0].params.body, ext: { irc: { nick: "rita_" } } });
+			}
+			const moved = store.mutate(op(clock, mover, `${mover}-guest-in`, "message", resubmit(guest.message as unknown as Record<string, unknown>, first))).message!;
+			expect(moved).toMatchObject({ room_id: first, from: { user_id: "guest_7" } });
+			store.mutate(op(clock, mover, `${mover}-guest-out`, "message", resubmit(moved as unknown as Record<string, unknown>, "general")));
+		}
+	}, { ...ROOMY, uploads: { ...UPLOAD_POLICY!, mediaOrigin: "https://media.test" } });
 });
 
 it("lets an admin or a mod create and edit top-level rooms, which hold threads and count against the thread ceiling", async () => {
