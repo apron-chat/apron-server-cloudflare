@@ -285,7 +285,10 @@ it('/invite-device mints up to three named tokens that sign in as the user, a na
 	const mint = async (name: string) => {
 		const minted = await command(owner, `device-${name}`, `/invite-device ${name}`);
 		expect(minted.frame.result).toEqual({});
-		return minted.notice!.params.body.text.match(/```\n(apron_device_[A-Za-z0-9_-]{43})\n```/)![1] as string;
+		const token = minted.notice!.params.body.text.match(/```\n(apron_device_[A-Za-z0-9_-]{43})\n```/)![1] as string;
+		// The same token in a link that any Apron app opens (Appendix A.4).
+		expect(minted.notice!.params.body.text).toContain(`<https://link.apron.chat/#server=wss://demo.test/ws&token=${token}>`);
+		return token;
 	};
 	try {
 		expect((await command(owner, 'help', '/help')).notice!.params.body.text).toContain('/invite-device <name>');
@@ -841,6 +844,7 @@ it('/invite mints a sign-up token that creates a user per use, each with its own
 		const minted = await command(admin, 'invite', '/invite 2');
 		expect(minted.frame.result).toEqual({});
 		const invite = /apron_join_[A-Za-z0-9_-]+/.exec(minted.notice!.params.body.text)![0];
+		expect(minted.notice!.params.body.text).toContain(`<https://link.apron.chat/#server=wss://demo.test/ws&token=${invite}>`);
 
 		// A guest signs up with it: a new registered user, named as asked, with its own token.
 		const ada = await fresh();

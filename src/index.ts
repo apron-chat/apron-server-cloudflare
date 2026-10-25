@@ -2367,6 +2367,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.sendNotice(socket, roomId, uses === 0 ? "The sign-up invite is revoked." : [
 			`This invite signs up ${uses} new user${uses === 1 ? "" : "s"} until ${new Date(expiresMs).toISOString().slice(0, 16).replace("T", " ")} UTC, and replaces any earlier one. Each gets their own token to sign in again with, and can add a passkey after.`,
 			"```\n" + token + "\n```",
+			...this.tokenLink(socket, token, "Or send this link, which signs each of them up with any Apron app"),
 			`To sign up, authenticate with the token scheme and a name: \`{"method": "auth", "params": {"scheme": "token", "token": "${token}", "name": "Ada"}}\``,
 		].join("\n\n"));
 		this.reply(socket, request, {});
@@ -4513,14 +4514,23 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await this.ctx.storage.put<StoredInviteToken>(key, { v: 1, userId });
 			await this.ctx.storage.put<StoredBot>(INVITE_KEY_PREFIX + userId, { v: 1, tokenKey: key });
 		}));
-		const endpoint = connectionAttachment(socket)?.endpoint ?? attachment.endpoint;
 		this.sendNotice(socket, roomId, [
 			`Created \`${userId}\`, who signs in with this token instead of a passkey. It does not expire, and anyone who has it signs in as \`${userId}\`, so hand it over privately. \`/purge ${userId}\` removes them and the token.`,
 			"```\n" + token + "\n```",
-			...(endpoint ? [`Or send them this link, which signs them in with any Apron app: <${apronLink(endpoint, { token })}>`] : []),
+			...this.tokenLink(socket, token, "Or send them this link, which signs them in with any Apron app", attachment.endpoint),
 			`To sign in, authenticate with the token scheme: \`{"method": "auth", "params": {"scheme": "token", "token": "${token}"}}\``,
 		].join("\n\n"));
 		this.reply(socket, request, {});
+	}
+
+	/**
+	 * `lead` and a link that brings `token` to any Apron app (Appendix A.4),
+	 * for the WebSocket URL this connection reached, as one line of a notice;
+	 * none when that URL isn't known.
+	 */
+	private tokenLink(socket: WebSocketConnection, token: string, lead: string, fallback?: string): string[] {
+		const endpoint = connectionAttachment(socket)?.endpoint ?? fallback;
+		return endpoint ? [`${lead}: <${apronLink(endpoint, { token })}>`] : [];
 	}
 
 	/** After `/rename`, points the user's invite token, if any, at the new `user_id`. */
@@ -4937,6 +4947,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.sendNotice(socket, roomId, [
 			`This token signs in as you (\`${userId}\`) on your device **${name}**${replaced ? ", and replaces its earlier token" : ""}. It does not expire, and anyone who has it can sign in as you, so keep it secret. \`/invite-device ${name}\` again replaces it.`,
 			"```\n" + token + "\n```",
+			...this.tokenLink(socket, token, `Or open this link on **${name}**, which signs you in there with any Apron app`),
 			`To sign in, authenticate with the token scheme: \`{"method": "auth", "params": {"scheme": "token", "token": "${token}"}}\``,
 		].join("\n\n"));
 		this.reply(socket, request, {});
