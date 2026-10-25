@@ -13,8 +13,9 @@ replacement/deletion/restoration/moves, thread rooms, emoji reactions, and a
 rolling retention floor. Guests only read (set `GUEST_POSTING=true` to let
 them post); signing in with a passkey lets a user post and invite a bot. It speaks protocol 9 with `history`,
 `edit`, `rooms`, `reactions`, `command` (`/help`, `/invite-bot`, and admin
-commands), and `ext` with its own extension `ext:settings`, and `ext:limits`; `embed:upload`
-when uploads are configured; `status` and push when VAPID keys are set; and
+commands), and `ext` with its own extension `ext:settings`, and `ext:limits` and
+`ext:permissions`; `embed:upload` and `ext:media` when uploads are configured;
+`status` and push when VAPID keys are set; and
 liveness pings and, with the Workers Paid budgets, typing through `activity`
 (`ACTIVITY` overrides); see [authentication and policy](policy.md) and [the
 implementation specification](../SPEC.md).
@@ -425,10 +426,13 @@ hostile traffic: rejected HTTP requests and incoming frames still cost platform
 resources. Local calibration is not proof of production billing or availability.
 
 Failed WebSocket handshakes can be diagnosed with an HTTP GET to the same `/`
-or `/ws` URL with `?apron_connection_status=1`. The response exposes `Retry-After`
-through CORS and disables caching. It checks live connection capacity and the
-cached daily SQL budget without reserving SQL work or opening a socket; it is
-advisory, and the real upgrade still enforces every admission gate. The native
+or `/ws` URL with `?apron_connection_status=1`. The response carries
+`Apron-Connection-Status: 1`, which marks it as the probe's own answer (clients
+ignore a reply without it, such as an edge's or a proxy's), exposes it and
+`Retry-After` through CORS, and disables caching. It checks live connection
+capacity and the cached daily SQL budget without reserving SQL work or opening
+a socket; it is advisory, and the real upgrade still enforces every admission
+gate. The native
 attempt limiters (per address, per IPv6 /48, and per location) also apply to
 these probes.
 

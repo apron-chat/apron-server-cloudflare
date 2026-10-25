@@ -2,8 +2,11 @@
 // sender, so the public bucket serves nothing a browser would run as a
 // document. Dimensions go in `og.image` when the header gives them cheaply.
 
+/** The image types sniffImage recognizes, and so the only ones kept. */
+export const IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"] as const;
+
 interface ImageInfo {
-	type: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+	type: typeof IMAGE_TYPES[number];
 	width?: number;
 	height?: number;
 }

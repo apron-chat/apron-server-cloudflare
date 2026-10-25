@@ -1,6 +1,6 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { expect, it, vi } from 'vitest';
-import { DEFAULT_LIMITS } from '../src/budget';
+import { DEFAULT_LIMITS, UPLOAD_POLICY } from '../src/budget';
 import { canonicalizeIp, hashIpKey } from '../src/ip';
 import { connect as open, exchange, greeting, reply, request, until, type ConnectOptions, type Frame, type Peer } from './helpers/socket';
 
@@ -45,11 +45,11 @@ const connect = ({ ip = `192.0.2.${nextIp++}`, ...options }: Partial<ConnectOpti
 async function authenticate(peer: Peer, scheme = 'guest', extraCaps: string[] = []) {
 	const { server } = await greeting(peer);
 	expect(server.params.apron).toBe(9);
-	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'status', 'ext', 'ext:settings', 'ext:limits']);
+	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'status', 'ext', 'ext:settings', 'ext:limits', 'ext:media', 'ext:permissions']);
 	expect(server.params.auth).toContain('webauthn');
 	expect(server.params.ping).toBe(45);
-	// The extension `ext:settings` keeps its data under its name in ext (§4, §4.12).
-	expect(Object.keys(server.params.ext)).toEqual(['settings']);
+	// The extensions `ext:settings` and `ext:media` keep their data under their names in ext (§4, §4.12).
+	expect(Object.keys(server.params.ext)).toEqual(['settings', 'media']);
 	peer.send({ method: 'auth', id: 'auth', params: { scheme } });
 	const auth = await peer.next();
 	expect(auth.result.you.user_id).toMatch(/^guest_/);
@@ -928,20 +928,32 @@ it('never closes the connection whose frame starts a sweep as stale, though it l
 	} finally { vi.restoreAllMocks(); alice.close(); bob.close(); await configure((config) => { config.limits.pingTimeoutSeconds = 150; }); }
 });
 
-it('advertises the extensions ext:settings and ext:limits', async () => {
+it('advertises the extensions ext:settings, ext:limits, ext:media and ext:permissions', async () => {
 	const peer = await connect();
 	try {
 		const server = (await peer.next()).params;
 		expect(server.capabilities).toContain('ext:settings');
 		expect(server.capabilities).toContain('ext:limits');
-		// Each boolean always sent; clients take an absent one as true.
-		expect(server.ext).toEqual({ settings: {
-			// vitest.config.ts turns guest posting on.
-			guest_posting: true,
-			read_cursors: false,
-			// No admin has turned `/toggle addmember` off.
-			add_members: true,
-		} });
+		expect(server.capabilities).toContain('ext:media');
+		expect(server.capabilities).toContain('ext:permissions');
+		const file = { max_bytes: UPLOAD_POLICY!.maxFileBytes };
+		const avatar = { max_bytes: UPLOAD_POLICY!.maxAvatarBytes };
+		expect(server.ext).toEqual({
+			// Each boolean always sent; clients take an absent one as true.
+			settings: {
+				// vitest.config.ts turns guest posting on.
+				guest_posting: true,
+				read_cursors: false,
+				// No admin has turned `/toggle addmember` off.
+				add_members: true,
+			},
+			// MEDIA_ORIGIN is not PUBLIC_ORIGIN, and every type the write keeps, exactly.
+			media: {
+				origins: ['https://media.test'],
+				upload: { 'image/png': file, 'image/jpeg': file, 'image/gif': file, 'image/webp': file, 'audio/webm': file, 'audio/ogg': file, 'audio/mp4': file },
+				avatar: { 'image/png': avatar, 'image/jpeg': avatar, 'image/gif': avatar, 'image/webp': avatar },
+			},
+		});
 	} finally { peer.close(); }
 });
 

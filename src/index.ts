@@ -5,8 +5,8 @@ import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTI
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor } from "./account-usage";
 import { EDGE_STOP_RULE_REF, readEdgeStop, runBudgetGuard, watchForFlood } from "./budget-guard";
-import { sniffAudio } from "./audio";
-import { sniffImage } from "./image";
+import { AUDIO_TYPES, sniffAudio } from "./audio";
+import { IMAGE_TYPES, sniffImage } from "./image";
 import { limitData } from "./store-error";
 import { signUploadToken, verifyUploadToken } from "./upload-token";
 import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
@@ -47,6 +47,8 @@ import {
 	MAX_ROOM_MUTES_PER_USER,
 	ROOM_ID,
 	MAX_USER_EXT_BYTES,
+	MODERATOR_ROLES,
+	clientUserExt,
 	mergeExt,
 	userExtFits,
 	Store,
@@ -1042,8 +1044,12 @@ export async function fetchEntry(request: Request, env: Env, ctx?: ExecutionCont
 	if (!isConnectionStatus(request)) return response;
 	const headers = new Headers(response.headers);
 	headers.set("Access-Control-Allow-Origin", "*");
-	headers.set("Access-Control-Expose-Headers", "Retry-After");
+	headers.set("Access-Control-Expose-Headers", "Retry-After, Apron-Connection-Status");
 	headers.set("Cache-Control", "no-store");
+	// Marks the probe's own answers, on the WebSocket URLs, so a client can
+	// tell them from an edge's, a proxy's, or the assets' for other paths.
+	const { pathname } = new URL(request.url);
+	if (pathname === "/" || pathname === "/ws") headers.set("Apron-Connection-Status", "1");
 	return new Response(response.body, { status: response.status, headers });
 }
 
@@ -1537,9 +1543,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 					// The `ext` clients write on users, messages, and rooms is kept,
 					// and writes merge it one level deep (§4.12).
 					"ext",
-					// This server's extensions: `ext.settings` below, and
-					// `ext.limits` on `retry_after` errors (limitData).
+					// This server's extensions: `ext.settings` below, `ext.limits`
+					// on `retry_after` errors (limitData), `ext.media` below where
+					// uploads are configured, and `ext.permissions` on `you`
+					// (permissions).
 					"ext:settings", "ext:limits",
+					...(this.config.uploads ? ["ext:media"] : []),
+					"ext:permissions",
 				],
 				// Passkeys and their session tokens only where passkeys are offered;
 				// bot tokens (`/invite-bot`) from anywhere, since bots are not browsers.
@@ -1569,8 +1579,28 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// `read_message_id` is kept or relayed; always `false` here.
 				// `add_members`: registered users may add others to rooms with
 				// `room_join` and a `user_id`; `/toggle addmember` turns it off.
-				ext: { settings: { guest_posting: this.config.guestPosting, read_cursors: false, add_members: this.addMemberOn() } },
+				ext: {
+					settings: { guest_posting: this.config.guestPosting, read_cursors: false, add_members: this.addMemberOn() },
+					...(this.config.uploads ? { media: this.mediaSettings(this.config.uploads) } : {}),
+				},
 			},
+		};
+	}
+
+	/**
+	 * Extension `ext:media`, from apron-web's EXT.md: the origin uploads are
+	 * served from, where it is not this server's own, and while uploads are
+	 * on, the types a write keeps (sniffImage and, for attachments,
+	 * sniffAudio), each with its largest size. No image side is limited.
+	 */
+	private mediaSettings(uploads: NonNullable<RuntimeConfig["uploads"]>): Record<string, unknown> {
+		const sized = (types: readonly string[], maxBytes: number) => Object.fromEntries(types.map((type) => [type, { max_bytes: maxBytes }]));
+		return {
+			...(uploads.mediaOrigin !== uploads.publicOrigin ? { origins: [uploads.mediaOrigin] } : {}),
+			...(this.uploadsOn() && UPLOAD_POLICY ? {
+				upload: sized([...IMAGE_TYPES, ...AUDIO_TYPES], UPLOAD_POLICY.maxFileBytes),
+				avatar: sized(IMAGE_TYPES, UPLOAD_POLICY.maxAvatarBytes),
+			} : {}),
 		};
 	}
 
@@ -2535,7 +2565,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const name = optionalString(request.params, "name");
 		const avatar = optionalString(request.params, "avatar");
 		const status = optionalString(request.params, "status");
-		const ext = objectParam(request.params, "ext", false);
+		// The keys the server owns, `permissions`, are ignored like `roles`.
+		const ext = clientUserExt(objectParam(request.params, "ext", false));
 		const writesExt = ext !== undefined && Object.keys(ext).length > 0;
 		if (name !== undefined && attachment.tier !== "registered") {
 			throw { name: "denied", message: "Only registered users may change their name" } satisfies ProtocolError;
@@ -3123,7 +3154,33 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private you(attachment: ConnectionAttachment): PublicUser | null {
 		const user = this.complete(attachment);
 		if (!user) return user;
-		return { ...user, ...this.ownStatus(attachment) };
+		return { ...this.withPermissions(user, attachment), ...this.ownStatus(attachment) };
+	}
+
+	/**
+	 * What a connection's user may do to other users' messages and
+	 * memberships (extension `ext:permissions`, from apron-web's EXT.md), for
+	 * their own `you` only: `move_any`, moving others' messages between
+	 * rooms, for a registered user with a moderator role (MODERATOR_ROLES,
+	 * which the store checks) but an owner's bot, whose identity tier is
+	 * `bot`; `add_members`, adding others to rooms with `room_join` and a
+	 * `user_id`, for an admin and, while `addmember` is on, any other
+	 * registered user not a bot (assertMayManage). Adding one's own bot needs
+	 * neither. A registered user's is `[]` when they have none, as `roles`
+	 * is, so it clears; guests have none.
+	 */
+	private permissions(attachment: ConnectionAttachment): string[] | undefined {
+		if (attachment.tier !== "registered") return undefined;
+		return [
+			...(!isBotId(attachment.userId) && MODERATOR_ROLES.some((role) => hasRole(attachment, role)) ? ["move_any"] : []),
+			...(!hasRole(attachment, "bot") && (hasRole(attachment, "admin") || this.addMemberOn()) ? ["add_members"] : []),
+		];
+	}
+
+	/** A user object as the user's own `you`: with their `permissions` in `ext` (see permissions), beside its other keys. */
+	private withPermissions(user: PublicUser, attachment: ConnectionAttachment): PublicUser {
+		const permissions = this.permissions(attachment);
+		return permissions ? { ...user, ext: { ...user.ext, permissions } } : user;
 	}
 
 	/** The `status` a connection's user chose, as their own `you` carries it (see you). */
@@ -4325,7 +4382,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * connected member listings, and mutes and `dnd` still silence pushes.
 	 * Turned on, it starts from each user's status then, and each signed-in
 	 * connection is sent the statuses others see as after a sign-in
-	 * (sendShownStatus).
+	 * (sendShownStatus). With `addmember` toggled, connected registered
+	 * users but admins and bots get `user` `you` with their new
+	 * `permissions`.
 	 */
 	private toggle(socket: WebSocketConnection, request: RequestFrame, roomId: string, feature: string): void {
 		const features: ToggleFeature[] = ["activity", ...(this.config.uploads ? ["uploads" as const] : []), ...(this.config.push ? ["presence" as const] : []), "addmember"];
@@ -4336,6 +4395,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const override = on === fallback ? undefined : on;
 		this.store.setToggle(chosen, override, nowMs());
 		this.toggles.set(chosen, override);
+		// Registered users' `add_members` follows the toggle, but admins' and
+		// bots' (permissions): the rest get `user` `you` with the new value.
+		if (chosen === "addmember") {
+			for (const ws of this.ctx.getWebSockets()) {
+				const socket = ws as WebSocketConnection;
+				const state = openSocket(socket) ? connectionAttachment(socket) : null;
+				if (!state?.userId || state.tier !== "registered" || hasRole(state, "admin") || hasRole(state, "bot")) continue;
+				this.deliverTo(socket, { method: "user", params: { you: { user_id: state.userId, ext: { permissions: this.permissions(state) } } } });
+			}
+		}
 		// What was announced before is forgotten: it starts again from each
 		// connected user's status now (flushPresence records it).
 		if (chosen === "presence") {
@@ -5132,8 +5201,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (socket === origin) continue;
 			const state = connectionAttachment(socket);
 			if (!state) continue;
-			// The user's own connections get `you`, with the status they chose (§4.5).
-			if (state.userId === identity.user_id) this.deliverTo(socket, { method: "user", params: { you: { ...identity, ...this.ownStatus(state) } } });
+			// The user's own connections get `you`, with their permissions and the
+			// status they chose (§4.5).
+			if (state.userId === identity.user_id) this.deliverTo(socket, { method: "user", params: { you: { ...this.withPermissions(identity, state), ...this.ownStatus(state) } } });
 			else if (state.rooms?.some((id) => shared.has(id))) this.deliverTo(socket, { method: "user", params: { new: others, ...(old ? { old } : {}) } });
 		}
 	}

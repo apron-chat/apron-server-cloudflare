@@ -991,11 +991,25 @@ function changedExt(before: Record<string, unknown> | undefined, after: Record<s
   return changed.size ? Object.fromEntries(changed) : undefined;
 }
 
-/** An identity row's `ext_json`: its object, or undefined when empty or unreadable. */
+/**
+ * Keys of a user's `ext` that the server owns: `permissions` (extension
+ * `ext:permissions`), which only the user's own `you` carries. A `me` write
+ * of one is ignored, like `roles`, and one stored before is never read.
+ */
+const SERVER_USER_EXT_KEYS: readonly string[] = ["permissions"];
+
+/** A user's `ext` without the keys the server owns (SERVER_USER_EXT_KEYS), or undefined when nothing is left. */
+export function clientUserExt(ext: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!ext || !SERVER_USER_EXT_KEYS.some((key) => Object.hasOwn(ext, key))) return ext;
+  const kept = Object.fromEntries(Object.entries(ext).filter(([key]) => !SERVER_USER_EXT_KEYS.includes(key)));
+  return Object.keys(kept).length ? kept : undefined;
+}
+
+/** An identity row's `ext_json`: its object without server-owned keys, or undefined when empty or unreadable. */
 function parseUserExt(json: string | null | undefined): Record<string, unknown> | undefined {
   if (!json) return undefined;
   const parsed = parseJson<unknown>(json, null);
-  return isPlainObject(parsed) && Object.keys(parsed).length ? parsed : undefined;
+  return isPlainObject(parsed) && Object.keys(parsed).length ? clientUserExt(parsed) : undefined;
 }
 
 /** Whether a user's merged `ext` fits MAX_USER_EXT_BYTES. */
@@ -4727,7 +4741,8 @@ export class Store {
 
   /**
    * A `me` profile write (§3.3) of a registered user: `name`, where `""`
-   * removes it, and `ext`, merged into the stored one (§4.12) and at most
+   * removes it, and `ext`, but for the keys the server owns
+   * (SERVER_USER_EXT_KEYS), merged into the stored one (§4.12) and at most
    * MAX_USER_EXT_BYTES after the merge. One identity row update, or none
    * when neither changes. `profile` has the user's whole `ext` after the
    * write and the keys it changed (changedExt).
@@ -4739,7 +4754,7 @@ export class Store {
       ensureText(name, "name", this.config.maxNameBytes);
       if ([...name].length > this.config.maxNameCodePoints) throw new StoreError("too_large", "name is too long");
     }
-    const write = this.optionalExt(input.params.ext);
+    const write = clientUserExt(this.optionalExt(input.params.ext));
     const existing = this.identityRow(input.userId);
     if (!existing) throw new StoreError("denied", "Only registered users may change their profile");
     const before = parseUserExt(existing.ext_json);

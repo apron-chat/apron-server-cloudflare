@@ -23,7 +23,9 @@ it('exposes daily exhaustion and Retry-After to browsers without spending SQL or
 			expect(response.status).toBe(429);
 			expect(await response.json()).toEqual({ error: 'Daily demo capacity reached' });
 			expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*');
-			expect(response.headers.get('Access-Control-Expose-Headers')).toBe('Retry-After');
+			expect(response.headers.get('Access-Control-Expose-Headers')).toBe('Retry-After, Apron-Connection-Status');
+			// Marks the probe's own answer, which clients read; others they ignore.
+			expect(response.headers.get('Apron-Connection-Status')).toBe('1');
 			expect(response.headers.get('Cache-Control')).toBe('no-store');
 			const retry = Number(response.headers.get('Retry-After'));
 			expect(Math.abs(retry - (86400 - Date.now() % 86400000 / 1000))).toBeLessThan(3);
@@ -79,4 +81,15 @@ it('keeps origin checks on the diagnostic path', async () => {
 	});
 	expect(response.status).toBe(403);
 	expect(await response.json()).toEqual({ error: 'Origin not allowed' });
+	expect(response.headers.get('Apron-Connection-Status')).toBe('1');
+});
+
+it('marks only the probe\'s own answers on the WebSocket URLs, not other paths or upgrades', async () => {
+	const other = await SELF.fetch('https://demo.test/elsewhere?apron_connection_status=1', { headers });
+	expect(other.headers.get('Apron-Connection-Status')).toBeNull();
+	await other.arrayBuffer();
+	const upgrade = await SELF.fetch('https://demo.test/ws', { headers: { ...headers, Origin: 'https://not-allowed.test', Upgrade: 'websocket' } });
+	expect(upgrade.status).toBe(403);
+	expect(upgrade.headers.get('Apron-Connection-Status')).toBeNull();
+	await upgrade.arrayBuffer();
 });

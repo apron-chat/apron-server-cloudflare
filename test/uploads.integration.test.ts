@@ -501,7 +501,7 @@ describe('uploads end to end', () => {
 			expect(embed.write_url).toMatch(/^https:\/\/demo\.test\/w\/a\./);
 			expect((await put(embed.write_url, png())).status).toBe(204);
 			const you = (await until(peer, (frame) => frame.method === 'user')).frame.params.you;
-			expect(you).toEqual({ user_id: userId, name: `Name of ${userId}`, avatar: expect.stringMatching(/^https:\/\/media\.test\/a\//), roles: [], status: 'online' });
+			expect(you).toEqual({ user_id: userId, name: `Name of ${userId}`, avatar: expect.stringMatching(/^https:\/\/media\.test\/a\//), roles: [], ext: { permissions: ['add_members'] }, status: 'online' });
 			expect((await request(peer, 'me', 'me', {})).result.you.avatar).toBe(you.avatar);
 			// A message's author is a recorded object, without the avatar.
 			const posted = await exchange(peer, 'post', 'message', { body: { text: 'hi' } });
@@ -581,6 +581,33 @@ describe('uploads end to end', () => {
 		} finally { watcher.close(); }
 	});
 
+	it('advertises ext:media only where uploads are configured, naming the media origin only when it is not the server\'s', async () => {
+		const setUploads = (uploads: unknown) => runInDurableObject(stub(), (instance) => {
+			const server = instance as unknown as { config: { uploads?: unknown } };
+			const original = server.config.uploads;
+			server.config = { ...server.config, uploads };
+			return original;
+		});
+		const announced = async () => {
+			const peer = await connect();
+			try { return (await peer.next()).params; } finally { peer.close(); }
+		};
+		const original = await setUploads(undefined);
+		try {
+			const bare = await announced();
+			expect(bare.capabilities).not.toContain('ext:media');
+			expect(bare.ext).not.toHaveProperty('media');
+			await setUploads({ ...(original as object), mediaOrigin: 'https://demo.test' });
+			const same = await announced();
+			expect(same.ext.media).not.toHaveProperty('origins');
+			expect(same.ext.media.upload['image/png']).toEqual({ max_bytes: UPLOAD_POLICY!.maxFileBytes });
+			expect(same.ext.media.avatar['image/png']).toEqual({ max_bytes: UPLOAD_POLICY!.maxAvatarBytes });
+			// Audio is kept as an attachment only, never as an avatar.
+			expect(same.ext.media.upload['audio/webm']).toBeDefined();
+			expect(same.ext.media.avatar['audio/webm']).toBeUndefined();
+		} finally { await setUploads(original); }
+	});
+
 	it('/toggle uploads turns uploads off and on for admins, saying which', async () => {
 		const user = await signedIn(unique('toggler'));
 		const admin = await connect(null);
@@ -596,13 +623,19 @@ describe('uploads end to end', () => {
 			expect(refused.error.message).toBe('Uploads are turned off here');
 			expect((await request(user, 'avatar', 'command', { body: { text: '/avatar', embeds: [{ kind: 'upload' }] } })).error.code).toBe(-32602);
 			const late = await connect();
-			expect((await late.next()).params.capabilities).not.toContain('embed:upload');
+			const offered = (await late.next()).params;
+			expect(offered.capabilities).not.toContain('embed:upload');
+			// Uploads already made are still served from the media origin, but nothing more is accepted.
+			expect(offered.capabilities).toContain('ext:media');
+			expect(offered.ext.media).toEqual({ origins: [MEDIA] });
 			late.close();
 			const on = await toggle('on');
 			expect(notice(on.skipped)).toBe('Uploads are now **on**.');
 			expect((await request(user, 'post2', 'message', { body: { text: 'y', embeds: [{ kind: 'upload' }] } })).result.embeds).toHaveLength(1);
 			const fresh = await connect();
-			expect((await fresh.next()).params.capabilities).toContain('embed:upload');
+			const back = (await fresh.next()).params;
+			expect(back.capabilities).toContain('embed:upload');
+			expect(Object.keys(back.ext.media)).toEqual(['origins', 'upload', 'avatar']);
 			fresh.close();
 			expect((await request(user, 'nope', 'command', { body: { text: '/toggle uploads' } })).error.code).toBe(-32001);
 			expect((await request(admin, 'bad', 'command', { room_id: 'general', body: { text: '/toggle typing' } })).error.message).toBe('Usage: /toggle activity|uploads|presence|addmember');
