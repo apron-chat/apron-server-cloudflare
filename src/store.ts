@@ -2617,6 +2617,30 @@ export class Store {
     return members;
   }
 
+  /** One registered member of a room, for `room_list` with `user_id` (§4.2.1), or null when they aren't one. */
+  roomMember(roomId: string, userId: string, now = this.clock.now(), withStatus = false): RoomMember | null {
+    this.ensureReady();
+    return this.reserved({ reads: 8 + (withStatus ? 3 : 2) }, false, now, () => {
+      const row = this.rawRows<RawMemberRow>(
+        withStatus
+          ? `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json, s.status
+             FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id LEFT JOIN user_status s ON s.user_id = m.user_id
+             WHERE m.room_id = ? AND m.user_id = ? LIMIT 1`
+          : `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id
+             WHERE m.room_id = ? AND m.user_id = ? LIMIT 1`,
+        roomId, userId,
+      )[0];
+      if (!row) return null;
+      const avatar = liveAvatar(row, now);
+      const ext = parseUserExt(row.ext_json);
+      return {
+        user_id: row.user_id, name: row.name ?? "", ...(avatar ? { avatar } : {}), roles: parseRoles(row.roles_json),
+        ...(ext ? { ext } : {}),
+        ...(withStatus ? { choice: choiceColumn(row.status) } : {}),
+      };
+    });
+  }
+
   getCredential(credentialId: string): StoredCredential | null {
     this.ensureReady();
     return this.reserved({ reads: 8 }, false, this.clock.now(), () => this.credentialValue(credentialId));

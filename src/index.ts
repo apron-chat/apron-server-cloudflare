@@ -4082,7 +4082,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * recently active first. `filter` (`joined`, `not_joined`, or `all`, the
 	 * default) leaves out the other array; one it asks for is present even
 	 * when empty. With `members: true`, each room carries its `members` and
-	 * the result `users` (see membersOf). `latest_log_id` is validated and
+	 * the result `users` (see membersOf); `user_id` then lists only that
+	 * user, if they are a member (memberOf). `latest_log_id` is validated and
 	 * ignored: guests' memberships are not logged, so a delta could miss their
 	 * joins and leaves, and a result without `left` is a full listing. At most
 	 * `roomListRequestsPerUserMinute` listings per user, except the first
@@ -4100,6 +4101,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const withMembers = params.members === true;
 		const parent = optionalString(params, "parent_room_id");
 		const roomId = optionalString(params, "room_id");
+		const userId = optionalString(params, "user_id");
 		asDecimalId(params.latest_log_id, "latest_log_id");
 		const joinedIds = new Set(attachment.rooms ?? []);
 		const result: ListingResult = {};
@@ -4141,7 +4143,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// Without parent_room_id, unjoined threads are left to their parent's listing.
 			else if (roomId !== undefined || parent !== undefined || room.parent_room_id === undefined) result.not_joined?.push({ ...room });
 		}
-		if (withMembers) {
+		if (withMembers && userId !== undefined) {
+			const users = new Map<string, PublicUser>();
+			for (const room of [...(result.joined ?? []), ...(result.not_joined ?? [])]) {
+				const member = this.memberOf(room.room_id, userId, socket);
+				room.members = member ? [{ user_id: member.user_id }] : [];
+				if (member) users.set(member.user_id, member);
+			}
+			result.users = [...users.values()];
+		} else if (withMembers) {
 			const listed = [...(result.joined ?? []), ...(result.not_joined ?? [])];
 			const totals = new Map<string, number>();
 			const members = this.membersOf(listed.map((room) => room.room_id), totals, socket);
@@ -5029,6 +5039,25 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const statuses = new Map(this.withStatus([...unique.values()], choices, lister).map((user) => [user.user_id, user]));
 		for (const [roomId, list] of members) members.set(roomId, list.map((user) => statuses.get(user.user_id) ?? user));
 		return members;
+	}
+
+	/**
+	 * One member of a room, as membersOf lists them, for `room_list` with
+	 * `user_id` (§4.2.1): a registered member stored with the room, or a
+	 * connected one, guests included. Undefined when they aren't a member.
+	 */
+	private memberOf(roomId: string, userId: string, lister?: WebSocketConnection): PublicUser | undefined {
+		const stored = this.store.roomMember(roomId, userId, nowMs(), this.presenceMode());
+		const choices = new Map<string, StatusChoice>();
+		let member: PublicUser | undefined;
+		if (stored) {
+			const { choice, ...user } = stored;
+			member = user;
+			if (choice !== undefined) choices.set(user.user_id, choice);
+		} else {
+			member = this.connectedMembers().get(roomId)?.find((user) => user.user_id === userId);
+		}
+		return member && this.withStatus([member], choices, lister)[0];
 	}
 
 	/**

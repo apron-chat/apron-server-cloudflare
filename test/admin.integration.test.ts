@@ -408,6 +408,35 @@ async function setRoomListMembers(value: number): Promise<void> {
 	});
 }
 
+it('room_list with user_id lists only that member, also one a truncated listing leaves out, and no one for a non-member', async () => {
+	const admin = await signedInAdmin();
+	// Not connected, so a truncated listing can leave them out.
+	const zoeId = unique('zoe');
+	await registered(zoeId);
+	const guest = await connect();
+	try {
+		await guest.next();
+		const guestId = (await request(guest, 'auth', 'auth', { scheme: 'guest' })).result.you.user_id;
+		const roomId = (await request(admin, unique('thread'), 'room_set', { parent_room_id: 'general', title: 'Lookup' })).result.room_id;
+		await request(admin, 'add-zoe', 'room_join', { room_id: roomId, user_id: zoeId });
+		await request(guest, 'join', 'room_join', { room_id: roomId });
+		await setRoomListMembers(1);
+		// The full listing lists one registered member, and counts the rest.
+		const full = (await request(admin, 'full', 'room_list', { room_id: roomId, members: true })).result.joined[0];
+		expect(full.members.map((member: { user_id: string }) => member.user_id)).not.toContain(zoeId);
+		expect(full.member_count).toBe(3);
+		for (const [id, userId] of [['zoe', zoeId], ['guest', guestId]]) {
+			const one = (await request(admin, `one-${id}`, 'room_list', { room_id: roomId, members: true, user_id: userId })).result;
+			expect(one.joined[0].members).toEqual([{ user_id: userId }]);
+			expect(one.joined[0].member_count).toBeUndefined();
+			expect(one.users.map((user: { user_id: string }) => user.user_id)).toEqual([userId]);
+		}
+		const none = (await request(admin, 'none', 'room_list', { room_id: roomId, members: true, user_id: unique('nobody') })).result;
+		expect(none.joined[0].members).toEqual([]);
+		expect(none.users).toEqual([]);
+	} finally { await setRoomListMembers(DEFAULT_LIMITS.roomListMembers); admin.close(); guest.close(); }
+});
+
 it('room_join and room_leave with a user_id add and remove others: an admin anyone, an owner their bot, and with addmember on anyone adds', async () => {
 	const admin = await signedInAdmin();
 	const bobId = unique('bob');
