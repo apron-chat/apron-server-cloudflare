@@ -12,6 +12,7 @@ import { signUploadToken, verifyUploadToken } from "./upload-token";
 import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
 import { extractClientIp, hashIpKey, hashIpv6PrefixKey, stripForwardingHeaders } from "./ip";
 import {
+	apronLink,
 	DEFINED_AUTH_SCHEMES,
 	errorFromUnknown,
 	FrameError,
@@ -4483,8 +4484,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `/invite-token <user_id>` (a leading `@` is allowed): creates a
 	 * registered user with no passkey (Store.createInvitedIdentity), who signs
 	 * in with the bearer token the sender gets in a `~private` notice before
-	 * the result (§1). A taken `user_id` is `invalid_params`. The token does
-	 * not expire; `/purge` revokes it, and `/rename` moves it.
+	 * the result (§1), as is and in a link that any Apron app opens (Appendix
+	 * A.4). A taken `user_id` is `invalid_params`. The token does not expire;
+	 * `/purge` revokes it, and `/rename` moves it.
 	 */
 	private async inviteToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, target: string): Promise<void> {
 		const userId = target.replace(/^@/, "");
@@ -4501,9 +4503,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await this.ctx.storage.put<StoredInviteToken>(key, { v: 1, userId });
 			await this.ctx.storage.put<StoredBot>(INVITE_KEY_PREFIX + userId, { v: 1, tokenKey: key });
 		}));
+		const endpoint = connectionAttachment(socket)?.endpoint ?? attachment.endpoint;
 		this.sendNotice(socket, roomId, [
 			`Created \`${userId}\`, who signs in with this token instead of a passkey. It does not expire, and anyone who has it signs in as \`${userId}\`, so hand it over privately. \`/purge ${userId}\` removes them and the token.`,
 			"```\n" + token + "\n```",
+			...(endpoint ? [`Or send them this link, which signs them in with any Apron app: <${apronLink(endpoint, { token })}>`] : []),
 			`To sign in, authenticate with the token scheme: \`{"method": "auth", "params": {"scheme": "token", "token": "${token}"}}\``,
 		].join("\n\n"));
 		this.reply(socket, request, {});

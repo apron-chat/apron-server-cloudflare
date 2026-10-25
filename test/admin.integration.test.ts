@@ -238,6 +238,8 @@ it('/invite-token creates a user who signs in with the token, which /rename move
 		const text: string = invited.notice!.params.body.text;
 		expect(text).toContain(`Created \`${userId}\``);
 		const token = text.match(/```\n(apron_invite_[A-Za-z0-9_-]{43})\n```/)![1];
+		// The same token in a link that any Apron app opens (Appendix A.4).
+		expect(text).toContain(`<https://link.apron.chat/#server=wss://demo.test/ws&token=${token}>`);
 
 		// The token signs in from any origin, as a registered user in general.
 		const first = await signIn(token);

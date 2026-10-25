@@ -237,3 +237,16 @@ export function positiveIntParam(params: Record<string, unknown>, name: string):
 	if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) throw { name: "invalid_params", message: `${name} must be a positive integer` } satisfies ProtocolError;
 	return value;
 }
+
+/**
+ * A link that any Apron client opens (Appendix A.4): `server`, the WebSocket
+ * URL, then `keys`, in the URL fragment so link.apron.chat never receives
+ * them. Letters, digits, `-._~:/` stay as they are, so the link reads well;
+ * every other character is percent-encoded.
+ */
+export function apronLink(server: string, keys: Record<string, string> = {}): string {
+	const encode = (value: string) => encodeURIComponent(value)
+		.replace(/%3A/g, ":").replace(/%2F/g, "/")
+		.replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+	return `https://link.apron.chat/#${Object.entries({ server, ...keys }).map(([key, value]) => `${encode(key)}=${encode(value)}`).join("&")}`;
+}
