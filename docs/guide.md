@@ -393,7 +393,8 @@ For direct Wrangler production commands, always pass
    no row, and every later wake only checks for it, reading no row. Earlier
    schema 9 code ignores the column, so rolling back to it and forward again
    keeps everything and resets nothing; only the `seen` of users who left
-   while it ran is not updated (see [SPEC section 8](../SPEC.md#schema-versions)).
+   while it ran is not updated, until they next go offline under this code
+   (see [SPEC section 8](../SPEC.md#schema-versions)).
    A schema 8 or 7 object is upgraded in place to 9 on its first wake. That
    upgrade is one-way: redeploying schema 8 or 7 code afterwards resets the
    object like any schema change, so fix forward instead of rolling back. It

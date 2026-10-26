@@ -178,9 +178,12 @@ it('adds seen to a schema 9 store from code before it, without a new schema vers
 		// None recorded yet: no seen.
 		expect(sql.exec<{ seen_ms: number }>("SELECT seen_ms FROM identities WHERE user_id = 'kept_user'").one().seen_ms).toBe(0);
 		expect(store.statusInputs('kept_user')).toEqual({ choice: 'dnd', roomMutes: [] });
+		expect(store.getIdentity('kept_user')).not.toHaveProperty('seen');
 		expect(store.getRoomState().latest_log_id).toBe(before.head);
 		store.setSeen({ userId: 'kept_user', seen: now, now });
-		expect(store.statusInputs('kept_user')).toEqual({ choice: 'dnd', roomMutes: [], seen: now });
+		// A sign-in reads it with the identity row, not with the status state.
+		expect(store.getIdentity('kept_user')?.seen).toBe(now);
+		expect(store.statusInputs('kept_user')).toEqual({ choice: 'dnd', roomMutes: [] });
 		return { writes: writesReserved(sql) };
 	});
 
@@ -204,7 +207,7 @@ it('adds seen to a schema 9 store from code before it, without a new schema vers
 		expect(probe.rowsRead).toBe(0);
 		expect(writesReserved(sql)).toBe(added.writes);
 		expect(identityColumns(sql).filter((name) => name === 'seen_ms')).toHaveLength(1);
-		expect(store.statusInputs('kept_user')).toEqual({ choice: 'dnd', roomMutes: [], seen: now });
+		expect(store.getIdentity('kept_user')?.seen).toBe(now);
 	});
 });
 
@@ -263,14 +266,14 @@ it('keeps seen and everything else when code before it runs on the store and is 
 		const sql = state.storage.sql;
 		expect(store.requiresReset()).toBe(false);
 		expect(identityColumns(sql).filter((name) => name === 'seen_ms')).toHaveLength(1);
-		expect(store.statusInputs('seen_user').seen).toBe(now - 1_000);
-		expect(store.statusInputs('renamed_to').seen).toBe(now - 1_000);
-		expect(store.statusInputs('old_user')).not.toHaveProperty('seen');
-		expect(store.statusInputs('carried_user')).not.toHaveProperty('seen');
+		expect(store.getIdentity('seen_user')?.seen).toBe(now - 1_000);
+		expect(store.getIdentity('renamed_to')?.seen).toBe(now - 1_000);
+		expect(store.getIdentity('old_user')).not.toHaveProperty('seen');
+		expect(store.getIdentity('carried_user')).not.toHaveProperty('seen');
 		expect(store.getIdentity('seen_user')).toMatchObject({ name: 'Seen', roles: ['friend'] });
 		expect(store.getIdentity('purged_user')).toBeNull();
 		store.setSeen({ userId: 'old_user', seen: now, now });
-		expect(store.statusInputs('old_user').seen).toBe(now);
+		expect(store.getIdentity('old_user')?.seen).toBe(now);
 	});
 });
 

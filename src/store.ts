@@ -665,6 +665,7 @@ interface RawIdentityRow {
   avatar_expires_ms: number;
   roles_json: string;
   ext_json: string;
+  seen_ms: number;
 }
 
 interface RawUploadRow {
@@ -872,15 +873,14 @@ interface RoomMute {
 /**
  * A user's stored `status` state (protocol §4.5), read once at sign-in:
  * the `status` they chose with `me`, until when their unscoped mute lasts
- * (absent when not muted), their room mutes in effect, in `room_id` order,
- * and when others last saw them go `offline` (`seen`, §4.5.2; absent when
- * none is recorded).
+ * (absent when not muted), and their room mutes in effect, in `room_id`
+ * order. Their `seen` (§4.5.2) comes with the identity row the sign-in
+ * reads anyway (getIdentity), not from here.
  */
 export interface StatusInputRecord {
   choice: StatusChoice;
   muteUntil?: number;
   roomMutes: RoomMute[];
-  seen?: number;
 }
 
 /**
@@ -2393,7 +2393,7 @@ export class Store {
 
   private identityRow(userId: string): RawIdentityRow | null {
     const rows = this.rawRows<RawIdentityRow>(
-      "SELECT user_id, user_handle, name, tier, created_ms, updated_ms, avatar_url, avatar_expires_ms, roles_json, ext_json FROM identities WHERE user_id = ? LIMIT 1",
+      "SELECT user_id, user_handle, name, tier, created_ms, updated_ms, avatar_url, avatar_expires_ms, roles_json, ext_json, seen_ms FROM identities WHERE user_id = ? LIMIT 1",
       userId,
     );
     return rows[0] ?? null;
@@ -2685,6 +2685,7 @@ export class Store {
       const credentialCount = integerColumn(count?.count);
       const avatar = liveAvatar(row, this.clock.now());
       const ext = parseUserExt(row.ext_json);
+      const seen = seenColumn(row.seen_ms);
       return {
         userId: row.user_id,
         name: row.name,
@@ -2694,6 +2695,7 @@ export class Store {
         roles: parseRoles(row.roles_json),
         ...(avatar ? { avatar } : {}),
         ...(ext ? { ext } : {}),
+        ...(seen !== undefined ? { seen } : {}),
       };
     });
   }
@@ -4707,10 +4709,11 @@ export class Store {
   /**
    * A registered user's stored `status` state (protocol §4.5), read once at
    * sign-in: the `status` they chose, their unscoped mute's end (absent when
-   * not muted, MUTE_FOREVER for `true`), their room mutes in effect, and
-   * their `seen` (absent when none is recorded). Two primary-key reads and
-   * one range of the user's room mutes, at most MAX_ROOM_MUTES_PER_USER
-   * rows; a missing row or range costs nothing.
+   * not muted, MUTE_FOREVER for `true`) and their room mutes in effect. One
+   * primary-key read and one range of the user's room mutes, at most
+   * MAX_ROOM_MUTES_PER_USER rows; a missing row or range costs nothing.
+   * Their `seen` is not read here: every sign-in reads their identity row
+   * anyway (getIdentity), which carries it.
    */
   statusInputs(userId: string, now = this.clock.now()): StatusInputRecord {
     this.ensureReady();
@@ -4718,12 +4721,10 @@ export class Store {
       const effective = this.effectiveNow(now);
       const row = this.userStatusRow(userId);
       const until = row?.mute_until_ms ?? 0;
-      const seen = seenColumn(this.rawRows<{ seen_ms: number }>("SELECT seen_ms FROM identities WHERE user_id = ? LIMIT 1", userId)[0]?.seen_ms);
       return {
         choice: row?.status ?? "online",
         ...(until > effective ? { muteUntil: until } : {}),
         roomMutes: this.roomMuteRows(userId).filter((mute) => mute.untilMs > effective),
-        ...(seen !== undefined ? { seen } : {}),
       };
     });
   }

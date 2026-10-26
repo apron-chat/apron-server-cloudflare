@@ -185,8 +185,9 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// User status, as on Free: connected users' from their connection
 		// attachments, and a listed member's chosen status read with them
 		// (nothing for members who never chose one or muted, one read at
-		// worst), with their `seen` written each time their last connection
-		// closes, reloads included, and with a chosen `invisible`.
+		// worst), with their `seen` written when their last connection
+		// closes or with a chosen `invisible`, at most once in 10 minutes
+		// per user (SEEN_WRITE_GRANULARITY_MS).
 		presence: true,
 	}),
 });

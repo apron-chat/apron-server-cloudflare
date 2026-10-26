@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, pushHostAllowed, type RuntimeConfig } from "./config";
-import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
+import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, SEEN_WRITE_GRANULARITY_MS, UPLOAD_POLICY } from "./budget";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor } from "./account-usage";
 import { EDGE_STOP_RULE_REF, readEdgeStop, runBudgetGuard, watchForFlood } from "./budget-guard";
@@ -191,11 +191,16 @@ interface ConnectionAttachment {
 	roomMuteNext?: number;
 	/**
 	 * When the status others see of the user last became `offline` (§4.5.2
-	 * `seen`), epoch milliseconds: read at sign-in for a registered user
-	 * (Store.statusInputs), set when a change to `offline` is announced, and
-	 * kept equal on all their connections, so a listing or a notification
-	 * that shows them `offline` while connected (`invisible`) needs no SQL
-	 * for it. Absent when none is recorded.
+	 * `seen`), epoch milliseconds: for a registered user, the one stored,
+	 * read at sign-in with their identity row (Store.getIdentity, no read of
+	 * its own) and set on all their connections whenever a change to
+	 * `offline` stores or carries one (settleSeen); for a guest, the one its
+	 * change to `offline` carried. So a listing or a notification that shows
+	 * them `offline` while connected (`invisible`) needs no SQL for it, and
+	 * their next change to `offline` knows, without a read, whether the
+	 * stored one stands (SEEN_WRITE_GRANULARITY_MS). It never runs ahead of
+	 * the store; one that lags it (an attachment from code before it, or
+	 * none) only makes that change write. Absent when none is recorded.
 	 */
 	seen?: number;
 	/**
@@ -256,6 +261,32 @@ function statusFrame(roomId: string | null, mute: number | boolean): Record<stri
  * `seen` it carries (§4.5.2), when their last connection closed.
  */
 type OwedStatus = [string, Status, Status, number] | [string, Status, Status, number, number];
+
+/**
+ * The stored `seen` (§4.5.2) a user's connections hold: the latest, since
+ * they all get each new one (settleSeen) and can only lag the store, never
+ * lead it. Undefined when none holds one.
+ */
+function keptSeen(states: ReadonlyArray<{ state: ConnectionAttachment }>): number | undefined {
+	let kept: number | undefined;
+	for (const { state } of states) if (state.seen !== undefined && state.seen > (kept ?? 0)) kept = state.seen;
+	return kept;
+}
+
+/**
+ * The `seen` (§4.5.2) that a user's shown status changing to `offline` at
+ * `now` carries, given `kept`, the stored one their connections hold, and
+ * whether it has to be written. A registered user's stored `seen` no older
+ * than SEEN_WRITE_GRANULARITY_MS stands: it is carried again, unwritten,
+ * so it is at most that much earlier than the change. Otherwise (none
+ * known, older, or after `now`) it is `now`, to be written. A guest's is
+ * never stored: always `now`.
+ */
+function seenFor(kept: number | undefined, registered: boolean, now: number): { seen: number; write: boolean } {
+	if (!registered) return { seen: now, write: false };
+	if (kept !== undefined && kept <= now && now - kept <= SEEN_WRITE_GRANULARITY_MS) return { seen: kept, write: false };
+	return { seen: now, write: true };
+}
 
 /**
  * A user's shown `status` as a current user object carries it (§4.5.2):
@@ -742,8 +773,15 @@ function presenceState(attachment: Partial<ConnectionAttachment>): Pick<Connecti
 	return out;
 }
 
-/** Keeps a user's stored `status` state (Store.statusInputs) on one of their connections. */
-function applyStatusInputs(state: ConnectionAttachment, stored: StatusInputRecord): void {
+/**
+ * What a registered user's sign-in keeps on their connection: their stored
+ * `status` state (Store.statusInputs) and their `seen`, from the identity
+ * row the sign-in reads anyway (Store.getIdentity).
+ */
+type SignInStatus = StatusInputRecord & { seen?: number };
+
+/** Keeps a user's stored `status` state and `seen` (SignInStatus) on one of their connections. */
+function applyStatusInputs(state: ConnectionAttachment, stored: SignInStatus): void {
 	if (stored.choice !== "online") state.choice = stored.choice;
 	else delete state.choice;
 	if (stored.muteUntil !== undefined) state.muteUntil = stored.muteUntil;
@@ -2036,6 +2074,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		let avatar: string | undefined;
 		let roles: string[] = [];
 		let ext: Record<string, unknown> | undefined;
+		// And their `seen` (§4.5.2), from the same row, for the connection's status state.
+		let seen: number | undefined;
 		const repository: CredentialRepository = {
 			getCredential: (credentialId) => this.store.getCredential(credentialId),
 			getIdentity: (userId) => {
@@ -2043,6 +2083,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				avatar = identity?.avatar;
 				roles = identity?.roles ?? [];
 				ext = identity?.ext;
+				seen = identity?.seen;
 				return identity ? { user_id: identity.userId, name: identity.name, tier: "registered" } : null;
 			},
 			registerCredential: (input) => {
@@ -2087,7 +2128,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// so a failure leaves neither an orphan session nor a changed
 		// connection. The storage writes awaited in between hold the input
 		// gate, so no other event changes the user's status or mutes meanwhile.
-		const stored = this.readStatusInputs(finished.identity.user_id);
+		const stored = this.readStatusInputs(finished.identity.user_id, seen);
 		const token = await this.issueSession(finished.identity.user_id, origin, nowMs());
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
 		const previous = this.guestBefore(socket, attachment);
@@ -2224,7 +2265,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
 		// Read before the connection changes, with no await after, so a failure leaves it as it was.
-		const stored = this.readStatusInputs(identity.userId);
+		const stored = this.readStatusInputs(identity.userId, identity.seen);
 		const previous = this.guestBefore(socket, attachment);
 		attachment.tier = "registered";
 		attachment.userId = identity.userId;
@@ -2326,11 +2367,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * invite, or a user's other `device`): the connection becomes the
 	 * identity, and the guest it replaces leaves as guestLeaves has it.
 	 */
-	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[]; avatar?: string; roles: string[]; ext?: Record<string, unknown> }, token?: string, created = false, device?: string): Promise<void> {
+	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[]; avatar?: string; roles: string[]; ext?: Record<string, unknown>; seen?: number }, token?: string, created = false, device?: string): Promise<void> {
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
 		this.assertRegisteredCapacity(socket, identity.userId);
 		// Read before the connection changes, so a failure leaves it as it was.
-		const stored = this.readStatusInputs(identity.userId);
+		const stored = this.readStatusInputs(identity.userId, identity.seen);
 		const previous = this.guestBefore(socket, attachment);
 		attachment.tier = "registered";
 		attachment.userId = identity.userId;
@@ -3102,17 +3143,18 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * A registered user's stored `status` state (Store.statusInputs: the
 	 * status they chose, their unscoped mute and their room mutes), read once
-	 * as they sign in, or undefined without push. Called before the
+	 * as they sign in, with `seen` from the identity row the sign-in already
+	 * read (Store.getIdentity), or undefined without push. Called before the
 	 * connection becomes theirs: if the read fails, the sign-in fails, with
 	 * the connection as it was. Signing in without it would show an invisible
 	 * user to others as connected and tell the client none of its mutes are
 	 * in effect, both until the next sign-in; a failed sign-in can be tried
 	 * again at once.
 	 */
-	private readStatusInputs(userId: string): StatusInputRecord | undefined {
+	private readStatusInputs(userId: string, seen: number | undefined): SignInStatus | undefined {
 		if (!this.config.push) return undefined;
 		try {
-			return this.store.statusInputs(userId, nowMs());
+			return { ...this.store.statusInputs(userId, nowMs()), ...(seen !== undefined ? { seen } : {}) };
 		} catch (error) {
 			const failure = errorToProtocol(error);
 			console.warn(JSON.stringify({ event: "status_inputs_failed", reason: failure.message }));
@@ -3125,14 +3167,21 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * Readies a connection that just signed in for its user's `status`:
 	 * forgets what it held for an identity it had before, keeps a registered
 	 * user's `stored` state (readStatusInputs) on the connection. Its `idle`
-	 * is its own and stays. Call before replying with `you`; afterSignIn
-	 * after.
+	 * is its own and stays. Its `seen` is the latest of the one read and
+	 * those their other connections hold, which all get each one stored
+	 * (settleSeen), so one stored after the read, though the input gate
+	 * keeps that from happening, is not missed. Call before replying with
+	 * `you`; afterSignIn after.
 	 */
-	private prepareStatus(socket: WebSocketConnection, stored?: StatusInputRecord): void {
+	private prepareStatus(socket: WebSocketConnection, stored?: SignInStatus): void {
 		const state = connectionAttachment(socket);
 		if (!state) return;
 		for (const key of ["choice", "muteUntil", "roomMuteNext", "seen", "pres", "held"] as const) delete state[key];
-		if (state.tier === "registered" && stored) applyStatusInputs(state, stored);
+		if (state.tier === "registered" && stored) {
+			applyStatusInputs(state, stored);
+			const kept = keptSeen([{ state }, ...this.liveStatesOf(state.userId!).filter((peer) => peer.socket !== socket)]);
+			if (kept !== undefined) state.seen = kept;
+		}
 		writeAttachment(socket, state);
 	}
 
@@ -3145,7 +3194,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * passkey to a signed-in connection, or a guest `auth` on one, is not a
 	 * sign-in and does not.
 	 */
-	private afterSignIn(socket: WebSocketConnection, stored?: StatusInputRecord): void {
+	private afterSignIn(socket: WebSocketConnection, stored?: SignInStatus): void {
 		this.sendMutesInEffect(socket, stored);
 		this.presenceSignedIn(socket);
 		this.sendShownStatus(socket);
@@ -3157,7 +3206,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * attachment, and the room mutes read at sign-in. Any scope not sent is
 	 * unmuted. A guest has none.
 	 */
-	private sendMutesInEffect(socket: WebSocketConnection, stored?: StatusInputRecord): void {
+	private sendMutesInEffect(socket: WebSocketConnection, stored?: SignInStatus): void {
 		const state = connectionAttachment(socket);
 		if (!this.config.push || !state || state.closing || state.tier !== "registered") return;
 		const now = nowMs();
@@ -3184,30 +3233,36 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const now = nowMs();
 		const wait = this.statusChanges.retry(userId, now);
 		if (wait !== undefined) throw { name: "retry_after", message: "Status changes limited", data: { retry_after: wait } } satisfies ProtocolError;
-		// Choosing `invisible` shows a connected user `offline` at once, which
-		// records `seen` (announceStatus): a registered user's is stored with
-		// the choice, in one reservation and transaction.
-		const seen = choice === "invisible" ? this.seenOnInvisible(userId, now) : undefined;
-		if (attachment.tier === "registered") this.store.setStatus({ userId, choice, now, ...(seen !== undefined ? { seen } : {}) });
+		// Choosing `invisible` shows a connected user `offline` at once, with
+		// a `seen` (announceStatus), settled here: a registered user's, when
+		// the stored one no longer stands (seenFor), is stored with the
+		// choice, in one reservation and transaction; otherwise the stored
+		// one is carried and only the choice is written.
+		const registered = attachment.tier === "registered";
+		const settled = choice === "invisible" ? this.seenOnInvisible(userId, registered, now) : undefined;
+		if (registered) this.store.setStatus({ userId, choice, now, ...(settled?.write ? { seen: settled.seen } : {}) });
 		this.statusChanges.take(userId, now);
 		this.cacheStatusState(userId, (state) => {
 			if (choice === "online") delete state.choice;
 			else state.choice = choice;
+			if (settled) state.seen = settled.seen;
 		});
 		for (const peer of this.connectionsOf(userId, socket)) this.deliverTo(peer, { method: "user", params: { you: { user_id: userId, status: choice } } });
-		this.touchPresence(userId, now, { immediate: true, ...(seen !== undefined && attachment.tier === "registered" ? { storedSeen: seen } : {}) });
+		this.touchPresence(userId, now, { immediate: true, ...(settled ? { seen: settled.seen } : {}) });
 	}
 
 	/**
 	 * The `seen` (§4.5.2) a connected user's choosing `invisible` now will
-	 * announce, as touchPresence does it at once: `now` when others were told
-	 * something other than `offline`, else none (presence off, or nothing
-	 * announced for them on this object yet, or already `offline`).
+	 * announce, as touchPresence does it at once, and whether it has to be
+	 * written (seenFor, from the one their connections hold): when others
+	 * were told something other than `offline`; else none (presence off,
+	 * nothing announced for them on this object yet, or already `offline`).
 	 */
-	private seenOnInvisible(userId: string, now: number): number | undefined {
+	private seenOnInvisible(userId: string, registered: boolean, now: number): { seen: number; write: boolean } | undefined {
 		if (!this.presenceMode()) return undefined;
-		const told = this.liveStatesOf(userId).find(({ state }) => state.pres)?.state.pres?.s;
-		return told !== undefined && told !== "offline" ? now : undefined;
+		const states = this.liveStatesOf(userId);
+		const told = states.find(({ state }) => state.pres)?.state.pres?.s;
+		return told !== undefined && told !== "offline" ? seenFor(keptSeen(states), registered, now) : undefined;
 	}
 
 	/**
@@ -3456,8 +3511,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `closing`: that connection's attachment, which tells, when it was the
 	 * last, what others were told and what they are owed now.
 	 * `immediate`: announce now, whatever the coalescing (a `me` change).
+	 * `seen`: the `seen` a change to `offline` carries, already settled and
+	 * kept (changeChoice).
 	 */
-	private touchPresence(userId: string | undefined, now = nowMs(), options: { hold?: boolean; closing?: ConnectionAttachment; immediate?: boolean; storedSeen?: number } = {}): void {
+	private touchPresence(userId: string | undefined, now = nowMs(), options: { hold?: boolean; closing?: ConnectionAttachment; immediate?: boolean; seen?: number } = {}): void {
 		if (!userId || !this.presenceMode()) return;
 		if (!this.presenceBusy) this.noteClosedSockets();
 		this.presenceWork(() => {
@@ -3481,7 +3538,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				const hold = Math.max(pres.h ?? 0, options.hold ? now + graceMs : 0);
 				const due = options.immediate ? now : Math.max(this.lastAnnounced(userId, pres) + coalesceMs, hold);
 				if (due <= now) {
-					this.announceStatus(userId, states, shown, now, options.storedSeen);
+					this.announceStatus(userId, states, shown, now, options.seen);
 					return;
 				}
 				if (hold > now && hold !== pres.h) this.writePresence(states, { ...pres, h: hold });
@@ -3494,10 +3551,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const told = closing.pres.s;
 			const status = shownStatus({ choice: closing.choice ?? "online", connected: false, attended: false });
 			const due = options.immediate ? now : Math.max(this.lastAnnounced(userId, closing.pres) + coalesceMs, options.hold ? now + graceMs : 0);
-			// A change to offline carries `seen`, when they left; one already
-			// shown offline (invisible) changes nothing, so `seen` stays.
-			const seen = status === "offline" && told !== "offline" ? now : undefined;
-			if (seen !== undefined) this.recordSeen(userId, closing.tier === "registered", seen);
+			// A change to offline carries `seen`, settled now, as they leave: a
+			// registered user's is written now, even if they come back within
+			// the grace and nothing is announced, unless the stored one stands.
+			// One already shown offline (invisible) changes nothing, so `seen`
+			// stays.
+			const seen = status === "offline" && told !== "offline" ? this.settleSeen(userId, closing.tier === "registered", closing.seen, now) : undefined;
 			this.oweStatus(userId, closing.rooms ?? [], told, status, due, now, seen);
 		});
 	}
@@ -3543,35 +3602,48 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Announces a connected user's status: `user` `new` to the connections of
 	 * others who share a room with them. It differs from what they were told,
-	 * so a change to `offline` (a chosen `invisible`) carries a new `seen`,
-	 * which needs no write of its own when it is `storedSeen`, stored with
-	 * the choice (changeChoice).
+	 * so a change to `offline` (a chosen `invisible`) carries a `seen`:
+	 * `settled`, when changeChoice settled and stored it with the choice,
+	 * else settled now (settleSeen).
 	 */
-	private announceStatus(userId: string, states: ReadonlyArray<{ socket: WebSocketConnection; state: ConnectionAttachment }>, shown: Status, now: number, storedSeen?: number): void {
+	private announceStatus(userId: string, states: ReadonlyArray<{ socket: WebSocketConnection; state: ConnectionAttachment }>, shown: Status, now: number, settled?: number): void {
 		const rooms = [...new Set(states.flatMap(({ state }) => state.rooms ?? []))];
 		this.writePresence(states, { s: shown, a: now });
 		this.noteAnnounced(userId, now);
-		const seen = shown === "offline" ? now : undefined;
-		if (seen !== undefined) this.recordSeen(userId, states.some(({ state }) => state.tier === "registered") && seen !== storedSeen, seen);
+		const seen = shown !== "offline" ? undefined
+			: settled ?? this.settleSeen(userId, states.some(({ state }) => state.tier === "registered"), keptSeen(states), now);
 		this.deliver({ method: "user", params: { new: { user_id: userId, ...shownFields(shown, seen) } } }, rooms, (state) => state.userId !== userId);
 	}
 
 	/**
-	 * Records `seen` (§4.5.2): the status others see of a user just became
-	 * `offline`. Kept on their connections, if any, and with `write` (a
-	 * registered user's, unless stored with their choice already) stored
+	 * Settles the `seen` (§4.5.2) that a user's shown status changing to
+	 * `offline` at `now` carries, from `kept`, the stored one their
+	 * connections hold (seenFor): a registered user's stored one if no older
+	 * than SEEN_WRITE_GRANULARITY_MS, with no write; else `now`, stored first
 	 * (Store.setSeen, one row), so listings carry it once they have no
-	 * connection and it survives eviction; a guest's lives and goes with its
-	 * connection. A failed write is logged: the announcement still carries it.
+	 * connection and it survives eviction. What it returns is what is
+	 * stored, so the announcement and every later listing agree: if the
+	 * write fails (it is logged), the stored one is carried instead, absent
+	 * when none is known. A guest's is `now`, never stored: it lives and goes
+	 * with its connections. Kept on the user's connections, if any.
 	 */
-	private recordSeen(userId: string, write: boolean, seen: number): void {
-		this.cacheStatusState(userId, (state) => { state.seen = seen; });
-		if (!write) return;
-		try {
-			this.store.setSeen({ userId, seen, now: seen });
-		} catch (error) {
-			console.warn(JSON.stringify({ event: "seen_write_failed", reason: errorToProtocol(error).message }));
+	private settleSeen(userId: string, registered: boolean, kept: number | undefined, now: number): number | undefined {
+		const settled = seenFor(kept, registered, now);
+		if (settled.write) {
+			try {
+				this.store.setSeen({ userId, seen: settled.seen, now });
+			} catch (error) {
+				console.warn(JSON.stringify({ event: "seen_write_failed", reason: errorToProtocol(error).message }));
+				return kept;
+			}
 		}
+		for (const peer of this.connectionsOf(userId)) {
+			const state = connectionAttachment(peer);
+			if (!state || state.seen === settled.seen) continue;
+			state.seen = settled.seen;
+			writeAttachment(peer, state);
+		}
+		return settled.seen;
 	}
 
 	/**
@@ -3802,7 +3874,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		for (const [userId, states] of users) {
 			shown.set(userId, states.find(({ state }) => state.pres)?.state.pres?.s ?? this.shownConnected(states, now));
 			rooms.set(userId, new Set(states.flatMap(({ state }) => state.rooms ?? [])));
-			const kept = states.find(({ state }) => state.seen !== undefined)?.state.seen;
+			const kept = keptSeen(states);
 			if (kept !== undefined) seen.set(userId, kept);
 			owed.delete(userId);
 		}
@@ -4958,7 +5030,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		for (const ws of this.ctx.getWebSockets()) {
 			const state = connectionAttachment(ws as WebSocketConnection);
 			if (!state?.owed?.some(([id]) => id === from)) continue;
-			state.owed = state.owed.map((entry) => entry[0] === from ? [to, entry[1], entry[2], entry[3]] as OwedStatus : entry);
+			state.owed = state.owed.map((entry) => entry[0] === from ? [to, ...entry.slice(1)] as OwedStatus : entry);
 			writeAttachment(ws as WebSocketConnection, state);
 		}
 		// Clients keep nothing yet for the new `user_id`, so the object carries

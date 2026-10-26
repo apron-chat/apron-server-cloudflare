@@ -406,6 +406,16 @@ export const MAX_ROOM_LIST_MEMBERS = 200;
 // Status changes wait at most this long (coalescing, offline grace), so what
 // others see is never more than about a minute behind.
 export const MAX_STATUS_DELAY_SECONDS = 60;
+// A registered user's `seen` (protocol §4.5.2, when the status others see
+// of them last became `offline`) is written at most once in this long: a
+// change to `offline` while the stored one is no older than this carries
+// that one again, with no write. So reloads, reconnects and `invisible`
+// flips cost at most one write (the identity row and the budget row; 4
+// rows with the status for `invisible`) per user per 10 minutes, at most
+// 144 a day, and `seen` is never more than this much earlier than the real
+// change. A change after a longer absence, however brief the return,
+// always writes, so a return after a week is never missed.
+export const SEEN_WRITE_GRANULARITY_MS = 10 * 60_000;
 // `status` `idle` changes one connection may make a minute (protocol §4.5
 // allows rate limiting `status`); past it, `retry_after` and nothing
 // changes. A client sends one when attention starts or ends, so a few a

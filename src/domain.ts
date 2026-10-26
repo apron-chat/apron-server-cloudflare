@@ -30,6 +30,12 @@ export interface StoredIdentity {
 	roles: string[];
 	/** The identity's `ext` (protocol §4.12), kept in its row; absent when empty. */
 	ext?: Record<string, unknown>;
+	/**
+	 * When the status others see of the identity last became `offline`
+	 * (protocol §4.5.2 `seen`), epoch milliseconds, kept in its row; absent
+	 * when none is recorded. A sign-in carries it onto the connection.
+	 */
+	seen?: number;
 }
 
 /**

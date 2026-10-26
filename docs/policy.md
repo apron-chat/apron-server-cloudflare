@@ -155,7 +155,11 @@ within it:
   `seen`, when they went offline (when their last connection closed, or
   when they chose `invisible`), in the notification and in later listings.
   It changes only when they go offline, so an invisible user's connections
-  never move it, and their own `you` never carries it.
+  never move it, and their own `you` never carries it. It is recorded at
+  most once in 10 minutes: going offline again within 10 minutes of the
+  last one recorded shows that one again, so `seen` may be up to 10
+  minutes earlier than the real departure. Going offline after a longer
+  absence always records a new one, however briefly they were back.
   `PRESENCE` (`true` or `false`) overrides the plan, and admins can turn it
   off and on with `/toggle presence`; turning it off tells connected
   clients to clear the statuses they were shown, and listings then show
