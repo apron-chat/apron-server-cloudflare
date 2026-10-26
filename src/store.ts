@@ -45,21 +45,23 @@ import { createHash } from "node:crypto";
 export const ROOM_ID = "general";
 const ROOM_TITLE = "General";
 /**
- * Schema 10 stores the server-wide log (room records, flat message
+ * Schema 9 stores the server-wide log (room records, flat message
  * snapshots, reaction sets, and registered users' memberships), a
  * `memberships` table of registered users' joined rooms, indexed both ways,
  * with each room's count of them, the `uploads` held in R2 with each
  * identity's avatar, each identity's roles, `ext` and `seen` in its row, and
  * the `push_subscriptions`, `push_wakes`, `user_status` and `room_mutes`
  * tables, with each limiter row's token bucket (limiter.ts) and each day's
- * count of history pages. Schema 9, which the deployed object holds, is
- * upgraded in place (see upgradeFromSchema9()), as are schemas 8 and 7 on
- * the way to it (see upgradeFromSchema8() and upgradeFromSchema7()); stored
- * data from any other schema version is not migrated: the object is wiped
- * and started fresh (see resetStorage()). Additive rows need no new
- * version: an absent `_meta` row reads as its initial value.
+ * count of history pages. Schemas 8 and 7 are upgraded in place (see
+ * upgradeFromSchema8() and upgradeFromSchema7()); stored data from any
+ * other schema version is not migrated: the object is wiped and started
+ * fresh (see resetStorage()). Additive changes that older code ignores need
+ * no new version, so redeploying that code keeps everything: an absent
+ * `_meta` row reads as its initial value, and the identities' `seen_ms`
+ * column, which code before it never names, is added where missing on a
+ * wake (see ensureSeenColumn()).
  */
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 9;
 /** The oldest schema upgraded in place rather than reset; each one from it up to SCHEMA_VERSION is. */
 export const UPGRADABLE_SCHEMA_VERSION = 7;
 /**
@@ -819,6 +821,8 @@ const MAX_PUSH_SUBSCRIPTIONS_PER_USER = MAX_PUSHES_PER_MESSAGE;
 const MEMBER_TABLES = /\b(identities|memberships|user_status)\b/;
 /** Store.setSeen's write, which updates reused listings in place rather than invalidating them. */
 const SEEN_UPDATE = "UPDATE identities SET seen_ms = ? WHERE user_id = ?";
+/** Store.ensureSeenColumn's probe: reads no row, and fails to compile where `seen_ms` is missing. */
+const SEEN_COLUMN_PROBE = "SELECT seen_ms FROM identities LIMIT 0";
 /**
  * Most `push_wakes` rows one user can hold: one per room they were woken
  * for, and wakes come only for messages in existing rooms (at most the
@@ -1298,10 +1302,11 @@ function ensureText(value: unknown, field: string, maxBytes: number): string {
  * §4.5): the `status` they chose with `me` and until when their unscoped
  * mute lasts, one row while either differs from the default (`online`, not
  * muted). `room_mutes` keeps their room mutes, keyed by user and room, at
- * most MAX_ROOM_MUTES_PER_USER a user. Schema 10 adds each identity's
- * `seen_ms` (protocol §4.5.2 `seen`, 0 for none): when the status others see
- * of the user last became `offline`, in the row a member listing reads
- * anyway.
+ * most MAX_ROOM_MUTES_PER_USER a user. Each identity's `seen_ms` (protocol
+ * §4.5.2 `seen`, 0 for none) is when the status others see of the user last
+ * became `offline`, in the row a member listing reads anyway; it is the
+ * last column, added to an older schema 9 object without a new version
+ * (ensureSeenColumn()).
  */
 const SCHEMA_DDL = `
   CREATE TABLE IF NOT EXISTS _meta (
@@ -1553,14 +1558,11 @@ export class Store {
     }
     if (version === 8) {
       this.upgradeFromSchema8();
-      version = 9;
-    }
-    if (version === 9) {
-      this.upgradeFromSchema9();
       version = SCHEMA_VERSION;
     }
     if (version !== 0 && version !== SCHEMA_VERSION) throw new Error(`storage schema ${version} requires resetStorage()`);
     if (version === SCHEMA_VERSION) {
+      this.ensureSeenColumn();
       this.lastEffectiveMs = Math.max(this.lastEffectiveMs, this.storedEffectiveMs());
       const unsafeMarker = this.metaValue(META_ACCOUNTING_UNSAFE).trim().toLowerCase();
       if (unsafeMarker === "1" || unsafeMarker === "true") {
@@ -1692,30 +1694,52 @@ export class Store {
   }
 
   /**
-   * Upgrades a schema 9 object to schema 10 in place, once, in one
-   * transaction: each identity gains `seen_ms`, 0 (none recorded), which
-   * rewrites no row. Charged like upgradeFromSchema7 (finishUpgrade).
+   * Adds the identities' `seen_ms` column (protocol §4.5.2 `seen`, 0 for
+   * none recorded) where a schema 9 object made by earlier code lacks it,
+   * once, in one transaction, without a new schema version: adding a column
+   * rewrites no row, and code before it names every identities column it
+   * reads or writes, so redeploying that code keeps everything and a later
+   * wake finds the column still there. Every wake probes for it with a
+   * statement that reads no row (it fails to compile without the column),
+   * charged as one read to the wake's handover allowance. The addition is
+   * charged like upgradeFromSchema7 (chargeUpgrade), and fails closed the
+   * same way.
    */
-  private upgradeFromSchema9(): void {
+  private ensureSeenColumn(): void {
+    try {
+      this.rawRows(SEEN_COLUMN_PROBE);
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/no such column/i.test(message)) throw error;
+    }
     const start = { reads: this.observed.reads, writes: this.observed.writes };
     const effective = Number(this.metaValue(META_EFFECTIVE_NOW));
     const day = dayFor(Math.max(Number.isSafeInteger(effective) ? effective : 0, this.clock.now()));
     this.transaction(() => {
-      this.rawScript("ALTER TABLE identities ADD COLUMN seen_ms INTEGER NOT NULL DEFAULT 0");
-      this.finishUpgrade(10, start, day);
+      this.rawExec("ALTER TABLE identities ADD COLUMN seen_ms INTEGER NOT NULL DEFAULT 0");
+      this.chargeUpgrade(start, day);
     });
-    console.warn(JSON.stringify({ event: "storage_schema_upgraded", from: 9, to: 10 }));
+    console.warn(JSON.stringify({ event: "storage_column_added", table: "identities", column: "seen_ms" }));
   }
 
   /**
    * Ends an in-place upgrade's transaction: marks the new schema version and
-   * charges the rows it read and wrote (measured from `start`) to the day's
-   * maintenance reservation without a capacity check, like a reset's
-   * passkey carry, so an upgrade cannot be blocked by an exhausted budget.
+   * charges what it did (chargeUpgrade).
    */
   private finishUpgrade(version: number, start: { reads: number; writes: number }, day: string): void {
     this.rawExec("UPDATE _meta SET value = ? WHERE key = 'schema_version'", String(version));
     this.rawExec("UPDATE maintenance SET schema_version = ? WHERE id = 1", version);
+    this.chargeUpgrade(start, day);
+  }
+
+  /**
+   * Charges the rows an in-place upgrade read and wrote (measured from
+   * `start`) to the day's maintenance reservation without a capacity check,
+   * like a reset's passkey carry, so an upgrade cannot be blocked by an
+   * exhausted budget.
+   */
+  private chargeUpgrade(start: { reads: number; writes: number }, day: string): void {
     const cost = { reads: this.observed.reads - start.reads, writes: this.observed.writes - start.writes + 2 };
     this.ledger.addUnchecked(day, maintenanceDelta(cost));
     this.observed.reservedReads += cost.reads;

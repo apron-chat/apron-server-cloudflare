@@ -1,7 +1,7 @@
 # Cloudflare Worker storage cost report
 
 This report records local native SQLite measurements used for the storage
-accounting review. It describes the current schema (schema 10: one server-wide
+accounting review. It describes the current schema (schema 9: one server-wide
 record log of room records, message snapshots, reaction sets, and
 memberships; a `memberships` table of registered users' rooms, keyed by
 room with an index by user; and the upload, push registration, user status
@@ -564,9 +564,16 @@ lives on their connection, never in SQL. Changes owed to others carry it
 in the `owed` entry, so it survives eviction with them. At the load models
 below, one last disconnect a registered admission writes about 2 rows:
 2,000 a day at R and 4,000 (Free) or 8,000 (Paid) at K, 3.3% / 6.7% of
-Free's 60,000 foreground writes and 0.3% / 1.1% of Paid's 700,000. A
-schema 9 object gains the column in place with a few written rows
-(measured under 64, with 500 identities).
+Free's 60,000 foreground writes and 0.3% / 1.1% of Paid's 700,000. The
+column came without a new schema version, so code from before it, which
+names every identity column it uses, runs on the same object after a
+rollback and loses nothing. An object made before it gains the column on
+its first wake with a few written rows (measured under 64, with 500
+identities); every wake checks for it with `SELECT seen_ms FROM identities
+LIMIT 0`, which reads no row and writes none (measured 0 rows read; the
+store charges it as one read, so a wake's own reads go from 7 to 8, within
+the eight-row handover allowance), where a schema version bump would have
+cost nothing per wake but made a rollback wipe the object.
 
 **`status` as a request.** A client's `status` is a request: it is
 answered `{}`, or with an error that changes nothing. A refusal costs no

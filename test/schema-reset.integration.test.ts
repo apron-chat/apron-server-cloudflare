@@ -113,16 +113,14 @@ it(`carries at most ${MAX_CARRIED_PASSKEYS} passkeys across a reset, most recent
 	});
 });
 
-/** Turns a fresh store's tables back into schema 9's: no `seen_ms` on identities. */
-function toSchema9(sql: SqlStorage): void {
+/** Turns a fresh store's identities back into those of code before `seen`, which makes the same schema 9 without `seen_ms`. */
+function withoutSeen(sql: SqlStorage): void {
 	sql.exec('ALTER TABLE identities DROP COLUMN seen_ms');
-	sql.exec("UPDATE _meta SET value = '9' WHERE key = 'schema_version'");
-	sql.exec('UPDATE maintenance SET schema_version = 9 WHERE id = 1');
 }
 
 /** Turns a fresh store's tables back into schema 8's: timestamp lists on limiter rows, no history count on budget rows. */
 function toSchema8(sql: SqlStorage): void {
-	toSchema9(sql);
+	withoutSeen(sql);
 	sql.exec('ALTER TABLE principal_limits DROP COLUMN level');
 	sql.exec('ALTER TABLE principal_limits DROP COLUMN level_ms');
 	for (const lane of ['post', 'auth', 'history', 'admission']) {
@@ -134,8 +132,11 @@ function toSchema8(sql: SqlStorage): void {
 	sql.exec('UPDATE maintenance SET schema_version = 8 WHERE id = 1');
 }
 
-it('upgrades a schema 9 store in place: identities gain an empty seen, and nothing else changes', async () => {
-	const stub = env.DEMO.getByName(`schema-upgrade-9-${crypto.randomUUID()}`);
+const identityColumns = (sql: SqlStorage) => sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('identities') ORDER BY cid").toArray().map((row) => row.name);
+const writesReserved = (sql: SqlStorage) => sql.exec<{ writes_reserved: number }>('SELECT writes_reserved FROM resource_budgets ORDER BY day DESC LIMIT 1').one().writes_reserved;
+
+it('adds seen to a schema 9 store from code before it, without a new schema version, and nothing else changes', async () => {
+	const stub = env.DEMO.getByName(`schema-seen-${crypto.randomUUID()}`);
 	const now = Date.now();
 	const before = await runInDurableObject(stub, async (instance, state) => {
 		const { store } = instance as unknown as Runtime;
@@ -146,33 +147,118 @@ it('upgrades a schema 9 store in place: identities gain an empty seen, and nothi
 		});
 		store.setStatus({ userId: 'kept_user', choice: 'dnd', now });
 		const head = store.getRoomState().latest_log_id;
-		// Last: the current code never runs against schema 9's tables.
-		toSchema9(sql);
-		// Identities: the upgrade's cost must not grow with them.
+		// Last: the current code never runs against these tables.
+		withoutSeen(sql);
+		// Identities: adding the column must not cost more with them.
 		for (let index = 0; index < 500; index++) {
 			sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES (?, ?, ?, 'registered', ?, ?)", `filler_${index}`, `hf${index}`, `F${index}`, now, now);
 		}
-		return { head, writes: sql.exec<{ writes_reserved: number }>('SELECT writes_reserved FROM resource_budgets ORDER BY day DESC LIMIT 1').one().writes_reserved };
+		return { head, writes: writesReserved(sql) };
 	});
 
 	await evictDurableObject(stub);
-	await runInDurableObject(stub, async (instance, state) => {
+	const added = await runInDurableObject(stub, async (instance, state) => {
 		const { store } = instance as unknown as Runtime;
 		const sql = state.storage.sql;
 		expect(store.requiresReset()).toBe(false);
-		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
-		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(SCHEMA_VERSION);
-		expect(sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('identities') ORDER BY cid").toArray().map((row) => row.name).slice(-2)).toEqual(['ext_json', 'seen_ms']);
+		// Still schema 9: code before `seen` runs on this object as it is.
+		expect(SCHEMA_VERSION).toBe(9);
+		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe('9');
+		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(9);
+		expect(identityColumns(sql).slice(-2)).toEqual(['ext_json', 'seen_ms']);
 		// None recorded yet: no seen.
 		expect(sql.exec<{ seen_ms: number }>("SELECT seen_ms FROM identities WHERE user_id = 'kept_user'").one().seen_ms).toBe(0);
 		expect(store.statusInputs('kept_user')).toEqual({ choice: 'dnd', roomMutes: [] });
 		// A few rows charged on top of the day's, however many identities there are.
-		const writes = sql.exec<{ writes_reserved: number }>('SELECT writes_reserved FROM resource_budgets ORDER BY day DESC LIMIT 1').one().writes_reserved;
+		const writes = writesReserved(sql);
 		expect(writes).toBeGreaterThan(before.writes);
 		expect(writes - before.writes).toBeLessThan(64);
 		expect(store.getRoomState().latest_log_id).toBe(before.head);
 		store.setSeen({ userId: 'kept_user', seen: now, now });
 		expect(store.statusInputs('kept_user')).toEqual({ choice: 'dnd', roomMutes: [], seen: now });
+		return { writes: writesReserved(sql) };
+	});
+
+	// A later wake finds the column and adds nothing: its probe reads no row and writes none.
+	await evictDurableObject(stub);
+	await runInDurableObject(stub, async (instance, state) => {
+		const { store } = instance as unknown as Runtime;
+		const sql = state.storage.sql;
+		expect(store.requiresReset()).toBe(false);
+		expect(store.storageAccounting().writes).toBe(0);
+		// The probe is metered as no row read (the store charges it as one).
+		const probe = sql.exec('SELECT seen_ms FROM identities LIMIT 0');
+		expect(probe.toArray()).toEqual([]);
+		expect(probe.rowsRead).toBe(0);
+		expect(writesReserved(sql)).toBe(added.writes);
+		expect(identityColumns(sql).filter((name) => name === 'seen_ms')).toHaveLength(1);
+		expect(store.statusInputs('kept_user')).toEqual({ choice: 'dnd', roomMutes: [], seen: now });
+	});
+});
+
+it('keeps seen and everything else when code before it runs on the store and is redeployed again (rollback, roll forward)', async () => {
+	const stub = env.DEMO.getByName(`schema-seen-rollback-${crypto.randomUUID()}`);
+	const now = Date.now();
+	await runInDurableObject(stub, async (instance) => {
+		const { store } = instance as unknown as Runtime;
+		for (const userId of ['seen_user', 'renamed_user', 'purged_user']) {
+			store.registerIdentity({
+				userId, name: userId, userHandle: `handle-${userId}`, now, ipKey: `ip-${userId}`,
+				credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
+			});
+			store.setSeen({ userId, seen: now - 1_000, now });
+		}
+	});
+
+	// Code before `seen` (708f6a5) on these tables: every statement it runs on
+	// `identities`, verbatim but for its bindings, names its columns; none
+	// recreates the table, inserts by position or reads `*`. It finds schema
+	// 9, so it neither resets nor upgrades.
+	await evictDurableObject(stub);
+	await runInDurableObject(stub, (_instance, state) => {
+		const sql = state.storage.sql;
+		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe('9');
+		// Registration, a bot or `admin`, and a reset's passkey carry: named columns, so `seen_ms` takes its default.
+		sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES (?, ?, ?, 'registered', ?, ?)", 'old_user', 'handle-old_user', 'Old', now, now);
+		sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES (?, '', ?, ?, ?, ?, ?)", 'bot_old_user', 'Bot', 'bot', now, now, '["bot"]');
+		sql.exec("INSERT OR IGNORE INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES (?, ?, ?, 'registered', ?, ?, ?)", 'carried_user', 'handle-carried', 'Carried', now, now, '[]');
+		// Reads by name.
+		expect(sql.exec("SELECT user_id, user_handle, name, tier, created_ms, updated_ms, avatar_url, avatar_expires_ms, roles_json, ext_json FROM identities WHERE user_id = ? LIMIT 1", 'seen_user').one()).toMatchObject({ user_id: 'seen_user', ext_json: '' });
+		expect(sql.exec(`SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json, s.status
+			FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id LEFT JOIN user_status s ON s.user_id = m.user_id
+			WHERE m.room_id = ? ORDER BY m.user_id LIMIT ?`, 'general', 10).toArray().map((row) => row.user_id)).toEqual(['purged_user', 'renamed_user', 'seen_user']);
+		expect(sql.exec(`SELECT c.credential_id, c.user_id, c.public_key_json, c.sign_count, c.transports_json,
+				c.created_ms, c.updated_ms, i.user_handle, i.name, i.tier, i.roles_json,
+				i.created_ms AS identity_created_ms, i.updated_ms AS identity_updated_ms,
+				EXISTS (SELECT 1 FROM memberships m WHERE m.room_id = ? AND m.user_id = c.user_id) AS in_general
+			FROM credentials c JOIN identities i ON i.user_id = c.user_id
+			WHERE i.tier = 'registered' AND i.user_id <> ?
+			ORDER BY c.updated_ms DESC, c.credential_id LIMIT ?`, 'general', 'admin', 100).toArray()).toHaveLength(3);
+		expect(sql.exec<{ count: number }>('SELECT COUNT(*) AS count FROM identities').one().count).toBe(6);
+		// Updates of other columns leave `seen_ms` as it is; /rename moves it with the row; /purge deletes the row.
+		sql.exec('UPDATE identities SET name = ?, ext_json = ?, updated_ms = ? WHERE user_id = ?', 'Seen', '{"tz":"UTC"}', now, 'seen_user');
+		sql.exec('UPDATE identities SET roles_json = ?, updated_ms = ? WHERE user_id = ?', '["friend"]', now, 'seen_user');
+		sql.exec('UPDATE identities SET avatar_url = ?, avatar_expires_ms = ?, updated_ms = ? WHERE user_id = ?', 'https://example.test/a.png', now + 1, now, 'seen_user');
+		sql.exec("UPDATE identities SET avatar_url = '', avatar_expires_ms = 0, updated_ms = ? WHERE user_id = ?", now, 'seen_user');
+		sql.exec('UPDATE identities SET user_id = ?, updated_ms = ? WHERE user_id = ?', 'renamed_to', now, 'renamed_user');
+		sql.exec('DELETE FROM identities WHERE user_id IN (?)', 'purged_user');
+	});
+
+	// The redeploy finds the column with what it held, and adds nothing.
+	await evictDurableObject(stub);
+	await runInDurableObject(stub, (instance, state) => {
+		const { store } = instance as unknown as Runtime;
+		const sql = state.storage.sql;
+		expect(store.requiresReset()).toBe(false);
+		expect(identityColumns(sql).filter((name) => name === 'seen_ms')).toHaveLength(1);
+		expect(store.statusInputs('seen_user').seen).toBe(now - 1_000);
+		expect(store.statusInputs('renamed_to').seen).toBe(now - 1_000);
+		expect(store.statusInputs('old_user')).not.toHaveProperty('seen');
+		expect(store.statusInputs('carried_user')).not.toHaveProperty('seen');
+		expect(store.getIdentity('seen_user')).toMatchObject({ name: 'Seen', roles: ['friend'] });
+		expect(store.getIdentity('purged_user')).toBeNull();
+		store.setSeen({ userId: 'old_user', seen: now, now });
+		expect(store.statusInputs('old_user').seen).toBe(now);
 	});
 });
 
