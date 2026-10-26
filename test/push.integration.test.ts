@@ -97,7 +97,7 @@ describe('push over the socket', () => {
 		const peer = await connect();
 		try {
 			const server = await peer.next();
-			expect(server.params.push).toEqual({ webpush: { key: env.VAPID_PUBLIC_KEY }, wake: ['mentions', 'replies'] });
+			expect(server.params.push).toEqual({ webpush: { key: env.VAPID_PUBLIC_KEY }, wake: ['mentions', 'replies', 'private'] });
 		} finally { peer.close(); }
 	});
 
@@ -169,7 +169,7 @@ describe('push over the socket', () => {
 			expect((await subscriptionsOf(userId)).map((row) => [row.url, row.pushId, row.wake])).toEqual([[url, pushId, ['mentions', 'replies']]]);
 			// Unknown scopes are ignored, and a changed wake is written at once.
 			await request(peer, 'wake-scopes', 'push_register', { kind: 'webpush', url, push_id: pushId, keys: (await subscriptionsOf(userId)).map((row) => ({ p256dh: row.p256dh, auth: row.auth }))[0], wake: ['replies', 'private', 'ext:x'] });
-			expect((await subscriptionsOf(userId))[0].wake).toEqual(['replies']);
+			expect((await subscriptionsOf(userId))[0].wake).toEqual(['replies', 'private']);
 			// Unregistering removes it; an unknown url is already gone.
 			expect((await request(peer, 'unregister', 'push_unregister', { url })).result).toEqual({});
 			expect((await request(peer, 'unregister-again', 'push_unregister', { url })).result).toEqual({});

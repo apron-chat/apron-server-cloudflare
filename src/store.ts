@@ -14,6 +14,8 @@ import {
   MAX_EMOJI_BYTES,
   MAX_PUSH_CANDIDATES,
   MAX_PUSHES_PER_MESSAGE,
+  MAX_PRIVATE_MEMBERSHIPS_PER_USER,
+  MAX_PRIVATE_ROOM_LIMIT,
   MAX_THREAD_LIMIT,
   type PushPolicy,
   type UploadPolicy,
@@ -73,6 +75,32 @@ export const DEFAULT_JOINED_ROOMS: readonly string[] = [ROOM_ID];
 const DEFAULT_THREAD_TITLE = "Thread";
 /** Title the demo supplies for a top-level room created or saved without one. */
 const DEFAULT_ROOM_TITLE = "Room";
+/**
+ * Prefix of a private room's `room_id` (§4.2.4): `private_<log id>`. A
+ * private room is visible only to its members, who alone may add others;
+ * nobody joins one by themselves. The ID is opaque to clients, which go by
+ * the record's `private: true`; here it tells a private room apart without
+ * a read, and keeps private rooms in a range of the rooms table's key that
+ * the public scans never touch (PUBLIC_ROOMS).
+ */
+export const PRIVATE_ROOM_PREFIX = "private_";
+/** Whether `roomId` names a private room (PRIVATE_ROOM_PREFIX). */
+export function isPrivateRoomId(roomId: string): boolean {
+  return roomId.startsWith(PRIVATE_ROOM_PREFIX);
+}
+/**
+ * SQL conditions on `room_id` for the private rooms, one range of the key's
+ * index, and the public ones, the ranges either side of it. A public scan
+ * reads no private row, so it stays within the thread ceiling it was
+ * calibrated for, and a private one within the private ceiling.
+ */
+const privateRange = (column: string) => `${column} >= 'private_' AND ${column} < 'private\`'`;
+const PRIVATE_ROOMS = privateRange("room_id");
+const PUBLIC_ROOMS = "(room_id < 'private_' OR room_id >= 'private`')";
+/** Most rows the rooms table holds: `general`, the thread ceiling (created top-level rooms count against it), and the private rooms. */
+const MAX_ROOM_ROWS = MAX_THREAD_LIMIT + 1 + MAX_PRIVATE_ROOM_LIMIT;
+/** Most rooms one registered user can be in: every public room, and their share of private ones. */
+const MAX_USER_ROOMS = MAX_THREAD_LIMIT + 1 + MAX_PRIVATE_MEMBERSHIPS_PER_USER;
 const MAX_SAFE_ID = Number.MAX_SAFE_INTEGER;
 export const RETENTION_MS = DEFAULT_LIMITS.retentionSeconds * 1000;
 const DEDUP_TTL_MS = DEFAULT_LIMITS.dedupTtlSeconds * 1000;
@@ -137,6 +165,12 @@ export interface StoreConfig {
   maxThreadsPerUser: number;
   /** Serialized client fields of one room record. */
   maxThreadMetadataBytes: number;
+  /** Private rooms (§4.2.4) that may exist at once, beside the threads. */
+  maxPrivateRooms: number;
+  /** Live private rooms one registered user may have created (`creator_id`) at once. */
+  maxPrivateRoomsPerUser: number;
+  /** Private rooms one registered user may be a member of at once. */
+  maxPrivateMembershipsPerUser: number;
   reactionUsersPerMessage: number;
   reactionEmojisPerUser: number;
   maxHistoryLimit: number;
@@ -272,6 +306,9 @@ const DEFAULT_CONFIG: StoreConfig = {
   maxThreads: DEFAULT_LIMITS.threadLimit,
   maxThreadsPerUser: DEFAULT_LIMITS.threadsPerUser,
   maxThreadMetadataBytes: DEFAULT_LIMITS.threadMetadataBytes,
+  maxPrivateRooms: DEFAULT_LIMITS.privateRoomLimit,
+  maxPrivateRoomsPerUser: DEFAULT_LIMITS.privateRoomsPerUser,
+  maxPrivateMembershipsPerUser: DEFAULT_LIMITS.privateMembershipsPerUser,
   reactionUsersPerMessage: DEFAULT_LIMITS.reactionUsersPerMessage,
   reactionEmojisPerUser: DEFAULT_LIMITS.reactionEmojisPerUser,
   maxHistoryLimit: DEFAULT_LIMITS.historyMaxLimit,
@@ -322,7 +359,9 @@ const DEFAULT_CONFIG: StoreConfig = {
   mutationCost: { reads: 64, writes: 64, posts: 1 },
   historyCost: { reads: 64 },
   authCost: { reads: 24, writes: 8, frames: 1 },
-  cleanupCost: { reads: 1024, writes: 1024 },
+  // A batch also scans the private range for expired rooms, twice, at up to
+  // two reads a row (its key's index entry and the row).
+  cleanupCost: { reads: 1024 + 4 * MAX_PRIVATE_ROOM_LIMIT, writes: 1024 },
 };
 
 export function defaultStoreConfig(overrides: Partial<StoreConfig> = {}): StoreConfig {
@@ -391,6 +430,8 @@ export interface RoomRecord {
   room_id: string;
   log_id: string;
   parent_room_id?: string;
+  /** Present on a private room only (§4.2.4, PRIVATE_ROOM_PREFIX). */
+  private?: true;
   title?: string;
   /** What the room is about, CommonMark by convention (§4.2). */
   description?: string;
@@ -665,6 +706,12 @@ const META_PURGE_ROOMS = "purge_rooms";
 /** Most removed rooms awaiting purge; cleanup removes no further room past it. */
 const MAX_PURGE_ROOMS = MAX_THREAD_LIMIT;
 /**
+ * Reads for privateRoomCounts(): the private range of the rooms table for
+ * the creator's live rooms, an index entry and a row each, and the
+ * creator's membership rows, live and awaiting purge, with a room lookup each.
+ */
+const PRIVATE_ROOM_COUNT_READS = 16 + 2 * MAX_PRIVATE_ROOM_LIMIT + 2 * (MAX_USER_ROOMS + MAX_PURGE_ROOMS);
+/**
  * Most retained records a budget-checked log scan (`/rename`) reserves for:
  * above a week of the paid plan's posts, and a small share of the day's
  * foreground reads. Counting reads one index entry per record, refunded past
@@ -776,7 +823,7 @@ const MEMBER_TABLES = /\b(identities|memberships|user_status)\b/;
  * thread ceiling and `general`); rows of rooms removed since cleanup last
  * ran, at most the purge list, wait for it.
  */
-const MAX_PUSH_WAKES_PER_USER = MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS;
+const MAX_PUSH_WAKES_PER_USER = MAX_USER_ROOMS + MAX_PURGE_ROOMS;
 /**
  * Longest push endpoint URL kept (protocol §4.9). Browsers' are a few
  * hundred bytes; a tighter bound keeps each row small, so sybil accounts
@@ -792,11 +839,14 @@ export const PUSH_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 /**
  * The wake scopes this server implements (protocol §4.9), each a bit of a
  * registration's `wake` column: `mentions` (messages whose `mentions` list
- * the user) and `replies` (replies to the user's messages).
+ * the user), `replies` (replies to the user's messages) and `private`
+ * (messages in the private rooms the user is in; they have no threads).
  */
-export const WAKE_SCOPES = { mentions: 1, replies: 2 } as const;
-/** Every scope, the default for a registration without `wake`. */
+export const WAKE_SCOPES = { mentions: 1, replies: 2, private: 4 } as const;
+/** `mentions` and `replies`, the default for a registration without `wake` (§4.9.4). */
 const DEFAULT_WAKE = WAKE_SCOPES.mentions | WAKE_SCOPES.replies;
+/** Every scope: a registration's `wake` names some of these. */
+const ALL_WAKE = WAKE_SCOPES.mentions | WAKE_SCOPES.replies | WAKE_SCOPES.private;
 
 /** A `user_status` or `room_mutes` row's `mute_until_ms` for a mute that lasts until changed (`mute: true`). */
 export const MUTE_FOREVER = Number.MAX_SAFE_INTEGER;
@@ -2165,6 +2215,8 @@ export class Store {
     const fields = parseJson<{ title?: unknown; description?: unknown; ext?: unknown }>(row.fields_json, {});
     const record: Record<string, unknown> = { room_id: row.room_id, log_id: idString(row.record_log_id) };
     if (row.parent_room_id !== null) record.parent_room_id = row.parent_room_id;
+    // Sent only on a room kept private (§4.2.4), so a client can check it before posting.
+    if (isPrivateRoomId(row.room_id)) record.private = true;
     if (typeof fields.title === "string") record.title = fields.title;
     if (typeof fields.description === "string") record.description = fields.description;
     if (isPlainObject(fields.ext)) record.ext = fields.ext;
@@ -2181,22 +2233,26 @@ export class Store {
   }
 
   /**
-   * Every visible room record, oldest first, for `room_list`. Maintenance
-   * callers (the retention `room_update` `updated` listing) charge the maintenance
-   * budget, and may keep only rooms whose history_log_id differs from what it
-   * was under an earlier retention floor.
+   * Every public room record, oldest first, for `room_list`, which adds the
+   * caller's private rooms (privateRoomsOf). Maintenance callers (the
+   * retention `room_update` `updated` listing, which goes to each room's
+   * members) charge the maintenance budget, may list the private rooms too
+   * (`withPrivate`), and may keep only rooms whose history_log_id differs
+   * from what it was under an earlier retention floor.
    */
-  listRooms(now = this.clock.now(), options: { maintenance?: boolean; changedSinceFloor?: number } = {}): RoomRecord[] {
+  listRooms(now = this.clock.now(), options: { maintenance?: boolean; changedSinceFloor?: number; withPrivate?: boolean } = {}): RoomRecord[] {
     this.ensureReady();
-    return this.reserved({ reads: this.roomListingReads() }, options.maintenance === true, now, () => {
+    const withPrivate = options.withPrivate === true;
+    return this.reserved({ reads: this.roomListingReads() + (withPrivate ? 4 * MAX_PRIVATE_ROOM_LIMIT : 0) }, options.maintenance === true, now, () => {
       const floor = this.logState().history_floor;
-      // The rooms table is capped at `general` plus the calibrated thread
+      // The public range is capped at `general` plus the calibrated thread
       // ceiling, which created top-level rooms count against too, so this
-      // ordered scan is bounded by that cap.
+      // ordered scan is bounded by that cap; the private range by its own.
       const rows = this.rawRows<RawRoomRow>(
-        `SELECT ${ROOM_COLUMNS} FROM rooms ORDER BY created_log_id ASC LIMIT ?`,
+        `SELECT ${ROOM_COLUMNS} FROM rooms WHERE ${PUBLIC_ROOMS} ORDER BY created_log_id ASC LIMIT ?`,
         MAX_THREAD_LIMIT + 1,
       );
+      if (withPrivate) rows.push(...this.rawRows<RawRoomRow>(`SELECT ${ROOM_COLUMNS} FROM rooms WHERE ${PRIVATE_ROOMS} LIMIT ?`, MAX_PRIVATE_ROOM_LIMIT));
       const since = options.changedSinceFloor;
       return rows
         .filter((row) => since === undefined || roomHistoryLogId(row, since) !== roomHistoryLogId(row, floor))
@@ -2211,6 +2267,25 @@ export class Store {
       const row = this.roomRow(roomId);
       if (!row) return null;
       return this.roomRecord(row, this.logState().history_floor);
+    });
+  }
+
+  /**
+   * The private rooms a registered user is in, as room records, for their
+   * listings: listRooms reads only the public ones. Their membership rows
+   * through the user index, live and awaiting purge, joined with `rooms`,
+   * which hides the latter.
+   */
+  privateRoomsOf(userId: string, now = this.clock.now()): RoomRecord[] {
+    this.ensureReady();
+    return this.reserved({ reads: 16 + 3 * (MAX_USER_ROOMS + MAX_PURGE_ROOMS) }, false, now, () => {
+      const floor = this.logState().history_floor;
+      return this.rawRows<RawRoomRow>(
+        `SELECT ${ROOM_COLUMNS.split(", ").map((column) => `r.${column}`).join(", ")}
+         FROM memberships m INDEXED BY memberships_user_idx JOIN rooms r ON r.room_id = m.room_id
+         WHERE m.user_id = ? AND ${privateRange("m.room_id")} LIMIT ?`,
+        userId, MAX_PRIVATE_MEMBERSHIPS_PER_USER,
+      ).map((row) => this.roomRecord(row, floor));
     });
   }
 
@@ -2261,13 +2336,13 @@ export class Store {
       `SELECT m.room_id FROM memberships m INDEXED BY memberships_user_idx
        JOIN rooms r ON r.room_id = m.room_id
        WHERE m.user_id = ? ORDER BY r.created_log_id LIMIT ?`,
-      userId, MAX_THREAD_LIMIT + 1,
+      userId, MAX_USER_ROOMS,
     ).map((row) => row.room_id);
   }
 
   /** Reads for userRooms(): the user's membership rows, live and awaiting purge, and a room lookup each. */
   private userRoomsReads(): number {
-    return 8 + 2 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS);
+    return 8 + 2 * (MAX_USER_ROOMS + MAX_PURGE_ROOMS);
   }
 
   /** Whether an identity has this `user_id` now, one indexed read. */
@@ -2311,7 +2386,7 @@ export class Store {
     const now = input.now ?? this.clock.now();
     const { from, to } = input;
     const records = this.retainedRecords(now);
-    const found = this.reserved({ reads: 64 + 8 * records + 2 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER) + 2 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS) }, false, now, () => {
+    const found = this.reserved({ reads: 64 + 8 * records + 2 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER) + 2 * (MAX_ROOM_ROWS + MAX_PURGE_ROOMS) }, false, now, () => {
       const identity = this.identityRow(from);
       if (!identity || identity.tier !== "registered") throw new StoreError("invalid_params", `No registered user has the user_id ${from}`.slice(0, 200));
       if (parseRoles(identity.roles_json).includes("bot")) throw new StoreError("denied", "A bot's user_id is fixed");
@@ -2338,7 +2413,7 @@ export class Store {
         requests: count("SELECT COUNT(*) AS count FROM accepted_requests WHERE user_id = ?"),
       };
     });
-    const membershipRows = MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS;
+    const membershipRows = MAX_USER_ROOMS + MAX_PURGE_ROOMS;
     // Moving a row keyed or indexed by the user_id reads its index entry and
     // row and rewrites both (measured: about 2 reads and 3 writes each);
     // rewriting a record's JSON in place is one write.
@@ -2452,10 +2527,10 @@ export class Store {
     // Per user: memberships (live and awaiting a room purge), a day's dedup
     // rows, limiter rows, push subscriptions, credential and identity; each
     // deletion also updates its indexes.
-    const perUser = 64 + 4 * (MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS) + 4 * Math.max(this.config.registeredPostsPerDay, this.config.trustedPostsPerDay) + 4 * uploadsPerOwner +
+    const perUser = 64 + 4 * (MAX_USER_ROOMS + MAX_PURGE_ROOMS) + 4 * Math.max(this.config.registeredPostsPerDay, this.config.trustedPostsPerDay) + 4 * uploadsPerOwner +
       4 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER);
     // Every room row is read for its creator, and each one theirs rewritten.
-    const roomRows = MAX_THREAD_LIMIT + 1 + MAX_PURGE_ROOMS;
+    const roomRows = MAX_ROOM_ROWS + MAX_PURGE_ROOMS;
     const cost = { reads: 64 + 5 * records + 2 * roomRows + ids.length * perUser, writes: 64 + 4 * records + 2 * roomRows + ids.length * perUser };
     return this.reserved(cost, false, now, () => this.transaction(() => {
       const messages = this.rawRows<{ message_id: string }>(`SELECT message_id FROM message_state WHERE author_id IN (${marks})`, ...ids)
@@ -2572,7 +2647,8 @@ export class Store {
     withStatus = false,
   ): Map<string, RoomMember[]> {
     this.ensureReady();
-    const ids = [...new Set(roomIds)].slice(0, MAX_THREAD_LIMIT + 1);
+    // A listing holds the public rooms and the caller's private ones.
+    const ids = [...new Set(roomIds)].slice(0, MAX_USER_ROOMS);
     const perRoom = Math.max(0, Math.floor(limit));
     const members = new Map<string, RoomMember[]>();
     if (!ids.length || perRoom === 0) return members;
@@ -2588,7 +2664,7 @@ export class Store {
       // measured at one more read a member at worst.
       this.reserved({ reads: 8 + missing.length * (4 + (withStatus ? 3 : 2) * perRoom) }, false, now, () => {
         const generation = this.memberGeneration;
-        if (this.memberCache.size > 2 * (MAX_THREAD_LIMIT + 1)) this.memberCache.clear();
+        if (this.memberCache.size > 2 * MAX_USER_ROOMS) this.memberCache.clear();
         for (const roomId of missing) {
           const rows = this.rawRows<RawMemberRow>(
             withStatus
@@ -3222,6 +3298,15 @@ export class Store {
     return rows[0];
   }
 
+  /**
+   * A current message `userId` may see: currentMessage, less one in a
+   * private room they are not in, which reads as unknown (§5.3).
+   */
+  private visibleMessage(messageId: string, userId: string, floor?: number): RawMessageRow | null {
+    const row = this.currentMessage(messageId, floor);
+    return row && isPrivateRoomId(row.room_id) && !this.isMember(row.room_id, userId) ? null : row;
+  }
+
   /** Whether a registered user holds a moderator role (MODERATOR_ROLES), from the identity row. */
   private isModerator(userId: string): boolean {
     return this.holdsRole(userId, MODERATOR_ROLES);
@@ -3252,7 +3337,7 @@ export class Store {
   topLevelRoomIds(now = this.clock.now()): string[] {
     this.ensureReady();
     return this.reserved({ reads: 4 + MAX_CREATED_ROOMS }, false, now, () => this.rawRows<{ room_id: string }>(
-      "SELECT room_id FROM rooms WHERE parent_room_id IS NULL ORDER BY created_log_id ASC LIMIT ?", MAX_CREATED_ROOMS + 1,
+      `SELECT room_id FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IS NULL ORDER BY created_log_id ASC LIMIT ?`, MAX_CREATED_ROOMS + 1,
     ).map((row) => row.room_id));
   }
 
@@ -3506,9 +3591,13 @@ export class Store {
     }
   }
 
-  /** The given room IDs that still exist, once each and in order. Reads the capped rooms table. */
+  /**
+   * The given public room IDs that still exist, once each and in order.
+   * Reads the capped public range of the rooms table; a private room is
+   * never among them, as nobody starts in one (only a member adds others).
+   */
   private existingRooms(ids: readonly string[]): string[] {
-    const known = new Set(this.rawRows<{ room_id: string }>("SELECT room_id FROM rooms LIMIT ?", MAX_THREAD_LIMIT + 1).map((row) => row.room_id));
+    const known = new Set(this.rawRows<{ room_id: string }>(`SELECT room_id FROM rooms WHERE ${PUBLIC_ROOMS} LIMIT ?`, MAX_THREAD_LIMIT + 1).map((row) => row.room_id));
     return [...new Set(ids)].filter((id) => known.has(id));
   }
 
@@ -3551,18 +3640,25 @@ export class Store {
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
     // The three posting limiter rows, the identity and membership rows, the
-    // room record, and the user's rooms.
-    const reserved = this.reserveCost({ reads: 64 + this.userRoomsReads(), writes: 64, posts: 1 }, false, operationNow);
+    // room record, and the user's rooms; a join of a private room also counts
+    // the private rooms the user is in, through the same membership rows.
+    const privateJoin = input.join && isPrivateRoomId(input.roomId);
+    const reserved = this.reserveCost({ reads: 64 + (privateJoin ? 2 : 1) * this.userRoomsReads(), writes: 64, posts: 1 }, false, operationNow);
     try {
       const effective = this.effectiveNow(operationNow);
       if (input.join) this.ensureGrowthCapacity(1024);
       return this.transaction(() => {
         const identity = this.identityRow(input.userId);
         if (!identity) throw new StoreError("denied", "Only registered identities keep rooms");
-        const room = this.roomRow(input.roomId);
+        // Only a private room's members see it, and only they add others to
+        // it: nobody joins one by themselves (PRIVATE_ROOM_PREFIX).
+        const room = privateJoin ? this.visibleRoomRow(input.roomId, input.actorId ?? input.userId) : this.roomRow(input.roomId);
         if (!room) throw new StoreError("invalid_params", "Unknown room");
         const member = this.rawRows("SELECT user_id FROM memberships WHERE room_id = ? AND user_id = ? LIMIT 1", input.roomId, input.userId).length > 0;
         if (member === input.join) return { rooms: this.userRooms(input.userId), changed: false };
+        if (privateJoin && this.privateMembershipCount(input.userId) >= this.config.maxPrivateMembershipsPerUser) {
+          throw new StoreError("denied", `${input.userId} is in as many private rooms as anyone may be, so cannot be added to another`.slice(0, 200));
+        }
         this.chargePosting({ userId: input.actorId ?? input.userId, tier: "registered", ipKey: input.ipKey, now: effective });
         if (input.join) this.rawExec("INSERT INTO memberships (room_id, user_id) VALUES (?, ?)", input.roomId, input.userId);
         else this.rawExec("DELETE FROM memberships WHERE room_id = ? AND user_id = ?", input.roomId, input.userId);
@@ -3603,7 +3699,7 @@ export class Store {
   }
 
   /**
-   * Removes a thread room that has emptied (§4.2.2): no registered member is
+   * Removes a thread or private room that has emptied (§4.2.2): no registered member is
    * left in it, so the last to leave frees its slot instead of leaving it
    * until its log expires, whatever messages it holds. The caller checks
    * that no connection, a guest's included, is still in it. Its records and
@@ -3615,10 +3711,13 @@ export class Store {
     this.ensureReady();
     return this.reserved({ reads: 16, writes: 8 }, false, now, () => this.transaction(() => {
       const room = this.roomRow(roomId);
-      if (!room || room.parent_room_id === null) return false;
+      // A private room goes the same way, freeing its slot among the private ones.
+      const isPrivate = room !== null && isPrivateRoomId(room.room_id);
+      if (!room || (room.parent_room_id === null && !isPrivate)) return false;
       if (this.rawRows("SELECT user_id FROM memberships WHERE room_id = ? LIMIT 1", roomId).length) return false;
-      this.rawExec("DELETE FROM rooms WHERE room_id = ? AND parent_room_id IS NOT NULL", roomId);
-      this.rawExec("UPDATE _meta SET value = ? WHERE key = 'thread_count'", String(Math.max(0, this.metaNumber("thread_count") - 1)));
+      this.rawExec("DELETE FROM rooms WHERE room_id = ?", roomId);
+      const counter = isPrivate ? "private_count" : "thread_count";
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", counter, String(Math.max(0, this.metaNumber(counter) - 1)));
       return true;
     }));
   }
@@ -3631,19 +3730,23 @@ export class Store {
 
   /**
    * Validate a bare message reference (`reply_to`). Only the
-   * `message_id` is kept. A new reference must name a retained message; a save
-   * that resubmits its current reference unchanged is accepted even after the
-   * target has expired, so old replies remain editable.
+   * `message_id` is kept. A new reference must name a retained message the
+   * `viewer` may see; a save that resubmits its current reference unchanged
+   * is accepted even after the target has expired, so old replies remain
+   * editable. A message in a private room is answered only in that room
+   * (`roomId`), so a reply elsewhere never points into it.
    */
-  private messageReference(value: unknown, field: string, floor: number, options: { self?: string; unchanged?: string } = {}): string | undefined {
+  private messageReference(value: unknown, field: string, floor: number, options: { viewer: string; roomId: string; self?: string; unchanged?: string }): string | undefined {
     if (value === undefined) return undefined;
     if (!isPlainObject(value) || typeof value.message_id !== "string" || value.message_id.length === 0) {
       throw new StoreError("invalid_params", `${field}.message_id must be a non-empty string`);
     }
     const messageId = ensureText(value.message_id, `${field}.message_id`, 256);
     if (options.self !== undefined && messageId === options.self) throw new StoreError("invalid_params", `${field} cannot name the message itself`);
-    if (messageId !== options.unchanged && !this.currentMessage(messageId, floor)) {
-      throw new StoreError("invalid_params", `${field} names an unknown or expired message`);
+    if (messageId !== options.unchanged) {
+      const target = this.visibleMessage(messageId, options.viewer, floor);
+      if (!target) throw new StoreError("invalid_params", `${field} names an unknown or expired message`);
+      if (isPrivateRoomId(target.room_id) && target.room_id !== options.roomId) throw new StoreError("denied", `${field} names a message in a private room; reply there instead`);
     }
     return messageId;
   }
@@ -3691,17 +3794,24 @@ export class Store {
     if (typeof roomId !== "string" || roomId.length === 0) throw new StoreError("invalid_params", "room_id must be a non-empty string");
     const messageIdParam = params.message_id;
     if (messageIdParam !== undefined && typeof messageIdParam !== "string") throw new StoreError("invalid_params", "message_id must be a string");
-    const current = messageIdParam === undefined ? null : this.currentMessage(ensureText(messageIdParam, "message_id", 256), floor);
+    const current = messageIdParam === undefined ? null : this.visibleMessage(ensureText(messageIdParam, "message_id", 256), input.userId, floor);
     if (messageIdParam !== undefined && !current) throw new StoreError("invalid_params", "unknown or expired message");
     // Someone else's message may only be moved, and only by a moderator (MODERATOR_ROLES).
     const moving = current !== null && current.author_id !== input.userId;
     if (moving && (current.room_id === roomId || !this.isModerator(input.userId))) throw new StoreError("denied", "Only the original author may edit this message");
-    if (!this.roomRow(roomId)) throw new StoreError("invalid_params", "unknown room");
+    // Posting needs no join, except in a private room, which only its members see.
+    if (!this.visibleRoomRow(roomId, input.userId)) throw new StoreError("invalid_params", "unknown room");
+    // A private room's messages stay in it, and no other room's come in.
+    if (current !== null && current.room_id !== roomId && (isPrivateRoomId(current.room_id) || isPrivateRoomId(roomId))) {
+      throw new StoreError("denied", "Messages cannot be moved into or out of a private room");
+    }
     const deleted = params.deleted === undefined ? false : params.deleted;
     if (typeof deleted !== "boolean") throw new StoreError("invalid_params", "deleted must be boolean");
     if (!current && deleted) throw new StoreError("invalid_params", "a message cannot be created deleted");
     const previous = current ? parseJson<MessageSnapshot>(current.snapshot_json) : null;
     const replyId = this.messageReference(params.reply_to, "reply_to", floor, {
+      viewer: input.userId,
+      roomId,
       ...(typeof messageIdParam === "string" ? { self: messageIdParam } : {}),
       ...(previous?.reply_to ? { unchanged: previous.reply_to.message_id } : {}),
     });
@@ -4176,7 +4286,7 @@ export class Store {
     if (utf8Bytes(input.url) > MAX_PUSH_URL_BYTES) throw new StoreError("too_large", "url is too long");
     if (input.pushId !== undefined && !PUSH_ID_PATTERN.test(input.pushId)) throw new StoreError("invalid_params", "push_id must be 1 to 64 letters, digits, _ or -");
     const wake = input.wake ?? DEFAULT_WAKE;
-    if (!Number.isInteger(wake) || wake < 0 || (wake & ~DEFAULT_WAKE) !== 0) throw new StoreError("invalid_params", "wake must name known scopes");
+    if (!Number.isInteger(wake) || wake < 0 || (wake & ~ALL_WAKE) !== 0) throw new StoreError("invalid_params", "wake must name known scopes");
     const now = input.now ?? this.clock.now();
     // The row and the user's index range; each eviction rewrites a row and
     // its three index entries.
@@ -4248,10 +4358,10 @@ export class Store {
     if (!policy || !candidates.length) return claim;
     const now = input.now ?? this.clock.now();
     // Each candidate's status row, live index range, two room mute probes,
-    // wake row and recipient counter; the room's parent, read once; the
+    // wake row, recipient counter and, in a private room, membership row; the room's parent, read once; the
     // server's and sender's counters; and for each woken user a wake row and
     // the recipient counter, created on a user's first push of the day.
-    const cost = { reads: 56 + candidates.length * (20 + 2 * policy.subscriptionsPerUser), writes: 32 + 12 * policy.wakesPerMessage };
+    const cost = { reads: 56 + candidates.length * (24 + 2 * policy.subscriptionsPerUser), writes: 32 + 12 * policy.wakesPerMessage };
     return this.reserved(cost, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       const day = dayFor(effective);
@@ -4263,6 +4373,8 @@ export class Store {
       let woken = 0;
       for (const userId of candidates) {
         if (woken >= policy.wakesPerMessage) break;
+        // A private room's message wakes only who is in it when it goes, however they were chosen.
+        if (isPrivateRoomId(input.roomId) && !this.isMember(input.roomId, userId)) continue;
         // A muted or `dnd` user gets no pushes (protocol §4.9, §4.5) and takes no wake.
         const status = this.rawRows<{ status: string; mute_until_ms: number | null }>("SELECT status, mute_until_ms FROM user_status WHERE user_id = ? LIMIT 1", userId)[0];
         if (status && (status.status === "dnd" || (status.mute_until_ms != null && integerColumn(status.mute_until_ms) > effective))) continue;
@@ -4584,7 +4696,7 @@ export class Store {
     const messageIdParam = params.message_id;
     if (typeof messageIdParam !== "string" || messageIdParam.length === 0) throw new StoreError("invalid_params", "message_id must be a non-empty string");
     const emojis = this.normalizedEmojis(params.emojis);
-    const message = this.currentMessage(ensureText(messageIdParam, "message_id", 256), floor);
+    const message = this.visibleMessage(ensureText(messageIdParam, "message_id", 256), input.userId, floor);
     if (!message) throw new StoreError("invalid_params", "unknown or expired message");
     const snapshot = parseJson<MessageSnapshot>(message.snapshot_json);
     // Clients hide a tombstone's reactions; the demo stores no new ones.
@@ -4632,13 +4744,16 @@ export class Store {
   /**
    * `room_set`: create a room or thread, or replace one's client fields (§4.2.4),
    * merging `ext` into the current one (§4.12).
-   * Demo policy: anyone may create a thread under a top-level room and save
-   * any thread; only an admin or mod (ROOM_CREATOR_ROLES) may create a
-   * top-level room or save one. Threads cannot be nested, and the permanent
-   * `general` room is fixed. Every created room counts against maxThreads,
-   * which bounds the rooms table. Rooms are never private here: every room
-   * is visible to everyone, so a creation with `private: true` is
-   * `unsupported`, as §4.2.4 requires.
+   * Demo policy: anyone may create a thread under a public top-level room and
+   * save any public thread; only an admin or mod (ROOM_CREATOR_ROLES) may
+   * create a public top-level room or save one. Threads cannot be nested, and
+   * the permanent `general` room is fixed. Every public room created counts
+   * against maxThreads, which bounds the rooms table's public range.
+   * A registered user may also create a private room with `private: true`
+   * (PRIVATE_ROOM_PREFIX): top-level, without a title unless given one, and
+   * counted against maxPrivateRooms, their maxPrivateRoomsPerUser and
+   * maxPrivateMembershipsPerUser instead. Its members, and only they, may
+   * save it; it has no threads. To anyone else it does not exist.
    */
   private commitRoom(input: StoreMutationInput, context: CommitContext, floor: number, registered: boolean): StoreMutationResult {
     const params = input.params;
@@ -4646,24 +4761,31 @@ export class Store {
     if (roomIdParam !== undefined && (typeof roomIdParam !== "string" || roomIdParam.length === 0)) throw new StoreError("invalid_params", "room_id must be a non-empty string");
     if (params.private !== undefined && typeof params.private !== "boolean") throw new StoreError("invalid_params", "private must be a boolean");
     // `private` is fixed at creation; on a save it is ignored like parent_room_id.
-    if (roomIdParam === undefined && params.private === true) throw new StoreError("unsupported", "Private rooms are not supported on this demo");
+    const makePrivate = roomIdParam === undefined && params.private === true;
+    // A deployment without private rooms (privateRoomLimit 0) says so, as §4.2.4 requires.
+    if (makePrivate && this.config.maxPrivateRooms === 0) throw new StoreError("unsupported", "Private rooms are not supported on this server");
+    if (makePrivate && !registered) throw new StoreError("denied", "Sign in to start a private room");
+    if (makePrivate && params.parent_room_id !== undefined) throw new StoreError("denied", "A private room cannot be a thread on this demo");
     const titleParam = params.title;
     if (titleParam !== undefined && typeof titleParam !== "string") throw new StoreError("invalid_params", "title must be a string");
     const descriptionParam = params.description;
     if (descriptionParam !== undefined && typeof descriptionParam !== "string") throw new StoreError("invalid_params", "description must be a string");
     const write = this.optionalExt(params.ext);
-    const existing = roomIdParam === undefined ? undefined : this.roomRow(roomIdParam);
+    // A private room someone is not in is unknown to them, as one that does not exist.
+    const existing = roomIdParam === undefined ? undefined : this.visibleRoomRow(roomIdParam, input.userId);
+    const isPrivate = makePrivate || (existing ? isPrivateRoomId(existing.room_id) : false);
     // Threads always carry a title so clients that ignore parent_room_id
-    // still render them (§4.2), and so do top-level rooms. An empty
+    // still render them (§4.2), and so do public top-level rooms. A private
+    // room may go without one: clients name it after its members. An empty
     // description is no description.
     const topLevel = existing === undefined ? params.parent_room_id === undefined : existing?.parent_room_id === null;
-    const fallbackTitle = existing?.room_id === ROOM_ID ? ROOM_TITLE : topLevel ? DEFAULT_ROOM_TITLE : DEFAULT_THREAD_TITLE;
+    const fallbackTitle = isPrivate ? undefined : existing?.room_id === ROOM_ID ? ROOM_TITLE : topLevel ? DEFAULT_ROOM_TITLE : DEFAULT_THREAD_TITLE;
     const title = typeof titleParam === "string" && titleParam.trim() !== "" ? titleParam : fallbackTitle;
     const description = typeof descriptionParam === "string" && descriptionParam.trim() !== "" ? descriptionParam : undefined;
     // `ext` merges into the room's current one (§4.12, §4.2.4); the size check runs on the result.
     const roomFields = (stored: unknown): Record<string, unknown> => {
       const ext = mergeExt(stored, write);
-      return { title, ...(description !== undefined ? { description } : {}), ...(ext ? { ext } : {}) };
+      return { ...(title !== undefined ? { title } : {}), ...(description !== undefined ? { description } : {}), ...(ext ? { ext } : {}) };
     };
 
     let row: RawRoomRow;
@@ -4671,15 +4793,26 @@ export class Store {
     if (roomIdParam === undefined) {
       const parentId = params.parent_room_id;
       let parentRoomId: string | null = null;
-      if (parentId === undefined) {
+      if (makePrivate) {
+        const counts = this.privateRoomCounts(input.userId, floor);
+        if (counts.memberships >= this.config.maxPrivateMembershipsPerUser) {
+          throw new StoreError("denied", `You are in ${counts.memberships} private rooms, the most at once; leave one to start another`);
+        }
+        // So one account cannot take every slot by starting rooms and leaving them to others.
+        if (counts.created >= this.config.maxPrivateRoomsPerUser) {
+          throw new StoreError("denied", `You can have started at most ${this.config.maxPrivateRoomsPerUser} private rooms at once; one stops counting when everyone has left it or its history expires`);
+        }
+        if (this.metaNumber("private_count") >= this.config.maxPrivateRooms) throw new StoreError("denied", "The demo holds as many private rooms as it can; one frees up when everyone has left it or its history expires");
+      } else if (parentId === undefined) {
         if (!registered || !this.holdsRole(input.userId, ROOM_CREATOR_ROLES)) throw new StoreError("denied", "Only an admin or mod may create a room; others may create threads");
-        const rooms = this.rawRows("SELECT room_id FROM rooms WHERE parent_room_id IS NULL LIMIT ?", MAX_CREATED_ROOMS + 1).length;
+        const rooms = this.rawRows(`SELECT room_id FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IS NULL LIMIT ?`, MAX_CREATED_ROOMS + 1).length;
         if (rooms > MAX_CREATED_ROOMS) throw new StoreError("denied", "room_limit");
       } else {
         if (typeof parentId !== "string" || parentId.length === 0) throw new StoreError("invalid_params", "parent_room_id must be a non-empty string");
-        const parent = this.roomRow(parentId);
+        const parent = this.visibleRoomRow(parentId, input.userId);
         if (!parent) throw new StoreError("invalid_params", "unknown parent_room_id");
         if (parent.parent_room_id !== null) throw new StoreError("denied", "Threads cannot be nested on this demo");
+        if (isPrivateRoomId(parentId)) throw new StoreError("denied", "A private room has no threads on this demo");
         parentRoomId = parentId;
         // So one account cannot take every slot: the threads a registered user
         // created that are still live, read from the capped rooms table. A
@@ -4689,11 +4822,12 @@ export class Store {
           throw new StoreError("denied", `You can have at most ${this.config.maxThreadsPerUser} threads at once; one stops counting when everyone has left it or its history expires`);
         }
       }
-      if (this.metaNumber("thread_count") >= this.config.maxThreads) throw new StoreError("denied", "thread_limit");
+      const counter = makePrivate ? "private_count" : "thread_count";
+      if (!makePrivate && this.metaNumber(counter) >= this.config.maxThreads) throw new StoreError("denied", "thread_limit");
       const fields = roomFields(undefined);
       this.checkRoomFields(fields);
       logId = this.allocateLogId(context);
-      const roomId = idString(logId);
+      const roomId = (makePrivate ? PRIVATE_ROOM_PREFIX : "") + idString(logId);
       // A registered creator is kept with the fields, outside the client's
       // size limit and the room record, so they can remove members (§4.2.2).
       const fieldsJson = JSON.stringify(registered ? { ...fields, creator_id: input.userId } : fields);
@@ -4701,7 +4835,7 @@ export class Store {
         `INSERT INTO rooms (${ROOM_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
         roomId, parentRoomId, logId, logId, logId, fieldsJson, context.commitMs, context.commitMs,
       );
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('thread_count', ?)", String(this.metaNumber("thread_count") + 1));
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", counter, String(this.metaNumber(counter) + 1));
       row = {
         room_id: roomId, parent_room_id: parentRoomId, created_log_id: logId, record_log_id: logId, latest_log_id: logId,
         fields_json: fieldsJson, created_ms: context.commitMs, updated_ms: context.commitMs, member_count: 0,
@@ -4710,7 +4844,7 @@ export class Store {
       if (!existing) throw new StoreError("invalid_params", "unknown room");
       if (existing.room_id === ROOM_ID) {
         if (!registered || !this.holdsRole(input.userId, ["admin"])) throw new StoreError("denied", "Only an admin may edit the general room");
-      } else if (existing.parent_room_id === null && (!registered || !this.holdsRole(input.userId, ROOM_CREATOR_ROLES))) {
+      } else if (existing.parent_room_id === null && !isPrivate && (!registered || !this.holdsRole(input.userId, ROOM_CREATOR_ROLES))) {
         throw new StoreError("denied", "Only an admin or mod may edit a room; anyone may edit a thread");
       }
       // parent_room_id is fixed at creation; a submitted value is ignored.
@@ -4750,13 +4884,59 @@ export class Store {
     return { result: { room_id: row.room_id }, broadcasts: [], room: record, created, ...(membership ? { membership } : {}) };
   }
 
-  /** Thread rooms `userId` created that are still live: not removed, and with a retained log. One scan of the capped rooms table. */
+  /** Thread rooms `userId` created that are still live: not removed, and with a retained log. One scan of the capped rooms table's public range. */
   private liveThreadsCreatedBy(userId: string, floor: number): number {
     return integerColumn(this.rawRows<{ count: number }>(
-      "SELECT COUNT(*) AS count FROM rooms WHERE parent_room_id IS NOT NULL AND latest_log_id >= ? AND json_extract(fields_json, '$.creator_id') = ?",
+      `SELECT COUNT(*) AS count FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IS NOT NULL AND latest_log_id >= ? AND json_extract(fields_json, '$.creator_id') = ?`,
       floor, userId,
     )[0]?.count);
   }
+
+  /**
+   * For a private room's creation (PRIVATE_ROOM_COUNT_READS): the live
+   * private rooms `userId` created, as liveThreadsCreatedBy counts threads,
+   * from the capped private range; and the private rooms they are in, from
+   * their memberships.
+   */
+  private privateRoomCounts(userId: string, floor: number): { created: number; memberships: number } {
+    const created = integerColumn(this.rawRows<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM rooms WHERE ${PRIVATE_ROOMS} AND latest_log_id >= ? AND json_extract(fields_json, '$.creator_id') = ?`,
+      floor, userId,
+    )[0]?.count);
+    return { created, memberships: this.privateMembershipCount(userId) };
+  }
+
+  /**
+   * The private rooms a registered user is in. Their membership rows,
+   * through the user index, joined with `rooms` so the rows of a removed
+   * room awaiting purge do not count: at most MAX_USER_ROOMS and
+   * MAX_PURGE_ROOMS rows, and a room lookup each.
+   */
+  private privateMembershipCount(userId: string): number {
+    return integerColumn(this.rawRows<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM memberships m INDEXED BY memberships_user_idx
+       JOIN rooms r ON r.room_id = m.room_id
+       WHERE m.user_id = ? AND ${privateRange("m.room_id")}`,
+      userId,
+    )[0]?.count);
+  }
+
+  /** Whether a registered user has a membership row in `roomId`. */
+  private isMember(roomId: string, userId: string): boolean {
+    return this.rawRows("SELECT 1 FROM memberships WHERE room_id = ? AND user_id = ? LIMIT 1", roomId, userId).length > 0;
+  }
+
+  /**
+   * The room, if `userId` may see it: any public room, and a private one
+   * only to its members. To anyone else a private room reads as absent, so
+   * every path answers as it does for a room that does not exist (§5.3).
+   */
+  private visibleRoomRow(roomId: string, userId: string): RawRoomRow | null {
+    const row = this.roomRow(roomId);
+    if (!row || !isPrivateRoomId(row.room_id)) return row;
+    return this.isMember(row.room_id, userId) ? row : null;
+  }
+
 
   /** A room's client fields (`title`, `description`, `ext`) fit maxThreadMetadataBytes serialized. */
   private checkRoomFields(fields: Record<string, unknown>): void {
@@ -4902,8 +5082,11 @@ export class Store {
     // Each embed may start or release an upload (§4.8.3).
     const uploadWrites = this.config.uploads && method === "message" ? this.config.maxEmbeds * UPLOAD_WRITES : 0;
     // A thread's creation counts its creator's live threads: a scan of the
-    // rooms table, capped at the thread ceiling and the created rooms.
-    const roomScan = method === "room_set" && input.params.room_id === undefined ? MAX_THREAD_LIMIT + MAX_CREATED_ROOMS + 2 : 0;
+    // rooms table, capped at the thread ceiling and the created rooms. A
+    // private room's counts the private range and the creator's memberships
+    // (privateRoomCounts). Any mutation may check a private room's membership.
+    const creating = method === "room_set" && input.params.room_id === undefined;
+    const roomScan = !creating ? 0 : input.params.private === true ? PRIVATE_ROOM_COUNT_READS : MAX_THREAD_LIMIT + MAX_CREATED_ROOMS + 2;
     const mutationCost = {
       ...this.config.mutationCost,
       reads: Math.max(256, this.config.mutationCost.reads ?? 0) + roomScan,
@@ -5020,7 +5203,8 @@ export class Store {
   private historyPageInternal(query: StoreHistoryQuery): StoreHistoryResult {
     const roomId = query.roomId === undefined ? ROOM_ID : query.roomId;
     if (typeof roomId !== "string" || roomId.length === 0) throw new StoreError("invalid_params", "room_id must be a non-empty string");
-    const room = this.roomRow(roomId);
+    // A requester's private room only if they are in it; internal pages, with no requester, see every room.
+    const room = query.userId === undefined ? this.roomRow(roomId) : this.visibleRoomRow(roomId, query.userId);
     if (!room) throw new StoreError("invalid_params", "unknown room");
     const floor = this.logState().history_floor;
     const lowerBound = roomHistoryFloor(room, floor);
@@ -5241,18 +5425,25 @@ export class Store {
       ) : [];
       for (const row of reactions) this.rawExec("DELETE FROM reaction_state WHERE message_id = ? AND user_id = ? AND log_id < ?", row.message_id, row.user_id, floor);
       remaining -= reactions.length;
-      // A thread room whose entire log (creation record included) has been
-      // discarded leaves the visible set. No message, reaction, or membership
-      // can still be current in it: each touches the room's head when
-      // committed. The rooms table is capped at the calibrated thread ceiling,
-      // bounding this scan. Its registered members' rows are purged below, in
-      // batches; until then the join with `rooms` hides them.
+      // A thread or private room whose entire log (creation record included)
+      // has been discarded leaves the visible set. No message, reaction, or
+      // membership can still be current in it: each touches the room's head
+      // when committed. The rooms table's public and private ranges are each
+      // capped, bounding these scans. Its registered members' rows are purged
+      // below, in batches; until then the join with `rooms` hides them.
       let purge = roomIdList(this.metaValue(META_PURGE_ROOMS));
-      const rooms = remaining > 0 && purge.length < MAX_PURGE_ROOMS ? this.rawRows<{ room_id: string }>(
-        "SELECT room_id FROM rooms WHERE parent_room_id IS NOT NULL AND latest_log_id < ? ORDER BY created_log_id LIMIT ?", floor, Math.min(remaining, MAX_PURGE_ROOMS - purge.length),
+      const threads = remaining > 0 && purge.length < MAX_PURGE_ROOMS ? this.rawRows<{ room_id: string }>(
+        `SELECT room_id FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IS NOT NULL AND latest_log_id < ? ORDER BY created_log_id LIMIT ?`, floor, Math.min(remaining, MAX_PURGE_ROOMS - purge.length),
       ) : [];
-      for (const row of rooms) this.rawExec("DELETE FROM rooms WHERE room_id = ? AND parent_room_id IS NOT NULL AND latest_log_id < ?", row.room_id, floor);
-      if (rooms.length) this.rawExec("UPDATE _meta SET value = ? WHERE key = 'thread_count'", String(Math.max(0, this.metaNumber("thread_count") - rooms.length)));
+      const roomCapacity = Math.min(remaining - threads.length, MAX_PURGE_ROOMS - purge.length - threads.length);
+      // In key order, which is creation order: the IDs carry log IDs of one length.
+      const privates = roomCapacity > 0 ? this.rawRows<{ room_id: string }>(
+        `SELECT room_id FROM rooms WHERE ${PRIVATE_ROOMS} AND latest_log_id < ? ORDER BY room_id LIMIT ?`, floor, roomCapacity,
+      ) : [];
+      const rooms = [...threads, ...privates];
+      for (const row of rooms) this.rawExec("DELETE FROM rooms WHERE room_id = ? AND latest_log_id < ?", row.room_id, floor);
+      if (threads.length) this.rawExec("UPDATE _meta SET value = ? WHERE key = 'thread_count'", String(Math.max(0, this.metaNumber("thread_count") - threads.length)));
+      if (privates.length) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('private_count', ?)", String(Math.max(0, this.metaNumber("private_count") - privates.length)));
       remaining -= rooms.length;
       const purgeBefore = purge.length;
       purge = [...purge, ...rooms.map((row) => row.room_id)];
@@ -5304,7 +5495,8 @@ export class Store {
       ) : [];
       for (const row of wakes) this.rawExec("DELETE FROM push_wakes WHERE user_id = ? AND room_id = ?", row.user_id, row.room_id);
       const hasMore = this.cleanupHasWork(floor, cutoff, effective, limiterCutoff) ||
-        this.rawRows("SELECT room_id FROM rooms WHERE parent_room_id IS NOT NULL AND latest_log_id < ? LIMIT 1", floor).length > 0;
+        this.rawRows(`SELECT room_id FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IS NOT NULL AND latest_log_id < ? LIMIT 1`, floor).length > 0 ||
+        this.rawRows(`SELECT room_id FROM rooms WHERE ${PRIVATE_ROOMS} AND latest_log_id < ? LIMIT 1`, floor).length > 0;
       const nextDue = effective + (hasMore ? 1000 : this.config.cleanupIntervalMs);
       this.rawExec("UPDATE maintenance SET next_cleanup_ms = ?, cleanup_cutoff_ms = ?, cleanup_cursor = ? WHERE id = 1", nextDue, hasMore ? cutoff : null, hasMore ? floor : null);
       this.assertReservation(reserved, beforeReads, beforeWrites);
