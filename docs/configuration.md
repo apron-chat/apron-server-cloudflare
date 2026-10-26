@@ -273,8 +273,9 @@ above: two Durable Object requests and one Worker request each, at most
 
 ## Push
 
-Mentions and replies wake registered users through Web Push (protocol §4.9,
-push kind `webpush`, advertising the wake scopes `mentions` and `replies`,
+Mentions, replies, and messages in their private rooms wake registered users
+through Web Push (protocol §4.9, push kind `webpush`, advertising the wake
+scopes `mentions`, `replies` and `private`,
 with the client's optional registration `push_id` in each push; see
 [SPEC section 4.4](../SPEC.md#44-push)). Both plans have a
 `push` policy, set in `src/plans/free.ts` with Paid's daily cap raised in
@@ -491,6 +492,12 @@ them. Cleanup and deduplication run in bounded batches/records, while
 top-level rooms admins and mods create (at most 16 of them);
 `threadsPerUser` (at most `threadLimit`) caps the live threads one
 registered user has created, so one account cannot take every slot; and
+`privateRoomLimit` (at most 200) counts private rooms apart from the
+threads (0 turns private rooms off: a creation is `unsupported`);
+`privateRoomsPerUser` caps the live private rooms one registered user has
+started, and `privateMembershipsPerUser` (at most 50, and at least
+`privateRoomsPerUser`) the private rooms one user is in, theirs and those
+others added them to, which `ext.settings.private_rooms` advertises;
 `threadMetadataBytes` bounds a room's serialized client fields (`title`,
 `description`, `ext`). A user's `ext` is at most 512 bytes serialized
 (`MAX_USER_EXT_BYTES` in `src/store.ts`, not configurable: every connection
@@ -527,7 +534,8 @@ The numeric rows are grouped by their unit and enforcement scope:
   `registeredIdentityCount`, `openConnections`, `anonymousConnectionsPerIp`,
   `registeredConnectionsPerUser`, `connectionsPerIp`,
   `pendingFramesPerConnection`, `repeatedPolicyViolations`, `cleanupBatch`,
-  `threadLimit`, `threadsPerUser`, `reactionUsersPerMessage`, `reactionEmojisPerUser`,
+  `threadLimit`, `threadsPerUser`, `privateRoomLimit`, `privateRoomsPerUser`,
+  `privateMembershipsPerUser`, `reactionUsersPerMessage`, `reactionEmojisPerUser`,
   `limiterRecordCap`, `frameLease`, `roomListMembers`, `guestNumberBlock`,
   `activityMaxTypingSeconds`, `pingSeconds` (advertised as `server.ping`), `pingTimeoutSeconds`
   (seconds; the timeout must be at least twice the interval). `roomListMembers`
@@ -632,6 +640,9 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `threadLimit` | 100 |  |
 | `threadsPerUser` | 25 |  |
 | `threadMetadataBytes` | 2048 |  |
+| `privateRoomLimit` | 100 |  |
+| `privateRoomsPerUser` | 5 |  |
+| `privateMembershipsPerUser` | 20 |  |
 | `reactionUsersPerMessage` | 32 |  |
 | `reactionEmojisPerUser` | 8 |  |
 | `dedupTtlSeconds` | 86400 |  |

@@ -284,8 +284,8 @@ it("creates only thread rooms and replaces their client fields on save", async (
 		expect(errorCode(() => store.mutate(op(clock, "alice", "bad-title", "room_set", { parent_room_id: "general", title: 7 })))).toBe("invalid_params");
 		expect(errorCode(() => store.mutate(op(clock, "alice", "bad-description", "room_set", { parent_room_id: "general", description: { text: "x" } })))).toBe("invalid_params");
 		expect(errorCode(() => store.mutate(op(clock, "alice", "long-description", "room_set", { parent_room_id: "general", description: "x".repeat(4096) })))).toBe("too_large");
-		// No room is private here, so asking for one is unsupported (§4.2.4).
-		expect(errorCode(() => store.mutate(op(clock, "alice", "private", "room_set", { parent_room_id: "general", private: true })))).toBe("unsupported");
+		// A private room is never a thread, and only a registered user starts one (§4.2.4).
+		expect(errorCode(() => store.mutate(op(clock, "alice", "private", "room_set", { parent_room_id: "general", private: true })))).toBe("denied");
 		expect(errorCode(() => store.mutate(op(clock, "alice", "bad-private", "room_set", { parent_room_id: "general", private: "yes" })))).toBe("invalid_params");
 
 		const created = store.mutate(op(clock, "bob", "create", "room_set", {

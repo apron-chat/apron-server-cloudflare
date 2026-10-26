@@ -32,8 +32,8 @@ IP attribution, quotas, or the fixed shared room. See the
 The implementation follows the current repository protocol. Local policy
 within it:
 
-- Rooms: every room is visible to every client, and a connection receives
-  deliveries only for the rooms its user has joined. A new guest or passkey
+- Rooms: every public room is visible to every client, and a connection
+  receives deliveries only for the rooms its user has joined. A new guest or passkey
   identity has joined `general`; posting to a room does not require joining it.
   Anyone may create a thread under a top-level room with `room_set`, and an
   `admin` or `mod` may also create a top-level room (others' are `denied`, as
@@ -47,8 +47,17 @@ within it:
   rooms, merge `ext` one level deep: each key sent replaces its value, an
   empty one (`""`, `[]`, `{}`) removes it, and keys left out stay; the size
   limits apply to the merged result. A deleted message keeps no `ext`.
-  Threads and rooms always carry a title (`Thread` or `Room` by default). No room is private:
-  creating one with `private: true` is `unsupported`. `room_join` and
+  Threads and public rooms always carry a title (`Thread` or `Room` by
+  default). A registered user may create a private room (`room_set` with
+  `private: true`, no parent; its `room_id` is `private_<log id>`, and its
+  record carries `private: true`): only its members see it, list it, read
+  it, post in it, or add others to it, whether or not `/toggle addmember` is
+  on, and nobody joins one by themselves. To anyone else every request about
+  it, or one of its messages, is answered as for one that does not exist.
+  Its messages are not moved in or out, nor replied to from elsewhere. It has
+  no threads, and no title unless given one. It goes when its last member
+  leaves or its history expires. One user may have started 5 live private
+  rooms and be in 20; the server holds 100. `room_join` and
   `room_leave` work for every room, and changes arrive as
   `room_update` before the result. With another user's `user_id`, an admin
   adds or removes anyone, and a registered user their own bot; while
@@ -154,7 +163,8 @@ within it:
   `{kind: "webpush", url, keys: {p256dh, auth}, push_id?}` (its
   `PushSubscription` JSON with `kind` and an optional `push_id` of 1 to 64
   letters, digits, `_` or `-`, and an optional `wake` list of scopes, of which
-  `mentions` and `replies` are implemented and the default), at most 5 each
+  `mentions`, `replies` and `private` are implemented and the first two the
+  default), at most 5 each
   and 10 registrations a
   minute; guests cannot. Registrations are each user's own, and lapse after
   7 days without being registered again (clients register on every
@@ -304,7 +314,8 @@ but do consume frame and lookup resources.
 The `server` frame advertises `ext:settings`, this implementation's
 extension, and carries its data in `server.params.ext.settings`, as the
 protocol's extension naming rule has it: three booleans, which a client takes
-as `true` when absent. `guest_posting` says whether guests may post, react,
+as `true` when absent, and `private_rooms`, the number of private rooms one
+user may be in. `guest_posting` says whether guests may post, react,
 join and leave rooms, and create threads (`GUEST_POSTING`),
 `read_cursors: false` says read markers are dropped, so clients can skip
 sending them, and `add_members` says whether registered users may add others

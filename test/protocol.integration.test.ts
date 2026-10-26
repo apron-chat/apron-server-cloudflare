@@ -946,6 +946,8 @@ it('advertises the extensions ext:settings, ext:limits, ext:media and ext:permis
 				read_cursors: false,
 				// No admin has turned `/toggle addmember` off.
 				add_members: true,
+				// A number, not a boolean: the most private rooms one user may be in.
+				private_rooms: DEFAULT_LIMITS.privateMembershipsPerUser,
 			},
 			// MEDIA_ORIGIN is not PUBLIC_ORIGIN, and every type the write keeps, exactly.
 			media: {
@@ -973,12 +975,15 @@ it('speaks protocol v9: a sign-in welcome, no email sign-in, and ~private notice
 	} finally { withPasskeys.close(); bot.close(); }
 });
 
-it('rejects private rooms as unsupported, since every room here is visible to everyone', async () => {
+it('refuses a guest\'s private room, and makes public rooms without `private`', async () => {
 	const alice = await connect();
 	try {
 		await authenticate(alice);
-		const refused = await request(alice, 'private', 'room_set', { parent_room_id: 'general', title: 'Secret', private: true });
-		expect(refused.error.code).toBe(-32601);
+		// Only registered users start private rooms, and never as threads (§4.2.4).
+		const refused = await request(alice, 'private', 'room_set', { title: 'Secret', private: true });
+		expect(refused.error.code).toBe(-32001);
+		const thread = await request(alice, 'private-thread', 'room_set', { parent_room_id: 'general', title: 'Secret', private: true });
+		expect(thread.error.code).toBe(-32001);
 		// Nothing was created, and a room made without `private` carries none.
 		const created = await exchange(alice, 'public', 'room_set', { parent_room_id: 'general', title: 'Open', private: false });
 		expect(created.skipped.find((frame) => frame.method === 'room_update')!.params.joined[0]).not.toHaveProperty('private');

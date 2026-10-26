@@ -264,6 +264,15 @@ function validateLimits(limits: Limits): void {
 	if (!Number.isSafeInteger(limits.threadsPerUser) || limits.threadsPerUser < 1 || limits.threadsPerUser > limits.threadLimit) {
 		fail("threadsPerUser must be between 1 and threadLimit");
 	}
+	if (!Number.isSafeInteger(limits.privateRoomLimit) || limits.privateRoomLimit < 0 || limits.privateRoomLimit > budget.MAX_PRIVATE_ROOM_LIMIT) {
+		fail("privateRoomLimit must be between 0 and the calibrated private room ceiling");
+	}
+	if (!Number.isSafeInteger(limits.privateMembershipsPerUser) || limits.privateMembershipsPerUser < 1 || limits.privateMembershipsPerUser > budget.MAX_PRIVATE_MEMBERSHIPS_PER_USER) {
+		fail("privateMembershipsPerUser must be between 1 and the calibrated per-user ceiling");
+	}
+	if (!Number.isSafeInteger(limits.privateRoomsPerUser) || limits.privateRoomsPerUser < 1 || limits.privateRoomsPerUser > limits.privateMembershipsPerUser) {
+		fail("privateRoomsPerUser must be between 1 and privateMembershipsPerUser");
+	}
 	if (limits.reactionUsersPerMessage > budget.MAX_REACTION_USERS_PER_MESSAGE || limits.reactionEmojisPerUser > budget.MAX_REACTION_EMOJIS_PER_USER) {
 		fail("reaction policy exceeds calibrated bounds");
 	}

@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, pushHostAllowed, type RuntimeConfig } from "./config";
-import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
+import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor } from "./account-usage";
 import { EDGE_STOP_RULE_REF, readEdgeStop, runBudgetGuard, watchForFlood } from "./budget-guard";
@@ -57,6 +57,7 @@ import {
 	UPLOAD_SWEEP_BATCH,
 	UPLOAD_WRITE_GRACE_MS,
 	uploadResultEmbed,
+	isPrivateRoomId,
 	type Broadcast,
 	type MessageSnapshot,
 	type PushCandidate,
@@ -323,8 +324,8 @@ const PRIVATE_IDENTITY = { user_id: "~private", name: "System message to you" } 
  */
 const PING_REQUEST = '{"method":"ping"}';
 const PING_RESPONSE = '{"method":"pong"}';
-/** Joined room IDs a connection attachment may carry: every room, with slack for removals in flight. */
-const MAX_ATTACHED_ROOMS = 2 * (MAX_THREAD_LIMIT + 1);
+/** Joined room IDs a connection attachment may carry: every public room and the user's private ones, with slack for removals in flight. */
+const MAX_ATTACHED_ROOMS = 2 * (MAX_THREAD_LIMIT + 1 + MAX_PRIVATE_MEMBERSHIPS_PER_USER);
 /** At most how many frames a connection's sign-in holds for it (holdDeliveries). */
 const MAX_HELD_FRAMES = 256;
 /**
@@ -570,6 +571,9 @@ function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		maxThreads: limits.threadLimit,
 		maxThreadsPerUser: limits.threadsPerUser,
 		maxThreadMetadataBytes: limits.threadMetadataBytes,
+		maxPrivateRooms: limits.privateRoomLimit,
+		maxPrivateRoomsPerUser: limits.privateRoomsPerUser,
+		maxPrivateMembershipsPerUser: limits.privateMembershipsPerUser,
 		reactionUsersPerMessage: limits.reactionUsersPerMessage,
 		reactionEmojisPerUser: limits.reactionEmojisPerUser,
 		maxHistoryLimit: limits.historyMaxLimit,
@@ -1508,6 +1512,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// Only rooms whose history_log_id moved need a new record.
 				const rooms = this.store.listRooms(nowMs(), {
 					maintenance: true,
+					withPrivate: true,
 					...(result ? { changedSinceFloor: Number(result.previous_floor) } : {}),
 				});
 				this.announceUpdated(rooms);
@@ -1573,15 +1578,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// but nobody sees `dnd` or `invisible`, so clients offer neither.
 				...(presence ? { status: [...OPTIONAL_STATUS_CHOICES] } : {}),
 				// Extension `ext:settings`, this server's own: what clients can do
-				// here beyond the capabilities. Each key is a boolean, and a client
-				// takes an absent one as true. `guest_posting`: guests may post,
+				// here beyond the capabilities. Each key but `private_rooms` is a
+				// boolean, and a client takes an absent one as true. `guest_posting`: guests may post,
 				// react, join and leave rooms, and create threads; `false` here
 				// unless GUEST_POSTING is on. `read_cursors`: an `activity`
 				// `read_message_id` is kept or relayed; always `false` here.
 				// `add_members`: registered users may add others to rooms with
-				// `room_join` and a `user_id`; `/toggle addmember` turns it off.
+				// `room_join` and a `user_id`; `/toggle addmember` turns it off
+				// (a private room's members may add others either way).
+				// `private_rooms`: the most private rooms one user may be in.
 				ext: {
-					settings: { guest_posting: this.config.guestPosting, read_cursors: false, add_members: this.addMemberOn() },
+					settings: {
+						guest_posting: this.config.guestPosting, read_cursors: false, add_members: this.addMemberOn(),
+						private_rooms: this.config.limits.privateMembershipsPerUser,
+					},
 					...(this.config.uploads ? { media: this.mediaSettings(this.config.uploads) } : {}),
 				},
 			},
@@ -2727,7 +2737,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				this.noteRoom(room.room_id, true);
 				const scope = [room.room_id, ...(room.parent_room_id !== undefined ? [room.parent_room_id] : [])];
 				if (result.created) {
-					if (room.parent_room_id === undefined) this.topLevelRooms?.push(room.room_id);
+					if (room.parent_room_id === undefined && !room.private) this.topLevelRooms?.push(room.room_id);
 					this.setRooms(identity.user_id, [...(this.liveRoomsOf(identity.user_id) ?? []), room.room_id]);
 					// A new room's only member is its creator: no storage to read.
 					const creator = this.complete(attachment)!;
@@ -2763,7 +2773,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const target = optionalUserId(request.params);
 		const known = this.store.getRoom(roomId, nowMs());
 		this.noteRoom(roomId, known !== null);
-		if (!known) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
+		// Only a private room's members see it: to anyone else, joining it or
+		// adding someone to it is a join of a room that does not exist.
+		if (!known || !this.sees(attachment, roomId)) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
 		if (target !== undefined && target !== identity.user_id) {
 			await this.addMember(socket, attachment, request, known, target);
 			return;
@@ -2825,7 +2837,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * in the room changes nothing.
 	 */
 	private async addMember(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, room: RoomRecord, userId: string): Promise<void> {
-		this.assertMayManage(attachment, userId, room.room_id, true);
+		// Adding is the only way into a private room, so its members (the
+		// caller is one: handleRoomJoin checked) may add anyone, whether or not
+		// `addmember` is on. A bot may not.
+		if (!room.private) this.assertMayManage(attachment, userId, room.room_id, true);
+		else if (attachment.tier !== "registered" || hasRole(attachment, "bot")) throw { name: "denied", message: "Only a signed-in member who is not a bot can add someone to a private room" } satisfies ProtocolError;
 		if (!this.store.identityExists(userId)) throw { name: "invalid_params", message: `${userId} is not a registered user`.slice(0, 200) } satisfies ProtocolError;
 		const totals = new Map<string, number>();
 		const before = this.membersOf([room.room_id], totals);
@@ -2863,7 +2879,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.assertMayWrite(attachment);
 		const roomId = requiredString(request.params, "room_id");
 		const target = optionalUserId(request.params);
-		if (!this.roomExists(roomId)) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
+		if (!this.roomExists(roomId) || !this.sees(attachment, roomId)) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
 		if (target !== undefined && target !== identity.user_id) {
 			this.assertMayManage(attachment, target, roomId, false);
 			if (!this.store.identityExists(target) && !this.connectionsOf(target).length) {
@@ -2921,7 +2937,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		// A guest who only reads has nothing to be typing.
 		if (attachment.tier === "anonymous" && !this.config.guestPosting) return;
-		if (typing === undefined || typeof roomId !== "string" || !this.roomExists(roomId)) return;
+		if (typing === undefined || typeof roomId !== "string" || !this.roomExists(roomId) || !this.sees(attachment, roomId)) return;
 		const now = nowMs();
 		const limit = this.config.limits.activityBroadcastsPerUserMinute;
 		if (!this.takeThrottle(socket, identity.user_id, "activity", limit, now)) {
@@ -2989,7 +3005,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (wait !== undefined) throw { name: "retry_after", message: "Idle changes limited", data: { retry_after: wait } } satisfies ProtocolError;
 		}
 		if (mute !== undefined) {
-			this.changeMute(state.userId!, roomId ?? null, mute, now);
+			this.changeMute(state, roomId ?? null, mute, now);
 		}
 		if (idleChange) {
 			if (limited) this.idleChanges.take(state.connId, now);
@@ -3011,10 +3027,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * MAX_ROOM_MUTES_PER_USER (`denied`); only a change that the store
 	 * accepted counts against `mutesPerUserMinute`.
 	 */
-	private changeMute(userId: string, roomId: string | null, mute: number | boolean, now: number): void {
+	private changeMute(attachment: ConnectionAttachment, roomId: string | null, mute: number | boolean, now: number): void {
+		const userId = attachment.userId!;
 		const untilMs = mute === true ? MUTE_FOREVER : mute === false ? null : now + Math.min(mute, MAX_MUTE_SECONDS) * 1_000;
 		// Clearing a room's mute needs no room: one that was removed can still be unmuted.
-		if (roomId !== null && untilMs !== null && !this.roomExists(roomId)) {
+		// A private room the user is not in is unknown, as everywhere.
+		if (roomId !== null && untilMs !== null && (!this.roomExists(roomId) || !this.sees(attachment, roomId))) {
 			throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
 		}
 		// Each change writes rows: past `mutesPerUserMinute` a user's changes
@@ -3910,6 +3928,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		const mentions = message.body?.mentions;
 		if (Array.isArray(mentions)) for (const userId of mentions) consider(userId, WAKE_SCOPES.mentions);
+		// Every member of a private room may wake for it (`private`, §4.9.4); claimPushes
+		// wakes only members there, for whatever reason they were considered.
+		if (isPrivateRoomId(message.room_id)) {
+			try {
+				for (const member of this.store.roomMembers([message.room_id], MAX_PUSH_CANDIDATES, now).get(message.room_id) ?? []) consider(member.user_id, WAKE_SCOPES.private);
+			} catch (error) {
+				console.warn(JSON.stringify({ event: "push_members_lookup_failed", reason: errorToProtocol(error).message }));
+			}
+		}
 		for (const [userId, reason] of held) this.holdWake(userId, message, reason, now);
 		if (reasons.size) this.scheduleWake(message, reasons);
 	}
@@ -3945,13 +3972,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Narrows a wake's reasons to what an edit made during the wait left: a
 	 * mention only for a user it still mentions, a reply only while it still
-	 * replies to the same message. Users left with no reason are dropped.
+	 * replies to the same message; `private` stays, as the room does. Users
+	 * left with no reason are dropped.
 	 */
 	private keepReasons(reasons: Map<string, number>, before: MessageSnapshot, after: MessageSnapshot): void {
 		const mentions = new Set(Array.isArray(after.body?.mentions) ? after.body.mentions : []);
 		const sameReply = after.reply_to?.message_id === before.reply_to?.message_id;
 		for (const [userId, reason] of reasons) {
-			const kept = (mentions.has(userId) ? reason & WAKE_SCOPES.mentions : 0) | (sameReply ? reason & WAKE_SCOPES.replies : 0);
+			const kept = (mentions.has(userId) ? reason & WAKE_SCOPES.mentions : 0) | (sameReply ? reason & WAKE_SCOPES.replies : 0) | (reason & WAKE_SCOPES.private);
 			if (kept) reasons.set(userId, kept);
 			else reasons.delete(userId);
 		}
@@ -4187,10 +4215,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (roomId !== undefined) {
 			const room = this.store.getRoom(roomId, now);
 			this.noteRoom(roomId, room !== null);
-			if (!room) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
+			// A private room the user is not in is as unknown as one that does not exist.
+			if (!room || !this.sees(attachment, roomId)) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
 			candidates = [room];
 		} else {
+			// The public rooms, and the private ones the user is in: nobody else sees those.
 			const rooms = this.store.listRooms(now);
+			if (identity.tier === "registered") rooms.push(...this.store.privateRoomsOf(identity.user_id, now));
 			for (const room of rooms) this.noteRoom(room.room_id, true);
 			if (parent !== undefined && !rooms.some((room) => room.room_id === parent)) throw { name: "invalid_params", message: "Unknown parent_room_id" } satisfies ProtocolError;
 			candidates = rooms.filter((room) => parent === undefined ? true : room.parent_room_id === parent);
@@ -4262,7 +4293,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const body = objectParam(params, "body");
 		if (!body) throw { name: "invalid_params", message: "Missing body" } satisfies ProtocolError;
 		const text = optionalString(body, "text") ?? "";
-		if (!this.roomExists(roomId)) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
+		if (!this.roomExists(roomId) || !this.sees(attachment, roomId)) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
 		const line = text.trim();
 		const words = line.startsWith("/") ? line.slice(1).split(/\s+/) : [""];
 		const name = words[0].toLowerCase();
@@ -5345,8 +5376,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private noteRoom(roomId: string, exists: boolean): void {
 		this.knownRooms.delete(roomId);
 		// The rooms table is capped; unknown IDs are bounded by the same size.
-		if (this.knownRooms.size >= 2 * (this.config.limits.threadLimit + 1)) this.knownRooms.delete(this.knownRooms.keys().next().value!);
+		if (this.knownRooms.size >= 2 * (this.config.limits.threadLimit + 1 + this.config.limits.privateRoomLimit)) this.knownRooms.delete(this.knownRooms.keys().next().value!);
 		this.knownRooms.set(roomId, exists);
+	}
+
+	/**
+	 * Whether this connection's user may see `roomId`, whether or not it
+	 * exists: any public room, and a private one only while they are in it
+	 * (`attachment.rooms`, kept for every connection of a registered user).
+	 * A path that finds a room it may not see answers as for an unknown room,
+	 * so nobody learns which private rooms exist (§5.3).
+	 */
+	private sees(attachment: ConnectionAttachment, roomId: string): boolean {
+		return !isPrivateRoomId(roomId) || (attachment.rooms ?? []).includes(roomId);
 	}
 
 	/** Whether a room exists, from the cache or one bounded lookup. */

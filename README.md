@@ -17,6 +17,11 @@ for a zero-overage deployment.
   reactions.
 - **Guests and passkeys.** Anyone can read as a guest; sign in with a passkey
   to post, and run `/invite-bot` to get a token for your own bot.
+- **Private rooms for DMs.** Signed-in users start private rooms
+  (`private: true`) that only their members see, and add people to them;
+  everyone else is answered as if the room did not exist. Each user may be in
+  20 and start 5 at a time, apart from the thread ceiling, and a room goes
+  when its last member leaves or its history expires.
 - **Images and avatars.** Signed-in users attach images and set avatars
   (`embed:upload`), stored in R2 within its free tier for a week (avatars a
   month).

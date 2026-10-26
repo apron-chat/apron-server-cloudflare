@@ -150,6 +150,12 @@ export interface Limits {
 	/** Live threads one registered user may have created; removed and expired ones do not count. */
 	threadsPerUser: number;
 	threadMetadataBytes: number;
+	/** Private rooms (§4.2.4) that may exist at once; they do not count against threadLimit. */
+	privateRoomLimit: number;
+	/** Live private rooms one registered user may have created; removed and expired ones do not count. */
+	privateRoomsPerUser: number;
+	/** Private rooms one registered user may be a member of at once, the ones others added them to included. */
+	privateMembershipsPerUser: number;
 	/** Distinct users whose reaction sets one message may carry. */
 	reactionUsersPerMessage: number;
 	/** Distinct emoji in one user's reaction set on one message. */
@@ -376,6 +382,11 @@ export const MAX_REGISTRATIONS_PER_DAY = DEFAULT_LIMITS.registrationsPerDay;
 export const MAX_CLEANUP_BATCH = 100;
 export const MAX_THREAD_LIMIT = 100;
 export const MAX_THREAD_METADATA_BYTES = 2 * 1024;
+// Private rooms share the rooms table with the threads, outside the ranges the
+// public scans read (store.ts, PUBLIC_ROOMS): the ceiling bounds the scans of
+// the private range, and the per-user ceiling the rooms one user can be in.
+export const MAX_PRIVATE_ROOM_LIMIT = 200;
+export const MAX_PRIVATE_MEMBERSHIPS_PER_USER = 50;
 // A move re-logs every reaction set of the moved message in one record, so the
 // per-message cap bounds that record, its SQL work, and its history response.
 export const MAX_REACTION_USERS_PER_MESSAGE = 64;
