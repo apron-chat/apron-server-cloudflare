@@ -43,6 +43,10 @@ PUBLIC_ORIGIN = "https://server.apron.chat"
 # The private key must match this public key.
 VAPID_PUBLIC_KEY = "BF-ztm22-yk6-AvyxkBGWzxaiA_CnO1c9vDAe1-RMg0WJ_EuNgmPhxxTyUq6J0nhaFxNxmcFsAc6KVfWLkdDl0M"
 VAPID_SUBJECT = "https://server.apron.chat"
+# The push services registrations may name: the browsers' own (the default,
+# src/config.ts DEFAULT_PUSH_HOSTS), which this list replaces, and
+# push.stupidtech.net.
+PUSH_HOSTS = "fcm.googleapis.com,*.push.services.mozilla.com,web.push.apple.com,*.push.apple.com,*.notify.windows.com,push.stupidtech.net"
 
 # Uploaded images (src/budget.ts). The bucket needs lifecycle rules deleting
 # f/ after 7 days and a/ after 30, and a custom domain for MEDIA_ORIGIN.
