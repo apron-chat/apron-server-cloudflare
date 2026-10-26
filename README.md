@@ -43,7 +43,9 @@ for a zero-overage deployment.
   chosen `invisible`, at most once in 10 minutes per user. Within 10
   minutes of the last one recorded, going offline again shows that one, so
   `seen` may be up to 10 minutes earlier than the real departure, and
-  reloads and reconnects cost nothing.
+  reloads and reconnects write it at most once in 10 minutes (a reload
+  shows nothing, but its close may record its time, which a departure
+  within the next 10 minutes then shows).
 - **Bring your own frontend.** Guest connections are accepted from any
   origin — even `localhost` or a browser console.
 - **Built to stay inside its plan.** Every operation is metered against

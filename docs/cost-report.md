@@ -14,7 +14,9 @@ user status (below) and again the same day for the current status design
 2026-10-06 for `status` as a request, statuses in every listing, and users'
 `ext`, none of which changes a row count, re-measured on 2026-10-24 for
 schema 9 (below), and on 2026-10-26 for `seen` (User status, below), and
-again the same day for writing it at most once in 10 minutes, with the
+again the same day for writing it at most once in 10 minutes, and for
+letting the store settle it (several tabs closing together, a stale copy,
+and the floor after `/toggle presence`), with the
 repository's workerd launcher:
 
 ```sh
@@ -140,7 +142,8 @@ upper bounds can be compared with the measured worst case.
 | Push registrations clear (`/passkeys remove`, a new bot token) | 1 | 2 | 144 | 400 |
 | Mute set (`status` `mute`, unscoped) | 3 | 3 | 24 | 24 |
 | Status set (`me` `status`) | 4 | 2 | 24 | 24 |
-| Seen set (a registered user shown `offline` as their last connection closed, the stored `seen` over 10 minutes old; within 10 minutes: no statement) | 2 | 2 | 16 | 16 |
+| Seen settled, written (a registered user shown `offline` as their last connection closed, the `seen` their connection holds and the stored one over 10 minutes old: one conditional update; within 10 minutes of the one held: no statement) | 2 | 2 | 16 | 16 |
+| Seen settled, the stored one standing (the connection's copy is stale: the update writes nothing, and one read of `seen_ms` finds the stored one) | 3 | 1 | 16 | 16 |
 | Room mute set (`status` `mute` with `room_id`) | 4 | 3 | 432 | 424 |
 | Room mute set past 100, refused (two counts and a delete of none ran out) | 303 | 2 | 432 | 424 |
 | Room mute clear | 3 | 2 | 432 | 424 |
@@ -148,8 +151,8 @@ upper bounds can be compared with the measured worst case.
 | Status inputs at sign-in, nothing stored | 3 | 1 | 224 | 8 |
 | Status inputs at sign-in, a status, a mute and one room mute (`seen` comes with the identity lookup) | 3 | 1 | 224 | 8 |
 | Status set to `invisible`, with its `seen` (the stored one over 10 minutes old; one reservation and transaction) | 4 | 4 | 24 | 24 |
-| Status set to `invisible`, the stored `seen` standing (within 10 minutes) | 3 | 3 | 24 | 24 |
-| Seen set for a user with no identity row | 1 | 1 | 16 | 16 |
+| Status set to `invisible`, the stored `seen` standing (within 10 minutes; decided from the identity row it reads anyway) | 3 | 3 | 24 | 24 |
+| Seen settled for a user with no identity row (the update matches nothing; the read finds none) | 2 | 1 | 16 | 16 |
 | Status inputs at sign-in, 100 room mutes | 102 | 1 | 224 | 8 |
 | Push wake claim, `dnd` and muted (passed over) | 2 | 1 | 94 | 160 |
 | Push wake claim, the thread's parent muted (passed over) | 7 | 1 | 94 | 160 |
@@ -557,7 +560,7 @@ reads frame times for it.
 nothing more for it (the member query gains a column, not a row), and on
 the user's connections from sign-in (read with the identity row, above),
 so a connected `invisible` user's needs no SQL, and nor does deciding
-whether to write it. It changes only when what others were told becomes
+not to write it. It changes only when what others were told becomes
 `offline`: a registered user's last connection closing while shown
 `online`, `idle` or `dnd`, at the close, or a connected user choosing
 `invisible`. It is written at most once in `SEEN_WRITE_GRANULARITY_MS`
@@ -565,24 +568,46 @@ whether to write it. It changes only when what others were told becomes
 hold, is no older than 10 minutes, that one is announced again and listed
 later, with no statement (measured: no write of `seen_ms`), so `seen` may
 be up to 10 minutes earlier than the real departure; otherwise the time
-of the change is written and announced. A close's write is one
-primary-key update, 2/2 with its reservation (16/16 reserved): the
-identity row and the budget row. It is made at the close even when the
+of the change is settled by the store, which writes it only where the
+one it holds does not stand either, so a stale copy never writes twice.
+A close's write is one conditional primary-key update, 2/2 with its
+reservation (16/16 reserved): the identity row and the budget row; where
+the stored one stands after all (a copy from code before `seen`), the
+update writes nothing and one read of `seen_ms` follows, 3/1. Several
+tabs closing together, which can each leave the runtime's socket list
+before the object handles any of their closes, are one departure: the
+first close settles `seen` and owes the change, and the rest change
+nothing (the object remembers the departure in memory until the user
+signs in, and after an eviction finds the change still owed in other
+connections' attachments), so they write once (measured: two and three
+tabs closed back to back write 1 row of `seen_ms`, where each tab wrote
+one before). It is made at the close even when the
 user comes back within the grace and nothing is announced, since the
 announcement it is for is kept only on the connections of others, which
 may all be gone by the time it is due; a reload loop still writes at most
 once in 10 minutes. A chosen `invisible` writes it in `setStatus`'s own
 reservation and transaction, so the two cannot part (an exhausted budget
 refuses both): 4/4 against 24/24 when it writes, 3/3 when the stored one
-stands (the status alone). A write that fails is logged and the stored
-one announced instead, so the announcement and later listings always
-agree. A `seen` for a user with no identity row (purged meanwhile) is
-charged the rows SQLite reports, none, so 1/1 with its reservation's
-bookkeeping. It is not an indexed column, so the row's index entries are
+stands (the status alone; `setStatus` decides from the identity row it
+reads anyway, measured with the decision). A settling the store refuses
+is logged and the connection's copy, which is what is stored, announced
+instead, so the announcement and later listings agree. A `seen` for a
+user with no identity row (purged meanwhile) writes nothing: 2/1 with its
+reservation's bookkeeping. It is not an indexed column, so the row's index entries are
 not rewritten, and it does not invalidate the listings kept for reuse: the
-store writes it by its own path, which updates their row in place, while
-every other write to the tables they read invalidates them (tested: 0
-statements for the next listing).
+store writes it by its own path, which updates their row in place once
+it is committed (a `setStatus` that rolls back leaves them as they were,
+tested), while every other write to the tables they read invalidates them
+(tested: 0 statements for the next listing).
+
+Turning presence back on with `/toggle` changes every user's shown status
+from `""`, so each user shown `offline` from then on carries that time
+unless a later `seen` is recorded. It is kept in one `_meta` row
+(`presence_on_ms`), written with the toggle in the same transaction (the
+toggle's reservation goes from 4/4 to 4/8 rows), and read with the toggle
+once per wake in the same statement, `SELECT key, value FROM _meta WHERE
+key IN (?, ?)`, which reads one more row only where the row exists, so
+nothing per user: no write, and no read at sign-in.
 
 Per account, every `seen` write, by a close or with `invisible`, needs the
 stored one to be over 10 minutes old, so writes are more than 10 minutes
