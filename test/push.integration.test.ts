@@ -501,6 +501,26 @@ describe('wake scopes', () => {
 			expect(pushes.filter((push) => push.url === urls.control)).toHaveLength(1);
 		} finally { sender.close(); here.close(); }
 	});
+
+	it('wakes a private room\'s members for a mention there, on mentions alone, and never someone outside it', async () => {
+		const pushes = capturePushes();
+		const urls = {
+			mentioned: await gone('dmm', ['mentions']),
+			unmentioned: await gone('dmu', ['mentions']),
+			privateOnly: await gone('dmp', ['private']),
+			outsider: await gone('dmo', ['mentions']),
+		};
+		const senderId = unique('sender');
+		const sender = await signedIn(senderId);
+		try {
+			const roomId = (await request(sender, 'dm', 'room_set', { private: true })).result.room_id as string;
+			for (const key of ['mentioned', 'unmentioned', 'privateOnly'] as const) {
+				expect((await request(sender, `add-${key}`, 'room_join', { room_id: roomId, user_id: userOf(urls[key]) })).result).toEqual({});
+			}
+			await post(sender, 'dm-mention', { room_id: roomId, body: { text: 'look', mentions: [userOf(urls.mentioned), userOf(urls.outsider)] } });
+			await vi.waitFor(() => expect(pushes.map((push) => push.url).sort()).toEqual([urls.mentioned, urls.privateOnly].sort()), { timeout: 5_000 });
+		} finally { sender.close(); }
+	});
 });
 
 describe('status mute', () => {
