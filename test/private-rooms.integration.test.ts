@@ -158,3 +158,31 @@ it('advertises how many private rooms one user may be in', async () => {
 		expect(server.params.ext.settings.private_rooms).toBeGreaterThan(0);
 	} finally { peer.close(); }
 });
+
+it('gives a member added while away the room at its latest activity when they sign in, and its messages live', async () => {
+	const ada = await signedIn('ada');
+	const bobId = unique('bob');
+	const bobToken = await register(bobId);
+	const before = await session(bobToken);
+	let bob: Peer | undefined;
+	try {
+		const since = (await request(before, 'since', 'room_list', { filter: 'joined' })).result.joined[0].latest_log_id as string;
+		before.close();
+		const roomId = (await exchange(ada.peer, 'create', 'room_set', { private: true })).frame.result.room_id as string;
+		expect((await request(ada.peer, 'add', 'room_join', { room_id: roomId, user_id: bobId })).result).toEqual({});
+		const sent = await exchange(ada.peer, 'away', 'message', { room_id: roomId, body: { text: 'while you were away' } });
+		const logId = sent.skipped.find((frame) => frame.method === 'message')?.params.log_id as string;
+		expect(logId).toBeDefined();
+
+		bob = await session(bobToken);
+		// Listed since a position from before, as a reconnecting client lists (§4.2.1).
+		const listed = await request(bob, 'delta', 'room_list', { filter: 'joined', latest_log_id: since });
+		expect(listed.result.joined.find((room: { room_id: string }) => room.room_id === roomId)).toMatchObject({ private: true, latest_log_id: logId });
+		const page = await request(bob, 'history', 'history', { room_id: roomId, after: since });
+		expect(page.result.messages.map((message: { log_id: string }) => message.log_id)).toContain(logId);
+		// And what comes next arrives live.
+		const next = (await request(ada.peer, 'next', 'message', { room_id: roomId, body: { text: 'welcome back' } })).result.message_id as string;
+		const live = await until(bob, (frame) => frame.method === 'message' && frame.params.message_id === next);
+		expect(live.frame.params.room_id).toBe(roomId);
+	} finally { ada.peer.close(); before.close(); bob?.close(); }
+});
