@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, pushHostAllowed, type RuntimeConfig } from "./config";
-import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, SEEN_WRITE_GRANULARITY_MS, UPLOAD_POLICY } from "./budget";
+import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor } from "./account-usage";
 import { EDGE_STOP_RULE_REF, readEdgeStop, runBudgetGuard, watchForFlood } from "./budget-guard";
@@ -58,6 +58,7 @@ import {
 	UPLOAD_WRITE_GRACE_MS,
 	uploadResultEmbed,
 	isPrivateRoomId,
+	seenStands,
 	type Broadcast,
 	type MessageSnapshot,
 	type PushCandidate,
@@ -200,7 +201,8 @@ interface ConnectionAttachment {
 	 * their next change to `offline` knows, without a read, whether the
 	 * stored one stands (SEEN_WRITE_GRANULARITY_MS). It never runs ahead of
 	 * the store; one that lags it (an attachment from code before it, or
-	 * none) only makes that change write. Absent when none is recorded.
+	 * none) only makes that change ask the store, which decides from the
+	 * one it holds (Store.settleSeen). Absent when none is recorded.
 	 */
 	seen?: number;
 	/**
@@ -275,17 +277,18 @@ function keptSeen(states: ReadonlyArray<{ state: ConnectionAttachment }>): numbe
 
 /**
  * The `seen` (§4.5.2) that a user's shown status changing to `offline` at
- * `now` carries, given `kept`, the stored one their connections hold, and
- * whether it has to be written. A registered user's stored `seen` no older
- * than SEEN_WRITE_GRANULARITY_MS stands: it is carried again, unwritten,
- * so it is at most that much earlier than the change. Otherwise (none
- * known, older, or after `now`) it is `now`, to be written. A guest's is
- * never stored: always `now`.
+ * `now` carries, given `known`, the one their connections hold, no
+ * earlier than the floor (seenWithFloor), and whether the store has to
+ * settle it. One no older
+ * than SEEN_WRITE_GRANULARITY_MS stands (seenStands): it is carried again,
+ * with no SQL, so it is at most that much earlier than the change.
+ * Otherwise (none known, older, or after `now`) it is `now`, which the
+ * store settles for a registered user (Store.settleSeen: written, unless
+ * the one it holds stands after all); a guest's is never stored.
  */
-function seenFor(kept: number | undefined, registered: boolean, now: number): { seen: number; write: boolean } {
-	if (!registered) return { seen: now, write: false };
-	if (kept !== undefined && kept <= now && now - kept <= SEEN_WRITE_GRANULARITY_MS) return { seen: kept, write: false };
-	return { seen: now, write: true };
+function seenFor(known: number | undefined, registered: boolean, now: number): { seen: number; settle: boolean } {
+	if (known !== undefined && seenStands(known, now)) return { seen: known, settle: false };
+	return { seen: now, settle: registered };
 }
 
 /**
@@ -766,9 +769,17 @@ function presenceState(attachment: Partial<ConnectionAttachment>): Pick<Connecti
 		out.pres = { s: pres.s, a: pres.a, ...(Number.isSafeInteger(pres.h) ? { h: pres.h } : {}) };
 	}
 	if (Array.isArray(attachment.owed)) {
-		const owed = attachment.owed.filter((entry): entry is OwedStatus => Array.isArray(entry) && (entry.length === 4 || (entry.length === 5 && Number.isSafeInteger(entry[4]) && (entry[4] as number) > 0)) &&
-			typeof entry[0] === "string" && entry[0].length > 0 && entry[0].length <= 128 && isStatus(entry[1]) && isStatus(entry[2]) && Number.isSafeInteger(entry[3])).slice(0, MAX_OWED);
-		if (owed.length) out.owed = owed.map((entry) => [...entry] as OwedStatus);
+		// An entry whose `seen` is malformed keeps the rest: the change it owes
+		// still goes out, as one without `seen`.
+		const owed: OwedStatus[] = [];
+		for (const entry of attachment.owed as unknown[]) {
+			if (owed.length >= MAX_OWED) break;
+			if (!Array.isArray(entry) || entry.length < 4) continue;
+			const [userId, told, status, due, seen] = entry as unknown[];
+			if (typeof userId !== "string" || userId.length === 0 || userId.length > 128 || !isStatus(told) || !isStatus(status) || !Number.isSafeInteger(due)) continue;
+			owed.push(Number.isSafeInteger(seen) && (seen as number) > 0 ? [userId, told, status, due as number, seen as number] : [userId, told, status, due as number]);
+		}
+		if (owed.length) out.owed = owed;
 	}
 	return out;
 }
@@ -1323,6 +1334,24 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * have no connection, whose next announcement may then come sooner.
 	 */
 	private readonly announcedAt = new Map<string, number>();
+	/**
+	 * Users whose last connection's close this object handled (touchPresence)
+	 * and who have not signed in since, most recent last, at most
+	 * RATE_LIMIT_KEYS. Several connections closing together (a browser
+	 * quitting with several tabs) can each leave the runtime's list of
+	 * sockets before the object handles any of their closes, so each is
+	 * handled as the last, with its own attachment, which predates the
+	 * departure: only the first counts, and the rest, finding the user here
+	 * (or, after an eviction lost this, a change of theirs still owed to
+	 * others), change nothing, so one departure settles one `seen` and owes
+	 * one change. Cleared when they sign in (presenceSignedIn).
+	 */
+	private readonly departed = new Set<string>();
+	/**
+	 * When presence was last turned on with `/toggle` (seenFloor), read with
+	 * the toggle (presenceMode), 0 for never.
+	 */
+	private presenceSince = 0;
 	/**
 	 * Wakes waiting `pushDelaySeconds` before they push (§4.9's suggested
 	 * convention), in memory: a user who comes back (`idle: false`) or posts
@@ -3234,35 +3263,41 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const wait = this.statusChanges.retry(userId, now);
 		if (wait !== undefined) throw { name: "retry_after", message: "Status changes limited", data: { retry_after: wait } } satisfies ProtocolError;
 		// Choosing `invisible` shows a connected user `offline` at once, with
-		// a `seen` (announceStatus), settled here: a registered user's, when
-		// the stored one no longer stands (seenFor), is stored with the
-		// choice, in one reservation and transaction; otherwise the stored
-		// one is carried and only the choice is written.
+		// a `seen` (announceStatus), settled here: when the one known no
+		// longer stands (seenFor), a registered user's is settled by the
+		// store with the choice, in one reservation and transaction (the
+		// stored one if it stands after all, else now, written); otherwise
+		// the known one is carried and only the choice is written.
 		const registered = attachment.tier === "registered";
 		const settled = choice === "invisible" ? this.seenOnInvisible(userId, registered, now) : undefined;
-		if (registered) this.store.setStatus({ userId, choice, now, ...(settled?.write ? { seen: settled.seen } : {}) });
+		let seen = settled?.seen;
+		if (registered) {
+			const result = this.store.setStatus({ userId, choice, now, ...(settled?.settle ? { seenAt: now } : {}) });
+			if (settled?.settle && result.seen !== undefined) seen = result.seen;
+		}
 		this.statusChanges.take(userId, now);
 		this.cacheStatusState(userId, (state) => {
 			if (choice === "online") delete state.choice;
 			else state.choice = choice;
-			if (settled) state.seen = settled.seen;
+			if (seen !== undefined) state.seen = seen;
 		});
 		for (const peer of this.connectionsOf(userId, socket)) this.deliverTo(peer, { method: "user", params: { you: { user_id: userId, status: choice } } });
-		this.touchPresence(userId, now, { immediate: true, ...(settled ? { seen: settled.seen } : {}) });
+		this.touchPresence(userId, now, { immediate: true, ...(seen !== undefined ? { seen } : {}) });
 	}
 
 	/**
 	 * The `seen` (§4.5.2) a connected user's choosing `invisible` now will
-	 * announce, as touchPresence does it at once, and whether it has to be
-	 * written (seenFor, from the one their connections hold): when others
+	 * announce, as touchPresence does it at once, and whether the store has
+	 * to settle it (seenFor, from the one their connections hold, no earlier
+	 * than the floor: seenWithFloor): when others
 	 * were told something other than `offline`; else none (presence off,
 	 * nothing announced for them on this object yet, or already `offline`).
 	 */
-	private seenOnInvisible(userId: string, registered: boolean, now: number): { seen: number; write: boolean } | undefined {
+	private seenOnInvisible(userId: string, registered: boolean, now: number): { seen: number; settle: boolean } | undefined {
 		if (!this.presenceMode()) return undefined;
 		const states = this.liveStatesOf(userId);
 		const told = states.find(({ state }) => state.pres)?.state.pres?.s;
-		return told !== undefined && told !== "offline" ? seenFor(keptSeen(states), registered, now) : undefined;
+		return told !== undefined && told !== "offline" ? seenFor(this.seenWithFloor(keptSeen(states)), registered, now) : undefined;
 	}
 
 	/**
@@ -3415,6 +3450,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.presenceTimerAt = Number.POSITIVE_INFINITY;
 		this.presenceDueAt = Number.POSITIVE_INFINITY;
 		this.announcedAt.clear();
+		this.departed.clear();
 		for (const ws of this.ctx.getWebSockets()) {
 			const socket = ws as WebSocketConnection;
 			const state = connectionAttachment(socket);
@@ -3548,15 +3584,21 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// Their last connection closed: whoever shares a room is owed the change.
 			const closing = options.closing;
 			if (!closing?.pres) return;
+			// Another close of a departure already handled (departed): it owes nothing more.
+			if (this.departed.has(userId) || this.owedChange(userId)) return;
+			this.departed.delete(userId);
+			this.departed.add(userId);
+			if (this.departed.size > RATE_LIMIT_KEYS) this.departed.delete(this.departed.values().next().value!);
 			const told = closing.pres.s;
 			const status = shownStatus({ choice: closing.choice ?? "online", connected: false, attended: false });
 			const due = options.immediate ? now : Math.max(this.lastAnnounced(userId, closing.pres) + coalesceMs, options.hold ? now + graceMs : 0);
 			// A change to offline carries `seen`, settled now, as they leave: a
 			// registered user's is written now, even if they come back within
-			// the grace and nothing is announced, unless the stored one stands.
-			// One already shown offline (invisible) changes nothing, so `seen`
-			// stays.
-			const seen = status === "offline" && told !== "offline" ? this.settleSeen(userId, closing.tier === "registered", closing.seen, now) : undefined;
+			// the grace and nothing is announced, unless the one known (or,
+			// failing that, the stored one) stands. One already shown offline
+			// (invisible) changes nothing, so `seen` stays.
+			const seen = status === "offline" && told !== "offline"
+				? this.settleSeen(userId, closing.tier === "registered", this.seenWithFloor(closing.seen), now) : undefined;
 			this.oweStatus(userId, closing.rooms ?? [], told, status, due, now, seen);
 		});
 	}
@@ -3611,39 +3653,78 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.writePresence(states, { s: shown, a: now });
 		this.noteAnnounced(userId, now);
 		const seen = shown !== "offline" ? undefined
-			: settled ?? this.settleSeen(userId, states.some(({ state }) => state.tier === "registered"), keptSeen(states), now);
+			: settled ?? this.settleSeen(userId, states.some(({ state }) => state.tier === "registered"), this.seenWithFloor(keptSeen(states)), now);
 		this.deliver({ method: "user", params: { new: { user_id: userId, ...shownFields(shown, seen) } } }, rooms, (state) => state.userId !== userId);
 	}
 
 	/**
 	 * Settles the `seen` (§4.5.2) that a user's shown status changing to
-	 * `offline` at `now` carries, from `kept`, the stored one their
-	 * connections hold (seenFor): a registered user's stored one if no older
-	 * than SEEN_WRITE_GRANULARITY_MS, with no write; else `now`, stored first
-	 * (Store.setSeen, one row), so listings carry it once they have no
-	 * connection and it survives eviction. What it returns is what is
-	 * stored, so the announcement and every later listing agree: if the
-	 * write fails (it is logged), the stored one is carried instead, absent
-	 * when none is known. A guest's is `now`, never stored: it lives and goes
-	 * with its connections. Kept on the user's connections, if any.
+	 * `offline` at `now` carries, from `known`, the one their connections
+	 * (or the closing one) hold, read at sign-in, no earlier than the floor
+	 * (seenWithFloor; seenFor): if no older than SEEN_WRITE_GRANULARITY_MS,
+	 * that one, with no SQL; else, for a registered user, what the store
+	 * settles (Store.settleSeen: the stored one if it stands, however stale
+	 * the copy, else `now`, written), so listings carry it once they have no
+	 * connection and it survives eviction. What it returns is what listings
+	 * show, so the announcement and every later listing agree. If the store
+	 * refuses (an exhausted budget; it is logged), `known` is carried
+	 * instead, absent when none is: what is stored, since every `seen` this
+	 * object settles is set on the user's connections and read again at
+	 * sign-in, unless the copy is one an older deployment made (none, so
+	 * none is carried). A guest's is `now` unless the one known stands,
+	 * never stored: it lives and goes with its connections. Kept on the
+	 * user's connections, if any.
 	 */
-	private settleSeen(userId: string, registered: boolean, kept: number | undefined, now: number): number | undefined {
-		const settled = seenFor(kept, registered, now);
-		if (settled.write) {
+	private settleSeen(userId: string, registered: boolean, known: number | undefined, now: number): number | undefined {
+		const decided = seenFor(known, registered, now);
+		let seen = decided.seen;
+		if (decided.settle) {
 			try {
-				this.store.setSeen({ userId, seen: settled.seen, now });
+				// Undefined for a user with no identity row (purged meanwhile), who is listed nowhere.
+				seen = this.store.settleSeen({ userId, at: now, now }) ?? now;
 			} catch (error) {
 				console.warn(JSON.stringify({ event: "seen_write_failed", reason: errorToProtocol(error).message }));
-				return kept;
+				return known;
 			}
 		}
 		for (const peer of this.connectionsOf(userId)) {
 			const state = connectionAttachment(peer);
-			if (!state || state.seen === settled.seen) continue;
-			state.seen = settled.seen;
+			if (!state || state.seen === seen) continue;
+			state.seen = seen;
 			writeAttachment(peer, state);
 		}
-		return settled.seen;
+		return seen;
+	}
+
+	/**
+	 * Whether a connection still owes others a change of a user's status
+	 * (`owed`), which survives eviction: so the user has not signed in since
+	 * their last connection's close was handled (presenceSignedIn drops it).
+	 */
+	private owedChange(userId: string): boolean {
+		return this.ctx.getWebSockets().some((ws) => connectionAttachment(ws as WebSocketConnection)?.owed?.some(([id]) => id === userId) === true);
+	}
+
+	/**
+	 * The earliest `seen` (§4.5.2) a user shown `offline` carries: when
+	 * presence was last turned on with `/toggle`, 0 for never. Turning it on
+	 * changes every user's shown status from `""` (what presence off shows),
+	 * so for each user shown `offline` since, that is when it last became
+	 * `offline`, unless a later `seen` is recorded; a brief return while it
+	 * was off, which settled nothing, is never shown as earlier. The same for
+	 * every user, connected (`invisible`) or not, so it tells nothing of
+	 * anyone's connections. One `_meta` row written per toggle, read with the
+	 * toggle; code before it ignores the row.
+	 */
+	private seenFloor(): number {
+		this.presenceMode();
+		return this.presenceSince;
+	}
+
+	/** A `seen` as shown: no earlier than the floor (seenFloor), which stands in for none. */
+	private seenWithFloor(seen: number | undefined): number | undefined {
+		const floor = this.seenFloor();
+		return floor > 0 && (seen === undefined || seen < floor) ? floor : seen;
 	}
 
 	/**
@@ -3813,6 +3894,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!this.presenceMode() || !state?.userId || (state.tier !== "anonymous" && state.tier !== "registered")) return;
 		const userId = state.userId;
 		const now = nowMs();
+		// Back: their next last close is a departure of its own.
+		this.departed.delete(userId);
 		this.presenceWork(() => {
 			const others = this.liveStatesOf(userId).filter((entry) => entry.socket !== socket);
 			let pres = others.find((entry) => entry.state.pres)?.state.pres;
@@ -3874,7 +3957,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		for (const [userId, states] of users) {
 			shown.set(userId, states.find(({ state }) => state.pres)?.state.pres?.s ?? this.shownConnected(states, now));
 			rooms.set(userId, new Set(states.flatMap(({ state }) => state.rooms ?? [])));
-			const kept = keptSeen(states);
+			const kept = this.seenWithFloor(keptSeen(states));
 			if (kept !== undefined) seen.set(userId, kept);
 			owed.delete(userId);
 		}
@@ -3945,7 +4028,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (pending) owing.push(pending);
 			const kept = stored.get(user.user_id);
 			const status = shown.get(user.user_id) ?? pending?.[1] ?? shownStatus({ choice: kept?.choice ?? "online", connected: false, attended: false });
-			return { ...user, ...shownFields(status, seen.get(user.user_id) ?? kept?.seen) };
+			return { ...user, ...shownFields(status, seen.get(user.user_id) ?? this.seenWithFloor(kept?.seen)) };
 		});
 		if (lister && owing.length) {
 			const state = connectionAttachment(lister);
@@ -4546,7 +4629,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** An admin's `/toggle` of a feature, read once and then kept in memory with every change. */
 	private toggled(feature: ToggleFeature): boolean | undefined {
-		if (!this.toggles.has(feature)) this.toggles.set(feature, this.store.toggle(feature, nowMs()));
+		if (!this.toggles.has(feature)) {
+			if (feature === "presence") {
+				// With when it was last turned on (seenFloor), in the same read.
+				const read = this.store.presenceToggle(nowMs());
+				this.presenceSince = read.since ?? 0;
+				this.toggles.set(feature, read.on);
+			} else {
+				this.toggles.set(feature, this.store.toggle(feature, nowMs()));
+			}
+		}
 		return this.toggles.get(feature);
 	}
 
@@ -4591,8 +4683,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const on = !(chosen === "uploads" ? this.uploadsOn() : chosen === "presence" ? this.presenceMode() : chosen === "addmember" ? this.addMemberOn() : this.activityOn());
 		const fallback = chosen === "uploads" || chosen === "addmember" ? true : chosen === "presence" ? this.config.presence : this.config.activityEnabled;
 		const override = on === fallback ? undefined : on;
-		this.store.setToggle(chosen, override, nowMs());
+		const now = nowMs();
+		// Presence turned on: every user's shown status changes from `""`, so
+		// each one shown `offline` from now has been since now (seenFloor).
+		const since = chosen === "presence" && on ? now : undefined;
+		this.store.setToggle(chosen, override, now, since);
 		this.toggles.set(chosen, override);
+		if (since !== undefined) this.presenceSince = since;
 		// Registered users' `add_members` follows the toggle, but admins' and
 		// bots' (permissions): the rest get `user` `you` with the new value.
 		if (chosen === "addmember") {
@@ -5027,6 +5124,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const announced = this.announcedAt.get(from);
 		this.announcedAt.delete(from);
 		if (announced !== undefined) this.noteAnnounced(to, announced);
+		if (this.departed.delete(from)) this.departed.add(to);
 		for (const ws of this.ctx.getWebSockets()) {
 			const state = connectionAttachment(ws as WebSocketConnection);
 			if (!state?.owed?.some(([id]) => id === from)) continue;

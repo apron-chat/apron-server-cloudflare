@@ -180,7 +180,7 @@ it('adds seen to a schema 9 store from code before it, without a new schema vers
 		expect(store.statusInputs('kept_user')).toEqual({ choice: 'dnd', roomMutes: [] });
 		expect(store.getIdentity('kept_user')).not.toHaveProperty('seen');
 		expect(store.getRoomState().latest_log_id).toBe(before.head);
-		store.setSeen({ userId: 'kept_user', seen: now, now });
+		store.settleSeen({ userId: 'kept_user', at: now, now });
 		// A sign-in reads it with the identity row, not with the status state.
 		expect(store.getIdentity('kept_user')?.seen).toBe(now);
 		expect(store.statusInputs('kept_user')).toEqual({ choice: 'dnd', roomMutes: [] });
@@ -221,7 +221,7 @@ it('keeps seen and everything else when code before it runs on the store and is 
 				userId, name: userId, userHandle: `handle-${userId}`, now, ipKey: `ip-${userId}`,
 				credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
 			});
-			store.setSeen({ userId, seen: now - 1_000, now });
+			store.settleSeen({ userId, at: now - 1_000, now });
 		}
 	});
 
@@ -272,7 +272,7 @@ it('keeps seen and everything else when code before it runs on the store and is 
 		expect(store.getIdentity('carried_user')).not.toHaveProperty('seen');
 		expect(store.getIdentity('seen_user')).toMatchObject({ name: 'Seen', roles: ['friend'] });
 		expect(store.getIdentity('purged_user')).toBeNull();
-		store.setSeen({ userId: 'old_user', seen: now, now });
+		store.settleSeen({ userId: 'old_user', at: now, now });
 		expect(store.getIdentity('old_user')?.seen).toBe(now);
 	});
 });

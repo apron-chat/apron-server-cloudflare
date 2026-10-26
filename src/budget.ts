@@ -412,9 +412,10 @@ export const MAX_STATUS_DELAY_SECONDS = 60;
 // that one again, with no write. So reloads, reconnects and `invisible`
 // flips cost at most one write (the identity row and the budget row; 4
 // rows with the status for `invisible`) per user per 10 minutes, at most
-// 144 a day, and `seen` is never more than this much earlier than the real
-// change. A change after a longer absence, however brief the return,
-// always writes, so a return after a week is never missed.
+// 144 a day (several tabs closing together are one departure), and `seen`
+// is never more than this much earlier than the real change. A change
+// after a longer absence, however brief the return, always writes, so a
+// return after a week is never missed.
 export const SEEN_WRITE_GRANULARITY_MS = 10 * 60_000;
 // `status` `idle` changes one connection may make a minute (protocol §4.5
 // allows rate limiting `status`); past it, `retry_after` and nothing

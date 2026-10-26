@@ -17,6 +17,7 @@ import {
   MAX_PRIVATE_MEMBERSHIPS_PER_USER,
   MAX_PRIVATE_ROOM_LIMIT,
   MAX_THREAD_LIMIT,
+  SEEN_WRITE_GRANULARITY_MS,
   type PushPolicy,
   type UploadPolicy,
 } from "./budget";
@@ -800,6 +801,14 @@ const USER_LIMIT_SCOPES = ["post", "history", "upload", "push", "push_recipient"
  * or `off`, and is absent while the feature follows the deployment's default.
  */
 const META_TOGGLE_PREFIX = "toggle:";
+/**
+ * `_meta` key: when an admin last turned presence on with `/toggle`
+ * (epoch milliseconds), when the status others see of every user changed
+ * from `""` and so, for each user then shown `offline`, when that began
+ * (protocol §4.5.2 `seen`; see ApronDemoServer.seenFloor). Written once per
+ * toggle; code before it ignores the row.
+ */
+const META_PRESENCE_ON = "presence_on_ms";
 /** Bytes all live uploads hold, pending writes at their largest (see startUpload). */
 const META_UPLOAD_BYTES = "upload_bytes";
 /**
@@ -918,6 +927,15 @@ function statusColumns(row: RawMemberRow): Pick<RoomMember, "choice" | "seen"> {
 /** Refuses a `seen` that is not positive epoch milliseconds. */
 function assertSeen(seen: number): void {
   if (!Number.isSafeInteger(seen) || seen <= 0) throw new StoreError("invalid_params", "invalid seen");
+}
+
+/**
+ * Whether a stored `seen` (protocol §4.5.2) stands for a change to `offline`
+ * at `at`: it is no more than SEEN_WRITE_GRANULARITY_MS before it (and not
+ * after it), so it is carried again rather than written.
+ */
+export function seenStands(stored: number | undefined, at: number): boolean {
+  return stored !== undefined && stored > 0 && stored <= at && at - stored <= SEEN_WRITE_GRANULARITY_MS;
 }
 
 /** A stored `seen_ms` as epoch milliseconds, or undefined for none (0). */
@@ -1761,8 +1779,10 @@ export class Store {
    * `general` membership, so users sign in again with the passkey they have
    * rather than deleting it and registering anew. The rows the carry reads
    * and writes are charged to the day's maintenance reservation below, with their roles
-   * (but `bot`, which no passkey holder has). Older passkeys past the cap, bots, and every session
-   * are dropped.
+   * (but `bot`, which no passkey holder has). Not their avatar, `ext` or
+   * `seen` (`seen_ms` starts at 0, none recorded, so a carried user is
+   * listed `offline` without `seen` until they next go offline). Older
+   * passkeys past the cap, bots, and every session are dropped.
    *
    * The guest-number high-water mark is carried over, so a guest ID is never
    * reissued across a reset (a wipe does not restart guests at `guest_1`).
@@ -1940,7 +1960,8 @@ export class Store {
       this.observed.reads += Math.max(0, cursor.rowsRead ?? 0);
       this.observed.writes += Math.max(1, cursor.rowsWritten ?? 1);
       // Reused member listings are stale once anything they read is written
-      // (`seen` is written by writeSeen, which updates them instead).
+      // (`seen` is written by writeSeen, whose callers update them instead,
+      // once it is committed: patchMemberSeen).
       if (MEMBER_TABLES.test(lower)) this.memberGeneration += 1;
     }
     return cursor;
@@ -4112,16 +4133,33 @@ export class Store {
   }
 
   /**
+   * The `presence` toggle (as toggle has it) and when presence was last
+   * turned on with it (META_PRESENCE_ON), if ever, in one statement: two
+   * primary-key lookups of `_meta`, of which a missing row reads nothing.
+   */
+  presenceToggle(now = this.clock.now()): { on: boolean | undefined; since?: number } {
+    this.ensureReady();
+    return this.reserved({ reads: 4 }, false, now, () => {
+      const rows = this.rawRows<{ key: string; value: string }>("SELECT key, value FROM _meta WHERE key IN (?, ?)", META_TOGGLE_PREFIX + "presence", META_PRESENCE_ON);
+      const value = rows.find((row) => row.key === META_TOGGLE_PREFIX + "presence")?.value;
+      const since = Number(rows.find((row) => row.key === META_PRESENCE_ON)?.value);
+      return { on: value === "on" ? true : value === "off" ? false : undefined, ...(Number.isSafeInteger(since) && since > 0 ? { since } : {}) };
+    });
+  }
+
+  /**
    * Sets or, with undefined, clears an admin's `/toggle` of a feature. With
    * `uploads` off, new upload embeds and `/avatar` are `denied`; writes
-   * already started still finish.
+   * already started still finish. With `since`, presence was turned on
+   * then: it is kept too (META_PRESENCE_ON), in the same reservation.
    */
-  setToggle(feature: string, on: boolean | undefined, now = this.clock.now()): void {
+  setToggle(feature: string, on: boolean | undefined, now = this.clock.now(), since?: number): void {
     this.ensureReady();
-    this.reserved({ reads: 4, writes: 4 }, false, now, () => {
+    this.reserved({ reads: 4, writes: 8 }, false, now, () => this.transaction(() => {
       if (on === undefined) this.rawExec("DELETE FROM _meta WHERE key = ?", META_TOGGLE_PREFIX + feature);
       else this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_TOGGLE_PREFIX + feature, on ? "on" : "off");
-    });
+      if (since !== undefined) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_PRESENCE_ON, String(since));
+    }));
   }
 
   /**
@@ -4598,23 +4636,38 @@ export class Store {
   /**
    * `me` `status` (protocol §4.5) for a registered user: the value they
    * chose, kept in their `user_status` row with the mute. Whether it changed.
-   * With `seen`, when choosing `invisible` shows them `offline` (§4.5.2), it
-   * is recorded too (writeSeen), in the same reservation and transaction,
-   * so the two cannot part.
+   * With `seenAt`, when choosing `invisible` shows them `offline` at that
+   * time (§4.5.2), their `seen` is settled too, from the identity row this
+   * reads anyway: the stored one if it stands (seenStands), else `seenAt`,
+   * written (writeSeen) in the same reservation and transaction, so the two
+   * cannot part. `seen` is what is stored after, absent for an unknown
+   * user. Listings kept for reuse get it only once it is committed.
    */
-  setStatus(input: { userId: string; choice: StatusChoice; now?: number; seen?: number }): { changed: boolean } {
-    if (input.seen !== undefined) assertSeen(input.seen);
+  setStatus(input: { userId: string; choice: StatusChoice; now?: number; seenAt?: number }): { changed: boolean; seen?: number } {
+    if (input.seenAt !== undefined) assertSeen(input.seenAt);
     this.ensureReady();
     const now = input.now ?? this.clock.now();
-    return this.reserved({ reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
+    let written: number | undefined;
+    const result = this.reserved({ reads: 16, writes: 16 }, false, now, () => this.transaction((): { changed: boolean; seen?: number } => {
       this.effectiveNow(now);
-      if (!this.identityRow(input.userId)) return { changed: false };
-      if (input.seen !== undefined) this.writeSeen(input.userId, input.seen);
+      const row = this.identityRow(input.userId);
+      if (!row) return { changed: false };
+      let seen: number | undefined;
+      if (input.seenAt !== undefined) {
+        seen = seenColumn(row.seen_ms);
+        if (!seenStands(seen, input.seenAt)) {
+          this.writeSeen(input.userId, input.seenAt);
+          seen = written = input.seenAt;
+        }
+      }
       const existing = this.userStatusRow(input.userId);
-      if ((existing?.status ?? "online") === input.choice) return { changed: false };
+      if ((existing?.status ?? "online") === input.choice) return { changed: false, ...(seen !== undefined ? { seen } : {}) };
       this.writeUserStatus(input.userId, existing, { status: input.choice });
-      return { changed: true };
+      return { changed: true, ...(seen !== undefined ? { seen } : {}) };
     }));
+    // Committed: listings kept for reuse may carry it now (a rollback leaves them as they were).
+    if (written !== undefined) this.patchMemberSeen(input.userId, written);
+    return result;
   }
 
   /** A user's `user_status` row, if any, with an expired mute left as stored. */
@@ -4730,33 +4783,65 @@ export class Store {
   }
 
   /**
-   * Records a registered user's `seen` (protocol §4.5.2): when the status
-   * others see of them became `offline`, epoch milliseconds, for a change
-   * to `offline` that is not a chosen `invisible` (setStatus records that
-   * one with the choice): their last connection closing. One update of
-   * their identity row (writeSeen); nothing for an unknown user.
+   * Settles a registered user's `seen` (protocol §4.5.2) for a change of
+   * the status others see of them to `offline` at `at` (epoch
+   * milliseconds) that is not a chosen `invisible` (setStatus settles that
+   * one with the choice): their last connection closing. The store decides,
+   * so every caller agrees with what it holds, however stale the copy it
+   * decided from (several tabs closing together, each handled as the last;
+   * an eviction in between): the stored one if it stands (seenStands), with
+   * no write, else `at`, written. Returns what is stored after, or
+   * undefined for an unknown user.
+   *
+   * One conditional update of the identity row, which writes only where the
+   * stored one does not stand (1 read, 1 write when it writes); where it
+   * stands, or for an unknown user, a primary-key read of `seen_ms` follows
+   * (2 reads, no write). Listings kept for reuse are patched in place, not
+   * invalidated (patchMemberSeen).
    */
-  setSeen(input: { userId: string; seen: number; now?: number }): void {
-    assertSeen(input.seen);
+  settleSeen(input: { userId: string; at: number; now?: number }): number | undefined {
+    assertSeen(input.at);
     this.ensureReady();
     const now = input.now ?? this.clock.now();
-    this.reserved({ reads: 8, writes: 8 }, false, now, () => {
+    return this.reserved({ reads: 8, writes: 8 }, false, now, () => {
       this.effectiveNow(now);
-      this.writeSeen(input.userId, input.seen);
+      const at = input.at;
+      // Written only where the stored one does not stand (seenStands, in SQL).
+      const cursor = this.sql.exec(
+        "UPDATE identities SET seen_ms = ? WHERE user_id = ? AND (seen_ms <= 0 OR seen_ms > ? OR seen_ms < ?)",
+        at, input.userId, at, at - SEEN_WRITE_GRANULARITY_MS,
+      );
+      this.observed.reads += Math.max(0, cursor.rowsRead ?? 0);
+      this.observed.writes += Math.max(0, cursor.rowsWritten ?? 1);
+      if ((cursor.rowsWritten ?? 0) > 0) {
+        this.patchMemberSeen(input.userId, at);
+        return at;
+      }
+      // It stands (or the user is unknown; or the SQL adapter does not
+      // report rows written, which this read covers too): what is stored.
+      const row = this.rawRows<{ seen_ms: number }>("SELECT seen_ms FROM identities WHERE user_id = ? LIMIT 1", input.userId)[0];
+      const stored = row ? seenColumn(row.seen_ms) : undefined;
+      if (stored === at) this.patchMemberSeen(input.userId, at);
+      return stored;
     });
   }
 
   /**
    * Writes a user's `seen` into their identity row, which a member listing
-   * reads anyway, and into the listings kept for reuse, which stay valid:
-   * unlike other writes to the tables listings read (rawExec), this one
-   * does not invalidate them. Charged the rows SQLite reports, so an
-   * unknown user's, which matches no row, costs none.
+   * reads anyway. Unlike other writes to the tables listings read
+   * (rawExec), this one does not invalidate the listings kept for reuse:
+   * the caller patches them once it is committed (patchMemberSeen). Charged
+   * the rows SQLite reports, so an unknown user's, which matches no row,
+   * costs none.
    */
   private writeSeen(userId: string, seen: number): void {
     const cursor = this.sql.exec("UPDATE identities SET seen_ms = ? WHERE user_id = ?", seen, userId);
     this.observed.reads += Math.max(0, cursor.rowsRead ?? 0);
     this.observed.writes += Math.max(0, cursor.rowsWritten ?? 1);
+  }
+
+  /** Sets a committed `seen` in the listings kept for reuse, which stay valid. */
+  private patchMemberSeen(userId: string, seen: number): void {
     for (const entry of this.memberCache.values()) {
       for (const row of entry.rows) if (row.user_id === userId && row.seen_ms !== undefined) row.seen_ms = seen;
     }

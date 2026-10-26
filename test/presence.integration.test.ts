@@ -2,6 +2,7 @@ import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_LIMITS, PUSH_POLICY, SEEN_WRITE_GRANULARITY_MS } from '../src/budget';
 import { MUTE_FOREVER, type Store } from '../src/store';
+import { StoreError } from '../src/store-error';
 import { connect as open, exchange, request, status as statusRequest, statusOnly, type Frame, type Peer } from './helpers/socket';
 import { softPasskey } from './helpers/webauthn';
 import { withStore } from './helpers/store';
@@ -682,7 +683,7 @@ describe('user status timing', () => {
 			store.setStatus({ userId, choice: 'invisible', now });
 			store.setMute({ userId, untilMs: now + 60_000, now });
 			store.setRoomMute({ userId, roomId: 'general', untilMs: MUTE_FOREVER, now });
-			store.setSeen({ userId, seen: now - 1_000, now });
+			store.settleSeen({ userId, at: now - 1_000, now });
 			store.renameIdentity({ from: userId, to: `${userId}x`, now });
 			expect(store.statusInputs(userId, now)).toEqual({ choice: 'online', roomMutes: [] });
 			expect(store.statusInputs(`${userId}x`, now)).toEqual({ choice: 'invisible', muteUntil: now + 60_000, roomMutes: [{ roomId: 'general', untilMs: MUTE_FOREVER }] });
@@ -1472,8 +1473,9 @@ describe('seen: when the shown status last became offline (§4.5.2)', () => {
 			const reuse = await runInDurableObject(stub(), (instance, state) => {
 				const runtime = instance as unknown as Runtime & { membersOf(ids: string[]): Map<string, Array<{ user_id: string; seen?: string }>> };
 				runtime.membersOf(['general']);
-				const later = Number(offline.seen) + 1_000;
-				runtime.store.setSeen({ userId: leaverId, seen: later, now: Date.now() });
+				// Past SEEN_WRITE_GRANULARITY_MS, so it is written.
+				const later = Number(offline.seen) + SEEN_WRITE_GRANULARITY_MS + 1_000;
+				runtime.store.settleSeen({ userId: leaverId, at: later, now: Date.now() });
 				let members: Map<string, Array<{ user_id: string; seen?: string }>> | undefined;
 				const sql = statements(state, /FROM memberships m/, () => { members = runtime.membersOf(['general']); });
 				return { queries: sql.queries, seen: members!.get('general')!.find((user) => user.user_id === leaverId)?.seen, later };
@@ -1502,22 +1504,23 @@ describe('seen is written at most once in SEEN_WRITE_GRANULARITY_MS', () => {
 	 * Records the SQL the object runs from now until the test ends (afterEach
 	 * restores sql.exec), with each statement's bindings.
 	 */
-	async function recordSql(): Promise<Array<{ query: string; bindings: unknown[] }>> {
-		const log: Array<{ query: string; bindings: unknown[] }> = [];
+	async function recordSql(): Promise<Array<{ query: string; bindings: unknown[]; written: () => number }>> {
+		const log: Array<{ query: string; bindings: unknown[]; written: () => number }> = [];
 		await runInDurableObject(stub(), (_instance, state) => {
 			const sql = state.storage.sql;
 			const original = sql.exec.bind(sql);
 			vi.spyOn(sql, 'exec').mockImplementation(((query: string, ...bindings: unknown[]) => {
-				log.push({ query: query.replace(/\s+/g, ' ').trim(), bindings });
-				return original(query, ...(bindings as []));
+				const cursor = original(query, ...(bindings as []));
+				log.push({ query: query.replace(/\s+/g, ' ').trim(), bindings, written: () => cursor.rowsWritten });
+				return cursor;
 			}) as typeof sql.exec);
 		});
 		return log;
 	}
 
-	/** The seen values written for `userId` in `log`, in order. */
-	const writes = (log: Array<{ query: string; bindings: unknown[] }>, userId: string): unknown[] =>
-		log.filter((entry) => /^UPDATE identities SET seen_ms/.test(entry.query) && entry.bindings[1] === userId).map((entry) => entry.bindings[0]);
+	/** The seen values written for `userId` in `log` (statements that wrote a row), in order. */
+	const writes = (log: Array<{ query: string; bindings: unknown[]; written: () => number }>, userId: string): unknown[] =>
+		log.filter((entry) => /^UPDATE identities SET seen_ms/.test(entry.query) && entry.bindings[1] === userId && entry.written() > 0).map((entry) => entry.bindings[0]);
 
 	/** The seen each of `userId`'s open connections holds. */
 	const held = async (userId: string): Promise<Array<number | undefined>> =>
@@ -1670,7 +1673,7 @@ describe('seen is written at most once in SEEN_WRITE_GRANULARITY_MS', () => {
 		const userId = unique('reader');
 		await register(userId);
 		const recorded = Date.now() - 60_000;
-		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.setSeen({ userId, seen: recorded, now: Date.now() }); });
+		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.settleSeen({ userId, at: recorded, now: Date.now() }); });
 		const sql = await recordSql();
 		const peer = await signedIn(userId, { existing: true });
 		try {
@@ -1736,5 +1739,289 @@ describe('seen is written at most once in SEEN_WRITE_GRANULARITY_MS', () => {
 			watcher.close(); dave.close(); admin.close();
 			await setAdminToken(undefined);
 		}
+	});
+
+	/** Closes all of `peers`, `userId`'s connections, back to back, and waits until the object has handled every close. */
+	async function closeTogether(peers: Peer[], userId: string): Promise<void> {
+		for (const peer of peers) peer.close();
+		for (let tries = 0; tries < 400 && await counted(userId) > 0; tries++) await new Promise((resolve) => setTimeout(resolve, 5));
+		expect(await counted(userId)).toBe(0);
+	}
+
+	/** `userId` signed in on `tabs` connections, and others told they are online. */
+	async function tabsOf(watcher: Peer, userId: string, tabs: number): Promise<Peer[]> {
+		const peers = [await signedIn(userId)];
+		while (peers.length < tabs) peers.push(await signedIn(userId, { existing: true }));
+		await advance(COALESCE + 1_000);
+		expect(shown(await drain(watcher), userId)).toEqual([{ user_id: userId, status: 'online' }]);
+		return peers;
+	}
+
+	/**
+	 * Has the object's Store.settleSeen run `settle` instead, with the real
+	 * one, until the test ends (afterEach restores it).
+	 */
+	function replaceSettle(settle: (real: (input: { userId: string; at: number; now?: number }) => number | undefined, input: { userId: string; at: number; now?: number }, runtime: Runtime & Record<string, any>) => number | undefined): Promise<void> {
+		return runInDurableObject(stub(), (instance) => {
+			const runtime = instance as unknown as Runtime & Record<string, any>;
+			const real = runtime.store.settleSeen.bind(runtime.store);
+			vi.spyOn(runtime.store, 'settleSeen').mockImplementation((input) => settle(real, input, runtime));
+		});
+	}
+
+	const refused = () => new StoreError('retry_after', 'Demo capacity reached', { retryAfterMs: 60_000 });
+
+	it('writes once when several tabs close together, each handled as the last, and tells one seen, the one listed', async () => {
+		const watcher = await signedIn(unique('watcher'));
+		const sql = await recordSql();
+		const opened: Peer[] = [];
+		try {
+			await drain(watcher);
+			for (const tabs of [2, 3]) {
+				const userId = unique(`tabs${tabs}`);
+				const peers = await tabsOf(watcher, userId, tabs);
+				opened.push(...peers);
+				await closeTogether(peers, userId);
+				await advance(WAIT);
+				const changes = shown(await drain(watcher), userId);
+				expect(changes).toEqual([{ user_id: userId, status: 'offline', seen: expect.stringMatching(/^\d+$/) }]);
+				expect(writes(sql, userId)).toEqual([Number(changes[0].seen)]);
+				expect(await stored(userId)).toBe(Number(changes[0].seen));
+				expect(await listed(watcher, userId)).toMatchObject({ status: 'offline', seen: changes[0].seen });
+			}
+			// Again with the object's memory of each close lost once it is
+			// handled, as an eviction between the closes would lose it: the
+			// rest find the change still owed to others, and the store, which
+			// would refuse them now, is not asked again.
+			const userId = unique('evicted');
+			const peers = await tabsOf(watcher, userId, 3);
+			opened.push(...peers);
+			let calls = 0;
+			await replaceSettle((real, input) => {
+				if (++calls > 1) throw refused();
+				return real(input);
+			});
+			await runInDurableObject(stub(), (instance) => {
+				const runtime = instance as unknown as { departed: Set<string>; connectionGone(attachment: unknown): void };
+				const real = runtime.connectionGone.bind(runtime);
+				vi.spyOn(runtime, 'connectionGone').mockImplementation((attachment) => {
+					real(attachment);
+					runtime.departed.clear();
+				});
+			});
+			await closeTogether(peers, userId);
+			// Every close handled before the grace ends.
+			for (let tries = 0; tries < 400 && await runInDurableObject(stub(), (instance) => (instance as unknown as { connectionGone: { mock: { calls: unknown[] } } }).connectionGone.mock.calls.length) < peers.length; tries++) {
+				await new Promise((resolve) => setTimeout(resolve, 5));
+			}
+			await advance(WAIT);
+			const changes = shown(await drain(watcher), userId);
+			expect(changes).toEqual([{ user_id: userId, status: 'offline', seen: expect.stringMatching(/^\d+$/) }]);
+			expect(calls).toBe(1);
+			expect(writes(sql, userId)).toEqual([Number(changes[0].seen)]);
+			vi.restoreAllMocks();
+			expect(await listed(watcher, userId)).toMatchObject({ status: 'offline', seen: changes[0].seen });
+		} finally { watcher.close(); for (const peer of opened) peer.close(); }
+	});
+
+	it('tells the stored seen when the store refuses to settle a departure, from every tab closing', async () => {
+		const watcher = await signedIn(unique('watcher'));
+		const userId = unique('refused');
+		await register(userId);
+		// A seen recorded long ago, which no longer stands.
+		const recorded = Date.now() - 3 * SEEN_WRITE_GRANULARITY_MS;
+		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.settleSeen({ userId, at: recorded, now: Date.now() }); });
+		const sql = await recordSql();
+		const peers = [await signedIn(userId, { existing: true }), await signedIn(userId, { existing: true })];
+		try {
+			await advance(COALESCE + 1_000);
+			await drain(watcher);
+			let calls = 0;
+			await replaceSettle(() => { calls += 1; throw refused(); });
+			await closeTogether(peers, userId);
+			await advance(WAIT);
+			expect(calls).toBeGreaterThanOrEqual(1);
+			// Refused: what is stored is told, the same from each close, and listed.
+			expect(shown(await drain(watcher), userId)).toEqual([{ user_id: userId, status: 'offline', seen: String(recorded) }]);
+			expect(writes(sql, userId)).toEqual([]);
+			vi.restoreAllMocks();
+			expect(await stored(userId)).toBe(recorded);
+			expect(await listed(watcher, userId)).toMatchObject({ status: 'offline', seen: String(recorded) });
+		} finally { watcher.close(); for (const peer of peers) peer.close(); }
+	});
+
+	it('lets the store decide from what it holds when a connection\'s copy is stale', async () => {
+		const watcher = await signedIn(unique('watcher'));
+		const userId = unique('stale');
+		let peer = await tabsOf(watcher, userId, 1).then((peers) => peers[0]);
+		const sql = await recordSql();
+		try {
+			await hangUp(peer, userId);
+			await advance(WAIT);
+			const [first] = shown(await drain(watcher), userId);
+			peer = await back(watcher, userId);
+			// The connection's copy is lost (as one from code before seen has
+			// none): within SEEN_WRITE_GRANULARITY_MS, the store finds its own
+			// standing, and tells it.
+			await runInDurableObject(stub(), (_instance, state) => {
+				for (const socket of state.getWebSockets()) {
+					const attachment = socket.deserializeAttachment() as Attachment;
+					if (attachment?.userId !== userId) continue;
+					delete attachment.seen;
+					socket.serializeAttachment(attachment);
+				}
+			});
+			offset += 60_000;
+			await hangUp(peer, userId);
+			await advance(WAIT);
+			expect(shown(await drain(watcher), userId)).toEqual([{ user_id: userId, status: 'offline', seen: first.seen }]);
+			expect(writes(sql, userId)).toEqual([Number(first.seen)]);
+			expect(await listed(watcher, userId)).toMatchObject({ status: 'offline', seen: first.seen });
+		} finally { watcher.close(); peer.close(); }
+	});
+
+	it('keeps an owed change whose seen is malformed, without seen', async () => {
+		const watcher = await signedIn(unique('watcher'));
+		const userId = unique('malformed');
+		try {
+			await drain(watcher);
+			const due = Date.now() + 1_000;
+			await runInDurableObject(stub(), (_instance, state) => {
+				for (const socket of state.getWebSockets()) {
+					const attachment = socket.deserializeAttachment() as Omit<Attachment, 'owed'> & { owed?: unknown[] };
+					if (attachment?.userId === undefined || socket.readyState !== 1 || attachment.closing) continue;
+					attachment.owed = [...(attachment.owed ?? []), [userId, 'online', 'offline', due, 'not a time']];
+					socket.serializeAttachment(attachment);
+				}
+			});
+			await advance(2_000);
+			expect(shown(await drain(watcher), userId)).toEqual([{ user_id: userId, status: 'offline' }]);
+		} finally { watcher.close(); }
+	});
+
+	it('fits 32 owed changes with seen and the longest user IDs in a busy connection\'s attachment', async () => {
+		const watcher = await signedIn(unique('watcher'));
+		const warn = vi.spyOn(console, 'warn');
+		try {
+			await drain(watcher);
+			const bytes = await runInDurableObject(stub(), (instance, state) => {
+				const now = Date.now();
+				// The longest user IDs: a bot of an admin-issued 64-character ID.
+				const id = (index: number) => `bot_${'x'.repeat(60)}${String(index).padStart(4, '0')}`;
+				const socket = state.getWebSockets().find((ws) => (ws.deserializeAttachment() as Attachment)?.userId !== undefined && ws.readyState === 1)!;
+				const attachment = socket.deserializeAttachment() as Record<string, unknown>;
+				socket.serializeAttachment({
+					...attachment,
+					owed: Array.from({ length: 32 }, (_, index) => [id(index), 'online', 'offline', now + 3_600_000, now]),
+					// A busy connection's other bounded lists, at their longest.
+					frameTimes: Array.from({ length: 120 }, (_, index) => now - index),
+					policyViolations: Array.from({ length: 120 }, (_, index) => now - index),
+					held: Array.from({ length: 8 }, (_, index) => ['m'.repeat(60) + String(index).padStart(4, '0'), 'r'.repeat(64), now, now]),
+				});
+				// The sweep reads it and writes it back (writeAttachment, with its safety check).
+				(instance as unknown as Runtime).flushPresence(now);
+				const written = socket.deserializeAttachment() as { owed?: unknown[] };
+				expect(written.owed).toHaveLength(32);
+				return new TextEncoder().encode(JSON.stringify(written)).length;
+			});
+			expect(warn.mock.calls.flat().some((line) => /presence_failed|exceeds safety budget/.test(String(line)))).toBe(false);
+			console.info('attachment-bytes', bytes);
+			expect(bytes).toBeLessThanOrEqual(12_000);
+		} finally {
+			// The owed entries are for no one: clear them.
+			await runInDurableObject(stub(), (_instance, state) => {
+				for (const socket of state.getWebSockets()) {
+					const attachment = socket.deserializeAttachment() as Attachment;
+					if (!attachment?.owed) continue;
+					delete attachment.owed;
+					socket.serializeAttachment(attachment);
+				}
+			});
+			watcher.close();
+		}
+	});
+
+	it('shows each user shown offline after /toggle presence comes back on as offline since then, with no write per user', async () => {
+		const adminId = unique('admin');
+		await register(adminId);
+		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.setRole({ userId: adminId, role: 'admin', on: true }); });
+		const admin = await signedIn(adminId, { existing: true });
+		const toggle = async (id: string) => expect((await exchange(admin, id, 'command', { room_id: 'general', body: { text: '/toggle presence' } })).frame.result).toEqual({});
+		// Away throughout, with a seen from long ago; back briefly while presence is off;
+		// connected and invisible throughout; and online when it comes back on.
+		const awayId = unique('away');
+		const briefId = unique('brief');
+		const shyId = unique('shy');
+		const stayId = unique('stay');
+		const old = Date.now() - 2 * DAY;
+		for (const userId of [awayId, briefId]) {
+			await register(userId);
+			await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.settleSeen({ userId, at: old, now: Date.now() }); });
+		}
+		const shy = await signedIn(shyId);
+		await choose(shy, 'invisible');
+		let stay = await signedIn(stayId);
+		const sql = await recordSql();
+		try {
+			await toggle('off');
+			offset += 60_000;
+			const brief = await signedIn(briefId, { existing: true });
+			await hangUp(brief, briefId);
+			await advance(WAIT);
+			offset += 60_000;
+			const before = Date.now();
+			await toggle('on');
+			const after = Date.now();
+			await drain(admin);
+			// Each shown offline: offline since presence came on, whatever was
+			// stored before, and later than the brief return it hid.
+			const list = await listing(admin);
+			const since = list.get(awayId)?.seen as string;
+			expect(Number(since)).toBeGreaterThanOrEqual(before);
+			expect(Number(since)).toBeLessThanOrEqual(after);
+			for (const userId of [awayId, briefId, shyId]) expect(list.get(userId)).toMatchObject({ status: 'offline', seen: since });
+			expect(list.get(stayId)).not.toHaveProperty('seen');
+			// One _meta row, no identity row.
+			expect(sql.filter((entry) => /^UPDATE identities SET seen_ms/.test(entry.query) && entry.written() > 0)).toEqual([]);
+			// Leaving within 10 minutes of it: told that time, listed with it, nothing written.
+			offset += 3 * 60_000;
+			await hangUp(stay, stayId);
+			await advance(WAIT);
+			expect(shown(await drain(admin), stayId)).toEqual([{ user_id: stayId, status: 'offline', seen: since }]);
+			expect(await listed(admin, stayId)).toMatchObject({ status: 'offline', seen: since });
+			expect(writes(sql, stayId)).toEqual([]);
+			// Kept across eviction, read with the toggle.
+			await evict();
+			expect(await listed(admin, awayId)).toMatchObject({ status: 'offline', seen: since });
+			expect(await listed(admin, shyId)).toMatchObject({ status: 'offline', seen: since });
+			// Later departures write their own as before.
+			offset += SEEN_WRITE_GRANULARITY_MS;
+			stay = await back(admin, stayId);
+			await hangUp(stay, stayId);
+			await advance(WAIT);
+			const [later] = shown(await drain(admin), stayId);
+			expect(Number(later.seen)).toBeGreaterThan(Number(since) + SEEN_WRITE_GRANULARITY_MS);
+			expect(await stored(stayId)).toBe(Number(later.seen));
+		} finally { admin.close(); shy.close(); stay.close(); }
+	});
+
+	it('lists a reused listing with the stored seen when the status it was written with rolls back', async () => {
+		const userId = unique('rollback');
+		await register(userId);
+		const result = await runInDurableObject(stub(), (instance) => {
+			const store = (instance as unknown as Runtime).store as Store & Record<string, any>;
+			const now = Date.now();
+			const old = now - 3 * SEEN_WRITE_GRANULARITY_MS;
+			store.settleSeen({ userId, at: old, now });
+			const seenOf = () => store.roomMembers(['general'], DEFAULT_LIMITS.roomListMembers, Date.now(), undefined, true).get('general')?.find((member: { user_id: string }) => member.user_id === userId)?.seen;
+			expect(seenOf()).toBe(old);
+			const spy = vi.spyOn(store, 'writeUserStatus').mockImplementation(() => { throw new Error('status write failed'); });
+			expect(() => store.setStatus({ userId, choice: 'invisible', seenAt: now, now })).toThrow('status write failed');
+			spy.mockRestore();
+			return { old, listed: seenOf(), stored: store.getIdentity(userId)?.seen };
+		});
+		// Rolled back with the status: neither stored nor listed.
+		expect(result.stored).toBe(result.old);
+		expect(result.listed).toBe(result.old);
 	});
 });

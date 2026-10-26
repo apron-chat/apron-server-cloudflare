@@ -171,9 +171,10 @@ export const FREE_PLAN: Plan = Object.freeze({
 		// row) when their last connection closes, or with a chosen
 		// `invisible` (4 rows, measured, where the status alone is 3), but
 		// at most once in SEEN_WRITE_GRANULARITY_MS (10 minutes): within it
-		// the stored one is shown again, so reloads and reconnects write
-		// nothing, and one account writes at most 144 a day (288 rows,
-		// 0.5% of the foreground writes). Requests are already this plan's
+		// the stored one is shown again, so reloads and reconnects within it
+		// write nothing, several tabs closing together write once, and one
+		// account writes at most 144 a day (288 rows, 0.5% of the
+		// foreground writes). Requests are already this plan's
 		// scarcest allowance after SQL writes; status adds none.
 		presence: true,
 	}),
