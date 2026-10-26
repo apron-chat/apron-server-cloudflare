@@ -819,8 +819,6 @@ const UPLOAD_WRITES = 16;
 const MAX_PUSH_SUBSCRIPTIONS_PER_USER = MAX_PUSHES_PER_MESSAGE;
 /** The tables a member listing reads (Store.roomMembers); a write to one invalidates reused listings. */
 const MEMBER_TABLES = /\b(identities|memberships|user_status)\b/;
-/** Store.setSeen's write, which updates reused listings in place rather than invalidating them. */
-const SEEN_UPDATE = "UPDATE identities SET seen_ms = ? WHERE user_id = ?";
 /** Store.ensureSeenColumn's probe: reads no row, and fails to compile where `seen_ms` is missing. */
 const SEEN_COLUMN_PROBE = "SELECT seen_ms FROM identities LIMIT 0";
 /**
@@ -915,6 +913,11 @@ interface RawMemberRow {
 function statusColumns(row: RawMemberRow): Pick<RoomMember, "choice" | "seen"> {
   const seen = seenColumn(row.seen_ms);
   return { choice: choiceColumn(row.status), ...(seen !== undefined ? { seen } : {}) };
+}
+
+/** Refuses a `seen` that is not positive epoch milliseconds. */
+function assertSeen(seen: number): void {
+  if (!Number.isSafeInteger(seen) || seen <= 0) throw new StoreError("invalid_params", "invalid seen");
 }
 
 /** A stored `seen_ms` as epoch milliseconds, or undefined for none (0). */
@@ -1936,9 +1939,9 @@ export class Store {
     } else {
       this.observed.reads += Math.max(0, cursor.rowsRead ?? 0);
       this.observed.writes += Math.max(1, cursor.rowsWritten ?? 1);
-      // Reused member listings are stale once anything they read is written,
-      // but for `seen`, which setSeen updates in them.
-      if (MEMBER_TABLES.test(lower) && query !== SEEN_UPDATE) this.memberGeneration += 1;
+      // Reused member listings are stale once anything they read is written
+      // (`seen` is written by writeSeen, which updates them instead).
+      if (MEMBER_TABLES.test(lower)) this.memberGeneration += 1;
     }
     return cursor;
   }
@@ -4593,13 +4596,18 @@ export class Store {
   /**
    * `me` `status` (protocol §4.5) for a registered user: the value they
    * chose, kept in their `user_status` row with the mute. Whether it changed.
+   * With `seen`, when choosing `invisible` shows them `offline` (§4.5.2), it
+   * is recorded too (writeSeen), in the same reservation and transaction,
+   * so the two cannot part.
    */
-  setStatus(input: { userId: string; choice: StatusChoice; now?: number }): { changed: boolean } {
+  setStatus(input: { userId: string; choice: StatusChoice; now?: number; seen?: number }): { changed: boolean } {
+    if (input.seen !== undefined) assertSeen(input.seen);
     this.ensureReady();
     const now = input.now ?? this.clock.now();
     return this.reserved({ reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
       this.effectiveNow(now);
       if (!this.identityRow(input.userId)) return { changed: false };
+      if (input.seen !== undefined) this.writeSeen(input.userId, input.seen);
       const existing = this.userStatusRow(input.userId);
       if ((existing?.status ?? "online") === input.choice) return { changed: false };
       this.writeUserStatus(input.userId, existing, { status: input.choice });
@@ -4722,22 +4730,35 @@ export class Store {
 
   /**
    * Records a registered user's `seen` (protocol §4.5.2): when the status
-   * others see of them became `offline`, epoch milliseconds. One update of
-   * their identity row, which a member listing reads anyway; listings kept
-   * for reuse are updated in place rather than read again. Nothing for an
-   * unknown user.
+   * others see of them became `offline`, epoch milliseconds, for a change
+   * to `offline` that is not a chosen `invisible` (setStatus records that
+   * one with the choice): their last connection closing. One update of
+   * their identity row (writeSeen); nothing for an unknown user.
    */
   setSeen(input: { userId: string; seen: number; now?: number }): void {
-    if (!Number.isSafeInteger(input.seen) || input.seen <= 0) throw new StoreError("invalid_params", "invalid seen");
+    assertSeen(input.seen);
     this.ensureReady();
     const now = input.now ?? this.clock.now();
     this.reserved({ reads: 8, writes: 8 }, false, now, () => {
       this.effectiveNow(now);
-      this.rawExec(SEEN_UPDATE, input.seen, input.userId);
-      for (const entry of this.memberCache.values()) {
-        for (const row of entry.rows) if (row.user_id === input.userId && row.seen_ms !== undefined) row.seen_ms = input.seen;
-      }
+      this.writeSeen(input.userId, input.seen);
     });
+  }
+
+  /**
+   * Writes a user's `seen` into their identity row, which a member listing
+   * reads anyway, and into the listings kept for reuse, which stay valid:
+   * unlike other writes to the tables listings read (rawExec), this one
+   * does not invalidate them. Charged the rows SQLite reports, so an
+   * unknown user's, which matches no row, costs none.
+   */
+  private writeSeen(userId: string, seen: number): void {
+    const cursor = this.sql.exec("UPDATE identities SET seen_ms = ? WHERE user_id = ?", seen, userId);
+    this.observed.reads += Math.max(0, cursor.rowsRead ?? 0);
+    this.observed.writes += Math.max(0, cursor.rowsWritten ?? 1);
+    for (const entry of this.memberCache.values()) {
+      for (const row of entry.rows) if (row.user_id === userId && row.seen_ms !== undefined) row.seen_ms = seen;
+    }
   }
 
   /**

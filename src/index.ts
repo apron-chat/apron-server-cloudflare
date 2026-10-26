@@ -3184,14 +3184,30 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const now = nowMs();
 		const wait = this.statusChanges.retry(userId, now);
 		if (wait !== undefined) throw { name: "retry_after", message: "Status changes limited", data: { retry_after: wait } } satisfies ProtocolError;
-		if (attachment.tier === "registered") this.store.setStatus({ userId, choice, now });
+		// Choosing `invisible` shows a connected user `offline` at once, which
+		// records `seen` (announceStatus): a registered user's is stored with
+		// the choice, in one reservation and transaction.
+		const seen = choice === "invisible" ? this.seenOnInvisible(userId, now) : undefined;
+		if (attachment.tier === "registered") this.store.setStatus({ userId, choice, now, ...(seen !== undefined ? { seen } : {}) });
 		this.statusChanges.take(userId, now);
 		this.cacheStatusState(userId, (state) => {
 			if (choice === "online") delete state.choice;
 			else state.choice = choice;
 		});
 		for (const peer of this.connectionsOf(userId, socket)) this.deliverTo(peer, { method: "user", params: { you: { user_id: userId, status: choice } } });
-		this.touchPresence(userId, now, { immediate: true });
+		this.touchPresence(userId, now, { immediate: true, ...(seen !== undefined && attachment.tier === "registered" ? { storedSeen: seen } : {}) });
+	}
+
+	/**
+	 * The `seen` (§4.5.2) a connected user's choosing `invisible` now will
+	 * announce, as touchPresence does it at once: `now` when others were told
+	 * something other than `offline`, else none (presence off, or nothing
+	 * announced for them on this object yet, or already `offline`).
+	 */
+	private seenOnInvisible(userId: string, now: number): number | undefined {
+		if (!this.presenceMode()) return undefined;
+		const told = this.liveStatesOf(userId).find(({ state }) => state.pres)?.state.pres?.s;
+		return told !== undefined && told !== "offline" ? now : undefined;
 	}
 
 	/**
@@ -3441,7 +3457,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * last, what others were told and what they are owed now.
 	 * `immediate`: announce now, whatever the coalescing (a `me` change).
 	 */
-	private touchPresence(userId: string | undefined, now = nowMs(), options: { hold?: boolean; closing?: ConnectionAttachment; immediate?: boolean } = {}): void {
+	private touchPresence(userId: string | undefined, now = nowMs(), options: { hold?: boolean; closing?: ConnectionAttachment; immediate?: boolean; storedSeen?: number } = {}): void {
 		if (!userId || !this.presenceMode()) return;
 		if (!this.presenceBusy) this.noteClosedSockets();
 		this.presenceWork(() => {
@@ -3465,7 +3481,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				const hold = Math.max(pres.h ?? 0, options.hold ? now + graceMs : 0);
 				const due = options.immediate ? now : Math.max(this.lastAnnounced(userId, pres) + coalesceMs, hold);
 				if (due <= now) {
-					this.announceStatus(userId, states, shown, now);
+					this.announceStatus(userId, states, shown, now, options.storedSeen);
 					return;
 				}
 				if (hold > now && hold !== pres.h) this.writePresence(states, { ...pres, h: hold });
@@ -3527,27 +3543,30 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Announces a connected user's status: `user` `new` to the connections of
 	 * others who share a room with them. It differs from what they were told,
-	 * so a change to `offline` (a chosen `invisible`) carries a new `seen`.
+	 * so a change to `offline` (a chosen `invisible`) carries a new `seen`,
+	 * which needs no write of its own when it is `storedSeen`, stored with
+	 * the choice (changeChoice).
 	 */
-	private announceStatus(userId: string, states: ReadonlyArray<{ socket: WebSocketConnection; state: ConnectionAttachment }>, shown: Status, now: number): void {
+	private announceStatus(userId: string, states: ReadonlyArray<{ socket: WebSocketConnection; state: ConnectionAttachment }>, shown: Status, now: number, storedSeen?: number): void {
 		const rooms = [...new Set(states.flatMap(({ state }) => state.rooms ?? []))];
 		this.writePresence(states, { s: shown, a: now });
 		this.noteAnnounced(userId, now);
 		const seen = shown === "offline" ? now : undefined;
-		if (seen !== undefined) this.recordSeen(userId, states.some(({ state }) => state.tier === "registered"), seen);
+		if (seen !== undefined) this.recordSeen(userId, states.some(({ state }) => state.tier === "registered") && seen !== storedSeen, seen);
 		this.deliver({ method: "user", params: { new: { user_id: userId, ...shownFields(shown, seen) } } }, rooms, (state) => state.userId !== userId);
 	}
 
 	/**
 	 * Records `seen` (§4.5.2): the status others see of a user just became
-	 * `offline`. Kept on their connections, if any, and for a registered user
-	 * stored (Store.setSeen, one row), so listings carry it once they have no
+	 * `offline`. Kept on their connections, if any, and with `write` (a
+	 * registered user's, unless stored with their choice already) stored
+	 * (Store.setSeen, one row), so listings carry it once they have no
 	 * connection and it survives eviction; a guest's lives and goes with its
 	 * connection. A failed write is logged: the announcement still carries it.
 	 */
-	private recordSeen(userId: string, registered: boolean, seen: number): void {
+	private recordSeen(userId: string, write: boolean, seen: number): void {
 		this.cacheStatusState(userId, (state) => { state.seen = seen; });
-		if (!registered) return;
+		if (!write) return;
 		try {
 			this.store.setSeen({ userId, seen, now: seen });
 		} catch (error) {

@@ -878,6 +878,12 @@ describe('measured storage accounting', () => {
 			expect(measure('status inputs at sign-in, status, mute and one room mute', () => store.statusInputs('matrix-user', clock.now()))).toEqual({ choice: 'dnd', muteUntil: clock.now() + 3_600_000, roomMutes: [{ roomId: 'general', untilMs: clock.now() + 60_000 }], seen: clock.now() });
 			store.setStatus({ userId: 'matrix-user', choice: 'online', now: clock.now() });
 			store.setMute({ userId: 'matrix-user', untilMs: null, now: clock.now() });
+			// Choosing invisible records seen with the status, in one reservation and transaction.
+			measure('status set to invisible, with seen', () => store.setStatus({ userId: 'matrix-user', choice: 'invisible', seen: clock.now(), now: clock.now() }));
+			expect(store.statusInputs('matrix-user', clock.now())).toMatchObject({ choice: 'invisible', seen: clock.now() });
+			// A seen for a user with no identity row writes no row.
+			measure('seen set, unknown user', () => store.setSeen({ userId: 'matrix-nobody', seen: clock.now(), now: clock.now() }));
+			store.setStatus({ userId: 'matrix-user', choice: 'online', now: clock.now() });
 			// The thread's parent is muted: a wake for the thread is silenced by it.
 			expect(measure('push wake claim, the thread\'s parent muted', () => store.claimPushes({ senderId: 'matrix-sender', roomId: threadId, candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() }))).toEqual({ subscriptions: [], skipped: 0 });
 			// The most room mutes a user may hold: the sign-in reads them all.
@@ -898,7 +904,7 @@ describe('measured storage accounting', () => {
 			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
 			expect(create.result.message_id).toBeTruthy();
-			expect(costs).toHaveLength(53);
+			expect(costs).toHaveLength(55);
 			expect(store.accountingStatus().unsafe).toBe(false);
 			return { costs };
 		});
