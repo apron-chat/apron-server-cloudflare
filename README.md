@@ -38,7 +38,9 @@ for a zero-overage deployment.
   to one a minute per user, a closed tab counts after a minute's grace, and
   a peer that vanishes without closing only once it is found stale (150
   seconds without a ping), all with no alarms of their own and no SQL but
-  one written row when a signed-in user goes offline.
+  two charged rows (their identity row and the day's budget row) when a
+  signed-in user's last connection closes, and one more row with a chosen
+  `invisible`.
 - **Bring your own frontend.** Guest connections are accepted from any
   origin — even `localhost` or a browser console.
 - **Built to stay inside its plan.** Every operation is metered against

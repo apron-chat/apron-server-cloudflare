@@ -166,8 +166,11 @@ export const FREE_PLAN: Plan = Object.freeze({
 		// with no SQL; a listing reads each listed member's chosen status
 		// with them, nothing for members who never chose one or muted
 		// (measured), and their `seen` from the identity row it reads anyway.
-		// A registered user shown offline writes their `seen` (2 rows,
-		// measured), about once a session. Requests are already this plan's
+		// A registered user shown offline writes their `seen` (2 charged
+		// rows, measured: the identity row and the budget row) each time
+		// their last connection closes, reloads included; choosing
+		// `invisible` writes it with the status (4 rows, measured, where
+		// the status alone is 3). Requests are already this plan's
 		// scarcest allowance after SQL writes; status adds none.
 		presence: true,
 	}),
