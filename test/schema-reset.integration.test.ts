@@ -1,7 +1,7 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
 import { BOOTSTRAP_ROW_RESERVATION } from '../src/budget';
-import { MAX_CARRIED_PASSKEYS, SCHEMA_VERSION, UPGRADABLE_SCHEMA_VERSION, type Store } from '../src/store';
+import { MAX_CARRIED_PASSKEYS, SCHEMA_VERSION, Store, UPGRADABLE_SCHEMA_VERSION, defaultStoreConfig } from '../src/store';
 import { pushSubscriptionsOf } from './helpers/store';
 
 type Runtime = { store: Store };
@@ -133,6 +133,7 @@ function toSchema8(sql: SqlStorage): void {
 }
 
 const identityColumns = (sql: SqlStorage) => sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('identities') ORDER BY cid").toArray().map((row) => row.name);
+const readsReserved = (sql: SqlStorage) => sql.exec<{ reads_reserved: number }>('SELECT reads_reserved FROM resource_budgets ORDER BY day DESC LIMIT 1').one().reads_reserved;
 const writesReserved = (sql: SqlStorage) => sql.exec<{ writes_reserved: number }>('SELECT writes_reserved FROM resource_budgets ORDER BY day DESC LIMIT 1').one().writes_reserved;
 
 it('adds seen to a schema 9 store from code before it, without a new schema version, and nothing else changes', async () => {
@@ -149,11 +150,13 @@ it('adds seen to a schema 9 store from code before it, without a new schema vers
 		const head = store.getRoomState().latest_log_id;
 		// Last: the current code never runs against these tables.
 		withoutSeen(sql);
+		// The probe's error without the column, as the store matches it.
+		expect(() => sql.exec('SELECT seen_ms FROM identities LIMIT 0')).toThrow(/no such column/i);
 		// Identities: adding the column must not cost more with them.
-		for (let index = 0; index < 500; index++) {
+		for (let index = 0; index < 10_000; index++) {
 			sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES (?, ?, ?, 'registered', ?, ?)", `filler_${index}`, `hf${index}`, `F${index}`, now, now);
 		}
-		return { head, writes: writesReserved(sql) };
+		return { head, writes: writesReserved(sql), reads: readsReserved(sql) };
 	});
 
 	await evictDurableObject(stub);
@@ -166,13 +169,15 @@ it('adds seen to a schema 9 store from code before it, without a new schema vers
 		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe('9');
 		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(9);
 		expect(identityColumns(sql).slice(-2)).toEqual(['ext_json', 'seen_ms']);
+		// A few rows charged on top of the day's, however many identities there
+		// are: the column is added, with no row rewritten or backfilled.
+		// (Measured 53 read and 3 written with 10,000 identities, as with 500.)
+		expect(readsReserved(sql) - before.reads).toBeLessThan(64);
+		expect(writesReserved(sql) - before.writes).toBeGreaterThan(0);
+		expect(writesReserved(sql) - before.writes).toBeLessThanOrEqual(4);
 		// None recorded yet: no seen.
 		expect(sql.exec<{ seen_ms: number }>("SELECT seen_ms FROM identities WHERE user_id = 'kept_user'").one().seen_ms).toBe(0);
 		expect(store.statusInputs('kept_user')).toEqual({ choice: 'dnd', roomMutes: [] });
-		// A few rows charged on top of the day's, however many identities there are.
-		const writes = writesReserved(sql);
-		expect(writes).toBeGreaterThan(before.writes);
-		expect(writes - before.writes).toBeLessThan(64);
 		expect(store.getRoomState().latest_log_id).toBe(before.head);
 		store.setSeen({ userId: 'kept_user', seen: now, now });
 		expect(store.statusInputs('kept_user')).toEqual({ choice: 'dnd', roomMutes: [], seen: now });
@@ -186,6 +191,13 @@ it('adds seen to a schema 9 store from code before it, without a new schema vers
 		const sql = state.storage.sql;
 		expect(store.requiresReset()).toBe(false);
 		expect(store.storageAccounting().writes).toBe(0);
+		// A wake's own reads, the probe's among them, stay within the eight-row
+		// handover allowance of its first reservation, and it writes nothing.
+		const woken = new Store(state, defaultStoreConfig());
+		woken.initialize();
+		// (Measured 6 reads, the probe charged as one of them.)
+		expect(woken.storageAccounting().writes).toBe(0);
+		expect(woken.storageAccounting().reads).toBeLessThanOrEqual(8);
 		// The probe is metered as no row read (the store charges it as one).
 		const probe = sql.exec('SELECT seen_ms FROM identities LIMIT 0');
 		expect(probe.toArray()).toEqual([]);
