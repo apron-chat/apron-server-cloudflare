@@ -151,7 +151,11 @@ within it:
   so a reload or a phone reconnecting shows nothing. A peer that vanishes
   without closing (a sleeping laptop) counts as gone only once it is found
   stale, 150 seconds after its last ping, and then waits the same minute.
-  A status a user chooses is shown at once.
+  A status a user chooses is shown at once. A user shown `offline` carries
+  `seen`, when they went offline (when their last connection closed, or
+  when they chose `invisible`), in the notification and in later listings.
+  It changes only when they go offline, so an invisible user's connections
+  never move it, and their own `you` never carries it.
   `PRESENCE` (`true` or `false`) overrides the plan, and admins can turn it
   off and on with `/toggle presence`; turning it off tells connected
   clients to clear the statuses they were shown, and listings then show

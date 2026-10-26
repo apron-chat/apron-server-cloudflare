@@ -113,8 +113,16 @@ it(`carries at most ${MAX_CARRIED_PASSKEYS} passkeys across a reset, most recent
 	});
 });
 
+/** Turns a fresh store's tables back into schema 9's: no `seen_ms` on identities. */
+function toSchema9(sql: SqlStorage): void {
+	sql.exec('ALTER TABLE identities DROP COLUMN seen_ms');
+	sql.exec("UPDATE _meta SET value = '9' WHERE key = 'schema_version'");
+	sql.exec('UPDATE maintenance SET schema_version = 9 WHERE id = 1');
+}
+
 /** Turns a fresh store's tables back into schema 8's: timestamp lists on limiter rows, no history count on budget rows. */
 function toSchema8(sql: SqlStorage): void {
+	toSchema9(sql);
 	sql.exec('ALTER TABLE principal_limits DROP COLUMN level');
 	sql.exec('ALTER TABLE principal_limits DROP COLUMN level_ms');
 	for (const lane of ['post', 'auth', 'history', 'admission']) {
@@ -125,6 +133,48 @@ function toSchema8(sql: SqlStorage): void {
 	sql.exec("UPDATE _meta SET value = '8' WHERE key = 'schema_version'");
 	sql.exec('UPDATE maintenance SET schema_version = 8 WHERE id = 1');
 }
+
+it('upgrades a schema 9 store in place: identities gain an empty seen, and nothing else changes', async () => {
+	const stub = env.DEMO.getByName(`schema-upgrade-9-${crypto.randomUUID()}`);
+	const now = Date.now();
+	const before = await runInDurableObject(stub, async (instance, state) => {
+		const { store } = instance as unknown as Runtime;
+		const sql = state.storage.sql;
+		store.registerIdentity({
+			userId: 'kept_user', name: 'Kept', userHandle: 'handle-kept_user', now, ipKey: 'ip-kept_user',
+			credential: { credentialId: 'cred-kept_user', userId: 'kept_user', publicKey: 'AAAA', counter: 0 },
+		});
+		store.setStatus({ userId: 'kept_user', choice: 'dnd', now });
+		const head = store.getRoomState().latest_log_id;
+		// Last: the current code never runs against schema 9's tables.
+		toSchema9(sql);
+		// Identities: the upgrade's cost must not grow with them.
+		for (let index = 0; index < 500; index++) {
+			sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES (?, ?, ?, 'registered', ?, ?)", `filler_${index}`, `hf${index}`, `F${index}`, now, now);
+		}
+		return { head, writes: sql.exec<{ writes_reserved: number }>('SELECT writes_reserved FROM resource_budgets ORDER BY day DESC LIMIT 1').one().writes_reserved };
+	});
+
+	await evictDurableObject(stub);
+	await runInDurableObject(stub, async (instance, state) => {
+		const { store } = instance as unknown as Runtime;
+		const sql = state.storage.sql;
+		expect(store.requiresReset()).toBe(false);
+		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
+		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(SCHEMA_VERSION);
+		expect(sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('identities') ORDER BY cid").toArray().map((row) => row.name).slice(-2)).toEqual(['ext_json', 'seen_ms']);
+		// None recorded yet: no seen.
+		expect(sql.exec<{ seen_ms: number }>("SELECT seen_ms FROM identities WHERE user_id = 'kept_user'").one().seen_ms).toBe(0);
+		expect(store.statusInputs('kept_user')).toEqual({ choice: 'dnd', roomMutes: [] });
+		// A few rows charged on top of the day's, however many identities there are.
+		const writes = sql.exec<{ writes_reserved: number }>('SELECT writes_reserved FROM resource_budgets ORDER BY day DESC LIMIT 1').one().writes_reserved;
+		expect(writes).toBeGreaterThan(before.writes);
+		expect(writes - before.writes).toBeLessThan(64);
+		expect(store.getRoomState().latest_log_id).toBe(before.head);
+		store.setSeen({ userId: 'kept_user', seen: now, now });
+		expect(store.statusInputs('kept_user')).toEqual({ choice: 'dnd', roomMutes: [], seen: now });
+	});
+});
 
 it('upgrades a schema 8 store in place: limiter rows trade their timestamp lists for a token bucket and keep their day counts', async () => {
 	const stub = env.DEMO.getByName(`schema-upgrade-8-${crypto.randomUUID()}`);

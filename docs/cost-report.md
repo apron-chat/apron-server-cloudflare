@@ -1,19 +1,20 @@
 # Cloudflare Worker storage cost report
 
 This report records local native SQLite measurements used for the storage
-accounting review. It describes the current schema (schema 9: one server-wide
+accounting review. It describes the current schema (schema 10: one server-wide
 record log of room records, message snapshots, reaction sets, and
 memberships; a `memberships` table of registered users' rooms, keyed by
 room with an index by user; and the upload, push registration, user status
-and room mute tables measured below) and the Workers test runtime; it does not claim a
+and room mute tables measured below, and each identity's `seen`) and the Workers test runtime; it does not claim a
 deployed account billing rate or a free-plan capacity.
 
 The figures were measured on 2026-09-26, and re-measured on 2026-10-05 with
 user status (below) and again the same day for the current status design
 (the status chosen with `me`, room mutes and the mute echo), and checked on
 2026-10-06 for `status` as a request, statuses in every listing, and users'
-`ext`, none of which changes a row count, and re-measured on 2026-10-24 for
-schema 9 (below), with the repository's workerd launcher:
+`ext`, none of which changes a row count, re-measured on 2026-10-24 for
+schema 9 (below), and on 2026-10-26 for `seen` (User status, below), with
+the repository's workerd launcher:
 
 ```sh
 devenv shell -- npm test -- \
@@ -138,13 +139,14 @@ upper bounds can be compared with the measured worst case.
 | Push registrations clear (`/passkeys remove`, a new bot token) | 1 | 2 | 144 | 400 |
 | Mute set (`status` `mute`, unscoped) | 3 | 3 | 24 | 24 |
 | Status set (`me` `status`) | 4 | 2 | 24 | 24 |
+| Seen set (a registered user shown `offline`: their last connection closed, or they chose `invisible`) | 2 | 2 | 16 | 16 |
 | Room mute set (`status` `mute` with `room_id`) | 4 | 3 | 432 | 424 |
 | Room mute set past 100, refused (two counts and a delete of none ran out) | 303 | 2 | 432 | 424 |
 | Room mute clear | 3 | 2 | 432 | 424 |
 | Room mute expiry, 50 of 100 ran out (read, delete) | 201 | 51 | 224 | 416 |
-| Status inputs at sign-in, nothing stored | 3 | 1 | 224 | 8 |
-| Status inputs at sign-in, a status, a mute and one room mute | 3 | 1 | 224 | 8 |
-| Status inputs at sign-in, 100 room mutes | 102 | 1 | 224 | 8 |
+| Status inputs at sign-in, nothing stored | 4 | 1 | 224 | 8 |
+| Status inputs at sign-in, a status, a mute, one room mute and `seen` | 4 | 1 | 224 | 8 |
+| Status inputs at sign-in, 100 room mutes | 103 | 1 | 224 | 8 |
 | Push wake claim, `dnd` and muted (passed over) | 2 | 1 | 94 | 160 |
 | Push wake claim, the thread's parent muted (passed over) | 7 | 1 | 94 | 160 |
 | Gone push subscription forget (one primary-key row) | 2 | 2 | 20 | 22 |
@@ -520,9 +522,10 @@ with 200 members reads it once instead of 100 times (about 40,000 rows
 saved at two a member). It is lost on hibernation; the figures below assume
 no reuse.
 
-**Sign-in and changes.** A registered sign-in reads the `user_status` row
-and one key range of the user's room mutes, in `room_id` order (3/1 with
-none or one; 102/1 with the 100 a user may hold), and keeps the chosen status and the mute ends on the
+**Sign-in and changes.** A registered sign-in reads the `user_status` row,
+the identity's `seen_ms`, and one key range of the user's room mutes, in
+`room_id` order (4/1 with none or one; 103/1 with the 100 a user may hold),
+and keeps the chosen status, `seen` and the mute ends on the
 connection; `me` reads nothing. The mutes in effect are sent after the
 `auth` result from that read, and the statuses of connected users who
 share a room from attachments: the test that resends them measures no SQL
@@ -530,7 +533,8 @@ statement at all. A `me` `status` change is 4/2, an unscoped mute 3/3, a
 room mute 4/3. Deriving and announcing statuses reads connection
 attachments only: the tests measure 0 rows read and written, and no
 statement, for an `idle` change, a sweep, a closed connection's change after
-its grace, and a status snapshot, and the alarm unchanged. A mute that runs
+its grace, and a status snapshot, and the alarm unchanged; the one write is
+`seen`, below. A mute that runs
 out is told from attachments for the unscoped one (0 rows, measured); a
 room mute that runs out while its user is connected costs one key range of
 their room mutes and a delete of those that ran out (201/51 for 50 of 100,
@@ -541,6 +545,28 @@ most once a minute per user for changes the connections cause, and one
 frames are not billed. A connection that never sends `idle` is told of
 changes too, and stays attended: idleness is never inferred, so no sweep
 reads frame times for it.
+
+**Seen.** Every object that shows a user `offline` carries `seen`
+(PROTOCOL.md §4.5.2), when that began. It is kept in the identity row
+(`seen_ms`), which a listing reads anyway for the name, so listings read
+nothing more for it (the member query gains a column, not a row), and on
+the user's connections from sign-in, so a connected `invisible` user's needs
+no SQL. It is written only when what others were told becomes `offline`:
+a registered user's last connection closing while shown `online`, `idle`
+or `dnd`, at the close (so a reload within the grace writes once and shows
+nothing), or a connected user choosing `invisible` (bounded by
+`mutesPerUserMinute` with other status changes). Each write is one
+primary-key update, 2/2 with its reservation (16/16 reserved). It is not
+an indexed column, so the row's index entries are not rewritten, and it
+does not invalidate the listings kept for reuse: the store updates their
+row in place (tested: 0 statements for the next listing). Guests' `seen`
+lives on their connection, never in SQL. Changes owed to others carry it
+in the `owed` entry, so it survives eviction with them. At the load models
+below, one last disconnect a registered admission writes about 2 rows:
+2,000 a day at R and 4,000 (Free) or 8,000 (Paid) at K, 3.3% / 6.7% of
+Free's 60,000 foreground writes and 0.3% / 1.1% of Paid's 700,000. A
+schema 9 object gains the column in place with a few written rows
+(measured under 64, with 500 identities).
 
 **`status` as a request.** A client's `status` is a request: it is
 answered `{}`, or with an error that changes nothing. A refusal costs no
@@ -605,7 +631,7 @@ are of each plan's daily allowance (Paid: its monthly included usage over
 | Durable Object duration, if every session ends in an otherwise quiet minute | ≤ 3,125 GB-s (24%) / bound by the whole day | ≤ 6,250 GB-s (48%) / bound by the whole day |
 | SQL rows read (foreground) | 1.4% / 2.7% (worst, every member with a status row: 9% / 18%); sign-ins +0.04% / +0.08% | 0.2% / 0.9% (worst: 1.5% / 6%) |
 | SQL rows read (account) | under 0.1% / under 0.2% | under 0.05% / under 0.2% |
-| SQL rows written (foreground) | about 2 per status change and 3 per mute: ≤ 0.9% / ≤ 3.4% | ≤ 0.15% / ≤ 0.6% |
+| SQL rows written (foreground) | about 2 per status change and 3 per mute: ≤ 0.9% / ≤ 3.4%; `seen`, about 2 per registered session: 3.3% / 6.7% | ≤ 0.15% / ≤ 0.6%; `seen`: 0.3% / 1.1% |
 | Frames | no incoming frame beyond what push already asked for; outgoing only: announcements, the statuses and mutes in effect after each sign-in, one `status` per mute change to the user's connections, and one `user` frame per user told of on `/toggle presence` off or on, none of which an allowance counts or SQL serves | same |
 
 Free's listings read a little more than they would without status: the price of showing a user who chose none as `""`

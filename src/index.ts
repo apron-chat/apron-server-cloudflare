@@ -190,6 +190,15 @@ interface ConnectionAttachment {
 	muteUntil?: number;
 	roomMuteNext?: number;
 	/**
+	 * When the status others see of the user last became `offline` (§4.5.2
+	 * `seen`), epoch milliseconds: read at sign-in for a registered user
+	 * (Store.statusInputs), set when a change to `offline` is announced, and
+	 * kept equal on all their connections, so a listing or a notification
+	 * that shows them `offline` while connected (`invisible`) needs no SQL
+	 * for it. Absent when none is recorded.
+	 */
+	seen?: number;
+	/**
 	 * What the user's status was last announced as (PresenceRecord), kept
 	 * equal on all their connections, so a change waiting to be announced
 	 * survives hibernation.
@@ -198,8 +207,9 @@ interface ConnectionAttachment {
 	/**
 	 * Status changes of users who have no connection left that this
 	 * connection still has to be told, once each is due: `[user_id, status
-	 * last told, status now, when due]`. Kept here, with the connection that
-	 * needs them, so they survive hibernation; at most MAX_OWED.
+	 * last told, status now, when due, seen]` (OwedStatus). Kept here, with
+	 * the connection that needs them, so they survive hibernation; at most
+	 * MAX_OWED.
 	 */
 	owed?: OwedStatus[];
 	closing?: boolean;
@@ -240,8 +250,21 @@ function statusFrame(roomId: string | null, mute: number | boolean): Record<stri
 	return { method: "status", params: { ...(roomId !== null ? { room_id: roomId } : {}), mute } };
 }
 
-/** A pending status change of a user without a connection: `[user_id, status last told, status now, when due]`. */
-type OwedStatus = [string, Status, Status, number];
+/**
+ * A pending status change of a user without a connection: `[user_id, status
+ * last told, status now, when due]`, and for a change to `offline`, the
+ * `seen` it carries (§4.5.2), when their last connection closed.
+ */
+type OwedStatus = [string, Status, Status, number] | [string, Status, Status, number, number];
+
+/**
+ * A user's shown `status` as a current user object carries it (§4.5.2):
+ * with `seen`, in the format of a `log_id`, only when it is `offline` and
+ * one is recorded.
+ */
+function shownFields(status: Status, seen: number | undefined): { status: Status; seen?: string } {
+	return status === "offline" && seen !== undefined ? { status, seen: String(seen) } : { status };
+}
 
 /**
  * A wake held for an attended user (ConnectionAttachment.held):
@@ -679,6 +702,7 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			...(isStatusChoice(attachment.choice) && attachment.choice !== "online" ? { choice: attachment.choice } : {}),
 			...(Number.isSafeInteger(attachment.muteUntil) && (attachment.muteUntil as number) > 0 ? { muteUntil: attachment.muteUntil } : {}),
 			...(Number.isSafeInteger(attachment.roomMuteNext) && (attachment.roomMuteNext as number) > 0 ? { roomMuteNext: attachment.roomMuteNext } : {}),
+			...(Number.isSafeInteger(attachment.seen) && (attachment.seen as number) > 0 ? { seen: attachment.seen } : {}),
 			...presenceState(attachment),
 			authDeadline: typeof attachment.authDeadline === "number" ? attachment.authDeadline : 0,
 			pendingFrames: typeof attachment.pendingFrames === "number" ? attachment.pendingFrames : 0,
@@ -711,7 +735,7 @@ function presenceState(attachment: Partial<ConnectionAttachment>): Pick<Connecti
 		out.pres = { s: pres.s, a: pres.a, ...(Number.isSafeInteger(pres.h) ? { h: pres.h } : {}) };
 	}
 	if (Array.isArray(attachment.owed)) {
-		const owed = attachment.owed.filter((entry): entry is OwedStatus => Array.isArray(entry) && entry.length === 4 &&
+		const owed = attachment.owed.filter((entry): entry is OwedStatus => Array.isArray(entry) && (entry.length === 4 || (entry.length === 5 && Number.isSafeInteger(entry[4]) && (entry[4] as number) > 0)) &&
 			typeof entry[0] === "string" && entry[0].length > 0 && entry[0].length <= 128 && isStatus(entry[1]) && isStatus(entry[2]) && Number.isSafeInteger(entry[3])).slice(0, MAX_OWED);
 		if (owed.length) out.owed = owed.map((entry) => [...entry] as OwedStatus);
 	}
@@ -727,6 +751,8 @@ function applyStatusInputs(state: ConnectionAttachment, stored: StatusInputRecor
 	const next = nextRoomMuteEnd(stored.roomMutes).next;
 	if (next !== undefined) state.roomMuteNext = next;
 	else delete state.roomMuteNext;
+	if (stored.seen !== undefined) state.seen = stored.seen;
+	else delete state.seen;
 }
 
 /** The throttle fields of a stored attachment, bounded and type-checked. */
@@ -900,7 +926,10 @@ function identityOf(attachment: ConnectionAttachment): IdentityShape | null {
  * A user object as this server sends it (§3.3): `user_id` and `name`, and in
  * current objects `avatar`, `roles`, `ext` (complete objects only) and `status`.
  */
-type PublicUser = { user_id: string; name?: string; avatar?: string; roles?: string[]; ext?: Record<string, unknown>; status?: Status | StatusChoice };
+type PublicUser = { user_id: string; name?: string; avatar?: string; roles?: string[]; ext?: Record<string, unknown>; status?: Status | StatusChoice; seen?: string };
+
+/** What a listing read of a registered member's status (Store.roomMembers): the status they chose, and their `seen`. */
+type StoredStatus = { choice: StatusChoice; seen?: number };
 
 /**
  * A room in a listing, with `members` when asked for (§4.2.1), and
@@ -3102,7 +3131,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private prepareStatus(socket: WebSocketConnection, stored?: StatusInputRecord): void {
 		const state = connectionAttachment(socket);
 		if (!state) return;
-		for (const key of ["choice", "muteUntil", "roomMuteNext", "pres", "held"] as const) delete state[key];
+		for (const key of ["choice", "muteUntil", "roomMuteNext", "seen", "pres", "held"] as const) delete state[key];
 		if (state.tier === "registered" && stored) applyStatusInputs(state, stored);
 		writeAttachment(socket, state);
 	}
@@ -3449,7 +3478,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const told = closing.pres.s;
 			const status = shownStatus({ choice: closing.choice ?? "online", connected: false, attended: false });
 			const due = options.immediate ? now : Math.max(this.lastAnnounced(userId, closing.pres) + coalesceMs, options.hold ? now + graceMs : 0);
-			this.oweStatus(userId, closing.rooms ?? [], told, status, due, now);
+			// A change to offline carries `seen`, when they left; one already
+			// shown offline (invisible) changes nothing, so `seen` stays.
+			const seen = status === "offline" && told !== "offline" ? now : undefined;
+			if (seen !== undefined) this.recordSeen(userId, closing.tier === "registered", seen);
+			this.oweStatus(userId, closing.rooms ?? [], told, status, due, now, seen);
 		});
 	}
 
@@ -3457,9 +3490,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * Tells those who share one of `rooms` with a user who has no connection
 	 * that their status is now `status`, once `due`: at once if due, else as
 	 * an `owed` entry on each connection, sent when due (flushPresence) or
-	 * dropped if the user comes back first (presenceSignedIn).
+	 * dropped if the user comes back first (presenceSignedIn). A change to
+	 * `offline` carries `seen`, the same to everyone.
 	 */
-	private oweStatus(userId: string, rooms: readonly string[], told: Status, status: Status, due: number, now: number): void {
+	private oweStatus(userId: string, rooms: readonly string[], told: Status, status: Status, due: number, now: number, seen?: number): void {
 		const shared = new Set(rooms);
 		let owing = false;
 		const toldNow: WebSocketConnection[] = [];
@@ -3474,7 +3508,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (due <= now || owed.length >= MAX_OWED) {
 					toldNow.push(socket);
 				} else {
-					owed.push([userId, told, status, due]);
+					owed.push(seen !== undefined ? [userId, told, status, due, seen] : [userId, told, status, due]);
 					owing = true;
 				}
 			}
@@ -3484,18 +3518,41 @@ export class ApronDemoServer extends DurableObject<Env> {
 			writeAttachment(socket, state);
 		}
 		// Sent after the attachments are written: a failed send closes its connection.
-		for (const socket of toldNow) this.deliverTo(socket, { method: "user", params: { new: { user_id: userId, status } } });
+		for (const socket of toldNow) this.deliverTo(socket, { method: "user", params: { new: { user_id: userId, ...shownFields(status, seen) } } });
 		if (told === status) return;
 		if (owing) this.armPresence(due);
 		else this.noteAnnounced(userId, now);
 	}
 
-	/** Announces a connected user's status: `user` `new` to the connections of others who share a room with them. */
+	/**
+	 * Announces a connected user's status: `user` `new` to the connections of
+	 * others who share a room with them. It differs from what they were told,
+	 * so a change to `offline` (a chosen `invisible`) carries a new `seen`.
+	 */
 	private announceStatus(userId: string, states: ReadonlyArray<{ socket: WebSocketConnection; state: ConnectionAttachment }>, shown: Status, now: number): void {
 		const rooms = [...new Set(states.flatMap(({ state }) => state.rooms ?? []))];
 		this.writePresence(states, { s: shown, a: now });
 		this.noteAnnounced(userId, now);
-		this.deliver({ method: "user", params: { new: { user_id: userId, status: shown } } }, rooms, (state) => state.userId !== userId);
+		const seen = shown === "offline" ? now : undefined;
+		if (seen !== undefined) this.recordSeen(userId, states.some(({ state }) => state.tier === "registered"), seen);
+		this.deliver({ method: "user", params: { new: { user_id: userId, ...shownFields(shown, seen) } } }, rooms, (state) => state.userId !== userId);
+	}
+
+	/**
+	 * Records `seen` (§4.5.2): the status others see of a user just became
+	 * `offline`. Kept on their connections, if any, and for a registered user
+	 * stored (Store.setSeen, one row), so listings carry it once they have no
+	 * connection and it survives eviction; a guest's lives and goes with its
+	 * connection. A failed write is logged: the announcement still carries it.
+	 */
+	private recordSeen(userId: string, registered: boolean, seen: number): void {
+		this.cacheStatusState(userId, (state) => { state.seen = seen; });
+		if (!registered) return;
+		try {
+			this.store.setSeen({ userId, seen, now: seen });
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "seen_write_failed", reason: errorToProtocol(error).message }));
+		}
 	}
 
 	/**
@@ -3596,7 +3653,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (!state?.owed?.length) continue;
 				const owed: OwedStatus[] = [];
 				for (const entry of state.owed) {
-					const [userId, told, status, due] = entry;
+					const [userId, told, status, due, seen] = entry;
 					// Back before it was due: their connection carries on from what was told.
 					if (users.has(userId)) continue;
 					if (due > now) {
@@ -3604,7 +3661,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 						next = Math.min(next, due);
 						continue;
 					}
-					if (told !== status) this.deliverTo(socket, { method: "user", params: { new: { user_id: userId, status } } });
+					if (told !== status) this.deliverTo(socket, { method: "user", params: { new: { user_id: userId, ...shownFields(status, seen) } } });
 					this.noteAnnounced(userId, now);
 				}
 				const latest = connectionAttachment(socket);
@@ -3704,10 +3761,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * The status every connected user and every user owed a change is shown
 	 * with in a snapshot (a listing, `room_update` `joined`): what others
-	 * were last told, so the changes still to come apply to it.
+	 * were last told, so the changes still to come apply to it; and each
+	 * connected user's `seen`, from their connections.
 	 */
-	private presenceSnapshot(now: number): { shown: Map<string, Status>; owed: Map<string, OwedStatus>; rooms: Map<string, Set<string>> } {
+	private presenceSnapshot(now: number): { shown: Map<string, Status>; owed: Map<string, OwedStatus>; rooms: Map<string, Set<string>>; seen: Map<string, number> } {
 		const shown = new Map<string, Status>();
+		const seen = new Map<string, number>();
 		const owed = new Map<string, OwedStatus>();
 		const rooms = new Map<string, Set<string>>();
 		const users = new Map<string, Array<{ socket: WebSocketConnection; state: ConnectionAttachment }>>();
@@ -3724,9 +3783,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		for (const [userId, states] of users) {
 			shown.set(userId, states.find(({ state }) => state.pres)?.state.pres?.s ?? this.shownConnected(states, now));
 			rooms.set(userId, new Set(states.flatMap(({ state }) => state.rooms ?? [])));
+			const kept = states.find(({ state }) => state.seen !== undefined)?.state.seen;
+			if (kept !== undefined) seen.set(userId, kept);
 			owed.delete(userId);
 		}
-		return { shown, owed, rooms };
+		return { shown, owed, rooms, seen };
 	}
 
 	/**
@@ -3761,17 +3822,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private announceJoiner(userId: string, roomId: string): void {
 		if (!this.presenceMode()) return;
-		const status = this.presenceSnapshot(nowMs()).shown.get(userId);
+		const snapshot = this.presenceSnapshot(nowMs());
+		const status = snapshot.shown.get(userId);
 		if (status === undefined) return;
-		this.deliver({ method: "user", params: { new: { user_id: userId, status } } }, [roomId], (state) => state.userId !== userId);
+		this.deliver({ method: "user", params: { new: { user_id: userId, ...shownFields(status, snapshot.seen.get(userId)) } } }, [roomId], (state) => state.userId !== userId);
 	}
 
 	/**
 	 * Adds each listed user's `status` (§4.5) to a snapshot's current user
 	 * objects, which §4.5 has every listing carry, `offline` and `""`
 	 * included: as presenceSnapshot shows them, else from the status they
-	 * chose (`choices`, read with the listing) as a user without a
-	 * connection, else `offline`. A `lister` is made owed the changes still
+	 * chose (`stored`, read with the listing) as a user without a
+	 * connection, else `offline`. Each shown `offline` carries `seen`
+	 * (§4.5.2) where one is recorded: a connected user's from their
+	 * connections, else the one read with the listing. A `lister` is made owed the changes still
 	 * due for the users without a connection it was shown, so what it was
 	 * shown does not go stale. With presence off (capability `status` is
 	 * still advertised) every user is `""`, none, as /toggle presence off
@@ -3779,18 +3843,18 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * one's status, and replaces any a client kept. Without push there is
 	 * no capability `status`, and no `status`.
 	 */
-	private withStatus<T extends PublicUser>(users: T[], choices: ReadonlyMap<string, StatusChoice>, lister?: WebSocketConnection): T[] {
+	private withStatus<T extends PublicUser>(users: T[], stored: ReadonlyMap<string, StoredStatus>, lister?: WebSocketConnection): T[] {
 		if (!this.config.push) return users;
 		if (!this.presenceMode()) return users.map((user) => ({ ...user, status: "" as Status }));
 		const now = nowMs();
-		const { shown, owed } = this.presenceSnapshot(now);
+		const { shown, owed, seen } = this.presenceSnapshot(now);
 		const owing: OwedStatus[] = [];
 		const out = users.map((user) => {
 			const pending = owed.get(user.user_id);
 			if (pending) owing.push(pending);
-			const choice = choices.get(user.user_id);
-			const status = shown.get(user.user_id) ?? pending?.[1] ?? shownStatus({ choice: choice ?? "online", connected: false, attended: false });
-			return { ...user, status };
+			const kept = stored.get(user.user_id);
+			const status = shown.get(user.user_id) ?? pending?.[1] ?? shownStatus({ choice: kept?.choice ?? "online", connected: false, attended: false });
+			return { ...user, ...shownFields(status, seen.get(user.user_id) ?? kept?.seen) };
 		});
 		if (lister && owing.length) {
 			const state = connectionAttachment(lister);
@@ -5126,12 +5190,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const stored = this.store.roomMembers(roomIds, this.config.limits.roomListMembers, nowMs(), counts, mode);
 		const connected = this.connectedMembers();
 		const members = new Map<string, PublicUser[]>();
-		const choices = new Map<string, StatusChoice>();
+		const statuses = new Map<string, StoredStatus>();
 		for (const roomId of new Set(roomIds)) {
 			const users = new Map<string, PublicUser>();
-			for (const { choice, ...member } of stored.get(roomId) ?? []) {
+			for (const { choice, seen, ...member } of stored.get(roomId) ?? []) {
 				users.set(member.user_id, member);
-				if (choice !== undefined) choices.set(member.user_id, choice);
+				if (choice !== undefined) statuses.set(member.user_id, { choice, ...(seen !== undefined ? { seen } : {}) });
 			}
 			for (const member of connected.get(roomId) ?? []) if (!users.has(member.user_id)) users.set(member.user_id, member);
 			members.set(roomId, sortedUsers(users.values()));
@@ -5147,8 +5211,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Each listed user once, with the status every room shows them with.
 		const unique = new Map<string, PublicUser>();
 		for (const list of members.values()) for (const user of list) unique.set(user.user_id, user);
-		const statuses = new Map(this.withStatus([...unique.values()], choices, lister).map((user) => [user.user_id, user]));
-		for (const [roomId, list] of members) members.set(roomId, list.map((user) => statuses.get(user.user_id) ?? user));
+		const shown = new Map(this.withStatus([...unique.values()], statuses, lister).map((user) => [user.user_id, user]));
+		for (const [roomId, list] of members) members.set(roomId, list.map((user) => shown.get(user.user_id) ?? user));
 		return members;
 	}
 
@@ -5159,16 +5223,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private memberOf(roomId: string, userId: string, lister?: WebSocketConnection): PublicUser | undefined {
 		const stored = this.store.roomMember(roomId, userId, nowMs(), this.presenceMode());
-		const choices = new Map<string, StatusChoice>();
+		const statuses = new Map<string, StoredStatus>();
 		let member: PublicUser | undefined;
 		if (stored) {
-			const { choice, ...user } = stored;
+			const { choice, seen, ...user } = stored;
 			member = user;
-			if (choice !== undefined) choices.set(user.user_id, choice);
+			if (choice !== undefined) statuses.set(user.user_id, { choice, ...(seen !== undefined ? { seen } : {}) });
 		} else {
 			member = this.connectedMembers().get(roomId)?.find((user) => user.user_id === userId);
 		}
-		return member && this.withStatus([member], choices, lister)[0];
+		return member && this.withStatus([member], statuses, lister)[0];
 	}
 
 	/**
@@ -5268,9 +5332,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// A new `user_id` (/rename) is a user others have not seen: it carries
 		// the status they were shown under the old one. A profile change leaves
 		// `status` out, so clients keep theirs (§4.5).
-		const renamed = old && old.user_id !== identity.user_id && this.presenceMode()
-			? this.presenceSnapshot(nowMs()).shown.get(identity.user_id) : undefined;
-		const others = renamed !== undefined ? { ...identity, status: renamed } : identity;
+		const snapshot = old && old.user_id !== identity.user_id && this.presenceMode() ? this.presenceSnapshot(nowMs()) : undefined;
+		const renamed = snapshot?.shown.get(identity.user_id);
+		const others = renamed !== undefined ? { ...identity, ...shownFields(renamed, snapshot!.seen.get(identity.user_id)) } : identity;
 		for (const peer of this.ctx.getWebSockets()) {
 			const socket = peer as WebSocketConnection;
 			if (socket === origin) continue;

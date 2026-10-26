@@ -385,13 +385,13 @@ For direct Wrangler production commands, always pass
 5. Review `wrangler.production.toml`: fixed DO binding, `new_sqlite_classes` migration,
    no paid-service bindings. Apply the initial migration once using the normal
    Wrangler deployment workflow. Do not rename or recreate the production
-   object to work around a quota or schema issue. The current schema is 8
-   (with push subscriptions, user status, and users' `ext`); a
-   schema 7 object, which the deployed demo holds, is upgraded in place on its
-   first wake, keeping everything: it gains the empty push and status tables
-   (`push_subscriptions`, `push_wakes`, `user_status`, `room_mutes`) and the
-   identities' empty `ext_json` column (see [SPEC section 8](../SPEC.md#schema-versions)).
-   The upgrade is one-way: redeploying schema 7 code afterwards resets the
+   object to work around a quota or schema issue. The current schema is 10
+   (with push subscriptions, user status, users' `ext`, and when each user
+   was last seen going offline); a schema 9 object, which the deployed demo
+   holds, is upgraded in place on its first wake, keeping everything: the
+   identities gain an empty `seen_ms` column. Schemas 8 and 7 are upgraded
+   on the way (see [SPEC section 8](../SPEC.md#schema-versions)).
+   The upgrade is one-way: redeploying schema 9 code afterwards resets the
    object like any schema change, so fix forward instead of rolling back. It
    also fails closed: if it cannot finish, nothing changes, and the object
    throws on every wake until a fixed deploy upgrades it.

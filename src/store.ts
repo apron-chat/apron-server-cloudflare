@@ -45,21 +45,21 @@ import { createHash } from "node:crypto";
 export const ROOM_ID = "general";
 const ROOM_TITLE = "General";
 /**
- * Schema 9 stores the server-wide log (room records, flat message
+ * Schema 10 stores the server-wide log (room records, flat message
  * snapshots, reaction sets, and registered users' memberships), a
  * `memberships` table of registered users' joined rooms, indexed both ways,
  * with each room's count of them, the `uploads` held in R2 with each
- * identity's avatar, each identity's roles and `ext` in its row, and the
- * `push_subscriptions`, `push_wakes`, `user_status` and `room_mutes` tables,
- * with each limiter row's token bucket (limiter.ts) and each day's count of
- * history pages. Schema 8, which the deployed object holds, is upgraded in
- * place (see upgradeFromSchema8()), as is schema 7 on the way to it (see
- * upgradeFromSchema7()); stored data from any other schema version is not
- * migrated: the object is wiped and started fresh (see resetStorage()).
- * Additive rows need no new version: an absent `_meta` row reads as its
- * initial value.
+ * identity's avatar, each identity's roles, `ext` and `seen` in its row, and
+ * the `push_subscriptions`, `push_wakes`, `user_status` and `room_mutes`
+ * tables, with each limiter row's token bucket (limiter.ts) and each day's
+ * count of history pages. Schema 9, which the deployed object holds, is
+ * upgraded in place (see upgradeFromSchema9()), as are schemas 8 and 7 on
+ * the way to it (see upgradeFromSchema8() and upgradeFromSchema7()); stored
+ * data from any other schema version is not migrated: the object is wiped
+ * and started fresh (see resetStorage()). Additive rows need no new
+ * version: an absent `_meta` row reads as its initial value.
  */
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 /** The oldest schema upgraded in place rather than reset; each one from it up to SCHEMA_VERSION is. */
 export const UPGRADABLE_SCHEMA_VERSION = 7;
 /**
@@ -817,6 +817,8 @@ const UPLOAD_WRITES = 16;
 const MAX_PUSH_SUBSCRIPTIONS_PER_USER = MAX_PUSHES_PER_MESSAGE;
 /** The tables a member listing reads (Store.roomMembers); a write to one invalidates reused listings. */
 const MEMBER_TABLES = /\b(identities|memberships|user_status)\b/;
+/** Store.setSeen's write, which updates reused listings in place rather than invalidating them. */
+const SEEN_UPDATE = "UPDATE identities SET seen_ms = ? WHERE user_id = ?";
 /**
  * Most `push_wakes` rows one user can hold: one per room they were woken
  * for, and wakes come only for messages in existing rooms (at most the
@@ -868,16 +870,21 @@ interface RoomMute {
 /**
  * A user's stored `status` state (protocol §4.5), read once at sign-in:
  * the `status` they chose with `me`, until when their unscoped mute lasts
- * (absent when not muted), and their room mutes in effect, in `room_id`
- * order.
+ * (absent when not muted), their room mutes in effect, in `room_id` order,
+ * and when others last saw them go `offline` (`seen`, §4.5.2; absent when
+ * none is recorded).
  */
 export interface StatusInputRecord {
   choice: StatusChoice;
   muteUntil?: number;
   roomMutes: RoomMute[];
+  seen?: number;
 }
 
-/** A registered room member as listings carry it, with the `status` they chose when asked for. */
+/**
+ * A registered room member as listings carry it, with the `status` they
+ * chose and their `seen` (absent when none is recorded) when asked for.
+ */
 interface RoomMember {
   user_id: string;
   name: string;
@@ -885,9 +892,10 @@ interface RoomMember {
   roles: string[];
   ext?: Record<string, unknown>;
   choice?: StatusChoice;
+  seen?: number;
 }
 
-/** One `roomMembers` row, with the chosen status when asked for. */
+/** One `roomMembers` row, with the chosen status and `seen` when asked for. */
 interface RawMemberRow {
   user_id: string;
   name: string | null;
@@ -896,6 +904,19 @@ interface RawMemberRow {
   roles_json: string | null;
   ext_json: string | null;
   status?: string | null;
+  seen_ms?: number | null;
+}
+
+/** A member row's chosen status and `seen`, as RoomMember carries them. */
+function statusColumns(row: RawMemberRow): Pick<RoomMember, "choice" | "seen"> {
+  const seen = seenColumn(row.seen_ms);
+  return { choice: choiceColumn(row.status), ...(seen !== undefined ? { seen } : {}) };
+}
+
+/** A stored `seen_ms` as epoch milliseconds, or undefined for none (0). */
+function seenColumn(value: unknown): number | undefined {
+  const seen = integerColumn(value);
+  return seen > 0 ? seen : undefined;
 }
 
 /** A stored `status` choice: `online` when there is no row, and `""` for a value this server no longer knows. */
@@ -1277,7 +1298,10 @@ function ensureText(value: unknown, field: string, maxBytes: number): string {
  * §4.5): the `status` they chose with `me` and until when their unscoped
  * mute lasts, one row while either differs from the default (`online`, not
  * muted). `room_mutes` keeps their room mutes, keyed by user and room, at
- * most MAX_ROOM_MUTES_PER_USER a user.
+ * most MAX_ROOM_MUTES_PER_USER a user. Schema 10 adds each identity's
+ * `seen_ms` (protocol §4.5.2 `seen`, 0 for none): when the status others see
+ * of the user last became `offline`, in the row a member listing reads
+ * anyway.
  */
 const SCHEMA_DDL = `
   CREATE TABLE IF NOT EXISTS _meta (
@@ -1338,7 +1362,8 @@ const SCHEMA_DDL = `
     avatar_url TEXT NOT NULL DEFAULT '',
     avatar_expires_ms INTEGER NOT NULL DEFAULT 0,
     roles_json TEXT NOT NULL DEFAULT '[]',
-    ext_json TEXT NOT NULL DEFAULT ''
+    ext_json TEXT NOT NULL DEFAULT '',
+    seen_ms INTEGER NOT NULL DEFAULT 0
   );
   CREATE TABLE IF NOT EXISTS uploads (
     upload_key TEXT PRIMARY KEY,
@@ -1528,6 +1553,10 @@ export class Store {
     }
     if (version === 8) {
       this.upgradeFromSchema8();
+      version = 9;
+    }
+    if (version === 9) {
+      this.upgradeFromSchema9();
       version = SCHEMA_VERSION;
     }
     if (version !== 0 && version !== SCHEMA_VERSION) throw new Error(`storage schema ${version} requires resetStorage()`);
@@ -1660,6 +1689,22 @@ export class Store {
       this.finishUpgrade(9, start, day);
     });
     console.warn(JSON.stringify({ event: "storage_schema_upgraded", from: 8, to: 9 }));
+  }
+
+  /**
+   * Upgrades a schema 9 object to schema 10 in place, once, in one
+   * transaction: each identity gains `seen_ms`, 0 (none recorded), which
+   * rewrites no row. Charged like upgradeFromSchema7 (finishUpgrade).
+   */
+  private upgradeFromSchema9(): void {
+    const start = { reads: this.observed.reads, writes: this.observed.writes };
+    const effective = Number(this.metaValue(META_EFFECTIVE_NOW));
+    const day = dayFor(Math.max(Number.isSafeInteger(effective) ? effective : 0, this.clock.now()));
+    this.transaction(() => {
+      this.rawScript("ALTER TABLE identities ADD COLUMN seen_ms INTEGER NOT NULL DEFAULT 0");
+      this.finishUpgrade(10, start, day);
+    });
+    console.warn(JSON.stringify({ event: "storage_schema_upgraded", from: 9, to: 10 }));
   }
 
   /**
@@ -1867,8 +1912,9 @@ export class Store {
     } else {
       this.observed.reads += Math.max(0, cursor.rowsRead ?? 0);
       this.observed.writes += Math.max(1, cursor.rowsWritten ?? 1);
-      // Reused member listings are stale once anything they read is written.
-      if (MEMBER_TABLES.test(lower)) this.memberGeneration += 1;
+      // Reused member listings are stale once anything they read is written,
+      // but for `seen`, which setSeen updates in them.
+      if (MEMBER_TABLES.test(lower) && query !== SEEN_UPDATE) this.memberGeneration += 1;
     }
     return cursor;
   }
@@ -2631,7 +2677,8 @@ export class Store {
    * `user_id` order: at most `limit` per room, read from the room's
    * primary-key range with one identity lookup each. With `withStatus`, each
    * also carries the `status` it chose (`choice`), from its `user_status`
-   * row, joined by primary key: a member without one costs nothing more.
+   * row, joined by primary key: a member without one costs nothing more;
+   * and its `seen`, from the identity row read anyway.
    * Guests' memberships are not stored; the caller adds connected ones.
    *
    * With `memberCacheMs`, a room's rows are kept in memory that long and
@@ -2668,7 +2715,7 @@ export class Store {
         for (const roomId of missing) {
           const rows = this.rawRows<RawMemberRow>(
             withStatus
-              ? `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json, s.status
+              ? `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json, i.seen_ms, s.status
                  FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id LEFT JOIN user_status s ON s.user_id = m.user_id
                  WHERE m.room_id = ? ORDER BY m.user_id LIMIT ?`
               : `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id
@@ -2697,7 +2744,7 @@ export class Store {
           return {
             user_id: row.user_id, name: row.name ?? "", ...(avatar ? { avatar } : {}), roles: parseRoles(row.roles_json),
             ...(ext ? { ext } : {}),
-            ...(withStatus ? { choice: choiceColumn(row.status) } : {}),
+            ...(withStatus ? statusColumns(row) : {}),
           };
         }));
       }
@@ -2713,7 +2760,7 @@ export class Store {
     return this.reserved({ reads: 8 + (withStatus ? 3 : 2) }, false, now, () => {
       const row = this.rawRows<RawMemberRow>(
         withStatus
-          ? `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json, s.status
+          ? `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json, i.seen_ms, s.status
              FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id LEFT JOIN user_status s ON s.user_id = m.user_id
              WHERE m.room_id = ? AND m.user_id = ? LIMIT 1`
           : `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id
@@ -2726,7 +2773,7 @@ export class Store {
       return {
         user_id: row.user_id, name: row.name ?? "", ...(avatar ? { avatar } : {}), roles: parseRoles(row.roles_json),
         ...(ext ? { ext } : {}),
-        ...(withStatus ? { choice: choiceColumn(row.status) } : {}),
+        ...(withStatus ? statusColumns(row) : {}),
       };
     });
   }
@@ -4628,9 +4675,10 @@ export class Store {
   /**
    * A registered user's stored `status` state (protocol §4.5), read once at
    * sign-in: the `status` they chose, their unscoped mute's end (absent when
-   * not muted, MUTE_FOREVER for `true`) and their room mutes in effect. One
-   * primary-key read and one range of the user's room mutes, at most
-   * MAX_ROOM_MUTES_PER_USER rows; a missing row or range costs nothing.
+   * not muted, MUTE_FOREVER for `true`), their room mutes in effect, and
+   * their `seen` (absent when none is recorded). Two primary-key reads and
+   * one range of the user's room mutes, at most MAX_ROOM_MUTES_PER_USER
+   * rows; a missing row or range costs nothing.
    */
   statusInputs(userId: string, now = this.clock.now()): StatusInputRecord {
     this.ensureReady();
@@ -4638,11 +4686,33 @@ export class Store {
       const effective = this.effectiveNow(now);
       const row = this.userStatusRow(userId);
       const until = row?.mute_until_ms ?? 0;
+      const seen = seenColumn(this.rawRows<{ seen_ms: number }>("SELECT seen_ms FROM identities WHERE user_id = ? LIMIT 1", userId)[0]?.seen_ms);
       return {
         choice: row?.status ?? "online",
         ...(until > effective ? { muteUntil: until } : {}),
         roomMutes: this.roomMuteRows(userId).filter((mute) => mute.untilMs > effective),
+        ...(seen !== undefined ? { seen } : {}),
       };
+    });
+  }
+
+  /**
+   * Records a registered user's `seen` (protocol §4.5.2): when the status
+   * others see of them became `offline`, epoch milliseconds. One update of
+   * their identity row, which a member listing reads anyway; listings kept
+   * for reuse are updated in place rather than read again. Nothing for an
+   * unknown user.
+   */
+  setSeen(input: { userId: string; seen: number; now?: number }): void {
+    if (!Number.isSafeInteger(input.seen) || input.seen <= 0) throw new StoreError("invalid_params", "invalid seen");
+    this.ensureReady();
+    const now = input.now ?? this.clock.now();
+    this.reserved({ reads: 8, writes: 8 }, false, now, () => {
+      this.effectiveNow(now);
+      this.rawExec(SEEN_UPDATE, input.seen, input.userId);
+      for (const entry of this.memberCache.values()) {
+        for (const row of entry.rows) if (row.user_id === input.userId && row.seen_ms !== undefined) row.seen_ms = input.seen;
+      }
     });
   }
 

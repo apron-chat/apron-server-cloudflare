@@ -20,7 +20,7 @@ type Runtime = {
 	issueSession(userId: string, origin: string, now: number): Promise<string>;
 	flushPresence(now?: number): void;
 };
-type Attachment = { userId?: string; closing?: boolean; pres?: { s: string; a: number; h?: number }; owed?: Array<[string, string, string, number]>; choice?: string; muteUntil?: number; roomMuteNext?: number };
+type Attachment = { userId?: string; closing?: boolean; pres?: { s: string; a: number; h?: number }; owed?: Array<[string, string, string, number, number?]>; choice?: string; muteUntil?: number; roomMuteNext?: number; seen?: number };
 
 // Status changes wait for time to pass (coalescing, the offline grace), so
 // these tests move the clock the object reads: Date.now runs `offset` ahead,
@@ -340,8 +340,10 @@ describe('the status a user chooses (§4.5)', () => {
 			expect(told(seen, shyId)).toEqual(['online', 'offline']);
 			const list = await request(observer, 'list', 'room_list', { filter: 'joined', members: true });
 			expectPrivate([...seen, list], shyId);
-			// Connected, invisible: listed as stored members are, offline.
-			expect(list.result.users.find((user: { user_id: string }) => user.user_id === shyId)).toEqual({ user_id: shyId, name: `Name of ${shyId}`, roles: [], status: 'offline' });
+			// Connected, invisible: listed as stored members are, offline, with
+			// the seen its change to offline carried.
+			const hidden = seen.find((frame) => frame.params?.new?.user_id === shyId && frame.params.new.status === 'offline')!;
+			expect(list.result.users.find((user: { user_id: string }) => user.user_id === shyId)).toEqual({ user_id: shyId, name: `Name of ${shyId}`, roles: [], status: 'offline', seen: hidden.params.new.seen });
 			const members = await runInDurableObject(stub(), (instance) => (instance as unknown as { connectedMembers(): Map<string, Array<{ user_id: string }>> }).connectedMembers());
 			expect((members.get('general') ?? []).map((user) => user.user_id)).not.toContain(shyId);
 			// A new connection of someone else's is not told of them after auth, as
@@ -551,7 +553,9 @@ describe('user status timing', () => {
 			await advance(1_000);
 			const held = await attachments();
 			expect(held.find((state) => state.userId === stayerId && !state.closing)?.pres).toMatchObject({ s: 'online' });
-			expect(held.find((state) => state.userId === watcherId)?.owed).toEqual([[leaverId, 'online', 'offline', expect.any(Number)]]);
+			// The change to offline carries seen, when the leaver left.
+			const owed = held.find((state) => state.userId === watcherId)?.owed;
+			expect(owed).toEqual([[leaverId, 'online', 'offline', expect.any(Number), expect.any(Number)]]);
 			// The object is evicted (a pending timer keeps it from hibernating, but
 			// not from being evicted): its timer and memory are gone, the
 			// attachments stay.
@@ -560,6 +564,7 @@ describe('user status timing', () => {
 			// The next event sweeps the attachments and announces what is due.
 			const frames = await drain(watcher);
 			expect(told(frames, leaverId)).toEqual(['offline']);
+			expect(frames.find((frame) => frame.params?.new?.user_id === leaverId)!.params.new).toEqual({ user_id: leaverId, status: 'offline', seen: String(owed![0][4]) });
 			expect(told(frames, stayerId)).toEqual(['idle']);
 			const after = await attachments();
 			expect(after.find((state) => state.userId === watcherId)?.owed).toBeUndefined();
@@ -677,11 +682,12 @@ describe('user status timing', () => {
 			store.setStatus({ userId, choice: 'invisible', now });
 			store.setMute({ userId, untilMs: now + 60_000, now });
 			store.setRoomMute({ userId, roomId: 'general', untilMs: MUTE_FOREVER, now });
+			store.setSeen({ userId, seen: now - 1_000, now });
 			store.renameIdentity({ from: userId, to: `${userId}x`, now });
 			expect(store.statusInputs(userId, now)).toEqual({ choice: 'online', roomMutes: [] });
-			expect(store.statusInputs(`${userId}x`, now)).toEqual({ choice: 'invisible', muteUntil: now + 60_000, roomMutes: [{ roomId: 'general', untilMs: MUTE_FOREVER }] });
+			expect(store.statusInputs(`${userId}x`, now)).toEqual({ choice: 'invisible', muteUntil: now + 60_000, roomMutes: [{ roomId: 'general', untilMs: MUTE_FOREVER }], seen: now - 1_000 });
 			store.setMute({ userId: `${userId}x`, untilMs: null, now });
-			expect(store.statusInputs(`${userId}x`, now)).toEqual({ choice: 'invisible', roomMutes: [{ roomId: 'general', untilMs: MUTE_FOREVER }] });
+			expect(store.statusInputs(`${userId}x`, now)).toEqual({ choice: 'invisible', roomMutes: [{ roomId: 'general', untilMs: MUTE_FOREVER }], seen: now - 1_000 });
 			store.purgeUsers({ userIds: [`${userId}x`], now });
 			expect(store.statusInputs(`${userId}x`, now)).toEqual({ choice: 'online', roomMutes: [] });
 			expect(store.accountingStatus().unsafe).toBe(false);
@@ -1292,5 +1298,177 @@ describe('a sign-in that logs joins', () => {
 			expect(joins(seen, freshId)).toHaveLength(1);
 			expect(joins(seen, upgradedId)).toHaveLength(1);
 		} finally { watcher.peer.close(); fresh.close(); visitor.close(); }
+	});
+});
+
+describe('seen: when the shown status last became offline (§4.5.2)', () => {
+	beforeEach(forgetAnnouncements);
+
+	/** The `user` `new` objects `frames` carry for `userId`'s status, in order. */
+	const shown = (frames: Frame[], userId: string): Array<Record<string, unknown>> =>
+		frames.filter((frame) => frame.method === 'user' && frame.params?.new?.user_id === userId && frame.params.new.status !== undefined).map((frame) => frame.params.new);
+
+	/** `userId`'s stored seen_ms, 0 for none. */
+	const stored = (userId: string): Promise<number> => runInDurableObject(stub(), (_instance, state) =>
+		Number(state.storage.sql.exec<{ seen_ms: number }>('SELECT seen_ms FROM identities WHERE user_id = ?', userId).toArray()[0]?.seen_ms ?? 0));
+
+	/** No `you` among `frames` (and no auth or me result) carries seen. */
+	const expectNoOwnSeen = (frames: Frame[]) => {
+		for (const frame of frames) {
+			expect(frame.params?.you ?? {}).not.toHaveProperty('seen');
+			expect(frame.result?.you ?? {}).not.toHaveProperty('seen');
+		}
+	};
+
+	it('sends seen with a disconnect, keeps it in later listings, and leaves it out while the shown status is not offline or in you', async () => {
+		const watcherId = unique('watcher');
+		const leaverId = unique('leaver');
+		const watcher = await signedIn(watcherId);
+		let leaver = await signIn(leaverId);
+		try {
+			expect(shown(await drain(watcher), leaverId)).toEqual([{ user_id: leaverId, status: 'online' }]);
+			expectNoOwnSeen([leaver.auth, ...leaver.afterAuth]);
+			// Online: no seen, though none is recorded anyway.
+			expect(await listed(watcher, leaverId)).not.toHaveProperty('seen');
+			const left = Date.now();
+			await hangUp(leaver.peer, leaverId);
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			const [offline] = shown(await drain(watcher), leaverId);
+			// A log_id-format timestamp: when the last connection closed.
+			expect(offline).toEqual({ user_id: leaverId, status: 'offline', seen: expect.stringMatching(/^[1-9]\d*$/) });
+			const seen = Number(offline.seen);
+			expect(seen).toBeGreaterThanOrEqual(left);
+			expect(seen).toBeLessThanOrEqual(Date.now());
+			expect(await stored(leaverId)).toBe(seen);
+			// A later listing carries the same seen with the shown offline.
+			expect(await listed(watcher, leaverId)).toMatchObject({ status: 'offline', seen: offline.seen });
+			// Back online: the kept seen is not shown, and never in their own you.
+			leaver = await signIn(leaverId, { existing: true });
+			expectNoOwnSeen([leaver.auth, ...leaver.afterAuth, await request(leaver.peer, 'me', 'me', {}), await choose(leaver.peer, 'dnd')]);
+			expect(shown(await drain(watcher), leaverId)).toEqual([{ user_id: leaverId, status: 'dnd' }]);
+			const back = await listing(leaver.peer);
+			expect(back.get(leaverId)).toEqual(expect.objectContaining({ status: 'dnd' }));
+			expect(back.get(leaverId)).not.toHaveProperty('seen');
+			expect(back.get(watcherId)).not.toHaveProperty('seen');
+			// A dnd user who disconnects is shown offline with a new seen.
+			offset += 5_000;
+			await hangUp(leaver.peer, leaverId);
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			const [again] = shown(await drain(watcher), leaverId);
+			expect(again).toEqual({ user_id: leaverId, status: 'offline', seen: expect.stringMatching(/^\d+$/) });
+			expect(Number(again.seen)).toBeGreaterThan(seen);
+			expect(await listed(watcher, leaverId)).toMatchObject({ status: 'offline', seen: again.seen });
+			// A reconnect within the grace shows nothing, and leaves the shown seen as it was.
+			const quick = await signIn(leaverId, { existing: true });
+			await hangUp(quick.peer, leaverId);
+			const brief = await signIn(leaverId, { existing: true });
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			expect(shown(await drain(watcher), leaverId)).toEqual([{ user_id: leaverId, status: 'dnd' }]);
+			brief.peer.close();
+		} finally { watcher.close(); leaver.peer.close(); }
+	});
+
+	it('shows a chosen invisible offline with seen, and its connections coming and going never move it', async () => {
+		const watcherId = unique('watcher');
+		const shyId = unique('shy');
+		const watcher = await signedIn(watcherId);
+		let shy = await signedIn(shyId);
+		try {
+			await drain(watcher);
+			const before = Date.now();
+			const chosen = await choose(shy, 'invisible');
+			expect(chosen.result.you).toEqual(expect.objectContaining({ user_id: shyId, status: 'invisible' }));
+			expectNoOwnSeen([chosen]);
+			const [hidden] = shown(await drain(watcher), shyId);
+			expect(hidden).toEqual({ user_id: shyId, status: 'offline', seen: expect.stringMatching(/^\d+$/) });
+			expect(Number(hidden.seen)).toBeGreaterThanOrEqual(before);
+			expect(await stored(shyId)).toBe(Number(hidden.seen));
+			// Connected and invisible: listed offline with that seen, from the connections.
+			expect(await listed(watcher, shyId)).toMatchObject({ status: 'offline', seen: hidden.seen });
+			// Its own listing shows others' view of it, as any listing does; its you does not.
+			expect((await listing(shy)).get(shyId)).toMatchObject({ status: 'offline', seen: hidden.seen });
+			// A second connection comes and goes, then the first: nothing is sent, seen stays.
+			const second = await signIn(shyId, { existing: true });
+			expectNoOwnSeen([second.auth, ...second.afterAuth]);
+			await hangUp(second.peer, shyId);
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			await hangUp(shy, shyId);
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			expect(shown(await drain(watcher), shyId)).toEqual([]);
+			expect(await stored(shyId)).toBe(Number(hidden.seen));
+			expect(await listed(watcher, shyId)).toMatchObject({ status: 'offline', seen: hidden.seen });
+			// Signing in again, still invisible: nothing, and the listing's seen is unchanged.
+			shy = await signedIn(shyId, { existing: true });
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			expect(shown(await drain(watcher), shyId)).toEqual([]);
+			expect(await listed(watcher, shyId)).toMatchObject({ status: 'offline', seen: hidden.seen });
+			// Visible again, then invisible again: a new change to offline, a new seen.
+			await choose(shy, 'online');
+			offset += 1_000;
+			await choose(shy, 'invisible');
+			const changes = shown(await drain(watcher), shyId);
+			expect(changes).toEqual([{ user_id: shyId, status: 'online' }, { user_id: shyId, status: 'offline', seen: expect.stringMatching(/^\d+$/) }]);
+			expect(Number(changes[1].seen)).toBeGreaterThan(Number(hidden.seen));
+		} finally { watcher.close(); shy.close(); }
+	});
+
+	it('gives "" no seen, and a guest a seen kept only on its connection', async () => {
+		const watcherId = unique('watcher');
+		const noneId = unique('none');
+		const watcher = await signedIn(watcherId);
+		const none = await signedIn(noneId);
+		const visitor = await guest();
+		const hiding = await guest();
+		try {
+			await drain(watcher);
+			await choose(none, '');
+			expect(shown(await drain(watcher), noneId)).toEqual([{ user_id: noneId, status: '' }]);
+			await hangUp(none, noneId);
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			expect(shown(await drain(watcher), noneId)).toEqual([]);
+			expect(await stored(noneId)).toBe(0);
+			expect(await listed(watcher, noneId)).toEqual(expect.not.objectContaining({ seen: expect.anything() }));
+			// A guest that disconnects is shown offline with seen; guests have no row to keep it.
+			await hangUp(visitor.peer, visitor.userId);
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			expect(shown(await drain(watcher), visitor.userId)).toEqual([{ user_id: visitor.userId, status: 'offline', seen: expect.stringMatching(/^\d+$/) }]);
+			// A guest that chooses invisible too, and its connection keeps that seen.
+			await choose(hiding.peer, 'invisible');
+			const [hidden] = shown(await drain(watcher), hiding.userId);
+			expect(hidden).toEqual({ user_id: hiding.userId, status: 'offline', seen: expect.stringMatching(/^\d+$/) });
+			expect((await attachments()).find((state) => state.userId === hiding.userId && !state.closing)?.seen).toBe(Number(hidden.seen));
+			// It goes without anything sent: it was already shown offline.
+			await hangUp(hiding.peer, hiding.userId);
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			expect(shown(await drain(watcher), hiding.userId)).toEqual([]);
+		} finally { watcher.close(); none.close(); visitor.peer.close(); hiding.peer.close(); }
+	});
+
+	it('keeps seen across eviction, and updates listings kept for reuse in place', async () => {
+		const watcherId = unique('watcher');
+		const leaverId = unique('leaver');
+		const watcher = await signedIn(watcherId);
+		const leaver = await signedIn(leaverId);
+		try {
+			await drain(watcher);
+			await hangUp(leaver, leaverId);
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			const [offline] = shown(await drain(watcher), leaverId);
+			expect(offline.seen).toMatch(/^\d+$/);
+			await evict();
+			expect(await listed(watcher, leaverId)).toMatchObject({ status: 'offline', seen: offline.seen });
+			// A listing kept for reuse is updated by a later seen without reading again.
+			const reuse = await runInDurableObject(stub(), (instance, state) => {
+				const runtime = instance as unknown as Runtime & { membersOf(ids: string[]): Map<string, Array<{ user_id: string; seen?: string }>> };
+				runtime.membersOf(['general']);
+				const later = Number(offline.seen) + 1_000;
+				runtime.store.setSeen({ userId: leaverId, seen: later, now: Date.now() });
+				let members: Map<string, Array<{ user_id: string; seen?: string }>> | undefined;
+				const sql = statements(state, /FROM memberships m/, () => { members = runtime.membersOf(['general']); });
+				return { queries: sql.queries, seen: members!.get('general')!.find((user) => user.user_id === leaverId)?.seen, later };
+			});
+			expect(reuse.queries).toEqual([]);
+			expect(reuse.seen).toBe(String(reuse.later));
+		} finally { watcher.close(); leaver.close(); }
 	});
 });
