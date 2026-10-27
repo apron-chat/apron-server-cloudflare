@@ -46,24 +46,23 @@ import { createHash } from "node:crypto";
 export const ROOM_ID = "general";
 const ROOM_TITLE = "General";
 /**
- * Schema 9 stores the server-wide log (room records, flat message
+ * Schema 10 stores the server-wide log (room records, flat message
  * snapshots, reaction sets, and registered users' memberships), a
  * `memberships` table of registered users' joined rooms, indexed both ways,
  * with each room's count of them, the `uploads` held in R2 with each
  * identity's avatar, each identity's roles, `ext` and `seen` in its row, and
- * the `push_subscriptions`, `push_wakes`, `user_status` and `room_mutes`
- * tables, with each limiter row's token bucket (limiter.ts) and each day's
- * count of history pages. Schemas 8 and 7 are upgraded in place (see
- * upgradeFromSchema8() and upgradeFromSchema7()); stored data from any
- * other schema version is not migrated: the object is wiped and started
- * fresh (see resetStorage()). Additive changes that older code ignores need
- * no new version, so redeploying that code keeps everything: an absent
- * `_meta` row reads as its initial value, and the identities' `seen_ms`
- * column and `push_subscriptions_joined_idx`, which code before them never
- * names, are added where missing on a wake (see ensureSeenColumn() and
- * ensureJoinedWakeIndex()).
+ * the `push_subscriptions`, `push_wakes`, `user_status`, `room_mutes` and
+ * `read_cursors` tables, with each limiter row's token bucket (limiter.ts)
+ * and each day's count of history pages (SCHEMA_DDL). Schemas 9, 8 and 7
+ * are upgraded in place (see upgradeFromSchema9(), upgradeFromSchema8() and
+ * upgradeFromSchema7()); stored data from any other schema version is not
+ * migrated: the object is wiped and started fresh (see resetStorage()). An
+ * absent `_meta` row reads as its initial value, so adding one needs no new
+ * version. A schema 9 object from code before the identities' `seen_ms`
+ * column gains it before its upgrade (ensureSeenColumn()); one from code
+ * before `push_subscriptions_joined_idx` gains that with schema 10.
  */
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 /** The oldest schema upgraded in place rather than reset; each one from it up to SCHEMA_VERSION is. */
 export const UPGRADABLE_SCHEMA_VERSION = 7;
 /**
@@ -879,11 +878,6 @@ const ALL_WAKE = WAKE_SCOPES.mentions | WAKE_SCOPES.replies | WAKE_SCOPES.privat
 export const JOINED_WAKE_ROLES: readonly string[] = ["admin", "mod"];
 /** Registrations that keep `joined`, the partial index's condition (push_subscriptions_joined_idx), spelled once so every query matches it. */
 const JOINED_WAKE_CONDITION = `(wake & ${WAKE_SCOPES.joined}) != 0`;
-/**
- * Store.ensureJoinedWakeIndex's probe: reads no row, and fails to compile
- * where `push_subscriptions_joined_idx` is missing.
- */
-const JOINED_WAKE_INDEX_PROBE = `SELECT user_id FROM push_subscriptions INDEXED BY push_subscriptions_joined_idx WHERE ${JOINED_WAKE_CONDITION} LIMIT 0`;
 
 /** A `user_status` or `room_mutes` row's `mute_until_ms` for a mute that lasts until changed (`mute: true`). */
 export const MUTE_FOREVER = Number.MAX_SAFE_INTEGER;
@@ -1338,6 +1332,34 @@ function ensureText(value: unknown, field: string, maxBytes: number): string {
   return value;
 }
 
+/** The indexes of schema 9's tables that schema 10 rebuilds (upgradeFromSchema9), dropped before the rebuild creates its own. */
+const SCHEMA_9_INDEXES = [
+  "records_log_idx", "records_retention_idx", "message_state_latest_idx", "reaction_state_log_idx",
+  "uploads_owner_idx", "uploads_expiry_idx", "uploads_pending_idx", "uploads_message_idx", "memberships_user_idx",
+  "credentials_user_idx", "push_subscriptions_user_idx", "push_subscriptions_updated_idx", "push_subscriptions_waking_idx",
+  "push_subscriptions_joined_idx", "push_wakes_woken_idx", "accepted_requests_expiry_idx", "principal_limits_updated_idx",
+];
+
+/** Each table schema 10 rebuilds as `WITHOUT ROWID` (upgradeFromSchema9), with the columns its rows keep. */
+const SCHEMA_10_COPIED_COLUMNS: Record<string, readonly string[]> = {
+  _meta: ["key", "value"],
+  rooms: ["room_id", "parent_room_id", "created_log_id", "record_log_id", "latest_log_id", "fields_json", "created_ms", "updated_ms", "member_count"],
+  records: ["room_id", "log_id", "commit_ms", "kind", "record_json"],
+  message_state: ["message_id", "room_id", "latest_log_id", "author_id"],
+  reaction_state: ["message_id", "user_id", "log_id", "from_json", "emojis_json"],
+  identities: ["user_id", "user_handle", "name", "tier", "created_ms", "updated_ms", "avatar_url", "avatar_expires_ms", "roles_json", "ext_json", "seen_ms"],
+  uploads: ["upload_key", "owner_id", "purpose", "message_id", "embed_id", "state", "bytes", "content_type", "write_expires_ms", "expires_ms", "created_ms"],
+  memberships: ["room_id", "user_id"],
+  credentials: ["credential_id", "user_id", "public_key_json", "sign_count", "transports_json", "created_ms", "updated_ms"],
+  push_subscriptions: ["user_id", "url", "p256dh", "auth", "push_id", "wake", "created_ms", "updated_ms"],
+  push_wakes: ["user_id", "room_id", "woken_ms"],
+  user_status: ["user_id", "status", "mute_until_ms"],
+  room_mutes: ["user_id", "room_id", "mute_until_ms"],
+  accepted_requests: ["user_id", "request_id", "digest", "result_json", "transition_json", "expires_ms"],
+  resource_budgets: ["day", "reads_reserved", "writes_reserved", "frames_reserved", "admissions_reserved", "posts_reserved", "registrations_reserved", "history_reserved", "effective_ms", "foreground_reads", "foreground_writes", "maintenance_reads", "maintenance_writes"],
+  principal_limits: ["scope", "principal_key", "level", "level_ms", "day", "posts_day", "registrations_day", "uploads_day", "updated_ms"],
+};
+
 /**
  * Schema 8: the server-wide log with membership records, and each registered
  * identity's joined rooms as `memberships` rows, by room (the primary key, for
@@ -1360,12 +1382,23 @@ function ensureText(value: unknown, field: string, maxBytes: number): string {
  * became `offline`, in the row a member listing reads anyway; it is the
  * last column, added to an older schema 9 object without a new version
  * (ensureSeenColumn()).
+ *
+ * Schema 10 (upgradeFromSchema9): every table keyed by text or by more than
+ * one column is `WITHOUT ROWID`, so its key is the table rather than a
+ * second index each insert writes. `records` is indexed by `log_id` only:
+ * commit times follow log order, so retention walks that index.
+ * `message_state` points at each message's latest record rather than
+ * holding a copy of it. `log_state` is written by retention only; each
+ * commit's head is the newest record, which `logState()` reads and keeps.
+ * `read_cursors` keeps each registered user's `read_message_id` (protocol
+ * §4.6) for each room they joined, keyed by user and room, at most one a
+ * membership (saveReadCursors), deleted with it.
  */
 const SCHEMA_DDL = `
   CREATE TABLE IF NOT EXISTS _meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
-  );
+  ) WITHOUT ROWID;
   CREATE TABLE IF NOT EXISTS log_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     last_log_id INTEGER NOT NULL,
@@ -1382,7 +1415,7 @@ const SCHEMA_DDL = `
     created_ms INTEGER NOT NULL,
     updated_ms INTEGER NOT NULL,
     member_count INTEGER NOT NULL DEFAULT 0
-  );
+  ) WITHOUT ROWID;
   CREATE TABLE IF NOT EXISTS records (
     room_id TEXT NOT NULL,
     log_id INTEGER NOT NULL,
@@ -1390,16 +1423,14 @@ const SCHEMA_DDL = `
     kind TEXT NOT NULL,
     record_json TEXT NOT NULL,
     PRIMARY KEY (room_id, log_id)
-  );
+  ) WITHOUT ROWID;
   CREATE INDEX IF NOT EXISTS records_log_idx ON records (log_id);
-  CREATE INDEX IF NOT EXISTS records_retention_idx ON records (commit_ms, log_id);
   CREATE TABLE IF NOT EXISTS message_state (
     message_id TEXT PRIMARY KEY,
     room_id TEXT NOT NULL,
     latest_log_id INTEGER NOT NULL,
-    snapshot_json TEXT NOT NULL,
     author_id TEXT NOT NULL
-  );
+  ) WITHOUT ROWID;
   CREATE INDEX IF NOT EXISTS message_state_latest_idx ON message_state (latest_log_id);
   CREATE TABLE IF NOT EXISTS reaction_state (
     message_id TEXT NOT NULL,
@@ -1408,7 +1439,7 @@ const SCHEMA_DDL = `
     from_json TEXT NOT NULL,
     emojis_json TEXT NOT NULL,
     PRIMARY KEY (message_id, user_id)
-  );
+  ) WITHOUT ROWID;
   CREATE INDEX IF NOT EXISTS reaction_state_log_idx ON reaction_state (log_id);
   CREATE TABLE IF NOT EXISTS identities (
     user_id TEXT PRIMARY KEY,
@@ -1422,7 +1453,7 @@ const SCHEMA_DDL = `
     roles_json TEXT NOT NULL DEFAULT '[]',
     ext_json TEXT NOT NULL DEFAULT '',
     seen_ms INTEGER NOT NULL DEFAULT 0
-  );
+  ) WITHOUT ROWID;
   CREATE TABLE IF NOT EXISTS uploads (
     upload_key TEXT PRIMARY KEY,
     owner_id TEXT NOT NULL,
@@ -1435,7 +1466,7 @@ const SCHEMA_DDL = `
     write_expires_ms INTEGER NOT NULL,
     expires_ms INTEGER NOT NULL,
     created_ms INTEGER NOT NULL
-  );
+  ) WITHOUT ROWID;
   CREATE INDEX IF NOT EXISTS uploads_owner_idx ON uploads (owner_id);
   CREATE INDEX IF NOT EXISTS uploads_expiry_idx ON uploads (expires_ms);
   CREATE INDEX IF NOT EXISTS uploads_pending_idx ON uploads (state, write_expires_ms);
@@ -1444,8 +1475,14 @@ const SCHEMA_DDL = `
     room_id TEXT NOT NULL,
     user_id TEXT NOT NULL,
     PRIMARY KEY (room_id, user_id)
-  );
+  ) WITHOUT ROWID;
   CREATE INDEX IF NOT EXISTS memberships_user_idx ON memberships (user_id);
+  CREATE TABLE IF NOT EXISTS read_cursors (
+    user_id TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    PRIMARY KEY (user_id, room_id)
+  ) WITHOUT ROWID;
   CREATE TABLE IF NOT EXISTS credentials (
     credential_id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
@@ -1454,7 +1491,7 @@ const SCHEMA_DDL = `
     transports_json TEXT,
     created_ms INTEGER NOT NULL,
     updated_ms INTEGER NOT NULL
-  );
+  ) WITHOUT ROWID;
   CREATE INDEX IF NOT EXISTS credentials_user_idx ON credentials (user_id);
   CREATE TABLE IF NOT EXISTS push_subscriptions (
     user_id TEXT NOT NULL,
@@ -1466,7 +1503,7 @@ const SCHEMA_DDL = `
     created_ms INTEGER NOT NULL,
     updated_ms INTEGER NOT NULL,
     PRIMARY KEY (user_id, url)
-  );
+  ) WITHOUT ROWID;
   CREATE INDEX IF NOT EXISTS push_subscriptions_user_idx ON push_subscriptions (user_id, updated_ms);
   CREATE INDEX IF NOT EXISTS push_subscriptions_updated_idx ON push_subscriptions (updated_ms);
   CREATE INDEX IF NOT EXISTS push_subscriptions_waking_idx ON push_subscriptions (user_id, updated_ms) WHERE wake != 0;
@@ -1476,19 +1513,19 @@ const SCHEMA_DDL = `
     room_id TEXT NOT NULL,
     woken_ms INTEGER NOT NULL,
     PRIMARY KEY (user_id, room_id)
-  );
+  ) WITHOUT ROWID;
   CREATE INDEX IF NOT EXISTS push_wakes_woken_idx ON push_wakes (woken_ms);
   CREATE TABLE IF NOT EXISTS user_status (
     user_id TEXT PRIMARY KEY,
     status TEXT NOT NULL DEFAULT 'online',
     mute_until_ms INTEGER
-  );
+  ) WITHOUT ROWID;
   CREATE TABLE IF NOT EXISTS room_mutes (
     user_id TEXT NOT NULL,
     room_id TEXT NOT NULL,
     mute_until_ms INTEGER NOT NULL,
     PRIMARY KEY (user_id, room_id)
-  );
+  ) WITHOUT ROWID;
   CREATE TABLE IF NOT EXISTS accepted_requests (
     user_id TEXT NOT NULL,
     request_id TEXT NOT NULL,
@@ -1497,7 +1534,7 @@ const SCHEMA_DDL = `
     transition_json TEXT,
     expires_ms INTEGER NOT NULL,
     PRIMARY KEY (user_id, request_id)
-  );
+  ) WITHOUT ROWID;
   CREATE INDEX IF NOT EXISTS accepted_requests_expiry_idx
     ON accepted_requests (expires_ms);
   CREATE TABLE IF NOT EXISTS resource_budgets (
@@ -1514,7 +1551,7 @@ const SCHEMA_DDL = `
     foreground_writes INTEGER NOT NULL DEFAULT 0,
     maintenance_reads INTEGER NOT NULL DEFAULT 0,
     maintenance_writes INTEGER NOT NULL DEFAULT 0
-  );
+  ) WITHOUT ROWID;
   CREATE TABLE IF NOT EXISTS principal_limits (
     scope TEXT NOT NULL,
     principal_key TEXT NOT NULL,
@@ -1526,7 +1563,7 @@ const SCHEMA_DDL = `
     uploads_day INTEGER NOT NULL DEFAULT 0,
     updated_ms INTEGER NOT NULL,
     PRIMARY KEY (scope, principal_key)
-  );
+  ) WITHOUT ROWID;
   CREATE INDEX IF NOT EXISTS principal_limits_updated_idx
     ON principal_limits (updated_ms);
   CREATE TABLE IF NOT EXISTS maintenance (
@@ -1554,6 +1591,13 @@ export class Store {
     reservedWrites: 0,
   };
   private lastEffectiveMs = 0;
+  /**
+   * The log's state (logState), kept here rather than written on every
+   * commit: the last log_id and commit time are those of the newest record,
+   * read once a wake, and are written with the history floor when cleanup
+   * moves it, which keeps them where every record they covered is gone.
+   */
+  private logCache: RawLogState | null = null;
   /** Principals' limiter rows, written every few charges (limiter-cache.ts). */
   private readonly limiters = new LimiterCache({ write: (row, now) => this.writeLimitRow(row, now, true) });
   /** The daily budget rows and today's cached copy (budget-ledger.ts), over this store's metered SQL. */
@@ -1612,12 +1656,15 @@ export class Store {
     }
     if (version === 8) {
       this.upgradeFromSchema8();
+      version = 9;
+    }
+    if (version === 9) {
+      this.ensureSeenColumn();
+      this.upgradeFromSchema9();
       version = SCHEMA_VERSION;
     }
     if (version !== 0 && version !== SCHEMA_VERSION) throw new Error(`storage schema ${version} requires resetStorage()`);
     if (version === SCHEMA_VERSION) {
-      this.ensureSeenColumn();
-      this.ensureJoinedWakeIndex();
       this.lastEffectiveMs = Math.max(this.lastEffectiveMs, this.storedEffectiveMs());
       const unsafeMarker = this.metaValue(META_ACCOUNTING_UNSAFE).trim().toLowerCase();
       if (unsafeMarker === "1" || unsafeMarker === "true") {
@@ -1749,6 +1796,44 @@ export class Store {
   }
 
   /**
+   * Upgrades a schema 9 object to schema 10 in place, once, in one
+   * transaction, rebuilding every table keyed by text, or by more than one
+   * column, as a `WITHOUT ROWID` table: SQLite otherwise keeps such a key as
+   * a separate index, so each insert wrote one more row. `records` loses its
+   * index by commit time, which repeated its index by `log_id` (commit times
+   * are nondecreasing in log order), and `message_state` its copy of each
+   * message's latest snapshot, read from `records` by its latest `log_id`
+   * instead. `read_cursors` is new and empty. The limiter rows' four
+   * timestamp lists, unread since schema 9, go with the rebuild.
+   *
+   * Each old table is renamed aside, the schema created anew, its rows copied
+   * by column and the old table dropped. The rows this reads and writes, once,
+   * are logged and not charged to the day's budget (as a carried passkey is
+   * not): a rebuild of every retained row must not hold back the day's posts
+   * nor its maintenance, and the account's own usage, which the deployment's
+   * budget guard reads, still counts it.
+   */
+  private upgradeFromSchema9(): void {
+    const start = { reads: this.observed.reads, writes: this.observed.writes };
+    this.transaction(() => {
+      for (const index of SCHEMA_9_INDEXES) this.rawExec(`DROP INDEX IF EXISTS ${index}`);
+      for (const table of Object.keys(SCHEMA_10_COPIED_COLUMNS)) this.rawExec(`ALTER TABLE ${table} RENAME TO ${table}_v9`);
+      this.rawScript(SCHEMA_DDL);
+      for (const [table, columns] of Object.entries(SCHEMA_10_COPIED_COLUMNS)) {
+        const list = columns.join(", ");
+        this.rawExec(`INSERT INTO ${table} (${list}) SELECT ${list} FROM ${table}_v9`);
+        this.rawExec(`DROP TABLE ${table}_v9`);
+      }
+      this.rawExec("UPDATE _meta SET value = ? WHERE key = 'schema_version'", String(SCHEMA_VERSION));
+      this.rawExec("UPDATE maintenance SET schema_version = ? WHERE id = 1", SCHEMA_VERSION);
+    });
+    console.warn(JSON.stringify({
+      event: "storage_schema_upgraded", from: 9, to: SCHEMA_VERSION,
+      rows_read: this.observed.reads - start.reads, rows_written: this.observed.writes - start.writes,
+    }));
+  }
+
+  /**
    * Adds the identities' `seen_ms` column (protocol §4.5.2 `seen`, 0 for
    * none recorded) where a schema 9 object made by earlier code lacks it,
    * once, in one transaction, without a new schema version: adding a column
@@ -1776,34 +1861,6 @@ export class Store {
       this.chargeUpgrade(start, day);
     });
     console.warn(JSON.stringify({ event: "storage_column_added", table: "identities", column: "seen_ms" }));
-  }
-
-  /**
-   * Adds `push_subscriptions_joined_idx`, the registrations that keep
-   * `joined` (JOINED_WAKE_ROLES), where a schema 9 object made by earlier
-   * code lacks it, the way ensureSeenColumn adds its column: once, in one
-   * transaction, without a new schema version. Earlier code never names the
-   * index, and SQLite keeps it current whatever writes the table, so
-   * redeploying that code keeps everything. Every wake probes for it with a
-   * statement that reads no row; building it reads each registration once,
-   * charged like upgradeFromSchema7 (chargeUpgrade).
-   */
-  private ensureJoinedWakeIndex(): void {
-    try {
-      this.rawRows(JOINED_WAKE_INDEX_PROBE);
-      return;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!/no such index/i.test(message)) throw error;
-    }
-    const start = { reads: this.observed.reads, writes: this.observed.writes };
-    const effective = Number(this.metaValue(META_EFFECTIVE_NOW));
-    const day = dayFor(Math.max(Number.isSafeInteger(effective) ? effective : 0, this.clock.now()));
-    this.transaction(() => {
-      this.rawExec(`CREATE INDEX IF NOT EXISTS push_subscriptions_joined_idx ON push_subscriptions (updated_ms, user_id) WHERE ${JOINED_WAKE_CONDITION}`);
-      this.chargeUpgrade(start, day);
-    });
-    console.warn(JSON.stringify({ event: "storage_index_added", table: "push_subscriptions", index: "push_subscriptions_joined_idx" }));
   }
 
   /**
@@ -1883,6 +1940,7 @@ export class Store {
     this.memberGeneration += 1;
     this.memberCache.clear();
     this.initialized = false;
+    this.logCache = null;
     this.accountingUnsafe = false;
     this.accountingUnsafePersisted = false;
     this.lastEffectiveMs = 0;
@@ -1989,6 +2047,7 @@ export class Store {
       state.history_floor,
       context.commitMs,
     );
+    this.logCache = null;
   }
 
   private readSchemaVersion(): number {
@@ -2050,13 +2109,16 @@ export class Store {
     // A nested call is refused by transactionInner, and must not disturb the outer journal.
     if (this.inTransaction) return this.transactionInner(fn);
     this.limiters.begin();
+    const logCache = this.logCache;
     try {
       const result = this.transactionInner(fn);
       this.limiters.commit();
       return result;
     } catch (error) {
-      // The rows the transaction wrote are rolled back: so are the cached ones it changed.
+      // The rows the transaction wrote are rolled back: so are the cached ones
+      // it changed, and the log head its commit kept (finishCommit).
       this.limiters.rollback();
+      this.logCache = logCache;
       throw error;
     }
   }
@@ -2354,11 +2416,22 @@ export class Store {
   }
 
   private logState(): RawLogState {
-    const rows = this.rawRows<RawLogState>(
-      "SELECT last_log_id, history_floor, last_commit_ms FROM log_state WHERE id = 1 LIMIT 1",
-    );
-    if (!rows.length) throw new StoreError("internal_error", "log state is missing");
-    return { ...rows[0] };
+    if (!this.logCache) {
+      const rows = this.rawRows<RawLogState>(
+        "SELECT last_log_id, history_floor, last_commit_ms FROM log_state WHERE id = 1 LIMIT 1",
+      );
+      if (!rows.length) throw new StoreError("internal_error", "log state is missing");
+      // The stored state is as of the last cleanup; the newest record, which no cleanup has reached, is newer.
+      const newest = this.rawRows<{ log_id: number; commit_ms: number }>(
+        "SELECT log_id, commit_ms FROM records INDEXED BY records_log_idx ORDER BY log_id DESC LIMIT 1",
+      )[0];
+      this.logCache = {
+        last_log_id: Math.max(integerColumn(rows[0].last_log_id), newest ? integerColumn(newest.log_id) : 0),
+        history_floor: integerColumn(rows[0].history_floor),
+        last_commit_ms: Math.max(integerColumn(rows[0].last_commit_ms), newest ? integerColumn(newest.commit_ms) : 0),
+      };
+    }
+    return { ...this.logCache };
   }
 
   private roomRow(roomId: string): RawRoomRow | null {
@@ -2557,7 +2630,7 @@ export class Store {
              OR (kind = 'membership' AND EXISTS (SELECT 1 FROM json_each(record_json, '$.members') WHERE json_extract(value, '$.user.user_id') = ?1))`,
           from,
         ),
-        messages: this.rawRows<{ message_id: string; snapshot_json: string }>("SELECT message_id, snapshot_json FROM message_state WHERE author_id = ?", from),
+        messages: this.rawRows<{ message_id: string }>("SELECT message_id FROM message_state WHERE author_id = ?", from),
         reactions: this.rawRows<{ message_id: string; from_json: string }>("SELECT message_id, from_json FROM reaction_state WHERE user_id = ?", from),
         // Every room row is read: the creator is kept in its JSON, unindexed.
         created: this.rawRows<{ room_id: string; fields_json: string }>("SELECT room_id, fields_json FROM rooms WHERE json_extract(fields_json, '$.creator_id') = ?", from),
@@ -2573,7 +2646,8 @@ export class Store {
     // Moving a row keyed or indexed by the user_id reads its index entry and
     // row and rewrites both (measured: about 2 reads and 3 writes each);
     // rewriting a record's JSON in place is one write.
-    const moved = membershipRows + found.reactions.length + found.uploads + found.pushes + found.requests + USER_LIMIT_SCOPES.length;
+    // Memberships, and as many read cursors at most.
+    const moved = 2 * membershipRows + found.reactions.length + found.uploads + found.pushes + found.requests + USER_LIMIT_SCOPES.length;
     const rewritten = found.records.length + found.messages.length + found.created.length;
     const cost = { reads: 64 + 4 * moved + 2 * rewritten + this.userRoomsReads(), writes: 32 + 4 * moved + 2 * rewritten };
     return this.reserved(cost, false, now, () => this.transaction(() => {
@@ -2581,6 +2655,7 @@ export class Store {
       this.rawExec("UPDATE identities SET user_id = ?, updated_ms = ? WHERE user_id = ?", to, this.effectiveNow(now), from);
       this.rawExec("UPDATE credentials SET user_id = ? WHERE user_id = ?", to, from);
       this.rawExec("UPDATE memberships SET user_id = ? WHERE user_id = ?", to, from);
+      this.rawExec("UPDATE read_cursors SET user_id = ? WHERE user_id = ?", to, from);
       for (const row of found.created) {
         this.rawExec("UPDATE rooms SET fields_json = ? WHERE room_id = ?", JSON.stringify({ ...parseJson<Record<string, unknown>>(row.fields_json, {}), creator_id: to }), row.room_id);
       }
@@ -2597,13 +2672,8 @@ export class Store {
           this.rewriteRecord(row, JSON.stringify({ ...membership, members: membership.members.map((member) => ({ ...member, user: renamed(member.user) })) }));
         }
       }
-      for (const row of found.messages) {
-        const snapshot = parseJson<MessageSnapshot>(row.snapshot_json);
-        this.rawExec(
-          "UPDATE message_state SET author_id = ?, snapshot_json = ? WHERE message_id = ?",
-          to, JSON.stringify({ ...snapshot, from: renamed(snapshot.from) }), row.message_id,
-        );
-      }
+      // A message's current snapshot is its latest record, renamed above.
+      for (const row of found.messages) this.rawExec("UPDATE message_state SET author_id = ? WHERE message_id = ?", to, row.message_id);
       for (const row of found.reactions) {
         this.rawExec(
           "UPDATE reaction_state SET user_id = ?, from_json = ? WHERE message_id = ? AND user_id = ?",
@@ -2683,12 +2753,14 @@ export class Store {
     // Per user: memberships (live and awaiting a room purge), a day's dedup
     // rows, limiter rows, push subscriptions, credential and identity; each
     // deletion also updates its indexes.
-    const perUser = 64 + 4 * (MAX_USER_ROOMS + MAX_PURGE_ROOMS) + 4 * Math.max(this.config.registeredPostsPerDay, this.config.trustedPostsPerDay) + 4 * uploadsPerOwner +
+    const perUser = 64 + 8 * (MAX_USER_ROOMS + MAX_PURGE_ROOMS) + 4 * Math.max(this.config.registeredPostsPerDay, this.config.trustedPostsPerDay) + 4 * uploadsPerOwner +
       4 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER);
     // Every room row is read for its creator, and each one theirs rewritten.
     const roomRows = MAX_ROOM_ROWS + MAX_PURGE_ROOMS;
     const cost = { reads: 64 + 5 * records + 2 * roomRows + ids.length * perUser, writes: 64 + 4 * records + 2 * roomRows + ids.length * perUser };
     return this.reserved(cost, false, now, () => this.transaction(() => {
+      // Their records may be the newest.
+      this.writeLogHead();
       const messages = this.rawRows<{ message_id: string }>(`SELECT message_id FROM message_state WHERE author_id IN (${marks})`, ...ids)
         .map((row) => row.message_id);
       const messageMarks = messages.map(() => "?").join(", ");
@@ -2735,7 +2807,7 @@ export class Store {
         ...ids, ...ids,
       );
       this.rawExec(`UPDATE rooms SET fields_json = json_remove(fields_json, '$.creator_id') WHERE json_extract(fields_json, '$.creator_id') IN (${marks})`, ...ids);
-      for (const table of ["memberships", "credentials", "push_subscriptions", "push_wakes", "user_status", "room_mutes", "accepted_requests", "identities"]) {
+      for (const table of ["memberships", "read_cursors", "credentials", "push_subscriptions", "push_wakes", "user_status", "room_mutes", "accepted_requests", "identities"]) {
         this.rawExec(`DELETE FROM ${table} WHERE user_id IN (${marks})`, ...ids);
       }
       // Their limiter rows, by primary key, and the count the cap reads lowered by as many.
@@ -2751,6 +2823,19 @@ export class Store {
       if (identities) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(Math.max(0, this.metaNumber("identity_count") - identities)));
       return { messages: messages.length, reactions: integerColumn(reactions), deletedUploads };
     }), true);
+  }
+
+  /**
+   * Writes the log's head as kept here (logCache) to `log_state`, with
+   * `floor` as its history floor if given, before records are deleted:
+   * otherwise the newest record, which a later wake reads the head from,
+   * may be one of them, and log IDs already issued would be issued again.
+   */
+  private writeLogHead(floor?: number): RawLogState {
+    const head = this.logState();
+    this.rawExec("UPDATE log_state SET history_floor = ?, last_log_id = MAX(last_log_id, ?), last_commit_ms = MAX(last_commit_ms, ?) WHERE id = 1",
+      floor ?? head.history_floor, head.last_log_id, head.last_commit_ms);
+    return head;
   }
 
   /** Replaces one logged record's JSON, or deletes the record when `json` is null. */
@@ -3448,8 +3533,11 @@ export class Store {
   private currentMessage(messageId: string, floor?: number): RawMessageRow | null {
     // A message in a thread removed while it was still retained (removeEmptyThread) is gone with it.
     const rows = this.rawRows<RawMessageRow>(
-      `SELECT m.message_id, m.room_id, m.latest_log_id, m.snapshot_json, m.author_id
-       FROM message_state m JOIN rooms r ON r.room_id = m.room_id WHERE m.message_id = ? LIMIT 1`,
+      // The current snapshot is the message's latest record, in the room it is in.
+      `SELECT m.message_id, m.room_id, m.latest_log_id, rec.record_json AS snapshot_json, m.author_id
+       FROM message_state m JOIN rooms r ON r.room_id = m.room_id
+       JOIN records rec ON rec.room_id = m.room_id AND rec.log_id = m.latest_log_id
+       WHERE m.message_id = ? LIMIT 1`,
       messageId,
     );
     if (!rows.length) return null;
@@ -3820,7 +3908,10 @@ export class Store {
         }
         this.chargePosting({ userId: input.actorId ?? input.userId, tier: "registered", ipKey: input.ipKey, now: effective });
         if (input.join) this.rawExec("INSERT INTO memberships (room_id, user_id) VALUES (?, ?)", input.roomId, input.userId);
-        else this.rawExec("DELETE FROM memberships WHERE room_id = ? AND user_id = ?", input.roomId, input.userId);
+        else {
+          this.rawExec("DELETE FROM memberships WHERE room_id = ? AND user_id = ?", input.roomId, input.userId);
+          this.rawExec("DELETE FROM read_cursors WHERE user_id = ? AND room_id = ?", input.userId, input.roomId);
+        }
         const state = this.logState();
         const startLogId = state.last_log_id;
         const context: CommitContext = { state, commitMs: Math.max(effective, state.last_commit_ms), touched: new Map() };
@@ -3937,11 +4028,12 @@ export class Store {
       if (members === 0) this.rawExec("UPDATE rooms SET latest_log_id = MAX(latest_log_id, ?) WHERE room_id = ?", logId, roomId);
       else this.rawExec("UPDATE rooms SET latest_log_id = MAX(latest_log_id, ?), member_count = MAX(0, member_count + ?) WHERE room_id = ?", logId, members, roomId);
     }
-    this.rawExec(
-      "UPDATE log_state SET last_log_id = ?, last_commit_ms = ? WHERE id = 1",
-      context.state.last_log_id,
-      Math.max(context.commitMs, context.state.last_commit_ms),
-    );
+    // Kept here, not written: the records just appended say as much (logCache).
+    this.logCache = {
+      ...this.logState(),
+      last_log_id: context.state.last_log_id,
+      last_commit_ms: Math.max(context.commitMs, context.state.last_commit_ms),
+    };
   }
 
   /** Create, save, delete, restore, or move a message (section 3.5, §4.4). */
@@ -4021,13 +4113,12 @@ export class Store {
     // A move belongs to the source and destination logs (§4.3.1).
     this.appendRecord(context, moved ? [current.room_id, roomId] : [roomId], "message", logId, json);
     this.rawExec(
-      `INSERT INTO message_state (message_id, room_id, latest_log_id, snapshot_json, author_id)
-       VALUES (?, ?, ?, ?, ?)
+      `INSERT INTO message_state (message_id, room_id, latest_log_id, author_id)
+       VALUES (?, ?, ?, ?)
        ON CONFLICT (message_id) DO UPDATE SET
          room_id = excluded.room_id,
-         latest_log_id = excluded.latest_log_id,
-         snapshot_json = excluded.snapshot_json`,
-      messageId, roomId, logId, json, from.user_id,
+         latest_log_id = excluded.latest_log_id`,
+      messageId, roomId, logId, from.user_id,
     );
     const broadcasts: Broadcast[] = [{
       method: "message", params: clone(snapshot) as unknown as Record<string, unknown>, rooms: moved ? [current.room_id, roomId] : [roomId],
@@ -4331,7 +4422,7 @@ export class Store {
     else next.body = { ...previousBody, embeds };
     const json = JSON.stringify(next);
     this.appendRecord(context, [message.room_id], "message", logId, json);
-    this.rawExec("UPDATE message_state SET latest_log_id = ?, snapshot_json = ? WHERE message_id = ?", logId, json, message.message_id);
+    this.rawExec("UPDATE message_state SET latest_log_id = ? WHERE message_id = ?", logId, message.message_id);
     this.finishCommit(context, startLogId);
     return [{ method: "message", params: clone(next) as unknown as Record<string, unknown>, rooms: [message.room_id] }];
   }
@@ -4890,6 +4981,49 @@ export class Store {
         roomMutes: this.roomMuteRows(userId).filter((mute) => mute.untilMs > effective),
       };
     });
+  }
+
+  /**
+   * A registered user's read cursors (protocol §4.6): the `read_message_id`
+   * kept for each room they joined that has one, by room. One range of the
+   * user's rows, at most one a membership; none costs nothing.
+   */
+  readCursors(userId: string, now = this.clock.now()): Map<string, string> {
+    this.ensureReady();
+    const rows = MAX_USER_ROOMS + MAX_PURGE_ROOMS;
+    return this.reserved({ reads: 8 + 2 * rows }, false, now, () => new Map(this.rawRows<{ room_id: string; message_id: number }>(
+      "SELECT room_id, message_id FROM read_cursors WHERE user_id = ? LIMIT ?", userId, rows,
+    ).map((row) => [row.room_id, idString(integerColumn(row.message_id))])));
+  }
+
+  /**
+   * Keeps a registered user's read cursors (protocol §4.6), each a room and
+   * the `read_message_id` read through, in `read_cursors`: only in rooms
+   * they are a member of, so a cursor goes with its membership (a leave,
+   * an expired room, `/purge`) and the table holds at most one a
+   * membership; and only forward, so cursors written from several
+   * connections, in any order, keep the furthest. Each is a primary-key
+   * probe of the membership (read alone, so member listings kept for reuse
+   * stay valid) and an upsert: a new cursor writes its row and its room
+   * index entry, a moved one its row, a cursor not past the kept one
+   * nothing.
+   */
+  saveReadCursors(input: { userId: string; cursors: ReadonlyArray<readonly [roomId: string, messageId: string]>; now?: number }): void {
+    const cursors = input.cursors.slice(0, MAX_USER_ROOMS);
+    if (!cursors.length) return;
+    this.ensureReady();
+    const now = input.now ?? this.clock.now();
+    this.reserved({ reads: 8 + 4 * cursors.length, writes: 8 + 4 * cursors.length }, false, now, () => this.transaction(() => {
+      this.effectiveNow(now);
+      for (const [roomId, messageId] of cursors) {
+        if (!this.rawRows("SELECT 1 FROM memberships WHERE room_id = ? AND user_id = ? LIMIT 1", roomId, input.userId).length) continue;
+        this.rawExec(
+          `INSERT INTO read_cursors (user_id, room_id, message_id) VALUES (?, ?, ?)
+           ON CONFLICT (user_id, room_id) DO UPDATE SET message_id = excluded.message_id WHERE excluded.message_id > read_cursors.message_id`,
+          input.userId, roomId, Number(messageId),
+        );
+      }
+    }));
   }
 
   /**
@@ -5678,7 +5812,9 @@ export class Store {
   private cleanupHasWork(floor: number, cutoff: number, effective: number, limiterCutoff: number): boolean {
     return roomIdList(this.metaValue(META_PURGE_ROOMS)).length > 0 ||
       this.rawRows("SELECT log_id FROM records INDEXED BY records_log_idx WHERE log_id < ? ORDER BY log_id LIMIT 1", floor).length > 0 ||
-      this.rawRows("SELECT log_id FROM records INDEXED BY records_retention_idx WHERE commit_ms < ? ORDER BY commit_ms, log_id LIMIT 1", cutoff).length > 0 ||
+      // Commit times are nondecreasing in log order, so the oldest record from the floor on says whether any expired.
+      this.rawRows<{ commit_ms: number }>("SELECT commit_ms FROM records INDEXED BY records_log_idx WHERE log_id >= ? ORDER BY log_id LIMIT 1", floor)
+        .some((row) => integerColumn(row.commit_ms) < cutoff) ||
       this.rawRows("SELECT message_id FROM message_state WHERE latest_log_id < ? ORDER BY latest_log_id LIMIT 1", floor).length > 0 ||
       this.rawRows("SELECT message_id FROM reaction_state WHERE log_id < ? ORDER BY log_id LIMIT 1", floor).length > 0 ||
       this.rawRows("SELECT user_id FROM accepted_requests WHERE expires_ms <= ? ORDER BY expires_ms LIMIT 1", effective).length > 0 ||
@@ -5769,15 +5905,18 @@ export class Store {
       const pending = this.rawRows<{ log_id: number }>(
         "SELECT log_id FROM records INDEXED BY records_log_idx WHERE log_id < ? ORDER BY log_id LIMIT 1", floor,
       );
-      const expired = pending.length ? [] : this.rawRows<{ log_id: number }>(
-        `SELECT log_id FROM records INDEXED BY records_retention_idx
-         WHERE commit_ms < ? AND log_id >= ?
-         ORDER BY commit_ms, log_id LIMIT ?`, cutoff, floor, batch,
+      // The expired records are the prefix of the log from the floor on whose commit time is before the cutoff.
+      const oldest = pending.length ? [] : this.rawRows<{ log_id: number; commit_ms: number }>(
+        `SELECT log_id, commit_ms FROM records INDEXED BY records_log_idx
+         WHERE log_id >= ? ORDER BY log_id LIMIT ?`, floor, batch,
       );
+      const fresh = oldest.findIndex((row) => integerColumn(row.commit_ms) >= cutoff);
+      const expired = fresh === -1 ? oldest : oldest.slice(0, fresh);
       if (expired.length) floor = Math.max(floor, expired[expired.length - 1].log_id + 1);
-      this.rawExec("UPDATE log_state SET history_floor = ? WHERE id = 1", floor);
+      const head = this.writeLogHead(floor);
       this.rawExec("UPDATE maintenance SET cleanup_cutoff_ms = ?, cleanup_cursor = ?, next_cleanup_ms = ? WHERE id = 1", cutoff, floor, effective + 1000);
       this.assertReservation(reserved, beforeReads, beforeWrites);
+      this.logCache = { ...head, history_floor: floor };
     });
     const result = this.transaction(() => {
       let remaining = batch;
@@ -5824,7 +5963,11 @@ export class Store {
         const roomId = purge[0];
         const members = this.rawRows<{ user_id: string }>("SELECT user_id FROM memberships WHERE room_id = ? LIMIT ?", roomId, remaining + 1);
         const batchRows = members.slice(0, remaining);
-        for (const row of batchRows) this.rawExec("DELETE FROM memberships WHERE room_id = ? AND user_id = ?", roomId, row.user_id);
+        // Each member's read cursor goes with the membership (saveReadCursors keeps none without one).
+        for (const row of batchRows) {
+          this.rawExec("DELETE FROM memberships WHERE room_id = ? AND user_id = ?", roomId, row.user_id);
+          this.rawExec("DELETE FROM read_cursors WHERE user_id = ? AND room_id = ?", row.user_id, roomId);
+        }
         memberships += batchRows.length;
         remaining -= batchRows.length;
         if (members.length > batchRows.length) break;

@@ -85,9 +85,13 @@ within it:
   listed.
 - Activity (where on): typing is relayed to the room's other
   members and never stored, at most 10 relays per user per minute; past that, updates are dropped and the
-  sender gets one `~private` notice a minute saying so. Read cursors are
-  neither kept nor relayed. Activity has no part in push: attendance is the
-  separate `status` request (below).
+  sender gets one `~private` notice a minute saying so. A registered user's
+  read cursor (`read_message_id`) is relayed to their own other connections
+  only, never to others (no read receipts), and kept for the rooms they
+  joined: written at most once a minute per connection and when it closes,
+  and sent back after their next listing, so another device, or a reload,
+  shows the same rooms read. A guest's is dropped. Activity has no part in
+  push: attendance is the separate `status` request (below).
 - Commands: `/help` replies with a `~private` notice listing the commands the
   sender may run; `/invite-bot` gives a registered user a bot token (below);
   `/invite-device <name>` gives them a token for another device (below);
@@ -344,8 +348,8 @@ protocol's extension naming rule has it: three booleans, which a client takes
 as `true` when absent, and `private_rooms`, the number of private rooms one
 user may be in. `guest_posting` says whether guests may post, react,
 join and leave rooms, and create threads (`GUEST_POSTING`),
-`read_cursors: false` says read markers are dropped, so clients can skip
-sending them, and `add_members` says whether registered users may add others
+`read_cursors` says whether a registered user's read cursors are kept
+(with activity), and `add_members` says whether registered users may add others
 to rooms (`/toggle addmember`). Where uploads are configured, `ext:media`
 (defined in apron-web's EXT.md) carries `server.params.ext.media`: the media
 origin when it is not the server's, and each type an attachment or avatar

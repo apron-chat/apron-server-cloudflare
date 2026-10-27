@@ -921,12 +921,19 @@ describe('measured storage accounting', () => {
 			expect(measure('room mute expiry, 50 of 100 ran out', () => store.expireRoomMutes('matrix-user', clock.now())).expired).toHaveLength(MAX_ROOM_MUTES_PER_USER / 2);
 			measure('room mute clear', () => store.setRoomMute({ userId: 'matrix-user', roomId: 'muted-001', untilMs: null, now: clock.now() }));
 			state.storage.sql.exec("DELETE FROM room_mutes WHERE user_id = 'matrix-user'");
+			// Read cursors (§4.6): a membership probe and an upsert each, a row and no index.
+			const read = String(create.result.message_id);
+			measure('read cursor written, new', () => store.saveReadCursors({ userId: 'matrix-user', cursors: [['general', read]], now: clock.now() }));
+			measure('read cursor written, moved', () => store.saveReadCursors({ userId: 'matrix-user', cursors: [['general', String(Number(read) + 1)]], now: clock.now() }));
+			measure('read cursor written, not past the one kept', () => store.saveReadCursors({ userId: 'matrix-user', cursors: [['general', read]], now: clock.now() }));
+			measure('read cursor written, a room not joined', () => store.saveReadCursors({ userId: 'matrix-user', cursors: [['matrix-not-joined', read]], now: clock.now() }));
+			expect(measure('read cursors at a listing', () => store.readCursors('matrix-user', clock.now()))).toEqual(new Map([['general', String(Number(read) + 1)]]));
 			clock.set(clock.now() + DAY + HOUR + 1);
 			measure('cleanup', () => store.runCleanup(clock.now()));
 			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
 			expect(create.result.message_id).toBeTruthy();
-			expect(costs).toHaveLength(60);
+			expect(costs).toHaveLength(65);
 			expect(store.accountingStatus().unsafe).toBe(false);
 			return { costs };
 		});
@@ -952,9 +959,8 @@ describe('measured storage accounting', () => {
 					WHERE room_id = ? AND log_id >= ? AND log_id <= ?
 					ORDER BY log_id ASC LIMIT ?`, 'general', 1, Number.MAX_SAFE_INTEGER, 21),
 				cleanup: explain(sql, `EXPLAIN QUERY PLAN
-					SELECT log_id FROM records INDEXED BY records_retention_idx
-					WHERE commit_ms < ? AND log_id >= ?
-					ORDER BY commit_ms, log_id LIMIT ?`, clock.now() - DAY, 1, 100),
+					SELECT log_id, commit_ms FROM records INDEXED BY records_log_idx
+					WHERE log_id >= ? ORDER BY log_id LIMIT ?`, 1, 100),
 				cleanupDelete: explain(sql, `EXPLAIN QUERY PLAN
 					SELECT room_id, log_id FROM records INDEXED BY records_log_idx
 					WHERE log_id < ? ORDER BY log_id LIMIT ?`, 100, 100),
@@ -982,8 +988,9 @@ describe('measured storage accounting', () => {
 			return { plans, databaseSize: store.databaseSize() };
 		});
 		console.info('accounting-query-plans', JSON.stringify(result));
-		expect(result.plans.history.some((detail) => /SEARCH records USING/i.test(detail))).toBe(true);
-		expect(result.plans.cleanup.some((detail) => /records_retention_idx/i.test(detail))).toBe(true);
+		// Tables keyed by text or composite keys are WITHOUT ROWID (schema 10): their lookups name the primary key.
+		expect(result.plans.history.some((detail) => /SEARCH records USING PRIMARY KEY/i.test(detail))).toBe(true);
+		expect(result.plans.cleanup.some((detail) => /records_log_idx/i.test(detail))).toBe(true);
 		expect(result.plans.cleanupDelete.some((detail) => /records_log_idx/i.test(detail))).toBe(true);
 		expect(result.plans.messageExpiry.some((detail) => /message_state_latest_idx/i.test(detail))).toBe(true);
 		expect(result.plans.reactionExpiry.some((detail) => /reaction_state_log_idx/i.test(detail))).toBe(true);
@@ -992,16 +999,16 @@ describe('measured storage accounting', () => {
 		expect(result.plans.roomListing.some((detail) => /SCAN rooms/i.test(detail))).toBe(true);
 		expect(result.plans.dedupExpiry.some((detail) => /accepted_requests.*expiry|expiry.*accepted_requests/i.test(detail))).toBe(true);
 		expect(result.plans.limiterExpiry.some((detail) => /principal_limits_updated_idx/i.test(detail))).toBe(true);
-		expect(result.plans.roomMembers.some((detail) => /SEARCH m USING .*autoindex_memberships/i.test(detail))).toBe(true);
+		expect(result.plans.roomMembers.some((detail) => /SEARCH m USING PRIMARY KEY \(room_id=\?\)/i.test(detail))).toBe(true);
 		expect(result.plans.roomMembers.some((detail) => /TEMP B-TREE/i.test(detail))).toBe(false);
 		expect(result.plans.userRooms.some((detail) => /memberships_user_idx/i.test(detail))).toBe(true);
 		// Status adds one primary-key lookup of `user_status`, and nothing of push registrations.
-		expect(result.plans.roomMembersWithStatus.some((detail) => /SEARCH s USING INDEX sqlite_autoindex_user_status_1/i.test(detail))).toBe(true);
+		expect(result.plans.roomMembersWithStatus.some((detail) => /SEARCH s USING PRIMARY KEY \(user_id=\?\)/i.test(detail))).toBe(true);
 		expect(result.plans.roomMembersWithStatus.some((detail) => /push_subscriptions/i.test(detail))).toBe(false);
 		expect(result.plans.roomMembersWithStatus.some((detail) => /TEMP B-TREE/i.test(detail))).toBe(false);
 		// A wake's room mute check is two primary-key probes; a sign-in's read is one key range, in order.
-		expect(result.plans.roomMuteProbe.some((detail) => /SEARCH room_mutes USING INDEX sqlite_autoindex_room_mutes_1 \(user_id=\? AND room_id=\?\)/i.test(detail))).toBe(true);
-		expect(result.plans.roomMuteRange.some((detail) => /SEARCH room_mutes USING INDEX sqlite_autoindex_room_mutes_1 \(user_id=\?\)/i.test(detail))).toBe(true);
+		expect(result.plans.roomMuteProbe.some((detail) => /SEARCH room_mutes USING PRIMARY KEY \(user_id=\? AND room_id=\?\)/i.test(detail))).toBe(true);
+		expect(result.plans.roomMuteRange.some((detail) => /SEARCH room_mutes USING PRIMARY KEY \(user_id=\?\)/i.test(detail))).toBe(true);
 		expect(result.plans.roomMuteRange.some((detail) => /TEMP B-TREE/i.test(detail))).toBe(false);
 	});
 });

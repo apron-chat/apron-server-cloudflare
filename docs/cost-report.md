@@ -1,12 +1,14 @@
 # Cloudflare Worker storage cost report
 
 This report records local native SQLite measurements used for the storage
-accounting review. It describes the current schema (schema 9: one server-wide
+accounting review. It describes the current schema (schema 10: one server-wide
 record log of room records, message snapshots, reaction sets, and
 memberships; a `memberships` table of registered users' rooms, keyed by
-room with an index by user; and the upload, push registration, user status
-and room mute tables measured below, and each identity's `seen`) and the Workers test runtime; it does not claim a
-deployed account billing rate or a free-plan capacity.
+room with an index by user; the upload, push registration, user status,
+room mute and read cursor tables measured below, and each identity's
+`seen`; every table keyed by text or by more than one column `WITHOUT
+ROWID`) and the Workers test runtime; it does not claim a deployed account
+billing rate or a free-plan capacity.
 
 The figures were measured on 2026-09-26, and re-measured on 2026-10-05 with
 user status (below) and again the same day for the current status design
@@ -16,8 +18,8 @@ user status (below) and again the same day for the current status design
 schema 9 (below), and on 2026-10-26 for `seen` (User status, below), and
 again the same day for writing it at most once in 10 minutes, and for
 letting the store settle it (several tabs closing together, a stale copy,
-and the floor after `/toggle presence`), with the
-repository's workerd launcher:
+and the floor after `/toggle presence`), and on 2026-10-27 for schema 10
+(below), with the repository's workerd launcher:
 
 ```sh
 devenv shell -- npm test -- \
@@ -29,6 +31,76 @@ constructs a `Store` over each object's native SQLite state with a fake clock.
 The traffic tests start at a future UTC noon, cross three UTC posting days,
 run cleanup a day and a half later, and evict/reinitialize one object to check
 persisted limiter state.
+
+## Schema 10: keys as tables, one index for the log, read cursors (2026-10-27)
+
+Measured with [`test/accounting.integration.test.ts`](../test/accounting.integration.test.ts)
+against the schema 9 code before it, the same day; the tables in this
+report carry the schema 10 figures.
+
+Each row SQLite writes is billed, and so is each index entry, so the
+indexes a write touches decide most of its cost. Schema 10 drops the ones
+that bought nothing:
+
+- Every table keyed by text or by more than one column is `WITHOUT ROWID`.
+  A rowid table keeps such a key as a second index (`sqlite_autoindex_*`),
+  so each insert wrote the row and its key; now the key is the table. A new
+  record, message, reaction set, membership, accepted request, limiter or
+  budget row writes one row fewer.
+- `records` loses its index by commit time (`records_retention_idx`). Commit
+  times are nondecreasing in log order, so the expired records are a prefix
+  of the log: retention walks `records_log_idx` and stops at the first one
+  inside the window. That is one index entry fewer for every record, at the
+  cost of reading each candidate's row (cleanup read 120 rows where it read
+  110, and writes as before).
+- `message_state` points at each message's latest record (`latest_log_id`)
+  instead of holding a copy of its snapshot, and a lookup joins `records` by
+  primary key. An edit no longer rewrites the copy.
+- `log_state` is no longer written by every commit: the head is the newest
+  record, read once a wake with the stored row and kept in memory, and the
+  row is written by retention and `/purge` before they delete records, so a
+  wake never issues a log ID twice.
+
+| Operation | Schema 9 reads / writes | Schema 10 reads / writes |
+| --- | ---: | ---: |
+| Post, its limiter rows held (the common case) | 11 / 15 | 9 / 10 |
+| Post that writes its limiter rows (first after a wake, every fourth) | 13 / 19 | 11 / 14 |
+| A poster's first post (creates its limiter rows) | 28 / 31 | 28 / 23 |
+| Edit | 14 / 14 | 12 / 10 |
+| Reaction set | 21 / 21 | 20 / 15 |
+| Thread room create | 23 / 29 | 20 / 19 |
+| Registered room join | 17 / 11 | 15 / 7 |
+| Identity registration (in `general`) | 29 / 27 | 28 / 18 |
+| Identity registration starting in 100 rooms | 228 / 819 | 225 / 513 |
+| Connection admission | 14 / 12 | 14 / 10 |
+| Guest reconnect from a new address (admission, auth, a frame block, one history page with its quota, a room listing) | about 41 written | about 35 written |
+
+Under the maintenance-reserve test's 1,000-row foreground ceiling, 76 posts
+fit where 56 did. A fresh object's SQLite file is 151,552 bytes, from
+217,088.
+
+### Read cursors
+
+A registered user's `read_message_id` (§4.6) costs no SQL when it arrives:
+it is relayed to their other connections and held on the connection's
+attachment. Each connection writes what it holds at most once a minute
+(`READ_CURSOR_FLUSH_MS`, by its next cursor or the next alarm) and when it
+closes, so a reader costs about one written row a minute and a room they
+read, however often their client sends. The table holds at most one row a
+membership and has no index: a leave, an expired room and `/purge` delete
+the row by its key, with the membership.
+
+| Read cursor operation | Observed reads | Observed writes |
+| --- | ---: | ---: |
+| Written, new (a membership probe and its row) | 2 | 2 |
+| Written, moved forward | 2 | 2 |
+| Written, not past the one kept | 2 | 2 |
+| Written for a room not joined (the probe alone; nothing kept) | 2 | 1 |
+| Read at a listing (one range of the user's rows) | 2 | 1 |
+
+Each written figure includes the day's budget row; a cursor not past the
+one kept is charged one row, as every statement is, though SQLite reports
+none.
 
 ## Schema 9: token-bucket limiters, cached limiter rows, one budget write (2026-10-24)
 
@@ -97,8 +169,8 @@ finished SQL reservation, measured from its cursors, is credited back in one
 budget-row update, so the daily counters are charged about the rows actually
 used plus one. A guest reconnect from a new address (admission, auth, a
 frame block, one history page with its quota, room listing, each creating
-its limiter row) is charged about 41 writes; a post about 15 while its
-limiter rows wait, 21 when they are written, and 31 for a poster's first; and an idle alarm run about 14 (not re-measured). The
+its limiter row) is charged about 35 writes; a post about 10 while its
+limiter rows wait, 14 when they are written, and 23 for a poster's first; and an idle alarm run about 14 (not re-measured). The
 reservation sizes still matter: they decide whether an operation is admitted
 near the ceiling.
 
@@ -123,69 +195,74 @@ upper bounds can be compared with the measured worst case.
 
 | Operation | Observed reads | Observed writes | Reserved reads | Reserved writes |
 | --- | ---: | ---: | ---: | ---: |
-| Auth attempt reservation | 8 | 7 | 48 | 32 |
-| Frame reservation (one frame) | 13 | 12 | 28 | 24 |
-| Frame block (10 frames) | 9 | 8 | 64 | 24 |
-| Guest number block | 2 | 3 | 16 | 16 |
-| Connection admission reservation | 14 | 12 | 72 | 40 |
-| Identity registration (starts in `general`, logs that membership) | 28 | 27 | 338 | 880 |
-| Identity registration starting in 100 rooms | 227 | 819 | 338 | 880 |
+| Auth attempt reservation | 8 | 6 | 48 | 32 |
+| Frame reservation (one frame) | 13 | 10 | 28 | 24 |
+| Frame block (10 frames) | 9 | 7 | 64 | 24 |
+| Guest number block | 2 | 2 | 16 | 16 |
+| Connection admission reservation | 14 | 10 | 72 | 40 |
+| Identity registration (starts in `general`, logs that membership) | 28 | 18 | 338 | 880 |
+| Identity registration starting in 100 rooms | 225 | 513 | 338 | 880 |
 | Credential lookup | 2 | 1 | 16 | 8 |
-| Identity lookup (with the user's rooms) | 6 | 1 | 434 | 8 |
+| Identity lookup (with the user's rooms) | 6 | 1 | 534 | 8 |
 | Identity count | 2 | 1 | 16 | 8 |
-| Credential IDs lookup | 3 | 1 | 40 | 8 |
+| Credential IDs lookup | 2 | 1 | 40 | 8 |
 | Credential counter update | 2 | 2 | 16 | 16 |
-| Push subscription register | 6 | 7 | 172 | 436 |
+| Push subscription register | 7 | 6 | 172 | 436 |
 | Push subscription register again, unchanged within a day | 3 | 1 | 172 | 436 |
-| Push subscription register, a moderator keeping `joined` (one more index entry) | 6 | 8 | 172 | 436 |
-| Push wake claim (one user, one subscription; creates the server, sender and recipient counters) | 25 | 19 | 106 | 160 |
-| Push wake claim, 31 unregistered candidates before one registered | 75 | 7 | 1,408 | 160 |
+| Push subscription register, a moderator keeping `joined` (one more index entry) | 7 | 7 | 172 | 436 |
+| Push wake claim (one user, one subscription; creates the server, sender and recipient counters) | 25 | 15 | 106 | 160 |
+| Push wake claim, 31 unregistered candidates before one registered | 75 | 6 | 1,408 | 160 |
 | Push registrations clear (`/passkeys remove`, a new bot token) | 1 | 2 | 144 | 400 |
-| Mute set (`status` `mute`, unscoped) | 3 | 3 | 24 | 24 |
-| Status set (`me` `status`) | 4 | 2 | 24 | 24 |
+| Mute set (`status` `mute`, unscoped) | 3 | 2 | 24 | 24 |
+| Status set (`me` `status`) | 3 | 2 | 24 | 24 |
 | Seen settled, written (a registered user shown `offline` as their last connection closed, the `seen` their connection holds and the stored one over 10 minutes old: one conditional update; within 10 minutes of the one held: no statement) | 2 | 2 | 16 | 16 |
 | Seen settled, the stored one standing (the connection's copy is stale: the update writes nothing, and one read of `seen_ms` finds the stored one) | 3 | 1 | 16 | 16 |
-| Room mute set (`status` `mute` with `room_id`) | 4 | 3 | 432 | 424 |
+| Room mute set (`status` `mute` with `room_id`) | 4 | 2 | 432 | 424 |
 | Room mute set past 100, refused (two counts and a delete of none ran out) | 303 | 2 | 432 | 424 |
 | Room mute clear | 3 | 2 | 432 | 424 |
 | Room mute expiry, 50 of 100 ran out (read, delete) | 201 | 51 | 224 | 416 |
 | Status inputs at sign-in, nothing stored | 3 | 1 | 224 | 8 |
 | Status inputs at sign-in, a status, a mute and one room mute (`seen` comes with the identity lookup) | 3 | 1 | 224 | 8 |
-| Status set to `invisible`, with its `seen` (the stored one over 10 minutes old; one reservation and transaction) | 4 | 4 | 24 | 24 |
-| Status set to `invisible`, the stored `seen` standing (within 10 minutes; decided from the identity row it reads anyway) | 3 | 3 | 24 | 24 |
+| Status set to `invisible`, with its `seen` (the stored one over 10 minutes old; one reservation and transaction) | 4 | 3 | 24 | 24 |
+| Status set to `invisible`, the stored `seen` standing (within 10 minutes; decided from the identity row it reads anyway) | 3 | 2 | 24 | 24 |
 | Seen settled for a user with no identity row (the update matches nothing; the read finds none) | 2 | 1 | 16 | 16 |
 | Status inputs at sign-in, 100 room mutes | 102 | 1 | 224 | 8 |
 | Push wake claim, `dnd` and muted (passed over) | 2 | 1 | 106 | 160 |
 | Push wake claim, the thread's parent muted (passed over) | 8 | 1 | 106 | 160 |
 | Gone push subscription forget (one primary-key row) | 2 | 2 | 20 | 22 |
 | Push reply author lookup | 4 | 1 | 16 | 8 |
-| Push wake claim for a reply (creates the recipient counter) | 17 | 11 | 106 | 160 |
+| Push wake claim for a reply (creates the recipient counter) | 17 | 9 | 106 | 160 |
 | Push joined wakers (the moderators who kept `joined`; one range of their partial index, read for every message) | 2 | 1 | 176 | 8 |
-| Push wake claim for `joined` (creates its own recipient counter; reads the role and the membership; charges no sender) | 18 | 10 | 106 | 160 |
-| Message create with request ID (the poster's first: creates its limiter rows) | 28 | 31 | 296 | 120 |
+| Push wake claim for `joined` (creates its own recipient counter; reads the role and the membership; charges no sender) | 18 | 8 | 106 | 160 |
+| Message create with request ID (the poster's first: creates its limiter rows) | 26 | 23 | 296 | 120 |
 | Empty new message (not logged) | 2 | 1 | 16 | 8 |
 | Deduplicated mutation retry | 2 | 1 | 32 | 16 |
-| Reaction set | 21 | 21 | 296 | 120 |
-| Thread room create by a registered user (counts the creator's live threads; stores and logs the membership) | 22 | 29 | 414 | 120 |
-| Thread room save | 12 | 12 | 296 | 120 |
-| Message move with one reaction set | 19 | 25 | 296 | 280 |
-| Registered name mutation | 16 | 13 | 296 | 120 |
-| Registered room leave (logs the membership; the user's fourth post since its limiter row was written, which writes it) | 21 | 17 | 482 | 72 |
-| Registered room join (logs the membership) | 17 | 11 | 482 | 72 |
-| Registered room join at the 100-thread ceiling | 330 | 27 | 482 | 72 |
-| Guest room join or leave (the guest's first: creates its and its IP's posting limiter rows) | 15 | 14 | 40 | 40 |
+| Reaction set | 20 | 15 | 296 | 120 |
+| Thread room create by a registered user (counts the creator's live threads; stores and logs the membership) | 20 | 19 | 414 | 120 |
+| Thread room save | 10 | 8 | 296 | 120 |
+| Message move with one reaction set | 17 | 17 | 296 | 280 |
+| Registered name mutation | 16 | 11 | 296 | 120 |
+| Registered room leave (logs the membership; the user's fourth post since its limiter row was written, which writes it) | 19 | 14 | 582 | 72 |
+| Registered room join (logs the membership) | 15 | 7 | 582 | 72 |
+| Registered room join at the 100-thread ceiling | 328 | 20 | 582 | 72 |
+| Guest room join or leave (the guest's first: creates its and its IP's posting limiter rows) | 15 | 12 | 40 | 40 |
 | Guest room join or leave (its limiter rows cached; writes the global row) | 3 | 2 | 40 | 40 |
 | History page | 9 | 1 | 264 | 40 |
-| History page with its quota, a new user and IP (creates both limiter rows) | 21 | 13 | 264 | 40 |
+| History page with its quota, a new user and IP (creates both limiter rows) | 21 | 11 | 264 | 40 |
 | History page with its quota, again within a minute | 9 | 1 | 264 | 40 |
-| Room record lookup (`general`) | 3 | 1 | 24 | 8 |
-| Room join lookup | 3 | 1 | 24 | 8 |
+| Room record lookup (`general`) | 2 | 1 | 24 | 8 |
+| Room join lookup | 2 | 1 | 24 | 8 |
 | Room listing (representative matrix) | 6 | 1 | 444 | 8 |
-| Room members, `general` and one thread | 6 | 1 | 824 | 8 |
-| Room members with status, `general` and one thread | 6 | 1 | 1,224 | 8 |
+| Room members, `general` and one thread | 8 | 1 | 824 | 8 |
+| Room members with status, `general` and one thread | 8 | 1 | 1,224 | 8 |
 | Room members, 101 rooms with 200 registered members each | 40,401 | 1 | 40,820 | 8 |
 | Room members with status, 101 rooms of 200, each member with a status row and the most push registrations and room mutes a user may hold (neither read) | 60,500 | 1 | 61,020 | 8 |
-| Cleanup (matrix, one day later) | 98 | 35 | 1,074 | 1,058 |
+| Read cursor written, new (a membership probe and its row, keyed by user and room, no index) | 2 | 2 | 20 | 20 |
+| Read cursor written, moved forward (its row) | 2 | 2 | 20 | 20 |
+| Read cursor written, not past the one kept (no row changes) | 2 | 2 | 20 | 20 |
+| Read cursor written for a room not joined (the probe alone) | 2 | 1 | 20 | 20 |
+| Read cursors at a listing (one range of the user's rows) | 2 | 1 | 518 | 8 |
+| Cleanup (matrix, one day later) | 127 | 42 | 1,874 | 1,058 |
 | Alarm scheduling | 6 | 3 | 24 | 12 |
 
 The matrix uses a fresh object and one representative operation for each
@@ -765,21 +842,20 @@ record and two creates), removed the unreferenced old current message, and kept
 the edited message whose latest record was still inside the retention window. It also removed two expired accepted-request rows without changing
 the room head.
 
-The maintenance-reserve test accepted 56 mutations under an explicit
-1,000/1,000 foreground ceiling (59 before every fourth post wrote its limiter
-rows), rejected the next mutation, then ran cleanup the next UTC day. The
-previous day's foreground counter was 912 while the new day's cleanup, run
-until it found nothing (one run deletes what its reservation covers), was
-charged 187 maintenance writes (454/187 observed, over five reservations)
-and removed 57 records (the creates and the seeded room record) and 56
-messages. The current budget row must be read by day; calling `budget()` after midnight
+The maintenance-reserve test accepted 76 mutations under an explicit
+1,000/1,000 foreground ceiling (56 with schema 9), rejected the next
+mutation, then ran cleanup the next UTC day. The previous day's foreground
+counter was 848 while the new day's cleanup, run until it found nothing (one
+run deletes what its reservation covers), was charged 250 maintenance writes
+(615/250 observed, over six reservations) and removed 77 records (the
+creates and the seeded room record) and 76 messages. The current budget row must be read by day; calling `budget()` after midnight
 correctly returns the new day's foreground counters rather than the exhausted
 previous day.
 
 After `evictDurableObject`, a fresh Store instance observed a bounded set of
 schema, effective-clock, and budget-cache reads and zero schema writes. The persisted principal-limit rows retained the
 original daily post count and the second mutation was rejected by that daily
-limit. The SQLite file remained 217,088 bytes across eviction.
+limit. The SQLite file remained 151,552 bytes across eviction.
 
 ## Storage pressure and page reuse
 
@@ -804,55 +880,57 @@ filesystem-file shrink or require VACUUM.
 
 ```text
 history (one room's log, every record kind):
-  SEARCH records USING INDEX sqlite_autoindex_records_1
-    (room_id=? AND log_id>? AND log_id<?)
-cleanup (server-wide prefix by commit time):
-  SEARCH records USING COVERING INDEX records_retention_idx (commit_ms<?)
+  SEARCH records USING PRIMARY KEY (room_id=? AND log_id>? AND log_id<?)
+cleanup (the server-wide log from the floor, in log order):
+  SEARCH records USING INDEX records_log_idx (log_id>?)
 cleanup physical delete:
-  SEARCH records USING INDEX records_log_idx (log_id<?)
+  SEARCH records USING COVERING INDEX records_log_idx (log_id<?)
 message state expiry:
-  SEARCH message_state USING INDEX message_state_latest_idx (latest_log_id<?)
+  SEARCH message_state USING COVERING INDEX message_state_latest_idx (latest_log_id<?)
 reaction state expiry:
-  SEARCH reaction_state USING INDEX reaction_state_log_idx (log_id<?)
+  SEARCH reaction_state USING COVERING INDEX reaction_state_log_idx (log_id<?)
 move re-logging reactions:
-  SEARCH reaction_state USING INDEX sqlite_autoindex_reaction_state_1 (message_id=?)
+  SEARCH reaction_state USING PRIMARY KEY (message_id=?)
   USE TEMP B-TREE FOR ORDER BY
 room listing:
   SCAN rooms
   USE TEMP B-TREE FOR ORDER BY
 dedup expiry:
-  SEARCH accepted_requests USING INDEX accepted_requests_expiry_idx (expires_ms<?)
+  SEARCH accepted_requests USING COVERING INDEX accepted_requests_expiry_idx (expires_ms<?)
 limiter expiry:
-  SEARCH principal_limits USING INDEX principal_limits_updated_idx (updated_ms<?)
+  SEARCH principal_limits USING COVERING INDEX principal_limits_updated_idx (updated_ms<?)
 room members:
-  SEARCH m USING COVERING INDEX sqlite_autoindex_memberships_1 (room_id=?)
-  SEARCH i USING INDEX sqlite_autoindex_identities_1 (user_id=?) LEFT-JOIN
+  SEARCH m USING PRIMARY KEY (room_id=?)
+  SEARCH i USING PRIMARY KEY (user_id=?) LEFT-JOIN
 room members with status:
-  SEARCH m USING COVERING INDEX sqlite_autoindex_memberships_1 (room_id=?)
-  SEARCH i USING INDEX sqlite_autoindex_identities_1 (user_id=?) LEFT-JOIN
-  SEARCH s USING INDEX sqlite_autoindex_user_status_1 (user_id=?) LEFT-JOIN
+  SEARCH m USING PRIMARY KEY (room_id=?)
+  SEARCH i USING PRIMARY KEY (user_id=?) LEFT-JOIN
+  SEARCH s USING PRIMARY KEY (user_id=?) LEFT-JOIN
 a wake's room mute check (the room and its parent):
-  SEARCH room_mutes USING INDEX sqlite_autoindex_room_mutes_1 (user_id=? AND room_id=?)
+  SEARCH room_mutes USING PRIMARY KEY (user_id=? AND room_id=?)
 a sign-in's room mutes:
-  SEARCH room_mutes USING INDEX sqlite_autoindex_room_mutes_1 (user_id=?)
+  SEARCH room_mutes USING PRIMARY KEY (user_id=?)
 a user's rooms:
-  SEARCH m USING INDEX memberships_user_idx (user_id=?)
-  SEARCH r USING INDEX sqlite_autoindex_rooms_1 (room_id=?)
+  SEARCH m USING COVERING INDEX memberships_user_idx (user_id=?)
+  SEARCH r USING PRIMARY KEY (room_id=?)
   USE TEMP B-TREE FOR ORDER BY
 ```
 
 History reads one contiguous primary-key range of one room's log; a move is
 stored once in each room it touches, so no membership filter or `UNION` is
-needed. The cleanup source selection explicitly uses `records_retention_idx`
-for the strict commit-time cutoff, then `records_log_idx` for the bounded
-physical delete. The move's reaction read and the room listing sort at most
+needed. Cleanup walks `records_log_idx` from the floor and stops at the first
+record inside the retention window (commit times follow log order), then
+deletes the bounded prefix by the same index. The move's reaction read and the room listing sort at most
 the capped per-message reaction sets and the capped room table respectively;
 the thread-room expiry check in cleanup scans that same capped table. Room
 members are one primary-key range per room, already in `user_id` order, with a
 primary-key identity lookup per member, and with status one primary-key
 probe of `user_status`; a user's room mutes are one primary-key range, already
 in `room_id` order, and a wake checks two of them by key; a user's rooms are
-one index range, sorted after joining the capped rooms table.
+one index range, sorted after joining the capped rooms table. On a
+`WITHOUT ROWID` table a secondary index holds the primary key, so the
+indexes by `latest_log_id`, `log_id`, `expires_ms` and `updated_ms` cover
+the expiry scans that read only keys.
 
 ## Schema upgrade and reset
 
@@ -863,7 +941,7 @@ registration time, by registration time, and a partial one by user and
 registration time of those that wake for messages), `push_wakes` (with an
 index by wake time), `user_status` and `room_mutes`, four indexes besides
 their primary keys, and adds the identities' empty `ext_json` column; the
-partial index of registrations that keep `joined` is added on the next wake,
+partial index of registrations that keep `joined` comes with schema 10,
 as on schema 9 below. The rows
 it measurably read and wrote are added to the day's maintenance counters
 without a capacity check, like the reset's passkey carry, so an exhausted
@@ -877,11 +955,24 @@ so the upgrade was charged 8 written rows over 503 limiter rows (measured on
 row, so about 43,000 at the 10,000-row limiter cap, more than Free's whole
 maintenance allocation.
 
-A schema 9 object from code before `joined` gains the partial index of
-registrations that keep it on its next wake, without a new schema version
-(Store.ensureJoinedWakeIndex): building it reads each registration once,
-charged to the day's maintenance like an upgrade; every later wake's probe
-compiles against it and reads no row.
+A schema 9 object from code before `joined` lacks the partial index of
+registrations that keep it; the upgrade to schema 10 below creates it with
+the rest of the schema.
+
+A schema 9 object is upgraded to schema 10 in place, once, in one
+transaction, on its first wake: each table schema 10 keys differently is
+renamed aside, the schema created anew, its rows copied by column, and the
+old table dropped (`Store.upgradeFromSchema9`). It reads and writes every
+retained row once, about one written row for each row copied (measured
+10,435 written and 13,937 read for a store of 10,000 identities; 445
+written for a nearly empty one), so a full store costs on the order of its
+row count, more than a day's maintenance allocation. It is therefore logged
+(`storage_schema_upgraded`, with `rows_read` and `rows_written`) and not
+charged to the day's budget, so it holds back neither the day's posts nor
+its maintenance; the account's own usage, which the budget guard reads,
+still counts it. A schema 8 or 7 object is upgraded to 9 first, then to 10.
+Code before schema 10 finds a newer version and resets the object, so a
+rollback across it loses the stored data, passkeys aside.
 
 Any other stored schema version resets the object with
 `deleteAll()` and recreates the schema (`test/schema-reset.integration.test.ts`).
