@@ -219,6 +219,16 @@ interface ConnectionAttachment {
 	 * MAX_OWED.
 	 */
 	owed?: OwedStatus[];
+	/**
+	 * Read cursors (§4.6) this connection sent for rooms its registered user
+	 * joined and has not yet written (Store.saveReadCursors): room to
+	 * `read_message_id`, at most MAX_ATTACHED_ROOMS. Kept here, so they
+	 * survive hibernation, and written once READ_CURSOR_FLUSH_MS has passed
+	 * since this connection last wrote (`readsAt`), by its next cursor or the
+	 * next alarm, or when it closes (flushReads).
+	 */
+	reads?: Record<string, string>;
+	readsAt?: number;
 	closing?: boolean;
 }
 
@@ -383,6 +393,8 @@ const PING_REQUEST = '{"method":"ping"}';
 const PING_RESPONSE = '{"method":"pong"}';
 /** Joined room IDs a connection attachment may carry: every public room and the user's private ones, with slack for removals in flight. */
 const MAX_ATTACHED_ROOMS = 2 * (MAX_THREAD_LIMIT + 1 + MAX_PRIVATE_MEMBERSHIPS_PER_USER);
+/** How often one connection writes the read cursors it was sent (flushReads): a reader writes about once a minute, however often their client sends. */
+const READ_CURSOR_FLUSH_MS = 60_000;
 /** At most how many frames a connection's sign-in holds for it (holdDeliveries). */
 const MAX_HELD_FRAMES = 256;
 /**
@@ -738,6 +750,7 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			...(Number.isSafeInteger(attachment.roomMuteNext) && (attachment.roomMuteNext as number) > 0 ? { roomMuteNext: attachment.roomMuteNext } : {}),
 			...(Number.isSafeInteger(attachment.seen) && (attachment.seen as number) > 0 ? { seen: attachment.seen } : {}),
 			...presenceState(attachment),
+			...readState(attachment),
 			authDeadline: typeof attachment.authDeadline === "number" ? attachment.authDeadline : 0,
 			pendingFrames: typeof attachment.pendingFrames === "number" ? attachment.pendingFrames : 0,
 			pendingBytes: typeof attachment.pendingBytes === "number" ? attachment.pendingBytes : 0,
@@ -750,6 +763,18 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 	} catch {
 		return null;
 	}
+}
+
+/** The unwritten read cursors of a stored attachment (`reads`, `readsAt`), type-checked and bounded. */
+function readState(attachment: Partial<ConnectionAttachment>): Pick<ConnectionAttachment, "reads" | "readsAt"> {
+	const out: Pick<ConnectionAttachment, "reads" | "readsAt"> = {};
+	if (Number.isSafeInteger(attachment.readsAt) && (attachment.readsAt as number) > 0) out.readsAt = attachment.readsAt;
+	if (isObject(attachment.reads)) {
+		const reads = Object.entries(attachment.reads).filter((entry): entry is [string, string] =>
+			entry[0].length > 0 && entry[0].length <= 64 && typeof entry[1] === "string" && /^\d{1,16}$/.test(entry[1])).slice(0, MAX_ATTACHED_ROOMS);
+		if (reads.length) out.reads = Object.fromEntries(reads);
+	}
+	return out;
 }
 
 /** The held wakes of a stored attachment, type-checked and bounded. */
@@ -1561,6 +1586,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				delete attachment.challenge;
 				writeAttachment(socket, attachment);
 			}
+			if (attachment.reads && !attachment.closing && now - (attachment.readsAt ?? 0) >= READ_CURSOR_FLUSH_MS) this.flushReads(attachment, now, socket);
 		}
 		if (now >= this.nextSessionSweepAt) {
 			try {
@@ -1678,14 +1704,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// boolean, and a client takes an absent one as true. `guest_posting`: guests may post,
 				// react, join and leave rooms, and create threads; `false` here
 				// unless GUEST_POSTING is on. `read_cursors`: an `activity`
-				// `read_message_id` is kept or relayed; always `false` here.
+				// `read_message_id` is kept or relayed; a registered user's are,
+				// with `activity` (handleActivity), so `false` only without it.
 				// `add_members`: registered users may add others to rooms with
 				// `room_join` and a `user_id`; `/toggle addmember` turns it off
 				// (a private room's members may add others either way).
 				// `private_rooms`: the most private rooms one user may be in.
 				ext: {
 					settings: {
-						guest_posting: this.config.guestPosting, read_cursors: false, add_members: this.addMemberOn(),
+						guest_posting: this.config.guestPosting, read_cursors: this.activityOn(), add_members: this.addMemberOn(),
 						private_rooms: this.config.limits.privateMembershipsPerUser,
 					},
 					...(this.config.uploads ? { media: this.mediaSettings(this.config.uploads) } : {}),
@@ -2017,6 +2044,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// `guest_<n>` from a server-wide counter, never reissued, with a
 			// generated name they keep (§3.2 lets the server assign identity).
 			const number = this.nextGuestNumber();
+			if (attachment.reads) this.flushReads(attachment, nowMs());
 			attachment.tier = "anonymous";
 			attachment.userId = `guest_${number}`;
 			attachment.name = `Guest ${number}`.slice(0, Math.min(this.config.limits.maxNameCodePoints, this.config.limits.maxNameBytes));
@@ -2161,6 +2189,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const token = await this.issueSession(finished.identity.user_id, origin, nowMs());
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
 		const previous = this.guestBefore(socket, attachment);
+		// Read cursors still unwritten are the previous user's.
+		if (attachment.reads) this.flushReads(attachment, nowMs());
 		attachment.tier = "registered";
 		attachment.userId = finished.identity.user_id;
 		attachment.name = finished.identity.name;
@@ -2296,6 +2326,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Read before the connection changes, with no await after, so a failure leaves it as it was.
 		const stored = this.readStatusInputs(identity.userId, identity.seen);
 		const previous = this.guestBefore(socket, attachment);
+		// Read cursors still unwritten are the previous user's.
+		if (attachment.reads) this.flushReads(attachment, nowMs());
 		attachment.tier = "registered";
 		attachment.userId = identity.userId;
 		attachment.name = identity.name;
@@ -2402,6 +2434,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Read before the connection changes, so a failure leaves it as it was.
 		const stored = this.readStatusInputs(identity.userId, identity.seen);
 		const previous = this.guestBefore(socket, attachment);
+		// Read cursors still unwritten are the previous user's.
+		if (attachment.reads) this.flushReads(attachment, nowMs());
 		attachment.tier = "registered";
 		attachment.userId = identity.userId;
 		attachment.name = identity.name;
@@ -3018,11 +3052,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Activity (§4.6). Typing is relayed to the room's other members and never
-	 * stored; without room_id it is in the default room. Read cursors are
-	 * dropped: the demo neither keeps nor relays them. Neither touches the
-	 * connection's `status` `idle` (§4.5). At most
-	 * `activityBroadcastsPerUserMinute` relays per user; past that the update
-	 * is dropped and the sender gets one `~private` notice per minute.
+	 * stored; without room_id it is in the default room. A registered user's
+	 * read cursor is relayed to their own other connections only, and kept
+	 * for a room they joined (noteRead); a guest's is dropped. Neither touches
+	 * the connection's `status` `idle` (§4.5). At most
+	 * `activityBroadcastsPerUserMinute` relays per user; past that typing is
+	 * dropped and the sender gets one `~private` notice per minute, and a read
+	 * cursor is kept but not relayed.
 	 */
 	private async handleActivity(socket: WebSocketConnection, request: RequestFrame): Promise<void> {
 		const attachment = connectionAttachment(socket);
@@ -3032,14 +3068,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (typing !== undefined && (typeof typing !== "number" || !Number.isFinite(typing) || typing < 0)) {
 			throw { name: "invalid_params", message: "typing must be a non-negative number of seconds" } satisfies ProtocolError;
 		}
+		const read = asDecimalId(request.params.read_message_id, "read_message_id", false);
 		const roomId = request.params.room_id ?? ROOM_ID;
-		if (typing !== undefined && !validRoomId(roomId)) {
+		if ((typing !== undefined || read !== undefined) && !validRoomId(roomId)) {
 			throw { name: "invalid_params", message: "room_id must be a room" } satisfies ProtocolError;
 		}
-		// A guest who only reads has nothing to be typing.
-		if (attachment.tier === "anonymous" && !this.config.guestPosting) return;
-		if (typing === undefined || typeof roomId !== "string" || !this.roomExists(roomId) || !this.sees(attachment, roomId)) return;
+		if (typeof roomId !== "string" || (typing === undefined && read === undefined) || !this.roomExists(roomId) || !this.sees(attachment, roomId)) return;
 		const now = nowMs();
+		if (read !== undefined) this.noteRead(socket, attachment, roomId, read, now);
+		// A guest who only reads has nothing to be typing.
+		if (typing === undefined || (attachment.tier === "anonymous" && !this.config.guestPosting)) return;
 		const limit = this.config.limits.activityBroadcastsPerUserMinute;
 		if (!this.takeThrottle(socket, identity.user_id, "activity", limit, now)) {
 			this.noticeThrottled(socket, identity.user_id, "activity", roomId, now,
@@ -3049,6 +3087,84 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const seconds = Math.min(Math.floor(typing), this.config.limits.activityMaxTypingSeconds);
 		const frame = { method: "activity", params: { room_id: roomId, from: identity, typing: seconds } };
 		this.deliver(frame, [roomId], undefined, socket);
+	}
+
+	/**
+	 * A registered user's `read_message_id` in a room they see (§4.6): relayed
+	 * at once to their other connections, so each of their devices shows the
+	 * room read, within the activity relays allowance (a cursor past it is
+	 * kept, and its devices learn of it at their next listing). For a room
+	 * they joined, it is kept on this connection until written (flushReads)
+	 * rather than written now: a reader's cursors cost about one write a
+	 * minute and a room, however often their client sends them. One not past
+	 * the one kept for the room is dropped; one kept here and lost with the
+	 * instance before it is written (a deploy) leaves the room read up to the
+	 * last one written. A guest's is dropped: guests keep nothing.
+	 */
+	private noteRead(socket: WebSocketConnection, attachment: ConnectionAttachment, roomId: string, read: string, now: number): void {
+		const identity = publicIdentity(attachment);
+		if (attachment.tier !== "registered" || !identity) return;
+		const kept = attachment.reads?.[roomId];
+		if (kept !== undefined && Number(read) <= Number(kept)) return;
+		const peers = this.connectionsOf(identity.user_id, socket);
+		if (peers.length && this.takeThrottle(socket, identity.user_id, "activity", this.config.limits.activityBroadcastsPerUserMinute, now)) {
+			const frame = { method: "activity", params: { room_id: roomId, from: identity, read_message_id: read } };
+			for (const peer of peers) this.deliverTo(peer, frame);
+		}
+		const latest = connectionAttachment(socket) ?? attachment;
+		if (!latest.rooms?.includes(roomId)) return;
+		latest.reads = { ...latest.reads, [roomId]: read };
+		if (now - (latest.readsAt ?? 0) >= READ_CURSOR_FLUSH_MS || Object.keys(latest.reads).length > MAX_ATTACHED_ROOMS) this.flushReads(latest, now, socket);
+		else writeAttachment(socket, latest);
+	}
+
+	/**
+	 * Writes the read cursors a connection holds unwritten (`reads`) to the
+	 * store, which keeps each only where its user is still a member, and only
+	 * forward (Store.saveReadCursors), and dates the connection's last write
+	 * (`readsAt`). Without `socket` the connection is closing, and its
+	 * attachment is not written back. Cursors the store refuses (an exhausted
+	 * budget) are dropped, not retried.
+	 */
+	private flushReads(attachment: ConnectionAttachment, now: number, socket?: WebSocketConnection): void {
+		const cursors = Object.entries(attachment.reads ?? {});
+		delete attachment.reads;
+		attachment.readsAt = now;
+		if (socket) writeAttachment(socket, attachment);
+		if (!cursors.length || attachment.tier !== "registered" || !attachment.userId) return;
+		try {
+			this.store.saveReadCursors({ userId: attachment.userId, cursors, now });
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "read_cursors_dropped", count: cursors.length, error: error instanceof Error ? error.message : String(error) }));
+		}
+	}
+
+	/**
+	 * After a listing that has `joined` (§4.6): the user's read cursors for
+	 * the joined rooms in it, as `activity` from them, each the one kept
+	 * (Store.readCursors, one range read) or, if further, one their
+	 * connections hold unwritten. A cursor the store cannot read for now (an
+	 * exhausted budget) is not sent: the client keeps the one it has.
+	 */
+	private sendReadCursors(socket: WebSocketConnection, attachment: ConnectionAttachment, roomIds: readonly string[]): void {
+		const identity = publicIdentity(attachment);
+		if (attachment.tier !== "registered" || !identity || !roomIds.length || !this.activityOn()) return;
+		let cursors: Map<string, string>;
+		try {
+			cursors = this.store.readCursors(identity.user_id, nowMs());
+		} catch {
+			return;
+		}
+		for (const peer of [socket, ...this.connectionsOf(identity.user_id, socket)]) {
+			for (const [roomId, read] of Object.entries(connectionAttachment(peer)?.reads ?? {})) {
+				const kept = cursors.get(roomId);
+				if (kept === undefined || Number(read) > Number(kept)) cursors.set(roomId, read);
+			}
+		}
+		for (const roomId of roomIds) {
+			const read = cursors.get(roomId);
+			if (read !== undefined) this.deliverTo(socket, { method: "activity", params: { room_id: roomId, from: identity, read_message_id: read } });
+		}
 	}
 
 	/**
@@ -3931,6 +4047,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private connectionGone(attachment: ConnectionAttachment | null): void {
 		if (!attachment?.userId || (attachment.tier !== "anonymous" && attachment.tier !== "registered")) return;
+		if (attachment.reads) this.flushReads(attachment, nowMs());
 		this.touchPresence(attachment.userId, nowMs(), { hold: true, closing: attachment });
 	}
 
@@ -4495,6 +4612,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			result.users = sortedUsers(users.values());
 		}
 		this.reply(socket, request, this.boundedListing(result));
+		if (result.joined?.length) this.sendReadCursors(socket, attachment, result.joined.map((room) => room.room_id));
 	}
 
 	/**

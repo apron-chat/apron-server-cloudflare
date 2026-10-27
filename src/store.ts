@@ -1368,6 +1368,17 @@ const SCHEMA_10_COPIED_COLUMNS: Record<string, readonly string[]> = {
  * became `offline`, in the row a member listing reads anyway; it is the
  * last column, added to an older schema 9 object without a new version
  * (ensureSeenColumn()).
+ *
+ * Schema 10 (upgradeFromSchema9): every table keyed by text or by more than
+ * one column is `WITHOUT ROWID`, so its key is the table rather than a
+ * second index each insert writes. `records` is indexed by `log_id` only:
+ * commit times follow log order, so retention walks that index.
+ * `message_state` points at each message's latest record rather than
+ * holding a copy of it. `log_state` is written by retention only; each
+ * commit's head is the newest record, which `logState()` reads and keeps.
+ * `read_cursors` keeps each registered user's `read_message_id` (protocol
+ * §4.6) for each room they joined, keyed by user and room, at most one a
+ * membership (saveReadCursors), deleted with it.
  */
 const SCHEMA_DDL = `
   CREATE TABLE IF NOT EXISTS _meta (
@@ -1458,7 +1469,6 @@ const SCHEMA_DDL = `
     message_id INTEGER NOT NULL,
     PRIMARY KEY (user_id, room_id)
   ) WITHOUT ROWID;
-  CREATE INDEX IF NOT EXISTS read_cursors_room_idx ON read_cursors (room_id);
   CREATE TABLE IF NOT EXISTS credentials (
     credential_id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
@@ -2618,7 +2628,8 @@ export class Store {
     // Moving a row keyed or indexed by the user_id reads its index entry and
     // row and rewrites both (measured: about 2 reads and 3 writes each);
     // rewriting a record's JSON in place is one write.
-    const moved = membershipRows + found.reactions.length + found.uploads + found.pushes + found.requests + USER_LIMIT_SCOPES.length;
+    // Memberships, and as many read cursors at most.
+    const moved = 2 * membershipRows + found.reactions.length + found.uploads + found.pushes + found.requests + USER_LIMIT_SCOPES.length;
     const rewritten = found.records.length + found.messages.length + found.created.length;
     const cost = { reads: 64 + 4 * moved + 2 * rewritten + this.userRoomsReads(), writes: 32 + 4 * moved + 2 * rewritten };
     return this.reserved(cost, false, now, () => this.transaction(() => {
@@ -2626,6 +2637,7 @@ export class Store {
       this.rawExec("UPDATE identities SET user_id = ?, updated_ms = ? WHERE user_id = ?", to, this.effectiveNow(now), from);
       this.rawExec("UPDATE credentials SET user_id = ? WHERE user_id = ?", to, from);
       this.rawExec("UPDATE memberships SET user_id = ? WHERE user_id = ?", to, from);
+      this.rawExec("UPDATE read_cursors SET user_id = ? WHERE user_id = ?", to, from);
       for (const row of found.created) {
         this.rawExec("UPDATE rooms SET fields_json = ? WHERE room_id = ?", JSON.stringify({ ...parseJson<Record<string, unknown>>(row.fields_json, {}), creator_id: to }), row.room_id);
       }
@@ -2723,12 +2735,14 @@ export class Store {
     // Per user: memberships (live and awaiting a room purge), a day's dedup
     // rows, limiter rows, push subscriptions, credential and identity; each
     // deletion also updates its indexes.
-    const perUser = 64 + 4 * (MAX_USER_ROOMS + MAX_PURGE_ROOMS) + 4 * Math.max(this.config.registeredPostsPerDay, this.config.trustedPostsPerDay) + 4 * uploadsPerOwner +
+    const perUser = 64 + 8 * (MAX_USER_ROOMS + MAX_PURGE_ROOMS) + 4 * Math.max(this.config.registeredPostsPerDay, this.config.trustedPostsPerDay) + 4 * uploadsPerOwner +
       4 * (MAX_PUSH_SUBSCRIPTIONS_PER_USER + MAX_PUSH_WAKES_PER_USER + 1 + MAX_ROOM_MUTES_PER_USER);
     // Every room row is read for its creator, and each one theirs rewritten.
     const roomRows = MAX_ROOM_ROWS + MAX_PURGE_ROOMS;
     const cost = { reads: 64 + 5 * records + 2 * roomRows + ids.length * perUser, writes: 64 + 4 * records + 2 * roomRows + ids.length * perUser };
     return this.reserved(cost, false, now, () => this.transaction(() => {
+      // Their records may be the newest.
+      this.writeLogHead();
       const messages = this.rawRows<{ message_id: string }>(`SELECT message_id FROM message_state WHERE author_id IN (${marks})`, ...ids)
         .map((row) => row.message_id);
       const messageMarks = messages.map(() => "?").join(", ");
@@ -2775,7 +2789,7 @@ export class Store {
         ...ids, ...ids,
       );
       this.rawExec(`UPDATE rooms SET fields_json = json_remove(fields_json, '$.creator_id') WHERE json_extract(fields_json, '$.creator_id') IN (${marks})`, ...ids);
-      for (const table of ["memberships", "credentials", "push_subscriptions", "push_wakes", "user_status", "room_mutes", "accepted_requests", "identities"]) {
+      for (const table of ["memberships", "read_cursors", "credentials", "push_subscriptions", "push_wakes", "user_status", "room_mutes", "accepted_requests", "identities"]) {
         this.rawExec(`DELETE FROM ${table} WHERE user_id IN (${marks})`, ...ids);
       }
       // Their limiter rows, by primary key, and the count the cap reads lowered by as many.
@@ -2791,6 +2805,19 @@ export class Store {
       if (identities) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(Math.max(0, this.metaNumber("identity_count") - identities)));
       return { messages: messages.length, reactions: integerColumn(reactions), deletedUploads };
     }), true);
+  }
+
+  /**
+   * Writes the log's head as kept here (logCache) to `log_state`, with
+   * `floor` as its history floor if given, before records are deleted:
+   * otherwise the newest record, which a later wake reads the head from,
+   * may be one of them, and log IDs already issued would be issued again.
+   */
+  private writeLogHead(floor?: number): RawLogState {
+    const head = this.logState();
+    this.rawExec("UPDATE log_state SET history_floor = ?, last_log_id = MAX(last_log_id, ?), last_commit_ms = MAX(last_commit_ms, ?) WHERE id = 1",
+      floor ?? head.history_floor, head.last_log_id, head.last_commit_ms);
+    return head;
   }
 
   /** Replaces one logged record's JSON, or deletes the record when `json` is null. */
@@ -3863,7 +3890,10 @@ export class Store {
         }
         this.chargePosting({ userId: input.actorId ?? input.userId, tier: "registered", ipKey: input.ipKey, now: effective });
         if (input.join) this.rawExec("INSERT INTO memberships (room_id, user_id) VALUES (?, ?)", input.roomId, input.userId);
-        else this.rawExec("DELETE FROM memberships WHERE room_id = ? AND user_id = ?", input.roomId, input.userId);
+        else {
+          this.rawExec("DELETE FROM memberships WHERE room_id = ? AND user_id = ?", input.roomId, input.userId);
+          this.rawExec("DELETE FROM read_cursors WHERE user_id = ? AND room_id = ?", input.userId, input.roomId);
+        }
         const state = this.logState();
         const startLogId = state.last_log_id;
         const context: CommitContext = { state, commitMs: Math.max(effective, state.last_commit_ms), touched: new Map() };
@@ -4888,6 +4918,49 @@ export class Store {
   }
 
   /**
+   * A registered user's read cursors (protocol §4.6): the `read_message_id`
+   * kept for each room they joined that has one, by room. One range of the
+   * user's rows, at most one a membership; none costs nothing.
+   */
+  readCursors(userId: string, now = this.clock.now()): Map<string, string> {
+    this.ensureReady();
+    const rows = MAX_USER_ROOMS + MAX_PURGE_ROOMS;
+    return this.reserved({ reads: 8 + 2 * rows }, false, now, () => new Map(this.rawRows<{ room_id: string; message_id: number }>(
+      "SELECT room_id, message_id FROM read_cursors WHERE user_id = ? LIMIT ?", userId, rows,
+    ).map((row) => [row.room_id, idString(integerColumn(row.message_id))])));
+  }
+
+  /**
+   * Keeps a registered user's read cursors (protocol §4.6), each a room and
+   * the `read_message_id` read through, in `read_cursors`: only in rooms
+   * they are a member of, so a cursor goes with its membership (a leave,
+   * an expired room, `/purge`) and the table holds at most one a
+   * membership; and only forward, so cursors written from several
+   * connections, in any order, keep the furthest. Each is a primary-key
+   * probe of the membership (read alone, so member listings kept for reuse
+   * stay valid) and an upsert: a new cursor writes its row and its room
+   * index entry, a moved one its row, a cursor not past the kept one
+   * nothing.
+   */
+  saveReadCursors(input: { userId: string; cursors: ReadonlyArray<readonly [roomId: string, messageId: string]>; now?: number }): void {
+    const cursors = input.cursors.slice(0, MAX_USER_ROOMS);
+    if (!cursors.length) return;
+    this.ensureReady();
+    const now = input.now ?? this.clock.now();
+    this.reserved({ reads: 8 + 4 * cursors.length, writes: 8 + 4 * cursors.length }, false, now, () => this.transaction(() => {
+      this.effectiveNow(now);
+      for (const [roomId, messageId] of cursors) {
+        if (!this.rawRows("SELECT 1 FROM memberships WHERE room_id = ? AND user_id = ? LIMIT 1", roomId, input.userId).length) continue;
+        this.rawExec(
+          `INSERT INTO read_cursors (user_id, room_id, message_id) VALUES (?, ?, ?)
+           ON CONFLICT (user_id, room_id) DO UPDATE SET message_id = excluded.message_id WHERE excluded.message_id > read_cursors.message_id`,
+          input.userId, roomId, Number(messageId),
+        );
+      }
+    }));
+  }
+
+  /**
    * Settles a registered user's `seen` (protocol §4.5.2) for a change of
    * the status others see of them to `offline` at `at` (epoch
    * milliseconds) that is not a chosen `invisible` (setStatus settles that
@@ -5774,10 +5847,7 @@ export class Store {
       const fresh = oldest.findIndex((row) => integerColumn(row.commit_ms) >= cutoff);
       const expired = fresh === -1 ? oldest : oldest.slice(0, fresh);
       if (expired.length) floor = Math.max(floor, expired[expired.length - 1].log_id + 1);
-      // The floor, with the log's head as kept here (logCache): records it may be about to delete said the head.
-      const head = this.logState();
-      this.rawExec("UPDATE log_state SET history_floor = ?, last_log_id = MAX(last_log_id, ?), last_commit_ms = MAX(last_commit_ms, ?) WHERE id = 1",
-        floor, head.last_log_id, head.last_commit_ms);
+      const head = this.writeLogHead(floor);
       this.rawExec("UPDATE maintenance SET cleanup_cutoff_ms = ?, cleanup_cursor = ?, next_cleanup_ms = ? WHERE id = 1", cutoff, floor, effective + 1000);
       this.assertReservation(reserved, beforeReads, beforeWrites);
       this.logCache = { ...head, history_floor: floor };
@@ -5827,7 +5897,11 @@ export class Store {
         const roomId = purge[0];
         const members = this.rawRows<{ user_id: string }>("SELECT user_id FROM memberships WHERE room_id = ? LIMIT ?", roomId, remaining + 1);
         const batchRows = members.slice(0, remaining);
-        for (const row of batchRows) this.rawExec("DELETE FROM memberships WHERE room_id = ? AND user_id = ?", roomId, row.user_id);
+        // Each member's read cursor goes with the membership (saveReadCursors keeps none without one).
+        for (const row of batchRows) {
+          this.rawExec("DELETE FROM memberships WHERE room_id = ? AND user_id = ?", roomId, row.user_id);
+          this.rawExec("DELETE FROM read_cursors WHERE user_id = ? AND room_id = ?", row.user_id, roomId);
+        }
         memberships += batchRows.length;
         remaining -= batchRows.length;
         if (members.length > batchRows.length) break;
