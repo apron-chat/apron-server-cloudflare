@@ -5965,26 +5965,41 @@ export class Store {
     });
     const result = this.transaction(() => {
       let remaining = batch;
-      const records = this.rawRows<{ room_id: string; log_id: number; kind: string; message_id: string | null }>(
-        `SELECT room_id, log_id, kind, json_extract(record_json, '$.message_id') AS message_id
+      const expiring = this.rawRows<{ room_id: string; log_id: number; kind: string; message_id: string | null; reactions_json: string | null }>(
+        `SELECT room_id, log_id, kind, json_extract(record_json, '$.message_id') AS message_id,
+           CASE WHEN kind = 'reactions' THEN record_json END AS reactions_json
          FROM records INDEXED BY records_log_idx WHERE log_id < ? ORDER BY log_id LIMIT ?`, floor, remaining,
       );
       // Current state survives while its latest record is retained, so it
       // goes with that record: a message's state row with its latest
-      // snapshot, a reaction set with the record that logged it. A move's
-      // record is stored in both rooms, so the second finds the row gone.
+      // snapshot, and each reaction set with the record that logged it, by
+      // its whole primary key (the users the record names), so a delete
+      // reads and writes at most the row it removes. A move's record is
+      // stored in both rooms, so the second finds the rows gone. Each state
+      // row counts against the batch with its record: a record whose state
+      // would not fit waits for the next batch, below the floor already.
+      const records: typeof expiring = [];
       let messages = 0;
       let reactions = 0;
-      for (const row of records) {
+      for (const row of expiring) {
+        const users = row.kind === "reactions" && row.message_id !== null && row.reactions_json !== null
+          ? parseJson<ReactionsRecord>(row.reactions_json).reactions.map((set) => set.from.user_id)
+          : [];
+        const state = row.message_id === null ? 0 : row.kind === "message" ? 1 : users.length;
+        if (records.length > 0 && 1 + state > remaining) break;
         this.rawExec("DELETE FROM records WHERE room_id = ? AND log_id = ?", row.room_id, row.log_id);
+        records.push(row);
+        remaining -= 1 + state;
         if (row.message_id === null) continue;
         if (row.kind === "message") {
-          messages += this.rawExec("DELETE FROM message_state WHERE message_id = ? AND latest_log_id = ?", row.message_id, row.log_id).rowsWritten ? 1 : 0;
-        } else if (row.kind === "reactions") {
-          reactions += this.rawExec("DELETE FROM reaction_state WHERE message_id = ? AND log_id = ?", row.message_id, row.log_id).rowsWritten ?? 0;
+          if (this.rawExec("DELETE FROM message_state WHERE message_id = ? AND latest_log_id = ?", row.message_id, row.log_id).rowsWritten) messages += 1;
+        } else {
+          for (const userId of users) {
+            if (this.rawExec("DELETE FROM reaction_state WHERE message_id = ? AND user_id = ? AND log_id = ?", row.message_id, userId, row.log_id).rowsWritten) reactions += 1;
+          }
         }
       }
-      remaining -= records.length;
+      remaining = Math.max(0, remaining);
       // A thread or private room whose entire log (creation record included)
       // has been discarded leaves the visible set. No message, reaction, or
       // membership can still be current in it: each touches the room's head

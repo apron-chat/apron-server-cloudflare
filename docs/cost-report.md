@@ -39,9 +39,16 @@ Measured against schema 10 the same day. Schema 11 drops what no query needs:
 
 - `message_state_latest_idx` and `reaction_state_log_idx`, which cleanup
   used to find expired state. Cleanup now deletes a message's state row
-  with its latest record, and a reaction set with the record that logged
-  it (a primary-key probe, and a key range of one message's sets), so every
-  message write and reaction set writes one index entry fewer.
+  with its latest record, and each reaction set with the record that
+  logged it, by its whole primary key from the users the record names, so
+  every message write and reaction set writes one index entry fewer. Each
+  state delete reads and writes at most the row it removes, and counts
+  against the batch with its record: a move's record, which names every set
+  of its message (up to 64), costs 65 of a batch's 100. Deleting a
+  message's sets by key prefix instead would read every set it holds for
+  each expiring record, which a popular message's history could take past
+  the cleanup reservation (`test/history.integration.test.ts`, 100 records
+  each naming 64 sets).
 - `push_subscriptions_user_idx` and the partial `push_subscriptions_waking_idx`:
   a user's registrations are a primary-key range of at most
   `subscriptionsPerUser`, sorted after reading. A registration writes 4 rows
@@ -919,8 +926,8 @@ cleanup physical delete:
   SEARCH records USING COVERING INDEX records_log_idx (log_id<?)
 message state expiry (with its latest record):
   SEARCH message_state USING PRIMARY KEY (message_id=?)
-reaction state expiry (with the record that logged it):
-  SEARCH reaction_state USING PRIMARY KEY (message_id=?)
+reaction state expiry (each set the record names, by its whole key):
+  SEARCH reaction_state USING PRIMARY KEY (message_id=? AND user_id=?)
 a wake's registrations (one user's):
   SEARCH push_subscriptions USING PRIMARY KEY (user_id=?)
   USE TEMP B-TREE FOR ORDER BY

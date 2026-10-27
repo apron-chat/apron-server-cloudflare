@@ -379,6 +379,52 @@ it("does not exceed the native cleanup reservation for a full bounded batch", as
 	});
 });
 
+it("keeps every cleanup batch within its reservation when expiring records name many reaction sets", async () => {
+	await withStore("cleanup-reaction-sets", { cleanupBatch: 100 }, (store, clock, state) => {
+		// The worst case for state deleted with its record: one message holding
+		// 64 reaction sets, and 100 expired reactions records each naming all of
+		// them (a move re-logs every set in one record). Deleting a message's sets
+		// by a key prefix would read all 64 for every record.
+		const sql = state.storage.sql;
+		const expiredAt = clock.value - RETENTION_MS - 1;
+		const users = Array.from({ length: 64 }, (_, index) => `reactor-${index}`);
+		sql.exec("DELETE FROM records");
+		const message = JSON.stringify({ message_id: "1", log_id: "1", room_id: "general", from: { user_id: "author", name: "Author" }, body: { format: "plain", text: "popular" } });
+		sql.exec("INSERT INTO records (room_id, log_id, commit_ms, kind, record_json) VALUES ('general', 1, ?, 'message', ?)", expiredAt, message);
+		sql.exec("INSERT INTO message_state (message_id, room_id, latest_log_id, author_id) VALUES ('1', 'general', 1, 'author')");
+		for (let logId = 2; logId <= 101; logId += 1) {
+			const record = JSON.stringify({ log_id: `${logId}`, message_id: "1", room_id: "general", reactions: users.map((userId) => ({ from: { user_id: userId }, emojis: ["x"] })) });
+			sql.exec("INSERT INTO records (room_id, log_id, commit_ms, kind, record_json) VALUES ('general', ?, ?, 'reactions', ?)", logId, expiredAt, record);
+		}
+		// Each set points at the newest record that logged it.
+		for (const userId of users) {
+			sql.exec("INSERT INTO reaction_state (message_id, user_id, log_id, from_json, emojis_json) VALUES ('1', ?, 101, ?, '[\"x\"]')", userId, JSON.stringify({ user_id: userId }));
+		}
+		sql.exec("UPDATE rooms SET created_log_id = 1, record_log_id = 1, latest_log_id = 101 WHERE room_id = 'general'");
+		sql.exec("UPDATE log_state SET last_log_id = 101, history_floor = 1, last_commit_ms = ?", expiredAt);
+		sql.exec("UPDATE maintenance SET next_cleanup_ms = ?, cleanup_cutoff_ms = NULL, cleanup_cursor = NULL WHERE id = 1", clock.value);
+
+		clock.value += RETENTION_MS + 1;
+		const deleted = { records: 0, messages: 0, reactions: 0 };
+		for (let run = 0; run < 200; run += 1) {
+			const before = store.storageAccounting();
+			const result = store.runCleanup(clock.value);
+			const after = store.storageAccounting();
+			expect(after.writes - before.writes).toBeLessThanOrEqual(after.reservedWrites - before.reservedWrites);
+			expect(after.reads - before.reads).toBeLessThanOrEqual(after.reservedReads - before.reservedReads);
+			deleted.records += result.deleted_records;
+			deleted.messages += result.deleted_messages;
+			deleted.reactions += result.deleted_reactions;
+			if (!result.did_work && result.next_due_ms > clock.value) break;
+			clock.value = result.next_due_ms + 1;
+		}
+		expect(deleted).toEqual({ records: 101, messages: 1, reactions: 64 });
+		expect(store.accountingStatus().unsafe).toBe(false);
+		expect(sql.exec("SELECT COUNT(*) AS count FROM reaction_state").one().count).toBe(0);
+		expect(sql.exec("SELECT COUNT(*) AS count FROM message_state").one().count).toBe(0);
+	});
+});
+
 it("finishes removing an expired thread room after a saturated batch", async () => {
 	// Regression: the room was left over when the deletion pass filled the
 	// batch, and the next run's idle check ended the job before removing it.
