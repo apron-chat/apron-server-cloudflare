@@ -3156,9 +3156,11 @@ export class Store {
    * don't undercut them (moving a long conversation into a thread is one
    * post per message, and more for one with many reactors:
    * MOVE_REACTION_SETS_PER_POST). An owner's bot (tier `bot`) is never
-   * trusted. The global limits hold for everyone.
+   * trusted. The global limits hold for everyone. A refusal names the
+   * `write` category (extension `ext:limits`), unless `uncategorized`: a
+   * `me` request, which the `write` row does not list.
    */
-  private chargePosting(input: { userId: string; tier: Tier; ipKey: string; now: number; weight?: number }): void {
+  private chargePosting(input: { userId: string; tier: Tier; ipKey: string; now: number; weight?: number; uncategorized?: boolean }): void {
     const { userId, tier, ipKey, now } = input;
     const weight = Math.max(1, input.weight ?? 1);
     const trusted = tier === "registered" && this.holdsAnyRole(userId);
@@ -3203,7 +3205,7 @@ export class Store {
         }
       }
     }
-    if (retryAfterMs > 0) throw new StoreError("retry_after", reason, { retryAfterMs, data: limitData("write") });
+    if (retryAfterMs > 0) throw new StoreError("retry_after", reason, { retryAfterMs, ...(input.uncategorized ? {} : { data: limitData("write") }) });
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index];
       const dailyCount = (row.day === daily ? row.posts_day : 0) + weight;
@@ -5600,7 +5602,7 @@ export class Store {
           return value;
         };
         const tier: Tier = this.identityRow(input.userId) ? "registered" : "anonymous";
-        this.chargePosting({ userId: input.userId, tier, ipKey: input.ipKey, now: effective });
+        this.chargePosting({ userId: input.userId, tier, ipKey: input.ipKey, now: effective, uncategorized: method === "me" });
         let committed: StoreMutationResult;
         if (method === "me") {
           committed = this.commitMeMutation(input, effective);

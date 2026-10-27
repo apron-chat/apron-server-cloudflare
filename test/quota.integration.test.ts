@@ -123,7 +123,7 @@ it('returns the longest applicable retry window and never replenishes on a backw
 	});
 });
 
-it('names every posting refusal `write` (ext:limits), memberships and reactions included', async () => {
+it('names every posting refusal of the write row `write` (ext:limits), memberships and reactions included, and a `me` refusal none', async () => {
 	await runInDurableObject(env.DEMO.getByName('quota-limits-write'), (_instance, state) => {
 		let now = (Math.floor(Date.now() / DAY) + 1) * DAY + 43_200_000;
 		const store = new Store(state, { registeredPostsPerMinute: 2, registeredPostsPerDay: 3, anonymousPostsPerMinute: 1, globalPostsPerDay: 5 }, { now: () => now });
@@ -140,7 +140,8 @@ it('names every posting refusal `write` (ext:limits), memberships and reactions 
 			identity: { user_id: userId }, params: { room_id: 'general', body: { text: 'bounded' } } });
 		const first = post('poster');
 		post('poster');
-		// The minute's limit, for a post, a reaction, a leave, and a profile change alike.
+		// The minute's limit, for a post, a reaction and a leave alike; a profile
+		// change shares it, but `me` is not in the write row, so it names none.
 		const minute = refusal(() => post('poster'));
 		expect(minute.message).toBe('Posting limit reached');
 		expect(minute.data).toEqual(write);
@@ -148,7 +149,7 @@ it('names every posting refusal `write` (ext:limits), memberships and reactions 
 			params: { message_id: first.result.message_id, reactions: ['👍'] } })).data).toEqual(write);
 		expect(refusal(() => store.changeMembership({ userId: 'poster', ipKey: 'poster-ip', roomId: 'general', join: false, now })).data).toEqual(write);
 		expect(refusal(() => store.mutate({ userId: 'poster', ipKey: 'poster-ip', method: 'me', now, identity: { user_id: 'poster' },
-			params: { name: 'Renamed' } })).data).toEqual(write);
+			params: { name: 'Renamed' } })).data).toBeUndefined();
 		// A guest's own.
 		post('guest');
 		const guest = refusal(() => post('guest'));
