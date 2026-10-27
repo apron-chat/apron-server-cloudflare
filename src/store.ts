@@ -5363,9 +5363,8 @@ export class Store {
   /**
    * Normalize a reaction set (§4.7): strings, bounded, each emoji sequence
    * fully qualified (qualifyEmoji), and duplicates collapsed, entries that
-   * differ only in U+FE0F included. An entry that looks like a custom emoji
-   * key (extension `ext:emoji`) must be in the catalog, else it is
-   * `invalid_params`; only such an entry reads the catalog.
+   * differ only in U+FE0F included. Custom emoji keys (extension
+   * `ext:emoji`) are checked against the catalog by commitReactions.
    */
   private normalizedEmojis(value: unknown): string[] {
     if (!Array.isArray(value)) throw new StoreError("invalid_params", "emojis must be an array");
@@ -5376,7 +5375,6 @@ export class Store {
       // eslint-disable-next-line no-control-regex
       if (utf8Bytes(item) > MAX_EMOJI_BYTES) throw new StoreError("too_large", "emoji is too long");
       if (/[\u0000-\u001f\u007f]/.test(item)) throw new StoreError("invalid_params", "emoji is not a single sequence");
-      if (isEmojiKey(item) && !this.loadEmojiCatalog().keys.has(item)) throw new StoreError("invalid_params", `${item} is not a custom emoji here`.slice(0, 200));
       const entry = isEmojiKey(item) ? item : qualifyEmoji(item);
       const identity = emojiIdentity(entry);
       if (seen.has(identity)) continue;
@@ -5404,6 +5402,15 @@ export class Store {
       message.message_id, input.userId,
     )[0];
     const currentSet = existing && existing.log_id >= floor ? parseJson<string[]>(existing.emojis_json, []) : [];
+    // A custom emoji key (extension `ext:emoji`) must be in the catalog, or
+    // already in the user's current set on this message: a request carries
+    // the whole set, so a removed emoji must not stop the user from changing
+    // their other reactions. Only a key not already in the set reads the catalog.
+    for (const emoji of emojis) {
+      if (isEmojiKey(emoji) && !currentSet.includes(emoji) && !this.loadEmojiCatalog().keys.has(emoji)) {
+        throw new StoreError("invalid_params", `${emoji} is not a custom emoji here`.slice(0, 200));
+      }
+    }
     // An unchanged set produces no record (§4.7 permits no change); entries
     // that differ only in U+FE0F are the same.
     const current = new Set(currentSet.map(emojiIdentity));

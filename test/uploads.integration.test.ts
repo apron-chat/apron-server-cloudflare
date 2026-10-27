@@ -808,6 +808,12 @@ describe('uploads end to end', () => {
 			await expect.poll(async () => await media().head(keyOf(replaced[':partyparrot:'].url))).toBeNull();
 			await expect.poll(async () => await media().head(keyOf(firstUrl))).toBeNull();
 			expect(await media().head(keyOf(secondUrl))).not.toBeNull();
+			// A removed key stays in a set that has it, so its user can still change their other reactions; nobody takes it up.
+			const kept = await exchange(user, 'kept', 'reactions', { message_id: posted.result.message_id, emojis: [':partyparrot:'] });
+			expect(kept.frame.result).toEqual({});
+			expect(kept.skipped.find((frame) => frame.method === 'reactions')!.params.reactions[0].emojis).toEqual([':partyparrot:']);
+			expect((await request(admin, 'taken-up', 'reactions', { message_id: posted.result.message_id, emojis: [':partyparrot:'] })).error.code).toBe(-32602);
+			expect((await request(user, 'cleared', 'reactions', { message_id: posted.result.message_id, emojis: [] })).result).toEqual({});
 			expect((await request(user, 'gone', 'reactions', { message_id: posted.result.message_id, emojis: [':partyparrot:'] })).error.code).toBe(-32602);
 		} finally { admin.close(); watcher.close(); user.close(); }
 	});

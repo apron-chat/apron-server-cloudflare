@@ -364,7 +364,8 @@ a custom emoji with `/emoji add :name:` (and one image), `ext:emoji` carries
 `server.params.ext.emoji.catalog_url`, the catalog's URL on the media origin,
 which changes with every `/emoji add` or `/emoji remove`; each change sends
 every connection a new `server` frame. A reaction may then use a key the
-catalog has; one it lacks is `invalid_params`. Reactions are stored fully
+catalog has, or one already in the user's set on that message; any other key
+is `invalid_params`. Reactions are stored fully
 qualified, and entries that differ only in U+FE0F are one entry. The ping interval is the standard `server.params.ping`.
 The demo's 16 KiB frame policy is an explicit exception to the base protocol's
 advisory 256 KiB recommendation. Payload lengths count UTF-8 bytes. Errors use
