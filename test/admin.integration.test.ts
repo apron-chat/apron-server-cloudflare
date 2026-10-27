@@ -469,8 +469,12 @@ it('room_join and room_leave with a user_id add and remove others: an admin anyo
 		expect(joined.frame.params.joined[0].members.map((member: { user_id: string }) => member.user_id)).toEqual(['admin', bobId].sort());
 		// `users` are current objects: the admin's carry its role (§3.3), and each
 		// their status (§4.5). The admin signed in earlier in this file, so what
-		// others were last told of them may still be waiting out a minute.
-		expect(joined.frame.params.users).toContainEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'], status: expect.stringMatching(/^(online|offline)$/) });
+		// others were last told of them may still be waiting out a minute; an
+		// offline one carries when it went offline (`seen`, §4.5.2).
+		const listedAdmin = joined.frame.params.users.find((user: { user_id: string }) => user.user_id === 'admin');
+		expect(listedAdmin).toEqual(listedAdmin.status === 'offline'
+			? { user_id: 'admin', name: 'Admin', roles: ['admin'], status: 'offline', seen: expect.stringMatching(/^\d+$/) }
+			: { user_id: 'admin', name: 'Admin', roles: ['admin'], status: 'online' });
 		expect(joined.frame.params.users).toContainEqual({ user_id: bobId, name: `Name of ${bobId}`, roles: [], status: 'online' });
 		// Adding a member again changes nothing.
 		expect((await exchange(admin, 'add-bob-again', 'room_join', { room_id: roomId, user_id: bobId })).skipped.some((frame) => frame.params?.memberships)).toBe(false);

@@ -32,12 +32,22 @@ for a zero-overage deployment.
   The push waits 30 seconds first, and doesn't go if they come back or
   post in that room meanwhile.
 - **Who's around.** With push on, member lists show each user as online,
-  idle, busy (`dnd`), or offline, and a user can choose `dnd`, `invisible`,
-  or no status at all with `me`. A chosen status shows at once; changes
-  the connections cause are coalesced to one a minute per user, a closed
-  tab counts after a minute's grace, and a peer that vanishes without
-  closing only once it is found stale (150 seconds without a ping), all
-  with no SQL or alarms of their own.
+  idle, busy (`dnd`), or offline, with when they were last `seen`, and a
+  user can choose `dnd`, `invisible`, or no status at all with `me`. A
+  chosen status shows at once; changes the connections cause are coalesced
+  to one a minute per user, a closed tab counts after a minute's grace, and
+  a peer that vanishes without closing only once it is found stale (150
+  seconds without a ping), all with no alarms of their own and no SQL but
+  `seen`'s: two charged rows (their identity row and the day's budget row)
+  when a signed-in user's last connection closes, or one more row with a
+  chosen `invisible`, at most once in 10 minutes per user. Within 10
+  minutes of the last one recorded, going offline again shows that one,
+  even if others saw them online in between (a deviation from the
+  protocol's "last went offline"; see [SPEC](SPEC.md)), so `seen` may be
+  up to 10 minutes earlier than the real departure, and
+  reloads and reconnects write it at most once in 10 minutes (a reload
+  shows nothing, but its close may record its time, which a departure
+  within the next 10 minutes then shows).
 - **Bring your own frontend.** Guest connections are accepted from any
   origin — even `localhost` or a browser console.
 - **Built to stay inside its plan.** Every operation is metered against

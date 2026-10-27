@@ -165,8 +165,17 @@ export const FREE_PLAN: Plan = Object.freeze({
 		// User status: connected users' from their connection attachments,
 		// with no SQL; a listing reads each listed member's chosen status
 		// with them, nothing for members who never chose one or muted
-		// (measured). Requests are already this plan's scarcest allowance
-		// after SQL writes; status adds none.
+		// (measured), and their `seen` from the identity row it reads anyway,
+		// as a sign-in does. A registered user shown offline writes their
+		// `seen` (2 charged rows, measured: the identity row and the budget
+		// row) when their last connection closes, or with a chosen
+		// `invisible` (4 rows, measured, where the status alone is 3), but
+		// at most once in SEEN_WRITE_GRANULARITY_MS (10 minutes): within it
+		// the stored one is shown again, so reloads and reconnects within it
+		// write nothing, several tabs closing together write once, and one
+		// account writes at most 144 a day (288 rows, 0.5% of the
+		// foreground writes). Requests are already this plan's
+		// scarcest allowance after SQL writes; status adds none.
 		presence: true,
 	}),
 });

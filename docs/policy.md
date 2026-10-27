@@ -151,12 +151,34 @@ within it:
   so a reload or a phone reconnecting shows nothing. A peer that vanishes
   without closing (a sleeping laptop) counts as gone only once it is found
   stale, 150 seconds after its last ping, and then waits the same minute.
-  A status a user chooses is shown at once.
+  A status a user chooses is shown at once. A user shown `offline` carries
+  `seen`, when they went offline (when their last connection closed, or
+  when they chose `invisible`), in the notification and in later listings.
+  It changes only when they go offline, or when presence is turned back
+  on (below), so an invisible user's connections never move it, and their
+  own `you` never carries it. It is recorded at most once in 10 minutes:
+  going offline again within 10 minutes of the last one recorded shows
+  that one again, even if others saw them online in between (a deviation
+  from protocol §4.5.2, whose `seen` is when they last went offline), so
+  `seen` may be up to 10 minutes earlier than the real departure, to keep
+  `seen` to at most 144 writes per account a day. Going offline after a
+  longer absence always records a new
+  one, however briefly they were back. It is recorded as the last
+  connection closes, before the minute's wait: so a reload, which shows
+  nothing, still records its time when the last one is over 10 minutes
+  old, and leaving within the next 10 minutes then shows that reload's
+  time, at most 10 minutes early like any other. Several tabs closing
+  together are one departure, recorded once. Users with none recorded are
+  shown `offline` without `seen`.
   `PRESENCE` (`true` or `false`) overrides the plan, and admins can turn it
   off and on with `/toggle presence`; turning it off tells connected
   clients to clear the statuses they were shown, and listings then show
   `""` for everyone; turning it on sends each connected client the
-  statuses others see, as after signing in. Invisibility hides
+  statuses others see, as after signing in, and every user then shown
+  `offline`, connected (`invisible`) or not, is shown offline since then,
+  unless a later `seen` is recorded (one value for all, so it tells
+  nothing of anyone's connections, and records nothing per user).
+  Invisibility hides
   presence only: posts, reactions, typing and room joins still show.
 - Push (`server.push` kind `webpush`, where VAPID keys are set): registered
   users register a browser's push subscription with `push_register`

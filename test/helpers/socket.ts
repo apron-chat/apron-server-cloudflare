@@ -11,17 +11,18 @@ export type ConnectOptions = {
 	host?: string;
 	/**
 	 * Keep the frames that only tell another user's `status` (§4.5): `user`
-	 * `{"new": {"user_id", "status"}}`, which every connection gets as others
-	 * sign in, change, and leave. Left out by default, for tests about
-	 * anything else.
+	 * `{"new": {"user_id", "status"}}`, with `seen` for a change to
+	 * `offline`, which every connection gets as others sign in, change, and
+	 * leave. Left out by default, for tests about anything else.
 	 */
 	statuses?: boolean;
 };
 
-/** Whether a frame only tells another user's `status` (§4.5). */
+/** Whether a frame only tells another user's `status` (§4.5), with its `seen` (§4.5.2). */
 export function statusOnly(frame: Frame): boolean {
 	const user = frame.method === "user" && !frame.params?.old ? frame.params?.new : undefined;
-	return !!user && Object.keys(frame.params).length === 1 && Object.keys(user).sort().join() === "status,user_id";
+	const keys = user ? Object.keys(user).sort().join() : "";
+	return !!user && Object.keys(frame.params).length === 1 && (keys === "status,user_id" || keys === "seen,status,user_id");
 }
 
 /** Opens a WebSocket to the Worker and queues its frames for `next()`. */

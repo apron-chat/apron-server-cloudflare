@@ -17,6 +17,7 @@ import {
   MAX_PRIVATE_MEMBERSHIPS_PER_USER,
   MAX_PRIVATE_ROOM_LIMIT,
   MAX_THREAD_LIMIT,
+  SEEN_WRITE_GRANULARITY_MS,
   type PushPolicy,
   type UploadPolicy,
 } from "./budget";
@@ -49,15 +50,17 @@ const ROOM_TITLE = "General";
  * snapshots, reaction sets, and registered users' memberships), a
  * `memberships` table of registered users' joined rooms, indexed both ways,
  * with each room's count of them, the `uploads` held in R2 with each
- * identity's avatar, each identity's roles and `ext` in its row, and the
- * `push_subscriptions`, `push_wakes`, `user_status` and `room_mutes` tables,
- * with each limiter row's token bucket (limiter.ts) and each day's count of
- * history pages. Schema 8, which the deployed object holds, is upgraded in
- * place (see upgradeFromSchema8()), as is schema 7 on the way to it (see
- * upgradeFromSchema7()); stored data from any other schema version is not
- * migrated: the object is wiped and started fresh (see resetStorage()).
- * Additive rows need no new version: an absent `_meta` row reads as its
- * initial value.
+ * identity's avatar, each identity's roles, `ext` and `seen` in its row, and
+ * the `push_subscriptions`, `push_wakes`, `user_status` and `room_mutes`
+ * tables, with each limiter row's token bucket (limiter.ts) and each day's
+ * count of history pages. Schemas 8 and 7 are upgraded in place (see
+ * upgradeFromSchema8() and upgradeFromSchema7()); stored data from any
+ * other schema version is not migrated: the object is wiped and started
+ * fresh (see resetStorage()). Additive changes that older code ignores need
+ * no new version, so redeploying that code keeps everything: an absent
+ * `_meta` row reads as its initial value, and the identities' `seen_ms`
+ * column, which code before it never names, is added where missing on a
+ * wake (see ensureSeenColumn()).
  */
 export const SCHEMA_VERSION = 9;
 /** The oldest schema upgraded in place rather than reset; each one from it up to SCHEMA_VERSION is. */
@@ -663,6 +666,7 @@ interface RawIdentityRow {
   avatar_expires_ms: number;
   roles_json: string;
   ext_json: string;
+  seen_ms: number;
 }
 
 interface RawUploadRow {
@@ -797,6 +801,14 @@ const USER_LIMIT_SCOPES = ["post", "history", "upload", "push", "push_recipient"
  * or `off`, and is absent while the feature follows the deployment's default.
  */
 const META_TOGGLE_PREFIX = "toggle:";
+/**
+ * `_meta` key: when an admin last turned presence on with `/toggle`
+ * (epoch milliseconds), when the status others see of every user changed
+ * from `""` and so, for each user then shown `offline`, when that began
+ * (protocol §4.5.2 `seen`; see ApronDemoServer.seenFloor). Written once per
+ * toggle; code before it ignores the row.
+ */
+const META_PRESENCE_ON = "presence_on_ms";
 /** Bytes all live uploads hold, pending writes at their largest (see startUpload). */
 const META_UPLOAD_BYTES = "upload_bytes";
 /**
@@ -817,6 +829,8 @@ const UPLOAD_WRITES = 16;
 const MAX_PUSH_SUBSCRIPTIONS_PER_USER = MAX_PUSHES_PER_MESSAGE;
 /** The tables a member listing reads (Store.roomMembers); a write to one invalidates reused listings. */
 const MEMBER_TABLES = /\b(identities|memberships|user_status)\b/;
+/** Store.ensureSeenColumn's probe: reads no row, and fails to compile where `seen_ms` is missing. */
+const SEEN_COLUMN_PROBE = "SELECT seen_ms FROM identities LIMIT 0";
 /**
  * Most `push_wakes` rows one user can hold: one per room they were woken
  * for, and wakes come only for messages in existing rooms (at most the
@@ -869,7 +883,8 @@ interface RoomMute {
  * A user's stored `status` state (protocol §4.5), read once at sign-in:
  * the `status` they chose with `me`, until when their unscoped mute lasts
  * (absent when not muted), and their room mutes in effect, in `room_id`
- * order.
+ * order. Their `seen` (§4.5.2) comes with the identity row the sign-in
+ * reads anyway (getIdentity), not from here.
  */
 export interface StatusInputRecord {
   choice: StatusChoice;
@@ -877,7 +892,10 @@ export interface StatusInputRecord {
   roomMutes: RoomMute[];
 }
 
-/** A registered room member as listings carry it, with the `status` they chose when asked for. */
+/**
+ * A registered room member as listings carry it, with the `status` they
+ * chose and their `seen` (absent when none is recorded) when asked for.
+ */
 interface RoomMember {
   user_id: string;
   name: string;
@@ -885,9 +903,10 @@ interface RoomMember {
   roles: string[];
   ext?: Record<string, unknown>;
   choice?: StatusChoice;
+  seen?: number;
 }
 
-/** One `roomMembers` row, with the chosen status when asked for. */
+/** One `roomMembers` row, with the chosen status and `seen` when asked for. */
 interface RawMemberRow {
   user_id: string;
   name: string | null;
@@ -896,6 +915,33 @@ interface RawMemberRow {
   roles_json: string | null;
   ext_json: string | null;
   status?: string | null;
+  seen_ms?: number | null;
+}
+
+/** A member row's chosen status and `seen`, as RoomMember carries them. */
+function statusColumns(row: RawMemberRow): Pick<RoomMember, "choice" | "seen"> {
+  const seen = seenColumn(row.seen_ms);
+  return { choice: choiceColumn(row.status), ...(seen !== undefined ? { seen } : {}) };
+}
+
+/** Refuses a `seen` that is not positive epoch milliseconds. */
+function assertSeen(seen: number): void {
+  if (!Number.isSafeInteger(seen) || seen <= 0) throw new StoreError("invalid_params", "invalid seen");
+}
+
+/**
+ * Whether a stored `seen` (protocol §4.5.2) stands for a change to `offline`
+ * at `at`: it is no more than SEEN_WRITE_GRANULARITY_MS before it (and not
+ * after it), so it is carried again rather than written.
+ */
+export function seenStands(stored: number | undefined, at: number): boolean {
+  return stored !== undefined && stored > 0 && stored <= at && at - stored <= SEEN_WRITE_GRANULARITY_MS;
+}
+
+/** A stored `seen_ms` as epoch milliseconds, or undefined for none (0). */
+function seenColumn(value: unknown): number | undefined {
+  const seen = integerColumn(value);
+  return seen > 0 ? seen : undefined;
 }
 
 /** A stored `status` choice: `online` when there is no row, and `""` for a value this server no longer knows. */
@@ -1277,7 +1323,11 @@ function ensureText(value: unknown, field: string, maxBytes: number): string {
  * §4.5): the `status` they chose with `me` and until when their unscoped
  * mute lasts, one row while either differs from the default (`online`, not
  * muted). `room_mutes` keeps their room mutes, keyed by user and room, at
- * most MAX_ROOM_MUTES_PER_USER a user.
+ * most MAX_ROOM_MUTES_PER_USER a user. Each identity's `seen_ms` (protocol
+ * §4.5.2 `seen`, 0 for none) is when the status others see of the user last
+ * became `offline`, in the row a member listing reads anyway; it is the
+ * last column, added to an older schema 9 object without a new version
+ * (ensureSeenColumn()).
  */
 const SCHEMA_DDL = `
   CREATE TABLE IF NOT EXISTS _meta (
@@ -1338,7 +1388,8 @@ const SCHEMA_DDL = `
     avatar_url TEXT NOT NULL DEFAULT '',
     avatar_expires_ms INTEGER NOT NULL DEFAULT 0,
     roles_json TEXT NOT NULL DEFAULT '[]',
-    ext_json TEXT NOT NULL DEFAULT ''
+    ext_json TEXT NOT NULL DEFAULT '',
+    seen_ms INTEGER NOT NULL DEFAULT 0
   );
   CREATE TABLE IF NOT EXISTS uploads (
     upload_key TEXT PRIMARY KEY,
@@ -1532,6 +1583,7 @@ export class Store {
     }
     if (version !== 0 && version !== SCHEMA_VERSION) throw new Error(`storage schema ${version} requires resetStorage()`);
     if (version === SCHEMA_VERSION) {
+      this.ensureSeenColumn();
       this.lastEffectiveMs = Math.max(this.lastEffectiveMs, this.storedEffectiveMs());
       const unsafeMarker = this.metaValue(META_ACCOUNTING_UNSAFE).trim().toLowerCase();
       if (unsafeMarker === "1" || unsafeMarker === "true") {
@@ -1663,14 +1715,52 @@ export class Store {
   }
 
   /**
+   * Adds the identities' `seen_ms` column (protocol §4.5.2 `seen`, 0 for
+   * none recorded) where a schema 9 object made by earlier code lacks it,
+   * once, in one transaction, without a new schema version: adding a column
+   * rewrites no row, and code before it names every identities column it
+   * reads or writes, so redeploying that code keeps everything and a later
+   * wake finds the column still there. Every wake probes for it with a
+   * statement that reads no row (it fails to compile without the column),
+   * charged as one read to the wake's handover allowance. The addition is
+   * charged like upgradeFromSchema7 (chargeUpgrade), and fails closed the
+   * same way.
+   */
+  private ensureSeenColumn(): void {
+    try {
+      this.rawRows(SEEN_COLUMN_PROBE);
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/no such column/i.test(message)) throw error;
+    }
+    const start = { reads: this.observed.reads, writes: this.observed.writes };
+    const effective = Number(this.metaValue(META_EFFECTIVE_NOW));
+    const day = dayFor(Math.max(Number.isSafeInteger(effective) ? effective : 0, this.clock.now()));
+    this.transaction(() => {
+      this.rawExec("ALTER TABLE identities ADD COLUMN seen_ms INTEGER NOT NULL DEFAULT 0");
+      this.chargeUpgrade(start, day);
+    });
+    console.warn(JSON.stringify({ event: "storage_column_added", table: "identities", column: "seen_ms" }));
+  }
+
+  /**
    * Ends an in-place upgrade's transaction: marks the new schema version and
-   * charges the rows it read and wrote (measured from `start`) to the day's
-   * maintenance reservation without a capacity check, like a reset's
-   * passkey carry, so an upgrade cannot be blocked by an exhausted budget.
+   * charges what it did (chargeUpgrade).
    */
   private finishUpgrade(version: number, start: { reads: number; writes: number }, day: string): void {
     this.rawExec("UPDATE _meta SET value = ? WHERE key = 'schema_version'", String(version));
     this.rawExec("UPDATE maintenance SET schema_version = ? WHERE id = 1", version);
+    this.chargeUpgrade(start, day);
+  }
+
+  /**
+   * Charges the rows an in-place upgrade read and wrote (measured from
+   * `start`) to the day's maintenance reservation without a capacity check,
+   * like a reset's passkey carry, so an upgrade cannot be blocked by an
+   * exhausted budget.
+   */
+  private chargeUpgrade(start: { reads: number; writes: number }, day: string): void {
     const cost = { reads: this.observed.reads - start.reads, writes: this.observed.writes - start.writes + 2 };
     this.ledger.addUnchecked(day, maintenanceDelta(cost));
     this.observed.reservedReads += cost.reads;
@@ -1689,8 +1779,10 @@ export class Store {
    * `general` membership, so users sign in again with the passkey they have
    * rather than deleting it and registering anew. The rows the carry reads
    * and writes are charged to the day's maintenance reservation below, with their roles
-   * (but `bot`, which no passkey holder has). Older passkeys past the cap, bots, and every session
-   * are dropped.
+   * (but `bot`, which no passkey holder has). Not their avatar, `ext` or
+   * `seen` (`seen_ms` starts at 0, none recorded, so a carried user is
+   * listed `offline` without `seen` until they next go offline). Older
+   * passkeys past the cap, bots, and every session are dropped.
    *
    * The guest-number high-water mark is carried over, so a guest ID is never
    * reissued across a reset (a wipe does not restart guests at `guest_1`).
@@ -1867,7 +1959,9 @@ export class Store {
     } else {
       this.observed.reads += Math.max(0, cursor.rowsRead ?? 0);
       this.observed.writes += Math.max(1, cursor.rowsWritten ?? 1);
-      // Reused member listings are stale once anything they read is written.
+      // Reused member listings are stale once anything they read is written
+      // (`seen` is written by writeSeen, whose callers update them instead,
+      // once it is committed: patchMemberSeen).
       if (MEMBER_TABLES.test(lower)) this.memberGeneration += 1;
     }
     return cursor;
@@ -2320,7 +2414,7 @@ export class Store {
 
   private identityRow(userId: string): RawIdentityRow | null {
     const rows = this.rawRows<RawIdentityRow>(
-      "SELECT user_id, user_handle, name, tier, created_ms, updated_ms, avatar_url, avatar_expires_ms, roles_json, ext_json FROM identities WHERE user_id = ? LIMIT 1",
+      "SELECT user_id, user_handle, name, tier, created_ms, updated_ms, avatar_url, avatar_expires_ms, roles_json, ext_json, seen_ms FROM identities WHERE user_id = ? LIMIT 1",
       userId,
     );
     return rows[0] ?? null;
@@ -2612,6 +2706,7 @@ export class Store {
       const credentialCount = integerColumn(count?.count);
       const avatar = liveAvatar(row, this.clock.now());
       const ext = parseUserExt(row.ext_json);
+      const seen = seenColumn(row.seen_ms);
       return {
         userId: row.user_id,
         name: row.name,
@@ -2621,6 +2716,7 @@ export class Store {
         roles: parseRoles(row.roles_json),
         ...(avatar ? { avatar } : {}),
         ...(ext ? { ext } : {}),
+        ...(seen !== undefined ? { seen } : {}),
       };
     });
   }
@@ -2631,7 +2727,8 @@ export class Store {
    * `user_id` order: at most `limit` per room, read from the room's
    * primary-key range with one identity lookup each. With `withStatus`, each
    * also carries the `status` it chose (`choice`), from its `user_status`
-   * row, joined by primary key: a member without one costs nothing more.
+   * row, joined by primary key: a member without one costs nothing more;
+   * and its `seen`, from the identity row read anyway.
    * Guests' memberships are not stored; the caller adds connected ones.
    *
    * With `memberCacheMs`, a room's rows are kept in memory that long and
@@ -2668,7 +2765,7 @@ export class Store {
         for (const roomId of missing) {
           const rows = this.rawRows<RawMemberRow>(
             withStatus
-              ? `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json, s.status
+              ? `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json, i.seen_ms, s.status
                  FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id LEFT JOIN user_status s ON s.user_id = m.user_id
                  WHERE m.room_id = ? ORDER BY m.user_id LIMIT ?`
               : `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id
@@ -2697,7 +2794,7 @@ export class Store {
           return {
             user_id: row.user_id, name: row.name ?? "", ...(avatar ? { avatar } : {}), roles: parseRoles(row.roles_json),
             ...(ext ? { ext } : {}),
-            ...(withStatus ? { choice: choiceColumn(row.status) } : {}),
+            ...(withStatus ? statusColumns(row) : {}),
           };
         }));
       }
@@ -2713,7 +2810,7 @@ export class Store {
     return this.reserved({ reads: 8 + (withStatus ? 3 : 2) }, false, now, () => {
       const row = this.rawRows<RawMemberRow>(
         withStatus
-          ? `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json, s.status
+          ? `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json, i.seen_ms, s.status
              FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id LEFT JOIN user_status s ON s.user_id = m.user_id
              WHERE m.room_id = ? AND m.user_id = ? LIMIT 1`
           : `SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id
@@ -2726,7 +2823,7 @@ export class Store {
       return {
         user_id: row.user_id, name: row.name ?? "", ...(avatar ? { avatar } : {}), roles: parseRoles(row.roles_json),
         ...(ext ? { ext } : {}),
-        ...(withStatus ? { choice: choiceColumn(row.status) } : {}),
+        ...(withStatus ? statusColumns(row) : {}),
       };
     });
   }
@@ -4036,16 +4133,33 @@ export class Store {
   }
 
   /**
+   * The `presence` toggle (as toggle has it) and when presence was last
+   * turned on with it (META_PRESENCE_ON), if ever, in one statement: two
+   * primary-key lookups of `_meta`, of which a missing row reads nothing.
+   */
+  presenceToggle(now = this.clock.now()): { on: boolean | undefined; since?: number } {
+    this.ensureReady();
+    return this.reserved({ reads: 4 }, false, now, () => {
+      const rows = this.rawRows<{ key: string; value: string }>("SELECT key, value FROM _meta WHERE key IN (?, ?)", META_TOGGLE_PREFIX + "presence", META_PRESENCE_ON);
+      const value = rows.find((row) => row.key === META_TOGGLE_PREFIX + "presence")?.value;
+      const since = Number(rows.find((row) => row.key === META_PRESENCE_ON)?.value);
+      return { on: value === "on" ? true : value === "off" ? false : undefined, ...(Number.isSafeInteger(since) && since > 0 ? { since } : {}) };
+    });
+  }
+
+  /**
    * Sets or, with undefined, clears an admin's `/toggle` of a feature. With
    * `uploads` off, new upload embeds and `/avatar` are `denied`; writes
-   * already started still finish.
+   * already started still finish. With `since`, presence was turned on
+   * then: it is kept too (META_PRESENCE_ON), in the same reservation.
    */
-  setToggle(feature: string, on: boolean | undefined, now = this.clock.now()): void {
+  setToggle(feature: string, on: boolean | undefined, now = this.clock.now(), since?: number): void {
     this.ensureReady();
-    this.reserved({ reads: 4, writes: 4 }, false, now, () => {
+    this.reserved({ reads: 4, writes: 8 }, false, now, () => this.transaction(() => {
       if (on === undefined) this.rawExec("DELETE FROM _meta WHERE key = ?", META_TOGGLE_PREFIX + feature);
       else this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_TOGGLE_PREFIX + feature, on ? "on" : "off");
-    });
+      if (since !== undefined) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_PRESENCE_ON, String(since));
+    }));
   }
 
   /**
@@ -4522,18 +4636,38 @@ export class Store {
   /**
    * `me` `status` (protocol §4.5) for a registered user: the value they
    * chose, kept in their `user_status` row with the mute. Whether it changed.
+   * With `seenAt`, when choosing `invisible` shows them `offline` at that
+   * time (§4.5.2), their `seen` is settled too, from the identity row this
+   * reads anyway: the stored one if it stands (seenStands), else `seenAt`,
+   * written (writeSeen) in the same reservation and transaction, so the two
+   * cannot part. `seen` is what is stored after, absent for an unknown
+   * user. Listings kept for reuse get it only once it is committed.
    */
-  setStatus(input: { userId: string; choice: StatusChoice; now?: number }): { changed: boolean } {
+  setStatus(input: { userId: string; choice: StatusChoice; now?: number; seenAt?: number }): { changed: boolean; seen?: number } {
+    if (input.seenAt !== undefined) assertSeen(input.seenAt);
     this.ensureReady();
     const now = input.now ?? this.clock.now();
-    return this.reserved({ reads: 16, writes: 16 }, false, now, () => this.transaction(() => {
+    let written: number | undefined;
+    const result = this.reserved({ reads: 16, writes: 16 }, false, now, () => this.transaction((): { changed: boolean; seen?: number } => {
       this.effectiveNow(now);
-      if (!this.identityRow(input.userId)) return { changed: false };
+      const row = this.identityRow(input.userId);
+      if (!row) return { changed: false };
+      let seen: number | undefined;
+      if (input.seenAt !== undefined) {
+        seen = seenColumn(row.seen_ms);
+        if (!seenStands(seen, input.seenAt)) {
+          this.writeSeen(input.userId, input.seenAt);
+          seen = written = input.seenAt;
+        }
+      }
       const existing = this.userStatusRow(input.userId);
-      if ((existing?.status ?? "online") === input.choice) return { changed: false };
+      if ((existing?.status ?? "online") === input.choice) return { changed: false, ...(seen !== undefined ? { seen } : {}) };
       this.writeUserStatus(input.userId, existing, { status: input.choice });
-      return { changed: true };
+      return { changed: true, ...(seen !== undefined ? { seen } : {}) };
     }));
+    // Committed: listings kept for reuse may carry it now (a rollback leaves them as they were).
+    if (written !== undefined) this.patchMemberSeen(input.userId, written);
+    return result;
   }
 
   /** A user's `user_status` row, if any, with an expired mute left as stored. */
@@ -4631,6 +4765,8 @@ export class Store {
    * not muted, MUTE_FOREVER for `true`) and their room mutes in effect. One
    * primary-key read and one range of the user's room mutes, at most
    * MAX_ROOM_MUTES_PER_USER rows; a missing row or range costs nothing.
+   * Their `seen` is not read here: every sign-in reads their identity row
+   * anyway (getIdentity), which carries it.
    */
   statusInputs(userId: string, now = this.clock.now()): StatusInputRecord {
     this.ensureReady();
@@ -4644,6 +4780,71 @@ export class Store {
         roomMutes: this.roomMuteRows(userId).filter((mute) => mute.untilMs > effective),
       };
     });
+  }
+
+  /**
+   * Settles a registered user's `seen` (protocol §4.5.2) for a change of
+   * the status others see of them to `offline` at `at` (epoch
+   * milliseconds) that is not a chosen `invisible` (setStatus settles that
+   * one with the choice): their last connection closing. The store decides,
+   * so every caller agrees with what it holds, however stale the copy it
+   * decided from (several tabs closing together, each handled as the last;
+   * an eviction in between): the stored one if it stands (seenStands), with
+   * no write, else `at`, written. Returns what is stored after, or
+   * undefined for an unknown user.
+   *
+   * One conditional update of the identity row, which writes only where the
+   * stored one does not stand (1 read, 1 write when it writes); where it
+   * stands, or for an unknown user, a primary-key read of `seen_ms` follows
+   * (2 reads, no write). Listings kept for reuse are patched in place, not
+   * invalidated (patchMemberSeen).
+   */
+  settleSeen(input: { userId: string; at: number; now?: number }): number | undefined {
+    assertSeen(input.at);
+    this.ensureReady();
+    const now = input.now ?? this.clock.now();
+    return this.reserved({ reads: 8, writes: 8 }, false, now, () => {
+      this.effectiveNow(now);
+      const at = input.at;
+      // Written only where the stored one does not stand (seenStands, in SQL).
+      const cursor = this.sql.exec(
+        "UPDATE identities SET seen_ms = ? WHERE user_id = ? AND (seen_ms <= 0 OR seen_ms > ? OR seen_ms < ?)",
+        at, input.userId, at, at - SEEN_WRITE_GRANULARITY_MS,
+      );
+      this.observed.reads += Math.max(0, cursor.rowsRead ?? 0);
+      this.observed.writes += Math.max(0, cursor.rowsWritten ?? 1);
+      if ((cursor.rowsWritten ?? 0) > 0) {
+        this.patchMemberSeen(input.userId, at);
+        return at;
+      }
+      // It stands (or the user is unknown; or the SQL adapter does not
+      // report rows written, which this read covers too): what is stored.
+      const row = this.rawRows<{ seen_ms: number }>("SELECT seen_ms FROM identities WHERE user_id = ? LIMIT 1", input.userId)[0];
+      const stored = row ? seenColumn(row.seen_ms) : undefined;
+      if (stored === at) this.patchMemberSeen(input.userId, at);
+      return stored;
+    });
+  }
+
+  /**
+   * Writes a user's `seen` into their identity row, which a member listing
+   * reads anyway. Unlike other writes to the tables listings read
+   * (rawExec), this one does not invalidate the listings kept for reuse:
+   * the caller patches them once it is committed (patchMemberSeen). Charged
+   * the rows SQLite reports, so an unknown user's, which matches no row,
+   * costs none.
+   */
+  private writeSeen(userId: string, seen: number): void {
+    const cursor = this.sql.exec("UPDATE identities SET seen_ms = ? WHERE user_id = ?", seen, userId);
+    this.observed.reads += Math.max(0, cursor.rowsRead ?? 0);
+    this.observed.writes += Math.max(0, cursor.rowsWritten ?? 1);
+  }
+
+  /** Sets a committed `seen` in the listings kept for reuse, which stay valid. */
+  private patchMemberSeen(userId: string, seen: number): void {
+    for (const entry of this.memberCache.values()) {
+      for (const row of entry.rows) if (row.user_id === userId && row.seen_ms !== undefined) row.seen_ms = seen;
+    }
   }
 
   /**

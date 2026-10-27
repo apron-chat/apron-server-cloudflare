@@ -1,7 +1,7 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { MAX_ROOM_MUTES_PER_USER, MUTE_FOREVER, Store, StoreError, WAKE_SCOPES, defaultStoreConfig } from '../src/store';
-import { DEFAULT_LIMITS, PUSH_POLICY } from '../src/budget';
+import { DEFAULT_LIMITS, PUSH_POLICY, SEEN_WRITE_GRANULARITY_MS } from '../src/budget';
 import { expectRetryAfter, messagesOf } from './helpers/store';
 
 // A day's retention with hourly cleanup, for tests that watch records expire.
@@ -872,11 +872,31 @@ describe('measured storage accounting', () => {
 			expect(measure('status inputs at sign-in, nothing stored', () => store.statusInputs('matrix-user', clock.now()))).toEqual({ choice: 'online', roomMutes: [] });
 			measure('mute set', () => store.setMute({ userId: 'matrix-user', untilMs: clock.now() + 3_600_000, now: clock.now() }));
 			measure('status set', () => store.setStatus({ userId: 'matrix-user', choice: 'dnd', now: clock.now() }));
+			// A close's seen, settled by the store: written when none (or an old one) is stored, else the stored one standing.
+			expect(measure('seen settled, written', () => store.settleSeen({ userId: 'matrix-user', at: clock.now(), now: clock.now() }))).toBe(clock.now());
+			expect(measure('seen settled, the stored one standing', () => store.settleSeen({ userId: 'matrix-user', at: clock.now() + 60_000, now: clock.now() }))).toBe(clock.now());
 			expect(measure('push wake claim, dnd and muted', () => store.claimPushes({ senderId: 'matrix-sender', roomId: threadId, candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() }))).toEqual({ subscriptions: [], skipped: 0 });
 			measure('room mute set', () => store.setRoomMute({ userId: 'matrix-user', roomId: 'general', untilMs: clock.now() + 60_000, now: clock.now() }));
 			expect(measure('status inputs at sign-in, status, mute and one room mute', () => store.statusInputs('matrix-user', clock.now()))).toEqual({ choice: 'dnd', muteUntil: clock.now() + 3_600_000, roomMutes: [{ roomId: 'general', untilMs: clock.now() + 60_000 }] });
 			store.setStatus({ userId: 'matrix-user', choice: 'online', now: clock.now() });
 			store.setMute({ userId: 'matrix-user', untilMs: null, now: clock.now() });
+			// Choosing invisible records seen with the status, in one reservation
+			// and transaction, when the stored one is older than
+			// SEEN_WRITE_GRANULARITY_MS; a sign-in reads it with the identity row.
+			// (The change is dated past the stored seen's 10 minutes, so it writes.)
+			const later = clock.now() + SEEN_WRITE_GRANULARITY_MS + 1;
+			expect(measure('status set to invisible, with seen', () => store.setStatus({ userId: 'matrix-user', choice: 'invisible', seenAt: later, now: clock.now() }))).toEqual({ changed: true, seen: later });
+			expect(store.statusInputs('matrix-user', clock.now())).toEqual({ choice: 'invisible', roomMutes: [{ roomId: 'general', untilMs: clock.now() + 60_000 }] });
+			expect(store.getIdentity('matrix-user')?.seen).toBe(later);
+			// A seen for a user with no identity row writes no row.
+			expect(measure('seen settled, unknown user', () => store.settleSeen({ userId: 'matrix-nobody', at: clock.now(), now: clock.now() }))).toBeUndefined();
+			store.setStatus({ userId: 'matrix-user', choice: 'online', now: clock.now() });
+			// Within SEEN_WRITE_GRANULARITY_MS of the stored seen, the store
+			// decides it stands, from the identity row it reads anyway: the
+			// status alone is written.
+			expect(measure('status set to invisible, the stored seen standing', () => store.setStatus({ userId: 'matrix-user', choice: 'invisible', seenAt: later + 60_000, now: clock.now() }))).toEqual({ changed: true, seen: later });
+			expect(store.getIdentity('matrix-user')?.seen).toBe(later);
+			store.setStatus({ userId: 'matrix-user', choice: 'online', now: clock.now() });
 			// The thread's parent is muted: a wake for the thread is silenced by it.
 			expect(measure('push wake claim, the thread\'s parent muted', () => store.claimPushes({ senderId: 'matrix-sender', roomId: threadId, candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() }))).toEqual({ subscriptions: [], skipped: 0 });
 			// The most room mutes a user may hold: the sign-in reads them all.
@@ -897,7 +917,7 @@ describe('measured storage accounting', () => {
 			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
 			expect(create.result.message_id).toBeTruthy();
-			expect(costs).toHaveLength(52);
+			expect(costs).toHaveLength(57);
 			expect(store.accountingStatus().unsafe).toBe(false);
 			return { costs };
 		});

@@ -1,7 +1,8 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { DEFAULT_LIMITS, PUSH_POLICY } from '../src/budget';
+import { DEFAULT_LIMITS, PUSH_POLICY, SEEN_WRITE_GRANULARITY_MS } from '../src/budget';
 import { MUTE_FOREVER, type Store } from '../src/store';
+import { StoreError } from '../src/store-error';
 import { connect as open, exchange, request, status as statusRequest, statusOnly, type Frame, type Peer } from './helpers/socket';
 import { softPasskey } from './helpers/webauthn';
 import { withStore } from './helpers/store';
@@ -20,7 +21,7 @@ type Runtime = {
 	issueSession(userId: string, origin: string, now: number): Promise<string>;
 	flushPresence(now?: number): void;
 };
-type Attachment = { userId?: string; closing?: boolean; pres?: { s: string; a: number; h?: number }; owed?: Array<[string, string, string, number]>; choice?: string; muteUntil?: number; roomMuteNext?: number };
+type Attachment = { userId?: string; closing?: boolean; pres?: { s: string; a: number; h?: number }; owed?: Array<[string, string, string, number, number?]>; choice?: string; muteUntil?: number; roomMuteNext?: number; seen?: number };
 
 // Status changes wait for time to pass (coalescing, the offline grace), so
 // these tests move the clock the object reads: Date.now runs `offset` ahead,
@@ -340,8 +341,10 @@ describe('the status a user chooses (§4.5)', () => {
 			expect(told(seen, shyId)).toEqual(['online', 'offline']);
 			const list = await request(observer, 'list', 'room_list', { filter: 'joined', members: true });
 			expectPrivate([...seen, list], shyId);
-			// Connected, invisible: listed as stored members are, offline.
-			expect(list.result.users.find((user: { user_id: string }) => user.user_id === shyId)).toEqual({ user_id: shyId, name: `Name of ${shyId}`, roles: [], status: 'offline' });
+			// Connected, invisible: listed as stored members are, offline, with
+			// the seen its change to offline carried.
+			const hidden = seen.find((frame) => frame.params?.new?.user_id === shyId && frame.params.new.status === 'offline')!;
+			expect(list.result.users.find((user: { user_id: string }) => user.user_id === shyId)).toEqual({ user_id: shyId, name: `Name of ${shyId}`, roles: [], status: 'offline', seen: hidden.params.new.seen });
 			const members = await runInDurableObject(stub(), (instance) => (instance as unknown as { connectedMembers(): Map<string, Array<{ user_id: string }>> }).connectedMembers());
 			expect((members.get('general') ?? []).map((user) => user.user_id)).not.toContain(shyId);
 			// A new connection of someone else's is not told of them after auth, as
@@ -551,7 +554,9 @@ describe('user status timing', () => {
 			await advance(1_000);
 			const held = await attachments();
 			expect(held.find((state) => state.userId === stayerId && !state.closing)?.pres).toMatchObject({ s: 'online' });
-			expect(held.find((state) => state.userId === watcherId)?.owed).toEqual([[leaverId, 'online', 'offline', expect.any(Number)]]);
+			// The change to offline carries seen, when the leaver left.
+			const owed = held.find((state) => state.userId === watcherId)?.owed;
+			expect(owed).toEqual([[leaverId, 'online', 'offline', expect.any(Number), expect.any(Number)]]);
 			// The object is evicted (a pending timer keeps it from hibernating, but
 			// not from being evicted): its timer and memory are gone, the
 			// attachments stay.
@@ -560,6 +565,7 @@ describe('user status timing', () => {
 			// The next event sweeps the attachments and announces what is due.
 			const frames = await drain(watcher);
 			expect(told(frames, leaverId)).toEqual(['offline']);
+			expect(frames.find((frame) => frame.params?.new?.user_id === leaverId)!.params.new).toEqual({ user_id: leaverId, status: 'offline', seen: String(owed![0][4]) });
 			expect(told(frames, stayerId)).toEqual(['idle']);
 			const after = await attachments();
 			expect(after.find((state) => state.userId === watcherId)?.owed).toBeUndefined();
@@ -677,13 +683,17 @@ describe('user status timing', () => {
 			store.setStatus({ userId, choice: 'invisible', now });
 			store.setMute({ userId, untilMs: now + 60_000, now });
 			store.setRoomMute({ userId, roomId: 'general', untilMs: MUTE_FOREVER, now });
+			store.settleSeen({ userId, at: now - 1_000, now });
 			store.renameIdentity({ from: userId, to: `${userId}x`, now });
 			expect(store.statusInputs(userId, now)).toEqual({ choice: 'online', roomMutes: [] });
 			expect(store.statusInputs(`${userId}x`, now)).toEqual({ choice: 'invisible', muteUntil: now + 60_000, roomMutes: [{ roomId: 'general', untilMs: MUTE_FOREVER }] });
+			// `seen` moves with the identity row, which a sign-in reads.
+			expect(store.getIdentity(`${userId}x`)?.seen).toBe(now - 1_000);
 			store.setMute({ userId: `${userId}x`, untilMs: null, now });
 			expect(store.statusInputs(`${userId}x`, now)).toEqual({ choice: 'invisible', roomMutes: [{ roomId: 'general', untilMs: MUTE_FOREVER }] });
 			store.purgeUsers({ userIds: [`${userId}x`], now });
 			expect(store.statusInputs(`${userId}x`, now)).toEqual({ choice: 'online', roomMutes: [] });
+			expect(store.getIdentity(`${userId}x`)).toBeNull();
 			expect(store.accountingStatus().unsafe).toBe(false);
 		});
 	});
@@ -1292,5 +1302,726 @@ describe('a sign-in that logs joins', () => {
 			expect(joins(seen, freshId)).toHaveLength(1);
 			expect(joins(seen, upgradedId)).toHaveLength(1);
 		} finally { watcher.peer.close(); fresh.close(); visitor.close(); }
+	});
+});
+
+describe('seen: when the shown status last became offline (§4.5.2)', () => {
+	beforeEach(forgetAnnouncements);
+
+	/** The `user` `new` objects `frames` carry for `userId`'s status, in order. */
+	const shown = (frames: Frame[], userId: string): Array<Record<string, unknown>> =>
+		frames.filter((frame) => frame.method === 'user' && frame.params?.new?.user_id === userId && frame.params.new.status !== undefined).map((frame) => frame.params.new);
+
+	/** `userId`'s stored seen_ms, 0 for none. */
+	const stored = (userId: string): Promise<number> => runInDurableObject(stub(), (_instance, state) =>
+		Number(state.storage.sql.exec<{ seen_ms: number }>('SELECT seen_ms FROM identities WHERE user_id = ?', userId).toArray()[0]?.seen_ms ?? 0));
+
+	/** No `you` among `frames` (and no auth or me result) carries seen. */
+	const expectNoOwnSeen = (frames: Frame[]) => {
+		for (const frame of frames) {
+			expect(frame.params?.you ?? {}).not.toHaveProperty('seen');
+			expect(frame.result?.you ?? {}).not.toHaveProperty('seen');
+		}
+	};
+
+	it('sends seen with a disconnect, keeps it in later listings, and leaves it out while the shown status is not offline or in you', async () => {
+		const watcherId = unique('watcher');
+		const leaverId = unique('leaver');
+		const watcher = await signedIn(watcherId);
+		let leaver = await signIn(leaverId);
+		try {
+			expect(shown(await drain(watcher), leaverId)).toEqual([{ user_id: leaverId, status: 'online' }]);
+			expectNoOwnSeen([leaver.auth, ...leaver.afterAuth]);
+			// Online: no seen, though none is recorded anyway.
+			expect(await listed(watcher, leaverId)).not.toHaveProperty('seen');
+			const left = Date.now();
+			await hangUp(leaver.peer, leaverId);
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			const [offline] = shown(await drain(watcher), leaverId);
+			// A log_id-format timestamp: when the last connection closed.
+			expect(offline).toEqual({ user_id: leaverId, status: 'offline', seen: expect.stringMatching(/^[1-9]\d*$/) });
+			const seen = Number(offline.seen);
+			expect(seen).toBeGreaterThanOrEqual(left);
+			expect(seen).toBeLessThanOrEqual(Date.now());
+			expect(await stored(leaverId)).toBe(seen);
+			// A later listing carries the same seen with the shown offline.
+			expect(await listed(watcher, leaverId)).toMatchObject({ status: 'offline', seen: offline.seen });
+			// Back online: the kept seen is not shown, and never in their own you.
+			leaver = await signIn(leaverId, { existing: true });
+			expectNoOwnSeen([leaver.auth, ...leaver.afterAuth, await request(leaver.peer, 'me', 'me', {}), await choose(leaver.peer, 'dnd')]);
+			expect(shown(await drain(watcher), leaverId)).toEqual([{ user_id: leaverId, status: 'dnd' }]);
+			const back = await listing(leaver.peer);
+			expect(back.get(leaverId)).toEqual(expect.objectContaining({ status: 'dnd' }));
+			expect(back.get(leaverId)).not.toHaveProperty('seen');
+			expect(back.get(watcherId)).not.toHaveProperty('seen');
+			// A dnd user who disconnects, longer than SEEN_WRITE_GRANULARITY_MS
+			// after the stored seen, is shown offline with a new one.
+			offset += SEEN_WRITE_GRANULARITY_MS;
+			await hangUp(leaver.peer, leaverId);
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			const [again] = shown(await drain(watcher), leaverId);
+			expect(again).toEqual({ user_id: leaverId, status: 'offline', seen: expect.stringMatching(/^\d+$/) });
+			expect(Number(again.seen)).toBeGreaterThan(seen);
+			expect(await listed(watcher, leaverId)).toMatchObject({ status: 'offline', seen: again.seen });
+			// A reconnect within the grace shows nothing, and leaves the shown seen as it was.
+			const quick = await signIn(leaverId, { existing: true });
+			await hangUp(quick.peer, leaverId);
+			const brief = await signIn(leaverId, { existing: true });
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			expect(shown(await drain(watcher), leaverId)).toEqual([{ user_id: leaverId, status: 'dnd' }]);
+			brief.peer.close();
+		} finally { watcher.close(); leaver.peer.close(); }
+	});
+
+	it('shows a chosen invisible offline with seen, and its connections coming and going never move it', async () => {
+		const watcherId = unique('watcher');
+		const shyId = unique('shy');
+		const watcher = await signedIn(watcherId);
+		let shy = await signedIn(shyId);
+		try {
+			await drain(watcher);
+			const before = Date.now();
+			const chosen = await choose(shy, 'invisible');
+			expect(chosen.result.you).toEqual(expect.objectContaining({ user_id: shyId, status: 'invisible' }));
+			expectNoOwnSeen([chosen]);
+			const [hidden] = shown(await drain(watcher), shyId);
+			expect(hidden).toEqual({ user_id: shyId, status: 'offline', seen: expect.stringMatching(/^\d+$/) });
+			expect(Number(hidden.seen)).toBeGreaterThanOrEqual(before);
+			expect(await stored(shyId)).toBe(Number(hidden.seen));
+			// Connected and invisible: listed offline with that seen, from the connections.
+			expect(await listed(watcher, shyId)).toMatchObject({ status: 'offline', seen: hidden.seen });
+			// Its own listing shows others' view of it, as any listing does; its you does not.
+			expect((await listing(shy)).get(shyId)).toMatchObject({ status: 'offline', seen: hidden.seen });
+			// A second connection comes and goes, then the first: nothing is sent, seen stays.
+			const second = await signIn(shyId, { existing: true });
+			expectNoOwnSeen([second.auth, ...second.afterAuth]);
+			await hangUp(second.peer, shyId);
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			await hangUp(shy, shyId);
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			expect(shown(await drain(watcher), shyId)).toEqual([]);
+			expect(await stored(shyId)).toBe(Number(hidden.seen));
+			expect(await listed(watcher, shyId)).toMatchObject({ status: 'offline', seen: hidden.seen });
+			// Signing in again, still invisible: nothing, and the listing's seen is unchanged.
+			shy = await signedIn(shyId, { existing: true });
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			expect(shown(await drain(watcher), shyId)).toEqual([]);
+			expect(await listed(watcher, shyId)).toMatchObject({ status: 'offline', seen: hidden.seen });
+			// Visible again, then invisible again: a new change to offline, which
+			// within SEEN_WRITE_GRANULARITY_MS carries the stored seen again.
+			await choose(shy, 'online');
+			offset += 1_000;
+			await choose(shy, 'invisible');
+			expect(shown(await drain(watcher), shyId)).toEqual([{ user_id: shyId, status: 'online' }, { user_id: shyId, status: 'offline', seen: hidden.seen }]);
+			// Past it, a new seen.
+			offset += SEEN_WRITE_GRANULARITY_MS;
+			await choose(shy, 'online');
+			await choose(shy, 'invisible');
+			const changes = shown(await drain(watcher), shyId);
+			expect(changes).toEqual([{ user_id: shyId, status: 'online' }, { user_id: shyId, status: 'offline', seen: expect.stringMatching(/^\d+$/) }]);
+			expect(Number(changes[1].seen)).toBeGreaterThan(Number(hidden.seen) + SEEN_WRITE_GRANULARITY_MS);
+			expect(await stored(shyId)).toBe(Number(changes[1].seen));
+		} finally { watcher.close(); shy.close(); }
+	});
+
+	it('gives "" no seen, and a guest a seen kept only on its connection', async () => {
+		const watcherId = unique('watcher');
+		const noneId = unique('none');
+		const watcher = await signedIn(watcherId);
+		const none = await signedIn(noneId);
+		const visitor = await guest();
+		const hiding = await guest();
+		try {
+			await drain(watcher);
+			await choose(none, '');
+			expect(shown(await drain(watcher), noneId)).toEqual([{ user_id: noneId, status: '' }]);
+			await hangUp(none, noneId);
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			expect(shown(await drain(watcher), noneId)).toEqual([]);
+			expect(await stored(noneId)).toBe(0);
+			expect(await listed(watcher, noneId)).toEqual(expect.not.objectContaining({ seen: expect.anything() }));
+			// A guest that disconnects is shown offline with seen; guests have no row to keep it.
+			await hangUp(visitor.peer, visitor.userId);
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			expect(shown(await drain(watcher), visitor.userId)).toEqual([{ user_id: visitor.userId, status: 'offline', seen: expect.stringMatching(/^\d+$/) }]);
+			// A guest that chooses invisible too, and its connection keeps that seen.
+			await choose(hiding.peer, 'invisible');
+			const [hidden] = shown(await drain(watcher), hiding.userId);
+			expect(hidden).toEqual({ user_id: hiding.userId, status: 'offline', seen: expect.stringMatching(/^\d+$/) });
+			expect((await attachments()).find((state) => state.userId === hiding.userId && !state.closing)?.seen).toBe(Number(hidden.seen));
+			// It goes without anything sent: it was already shown offline.
+			await hangUp(hiding.peer, hiding.userId);
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			expect(shown(await drain(watcher), hiding.userId)).toEqual([]);
+		} finally { watcher.close(); none.close(); visitor.peer.close(); hiding.peer.close(); }
+	});
+
+	it('keeps seen across eviction, and updates listings kept for reuse in place', async () => {
+		const watcherId = unique('watcher');
+		const leaverId = unique('leaver');
+		const watcher = await signedIn(watcherId);
+		const leaver = await signedIn(leaverId);
+		try {
+			await drain(watcher);
+			await hangUp(leaver, leaverId);
+			await advance(Math.max(COALESCE, GRACE) + 1_000);
+			const [offline] = shown(await drain(watcher), leaverId);
+			expect(offline.seen).toMatch(/^\d+$/);
+			await evict();
+			expect(await listed(watcher, leaverId)).toMatchObject({ status: 'offline', seen: offline.seen });
+			// A listing kept for reuse is updated by a later seen without reading again.
+			const reuse = await runInDurableObject(stub(), (instance, state) => {
+				const runtime = instance as unknown as Runtime & { membersOf(ids: string[]): Map<string, Array<{ user_id: string; seen?: string }>> };
+				runtime.membersOf(['general']);
+				// Past SEEN_WRITE_GRANULARITY_MS, so it is written.
+				const later = Number(offline.seen) + SEEN_WRITE_GRANULARITY_MS + 1_000;
+				runtime.store.settleSeen({ userId: leaverId, at: later, now: Date.now() });
+				let members: Map<string, Array<{ user_id: string; seen?: string }>> | undefined;
+				const sql = statements(state, /FROM memberships m/, () => { members = runtime.membersOf(['general']); });
+				return { queries: sql.queries, seen: members!.get('general')!.find((user) => user.user_id === leaverId)?.seen, later };
+			});
+			expect(reuse.queries).toEqual([]);
+			expect(reuse.seen).toBe(String(reuse.later));
+		} finally { watcher.close(); leaver.close(); }
+	});
+});
+
+describe('seen is written at most once in SEEN_WRITE_GRANULARITY_MS', () => {
+	beforeEach(forgetAnnouncements);
+
+	const WAIT = Math.max(COALESCE, GRACE) + 1_000;
+	const DAY = 24 * 60 * 60_000;
+
+	/** The `user` `new` objects `frames` carry for `userId`'s status changes (not a /rename's), in order. */
+	const shown = (frames: Frame[], userId: string): Array<Record<string, unknown>> =>
+		frames.filter((frame) => frame.method === 'user' && !frame.params?.old && frame.params?.new?.user_id === userId && frame.params.new.status !== undefined).map((frame) => frame.params.new);
+
+	/** `userId`'s stored seen_ms, 0 for none. */
+	const stored = (userId: string): Promise<number> => runInDurableObject(stub(), (_instance, state) =>
+		Number(state.storage.sql.exec<{ seen_ms: number }>('SELECT seen_ms FROM identities WHERE user_id = ?', userId).toArray()[0]?.seen_ms ?? 0));
+
+	/**
+	 * Records the SQL the object runs from now until the test ends (afterEach
+	 * restores sql.exec), with each statement's bindings.
+	 */
+	async function recordSql(): Promise<Array<{ query: string; bindings: unknown[]; written: () => number }>> {
+		const log: Array<{ query: string; bindings: unknown[]; written: () => number }> = [];
+		await runInDurableObject(stub(), (_instance, state) => {
+			const sql = state.storage.sql;
+			const original = sql.exec.bind(sql);
+			vi.spyOn(sql, 'exec').mockImplementation(((query: string, ...bindings: unknown[]) => {
+				const cursor = original(query, ...(bindings as []));
+				log.push({ query: query.replace(/\s+/g, ' ').trim(), bindings, written: () => cursor.rowsWritten });
+				return cursor;
+			}) as typeof sql.exec);
+		});
+		return log;
+	}
+
+	/** The seen values written for `userId` in `log` (statements that wrote a row), in order. */
+	const writes = (log: Array<{ query: string; bindings: unknown[]; written: () => number }>, userId: string): unknown[] =>
+		log.filter((entry) => /^UPDATE identities SET seen_ms/.test(entry.query) && entry.bindings[1] === userId && entry.written() > 0).map((entry) => entry.bindings[0]);
+
+	/** The seen each of `userId`'s open connections holds. */
+	const held = async (userId: string): Promise<Array<number | undefined>> =>
+		(await attachments()).filter((state) => state.userId === userId && !state.closing).map((state) => state.seen);
+
+	/** Signs `userId` in again and lets others be told they are back. */
+	async function back(watcher: Peer, userId: string): Promise<Peer> {
+		const peer = await signedIn(userId, { existing: true });
+		await advance(COALESCE + 1_000);
+		expect(shown(await drain(watcher), userId)).toEqual([{ user_id: userId, status: 'online' }]);
+		return peer;
+	}
+
+	it('re-announces a stored seen within it with no write, writes a later departure, and never misses a brief return after a week', async () => {
+		const watcherId = unique('watcher');
+		const leaverId = unique('leaver');
+		const watcher = await signedIn(watcherId);
+		let leaver = await signedIn(leaverId);
+		const sql = await recordSql();
+		try {
+			await drain(watcher);
+			await hangUp(leaver, leaverId);
+			await advance(WAIT);
+			const [first] = shown(await drain(watcher), leaverId);
+			expect(first).toEqual({ user_id: leaverId, status: 'offline', seen: expect.stringMatching(/^\d+$/) });
+			const s1 = Number(first.seen);
+			expect(writes(sql, leaverId)).toEqual([s1]);
+			expect(await stored(leaverId)).toBe(s1);
+			expect(await listed(watcher, leaverId)).toMatchObject({ status: 'offline', seen: first.seen });
+
+			// Back within it: the sign-in keeps the stored seen on the connection.
+			leaver = await back(watcher, leaverId);
+			expect(await held(leaverId)).toEqual([s1]);
+			// Gone again a few minutes later: the stored seen stands, announced again, unwritten.
+			offset += 3 * 60_000;
+			await hangUp(leaver, leaverId);
+			await advance(WAIT);
+			expect(shown(await drain(watcher), leaverId)).toEqual([{ user_id: leaverId, status: 'offline', seen: first.seen }]);
+			expect(writes(sql, leaverId)).toEqual([s1]);
+			expect(await listed(watcher, leaverId)).toMatchObject({ status: 'offline', seen: first.seen });
+
+			// A reload within the grace: nothing announced, nothing written.
+			leaver = await back(watcher, leaverId);
+			await hangUp(leaver, leaverId);
+			leaver = await signedIn(leaverId, { existing: true });
+			await advance(WAIT);
+			expect(shown(await drain(watcher), leaverId)).toEqual([]);
+			expect(writes(sql, leaverId)).toEqual([s1]);
+			expect(await held(leaverId)).toEqual([s1]);
+
+			// Gone longer than SEEN_WRITE_GRANULARITY_MS after the stored seen: a new one, written.
+			offset += SEEN_WRITE_GRANULARITY_MS;
+			const left = Date.now();
+			await hangUp(leaver, leaverId);
+			await advance(WAIT);
+			const [second] = shown(await drain(watcher), leaverId);
+			const s2 = Number(second.seen);
+			expect(s2).toBeGreaterThanOrEqual(left);
+			expect(s2).toBeGreaterThan(s1 + SEEN_WRITE_GRANULARITY_MS);
+			expect(writes(sql, leaverId)).toEqual([s1, s2]);
+			expect(await stored(leaverId)).toBe(s2);
+			expect(await listed(watcher, leaverId)).toMatchObject({ status: 'offline', seen: second.seen });
+
+			// Away a week, back for a minute, gone again: the new departure is recorded.
+			offset += 7 * DAY;
+			await drain(watcher);
+			leaver = await back(watcher, leaverId);
+			offset += 60_000;
+			const returned = Date.now();
+			await hangUp(leaver, leaverId);
+			await advance(WAIT);
+			const [third] = shown(await drain(watcher), leaverId);
+			const s3 = Number(third.seen);
+			expect(third).toEqual({ user_id: leaverId, status: 'offline', seen: String(s3) });
+			expect(s3).toBeGreaterThanOrEqual(returned);
+			expect(s3 - s2).toBeGreaterThan(7 * DAY);
+			expect(writes(sql, leaverId)).toEqual([s1, s2, s3]);
+			expect(await stored(leaverId)).toBe(s3);
+			expect(await listed(watcher, leaverId)).toMatchObject({ status: 'offline', seen: third.seen });
+		} finally { watcher.close(); leaver.close(); }
+	});
+
+	it('writes at most one seen in it for a user flipping invisible, on any of their connections, and never for an invisible user\'s connections', async () => {
+		const watcherId = unique('watcher');
+		const shyId = unique('shy');
+		const watcher = await signedIn(watcherId);
+		let shy = await signedIn(shyId);
+		let other = await signedIn(shyId, { existing: true });
+		const sql = await recordSql();
+		try {
+			await drain(watcher);
+			await choose(shy, 'invisible');
+			const [hidden] = shown(await drain(watcher), shyId);
+			const s1 = Number(hidden.seen);
+			expect(writes(sql, shyId)).toEqual([s1]);
+			// Kept on both connections, so either one's next change knows it.
+			expect(await held(shyId)).toEqual([s1, s1]);
+			expect(await listed(watcher, shyId)).toMatchObject({ status: 'offline', seen: hidden.seen });
+			// Flipping back and forth, a minute apart (status changes are limited a minute), from either connection.
+			for (const peer of [shy, other, shy]) {
+				offset += 60_000;
+				await choose(peer, 'online');
+				await choose(peer, 'invisible');
+				expect(shown(await drain(watcher), shyId)).toEqual([{ user_id: shyId, status: 'online' }, { user_id: shyId, status: 'offline', seen: hidden.seen }]);
+				expect(await listed(watcher, shyId)).toMatchObject({ status: 'offline', seen: hidden.seen });
+			}
+			expect(writes(sql, shyId)).toEqual([s1]);
+			// Visible on one connection, then both close within it: the stored seen, unwritten.
+			offset += 60_000;
+			await choose(other, 'online');
+			expect(shown(await drain(watcher), shyId)).toEqual([{ user_id: shyId, status: 'online' }]);
+			await hangUp(shy, shyId);
+			await hangUp(other, shyId);
+			await advance(WAIT);
+			expect(shown(await drain(watcher), shyId)).toEqual([{ user_id: shyId, status: 'offline', seen: hidden.seen }]);
+			expect(writes(sql, shyId)).toEqual([s1]);
+			expect(await listed(watcher, shyId)).toMatchObject({ status: 'offline', seen: hidden.seen });
+
+			// Past it: the next flip writes once, then stands again.
+			shy = await back(watcher, shyId);
+			offset += SEEN_WRITE_GRANULARITY_MS;
+			await choose(shy, 'invisible');
+			const [later] = shown(await drain(watcher), shyId);
+			const s2 = Number(later.seen);
+			expect(s2).toBeGreaterThan(s1 + SEEN_WRITE_GRANULARITY_MS);
+			offset += 60_000;
+			await choose(shy, 'online');
+			await choose(shy, 'invisible');
+			expect(shown(await drain(watcher), shyId)).toEqual([{ user_id: shyId, status: 'online' }, { user_id: shyId, status: 'offline', seen: later.seen }]);
+			expect(writes(sql, shyId)).toEqual([s1, s2]);
+			expect(await stored(shyId)).toBe(s2);
+
+			// Invisible, long past it: connections coming and going tell nothing and write nothing.
+			offset += 2 * SEEN_WRITE_GRANULARITY_MS;
+			other = await signedIn(shyId, { existing: true });
+			await hangUp(other, shyId);
+			await advance(WAIT);
+			await hangUp(shy, shyId);
+			await advance(WAIT);
+			shy = await signedIn(shyId, { existing: true });
+			await advance(WAIT);
+			expect(shown(await drain(watcher), shyId)).toEqual([]);
+			expect(writes(sql, shyId)).toEqual([s1, s2]);
+			expect(await stored(shyId)).toBe(s2);
+			expect(await listed(watcher, shyId)).toMatchObject({ status: 'offline', seen: later.seen });
+		} finally { watcher.close(); shy.close(); other.close(); }
+	});
+
+	it('reads seen at sign-in with the identity row, with no read of its own', async () => {
+		const userId = unique('reader');
+		await register(userId);
+		const recorded = Date.now() - 60_000;
+		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.settleSeen({ userId, at: recorded, now: Date.now() }); });
+		const sql = await recordSql();
+		const peer = await signedIn(userId, { existing: true });
+		try {
+			const identityReads = sql.filter((entry) => /\bFROM identities WHERE user_id = \?/.test(entry.query) && entry.bindings[0] === userId);
+			// The identity row reads a sign-in did before seen (the identity
+			// lookup, and the avatar refresh check after the reply), the column
+			// now among the ones they read, and nothing else of `identities`.
+			const row = 'SELECT user_id, user_handle, name, tier, created_ms, updated_ms, avatar_url, avatar_expires_ms, roles_json, ext_json, seen_ms FROM identities WHERE user_id = ? LIMIT 1';
+			expect(identityReads.map((entry) => entry.query)).toEqual([row, row]);
+			expect(sql.filter((entry) => /\bidentities\b/.test(entry.query)).length).toBe(2);
+			expect(sql.some((entry) => /^SELECT seen_ms FROM identities WHERE/.test(entry.query))).toBe(false);
+			expect(await held(userId)).toEqual([recorded]);
+		} finally { peer.close(); }
+	});
+
+	it('keeps seen through /rename, on the connection and in a change still owed', async () => {
+		const ADMIN_TOKEN = 'admin-token-seen-0123456789';
+		const setAdminToken = (value: string | undefined) => runInDurableObject(stub(), (instance) => {
+			const server = instance as unknown as { config: { adminToken?: string } };
+			server.config = { ...server.config, adminToken: value };
+		});
+		await setAdminToken(ADMIN_TOKEN);
+		const watcherId = unique('watcher');
+		const fromId = unique('dave');
+		const toId = unique('david');
+		const lastId = unique('davy');
+		const watcher = await signedIn(watcherId);
+		let dave = await signedIn(fromId);
+		const admin = await connect();
+		await admin.next();
+		await admin.next();
+		expect((await request(admin, 'admin', 'auth', { scheme: 'token', token: ADMIN_TOKEN })).result.you.user_id).toBe('admin');
+		const sql = await recordSql();
+		const rename = async (from: string, to: string) => {
+			const { frame } = await exchange(admin, `rename-${crypto.randomUUID()}`, 'command', { room_id: 'general', body: { text: `/rename ${from} ${to}` } });
+			expect(frame.result).toEqual({});
+		};
+		try {
+			await drain(watcher);
+			await hangUp(dave, fromId);
+			await advance(WAIT);
+			const [first] = shown(await drain(watcher), fromId);
+			const s1 = Number(first.seen);
+			dave = await back(watcher, fromId);
+			// Renamed while connected: the connection keeps the stored seen, which moved with the row.
+			await rename(fromId, toId);
+			expect(await held(toId)).toEqual([s1]);
+			offset += 60_000;
+			await hangUp(dave, toId);
+			await advance(WAIT);
+			expect(shown(await drain(watcher), toId)).toEqual([{ user_id: toId, status: 'offline', seen: first.seen }]);
+			expect(await listed(watcher, toId)).toMatchObject({ status: 'offline', seen: first.seen });
+			// Renamed while the change to offline is still owed: it goes out under the new user_id, with its seen.
+			dave = await back(watcher, toId);
+			await hangUp(dave, toId);
+			await rename(toId, lastId);
+			await advance(WAIT);
+			expect(shown(await drain(watcher), lastId)).toEqual([{ user_id: lastId, status: 'offline', seen: first.seen }]);
+			expect(await listed(watcher, lastId)).toMatchObject({ status: 'offline', seen: first.seen });
+			expect(await stored(lastId)).toBe(s1);
+			expect([...writes(sql, fromId), ...writes(sql, toId), ...writes(sql, lastId)]).toEqual([s1]);
+		} finally {
+			watcher.close(); dave.close(); admin.close();
+			await setAdminToken(undefined);
+		}
+	});
+
+	/** Closes all of `peers`, `userId`'s connections, back to back, and waits until the object has handled every close. */
+	async function closeTogether(peers: Peer[], userId: string): Promise<void> {
+		for (const peer of peers) peer.close();
+		for (let tries = 0; tries < 400 && await counted(userId) > 0; tries++) await new Promise((resolve) => setTimeout(resolve, 5));
+		expect(await counted(userId)).toBe(0);
+	}
+
+	/** `userId` signed in on `tabs` connections, and others told they are online. */
+	async function tabsOf(watcher: Peer, userId: string, tabs: number): Promise<Peer[]> {
+		const peers = [await signedIn(userId)];
+		while (peers.length < tabs) peers.push(await signedIn(userId, { existing: true }));
+		await advance(COALESCE + 1_000);
+		expect(shown(await drain(watcher), userId)).toEqual([{ user_id: userId, status: 'online' }]);
+		return peers;
+	}
+
+	/**
+	 * Has the object's Store.settleSeen run `settle` instead, with the real
+	 * one, until the test ends (afterEach restores it).
+	 */
+	function replaceSettle(settle: (real: (input: { userId: string; at: number; now?: number }) => number | undefined, input: { userId: string; at: number; now?: number }, runtime: Runtime & Record<string, any>) => number | undefined): Promise<void> {
+		return runInDurableObject(stub(), (instance) => {
+			const runtime = instance as unknown as Runtime & Record<string, any>;
+			const real = runtime.store.settleSeen.bind(runtime.store);
+			vi.spyOn(runtime.store, 'settleSeen').mockImplementation((input) => settle(real, input, runtime));
+		});
+	}
+
+	const refused = () => new StoreError('retry_after', 'Demo capacity reached', { retryAfterMs: 60_000 });
+
+	it('writes once when several tabs close together, each handled as the last, and tells one seen, the one listed', async () => {
+		const watcher = await signedIn(unique('watcher'));
+		const sql = await recordSql();
+		const opened: Peer[] = [];
+		try {
+			await drain(watcher);
+			for (const tabs of [2, 3]) {
+				const userId = unique(`tabs${tabs}`);
+				const peers = await tabsOf(watcher, userId, tabs);
+				opened.push(...peers);
+				await closeTogether(peers, userId);
+				await advance(WAIT);
+				const changes = shown(await drain(watcher), userId);
+				expect(changes).toEqual([{ user_id: userId, status: 'offline', seen: expect.stringMatching(/^\d+$/) }]);
+				expect(writes(sql, userId)).toEqual([Number(changes[0].seen)]);
+				expect(await stored(userId)).toBe(Number(changes[0].seen));
+				expect(await listed(watcher, userId)).toMatchObject({ status: 'offline', seen: changes[0].seen });
+			}
+			// Again with the object's memory of each close lost once it is
+			// handled, as an eviction between the closes would lose it: the
+			// rest find the change still owed to others, and the store, which
+			// would refuse them now, is not asked again.
+			const userId = unique('evicted');
+			const peers = await tabsOf(watcher, userId, 3);
+			opened.push(...peers);
+			let calls = 0;
+			await replaceSettle((real, input) => {
+				if (++calls > 1) throw refused();
+				return real(input);
+			});
+			await runInDurableObject(stub(), (instance) => {
+				const runtime = instance as unknown as { departed: Set<string>; connectionGone(attachment: unknown): void };
+				const real = runtime.connectionGone.bind(runtime);
+				vi.spyOn(runtime, 'connectionGone').mockImplementation((attachment) => {
+					real(attachment);
+					runtime.departed.clear();
+				});
+			});
+			await closeTogether(peers, userId);
+			// Every close handled before the grace ends.
+			for (let tries = 0; tries < 400 && await runInDurableObject(stub(), (instance) => (instance as unknown as { connectionGone: { mock: { calls: unknown[] } } }).connectionGone.mock.calls.length) < peers.length; tries++) {
+				await new Promise((resolve) => setTimeout(resolve, 5));
+			}
+			await advance(WAIT);
+			const changes = shown(await drain(watcher), userId);
+			expect(changes).toEqual([{ user_id: userId, status: 'offline', seen: expect.stringMatching(/^\d+$/) }]);
+			expect(calls).toBe(1);
+			expect(writes(sql, userId)).toEqual([Number(changes[0].seen)]);
+			vi.restoreAllMocks();
+			expect(await listed(watcher, userId)).toMatchObject({ status: 'offline', seen: changes[0].seen });
+		} finally { watcher.close(); for (const peer of opened) peer.close(); }
+	});
+
+	it('tells the stored seen when the store refuses to settle a departure, from every tab closing', async () => {
+		const watcher = await signedIn(unique('watcher'));
+		const userId = unique('refused');
+		await register(userId);
+		// A seen recorded long ago, which no longer stands.
+		const recorded = Date.now() - 3 * SEEN_WRITE_GRANULARITY_MS;
+		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.settleSeen({ userId, at: recorded, now: Date.now() }); });
+		const sql = await recordSql();
+		const peers = [await signedIn(userId, { existing: true }), await signedIn(userId, { existing: true })];
+		try {
+			await advance(COALESCE + 1_000);
+			await drain(watcher);
+			let calls = 0;
+			await replaceSettle(() => { calls += 1; throw refused(); });
+			await closeTogether(peers, userId);
+			await advance(WAIT);
+			expect(calls).toBeGreaterThanOrEqual(1);
+			// Refused: what is stored is told, the same from each close, and listed.
+			expect(shown(await drain(watcher), userId)).toEqual([{ user_id: userId, status: 'offline', seen: String(recorded) }]);
+			expect(writes(sql, userId)).toEqual([]);
+			vi.restoreAllMocks();
+			expect(await stored(userId)).toBe(recorded);
+			expect(await listed(watcher, userId)).toMatchObject({ status: 'offline', seen: String(recorded) });
+		} finally { watcher.close(); for (const peer of peers) peer.close(); }
+	});
+
+	it('lets the store decide from what it holds when a connection\'s copy is stale', async () => {
+		const watcher = await signedIn(unique('watcher'));
+		const userId = unique('stale');
+		let peer = await tabsOf(watcher, userId, 1).then((peers) => peers[0]);
+		const sql = await recordSql();
+		try {
+			await hangUp(peer, userId);
+			await advance(WAIT);
+			const [first] = shown(await drain(watcher), userId);
+			peer = await back(watcher, userId);
+			// The connection's copy is lost (as one from code before seen has
+			// none): within SEEN_WRITE_GRANULARITY_MS, the store finds its own
+			// standing, and tells it.
+			await runInDurableObject(stub(), (_instance, state) => {
+				for (const socket of state.getWebSockets()) {
+					const attachment = socket.deserializeAttachment() as Attachment;
+					if (attachment?.userId !== userId) continue;
+					delete attachment.seen;
+					socket.serializeAttachment(attachment);
+				}
+			});
+			offset += 60_000;
+			await hangUp(peer, userId);
+			await advance(WAIT);
+			expect(shown(await drain(watcher), userId)).toEqual([{ user_id: userId, status: 'offline', seen: first.seen }]);
+			expect(writes(sql, userId)).toEqual([Number(first.seen)]);
+			expect(await listed(watcher, userId)).toMatchObject({ status: 'offline', seen: first.seen });
+		} finally { watcher.close(); peer.close(); }
+	});
+
+	it('keeps an owed change whose seen is malformed, without seen', async () => {
+		const watcher = await signedIn(unique('watcher'));
+		const userId = unique('malformed');
+		try {
+			await drain(watcher);
+			const due = Date.now() + 1_000;
+			await runInDurableObject(stub(), (_instance, state) => {
+				for (const socket of state.getWebSockets()) {
+					const attachment = socket.deserializeAttachment() as Omit<Attachment, 'owed'> & { owed?: unknown[] };
+					if (attachment?.userId === undefined || socket.readyState !== 1 || attachment.closing) continue;
+					attachment.owed = [...(attachment.owed ?? []), [userId, 'online', 'offline', due, 'not a time']];
+					socket.serializeAttachment(attachment);
+				}
+			});
+			await advance(2_000);
+			expect(shown(await drain(watcher), userId)).toEqual([{ user_id: userId, status: 'offline' }]);
+		} finally { watcher.close(); }
+	});
+
+	it('fits 32 owed changes with seen and the longest user IDs in a busy connection\'s attachment', async () => {
+		const watcher = await signedIn(unique('watcher'));
+		const warn = vi.spyOn(console, 'warn');
+		try {
+			await drain(watcher);
+			const bytes = await runInDurableObject(stub(), (instance, state) => {
+				const now = Date.now();
+				// The longest user IDs: a bot of an admin-issued 64-character ID.
+				const id = (index: number) => `bot_${'x'.repeat(60)}${String(index).padStart(4, '0')}`;
+				const socket = state.getWebSockets().find((ws) => (ws.deserializeAttachment() as Attachment)?.userId !== undefined && ws.readyState === 1)!;
+				const attachment = socket.deserializeAttachment() as Record<string, unknown>;
+				socket.serializeAttachment({
+					...attachment,
+					owed: Array.from({ length: 32 }, (_, index) => [id(index), 'online', 'offline', now + 3_600_000, now]),
+					// A busy connection's other bounded lists, at their longest.
+					frameTimes: Array.from({ length: 120 }, (_, index) => now - index),
+					policyViolations: Array.from({ length: 120 }, (_, index) => now - index),
+					held: Array.from({ length: 8 }, (_, index) => ['m'.repeat(60) + String(index).padStart(4, '0'), 'r'.repeat(64), now, now]),
+				});
+				// The sweep reads it and writes it back (writeAttachment, with its safety check).
+				(instance as unknown as Runtime).flushPresence(now);
+				const written = socket.deserializeAttachment() as { owed?: unknown[] };
+				expect(written.owed).toHaveLength(32);
+				return new TextEncoder().encode(JSON.stringify(written)).length;
+			});
+			expect(warn.mock.calls.flat().some((line) => /presence_failed|exceeds safety budget/.test(String(line)))).toBe(false);
+			console.info('attachment-bytes', bytes);
+			expect(bytes).toBeLessThanOrEqual(12_000);
+		} finally {
+			// The owed entries are for no one: clear them.
+			await runInDurableObject(stub(), (_instance, state) => {
+				for (const socket of state.getWebSockets()) {
+					const attachment = socket.deserializeAttachment() as Attachment;
+					if (!attachment?.owed) continue;
+					delete attachment.owed;
+					socket.serializeAttachment(attachment);
+				}
+			});
+			watcher.close();
+		}
+	});
+
+	it('shows each user shown offline after /toggle presence comes back on as offline since then, with no write per user', async () => {
+		const adminId = unique('admin');
+		await register(adminId);
+		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.setRole({ userId: adminId, role: 'admin', on: true }); });
+		const admin = await signedIn(adminId, { existing: true });
+		const toggle = async (id: string) => expect((await exchange(admin, id, 'command', { room_id: 'general', body: { text: '/toggle presence' } })).frame.result).toEqual({});
+		// Away throughout, with a seen from long ago; back briefly while presence is off;
+		// connected and invisible throughout; and online when it comes back on.
+		const awayId = unique('away');
+		const briefId = unique('brief');
+		const shyId = unique('shy');
+		const stayId = unique('stay');
+		const old = Date.now() - 2 * DAY;
+		for (const userId of [awayId, briefId]) {
+			await register(userId);
+			await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.settleSeen({ userId, at: old, now: Date.now() }); });
+		}
+		const shy = await signedIn(shyId);
+		await choose(shy, 'invisible');
+		let stay = await signedIn(stayId);
+		const sql = await recordSql();
+		try {
+			await toggle('off');
+			offset += 60_000;
+			const brief = await signedIn(briefId, { existing: true });
+			await hangUp(brief, briefId);
+			await advance(WAIT);
+			offset += 60_000;
+			const before = Date.now();
+			await toggle('on');
+			const after = Date.now();
+			await drain(admin);
+			// Each shown offline: offline since presence came on, whatever was
+			// stored before, and later than the brief return it hid.
+			const list = await listing(admin);
+			const since = list.get(awayId)?.seen as string;
+			expect(Number(since)).toBeGreaterThanOrEqual(before);
+			expect(Number(since)).toBeLessThanOrEqual(after);
+			for (const userId of [awayId, briefId, shyId]) expect(list.get(userId)).toMatchObject({ status: 'offline', seen: since });
+			expect(list.get(stayId)).not.toHaveProperty('seen');
+			// One _meta row, no identity row.
+			expect(sql.filter((entry) => /^UPDATE identities SET seen_ms/.test(entry.query) && entry.written() > 0)).toEqual([]);
+			// Leaving within 10 minutes of it: told that time, listed with it, nothing written.
+			offset += 3 * 60_000;
+			await hangUp(stay, stayId);
+			await advance(WAIT);
+			expect(shown(await drain(admin), stayId)).toEqual([{ user_id: stayId, status: 'offline', seen: since }]);
+			expect(await listed(admin, stayId)).toMatchObject({ status: 'offline', seen: since });
+			expect(writes(sql, stayId)).toEqual([]);
+			// Kept across eviction, read with the toggle.
+			await evict();
+			expect(await listed(admin, awayId)).toMatchObject({ status: 'offline', seen: since });
+			expect(await listed(admin, shyId)).toMatchObject({ status: 'offline', seen: since });
+			// Later departures write their own as before.
+			offset += SEEN_WRITE_GRANULARITY_MS;
+			stay = await back(admin, stayId);
+			await hangUp(stay, stayId);
+			await advance(WAIT);
+			const [later] = shown(await drain(admin), stayId);
+			expect(Number(later.seen)).toBeGreaterThan(Number(since) + SEEN_WRITE_GRANULARITY_MS);
+			expect(await stored(stayId)).toBe(Number(later.seen));
+		} finally { admin.close(); shy.close(); stay.close(); }
+	});
+
+	it('lists a reused listing with the stored seen when the status it was written with rolls back', async () => {
+		const userId = unique('rollback');
+		await register(userId);
+		const result = await runInDurableObject(stub(), (instance) => {
+			const store = (instance as unknown as Runtime).store as Store & Record<string, any>;
+			const now = Date.now();
+			const old = now - 3 * SEEN_WRITE_GRANULARITY_MS;
+			store.settleSeen({ userId, at: old, now });
+			const seenOf = () => store.roomMembers(['general'], DEFAULT_LIMITS.roomListMembers, Date.now(), undefined, true).get('general')?.find((member: { user_id: string }) => member.user_id === userId)?.seen;
+			expect(seenOf()).toBe(old);
+			const spy = vi.spyOn(store, 'writeUserStatus').mockImplementation(() => { throw new Error('status write failed'); });
+			expect(() => store.setStatus({ userId, choice: 'invisible', seenAt: now, now })).toThrow('status write failed');
+			spy.mockRestore();
+			return { old, listed: seenOf(), stored: store.getIdentity(userId)?.seen };
+		});
+		// Rolled back with the status: neither stored nor listed.
+		expect(result.stored).toBe(result.old);
+		expect(result.listed).toBe(result.old);
 	});
 });

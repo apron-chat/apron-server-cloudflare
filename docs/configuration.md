@@ -384,6 +384,17 @@ a minute behind:
 - `offlineGraceSeconds` (60): a change caused by a closed connection waits
   this long, so a reload or a phone reconnecting shows nothing.
 
+A user shown `offline` carries `seen`, when that began. A registered
+user's is written at most once in 10 minutes (`SEEN_WRITE_GRANULARITY_MS`,
+fixed, not a plan limit): going `offline` again within 10 minutes of the
+stored one shows that one, with no write, so `seen` may be up to 10
+minutes earlier than the real departure, and one account writes it at
+most 144 times a day, however many tabs close together. Going `offline`
+after a longer absence always writes. It is written as the last
+connection closes, before `offlineGraceSeconds`, so a reload within the
+grace, which shows nothing, writes its time when the stored one is over
+10 minutes old, and a departure within the next 10 minutes shows that.
+
 Waiting changes, and mutes that run out within the minute, are handled by
 one in-memory timer, armed only while a signed-in connection is open, which
 keeps the object awake for at most a minute after its last event; it uses no
