@@ -185,21 +185,26 @@ within it:
   `{kind: "webpush", url, keys: {p256dh, auth}, push_id?}` (its
   `PushSubscription` JSON with `kind` and an optional `push_id` of 1 to 64
   letters, digits, `_` or `-`, and an optional `wake` list of scopes, of which
-  `mentions`, `replies` and `private` are implemented and the first two the
-  default), at most 5 each
+  `mentions`, `replies`, `private` and `joined` are implemented and the first
+  two the default; `joined` is kept only for an `admin` or `mod`, and
+  dropped from anyone else's), at most 5 each
   and 10 registrations a
   minute; guests cannot. Registrations are each user's own, and lapse after
   7 days without being registered again (clients register on every
   connection). Endpoints must be public `https` hosts on an allowed push
   service (by default the browsers' own), not IP literals or internal names. A new message that
   mentions a user, or replies to their message, wakes them by push (on the
-  registrations whose `wake` includes that scope) only when none of their
-  connections is
+  registrations whose `wake` includes that scope), and so does every message
+  in a room (or a thread of one) for an `admin` or `mod` who kept `joined`
+  and is a member of it (at `normal` urgency, after everyone else the
+  message wakes), only when none of their connections is
   attended (every one idle, stale, or closed) and neither a mute of
   theirs nor a `dnd` status silences it: at most 10 users with
   registrations a message, once a minute per user and room, 100 pushes a day
   per recipient, 200 pushes a day per sender (delivered or not), and 5,000 pushes a
-  day in all. Guests' messages wake no one
+  day in all. A push only for `joined` goes at most once every 5 minutes per
+  moderator and room, at most 20 a day per moderator apart from their 100,
+  and is charged to no sender. Guests' messages wake no one
   (see
   [SPEC section 4.4](../SPEC.md#44-push)). The push carries
   `{push_id, message}`: the registration's `push_id` when it has one, and
@@ -346,8 +351,10 @@ to rooms (`/toggle addmember`). Where uploads are configured, `ext:media`
 origin when it is not the server's, and each type an attachment or avatar
 upload keeps with its largest size. `ext:permissions` (also from EXT.md) puts
 `ext.permissions` on the user's own `you` only: `move_any` for a registered
-user with `admin`, `mod` or `threader` (not an owner's bot), and `add_members`
-for an admin, or any registered user but a bot while `addmember` is on. It is
+user with `admin`, `mod` or `threader` (not an owner's bot), `add_members`
+for an admin, or any registered user but a bot while `addmember` is on, and
+`push_joined` for a registered `admin` or `mod` (not an owner's bot) while
+push is on. It is
 the server's: `me` ignores an `ext.permissions` it writes. The ping interval is the standard `server.params.ping`.
 The demo's 16 KiB frame policy is an explicit exception to the base protocol's
 advisory 256 KiB recommendation. Payload lengths count UTF-8 bytes. Errors use

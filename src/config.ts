@@ -384,10 +384,14 @@ export function validatePushPolicy(policy: PushPolicy): void {
 	if (policy.wakesPerMessage > MAX_PUSH_CANDIDATES) throw new ConfigError(`push.wakesPerMessage must be at most ${MAX_PUSH_CANDIDATES}`);
 	if (policy.pushesPerSenderDay > policy.pushesPerDay) throw new ConfigError("push.pushesPerSenderDay must fit pushesPerDay");
 	if (policy.pushesPerRecipientDay > policy.pushesPerDay) throw new ConfigError("push.pushesPerRecipientDay must fit pushesPerDay");
+	if (policy.joinedPushesPerRecipientDay > policy.pushesPerDay) throw new ConfigError("push.joinedPushesPerRecipientDay must fit pushesPerDay");
 	if (policy.mutesPerUserMinute > MAX_TYPE_THROTTLE_PER_MINUTE) throw new ConfigError(`push.mutesPerUserMinute must be at most ${MAX_TYPE_THROTTLE_PER_MINUTE}`);
 	if (policy.registersPerUserMinute > MAX_TYPE_THROTTLE_PER_MINUTE) throw new ConfigError(`push.registersPerUserMinute must be at most ${MAX_TYPE_THROTTLE_PER_MINUTE}`);
 	// The coalescing rows are deleted by cleanup once a day at the latest.
 	if (policy.coalesceSeconds > 86_400) throw new ConfigError("push.coalesceSeconds must be at most a day");
+	if (policy.joinedCoalesceSeconds < policy.coalesceSeconds || policy.joinedCoalesceSeconds > 86_400) {
+		throw new ConfigError("push.joinedCoalesceSeconds must be coalesceSeconds to a day");
+	}
 	// The wait is an in-memory timer that keeps the object awake.
 	if (policy.delaySeconds > MAX_STATUS_DELAY_SECONDS) throw new ConfigError(`push.delaySeconds must be at most ${MAX_STATUS_DELAY_SECONDS}`);
 	// Registrations refresh at most daily, so a subscription needs a day at least.
