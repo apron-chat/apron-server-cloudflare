@@ -213,3 +213,17 @@ export function toSchema9(sql: SqlStorage): void {
 	sql.exec("UPDATE _meta SET value = '9' WHERE key = 'schema_version'");
 	sql.exec("UPDATE maintenance SET schema_version = 9 WHERE id = 1");
 }
+
+/**
+ * Turns a fresh store's tables back into schema 10's: the indexes schema 11
+ * dropped, and the uploads' `content_type`, empty.
+ */
+export function toSchema10(sql: SqlStorage): void {
+	sql.exec("CREATE INDEX message_state_latest_idx ON message_state (latest_log_id)");
+	sql.exec("CREATE INDEX reaction_state_log_idx ON reaction_state (log_id)");
+	sql.exec("CREATE INDEX push_subscriptions_user_idx ON push_subscriptions (user_id, updated_ms)");
+	sql.exec("CREATE INDEX push_subscriptions_waking_idx ON push_subscriptions (user_id, updated_ms) WHERE wake != 0");
+	sql.exec("ALTER TABLE uploads ADD COLUMN content_type TEXT NOT NULL DEFAULT ''");
+	sql.exec("UPDATE _meta SET value = '10' WHERE key = 'schema_version'");
+	sql.exec("UPDATE maintenance SET schema_version = 10 WHERE id = 1");
+}

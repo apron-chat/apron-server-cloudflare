@@ -46,7 +46,7 @@ import { createHash } from "node:crypto";
 export const ROOM_ID = "general";
 const ROOM_TITLE = "General";
 /**
- * Schema 10 stores the server-wide log (room records, flat message
+ * Schema 11 stores the server-wide log (room records, flat message
  * snapshots, reaction sets, and registered users' memberships), a
  * `memberships` table of registered users' joined rooms, indexed both ways,
  * with each room's count of them, the `uploads` held in R2 with each
@@ -60,9 +60,9 @@ const ROOM_TITLE = "General";
  * absent `_meta` row reads as its initial value, so adding one needs no new
  * version. A schema 9 object from code before the identities' `seen_ms`
  * column gains it before its upgrade (ensureSeenColumn()); one from code
- * before `push_subscriptions_joined_idx` gains that with schema 10.
+ * before `push_subscriptions_joined_idx` gains that with the rebuild.
  */
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 /** The oldest schema upgraded in place rather than reset; each one from it up to SCHEMA_VERSION is. */
 export const UPGRADABLE_SCHEMA_VERSION = 7;
 /**
@@ -1340,7 +1340,10 @@ const SCHEMA_9_INDEXES = [
   "push_subscriptions_joined_idx", "push_wakes_woken_idx", "accepted_requests_expiry_idx", "principal_limits_updated_idx",
 ];
 
-/** Each table schema 10 rebuilds as `WITHOUT ROWID` (upgradeFromSchema9), with the columns its rows keep. */
+/** The indexes of schema 10 that schema 11 drops (upgradeFromSchema10): no query reads them any more. */
+const SCHEMA_10_DROPPED_INDEXES = ["message_state_latest_idx", "reaction_state_log_idx", "push_subscriptions_user_idx", "push_subscriptions_waking_idx"];
+
+/** Each table schema 10 rebuilds as `WITHOUT ROWID` (upgradeFromSchema9), with the columns its rows keep in the current schema. */
 const SCHEMA_10_COPIED_COLUMNS: Record<string, readonly string[]> = {
   _meta: ["key", "value"],
   rooms: ["room_id", "parent_room_id", "created_log_id", "record_log_id", "latest_log_id", "fields_json", "created_ms", "updated_ms", "member_count"],
@@ -1348,7 +1351,7 @@ const SCHEMA_10_COPIED_COLUMNS: Record<string, readonly string[]> = {
   message_state: ["message_id", "room_id", "latest_log_id", "author_id"],
   reaction_state: ["message_id", "user_id", "log_id", "from_json", "emojis_json"],
   identities: ["user_id", "user_handle", "name", "tier", "created_ms", "updated_ms", "avatar_url", "avatar_expires_ms", "roles_json", "ext_json", "seen_ms"],
-  uploads: ["upload_key", "owner_id", "purpose", "message_id", "embed_id", "state", "bytes", "content_type", "write_expires_ms", "expires_ms", "created_ms"],
+  uploads: ["upload_key", "owner_id", "purpose", "message_id", "embed_id", "state", "bytes", "write_expires_ms", "expires_ms", "created_ms"],
   memberships: ["room_id", "user_id"],
   credentials: ["credential_id", "user_id", "public_key_json", "sign_count", "transports_json", "created_ms", "updated_ms"],
   push_subscriptions: ["user_id", "url", "p256dh", "auth", "push_id", "wake", "created_ms", "updated_ms"],
@@ -1393,6 +1396,12 @@ const SCHEMA_10_COPIED_COLUMNS: Record<string, readonly string[]> = {
  * `read_cursors` keeps each registered user's `read_message_id` (protocol
  * §4.6) for each room they joined, keyed by user and room, at most one a
  * membership (saveReadCursors), deleted with it.
+ *
+ * Schema 11 (upgradeFromSchema10): message and reaction state is deleted
+ * with the record it points at, so neither table is indexed by log ID; a
+ * user's push registrations are their primary-key range, so only expiry
+ * and the moderators' `joined` registrations are indexed; and uploads no
+ * longer keep their content type, which nothing read.
  */
 const SCHEMA_DDL = `
   CREATE TABLE IF NOT EXISTS _meta (
@@ -1431,7 +1440,6 @@ const SCHEMA_DDL = `
     latest_log_id INTEGER NOT NULL,
     author_id TEXT NOT NULL
   ) WITHOUT ROWID;
-  CREATE INDEX IF NOT EXISTS message_state_latest_idx ON message_state (latest_log_id);
   CREATE TABLE IF NOT EXISTS reaction_state (
     message_id TEXT NOT NULL,
     user_id TEXT NOT NULL,
@@ -1440,7 +1448,6 @@ const SCHEMA_DDL = `
     emojis_json TEXT NOT NULL,
     PRIMARY KEY (message_id, user_id)
   ) WITHOUT ROWID;
-  CREATE INDEX IF NOT EXISTS reaction_state_log_idx ON reaction_state (log_id);
   CREATE TABLE IF NOT EXISTS identities (
     user_id TEXT PRIMARY KEY,
     user_handle TEXT NOT NULL,
@@ -1462,7 +1469,6 @@ const SCHEMA_DDL = `
     embed_id TEXT,
     state TEXT NOT NULL,
     bytes INTEGER NOT NULL,
-    content_type TEXT NOT NULL DEFAULT '',
     write_expires_ms INTEGER NOT NULL,
     expires_ms INTEGER NOT NULL,
     created_ms INTEGER NOT NULL
@@ -1504,9 +1510,7 @@ const SCHEMA_DDL = `
     updated_ms INTEGER NOT NULL,
     PRIMARY KEY (user_id, url)
   ) WITHOUT ROWID;
-  CREATE INDEX IF NOT EXISTS push_subscriptions_user_idx ON push_subscriptions (user_id, updated_ms);
   CREATE INDEX IF NOT EXISTS push_subscriptions_updated_idx ON push_subscriptions (updated_ms);
-  CREATE INDEX IF NOT EXISTS push_subscriptions_waking_idx ON push_subscriptions (user_id, updated_ms) WHERE wake != 0;
   CREATE INDEX IF NOT EXISTS push_subscriptions_joined_idx ON push_subscriptions (updated_ms, user_id) WHERE ${JOINED_WAKE_CONDITION};
   CREATE TABLE IF NOT EXISTS push_wakes (
     user_id TEXT NOT NULL,
@@ -1663,6 +1667,10 @@ export class Store {
       this.upgradeFromSchema9();
       version = SCHEMA_VERSION;
     }
+    if (version === 10) {
+      this.upgradeFromSchema10();
+      version = SCHEMA_VERSION;
+    }
     if (version !== 0 && version !== SCHEMA_VERSION) throw new Error(`storage schema ${version} requires resetStorage()`);
     if (version === SCHEMA_VERSION) {
       this.lastEffectiveMs = Math.max(this.lastEffectiveMs, this.storedEffectiveMs());
@@ -1796,15 +1804,17 @@ export class Store {
   }
 
   /**
-   * Upgrades a schema 9 object to schema 10 in place, once, in one
-   * transaction, rebuilding every table keyed by text, or by more than one
+   * Upgrades a schema 9 object to the current schema in place, once, in one
+   * transaction (it creates SCHEMA_DDL, so schema 11's own upgrade has
+   * nothing left to do), rebuilding every table keyed by text, or by more than one
    * column, as a `WITHOUT ROWID` table: SQLite otherwise keeps such a key as
    * a separate index, so each insert wrote one more row. `records` loses its
    * index by commit time, which repeated its index by `log_id` (commit times
    * are nondecreasing in log order), and `message_state` its copy of each
    * message's latest snapshot, read from `records` by its latest `log_id`
    * instead. `read_cursors` is new and empty. The limiter rows' four
-   * timestamp lists, unread since schema 9, go with the rebuild.
+   * timestamp lists, unread since schema 9, go with the rebuild, and so does
+   * the state below the history floor (dropExpiredState).
    *
    * Each old table is renamed aside, the schema created anew, its rows copied
    * by column and the old table dropped. The rows this reads and writes, once,
@@ -1816,6 +1826,8 @@ export class Store {
   private upgradeFromSchema9(): void {
     const start = { reads: this.observed.reads, writes: this.observed.writes };
     this.transaction(() => {
+      // While schema 9's expiry indexes can find them: the rebuilt tables have none.
+      this.dropExpiredState();
       for (const index of SCHEMA_9_INDEXES) this.rawExec(`DROP INDEX IF EXISTS ${index}`);
       for (const table of Object.keys(SCHEMA_10_COPIED_COLUMNS)) this.rawExec(`ALTER TABLE ${table} RENAME TO ${table}_v9`);
       this.rawScript(SCHEMA_DDL);
@@ -1831,6 +1843,41 @@ export class Store {
       event: "storage_schema_upgraded", from: 9, to: SCHEMA_VERSION,
       rows_read: this.observed.reads - start.reads, rows_written: this.observed.writes - start.writes,
     }));
+  }
+
+  /**
+   * Upgrades a schema 10 object to schema 11 in place, once, in one
+   * transaction: it drops the indexes cleanup no longer reads, which every
+   * write kept, and the uploads' `content_type`, which nothing read.
+   * Message and reaction state now goes with the record it points at
+   * (runCleanup), so the state rows already below the history floor, which
+   * the dropped indexes found, are deleted first. Dropping a column
+   * rewrites the uploads table, at most the uploads cap of rows. Charged
+   * like upgradeFromSchema8 (finishUpgrade).
+   */
+  private upgradeFromSchema10(): void {
+    const start = { reads: this.observed.reads, writes: this.observed.writes };
+    const effective = Number(this.metaValue(META_EFFECTIVE_NOW));
+    const day = dayFor(Math.max(Number.isSafeInteger(effective) ? effective : 0, this.clock.now()));
+    this.transaction(() => {
+      this.dropExpiredState();
+      for (const index of SCHEMA_10_DROPPED_INDEXES) this.rawExec(`DROP INDEX IF EXISTS ${index}`);
+      this.rawExec("ALTER TABLE uploads DROP COLUMN content_type");
+      this.finishUpgrade(SCHEMA_VERSION, start, day);
+    });
+    console.warn(JSON.stringify({ event: "storage_schema_upgraded", from: 10, to: SCHEMA_VERSION }));
+  }
+
+  /**
+   * Deletes the message and reaction state below the history floor, by the
+   * schema 9 and 10 indexes on their latest log IDs: what cleanup left
+   * when a batch ran out before them. From schema 11 state goes with its
+   * record, so none is left below the floor.
+   */
+  private dropExpiredState(): void {
+    const floor = this.logState().history_floor;
+    this.rawExec("DELETE FROM message_state WHERE latest_log_id < ?", floor);
+    this.rawExec("DELETE FROM reaction_state WHERE log_id < ?", floor);
   }
 
   /**
@@ -2635,7 +2682,7 @@ export class Store {
         // Every room row is read: the creator is kept in its JSON, unindexed.
         created: this.rawRows<{ room_id: string; fields_json: string }>("SELECT room_id, fields_json FROM rooms WHERE json_extract(fields_json, '$.creator_id') = ?", from),
         uploads: count("SELECT COUNT(*) AS count FROM uploads INDEXED BY uploads_owner_idx WHERE owner_id = ?"),
-        pushes: count("SELECT COUNT(*) AS count FROM push_subscriptions INDEXED BY push_subscriptions_user_idx WHERE user_id = ?") +
+        pushes: count("SELECT COUNT(*) AS count FROM push_subscriptions WHERE user_id = ?") +
           count("SELECT COUNT(*) AS count FROM push_wakes WHERE user_id = ?") +
           count("SELECT COUNT(*) AS count FROM user_status WHERE user_id = ?") +
           count("SELECT COUNT(*) AS count FROM room_mutes WHERE user_id = ?"),
@@ -4271,8 +4318,8 @@ export class Store {
   }
 
   /** Marks a pending upload written, counting its real size in place of the largest. */
-  private completeUploadRow(row: RawUploadRow, bytes: number, contentType: string): void {
-    this.rawExec("UPDATE uploads SET state = 'done', bytes = ?, content_type = ? WHERE upload_key = ?", bytes, contentType, row.upload_key);
+  private completeUploadRow(row: RawUploadRow, bytes: number): void {
+    this.rawExec("UPDATE uploads SET state = 'done', bytes = ? WHERE upload_key = ?", bytes, row.upload_key);
     this.setUploadBytes(this.metaNumber(META_UPLOAD_BYTES) - row.bytes + bytes);
   }
 
@@ -4380,7 +4427,7 @@ export class Store {
     if (row.purpose === "avatar") {
       const identity = this.identityRow(row.owner_id);
       if (!ok || !identity || !write.contentType!.startsWith("image/")) return { accepted: false, broadcasts: [], deletedUploads: this.releaseUploadRows([row]) };
-      this.completeUploadRow(row, write.bytes!, write.contentType!);
+      this.completeUploadRow(row, write.bytes!);
       const replaced = this.rawRows<RawUploadRow>(
         `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
          FROM uploads INDEXED BY uploads_owner_idx WHERE owner_id = ? AND purpose = 'avatar' AND state = 'done' AND upload_key <> ? LIMIT 8`,
@@ -4397,7 +4444,7 @@ export class Store {
     let replacement: Record<string, unknown> | null = null;
     let deletedUploads: string[] = [];
     if (ok) {
-      this.completeUploadRow(row, write.bytes!, write.contentType!);
+      this.completeUploadRow(row, write.bytes!);
       const size = write.width && write.height ? { width: write.width, height: write.height } : {};
       const media = write.contentType!.startsWith("audio/") ? { audio: { url, type: write.contentType } } : { image: { url, type: write.contentType, ...size } };
       replacement = { ...embed, url, og: { ...(typeof embed.title === "string" ? { title: embed.title } : {}), ...media } };
@@ -4582,7 +4629,7 @@ export class Store {
       // The new one never goes, even when it shares its millisecond with others.
       this.rawExec(
         `DELETE FROM push_subscriptions WHERE user_id = ? AND url IN (
-           SELECT url FROM push_subscriptions INDEXED BY push_subscriptions_user_idx
+           SELECT url FROM push_subscriptions
            WHERE user_id = ? AND url <> ? ORDER BY updated_ms DESC LIMIT -1 OFFSET ?)`,
         input.userId, input.userId, input.url, policy.subscriptionsPerUser - 1,
       );
@@ -4691,11 +4738,11 @@ export class Store {
           why &= ~WAKE_SCOPES.joined;
           if (!why) continue;
         }
-        // Filtered after the bounded read, so the read stays one index range of
-        // at most `subscriptionsPerUser` rows whatever the scopes; the partial
-        // index leaves out registrations that wake for nothing.
+        // Filtered after the bounded read, so the read stays one primary-key
+        // range of the user's registrations, at most `subscriptionsPerUser`,
+        // whatever the scopes.
         const rows = this.rawRows<RawPushRow>(
-          `SELECT url, p256dh, auth, push_id, wake FROM push_subscriptions INDEXED BY push_subscriptions_waking_idx
+          `SELECT url, p256dh, auth, push_id, wake FROM push_subscriptions
            WHERE user_id = ? AND wake != 0 AND updated_ms >= ? ORDER BY updated_ms DESC LIMIT ?`,
           userId, live, policy.subscriptionsPerUser,
         ).filter((row) => (integerColumn(row.wake) & why) !== 0 && (input.allowed?.(row.url) ?? true));
@@ -5815,8 +5862,6 @@ export class Store {
       // Commit times are nondecreasing in log order, so the oldest record from the floor on says whether any expired.
       this.rawRows<{ commit_ms: number }>("SELECT commit_ms FROM records INDEXED BY records_log_idx WHERE log_id >= ? ORDER BY log_id LIMIT 1", floor)
         .some((row) => integerColumn(row.commit_ms) < cutoff) ||
-      this.rawRows("SELECT message_id FROM message_state WHERE latest_log_id < ? ORDER BY latest_log_id LIMIT 1", floor).length > 0 ||
-      this.rawRows("SELECT message_id FROM reaction_state WHERE log_id < ? ORDER BY log_id LIMIT 1", floor).length > 0 ||
       this.rawRows("SELECT user_id FROM accepted_requests WHERE expires_ms <= ? ORDER BY expires_ms LIMIT 1", effective).length > 0 ||
       this.rawRows("SELECT scope FROM principal_limits WHERE updated_ms < ? ORDER BY updated_ms LIMIT 1", limiterCutoff).length > 0 ||
       this.rawRows("SELECT user_id FROM push_subscriptions INDEXED BY push_subscriptions_updated_idx WHERE updated_ms < ? ORDER BY updated_ms LIMIT 1", this.pushCutoffs(effective).subscriptions).length > 0 ||
@@ -5920,22 +5965,41 @@ export class Store {
     });
     const result = this.transaction(() => {
       let remaining = batch;
-      const records = this.rawRows<{ room_id: string; log_id: number }>(
-        "SELECT room_id, log_id FROM records INDEXED BY records_log_idx WHERE log_id < ? ORDER BY log_id LIMIT ?", floor, remaining,
+      const expiring = this.rawRows<{ room_id: string; log_id: number; kind: string; message_id: string | null; reactions_json: string | null }>(
+        `SELECT room_id, log_id, kind, json_extract(record_json, '$.message_id') AS message_id,
+           CASE WHEN kind = 'reactions' THEN record_json END AS reactions_json
+         FROM records INDEXED BY records_log_idx WHERE log_id < ? ORDER BY log_id LIMIT ?`, floor, remaining,
       );
-      for (const row of records) this.rawExec("DELETE FROM records WHERE room_id = ? AND log_id = ?", row.room_id, row.log_id);
-      remaining -= records.length;
-      // Current state survives while its latest record is retained.
-      const messages = remaining > 0 ? this.rawRows<{ message_id: string }>(
-        "SELECT message_id FROM message_state WHERE latest_log_id < ? ORDER BY latest_log_id LIMIT ?", floor, remaining,
-      ) : [];
-      for (const row of messages) this.rawExec("DELETE FROM message_state WHERE message_id = ? AND latest_log_id < ?", row.message_id, floor);
-      remaining -= messages.length;
-      const reactions = remaining > 0 ? this.rawRows<{ message_id: string; user_id: string }>(
-        "SELECT message_id, user_id FROM reaction_state WHERE log_id < ? ORDER BY log_id LIMIT ?", floor, remaining,
-      ) : [];
-      for (const row of reactions) this.rawExec("DELETE FROM reaction_state WHERE message_id = ? AND user_id = ? AND log_id < ?", row.message_id, row.user_id, floor);
-      remaining -= reactions.length;
+      // Current state survives while its latest record is retained, so it
+      // goes with that record: a message's state row with its latest
+      // snapshot, and each reaction set with the record that logged it, by
+      // its whole primary key (the users the record names), so a delete
+      // reads and writes at most the row it removes. A move's record is
+      // stored in both rooms, so the second finds the rows gone. Each state
+      // row counts against the batch with its record: a record whose state
+      // would not fit waits for the next batch, below the floor already.
+      const records: typeof expiring = [];
+      let messages = 0;
+      let reactions = 0;
+      for (const row of expiring) {
+        const users = row.kind === "reactions" && row.message_id !== null && row.reactions_json !== null
+          ? parseJson<ReactionsRecord>(row.reactions_json).reactions.map((set) => set.from.user_id)
+          : [];
+        const state = row.message_id === null ? 0 : row.kind === "message" ? 1 : users.length;
+        if (records.length > 0 && 1 + state > remaining) break;
+        this.rawExec("DELETE FROM records WHERE room_id = ? AND log_id = ?", row.room_id, row.log_id);
+        records.push(row);
+        remaining -= 1 + state;
+        if (row.message_id === null) continue;
+        if (row.kind === "message") {
+          if (this.rawExec("DELETE FROM message_state WHERE message_id = ? AND latest_log_id = ?", row.message_id, row.log_id).rowsWritten) messages += 1;
+        } else {
+          for (const userId of users) {
+            if (this.rawExec("DELETE FROM reaction_state WHERE message_id = ? AND user_id = ? AND log_id = ?", row.message_id, userId, row.log_id).rowsWritten) reactions += 1;
+          }
+        }
+      }
+      remaining = Math.max(0, remaining);
       // A thread or private room whose entire log (creation record included)
       // has been discarded leaves the visible set. No message, reaction, or
       // membership can still be current in it: each touches the room's head
@@ -6015,10 +6079,10 @@ export class Store {
       const nextDue = effective + (hasMore ? 1000 : this.config.cleanupIntervalMs);
       this.rawExec("UPDATE maintenance SET next_cleanup_ms = ?, cleanup_cutoff_ms = ?, cleanup_cursor = ? WHERE id = 1", nextDue, hasMore ? cutoff : null, hasMore ? floor : null);
       this.assertReservation(reserved, beforeReads, beforeWrites);
-      const deleted = records.length + messages.length + reactions.length + rooms.length + memberships + requests.length + limiters.length + subscriptions.length + wakes.length;
+      const deleted = records.length + messages + reactions + rooms.length + memberships + requests.length + limiters.length + subscriptions.length + wakes.length;
       return {
         history_floor: idString(floor), previous_floor: idString(previousFloor), latest_id: idString(state.last_log_id),
-        deleted_records: records.length, deleted_messages: messages.length, deleted_reactions: reactions.length,
+        deleted_records: records.length, deleted_messages: messages, deleted_reactions: reactions,
         deleted_memberships: memberships, deleted_requests: requests.length, deleted_limiters: deletedLimiters,
         removed_rooms: rooms.map((row) => row.room_id),
         next_due_ms: nextDue,

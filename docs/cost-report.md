@@ -1,7 +1,7 @@
 # Cloudflare Worker storage cost report
 
 This report records local native SQLite measurements used for the storage
-accounting review. It describes the current schema (schema 10: one server-wide
+accounting review. It describes the current schema (schema 11: one server-wide
 record log of room records, message snapshots, reaction sets, and
 memberships; a `memberships` table of registered users' rooms, keyed by
 room with an index by user; the upload, push registration, user status,
@@ -19,7 +19,8 @@ schema 9 (below), and on 2026-10-26 for `seen` (User status, below), and
 again the same day for writing it at most once in 10 minutes, and for
 letting the store settle it (several tabs closing together, a stale copy,
 and the floor after `/toggle presence`), and on 2026-10-27 for schema 10
-(below), with the repository's workerd launcher:
+(below), and again the same day for schema 11 (below), with the
+repository's workerd launcher:
 
 ```sh
 devenv shell -- npm test -- \
@@ -31,6 +32,43 @@ constructs a `Store` over each object's native SQLite state with a fake clock.
 The traffic tests start at a future UTC noon, cross three UTC posting days,
 run cleanup a day and a half later, and evict/reinitialize one object to check
 persisted limiter state.
+
+## Schema 11: state goes with its record, fewer push indexes (2026-10-27)
+
+Measured against schema 10 the same day. Schema 11 drops what no query needs:
+
+- `message_state_latest_idx` and `reaction_state_log_idx`, which cleanup
+  used to find expired state. Cleanup now deletes a message's state row
+  with its latest record, and each reaction set with the record that
+  logged it, by its whole primary key from the users the record names, so
+  every message write and reaction set writes one index entry fewer. Each
+  state delete reads and writes at most the row it removes, and counts
+  against the batch with its record: a move's record, which names every set
+  of its message (up to 64), costs 65 of a batch's 100. Deleting a
+  message's sets by key prefix instead would read every set it holds for
+  each expiring record, which a popular message's history could take past
+  the cleanup reservation (`test/history.integration.test.ts`, 100 records
+  each naming 64 sets).
+- `push_subscriptions_user_idx` and the partial `push_subscriptions_waking_idx`:
+  a user's registrations are a primary-key range of at most
+  `subscriptionsPerUser`, sorted after reading. A registration writes 4 rows
+  where it wrote 6.
+- The uploads' `content_type`, written and never read.
+
+| Operation | Schema 10 reads / writes | Schema 11 reads / writes |
+| --- | ---: | ---: |
+| Post, limiter rows held | 9 / 10 | 9 / 9 |
+| Edit | 12 / 10 | 12 / 9 |
+| Reaction set | 20 / 15 | 20 / 14 |
+| Move of a message with 64 reaction sets | 209 / 148 | 209 / 83 |
+| Push subscription register | 7 / 6 | 8 / 4 |
+| Cleanup (matrix) | 127 / 42 | 121 / 42 |
+
+A fresh object's SQLite file is 139,264 bytes, from 151,552. A schema 10
+object is upgraded in one charged transaction: it deletes the state below
+the history floor that schema 10's cleanup may have left (by the indexes it
+then drops), drops the four indexes, and drops the column, which rewrites
+the uploads table. A schema 9 object is rebuilt straight into schema 11.
 
 ## Schema 10: keys as tables, one index for the log, read cursors (2026-10-27)
 
@@ -207,11 +245,11 @@ upper bounds can be compared with the measured worst case.
 | Identity count | 2 | 1 | 16 | 8 |
 | Credential IDs lookup | 2 | 1 | 40 | 8 |
 | Credential counter update | 2 | 2 | 16 | 16 |
-| Push subscription register | 7 | 6 | 172 | 436 |
+| Push subscription register | 8 | 4 | 172 | 436 |
 | Push subscription register again, unchanged within a day | 3 | 1 | 172 | 436 |
-| Push subscription register, a moderator keeping `joined` (one more index entry) | 7 | 7 | 172 | 436 |
-| Push wake claim (one user, one subscription; creates the server, sender and recipient counters) | 25 | 15 | 106 | 160 |
-| Push wake claim, 31 unregistered candidates before one registered | 75 | 6 | 1,408 | 160 |
+| Push subscription register, a moderator keeping `joined` (one more index entry) | 9 | 5 | 172 | 436 |
+| Push wake claim (one user, one subscription; creates the server, sender and recipient counters) | 26 | 15 | 106 | 160 |
+| Push wake claim, 31 unregistered candidates before one registered | 76 | 6 | 1,408 | 160 |
 | Push registrations clear (`/passkeys remove`, a new bot token) | 1 | 2 | 144 | 400 |
 | Mute set (`status` `mute`, unscoped) | 3 | 2 | 24 | 24 |
 | Status set (`me` `status`) | 3 | 2 | 24 | 24 |
@@ -231,16 +269,16 @@ upper bounds can be compared with the measured worst case.
 | Push wake claim, the thread's parent muted (passed over) | 8 | 1 | 106 | 160 |
 | Gone push subscription forget (one primary-key row) | 2 | 2 | 20 | 22 |
 | Push reply author lookup | 4 | 1 | 16 | 8 |
-| Push wake claim for a reply (creates the recipient counter) | 17 | 9 | 106 | 160 |
+| Push wake claim for a reply (creates the recipient counter) | 18 | 9 | 106 | 160 |
 | Push joined wakers (the moderators who kept `joined`; one range of their partial index, read for every message) | 2 | 1 | 176 | 8 |
-| Push wake claim for `joined` (creates its own recipient counter; reads the role and the membership; charges no sender) | 18 | 8 | 106 | 160 |
-| Message create with request ID (the poster's first: creates its limiter rows) | 26 | 23 | 296 | 120 |
+| Push wake claim for `joined` (creates its own recipient counter; reads the role and the membership; charges no sender) | 20 | 8 | 106 | 160 |
+| Message create with request ID (the poster's first: creates its limiter rows) | 26 | 22 | 296 | 120 |
 | Empty new message (not logged) | 2 | 1 | 16 | 8 |
 | Deduplicated mutation retry | 2 | 1 | 32 | 16 |
-| Reaction set | 20 | 15 | 296 | 120 |
+| Reaction set | 20 | 14 | 296 | 120 |
 | Thread room create by a registered user (counts the creator's live threads; stores and logs the membership) | 20 | 19 | 414 | 120 |
 | Thread room save | 10 | 8 | 296 | 120 |
-| Message move with one reaction set | 17 | 17 | 296 | 280 |
+| Message move with one reaction set | 17 | 15 | 296 | 280 |
 | Registered name mutation | 16 | 11 | 296 | 120 |
 | Registered room leave (logs the membership; the user's fourth post since its limiter row was written, which writes it) | 19 | 14 | 582 | 72 |
 | Registered room join (logs the membership) | 15 | 7 | 582 | 72 |
@@ -262,7 +300,7 @@ upper bounds can be compared with the measured worst case.
 | Read cursor written, not past the one kept (no row changes) | 2 | 2 | 20 | 20 |
 | Read cursor written for a room not joined (the probe alone) | 2 | 1 | 20 | 20 |
 | Read cursors at a listing (one range of the user's rows) | 2 | 1 | 518 | 8 |
-| Cleanup (matrix, one day later) | 127 | 42 | 1,874 | 1,058 |
+| Cleanup (matrix, one day later) | 121 | 42 | 1,874 | 1,058 |
 | Alarm scheduling | 6 | 3 | 24 | 12 |
 
 The matrix uses a fresh object and one representative operation for each
@@ -552,7 +590,8 @@ at most 100 per registered user, about 60 bytes each.
 A registration now also writes its entry in the partial index of waking
 registrations (9/8 against 9/7), and the wake claim reads live waking
 registrations through that index, so registrations that wake for nothing
-are not read.
+are not read. (Schema 11 drops that index: a wake reads the user's
+registrations by primary key, at most `subscriptionsPerUser`.)
 
 **`joined`, for moderators.** Only a registered `admin` or `mod` keeps
 `joined` when they register (JOINED_WAKE_ROLES); everyone else's is dropped,
@@ -885,10 +924,13 @@ cleanup (the server-wide log from the floor, in log order):
   SEARCH records USING INDEX records_log_idx (log_id>?)
 cleanup physical delete:
   SEARCH records USING COVERING INDEX records_log_idx (log_id<?)
-message state expiry:
-  SEARCH message_state USING COVERING INDEX message_state_latest_idx (latest_log_id<?)
-reaction state expiry:
-  SEARCH reaction_state USING COVERING INDEX reaction_state_log_idx (log_id<?)
+message state expiry (with its latest record):
+  SEARCH message_state USING PRIMARY KEY (message_id=?)
+reaction state expiry (each set the record names, by its whole key):
+  SEARCH reaction_state USING PRIMARY KEY (message_id=? AND user_id=?)
+a wake's registrations (one user's):
+  SEARCH push_subscriptions USING PRIMARY KEY (user_id=?)
+  USE TEMP B-TREE FOR ORDER BY
 move re-logging reactions:
   SEARCH reaction_state USING PRIMARY KEY (message_id=?)
   USE TEMP B-TREE FOR ORDER BY
@@ -920,7 +962,8 @@ History reads one contiguous primary-key range of one room's log; a move is
 stored once in each room it touches, so no membership filter or `UNION` is
 needed. Cleanup walks `records_log_idx` from the floor and stops at the first
 record inside the retention window (commit times follow log order), then
-deletes the bounded prefix by the same index. The move's reaction read and the room listing sort at most
+deletes the bounded prefix by the same index, and with each record the
+state that pointed at it, by primary key. The move's reaction read and the room listing sort at most
 the capped per-message reaction sets and the capped room table respectively;
 the thread-room expiry check in cleanup scans that same capped table. Room
 members are one primary-key range per room, already in `user_id` order, with a
@@ -929,8 +972,8 @@ probe of `user_status`; a user's room mutes are one primary-key range, already
 in `room_id` order, and a wake checks two of them by key; a user's rooms are
 one index range, sorted after joining the capped rooms table. On a
 `WITHOUT ROWID` table a secondary index holds the primary key, so the
-indexes by `latest_log_id`, `log_id`, `expires_ms` and `updated_ms` cover
-the expiry scans that read only keys.
+indexes by `expires_ms` and `updated_ms` cover the expiry scans that read
+only keys.
 
 ## Schema upgrade and reset
 
@@ -970,9 +1013,11 @@ row count, more than a day's maintenance allocation. It is therefore logged
 (`storage_schema_upgraded`, with `rows_read` and `rows_written`) and not
 charged to the day's budget, so it holds back neither the day's posts nor
 its maintenance; the account's own usage, which the budget guard reads,
-still counts it. A schema 8 or 7 object is upgraded to 9 first, then to 10.
-Code before schema 10 finds a newer version and resets the object, so a
-rollback across it loses the stored data, passkeys aside.
+still counts it. A schema 8 or 7 object is upgraded to 9 first, then
+rebuilt; the rebuild creates the current schema, so a schema 9 object goes
+straight to 11. A schema 10 object is upgraded to 11 as described above.
+Code before schema 11 finds a newer version and resets the object, so a
+rollback across either upgrade loses the stored data, passkeys aside.
 
 Any other stored schema version resets the object with
 `deleteAll()` and recreates the schema (`test/schema-reset.integration.test.ts`).

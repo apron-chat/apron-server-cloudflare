@@ -964,8 +964,11 @@ describe('measured storage accounting', () => {
 				cleanupDelete: explain(sql, `EXPLAIN QUERY PLAN
 					SELECT room_id, log_id FROM records INDEXED BY records_log_idx
 					WHERE log_id < ? ORDER BY log_id LIMIT ?`, 100, 100),
-				messageExpiry: explain(sql, 'EXPLAIN QUERY PLAN SELECT message_id FROM message_state WHERE latest_log_id < ? ORDER BY latest_log_id LIMIT ?', 100, 100),
-				reactionExpiry: explain(sql, 'EXPLAIN QUERY PLAN SELECT message_id, user_id FROM reaction_state WHERE log_id < ? ORDER BY log_id LIMIT ?', 100, 100),
+				// State goes with the record it points at: a primary-key probe each, the message's and each named set's.
+				messageExpiry: explain(sql, 'EXPLAIN QUERY PLAN DELETE FROM message_state WHERE message_id = ? AND latest_log_id = ?', '1', 1),
+				reactionExpiry: explain(sql, 'EXPLAIN QUERY PLAN DELETE FROM reaction_state WHERE message_id = ? AND user_id = ? AND log_id = ?', '1', 'plan-user', 1),
+				pushWake: explain(sql, `EXPLAIN QUERY PLAN SELECT url, p256dh, auth, push_id, wake FROM push_subscriptions
+					WHERE user_id = ? AND wake != 0 AND updated_ms >= ? ORDER BY updated_ms DESC LIMIT ?`, 'plan-user', 0, 5),
 				moveReactions: explain(sql, 'EXPLAIN QUERY PLAN SELECT message_id, user_id, log_id, from_json, emojis_json FROM reaction_state WHERE message_id = ? AND log_id >= ? ORDER BY log_id, user_id LIMIT ?', '1', 1, 32),
 				roomListing: explain(sql, `EXPLAIN QUERY PLAN
 					SELECT room_id, fields_json FROM rooms ORDER BY created_log_id ASC LIMIT ?`, 101),
@@ -992,8 +995,10 @@ describe('measured storage accounting', () => {
 		expect(result.plans.history.some((detail) => /SEARCH records USING PRIMARY KEY/i.test(detail))).toBe(true);
 		expect(result.plans.cleanup.some((detail) => /records_log_idx/i.test(detail))).toBe(true);
 		expect(result.plans.cleanupDelete.some((detail) => /records_log_idx/i.test(detail))).toBe(true);
-		expect(result.plans.messageExpiry.some((detail) => /message_state_latest_idx/i.test(detail))).toBe(true);
-		expect(result.plans.reactionExpiry.some((detail) => /reaction_state_log_idx/i.test(detail))).toBe(true);
+		expect(result.plans.messageExpiry.some((detail) => /SEARCH message_state USING PRIMARY KEY \(message_id=\?\)/i.test(detail))).toBe(true);
+		expect(result.plans.reactionExpiry.some((detail) => /SEARCH reaction_state USING PRIMARY KEY \(message_id=\? AND user_id=\?\)/i.test(detail))).toBe(true);
+		// A wake reads one user's registrations by their primary key, at most `subscriptionsPerUser`, sorted after.
+		expect(result.plans.pushWake.some((detail) => /SEARCH push_subscriptions USING PRIMARY KEY \(user_id=\?\)/i.test(detail))).toBe(true);
 		expect(result.plans.moveReactions.some((detail) => /SEARCH reaction_state USING/i.test(detail))).toBe(true);
 		// The rooms table is capped at the thread ceiling plus `general`, so the listing scans it.
 		expect(result.plans.roomListing.some((detail) => /SCAN rooms/i.test(detail))).toBe(true);

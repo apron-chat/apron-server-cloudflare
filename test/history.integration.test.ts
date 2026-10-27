@@ -319,7 +319,10 @@ it("does not exceed the native cleanup reservation for a full bounded batch", as
 			});
 			sql.exec("INSERT INTO records (room_id, log_id, commit_ms, kind, record_json) VALUES ('general', ?, ?, 'message', ?)", index, expiredAt, snapshot);
 			sql.exec("INSERT INTO message_state (message_id, room_id, latest_log_id, author_id) VALUES (?, 'general', ?, ?)", messageId, index, userId);
-			sql.exec("INSERT INTO reaction_state (message_id, user_id, log_id, from_json, emojis_json) VALUES (?, ?, ?, ?, '[\"x\"]')", messageId, userId, index, JSON.stringify({ user_id: userId }));
+			// Each reaction set points at the record that logged it, which cleanup deletes it with.
+			const reactions = JSON.stringify({ log_id: `${100 + index}`, message_id: messageId, room_id: "general", reactions: [{ from: { user_id: userId }, emojis: ["x"] }] });
+			sql.exec("INSERT INTO records (room_id, log_id, commit_ms, kind, record_json) VALUES ('general', ?, ?, 'reactions', ?)", 100 + index, expiredAt, reactions);
+			sql.exec("INSERT INTO reaction_state (message_id, user_id, log_id, from_json, emojis_json) VALUES (?, ?, ?, ?, '[\"x\"]')", messageId, userId, 100 + index, JSON.stringify({ user_id: userId }));
 			sql.exec(
 				"INSERT INTO accepted_requests (user_id, request_id, digest, result_json, transition_json, expires_ms) VALUES (?, ?, ?, ?, NULL, ?)",
 				userId, `request-${index}`, `digest-${index}`, JSON.stringify({ message_id: messageId }), expiredAt,
@@ -335,8 +338,8 @@ it("does not exceed the native cleanup reservation for a full bounded batch", as
 			sql.exec("INSERT INTO memberships (room_id, user_id) VALUES (?, ?)", `thread-${index}`, userId);
 		}
 		sql.exec("UPDATE _meta SET value = '100' WHERE key IN ('principal_limit_count', 'thread_count')");
-		sql.exec("UPDATE rooms SET created_log_id = 1, record_log_id = 1, latest_log_id = 100 WHERE room_id = 'general'");
-		sql.exec("UPDATE log_state SET last_log_id = 100, history_floor = 1, last_commit_ms = ?", expiredAt);
+		sql.exec("UPDATE rooms SET created_log_id = 1, record_log_id = 1, latest_log_id = 200 WHERE room_id = 'general'");
+		sql.exec("UPDATE log_state SET last_log_id = 200, history_floor = 1, last_commit_ms = ?", expiredAt);
 		sql.exec("UPDATE maintenance SET next_cleanup_ms = ?, cleanup_cutoff_ms = NULL, cleanup_cursor = NULL WHERE id = 1", clock.value);
 
 		clock.value += RETENTION_MS + 1;
@@ -365,12 +368,60 @@ it("does not exceed the native cleanup reservation for a full bounded batch", as
 			if (!lastResult.did_work && lastResult.next_due_ms > clock.value) break;
 			clock.value = lastResult.next_due_ms + 1;
 		}
-		expect(deleted).toEqual({ records: 100, messages: 100, reactions: 100, rooms: 100, memberships: 100, requests: 100, limiters: 100 });
-		expect(lastResult?.history_floor).toBe("101");
-		expect(lastResult?.latest_id).toBe("100");
+		expect(deleted).toEqual({ records: 200, messages: 100, reactions: 100, rooms: 100, memberships: 100, requests: 100, limiters: 100 });
+		expect(lastResult?.history_floor).toBe("201");
+		expect(lastResult?.latest_id).toBe("200");
 		expect(lastResult?.did_work).toBe(false);
 		expect(state.storage.sql.exec("SELECT value FROM _meta WHERE key = 'thread_count'").one().value).toBe("0");
-		expect(store.getRoomState()).toMatchObject({ room_id: "general", latest_log_id: "100", history_log_id: null });
+		expect(store.getRoomState()).toMatchObject({ room_id: "general", latest_log_id: "200", history_log_id: null });
+		expect(state.storage.sql.exec("SELECT COUNT(*) AS count FROM message_state").one().count).toBe(0);
+		expect(state.storage.sql.exec("SELECT COUNT(*) AS count FROM reaction_state").one().count).toBe(0);
+	});
+});
+
+it("keeps every cleanup batch within its reservation when expiring records name many reaction sets", async () => {
+	await withStore("cleanup-reaction-sets", { cleanupBatch: 100 }, (store, clock, state) => {
+		// The worst case for state deleted with its record: one message holding
+		// 64 reaction sets, and 100 expired reactions records each naming all of
+		// them (a move re-logs every set in one record). Deleting a message's sets
+		// by a key prefix would read all 64 for every record.
+		const sql = state.storage.sql;
+		const expiredAt = clock.value - RETENTION_MS - 1;
+		const users = Array.from({ length: 64 }, (_, index) => `reactor-${index}`);
+		sql.exec("DELETE FROM records");
+		const message = JSON.stringify({ message_id: "1", log_id: "1", room_id: "general", from: { user_id: "author", name: "Author" }, body: { format: "plain", text: "popular" } });
+		sql.exec("INSERT INTO records (room_id, log_id, commit_ms, kind, record_json) VALUES ('general', 1, ?, 'message', ?)", expiredAt, message);
+		sql.exec("INSERT INTO message_state (message_id, room_id, latest_log_id, author_id) VALUES ('1', 'general', 1, 'author')");
+		for (let logId = 2; logId <= 101; logId += 1) {
+			const record = JSON.stringify({ log_id: `${logId}`, message_id: "1", room_id: "general", reactions: users.map((userId) => ({ from: { user_id: userId }, emojis: ["x"] })) });
+			sql.exec("INSERT INTO records (room_id, log_id, commit_ms, kind, record_json) VALUES ('general', ?, ?, 'reactions', ?)", logId, expiredAt, record);
+		}
+		// Each set points at the newest record that logged it.
+		for (const userId of users) {
+			sql.exec("INSERT INTO reaction_state (message_id, user_id, log_id, from_json, emojis_json) VALUES ('1', ?, 101, ?, '[\"x\"]')", userId, JSON.stringify({ user_id: userId }));
+		}
+		sql.exec("UPDATE rooms SET created_log_id = 1, record_log_id = 1, latest_log_id = 101 WHERE room_id = 'general'");
+		sql.exec("UPDATE log_state SET last_log_id = 101, history_floor = 1, last_commit_ms = ?", expiredAt);
+		sql.exec("UPDATE maintenance SET next_cleanup_ms = ?, cleanup_cutoff_ms = NULL, cleanup_cursor = NULL WHERE id = 1", clock.value);
+
+		clock.value += RETENTION_MS + 1;
+		const deleted = { records: 0, messages: 0, reactions: 0 };
+		for (let run = 0; run < 200; run += 1) {
+			const before = store.storageAccounting();
+			const result = store.runCleanup(clock.value);
+			const after = store.storageAccounting();
+			expect(after.writes - before.writes).toBeLessThanOrEqual(after.reservedWrites - before.reservedWrites);
+			expect(after.reads - before.reads).toBeLessThanOrEqual(after.reservedReads - before.reservedReads);
+			deleted.records += result.deleted_records;
+			deleted.messages += result.deleted_messages;
+			deleted.reactions += result.deleted_reactions;
+			if (!result.did_work && result.next_due_ms > clock.value) break;
+			clock.value = result.next_due_ms + 1;
+		}
+		expect(deleted).toEqual({ records: 101, messages: 1, reactions: 64 });
+		expect(store.accountingStatus().unsafe).toBe(false);
+		expect(sql.exec("SELECT COUNT(*) AS count FROM reaction_state").one().count).toBe(0);
+		expect(sql.exec("SELECT COUNT(*) AS count FROM message_state").one().count).toBe(0);
 	});
 });
 
