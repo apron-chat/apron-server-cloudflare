@@ -80,6 +80,32 @@ it('advertises read cursors with activity, relays one to the user\'s other conne
 	} finally { first.peer.close(); second.peer.close(); other.peer.close(); }
 });
 
+it('relays read cursors within an allowance of their own, so reading never throttles typing', async () => {
+	const ada = unique('ada');
+	const bob = unique('bob');
+	await register(ada);
+	await register(bob);
+	const first = await signIn(ada);
+	const second = await signIn(ada);
+	const other = await signIn(bob);
+	try {
+		const ids: string[] = [];
+		for (let index = 0; index < 12; index++) ids.push(await post(other.peer, `m${index}`));
+		await drain(first.peer);
+		await drain(second.peer);
+		// Twelve cursors, past the ten relays a minute: the last two are kept, not relayed.
+		for (const id of ids) first.peer.send({ method: 'activity', params: { room_id: 'general', read_message_id: id } });
+		await drain(first.peer);
+		expect(reads(await drain(second.peer)).map((params) => params.read_message_id)).toEqual(ids.slice(0, 10));
+		// Typing still goes out, with no throttle notice.
+		first.peer.send({ method: 'activity', params: { room_id: 'general', typing: 5 } });
+		const typing = await until(other.peer, (frame) => frame.method === 'activity' && frame.params.typing !== undefined);
+		expect(typing.frame.params).toMatchObject({ room_id: 'general', from: { user_id: ada }, typing: 5 });
+		const mine = await drain(first.peer);
+		expect(mine.filter((frame) => frame.method === 'message' && frame.params.from?.user_id === '~private')).toEqual([]);
+	} finally { first.peer.close(); second.peer.close(); other.peer.close(); }
+});
+
 it('writes a connection\'s cursors at most once a minute, sends the furthest after a listing, and writes the rest on close', async () => {
 	const ada = unique('ada');
 	await register(ada);

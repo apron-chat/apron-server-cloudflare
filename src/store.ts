@@ -2094,13 +2094,16 @@ export class Store {
     // A nested call is refused by transactionInner, and must not disturb the outer journal.
     if (this.inTransaction) return this.transactionInner(fn);
     this.limiters.begin();
+    const logCache = this.logCache;
     try {
       const result = this.transactionInner(fn);
       this.limiters.commit();
       return result;
     } catch (error) {
-      // The rows the transaction wrote are rolled back: so are the cached ones it changed.
+      // The rows the transaction wrote are rolled back: so are the cached ones
+      // it changed, and the log head its commit kept (finishCommit).
       this.limiters.rollback();
+      this.logCache = logCache;
       throw error;
     }
   }

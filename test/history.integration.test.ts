@@ -1,4 +1,4 @@
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { RETENTION_MS, Store, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
 import { errorCode, messagesOf, withStore as withNamedStore, type TestClock } from "./helpers/store";
 
@@ -515,5 +515,23 @@ it("purges an expired thread's memberships in bounded batches after removing it"
 		const rows = state.storage.sql.exec("SELECT COUNT(*) AS count FROM memberships WHERE room_id = ?", thread).one();
 		expect(rows.count).toBe(0);
 		expect(state.storage.sql.exec("SELECT value FROM _meta WHERE key = 'purge_rooms'").one().value).toBe("[]");
+	});
+});
+
+it("keeps the log head where it was when a commit rolls back after taking its log ID", async () => {
+	await withStore("rolled-back-head", ROOMY, (store, clock) => {
+		store.mutate(messageInput(clock, "kept", { body: { text: "kept" } }));
+		const head = store.logBounds().latest_log_id;
+		// The storage check after the commit fails (a store at its target): the records roll back.
+		const check = vi.spyOn(store as unknown as { assertStorageTarget(): void }, "assertStorageTarget").mockImplementationOnce(() => {
+			throw new Error("over the target");
+		});
+		clock.value += 1_000;
+		expect(() => store.mutate(messageInput(clock, "refused", { body: { text: "refused" } }))).toThrow("over the target");
+		check.mockRestore();
+		// No record has the refused post's log ID, so the head does not claim it.
+		expect(store.logBounds().latest_log_id).toBe(head);
+		const next = store.mutate(messageInput(clock, "next", { body: { text: "next" } }));
+		expect(logId(next)).toBeGreaterThan(BigInt(head));
 	});
 });

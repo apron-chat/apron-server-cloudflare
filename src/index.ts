@@ -342,8 +342,9 @@ interface PendingWake {
 const MAX_OWED = 32;
 
 /** Message types with their own per-user rate (budget.ts). */
-type ThrottledType = "activity" | "room_list";
-const THROTTLED_TYPES: readonly ThrottledType[] = ["activity", "room_list"];
+/** `activity` counts typing relays and `read` read cursor relays, each its own allowance, so reading never throttles typing. */
+type ThrottledType = "activity" | "read" | "room_list";
+const THROTTLED_TYPES: readonly ThrottledType[] = ["activity", "read", "room_list"];
 
 /**
  * An event count per key (a user, or a connection) in a rolling minute,
@@ -3092,7 +3093,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * A registered user's `read_message_id` in a room they see (§4.6): relayed
 	 * at once to their other connections, so each of their devices shows the
-	 * room read, within the activity relays allowance (a cursor past it is
+	 * room read, within an allowance of its own as large as typing's (a cursor past it is
 	 * kept, and its devices learn of it at their next listing). For a room
 	 * they joined, it is kept on this connection until written (flushReads)
 	 * rather than written now: a reader's cursors cost about one write a
@@ -3107,7 +3108,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const kept = attachment.reads?.[roomId];
 		if (kept !== undefined && Number(read) <= Number(kept)) return;
 		const peers = this.connectionsOf(identity.user_id, socket);
-		if (peers.length && this.takeThrottle(socket, identity.user_id, "activity", this.config.limits.activityBroadcastsPerUserMinute, now)) {
+		if (peers.length && this.takeThrottle(socket, identity.user_id, "read", this.config.limits.activityBroadcastsPerUserMinute, now)) {
 			const frame = { method: "activity", params: { room_id: roomId, from: identity, read_message_id: read } };
 			for (const peer of peers) this.deliverTo(peer, frame);
 		}
