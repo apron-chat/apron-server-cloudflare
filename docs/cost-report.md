@@ -135,10 +135,11 @@ upper bounds can be compared with the measured worst case.
 | Identity count | 2 | 1 | 16 | 8 |
 | Credential IDs lookup | 3 | 1 | 40 | 8 |
 | Credential counter update | 2 | 2 | 16 | 16 |
-| Push subscription register | 6 | 7 | 172 | 370 |
-| Push subscription register again, unchanged within a day | 3 | 1 | 172 | 370 |
-| Push wake claim (one user, one subscription; creates the server, sender and recipient counters) | 25 | 19 | 94 | 160 |
-| Push wake claim, 31 unregistered candidates before one registered | 75 | 7 | 1,024 | 160 |
+| Push subscription register | 6 | 7 | 172 | 436 |
+| Push subscription register again, unchanged within a day | 3 | 1 | 172 | 436 |
+| Push subscription register, a moderator keeping `joined` (one more index entry) | 6 | 8 | 172 | 436 |
+| Push wake claim (one user, one subscription; creates the server, sender and recipient counters) | 25 | 19 | 106 | 160 |
+| Push wake claim, 31 unregistered candidates before one registered | 75 | 7 | 1,408 | 160 |
 | Push registrations clear (`/passkeys remove`, a new bot token) | 1 | 2 | 144 | 400 |
 | Mute set (`status` `mute`, unscoped) | 3 | 3 | 24 | 24 |
 | Status set (`me` `status`) | 4 | 2 | 24 | 24 |
@@ -154,11 +155,13 @@ upper bounds can be compared with the measured worst case.
 | Status set to `invisible`, the stored `seen` standing (within 10 minutes; decided from the identity row it reads anyway) | 3 | 3 | 24 | 24 |
 | Seen settled for a user with no identity row (the update matches nothing; the read finds none) | 2 | 1 | 16 | 16 |
 | Status inputs at sign-in, 100 room mutes | 102 | 1 | 224 | 8 |
-| Push wake claim, `dnd` and muted (passed over) | 2 | 1 | 94 | 160 |
-| Push wake claim, the thread's parent muted (passed over) | 7 | 1 | 94 | 160 |
+| Push wake claim, `dnd` and muted (passed over) | 2 | 1 | 106 | 160 |
+| Push wake claim, the thread's parent muted (passed over) | 8 | 1 | 106 | 160 |
 | Gone push subscription forget (one primary-key row) | 2 | 2 | 20 | 22 |
 | Push reply author lookup | 4 | 1 | 16 | 8 |
-| Push wake claim for a reply (creates the recipient counter) | 17 | 11 | 94 | 160 |
+| Push wake claim for a reply (creates the recipient counter) | 17 | 11 | 106 | 160 |
+| Push joined wakers (the moderators who kept `joined`; one range of their partial index, read for every message) | 2 | 1 | 176 | 8 |
+| Push wake claim for `joined` (creates the recipient counter; reads the role and the membership) | 19 | 11 | 106 | 160 |
 | Message create with request ID (the poster's first: creates its limiter rows) | 28 | 31 | 296 | 120 |
 | Empty new message (not logged) | 2 | 1 | 16 | 8 |
 | Deduplicated mutation retry | 2 | 1 | 32 | 16 |
@@ -429,7 +432,7 @@ sender's counters, charged as the pushes are claimed, delivered or not: 19
 writes for the day's first wake (counter rows created), about 7 after. A message whose candidates have no live
 registrations, or are all coalesced, writes nothing; one that mentions no
 one idle or gone does no push SQL. The reservation covers 32 candidates at
-5 registrations each (888 reads) and `wakesPerMessage` wake rows and
+5 registrations each (1,400 reads) and `wakesPerMessage` wake rows and
 recipient counters (160 writes), mostly credited back. A push service's
 404, 410 or 403 costs one primary-key delete per gone registration,
 whatever other accounts share the endpoint: deleting by endpoint alone
@@ -473,6 +476,23 @@ A registration now also writes its entry in the partial index of waking
 registrations (9/8 against 9/7), and the wake claim reads live waking
 registrations through that index, so registrations that wake for nothing
 are not read.
+
+**`joined`, for moderators.** Only a registered `admin` or `mod` keeps
+`joined` when they register (JOINED_WAKE_ROLES); everyone else's is dropped,
+so a second partial index, by registration time, holds only moderators'
+registrations that keep it (one more written index entry for those, 6/8).
+Every new message reads that index's live range once (Store.joinedWakers:
+2/1 with one moderator; at most 32 users of 5 registrations, 176 reserved)
+whether or not anyone kept it, and adds them as candidates after everyone
+else, so they crowd out no mention, reply or private-room member. The claim
+reads each one's identity row for the role and probes their membership of
+the room and, for a thread, its parent: two rows more than a reply (19/11
+against 17/11), and its reservation grows by 8 rows a candidate (106 for
+one, 1,408 for 32). The pushes are bounded as every other:
+`wakesPerMessage` a message, once per `coalesceSeconds` per user and room,
+and the recipient's, sender's and server's daily allowances, so at most
+1,440 a day per moderator and room before `pushesPerRecipientDay` (100)
+stops them.
 
 Cleanup deletes expired registrations (`pushExpiryDays`, 7) and wake times
 past `coalesceSeconds` within its existing batch, by their time indexes.
@@ -838,7 +858,9 @@ creates four empty tables, `push_subscriptions` (with indexes by user and
 registration time, by registration time, and a partial one by user and
 registration time of those that wake for messages), `push_wakes` (with an
 index by wake time), `user_status` and `room_mutes`, four indexes besides
-their primary keys, and adds the identities' empty `ext_json` column. The rows
+their primary keys, and adds the identities' empty `ext_json` column; the
+partial index of registrations that keep `joined` is added on the next wake,
+as on schema 9 below. The rows
 it measurably read and wrote are added to the day's maintenance counters
 without a capacity check, like the reset's passkey carry, so an exhausted
 budget cannot block it. The object is not wiped.
@@ -850,6 +872,12 @@ so the upgrade was charged 8 written rows over 503 limiter rows (measured on
 2026-10-24); dropping the four lists as well measured 2,168, about 4.3 a
 row, so about 43,000 at the 10,000-row limiter cap, more than Free's whole
 maintenance allocation.
+
+A schema 9 object from code before `joined` gains the partial index of
+registrations that keep it on its next wake, without a new schema version
+(Store.ensureJoinedWakeIndex): building it reads each registration once,
+charged to the day's maintenance like an upgrade; every later wake's probe
+compiles against it and reads no row.
 
 Any other stored schema version resets the object with
 `deleteAll()` and recreates the schema (`test/schema-reset.integration.test.ts`).

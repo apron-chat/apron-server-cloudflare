@@ -828,6 +828,15 @@ describe('measured storage accounting', () => {
 			expect(measure('push reply author lookup', () => store.messageAuthor(messageId, clock.now()))).toBe('matrix-user');
 			store.registerPushSubscription({ ...subscription, now: clock.now() });
 			expect(measure('push wake claim for a reply', () => store.claimPushes({ senderId: 'matrix-replier', roomId: 'matrix-reply-room', candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.replies }], now: clock.now() })).subscriptions).toHaveLength(1);
+			// A moderator who kept `joined`: the read each message makes for them, and their claim (role and membership checked).
+			store.registerIdentity({
+				userId: 'matrix-mod', name: 'Matrix mod', userHandle: 'matrix-mod-handle', now: clock.now(), ipKey: 'matrix-mod-ip',
+				credential: { credentialId: 'matrix-mod-credential', userId: 'matrix-mod', publicKey: 'matrix-public-key', counter: 0 },
+			});
+			store.setRole({ userId: 'matrix-mod', role: 'mod', on: true, now: clock.now() });
+			measure('push subscription register, keeping joined', () => store.registerPushSubscription({ ...subscription, userId: 'matrix-mod', wake: WAKE_SCOPES.joined, now: clock.now() }));
+			expect(measure('push joined wakers', () => store.joinedWakers(clock.now()))).toEqual(['matrix-mod']);
+			expect(measure('push wake claim for joined', () => store.claimPushes({ senderId: 'matrix-sender', roomId: 'general', candidates: [{ userId: 'matrix-mod', reasons: WAKE_SCOPES.joined }], now: clock.now() })).subscriptions).toHaveLength(1);
 			measure('reaction set', () => store.commitMutation({
 				userId: 'matrix-user', ipKey: 'matrix-react-ip', requestId: 'matrix-react', method: 'reactions', now: clock.now(),
 				params: { message_id: messageId, emojis: ['👍', '🎉'] }, identity,
@@ -917,7 +926,7 @@ describe('measured storage accounting', () => {
 			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
 			expect(create.result.message_id).toBeTruthy();
-			expect(costs).toHaveLength(57);
+			expect(costs).toHaveLength(60);
 			expect(store.accountingStatus().unsafe).toBe(false);
 			return { costs };
 		});

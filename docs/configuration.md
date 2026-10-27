@@ -275,7 +275,8 @@ above: two Durable Object requests and one Worker request each, at most
 
 Mentions, replies, and messages in their private rooms wake registered users
 through Web Push (protocol §4.9, push kind `webpush`, advertising the wake
-scopes `mentions`, `replies` and `private`,
+scopes `mentions`, `replies`, `private` and `joined`, the last for admins and
+mods only,
 with the client's optional registration `push_id` in each push; see
 [SPEC section 4.4](../SPEC.md#44-push)). Both plans have a
 `push` policy, set in `src/plans/free.ts` with Paid's daily cap raised in

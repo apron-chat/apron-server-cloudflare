@@ -60,9 +60,9 @@ import {
 	isPrivateRoomId,
 	seenStands,
 	type Broadcast,
+	type ClaimedPush,
 	type MessageSnapshot,
 	type PushCandidate,
-	type PushSubscriptionRecord,
 	type RoomRecord,
 	type StatusInputRecord,
 	type StoreConfig,
@@ -4053,8 +4053,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * letters, digits, `_` or `-`, goes unchanged into every push to this
 	 * registration. `wake` lists the scopes it wakes for (§4.9): at most
 	 * MAX_WAKE_ENTRIES strings of at most 64 characters; scopes this server
-	 * does not implement are ignored, `[]` wakes for nothing, and without it
-	 * the registration wakes for `mentions` and `replies`. At most
+	 * does not implement are ignored, and so is `joined` for a user without
+	 * one of JOINED_WAKE_ROLES (the store drops it); `[]` wakes for nothing,
+	 * and without it the registration wakes for `mentions` and `replies`. At most
 	 * `registersPerUserMinute` a user, across their
 	 * connections; past that, `retry_after`. Registered users only; a
 	 * guest's identity lasts one connection, so there is no one to wake. The
@@ -4123,10 +4124,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Wakes those a registered user's new message concerns (§4.9): the users
-	 * its `body.mentions` lists (scope `mentions`) and the author of the
-	 * message it replies to (scope `replies`, one metered lookup); guests'
-	 * messages wake no one. The candidates, the replied-to author first so
-	 * mentions cannot crowd them out, then mentions in order, deduplicated
+	 * its `body.mentions` lists (scope `mentions`), the author of the
+	 * message it replies to (scope `replies`, one metered lookup), a private
+	 * room's members (scope `private`), and the moderators who kept `joined`
+	 * (Store.joinedWakers, one metered read; the claim wakes only those in
+	 * the room); guests' messages wake no one. The candidates, the replied-to
+	 * author first so mentions cannot crowd them out, then mentions in order,
+	 * private members, and `joined` last, so it crowds out nothing, deduplicated
 	 * with their reasons combined, are users other than the sender (and not
 	 * guests) with no attended connection (see attended), at most
 	 * MAX_PUSH_CANDIDATES. Store.claimPushes then wakes up to
@@ -4177,7 +4181,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 				console.warn(JSON.stringify({ event: "push_members_lookup_failed", reason: errorToProtocol(error).message }));
 			}
 		}
-		for (const [userId, reason] of held) this.holdWake(userId, message, reason, now);
+		// Moderators may wake for every message in a room they joined (`joined`, §4.9.4,
+		// JOINED_WAKE_ROLES); claimPushes checks the role and the membership.
+		try {
+			for (const userId of this.store.joinedWakers(now)) consider(userId, WAKE_SCOPES.joined);
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "push_joined_lookup_failed", reason: errorToProtocol(error).message }));
+		}
+		// `joined` is not held: what came while a moderator was there, they could see,
+		// and a busy room would otherwise crowd their mentions out of what is held.
+		for (const [userId, reason] of held) if (reason & ~WAKE_SCOPES.joined) this.holdWake(userId, message, reason & ~WAKE_SCOPES.joined, now);
 		if (reasons.size) this.scheduleWake(message, reasons);
 	}
 
@@ -4212,14 +4225,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Narrows a wake's reasons to what an edit made during the wait left: a
 	 * mention only for a user it still mentions, a reply only while it still
-	 * replies to the same message; `private` stays, as the room does. Users
-	 * left with no reason are dropped.
+	 * replies to the same message; `private` and `joined` stay, as the room
+	 * does. Users left with no reason are dropped.
 	 */
 	private keepReasons(reasons: Map<string, number>, before: MessageSnapshot, after: MessageSnapshot): void {
 		const mentions = new Set(Array.isArray(after.body?.mentions) ? after.body.mentions : []);
 		const sameReply = after.reply_to?.message_id === before.reply_to?.message_id;
 		for (const [userId, reason] of reasons) {
-			const kept = (mentions.has(userId) ? reason & WAKE_SCOPES.mentions : 0) | (sameReply ? reason & WAKE_SCOPES.replies : 0) | (reason & WAKE_SCOPES.private);
+			const kept = (mentions.has(userId) ? reason & WAKE_SCOPES.mentions : 0) | (sameReply ? reason & WAKE_SCOPES.replies : 0) | (reason & (WAKE_SCOPES.private | WAKE_SCOPES.joined));
 			if (kept) reasons.set(userId, kept);
 			else reasons.delete(userId);
 		}
@@ -4371,16 +4384,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * (404 or 410) or refuses this server's key (403). Other failures are only logged: the
 	 * push is lost, not retried.
 	 */
-	private async deliverPushes(subscriptions: readonly PushSubscriptionRecord[], message: MessageSnapshot, vapid: VapidKeys, ttlSeconds: number): Promise<void> {
+	private async deliverPushes(subscriptions: readonly ClaimedPush[], message: MessageSnapshot, vapid: VapidKeys, ttlSeconds: number): Promise<void> {
 		const payloads = new Map<string | undefined, string>();
 		const payloadFor = (pushId: string | undefined): string => {
 			let payload = payloads.get(pushId);
 			if (payload === undefined) payloads.set(pushId, payload = pushPayload(message, pushId));
 			return payload;
 		};
-		// Mentions and replies are messages for this user, so `high` (§4.9).
+		// Mentions, replies and private rooms are messages for this user, so
+		// `high`; one pushed only for `joined` is `normal` (§4.9).
 		const outcomes = await Promise.allSettled(subscriptions.map((subscription) =>
-			sendWebPush(subscription, payloadFor(subscription.pushId), vapid, { ttlSeconds, urgency: "high", nowMs: nowMs() })));
+			sendWebPush(subscription, payloadFor(subscription.pushId), vapid, { ttlSeconds, urgency: subscription.reasons === WAKE_SCOPES.joined ? "normal" : "high", nowMs: nowMs() })));
 		const gone: Array<{ userId: string; url: string; p256dh: string }> = [];
 		let failed = 0;
 		outcomes.forEach((outcome, index) => {
