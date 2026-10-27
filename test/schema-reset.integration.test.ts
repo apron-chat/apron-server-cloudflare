@@ -2,7 +2,7 @@ import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
 import { BOOTSTRAP_ROW_RESERVATION } from '../src/budget';
 import { MAX_CARRIED_PASSKEYS, SCHEMA_VERSION, Store, UPGRADABLE_SCHEMA_VERSION, defaultStoreConfig } from '../src/store';
-import { toSchema9 } from './helpers/schema9';
+import { toSchema10, toSchema9 } from './helpers/schema9';
 import { messagesOf, pushSubscriptionsOf } from './helpers/store';
 
 type Runtime = { store: Store };
@@ -232,7 +232,7 @@ const SHARED_COLUMNS: Record<string, string[]> = {
 	principal_limits: ['scope', 'principal_key', 'level', 'day', 'posts_day'],
 };
 
-it('upgrades a schema 9 store to schema 10 in place: every row kept, rebuilt WITHOUT ROWID, and the rebuild not charged', async () => {
+it('upgrades a schema 9 store to the current schema in place: every row kept, rebuilt WITHOUT ROWID, and the rebuild not charged', async () => {
 	const stub = env.DEMO.getByName(`schema-upgrade-9-${crypto.randomUUID()}`);
 	const now = Date.now();
 	const before = await runInDurableObject(stub, async (instance, state) => {
@@ -302,7 +302,7 @@ it('upgrades a schema 9 store to schema 10 in place: every row kept, rebuilt WIT
 	});
 });
 
-it('builds the joined wake index for a schema 9 store from code before it, with schema 10, and later wakes add nothing', async () => {
+it('builds the joined wake index for a schema 9 store from code before it, with the rebuild, and later wakes add nothing', async () => {
 	const stub = env.DEMO.getByName(`schema-joined-${crypto.randomUUID()}`);
 	const now = Date.now();
 	await runInDurableObject(stub, async (instance, state) => {
@@ -341,6 +341,52 @@ it('builds the joined wake index for a schema 9 store from code before it, with 
 		expect(woken.storageAccounting().writes).toBe(0);
 		expect(woken.storageAccounting().reads).toBeLessThanOrEqual(8);
 		expect(writesReserved(sql)).toBe(added.writes);
+	});
+});
+
+it('upgrades a schema 10 store to 11 in place: the unread indexes and column go, with the state below the floor, and the rest stays', async () => {
+	const stub = env.DEMO.getByName(`schema-upgrade-10-${crypto.randomUUID()}`);
+	const now = Date.now();
+	const before = await runInDurableObject(stub, async (instance, state) => {
+		const { store } = instance as unknown as Runtime;
+		const sql = state.storage.sql;
+		store.registerIdentity({
+			userId: 'kept_user', name: 'Kept', userHandle: 'handle-kept_user', now, ipKey: 'ip-kept_user',
+			credential: { credentialId: 'cred-kept_user', userId: 'kept_user', publicKey: 'AAAA', counter: 0 },
+		});
+		const posted = store.mutate({
+			userId: 'kept_user', ipKey: 'ip-kept_user', requestId: 'kept', method: 'message', now,
+			identity: { user_id: 'kept_user' }, params: { room_id: 'general', body: { text: 'kept' } },
+		});
+		store.mutate({
+			userId: 'kept_user', ipKey: 'ip-kept_user', requestId: 'react', method: 'reactions', now,
+			identity: { user_id: 'kept_user' }, params: { message_id: posted.result.message_id, emojis: ['👍'] },
+		});
+		toSchema10(sql);
+		// What schema 10's cleanup left when a batch ran out: state below the floor, its records gone.
+		const floor = sql.exec<{ history_floor: number }>('SELECT history_floor FROM log_state').one().history_floor;
+		sql.exec("INSERT INTO message_state (message_id, room_id, latest_log_id, author_id) VALUES ('expired', 'general', ?, 'kept_user')", floor - 1);
+		sql.exec("INSERT INTO reaction_state (message_id, user_id, log_id, from_json, emojis_json) VALUES ('expired', 'kept_user', ?, '{}', '[]')", floor - 1);
+		sql.exec("INSERT INTO uploads (upload_key, owner_id, purpose, state, bytes, content_type, write_expires_ms, expires_ms, created_ms) VALUES ('kept-upload', 'kept_user', 'avatar', 'done', 10, 'image/png', ?, ?, ?)", now, now + 60_000, now);
+		return { messageId: String(posted.result.message_id), writes: writesReserved(sql) };
+	});
+
+	await evictDurableObject(stub);
+	await runInDurableObject(stub, async (instance, state) => {
+		const { store } = instance as unknown as Runtime;
+		const sql = state.storage.sql;
+		expect(store.requiresReset()).toBe(false);
+		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
+		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(SCHEMA_VERSION);
+		expect(sql.exec("SELECT name FROM sqlite_master WHERE name IN ('message_state_latest_idx', 'reaction_state_log_idx', 'push_subscriptions_user_idx', 'push_subscriptions_waking_idx')").toArray()).toEqual([]);
+		expect(sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('uploads')").toArray().map((row) => row.name)).not.toContain('content_type');
+		expect(sql.exec("SELECT upload_key, state, bytes FROM uploads").toArray()).toEqual([{ upload_key: 'kept-upload', state: 'done', bytes: 10 }]);
+		// The state below the floor went; the live message and its reaction set stayed.
+		expect(sql.exec<{ message_id: string }>('SELECT message_id FROM message_state').toArray().map((row) => row.message_id)).toEqual([before.messageId]);
+		expect(sql.exec<{ message_id: string }>('SELECT message_id FROM reaction_state').toArray().map((row) => row.message_id)).toEqual([before.messageId]);
+		// A few rows, charged like the upgrades before it.
+		expect(writesReserved(sql) - before.writes).toBeGreaterThan(0);
+		expect(writesReserved(sql) - before.writes).toBeLessThan(64);
 	});
 });
 
@@ -435,9 +481,8 @@ it('upgrades a schema 7 store in place: it gains the push and user status tables
 		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
 		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(SCHEMA_VERSION);
 		const indexes = (table: string) => sql.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?", table).toArray().map((row) => row.name);
-		expect(indexes('push_subscriptions')).toEqual(expect.arrayContaining(['push_subscriptions_user_idx', 'push_subscriptions_updated_idx', 'push_subscriptions_waking_idx', 'push_subscriptions_joined_idx']));
-		// The waking-registration index is partial: registrations that wake for nothing are not in it.
-		expect(sql.exec<{ sql: string }>("SELECT sql FROM sqlite_master WHERE name = 'push_subscriptions_waking_idx'").one().sql).toMatch(/WHERE wake != 0$/);
+		// By registration time for expiry, and the partial index of `joined` registrations; a user's are their primary-key range.
+		expect(indexes('push_subscriptions').sort()).toEqual(['push_subscriptions_joined_idx', 'push_subscriptions_updated_idx']);
 		expect(indexes('push_wakes')).toContain('push_wakes_woken_idx');
 		expect(sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('user_status') ORDER BY cid").toArray().map((row) => row.name)).toEqual(['user_id', 'status', 'mute_until_ms']);
 		expect(sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('room_mutes') ORDER BY cid").toArray().map((row) => row.name)).toEqual(['user_id', 'room_id', 'mute_until_ms']);

@@ -686,7 +686,7 @@ it('with ACTIVITY on, relays typing to room members, throttles per user, and tel
 		// Typing is capped by policy, in the default room without room_id; the
 		// sender's own connection is not echoed.
 		expect(first.frame.params).toEqual({ room_id: 'general', from: aliceId, typing: 30 });
-		// A read cursor is neither kept nor relayed, and does not count.
+		// A guest's read cursor is neither kept nor relayed, and does not count.
 		alice.send({ method: 'activity', params: { room_id: 'general', read_message_id: '1' } });
 		// Unknown rooms are dropped too.
 		alice.send({ method: 'activity', params: { room_id: '999', typing: 5 } });
