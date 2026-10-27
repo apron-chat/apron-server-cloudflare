@@ -912,12 +912,19 @@ describe('measured storage accounting', () => {
 			expect(measure('room mute expiry, 50 of 100 ran out', () => store.expireRoomMutes('matrix-user', clock.now())).expired).toHaveLength(MAX_ROOM_MUTES_PER_USER / 2);
 			measure('room mute clear', () => store.setRoomMute({ userId: 'matrix-user', roomId: 'muted-001', untilMs: null, now: clock.now() }));
 			state.storage.sql.exec("DELETE FROM room_mutes WHERE user_id = 'matrix-user'");
+			// Read cursors (§4.6): a membership probe and an upsert each, a row and no index.
+			const read = String(create.result.message_id);
+			measure('read cursor written, new', () => store.saveReadCursors({ userId: 'matrix-user', cursors: [['general', read]], now: clock.now() }));
+			measure('read cursor written, moved', () => store.saveReadCursors({ userId: 'matrix-user', cursors: [['general', String(Number(read) + 1)]], now: clock.now() }));
+			measure('read cursor written, not past the one kept', () => store.saveReadCursors({ userId: 'matrix-user', cursors: [['general', read]], now: clock.now() }));
+			measure('read cursor written, a room not joined', () => store.saveReadCursors({ userId: 'matrix-user', cursors: [['matrix-not-joined', read]], now: clock.now() }));
+			expect(measure('read cursors at a listing', () => store.readCursors('matrix-user', clock.now()))).toEqual(new Map([['general', String(Number(read) + 1)]]));
 			clock.set(clock.now() + DAY + HOUR + 1);
 			measure('cleanup', () => store.runCleanup(clock.now()));
 			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
 			expect(create.result.message_id).toBeTruthy();
-			expect(costs).toHaveLength(57);
+			expect(costs).toHaveLength(62);
 			expect(store.accountingStatus().unsafe).toBe(false);
 			return { costs };
 		});
