@@ -411,7 +411,7 @@ it('pipelined guest auth precedes mutation and errors preserve identifiable IDs'
 	} finally { peer.close(); }
 });
 
-it('posts and pages the default room without room_id, and neither logs nor delivers an empty message', async () => {
+it('posts to the default room without room_id, pages it among the joined rooms without room_id, and neither logs nor delivers an empty message', async () => {
 	const alice = await connect();
 	const bob = await connect();
 	try {
