@@ -186,3 +186,46 @@ it('gives a member added while away the room at its latest activity when they si
 		expect(live.frame.params.room_id).toBe(roomId);
 	} finally { ada.peer.close(); before.close(); bob?.close(); }
 });
+
+it('pages the log of every joined room without room_id, private ones included, and nothing of rooms not joined', async () => {
+	const ada = await signedIn('ada');
+	const bob = await signedIn('bob');
+	const carol = await signedIn('carol');
+	try {
+		const since = (await request(bob.peer, 'since', 'room_list', { filter: 'joined' })).result.joined[0].latest_log_id as string;
+		const dm = (await exchange(ada.peer, 'dm', 'room_set', { private: true })).frame.result.room_id as string;
+		await request(ada.peer, 'add', 'room_join', { room_id: dm, user_id: bob.userId });
+		const theirs = (await exchange(carol.peer, 'theirs', 'room_set', { private: true })).frame.result.room_id as string;
+		const thread = (await exchange(carol.peer, 'thread', 'room_set', { parent_room_id: 'general', title: 'Aside' })).frame.result.room_id as string;
+		const post = async (peer: Peer, id: string, roomId: string) => (await request(peer, id, 'message', { room_id: roomId, body: { text: id } })).result.message_id as string;
+		const mine = [await post(ada.peer, 'dm-1', dm), await post(carol.peer, 'general-1', 'general')];
+		// Enough of others' traffic that a scan of the log by log_id comes up short, and each room's slice is read.
+		for (let index = 0; index < 10; index += 1) await post(carol.peer, `theirs-${index}`, theirs);
+		await post(carol.peer, 'aside', thread);
+		mine.push(await post(ada.peer, 'dm-2', dm));
+
+		const ids = (page: Record<string, any>) => (page.messages ?? []).map((message: { message_id: string }) => message.message_id);
+		const all = (await request(bob.peer, 'all', 'history', { after: since, limit: 50 })).result;
+		expect(ids(all)).toEqual(mine);
+		expect(all.more).toBe(false);
+		expect(all.latest_log_id).toBe(mine[2]);
+		// Bob's own join of the private room, among its memberships.
+		expect(all.memberships.some((record: { room_id: string }) => record.room_id === dm)).toBe(true);
+		expect([...(all.rooms ?? []), ...(all.memberships ?? []), ...(all.messages ?? [])].every((record: { room_id: string }) => [dm, 'general'].includes(record.room_id))).toBe(true);
+
+		// Forward one record at a time, continuing from last_log_id + 1, across both rooms.
+		const forward: string[] = [];
+		let after = since;
+		for (let pages = 0; pages < 20; pages += 1) {
+			const page = (await request(bob.peer, `forward-${pages}`, 'history', { after, limit: 1 })).result;
+			forward.push(...ids(page));
+			if (!page.more) break;
+			after = String(BigInt(page.last_log_id) + 1n);
+		}
+		expect(forward).toEqual(mine);
+		// Backward, the newest first.
+		const newest = (await request(bob.peer, 'newest', 'history', { limit: 1 })).result;
+		expect(ids(newest)).toEqual([mine[2]]);
+		expect(newest.more).toBe(true);
+	} finally { ada.peer.close(); bob.peer.close(); carol.peer.close(); }
+});

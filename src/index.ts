@@ -2526,8 +2526,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate before loading history" } satisfies ProtocolError;
 		if (attachment.historyInFlight >= this.config.limits.concurrentHistoryPerConnection) throw { name: "retry_after", message: "History request already in progress", data: { retry_after: 1, ...limitData("read") } } satisfies ProtocolError;
 		const params = request.params;
-		// Without room_id, history pages the default room (§4.3). Every room is
-		// visible, so any room's history may be read without joining it.
+		// With room_id, that room's log, which any room's visitor may read
+		// without joining it, unless it is private (§4.3.1). Without room_id,
+		// the log of every room whose deliveries this connection receives, its
+		// joined rooms, so one request catches up on all of them (§4.3).
 		const roomId = optionalString(params, "room_id");
 		const after = asDecimalId(params.after, "after");
 		const before = asDecimalId(params.before, "before");
@@ -2536,7 +2538,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		writeAttachment(socket, attachment);
 		try {
 			const page = this.store.history({
-				...(roomId !== undefined ? { roomId } : {}),
+				...(roomId !== undefined ? { roomId } : { roomIds: attachment.rooms ?? [] }),
 				after,
 				before,
 				limit: limit ?? this.config.limits.historyDefaultLimit,

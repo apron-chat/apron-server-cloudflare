@@ -512,8 +512,14 @@ export interface StoreMutationResult {
 }
 
 interface StoreHistoryQuery {
-  /** Omitted, the default room (§4.3). */
+  /** One room's log (§4.3.1); omitted, the log of `roomIds`. */
   roomId?: string;
+  /**
+   * Without `roomId`, the log of these rooms together (§4.3): the rooms whose
+   * deliveries the requesting connection receives. Unknown ones, and private
+   * ones the requester is not in, are left out. Omitted, the default room.
+   */
+  roomIds?: readonly string[];
   after?: string | bigint;
   before?: string | bigint;
   limit?: number;
@@ -1075,6 +1081,12 @@ function dayFor(ms: number): string {
 function maintenanceDelta(cost: { reads: number; writes: number }): BudgetDelta {
   return { reads_reserved: cost.reads, writes_reserved: cost.writes, maintenance_reads: cost.reads, maintenance_writes: cost.writes };
 }
+
+/**
+ * How many pages of the log a history page of several rooms scans by log_id
+ * before it reads each room's slice instead (Store.historyPageInternal).
+ */
+const HISTORY_SCAN_PAGES = 4;
 
 function positiveLimit(value: number | undefined, defaultValue: number, max: number): number {
   if (value === undefined) return defaultValue;
@@ -5152,7 +5164,7 @@ export class Store {
     const charged = Boolean(query.userId && query.ipKey);
     return this.reserved({
       ...this.config.historyCost,
-      reads: Math.max(256, this.config.historyCost.reads ?? 0),
+      reads: this.historyReads(query),
       // A page writes only its two limiter rows and the budget row: about 20
       // rows for a first request, which creates both limiter rows.
       writes: Math.max(32, this.config.historyCost.writes ?? 0),
@@ -5187,12 +5199,25 @@ export class Store {
     const operationNow = query.now ?? this.clock.now();
     return this.reserved({
       ...this.config.historyCost,
-      reads: Math.max(256, this.config.historyCost.reads ?? 0),
+      reads: this.historyReads(query),
       writes: Math.max(32, this.config.historyCost.writes ?? 0),
     }, false, operationNow, () => {
       const now = this.effectiveNow(operationNow);
       return this.transaction(() => this.historyPageInternal({ ...query, now }));
     });
+  }
+
+  /**
+   * The rows a history page may read: one room's page, or for several rooms
+   * each one's row and at most a page and one more of its records, besides
+   * the limiter and budget rows.
+   */
+  private historyReads(query: StoreHistoryQuery): number {
+    const single = Math.max(256, this.config.historyCost.reads ?? 0);
+    if (query.roomId !== undefined || !query.roomIds) return single;
+    const limit = query.limit !== undefined && Number.isInteger(query.limit) && query.limit > 0 ? Math.min(query.limit, this.config.maxHistoryLimit) : this.config.historyDefaultLimit;
+    // The scan of the log reads an index entry and a row for each record.
+    return Math.max(single, 64 + 2 * HISTORY_SCAN_PAGES * (limit + 1) + new Set(query.roomIds).size * (limit + 3));
   }
 
   private historyBound(value: string | bigint | undefined, field: string): number | undefined {
@@ -5201,36 +5226,80 @@ export class Store {
   }
 
   private historyPageInternal(query: StoreHistoryQuery): StoreHistoryResult {
-    const roomId = query.roomId === undefined ? ROOM_ID : query.roomId;
-    if (typeof roomId !== "string" || roomId.length === 0) throw new StoreError("invalid_params", "room_id must be a non-empty string");
+    const multiple = query.roomId === undefined && query.roomIds !== undefined;
+    const roomIds = multiple ? [...new Set(query.roomIds)] : [query.roomId === undefined ? ROOM_ID : query.roomId];
+    for (const roomId of roomIds) {
+      if (typeof roomId !== "string" || roomId.length === 0) throw new StoreError("invalid_params", "room_id must be a non-empty string");
+    }
     // A requester's private room only if they are in it; internal pages, with no requester, see every room.
-    const room = query.userId === undefined ? this.roomRow(roomId) : this.visibleRoomRow(roomId, query.userId);
-    if (!room) throw new StoreError("invalid_params", "unknown room");
+    const visible = (roomId: string) => query.userId === undefined ? this.roomRow(roomId) : this.visibleRoomRow(roomId, query.userId);
+    const sources = roomIds.map(visible).filter((room): room is RawRoomRow => room !== null);
+    if (!multiple && !sources.length) throw new StoreError("invalid_params", "unknown room");
     const floor = this.logState().history_floor;
-    const lowerBound = roomHistoryFloor(room, floor);
-    const head = room.latest_log_id;
     const after = this.historyBound(query.after, "after");
     const before = this.historyBound(query.before, "before");
-    const lower = Math.max(lowerBound, after ?? lowerBound);
-    const upper = Math.min(head, before ?? head);
     const limit = positiveLimit(query.limit, this.config.historyDefaultLimit, this.config.maxHistoryLimit);
     const maxBytes = Math.min(query.maxBytes ?? this.config.maxHistoryResponseBytes, this.config.maxHistoryResponseBytes);
+    // The log queried is these rooms' logs together (§4.3.3): its head is the
+    // greatest of theirs, and its history starts where the earliest of theirs
+    // does, as everything after the retention floor is kept in every room.
+    const head = sources.reduce((greatest, room) => Math.max(greatest, room.latest_log_id), 0);
+    const lowerBound = sources.reduce((least, room) => Math.min(least, roomHistoryFloor(room, floor)), Number.MAX_SAFE_INTEGER);
     const latestLogId = idString(head);
-    const historyLogId = roomHistoryLogId(room, floor);
+    const historyLogId = sources.length && lowerBound <= head ? idString(lowerBound) : null;
     // An empty slice has neither bound and omits every array (§4.3.2).
     const empty = (): StoreHistoryResult => ({ more: false, latest_log_id: latestLogId, history_log_id: historyLogId });
     const forward = after !== undefined;
-    // One contiguous slice of the room's log across every record kind; the
-    // limit counts records of any kind (§4.3.2). A window bounded to one log_id
-    // (after == before) is that record in this room's log only: a moved
-    // message's earlier snapshot is fetched from the room its prev_room_id names.
-    const rows = lower > upper || historyLogId === null ? [] : this.rawRows<RawRecordRow>(
+    // One contiguous slice of the log across every record kind; the limit
+    // counts records of any kind (§4.3.2). Each room's slice is read from its
+    // own key range, a page and one more at most, and a room with nothing in
+    // the window is not read at all: the slices merge by log_id. A moved
+    // message's snapshot is in both rooms' logs, and once in theirs together.
+    // A window bounded to one log_id (after == before) in one room is that
+    // record in this room's log only: a moved message's earlier snapshot is
+    // fetched from the room its prev_room_id names.
+    const windows = new Map<string, { lower: number; upper: number }>();
+    for (const room of sources) {
+      const lower = Math.max(roomHistoryFloor(room, floor), after ?? 0);
+      const upper = Math.min(room.latest_log_id, before ?? room.latest_log_id);
+      if (lower <= upper && roomHistoryLogId(room, floor) !== null) windows.set(room.room_id, { lower, upper });
+    }
+    const order = (a: RawRecordRow, b: RawRecordRow) => forward ? a.log_id - b.log_id : b.log_id - a.log_id;
+    const byLogId = new Map<number, RawRecordRow>();
+    const take = (row: RawRecordRow) => {
+      const window = windows.get(row.room_id);
+      if (window && row.log_id >= window.lower && row.log_id <= window.upper && !byLogId.has(row.log_id)) byLogId.set(row.log_id, row);
+    };
+    const roomSlice = (roomId: string, window: { lower: number; upper: number }) => this.rawRows<RawRecordRow>(
       `SELECT room_id, log_id, kind, record_json FROM records
        WHERE room_id = ? AND log_id >= ? AND log_id <= ?
        ORDER BY log_id ${forward ? "ASC" : "DESC"} LIMIT ?`,
-      room.room_id, lower, upper, limit + 1,
+      roomId, window.lower, window.upper, limit + 1,
     );
+    if (!multiple || windows.size <= 1) {
+      for (const [roomId, window] of windows) for (const row of roomSlice(roomId, window)) take(row);
+    } else {
+      // Several rooms: first the log itself, by log_id across every room, at
+      // most HISTORY_SCAN_PAGES pages of it. That is the cheapest read when
+      // these rooms hold most of the log; when they hold little of it, each
+      // room's slice is read instead, a page and one more at most.
+      const lower = Math.min(...[...windows.values()].map((window) => window.lower));
+      const upper = Math.max(...[...windows.values()].map((window) => window.upper));
+      const scanned = this.rawRows<RawRecordRow>(
+        `SELECT room_id, log_id, kind, record_json FROM records INDEXED BY records_log_idx
+         WHERE log_id >= ? AND log_id <= ?
+         ORDER BY log_id ${forward ? "ASC" : "DESC"} LIMIT ?`,
+        lower, upper, HISTORY_SCAN_PAGES * (limit + 1),
+      );
+      for (const row of scanned) take(row);
+      if (byLogId.size <= limit && scanned.length === HISTORY_SCAN_PAGES * (limit + 1)) {
+        byLogId.clear();
+        for (const [roomId, window] of windows) for (const row of roomSlice(roomId, window)) take(row);
+      }
+    }
+    const rows = [...byLogId.values()].sort(order).slice(0, limit + 1);
     if (rows.length === 0) return empty();
+    const roomFields = new Map(sources.map((room) => [room.room_id, { latest_log_id: idString(room.latest_log_id), history_log_id: roomHistoryLogId(room, floor) }]));
     // The runtime wraps this result in a reply.  Reserve a fixed
     // envelope allowance for id/result keys, decimal IDs, commas and
     // first/last/more fields.  An empty page is always valid even when a
@@ -5247,7 +5316,7 @@ export class Store {
     for (const row of rows.slice(0, limit + 1)) {
       const value = parseJson<Record<string, unknown>>(row.record_json);
       // Room records carry this client's delivery fields, as `room_list` and `room_update` records do.
-      if (row.kind === "room") Object.assign(value, { latest_log_id: latestLogId, history_log_id: historyLogId });
+      if (row.kind === "room") Object.assign(value, roomFields.get(row.room_id));
       const entryBytes = utf8Bytes(JSON.stringify(value));
       if (entryBytes + bytes + responseOverhead + 1 > maxBytes) {
         if (selected.length === 0) throw new StoreError("too_large", "history record exceeds response budget");
