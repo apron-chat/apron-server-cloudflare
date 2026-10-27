@@ -13,8 +13,9 @@ replacement/deletion/restoration/moves, thread rooms, emoji reactions, and a
 rolling retention floor. Guests only read (set `GUEST_POSTING=true` to let
 them post); signing in with a passkey lets a user post and invite a bot. It speaks protocol 9 with `history`,
 `edit`, `rooms`, `reactions`, `command` (`/help`, `/invite-bot`, and admin
-commands), and `ext` with its own extension `ext:settings`, and `ext:limits` and
-`ext:permissions`; `embed:upload` and `ext:media` when uploads are configured;
+commands), and `ext` with the extensions `ext:settings`, `ext:limits` and
+`ext:permissions` (EXTENSIONS.md); `embed:upload` and `ext:media` when uploads are configured,
+and `ext:emoji` once an admin adds a custom emoji with `/emoji add`;
 `status` and push when VAPID keys are set; and
 liveness pings and, with the Workers Paid budgets, typing through `activity`
 (`ACTIVITY` overrides); see [authentication and policy](policy.md) and [the
@@ -72,6 +73,22 @@ follow its README (`npm ci`, then `npm run dev`) in another terminal, and open
 `http://localhost:5173`; its dev proxy connects `/ws` to port 8080. Use **localhost**, matching the development passkey
 RP ID and origin. Wrangler persists local SQLite state between runs. Do not
 delete its state while investigating restart-safe quotas or identity recovery.
+
+Uploads, avatars and custom emoji are off locally until the upload settings
+are set. Let the Worker be its own media origin, and give it an admin token
+for `/emoji add`:
+
+```sh
+npx wrangler dev --port 8080 \
+  --var MEDIA_ORIGIN:http://localhost:8080 --var PUBLIC_ORIGIN:http://localhost:8080 \
+  --var UPLOAD_SIGNING_KEY:dev-upload-signing-key-0123456789abcdef \
+  --var APRON_ADMIN_TOKEN:dev-admin-token-0123456789abcdef
+```
+
+With `MEDIA_ORIGIN` equal to `PUBLIC_ORIGIN`, the Worker serves `GET` and
+`HEAD` of uploads (`f/`, `a/`, `e/`) from the local bucket itself, readable
+from any origin; in production the bucket's own domain serves them and the
+Worker does not.
 
 ```sh
 npm run typecheck
@@ -254,8 +271,8 @@ not post again. Request deduplication lasts 24 hours.
 
 Temporary limits return `retry_after` with `data.retry_after` (whole
 seconds) and, for a reading, posting or upload limit, `data.ext.limits`
-(`read`, `write` or `upload`: extension `ext:limits`, defined in apron-web's
-EXT.md; SPEC section 6), which says what to hold back; clients back off. Daily
+(`read`, `write` or `upload`: extension `ext:limits`, defined in Apron's
+EXTENSIONS.md; SPEC section 6), which says what to hold back; clients back off. Daily
 posting/write exhaustion makes the demo read-only while affordable reads remain
 available. History exhaustion returns an error. Registration caps do not revoke
 existing passkeys. Permanent identity/thread-room caps return `denied`. Storage

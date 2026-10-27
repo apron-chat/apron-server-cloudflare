@@ -49,7 +49,9 @@ VAPID_SUBJECT = "https://server.apron.chat"
 PUSH_HOSTS = "fcm.googleapis.com,*.push.services.mozilla.com,web.push.apple.com,*.push.apple.com,*.notify.windows.com,push.stupidtech.net"
 
 # Uploaded images (src/budget.ts). The bucket needs lifecycle rules deleting
-# f/ after 7 days and a/ after 30, and a custom domain for MEDIA_ORIGIN.
+# f/ after 7 days and a/ after 30 (none for e/, custom emoji), a custom domain
+# for MEDIA_ORIGIN, and a CORS policy allowing GET from any origin for the
+# custom emoji catalog (docs/configuration.md, Uploads).
 [[r2_buckets]]
 binding = "MEDIA"
 bucket_name = "apron-media"
