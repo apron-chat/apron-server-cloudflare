@@ -113,6 +113,7 @@ export const SCHEMA_9_DDL = `
   CREATE INDEX IF NOT EXISTS push_subscriptions_user_idx ON push_subscriptions (user_id, updated_ms);
   CREATE INDEX IF NOT EXISTS push_subscriptions_updated_idx ON push_subscriptions (updated_ms);
   CREATE INDEX IF NOT EXISTS push_subscriptions_waking_idx ON push_subscriptions (user_id, updated_ms) WHERE wake != 0;
+  CREATE INDEX IF NOT EXISTS push_subscriptions_joined_idx ON push_subscriptions (updated_ms, user_id) WHERE (wake & 8) != 0;
   CREATE TABLE IF NOT EXISTS push_wakes (
     user_id TEXT NOT NULL,
     room_id TEXT NOT NULL,

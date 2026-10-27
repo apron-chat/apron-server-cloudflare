@@ -282,6 +282,8 @@ it('upgrades a schema 9 store to schema 10 in place: every row kept, rebuilt WIT
 			expect(sql.exec<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", table).one().sql, table).toMatch(/WITHOUT ROWID$/);
 		}
 		expect(sql.exec("SELECT name FROM sqlite_master WHERE name LIKE 'sqlite_autoindex_%' OR name LIKE '%_v9' OR name = 'records_retention_idx'").toArray()).toEqual([]);
+		// The indexes schema 9 had are rebuilt on the new tables, the partial one of `joined` registrations among them.
+		expect(sql.exec<{ tbl_name: string }>("SELECT tbl_name FROM sqlite_master WHERE name = 'push_subscriptions_joined_idx'").one().tbl_name).toBe('push_subscriptions');
 		expect(sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('message_state') ORDER BY cid").toArray().map((row) => row.name)).toEqual(['message_id', 'room_id', 'latest_log_id', 'author_id']);
 		expect(sql.exec<{ count: number }>('SELECT COUNT(*) AS count FROM read_cursors').one().count).toBe(0);
 		// The rebuild read and wrote every row once, and none of it is charged: the wake's own few are.
@@ -297,6 +299,48 @@ it('upgrades a schema 9 store to schema 10 in place: every row kept, rebuilt WIT
 			params: { room_id: 'general', message_id: before.messageId, body: { text: 'edited again' } },
 		});
 		expect(latestText(store, before.messageId, now)).toBe('edited again');
+	});
+});
+
+it('builds the joined wake index for a schema 9 store from code before it, with schema 10, and later wakes add nothing', async () => {
+	const stub = env.DEMO.getByName(`schema-joined-${crypto.randomUUID()}`);
+	const now = Date.now();
+	await runInDurableObject(stub, async (instance, state) => {
+		const { store } = instance as unknown as Runtime;
+		const sql = state.storage.sql;
+		store.registerIdentity({
+			userId: 'kept_mod', name: 'Mod', userHandle: 'handle-kept_mod', now, ipKey: 'ip-kept_mod',
+			credential: { credentialId: 'cred-kept_mod', userId: 'kept_mod', publicKey: 'AAAA', counter: 0 },
+		});
+		// As code before the index stored it: a registration with the scope's bit, which that code never set or read.
+		sql.exec("INSERT INTO push_subscriptions (user_id, url, p256dh, auth, push_id, wake, created_ms, updated_ms) VALUES ('kept_mod', 'https://push.example.net/kept', 'p', 'a', NULL, 11, ?, ?)", now, now);
+		// Last: code before the index made schema 9 without it.
+		toSchema9(sql);
+		sql.exec('DROP INDEX push_subscriptions_joined_idx');
+		expect(() => sql.exec('SELECT user_id FROM push_subscriptions INDEXED BY push_subscriptions_joined_idx WHERE (wake & 8) != 0 LIMIT 0')).toThrow(/no such index/i);
+	});
+
+	await evictDurableObject(stub);
+	const added = await runInDurableObject(stub, async (instance, state) => {
+		const { store } = instance as unknown as Runtime;
+		const sql = state.storage.sql;
+		expect(store.requiresReset()).toBe(false);
+		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
+		expect(sql.exec<{ sql: string }>("SELECT sql FROM sqlite_master WHERE name = 'push_subscriptions_joined_idx'").one().sql).toMatch(/WHERE \(wake & 8\) != 0$/);
+		// The registration made before is in it.
+		expect(store.joinedWakers(now)).toEqual(['kept_mod']);
+		return { writes: writesReserved(sql) };
+	});
+
+	// A later wake finds schema 10 and changes nothing.
+	await evictDurableObject(stub);
+	await runInDurableObject(stub, async (_instance, state) => {
+		const sql = state.storage.sql;
+		const woken = new Store(state, defaultStoreConfig());
+		woken.initialize();
+		expect(woken.storageAccounting().writes).toBe(0);
+		expect(woken.storageAccounting().reads).toBeLessThanOrEqual(8);
+		expect(writesReserved(sql)).toBe(added.writes);
 	});
 });
 
@@ -391,7 +435,7 @@ it('upgrades a schema 7 store in place: it gains the push and user status tables
 		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
 		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(SCHEMA_VERSION);
 		const indexes = (table: string) => sql.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?", table).toArray().map((row) => row.name);
-		expect(indexes('push_subscriptions')).toEqual(expect.arrayContaining(['push_subscriptions_user_idx', 'push_subscriptions_updated_idx', 'push_subscriptions_waking_idx']));
+		expect(indexes('push_subscriptions')).toEqual(expect.arrayContaining(['push_subscriptions_user_idx', 'push_subscriptions_updated_idx', 'push_subscriptions_waking_idx', 'push_subscriptions_joined_idx']));
 		// The waking-registration index is partial: registrations that wake for nothing are not in it.
 		expect(sql.exec<{ sql: string }>("SELECT sql FROM sqlite_master WHERE name = 'push_subscriptions_waking_idx'").one().sql).toMatch(/WHERE wake != 0$/);
 		expect(indexes('push_wakes')).toContain('push_wakes_woken_idx');

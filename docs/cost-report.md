@@ -207,10 +207,11 @@ upper bounds can be compared with the measured worst case.
 | Identity count | 2 | 1 | 16 | 8 |
 | Credential IDs lookup | 2 | 1 | 40 | 8 |
 | Credential counter update | 2 | 2 | 16 | 16 |
-| Push subscription register | 7 | 6 | 172 | 370 |
-| Push subscription register again, unchanged within a day | 3 | 1 | 172 | 370 |
-| Push wake claim (one user, one subscription; creates the server, sender and recipient counters) | 25 | 15 | 98 | 160 |
-| Push wake claim, 31 unregistered candidates before one registered | 75 | 6 | 1,152 | 160 |
+| Push subscription register | 7 | 6 | 172 | 436 |
+| Push subscription register again, unchanged within a day | 3 | 1 | 172 | 436 |
+| Push subscription register, a moderator keeping `joined` (one more index entry) | 7 | 7 | 172 | 436 |
+| Push wake claim (one user, one subscription; creates the server, sender and recipient counters) | 25 | 15 | 106 | 160 |
+| Push wake claim, 31 unregistered candidates before one registered | 75 | 6 | 1,408 | 160 |
 | Push registrations clear (`/passkeys remove`, a new bot token) | 1 | 2 | 144 | 400 |
 | Mute set (`status` `mute`, unscoped) | 3 | 2 | 24 | 24 |
 | Status set (`me` `status`) | 3 | 2 | 24 | 24 |
@@ -226,11 +227,13 @@ upper bounds can be compared with the measured worst case.
 | Status set to `invisible`, the stored `seen` standing (within 10 minutes; decided from the identity row it reads anyway) | 3 | 2 | 24 | 24 |
 | Seen settled for a user with no identity row (the update matches nothing; the read finds none) | 2 | 1 | 16 | 16 |
 | Status inputs at sign-in, 100 room mutes | 102 | 1 | 224 | 8 |
-| Push wake claim, `dnd` and muted (passed over) | 2 | 1 | 98 | 160 |
-| Push wake claim, the thread's parent muted (passed over) | 7 | 1 | 98 | 160 |
+| Push wake claim, `dnd` and muted (passed over) | 2 | 1 | 106 | 160 |
+| Push wake claim, the thread's parent muted (passed over) | 8 | 1 | 106 | 160 |
 | Gone push subscription forget (one primary-key row) | 2 | 2 | 20 | 22 |
 | Push reply author lookup | 4 | 1 | 16 | 8 |
-| Push wake claim for a reply (creates the recipient counter) | 17 | 9 | 98 | 160 |
+| Push wake claim for a reply (creates the recipient counter) | 17 | 9 | 106 | 160 |
+| Push joined wakers (the moderators who kept `joined`; one range of their partial index, read for every message) | 2 | 1 | 176 | 8 |
+| Push wake claim for `joined` (creates its own recipient counter; reads the role and the membership; charges no sender) | 18 | 8 | 106 | 160 |
 | Message create with request ID (the poster's first: creates its limiter rows) | 26 | 23 | 296 | 120 |
 | Empty new message (not logged) | 2 | 1 | 16 | 8 |
 | Deduplicated mutation retry | 2 | 1 | 32 | 16 |
@@ -244,14 +247,14 @@ upper bounds can be compared with the measured worst case.
 | Registered room join at the 100-thread ceiling | 328 | 20 | 582 | 72 |
 | Guest room join or leave (the guest's first: creates its and its IP's posting limiter rows) | 15 | 12 | 40 | 40 |
 | Guest room join or leave (its limiter rows cached; writes the global row) | 3 | 2 | 40 | 40 |
-| History page | 8 | 1 | 264 | 40 |
-| History page with its quota, a new user and IP (creates both limiter rows) | 20 | 11 | 264 | 40 |
-| History page with its quota, again within a minute | 8 | 1 | 264 | 40 |
+| History page | 9 | 1 | 264 | 40 |
+| History page with its quota, a new user and IP (creates both limiter rows) | 21 | 11 | 264 | 40 |
+| History page with its quota, again within a minute | 9 | 1 | 264 | 40 |
 | Room record lookup (`general`) | 2 | 1 | 24 | 8 |
 | Room join lookup | 2 | 1 | 24 | 8 |
 | Room listing (representative matrix) | 6 | 1 | 444 | 8 |
-| Room members, `general` and one thread | 6 | 1 | 824 | 8 |
-| Room members with status, `general` and one thread | 6 | 1 | 1,224 | 8 |
+| Room members, `general` and one thread | 8 | 1 | 824 | 8 |
+| Room members with status, `general` and one thread | 8 | 1 | 1,224 | 8 |
 | Room members, 101 rooms with 200 registered members each | 40,401 | 1 | 40,820 | 8 |
 | Room members with status, 101 rooms of 200, each member with a status row and the most push registrations and room mutes a user may hold (neither read) | 60,500 | 1 | 61,020 | 8 |
 | Read cursor written, new (a membership probe and its row, keyed by user and room, no index) | 2 | 2 | 20 | 20 |
@@ -259,7 +262,7 @@ upper bounds can be compared with the measured worst case.
 | Read cursor written, not past the one kept (no row changes) | 2 | 2 | 20 | 20 |
 | Read cursor written for a room not joined (the probe alone) | 2 | 1 | 20 | 20 |
 | Read cursors at a listing (one range of the user's rows) | 2 | 1 | 518 | 8 |
-| Cleanup (matrix, one day later) | 120 | 39 | 1,874 | 1,058 |
+| Cleanup (matrix, one day later) | 127 | 42 | 1,874 | 1,058 |
 | Alarm scheduling | 6 | 3 | 24 | 12 |
 
 The matrix uses a fresh object and one representative operation for each
@@ -506,7 +509,7 @@ sender's counters, charged as the pushes are claimed, delivered or not: 19
 writes for the day's first wake (counter rows created), about 7 after. A message whose candidates have no live
 registrations, or are all coalesced, writes nothing; one that mentions no
 one idle or gone does no push SQL. The reservation covers 32 candidates at
-5 registrations each (888 reads) and `wakesPerMessage` wake rows and
+5 registrations each (1,400 reads) and `wakesPerMessage` wake rows and
 recipient counters (160 writes), mostly credited back. A push service's
 404, 410 or 403 costs one primary-key delete per gone registration,
 whatever other accounts share the endpoint: deleting by endpoint alone
@@ -550,6 +553,27 @@ A registration now also writes its entry in the partial index of waking
 registrations (9/8 against 9/7), and the wake claim reads live waking
 registrations through that index, so registrations that wake for nothing
 are not read.
+
+**`joined`, for moderators.** Only a registered `admin` or `mod` keeps
+`joined` when they register (JOINED_WAKE_ROLES); everyone else's is dropped,
+so a second partial index, by registration time, holds only moderators'
+registrations that keep it (one more written index entry for those, 6/8).
+Every new message reads that index's live range once (Store.joinedWakers:
+2/1 with one moderator; at most 32 users of 5 registrations, 176 reserved)
+whether or not anyone kept it, and adds them as candidates after everyone
+else, so they crowd out no mention, reply or private-room member. The claim
+reads each one's identity row for the role and probes their membership of
+the room and, for a thread, its parent, but leaves the sender's counter
+alone: 18/10 against a reply's 17/11, and its reservation grows by 8 rows a candidate (106 for
+one, 1,408 for 32). The pushes are bounded as every other:
+`wakesPerMessage` a message and the server's daily allowance, and those only
+for `joined` by their own: `joinedCoalesceSeconds` (300) per user and room,
+read from the same `push_wakes` row, and `joinedPushesPerRecipientDay` (20),
+a recipient counter that takes the place of the one a push for anything else
+writes. They are charged to no sender, so a claim that pushes only for
+`joined` leaves the sender's counter unwritten (18/10 measured, against
+19/11 when it was charged as any push). The separate allowance adds no row
+to a claim, and one limiter row a day per moderator woken for `joined`.
 
 Cleanup deletes expired registrations (`pushExpiryDays`, 7) and wake times
 past `coalesceSeconds` within its existing batch, by their time indexes.
@@ -916,7 +940,9 @@ creates four empty tables, `push_subscriptions` (with indexes by user and
 registration time, by registration time, and a partial one by user and
 registration time of those that wake for messages), `push_wakes` (with an
 index by wake time), `user_status` and `room_mutes`, four indexes besides
-their primary keys, and adds the identities' empty `ext_json` column. The rows
+their primary keys, and adds the identities' empty `ext_json` column; the
+partial index of registrations that keep `joined` comes with schema 10,
+as on schema 9 below. The rows
 it measurably read and wrote are added to the day's maintenance counters
 without a capacity check, like the reset's passkey carry, so an exhausted
 budget cannot block it. The object is not wiped.
@@ -928,6 +954,10 @@ so the upgrade was charged 8 written rows over 503 limiter rows (measured on
 2026-10-24); dropping the four lists as well measured 2,168, about 4.3 a
 row, so about 43,000 at the 10,000-row limiter cap, more than Free's whole
 maintenance allocation.
+
+A schema 9 object from code before `joined` lacks the partial index of
+registrations that keep it; the upgrade to schema 10 below creates it with
+the rest of the schema.
 
 A schema 9 object is upgraded to schema 10 in place, once, in one
 transaction, on its first wake: each table schema 10 keys differently is

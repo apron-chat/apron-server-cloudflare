@@ -30,7 +30,8 @@ for a zero-overage deployment.
   their browser's Web Push service (`server.push` kind `webpush`), unless
   they muted it with `status`, everywhere or in that room, or chose `dnd`.
   The push waits 30 seconds first, and doesn't go if they come back or
-  post in that room meanwhile.
+  post in that room meanwhile. Admins and mods can also ask to be woken for
+  every message in the rooms they joined (`joined`).
 - **Who's around.** With push on, member lists show each user as online,
   idle, busy (`dnd`), or offline, with when they were last `seen`, and a
   user can choose `dnd`, `invisible`, or no status at all with `me`. A

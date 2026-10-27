@@ -175,6 +175,9 @@ describe('push configuration', () => {
 		expect(() => validatePushPolicy({ ...PUSH_POLICY!, pushesPerRecipientDay: PUSH_POLICY!.pushesPerDay + 1 })).toThrow(ConfigError);
 		expect(() => validatePushPolicy({ ...PUSH_POLICY!, mutesPerUserMinute: 61 })).toThrow(ConfigError);
 		expect(() => validatePushPolicy({ ...PUSH_POLICY!, coalesceSeconds: 86_401 })).toThrow(ConfigError);
+		expect(() => validatePushPolicy({ ...PUSH_POLICY!, joinedPushesPerRecipientDay: PUSH_POLICY!.pushesPerDay + 1 })).toThrow(ConfigError);
+		expect(() => validatePushPolicy({ ...PUSH_POLICY!, joinedCoalesceSeconds: PUSH_POLICY!.coalesceSeconds - 1 })).toThrow(ConfigError);
+		expect(() => validatePushPolicy({ ...PUSH_POLICY!, joinedCoalesceSeconds: 86_401 })).toThrow(ConfigError);
 		expect(() => validatePushPolicy({ ...PUSH_POLICY!, delaySeconds: 61 })).toThrow(ConfigError);
 		expect(() => validatePushPolicy({ ...PUSH_POLICY!, pushExpiryDays: 1 })).toThrow(ConfigError);
 	});

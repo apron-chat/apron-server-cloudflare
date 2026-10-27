@@ -146,10 +146,15 @@ export const FREE_PLAN: Plan = Object.freeze({
 		// sybils cannot use up everyone's pushes or flood one person.
 		pushesPerSenderDay: 50,
 		pushesPerRecipientDay: 100,
+		// Every message in a moderator's joined rooms (`joined`): its own
+		// allowance, apart from the 100 their mentions and replies use, and
+		// charged to no sender; at most one a room every 5 minutes.
+		joinedPushesPerRecipientDay: 20,
 		// Each mute or status change costs a few written rows.
 		mutesPerUserMinute: 6,
 		// A busy conversation wakes an unattended user (no connection attended, §4.5) at most once a minute per room.
 		coalesceSeconds: 60,
+		joinedCoalesceSeconds: 5 * 60,
 		// A wake waits half a minute, so a user back at their screen by then is not pushed too.
 		delaySeconds: 30,
 		subscriptionsPerUser: 5,

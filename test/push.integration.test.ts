@@ -97,7 +97,7 @@ describe('push over the socket', () => {
 		const peer = await connect();
 		try {
 			const server = await peer.next();
-			expect(server.params.push).toEqual({ webpush: { key: env.VAPID_PUBLIC_KEY }, wake: ['mentions', 'replies', 'private'] });
+			expect(server.params.push).toEqual({ webpush: { key: env.VAPID_PUBLIC_KEY }, wake: ['mentions', 'replies', 'private', 'joined'] });
 		} finally { peer.close(); }
 	});
 
@@ -520,6 +520,38 @@ describe('wake scopes', () => {
 			await post(sender, 'dm-mention', { room_id: roomId, body: { text: 'look', mentions: [userOf(urls.mentioned), userOf(urls.outsider)] } });
 			await vi.waitFor(() => expect(pushes.map((push) => push.url).sort()).toEqual([urls.mentioned, urls.privateOnly].sort()), { timeout: 5_000 });
 		} finally { sender.close(); }
+	});
+
+	it('wakes a moderator who kept joined for every message in a room they joined, at normal urgency, and nobody else for it', async () => {
+		const pushes = capturePushes();
+		const moderatorId = unique('jmod');
+		await register(moderatorId);
+		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.setRole({ userId: moderatorId, role: 'mod', on: true }); });
+		const moderator = await signedIn(moderatorId, true);
+		const { url: moderatorUrl } = await subscribe(moderator, moderatorId, undefined, ['joined', 'mentions']);
+		moderator.close();
+		await vi.waitFor(async () => expect(await idleOf(moderatorId)).toEqual([]), { timeout: 5_000 });
+		expect((await subscriptionsOf(moderatorId)).map((row) => row.wake)).toEqual([['mentions', 'joined']]);
+		// Anyone else's `joined` is dropped as it is registered.
+		const regular = await gone('jreg', ['joined']);
+		expect((await subscriptionsOf(userOf(regular))).map((row) => row.wake)).toEqual([[]]);
+		const senderId = unique('sender');
+		const sender = await signedIn(senderId);
+		try {
+			await post(sender, 'joined-plain', { body: { text: 'nothing for anyone in particular' } });
+			await vi.waitFor(() => expect(pushes.map((push) => push.url)).toEqual([moderatorUrl]), { timeout: 5_000 });
+			expect(pushes[0].headers.get('Urgency')).toBe('normal');
+			// A mention is `high`, in another room so coalescing does not pass it over.
+			const thread = (await request(sender, 'joined-thread', 'room_set', { parent_room_id: 'general', title: 'Joined thread' })).result.room_id as string;
+			await post(sender, 'joined-mention', { room_id: thread, body: { text: 'look', mentions: [moderatorId] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(2), { timeout: 5_000 });
+			expect(pushes[1].url).toBe(moderatorUrl);
+			expect(pushes[1].headers.get('Urgency')).toBe('high');
+		} finally {
+			sender.close();
+			// Every other test here posts in general: this moderator must wake for none of it.
+			await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.clearPushSubscriptions(moderatorId); });
+		}
 	});
 });
 
@@ -1130,6 +1162,34 @@ describe('held wakes', () => {
 		} finally { alice.close(); bob.close(); }
 	});
 
+	it('holds no joined wake for an attended moderator, so a busy room cannot crowd out their mention', async () => {
+		const pushes = capturePushes();
+		const [aliceId, modId] = [unique('alice'), unique('hmod')];
+		await register(modId);
+		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.setRole({ userId: modId, role: 'mod', on: true }); });
+		const alice = await signedIn(aliceId);
+		const mod = await signedIn(modId, true);
+		try {
+			const modSub = await subscribe(mod, 'hmod', undefined, ['mentions', 'joined']);
+			const mention = await post(alice, 'held-mention', { body: { text: 'look', mentions: [modId] } });
+			// More than a connection holds, each only for `joined`: none is held.
+			await runInDurableObject(stub(), (instance) => {
+				const runtime = instance as unknown as { wakeFor(message: unknown): void };
+				for (let n = 0; n < 9; n++) runtime.wakeFor({ message_id: String(900_000_000 + n), log_id: String(900_000_000 + n), room_id: 'general', from: { user_id: aliceId }, body: { text: `chatter ${n}` } });
+			});
+			await settleFor();
+			expect(pushes).toEqual([]);
+			await idleFor(mod, 60);
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(pushes[0].url).toBe(modSub.url);
+			expect(pushes[0].headers.get('Urgency')).toBe('high');
+			expect(JSON.parse((await decryptPush(pushes[0].body, modSub.browser)).plaintext).message.message_id).toBe(mention.result.message_id);
+		} finally {
+			alice.close(); mod.close();
+			await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.clearPushSubscriptions(modId); });
+		}
+	});
+
 	it('takes idle as whole seconds, and nothing else but a boolean', async () => {
 		const userId = unique('seconds');
 		const peer = await signedIn(userId);
@@ -1645,6 +1705,105 @@ describe('push subscriptions in the store', () => {
 			expect(integer(state.storage.sql.exec("SELECT COUNT(*) AS count FROM room_mutes WHERE user_id = 'rho'").one().count)).toBe(MAX_ROOM_MUTES_PER_USER - 1);
 			// Unmuting a room that no longer exists still works.
 			expect(store.setRoomMute({ userId: 'rho', roomId: 'room-5', untilMs: null, now: clock.value })).toEqual({ changed: true });
+			expect(store.accountingStatus().unsafe).toBe(false);
+		});
+	});
+
+	it('keeps joined only for admins and mods, wakes them for rooms they joined or a thread\'s parent, and checks the role again', async () => {
+		const keys = await browserKeys();
+		await withStore('push-joined', config, (store, clock, state) => {
+			const roles: Record<string, string | undefined> = { ada: 'admin', mia: 'mod', lea: 'mod', rob: 'helper', uma: undefined };
+			for (const [userId, role] of Object.entries(roles)) {
+				registerUser(store, clock, userId);
+				if (role) store.setRole({ userId, role, on: true, now: clock.value });
+				store.registerPushSubscription({ userId, url: `https://push.example.net/${userId}`, ...keys, wake: WAKE_SCOPES.joined | WAKE_SCOPES.mentions, now: clock.value });
+			}
+			const wakeOf = (userId: string) => pushSubscriptionsOf(state, userId).map((row) => row.wake);
+			expect(wakeOf('mia')).toEqual([['mentions', 'joined']]);
+			expect(wakeOf('rob')).toEqual([['mentions']]);
+			expect(wakeOf('uma')).toEqual([['mentions']]);
+			expect(store.joinedWakers(clock.value).sort()).toEqual(['ada', 'lea', 'mia']);
+			store.changeMembership({ userId: 'lea', ipKey: 'ip-lea', roomId: 'general', join: false, now: clock.value });
+			const joined = (roomId: string, userIds: string[], reasons: number = WAKE_SCOPES.joined) =>
+				store.claimPushes({ senderId: 'sender', roomId, candidates: userIds.map((userId) => ({ userId, reasons })), now: clock.value }).subscriptions
+					.map((row) => [row.userId, row.reasons]);
+			// Lea left general; Rob and Uma never kept `joined`.
+			expect(joined('general', ['ada', 'lea', 'mia', 'rob', 'uma'])).toEqual([['ada', WAKE_SCOPES.joined], ['mia', WAKE_SCOPES.joined]]);
+			// A thread wakes the members of its parent; Uma, who made it, is in it but no moderator.
+			const thread = store.mutate({
+				userId: 'uma', ipKey: 'ip-uma', requestId: 'joined-thread', method: 'room_set', now: clock.value,
+				identity: { user_id: 'uma' }, params: { parent_room_id: 'general', title: 'A thread' },
+			}).result.room_id as string;
+			expect(joined(thread, ['lea', 'mia', 'uma'])).toEqual([['mia', WAKE_SCOPES.joined]]);
+			// A room mute silences `joined` as it does every scope: the room's own, or for a thread its parent's.
+			const elsewhere = store.mutate({
+				userId: 'uma', ipKey: 'ip-uma', requestId: 'joined-thread-2', method: 'room_set', now: clock.value,
+				identity: { user_id: 'uma' }, params: { parent_room_id: 'general', title: 'Another thread' },
+			}).result.room_id as string;
+			store.setRoomMute({ userId: 'ada', roomId: 'general', untilMs: MUTE_FOREVER, now: clock.value });
+			expect(joined(elsewhere, ['ada'])).toEqual([]);
+			store.setRoomMute({ userId: 'ada', roomId: 'general', untilMs: null, now: clock.value });
+			expect(joined(elsewhere, ['ada'])).toEqual([['ada', WAKE_SCOPES.joined]]);
+			// Mia is a mod no more: her registration still keeps `joined`, but the claim reads her role as it is now.
+			store.setRole({ userId: 'mia', role: 'mod', on: false, now: clock.value });
+			clock.value += POLICY.coalesceSeconds * 1_000;
+			expect(joined('general', ['mia'])).toEqual([]);
+			// Qualifying otherwise as well, she is pushed for that alone.
+			expect(joined('general', ['mia'], WAKE_SCOPES.joined | WAKE_SCOPES.mentions)).toEqual([['mia', WAKE_SCOPES.mentions]]);
+			// Her next registration drops it.
+			store.registerPushSubscription({ userId: 'mia', url: 'https://push.example.net/mia', ...keys, wake: WAKE_SCOPES.joined | WAKE_SCOPES.mentions, now: clock.value });
+			expect(wakeOf('mia')).toEqual([['mentions']]);
+			expect(store.joinedWakers(clock.value).sort()).toEqual(['ada', 'lea']);
+			// Expired registrations are not read.
+			clock.value += POLICY.pushExpiryDays * DAY + 1;
+			expect(store.joinedWakers(clock.value)).toEqual([]);
+			expect(store.accountingStatus().unsafe).toBe(false);
+		});
+	});
+
+	it('keeps joined pushes to their own recipient allowance and window, charging no sender, unless pushed for more', async () => {
+		const keys = await browserKeys();
+		const policy = { ...POLICY, pushesPerSenderDay: 2, pushesPerRecipientDay: 3, joinedPushesPerRecipientDay: 3, coalesceSeconds: 1, joinedCoalesceSeconds: 10 };
+		await withStore('push-joined-budget', { push: policy }, (store, clock, state) => {
+			atMidday(clock);
+			registerUser(store, clock, 'mo');
+			store.setRole({ userId: 'mo', role: 'mod', on: true, now: clock.value });
+			store.registerPushSubscription({ userId: 'mo', url: 'https://push.example.net/mo', ...keys, wake: WAKE_SCOPES.joined | WAKE_SCOPES.mentions, now: clock.value });
+			const push = (reasons: number, sender = 'sam') => store.claimPushes({ senderId: sender, roomId: 'general', candidates: [{ userId: 'mo', reasons }], now: clock.value });
+			const counter = (scope: string, key: string) =>
+				integer(state.storage.sql.exec("SELECT posts_day FROM principal_limits WHERE scope = ? AND principal_key = ?", scope, key).toArray()[0]?.posts_day ?? 0);
+			expect(push(WAKE_SCOPES.joined).subscriptions.map((row) => row.reasons)).toEqual([WAKE_SCOPES.joined]);
+			expect(counter('push_joined_recipient', 'user:mo')).toBe(1);
+			expect(counter('push_recipient', 'user:mo')).toBe(0);
+			expect(counter('push', 'user:sam')).toBe(0);
+			expect(counter('push', 'global')).toBe(1);
+			// For `joined` alone, the room waits joinedCoalesceSeconds; a mention, only coalesceSeconds.
+			clock.value += 2_000;
+			expect(push(WAKE_SCOPES.joined).subscriptions).toEqual([]);
+			expect(push(WAKE_SCOPES.joined | WAKE_SCOPES.mentions).subscriptions.map((row) => row.reasons)).toEqual([WAKE_SCOPES.joined | WAKE_SCOPES.mentions]);
+			// Pushed for a mention as well, it is charged as any push: to Sam and to Mo's own allowance.
+			expect(counter('push', 'user:sam')).toBe(1);
+			expect(counter('push_recipient', 'user:mo')).toBe(1);
+			expect(counter('push_joined_recipient', 'user:mo')).toBe(1);
+			// Sam's allowance spent, his messages still wake Mo for `joined`, up to Mo's 3.
+			clock.value += 2_000;
+			expect(push(WAKE_SCOPES.mentions, 'sam').subscriptions).toHaveLength(1);
+			expect(counter('push', 'user:sam')).toBe(2);
+			for (const expected of [1, 1, 0]) {
+				clock.value += 10_000;
+				expect(push(WAKE_SCOPES.joined, 'sam').subscriptions).toHaveLength(expected);
+			}
+			expect(counter('push_joined_recipient', 'user:mo')).toBe(3);
+			// Mo's mentions keep their own allowance: 2 of 3 spent, the joined pushes none of it (Sam's is spent, so from Tess).
+			clock.value += 2_000;
+			expect(push(WAKE_SCOPES.mentions, 'tess').subscriptions).toHaveLength(1);
+			// The coalescing rows stay until the longer window passes.
+			clock.value += 5_000;
+			store.runCleanup(clock.value);
+			expect(integer(state.storage.sql.exec("SELECT COUNT(*) AS count FROM push_wakes WHERE user_id = 'mo'").one().count)).toBe(1);
+			// /rename moves the joined allowance with the rest.
+			store.renameIdentity({ from: 'mo', to: 'moe', now: clock.value });
+			expect(counter('push_joined_recipient', 'user:moe')).toBe(3);
 			expect(store.accountingStatus().unsafe).toBe(false);
 		});
 	});
