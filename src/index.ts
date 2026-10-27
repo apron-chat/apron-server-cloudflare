@@ -232,6 +232,12 @@ interface ConnectionAttachment {
 	 */
 	reads?: Record<string, string>;
 	readsAt?: number;
+	/**
+	 * The last `server` frame this connection got listed wake scope `joined`
+	 * in `push.wake` (wakesJoined), so a sign-in or role change that changes
+	 * it sends a new one (syncServer).
+	 */
+	wakeJoined?: boolean;
 	closing?: boolean;
 }
 
@@ -763,6 +769,7 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			historyInFlight: typeof attachment.historyInFlight === "number" ? attachment.historyInFlight : 0,
 			frameTimes: Array.isArray(attachment.frameTimes) ? attachment.frameTimes.slice(-120) : [],
 			...throttleState(attachment),
+			...(attachment.wakeJoined === true ? { wakeJoined: true } : {}),
 			...(attachment.closing ? { closing: true } : {}),
 		};
 	} catch {
@@ -1693,7 +1700,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return responseError(status, message, typeof retry === "number" ? retry * 1_000 : undefined);
 	}
 
-	private serverAnnouncement(origin: string | null): Record<string, unknown> {
+	private serverAnnouncement(origin: string | null, wakeJoined = false): Record<string, unknown> {
 		const limits = this.config.limits;
 		const presence = this.presenceMode();
 		const emoji = this.emojiCatalogUrl();
@@ -1741,8 +1748,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 				...this.config.server,
 				// Answered by the runtime without waking the object (see PING_REQUEST).
 				ping: limits.pingSeconds,
-				// Web Push (§4.9), with the VAPID key browsers subscribe with and the wake scopes.
-				...(this.config.push ? { push: { webpush: { key: this.config.push.publicKey }, wake: Object.keys(WAKE_SCOPES) } } : {}),
+				// Web Push (§4.9), with the VAPID key browsers subscribe with and
+				// the wake scopes: `joined` only to a connection whose user may wake
+				// for it (wakesJoined), since a server advertises only the scopes it
+				// implements, and ignores the others in `wake`.
+				...(this.config.push ? { push: { webpush: { key: this.config.push.publicKey }, wake: Object.keys(WAKE_SCOPES).filter((scope) => wakeJoined || scope !== "joined") } } : {}),
 				// The optional `status` values `me` accepts (§3.1, §4.5), only while
 				// others are shown them: with presence off a choice is still kept,
 				// but nobody sees `dnd` or `invisible`, so clients offer neither.
@@ -3402,6 +3412,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * sign-in and does not.
 	 */
 	private afterSignIn(socket: WebSocketConnection, stored?: SignInStatus): void {
+		this.syncServer(socket);
 		this.sendMutesInEffect(socket, stored);
 		this.presenceSignedIn(socket);
 		this.sendShownStatus(socket);
@@ -3501,12 +3512,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * on, any other registered user not a bot (assertMayManage); `move_any`,
 	 * moving others' messages between rooms, for a registered user with a
 	 * moderator role (MODERATOR_ROLES, which the store checks) but an owner's
-	 * bot, whose identity tier is `bot`; and this server's own `push_joined`,
-	 * being woken by push for wake scope `joined`, where push is on, for a
-	 * registered user holding one of JOINED_WAKE_ROLES but an owner's bot
-	 * (which the store checks), so clients show `joined` as alerting only
-	 * while open to everyone else. Adding one's own bot, and adding others to
-	 * a private room one is in, needs no permission. Every `you` carries it,
+	 * bot, whose identity tier is `bot`. Who may wake for scope `joined` is
+	 * in the connection's `server` frame instead (wakesJoined). Adding one's
+	 * own bot, and adding others to a private room one is in, needs no
+	 * permission. Every `you` carries it,
 	 * `{}` when every key takes its default; a role change or `/toggle
 	 * addmember` sends it again.
 	 */
@@ -3515,7 +3524,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return {
 			...(!hasRole(attachment, "bot") && (hasRole(attachment, "admin") || this.addMemberOn()) ? { add_members: true } : {}),
 			...(!isBotId(attachment.userId) && MODERATOR_ROLES.some((role) => hasRole(attachment, role)) ? { move_any: true } : {}),
-			...(this.config.push && !isBotId(attachment.userId) && JOINED_WAKE_ROLES.some((role) => hasRole(attachment, role)) ? { push_joined: true } : {}),
 		};
 	}
 
@@ -5070,7 +5078,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Sends every open connection a new `server` frame (§3.1), which fully
 	 * replaces the one it had: after the custom emoji catalog changed. One
-	 * frame is built for each origin, since the frame depends on it.
+	 * frame is built for each origin and wake scope list, since the frame
+	 * depends on them.
 	 */
 	private announceServer(): void {
 		const frames = new Map<string, Record<string, unknown>>();
@@ -5079,13 +5088,46 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const state = connectionAttachment(socket);
 			if (!state || state.closing) continue;
 			const origin = state.origin ?? null;
-			let frame = frames.get(origin ?? "");
+			const joined = this.wakesJoined(state);
+			const cacheKey = `${joined ? 1 : 0}${origin ?? ""}`;
+			let frame = frames.get(cacheKey);
 			if (!frame) {
-				frame = this.serverAnnouncement(origin);
-				frames.set(origin ?? "", frame);
+				frame = this.serverAnnouncement(origin, joined);
+				frames.set(cacheKey, frame);
 			}
-			this.send(socket, frame);
+			this.sendServer(socket, state, frame, joined);
 		}
+	}
+
+	/**
+	 * Whether a connection's user may be woken by push for wake scope
+	 * `joined` (§4.9.4), so its `server` frame lists it: where push is on,
+	 * a registered user holding one of JOINED_WAKE_ROLES but an owner's bot
+	 * (the store checks the same at registration and when it wakes).
+	 */
+	private wakesJoined(state: ConnectionAttachment): boolean {
+		return !!this.config.push && !isBotId(state.userId) && JOINED_WAKE_ROLES.some((role) => hasRole(state, role));
+	}
+
+	/** Sends a connection a `server` frame that lists `joined` or not, and keeps which on its attachment. */
+	private sendServer(socket: WebSocketConnection, state: ConnectionAttachment, frame: Record<string, unknown>, joined: boolean): void {
+		if (!this.send(socket, frame) || joined === (state.wakeJoined === true)) return;
+		if (joined) state.wakeJoined = true;
+		else delete state.wakeJoined;
+		writeAttachment(socket, state);
+	}
+
+	/**
+	 * After a sign-in or a role change: a new `server` frame for a connection
+	 * whose wake scopes changed (wakesJoined), so its clients offer `joined`
+	 * exactly while it works. Other connections get nothing.
+	 */
+	private syncServer(socket: WebSocketConnection): void {
+		const state = connectionAttachment(socket);
+		if (!state || state.closing) return;
+		const joined = this.wakesJoined(state);
+		if (joined === (state.wakeJoined === true)) return;
+		this.sendServer(socket, state, this.serverAnnouncement(state.origin ?? null, joined), joined);
 	}
 
 	/**
@@ -5832,8 +5874,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!state) continue;
 			// The user's own connections get `you`, with their permissions and the
 			// status they chose (§4.5).
-			if (state.userId === identity.user_id) this.deliverTo(socket, { method: "user", params: { you: { ...this.withPermissions(identity, state), ...this.ownStatus(state) } } });
-			else if (state.rooms?.some((id) => shared.has(id))) this.deliverTo(socket, { method: "user", params: { new: others, ...(old ? { old } : {}) } });
+			if (state.userId === identity.user_id) {
+				this.deliverTo(socket, { method: "user", params: { you: { ...this.withPermissions(identity, state), ...this.ownStatus(state) } } });
+				// A role change may change the wake scopes it is offered.
+				this.syncServer(socket);
+			} else if (state.rooms?.some((id) => shared.has(id))) this.deliverTo(socket, { method: "user", params: { new: others, ...(old ? { old } : {}) } });
 		}
 	}
 

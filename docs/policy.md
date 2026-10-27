@@ -357,8 +357,10 @@ puts `ext.permissions` on the user's own `you` only, an object of the keys
 that differ from their defaults: `write: false` for a guest while guests only
 read, `add_members` for an admin, or any registered user but a bot while
 `addmember` is on, `move_any` for a registered user with `admin`, `mod` or
-`threader` (not an owner's bot), and this server's `push_joined` for a
-registered `admin` or `mod` (not an owner's bot) while push is on. It is the
+`threader` (not an owner's bot). Where push is on, `server.params.push.wake`
+lists `joined` only on a connection signed in as a registered `admin` or
+`mod` (not an owner's bot); a sign-in or role change that changes that sends
+a new `server` frame. `ext.permissions` is the
 server's: `me` ignores an `ext.permissions` it writes. Once an admin has added
 a custom emoji with `/emoji add :name:` (and one image), `ext:emoji` carries
 `server.params.ext.emoji.catalog_url`, the catalog's URL on the media origin,

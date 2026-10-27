@@ -166,7 +166,7 @@ it('/rename moves a registered user, their passkey, rooms and admin status to a 
 		// A role change is a profile change (§3.3): the new admin and a room-mate hear of it.
 		const granted = await until(dave, (frame) => frame.method === 'user' && frame.params.you !== undefined);
 		// Only their own `you` carries what they may now do (ext:permissions).
-		expect(granted.frame.params).toEqual({ you: { user_id: fromId, name: `Name of ${fromId}`, roles: ['admin'], ext: { permissions: { move_any: true, add_members: true, push_joined: true } }, status: 'online' } });
+		expect(granted.frame.params).toEqual({ you: { user_id: fromId, name: `Name of ${fromId}`, roles: ['admin'], ext: { permissions: { move_any: true, add_members: true } }, status: 'online' } });
 		const seen = await until(erin, (frame) => frame.method === 'user' && frame.params.new?.user_id === fromId && frame.params.new.roles !== undefined);
 		expect(seen.frame.params).toEqual({ new: { user_id: fromId, name: `Name of ${fromId}`, roles: ['admin'] } });
 		const before = await exchange(dave, 'before', 'message', { room_id: 'general', body: { text: 'before the rename' } });
@@ -177,7 +177,7 @@ it('/rename moves a registered user, their passkey, rooms and admin status to a 
 		expect(renamed.notice!.params.body.text).toBe(`Renamed \`${fromId}\` to \`${toId}\`.`);
 		// The user's connection becomes the new identity; a room-mate learns of the change (§3.3).
 		const you = await until(dave, (frame) => frame.method === 'user' && frame.params.you !== undefined);
-		expect(you.frame.params).toEqual({ you: { user_id: toId, name: `Name of ${fromId}`, roles: ['admin'], ext: { permissions: { move_any: true, add_members: true, push_joined: true } }, status: 'online' } });
+		expect(you.frame.params).toEqual({ you: { user_id: toId, name: `Name of ${fromId}`, roles: ['admin'], ext: { permissions: { move_any: true, add_members: true } }, status: 'online' } });
 		const change = await until(erin, (frame) => frame.method === 'user' && frame.params.old?.user_id === fromId);
 		// The new user_id carries the status others were shown under the old one (§4.5).
 		expect(change.frame.params).toEqual({ new: { user_id: toId, name: `Name of ${fromId}`, roles: ['admin'], status: 'online' }, old: { user_id: fromId, name: `Name of ${fromId}` } });
@@ -732,7 +732,7 @@ it('never gives out a ~ user_id, which the protocol reserves for system identiti
 			expect((await command(admin, text, text)).frame.error.code).toBe(-32602);
 		}
 		// `roles` are the server's to assign: `me` ignores them.
-		expect((await request(admin, 'me', 'me', { roles: ['moderator'] })).result.you).toEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'], ext: { permissions: { move_any: true, add_members: true, push_joined: true } }, status: 'online' });
+		expect((await request(admin, 'me', 'me', { roles: ['moderator'] })).result.you).toEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'], ext: { permissions: { move_any: true, add_members: true } }, status: 'online' });
 	} finally { admin.close(); guest.close(); }
 });
 
@@ -1041,8 +1041,7 @@ it('tells only a user their own permissions (ext:permissions): admin, mod and th
 		expect((await move(tia, 'before', threadId)).error.code).toBe(-32001);
 		for (const role of ['threader', 'mod', 'admin']) {
 			await command(admin, `give-${role}`, `/role ${tiaId} ${role}`);
-			// Admins and mods may also be pushed for every message in their joined rooms (`joined`).
-			expect((await ownYou(tia)).ext).toEqual({ permissions: { move_any: true, add_members: true, ...(role === 'threader' ? {} : { push_joined: true }) } });
+			expect((await ownYou(tia)).ext).toEqual({ permissions: { move_any: true, add_members: true } });
 			// Others' objects for her never carry it.
 			expect(await theirNew(mate, tiaId)).not.toHaveProperty('ext');
 			// What it says is so: she moves the message into the thread, and back.

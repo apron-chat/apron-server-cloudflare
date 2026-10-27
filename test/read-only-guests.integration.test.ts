@@ -231,7 +231,7 @@ it('signs in as the admin user with APRON_ADMIN_TOKEN from anywhere, once it is 
 		await first.next();
 		const exchanged = await exchange(first, 'auth', 'auth', { scheme: 'token', token: adminToken });
 		const auth = exchanged.frame;
-		expect(auth.result).toEqual({ you: { user_id: 'admin', name: 'Admin', roles: ['admin'], ext: { permissions: { move_any: true, add_members: true, push_joined: true } }, status: 'online' } });
+		expect(auth.result).toEqual({ you: { user_id: 'admin', name: 'Admin', roles: ['admin'], ext: { permissions: { move_any: true, add_members: true } }, status: 'online' } });
 		// Created on first use, it starts in general: its logged join reaches
 		// this connection after the auth result (§3.2), not before.
 		const adminJoin = (frame: { method?: string; params?: any }) => frame.method === 'room_update' && frame.params?.memberships?.[0]?.members?.[0]?.user?.user_id === 'admin';
@@ -245,7 +245,7 @@ it('signs in as the admin user with APRON_ADMIN_TOKEN from anywhere, once it is 
 
 		// The same token signs in again, as the same user, from a browser too.
 		await second.next();
-		expect((await request(second, 'auth', 'auth', { scheme: 'token', token: adminToken })).result.you).toEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'], ext: { permissions: { move_any: true, add_members: true, push_joined: true } }, status: 'online' });
+		expect((await request(second, 'auth', 'auth', { scheme: 'token', token: adminToken })).result.you).toEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'], ext: { permissions: { move_any: true, add_members: true } }, status: 'online' });
 	} finally { first.close(); second.close(); await withAdminToken(undefined); }
 });
 
