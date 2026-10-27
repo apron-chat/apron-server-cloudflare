@@ -288,7 +288,9 @@ with the client's optional registration `push_id` in each push; see
 | `wakesPerMessage` (users with live registrations one message may wake) | 10 | 10 |
 | `pushesPerSenderDay` (pushes one sender's messages may claim, delivered or not) | 200 | 50 |
 | `pushesPerRecipientDay` (pushes one user may receive) | 100 | 100 |
+| `joinedPushesPerRecipientDay` (pushes one moderator may receive only for `joined`, apart from `pushesPerRecipientDay` and charged to no sender) | 20 | 20 |
 | `coalesceSeconds` (a user is woken for a room at most once in this window) | 60 | 60 |
+| `joinedCoalesceSeconds` (the same for a push only for `joined`) | 300 | 300 |
 | `delaySeconds` (how long a message's wake waits before it pushes; a user who sends `idle: false` or posts in the room meanwhile, or is attended when it ends, is not pushed) | 30 | 30 |
 | `subscriptionsPerUser` | 5 | 5 |
 | `pushExpiryDays` (a registration not renewed this long is skipped, then deleted) | 7 | 7 |
@@ -299,7 +301,8 @@ with the client's optional registration `push_id` in each push; see
 `wakesPerMessage` times `subscriptionsPerUser`, the pushes one message may
 send, is at most 64; `wakesPerMessage` is at most 32, the mentioned users one
 message looks up; `pushesPerSenderDay` and `pushesPerRecipientDay` fit
-`pushesPerDay`; `registersPerUserMinute` and `mutesPerUserMinute` are at
+`pushesPerDay`, and so does `joinedPushesPerRecipientDay`;
+`joinedCoalesceSeconds` is `coalesceSeconds` to a day; `registersPerUserMinute` and `mutesPerUserMinute` are at
 most 60, the per-type throttle bound;
 `coalesceSeconds` is at most a day; `delaySeconds` is at most 60, since its
 wait keeps the object awake; `pushExpiryDays` is 2 to 90; and

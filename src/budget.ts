@@ -305,6 +305,15 @@ export interface PushPolicy {
 	/** Pushes one user may receive a UTC day, from all senders together. */
 	pushesPerRecipientDay: number;
 	/**
+	 * Pushes one moderator may receive a UTC day only for `joined` (every
+	 * message in a room they joined), counted apart from
+	 * `pushesPerRecipientDay`, so a busy room cannot spend the pushes their
+	 * mentions and replies need. Such pushes are not charged to the sender's
+	 * `pushesPerSenderDay` either: the moderator chose them. They still count
+	 * against `pushesPerDay`.
+	 */
+	joinedPushesPerRecipientDay: number;
+	/**
 	 * `status` `mute` and `me` `status` changes one user may make a minute,
 	 * together, across their connections and reconnects; past it, a `status`
 	 * request with `mute` and a `me` with a changed `status` are
@@ -316,6 +325,12 @@ export interface PushPolicy {
 	 * them again only once this long has passed.
 	 */
 	coalesceSeconds: number;
+	/**
+	 * The same for a push only for `joined`: after a moderator is woken for
+	 * a room, a message there wakes them for `joined` alone only once this
+	 * long has passed. At least `coalesceSeconds`.
+	 */
+	joinedCoalesceSeconds: number;
 	/**
 	 * How long a message's wake waits before it pushes (§4.9's suggested
 	 * convention), so a user who comes back meanwhile (`idle: false`) or

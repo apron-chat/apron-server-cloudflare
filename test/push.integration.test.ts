@@ -1761,6 +1761,53 @@ describe('push subscriptions in the store', () => {
 		});
 	});
 
+	it('keeps joined pushes to their own recipient allowance and window, charging no sender, unless pushed for more', async () => {
+		const keys = await browserKeys();
+		const policy = { ...POLICY, pushesPerSenderDay: 2, pushesPerRecipientDay: 3, joinedPushesPerRecipientDay: 3, coalesceSeconds: 1, joinedCoalesceSeconds: 10 };
+		await withStore('push-joined-budget', { push: policy }, (store, clock, state) => {
+			atMidday(clock);
+			registerUser(store, clock, 'mo');
+			store.setRole({ userId: 'mo', role: 'mod', on: true, now: clock.value });
+			store.registerPushSubscription({ userId: 'mo', url: 'https://push.example.net/mo', ...keys, wake: WAKE_SCOPES.joined | WAKE_SCOPES.mentions, now: clock.value });
+			const push = (reasons: number, sender = 'sam') => store.claimPushes({ senderId: sender, roomId: 'general', candidates: [{ userId: 'mo', reasons }], now: clock.value });
+			const counter = (scope: string, key: string) =>
+				integer(state.storage.sql.exec("SELECT posts_day FROM principal_limits WHERE scope = ? AND principal_key = ?", scope, key).toArray()[0]?.posts_day ?? 0);
+			expect(push(WAKE_SCOPES.joined).subscriptions.map((row) => row.reasons)).toEqual([WAKE_SCOPES.joined]);
+			expect(counter('push_joined_recipient', 'user:mo')).toBe(1);
+			expect(counter('push_recipient', 'user:mo')).toBe(0);
+			expect(counter('push', 'user:sam')).toBe(0);
+			expect(counter('push', 'global')).toBe(1);
+			// For `joined` alone, the room waits joinedCoalesceSeconds; a mention, only coalesceSeconds.
+			clock.value += 2_000;
+			expect(push(WAKE_SCOPES.joined).subscriptions).toEqual([]);
+			expect(push(WAKE_SCOPES.joined | WAKE_SCOPES.mentions).subscriptions.map((row) => row.reasons)).toEqual([WAKE_SCOPES.joined | WAKE_SCOPES.mentions]);
+			// Pushed for a mention as well, it is charged as any push: to Sam and to Mo's own allowance.
+			expect(counter('push', 'user:sam')).toBe(1);
+			expect(counter('push_recipient', 'user:mo')).toBe(1);
+			expect(counter('push_joined_recipient', 'user:mo')).toBe(1);
+			// Sam's allowance spent, his messages still wake Mo for `joined`, up to Mo's 3.
+			clock.value += 2_000;
+			expect(push(WAKE_SCOPES.mentions, 'sam').subscriptions).toHaveLength(1);
+			expect(counter('push', 'user:sam')).toBe(2);
+			for (const expected of [1, 1, 0]) {
+				clock.value += 10_000;
+				expect(push(WAKE_SCOPES.joined, 'sam').subscriptions).toHaveLength(expected);
+			}
+			expect(counter('push_joined_recipient', 'user:mo')).toBe(3);
+			// Mo's mentions keep their own allowance: 2 of 3 spent, the joined pushes none of it (Sam's is spent, so from Tess).
+			clock.value += 2_000;
+			expect(push(WAKE_SCOPES.mentions, 'tess').subscriptions).toHaveLength(1);
+			// The coalescing rows stay until the longer window passes.
+			clock.value += 5_000;
+			store.runCleanup(clock.value);
+			expect(integer(state.storage.sql.exec("SELECT COUNT(*) AS count FROM push_wakes WHERE user_id = 'mo'").one().count)).toBe(1);
+			// /rename moves the joined allowance with the rest.
+			store.renameIdentity({ from: 'mo', to: 'moe', now: clock.value });
+			expect(counter('push_joined_recipient', 'user:moe')).toBe(3);
+			expect(store.accountingStatus().unsafe).toBe(false);
+		});
+	});
+
 	it('moves subscriptions with /rename, push_id kept, and deletes them with /purge', async () => {
 		const keys = await browserKeys();
 		await withStore('push-rename', config, (store, clock, state) => {

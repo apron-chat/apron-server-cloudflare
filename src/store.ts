@@ -802,7 +802,7 @@ const META_PURGED_PREFIX = "purged:";
 const META_BOT_SWEEP = "bot_sweep_ms";
 
 /** The limiter scopes keyed by a registered user (`user:<user_id>`), which `/rename` moves. */
-const USER_LIMIT_SCOPES = ["post", "history", "upload", "push", "push_recipient"] as const;
+const USER_LIMIT_SCOPES = ["post", "history", "upload", "push", "push_recipient", "push_joined_recipient"] as const;
 /**
  * `_meta` key prefix for an admin's `/toggle`: `toggle:<feature>` holds `on`
  * or `off`, and is absent while the feature follows the deployment's default.
@@ -4550,7 +4550,10 @@ export class Store {
    * registered first). Pushes are charged as they are claimed, delivered
    * or not, to the sender's `pushesPerSenderDay`, the recipient's
    * `pushesPerRecipientDay` and the server's `pushesPerDay`; past any of
-   * them, what is left is `skipped`. A sender is charged for a push that
+   * them, what is left is `skipped`. A user pushed only for `joined` is
+   * charged instead to their `joinedPushesPerRecipientDay` and the server's
+   * allowance, not the sender's, and coalesced by `joinedCoalesceSeconds`.
+   * A sender is charged for a push that
    * fails too, so registrations that always fail cannot let one sender
    * spend the server's day. With
    * `allowed`, a registration whose endpoint it refuses (PUSH_HOSTS) is
@@ -4576,7 +4579,7 @@ export class Store {
       const effective = this.effectiveNow(now);
       const day = dayFor(effective);
       const live = effective - policy.pushExpiryDays * 86_400_000;
-      let counters: { server: RawLimitRow; sender: RawLimitRow; sent: number; charged: number } | undefined;
+      let counters: { server: RawLimitRow; sender: RawLimitRow; sent: number; charged: number; chargedBefore: number } | undefined;
       // The rooms a room mute silences this message by: its room and, for a
       // thread, the parent (protocol §4.5), read once a candidate needs it.
       // The same rooms make it a message in a room one joined (`joined`).
@@ -4612,36 +4615,38 @@ export class Store {
           userId, ...rooms, effective,
         );
         if (roomMuted.length) continue;
+        // Pushed only for `joined`: its own window and recipient allowance, and no sender's.
+        const joinedOnly = rows.every((row) => (integerColumn(row.wake) & why) === WAKE_SCOPES.joined);
         const last = this.rawRows<{ woken_ms: number }>("SELECT woken_ms FROM push_wakes WHERE user_id = ? AND room_id = ? LIMIT 1", userId, input.roomId)[0];
-        if (last && effective - integerColumn(last.woken_ms) < policy.coalesceSeconds * 1_000) continue;
+        const window = joinedOnly ? policy.joinedCoalesceSeconds : policy.coalesceSeconds;
+        if (last && effective - integerColumn(last.woken_ms) < window * 1_000) continue;
         // The counters are read once a user is found to wake, so a message
         // that wakes no one writes nothing. Reuse posts_day as the counts; the
         // scope separates them.
         if (!counters) {
           const server = this.limitRow("push", "global", effective);
           const sender = this.limitRow("push", `user:${input.senderId}`, effective);
-          counters = {
-            server, sender, sent: server.day === day ? integerColumn(server.posts_day) : 0,
-            charged: sender.day === day ? integerColumn(sender.posts_day) : 0,
-          };
+          const charged = sender.day === day ? integerColumn(sender.posts_day) : 0;
+          counters = { server, sender, sent: server.day === day ? integerColumn(server.posts_day) : 0, charged, chargedBefore: charged };
         }
+        const recipientScope = joinedOnly ? "push_joined_recipient" : "push_recipient";
         const recipient = this.rawRows<{ day: string; posts_day: number }>(
-          "SELECT day, posts_day FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1", "push_recipient", `user:${userId}`,
+          "SELECT day, posts_day FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1", recipientScope, `user:${userId}`,
         )[0];
         const received = recipient?.day === day ? integerColumn(recipient.posts_day) : 0;
         const allowed = Math.max(0, Math.min(
           rows.length,
           policy.pushesPerDay - counters.sent,
-          policy.pushesPerRecipientDay - received,
-          policy.pushesPerSenderDay - counters.charged,
+          (joinedOnly ? policy.joinedPushesPerRecipientDay : policy.pushesPerRecipientDay) - received,
+          joinedOnly ? Infinity : policy.pushesPerSenderDay - counters.charged,
         ));
         claim.skipped += rows.length - allowed;
         if (!allowed) continue;
         for (const row of rows.slice(0, allowed)) claim.subscriptions.push({ ...pushRecord(row, userId), reasons: integerColumn(row.wake) & why });
         counters.sent += allowed;
-        counters.charged += allowed;
+        if (!joinedOnly) counters.charged += allowed;
         woken += 1;
-        this.updateLimitRow(this.limitRow("push_recipient", `user:${userId}`, effective), { day, posts_day: received + allowed }, effective);
+        this.updateLimitRow(this.limitRow(recipientScope, `user:${userId}`, effective), { day, posts_day: received + allowed }, effective);
         this.rawExec(
           "INSERT INTO push_wakes (user_id, room_id, woken_ms) VALUES (?, ?, ?) ON CONFLICT (user_id, room_id) DO UPDATE SET woken_ms = excluded.woken_ms",
           userId, input.roomId, effective,
@@ -4649,7 +4654,8 @@ export class Store {
       }
       if (counters && woken) {
         this.updateLimitRow(counters.server, { day, posts_day: counters.sent }, effective);
-        this.updateLimitRow(counters.sender, { day, posts_day: counters.charged }, effective);
+        // Untouched when only `joined` pushes went, which no sender is charged for.
+        if (counters.charged !== counters.chargedBefore) this.updateLimitRow(counters.sender, { day, posts_day: counters.charged }, effective);
       }
       return claim;
     }));
@@ -5690,7 +5696,7 @@ export class Store {
     const policy = this.config.push;
     return {
       subscriptions: policy ? effective - policy.pushExpiryDays * 86_400_000 : 0,
-      wakes: effective - (policy ? policy.coalesceSeconds * 1_000 : 0),
+      wakes: effective - (policy ? Math.max(policy.coalesceSeconds, policy.joinedCoalesceSeconds) * 1_000 : 0),
     };
   }
 

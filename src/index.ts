@@ -48,6 +48,7 @@ import {
 	MAX_ROOM_MUTES_PER_USER,
 	ROOM_ID,
 	MAX_USER_EXT_BYTES,
+	JOINED_WAKE_ROLES,
 	MODERATOR_ROLES,
 	clientUserExt,
 	mergeExt,
@@ -3322,15 +3323,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * which the store checks) but an owner's bot, whose identity tier is
 	 * `bot`; `add_members`, adding others to rooms with `room_join` and a
 	 * `user_id`, for an admin and, while `addmember` is on, any other
-	 * registered user not a bot (assertMayManage). Adding one's own bot needs
+	 * registered user not a bot (assertMayManage); `push_joined`, being woken
+	 * by push for wake scope `joined`, where push is on, for a registered user
+	 * holding one of JOINED_WAKE_ROLES but an owner's bot (which the store checks), so clients
+	 * show `joined` as alerting only while open to everyone else. Adding one's own bot needs
 	 * neither. A registered user's is `[]` when they have none, as `roles`
-	 * is, so it clears; guests have none.
+	 * is, so it clears; guests have none. A role change sends them again.
 	 */
 	private permissions(attachment: ConnectionAttachment): string[] | undefined {
 		if (attachment.tier !== "registered") return undefined;
 		return [
 			...(!isBotId(attachment.userId) && MODERATOR_ROLES.some((role) => hasRole(attachment, role)) ? ["move_any"] : []),
 			...(!hasRole(attachment, "bot") && (hasRole(attachment, "admin") || this.addMemberOn()) ? ["add_members"] : []),
+			...(this.config.push && !isBotId(attachment.userId) && JOINED_WAKE_ROLES.some((role) => hasRole(attachment, role)) ? ["push_joined"] : []),
 		];
 	}
 

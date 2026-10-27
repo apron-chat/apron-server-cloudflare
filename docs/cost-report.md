@@ -161,7 +161,7 @@ upper bounds can be compared with the measured worst case.
 | Push reply author lookup | 4 | 1 | 16 | 8 |
 | Push wake claim for a reply (creates the recipient counter) | 17 | 11 | 106 | 160 |
 | Push joined wakers (the moderators who kept `joined`; one range of their partial index, read for every message) | 2 | 1 | 176 | 8 |
-| Push wake claim for `joined` (creates the recipient counter; reads the role and the membership) | 19 | 11 | 106 | 160 |
+| Push wake claim for `joined` (creates its own recipient counter; reads the role and the membership; charges no sender) | 18 | 10 | 106 | 160 |
 | Message create with request ID (the poster's first: creates its limiter rows) | 28 | 31 | 296 | 120 |
 | Empty new message (not logged) | 2 | 1 | 16 | 8 |
 | Deduplicated mutation retry | 2 | 1 | 32 | 16 |
@@ -486,13 +486,17 @@ Every new message reads that index's live range once (Store.joinedWakers:
 whether or not anyone kept it, and adds them as candidates after everyone
 else, so they crowd out no mention, reply or private-room member. The claim
 reads each one's identity row for the role and probes their membership of
-the room and, for a thread, its parent: two rows more than a reply (19/11
-against 17/11), and its reservation grows by 8 rows a candidate (106 for
+the room and, for a thread, its parent, but leaves the sender's counter
+alone: 18/10 against a reply's 17/11, and its reservation grows by 8 rows a candidate (106 for
 one, 1,408 for 32). The pushes are bounded as every other:
-`wakesPerMessage` a message, once per `coalesceSeconds` per user and room,
-and the recipient's, sender's and server's daily allowances, so at most
-1,440 a day per moderator and room before `pushesPerRecipientDay` (100)
-stops them.
+`wakesPerMessage` a message and the server's daily allowance, and those only
+for `joined` by their own: `joinedCoalesceSeconds` (300) per user and room,
+read from the same `push_wakes` row, and `joinedPushesPerRecipientDay` (20),
+a recipient counter that takes the place of the one a push for anything else
+writes. They are charged to no sender, so a claim that pushes only for
+`joined` leaves the sender's counter unwritten (18/10 measured, against
+19/11 when it was charged as any push). The separate allowance adds no row
+to a claim, and one limiter row a day per moderator woken for `joined`.
 
 Cleanup deletes expired registrations (`pushExpiryDays`, 7) and wake times
 past `coalesceSeconds` within its existing batch, by their time indexes.
