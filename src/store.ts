@@ -5240,13 +5240,17 @@ export class Store {
     const before = this.historyBound(query.before, "before");
     const limit = positiveLimit(query.limit, this.config.historyDefaultLimit, this.config.maxHistoryLimit);
     const maxBytes = Math.min(query.maxBytes ?? this.config.maxHistoryResponseBytes, this.config.maxHistoryResponseBytes);
-    // The log queried is these rooms' logs together (§4.3.3): its head is the
-    // greatest of theirs, and its history starts where the earliest of theirs
-    // does, as everything after the retention floor is kept in every room.
-    const head = sources.reduce((greatest, room) => Math.max(greatest, room.latest_log_id), 0);
-    const lowerBound = sources.reduce((least, room) => Math.min(least, roomHistoryFloor(room, floor)), Number.MAX_SAFE_INTEGER);
+    // One room's log starts at its creation or the retention floor. The
+    // joined rooms' log together (§4.3.3) starts where the server's does, at
+    // the default room's creation or the floor, whichever rooms they are, so
+    // its lower bound never moves back with a join, nor ahead with a leave.
+    // Its head is the greatest of theirs; with nothing retrievable, such as
+    // in no rooms, it is empty and ends just before its start.
+    const lowerBound = multiple ? Math.max(floor, this.roomRow(ROOM_ID)?.created_log_id ?? 1) : roomHistoryFloor(sources[0], floor);
+    let head = sources.reduce((greatest, room) => Math.max(greatest, room.latest_log_id), 0);
+    if (multiple && head < lowerBound) head = lowerBound - 1;
     const latestLogId = idString(head);
-    const historyLogId = sources.length && lowerBound <= head ? idString(lowerBound) : null;
+    const historyLogId = lowerBound <= head ? idString(lowerBound) : null;
     // An empty slice has neither bound and omits every array (§4.3.2).
     const empty = (): StoreHistoryResult => ({ more: false, latest_log_id: latestLogId, history_log_id: historyLogId });
     const forward = after !== undefined;

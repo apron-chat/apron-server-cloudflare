@@ -227,5 +227,18 @@ it('pages the log of every joined room without room_id, private ones included, a
 		const newest = (await request(bob.peer, 'newest', 'history', { limit: 1 })).result;
 		expect(ids(newest)).toEqual([mine[2]]);
 		expect(newest.more).toBe(true);
+
+		// The log's lower bound is the server's, whichever rooms Bob is in, so
+		// it never moves (§4.3.3); in no rooms, the log is empty and ends just before it.
+		const start = all.history_log_id as string;
+		expect(start).toBe((await request(bob.peer, 'general-page', 'history', { room_id: 'general', limit: 1 })).result.history_log_id);
+		for (const roomId of ['general', dm]) {
+			await exchange(bob.peer, `leave-${roomId}`, 'room_leave', { room_id: roomId });
+			const page = (await request(bob.peer, `after-leave-${roomId}`, 'history', { limit: 1 })).result;
+			if (roomId === 'general') expect(page.history_log_id).toBe(start);
+			else expect(page).toEqual({ more: false, history_log_id: null, latest_log_id: String(BigInt(start) - 1n) });
+		}
+		await exchange(bob.peer, 'rejoin', 'room_join', { room_id: 'general' });
+		expect((await request(bob.peer, 'rejoined', 'history', { limit: 1 })).result.history_log_id).toBe(start);
 	} finally { ada.peer.close(); bob.peer.close(); carol.peer.close(); }
 });
