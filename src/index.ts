@@ -7,6 +7,7 @@ import { AccountUsageMonitor } from "./account-usage";
 import { EDGE_STOP_RULE_REF, readEdgeStop, runBudgetGuard, watchForFlood } from "./budget-guard";
 import { AUDIO_TYPES, sniffAudio } from "./audio";
 import { IMAGE_TYPES, sniffImage } from "./image";
+import { isEmojiKey, MAX_EMOJI_NAME_CHARS } from "./emoji";
 import { limitData } from "./store-error";
 import { signUploadToken, verifyUploadToken } from "./upload-token";
 import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
@@ -62,6 +63,7 @@ import {
 	seenStands,
 	type Broadcast,
 	type ClaimedPush,
+	type EmojiDraft,
 	type MessageSnapshot,
 	type PushCandidate,
 	type RoomRecord,
@@ -431,6 +433,7 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
 	{ name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", audience: "admins" },
 	{ name: "invite", usage: "/invite <uses>", help: `get a token that signs up to <uses> new users (at most ${MAX_JOIN_USES}) for a week, replacing the last one; /invite 0 revokes it`, audience: "admins" },
+	{ name: "emoji", usage: "/emoji add|remove :name:", help: "add a custom emoji, or replace its image: send /emoji add :name: with one image attached; /emoji remove :name: removes it", audience: "admins" },
 	{ name: "toggle", usage: "/toggle <activity|uploads|presence|addmember>", help: "turn typing activity, uploads, user status (presence), or users adding others to rooms (addmember) off or on for everyone", audience: "admins" },
 	{ name: "purge", usage: "/purge <user_id>", help: "disconnect a user and delete their account, bot, and everything they posted or uploaded", audience: "admins" },
 	{ name: "status", usage: "/status", help: "show today's Cloudflare usage and the demo's budgets", audience: "admins" },
@@ -1167,7 +1170,7 @@ export async function fetchEntry(request: Request, env: Env, ctx?: ExecutionCont
  * `PUT /w/<token>`: a `write_url` (§4.8.3). The token's signature is checked
  * before the body is read, the Durable Object claims the upload so a URL
  * writes once, and the bytes must be a PNG, JPEG, GIF, or WebP image, or for
- * an attachment (not an avatar) WebM, Ogg, or MP4 audio, within the token's
+ * an attachment (not an avatar or custom emoji) WebM, Ogg, or MP4 audio, within the token's
  * size. The object is stored in R2 with the type its bytes
  * show, then the Durable Object finishes the write; one it no longer wants
  * is deleted again.
@@ -1194,6 +1197,14 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 	if (!uploads || !media || !env.DEMO) return answer(404, "Not found");
 	const grant = await verifyUploadToken(uploads.signingKey, token);
 	if (!grant) return answer(403, "This write_url is not valid or has expired");
+	// The write's declared type, where it has one, must be one the server
+	// keeps (extension `ext:media`); what is kept is typed from its bytes.
+	const attachment = grant.key.startsWith("f/");
+	const emoji = grant.key.startsWith("e/");
+	const kept: readonly string[] = attachment ? [...IMAGE_TYPES, ...AUDIO_TYPES] : IMAGE_TYPES;
+	const refusal = attachment ? "Only PNG, JPEG, GIF, and WebP images and WebM, Ogg, and MP4 audio can be uploaded" : `Only PNG, JPEG, GIF, and WebP images can be ${emoji ? "custom emoji" : "avatars"}`;
+	const declared = request.headers.get("Content-Type")?.split(";")[0].trim().toLowerCase();
+	if (declared && !kept.includes(declared)) return answer(415, refusal);
 	const length = Number(request.headers.get("Content-Length") ?? NaN);
 	if (!Number.isSafeInteger(length) || length <= 0) return answer(411, "Content-Length is required");
 	if (length > grant.maxBytes) return answer(413, `An upload here is at most ${grant.maxBytes} bytes`);
@@ -1216,15 +1227,15 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 		return fail(400, "The upload was interrupted");
 	}
 	if (body.byteLength !== length || body.byteLength > grant.maxBytes) return fail(400, "The body does not match its Content-Length");
-	const attachment = grant.key.startsWith("f/");
 	const sniffed = sniffImage(body) ?? (attachment ? sniffAudio(body) : null);
-	if (!sniffed) return fail(415, attachment ? "Only PNG, JPEG, GIF, and WebP images and WebM, Ogg, and MP4 audio can be uploaded" : "Only PNG, JPEG, GIF, and WebP images can be avatars");
+	if (!sniffed) return fail(415, refusal);
 	try {
 		await media.put(grant.key, body, {
 			httpMetadata: {
 				contentType: sniffed.type,
-				// Attachments never change; an avatar key is rewritten when refreshed.
-				cacheControl: attachment ? "public, max-age=604800, immutable" : "public, max-age=86400",
+				// Attachments and custom emoji never change; an avatar key is
+				// rewritten when refreshed. Custom emoji live until removed.
+				cacheControl: attachment ? "public, max-age=604800, immutable" : emoji ? "public, max-age=31536000, immutable" : "public, max-age=86400",
 			},
 		});
 	} catch {
@@ -1656,6 +1667,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private serverAnnouncement(origin: string | null): Record<string, unknown> {
 		const limits = this.config.limits;
 		const presence = this.presenceMode();
+		const emoji = this.emojiCatalogUrl();
 		return {
 			method: "server",
 			params: {
@@ -1680,6 +1692,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 					"ext:settings", "ext:limits",
 					...(this.config.uploads ? ["ext:media"] : []),
 					"ext:permissions",
+					// Custom emoji (ext:emoji), once an admin has added one.
+					...(emoji ? ["ext:emoji"] : []),
 				],
 				// Passkeys and their session tokens only where passkeys are offered;
 				// bot tokens (`/invite-bot`) from anywhere, since bots are not browsers.
@@ -1713,16 +1727,21 @@ export class ApronDemoServer extends DurableObject<Env> {
 				ext: {
 					settings: { read_cursors: this.activityOn(), private_rooms: this.config.limits.privateMembershipsPerUser },
 					...(this.config.uploads ? { media: this.mediaSettings(this.config.uploads) } : {}),
+					// Extension `ext:emoji`: where clients fetch the catalog, which
+					// changes with it (publishEmoji).
+					...(emoji ? { emoji: { catalog_url: emoji } } : {}),
 				},
 			},
 		};
 	}
 
 	/**
-	 * Extension `ext:media`, from apron-web's EXT.md: the origin uploads are
-	 * served from, where it is not this server's own, and while uploads are
-	 * on, the types a write keeps (sniffImage and, for attachments,
-	 * sniffAudio), each with its largest size. No image side is limited.
+	 * Extension `ext:media` (EXTENSIONS.md): the origin uploads are served
+	 * from, where it is not this server's own, and while uploads are on, the
+	 * types a write keeps (sniffImage and, for attachments, sniffAudio), each
+	 * with its largest size, for attachments, avatars, and this server's
+	 * `emoji` (`/emoji add`). No `max_side` is sent: images are kept as
+	 * written, never scaled.
 	 */
 	private mediaSettings(uploads: NonNullable<RuntimeConfig["uploads"]>): Record<string, unknown> {
 		const sized = (types: readonly string[], maxBytes: number) => Object.fromEntries(types.map((type) => [type, { max_bytes: maxBytes }]));
@@ -1731,8 +1750,23 @@ export class ApronDemoServer extends DurableObject<Env> {
 			...(this.uploadsOn() && UPLOAD_POLICY ? {
 				upload: sized([...IMAGE_TYPES, ...AUDIO_TYPES], UPLOAD_POLICY.maxFileBytes),
 				avatar: sized(IMAGE_TYPES, UPLOAD_POLICY.maxAvatarBytes),
+				emoji: sized(IMAGE_TYPES, UPLOAD_POLICY.maxEmojiBytes),
 			} : {}),
 		};
+	}
+
+	/**
+	 * The custom emoji catalog's URL (extension `ext:emoji`), where uploads
+	 * are configured and the catalog has an emoji; undefined too when its
+	 * one read after a wake cannot be afforded.
+	 */
+	private emojiCatalogUrl(): string | undefined {
+		if (!this.config.uploads) return undefined;
+		try {
+			return this.store.emojiCatalog(nowMs())?.url;
+		} catch {
+			return undefined;
+		}
 	}
 
 	/** Whether this origin is offered passkeys (§4.10) and their session tokens. */
@@ -4705,6 +4739,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await this.startAvatar(socket, attachment, request, body);
 			return;
 		}
+		if (command.name === "emoji") {
+			try {
+				await this.emojiCommand(socket, attachment, request, roomId, words.slice(1), body);
+			} catch (error) {
+				const protocol = errorToProtocol(error);
+				if (protocol.name !== "invalid_params") throw error;
+				this.fail(socket, request, protocol);
+			}
+			return;
+		}
 		if (command.name === "passkeys") {
 			try {
 				this.passkeysCommand(socket, attachment, request, roomId, words.slice(1));
@@ -4761,9 +4805,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.reply(socket, request, {});
 	}
 
-	/** The commands this deployment offers: `/avatar` only while uploads are on. */
+	/** The commands this deployment offers: `/avatar` only while uploads are on, and `/emoji` where they are configured. */
 	private commands(): typeof COMMANDS {
-		return this.uploadsOn() ? COMMANDS : COMMANDS.filter((command) => command.name !== "avatar");
+		return COMMANDS.filter((command) => (command.name !== "avatar" || this.uploadsOn()) && (command.name !== "emoji" || !!this.config.uploads));
 	}
 
 	/** An admin's `/toggle` of a feature, read once and then kept in memory with every change. */
@@ -4924,6 +4968,95 @@ export class ApronDemoServer extends DurableObject<Env> {
 			started = this.afterUploads({ uploads: [upload] });
 		});
 		if (started) await this.rescheduleAlarm();
+	}
+
+	/**
+	 * `/emoji add :name:` with one `upload` embed, and `/emoji remove :name:`
+	 * (extension `ext:emoji`, its suggested convention), for admins. An add's
+	 * result carries the embed's `write_url`, and the image becomes the key's
+	 * when the write finishes (finishEmoji), replacing an image the key had.
+	 * A removal answers with a `~private` notice before the result (§1). Either
+	 * change publishes a new catalog (publishEmoji).
+	 */
+	private async emojiCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, args: string[], body: Record<string, unknown>): Promise<void> {
+		if (args.length !== 2 || (args[0] !== "add" && args[0] !== "remove")) {
+			throw { name: "invalid_params", message: "Usage: /emoji add :name: with one image attached, or /emoji remove :name:" } satisfies ProtocolError;
+		}
+		const key = args[1];
+		if (!isEmojiKey(key) || key.length - 2 > MAX_EMOJI_NAME_CHARS) {
+			throw { name: "invalid_params", message: `A custom emoji is written :name:, with a name of 1 to ${MAX_EMOJI_NAME_CHARS} letters, digits, _, + or -` } satisfies ProtocolError;
+		}
+		if (args[0] === "add") {
+			const embeds = body.embeds;
+			const attached = Array.isArray(embeds) && embeds.length === 1 && !!embeds[0] && typeof embeds[0] === "object" && (embeds[0] as Record<string, unknown>).kind === "upload";
+			if (!attached) throw { name: "invalid_params", message: `Attach one image to /emoji add ${key} as an upload embed` } satisfies ProtocolError;
+			let started = false;
+			await this.runMutation(async () => {
+				const upload = this.store.startEmojiUpload({ userId: attachment.userId!, key, now: nowMs() });
+				this.reply(socket, request, await this.withWriteUrls({ embeds: [uploadResultEmbed(upload)] }));
+				started = this.afterUploads({ uploads: [upload] });
+			});
+			if (started) await this.rescheduleAlarm();
+			return;
+		}
+		let outcome: "removed" | "unknown" | "failed" = "unknown";
+		await this.runMutation(async () => {
+			const draft = this.store.emojiDraft({ remove: key }, nowMs());
+			if (draft) outcome = await this.publishEmoji(draft) ? "removed" : "failed";
+		});
+		if (outcome === "unknown") throw { name: "invalid_params", message: `${key} is not a custom emoji here` } satisfies ProtocolError;
+		if (outcome === "failed") throw { name: "retry_after", message: "Storage is unavailable; try again", data: { retry_after: 10 } } satisfies ProtocolError;
+		this.sendNotice(socket, roomId, `Removed the custom emoji \`${key}\`.`);
+		this.reply(socket, request, {});
+	}
+
+	/**
+	 * Makes an emoji edit's catalog current (extension `ext:emoji`), inside
+	 * runMutation so no other edit interleaves: its JSON is written to R2
+	 * first, at a key named by its hash, so `catalog_url` never refers to a
+	 * missing object; then the edit commits (Store.commitEmoji), the images
+	 * and the catalog it releases are deleted, and every connection gets a
+	 * new `server` frame with the new `catalog_url` (announceServer). Returns
+	 * whether it applied.
+	 */
+	private async publishEmoji(draft: EmojiDraft): Promise<boolean> {
+		const media = this.runtimeEnv.MEDIA;
+		if (!media) return false;
+		if (draft.key) {
+			try {
+				await media.put(draft.key, draft.json, { httpMetadata: { contentType: "application/json", cacheControl: "public, max-age=31536000, immutable" } });
+			} catch {
+				return false;
+			}
+		}
+		// A draft that no longer applies leaves its JSON in R2: the catalog it
+		// was made from cannot change meanwhile, so it does not happen.
+		const committed = this.store.commitEmoji(draft, nowMs());
+		if (!committed.applied) return false;
+		this.deleteMedia(committed.deletedUploads);
+		this.announceServer();
+		return true;
+	}
+
+	/**
+	 * Sends every open connection a new `server` frame (§3.1), which fully
+	 * replaces the one it had: after the custom emoji catalog changed. One
+	 * frame is built for each origin, since the frame depends on it.
+	 */
+	private announceServer(): void {
+		const frames = new Map<string, Record<string, unknown>>();
+		for (const ws of this.ctx.getWebSockets()) {
+			const socket = ws as WebSocketConnection;
+			const state = connectionAttachment(socket);
+			if (!state || state.closing) continue;
+			const origin = state.origin ?? null;
+			let frame = frames.get(origin ?? "");
+			if (!frame) {
+				frame = this.serverAnnouncement(origin);
+				frames.set(origin ?? "", frame);
+			}
+			this.send(socket, frame);
+		}
 	}
 
 	/**
@@ -5971,6 +6104,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	async finishUpload(write: UploadWrite): Promise<boolean> {
 		if (!this.config.uploads) return false;
+		if (write.key.startsWith("e/")) return this.finishEmoji(write);
 		let finished: UploadFinish = { accepted: false, broadcasts: [], deletedUploads: [] };
 		await this.runMutation(async () => {
 			finished = this.store.finishUpload(write, nowMs());
@@ -5979,6 +6113,24 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.deleteMedia(finished.deletedUploads);
 		if (finished.avatar) this.announceAvatar(finished.avatar.userId, finished.avatar.url);
 		return finished.accepted;
+	}
+
+	/**
+	 * A finished custom emoji write (`/emoji add`): the image becomes its
+	 * key's in a new catalog (publishEmoji). One that cannot, such as one
+	 * that came too late, is not an image, or found R2 unavailable for the
+	 * catalog, is released, and the Worker deletes what it stored.
+	 */
+	private async finishEmoji(write: UploadWrite): Promise<boolean> {
+		let accepted = false;
+		let released: string[] = [];
+		await this.runMutation(async () => {
+			const draft = this.store.emojiDraft({ add: write }, nowMs());
+			accepted = !!draft && await this.publishEmoji(draft);
+			if (!accepted) released = this.store.finishUpload({ key: write.key, ok: false }, nowMs()).deletedUploads;
+		});
+		this.deleteMedia(released);
+		return accepted;
 	}
 
 	/**

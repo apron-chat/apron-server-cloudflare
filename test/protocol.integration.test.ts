@@ -1,6 +1,7 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { expect, it, vi } from 'vitest';
 import { DEFAULT_LIMITS, UPLOAD_POLICY } from '../src/budget';
+import { DEFAULT_SERVER_DESCRIPTION } from '../src/config';
 import { canonicalizeIp, hashIpKey } from '../src/ip';
 import { connect as open, exchange, greeting, reply, request, until, type ConnectOptions, type Frame, type Peer } from './helpers/socket';
 
@@ -55,7 +56,10 @@ async function authenticate(peer: Peer, scheme = 'guest', extraCaps: string[] = 
 	expect(auth.result.you.user_id).toMatch(/^guest_/);
 	// `you` carries the user's own `status` (§4.5), which recorded objects such as `from` never do.
 	expect(auth.result.you.status).toBe('online');
-	const { status: _status, ...identity } = auth.result.you;
+	// So does what the user may do (ext:permissions): vitest.config.ts lets
+	// guests post, so every key takes its default.
+	expect(auth.result.you.ext).toEqual({ permissions: {} });
+	const { status: _status, ext: _ext, ...identity } = auth.result.you;
 	return identity;
 }
 
@@ -936,17 +940,20 @@ it('advertises the extensions ext:settings, ext:limits, ext:media and ext:permis
 		expect(server.capabilities).toContain('ext:limits');
 		expect(server.capabilities).toContain('ext:media');
 		expect(server.capabilities).toContain('ext:permissions');
+		// No custom emoji yet: ext:emoji waits for the first (uploads.integration.test.ts).
+		expect(server.capabilities).not.toContain('ext:emoji');
+		// What the server is (§3.1): RP_NAME and the demo's description, without an avatar by default.
+		expect(server.title).toBe('Apron Demo');
+		expect(server.description).toBe(DEFAULT_SERVER_DESCRIPTION);
+		expect(server).not.toHaveProperty('avatar');
 		const file = { max_bytes: UPLOAD_POLICY!.maxFileBytes };
 		const avatar = { max_bytes: UPLOAD_POLICY!.maxAvatarBytes };
+		const emoji = { max_bytes: UPLOAD_POLICY!.maxEmojiBytes };
 		expect(server.ext).toEqual({
-			// Each boolean always sent; clients take an absent one as true.
 			settings: {
-				// vitest.config.ts turns guest posting on.
-				guest_posting: true,
+				// Typing is off in vitest.config.ts, and read cursors with it.
 				read_cursors: false,
-				// No admin has turned `/toggle addmember` off.
-				add_members: true,
-				// A number, not a boolean: the most private rooms one user may be in.
+				// The most private rooms one user may be in.
 				private_rooms: DEFAULT_LIMITS.privateMembershipsPerUser,
 			},
 			// MEDIA_ORIGIN is not PUBLIC_ORIGIN, and every type the write keeps, exactly.
@@ -954,6 +961,8 @@ it('advertises the extensions ext:settings, ext:limits, ext:media and ext:permis
 				origins: ['https://media.test'],
 				upload: { 'image/png': file, 'image/jpeg': file, 'image/gif': file, 'image/webp': file, 'audio/webm': file, 'audio/ogg': file, 'audio/mp4': file },
 				avatar: { 'image/png': avatar, 'image/jpeg': avatar, 'image/gif': avatar, 'image/webp': avatar },
+				// This server's own: images for /emoji add (ext:emoji).
+				emoji: { 'image/png': emoji, 'image/jpeg': emoji, 'image/gif': emoji, 'image/webp': emoji },
 			},
 		});
 	} finally { peer.close(); }
@@ -1058,7 +1067,9 @@ it('finishes auth before later frames: pipelined requests run as the new identit
 		expect(rooms.id).toBe('rooms');
 		expect(ids(rooms.result.joined)).toEqual(['general']);
 		expect(rooms.result.joined[0].members).toEqual(expect.arrayContaining([{ user_id: auth.result.you.user_id }]));
-		expect(rooms.result.users).toEqual(expect.arrayContaining([auth.result.you]));
+		// Others see the guest without its own permissions (ext:permissions).
+		const { ext: _ext, ...shown } = auth.result.you;
+		expect(rooms.result.users).toEqual(expect.arrayContaining([shown]));
 		const history = await peer.next();
 		expect(history.id).toBe('history');
 		expect(history.result.latest_log_id).toMatch(/^[1-9][0-9]*$/);

@@ -41,6 +41,7 @@ import { isProtocolId, type StoredCredential, type StoredIdentity } from "./doma
 // @ts-expect-error Workers' nodejs_compat runtime supplies this module; the
 // worker type package intentionally omits Node's full module declarations.
 import { createHash } from "node:crypto";
+import { emojiIdentity, isEmojiKey, qualifyEmoji } from "./emoji";
 
 /** The seeded, permanent top-level room. */
 export const ROOM_ID = "general";
@@ -255,7 +256,7 @@ interface StoreUploadConfig extends UploadPolicy {
 
 /** An upload waiting for its write (protocol §4.8.3): what its `write_url` signs. */
 interface PendingUpload {
-  /** The R2 object key: `f/<id>` for an attached file, `a/<id>` for an avatar. */
+  /** The R2 object key: `f/<id>` for an attached file, `a/<id>` for an avatar, `e/<id>` for a custom emoji. */
   key: string;
   purpose: UploadPurpose;
   embedId: string;
@@ -263,7 +264,30 @@ interface PendingUpload {
   writeExpiresMs: number;
 }
 
-type UploadPurpose = "file" | "avatar";
+type UploadPurpose = "file" | "avatar" | "emoji";
+
+/** One custom emoji in the catalog (extension `ext:emoji`), as published. */
+export interface EmojiEntry {
+  url: string;
+  width?: number;
+  height?: number;
+}
+
+/** A catalog edit: a finished `/emoji add` write, or `/emoji remove`. */
+export type EmojiEdit = { add: UploadWrite } | { remove: string };
+
+/**
+ * The catalog an emoji edit leads to, worked out before anything changes
+ * (emojiDraft): its JSON, exactly as published, and the R2 key the caller
+ * writes it to before commitEmoji, or null for an empty catalog, which is
+ * not published.
+ */
+export interface EmojiDraft {
+  edit: EmojiEdit;
+  json: string;
+  key: string | null;
+  entries: Record<string, EmojiEntry>;
+}
 
 /** What finishUpload did: the snapshot to broadcast, or the avatar set, and R2 objects to delete. */
 export interface UploadFinish {
@@ -817,6 +841,29 @@ const META_TOGGLE_PREFIX = "toggle:";
 const META_PRESENCE_ON = "presence_on_ms";
 /** Bytes all live uploads hold, pending writes at their largest (see startUpload). */
 const META_UPLOAD_BYTES = "upload_bytes";
+/**
+ * `_meta` key: the custom emoji catalog (extension `ext:emoji`), the JSON
+ * object exactly as published, absent while it is empty. Its R2 key, and
+ * so `catalog_url`, is `e/c/<SHA-256 of the JSON>.json` (emojiObjectKey).
+ */
+const META_EMOJI_CATALOG = "emoji_catalog";
+/**
+ * `_meta` key: the R2 key of the catalog the current one replaced, kept so
+ * that clients that just read the old `catalog_url` can still fetch it, and
+ * deleted at the next change.
+ */
+const META_EMOJI_PREVIOUS = "emoji_catalog_previous";
+/**
+ * The owner of custom emoji uploads: the server, not the admin who added
+ * one, so `/purge` and `/rename` of that admin leave the catalog alone. No
+ * user can hold an id starting with `~`.
+ */
+const EMOJI_OWNER = "~emoji";
+
+/** The R2 key a catalog's JSON is published at: named by its SHA-256, so a new catalog has a new `catalog_url`. */
+function emojiObjectKey(json: string): string {
+  return `e/c/${createHash("sha256").update(json).digest("hex")}.json`;
+}
 /**
  * How long past its write window a pending upload may still finish: the write
  * started in time and is still arriving. Expiry waits this long too.
@@ -1614,6 +1661,12 @@ export class Store {
   private memberGeneration = 0;
   /** Member listings kept for reuse, by room (roomMembers, `memberCacheMs`). */
   private readonly memberCache = new Map<string, MemberCacheEntry>();
+  /**
+   * The custom emoji catalog (META_EMOJI_CATALOG), read on first need after
+   * a wake (one row) and replaced on every edit, so a reaction's key is
+   * checked against it with no read.
+   */
+  private emojiCache: { key: string | null; json: string; entries: Record<string, EmojiEntry>; keys: ReadonlySet<string> } | null = null;
   /** The rooms one roomMembers call read, when nothing is kept. */
   private readonly uncachedMembers = new Map<string, MemberCacheEntry>();
 
@@ -1986,6 +2039,7 @@ export class Store {
     await deleteAll.call(this.durableStorage);
     this.memberGeneration += 1;
     this.memberCache.clear();
+    this.emojiCache = null;
     this.initialized = false;
     this.logCache = null;
     this.accountingUnsafe = false;
@@ -4255,12 +4309,12 @@ export class Store {
    * (claimUpload), so uploads started and never written cannot close
    * uploads for everyone.
    */
-  private startUpload(purpose: UploadPurpose, userId: string, now: number, link: { messageId?: string; embedId: string }): PendingUpload {
+  private startUpload(purpose: UploadPurpose, userId: string, now: number, link: { messageId?: string; embedId: string }, owner = userId): PendingUpload {
     const policy = this.config.uploads;
     if (!policy) throw new StoreError("unsupported", "Uploads are not available here");
     if (!this.identityRow(userId)) throw new StoreError("denied", "Sign in with a passkey to upload");
     if (this.metaValue(META_TOGGLE_PREFIX + "uploads") === "off") throw new StoreError("denied", "Uploads are turned off here");
-    const maxBytes = purpose === "file" ? policy.maxFileBytes : policy.maxAvatarBytes;
+    const maxBytes = purpose === "file" ? policy.maxFileBytes : purpose === "emoji" ? policy.maxEmojiBytes : policy.maxAvatarBytes;
     const day = dayFor(now);
     const rows = [this.limitRow("upload", `user:${userId}`, now), this.limitRow("upload", "global", now)];
     const counts = rows.map((row) => (row.day === day ? row.uploads_day : 0));
@@ -4273,13 +4327,14 @@ export class Store {
     }
     this.updateLimitRow(rows[0], { day, uploads_day: counts[0] + 1 }, now);
     this.setUploadBytes(stored + maxBytes);
-    const key = `${purpose === "file" ? "f" : "a"}/${randomKey()}`;
+    const key = `${purpose === "file" ? "f" : purpose === "emoji" ? "e" : "a"}/${randomKey()}`;
     const writeExpiresMs = now + policy.writeWindowSeconds * 1_000;
-    const retentionMs = (purpose === "file" ? policy.fileRetentionSeconds : policy.avatarRetentionSeconds) * 1_000;
+    // Custom emoji never expire: they go when an admin removes them.
+    const expiresMs = purpose === "emoji" ? Number.MAX_SAFE_INTEGER : now + (purpose === "file" ? policy.fileRetentionSeconds : policy.avatarRetentionSeconds) * 1_000;
     this.rawExec(
       `INSERT INTO uploads (upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms, created_ms)
        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
-      key, userId, purpose, link.messageId ?? null, link.embedId, maxBytes, writeExpiresMs, now + retentionMs, now,
+      key, owner, purpose, link.messageId ?? null, link.embedId, maxBytes, writeExpiresMs, expiresMs, now,
     );
     return { key, purpose, embedId: link.embedId, maxBytes, writeExpiresMs };
   }
@@ -4378,6 +4433,140 @@ export class Store {
   }
 
   /**
+   * Starts a custom emoji upload (extension `ext:emoji`): `/emoji add
+   * :name:` with one `upload` embed, by an admin. The upload row keeps the
+   * key in `message_id`, and is the server's (EMOJI_OWNER); it counts
+   * against the admin's and the server's daily uploads and the stored-bytes
+   * cap like any other. The catalog changes when the write finishes
+   * (emojiDraft, commitEmoji). A new key past `maxEmoji` is `denied`.
+   */
+  startEmojiUpload(input: { userId: string; key: string; now?: number }): PendingUpload {
+    this.ensureReady();
+    const now = input.now ?? this.clock.now();
+    return this.reserved({ reads: 32, writes: UPLOAD_WRITES + 8 }, false, now, () => this.transaction(() => {
+      const effective = this.effectiveNow(now);
+      const catalog = this.loadEmojiCatalog();
+      const most = this.config.uploads?.maxEmoji ?? 0;
+      if (!catalog.keys.has(input.key) && catalog.keys.size >= most) throw new StoreError("denied", `This server keeps at most ${most} custom emoji; remove one first`);
+      return this.startUpload("emoji", input.userId, effective, { messageId: input.key, embedId: `embed_${randomKey()}` }, EMOJI_OWNER);
+    }));
+  }
+
+  /**
+   * The custom emoji catalog (extension `ext:emoji`): its `catalog_url` on
+   * the media origin and its keys, or null while it is empty or uploads are
+   * not configured. Read once after a wake (one row), then kept in memory.
+   */
+  emojiCatalog(now = this.clock.now()): { url: string; keys: ReadonlySet<string> } | null {
+    this.ensureReady();
+    const origin = this.config.uploads?.mediaOrigin;
+    if (!origin) return null;
+    const catalog = this.emojiCache ?? this.reserved({ reads: 4 }, false, now, () => this.loadEmojiCatalog());
+    return catalog.key ? { url: `${origin}/${catalog.key}`, keys: catalog.keys } : null;
+  }
+
+  /** The cached catalog, read from META_EMOJI_CATALOG on first need; the caller holds a reservation. */
+  private loadEmojiCatalog(): NonNullable<Store["emojiCache"]> {
+    if (this.emojiCache) return this.emojiCache;
+    const json = this.metaValue(META_EMOJI_CATALOG);
+    const parsed = json ? parseJson<unknown>(json, null) : null;
+    const entries = isPlainObject(parsed) ? parsed as Record<string, EmojiEntry> : {};
+    this.emojiCache = this.emojiCacheFor(Object.keys(entries).length ? json : "", entries);
+    return this.emojiCache;
+  }
+
+  private emojiCacheFor(json: string, entries: Record<string, EmojiEntry>): NonNullable<Store["emojiCache"]> {
+    return { key: json ? emojiObjectKey(json) : null, json, entries, keys: new Set(Object.keys(entries)) };
+  }
+
+  /**
+   * The catalog an edit leads to, changing nothing, so the caller can
+   * publish it to R2 before commitEmoji makes it current: with an added
+   * key's entry (its image's `url`, and `width` and `height` where the
+   * write found them), or without a removed one. Null when the edit cannot
+   * apply: a write that is not an emoji's, failed, came too late or is not
+   * an image, or a new key past `maxEmoji` (finishUpload then releases
+   * it), or a removed key the catalog lacks.
+   */
+  emojiDraft(edit: EmojiEdit, now = this.clock.now()): EmojiDraft | null {
+    this.ensureReady();
+    const origin = this.config.uploads?.mediaOrigin;
+    if (!origin) return null;
+    return this.reserved({ reads: 16 }, false, now, () => {
+      const catalog = this.loadEmojiCatalog();
+      let entries: Record<string, EmojiEntry>;
+      if ("add" in edit) {
+        const write = edit.add;
+        const row = this.uploadRow(write.key);
+        if (!row || row.purpose !== "emoji" || !row.message_id || !this.emojiWriteAccepted(row, write, this.effectiveNow(now))) return null;
+        if (!catalog.keys.has(row.message_id) && catalog.keys.size >= (this.config.uploads?.maxEmoji ?? 0)) return null;
+        const entry: EmojiEntry = { url: `${origin}/${row.upload_key}`, ...(write.width && write.height ? { width: write.width, height: write.height } : {}) };
+        entries = { ...catalog.entries, [row.message_id]: entry };
+      } else {
+        if (!catalog.keys.has(edit.remove)) return null;
+        entries = Object.fromEntries(Object.entries(catalog.entries).filter(([key]) => key !== edit.remove));
+      }
+      const json = Object.keys(entries).length ? JSON.stringify(entries) : "";
+      return { edit, json, key: json ? emojiObjectKey(json) : null, entries };
+    });
+  }
+
+  /** Whether a finished write may become a custom emoji: still writing, in time, an image within its size. */
+  private emojiWriteAccepted(row: RawUploadRow, write: UploadWrite, now: number): boolean {
+    return row.state === "writing" && now <= row.write_expires_ms + UPLOAD_WRITE_GRACE_MS &&
+      write.ok && typeof write.bytes === "number" && write.bytes > 0 && write.bytes <= row.bytes && !!write.contentType?.startsWith("image/");
+  }
+
+  /**
+   * Makes a draft's catalog current, in one transaction with the edit: an
+   * added key's upload is done, and the image it replaces released; a
+   * removed key's image is released. The catalog before this one becomes
+   * the previous (META_EMOJI_PREVIOUS), and the one before that is
+   * released. Returns whether it applied (a draft whose catalog changed
+   * meanwhile, or whose write is no longer acceptable, does not), and the
+   * R2 objects the caller deletes.
+   */
+  commitEmoji(draft: EmojiDraft, now = this.clock.now()): { applied: boolean; deletedUploads: string[] } {
+    this.ensureReady();
+    const most = this.config.uploads?.maxEmoji ?? 0;
+    const result = this.reserved({ reads: 64, writes: 64 + UPLOAD_WRITES }, false, now, () => this.transaction(() => {
+      const effective = this.effectiveNow(now);
+      const before = this.loadEmojiCatalog();
+      // Everything is checked before anything is written.
+      const write = "add" in draft.edit ? draft.edit.add : null;
+      const row = write ? this.uploadRow(write.key) : null;
+      const name = row ? row.message_id : "remove" in draft.edit ? draft.edit.remove : null;
+      if (!name || (write && (!row || row.purpose !== "emoji" || !this.emojiWriteAccepted(row, write, effective)))) return null;
+      if (row && draft.entries[name]?.url !== `${this.config.uploads?.mediaOrigin}/${row.upload_key}`) return null;
+      if (row && !before.keys.has(name) && before.keys.size >= most) return null;
+      // The draft must have been made from the catalog as it still is.
+      const expected: Record<string, EmojiEntry> = { ...before.entries };
+      if (row) expected[name] = draft.entries[name];
+      else delete expected[name];
+      if (JSON.stringify(expected) !== (draft.json || "{}")) return null;
+      if (row) this.completeUploadRow(row, write!.bytes!);
+      const replaced = this.rawRows<RawUploadRow>(
+        `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
+         FROM uploads INDEXED BY uploads_message_idx WHERE message_id = ? AND purpose = 'emoji' AND state = 'done' LIMIT 8`,
+        name,
+      ).filter((candidate) => candidate.upload_key !== row?.upload_key);
+      const deletedUploads = this.releaseUploadRows(replaced);
+      if (draft.json) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_EMOJI_CATALOG, draft.json);
+      else this.rawExec("DELETE FROM _meta WHERE key = ?", META_EMOJI_CATALOG);
+      // The catalog before this one stays until the next change; the one
+      // before that goes now.
+      const previous = this.metaValue(META_EMOJI_PREVIOUS);
+      if (previous && previous !== draft.key && previous !== before.key) deletedUploads.push(previous);
+      if (before.key && before.key !== draft.key) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_EMOJI_PREVIOUS, before.key);
+      else if (previous) this.rawExec("DELETE FROM _meta WHERE key = ?", META_EMOJI_PREVIOUS);
+      return deletedUploads;
+    }));
+    if (!result) return { applied: false, deletedUploads: [] };
+    this.emojiCache = this.emojiCacheFor(draft.json, draft.entries);
+    return { applied: true, deletedUploads: result };
+  }
+
+  /**
    * Finishes a write exactly once (protocol §4.8.3). A file's message gets a
    * new snapshot, with the embed completed (`url`, and `og.image` or, for a
    * voice clip, `og.audio` describing it) or, for a failed write, without it; an avatar becomes its owner's.
@@ -4426,6 +4615,9 @@ export class Store {
   private completeUpload(row: RawUploadRow, write: UploadWrite, now: number): UploadFinish {
     const ok = write.ok && typeof write.bytes === "number" && write.bytes > 0 && write.bytes <= row.bytes && !!write.contentType;
     const url = `${this.config.uploads?.mediaOrigin ?? ""}/${row.upload_key}`;
+    // A custom emoji's write is accepted only through emojiDraft and
+    // commitEmoji, which publish the catalog first; here it fails.
+    if (row.purpose === "emoji") return { accepted: false, broadcasts: [], deletedUploads: this.releaseUploadRows([row]) };
     if (row.purpose === "avatar") {
       const identity = this.identityRow(row.owner_id);
       if (!ok || !identity || !write.contentType!.startsWith("image/")) return { accepted: false, broadcasts: [], deletedUploads: this.releaseUploadRows([row]) };

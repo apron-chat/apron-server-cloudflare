@@ -4,14 +4,14 @@
 // a byte, so a guessed or altered URL never reaches R2 or the Durable Object.
 
 interface UploadGrant {
-	/** The R2 object key, `f/<id>` or `a/<id>`. */
+	/** The R2 object key, `f/<id>`, `a/<id>`, or `e/<id>` for a custom emoji. */
 	key: string;
 	maxBytes: number;
 	expiresMs: number;
 }
 
 const encoder = new TextEncoder();
-const KEY_PATTERN = /^[fa]\/[A-Za-z0-9_-]{22}$/;
+const KEY_PATTERN = /^[fae]\/[A-Za-z0-9_-]{22}$/;
 
 function base64Url(bytes: Uint8Array): string {
 	return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");

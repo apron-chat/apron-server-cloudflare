@@ -4,7 +4,7 @@ import { UPLOAD_POLICY } from '../src/budget';
 import { sniffAudio } from '../src/audio';
 import { sniffImage } from '../src/image';
 import { signUploadToken, verifyUploadToken } from '../src/upload-token';
-import { UPLOAD_WRITE_GRACE_MS, type Store, type StoreError } from '../src/store';
+import { Store, UPLOAD_WRITE_GRACE_MS, type StoreError } from '../src/store';
 import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
 import { errorCode, expectRetryAfter, withStore, type TestClock } from './helpers/store';
 
@@ -242,6 +242,51 @@ describe('store uploads', () => {
 		});
 	});
 
+	it('keeps custom emoji in one catalog row as published, never expiring, and the server\'s rather than the uploader\'s (ext:emoji)', async () => {
+		const config = { uploads: { ...UPLOADS, maxEmoji: 2 } };
+		await withStore('uploads-emoji', config, (store, clock, state) => {
+			register(store, clock, 'ada');
+			const add = (key: string, side = 1) => {
+				const upload = store.startEmojiUpload({ userId: 'ada', key, now: clock.value });
+				expect(upload).toMatchObject({ key: expect.stringMatching(/^e\/[A-Za-z0-9_-]{22}$/), maxBytes: UPLOADS.maxEmojiBytes });
+				expect(store.claimUpload(upload.key, clock.value)).toBe(true);
+				const draft = store.emojiDraft({ add: { key: upload.key, ok: true, bytes: 64, contentType: 'image/png', width: side, height: side } }, clock.value)!;
+				const committed = store.commitEmoji(draft, clock.value);
+				expect(committed.applied).toBe(true);
+				return { upload, draft, committed };
+			};
+			const stored = () => state.storage.sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'emoji_catalog'").toArray()[0]?.value;
+			expect(store.emojiCatalog(clock.value)).toBeNull();
+			const a = add(':a:');
+			expect(store.emojiCatalog(clock.value)).toEqual({ url: `${MEDIA}/${a.draft.key}`, keys: new Set([':a:']) });
+			expect(a.draft.key).toMatch(/^e\/c\/[0-9a-f]{64}\.json$/);
+			expect(stored()).toBe(a.draft.json);
+			expect(JSON.parse(stored()!)).toEqual({ ':a:': { url: `${MEDIA}/${a.upload.key}`, width: 1, height: 1 } });
+			const b = add(':b:');
+			expect(b.committed.deletedUploads).toEqual([]);
+			// At the cap a new key is denied; a known one may still be replaced,
+			// releasing its old image and the catalog two back.
+			expect(errorCode(() => store.startEmojiUpload({ userId: 'ada', key: ':c:', now: clock.value }))).toBe('denied');
+			const replaced = add(':a:', 2);
+			expect(replaced.committed.deletedUploads).toEqual([a.upload.key, a.draft.key]);
+			expect(JSON.parse(stored()!)).toEqual({ ':a:': { url: `${MEDIA}/${replaced.upload.key}`, width: 2, height: 2 }, ':b:': { url: `${MEDIA}/${b.upload.key}`, width: 1, height: 1 } });
+			// A draft made from a catalog that changed since does not apply.
+			const stale = store.emojiDraft({ remove: ':b:' }, clock.value)!;
+			expect(store.commitEmoji(store.emojiDraft({ remove: ':a:' }, clock.value)!, clock.value)).toEqual({ applied: true, deletedUploads: [replaced.upload.key, b.draft.key] });
+			expect(store.commitEmoji(stale, clock.value)).toEqual({ applied: false, deletedUploads: [] });
+			expect(store.emojiDraft({ remove: ':a:' }, clock.value)).toBeNull();
+			// Emoji never expire, and purging the admin who added them leaves them.
+			clock.value += 400 * 86_400_000;
+			store.cleanupUploads(clock.value);
+			expect(store.purgeUsers({ userIds: ['ada'], now: clock.value }).deletedUploads).toEqual([]);
+			expect(store.emojiCatalog(clock.value)?.keys).toEqual(new Set([':b:']));
+			// After a wake, the catalog is read again from its row.
+			const woken = new Store(state, config, clock.clock);
+			woken.initialize();
+			expect(woken.emojiCatalog(clock.value)).toEqual(store.emojiCatalog(clock.value));
+		});
+	});
+
 	it('purges users and everything they left, rewriting records they share with others', async () => {
 		await withStore('uploads-purge', { uploads: UPLOADS }, (store, clock, state) => {
 			register(store, clock, 'mallory');
@@ -442,7 +487,10 @@ describe('uploads end to end', () => {
 		try {
 			const { frame } = await exchange(peer, 'post', 'message', { body: { embeds: [{ kind: 'upload', title: 'voice-message.webm' }] } });
 			const messageId = frame.result.message_id;
-			expect((await put(frame.result.embeds[0].write_url, webm())).status).toBe(204);
+			// As MediaRecorder types it, with its codecs (ext:media matches the type alone).
+			const body = webm();
+			const written = await SELF.fetch(frame.result.embeds[0].write_url, { method: 'PUT', body: body as Uint8Array<ArrayBuffer>, headers: { 'Content-Length': String(body.byteLength), 'Content-Type': 'audio/webm;codecs=opus' } });
+			expect(written.status).toBe(204);
 			const completed = (await until(peer, isMessage(messageId))).frame.params.body.embeds[0];
 			expect(completed).toEqual({ embed_id: frame.result.embeds[0].embed_id, kind: 'upload', title: 'voice-message.webm', url: expect.stringMatching(/^https:\/\/media\.test\/f\//), og: { title: 'voice-message.webm', audio: { url: completed.url, type: 'audio/webm' } } });
 			expect((await media().get(completed.url.slice('https://media.test/'.length)))?.httpMetadata?.contentType).toBe('audio/webm');
@@ -487,6 +535,11 @@ describe('uploads end to end', () => {
 			const { frame } = await exchange(peer, 'post', 'message', { body: { text: 'not an image', embeds: [{ kind: 'upload' }] } });
 			const tooBig = new Uint8Array(UPLOAD_POLICY!.maxFileBytes + 1);
 			expect((await put(frame.result.embeds[0].write_url, tooBig)).status).toBe(413);
+			// A declared type the server does not keep is refused before the body
+			// is read (ext:media), and leaves the write open; parameters are ignored.
+			const typed = (type: string, body: Uint8Array) => SELF.fetch(frame.result.embeds[0].write_url, { method: 'PUT', body: body as Uint8Array<ArrayBuffer>, headers: { 'Content-Length': String(body.byteLength), 'Content-Type': type } });
+			expect((await typed('text/plain', png())).status).toBe(415);
+			expect((await typed('image/svg+xml', png())).status).toBe(415);
 			expect((await put(frame.result.embeds[0].write_url, new TextEncoder().encode('<script>alert(1)</script>'))).status).toBe(415);
 			expect((await until(peer, isMessage(frame.result.message_id))).frame.params.body.embeds).toEqual([]);
 		} finally { peer.close(); }
@@ -501,7 +554,7 @@ describe('uploads end to end', () => {
 			expect(embed.write_url).toMatch(/^https:\/\/demo\.test\/w\/a\./);
 			expect((await put(embed.write_url, png())).status).toBe(204);
 			const you = (await until(peer, (frame) => frame.method === 'user')).frame.params.you;
-			expect(you).toEqual({ user_id: userId, name: `Name of ${userId}`, avatar: expect.stringMatching(/^https:\/\/media\.test\/a\//), roles: [], ext: { permissions: ['add_members'] }, status: 'online' });
+			expect(you).toEqual({ user_id: userId, name: `Name of ${userId}`, avatar: expect.stringMatching(/^https:\/\/media\.test\/a\//), roles: [], ext: { permissions: { add_members: true } }, status: 'online' });
 			expect((await request(peer, 'me', 'me', {})).result.you.avatar).toBe(you.avatar);
 			// A message's author is a recorded object, without the avatar.
 			const posted = await exchange(peer, 'post', 'message', { body: { text: 'hi' } });
@@ -635,7 +688,7 @@ describe('uploads end to end', () => {
 			const fresh = await connect();
 			const back = (await fresh.next()).params;
 			expect(back.capabilities).toContain('embed:upload');
-			expect(Object.keys(back.ext.media)).toEqual(['origins', 'upload', 'avatar']);
+			expect(Object.keys(back.ext.media)).toEqual(['origins', 'upload', 'avatar', 'emoji']);
 			fresh.close();
 			expect((await request(user, 'nope', 'command', { body: { text: '/toggle uploads' } })).error.code).toBe(-32001);
 			expect((await request(admin, 'bad', 'command', { room_id: 'general', body: { text: '/toggle typing' } })).error.message).toBe('Usage: /toggle activity|uploads|presence|addmember');
@@ -677,6 +730,85 @@ describe('uploads end to end', () => {
 			quiet.alice.close(); quiet.bob.close();
 			expect(await runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.toggle('activity'))).toBeUndefined();
 		} finally { admin.close(); }
+	});
+
+	it('adds, replaces and removes custom emoji with /emoji, publishing each catalog at a new catalog_url (ext:emoji)', async () => {
+		const admin = await connect(null);
+		await admin.next();
+		expect((await request(admin, 'auth', 'auth', { scheme: 'token', token: ADMIN_TOKEN })).result.you.user_id).toBe('admin');
+		const watcher = await connect();
+		const user = await signedIn(unique('reactor'));
+		const keyOf = (url: string) => url.slice('https://media.test/'.length);
+		const serverFrame = async (peer: Peer) => (await until(peer, (frame) => frame.method === 'server')).frame.params;
+		const add = async (id: string, image: Uint8Array) => {
+			const started = await request(admin, id, 'command', { room_id: 'general', body: { text: '/emoji add :partyparrot:', embeds: [{ kind: 'upload' }] } });
+			expect(started.result.embeds[0].write_url).toMatch(/^https:\/\/demo\.test\/w\/e\./);
+			return put(started.result.embeds[0].write_url, image);
+		};
+		try {
+			// No catalog yet: the extension is not offered.
+			const before = (await watcher.next()).params;
+			expect(before.capabilities).not.toContain('ext:emoji');
+			expect(before.ext).not.toHaveProperty('emoji');
+			// Admins only, listed in their /help; a key is :name:, with one image.
+			const help = await exchange(admin, 'help', 'command', { room_id: 'general', body: { text: '/help' } });
+			expect(help.skipped.find((frame) => frame.params?.from?.user_id === '~private')!.params.body.text).toContain('`/emoji add|remove :name:`');
+			expect((await request(user, 'not-admin', 'command', { body: { text: '/emoji add :mine:', embeds: [{ kind: 'upload' }] } })).error.code).toBe(-32001);
+			expect((await request(admin, 'no-colons', 'command', { body: { text: '/emoji add partyparrot', embeds: [{ kind: 'upload' }] } })).error.code).toBe(-32602);
+			expect((await request(admin, 'no-image', 'command', { body: { text: '/emoji add :partyparrot:' } })).error.code).toBe(-32602);
+			expect((await request(admin, 'unknown', 'command', { body: { text: '/emoji remove :partyparrot:' } })).error.code).toBe(-32602);
+			// Not an image: refused, and nothing changes.
+			const started = await request(admin, 'audio', 'command', { room_id: 'general', body: { text: '/emoji add :partyparrot:', embeds: [{ kind: 'upload' }] } });
+			expect((await put(started.result.embeds[0].write_url, webm())).status).toBe(415);
+
+			// An image becomes the key's, and every connection gets a new server frame.
+			expect((await add('add', png(64, 32))).status).toBe(204);
+			const first = await serverFrame(watcher);
+			expect(first.capabilities).toContain('ext:emoji');
+			const firstUrl: string = first.ext.emoji.catalog_url;
+			expect(firstUrl).toMatch(/^https:\/\/media\.test\/e\/c\/[0-9a-f]{64}\.json$/);
+			expect((await serverFrame(user)).ext.emoji.catalog_url).toBe(firstUrl);
+			const published = await media().get(keyOf(firstUrl));
+			expect(published?.httpMetadata).toMatchObject({ contentType: 'application/json', cacheControl: 'public, max-age=31536000, immutable' });
+			const catalog = await published!.json<Record<string, { url: string }>>();
+			expect(catalog).toEqual({ ':partyparrot:': { url: expect.stringMatching(/^https:\/\/media\.test\/e\/[A-Za-z0-9_-]{22}$/), width: 64, height: 32 } });
+			const firstImage = keyOf(catalog[':partyparrot:'].url);
+			expect((await media().head(firstImage))?.httpMetadata?.cacheControl).toBe('public, max-age=31536000, immutable');
+			// A new connection is offered the same catalog.
+			const late = await connect();
+			expect((await late.next()).params.ext.emoji).toEqual({ catalog_url: firstUrl });
+			late.close();
+
+			// Reactions take keys the catalog has, beside emoji sequences.
+			const posted = await request(user, 'post', 'message', { body: { text: 'party' } });
+			const reacted = await exchange(user, 'react', 'reactions', { message_id: posted.result.message_id, emojis: [':partyparrot:', '\u2764'] });
+			expect(reacted.frame.result).toEqual({});
+			expect(reacted.skipped.find((frame) => frame.method === 'reactions')!.params.reactions[0].emojis).toEqual([':partyparrot:', '\u2764\uFE0F']);
+			expect((await request(user, 'unknown-key', 'reactions', { message_id: posted.result.message_id, emojis: [':nope:'] })).error.code).toBe(-32602);
+			expect((await request(user, 'case', 'reactions', { message_id: posted.result.message_id, emojis: [':PartyParrot:'] })).error.code).toBe(-32602);
+
+			// A new image replaces the old, which goes; the catalog before stays until the next change.
+			expect((await add('replace', png(16, 16))).status).toBe(204);
+			const secondUrl: string = (await serverFrame(watcher)).ext.emoji.catalog_url;
+			expect(secondUrl).not.toBe(firstUrl);
+			const replaced = await (await media().get(keyOf(secondUrl)))!.json<Record<string, { url: string }>>();
+			expect(Object.keys(replaced)).toEqual([':partyparrot:']);
+			expect(replaced[':partyparrot:']).toMatchObject({ width: 16, height: 16 });
+			await expect.poll(async () => await media().head(firstImage)).toBeNull();
+			expect(await media().head(keyOf(firstUrl))).not.toBeNull();
+
+			// Removing the last one withdraws the extension, deletes its image and the catalog two back.
+			const removed = await exchange(admin, 'remove', 'command', { room_id: 'general', body: { text: '/emoji remove :partyparrot:' } });
+			expect(removed.frame.result).toEqual({});
+			expect(removed.skipped.find((frame) => frame.params?.from?.user_id === '~private')!.params.body.text).toBe('Removed the custom emoji `:partyparrot:`.');
+			const after = await serverFrame(watcher);
+			expect(after.capabilities).not.toContain('ext:emoji');
+			expect(after.ext).not.toHaveProperty('emoji');
+			await expect.poll(async () => await media().head(keyOf(replaced[':partyparrot:'].url))).toBeNull();
+			await expect.poll(async () => await media().head(keyOf(firstUrl))).toBeNull();
+			expect(await media().head(keyOf(secondUrl))).not.toBeNull();
+			expect((await request(user, 'gone', 'reactions', { message_id: posted.result.message_id, emojis: [':partyparrot:'] })).error.code).toBe(-32602);
+		} finally { admin.close(); watcher.close(); user.close(); }
 	});
 
 	it('/purge disconnects a user and deletes their content and uploads', async () => {
