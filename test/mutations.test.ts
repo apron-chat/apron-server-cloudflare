@@ -506,6 +506,24 @@ it("sets, clears, collapses, and deduplicates reactions", async () => {
 	});
 });
 
+it("stores emoji sequences fully qualified, takes entries that differ only in U+FE0F as one, and accepts only known custom emoji keys (§4.7)", async () => {
+	await withStore("reaction-entries", (store, clock) => {
+		const target = post(store, clock, "alice", "target", { body: { text: "react to me" } });
+		const messageId = String(target.result.message_id);
+		// ❤ is text-default: stored as ❤️, once, whichever form came first.
+		const heart = store.mutate(op(clock, "bob", "h1", "reactions", { message_id: messageId, emojis: ["\u2764", "\u2764\uFE0F", "🏳\u200D🌈", "👍🏽"] }));
+		expect(heart.broadcasts[0].params.reactions).toEqual([{ from: { user_id: "bob", name: "Bob" }, emojis: ["\u2764\uFE0F", "🏳️‍🌈", "👍🏽"] }]);
+		// The same set in other forms is no change.
+		const same = store.mutate(op(clock, "bob", "h2", "reactions", { message_id: messageId, emojis: ["👍🏽", "🏳️‍🌈", "\u2764"] }));
+		expect(same.broadcasts).toEqual([]);
+		// A key must be a custom emoji the catalog has (ext:emoji); this store has none.
+		expect(errorCode(() => store.mutate(op(clock, "bob", "key", "reactions", { message_id: messageId, emojis: [":partyparrot:"] })))).toBe("invalid_params");
+		// Text that is not a key, such as a lone colon word, is kept as written.
+		const colon = store.mutate(op(clock, "bob", "colon", "reactions", { message_id: messageId, emojis: [":party"] }));
+		expect((colon.broadcasts[0].params.reactions as Array<{ emojis: string[] }>)[0].emojis).toEqual([":party"]);
+	});
+});
+
 it("rejects new reactions on tombstones and caps reacting users per message", async () => {
 	await withStore("reaction-policy", (store, clock) => {
 		const target = post(store, clock, "alice", "target", { body: { text: "popular" } });

@@ -5360,16 +5360,28 @@ export class Store {
     });
   }
 
-  /** Normalize a reaction set: strings, duplicates collapsed, bounded. */
+  /**
+   * Normalize a reaction set (§4.7): strings, bounded, each emoji sequence
+   * fully qualified (qualifyEmoji), and duplicates collapsed, entries that
+   * differ only in U+FE0F included. An entry that looks like a custom emoji
+   * key (extension `ext:emoji`) must be in the catalog, else it is
+   * `invalid_params`; only such an entry reads the catalog.
+   */
   private normalizedEmojis(value: unknown): string[] {
     if (!Array.isArray(value)) throw new StoreError("invalid_params", "emojis must be an array");
     const emojis: string[] = [];
+    const seen = new Set<string>();
     for (const item of value) {
       if (typeof item !== "string" || item.length === 0) throw new StoreError("invalid_params", "each emoji must be a non-empty string");
       // eslint-disable-next-line no-control-regex
       if (utf8Bytes(item) > MAX_EMOJI_BYTES) throw new StoreError("too_large", "emoji is too long");
       if (/[\u0000-\u001f\u007f]/.test(item)) throw new StoreError("invalid_params", "emoji is not a single sequence");
-      if (!emojis.includes(item)) emojis.push(item);
+      if (isEmojiKey(item) && !this.loadEmojiCatalog().keys.has(item)) throw new StoreError("invalid_params", `${item} is not a custom emoji here`.slice(0, 200));
+      const entry = isEmojiKey(item) ? item : qualifyEmoji(item);
+      const identity = emojiIdentity(entry);
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      emojis.push(entry);
     }
     // A count limit this server sets: denied (§1.1).
     if (emojis.length > this.config.reactionEmojisPerUser) throw new StoreError("denied", `A reaction set holds at most ${this.config.reactionEmojisPerUser} emoji`);
@@ -5392,8 +5404,10 @@ export class Store {
       message.message_id, input.userId,
     )[0];
     const currentSet = existing && existing.log_id >= floor ? parseJson<string[]>(existing.emojis_json, []) : [];
-    // An unchanged set produces no record (§4.7 permits no change).
-    if (currentSet.length === emojis.length && emojis.every((emoji) => currentSet.includes(emoji))) {
+    // An unchanged set produces no record (§4.7 permits no change); entries
+    // that differ only in U+FE0F are the same.
+    const current = new Set(currentSet.map(emojiIdentity));
+    if (current.size === emojis.length && emojis.every((emoji) => current.has(emojiIdentity(emoji)))) {
       return { result: {}, broadcasts: [] };
     }
     if (!existing && emojis.length) {
