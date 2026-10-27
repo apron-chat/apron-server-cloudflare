@@ -2,7 +2,8 @@ import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
 import { BOOTSTRAP_ROW_RESERVATION } from '../src/budget';
 import { MAX_CARRIED_PASSKEYS, SCHEMA_VERSION, Store, UPGRADABLE_SCHEMA_VERSION, defaultStoreConfig } from '../src/store';
-import { pushSubscriptionsOf } from './helpers/store';
+import { toSchema9 } from './helpers/schema9';
+import { messagesOf, pushSubscriptionsOf } from './helpers/store';
 
 type Runtime = { store: Store };
 
@@ -113,8 +114,9 @@ it(`carries at most ${MAX_CARRIED_PASSKEYS} passkeys across a reset, most recent
 	});
 });
 
-/** Turns a fresh store's identities back into those of code before `seen`, which makes the same schema 9 without `seen_ms`. */
+/** Turns a fresh store back into schema 9 as code before `seen` made it, without `seen_ms`. */
 function withoutSeen(sql: SqlStorage): void {
+	toSchema9(sql);
 	sql.exec('ALTER TABLE identities DROP COLUMN seen_ms');
 }
 
@@ -136,7 +138,7 @@ const identityColumns = (sql: SqlStorage) => sql.exec<{ name: string }>("SELECT 
 const readsReserved = (sql: SqlStorage) => sql.exec<{ reads_reserved: number }>('SELECT reads_reserved FROM resource_budgets ORDER BY day DESC LIMIT 1').one().reads_reserved;
 const writesReserved = (sql: SqlStorage) => sql.exec<{ writes_reserved: number }>('SELECT writes_reserved FROM resource_budgets ORDER BY day DESC LIMIT 1').one().writes_reserved;
 
-it('adds seen to a schema 9 store from code before it, without a new schema version, and nothing else changes', async () => {
+it('adds seen to a schema 9 store from code before it, charged, as it rebuilds the store as schema 10, not charged', async () => {
 	const stub = env.DEMO.getByName(`schema-seen-${crypto.randomUUID()}`);
 	const now = Date.now();
 	const before = await runInDurableObject(stub, async (instance, state) => {
@@ -164,13 +166,12 @@ it('adds seen to a schema 9 store from code before it, without a new schema vers
 		const { store } = instance as unknown as Runtime;
 		const sql = state.storage.sql;
 		expect(store.requiresReset()).toBe(false);
-		// Still schema 9: code before `seen` runs on this object as it is.
-		expect(SCHEMA_VERSION).toBe(9);
-		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe('9');
-		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(9);
+		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
+		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(SCHEMA_VERSION);
 		expect(identityColumns(sql).slice(-2)).toEqual(['ext_json', 'seen_ms']);
 		// A few rows charged on top of the day's, however many identities there
-		// are: the column is added, with no row rewritten or backfilled.
+		// are: the column is added, with no row rewritten or backfilled, and the
+		// rebuild that copies all 10,000 rows into schema 10 is not charged.
 		// (Measured 53 read and 3 written with 10,000 identities, as with 500.)
 		expect(readsReserved(sql) - before.reads).toBeLessThan(64);
 		expect(writesReserved(sql) - before.writes).toBeGreaterThan(0);
@@ -187,93 +188,115 @@ it('adds seen to a schema 9 store from code before it, without a new schema vers
 		return { writes: writesReserved(sql) };
 	});
 
-	// A later wake finds the column and adds nothing: its probe reads no row and writes none.
+	// A later wake finds schema 10 and changes nothing.
 	await evictDurableObject(stub);
 	await runInDurableObject(stub, async (instance, state) => {
 		const { store } = instance as unknown as Runtime;
 		const sql = state.storage.sql;
 		expect(store.requiresReset()).toBe(false);
 		expect(store.storageAccounting().writes).toBe(0);
-		// A wake's own reads, the probe's among them, stay within the eight-row
-		// handover allowance of its first reservation, and it writes nothing.
+		// A wake's own reads stay within the eight-row handover allowance of its
+		// first reservation, and it writes nothing.
 		const woken = new Store(state, defaultStoreConfig());
 		woken.initialize();
-		// (Measured 6 reads, the probe charged as one of them.)
 		expect(woken.storageAccounting().writes).toBe(0);
 		expect(woken.storageAccounting().reads).toBeLessThanOrEqual(8);
-		// The probe is metered as no row read (the store charges it as one).
-		const probe = sql.exec('SELECT seen_ms FROM identities LIMIT 0');
-		expect(probe.toArray()).toEqual([]);
-		expect(probe.rowsRead).toBe(0);
 		expect(writesReserved(sql)).toBe(added.writes);
 		expect(identityColumns(sql).filter((name) => name === 'seen_ms')).toHaveLength(1);
 		expect(store.getIdentity('kept_user')?.seen).toBe(now);
 	});
 });
 
-it('keeps seen and everything else when code before it runs on the store and is redeployed again (rollback, roll forward)', async () => {
-	const stub = env.DEMO.getByName(`schema-seen-rollback-${crypto.randomUUID()}`);
+/** Every row of `table`, by the columns schema 9 and 10 share, in key order. */
+function rowsOf(sql: SqlStorage, table: string, columns: string[]): unknown[] {
+	return sql.exec(`SELECT ${columns.join(', ')} FROM ${table} ORDER BY ${columns.join(', ')}`).toArray();
+}
+
+/** A message's latest text in its room's history: its last record there. */
+function latestText(store: Store, messageId: string, now: number): string | undefined {
+	return messagesOf(store.history({ roomId: 'general', after: 0n, now })).filter((message) => message.message_id === messageId).pop()?.body?.text;
+}
+
+const SHARED_COLUMNS: Record<string, string[]> = {
+	rooms: ['room_id', 'parent_room_id', 'created_log_id', 'record_log_id', 'latest_log_id', 'fields_json', 'member_count'],
+	records: ['room_id', 'log_id', 'commit_ms', 'kind', 'record_json'],
+	message_state: ['message_id', 'room_id', 'latest_log_id', 'author_id'],
+	reaction_state: ['message_id', 'user_id', 'log_id', 'from_json', 'emojis_json'],
+	identities: ['user_id', 'user_handle', 'name', 'tier', 'roles_json', 'ext_json', 'seen_ms'],
+	memberships: ['room_id', 'user_id'],
+	credentials: ['credential_id', 'user_id', 'public_key_json', 'sign_count'],
+	user_status: ['user_id', 'status', 'mute_until_ms'],
+	room_mutes: ['user_id', 'room_id', 'mute_until_ms'],
+	accepted_requests: ['user_id', 'request_id', 'digest', 'expires_ms'],
+	resource_budgets: ['day', 'reads_reserved', 'writes_reserved', 'foreground_writes', 'maintenance_writes'],
+	principal_limits: ['scope', 'principal_key', 'level', 'day', 'posts_day'],
+};
+
+it('upgrades a schema 9 store to schema 10 in place: every row kept, rebuilt WITHOUT ROWID, and the rebuild not charged', async () => {
+	const stub = env.DEMO.getByName(`schema-upgrade-9-${crypto.randomUUID()}`);
 	const now = Date.now();
-	await runInDurableObject(stub, async (instance) => {
+	const before = await runInDurableObject(stub, async (instance, state) => {
 		const { store } = instance as unknown as Runtime;
-		for (const userId of ['seen_user', 'renamed_user', 'purged_user']) {
+		const sql = state.storage.sql;
+		for (const userId of ['ada', 'bob']) {
 			store.registerIdentity({
 				userId, name: userId, userHandle: `handle-${userId}`, now, ipKey: `ip-${userId}`,
 				credential: { credentialId: `cred-${userId}`, userId, publicKey: 'AAAA', counter: 0 },
 			});
-			store.settleSeen({ userId, at: now - 1_000, now });
 		}
+		const post = (userId: string, requestId: string, params: Record<string, unknown>) => store.mutate({
+			userId, ipKey: `ip-${userId}`, requestId, method: 'message', now, identity: { user_id: userId }, params: { room_id: 'general', ...params },
+		});
+		const first = post('ada', 'first', { body: { text: 'first' } });
+		post('bob', 'second', { body: { text: 'second' } });
+		post('ada', 'edit', { message_id: first.result.message_id, body: { text: 'first, edited' } });
+		store.mutate({
+			userId: 'bob', ipKey: 'ip-bob', requestId: 'react', method: 'reactions', now, identity: { user_id: 'bob' },
+			params: { message_id: first.result.message_id, emojis: ['👍'] },
+		});
+		store.setStatus({ userId: 'bob', choice: 'dnd', now });
+		toSchema9(sql);
+		// Filler: the uncharged rebuild must copy them all.
+		for (let index = 0; index < 2_000; index++) {
+			sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES (?, ?, ?, 'registered', ?, ?)", `filler_${index}`, `hf${index}`, `F${index}`, now, now);
+		}
+		const rows = Object.fromEntries(Object.entries(SHARED_COLUMNS).map(([table, columns]) => [table, rowsOf(sql, table, columns)]));
+		return { rows, page: messagesOf(store.history({ roomId: 'general', after: 0n, now })), writes: writesReserved(sql), reads: readsReserved(sql), messageId: String(first.result.message_id) };
 	});
+	expect(before.rows.message_state).toHaveLength(2);
+	expect(before.rows.reaction_state).toHaveLength(1);
 
-	// Code before `seen` (708f6a5) on these tables: every statement it runs on
-	// `identities`, verbatim but for its bindings, names its columns; none
-	// recreates the table, inserts by position or reads `*`. It finds schema
-	// 9, so it neither resets nor upgrades.
 	await evictDurableObject(stub);
-	await runInDurableObject(stub, (_instance, state) => {
-		const sql = state.storage.sql;
-		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe('9');
-		// Registration, a bot or `admin`, and a reset's passkey carry: named columns, so `seen_ms` takes its default.
-		sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES (?, ?, ?, 'registered', ?, ?)", 'old_user', 'handle-old_user', 'Old', now, now);
-		sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES (?, '', ?, ?, ?, ?, ?)", 'bot_old_user', 'Bot', 'bot', now, now, '["bot"]');
-		sql.exec("INSERT OR IGNORE INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES (?, ?, ?, 'registered', ?, ?, ?)", 'carried_user', 'handle-carried', 'Carried', now, now, '[]');
-		// Reads by name.
-		expect(sql.exec("SELECT user_id, user_handle, name, tier, created_ms, updated_ms, avatar_url, avatar_expires_ms, roles_json, ext_json FROM identities WHERE user_id = ? LIMIT 1", 'seen_user').one()).toMatchObject({ user_id: 'seen_user', ext_json: '' });
-		expect(sql.exec(`SELECT m.user_id, i.name, i.avatar_url, i.avatar_expires_ms, i.roles_json, i.ext_json, s.status
-			FROM memberships m LEFT JOIN identities i ON i.user_id = m.user_id LEFT JOIN user_status s ON s.user_id = m.user_id
-			WHERE m.room_id = ? ORDER BY m.user_id LIMIT ?`, 'general', 10).toArray().map((row) => row.user_id)).toEqual(['purged_user', 'renamed_user', 'seen_user']);
-		expect(sql.exec(`SELECT c.credential_id, c.user_id, c.public_key_json, c.sign_count, c.transports_json,
-				c.created_ms, c.updated_ms, i.user_handle, i.name, i.tier, i.roles_json,
-				i.created_ms AS identity_created_ms, i.updated_ms AS identity_updated_ms,
-				EXISTS (SELECT 1 FROM memberships m WHERE m.room_id = ? AND m.user_id = c.user_id) AS in_general
-			FROM credentials c JOIN identities i ON i.user_id = c.user_id
-			WHERE i.tier = 'registered' AND i.user_id <> ?
-			ORDER BY c.updated_ms DESC, c.credential_id LIMIT ?`, 'general', 'admin', 100).toArray()).toHaveLength(3);
-		expect(sql.exec<{ count: number }>('SELECT COUNT(*) AS count FROM identities').one().count).toBe(6);
-		// Updates of other columns leave `seen_ms` as it is; /rename moves it with the row; /purge deletes the row.
-		sql.exec('UPDATE identities SET name = ?, ext_json = ?, updated_ms = ? WHERE user_id = ?', 'Seen', '{"tz":"UTC"}', now, 'seen_user');
-		sql.exec('UPDATE identities SET roles_json = ?, updated_ms = ? WHERE user_id = ?', '["friend"]', now, 'seen_user');
-		sql.exec('UPDATE identities SET avatar_url = ?, avatar_expires_ms = ?, updated_ms = ? WHERE user_id = ?', 'https://example.test/a.png', now + 1, now, 'seen_user');
-		sql.exec("UPDATE identities SET avatar_url = '', avatar_expires_ms = 0, updated_ms = ? WHERE user_id = ?", now, 'seen_user');
-		sql.exec('UPDATE identities SET user_id = ?, updated_ms = ? WHERE user_id = ?', 'renamed_to', now, 'renamed_user');
-		sql.exec('DELETE FROM identities WHERE user_id IN (?)', 'purged_user');
-	});
-
-	// The redeploy finds the column with what it held, and adds nothing.
-	await evictDurableObject(stub);
-	await runInDurableObject(stub, (instance, state) => {
+	await runInDurableObject(stub, async (instance, state) => {
 		const { store } = instance as unknown as Runtime;
 		const sql = state.storage.sql;
 		expect(store.requiresReset()).toBe(false);
-		expect(identityColumns(sql).filter((name) => name === 'seen_ms')).toHaveLength(1);
-		expect(store.getIdentity('seen_user')?.seen).toBe(now - 1_000);
-		expect(store.getIdentity('renamed_to')?.seen).toBe(now - 1_000);
-		expect(store.getIdentity('old_user')).not.toHaveProperty('seen');
-		expect(store.getIdentity('carried_user')).not.toHaveProperty('seen');
-		expect(store.getIdentity('seen_user')).toMatchObject({ name: 'Seen', roles: ['friend'] });
-		expect(store.getIdentity('purged_user')).toBeNull();
-		store.settleSeen({ userId: 'old_user', at: now, now });
-		expect(store.getIdentity('old_user')?.seen).toBe(now);
+		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
+		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(SCHEMA_VERSION);
+		// The day's budget row moves by the wake's own charge (below); every other row is as it was.
+		for (const [table, columns] of Object.entries(SHARED_COLUMNS)) {
+			if (table !== 'resource_budgets') expect(rowsOf(sql, table, columns), table).toEqual(before.rows[table]);
+		}
+		// Every table keyed by text or more than one column is WITHOUT ROWID: no autoindex is left.
+		for (const table of Object.keys(SHARED_COLUMNS)) {
+			expect(sql.exec<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", table).one().sql, table).toMatch(/WITHOUT ROWID$/);
+		}
+		expect(sql.exec("SELECT name FROM sqlite_master WHERE name LIKE 'sqlite_autoindex_%' OR name LIKE '%_v9' OR name = 'records_retention_idx'").toArray()).toEqual([]);
+		expect(sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('message_state') ORDER BY cid").toArray().map((row) => row.name)).toEqual(['message_id', 'room_id', 'latest_log_id', 'author_id']);
+		expect(sql.exec<{ count: number }>('SELECT COUNT(*) AS count FROM read_cursors').one().count).toBe(0);
+		// The rebuild read and wrote every row once, and none of it is charged: the wake's own few are.
+		expect(writesReserved(sql) - before.writes).toBeLessThanOrEqual(4);
+		expect(readsReserved(sql) - before.reads).toBeLessThan(64);
+		// The store reads the same: history, the edited message's current snapshot, reactions, status.
+		expect(messagesOf(store.history({ roomId: 'general', after: 0n, now }))).toEqual(before.page);
+		expect(latestText(store, before.messageId, now)).toBe('first, edited');
+		expect(store.statusInputs('bob')).toEqual({ choice: 'dnd', roomMutes: [] });
+		// And it writes: an edit of the upgraded message, and a new post.
+		store.mutate({
+			userId: 'ada', ipKey: 'ip-ada', requestId: 'after', method: 'message', now, identity: { user_id: 'ada' },
+			params: { room_id: 'general', message_id: before.messageId, body: { text: 'edited again' } },
+		});
+		expect(latestText(store, before.messageId, now)).toBe('edited again');
 	});
 });
 
@@ -314,9 +337,8 @@ it('upgrades a schema 8 store in place: limiter rows trade their timestamp lists
 		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
 		expect(sql.exec<{ schema_version: number }>('SELECT schema_version FROM maintenance WHERE id = 1').one().schema_version).toBe(SCHEMA_VERSION);
 		const columns = (table: string) => sql.exec<{ name: string }>("SELECT name FROM pragma_table_info(?) ORDER BY cid", table).toArray().map((row) => row.name);
-		// Schema 8's timestamp lists stay, unread: dropping them would rewrite the table four times.
-		expect(columns('principal_limits')).toEqual(['scope', 'principal_key', 'day', 'posts_day', 'registrations_day', 'uploads_day', 'updated_ms',
-			'post_events_json', 'auth_events_json', 'history_events_json', 'admission_events_json', 'level', 'level_ms']);
+		// Schema 8's timestamp lists, kept unread by schema 9, go with schema 10's rebuild.
+		expect(columns('principal_limits')).toEqual(['scope', 'principal_key', 'level', 'level_ms', 'day', 'posts_day', 'registrations_day', 'uploads_day', 'updated_ms']);
 		expect(columns('resource_budgets')).toContain('history_reserved');
 		const row = sql.exec<{ level: number; posts_day: number }>("SELECT level, posts_day FROM principal_limits WHERE scope = 'post' AND principal_key = 'user:kept_user'").one();
 		// The rolling minute starts over; the day's count stays.

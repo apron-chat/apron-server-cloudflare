@@ -318,7 +318,7 @@ it("does not exceed the native cleanup reservation for a full bounded batch", as
 				body: { format: "plain", text: `expired-${index}` },
 			});
 			sql.exec("INSERT INTO records (room_id, log_id, commit_ms, kind, record_json) VALUES ('general', ?, ?, 'message', ?)", index, expiredAt, snapshot);
-			sql.exec("INSERT INTO message_state (message_id, room_id, latest_log_id, snapshot_json, author_id) VALUES (?, 'general', ?, ?, ?)", messageId, index, snapshot, userId);
+			sql.exec("INSERT INTO message_state (message_id, room_id, latest_log_id, author_id) VALUES (?, 'general', ?, ?)", messageId, index, userId);
 			sql.exec("INSERT INTO reaction_state (message_id, user_id, log_id, from_json, emojis_json) VALUES (?, ?, ?, ?, '[\"x\"]')", messageId, userId, index, JSON.stringify({ user_id: userId }));
 			sql.exec(
 				"INSERT INTO accepted_requests (user_id, request_id, digest, result_json, transition_json, expires_ms) VALUES (?, ?, ?, ?, NULL, ?)",
