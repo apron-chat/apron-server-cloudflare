@@ -1735,6 +1735,15 @@ describe('push subscriptions in the store', () => {
 				identity: { user_id: 'uma' }, params: { parent_room_id: 'general', title: 'A thread' },
 			}).result.room_id as string;
 			expect(joined(thread, ['lea', 'mia', 'uma'])).toEqual([['mia', WAKE_SCOPES.joined]]);
+			// A room mute silences `joined` as it does every scope: the room's own, or for a thread its parent's.
+			const elsewhere = store.mutate({
+				userId: 'uma', ipKey: 'ip-uma', requestId: 'joined-thread-2', method: 'room_set', now: clock.value,
+				identity: { user_id: 'uma' }, params: { parent_room_id: 'general', title: 'Another thread' },
+			}).result.room_id as string;
+			store.setRoomMute({ userId: 'ada', roomId: 'general', untilMs: MUTE_FOREVER, now: clock.value });
+			expect(joined(elsewhere, ['ada'])).toEqual([]);
+			store.setRoomMute({ userId: 'ada', roomId: 'general', untilMs: null, now: clock.value });
+			expect(joined(elsewhere, ['ada'])).toEqual([['ada', WAKE_SCOPES.joined]]);
 			// Mia is a mod no more: her registration still keeps `joined`, but the claim reads her role as it is now.
 			store.setRole({ userId: 'mia', role: 'mod', on: false, now: clock.value });
 			clock.value += POLICY.coalesceSeconds * 1_000;
