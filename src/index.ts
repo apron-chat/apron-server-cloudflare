@@ -1252,9 +1252,38 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 	return answer(204);
 }
 
+/** The object keys a media origin serves: attachments, avatars, custom emoji and their catalogs. */
+const MEDIA_KEY_PATTERN = /^(?:[fae]\/[A-Za-z0-9_-]{22}|e\/c\/[0-9a-f]{64}\.json)$/;
+
+/**
+ * `GET` or `HEAD` of an upload, where this Worker is its own media origin
+ * (`MEDIA_ORIGIN` equal to `PUBLIC_ORIGIN`, as for local development):
+ * the R2 object with its stored type and cache headers, readable from any
+ * origin, so that clients can fetch the custom emoji catalog. Null where
+ * the bucket's own domain serves uploads, as in production.
+ */
+async function handleMediaRead(request: Request, env: Env, key: string): Promise<Response | null> {
+	if ((request.method !== "GET" && request.method !== "HEAD") || !MEDIA_KEY_PATTERN.test(key) || !env.MEDIA) return null;
+	let config: RuntimeConfig;
+	try {
+		config = loadConfig(env);
+	} catch {
+		return null;
+	}
+	if (!config.uploads || config.uploads.mediaOrigin !== config.uploads.publicOrigin) return null;
+	const object = await env.MEDIA.get(key);
+	if (!object) return responseError(404, "Not found");
+	const headers = new Headers({ "Access-Control-Allow-Origin": "*", "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'" });
+	object.writeHttpMetadata(headers);
+	headers.set("ETag", object.httpEtag);
+	return new Response(request.method === "HEAD" ? null : object.body, { headers });
+}
+
 async function fetchConnection(request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url);
 	if (url.pathname.startsWith("/w/")) return handleUploadWrite(request, env, url.pathname.slice(3));
+	const media = await handleMediaRead(request, env, url.pathname.slice(1));
+	if (media) return media;
 	const status = isConnectionStatus(request);
 	const rootUpgrade = url.pathname === "/" && (isUpgrade(request) || status);
 	if (url.pathname !== "/ws" && !rootUpgrade) {

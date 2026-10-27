@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { UPLOAD_POLICY } from '../src/budget';
 import { sniffAudio } from '../src/audio';
 import { sniffImage } from '../src/image';
+import { fetchEntry } from '../src/index';
 import { signUploadToken, verifyUploadToken } from '../src/upload-token';
 import { Store, UPLOAD_WRITE_GRACE_MS, type StoreError } from '../src/store';
 import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
@@ -809,6 +810,25 @@ describe('uploads end to end', () => {
 			expect(await media().head(keyOf(secondUrl))).not.toBeNull();
 			expect((await request(user, 'gone', 'reactions', { message_id: posted.result.message_id, emojis: [':partyparrot:'] })).error.code).toBe(-32602);
 		} finally { admin.close(); watcher.close(); user.close(); }
+	});
+
+	it('serves uploads itself, readable from any origin, only where it is its own media origin', async () => {
+		const key = `e/c/${'0'.repeat(64)}.json`;
+		await media().put(key, '{":x:":{"url":"https://demo.test/e/x"}}', { httpMetadata: { contentType: 'application/json', cacheControl: 'public, max-age=31536000, immutable' } });
+		try {
+			const own = { ...env, MEDIA_ORIGIN: 'https://demo.test' } as Env;
+			const served = await fetchEntry(new Request(`https://demo.test/${key}`), own);
+			expect(served.status).toBe(200);
+			expect(served.headers.get('Access-Control-Allow-Origin')).toBe('*');
+			expect(served.headers.get('Content-Type')).toBe('application/json');
+			expect(served.headers.get('Cache-Control')).toBe('public, max-age=31536000, immutable');
+			expect(await served.json()).toEqual({ ':x:': { url: 'https://demo.test/e/x' } });
+			expect((await fetchEntry(new Request(`https://demo.test/${key}`, { method: 'HEAD' }), own)).status).toBe(200);
+			expect((await fetchEntry(new Request(`https://demo.test/e/c/${'1'.repeat(64)}.json`), own)).status).toBe(404);
+			expect((await fetchEntry(new Request(`https://demo.test/${key}`, { method: 'DELETE' }), own)).status).toBe(404);
+			// Where the bucket's own domain serves them, the Worker does not.
+			expect((await SELF.fetch(`https://demo.test/${key}`)).status).toBe(404);
+		} finally { await media().delete(key); }
 	});
 
 	it('/purge disconnects a user and deletes their content and uploads', async () => {
