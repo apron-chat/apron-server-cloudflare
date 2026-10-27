@@ -26,6 +26,9 @@ declare global {
 		RP_ID?: string;
 		RP_ORIGINS?: string;
 		RP_NAME?: string;
+		SERVER_TITLE?: string;
+		SERVER_DESCRIPTION?: string;
+		SERVER_AVATAR?: string;
 		ADMISSION_OFF?: string;
 		ACTIVITY?: string;
 		GUEST_POSTING?: string;
@@ -58,6 +61,9 @@ declare global {
 			RP_ID?: string;
 			RP_ORIGINS?: string;
 			RP_NAME?: string;
+			SERVER_TITLE?: string;
+			SERVER_DESCRIPTION?: string;
+			SERVER_AVATAR?: string;
 			ADMISSION_OFF?: string;
 			ACTIVITY?: string;
 			GUEST_POSTING?: string;

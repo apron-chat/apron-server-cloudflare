@@ -1693,6 +1693,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 				signup: this.passkeysOffered(origin) ? ["webauthn", "token"] : ["token"],
 				// For the sign-in screen (§3.2); the `~private` welcome below goes in a room.
 				welcome: this.generalDescription() ?? this.signInWelcome(origin),
+				// What the server is, for lists of servers (§3.1): from SERVER_TITLE,
+				// SERVER_DESCRIPTION and SERVER_AVATAR (config.ts).
+				...this.config.server,
 				// Answered by the runtime without waking the object (see PING_REQUEST).
 				ping: limits.pingSeconds,
 				// Web Push (§4.9), with the VAPID key browsers subscribe with and the wake scopes.

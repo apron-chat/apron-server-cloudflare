@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ConfigError, DEFAULT_LIMITS, isAllowedOrigin, loadConfig } from '../src/config';
+import { ConfigError, DEFAULT_LIMITS, DEFAULT_SERVER_DESCRIPTION, isAllowedOrigin, loadConfig } from '../src/config';
 import { ACCOUNT_USAGE_POLICY, DEFAULT_FEATURES, PLAN } from '../src/budget';
 import { FREE_PLAN } from '../src/plans/free';
 import { PAID_PLAN } from '../src/plans/paid';
@@ -137,6 +137,22 @@ describe('configuration policy boundaries', () => {
 		expect(() => config({ APRON_ADMIN_TOKEN: 'apron_bot_0123456789abcdefghij' })).toThrow(ConfigError);
 		expect(() => config({ APRON_ADMIN_TOKEN: 'apron_join_0123456789abcdefghij' })).toThrow(ConfigError);
 		expect(() => config({ APRON_ADMIN_TOKEN: 'apron_device_0123456789abcdefghij' })).toThrow(ConfigError);
+	});
+
+	it('takes the server frame\'s title, description and avatar (§3.1) from SERVER_*, with demo defaults', () => {
+		expect(config().server).toEqual({ title: 'Apron Demo', description: DEFAULT_SERVER_DESCRIPTION });
+		expect(config({ RP_NAME: 'Chat Club' }).server.title).toBe('Chat Club');
+		expect(config({
+			SERVER_TITLE: ' Chat Club ', SERVER_DESCRIPTION: 'Talk about *clubs*.\nAll welcome.', SERVER_AVATAR: 'https://chat.example/icon.png',
+		}).server).toEqual({ title: 'Chat Club', description: 'Talk about *clubs*.\nAll welcome.', avatar: 'https://chat.example/icon.png' });
+		// Empty leaves a field out.
+		expect(config({ SERVER_TITLE: '', SERVER_DESCRIPTION: '' }).server).toEqual({});
+		expect(config({ SERVER_AVATAR: 'data:image/png;base64,iVBORw0KGgo=' }).server.avatar).toBe('data:image/png;base64,iVBORw0KGgo=');
+		expect(() => config({ SERVER_TITLE: 'x'.repeat(81) })).toThrow(ConfigError);
+		expect(() => config({ SERVER_TITLE: 'two\nlines' })).toThrow(ConfigError);
+		expect(() => config({ SERVER_DESCRIPTION: 'x'.repeat(501) })).toThrow(ConfigError);
+		expect(() => config({ SERVER_AVATAR: 'http://chat.example/icon.png' })).toThrow(ConfigError);
+		expect(() => config({ SERVER_AVATAR: 'data:image/svg+xml;base64,PHN2Zz4=' })).toThrow(ConfigError);
 	});
 
 	it('rejects unsafe payload, queue, history, and maintenance combinations', () => {
