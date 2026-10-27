@@ -158,8 +158,11 @@ within it:
   on (below), so an invisible user's connections never move it, and their
   own `you` never carries it. It is recorded at most once in 10 minutes:
   going offline again within 10 minutes of the last one recorded shows
-  that one again, so `seen` may be up to 10 minutes earlier than the real
-  departure. Going offline after a longer absence always records a new
+  that one again, even if others saw them online in between (a deviation
+  from protocol §4.5.2, whose `seen` is when they last went offline), so
+  `seen` may be up to 10 minutes earlier than the real departure, to keep
+  `seen` to at most 144 writes per account a day. Going offline after a
+  longer absence always records a new
   one, however briefly they were back. It is recorded as the last
   connection closes, before the minute's wait: so a reload, which shows
   nothing, still records its time when the last one is over 10 minutes

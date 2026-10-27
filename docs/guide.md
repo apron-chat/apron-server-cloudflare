@@ -392,8 +392,11 @@ For direct Wrangler production commands, always pass
    wake of an object made by earlier schema 9 code adds it, empty, rewriting
    no row, and every later wake only checks for it, reading no row. Earlier
    schema 9 code ignores the column, so rolling back to it and forward again
-   keeps everything and resets nothing; only the `seen` of users who left
-   while it ran is not updated, until they next go offline under this code
+   keeps every stored row and resets nothing; only the `seen` of users who left
+   while it ran is not updated, until they next go offline under this code,
+   and offline notices still owed at the rollback (about 2 minutes' worth,
+   whose entries carry `seen`, which that code does not accept) are dropped,
+   so watchers show those users online until their next listing
    (see [SPEC section 8](../SPEC.md#schema-versions)).
    A schema 8 or 7 object is upgraded in place to 9 on its first wake. That
    upgrade is one-way: redeploying schema 8 or 7 code afterwards resets the

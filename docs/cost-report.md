@@ -567,7 +567,9 @@ not to write it. It changes only when what others were told becomes
 (10 minutes) per user: when the stored `seen`, which the connections
 hold, is no older than 10 minutes, that one is announced again and listed
 later, with no statement (measured: no write of `seen_ms`), so `seen` may
-be up to 10 minutes earlier than the real departure; otherwise the time
+be up to 10 minutes earlier than the real departure, even across a return
+others saw (a deviation from PROTOCOL.md §4.5.2's last time it became
+`offline`; SPEC section 4.4, User status); otherwise the time
 of the change is settled by the store, which writes it only where the
 one it holds does not stand either, so a stale copy never writes twice.
 A close's write is one conditional primary-key update, 2/2 with its
@@ -636,8 +638,11 @@ those admissions include (each wrote 2 rows before). The sign-in's
 separate read of `seen_ms` is gone: 1,000 to 4,000 fewer reads a day at
 these models. The column came without a new schema version, so code from before it, which
 names every identity column it uses, runs on the same object after a
-rollback and loses nothing. An object made before it gains the column on
-its first wake, charged 53 read and 3 written rows alike with 500 and
+rollback and loses no stored row; it does drop offline notices still owed
+at that moment (about 2 minutes' worth), whose `owed` entries carry `seen`
+as a fifth element it does not accept, so watchers show those users online
+until their next listing (SPEC section 8, Schema versions). An object
+made before it gains the column on its first wake, charged 53 read and 3 written rows alike with 500 and
 10,000 identities (no row is rewritten or backfilled); every wake checks
 for it with `SELECT seen_ms FROM identities LIMIT 0`, which reads no row
 and writes none (measured 0 rows read, where `pragma_table_info` reads

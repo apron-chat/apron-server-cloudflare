@@ -41,8 +41,10 @@ for a zero-overage deployment.
   `seen`'s: two charged rows (their identity row and the day's budget row)
   when a signed-in user's last connection closes, or one more row with a
   chosen `invisible`, at most once in 10 minutes per user. Within 10
-  minutes of the last one recorded, going offline again shows that one, so
-  `seen` may be up to 10 minutes earlier than the real departure, and
+  minutes of the last one recorded, going offline again shows that one,
+  even if others saw them online in between (a deviation from the
+  protocol's "last went offline"; see [SPEC](SPEC.md)), so `seen` may be
+  up to 10 minutes earlier than the real departure, and
   reloads and reconnects write it at most once in 10 minutes (a reload
   shows nothing, but its close may record its time, which a departure
   within the next 10 minutes then shows).
