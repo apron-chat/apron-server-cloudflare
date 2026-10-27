@@ -1701,22 +1701,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// others are shown them: with presence off a choice is still kept,
 				// but nobody sees `dnd` or `invisible`, so clients offer neither.
 				...(presence ? { status: [...OPTIONAL_STATUS_CHOICES] } : {}),
-				// Extension `ext:settings`, this server's own: what clients can do
-				// here beyond the capabilities. Each key but `private_rooms` is a
-				// boolean, and a client takes an absent one as true. `guest_posting`: guests may post,
-				// react, join and leave rooms, and create threads; `false` here
-				// unless GUEST_POSTING is on. `read_cursors`: an `activity`
-				// `read_message_id` is kept or relayed; a registered user's are,
-				// with `activity` (handleActivity), so `false` only without it.
-				// `add_members`: registered users may add others to rooms with
-				// `room_join` and a `user_id`; `/toggle addmember` turns it off
-				// (a private room's members may add others either way).
-				// `private_rooms`: the most private rooms one user may be in.
+				// Extension `ext:settings` (EXTENSIONS.md): server-wide settings.
+				// `read_cursors`: an `activity` `read_message_id` is kept; a
+				// registered user's are, with `activity` (handleActivity), so
+				// `false` only without it. `private_rooms`: the most private rooms
+				// one user may be in. What each user may do is in `you`
+				// (permissions).
 				ext: {
-					settings: {
-						guest_posting: this.config.guestPosting, read_cursors: this.activityOn(), add_members: this.addMemberOn(),
-						private_rooms: this.config.limits.privateMembershipsPerUser,
-					},
+					settings: { read_cursors: this.activityOn(), private_rooms: this.config.limits.privateMembershipsPerUser },
 					...(this.config.uploads ? { media: this.mediaSettings(this.config.uploads) } : {}),
 				},
 			},
@@ -3433,33 +3425,37 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * What a connection's user may do to other users' messages and
-	 * memberships (extension `ext:permissions`, from apron-web's EXT.md), for
-	 * their own `you` only: `move_any`, moving others' messages between
-	 * rooms, for a registered user with a moderator role (MODERATOR_ROLES,
-	 * which the store checks) but an owner's bot, whose identity tier is
-	 * `bot`; `add_members`, adding others to rooms with `room_join` and a
-	 * `user_id`, for an admin and, while `addmember` is on, any other
-	 * registered user not a bot (assertMayManage); `push_joined`, being woken
-	 * by push for wake scope `joined`, where push is on, for a registered user
-	 * holding one of JOINED_WAKE_ROLES but an owner's bot (which the store checks), so clients
-	 * show `joined` as alerting only while open to everyone else. Adding one's own bot needs
-	 * neither. A registered user's is `[]` when they have none, as `roles`
-	 * is, so it clears; guests have none. A role change sends them again.
+	 * What a connection's user may do (extension `ext:permissions`,
+	 * EXTENSIONS.md), for their own `you` only, as an object whose absent
+	 * keys take their defaults, so only the keys that differ are sent:
+	 * `write: false` for a guest while guests only read (GUEST_POSTING off),
+	 * who may then send none of `message`, `reactions`, `room_join`,
+	 * `room_leave` and `room_set`; `add_members`, adding others to any room
+	 * with `room_join` and a `user_id`, for an admin and, while `addmember` is
+	 * on, any other registered user not a bot (assertMayManage); `move_any`,
+	 * moving others' messages between rooms, for a registered user with a
+	 * moderator role (MODERATOR_ROLES, which the store checks) but an owner's
+	 * bot, whose identity tier is `bot`; and this server's own `push_joined`,
+	 * being woken by push for wake scope `joined`, where push is on, for a
+	 * registered user holding one of JOINED_WAKE_ROLES but an owner's bot
+	 * (which the store checks), so clients show `joined` as alerting only
+	 * while open to everyone else. Adding one's own bot, and adding others to
+	 * a private room one is in, needs no permission. Every `you` carries it,
+	 * `{}` when every key takes its default; a role change or `/toggle
+	 * addmember` sends it again.
 	 */
-	private permissions(attachment: ConnectionAttachment): string[] | undefined {
-		if (attachment.tier !== "registered") return undefined;
-		return [
-			...(!isBotId(attachment.userId) && MODERATOR_ROLES.some((role) => hasRole(attachment, role)) ? ["move_any"] : []),
-			...(!hasRole(attachment, "bot") && (hasRole(attachment, "admin") || this.addMemberOn()) ? ["add_members"] : []),
-			...(this.config.push && !isBotId(attachment.userId) && JOINED_WAKE_ROLES.some((role) => hasRole(attachment, role)) ? ["push_joined"] : []),
-		];
+	private permissions(attachment: ConnectionAttachment): Record<string, boolean> {
+		if (attachment.tier !== "registered") return this.config.guestPosting ? {} : { write: false };
+		return {
+			...(!hasRole(attachment, "bot") && (hasRole(attachment, "admin") || this.addMemberOn()) ? { add_members: true } : {}),
+			...(!isBotId(attachment.userId) && MODERATOR_ROLES.some((role) => hasRole(attachment, role)) ? { move_any: true } : {}),
+			...(this.config.push && !isBotId(attachment.userId) && JOINED_WAKE_ROLES.some((role) => hasRole(attachment, role)) ? { push_joined: true } : {}),
+		};
 	}
 
 	/** A user object as the user's own `you`: with their `permissions` in `ext` (see permissions), beside its other keys. */
 	private withPermissions(user: PublicUser, attachment: ConnectionAttachment): PublicUser {
-		const permissions = this.permissions(attachment);
-		return permissions ? { ...user, ext: { ...user.ext, permissions } } : user;
+		return { ...user, ext: { ...user.ext, permissions: this.permissions(attachment) } };
 	}
 
 	/** The `status` a connection's user chose, as their own `you` carries it (see you). */

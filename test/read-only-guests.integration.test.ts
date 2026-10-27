@@ -53,7 +53,8 @@ it('tells a guest it only reads, then denies its writes, joins and leaves includ
 	const guest = await connect();
 	try {
 		const { server, welcome } = await greeting(guest);
-		expect(server.params.ext.settings.guest_posting).toBe(false);
+		// What a guest may do is in its own `you` (ext:permissions), not in the settings.
+		expect(server.params.ext.settings).not.toHaveProperty('guest_posting');
 		// The welcome follows the server frame, before any auth (Appendix B):
 		// transient (§3.5), with no room_id since the client knows no rooms yet.
 		// Where guests only read, it says so after the server version.
@@ -64,6 +65,9 @@ it('tells a guest it only reads, then denies its writes, joins and leaves includ
 		const auth = await guest.next();
 		expect(auth.id).toBe('auth');
 		expect(auth.result.you.user_id).toMatch(/^guest_/);
+		// It may send none of the write row of ext:limits (ext:permissions).
+		expect(auth.result.you.ext).toEqual({ permissions: { write: false } });
+		expect((await request(guest, 'me', 'me', {})).result.you.ext).toEqual({ permissions: { write: false } });
 
 		const denied = (frame: Frame) => {
 			expect(frame.error.code).toBe(-32001);
@@ -133,7 +137,7 @@ it('lets a registered user invite a bot that signs in from anywhere with its tok
 		expect((await bot.next()).params.auth).toEqual(['token', 'guest']);
 		const auth = await request(bot, 'auth', 'auth', { scheme: 'token', token });
 		// A bot may neither move others' messages nor add others (ext:permissions).
-		expect(auth.result).toEqual({ you: { user_id: 'bot_u_owner', name: 'Bot of Name of u_owner', roles: ['bot'], ext: { permissions: [] }, status: 'online' } });
+		expect(auth.result).toEqual({ you: { user_id: 'bot_u_owner', name: 'Bot of Name of u_owner', roles: ['bot'], ext: { permissions: {} }, status: 'online' } });
 		expect(auth.result.token).toBeUndefined();
 		expect((await request(bot, 'rooms', 'room_list', { filter: 'joined' })).result.joined.map((room: { room_id: string }) => room.room_id)).toEqual(['general']);
 
@@ -173,7 +177,7 @@ it('replaces a bot token on a new invite, signing out the old one, and renames t
 		await stale.next();
 		expect((await request(stale, 'auth', 'auth', { scheme: 'token', token: oldToken })).error.code).toBe(-32001);
 		await fresh.next();
-		expect((await request(fresh, 'auth', 'auth', { scheme: 'token', token: newToken })).result.you).toEqual({ user_id: 'bot_u_rotating', name: 'Bot of Rotated', roles: ['bot'], ext: { permissions: [] }, status: 'online' });
+		expect((await request(fresh, 'auth', 'auth', { scheme: 'token', token: newToken })).result.you).toEqual({ user_id: 'bot_u_rotating', name: 'Bot of Rotated', roles: ['bot'], ext: { permissions: {} }, status: 'online' });
 	} finally { owner.close(); first.close(); stale.close(); fresh.close(); }
 });
 
@@ -227,7 +231,7 @@ it('signs in as the admin user with APRON_ADMIN_TOKEN from anywhere, once it is 
 		await first.next();
 		const exchanged = await exchange(first, 'auth', 'auth', { scheme: 'token', token: adminToken });
 		const auth = exchanged.frame;
-		expect(auth.result).toEqual({ you: { user_id: 'admin', name: 'Admin', roles: ['admin'], ext: { permissions: ['move_any', 'add_members', 'push_joined'] }, status: 'online' } });
+		expect(auth.result).toEqual({ you: { user_id: 'admin', name: 'Admin', roles: ['admin'], ext: { permissions: { move_any: true, add_members: true, push_joined: true } }, status: 'online' } });
 		// Created on first use, it starts in general: its logged join reaches
 		// this connection after the auth result (§3.2), not before.
 		const adminJoin = (frame: { method?: string; params?: any }) => frame.method === 'room_update' && frame.params?.memberships?.[0]?.members?.[0]?.user?.user_id === 'admin';
@@ -241,7 +245,7 @@ it('signs in as the admin user with APRON_ADMIN_TOKEN from anywhere, once it is 
 
 		// The same token signs in again, as the same user, from a browser too.
 		await second.next();
-		expect((await request(second, 'auth', 'auth', { scheme: 'token', token: adminToken })).result.you).toEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'], ext: { permissions: ['move_any', 'add_members', 'push_joined'] }, status: 'online' });
+		expect((await request(second, 'auth', 'auth', { scheme: 'token', token: adminToken })).result.you).toEqual({ user_id: 'admin', name: 'Admin', roles: ['admin'], ext: { permissions: { move_any: true, add_members: true, push_joined: true } }, status: 'online' });
 	} finally { first.close(); second.close(); await withAdminToken(undefined); }
 });
 
