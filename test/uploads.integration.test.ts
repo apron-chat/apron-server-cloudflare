@@ -5,7 +5,7 @@ import { sniffAudio } from '../src/audio';
 import { sniffImage } from '../src/image';
 import { fetchEntry } from '../src/index';
 import { signUploadToken, verifyUploadToken } from '../src/upload-token';
-import { Store, UPLOAD_WRITE_GRACE_MS, type StoreError } from '../src/store';
+import { Store, UPLOAD_WRITE_GRACE_MS, type EmojiDraft, type StoreError } from '../src/store';
 import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
 import { errorCode, expectRetryAfter, withStore, type TestClock } from './helpers/store';
 
@@ -266,14 +266,15 @@ describe('store uploads', () => {
 			const b = add(':b:');
 			expect(b.committed.deletedUploads).toEqual([]);
 			// At the cap a new key is denied; a known one may still be replaced,
-			// releasing its old image and the catalog two back.
+			// releasing the catalog two back. Its old image stays with the
+			// previous catalog, which refers to it.
 			expect(errorCode(() => store.startEmojiUpload({ userId: 'ada', key: ':c:', now: clock.value }))).toBe('denied');
 			const replaced = add(':a:', 2);
-			expect(replaced.committed.deletedUploads).toEqual([a.upload.key, a.draft.key]);
+			expect(replaced.committed.deletedUploads).toEqual([a.draft.key]);
 			expect(JSON.parse(stored()!)).toEqual({ ':a:': { url: `${MEDIA}/${replaced.upload.key}`, width: 2, height: 2 }, ':b:': { url: `${MEDIA}/${b.upload.key}`, width: 1, height: 1 } });
 			// A draft made from a catalog that changed since does not apply.
 			const stale = store.emojiDraft({ remove: ':b:' }, clock.value)!;
-			expect(store.commitEmoji(store.emojiDraft({ remove: ':a:' }, clock.value)!, clock.value)).toEqual({ applied: true, deletedUploads: [replaced.upload.key, b.draft.key] });
+			expect(store.commitEmoji(store.emojiDraft({ remove: ':a:' }, clock.value)!, clock.value)).toEqual({ applied: true, deletedUploads: [a.upload.key, b.draft.key] });
 			expect(store.commitEmoji(stale, clock.value)).toEqual({ applied: false, deletedUploads: [] });
 			expect(store.emojiDraft({ remove: ':a:' }, clock.value)).toBeNull();
 			// Emoji never expire, and purging the admin who added them leaves them.
@@ -285,6 +286,78 @@ describe('store uploads', () => {
 			const woken = new Store(state, config, clock.clock);
 			woken.initialize();
 			expect(woken.emojiCatalog(clock.value)).toEqual(store.emojiCatalog(clock.value));
+		});
+	});
+
+	it('keeps a replaced or removed emoji image with the previous catalog, and releases both at the next change (ext:emoji)', async () => {
+		const config = { uploads: { ...UPLOADS, maxEmoji: 4 } };
+		await withStore('uploads-emoji-superseded', config, (store, clock, state) => {
+			register(store, clock, 'ada');
+			const add = (key: string, bytes: number) => {
+				const upload = store.startEmojiUpload({ userId: 'ada', key, now: clock.value });
+				expect(store.claimUpload(upload.key, clock.value)).toBe(true);
+				return commit(store.emojiDraft({ add: { key: upload.key, ok: true, bytes, contentType: 'image/png' } }, clock.value)!, upload.key);
+			};
+			const remove = (key: string) => commit(store.emojiDraft({ remove: key }, clock.value)!);
+			const commit = (draft: EmojiDraft, image?: string) => {
+				const committed = store.commitEmoji(draft, clock.value);
+				expect(committed.applied).toBe(true);
+				// The stored-bytes count is always the sum of the rows kept.
+				expect(storedBytes()).toBe(rowBytes());
+				return { image, catalog: draft.key, deleted: committed.deletedUploads };
+			};
+			const sql = <T extends Record<string, SqlStorageValue>>(query: string) => state.storage.sql.exec<T>(query).toArray();
+			const storedBytes = () => Number(sql<{ value: string }>("SELECT value FROM _meta WHERE key = 'upload_bytes'")[0]?.value ?? 0);
+			const rowBytes = () => sql<{ total: number | null }>('SELECT SUM(bytes) AS total FROM uploads')[0].total ?? 0;
+			const states = () => Object.fromEntries(sql<{ upload_key: string; state: string }>('SELECT upload_key, state FROM uploads').map((row) => [row.upload_key, row.state]));
+			const previous = () => sql<{ value: string }>("SELECT value FROM _meta WHERE key = 'emoji_catalog_previous'")[0]?.value;
+
+			const x = add(':x:', 64);
+			const y = add(':y:', 100);
+			expect(y.deleted).toEqual([]);
+			expect(storedBytes()).toBe(164);
+			// Removing the key just added returns the catalog to the one before:
+			// that catalog is current again, so nothing goes, and :y:'s image
+			// stays, with its bytes, while the previous catalog refers to it.
+			const back = remove(':y:');
+			expect(back.catalog).toBe(x.catalog);
+			expect(back.deleted).toEqual([]);
+			expect(previous()).toBe(y.catalog);
+			expect(states()).toEqual({ [x.image!]: 'done', [y.image!]: 'superseded' });
+			expect(storedBytes()).toBe(164);
+			// The next change releases that catalog and the image only it had.
+			const empty = remove(':x:');
+			expect(empty.catalog).toBeNull();
+			expect(empty.deleted).toEqual([y.image, y.catalog]);
+			expect(previous()).toBe(x.catalog);
+			expect(states()).toEqual({ [x.image!]: 'superseded' });
+			expect(storedBytes()).toBe(64);
+			const z = add(':z:', 10);
+			expect(z.deleted).toEqual([x.image, x.catalog]);
+			expect(previous()).toBeUndefined();
+			expect(states()).toEqual({ [z.image!]: 'done' });
+			// Replacing twice: each image goes one change after it was replaced.
+			const z2 = add(':z:', 20);
+			expect(z2.deleted).toEqual([]);
+			expect(states()).toEqual({ [z.image!]: 'superseded', [z2.image!]: 'done' });
+			expect(storedBytes()).toBe(30);
+			const z3 = add(':z:', 30);
+			expect(z3.deleted).toEqual([z.image, z.catalog]);
+			expect(states()).toEqual({ [z2.image!]: 'superseded', [z3.image!]: 'done' });
+			expect(storedBytes()).toBe(50);
+			// A superseded image counts against the stored-bytes cap, and not
+			// against maxEmoji; it is the server's, so purges and expiry leave it.
+			clock.value += 400 * 86_400_000;
+			store.cleanupUploads(clock.value);
+			expect(store.purgeUsers({ userIds: ['ada'], now: clock.value }).deletedUploads).toEqual([]);
+			expect(states()).toEqual({ [z2.image!]: 'superseded', [z3.image!]: 'done' });
+			// It survives a wake, and the next change after it releases it.
+			const woken = new Store(state, config, clock.clock);
+			woken.initialize();
+			const committed = woken.commitEmoji(woken.emojiDraft({ remove: ':z:' }, clock.value)!, clock.value);
+			expect(committed).toEqual({ applied: true, deletedUploads: [z2.image, z2.catalog] });
+			expect(states()).toEqual({ [z3.image!]: 'superseded' });
+			expect(storedBytes()).toBe(rowBytes());
 		});
 	});
 
@@ -741,8 +814,8 @@ describe('uploads end to end', () => {
 		const user = await signedIn(unique('reactor'));
 		const keyOf = (url: string) => url.slice('https://media.test/'.length);
 		const serverFrame = async (peer: Peer) => (await until(peer, (frame) => frame.method === 'server')).frame.params;
-		const add = async (id: string, image: Uint8Array) => {
-			const started = await request(admin, id, 'command', { room_id: 'general', body: { text: '/emoji add :partyparrot:', embeds: [{ kind: 'upload' }] } });
+		const add = async (id: string, image: Uint8Array, key = ':partyparrot:') => {
+			const started = await request(admin, id, 'command', { room_id: 'general', body: { text: `/emoji add ${key}`, embeds: [{ kind: 'upload' }] } });
 			expect(started.result.embeds[0].write_url).toMatch(/^https:\/\/demo\.test\/w\/e\./);
 			return put(started.result.embeds[0].write_url, image);
 		};
@@ -788,26 +861,30 @@ describe('uploads end to end', () => {
 			expect((await request(user, 'unknown-key', 'reactions', { message_id: posted.result.message_id, emojis: [':nope:'] })).error.code).toBe(-32602);
 			expect((await request(user, 'case', 'reactions', { message_id: posted.result.message_id, emojis: [':PartyParrot:'] })).error.code).toBe(-32602);
 
-			// A new image replaces the old, which goes; the catalog before stays until the next change.
+			// A new image replaces the old; the catalog before, and the old image
+			// it refers to, stay until the next change.
 			expect((await add('replace', png(16, 16))).status).toBe(204);
 			const secondUrl: string = (await serverFrame(watcher)).ext.emoji.catalog_url;
 			expect(secondUrl).not.toBe(firstUrl);
 			const replaced = await (await media().get(keyOf(secondUrl)))!.json<Record<string, { url: string }>>();
 			expect(Object.keys(replaced)).toEqual([':partyparrot:']);
 			expect(replaced[':partyparrot:']).toMatchObject({ width: 16, height: 16 });
-			await expect.poll(async () => await media().head(firstImage)).toBeNull();
+			expect(await media().head(firstImage)).not.toBeNull();
 			expect(await media().head(keyOf(firstUrl))).not.toBeNull();
 
-			// Removing the last one withdraws the extension, deletes its image and the catalog two back.
+			// Removing the last one withdraws the extension, and deletes the
+			// catalog two back with the image only it had; the removed image
+			// stays with the catalog before.
 			const removed = await exchange(admin, 'remove', 'command', { room_id: 'general', body: { text: '/emoji remove :partyparrot:' } });
 			expect(removed.frame.result).toEqual({});
 			expect(removed.skipped.find((frame) => frame.params?.from?.user_id === '~private')!.params.body.text).toBe('Removed the custom emoji `:partyparrot:`.');
 			const after = await serverFrame(watcher);
 			expect(after.capabilities).not.toContain('ext:emoji');
 			expect(after.ext).not.toHaveProperty('emoji');
-			await expect.poll(async () => await media().head(keyOf(replaced[':partyparrot:'].url))).toBeNull();
+			await expect.poll(async () => await media().head(firstImage)).toBeNull();
 			await expect.poll(async () => await media().head(keyOf(firstUrl))).toBeNull();
 			expect(await media().head(keyOf(secondUrl))).not.toBeNull();
+			expect(await media().head(keyOf(replaced[':partyparrot:'].url))).not.toBeNull();
 			// A removed key stays in a set that has it, so its user can still change their other reactions; nobody takes it up.
 			const kept = await exchange(user, 'kept', 'reactions', { message_id: posted.result.message_id, emojis: [':partyparrot:'] });
 			expect(kept.frame.result).toEqual({});
@@ -815,6 +892,14 @@ describe('uploads end to end', () => {
 			expect((await request(admin, 'taken-up', 'reactions', { message_id: posted.result.message_id, emojis: [':partyparrot:'] })).error.code).toBe(-32602);
 			expect((await request(user, 'cleared', 'reactions', { message_id: posted.result.message_id, emojis: [] })).result).toEqual({});
 			expect((await request(user, 'gone', 'reactions', { message_id: posted.result.message_id, emojis: [':partyparrot:'] })).error.code).toBe(-32602);
+
+			// The next change deletes them; removing that emoji again leaves the catalog empty.
+			expect((await add('other', png(), ':confetti:')).status).toBe(204);
+			expect((await serverFrame(watcher)).capabilities).toContain('ext:emoji');
+			await expect.poll(async () => await media().head(keyOf(replaced[':partyparrot:'].url))).toBeNull();
+			await expect.poll(async () => await media().head(keyOf(secondUrl))).toBeNull();
+			expect((await request(admin, 'remove-other', 'command', { room_id: 'general', body: { text: '/emoji remove :confetti:' } })).result).toEqual({});
+			expect((await serverFrame(watcher)).capabilities).not.toContain('ext:emoji');
 		} finally { admin.close(); watcher.close(); user.close(); }
 	});
 

@@ -705,8 +705,13 @@ interface RawUploadRow {
   purpose: UploadPurpose;
   message_id: string | null;
   embed_id: string | null;
-  /** `pending` until the Worker claims the write, `writing` while it stores it, then `done`. */
-  state: "pending" | "writing" | "done";
+  /**
+   * `pending` until the Worker claims the write, `writing` while it stores
+   * it, then `done`. A custom emoji's image that a catalog change replaced
+   * or removed is `superseded`: kept, with its bytes, while the previous
+   * catalog refers to it (commitEmoji).
+   */
+  state: "pending" | "writing" | "done" | "superseded";
   bytes: number;
   write_expires_ms: number;
   expires_ms: number;
@@ -850,7 +855,8 @@ const META_EMOJI_CATALOG = "emoji_catalog";
 /**
  * `_meta` key: the R2 key of the catalog the current one replaced, kept so
  * that clients that just read the old `catalog_url` can still fetch it, and
- * deleted at the next change.
+ * deleted at the next change. The images only it refers to are kept as long
+ * (upload state `superseded`).
  */
 const META_EMOJI_PREVIOUS = "emoji_catalog_previous";
 /**
@@ -4519,17 +4525,18 @@ export class Store {
 
   /**
    * Makes a draft's catalog current, in one transaction with the edit: an
-   * added key's upload is done, and the image it replaces released; a
-   * removed key's image is released. The catalog before this one becomes
-   * the previous (META_EMOJI_PREVIOUS), and the one before that is
-   * released. Returns whether it applied (a draft whose catalog changed
-   * meanwhile, or whose write is no longer acceptable, does not), and the
-   * R2 objects the caller deletes.
+   * added key's upload is done. The catalog before this one becomes the
+   * previous (META_EMOJI_PREVIOUS), and the image an add replaces or a
+   * remove removes is `superseded`: both stay for clients that just read
+   * the previous `catalog_url`. The catalog before that, and the images
+   * superseded with it, are released. Returns whether it applied (a draft
+   * whose catalog changed meanwhile, or whose write is no longer
+   * acceptable, does not), and the R2 objects the caller deletes.
    */
   commitEmoji(draft: EmojiDraft, now = this.clock.now()): { applied: boolean; deletedUploads: string[] } {
     this.ensureReady();
     const most = this.config.uploads?.maxEmoji ?? 0;
-    const result = this.reserved({ reads: 64, writes: 64 + UPLOAD_WRITES }, false, now, () => this.transaction(() => {
+    const result = this.reserved({ reads: 96, writes: 96 + UPLOAD_WRITES }, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       const before = this.loadEmojiCatalog();
       // Everything is checked before anything is written.
@@ -4545,12 +4552,24 @@ export class Store {
       else delete expected[name];
       if (JSON.stringify(expected) !== (draft.json || "{}")) return null;
       if (row) this.completeUploadRow(row, write!.bytes!);
+      // The images the last change superseded, which only the previous
+      // catalog refers to, go with it: at most the 8 one change supersedes.
+      // An image is never referred to again once superseded, since an add
+      // always brings a new upload, so this holds even when the catalog
+      // returns to the previous one (an add, then a remove of that key).
+      const superseded = this.rawRows<RawUploadRow>(
+        `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
+         FROM uploads INDEXED BY uploads_pending_idx WHERE state = 'superseded' LIMIT 16`,
+      );
+      const deletedUploads = this.releaseUploadRows(superseded);
+      // The image this change replaces or removes stays, with its bytes,
+      // while the catalog before this one does.
       const replaced = this.rawRows<RawUploadRow>(
         `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
          FROM uploads INDEXED BY uploads_message_idx WHERE message_id = ? AND purpose = 'emoji' AND state = 'done' LIMIT 8`,
         name,
       ).filter((candidate) => candidate.upload_key !== row?.upload_key);
-      const deletedUploads = this.releaseUploadRows(replaced);
+      for (const candidate of replaced) this.rawExec("UPDATE uploads SET state = 'superseded' WHERE upload_key = ?", candidate.upload_key);
       if (draft.json) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_EMOJI_CATALOG, draft.json);
       else this.rawExec("DELETE FROM _meta WHERE key = ?", META_EMOJI_CATALOG);
       // The catalog before this one stays until the next change; the one

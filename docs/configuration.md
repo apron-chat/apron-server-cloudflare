@@ -279,7 +279,9 @@ catalog is one row of the Durable Object's SQLite storage, published to the
 bucket at `e/c/<sha256>.json`, whose URL the `server` frame carries as
 `ext.emoji.catalog_url` once the catalog has an emoji. Each change publishes
 a new catalog, sends every connection a new `server` frame, and deletes the
-catalog before the last one and any image it replaced. Emoji images count
+catalog before the last one with any image only it referred to: a replaced
+or removed image stays until the next change, for clients that just read the
+last catalog. Emoji images count
 against `uploadsPerDay`, the admin's `uploadsPerUserDay`, and
 `storedBytesCap`, for as long as they stay: at most 500 of 256 KB, 125 MB.
 
