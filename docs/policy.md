@@ -343,8 +343,8 @@ but do consume frame and lookup resources.
 ## Server settings
 
 The `server` frame carries `title`, `description` and `avatar` (protocol
-§3.1), from `SERVER_TITLE` (else `RP_NAME`), `SERVER_DESCRIPTION` (else a
-line about the demo) and `SERVER_AVATAR` (else none), so clients can show
+§3.1), from `SERVER_TITLE` (else `RP_NAME`), `SERVER_DESCRIPTION` and
+`SERVER_AVATAR` (each else left out), so clients can show
 which server this is. Every extension it advertises is defined in
 [EXTENSIONS.md](https://github.com/shazow/apron/blob/main/EXTENSIONS.md). `ext:settings` carries
 `server.params.ext.settings`: `read_cursors`, whether a registered user's read

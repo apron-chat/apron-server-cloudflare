@@ -12,9 +12,9 @@ export interface RuntimeConfig {
 	/**
 	 * What the `server` frame shows people about this server (§3.1): a plain
 	 * `title` (`SERVER_TITLE`, else `RP_NAME`), a short CommonMark
-	 * `description` (`SERVER_DESCRIPTION`, else the demo's), and an `avatar`
-	 * image URL (`SERVER_AVATAR`, else none). An empty variable leaves its
-	 * field out.
+	 * `description` (`SERVER_DESCRIPTION`, else none), and an `avatar` image
+	 * URL (`SERVER_AVATAR`, else none). An empty variable leaves its field
+	 * out.
 	 */
 	server: ServerMetadata;
 	admissionOff: boolean;
@@ -78,8 +78,6 @@ export interface ServerMetadata {
 	avatar?: string;
 }
 
-/** `server.description` when `SERVER_DESCRIPTION` is unset. */
-export const DEFAULT_SERVER_DESCRIPTION = "The public demo of [Apron](https://github.com/shazow/apron), an open chat protocol.";
 /** The longest `SERVER_DESCRIPTION`, in UTF-8 bytes: a few words, sent in every `server` frame. */
 const MAX_SERVER_DESCRIPTION_BYTES = 500;
 /** The longest `SERVER_AVATAR`, in characters: an https URL, or a small `data:` image. */
@@ -387,14 +385,14 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 
 /**
  * `SERVER_TITLE`, `SERVER_DESCRIPTION` and `SERVER_AVATAR` (§3.1): unset,
- * the title is `RP_NAME` and the description the demo's; empty, the field
- * is left out. The title is a plain name within the display-name policy,
+ * the title is `RP_NAME` and the others are left out; empty, the field is
+ * left out. The title is a plain name within the display-name policy,
  * the description short CommonMark, and the avatar an `https:` URL or a
  * `data:image/{png,jpeg,gif,webp};base64,` URL (§4.8.6).
  */
 function loadServerMetadata(env: EnvLike, rpName: string, limits: Limits): ServerMetadata {
 	const title = (env.SERVER_TITLE ?? rpName).trim();
-	const description = (env.SERVER_DESCRIPTION ?? DEFAULT_SERVER_DESCRIPTION).trim();
+	const description = (env.SERVER_DESCRIPTION ?? "").trim();
 	const avatar = (env.SERVER_AVATAR ?? "").trim();
 	// eslint-disable-next-line no-control-regex
 	const control = /[\u0000-\u001f\u007f]/;

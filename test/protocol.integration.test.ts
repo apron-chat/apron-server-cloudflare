@@ -1,7 +1,6 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { expect, it, vi } from 'vitest';
 import { DEFAULT_LIMITS, UPLOAD_POLICY } from '../src/budget';
-import { DEFAULT_SERVER_DESCRIPTION } from '../src/config';
 import { canonicalizeIp, hashIpKey } from '../src/ip';
 import { connect as open, exchange, greeting, reply, request, until, type ConnectOptions, type Frame, type Peer } from './helpers/socket';
 
@@ -942,9 +941,9 @@ it('advertises the extensions ext:settings, ext:limits, ext:media and ext:permis
 		expect(server.capabilities).toContain('ext:permissions');
 		// No custom emoji yet: ext:emoji waits for the first (uploads.integration.test.ts).
 		expect(server.capabilities).not.toContain('ext:emoji');
-		// What the server is (§3.1): RP_NAME and the demo's description, without an avatar by default.
+		// What the server is (§3.1): RP_NAME, without a description or an avatar by default.
 		expect(server.title).toBe('Apron Demo');
-		expect(server.description).toBe(DEFAULT_SERVER_DESCRIPTION);
+		expect(server).not.toHaveProperty('description');
 		expect(server).not.toHaveProperty('avatar');
 		const file = { max_bytes: UPLOAD_POLICY!.maxFileBytes };
 		const avatar = { max_bytes: UPLOAD_POLICY!.maxAvatarBytes };
