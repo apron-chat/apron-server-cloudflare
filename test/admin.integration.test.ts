@@ -950,6 +950,60 @@ it("shows general's description as server.welcome while it has one", async () =>
 	try { expect((await after.next()).params.welcome).toMatch(/Apron public demo/); } finally { after.close(); }
 });
 
+it("falls back to general's description as server.description, re-announced while it is in use (§3.1)", async () => {
+	const admin = await signedInAdmin();
+	const watcher = await connect();
+	const configured = await runInDurableObject(stub(), (instance) => (instance as unknown as { config: { server: Record<string, string> } }).config.server);
+	const setVariables = (server: Record<string, string>) => runInDurableObject(stub(), (instance) => {
+		const runtime = instance as unknown as { config: { server: Record<string, string> } };
+		runtime.config = { ...runtime.config, server };
+	});
+	// Request ids are unique: a room_set retried with an id already used is deduplicated.
+	const describe = (id: string, description?: string) => exchange(admin, unique(id), 'room_set', { room_id: 'general', title: 'General', ...(description !== undefined ? { description } : {}) });
+	const serverFrames = (skipped: Frame[]) => skipped.filter((frame) => frame.method === 'server');
+	const fresh = async () => { const peer = await connect(); try { return (await peer.next()).params; } finally { peer.close(); } };
+	try {
+		await watcher.next();
+		// The admin's sign-in may have sent it a new server frame (wake scope joined).
+		await command(admin, 'drain', '/help');
+		await setVariables({});
+		// Unset: general's description, sent to every connection when it changes.
+		const described = await describe('describe', '  Say hi in **general**. ');
+		expect(serverFrames(described.skipped).map((frame) => frame.params.description)).toEqual(['Say hi in **general**.']);
+		expect((await until(watcher, (frame) => frame.method === 'server')).frame.params.description).toBe('Say hi in **general**.');
+		expect(await fresh()).toMatchObject({ description: 'Say hi in **general**.', welcome: '  Say hi in **general**. ' });
+		expect((await command(admin, 'show', '/server')).notice!.params.body.text).toContain("- **description** (from the default room `general`'s description):\n  > Say hi in **general**.");
+		// Past 500 bytes it is left out, not cut; without one, there is none.
+		const long = await describe('long', 'x'.repeat(501));
+		expect(serverFrames(long.skipped).map((frame) => frame.params.description)).toEqual([undefined]);
+		expect((await command(admin, 'show-long', '/server')).notice!.params.body.text).toContain("- **description**: none (`general`'s description is longer than 500 bytes or holds control characters, so it is left out)");
+		expect(serverFrames((await describe('again', 'Say hi.')).skipped).map((frame) => frame.params.description)).toEqual(['Say hi.']);
+		expect(serverFrames((await describe('removed')).skipped).map((frame) => frame.params.description)).toEqual([undefined]);
+		expect(await fresh()).not.toHaveProperty('description');
+		// An unchanged one sends nothing.
+		expect(serverFrames((await describe('unchanged')).skipped)).toEqual([]);
+
+		// SERVER_DESCRIPTION (empty counts as unset) and /server description come first: general's changes then send nothing.
+		await describe('set', 'Say hi.');
+		await setVariables({ description: 'From the variable.' });
+		expect(serverFrames((await describe('overridden', 'Say hello.')).skipped)).toEqual([]);
+		expect((await fresh()).description).toBe('From the variable.');
+		await command(admin, 'own', '/server description Our own.');
+		expect((await fresh()).description).toBe('Our own.');
+		await setVariables({});
+		expect(serverFrames((await describe('still-overridden', 'Say hey.')).skipped)).toEqual([]);
+		expect((await fresh()).description).toBe('Our own.');
+		// Cleared, general's applies again.
+		const cleared = await command(admin, 'clear', '/server description');
+		expect(serverFrames(cleared.skipped).map((frame) => frame.params.description)).toEqual(['Say hey.']);
+		expect((await fresh()).description).toBe('Say hey.');
+	} finally {
+		await describe('undescribe');
+		await setVariables(configured);
+		admin.close(); watcher.close();
+	}
+});
+
 it('/admin remove takes the admin role away, announced with roles: [] (§3.3)', async () => {
 	const admin = await signedInAdmin();
 	const userId = unique('demoted');

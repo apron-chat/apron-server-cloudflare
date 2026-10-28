@@ -256,7 +256,7 @@ interface StoreUploadConfig extends UploadPolicy {
 
 /** An upload waiting for its write (protocol §4.8.3): what its `write_url` signs. */
 interface PendingUpload {
-  /** The R2 object key: `f/<id>` for an attached file, `a/<id>` for an avatar, `e/<id>` for a custom emoji. */
+  /** The R2 object key: `f/<id>` for an attached file, `a/<id>` for an avatar, `e/<id>` for a custom emoji or the server's avatar. */
   key: string;
   purpose: UploadPurpose;
   embedId: string;
@@ -264,7 +264,21 @@ interface PendingUpload {
   writeExpiresMs: number;
 }
 
-type UploadPurpose = "file" | "avatar" | "emoji";
+/**
+ * What an upload is for: an attached `file`, a user's `avatar`, a custom
+ * `emoji`, or the server's own avatar (`server`, `/server avatar`).
+ */
+type UploadPurpose = "file" | "avatar" | "emoji" | "server";
+
+/**
+ * The server's `title`, `description` and `avatar` (§3.1) as admins set them
+ * with `/server`, each absent while its deployment variable applies.
+ */
+export interface StoredServerMetadata {
+  title?: string;
+  description?: string;
+  avatar?: string;
+}
 
 /** One custom emoji in the catalog (extension `ext:emoji`), as published. */
 export interface EmojiEntry {
@@ -294,6 +308,8 @@ export interface UploadFinish {
   accepted: boolean;
   broadcasts: Broadcast[];
   avatar?: { userId: string; url: string };
+  /** The server's new avatar URL (`/server avatar`). */
+  serverAvatar?: string;
   deletedUploads: string[];
 }
 
@@ -865,6 +881,19 @@ const META_EMOJI_PREVIOUS = "emoji_catalog_previous";
  * user can hold an id starting with `~`.
  */
 const EMOJI_OWNER = "~emoji";
+/**
+ * The owner of the server's avatar upload (`/server avatar`), for the same
+ * reason: it stays across `/purge` and `/rename` of the admin who set it.
+ */
+const SERVER_OWNER = "~server";
+/**
+ * `_meta` key prefix for the server's `title`, `description` and `avatar`
+ * (§3.1) as admins set them with `/server`: `server:<field>` holds the value
+ * (the avatar's URL on the media origin), absent while the deployment
+ * variable applies. Code before it ignores the rows.
+ */
+const META_SERVER_PREFIX = "server:";
+const SERVER_FIELDS = ["title", "description", "avatar"] as const;
 
 /** The R2 key a catalog's JSON is published at: named by its SHA-256, so a new catalog has a new `catalog_url`. */
 function emojiObjectKey(json: string): string {
@@ -1673,6 +1702,8 @@ export class Store {
    * checked against it with no read.
    */
   private emojiCache: { key: string | null; json: string; entries: Record<string, EmojiEntry>; keys: ReadonlySet<string> } | null = null;
+  /** The server's stored `title`, `description` and `avatar` (`/server`), read once and kept with every change. */
+  private serverCache: StoredServerMetadata | null = null;
   /** The rooms one roomMembers call read, when nothing is kept. */
   private readonly uncachedMembers = new Map<string, MemberCacheEntry>();
 
@@ -2046,6 +2077,7 @@ export class Store {
     this.memberGeneration += 1;
     this.memberCache.clear();
     this.emojiCache = null;
+    this.serverCache = null;
     this.initialized = false;
     this.logCache = null;
     this.accountingUnsafe = false;
@@ -4320,6 +4352,7 @@ export class Store {
     if (!policy) throw new StoreError("unsupported", "Uploads are not available here");
     if (!this.identityRow(userId)) throw new StoreError("denied", "Sign in with a passkey to upload");
     if (this.metaValue(META_TOGGLE_PREFIX + "uploads") === "off") throw new StoreError("denied", "Uploads are turned off here");
+    // The server's avatar is an avatar in size.
     const maxBytes = purpose === "file" ? policy.maxFileBytes : purpose === "emoji" ? policy.maxEmojiBytes : policy.maxAvatarBytes;
     const day = dayFor(now);
     const rows = [this.limitRow("upload", `user:${userId}`, now), this.limitRow("upload", "global", now)];
@@ -4333,10 +4366,14 @@ export class Store {
     }
     this.updateLimitRow(rows[0], { day, uploads_day: counts[0] + 1 }, now);
     this.setUploadBytes(stored + maxBytes);
-    const key = `${purpose === "file" ? "f" : purpose === "emoji" ? "e" : "a"}/${randomKey()}`;
+    // The server's avatar is kept like a custom emoji, under `e/`, which the
+    // bucket's lifecycle rules leave alone.
+    const kept = purpose === "emoji" || purpose === "server";
+    const key = `${purpose === "file" ? "f" : kept ? "e" : "a"}/${randomKey()}`;
     const writeExpiresMs = now + policy.writeWindowSeconds * 1_000;
-    // Custom emoji never expire: they go when an admin removes them.
-    const expiresMs = purpose === "emoji" ? Number.MAX_SAFE_INTEGER : now + (purpose === "file" ? policy.fileRetentionSeconds : policy.avatarRetentionSeconds) * 1_000;
+    // Custom emoji and the server's avatar never expire: they go when an
+    // admin removes or replaces them.
+    const expiresMs = kept ? Number.MAX_SAFE_INTEGER : now + (purpose === "file" ? policy.fileRetentionSeconds : policy.avatarRetentionSeconds) * 1_000;
     this.rawExec(
       `INSERT INTO uploads (upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms, created_ms)
        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
@@ -4455,6 +4492,90 @@ export class Store {
       const most = this.config.uploads?.maxEmoji ?? 0;
       if (!catalog.keys.has(input.key) && catalog.keys.size >= most) throw new StoreError("denied", `This server keeps at most ${most} custom emoji; remove one first`);
       return this.startUpload("emoji", input.userId, effective, { messageId: input.key, embedId: `embed_${randomKey()}` }, EMOJI_OWNER);
+    }));
+  }
+
+  /**
+   * Starts the server's avatar upload (§3.1, §4.8.6): `/server avatar` with
+   * one `upload` embed, by an admin. Kept like a custom emoji: the server's
+   * (SERVER_OWNER), never expiring, an avatar in size, and counted against
+   * the admin's and the server's daily uploads and the stored-bytes cap.
+   * The avatar is set when the write finishes (finishUpload).
+   */
+  startServerAvatarUpload(input: { userId: string; now?: number }): PendingUpload {
+    this.ensureReady();
+    const now = input.now ?? this.clock.now();
+    return this.reserved({ reads: 32, writes: UPLOAD_WRITES + 8 }, false, now, () => this.transaction(() => {
+      const effective = this.effectiveNow(now);
+      return this.startUpload("server", input.userId, effective, { embedId: `embed_${randomKey()}` }, SERVER_OWNER);
+    }));
+  }
+
+  /**
+   * The server's `title`, `description` and `avatar` as admins set them with
+   * `/server`, each absent while its deployment variable applies. Read once
+   * after a wake (three primary-key lookups of `_meta`), then kept in memory.
+   */
+  serverMetadata(now = this.clock.now()): StoredServerMetadata {
+    this.ensureReady();
+    return { ...(this.serverCache ?? this.reserved({ reads: 4 }, false, now, () => this.loadServerMetadata())) };
+  }
+
+  /** The cached server metadata, read from its `_meta` rows on first need; the caller holds a reservation. */
+  private loadServerMetadata(): StoredServerMetadata {
+    if (this.serverCache) return this.serverCache;
+    const rows = this.rawRows<{ key: string; value: string }>(
+      "SELECT key, value FROM _meta WHERE key IN (?, ?, ?)",
+      ...SERVER_FIELDS.map((field) => META_SERVER_PREFIX + field),
+    );
+    const stored: StoredServerMetadata = {};
+    for (const field of SERVER_FIELDS) {
+      const value = rows.find((row) => row.key === META_SERVER_PREFIX + field)?.value;
+      if (value) stored[field] = value;
+    }
+    this.serverCache = stored;
+    return stored;
+  }
+
+  /** Keeps one stored server field, or with undefined forgets it; the caller holds a reservation. */
+  private writeServerField(field: (typeof SERVER_FIELDS)[number], value: string | undefined): void {
+    const stored = { ...this.loadServerMetadata() };
+    if (value === undefined) {
+      this.rawExec("DELETE FROM _meta WHERE key = ?", META_SERVER_PREFIX + field);
+      delete stored[field];
+    } else {
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_SERVER_PREFIX + field, value);
+      stored[field] = value;
+    }
+    this.serverCache = stored;
+  }
+
+  /**
+   * Sets the server's `title` or `description` (`/server title <text>`,
+   * `/server description <text>`), or with undefined clears it, so its
+   * deployment variable applies again. The caller validates the value.
+   */
+  setServerText(field: "title" | "description", value: string | undefined, now = this.clock.now()): void {
+    this.ensureReady();
+    this.reserved({ reads: 8, writes: 8 }, false, now, () => this.transaction(() => this.writeServerField(field, value)));
+  }
+
+  /**
+   * Clears the server's avatar (`/server avatar` alone), so `SERVER_AVATAR`
+   * applies again: forgets its URL and releases its upload, whose R2 object
+   * the caller deletes. Returns whether one was set.
+   */
+  clearServerAvatar(now = this.clock.now()): { changed: boolean; deletedUploads: string[] } {
+    this.ensureReady();
+    return this.reserved({ reads: 32, writes: 32 }, false, now, () => this.transaction(() => {
+      const changed = this.loadServerMetadata().avatar !== undefined;
+      if (changed) this.writeServerField("avatar", undefined);
+      const rows = this.rawRows<RawUploadRow>(
+        `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
+         FROM uploads INDEXED BY uploads_owner_idx WHERE owner_id = ? AND purpose = 'server' AND state = 'done' LIMIT 8`,
+        SERVER_OWNER,
+      );
+      return { changed, deletedUploads: this.releaseUploadRows(rows) };
     }));
   }
 
@@ -4648,6 +4769,18 @@ export class Store {
       );
       this.rawExec("UPDATE identities SET avatar_url = ?, avatar_expires_ms = ?, updated_ms = ? WHERE user_id = ?", url, row.expires_ms, now, row.owner_id);
       return { accepted: true, broadcasts: [], avatar: { userId: row.owner_id, url }, deletedUploads: this.releaseUploadRows(replaced) };
+    }
+    if (row.purpose === "server") {
+      if (!ok || !write.contentType!.startsWith("image/")) return { accepted: false, broadcasts: [], deletedUploads: this.releaseUploadRows([row]) };
+      this.completeUploadRow(row, write.bytes!);
+      // The avatar it replaces goes at once, as a user's does.
+      const replaced = this.rawRows<RawUploadRow>(
+        `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
+         FROM uploads INDEXED BY uploads_owner_idx WHERE owner_id = ? AND purpose = 'server' AND state = 'done' AND upload_key <> ? LIMIT 8`,
+        SERVER_OWNER, row.upload_key,
+      );
+      this.writeServerField("avatar", url);
+      return { accepted: true, broadcasts: [], serverAvatar: url, deletedUploads: this.releaseUploadRows(replaced) };
     }
     const message = row.message_id ? this.currentMessage(row.message_id) : null;
     const snapshot = message ? parseJson<MessageSnapshot>(message.snapshot_json) : null;

@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
-import { isAllowedOrigin, loadConfig, pushHostAllowed, type RuntimeConfig } from "./config";
+import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor } from "./account-usage";
@@ -71,6 +71,7 @@ import {
 	type StoreConfig,
 	type StoreMutationInput,
 	type StoreMutationResult,
+	type StoredServerMetadata,
 	type UploadFinish,
 	type UploadWrite,
 } from "./store";
@@ -423,6 +424,17 @@ const JOIN_INVITE_TTL_MS = 7 * 86_400_000;
 /** Device tokens one user may hold at once, each under its own name. */
 const MAX_DEVICE_TOKENS = 3;
 /**
+ * The default room's `description` as the server's (§3.1), where neither
+ * `/server description` nor `SERVER_DESCRIPTION` sets one: trimmed, and left
+ * out, not cut, when empty or past the server description's rules (at most
+ * MAX_SERVER_DESCRIPTION_BYTES), since cut CommonMark can end mid-markup.
+ */
+function roomServerDescription(description: string | undefined): string | undefined {
+	const trimmed = description?.trim();
+	return trimmed && validServerDescription(trimmed) ? trimmed : undefined;
+}
+
+/**
  * The commands this server provides (§4.1), as `/help` lists them to those
  * who may run them: `everyone`, `owners` (registered users other than bots),
  * or `admins` (the `APRON_ADMIN_TOKEN` user and those given the `admin` role).
@@ -440,6 +452,7 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", audience: "admins" },
 	{ name: "invite", usage: "/invite <uses>", help: `get a token that signs up to <uses> new users (at most ${MAX_JOIN_USES}) for a week, replacing the last one; /invite 0 revokes it`, audience: "admins" },
 	{ name: "emoji", usage: "/emoji add|remove :name:", help: "add a custom emoji, or replace its image: send /emoji add :name: with one image attached; /emoji remove :name: removes it", audience: "admins" },
+	{ name: "server", usage: "/server [title|description [<text>] | avatar]", help: "show this server's title, description and avatar; set one, the avatar with one image attached; or clear one, back to the deployment's", audience: "admins" },
 	{ name: "toggle", usage: "/toggle <activity|uploads|presence|addmember>", help: "turn typing activity, uploads, user status (presence), or users adding others to rooms (addmember) off or on for everyone", audience: "admins" },
 	{ name: "purge", usage: "/purge <user_id>", help: "disconnect a user and delete their account, bot, and everything they posted or uploaded", audience: "admins" },
 	{ name: "status", usage: "/status", help: "show today's Cloudflare usage and the demo's budgets", audience: "admins" },
@@ -1209,7 +1222,8 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 	const attachment = grant.key.startsWith("f/");
 	const emoji = grant.key.startsWith("e/");
 	const kept: readonly string[] = attachment ? [...IMAGE_TYPES, ...AUDIO_TYPES] : IMAGE_TYPES;
-	const refusal = attachment ? "Only PNG, JPEG, GIF, and WebP images and WebM, Ogg, and MP4 audio can be uploaded" : `Only PNG, JPEG, GIF, and WebP images can be ${emoji ? "custom emoji" : "avatars"}`;
+	// `e/` holds custom emoji and the server's avatar (`/server avatar`).
+	const refusal = attachment ? "Only PNG, JPEG, GIF, and WebP images and WebM, Ogg, and MP4 audio can be uploaded" : `Only PNG, JPEG, GIF, and WebP images can be ${emoji ? "custom emoji or the server's avatar" : "avatars"}`;
 	const declared = request.headers.get("Content-Type")?.split(";")[0].trim().toLowerCase();
 	if (declared && !kept.includes(declared)) return answer(415, refusal);
 	const length = Number(request.headers.get("Content-Length") ?? NaN);
@@ -1240,8 +1254,9 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 		await media.put(grant.key, body, {
 			httpMetadata: {
 				contentType: sniffed.type,
-				// Attachments and custom emoji never change; an avatar key is
-				// rewritten when refreshed. Custom emoji live until removed.
+				// Attachments, custom emoji and the server's avatar never change;
+				// an avatar key is rewritten when refreshed. Custom emoji and the
+				// server's avatar live until removed or replaced.
 				cacheControl: attachment ? "public, max-age=604800, immutable" : emoji ? "public, max-age=31536000, immutable" : "public, max-age=86400",
 			},
 		});
@@ -1259,7 +1274,7 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 	return answer(204);
 }
 
-/** The object keys a media origin serves: attachments, avatars, custom emoji and their catalogs. */
+/** The object keys a media origin serves: attachments, avatars, custom emoji and their catalogs, and the server's avatar (`e/`). */
 const MEDIA_KEY_PATTERN = /^(?:[fae]\/[A-Za-z0-9_-]{22}|e\/c\/[0-9a-f]{64}\.json)$/;
 
 /**
@@ -1704,6 +1719,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const limits = this.config.limits;
 		const presence = this.presenceMode();
 		const emoji = this.emojiCatalogUrl();
+		const general = this.generalDescription();
 		return {
 			method: "server",
 			params: {
@@ -1742,10 +1758,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// connection, not an account, so `guest` is listed only in `auth`.
 				signup: this.passkeysOffered(origin) ? ["webauthn", "token"] : ["token"],
 				// For the sign-in screen (§3.2); the `~private` welcome below goes in a room.
-				welcome: this.generalDescription() ?? this.signInWelcome(origin),
-				// What the server is, for lists of servers (§3.1): from SERVER_TITLE,
-				// SERVER_DESCRIPTION and SERVER_AVATAR (config.ts).
-				...this.config.server,
+				welcome: general ?? this.signInWelcome(origin),
+				// What the server is, for lists of servers (§3.1): what admins set
+				// with `/server`, else SERVER_TITLE, SERVER_DESCRIPTION and
+				// SERVER_AVATAR (config.ts), else for the description `general`'s.
+				...this.serverMetadata(general),
 				// Answered by the runtime without waking the object (see PING_REQUEST).
 				ping: limits.pingSeconds,
 				// Web Push (§4.9), with the VAPID key browsers subscribe with and
@@ -1772,6 +1789,29 @@ export class ApronDemoServer extends DurableObject<Env> {
 				},
 			},
 		};
+	}
+
+	/**
+	 * The server's `title`, `description` and `avatar` (§3.1): each as an
+	 * admin set it with `/server`, else as the deployment's variable sets it,
+	 * else none, but for the description, which is then the default room
+	 * `general`'s (`general`, read by the caller where it has it), when that
+	 * one is within the description rules. The stored ones are read once
+	 * after a wake; while that read cannot be afforded, the variables apply.
+	 */
+	private serverMetadata(general = this.generalDescription()): ServerMetadata {
+		const metadata: ServerMetadata = { ...this.config.server, ...this.storedServerMetadata() };
+		const fallback = metadata.description === undefined ? roomServerDescription(general) : undefined;
+		return fallback ? { ...metadata, description: fallback } : metadata;
+	}
+
+	/** What admins set with `/server`, or nothing while it cannot be read. */
+	private storedServerMetadata(): StoredServerMetadata {
+		try {
+			return this.store.serverMetadata(nowMs());
+		} catch {
+			return {};
+		}
 	}
 
 	/**
@@ -2933,6 +2973,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!identity) throw { name: "denied", message: "Authenticate before changing rooms" } satisfies ProtocolError;
 		this.assertMayWrite(attachment);
 		await this.runMutation(async () => {
+			// The server's description follows `general`'s while nothing else
+			// sets it (serverMetadata): read before a save of `general`.
+			const describedBefore = request.params.room_id === ROOM_ID ? this.serverMetadata().description : undefined;
 			const result = this.store.mutate({
 				userId: identity.user_id, tier: identity.tier, ipKey: attachment.ipKey,
 				requestId: request.id, method: "room_set", now: nowMs(), params: request.params, identity,
@@ -2953,6 +2996,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 				} else {
 					this.deliver(roomUpdate("updated", room), scope, (state) => state.userId !== identity.user_id);
 					this.sendToUser(identity.user_id, roomUpdate("updated", room));
+					// A new `general` description that is the server's: every
+					// connection gets a new `server` frame with it.
+					if (room.room_id === ROOM_ID && this.serverMetadata(room.description).description !== describedBefore) this.announceServer();
 				}
 			}
 			this.reply(socket, request, result.result);
@@ -4786,6 +4832,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 			return;
 		}
+		if (command.name === "server") {
+			try {
+				await this.serverCommand(socket, attachment, request, roomId, line, body);
+			} catch (error) {
+				const protocol = errorToProtocol(error);
+				if (protocol.name !== "invalid_params") throw error;
+				this.fail(socket, request, protocol);
+			}
+			return;
+		}
 		if (command.name === "passkeys") {
 			try {
 				this.passkeysCommand(socket, attachment, request, roomId, words.slice(1));
@@ -5048,6 +5104,102 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
+	 * `/server` (§4.1, its suggested convention), for admins: alone, a
+	 * `~private` notice showing the server's `title`, `description` and
+	 * `avatar` (§3.1) and where each comes from. `/server title <text>` and
+	 * `/server description <text>` set one, with the rules of `SERVER_TITLE`
+	 * and `SERVER_DESCRIPTION`; without the text they clear the stored value,
+	 * so the deployment's variable applies again. `/server avatar` with one
+	 * `upload` embed answers with its `write_url`, and the image becomes the
+	 * server's avatar when the write finishes (finishEmoji); alone, it clears
+	 * the avatar and deletes its image. A set or clear answers with a
+	 * `~private` notice before the result (§1), and a change sends every
+	 * connection a new `server` frame (announceServer).
+	 */
+	private async serverCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, line: string, body: Record<string, unknown>): Promise<void> {
+		// The text after the field is taken as typed, line breaks included.
+		const [, field = "", rest = ""] = /^\/\S+\s*(\S*)([\s\S]*)$/.exec(line) ?? [];
+		const value = rest.trim();
+		const chosen = field.toLowerCase();
+		const embeds = Array.isArray(body.embeds) ? body.embeds : [];
+		if (chosen !== "avatar" && embeds.length) throw { name: "invalid_params", message: "Only /server avatar takes an attachment" } satisfies ProtocolError;
+		if (!chosen) {
+			this.sendNotice(socket, roomId, this.serverOverview());
+			this.reply(socket, request, {});
+			return;
+		}
+		if (chosen === "avatar") {
+			if (value) throw { name: "invalid_params", message: "Usage: /server avatar with one image attached, or alone to clear it" } satisfies ProtocolError;
+			if (embeds.length) {
+				const attached = embeds.length === 1 && !!embeds[0] && typeof embeds[0] === "object" && (embeds[0] as Record<string, unknown>).kind === "upload";
+				if (!attached) throw { name: "invalid_params", message: "Attach one image to /server avatar as an upload embed" } satisfies ProtocolError;
+				let started = false;
+				await this.runMutation(async () => {
+					const upload = this.store.startServerAvatarUpload({ userId: attachment.userId!, now: nowMs() });
+					this.reply(socket, request, await this.withWriteUrls({ embeds: [uploadResultEmbed(upload)] }));
+					started = this.afterUploads({ uploads: [upload] });
+				});
+				if (started) await this.rescheduleAlarm();
+				return;
+			}
+			let cleared: { changed: boolean; deletedUploads: string[] } = { changed: false, deletedUploads: [] };
+			await this.runMutation(async () => {
+				cleared = this.store.clearServerAvatar(nowMs());
+			});
+			this.deleteMedia(cleared.deletedUploads);
+			if (cleared.changed) this.announceServer();
+			this.sendNotice(socket, roomId, `${cleared.changed ? "Cleared the server's avatar." : "The server's avatar was not set with `/server avatar`."}\n\n${this.serverOverview()}`);
+			this.reply(socket, request, {});
+			return;
+		}
+		if (chosen !== "title" && chosen !== "description") throw { name: "invalid_params", message: "Usage: /server, /server title|description [<text>], or /server avatar" } satisfies ProtocolError;
+		if (chosen === "title" && !validServerTitle(value, this.config.limits)) {
+			throw { name: "invalid_params", message: `A server title is one line of at most ${this.config.limits.maxNameCodePoints} characters` } satisfies ProtocolError;
+		}
+		if (chosen === "description" && !validServerDescription(value)) {
+			throw { name: "invalid_params", message: `A server description is CommonMark of at most ${MAX_SERVER_DESCRIPTION_BYTES} bytes` } satisfies ProtocolError;
+		}
+		const before = this.storedServerMetadata()[chosen];
+		const next = value || undefined;
+		if (next !== before) {
+			await this.runMutation(async () => {
+				this.store.setServerText(chosen, next, nowMs());
+			});
+			this.announceServer();
+		}
+		const done = next !== undefined ? `Set the server's ${chosen}.` : before !== undefined ? `Cleared the server's ${chosen}.` : `The server's ${chosen} was not set with \`/server ${chosen}\`.`;
+		this.sendNotice(socket, roomId, `${done}\n\n${this.serverOverview()}`);
+		this.reply(socket, request, {});
+	}
+
+	/**
+	 * The server's `title`, `description` and `avatar` for `/server`, each
+	 * with where it comes from: set with `/server`, a deployment variable, or
+	 * neither.
+	 */
+	private serverOverview(): string {
+		const stored = this.storedServerMetadata();
+		const variables = { title: "SERVER_TITLE", description: "SERVER_DESCRIPTION", avatar: "SERVER_AVATAR" } as const;
+		const shown = (field: keyof typeof variables, value: string): string => {
+			// CommonMark, quoted in the list item as clients will show it.
+			if (field === "description") return `\n${value.split("\n").map((text) => `  > ${text}`).join("\n")}`;
+			if (field === "avatar") return value.startsWith("data:") ? ` a \`data:\` image of ${value.length} characters` : ` <${value}>`;
+			// A plain name: shown as written, not as CommonMark.
+			return ` ${value.replace(/[\\`*_{}[\]()#+\-.!|<>~&]/g, "\\$&")}`;
+		};
+		const general = this.generalDescription()?.trim();
+		const lines = (["title", "description", "avatar"] as const).map((field) => {
+			const own = stored[field] ?? this.config.server[field];
+			const value = own ?? (field === "description" ? roomServerDescription(general) : undefined);
+			const source = stored[field] !== undefined ? `set with \`/server ${field}\`` : own !== undefined ? `from \`${variables[field]}\`` : `from the default room \`${ROOM_ID}\`'s description`;
+			if (value !== undefined) return `- **${field}** (${source}):${shown(field, value)}`;
+			const why = field === "title" ? " (clients show the server's address)" : field === "description" && general ? ` (\`${ROOM_ID}\`'s description is longer than ${MAX_SERVER_DESCRIPTION_BYTES} bytes or holds control characters, so it is left out)` : "";
+			return `- **${field}**: none${why}`;
+		});
+		return ["This server's title, description and avatar, as clients show it:", ...lines].join("\n");
+	}
+
+	/**
 	 * Makes an emoji edit's catalog current (extension `ext:emoji`), inside
 	 * runMutation so no other edit interleaves: its JSON is written to R2
 	 * first, at a key named by its hash, so `catalog_url` never refers to a
@@ -5077,7 +5229,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Sends every open connection a new `server` frame (§3.1), which fully
-	 * replaces the one it had: after the custom emoji catalog changed. One
+	 * replaces the one it had: after the custom emoji catalog, or the
+	 * server's title, description or avatar (`/server`), changed. One
 	 * frame is built for each origin and wake scope list, since the frame
 	 * depends on them.
 	 */
@@ -6190,20 +6343,31 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * A finished custom emoji write (`/emoji add`): the image becomes its
+	 * A finished `e/` write. A custom emoji's (`/emoji add`) image becomes its
 	 * key's in a new catalog (publishEmoji). One that cannot, such as one
 	 * that came too late, is not an image, or found R2 unavailable for the
-	 * catalog, is released, and the Worker deletes what it stored.
+	 * catalog, is released, and the Worker deletes what it stored. The
+	 * server's avatar (`/server avatar`), kept under `e/` too, is no custom
+	 * emoji (emojiDraft): it finishes as any other upload, and becomes the
+	 * server's `avatar` in a new `server` frame for every connection.
 	 */
 	private async finishEmoji(write: UploadWrite): Promise<boolean> {
 		let accepted = false;
 		let released: string[] = [];
+		let serverAvatar: string | undefined;
 		await this.runMutation(async () => {
 			const draft = this.store.emojiDraft({ add: write }, nowMs());
 			accepted = !!draft && await this.publishEmoji(draft);
-			if (!accepted) released = this.store.finishUpload({ key: write.key, ok: false }, nowMs()).deletedUploads;
+			if (accepted) return;
+			// Without a draft, the write may be the server's avatar's: the store
+			// finishes that one, and fails a custom emoji's as above.
+			const finished = this.store.finishUpload(draft ? { key: write.key, ok: false } : write, nowMs());
+			accepted = finished.accepted;
+			serverAvatar = finished.serverAvatar;
+			released = finished.deletedUploads;
 		});
 		this.deleteMedia(released);
+		if (serverAvatar) this.announceServer();
 		return accepted;
 	}
 

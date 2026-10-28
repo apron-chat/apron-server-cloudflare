@@ -95,7 +95,9 @@ within it:
 - Commands: `/help` replies with a `~private` notice listing the commands the
   sender may run; `/invite-bot` gives a registered user a bot token (below);
   `/invite-device <name>` gives them a token for another device (below);
-  `/avatar` sets one with an attached image (below); other commands are
+  `/avatar` sets one with an attached image (below); admins have their own
+  (SPEC section 5, Admins), among them `/server`, which sets the server's
+  title, description and avatar (below); other commands are
   `invalid_params`.
 - Uploads (cap `embed:upload`, Workers Paid budgets): registered users attach
   images and voice clips as `upload` embeds, written to the `write_url` in their result and
@@ -343,9 +345,12 @@ but do consume frame and lookup resources.
 ## Server settings
 
 The `server` frame carries `title`, `description` and `avatar` (protocol
-§3.1), from `SERVER_TITLE` (else `RP_NAME`), `SERVER_DESCRIPTION` and
-`SERVER_AVATAR` (each else left out), so clients can show
-which server this is. Every extension it advertises is defined in
+§3.1), so clients can show which server this is: each as an admin set it
+with `/server`, else from `SERVER_TITLE`, `SERVER_DESCRIPTION` and
+`SERVER_AVATAR`, else, for the description, `general`'s description where it
+is at most 500 bytes, else left out (`RP_NAME` is for passkey prompts only).
+Each change sends every connection a new `server` frame (see
+[configuration](configuration.md#server-title-description-and-avatar)). Every extension it advertises is defined in
 [EXTENSIONS.md](https://github.com/shazow/apron/blob/main/EXTENSIONS.md). `ext:settings` carries
 `server.params.ext.settings`: `read_cursors`, whether a registered user's read
 cursors are kept (with activity), and `private_rooms`, the number of private

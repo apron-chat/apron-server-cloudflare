@@ -4,7 +4,7 @@
 // a byte, so a guessed or altered URL never reaches R2 or the Durable Object.
 
 interface UploadGrant {
-	/** The R2 object key, `f/<id>`, `a/<id>`, or `e/<id>` for a custom emoji. */
+	/** The R2 object key, `f/<id>`, `a/<id>`, or `e/<id>` for a custom emoji or the server's avatar. */
 	key: string;
 	maxBytes: number;
 	expiresMs: number;

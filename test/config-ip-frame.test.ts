@@ -139,15 +139,17 @@ describe('configuration policy boundaries', () => {
 		expect(() => config({ APRON_ADMIN_TOKEN: 'apron_device_0123456789abcdefghij' })).toThrow(ConfigError);
 	});
 
-	it('takes the server frame\'s title, description and avatar (§3.1) from SERVER_*, with only the title by default', () => {
-		// Unset, the title is RP_NAME; no description or avatar.
-		expect(config().server).toEqual({ title: 'Apron Demo' });
-		expect(config({ RP_NAME: 'Chat Club' }).server.title).toBe('Chat Club');
+	it('takes the server frame\'s title, description and avatar (§3.1) from SERVER_*, with none by default', () => {
+		// Unset, none of them; RP_NAME names the server only to WebAuthn.
+		expect(config().server).toEqual({});
+		expect(config({ RP_NAME: 'Chat Club' }).server).toEqual({});
+		expect(config({ RP_NAME: 'Chat Club' }).rpName).toBe('Chat Club');
 		expect(config({
 			SERVER_TITLE: ' Chat Club ', SERVER_DESCRIPTION: 'Talk about *clubs*.\nAll welcome.', SERVER_AVATAR: 'https://chat.example/icon.png',
 		}).server).toEqual({ title: 'Chat Club', description: 'Talk about *clubs*.\nAll welcome.', avatar: 'https://chat.example/icon.png' });
 		// Empty leaves a field out.
 		expect(config({ SERVER_TITLE: '', SERVER_DESCRIPTION: '' }).server).toEqual({});
+		expect(config({ SERVER_DESCRIPTION: '   ' }).server).toEqual({});
 		expect(config({ SERVER_AVATAR: 'data:image/png;base64,iVBORw0KGgo=' }).server.avatar).toBe('data:image/png;base64,iVBORw0KGgo=');
 		expect(() => config({ SERVER_TITLE: 'x'.repeat(81) })).toThrow(ConfigError);
 		expect(() => config({ SERVER_TITLE: 'two\nlines' })).toThrow(ConfigError);

@@ -76,7 +76,7 @@ delete its state while investigating restart-safe quotas or identity recovery.
 
 Uploads, avatars and custom emoji are off locally until the upload settings
 are set. Let the Worker be its own media origin, and give it an admin token
-for `/emoji add`:
+for `/emoji add` and `/server avatar`:
 
 ```sh
 npx wrangler dev --port 8080 \

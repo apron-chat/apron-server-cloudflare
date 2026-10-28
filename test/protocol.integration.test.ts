@@ -941,8 +941,8 @@ it('advertises the extensions ext:settings, ext:limits, ext:media and ext:permis
 		expect(server.capabilities).toContain('ext:permissions');
 		// No custom emoji yet: ext:emoji waits for the first (uploads.integration.test.ts).
 		expect(server.capabilities).not.toContain('ext:emoji');
-		// What the server is (§3.1): RP_NAME, without a description or an avatar by default.
-		expect(server.title).toBe('Apron Demo');
+		// What the server is (§3.1): nothing without SERVER_* or /server, not RP_NAME.
+		expect(server).not.toHaveProperty('title');
 		expect(server).not.toHaveProperty('description');
 		expect(server).not.toHaveProperty('avatar');
 		const file = { max_bytes: UPLOAD_POLICY!.maxFileBytes };

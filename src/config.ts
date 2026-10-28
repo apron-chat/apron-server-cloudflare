@@ -10,11 +10,11 @@ export interface RuntimeConfig {
 	rpOrigins: readonly string[];
 	rpName: string;
 	/**
-	 * What the `server` frame shows people about this server (§3.1): a plain
-	 * `title` (`SERVER_TITLE`, else `RP_NAME`), a short CommonMark
-	 * `description` (`SERVER_DESCRIPTION`, else none), and an `avatar` image
-	 * URL (`SERVER_AVATAR`, else none). An empty variable leaves its field
-	 * out.
+	 * What the `server` frame shows people about this server (§3.1), as the
+	 * deployment sets it: a plain `title` (`SERVER_TITLE`), a short CommonMark
+	 * `description` (`SERVER_DESCRIPTION`), and an `avatar` image URL
+	 * (`SERVER_AVATAR`), each else none. An empty variable leaves its field
+	 * out. An admin's `/server` overrides each (ApronDemoServer.serverMetadata).
 	 */
 	server: ServerMetadata;
 	admissionOff: boolean;
@@ -78,8 +78,8 @@ export interface ServerMetadata {
 	avatar?: string;
 }
 
-/** The longest `SERVER_DESCRIPTION`, in UTF-8 bytes: a few words, sent in every `server` frame. */
-const MAX_SERVER_DESCRIPTION_BYTES = 500;
+/** The longest server `description` (`SERVER_DESCRIPTION`, `/server description`), in UTF-8 bytes: a few words, sent in every `server` frame. */
+export const MAX_SERVER_DESCRIPTION_BYTES = 500;
 /** The longest `SERVER_AVATAR`, in characters: an https URL, or a small `data:` image. */
 const MAX_SERVER_AVATAR_CHARS = 8_192;
 
@@ -363,7 +363,7 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 	if (!rpName.trim() || [...rpName].length > limits.maxNameCodePoints || new TextEncoder().encode(rpName).byteLength > limits.maxNameBytes) {
 		throw new ConfigError("RP_NAME exceeds the configured display-name policy");
 	}
-	const server = loadServerMetadata(env, rpName, limits);
+	const server = loadServerMetadata(env, limits);
 	return {
 		limits,
 		allowedOrigins,
@@ -384,25 +384,39 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 }
 
 /**
- * `SERVER_TITLE`, `SERVER_DESCRIPTION` and `SERVER_AVATAR` (§3.1): unset,
- * the title is `RP_NAME` and the others are left out; empty, the field is
- * left out. The title is a plain name within the display-name policy,
- * the description short CommonMark, and the avatar an `https:` URL or a
+ * Whether a server `title` (§3.1), trimmed, is a plain name within the
+ * display-name policy: one line, at most `maxNameCodePoints` code points and
+ * `maxNameBytes` bytes. `SERVER_TITLE` and `/server title` both follow it.
+ */
+export function validServerTitle(title: string, limits: Limits): boolean {
+	// eslint-disable-next-line no-control-regex
+	return !/[\u0000-\u001f\u007f]/.test(title) && [...title].length <= limits.maxNameCodePoints && new TextEncoder().encode(title).byteLength <= limits.maxNameBytes;
+}
+
+/**
+ * Whether a server `description` (§3.1), trimmed, is short CommonMark: text
+ * whose only control character is a line feed, at most
+ * MAX_SERVER_DESCRIPTION_BYTES. `SERVER_DESCRIPTION` and `/server
+ * description` both follow it.
+ */
+export function validServerDescription(description: string): boolean {
+	// eslint-disable-next-line no-control-regex
+	return !/[\u0000-\u0009\u000b-\u001f\u007f]/.test(description) && new TextEncoder().encode(description).byteLength <= MAX_SERVER_DESCRIPTION_BYTES;
+}
+
+/**
+ * `SERVER_TITLE`, `SERVER_DESCRIPTION` and `SERVER_AVATAR` (§3.1): unset or
+ * empty, the field is left out (`RP_NAME` names the server only to WebAuthn).
+ * The title is a plain name within the display-name policy, the description
+ * short CommonMark, and the avatar an `https:` URL or a
  * `data:image/{png,jpeg,gif,webp};base64,` URL (§4.8.6).
  */
-function loadServerMetadata(env: EnvLike, rpName: string, limits: Limits): ServerMetadata {
-	const title = (env.SERVER_TITLE ?? rpName).trim();
+function loadServerMetadata(env: EnvLike, limits: Limits): ServerMetadata {
+	const title = (env.SERVER_TITLE ?? "").trim();
 	const description = (env.SERVER_DESCRIPTION ?? "").trim();
 	const avatar = (env.SERVER_AVATAR ?? "").trim();
-	// eslint-disable-next-line no-control-regex
-	const control = /[\u0000-\u001f\u007f]/;
-	if (title && (control.test(title) || [...title].length > limits.maxNameCodePoints || new TextEncoder().encode(title).byteLength > limits.maxNameBytes)) {
-		throw new ConfigError("SERVER_TITLE must be a plain name within the display-name policy");
-	}
-	// eslint-disable-next-line no-control-regex
-	if (/[\u0000-\u0009\u000b-\u001f\u007f]/.test(description) || new TextEncoder().encode(description).byteLength > MAX_SERVER_DESCRIPTION_BYTES) {
-		throw new ConfigError(`SERVER_DESCRIPTION must be at most ${MAX_SERVER_DESCRIPTION_BYTES} bytes of text`);
-	}
+	if (!validServerTitle(title, limits)) throw new ConfigError("SERVER_TITLE must be a plain name within the display-name policy");
+	if (!validServerDescription(description)) throw new ConfigError(`SERVER_DESCRIPTION must be at most ${MAX_SERVER_DESCRIPTION_BYTES} bytes of text`);
 	if (avatar && (avatar.length > MAX_SERVER_AVATAR_CHARS || !(validHttpsUrl(avatar) || /^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(avatar)))) {
 		throw new ConfigError("SERVER_AVATAR must be an https: URL or a small data:image/{png,jpeg,gif,webp};base64, URL");
 	}

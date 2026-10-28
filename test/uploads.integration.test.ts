@@ -289,6 +289,61 @@ describe('store uploads', () => {
 		});
 	});
 
+	it('keeps the server\'s title, description and avatar in _meta, the avatar the server\'s, never expiring and counted as stored (/server)', async () => {
+		await withStore('uploads-server', { uploads: UPLOADS }, (store, clock, state) => {
+			register(store, clock, 'ada');
+			const sql = state.storage.sql;
+			const storedBytes = () => Number(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'upload_bytes'").toArray()[0]?.value ?? 0);
+			const meta = () => Object.fromEntries(sql.exec<{ key: string; value: string }>("SELECT key, value FROM _meta WHERE key LIKE 'server:%'").toArray().map((row) => [row.key, row.value]));
+			expect(store.serverMetadata(clock.value)).toEqual({});
+			store.setServerText('title', 'Chat Club', clock.value);
+			store.setServerText('description', 'Talk about *clubs*.', clock.value);
+			expect(store.serverMetadata(clock.value)).toEqual({ title: 'Chat Club', description: 'Talk about *clubs*.' });
+			store.setServerText('description', undefined, clock.value);
+			expect(meta()).toEqual({ 'server:title': 'Chat Club' });
+
+			// An avatar is an avatar in size, kept under e/ as the server's.
+			const start = () => {
+				const upload = store.startServerAvatarUpload({ userId: 'ada', now: clock.value });
+				expect(upload).toMatchObject({ key: expect.stringMatching(/^e\/[A-Za-z0-9_-]{22}$/), maxBytes: UPLOADS.maxAvatarBytes });
+				expect(store.claimUpload(upload.key, clock.value)).toBe(true);
+				return upload;
+			};
+			const first = start();
+			expect(storedBytes()).toBe(UPLOADS.maxAvatarBytes);
+			// It is no custom emoji, and only an image becomes the avatar.
+			expect(store.emojiDraft({ add: { key: first.key, ok: true, bytes: 64, contentType: 'image/png' } }, clock.value)).toBeNull();
+			const finished = store.finishUpload({ key: first.key, ok: true, bytes: 64, contentType: 'image/png' }, clock.value);
+			expect(finished).toEqual({ accepted: true, broadcasts: [], serverAvatar: `${MEDIA}/${first.key}`, deletedUploads: [] });
+			expect(storedBytes()).toBe(64);
+			expect(sql.exec<{ owner_id: string; expires_ms: number }>('SELECT owner_id, expires_ms FROM uploads WHERE upload_key = ?', first.key).one()).toEqual({ owner_id: '~server', expires_ms: Number.MAX_SAFE_INTEGER });
+			const audio = start();
+			expect(store.finishUpload({ key: audio.key, ok: true, bytes: 64, contentType: 'audio/webm' }, clock.value)).toMatchObject({ accepted: false, deletedUploads: [audio.key] });
+			// A new one replaces the old, whose object goes at once.
+			const second = start();
+			expect(store.finishUpload({ key: second.key, ok: true, bytes: 32, contentType: 'image/png' }, clock.value)).toEqual({ accepted: true, broadcasts: [], serverAvatar: `${MEDIA}/${second.key}`, deletedUploads: [first.key] });
+			expect(storedBytes()).toBe(32);
+
+			// It never expires, and renaming or purging the admin who set it leaves it.
+			clock.value += 400 * 86_400_000;
+			store.cleanupUploads(clock.value);
+			store.renameIdentity({ from: 'ada', to: 'ada_2', now: clock.value });
+			expect(store.purgeUsers({ userIds: ['ada_2'], now: clock.value }).deletedUploads).toEqual([]);
+			expect(store.serverMetadata(clock.value)).toEqual({ title: 'Chat Club', avatar: `${MEDIA}/${second.key}` });
+			expect(storedBytes()).toBe(32);
+
+			// After a wake, the values are read again from their rows.
+			const woken = new Store(state, { uploads: UPLOADS }, clock.clock);
+			woken.initialize();
+			expect(woken.serverMetadata(clock.value)).toEqual({ title: 'Chat Club', avatar: `${MEDIA}/${second.key}` });
+			// Clearing the avatar releases its image.
+			expect(woken.clearServerAvatar(clock.value)).toEqual({ changed: true, deletedUploads: [second.key] });
+			expect(woken.clearServerAvatar(clock.value)).toEqual({ changed: false, deletedUploads: [] });
+			expect(storedBytes()).toBe(0);
+			expect(meta()).toEqual({ 'server:title': 'Chat Club' });
+		});
+	});
+
 	it('keeps a replaced or removed emoji image with the previous catalog, and releases both at the next change (ext:emoji)', async () => {
 		const config = { uploads: { ...UPLOADS, maxEmoji: 4 } };
 		await withStore('uploads-emoji-superseded', config, (store, clock, state) => {
@@ -901,6 +956,101 @@ describe('uploads end to end', () => {
 			expect((await request(admin, 'remove-other', 'command', { room_id: 'general', body: { text: '/emoji remove :confetti:' } })).result).toEqual({});
 			expect((await serverFrame(watcher)).capabilities).not.toContain('ext:emoji');
 		} finally { admin.close(); watcher.close(); user.close(); }
+	});
+
+	it('/server shows, sets and clears the server\'s title, description and avatar for admins, over its variables', async () => {
+		const admin = await connect(null);
+		await admin.next();
+		expect((await request(admin, 'auth', 'auth', { scheme: 'token', token: ADMIN_TOKEN })).result.you.user_id).toBe('admin');
+		const watcher = await connect();
+		const user = await signedIn(unique('member'));
+		const serverFrame = async (peer: Peer) => (await until(peer, (frame) => frame.method === 'server')).frame.params;
+		const notice = (skipped: Frame[]) => skipped.find((frame) => frame.params?.from?.user_id === '~private')!.params.body.text as string;
+		const command = (id: string, text: string, embeds?: unknown[]) => exchange(admin, id, 'command', { room_id: 'general', body: { text, ...(embeds ? { embeds } : {}) } });
+		const configured = await runInDurableObject(stub(), (instance) => (instance as unknown as { config: { server: Record<string, string> } }).config.server);
+		const setVariables = (server: Record<string, string>) => runInDurableObject(stub(), (instance) => {
+			const runtime = instance as unknown as { config: { server: Record<string, string> } };
+			runtime.config = { ...runtime.config, server };
+		});
+		try {
+			// Nothing set: no title (not RP_NAME), description or avatar.
+			const before = (await watcher.next()).params;
+			expect(before).not.toHaveProperty('title');
+			expect(before).not.toHaveProperty('description');
+			expect(before).not.toHaveProperty('avatar');
+			const shown = await command('show', '/server');
+			expect(shown.frame.result).toEqual({});
+			expect(notice(shown.skipped)).toBe([
+				'This server\'s title, description and avatar, as clients show it:',
+				'- **title**: none (clients show the server\'s address)',
+				'- **description**: none',
+				'- **avatar**: none',
+			].join('\n'));
+			// Admins only, listed in their /help.
+			const help = await exchange(admin, 'help', 'command', { room_id: 'general', body: { text: '/help' } });
+			expect(notice(help.skipped)).toContain('`/server [title|description [<text>] | avatar]`');
+			expect((await request(user, 'not-admin', 'command', { body: { text: '/server title Mine' } })).error.code).toBe(-32001);
+			expect((await request(user, 'not-admin-show', 'command', { body: { text: '/server' } })).error.code).toBe(-32001);
+			// The rules of SERVER_TITLE and SERVER_DESCRIPTION; unknown fields and stray attachments are refused.
+			for (const [id, text] of [['long-title', `/server title ${'x'.repeat(81)}`], ['two-lines', '/server title two\nlines'], ['long-description', `/server description ${'x'.repeat(501)}`], ['control', '/server description a\u0007b'], ['unknown', '/server colour blue'], ['avatar-text', '/server avatar https://example.com/a.png']]) {
+				expect((await request(admin, id, 'command', { body: { text } })).error.code).toBe(-32602);
+			}
+			expect((await request(admin, 'stray', 'command', { body: { text: '/server title Club', embeds: [{ kind: 'upload' }] } })).error.code).toBe(-32602);
+			expect((await request(admin, 'two-images', 'command', { body: { text: '/server avatar', embeds: [{ kind: 'upload' }, { kind: 'upload' }] } })).error.code).toBe(-32602);
+
+			// Each change sends every connection a new server frame.
+			const titled = await command('title', '/server title  Chat Club ');
+			expect(notice(titled.skipped)).toContain('Set the server\'s title.\n\nThis server\'s title, description and avatar, as clients show it:\n- **title** (set with `/server title`): Chat Club\n');
+			expect((await serverFrame(watcher)).title).toBe('Chat Club');
+			expect((await serverFrame(user)).title).toBe('Chat Club');
+			await command('description', '/server description Talk about *clubs*.\nAll welcome.');
+			const described = await serverFrame(watcher);
+			expect(described).toMatchObject({ title: 'Chat Club', description: 'Talk about *clubs*.\nAll welcome.' });
+			expect(described.capabilities).toContain('command');
+			expect(notice((await command('show-set', '/server')).skipped)).toContain('- **description** (set with `/server description`):\n  > Talk about *clubs*.\n  > All welcome.');
+
+			// An image becomes the avatar when its write finishes; it is kept under e/, never expiring.
+			const audio = await command('audio', '/server avatar', [{ kind: 'upload' }]);
+			expect((await put(audio.frame.result.embeds[0].write_url, webm())).status).toBe(415);
+			const started = await command('avatar', '/server avatar', [{ kind: 'upload' }]);
+			const write = started.frame.result.embeds[0].write_url as string;
+			expect(write).toMatch(/^https:\/\/demo\.test\/w\/e\./);
+			expect((await put(write, png(256, 256))).status).toBe(204);
+			const avatar = (await serverFrame(watcher)).avatar as string;
+			expect(avatar).toMatch(/^https:\/\/media\.test\/e\/[A-Za-z0-9_-]{22}$/);
+			await until(user, (frame) => frame.method === 'server' && frame.params.avatar === avatar);
+			const key = avatar.slice('https://media.test/'.length);
+			expect((await media().head(key))?.httpMetadata).toMatchObject({ contentType: 'image/png', cacheControl: 'public, max-age=31536000, immutable' });
+			expect(await runInDurableObject(stub(), (_instance, state) => state.storage.sql.exec<{ owner_id: string; purpose: string }>('SELECT owner_id, purpose FROM uploads WHERE upload_key = ?', key).one())).toEqual({ owner_id: '~server', purpose: 'server' });
+			const late = await connect();
+			expect((await late.next()).params).toMatchObject({ title: 'Chat Club', description: 'Talk about *clubs*.\nAll welcome.', avatar });
+			late.close();
+
+			// Stored values survive a restart and override the variables; clearing one falls back to its variable.
+			await setVariables({ title: 'From Variable', description: 'Variable *description*.', avatar: 'https://example.com/icon.png' });
+			await runInDurableObject(stub(), (instance) => { (instance as unknown as { store: { serverCache: unknown } }).store.serverCache = null; });
+			const restarted = await connect();
+			expect((await restarted.next()).params).toMatchObject({ title: 'Chat Club', description: 'Talk about *clubs*.\nAll welcome.', avatar });
+			restarted.close();
+			const cleared = await command('clear-title', '/server title');
+			expect(notice(cleared.skipped)).toContain('Cleared the server\'s title.\n\nThis server\'s title, description and avatar, as clients show it:\n- **title** (from `SERVER_TITLE`): From Variable\n');
+			expect((await serverFrame(watcher)).title).toBe('From Variable');
+			await command('clear-description', '/server description');
+			expect((await serverFrame(watcher)).description).toBe('Variable *description*.');
+			const unset = await command('clear-again', '/server title');
+			expect(notice(unset.skipped)).toContain('The server\'s title was not set with `/server title`.');
+			// Clearing the avatar deletes its image.
+			const removed = await command('clear-avatar', '/server avatar');
+			expect(removed.frame.result).toEqual({});
+			expect(notice(removed.skipped)).toContain('Cleared the server\'s avatar.');
+			expect(notice(removed.skipped)).toContain('- **avatar** (from `SERVER_AVATAR`): <https://example.com/icon.png>');
+			expect((await serverFrame(watcher)).avatar).toBe('https://example.com/icon.png');
+			await expect.poll(async () => await media().head(key)).toBeNull();
+			expect(await runInDurableObject(stub(), (_instance, state) => state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM _meta WHERE key LIKE 'server:%'").one().count)).toBe(0);
+		} finally {
+			await setVariables(configured);
+			admin.close(); watcher.close(); user.close();
+		}
 	});
 
 	it('serves uploads itself, readable from any origin, only where it is its own media origin', async () => {
