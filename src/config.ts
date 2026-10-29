@@ -264,6 +264,9 @@ function validateLimits(limits: Limits): void {
 	if (limits.pingTimeoutSeconds < 2 * limits.pingSeconds) {
 		fail("the ping timeout must outlast a missed ping");
 	}
+	if (limits.unpingedTimeoutSeconds < limits.pingTimeoutSeconds) {
+		fail("the timeout for connections that never pinged must outlast the ping timeout");
+	}
 	if (limits.globalPostsPerMinute > budget.MAX_GLOBAL_POSTS_PER_MINUTE || limits.globalPostsPerDay > budget.MAX_GLOBAL_POSTS_PER_DAY || limits.globalPostsPerMinute > limits.globalPostsPerDay) {
 		fail("global posting policy exceeds the demo ceiling");
 	}

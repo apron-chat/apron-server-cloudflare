@@ -37,6 +37,14 @@ async function advance(ms: number): Promise<void> {
 	await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).flushPresence());
 }
 
+/** Sets the running object's unpingedTimeoutSeconds; callers restore it. */
+async function unpingedTimeout(seconds: number): Promise<void> {
+	await runInDurableObject(stub(), (instance) => {
+		const server = instance as unknown as { config: { limits: Record<string, number> } };
+		server.config = { ...server.config, limits: { ...server.config.limits, unpingedTimeoutSeconds: seconds } };
+	});
+}
+
 async function register(userId: string): Promise<void> {
 	await runInDurableObject(stub(), (instance) => {
 		(instance as unknown as Runtime).store.registerIdentity({
@@ -1067,7 +1075,7 @@ describe('sign-ins, listings and attendance', () => {
 		} finally { observer.close(); dnd.close(); }
 	});
 
-	it('never infers idle: a connection that never sent idle stays online to others however long it is quiet', async () => {
+	it('never infers idle: a connection that never sent idle stays online to others while it is quiet', async () => {
 		const watcherId = unique('watcher');
 		const watcher = await signedIn(watcherId);
 		const userId = unique('quiet');
@@ -1079,8 +1087,10 @@ describe('sign-ins, listings and attendance', () => {
 			expect((await request(quiet, 'auth', 'auth', { scheme: 'token', token })).result.you.user_id).toBe(userId);
 			await advance(COALESCE);
 			expect(told(await drain(watcher), userId)).toEqual(['online']);
-			// An hour without a frame from it: still attended, so nothing changes.
-			await advance(60 * 60_000);
+			// Twelve minutes without a frame from it: still attended, so nothing
+			// changes. (It never pings: 15 minutes, unpingedTimeoutSeconds, after
+			// its last frame it would be closed as stale, never made idle.)
+			await advance(12 * 60_000);
 			await advance(COALESCE);
 			expect(told(await drain(watcher), userId)).toEqual([]);
 			expect(await listed(watcher, userId)).toMatchObject({ status: 'online' });
@@ -1610,6 +1620,9 @@ describe('seen is written at most once in SEEN_WRITE_GRANULARITY_MS', () => {
 		let shy = await signedIn(shyId);
 		let other = await signedIn(shyId, { existing: true });
 		const sql = await recordSql();
+		// The clock jumps past unpingedTimeoutSeconds here with the watcher
+		// quiet; a real client would be pinging, so keep it from going stale.
+		await unpingedTimeout(24 * 60 * 60);
 		try {
 			await drain(watcher);
 			await choose(shy, 'invisible');
@@ -1666,7 +1679,7 @@ describe('seen is written at most once in SEEN_WRITE_GRANULARITY_MS', () => {
 			expect(writes(sql, shyId)).toEqual([s1, s2]);
 			expect(await stored(shyId)).toBe(s2);
 			expect(await listed(watcher, shyId)).toMatchObject({ status: 'offline', seen: later.seen });
-		} finally { watcher.close(); shy.close(); other.close(); }
+		} finally { await unpingedTimeout(900); watcher.close(); shy.close(); other.close(); }
 	});
 
 	it('reads seen at sign-in with the identity row, with no read of its own', async () => {
