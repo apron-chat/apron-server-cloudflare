@@ -31,10 +31,12 @@ new_sqlite_classes = ["ApronDemoServer"]
 RP_ID = "apron.chat"
 RP_ORIGINS = "https://web.apron.chat"
 ALLOWED_ORIGINS = "*"
-# The server frame's title and description (docs/configuration.md, Server
-# title, description and avatar); an admin's /server overrides either.
+# The server frame's title, description and avatar (docs/configuration.md,
+# Server title, description and avatar); an admin's /server overrides each.
 SERVER_TITLE = "Apron Demo"
 SERVER_DESCRIPTION = "The public demo of [Apron](https://github.com/shazow/apron), an open chat protocol."
+# The Apron icon, square at 512px, served by apron-web.
+SERVER_AVATAR = "https://web.apron.chat/icon-512.png"
 ACCOUNT_ID = "2bfd32937c0c07a923c79f6bb1a17253"
 # The apron.chat zone, where the budget guard turns the apron_budget_stop rule
 # on and off (with the EDGE_STOP_TOKEN secret).
