@@ -115,6 +115,9 @@ describe('admin alerts', () => {
 			const sent = pushes.find((push) => push.url === bossPush.url)!;
 			const payload = JSON.parse((await decryptPush(sent.body, bossPush.browser)).plaintext);
 			expect(payload).toMatchObject({ push_id: 'boss-push', message: { room_id: 'general', from: { user_id: 'admin' }, message_id: shown.frame.params.message_id } });
+			// A second alert within the room's coalescing window is pushed too.
+			await stub().notifyAdmins('**Storage accounting closed.**');
+			await vi.waitFor(() => expect(pushes.filter((push) => push.url === bossPush.url)).toHaveLength(2));
 		} finally { boss.close(); plain.close(); }
 	});
 });

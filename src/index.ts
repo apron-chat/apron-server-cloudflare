@@ -482,8 +482,8 @@ const ADMIN_USER_NAME = "Admin";
 const UNAVAILABLE_RETRY_MS = 60_000;
 /** The IP key an operator alert is charged to (notifyAdmins): no connection sends it. */
 const ALERT_IP_KEY = "alert";
-/** Admins one alert mentions and pushes to, so its text and its push claims stay bounded. */
-const MAX_ALERT_ADMINS = 16;
+/** Admins one alert mentions and pushes to: as many as one message may wake, which bounds the claim's reservation. */
+const MAX_ALERT_ADMINS = PUSH_POLICY?.wakesPerMessage ?? 10;
 /** Bot tokens start with this, so `auth` tells them from passkey session tokens without a storage read. */
 const BOT_TOKEN_PREFIX = "apron_bot_";
 /** Key prefix for bot tokens in key-value storage, by the token's SHA-256 like sessions. */
@@ -4667,24 +4667,36 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	async notifyAdmins(text: string): Promise<void> {
 		this.noteActivity();
+		// Caught inside, so a failed alert never takes runMutation's way out of
+		// an uncertain commit, closing every socket: under the edge stop, the
+		// sockets already open are the only ones that still work.
+		let failure: unknown;
 		await this.runMutation(async () => {
-			const now = nowMs();
-			const admins = this.store.alert(() => {
-				const ensured = this.store.ensureAdminUser({ userId: ADMIN_USER_ID, name: ADMIN_USER_NAME, now, ipKey: ALERT_IP_KEY });
-				for (const record of ensured.broadcasts) this.broadcastRecord(record);
-				return this.store.usersWithRole("admin", MAX_ALERT_ADMINS, now).filter((userId) => userId !== ADMIN_USER_ID);
-			});
-			const body = { text: [...admins.map((userId) => `@${userId}`), text].join(" "), ...(admins.length ? { mentions: admins } : {}) };
-			this.store.alert(() => {
-				const result = this.store.mutate({
-					userId: ADMIN_USER_ID, tier: "registered", ipKey: ALERT_IP_KEY, method: "message", now, system: true,
-					params: { room_id: ROOM_ID, body }, identity: { user_id: ADMIN_USER_ID, name: ADMIN_USER_NAME, tier: "registered" },
+			try {
+				const now = nowMs();
+				const admins = this.store.alert(() => {
+					const ensured = this.store.ensureAdminUser({ userId: ADMIN_USER_ID, name: ADMIN_USER_NAME, now, ipKey: ALERT_IP_KEY });
+					for (const record of ensured.broadcasts) this.broadcastRecord(record);
+					return this.store.usersWithRole("admin", MAX_ALERT_ADMINS, now).filter((userId) => userId !== ADMIN_USER_ID);
 				});
-				for (const record of result.broadcasts) this.broadcastRecord(record);
-				if (result.message && admins.length) this.pushWake(result.message, new Map(admins.map((userId) => [userId, WAKE_SCOPES.mentions])));
-			});
-			console.warn(JSON.stringify({ event: "admins_notified", admins: admins.length }));
+				// The notice first, so a push's shortened text still shows it.
+				const mentioned = admins.length ? `${text}\n\n${admins.map((userId) => `@${userId}`).join(" ")}` : text;
+				const body = { text: mentioned, format: "markdown", ...(admins.length ? { mentions: admins } : {}) };
+				const pushed = this.store.alert(() => {
+					const result = this.store.mutate({
+						userId: ADMIN_USER_ID, tier: "registered", ipKey: ALERT_IP_KEY, method: "message", now, system: true,
+						params: { room_id: ROOM_ID, body }, identity: { user_id: ADMIN_USER_ID, name: ADMIN_USER_NAME, tier: "registered" },
+					});
+					for (const record of result.broadcasts) this.broadcastRecord(record);
+					return !!result.message && admins.length > 0 && !!this.config.push && this.pushWake(result.message, new Map(admins.map((userId) => [userId, WAKE_SCOPES.mentions])), true);
+				});
+				// `pushed: false` with admins: none had a registration that a mute or `dnd` left.
+				console.warn(JSON.stringify({ event: "admins_notified", admins: admins.length, pushed }));
+			} catch (error) {
+				failure = error;
+			}
 		});
+		if (failure !== undefined) throw failure;
 	}
 
 	/**
@@ -4692,7 +4704,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * Whether that settled it: something was claimed, or an allowance is
 	 * spent, so another message would not do.
 	 */
-	private pushWake(message: MessageSnapshot, reasons: ReadonlyMap<string, number>): boolean {
+	private pushWake(message: MessageSnapshot, reasons: ReadonlyMap<string, number>, alert = false): boolean {
 		const vapid = this.config.push;
 		const policy = PUSH_POLICY;
 		if (!vapid || !policy) return true;
@@ -4704,7 +4716,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// PUSH_HOSTS as configured now: a registration made under a wider list
 			// is passed over before it takes a wake or a push.
 			const hosts = this.config.pushHosts;
-			claimed = this.store.claimPushes({ senderId: sender, roomId: message.room_id, candidates, allowed: (url) => pushEndpointError(url, hosts) === null, now });
+			claimed = this.store.claimPushes({ senderId: sender, roomId: message.room_id, candidates, allowed: (url) => pushEndpointError(url, hosts) === null, now, alert });
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "push_claim_failed", reason: errorToProtocol(error).message }));
 			return true;

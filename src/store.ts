@@ -532,7 +532,7 @@ export interface StoreMutationInput {
   params: Record<string, unknown>;
   identity: Identity;
   digest?: string;
-  /** An operator alert the server posts itself (Store.alert): no posting limits apply. */
+  /** An operator alert the server posts itself (Store.alert): no posting limits or storage high-water apply. */
   system?: boolean;
 }
 
@@ -2072,11 +2072,13 @@ export class Store {
     const start = { reads: this.observed.reads, writes: this.observed.writes };
     if (this.metaValue(META_ACCOUNTING_RECOVERY) === recovery) return false;
     const day = dayFor(Math.max(this.lastEffectiveMs, this.clock.now()));
+    // Written below, so the write after the transaction (persistAccountingMarker)
+    // does not repeat it; a failed transaction fails initialize, which reads it again.
+    this.accountingMarker = "0";
     this.transaction(() => {
       this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, '0'), (?, ?)", META_ACCOUNTING_UNSAFE, META_ACCOUNTING_RECOVERY, recovery);
       this.chargeUpgrade(start, day);
     });
-    this.accountingMarker = "0";
     console.warn(JSON.stringify({ event: "accounting_unsafe_cleared", recovery }));
     return true;
   }
@@ -2094,22 +2096,27 @@ export class Store {
    */
   private recoverUncertain(): boolean {
     if (this.inTransaction) return false;
+    const start = { reads: this.observed.reads, writes: this.observed.writes };
+    const day = dayFor(Math.max(this.lastEffectiveMs, this.clock.now()));
     let charged: { reads: number; writes: number } | undefined;
-    if (this.lostOnWake) {
-      charged = { reads: Math.ceil(this.config.sqlReadsPerDay / 100), writes: Math.ceil(this.config.sqlWritesPerDay / 100) };
-      const day = dayFor(Math.max(this.lastEffectiveMs, this.clock.now()));
-      const start = { reads: this.observed.reads, writes: this.observed.writes };
-      try {
+    try {
+      if (this.lostOnWake) {
+        charged = { reads: Math.ceil(this.config.sqlReadsPerDay / 100), writes: Math.ceil(this.config.sqlWritesPerDay / 100) };
         this.ledger.addUnchecked(day, maintenanceDelta(charged));
-        // And the rows that charge took, as an in-place upgrade's are.
-        this.chargeUpgrade(start, day);
-      } catch {
-        return false;
+        // Charged once, even if what follows fails and recovery is tried again.
+        this.lostOnWake = false;
       }
-      this.lostOnWake = false;
+      this.ledger.flush();
+      if (this.ledger.hasStaged()) return false;
+      // Nothing was staged when a read failed: read the budget row, so a read
+      // that still fails is not taken for recovery.
+      this.rawRows("SELECT day FROM resource_budgets WHERE day = ? LIMIT 1", day);
+      // The rows recovery took, charged as an in-place upgrade's are: callers
+      // recover before they count their own (assertAccounting).
+      this.chargeUpgrade(start, day);
+    } catch {
+      return false;
     }
-    this.ledger.flush();
-    if (this.ledger.hasStaged()) return false;
     this.accountingUncertain = false;
     this.persistAccountingMarker();
     console.warn(JSON.stringify({ event: "accounting_uncertain_recovered", ...(charged ? { charged } : {}) }));
@@ -2119,7 +2126,9 @@ export class Store {
   /**
    * Throws while accounting is closed: for good after an overrun, and after
    * a storage failure until recoverUncertain succeeds. An operator alert
-   * (alert) runs regardless.
+   * (alert) runs regardless. Every metered operation calls it before it
+   * starts counting its rows, so recovery's own rows are never charged to
+   * the operation that triggered it.
    */
   private assertAccounting(): void {
     if (this.alerting) return;
@@ -2555,6 +2564,7 @@ export class Store {
 
   /** Explicit boundary for runtime operations that do their own SQL. */
   withMeter<T>(kind: "foreground" | "maintenance", cost: CostEstimate, fn: () => T, now = this.clock.now()): T {
+    this.assertAccounting();
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
     const reserved = this.reserveCost(cost, kind === "maintenance", now);
@@ -2617,6 +2627,7 @@ export class Store {
    * serve, whether it returns or throws.
    */
   private reserved<T>(cost: CostEstimate, maintenance: boolean, now: number, fn: (unused: { history: number }) => T, unchecked = false): T {
+    this.assertAccounting();
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
     const reservation = this.reserveCost(cost, maintenance, now, unchecked);
@@ -3583,6 +3594,7 @@ export class Store {
   }): StoredIdentity & { broadcasts: Broadcast[] } {
     this.ensureReady();
     const { credential } = input;
+    this.assertAccounting();
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
     // The starting rooms are checked against the capped rooms table, and each
@@ -3682,6 +3694,7 @@ export class Store {
   addCredential(input: { userId: string; userHandle: string; credential: StoredCredential; now: number; ipKey: string }): { userId: string; name: string } {
     this.ensureReady();
     const { credential } = input;
+    this.assertAccounting();
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
     const reservation = this.reserveCost({ reads: 96, writes: 48, registrations: 1 }, false, input.now);
@@ -4105,19 +4118,23 @@ export class Store {
   private createKeylessIdentity(input: { userId: string; name: string; tier: "bot" | "registered"; roles?: string[]; now: number; ipKey: string }): { broadcasts: Broadcast[] } {
     ensureText(input.name, "name", this.config.maxNameBytes);
     if ([...input.name].length > this.config.maxNameCodePoints) throw new StoreError("too_large", "name is too long");
+    this.assertAccounting();
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
     // The limiter and meta rows, the identity row, and one membership row and
     // logged record in `general`.
     const reservation = this.reserveCost({ reads: 128, writes: 72, registrations: 1 }, false, input.now);
+    // An operator alert creating the admin user it posts as (alert) is not
+    // held to the registration cap, limits, or storage high-water.
+    const alerting = this.alerting;
     try {
-      if (this.metaNumber("identity_count") >= this.config.registeredIdentityCount) throw new StoreError("denied", "registration_closed");
-      this.ensureGrowthCapacity(this.config.maxSnapshotBytes);
+      if (!alerting && this.metaNumber("identity_count") >= this.config.registeredIdentityCount) throw new StoreError("denied", "registration_closed");
+      if (!alerting) this.ensureGrowthCapacity(this.config.maxSnapshotBytes);
       const effective = this.effectiveNow(input.now);
       return this.transaction(() => {
         if (this.identityRow(input.userId)) throw new StoreError("invalid_params", "identity already exists");
-        if (this.metaNumber("identity_count") >= this.config.registeredIdentityCount) throw new StoreError("denied", "registration_closed");
-        this.chargeRegistration(input.ipKey, effective);
+        if (!alerting && this.metaNumber("identity_count") >= this.config.registeredIdentityCount) throw new StoreError("denied", "registration_closed");
+        if (!alerting) this.chargeRegistration(input.ipKey, effective);
         this.rawExec(
           "INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES (?, '', ?, ?, ?, ?, ?)",
           input.userId, input.name, input.tier, effective, effective, JSON.stringify(input.roles ?? []),
@@ -4190,6 +4207,7 @@ export class Store {
   } {
     this.ensureReady();
     const operationNow = input.now ?? this.clock.now();
+    this.assertAccounting();
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
     // The three posting limiter rows, the identity and membership rows, the
@@ -5208,9 +5226,12 @@ export class Store {
    * spend the server's day. With
    * `allowed`, a registration whose endpoint it refuses (PUSH_HOSTS) is
    * passed over before it counts. Each woken user's time for the room is kept for coalescing.
-   * Each claimed registration carries the scopes it is pushed for.
+   * Each claimed registration carries the scopes it is pushed for. An
+   * operator `alert` (ApronDemoServer.notifyAdmins) skips the coalescing
+   * window and the allowances, though it is counted against them; a mute
+   * or `dnd` still silences it (§4.9).
    */
-  claimPushes(input: { senderId: string; roomId: string; candidates: readonly PushCandidate[]; allowed?: (url: string) => boolean; now?: number }): PushClaim {
+  claimPushes(input: { senderId: string; roomId: string; candidates: readonly PushCandidate[]; allowed?: (url: string) => boolean; now?: number; alert?: boolean }): PushClaim {
     this.ensureReady();
     const policy = this.config.push;
     const reasons = new Map<string, number>();
@@ -5269,7 +5290,8 @@ export class Store {
         const joinedOnly = rows.every((row) => (integerColumn(row.wake) & why) === WAKE_SCOPES.joined);
         const last = this.rawRows<{ woken_ms: number }>("SELECT woken_ms FROM push_wakes WHERE user_id = ? AND room_id = ? LIMIT 1", userId, input.roomId)[0];
         const window = joinedOnly ? policy.joinedCoalesceSeconds : policy.coalesceSeconds;
-        if (last && effective - integerColumn(last.woken_ms) < window * 1_000) continue;
+        // An operator alert is never held back by the window or the allowances below.
+        if (!input.alert && last && effective - integerColumn(last.woken_ms) < window * 1_000) continue;
         // The counters are read once a user is found to wake, so a message
         // that wakes no one writes nothing. Reuse posts_day as the counts; the
         // scope separates them.
@@ -5284,7 +5306,7 @@ export class Store {
           "SELECT day, posts_day FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1", recipientScope, `user:${userId}`,
         )[0];
         const received = recipient?.day === day ? integerColumn(recipient.posts_day) : 0;
-        const allowed = Math.max(0, Math.min(
+        const allowed = input.alert ? rows.length : Math.max(0, Math.min(
           rows.length,
           policy.pushesPerDay - counters.sent,
           (joinedOnly ? policy.joinedPushesPerRecipientDay : policy.pushesPerRecipientDay) - received,
@@ -6117,12 +6139,14 @@ export class Store {
       reads: Math.max(256, this.config.mutationCost.reads ?? 0) + roomScan,
       writes: Math.max(mayMove ? 256 : 96, this.config.mutationCost.writes ?? 0) + uploadWrites,
     };
+    this.assertAccounting();
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
     const reserved = this.reserveCost(mutationCost, false, operationNow);
     try {
       effective = this.effectiveNow(operationNow);
-      this.ensureGrowthCapacity(this.config.maxSnapshotBytes);
+      // An operator alert is one small message: storage high-water does not hold it back.
+      if (!input.system) this.ensureGrowthCapacity(this.config.maxSnapshotBytes);
       return this.transaction(() => {
         const beforeCommit = <T>(value: T): T => {
           // Assert while transactionSync's closure is still open.  If an
@@ -6375,6 +6399,7 @@ export class Store {
   private deferCleanup(effective: number): void {
     const nextDue = Math.max(effective + 1000, (Math.floor(effective / 86_400_000) + 1) * 86_400_000);
     if (this.deferredCleanupUntil >= nextDue) return;
+    this.assertAccounting();
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
     const reserved = this.reserveMaintenanceControl({ reads: 2, writes: 2 }, effective);
@@ -6459,6 +6484,7 @@ export class Store {
       removed_rooms: [], next_due_ms: nextDue, did_work: false,
     });
     if (effective < due) return empty(due);
+    this.assertAccounting();
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
     let reserved: BudgetCost;
@@ -6637,6 +6663,7 @@ export class Store {
     const candidateTime = Math.max(Math.trunc(now), this.lastEffectiveMs);
     if (this.scheduledAlarmAt !== undefined && this.scheduledAlarmAt > candidateTime &&
         (socketDeadline === undefined || this.scheduledAlarmAt <= socketDeadline)) return;
+    this.assertAccounting();
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
     let reserved: BudgetCost;

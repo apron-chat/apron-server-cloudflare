@@ -40,7 +40,7 @@ it('tells the admins when an overrun closes accounting, and a status probe then 
 		const record = JSON.parse(latest.record_json) as { from: { user_id: string }; body: { text: string; mentions: string[] } };
 		expect(record.from.user_id).toBe('admin');
 		expect(record.body.mentions).toEqual([bossId]);
-		expect(record.body.text).toContain(`@${bossId} **Storage accounting closed.**`);
+		expect(record.body.text).toMatch(new RegExp(`^\\*\\*Storage accounting closed\\.\\*\\*[^]*\\n\\n@${bossId}$`));
 	});
 
 	const probe = await stub.fetch(new Request('https://demo.test/?apron_connection_status=1', { headers: { Origin: 'http://localhost:5173', 'X-Apron-Trusted-IP-Key': 'probe-key-for-the-test' } }));
@@ -85,4 +85,18 @@ it('logs how long a timer kept the object awake since its last activity', async 
 	const lines = log.mock.calls.map(([line]) => String(line)).filter((line) => line.includes('"timer_kept_awake"')).map((line) => JSON.parse(line));
 	// The second counts only from the first: a timer firing is activity too.
 	expect(lines).toEqual([{ event: 'timer_kept_awake', timer: 'presence', ms: 45_000 }, { event: 'timer_kept_awake', timer: 'push_wake', ms: 15_000 }]);
+});
+
+it('posts the alert though registration is closed and the admin user does not exist yet', async () => {
+	const stub = env.DEMO.getByName('alert-registration-closed');
+	const warn = vi.spyOn(console, 'warn');
+	await runInDurableObject(stub, async (instance, state) => {
+		const store = (instance as unknown as Runtime).store as unknown as Store & { config: { registeredIdentityCount: number } };
+		expect(state.storage.sql.exec("SELECT COUNT(*) AS count FROM identities WHERE user_id = 'admin'").one().count).toBe(0);
+		store.config.registeredIdentityCount = 0;
+		await (instance as unknown as { notifyAdmins(text: string): Promise<void> }).notifyAdmins('**Budget stop is on.**');
+		const [latest] = state.storage.sql.exec<{ record_json: string }>("SELECT record_json FROM records WHERE room_id = 'general' AND kind = 'message' ORDER BY log_id DESC LIMIT 1").toArray();
+		expect(JSON.parse(latest.record_json)).toMatchObject({ from: { user_id: 'admin' }, body: { text: '**Budget stop is on.**', format: 'markdown' } });
+	});
+	expect(warn.mock.calls.map(([line]) => String(line))).toContainEqual(expect.stringContaining('"admins_notified"'));
 });

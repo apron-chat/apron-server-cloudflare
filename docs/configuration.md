@@ -133,9 +133,11 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
 - **Admin alert.** When the guard or the flood trip (below) turns the rule
   on, and when a cost overrun closes storage accounting, the server posts a
   message in `general` as the `admin` user that mentions every user with the
-  `admin` role (at most 16), and pushes it to them at once. Give yourself the
-  role (`/admin <user_id>`) and allow notifications in your client to get it
-  on your phone. The rule is turned on first and the alert sent after; an
+  `admin` role (up to 10, as many as one message wakes), and pushes it to
+  them at once, past the usual wait, coalescing and push allowances. Give
+  yourself the role (`/admin <user_id>`) and allow notifications in your
+  client to get it on your phone; muting `general` or choosing `dnd`
+  silences it, as it does any push. Nothing is sent when the stop lifts. The rule is turned on first and the alert sent after; an
   alert that fails is logged (`trigger_notice_failed`) and changes nothing
   else. The edge rule blocks only public requests, so the alert still reaches
   the Durable Object and the push services.
