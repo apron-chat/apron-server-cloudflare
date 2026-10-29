@@ -384,14 +384,19 @@ For direct Wrangler production commands, always pass
 1. Verify the **account's actual plan matches `PLAN`** in `src/budget.ts` and
    SQLite Durable Objects are enabled. Inventory other Workers, DO namespaces,
    and staging workloads; their usage shares the same account allowances.
-2. Recheck [DO pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/)
-   and [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/).
-   The documentation checked 2026-09-27 lists daily Free allowances of 100,000 DO
+2. Recheck [DO pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/),
+   [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/),
+   [Observability pricing](https://developers.cloudflare.com/observability/pricing/)
+   (Workers Logs from 2026-12-01) and [R2 pricing](https://developers.cloudflare.com/r2/pricing/).
+   The documentation checked 2026-10-29 lists daily Free allowances of 100,000 DO
    requests, 13,000 GB-seconds, 5 million SQLite rows read, 100,000 rows written,
    5 GB account SQLite storage, and 100,000 entry Worker requests; and monthly
    Paid included usage of 1 million DO requests, 400,000 GB-seconds, 25 billion
-   rows read, 50 million rows written, 5 GB-month of storage, and 10 million
-   entry Worker requests. Reserve headroom for all account workloads. Confirm
+   rows read, 50 million rows written, 5 GB-month of storage, 10 million entry
+   Worker requests and 30 million CPU milliseconds, 50 GB of logs ingested and
+   10 GB-month stored (20 million log events before 2026-12-01), and R2's free
+   1 million Class A and 10 million Class B operations and 10 GB-month. The
+   plan files (`src/plans/`) encode these; change them with the prices. Reserve headroom for all account workloads. Confirm
    the application cost tests and configured limits still fit; the daily post
    ceiling (10,000; 5,000 on Free) is a ceiling, not a promise. On Paid, set
    up the [budget guard](configuration.md#budget-guard): the

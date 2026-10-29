@@ -129,11 +129,24 @@ export const PAID_PLAN: Plan = Object.freeze({
 			durableObjectDurationGbSeconds: 400_000,
 			sqlRowsRead: 25_000_000_000,
 			sqlRowsWritten: 50_000_000,
-			// Workers Logs: one event per Worker or Durable Object invocation,
-			// counted without the WebSocket ratio.
-			logEvents: 20_000_000,
+			// Workers Logs from 2026-12-01: 50 GB ingested and 10 GB-month stored
+			// a billing cycle, then $0.25 a GB and $0.10 a GB-month. Logs are kept
+			// 7 days, so storage is at most 7/30 of what was ingested in the cycle
+			// and the week before: about 6 GB-month for one month's stop, and
+			// past 10 only when two months' stops fall in one cycle, by cents.
+			// Until then logs bill per event, 20 million included: the stop is
+			// about 3 million sampled worker events, and the Durable Object
+			// request stop comes long before its 12 million Durable Object ones.
+			logBytes: 50_000_000_000,
 		}),
 		monthlyStopRatio: 0.5,
+		// Measured on the demo in October 2026: Durable Object events about
+		// 1 KB, entry Worker events up to 6.3 KB with their request headers.
+		logEstimate: Object.freeze({
+			sampleRate: 0.1,
+			workerEventBytes: 8_192,
+			durableObjectEventBytes: 2_048,
+		}),
 		// R2's free tier, which covers uploads (below): billed past it too.
 		r2: Object.freeze({
 			classAOperationsMonthly: 1_000_000,

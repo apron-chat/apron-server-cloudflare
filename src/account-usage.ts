@@ -30,7 +30,8 @@ interface AccountUsageMonth {
 	durableObjectDurationGbSeconds: number;
 	sqlRowsRead: number;
 	sqlRowsWritten: number;
-	logEvents: number;
+	/** Log bytes ingested, estimated (`logEstimate`). */
+	logBytes: number;
 	/** R2 operations this month, for a plan with R2 allowances. */
 	r2?: R2Usage;
 }
@@ -173,6 +174,17 @@ export function accountUsageSnapshotFromResult(result: unknown, sampledAt: numbe
 	return { ...usage, stop: exceededAllowances(usage).length > 0 };
 }
 
+/**
+ * Log bytes for a month's invocations: each entry Worker request and Durable
+ * Object invocation at the most its event takes, times the sampling rate.
+ * scripts/budget.mjs refuses a plan with monthly allowances but no estimate.
+ */
+function logBytes(workerRequests: number, invocations: number): number {
+	const estimate = ACCOUNT_USAGE_POLICY.logEstimate;
+	if (!estimate) throw new AccountUsageError("the plan has no logEstimate");
+	return (workerRequests * estimate.workerEventBytes + invocations * estimate.durableObjectEventBytes) * estimate.sampleRate;
+}
+
 function monthUsage(account: Record<string, unknown>, sampledAt: number): AccountUsageMonth {
 	const workerRequests = sum(account.monthWorkers, "requests");
 	const invocations = sum(account.monthInvocations, "requests");
@@ -184,7 +196,7 @@ function monthUsage(account: Record<string, unknown>, sampledAt: number): Accoun
 		durableObjectDurationGbSeconds: sum(account.monthPeriodic, "duration"),
 		sqlRowsRead: sum(account.monthPeriodic, "rowsRead"),
 		sqlRowsWritten: sum(account.monthPeriodic, "rowsWritten"),
-		logEvents: workerRequests + invocations,
+		logBytes: logBytes(workerRequests, invocations),
 		...(ACCOUNT_USAGE_POLICY.r2 ? { r2: r2Operations(account.monthR2Operations) } : {}),
 	};
 }

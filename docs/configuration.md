@@ -150,8 +150,8 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   silences it. Nothing is sent when the stop lifts. An alert that fails is
   logged (`trigger_notice_failed`) and never undoes the stop.
 - The monthly allowances are Worker requests, Worker CPU, Durable Object
-  requests and duration, SQL rows read and written, and Workers Logs events,
-  plus R2's free tier for uploads: Class A and Class B operations (each day
+  requests and duration, SQL rows read and written, and Workers Logs bytes
+  (estimated; below), plus R2's free tier for uploads: Class A and Class B operations (each day
   also stopping at a 31st of the month) and 10 GB stored.
   A billing cycle overlaps at most two calendar months, so stopping each month
   at one half keeps any cycle inside the included usage.
@@ -168,10 +168,18 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   rule on for at least `holdSeconds` (30 minutes) after it was turned on,
   long enough for analytics to show the flood and the daily or monthly stop
   to take over. These settings are in the plan's `edgeStop`.
-- **Log sampling.** Every invocation writes a Workers Logs event, billed past
-  20 million a month at twice the request price, so production keeps one in
-  ten (`head_sampling_rate = 0.1`). The guard's `logEvents` count every
-  invocation, so it stops early on logs rather than late.
+- **Log sampling.** Every invocation writes a Workers Logs event. From
+  2026-12-01 logs bill by the GB ([Cloudflare Observability
+  pricing](https://developers.cloudflare.com/observability/pricing/): 50 GB
+  ingested and 10 GB-month stored a billing cycle, then $0.25 a GB and $0.10
+  a GB-month); until then by the event (20 million a month, then $0.60 a
+  million). Production keeps one in ten (`head_sampling_rate = 0.1`).
+  Analytics do not report log bytes, so the guard estimates them from
+  invocations with the plan's `logEstimate`: every entry Worker request at
+  8 KiB and every Durable Object invocation at 2 KiB, above the 6.3 KB and
+  1 KB measured on the demo, times the sampling rate. `npm run budget:check`
+  refuses a production config that samples more than the estimate assumes.
+  The request stops come long before this one; it is a backstop.
 
 Set it up once per deployment:
 
@@ -196,17 +204,19 @@ and `budget_guard_rule_failed`, one in ten of them with log sampling.
 What the guard cannot promise:
 
 - **A few seconds of every flood are billed.** A request past the included
-  usage costs about $0.38 a million (request $0.30, a tenth of a log event
-  $0.06, about a millisecond of CPU $0.02). Each calendar month stops at half
+  usage costs about $0.49 a million from 2026-12-01 (request $0.30, about a
+  millisecond of CPU $0.02, and a tenth of a 6.3 KB log event, $0.16 to
+  ingest and $0.015 to keep a week); $0.38 before, when that tenth of a log
+  event cost $0.06. Each calendar month stops at half
   its allowance plus whatever arrives before the stop takes effect, so a
   billing cycle that straddles two calendar months can be billed for two such
   windows. A flood is stopped within the rate limiter's detection (1,200
   requests at one location, a second or less at flood rates) plus the rule
   change reaching the edge, taken here as 30 seconds: at 100,000 requests a
-  second, two windows cost about $2.30, and the cost grows with the rate.
+  second, two windows cost about $2.95, and the cost grows with the rate.
   An attack spread thinly enough to stay under 20 requests a second at every
   location (a few thousand a second in all) is left to the minute guard and
-  its analytics lag of about six minutes: about $1.80 for two windows. These
+  its analytics lag of about six minutes: about $2.30 for two windows. These
   are worst cases for sustained attacks that Cloudflare's own DDoS mitigation
   does not catch.
 - **Open sockets.** The edge rule stops new requests, not WebSockets already

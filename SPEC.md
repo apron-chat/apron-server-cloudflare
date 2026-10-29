@@ -494,7 +494,7 @@ Stop admission and close remaining sockets when the global frame budget is exhau
 
 ## 7. Budget accounting and plan guarantee
 
-Current planning baseline, checked 2026-09-27. Each plan's budgets live in `src/plans/`; `PLAN` in `src/budget.ts` selects the one that matches the account.
+Current planning baseline, checked 2026-10-29. Each plan's budgets live in `src/plans/`; `PLAN` in `src/budget.ts` selects the one that matches the account.
 
 | Cloudflare resource | Workers Free allowance | Workers Paid included usage (per 31-day share) |
 | --- | ---: | ---: |
@@ -504,6 +504,7 @@ Current planning baseline, checked 2026-09-27. Each plan's budgets live in `src/
 | SQLite rows written | 100,000/day | 50 million/month (1.6 million/day) |
 | SQLite storage | 5 GB/account | 5 GB-month |
 | Entry Worker requests | 100,000/day | 10 million/month (320,000/day) |
+| Workers Logs | 200,000 events/day (0.5 GB/day from 2026-12-01) | 50 GB ingested and 10 GB-month stored per billing cycle from 2026-12-01 (20 million events/month before) |
 
 DO incoming WebSocket messages have a 20:1 request-metering ratio; handshakes/RPC/alarms also count. Outgoing messages have no request charge. These are shared allowances, not per-object allocations. Free-plan exhaustion fails operations; a paid plan's included allowance is not a spending cap, so the Paid budgets are sized against its per-day share with headroom and the account-usage stop acts at 90% of it. Paid includes fewer DO requests than Free, so frame and connection budgets rise much less than SQL ones. See [DO pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/) and [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/); the [deployment checklist](docs/guide.md#deployment-checklist) rechecks them.
 

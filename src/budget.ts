@@ -213,6 +213,8 @@ interface AccountAllowance {
 	 */
 	monthly?: Readonly<MonthlyAllowance>;
 	monthlyStopRatio?: number;
+	/** How the monthly stop estimates `logBytes`, for a plan with monthly allowances. */
+	logEstimate?: Readonly<LogEstimate>;
 	/**
 	 * R2's free tier, for a plan that stores uploads there. Each day stops at
 	 * its share (a 31st) of the monthly operations, and the month at
@@ -234,7 +236,26 @@ interface MonthlyAllowance {
 	durableObjectDurationGbSeconds: number;
 	sqlRowsRead: number;
 	sqlRowsWritten: number;
-	logEvents: number;
+	/**
+	 * Bytes of logs ingested: Workers Logs bill by the GB from 2026-12-01
+	 * (Cloudflare Observability pricing). Analytics do not report them, so
+	 * they are estimated from invocations (LogEstimate).
+	 */
+	logBytes: number;
+}
+
+/**
+ * Log bytes per invocation, as the account-usage stop estimates them: every
+ * entry Worker request and Durable Object invocation, times the sampling
+ * rate, at the most one event of each kind takes.
+ */
+interface LogEstimate {
+	/** The production `head_sampling_rate` or above; scripts/budget.mjs refuses a config that logs more. */
+	sampleRate: number;
+	/** An entry Worker request's event, its request headers included. */
+	workerEventBytes: number;
+	/** A Durable Object invocation's event (a WebSocket message, an alarm, an RPC). */
+	durableObjectEventBytes: number;
 }
 
 /** Defaults for the feature switches; `ACTIVITY`, `GUEST_POSTING` and `PRESENCE` override them. */

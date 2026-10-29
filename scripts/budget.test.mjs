@@ -112,6 +112,22 @@ test('a plan that bills past its included usage requires the budget guard cron a
 	assert.throws(() => check(base + cron), /ZONE_ID/);
 });
 
+test('a plan that estimates log bytes requires production to sample logs at most at its rate', () => {
+	const packageJson = { scripts: { deploy: 'npm run budget:check && wrangler deploy --config wrangler.production.toml' } };
+	const workflow = '      - run: npm run deploy\n';
+	const development = 'name = "apron-cloudflare-demo-dev"\n';
+	const base = 'name = "apron-cloudflare-demo"\nworkers_dev = false\npreview_urls = false\nroutes = [{ pattern = "server.apron.chat", custom_domain = true }]\n';
+	const check = (production) => validateDeploymentConfiguration({ development, production, packageJson, workflow, logSampleRate: 0.1 });
+	assert.doesNotThrow(() => check(base + '[observability]\nenabled = true\nhead_sampling_rate = 0.1\n'));
+	assert.doesNotThrow(() => check(base + '[observability]\nenabled = true\n# one in twenty\nhead_sampling_rate = 0.05\n'));
+	assert.doesNotThrow(() => check(base + '[observability]\nenabled = false\n'));
+	assert.throws(() => check(base + '[observability]\nenabled = true\nhead_sampling_rate = 0.5\n'), /head_sampling_rate/);
+	// Unset, Workers Logs sample every request.
+	assert.throws(() => check(base + '[observability]\nenabled = true\n'), /head_sampling_rate/);
+	assert.throws(() => check(base), /head_sampling_rate/);
+	assert.doesNotThrow(() => validateDeploymentConfiguration({ development, production: base, packageJson, workflow }));
+});
+
 test('a plan with an edge stop also generates the sampled flood counter', () => {
 	const edgeStop = { floodRequestsPerColoMinute: 1200, floodSampleEvery: 20, holdSeconds: 1800 };
 	const binding = renderBinding(namespaces, ADMISSION_BUDGET, { namespace: '456', edgeStop });

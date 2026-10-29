@@ -155,7 +155,7 @@ function configName(source, file) {
 	return match[1];
 }
 
-export function validateDeploymentConfiguration({ development, production, packageJson, workflow, budgetGuard = false, uploads = false }) {
+export function validateDeploymentConfiguration({ development, production, packageJson, workflow, budgetGuard = false, uploads = false, logSampleRate }) {
 	const developmentName = configName(development, 'wrangler.toml');
 	const productionName = configName(production, 'wrangler.production.toml');
 	const productionTopLevel = topLevelConfig(production);
@@ -190,6 +190,17 @@ export function validateDeploymentConfiguration({ development, production, packa
 			throw new Error('Production Wrangler config must set ZONE_ID for the budget guard');
 		}
 	}
+	// The budget guard estimates log bytes at the plan's sampling rate, so
+	// production must not log more: Workers Logs sample every request unless
+	// head_sampling_rate says otherwise.
+	if (logSampleRate !== undefined) {
+		const observability = production.match(/^\[observability\]\s*(?:#.*)?\n((?:[^\[].*\n?)*)/m)?.[1] ?? '';
+		const off = /^enabled\s*=\s*false\s*(?:#.*)?$/m.test(observability);
+		const rate = Number(observability.match(/^head_sampling_rate\s*=\s*([0-9.]+)\s*(?:#.*)?$/m)?.[1] ?? (off ? 0 : 1));
+		if (!off && !(rate <= logSampleRate)) {
+			throw new Error(`Production Wrangler config must sample logs at most at the plan's rate (head_sampling_rate <= ${logSampleRate})`);
+		}
+	}
 	// A plan with uploads needs its bucket and both origins, or uploads are off.
 	if (uploads) {
 		if (!/^\[\[r2_buckets\]\]\s*\n(?:[^\[].*\n)*?binding\s*=\s*"MEDIA"/m.test(production)) {
@@ -216,7 +227,13 @@ function main() {
 	const production = readFileSync(new URL('wrangler.production.toml', root), 'utf8');
 	const packageJson = JSON.parse(readFileSync(new URL('package.json', root), 'utf8'));
 	const workflow = readFileSync(new URL('.github/workflows/deploy.yml', root), 'utf8');
-	validateDeploymentConfiguration({ development, production, packageJson, workflow, budgetGuard: Boolean(ACCOUNT_USAGE_POLICY.monthly), uploads: Boolean(PLAN.uploads) });
+	if (ACCOUNT_USAGE_POLICY.monthly && !ACCOUNT_USAGE_POLICY.logEstimate) throw new Error('A plan with monthly allowances needs a logEstimate for the budget guard');
+	validateDeploymentConfiguration({
+		development, production, packageJson, workflow,
+		budgetGuard: Boolean(ACCOUNT_USAGE_POLICY.monthly),
+		uploads: Boolean(PLAN.uploads),
+		logSampleRate: ACCOUNT_USAGE_POLICY.logEstimate?.sampleRate,
+	});
 	const outputs = [];
 	for (const [file, attempts, floodNamespace, prefix, location] of [
 		['wrangler.toml', '73001', '73003', '73005', '73007'],

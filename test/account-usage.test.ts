@@ -25,6 +25,12 @@ function result(overrides: Record<string, unknown> = {}) {
 	return { data: { viewer: { accounts: [{ ...base, ...overrides }] } } };
 }
 
+/** The log bytes the plan estimates for a month's worker requests and Durable Object invocations. */
+function logBytesFor(workerRequests: number, invocations: number): number {
+	const estimate = ACCOUNT_USAGE_POLICY.logEstimate!;
+	return (workerRequests * estimate.workerEventBytes + invocations * estimate.durableObjectEventBytes) * estimate.sampleRate;
+}
+
 describe("account usage snapshots", () => {
 	it("queries the supported Workers dataset and parses the response", async () => {
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
@@ -86,7 +92,7 @@ describe("account usage snapshots", () => {
 			durableObjectDurationGbSeconds: 30,
 			sqlRowsRead: 40,
 			sqlRowsWritten: 50,
-			logEvents: 70,
+			logBytes: logBytesFor(10, 60),
 			...(ACCOUNT_USAGE_POLICY.r2 ? { r2: { classAOperations: 30, classBOperations: 50 } } : {}),
 		});
 		expect(exceededAllowances(snapshot)).toEqual([]);
@@ -96,6 +102,13 @@ describe("account usage snapshots", () => {
 		}), Date.now());
 		expect(overMonth.stop).toBe(true);
 		expect(exceededAllowances(overMonth)).toEqual(["monthly.workerCpuMs"]);
+		// Log bytes are estimated from invocations, sampled: a month of entry
+		// Worker requests that logs its ratio of the allowance stops.
+		const estimate = ACCOUNT_USAGE_POLICY.logEstimate!;
+		const floodRequests = Math.ceil((monthly.logBytes * ratio) / (estimate.workerEventBytes * estimate.sampleRate));
+		const overLogs = accountUsageSnapshotFromResult(result({ monthWorkers: [{ sum: { requests: floodRequests, cpuTimeUs: 0 } }] }), Date.now());
+		expect(overLogs.month?.logBytes).toBeGreaterThanOrEqual(monthly.logBytes * ratio);
+		expect(exceededAllowances(overLogs)).toContain("monthly.logBytes");
 		const overDay = accountUsageSnapshotFromResult(result({
 			workersInvocationsAdaptive: [{ sum: { requests: ACCOUNT_USAGE_POLICY.daily.workerRequests } }],
 		}), Date.now());
