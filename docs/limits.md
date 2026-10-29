@@ -69,7 +69,8 @@ A limit can reach a client in four ways:
 | 503 | Demo admission is closed | Operator switch | none | Maintenance or an incident. |
 | 503 | Server unavailable; try again shortly | Platform failure | 60 | Not your client. |
 | 403 | Origin not allowed | `ALLOWED_ORIGINS` (the demo allows any) | none | Only on a deployment that restricts origins. |
-| 400 | WebSocket upgrade required | Only `GET /` or `GET /ws` with `Upgrade: websocket`, or the probe | none | A plain HTTP request, or a request with a body. |
+| 400 | WebSocket upgrade required | Only `GET /` or `GET /ws` with `Upgrade: websocket`, or the probe | none | A plain HTTP request. A non-`GET` gets 405 "Method not allowed", and a handshake with a body 400 "WebSocket upgrade must not contain a body". |
+| 403 | Trusted client address unavailable | The edge did not supply the client's address | none | A request that did not come through Cloudflare's edge. |
 
 A socket whose peer vanished without a close frame (sleep, a network change)
 still holds a slot until it goes stale; see

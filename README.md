@@ -12,20 +12,21 @@ for a zero-overage deployment.
 
 ## Highlights
 
-- **One Durable Object, hibernating WebSockets.** A permanent `general` room
-  plus thread rooms, with complete-snapshot history, edits, moves, and emoji
-  reactions.
+- **One Durable Object, hibernating WebSockets.** A permanent `general` room,
+  rooms admins and mods create, and thread rooms, with complete-snapshot
+  history, edits, moves, and emoji reactions.
 - **Guests and passkeys.** Anyone can read as a guest; sign in with a passkey
   to post, and run `/invite-bot` to get a token for your own bot.
 - **Private rooms for DMs.** Signed-in users start private rooms
   (`private: true`) that only their members see, and add people to them;
-  everyone else is answered as if the room did not exist. Each user may be in
-  20 and start 5 at a time, apart from the thread ceiling, and a room goes
-  when its last member leaves or its history expires.
-- **Images and avatars.** Signed-in users attach images and set avatars
-  (`embed:upload`), stored in R2 within its free tier for a week (avatars a
-  month). Admins add custom emoji with `/emoji add :name:`, which everyone
-  can react with (`ext:emoji`).
+  everyone else is answered as if the room did not exist. A room goes when
+  its last member leaves or its history expires; see
+  [limits](docs/limits.md#hard-caps) for how many each user may have.
+- **Images, voice clips and avatars.** Signed-in users attach images and
+  voice clips and set avatars (`embed:upload`), stored in R2 within its free
+  tier for a week (avatars a month). Admins, mods and friends add custom
+  emoji with `/emoji add :name:`, which everyone can react with
+  (`ext:emoji`).
 - **Push for mentions and replies.** With VAPID keys set, a mention or a
   reply wakes a signed-in user whose every tab is idle or closed, through
   their browser's Web Push service (`server.push` kind `webpush`), unless
@@ -36,20 +37,9 @@ for a zero-overage deployment.
 - **Who's around.** With push on, member lists show each user as online,
   idle, busy (`dnd`), or offline, with when they were last `seen`, and a
   user can choose `dnd`, `invisible`, or no status at all with `me`. A
-  chosen status shows at once; changes the connections cause are coalesced
-  to one a minute per user, a closed tab counts after a minute's grace, and
-  a peer that vanishes without closing only once it is found stale (150
-  seconds without a ping), all with no alarms of their own and no SQL but
-  `seen`'s: two charged rows (their identity row and the day's budget row)
-  when a signed-in user's last connection closes, or one more row with a
-  chosen `invisible`, at most once in 10 minutes per user. Within 10
-  minutes of the last one recorded, going offline again shows that one,
-  even if others saw them online in between (a deviation from the
-  protocol's "last went offline"; see [SPEC](SPEC.md)), so `seen` may be
-  up to 10 minutes earlier than the real departure, and
-  reloads and reconnects write it at most once in 10 minutes (a reload
-  shows nothing, but its close may record its time, which a departure
-  within the next 10 minutes then shows).
+  chosen status shows at once; other changes are coalesced to one a minute
+  per user, and `seen` may be up to 10 minutes early (see
+  [user status](docs/configuration.md#user-status-presence)).
 - **Bring your own frontend.** Guest connections are accepted from any
   origin — even `localhost` or a browser console.
 - **Built to stay inside its plan.** Every operation is metered against
@@ -96,7 +86,7 @@ socket.onmessage = ({ data }) => {
 | [Implementation specification](SPEC.md) | The protocol contract, architecture, and limits |
 | [Authentication and policy](docs/policy.md) | Guests, passkeys, and demo policy |
 | [Limits for client developers](docs/limits.md) | Every limit a client can hit, how it shows up, and a checklist for a well-behaved client |
-| [Configuration reference](docs/configuration.md) | Every policy variable and budget |
+| [Configuration reference](docs/configuration.md) | Every variable, secret and budget |
 | [Edge admission](docs/edge-admission.md) | WAF rules and the quota-exhaustion runbook |
 | [Cost report](docs/cost-report.md) | Measured resource bounds and assumptions |
 
