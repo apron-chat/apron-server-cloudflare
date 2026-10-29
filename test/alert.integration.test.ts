@@ -46,7 +46,7 @@ it('tells the admins when an overrun closes accounting, and a status probe then 
 	const probe = await stub.fetch(new Request('https://demo.test/?apron_connection_status=1', { headers: { Origin: 'http://localhost:5173', 'X-Apron-Trusted-IP-Key': 'probe-key-for-the-test' } }));
 	expect(probe.status).toBe(503);
 	expect(probe.headers.get('retry-after')).toBe('60');
-	expect(await probe.json()).toEqual({ error: 'Demo closed: storage accounting stopped after a cost overrun, until an operator reopens it' });
+	expect(await probe.json()).toEqual({ error: 'Server closed: storage accounting stopped after a cost overrun, until an operator reopens it' });
 });
 
 it('answers a status probe with storage unavailable while budget writes fail, and opens again once they work', async () => {
@@ -62,7 +62,7 @@ it('answers a status probe with storage unavailable while budget writes fail, an
 	const refused = await probe();
 	expect(refused.status).toBe(503);
 	expect(refused.headers.get('retry-after')).toBe('60');
-	expect(await refused.json()).toEqual({ error: 'Demo storage is unavailable; try again shortly' });
+	expect(await refused.json()).toEqual({ error: 'Server storage is unavailable; try again shortly' });
 
 	await runInDurableObject(stub, (_instance, state) => { state.storage.sql.exec('DROP TRIGGER fail_budget_reservation'); });
 	const reopened = await probe();

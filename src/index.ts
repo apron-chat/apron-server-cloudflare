@@ -928,9 +928,9 @@ function writeSessionAttachment(socket: WebSocketConnection, attachment: Connect
  * says why the server refuses.
  */
 function internalErrorMessage(reason: unknown): string {
-	if (reason === ACCOUNTING_OVERRUN) return "Demo closed: storage accounting stopped after a cost overrun, until an operator reopens it";
-	if (reason === STORAGE_UNAVAILABLE) return "Demo storage is unavailable; try again shortly";
-	return "Demo temporarily unavailable";
+	if (reason === ACCOUNTING_OVERRUN) return "Server closed: storage accounting stopped after a cost overrun, until an operator reopens it";
+	if (reason === STORAGE_UNAVAILABLE) return "Server storage is unavailable; try again shortly";
+	return "Server temporarily unavailable";
 }
 
 function errorToProtocol(error: unknown): ProtocolError {
@@ -1383,7 +1383,7 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 	const stub = env.DEMO.getByName(OBJECT_NAME);
 	try { return await stub.fetch(forwarded); }
 	// The object threw: a platform failure, not capacity.
-	catch { return responseError(503, "Demo server unavailable; try again shortly", UNAVAILABLE_RETRY_MS); }
+	catch { return responseError(503, "Server unavailable; try again shortly", UNAVAILABLE_RETRY_MS); }
 }
 
 export default {
