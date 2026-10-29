@@ -630,8 +630,10 @@ The numeric rows are grouped by their unit and enforcement scope:
   `threadLimit`, `threadsPerUser`, `privateRoomLimit`, `privateRoomsPerUser`,
   `privateMembershipsPerUser`, `reactionUsersPerMessage`, `reactionEmojisPerUser`,
   `limiterRecordCap`, `frameLease`, `roomListMembers`, `guestNumberBlock`,
-  `activityMaxTypingSeconds`, `pingSeconds` (advertised as `server.ping`), `pingTimeoutSeconds`
-  (seconds; the timeout must be at least twice the interval). `roomListMembers`
+  `activityMaxTypingSeconds`, `pingSeconds` (advertised as `server.ping`), `pingTimeoutSeconds`,
+  `unpingedTimeoutSeconds` (seconds; the ping timeout must be at least twice
+  the interval, and the timeout for a connection that never pinged at least
+  the ping timeout). `roomListMembers`
   is how many registered members each room lists in `members`, in `user_id`
   order, besides every connected member; each costs two indexed reads per
   listed room. A room with more says how many members it has in
@@ -717,6 +719,7 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `roomListMembers` | 200 | 100 |
 | `pingSeconds` | 45 |  |
 | `pingTimeoutSeconds` | 150 |  |
+| `unpingedTimeoutSeconds` | 900 |  |
 | `guestNumberBlock` | 10 |  |
 | `statusCoalesceSeconds` | 60 |  |
 | `offlineGraceSeconds` | 60 |  |

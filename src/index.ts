@@ -139,6 +139,8 @@ interface ConnectionAttachment {
 	/** The device name of the `/invite-device` token this connection signed in with, so a new token for it closes the connection. */
 	device?: string;
 	challenge?: ChallengeRecord;
+	/** When the connection was accepted, which a connection that never pings is judged stale from (staleAfter). */
+	openedAt?: number;
 	authDeadline: number;
 	pendingFrames: number;
 	pendingBytes: number;
@@ -778,6 +780,7 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			...(Number.isSafeInteger(attachment.seen) && (attachment.seen as number) > 0 ? { seen: attachment.seen } : {}),
 			...presenceState(attachment),
 			...readState(attachment),
+			...(Number.isSafeInteger(attachment.openedAt) && (attachment.openedAt as number) > 0 ? { openedAt: attachment.openedAt } : {}),
 			authDeadline: typeof attachment.authDeadline === "number" ? attachment.authDeadline : 0,
 			pendingFrames: typeof attachment.pendingFrames === "number" ? attachment.pendingFrames : 0,
 			pendingBytes: typeof attachment.pendingBytes === "number" ? attachment.pendingBytes : 0,
@@ -884,6 +887,13 @@ function writeAttachment(socket: WebSocketConnection, attachment: ConnectionAtta
 	const serialized = JSON.stringify(attachment);
 	if (utf8Bytes(serialized) > 12_000) throw new Error("connection attachment exceeds safety budget");
 	socket.serializeAttachment?.(attachment);
+}
+
+/** Seconds as said in a notice: whole minutes as minutes, else seconds. */
+function spokenSeconds(seconds: number): string {
+	if (seconds % 60 !== 0) return `${seconds} seconds`;
+	const minutes = seconds / 60;
+	return minutes === 1 ? "1 minute" : `${minutes} minutes`;
 }
 
 function openSocket(socket: WebSocketConnection): boolean {
@@ -1543,6 +1553,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			tier: "pending",
 			...(origin ? { origin } : {}),
 			...(endpoint ? { endpoint } : {}),
+			openedAt: nowMs(),
 			authDeadline: nowMs() + this.config.limits.unauthenticatedTimeoutSeconds * 1_000,
 			pendingFrames: 0,
 			pendingBytes: 0,
@@ -5972,42 +5983,69 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Whether a connection's peer has gone quiet: it has sent the liveness
-	 * ping, but neither that nor any frame within the timeout. The runtime
+	 * Whether a connection's peer has gone quiet (staleAfter). The runtime
 	 * cannot ping, so a peer that vanished without a close frame (sleep, a
-	 * network change) otherwise stays connected until the edge gives up on it.
-	 * A connection that never pinged is never judged stale.
+	 * network change) otherwise stays connected until the edge gives up on
+	 * it, which can take until the object restarts.
 	 */
 	private isStale(socket: WebSocket, now: number): boolean {
-		const pinged = this.ctx.getWebSocketAutoResponseTimestamp(socket)?.getTime();
-		if (pinged === undefined) return false;
-		const frames = connectionAttachment(socket as WebSocketConnection)?.frameTimes ?? [];
-		const heard = Math.max(pinged, frames[frames.length - 1] ?? 0);
-		return heard <= now - this.config.limits.pingTimeoutSeconds * 1_000;
+		return this.staleAfter(socket, now) !== undefined;
 	}
 
 	/**
-	 * Closes stale connections. Nothing schedules this: it runs where a stale
-	 * peer would be seen, before `members` are listed and before admission.
-	 * `live`, a socket whose frame is being handled, has just been heard from
-	 * though its frame time is not recorded yet, so it is never closed.
+	 * The timeout a connection outlasted, in seconds, if it is stale, else
+	 * undefined: `pingTimeoutSeconds` with no ping or frame once it has
+	 * pinged, `unpingedTimeoutSeconds` with no frame since it opened if it
+	 * never has.
+	 */
+	private staleAfter(socket: WebSocket, now: number): number | undefined {
+		const { pingTimeoutSeconds, unpingedTimeoutSeconds } = this.config.limits;
+		const attachment = connectionAttachment(socket as WebSocketConnection);
+		const frames = attachment?.frameTimes ?? [];
+		const framed = frames[frames.length - 1] ?? 0;
+		const pinged = this.ctx.getWebSocketAutoResponseTimestamp(socket)?.getTime();
+		if (pinged !== undefined) return Math.max(pinged, framed) <= now - pingTimeoutSeconds * 1_000 ? pingTimeoutSeconds : undefined;
+		// An attachment from before openedAt: its auth deadline, a little after it opened.
+		const opened = attachment?.openedAt ?? attachment?.authDeadline ?? now;
+		return Math.max(opened, framed) <= now - unpingedTimeoutSeconds * 1_000 ? unpingedTimeoutSeconds : undefined;
+	}
+
+	/**
+	 * Closes stale connections, each told why first in a `~private` notice
+	 * to it alone. Nothing schedules this: it runs where a stale peer would
+	 * be seen, before `members` are listed and before admission. `live`, a
+	 * socket whose frame is being handled, has just been heard from though
+	 * its frame time is not recorded yet, so it is never closed.
 	 */
 	private closeStale(now: number, live?: WebSocket): void {
 		const sockets = this.ctx.getWebSockets();
 		let closed = 0;
+		let unpinged = 0;
+		let unpingedClosed = 0;
+		const unpingedOrigins = new Set<string>();
 		for (const ws of sockets) {
+			const neverPinged = !this.ctx.getWebSocketAutoResponseTimestamp(ws);
+			if (neverPinged) unpinged++;
 			if (ws === live) continue;
 			const socket = ws as WebSocketConnection;
 			const attachment = connectionAttachment(socket);
-			if (!attachment || attachment.closing || !this.isStale(socket, now)) continue;
+			if (!attachment || attachment.closing) continue;
+			const after = this.staleAfter(socket, now);
+			if (after === undefined) continue;
+			this.send(socket, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text: `Did not receive \`{"method":"ping"}\` in ${spokenSeconds(after)}, closing stale connection.`, format: "markdown" } } });
 			attachment.closing = true;
 			writeAttachment(socket, attachment);
 			try { socket.close(1001, "Connection idle; reconnect to recover"); } catch { /* already closed */ }
 			this.connectionGone(attachment);
 			closed++;
+			if (neverPinged) {
+				unpingedClosed++;
+				if (unpingedOrigins.size < 8) unpingedOrigins.add(attachment.origin ?? "none");
+			}
 		}
-		// Shows in Workers Logs whether vanished peers are being found.
-		if (closed) console.log(JSON.stringify({ event: "stale_connections_closed", closed, sockets: sockets.length }));
+		// Shows in Workers Logs whether vanished peers are being found, and how
+		// many connections never ping (by origin; "none" for native clients).
+		if (closed) console.log(JSON.stringify({ event: "stale_connections_closed", closed, sockets: sockets.length, unpinged, unpinged_closed: unpingedClosed, unpinged_origins: [...unpingedOrigins] }));
 	}
 
 	/**

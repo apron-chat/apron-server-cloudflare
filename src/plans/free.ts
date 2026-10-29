@@ -68,6 +68,7 @@ export const FREE_PLAN: Plan = Object.freeze({
 		roomListMembers: 100,
 		pingSeconds: 45,
 		pingTimeoutSeconds: 150,
+		unpingedTimeoutSeconds: 900,
 		guestNumberBlock: 10,
 		// Status changes are announced at most once a minute per user, and a
 		// closed connection's change waits a minute, so a reload or a mobile

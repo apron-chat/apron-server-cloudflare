@@ -114,6 +114,12 @@ export interface Limits {
 	 */
 	pingTimeoutSeconds: number;
 	/**
+	 * A connection that has never pinged is stale once this long passes with
+	 * no frame since it opened: a peer that vanished without a close frame is
+	 * otherwise never found. It is told why before it is closed.
+	 */
+	unpingedTimeoutSeconds: number;
+	/**
 	 * Guest numbers (`guest_<n>`) the object reserves with one durable write.
 	 * It serves them from memory and reserves the next block when they run
 	 * out. A wake from hibernation or eviction cannot know how far it got, so
