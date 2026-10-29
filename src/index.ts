@@ -706,6 +706,7 @@ function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		storageHardTargetBytes: limits.databaseHardTargetBytes,
 		storageLowWaterBytes: limits.databaseResumeLowWaterBytes,
 		admissionEnabled: !config.admissionOff,
+		...(config.accountingRecovery !== undefined ? { accountingRecovery: config.accountingRecovery } : {}),
 		uploads: config.uploads && UPLOAD_POLICY ? { ...UPLOAD_POLICY, mediaOrigin: config.uploads.mediaOrigin } : null,
 		push: config.push && PUSH_POLICY ? { ...PUSH_POLICY } : null,
 		// A member listing is reused until anything it read is written, and

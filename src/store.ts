@@ -221,6 +221,8 @@ export interface StoreConfig {
   storageLowWaterBytes: number;
   /** Optional operator switch. */
   admissionEnabled: boolean;
+  /** Clears a persisted accounting stop once per value (recoverAccounting). */
+  accountingRecovery?: string;
   /**
    * Keep `og` media (`image`, `video`, `audio`) that point at other servers.
    * Off: every viewer's client would load a URL the sender chose, and this
@@ -774,6 +776,8 @@ const PRIVATE_ROOM_COUNT_READS = 16 + 2 * MAX_PRIVATE_ROOM_LIMIT + 2 * (MAX_USER
  */
 const RETAINED_SCAN_CAP = 100_000;
 const META_ACCOUNTING_UNSAFE = "accounting_unsafe";
+/** The last `accountingRecovery` value that cleared the stop, so each clears it once. */
+const META_ACCOUNTING_RECOVERY = "accounting_recovery";
 const META_ACCOUNT_USAGE = "account_usage_snapshot";
 /** The highest guest number ever reserved (see reserveGuestNumbers); absent means none. */
 const META_GUEST_NUMBER_MARK = "guest_number_mark";
@@ -1772,7 +1776,7 @@ export class Store {
     if (version === SCHEMA_VERSION) {
       this.lastEffectiveMs = Math.max(this.lastEffectiveMs, this.storedEffectiveMs());
       const unsafeMarker = this.metaValue(META_ACCOUNTING_UNSAFE).trim().toLowerCase();
-      if (unsafeMarker === "1" || unsafeMarker === "true") {
+      if ((unsafeMarker === "1" || unsafeMarker === "true") && !this.recoverAccounting()) {
         this.accountingUnsafe = true;
         this.accountingUnsafePersisted = true;
       }
@@ -2015,6 +2019,28 @@ export class Store {
     this.rawExec("UPDATE _meta SET value = ? WHERE key = 'schema_version'", String(version));
     this.rawExec("UPDATE maintenance SET schema_version = ? WHERE id = 1", version);
     this.chargeUpgrade(start, day);
+  }
+
+  /**
+   * Clears a persisted accounting stop when the operator sets
+   * `accountingRecovery` to a value that has not cleared it before, and
+   * records that value, so a stop latched later stays until the operator
+   * picks a new one. Today's budget row is kept: what the failure that
+   * latched the stop left unwritten is not charged. The rows this reads and
+   * writes are charged like an in-place upgrade.
+   */
+  private recoverAccounting(): boolean {
+    const recovery = this.config.accountingRecovery;
+    if (!recovery) return false;
+    const start = { reads: this.observed.reads, writes: this.observed.writes };
+    if (this.metaValue(META_ACCOUNTING_RECOVERY) === recovery) return false;
+    const day = dayFor(Math.max(this.lastEffectiveMs, this.clock.now()));
+    this.transaction(() => {
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, '0'), (?, ?)", META_ACCOUNTING_UNSAFE, META_ACCOUNTING_RECOVERY, recovery);
+      this.chargeUpgrade(start, day);
+    });
+    console.warn(JSON.stringify({ event: "accounting_unsafe_cleared", recovery }));
+    return true;
   }
 
   /**

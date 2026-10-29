@@ -29,6 +29,10 @@ new_sqlite_classes = ["ApronDemoServer"]
 
 [vars]
 RP_ID = "apron.chat"
+# Clears a persisted accounting stop once per value (docs/configuration.md,
+# ACCOUNTING_RECOVERY). Set after the 2026-10-29 storage failure; a later stop
+# needs a new value.
+ACCOUNTING_RECOVERY = "2026-10-29"
 RP_ORIGINS = "https://web.apron.chat"
 ALLOWED_ORIGINS = "*"
 # The server frame's title, description and avatar (docs/configuration.md,
