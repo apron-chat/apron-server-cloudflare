@@ -50,6 +50,7 @@ import {
 	ROOM_ID,
 	MAX_USER_EXT_BYTES,
 	JOINED_WAKE_ROLES,
+	EMOJI_ROLES,
 	MODERATOR_ROLES,
 	clientUserExt,
 	mergeExt,
@@ -438,20 +439,21 @@ function roomServerDescription(description: string | undefined): string | undefi
  * The commands this server provides (§4.1), as `/help` lists them to those
  * who may run them: `everyone`, `owners` (registered users other than bots),
  * or `admins` (the `APRON_ADMIN_TOKEN` user and those given the `admin` role).
+ * An `owners` command with `roles` is for owners who hold one of them.
  */
-const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audience: "everyone" | "owners" | "admins" }> = [
+const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audience: "everyone" | "owners" | "admins"; roles?: readonly string[] }> = [
 	{ name: "help", usage: "/help", help: "list the commands you can use here", audience: "everyone" },
 	{ name: "invite-bot", usage: "/invite-bot", help: "get a sign-in token for your bot; a new one replaces the last", audience: "owners" },
 	{ name: "invite-device", usage: "/invite-device <name>", help: `get a token that signs in as you on another device, named <name>; at most ${MAX_DEVICE_TOKENS} names, and a name again replaces its token`, audience: "owners" },
 	{ name: "avatar", usage: "/avatar", help: "set your avatar: send this command with one image attached", audience: "owners" },
 	{ name: "passkeys", usage: "/passkeys [remove <n>]", help: "list your account's passkeys, or remove one of them", audience: "owners" },
 	{ name: "admin", usage: "/admin [remove] <user_id>", help: "make a registered user an admin, or no longer one", audience: "admins" },
-	{ name: "role", usage: "/role <user_id> [<role>]", help: "show a user's roles, or give or take away one (admin, mod, threader and bot act as such; friend, like any role, raises their posting limits)", audience: "admins" },
+	{ name: "role", usage: "/role <user_id> [<role>]", help: "show a user's roles, or give or take away one (admin, mod, threader and bot act as such; friend, like any role, raises their posting limits, and admin, mod and friend may use /emoji)", audience: "admins" },
 	{ name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", audience: "admins" },
 	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
 	{ name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", audience: "admins" },
 	{ name: "invite", usage: "/invite <uses>", help: `get a token that signs up to <uses> new users (at most ${MAX_JOIN_USES}) for a week, replacing the last one; /invite 0 revokes it`, audience: "admins" },
-	{ name: "emoji", usage: "/emoji add|remove :name:", help: "add a custom emoji, or replace its image: send /emoji add :name: with one image attached; /emoji remove :name: removes it", audience: "admins" },
+	{ name: "emoji", usage: "/emoji add|remove :name:", help: "add a custom emoji, or replace its image: send /emoji add :name: with one image attached; /emoji remove :name: removes it", audience: "owners", roles: EMOJI_ROLES },
 	{ name: "server", usage: "/server [title|description [<text>] | avatar]", help: "show this server's title, description and avatar; set one, the avatar with one image attached; or clear one, back to the deployment's", audience: "admins" },
 	{ name: "toggle", usage: "/toggle <activity|uploads|presence|addmember>", help: "turn typing activity, uploads, user status (presence), or users adding others to rooms (addmember) off or on for everyone", audience: "admins" },
 	{ name: "purge", usage: "/purge <user_id>", help: "disconnect a user and delete their account, bot, and everything they posted or uploaded", audience: "admins" },
@@ -4803,6 +4805,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		const admin = owner && hasRole(attachment, "admin");
 		if (command.audience === "admins" && !admin) throw { name: "denied", message: `Only an admin can use /${name}` } satisfies ProtocolError;
+		if (command.roles && !command.roles.some((role) => hasRole(attachment, role))) {
+			throw { name: "denied", message: `/${name} needs one of the roles ${command.roles.join(", ")}` } satisfies ProtocolError;
+		}
 		if (command.name === "invite-bot") {
 			await this.inviteBot(socket, attachment, request, roomId);
 			return;
@@ -4886,7 +4891,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return;
 		}
 		// The reply a command causes comes before its result (§1).
-		const available = this.commands().filter((candidate) => candidate.audience === "everyone" || (candidate.audience === "owners" && owner) || admin);
+		const available = this.commands().filter((candidate) => candidate.audience === "everyone" || (candidate.audience === "owners" && owner && (!candidate.roles || candidate.roles.some((role) => hasRole(attachment, role)))) || admin);
 		this.send(socket, {
 			method: "message",
 			params: {
@@ -5471,8 +5476,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * role name is a label shown in `roles` (§3.3); `admin` also lets them run
 	 * the admin commands, `mod` and `threader` let them move other users'
 	 * messages (as `admin` does), `admin` and `mod` let them create top-level
-	 * rooms, and `bot` makes them a bot. Any role, `friend` the one that
-	 * grants nothing else, puts their posts under the trusted limits. The sender gets a
+	 * rooms, `admin`, `mod` and `friend` let them use `/emoji` (EMOJI_ROLES),
+	 * and `bot` makes them a bot. Any role puts their posts under the trusted
+	 * limits. The sender gets a
 	 * `~private` notice before the result (§1).
 	 */
 	private role(socket: WebSocketConnection, request: RequestFrame, roomId: string, target: string, requested?: string): void {

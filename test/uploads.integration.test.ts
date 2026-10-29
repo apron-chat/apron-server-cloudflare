@@ -958,6 +958,38 @@ describe('uploads end to end', () => {
 		} finally { admin.close(); watcher.close(); user.close(); }
 	});
 
+	it('lets mods and friends use /emoji too, and no other role (ext:emoji)', async () => {
+		const admin = await connect(null);
+		await admin.next();
+		expect((await request(admin, 'auth', 'auth', { scheme: 'token', token: ADMIN_TOKEN })).result.you.user_id).toBe('admin');
+		const userId = unique('curator');
+		const user = await signedIn(userId);
+		const help = async (id: string) => (await exchange(user, id, 'command', { room_id: 'general', body: { text: '/help' } })).skipped.find((frame) => frame.params?.from?.user_id === '~private')!.params.body.text as string;
+		const role = async (id: string, name: string) => expect((await request(admin, id, 'command', { room_id: 'general', body: { text: `/role ${userId} ${name}` } })).result).toEqual({});
+		const add = async (id: string, key: string) => {
+			const started = await request(user, id, 'command', { room_id: 'general', body: { text: `/emoji add ${key}`, embeds: [{ kind: 'upload' }] } });
+			expect((await put(started.result.embeds[0].write_url, png())).status).toBe(204);
+		};
+		const remove = async (id: string, key: string) => expect((await request(user, id, 'command', { room_id: 'general', body: { text: `/emoji remove ${key}` } })).result).toEqual({});
+		try {
+			// Without one of the roles, /help leaves it out and it is denied.
+			await role('label', 'helper');
+			expect(await help('help-label')).not.toContain('/emoji');
+			expect((await request(user, 'denied', 'command', { room_id: 'general', body: { text: '/emoji remove :mine:' } })).error).toMatchObject({ code: -32001, message: '/emoji needs one of the roles admin, mod, friend' });
+			// `friend` and `mod` each may add and remove.
+			await role('friend', 'friend');
+			expect(await help('help-friend')).toContain('`/emoji add|remove :name:`');
+			await add('friend-add', ':mine:');
+			await remove('friend-remove', ':mine:');
+			await role('unfriend', 'friend');
+			await role('mod', 'mod');
+			await add('mod-add', ':ours:');
+			await remove('mod-remove', ':ours:');
+			// They still get no admin command.
+			expect((await request(user, 'status', 'command', { room_id: 'general', body: { text: '/status' } })).error.code).toBe(-32001);
+		} finally { admin.close(); user.close(); }
+	});
+
 	it('/server shows, sets and clears the server\'s title, description and avatar for admins, over its variables', async () => {
 		const admin = await connect(null);
 		await admin.next();

@@ -15,7 +15,7 @@ them post); signing in with a passkey lets a user post and invite a bot. It spea
 `edit`, `rooms`, `reactions`, `command` (`/help`, `/invite-bot`, and admin
 commands), and `ext` with the extensions `ext:settings`, `ext:limits` and
 `ext:permissions` (EXTENSIONS.md); `embed:upload` and `ext:media` when uploads are configured,
-and `ext:emoji` once an admin adds a custom emoji with `/emoji add`;
+and `ext:emoji` once an admin, mod or friend adds a custom emoji with `/emoji add`;
 `status` and push when VAPID keys are set; and
 liveness pings and, with the Workers Paid budgets, typing through `activity`
 (`ACTIVITY` overrides); see [authentication and policy](policy.md) and [the

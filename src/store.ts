@@ -958,6 +958,13 @@ const ALL_WAKE = WAKE_SCOPES.mentions | WAKE_SCOPES.replies | WAKE_SCOPES.privat
  * so the few who keep it are all a message's `joined` wake reads.
  */
 export const JOINED_WAKE_ROLES: readonly string[] = ["admin", "mod"];
+/**
+ * The roles whose registered holders may add, replace and remove custom
+ * emoji with `/emoji` (extension `ext:emoji`). Their images are the
+ * server's (EMOJI_OWNER), so they stay when the user who added them is
+ * purged or renamed.
+ */
+export const EMOJI_ROLES: readonly string[] = ["admin", "mod", "friend"];
 /** Registrations that keep `joined`, the partial index's condition (push_subscriptions_joined_idx), spelled once so every query matches it. */
 const JOINED_WAKE_CONDITION = `(wake & ${WAKE_SCOPES.joined}) != 0`;
 
@@ -4477,9 +4484,10 @@ export class Store {
 
   /**
    * Starts a custom emoji upload (extension `ext:emoji`): `/emoji add
-   * :name:` with one `upload` embed, by an admin. The upload row keeps the
-   * key in `message_id`, and is the server's (EMOJI_OWNER); it counts
-   * against the admin's and the server's daily uploads and the stored-bytes
+   * :name:` with one `upload` embed, by a holder of one of EMOJI_ROLES. The
+   * upload row keeps the key in `message_id`, and is the server's
+   * (EMOJI_OWNER); it counts
+   * against the user's and the server's daily uploads and the stored-bytes
    * cap like any other. The catalog changes when the write finishes
    * (emojiDraft, commitEmoji). A new key past `maxEmoji` is `denied`.
    */

@@ -1044,7 +1044,7 @@ it('/role shows a user\'s roles and toggles one, any name a label, admin also th
 		expect(given.notice!.params.body.text).toBe(`${who} now has the role \`friend\`.`);
 		expect((await until(labeled, (frame) => frame.method === 'user' && frame.params.you !== undefined)).frame.params).toEqual({ you: { user_id: userId, name: `Name of ${userId}`, roles: ['friend'], ext: { permissions: { add_members: true } }, status: 'online' } });
 		expect((await until(mate, (frame) => frame.method === 'user' && frame.params.new?.user_id === userId && frame.params.new.roles !== undefined)).frame.params.new.roles).toEqual(['friend']);
-		// A label grants nothing.
+		// `friend` grants no admin command.
 		expect((await command(labeled, 'status-label', '/status')).frame.error.code).toBe(-32001);
 
 		// `admin` given with /role is the same as /admin.

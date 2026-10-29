@@ -273,7 +273,8 @@ deploy: new connections stop being offered `embed:upload`, and new
 attachments, avatars and custom emoji are refused until it is turned back on.
 
 **Custom emoji** (extension `ext:emoji`; see
-[SPEC section 4](../SPEC.md#extension-extemoji)). An admin adds one with
+[SPEC section 4](../SPEC.md#extension-extemoji)). A registered user with the
+role `admin`, `mod` or `friend` adds one with
 `/emoji add :name:` and one image attached, which also replaces the image of
 a name the catalog has, and removes one with `/emoji remove :name:`. The
 catalog is one row of the Durable Object's SQLite storage, published to the
@@ -283,7 +284,7 @@ a new catalog, sends every connection a new `server` frame, and deletes the
 catalog before the last one with any image only it referred to: a replaced
 or removed image stays until the next change, for clients that just read the
 last catalog. Emoji images count
-against `uploadsPerDay`, the admin's `uploadsPerUserDay`, and
+against `uploadsPerDay`, the user's `uploadsPerUserDay`, and
 `storedBytesCap`, for as long as they stay: at most 500 of 256 KB, 125 MB.
 The server's avatar (`/server avatar`, below) is kept the same way, one image
 of at most `maxAvatarBytes`.
