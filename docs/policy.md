@@ -81,7 +81,8 @@ within it:
   everywhere; it ignores `latest_log_id` and always returns a
   full listing, since guest memberships are not logged. A client that sends
   the `{"method":"ping"}` liveness ping every 45 seconds and then goes quiet
-  for 150 is disconnected, so a peer that vanished without closing is not
+  for 150 is disconnected, and so is one that never pings once it sends
+  nothing for 15 minutes, so a peer that vanished without closing is not
   listed.
 - Activity (where on): typing is relayed to the room's other
   members and never stored, at most 10 relays per user per minute; past that, updates are dropped and the
@@ -156,7 +157,8 @@ within it:
   connection is shown offline (or idle) only after a minute without them,
   so a reload or a phone reconnecting shows nothing. A peer that vanishes
   without closing (a sleeping laptop) counts as gone only once it is found
-  stale, 150 seconds after its last ping, and then waits the same minute.
+  stale, 150 seconds after its last ping (15 minutes after its last frame
+  for a client that never pings), and then waits the same minute.
   A status a user chooses is shown at once. A user shown `offline` carries
   `seen`, when they went offline (when their last connection closed, or
   when they chose `invisible`), in the notification and in later listings.

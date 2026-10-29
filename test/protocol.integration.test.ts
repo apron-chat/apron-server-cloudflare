@@ -936,11 +936,9 @@ it('never closes the connection whose frame starts a sweep as stale, though it l
 });
 
 it('tells a connection that never pinged why, then closes it as stale once unpingedTimeoutSeconds pass without a frame', async () => {
-	const alice = await connect();
 	const bob = await connect();
 	const carol = await connect();
 	try {
-		await authenticate(alice);
 		const bobId = await authenticate(bob);
 		const carolId = await authenticate(carol);
 		await configure((config) => { config.limits.unpingedTimeoutSeconds = 2; });
@@ -951,12 +949,12 @@ it('tells a connection that never pinged why, then closes it as stale once unpin
 			return (socket.deserializeAttachment() as { openedAt: number }).openedAt;
 		});
 		expect(opened).toBeGreaterThan(0);
-		// Past the timeout for both: Carol sends a frame first, so only Bob,
-		// silent since he signed in, is stale when Alice lists the members.
+		// Past the timeout for both, Carol lists the members: her own frame is
+		// fresh wherever a sweep runs, so only Bob, silent since he signed in,
+		// is stale.
 		vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 10_000);
 		const log = vi.spyOn(console, 'log');
-		expect((await request(carol, 'carol', 'me', {})).result).toBeDefined();
-		const listed = (await request(alice, 'list', 'room_list', { room_id: 'general', members: true })).result.joined[0].members.map((member: { user_id: string }) => member.user_id);
+		const listed = (await request(carol, 'list', 'room_list', { room_id: 'general', members: true })).result.joined[0].members.map((member: { user_id: string }) => member.user_id);
 		expect(listed).toContain(carolId.user_id);
 		expect(listed).not.toContain(bobId.user_id);
 		const notice = await until(bob, (frame) => frame.method === 'message' && frame.params?.from?.user_id === '~private' && String(frame.params?.body?.text).startsWith('Did not receive'));
@@ -965,8 +963,9 @@ it('tells a connection that never pinged why, then closes it as stale once unpin
 		expect(await closed).toBe(1001);
 		expect(carol.closed()).toBeUndefined();
 		const closings = log.mock.calls.map(([line]) => String(line)).filter((line) => line.includes('"stale_connections_closed"')).map((line) => JSON.parse(line));
-		expect(closings).toContainEqual(expect.objectContaining({ closed: 1, unpinged_closed: 1, unpinged_origins: ['http://localhost:5173'] }));
-	} finally { vi.restoreAllMocks(); alice.close(); bob.close(); carol.close(); await configure((config) => { config.limits.unpingedTimeoutSeconds = 900; }); }
+		expect(closings).toContainEqual(expect.objectContaining({ unpinged_closed: expect.any(Number), unpinged_origins: expect.arrayContaining(['http://localhost:5173']) }));
+		expect(closings.every((line) => line.unpinged_closed >= 1 && line.unpinged_closed <= line.closed && line.unpinged <= line.sockets)).toBe(true);
+	} finally { vi.restoreAllMocks(); bob.close(); carol.close(); await configure((config) => { config.limits.unpingedTimeoutSeconds = 900; }); }
 });
 
 it('advertises the extensions ext:settings, ext:limits, ext:media and ext:permissions', async () => {

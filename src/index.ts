@@ -3621,8 +3621,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Whether a user has a connection someone attends: authenticated as them,
 	 * not stale, and not idle (§4.5). A connection is attended from sign-in
-	 * until its client sends `idle` with seconds, however long it stays silent: the
-	 * server never infers idleness.
+	 * until its client sends `idle` with seconds, however long it stays silent
+	 * while it is not stale: the server never infers idleness. A connection
+	 * that never pings is stale, and closed, after `unpingedTimeoutSeconds`
+	 * without a frame (staleAfter).
 	 */
 	private attended(userId: string, now: number): boolean {
 		return this.connectionsOf(userId).some((peer) => this.attendedConnection(peer, connectionAttachment(peer), now));
@@ -6034,7 +6036,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!attachment || attachment.closing) continue;
 			const after = this.staleAfter(socket, now);
 			if (after === undefined) continue;
-			if (neverPinged) this.send(socket, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text: `Did not receive \`{"method":"ping"}\` in ${spokenSeconds(after)}, closing stale connection.`, format: "markdown" } } });
+			// A send that fails has closed the socket itself (closePolicy).
+			if (neverPinged && !this.send(socket, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text: `Did not receive \`{"method":"ping"}\` in ${spokenSeconds(after)}, closing stale connection.`, format: "markdown" } } })) continue;
 			attachment.closing = true;
 			writeAttachment(socket, attachment);
 			try { socket.close(1001, "Connection idle; reconnect to recover"); } catch { /* already closed */ }
