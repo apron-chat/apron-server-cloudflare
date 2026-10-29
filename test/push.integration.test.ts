@@ -504,6 +504,73 @@ describe('push over the socket', () => {
 		}
 	});
 
+	it('zeroes unread on coming back only when a push counted it up, and with SQL only then', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId] = [unique('alice'), unique('bob')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		const tab = await signedIn(bobId, true);
+		try {
+			await subscribe(bob, 'bob');
+			const unreadRow = () => runInDurableObject(stub(), (_instance, state) =>
+				state.storage.sql.exec("SELECT uploads_day FROM principal_limits WHERE scope = 'push_recipient' AND principal_key = ?", `user:${bobId}`).toArray()[0]?.uploads_day);
+			const owed = () => runInDurableObject(stub(), (_instance, state) => state.getWebSockets()
+				.map((socket) => socket.deserializeAttachment() as { userId?: string; unreadOwed?: boolean; closing?: boolean })
+				.filter((attachment) => attachment.userId === bobId && !attachment.closing).map((attachment) => attachment.unreadOwed === true));
+			/** Bob's connection `index` comes back (`idle: false`), counting the SQL statements it runs. */
+			const comeBack = (index: number) => runInDurableObject(stub(), (instance, state) => {
+				const runtime = instance as unknown as { handleStatus(socket: WebSocket, request: unknown): void };
+				const socket = state.getWebSockets().filter((ws) => (ws.deserializeAttachment() as { userId?: string }).userId === bobId)[index];
+				const sql = state.storage.sql as unknown as { exec: (...args: unknown[]) => unknown };
+				const exec = sql.exec.bind(sql);
+				let queries = 0;
+				sql.exec = (...args: unknown[]) => { queries++; return exec(...args); };
+				try { runtime.handleStatus(socket, { method: 'status', id: `back-${crypto.randomUUID()}`, params: { idle: false }, full: false }); } finally { sql.exec = exec; }
+				return queries;
+			});
+			await setIdle(bob, true);
+			await setIdle(tab, true);
+			// Never pushed: coming back reads and writes nothing.
+			expect(await comeBack(0)).toBe(0);
+			// Both idle again, whichever came back.
+			for (const peer of [bob, tab]) await setIdle(peer, true);
+			await post(alice, 'mention', { body: { text: 'ping', mentions: [bobId] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			// Owed on both of Bob's connections; coming back on either zeroes it, for all of them.
+			expect(await owed()).toEqual([true, true]);
+			expect(await unreadRow()).toBe(1);
+			expect(await comeBack(1)).toBeGreaterThan(0);
+			expect(await unreadRow()).toBe(0);
+			expect(await owed()).toEqual([false, false]);
+			// Back again, with nothing pushed since: no SQL.
+			expect(await comeBack(0)).toBe(0);
+		} finally { alice.close(); bob.close(); tab.close(); }
+	});
+
+	it('zeroes an owed unread on any frame from a connection that is not idle, such as a stale one resuming', async () => {
+		const [bobId] = [unique('bob')];
+		const bob = await signedIn(bobId);
+		try {
+			// As a push to a stale connection leaves it: a count, and the connection owing its zeroing.
+			await runInDurableObject(stub(), (_instance, state) => {
+				state.storage.sql.exec("INSERT OR REPLACE INTO principal_limits (scope, principal_key, level, level_ms, day, posts_day, registrations_day, uploads_day, updated_ms) VALUES ('push_recipient', ?, 0, 0, ?, 1, 0, 3, ?)",
+					`user:${bobId}`, new Date().toISOString().slice(0, 10), Date.now());
+				for (const socket of state.getWebSockets()) {
+					const attachment = socket.deserializeAttachment() as { userId?: string; unreadOwed?: boolean };
+					if (attachment.userId === bobId) socket.serializeAttachment({ ...attachment, unreadOwed: true });
+				}
+			});
+			// Any request the handler sees will do: here a ping with spacing the runtime does not answer itself.
+			bob.socket.send('{ "method": "ping" }');
+			await until(bob, (frame) => frame.method === 'pong');
+			const after = await runInDurableObject(stub(), (_instance, state) => ({
+				unread: state.storage.sql.exec("SELECT uploads_day FROM principal_limits WHERE scope = 'push_recipient' AND principal_key = ?", `user:${bobId}`).one().uploads_day,
+				owed: state.getWebSockets().map((socket) => socket.deserializeAttachment() as { userId?: string; unreadOwed?: boolean }).filter((attachment) => attachment.userId === bobId).map((attachment) => attachment.unreadOwed === true),
+			}));
+			expect(after).toEqual({ unread: 0, owed: [false] });
+		} finally { bob.close(); }
+	});
+
 	it('forgets a subscription its push service says is gone', async () => {
 		const pushes = capturePushes((url) => url.includes('/gone-') ? 410 : 201);
 		const [aliceId, erinId] = [unique('alice'), unique('erin')];

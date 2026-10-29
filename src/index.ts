@@ -230,6 +230,14 @@ interface ConnectionAttachment {
 	 */
 	owed?: OwedStatus[];
 	/**
+	 * A push counted up its user's `unread` (Store.claimPushes) since it was
+	 * last zeroed: set on all their connections when one is claimed, so
+	 * coming back on any zeroes it (clearUnread), and only then costs SQL. A
+	 * connection that signs in after is zeroed by the sign-in instead. Kept
+	 * in the attachment, so it survives hibernation.
+	 */
+	unreadOwed?: true;
+	/**
 	 * Read cursors (§4.6) this connection sent for rooms its registered user
 	 * joined and has not yet written (Store.saveReadCursors): room to
 	 * `read_message_id`, at most MAX_ATTACHED_ROOMS. Kept here, so they
@@ -798,6 +806,7 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			frameTimes: Array.isArray(attachment.frameTimes) ? attachment.frameTimes.slice(-120) : [],
 			...throttleState(attachment),
 			...(attachment.wakeJoined === true ? { wakeJoined: true } : {}),
+			...(attachment.unreadOwed === true ? { unreadOwed: true } : {}),
 			...(attachment.closing ? { closing: true } : {}),
 		};
 	} catch {
@@ -925,7 +934,7 @@ function writeSessionAttachment(socket: WebSocketConnection, attachment: Connect
 		if (current.idle) attachment.idle = true;
 		else delete attachment.idle;
 		// Kept current by this connection's and other connections' events meanwhile.
-		for (const key of ["idleAt", "held", "choice", "muteUntil", "roomMuteNext", "pres", "owed"] as const) {
+		for (const key of ["idleAt", "held", "choice", "muteUntil", "roomMuteNext", "pres", "owed", "unreadOwed"] as const) {
 			if (current[key] !== undefined) (attachment as unknown as Record<string, unknown>)[key] = current[key];
 			else delete attachment[key];
 		}
@@ -1162,9 +1171,6 @@ const PUSH_TEXT_CODE_POINTS = 200;
 
 /** Largest push payload, in bytes of JSON (§4.9), leaving a relay room to wrap it for APNs or FCM. */
 const MAX_PUSH_PAYLOAD_BYTES = 2048;
-
-/** Users the instance remembers having zeroed `unread` for (unreadCleared); past it, it forgets them all. */
-const MAX_UNREAD_CLEARED = 4_096;
 
 /**
  * What a push carries (§4.9): the envelope `{push_id?, unread?, message}`,
@@ -1500,14 +1506,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * wake lost with the instance is not pushed. At most MAX_PENDING_WAKES.
 	 */
 	private readonly pendingWakes = new Set<PendingWake>();
-	/**
-	 * Users whose `unread` this instance zeroed or found zero (clearUnread,
-	 * or a sign-in's Store.statusInputs), until a push is claimed for them,
-	 * so coming back again and every read cursor after costs no SQL. In
-	 * memory: after a wake, each user's first costs one probe. At most
-	 * MAX_UNREAD_CLEARED.
-	 */
-	private readonly unreadCleared = new Set<string>();
 	/** Pushes claimed with an `unread` by this instance, so a sign-in can tell whether one came while it read (afterSignIn). */
 	private unreadClaims = 0;
 	/** The one timer that announces waiting status changes, and when it fires. */
@@ -2122,6 +2120,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// A request method sent without an `id` is ignored, as §1.1 lets a
 		// server (REQUEST_METHODS): no change, and no reply.
 		if (request.id === undefined && REQUEST_METHODS.has(request.method)) return;
+		// A frame from a connection not idle is its user attended (see attended),
+		// a stale one resuming included: what was pushed is unread no longer.
+		if (!attachment.idle) this.clearUnread(attachment);
 		switch (request.method) {
 			case "auth":
 				await this.handleAuth(socket, attachment, request);
@@ -3518,7 +3519,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private prepareStatus(socket: WebSocketConnection, stored?: SignInStatus): void {
 		const state = connectionAttachment(socket);
 		if (!state) return;
-		for (const key of ["choice", "muteUntil", "roomMuteNext", "seen", "pres", "held"] as const) delete state[key];
+		for (const key of ["choice", "muteUntil", "roomMuteNext", "seen", "pres", "held", "unreadOwed"] as const) delete state[key];
 		if (state.tier === "registered" && stored) {
 			applyStatusInputs(state, stored);
 			const kept = keptSeen([{ state }, ...this.liveStatesOf(state.userId!).filter((peer) => peer.socket !== socket)]);
@@ -3537,10 +3538,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * sign-in and does not.
 	 */
 	private afterSignIn(socket: WebSocketConnection, stored?: SignInStatus): void {
-		// The sign-in zeroed their `unread` (readStatusInputs): remembered,
-		// unless a push counted it up again while the sign-in went on.
-		const userId = connectionAttachment(socket)?.userId;
-		if (userId && stored?.unreadClaims === this.unreadClaims) this.rememberUnreadCleared(userId);
+		// The sign-in zeroed their `unread` (readStatusInputs). A push that
+		// counted it up again while the sign-in went on did not see this
+		// connection as theirs: it owes the zeroing too.
+		const signedIn = connectionAttachment(socket);
+		if (signedIn && stored && stored.unreadClaims !== this.unreadClaims) {
+			signedIn.unreadOwed = true;
+			writeAttachment(socket, signedIn);
+		}
 		this.syncServer(socket);
 		this.sendMutesInEffect(socket, stored);
 		this.presenceSignedIn(socket);
@@ -4649,24 +4654,34 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Zeroes a registered user's `unread` (Store.clearPushUnread) as they
-	 * come back, unless this instance already did since their last push
-	 * (unreadCleared). A failure leaves them to the next time.
+	 * come back, when a push counted it up since it was last zeroed: any of
+	 * their connections holds `unreadOwed`. Otherwise no SQL. A failure
+	 * leaves it owed, for the next time.
 	 */
 	private clearUnread(state: ConnectionAttachment): void {
 		const userId = state.userId;
-		if (!this.config.push || state.tier !== "registered" || !userId || this.unreadCleared.has(userId)) return;
+		if (!this.config.push || state.tier !== "registered" || !userId) return;
+		if (!state.unreadOwed && !this.connectionsOf(userId).some((peer) => connectionAttachment(peer)?.unreadOwed)) return;
 		try {
 			this.store.clearPushUnread(userId, nowMs());
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "push_unread_clear_failed", reason: errorToProtocol(error).message }));
 			return;
 		}
-		this.rememberUnreadCleared(userId);
+		// The caller's copy too, so writing it back does not owe it again.
+		delete state.unreadOwed;
+		this.markUnreadOwed(userId, false);
 	}
 
-	private rememberUnreadCleared(userId: string): void {
-		if (this.unreadCleared.size >= MAX_UNREAD_CLEARED) this.unreadCleared.clear();
-		this.unreadCleared.add(userId);
+	/** Sets or clears `unreadOwed` on all of a user's connections: attachments only. */
+	private markUnreadOwed(userId: string, owed: boolean): void {
+		for (const peer of this.connectionsOf(userId)) {
+			const state = connectionAttachment(peer);
+			if (!state || !!state.unreadOwed === owed) continue;
+			if (owed) state.unreadOwed = true;
+			else delete state.unreadOwed;
+			writeAttachment(peer, state);
+		}
 	}
 
 	/**
@@ -4810,11 +4825,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (claimed.skipped) console.warn(JSON.stringify({ event: "push_allowance_reached", skipped: claimed.skipped }));
 		// Their `unread` counted up: the next time they come back zeroes it again.
-		for (const subscription of claimed.subscriptions) {
-			if (subscription.unread === undefined) continue;
-			this.unreadCleared.delete(subscription.userId);
-			this.unreadClaims += 1;
-		}
+		const counted = new Set(claimed.subscriptions.filter((subscription) => subscription.unread !== undefined).map((subscription) => subscription.userId));
+		for (const userId of counted) this.markUnreadOwed(userId, true);
+		this.unreadClaims += counted.size;
 		if (claimed.subscriptions.length) this.ctx.waitUntil(this.deliverPushes(claimed.subscriptions, message, vapid, policy.ttlSeconds));
 		return claimed.subscriptions.length > 0 || claimed.skipped > 0;
 	}

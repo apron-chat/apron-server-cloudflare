@@ -119,9 +119,11 @@ fit where 56 did. A fresh object's SQLite file is 151,552 bytes, from
 
 ### Read cursors
 
-A registered user's `read_message_id` (§4.6) costs no SQL when it arrives:
-it is relayed to their other connections and held on the connection's
-attachment. Each connection writes what it holds at most once a minute
+A registered user's `read_message_id` (§4.6) costs no SQL when it arrives,
+unless a push counted up their `unread` since they were last back (one small
+reservation to zero it, below) or it passes the newest of held wakes released
+together (one lookup): it is relayed to their other connections and held on
+the connection's attachment. Each connection writes what it holds at most once a minute
 (`READ_CURSOR_FLUSH_MS`, by its next cursor or the next alarm) and when it
 closes, so a reader costs about one written row a minute and a room they
 read, however often their client sends. The table holds at most one row a
@@ -625,17 +627,19 @@ already reads and writes for every user it wakes. So counting adds no row to
 a claim (26/15, 18/9 and 20/8 measured, as before). Coming back zeroes it:
 a sign-in with one more primary-key read in the reservation that already
 reads the user's status and mutes, and a write only when it held a count;
-`idle: false` and a read cursor with a reservation of their own (2/1 when
-nothing was counted, 3/2 when it zeroes one), skipped while the instance
-remembers having zeroed it since the user's last push. The probe is a read,
-and the update runs only when the count is not 0: an update that changes
-nothing is still charged a write. So a user who is never pushed pays at most
-one read a sign-in and one small reservation per wake of the object, and one
-who is, one write per return.
+any other return (`idle: false`, a read cursor, any frame from a connection
+not idle) with a reservation of its own (3/2 measured), only when a push
+counted it up since: the claim marks all the user's connections
+(`unreadOwed`, in their attachments, so it survives hibernation), and the
+zeroing clears the mark. Unmarked, a return runs no SQL (measured). The
+probe is a read, and the update runs only when the count is not 0, since an
+update that changes nothing is still charged a write (2/1 when there is
+nothing to zero). So a user who is never pushed pays one read a sign-in, and
+one who is, one small reservation per return after a push.
 
 **Read cursors drop pushes.** A read cursor that passes a message drops
 the user's waiting wake for it and their held wakes for it as it arrives,
-from memory and connection attachments: no SQL. Only when it passes the
+from memory and connection attachments, with no SQL of its own. Only when it passes the
 newest of held wakes released together does the next one left cost its
 lookup (one metered read, as releasing them does). A push it drops spends
 no claim, coalescing window or allowance.
@@ -706,7 +710,8 @@ share a room from attachments: the test that resends them measures no SQL
 statement at all. A `me` `status` change is 4/2, an unscoped mute 3/3, a
 room mute 4/3. Deriving and announcing statuses reads connection
 attachments only: the tests measure 0 rows read and written, and no
-statement, for an `idle` change, a sweep, a closed connection's change after
+statement, for an `idle` change (but `idle: false` after a push counted up
+`unread`, which zeroes it), a sweep, a closed connection's change after
 its grace, and a status snapshot, and the alarm unchanged; the one write is
 `seen`, below. A mute that runs
 out is told from attachments for the unscoped one (0 rows, measured); a
@@ -825,7 +830,8 @@ lookup; a room mute at the cap of 100 the same 303/2). The
 reply is one outgoing frame, not billed. `status` before sign-in is
 `denied`, so a sign-in applies no mutes kept on the connection: it writes
 nothing for them. An `idle` change still reads attachments only (0
-rows, measured, limited or not); a connection may go idle 12 times a minute
+rows, measured, limited or not; `idle: false` after a push that counted up
+`unread` also zeroes it, 3/2); a connection may go idle 12 times a minute
 (IDLE_CHANGES_PER_CONNECTION_MINUTE; `idle: false` is never refused, and
 each going idle needs one to repeat), counted in memory, so a client
 flipping it cannot make the object re-derive its user's status at frame

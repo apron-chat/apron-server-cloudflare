@@ -5359,9 +5359,11 @@ export class Store {
 
   /**
    * Zeroes a user's `unread` (PUSH_UNREAD_SCOPE) when they come back: end
-   * `idle` or move a read cursor (a sign-in zeroes it with statusInputs).
+   * `idle`, move a read cursor, or send from a connection not idle (a
+   * sign-in zeroes it with statusInputs).
    * One primary-key probe of their recipient counter, written only when it
-   * held a count; the caller remembers whom it zeroed, so it seldom runs.
+   * held a count; the caller runs it only when a push counted it up since
+   * the user was last back, so it seldom runs.
    */
   clearPushUnread(userId: string, now = this.clock.now()): void {
     this.ensureReady();
