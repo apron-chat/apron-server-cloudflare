@@ -161,7 +161,9 @@ public: `private: true` is `unsupported`. System notices come from `~private`,
 `~room`, or `~server`; no user's `user_id` starts with `~`. This is a shared public room, not
 an isolated sandbox: test messages are visible to others, guest ownership lasts
 only for the socket, and IP/resource quotas and retention still apply. Changing
-frontend origins does not give an IP a fresh allowance. Honor `retry_after`.
+frontend origins does not give an IP a fresh allowance. Honor `retry_after`;
+[limits for client developers](limits.md) lists every limit a client can hit
+and ends with a checklist for a well-behaved client.
 
 The `server` frame's `welcome` is CommonMark for your sign-in screen. The server
 advertises `token` (for bot tokens) and `guest` to custom frontends, and never
