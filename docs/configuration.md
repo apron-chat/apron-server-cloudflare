@@ -18,9 +18,13 @@ headroom. Paid includes 16 times the SQL rows written and 160 times the rows
 read, so the SQL ceilings rise tenfold, and posts, registrations, admissions,
 history pages, and member listings with them. History is kept 7 days instead
 of 24 hours, matching uploaded images, with daily cleanup; the database
-watermarks rise to 768 MiB (1 GiB hard), a fifth of the 5 GB-month included. It includes only a third of
-Free's Durable Object requests (1 million a month against 100,000 a day), so
-the frame budgets rise by half and connection limits stay. The header of
+watermarks rise to 768 MiB (1 GiB hard), a fifth of the 5 GB-month included.
+
+Paid includes only a third of Free's Durable Object requests (1 million a
+month against 100,000 a day), so frame budgets move less: the daily frame
+budget rises by half and the server-wide frame minute doubles. The total
+connection limits stay; guest connections and admissions per address rise so
+that two browsers on one address can each sign in. The header of
 `src/plans/paid.ts` gives the worst case of each allowance.
 
 To switch plans, import the other plan in `src/budget.ts`, then run the
@@ -34,10 +38,10 @@ registrations, SQL ceilings, database watermarks) follow the selected plan too.
 `src/budget.ts` and the plan files are the source of truth for application
 defaults, resource ceilings, maintenance reserves, and admission rates. The
 Worker, standalone store, and protocol parser all consume the selected plan's
-defaults. Resource ceilings reference those
-defaults rather than repeating numeric allocations. Separate calibrated parser,
-payload, and memory bounds remain in that same file; increasing them requires
-reviewing their consumers and repeating cost calibration.
+defaults. Resource ceilings reference those defaults rather than repeating
+numeric allocations. Separate calibrated parser, payload, and memory bounds
+remain in `src/budget.ts`; increasing them requires reviewing their consumers
+and repeating cost calibration.
 
 After changing the policy, run from the repository root:
 
@@ -52,7 +56,7 @@ rate-limiter binding blocks in both Wrangler files and the edge-rule definitions
 in `docs/edge-rules.generated.json`. It does not contact Cloudflare. Tests,
 typechecking, and both supported deployment commands reject stale generated
 configuration. Application defaults are imported directly and need no generated
-copy. Use Node.js 24, as in the repository development environment.
+copy. Use Node.js 24 (`.node-version`).
 
 `ADMISSION_BUDGET.requestsPerIpMinute` defaults to 20 attempted handshakes per
 minute (10 with the Free budgets), before calling the DO. This leaves retry
@@ -78,6 +82,10 @@ through, stop the per-address limit from being multiplied:
   so a deploy or a wake does not reach it. Past it, attempts there get 503 with
   `Retry-After: 60`, while other locations go on.
 
+Generation refuses a per-address limit below `connectionAdmissionsPerIpMinute`,
+a /48 limit below the per-address one, and a location limit below the /48's
+or `openConnections`.
+
 `ACCOUNT_USAGE_POLICY` in `src/budget.ts` defines the lightweight account-usage
 stop. The Durable Object refreshes after about 1,000 incoming events, no more
 often than once per minute, and treats a snapshot older than five minutes as
@@ -94,13 +102,15 @@ divided by 31 days, so stopping inside each day's share keeps the month inside
 what the plan includes. Incoming WebSocket messages, which analytics report as
 `hibernation` invocations, count as a twentieth of a request on Paid, as it
 bills them, and as a whole one on Free. On Paid it also reads usage since the
-start of the calendar month against the plan's `monthly` allowances. At 90% of
-any daily allowance, or `monthlyStopRatio` of a monthly one, the object
-persists a stop, rejects new connections, and closes live sockets. A daily
-stop holds for that UTC day, and a monthly one for that calendar month, even
-while a refresh in the new day is pending or failing. This is an early-stop signal, not an exact remaining-
-quota meter: analytics lag, sampling, and other account workloads can still cause
-an earlier or later platform limit.
+start of the calendar month against the plan's `monthly` allowances.
+
+At 90% of any daily allowance or of stored bytes, or `monthlyStopRatio` of a
+monthly allowance, the object persists a stop, rejects new connections, and
+closes live sockets. A daily stop holds for that UTC day, and a monthly one
+for that calendar month, even while a refresh in the new day is pending or
+failing. This is an early-stop signal, not an exact remaining-quota meter:
+analytics lag, sampling, and other account workloads can still cause an
+earlier or later platform limit.
 
 The optional Free WAF rate rule uses `edgeRequestsPerIpWindow`,
 `edgeWindowSeconds`, and `edgeBlockSeconds` from the same file. Its counting and
@@ -132,15 +142,13 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   `apron_admission_off` stays yours to use by hand.
 - **Admin alert.** When the guard or the flood trip (below) turns the rule
   on, and when a cost overrun closes storage accounting, the server posts a
-  message in `general` as the `admin` user that mentions every user with the
-  `admin` role (up to 10, as many as one message wakes), and pushes it to
-  them at once, past the usual wait, coalescing and push allowances. Give
-  yourself the role (`/admin <user_id>`) and allow notifications in your
+  message in `general` as the `admin` user that mentions and pushes to every
+  user with the `admin` role (up to `wakesPerMessage`, 10); see
+  [SPEC section 10](../SPEC.md#10-degradation-and-public-demo-behavior).
+  Give yourself the role (`/admin <user_id>`) and allow notifications in your
   client to get it on your phone; muting `general` or choosing `dnd`
-  silences it, as it does any push. Nothing is sent when the stop lifts. The rule is turned on first and the alert sent after; an
-  alert that fails is logged (`trigger_notice_failed`) and changes nothing
-  else. The edge rule blocks only public requests, so the alert still reaches
-  the Durable Object and the push services.
+  silences it. Nothing is sent when the stop lifts. An alert that fails is
+  logged (`trigger_notice_failed`) and never undoes the stop.
 - The monthly allowances are Worker requests, Worker CPU, Durable Object
   requests and duration, SQL rows read and written, and Workers Logs events,
   plus R2's free tier for uploads: Class A and Class B operations (each day
@@ -207,7 +215,8 @@ What the guard cannot promise:
 - **Other Workers.** Allowances are account-wide. The guard counts every
   Worker's usage but blocks only this server. Another Worker reachable on
   `workers.dev` or preview URLs, where zone WAF rules do not apply, can still
-  run up the bill; turn those off for Workers that do not need them.
+  run up the bill; turn those off for Workers that do not need them (this
+  server's production config must, or `npm run deploy` refuses it).
 - **The public bucket.** Upload views go straight to R2's public domain,
   not through the Worker, so the flood trip does not see them. A flood of
   requests for images not in Cloudflare's cache, such as made-up keys, is
@@ -221,14 +230,14 @@ What the guard cannot promise:
 
 ## Uploads
 
-With the Workers Paid budgets, registered users attach images to messages
-and set avatars (protocol §4.8, cap `embed:upload`; see
+With the Workers Paid budgets, registered users attach images and voice clips
+to messages and set avatars (protocol §4.8, cap `embed:upload`; see
 [SPEC section 4.3](../SPEC.md#43-uploads-and-avatars)). The plan's `uploads`
 in `src/plans/paid.ts` sets the limits:
 
 | Setting | Value |
 | --- | ---: |
-| `maxFileBytes` | 5 MB |
+| `maxFileBytes` (an attached image or voice clip) | 5 MB |
 | `maxAvatarBytes` | 256 KB |
 | `maxEmojiBytes` (a custom emoji's image, `/emoji add`) | 256 KB |
 | `maxEmoji` (custom emoji in the catalog, kept until removed) | 500 |
@@ -241,7 +250,8 @@ in `src/plans/paid.ts` sets the limits:
 | `lifecycleLagSeconds` | 1 day |
 | `storedBytesCap` | 5 GB |
 
-Uploads are off until all of these are set:
+Uploads turn on once the bucket, the signing key and the two origins (below)
+are set; set up all of these first:
 
 1. **Bucket.** Create an R2 bucket named `apron-media` (the `MEDIA` binding
    in `wrangler.production.toml`). Deploying fails while it does not exist.
@@ -263,9 +273,10 @@ Uploads are off until all of these are set:
    invalidates `write_url`s already issued, nothing else.
 6. **Edge rules.** Update `apron_invalid_request` and `apron_budget_stop`,
    and create `apron_media_invalid`, from
-   [the generated definitions](edge-rules.generated.json). The old
-   `apron_invalid_request` blocks `write_url` requests, and an
-   `apron_media_invalid` from before custom emoji blocks `e/`.
+   [the generated definitions](edge-rules.generated.json). With uploads,
+   `apron_invalid_request` lets `write_url` requests (`PUT` and `OPTIONS` on
+   `/w/`) through, `apron_budget_stop` blocks the media host too, and
+   `apron_media_invalid` allows `f/`, `a/` and `e/`.
 7. **CORS.** Clients fetch the custom emoji catalog with `fetch()`, from
    their own origin, so the bucket needs a CORS policy (bucket Settings, CORS
    Policy) that allows `GET` and `HEAD` from the client origins, `*` for a
@@ -285,17 +296,10 @@ attachments, avatars and custom emoji are refused until it is turned back on.
 
 **Custom emoji** (extension `ext:emoji`; see
 [SPEC section 4](../SPEC.md#extension-extemoji)). A registered user with the
-role `admin`, `mod` or `friend` adds one with
-`/emoji add :name:` and one image attached, which also replaces the image of
-a name the catalog has, and removes one with `/emoji remove :name:`. The
-catalog is one row of the Durable Object's SQLite storage, published to the
-bucket at `e/c/<sha256>.json`, whose URL the `server` frame carries as
-`ext.emoji.catalog_url` once the catalog has an emoji. Each change publishes
-a new catalog, sends every connection a new `server` frame, and deletes the
-catalog before the last one with any image only it referred to: a replaced
-or removed image stays until the next change, for clients that just read the
-last catalog. Emoji images count
-against `uploadsPerDay`, the user's `uploadsPerUserDay`, and
+role `admin`, `mod` or `friend` adds one with `/emoji add :name:` and one
+image attached, and removes one with `/emoji remove :name:`. Each change
+publishes a new catalog to the bucket at `e/c/<sha256>.json`. Emoji images
+count against `uploadsPerDay`, the user's `uploadsPerUserDay`, and
 `storedBytesCap`, for as long as they stay: at most 500 of 256 KB, 125 MB.
 The server's avatar (`/server avatar`, below) is kept the same way, one image
 of at most `maxAvatarBytes`.
@@ -335,36 +339,22 @@ first of these that sets it:
 Otherwise the field is left out: without a title, clients show the server's
 address. `RP_NAME` names the server only to passkey prompts.
 
-An admin runs:
-
-- `/server`: shows the three, and where each comes from.
-- `/server title <text>` and `/server description <text>`: set one, with the
-  rules of its variable (a one-line name of at most 80 code points; CommonMark
-  of at most 500 bytes). Without the text, they clear what `/server` set, so
-  the variable, or for the description `general`'s, applies again.
-- `/server avatar` with one image attached (an `upload` embed): sets the
-  avatar when the write finishes. The image is kept like a custom emoji: under
-  `e/`, which has no lifecycle rule, never expiring, the server's rather than
-  the admin's (so `/purge` and `/rename` of that admin leave it), at most
-  `maxAvatarBytes`, and counted against `uploadsPerDay`, the admin's
-  `uploadsPerUserDay` and `storedBytesCap`. A new one replaces and deletes the
-  old. It needs uploads, and is refused while they are toggled off. Without
-  an image, `/server avatar` clears the avatar and deletes its image.
-
-Each change sends every connection a new `server` frame, and so does a
-`room_set` of `general` that changes its description while that is the
-server's. `welcome` stays `general`'s description, or the generated sign-in
-text, as before.
+An admin's `/server` shows the three and where each comes from;
+`/server title <text>`, `/server description <text>` and `/server avatar`
+(with one image attached) set one, and each without its argument clears it
+(see [SPEC section 5, Admins](../SPEC.md#admins)). `/server avatar` needs
+uploads, and is refused while they are toggled off; its image is kept like a
+custom emoji (above). Each change sends every connection a new `server`
+frame, and so does a `room_set` of `general` that changes its description
+while that is the server's.
 
 ## Push
 
 Mentions, replies, and messages in their private rooms wake registered users
-through Web Push (protocol §4.9, push kind `webpush`, advertising the wake
-scopes `mentions`, `replies`, `private` and `joined`, the last for admins and
-mods only,
-with the client's optional registration `push_id` in each push; see
-[SPEC section 4.4](../SPEC.md#44-push)). Both plans have a
-`push` policy, set in `src/plans/free.ts` with Paid's daily cap raised in
+through Web Push (protocol §4.9, push kind `webpush`; admins and mods may also
+wake for every message in rooms they joined; see
+[SPEC section 4.4](../SPEC.md#44-push)). Both plans have a `push` policy, set
+in `src/plans/free.ts` with Paid's daily and per-sender caps raised in
 `src/plans/paid.ts`:
 
 | Setting | Workers Paid | Workers Free |
@@ -376,22 +366,26 @@ with the client's optional registration `push_id` in each push; see
 | `joinedPushesPerRecipientDay` (pushes one moderator may receive only for `joined`, apart from `pushesPerRecipientDay` and charged to no sender) | 20 | 20 |
 | `coalesceSeconds` (a user is woken for a room at most once in this window) | 60 | 60 |
 | `joinedCoalesceSeconds` (the same for a push only for `joined`) | 300 | 300 |
-| `delaySeconds` (how long a message's wake waits before it pushes; a user who sends `idle: false` or posts in the room meanwhile, or is attended when it ends, is not pushed) | 30 | 30 |
+| `delaySeconds` (how long a message's wake waits before it pushes, so a user who comes back meanwhile is not pushed; `PUSH_DELAY_SECONDS` overrides it) | 30 | 30 |
 | `subscriptionsPerUser` | 5 | 5 |
 | `pushExpiryDays` (a registration not renewed this long is skipped, then deleted) | 7 | 7 |
 | `registersPerUserMinute` (`push_register` requests per user, across reconnects) | 10 | 10 |
-| `mutesPerUserMinute` (`status` `mute` and `me` `status` changes per user, together; past it either is `retry_after` and nothing changes) | 6 | 6 |
+| `mutesPerUserMinute` (`status` `mute` and `me` `status` changes per user, together) | 6 | 6 |
 | `ttlSeconds` (how long a push service keeps an undelivered push) | 1 day | 1 day |
 
-`wakesPerMessage` times `subscriptionsPerUser`, the pushes one message may
-send, is at most 64; `wakesPerMessage` is at most 32, the mentioned users one
-message looks up; `pushesPerSenderDay` and `pushesPerRecipientDay` fit
-`pushesPerDay`, and so does `joinedPushesPerRecipientDay`;
-`joinedCoalesceSeconds` is `coalesceSeconds` to a day; `registersPerUserMinute` and `mutesPerUserMinute` are at
-most 60, the per-type throttle bound;
-`coalesceSeconds` is at most a day; `delaySeconds` is at most 60, since its
-wait keeps the object awake; `pushExpiryDays` is 2 to 90; and
-`ttlSeconds` is at most four weeks. The configuration check fails otherwise.
+The configuration check fails unless:
+
+- `wakesPerMessage` times `subscriptionsPerUser`, the pushes one message may
+  send, is at most 64, and `wakesPerMessage` is at most 32, the mentioned
+  users one message looks up;
+- `pushesPerSenderDay`, `pushesPerRecipientDay` and
+  `joinedPushesPerRecipientDay` each fit `pushesPerDay`;
+- `coalesceSeconds` is at most a day, and `joinedCoalesceSeconds` is
+  `coalesceSeconds` to a day;
+- `registersPerUserMinute` and `mutesPerUserMinute` are at most 60, the
+  per-type throttle bound;
+- `delaySeconds` is at most 60, since its wait keeps the object awake;
+- `pushExpiryDays` is 2 to 90, and `ttlSeconds` at most four weeks.
 
 **Allowed push services.** `PUSH_HOSTS` lists the hosts a registration's
 endpoint may name, comma-separated: an exact host such as
@@ -424,13 +418,14 @@ Push is off, and `server.push` absent, until a VAPID key pair
 Locally, put the three in `.dev.vars`. A malformed key or subject makes every
 request fail its configuration check, and so does a private key that does
 not match the public one: the check signs with one and verifies with the
-other. Browsers subscribe with the public
-key, so replacing the pair strands every subscription: push services refuse
-pushes signed with the new key (with 403), and clients must subscribe again.
-An old row goes at the first push its service refuses with 403, or when its
-user's newer registration replaces it or it expires, whichever comes first. Deleting the
-secret turns push off; stored subscriptions stay, unused, until it is set
-again.
+other.
+
+Browsers subscribe with the public key, so replacing the pair strands every
+subscription: push services refuse pushes signed with the new key (with 403),
+and clients must subscribe again. An old row goes at the first push its
+service refuses with 403, or when its user's newer registration replaces it
+or it expires, whichever comes first. Deleting the secret turns push off;
+stored subscriptions stay, unused, until it is set again.
 
 Pushes are outbound requests from the Durable Object, which no Worker or
 Durable Object allowance counts and no edge rule needs to allow. Their SQL is
@@ -441,16 +436,11 @@ in the [cost report](cost-report.md#push); `/status` shows the day's pushes.
 With push on, the server advertises capability `status` (protocol §4.5):
 users choose a `status` with `me` (`online`, `""` for none, `dnd`,
 `invisible`), connections report `idle`, and users mute their pushes
-everywhere or in a room and its threads (at most 100 rooms a user). With
-presence on, others see each user's `status`: `online`, `idle` or `offline`
-from their connections when they chose `online`, `dnd` while connected,
-`offline` when invisible, and `""` when they chose none (see
-[SPEC section 4.4](../SPEC.md#44-push), Chosen status, Mute and User
-status). The `server` frame then lists `server.status: ["dnd",
-"invisible"]` (protocol §3.1), the optional values clients may offer; with
-presence off it is left out, though `me` still accepts and keeps `dnd` and
-`invisible` (a server choice, so a choice holds across `/toggle presence`). The plan's `features.presence` turns it on, and `PRESENCE`
-overrides it:
+everywhere or in a room and its threads. With presence on, others see each
+user's `status`, and the `server` frame lists `server.status: ["dnd",
+"invisible"]` (see [SPEC section 4.4](../SPEC.md#44-push), Chosen status,
+Mute and User status). The plan's `features.presence` turns it on, and
+`PRESENCE` overrides it:
 
 | `PRESENCE` | What others see | Extra SQL |
 | --- | --- | --- |
@@ -460,7 +450,7 @@ overrides it:
 Without push there is no `status` capability, so presence is off whatever
 it says. An admin's `/toggle presence` turns it off and on again without a
 deploy. A status or mute change writes about 3 or 4 rows, and the two share
-`mutesPerUserMinute`. A push registration never makes anyone `idle`.
+`mutesPerUserMinute`.
 
 Two limits shape how fast changes are announced, both in seconds and at most
 60 (`MAX_STATUS_DELAY_SECONDS`), so what others see is never more than about
@@ -473,30 +463,24 @@ a minute behind:
 - `offlineGraceSeconds` (60): a change caused by a closed connection waits
   this long, so a reload or a phone reconnecting shows nothing.
 
-A user shown `offline` carries `seen`, when that began. A registered
-user's is written at most once in 10 minutes (`SEEN_WRITE_GRANULARITY_MS`,
-fixed, not a plan limit): going `offline` again within 10 minutes of the
-stored one shows that one, with no write, so `seen` may be up to 10
-minutes earlier than the real departure, and one account writes it at
-most 144 times a day, however many tabs close together. Going `offline`
-after a longer absence always writes. It is written as the last
-connection closes, before `offlineGraceSeconds`, so a reload within the
-grace, which shows nothing, writes its time when the stored one is over
-10 minutes old, and a departure within the next 10 minutes shows that.
-
-Waiting changes, and mutes that run out within the minute, are handled by
-one in-memory timer, armed only while a signed-in connection is open, which
-keeps the object awake for at most a minute after its last event; it uses no
-SQL (but to read a room mute that ran out) and no alarm, so no Durable
-Object request. A mute that runs out later is told at the next event. See
-the [cost report](cost-report.md#user-status).
+A registered user's `seen` (when they were last shown `offline`) is written
+at most once in 10 minutes (`SEEN_WRITE_GRANULARITY_MS`, fixed, not a plan
+limit), so at most 144 times a day per account. Waiting changes use one
+in-memory timer, which keeps the object awake for at most a minute after its
+last event but uses no alarm, so no Durable Object request. See the
+[cost report](cost-report.md#user-status).
 
 ## Runtime overrides
 
-Wrangler string variables use the exact names below. Numeric policy variables
-accept camelCase, matching `src/budget.ts`, or uppercase snake case with an
-optional `LIMIT_` prefix (for example `LIMIT_MAX_FRAME_BYTES`). The prefixed
-form takes precedence, then uppercase, then camelCase. Omitted variables use the defaults.
+Wrangler string variables use the exact names below. Every row of the numeric
+table accepts three names, in this precedence: the `LIMIT_`-prefixed
+uppercase snake case (`LIMIT_MAX_FRAME_BYTES`), plain uppercase snake case
+(`MAX_FRAME_BYTES`), then camelCase as in `src/budget.ts` (`maxFrameBytes`).
+Wrangler deployments should use the uppercase form; local tests may use
+camelCase. Omitted variables use the defaults. Each value must be a positive
+JavaScript safe integer: `0`, fractions, negative values, and values above
+`Number.MAX_SAFE_INTEGER` fail startup.
+
 Production should use the checked-in budget defaults; retain overrides for local
 tests or deliberate temporary reductions. Overrides do not regenerate the native
 limiter or edge rules. Remove temporary overrides before applying a budget increase.
@@ -505,13 +489,6 @@ allowance. Validate changes locally and rerun cost calibration before deployment
 Use small values for deterministic test exhaustion, not larger production limits
 to make a test pass.
 
-Every numeric variable is parsed as a positive JavaScript safe integer. `0`,
-fractions, negative values, and values above `Number.MAX_SAFE_INTEGER` fail
-startup. For example, `maxFrameBytes` accepts `LIMIT_MAX_FRAME_BYTES`,
-`MAX_FRAME_BYTES`, or `maxFrameBytes`, in that precedence order. The same
-aliases apply to every row in the numeric table; Wrangler deployments should
-use the uppercase form, and local tests may use the camelCase form.
-
 The worker validates relationships before it accepts an HTTP request or a
 WebSocket. These checks are part of the deployment policy, not alternate
 defaults:
@@ -519,6 +496,8 @@ defaults:
 - `historyDefaultLimit` cannot exceed `historyMaxLimit`, which is at most 50;
   one snapshot plus response overhead must fit `historyMaxResponseBytes`, which
   is at most 256 KiB.
+- A user's history burst, minute and day allowances cannot exceed their IP's,
+  nor an IP's daily count `historyRequestsPerDay`.
 - `maxTextBytes`, credential bytes, challenge bytes, and request IDs must fit
   the frame policy. Text, names, and snapshots must fit their respective
   snapshot/frame bounds; parser depth, node, embed, and metadata caps have the
@@ -526,9 +505,12 @@ defaults:
 - A connection's pending frame count and bytes must hold every admitted frame.
   Across `openConnections`, the pending-byte allocation is at most 32 MiB.
   Pending frames, connection rates, and limiter records have bounded ceilings.
-- Per-minute and per-day budgets cannot contradict their own windows. Global
-  posting, registration, identity, and processed-frame caps are fixed demo
-  ceilings. Low, high, and hard storage watermarks must be strictly ordered.
+- Per-minute and per-day budgets cannot contradict their own windows. Trusted
+  posting limits are at least the registered ones. Global posting,
+  registration, identity, and processed-frame caps are fixed demo ceilings.
+  Low, high, and hard storage watermarks must be strictly ordered.
+- `retentionSeconds` is at least `cleanupSeconds`; `sessionTtlSeconds` is at
+  most 30 days.
 - A moved message re-logs every reaction set in one record, so
   `reactionUsersPerMessage` times the per-user bound (emoji at most 64 UTF-8
   bytes each, escaped, plus the user's name) must fit `historyMaxResponseBytes`.
@@ -540,7 +522,8 @@ defaults:
 The calibrated hard ceilings are `maxFrameBytes` 16 KiB, `maxTextBytes` 4 KiB,
 `maxSnapshotBytes` 8 KiB, JSON depth 8, JSON nodes 2,048, request IDs 128
 bytes, names 80 Unicode code points/320 UTF-8 bytes, embeds 4, history limit
-50, history response 256 KiB, pending work 8 frames/128 KiB, open sockets 100,
+50, history response 256 KiB, one concurrent history request per connection,
+pending work 8 frames/128 KiB, open sockets 100,
 registered identities and limiter records 10,000 each, processed frames
 150,000/day, global posts 120/minute and 10,000/day, registrations 300/day,
 connection frame rate 120/minute, server-wide frames 1,000/minute (at least one
@@ -549,24 +532,27 @@ IP's minute), per-type throttles 60/minute, frame blocks
 minute), `room_list` registered members 200 per room, guest-number blocks
 10,000 numbers, SQL writes 800,000/day, SQL reads 30,000,000/day,
 database high-water 768 MiB and hard target 1 GiB, cleanup 100 records,
-thread rooms 100 with 2 KiB of client fields, reactions 64 users per message
-and 16 emoji per user, and credentials/challenges 16 KiB. Operators
-may lower these values but cannot raise them without changing the implementation
-and recalibrating its resource model.
+thread rooms 100 with 2 KiB of client fields, private rooms 200 and 50
+memberships per user, reactions 64 users per message
+and 16 emoji per user, and credentials/challenges 16 KiB. The ceilings for
+open sockets, identities, limiter records, processed frames, global posts,
+registrations, SQL and database watermarks are the selected plan's defaults.
+Operators may lower these values but cannot raise them without changing the
+implementation and recalibrating its resource model.
 
 | Variable | Meaning |
 | --- | --- |
-| `RP_ID` | Explicit passkey relying-party hostname; local default `localhost` |
-| `RP_ORIGINS` | Comma-separated exact WebAuthn origins; required explicitly with wildcard guest admission; never accepts wildcards |
+| `RP_ID` | Explicit passkey relying-party hostname; local default `localhost`; every `RP_ORIGINS` host must be it or its subdomain |
+| `RP_ORIGINS` | Comma-separated exact WebAuthn origins; defaults to `ALLOWED_ORIGINS` and must be a subset of it, but is required explicitly with wildcard guest admission; never accepts wildcards |
 | `ALLOWED_ORIGINS` | Exact browser-origin allowlist, or standalone `*` to admit every guest origin (including opaque/missing Origin); cannot mix `*` with explicit origins; all clients remain subject to quotas |
-| `RP_NAME` | Bounded display name for browser passkey prompts; WebAuthn only, never the `server` frame's `title` |
+| `RP_NAME` | Bounded display name for browser passkey prompts, default `Apron Demo`; WebAuthn only, never the `server` frame's `title` |
 | `ACTIVITY` | `true` advertises and relays typing (cap `activity`, section 4.2 of the spec); `false` turns it off. Unset, the plan decides: on for Workers Paid, off for Free. An admin's `/toggle activity` overrides it until toggled back. With it, registered users' read cursors are kept too (`ext.settings.read_cursors`) |
 | `PRESENCE` | `true` or `false`: whether others see each user's `status` (protocol §4.5); needs push. The status users choose with `me` and their mutes are taken whatever it says. Unset, the plan decides: on for both. An admin's `/toggle presence` overrides it until toggled back. See [User status](#user-status-presence) |
 | `GUEST_POSTING` | `true` lets guests post, react, join and leave rooms, and create threads under the guest quotas; default off in both plans, so guests only list rooms and read history until they sign in with a passkey. Announced in each guest's own `you`: `ext.permissions` is `{"write": false}` while guests only read (extension `ext:permissions`) |
-| `SERVER_TITLE` | The `server` frame's `title` (protocol §3.1), a plain name within the display-name policy (80 code points); unset or empty, left out, and clients show the server's address. The public demo sets it in `wrangler.production.toml`. An admin's `/server title` overrides it (see [Server title, description and avatar](#server-title-description-and-avatar)) |
+| `SERVER_TITLE` | The `server` frame's `title` (protocol §3.1), a one-line plain name within the display-name policy (80 code points); unset or empty, left out, and clients show the server's address. The public demo sets it in `wrangler.production.toml`. An admin's `/server title` overrides it (see [Server title, description and avatar](#server-title-description-and-avatar)) |
 | `SERVER_DESCRIPTION` | The `server` frame's `description`, a few words of CommonMark (at most 500 bytes) saying what the server is about; unset or empty, `general`'s description where it fits, else left out. The public demo sets it in `wrangler.production.toml`. An admin's `/server description` overrides it |
 | `SERVER_AVATAR` | The `server` frame's `avatar`, the server's square icon: an `https:` URL, or a small `data:image/{png,jpeg,gif,webp};base64,` URL (at most 8 KiB); unset or empty, left out. The public demo sets it in `wrangler.production.toml`, to apron-web's icon. An admin's `/server avatar` overrides it |
-| `APRON_ADMIN_TOKEN` | Optional fixed bearer token, 24 to 256 of `A-Z a-z 0-9 - _` and not starting `apron_bot_`, `apron_invite_`, `apron_join_`, or `apron_device_`: `auth` with `scheme: "token"` and this token signs in as the registered user `admin` ("Admin"), from any origin and without a passkey, created on first use (a registration against the usual caps). That user is always an admin and can run the admin commands (`/admin`, `/kick`, `/rename`, `/invite-token`, `/invite`, `/purge`, `/server`, `/toggle`, `/emoji` and `/status`; see [SPEC section 5, Admins](../SPEC.md#admins)). Unset by default. Anyone holding it can act as the admin, so set it only as a secret, never a Wrangler var in source: `npx wrangler secret put APRON_ADMIN_TOKEN --config wrangler.production.toml`. It persists across deploys; delete it with `npx wrangler secret delete APRON_ADMIN_TOKEN --config wrangler.production.toml` to turn it off (the `admin` user never holds a passkey, so nothing else signs in as it). A malformed value makes every request fail its configuration check. Locally, use `npx wrangler dev --var APRON_ADMIN_TOKEN:…` or `.dev.vars` |
+| `APRON_ADMIN_TOKEN` | Optional secret, unset by default: 24 to 256 of `A-Z a-z 0-9 - _`, not starting `apron_bot_`, `apron_invite_`, `apron_join_`, or `apron_device_`. `auth` with `scheme: "token"` and this token signs in as the registered user `admin`, who is always an admin, from any origin and without a passkey ([SPEC section 5, Admins](../SPEC.md#admins)). Anyone holding it can act as the admin, so never put it in a Wrangler var or source: `npx wrangler secret put APRON_ADMIN_TOKEN --config wrangler.production.toml`. Delete the secret (`npx wrangler secret delete …`) to turn it off; the `admin` user never holds a passkey. A malformed value makes every request fail its configuration check. Locally, use `npx wrangler dev --var APRON_ADMIN_TOKEN:…` or `.dev.vars` |
 | `MEDIA_ORIGIN` | Exact https origin where the upload bucket serves objects, such as `https://media.apron.chat`; with `PUBLIC_ORIGIN`, `UPLOAD_SIGNING_KEY` and the `MEDIA` binding, turns uploads on for a plan that has them. Announced as `ext.media.origins` (extension `ext:media`) when it is not `PUBLIC_ORIGIN` |
 | `PUBLIC_ORIGIN` | This Worker's exact public origin, which `write_url`s point at |
 | `UPLOAD_SIGNING_KEY` | Secret of at least 32 characters that signs `write_url`s; set with `npx wrangler secret put UPLOAD_SIGNING_KEY --config wrangler.production.toml` |
@@ -575,10 +561,27 @@ and recalibrating its resource model.
 | `VAPID_SUBJECT` | `mailto:` address or `https:` URL sent to push services in each VAPID token as the operator's contact |
 | `PUSH_HOSTS` | Comma-separated push service hosts registrations may name, `*.host` for a host's subdomains, or a standalone `*` for any public host; unset, the browsers' own services (see [Push](#push)) |
 | `PUSH_DELAY_SECONDS` | Whole seconds, 0 to 60, a message's wake waits before it pushes; unset, the plan's `push.delaySeconds`; `0` pushes at once |
-| `ADMISSION_OFF` | Operator admission switch; `true` rejects new sockets in the entry Worker before the limiter or DO call; existing sockets remain subject to DO budgets |
-| `ACCOUNTING_RECOVERY` | Operator recovery from a persisted accounting stop after a reservation overrun (every connection refused with `Server closed: storage accounting stopped after a cost overrun, until an operator reopens it`; the admins are alerted when it happens): 1 to 64 letters, digits, `.`, `_`, `:` or `-`. The Durable Object clears the stop when it next starts, once per value, and logs `accounting_unsafe_cleared`; a stop latched later needs a new value. A stop left by a storage failure (`Server storage is unavailable; try again shortly`) needs none of this: it clears itself once storage works (`accounting_uncertain_recovered`). Set it in `wrangler.production.toml` and deploy, or once with `npm run deploy -- --var ACCOUNTING_RECOVERY:2026-10-29`; leaving a used value set changes nothing; what the failure left unwritten is not charged |
+| `ACCOUNT_ID` | The Cloudflare account whose analytics the account-usage stop and the budget guard read; a Wrangler var (see [Editing the deployment budget](#editing-the-deployment-budget)) |
+| `ACCOUNT_ANALYTICS_TOKEN` | Secret: a read-only account analytics token; with `ACCOUNT_ID`, turns the account-usage stop on |
+| `ZONE_ID` | The zone holding `apron_budget_stop`; a Wrangler var (see [Budget guard](#budget-guard)) |
+| `EDGE_STOP_TOKEN` | Secret: an API token with Zone WAF edit permission on `ZONE_ID`, which the budget guard and the flood trip use |
+| `ADMISSION_OFF` | `true` or `false`: operator admission switch; `true` rejects new sockets in the entry Worker with 503 before the limiter or DO call; existing sockets remain subject to DO budgets |
+| `ACCOUNTING_RECOVERY` | 1 to 64 letters, digits, `.`, `_`, `:` or `-`: reopens a persisted accounting stop after a reservation overrun (see below) |
 | `ENVIRONMENT` | Set to `development` to enable local origin defaults when `ALLOWED_ORIGINS` and `RP_ORIGINS` are omitted |
 | `NODE_ENV` | Set to `test` to enable the same local origin defaults for tests; production-like deployments must configure origins explicitly |
+
+**Accounting recovery.** A reservation overrun closes storage accounting for
+good: every connection is refused with `Server closed: storage accounting
+stopped after a cost overrun, until an operator reopens it`, and the admins
+are alerted. To reopen it, set `ACCOUNTING_RECOVERY` to a value it has not
+used before, in `wrangler.production.toml` or once with
+`npm run deploy -- --var ACCOUNTING_RECOVERY:<value>`, and deploy. The
+Durable Object clears the stop when it next starts and logs
+`accounting_unsafe_cleared`; leaving a used value set changes nothing, so a
+stop latched later needs a new value. What the failure left unwritten is not
+charged. A stop left by a storage failure (`Server storage is unavailable;
+try again shortly`) needs none of this: it clears itself once storage works
+(`accounting_uncertain_recovered`).
 
 Numeric values are positive safe integer counts. Values named `Bytes` count
 UTF-8 bytes, `CodePoints` count Unicode code points, and values named `Seconds`
@@ -587,21 +590,21 @@ are item/count caps. `Bytes` on storage watermarks means effective occupied
 SQLite bytes. Posting, history, authentication, frame, and admission `Minute`
 limits are token buckets (`src/limiter.ts`): a principal may spend a burst at
 once (a minute's worth, or `historyBurstPer*` for history) and then the rate
-a minute, and a refused request learns its exact wait. `Day` limits use the server's effective
-monotonic time and UTC calendar date; a backward wall-clock jump cannot reset
-them. Cleanup and deduplication run in bounded batches/records, while
-`foreground*` and `maintenance*` are daily SQL operation budgets.
+a minute, and a refused request learns its exact wait. `Day` limits use the
+server's effective monotonic time and UTC calendar date; a backward
+wall-clock jump cannot reset them. Cleanup and deduplication run in bounded
+batches/records, while `foreground*` and `maintenance*` are daily SQL
+operation budgets.
 
 `threadLimit` counts thread rooms (rooms with a `parent_room_id`) and the
 top-level rooms admins and mods create (at most 16 of them);
 `threadsPerUser` (at most `threadLimit`) caps the live threads one
-registered user has created, so one account cannot take every slot; and
+registered user has created, so one account cannot take every slot.
 `privateRoomLimit` (at most 200) counts private rooms apart from the
-threads (0 turns private rooms off: a creation is `unsupported`);
-`privateRoomsPerUser` caps the live private rooms one registered user has
-started, and `privateMembershipsPerUser` (at most 50, and at least
+threads; `privateRoomsPerUser` caps the live private rooms one registered
+user has started, and `privateMembershipsPerUser` (at most 50, and at least
 `privateRoomsPerUser`) the private rooms one user is in, theirs and those
-others added them to, which `ext.settings.private_rooms` advertises;
+others added them to, which `ext.settings.private_rooms` advertises.
 `threadMetadataBytes` bounds a room's serialized client fields (`title`,
 `description`, `ext`). A user's `ext` is at most 512 bytes serialized
 (`MAX_USER_EXT_BYTES` in `src/store.ts`, not configurable: every connection
@@ -609,22 +612,23 @@ of the user carries it in its attachment). The `anonymous*` variables
 configure the guest tier (the `guest` auth scheme).
 
 Guests are numbered `guest_1`, `guest_2`, … from a server-wide counter. The
-object reserves `guestNumberBlock` numbers at a time by advancing a stored
-high-water mark (one `_meta` row, about four written rows with the
-reservation's bookkeeping), then hands them out from memory. A restart,
-eviction, or hibernation wake forgets the in-memory block, so the next guest
-reserves a fresh block and the unused numbers are skipped; numbers are never
+object reserves `guestNumberBlock` numbers at a time with one durable write
+(about four written rows with the reservation's bookkeeping), then hands them
+out from memory. A restart, eviction, or hibernation wake forgets the
+in-memory block, so the unused numbers are skipped; numbers are never
 reissued. The default of 10 favours a meaningful count over saved writes:
 this object sleeps between quiet visits, and each visit after a sleep burns
 the rest of a block whatever its size, so a block of 1,000 would number
-occasional visitors 1, 1001, 2001, … while saving at most about 1,600 written rows
-a day (at most 400 blocks for the 4,000 guest admissions a day, against
-about 60 rows each guest connection already writes). Raise it only for a deployment that stays awake.
+occasional visitors 1, 1001, 2001, … while saving at most about 1,600 written
+rows a day (at most 400 blocks for the 4,000 guest admissions a day, against
+about 60 rows each guest connection already writes). Raise it only for a
+deployment that stays awake.
 
 The numeric rows are grouped by their unit and enforcement scope:
 
 - Durations: `retentionSeconds`, `cleanupSeconds`, `challengeTtlSeconds`,
-  `unauthenticatedTimeoutSeconds`, `dedupTtlSeconds`, and
+  `sessionTtlSeconds` (a passkey session token's lifetime, renewed on each
+  resume), `unauthenticatedTimeoutSeconds`, `dedupTtlSeconds`, and
   `statusCoalesceSeconds` and `offlineGraceSeconds` (each at most 60; see
   [User status](#user-status-presence)).
 - Payload/storage bytes: `maxFrameBytes`, `maxTextBytes`, `maxSnapshotBytes`,
@@ -649,7 +653,7 @@ The numeric rows are grouped by their unit and enforcement scope:
   order, besides every connected member; each costs two indexed reads per
   listed room. A room with more says how many members it has in
   `member_count`. `guestNumberBlock` is how many guest numbers (`guest_<n>`) one
-  durable write reserves; see below.
+  durable write reserves; see above.
 - Minute budgets: `historyRequestsPerUserMinute` and
   `historyRequestsPerIpMinute` (after bursts of `historyBurstPerUser` and
   `historyBurstPerIp`, which must drain within the hour cleanup keeps an idle
@@ -675,6 +679,7 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `retentionSeconds` | 604800 | 86400 |
 | `cleanupSeconds` | 86400 | 3600 |
 | `challengeTtlSeconds` | 120 |  |
+| `sessionTtlSeconds` | 2592000 |  |
 | `maxFrameBytes` | 16384 |  |
 | `maxTextBytes` | 4096 |  |
 | `maxSnapshotBytes` | 8192 |  |
@@ -756,4 +761,3 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `limiterRecordCap` | 10000 |  |
 | `maxCredentialBytes` | 16384 |  |
 | `maxChallengeBytes` | 16384 |  |
-| `sessionTtlSeconds` | 2592000 |  |
