@@ -4987,10 +4987,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `command` (§4.1): never logged, broadcast, or saved. The demo provides
-	 * `/help`, which replies with a `~private` notice listing the commands the
-	 * sender may run, `/invite-bot` for registered users, and `/admin`,
-	 * `/kick`, `/rename` and `/status` for admins. An unknown
+	 * `command` (§4.1): never logged, broadcast, or saved. The commands are
+	 * COMMANDS, each for its audience and roles; `/help` replies with a
+	 * `~private` notice listing those the sender may run. An unknown
 	 * command is an error the client shows; it is not a policy violation,
 	 * since people mistype.
 	 */
@@ -5285,7 +5284,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * `/emoji add :name:` with one `upload` embed, and `/emoji remove :name:`
-	 * (extension `ext:emoji`, its suggested convention), for admins. An add's
+	 * (extension `ext:emoji`, its suggested convention), for registered users
+	 * holding one of EMOJI_ROLES (`admin`, `mod`, `friend`), not bots. An add's
 	 * result carries the embed's `write_url`, and the image becomes the key's
 	 * when the write finishes (finishEmoji), replacing an image the key had.
 	 * A removal answers with a `~private` notice before the result (§1). Either

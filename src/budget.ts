@@ -309,8 +309,9 @@ export interface PushPolicy {
 	 */
 	wakesPerMessage: number;
 	/**
-	 * Pushes one sender's messages may get delivered a UTC day, counting only
-	 * those the push service accepted (2xx), so a sender pays for real pushes.
+	 * Pushes one sender's messages may get a UTC day, charged as they are
+	 * claimed, delivered or not, so a failing push service cannot let a sender
+	 * past it.
 	 */
 	pushesPerSenderDay: number;
 	/** Pushes one user may receive a UTC day, from all senders together. */
