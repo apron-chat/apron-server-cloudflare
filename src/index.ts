@@ -5,6 +5,7 @@ import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTI
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor } from "./account-usage";
 import { EDGE_STOP_RULE_REF, readEdgeStop, runBudgetGuard, watchForFlood } from "./budget-guard";
+import { notifyTrigger, type NoticeChannels } from "./notify";
 import { AUDIO_TYPES, sniffAudio } from "./audio";
 import { IMAGE_TYPES, sniffImage } from "./image";
 import { isEmojiKey, MAX_EMOJI_NAME_CHARS } from "./emoji";
@@ -34,6 +35,7 @@ import {
 	type RequestFrame,
 } from "./protocol";
 import {
+	ACCOUNTING_OVERRUN,
 	ADMIN_USER_ID,
 	DEFAULT_JOINED_ROOMS,
 	MAX_PASSKEYS_PER_USER,
@@ -75,6 +77,7 @@ import {
 	type StoredServerMetadata,
 	type UploadFinish,
 	type UploadWrite,
+	STORAGE_UNAVAILABLE,
 } from "./store";
 import { isProtocolId } from "./domain";
 
@@ -139,6 +142,8 @@ interface ConnectionAttachment {
 	/** The device name of the `/invite-device` token this connection signed in with, so a new token for it closes the connection. */
 	device?: string;
 	challenge?: ChallengeRecord;
+	/** When the connection was accepted, which a connection that never pings is judged stale from (staleAfter). */
+	openedAt?: number;
 	authDeadline: number;
 	pendingFrames: number;
 	pendingBytes: number;
@@ -475,6 +480,12 @@ type ToggleFeature = "activity" | "uploads" | "presence" | "addmember";
  * passkey user can take its id, and it never holds a passkey.
  */
 const ADMIN_USER_NAME = "Admin";
+/** `Retry-After` on a 503 that names no delay of its own: a minute. */
+const UNAVAILABLE_RETRY_MS = 60_000;
+/** The IP key an operator alert is charged to (notifyAdmins): no connection sends it. */
+const ALERT_IP_KEY = "alert";
+/** Admins one alert mentions and pushes to: as many as one message may wake, which bounds the claim's reservation. */
+const MAX_ALERT_ADMINS = PUSH_POLICY?.wakesPerMessage ?? 10;
 /** Bot tokens start with this, so `auth` tells them from passkey session tokens without a storage read. */
 const BOT_TOKEN_PREFIX = "apron_bot_";
 /** Key prefix for bot tokens in key-value storage, by the token's SHA-256 like sessions. */
@@ -778,6 +789,7 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			...(Number.isSafeInteger(attachment.seen) && (attachment.seen as number) > 0 ? { seen: attachment.seen } : {}),
 			...presenceState(attachment),
 			...readState(attachment),
+			...(Number.isSafeInteger(attachment.openedAt) && (attachment.openedAt as number) > 0 ? { openedAt: attachment.openedAt } : {}),
 			authDeadline: typeof attachment.authDeadline === "number" ? attachment.authDeadline : 0,
 			pendingFrames: typeof attachment.pendingFrames === "number" ? attachment.pendingFrames : 0,
 			pendingBytes: typeof attachment.pendingBytes === "number" ? attachment.pendingBytes : 0,
@@ -887,6 +899,13 @@ function writeAttachment(socket: WebSocketConnection, attachment: ConnectionAtta
 	socket.serializeAttachment?.(attachment);
 }
 
+/** Seconds as said in a notice: whole minutes as minutes, else seconds. */
+function spokenSeconds(seconds: number): string {
+	if (seconds % 60 !== 0) return `${seconds} seconds`;
+	const minutes = seconds / 60;
+	return minutes === 1 ? "1 minute" : `${minutes} minutes`;
+}
+
 function openSocket(socket: WebSocketConnection): boolean {
 	return socket.readyState === 1;
 }
@@ -914,13 +933,24 @@ function writeSessionAttachment(socket: WebSocketConnection, attachment: Connect
 	writeAttachment(socket, attachment);
 }
 
+/**
+ * What people are told of an internal error, by its cause where the store
+ * names one (Store.assertAccounting), so a connection status probe alone
+ * says why the server refuses.
+ */
+function internalErrorMessage(reason: unknown): string {
+	if (reason === ACCOUNTING_OVERRUN) return "Server closed: storage accounting stopped after a cost overrun, until an operator reopens it";
+	if (reason === STORAGE_UNAVAILABLE) return "Server storage is unavailable; try again shortly";
+	return "Server temporarily unavailable";
+}
+
 function errorToProtocol(error: unknown): ProtocolError {
 	if (error instanceof AuthTooLargeError) return { name: "too_large", message: error.message };
 	if (error instanceof AuthError) {
 		return { name: "denied", message: error.message };
 	}
 	if (error instanceof StoreError) {
-		if (error.code === "internal_error") return { name: "internal_error", message: "Demo temporarily unavailable" };
+		if (error.code === "internal_error") return { name: "internal_error", message: internalErrorMessage(error.data?.reason) };
 		return {
 			name: error.code,
 			message: error.message,
@@ -1178,9 +1208,17 @@ function isConnectionStatus(request: Request): boolean {
 	return request.method === "GET" && new URL(request.url).searchParams.get("apron_connection_status") === "1" && !isUpgrade(request);
 }
 
+/** The admins' channel for a notice from outside the object (notifyTrigger): an RPC to it. */
+function adminChannels(env: Env): NoticeChannels {
+	return { admins: async (text) => {
+		if (!env.DEMO) throw new Error("DEMO binding unavailable");
+		await env.DEMO.getByName(OBJECT_NAME).notifyAdmins(text);
+	} };
+}
+
 export async function fetchEntry(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
 	// Every request the Worker sees is billed, whatever it answers.
-	watchForFlood(env, ctx);
+	watchForFlood(env, ctx, Date.now(), Math.random, fetch, () => notifyTrigger({ kind: "edge_stop", exceeded: ["flood"] }, adminChannels(env)));
 	const response = await fetchConnection(request, env);
 	if (!isConnectionStatus(request)) return response;
 	const headers = new Headers(response.headers);
@@ -1344,13 +1382,13 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 	// which bounds the Durable Object requests every address there spends.
 	try {
 		const { CONNECTION_ATTEMPTS, PREFIX_ATTEMPTS, LOCATION_ATTEMPTS } = env;
-		if (!CONNECTION_ATTEMPTS || !PREFIX_ATTEMPTS || !LOCATION_ATTEMPTS) return responseError(503, "Demo admission unavailable");
+		if (!CONNECTION_ATTEMPTS || !PREFIX_ATTEMPTS || !LOCATION_ATTEMPTS) return responseError(503, "Demo admission unavailable", UNAVAILABLE_RETRY_MS);
 		const window = ADMISSION_BUDGET.workerWindowSeconds * 1_000;
 		if (!(await CONNECTION_ATTEMPTS.limit({ key })).success) return responseError(429, "Connection attempts exceeded", window);
 		if (prefixKey && !(await PREFIX_ATTEMPTS.limit({ key: prefixKey })).success) return responseError(429, "Connection attempts exceeded", window);
 		if (!(await LOCATION_ATTEMPTS.limit({ key: "location" })).success) return responseError(503, "Demo is busy; try again shortly", window);
 	} catch {
-		return responseError(503, "Demo admission unavailable");
+		return responseError(503, "Demo admission unavailable", UNAVAILABLE_RETRY_MS);
 	}
 	if (!env.DEMO) return responseError(503, "Demo capacity unavailable");
 	const headers = stripForwardingHeaders(request.headers);
@@ -1359,14 +1397,19 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 	const forwarded = new Request(request, { headers });
 	const stub = env.DEMO.getByName(OBJECT_NAME);
 	try { return await stub.fetch(forwarded); }
-	catch { return responseError(503, "Demo capacity reached", 60_000); }
+	// The object threw: a platform failure, not capacity.
+	catch { return responseError(503, "Server unavailable; try again shortly", UNAVAILABLE_RETRY_MS); }
 }
 
 export default {
 	fetch: fetchEntry,
 	// The cron trigger in wrangler.production.toml runs the budget guard.
 	scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): void {
-		ctx.waitUntil(runBudgetGuard(env, controller.scheduledTime));
+		// The stop is set first; only a stop just turned on is told, and the
+		// telling never throws (notifyTrigger).
+		ctx.waitUntil(runBudgetGuard(env, controller.scheduledTime).then((result) => {
+			if (result.outcome === "changed" && result.stop) return notifyTrigger({ kind: "edge_stop", exceeded: result.exceeded }, adminChannels(env));
+		}));
 	},
 } satisfies ExportedHandler<Env>;
 
@@ -1469,6 +1512,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private unreadClaims = 0;
 	/** The one timer that announces waiting status changes, and when it fires. */
 	private presenceTimer: ReturnType<typeof setTimeout> | undefined;
+	/** When an event or a timer last ran in this instance (noteActivity, noteTimerFired), 0 for none yet. */
+	private lastActivityAt = 0;
 	private presenceTimerAt = Number.POSITIVE_INFINITY;
 	/**
 	 * When the next waiting status change is due, timer or not: with no
@@ -1487,6 +1532,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.runtimeEnv = env;
 		this.config = loadConfig(env);
 		this.store = new Store(ctx as unknown as ConstructorParameters<typeof Store>[0], asStoreConfig(this.config));
+		// An overrun closes accounting until an operator clears it: tell them.
+		this.store.onOverrun = () => ctx.waitUntil(notifyTrigger({ kind: "accounting_overrun" }, { admins: (text) => this.notifyAdmins(text) }));
 		this.accountUsage = new AccountUsageMonitor({
 			env,
 			persist: (snapshot, now) => this.store.persistAccountUsageSnapshot(snapshot, now),
@@ -1518,6 +1565,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	async fetch(request: Request): Promise<Response> {
+		this.noteActivity();
 		const status = isConnectionStatus(request);
 		if (request.method !== "GET" || (!isUpgrade(request) && !status)) return responseError(400, "WebSocket upgrade required");
 		const ipKey = trustedIpKey(request);
@@ -1558,6 +1606,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			tier: "pending",
 			...(origin ? { origin } : {}),
 			...(endpoint ? { endpoint } : {}),
+			openedAt: nowMs(),
 			authDeadline: nowMs() + this.config.limits.unauthenticatedTimeoutSeconds * 1_000,
 			pendingFrames: 0,
 			pendingBytes: 0,
@@ -1578,6 +1627,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+		this.noteActivity();
 		const socket = ws as WebSocketConnection;
 		// Before the attachment is read: the sweep may write it. The sending
 		// socket has just been heard, so the sweep never judges it stale.
@@ -1626,6 +1676,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	async webSocketClose(ws: WebSocket, code = 1000): Promise<void> {
+		this.noteActivity();
 		const socket = ws as WebSocketConnection;
 		this.sweepPresence();
 		const attachment = connectionAttachment(socket);
@@ -1639,6 +1690,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	async webSocketError(ws: WebSocket): Promise<void> {
+		this.noteActivity();
 		const socket = ws as WebSocketConnection;
 		this.sweepPresence();
 		const attachment = connectionAttachment(socket);
@@ -1652,6 +1704,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	async alarm(): Promise<void> {
+		this.noteActivity();
 		this.alarmKnown = false;
 		const now = nowMs();
 		this.sweepPresence(now);
@@ -1730,7 +1783,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const status = protocol.name === "retry_after" ? 429 : protocol.name === "denied" ? 403 : 503;
 		const retry = protocol.data?.retry_after;
 		const message = protocol.data?.reason === "daily_budget" ? "Daily demo capacity reached" : protocol.message;
-		return responseError(status, message, typeof retry === "number" ? retry * 1_000 : undefined);
+		// A 503 without its own delay still asks clients to wait, so an outage
+		// is not met with every client retrying at once.
+		return responseError(status, message, typeof retry === "number" ? retry * 1_000 : status === 503 ? UNAVAILABLE_RETRY_MS : undefined);
 	}
 
 	private serverAnnouncement(origin: string | null, wakeJoined = false): Record<string, unknown> {
@@ -3635,8 +3690,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Whether a user has a connection someone attends: authenticated as them,
 	 * not stale, and not idle (§4.5). A connection is attended from sign-in
-	 * until its client sends `idle` with seconds, however long it stays silent: the
-	 * server never infers idleness.
+	 * until its client sends `idle` with seconds, however long it stays silent
+	 * while it is not stale: the server never infers idleness. A connection
+	 * that never pings is stale, and closed, after `unpingedTimeoutSeconds`
+	 * without a frame (staleAfter).
 	 */
 	private attended(userId: string, now: number): boolean {
 		return this.connectionsOf(userId).some((peer) => this.attendedConnection(peer, connectionAttachment(peer), now));
@@ -4008,6 +4065,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (this.presenceTimer !== undefined) clearTimeout(this.presenceTimer);
 		this.presenceTimerAt = due;
 		this.presenceTimer = setTimeout(() => {
+			this.noteTimerFired("presence");
 			this.presenceTimer = undefined;
 			this.presenceTimerAt = Number.POSITIVE_INFINITY;
 			this.flushPresence(nowMs());
@@ -4475,6 +4533,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return;
 		}
 		wake.timer = setTimeout(() => {
+			this.noteTimerFired("push_wake");
 			this.pendingWakes.delete(wake);
 			const now = nowMs();
 			for (const userId of [...wake.reasons.keys()]) if (this.attended(userId, now)) wake.reasons.delete(userId);
@@ -4639,12 +4698,73 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 	}
 
+	/** Notes an event (a request, a socket's frame or close, the alarm, an RPC): the object is awake for it anyway. */
+	private noteActivity(): void {
+		this.lastActivityAt = nowMs();
+	}
+
+	/**
+	 * Logs how long a timer kept the object awake, `timer_kept_awake`: the
+	 * time since the last event or timer. The object hibernates about ten
+	 * seconds after its last activity; a timer firing later puts that off by
+	 * the whole gap. The numbers decide whether moving these in-memory timers
+	 * onto the alarm is worth its writes. Logs are sampled, so totals scale up.
+	 */
+	private noteTimerFired(timer: "presence" | "push_wake"): void {
+		const now = nowMs();
+		if (this.lastActivityAt > 0 && now > this.lastActivityAt) console.log(JSON.stringify({ event: "timer_kept_awake", timer, ms: now - this.lastActivityAt }));
+		this.lastActivityAt = now;
+	}
+
+	/**
+	 * Posts `text` in `general` as the admin user, mentioning every other
+	 * user with the `admin` role (at most MAX_ALERT_ADMINS), and pushes it to
+	 * them at once, attended or not, skipping the wait: a mention is how the
+	 * protocol lets a server reach a phone (§4.9.4). Its storage work runs in
+	 * Store.alert, so neither an exhausted budget nor closed accounting stops
+	 * it. Called through notifyTrigger, which catches what this throws; the
+	 * budget guard calls it over RPC, which the edge stop does not block.
+	 */
+	async notifyAdmins(text: string): Promise<void> {
+		this.noteActivity();
+		// Caught inside, so a failed alert never takes runMutation's way out of
+		// an uncertain commit, closing every socket: under the edge stop, the
+		// sockets already open are the only ones that still work.
+		let failure: unknown;
+		await this.runMutation(async () => {
+			try {
+				const now = nowMs();
+				const admins = this.store.alert(() => {
+					const ensured = this.store.ensureAdminUser({ userId: ADMIN_USER_ID, name: ADMIN_USER_NAME, now, ipKey: ALERT_IP_KEY });
+					for (const record of ensured.broadcasts) this.broadcastRecord(record);
+					return this.store.usersWithRole("admin", MAX_ALERT_ADMINS, now).filter((userId) => userId !== ADMIN_USER_ID);
+				});
+				// The notice first, so a push's shortened text still shows it.
+				const mentioned = admins.length ? `${text}\n\n${admins.map((userId) => `@${userId}`).join(" ")}` : text;
+				const body = { text: mentioned, format: "markdown", ...(admins.length ? { mentions: admins } : {}) };
+				const pushed = this.store.alert(() => {
+					const result = this.store.mutate({
+						userId: ADMIN_USER_ID, tier: "registered", ipKey: ALERT_IP_KEY, method: "message", now, system: true,
+						params: { room_id: ROOM_ID, body }, identity: { user_id: ADMIN_USER_ID, name: ADMIN_USER_NAME, tier: "registered" },
+					});
+					for (const record of result.broadcasts) this.broadcastRecord(record);
+					return !!result.message && admins.length > 0 && !!this.config.push && this.pushWake(result.message, new Map(admins.map((userId) => [userId, WAKE_SCOPES.mentions])), true);
+				});
+				// `pushed: false` with admins: none had a registration that a mute or `dnd` left.
+				console.warn(JSON.stringify({ event: "admins_notified", admins: admins.length, pushed }));
+			} catch (error) {
+				failure = error;
+			}
+		});
+		if (failure !== undefined) throw failure;
+	}
+
 	/**
 	 * Claims and sends one message's wake for `reasons` (see wakeFor).
 	 * Whether that settled it: something was claimed, or an allowance is
 	 * spent, so another message would not do.
 	 */
-	private pushWake(message: MessageSnapshot, reasons: ReadonlyMap<string, number>): boolean {
+	private pushWake(message: MessageSnapshot, reasons: ReadonlyMap<string, number>, alert = false): boolean {
 		const vapid = this.config.push;
 		const policy = PUSH_POLICY;
 		if (!vapid || !policy) return true;
@@ -4656,7 +4776,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// PUSH_HOSTS as configured now: a registration made under a wider list
 			// is passed over before it takes a wake or a push.
 			const hosts = this.config.pushHosts;
-			claimed = this.store.claimPushes({ senderId: sender, roomId: message.room_id, candidates, allowed: (url) => pushEndpointError(url, hosts) === null, now });
+			claimed = this.store.claimPushes({ senderId: sender, roomId: message.room_id, candidates, allowed: (url) => pushEndpointError(url, hosts) === null, now, alert });
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "push_claim_failed", reason: errorToProtocol(error).message }));
 			return true;
@@ -6026,42 +6146,72 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Whether a connection's peer has gone quiet: it has sent the liveness
-	 * ping, but neither that nor any frame within the timeout. The runtime
+	 * Whether a connection's peer has gone quiet (staleAfter). The runtime
 	 * cannot ping, so a peer that vanished without a close frame (sleep, a
-	 * network change) otherwise stays connected until the edge gives up on it.
-	 * A connection that never pinged is never judged stale.
+	 * network change) otherwise stays connected until the edge gives up on
+	 * it, which can take until the object restarts.
 	 */
 	private isStale(socket: WebSocket, now: number): boolean {
-		const pinged = this.ctx.getWebSocketAutoResponseTimestamp(socket)?.getTime();
-		if (pinged === undefined) return false;
-		const frames = connectionAttachment(socket as WebSocketConnection)?.frameTimes ?? [];
-		const heard = Math.max(pinged, frames[frames.length - 1] ?? 0);
-		return heard <= now - this.config.limits.pingTimeoutSeconds * 1_000;
+		return this.staleAfter(socket, now) !== undefined;
 	}
 
 	/**
-	 * Closes stale connections. Nothing schedules this: it runs where a stale
-	 * peer would be seen, before `members` are listed and before admission.
-	 * `live`, a socket whose frame is being handled, has just been heard from
-	 * though its frame time is not recorded yet, so it is never closed.
+	 * The timeout a connection outlasted, in seconds, if it is stale, else
+	 * undefined: `pingTimeoutSeconds` with no ping or frame once it has
+	 * pinged, `unpingedTimeoutSeconds` with no frame since it opened if it
+	 * never has.
+	 */
+	private staleAfter(socket: WebSocket, now: number): number | undefined {
+		const { pingTimeoutSeconds, unpingedTimeoutSeconds } = this.config.limits;
+		const attachment = connectionAttachment(socket as WebSocketConnection);
+		const frames = attachment?.frameTimes ?? [];
+		const framed = frames[frames.length - 1] ?? 0;
+		const pinged = this.ctx.getWebSocketAutoResponseTimestamp(socket)?.getTime();
+		if (pinged !== undefined) return Math.max(pinged, framed) <= now - pingTimeoutSeconds * 1_000 ? pingTimeoutSeconds : undefined;
+		// An attachment from before openedAt: its auth deadline, a little after it opened.
+		const opened = attachment?.openedAt ?? attachment?.authDeadline ?? now;
+		return Math.max(opened, framed) <= now - unpingedTimeoutSeconds * 1_000 ? unpingedTimeoutSeconds : undefined;
+	}
+
+	/**
+	 * Closes stale connections. One that never pinged is told why first, in
+	 * a `~private` notice to it alone, so a client that has not implemented
+	 * the ping learns it should; one that pings already knows. Nothing
+	 * schedules this: it runs where a stale peer would be seen, before
+	 * `members` are listed and before admission. `live`, a socket whose frame
+	 * is being handled, has just been heard from though its frame time is not
+	 * recorded yet, so it is never closed.
 	 */
 	private closeStale(now: number, live?: WebSocket): void {
 		const sockets = this.ctx.getWebSockets();
 		let closed = 0;
+		let unpinged = 0;
+		let unpingedClosed = 0;
+		const unpingedOrigins = new Set<string>();
 		for (const ws of sockets) {
+			const neverPinged = !this.ctx.getWebSocketAutoResponseTimestamp(ws);
+			if (neverPinged) unpinged++;
 			if (ws === live) continue;
 			const socket = ws as WebSocketConnection;
 			const attachment = connectionAttachment(socket);
-			if (!attachment || attachment.closing || !this.isStale(socket, now)) continue;
+			if (!attachment || attachment.closing) continue;
+			const after = this.staleAfter(socket, now);
+			if (after === undefined) continue;
+			// A send that fails has closed the socket itself (closePolicy).
+			if (neverPinged && !this.send(socket, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text: `Did not receive \`{"method":"ping"}\` in ${spokenSeconds(after)}, closing stale connection.`, format: "markdown" } } })) continue;
 			attachment.closing = true;
 			writeAttachment(socket, attachment);
 			try { socket.close(1001, "Connection idle; reconnect to recover"); } catch { /* already closed */ }
 			this.connectionGone(attachment);
 			closed++;
+			if (neverPinged) {
+				unpingedClosed++;
+				if (unpingedOrigins.size < 8) unpingedOrigins.add(attachment.origin ?? "none");
+			}
 		}
-		// Shows in Workers Logs whether vanished peers are being found.
-		if (closed) console.log(JSON.stringify({ event: "stale_connections_closed", closed, sockets: sockets.length }));
+		// Shows in Workers Logs whether vanished peers are being found, and how
+		// many connections never ping (by origin; "none" for native clients).
+		if (closed) console.log(JSON.stringify({ event: "stale_connections_closed", closed, sockets: sockets.length, unpinged, unpinged_closed: unpingedClosed, unpinged_origins: [...unpingedOrigins] }));
 	}
 
 	/**
@@ -6381,6 +6531,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * this upload is waiting for one. Only one request may write it.
 	 */
 	async claimUpload(key: string): Promise<boolean | "closed"> {
+		this.noteActivity();
 		return !!this.config.uploads && this.store.claimUpload(key, nowMs());
 	}
 
@@ -6391,6 +6542,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * deletes what it stored.
 	 */
 	async finishUpload(write: UploadWrite): Promise<boolean> {
+		this.noteActivity();
 		if (!this.config.uploads) return false;
 		if (write.key.startsWith("e/")) return this.finishEmoji(write);
 		let finished: UploadFinish = { accepted: false, broadcasts: [], deletedUploads: [] };

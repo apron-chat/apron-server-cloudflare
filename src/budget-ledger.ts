@@ -364,6 +364,11 @@ export class BudgetLedger {
     }
   }
 
+  /** Whether changes wait unwritten: a failed flush (or one inside a transaction) leaves them staged. */
+  hasStaged(): boolean {
+    return this.staged.size > 0;
+  }
+
   /** Forgets the cached row, after writing what is staged; the next reservation reads it again. */
   forget(): void {
     this.flush();

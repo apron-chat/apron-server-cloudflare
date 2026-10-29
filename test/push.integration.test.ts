@@ -92,6 +92,38 @@ async function post(peer: Peer, id: string, params: Record<string, unknown>): Pr
 
 afterEach(() => { vi.restoreAllMocks(); });
 
+describe('admin alerts', () => {
+	it('posts the alert in general as the admin user, mentioning each admin, and pushes it to them at once', async () => {
+		const bossId = unique('boss');
+		const plainId = unique('plain');
+		const boss = await signedIn(bossId);
+		const plain = await signedIn(plainId);
+		try {
+			await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.setRole({ userId: bossId, role: 'admin', on: true }); });
+			const bossPush = await subscribe(boss, 'boss', 'boss-push');
+			const plainPush = await subscribe(plain, 'plain', 'plain-push');
+			const pushes = capturePushes();
+			// The boss is connected and attended: an alert pushes regardless.
+			await stub().notifyAdmins('**Budget stop is on.**');
+			const shown = await until(boss, (frame) => frame.method === 'message' && frame.params?.from?.user_id === 'admin');
+			expect(shown.frame.params.room_id).toBe('general');
+			expect(shown.frame.params.body.mentions).toContain(bossId);
+			expect(shown.frame.params.body.text).toContain(`@${bossId}`);
+			expect(shown.frame.params.body.text).toContain('**Budget stop is on.**');
+			await vi.waitFor(() => expect(pushes.map((push) => push.url)).toContain(bossPush.url));
+			expect(pushes.map((push) => push.url)).not.toContain(plainPush.url);
+			const sent = pushes.find((push) => push.url === bossPush.url)!;
+			const payload = JSON.parse((await decryptPush(sent.body, bossPush.browser)).plaintext);
+			expect(payload).toMatchObject({ push_id: 'boss-push', message: { room_id: 'general', from: { user_id: 'admin' }, message_id: shown.frame.params.message_id } });
+			// Pushed attended or not, an alert counts nothing as unread.
+			expect(payload).not.toHaveProperty('unread');
+			// A second alert within the room's coalescing window is pushed too.
+			await stub().notifyAdmins('**Storage accounting closed.**');
+			await vi.waitFor(() => expect(pushes.filter((push) => push.url === bossPush.url)).toHaveLength(2));
+		} finally { boss.close(); plain.close(); }
+	});
+});
+
 describe('push over the socket', () => {
 	it('advertises webpush with the VAPID public key', async () => {
 		const peer = await connect();
