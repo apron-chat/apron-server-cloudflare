@@ -5,7 +5,7 @@ import { pushPayload } from '../src/index';
 import { MAX_MUTE_SECONDS, MAX_ROOM_MUTES_PER_USER, MUTE_FOREVER, WAKE_SCOPES, type Store } from '../src/store';
 
 const integer = (value: unknown) => Number(value);
-import { connect as open, exchange, request, status, type Frame, type Peer } from './helpers/socket';
+import { connect as open, exchange, request, status, until, type Frame, type Peer } from './helpers/socket';
 import { pushSubscriptionsOf, withStore, type StoredPushSubscription, type TestClock } from './helpers/store';
 import { decryptPush, testBrowser, type TestBrowser } from './helpers/webpush';
 
@@ -97,8 +97,42 @@ describe('push over the socket', () => {
 		const peer = await connect();
 		try {
 			const server = await peer.next();
-			expect(server.params.push).toEqual({ webpush: { key: env.VAPID_PUBLIC_KEY }, wake: ['mentions', 'replies', 'private', 'joined'] });
+			// Before sign-in, without `joined`: only admins and mods wake for it.
+			expect(server.params.push).toEqual({ webpush: { key: env.VAPID_PUBLIC_KEY }, wake: ['mentions', 'replies', 'private'] });
 		} finally { peer.close(); }
+	});
+
+	it('lists wake scope joined only to connections whose user may wake for it, with a new server frame when that changes', async () => {
+		const wakeOf = (frame: Frame) => frame.params.push.wake;
+		const changeRole = (userId: string, on: boolean) => runInDurableObject(stub(), (instance) => {
+			(instance as unknown as { changeRole(userId: string, role: string, on?: boolean): unknown }).changeRole(userId, 'mod', on);
+		});
+		const regularId = unique('wregular');
+		const regular = await signedIn(regularId);
+		const moderatorId = unique('wmod');
+		await register(moderatorId);
+		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.setRole({ userId: moderatorId, role: 'mod', on: true }); });
+		const token = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).issueSession(moderatorId, 'http://localhost:5173', Date.now()));
+		const moderator = await connect();
+		try {
+			// A regular user's sign-in sends no new server frame.
+			expect((await exchange(regular, 'me', 'me', {})).skipped.filter((frame) => frame.method === 'server')).toEqual([]);
+			// A moderator's sign-in sends one with `joined`, right after the result.
+			expect(wakeOf(await moderator.next())).toEqual(['mentions', 'replies', 'private']);
+			expect((await request(moderator, 'auth', 'auth', { scheme: 'token', token })).result.you.user_id).toBe(moderatorId);
+			const signedInFrame = await until(moderator, (frame) => frame.method === 'server');
+			expect(signedInFrame.skipped.filter((frame) => frame.id !== undefined)).toEqual([]);
+			expect(wakeOf(signedInFrame.frame)).toEqual(['mentions', 'replies', 'private', 'joined']);
+			// A role change sends `you`, then the server frame with the wake scopes it now has.
+			await changeRole(regularId, true);
+			const granted = await until(regular, (frame) => frame.method === 'server');
+			expect(granted.skipped.some((frame) => frame.method === 'user' && frame.params.you?.user_id === regularId)).toBe(true);
+			expect(wakeOf(granted.frame)).toEqual(['mentions', 'replies', 'private', 'joined']);
+			await changeRole(regularId, false);
+			expect(wakeOf((await until(regular, (frame) => frame.method === 'server')).frame)).toEqual(['mentions', 'replies', 'private']);
+			// `ext.permissions` carries no server-specific key for it.
+			expect((await request(moderator, 'me-mod', 'me', {})).result.you.ext.permissions).not.toHaveProperty('push_joined');
+		} finally { regular.close(); moderator.close(); }
 	});
 
 	it('takes registrations from registered users only, with a public https endpoint and valid keys', async () => {

@@ -31,11 +31,12 @@ export class StoreError extends Error {
 }
 
 /**
- * What a `retry_after`'s limit holds back (extension `ext:limits`, defined in
- * apron-web's EXT.md): `read`, the refused `history` or `room_list` only;
- * `write`, every request that changes shared state (`message`, `command`,
- * `reactions`, `room_join`, `room_leave`, `room_set`, `me`); `upload`, the
- * `message` and `command` requests that carry `upload` embeds.
+ * What a `retry_after`'s limit holds back (extension `ext:limits`,
+ * EXTENSIONS.md): `read`, the refused `history` or `room_list` only;
+ * `write`, `message`, `reactions`, `room_join`, `room_leave` and
+ * `room_set`; `upload`, the `message` and `command` requests that carry new
+ * `upload` embeds. A refusal names a category only on a request its row
+ * lists.
  */
 export type LimitCategory = "read" | "write" | "upload";
 

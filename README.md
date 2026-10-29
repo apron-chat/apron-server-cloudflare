@@ -24,7 +24,8 @@ for a zero-overage deployment.
   when its last member leaves or its history expires.
 - **Images and avatars.** Signed-in users attach images and set avatars
   (`embed:upload`), stored in R2 within its free tier for a week (avatars a
-  month).
+  month). Admins add custom emoji with `/emoji add :name:`, which everyone
+  can react with (`ext:emoji`).
 - **Push for mentions and replies.** With VAPID keys set, a mention or a
   reply wakes a signed-in user whose every tab is idle or closed, through
   their browser's Web Push service (`server.push` kind `webpush`), unless

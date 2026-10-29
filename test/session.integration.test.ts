@@ -192,25 +192,25 @@ it('updates a registered name and ext with me, declines avatar, and treats name 
 	expect(resumed.result.you.user_id).toBe('user_session_me');
 
 	peer.send({ id: 'rename', method: 'me', params: { name: 'Ada' } });
-	expect((await reply(peer, 'rename')).result).toEqual({ you: { user_id: 'user_session_me', name: 'Ada', roles: [], ext: { permissions: ['add_members'] }, status: 'online' } });
+	expect((await reply(peer, 'rename')).result).toEqual({ you: { user_id: 'user_session_me', name: 'Ada', roles: [], ext: { permissions: { add_members: true } }, status: 'online' } });
 	// Omitted fields stay unchanged; avatars come only from uploads, and ext is kept (§4.12).
 	peer.send({ id: 'profile', method: 'me', params: { avatar: 'https://example.test/a.png', ext: { demo: true } } });
-	expect((await reply(peer, 'profile')).result).toEqual({ you: { user_id: 'user_session_me', name: 'Ada', roles: [], ext: { demo: true, permissions: ['add_members'] }, status: 'online' } });
+	expect((await reply(peer, 'profile')).result).toEqual({ you: { user_id: 'user_session_me', name: 'Ada', roles: [], ext: { demo: true, permissions: { add_members: true } }, status: 'online' } });
 	peer.send({ id: 'no-ext', method: 'me', params: { ext: { demo: '' } } });
-	expect((await reply(peer, 'no-ext')).result).toEqual({ you: { user_id: 'user_session_me', name: 'Ada', roles: [], ext: { permissions: ['add_members'] }, status: 'online' } });
+	expect((await reply(peer, 'no-ext')).result).toEqual({ you: { user_id: 'user_session_me', name: 'Ada', roles: [], ext: { permissions: { add_members: true } }, status: 'online' } });
 	peer.send({ id: 'bad-avatar', method: 'me', params: { avatar: 7 } });
 	expect((await reply(peer, 'bad-avatar')).error.code).toBe(-32602);
 	// An empty name removes it, so clients fall back to the user_id.
 	// It is announced as its empty value (§3.3).
 	peer.send({ id: 'clear', method: 'me', params: { name: '' } });
-	expect((await reply(peer, 'clear')).result).toEqual({ you: { user_id: 'user_session_me', name: '', roles: [], ext: { permissions: ['add_members'] }, status: 'online' } });
+	expect((await reply(peer, 'clear')).result).toEqual({ you: { user_id: 'user_session_me', name: '', roles: [], ext: { permissions: { add_members: true } }, status: 'online' } });
 	peer.send({ id: 'unchanged', method: 'me', params: {} });
-	expect((await reply(peer, 'unchanged')).result).toEqual({ you: { user_id: 'user_session_me', roles: [], ext: { permissions: ['add_members'] }, status: 'online' } });
+	expect((await reply(peer, 'unchanged')).result).toEqual({ you: { user_id: 'user_session_me', roles: [], ext: { permissions: { add_members: true } }, status: 'online' } });
 	peer.close();
 
 	// The removal is durable: a later resume carries no name either.
 	const again = await resume(token);
-	expect(again.reply.result.you).toEqual({ user_id: 'user_session_me', roles: [], ext: { permissions: ['add_members'] }, status: 'online' });
+	expect(again.reply.result.you).toEqual({ user_id: 'user_session_me', roles: [], ext: { permissions: { add_members: true } }, status: 'online' });
 	again.peer.close();
 });
 
@@ -297,7 +297,7 @@ it('sends user notifications for renames, and no old link for a guest signing in
 		await until(second, (frame) => frame.id === 'resume');
 		tab.send({ id: 'rename', method: 'me', params: { name: 'Notified' } });
 		await until(tab, (frame) => frame.id === 'rename');
-		expect((await until(second, (frame) => frame.method === 'user')).frame.params).toEqual({ you: { user_id: 'user_session_notify', name: 'Notified', roles: [], ext: { permissions: ['add_members'] }, status: 'online' } });
+		expect((await until(second, (frame) => frame.method === 'user')).frame.params).toEqual({ you: { user_id: 'user_session_notify', name: 'Notified', roles: [], ext: { permissions: { add_members: true } }, status: 'online' } });
 		expect((await until(watcher, (frame) => frame.method === 'user' && frame.params.new?.name !== undefined)).frame.params).toEqual({ new: { user_id: 'user_session_notify', name: 'Notified', roles: [] } });
 	} finally { watcher.close(); tab.close(); second.close(); }
 });
@@ -353,7 +353,7 @@ it('logs a registered user\'s joins and leaves as memberships, delivered around 
 	let threadId: string;
 	try {
 		await greeting(reader);
-		const guest = (await exchange(reader, 'guest', 'auth', { scheme: 'guest' })).frame.result.you;
+		const { ext: _ext, ...guest } = (await exchange(reader, 'guest', 'auth', { scheme: 'guest' })).frame.result.you;
 		// Creating: one `room_update` with `joined` (the creator as the only
 		// member, whose head is already the creator's logged membership), that
 		// `membership`, and `users`, then the result; on every connection of the user.

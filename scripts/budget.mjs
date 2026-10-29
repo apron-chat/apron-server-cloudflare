@@ -103,7 +103,7 @@ export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHos
 				...(mediaHostname ? [{
 					ref: 'apron_media_invalid',
 					description: 'Apron: the upload bucket serves only GET and HEAD of object keys, without a query string that would skip the cache',
-					expression: `(http.host eq ${JSON.stringify(mediaHostname)}) and (not http.request.method in {"GET" "HEAD"} or http.request.uri.query ne "" or not (starts_with(http.request.uri.path, "/f/") or starts_with(http.request.uri.path, "/a/")))`,
+					expression: `(http.host eq ${JSON.stringify(mediaHostname)}) and (not http.request.method in {"GET" "HEAD"} or http.request.uri.query ne "" or not (starts_with(http.request.uri.path, "/f/") or starts_with(http.request.uri.path, "/a/") or starts_with(http.request.uri.path, "/e/")))`,
 					action: 'block', enabled: true,
 				}] : []),
 				{

@@ -161,6 +161,9 @@ export const PAID_PLAN: Plan = Object.freeze({
 	uploads: Object.freeze({
 		maxFileBytes: 5 * 1024 * 1024,
 		maxAvatarBytes: 256 * 1024,
+		// Custom emoji live until an admin removes them: at most 125 MB.
+		maxEmojiBytes: 256 * 1024,
+		maxEmoji: 500,
 		uploadsPerDay: 500,
 		uploadsPerUserDay: 20,
 		writeWindowSeconds: 10 * 60,

@@ -204,7 +204,7 @@ What the guard cannot promise:
   month, until the minute guard's analytics show it: about $2.60 at 10,000
   requests a second, or about $26 at 100,000, for two six-minute windows.
   `apron_media_invalid` blocks query strings, other methods, and paths
-  outside `f/` and `a/`, so cached images cannot be bypassed.
+  outside `f/`, `a/` and `e/`, so cached images cannot be bypassed.
 - **Other products** on the account (KV, Queues, and so on) are not
   measured.
 
@@ -219,7 +219,9 @@ in `src/plans/paid.ts` sets the limits:
 | --- | ---: |
 | `maxFileBytes` | 5 MB |
 | `maxAvatarBytes` | 256 KB |
-| `uploadsPerDay` (server-wide, avatars included; counted when a write is claimed) | 500 |
+| `maxEmojiBytes` (a custom emoji's image, `/emoji add`) | 256 KB |
+| `maxEmoji` (custom emoji in the catalog, kept until removed) | 500 |
+| `uploadsPerDay` (server-wide, avatars and custom emoji included; counted when a write is claimed) | 500 |
 | `uploadsPerUserDay` (counted when an upload starts) | 20 |
 | `writeWindowSeconds` | 10 minutes |
 | `fileRetentionSeconds` | 7 days |
@@ -234,7 +236,10 @@ Uploads are off until all of these are set:
    in `wrangler.production.toml`). Deploying fails while it does not exist.
 2. **Lifecycle rules.** On the bucket, delete objects with prefix `f/` 7 days
    after upload and prefix `a/` 30 days after upload. They must match
-   `fileRetentionSeconds` and `avatarRetentionSeconds`.
+   `fileRetentionSeconds` and `avatarRetentionSeconds`. Add no rule for
+   `e/`: custom emoji images (`e/<id>`), their catalogs (`e/c/<sha256>.json`)
+   and the server's avatar (`e/<id>`, `/server avatar`) stay until the
+   server deletes them.
 3. **Public domain.** Connect the custom domain `media.apron.chat` to the
    bucket (bucket Settings, Custom Domains), and keep its `r2.dev` URL
    disabled, since WAF rules do not apply there.
@@ -248,11 +253,40 @@ Uploads are off until all of these are set:
 6. **Edge rules.** Update `apron_invalid_request` and `apron_budget_stop`,
    and create `apron_media_invalid`, from
    [the generated definitions](edge-rules.generated.json). The old
-   `apron_invalid_request` blocks `write_url` requests.
+   `apron_invalid_request` blocks `write_url` requests, and an
+   `apron_media_invalid` from before custom emoji blocks `e/`.
+7. **CORS.** Clients fetch the custom emoji catalog with `fetch()`, from
+   their own origin, so the bucket needs a CORS policy (bucket Settings, CORS
+   Policy) that allows `GET` and `HEAD` from the client origins, `*` for a
+   server that admits any origin as this one does:
+
+   ```json
+   [{"AllowedOrigins": ["*"], "AllowedMethods": ["GET", "HEAD"], "MaxAgeSeconds": 86400}]
+   ```
+
+   Images load without it; only the catalog's `fetch()` needs it. Keep the
+   methods to `GET` and `HEAD`: `apron_media_invalid` blocks the rest, a CORS
+   preflight included, and a plain `GET` needs none.
 
 An admin can turn uploads off and on again with `/toggle uploads`, without a
 deploy: new connections stop being offered `embed:upload`, and new
-attachments and avatars are refused until it is turned back on.
+attachments, avatars and custom emoji are refused until it is turned back on.
+
+**Custom emoji** (extension `ext:emoji`; see
+[SPEC section 4](../SPEC.md#extension-extemoji)). An admin adds one with
+`/emoji add :name:` and one image attached, which also replaces the image of
+a name the catalog has, and removes one with `/emoji remove :name:`. The
+catalog is one row of the Durable Object's SQLite storage, published to the
+bucket at `e/c/<sha256>.json`, whose URL the `server` frame carries as
+`ext.emoji.catalog_url` once the catalog has an emoji. Each change publishes
+a new catalog, sends every connection a new `server` frame, and deletes the
+catalog before the last one with any image only it referred to: a replaced
+or removed image stays until the next change, for clients that just read the
+last catalog. Emoji images count
+against `uploadsPerDay`, the admin's `uploadsPerUserDay`, and
+`storedBytesCap`, for as long as they stay: at most 500 of 256 KB, 125 MB.
+The server's avatar (`/server avatar`, below) is kept the same way, one image
+of at most `maxAvatarBytes`.
 
 `MEDIA_ORIGIN` (`https://media.apron.chat`) and `PUBLIC_ORIGIN`
 (`https://server.apron.chat`, where `write_url`s point) are Wrangler vars;
@@ -270,6 +304,45 @@ binding.
 Upload writes and their claims use the Worker and Durable Object allowances
 above: two Durable Object requests and one Worker request each, at most
 500 a day. Deletes are free.
+
+## Server title, description and avatar
+
+The `server` frame's `title`, `description` and `avatar` (protocol §3.1) say
+which server this is in a client's list of servers. Each comes from the
+first of these that sets it:
+
+1. What an admin set with `/server` (protocol §4.1, its suggested
+   convention), kept in the Durable Object's `_meta` rows (`server:title`,
+   `server:description`, `server:avatar`) across restarts.
+2. Its variable: `SERVER_TITLE`, `SERVER_DESCRIPTION` or `SERVER_AVATAR`
+   (below). An empty one counts as unset.
+3. For the description only, the default room `general`'s `description`,
+   trimmed, while it is at most 500 bytes; a longer one is left out, not cut,
+   since cut CommonMark can end mid-markup.
+
+Otherwise the field is left out: without a title, clients show the server's
+address. `RP_NAME` names the server only to passkey prompts.
+
+An admin runs:
+
+- `/server`: shows the three, and where each comes from.
+- `/server title <text>` and `/server description <text>`: set one, with the
+  rules of its variable (a one-line name of at most 80 code points; CommonMark
+  of at most 500 bytes). Without the text, they clear what `/server` set, so
+  the variable, or for the description `general`'s, applies again.
+- `/server avatar` with one image attached (an `upload` embed): sets the
+  avatar when the write finishes. The image is kept like a custom emoji: under
+  `e/`, which has no lifecycle rule, never expiring, the server's rather than
+  the admin's (so `/purge` and `/rename` of that admin leave it), at most
+  `maxAvatarBytes`, and counted against `uploadsPerDay`, the admin's
+  `uploadsPerUserDay` and `storedBytesCap`. A new one replaces and deletes the
+  old. It needs uploads, and is refused while they are toggled off. Without
+  an image, `/server avatar` clears the avatar and deletes its image.
+
+Each change sends every connection a new `server` frame, and so does a
+`room_set` of `general` that changes its description while that is the
+server's. `welcome` stays `general`'s description, or the generated sign-in
+text, as before.
 
 ## Push
 
@@ -474,11 +547,14 @@ and recalibrating its resource model.
 | `RP_ID` | Explicit passkey relying-party hostname; local default `localhost` |
 | `RP_ORIGINS` | Comma-separated exact WebAuthn origins; required explicitly with wildcard guest admission; never accepts wildcards |
 | `ALLOWED_ORIGINS` | Exact browser-origin allowlist, or standalone `*` to admit every guest origin (including opaque/missing Origin); cannot mix `*` with explicit origins; all clients remain subject to quotas |
-| `RP_NAME` | Bounded display name for browser passkey prompts |
+| `RP_NAME` | Bounded display name for browser passkey prompts; WebAuthn only, never the `server` frame's `title` |
 | `ACTIVITY` | `true` advertises and relays typing (cap `activity`, section 4.2 of the spec); `false` turns it off. Unset, the plan decides: on for Workers Paid, off for Free. An admin's `/toggle activity` overrides it until toggled back. With it, registered users' read cursors are kept too (`ext.settings.read_cursors`) |
 | `PRESENCE` | `true` or `false`: whether others see each user's `status` (protocol §4.5); needs push. The status users choose with `me` and their mutes are taken whatever it says. Unset, the plan decides: on for both. An admin's `/toggle presence` overrides it until toggled back. See [User status](#user-status-presence) |
-| `GUEST_POSTING` | `true` lets guests post, react, join and leave rooms, and create threads under the guest quotas; default off in both plans, so guests only list rooms and read history until they sign in with a passkey. Announced as `ext.settings.guest_posting` (extension `ext:settings`) |
-| `APRON_ADMIN_TOKEN` | Optional fixed bearer token, 24 to 256 of `A-Z a-z 0-9 - _` and not starting `apron_bot_`, `apron_invite_`, `apron_join_`, or `apron_device_`: `auth` with `scheme: "token"` and this token signs in as the registered user `admin` ("Admin"), from any origin and without a passkey, created on first use (a registration against the usual caps). That user is always an admin and can run the admin commands (`/admin`, `/kick`, `/rename`, `/invite-token`, `/invite`, `/purge`, `/toggle` and `/status`; see [SPEC section 5, Admins](../SPEC.md#admins)). Unset by default. Anyone holding it can act as the admin, so set it only as a secret, never a Wrangler var in source: `npx wrangler secret put APRON_ADMIN_TOKEN --config wrangler.production.toml`. It persists across deploys; delete it with `npx wrangler secret delete APRON_ADMIN_TOKEN --config wrangler.production.toml` to turn it off (the `admin` user never holds a passkey, so nothing else signs in as it). A malformed value makes every request fail its configuration check. Locally, use `npx wrangler dev --var APRON_ADMIN_TOKEN:…` or `.dev.vars` |
+| `GUEST_POSTING` | `true` lets guests post, react, join and leave rooms, and create threads under the guest quotas; default off in both plans, so guests only list rooms and read history until they sign in with a passkey. Announced in each guest's own `you`: `ext.permissions` is `{"write": false}` while guests only read (extension `ext:permissions`) |
+| `SERVER_TITLE` | The `server` frame's `title` (protocol §3.1), a plain name within the display-name policy (80 code points); unset or empty, left out, and clients show the server's address. The public demo sets it in `wrangler.production.toml`. An admin's `/server title` overrides it (see [Server title, description and avatar](#server-title-description-and-avatar)) |
+| `SERVER_DESCRIPTION` | The `server` frame's `description`, a few words of CommonMark (at most 500 bytes) saying what the server is about; unset or empty, `general`'s description where it fits, else left out. The public demo sets it in `wrangler.production.toml`. An admin's `/server description` overrides it |
+| `SERVER_AVATAR` | The `server` frame's `avatar`, the server's square icon: an `https:` URL, or a small `data:image/{png,jpeg,gif,webp};base64,` URL (at most 8 KiB); unset or empty, left out. The public demo sets it in `wrangler.production.toml`, to apron-web's icon. An admin's `/server avatar` overrides it |
+| `APRON_ADMIN_TOKEN` | Optional fixed bearer token, 24 to 256 of `A-Z a-z 0-9 - _` and not starting `apron_bot_`, `apron_invite_`, `apron_join_`, or `apron_device_`: `auth` with `scheme: "token"` and this token signs in as the registered user `admin` ("Admin"), from any origin and without a passkey, created on first use (a registration against the usual caps). That user is always an admin and can run the admin commands (`/admin`, `/kick`, `/rename`, `/invite-token`, `/invite`, `/purge`, `/server`, `/toggle`, `/emoji` and `/status`; see [SPEC section 5, Admins](../SPEC.md#admins)). Unset by default. Anyone holding it can act as the admin, so set it only as a secret, never a Wrangler var in source: `npx wrangler secret put APRON_ADMIN_TOKEN --config wrangler.production.toml`. It persists across deploys; delete it with `npx wrangler secret delete APRON_ADMIN_TOKEN --config wrangler.production.toml` to turn it off (the `admin` user never holds a passkey, so nothing else signs in as it). A malformed value makes every request fail its configuration check. Locally, use `npx wrangler dev --var APRON_ADMIN_TOKEN:…` or `.dev.vars` |
 | `MEDIA_ORIGIN` | Exact https origin where the upload bucket serves objects, such as `https://media.apron.chat`; with `PUBLIC_ORIGIN`, `UPLOAD_SIGNING_KEY` and the `MEDIA` binding, turns uploads on for a plan that has them. Announced as `ext.media.origins` (extension `ext:media`) when it is not `PUBLIC_ORIGIN` |
 | `PUBLIC_ORIGIN` | This Worker's exact public origin, which `write_url`s point at |
 | `UPLOAD_SIGNING_KEY` | Secret of at least 32 characters that signs `write_url`s; set with `npx wrangler secret put UPLOAD_SIGNING_KEY --config wrangler.production.toml` |

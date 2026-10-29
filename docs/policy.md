@@ -95,7 +95,9 @@ within it:
 - Commands: `/help` replies with a `~private` notice listing the commands the
   sender may run; `/invite-bot` gives a registered user a bot token (below);
   `/invite-device <name>` gives them a token for another device (below);
-  `/avatar` sets one with an attached image (below); other commands are
+  `/avatar` sets one with an attached image (below); admins have their own
+  (SPEC section 5, Admins), among them `/server`, which sets the server's
+  title, description and avatar (below); other commands are
   `invalid_params`.
 - Uploads (cap `embed:upload`, Workers Paid budgets): registered users attach
   images and voice clips as `upload` embeds, written to the `write_url` in their result and
@@ -300,8 +302,8 @@ are stored hashed in the object and swept on expiry. Signing out is local to
 the client: it drops the stored token, and the connection returns as a fresh
 guest.
 
-Guests only read unless the deployment sets `GUEST_POSTING=true`
-(`ext.settings.guest_posting` says which): they can list rooms, read any room's
+Guests only read unless the deployment sets `GUEST_POSTING=true` (a guest's
+own `you` says which, with `ext.permissions` `{"write": false}`): they can list rooms, read any room's
 history without joining it, and run `/help`, and stay in `general`, where
 authentication put them. Posting, reacting, joining, leaving, and creating or
 editing threads are writes, `denied` ("Guests can only read here; sign in with
@@ -342,31 +344,43 @@ but do consume frame and lookup resources.
 
 ## Server settings
 
-The `server` frame advertises `ext:settings`, this implementation's
-extension, and carries its data in `server.params.ext.settings`, as the
-protocol's extension naming rule has it: three booleans, which a client takes
-as `true` when absent, and `private_rooms`, the number of private rooms one
-user may be in. `guest_posting` says whether guests may post, react,
-join and leave rooms, and create threads (`GUEST_POSTING`),
-`read_cursors` says whether a registered user's read cursors are kept
-(with activity), and `add_members` says whether registered users may add others
-to rooms (`/toggle addmember`). Where uploads are configured, `ext:media`
-(defined in apron-web's EXT.md) carries `server.params.ext.media`: the media
-origin when it is not the server's, and each type an attachment or avatar
-upload keeps with its largest size. `ext:permissions` (also from EXT.md) puts
-`ext.permissions` on the user's own `you` only: `move_any` for a registered
-user with `admin`, `mod` or `threader` (not an owner's bot), `add_members`
-for an admin, or any registered user but a bot while `addmember` is on, and
-`push_joined` for a registered `admin` or `mod` (not an owner's bot) while
-push is on. It is
-the server's: `me` ignores an `ext.permissions` it writes. The ping interval is the standard `server.params.ping`.
+The `server` frame carries `title`, `description` and `avatar` (protocol
+§3.1), so clients can show which server this is: each as an admin set it
+with `/server`, else from `SERVER_TITLE`, `SERVER_DESCRIPTION` and
+`SERVER_AVATAR`, else, for the description, `general`'s description where it
+is at most 500 bytes, else left out (`RP_NAME` is for passkey prompts only).
+Each change sends every connection a new `server` frame (see
+[configuration](configuration.md#server-title-description-and-avatar)). Every extension it advertises is defined in
+[EXTENSIONS.md](https://github.com/shazow/apron/blob/main/EXTENSIONS.md). `ext:settings` carries
+`server.params.ext.settings`: `read_cursors`, whether a registered user's read
+cursors are kept (with activity), and `private_rooms`, the number of private
+rooms one user may be in. Where uploads are configured, `ext:media` carries
+`server.params.ext.media`: the media origin when it is not the server's, and
+each type an attachment, avatar or custom emoji upload keeps with its largest
+size; images are never scaled, so no `max_side` is sent. `ext:permissions`
+puts `ext.permissions` on the user's own `you` only, an object of the keys
+that differ from their defaults: `write: false` for a guest while guests only
+read, `add_members` for an admin, or any registered user but a bot while
+`addmember` is on, `move_any` for a registered user with `admin`, `mod` or
+`threader` (not an owner's bot). Where push is on, `server.params.push.wake`
+lists `joined` only on a connection signed in as a registered `admin` or
+`mod` (not an owner's bot); a sign-in or role change that changes that sends
+a new `server` frame. `ext.permissions` is the
+server's: `me` ignores an `ext.permissions` it writes. Once an admin has added
+a custom emoji with `/emoji add :name:` (and one image), `ext:emoji` carries
+`server.params.ext.emoji.catalog_url`, the catalog's URL on the media origin,
+which changes with every `/emoji add` or `/emoji remove`; each change sends
+every connection a new `server` frame. A reaction may then use a key the
+catalog has, or one already in the user's set on that message; any other key
+is `invalid_params`. Reactions are stored fully
+qualified, and entries that differ only in U+FE0F are one entry. The ping interval is the standard `server.params.ping`.
 The demo's 16 KiB frame policy is an explicit exception to the base protocol's
 advisory 256 KiB recommendation. Payload lengths count UTF-8 bytes. Errors use
 the base protocol codes; `retry_after` includes `data.retry_after`, whole
 seconds rounded up, and, when a reading, posting or upload limit refused the
 request, `data.ext.limits`: `read`, `write` or `upload` (extension
-`ext:limits`, advertised in `capabilities` and defined in apron-web's EXT.md;
-SPEC section 6), which tells clients what to hold back; they ignore a value
+`ext:limits`, advertised in `capabilities`; SPEC section 6; a refused `me`
+names none), which tells clients what to hold back; they ignore a value
 they do not know. Messages name the limit, never its amount or delay. Permanent identity/thread-room ceilings return `denied`, not a fabricated replenishment time.
 Every count limit the server sets (embeds per message, emoji per reaction set,
 reacting users per message, push `wake` entries, invite uses, passkeys, roles,

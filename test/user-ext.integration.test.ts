@@ -57,7 +57,7 @@ it('merges a user ext one level deep, sends it whole in complete objects, and on
 	const bob = await signIn(await register(bobId));
 	try {
 		// Only what the server keeps for her own `you` (ext:permissions).
-		const own = { permissions: ['add_members'] };
+		const own = { permissions: { add_members: true } };
 		expect(alice.you.ext).toEqual(own);
 		await userFrames(bob.peer);
 		await userFrames(other.peer);
@@ -116,18 +116,18 @@ it('keeps ext.permissions the server\'s: `me` cannot set or clear it, and only t
 	const aliceToken = await register(aliceId);
 	const alice = await signIn(aliceToken);
 	const bob = await signIn(await register(unique('bob')));
-	const own = { permissions: ['add_members'] };
+	const own = { permissions: { add_members: true } };
 	try {
 		await userFrames(bob.peer);
 		// A write of it is ignored, like `roles`; the rest of the write is kept.
-		const spoofed = await request(alice.peer, 'spoof', 'me', { ext: { permissions: ['move_any'], tz: 'Europe/Oslo' } });
+		const spoofed = await request(alice.peer, 'spoof', 'me', { ext: { permissions: { move_any: true }, tz: 'Europe/Oslo' } });
 		expect(spoofed.result.you.ext).toEqual({ tz: 'Europe/Oslo', ...own });
 		expect((await userFrames(bob.peer)).map((frame) => frame.params.new.ext)).toEqual([{ tz: 'Europe/Oslo' }]);
-		expect((await request(alice.peer, 'clear', 'me', { ext: { permissions: [] } })).result.you.ext).toEqual({ tz: 'Europe/Oslo', ...own });
+		expect((await request(alice.peer, 'clear', 'me', { ext: { permissions: {} } })).result.you.ext).toEqual({ tz: 'Europe/Oslo', ...own });
 		expect(await userFrames(bob.peer)).toEqual([]);
 		// One stored before is never read: not in her `you`, nor in others' objects for her.
 		await runInDurableObject(stub(), (_instance, state) => {
-			state.storage.sql.exec('UPDATE identities SET ext_json = ? WHERE user_id = ?', JSON.stringify({ tz: 'Europe/Oslo', permissions: ['move_any'] }), aliceId);
+			state.storage.sql.exec('UPDATE identities SET ext_json = ? WHERE user_id = ?', JSON.stringify({ tz: 'Europe/Oslo', permissions: { move_any: true } }), aliceId);
 		});
 		const again = await signIn(aliceToken);
 		expect(again.you.ext).toEqual({ tz: 'Europe/Oslo', ...own });
@@ -137,12 +137,12 @@ it('keeps ext.permissions the server\'s: `me` cannot set or clear it, and only t
 	} finally { alice.peer.close(); bob.peer.close(); }
 });
 
-it('keeps no ext for guests', async () => {
+it('keeps no ext for guests, whose own `you` carries only their permissions', async () => {
 	const peer = await connect();
 	try {
 		await greeting(peer);
 		await request(peer, 'auth', 'auth', { scheme: 'guest' });
 		expect((await request(peer, 'set', 'me', { ext: { tz: 'Europe/Oslo' } })).error.code).toBe(-32001);
-		expect((await request(peer, 'empty', 'me', { ext: {} })).result.you).not.toHaveProperty('ext');
+		expect((await request(peer, 'empty', 'me', { ext: {} })).result.you.ext).toEqual({ permissions: {} });
 	} finally { peer.close(); }
 });

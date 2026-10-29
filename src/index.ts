@@ -1,12 +1,13 @@
 import { DurableObject } from "cloudflare:workers";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
-import { isAllowedOrigin, loadConfig, pushHostAllowed, type RuntimeConfig } from "./config";
+import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor } from "./account-usage";
 import { EDGE_STOP_RULE_REF, readEdgeStop, runBudgetGuard, watchForFlood } from "./budget-guard";
 import { AUDIO_TYPES, sniffAudio } from "./audio";
 import { IMAGE_TYPES, sniffImage } from "./image";
+import { isEmojiKey, MAX_EMOJI_NAME_CHARS } from "./emoji";
 import { limitData } from "./store-error";
 import { signUploadToken, verifyUploadToken } from "./upload-token";
 import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
@@ -62,6 +63,7 @@ import {
 	seenStands,
 	type Broadcast,
 	type ClaimedPush,
+	type EmojiDraft,
 	type MessageSnapshot,
 	type PushCandidate,
 	type RoomRecord,
@@ -69,6 +71,7 @@ import {
 	type StoreConfig,
 	type StoreMutationInput,
 	type StoreMutationResult,
+	type StoredServerMetadata,
 	type UploadFinish,
 	type UploadWrite,
 } from "./store";
@@ -230,6 +233,12 @@ interface ConnectionAttachment {
 	 */
 	reads?: Record<string, string>;
 	readsAt?: number;
+	/**
+	 * The last `server` frame this connection got listed wake scope `joined`
+	 * in `push.wake` (wakesJoined), so a sign-in or role change that changes
+	 * it sends a new one (syncServer).
+	 */
+	wakeJoined?: boolean;
 	closing?: boolean;
 }
 
@@ -415,6 +424,17 @@ const JOIN_INVITE_TTL_MS = 7 * 86_400_000;
 /** Device tokens one user may hold at once, each under its own name. */
 const MAX_DEVICE_TOKENS = 3;
 /**
+ * The default room's `description` as the server's (§3.1), where neither
+ * `/server description` nor `SERVER_DESCRIPTION` sets one: trimmed, and left
+ * out, not cut, when empty or past the server description's rules (at most
+ * MAX_SERVER_DESCRIPTION_BYTES), since cut CommonMark can end mid-markup.
+ */
+function roomServerDescription(description: string | undefined): string | undefined {
+	const trimmed = description?.trim();
+	return trimmed && validServerDescription(trimmed) ? trimmed : undefined;
+}
+
+/**
  * The commands this server provides (§4.1), as `/help` lists them to those
  * who may run them: `everyone`, `owners` (registered users other than bots),
  * or `admins` (the `APRON_ADMIN_TOKEN` user and those given the `admin` role).
@@ -431,6 +451,8 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
 	{ name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", audience: "admins" },
 	{ name: "invite", usage: "/invite <uses>", help: `get a token that signs up to <uses> new users (at most ${MAX_JOIN_USES}) for a week, replacing the last one; /invite 0 revokes it`, audience: "admins" },
+	{ name: "emoji", usage: "/emoji add|remove :name:", help: "add a custom emoji, or replace its image: send /emoji add :name: with one image attached; /emoji remove :name: removes it", audience: "admins" },
+	{ name: "server", usage: "/server [title|description [<text>] | avatar]", help: "show this server's title, description and avatar; set one, the avatar with one image attached; or clear one, back to the deployment's", audience: "admins" },
 	{ name: "toggle", usage: "/toggle <activity|uploads|presence|addmember>", help: "turn typing activity, uploads, user status (presence), or users adding others to rooms (addmember) off or on for everyone", audience: "admins" },
 	{ name: "purge", usage: "/purge <user_id>", help: "disconnect a user and delete their account, bot, and everything they posted or uploaded", audience: "admins" },
 	{ name: "status", usage: "/status", help: "show today's Cloudflare usage and the demo's budgets", audience: "admins" },
@@ -760,6 +782,7 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			historyInFlight: typeof attachment.historyInFlight === "number" ? attachment.historyInFlight : 0,
 			frameTimes: Array.isArray(attachment.frameTimes) ? attachment.frameTimes.slice(-120) : [],
 			...throttleState(attachment),
+			...(attachment.wakeJoined === true ? { wakeJoined: true } : {}),
 			...(attachment.closing ? { closing: true } : {}),
 		};
 	} catch {
@@ -1167,7 +1190,7 @@ export async function fetchEntry(request: Request, env: Env, ctx?: ExecutionCont
  * `PUT /w/<token>`: a `write_url` (§4.8.3). The token's signature is checked
  * before the body is read, the Durable Object claims the upload so a URL
  * writes once, and the bytes must be a PNG, JPEG, GIF, or WebP image, or for
- * an attachment (not an avatar) WebM, Ogg, or MP4 audio, within the token's
+ * an attachment (not an avatar or custom emoji) WebM, Ogg, or MP4 audio, within the token's
  * size. The object is stored in R2 with the type its bytes
  * show, then the Durable Object finishes the write; one it no longer wants
  * is deleted again.
@@ -1194,6 +1217,15 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 	if (!uploads || !media || !env.DEMO) return answer(404, "Not found");
 	const grant = await verifyUploadToken(uploads.signingKey, token);
 	if (!grant) return answer(403, "This write_url is not valid or has expired");
+	// The write's declared type, where it has one, must be one the server
+	// keeps (extension `ext:media`); what is kept is typed from its bytes.
+	const attachment = grant.key.startsWith("f/");
+	const emoji = grant.key.startsWith("e/");
+	const kept: readonly string[] = attachment ? [...IMAGE_TYPES, ...AUDIO_TYPES] : IMAGE_TYPES;
+	// `e/` holds custom emoji and the server's avatar (`/server avatar`).
+	const refusal = attachment ? "Only PNG, JPEG, GIF, and WebP images and WebM, Ogg, and MP4 audio can be uploaded" : `Only PNG, JPEG, GIF, and WebP images can be ${emoji ? "custom emoji or the server's avatar" : "avatars"}`;
+	const declared = request.headers.get("Content-Type")?.split(";")[0].trim().toLowerCase();
+	if (declared && !kept.includes(declared)) return answer(415, refusal);
 	const length = Number(request.headers.get("Content-Length") ?? NaN);
 	if (!Number.isSafeInteger(length) || length <= 0) return answer(411, "Content-Length is required");
 	if (length > grant.maxBytes) return answer(413, `An upload here is at most ${grant.maxBytes} bytes`);
@@ -1216,15 +1248,16 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 		return fail(400, "The upload was interrupted");
 	}
 	if (body.byteLength !== length || body.byteLength > grant.maxBytes) return fail(400, "The body does not match its Content-Length");
-	const attachment = grant.key.startsWith("f/");
 	const sniffed = sniffImage(body) ?? (attachment ? sniffAudio(body) : null);
-	if (!sniffed) return fail(415, attachment ? "Only PNG, JPEG, GIF, and WebP images and WebM, Ogg, and MP4 audio can be uploaded" : "Only PNG, JPEG, GIF, and WebP images can be avatars");
+	if (!sniffed) return fail(415, refusal);
 	try {
 		await media.put(grant.key, body, {
 			httpMetadata: {
 				contentType: sniffed.type,
-				// Attachments never change; an avatar key is rewritten when refreshed.
-				cacheControl: attachment ? "public, max-age=604800, immutable" : "public, max-age=86400",
+				// Attachments, custom emoji and the server's avatar never change;
+				// an avatar key is rewritten when refreshed. Custom emoji and the
+				// server's avatar live until removed or replaced.
+				cacheControl: attachment ? "public, max-age=604800, immutable" : emoji ? "public, max-age=31536000, immutable" : "public, max-age=86400",
 			},
 		});
 	} catch {
@@ -1241,9 +1274,38 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 	return answer(204);
 }
 
+/** The object keys a media origin serves: attachments, avatars, custom emoji and their catalogs, and the server's avatar (`e/`). */
+const MEDIA_KEY_PATTERN = /^(?:[fae]\/[A-Za-z0-9_-]{22}|e\/c\/[0-9a-f]{64}\.json)$/;
+
+/**
+ * `GET` or `HEAD` of an upload, where this Worker is its own media origin
+ * (`MEDIA_ORIGIN` equal to `PUBLIC_ORIGIN`, as for local development):
+ * the R2 object with its stored type and cache headers, readable from any
+ * origin, so that clients can fetch the custom emoji catalog. Null where
+ * the bucket's own domain serves uploads, as in production.
+ */
+async function handleMediaRead(request: Request, env: Env, key: string): Promise<Response | null> {
+	if ((request.method !== "GET" && request.method !== "HEAD") || !MEDIA_KEY_PATTERN.test(key) || !env.MEDIA) return null;
+	let config: RuntimeConfig;
+	try {
+		config = loadConfig(env);
+	} catch {
+		return null;
+	}
+	if (!config.uploads || config.uploads.mediaOrigin !== config.uploads.publicOrigin) return null;
+	const object = await env.MEDIA.get(key);
+	if (!object) return responseError(404, "Not found");
+	const headers = new Headers({ "Access-Control-Allow-Origin": "*", "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'" });
+	object.writeHttpMetadata(headers);
+	headers.set("ETag", object.httpEtag);
+	return new Response(request.method === "HEAD" ? null : object.body, { headers });
+}
+
 async function fetchConnection(request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url);
 	if (url.pathname.startsWith("/w/")) return handleUploadWrite(request, env, url.pathname.slice(3));
+	const media = await handleMediaRead(request, env, url.pathname.slice(1));
+	if (media) return media;
 	const status = isConnectionStatus(request);
 	const rootUpgrade = url.pathname === "/" && (isUpgrade(request) || status);
 	if (url.pathname !== "/ws" && !rootUpgrade) {
@@ -1653,9 +1715,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return responseError(status, message, typeof retry === "number" ? retry * 1_000 : undefined);
 	}
 
-	private serverAnnouncement(origin: string | null): Record<string, unknown> {
+	private serverAnnouncement(origin: string | null, wakeJoined = false): Record<string, unknown> {
 		const limits = this.config.limits;
 		const presence = this.presenceMode();
+		const emoji = this.emojiCatalogUrl();
+		const general = this.generalDescription();
 		return {
 			method: "server",
 			params: {
@@ -1680,6 +1744,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 					"ext:settings", "ext:limits",
 					...(this.config.uploads ? ["ext:media"] : []),
 					"ext:permissions",
+					// Custom emoji (ext:emoji), once an admin has added one.
+					...(emoji ? ["ext:emoji"] : []),
 				],
 				// Passkeys and their session tokens only where passkeys are offered;
 				// bot tokens (`/invite-bot`) from anywhere, since bots are not browsers.
@@ -1692,42 +1758,69 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// connection, not an account, so `guest` is listed only in `auth`.
 				signup: this.passkeysOffered(origin) ? ["webauthn", "token"] : ["token"],
 				// For the sign-in screen (§3.2); the `~private` welcome below goes in a room.
-				welcome: this.generalDescription() ?? this.signInWelcome(origin),
+				welcome: general ?? this.signInWelcome(origin),
+				// What the server is, for lists of servers (§3.1): what admins set
+				// with `/server`, else SERVER_TITLE, SERVER_DESCRIPTION and
+				// SERVER_AVATAR (config.ts), else for the description `general`'s.
+				...this.serverMetadata(general),
 				// Answered by the runtime without waking the object (see PING_REQUEST).
 				ping: limits.pingSeconds,
-				// Web Push (§4.9), with the VAPID key browsers subscribe with and the wake scopes.
-				...(this.config.push ? { push: { webpush: { key: this.config.push.publicKey }, wake: Object.keys(WAKE_SCOPES) } } : {}),
+				// Web Push (§4.9), with the VAPID key browsers subscribe with and
+				// the wake scopes: `joined` only to a connection whose user may wake
+				// for it (wakesJoined), since a server advertises only the scopes it
+				// implements, and ignores the others in `wake`.
+				...(this.config.push ? { push: { webpush: { key: this.config.push.publicKey }, wake: Object.keys(WAKE_SCOPES).filter((scope) => wakeJoined || scope !== "joined") } } : {}),
 				// The optional `status` values `me` accepts (§3.1, §4.5), only while
 				// others are shown them: with presence off a choice is still kept,
 				// but nobody sees `dnd` or `invisible`, so clients offer neither.
 				...(presence ? { status: [...OPTIONAL_STATUS_CHOICES] } : {}),
-				// Extension `ext:settings`, this server's own: what clients can do
-				// here beyond the capabilities. Each key but `private_rooms` is a
-				// boolean, and a client takes an absent one as true. `guest_posting`: guests may post,
-				// react, join and leave rooms, and create threads; `false` here
-				// unless GUEST_POSTING is on. `read_cursors`: an `activity`
-				// `read_message_id` is kept or relayed; a registered user's are,
-				// with `activity` (handleActivity), so `false` only without it.
-				// `add_members`: registered users may add others to rooms with
-				// `room_join` and a `user_id`; `/toggle addmember` turns it off
-				// (a private room's members may add others either way).
-				// `private_rooms`: the most private rooms one user may be in.
+				// Extension `ext:settings` (EXTENSIONS.md): server-wide settings.
+				// `read_cursors`: an `activity` `read_message_id` is kept; a
+				// registered user's are, with `activity` (handleActivity), so
+				// `false` only without it. `private_rooms`: the most private rooms
+				// one user may be in. What each user may do is in `you`
+				// (permissions).
 				ext: {
-					settings: {
-						guest_posting: this.config.guestPosting, read_cursors: this.activityOn(), add_members: this.addMemberOn(),
-						private_rooms: this.config.limits.privateMembershipsPerUser,
-					},
+					settings: { read_cursors: this.activityOn(), private_rooms: this.config.limits.privateMembershipsPerUser },
 					...(this.config.uploads ? { media: this.mediaSettings(this.config.uploads) } : {}),
+					// Extension `ext:emoji`: where clients fetch the catalog, which
+					// changes with it (publishEmoji).
+					...(emoji ? { emoji: { catalog_url: emoji } } : {}),
 				},
 			},
 		};
 	}
 
 	/**
-	 * Extension `ext:media`, from apron-web's EXT.md: the origin uploads are
-	 * served from, where it is not this server's own, and while uploads are
-	 * on, the types a write keeps (sniffImage and, for attachments,
-	 * sniffAudio), each with its largest size. No image side is limited.
+	 * The server's `title`, `description` and `avatar` (§3.1): each as an
+	 * admin set it with `/server`, else as the deployment's variable sets it,
+	 * else none, but for the description, which is then the default room
+	 * `general`'s (`general`, read by the caller where it has it), when that
+	 * one is within the description rules. The stored ones are read once
+	 * after a wake; while that read cannot be afforded, the variables apply.
+	 */
+	private serverMetadata(general = this.generalDescription()): ServerMetadata {
+		const metadata: ServerMetadata = { ...this.config.server, ...this.storedServerMetadata() };
+		const fallback = metadata.description === undefined ? roomServerDescription(general) : undefined;
+		return fallback ? { ...metadata, description: fallback } : metadata;
+	}
+
+	/** What admins set with `/server`, or nothing while it cannot be read. */
+	private storedServerMetadata(): StoredServerMetadata {
+		try {
+			return this.store.serverMetadata(nowMs());
+		} catch {
+			return {};
+		}
+	}
+
+	/**
+	 * Extension `ext:media` (EXTENSIONS.md): the origin uploads are served
+	 * from, where it is not this server's own, and while uploads are on, the
+	 * types a write keeps (sniffImage and, for attachments, sniffAudio), each
+	 * with its largest size, for attachments, avatars, and this server's
+	 * `emoji` (`/emoji add`). No `max_side` is sent: images are kept as
+	 * written, never scaled.
 	 */
 	private mediaSettings(uploads: NonNullable<RuntimeConfig["uploads"]>): Record<string, unknown> {
 		const sized = (types: readonly string[], maxBytes: number) => Object.fromEntries(types.map((type) => [type, { max_bytes: maxBytes }]));
@@ -1736,8 +1829,23 @@ export class ApronDemoServer extends DurableObject<Env> {
 			...(this.uploadsOn() && UPLOAD_POLICY ? {
 				upload: sized([...IMAGE_TYPES, ...AUDIO_TYPES], UPLOAD_POLICY.maxFileBytes),
 				avatar: sized(IMAGE_TYPES, UPLOAD_POLICY.maxAvatarBytes),
+				emoji: sized(IMAGE_TYPES, UPLOAD_POLICY.maxEmojiBytes),
 			} : {}),
 		};
+	}
+
+	/**
+	 * The custom emoji catalog's URL (extension `ext:emoji`), where uploads
+	 * are configured and the catalog has an emoji; undefined too when its
+	 * one read after a wake cannot be afforded.
+	 */
+	private emojiCatalogUrl(): string | undefined {
+		if (!this.config.uploads) return undefined;
+		try {
+			return this.store.emojiCatalog(nowMs())?.url;
+		} catch {
+			return undefined;
+		}
 	}
 
 	/** Whether this origin is offered passkeys (§4.10) and their session tokens. */
@@ -2865,6 +2973,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!identity) throw { name: "denied", message: "Authenticate before changing rooms" } satisfies ProtocolError;
 		this.assertMayWrite(attachment);
 		await this.runMutation(async () => {
+			// The server's description follows `general`'s while nothing else
+			// sets it (serverMetadata): read before a save of `general`.
+			const describedBefore = request.params.room_id === ROOM_ID ? this.serverMetadata().description : undefined;
 			const result = this.store.mutate({
 				userId: identity.user_id, tier: identity.tier, ipKey: attachment.ipKey,
 				requestId: request.id, method: "room_set", now: nowMs(), params: request.params, identity,
@@ -2885,6 +2996,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 				} else {
 					this.deliver(roomUpdate("updated", room), scope, (state) => state.userId !== identity.user_id);
 					this.sendToUser(identity.user_id, roomUpdate("updated", room));
+					// A new `general` description that is the server's: every
+					// connection gets a new `server` frame with it.
+					if (room.room_id === ROOM_ID && this.serverMetadata(room.description).description !== describedBefore) this.announceServer();
 				}
 			}
 			this.reply(socket, request, result.result);
@@ -3344,6 +3458,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * sign-in and does not.
 	 */
 	private afterSignIn(socket: WebSocketConnection, stored?: SignInStatus): void {
+		this.syncServer(socket);
 		this.sendMutesInEffect(socket, stored);
 		this.presenceSignedIn(socket);
 		this.sendShownStatus(socket);
@@ -3433,33 +3548,34 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * What a connection's user may do to other users' messages and
-	 * memberships (extension `ext:permissions`, from apron-web's EXT.md), for
-	 * their own `you` only: `move_any`, moving others' messages between
-	 * rooms, for a registered user with a moderator role (MODERATOR_ROLES,
-	 * which the store checks) but an owner's bot, whose identity tier is
-	 * `bot`; `add_members`, adding others to rooms with `room_join` and a
-	 * `user_id`, for an admin and, while `addmember` is on, any other
-	 * registered user not a bot (assertMayManage); `push_joined`, being woken
-	 * by push for wake scope `joined`, where push is on, for a registered user
-	 * holding one of JOINED_WAKE_ROLES but an owner's bot (which the store checks), so clients
-	 * show `joined` as alerting only while open to everyone else. Adding one's own bot needs
-	 * neither. A registered user's is `[]` when they have none, as `roles`
-	 * is, so it clears; guests have none. A role change sends them again.
+	 * What a connection's user may do (extension `ext:permissions`,
+	 * EXTENSIONS.md), for their own `you` only, as an object whose absent
+	 * keys take their defaults, so only the keys that differ are sent:
+	 * `write: false` for a guest while guests only read (GUEST_POSTING off),
+	 * who may then send none of `message`, `reactions`, `room_join`,
+	 * `room_leave` and `room_set`; `add_members`, adding others to any room
+	 * with `room_join` and a `user_id`, for an admin and, while `addmember` is
+	 * on, any other registered user not a bot (assertMayManage); `move_any`,
+	 * moving others' messages between rooms, for a registered user with a
+	 * moderator role (MODERATOR_ROLES, which the store checks) but an owner's
+	 * bot, whose identity tier is `bot`. Who may wake for scope `joined` is
+	 * in the connection's `server` frame instead (wakesJoined). Adding one's
+	 * own bot, and adding others to a private room one is in, needs no
+	 * permission. Every `you` carries it,
+	 * `{}` when every key takes its default; a role change or `/toggle
+	 * addmember` sends it again.
 	 */
-	private permissions(attachment: ConnectionAttachment): string[] | undefined {
-		if (attachment.tier !== "registered") return undefined;
-		return [
-			...(!isBotId(attachment.userId) && MODERATOR_ROLES.some((role) => hasRole(attachment, role)) ? ["move_any"] : []),
-			...(!hasRole(attachment, "bot") && (hasRole(attachment, "admin") || this.addMemberOn()) ? ["add_members"] : []),
-			...(this.config.push && !isBotId(attachment.userId) && JOINED_WAKE_ROLES.some((role) => hasRole(attachment, role)) ? ["push_joined"] : []),
-		];
+	private permissions(attachment: ConnectionAttachment): Record<string, boolean> {
+		if (attachment.tier !== "registered") return this.config.guestPosting ? {} : { write: false };
+		return {
+			...(!hasRole(attachment, "bot") && (hasRole(attachment, "admin") || this.addMemberOn()) ? { add_members: true } : {}),
+			...(!isBotId(attachment.userId) && MODERATOR_ROLES.some((role) => hasRole(attachment, role)) ? { move_any: true } : {}),
+		};
 	}
 
 	/** A user object as the user's own `you`: with their `permissions` in `ext` (see permissions), beside its other keys. */
 	private withPermissions(user: PublicUser, attachment: ConnectionAttachment): PublicUser {
-		const permissions = this.permissions(attachment);
-		return permissions ? { ...user, ext: { ...user.ext, permissions } } : user;
+		return { ...user, ext: { ...user.ext, permissions: this.permissions(attachment) } };
 	}
 
 	/** The `status` a connection's user chose, as their own `you` carries it (see you). */
@@ -4706,6 +4822,26 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await this.startAvatar(socket, attachment, request, body);
 			return;
 		}
+		if (command.name === "emoji") {
+			try {
+				await this.emojiCommand(socket, attachment, request, roomId, words.slice(1), body);
+			} catch (error) {
+				const protocol = errorToProtocol(error);
+				if (protocol.name !== "invalid_params") throw error;
+				this.fail(socket, request, protocol);
+			}
+			return;
+		}
+		if (command.name === "server") {
+			try {
+				await this.serverCommand(socket, attachment, request, roomId, line, body);
+			} catch (error) {
+				const protocol = errorToProtocol(error);
+				if (protocol.name !== "invalid_params") throw error;
+				this.fail(socket, request, protocol);
+			}
+			return;
+		}
 		if (command.name === "passkeys") {
 			try {
 				this.passkeysCommand(socket, attachment, request, roomId, words.slice(1));
@@ -4762,9 +4898,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.reply(socket, request, {});
 	}
 
-	/** The commands this deployment offers: `/avatar` only while uploads are on. */
+	/** The commands this deployment offers: `/avatar` only while uploads are on, and `/emoji` where they are configured. */
 	private commands(): typeof COMMANDS {
-		return this.uploadsOn() ? COMMANDS : COMMANDS.filter((command) => command.name !== "avatar");
+		return COMMANDS.filter((command) => (command.name !== "avatar" || this.uploadsOn()) && (command.name !== "emoji" || !!this.config.uploads));
 	}
 
 	/** An admin's `/toggle` of a feature, read once and then kept in memory with every change. */
@@ -4925,6 +5061,226 @@ export class ApronDemoServer extends DurableObject<Env> {
 			started = this.afterUploads({ uploads: [upload] });
 		});
 		if (started) await this.rescheduleAlarm();
+	}
+
+	/**
+	 * `/emoji add :name:` with one `upload` embed, and `/emoji remove :name:`
+	 * (extension `ext:emoji`, its suggested convention), for admins. An add's
+	 * result carries the embed's `write_url`, and the image becomes the key's
+	 * when the write finishes (finishEmoji), replacing an image the key had.
+	 * A removal answers with a `~private` notice before the result (§1). Either
+	 * change publishes a new catalog (publishEmoji).
+	 */
+	private async emojiCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, args: string[], body: Record<string, unknown>): Promise<void> {
+		if (args.length !== 2 || (args[0] !== "add" && args[0] !== "remove")) {
+			throw { name: "invalid_params", message: "Usage: /emoji add :name: with one image attached, or /emoji remove :name:" } satisfies ProtocolError;
+		}
+		const key = args[1];
+		if (!isEmojiKey(key) || key.length - 2 > MAX_EMOJI_NAME_CHARS) {
+			throw { name: "invalid_params", message: `A custom emoji is written :name:, with a name of 1 to ${MAX_EMOJI_NAME_CHARS} letters, digits, _, + or -` } satisfies ProtocolError;
+		}
+		if (args[0] === "add") {
+			const embeds = body.embeds;
+			const attached = Array.isArray(embeds) && embeds.length === 1 && !!embeds[0] && typeof embeds[0] === "object" && (embeds[0] as Record<string, unknown>).kind === "upload";
+			if (!attached) throw { name: "invalid_params", message: `Attach one image to /emoji add ${key} as an upload embed` } satisfies ProtocolError;
+			let started = false;
+			await this.runMutation(async () => {
+				const upload = this.store.startEmojiUpload({ userId: attachment.userId!, key, now: nowMs() });
+				this.reply(socket, request, await this.withWriteUrls({ embeds: [uploadResultEmbed(upload)] }));
+				started = this.afterUploads({ uploads: [upload] });
+			});
+			if (started) await this.rescheduleAlarm();
+			return;
+		}
+		let outcome: "removed" | "unknown" | "failed" = "unknown";
+		await this.runMutation(async () => {
+			const draft = this.store.emojiDraft({ remove: key }, nowMs());
+			if (draft) outcome = await this.publishEmoji(draft) ? "removed" : "failed";
+		});
+		if (outcome === "unknown") throw { name: "invalid_params", message: `${key} is not a custom emoji here` } satisfies ProtocolError;
+		if (outcome === "failed") throw { name: "retry_after", message: "Storage is unavailable; try again", data: { retry_after: 10 } } satisfies ProtocolError;
+		this.sendNotice(socket, roomId, `Removed the custom emoji \`${key}\`.`);
+		this.reply(socket, request, {});
+	}
+
+	/**
+	 * `/server` (§4.1, its suggested convention), for admins: alone, a
+	 * `~private` notice showing the server's `title`, `description` and
+	 * `avatar` (§3.1) and where each comes from. `/server title <text>` and
+	 * `/server description <text>` set one, with the rules of `SERVER_TITLE`
+	 * and `SERVER_DESCRIPTION`; without the text they clear the stored value,
+	 * so the deployment's variable applies again. `/server avatar` with one
+	 * `upload` embed answers with its `write_url`, and the image becomes the
+	 * server's avatar when the write finishes (finishEmoji); alone, it clears
+	 * the avatar and deletes its image. A set or clear answers with a
+	 * `~private` notice before the result (§1), and a change sends every
+	 * connection a new `server` frame (announceServer).
+	 */
+	private async serverCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, line: string, body: Record<string, unknown>): Promise<void> {
+		// The text after the field is taken as typed, line breaks included.
+		const [, field = "", rest = ""] = /^\/\S+\s*(\S*)([\s\S]*)$/.exec(line) ?? [];
+		const value = rest.trim();
+		const chosen = field.toLowerCase();
+		const embeds = Array.isArray(body.embeds) ? body.embeds : [];
+		if (chosen !== "avatar" && embeds.length) throw { name: "invalid_params", message: "Only /server avatar takes an attachment" } satisfies ProtocolError;
+		if (!chosen) {
+			this.sendNotice(socket, roomId, this.serverOverview());
+			this.reply(socket, request, {});
+			return;
+		}
+		if (chosen === "avatar") {
+			if (value) throw { name: "invalid_params", message: "Usage: /server avatar with one image attached, or alone to clear it" } satisfies ProtocolError;
+			if (embeds.length) {
+				const attached = embeds.length === 1 && !!embeds[0] && typeof embeds[0] === "object" && (embeds[0] as Record<string, unknown>).kind === "upload";
+				if (!attached) throw { name: "invalid_params", message: "Attach one image to /server avatar as an upload embed" } satisfies ProtocolError;
+				let started = false;
+				await this.runMutation(async () => {
+					const upload = this.store.startServerAvatarUpload({ userId: attachment.userId!, now: nowMs() });
+					this.reply(socket, request, await this.withWriteUrls({ embeds: [uploadResultEmbed(upload)] }));
+					started = this.afterUploads({ uploads: [upload] });
+				});
+				if (started) await this.rescheduleAlarm();
+				return;
+			}
+			let cleared: { changed: boolean; deletedUploads: string[] } = { changed: false, deletedUploads: [] };
+			await this.runMutation(async () => {
+				cleared = this.store.clearServerAvatar(nowMs());
+			});
+			this.deleteMedia(cleared.deletedUploads);
+			if (cleared.changed) this.announceServer();
+			this.sendNotice(socket, roomId, `${cleared.changed ? "Cleared the server's avatar." : "The server's avatar was not set with `/server avatar`."}\n\n${this.serverOverview()}`);
+			this.reply(socket, request, {});
+			return;
+		}
+		if (chosen !== "title" && chosen !== "description") throw { name: "invalid_params", message: "Usage: /server, /server title|description [<text>], or /server avatar" } satisfies ProtocolError;
+		if (chosen === "title" && !validServerTitle(value, this.config.limits)) {
+			throw { name: "invalid_params", message: `A server title is one line of at most ${this.config.limits.maxNameCodePoints} characters` } satisfies ProtocolError;
+		}
+		if (chosen === "description" && !validServerDescription(value)) {
+			throw { name: "invalid_params", message: `A server description is CommonMark of at most ${MAX_SERVER_DESCRIPTION_BYTES} bytes` } satisfies ProtocolError;
+		}
+		const before = this.storedServerMetadata()[chosen];
+		const next = value || undefined;
+		if (next !== before) {
+			await this.runMutation(async () => {
+				this.store.setServerText(chosen, next, nowMs());
+			});
+			this.announceServer();
+		}
+		const done = next !== undefined ? `Set the server's ${chosen}.` : before !== undefined ? `Cleared the server's ${chosen}.` : `The server's ${chosen} was not set with \`/server ${chosen}\`.`;
+		this.sendNotice(socket, roomId, `${done}\n\n${this.serverOverview()}`);
+		this.reply(socket, request, {});
+	}
+
+	/**
+	 * The server's `title`, `description` and `avatar` for `/server`, each
+	 * with where it comes from: set with `/server`, a deployment variable, or
+	 * neither.
+	 */
+	private serverOverview(): string {
+		const stored = this.storedServerMetadata();
+		const variables = { title: "SERVER_TITLE", description: "SERVER_DESCRIPTION", avatar: "SERVER_AVATAR" } as const;
+		const shown = (field: keyof typeof variables, value: string): string => {
+			// CommonMark, quoted in the list item as clients will show it.
+			if (field === "description") return `\n${value.split("\n").map((text) => `  > ${text}`).join("\n")}`;
+			if (field === "avatar") return value.startsWith("data:") ? ` a \`data:\` image of ${value.length} characters` : ` <${value}>`;
+			// A plain name: shown as written, not as CommonMark.
+			return ` ${value.replace(/[\\`*_{}[\]()#+\-.!|<>~&]/g, "\\$&")}`;
+		};
+		const general = this.generalDescription()?.trim();
+		const lines = (["title", "description", "avatar"] as const).map((field) => {
+			const own = stored[field] ?? this.config.server[field];
+			const value = own ?? (field === "description" ? roomServerDescription(general) : undefined);
+			const source = stored[field] !== undefined ? `set with \`/server ${field}\`` : own !== undefined ? `from \`${variables[field]}\`` : `from the default room \`${ROOM_ID}\`'s description`;
+			if (value !== undefined) return `- **${field}** (${source}):${shown(field, value)}`;
+			const why = field === "title" ? " (clients show the server's address)" : field === "description" && general ? ` (\`${ROOM_ID}\`'s description is longer than ${MAX_SERVER_DESCRIPTION_BYTES} bytes or holds control characters, so it is left out)` : "";
+			return `- **${field}**: none${why}`;
+		});
+		return ["This server's title, description and avatar, as clients show it:", ...lines].join("\n");
+	}
+
+	/**
+	 * Makes an emoji edit's catalog current (extension `ext:emoji`), inside
+	 * runMutation so no other edit interleaves: its JSON is written to R2
+	 * first, at a key named by its hash, so `catalog_url` never refers to a
+	 * missing object; then the edit commits (Store.commitEmoji), the images
+	 * and the catalog it releases are deleted, and every connection gets a
+	 * new `server` frame with the new `catalog_url` (announceServer). Returns
+	 * whether it applied.
+	 */
+	private async publishEmoji(draft: EmojiDraft): Promise<boolean> {
+		const media = this.runtimeEnv.MEDIA;
+		if (!media) return false;
+		if (draft.key) {
+			try {
+				await media.put(draft.key, draft.json, { httpMetadata: { contentType: "application/json", cacheControl: "public, max-age=31536000, immutable" } });
+			} catch {
+				return false;
+			}
+		}
+		// A draft that no longer applies leaves its JSON in R2: the catalog it
+		// was made from cannot change meanwhile, so it does not happen.
+		const committed = this.store.commitEmoji(draft, nowMs());
+		if (!committed.applied) return false;
+		this.deleteMedia(committed.deletedUploads);
+		this.announceServer();
+		return true;
+	}
+
+	/**
+	 * Sends every open connection a new `server` frame (§3.1), which fully
+	 * replaces the one it had: after the custom emoji catalog, or the
+	 * server's title, description or avatar (`/server`), changed. One
+	 * frame is built for each origin and wake scope list, since the frame
+	 * depends on them.
+	 */
+	private announceServer(): void {
+		const frames = new Map<string, Record<string, unknown>>();
+		for (const ws of this.ctx.getWebSockets()) {
+			const socket = ws as WebSocketConnection;
+			const state = connectionAttachment(socket);
+			if (!state || state.closing) continue;
+			const origin = state.origin ?? null;
+			const joined = this.wakesJoined(state);
+			const cacheKey = `${joined ? 1 : 0}${origin ?? ""}`;
+			let frame = frames.get(cacheKey);
+			if (!frame) {
+				frame = this.serverAnnouncement(origin, joined);
+				frames.set(cacheKey, frame);
+			}
+			this.sendServer(socket, state, frame, joined);
+		}
+	}
+
+	/**
+	 * Whether a connection's user may be woken by push for wake scope
+	 * `joined` (§4.9.4), so its `server` frame lists it: where push is on,
+	 * a registered user holding one of JOINED_WAKE_ROLES but an owner's bot
+	 * (the store checks the same at registration and when it wakes).
+	 */
+	private wakesJoined(state: ConnectionAttachment): boolean {
+		return !!this.config.push && !isBotId(state.userId) && JOINED_WAKE_ROLES.some((role) => hasRole(state, role));
+	}
+
+	/** Sends a connection a `server` frame that lists `joined` or not, and keeps which on its attachment. */
+	private sendServer(socket: WebSocketConnection, state: ConnectionAttachment, frame: Record<string, unknown>, joined: boolean): void {
+		if (!this.send(socket, frame) || joined === (state.wakeJoined === true)) return;
+		if (joined) state.wakeJoined = true;
+		else delete state.wakeJoined;
+		writeAttachment(socket, state);
+	}
+
+	/**
+	 * After a sign-in or a role change: a new `server` frame for a connection
+	 * whose wake scopes changed (wakesJoined), so its clients offer `joined`
+	 * exactly while it works. Other connections get nothing.
+	 */
+	private syncServer(socket: WebSocketConnection): void {
+		const state = connectionAttachment(socket);
+		if (!state || state.closing) return;
+		const joined = this.wakesJoined(state);
+		if (joined === (state.wakeJoined === true)) return;
+		this.sendServer(socket, state, this.serverAnnouncement(state.origin ?? null, joined), joined);
 	}
 
 	/**
@@ -5671,8 +6027,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!state) continue;
 			// The user's own connections get `you`, with their permissions and the
 			// status they chose (§4.5).
-			if (state.userId === identity.user_id) this.deliverTo(socket, { method: "user", params: { you: { ...this.withPermissions(identity, state), ...this.ownStatus(state) } } });
-			else if (state.rooms?.some((id) => shared.has(id))) this.deliverTo(socket, { method: "user", params: { new: others, ...(old ? { old } : {}) } });
+			if (state.userId === identity.user_id) {
+				this.deliverTo(socket, { method: "user", params: { you: { ...this.withPermissions(identity, state), ...this.ownStatus(state) } } });
+				// A role change may change the wake scopes it is offered.
+				this.syncServer(socket);
+			} else if (state.rooms?.some((id) => shared.has(id))) this.deliverTo(socket, { method: "user", params: { new: others, ...(old ? { old } : {}) } });
 		}
 	}
 
@@ -5972,6 +6331,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	async finishUpload(write: UploadWrite): Promise<boolean> {
 		if (!this.config.uploads) return false;
+		if (write.key.startsWith("e/")) return this.finishEmoji(write);
 		let finished: UploadFinish = { accepted: false, broadcasts: [], deletedUploads: [] };
 		await this.runMutation(async () => {
 			finished = this.store.finishUpload(write, nowMs());
@@ -5980,6 +6340,35 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.deleteMedia(finished.deletedUploads);
 		if (finished.avatar) this.announceAvatar(finished.avatar.userId, finished.avatar.url);
 		return finished.accepted;
+	}
+
+	/**
+	 * A finished `e/` write. A custom emoji's (`/emoji add`) image becomes its
+	 * key's in a new catalog (publishEmoji). One that cannot, such as one
+	 * that came too late, is not an image, or found R2 unavailable for the
+	 * catalog, is released, and the Worker deletes what it stored. The
+	 * server's avatar (`/server avatar`), kept under `e/` too, is no custom
+	 * emoji (emojiDraft): it finishes as any other upload, and becomes the
+	 * server's `avatar` in a new `server` frame for every connection.
+	 */
+	private async finishEmoji(write: UploadWrite): Promise<boolean> {
+		let accepted = false;
+		let released: string[] = [];
+		let serverAvatar: string | undefined;
+		await this.runMutation(async () => {
+			const draft = this.store.emojiDraft({ add: write }, nowMs());
+			accepted = !!draft && await this.publishEmoji(draft);
+			if (accepted) return;
+			// Without a draft, the write may be the server's avatar's: the store
+			// finishes that one, and fails a custom emoji's as above.
+			const finished = this.store.finishUpload(draft ? { key: write.key, ok: false } : write, nowMs());
+			accepted = finished.accepted;
+			serverAvatar = finished.serverAvatar;
+			released = finished.deletedUploads;
+		});
+		this.deleteMedia(released);
+		if (serverAvatar) this.announceServer();
+		return accepted;
 	}
 
 	/**

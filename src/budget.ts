@@ -265,7 +265,11 @@ export interface UploadPolicy {
 	maxFileBytes: number;
 	/** Largest avatar image. */
 	maxAvatarBytes: number;
-	/** Uploads the whole server issues a UTC day, avatars included. */
+	/** Largest custom emoji image (`/emoji add`, extension `ext:emoji`). */
+	maxEmojiBytes: number;
+	/** Most custom emoji the catalog holds; they never expire, so they count against storedBytesCap for good. */
+	maxEmoji: number;
+	/** Uploads the whole server issues a UTC day, avatars and custom emoji included. */
 	uploadsPerDay: number;
 	/** Uploads one user may start a UTC day. */
 	uploadsPerUserDay: number;
