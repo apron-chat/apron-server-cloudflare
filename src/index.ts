@@ -348,10 +348,10 @@ interface PendingWake {
 	timer?: ReturnType<typeof setTimeout>;
 	/**
 	 * For held wakes released together as one push (releaseHeld): the older
-	 * messages, newest first, to push instead when `message` wakes no one
-	 * (its room muted, or woken for already).
+	 * messages and their rooms, newest first, to push instead when `message`
+	 * wakes no one (its room muted, or woken for already) or is read first.
 	 */
-	others?: string[];
+	others?: Array<[messageId: string, roomId: string]>;
 }
 
 /** Pending status changes one connection may hold; more are delivered at once. */
@@ -3297,6 +3297,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (kept !== undefined && Number(read) <= Number(kept)) return;
 		// Reading, from a connection that may never have said it was back (a stale one resuming).
 		this.clearUnread(attachment);
+		// Read through `read`: what waits or is held to push for the room up to it is not needed.
+		this.dropWakes(identity.user_id, roomId, read);
+		this.dropHeld(identity.user_id, roomId, read);
 		const peers = this.connectionsOf(identity.user_id, socket);
 		if (peers.length && this.takeThrottle(socket, identity.user_id, "read", this.config.limits.activityBroadcastsPerUserMinute, now)) {
 			const frame = { method: "activity", params: { room_id: roomId, from: identity, read_message_id: read } };
@@ -4524,7 +4527,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * (see pendingWakes), with the message as it is then (keepReasons), or at
 	 * once without a wait.
 	 */
-	private scheduleWake(message: MessageSnapshot, reasons: Map<string, number>, others?: string[]): void {
+	private scheduleWake(message: MessageSnapshot, reasons: Map<string, number>, others?: Array<[string, string]>): void {
 		const wake: PendingWake = { message, reasons, ...(others ? { others } : {}) };
 		const delay = this.config.pushDelaySeconds * 1_000;
 		// Past the bound, a wake goes at once, as it would with no wait.
@@ -4575,20 +4578,32 @@ export class ApronDemoServer extends DurableObject<Env> {
 		while (message) {
 			if (this.pushWake(message, wake.reasons) || !others.length) return;
 			message = null;
-			while (!message && others.length) message = this.heldMessage(others.shift()!, nowMs());
+			while (!message && others.length) message = this.heldMessage(others.shift()![0], nowMs());
 		}
 	}
 
 	/**
 	 * Drops a user from the wakes waiting to push (pendingWakes): all of them
-	 * when they come back (`idle: false`), or `roomId`'s when they post there.
+	 * when they come back (`idle: false`); `roomId`'s when they post there;
+	 * and its messages up to `through` when their read cursor passes them
+	 * (§4.9.4's suggested convention), which their client sends only for
+	 * what was on screen. For held wakes released together (`others`), the
+	 * messages seen go, and if the newest is one, the next left waits in its
+	 * place (scheduleHeld).
 	 */
-	private dropWakes(userId: string, roomId?: string): void {
-		for (const wake of this.pendingWakes) {
-			if (roomId !== undefined && wake.message.room_id !== roomId) continue;
-			if (!wake.reasons.delete(userId) || wake.reasons.size) continue;
+	private dropWakes(userId: string, roomId?: string, through?: string): void {
+		const seen = (messageId: string, room: string) =>
+			roomId === undefined || (room === roomId && (through === undefined || Number(messageId) <= Number(through)));
+		for (const wake of [...this.pendingWakes]) {
+			const reasons = wake.reasons.get(userId);
+			if (reasons === undefined) continue;
+			if (wake.others && roomId !== undefined) wake.others = wake.others.filter(([messageId, room]) => !seen(messageId, room));
+			if (!seen(wake.message.message_id, wake.message.room_id)) continue;
+			wake.reasons.delete(userId);
+			if (wake.reasons.size) continue;
 			clearTimeout(wake.timer);
 			this.pendingWakes.delete(wake);
+			if (roomId !== undefined && wake.others?.length) this.scheduleHeld(userId, reasons, wake.others, nowMs());
 		}
 	}
 
@@ -4616,13 +4631,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Forgets a user's held wakes (holdWake): `roomId`'s when they post there,
-	 * which shows they saw it, or all of them.
+	 * which shows they saw it, or its messages up to `through` when their
+	 * read cursor passes them; or all of them.
 	 */
-	private dropHeld(userId: string, roomId?: string): void {
+	private dropHeld(userId: string, roomId?: string, through?: string): void {
 		for (const peer of this.connectionsOf(userId)) {
 			const state = connectionAttachment(peer);
 			if (!state?.held) continue;
-			const kept = roomId === undefined ? [] : state.held.filter((entry) => entry[1] !== roomId);
+			const kept = roomId === undefined ? [] : state.held.filter(([messageId, room]) =>
+				room !== roomId || (through !== undefined && Number(messageId) > Number(through)));
 			if (kept.length === state.held.length) continue;
 			if (kept.length) state.held = kept;
 			else delete state.held;
@@ -4666,23 +4683,33 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!states.some(({ state }) => state.held?.length)) return;
 		if (states.some(({ socket, state }) => this.attendedConnection(socket, state, now))) return;
 		const attendedUntil = Math.max(now - HELD_WAKE_SECONDS * 1_000, ...states.map(({ state }) => state.idleAt ?? state.frameTimes[state.frameTimes.length - 1] ?? 0));
-		const due = new Map<string, number>();
+		const due = new Map<string, { at: number; roomId: string }>();
 		let reasons = 0;
 		for (const { state } of states) {
-			for (const [messageId, , why, at] of state.held ?? []) {
+			for (const [messageId, roomId, why, at] of state.held ?? []) {
 				if (at <= attendedUntil) continue;
-				due.set(messageId, Math.max(due.get(messageId) ?? 0, at));
+				due.set(messageId, { at: Math.max(due.get(messageId)?.at ?? 0, at), roomId });
 				reasons |= why;
 			}
 		}
 		this.dropHeld(userId);
 		// One push for them all, as each push costs: the newest; the rest stand by in case it wakes no one.
 		// At most MAX_HELD_WAKES of them, so the lookups and claims a release may try stay bounded.
-		const ids = [...due].sort((a, b) => b[1] - a[1]).slice(0, MAX_HELD_WAKES).map(([messageId]) => messageId);
-		while (ids.length) {
-			const message = this.heldMessage(ids.shift()!, now);
+		const ids = [...due].sort((a, b) => b[1].at - a[1].at).slice(0, MAX_HELD_WAKES).map(([messageId, { roomId }]) => [messageId, roomId] as [string, string]);
+		this.scheduleHeld(userId, reasons, ids, now);
+	}
+
+	/**
+	 * Schedules held wakes released together (releaseHeld) as one: the first
+	 * of `ids` whose message is still there (one metered lookup each), the
+	 * rest standing by (`others`).
+	 */
+	private scheduleHeld(userId: string, reasons: number, ids: Array<[string, string]>, now: number): void {
+		const rest = [...ids];
+		while (rest.length) {
+			const message = this.heldMessage(rest.shift()![0], now);
 			if (!message) continue;
-			this.scheduleWake(message, new Map([[userId, reasons]]), ids);
+			this.scheduleWake(message, new Map([[userId, reasons]]), rest);
 			return;
 		}
 	}

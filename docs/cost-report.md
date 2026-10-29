@@ -633,6 +633,13 @@ nothing is still charged a write. So a user who is never pushed pays at most
 one read a sign-in and one small reservation per wake of the object, and one
 who is, one write per return.
 
+**Read cursors drop pushes.** A read cursor that passes a message drops
+the user's waiting wake for it and their held wakes for it as it arrives,
+from memory and connection attachments: no SQL. Only when it passes the
+newest of held wakes released together does the next one left cost its
+lookup (one metered read, as releasing them does). A push it drops spends
+no claim, coalescing window or allowance.
+
 Cleanup deletes expired registrations (`pushExpiryDays`, 7) and wake times
 past `coalesceSeconds` within its existing batch, by their time indexes.
 Wake times number at most one per woken user and room a day, so at most

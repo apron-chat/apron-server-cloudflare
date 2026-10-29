@@ -1127,6 +1127,79 @@ describe('push delay', () => {
 		}
 	});
 
+	/** Sends a read cursor (§4.6), applied once a ping the handler answers comes back after it. */
+	async function readThrough(peer: Peer, roomId: string, messageId: string): Promise<void> {
+		peer.send({ method: 'activity', params: { room_id: roomId, read_message_id: messageId } });
+		peer.socket.send('{ "method": "ping" }');
+		await until(peer, (frame) => frame.method === 'pong');
+	}
+	const setActivity = (on: boolean) => runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).config.activityEnabled = on; });
+
+	it('drops a waiting wake once the user\'s read cursor passes its message, and only in that room', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId] = [unique('alice'), unique('bob')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		try {
+			const bobSub = await subscribe(bob, 'bob');
+			await setIdle(bob, true);
+			await setActivity(true);
+			await setDelay(1);
+			const [one, two] = [
+				(await request(alice, 'read-one', 'room_set', { parent_room_id: 'general', title: 'Read one' })).result.room_id,
+				(await request(alice, 'read-two', 'room_set', { parent_room_id: 'general', title: 'Read two' })).result.room_id,
+			];
+			const first = await post(alice, 'first', { room_id: one, body: { text: 'first', mentions: [bobId] } });
+			const second = await post(alice, 'second', { room_id: one, body: { text: 'second', mentions: [bobId] } });
+			const elsewhere = await post(alice, 'elsewhere', { room_id: two, body: { text: 'elsewhere', mentions: [bobId] } });
+			// Bob, still idle, reads the first room through its first message only.
+			await readThrough(bob, one, first.result.message_id);
+			await waitOut();
+			await vi.waitFor(() => expect(pushes).toHaveLength(2), { timeout: 5_000 });
+			const pushed = await Promise.all(pushes.map(async (push) => JSON.parse((await decryptPush(push.body, bobSub.browser)).plaintext).message.message_id));
+			expect(pushed.sort()).toEqual([second.result.message_id, elsewhere.result.message_id].sort());
+			// What was read counts nothing as unread either: the read zeroed it, and the first was never pushed.
+			const counts = await Promise.all(pushes.map(async (push) => JSON.parse((await decryptPush(push.body, bobSub.browser)).plaintext).unread));
+			expect(counts.sort()).toEqual([1, 2]);
+		} finally {
+			await setDelay(0);
+			await setActivity(false);
+			alice.close(); bob.close();
+		}
+	});
+
+	it('forgets held wakes a read cursor passes, and falls back past a released one read while it waits', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId] = [unique('alice'), unique('bob')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		try {
+			const bobSub = await subscribe(bob, 'bob');
+			await setActivity(true);
+			await setDelay(1);
+			const rooms: string[] = [];
+			for (const title of ['A', 'B', 'C']) rooms.push((await request(alice, `held-${title}`, 'room_set', { parent_room_id: 'general', title: `Held ${title}` })).result.room_id);
+			// Bob is attended: each mention is held, oldest first.
+			const ids: string[] = [];
+			for (const [index, room] of rooms.entries()) ids.push((await post(alice, `held-${index}`, { room_id: room, body: { text: `held ${index}`, mentions: [bobId] } })).result.message_id);
+			// He reads B there: it is held no longer.
+			await readThrough(bob, rooms[1], ids[1]);
+			// Gone a minute: C, the newest, waits to push, with A behind it.
+			expect((await status(bob, { idle: 60 })).frame.result).toEqual({});
+			// He reads C before the wait is over: A waits in its place.
+			await readThrough(bob, rooms[2], ids[2]);
+			await waitOut();
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.message_id).toBe(ids[0]);
+			await waitOut();
+			expect(pushes).toHaveLength(1);
+		} finally {
+			await setDelay(0);
+			await setActivity(false);
+			alice.close(); bob.close();
+		}
+	});
+
 	it('spends no wake slot or coalescing on a wake dropped while it waited', async () => {
 		const pushes = capturePushes();
 		const [aliceId, bobId] = [unique('alice'), unique('bob')];
