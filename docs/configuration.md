@@ -130,6 +130,17 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   once usage is back under every allowance: at the next UTC day for a daily
   share, or the next month for a monthly one. It touches no other rule, so
   `apron_admission_off` stays yours to use by hand.
+- **Admin alert.** When the guard or the flood trip (below) turns the rule
+  on, and when a cost overrun closes storage accounting, the server posts a
+  message in `general` as the `admin` user that mentions every user with the
+  `admin` role (up to 10, as many as one message wakes), and pushes it to
+  them at once, past the usual wait, coalescing and push allowances. Give
+  yourself the role (`/admin <user_id>`) and allow notifications in your
+  client to get it on your phone; muting `general` or choosing `dnd`
+  silences it, as it does any push. Nothing is sent when the stop lifts. The rule is turned on first and the alert sent after; an
+  alert that fails is logged (`trigger_notice_failed`) and changes nothing
+  else. The edge rule blocks only public requests, so the alert still reaches
+  the Durable Object and the push services.
 - The monthly allowances are Worker requests, Worker CPU, Durable Object
   requests and duration, SQL rows read and written, and Workers Logs events,
   plus R2's free tier for uploads: Class A and Class B operations (each day
@@ -565,7 +576,7 @@ and recalibrating its resource model.
 | `PUSH_HOSTS` | Comma-separated push service hosts registrations may name, `*.host` for a host's subdomains, or a standalone `*` for any public host; unset, the browsers' own services (see [Push](#push)) |
 | `PUSH_DELAY_SECONDS` | Whole seconds, 0 to 60, a message's wake waits before it pushes; unset, the plan's `push.delaySeconds`; `0` pushes at once |
 | `ADMISSION_OFF` | Operator admission switch; `true` rejects new sockets in the entry Worker before the limiter or DO call; existing sockets remain subject to DO budgets |
-| `ACCOUNTING_RECOVERY` | Operator recovery from a persisted accounting stop (every connection refused with `Demo temporarily unavailable` after a storage failure or a reservation overrun): 1 to 64 letters, digits, `.`, `_`, `:` or `-`. The Durable Object clears the stop when it next starts, once per value, and logs `accounting_unsafe_cleared`; a stop latched later needs a new value. Set it in `wrangler.production.toml` and deploy, or once with `npm run deploy -- --var ACCOUNTING_RECOVERY:2026-10-29`; leaving a used value set changes nothing; what the failure left unwritten is not charged |
+| `ACCOUNTING_RECOVERY` | Operator recovery from a persisted accounting stop after a reservation overrun (every connection refused with `Server closed: storage accounting stopped after a cost overrun, until an operator reopens it`; the admins are alerted when it happens): 1 to 64 letters, digits, `.`, `_`, `:` or `-`. The Durable Object clears the stop when it next starts, once per value, and logs `accounting_unsafe_cleared`; a stop latched later needs a new value. A stop left by a storage failure (`Server storage is unavailable; try again shortly`) needs none of this: it clears itself once storage works (`accounting_uncertain_recovered`). Set it in `wrangler.production.toml` and deploy, or once with `npm run deploy -- --var ACCOUNTING_RECOVERY:2026-10-29`; leaving a used value set changes nothing; what the failure left unwritten is not charged |
 | `ENVIRONMENT` | Set to `development` to enable local origin defaults when `ALLOWED_ORIGINS` and `RP_ORIGINS` are omitted |
 | `NODE_ENV` | Set to `test` to enable the same local origin defaults for tests; production-like deployments must configure origins explicitly |
 

@@ -1,48 +1,76 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
-import { Store, StoreError } from '../src/store';
+import { DEFAULT_LIMITS } from '../src/budget';
+import { Store } from '../src/store';
 
-it('persists an accounting stop when an operation\'s budget write fails', async () => {
+it('closes accounting while a budget write fails, and reopens once the staged write lands', async () => {
 	const stub = env.DEMO.getByName('budget-reservation-failure');
 	const now = Date.now() + 1_000;
 	await runInDurableObject(stub, (_instance, state) => {
 		const store = new Store(state, {}, { now: () => now });
 		store.initialize();
-		const before = state.storage.sql.exec<{ reads_reserved: number; writes_reserved: number }>(
+		const reserved = () => state.storage.sql.exec<{ reads_reserved: number; writes_reserved: number }>(
 			'SELECT reads_reserved, writes_reserved FROM resource_budgets ORDER BY day DESC LIMIT 1',
 		).one();
+		const marker = () => state.storage.sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'accounting_unsafe' LIMIT 1").one().value;
+		const before = reserved();
 		state.storage.sql.exec(`CREATE TRIGGER fail_budget_reservation
 			BEFORE UPDATE OF reads_reserved ON resource_budgets
 			BEGIN SELECT RAISE(ABORT, 'injected budget reservation failure'); END`);
 
 		// The reservation is staged; the write that settles it fails after the
-		// operation. That latches accounting unsafe, the marker written outside
-		// the failed statement, so nothing else runs on uncertain accounting.
+		// operation. That closes accounting as uncertain, the marker written
+		// outside the failed statement, so nothing runs on a lagging row.
 		store.getRoomState();
-		const marker = state.storage.sql.exec<{ value: string }>(
-			"SELECT value FROM _meta WHERE key = 'accounting_unsafe' LIMIT 1",
-		).one();
-		expect(marker.value).toBe('1');
-		const after = state.storage.sql.exec<{ reads_reserved: number; writes_reserved: number }>(
-			'SELECT reads_reserved, writes_reserved FROM resource_budgets ORDER BY day DESC LIMIT 1',
-		).one();
-		expect(after).toEqual(before);
+		expect(marker()).toBe('uncertain');
+		expect(reserved()).toEqual(before);
+		expect(store.accountingStatus()).toMatchObject({ unsafe: false, uncertain: true });
+		// While the write still fails, work is refused as storage unavailable.
+		expect(() => store.getRoomState()).toThrow('storage is unavailable');
 
+		// Storage works again: the next operation writes what was staged first,
+		// then runs, and the marker clears without an operator.
 		state.storage.sql.exec('DROP TRIGGER fail_budget_reservation');
-		expect(() => store.getRoomState()).toThrow(StoreError);
-		return store.accountingStatus();
+		expect(() => store.getRoomState()).not.toThrow();
+		expect(store.accountingStatus()).toMatchObject({ unsafe: false, uncertain: false });
+		expect(marker()).toBe('0');
+		expect(reserved().reads_reserved).toBeGreaterThan(before.reads_reserved);
+	});
+});
+
+it('reopens accounting a storage failure left uncertain on the next wake, charging for what was lost', async () => {
+	const stub = env.DEMO.getByName('budget-uncertain-wake');
+	const now = Date.now() + 1_500;
+	const maintenance = (state: DurableObjectState) => state.storage.sql.exec<{ maintenance_reads: number; maintenance_writes: number }>(
+		'SELECT maintenance_reads, maintenance_writes FROM resource_budgets ORDER BY day DESC LIMIT 1',
+	).one();
+	let before = { maintenance_reads: 0, maintenance_writes: 0 };
+	await runInDurableObject(stub, (_instance, state) => {
+		const store = new Store(state, {}, { now: () => now });
+		store.initialize();
+		state.storage.sql.exec(`CREATE TRIGGER fail_budget_reservation
+			BEFORE UPDATE OF reads_reserved ON resource_budgets
+			BEGIN SELECT RAISE(ABORT, 'injected budget reservation failure'); END`);
+		store.getRoomState();
+		expect(store.accountingStatus().uncertain).toBe(true);
+		// The instance goes before the staged write lands.
+		state.storage.sql.exec('DROP TRIGGER fail_budget_reservation');
+		before = maintenance(state);
 	});
 
 	await evictDurableObject(stub);
 	await runInDurableObject(stub, (_instance, state) => {
 		const restarted = new Store(state, {}, { now: () => now });
 		restarted.initialize();
-		expect(restarted.accountingStatus().unsafe).toBe(true);
-		const before = restarted.storageAccounting();
-		expect(() => restarted.getRoomState()).toThrow('storage accounting is unsafe');
-		// A persisted stop is checked before reserveCost performs any SQL, so a
-		// restart cannot reissue the failed lease.
-		expect(restarted.storageAccounting()).toEqual(before);
+		// A wake writes nothing: the first operation charges for what was lost, then runs.
+		expect(restarted.accountingStatus()).toMatchObject({ unsafe: false, uncertain: true });
+		expect(maintenance(state)).toEqual(before);
+		expect(() => restarted.getRoomState()).not.toThrow();
+		expect(restarted.accountingStatus()).toMatchObject({ unsafe: false, uncertain: false });
+		expect(state.storage.sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'accounting_unsafe' LIMIT 1").one().value).toBe('0');
+		const after = maintenance(state);
+		expect(after.maintenance_reads).toBeGreaterThanOrEqual(before.maintenance_reads + Math.ceil(DEFAULT_LIMITS.sqlReadsPerDay / 100));
+		expect(after.maintenance_writes).toBeGreaterThanOrEqual(before.maintenance_writes + Math.ceil(DEFAULT_LIMITS.sqlWritesPerDay / 100));
 	});
 });
 
