@@ -6,20 +6,27 @@ the protocol contract and design, see the [implementation specification](../SPEC
 ## Overview
 
 A single SQLite Durable Object serves the permanent `general` room, the
-top-level rooms admins and mods create, and their thread rooms over
-hibernating WebSockets. The backend supports guest access,
+top-level rooms admins and mods create, their thread rooms, and users'
+private rooms over hibernating WebSockets. The backend supports guest access,
 discoverable passkeys, complete-snapshot history, message
-replacement/deletion/restoration/moves, thread rooms, emoji reactions, and a
-rolling retention floor. Guests only read (set `GUEST_POSTING=true` to let
-them post); signing in with a passkey lets a user post and invite a bot. It speaks protocol 9 with `history`,
-`edit`, `rooms`, `reactions`, `command` (`/help`, `/invite-bot`, and admin
-commands), and `ext` with the extensions `ext:settings`, `ext:limits` and
-`ext:permissions` (EXTENSIONS.md); `embed:upload` and `ext:media` when uploads are configured,
-and `ext:emoji` once an admin, mod or friend adds a custom emoji with `/emoji add`;
-`status` and push when VAPID keys are set; and
-liveness pings and, with the Workers Paid budgets, typing through `activity`
-(`ACTIVITY` overrides); see [authentication and policy](policy.md) and [the
-implementation specification](../SPEC.md).
+replacement/deletion/restoration/moves, emoji reactions, and a rolling
+retention floor. Guests only read (set `GUEST_POSTING=true` to let them
+post); signing in with a passkey lets a user post and invite a bot.
+
+It speaks protocol 9 and advertises:
+
+- always: `history`, `edit`, `rooms`, `reactions`, `command` (`/help`,
+  `/invite-bot`, and admin commands), `ext`, and the extensions
+  `ext:settings`, `ext:limits` and `ext:permissions` (EXTENSIONS.md), with
+  liveness pings (`server.ping`);
+- `activity` (typing) with the Workers Paid budgets (`ACTIVITY` overrides);
+- `embed:upload` and `ext:media` when uploads are configured, and
+  `ext:emoji` once an admin, mod or friend adds a custom emoji with
+  `/emoji add`;
+- `status` and push when VAPID keys are set.
+
+See [authentication and policy](policy.md) and [the implementation
+specification](../SPEC.md).
 
 ## Budgets, sessions, and analytics
 
@@ -33,19 +40,15 @@ The entry Worker rejects excessive connection attempts before calling the DO.
 See [edge admission operations](edge-admission.md) for applying WAF rules,
 their Free-plan limitations, and the quota-exhaustion runbook.
 
-Passkey session cleanup uses an ordered expiry index. An alarm sweeps it at most
-once an hour (every connection wakes the alarm at its auth deadline), processing
-at most 16 expired entries and sweeping again on the next alarm after a full
-batch; a sweep with no expired entries performs only a small metered probe. A
-token resume rejects an expired session whether or not it has been swept. Session issuance,
-renewal, and cleanup share a queue so cleanup cannot delete a concurrent renewal.
-KV operations reserve conservative row allowances before running; an exhausted
-maintenance budget leaves unfinished cleanup for a later alarm.
+Expired passkey sessions are swept by the alarm in small batches, at most
+once an hour; a token resume rejects an expired session whether or not it has
+been swept, and an exhausted maintenance budget leaves the rest for a later
+alarm.
 
-For an additional delayed account-wide safety stop, configure `ACCOUNT_ID` and
-the `ACCOUNT_ANALYTICS_TOKEN` secret. The Durable Object refreshes account usage
-periodically and keeps local limits as the fallback when analytics is unavailable.
-Provision it with `npx wrangler secret put ACCOUNT_ANALYTICS_TOKEN --config wrangler.production.toml`.
+For a delayed account-wide safety stop, set `ACCOUNT_ID` and the
+`ACCOUNT_ANALYTICS_TOKEN` secret (see the
+[configuration reference](configuration.md#editing-the-deployment-budget));
+without them, local limits still apply.
 
 The selected budgets are for **Workers Paid** ($5/month), with SQLite Durable
 Objects; select the Free ones (`src/plans/free.ts`, see
@@ -63,15 +66,14 @@ below. Install from the lockfile:
 npm ci
 ```
 
-No secret provisioning is required for local development. Production can run
-with local limits alone; configure the optional analytics secret above to enable
-the delayed account-wide safety stop.
+No secret provisioning is required for local development; production secrets
+are covered in the [deployment checklist](#deployment-checklist).
 
 `npx wrangler dev --port 8080` serves the development Worker. To use it with the
 web client, check out [apron-chat/apron-web](https://github.com/apron-chat/apron-web),
 follow its README (`npm ci`, then `npm run dev`) in another terminal, and open
-`http://localhost:5173`; its dev proxy connects `/ws` to port 8080. Use **localhost**, matching the development passkey
-RP ID and origin. Wrangler persists local SQLite state between runs. Do not
+`http://localhost:5173`; its dev proxy connects `/ws` to port 8080. Use
+**localhost**, matching the development passkey RP ID and origin. Wrangler persists local SQLite state between runs. Do not
 delete its state while investigating restart-safe quotas or identity recovery.
 
 Uploads, avatars and custom emoji are off locally until the upload settings
@@ -132,36 +134,51 @@ setInterval(() => socket.send('{"method":"ping"}'), 45_000);
 ```
 
 A guest only reads: each connection gets a `~private` welcome saying so right
-after the `server` frame, before any `auth`, and
-`message`, `reactions`, `room_set`, `room_join`, and `room_leave` are `denied`;
-`room_list` and `history` work for any room without joining it. To exercise posting,
+after the `server` frame, before any `auth`, and `message`, `reactions`,
+`room_set`, `room_join`, and `room_leave` are `denied`; `room_list` and
+`history` work for any public room without joining it. To exercise posting,
 editing, deletion/restoration, moves, threads, and reactions from your own
 client, sign in on the demo with a passkey, run `/invite-bot`, and connect with
-the token it gives you (see [Bots](#bots)). A new guest has joined `general`, and
-receives only the rooms it has joined (a thread's messages go to its members
-only); posting to a room does not require joining it. `room_list` lists
-joined rooms and rooms to join by `filter`, with `members` and `users` on
-request, up to 6 times a minute per user (the first `filter: "joined"`
-listing after authentication is free), and `room_update` reports changes.
-A registered user's joins and leaves are logged membership records,
-delivered in `room_update` `memberships` and returned in `history`; a guest's live in its connection and are not logged,
-so `room_list` ignores `latest_log_id` and always answers with a full
-listing. `members` lists every connected member and at most 200 registered
-members per room (100 with the Free budgets); a room with more lists the first by `user_id`, not by recent activity, and also gives
-`member_count`. Registered users carry `roles` (`admin`, `mod`, `threader`, `bot`, `friend`, labels an admin gave with `/role`, or `[]` for none; any role lifts the user to the trusted posting limits) in `users`
-and `you`. See [SPEC section 4](../SPEC.md#memberships).
-The whole server processes at most 600 frames a
-minute (300 with the Free budgets); past that, requests get `retry_after` and the socket stays open. Anyone
-may create a thread (`room_set` with the `parent_room_id` of a top-level room);
-only an `admin` or `mod` may create a top-level room (`room_set` without
-`parent_room_id`, at most 16, kept for good) or edit one, and only an `admin`
-may edit `general` itself. A thread's `description` (CommonMark)
-says what it is about, and any participant may change it. Every room is
-public: `private: true` is `unsupported`. System notices come from `~private`,
-`~room`, or `~server`; no user's `user_id` starts with `~`. This is a shared public room, not
-an isolated sandbox: test messages are visible to others, guest ownership lasts
-only for the socket, and IP/resource quotas and retention still apply. Changing
-frontend origins does not give an IP a fresh allowance. Honor `retry_after`.
+the token it gives you (see [Bots](#bots)).
+
+A new guest has joined `general`, and receives only the rooms it has joined
+(a thread's messages go to its members only); posting to a room does not
+require joining it. `room_list` lists joined rooms and rooms to join by
+`filter`, with `members` and `users` on request, and `room_update` reports
+changes; keep your list current from `room_update` rather than polling. A
+registered user's joins and leaves are logged membership records; a guest's
+are not, so `room_list` always answers with a full listing. `members` lists
+every connected member and a capped page of registered members, in `user_id`
+order, with `member_count` when the page is full. Registered users carry
+`roles` (`admin`, `mod`, `threader`, `bot`, `friend`, labels an admin gave
+with `/role`, or `[]` for none) in `users` and `you`. See
+[SPEC section 4](../SPEC.md#memberships).
+
+Rooms come in three kinds:
+
+- **Threads.** Any signed-in user may create one with `room_set` and the
+  `parent_room_id` of a public top-level room. A thread's `description`
+  (CommonMark) says what it is about, and any participant may change it.
+- **Top-level rooms.** Only an `admin` or `mod` may create one (`room_set`
+  without `parent_room_id`, at most 16, kept for good) or edit one, and only
+  an `admin` may edit `general` itself.
+- **Private rooms.** A signed-in user creates one with `room_set` and
+  `private: true` (no `parent_room_id`; private rooms have no threads). Only
+  its members see it: to anyone else it answers as if it did not exist. Its
+  members add others with `room_join` and a `user_id`. It is removed when its
+  last member leaves or its history expires.
+  `server.ext.settings.private_rooms` gives how many one user may be in.
+
+System notices come from `~private`, `~room`, or `~server`; no user's
+`user_id` starts with `~`.
+
+This is a shared public server, not an isolated sandbox: test messages in
+public rooms are visible to others, guest ownership lasts only for the
+socket, and IP/resource quotas and retention still apply. Changing frontend
+origins does not give an IP a fresh allowance. Honor `retry_after`;
+[limits for client developers](limits.md) lists every limit a client can hit,
+including the posting, listing and frame quotas and the thread and private
+room caps, and ends with a checklist for a well-behaved client.
 
 The `server` frame's `welcome` is CommonMark for your sign-in screen. The server
 advertises `token` (for bot tokens) and `guest` to custom frontends, and never
@@ -169,10 +186,9 @@ advertises `token` (for bot tokens) and `guest` to custom frontends, and never
 (`webauthn` on the demo's own site, and `token` for an admin's `/invite`
 sign-up token, whose `auth` result carries the new user's own token to save).
 A user who signed up with a token can add a passkey by registering one while
-signed in.
-`web.apron.chat` additionally receives `webauthn`, and its `token` also resumes
-passkey sessions; inspect each connection's `server.params.auth` rather than
-assuming passkeys are available everywhere.
+signed in. `web.apron.chat` additionally receives `webauthn`, and its `token`
+also resumes passkey sessions; inspect each connection's
+`server.params.auth` rather than assuming passkeys are available everywhere.
 A frontend with a Content Security Policy must permit the endpoint in
 `connect-src` (for example, `connect-src wss://server.apron.chat`). Wildcard
 admission cannot override the frontend's own browser policies.
@@ -201,12 +217,24 @@ A bot posts, reacts, starts threads, and keeps its rooms like a registered
 user, under its own posting quota; it cannot rename itself or invite bots.
 You can add your bot to a thread, say to keep its `description` current,
 with `room_join` and its `user_id`, and remove it with `room_leave` the same
-way. The
-token does not expire. Running `/invite-bot` again replaces it, signs out
-connections that used the old one, and renames the bot after your current name.
-The first invite counts as a registration. A bot that neither signs in nor
-posts for a week is signed out and taken out of its rooms (what it posted
-stays); run `/invite-bot` again for a new token. See [SPEC section 5](../SPEC.md#bots).
+way. The token does not expire. Running `/invite-bot` again replaces it,
+signs out connections that used the old one, and renames the bot after your
+current name. The first invite counts as a registration. A bot that neither
+signs in nor posts for a week is signed out and taken out of its rooms (what
+it posted stays); run `/invite-bot` again for a new token. See
+[SPEC section 5](../SPEC.md#bots).
+
+This repository runs one: the [Announce workflow](../.github/workflows/announce.yml)
+posts each pull request merged into `main` to `general`, with a link preview
+(`og` title, description, and site name) built from the pull request, using
+the [apron-pr-bot](https://github.com/apron-chat/apron-pr-bot) action, and
+the [Deploy workflow](../.github/workflows/deploy.yml) reacts to those posts,
+as the same bot, once it has deployed them. Set the `APRON_BOT_TOKEN` secret
+of the `announce` environment to a token from `/invite-bot` to turn both on;
+without the secret the jobs succeed without posting. Set the environment's
+`APRON_ROOM_ID` variable to post in a room other than `general`. Rerunning
+the job for the same pull request within the deduplication window does not
+post it twice.
 
 ## Other devices
 
@@ -218,79 +246,58 @@ secret. You can hold 3, each under its own name. Running `/invite-device`
 again with the same name replaces that token and signs out connections that
 used the old one. See [SPEC section 5](../SPEC.md#devices).
 
-This repository runs one: the [Announce workflow](../.github/workflows/announce.yml)
-posts each pull request merged into `main` to `general`, with a link preview
-(`og` title, description, and site name) built from the pull request, using
-the [apron-pr-bot](https://github.com/apron-chat/apron-pr-bot) action. Set the
-`APRON_BOT_TOKEN` secret of the `announce` environment to a token from
-`/invite-bot` to turn it on; without the secret the job succeeds without
-posting. Set the environment's `APRON_ROOM_ID` variable to post in a room
-other than `general`. Rerunning the job for the same pull request within the
-deduplication window does not post it twice.
-
 ## User-visible policies
 
 Only the last 7 days of records (messages, reactions, room changes, and
 registered users' memberships) are retained, 24 hours on Workers Free. Cleanup
 once a day (hourly on Free) normally exposes 7 to 8 days; quota exhaustion may
-delay physical deletion. The `general` room ID, the top-level rooms admins and mods create, and the log
-head never rotate.
-Recent edits can keep old messages visible. Rooms keep their current record
-after its log entry expires; a thread room whose whole log has expired is
-removed (its members get `room_update` `left`), which frees its slot under the
-100-thread ceiling, and from its creator's 25. A thread also goes, and frees
-its slot, as soon as the last one in it leaves (or is removed, or purged), and
-its messages go with it.
+delay physical deletion. The `general` room ID, the top-level rooms admins
+and mods create, and the log head never rotate. Recent edits can keep old
+messages visible. Rooms keep their current record after its log entry
+expires; a thread or private room whose whole log has expired is removed (its
+members get `room_update` `left`), which frees its slot under the
+[caps](limits.md#hard-caps). It also goes, and frees its slot, as soon as the
+last one in it leaves (or is removed, or purged), and its messages go with it.
 This is not secure erasure, and says nothing about provider backups or copies
 on clients.
 
-Guests are numbered in arrival order: `guest_1` named "Guest 1", then
-`guest_2`, and so on, so the latest number roughly counts the demo's guests.
-The object reserves numbers ten at a time with one durable write and skips
-the rest of a block when it restarts or wakes from hibernation, so numbers
-are never reissued but have gaps (see [SPEC section 5](../SPEC.md#guest)).
-Guest identities last only for their socket, including hibernation, and so do
-the rooms a guest has joined. A
+Guests are numbered in arrival order (`guest_1` named "Guest 1", then
+`guest_2`), never reissued but with gaps (see
+[SPEC section 5](../SPEC.md#guest)). Guest identities last only for their
+socket, including hibernation, and so do the rooms a guest has joined. A
 reconnect receives a new guest identity, joined to `general` only, so earlier
 guest messages cannot be edited or deduplicated across that reconnect. A
 passkey creates a separate, stable registered identity that keeps its rooms
 across connections (starting with the guest's); it does not inherit guest
-message ownership.
-Passkeys require authentication on each new connection and do not prevent
-multiple registrations by one person.
+message ownership. Passkeys require authentication on each new connection and
+do not prevent multiple registrations by one person.
 
-Guests only read by default. With `GUEST_POSTING=true`, guest posting is
-shared by IP (native IPv6 grouped by /56): five accepted
-mutations per rolling minute and 200 per UTC day (100 with the Free budgets).
-Registered users receive 20/minute and 1,000/day (500), subject to the common IP and global limits. NAT users
-share allowances. Creates, edits, deletion, restoration, moves, reaction
-changes, thread room creation or edits, and room joins and leaves (a guest's
-included; one that changes nothing is free) all consume posting quota.
-Matching accepted request retries consume lookup and frame resources, but do
-not post again. Request deduplication lasts 24 hours.
+Guests only read by default. Posting quotas are per account, per IP (native
+IPv6 grouped by /56, so NAT users share allowances) and server-wide; creates,
+edits, deletion, restoration, moves, reaction changes, room creation or
+edits, and room joins and leaves (one that changes nothing is free) all
+consume them. A retried request with an `id` accepted in the last 24 hours
+does not post again. See [posting and other writes](limits.md#posting-and-other-writes)
+for the numbers.
 
-Temporary limits return `retry_after` with `data.retry_after` (whole
-seconds) and, for a reading, posting or upload limit, `data.ext.limits`
-(`read`, `write` or `upload`: extension `ext:limits`, defined in Apron's
-EXTENSIONS.md; SPEC section 6), which says what to hold back; clients back off. Daily
-posting/write exhaustion makes the demo read-only while affordable reads remain
-available. History exhaustion returns an error. Registration caps do not revoke
-existing passkeys. Permanent identity/thread-room caps return `denied`. Storage
-pressure suspends growth and retains the published history boundary; it never
-shortens history to accept another post. Global frame exhaustion closes sockets
-and rejects new admissions until replenishment.
+Temporary limits return `retry_after`, and clients back off (see
+[how a limit reaches you](limits.md#how-a-limit-reaches-you)). Daily
+posting/write exhaustion makes the demo read-only while affordable reads
+remain available. History exhaustion returns an error. Registration caps do
+not revoke existing passkeys. Permanent identity/thread-room caps return
+`denied`. Storage pressure suspends growth and retains the published history
+boundary; it never shortens history to accept another post. Global frame
+exhaustion closes sockets and rejects new admissions until replenishment.
 
 ## Operations and secrets
 
-IP rate limits use the first 128 bits of SHA-256 of the canonical address key,
-encoded as 22 base64url characters. IPv4-mapped IPv6 shares its IPv4 key; native
-IPv6 is grouped by /56, the size ISPs most often delegate to one home or site,
-so a subscriber cannot multiply its limits across the /64s it routes. No IP
-secret or backup is needed. These internal hashes
-are compact identifiers, not anonymization: candidate IPs can be hashed to
-recover a match. Neither raw IPs nor these keys are sent to chat clients.
-
-Keep the hash format stable across deployments to preserve active IP windows.
+IP rate limits key on the first 128 bits of SHA-256 of the canonical address
+(IPv4-mapped IPv6 as its IPv4, native IPv6 by /56; see
+[SPEC section 5](../SPEC.md#ip-key)). No IP secret or backup is needed. These
+internal hashes are compact identifiers, not anonymization: candidate IPs can
+be hashed to recover a match. Neither raw IPs nor these keys are sent to chat
+clients. Keep the hash format stable across deployments to preserve active IP
+windows.
 
 The public Worker reaches exactly `DEMO.getByName("public-demo-v1")`. URL,
 query, room, and identity input cannot select another object. Do not expose a
@@ -304,10 +311,11 @@ Expiration first publishes a durable monotonic floor, then deletes bounded
 batches. Budget authority, credentials, and the room head are independent of
 retention. SQLite frees pages for reuse without necessarily shrinking the file.
 The inspected [workerd implementation](https://github.com/cloudflare/workerd/blob/main/src/workerd/api/sql.c++)
-reports occupied pages through `databaseSize`, excluding freelist pages. Pressure
-stops growth at 768 MiB and resumes only below 640 MiB; transactions also check the
-1 GiB hard target before committing (96, 80 and 128 MiB with the Free budgets). Recheck this runtime assumption on upgrades.
-Do not delete the database or run unmetered VACUUM as a space-recovery measure.
+reports occupied pages through `databaseSize`, excluding freelist pages; recheck
+this on runtime upgrades. Pressure stops growth at 768 MiB and resumes only
+below 640 MiB; transactions also check the 1 GiB hard target before committing
+(96, 80 and 128 MiB with the Free budgets). Do not delete the database or run
+unmetered VACUUM as a space-recovery measure.
 
 ## Continuous deployment
 
@@ -343,19 +351,19 @@ The production backend at `wss://server.apron.chat/` uses
 using its `wrangler.toml`; `apron.chat` is
 reserved for static documentation. The production backend has no static assets.
 WebSocket upgrades use `/` or `/ws`.
-The default development Worker is `apron-cloudflare-demo-dev`; it is separate
-from the production Worker `apron-cloudflare-demo`. Like production, it binds no
-static assets: the frontend's development server proxies to it. Keep bindings,
-migrations, and compatibility settings in sync.
-Custom Domains configure DNS and HTTPS through Cloudflare; workers.dev and
-preview URLs are disabled for both deployments.
+The default development Worker (`wrangler.toml`) is `apron-cloudflare-demo-dev`;
+it is separate from the production Worker `apron-cloudflare-demo`. Like
+production, it binds no static assets: the frontend's development server
+proxies to it. Keep bindings, migrations, and compatibility settings in sync.
+The production Worker's Custom Domain configures DNS and HTTPS through
+Cloudflare, and its workers.dev and preview URLs are disabled (`npm run
+budget:check` refuses a production config without that). `wrangler.toml` sets
+neither, so turn them off before deploying it anywhere.
 
-The RP ID stays `apron.chat` to preserve existing passkey credentials across
-the move. Guest connections accept every origin, including localhost, LAN
-frontends, local files (opaque origins), and clients without Origin. Passkey
-verification allows only the exact `https://web.apron.chat` origin. Browser
-local storage is origin-specific, so saved names and server preferences do not
-move from the apex automatically.
+The RP ID stays `apron.chat` to keep existing passkey credentials working.
+Guest connections accept every origin, including localhost, LAN frontends,
+local files (opaque origins), and clients without Origin. Passkey
+verification allows only the exact `https://web.apron.chat` origin.
 
 Merging to `main` deploys the backend (see
 [continuous deployment](#continuous-deployment)). The frontend deploys from
@@ -398,42 +406,33 @@ For direct Wrangler production commands, always pass
    wildcard guest admission never enables wildcard passkey verification.
    RP changes can make previously registered credentials unusable.
 4. Run all checks here, and check the matching frontend in apron-chat/apron-web
-   (its CI runs `npm run check`, `npm test` and `npm run build`). Review the lockfile and compatibility date together.
-5. Review `wrangler.production.toml`: fixed DO binding, `new_sqlite_classes` migration,
-   no paid-service bindings. Apply the initial migration once using the normal
+   (its CI runs `npm run check`, `npm test` and `npm run build`). Review the
+   lockfile and compatibility date together.
+5. Review `wrangler.production.toml`: fixed DO binding, `new_sqlite_classes`
+   migration, no new paid-service bindings (the `MEDIA` R2 bucket is sized to
+   R2's free tier). Apply the initial migration once using the normal
    Wrangler deployment workflow. Do not rename or recreate the production
-   object to work around a quota or schema issue. The current schema is 11
-   (push subscriptions, user status, users' `ext`, when each user was last
-   seen going offline, and read cursors; tables keyed by text `WITHOUT
-   ROWID`). A schema 10 object drops four unread indexes and a column on
-   its first wake, in one small charged transaction. A schema 9 object's
-   first wake after the deploy rebuilds every table in place, in one transaction, copying every
-   row once (about one written row a row stored, logged as
-   `storage_schema_upgraded` and not charged to the day's budget, so
-   expect a one-off spike in the account's Durable Object writes), and adds
-   the identities' `seen_ms` column first where earlier schema 9 code made
-   none (see [SPEC section 8](../SPEC.md#schema-versions)).
-   A schema 8 or 7 object is upgraded in place the same way, through 9.
-   Each upgrade is one-way: redeploying older-schema code afterwards
-   resets the object like any schema change, keeping only the 100 most
-   recently used passkeys, so fix forward instead of rolling back. It
-   also fails closed: if it cannot finish, nothing changes, and the object
-   throws on every wake until a fixed deploy upgrades it.
-   Stored data from any other schema is not migrated: a deploy that changes
-   the storage schema otherwise resets the demo on the object's first wake.
-   All chat history, rooms,
-   sessions, bot tokens, and limiter windows are deleted, and saved session
-   tokens fall back to sign-in. Registered passkeys survive a reset from
-   schema 7 or later (an older object carries none): up to 100 of the
-   most recently used are carried over with their identities, so users sign in
-   with the passkey they already have; older ones past that cap must be
-   registered again. Besides those, only the current day's resource
-   reservations and the guest-number mark are carried over. Deploy the matching
-   frontend together with this backend.
+   object to work around a quota or schema issue. The current schema is 11.
+   Schemas 7 to 10 are upgraded in place on the object's first wake; the
+   rebuild from schema 9 copies every row once, uncharged to the day's
+   budget but logged as `storage_schema_upgraded`, so expect a one-off spike
+   in the account's Durable Object writes. An upgrade is one-way and fails
+   closed: if it cannot finish, nothing changes and the
+   object throws on every wake until a fixed deploy upgrades it, and
+   redeploying older-schema code afterwards resets the object, so fix
+   forward instead of rolling back. Any other schema change resets the demo
+   on the first wake: chat history, rooms, sessions, bot tokens, and limiter
+   windows are deleted, and saved session tokens fall back to sign-in; up to
+   100 of the most recently used passkeys (from schema 7 or later), the
+   current day's resource reservations, and the guest-number mark are
+   carried over. See [SPEC section 8](../SPEC.md#schema-versions). Deploy the
+   matching frontend together with this backend.
 6. When deployment is authorized, merge to `main` (or run the Deploy workflow)
-   and merge the matching frontend in apron-chat/apron-web, which deploys it. Verify guest access, passkey registration/login, edits, threads, reactions, history,
-   duplicate retries, custom-origin guest access, and rejection of passkey
-   requests from unapproved origins against the deployed endpoint.
+   and merge the matching frontend in apron-chat/apron-web, which deploys it.
+   Verify guest access, passkey registration/login, edits, threads, private
+   rooms, reactions, history, duplicate retries, custom-origin guest access,
+   and rejection of passkey requests from unapproved origins against the
+   deployed endpoint.
 7. Exercise idle **hibernation and wake**, then a real redeploy/reconnect. Check
    identity attachments, challenges, persistent quotas, room head/floor, alarm
    scheduling, and recovery. A local reconnect test alone does not establish
@@ -450,31 +449,18 @@ hostile traffic: rejected HTTP requests and incoming frames still cost platform
 resources. Local calibration is not proof of production billing or availability.
 
 Failed WebSocket handshakes can be diagnosed with an HTTP GET to the same `/`
-or `/ws` URL with `?apron_connection_status=1`. The response carries
-`Apron-Connection-Status: 1`, which marks it as the probe's own answer (clients
-ignore a reply without it, such as an edge's or a proxy's), exposes it and
-`Retry-After` through CORS, and disables caching. It checks live connection
-capacity and the cached daily SQL budget without reserving SQL work or opening
-a socket; it is advisory, and the real upgrade still enforces every admission
-gate. The native
-attempt limiters (per address, per IPv6 /48, and per location) also apply to
-these probes.
+or `/ws` URL with `?apron_connection_status=1` (see
+[how a limit reaches you](limits.md#how-a-limit-reaches-you)). It checks live
+connection capacity and the cached daily SQL budget without reserving SQL
+work or opening a socket; it is advisory, and the real upgrade still enforces
+every admission gate.
 
 When the daily SQL guard stops work, a `daily_budget_exhausted` log records the
 reserved counters and limits once per object instance/day. Each operation reserves
 a conservative bound before it runs, and once it finishes the unused part, measured
 from its SQL cursors, is credited back, so the counters follow the rows actually
-read and written (plus one row per credit). Key-value work stays charged at its
-bound. Compare the counters with account analytics
-before tuning operation costs. Daily reservations survive redeploys and reset at
-UTC midnight; resetting the object or its counters would discard that protection.
-
-Idle cleanup runs use indexed existence checks before reserving a deletion batch.
-If no records are eligible, they only advance the cleanup deadline. Within an
-object instance, a known adequate future alarm is reused without SQL bookkeeping;
-earlier deadlines, fired alarms, cleanup runs, and hibernation wakes are rechecked.
-
-On 2026-09-21 the app stopped at 59,976 reserved foreground writes after 93
-admissions, while account analytics reported about 13,165 actual writes. Crediting
-back each operation's measured unused reservation closes most of that gap without
-relying on aggregate analytics; a crash or rollback still leaves work charged.
+read and written (plus one row per credit); key-value work, and work lost to a
+crash, stays charged at its bound. Compare the counters with account analytics
+before tuning operation costs (see [reservation accounting](cost-report.md#reservation-accounting)).
+Daily reservations survive redeploys and reset at UTC midnight; resetting the
+object or its counters would discard that protection.

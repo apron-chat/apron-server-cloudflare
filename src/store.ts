@@ -2041,9 +2041,10 @@ export class Store {
    * once, in one transaction, without a new schema version: adding a column
    * rewrites no row, and code before it names every identities column it
    * reads or writes, so redeploying that code keeps everything and a later
-   * wake finds the column still there. Every wake probes for it with a
-   * statement that reads no row (it fails to compile without the column),
-   * charged as one read to the wake's handover allowance. The addition is
+   * wake finds the column still there. Only a schema 9 object's wake probes
+   * for it, before its upgrade, with a statement that reads no row (it fails
+   * to compile without the column), charged as one read to the wake's
+   * handover allowance. The addition is
    * charged like upgradeFromSchema7 (chargeUpgrade), and fails closed the
    * same way.
    */
@@ -5861,7 +5862,8 @@ export class Store {
     if (params.private !== undefined && typeof params.private !== "boolean") throw new StoreError("invalid_params", "private must be a boolean");
     // `private` is fixed at creation; on a save it is ignored like parent_room_id.
     const makePrivate = roomIdParam === undefined && params.private === true;
-    // A deployment without private rooms (privateRoomLimit 0) says so, as §4.2.4 requires.
+    // A store without private rooms (maxPrivateRooms 0) says so, as §4.2.4 requires. A
+    // deployment's privateRoomLimit is always positive (loadConfig), so only tests use it.
     if (makePrivate && this.config.maxPrivateRooms === 0) throw new StoreError("unsupported", "Private rooms are not supported on this server");
     if (makePrivate && !registered) throw new StoreError("denied", "Sign in to start a private room");
     if (makePrivate && params.parent_room_id !== undefined) throw new StoreError("denied", "A private room cannot be a thread on this demo");

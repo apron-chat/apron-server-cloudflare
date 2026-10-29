@@ -30,10 +30,13 @@ declare global {
 		SERVER_DESCRIPTION?: string;
 		SERVER_AVATAR?: string;
 		ADMISSION_OFF?: string;
+		ACCOUNTING_RECOVERY?: string;
 		ACTIVITY?: string;
 		GUEST_POSTING?: string;
 		PRESENCE?: string;
+		APRON_ADMIN_TOKEN?: string;
 		ENVIRONMENT?: string;
+		NODE_ENV?: string;
 	}
 	namespace Cloudflare {
 		interface Env {
@@ -65,10 +68,13 @@ declare global {
 			SERVER_DESCRIPTION?: string;
 			SERVER_AVATAR?: string;
 			ADMISSION_OFF?: string;
+			ACCOUNTING_RECOVERY?: string;
 			ACTIVITY?: string;
 			GUEST_POSTING?: string;
 			PRESENCE?: string;
+			APRON_ADMIN_TOKEN?: string;
 			ENVIRONMENT?: string;
+			NODE_ENV?: string;
 		}
 	}
 }

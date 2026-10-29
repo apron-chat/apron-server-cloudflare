@@ -296,8 +296,8 @@ function validateLimits(limits: Limits): void {
 	if (!Number.isSafeInteger(limits.threadsPerUser) || limits.threadsPerUser < 1 || limits.threadsPerUser > limits.threadLimit) {
 		fail("threadsPerUser must be between 1 and threadLimit");
 	}
-	if (!Number.isSafeInteger(limits.privateRoomLimit) || limits.privateRoomLimit < 0 || limits.privateRoomLimit > budget.MAX_PRIVATE_ROOM_LIMIT) {
-		fail("privateRoomLimit must be between 0 and the calibrated private room ceiling");
+	if (!Number.isSafeInteger(limits.privateRoomLimit) || limits.privateRoomLimit < 1 || limits.privateRoomLimit > budget.MAX_PRIVATE_ROOM_LIMIT) {
+		fail("privateRoomLimit must be between 1 and the calibrated private room ceiling");
 	}
 	if (!Number.isSafeInteger(limits.privateMembershipsPerUser) || limits.privateMembershipsPerUser < 1 || limits.privateMembershipsPerUser > budget.MAX_PRIVATE_MEMBERSHIPS_PER_USER) {
 		fail("privateMembershipsPerUser must be between 1 and the calibrated per-user ceiling");
@@ -477,8 +477,8 @@ export function validatePushPolicy(policy: PushPolicy): void {
 
 /**
  * VAPID keys, when the plan has push and the deployment sets all three;
- * malformed ones fail the configuration check. That the private key matches
- * the public one shows only when a push service rejects the signature.
+ * malformed ones, or a private key that does not match the public one,
+ * fail the configuration check.
  */
 function loadPush(env: EnvLike): VapidKeys | undefined {
 	const publicKey = env.VAPID_PUBLIC_KEY?.trim() ?? "";
