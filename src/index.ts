@@ -840,9 +840,10 @@ function presenceState(attachment: Partial<ConnectionAttachment>): Pick<Connecti
 /**
  * What a registered user's sign-in keeps on their connection: their stored
  * `status` state (Store.statusInputs) and their `seen`, from the identity
- * row the sign-in reads anyway (Store.getIdentity).
+ * row the sign-in reads anyway (Store.getIdentity); and how many pushes
+ * with an `unread` the instance had claimed when it read them (afterSignIn).
  */
-type SignInStatus = StatusInputRecord & { seen?: number };
+type SignInStatus = StatusInputRecord & { seen?: number; unreadClaims?: number };
 
 /** Keeps a user's stored `status` state and `seen` (SignInStatus) on one of their connections. */
 function applyStatusInputs(state: ConnectionAttachment, stored: SignInStatus): void {
@@ -1132,24 +1133,28 @@ const PUSH_TEXT_CODE_POINTS = 200;
 /** Largest push payload, in bytes of JSON (§4.9), leaving a relay room to wrap it for APNs or FCM. */
 const MAX_PUSH_PAYLOAD_BYTES = 2048;
 
+/** Users the instance remembers having zeroed `unread` for (unreadCleared); past it, it forgets them all. */
+const MAX_UNREAD_CLEARED = 4_096;
+
 /**
- * What a push carries (§4.9): the envelope `{push_id?, message}`, with the
- * registration's `push_id` when it has one (`unread` is not implemented,
- * so never sent), and as `message` the message without `log_id`, its text
- * cut to PUSH_TEXT_CODE_POINTS (left out when empty), and without `format`,
- * `embeds`, `ext`, or the server's `prev_*` links. Each fallback drops more
+ * What a push carries (§4.9): the envelope `{push_id?, unread?, message}`,
+ * with the registration's `push_id` when it has one, its user's `unread`
+ * when the claim counted one (Store.claimPushes), and as `message` the
+ * message without `log_id`, its text cut to PUSH_TEXT_CODE_POINTS (left
+ * out when empty), and without `format`, `embeds`, `ext`, or the server's
+ * `prev_*` links. Each fallback drops more
  * of `message` until the whole envelope fits MAX_PUSH_PAYLOAD_BYTES: first
  * `mentions`, then all of `from` but its `user_id` and `name`, then `body`,
  * and last everything but `message_id`, `room_id`, and `from.user_id`.
  */
-export function pushPayload(message: MessageSnapshot, pushId?: string): string {
+export function pushPayload(message: MessageSnapshot, pushId?: string, unread?: number): string {
 	const body = message.body ?? {};
 	const points = typeof body.text === "string" ? [...body.text] : [];
 	const text = points.length > PUSH_TEXT_CODE_POINTS ? points.slice(0, PUSH_TEXT_CODE_POINTS - 1).join("") + "…" : points.join("");
 	const tail = message.reply_to ? { reply_to: message.reply_to } : {};
 	const shortFrom = { user_id: message.from.user_id, ...(typeof message.from.name === "string" ? { name: message.from.name } : {}) };
 	const textField = text ? { text } : {};
-	const envelope = (inner: Record<string, unknown>) => jsonString({ ...(pushId !== undefined ? { push_id: pushId } : {}), message: inner });
+	const envelope = (inner: Record<string, unknown>) => jsonString({ ...(pushId !== undefined ? { push_id: pushId } : {}), ...(unread !== undefined ? { unread } : {}), message: inner });
 	const payload = (from: unknown, fields: Record<string, unknown>) =>
 		envelope({ message_id: message.message_id, room_id: message.room_id, from, ...tail, ...(Object.keys(fields).length ? { body: fields } : {}) });
 	const candidates = [
@@ -1160,8 +1165,8 @@ export function pushPayload(message: MessageSnapshot, pushId?: string): string {
 	];
 	const fitting = candidates.find((candidate) => utf8Bytes(candidate) <= MAX_PUSH_PAYLOAD_BYTES);
 	if (fitting !== undefined) return fitting;
-	// The last resort: only what names the message. Its ids and the `push_id`
-	// are bounded, so it always fits; the assertion keeps that true.
+	// The last resort: only what names the message. Its ids, the `push_id`
+	// and `unread` are bounded, so it always fits; the assertion keeps that true.
 	const minimal = envelope({ message_id: message.message_id, room_id: message.room_id, from: { user_id: message.from.user_id } });
 	if (utf8Bytes(minimal) > MAX_PUSH_PAYLOAD_BYTES) throw new Error("push payload exceeds MAX_PUSH_PAYLOAD_BYTES");
 	return minimal;
@@ -1452,6 +1457,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * wake lost with the instance is not pushed. At most MAX_PENDING_WAKES.
 	 */
 	private readonly pendingWakes = new Set<PendingWake>();
+	/**
+	 * Users whose `unread` this instance zeroed or found zero (clearUnread,
+	 * or a sign-in's Store.statusInputs), until a push is claimed for them,
+	 * so coming back again and every read cursor after costs no SQL. In
+	 * memory: after a wake, each user's first costs one probe. At most
+	 * MAX_UNREAD_CLEARED.
+	 */
+	private readonly unreadCleared = new Set<string>();
+	/** Pushes claimed with an `unread` by this instance, so a sign-in can tell whether one came while it read (afterSignIn). */
+	private unreadClaims = 0;
 	/** The one timer that announces waiting status changes, and when it fires. */
 	private presenceTimer: ReturnType<typeof setTimeout> | undefined;
 	private presenceTimerAt = Number.POSITIVE_INFINITY;
@@ -3225,6 +3240,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (attachment.tier !== "registered" || !identity) return;
 		const kept = attachment.reads?.[roomId];
 		if (kept !== undefined && Number(read) <= Number(kept)) return;
+		// Reading, from a connection that may never have said it was back (a stale one resuming).
+		this.clearUnread(attachment);
 		const peers = this.connectionsOf(identity.user_id, socket);
 		if (peers.length && this.takeThrottle(socket, identity.user_id, "read", this.config.limits.activityBroadcastsPerUserMinute, now)) {
 			const frame = { method: "activity", params: { room_id: roomId, from: identity, read_message_id: read } };
@@ -3415,12 +3432,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * the connection as it was. Signing in without it would show an invisible
 	 * user to others as connected and tell the client none of its mutes are
 	 * in effect, both until the next sign-in; a failed sign-in can be tried
-	 * again at once.
+	 * again at once. The read zeroes their `unread` too.
 	 */
 	private readStatusInputs(userId: string, seen: number | undefined): SignInStatus | undefined {
 		if (!this.config.push) return undefined;
+		const unreadClaims = this.unreadClaims;
 		try {
-			return { ...this.store.statusInputs(userId, nowMs()), ...(seen !== undefined ? { seen } : {}) };
+			return { ...this.store.statusInputs(userId, nowMs()), ...(seen !== undefined ? { seen } : {}), unreadClaims };
 		} catch (error) {
 			const failure = errorToProtocol(error);
 			console.warn(JSON.stringify({ event: "status_inputs_failed", reason: failure.message }));
@@ -3461,6 +3479,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * sign-in and does not.
 	 */
 	private afterSignIn(socket: WebSocketConnection, stored?: SignInStatus): void {
+		// The sign-in zeroed their `unread` (readStatusInputs): remembered,
+		// unless a push counted it up again while the sign-in went on.
+		const userId = connectionAttachment(socket)?.userId;
+		if (userId && stored?.unreadClaims === this.unreadClaims) this.rememberUnreadCleared(userId);
 		this.syncServer(socket);
 		this.sendMutesInEffect(socket, stored);
 		this.presenceSignedIn(socket);
@@ -3600,8 +3622,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			delete state.idleAt;
 		}
 		writeAttachment(socket, state);
-		// Back: a push still waiting for them is not needed.
-		if (!idle && state.userId) this.dropWakes(state.userId);
+		// Back: a push still waiting for them is not needed, and what was pushed counts as unread no longer.
+		if (!idle && state.userId) {
+			this.dropWakes(state.userId);
+			this.clearUnread(state);
+		}
 		// Gone: what they were passed over for since they were last attended is pushed.
 		if (idle && state.userId) this.releaseHeld(state.userId, now);
 		this.touchPresence(state.userId);
@@ -4547,6 +4572,28 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
+	 * Zeroes a registered user's `unread` (Store.clearPushUnread) as they
+	 * come back, unless this instance already did since their last push
+	 * (unreadCleared). A failure leaves them to the next time.
+	 */
+	private clearUnread(state: ConnectionAttachment): void {
+		const userId = state.userId;
+		if (!this.config.push || state.tier !== "registered" || !userId || this.unreadCleared.has(userId)) return;
+		try {
+			this.store.clearPushUnread(userId, nowMs());
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "push_unread_clear_failed", reason: errorToProtocol(error).message }));
+			return;
+		}
+		this.rememberUnreadCleared(userId);
+	}
+
+	private rememberUnreadCleared(userId: string): void {
+		if (this.unreadCleared.size >= MAX_UNREAD_CLEARED) this.unreadCleared.clear();
+		this.unreadCleared.add(userId);
+	}
+
+	/**
 	 * When a user's last attended connection goes idle, pushes the wakes they
 	 * were held for (holdWake) that came after they were last attended: the
 	 * latest `idleAt` of their connections, which `idle` dates back
@@ -4615,28 +4662,35 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return true;
 		}
 		if (claimed.skipped) console.warn(JSON.stringify({ event: "push_allowance_reached", skipped: claimed.skipped }));
+		// Their `unread` counted up: the next time they come back zeroes it again.
+		for (const subscription of claimed.subscriptions) {
+			if (subscription.unread === undefined) continue;
+			this.unreadCleared.delete(subscription.userId);
+			this.unreadClaims += 1;
+		}
 		if (claimed.subscriptions.length) this.ctx.waitUntil(this.deliverPushes(claimed.subscriptions, message, vapid, policy.ttlSeconds));
 		return claimed.subscriptions.length > 0 || claimed.skipped > 0;
 	}
 
 	/**
 	 * Pushes a message to each registration at once, each payload carrying
-	 * that registration's `push_id` (the sender was charged for each when it
-	 * was claimed), and forgets those whose push service says they are gone
+	 * that registration's `push_id` and its user's `unread` (the sender was
+	 * charged for each when it was claimed), and forgets those whose push service says they are gone
 	 * (404 or 410) or refuses this server's key (403). Other failures are only logged: the
 	 * push is lost, not retried.
 	 */
 	private async deliverPushes(subscriptions: readonly ClaimedPush[], message: MessageSnapshot, vapid: VapidKeys, ttlSeconds: number): Promise<void> {
-		const payloads = new Map<string | undefined, string>();
-		const payloadFor = (pushId: string | undefined): string => {
-			let payload = payloads.get(pushId);
-			if (payload === undefined) payloads.set(pushId, payload = pushPayload(message, pushId));
+		const payloads = new Map<string, string>();
+		const payloadFor = (pushId: string | undefined, unread: number | undefined): string => {
+			const key = JSON.stringify([pushId ?? null, unread ?? null]);
+			let payload = payloads.get(key);
+			if (payload === undefined) payloads.set(key, payload = pushPayload(message, pushId, unread));
 			return payload;
 		};
 		// Mentions, replies and private rooms are messages for this user, so
 		// `high`; one pushed only for `joined` is `normal` (§4.9).
 		const outcomes = await Promise.allSettled(subscriptions.map((subscription) =>
-			sendWebPush(subscription, payloadFor(subscription.pushId), vapid, { ttlSeconds, urgency: subscription.reasons === WAKE_SCOPES.joined ? "normal" : "high", nowMs: nowMs() })));
+			sendWebPush(subscription, payloadFor(subscription.pushId, subscription.unread), vapid, { ttlSeconds, urgency: subscription.reasons === WAKE_SCOPES.joined ? "normal" : "high", nowMs: nowMs() })));
 		const gone: Array<{ userId: string; url: string; p256dh: string }> = [];
 		let failed = 0;
 		outcomes.forEach((outcome, index) => {

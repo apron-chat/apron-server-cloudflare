@@ -259,17 +259,20 @@ upper bounds can be compared with the measured worst case.
 | Room mute set past 100, refused (two counts and a delete of none ran out) | 303 | 2 | 432 | 424 |
 | Room mute clear | 3 | 2 | 432 | 424 |
 | Room mute expiry, 50 of 100 ran out (read, delete) | 201 | 51 | 224 | 416 |
-| Status inputs at sign-in, nothing stored | 3 | 1 | 224 | 8 |
-| Status inputs at sign-in, a status, a mute and one room mute (`seen` comes with the identity lookup) | 3 | 1 | 224 | 8 |
+| Status inputs at sign-in, nothing stored (with the `unread` probe, nothing counted) | 4 | 1 | 224 | 16 |
+| Status inputs at sign-in, a status, a mute and one room mute (`seen` comes with the identity lookup) | 4 | 1 | 224 | 16 |
+| Status inputs at sign-in, zeroing an `unread` count (the probe and its update) | 5 | 2 | 224 | 16 |
 | Status set to `invisible`, with its `seen` (the stored one over 10 minutes old; one reservation and transaction) | 4 | 3 | 24 | 24 |
 | Status set to `invisible`, the stored `seen` standing (within 10 minutes; decided from the identity row it reads anyway) | 3 | 2 | 24 | 24 |
 | Seen settled for a user with no identity row (the update matches nothing; the read finds none) | 2 | 1 | 16 | 16 |
-| Status inputs at sign-in, 100 room mutes | 102 | 1 | 224 | 8 |
+| Status inputs at sign-in, 100 room mutes | 103 | 1 | 224 | 16 |
 | Push wake claim, `dnd` and muted (passed over) | 2 | 1 | 106 | 160 |
 | Push wake claim, the thread's parent muted (passed over) | 8 | 1 | 106 | 160 |
 | Gone push subscription forget (one primary-key row) | 2 | 2 | 20 | 22 |
 | Push reply author lookup | 4 | 1 | 16 | 8 |
 | Push wake claim for a reply (creates the recipient counter) | 18 | 9 | 106 | 160 |
+| Push `unread` zeroed (`idle: false` or a read cursor after a push: the recipient counter's probe and its update) | 3 | 2 | 16 | 16 |
+| Push `unread` zeroed, nothing counted (the probe only) | 2 | 1 | 16 | 16 |
 | Push joined wakers (the moderators who kept `joined`; one range of their partial index, read for every message) | 2 | 1 | 176 | 8 |
 | Push wake claim for `joined` (creates its own recipient counter; reads the role and the membership; charges no sender) | 20 | 8 | 106 | 160 |
 | Message create with request ID (the poster's first: creates its limiter rows) | 26 | 22 | 296 | 120 |
@@ -575,8 +578,9 @@ to the user's connections as `status` or `user` from the same operation,
 with no SQL. A room mute past the 100 a user may hold counts the user's
 room mutes and deletes those that ran out (303/2 when none did); its
 reservation covers deleting all 100 (432/424). A registered sign-in on a
-push server reads the `user_status` row and one key range of the user's
-room mutes (3/1 with none or one, 102/1 with 100) and keeps the status and
+push server reads the `user_status` row, one key range of the user's
+room mutes and their recipient counter, to zero their `unread` (4/1 with
+none or one, 103/1 with 100; 5/2 when it held a count) and keeps the status and
 mute ends on the connection, so `me` results and later `you` objects read
 nothing. `mutesPerUserMinute` (6) bounds mute and status changes together,
 counted per user across reconnects, so flipping them cannot drain the write
@@ -613,6 +617,21 @@ writes. They are charged to no sender, so a claim that pushes only for
 `joined` leaves the sender's counter unwritten (18/10 measured, against
 19/11 when it was charged as any push). The separate allowance adds no row
 to a claim, and one limiter row a day per moderator woken for `joined`.
+
+**`unread`.** Each push for anything but `joined` alone carries the
+user's `unread`: the pushes claimed for them since they last came back, kept
+in the `uploads_day` column of the `push_recipient` counter the claim
+already reads and writes for every user it wakes. So counting adds no row to
+a claim (26/15, 18/9 and 20/8 measured, as before). Coming back zeroes it:
+a sign-in with one more primary-key read in the reservation that already
+reads the user's status and mutes, and a write only when it held a count;
+`idle: false` and a read cursor with a reservation of their own (2/1 when
+nothing was counted, 3/2 when it zeroes one), skipped while the instance
+remembers having zeroed it since the user's last push. The probe is a read,
+and the update runs only when the count is not 0: an update that changes
+nothing is still charged a write. So a user who is never pushed pays at most
+one read a sign-in and one small reservation per wake of the object, and one
+who is, one write per return.
 
 Cleanup deletes expired registrations (`pushExpiryDays`, 7) and wake times
 past `coalesceSeconds` within its existing batch, by their time indexes.

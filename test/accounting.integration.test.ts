@@ -828,6 +828,13 @@ describe('measured storage accounting', () => {
 			expect(measure('push reply author lookup', () => store.messageAuthor(messageId, clock.now()))).toBe('matrix-user');
 			store.registerPushSubscription({ ...subscription, now: clock.now() });
 			expect(measure('push wake claim for a reply', () => store.claimPushes({ senderId: 'matrix-replier', roomId: 'matrix-reply-room', candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.replies }], now: clock.now() })).subscriptions).toHaveLength(1);
+			// The unread count the claims kept on the recipient counter, zeroed as the user comes back: written once, then nothing.
+			measure('push unread clear', () => store.clearPushUnread('matrix-user', clock.now()));
+			measure('push unread clear, already zero', () => store.clearPushUnread('matrix-user', clock.now()));
+			// A sign-in zeroes it in the reservation that reads the user's status and mutes.
+			store.claimPushes({ senderId: 'matrix-replier', roomId: 'matrix-unread-room', candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() });
+			expect(measure('status inputs at sign-in, zeroing unread', () => store.statusInputs('matrix-user', clock.now()))).toEqual({ choice: 'online', roomMutes: [] });
+			expect(state.storage.sql.exec("SELECT uploads_day FROM principal_limits WHERE scope = 'push_recipient' AND principal_key = 'user:matrix-user'").one().uploads_day).toBe(0);
 			// A moderator who kept `joined`: the read each message makes for them, and their claim (role and membership checked).
 			store.registerIdentity({
 				userId: 'matrix-mod', name: 'Matrix mod', userHandle: 'matrix-mod-handle', now: clock.now(), ipKey: 'matrix-mod-ip',
@@ -933,7 +940,7 @@ describe('measured storage accounting', () => {
 			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
 			expect(create.result.message_id).toBeTruthy();
-			expect(costs).toHaveLength(65);
+			expect(costs).toHaveLength(68);
 			expect(store.accountingStatus().unsafe).toBe(false);
 			return { costs };
 		});
