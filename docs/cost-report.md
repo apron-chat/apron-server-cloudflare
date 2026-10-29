@@ -119,9 +119,11 @@ fit where 56 did. A fresh object's SQLite file is 151,552 bytes, from
 
 ### Read cursors
 
-A registered user's `read_message_id` (§4.6) costs no SQL when it arrives:
-it is relayed to their other connections and held on the connection's
-attachment. Each connection writes what it holds at most once a minute
+A registered user's `read_message_id` (§4.6) costs no SQL when it arrives,
+unless a push counted up their `unread` since they were last back (one small
+reservation to zero it, below) or it passes the newest of held wakes released
+together (one lookup): it is relayed to their other connections and held on
+the connection's attachment. Each connection writes what it holds at most once a minute
 (`READ_CURSOR_FLUSH_MS`, by its next cursor or the next alarm) and when it
 closes, so a reader costs about one written row a minute and a room they
 read, however often their client sends. The table holds at most one row a
@@ -259,17 +261,20 @@ upper bounds can be compared with the measured worst case.
 | Room mute set past 100, refused (two counts and a delete of none ran out) | 303 | 2 | 432 | 424 |
 | Room mute clear | 3 | 2 | 432 | 424 |
 | Room mute expiry, 50 of 100 ran out (read, delete) | 201 | 51 | 224 | 416 |
-| Status inputs at sign-in, nothing stored | 3 | 1 | 224 | 8 |
-| Status inputs at sign-in, a status, a mute and one room mute (`seen` comes with the identity lookup) | 3 | 1 | 224 | 8 |
+| Status inputs at sign-in, nothing stored (with the `unread` probe, nothing counted) | 4 | 1 | 224 | 16 |
+| Status inputs at sign-in, a status, a mute and one room mute (`seen` comes with the identity lookup) | 4 | 1 | 224 | 16 |
+| Status inputs at sign-in, zeroing an `unread` count (the probe and its update) | 5 | 2 | 224 | 16 |
 | Status set to `invisible`, with its `seen` (the stored one over 10 minutes old; one reservation and transaction) | 4 | 3 | 24 | 24 |
 | Status set to `invisible`, the stored `seen` standing (within 10 minutes; decided from the identity row it reads anyway) | 3 | 2 | 24 | 24 |
 | Seen settled for a user with no identity row (the update matches nothing; the read finds none) | 2 | 1 | 16 | 16 |
-| Status inputs at sign-in, 100 room mutes | 102 | 1 | 224 | 8 |
+| Status inputs at sign-in, 100 room mutes | 103 | 1 | 224 | 16 |
 | Push wake claim, `dnd` and muted (passed over) | 2 | 1 | 106 | 160 |
 | Push wake claim, the thread's parent muted (passed over) | 8 | 1 | 106 | 160 |
 | Gone push subscription forget (one primary-key row) | 2 | 2 | 20 | 22 |
 | Push reply author lookup | 4 | 1 | 16 | 8 |
 | Push wake claim for a reply (creates the recipient counter) | 18 | 9 | 106 | 160 |
+| Push `unread` zeroed (`idle: false` or a read cursor after a push: the recipient counter's probe and its update) | 3 | 2 | 16 | 16 |
+| Push `unread` zeroed, nothing counted (the probe only) | 2 | 1 | 16 | 16 |
 | Push joined wakers (the moderators who kept `joined`; one range of their partial index, read for every message) | 2 | 1 | 176 | 8 |
 | Push wake claim for `joined` (creates its own recipient counter; reads the role and the membership; charges no sender) | 20 | 8 | 106 | 160 |
 | Message create with request ID (the poster's first: creates its limiter rows) | 26 | 22 | 296 | 120 |
@@ -575,8 +580,9 @@ to the user's connections as `status` or `user` from the same operation,
 with no SQL. A room mute past the 100 a user may hold counts the user's
 room mutes and deletes those that ran out (303/2 when none did); its
 reservation covers deleting all 100 (432/424). A registered sign-in on a
-push server reads the `user_status` row and one key range of the user's
-room mutes (3/1 with none or one, 102/1 with 100) and keeps the status and
+push server reads the `user_status` row, one key range of the user's
+room mutes and their recipient counter, to zero their `unread` (4/1 with
+none or one, 103/1 with 100; 5/2 when it held a count) and keeps the status and
 mute ends on the connection, so `me` results and later `you` objects read
 nothing. `mutesPerUserMinute` (6) bounds mute and status changes together,
 counted per user across reconnects, so flipping them cannot drain the write
@@ -613,6 +619,30 @@ writes. They are charged to no sender, so a claim that pushes only for
 `joined` leaves the sender's counter unwritten (18/10 measured, against
 19/11 when it was charged as any push). The separate allowance adds no row
 to a claim, and one limiter row a day per moderator woken for `joined`.
+
+**`unread`.** Each push for anything but `joined` alone carries the
+user's `unread`: the pushes claimed for them since they last came back, kept
+in the `uploads_day` column of the `push_recipient` counter the claim
+already reads and writes for every user it wakes. So counting adds no row to
+a claim (26/15, 18/9 and 20/8 measured, as before). Coming back zeroes it:
+a sign-in with one more primary-key read in the reservation that already
+reads the user's status and mutes, and a write only when it held a count;
+any other return (`idle: false`, a read cursor, any frame from a connection
+not idle) with a reservation of its own (3/2 measured), only when a push
+counted it up since: the claim marks all the user's connections
+(`unreadOwed`, in their attachments, so it survives hibernation), and the
+zeroing clears the mark. Unmarked, a return runs no SQL (measured). The
+probe is a read, and the update runs only when the count is not 0, since an
+update that changes nothing is still charged a write (2/1 when there is
+nothing to zero). So a user who is never pushed pays one read a sign-in, and
+one who is, one small reservation per return after a push.
+
+**Read cursors drop pushes.** A read cursor that passes a message drops
+the user's waiting wake for it and their held wakes for it as it arrives,
+from memory and connection attachments, with no SQL of its own. Only when it passes the
+newest of held wakes released together does the next one left cost its
+lookup (one metered read, as releasing them does). A push it drops spends
+no claim, coalescing window or allowance.
 
 Cleanup deletes expired registrations (`pushExpiryDays`, 7) and wake times
 past `coalesceSeconds` within its existing batch, by their time indexes.
@@ -680,7 +710,8 @@ share a room from attachments: the test that resends them measures no SQL
 statement at all. A `me` `status` change is 4/2, an unscoped mute 3/3, a
 room mute 4/3. Deriving and announcing statuses reads connection
 attachments only: the tests measure 0 rows read and written, and no
-statement, for an `idle` change, a sweep, a closed connection's change after
+statement, for an `idle` change (but `idle: false` after a push counted up
+`unread`, which zeroes it), a sweep, a closed connection's change after
 its grace, and a status snapshot, and the alarm unchanged; the one write is
 `seen`, below. A mute that runs
 out is told from attachments for the unscoped one (0 rows, measured); a
@@ -799,7 +830,8 @@ lookup; a room mute at the cap of 100 the same 303/2). The
 reply is one outgoing frame, not billed. `status` before sign-in is
 `denied`, so a sign-in applies no mutes kept on the connection: it writes
 nothing for them. An `idle` change still reads attachments only (0
-rows, measured, limited or not); a connection may go idle 12 times a minute
+rows, measured, limited or not; `idle: false` after a push that counted up
+`unread` also zeroes it, 3/2); a connection may go idle 12 times a minute
 (IDLE_CHANGES_PER_CONNECTION_MINUTE; `idle: false` is never refused, and
 each going idle needs one to repeat), counted in memory, so a client
 flipping it cannot make the object re-derive its user's status at frame

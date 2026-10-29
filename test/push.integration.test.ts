@@ -115,6 +115,8 @@ describe('admin alerts', () => {
 			const sent = pushes.find((push) => push.url === bossPush.url)!;
 			const payload = JSON.parse((await decryptPush(sent.body, bossPush.browser)).plaintext);
 			expect(payload).toMatchObject({ push_id: 'boss-push', message: { room_id: 'general', from: { user_id: 'admin' }, message_id: shown.frame.params.message_id } });
+			// Pushed attended or not, an alert counts nothing as unread.
+			expect(payload).not.toHaveProperty('unread');
 			// A second alert within the room's coalescing window is pushed too.
 			await stub().notifyAdmins('**Storage accounting closed.**');
 			await vi.waitFor(() => expect(pushes.filter((push) => push.url === bossPush.url)).toHaveLength(2));
@@ -380,20 +382,23 @@ describe('push over the socket', () => {
 			expect(carolPush.headers.get('content-encoding')).toBe('aes128gcm');
 			expect(carolPush.headers.get('ttl')).toBe(String(POLICY.ttlSeconds));
 			expect(carolPush.headers.get('urgency')).toBe('high');
-			// The envelope: the registration's push_id, no unread, and the message
-			// without log_id, format or embeds, its text cut to 200 code points.
+			// The envelope: the registration's push_id, Carol's unread (her first
+			// push since she was last back), and the message without log_id,
+			// format or embeds, its text cut to 200 code points.
 			const payload = JSON.parse((await decryptPush(carolPush.body, carolSub.browser)).plaintext);
 			expect(payload).toEqual({
 				push_id: 'carol-phone',
+				unread: 1,
 				message: {
 					message_id: first.result.message_id, room_id: 'general', from: { user_id: aliceId, name: `Name of ${aliceId}` },
 					body: { text: `${'é'.repeat(199)}…`, mentions: [bobId, carolId, aliceId, daveId, 'guest_1'] },
 				},
 			});
-			// Dave registered without a push_id: his envelope has only the message.
+			// Dave registered without a push_id: his envelope has only his unread and the message.
 			const davePush = pushes.find((push) => push.url === daveSub.url)!;
 			const davePayload = JSON.parse((await decryptPush(davePush.body, daveSub.browser)).plaintext);
-			expect(Object.keys(davePayload)).toEqual(['message']);
+			expect(Object.keys(davePayload)).toEqual(['unread', 'message']);
+			expect(davePayload.unread).toBe(1);
 			expect(davePayload.message.message_id).toBe(first.result.message_id);
 
 			// Edits, retries, and commands wake no one. Carol is attended again.
@@ -449,11 +454,121 @@ describe('push over the socket', () => {
 			const payload = JSON.parse(plaintext);
 			// The bound covers the whole envelope; the fallbacks apply inside `message`.
 			expect(payload.push_id).toBe('p'.repeat(64));
-			expect(Object.keys(payload)).toEqual(['push_id', 'message']);
+			expect(Object.keys(payload)).toEqual(['push_id', 'unread', 'message']);
 			expect(payload.message.body).not.toHaveProperty('mentions');
 			expect(payload.message.body.text).toMatch(/^"quoted"/);
 			expect(payload.message.from).toEqual({ user_id: aliceId, name: `Name of ${aliceId}` });
 		} finally { alice.close(); bob.close(); }
+	});
+
+	it('counts the pushes since a user was last back as unread, zeroed by idle false, a read cursor, and a sign-in', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId] = [unique('alice'), unique('bob')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		let again: Peer | undefined;
+		try {
+			const bobSub = await subscribe(bob, 'bob', 'bob-phone');
+			await setIdle(bob, true);
+			// One room a push, so coalescing passes none over.
+			const rooms: string[] = [];
+			for (let index = 0; index < 5; index++) rooms.push((await request(alice, `room-${index}`, 'room_set', { parent_room_id: 'general', title: `Unread ${index}` })).result.room_id);
+			const unreadOf = async (room: string, count: number) => {
+				const first = await post(alice, `in-${room}`, { room_id: room, body: { text: 'ping', mentions: [bobId] } });
+				await vi.waitFor(() => expect(pushes).toHaveLength(count), { timeout: 5_000 });
+				const payload = JSON.parse((await decryptPush(pushes[count - 1].body, bobSub.browser)).plaintext);
+				expect(payload.message.message_id).toBe(first.result.message_id);
+				return payload.unread;
+			};
+			expect(await unreadOf(rooms[0], 1)).toBe(1);
+			expect(await unreadOf(rooms[1], 2)).toBe(2);
+			// Back, and gone again: counted from one.
+			await setIdle(bob, false);
+			await setIdle(bob, true);
+			expect(await unreadOf(rooms[2], 3)).toBe(1);
+			expect(await unreadOf(rooms[3], 4)).toBe(2);
+			// A read cursor, from a connection still idle, zeroes it too (the idle repeat only waits for it).
+			await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).config.activityEnabled = true; });
+			bob.send({ method: 'activity', params: { room_id: 'general', read_message_id: (await post(alice, 'plain', { body: { text: 'plain' } })).result.message_id } });
+			await setIdle(bob, true);
+			await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).config.activityEnabled = false; });
+			expect(await unreadOf(rooms[4], 5)).toBe(1);
+			// So does signing in, here on a connection that then goes.
+			again = await signedIn(bobId, true);
+			again.close();
+			await vi.waitFor(async () => expect(await idleOf(bobId)).toEqual([true]), { timeout: 5_000 });
+			expect(await unreadOf('general', 6)).toBe(1);
+		} finally {
+			alice.close(); bob.close(); again?.close();
+			await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).config.activityEnabled = false; });
+		}
+	});
+
+	it('zeroes unread on coming back only when a push counted it up, and with SQL only then', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId] = [unique('alice'), unique('bob')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		const tab = await signedIn(bobId, true);
+		try {
+			await subscribe(bob, 'bob');
+			const unreadRow = () => runInDurableObject(stub(), (_instance, state) =>
+				state.storage.sql.exec("SELECT uploads_day FROM principal_limits WHERE scope = 'push_recipient' AND principal_key = ?", `user:${bobId}`).toArray()[0]?.uploads_day);
+			const owed = () => runInDurableObject(stub(), (_instance, state) => state.getWebSockets()
+				.map((socket) => socket.deserializeAttachment() as { userId?: string; unreadOwed?: boolean; closing?: boolean })
+				.filter((attachment) => attachment.userId === bobId && !attachment.closing).map((attachment) => attachment.unreadOwed === true));
+			/** Bob's connection `index` comes back (`idle: false`), counting the SQL statements it runs. */
+			const comeBack = (index: number) => runInDurableObject(stub(), (instance, state) => {
+				const runtime = instance as unknown as { handleStatus(socket: WebSocket, request: unknown): void };
+				const socket = state.getWebSockets().filter((ws) => (ws.deserializeAttachment() as { userId?: string }).userId === bobId)[index];
+				const sql = state.storage.sql as unknown as { exec: (...args: unknown[]) => unknown };
+				const exec = sql.exec.bind(sql);
+				let queries = 0;
+				sql.exec = (...args: unknown[]) => { queries++; return exec(...args); };
+				try { runtime.handleStatus(socket, { method: 'status', id: `back-${crypto.randomUUID()}`, params: { idle: false }, full: false }); } finally { sql.exec = exec; }
+				return queries;
+			});
+			await setIdle(bob, true);
+			await setIdle(tab, true);
+			// Never pushed: coming back reads and writes nothing.
+			expect(await comeBack(0)).toBe(0);
+			// Both idle again, whichever came back.
+			for (const peer of [bob, tab]) await setIdle(peer, true);
+			await post(alice, 'mention', { body: { text: 'ping', mentions: [bobId] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			// Owed on both of Bob's connections; coming back on either zeroes it, for all of them.
+			expect(await owed()).toEqual([true, true]);
+			expect(await unreadRow()).toBe(1);
+			expect(await comeBack(1)).toBeGreaterThan(0);
+			expect(await unreadRow()).toBe(0);
+			expect(await owed()).toEqual([false, false]);
+			// Back again, with nothing pushed since: no SQL.
+			expect(await comeBack(0)).toBe(0);
+		} finally { alice.close(); bob.close(); tab.close(); }
+	});
+
+	it('zeroes an owed unread on any frame from a connection that is not idle, such as a stale one resuming', async () => {
+		const [bobId] = [unique('bob')];
+		const bob = await signedIn(bobId);
+		try {
+			// As a push to a stale connection leaves it: a count, and the connection owing its zeroing.
+			await runInDurableObject(stub(), (_instance, state) => {
+				state.storage.sql.exec("INSERT OR REPLACE INTO principal_limits (scope, principal_key, level, level_ms, day, posts_day, registrations_day, uploads_day, updated_ms) VALUES ('push_recipient', ?, 0, 0, ?, 1, 0, 3, ?)",
+					`user:${bobId}`, new Date().toISOString().slice(0, 10), Date.now());
+				for (const socket of state.getWebSockets()) {
+					const attachment = socket.deserializeAttachment() as { userId?: string; unreadOwed?: boolean };
+					if (attachment.userId === bobId) socket.serializeAttachment({ ...attachment, unreadOwed: true });
+				}
+			});
+			// Any request the handler sees will do: here a ping with spacing the runtime does not answer itself.
+			bob.socket.send('{ "method": "ping" }');
+			await until(bob, (frame) => frame.method === 'pong');
+			const after = await runInDurableObject(stub(), (_instance, state) => ({
+				unread: state.storage.sql.exec("SELECT uploads_day FROM principal_limits WHERE scope = 'push_recipient' AND principal_key = ?", `user:${bobId}`).one().uploads_day,
+				owed: state.getWebSockets().map((socket) => socket.deserializeAttachment() as { userId?: string; unreadOwed?: boolean }).filter((attachment) => attachment.userId === bobId).map((attachment) => attachment.unreadOwed === true),
+			}));
+			expect(after).toEqual({ unread: 0, owed: [false] });
+		} finally { bob.close(); }
 	});
 
 	it('forgets a subscription its push service says is gone', async () => {
@@ -592,7 +707,8 @@ describe('wake scopes', () => {
 		await register(moderatorId);
 		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.setRole({ userId: moderatorId, role: 'mod', on: true }); });
 		const moderator = await signedIn(moderatorId, true);
-		const { url: moderatorUrl } = await subscribe(moderator, moderatorId, undefined, ['joined', 'mentions']);
+		const moderatorSub = await subscribe(moderator, moderatorId, undefined, ['joined', 'mentions']);
+		const moderatorUrl = moderatorSub.url;
 		moderator.close();
 		await vi.waitFor(async () => expect(await idleOf(moderatorId)).toEqual([]), { timeout: 5_000 });
 		expect((await subscriptionsOf(moderatorId)).map((row) => row.wake)).toEqual([['mentions', 'joined']]);
@@ -605,12 +721,15 @@ describe('wake scopes', () => {
 			await post(sender, 'joined-plain', { body: { text: 'nothing for anyone in particular' } });
 			await vi.waitFor(() => expect(pushes.map((push) => push.url)).toEqual([moderatorUrl]), { timeout: 5_000 });
 			expect(pushes[0].headers.get('Urgency')).toBe('normal');
+			// A push for `joined` alone counts nothing as unread, and carries no count.
+			expect(JSON.parse((await decryptPush(pushes[0].body, moderatorSub.browser)).plaintext)).not.toHaveProperty('unread');
 			// A mention is `high`, in another room so coalescing does not pass it over.
 			const thread = (await request(sender, 'joined-thread', 'room_set', { parent_room_id: 'general', title: 'Joined thread' })).result.room_id as string;
 			await post(sender, 'joined-mention', { room_id: thread, body: { text: 'look', mentions: [moderatorId] } });
 			await vi.waitFor(() => expect(pushes).toHaveLength(2), { timeout: 5_000 });
 			expect(pushes[1].url).toBe(moderatorUrl);
 			expect(pushes[1].headers.get('Urgency')).toBe('high');
+			expect(JSON.parse((await decryptPush(pushes[1].body, moderatorSub.browser)).plaintext).unread).toBe(1);
 		} finally {
 			sender.close();
 			// Every other test here posts in general: this moderator must wake for none of it.
@@ -1072,6 +1191,79 @@ describe('push delay', () => {
 		} finally {
 			await setDelay(0);
 			alice.close(); stay.close(); back.close(); poster.close(); other.close(); joiner.close(); again?.close();
+		}
+	});
+
+	/** Sends a read cursor (§4.6), applied once a ping the handler answers comes back after it. */
+	async function readThrough(peer: Peer, roomId: string, messageId: string): Promise<void> {
+		peer.send({ method: 'activity', params: { room_id: roomId, read_message_id: messageId } });
+		peer.socket.send('{ "method": "ping" }');
+		await until(peer, (frame) => frame.method === 'pong');
+	}
+	const setActivity = (on: boolean) => runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).config.activityEnabled = on; });
+
+	it('drops a waiting wake once the user\'s read cursor passes its message, and only in that room', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId] = [unique('alice'), unique('bob')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		try {
+			const bobSub = await subscribe(bob, 'bob');
+			await setIdle(bob, true);
+			await setActivity(true);
+			await setDelay(1);
+			const [one, two] = [
+				(await request(alice, 'read-one', 'room_set', { parent_room_id: 'general', title: 'Read one' })).result.room_id,
+				(await request(alice, 'read-two', 'room_set', { parent_room_id: 'general', title: 'Read two' })).result.room_id,
+			];
+			const first = await post(alice, 'first', { room_id: one, body: { text: 'first', mentions: [bobId] } });
+			const second = await post(alice, 'second', { room_id: one, body: { text: 'second', mentions: [bobId] } });
+			const elsewhere = await post(alice, 'elsewhere', { room_id: two, body: { text: 'elsewhere', mentions: [bobId] } });
+			// Bob, still idle, reads the first room through its first message only.
+			await readThrough(bob, one, first.result.message_id);
+			await waitOut();
+			await vi.waitFor(() => expect(pushes).toHaveLength(2), { timeout: 5_000 });
+			const pushed = await Promise.all(pushes.map(async (push) => JSON.parse((await decryptPush(push.body, bobSub.browser)).plaintext).message.message_id));
+			expect(pushed.sort()).toEqual([second.result.message_id, elsewhere.result.message_id].sort());
+			// What was read counts nothing as unread either: the read zeroed it, and the first was never pushed.
+			const counts = await Promise.all(pushes.map(async (push) => JSON.parse((await decryptPush(push.body, bobSub.browser)).plaintext).unread));
+			expect(counts.sort()).toEqual([1, 2]);
+		} finally {
+			await setDelay(0);
+			await setActivity(false);
+			alice.close(); bob.close();
+		}
+	});
+
+	it('forgets held wakes a read cursor passes, and falls back past a released one read while it waits', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId] = [unique('alice'), unique('bob')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		try {
+			const bobSub = await subscribe(bob, 'bob');
+			await setActivity(true);
+			await setDelay(1);
+			const rooms: string[] = [];
+			for (const title of ['A', 'B', 'C']) rooms.push((await request(alice, `held-${title}`, 'room_set', { parent_room_id: 'general', title: `Held ${title}` })).result.room_id);
+			// Bob is attended: each mention is held, oldest first.
+			const ids: string[] = [];
+			for (const [index, room] of rooms.entries()) ids.push((await post(alice, `held-${index}`, { room_id: room, body: { text: `held ${index}`, mentions: [bobId] } })).result.message_id);
+			// He reads B there: it is held no longer.
+			await readThrough(bob, rooms[1], ids[1]);
+			// Gone a minute: C, the newest, waits to push, with A behind it.
+			expect((await status(bob, { idle: 60 })).frame.result).toEqual({});
+			// He reads C before the wait is over: A waits in its place.
+			await readThrough(bob, rooms[2], ids[2]);
+			await waitOut();
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.message_id).toBe(ids[0]);
+			await waitOut();
+			expect(pushes).toHaveLength(1);
+		} finally {
+			await setDelay(0);
+			await setActivity(false);
+			alice.close(); bob.close();
 		}
 	});
 
@@ -1868,6 +2060,35 @@ describe('push subscriptions in the store', () => {
 			// /rename moves the joined allowance with the rest.
 			store.renameIdentity({ from: 'mo', to: 'moe', now: clock.value });
 			expect(counter('push_joined_recipient', 'user:moe')).toBe(3);
+			expect(store.accountingStatus().unsafe).toBe(false);
+		});
+	});
+
+	it('counts unread on the recipient counter, zeroed by clearPushUnread and by a new UTC day, and moved with /rename', async () => {
+		const keys = await browserKeys();
+		await withStore('push-unread', { push: { ...POLICY, coalesceSeconds: 1 } }, (store, clock) => {
+			atMidday(clock);
+			registerUser(store, clock, 'uma');
+			store.registerPushSubscription({ userId: 'uma', url: 'https://push.example.net/uma-1', ...keys, now: clock.value });
+			store.registerPushSubscription({ userId: 'uma', url: 'https://push.example.net/uma-2', ...keys, now: clock.value });
+			const unread = (userId = 'uma') => {
+				clock.value += 2_000;
+				return claim(store, clock, [userId]).subscriptions.map((row) => row.unread);
+			};
+			// One a push, whatever the registrations: each carries the same count.
+			expect(unread()).toEqual([1, 1]);
+			expect(unread()).toEqual([2, 2]);
+			store.clearPushUnread('uma', clock.value);
+			expect(unread()).toEqual([1, 1]);
+			// Zeroing a count of none changes nothing.
+			store.clearPushUnread('uma', clock.value);
+			store.clearPushUnread('uma', clock.value);
+			expect(unread()).toEqual([1, 1]);
+			// Only the day's count stands.
+			atMidday(clock);
+			expect(unread()).toEqual([1, 1]);
+			store.renameIdentity({ from: 'uma', to: 'ume', now: clock.value });
+			expect(unread('ume')).toEqual([2, 2]);
 			expect(store.accountingStatus().unsafe).toBe(false);
 		});
 	});

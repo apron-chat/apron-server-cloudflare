@@ -230,6 +230,14 @@ interface ConnectionAttachment {
 	 */
 	owed?: OwedStatus[];
 	/**
+	 * A push counted up its user's `unread` (Store.claimPushes) since it was
+	 * last zeroed: set on all their connections when one is claimed, so
+	 * coming back on any zeroes it (clearUnread), and only then costs SQL. A
+	 * connection that signs in after is zeroed by the sign-in instead. Kept
+	 * in the attachment, so it survives hibernation.
+	 */
+	unreadOwed?: true;
+	/**
 	 * Read cursors (§4.6) this connection sent for rooms its registered user
 	 * joined and has not yet written (Store.saveReadCursors): room to
 	 * `read_message_id`, at most MAX_ATTACHED_ROOMS. Kept here, so they
@@ -348,10 +356,10 @@ interface PendingWake {
 	timer?: ReturnType<typeof setTimeout>;
 	/**
 	 * For held wakes released together as one push (releaseHeld): the older
-	 * messages, newest first, to push instead when `message` wakes no one
-	 * (its room muted, or woken for already).
+	 * messages and their rooms, newest first, to push instead when `message`
+	 * wakes no one (its room muted, or woken for already) or is read first.
 	 */
-	others?: string[];
+	others?: Array<[messageId: string, roomId: string]>;
 }
 
 /** Pending status changes one connection may hold; more are delivered at once. */
@@ -798,6 +806,7 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			frameTimes: Array.isArray(attachment.frameTimes) ? attachment.frameTimes.slice(-120) : [],
 			...throttleState(attachment),
 			...(attachment.wakeJoined === true ? { wakeJoined: true } : {}),
+			...(attachment.unreadOwed === true ? { unreadOwed: true } : {}),
 			...(attachment.closing ? { closing: true } : {}),
 		};
 	} catch {
@@ -852,9 +861,10 @@ function presenceState(attachment: Partial<ConnectionAttachment>): Pick<Connecti
 /**
  * What a registered user's sign-in keeps on their connection: their stored
  * `status` state (Store.statusInputs) and their `seen`, from the identity
- * row the sign-in reads anyway (Store.getIdentity).
+ * row the sign-in reads anyway (Store.getIdentity); and how many pushes
+ * with an `unread` the instance had claimed when it read them (afterSignIn).
  */
-type SignInStatus = StatusInputRecord & { seen?: number };
+type SignInStatus = StatusInputRecord & { seen?: number; unreadClaims?: number };
 
 /** Keeps a user's stored `status` state and `seen` (SignInStatus) on one of their connections. */
 function applyStatusInputs(state: ConnectionAttachment, stored: SignInStatus): void {
@@ -924,7 +934,7 @@ function writeSessionAttachment(socket: WebSocketConnection, attachment: Connect
 		if (current.idle) attachment.idle = true;
 		else delete attachment.idle;
 		// Kept current by this connection's and other connections' events meanwhile.
-		for (const key of ["idleAt", "held", "choice", "muteUntil", "roomMuteNext", "pres", "owed"] as const) {
+		for (const key of ["idleAt", "held", "choice", "muteUntil", "roomMuteNext", "pres", "owed", "unreadOwed"] as const) {
 			if (current[key] !== undefined) (attachment as unknown as Record<string, unknown>)[key] = current[key];
 			else delete attachment[key];
 		}
@@ -1163,23 +1173,24 @@ const PUSH_TEXT_CODE_POINTS = 200;
 const MAX_PUSH_PAYLOAD_BYTES = 2048;
 
 /**
- * What a push carries (§4.9): the envelope `{push_id?, message}`, with the
- * registration's `push_id` when it has one (`unread` is not implemented,
- * so never sent), and as `message` the message without `log_id`, its text
- * cut to PUSH_TEXT_CODE_POINTS (left out when empty), and without `format`,
- * `embeds`, `ext`, or the server's `prev_*` links. Each fallback drops more
+ * What a push carries (§4.9): the envelope `{push_id?, unread?, message}`,
+ * with the registration's `push_id` when it has one, its user's `unread`
+ * when the claim counted one (Store.claimPushes), and as `message` the
+ * message without `log_id`, its text cut to PUSH_TEXT_CODE_POINTS (left
+ * out when empty), and without `format`, `embeds`, `ext`, or the server's
+ * `prev_*` links. Each fallback drops more
  * of `message` until the whole envelope fits MAX_PUSH_PAYLOAD_BYTES: first
  * `mentions`, then all of `from` but its `user_id` and `name`, then `body`,
  * and last everything but `message_id`, `room_id`, and `from.user_id`.
  */
-export function pushPayload(message: MessageSnapshot, pushId?: string): string {
+export function pushPayload(message: MessageSnapshot, pushId?: string, unread?: number): string {
 	const body = message.body ?? {};
 	const points = typeof body.text === "string" ? [...body.text] : [];
 	const text = points.length > PUSH_TEXT_CODE_POINTS ? points.slice(0, PUSH_TEXT_CODE_POINTS - 1).join("") + "…" : points.join("");
 	const tail = message.reply_to ? { reply_to: message.reply_to } : {};
 	const shortFrom = { user_id: message.from.user_id, ...(typeof message.from.name === "string" ? { name: message.from.name } : {}) };
 	const textField = text ? { text } : {};
-	const envelope = (inner: Record<string, unknown>) => jsonString({ ...(pushId !== undefined ? { push_id: pushId } : {}), message: inner });
+	const envelope = (inner: Record<string, unknown>) => jsonString({ ...(pushId !== undefined ? { push_id: pushId } : {}), ...(unread !== undefined ? { unread } : {}), message: inner });
 	const payload = (from: unknown, fields: Record<string, unknown>) =>
 		envelope({ message_id: message.message_id, room_id: message.room_id, from, ...tail, ...(Object.keys(fields).length ? { body: fields } : {}) });
 	const candidates = [
@@ -1190,8 +1201,8 @@ export function pushPayload(message: MessageSnapshot, pushId?: string): string {
 	];
 	const fitting = candidates.find((candidate) => utf8Bytes(candidate) <= MAX_PUSH_PAYLOAD_BYTES);
 	if (fitting !== undefined) return fitting;
-	// The last resort: only what names the message. Its ids and the `push_id`
-	// are bounded, so it always fits; the assertion keeps that true.
+	// The last resort: only what names the message. Its ids, the `push_id`
+	// and `unread` are bounded, so it always fits; the assertion keeps that true.
 	const minimal = envelope({ message_id: message.message_id, room_id: message.room_id, from: { user_id: message.from.user_id } });
 	if (utf8Bytes(minimal) > MAX_PUSH_PAYLOAD_BYTES) throw new Error("push payload exceeds MAX_PUSH_PAYLOAD_BYTES");
 	return minimal;
@@ -1495,6 +1506,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * wake lost with the instance is not pushed. At most MAX_PENDING_WAKES.
 	 */
 	private readonly pendingWakes = new Set<PendingWake>();
+	/** Pushes claimed with an `unread` by this instance, so a sign-in can tell whether one came while it read (afterSignIn). */
+	private unreadClaims = 0;
 	/** The one timer that announces waiting status changes, and when it fires. */
 	private presenceTimer: ReturnType<typeof setTimeout> | undefined;
 	/** When an event or a timer last ran in this instance (noteActivity, noteTimerFired), 0 for none yet. */
@@ -2107,6 +2120,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// A request method sent without an `id` is ignored, as §1.1 lets a
 		// server (REQUEST_METHODS): no change, and no reply.
 		if (request.id === undefined && REQUEST_METHODS.has(request.method)) return;
+		// A frame from a connection not idle is its user attended (see attended),
+		// a stale one resuming included: what was pushed is unread no longer.
+		if (!attachment.idle) this.clearUnread(attachment);
 		switch (request.method) {
 			case "auth":
 				await this.handleAuth(socket, attachment, request);
@@ -3280,6 +3296,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (attachment.tier !== "registered" || !identity) return;
 		const kept = attachment.reads?.[roomId];
 		if (kept !== undefined && Number(read) <= Number(kept)) return;
+		// Reading, from a connection that may never have said it was back (a stale one resuming).
+		this.clearUnread(attachment);
+		// Read through `read`: what waits or is held to push for the room up to it is not needed.
+		this.dropWakes(identity.user_id, roomId, read);
+		this.dropHeld(identity.user_id, roomId, read);
 		const peers = this.connectionsOf(identity.user_id, socket);
 		if (peers.length && this.takeThrottle(socket, identity.user_id, "read", this.config.limits.activityBroadcastsPerUserMinute, now)) {
 			const frame = { method: "activity", params: { room_id: roomId, from: identity, read_message_id: read } };
@@ -3470,12 +3491,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * the connection as it was. Signing in without it would show an invisible
 	 * user to others as connected and tell the client none of its mutes are
 	 * in effect, both until the next sign-in; a failed sign-in can be tried
-	 * again at once.
+	 * again at once. The read zeroes their `unread` too.
 	 */
 	private readStatusInputs(userId: string, seen: number | undefined): SignInStatus | undefined {
 		if (!this.config.push) return undefined;
+		const unreadClaims = this.unreadClaims;
 		try {
-			return { ...this.store.statusInputs(userId, nowMs()), ...(seen !== undefined ? { seen } : {}) };
+			return { ...this.store.statusInputs(userId, nowMs()), ...(seen !== undefined ? { seen } : {}), unreadClaims };
 		} catch (error) {
 			const failure = errorToProtocol(error);
 			console.warn(JSON.stringify({ event: "status_inputs_failed", reason: failure.message }));
@@ -3497,7 +3519,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private prepareStatus(socket: WebSocketConnection, stored?: SignInStatus): void {
 		const state = connectionAttachment(socket);
 		if (!state) return;
-		for (const key of ["choice", "muteUntil", "roomMuteNext", "seen", "pres", "held"] as const) delete state[key];
+		for (const key of ["choice", "muteUntil", "roomMuteNext", "seen", "pres", "held", "unreadOwed"] as const) delete state[key];
 		if (state.tier === "registered" && stored) {
 			applyStatusInputs(state, stored);
 			const kept = keptSeen([{ state }, ...this.liveStatesOf(state.userId!).filter((peer) => peer.socket !== socket)]);
@@ -3516,6 +3538,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * sign-in and does not.
 	 */
 	private afterSignIn(socket: WebSocketConnection, stored?: SignInStatus): void {
+		// The sign-in zeroed their `unread` (readStatusInputs). A push that
+		// counted it up again while the sign-in went on did not see this
+		// connection as theirs: it owes the zeroing too.
+		const signedIn = connectionAttachment(socket);
+		if (signedIn && stored && stored.unreadClaims !== this.unreadClaims) {
+			signedIn.unreadOwed = true;
+			writeAttachment(socket, signedIn);
+		}
 		this.syncServer(socket);
 		this.sendMutesInEffect(socket, stored);
 		this.presenceSignedIn(socket);
@@ -3655,8 +3685,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			delete state.idleAt;
 		}
 		writeAttachment(socket, state);
-		// Back: a push still waiting for them is not needed.
-		if (!idle && state.userId) this.dropWakes(state.userId);
+		// Back: a push still waiting for them is not needed, and what was pushed counts as unread no longer.
+		if (!idle && state.userId) {
+			this.dropWakes(state.userId);
+			this.clearUnread(state);
+		}
 		// Gone: what they were passed over for since they were last attended is pushed.
 		if (idle && state.userId) this.releaseHeld(state.userId, now);
 		this.touchPresence(state.userId);
@@ -4499,7 +4532,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * (see pendingWakes), with the message as it is then (keepReasons), or at
 	 * once without a wait.
 	 */
-	private scheduleWake(message: MessageSnapshot, reasons: Map<string, number>, others?: string[]): void {
+	private scheduleWake(message: MessageSnapshot, reasons: Map<string, number>, others?: Array<[string, string]>): void {
 		const wake: PendingWake = { message, reasons, ...(others ? { others } : {}) };
 		const delay = this.config.pushDelaySeconds * 1_000;
 		// Past the bound, a wake goes at once, as it would with no wait.
@@ -4550,20 +4583,32 @@ export class ApronDemoServer extends DurableObject<Env> {
 		while (message) {
 			if (this.pushWake(message, wake.reasons) || !others.length) return;
 			message = null;
-			while (!message && others.length) message = this.heldMessage(others.shift()!, nowMs());
+			while (!message && others.length) message = this.heldMessage(others.shift()![0], nowMs());
 		}
 	}
 
 	/**
 	 * Drops a user from the wakes waiting to push (pendingWakes): all of them
-	 * when they come back (`idle: false`), or `roomId`'s when they post there.
+	 * when they come back (`idle: false`); `roomId`'s when they post there;
+	 * and its messages up to `through` when their read cursor passes them
+	 * (§4.9.4's suggested convention), which their client sends only for
+	 * what was on screen. For held wakes released together (`others`), the
+	 * messages seen go, and if the newest is one, the next left waits in its
+	 * place (scheduleHeld).
 	 */
-	private dropWakes(userId: string, roomId?: string): void {
-		for (const wake of this.pendingWakes) {
-			if (roomId !== undefined && wake.message.room_id !== roomId) continue;
-			if (!wake.reasons.delete(userId) || wake.reasons.size) continue;
+	private dropWakes(userId: string, roomId?: string, through?: string): void {
+		const seen = (messageId: string, room: string) =>
+			roomId === undefined || (room === roomId && (through === undefined || Number(messageId) <= Number(through)));
+		for (const wake of [...this.pendingWakes]) {
+			const reasons = wake.reasons.get(userId);
+			if (reasons === undefined) continue;
+			if (wake.others && roomId !== undefined) wake.others = wake.others.filter(([messageId, room]) => !seen(messageId, room));
+			if (!seen(wake.message.message_id, wake.message.room_id)) continue;
+			wake.reasons.delete(userId);
+			if (wake.reasons.size) continue;
 			clearTimeout(wake.timer);
 			this.pendingWakes.delete(wake);
+			if (roomId !== undefined && wake.others?.length) this.scheduleHeld(userId, reasons, wake.others, nowMs());
 		}
 	}
 
@@ -4591,16 +4636,50 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Forgets a user's held wakes (holdWake): `roomId`'s when they post there,
-	 * which shows they saw it, or all of them.
+	 * which shows they saw it, or its messages up to `through` when their
+	 * read cursor passes them; or all of them.
 	 */
-	private dropHeld(userId: string, roomId?: string): void {
+	private dropHeld(userId: string, roomId?: string, through?: string): void {
 		for (const peer of this.connectionsOf(userId)) {
 			const state = connectionAttachment(peer);
 			if (!state?.held) continue;
-			const kept = roomId === undefined ? [] : state.held.filter((entry) => entry[1] !== roomId);
+			const kept = roomId === undefined ? [] : state.held.filter(([messageId, room]) =>
+				room !== roomId || (through !== undefined && Number(messageId) > Number(through)));
 			if (kept.length === state.held.length) continue;
 			if (kept.length) state.held = kept;
 			else delete state.held;
+			writeAttachment(peer, state);
+		}
+	}
+
+	/**
+	 * Zeroes a registered user's `unread` (Store.clearPushUnread) as they
+	 * come back, when a push counted it up since it was last zeroed: any of
+	 * their connections holds `unreadOwed`. Otherwise no SQL. A failure
+	 * leaves it owed, for the next time.
+	 */
+	private clearUnread(state: ConnectionAttachment): void {
+		const userId = state.userId;
+		if (!this.config.push || state.tier !== "registered" || !userId) return;
+		if (!state.unreadOwed && !this.connectionsOf(userId).some((peer) => connectionAttachment(peer)?.unreadOwed)) return;
+		try {
+			this.store.clearPushUnread(userId, nowMs());
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "push_unread_clear_failed", reason: errorToProtocol(error).message }));
+			return;
+		}
+		// The caller's copy too, so writing it back does not owe it again.
+		delete state.unreadOwed;
+		this.markUnreadOwed(userId, false);
+	}
+
+	/** Sets or clears `unreadOwed` on all of a user's connections: attachments only. */
+	private markUnreadOwed(userId: string, owed: boolean): void {
+		for (const peer of this.connectionsOf(userId)) {
+			const state = connectionAttachment(peer);
+			if (!state || !!state.unreadOwed === owed) continue;
+			if (owed) state.unreadOwed = true;
+			else delete state.unreadOwed;
 			writeAttachment(peer, state);
 		}
 	}
@@ -4619,23 +4698,33 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!states.some(({ state }) => state.held?.length)) return;
 		if (states.some(({ socket, state }) => this.attendedConnection(socket, state, now))) return;
 		const attendedUntil = Math.max(now - HELD_WAKE_SECONDS * 1_000, ...states.map(({ state }) => state.idleAt ?? state.frameTimes[state.frameTimes.length - 1] ?? 0));
-		const due = new Map<string, number>();
+		const due = new Map<string, { at: number; roomId: string }>();
 		let reasons = 0;
 		for (const { state } of states) {
-			for (const [messageId, , why, at] of state.held ?? []) {
+			for (const [messageId, roomId, why, at] of state.held ?? []) {
 				if (at <= attendedUntil) continue;
-				due.set(messageId, Math.max(due.get(messageId) ?? 0, at));
+				due.set(messageId, { at: Math.max(due.get(messageId)?.at ?? 0, at), roomId });
 				reasons |= why;
 			}
 		}
 		this.dropHeld(userId);
 		// One push for them all, as each push costs: the newest; the rest stand by in case it wakes no one.
 		// At most MAX_HELD_WAKES of them, so the lookups and claims a release may try stay bounded.
-		const ids = [...due].sort((a, b) => b[1] - a[1]).slice(0, MAX_HELD_WAKES).map(([messageId]) => messageId);
-		while (ids.length) {
-			const message = this.heldMessage(ids.shift()!, now);
+		const ids = [...due].sort((a, b) => b[1].at - a[1].at).slice(0, MAX_HELD_WAKES).map(([messageId, { roomId }]) => [messageId, roomId] as [string, string]);
+		this.scheduleHeld(userId, reasons, ids, now);
+	}
+
+	/**
+	 * Schedules held wakes released together (releaseHeld) as one: the first
+	 * of `ids` whose message is still there (one metered lookup each), the
+	 * rest standing by (`others`).
+	 */
+	private scheduleHeld(userId: string, reasons: number, ids: Array<[string, string]>, now: number): void {
+		const rest = [...ids];
+		while (rest.length) {
+			const message = this.heldMessage(rest.shift()![0], now);
 			if (!message) continue;
-			this.scheduleWake(message, new Map([[userId, reasons]]), ids);
+			this.scheduleWake(message, new Map([[userId, reasons]]), rest);
 			return;
 		}
 	}
@@ -4735,28 +4824,33 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return true;
 		}
 		if (claimed.skipped) console.warn(JSON.stringify({ event: "push_allowance_reached", skipped: claimed.skipped }));
+		// Their `unread` counted up: the next time they come back zeroes it again.
+		const counted = new Set(claimed.subscriptions.filter((subscription) => subscription.unread !== undefined).map((subscription) => subscription.userId));
+		for (const userId of counted) this.markUnreadOwed(userId, true);
+		this.unreadClaims += counted.size;
 		if (claimed.subscriptions.length) this.ctx.waitUntil(this.deliverPushes(claimed.subscriptions, message, vapid, policy.ttlSeconds));
 		return claimed.subscriptions.length > 0 || claimed.skipped > 0;
 	}
 
 	/**
 	 * Pushes a message to each registration at once, each payload carrying
-	 * that registration's `push_id` (the sender was charged for each when it
-	 * was claimed), and forgets those whose push service says they are gone
+	 * that registration's `push_id` and its user's `unread` (the sender was
+	 * charged for each when it was claimed), and forgets those whose push service says they are gone
 	 * (404 or 410) or refuses this server's key (403). Other failures are only logged: the
 	 * push is lost, not retried.
 	 */
 	private async deliverPushes(subscriptions: readonly ClaimedPush[], message: MessageSnapshot, vapid: VapidKeys, ttlSeconds: number): Promise<void> {
-		const payloads = new Map<string | undefined, string>();
-		const payloadFor = (pushId: string | undefined): string => {
-			let payload = payloads.get(pushId);
-			if (payload === undefined) payloads.set(pushId, payload = pushPayload(message, pushId));
+		const payloads = new Map<string, string>();
+		const payloadFor = (pushId: string | undefined, unread: number | undefined): string => {
+			const key = JSON.stringify([pushId ?? null, unread ?? null]);
+			let payload = payloads.get(key);
+			if (payload === undefined) payloads.set(key, payload = pushPayload(message, pushId, unread));
 			return payload;
 		};
 		// Mentions, replies and private rooms are messages for this user, so
 		// `high`; one pushed only for `joined` is `normal` (§4.9).
 		const outcomes = await Promise.allSettled(subscriptions.map((subscription) =>
-			sendWebPush(subscription, payloadFor(subscription.pushId), vapid, { ttlSeconds, urgency: subscription.reasons === WAKE_SCOPES.joined ? "normal" : "high", nowMs: nowMs() })));
+			sendWebPush(subscription, payloadFor(subscription.pushId, subscription.unread), vapid, { ttlSeconds, urgency: subscription.reasons === WAKE_SCOPES.joined ? "normal" : "high", nowMs: nowMs() })));
 		const gone: Array<{ userId: string; url: string; p256dh: string }> = [];
 		let failed = 0;
 		outcomes.forEach((outcome, index) => {

@@ -938,6 +938,19 @@ const SEEN_COLUMN_PROBE = "SELECT seen_ms FROM identities LIMIT 0";
  */
 const MAX_PUSH_WAKES_PER_USER = MAX_USER_ROOMS + MAX_PURGE_ROOMS;
 /**
+ * Where a user's `unread` (protocol §4.9.3) is kept: the `uploads_day` of
+ * their `push_recipient` counter, which every push claimed for them reads
+ * and writes anyway, so counting costs a claim no row. It counts the
+ * pushes claimed for them since they were last back (Store.clearPushUnread):
+ * each for a message from someone else that came while nobody attended them,
+ * so it never counts more messages than they have not seen, and is often
+ * fewer: a message coalesced away, or pushed for `joined` alone, counts
+ * none, and held wakes released together count one. Only the current UTC
+ * day's count stands, as with the counter's own (cleanup deletes the row
+ * after it).
+ */
+const PUSH_UNREAD_SCOPE = "push_recipient";
+/**
  * Longest push endpoint URL kept (protocol §4.9). Browsers' are a few
  * hundred bytes; a tighter bound keeps each row small, so sybil accounts
  * cannot fill storage with registrations.
@@ -1116,8 +1129,12 @@ function pushRecord(row: RawPushRow, userId: string): PushSubscriptionRecord {
   return { url: row.url, userId, p256dh: row.p256dh, auth: row.auth, ...(row.push_id !== null ? { pushId: row.push_id } : {}) };
 }
 
-/** A registration a wake claimed, with the scopes it is pushed for: what it wakes for among why its user qualified. */
-export type ClaimedPush = PushSubscriptionRecord & { reasons: number };
+/**
+ * A registration a wake claimed, with the scopes it is pushed for: what it
+ * wakes for among why its user qualified, and its user's `unread` count
+ * (protocol §4.9.3) when the push carries one.
+ */
+export type ClaimedPush = PushSubscriptionRecord & { reasons: number; unread?: number };
 
 /** What a message's wake claimed (Store.claimPushes). */
 interface PushClaim {
@@ -5221,6 +5238,10 @@ export class Store {
    * them, what is left is `skipped`. A user pushed only for `joined` is
    * charged instead to their `joinedPushesPerRecipientDay` and the server's
    * allowance, not the sender's, and coalesced by `joinedCoalesceSeconds`.
+   * Each user woken for anything but `joined` alone has their `unread`
+   * (PUSH_UNREAD_SCOPE) counted up by one in the recipient counter the claim
+   * reads and writes anyway, and every registration claimed for them carries
+   * it; a push for `joined` alone, or an operator alert, carries none.
    * A sender is charged for a push that
    * fails too, so registrations that always fail cannot let one sender
    * spend the server's day. With
@@ -5301,11 +5322,14 @@ export class Store {
           const charged = sender.day === day ? integerColumn(sender.posts_day) : 0;
           counters = { server, sender, sent: server.day === day ? integerColumn(server.posts_day) : 0, charged, chargedBefore: charged };
         }
-        const recipientScope = joinedOnly ? "push_joined_recipient" : "push_recipient";
-        const recipient = this.rawRows<{ day: string; posts_day: number }>(
-          "SELECT day, posts_day FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1", recipientScope, `user:${userId}`,
+        const recipientScope = joinedOnly ? "push_joined_recipient" : PUSH_UNREAD_SCOPE;
+        const recipient = this.rawRows<{ day: string; posts_day: number; uploads_day: number }>(
+          "SELECT day, posts_day, uploads_day FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1", recipientScope, `user:${userId}`,
         )[0];
         const received = recipient?.day === day ? integerColumn(recipient.posts_day) : 0;
+        // The same row's `uploads_day` is the user's `unread` (PUSH_UNREAD_SCOPE). A push for `joined` alone
+        // counts none, nor does an operator alert, which goes to admins attended or not.
+        const unread = !joinedOnly && !input.alert ? (recipient?.day === day ? integerColumn(recipient.uploads_day) : 0) + 1 : undefined;
         const allowed = input.alert ? rows.length : Math.max(0, Math.min(
           rows.length,
           policy.pushesPerDay - counters.sent,
@@ -5314,11 +5338,11 @@ export class Store {
         ));
         claim.skipped += rows.length - allowed;
         if (!allowed) continue;
-        for (const row of rows.slice(0, allowed)) claim.subscriptions.push({ ...pushRecord(row, userId), reasons: integerColumn(row.wake) & why });
+        for (const row of rows.slice(0, allowed)) claim.subscriptions.push({ ...pushRecord(row, userId), reasons: integerColumn(row.wake) & why, ...(unread !== undefined ? { unread } : {}) });
         counters.sent += allowed;
         if (!joinedOnly) counters.charged += allowed;
         woken += 1;
-        this.updateLimitRow(this.limitRow(recipientScope, `user:${userId}`, effective), { day, posts_day: received + allowed }, effective);
+        this.updateLimitRow(this.limitRow(recipientScope, `user:${userId}`, effective), { day, posts_day: received + allowed, ...(unread !== undefined ? { uploads_day: unread } : {}) }, effective);
         this.rawExec(
           "INSERT INTO push_wakes (user_id, room_id, woken_ms) VALUES (?, ?, ?) ON CONFLICT (user_id, room_id) DO UPDATE SET woken_ms = excluded.woken_ms",
           userId, input.roomId, effective,
@@ -5331,6 +5355,31 @@ export class Store {
       }
       return claim;
     }));
+  }
+
+  /**
+   * Zeroes a user's `unread` (PUSH_UNREAD_SCOPE) when they come back: end
+   * `idle`, move a read cursor, or send from a connection not idle (a
+   * sign-in zeroes it with statusInputs).
+   * One primary-key probe of their recipient counter, written only when it
+   * held a count; the caller runs it only when a push counted it up since
+   * the user was last back, so it seldom runs.
+   */
+  clearPushUnread(userId: string, now = this.clock.now()): void {
+    this.ensureReady();
+    if (!this.config.push) return;
+    this.reserved({ reads: 8, writes: 8 }, false, now, () => this.zeroPushUnread(userId));
+  }
+
+  /** Read first: an update is charged a write even when it changes nothing (rawExec), and most find none. */
+  private zeroPushUnread(userId: string): void {
+    const key = `user:${userId}`;
+    const row = this.rawRows<{ uploads_day: number }>(
+      "SELECT uploads_day FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1", PUSH_UNREAD_SCOPE, key,
+    )[0];
+    if (row && integerColumn(row.uploads_day) !== 0) {
+      this.rawExec("UPDATE principal_limits SET uploads_day = 0 WHERE scope = ? AND principal_key = ?", PUSH_UNREAD_SCOPE, key);
+    }
   }
 
   /**
@@ -5548,11 +5597,14 @@ export class Store {
    * primary-key read and one range of the user's room mutes, at most
    * MAX_ROOM_MUTES_PER_USER rows; a missing row or range costs nothing.
    * Their `seen` is not read here: every sign-in reads their identity row
-   * anyway (getIdentity), which carries it.
+   * anyway (getIdentity), which carries it. Signing in brings them back, so
+   * it also zeroes their `unread` (clearPushUnread), in the same
+   * reservation: one more primary-key probe, written only when it held a count.
    */
   statusInputs(userId: string, now = this.clock.now()): StatusInputRecord {
     this.ensureReady();
-    return this.reserved({ reads: 16 + 2 * MAX_ROOM_MUTES_PER_USER }, false, now, () => {
+    return this.reserved({ reads: 16 + 2 * MAX_ROOM_MUTES_PER_USER, writes: 8 }, false, now, () => {
+      if (this.config.push) this.zeroPushUnread(userId);
       const effective = this.effectiveNow(now);
       const row = this.userStatusRow(userId);
       const until = row?.mute_until_ms ?? 0;
