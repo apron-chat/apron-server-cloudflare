@@ -10,8 +10,10 @@ routes = [
 
 [observability]
 enabled = true
-# Every request writes a log event, billed past 20 million a month; keep one
-# in ten so a flood costs mostly its requests.
+# Every request writes a log event, billed by the GB from 2026-12-01 (by the
+# event before); keep one in ten so a flood costs mostly its requests. The
+# budget guard's log estimate assumes at most this rate (src/plans/paid.ts
+# logEstimate), and npm run budget:check refuses more.
 head_sampling_rate = 0.1
 
 # The deployed version, shown in the welcome each connection gets.

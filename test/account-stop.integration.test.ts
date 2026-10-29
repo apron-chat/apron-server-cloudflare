@@ -37,7 +37,7 @@ function stopSnapshot(now = Date.now()): AccountUsageSnapshot {
 		month: {
 			month: today.slice(0, 7),
 			workerRequests: 0, workerCpuMs: monthly.workerCpuMs, durableObjectRequests: 0, durableObjectDurationGbSeconds: 0,
-			sqlRowsRead: 0, sqlRowsWritten: 0, logEvents: 0,
+			sqlRowsRead: 0, sqlRowsWritten: 0, logBytes: 0,
 		},
 		stop: true,
 	};

@@ -5907,7 +5907,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 					`- Durable Object duration (GB-s): ${share(month.durableObjectDurationGbSeconds, monthly.durableObjectDurationGbSeconds)}`,
 					`- SQL rows read: ${share(month.sqlRowsRead, monthly.sqlRowsRead)}`,
 					`- SQL rows written: ${share(month.sqlRowsWritten, monthly.sqlRowsWritten)}`,
-					`- Log events: ${share(month.logEvents, monthly.logEvents)}`,
+					`- Log bytes (estimated): ${share(month.logBytes, monthly.logBytes)}`,
 				);
 				if (r2 && month.r2) {
 					lines.push(
