@@ -532,6 +532,8 @@ export interface StoreMutationInput {
   params: Record<string, unknown>;
   identity: Identity;
   digest?: string;
+  /** An operator alert the server posts itself (Store.alert): no posting limits apply. */
+  system?: boolean;
 }
 
 export interface StoreMutationResult {
@@ -778,6 +780,11 @@ const RETAINED_SCAN_CAP = 100_000;
 const META_ACCOUNTING_UNSAFE = "accounting_unsafe";
 /** The last `accountingRecovery` value that cleared the stop, so each clears it once. */
 const META_ACCOUNTING_RECOVERY = "accounting_recovery";
+/** The accounting marker's value after a storage failure (markAccountingUnsafe), cleared without an operator. */
+const ACCOUNTING_UNCERTAIN = "uncertain";
+/** `data.reason` of the internal errors closed accounting raises (assertAccounting), which the socket layer words for people. */
+export const ACCOUNTING_OVERRUN = "accounting_overrun";
+export const STORAGE_UNAVAILABLE = "storage_unavailable";
 const META_ACCOUNT_USAGE = "account_usage_snapshot";
 /** The highest guest number ever reserved (see reserveGuestNumbers); absent means none. */
 const META_GUEST_NUMBER_MARK = "guest_number_mark";
@@ -1699,8 +1706,34 @@ export class Store {
   private readonly limiters = new LimiterCache({ write: (row, now) => this.writeLimitRow(row, now, true) });
   /** The daily budget rows and today's cached copy (budget-ledger.ts), over this store's metered SQL. */
   private readonly ledger: BudgetLedger;
+  /**
+   * A reservation overran its estimate (assertReservation): the cost model
+   * is wrong, so nothing runs until an operator clears the persisted stop
+   * (recoverAccounting) or storage is reset.
+   */
   private accountingUnsafe = false;
-  private accountingUnsafePersisted = false;
+  /**
+   * A ledger read or write failed, as storage does in a platform outage, so
+   * the budget row may lag the cached copy. Work is refused only until a
+   * later flush writes what is staged (recoverUncertain); an eviction
+   * meanwhile is covered on the next wake (lostOnWake).
+   */
+  private accountingUncertain = false;
+  /**
+   * The marker said `uncertain` on this wake: the instance before this one
+   * left staged changes unwritten, which recoverUncertain charges for before
+   * it reopens.
+   */
+  private lostOnWake = false;
+  /** The accounting marker as last read or written (`0`, `1`, or `uncertain`), so it is written only when it changes. */
+  private accountingMarker = "0";
+  /** Set while an operator alert runs (alert): reservations are charged, never refused, even with accounting closed. */
+  private alerting = false;
+  /**
+   * Called once an overrun closes accounting, after the failing operation
+   * has unwound, so the operators hear of it (ApronDemoServer.notify).
+   */
+  onOverrun?: () => void;
   private deferredCleanupUntil = 0;
   private scheduledAlarmAt?: number;
   /** Bumped by every write to a table member listings read (MEMBER_TABLES). */
@@ -1745,7 +1778,7 @@ export class Store {
       advanceClock: (now) => { this.effectiveNow(now); },
       clock: () => this.lastEffectiveMs,
       inTransaction: () => this.inTransaction,
-      markUnsafe: () => this.markAccountingUnsafe(),
+      markUnsafe: () => this.markAccountingUnsafe("uncertain"),
     }, this.config);
   }
 
@@ -1776,9 +1809,13 @@ export class Store {
     if (version === SCHEMA_VERSION) {
       this.lastEffectiveMs = Math.max(this.lastEffectiveMs, this.storedEffectiveMs());
       const unsafeMarker = this.metaValue(META_ACCOUNTING_UNSAFE).trim().toLowerCase();
+      this.accountingMarker = unsafeMarker || "0";
       if ((unsafeMarker === "1" || unsafeMarker === "true") && !this.recoverAccounting()) {
         this.accountingUnsafe = true;
-        this.accountingUnsafePersisted = true;
+      } else if (unsafeMarker === ACCOUNTING_UNCERTAIN) {
+        // Charged and cleared by the first operation, not here: a wake writes nothing.
+        this.accountingUncertain = true;
+        this.lostOnWake = true;
       }
       // Schema/effective-clock handover reads are charged to the first
       // durable reservation after a wake. No schema rows are rewritten here.
@@ -2039,8 +2076,59 @@ export class Store {
       this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, '0'), (?, ?)", META_ACCOUNTING_UNSAFE, META_ACCOUNTING_RECOVERY, recovery);
       this.chargeUpgrade(start, day);
     });
+    this.accountingMarker = "0";
     console.warn(JSON.stringify({ event: "accounting_unsafe_cleared", recovery }));
     return true;
+  }
+
+  /**
+   * Clears accounting a storage failure left uncertain once what the ledger
+   * staged is written (budget-ledger.ts: flush), so the budget row and its
+   * copy agree again. After a wake that found the marker (lostOnWake), what
+   * the lost instance left unwritten cannot be known, so a hundredth of the
+   * day's SQL ceilings is charged to the maintenance reservation in its
+   * place, more than an ordinary operation reserves; the app's own ceilings
+   * sit inside the account's allowances, which the budget guard enforces
+   * from Cloudflare's own counts. True once clear; false while storage still
+   * fails.
+   */
+  private recoverUncertain(): boolean {
+    if (this.inTransaction) return false;
+    let charged: { reads: number; writes: number } | undefined;
+    if (this.lostOnWake) {
+      charged = { reads: Math.ceil(this.config.sqlReadsPerDay / 100), writes: Math.ceil(this.config.sqlWritesPerDay / 100) };
+      const day = dayFor(Math.max(this.lastEffectiveMs, this.clock.now()));
+      const start = { reads: this.observed.reads, writes: this.observed.writes };
+      try {
+        this.ledger.addUnchecked(day, maintenanceDelta(charged));
+        // And the rows that charge took, as an in-place upgrade's are.
+        this.chargeUpgrade(start, day);
+      } catch {
+        return false;
+      }
+      this.lostOnWake = false;
+    }
+    this.ledger.flush();
+    if (this.ledger.hasStaged()) return false;
+    this.accountingUncertain = false;
+    this.persistAccountingMarker();
+    console.warn(JSON.stringify({ event: "accounting_uncertain_recovered", ...(charged ? { charged } : {}) }));
+    return true;
+  }
+
+  /**
+   * Throws while accounting is closed: for good after an overrun, and after
+   * a storage failure until recoverUncertain succeeds. An operator alert
+   * (alert) runs regardless.
+   */
+  private assertAccounting(): void {
+    if (this.alerting) return;
+    if (this.accountingUnsafe) {
+      throw new StoreError("internal_error", "storage accounting is unsafe; admission is closed", { data: { reason: ACCOUNTING_OVERRUN } });
+    }
+    if (this.accountingUncertain && !this.recoverUncertain()) {
+      throw new StoreError("internal_error", "storage is unavailable", { data: { reason: STORAGE_UNAVAILABLE } });
+    }
   }
 
   /**
@@ -2114,7 +2202,9 @@ export class Store {
     this.initialized = false;
     this.logCache = null;
     this.accountingUnsafe = false;
-    this.accountingUnsafePersisted = false;
+    this.accountingUncertain = false;
+    this.lostOnWake = false;
+    this.accountingMarker = "0";
     this.lastEffectiveMs = 0;
     this.limiters.clear();
     this.scheduledAlarmAt = undefined;
@@ -2304,11 +2394,11 @@ export class Store {
       try {
         const result = this.transactionSync(fn);
         this.inTransaction = false;
-        this.persistAccountingUnsafeMarker();
+        this.persistAccountingMarker();
         return result;
       } catch (error) {
         this.inTransaction = false;
-        this.persistAccountingUnsafeMarker();
+        this.persistAccountingMarker();
         throw error;
       }
     }
@@ -2320,41 +2410,52 @@ export class Store {
     try {
       const result = fn();
       this.inTransaction = false;
-      this.persistAccountingUnsafeMarker();
+      this.persistAccountingMarker();
       return result;
     } catch (error) {
       this.inTransaction = false;
-      this.persistAccountingUnsafeMarker();
+      this.persistAccountingMarker();
       throw error;
     }
   }
 
   /**
-   * An overrun is an authority failure, rather than an operation-local error.
-   * Keep the latch in memory immediately and persist it after any enclosing
-   * native transaction has rolled back.  The write is deliberately outside
-   * the failed transaction so a rollback cannot erase the only durable stop.
+   * Writes the accounting marker when it changed: `1` after an overrun,
+   * `uncertain` after a storage failure, `0` once clear. It is written after
+   * any enclosing native transaction has rolled back, so a rollback cannot
+   * erase the only durable stop.
    */
-  private persistAccountingUnsafeMarker(): void {
-    if (!this.accountingUnsafe || this.accountingUnsafePersisted || this.inTransaction) return;
+  private persistAccountingMarker(): void {
+    if (this.inTransaction) return;
+    const value = this.accountingUnsafe ? "1" : this.accountingUncertain ? ACCOUNTING_UNCERTAIN : "0";
+    if (value === this.accountingMarker) return;
     try {
-      this.rawExec(
-        "INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
-        META_ACCOUNTING_UNSAFE,
-        "1",
-      );
-      this.accountingUnsafePersisted = true;
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ACCOUNTING_UNSAFE, value);
+      this.accountingMarker = value;
     } catch {
       // The in-memory latch remains closed. A native storage failure may also
       // prevent the marker write; callers still fail closed for this object,
-      // and the runtime will force a fresh recovery attempt rather than reuse
-      // uncertain accounting.
+      // and the next transaction tries the write again.
     }
   }
 
-  private markAccountingUnsafe(): void {
+  /**
+   * Closes accounting: for good on an `overrun` (an authority failure, not
+   * an operation-local error), until storage works again on `uncertain`.
+   * The first overrun tells the operators (onOverrun), once the failing
+   * operation has unwound.
+   */
+  private markAccountingUnsafe(kind: "overrun" | "uncertain"): void {
+    if (kind === "uncertain") {
+      this.accountingUncertain = true;
+      this.persistAccountingMarker();
+      return;
+    }
+    const first = !this.accountingUnsafe;
     this.accountingUnsafe = true;
-    this.persistAccountingUnsafeMarker();
+    this.persistAccountingMarker();
+    const notify = this.onOverrun;
+    if (first && notify) queueMicrotask(() => { try { notify(); } catch { /* a notice never breaks the stop */ } });
   }
 
   /**
@@ -2383,10 +2484,13 @@ export class Store {
     return Math.max(Number.isSafeInteger(meta) && meta >= 0 ? meta : 0, budget);
   }
 
-  /** Advisory capacity check: no SQL, reservations, or durable clock updates. */
+  /**
+   * Advisory capacity check: no SQL, reservations, or durable clock updates,
+   * but the ledger's write when recovering from a storage failure.
+   */
   checkConnectionBudget(now = this.clock.now()): void {
     this.ensureReady();
-    if (this.accountingUnsafe) throw new StoreError("internal_error", "storage accounting is unsafe; admission is closed");
+    this.assertAccounting();
     if (!this.config.admissionEnabled) throw new StoreError("denied", "Demo admission is closed");
     this.ledger.checkConnection(Math.max(Math.trunc(now), this.lastEffectiveMs));
   }
@@ -2398,10 +2502,8 @@ export class Store {
    */
   private reserveCost(costInput: CostEstimate, maintenance = false, now = this.clock.now(), unchecked = false): BudgetCost {
     this.ensureReady();
-    if (this.accountingUnsafe) {
-      throw new StoreError("internal_error", "storage accounting is unsafe; admission is closed");
-    }
-    const cost = this.ledger.reserve(costInput, Math.max(Math.trunc(now), this.lastEffectiveMs), now, maintenance, unchecked);
+    this.assertAccounting();
+    const cost = this.ledger.reserve(costInput, Math.max(Math.trunc(now), this.lastEffectiveMs), now, maintenance, unchecked || this.alerting);
     this.countReservation(cost);
     return cost;
   }
@@ -2409,7 +2511,7 @@ export class Store {
   /** Spend the maintenance control gap when ordinary work is exhausted. */
   private reserveMaintenanceControl(costInput: CostEstimate, now: number): BudgetCost {
     this.ensureReady();
-    if (this.accountingUnsafe) throw new StoreError("internal_error", "storage accounting is unsafe; admission is closed");
+    this.assertAccounting();
     const cost = this.ledger.reserveControl(costInput, Math.max(Math.trunc(now), this.lastEffectiveMs));
     this.countReservation(cost);
     return cost;
@@ -2419,6 +2521,36 @@ export class Store {
     this.observed.operations += 1;
     this.observed.reservedReads += cost.reads;
     this.observed.reservedWrites += cost.writes;
+  }
+
+  /**
+   * Runs an operator alert's storage work (ApronDemoServer.notifyAdmins):
+   * its reservations are charged but never refused, by an exhausted budget or
+   * by closed accounting, so the operators still hear of the stop that closed
+   * it. Mutations it makes should pass `system`.
+   */
+  alert<T>(fn: () => T): T {
+    const was = this.alerting;
+    this.alerting = true;
+    try {
+      return fn();
+    } finally {
+      this.alerting = was;
+    }
+  }
+
+  /**
+   * Registered users with `role`, by `user_id`, at most `limit`: one scan
+   * of the identities, for an operator alert. Bots and the admin user are
+   * identities too, so the reservation allows twice the registration cap.
+   */
+  usersWithRole(role: string, limit: number, now = this.clock.now()): string[] {
+    return this.reserved({ reads: 2 * this.config.registeredIdentityCount + 64 }, false, now, () =>
+      this.rawRows<{ user_id: string; roles_json: string }>("SELECT user_id, roles_json FROM identities WHERE roles_json LIKE ?", `%${JSON.stringify(role)}%`)
+        .filter((row) => parseRoles(row.roles_json).includes(role))
+        .map((row) => row.user_id)
+        .sort()
+        .slice(0, limit));
   }
 
   /** Explicit boundary for runtime operations that do their own SQL. */
@@ -2461,7 +2593,7 @@ export class Store {
       // Set the latch before throwing. If this assertion is inside a native
       // transaction, transaction() persists it after rollback; outside a
       // transaction it is durable immediately.
-      this.markAccountingUnsafe();
+      this.markAccountingUnsafe("overrun");
       throw new StoreError("internal_error", "storage cost exceeded its reservation", {
         data: {
           reserved_reads: reserved.reads,
@@ -2496,8 +2628,8 @@ export class Store {
     }
   }
 
-  accountingStatus(): { unsafe: boolean; database_bytes: number | null } {
-    return { unsafe: this.accountingUnsafe, database_bytes: this.databaseSize() };
+  accountingStatus(): { unsafe: boolean; uncertain: boolean; database_bytes: number | null } {
+    return { unsafe: this.accountingUnsafe, uncertain: this.accountingUncertain, database_bytes: this.databaseSize() };
   }
 
   accountUsageSnapshot(): AccountUsageSnapshot | null {
@@ -6001,7 +6133,7 @@ export class Store {
           return value;
         };
         const tier: Tier = this.identityRow(input.userId) ? "registered" : "anonymous";
-        this.chargePosting({ userId: input.userId, tier, ipKey: input.ipKey, now: effective, uncategorized: method === "me" });
+        if (!input.system) this.chargePosting({ userId: input.userId, tier, ipKey: input.ipKey, now: effective, uncategorized: method === "me" });
         let committed: StoreMutationResult;
         if (method === "me") {
           committed = this.commitMeMutation(input, effective);
@@ -6014,7 +6146,7 @@ export class Store {
             : method === "room_set" ? this.commitRoom(input, context, floor, tier === "registered")
             : this.commitReactions(input, context, floor);
           // Within the transaction: a move its sender cannot pay for is refused whole.
-          if (context.extraPosts) this.chargePosting({ userId: input.userId, tier, ipKey: input.ipKey, now: effective, weight: context.extraPosts });
+          if (context.extraPosts && !input.system) this.chargePosting({ userId: input.userId, tier, ipKey: input.ipKey, now: effective, weight: context.extraPosts });
           this.finishCommit(context, startLogId);
         }
         this.commitStoredResult(input.userId, input.requestId, digest, committed.result, effective + this.config.dedupTtlMs);

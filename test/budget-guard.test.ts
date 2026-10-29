@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createExecutionContext, createScheduledController, env as testEnv, waitOnExecutionContext } from "cloudflare:test";
 import worker from "../src/index";
 import * as guard from "../src/budget-guard";
+import * as notifier from "../src/notify";
 import { ACCOUNT_USAGE_POLICY as POLICY, PLAN } from "../src/budget";
 import { EDGE_STOP_RULE_REF, readEdgeStop, resetFloodWatch, runBudgetGuard, watchForFlood } from "../src/budget-guard";
 
@@ -113,6 +114,27 @@ describe("budget guard", () => {
 			await expect(run.mock.results[0].value).resolves.toEqual({ outcome: "unconfigured" });
 		} finally { run.mockRestore(); }
 	});
+
+	it("tells the operators when its run turns the stop on, and only then", async () => {
+		const notify = vi.spyOn(notifier, "notifyTrigger").mockResolvedValue(undefined);
+		const run = vi.spyOn(guard, "runBudgetGuard");
+		try {
+			const cases: Array<[Awaited<ReturnType<typeof runBudgetGuard>>, boolean]> = [
+				[{ outcome: "changed", stop: true, exceeded: ["monthly.workerRequests"] }, true],
+				[{ outcome: "changed", stop: false, exceeded: [] }, false],
+				[{ outcome: "unchanged", stop: true, exceeded: ["monthly.workerRequests"] }, false],
+			];
+			for (const [result, told] of cases) {
+				notify.mockClear();
+				run.mockResolvedValueOnce(result);
+				const ctx = createExecutionContext();
+				worker.scheduled(createScheduledController({ cron: "* * * * *", scheduledTime: 2_000 }), testEnv, ctx);
+				await waitOnExecutionContext(ctx);
+				if (told) expect(notify).toHaveBeenCalledWith({ kind: "edge_stop", exceeded: ["monthly.workerRequests"] }, expect.objectContaining({ admins: expect.any(Function) }));
+				else expect(notify).not.toHaveBeenCalled();
+			}
+		} finally { run.mockRestore(); notify.mockRestore(); }
+	});
 });
 
 describe("edge stop reading", () => {
@@ -141,12 +163,12 @@ describe.runIf(PLAN.edgeStop)("flood trip", () => {
 	const policy = PLAN.edgeStop!;
 
 	/** Runs watchForFlood once and waits for its work after the response. */
-	async function watch(opts: { random: number; success?: boolean; now?: number; fetcher?: typeof fetch; limiter?: RateLimit | undefined }) {
+	async function watch(opts: { random: number; success?: boolean; now?: number; fetcher?: typeof fetch; limiter?: RateLimit | undefined; onStop?: () => Promise<void> }) {
 		const limit = vi.fn(async () => ({ success: opts.success ?? true }));
 		const pending: Promise<unknown>[] = [];
 		const { fetcher } = opts.fetcher ? { fetcher: opts.fetcher } : api();
 		const floodEnv = { ...env, FLOOD_WATCH: "limiter" in opts ? opts.limiter : { limit } as unknown as RateLimit };
-		watchForFlood(floodEnv, { waitUntil: (promise) => { pending.push(promise); } }, opts.now ?? Date.now(), () => opts.random, fetcher);
+		watchForFlood(floodEnv, { waitUntil: (promise) => { pending.push(promise); } }, opts.now ?? Date.now(), () => opts.random, fetcher, opts.onStop);
 		await Promise.all(pending);
 		return { limit, pending };
 	}
@@ -172,6 +194,21 @@ describe.runIf(PLAN.edgeStop)("flood trip", () => {
 		const later = api();
 		await watch({ random: 0, success: false, now: now + 60_000, fetcher: later.fetcher });
 		expect(later.updates).toHaveLength(1);
+	});
+
+	it("tells the operators once it has turned the stop on, and a failing notice changes nothing", async () => {
+		resetFloodWatch();
+		const now = Date.parse("2026-09-27T13:00:00Z");
+		const onStop = vi.fn(async () => { throw new Error("notice failed"); });
+		const tripped = api();
+		await watch({ random: 0, success: false, now, fetcher: tripped.fetcher, onStop });
+		expect(tripped.updates).toEqual([expect.objectContaining({ enabled: true })]);
+		expect(onStop).toHaveBeenCalledTimes(1);
+		// Already on: nothing changed, so nothing is told.
+		const already = api({ enabled: true });
+		await watch({ random: 0, success: false, now: now + 60_000, fetcher: already.fetcher, onStop });
+		expect(already.updates).toEqual([]);
+		expect(onStop).toHaveBeenCalledTimes(1);
 	});
 
 	it("does nothing under the limit or without its binding", async () => {

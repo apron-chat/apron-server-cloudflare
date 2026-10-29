@@ -152,9 +152,10 @@ let floodTrippedAt = -Infinity;
  * counted against a per-location limit after the response; past it, the
  * edge stop is turned on at once instead of waiting minutes for analytics.
  * Counting writes nothing; tripping is the only write, and each isolate
- * tries at most once a minute.
+ * tries at most once a minute. `onStop` runs once the trip has turned the
+ * stop on, after it; whatever it throws is ignored.
  */
-export function watchForFlood(env: BudgetGuardEnvironment, ctx: Pick<ExecutionContext, "waitUntil"> | undefined, now = Date.now(), random = Math.random, fetcher: typeof fetch = fetch): void {
+export function watchForFlood(env: BudgetGuardEnvironment, ctx: Pick<ExecutionContext, "waitUntil"> | undefined, now = Date.now(), random = Math.random, fetcher: typeof fetch = fetch, onStop?: () => Promise<void>): void {
 	const policy = PLAN.edgeStop;
 	const { FLOOD_WATCH, ZONE_ID, EDGE_STOP_TOKEN } = env;
 	if (!policy || !ctx || !FLOOD_WATCH || !ZONE_ID || !EDGE_STOP_TOKEN) return;
@@ -167,7 +168,8 @@ export function watchForFlood(env: BudgetGuardEnvironment, ctx: Pick<ExecutionCo
 		}
 		if (now - floodTrippedAt < FLOOD_RETRY_MS) return;
 		floodTrippedAt = now;
-		await setEdgeStop({ ...env, ZONE_ID, EDGE_STOP_TOKEN }, true, ["flood"], now, fetcher);
+		if (await setEdgeStop({ ...env, ZONE_ID, EDGE_STOP_TOKEN }, true, ["flood"], now, fetcher) !== "changed") return;
+		try { await onStop?.(); } catch { /* a notice never breaks the stop */ }
 	})());
 }
 
