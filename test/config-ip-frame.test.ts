@@ -275,6 +275,12 @@ describe('configuration policy boundaries', () => {
 		expect(isAllowedOrigin(restricted, 'null')).toBe(false);
 	});
 
+	it('requires the timeout for connections that never pinged to outlast the ping timeout', () => {
+		expect(config().limits.unpingedTimeoutSeconds).toBe(900);
+		expect(config({ LIMIT_UNPINGED_TIMEOUT_SECONDS: '150' }).limits.unpingedTimeoutSeconds).toBe(150);
+		expect(() => config({ LIMIT_UNPINGED_TIMEOUT_SECONDS: '149' })).toThrow(ConfigError);
+	});
+
 	it('reads ACCOUNTING_RECOVERY as an optional short value', () => {
 		expect(config().accountingRecovery).toBeUndefined();
 		expect(config({ ACCOUNTING_RECOVERY: '' }).accountingRecovery).toBeUndefined();
