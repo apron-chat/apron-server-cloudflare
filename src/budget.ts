@@ -116,7 +116,8 @@ export interface Limits {
 	/**
 	 * A connection that has never pinged is stale once this long passes with
 	 * no frame since it opened: a peer that vanished without a close frame is
-	 * otherwise never found. It is told why before it is closed.
+	 * otherwise never found. It is told why before it is closed, so a client
+	 * that has not implemented the ping learns it should.
 	 */
 	unpingedTimeoutSeconds: number;
 	/**

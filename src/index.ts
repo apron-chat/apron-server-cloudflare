@@ -6011,11 +6011,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Closes stale connections, each told why first in a `~private` notice
-	 * to it alone. Nothing schedules this: it runs where a stale peer would
-	 * be seen, before `members` are listed and before admission. `live`, a
-	 * socket whose frame is being handled, has just been heard from though
-	 * its frame time is not recorded yet, so it is never closed.
+	 * Closes stale connections. One that never pinged is told why first, in
+	 * a `~private` notice to it alone, so a client that has not implemented
+	 * the ping learns it should; one that pings already knows. Nothing
+	 * schedules this: it runs where a stale peer would be seen, before
+	 * `members` are listed and before admission. `live`, a socket whose frame
+	 * is being handled, has just been heard from though its frame time is not
+	 * recorded yet, so it is never closed.
 	 */
 	private closeStale(now: number, live?: WebSocket): void {
 		const sockets = this.ctx.getWebSockets();
@@ -6032,7 +6034,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!attachment || attachment.closing) continue;
 			const after = this.staleAfter(socket, now);
 			if (after === undefined) continue;
-			this.send(socket, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text: `Did not receive \`{"method":"ping"}\` in ${spokenSeconds(after)}, closing stale connection.`, format: "markdown" } } });
+			if (neverPinged) this.send(socket, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text: `Did not receive \`{"method":"ping"}\` in ${spokenSeconds(after)}, closing stale connection.`, format: "markdown" } } });
 			attachment.closing = true;
 			writeAttachment(socket, attachment);
 			try { socket.close(1001, "Connection idle; reconnect to recover"); } catch { /* already closed */ }

@@ -902,6 +902,10 @@ it('drops a connection that pinged and went quiet from room_list members and clo
 		expect(listed).toContain(carolId.user_id);
 		expect(listed).not.toContain(bobId.user_id);
 		expect(await closed).toBe(1001);
+		// Bob pings, so he already knows about it: no notice before the close.
+		const received = [];
+		for (let frame = await Promise.race([bob.next(), null]); frame; frame = await Promise.race([bob.next(), null])) received.push(frame);
+		expect(received.filter((frame) => frame.params?.from?.user_id === '~private')).toEqual([]);
 	} finally { vi.restoreAllMocks(); alice.close(); bob.close(); carol.close(); await configure((config) => { config.limits.pingTimeoutSeconds = 150; }); }
 });
 
