@@ -275,6 +275,14 @@ describe('configuration policy boundaries', () => {
 		expect(isAllowedOrigin(restricted, 'null')).toBe(false);
 	});
 
+	it('reads ACCOUNTING_RECOVERY as an optional short value', () => {
+		expect(config().accountingRecovery).toBeUndefined();
+		expect(config({ ACCOUNTING_RECOVERY: '' }).accountingRecovery).toBeUndefined();
+		expect(config({ ACCOUNTING_RECOVERY: '2026-10-29' }).accountingRecovery).toBe('2026-10-29');
+		expect(() => config({ ACCOUNTING_RECOVERY: 'has space' })).toThrow(ConfigError);
+		expect(() => config({ ACCOUNTING_RECOVERY: 'x'.repeat(65) })).toThrow(ConfigError);
+	});
+
 	it('requires exact origins and bounds the browser display name', () => {
 		expect(() => loadConfig({})).toThrow(ConfigError);
 		expect(config({ ENVIRONMENT: 'development' }).allowedOrigins).toEqual([

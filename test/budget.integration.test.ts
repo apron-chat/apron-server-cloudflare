@@ -78,6 +78,52 @@ it('persists an overrun stop across object eviction', async () => {
 	});
 });
 
+it('clears a persisted accounting stop once per recovery value', async () => {
+	const stub = env.DEMO.getByName('budget-recovery');
+	const now = Date.now() + 3_000;
+	const marker = (state: DurableObjectState) => state.storage.sql.exec<{ value: string }>(
+		"SELECT value FROM _meta WHERE key = 'accounting_unsafe' LIMIT 1",
+	).one().value;
+	await runInDurableObject(stub, (_instance, state) => {
+		const store = new Store(state, {}, { now: () => now });
+		store.initialize();
+		state.storage.sql.exec("UPDATE _meta SET value = '1' WHERE key = 'accounting_unsafe'");
+	});
+
+	await evictDurableObject(stub);
+	await runInDurableObject(stub, (_instance, state) => {
+		// Without a recovery value the stop stays.
+		const latched = new Store(state, {}, { now: () => now });
+		latched.initialize();
+		expect(latched.accountingStatus().unsafe).toBe(true);
+
+		const before = state.storage.sql.exec<{ maintenance_writes: number }>(
+			'SELECT maintenance_writes FROM resource_budgets ORDER BY day DESC LIMIT 1',
+		).one().maintenance_writes;
+		const recovered = new Store(state, { accountingRecovery: 'first' }, { now: () => now });
+		recovered.initialize();
+		expect(recovered.accountingStatus().unsafe).toBe(false);
+		expect(marker(state)).toBe('0');
+		expect(() => recovered.getRoomState()).not.toThrow();
+		const after = state.storage.sql.exec<{ maintenance_writes: number }>(
+			'SELECT maintenance_writes FROM resource_budgets ORDER BY day DESC LIMIT 1',
+		).one().maintenance_writes;
+		expect(after).toBeGreaterThan(before);
+
+		// A stop latched later is not cleared by the value already used.
+		state.storage.sql.exec("UPDATE _meta SET value = '1' WHERE key = 'accounting_unsafe'");
+		const again = new Store(state, { accountingRecovery: 'first' }, { now: () => now });
+		again.initialize();
+		expect(again.accountingStatus().unsafe).toBe(true);
+		expect(() => again.getRoomState()).toThrow('storage accounting is unsafe');
+
+		const next = new Store(state, { accountingRecovery: 'second' }, { now: () => now });
+		next.initialize();
+		expect(next.accountingStatus().unsafe).toBe(false);
+		expect(marker(state)).toBe('0');
+	});
+});
+
 it('writes an async operation\'s reservation before it awaits, and status writes the budget row once', async () => {
 	await runInDurableObject(env.DEMO.getByName('budget-async-and-status'), async (_instance, state) => {
 		const now = Date.now() + 1_000;

@@ -565,6 +565,7 @@ and recalibrating its resource model.
 | `PUSH_HOSTS` | Comma-separated push service hosts registrations may name, `*.host` for a host's subdomains, or a standalone `*` for any public host; unset, the browsers' own services (see [Push](#push)) |
 | `PUSH_DELAY_SECONDS` | Whole seconds, 0 to 60, a message's wake waits before it pushes; unset, the plan's `push.delaySeconds`; `0` pushes at once |
 | `ADMISSION_OFF` | Operator admission switch; `true` rejects new sockets in the entry Worker before the limiter or DO call; existing sockets remain subject to DO budgets |
+| `ACCOUNTING_RECOVERY` | Operator recovery from a persisted accounting stop (every connection refused with `Demo temporarily unavailable` after a storage failure or a reservation overrun): 1 to 64 letters, digits, `.`, `_`, `:` or `-`. The Durable Object clears the stop when it next starts, once per value, and logs `accounting_unsafe_cleared`; a stop latched later needs a new value. Deploy with it once, e.g. `npm run deploy -- --var ACCOUNTING_RECOVERY:2026-10-29`; what the failure left unwritten is not charged |
 | `ENVIRONMENT` | Set to `development` to enable local origin defaults when `ALLOWED_ORIGINS` and `RP_ORIGINS` are omitted |
 | `NODE_ENV` | Set to `test` to enable the same local origin defaults for tests; production-like deployments must configure origins explicitly |
 
