@@ -449,8 +449,8 @@ Mute and User status). The plan's `features.presence` turns it on, and
 
 Without push there is no `status` capability, so presence is off whatever
 it says. An admin's `/toggle presence` turns it off and on again without a
-deploy. A status or mute change writes about 3 or 4 rows, and the two share
-`mutesPerUserMinute`.
+deploy. A status or mute change writes about 2 rows (3 for `invisible`),
+and the two share `mutesPerUserMinute`.
 
 Two limits shape how fast changes are announced, both in seconds and at most
 60 (`MAX_STATUS_DELAY_SECONDS`), so what others see is never more than about
