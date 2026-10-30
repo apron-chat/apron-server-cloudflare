@@ -204,12 +204,16 @@ export class LiveReaders {
 	}
 }
 
-/** The headers of a live text's `url` (§4.8.3), readable from any origin. */
+/**
+ * The headers of a live text's `url` (§4.8.3), readable from any origin.
+ * `no-transform` keeps the edge (and wrangler dev) from compressing it:
+ * compression buffers the stream, so readers would see nothing until the end.
+ */
 export function liveTextHeaders(): Headers {
 	return new Headers({
 		"Content-Type": "text/plain; charset=utf-8",
 		"X-Content-Type-Options": "nosniff",
-		"Cache-Control": "no-store",
+		"Cache-Control": "no-store, no-transform",
 		"Access-Control-Allow-Origin": "*",
 		"Content-Security-Policy": "default-src 'none'",
 	});

@@ -140,6 +140,8 @@ describe('live text end to end', () => {
 			expect(reader.response.status).toBe(200);
 			expect(reader.response.headers.get('Content-Type')).toBe('text/plain; charset=utf-8');
 			expect(reader.response.headers.get('X-Content-Type-Options')).toBe('nosniff');
+			// No compression: it would buffer the stream until the end.
+			expect(reader.response.headers.get('Cache-Control')).toContain('no-transform');
 			expect(reader.response.headers.get('Access-Control-Allow-Origin')).toBe('*');
 			// The kept text first, then each chunk as it arrives.
 			await reader.waitFor('ok\x1b[0m 1\r\n');
