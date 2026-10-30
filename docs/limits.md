@@ -119,7 +119,7 @@ minutes after a few unclean reconnects.
 | `unsupported` "Passkeys are not offered to this origin"; `denied` "Frontend origin is not configured for passkeys" (a passkey session `token`) | Passkeys and passkey session resume work only from the configured origin (`https://web.apron.chat` on the demo) | A third-party client on another origin, or a native client. Use a guest, a bot token (`/invite-bot`) or a device token (`/invite-device`), which work from any origin or none. |
 | `denied` "Session expired; sign in with your passkey" | A passkey session lasts 30 days, renewed on a resume once half has passed; it resumes only from the origin it was made on | A stale stored token, or a token from another origin. |
 | `denied` "Identity switching requires reconnect" | One identity per connection once signed in | Calling `auth` again on a signed-in socket. Open a new connection instead. |
-| `denied` "An account holds at most 8 passkeys" | 8 passkeys; 3 device tokens per account | Registering a new passkey on every sign-in. |
+| `denied` "An account holds at most 8 passkeys" | 8 passkeys; 5 device tokens per account | Registering a new passkey on every sign-in. |
 
 Guests get a new `guest_<n>` identity on every connection, and on the demo
 they can only read: writes are `denied` ("Guests can only read here; sign in

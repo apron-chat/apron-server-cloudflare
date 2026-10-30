@@ -139,7 +139,7 @@ interface ConnectionAttachment {
 	origin?: string;
 	/** The WebSocket URL this connection reached, for instructions that name the server (`/invite-bot`). */
 	endpoint?: string;
-	/** The device name of the `/invite-device` token this connection signed in with, so a new token for it closes the connection. */
+	/** The device id of the `/invite-device` token this connection signed in with, so a new token for it closes the connection. */
 	device?: string;
 	challenge?: ChallengeRecord;
 	/** When the connection was accepted, which a connection that never pings is judged stale from (staleAfter). */
@@ -435,8 +435,8 @@ const MAX_JOIN_USES = 50;
 /** The name of a user who signs up with an invite and asks for none: not "Guest", which names guests. */
 const JOIN_DEFAULT_NAME = "Member";
 const JOIN_INVITE_TTL_MS = 7 * 86_400_000;
-/** Device tokens one user may hold at once, each under its own name. */
-const MAX_DEVICE_TOKENS = 3;
+/** Device tokens one user may hold at once, each under its own id. */
+const MAX_DEVICE_TOKENS = 5;
 /**
  * The default room's `description` as the server's (§3.1), where neither
  * `/server description` nor `SERVER_DESCRIPTION` sets one: trimmed, and left
@@ -453,24 +453,25 @@ function roomServerDescription(description: string | undefined): string | undefi
  * who may run them: `everyone`, `owners` (registered users other than bots),
  * or `admins` (the `APRON_ADMIN_TOKEN` user and those given the `admin` role).
  * An `owners` command with `roles` is for owners who hold one of them.
+ * Kept in alphabetical order, the order `/help` lists them in.
  */
 const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audience: "everyone" | "owners" | "admins"; roles?: readonly string[] }> = [
+	{ name: "admin", usage: "/admin [remove] <user_id>", help: "make a registered user an admin, or no longer one", audience: "admins" },
+	{ name: "avatar", usage: "/avatar", help: "set your avatar: send this command with one image attached", audience: "owners" },
+	{ name: "emoji", usage: "/emoji add|remove :name:", help: "add a custom emoji, or replace its image: send /emoji add :name: with one image attached; /emoji remove :name: removes it", audience: "owners", roles: EMOJI_ROLES },
 	{ name: "help", usage: "/help", help: "list the commands you can use here", audience: "everyone" },
 	{ name: "invite-bot", usage: "/invite-bot", help: "get a sign-in token for your bot; a new one replaces the last", audience: "owners" },
-	{ name: "invite-device", usage: "/invite-device <name>", help: `get a token that signs in as you on another device, named <name>; at most ${MAX_DEVICE_TOKENS} names, and a name again replaces its token`, audience: "owners" },
-	{ name: "avatar", usage: "/avatar", help: "set your avatar: send this command with one image attached", audience: "owners" },
-	{ name: "passkeys", usage: "/passkeys [remove <n>]", help: "list your account's passkeys, or remove one of them", audience: "owners" },
-	{ name: "admin", usage: "/admin [remove] <user_id>", help: "make a registered user an admin, or no longer one", audience: "admins" },
-	{ name: "role", usage: "/role <user_id> [<role>]", help: "show a user's roles, or give or take away one (admin, mod, threader and bot act as such; friend, like any role, raises their posting limits, and admin, mod and friend may use /emoji)", audience: "admins" },
-	{ name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", audience: "admins" },
-	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
-	{ name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", audience: "admins" },
 	{ name: "invite-code", usage: "/invite-code <uses>", help: `get a token that signs up to <uses> new users (at most ${MAX_JOIN_USES}) for a week, replacing the last one; /invite-code 0 revokes it`, audience: "admins" },
-	{ name: "emoji", usage: "/emoji add|remove :name:", help: "add a custom emoji, or replace its image: send /emoji add :name: with one image attached; /emoji remove :name: removes it", audience: "owners", roles: EMOJI_ROLES },
-	{ name: "server", usage: "/server [title|description [<text>] | avatar]", help: "show this server's title, description and avatar; set one, the avatar with one image attached; or clear one, back to the deployment's", audience: "admins" },
-	{ name: "toggle", usage: "/toggle <activity|uploads|presence|addmember>", help: "turn typing activity, uploads, user status (presence), or users adding others to rooms (addmember) off or on for everyone", audience: "admins" },
+	{ name: "invite-device", usage: "/invite-device add|remove [<id>]", help: "get a token that signs in as you on another device, or revoke one", audience: "owners" },
+	{ name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", audience: "admins" },
+	{ name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", audience: "admins" },
+	{ name: "passkeys", usage: "/passkeys [remove <n>]", help: "list your account's passkeys, or remove one of them", audience: "owners" },
 	{ name: "purge", usage: "/purge <user_id>", help: "disconnect a user and delete their account, bot, and everything they posted or uploaded", audience: "admins" },
+	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
+	{ name: "role", usage: "/role <user_id> [<role>]", help: "show a user's roles, or give or take away one (admin, mod, threader and bot act as such; friend, like any role, raises their posting limits, and admin, mod and friend may use /emoji)", audience: "admins" },
+	{ name: "server", usage: "/server [title|description [<text>] | avatar]", help: "show this server's title, description and avatar; set one, the avatar with one image attached; or clear one, back to the deployment's", audience: "admins" },
 	{ name: "status", usage: "/status", help: "show today's Cloudflare usage and the demo's budgets", audience: "admins" },
+	{ name: "toggle", usage: "/toggle <activity|uploads|presence|addmember>", help: "turn typing activity, uploads, user status (presence), or users adding others to rooms (addmember) off or on for everyone", audience: "admins" },
 ];
 /** Why a guest's post, reaction, join, leave, or room change is denied while guests only read. */
 const GUEST_READ_ONLY = "Guests can only read here; sign in with a passkey to post or join rooms";
@@ -508,8 +509,8 @@ const INVITE_KEY_PREFIX = "invite:";
 const DEVICE_TOKEN_PREFIX = "apron_device_";
 const DEVICE_TOKEN_KEY_PREFIX = "device-token:";
 const DEVICES_KEY_PREFIX = "devices:";
-/** A device name: 1 to 32 letters, digits, `_`, `.` or `-`, starting with a letter or digit. */
-const DEVICE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$/;
+/** A device id: 1 to 32 letters, digits, `_`, `.` or `-`, starting with a letter or digit. */
+const DEVICE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$/;
 /** The protocol a bot's instructions point it at (`/invite-bot`). */
 const PROTOCOL_URL = "https://github.com/shazow/apron/blob/main/PROTOCOL.md";
 
@@ -556,7 +557,7 @@ interface StoredInviteToken {
 /**
  * A device token (`/invite-device`), stored only as its SHA-256 under
  * DEVICE_TOKEN_KEY_PREFIX: the registered user it signs in as, and the
- * device name it was minted under.
+ * device id it was minted under.
  */
 interface StoredDeviceToken {
 	v: 1;
@@ -565,9 +566,10 @@ interface StoredDeviceToken {
 }
 
 /**
- * A user's device tokens, under DEVICES_KEY_PREFIX: each device name with
- * its token's key, oldest first, so a name again can revoke its token. A
- * list, not an object keyed by name, so no name can be `__proto__`.
+ * A user's device tokens, under DEVICES_KEY_PREFIX: each device id (as
+ * `name`, its stored field) with its token's key, oldest first, so an id
+ * again can revoke its token. A list, not an object keyed by id, so no id
+ * can be `__proto__`.
  */
 interface StoredDevices {
 	v: 1;
@@ -618,6 +620,13 @@ async function sameToken(presented: string, configured: string): Promise<boolean
 
 async function sessionKey(token: string): Promise<string> {
 	return SESSION_KEY_PREFIX + await sha256Hex(token);
+}
+
+/** Throws `invalid_params` for a device id that is given but not DEVICE_ID_PATTERN. */
+function checkDeviceId(id: string | undefined): void {
+	if (id !== undefined && !DEVICE_ID_PATTERN.test(id)) {
+		throw { name: "invalid_params", message: "A device id is 1 to 32 letters, digits, _, . or -, starting with a letter or digit" } satisfies ProtocolError;
+	}
 }
 
 /** A user's device tokens as stored (StoredDevices), dropping anything malformed. */
@@ -782,7 +791,7 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			...(isObject(attachment.ext) && userExtFits(attachment.ext) ? { ext: attachment.ext } : {}),
 			...(typeof attachment.origin === "string" ? { origin: attachment.origin } : {}),
 			...(typeof attachment.endpoint === "string" && attachment.endpoint.length <= MAX_ENDPOINT_CHARS ? { endpoint: attachment.endpoint } : {}),
-			...(typeof attachment.device === "string" && DEVICE_NAME_PATTERN.test(attachment.device) ? { device: attachment.device } : {}),
+			...(typeof attachment.device === "string" && DEVICE_ID_PATTERN.test(attachment.device) ? { device: attachment.device } : {}),
 			...(challenge ? { challenge } : {}),
 			...(Array.isArray(attachment.rooms) ? {
 				rooms: attachment.rooms.filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 64).slice(0, MAX_ATTACHED_ROOMS),
@@ -2569,7 +2578,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Signs a user in with a token they made for another device
 	 * (`/invite-device`), through the `token` scheme (§3.2), from any origin
-	 * like an invite token. The connection keeps the device name, so the
+	 * like an invite token. The connection keeps the device id, so the
 	 * next token for that name closes it.
 	 */
 	private async handleDeviceToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, token: string): Promise<void> {
@@ -2578,7 +2587,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "too_large", message: "token is too long" } satisfies ProtocolError;
 			const key = DEVICE_TOKEN_KEY_PREFIX + await sha256Hex(token);
 			const stored = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredDeviceToken>(key));
-			const invalid = { name: "denied", message: "This device token is not valid; get a new one with /invite-device on a signed-in device" } satisfies ProtocolError;
+			const invalid = { name: "denied", message: "This device token is not valid; get a new one with /invite-device add on a signed-in device" } satisfies ProtocolError;
 			if (!stored || stored.v !== 1 || typeof stored.userId !== "string" || typeof stored.device !== "string") throw invalid;
 			const identity = this.store.getIdentity(stored.userId);
 			if (!identity) throw invalid;
@@ -5028,8 +5037,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (command.name === "invite-device") {
 			try {
-				if (words.length !== 2) throw { name: "invalid_params", message: `Usage: ${command.usage}` } satisfies ProtocolError;
-				await this.inviteDevice(socket, attachment, request, roomId, words[1]);
+				const action = words[1];
+				if ((action !== "add" && action !== "remove") || words.length > 3 || (action === "remove" && words.length !== 3)) {
+					throw { name: "invalid_params", message: `Usage: ${command.usage}` } satisfies ProtocolError;
+				}
+				if (action === "add") await this.inviteDevice(socket, attachment, request, roomId, words[2]);
+				else await this.removeDevice(socket, attachment, request, roomId, words[2]);
 			} catch (error) {
 				const protocol = errorToProtocol(error);
 				if (protocol.name !== "invalid_params") throw error;
@@ -5968,59 +5981,95 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `/invite-device <name>`: mints a bearer token that signs in as the
-	 * sender from another device, from any origin, kept under `name`. A user
-	 * holds at most MAX_DEVICE_TOKENS; the same name again replaces its token,
-	 * and the user's other connections that signed in with the old one close.
-	 * The token goes to this connection only, in a `~private` notice before
-	 * the result (§1). It does not expire; `/purge` revokes it, and `/rename`
-	 * moves it.
+	 * `/invite-device add [<id>]`: mints a bearer token that signs in as the
+	 * sender from another device, from any origin, kept under `id`, or the
+	 * first free `device_<n>` when none is given. A user holds at most
+	 * MAX_DEVICE_TOKENS; the same id again replaces its token, and the
+	 * user's other connections that signed in with the old one close. The
+	 * token goes to this connection only, in a `~private` notice before the
+	 * result (§1). It does not expire; `/invite-device remove` and `/purge`
+	 * revoke it, and `/rename` moves it.
 	 */
-	private async inviteDevice(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, name: string): Promise<void> {
+	private async inviteDevice(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, requested: string | undefined): Promise<void> {
 		const userId = attachment.userId!;
 		// A token would outlive APRON_ADMIN_TOKEN, as a passkey would.
 		if (userId === ADMIN_USER_ID) throw { name: "denied", message: "The admin user signs in with APRON_ADMIN_TOKEN only; make your own account an admin with /admin" } satisfies ProtocolError;
-		if (!DEVICE_NAME_PATTERN.test(name)) {
-			throw { name: "invalid_params", message: "A device name is 1 to 32 letters, digits, _, . or -, starting with a letter or digit" } satisfies ProtocolError;
-		}
+		checkDeviceId(requested);
 		const token = DEVICE_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 		const key = DEVICE_TOKEN_KEY_PREFIX + await sha256Hex(token);
 		const pointerKey = DEVICES_KEY_PREFIX + userId;
-		const replaced = await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1, writes: 3 }, async () => {
+		const { id, replaced } = await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1, writes: 3 }, async () => {
 			// A `/rename` or `/purge` of the user may have run since this command
 			// began; a token for the old `user_id` would never sign in, and the
 			// connections it replaces would not be found under it.
 			if (!this.store.identityExists(userId)) throw { name: "denied", message: "Your account changed; reconnect and try again" } satisfies ProtocolError;
 			const devices = storedDevices(await this.ctx.storage.get<StoredDevices>(pointerKey));
-			const previous = devices.find((device) => device.name === name);
+			let id = requested;
+			for (let n = 1; id === undefined; n++) {
+				if (!devices.some((device) => device.name === `device_${n}`)) id = `device_${n}`;
+			}
+			const previous = devices.find((device) => device.name === id);
 			if (!previous && devices.length >= MAX_DEVICE_TOKENS) {
-				const names = devices.map((device) => `\`${device.name}\``).join(", ");
-				throw { name: "denied", message: `You have ${MAX_DEVICE_TOKENS} device tokens (${names}); run /invite-device with one of those names to replace its token` } satisfies ProtocolError;
+				const ids = devices.map((device) => `\`${device.name}\``).join(", ");
+				throw { name: "denied", message: `You have ${MAX_DEVICE_TOKENS} device tokens (${ids}); run /invite-device add with one of those ids to replace its token, or /invite-device remove to revoke one` } satisfies ProtocolError;
 			}
 			// Revoke first: a failure between the writes leaves no token, never two.
 			if (previous) await this.ctx.storage.delete(previous.tokenKey);
-			await this.ctx.storage.put<StoredDeviceToken>(key, { v: 1, userId, device: name });
-			await this.ctx.storage.put<StoredDevices>(pointerKey, { v: 1, devices: [...devices.filter((device) => device !== previous), { name, tokenKey: key }] });
-			return !!previous;
+			await this.ctx.storage.put<StoredDeviceToken>(key, { v: 1, userId, device: id });
+			await this.ctx.storage.put<StoredDevices>(pointerKey, { v: 1, devices: [...devices.filter((device) => device !== previous), { name: id, tokenKey: key }] });
+			return { id, replaced: !!previous };
 		}));
-		if (replaced) {
-			// Whatever ran with the old token loses its connections, and the user's pushes too:
-			// their other devices register again on their next connection. The
-			// connections close first, so a push clear refused by the budget
-			// cannot leave them open.
-			for (const peer of this.connectionsOf(userId, socket)) {
-				const state = connectionAttachment(peer);
-				if (state?.device === name) this.closePolicy(peer, state, 1008, "Device token replaced; sign in with the new one");
-			}
-			if (this.config.push) this.store.clearPushSubscriptions(userId, nowMs());
-		}
+		if (replaced) this.closeDevice(socket, userId, id, "Device token replaced; sign in with the new one");
 		this.sendNotice(socket, roomId, [
-			`This token signs in as you (\`${userId}\`) on your device **${name}**${replaced ? ", and replaces its earlier token" : ""}. It does not expire, and anyone who has it can sign in as you, so keep it secret. \`/invite-device ${name}\` again replaces it.`,
+			`This token signs in as you (\`${userId}\`) on your device **${id}**${replaced ? ", and replaces its earlier token" : ""}. It does not expire, and anyone who has it can sign in as you, so keep it secret. \`/invite-device add ${id}\` again replaces it, and \`/invite-device remove ${id}\` revokes it.`,
 			"```\n" + token + "\n```",
-			...this.tokenLink(socket, token, `Or open this link on **${name}**, which signs you in there with any Apron app`),
+			...this.tokenLink(socket, token, `Or open this link on **${id}**, which signs you in there with any Apron app`),
 			`To sign in, authenticate with the token scheme: \`{"method": "auth", "params": {"scheme": "token", "token": "${token}"}}\``,
 		].join("\n\n"));
 		this.reply(socket, request, {});
+	}
+
+	/**
+	 * `/invite-device remove <id>`: revokes the sender's device token kept
+	 * under `id`, closing the user's other connections that signed in with
+	 * it, and answers with a `~private` notice before the result (§1).
+	 */
+	private async removeDevice(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, id: string): Promise<void> {
+		const userId = attachment.userId!;
+		if (userId === ADMIN_USER_ID) throw { name: "denied", message: "The admin user signs in with APRON_ADMIN_TOKEN only; make your own account an admin with /admin" } satisfies ProtocolError;
+		checkDeviceId(id);
+		const pointerKey = DEVICES_KEY_PREFIX + userId;
+		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1, writes: 2 }, async () => {
+			if (!this.store.identityExists(userId)) throw { name: "denied", message: "Your account changed; reconnect and try again" } satisfies ProtocolError;
+			const devices = storedDevices(await this.ctx.storage.get<StoredDevices>(pointerKey));
+			const previous = devices.find((device) => device.name === id);
+			if (!previous) {
+				const ids = devices.map((device) => `\`${device.name}\``).join(", ");
+				throw { name: "invalid_params", message: devices.length ? `You have no device token with the id ${id}; yours are ${ids}` : "You have no device tokens; get one with /invite-device add" } satisfies ProtocolError;
+			}
+			await this.ctx.storage.delete(previous.tokenKey);
+			const rest = devices.filter((device) => device !== previous);
+			if (rest.length) await this.ctx.storage.put<StoredDevices>(pointerKey, { v: 1, devices: rest });
+			else await this.ctx.storage.delete(pointerKey);
+		}));
+		this.closeDevice(socket, userId, id, "Device token revoked");
+		this.sendNotice(socket, roomId, `Revoked the device token for **${id}**.`);
+		this.reply(socket, request, {});
+	}
+
+	/**
+	 * After a device token is replaced or revoked: whatever ran with it loses
+	 * its connections, other than the asking one, and the user's pushes go
+	 * too: their other devices register again on their next connection. The
+	 * connections close first, so a push clear refused by the budget cannot
+	 * leave them open.
+	 */
+	private closeDevice(socket: WebSocketConnection, userId: string, id: string, reason: string): void {
+		for (const peer of this.connectionsOf(userId, socket)) {
+			const state = connectionAttachment(peer);
+			if (state?.device === id) this.closePolicy(peer, state, 1008, reason);
+		}
+		if (this.config.push) this.store.clearPushSubscriptions(userId, nowMs());
 	}
 
 	/**
