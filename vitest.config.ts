@@ -8,7 +8,7 @@ export default defineConfig({
 			// Pin the feature switches whatever the plan's defaults. Most suites use
 			// guests as convenient posters; test/read-only-guests turns this off to
 			// cover guests that only read. Suites that cover typing turn it on.
-			// Uploads are on, served from a stand-in media origin. Push is on with a
+			// Uploads are on, served from a stand-in media origin, and so is live text. Push is on with a
 			// test-only VAPID key pair and a stand-in push service; nothing is pushed
 			// unless a test registers a subscription and mentions its user.
 			miniflare: {
@@ -30,6 +30,11 @@ export default defineConfig({
 					PUSH_HOSTS: "push.example.net",
 					// Wakes push at once; the suites that cover the wait set one.
 					PUSH_DELAY_SECONDS: "0",
+					// Live text (on with PUBLIC_ORIGIN and UPLOAD_SIGNING_KEY) with tiny
+					// time limits, so test/live-text.integration.test.ts sees them end.
+					LIVE_TEXT_MAX_SECONDS: "2",
+					LIVE_TEXT_MODERATOR_MAX_SECONDS: "3",
+					LIVE_TEXT_WRITE_WINDOW_SECONDS: "3",
 				},
 			},
 		}),
