@@ -272,7 +272,7 @@ it('/invite-token creates a user who signs in with the token, which /rename move
 	} finally { admin.close(); }
 });
 
-it('/invite-device add mints up to five named tokens that sign in as the user, a name again replacing its token', async () => {
+it('/invite-device add mints up to five tokens, each with its own id, that sign in as the user, an id again replacing its token', async () => {
 	const admin = await signedInAdmin();
 	const userId = unique('owner');
 	const owner = await signedIn(userId);
@@ -283,8 +283,8 @@ it('/invite-device add mints up to five named tokens that sign in as the user, a
 		await peer.next();
 		return { peer, reply: await request(peer, 'auth', 'auth', { scheme: 'token', token }) };
 	};
-	const mint = async (name: string) => {
-		const minted = await command(owner, `device-${name}`, `/invite-device add ${name}`);
+	const mint = async (id: string) => {
+		const minted = await command(owner, `device-${id}`, `/invite-device add ${id}`);
 		expect(minted.frame.result).toEqual({});
 		const token = minted.notice!.params.body.text.match(/```\n(apron_device_[A-Za-z0-9_-]{43})\n```/)![1] as string;
 		// The same token in a link that any Apron app opens (Appendix A.4).
@@ -292,7 +292,7 @@ it('/invite-device add mints up to five named tokens that sign in as the user, a
 		return token;
 	};
 	try {
-		expect((await command(owner, 'help', '/help')).notice!.params.body.text).toContain('/invite-device add|remove [<name>]');
+		expect((await command(owner, 'help', '/help')).notice!.params.body.text).toContain('/invite-device add|remove [<id>]');
 
 		// The token signs in as the user from any origin.
 		const laptop = await mint('laptop');
@@ -304,7 +304,7 @@ it('/invite-device add mints up to five named tokens that sign in as the user, a
 		const onPhone = await signIn(phone);
 		expect(onPhone.reply.result.you.user_id).toBe(userId);
 		const tablet = await mint('tablet');
-		// Without a name, the first free device_<n>.
+		// Without an id, the first free device_<n>.
 		const unnamed = async (id: string) => {
 			const minted = await command(owner, id, '/invite-device add');
 			expect(minted.frame.result).toEqual({});
@@ -313,12 +313,12 @@ it('/invite-device add mints up to five named tokens that sign in as the user, a
 		expect(await unnamed('device-unnamed-1')).toContain('your device **device_1**');
 		expect(await unnamed('device-unnamed-2')).toContain('your device **device_2**');
 
-		// A sixth name is refused, naming the five; bad names and usage are errors to show.
+		// A sixth id is refused, naming the five; bad ids and usage are errors to show.
 		const sixth = await command(owner, 'device-desktop', '/invite-device add desktop');
 		expect(sixth.frame.error.code).toBe(-32001);
 		expect(sixth.frame.error.message).toContain('`laptop`, `phone`, `tablet`, `device_1`, `device_2`');
 		expect((await command(owner, 'device-unnamed-3', '/invite-device add')).frame.error.code).toBe(-32001);
-		expect((await command(owner, 'usage', '/invite-device')).frame.error.message).toBe('Usage: /invite-device add|remove [<name>]');
+		expect((await command(owner, 'usage', '/invite-device')).frame.error.message).toBe('Usage: /invite-device add|remove [<id>]');
 		expect((await command(owner, 'usage-2', '/invite-device laptop')).frame.error.code).toBe(-32602);
 		expect((await command(owner, 'usage-3', '/invite-device add a b')).frame.error.code).toBe(-32602);
 		expect((await command(owner, 'usage-4', '/invite-device remove')).frame.error.code).toBe(-32602);
@@ -328,14 +328,14 @@ it('/invite-device add mints up to five named tokens that sign in as the user, a
 		expect(unknown.frame.error.code).toBe(-32602);
 		expect(unknown.frame.error.message).toContain('`laptop`, `phone`, `tablet`, `device_1`, `device_2`');
 
-		// Removing frees the name, and device_1 is taken again next.
+		// Removing frees the id, and device_1 is taken again next.
 		const removed = await command(owner, 'remove-device-1', '/invite-device remove device_1');
 		expect(removed.frame.result).toEqual({});
 		expect(removed.notice!.params.body.text).toContain('Revoked the device token for **device_1**');
 		expect(await unnamed('device-unnamed-4')).toContain('your device **device_1**');
 		expect(owner.closed()).toBeUndefined();
 
-		// The same name again replaces its token, closing what signed in with
+		// The same id again replaces its token, closing what signed in with
 		// the old one, but not the asking connection or the other devices.
 		const replaced = await command(onLaptop.peer, 'device-laptop-again', '/invite-device add laptop');
 		expect(replaced.notice!.params.body.text).toContain('replaces its earlier token');
