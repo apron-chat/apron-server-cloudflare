@@ -1391,7 +1391,7 @@ export function liveCommandNotice(kind: LiveKind, writeUrl: string, entry: Pick<
 			`script -q /dev/null sh -c 'stty cols 80 rows 40; YOUR_COMMAND' | curl -sT - ${url}`,
 			"```",
 			"",
-			"The message appears when the stream starts. The link works once, and only for you: don't share it.",
+			"The message appears when the stream starts. At a limit the stream ends, and so does the command feeding it. The link works once, and only for you: don't share it.",
 		].join("\n");
 	}
 	return [
@@ -1401,7 +1401,7 @@ export function liveCommandNotice(kind: LiveKind, writeUrl: string, entry: Pick<
 		`your-llm-command | curl -sT - ${url}`,
 		"```",
 		"",
-		"The message appears when the stream starts. The link works once, and only for you: don't share it.",
+		"The message appears when the stream starts. At a limit the stream ends, and so does the command feeding it. The link works once, and only for you: don't share it.",
 	].join("\n");
 }
 
