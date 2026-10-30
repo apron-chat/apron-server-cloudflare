@@ -3802,6 +3802,25 @@ export class Store {
     }));
   }
 
+  /**
+   * Removes every passkey of an identity and clears its WebAuthn user
+   * handle, for `/invite-purge`: the passkey sessions issued under the old
+   * handle no longer resume, and a passkey registered later takes a new one.
+   * Returns how many passkeys were removed.
+   */
+  resetAuth(input: { userId: string; now?: number }): number {
+    this.ensureReady();
+    const now = input.now ?? this.clock.now();
+    return this.reserved({ reads: 16 + 2 * MAX_PASSKEYS_PER_USER, writes: 16 + 4 * MAX_PASSKEYS_PER_USER }, false, now, () => this.transaction(() => {
+      const count = integerColumn(this.rawRows<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM (SELECT 1 FROM credentials WHERE user_id = ? LIMIT ?)", input.userId, MAX_PASSKEYS_PER_USER,
+      )[0]?.count);
+      if (count) this.rawExec("DELETE FROM credentials WHERE user_id = ?", input.userId);
+      this.rawExec("UPDATE identities SET user_handle = '', updated_ms = ? WHERE user_id = ? AND user_handle != ''", this.effectiveNow(now), input.userId);
+      return count;
+    }));
+  }
+
   credentialIdsForUser(userId: string): string[] {
     this.ensureReady();
     return this.reserved({ reads: 32 }, false, this.clock.now(), () => {

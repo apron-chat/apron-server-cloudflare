@@ -100,12 +100,15 @@ within it:
   push: attendance is the separate `status` request (below).
 - Commands: `/help` replies with a `~private` notice listing the commands the
   sender may run. Registered users other than bots have `/invite-bot` (a bot
-  token), `/invite-device add|remove [<id>]` (a token for another device), `/passkeys`,
+  token), `/invite-device list|add|remove [<id>]` (tokens for other devices), `/passkeys`,
   and, with uploads, `/avatar` (all below); those with the role `admin`,
   `mod`, or `friend` also have `/emoji add|remove :name:` (custom emoji,
   below). Admins have their own (see [SPEC section 5](../SPEC.md#admins)),
   among them `/server`, which sets the server's title, description and
-  avatar (below), and `/toggle activity|uploads|presence|addmember`. An
+  avatar (below), `/toggle activity|uploads|presence|addmember`, and
+  `/invite-purge <user_id>`, which signs a user out everywhere, removes
+  their passkeys and tokens, and gives the admin a new token for them.
+  `/help` lists commands alphabetically and marks the admins' "(admin-only)". An
   unknown command is `invalid_params`, and one the sender may not run
   `denied`.
 - Uploads (cap `embed:upload`, Workers Paid budgets): registered users attach
@@ -341,7 +344,8 @@ under its own id (1 to 32 letters, digits, `_`, `.` or `-`, starting with
 a letter or digit; `device_1`, `device_2`, … when none is given); the same id
 again replaces its token, closes the user's other connections that used the
 old one, and drops the user's push registrations. `/invite-device remove <id>`
-revokes a token the same way. `/rename` moves the tokens
+revokes a token the same way, and `/invite-device list` shows each id with
+when it was added and last used. `/rename` moves the tokens
 and `/purge` revokes them. See [SPEC section 5](../SPEC.md#devices).
 
 Guest identities last for a socket, including hibernation. Repeated guest
