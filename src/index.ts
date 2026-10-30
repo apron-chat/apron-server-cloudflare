@@ -135,7 +135,7 @@ interface ConnectionAttachment {
 	tier: "pending" | "anonymous" | "registered";
 	userId?: string;
 	name?: string;
-	/** The user's avatar (§4.8.6), for current user objects; never in `from`. */
+	/** The user's avatar (§4.8.7), for current user objects; never in `from`. */
 	avatar?: string;
 	/**
 	 * A registered user's roles (§3.3), read with the identity at sign-in and
@@ -1046,7 +1046,7 @@ function publicIdentity(attachment: ConnectionAttachment): { user_id: string; na
 
 /**
  * A connection's user as a current object (§3.3): `you`, `new`, and room
- * `members` and `users`, which carry `avatar` (§4.8.6). Recorded objects,
+ * `members` and `users`, which carry `avatar` (§4.8.7). Recorded objects,
  * such as a message's `from`, use publicIdentity and never do.
  */
 function currentUser(attachment: ConnectionAttachment): PublicUser | null {
@@ -1452,29 +1452,15 @@ async function handleLiveWrite(request: Request, env: Env, key: string): Promise
 	if (!request.body) return liveAnswer(400, "Send the text as the request body");
 	const admitted = await liveAdmission(request, env);
 	if ("refused" in admitted) return admitted.refused;
-	// Pumped through a stream this request controls: the object may answer
-	// before the body ends (at a time or size limit), and the rest of the body
-	// is then cancelled here, before the answer is returned, since nothing may
-	// read a request's body after its response.
-	const pipe = new TransformStream<Uint8Array, Uint8Array>();
-	const source = request.body.getReader();
-	source.closed.catch(() => undefined);
-	const sink = pipe.writable.getWriter();
-	// A cancelled pump rejects these; nothing waits on them.
-	sink.closed.catch(() => undefined);
-	sink.ready.catch(() => undefined);
-	void (async () => {
-		try {
-			for (;;) {
-				const { done, value } = await source.read();
-				if (done) break;
-				await sink.write(value);
-			}
-			await sink.close();
-		} catch {
-			await sink.abort().catch(() => undefined);
-		}
-	})();
+	// Piped natively (an IdentityTransformStream: no JavaScript runs per
+	// chunk, so the Worker's CPU does not grow with the text) through a stream
+	// this request controls: the object may answer before the body ends (at a
+	// time or size limit), and the pipe is then aborted here, before the
+	// answer is returned, since nothing may read a request's body after its
+	// response.
+	const pipe = new IdentityTransformStream();
+	const abort = new AbortController();
+	request.body.pipeTo(pipe.writable, { signal: abort.signal }).catch(() => undefined);
 	const forwarded = new Request(`https://live.internal${LIVE_WRITE_PATH}${encodeURIComponent(key)}`, {
 		method: "PUT",
 		headers: { [INTERNAL_IP_HEADER]: admitted.ipKey },
@@ -1486,7 +1472,7 @@ async function handleLiveWrite(request: Request, env: Env, key: string): Promise
 	} catch {
 		response = liveAnswer(503, "Server unavailable; try again shortly", UNAVAILABLE_RETRY_MS);
 	}
-	await source.cancel().catch(() => undefined);
+	abort.abort();
 	return response;
 }
 
@@ -3102,7 +3088,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * is unchanged, and an empty one removes it. Only registered users may
 	 * change their name; `name: ""` removes it, so the user falls back to
 	 * `user_id`. With uploads, `avatar: ""` removes a registered user's
-	 * avatar; a new one comes only through `/avatar` (§4.8.6), so other values
+	 * avatar; a new one comes only through `/avatar` (§4.8.7), so other values
 	 * are declined. `ext` (§4.12) merges one level deep into the user's kept
 	 * one, at most MAX_USER_EXT_BYTES after the merge (else `too_large`); only
 	 * registered users keep one, so a guest's `ext` with keys is `denied`, and
@@ -3214,6 +3200,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			identity,
 		};
 		let started = false;
+		let liveEnded = false;
 		let created: MessageSnapshot | undefined;
 		// A new live text first ends any a lost instance left open (recoverLiveTexts).
 		if (method === "message" && this.config.liveText && hasLiveEmbed(request.params)) await this.recoverLiveTexts();
@@ -3226,6 +3213,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			started = this.afterUploads(result);
 			// A save that removed a live text's embed ended it (§4.8.3): its write stops.
 			for (const key of result.liveEnded ?? []) this.stopLiveText(key, "removed");
+			if (result.liveEnded?.length) liveEnded = true;
 			for (const entry of result.liveStarted ?? []) started = this.noteLiveDeadline(liveDeadline(entry)) || started;
 			// Only a new message wakes anyone: not an edit, move, or retry (§4.9).
 			if (method === "message" && !result.deduplicated && result.message?.prev_log_id === undefined) created = result.message;
@@ -3239,6 +3227,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		// Pending writes that never come are failed by the alarm (§4.8.3).
 		if (started) await this.rescheduleAlarm();
+		// A live text a save ended leaves no alarm for its deadline.
+		if (liveEnded) await this.refreshLiveDeadline().catch(() => undefined);
 	}
 
 	private async handleMessage(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
@@ -5512,7 +5502,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `/avatar` with one `upload` embed (§4.8.6): the result carries the
+	 * `/avatar` with one `upload` embed (§4.8.7): the result carries the
 	 * embed's `write_url`, and the image becomes the sender's avatar when the
 	 * write finishes (finishUpload).
 	 */
@@ -5523,7 +5513,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `~private` notice with the URL in copy-paste recipes. Nothing is posted
 	 * until the write arrives (liveWrite); one that never comes expires.
 	 * The rest of the command line is the terminal's plain title, or the
-	 * append's opening markdown, newlines and all.
+	 * append's opening markdown, newlines and all; a non-empty opening, its
+	 * trailing whitespace trimmed, is followed by a paragraph break ("\n\n")
+	 * so the streamed text starts a new paragraph.
 	 */
 	private async liveCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, kind: LiveKind, text: string): Promise<void> {
 		const identity = identityOf(attachment);
@@ -5539,7 +5531,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			entry = this.store.startLiveCommand({
 				userId: identity.user_id, ipKey: attachment.ipKey, identity: { user_id: identity.user_id, ...(attachment.name ? { name: attachment.name } : {}) },
 				kind, roomId, now: nowMs(),
-				...(kind === "terminal" ? { title: rest } : { text: rest }),
+				// A non-empty opening ends in a paragraph break, so the streamed text starts a new paragraph.
+				...(kind === "terminal" ? { title: rest } : { text: rest.trimEnd() ? `${rest.trimEnd()}\n\n` : "" }),
 				...(replyId !== undefined ? { replyTo: replyId } : {}),
 			});
 			const result = await this.withWriteUrls({ embeds: [liveResultEmbed(entry, live.policy)] });
@@ -5549,6 +5542,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.reply(socket, request, result);
 		});
 		if (entry && this.noteLiveDeadline(liveDeadline(entry))) await this.rescheduleAlarm();
+	}
+
+	/**
+	 * Sets the alarm's live text deadline from the open texts as they are
+	 * now (from memory after the first read), so a text that ended or
+	 * started streaming leaves no alarm for a deadline it no longer has.
+	 */
+	private async refreshLiveDeadline(): Promise<void> {
+		const entries = this.store.openLiveTexts(nowMs());
+		const next = entries.length ? Math.min(...entries.map(liveDeadline)) : undefined;
+		if (next === this.liveDeadlineAt) return;
+		this.liveDeadlineAt = next;
+		await this.rescheduleAlarm();
 	}
 
 	/** Notes when an open live text falls due; true when that moves the alarm earlier. */
@@ -5697,8 +5703,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const buffer = new LiveBuffer(entry.kind, entry.limit);
 		session.buffer = buffer;
 		this.liveSessions.set(entry.id, session);
-		// The alarm ends it should this instance be lost meanwhile.
-		if (this.noteLiveDeadline(liveDeadline(entry))) await this.rescheduleAlarm();
+		// The alarm ends it should this instance be lost meanwhile, and no longer waits for its write.
+		await this.refreshLiveDeadline().catch(() => undefined);
 		const reader = body.getReader();
 		reader.closed.catch(() => undefined);
 		let end: LiveEnd | undefined;
@@ -5751,6 +5757,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		session.readers.close();
 		this.liveSessions.delete(entry.id);
+		// No alarm is left for this text's deadline.
+		if (end !== "unavailable") await this.refreshLiveDeadline().catch(() => undefined);
 		const policy = this.config.liveText!.policy;
 		const messages: Record<LiveEnd, string> = {
 			complete: "Done: the text is posted.",
@@ -6031,7 +6039,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		});
 		for (const roomId of rooms) this.removeIfEmpty(roomId);
 		this.deleteMedia(purged.deletedUploads);
-		await this.endLiveOf(userIds);
+		// A text left open by a failure here ends at its time limit, publishing nothing.
+		await this.endLiveOf(userIds).catch(() => undefined);
 		await this.forgetTokens(userIds);
 		const uploads = purged.deletedUploads.length;
 		this.sendNotice(socket, roomId, `Purged \`${userId}\`: ${purged.messages} message${purged.messages === 1 ? "" : "s"}, ${purged.reactions} reaction set${purged.reactions === 1 ? "" : "s"}, ${uploads} upload${uploads === 1 ? "" : "s"}.`);
@@ -7037,7 +7046,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * A user's avatar changed (§4.8.6): their connections keep it, they get
+	 * A user's avatar changed (§4.8.7): their connections keep it, they get
 	 * `user` `you`, and those who share a room with them `user` `new`. An empty
 	 * `avatar` announces a removed one.
 	 */

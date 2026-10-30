@@ -1505,7 +1505,7 @@ const OG_MEDIA_MAX_DIMENSION = 16_384;
 const OG_UNSAFE_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
 
 /** `value` as one line of plain text of at most `max` code points, or undefined when empty. */
-/** An identity's avatar while it has not expired (protocol §4.8.6). */
+/** An identity's avatar while it has not expired (protocol §4.8.7). */
 function liveAvatar(row: { avatar_url: string | null; avatar_expires_ms: number | null }, now: number): string | undefined {
   return row.avatar_url && (row.avatar_expires_ms ?? 0) > now ? row.avatar_url : undefined;
 }
@@ -5030,6 +5030,8 @@ export class Store {
   expireLiveTexts(streaming: ReadonlySet<string>, now = this.clock.now()): { broadcasts: Broadcast[]; ended: LiveEntry[]; next?: number } {
     this.ensureReady();
     if (!this.config.liveText) return { broadcasts: [], ended: [] };
+    // Known to be none: nothing to read or reserve, so the alarm pays nothing for the feature.
+    if (this.liveCache?.length === 0) return { broadcasts: [], ended: [] };
     return this.reserved({ reads: 32 + 64 * this.config.liveText.concurrent, writes: 8 + 32 * this.config.liveText.concurrent }, true, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       const entries = this.liveTexts();
@@ -5108,7 +5110,7 @@ export class Store {
   }
 
   /**
-   * Starts an avatar upload (protocol §4.8.6): `/avatar` with one `upload`
+   * Starts an avatar upload (protocol §4.8.7): `/avatar` with one `upload`
    * embed. The avatar is set when the write finishes (finishUpload).
    */
   startAvatarUpload(input: { userId: string; now?: number }): PendingUpload {
@@ -5142,7 +5144,7 @@ export class Store {
   }
 
   /**
-   * Starts the server's avatar upload (§3.1, §4.8.6): `/server avatar` with
+   * Starts the server's avatar upload (§3.1, §4.8.7): `/server avatar` with
    * one `upload` embed, by an admin. Kept like a custom emoji: the server's
    * (SERVER_OWNER), never expiring, an avatar in size, and counted against
    * the admin's and the server's daily uploads and the stored-bytes cap.

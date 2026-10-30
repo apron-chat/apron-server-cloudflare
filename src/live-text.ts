@@ -114,9 +114,23 @@ export class LiveBuffer {
 	}
 }
 
-/** One text's readers: response streams fed from memory. */
+/**
+ * How long readers' bytes wait to be sent together, and how many may wait.
+ * A writer in a pseudo-terminal sends a chunk per line or less, and each
+ * chunk to each reader is a write through the runtime to the entry Worker
+ * and on to the client: sending at most every 50 ms costs a fraction of the
+ * CPU, a delay no reader sees.
+ */
+export const READER_FLUSH_MS = 50;
+export const READER_FLUSH_BYTES = 16 * 1024;
+
+/** One text's readers: response streams fed from memory, in batches. */
 export class LiveReaders {
 	private readonly controllers = new Set<ReadableStreamDefaultController<Uint8Array>>();
+	/** Bytes not yet sent to the readers, and the one timer that sends them. */
+	private pending: Uint8Array[] = [];
+	private pendingBytes = 0;
+	private timer: ReturnType<typeof setTimeout> | undefined;
 	/** Reads the text has served over its life, reconnects included. */
 	served = 0;
 
@@ -124,8 +138,13 @@ export class LiveReaders {
 		return this.controllers.size;
 	}
 
-	/** A new reader's stream, starting with `initial`. */
+	/**
+	 * A new reader's stream, starting with `initial`, what is kept now: the
+	 * bytes still waiting go to the other readers first, since `initial`
+	 * already holds them.
+	 */
 	open(initial: Uint8Array): ReadableStream<Uint8Array> {
+		this.flush();
 		this.served += 1;
 		let own: ReadableStreamDefaultController<Uint8Array> | undefined;
 		return new ReadableStream<Uint8Array>({
@@ -140,9 +159,30 @@ export class LiveReaders {
 		}, new ByteLengthQueuingStrategy({ highWaterMark: 64 * 1024 }));
 	}
 
-	/** Sends a chunk to every reader; one too far behind is dropped. */
+	/** Queues a chunk for every reader: sent within READER_FLUSH_MS, or at once past READER_FLUSH_BYTES. */
 	send(chunk: Uint8Array): void {
-		if (!chunk.length) return;
+		if (!chunk.length || !this.controllers.size) return;
+		this.pending.push(chunk);
+		this.pendingBytes += chunk.length;
+		if (this.pendingBytes >= READER_FLUSH_BYTES) this.flush();
+		else this.timer ??= setTimeout(() => this.flush(), READER_FLUSH_MS);
+	}
+
+	/** Sends what waits, as one chunk; a reader too far behind is dropped. */
+	flush(): void {
+		if (this.timer !== undefined) clearTimeout(this.timer);
+		this.timer = undefined;
+		if (!this.pendingBytes) return;
+		const chunk = this.pending.length === 1 ? this.pending[0] : new Uint8Array(this.pendingBytes);
+		if (this.pending.length > 1) {
+			let offset = 0;
+			for (const part of this.pending) {
+				chunk.set(part, offset);
+				offset += part.length;
+			}
+		}
+		this.pending = [];
+		this.pendingBytes = 0;
 		for (const controller of [...this.controllers]) {
 			const desired = controller.desiredSize;
 			if (desired !== null && desired < -MAX_READER_BACKLOG_BYTES) {
@@ -154,8 +194,9 @@ export class LiveReaders {
 		}
 	}
 
-	/** Ends every reader's response: the text ended. */
+	/** Ends every reader's response, after what waits: the text ended. No timer is left. */
 	close(): void {
+		this.flush();
 		for (const controller of this.controllers) {
 			try { controller.close(); } catch { /* already closed or errored */ }
 		}

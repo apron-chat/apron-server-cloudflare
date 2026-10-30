@@ -452,7 +452,7 @@ export function validServerDescription(description: string): boolean {
  * empty, the field is left out (`RP_NAME` names the server only to WebAuthn).
  * The title is a plain name within the display-name policy, the description
  * short CommonMark, and the avatar an `https:` URL or a
- * `data:image/{png,jpeg,gif,webp};base64,` URL (§4.8.6).
+ * `data:image/{png,jpeg,gif,webp};base64,` URL (§4.8.7).
  */
 function loadServerMetadata(env: EnvLike, limits: Limits): ServerMetadata {
 	const title = (env.SERVER_TITLE ?? "").trim();

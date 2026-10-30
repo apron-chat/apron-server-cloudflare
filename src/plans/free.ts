@@ -170,8 +170,8 @@ export const FREE_PLAN: Plan = Object.freeze({
 	// while it streams, which the duration allowance covers (one object awake
 	// all day is 10,800 of its 13,000 GB-s), and costs a Durable Object
 	// request for its write and for each read: at most 30 texts a day of 15
-	// reads each is 480 of the 100,000. Its rows are two posts' worth, and
-	// its kept text at most 1.5 MB of a day's retention.
+	// reads each is 480 of the 100,000. Its rows are two or three posts'
+	// worth, and its kept text at most 3 MB of a day's retention.
 	liveText: Object.freeze({
 		// The owner's ceilings: 120 seconds, and 300 for admins and mods.
 		maxSeconds: 120,

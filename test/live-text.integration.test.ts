@@ -167,7 +167,8 @@ describe('live text end to end', () => {
 		const writer = await signedIn(userId, ['admin']);
 		try {
 			const question = (await request(writer, 'q', 'message', { body: { text: 'What now?' } })).result.message_id;
-			const { frame, skipped } = await command(writer, 'append', '/embed-append **Plan:**\n\n', { reply_to: { message_id: question } });
+			// The opening, trailing whitespace trimmed, ends in a paragraph break.
+			const { frame, skipped } = await command(writer, 'append', '/embed-append **Plan:** ', { reply_to: { message_id: question } });
 			const [result] = frame.result.embeds;
 			expect(result.kind).toBe('append');
 			expect(skipped.find(fromUser('~private'))!.params.body.text).toContain(`your-llm-command | curl -sT - '${result.write_url}'`);
@@ -183,6 +184,29 @@ describe('live text end to end', () => {
 			const merged = (await until(writer, isMessage(posted.message_id))).frame.params;
 			expect(merged.body).toEqual({ text: '**Plan:**\n\n1. Roll back.\n2. Renew the *cert*.\n', format: 'markdown' });
 			expect(reader.text()).toBe('1. Roll back.\n2. Renew the *cert*.\n');
+		} finally { writer.close(); }
+	});
+
+	it('starts an /embed-append without an opening with empty text, and keeps a message\'s text exactly as sent', async () => {
+		const userId = unique('bare');
+		const writer = await signedIn(userId, ['mod']);
+		try {
+			const { frame } = await command(writer, 'bare', '/embed-append');
+			const put = streamTo(frame.result.embeds[0].write_url);
+			await put.send('Hello');
+			const posted = (await until(writer, fromUser(userId))).frame.params;
+			expect(posted.body).toMatchObject({ text: '', format: 'markdown' });
+			await put.end();
+			await put.response;
+			expect((await until(writer, isMessage(posted.message_id))).frame.params.body).toEqual({ text: 'Hello', format: 'markdown' });
+			// The message flow adds nothing to the text it is sent.
+			const { frame: sent, skipped } = await exchange(writer, 'msg', 'message', { body: { text: 'logs:', format: 'markdown', embeds: [{ kind: 'append' }] } });
+			expect(skipped.find(isMessage(sent.result.message_id))!.params.body.text).toBe('logs:');
+			const rest = streamTo(sent.result.embeds[0].write_url);
+			await rest.send('ok');
+			await rest.end();
+			await rest.response;
+			expect((await until(writer, (f) => isMessage(sent.result.message_id)(f) && f.params.prev_log_id !== undefined)).frame.params.body.text).toBe('logs:ok');
 		} finally { writer.close(); }
 	});
 
