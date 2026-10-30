@@ -65,6 +65,10 @@ it('lists and runs the admin commands for admins only', async () => {
 		expect(help.notice!.params.body.text).toContain('/kick <user_id>');
 		expect(help.notice!.params.body.text).toContain('/status');
 		expect(help.notice!.params.body.text).toContain('/rename <old_user_id> <new_user_id>');
+		// Listed alphabetically.
+		const listed = [...help.notice!.params.body.text.matchAll(/^- `\/([a-z-]+)/gm)].map((match) => match[1]);
+		expect(listed.length).toBeGreaterThan(10);
+		expect(listed).toEqual([...listed].sort());
 
 		const plain = await command(alice, 'help', '/help');
 		expect(plain.notice!.params.body.text).toContain('/invite-bot');
