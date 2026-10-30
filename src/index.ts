@@ -2375,6 +2375,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 			},
 			registerCredential: (input) => {
 				if (input.adds) {
+					// `/invite-purge` may have cleared the account's user handle (and
+					// closed this connection) while the ceremony was verifying; the
+					// handle it began under must not come back with a new passkey.
+					if (connectionAttachment(socket)?.closing || !this.store.getIdentity(input.userId)?.userHandle) {
+						throw { name: "denied", message: "Your account changed; reconnect and try again" } satisfies ProtocolError;
+					}
 					const added = this.store.addCredential({ userId: input.userId, userHandle: input.userHandle, credential: input.credential, now: input.now, ipKey: input.ipKey });
 					return { user_id: added.userId, name: added.name };
 				}
@@ -2420,6 +2426,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const token = await this.issueSession(finished.identity.user_id, origin, nowMs(), handle);
 		const sessionCredential = await sessionKey(token);
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
+		// A passkey `/invite-purge` removed while the ceremony was verifying
+		// signs nobody in; with no await from here, a later purge finds this
+		// connection signed in and closes it.
+		if (finished.credential && !this.store.getCredential(finished.credential.credentialId)) {
+			throw { name: "denied", message: "This passkey is no longer on the account" } satisfies ProtocolError;
+		}
 		const previous = this.guestBefore(socket, attachment);
 		// Read cursors still unwritten are the previous user's.
 		if (attachment.reads) this.flushReads(attachment, nowMs());
@@ -2644,7 +2656,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// When it was last used, at most once a UTC day, for `/invite-device list`.
 			const now = nowMs();
 			if (stored.usedMs === undefined || utcDay(stored.usedMs) !== utcDay(now)) {
-				await this.store.withMeterAsync("foreground", { writes: 1 }, () => this.ctx.storage.put<StoredDeviceToken>(key, { ...stored, usedMs: now }));
+				// Best effort: the sign-in has been answered, and a budget refusal only leaves the day unrecorded.
+				try {
+					await this.store.withMeterAsync("foreground", { writes: 1 }, () => this.ctx.storage.put<StoredDeviceToken>(key, { ...stored, usedMs: now }));
+				} catch { /* unrecorded */ }
 			}
 		});
 	}

@@ -918,6 +918,38 @@ async function passkeyLogin(passkey: Awaited<ReturnType<typeof softPasskey>>, ed
 	} finally { peer.close(); }
 }
 
+it('a passkey ceremony verifying while /invite-purge runs signs nobody in and adds no passkey', async () => {
+	const userId = unique('raced');
+	const user = await signedIn(userId);
+	type Patchable = { store: Store & { updateCredentialCounter: (...args: unknown[]) => void } };
+	try {
+		const added = await registerPasskey(user, 'add');
+		expect(added.finished.result.you.user_id).toBe(userId);
+		// The purge's store change lands while the login's proof is being checked.
+		await runInDurableObject(stub(), (instance) => {
+			const store = (instance as unknown as Patchable).store;
+			const original = store.updateCredentialCounter.bind(store);
+			store.updateCredentialCounter = (...args: unknown[]) => {
+				store.resetAuth({ userId });
+				(original as (...a: unknown[]) => void)(...args);
+			};
+		});
+		expect((await passkeyLogin(added.passkey)).error.message).toBe('This passkey is no longer on the account');
+		await runInDurableObject(stub(), (instance) => {
+			delete (instance as unknown as { store: Partial<Patchable['store']> }).store.updateCredentialCounter;
+		});
+
+		// An addition begun before the purge cleared the handle is refused at its finish.
+		const passkey = await softPasskey('http://localhost:5173');
+		const begun = await request(user, 'again-begin', 'auth', { scheme: 'webauthn', action: 'register', step: 'begin' });
+		const credential = await passkey.register(begun.result.public_key);
+		await runInDurableObject(stub(), (instance) => { (instance as unknown as Patchable).store.resetAuth({ userId }); });
+		const refused = await request(user, 'again-finish', 'auth', { scheme: 'webauthn', action: 'register', step: 'finish', challenge_id: begun.result.challenge_id, credential });
+		expect(refused.error.message).toBe('Your account changed; reconnect and try again');
+		expect(await runInDurableObject(stub(), (instance) => (instance as unknown as Patchable).store.passkeys(userId))).toEqual([]);
+	} finally { user.close(); }
+});
+
 it('adds a passkey to the signed-in account (§4.10); a guest\'s registration makes a new account', async () => {
 	const userId = unique('keys');
 	const user = await signedIn(userId);
