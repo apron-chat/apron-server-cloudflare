@@ -183,7 +183,7 @@ room caps, and ends with a checklist for a well-behaved client.
 The `server` frame's `welcome` is CommonMark for your sign-in screen. The server
 advertises `token` (for bot tokens) and `guest` to custom frontends, and never
 `email` or `external`; `signup` names the schemes that create an account
-(`webauthn` on the demo's own site, and `token` for an admin's `/invite`
+(`webauthn` on the demo's own site, and `token` for an admin's `/invite-code`
 sign-up token, whose `auth` result carries the new user's own token to save).
 A user who signed up with a token can add a passkey by registering one while
 signed in. `web.apron.chat` additionally receives `webauthn`, and its `token`

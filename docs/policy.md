@@ -290,7 +290,7 @@ identity must reconnect before signing in as another.
 
 `server.signup` lists the schemes that create accounts: `webauthn` where
 passkeys are offered, and `token`, which creates one only with an admin's
-sign-up invite (`/invite <uses>`, at most 50 sign-ups within 7 days, one
+sign-up invite (`/invite-code <uses>`, at most 50 sign-ups within 7 days, one
 live invite at a time). Each sign-up gets its own `apron_invite_` token in
 the `auth` result to sign in with afterwards. Other tokens only sign in, and
 `guest` is not an account.

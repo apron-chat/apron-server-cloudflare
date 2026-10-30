@@ -845,12 +845,12 @@ it('adds a passkey to the signed-in account (§4.10); a guest\'s registration ma
 	} finally { user.close(); guest.close(); admin.close(); }
 });
 
-it('/invite mints a sign-up token that creates a user per use, each with its own token (Appendix B)', async () => {
+it('/invite-code mints a sign-up token that creates a user per use, each with its own token (Appendix B)', async () => {
 	const admin = await signedInAdmin();
 	const peers: Peer[] = [];
 	const fresh = async () => { const peer = await connect(); peers.push(peer); await peer.next(); return peer; };
 	try {
-		const minted = await command(admin, 'invite', '/invite 2');
+		const minted = await command(admin, 'invite', '/invite-code 2');
 		expect(minted.frame.result).toEqual({});
 		const invite = /apron_join_[A-Za-z0-9_-]+/.exec(minted.notice!.params.body.text)![0];
 		expect(minted.notice!.params.body.text).toContain(`<https://link.apron.chat/#server=wss://demo.test/ws&token=${invite}>`);
@@ -887,7 +887,7 @@ it('/invite mints a sign-up token that creates a user per use, each with its own
 		expect(await runInDurableObject(stub(), async (_instance, state) => (await state.storage.list({ prefix: 'join-token:' })).size)).toBe(0);
 
 		// A budget failure before the sign-up leaves no account and spends no use.
-		const budgeted = /apron_join_[A-Za-z0-9_-]+/.exec((await command(admin, 'invite-budget', '/invite 1')).notice!.params.body.text)![0];
+		const budgeted = /apron_join_[A-Za-z0-9_-]+/.exec((await command(admin, 'invite-budget', '/invite-code 1')).notice!.params.body.text)![0];
 		const identities = () => runInDurableObject(stub(), (_instance, state) => state.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM identities').one().n);
 		const before = await identities();
 		await runInDurableObject(stub(), (instance) => {
@@ -905,14 +905,14 @@ it('/invite mints a sign-up token that creates a user per use, each with its own
 		expect(await identities()).toBe(before);
 		expect((await request(await fresh(), 'join', 'auth', { scheme: 'token', token: budgeted, name: 'Fine' })).result.you.name).toBe('Fine');
 
-		// A new invite replaces the last; /invite 0 revokes it.
-		const replaced = /apron_join_[A-Za-z0-9_-]+/.exec((await command(admin, 'invite-2', '/invite 1')).notice!.params.body.text)![0];
-		expect((await command(admin, 'revoke', '/invite 0')).notice!.params.body.text).toMatch(/revoked/);
+		// A new invite replaces the last; /invite-code 0 revokes it.
+		const replaced = /apron_join_[A-Za-z0-9_-]+/.exec((await command(admin, 'invite-2', '/invite-code 1')).notice!.params.body.text)![0];
+		expect((await command(admin, 'revoke', '/invite-code 0')).notice!.params.body.text).toMatch(/revoked/);
 		expect((await request(await fresh(), 'join', 'auth', { scheme: 'token', token: replaced })).error.code).toBe(-32001);
 		// Past the server's count limit: denied (§1.1).
-		expect((await command(admin, 'too-many', '/invite 51')).frame.error.code).toBe(-32001);
+		expect((await command(admin, 'too-many', '/invite-code 51')).frame.error.code).toBe(-32001);
 		// Only admins mint invites.
-		expect((await command(ada, 'not-admin', '/invite 1')).frame.error.code).toBe(-32001);
+		expect((await command(ada, 'not-admin', '/invite-code 1')).frame.error.code).toBe(-32001);
 	} finally { admin.close(); for (const peer of peers) peer.close(); }
 });
 
