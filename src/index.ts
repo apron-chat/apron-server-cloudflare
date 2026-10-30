@@ -436,7 +436,7 @@ const MAX_JOIN_USES = 50;
 const JOIN_DEFAULT_NAME = "Member";
 const JOIN_INVITE_TTL_MS = 7 * 86_400_000;
 /** Device tokens one user may hold at once, each under its own name. */
-const MAX_DEVICE_TOKENS = 3;
+const MAX_DEVICE_TOKENS = 5;
 /**
  * The default room's `description` as the server's (§3.1), where neither
  * `/server description` nor `SERVER_DESCRIPTION` sets one: trimmed, and left
@@ -457,7 +457,7 @@ function roomServerDescription(description: string | undefined): string | undefi
 const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audience: "everyone" | "owners" | "admins"; roles?: readonly string[] }> = [
 	{ name: "help", usage: "/help", help: "list the commands you can use here", audience: "everyone" },
 	{ name: "invite-bot", usage: "/invite-bot", help: "get a sign-in token for your bot; a new one replaces the last", audience: "owners" },
-	{ name: "invite-device", usage: "/invite-device <name>", help: `get a token that signs in as you on another device, named <name>; at most ${MAX_DEVICE_TOKENS} names, and a name again replaces its token`, audience: "owners" },
+	{ name: "invite-device", usage: "/invite-device add|remove [<name>]", help: `get a token that signs in as you on another device, named <name> (device_1, device_2… if not given), or revoke one; at most ${MAX_DEVICE_TOKENS} names, and adding a name again replaces its token`, audience: "owners" },
 	{ name: "avatar", usage: "/avatar", help: "set your avatar: send this command with one image attached", audience: "owners" },
 	{ name: "passkeys", usage: "/passkeys [remove <n>]", help: "list your account's passkeys, or remove one of them", audience: "owners" },
 	{ name: "admin", usage: "/admin [remove] <user_id>", help: "make a registered user an admin, or no longer one", audience: "admins" },
@@ -621,6 +621,13 @@ async function sessionKey(token: string): Promise<string> {
 }
 
 /** A user's device tokens as stored (StoredDevices), dropping anything malformed. */
+/** Throws `invalid_params` for a device name that is given but not DEVICE_NAME_PATTERN. */
+function checkDeviceName(name: string | undefined): void {
+	if (name !== undefined && !DEVICE_NAME_PATTERN.test(name)) {
+		throw { name: "invalid_params", message: "A device name is 1 to 32 letters, digits, _, . or -, starting with a letter or digit" } satisfies ProtocolError;
+	}
+}
+
 function storedDevices(stored: StoredDevices | undefined): StoredDevices["devices"] {
 	if (stored?.v !== 1 || !Array.isArray(stored.devices)) return [];
 	return stored.devices.filter((device) => typeof device?.name === "string" && typeof device.tokenKey === "string");
@@ -2578,7 +2585,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "too_large", message: "token is too long" } satisfies ProtocolError;
 			const key = DEVICE_TOKEN_KEY_PREFIX + await sha256Hex(token);
 			const stored = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredDeviceToken>(key));
-			const invalid = { name: "denied", message: "This device token is not valid; get a new one with /invite-device on a signed-in device" } satisfies ProtocolError;
+			const invalid = { name: "denied", message: "This device token is not valid; get a new one with /invite-device add on a signed-in device" } satisfies ProtocolError;
 			if (!stored || stored.v !== 1 || typeof stored.userId !== "string" || typeof stored.device !== "string") throw invalid;
 			const identity = this.store.getIdentity(stored.userId);
 			if (!identity) throw invalid;
@@ -5028,8 +5035,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (command.name === "invite-device") {
 			try {
-				if (words.length !== 2) throw { name: "invalid_params", message: `Usage: ${command.usage}` } satisfies ProtocolError;
-				await this.inviteDevice(socket, attachment, request, roomId, words[1]);
+				const action = words[1];
+				if ((action !== "add" && action !== "remove") || words.length > 3 || (action === "remove" && words.length !== 3)) {
+					throw { name: "invalid_params", message: `Usage: ${command.usage}` } satisfies ProtocolError;
+				}
+				if (action === "add") await this.inviteDevice(socket, attachment, request, roomId, words[2]);
+				else await this.removeDevice(socket, attachment, request, roomId, words[2]);
 			} catch (error) {
 				const protocol = errorToProtocol(error);
 				if (protocol.name !== "invalid_params") throw error;
@@ -5968,59 +5979,95 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `/invite-device <name>`: mints a bearer token that signs in as the
-	 * sender from another device, from any origin, kept under `name`. A user
-	 * holds at most MAX_DEVICE_TOKENS; the same name again replaces its token,
-	 * and the user's other connections that signed in with the old one close.
-	 * The token goes to this connection only, in a `~private` notice before
-	 * the result (§1). It does not expire; `/purge` revokes it, and `/rename`
-	 * moves it.
+	 * `/invite-device add [<name>]`: mints a bearer token that signs in as the
+	 * sender from another device, from any origin, kept under `name`, or the
+	 * first free `device_<n>` when none is given. A user holds at most
+	 * MAX_DEVICE_TOKENS; the same name again replaces its token, and the
+	 * user's other connections that signed in with the old one close. The
+	 * token goes to this connection only, in a `~private` notice before the
+	 * result (§1). It does not expire; `/invite-device remove` and `/purge`
+	 * revoke it, and `/rename` moves it.
 	 */
-	private async inviteDevice(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, name: string): Promise<void> {
+	private async inviteDevice(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, requested: string | undefined): Promise<void> {
 		const userId = attachment.userId!;
 		// A token would outlive APRON_ADMIN_TOKEN, as a passkey would.
 		if (userId === ADMIN_USER_ID) throw { name: "denied", message: "The admin user signs in with APRON_ADMIN_TOKEN only; make your own account an admin with /admin" } satisfies ProtocolError;
-		if (!DEVICE_NAME_PATTERN.test(name)) {
-			throw { name: "invalid_params", message: "A device name is 1 to 32 letters, digits, _, . or -, starting with a letter or digit" } satisfies ProtocolError;
-		}
+		checkDeviceName(requested);
 		const token = DEVICE_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 		const key = DEVICE_TOKEN_KEY_PREFIX + await sha256Hex(token);
 		const pointerKey = DEVICES_KEY_PREFIX + userId;
-		const replaced = await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1, writes: 3 }, async () => {
+		const { name, replaced } = await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1, writes: 3 }, async () => {
 			// A `/rename` or `/purge` of the user may have run since this command
 			// began; a token for the old `user_id` would never sign in, and the
 			// connections it replaces would not be found under it.
 			if (!this.store.identityExists(userId)) throw { name: "denied", message: "Your account changed; reconnect and try again" } satisfies ProtocolError;
 			const devices = storedDevices(await this.ctx.storage.get<StoredDevices>(pointerKey));
+			let name = requested;
+			for (let n = 1; name === undefined; n++) {
+				if (!devices.some((device) => device.name === `device_${n}`)) name = `device_${n}`;
+			}
 			const previous = devices.find((device) => device.name === name);
 			if (!previous && devices.length >= MAX_DEVICE_TOKENS) {
 				const names = devices.map((device) => `\`${device.name}\``).join(", ");
-				throw { name: "denied", message: `You have ${MAX_DEVICE_TOKENS} device tokens (${names}); run /invite-device with one of those names to replace its token` } satisfies ProtocolError;
+				throw { name: "denied", message: `You have ${MAX_DEVICE_TOKENS} device tokens (${names}); run /invite-device add with one of those names to replace its token, or /invite-device remove to revoke one` } satisfies ProtocolError;
 			}
 			// Revoke first: a failure between the writes leaves no token, never two.
 			if (previous) await this.ctx.storage.delete(previous.tokenKey);
 			await this.ctx.storage.put<StoredDeviceToken>(key, { v: 1, userId, device: name });
 			await this.ctx.storage.put<StoredDevices>(pointerKey, { v: 1, devices: [...devices.filter((device) => device !== previous), { name, tokenKey: key }] });
-			return !!previous;
+			return { name, replaced: !!previous };
 		}));
-		if (replaced) {
-			// Whatever ran with the old token loses its connections, and the user's pushes too:
-			// their other devices register again on their next connection. The
-			// connections close first, so a push clear refused by the budget
-			// cannot leave them open.
-			for (const peer of this.connectionsOf(userId, socket)) {
-				const state = connectionAttachment(peer);
-				if (state?.device === name) this.closePolicy(peer, state, 1008, "Device token replaced; sign in with the new one");
-			}
-			if (this.config.push) this.store.clearPushSubscriptions(userId, nowMs());
-		}
+		if (replaced) this.closeDevice(socket, userId, name, "Device token replaced; sign in with the new one");
 		this.sendNotice(socket, roomId, [
-			`This token signs in as you (\`${userId}\`) on your device **${name}**${replaced ? ", and replaces its earlier token" : ""}. It does not expire, and anyone who has it can sign in as you, so keep it secret. \`/invite-device ${name}\` again replaces it.`,
+			`This token signs in as you (\`${userId}\`) on your device **${name}**${replaced ? ", and replaces its earlier token" : ""}. It does not expire, and anyone who has it can sign in as you, so keep it secret. \`/invite-device add ${name}\` again replaces it, and \`/invite-device remove ${name}\` revokes it.`,
 			"```\n" + token + "\n```",
 			...this.tokenLink(socket, token, `Or open this link on **${name}**, which signs you in there with any Apron app`),
 			`To sign in, authenticate with the token scheme: \`{"method": "auth", "params": {"scheme": "token", "token": "${token}"}}\``,
 		].join("\n\n"));
 		this.reply(socket, request, {});
+	}
+
+	/**
+	 * `/invite-device remove <name>`: revokes the sender's device token kept
+	 * under `name`, closing the user's other connections that signed in with
+	 * it, and answers with a `~private` notice before the result (§1).
+	 */
+	private async removeDevice(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, name: string): Promise<void> {
+		const userId = attachment.userId!;
+		if (userId === ADMIN_USER_ID) throw { name: "denied", message: "The admin user signs in with APRON_ADMIN_TOKEN only; make your own account an admin with /admin" } satisfies ProtocolError;
+		checkDeviceName(name);
+		const pointerKey = DEVICES_KEY_PREFIX + userId;
+		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1, writes: 2 }, async () => {
+			if (!this.store.identityExists(userId)) throw { name: "denied", message: "Your account changed; reconnect and try again" } satisfies ProtocolError;
+			const devices = storedDevices(await this.ctx.storage.get<StoredDevices>(pointerKey));
+			const previous = devices.find((device) => device.name === name);
+			if (!previous) {
+				const names = devices.map((device) => `\`${device.name}\``).join(", ");
+				throw { name: "invalid_params", message: devices.length ? `You have no device token named ${name}; yours are ${names}` : "You have no device tokens; get one with /invite-device add" } satisfies ProtocolError;
+			}
+			await this.ctx.storage.delete(previous.tokenKey);
+			const rest = devices.filter((device) => device !== previous);
+			if (rest.length) await this.ctx.storage.put<StoredDevices>(pointerKey, { v: 1, devices: rest });
+			else await this.ctx.storage.delete(pointerKey);
+		}));
+		this.closeDevice(socket, userId, name, "Device token revoked");
+		this.sendNotice(socket, roomId, `Revoked the device token for **${name}**.`);
+		this.reply(socket, request, {});
+	}
+
+	/**
+	 * After a device token is replaced or revoked: whatever ran with it loses
+	 * its connections, other than the asking one, and the user's pushes go
+	 * too: their other devices register again on their next connection. The
+	 * connections close first, so a push clear refused by the budget cannot
+	 * leave them open.
+	 */
+	private closeDevice(socket: WebSocketConnection, userId: string, name: string, reason: string): void {
+		for (const peer of this.connectionsOf(userId, socket)) {
+			const state = connectionAttachment(peer);
+			if (state?.device === name) this.closePolicy(peer, state, 1008, reason);
+		}
+		if (this.config.push) this.store.clearPushSubscriptions(userId, nowMs());
 	}
 
 	/**
