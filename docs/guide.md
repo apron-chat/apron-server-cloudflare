@@ -245,7 +245,8 @@ command-line client, or another origin, run `/invite-device add [<id>]`
 as you with the token scheme, from any origin; it does not expire, so keep it
 secret. You can hold 5, each under its own id. Running `/invite-device add`
 again with the same id replaces that token and signs out connections that
-used the old one; `/invite-device remove <id>` revokes it. See [SPEC section 5](../SPEC.md#devices).
+used the old one; `/invite-device remove <id>` revokes it, and
+`/invite-device list` shows your ids with when each was added and last used. See [SPEC section 5](../SPEC.md#devices).
 
 ## User-visible policies
 
