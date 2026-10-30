@@ -27,8 +27,11 @@ During an authorized deployment:
    the generated expression and Block action. It is scoped to the server hostname
    and rejects unsupported paths, non-GET requests, and missing/non-WebSocket
    Upgrade headers, except for the explicit `apron_connection_status=1` HTTP
-   diagnostic probe and, with uploads, `write_url` requests (`PUT` and `OPTIONS`
-   on `/w/`). Probes retain Worker rate limiting and origin checks.
+   diagnostic probe, with uploads or live text, `write_url` requests (`PUT`
+   and `OPTIONS` on `/w/`), and with live text the reads of a live `url`
+   (`GET`, `HEAD` and `OPTIONS` on `/live/`). Probes retain Worker rate
+   limiting and origin checks; live text requests are counted against the
+   same per-address and per-location attempt limiters as connections.
    Header comparison is case insensitive. Have Cloudflare validate
    the expression before saving. Place it before any applicable Skip rule.
 3. Optionally create `apron_admission_off`, disabled, as an emergency Block rule.

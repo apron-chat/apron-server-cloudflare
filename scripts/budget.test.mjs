@@ -167,6 +167,15 @@ test('with uploads, write URLs pass the invalid-request rule and the budget stop
 	assert.equal(mediaHostname('MEDIA_ORIGIN = "http://media.example.test"\n'), undefined);
 });
 
+test('with live text, write URLs and live reads pass the invalid-request rule', () => {
+	const edge = renderEdgeRules('chat.example.test', ADMISSION_BUDGET, 'media.example.test', true);
+	const rule = edge.custom.rules[0];
+	assert.match(rule.expression, /and not \(http\.request\.method in \{"PUT" "OPTIONS"\} and starts_with\(http\.request\.uri\.path, "\/w\/"\)\) and not \(http\.request\.method in \{"GET" "HEAD" "OPTIONS"\} and starts_with\(http\.request\.uri\.path, "\/live\/"\)\) and /);
+	assert.equal(rule.description, 'Apron: allow WebSocket handshakes, connection status probes, upload writes, and live text');
+	// Without uploads, live text still needs its writes.
+	assert.match(renderEdgeRules('chat.example.test', ADMISSION_BUDGET, undefined, true).custom.rules[0].expression, /"\/w\/"/);
+});
+
 test('a plan with uploads requires the bucket binding and both origins', () => {
 	const packageJson = { scripts: { deploy: 'npm run budget:check && wrangler deploy --config wrangler.production.toml' } };
 	const workflow = '      - run: npm run deploy\n';
