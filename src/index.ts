@@ -622,7 +622,6 @@ async function sessionKey(token: string): Promise<string> {
 	return SESSION_KEY_PREFIX + await sha256Hex(token);
 }
 
-/** A user's device tokens as stored (StoredDevices), dropping anything malformed. */
 /** Throws `invalid_params` for a device id that is given but not DEVICE_ID_PATTERN. */
 function checkDeviceId(id: string | undefined): void {
 	if (id !== undefined && !DEVICE_ID_PATTERN.test(id)) {
@@ -630,6 +629,7 @@ function checkDeviceId(id: string | undefined): void {
 	}
 }
 
+/** A user's device tokens as stored (StoredDevices), dropping anything malformed. */
 function storedDevices(stored: StoredDevices | undefined): StoredDevices["devices"] {
 	if (stored?.v !== 1 || !Array.isArray(stored.devices)) return [];
 	return stored.devices.filter((device) => typeof device?.name === "string" && typeof device.tokenKey === "string");
