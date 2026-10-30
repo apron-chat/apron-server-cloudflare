@@ -22,6 +22,18 @@ function reference(output: Uint8Array, limit: number): Uint8Array {
 	return tail.slice(start);
 }
 
+describe('liveTextString', () => {
+	it("decodes as WHATWG's UTF-8 decode without BOM (§4.8.3)", () => {
+		const bytes = (...b: number[]) => new Uint8Array(b);
+		// One U+FFFD per maximal invalid subsequence (Unicode §3.9.6).
+		expect(liveTextString(bytes(0x61, 0xf1, 0x80, 0x80, 0xe1, 0x80, 0xc2, 0x62))).toBe('a\ufffd\ufffd\ufffdb');
+		expect(liveTextString(bytes(0xe1, 0x80, 0xe2, 0xf0, 0x91, 0x92, 0xf1, 0xbf, 0x41))).toBe('\ufffd\ufffd\ufffd\ufffdA');
+		// An incomplete sequence at the end is one U+FFFD; a leading BOM stays.
+		expect(liveTextString(bytes(0x65, 0xe2, 0x82))).toBe('e\ufffd');
+		expect(liveTextString(bytes(0xef, 0xbb, 0xbf, 0x62))).toBe('\ufeffb');
+	});
+});
+
 describe('keep_last and keep_first', () => {
 	it('cuts a terminal at its first control character in the last part (§4.8.6)', () => {
 		expect(keepLast(encode('abc\x1b[31mdef'), 100)).toEqual(encode('abc\x1b[31mdef'));

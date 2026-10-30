@@ -39,9 +39,13 @@ export function keepFirst(text: Uint8Array, limit: number): Uint8Array {
 	return text.subarray(0, end);
 }
 
-const decoder = new TextDecoder("utf-8");
+const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
 
-/** Kept bytes as text; invalid UTF-8 reads as U+FFFD, as a client decodes it. */
+/**
+ * Kept bytes as text, with WHATWG's UTF-8 decode without BOM (§4.8.3): each
+ * invalid sequence, and an incomplete one at the end, reads as one U+FFFD,
+ * and a leading BOM is kept, as a client's streaming decoder shows it.
+ */
 export function liveTextString(bytes: Uint8Array): string {
 	return decoder.decode(bytes);
 }
