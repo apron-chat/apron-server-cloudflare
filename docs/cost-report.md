@@ -701,6 +701,129 @@ and 84% of Paid's daily 12,900 (334,800 GB-s in a 31-day month, under Paid's
 `offlineGraceSeconds` and `statusCoalesceSeconds` trade staleness for
 duration: at 30 seconds each the duration rows halve.
 
+## Live text
+
+Live text (`embed:terminal`, `embed:append`; [SPEC section 4.5](../SPEC.md#45-live-text),
+[configuration](configuration.md#live-text)) was measured on 2026-10-30 in two
+ways, both local, never against the deployed server:
+
+- Rows and bytes: [`test/live-text-cost.integration.test.ts`](../test/live-text-cost.integration.test.ts),
+  with the Workers Paid and Free policies, on native SQLite in the test
+  runtime, as the rest of this report (`npm test -- --run
+  test/live-text-cost.integration.test.ts --reporter=verbose` prints the table).
+- Requests, wall time and CPU: [`scripts/live-text-load.py`](../scripts/live-text-load.py)
+  against `npx wrangler dev` on a Linux container, with a
+  local copy of `wrangler.toml` whose attempt limiters were raised to 10,000 a
+  minute and `LIMIT_*` variables raising the per-address admission limits, so
+  that eleven HTTP clients on one address are admitted. It streams colored
+  terminal lines (66 bytes each, one chunk per line, as `script` writes them)
+  to a `/embed-terminal` write URL with ten readers attached, and reads the
+  CPU time the local workerd process spent from `/proc`, less the same span
+  idle measured first. The number of requests is counted from the requests
+  each step makes (and checked against Wrangler's request log).
+
+### One text
+
+| Operation | Reads / writes |
+| --- | ---: |
+| Message with a new terminal embed (the user's first live text: creates its `live` limiter rows) | 30 / 19 |
+| Message with a new append embed (`live` limiter rows exist) | 19 / 18 |
+| `/embed-terminal` (charges the post and the start; posts nothing) | 17 / 14 |
+| Write claimed (the `PUT` arrives); a command's write, which posts its message | 1 / 2; 4 / 6 |
+| Text finished: terminal with 32 KB of output, append with 4 KB, or nothing kept | 7 / 6 |
+| Alarm ends a write that never came | 7 / 6 |
+| Alarm with no open text | none (known to be none, from memory) |
+| Open texts read after a wake / again | 2 / 1; none |
+
+Each figure includes the day's budget row. A text also reschedules the alarm
+when it starts, when its write arrives and when it ends (6 / 3 each, the
+alarm-scheduling row of the [matrix](#reservation-accounting), `setAlarm`
+included), so a whole text is about **50 rows read and 36 written**, two to
+three posts' worth, whichever way it starts. Every operation stayed within
+its reservation (the claim reserves a post's 264 / 120, the finish 104 / 88
+as maintenance).
+
+Stored: the finished terminal is one record, its `output` JSON-escaped (32 KB
+of colored output was 45,457 bytes of JSON, and the database grew 45,056
+bytes); the creation snapshot with `url` stays beside it (a few hundred
+bytes). The `output` is cut further while its JSON passes 128 KiB, its worst
+case (every byte a control character, six bytes of JSON each). An append adds
+its kept text (at most 4 KB) to one record. The open-text row (`live_texts`)
+is at most a few kilobytes and is deleted when none is open. On Free (16 KB
+kept) the figures are the same rows, 22,754 bytes of JSON, and 24,576
+bytes of growth.
+
+| Load, Workers Paid limits (local) | 120 s, ordinary user, 10 readers | 300 s, admin, 10 readers | 120 s, no reader |
+| --- | ---: | ---: | ---: |
+| Sent (ended by the time limit) | 1,724,348 bytes, 26,126 chunks | 1,824,322 bytes, 27,641 chunks | 1,722,054 bytes |
+| Each reader got | everything but the line sent after the end | the same | |
+| Kept as `output` | 32,766 bytes | 32,766 bytes | 32,766 bytes |
+| Worker requests / Durable Object requests | 11 / 11 (1 `PUT`, 10 `GET`s), plus 1/20 for the command's frame | 11 / 11 | 1 / 1 |
+| SQL rows read / written | about 50 / 36 (above) | the same | the same |
+| Durable Object awake (wall clock) | 120 s, 15 GB-s at 128 MB | 300 s, 37.5 GB-s | 120 s, 15 GB-s |
+| workerd CPU, Worker and object together, less idle | 5.8 s | 9.1 s | 4.8 s |
+| The same before batching readers and piping natively | 29.1 s | 31.7 s | |
+
+Two changes came from the first measurement. Readers were sent each chunk as
+it came, one write per chunk per reader through the runtime: 27,000 chunks
+to ten readers cost 29 seconds of CPU. They now get what arrived in one batch
+at most every 50 ms (or 16 KiB), and ten readers cost about one second over
+the writer alone. And the entry Worker pumped the write's body with
+JavaScript (to cancel it when the object answers early), about 0.14 ms of
+Worker CPU per chunk, so 4 seconds of billed CPU for a worst-case text; it
+now pipes it natively through an `IdentityTransformStream` and aborts the
+pipe, so the Worker's CPU no longer grows with the text: it is the setup of
+its requests (a token check, two rate-limiter calls). The CPU left is the
+object's, which Durable Objects do not bill beyond duration, and local
+workerd's own proxying; production CPU will differ, and the figures are an
+upper bound for the work, not a billing figure.
+
+### Worst-case month
+
+At the Workers Paid limits, 100 texts a day start server-wide; the worst
+month has every one at its limits: 30 reads each (10 at once), the longest
+time (300 s, as if every writer were an admin or mod), a message whose readers
+wait the whole 2-minute window for its write, and a write that never came
+ending by the alarm. Requests and rows per day, times 31, against the plan's
+included usage and this server's own budgets
+([SPEC section 7](../SPEC.md#7-budget-accounting-and-plan-guarantee),
+`src/plans/paid.ts`):
+
+| Resource | Included (Paid, a month) | Server budget or stop | Before: worst day (month) | Live text adds, worst day (month) | After: worst day (month) |
+| --- | ---: | --- | ---: | ---: | ---: |
+| Durable Object requests | 1,000,000 | daily stop at 90% of 32,000; monthly stop at 50% | about 21,000 (651,000) | 3,200: 100 × (1 `PUT` + 30 `GET`s + 1 alarm), the command frames 5 (99,200) | about 24,200 (750,200) |
+| Worker requests | 10,000,000 | same stops | admissions and probes within the attempt limiters | 3,100 (96,100) | + 1% of the daily share |
+| Worker CPU | 30,000,000 ms | same stops | a few ms a request | the setup of 3,100 requests, about 2 ms each (about 200,000 ms) | + under 1% |
+| Durable Object duration | 400,000 GB-s | daily stop at 90% of 12,900; monthly stop at 50% | one object awake all day: 10,800 (334,800) | 100 × (300 + 120) s at 128 MB: 5,250 (162,750) alone; 3,000 for ordinary users | still at most 10,800 (334,800): one object cannot be awake longer than the day |
+| SQL rows written | 50,000,000 | 800,000 a day (fails closed) | up to the ceiling | about 3,600 | within the same ceiling |
+| SQL rows read | 25,000,000,000 | 30,000,000 a day (fails closed) | up to the ceiling | about 5,000 | within the same ceiling |
+| SQL storage | 5 GB-month | 768 MiB high-water (growth stops) | up to the watermark | the kept text of 7 days: at most 700 × 132 KiB ≈ 90 MiB (typical 45 KB each: about 31 MB) | within the same watermark |
+| Logs (from 2026-12-01) | 50 GB | monthly stop at 50% | | about 32 invocations a text, sampled at 0.1: under 100 MB | + under 0.2% |
+
+So live text fits the plan: alone its worst month is a tenth of the included
+Durable Object requests, 1% of the Worker requests, and under 1% of the rows
+written and CPU. It exceeds no daily share: the worst day stays under the
+account-usage stop (28,800 Durable Object requests). It adds no duration the
+single object did not already bound: the object cannot be awake more than a
+day a day, which the duration share covers, so streaming spends duration, as
+user status does, rather than adding a new risk; what it changes is the
+typical month, in which the object hibernates between events and each text
+keeps it awake for its length (20 two-minute texts a day are about 300 GB-s,
+under 1% of a daily share). As before this change, a month spent entirely at
+every ceiling would reach the budget guard's monthly stop at half the
+included Durable Object requests: about day 21 instead of day 24. The guard
+then blocks the hostname, so the included usage is still never billed past;
+that stop is how the plan guarantee is kept (section 7), and live text moves
+it three days earlier only in that all-out case. The 120- and 300-second
+limits are the owner's maximums and are kept; the counts above are the
+levers, and halving `readsPerText` or `startsPerDay` halves live text's share.
+
+On Workers Free (off by default; `LIVE_TEXT=true`), at its limits a day is
+30 texts × (1 + 15 + 1) = 510 Durable Object requests of 100,000, about 1,100
+rows written of the 60,000 foreground, at most 3 MB kept for the day's
+retention of the 96 MiB high-water mark, and duration within the same
+single-object bound (10,800 of 13,000 GB-s).
+
 ## Retention, maintenance, and persistent state
 
 The three-day cleanup advanced the internal server-wide retention floor
@@ -867,6 +990,12 @@ written), the maintenance-reserve test's 76 posts, and the evicted object's
 151,552-byte file (schema 10), and the schema 9 rebuild's row counts
 (measured into schema 10).
 
+Live text's CPU figures come from a local `wrangler dev`, whose workerd also
+proxies and traces each request: they bound the work, not a deployed bill.
+Its request counts follow from the code paths and Wrangler's request log;
+Cloudflare's own analytics were not read.
+
 The executable coverage for this report is in
-[`test/accounting.integration.test.ts`](../test/accounting.integration.test.ts)
-and [`test/pressure.integration.test.ts`](../test/pressure.integration.test.ts).
+[`test/accounting.integration.test.ts`](../test/accounting.integration.test.ts),
+[`test/pressure.integration.test.ts`](../test/pressure.integration.test.ts)
+and [`test/live-text-cost.integration.test.ts`](../test/live-text-cost.integration.test.ts).
