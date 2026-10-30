@@ -321,10 +321,10 @@ posts.
   `/passkeys` reads at most 8 credential rows; `/passkeys remove` adds one
   delete with its index. Adding a passkey to an account without a WebAuthn
   user handle writes it at `begin` (one conditional row update).
-- A sign-up with an `/invite` token is an `/invite-token` registration, plus
+- A sign-up with an `/invite-code` token is an `/invite-token` registration, plus
   up to 8 `user_id` availability probes (8 reads each, reserved), the new
   user's identity read, and one KV read and three KV writes (in one put),
-  reserved at their bound. `/invite` and `/invite-device` are one KV read and
+  reserved at their bound. `/invite-code` and `/invite-device` are one KV read and
   three writes, `/invite-token` two KV writes; signing in with a device
   token is one KV read, like a bot token.
 - Roles (`roles_json`) and `ext` (`ext_json`) are columns of the identity

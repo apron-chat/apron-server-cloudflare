@@ -423,14 +423,14 @@ const READ_CURSOR_FLUSH_MS = 60_000;
 /** At most how many frames a connection's sign-in holds for it (holdDeliveries). */
 const MAX_HELD_FRAMES = 256;
 /**
- * Sign-up invites (`/invite`, protocol Appendix B): one token that creates a
+ * Sign-up invites (`/invite-code`, protocol Appendix B): one token that creates a
  * new registered user on each use, up to its count. What they look like, the
  * key of the one live invite by the token's SHA-256, and the pointer to it.
  */
 const JOIN_TOKEN_PREFIX = "apron_join_";
 const JOIN_TOKEN_KEY_PREFIX = "join-token:";
 const JOIN_INVITE_KEY = "join-invite";
-/** Sign-ups one `/invite` may allow, and how long it lasts. */
+/** Sign-ups one `/invite-code` may allow, and how long it lasts. */
 const MAX_JOIN_USES = 50;
 /** The name of a user who signs up with an invite and asks for none: not "Guest", which names guests. */
 const JOIN_DEFAULT_NAME = "Member";
@@ -465,7 +465,7 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", audience: "admins" },
 	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
 	{ name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", audience: "admins" },
-	{ name: "invite", usage: "/invite <uses>", help: `get a token that signs up to <uses> new users (at most ${MAX_JOIN_USES}) for a week, replacing the last one; /invite 0 revokes it`, audience: "admins" },
+	{ name: "invite-code", usage: "/invite-code <uses>", help: `get a token that signs up to <uses> new users (at most ${MAX_JOIN_USES}) for a week, replacing the last one; /invite-code 0 revokes it`, audience: "admins" },
 	{ name: "emoji", usage: "/emoji add|remove :name:", help: "add a custom emoji, or replace its image: send /emoji add :name: with one image attached; /emoji remove :name: removes it", audience: "owners", roles: EMOJI_ROLES },
 	{ name: "server", usage: "/server [title|description [<text>] | avatar]", help: "show this server's title, description and avatar; set one, the avatar with one image attached; or clear one, back to the deployment's", audience: "admins" },
 	{ name: "toggle", usage: "/toggle <activity|uploads|presence|addmember>", help: "turn typing activity, uploads, user status (presence), or users adding others to rooms (addmember) off or on for everyone", audience: "admins" },
@@ -575,7 +575,7 @@ interface StoredDevices {
 }
 
 /**
- * The live sign-up invite (`/invite`), stored only under its token's SHA-256:
+ * The live sign-up invite (`/invite-code`), stored only under its token's SHA-256:
  * how many sign-ups it has left and when it expires.
  */
 interface StoredJoinInvite {
@@ -1824,7 +1824,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// (no sign-in page).
 				auth: this.passkeysOffered(origin) ? ["webauthn", "token", "guest"] : ["token", "guest"],
 				// Schemes that create an account (§3.2): a passkey registration, and
-				// a token only as an admin's sign-up invite (`/invite`); other tokens
+				// a token only as an admin's sign-up invite (`/invite-code`); other tokens
 				// sign in to existing users. A guest is a throwaway identity for one
 				// connection, not an account, so `guest` is listed only in `auth`.
 				signup: this.passkeysOffered(origin) ? ["webauthn", "token"] : ["token"],
@@ -2641,7 +2641,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Signs up a new user with the live `/invite` token (protocol Appendix B):
+	 * Signs up a new user with the live `/invite-code` token (protocol Appendix B):
 	 * each use creates a registered user with no passkey, named as `auth`
 	 * asks (else "Guest"), with a `user_id` picked from the name like a
 	 * passkey registration's, charged as a registration. The result carries
@@ -2700,14 +2700,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `/invite <uses>`: mints the sign-up invite (protocol Appendix B), a
+	 * `/invite-code <uses>`: mints the sign-up invite (protocol Appendix B), a
 	 * token that signs up to `uses` new users within a week, and revokes the
-	 * last one; `/invite 0` only revokes. The token goes to this connection
+	 * last one; `/invite-code 0` only revokes. The token goes to this connection
 	 * only, in a `~private` notice, before the result (§1).
 	 */
 	private async invite(socket: WebSocketConnection, request: RequestFrame, roomId: string, count: string): Promise<void> {
 		const uses = /^\d{1,3}$/.test(count) ? Number(count) : -1;
-		if (uses < 0) throw { name: "invalid_params", message: `Usage: /invite <uses>, 0 to ${MAX_JOIN_USES}` } satisfies ProtocolError;
+		if (uses < 0) throw { name: "invalid_params", message: `Usage: /invite-code <uses>, 0 to ${MAX_JOIN_USES}` } satisfies ProtocolError;
 		// More uses than the server allows is a count limit: denied (§1.1).
 		if (uses > MAX_JOIN_USES) throw { name: "denied", message: `An invite signs up at most ${MAX_JOIN_USES} users` } satisfies ProtocolError;
 		const token = JOIN_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
@@ -5071,7 +5071,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 			return;
 		}
-		if (["admin", "role", "kick", "rename", "purge", "toggle", "invite-token", "invite"].includes(command.name)) {
+		if (["admin", "role", "kick", "rename", "purge", "toggle", "invite-token", "invite-code"].includes(command.name)) {
 			try {
 				if (command.name === "role") {
 					if (words.length !== 2 && words.length !== 3) throw { name: "invalid_params", message: `Usage: ${command.usage}` } satisfies ProtocolError;
@@ -5089,7 +5089,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				else if (command.name === "purge") await this.purge(socket, attachment, request, roomId, target);
 				else if (command.name === "toggle") this.toggle(socket, request, roomId, target);
 				else if (command.name === "invite-token") await this.inviteToken(socket, attachment, request, roomId, target);
-				else if (command.name === "invite") await this.invite(socket, request, roomId, target);
+				else if (command.name === "invite-code") await this.invite(socket, request, roomId, target);
 				else await this.rename(socket, request, roomId, target, words[2].replace(/^@/, ""));
 			} catch (error) {
 				// A mistyped or wrong user_id is an error to show, like an unknown
