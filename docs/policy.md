@@ -1,6 +1,6 @@
 # Public demo authentication and policy
 
-The demo speaks Apron protocol **9**. Its `server` frame advertises the
+The demo speaks Apron protocol **10**. Its `server` frame advertises the
 capabilities `history`, `edit`, `rooms`, `reactions`, `command`, and `ext`,
 the extensions `ext:settings`, `ext:limits`, and `ext:permissions`, and
 `server.ping` (45 seconds). Others depend on the deployment:
@@ -10,6 +10,10 @@ the extensions `ext:settings`, `ext:limits`, and `ext:permissions`, and
   [plans](configuration.md#plans)), and admins can turn it off and on with
   `/toggle activity`.
 - `embed:upload` and `ext:media` where uploads are configured (below).
+- `embed:terminal` and `embed:append` (live text, below) where `PUBLIC_ORIGIN`
+  and `UPLOAD_SIGNING_KEY` are set, on with the Workers Paid budgets and off
+  with the Free ones; `LIVE_TEXT` overrides either, and admins can turn it off
+  and on with `/toggle livetext`.
 - `status` where push is configured, which also shows each user's status to
   others (presence, below; `/toggle presence`).
 - `ext:emoji` once the custom emoji catalog has an emoji (below).
@@ -101,11 +105,13 @@ within it:
 - Commands: `/help` replies with a `~private` notice listing the commands the
   sender may run. Registered users other than bots have `/invite-bot` (a bot
   token), `/invite-device <name>` (a token for another device), `/passkeys`,
-  and, with uploads, `/avatar` (all below); those with the role `admin`,
+  and, with uploads, `/avatar` (all below); anyone who may post has, with
+  live text, `/embed-terminal [title]` and `/embed-append [markdown]`
+  (below); those with the role `admin`,
   `mod`, or `friend` also have `/emoji add|remove :name:` (custom emoji,
   below). Admins have their own (see [SPEC section 5](../SPEC.md#admins)),
   among them `/server`, which sets the server's title, description and
-  avatar (below), and `/toggle activity|uploads|presence|addmember`. An
+  avatar (below), and `/toggle activity|uploads|presence|addmember|livetext`. An
   unknown command is `invalid_params`, and one the sender may not run
   `denied`.
 - Uploads (cap `embed:upload`, Workers Paid budgets): registered users attach
@@ -120,6 +126,42 @@ within it:
   keep embeds by it. Admins can turn uploads off and on with
   `/toggle uploads`. Clients should resize images and strip their metadata
   (such as location) before uploading: the server stores the bytes as sent.
+- Live text (caps `embed:terminal` and `embed:append`, PROTOCOL.md §4.8.3):
+  a sender streams text with an HTTP `PUT` to a `write_url`, and everyone in
+  the room watches it grow at the embed's `url`: a terminal (80×40, colors
+  and cursor movement, such as a build) or text appended to the message's
+  markdown body (such as an LLM's reply). It starts two ways, with the same
+  limits:
+  - `/embed-terminal [title]` or `/embed-append [markdown]`: the result is
+    `{"embeds": [{embed_id, kind, write_url}]}`, and a `~private` notice
+    gives the link in copy-paste recipes, for example
+    `script -qfc 'stty cols 80 rows 40; make test' /dev/null | curl -sT - '<write_url>'`.
+    Nothing is posted until the `PUT` arrives; then the message is posted
+    from the sender, in the command's room, replying where the command did.
+    An append's opening markdown, when there is one, ends in a paragraph
+    break, so the streamed text starts a new paragraph.
+  - A `message` with a new `{"kind": "terminal"}` or `{"kind": "append"}`
+    embed: the message is posted at once, with the embed's `url`, and the
+    result lists its `write_url`.
+
+  A text streams for at most **120 seconds** from its `PUT` (**300** for
+  users with the role `admin` or `mod`), and at most 2 MB. A user has **one
+  live text open at a time**, counting a `write_url` not used yet, which
+  expires after **2 minutes**. Starting one is limited to 3 at once and then
+  one every 3 min 20 s per user, 6 and one every 1 min 40 s per IP address,
+  20 a day per user, 100 a day on the server, and 4 open at once on the
+  server; a message has one at most. A text has at most 10 readers at once
+  and 30 reads in all. Guests use it only where guests may post. When a
+  text ends (its body ends, the writer goes, or a limit is reached), the
+  message gets one more snapshot: a terminal keeps its last 32 KB as
+  `output`, and an append's text joins `body.text` (its first part, so the
+  body stays within 4,096 bytes), without changing mentions. A save that
+  removes the embed, or deletes the message, ends it early, publishing
+  nothing more. Nothing is stored while the text streams: if the server
+  restarts meanwhile (a deploy), the text ends and its embed is removed.
+  Why these limits: each text keeps the one server object awake and costs a
+  request for its write and for each reader, and its kept text is stored for
+  the week its message is ([cost report](cost-report.md#live-text)).
 - Status (cap `status`, with push): a user chooses a status with `me`
   `{"status": …}`: `online` (the default), `dnd` (busy: no pushes),
   `invisible` (appear `offline` to everyone), or `""` (none: show no

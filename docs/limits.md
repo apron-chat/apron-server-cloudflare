@@ -181,6 +181,44 @@ attachments and 256 KiB for avatars and custom emoji. A write URL is valid for
 (20 a day per account), "Daily upload limit reached for the server" (500 a
 day), and "Upload storage is full" (retry in an hour).
 
+### Live text
+
+Live text (`embed:terminal` and `embed:append`, PROTOCOL.md §4.8.3) is
+offered by `/embed-terminal [title]`, `/embed-append [markdown]`, and a
+`message` with a new `{"kind": "terminal"}` or `{"kind": "append"}` embed.
+Both ways share these limits:
+
+| Limit | Demo value | Refusal |
+| --- | ---: | --- |
+| Open live texts per account, a `write_url` not used yet included | 1 | `denied` "You already have a live text open; finish it, or let its write_url expire, before you start another" |
+| Live texts started per account | 3 at once, then one every 3 min 20 s; 20 a day | `retry_after` "Live text limit reached" / "Daily live text limit reached" |
+| Live texts started per IP address | 6 at once, then one every 1 min 40 s | `retry_after` "Live text limit reached" |
+| Live texts started on the server | 100 a day | `retry_after` "Daily live text limit reached for the server" |
+| Live texts open on the server | 4 | `retry_after` "Live text is busy on this server; try again shortly" |
+| Live texts per message | 1, and at most one `append` | `denied` |
+| `write_url` lifetime | 2 minutes | the `PUT` gets 403 or 409, and a message's embed is removed |
+| Streaming time, from the `PUT` | 120 s; 300 s for `admin` and `mod` | the text ends, and the `PUT` is answered |
+| Bytes one `PUT` may send | 2 MB | the text ends |
+| Terminal output kept (`keep_last`) | the last 32 KB | the rest scrolls away |
+| Appended text kept | what keeps `body.text` within 4,096 bytes | the text ends with the first part |
+| Readers of one text at once / over its life | 10 / 30 | `GET` 429 with `Retry-After: 10` / 403 |
+
+Every one of these limits is server-wide policy: `retry_after` refusals carry
+no `ext.limits` category, since none of them counts every request of a row.
+Each command or message also counts as a post. Guests use live text only
+where guests may post. A terminal or append embed in any other command is
+`invalid_params`.
+
+The `PUT` and the `GET`s are plain HTTP, counted against the same per-address
+attempt limit as WebSocket connections (20 a minute). The `PUT` is answered
+in plain text when the text has ended and its last snapshot is published:
+`200` "Done: the text is posted.", "Stopped at the 120-second limit; what was
+kept is posted.", "Stopped at the 2 MB limit; …", or "Stopped: the message
+or its embed was removed."; a used or expired `write_url` is `409` or `403`.
+A `GET` of a text that has ended, or never existed, is `404`: keep what you
+show until the snapshot without the live `url` arrives. `url` is
+`text/plain; charset=utf-8` with `X-Content-Type-Options: nosniff`.
+
 ### Size bounds
 
 Oversized fields get `too_large`; a frame over the limit closes the socket

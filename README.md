@@ -27,6 +27,13 @@ for a zero-overage deployment.
   tier for a week (avatars a month). Admins, mods and friends add custom
   emoji with `/emoji add :name:`, which everyone can react with
   (`ext:emoji`).
+- **Live terminals and streamed replies.** `/embed-terminal` and
+  `/embed-append` give a link to `curl -T` a terminal session or an LLM's
+  reply into the room, which everyone watches grow, and bots do the same with
+  a message's `terminal` or `append` embed (`embed:terminal`,
+  `embed:append`). Streams last up to two minutes (five for admins and mods),
+  one at a time per user, held in memory and stored once when they end; see
+  [live text](docs/limits.md#live-text).
 - **Push for mentions and replies.** With VAPID keys set, a mention or a
   reply wakes a signed-in user whose every tab is idle or closed, through
   their browser's Web Push service (`server.push` kind `webpush`), unless
