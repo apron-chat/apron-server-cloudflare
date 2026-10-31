@@ -961,7 +961,11 @@ it('tells a connection that never pinged why, then closes it as stale once unpin
 		// is stale.
 		vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 10_000);
 		const log = vi.spyOn(console, 'log');
+		const writeDataPoint = vi.fn();
+		await runInDurableObject(env.DEMO.getByName('public-demo-v1'), (instance) => { (instance as unknown as { runtimeEnv: { METRICS?: unknown } }).runtimeEnv.METRICS = { writeDataPoint }; });
 		const listed = (await request(carol, 'list', 'room_list', { room_id: 'general', members: true })).result.joined[0].members.map((member: { user_id: string }) => member.user_id);
+		await runInDurableObject(env.DEMO.getByName('public-demo-v1'), (instance) => { delete (instance as unknown as { runtimeEnv: { METRICS?: unknown } }).runtimeEnv.METRICS; });
+		expect(writeDataPoint).toHaveBeenCalledWith({ indexes: ['stale_close'], blobs: ['stale_close', 'unpinged', 'http://localhost:5173'], doubles: [1] });
 		expect(listed).toContain(carolId.user_id);
 		expect(listed).not.toContain(bobId.user_id);
 		const notice = await until(bob, (frame) => frame.method === 'message' && frame.params?.from?.user_id === '~private' && String(frame.params?.body?.text).startsWith('Did not receive'));

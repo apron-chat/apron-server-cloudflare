@@ -70,23 +70,6 @@ it('answers a status probe with storage unavailable while budget writes fail, an
 	expect(await reopened.json()).toEqual({ available: true });
 });
 
-it('logs how long a timer kept the object awake since its last activity', async () => {
-	const log = vi.spyOn(console, 'log');
-	await runInDurableObject(env.DEMO.getByName('timer-log'), (instance) => {
-		const server = instance as unknown as { noteActivity(): void; noteTimerFired(timer: string): void };
-		const start = Date.now();
-		vi.spyOn(Date, 'now').mockReturnValue(start);
-		server.noteActivity();
-		vi.spyOn(Date, 'now').mockReturnValue(start + 45_000);
-		server.noteTimerFired('presence');
-		vi.spyOn(Date, 'now').mockReturnValue(start + 60_000);
-		server.noteTimerFired('push_wake');
-	});
-	const lines = log.mock.calls.map(([line]) => String(line)).filter((line) => line.includes('"timer_kept_awake"')).map((line) => JSON.parse(line));
-	// The second counts only from the first: a timer firing is activity too.
-	expect(lines).toEqual([{ event: 'timer_kept_awake', timer: 'presence', ms: 45_000 }, { event: 'timer_kept_awake', timer: 'push_wake', ms: 15_000 }]);
-});
-
 it('posts the alert though registration is closed and the admin user does not exist yet', async () => {
 	const stub = env.DEMO.getByName('alert-registration-closed');
 	const warn = vi.spyOn(console, 'warn');
@@ -94,9 +77,87 @@ it('posts the alert though registration is closed and the admin user does not ex
 		const store = (instance as unknown as Runtime).store as unknown as Store & { config: { registeredIdentityCount: number } };
 		expect(state.storage.sql.exec("SELECT COUNT(*) AS count FROM identities WHERE user_id = 'admin'").one().count).toBe(0);
 		store.config.registeredIdentityCount = 0;
+		const writeDataPoint = vi.fn();
+		(instance as unknown as { runtimeEnv: { METRICS?: unknown } }).runtimeEnv.METRICS = { writeDataPoint };
 		await (instance as unknown as { notifyAdmins(text: string): Promise<void> }).notifyAdmins('**Budget stop is on.**');
+		delete (instance as unknown as { runtimeEnv: { METRICS?: unknown } }).runtimeEnv.METRICS;
+		// No admin but the sender: nobody mentioned, nothing pushed.
+		expect(writeDataPoint).toHaveBeenCalledWith({ indexes: ['admins_notified'], blobs: ['admins_notified', 'not_pushed'], doubles: [0] });
 		const [latest] = state.storage.sql.exec<{ record_json: string }>("SELECT record_json FROM records WHERE room_id = 'general' AND kind = 'message' ORDER BY log_id DESC LIMIT 1").toArray();
 		expect(JSON.parse(latest.record_json)).toMatchObject({ from: { user_id: 'admin' }, body: { text: '**Budget stop is on.**', format: 'markdown' } });
 	});
 	expect(warn.mock.calls.map(([line]) => String(line))).toContainEqual(expect.stringContaining('"admins_notified"'));
+});
+
+it('counts alarms and accounting changes in METRICS, and logs why accounting closed', async () => {
+	const stub = env.DEMO.getByName('metrics-counters');
+	const error = vi.spyOn(console, 'error');
+	const points = await runInDurableObject(stub, async (instance, state) => {
+		const runtime = instance as unknown as Runtime & { runtimeEnv: { METRICS?: { writeDataPoint(point: unknown): void } }; alarm(): Promise<void> };
+		const writeDataPoint = vi.fn();
+		runtime.runtimeEnv.METRICS = { writeDataPoint };
+		// An alarm with nothing but status work, then one with cleanup due.
+		state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', Date.now() + 3_600_000);
+		runtime.store.forgetCleanupDue();
+		await runtime.alarm();
+		state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1');
+		runtime.store.forgetCleanupDue();
+		await runtime.alarm();
+		// A budget write that fails closes accounting as uncertain; it reopens once writes work.
+		state.storage.sql.exec(`CREATE TRIGGER fail_budget_reservation
+			BEFORE UPDATE OF reads_reserved ON resource_budgets
+			BEGIN SELECT RAISE(ABORT, 'injected budget reservation failure'); END`);
+		runtime.store.getRoomState();
+		state.storage.sql.exec('DROP TRIGGER fail_budget_reservation');
+		runtime.store.getRoomState();
+		delete runtime.runtimeEnv.METRICS;
+		return writeDataPoint.mock.calls.map(([point]) => (point as { blobs: string[] }).blobs);
+	});
+	expect(points).toEqual([['alarm', 'light'], ['alarm', 'full'], ['accounting', 'uncertain'], ['accounting', 'recovered']]);
+	const closed = error.mock.calls.map(([line]) => String(line)).filter((line) => line.includes('"accounting_closed"')).map((line) => JSON.parse(line));
+	expect(closed).toEqual([{ event: 'accounting_closed', kind: 'uncertain', message: expect.stringContaining('injected budget reservation failure') }]);
+});
+
+it('runs the full alarm for a live text past its deadline, or open texts a lost instance left, and not otherwise', async () => {
+	type LiveRuntime = Runtime & { alarm(): Promise<void>; liveDeadlineAt: number | undefined };
+	await runInDurableObject(env.DEMO.getByName('live-deadline-alarm'), async (instance, state) => {
+		const runtime = instance as unknown as LiveRuntime;
+		state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', Date.now() + 3_600_000);
+		runtime.store.forgetCleanupDue();
+		const expire = vi.spyOn(runtime.store, 'expireLiveTexts');
+		// No open text to recover: a light alarm.
+		await runtime.alarm();
+		expect(expire).not.toHaveBeenCalled();
+		// A text past its deadline: the full alarm ends it (the time limit).
+		runtime.liveDeadlineAt = Date.now() - 1;
+		await runtime.alarm();
+		expect(expire).toHaveBeenCalledTimes(1);
+	});
+	await runInDurableObject(env.DEMO.getByName('live-lost-alarm'), async (instance, state) => {
+		const runtime = instance as unknown as LiveRuntime;
+		state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', Date.now() + 3_600_000);
+		runtime.store.forgetCleanupDue();
+		// Open in storage, from an instance that was evicted or redeployed.
+		vi.spyOn(runtime.store, 'openLiveTexts').mockReturnValue([{} as ReturnType<Store['openLiveTexts']>[number]]);
+		const expire = vi.spyOn(runtime.store, 'expireLiveTexts').mockReturnValue({ broadcasts: [], ended: [], next: undefined } as unknown as ReturnType<Store['expireLiveTexts']>);
+		await runtime.alarm();
+		expect(expire).toHaveBeenCalledTimes(1);
+	});
+});
+
+it('runs the full alarm for an upload deadline stored before a wake, which the instance never saw', async () => {
+	await runInDurableObject(env.DEMO.getByName('upload-deadline-wake'), async (instance, state) => {
+		const runtime = instance as unknown as Runtime & { alarm(): Promise<void> };
+		state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', Date.now() + 3_600_000);
+		runtime.store.forgetCleanupDue();
+		// Claimed by an earlier instance: only storage knows its deadline.
+		const stored = vi.spyOn(runtime.store, 'nextUploadDeadline').mockReturnValue(Date.now() - 1);
+		const expire = vi.spyOn(runtime.store, 'expirePendingUploads');
+		await runtime.alarm();
+		expect(stored).toHaveBeenCalledTimes(1);
+		expect(expire).toHaveBeenCalledTimes(1);
+		// Read once per instance: the next alarm goes by what the sweep found.
+		await runtime.alarm();
+		expect(stored).toHaveBeenCalledTimes(1);
+	});
 });

@@ -276,6 +276,13 @@ describe('configuration policy boundaries', () => {
 		expect(isAllowedOrigin(restricted, 'null')).toBe(false);
 	});
 
+	it('bounds presence alarm rounding: at most a minute, the guests\' a multiple of the users\'', () => {
+		expect(config().limits.presenceAlarmSeconds).toBe(DEFAULT_LIMITS.presenceAlarmSeconds);
+		expect(config({ LIMIT_PRESENCE_ALARM_SECONDS: '30', LIMIT_GUEST_PRESENCE_ALARM_SECONDS: '60' }).limits.presenceAlarmSeconds).toBe(30);
+		expect(() => config({ LIMIT_PRESENCE_ALARM_SECONDS: '61' })).toThrow(ConfigError);
+		expect(() => config({ LIMIT_PRESENCE_ALARM_SECONDS: '25', LIMIT_GUEST_PRESENCE_ALARM_SECONDS: '60' })).toThrow(ConfigError);
+	});
+
 	it('requires the timeout for connections that never pinged to outlast the ping timeout', () => {
 		expect(config().limits.unpingedTimeoutSeconds).toBe(900);
 		expect(config({ LIMIT_UNPINGED_TIMEOUT_SECONDS: '150' }).limits.unpingedTimeoutSeconds).toBe(150);

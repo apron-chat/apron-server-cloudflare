@@ -281,6 +281,10 @@ function validateLimits(limits: Limits): void {
 	if (limits.roomListMembers > budget.MAX_ROOM_LIST_MEMBERS) {
 		fail("room_list members exceed the calibrated bound");
 	}
+	if (limits.presenceAlarmSeconds > MAX_STATUS_DELAY_SECONDS || limits.guestPresenceAlarmSeconds > MAX_STATUS_DELAY_SECONDS ||
+		limits.guestPresenceAlarmSeconds % limits.presenceAlarmSeconds !== 0) {
+		fail("presence alarm rounding must be at most a minute, the guests' a multiple of the users'");
+	}
 	if (limits.statusCoalesceSeconds > MAX_STATUS_DELAY_SECONDS || limits.offlineGraceSeconds > MAX_STATUS_DELAY_SECONDS) {
 		fail(`status changes may wait at most ${MAX_STATUS_DELAY_SECONDS} seconds`);
 	}

@@ -143,6 +143,19 @@ export interface Limits {
 	 * a reload or a mobile reconnect within it shows nothing.
 	 */
 	offlineGraceSeconds: number;
+	/**
+	 * A registered user's waiting status change asks the object's alarm for a
+	 * time rounded up to this many seconds, so changes due in one window share
+	 * a wake: at most a day's seconds over this many presence wakes, each
+	 * about 9 metered maintenance writes. Statuses show up to this much later.
+	 */
+	presenceAlarmSeconds: number;
+	/**
+	 * The same for a guest's change, coarser because anyone can open a guest
+	 * connection. A multiple of `presenceAlarmSeconds`, so guests' wakes land
+	 * on the same boundaries and the ceiling does not grow.
+	 */
+	guestPresenceAlarmSeconds: number;
 	sqlWritesPerDay: number;
 	sqlReadsPerDay: number;
 	foregroundWritesPerDay: number;

@@ -68,6 +68,13 @@ PUSH_HOSTS = "fcm.googleapis.com,*.push.services.mozilla.com,web.push.apple.com,
 binding = "MEDIA"
 bucket_name = "apron-media"
 
+# Exact operational counters (src/metrics.ts): stale closes, alarms, pushes,
+# accounting and edge-stop changes. Analytics Engine creates the dataset on
+# its first write; `npm run usage:report` reads it back.
+[[analytics_engine_datasets]]
+binding = "METRICS"
+dataset = "apron_server_metrics"
+
 # The budget guard checks account usage every minute (src/budget-guard.ts).
 [triggers]
 crons = ["* * * * *"]

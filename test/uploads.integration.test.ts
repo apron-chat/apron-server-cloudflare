@@ -137,6 +137,8 @@ describe('store uploads', () => {
 			// Past its window and grace, a write never started is failed by the sweep;
 			// a message left with nothing is a tombstone.
 			expect(store.expirePendingUploads(clock.value)).toMatchObject({ broadcasts: [], next: writeOf(alone.result).write.expires_ms + UPLOAD_WRITE_GRACE_MS });
+			// An alarm after a wake reads the same deadline from storage.
+			expect(store.nextUploadDeadline(clock.value)).toBe(writeOf(alone.result).write.expires_ms + UPLOAD_WRITE_GRACE_MS);
 			clock.value += UPLOADS.writeWindowSeconds * 1_000 + UPLOAD_WRITE_GRACE_MS + 1;
 			expect(store.claimUpload(writeOf(alone.result).write.key, clock.value)).toBe(false);
 			const expired = store.expirePendingUploads(clock.value);
@@ -144,6 +146,7 @@ describe('store uploads', () => {
 			expect(expired.broadcasts[0].params).toMatchObject({ message_id: alone.result.message_id, deleted: true });
 			expect(expired.broadcasts[0].params.body).toBeUndefined();
 			expect(expired.next).toBeUndefined();
+			expect(store.nextUploadDeadline(clock.value)).toBeUndefined();
 			// A message deleted while its write was in flight does not take the object.
 			clock.value += 1_000;
 			const deleted = post(store, clock, 'bob', { body: { text: 'soon gone', embeds: [{ kind: 'upload' }] } });
