@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ADMISSION_BUDGET, DEFAULT_LIMITS } from '../src/budget.ts';
-import { mediaHostname, renderBinding, renderEdgeRules, replaceBinding, validateAdmission, validateDeploymentConfiguration, validateEdgeStop } from './budget.mjs';
+import { mediaHostname, relyingPartyId, renderBinding, renderEdgeRules, replaceBinding, validateAdmission, validateDeploymentConfiguration, validateEdgeStop } from './budget.mjs';
 
 const namespaces = { attempts: '123', prefix: '124', location: '125' };
 
@@ -174,6 +174,18 @@ test('with live text, write URLs and live reads pass the invalid-request rule', 
 	assert.equal(rule.description, 'Apron: allow WebSocket handshakes, connection status probes, upload writes, and live text');
 	// Without uploads, live text still needs its writes.
 	assert.match(renderEdgeRules('chat.example.test', ADMISSION_BUDGET, undefined, true).custom.rules[0].expression, /"\/w\/"/);
+});
+
+test('where the server hostname is its RP ID, passkey related origins pass the invalid-request rule', () => {
+	const plain = renderEdgeRules('chat.example.test', ADMISSION_BUDGET, 'media.example.test', true);
+	assert.doesNotMatch(plain.custom.rules[0].expression, /well-known/);
+	const edge = renderEdgeRules('chat.example.test', ADMISSION_BUDGET, 'media.example.test', true, true);
+	const rule = edge.custom.rules[0];
+	assert.equal(rule.expression, plain.custom.rules[0].expression.replace(' and (http.request.method ne "GET"', ' and not (http.request.method in {"GET" "HEAD"} and http.request.uri.path eq "/.well-known/webauthn") and (http.request.method ne "GET"'));
+	assert.equal(rule.description, 'Apron: allow WebSocket handshakes, connection status probes, upload writes, live text, and passkey related origins');
+	assert.deepEqual(edge.custom.rules.slice(1), plain.custom.rules.slice(1));
+	assert.equal(relyingPartyId('[vars]\nRP_ID = "Chat.Example.Test" # the server\n'), 'chat.example.test');
+	assert.equal(relyingPartyId('[vars]\nRP_ORIGINS = "https://chat.example.test"\n'), undefined);
 });
 
 test('a plan with uploads requires the bucket binding and both origins', () => {

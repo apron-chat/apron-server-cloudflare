@@ -372,16 +372,17 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 		throw new ConfigError("ALLOWED_ORIGINS must contain exact HTTP(S) origins or a standalone *");
 	}
 	if (allowAnyOrigin && env.RP_ORIGINS === undefined) throw new ConfigError("RP_ORIGINS must be explicit when ALLOWED_ORIGINS is *");
-	if (rpOrigins.length === 0 || rpOrigins.some((origin) => !validOrigin(origin))) {
+	// URL parsing takes `*` as a host character, so a would-be wildcard such
+	// as https://*.example.com is refused here rather than matching nothing.
+	if (rpOrigins.length === 0 || rpOrigins.some((origin) => !validOrigin(origin) || origin.includes("*"))) {
 		throw new ConfigError("RP_ORIGINS must contain exact HTTP(S) origins");
 	}
 	if (!allowAnyOrigin && rpOrigins.some((origin) => !allowedOrigins.includes(origin))) throw new ConfigError("RP_ORIGINS must be a subset of ALLOWED_ORIGINS");
 	const rpId = (env.RP_ID === undefined ? "localhost" : String(env.RP_ID)).trim().toLowerCase();
 	if (!rpId || rpId.includes("://") || rpId.includes("/") || rpId.includes(" ")) throw new ConfigError("RP_ID must be a host name");
-	for (const origin of rpOrigins) {
-		const hostname = new URL(origin).hostname.toLowerCase();
-		if (hostname !== rpId && !hostname.endsWith(`.${rpId}`)) throw new ConfigError(`RP_ID is not valid for origin ${origin}`);
-	}
+	// An origin outside RP_ID is a WebAuthn related origin: browsers allow it
+	// where https://<RP_ID>/.well-known/webauthn lists it, which the Worker
+	// answers when it serves RP_ID's host (handleRelatedOrigins).
 	if (env.ADMISSION_OFF !== undefined && !["true", "false"].includes(String(env.ADMISSION_OFF).toLowerCase())) throw new ConfigError("ADMISSION_OFF must be true or false");
 	const admissionOff = String(env.ADMISSION_OFF ?? "").toLowerCase() === "true";
 	const accountingRecovery = env.ACCOUNTING_RECOVERY === undefined || env.ACCOUNTING_RECOVERY === "" ? undefined : String(env.ACCOUNTING_RECOVERY);

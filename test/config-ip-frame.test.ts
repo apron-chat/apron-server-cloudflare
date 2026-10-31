@@ -269,7 +269,6 @@ describe('configuration policy boundaries', () => {
 		expect(() => config({ ALLOWED_ORIGINS: '*' })).toThrow(ConfigError);
 		expect(() => config({ ALLOWED_ORIGINS: '*', RP_ORIGINS: '*' })).toThrow(ConfigError);
 		expect(() => config({ ALLOWED_ORIGINS: '*,http://localhost:5173', RP_ORIGINS: 'http://localhost:5173' })).toThrow(ConfigError);
-		expect(() => config({ ALLOWED_ORIGINS: '*', RP_ORIGINS: 'https://unrelated.example', RP_ID: 'apron.chat' })).toThrow(ConfigError);
 		const restricted = config();
 		expect(isAllowedOrigin(restricted, 'http://localhost:5173')).toBe(true);
 		expect(isAllowedOrigin(restricted, null)).toBe(true);
@@ -308,5 +307,22 @@ describe('configuration policy boundaries', () => {
 			RP_ID: 'example.test',
 		})).toThrow(ConfigError);
 		expect(() => config({ RP_NAME: 'x'.repeat(DEFAULT_LIMITS.maxNameCodePoints + 1) })).toThrow(ConfigError);
+	});
+
+	it('accepts passkey origins outside RP_ID as related origins', () => {
+		// A self-hosted server whose RP ID is its own host, used from a shared client elsewhere.
+		const related = config({
+			ALLOWED_ORIGINS: 'https://apron.shazow.net,https://web.apron.chat',
+			RP_ORIGINS: 'https://apron.shazow.net,https://web.apron.chat',
+			RP_ID: 'apron.shazow.net',
+		});
+		expect(related.rpId).toBe('apron.shazow.net');
+		expect(related.rpOrigins).toEqual(['https://apron.shazow.net', 'https://web.apron.chat']);
+		expect(config({ ALLOWED_ORIGINS: '*', RP_ORIGINS: 'https://unrelated.example', RP_ID: 'apron.chat' }).rpOrigins).toEqual(['https://unrelated.example']);
+		// The other rules still hold: exact origins, no wildcards, within ALLOWED_ORIGINS.
+		expect(() => config({ ALLOWED_ORIGINS: 'https://apron.shazow.net', RP_ORIGINS: 'https://apron.shazow.net,https://web.apron.chat', RP_ID: 'apron.shazow.net' })).toThrow(/subset of ALLOWED_ORIGINS/);
+		expect(() => config({ ALLOWED_ORIGINS: '*', RP_ORIGINS: 'https://*.apron.chat', RP_ID: 'apron.shazow.net' })).toThrow(ConfigError);
+		expect(() => config({ ALLOWED_ORIGINS: '*', RP_ORIGINS: 'https://web.apron.chat/app', RP_ID: 'apron.shazow.net' })).toThrow(ConfigError);
+		expect(() => config({ ALLOWED_ORIGINS: '*', RP_ORIGINS: 'https://web.apron.chat', RP_ID: 'https://apron.shazow.net' })).toThrow(/RP_ID must be a host name/);
 	});
 });

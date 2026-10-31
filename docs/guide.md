@@ -323,6 +323,37 @@ not revoke existing passkeys. Permanent identity/thread-room caps return
 boundary; it never shortens history to accept another post. Global frame
 exhaustion closes sockets and rejects new admissions until replenishment.
 
+## Passkeys on your own server
+
+A self-hosted server sets `RP_ID` to its own host or a domain it is under;
+Apron clients refuse any other ([PROTOCOL.md §4.10](https://github.com/shazow/apron/blob/main/PROTOCOL.md#410-webauthn-authentication)).
+Each frontend offered passkeys is listed in `RP_ORIGINS` (and in
+`ALLOWED_ORIGINS`, unless that is `*`). One on the RP ID's domain needs
+nothing more; one elsewhere, such as the shared client at
+`https://web.apron.chat`, works as a WebAuthn
+[related origin](https://www.w3.org/TR/webauthn-3/#sctn-related-origins):
+
+```toml
+[vars]
+RP_ID = "apron.shazow.net"
+RP_ORIGINS = "https://apron.shazow.net,https://web.apron.chat"
+ALLOWED_ORIGINS = "https://apron.shazow.net,https://web.apron.chat"
+```
+
+The browser on `web.apron.chat` fetches
+`https://apron.shazow.net/.well-known/webauthn` and takes the RP ID only if
+that lists its origin. The Worker answers it with `RP_ORIGINS`, cached for
+five minutes, when it serves the RP ID's own host, as here, without waking
+the Durable Object. Where it does not, as with the Worker on
+`chat.example.com` and `RP_ID = "example.com"`, serve
+`{"origins": [...]}` as JSON at `https://example.com/.well-known/webauthn`
+yourself. With edge rules, regenerate them: `apron_invalid_request` lets the
+path through when the production custom domain is `RP_ID`
+([edge admission](edge-admission.md)). Browsers without related origins
+refuse passkeys on such a frontend; there its users sign in another way,
+such as with a token from `/invite-device` ([other devices](#other-devices)).
+Changing `RP_ID` strands the passkeys registered under the old one.
+
 ## Operations and secrets
 
 IP rate limits key on the first 128 bits of SHA-256 of the canonical address

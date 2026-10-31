@@ -1573,10 +1573,37 @@ async function handleMediaRead(request: Request, env: Env, key: string): Promise
 	return new Response(request.method === "HEAD" ? null : object.body, { headers });
 }
 
+/** Where a browser looks for an RP ID's related origins: https://www.w3.org/TR/webauthn-3/#sctn-related-origins */
+const WEBAUTHN_WELL_KNOWN_PATH = "/.well-known/webauthn";
+
+/**
+ * `GET` or `HEAD` of `/.well-known/webauthn` on the host that is `RP_ID`:
+ * `RP_ORIGINS` as WebAuthn related origins, so a frontend on another site
+ * may use this RP ID. Answered from configuration alone, without the
+ * Durable Object or storage, like other paths the Worker answers itself.
+ * Null, so the request goes on as for any other path, where `RP_ID` is
+ * not set or the configuration does not load, or on another host, where
+ * a browser would never look.
+ */
+function handleRelatedOrigins(request: Request, env: Env, url: URL): Response | null {
+	if ((request.method !== "GET" && request.method !== "HEAD") || url.pathname !== WEBAUTHN_WELL_KNOWN_PATH || !env.RP_ID) return null;
+	let config: RuntimeConfig;
+	try {
+		config = loadConfig(env);
+	} catch {
+		return null;
+	}
+	if (url.hostname.toLowerCase() !== config.rpId) return null;
+	const headers = { "Content-Type": "application/json", "Cache-Control": "public, max-age=300", "X-Content-Type-Options": "nosniff" };
+	return new Response(request.method === "HEAD" ? null : JSON.stringify({ origins: config.rpOrigins }), { headers });
+}
+
 async function fetchConnection(request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url);
 	if (url.pathname.startsWith("/w/")) return handleUploadWrite(request, env, url.pathname.slice(3));
 	if (url.pathname.startsWith("/live/")) return handleLiveRead(request, env, url.pathname.slice(6));
+	const relatedOrigins = handleRelatedOrigins(request, env, url);
+	if (relatedOrigins) return relatedOrigins;
 	const media = await handleMediaRead(request, env, url.pathname.slice(1));
 	if (media) return media;
 	const status = isConnectionStatus(request);
