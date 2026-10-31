@@ -726,9 +726,9 @@ it('answers /help with a private notice and rejects other commands without closi
 			room_id: 'general', from: { user_id: '~private', name: 'System message to you' },
 			body: {
 				text: [
-					'- `/help`: list the commands you can use here',
-					'- `/embed-terminal [title]`: get a link to stream a terminal (80×40) into this room, such as a build: the message appears when the stream starts',
 					'- `/embed-append [markdown]`: get a link to stream text into a message that starts with [markdown], such as an LLM\'s reply: the message appears when the stream starts',
+					'- `/embed-terminal [title]`: get a link to stream a terminal (80×40) into this room, such as a build: the message appears when the stream starts',
+					'- `/help`: list the commands you can use here',
 				].join('\n'),
 				format: 'markdown',
 			},

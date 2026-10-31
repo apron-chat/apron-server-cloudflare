@@ -263,12 +263,14 @@ post it twice.
 ## Other devices
 
 To sign in as yourself where your passkey isn't, such as another browser, a
-command-line client, or another origin, run `/invite-device <name>` (say
-`/invite-device laptop`). The `~private` notice holds a token that signs in
+command-line client, or another origin, run `/invite-device add [<id>]`
+(say `/invite-device add laptop`; without an id it is `device_1`,
+`device_2`, and so on). The `~private` notice holds a token that signs in
 as you with the token scheme, from any origin; it does not expire, so keep it
-secret. You can hold 3, each under its own name. Running `/invite-device`
-again with the same name replaces that token and signs out connections that
-used the old one. See [SPEC section 5](../SPEC.md#devices).
+secret. You can hold 5, each under its own id. Running `/invite-device add`
+again with the same id replaces that token and signs out connections that
+used the old one; `/invite-device remove <id>` revokes it, and
+`/invite-device list` shows your ids with when each was added and last used. See [SPEC section 5](../SPEC.md#devices).
 
 ## User-visible policies
 

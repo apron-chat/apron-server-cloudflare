@@ -65,10 +65,19 @@ it('lists and runs the admin commands for admins only', async () => {
 		expect(help.notice!.params.body.text).toContain('/kick <user_id>');
 		expect(help.notice!.params.body.text).toContain('/status');
 		expect(help.notice!.params.body.text).toContain('/rename <old_user_id> <new_user_id>');
+		// Admins' commands say so; everyone else's don't.
+		expect(help.notice!.params.body.text).toContain('- `/kick <user_id>`: remove a user from this room (admin-only)');
+		expect(help.notice!.params.body.text).toContain('/invite-purge <user_id>');
+		expect(help.notice!.params.body.text).not.toMatch(/`\/invite-bot`.*\(admin-only\)/);
+		// Listed alphabetically.
+		const listed = [...help.notice!.params.body.text.matchAll(/^- `\/([a-z-]+)/gm)].map((match) => match[1]);
+		expect(listed.length).toBeGreaterThan(10);
+		expect(listed).toEqual([...listed].sort());
 
 		const plain = await command(alice, 'help', '/help');
 		expect(plain.notice!.params.body.text).toContain('/invite-bot');
 		expect(plain.notice!.params.body.text).not.toContain('/kick');
+		expect(plain.notice!.params.body.text).not.toContain('(admin-only)');
 		for (const text of ['/status', '/kick admin', `/admin ${aliceId}`]) {
 			const denied = await command(alice, `denied-${text}`, text);
 			expect(denied.frame.error.code).toBe(-32001);
@@ -272,7 +281,7 @@ it('/invite-token creates a user who signs in with the token, which /rename move
 	} finally { admin.close(); }
 });
 
-it('/invite-device mints up to three named tokens that sign in as the user, a name again replacing its token', async () => {
+it('/invite-device add mints up to five tokens, each with its own id, that sign in as the user, an id again replacing its token', async () => {
 	const admin = await signedInAdmin();
 	const userId = unique('owner');
 	const owner = await signedIn(userId);
@@ -283,8 +292,8 @@ it('/invite-device mints up to three named tokens that sign in as the user, a na
 		await peer.next();
 		return { peer, reply: await request(peer, 'auth', 'auth', { scheme: 'token', token }) };
 	};
-	const mint = async (name: string) => {
-		const minted = await command(owner, `device-${name}`, `/invite-device ${name}`);
+	const mint = async (id: string) => {
+		const minted = await command(owner, `device-${id}`, `/invite-device add ${id}`);
 		expect(minted.frame.result).toEqual({});
 		const token = minted.notice!.params.body.text.match(/```\n(apron_device_[A-Za-z0-9_-]{43})\n```/)![1] as string;
 		// The same token in a link that any Apron app opens (Appendix A.4).
@@ -292,7 +301,7 @@ it('/invite-device mints up to three named tokens that sign in as the user, a na
 		return token;
 	};
 	try {
-		expect((await command(owner, 'help', '/help')).notice!.params.body.text).toContain('/invite-device <name>');
+		expect((await command(owner, 'help', '/help')).notice!.params.body.text).toContain('/invite-device list|add|remove [<id>]');
 
 		// The token signs in as the user from any origin.
 		const laptop = await mint('laptop');
@@ -300,34 +309,68 @@ it('/invite-device mints up to three named tokens that sign in as the user, a na
 		expect(onLaptop.reply.result.you.user_id).toBe(userId);
 		expect(onLaptop.reply.result.token).toBeUndefined();
 		// A device signed in with a token may mint one too.
-		const phone = (await command(onLaptop.peer, 'device-phone', '/invite-device phone')).notice!.params.body.text.match(/apron_device_[A-Za-z0-9_-]{43}/)![0];
+		const phone = (await command(onLaptop.peer, 'device-phone', '/invite-device add phone')).notice!.params.body.text.match(/apron_device_[A-Za-z0-9_-]{43}/)![0];
 		const onPhone = await signIn(phone);
 		expect(onPhone.reply.result.you.user_id).toBe(userId);
 		const tablet = await mint('tablet');
+		// Without an id, the first free device_<n>.
+		const unnamed = async (id: string) => {
+			const minted = await command(owner, id, '/invite-device add');
+			expect(minted.frame.result).toEqual({});
+			return minted.notice!.params.body.text;
+		};
+		expect(await unnamed('device-unnamed-1')).toContain('your device **device_1**');
+		expect(await unnamed('device-unnamed-2')).toContain('your device **device_2**');
 
-		// A fourth name is refused, naming the three; bad names and usage are errors to show.
-		const fourth = await command(owner, 'device-desktop', '/invite-device desktop');
-		expect(fourth.frame.error.code).toBe(-32001);
-		expect(fourth.frame.error.message).toContain('`laptop`, `phone`, `tablet`');
-		expect((await command(owner, 'usage', '/invite-device')).frame.error.message).toBe('Usage: /invite-device <name>');
-		expect((await command(owner, 'usage-2', '/invite-device a b')).frame.error.code).toBe(-32602);
-		expect((await command(owner, 'bad-name', '/invite-device -x')).frame.error.code).toBe(-32602);
-		expect((await command(owner, 'proto', '/invite-device __proto__')).frame.error.code).toBe(-32602);
+		// A sixth id is refused, naming the five; bad ids and usage are errors to show.
+		const sixth = await command(owner, 'device-desktop', '/invite-device add desktop');
+		expect(sixth.frame.error.code).toBe(-32001);
+		expect(sixth.frame.error.message).toContain('`laptop`, `phone`, `tablet`, `device_1`, `device_2`');
+		expect((await command(owner, 'device-unnamed-3', '/invite-device add')).frame.error.code).toBe(-32001);
+		expect((await command(owner, 'usage', '/invite-device')).frame.error.message).toBe('Usage: /invite-device list|add|remove [<id>]');
+		expect((await command(owner, 'usage-2', '/invite-device laptop')).frame.error.code).toBe(-32602);
+		expect((await command(owner, 'usage-3', '/invite-device add a b')).frame.error.code).toBe(-32602);
+		expect((await command(owner, 'usage-4', '/invite-device remove')).frame.error.code).toBe(-32602);
+		expect((await command(owner, 'bad-name', '/invite-device add -x')).frame.error.code).toBe(-32602);
+		expect((await command(owner, 'proto', '/invite-device add __proto__')).frame.error.code).toBe(-32602);
+		expect((await command(owner, 'usage-5', '/invite-device list laptop')).frame.error.code).toBe(-32602);
+
+		// list: each id, oldest first, with when it was added and last signed in.
+		const today = new Date().toISOString().slice(0, 10);
+		const listed = await command(owner, 'list', '/invite-device list');
+		expect(listed.frame.result).toEqual({});
+		expect(listed.notice!.params.body.text).toBe([
+			'Your device tokens:',
+			`- \`laptop\`, added ${today}, last used ${today}`,
+			`- \`phone\`, added ${today}, last used ${today}`,
+			`- \`tablet\`, added ${today}, never used`,
+			`- \`device_1\`, added ${today}, never used`,
+			`- \`device_2\`, added ${today}, never used`,
+		].join('\n'));
+		const unknown = await command(owner, 'remove-unknown', '/invite-device remove desktop');
+		expect(unknown.frame.error.code).toBe(-32602);
+		expect(unknown.frame.error.message).toContain('`laptop`, `phone`, `tablet`, `device_1`, `device_2`');
+
+		// Removing frees the id, and device_1 is taken again next.
+		const removed = await command(owner, 'remove-device-1', '/invite-device remove device_1');
+		expect(removed.frame.result).toEqual({});
+		expect(removed.notice!.params.body.text).toContain('Revoked the device token for **device_1**');
+		expect(await unnamed('device-unnamed-4')).toContain('your device **device_1**');
 		expect(owner.closed()).toBeUndefined();
 
-		// The same name again replaces its token, closing what signed in with
+		// The same id again replaces its token, closing what signed in with
 		// the old one, but not the asking connection or the other devices.
-		const replaced = await command(onLaptop.peer, 'device-laptop-again', '/invite-device laptop');
+		const replaced = await command(onLaptop.peer, 'device-laptop-again', '/invite-device add laptop');
 		expect(replaced.notice!.params.body.text).toContain('replaces its earlier token');
 		const laptop2 = replaced.notice!.params.body.text.match(/apron_device_[A-Za-z0-9_-]{43}/)![0];
 		expect(onLaptop.peer.closed()).toBeUndefined();
-		const again = await command(owner, 'device-laptop-3', '/invite-device laptop');
+		const again = await command(owner, 'device-laptop-3', '/invite-device add laptop');
 		const laptop3 = again.notice!.params.body.text.match(/apron_device_[A-Za-z0-9_-]{43}/)![0];
 		await vi.waitFor(() => expect(onLaptop.peer.closed()?.code).toBe(1008));
 		expect(onPhone.peer.closed()).toBeUndefined();
 		expect(owner.closed()).toBeUndefined();
 		for (const old of [laptop, laptop2]) {
-			expect((await signIn(old)).reply.error.message).toBe('This device token is not valid; get a new one with /invite-device on a signed-in device');
+			expect((await signIn(old)).reply.error.message).toBe('This device token is not valid; get a new one with /invite-device add on a signed-in device');
 		}
 		expect((await signIn(laptop3)).reply.result.you.user_id).toBe(userId);
 
@@ -336,8 +379,8 @@ it('/invite-device mints up to three named tokens that sign in as the user, a na
 		opened.push(guest);
 		await guest.next();
 		await request(guest, 'auth', 'auth', { scheme: 'guest' });
-		expect((await command(guest, 'guest', '/invite-device laptop')).frame.error.code).toBe(-32001);
-		expect((await command(admin, 'admin', '/invite-device laptop')).frame.error.code).toBe(-32001);
+		expect((await command(guest, 'guest', '/invite-device add laptop')).frame.error.code).toBe(-32001);
+		expect((await command(admin, 'admin', '/invite-device add laptop')).frame.error.code).toBe(-32001);
 
 		// /rename moves the tokens to the new user_id, and /purge revokes them.
 		for (const peer of opened) peer.close();
@@ -358,7 +401,7 @@ it('/invite-device closes what used a replaced token even when clearing pushes f
 	let phone: Peer | undefined;
 	type Patchable = { store: { clearPushSubscriptions: (...args: unknown[]) => void } };
 	try {
-		const token = (await command(owner, 'device-phone', '/invite-device phone')).notice!.params.body.text.match(/apron_device_[A-Za-z0-9_-]{43}/)![0];
+		const token = (await command(owner, 'device-phone', '/invite-device add phone')).notice!.params.body.text.match(/apron_device_[A-Za-z0-9_-]{43}/)![0];
 		phone = await connect(null);
 		await phone.next();
 		expect((await request(phone, 'auth', 'auth', { scheme: 'token', token })).result.you).toBeDefined();
@@ -367,7 +410,7 @@ it('/invite-device closes what used a replaced token even when clearing pushes f
 			const store = (instance as unknown as Patchable).store;
 			store.clearPushSubscriptions = () => { throw new Error('budget refused'); };
 		});
-		expect((await command(owner, 'device-phone-again', '/invite-device phone')).frame.error).toBeDefined();
+		expect((await command(owner, 'device-phone-again', '/invite-device add phone')).frame.error).toBeDefined();
 		await vi.waitFor(() => expect(phone!.closed()?.code).toBe(1008));
 		expect(owner.closed()).toBeUndefined();
 	} finally {
@@ -376,6 +419,105 @@ it('/invite-device closes what used a replaced token even when clearing pushes f
 			delete (store as Partial<Patchable['store']>).clearPushSubscriptions;
 		});
 		phone?.close(); owner.close();
+	}
+});
+
+it('/invite-device remove revokes a token and closes what signed in with it', async () => {
+	const userId = unique('owner');
+	const owner = await signedIn(userId);
+	let phone: Peer | undefined;
+	try {
+		const token = (await command(owner, 'device-phone', '/invite-device add phone')).notice!.params.body.text.match(/apron_device_[A-Za-z0-9_-]{43}/)![0];
+		phone = await connect(null);
+		await phone.next();
+		expect((await request(phone, 'auth', 'auth', { scheme: 'token', token })).result.you).toBeDefined();
+		expect((await command(owner, 'remove-phone', '/invite-device remove phone')).frame.result).toEqual({});
+		await vi.waitFor(() => expect(phone!.closed()?.code).toBe(1008));
+		expect(owner.closed()).toBeUndefined();
+		phone = await connect(null);
+		await phone.next();
+		expect((await request(phone, 'auth', 'auth', { scheme: 'token', token })).error.code).toBe(-32001);
+		// The last one removed leaves no list behind.
+		expect(await runInDurableObject(stub(), (_instance, state) => state.storage.get(`devices:${userId}`))).toBeUndefined();
+		expect((await command(owner, 'remove-again', '/invite-device remove phone')).frame.error.message).toBe('You have no device tokens; get one with /invite-device add');
+		expect((await command(owner, 'list-none', '/invite-device list')).notice!.params.body.text).toBe('You have no device tokens; get one with `/invite-device add`.');
+
+		// A device that removes its own token gets the result, then is closed.
+		const tablet = (await command(owner, 'device-tablet', '/invite-device add tablet')).notice!.params.body.text.match(/apron_device_[A-Za-z0-9_-]{43}/)![0];
+		phone = await connect(null);
+		await phone.next();
+		expect((await request(phone, 'auth', 'auth', { scheme: 'token', token: tablet })).result.you).toBeDefined();
+		const self = await command(phone, 'remove-self', '/invite-device remove tablet');
+		expect(self.frame.result).toEqual({});
+		expect(self.notice!.params.body.text).toContain('Revoked the device token for **tablet**');
+		await vi.waitFor(() => expect(phone!.closed()?.code).toBe(1008));
+		expect(owner.closed()).toBeUndefined();
+	} finally { phone?.close(); owner.close(); }
+});
+
+it('/invite-purge removes every way a user signs in and gives the admin a new token for them', async () => {
+	const admin = await signedInAdmin();
+	const userId = unique('target');
+	// A session from before sessions carried their user handle, and one after.
+	const legacy = await signedIn(userId);
+	const opened: Peer[] = [legacy];
+	const signIn = async (token: string) => {
+		const peer = await connect();
+		opened.push(peer);
+		await peer.next();
+		return { peer, reply: await request(peer, 'auth', 'auth', { scheme: 'token', token }) };
+	};
+	try {
+		const [legacyToken, session] = await runInDurableObject(stub(), (instance) => {
+			const runtime = instance as unknown as { issueSession(userId: string, origin: string, now: number, handle?: string): Promise<string> };
+			return Promise.all([
+				runtime.issueSession(userId, 'http://localhost:5173', Date.now()),
+				runtime.issueSession(userId, 'http://localhost:5173', Date.now(), `handle-${userId}`),
+			]);
+		});
+		const onSession = await signIn(session);
+		expect(onSession.reply.result.you.user_id).toBe(userId);
+		const device = (await command(legacy, 'device', '/invite-device add phone')).notice!.params.body.text.match(/apron_device_[A-Za-z0-9_-]{43}/)![0];
+		const onDevice = await signIn(device);
+		expect(onDevice.reply.result.you.user_id).toBe(userId);
+
+		const purged = await command(admin, 'invite-purge', `/invite-purge @${userId}`);
+		expect(purged.frame.result).toEqual({});
+		expect(purged.notice!.params.body.text).toContain(`Signed \`${userId}\` out everywhere and removed 1 passkey`);
+		const fresh = purged.notice!.params.body.text.match(/```\n(apron_invite_[A-Za-z0-9_-]{43})\n```/)![1] as string;
+		for (const peer of [legacy, onSession.peer, onDevice.peer]) await vi.waitFor(() => expect(peer.closed()?.code).toBe(1008));
+		expect(admin.closed()).toBeUndefined();
+
+		// Nothing they signed in with works any more, but the new token does.
+		for (const old of [legacyToken, session]) expect((await signIn(old)).reply.error.message).toBe('Session expired; sign in with your passkey');
+		expect((await signIn(device)).reply.error.code).toBe(-32001);
+		expect(await runInDurableObject(stub(), (instance) => (instance as unknown as { store: Store }).store.passkeys(userId))).toEqual([]);
+		const onFresh = await signIn(fresh);
+		expect(onFresh.reply.result.you.user_id).toBe(userId);
+		expect((await command(onFresh.peer, 'list', '/invite-device list')).notice!.params.body.text).toContain('no device tokens');
+
+		// Again, the token it gave before stops working too.
+		const again = await command(admin, 'invite-purge-2', `/invite-purge ${userId}`);
+		expect(again.notice!.params.body.text).toContain('removed 0 passkeys');
+		await vi.waitFor(() => expect(onFresh.peer.closed()?.code).toBe(1008));
+		expect((await signIn(fresh)).reply.error.message).toBe('This invite token is not valid; ask an admin for a new one');
+
+		// Not oneself, the admin user, a bot or an unknown user; and only for admins.
+		const otherAdminId = unique('admin');
+		const otherAdmin = await signedIn(otherAdminId);
+		opened.push(otherAdmin);
+		await command(admin, 'grant', `/admin ${otherAdminId}`);
+		expect((await command(otherAdmin, 'self', `/invite-purge ${otherAdminId}`)).frame.error.message).toBe("You can't /invite-purge yourself");
+		expect((await command(admin, 'admin-user', '/invite-purge admin')).frame.error.code).toBe(-32001);
+		expect((await command(admin, 'bot', `/invite-purge bot_${userId}`)).frame.error.code).toBe(-32001);
+		expect((await command(admin, 'unknown', `/invite-purge ${unique('nobody')}`)).frame.error.code).toBe(-32602);
+		expect((await command(admin, 'usage', '/invite-purge')).frame.error.message).toBe('Usage: /invite-purge <user_id>');
+		const plain = await signedIn(unique('plain'));
+		opened.push(plain);
+		expect((await command(plain, 'plain', `/invite-purge ${otherAdminId}`)).frame.error.message).toMatch(/Only an admin/);
+	} finally {
+		for (const peer of opened) peer.close();
+		admin.close();
 	}
 });
 
@@ -388,7 +530,7 @@ it('/invite-device refuses a user renamed while the command was on its way', asy
 		await runInDurableObject(stub(), (instance) => {
 			(instance as unknown as { store: Store }).store.renameIdentity({ from: userId, to: unique('renamed'), now: Date.now() });
 		});
-		const refused = await command(owner, 'device', '/invite-device laptop');
+		const refused = await command(owner, 'device', '/invite-device add laptop');
 		expect(refused.frame.error.message).toBe('Your account changed; reconnect and try again');
 		expect(refused.notice).toBeUndefined();
 		expect(await runInDurableObject(stub(), (_instance, state) => state.storage.get(`devices:${userId}`))).toBeUndefined();
@@ -775,6 +917,38 @@ async function passkeyLogin(passkey: Awaited<ReturnType<typeof softPasskey>>, ed
 		return await request(peer, 'login-finish', 'auth', { scheme: 'webauthn', action: 'login', step: 'finish', challenge_id: begun.result.challenge_id, credential });
 	} finally { peer.close(); }
 }
+
+it('a passkey ceremony verifying while /invite-purge runs signs nobody in and adds no passkey', async () => {
+	const userId = unique('raced');
+	const user = await signedIn(userId);
+	type Patchable = { store: Store & { updateCredentialCounter: (...args: unknown[]) => void } };
+	try {
+		const added = await registerPasskey(user, 'add');
+		expect(added.finished.result.you.user_id).toBe(userId);
+		// The purge's store change lands while the login's proof is being checked.
+		await runInDurableObject(stub(), (instance) => {
+			const store = (instance as unknown as Patchable).store;
+			const original = store.updateCredentialCounter.bind(store);
+			store.updateCredentialCounter = (...args: unknown[]) => {
+				store.resetAuth({ userId });
+				(original as (...a: unknown[]) => void)(...args);
+			};
+		});
+		expect((await passkeyLogin(added.passkey)).error.message).toBe('This passkey is no longer on the account');
+		await runInDurableObject(stub(), (instance) => {
+			delete (instance as unknown as { store: Partial<Patchable['store']> }).store.updateCredentialCounter;
+		});
+
+		// An addition begun before the purge cleared the handle is refused at its finish.
+		const passkey = await softPasskey('http://localhost:5173');
+		const begun = await request(user, 'again-begin', 'auth', { scheme: 'webauthn', action: 'register', step: 'begin' });
+		const credential = await passkey.register(begun.result.public_key);
+		await runInDurableObject(stub(), (instance) => { (instance as unknown as Patchable).store.resetAuth({ userId }); });
+		const refused = await request(user, 'again-finish', 'auth', { scheme: 'webauthn', action: 'register', step: 'finish', challenge_id: begun.result.challenge_id, credential });
+		expect(refused.error.message).toBe('Your account changed; reconnect and try again');
+		expect(await runInDurableObject(stub(), (instance) => (instance as unknown as Patchable).store.passkeys(userId))).toEqual([]);
+	} finally { user.close(); }
+});
 
 it('adds a passkey to the signed-in account (§4.10); a guest\'s registration makes a new account', async () => {
 	const userId = unique('keys');

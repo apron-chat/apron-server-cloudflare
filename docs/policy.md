@@ -104,14 +104,17 @@ within it:
   push: attendance is the separate `status` request (below).
 - Commands: `/help` replies with a `~private` notice listing the commands the
   sender may run. Registered users other than bots have `/invite-bot` (a bot
-  token), `/invite-device <name>` (a token for another device), `/passkeys`,
+  token), `/invite-device list|add|remove [<id>]` (tokens for other devices), `/passkeys`,
   and, with uploads, `/avatar` (all below); anyone who may post has, with
   live text, `/embed-terminal [title]` and `/embed-append [markdown]`
   (below); those with the role `admin`,
   `mod`, or `friend` also have `/emoji add|remove :name:` (custom emoji,
   below). Admins have their own (see [SPEC section 5](../SPEC.md#admins)),
   among them `/server`, which sets the server's title, description and
-  avatar (below), and `/toggle activity|uploads|presence|addmember|livetext`. An
+  avatar (below), `/toggle activity|uploads|presence|addmember|livetext`, and
+  `/invite-purge <user_id>`, which signs a user out everywhere, removes
+  their passkeys and tokens, and gives the admin a new token for them.
+  `/help` lists commands alphabetically and marks the admins' "(admin-only)". An
   unknown command is `invalid_params`, and one the sender may not run
   `denied`.
 - Uploads (cap `embed:upload`, Workers Paid budgets): registered users attach
@@ -375,14 +378,16 @@ itself with `me`, and cannot invite bots. An account whose only role is
 are revoked and it leaves its rooms, while its account and posts stay. See
 [SPEC section 5](../SPEC.md#bots).
 
-A registered user's `/invite-device <name>` (not a bot's or the `admin`
+A registered user's `/invite-device add [<id>]` (not a bot's or the `admin`
 user's) returns a bearer token that signs in as them on another device, in a
 `~private` notice to that connection only. It signs in with `scheme: "token"`
-from any origin, or none, and does not expire. A user holds at most 3, each
-under its own name (1 to 32 letters, digits, `_`, `.` or `-`, starting with
-a letter or digit); the same name
+from any origin, or none, and does not expire. A user holds at most 5, each
+under its own id (1 to 32 letters, digits, `_`, `.` or `-`, starting with
+a letter or digit; `device_1`, `device_2`, … when none is given); the same id
 again replaces its token, closes the user's other connections that used the
-old one, and drops the user's push registrations. `/rename` moves the tokens
+old one, and drops the user's push registrations. `/invite-device remove <id>`
+revokes a token the same way, and `/invite-device list` shows each id with
+when it was added and last used. `/rename` moves the tokens
 and `/purge` revokes them. See [SPEC section 5](../SPEC.md#devices).
 
 Guest identities last for a socket, including hibernation. Repeated guest
