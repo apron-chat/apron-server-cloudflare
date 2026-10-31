@@ -475,10 +475,10 @@ a minute behind:
 
 A registered user's `seen` (when they were last shown `offline`) is written
 at most once in 10 minutes (`SEEN_WRITE_GRANULARITY_MS`, fixed, not a plan
-limit), so at most 144 times a day per account. Waiting changes use one
-in-memory timer, which keeps the object awake for at most a minute after its
-last event but uses no alarm, so no Durable Object request. See the
-[cost report](cost-report.md#user-status).
+limit), so at most 144 times a day per account. Waiting changes use the
+object's alarm, so the object hibernates while they wait: each costs at most
+one alarm (a Durable Object request) and a metered alarm write when it
+moves the alarm earlier. See the [cost report](cost-report.md#user-status).
 
 ## Runtime overrides
 

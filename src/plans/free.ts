@@ -72,8 +72,8 @@ export const FREE_PLAN: Plan = Object.freeze({
 		guestNumberBlock: 10,
 		// Status changes are announced at most once a minute per user, and a
 		// closed connection's change waits a minute, so a reload or a mobile
-		// reconnect shows nothing. Both run on one in-memory timer: no SQL, no
-		// alarm, no Durable Object request.
+		// reconnect shows nothing. Both run on the object's alarm, so it
+		// hibernates while they wait.
 		statusCoalesceSeconds: 60,
 		offlineGraceSeconds: 60,
 		sqlWritesPerDay: 80_000,

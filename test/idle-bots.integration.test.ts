@@ -75,9 +75,14 @@ async function setActive(userIds: readonly string[], ms: number): Promise<void> 
 const activeMs = (userId: string) => runInDurableObject(stub(), (_instance, state) =>
 	state.storage.sql.exec<{ updated_ms: number }>('SELECT updated_ms FROM identities WHERE user_id = ?', userId).one().updated_ms);
 
-/** Runs the alarm, with the idle bot sweep due at `due` (absent: never swept before). */
+/**
+ * Runs the alarm with its full work (cleanup due, as the hourly cleanup alarm
+ * is; an alarm with only status work skips the sweep), with the idle bot
+ * sweep due at `due` (absent: never swept before).
+ */
 async function sweep(due: number | null = 0): Promise<void> {
 	await runInDurableObject(stub(), async (instance, state) => {
+		state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1');
 		if (due === null) state.storage.sql.exec("DELETE FROM _meta WHERE key = 'bot_sweep_ms'");
 		else state.storage.sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('bot_sweep_ms', ?)", String(due));
 		await (instance as unknown as Runtime).alarm();

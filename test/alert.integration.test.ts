@@ -78,13 +78,13 @@ it('logs how long a timer kept the object awake since its last activity', async 
 		vi.spyOn(Date, 'now').mockReturnValue(start);
 		server.noteActivity();
 		vi.spyOn(Date, 'now').mockReturnValue(start + 45_000);
-		server.noteTimerFired('presence');
+		server.noteTimerFired('push_wake');
 		vi.spyOn(Date, 'now').mockReturnValue(start + 60_000);
 		server.noteTimerFired('push_wake');
 	});
 	const lines = log.mock.calls.map(([line]) => String(line)).filter((line) => line.includes('"timer_kept_awake"')).map((line) => JSON.parse(line));
 	// The second counts only from the first: a timer firing is activity too.
-	expect(lines).toEqual([{ event: 'timer_kept_awake', timer: 'presence', ms: 45_000 }, { event: 'timer_kept_awake', timer: 'push_wake', ms: 15_000 }]);
+	expect(lines).toEqual([{ event: 'timer_kept_awake', timer: 'push_wake', ms: 45_000 }, { event: 'timer_kept_awake', timer: 'push_wake', ms: 15_000 }]);
 });
 
 it('posts the alert though registration is closed and the admin user does not exist yet', async () => {

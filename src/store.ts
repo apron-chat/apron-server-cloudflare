@@ -6518,6 +6518,20 @@ export class Store {
     return Math.min(Math.floor(effective / 86_400_000) * 86_400_000, effective - LIMITER_IDLE_MS);
   }
 
+  /**
+   * Whether cleanup is due by `now`: one read of the maintenance row, for an
+   * alarm deciding whether to run it (ApronDemoServer.alarmWorkDue). A read
+   * that fails counts as due, so the alarm runs its full work.
+   */
+  cleanupDue(now = this.clock.now()): boolean {
+    try {
+      return this.reserved({ reads: 4 }, true, now, () =>
+        Math.max(this.maintenanceRow().next_cleanup_ms, this.deferredCleanupUntil) <= this.effectiveNow(now));
+    } catch {
+      return true;
+    }
+  }
+
   runCleanup(now = this.clock.now()): StoreCleanupResult {
     this.ensureReady();
     // An alarm may have fired, and cleanup may establish an earlier continuation.

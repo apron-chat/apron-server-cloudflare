@@ -1551,15 +1551,18 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly pendingWakes = new Set<PendingWake>();
 	/** Pushes claimed with an `unread` by this instance, so a sign-in can tell whether one came while it read (afterSignIn). */
 	private unreadClaims = 0;
-	/** The one timer that announces waiting status changes, and when it fires. */
-	private presenceTimer: ReturnType<typeof setTimeout> | undefined;
 	/** When an event or a timer last ran in this instance (noteActivity, noteTimerFired), 0 for none yet. */
 	private lastActivityAt = 0;
-	private presenceTimerAt = Number.POSITIVE_INFINITY;
 	/**
-	 * When the next waiting status change is due, timer or not: with no
+	 * When the alarm is asked to announce waiting status changes
+	 * (armPresence), infinity for not. In memory: a wake forgets it, and the
+	 * alarm that woke the object sweeps from the attachments anyway.
+	 */
+	private presenceAlarmAt = Number.POSITIVE_INFINITY;
+	/**
+	 * When the next waiting status change is due, alarm or not: with no
 	 * connection that is told of changes, nothing needs it on time, so no
-	 * timer keeps the object awake for it, and the next event sweeps it.
+	 * alarm is set for it, and the next event sweeps it.
 	 */
 	private presenceDueAt = Number.POSITIVE_INFINITY;
 	/** When attachments were last swept for status changes; 0 after a wake, so the first event sweeps. */
@@ -1749,6 +1752,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.alarmKnown = false;
 		const now = nowMs();
 		this.sweepPresence(now);
+		// An alarm that only announced waiting status changes stops here: the
+		// usage refresh, sweeps and cleanup below run on the alarms that have
+		// their own work, as they did before presence used the alarm.
+		if (!this.alarmWorkDue(now)) {
+			await this.rescheduleAlarm();
+			return;
+		}
 		await this.accountUsage.refresh(now, false);
 		for (const ws of this.ctx.getWebSockets()) {
 			const socket = ws as WebSocketConnection;
@@ -1817,6 +1827,23 @@ export class ApronDemoServer extends DurableObject<Env> {
 			} catch { /* announcement also requires capacity; clients see the floor on their next history page */ }
 		}
 		await this.rescheduleAlarm();
+	}
+
+	/**
+	 * Whether an alarm has work besides announcing status changes: a
+	 * connection's auth deadline, challenge expiry or read cursor to write,
+	 * an upload deadline, or storage cleanup (Store.cleanupDue).
+	 */
+	private alarmWorkDue(now: number): boolean {
+		for (const ws of this.ctx.getWebSockets()) {
+			const attachment = connectionAttachment(ws as WebSocketConnection);
+			if (!attachment) continue;
+			if (attachment.tier === "pending" && attachment.authDeadline <= now) return true;
+			if (attachment.challenge && attachment.challenge.expiresAt <= now) return true;
+			if (attachment.reads && !attachment.closing && now - (attachment.readsAt ?? 0) >= READ_CURSOR_FLUSH_MS) return true;
+		}
+		if (this.uploadDeadline !== undefined && this.uploadDeadline <= now) return true;
+		return this.store.cleanupDue(now);
 	}
 
 	private storeResponseError(error: unknown): Response {
@@ -3857,9 +3884,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** Forgets every announced status and pending change (`/toggle presence`). */
 	private resetPresence(): void {
-		if (this.presenceTimer !== undefined) clearTimeout(this.presenceTimer);
-		this.presenceTimer = undefined;
-		this.presenceTimerAt = Number.POSITIVE_INFINITY;
+		this.presenceAlarmAt = Number.POSITIVE_INFINITY;
 		this.presenceDueAt = Number.POSITIVE_INFINITY;
 		this.announcedAt.clear();
 		this.departed.clear();
@@ -4140,28 +4165,25 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Notes that status work is due at `due`, and arms the timer for it,
-	 * unless it already fires sooner. The timer keeps the object awake until
-	 * then, so it is armed only while a signed-in connection is open to be
-	 * told; without one, the next event sweeps (sweepPresence).
+	 * Notes that status work is due at `due`, and asks the alarm for it,
+	 * unless it is already asked for sooner. An alarm, not a timer: a timer
+	 * kept the object awake (and billed) until it fired, while the object
+	 * hibernates until an alarm wakes it, which costs a metered alarm write
+	 * when it moves the alarm earlier (Store.scheduleAlarm). Asked for only
+	 * while a signed-in connection is open to be told; without one, the next
+	 * event sweeps (sweepPresence).
 	 */
 	private armPresence(due: number): void {
 		if (!Number.isFinite(due)) return;
 		this.presenceDueAt = Math.min(this.presenceDueAt, due);
-		if (due >= this.presenceTimerAt || !this.anySignedIn()) return;
-		if (this.presenceTimer !== undefined) clearTimeout(this.presenceTimer);
-		this.presenceTimerAt = due;
-		this.presenceTimer = setTimeout(() => {
-			this.noteTimerFired("presence");
-			this.presenceTimer = undefined;
-			this.presenceTimerAt = Number.POSITIVE_INFINITY;
-			this.flushPresence(nowMs());
-		}, Math.max(0, due - nowMs()) + 25);
+		if (due >= this.presenceAlarmAt || !this.anySignedIn()) return;
+		this.presenceAlarmAt = due;
+		void this.rescheduleAlarm();
 	}
 
 	/**
-	 * Sweeps for status work at the start of an event: after a wake (the
-	 * timer was lost with the instance), when the timer is overdue, or once
+	 * Sweeps for status work at the start of an event: after a wake (what
+	 * was due was lost with the instance), when the alarm is overdue, or once
 	 * every half `statusCoalesceSeconds`, for changes nothing announces (a
 	 * mute running out, a peer gone stale).
 	 */
@@ -4180,7 +4202,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Does every piece of status work that is due, then re-arms the timer for
+	 * Does every piece of status work that is due, then asks the alarm for
 	 * the next one. Mutes that ran out (§4.5), presence on or off: an
 	 * unscoped one, from attachments, is sent as `status` `mute: false` to
 	 * each of the user's connections; room mutes, once the attachments say
@@ -4192,9 +4214,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	flushPresence(now = nowMs(), live?: WebSocket): void {
 		this.presenceSweptAt = now;
-		if (this.presenceTimer !== undefined) clearTimeout(this.presenceTimer);
-		this.presenceTimer = undefined;
-		this.presenceTimerAt = Number.POSITIVE_INFINITY;
+		this.presenceAlarmAt = Number.POSITIVE_INFINITY;
 		this.presenceDueAt = Number.POSITIVE_INFINITY;
 		if (!this.config.push) return;
 		const mode = this.presenceMode();
@@ -4825,13 +4845,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Logs how long a timer kept the object awake, `timer_kept_awake`: the
-	 * time since the last event or timer. The object hibernates about ten
-	 * seconds after its last activity; a timer firing later puts that off by
-	 * the whole gap. The numbers decide whether moving these in-memory timers
-	 * onto the alarm is worth its writes. Logs are sampled, so totals scale up.
+	 * Logs how long a push wake's wait kept the object awake,
+	 * `timer_kept_awake`: the time since the last event or timer. The object
+	 * hibernates about ten seconds after its last activity; a timer firing
+	 * later puts that off by the whole gap. Logs are sampled, so totals scale up.
 	 */
-	private noteTimerFired(timer: "presence" | "push_wake"): void {
+	private noteTimerFired(timer: "push_wake"): void {
 		const now = nowMs();
 		if (this.lastActivityAt > 0 && now > this.lastActivityAt) console.log(JSON.stringify({ event: "timer_kept_awake", timer, ms: now - this.lastActivityAt }));
 		this.lastActivityAt = now;
@@ -6947,6 +6966,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				for (const value of due) deadline = deadline === undefined ? value : Math.min(deadline, value);
 			}
 			if (this.uploadDeadline !== undefined) deadline = deadline === undefined ? this.uploadDeadline : Math.min(deadline, this.uploadDeadline);
+			if (Number.isFinite(this.presenceAlarmAt)) deadline = deadline === undefined ? this.presenceAlarmAt : Math.min(deadline, this.presenceAlarmAt);
 			await this.store.scheduleAlarm(deadline, nowMs());
 			this.alarmKnown = true;
 		});
