@@ -863,7 +863,7 @@ describe('status mute', () => {
 			await drainTo(peer, 'sync-set');
 			await drainTo(other, 'sync-set-other');
 			// A mute that runs out within the minute asks for the alarm.
-			expect(await runInDurableObject(stub(), (instance) => (instance as unknown as { presenceAlarmAt: number }).presenceAlarmAt - Date.now())).toBeLessThanOrEqual(30_100);
+			expect(await runInDurableObject(stub(), (instance) => (instance as unknown as { presenceAlarmAt: number }).presenceAlarmAt - Date.now())).toBeLessThanOrEqual(45_100);
 			offset += 31_000;
 			// The unscoped mute ran out: told from attachments, no SQL.
 			expect(await flush()).toEqual({ reads: 0, writes: 0 });

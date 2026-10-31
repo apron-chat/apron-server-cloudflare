@@ -98,8 +98,10 @@ it('counts alarms and accounting changes in METRICS, and logs why accounting clo
 		runtime.runtimeEnv.METRICS = { writeDataPoint };
 		// An alarm with nothing but status work, then one with cleanup due.
 		state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', Date.now() + 3_600_000);
+		runtime.store.forgetCleanupDue();
 		await runtime.alarm();
 		state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1');
+		runtime.store.forgetCleanupDue();
 		await runtime.alarm();
 		// A budget write that fails closes accounting as uncertain; it reopens once writes work.
 		state.storage.sql.exec(`CREATE TRIGGER fail_budget_reservation
@@ -114,4 +116,21 @@ it('counts alarms and accounting changes in METRICS, and logs why accounting clo
 	expect(points).toEqual([['alarm', 'light'], ['alarm', 'full'], ['accounting', 'uncertain'], ['accounting', 'recovered']]);
 	const closed = error.mock.calls.map(([line]) => String(line)).filter((line) => line.includes('"accounting_closed"')).map((line) => JSON.parse(line));
 	expect(closed).toEqual([{ event: 'accounting_closed', kind: 'uncertain', message: expect.stringContaining('injected budget reservation failure') }]);
+});
+
+it('runs the full alarm for an upload deadline stored before a wake, which the instance never saw', async () => {
+	await runInDurableObject(env.DEMO.getByName('upload-deadline-wake'), async (instance, state) => {
+		const runtime = instance as unknown as Runtime & { alarm(): Promise<void> };
+		state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', Date.now() + 3_600_000);
+		runtime.store.forgetCleanupDue();
+		// Claimed by an earlier instance: only storage knows its deadline.
+		const stored = vi.spyOn(runtime.store, 'nextUploadDeadline').mockReturnValue(Date.now() - 1);
+		const expire = vi.spyOn(runtime.store, 'expirePendingUploads');
+		await runtime.alarm();
+		expect(stored).toHaveBeenCalledTimes(1);
+		expect(expire).toHaveBeenCalledTimes(1);
+		// Read once per instance: the next alarm goes by what the sweep found.
+		await runtime.alarm();
+		expect(stored).toHaveBeenCalledTimes(1);
+	});
 });

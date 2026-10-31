@@ -498,6 +498,13 @@ type ToggleFeature = "activity" | "uploads" | "presence" | "addmember";
 const ADMIN_USER_NAME = "Admin";
 /** `Retry-After` on a 503 that names no delay of its own: a minute. */
 const UNAVAILABLE_RETRY_MS = 60_000;
+/** Presence alarms round up to this boundary, so changes due in one window share a wake (armPresence). */
+const PRESENCE_ALARM_ROUND_MS = 15_000;
+
+/** Whether a user id is a guest's (`guest_<n>`); no registered user_id may start so. */
+function isGuestId(userId: string): boolean {
+	return userId.startsWith("guest_");
+}
 /** The IP key an operator alert is charged to (notifyAdmins): no connection sends it. */
 const ALERT_IP_KEY = "alert";
 /** Admins one alert mentions and pushes to: as many as one message may wake, which bounds the claim's reservation. */
@@ -1485,6 +1492,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly toggles = new Map<ToggleFeature, boolean | undefined>();
 	/** When the earliest pending upload's write window closes, if one is known (§4.8.3). */
 	private uploadDeadline: number | undefined;
+	/**
+	 * Whether this instance has read the stored deadline (alarmWorkDue): one
+	 * claimed before a wake is known only from storage.
+	 */
+	private uploadDeadlineRead = false;
 	/** The account-usage stop: the latest Cloudflare usage snapshot, and when to read the next. */
 	private readonly accountUsage: AccountUsageMonitor;
 	private readonly queues = new WeakMap<WebSocketConnection, Promise<void>>();
@@ -1563,6 +1575,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * alarm that woke the object sweeps from the attachments anyway.
 	 */
 	private presenceAlarmAt = Number.POSITIVE_INFINITY;
+	/** The earliest waiting change the alarm is for (armPresence): a registered user's, never a guest's. */
+	private presenceAlarmDue = Number.POSITIVE_INFINITY;
+	/** While the alarm handler runs, which sets the next alarm itself when done. */
+	private inAlarm = false;
 	/**
 	 * When the next waiting status change is due, alarm or not: with no
 	 * connection that is told of changes, nothing needs it on time, so no
@@ -1749,6 +1765,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	async alarm(): Promise<void> {
+		this.inAlarm = true;
+		try { await this.runAlarm(); } finally { this.inAlarm = false; }
+	}
+
+	private async runAlarm(): Promise<void> {
 		this.alarmKnown = false;
 		const now = nowMs();
 		this.sweepPresence(now);
@@ -1805,6 +1826,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 					for (const record of expired.broadcasts) this.broadcastRecord(record);
 					this.deleteMedia(expired.deletedUploads);
 					this.uploadDeadline = expired.next;
+					this.uploadDeadlineRead = true;
 				});
 				// A full batch may have left more behind: sweep again shortly rather
 				// than a cleanup interval later, so released bytes do not pile up.
@@ -1834,7 +1856,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Whether an alarm has work besides announcing status changes: a
 	 * connection's auth deadline, challenge expiry or read cursor to write,
-	 * an upload deadline, or storage cleanup (Store.cleanupDue).
+	 * an upload deadline (read from storage once after a wake, which forgets
+	 * it), or storage cleanup (Store.cleanupDue).
 	 */
 	private alarmWorkDue(now: number): boolean {
 		for (const ws of this.ctx.getWebSockets()) {
@@ -1843,6 +1866,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (attachment.tier === "pending" && attachment.authDeadline <= now) return true;
 			if (attachment.challenge && attachment.challenge.expiresAt <= now) return true;
 			if (attachment.reads && !attachment.closing && now - (attachment.readsAt ?? 0) >= READ_CURSOR_FLUSH_MS) return true;
+		}
+		if (this.config.uploads && !this.uploadDeadlineRead) {
+			try {
+				const stored = this.store.nextUploadDeadline(now);
+				if (stored !== undefined) this.uploadDeadline = this.uploadDeadline === undefined ? stored : Math.min(this.uploadDeadline, stored);
+				this.uploadDeadlineRead = true;
+			} catch {
+				return true;
+			}
 		}
 		if (this.uploadDeadline !== undefined && this.uploadDeadline <= now) return true;
 		return this.store.cleanupDue(now);
@@ -3577,7 +3609,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const frame = statusFrame(roomId, result.untilMs === undefined ? false : muteValue(result.untilMs, now));
 		for (const peer of this.connectionsOf(userId)) this.deliverTo(peer, frame);
 		// A timed mute that runs out within the minute is told on time (flushPresence).
-		if (result.untilMs !== undefined && result.untilMs - now <= MAX_STATUS_DELAY_SECONDS * 1_000) this.armPresence(result.untilMs);
+		if (result.untilMs !== undefined && result.untilMs - now <= MAX_STATUS_DELAY_SECONDS * 1_000) this.armPresence(result.untilMs, !isGuestId(userId));
 	}
 
 	/** Applies `change` to the cached status state on each of a user's connections. */
@@ -3831,9 +3863,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	// `statusCoalesceSeconds` per user, the latest winning, and one a closed
 	// connection caused waits `offlineGraceSeconds` first, so a reload or a
 	// reconnect shows nothing; a change the user makes with `me` goes out at
-	// once. One in-memory timer announces what is due, and so keeps the
-	// object awake until then (at most MAX_STATUS_DELAY_SECONDS); events
-	// sweep too. Changes go as `user` `new` to others who share a room. The
+	// once. The object's alarm announces a registered user's change when it
+	// is due (armPresence), rounded up to 15 seconds, and lets the object
+	// hibernate meanwhile; a guest's change, and anything else due, goes out
+	// at the next event's sweep. Changes go as `user` `new` to others who share a room. The
 	// same sweep tells the user's connections of mutes that run out.
 
 	/** Presence as configured and toggled: off without push, which capability `status` needs. */
@@ -3887,6 +3920,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** Forgets every announced status and pending change (`/toggle presence`). */
 	private resetPresence(): void {
 		this.presenceAlarmAt = Number.POSITIVE_INFINITY;
+		this.presenceAlarmDue = Number.POSITIVE_INFINITY;
 		this.presenceDueAt = Number.POSITIVE_INFINITY;
 		this.announcedAt.clear();
 		this.departed.clear();
@@ -4017,7 +4051,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 					return;
 				}
 				if (hold > now && hold !== pres.h) this.writePresence(states, { ...pres, h: hold });
-				this.armPresence(due);
+				this.armPresence(due, !isGuestId(userId));
 				return;
 			}
 			// Their last connection closed: whoever shares a room is owed the change.
@@ -4076,7 +4110,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Sent after the attachments are written: a failed send closes its connection.
 		for (const socket of toldNow) this.deliverTo(socket, { method: "user", params: { new: { user_id: userId, ...shownFields(status, seen) } } });
 		if (told === status) return;
-		if (owing) this.armPresence(due);
+		if (owing) this.armPresence(due, !isGuestId(userId));
 		else this.noteAnnounced(userId, now);
 	}
 
@@ -4167,20 +4201,28 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Notes that status work is due at `due`, and asks the alarm for it,
-	 * unless it is already asked for sooner. An alarm, not a timer: a timer
-	 * kept the object awake (and billed) until it fired, while the object
-	 * hibernates until an alarm wakes it, which costs a metered alarm write
-	 * when it moves the alarm earlier (Store.scheduleAlarm). Asked for only
-	 * while a signed-in connection is open to be told; without one, the next
-	 * event sweeps (sweepPresence).
+	 * Notes that status work is due at `due`, and, for a registered user's
+	 * change (`alarm`), asks the alarm for it, unless it is already asked for
+	 * sooner. An alarm, not a timer: a timer kept the object awake (and
+	 * billed) until it fired, while the object hibernates until an alarm wakes
+	 * it, which costs metered maintenance writes when it moves the alarm
+	 * earlier (Store.scheduleAlarm). So the alarm time is rounded up to
+	 * PRESENCE_ALARM_ROUND_MS, and changes due in the same window share one
+	 * wake; a guest's change never asks for it, so guest connections, which
+	 * anyone can open, cannot spend the maintenance budget: it waits for the
+	 * next event, which sweeps (sweepPresence). Asked for only while a
+	 * signed-in connection is open to be told.
 	 */
-	private armPresence(due: number): void {
+	private armPresence(due: number, alarm = true): void {
 		if (!Number.isFinite(due)) return;
 		this.presenceDueAt = Math.min(this.presenceDueAt, due);
-		if (due >= this.presenceAlarmAt || !this.anySignedIn()) return;
-		this.presenceAlarmAt = due;
-		void this.rescheduleAlarm();
+		if (!alarm) return;
+		this.presenceAlarmDue = Math.min(this.presenceAlarmDue, due);
+		const at = Math.ceil(due / PRESENCE_ALARM_ROUND_MS) * PRESENCE_ALARM_ROUND_MS;
+		if (at >= this.presenceAlarmAt || !this.anySignedIn()) return;
+		this.presenceAlarmAt = at;
+		// The alarm handler sets the next alarm itself once it is done.
+		if (!this.inAlarm) void this.rescheduleAlarm();
 	}
 
 	/**
@@ -4217,6 +4259,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	flushPresence(now = nowMs(), live?: WebSocket): void {
 		this.presenceSweptAt = now;
 		this.presenceAlarmAt = Number.POSITIVE_INFINITY;
+		this.presenceAlarmDue = Number.POSITIVE_INFINITY;
 		this.presenceDueAt = Number.POSITIVE_INFINITY;
 		if (!this.config.push) return;
 		const mode = this.presenceMode();
@@ -4237,9 +4280,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 				list.push({ socket, state });
 				if (state.owed?.length) holders.push({ socket, state });
 			}
+			// The next change for an event to sweep, and the next the alarm is for (not a guest's).
 			let next = Number.POSITIVE_INFINITY;
+			let nextAlarm = Number.POSITIVE_INFINITY;
+			const wait = (userId: string, due: number) => {
+				next = Math.min(next, due);
+				if (!isGuestId(userId)) nextAlarm = Math.min(nextAlarm, due);
+			};
 			for (const [userId, states] of users) {
-				next = Math.min(next, this.expireMutes(userId, states, now));
+				wait(userId, this.expireMutes(userId, states, now));
 				if (!mode) continue;
 				const shown = this.shownConnected(states, now);
 				const pres = states.find(({ state }) => state.pres)?.state.pres;
@@ -4253,7 +4302,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				}
 				const due = Math.max(this.lastAnnounced(userId, pres) + coalesceMs, pres.h ?? 0);
 				if (due <= now) this.announceStatus(userId, states, shown, now);
-				else next = Math.min(next, due);
+				else wait(userId, due);
 			}
 			for (const { socket } of mode ? holders : []) {
 				const state = connectionAttachment(socket);
@@ -4265,7 +4314,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 					if (users.has(userId)) continue;
 					if (due > now) {
 						owed.push(entry);
-						next = Math.min(next, due);
+						wait(userId, due);
 						continue;
 					}
 					if (told !== status) this.deliverTo(socket, { method: "user", params: { new: { user_id: userId, ...shownFields(status, seen) } } });
@@ -4278,7 +4327,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 				writeAttachment(socket, latest);
 			}
 			// A mute that runs out within the minute is told on time; a later one when an event sweeps.
-			this.armPresence(next);
+			this.armPresence(next, false);
+			this.armPresence(nextAlarm);
 		});
 	}
 
@@ -4355,7 +4405,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		});
 		this.touchPresence(userId, now);
 		// A change waiting from before now has a connection to tell.
-		this.armPresence(this.presenceDueAt);
+		this.armPresence(this.presenceAlarmDue);
 	}
 
 	/**

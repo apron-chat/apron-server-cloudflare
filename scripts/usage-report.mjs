@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // Prints a per-day report of the server's Cloudflare usage: the Durable
 // Object's awake time and billed duration, peak open sockets and busiest hour
-// (GraphQL analytics, unsampled), invocations that threw, and the counters in
-// the METRICS Analytics Engine dataset (src/metrics.ts), also unsampled.
+// (GraphQL analytics, exact), its invocations and those that threw (GraphQL
+// adaptive analytics, sampled at high volume), and the counters in the
+// METRICS Analytics Engine dataset (src/metrics.ts), unsampled.
 //
 //   CLOUDFLARE_ACCOUNT_ID=... CLOUDFLARE_API_TOKEN=... npm run usage:report -- --days 3
 //
@@ -37,7 +38,9 @@ async function graphql(query) {
 	const response = await fetch(`${api}/graphql`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ query }) });
 	const body = await response.json();
 	if (!response.ok || body.errors?.length) throw new Error(`GraphQL: ${JSON.stringify(body.errors ?? response.status)}`);
-	return body.data.viewer.accounts[0];
+	const accountData = body.data?.viewer?.accounts?.[0];
+	if (!accountData) throw new Error("GraphQL returned no account: check CLOUDFLARE_ACCOUNT_ID, and that the token has Account Analytics Read on it.");
+	return accountData;
 }
 
 async function analyticsSql(sql) {
@@ -73,7 +76,7 @@ for (const group of durable.invocations) {
 }
 
 const percent = (value) => `${Math.round(value * 100)}%`;
-console.log("Durable Object, per UTC day (GraphQL analytics, unsampled)\n");
+console.log("Durable Object, per UTC day (GraphQL analytics; invocations sampled at high volume)\n");
 console.table([...perDay].sort(([a], [b]) => a.localeCompare(b)).map(([date, day]) => ({
 	day: date,
 	"awake s": Math.round(day.awake),
