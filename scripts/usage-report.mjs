@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Prints a per-day report of the server's Cloudflare usage: the Durable
-// Object's awake time and billed duration, peak open sockets and busiest hour
+// Object's awake time and billed duration (every Durable Object in the
+// account: these analytics cannot filter by Worker), peak open sockets and busiest hour
 // (GraphQL analytics, exact), its invocations and those that threw (GraphQL
 // adaptive analytics, sampled at high volume), and the counters in the
 // METRICS Analytics Engine dataset (src/metrics.ts), unsampled.

@@ -671,15 +671,18 @@ timer keeping the object awake 5,900 to 8,200 seconds a day (34% to 38% of
 its awake time, 2026-10-29 to 31), because it kept the object from
 hibernating through every quiet wait. A wake instead costs one request,
 the alarm write when it moves the alarm earlier (`Store.scheduleAlarm`,
-3 net writes), a status-only alarm run (the cleanup check from a cached
-value, then setting the next alarm, about 3 more) and about 10 s awake
-(1.28 GB-s). At production's 150 to 300 wakes a day that is about 1,000 to
-2,000 maintenance writes (1% to 2% of Paid's 100,000) for 540 to 640 GB-s
-saved. Rounding caps presence wakes at 5,760 a day whatever the traffic
-(about 35,000 writes, 35% of Paid's); reaching it takes registered users,
-whom passkeys and the registration cap bound, changing status around the
-clock. On Free that ceiling is above its 20,000 maintenance writes, which
-a deployment there would trade against the timer's duration.
+3 writes, measured), a status-only alarm run, and about 10 s awake (1.28
+GB-s). The run costs 3 writes when the instance is still in memory, and 6
+after hibernation, when the cleanup time and the pending upload deadline
+are read again; a presence wake usually follows hibernation, so about 9
+writes in all. At production's 150 to 300 wakes a day that is about 1,400
+to 2,700 maintenance writes (1% to 3% of Paid's 100,000) for 540 to 640
+GB-s saved. Rounding caps presence wakes at 5,760 a day whatever the
+traffic (about 52,000 writes, 52% of Paid's); reaching it takes registered
+users, whom passkeys and the registration cap bound, changing status in
+every 15-second window around the clock. On Free that ceiling is 2.6 times
+its 20,000 maintenance writes, and once they run out no alarm can be set
+until the next UTC day.
 
 A mute that runs out more than a minute after the last event is told at the
 first event after it (any frame, connection, close or alarm, each of which

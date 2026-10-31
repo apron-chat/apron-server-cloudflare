@@ -496,7 +496,8 @@ at most once in 10 minutes (`SEEN_WRITE_GRANULARITY_MS`, fixed, not a plan
 limit), so at most 144 times a day per account. A registered user's waiting
 change uses the object's alarm, rounded up to 15 seconds, so the object
 hibernates while it waits: each wake costs one alarm (a Durable Object
-request) and about 6 metered maintenance writes. A guest's change waits for
+request) and about 9 metered maintenance writes (6 if the object was still
+in memory). A guest's change waits for
 the next event instead, so guests cannot spend that budget. See the
 [cost report](cost-report.md#user-status).
 

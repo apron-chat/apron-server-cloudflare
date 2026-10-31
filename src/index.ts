@@ -1766,7 +1766,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	async alarm(): Promise<void> {
 		this.inAlarm = true;
-		try { await this.runAlarm(); } finally { this.inAlarm = false; }
+		let done = false;
+		try {
+			await this.runAlarm();
+			done = true;
+		} finally {
+			this.inAlarm = false;
+			// A handler that threw before setting the next alarm still sets it,
+			// so a presence change asked for meanwhile is not left without one.
+			if (!done) await this.rescheduleAlarm();
+		}
 	}
 
 	private async runAlarm(): Promise<void> {
