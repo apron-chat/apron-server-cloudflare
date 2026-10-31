@@ -169,6 +169,7 @@ meanwhile are dropped without a reply.
 | Method | Limit | Over the limit |
 | --- | --- | --- |
 | `activity` typing | 10 relayed a minute per account | Dropped, with one `~private` notice per minute. Send it as a notification (no `id`). |
+| `activity` `read_message_id` | 10 relayed a minute per account to its other connections, apart from typing's; registered accounts only (a guest's is dropped, without an error) | Kept but not relayed: the account's other devices get it after their next `room_list` of joined rooms. Send it as a notification, only while signed in to an account, at most one a room every few seconds. |
 | `status` idle changes | 12 a minute per connection | `retry_after` "Idle changes limited". `idle: false` is never refused. |
 | `status` mute and `me` status changes | 6 a minute per account, together | `retry_after` "Mute changes limited" / "Status changes limited". |
 | `push_register` | 10 a minute per account | `retry_after` "Push registrations limited". |
@@ -305,6 +306,11 @@ A thread stops counting when everyone has left it or its history expires.
 - [ ] Stay well under 60 frames a minute per connection. Throttle typing
       (it is a notification, at most 10 relayed a minute) and read cursors
       locally.
+- [ ] Send read cursors (`activity` `read_message_id`) only when signed in
+      to an account, the server advertises `activity`, and
+      `ext.settings.read_cursors` isn't `false`: a guest's are dropped
+      without an error. Send one a room at most every few seconds, the
+      latest, and any still waiting when the page is hidden.
 - [ ] Check sizes before sending: frames under 16 KiB, text under 4 KiB,
       request `id`s under 128 bytes, text frames only.
 - [ ] Retry only `retry_after` errors, and retry a mutation with the same
