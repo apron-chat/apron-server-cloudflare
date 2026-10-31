@@ -347,8 +347,10 @@ five minutes, when it serves the RP ID's own host, as here, without waking
 the Durable Object. Where it does not, as with the Worker on
 `chat.example.com` and `RP_ID = "example.com"`, serve
 `{"origins": [...]}` as JSON at `https://example.com/.well-known/webauthn`
-yourself. With edge rules, regenerate them: `apron_invalid_request` lets the
-path through when the production custom domain is `RP_ID`
+yourself: nothing else does. Startup does not check `RP_ORIGINS` against
+`RP_ID`, so a mistyped origin fails only in the browser, which refuses the
+passkey there. With edge rules, regenerate them: `apron_invalid_request`
+lets the path through when the production custom domain is `RP_ID`
 ([edge admission](edge-admission.md)). Browsers without related origins
 refuse passkeys on such a frontend; there its users sign in another way,
 such as with a token from `/invite-device` ([other devices](#other-devices)).

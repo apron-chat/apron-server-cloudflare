@@ -1,5 +1,5 @@
 import { env, runDurableObjectAlarm, runInDurableObject, SELF } from 'cloudflare:test';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Store } from '../src/store';
 import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
 
@@ -93,7 +93,10 @@ const fromUser = (userId: string) => (frame: Frame) => frame.method === 'message
 
 describe('live text end to end', () => {
 	beforeEach(() => setConfig({ adminToken: ADMIN_TOKEN }));
-	afterEach(() => setConfig({ adminToken: undefined, guestPosting: true }));
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		await setConfig({ adminToken: undefined, guestPosting: true });
+	});
 
 	it('advertises embed:terminal and embed:append, and /toggle livetext turns them off and on', async () => {
 		const admin = await connect();
@@ -236,6 +239,35 @@ describe('live text end to end', () => {
 			// A terminal or append in any other command is invalid_params.
 			expect((await command(writer, 'avatar', '/avatar', { body: { text: '/avatar', embeds: [{ kind: 'append' }] } })).frame.error).toBeTruthy();
 			expect((await request(writer, 'help-embed', 'command', { room_id: 'general', body: { text: '/help', embeds: [{ kind: 'terminal' }] } })).error).toMatchObject({ code: -32602 });
+		} finally { writer.close(); }
+	});
+
+	it('keeps streaming a write whose claim an expiry queued behind', async () => {
+		const userId = unique('racer');
+		const writer = await signedIn(userId, ['mod']);
+		try {
+			const { frame } = await command(writer, 'race', '/embed-terminal');
+			// The alarm's expiry (or a request's recovery) starts while the write's claim holds the mutation lock.
+			let expiry: Promise<void> | undefined;
+			await runInDurableObject(stub(), (instance) => {
+				const runtime = instance as unknown as { store: Store; expireLive(now: number): Promise<void> };
+				const claim = runtime.store.claimLiveText.bind(runtime.store);
+				vi.spyOn(runtime.store, 'claimLiveText').mockImplementationOnce((key, now) => {
+					const claimed = claim(key, now);
+					expiry = runtime.expireLive(Date.now());
+					return claimed;
+				});
+			});
+			const put = streamTo(frame.result.embeds[0].write_url);
+			await put.send('still here\n');
+			const posted = (await until(writer, fromUser(userId))).frame.params;
+			await vi.waitFor(() => expect(expiry).toBeDefined());
+			await expiry;
+			await put.end();
+			const response = await put.response;
+			expect(await response.text()).toBe('Done: the text is posted.\n');
+			const finished = (await until(writer, isMessage(posted.message_id))).frame.params;
+			expect(finished.body.embeds).toEqual([{ embed_id: frame.result.embeds[0].embed_id, kind: 'terminal', output: 'still here\n' }]);
 		} finally { writer.close(); }
 	});
 

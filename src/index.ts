@@ -1442,7 +1442,7 @@ export function liveCommandNotice(kind: LiveKind, writeUrl: string, entry: Pick<
 			`script -q /dev/null sh -c 'stty cols 80 rows 40; YOUR_COMMAND' | curl -sT - ${url}`,
 			"```",
 			"",
-			"The message appears when the stream starts. At a limit the stream ends, and so does the command feeding it. The link works once, and only for you: don't share it.",
+			"The message appears when the stream starts. At a limit the stream ends, and so does the command feeding it. The link works once, and anyone with it can stream as you, so don't share it.",
 		].join("\n");
 	}
 	return [
@@ -1452,7 +1452,7 @@ export function liveCommandNotice(kind: LiveKind, writeUrl: string, entry: Pick<
 		`your-llm-command | curl -sT - ${url}`,
 		"```",
 		"",
-		"The message appears when the stream starts. At a limit the stream ends, and so does the command feeding it. The link works once, and only for you: don't share it.",
+		"The message appears when the stream starts. At a limit the stream ends, and so does the command feeding it. The link works once, and anyone with it can stream as you, so don't share it.",
 	].join("\n");
 }
 
@@ -5778,9 +5778,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** Ends the live texts that fell due or were lost (Store.expireLiveTexts), and closes their waiting readers. */
 	private async expireLive(now: number): Promise<void> {
-		const streaming = new Set<string>();
-		for (const session of this.liveSessions.values()) if (session.buffer) streaming.add(session.entry.key);
 		await this.runMutation(async () => {
+			// Read inside the mutation: a write claimed before it is streaming by now (liveWrite).
+			const streaming = new Set<string>();
+			for (const session of this.liveSessions.values()) if (session.buffer) streaming.add(session.entry.key);
 			const expired = this.store.expireLiveTexts(streaming, now);
 			for (const record of expired.broadcasts) this.broadcastRecord(record);
 			for (const entry of expired.ended) {
@@ -5881,11 +5882,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async liveWrite(key: string, body: ReadableStream<Uint8Array>): Promise<Response> {
 		let claimed: ReturnType<Store["claimLiveText"]> = null;
+		let streaming: LiveSession | undefined;
 		await this.runMutation(async () => {
 			claimed = this.store.claimLiveText(key, nowMs());
-			if (claimed) for (const record of claimed.broadcasts) this.broadcastRecord(record);
+			if (!claimed) return;
+			for (const record of claimed.broadcasts) this.broadcastRecord(record);
+			// Streaming from its claim, in the same mutation, so an expiry queued behind it does not end it as lost.
+			const entry = claimed.entry;
+			streaming = this.liveSessions.get(entry.id) ?? { entry, readers: new LiveReaders() };
+			streaming.entry = entry;
+			streaming.buffer = new LiveBuffer(entry.kind, entry.limit);
+			this.liveSessions.set(entry.id, streaming);
 		});
-		if (!claimed) {
+		if (!claimed || !streaming) {
 			await body.cancel().catch(() => undefined);
 			return liveAnswer(409, "This write_url was already used or has expired");
 		}
@@ -5896,11 +5905,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.dropHeld(entry.owner, message.room_id);
 			if (this.store.identityExists(entry.owner)) this.wakeFor(message);
 		}
-		const session: LiveSession = this.liveSessions.get(entry.id) ?? { entry, readers: new LiveReaders() };
-		session.entry = entry;
-		const buffer = new LiveBuffer(entry.kind, entry.limit);
-		session.buffer = buffer;
-		this.liveSessions.set(entry.id, session);
+		const session: LiveSession = streaming;
+		const buffer = session.buffer!;
 		// The alarm ends it should this instance be lost meanwhile, and no longer waits for its write.
 		await this.refreshLiveDeadline().catch(() => undefined);
 		const reader = body.getReader();

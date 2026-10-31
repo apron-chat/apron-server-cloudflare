@@ -4715,12 +4715,11 @@ export class Store {
     }
     const live = this.config.liveText ?? null;
     const isLive = (kind: unknown) => !!live && typeof kind === "string" && LIVE_KINDS.has(kind);
-    // §4.8.5: a message has at most one append; and a user has one live text open at a time.
+    // §4.8.5: a message has at most one append, a protocol rule; and a user has one live text open at a time.
+    const appends = embeds.filter((embed) => embed.embed_id === undefined ? embed.kind === "append" && isLive(embed.kind) : earlier.get(embed.embed_id as string)?.kind === "append");
+    if (appends.length > 1) throw new StoreError("invalid_params", "A message has at most one append embed");
     const fresh = embeds.filter((embed) => embed.embed_id === undefined && isLive(embed.kind));
     if (fresh.length > 1) throw new StoreError("denied", "A message can start one live text (terminal or append) at a time");
-    if (fresh.some((embed) => embed.kind === "append") && embeds.some((embed) => embed.embed_id !== undefined && earlier.get(embed.embed_id as string)?.kind === "append")) {
-      throw new StoreError("denied", "A message has at most one append embed");
-    }
     const kept = new Set<string>();
     const uploads: PendingUpload[] = [];
     const writes: Record<string, unknown>[] = [];

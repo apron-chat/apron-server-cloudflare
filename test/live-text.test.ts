@@ -134,6 +134,8 @@ describe('live text policy', () => {
 		const append = liveCommandNotice('append', 'https://demo.test/w/l.y', { maxMs: 120_000, limit: 4_000 }, policy);
 		expect(append).toContain('up to 120 seconds and 4,000 bytes');
 		expect(append).toContain("your-llm-command | curl -sT - 'https://demo.test/w/l.y'");
+		// The link is a bearer credential, good for one write.
+		for (const notice of [terminal, append]) expect(notice).toContain("The link works once, and anyone with it can stream as you, so don't share it.");
 	});
 });
 
@@ -191,9 +193,14 @@ describe('store live text', () => {
 			// The appended text does not change mentions.
 			expect(params.body).toEqual({ text: 'Plan: roll back @car', format: 'markdown', mentions: ['bob'] });
 			expect(params.prev_log_id).toBe(created.result.message_id);
-			// At most one append in a message, and one live text per message.
-			expect(errorCode(() => post(store, clock, 'bob', { body: { embeds: [{ kind: 'append' }, { kind: 'append' }] } }))).toBe('denied');
+			// At most one append in a message (§4.8.5, invalid_params), and one live text per message (policy).
+			expect(errorCode(() => post(store, clock, 'bob', { body: { embeds: [{ kind: 'append' }, { kind: 'append' }] } }))).toBe('invalid_params');
 			expect(errorCode(() => post(store, clock, 'bob', { body: { embeds: [{ kind: 'terminal' }, { kind: 'append' }] } }))).toBe('denied');
+			const open = post(store, clock, 'bob', { body: { text: 'x', embeds: [{ kind: 'append' }] } });
+			const keptAppend = { embed_id: writeOf(open.result).embed_id, kind: 'append' };
+			const twice = () => post(store, clock, 'bob', { message_id: open.result.message_id, body: { text: 'x', embeds: [keptAppend, { kind: 'append' }] } });
+			expect(errorCode(twice)).toBe('invalid_params');
+			expect(twice).toThrow('A message has at most one append embed');
 		});
 	});
 
