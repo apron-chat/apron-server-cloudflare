@@ -84,7 +84,8 @@ A registered user's `read_message_id` (§4.6) costs no SQL when it arrives,
 unless a push counted up their `unread` since they were last back (one small
 reservation to zero it, [below](#push)) or it passes the newest of held
 wakes released together (one lookup): it is relayed to their other
-connections and held on the connection's attachment. Each connection writes
+connections (in a private room, its members' too: read receipts) and held on
+the connection's attachment. Each connection writes
 what it holds at most once a minute (`READ_CURSOR_FLUSH_MS`, by its next
 cursor or the next alarm) and when it closes, so a reader costs about one
 written row a minute and a room they read, however often their client sends.
@@ -93,7 +94,10 @@ an expired room and `/purge` delete the row by its key, with the membership.
 The costs are the read cursor rows of the [matrix](#reservation-accounting):
 each written figure includes the day's budget row, and a cursor not past the
 one kept is charged one row, as every statement is, though SQLite reports
-none.
+none. A listing's read receipts read, for each private room listed, its
+memberships joined to their cursors by primary key, at most 32 members a
+room: a reservation of `8 + rooms × (4 + 2 × 32)` reads, about two rows a
+member with a cursor.
 
 ## Limiter rows and the budget row
 
@@ -250,6 +254,7 @@ upper bounds can be compared with the measured worst case:
 | Read cursor written, not past the one kept (no row changes) | 2 | 2 | 20 | 20 |
 | Read cursor written for a room not joined (the probe alone) | 2 | 1 | 20 | 20 |
 | Read cursors at a listing (one range of the user's rows) | 2 | 1 | 518 | 8 |
+| Read receipts at a listing, one private room with one cursor (its memberships joined to their cursors) | 3 | 1 | 84 | 8 |
 | Cleanup (matrix, one day later) | 121 | 42 | 1,874 | 1,058 |
 | Alarm scheduling | 6 | 3 | 24 | 12 |
 

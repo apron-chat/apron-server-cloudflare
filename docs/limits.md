@@ -169,7 +169,7 @@ meanwhile are dropped without a reply.
 | Method | Limit | Over the limit |
 | --- | --- | --- |
 | `activity` typing | 10 relayed a minute per account | Dropped, with one `~private` notice per minute. Send it as a notification (no `id`). |
-| `activity` `read_message_id` | 10 relayed a minute per account to its other connections, apart from typing's; registered accounts only (a guest's is dropped, without an error) | Kept but not relayed: the account's other devices get it after their next `room_list` of joined rooms. Send it as a notification, only while signed in to an account, at most one a room every few seconds. |
+| `activity` `read_message_id` | 10 relayed a minute per account, apart from typing's, to its other connections and, in a private room, the other members' (read receipts); registered accounts only (a guest's is dropped, without an error) | Kept but not relayed: the account's other devices, and a private room's members, get it after their next `room_list` of joined rooms. Send it as a notification, only while signed in to an account, at most one a room every few seconds. |
 | `status` idle changes | 12 a minute per connection | `retry_after` "Idle changes limited". `idle: false` is never refused. |
 | `status` mute and `me` status changes | 6 a minute per account, together | `retry_after` "Mute changes limited" / "Status changes limited". |
 | `push_register` | 10 a minute per account | `retry_after` "Push registrations limited". |

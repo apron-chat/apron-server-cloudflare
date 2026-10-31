@@ -80,6 +80,47 @@ it('advertises read cursors with activity, relays one to the user\'s other conne
 	} finally { first.peer.close(); second.peer.close(); other.peer.close(); }
 });
 
+it('shows a private room\'s members each other\'s read cursors, live and after a listing, and nobody else (read receipts)', async () => {
+	const ada = unique('ada');
+	const bob = unique('bob');
+	const carol = unique('carol');
+	await register(ada);
+	await register(bob);
+	await register(carol);
+	const first = await signIn(ada);
+	const other = await signIn(bob);
+	const outsider = await signIn(carol);
+	try {
+		expect(first.server.params.ext.settings.read_receipts).toBe('private');
+		const created = await exchange(first.peer, 'create', 'room_set', { private: true });
+		const roomId = created.frame.result.room_id as string;
+		await request(first.peer, 'add', 'room_join', { room_id: roomId, user_id: bob });
+		await until(other.peer, (frame) => frame.method === 'room_update' && frame.params.joined?.[0]?.room_id === roomId);
+		const one = (await request(first.peer, 'one', 'message', { room_id: roomId, body: { text: 'one' } })).result.message_id;
+		await drain(first.peer);
+		await drain(other.peer);
+		await drain(outsider.peer);
+		// Bob reads it: Ada sees it, Carol (not a member) does not, nor Bob's own connection.
+		other.peer.send({ method: 'activity', params: { room_id: roomId, read_message_id: one } });
+		const relayed = await until(first.peer, (frame) => frame.method === 'activity');
+		expect(relayed.frame.params).toEqual({ room_id: roomId, from: { user_id: bob, name: `Name of ${bob}` }, read_message_id: one });
+		expect(reads(await drain(other.peer))).toEqual([]);
+		expect(reads(await drain(outsider.peer))).toEqual([]);
+		// Ada's other device lists the room: Bob's cursor, by user_id alone, not her own (she has none).
+		const second = await signIn(ada);
+		try {
+			await exchange(second.peer, 'list', 'room_list', { filter: 'joined' });
+			expect(reads(await drain(second.peer))).toEqual([{ room_id: roomId, from: { user_id: bob }, read_message_id: one }]);
+		} finally { second.peer.close(); }
+		// A public room's cursor still goes to the user's own connections only.
+		const general = await post(first.peer, 'general');
+		await drain(first.peer);
+		other.peer.send({ method: 'activity', params: { room_id: 'general', read_message_id: general } });
+		expect(reads(await drain(other.peer))).toEqual([]);
+		expect(reads(await drain(first.peer))).toEqual([]);
+	} finally { first.peer.close(); other.peer.close(); outsider.peer.close(); }
+});
+
 it('relays read cursors within an allowance of their own, so reading never throttles typing', async () => {
 	const ada = unique('ada');
 	const bob = unique('bob');

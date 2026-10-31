@@ -107,6 +107,8 @@ const PUBLIC_ROOMS = "(room_id < 'private_' OR room_id >= 'private`')";
 const MAX_ROOM_ROWS = MAX_THREAD_LIMIT + 1 + MAX_PRIVATE_ROOM_LIMIT;
 /** Most rooms one registered user can be in: every public room, and their share of private ones. */
 const MAX_USER_ROOMS = MAX_THREAD_LIMIT + 1 + MAX_PRIVATE_MEMBERSHIPS_PER_USER;
+/** The most members of one private room whose read cursors a listing reads back (roomReadCursors). */
+export const MAX_READ_RECEIPT_MEMBERS = 32;
 const MAX_SAFE_ID = Number.MAX_SAFE_INTEGER;
 export const RETENTION_MS = DEFAULT_LIMITS.retentionSeconds * 1000;
 const DEDUP_TTL_MS = DEFAULT_LIMITS.dedupTtlSeconds * 1000;
@@ -6129,6 +6131,32 @@ export class Store {
     return this.reserved({ reads: 8 + 2 * rows }, false, now, () => new Map(this.rawRows<{ room_id: string; message_id: number }>(
       "SELECT room_id, message_id FROM read_cursors WHERE user_id = ? LIMIT ?", userId, rows,
     ).map((row) => [row.room_id, idString(integerColumn(row.message_id))])));
+  }
+
+  /**
+   * The read cursors of a private room's members (read receipts, protocol
+   * §4.6): for each room, the users with a cursor kept there and the
+   * `read_message_id` each read through, at most MAX_READ_RECEIPT_MEMBERS a
+   * room. A range of the room's memberships, each joined to its cursor by
+   * primary key, so a member without one costs its membership read alone.
+   */
+  roomReadCursors(roomIds: readonly string[], now = this.clock.now()): Map<string, Array<[userId: string, messageId: string]>> {
+    const rooms = roomIds.filter(isPrivateRoomId).slice(0, MAX_PRIVATE_MEMBERSHIPS_PER_USER);
+    const found = new Map<string, Array<[string, string]>>();
+    if (!rooms.length) return found;
+    this.ensureReady();
+    return this.reserved({ reads: 8 + rooms.length * (4 + 2 * MAX_READ_RECEIPT_MEMBERS) }, false, now, () => {
+      for (const roomId of rooms) {
+        const rows = this.rawRows<{ user_id: string; message_id: number }>(
+          `SELECT read_cursors.user_id, read_cursors.message_id FROM memberships
+           JOIN read_cursors ON read_cursors.user_id = memberships.user_id AND read_cursors.room_id = memberships.room_id
+           WHERE memberships.room_id = ? LIMIT ?`,
+          roomId, MAX_READ_RECEIPT_MEMBERS,
+        );
+        if (rows.length) found.set(roomId, rows.map((row) => [row.user_id, idString(integerColumn(row.message_id))]));
+      }
+      return found;
+    });
   }
 
   /**

@@ -935,12 +935,18 @@ describe('measured storage accounting', () => {
 			measure('read cursor written, not past the one kept', () => store.saveReadCursors({ userId: 'matrix-user', cursors: [['general', read]], now: clock.now() }));
 			measure('read cursor written, a room not joined', () => store.saveReadCursors({ userId: 'matrix-user', cursors: [['matrix-not-joined', read]], now: clock.now() }));
 			expect(measure('read cursors at a listing', () => store.readCursors('matrix-user', clock.now()))).toEqual(new Map([['general', String(Number(read) + 1)]]));
+			// Read receipts: a private room's members joined to their cursors, by primary key.
+			const privateRoom = String(store.mutate({
+				userId: 'matrix-user', ipKey: 'matrix-ip', requestId: 'matrix-private', method: 'room_set', now: clock.now(), identity: { user_id: 'matrix-user' }, params: { private: true },
+			}).result.room_id);
+			store.saveReadCursors({ userId: 'matrix-user', cursors: [[privateRoom, read]], now: clock.now() });
+			expect(measure('read receipts at a listing, one private room', () => store.roomReadCursors([privateRoom], clock.now()))).toEqual(new Map([[privateRoom, [['matrix-user', read]]]]));
 			clock.set(clock.now() + DAY + HOUR + 1);
 			measure('cleanup', () => store.runCleanup(clock.now()));
 			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
 			expect(create.result.message_id).toBeTruthy();
-			expect(costs).toHaveLength(68);
+			expect(costs).toHaveLength(69);
 			expect(store.accountingStatus().unsafe).toBe(false);
 			return { costs };
 		});

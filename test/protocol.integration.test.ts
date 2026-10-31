@@ -998,8 +998,9 @@ it('advertises the extensions ext:settings, ext:limits, ext:media and ext:permis
 		const emoji = { max_bytes: UPLOAD_POLICY!.maxEmojiBytes };
 		expect(server.ext).toEqual({
 			settings: {
-				// Typing is off in vitest.config.ts, and read cursors with it.
+				// Typing is off in vitest.config.ts, and read cursors and receipts with it.
 				read_cursors: false,
+				read_receipts: false,
 				// The most private rooms one user may be in.
 				private_rooms: DEFAULT_LIMITS.privateMembershipsPerUser,
 			},
