@@ -81,8 +81,8 @@ export interface LedgerHost {
   clock(): number;
   /** True inside a storage transaction, which may yet roll back: staged changes wait for the next flush outside one. */
   inTransaction(): boolean;
-  /** Latches accounting unsafe after a failure that leaves the ledger uncertain. */
-  markUnsafe(): void;
+  /** Latches accounting unsafe after a failure that leaves the ledger uncertain; `error` is what failed, for the log. */
+  markUnsafe(error?: unknown): void;
 }
 
 // Keep a small durable control reserve inside the maintenance allocation.
@@ -265,7 +265,7 @@ export class BudgetLedger {
       if (pruning) this.prune(day);
       return { ...cost, day, maintenance };
     } catch (error) {
-      if (!isRetryAfter(error)) this.host.markUnsafe();
+      if (!isRetryAfter(error)) this.host.markUnsafe(error);
       throw error;
     }
   }
@@ -299,7 +299,7 @@ export class BudgetLedger {
       this.handoverPending = false;
       return { reads, writes, frames: cost.frames, admissions: cost.admissions, posts: cost.posts, registrations: cost.registrations, history: cost.history };
     } catch (error) {
-      if (!isRetryAfter(error)) this.host.markUnsafe();
+      if (!isRetryAfter(error)) this.host.markUnsafe(error);
       throw error;
     }
   }
@@ -358,8 +358,8 @@ export class BudgetLedger {
           if (cursor.rowsWritten !== undefined && cursor.rowsWritten < 1) throw new StoreError("internal_error", "budget reservation did not update durable state");
         }
         this.staged.delete(day);
-      } catch {
-        this.host.markUnsafe();
+      } catch (error) {
+        this.host.markUnsafe(error);
       }
     }
   }

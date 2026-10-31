@@ -14,7 +14,8 @@
 		"typecheck": "npm run budget:check && tsc --noEmit",
 		"test": "npm run budget:check && node --test scripts/budget.test.mjs && vitest run",
 		"test:watch": "vitest",
-		"cf-typegen": "wrangler types"
+		"cf-typegen": "wrangler types",
+		"usage:report": "node scripts/usage-report.mjs"
 	},
 	"dependencies": {
 		"@simplewebauthn/server": "^14.0.0"

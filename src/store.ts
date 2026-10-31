@@ -1751,6 +1751,8 @@ export class Store {
    * has unwound, so the operators hear of it (ApronDemoServer.notify).
    */
   onOverrun?: () => void;
+  /** Called, synchronously, as accounting closes or reopens, for a metric; it must not touch storage. */
+  onAccounting?: (change: "overrun" | "uncertain" | "recovered") => void;
   private deferredCleanupUntil = 0;
   private scheduledAlarmAt?: number;
   /** Bumped by every write to a table member listings read (MEMBER_TABLES). */
@@ -1795,7 +1797,7 @@ export class Store {
       advanceClock: (now) => { this.effectiveNow(now); },
       clock: () => this.lastEffectiveMs,
       inTransaction: () => this.inTransaction,
-      markUnsafe: () => this.markAccountingUnsafe("uncertain"),
+      markUnsafe: (error) => this.markAccountingUnsafe("uncertain", error),
     }, this.config);
   }
 
@@ -2138,6 +2140,7 @@ export class Store {
     this.accountingUncertain = false;
     this.persistAccountingMarker();
     console.warn(JSON.stringify({ event: "accounting_uncertain_recovered", ...(charged ? { charged } : {}) }));
+    try { this.onAccounting?.("recovered"); } catch { /* a metric never breaks recovery */ }
     return true;
   }
 
@@ -2472,7 +2475,12 @@ export class Store {
    * The first overrun tells the operators (onOverrun), once the failing
    * operation has unwound.
    */
-  private markAccountingUnsafe(kind: "overrun" | "uncertain"): void {
+  private markAccountingUnsafe(kind: "overrun" | "uncertain", error?: unknown): void {
+    // Once a closing, with what failed: the one record of why the server refuses.
+    if (kind === "overrun" ? !this.accountingUnsafe : !this.accountingUncertain) {
+      console.error(JSON.stringify({ event: "accounting_closed", kind, message: error instanceof Error ? error.message : error === undefined ? undefined : String(error) }));
+      try { this.onAccounting?.(kind); } catch { /* a metric never breaks the stop */ }
+    }
     if (kind === "uncertain") {
       this.accountingUncertain = true;
       this.persistAccountingMarker();
@@ -2621,7 +2629,7 @@ export class Store {
       // Set the latch before throwing. If this assertion is inside a native
       // transaction, transaction() persists it after rollback; outside a
       // transaction it is durable immediately.
-      this.markAccountingUnsafe("overrun");
+      this.markAccountingUnsafe("overrun", `storage cost exceeded its reservation: ${actualReads}/${reserved.reads} reads, ${actualWrites}/${reserved.writes} writes`);
       throw new StoreError("internal_error", "storage cost exceeded its reservation", {
         data: {
           reserved_reads: reserved.reads,

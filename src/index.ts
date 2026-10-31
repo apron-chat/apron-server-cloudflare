@@ -5,6 +5,7 @@ import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTI
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor } from "./account-usage";
 import { EDGE_STOP_RULE_REF, readEdgeStop, runBudgetGuard, watchForFlood } from "./budget-guard";
+import { recordMetric } from "./metrics";
 import { notifyTrigger, type NoticeChannels } from "./notify";
 import { AUDIO_TYPES, sniffAudio } from "./audio";
 import { IMAGE_TYPES, sniffImage } from "./image";
@@ -1267,7 +1268,10 @@ function adminChannels(env: Env): NoticeChannels {
 
 export async function fetchEntry(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
 	// Every request the Worker sees is billed, whatever it answers.
-	watchForFlood(env, ctx, Date.now(), Math.random, fetch, () => notifyTrigger({ kind: "edge_stop", exceeded: ["flood"] }, adminChannels(env)));
+	watchForFlood(env, ctx, Date.now(), Math.random, fetch, () => {
+		recordMetric(env.METRICS, "edge_stop", ["flood"]);
+		return notifyTrigger({ kind: "edge_stop", exceeded: ["flood"] }, adminChannels(env));
+	});
 	const response = await fetchConnection(request, env);
 	if (!isConnectionStatus(request)) return response;
 	const headers = new Headers(response.headers);
@@ -1457,7 +1461,9 @@ export default {
 		// The stop is set first; only a stop just turned on is told, and the
 		// telling never throws (notifyTrigger).
 		ctx.waitUntil(runBudgetGuard(env, controller.scheduledTime).then((result) => {
-			if (result.outcome === "changed" && result.stop) return notifyTrigger({ kind: "edge_stop", exceeded: result.exceeded }, adminChannels(env));
+			if (result.outcome !== "changed" || !result.stop) return;
+			recordMetric(env.METRICS, "edge_stop", ["guard", result.exceeded.join(",")]);
+			return notifyTrigger({ kind: "edge_stop", exceeded: result.exceeded }, adminChannels(env));
 		}));
 	},
 } satisfies ExportedHandler<Env>;
@@ -1551,8 +1557,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly pendingWakes = new Set<PendingWake>();
 	/** Pushes claimed with an `unread` by this instance, so a sign-in can tell whether one came while it read (afterSignIn). */
 	private unreadClaims = 0;
-	/** When an event or a timer last ran in this instance (noteActivity, noteTimerFired), 0 for none yet. */
-	private lastActivityAt = 0;
 	/**
 	 * When the alarm is asked to announce waiting status changes
 	 * (armPresence), infinity for not. In memory: a wake forgets it, and the
@@ -1578,6 +1582,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.store = new Store(ctx as unknown as ConstructorParameters<typeof Store>[0], asStoreConfig(this.config));
 		// An overrun closes accounting until an operator clears it: tell them.
 		this.store.onOverrun = () => ctx.waitUntil(notifyTrigger({ kind: "accounting_overrun" }, { admins: (text) => this.notifyAdmins(text) }));
+		this.store.onAccounting = (change) => recordMetric(this.runtimeEnv.METRICS, "accounting", [change]);
 		this.accountUsage = new AccountUsageMonitor({
 			env,
 			persist: (snapshot, now) => this.store.persistAccountUsageSnapshot(snapshot, now),
@@ -1609,7 +1614,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	async fetch(request: Request): Promise<Response> {
-		this.noteActivity();
 		const status = isConnectionStatus(request);
 		if (request.method !== "GET" || (!isUpgrade(request) && !status)) return responseError(400, "WebSocket upgrade required");
 		const ipKey = trustedIpKey(request);
@@ -1671,7 +1675,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-		this.noteActivity();
 		const socket = ws as WebSocketConnection;
 		// Before the attachment is read: the sweep may write it. The sending
 		// socket has just been heard, so the sweep never judges it stale.
@@ -1720,7 +1723,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	async webSocketClose(ws: WebSocket, code = 1000): Promise<void> {
-		this.noteActivity();
 		const socket = ws as WebSocketConnection;
 		this.sweepPresence();
 		const attachment = connectionAttachment(socket);
@@ -1734,7 +1736,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	async webSocketError(ws: WebSocket): Promise<void> {
-		this.noteActivity();
 		const socket = ws as WebSocketConnection;
 		this.sweepPresence();
 		const attachment = connectionAttachment(socket);
@@ -1748,14 +1749,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	async alarm(): Promise<void> {
-		this.noteActivity();
 		this.alarmKnown = false;
 		const now = nowMs();
 		this.sweepPresence(now);
 		// An alarm that only announced waiting status changes stops here: the
 		// usage refresh, sweeps and cleanup below run on the alarms that have
 		// their own work, as they did before presence used the alarm.
-		if (!this.alarmWorkDue(now)) {
+		const full = this.alarmWorkDue(now);
+		recordMetric(this.runtimeEnv.METRICS, "alarm", [full ? "full" : "light"]);
+		if (!full) {
 			await this.rescheduleAlarm();
 			return;
 		}
@@ -4640,7 +4642,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return;
 		}
 		wake.timer = setTimeout(() => {
-			this.noteTimerFired("push_wake");
 			this.pendingWakes.delete(wake);
 			const now = nowMs();
 			for (const userId of [...wake.reasons.keys()]) if (this.attended(userId, now)) wake.reasons.delete(userId);
@@ -4839,23 +4840,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 	}
 
-	/** Notes an event (a request, a socket's frame or close, the alarm, an RPC): the object is awake for it anyway. */
-	private noteActivity(): void {
-		this.lastActivityAt = nowMs();
-	}
-
-	/**
-	 * Logs how long a push wake's wait kept the object awake,
-	 * `timer_kept_awake`: the time since the last event or timer. The object
-	 * hibernates about ten seconds after its last activity; a timer firing
-	 * later puts that off by the whole gap. Logs are sampled, so totals scale up.
-	 */
-	private noteTimerFired(timer: "push_wake"): void {
-		const now = nowMs();
-		if (this.lastActivityAt > 0 && now > this.lastActivityAt) console.log(JSON.stringify({ event: "timer_kept_awake", timer, ms: now - this.lastActivityAt }));
-		this.lastActivityAt = now;
-	}
-
 	/**
 	 * Posts `text` in `general` as the admin user, mentioning every other
 	 * user with the `admin` role (at most MAX_ALERT_ADMINS), and pushes it to
@@ -4866,7 +4850,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * budget guard calls it over RPC, which the edge stop does not block.
 	 */
 	async notifyAdmins(text: string): Promise<void> {
-		this.noteActivity();
 		// Caught inside, so a failed alert never takes runMutation's way out of
 		// an uncertain commit, closing every socket: under the edge stop, the
 		// sockets already open are the only ones that still work.
@@ -4892,6 +4875,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				});
 				// `pushed: false` with admins: none had a registration that a mute or `dnd` left.
 				console.warn(JSON.stringify({ event: "admins_notified", admins: admins.length, pushed }));
+				recordMetric(this.runtimeEnv.METRICS, "admins_notified", [pushed ? "pushed" : "not_pushed"], admins.length);
 			} catch (error) {
 				failure = error;
 			}
@@ -4964,6 +4948,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			else failed++;
 		});
 		if (failed) console.warn(JSON.stringify({ event: "push_delivery_failed", failed, sent: subscriptions.length }));
+		const sent = subscriptions.length - failed - gone.length;
+		for (const [outcome, count] of [["sent", sent], ["failed", failed], ["gone", gone.length]] as const) {
+			if (count) recordMetric(this.runtimeEnv.METRICS, "push", [outcome], count);
+		}
 		try {
 			if (gone.length) this.store.forgetPushSubscriptions(gone, nowMs());
 		} catch { /* a failed delete is retried by nothing: the next push tries again */ }
@@ -6482,6 +6470,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			try { socket.close(1001, "Connection idle; reconnect to recover"); } catch { /* already closed */ }
 			this.connectionGone(attachment);
 			closed++;
+			recordMetric(this.runtimeEnv.METRICS, "stale_close", [neverPinged ? "unpinged" : "pinged", attachment.origin ?? "none"]);
 			if (neverPinged) {
 				unpingedClosed++;
 				if (unpingedOrigins.size < 8) unpingedOrigins.add(attachment.origin ?? "none");
@@ -6809,7 +6798,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * this upload is waiting for one. Only one request may write it.
 	 */
 	async claimUpload(key: string): Promise<boolean | "closed"> {
-		this.noteActivity();
 		return !!this.config.uploads && this.store.claimUpload(key, nowMs());
 	}
 
@@ -6820,7 +6808,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * deletes what it stored.
 	 */
 	async finishUpload(write: UploadWrite): Promise<boolean> {
-		this.noteActivity();
 		if (!this.config.uploads) return false;
 		if (write.key.startsWith("e/")) return this.finishEmoji(write);
 		let finished: UploadFinish = { accepted: false, broadcasts: [], deletedUploads: [] };

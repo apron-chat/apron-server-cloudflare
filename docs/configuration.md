@@ -180,6 +180,24 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   1 KB measured on the demo, times the sampling rate. `npm run budget:check`
   refuses a production config that samples more than the estimate assumes.
   The request stops come long before this one; it is a backstop.
+- **Metrics.** Logs are sampled, so rare events can be missed and totals are
+  estimates. The production config also binds a Workers Analytics Engine
+  dataset, `METRICS` (`apron_server_metrics`), and `src/metrics.ts` writes one
+  unsampled data point per event worth counting: stale connections closed
+  (`stale_close`: `pinged` or `unpinged`, and the origin), alarms (`alarm`:
+  `light` for status changes only, or `full`), pushes delivered (`push`:
+  `sent`, `failed` or `gone`), accounting closing and reopening
+  (`accounting`: `overrun`, `uncertain` or `recovered`; the log line
+  `accounting_closed` carries what failed), admin alerts (`admins_notified`)
+  and the edge stop turning on (`edge_stop`: `guard` or `flood`). Each point
+  is `blob1` the event, `blob2` and `blob3` its details and `double1` its
+  value. Writing never awaits or throws, and without the binding nothing is
+  written. Workers Paid includes 10 million data points a month; this server
+  writes a few thousand a day. `npm run usage:report -- --days 3` (with
+  `CLOUDFLARE_ACCOUNT_ID` and a `CLOUDFLARE_API_TOKEN` that has Account
+  Analytics Read) prints each UTC day's Durable Object awake time, billed
+  duration, peak sockets and busiest hour from GraphQL analytics, and the
+  counters from the dataset.
 
 Set it up once per deployment:
 
