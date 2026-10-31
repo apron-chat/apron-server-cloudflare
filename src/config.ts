@@ -1,5 +1,5 @@
 import * as budget from "./budget.ts";
-import { DEFAULT_FEATURES, DEFAULT_LIMITS, MAX_PUSH_CANDIDATES, MAX_PUSHES_PER_MESSAGE, MAX_STATUS_DELAY_SECONDS, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits, type PushPolicy } from "./budget.ts";
+import { DEFAULT_FEATURES, DEFAULT_LIMITS, LIVE_TEXT_POLICY, MAX_PUSH_CANDIDATES, MAX_PUSHES_PER_MESSAGE, MAX_STATUS_DELAY_SECONDS, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits, type LiveTextPolicy, type PushPolicy } from "./budget.ts";
 import { base64UrlDecode, P256_PRIVATE_KEY_BYTES, P256_PUBLIC_KEY_BYTES, vapidKeysMatch, type VapidKeys } from "./webpush.ts";
 export { DEFAULT_LIMITS } from "./budget.ts";
 
@@ -46,6 +46,18 @@ export interface RuntimeConfig {
 	 */
 	uploads?: UploadConfig;
 	/**
+	 * Live text (protocol §4.8.3, caps `embed:terminal` and `embed:append`),
+	 * configured when the plan has a live text policy and the deployment sets
+	 * `PUBLIC_ORIGIN` and the `UPLOAD_SIGNING_KEY` secret, which signs every
+	 * `write_url`. No R2 is needed: the text lives in the Durable Object.
+	 */
+	liveText?: LiveTextConfig;
+	/**
+	 * Whether live text is on while configured: the plan's default, or
+	 * `LIVE_TEXT`. An admin's `/toggle livetext` overrides it.
+	 */
+	liveTextEnabled: boolean;
+	/**
 	 * Web Push (protocol §4.9, push kind `webpush`), on when the plan has a
 	 * push policy and the deployment sets `VAPID_PUBLIC_KEY`, `VAPID_SUBJECT`,
 	 * and the `VAPID_PRIVATE_KEY` secret.
@@ -89,6 +101,19 @@ export const MAX_SERVER_DESCRIPTION_BYTES = 500;
 /** The longest `SERVER_AVATAR`, in characters: an https URL, or a small `data:` image. */
 const MAX_SERVER_AVATAR_CHARS = 8_192;
 
+interface LiveTextConfig {
+	/**
+	 * The plan's live text policy, with any `LIVE_TEXT_<KEY>` variable
+	 * (such as `LIVE_TEXT_MAX_SECONDS`) in place of its value, within the
+	 * calibrated bounds (validateLiveTextPolicy).
+	 */
+	policy: LiveTextPolicy;
+	/** This Worker's public origin, where `write_url`s and live `url`s point. */
+	publicOrigin: string;
+	/** Signs `write_url` tokens (upload-token.ts); at least 32 characters. */
+	signingKey: string;
+}
+
 interface UploadConfig {
 	/** Where the bucket serves objects, such as `https://media.apron.chat`. */
 	mediaOrigin: string;
@@ -128,6 +153,7 @@ type EnvLike = {
 	ACTIVITY?: string;
 	GUEST_POSTING?: string;
 	PRESENCE?: string;
+	LIVE_TEXT?: string;
 	APRON_ADMIN_TOKEN?: string;
 	MEDIA_ORIGIN?: string;
 	PUBLIC_ORIGIN?: string;
@@ -367,6 +393,8 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 	const adminTokenProblem = adminToken === undefined ? null : adminTokenError(adminToken);
 	if (adminTokenProblem) throw new ConfigError(adminTokenProblem);
 	const uploads = loadUploads(env);
+	const liveText = loadLiveText(env, limits);
+	const liveTextEnabled = parseSwitch(env.LIVE_TEXT, "LIVE_TEXT", DEFAULT_FEATURES.liveText);
 	if (PUSH_POLICY) validatePushPolicy(PUSH_POLICY);
 	const push = loadPush(env);
 	const pushHosts = loadPushHosts(env.PUSH_HOSTS);
@@ -390,6 +418,8 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 		presence,
 		...(adminToken !== undefined ? { adminToken } : {}),
 		...(uploads ? { uploads } : {}),
+		...(liveText ? { liveText } : {}),
+		liveTextEnabled,
 		...(push ? { push } : {}),
 		pushHosts,
 		pushDelaySeconds,
@@ -422,7 +452,7 @@ export function validServerDescription(description: string): boolean {
  * empty, the field is left out (`RP_NAME` names the server only to WebAuthn).
  * The title is a plain name within the display-name policy, the description
  * short CommonMark, and the avatar an `https:` URL or a
- * `data:image/{png,jpeg,gif,webp};base64,` URL (§4.8.6).
+ * `data:image/{png,jpeg,gif,webp};base64,` URL (§4.8.7).
  */
 function loadServerMetadata(env: EnvLike, limits: Limits): ServerMetadata {
 	const title = (env.SERVER_TITLE ?? "").trim();
@@ -446,6 +476,62 @@ function loadUploads(env: EnvLike): UploadConfig | undefined {
 	if (!validOrigin(publicOrigin)) throw new ConfigError("PUBLIC_ORIGIN must be an exact HTTP(S) origin");
 	if (signingKey.length < 32) throw new ConfigError("UPLOAD_SIGNING_KEY must be at least 32 characters");
 	return { mediaOrigin, publicOrigin, signingKey };
+}
+
+/**
+ * Live text settings, when the plan has a live text policy and the
+ * deployment sets `PUBLIC_ORIGIN` and `UPLOAD_SIGNING_KEY`; malformed ones
+ * fail the configuration check.
+ */
+function loadLiveText(env: EnvLike, limits: Limits): LiveTextConfig | undefined {
+	if (!LIVE_TEXT_POLICY) return undefined;
+	const policy = { ...LIVE_TEXT_POLICY } as LiveTextPolicy;
+	const values = env as EnvLike & Record<string, unknown>;
+	for (const key of Object.keys(policy) as (keyof LiveTextPolicy)[]) {
+		const name = `LIVE_TEXT_${key.replace(/[A-Z]/g, (letter) => `_${letter}`).toUpperCase()}`;
+		const raw = values[name];
+		if (raw === undefined || raw === "") continue;
+		const value = typeof raw === "number" ? raw : Number(raw);
+		if (!Number.isSafeInteger(value) || value <= 0) throw new ConfigError(`${name} must be a positive safe integer`);
+		policy[key] = value;
+	}
+	validateLiveTextPolicy(policy, limits);
+	const publicOrigin = env.PUBLIC_ORIGIN?.trim() ?? "";
+	const signingKey = env.UPLOAD_SIGNING_KEY ?? "";
+	if (!publicOrigin || !signingKey) return undefined;
+	if (!validOrigin(publicOrigin)) throw new ConfigError("PUBLIC_ORIGIN must be an exact HTTP(S) origin");
+	if (signingKey.length < 32) throw new ConfigError("UPLOAD_SIGNING_KEY must be at least 32 characters");
+	return { policy, publicOrigin, signingKey };
+}
+
+/**
+ * Throws unless the plan's live text policy is within its calibrated bounds
+ * (budget.ts): the owner's 120 and 300 seconds, an append within the
+ * message text limit, and in-memory state the one object can hold.
+ */
+export function validateLiveTextPolicy(policy: LiveTextPolicy, limits: Pick<Limits, "maxTextBytes">): void {
+	for (const [key, value] of Object.entries(policy)) {
+		if (!Number.isSafeInteger(value) || value <= 0) throw new ConfigError(`liveText.${key} must be a positive safe integer`);
+	}
+	if (policy.maxSeconds > budget.MAX_LIVE_TEXT_SECONDS) throw new ConfigError(`liveText.maxSeconds must be at most ${budget.MAX_LIVE_TEXT_SECONDS}`);
+	if (policy.moderatorMaxSeconds > budget.MAX_LIVE_TEXT_MODERATOR_SECONDS || policy.moderatorMaxSeconds < policy.maxSeconds) {
+		throw new ConfigError(`liveText.moderatorMaxSeconds must be maxSeconds to ${budget.MAX_LIVE_TEXT_MODERATOR_SECONDS}`);
+	}
+	if (policy.writeWindowSeconds > budget.MAX_LIVE_WRITE_WINDOW_SECONDS) throw new ConfigError(`liveText.writeWindowSeconds must be at most ${budget.MAX_LIVE_WRITE_WINDOW_SECONDS}`);
+	if (policy.terminalKeepBytes > budget.MAX_TERMINAL_KEEP_BYTES) throw new ConfigError(`liveText.terminalKeepBytes must be at most ${budget.MAX_TERMINAL_KEEP_BYTES}`);
+	if (policy.maxInputBytes > budget.MAX_LIVE_INPUT_BYTES || policy.maxInputBytes < policy.terminalKeepBytes) {
+		throw new ConfigError(`liveText.maxInputBytes must be terminalKeepBytes to ${budget.MAX_LIVE_INPUT_BYTES}`);
+	}
+	if (policy.appendMaxBytes > limits.maxTextBytes) throw new ConfigError("liveText.appendMaxBytes must fit the message text limit (maxTextBytes)");
+	if (policy.concurrent > budget.MAX_LIVE_TEXTS) throw new ConfigError(`liveText.concurrent must be at most ${budget.MAX_LIVE_TEXTS}`);
+	if (policy.readersPerText > budget.MAX_LIVE_READERS_PER_TEXT || policy.readsPerText < policy.readersPerText || policy.readsPerText > budget.MAX_LIVE_READS_PER_TEXT) {
+		throw new ConfigError(`liveText.readersPerText must be at most ${budget.MAX_LIVE_READERS_PER_TEXT} and readsPerText, at most ${budget.MAX_LIVE_READS_PER_TEXT}`);
+	}
+	if (policy.startsPerDay > budget.MAX_LIVE_TEXTS_PER_DAY) throw new ConfigError(`liveText.startsPerDay must be at most ${budget.MAX_LIVE_TEXTS_PER_DAY}`);
+	if (policy.startsPerUser > policy.startsPerIp || policy.startsPerUserDay > policy.startsPerDay || policy.startsPerUser > policy.startsPerUserDay) {
+		throw new ConfigError("a user's live text allowance cannot exceed its IP's or the server's");
+	}
+	if (policy.startWindowMinutes > 24 * 60) throw new ConfigError("liveText.startWindowMinutes must be at most a day");
 }
 
 /** Throws unless the plan's push policy is within its calibrated bounds. */

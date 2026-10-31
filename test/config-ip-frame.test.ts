@@ -212,7 +212,7 @@ describe('configuration policy boundaries', () => {
 	});
 
 	it('keeps the free plan as it was and valid, and the paid plan inside its allowances', () => {
-		expect(FREE_PLAN.features).toEqual({ activity: false, guestPosting: false, presence: true });
+		expect(FREE_PLAN.features).toEqual({ activity: false, guestPosting: false, presence: true, liveText: false });
 		expect(PAID_PLAN.features.presence).toBe(true);
 		expect(FREE_PLAN.limits).toMatchObject({ globalFramesPerMinute: 300, processedFramesPerDay: 100_000, globalPostsPerDay: 5_000, registrationsPerDay: 100, sqlWritesPerDay: 80_000, sqlReadsPerDay: 3_000_000 });
 		expect(FREE_PLAN.account.daily.sqlRowsWritten).toBe(100_000);
@@ -227,7 +227,9 @@ describe('configuration policy boundaries', () => {
 			// from every open connection every pingSeconds, at 20 incoming WebSocket
 			// messages a request, plus admissions and a cleanup alarm an hour.
 			const messages = plan.limits.processedFramesPerDay + plan.limits.openConnections * Math.ceil(86_400 / plan.limits.pingSeconds);
-			const requests = messages / 20 + plan.limits.connectionAdmissionsPerDay + 24;
+			// Live text, where on: each text's write and its reads, at the daily cap.
+			const live = plan.liveText && plan.features.liveText ? plan.liveText.startsPerDay * (1 + plan.liveText.readsPerText) : 0;
+			const requests = messages / 20 + plan.limits.connectionAdmissionsPerDay + 24 + live;
 			expect(requests).toBeLessThan(daily.durableObjectRequests * ACCOUNT_USAGE_POLICY.stopRatio);
 		}
 	});

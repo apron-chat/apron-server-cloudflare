@@ -193,6 +193,24 @@ export const PAID_PLAN: Plan = Object.freeze({
 		pushesPerDay: 5_000,
 		pushesPerSenderDay: 200,
 	}),
+	// Live text (embed:terminal, embed:append): the free plan's policy with
+	// more texts a day, more readers, and more kept. A day at these limits is
+	// at most 3,200 Durable Object requests (100 writes, 30 reads each, and an
+	// alarm), a tenth of the 32,000 daily share; about 3,600 SQL rows written;
+	// and the kept text of a week at most about 90 MB of SQLite (each
+	// terminal's output at most 128 KiB of JSON), an eighth of the high-water
+	// mark. Streaming keeps the object awake, which the duration bound above
+	// already covers (docs/cost-report.md, Live text).
+	liveText: Object.freeze({
+		...FREE_PLAN.liveText!,
+		terminalKeepBytes: 32 * 1024,
+		maxInputBytes: 2 * 1024 * 1024,
+		startsPerUserDay: 20,
+		startsPerDay: 100,
+		concurrent: 4,
+		readersPerText: 10,
+		readsPerText: 30,
+	}),
 	features: Object.freeze({
 		// Typing costs about 5 frames a typing minute, inside the frame budget.
 		activity: true,
@@ -205,5 +223,7 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// closes or with a chosen `invisible`, at most once in 10 minutes
 		// per user (SEEN_WRITE_GRANULARITY_MS).
 		presence: true,
+		// Live text, where PUBLIC_ORIGIN and UPLOAD_SIGNING_KEY are set.
+		liveText: true,
 	}),
 });

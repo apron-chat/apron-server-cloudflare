@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
+import { LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor } from "./account-usage";
 import { EDGE_STOP_RULE_REF, readEdgeStop, runBudgetGuard, watchForFlood } from "./budget-guard";
@@ -62,11 +63,14 @@ import {
 	UPLOAD_SWEEP_BATCH,
 	UPLOAD_WRITE_GRACE_MS,
 	uploadResultEmbed,
+	liveDeadline,
+	liveResultEmbed,
 	isPrivateRoomId,
 	seenStands,
 	type Broadcast,
 	type ClaimedPush,
 	type EmojiDraft,
+	type LiveEntry,
 	type MessageSnapshot,
 	type PushCandidate,
 	type RoomRecord,
@@ -83,6 +87,15 @@ import { isProtocolId } from "./domain";
 
 const OBJECT_NAME = "public-demo-v1";
 const INTERNAL_IP_HEADER = "X-Apron-Trusted-IP-Key";
+/**
+ * The paths the entry Worker forwards live text to the object on (§4.8.3):
+ * a write's `PUT` and a reader's `GET`. The Worker builds these requests
+ * itself; it forwards only `/` and `/ws` from clients, so none reaches them.
+ */
+const LIVE_WRITE_PATH = "/__live/write/";
+const LIVE_READ_PATH = "/__live/read/";
+/** A live text's `url` path segment: 128 random bits, base64url. */
+const LIVE_ID_PATTERN = /^[A-Za-z0-9_-]{22}$/;
 const ATTACHMENT_VERSION = 1;
 /** Key prefix for passkey session records in the object's key-value storage. */
 const SESSION_KEY_PREFIX = "session:";
@@ -122,7 +135,7 @@ interface ConnectionAttachment {
 	tier: "pending" | "anonymous" | "registered";
 	userId?: string;
 	name?: string;
-	/** The user's avatar (§4.8.6), for current user objects; never in `from`. */
+	/** The user's avatar (§4.8.7), for current user objects; never in `from`. */
 	avatar?: string;
 	/**
 	 * A registered user's roles (§3.3), read with the identity at sign-in and
@@ -463,6 +476,8 @@ function roomServerDescription(description: string | undefined): string | undefi
 const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audience: "everyone" | "owners" | "admins"; roles?: readonly string[] }> = [
 	{ name: "admin", usage: "/admin [remove] <user_id>", help: "make a registered user an admin, or no longer one", audience: "admins" },
 	{ name: "avatar", usage: "/avatar", help: "set your avatar: send this command with one image attached", audience: "owners" },
+	{ name: "embed-append", usage: "/embed-append [markdown]", help: "get a link to stream text into a message that starts with [markdown], such as an LLM's reply: the message appears when the stream starts", audience: "everyone" },
+	{ name: "embed-terminal", usage: "/embed-terminal [title]", help: "get a link to stream a terminal (80×40) into this room, such as a build: the message appears when the stream starts", audience: "everyone" },
 	{ name: "emoji", usage: "/emoji add|remove :name:", help: "add a custom emoji, or replace its image: send /emoji add :name: with one image attached; /emoji remove :name: removes it", audience: "owners", roles: EMOJI_ROLES },
 	{ name: "help", usage: "/help", help: "list the commands you can use here", audience: "everyone" },
 	{ name: "invite-bot", usage: "/invite-bot", help: "get a sign-in token for your bot; a new one replaces the last", audience: "owners" },
@@ -477,7 +492,7 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "role", usage: "/role <user_id> [<role>]", help: "show a user's roles, or give or take away one (admin, mod, threader and bot act as such; friend, like any role, raises their posting limits, and admin, mod and friend may use /emoji)", audience: "admins" },
 	{ name: "server", usage: "/server [title|description [<text>] | avatar]", help: "show this server's title, description and avatar; set one, the avatar with one image attached; or clear one, back to the deployment's", audience: "admins" },
 	{ name: "status", usage: "/status", help: "show today's Cloudflare usage and the demo's budgets", audience: "admins" },
-	{ name: "toggle", usage: "/toggle <activity|uploads|presence|addmember>", help: "turn typing activity, uploads, user status (presence), or users adding others to rooms (addmember) off or on for everyone", audience: "admins" },
+	{ name: "toggle", usage: "/toggle <activity|uploads|presence|addmember|livetext>", help: "turn typing activity, uploads, user status (presence), users adding others to rooms (addmember), or live text (livetext: terminals and appends) off or on for everyone", audience: "admins" },
 ];
 /** Why a guest's post, reaction, join, leave, or room change is denied while guests only read. */
 const GUEST_READ_ONLY = "Guests can only read here; sign in with a passkey to post or join rooms";
@@ -488,7 +503,7 @@ const GUEST_READ_ONLY = "Guests can only read here; sign in with a passkey to po
  */
 const BOT_ID_PREFIX = "bot_";
 /** Features an admin can turn off and on with `/toggle`. */
-type ToggleFeature = "activity" | "uploads" | "presence" | "addmember";
+type ToggleFeature = "activity" | "uploads" | "presence" | "addmember" | "livetext";
 /**
  * The registered user `APRON_ADMIN_TOKEN` signs in as (ADMIN_USER_ID, `admin`)
  * is always an admin. Registered users are `<name>_<digits>` or `u_…`, so no
@@ -771,6 +786,7 @@ function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		...(config.accountingRecovery !== undefined ? { accountingRecovery: config.accountingRecovery } : {}),
 		uploads: config.uploads && UPLOAD_POLICY ? { ...UPLOAD_POLICY, mediaOrigin: config.uploads.mediaOrigin } : null,
 		push: config.push && PUSH_POLICY ? { ...PUSH_POLICY } : null,
+		liveText: config.liveText ? { ...config.liveText.policy, publicOrigin: config.liveText.publicOrigin, enabled: config.liveTextEnabled } : null,
 		// A member listing is reused until anything it read is written, and
 		// never longer than a status change may wait.
 		memberCacheMs: limits.statusCoalesceSeconds * 1_000,
@@ -1073,7 +1089,7 @@ function publicIdentity(attachment: ConnectionAttachment): { user_id: string; na
 
 /**
  * A connection's user as a current object (§3.3): `you`, `new`, and room
- * `members` and `users`, which carry `avatar` (§4.8.6). Recorded objects,
+ * `members` and `users`, which carry `avatar` (§4.8.7). Recorded objects,
  * such as a message's `from`, use publicIdentity and never do.
  */
 function currentUser(attachment: ConnectionAttachment): PublicUser | null {
@@ -1307,11 +1323,15 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 	} catch {
 		return answer(503, "Configuration unavailable");
 	}
+	// Uploads and live text sign their write_urls with the same key.
+	const signingKey = config.uploads?.signingKey ?? config.liveText?.signingKey;
+	if (!signingKey || !env.DEMO) return answer(404, "Not found");
+	const grant = await verifyUploadToken(signingKey, token);
+	if (!grant) return answer(403, "This write_url is not valid or has expired");
+	if (grant.key.startsWith("l/")) return config.liveText ? handleLiveWrite(request, env, grant.key) : answer(404, "Not found");
 	const uploads = config.uploads;
 	const media = env.MEDIA;
-	if (!uploads || !media || !env.DEMO) return answer(404, "Not found");
-	const grant = await verifyUploadToken(uploads.signingKey, token);
-	if (!grant) return answer(403, "This write_url is not valid or has expired");
+	if (!uploads || !media) return answer(404, "Not found");
 	// The write's declared type, where it has one, must be one the server
 	// keeps (extension `ext:media`); what is kept is typed from its bytes.
 	const attachment = grant.key.startsWith("f/");
@@ -1369,6 +1389,163 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 	return answer(204);
 }
 
+/** Whether a `message` request's body has a new `terminal` or `append` embed (§4.8.3). */
+function hasLiveEmbed(params: Record<string, unknown>): boolean {
+	const body = params.body;
+	if (!body || typeof body !== "object") return false;
+	const embeds = (body as Record<string, unknown>).embeds;
+	return Array.isArray(embeds) && embeds.some((embed) => !!embed && typeof embed === "object" &&
+		(embed as Record<string, unknown>).embed_id === undefined && ["terminal", "append"].includes((embed as Record<string, unknown>).kind as string));
+}
+
+/** A byte count as people read it: 4,096 bytes, 32 KB, 2 MB. */
+function byteSize(bytes: number): string {
+	if (bytes >= 1024 * 1024 && bytes % (1024 * 1024) === 0) return `${bytes / (1024 * 1024)} MB`;
+	if (bytes >= 1024 && bytes % 1024 === 0) return `${bytes / 1024} KB`;
+	return `${bytes.toLocaleString("en-US")} bytes`;
+}
+
+/** A duration as people read it: 2 minutes, 90 seconds. */
+function duration(seconds: number): string {
+	if (seconds % 60 === 0) return `${seconds / 60} minute${seconds === 60 ? "" : "s"}`;
+	return `${seconds} seconds`;
+}
+
+/**
+ * The `~private` notice that answers `/embed-terminal` and `/embed-append`
+ * (Appendix A.1): the write URL in copy-paste recipes, with the limits that
+ * apply to this user.
+ */
+export function liveCommandNotice(kind: LiveKind, writeUrl: string, entry: Pick<LiveEntry, "maxMs" | "limit">, policy: { writeWindowSeconds: number; maxInputBytes: number }): string {
+	const window = duration(policy.writeWindowSeconds);
+	const seconds = Math.round(entry.maxMs / 1_000);
+	const url = `'${writeUrl}'`;
+	if (kind === "terminal") {
+		return [
+			`Stream a terminal into this room within ${window} (80×40, up to ${seconds} seconds and ${byteSize(policy.maxInputBytes)}; the last ${byteSize(entry.limit)} is kept):`,
+			"",
+			"```sh",
+			`script -qfc 'stty cols 80 rows 40; YOUR_COMMAND' /dev/null | curl -sT - ${url}`,
+			"```",
+			"",
+			"On macOS:",
+			"",
+			"```sh",
+			`script -q /dev/null sh -c 'stty cols 80 rows 40; YOUR_COMMAND' | curl -sT - ${url}`,
+			"```",
+			"",
+			"The message appears when the stream starts. At a limit the stream ends, and so does the command feeding it. The link works once, and only for you: don't share it.",
+		].join("\n");
+	}
+	return [
+		`Stream text into this room within ${window} (up to ${seconds} seconds and ${byteSize(entry.limit)}; it is appended to your message as markdown):`,
+		"",
+		"```sh",
+		`your-llm-command | curl -sT - ${url}`,
+		"```",
+		"",
+		"The message appears when the stream starts. At a limit the stream ends, and so does the command feeding it. The link works once, and only for you: don't share it.",
+	].join("\n");
+}
+
+/** A plain-text answer to a live text's writer or reader, readable in a terminal, from any origin. */
+function liveAnswer(status: number, message: string, retryAfterMs?: number): Response {
+	const headers = new Headers({
+		"Content-Type": "text/plain; charset=utf-8",
+		"X-Content-Type-Options": "nosniff",
+		"Cache-Control": "no-store",
+		"Access-Control-Allow-Origin": "*",
+		"Access-Control-Expose-Headers": "Retry-After",
+	});
+	if (retryAfterMs !== undefined) headers.set("Retry-After", String(Math.max(1, Math.ceil(retryAfterMs / 1_000))));
+	return new Response(`${message}\n`, { status, headers });
+}
+
+/**
+ * Charges a live text request to its address's and its location's
+ * connection-attempt limiters, as a WebSocket upgrade is, before it can
+ * cost a Durable Object request. Null when it may go on.
+ */
+async function liveAdmission(request: Request, env: Env): Promise<{ refused: Response } | { ipKey: string }> {
+	const clientIp = extractClientIp(request.headers);
+	if (!clientIp) return { refused: liveAnswer(403, "Trusted client address unavailable") };
+	const key = await hashIpKey(clientIp);
+	try {
+		const { CONNECTION_ATTEMPTS, LOCATION_ATTEMPTS } = env;
+		if (!CONNECTION_ATTEMPTS || !LOCATION_ATTEMPTS) return { refused: liveAnswer(503, "Demo admission unavailable", UNAVAILABLE_RETRY_MS) };
+		const window = ADMISSION_BUDGET.workerWindowSeconds * 1_000;
+		if (!(await CONNECTION_ATTEMPTS.limit({ key })).success) return { refused: liveAnswer(429, "Too many requests from your address", window) };
+		if (!(await LOCATION_ATTEMPTS.limit({ key: "location" })).success) return { refused: liveAnswer(503, "Demo is busy; try again shortly", window) };
+	} catch {
+		return { refused: liveAnswer(503, "Demo admission unavailable", UNAVAILABLE_RETRY_MS) };
+	}
+	return { ipKey: key };
+}
+
+/**
+ * The `PUT` of a live text's `write_url` (§4.8.3), its token already
+ * checked: the body streams to the Durable Object, which posts or goes on
+ * with the message, fans the text out to readers, and answers when the text
+ * has ended and its last snapshot is published.
+ */
+async function handleLiveWrite(request: Request, env: Env, key: string): Promise<Response> {
+	// Any declared type is accepted: tools label a piped body variously (curl
+	// sends none, others application/x-www-form-urlencoded), and the bytes
+	// are read as UTF-8 whatever it says.
+	if (!request.body) return liveAnswer(400, "Send the text as the request body");
+	const admitted = await liveAdmission(request, env);
+	if ("refused" in admitted) return admitted.refused;
+	// Piped natively (an IdentityTransformStream: no JavaScript runs per
+	// chunk, so the Worker's CPU does not grow with the text) through a stream
+	// this request controls: the object may answer before the body ends (at a
+	// time or size limit), and the pipe is then aborted here, before the
+	// answer is returned, since nothing may read a request's body after its
+	// response.
+	const pipe = new IdentityTransformStream();
+	const abort = new AbortController();
+	request.body.pipeTo(pipe.writable, { signal: abort.signal }).catch(() => undefined);
+	const forwarded = new Request(`https://live.internal${LIVE_WRITE_PATH}${encodeURIComponent(key)}`, {
+		method: "PUT",
+		headers: { [INTERNAL_IP_HEADER]: admitted.ipKey },
+		body: pipe.readable,
+	});
+	let response: Response;
+	try {
+		response = await env.DEMO!.getByName(OBJECT_NAME).fetch(forwarded);
+	} catch {
+		response = liveAnswer(503, "Server unavailable; try again shortly", UNAVAILABLE_RETRY_MS);
+	}
+	abort.abort();
+	return response;
+}
+
+/**
+ * `GET` of a live text's `url` (§4.8.3): the kept text, then the rest as it
+ * arrives, from the Durable Object's memory, as `text/plain; charset=utf-8`
+ * with `nosniff`. Charged as a connection attempt first.
+ */
+async function handleLiveRead(request: Request, env: Env, id: string): Promise<Response> {
+	if (request.method === "OPTIONS") {
+		return new Response(null, { status: 204, headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS", "Access-Control-Max-Age": "86400" } });
+	}
+	if (request.method !== "GET" && request.method !== "HEAD") return liveAnswer(405, "Method not allowed");
+	let config: RuntimeConfig;
+	try {
+		config = loadConfig(env);
+	} catch {
+		return liveAnswer(503, "Configuration unavailable");
+	}
+	if (!config.liveText || !env.DEMO || !LIVE_ID_PATTERN.test(id)) return liveAnswer(404, "Not found");
+	const admitted = await liveAdmission(request, env);
+	if ("refused" in admitted) return admitted.refused;
+	const forwarded = new Request(`https://live.internal${LIVE_READ_PATH}${id}`, { method: request.method, headers: { [INTERNAL_IP_HEADER]: admitted.ipKey } });
+	try {
+		return await env.DEMO.getByName(OBJECT_NAME).fetch(forwarded);
+	} catch {
+		return liveAnswer(503, "Server unavailable; try again shortly", UNAVAILABLE_RETRY_MS);
+	}
+}
+
 /** The object keys a media origin serves: attachments, avatars, custom emoji and their catalogs, and the server's avatar (`e/`). */
 const MEDIA_KEY_PATTERN = /^(?:[fae]\/[A-Za-z0-9_-]{22}|e\/c\/[0-9a-f]{64}\.json)$/;
 
@@ -1399,6 +1576,7 @@ async function handleMediaRead(request: Request, env: Env, key: string): Promise
 async function fetchConnection(request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url);
 	if (url.pathname.startsWith("/w/")) return handleUploadWrite(request, env, url.pathname.slice(3));
+	if (url.pathname.startsWith("/live/")) return handleLiveRead(request, env, url.pathname.slice(6));
 	const media = await handleMediaRead(request, env, url.pathname.slice(1));
 	if (media) return media;
 	const status = isConnectionStatus(request);
@@ -1462,6 +1640,19 @@ export default {
 	},
 } satisfies ExportedHandler<Env>;
 
+/**
+ * A live text this instance holds (§4.8.3): one that streams, with its kept
+ * bytes, or one a message announced whose readers wait for its write.
+ */
+interface LiveSession {
+	entry: LiveEntry;
+	readers: LiveReaders;
+	/** The kept bytes, once the write streams. */
+	buffer?: LiveBuffer;
+	/** Ends the write early, as for its time limit or a save that removed its embed. */
+	stop?: (reason: LiveEnd) => void;
+}
+
 export class ApronDemoServer extends DurableObject<Env> {
 	private readonly config: RuntimeConfig;
 	private readonly runtimeEnv: Env;
@@ -1479,6 +1670,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly toggles = new Map<ToggleFeature, boolean | undefined>();
 	/** When the earliest pending upload's write window closes, if one is known (§4.8.3). */
 	private uploadDeadline: number | undefined;
+	/** When the earliest open live text falls due (liveDeadline), if one is known (§4.8.3). */
+	private liveDeadlineAt: number | undefined;
+	/**
+	 * Live texts this instance holds, by the id in their `url`: in memory
+	 * only, so an evicted or redeployed instance loses them, and the next one
+	 * ends them (recoverLiveTexts). Bounded by the policy's `concurrent`.
+	 */
+	private readonly liveSessions = new Map<string, LiveSession>();
+	/** Whether this instance has ended the live texts a lost one left open (recoverLiveTexts). */
+	private liveRecovered = false;
 	/** The account-usage stop: the latest Cloudflare usage snapshot, and when to read the next. */
 	private readonly accountUsage: AccountUsageMonitor;
 	private readonly queues = new WeakMap<WebSocketConnection, Promise<void>>();
@@ -1607,6 +1808,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	async fetch(request: Request): Promise<Response> {
 		this.noteActivity();
+		const path = new URL(request.url).pathname;
+		if (path.startsWith(LIVE_WRITE_PATH) || path.startsWith(LIVE_READ_PATH)) return this.liveFetch(request, path);
 		const status = isConnectionStatus(request);
 		if (request.method !== "GET" || (!isUpgrade(request) && !status)) return responseError(400, "WebSocket upgrade required");
 		const ipKey = trustedIpKey(request);
@@ -1802,6 +2005,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 				}
 			} catch { /* a metered maintenance failure is retried on the next alarm */ }
 		}
+		if (this.config.liveText) {
+			this.liveRecovered = true;
+			try { await this.expireLive(now); } catch { /* a metered maintenance failure is retried on the next alarm */ }
+		}
 		const removed = result?.removed_rooms ?? [];
 		for (const roomId of removed) this.noteRoom(roomId, false);
 		if (removed.length) this.removeRooms(removed);
@@ -1839,12 +2046,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 			params: {
 				// The protocol version, the implementation string, and the
 				// capabilities (§3.1).
-				apron: 9,
-				agent: "apron-cloudflare-demo/9",
+				apron: 10,
+				agent: "apron-cloudflare-demo/10",
 				capabilities: [
 					"history", "edit", "rooms", "reactions", "command",
 					...(this.activityOn() ? ["activity"] : []),
 					...(this.uploadsOn() ? ["embed:upload"] : []),
+					// Live text (§4.8.3): terminals and appends, while configured and on.
+					...(this.liveTextOn() ? ["embed:terminal", "embed:append"] : []),
 					// The user `status` chosen with `me`, idle connections and mutes,
 					// which decide pushes (§4.9, §4.5).
 					...(this.config.push ? ["status"] : []),
@@ -2958,7 +3167,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * is unchanged, and an empty one removes it. Only registered users may
 	 * change their name; `name: ""` removes it, so the user falls back to
 	 * `user_id`. With uploads, `avatar: ""` removes a registered user's
-	 * avatar; a new one comes only through `/avatar` (§4.8.6), so other values
+	 * avatar; a new one comes only through `/avatar` (§4.8.7), so other values
 	 * are declined. `ext` (§4.12) merges one level deep into the user's kept
 	 * one, at most MAX_USER_EXT_BYTES after the merge (else `too_large`); only
 	 * registered users keep one, so a guest's `ext` with keys is `denied`, and
@@ -3070,7 +3279,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			identity,
 		};
 		let started = false;
+		let liveEnded = false;
 		let created: MessageSnapshot | undefined;
+		// A new live text first ends any a lost instance left open (recoverLiveTexts).
+		if (method === "message" && this.config.liveText && hasLiveEmbed(request.params)) await this.recoverLiveTexts();
 		await this.runMutation(async () => {
 			const result = this.store.mutate(input);
 			// A deduplicated retry carries no records and is never rebroadcast.
@@ -3078,6 +3290,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			for (const record of result.broadcasts) this.broadcastRecord(record);
 			this.reply(socket, request, await this.withWriteUrls(result.result));
 			started = this.afterUploads(result);
+			// A save that removed a live text's embed ended it (§4.8.3): its write stops.
+			for (const key of result.liveEnded ?? []) this.stopLiveText(key, "removed");
+			if (result.liveEnded?.length) liveEnded = true;
+			for (const entry of result.liveStarted ?? []) started = this.noteLiveDeadline(liveDeadline(entry)) || started;
 			// Only a new message wakes anyone: not an edit, move, or retry (§4.9).
 			if (method === "message" && !result.deduplicated && result.message?.prev_log_id === undefined) created = result.message;
 		});
@@ -3090,6 +3306,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		// Pending writes that never come are failed by the alarm (§4.8.3).
 		if (started) await this.rescheduleAlarm();
+		// A live text a save ended leaves no alarm for its deadline.
+		if (liveEnded) await this.refreshLiveDeadline().catch(() => undefined);
 	}
 
 	private async handleMessage(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
@@ -5101,6 +5319,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (command.roles && !command.roles.some((role) => hasRole(attachment, role))) {
 			throw { name: "denied", message: `/${name} needs one of the roles ${command.roles.join(", ")}` } satisfies ProtocolError;
 		}
+		// Live text starts with its own commands, or in a message (§4.8.3).
+		if (Array.isArray(body.embeds) && body.embeds.some((embed) => !!embed && typeof embed === "object" && ["terminal", "append"].includes((embed as Record<string, unknown>).kind as string))) {
+			throw { name: "invalid_params", message: "A terminal or append embed goes in a message; or use /embed-terminal or /embed-append" } satisfies ProtocolError;
+		}
+		if (command.name === "embed-terminal" || command.name === "embed-append") {
+			await this.liveCommand(socket, attachment, request, roomId, command.name === "embed-terminal" ? "terminal" : "append", text);
+			return;
+		}
 		if (command.name === "invite-bot") {
 			await this.inviteBot(socket, attachment, request, roomId);
 			return;
@@ -5189,7 +5415,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return;
 		}
 		// The reply a command causes comes before its result (§1).
-		const available = this.commands().filter((candidate) => candidate.audience === "everyone" || (candidate.audience === "owners" && owner && (!candidate.roles || candidate.roles.some((role) => hasRole(attachment, role)))) || admin);
+		const writes = attachment.tier !== "anonymous" || this.config.guestPosting;
+		const available = this.commands().filter((candidate) => (candidate.audience === "everyone" && (writes || !candidate.name.startsWith("embed-"))) || (candidate.audience === "owners" && owner && (!candidate.roles || candidate.roles.some((role) => hasRole(attachment, role)))) || admin);
 		this.send(socket, {
 			method: "message",
 			params: {
@@ -5201,9 +5428,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.reply(socket, request, {});
 	}
 
-	/** The commands this deployment offers: `/avatar` only while uploads are on, and `/emoji` where they are configured. */
+	/** The commands this deployment offers: `/avatar` only while uploads are on, `/emoji` where they are configured, and `/embed-terminal` and `/embed-append` while live text is on. */
 	private commands(): typeof COMMANDS {
-		return COMMANDS.filter((command) => (command.name !== "avatar" || this.uploadsOn()) && (command.name !== "emoji" || !!this.config.uploads));
+		return COMMANDS.filter((command) => (command.name !== "avatar" || this.uploadsOn()) && (command.name !== "emoji" || !!this.config.uploads) &&
+			(!command.name.startsWith("embed-") || this.liveTextOn()));
 	}
 
 	/** An admin's `/toggle` of a feature, read once and then kept in memory with every change. */
@@ -5224,6 +5452,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** Uploads: configured, and not turned off by an admin. */
 	private uploadsOn(): boolean {
 		return !!this.config.uploads && (this.toggled("uploads") ?? true);
+	}
+
+	/** Live text: configured, and the deployment's default (plan or `LIVE_TEXT`) unless an admin toggled it. */
+	private liveTextOn(): boolean {
+		return !!this.config.liveText && (this.toggled("livetext") ?? this.config.liveTextEnabled);
 	}
 
 	/** Activity (typing): the deployment's default (plan or `ACTIVITY`) unless an admin toggled it. */
@@ -5256,11 +5489,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `permissions`.
 	 */
 	private toggle(socket: WebSocketConnection, request: RequestFrame, roomId: string, feature: string): void {
-		const features: ToggleFeature[] = ["activity", ...(this.config.uploads ? ["uploads" as const] : []), ...(this.config.push ? ["presence" as const] : []), "addmember"];
+		const features: ToggleFeature[] = ["activity", ...(this.config.uploads ? ["uploads" as const] : []), ...(this.config.push ? ["presence" as const] : []), "addmember", ...(this.config.liveText ? ["livetext" as const] : [])];
 		const chosen = features.find((candidate) => candidate === feature);
 		if (!chosen) throw { name: "invalid_params", message: `Usage: /toggle ${features.join("|")}` } satisfies ProtocolError;
-		const on = !(chosen === "uploads" ? this.uploadsOn() : chosen === "presence" ? this.presenceMode() : chosen === "addmember" ? this.addMemberOn() : this.activityOn());
-		const fallback = chosen === "uploads" || chosen === "addmember" ? true : chosen === "presence" ? this.config.presence : this.config.activityEnabled;
+		const on = !(chosen === "uploads" ? this.uploadsOn() : chosen === "presence" ? this.presenceMode() : chosen === "addmember" ? this.addMemberOn() : chosen === "livetext" ? this.liveTextOn() : this.activityOn());
+		const fallback = chosen === "uploads" || chosen === "addmember" ? true : chosen === "presence" ? this.config.presence : chosen === "livetext" ? this.config.liveTextEnabled : this.config.activityEnabled;
 		const override = on === fallback ? undefined : on;
 		const now = nowMs();
 		// Presence turned on: every user's shown status changes from `""`, so
@@ -5308,6 +5541,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 				"Uploads are now **on**.",
 				"Uploads are now **off**: new attachments and avatars are refused, and new connections are not offered uploads.",
 			],
+			livetext: [
+				"Live text is now **on**: terminals and appends can stream, and new connections are offered them.",
+				"Live text is now **off**: new terminals and appends are refused, and new connections are not offered them. Texts already streaming finish.",
+			],
 		};
 		this.sendNotice(socket, roomId, notices[chosen][on ? 0 : 1]);
 		this.reply(socket, request, {});
@@ -5349,10 +5586,278 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `/avatar` with one `upload` embed (§4.8.6): the result carries the
+	 * `/avatar` with one `upload` embed (§4.8.7): the result carries the
 	 * embed's `write_url`, and the image becomes the sender's avatar when the
 	 * write finishes (finishUpload).
 	 */
+	/**
+	 * `/embed-terminal [title]` and `/embed-append [markdown]` (live text,
+	 * §4.8.3): checks the policy, charges the post and the start, and answers
+	 * with the write's `{embeds: [{embed_id, kind, write_url}]}`, after a
+	 * `~private` notice with the URL in copy-paste recipes. Nothing is posted
+	 * until the write arrives (liveWrite); one that never comes expires.
+	 * The rest of the command line is the terminal's plain title, or the
+	 * append's opening markdown, newlines and all; a non-empty opening, its
+	 * trailing whitespace trimmed, is followed by a paragraph break ("\n\n")
+	 * so the streamed text starts a new paragraph.
+	 */
+	private async liveCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, kind: LiveKind, text: string): Promise<void> {
+		const identity = identityOf(attachment);
+		if (!identity) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
+		this.assertMayWrite(attachment);
+		const live = this.config.liveText!;
+		const rest = text.replace(/^\s*\/\S+[ \t]*(?:\r?\n)?/, "");
+		const replyTo = objectParam(request.params, "reply_to", false);
+		const replyId = replyTo === undefined ? undefined : requiredString(replyTo, "message_id");
+		await this.recoverLiveTexts();
+		let entry: LiveEntry | undefined;
+		await this.runMutation(async () => {
+			entry = this.store.startLiveCommand({
+				userId: identity.user_id, ipKey: attachment.ipKey, identity: { user_id: identity.user_id, ...(attachment.name ? { name: attachment.name } : {}) },
+				kind, roomId, now: nowMs(),
+				// A non-empty opening ends in a paragraph break, so the streamed text starts a new paragraph.
+				...(kind === "terminal" ? { title: rest } : { text: rest.trimEnd() ? `${rest.trimEnd()}\n\n` : "" }),
+				...(replyId !== undefined ? { replyTo: replyId } : {}),
+			});
+			const result = await this.withWriteUrls({ embeds: [liveResultEmbed(entry, live.policy)] });
+			const writeUrl = (result.embeds as Array<{ write_url: string }>)[0].write_url;
+			// The reply a command causes comes before its result (§1).
+			this.sendNotice(socket, roomId, liveCommandNotice(kind, writeUrl, entry, live.policy));
+			this.reply(socket, request, result);
+		});
+		if (entry && this.noteLiveDeadline(liveDeadline(entry))) await this.rescheduleAlarm();
+	}
+
+	/**
+	 * Sets the alarm's live text deadline from the open texts as they are
+	 * now (from memory after the first read), so a text that ended or
+	 * started streaming leaves no alarm for a deadline it no longer has.
+	 */
+	private async refreshLiveDeadline(): Promise<void> {
+		const entries = this.store.openLiveTexts(nowMs());
+		const next = entries.length ? Math.min(...entries.map(liveDeadline)) : undefined;
+		if (next === this.liveDeadlineAt) return;
+		this.liveDeadlineAt = next;
+		await this.rescheduleAlarm();
+	}
+
+	/** Notes when an open live text falls due; true when that moves the alarm earlier. */
+	private noteLiveDeadline(due: number): boolean {
+		if (this.liveDeadlineAt !== undefined && this.liveDeadlineAt <= due) return false;
+		this.liveDeadlineAt = due;
+		return true;
+	}
+
+	/**
+	 * Once per instance, before its first live text work: ends the texts a
+	 * lost instance (evicted, or replaced by a deploy) left streaming, whose
+	 * bytes went with it, and the writes that expired meanwhile, and learns
+	 * when the next one falls due. One `_meta` read when there are none.
+	 */
+	private async recoverLiveTexts(): Promise<void> {
+		if (!this.config.liveText) return;
+		if (this.liveRecovered && (this.liveDeadlineAt === undefined || this.liveDeadlineAt > nowMs())) return;
+		this.liveRecovered = true;
+		await this.expireLive(nowMs());
+		await this.rescheduleAlarm();
+	}
+
+	/** Ends the live texts that fell due or were lost (Store.expireLiveTexts), and closes their waiting readers. */
+	private async expireLive(now: number): Promise<void> {
+		const streaming = new Set<string>();
+		for (const session of this.liveSessions.values()) if (session.buffer) streaming.add(session.entry.key);
+		await this.runMutation(async () => {
+			const expired = this.store.expireLiveTexts(streaming, now);
+			for (const record of expired.broadcasts) this.broadcastRecord(record);
+			for (const entry of expired.ended) {
+				const session = this.liveSessions.get(entry.id);
+				if (session && !session.buffer) {
+					session.readers.close();
+					this.liveSessions.delete(entry.id);
+				}
+			}
+			this.liveDeadlineAt = expired.next;
+		});
+	}
+
+	/** Stops a streaming write early: a save removed its embed, or its owner was purged. */
+	private stopLiveText(key: string, reason: LiveEnd): void {
+		for (const session of this.liveSessions.values()) {
+			if (session.entry.key !== key) continue;
+			if (session.stop) session.stop(reason);
+			else {
+				session.readers.close();
+				this.liveSessions.delete(session.entry.id);
+			}
+		}
+	}
+
+	/** Ends the live texts of purged users: their messages are gone, so nothing is published. */
+	private async endLiveOf(userIds: readonly string[]): Promise<void> {
+		if (!this.config.liveText) return;
+		const entries = this.store.openLiveTexts(nowMs()).filter((entry) => userIds.includes(entry.owner));
+		for (const entry of entries) {
+			const session = this.liveSessions.get(entry.id);
+			if (session?.stop) session.stop("removed");
+			else {
+				await this.runMutation(async () => { this.store.finishLiveText(entry.key, null, nowMs()); });
+				this.stopLiveText(entry.key, "removed");
+			}
+		}
+	}
+
+	/** A live text request the entry Worker forwarded (§4.8.3): a write's `PUT` or a reader's `GET`. */
+	private async liveFetch(request: Request, path: string): Promise<Response> {
+		if (!this.config.liveText || !trustedIpKey(request)) return liveAnswer(404, "Not found");
+		const now = nowMs();
+		this.accountUsage.noteActivity(now);
+		if (this.accountUsage.stops(now)) {
+			await request.body?.cancel().catch(() => undefined);
+			return liveAnswer(503, "Demo account capacity reached", 300_000);
+		}
+		try {
+			await this.recoverLiveTexts();
+			if (path.startsWith(LIVE_READ_PATH)) return this.liveRead(path.slice(LIVE_READ_PATH.length), request.method === "HEAD");
+			if (request.method !== "PUT" || !request.body) return liveAnswer(405, "Method not allowed");
+			return await this.liveWrite(decodeURIComponent(path.slice(LIVE_WRITE_PATH.length)), request.body);
+		} catch (error) {
+			await request.body?.cancel().catch(() => undefined);
+			return this.liveError(error);
+		}
+	}
+
+	/** A refused live text request in plain text, with `Retry-After` where the refusal has one. */
+	private liveError(error: unknown): Response {
+		const protocol = errorToProtocol(error);
+		const retry = typeof protocol.data?.retry_after === "number" ? protocol.data.retry_after * 1_000 : undefined;
+		if (protocol.name === "retry_after") return liveAnswer(429, protocol.data?.reason === "daily_budget" ? "Daily demo capacity reached" : protocol.message, retry);
+		if (protocol.name === "denied" || protocol.name === "invalid_params" || protocol.name === "too_large") return liveAnswer(410, `This text can no longer be posted: ${protocol.message}`);
+		return liveAnswer(503, protocol.message, retry ?? UNAVAILABLE_RETRY_MS);
+	}
+
+	/**
+	 * A reader's `GET` of a live text's `url` (§4.8.3): what is kept, then
+	 * every chunk as it arrives, from memory, until the text ends. A text a
+	 * message announced whose write has not started yet has its readers wait
+	 * for it. Each text has at most `readersPerText` readers at once and
+	 * `readsPerText` reads over its life; an ended or unknown one is 404.
+	 */
+	private liveRead(id: string, head: boolean): Response {
+		const policy = this.config.liveText!.policy;
+		let session = this.liveSessions.get(id);
+		if (!session) {
+			const entry = this.store.openLiveTexts(nowMs()).find((candidate) => candidate.id === id);
+			if (!entry || entry.state !== "pending" || entry.messageId === undefined) return liveAnswer(404, "This live text has ended, or never existed");
+			session = { entry, readers: new LiveReaders() };
+			this.liveSessions.set(id, session);
+		}
+		if (head) return new Response(null, { headers: liveTextHeaders() });
+		if (session.readers.served >= policy.readsPerText) return liveAnswer(403, "This live text has been read as often as it may be");
+		if (session.readers.size >= policy.readersPerText) return liveAnswer(429, "This live text has as many readers as it may have", 10_000);
+		return new Response(session.readers.open(session.buffer?.kept() ?? new Uint8Array(0)), { headers: liveTextHeaders() });
+	}
+
+	/**
+	 * A live text's write (§4.8.3): claims it once (a command's message is
+	 * posted now), then reads the streaming body into memory, sending each
+	 * chunk to the readers, until the body ends, the writer goes, or a limit
+	 * is reached: the owner's time (a one-shot timer, cleared at the end),
+	 * `maxInputBytes`, or an append's kept bytes. Then it publishes what was
+	 * kept once (endLiveText) and answers the writer.
+	 */
+	private async liveWrite(key: string, body: ReadableStream<Uint8Array>): Promise<Response> {
+		let claimed: ReturnType<Store["claimLiveText"]> = null;
+		await this.runMutation(async () => {
+			claimed = this.store.claimLiveText(key, nowMs());
+			if (claimed) for (const record of claimed.broadcasts) this.broadcastRecord(record);
+		});
+		if (!claimed) {
+			await body.cancel().catch(() => undefined);
+			return liveAnswer(409, "This write_url was already used or has expired");
+		}
+		const { entry, message } = claimed as NonNullable<ReturnType<Store["claimLiveText"]>>;
+		// A command's message is new now: it wakes as a posted one does (§4.9).
+		if (message) {
+			this.dropWakes(entry.owner, message.room_id);
+			this.dropHeld(entry.owner, message.room_id);
+			if (this.store.identityExists(entry.owner)) this.wakeFor(message);
+		}
+		const session: LiveSession = this.liveSessions.get(entry.id) ?? { entry, readers: new LiveReaders() };
+		session.entry = entry;
+		const buffer = new LiveBuffer(entry.kind, entry.limit);
+		session.buffer = buffer;
+		this.liveSessions.set(entry.id, session);
+		// The alarm ends it should this instance be lost meanwhile, and no longer waits for its write.
+		await this.refreshLiveDeadline().catch(() => undefined);
+		const reader = body.getReader();
+		reader.closed.catch(() => undefined);
+		let end: LiveEnd | undefined;
+		session.stop = (reason) => {
+			end ??= reason;
+			reader.cancel().catch(() => undefined);
+		};
+		const timer = setTimeout(() => session.stop!("time"), Math.max(0, (entry.startedMs ?? nowMs()) + entry.maxMs - nowMs()));
+		const maxInput = this.config.liveText!.policy.maxInputBytes;
+		try {
+			for (;;) {
+				const { done, value } = await reader.read();
+				if (done || end) break;
+				const room = maxInput - buffer.received;
+				const pushed = buffer.push(value.length > room ? value.subarray(0, room) : value);
+				session.readers.send(pushed.send);
+				if (pushed.full || buffer.received >= maxInput) {
+					end = "size";
+					break;
+				}
+			}
+		} catch {
+			end ??= "disconnected";
+		} finally {
+			clearTimeout(timer);
+		}
+		end ??= "complete";
+		reader.cancel().catch(() => undefined);
+		return this.endLiveText(session, end);
+	}
+
+	/**
+	 * Ends a streaming text exactly once (§4.8.3): publishes what it kept
+	 * (Store.finishLiveText; nothing after a save that removed it), ends its
+	 * readers, and tells the writer why it ended, after the snapshot.
+	 */
+	private async endLiveText(session: LiveSession, end: LiveEnd): Promise<Response> {
+		const entry = session.entry;
+		const kept = session.buffer?.kept() ?? new Uint8Array(0);
+		let published = false;
+		try {
+			await this.runMutation(async () => {
+				const finished = this.store.finishLiveText(entry.key, kept, nowMs());
+				for (const record of finished.broadcasts) this.broadcastRecord(record);
+				published = !!finished.entry;
+			});
+		} catch {
+			// Left open: the alarm ends it, without what was kept.
+			end = "unavailable";
+		}
+		session.readers.close();
+		this.liveSessions.delete(entry.id);
+		// No alarm is left for this text's deadline.
+		if (end !== "unavailable") await this.refreshLiveDeadline().catch(() => undefined);
+		const policy = this.config.liveText!.policy;
+		const messages: Record<LiveEnd, string> = {
+			complete: "Done: the text is posted.",
+			time: `Stopped at the ${Math.round(entry.maxMs / 1_000)}-second limit; what was kept is posted.`,
+			size: entry.kind === "append"
+				? `Stopped at the ${byteSize(entry.limit)} limit; the first ${byteSize(entry.limit)} is posted.`
+				: `Stopped at the ${byteSize(policy.maxInputBytes)} limit; the last ${byteSize(entry.limit)} is posted.`,
+			disconnected: "The write was interrupted; what arrived is posted.",
+			removed: "Stopped: the message or its embed was removed.",
+			unavailable: "Server storage is unavailable; the text could not be posted.",
+		};
+		if (end === "unavailable") return liveAnswer(503, messages.unavailable, UNAVAILABLE_RETRY_MS);
+		return liveAnswer(200, published || end === "removed" ? messages[end] : messages.removed);
+	}
+
 	private async startAvatar(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, body: Record<string, unknown>): Promise<void> {
 		const embeds = body.embeds;
 		const attached = Array.isArray(embeds) && embeds.length === 1 && !!embeds[0] && typeof embeds[0] === "object" && (embeds[0] as Record<string, unknown>).kind === "upload";
@@ -5618,6 +6123,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		});
 		for (const roomId of rooms) this.removeIfEmpty(roomId);
 		this.deleteMedia(purged.deletedUploads);
+		// A text left open by a failure here ends at its time limit, publishing nothing.
+		await this.endLiveOf(userIds).catch(() => undefined);
 		await this.forgetTokens(userIds);
 		const uploads = purged.deletedUploads.length;
 		this.sendNotice(socket, roomId, `Purged \`${userId}\`: ${purged.messages} message${purged.messages === 1 ? "" : "s"}, ${purged.reactions} reaction set${purged.reactions === 1 ? "" : "s"}, ${uploads} upload${uploads === 1 ? "" : "s"}.`);
@@ -6695,7 +7202,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * the `write` the store keeps, so a retry signs the same URL.
 	 */
 	private async withWriteUrls(result: Record<string, unknown>): Promise<Record<string, unknown>> {
-		const uploads = this.config.uploads;
+		// Uploads and live text sign with the same key, and both write on the public origin.
+		const uploads = this.config.uploads ?? this.config.liveText;
 		if (!uploads || !Array.isArray(result.embeds)) return result;
 		const embeds = await Promise.all(result.embeds.map(async (embed: unknown) => {
 			if (!embed || typeof embed !== "object") return embed;
@@ -6757,7 +7265,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * A user's avatar changed (§4.8.6): their connections keep it, they get
+	 * A user's avatar changed (§4.8.7): their connections keep it, they get
 	 * `user` `you`, and those who share a room with them `user` `new`. An empty
 	 * `avatar` announces a removed one.
 	 */
@@ -6947,6 +7455,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				for (const value of due) deadline = deadline === undefined ? value : Math.min(deadline, value);
 			}
 			if (this.uploadDeadline !== undefined) deadline = deadline === undefined ? this.uploadDeadline : Math.min(deadline, this.uploadDeadline);
+			if (this.liveDeadlineAt !== undefined) deadline = deadline === undefined ? this.liveDeadlineAt : Math.min(deadline, this.liveDeadlineAt);
 			await this.store.scheduleAlarm(deadline, nowMs());
 			this.alarmKnown = true;
 		});

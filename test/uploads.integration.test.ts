@@ -820,7 +820,7 @@ describe('uploads end to end', () => {
 			expect(Object.keys(back.ext.media)).toEqual(['origins', 'upload', 'avatar', 'emoji']);
 			fresh.close();
 			expect((await request(user, 'nope', 'command', { body: { text: '/toggle uploads' } })).error.code).toBe(-32001);
-			expect((await request(admin, 'bad', 'command', { room_id: 'general', body: { text: '/toggle typing' } })).error.message).toBe('Usage: /toggle activity|uploads|presence|addmember');
+			expect((await request(admin, 'bad', 'command', { room_id: 'general', body: { text: '/toggle typing' } })).error.message).toBe('Usage: /toggle activity|uploads|presence|addmember|livetext');
 		} finally { user.close(); admin.close(); }
 	});
 

@@ -44,8 +44,8 @@ const connect = ({ ip = `192.0.2.${nextIp++}`, ...options }: Partial<ConnectOpti
 
 async function authenticate(peer: Peer, scheme = 'guest', extraCaps: string[] = []) {
 	const { server } = await greeting(peer);
-	expect(server.params.apron).toBe(9);
-	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'status', 'ext', 'ext:settings', 'ext:limits', 'ext:media', 'ext:permissions']);
+	expect(server.params.apron).toBe(10);
+	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'embed:terminal', 'embed:append', 'status', 'ext', 'ext:settings', 'ext:limits', 'ext:media', 'ext:permissions']);
 	expect(server.params.auth).toContain('webauthn');
 	expect(server.params.ping).toBe(45);
 	// The extensions `ext:settings` and `ext:media` keep their data under their names in ext (§4, §4.12).
@@ -724,7 +724,14 @@ it('answers /help with a private notice and rejects other commands without closi
 		expect(notices).toHaveLength(1);
 		expect(notices[0].params).toEqual({
 			room_id: 'general', from: { user_id: '~private', name: 'System message to you' },
-			body: { text: '- `/help`: list the commands you can use here', format: 'markdown' },
+			body: {
+				text: [
+					'- `/embed-append [markdown]`: get a link to stream text into a message that starts with [markdown], such as an LLM\'s reply: the message appears when the stream starts',
+					'- `/embed-terminal [title]`: get a link to stream a terminal (80×40) into this room, such as a build: the message appears when the stream starts',
+					'- `/help`: list the commands you can use here',
+				].join('\n'),
+				format: 'markdown',
+			},
 		});
 		// Mistyped commands are ordinary errors, not policy violations.
 		for (let index = 0; index < 4; index += 1) {
@@ -1004,12 +1011,12 @@ it('advertises the extensions ext:settings, ext:limits, ext:media and ext:permis
 	} finally { peer.close(); }
 });
 
-it('speaks protocol v9: a sign-in welcome, no email sign-in, and ~private notices', async () => {
+it('speaks protocol v10: a sign-in welcome, no email sign-in, and ~private notices', async () => {
 	const withPasskeys = await connect();
 	const bot = await connect({ origin: null });
 	try {
 		const { server, welcome } = await greeting(withPasskeys);
-		expect(server.params).toMatchObject({ apron: 9, agent: 'apron-cloudflare-demo/9', auth: ['webauthn', 'token', 'guest'] });
+		expect(server.params).toMatchObject({ apron: 10, agent: 'apron-cloudflare-demo/10', auth: ['webauthn', 'token', 'guest'] });
 		// `server.welcome` is for the sign-in screen (§3.2), worded for this origin.
 		expect(server.params.welcome).toMatch(/Create a passkey/);
 		expect(server.params.welcome).toContain(`kept for ${Math.round(DEFAULT_LIMITS.retentionSeconds / 86_400)} days`);

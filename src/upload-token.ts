@@ -1,17 +1,18 @@
 // A `write_url` (protocol §4.8.3) is a credential: its token names the R2
-// object, the largest body it accepts, and when it expires, signed with
+// object (or, for live text, `l/<id>`, the text's write key in the Durable
+// Object), the largest body it accepts, and when it expires, signed with
 // `UPLOAD_SIGNING_KEY`. The entry Worker checks the signature before it reads
 // a byte, so a guessed or altered URL never reaches R2 or the Durable Object.
 
 interface UploadGrant {
-	/** The R2 object key, `f/<id>`, `a/<id>`, or `e/<id>` for a custom emoji or the server's avatar. */
+	/** The R2 object key, `f/<id>`, `a/<id>`, or `e/<id>` for a custom emoji or the server's avatar; `l/<id>` for live text. */
 	key: string;
 	maxBytes: number;
 	expiresMs: number;
 }
 
 const encoder = new TextEncoder();
-const KEY_PATTERN = /^[fae]\/[A-Za-z0-9_-]{22}$/;
+const KEY_PATTERN = /^[fael]\/[A-Za-z0-9_-]{22}$/;
 
 function base64Url(bytes: Uint8Array): string {
 	return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
