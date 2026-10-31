@@ -3686,9 +3686,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * A registered user's `read_message_id` in a room they see (§4.6): relayed
 	 * at once to their other connections, so each of their devices shows the
 	 * room read, and in a private room to its other members' connections too
-	 * (read receipts, `ext.settings.read_receipts`), within an allowance of
-	 * its own as large as typing's (a cursor past it is kept, and the others
-	 * learn of it at their next listing). For a room
+	 * (read receipts, `ext.settings.read_receipts`) unless they chose
+	 * `invisible`, within an allowance of its own as large as typing's (a
+	 * cursor past it is kept, and the others learn of it at their next
+	 * listing). For a room
 	 * they joined, it is kept on this connection until written (flushReads)
 	 * rather than written now: a reader's cursors cost about one write a
 	 * minute and a room, however often their client sends them. One not past
@@ -3707,8 +3708,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.dropWakes(identity.user_id, roomId, read);
 		this.dropHeld(identity.user_id, roomId, read);
 		const peers = new Set(this.connectionsOf(identity.user_id, socket));
-		// Read receipts: a private room's other members (only they see it) get it too.
-		if (isPrivateRoomId(roomId)) {
+		// Read receipts: a private room's other members (only they see it) get it too, unless the reader is invisible.
+		if (isPrivateRoomId(roomId) && (connectionAttachment(socket) ?? attachment).choice !== "invisible") {
 			for (const ws of this.ctx.getWebSockets()) {
 				const peer = ws as WebSocketConnection;
 				if (peer !== socket && connectionAttachment(peer)?.rooms?.includes(roomId)) peers.add(peer);
@@ -3782,8 +3783,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * cursors, as `activity` from each (`from` holds only their `user_id`:
 	 * the client knows the members), the one kept (Store.roomReadCursors, at
 	 * most MAX_READ_RECEIPT_MEMBERS a room) or, if further, one their
-	 * connections hold unwritten. Those the store cannot read for now are not
-	 * sent, as for the user's own.
+	 * connections hold unwritten. A member who chose `invisible` shows no
+	 * cursor (Store.roomReadCursors leaves theirs out too). Those the store
+	 * cannot read for now are not sent, as for the user's own.
 	 */
 	private sendReadReceipts(socket: WebSocketConnection, userId: string, roomIds: readonly string[]): void {
 		if (!roomIds.length) return;
@@ -3796,7 +3798,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const cursors = new Map(roomIds.map((roomId) => [roomId, new Map(kept.get(roomId) ?? [])]));
 		for (const ws of this.ctx.getWebSockets()) {
 			const state = connectionAttachment(ws as WebSocketConnection);
-			if (state?.tier !== "registered" || !state.userId || !state.reads) continue;
+			if (state?.tier !== "registered" || !state.userId || !state.reads || state.choice === "invisible") continue;
 			for (const [roomId, read] of Object.entries(state.reads)) {
 				const room = cursors.get(roomId);
 				const current = room?.get(state.userId);

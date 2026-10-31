@@ -6137,20 +6137,23 @@ export class Store {
    * The read cursors of a private room's members (read receipts, protocol
    * §4.6): for each room, the users with a cursor kept there and the
    * `read_message_id` each read through, at most MAX_READ_RECEIPT_MEMBERS a
-   * room. A range of the room's memberships, each joined to its cursor by
-   * primary key, so a member without one costs its membership read alone.
+   * room, leaving out members who chose `invisible`. A range of the room's
+   * memberships, each joined to its cursor and its `user_status` row by
+   * primary key, so a member without a cursor costs its membership read
+   * alone.
    */
   roomReadCursors(roomIds: readonly string[], now = this.clock.now()): Map<string, Array<[userId: string, messageId: string]>> {
     const rooms = roomIds.filter(isPrivateRoomId).slice(0, MAX_PRIVATE_MEMBERSHIPS_PER_USER);
     const found = new Map<string, Array<[string, string]>>();
     if (!rooms.length) return found;
     this.ensureReady();
-    return this.reserved({ reads: 8 + rooms.length * (4 + 2 * MAX_READ_RECEIPT_MEMBERS) }, false, now, () => {
+    return this.reserved({ reads: 8 + rooms.length * (4 + 3 * MAX_READ_RECEIPT_MEMBERS) }, false, now, () => {
       for (const roomId of rooms) {
         const rows = this.rawRows<{ user_id: string; message_id: number }>(
           `SELECT read_cursors.user_id, read_cursors.message_id FROM memberships
            JOIN read_cursors ON read_cursors.user_id = memberships.user_id AND read_cursors.room_id = memberships.room_id
-           WHERE memberships.room_id = ? LIMIT ?`,
+           LEFT JOIN user_status ON user_status.user_id = memberships.user_id
+           WHERE memberships.room_id = ? AND (user_status.status IS NULL OR user_status.status != 'invisible') LIMIT ?`,
           roomId, MAX_READ_RECEIPT_MEMBERS,
         );
         if (rows.length) found.set(roomId, rows.map((row) => [row.user_id, idString(integerColumn(row.message_id))]));

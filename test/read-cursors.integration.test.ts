@@ -121,6 +121,43 @@ it('shows a private room\'s members each other\'s read cursors, live and after a
 	} finally { first.peer.close(); other.peer.close(); outsider.peer.close(); }
 });
 
+it('shows no read receipt of a member who chose invisible, live or after a listing, until they are visible again', async () => {
+	const ada = unique('ada');
+	const bob = unique('bob');
+	await register(ada);
+	await register(bob);
+	const first = await signIn(ada);
+	const other = await signIn(bob);
+	const mine = await signIn(bob);
+	try {
+		const created = await exchange(first.peer, 'create', 'room_set', { private: true });
+		const roomId = created.frame.result.room_id as string;
+		await request(first.peer, 'add', 'room_join', { room_id: roomId, user_id: bob });
+		await until(other.peer, (frame) => frame.method === 'room_update' && frame.params.joined?.[0]?.room_id === roomId);
+		const one = (await request(first.peer, 'one', 'message', { room_id: roomId, body: { text: 'one' } })).result.message_id;
+		expect((await request(other.peer, 'hide', 'me', { status: 'invisible' })).result.you).toMatchObject({ status: 'invisible' });
+		await drain(first.peer);
+		await drain(mine.peer);
+		other.peer.send({ method: 'activity', params: { room_id: roomId, read_message_id: one } });
+		// Bob's own other connection still gets it; Ada does not.
+		expect((await until(mine.peer, (frame) => frame.method === 'activity')).frame.params.read_message_id).toBe(one);
+		expect(reads(await drain(first.peer))).toEqual([]);
+		// Kept for Bob, but neither the kept one nor one held unwritten shows at Ada's listing.
+		await vi.waitFor(async () => expect((await kept(bob))[roomId]).toBe(one));
+		const listing = async () => {
+			const second = await signIn(ada);
+			try {
+				await exchange(second.peer, 'list', 'room_list', { filter: 'joined' });
+				return reads(await drain(second.peer));
+			} finally { second.peer.close(); }
+		};
+		expect(await listing()).toEqual([]);
+		// Visible again: the room shows how far Bob has read.
+		await request(other.peer, 'show', 'me', { status: 'online' });
+		expect(await listing()).toEqual([{ room_id: roomId, from: { user_id: bob }, read_message_id: one }]);
+	} finally { first.peer.close(); other.peer.close(); mine.peer.close(); }
+});
+
 it('relays read cursors within an allowance of their own, so reading never throttles typing', async () => {
 	const ada = unique('ada');
 	const bob = unique('bob');
