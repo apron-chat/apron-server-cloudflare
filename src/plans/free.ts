@@ -76,6 +76,10 @@ export const FREE_PLAN: Plan = Object.freeze({
 		// hibernates while they wait.
 		statusCoalesceSeconds: 60,
 		offlineGraceSeconds: 60,
+		// Presence alarm rounding (armPresence): at most 1,440 wakes a day,
+		// about 13,000 maintenance writes, within Free's 20,000.
+		presenceAlarmSeconds: 60,
+		guestPresenceAlarmSeconds: 60,
 		sqlWritesPerDay: 80_000,
 		sqlReadsPerDay: 3_000_000,
 		foregroundWritesPerDay: 60_000,

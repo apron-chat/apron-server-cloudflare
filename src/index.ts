@@ -498,9 +498,6 @@ type ToggleFeature = "activity" | "uploads" | "presence" | "addmember";
 const ADMIN_USER_NAME = "Admin";
 /** `Retry-After` on a 503 that names no delay of its own: a minute. */
 const UNAVAILABLE_RETRY_MS = 60_000;
-/** Presence alarms round up to this boundary, so changes due in one window share a wake (armPresence). */
-const PRESENCE_ALARM_ROUND_MS = 15_000;
-
 /** Whether a user id is a guest's (`guest_<n>`); no registered user_id may start so. */
 function isGuestId(userId: string): boolean {
 	return userId.startsWith("guest_");
@@ -1575,7 +1572,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * alarm that woke the object sweeps from the attachments anyway.
 	 */
 	private presenceAlarmAt = Number.POSITIVE_INFINITY;
-	/** The earliest waiting change the alarm is for (armPresence): a registered user's, never a guest's. */
+	/** The earliest alarm time asked for (askPresenceAlarm), rounded, kept for a sign-in to ask again. */
 	private presenceAlarmDue = Number.POSITIVE_INFINITY;
 	/** While the alarm handler runs, which sets the next alarm itself when done. */
 	private inAlarm = false;
@@ -3618,7 +3615,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const frame = statusFrame(roomId, result.untilMs === undefined ? false : muteValue(result.untilMs, now));
 		for (const peer of this.connectionsOf(userId)) this.deliverTo(peer, frame);
 		// A timed mute that runs out within the minute is told on time (flushPresence).
-		if (result.untilMs !== undefined && result.untilMs - now <= MAX_STATUS_DELAY_SECONDS * 1_000) this.armPresence(result.untilMs, !isGuestId(userId));
+		if (result.untilMs !== undefined && result.untilMs - now <= MAX_STATUS_DELAY_SECONDS * 1_000) this.armPresence(result.untilMs, isGuestId(userId));
 	}
 
 	/** Applies `change` to the cached status state on each of a user's connections. */
@@ -3872,10 +3869,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	// `statusCoalesceSeconds` per user, the latest winning, and one a closed
 	// connection caused waits `offlineGraceSeconds` first, so a reload or a
 	// reconnect shows nothing; a change the user makes with `me` goes out at
-	// once. The object's alarm announces a registered user's change when it
-	// is due (armPresence), rounded up to 15 seconds, and lets the object
-	// hibernate meanwhile; a guest's change, and anything else due, goes out
-	// at the next event's sweep. Changes go as `user` `new` to others who share a room. The
+	// once. The object's alarm announces a change when it is due
+	// (armPresence), rounded up to `presenceAlarmSeconds` (a guest's to
+	// `guestPresenceAlarmSeconds`), and lets the object hibernate meanwhile;
+	// events sweep too. Changes go as `user` `new` to others who share a room. The
 	// same sweep tells the user's connections of mutes that run out.
 
 	/** Presence as configured and toggled: off without push, which capability `status` needs. */
@@ -4060,7 +4057,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 					return;
 				}
 				if (hold > now && hold !== pres.h) this.writePresence(states, { ...pres, h: hold });
-				this.armPresence(due, !isGuestId(userId));
+				this.armPresence(due, isGuestId(userId));
 				return;
 			}
 			// Their last connection closed: whoever shares a room is owed the change.
@@ -4119,7 +4116,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Sent after the attachments are written: a failed send closes its connection.
 		for (const socket of toldNow) this.deliverTo(socket, { method: "user", params: { new: { user_id: userId, ...shownFields(status, seen) } } });
 		if (told === status) return;
-		if (owing) this.armPresence(due, !isGuestId(userId));
+		if (owing) this.armPresence(due, isGuestId(userId));
 		else this.noteAnnounced(userId, now);
 	}
 
@@ -4210,24 +4207,38 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Notes that status work is due at `due`, and, for a registered user's
-	 * change (`alarm`), asks the alarm for it, unless it is already asked for
-	 * sooner. An alarm, not a timer: a timer kept the object awake (and
-	 * billed) until it fired, while the object hibernates until an alarm wakes
-	 * it, which costs metered maintenance writes when it moves the alarm
-	 * earlier (Store.scheduleAlarm). So the alarm time is rounded up to
-	 * PRESENCE_ALARM_ROUND_MS, and changes due in the same window share one
-	 * wake; a guest's change never asks for it, so guest connections, which
-	 * anyone can open, cannot spend the maintenance budget: it waits for the
-	 * next event, which sweeps (sweepPresence). Asked for only while a
-	 * signed-in connection is open to be told.
+	 * Notes that status work is due at `due`, and asks the alarm for it,
+	 * rounded up to the next boundary of `presenceAlarmSeconds`, or of the
+	 * coarser `guestPresenceAlarmSeconds` for a guest's change, since anyone
+	 * can open a guest connection. An alarm, not a timer: a timer kept the
+	 * object awake (and billed) until it fired, while the object hibernates
+	 * until an alarm wakes it, which costs metered maintenance writes when it
+	 * moves the alarm earlier (Store.scheduleAlarm). Rounding lets changes due
+	 * in the same window share one wake, and bounds the wakes a day; the
+	 * guests' rounding is a multiple of the users', so it adds no boundaries.
 	 */
-	private armPresence(due: number, alarm = true): void {
+	private armPresence(due: number, guest = false): void {
 		if (!Number.isFinite(due)) return;
 		this.presenceDueAt = Math.min(this.presenceDueAt, due);
-		if (!alarm) return;
-		this.presenceAlarmDue = Math.min(this.presenceAlarmDue, due);
-		const at = Math.ceil(due / PRESENCE_ALARM_ROUND_MS) * PRESENCE_ALARM_ROUND_MS;
+		this.askPresenceAlarm(this.presenceAlarmTime(due, guest));
+	}
+
+	/** When the alarm should announce a change due at `due`: rounded up by tier (armPresence). */
+	private presenceAlarmTime(due: number, guest: boolean): number {
+		if (!Number.isFinite(due)) return due;
+		const limits = this.config.limits;
+		const round = (guest ? limits.guestPresenceAlarmSeconds : limits.presenceAlarmSeconds) * 1_000;
+		return Math.ceil(due / round) * round;
+	}
+
+	/**
+	 * Asks the alarm for `at`, an already rounded time, unless it is already
+	 * asked for sooner; only while a signed-in connection is open to be told,
+	 * otherwise the next event sweeps (sweepPresence).
+	 */
+	private askPresenceAlarm(at: number): void {
+		if (!Number.isFinite(at)) return;
+		this.presenceAlarmDue = Math.min(this.presenceAlarmDue, at);
 		if (at >= this.presenceAlarmAt || !this.anySignedIn()) return;
 		this.presenceAlarmAt = at;
 		// The alarm handler sets the next alarm itself once it is done.
@@ -4289,12 +4300,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 				list.push({ socket, state });
 				if (state.owed?.length) holders.push({ socket, state });
 			}
-			// The next change for an event to sweep, and the next the alarm is for (not a guest's).
+			// The next change for an event to sweep, and the alarm time it asks for (rounded by tier).
 			let next = Number.POSITIVE_INFINITY;
 			let nextAlarm = Number.POSITIVE_INFINITY;
 			const wait = (userId: string, due: number) => {
 				next = Math.min(next, due);
-				if (!isGuestId(userId)) nextAlarm = Math.min(nextAlarm, due);
+				nextAlarm = Math.min(nextAlarm, this.presenceAlarmTime(due, isGuestId(userId)));
 			};
 			for (const [userId, states] of users) {
 				wait(userId, this.expireMutes(userId, states, now));
@@ -4336,8 +4347,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 				writeAttachment(socket, latest);
 			}
 			// A mute that runs out within the minute is told on time; a later one when an event sweeps.
-			this.armPresence(next, false);
-			this.armPresence(nextAlarm);
+			if (Number.isFinite(next)) this.presenceDueAt = Math.min(this.presenceDueAt, next);
+			this.askPresenceAlarm(nextAlarm);
 		});
 	}
 
@@ -4414,7 +4425,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		});
 		this.touchPresence(userId, now);
 		// A change waiting from before now has a connection to tell.
-		this.armPresence(this.presenceAlarmDue);
+		this.askPresenceAlarm(this.presenceAlarmDue);
 	}
 
 	/**

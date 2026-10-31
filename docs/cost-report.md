@@ -660,11 +660,13 @@ of it uses requests.
 
 **Alarm and duration.** A change waits for the coalescing minute and, when
 a closed connection caused it, the 60-second grace; a mute running out
-within a minute waits the same way. A registered user's change asks the
-object's alarm for its time, rounded up to 15 seconds so changes due in the
-same window share one wake, and only while a signed-in connection is open;
-a guest's change asks nothing and goes out at the next event, so guest
-connections, which anyone can open, cannot spend maintenance writes. Until
+within a minute waits the same way. The change asks the object's alarm for
+its time, only while a signed-in connection is open, rounded up so changes
+due in the same window share one wake: a registered user's to
+`presenceAlarmSeconds` (15 s; Free: 60 s), a guest's to the coarser
+`guestPresenceAlarmSeconds` (60 s), since anyone can open a guest
+connection. Every alarm time is a multiple of the first, so guests add no
+wakes past its ceiling. Until
 2026-10-31 an in-memory `setTimeout` did this. This report estimated it at
 6.25 GB-s per change, 0.05% of daily duration; production measured the
 timer keeping the object awake 5,900 to 8,200 seconds a day (34% to 38% of
@@ -677,12 +679,13 @@ after hibernation, when the cleanup time and the pending upload deadline
 are read again; a presence wake usually follows hibernation, so about 9
 writes in all. At production's 150 to 300 wakes a day that is about 1,400
 to 2,700 maintenance writes (1% to 3% of Paid's 100,000) for 540 to 640
-GB-s saved. Rounding caps presence wakes at 5,760 a day whatever the
-traffic (about 52,000 writes, 52% of Paid's); reaching it takes registered
-users, whom passkeys and the registration cap bound, changing status in
-every 15-second window around the clock. On Free that ceiling is 2.6 times
-its 20,000 maintenance writes, and once they run out no alarm can be set
-until the next UTC day.
+GB-s saved. Rounding caps presence wakes whatever the traffic: 5,760 a day
+on Paid (about 52,000 writes, 52% of its 100,000), reached only by
+registered users, whom passkeys and the registration cap bound, changing
+status in every 15-second window around the clock (guests alone reach at
+most 1,440, about 13,000 writes); 1,440 a day on Free (about 13,000 writes,
+65% of its 20,000). Were the maintenance writes to run out, no alarm could
+be set until the next UTC day.
 
 A mute that runs out more than a minute after the last event is told at the
 first event after it (any frame, connection, close or alarm, each of which

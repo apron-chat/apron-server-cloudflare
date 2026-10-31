@@ -580,7 +580,7 @@ describe('user status timing', () => {
 		} finally { watcher.close(); leaver.close(); stayer.close(); }
 	});
 
-	it('never asks the alarm for a guest\'s change: the next event announces it', async () => {
+	it('asks the alarm for a guest\'s change on the coarser guest boundary', async () => {
 		const watcherId = unique('watcher');
 		const watcher = await signedIn(watcherId);
 		const visitor = await guest();
@@ -593,11 +593,13 @@ describe('user status timing', () => {
 				await runtime.alarmTail;
 				return { alarm: runtime.presenceAlarmAt, due: runtime.presenceDueAt };
 			});
-			// Waiting, but for an event: guests cannot spend the alarm's writes.
-			expect(pending.alarm).toBe(Number.POSITIVE_INFINITY);
-			expect(Number.isFinite(pending.due)).toBe(true);
+			// Rounded up to guestPresenceAlarmSeconds, at most that much late.
+			const round = DEFAULT_LIMITS.guestPresenceAlarmSeconds * 1_000;
+			expect(pending.alarm % round).toBe(0);
+			expect(pending.alarm).toBeGreaterThanOrEqual(pending.due);
+			expect(pending.alarm - pending.due).toBeLessThan(round);
 			offset += COALESCE;
-			// Any frame is an event that sweeps: drain's own request announces it.
+			// The alarm or any earlier event announces it: drain's own request sweeps.
 			expect(told(await drain(watcher), visitor.userId)).toEqual(['idle']);
 		} finally { watcher.close(); visitor.peer.close(); }
 	});
@@ -639,10 +641,11 @@ describe('user status timing', () => {
 			});
 			// Asked for the grace, never more than MAX_STATUS_DELAY_SECONDS ahead,
 			// and the object's alarm is set no later than that.
-			// Rounded up to a 15-second boundary, so changes due together share a wake.
-			expect(pending.at % 15_000).toBe(0);
+			// Rounded up to presenceAlarmSeconds, so changes due together share a wake.
+			const round = DEFAULT_LIMITS.presenceAlarmSeconds * 1_000;
+			expect(pending.at % round).toBe(0);
 			expect(pending.at - Date.now()).toBeGreaterThan(GRACE - 5_000);
-			expect(pending.at - Date.now()).toBeLessThanOrEqual(Math.max(GRACE, COALESCE) + 15_000 + 100);
+			expect(pending.at - Date.now()).toBeLessThanOrEqual(Math.max(GRACE, COALESCE) + round + 100);
 			expect(pending.alarm).not.toBeNull();
 			expect(pending.alarm!).toBeLessThanOrEqual(pending.at);
 			offset += GRACE;
