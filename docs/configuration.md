@@ -180,6 +180,24 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   1 KB measured on the demo, times the sampling rate. `npm run budget:check`
   refuses a production config that samples more than the estimate assumes.
   The request stops come long before this one; it is a backstop.
+- **Metrics.** Logs are sampled, so rare events can be missed and totals are
+  estimates. The production config also binds a Workers Analytics Engine
+  dataset, `METRICS` (`apron_server_metrics`), and `src/metrics.ts` writes one
+  unsampled data point per event worth counting: stale connections closed
+  (`stale_close`: `pinged` or `unpinged`, and the origin), alarms (`alarm`:
+  `light` for status changes only, or `full`), pushes delivered (`push`:
+  `sent`, `failed` or `gone`), accounting closing and reopening
+  (`accounting`: `overrun`, `uncertain` or `recovered`; the log line
+  `accounting_closed` carries what failed), admin alerts (`admins_notified`)
+  and the edge stop turning on (`edge_stop`: `guard` or `flood`). Each point
+  is `blob1` the event, `blob2` and `blob3` its details and `double1` its
+  value. Writing never awaits or throws, and without the binding nothing is
+  written. Workers Paid includes 10 million data points a month; this server
+  writes a few thousand a day. `npm run usage:report -- --days 3` (with
+  `CLOUDFLARE_ACCOUNT_ID` and a `CLOUDFLARE_API_TOKEN` that has Account
+  Analytics Read) prints each UTC day's Durable Object awake time, billed
+  duration, peak sockets and busiest hour from GraphQL analytics, and the
+  counters from the dataset.
 
 Set it up once per deployment:
 
@@ -472,12 +490,21 @@ a minute behind:
   is written.
 - `offlineGraceSeconds` (60): a change caused by a closed connection waits
   this long, so a reload or a phone reconnecting shows nothing.
+- `presenceAlarmSeconds` (15; Free: 60): a registered user's waiting change
+  wakes the object at the next boundary of this many seconds, so changes due
+  together share a wake and statuses show up at most this much later. It
+  caps presence wakes at a day's seconds over it (5,760; Free: 1,440).
+- `guestPresenceAlarmSeconds` (60): the same for a guest's change, a
+  multiple of `presenceAlarmSeconds`, since anyone can open a guest
+  connection.
 
 A registered user's `seen` (when they were last shown `offline`) is written
 at most once in 10 minutes (`SEEN_WRITE_GRANULARITY_MS`, fixed, not a plan
-limit), so at most 144 times a day per account. Waiting changes use one
-in-memory timer, which keeps the object awake for at most a minute after its
-last event but uses no alarm, so no Durable Object request. See the
+limit), so at most 144 times a day per account. A waiting change uses the
+object's alarm, rounded up to `presenceAlarmSeconds` (a guest's to
+`guestPresenceAlarmSeconds`), so the object hibernates while it waits: each
+wake costs one alarm (a Durable Object request) and about 9 metered
+maintenance writes (6 if the object was still in memory). See the
 [cost report](cost-report.md#user-status).
 
 ## Runtime overrides
@@ -639,8 +666,9 @@ The numeric rows are grouped by their unit and enforcement scope:
 - Durations: `retentionSeconds`, `cleanupSeconds`, `challengeTtlSeconds`,
   `sessionTtlSeconds` (a passkey session token's lifetime, renewed on each
   resume), `unauthenticatedTimeoutSeconds`, `dedupTtlSeconds`, and
-  `statusCoalesceSeconds` and `offlineGraceSeconds` (each at most 60; see
-  [User status](#user-status-presence)).
+  `statusCoalesceSeconds`, `offlineGraceSeconds`, `presenceAlarmSeconds` and
+  `guestPresenceAlarmSeconds` (each at most 60, the last a multiple of the one
+  before; see [User status](#user-status-presence)).
 - Payload/storage bytes: `maxFrameBytes`, `maxTextBytes`, `maxSnapshotBytes`,
   `maxRequestIdBytes`, `maxNameBytes`, `historyMaxResponseBytes`, `pendingBytesPerConnection`,
   `databaseHighWaterBytes`, `databaseHardTargetBytes`,
@@ -749,6 +777,8 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `guestNumberBlock` | 10 |  |
 | `statusCoalesceSeconds` | 60 |  |
 | `offlineGraceSeconds` | 60 |  |
+| `presenceAlarmSeconds` | 15 | 60 |
+| `guestPresenceAlarmSeconds` | 60 |  |
 | `sqlWritesPerDay` | 800000 | 80000 |
 | `sqlReadsPerDay` | 30000000 | 3000000 |
 | `foregroundWritesPerDay` | 700000 | 60000 |

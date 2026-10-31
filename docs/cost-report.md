@@ -658,18 +658,34 @@ rows per candidate with registrations, at most about 3,000 a day at
 `pushesPerDay` (1,000); storage is at most 100 rows a registered user; none
 of it uses requests.
 
-**Timer and duration.** A change waits for the coalescing minute and, when
+**Alarm and duration.** A change waits for the coalescing minute and, when
 a closed connection caused it, the 60-second grace; a mute running out
-within a minute arms the same timer: one in-memory `setTimeout`, armed only
-while a signed-in connection is open. It sets no alarm and uses no SQL (both
-measured; a room mute that ran out aside), and keeps the object awake at
-most 60 s after its last event, against about 10 s before it would
-hibernate: at most 50 s × 0.125 GB = 6.25 GB-s per change that lands in a
-quiet period, 0.05% of either plan's daily duration. An alarm per due change
-would instead cost one request per wake (2% of Free's requests, 12.5% of
-Paid's at 4,000 a day), alarm scheduling (6/3) and an alarm run (about 14
-written rows), about 34,000 maintenance writes a day at Free's 2,000
-admissions (170% of its 20,000), and about 1.25 GB-s per wake.
+within a minute waits the same way. The change asks the object's alarm for
+its time, only while a signed-in connection is open, rounded up so changes
+due in the same window share one wake: a registered user's to
+`presenceAlarmSeconds` (15 s; Free: 60 s), a guest's to the coarser
+`guestPresenceAlarmSeconds` (60 s), since anyone can open a guest
+connection. Every alarm time is a multiple of the first, so guests add no
+wakes past its ceiling. Until
+2026-10-31 an in-memory `setTimeout` did this. This report estimated it at
+6.25 GB-s per change, 0.05% of daily duration; production measured the
+timer keeping the object awake 5,900 to 8,200 seconds a day (34% to 38% of
+its awake time, 2026-10-29 to 31), because it kept the object from
+hibernating through every quiet wait. A wake instead costs one request,
+the alarm write when it moves the alarm earlier (`Store.scheduleAlarm`,
+3 writes, measured), a status-only alarm run, and about 10 s awake (1.28
+GB-s). The run costs 3 writes when the instance is still in memory, and 6
+after hibernation, when the cleanup time and the pending upload deadline
+are read again; a presence wake usually follows hibernation, so about 9
+writes in all. At production's 150 to 300 wakes a day that is about 1,400
+to 2,700 maintenance writes (1% to 3% of Paid's 100,000) for 540 to 640
+GB-s saved. Rounding caps presence wakes whatever the traffic: 5,760 a day
+on Paid (about 52,000 writes, 52% of its 100,000), reached only by
+registered users, whom passkeys and the registration cap bound, changing
+status in every 15-second window around the clock (guests alone reach at
+most 1,440, about 13,000 writes); 1,440 a day on Free (about 13,000 writes,
+65% of its 20,000). Were the maintenance writes to run out, no alarm could
+be set until the next UTC day.
 
 A mute that runs out more than a minute after the last event is told at the
 first event after it (any frame, connection, close or alarm, each of which

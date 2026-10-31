@@ -19,7 +19,8 @@ it('tells members of expired thread rooms they left, even when the room listing 
 			state.storage.sql.exec('UPDATE records SET commit_ms = 0');
 			state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = 0, cleanup_cursor = NULL, cleanup_cutoff_ms = NULL WHERE id = 1');
 			// Simulate an exhausted budget for the re-announcement listing.
-			const runtime = instance as unknown as { store: { listRooms: () => unknown }; alarm(): Promise<void> };
+			const runtime = instance as unknown as { store: { listRooms: () => unknown; forgetCleanupDue(): void }; alarm(): Promise<void> };
+			runtime.store.forgetCleanupDue();
 			const listRooms = runtime.store.listRooms;
 			runtime.store.listRooms = () => { throw new Error('listing unavailable'); };
 			try { await runtime.alarm(); } finally { runtime.store.listRooms = listRooms; }

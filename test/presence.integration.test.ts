@@ -133,14 +133,10 @@ async function listed(observer: Peer, userId: string): Promise<Record<string, un
 }
 
 /**
- * Evicts the object as a deploy or a restart would, after stopping its
- * status timer (the test runtime waits for pending timers before evicting).
+ * Evicts the object as a deploy or a restart would: what it held in
+ * memory is gone, its attachments and its alarm are not.
  */
 async function evict(): Promise<void> {
-	await runInDurableObject(stub(), (instance) => {
-		const runtime = instance as unknown as { presenceTimer?: ReturnType<typeof setTimeout> };
-		if (runtime.presenceTimer !== undefined) clearTimeout(runtime.presenceTimer);
-	});
 	await evictDurableObject(stub());
 }
 
@@ -584,7 +580,31 @@ describe('user status timing', () => {
 		} finally { watcher.close(); leaver.close(); stayer.close(); }
 	});
 
-	it('waits on one in-memory timer, at most a minute ahead: no SQL, no alarm, no request', async () => {
+	it('asks the alarm for a guest\'s change on the coarser guest boundary', async () => {
+		const watcherId = unique('watcher');
+		const watcher = await signedIn(watcherId);
+		const visitor = await guest();
+		type Pending = Runtime & { presenceAlarmAt: number; presenceDueAt: number; alarmTail: Promise<void> };
+		try {
+			await drain(watcher);
+			await status(visitor.peer, { idle: 0 });
+			const pending = await runInDurableObject(stub(), async (instance) => {
+				const runtime = instance as unknown as Pending;
+				await runtime.alarmTail;
+				return { alarm: runtime.presenceAlarmAt, due: runtime.presenceDueAt };
+			});
+			// Rounded up to guestPresenceAlarmSeconds, at most that much late.
+			const round = DEFAULT_LIMITS.guestPresenceAlarmSeconds * 1_000;
+			expect(pending.alarm % round).toBe(0);
+			expect(pending.alarm).toBeGreaterThanOrEqual(pending.due);
+			expect(pending.alarm - pending.due).toBeLessThan(round);
+			offset += COALESCE;
+			// The alarm or any earlier event announces it: drain's own request sweeps.
+			expect(told(await drain(watcher), visitor.userId)).toEqual(['idle']);
+		} finally { watcher.close(); visitor.peer.close(); }
+	});
+
+	it('announces from the attachments when the alarm wakes an evicted object', async () => {
 		const watcherId = unique('watcher');
 		const leaverId = unique('leaver');
 		const watcher = await signedIn(watcherId);
@@ -592,34 +612,82 @@ describe('user status timing', () => {
 		try {
 			await drain(watcher);
 			await hangUp(leaver, leaverId);
-			const pending = await runInDurableObject(stub(), async (instance, state) => {
-				const runtime = instance as unknown as Runtime & { presenceTimer?: unknown; presenceTimerAt: number };
-				return { timer: runtime.presenceTimer !== undefined, ahead: runtime.presenceTimerAt - Date.now(), alarm: await state.storage.getAlarm() };
-			});
-			// Armed for the grace, never more than MAX_STATUS_DELAY_SECONDS ahead.
-			expect(pending.timer).toBe(true);
-			expect(pending.ahead).toBeGreaterThan(GRACE - 5_000);
-			expect(pending.ahead).toBeLessThanOrEqual(Math.max(GRACE, COALESCE) + 100);
+			// What the old instance held in memory is gone; the owed change is on the watcher's attachment.
+			await evict();
 			offset += GRACE;
-			const flushed = await runInDurableObject(stub(), async (instance, state) => {
-				const runtime = instance as unknown as Runtime & { presenceTimer?: unknown };
-				const before = runtime.store.storageAccounting();
-				runtime.flushPresence();
-				const after = runtime.store.storageAccounting();
-				return { reads: after.reads - before.reads, writes: after.writes - before.writes, alarm: await state.storage.getAlarm(), timer: runtime.presenceTimer !== undefined };
+			await runInDurableObject(stub(), async (instance, state) => {
+				const runtime = instance as unknown as Runtime & { alarm(): Promise<void> };
+				state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', Date.now() + 3_600_000);
+				runtime.store.forgetCleanupDue();
+				await runtime.alarm();
 			});
-			// Announcing touched no storage, scheduled no alarm (so no extra
-			// request), and left nothing waiting to keep the object awake.
-			expect(flushed).toMatchObject({ reads: 0, writes: 0, alarm: pending.alarm, timer: false });
 			expect(told(await drain(watcher), leaverId)).toEqual(['offline']);
-			// A mute that runs out in an hour arms nothing: an event sweeps for it.
-			await status(watcher, { mute: 3600 });
-			expect(await runInDurableObject(stub(), (instance) => (instance as unknown as { presenceTimer?: unknown }).presenceTimer !== undefined)).toBe(false);
-			// With no connection to tell of changes, nothing keeps the object awake.
-			await hangUp(watcher, watcherId);
-			const idleTimer = await runInDurableObject(stub(), (instance) => (instance as unknown as { presenceTimer?: unknown }).presenceTimer !== undefined);
-			expect(idleTimer).toBe(false);
 		} finally { watcher.close(); leaver.close(); }
+	});
+
+	it('waits on the object\'s alarm, at most a minute ahead, and an alarm with only status work skips the rest', async () => {
+		const watcherId = unique('watcher');
+		const leaverId = unique('leaver');
+		const watcher = await signedIn(watcherId);
+		const leaver = await signedIn(leaverId);
+		type AlarmRuntime = Runtime & { presenceAlarmAt: number; alarmTail: Promise<void>; alarm(): Promise<void>; accountUsage: { refresh(now: number, forced: boolean): Promise<void> } };
+		try {
+			await drain(watcher);
+			await hangUp(leaver, leaverId);
+			const pending = await runInDurableObject(stub(), async (instance, state) => {
+				const runtime = instance as unknown as AlarmRuntime;
+				await runtime.alarmTail;
+				return { at: runtime.presenceAlarmAt, alarm: await state.storage.getAlarm() };
+			});
+			// Asked for the grace, never more than MAX_STATUS_DELAY_SECONDS ahead,
+			// and the object's alarm is set no later than that.
+			// Rounded up to presenceAlarmSeconds, so changes due together share a wake.
+			const round = DEFAULT_LIMITS.presenceAlarmSeconds * 1_000;
+			expect(pending.at % round).toBe(0);
+			expect(pending.at - Date.now()).toBeGreaterThan(GRACE - 5_000);
+			expect(pending.at - Date.now()).toBeLessThanOrEqual(Math.max(GRACE, COALESCE) + round + 100);
+			expect(pending.alarm).not.toBeNull();
+			expect(pending.alarm!).toBeLessThanOrEqual(pending.at);
+			offset += GRACE;
+			const fired = await runInDurableObject(stub(), async (instance, state) => {
+				const runtime = instance as unknown as AlarmRuntime;
+				// Nothing but the status change is due when the alarm fires.
+				state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', Date.now() + 3_600_000);
+				runtime.store.forgetCleanupDue();
+				const cleanup = vi.spyOn(runtime.store, 'runCleanup');
+				const refresh = vi.spyOn(runtime.accountUsage, 'refresh');
+				await runtime.alarm();
+				await runtime.alarmTail;
+				return { cleanup: cleanup.mock.calls.length, refresh: refresh.mock.calls.length, at: runtime.presenceAlarmAt, alarm: await state.storage.getAlarm() };
+			});
+			// It announced the change and set the next alarm, skipping the usage
+			// refresh and cleanup, which the alarms with their own work run.
+			expect(fired).toMatchObject({ cleanup: 0, refresh: 0, at: Number.POSITIVE_INFINITY });
+			expect(fired.alarm).not.toBeNull();
+			expect(told(await drain(watcher), leaverId)).toEqual(['offline']);
+			// A mute that runs out in an hour asks for nothing: an event sweeps for it.
+			await status(watcher, { mute: 3600 });
+			expect(await runInDurableObject(stub(), (instance) => (instance as unknown as AlarmRuntime).presenceAlarmAt)).toBe(Number.POSITIVE_INFINITY);
+			// With no connection to tell of changes, nothing is asked of the alarm.
+			await hangUp(watcher, watcherId);
+			expect(await runInDurableObject(stub(), (instance) => (instance as unknown as AlarmRuntime).presenceAlarmAt)).toBe(Number.POSITIVE_INFINITY);
+		} finally { watcher.close(); leaver.close(); }
+	});
+
+	it('runs an alarm\'s full work when something besides status changes is due', async () => {
+		const runAlarm = (cleanupDue: boolean) => runInDurableObject(stub(), async (instance, state) => {
+			const runtime = instance as unknown as Runtime & { alarm(): Promise<void>; alarmTail: Promise<void> };
+			state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', cleanupDue ? 0 : Date.now() + 3_600_000);
+			runtime.store.forgetCleanupDue();
+			const cleanup = vi.spyOn(runtime.store, 'runCleanup');
+			await runtime.alarm();
+			await runtime.alarmTail;
+			const calls = cleanup.mock.calls.length;
+			cleanup.mockRestore();
+			return calls;
+		});
+		expect(await runAlarm(true)).toBe(1);
+		expect(await runAlarm(false)).toBe(0);
 	});
 
 	it('fails a sign-in whose stored status and mutes cannot be read, leaving the connection as it was', async () => {

@@ -1751,7 +1751,15 @@ export class Store {
    * has unwound, so the operators hear of it (ApronDemoServer.notify).
    */
   onOverrun?: () => void;
+  /** Called, synchronously, as accounting closes or reopens, for a metric; it must not touch storage. */
+  onAccounting?: (change: "overrun" | "uncertain" | "recovered") => void;
   private deferredCleanupUntil = 0;
+  /**
+   * `next_cleanup_ms` as last read (maintenanceRow), so an alarm can tell
+   * whether cleanup is due without a reservation (cleanupDue); forgotten at
+   * every write of it, which reads it again.
+   */
+  private cleanupDueCache?: number;
   private scheduledAlarmAt?: number;
   /** Bumped by every write to a table member listings read (MEMBER_TABLES). */
   private memberGeneration = 0;
@@ -1795,7 +1803,7 @@ export class Store {
       advanceClock: (now) => { this.effectiveNow(now); },
       clock: () => this.lastEffectiveMs,
       inTransaction: () => this.inTransaction,
-      markUnsafe: () => this.markAccountingUnsafe("uncertain"),
+      markUnsafe: (error) => this.markAccountingUnsafe("uncertain", error),
     }, this.config);
   }
 
@@ -1993,6 +2001,7 @@ export class Store {
       }
       this.rawExec("UPDATE _meta SET value = ? WHERE key = 'schema_version'", String(SCHEMA_VERSION));
       this.rawExec("UPDATE maintenance SET schema_version = ? WHERE id = 1", SCHEMA_VERSION);
+      this.cleanupDueCache = undefined;
     });
     console.warn(JSON.stringify({
       event: "storage_schema_upgraded", from: 9, to: SCHEMA_VERSION,
@@ -2073,6 +2082,7 @@ export class Store {
   private finishUpgrade(version: number, start: { reads: number; writes: number }, day: string): void {
     this.rawExec("UPDATE _meta SET value = ? WHERE key = 'schema_version'", String(version));
     this.rawExec("UPDATE maintenance SET schema_version = ? WHERE id = 1", version);
+    this.cleanupDueCache = undefined;
     this.chargeUpgrade(start, day);
   }
 
@@ -2138,6 +2148,7 @@ export class Store {
     this.accountingUncertain = false;
     this.persistAccountingMarker();
     console.warn(JSON.stringify({ event: "accounting_uncertain_recovered", ...(charged ? { charged } : {}) }));
+    try { this.onAccounting?.("recovered"); } catch { /* a metric never breaks recovery */ }
     return true;
   }
 
@@ -2233,6 +2244,7 @@ export class Store {
     this.lostOnWake = false;
     this.accountingMarker = "0";
     this.lastEffectiveMs = 0;
+    this.cleanupDueCache = undefined;
     this.limiters.clear();
     this.scheduledAlarmAt = undefined;
     this.initialize();
@@ -2472,7 +2484,12 @@ export class Store {
    * The first overrun tells the operators (onOverrun), once the failing
    * operation has unwound.
    */
-  private markAccountingUnsafe(kind: "overrun" | "uncertain"): void {
+  private markAccountingUnsafe(kind: "overrun" | "uncertain", error?: unknown): void {
+    // Once a closing, with what failed: the one record of why the server refuses.
+    if (kind === "overrun" ? !this.accountingUnsafe : !this.accountingUncertain) {
+      console.error(JSON.stringify({ event: "accounting_closed", kind, message: error instanceof Error ? error.message : error === undefined ? undefined : String(error) }));
+      try { this.onAccounting?.(kind); } catch { /* a metric never breaks the stop */ }
+    }
     if (kind === "uncertain") {
       this.accountingUncertain = true;
       this.persistAccountingMarker();
@@ -2621,7 +2638,7 @@ export class Store {
       // Set the latch before throwing. If this assertion is inside a native
       // transaction, transaction() persists it after rollback; outside a
       // transaction it is durable immediately.
-      this.markAccountingUnsafe("overrun");
+      this.markAccountingUnsafe("overrun", `storage cost exceeded its reservation: ${actualReads}/${reserved.reads} reads, ${actualWrites}/${reserved.writes} writes`);
       throw new StoreError("internal_error", "storage cost exceeded its reservation", {
         data: {
           reserved_reads: reserved.reads,
@@ -3883,6 +3900,7 @@ export class Store {
       "SELECT id, next_cleanup_ms, cleanup_cutoff_ms, cleanup_cursor, schema_version FROM maintenance WHERE id = 1 LIMIT 1",
     );
     if (!rows.length) throw new StoreError("internal_error", "maintenance state is missing");
+    this.cleanupDueCache = rows[0].next_cleanup_ms;
     return rows[0];
   }
 
@@ -5069,6 +5087,20 @@ export class Store {
       "SELECT MIN(write_expires_ms) AS due FROM uploads INDEXED BY uploads_pending_idx WHERE state IN ('pending', 'writing')",
     )[0]?.due);
     return typeof next === "number" ? { ...done, next: next + UPLOAD_WRITE_GRACE_MS } : done;
+  }
+
+  /**
+   * When the earliest pending upload's write runs out, grace included, or
+   * undefined with none pending: one indexed read, for an alarm that woke
+   * without knowing (ApronDemoServer.alarmWorkDue).
+   */
+  nextUploadDeadline(now = this.clock.now()): number | undefined {
+    this.ensureReady();
+    if (!this.config.uploads) return undefined;
+    const next = this.reserved({ reads: 8 }, true, now, () => this.rawRows<{ due: number | null }>(
+      "SELECT MIN(write_expires_ms) AS due FROM uploads INDEXED BY uploads_pending_idx WHERE state IN ('pending', 'writing')",
+    )[0]?.due);
+    return typeof next === "number" ? next + UPLOAD_WRITE_GRACE_MS : undefined;
   }
 
   /**
@@ -6477,6 +6509,7 @@ export class Store {
     const beforeWrites = this.observed.writes;
     const reserved = this.reserveMaintenanceControl({ reads: 2, writes: 2 }, effective);
     this.rawExec("UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1", nextDue);
+    this.cleanupDueCache = undefined;
     this.deferredCleanupUntil = nextDue;
     this.assertReservation(reserved, beforeReads, beforeWrites);
   }
@@ -6518,6 +6551,27 @@ export class Store {
     return Math.min(Math.floor(effective / 86_400_000) * 86_400_000, effective - LIMITER_IDLE_MS);
   }
 
+  /**
+   * Whether cleanup is due by `now`, for an alarm deciding whether to run it
+   * (ApronDemoServer.alarmWorkDue): from the cached `next_cleanup_ms` when
+   * there is one, else one read of the maintenance row. A read that fails
+   * counts as due, so the alarm runs its full work.
+   */
+  /** Forgets the cached `next_cleanup_ms` after a write the store did not make (a test, an operator's SQL). */
+  forgetCleanupDue(): void {
+    this.cleanupDueCache = undefined;
+  }
+
+  cleanupDue(now = this.clock.now()): boolean {
+    if (this.cleanupDueCache !== undefined) return Math.max(this.cleanupDueCache, this.deferredCleanupUntil) <= Math.max(Math.trunc(now), this.lastEffectiveMs);
+    try {
+      return this.reserved({ reads: 4 }, true, now, () =>
+        Math.max(this.maintenanceRow().next_cleanup_ms, this.deferredCleanupUntil) <= this.effectiveNow(now));
+    } catch {
+      return true;
+    }
+  }
+
   runCleanup(now = this.clock.now()): StoreCleanupResult {
     this.ensureReady();
     // An alarm may have fired, and cleanup may establish an earlier continuation.
@@ -6540,6 +6594,7 @@ export class Store {
           if (!this.cleanupHasWork(state.history_floor, cutoff, effective, this.limiterCutoff(effective))) {
             maintenance.next_cleanup_ms = effective + this.config.cleanupIntervalMs;
             this.rawExec("UPDATE maintenance SET next_cleanup_ms = ?, cleanup_cutoff_ms = NULL, cleanup_cursor = NULL WHERE id = 1", maintenance.next_cleanup_ms);
+            this.cleanupDueCache = undefined;
           }
         }
         return { maintenance, state, effective };
@@ -6592,6 +6647,7 @@ export class Store {
       if (expired.length) floor = Math.max(floor, expired[expired.length - 1].log_id + 1);
       const head = this.writeLogHead(floor);
       this.rawExec("UPDATE maintenance SET cleanup_cutoff_ms = ?, cleanup_cursor = ?, next_cleanup_ms = ? WHERE id = 1", cutoff, floor, effective + 1000);
+      this.cleanupDueCache = undefined;
       this.assertReservation(reserved, beforeReads, beforeWrites);
       this.logCache = { ...head, history_floor: floor };
     });
@@ -6710,6 +6766,7 @@ export class Store {
         this.rawRows(`SELECT room_id FROM rooms WHERE ${PRIVATE_ROOMS} AND latest_log_id < ? LIMIT 1`, floor).length > 0;
       const nextDue = effective + (hasMore ? 1000 : this.config.cleanupIntervalMs);
       this.rawExec("UPDATE maintenance SET next_cleanup_ms = ?, cleanup_cutoff_ms = ?, cleanup_cursor = ? WHERE id = 1", nextDue, hasMore ? cutoff : null, hasMore ? floor : null);
+      this.cleanupDueCache = undefined;
       this.assertReservation(reserved, beforeReads, beforeWrites);
       const deleted = records.length + messages + reactions + rooms.length + memberships + requests.length + limiters.length + subscriptions.length + wakes.length;
       return {
