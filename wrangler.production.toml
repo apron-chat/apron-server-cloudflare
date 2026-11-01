@@ -31,10 +31,6 @@ new_sqlite_classes = ["ApronDemoServer"]
 
 [vars]
 RP_ID = "apron.chat"
-# Clears a persisted accounting stop once per value (docs/configuration.md,
-# ACCOUNTING_RECOVERY). Set after the 2026-11-01 overrun in topLevelRoomIds
-# (#67); a later stop needs a new value.
-ACCOUNTING_RECOVERY = "2026-11-01"
 RP_ORIGINS = "https://web.apron.chat"
 ALLOWED_ORIGINS = "*"
 # The server frame's title, description and avatar (docs/configuration.md,
@@ -92,9 +88,9 @@ simple = { limit = 60, period = 60 }
 [[ratelimits]]
 name = "LOCATION_ATTEMPTS"
 namespace_id = "73008"
-simple = { limit = 200, period = 60 }
+simple = { limit = 1000, period = 60 }
 [[ratelimits]]
 name = "FLOOD_WATCH"
 namespace_id = "73004"
-simple = { limit = 60, period = 60 }
+simple = { limit = 600, period = 60 }
 # END GENERATED ADMISSION BUDGET

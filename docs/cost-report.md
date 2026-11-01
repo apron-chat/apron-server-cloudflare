@@ -11,6 +11,16 @@ guarantee work is in
 budgets are in `src/plans/` ([configuration](configuration.md#plans)).
 Production runs Workers Paid; Free figures are given where they differ.
 
+Since 2026-11-01 the Paid account stop is a bill cap in dollars of overage
+($5 added in a day, $25 in a month; [budget guard](configuration.md#budget-guard)),
+not 90% of a daily share or half the month's inclusion. Sections below that
+say "daily stop" or "monthly stop at 50%" describe the stops in force when
+they were measured; their usage figures still hold. The same day Paid's
+limits moved to a launch profile (500 connections, 3.1 million rows written
+and 105 million read a day, 2 million frames; `src/plans/paid.ts`): a day at
+every ceiling is about $3.40 past the inclusions, and the per-operation
+costs measured below are unchanged.
+
 Reproduce with the repository's workerd launcher:
 
 ```sh
@@ -498,7 +508,7 @@ back.
 primary-key delete per gone registration (2/2), whatever other accounts share
 the endpoint: deleting by endpoint alone would read and write every account's
 row for it, which an attacker can multiply by registering one endpoint from
-many accounts, and would overrun the reservation and latch accounting unsafe.
+many accounts, and would overrun the reservation (charged, and counted toward its breaker).
 Many accounts sharing one endpoint otherwise cost what as many separate
 registrations do: a wake claims at most `wakesPerMessage` users of
 `subscriptionsPerUser` each.

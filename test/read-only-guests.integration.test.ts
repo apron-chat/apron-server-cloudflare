@@ -1,5 +1,5 @@
 import { env, runInDurableObject } from 'cloudflare:test';
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import { connect as open, exchange, greeting, request, until, type Frame, type Peer } from './helpers/socket';
 
 let nextIp = 1;
@@ -258,4 +258,69 @@ it('rejects a made-up bot token', async () => {
 		expect(forged.error.code).toBe(-32001);
 		expect(forged.error.message).toMatch(/invite-bot/);
 	} finally { peer.close(); }
+});
+
+it('keeps scrolling back for accounts: a guest gets the newest page, charged to its address alone', async () => {
+	const guest = await connect();
+	try {
+		await greeting(guest);
+		expect((await request(guest, 'auth', 'auth', { scheme: 'guest' })).result.you.user_id).toMatch(/^guest_/);
+		const newest = await request(guest, 'newest', 'history', { room_id: 'general', limit: 5 });
+		expect(newest.result).toBeTruthy();
+		const older = await request(guest, 'older', 'history', { room_id: 'general', before: '999999999999999' });
+		expect(older.error).toMatchObject({ code: -32001, message: 'Sign in to load older history' });
+		// A guest's pages write no limiter row of its own.
+		const rows = await runInDurableObject(stub(), (_instance, state) =>
+			state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM principal_limits WHERE scope = 'history' AND principal_key LIKE 'user:guest_%'").one().count);
+		expect(rows).toBe(0);
+	} finally { guest.close(); }
+});
+
+it('makes room on a full server by closing the guest idle longest, never a registered user', async () => {
+	const idle = await connect();
+	const busy = await signedIn('evict-registered');
+	try {
+		await greeting(idle);
+		await request(idle, 'auth', 'auth', { scheme: 'guest' });
+		const closed = new Promise<{ code: number; reason: string }>((resolve) => idle.socket.addEventListener('close', (event) => resolve({ code: event.code, reason: event.reason })));
+		const evicted = await runInDurableObject(stub(), (instance, state) => {
+			const runtime = instance as unknown as { evictIdleGuest(sockets: WebSocket[], now: number): boolean };
+			const sockets = state.getWebSockets();
+			// Nobody has been idle ten minutes yet.
+			expect(runtime.evictIdleGuest(sockets, Date.now())).toBe(false);
+			return runtime.evictIdleGuest(sockets, Date.now() + 11 * 60_000);
+		});
+		expect(evicted).toBe(true);
+		expect(await closed).toEqual({ code: 4000, reason: "Idle guest connection closed to make room; reconnect when you're back" });
+		// The registered user is still served.
+		expect((await request(busy, 'after', 'room_list', {})).result).toBeTruthy();
+	} finally { idle.close(); busy.close(); }
+});
+
+it('evicts an idle guest only for an upgrade that passes every check, never for a status probe', async () => {
+	const idle = await connect();
+	try {
+		await greeting(idle);
+		await request(idle, 'auth', 'auth', { scheme: 'guest' });
+		let closedWith: number | undefined;
+		idle.socket.addEventListener('close', (event) => { closedWith = event.code; });
+		await runInDurableObject(stub(), (instance, state) => {
+			const runtime = instance as unknown as { config: { limits: Record<string, number> }; admit(ipKey: string, status: boolean): Response | undefined };
+			const limits = runtime.config.limits;
+			runtime.config = { ...runtime.config, limits: { ...limits, openConnections: state.getWebSockets().length } };
+			const later = Date.now() + 11 * 60_000;
+			const now = vi.spyOn(Date, 'now').mockReturnValue(later);
+			try {
+				// The probe says a slot is free, and closes nobody.
+				expect(runtime.admit('probe-ip', true)?.status).toBe(200);
+				expect(state.getWebSockets().some((socket) => (socket.deserializeAttachment() as { closing?: boolean })?.closing)).toBe(false);
+				// The upgrade takes it.
+				expect(runtime.admit('upgrade-ip', false)).toBeUndefined();
+			} finally {
+				now.mockRestore();
+				runtime.config = { ...runtime.config, limits };
+			}
+		});
+		await vi.waitFor(() => expect(closedWith).toBe(4000));
+	} finally { idle.close(); }
 });

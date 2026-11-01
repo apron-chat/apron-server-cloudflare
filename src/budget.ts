@@ -221,11 +221,21 @@ interface AccountAllowance {
 	/** Incoming WebSocket messages billed as one Durable Object request. */
 	webSocketMessagesPerRequest: number;
 	/**
-	 * Included usage per month, for a plan that bills past it. Usage since the
-	 * start of the UTC calendar month stops at `monthlyStopRatio` of any of it.
+	 * Included usage per month, for a plan that bills past it. With a
+	 * `billCap` the stop is in dollars of overage (src/pricing.ts); without
+	 * one, usage since the start of the UTC calendar month stops at
+	 * `monthlyStopRatio` of any of it.
 	 */
 	monthly?: Readonly<MonthlyAllowance>;
 	monthlyStopRatio?: number;
+	/**
+	 * Dollars of overage past the monthly inclusions the server may run up
+	 * before it stops: added today (`dayUsd`, lifts at midnight UTC) or this
+	 * calendar month (`monthUsd`, lifts on the 1st). It replaces the daily
+	 * shares and `monthlyStopRatio` as the stop. `BILL_CAP_DAY` and
+	 * `BILL_CAP_MONTH` override it.
+	 */
+	billCap?: Readonly<{ dayUsd: number; monthUsd: number }>;
 	/** How the monthly stop estimates `logBytes`, for a plan with monthly allowances. */
 	logEstimate?: Readonly<LogEstimate>;
 	/**
@@ -507,7 +517,7 @@ export const MAX_REACTION_EMOJIS_PER_USER = 16;
 export const MAX_EMOJI_BYTES = 64;
 export const MAX_CONNECTION_FRAME_RATE = 120;
 // The server-wide frame window is one in-memory timestamp per frame.
-export const MAX_GLOBAL_FRAMES_PER_MINUTE = 1_000;
+export const MAX_GLOBAL_FRAMES_PER_MINUTE = 5_000;
 // Throttle windows live in connection attachments, one timestamp per event.
 export const MAX_TYPE_THROTTLE_PER_MINUTE = 60;
 // A block counts against the IP's frame minute all at once.
@@ -570,7 +580,9 @@ export const MAX_SQL_WRITES = DEFAULT_LIMITS.sqlWritesPerDay;
 export const MAX_SQL_READS = DEFAULT_LIMITS.sqlReadsPerDay;
 export const MAX_DATABASE_HIGH_WATER_BYTES = DEFAULT_LIMITS.databaseHighWaterBytes;
 export const MAX_DATABASE_HARD_TARGET_BYTES = DEFAULT_LIMITS.databaseHardTargetBytes;
-export const MAINTENANCE_CONTROL_RESERVE = 8;
+// Withheld from ordinary maintenance for deferCleanup (8) and the alarm
+// that resets it (24), each with headroom over what it measures (2 and 6).
+export const MAINTENANCE_CONTROL_RESERVE = 32;
 export const BOOTSTRAP_ROW_RESERVATION = 512;
 export const MAX_SOCKET_QUEUE_ALLOCATION = 32 * 1024 * 1024;
 export const ADMISSION_BUDGET: Readonly<AdmissionBudget> = PLAN.admission;

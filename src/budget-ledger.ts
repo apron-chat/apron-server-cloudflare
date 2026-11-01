@@ -37,6 +37,10 @@ export interface BudgetCost {
   /** Set on a reservation charged to a day's budget row, so its unused part can be refunded. */
   day?: string;
   maintenance?: boolean;
+  /** The excess already noted and charged (Store.assertReservation), so a later check adds only rows past it. */
+  overrun?: { reads: number; writes: number };
+  /** Where the reservation was made: the stack an overrun or breaker is named from (Store.operationName). */
+  site?: Error;
 }
 
 export interface BudgetSnapshot extends BudgetCost {
@@ -194,6 +198,27 @@ export class BudgetLedger {
     this.host.exec("INSERT OR IGNORE INTO resource_budgets (day) VALUES (?)", day);
     this.update(day, delta, false);
     this.forget();
+  }
+
+  /**
+   * Adds to a day's counters without a capacity check, like addUnchecked,
+   * but through the cached copy when it holds that day: the row is written
+   * at once and stays cached, so a reservation open meanwhile still settles
+   * (its refund needs the cached row) and the shares stay readable.
+   */
+  chargeUnchecked(day: string, delta: BudgetDelta): void {
+    const row = this.cachedDay === day ? this.cached : null;
+    if (!row) {
+      this.addUnchecked(day, delta);
+      return;
+    }
+    this.stage(day, row, delta);
+    this.flush();
+  }
+
+  /** A day's counters from the cached copy only, with no SQL; null before the day's first reservation here. */
+  cachedSnapshot(day: string): BudgetSnapshot | null {
+    return this.cachedDay === day && this.cached ? this.snapshot(day) : null;
   }
 
   /** A day's counters, creating its row if it has none. The cached copy, which holds what is staged, needs no SQL. */

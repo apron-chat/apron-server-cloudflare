@@ -1,5 +1,6 @@
 import * as budget from "./budget.ts";
 import { DEFAULT_FEATURES, DEFAULT_LIMITS, LIVE_TEXT_POLICY, MAX_PUSH_CANDIDATES, MAX_PUSHES_PER_MESSAGE, MAX_STATUS_DELAY_SECONDS, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits, type LiveTextPolicy, type PushPolicy } from "./budget.ts";
+import { billCap, type BillCap } from "./pricing.ts";
 import { base64UrlDecode, P256_PRIVATE_KEY_BYTES, P256_PUBLIC_KEY_BYTES, vapidKeysMatch, type VapidKeys } from "./webpush.ts";
 export { DEFAULT_LIMITS } from "./budget.ts";
 
@@ -18,12 +19,6 @@ export interface RuntimeConfig {
 	 */
 	server: ServerMetadata;
 	admissionOff: boolean;
-	/**
-	 * Clears a persisted accounting stop once (`ACCOUNTING_RECOVERY`): the
-	 * Durable Object clears it on its next start, once per value
-	 * (Store.recoverAccounting). Unset, a stop stays until a reset.
-	 */
-	accountingRecovery?: string;
 	/** Advertise and relay typing (cap `activity`); `ACTIVITY` overrides the plan's default. */
 	activityEnabled: boolean;
 	/** Let guests post, react, join and leave rooms, and create threads; `GUEST_POSTING` overrides the plan's default. Off, guests only read. */
@@ -58,6 +53,12 @@ export interface RuntimeConfig {
 	 */
 	liveTextEnabled: boolean;
 	/**
+	 * Whether the attack pause may pause the server (src/burn.ts):
+	 * `ATTACK_PAUSE`, on unless `false`. Off, what would pause only alerts the
+	 * admins, a pause in force ends, and the budget guard ignores its hold.
+	 */
+	attackPause: boolean;
+	/**
 	 * Web Push (protocol §4.9, push kind `webpush`), on when the plan has a
 	 * push policy and the deployment sets `VAPID_PUBLIC_KEY`, `VAPID_SUBJECT`,
 	 * and the `VAPID_PRIVATE_KEY` secret.
@@ -79,6 +80,12 @@ export interface RuntimeConfig {
 	 * an empty list keeps no remote media.
 	 */
 	ogMediaHosts: readonly string[] | "*";
+	/**
+	 * The overage in dollars the server may run up before the account stop
+	 * (`BILL_CAP_DAY`, `BILL_CAP_MONTH`, else the plan's `billCap`); null on
+	 * a plan that fails closed at its allowances.
+	 */
+	billCap: BillCap | null;
 }
 
 /** The browsers' own push services, allowed when `PUSH_HOSTS` is unset. */
@@ -191,6 +198,8 @@ export class ConfigError extends Error {
 }
 
 type EnvLike = {
+	BILL_CAP_DAY?: string;
+	BILL_CAP_MONTH?: string;
 	ALLOWED_ORIGINS?: string;
 	RP_ID?: string;
 	RP_ORIGINS?: string;
@@ -199,11 +208,11 @@ type EnvLike = {
 	SERVER_DESCRIPTION?: string;
 	SERVER_AVATAR?: string;
 	ADMISSION_OFF?: string;
-	ACCOUNTING_RECOVERY?: string;
 	ACTIVITY?: string;
 	GUEST_POSTING?: string;
 	PRESENCE?: string;
 	LIVE_TEXT?: string;
+	ATTACK_PAUSE?: string;
 	APRON_ADMIN_TOKEN?: string;
 	MEDIA_ORIGIN?: string;
 	PUBLIC_ORIGIN?: string;
@@ -300,7 +309,10 @@ function validateLimits(limits: Limits): void {
 	if (limits.pendingFramesPerConnection > budget.MAX_PENDING_FRAMES || limits.pendingBytesPerConnection > budget.MAX_PENDING_BYTES) {
 		fail("socket pending-work policy exceeds calibrated bounds");
 	}
-	if (limits.pendingBytesPerConnection < limits.maxFrameBytes || limits.pendingFramesPerConnection > Math.floor(limits.pendingBytesPerConnection / limits.maxFrameBytes)) {
+	// The byte budget must hold at least two maximum-size frames. Past that the
+	// two bounds work together: small frames pipeline up to the frame count,
+	// large ones up to the bytes, whichever is reached first.
+	if (limits.pendingBytesPerConnection < 2 * limits.maxFrameBytes) {
 		fail("pending socket budget cannot hold its configured frames");
 	}
 	if (limits.openConnections > budget.MAX_OPEN_CONNECTIONS || limits.openConnections * limits.pendingBytesPerConnection > budget.MAX_SOCKET_QUEUE_ALLOCATION) {
@@ -440,8 +452,6 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 	// answers when it serves RP_ID's host (handleRelatedOrigins).
 	if (env.ADMISSION_OFF !== undefined && !["true", "false"].includes(String(env.ADMISSION_OFF).toLowerCase())) throw new ConfigError("ADMISSION_OFF must be true or false");
 	const admissionOff = String(env.ADMISSION_OFF ?? "").toLowerCase() === "true";
-	const accountingRecovery = env.ACCOUNTING_RECOVERY === undefined || env.ACCOUNTING_RECOVERY === "" ? undefined : String(env.ACCOUNTING_RECOVERY);
-	if (accountingRecovery !== undefined && !/^[A-Za-z0-9._:-]{1,64}$/.test(accountingRecovery)) throw new ConfigError("ACCOUNTING_RECOVERY must be 1 to 64 letters, digits, ., _, : or -");
 	const activityEnabled = parseSwitch(env.ACTIVITY, "ACTIVITY", DEFAULT_FEATURES.activity);
 	const guestPosting = parseSwitch(env.GUEST_POSTING, "GUEST_POSTING", DEFAULT_FEATURES.guestPosting);
 	const presence = parseSwitch(env.PRESENCE, "PRESENCE", DEFAULT_FEATURES.presence);
@@ -451,6 +461,7 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 	const uploads = loadUploads(env);
 	const liveText = loadLiveText(env, limits);
 	const liveTextEnabled = parseSwitch(env.LIVE_TEXT, "LIVE_TEXT", DEFAULT_FEATURES.liveText);
+	const attackPause = parseSwitch(env.ATTACK_PAUSE, "ATTACK_PAUSE", true);
 	if (PUSH_POLICY) validatePushPolicy(PUSH_POLICY);
 	const push = loadPush(env);
 	const pushHosts = loadPushHosts(env.PUSH_HOSTS);
@@ -461,6 +472,12 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 		throw new ConfigError("RP_NAME exceeds the configured display-name policy");
 	}
 	const server = loadServerMetadata(env, limits);
+	let cap: BillCap | null;
+	try {
+		cap = billCap({ BILL_CAP_DAY: env.BILL_CAP_DAY === undefined ? undefined : String(env.BILL_CAP_DAY), BILL_CAP_MONTH: env.BILL_CAP_MONTH === undefined ? undefined : String(env.BILL_CAP_MONTH) });
+	} catch (error) {
+		throw new ConfigError((error as Error).message);
+	}
 	return {
 		limits,
 		allowedOrigins,
@@ -469,7 +486,6 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 		rpName,
 		server,
 		admissionOff,
-		...(accountingRecovery !== undefined ? { accountingRecovery } : {}),
 		activityEnabled,
 		guestPosting,
 		presence,
@@ -481,6 +497,8 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 		pushHosts,
 		pushDelaySeconds,
 		ogMediaHosts,
+		billCap: cap,
+		attackPause,
 	};
 }
 

@@ -1,12 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import { ACCOUNT_USAGE_POLICY } from "../src/budget";
-import { AccountUsageMonitor, accountUsageSnapshotFromResult, accountUsageStops, exceededAllowances, fetchAccountUsage } from "../src/account-usage";
+import { AccountUsageMonitor, accountUsageSnapshotFromResult, accountUsageStops, exceededAllowances, fetchAccountUsage, snapshotBill } from "../src/account-usage";
+import { billCap } from "../src/pricing";
 import { env, runInDurableObject } from "cloudflare:test";
 import { Store } from "../src/store";
 
 function result(overrides: Record<string, unknown> = {}) {
 	const base = {
-		workersInvocationsAdaptive: [{ sum: { requests: 1 } }],
+		workersInvocationsAdaptive: [{ sum: { requests: 1, cpuTimeUs: 2_000 } }],
 		durableObjectsInvocationsAdaptiveGroups: [{ sum: { requests: 2 } }],
 		durableObjectsPeriodicGroups: [{ sum: { duration: 3, rowsRead: 4, rowsWritten: 5 } }],
 		durableObjectsStorageGroups: [{ max: { storedBytes: 6 } }],
@@ -23,6 +24,14 @@ function result(overrides: Record<string, unknown> = {}) {
 		monthR2Operations: [{ dimensions: { actionType: "PutObject" }, sum: { requests: 30 } }, { dimensions: { actionType: "HeadObject" }, sum: { requests: 50 } }],
 	};
 	return { data: { viewer: { accounts: [{ ...base, ...overrides }] } } };
+}
+
+/** Today and the month so far both at `requests` Worker requests: past the inclusion from 10 million. */
+function workerRequests(requests: number, monthRequests = requests) {
+	return {
+		workersInvocationsAdaptive: [{ sum: { requests, cpuTimeUs: 0 } }],
+		monthWorkers: [{ sum: { requests: monthRequests, cpuTimeUs: 0 } }],
+	};
 }
 
 /** The log bytes the plan estimates for a month's worker requests and Durable Object invocations. */
@@ -72,18 +81,30 @@ describe("account usage snapshots", () => {
 		}
 	});
 
-	it("stops when any shared allowance reaches the configured ratio", () => {
-		const snapshot = accountUsageSnapshotFromResult(result({
-			workersInvocationsAdaptive: [{ sum: { requests: ACCOUNT_USAGE_POLICY.daily.workerRequests * ACCOUNT_USAGE_POLICY.stopRatio } }],
-		}), Date.now());
-		expect(snapshot.stop).toBe(true);
+	it("stops on a daily share on a plan that fails closed, and on dollars on one that bills", () => {
+		const share = ACCOUNT_USAGE_POLICY.daily.workerRequests;
+		const busy = accountUsageSnapshotFromResult(result(workerRequests(share * 3)), Date.now());
+		if (!billCap()) return expect(busy.stop).toBe(true);
+		// Three days' share in one day, inside the month's inclusion: $0, no stop.
+		expect(busy).toMatchObject({ stop: false, exceeded: [] });
+		expect(snapshotBill(busy)).toMatchObject({ monthUsd: 0, dayUsd: 0 });
+		// 30 million today: 20 million past the inclusion, $6, and logs still
+		// inside theirs. Over the day's $5, under the month's $25.
+		const day = accountUsageSnapshotFromResult(result(workerRequests(30_000_000)), Date.now());
+		expect(day).toMatchObject({ stop: true, exceeded: ["day overage $6 over $5"] });
+		// The same month, but only a million of it today: no day overage.
+		const earlier = accountUsageSnapshotFromResult(result(workerRequests(1_000_000, 30_000_000)), Date.now());
+		expect(snapshotBill(earlier)).toMatchObject({ monthUsd: 6, dayUsd: 0.3 });
+		expect(earlier.stop).toBe(false);
+		// A cap of $0 stops at the first billed unit.
+		expect(exceededAllowances(earlier, { dayUsd: 0, monthUsd: 0 })).toEqual(["day overage $0.30 over $0", "month overage $6 over $0"]);
 	});
 
-	it("reads usage since the start of the month and stops at the monthly ratio", () => {
-		const { monthly, monthlyStopRatio: ratio } = ACCOUNT_USAGE_POLICY;
+	it("reads usage since the start of the month and prices it", () => {
+		const { monthly } = ACCOUNT_USAGE_POLICY;
 		const snapshot = accountUsageSnapshotFromResult(result(), Date.parse("2026-09-21T12:00:00Z"));
 		// A plan that fails closed at its allowances, like Free, reads no month.
-		if (!monthly || !ratio) return expect(snapshot.month).toBeUndefined();
+		if (!monthly) return expect(snapshot.month).toBeUndefined();
 		expect(snapshot.month).toEqual({
 			month: "2026-09",
 			workerRequests: 10,
@@ -95,28 +116,25 @@ describe("account usage snapshots", () => {
 			logBytes: logBytesFor(10, 60),
 			...(ACCOUNT_USAGE_POLICY.r2 ? { r2: { classAOperations: 30, classBOperations: 50 } } : {}),
 		});
+		expect(snapshot).toMatchObject({ workerCpuMs: 2, logBytes: logBytesFor(1, 2) });
 		expect(exceededAllowances(snapshot)).toEqual([]);
-		// Well under the daily share, but past the month's ratio.
-		const overMonth = accountUsageSnapshotFromResult(result({
-			monthWorkers: [{ sum: { requests: 1, cpuTimeUs: monthly.workerCpuMs * ratio * 1_000 } }],
-		}), Date.now());
-		expect(overMonth.stop).toBe(true);
-		expect(exceededAllowances(overMonth)).toEqual(["monthly.workerCpuMs"]);
-		// Log bytes are estimated from invocations, sampled: a month of entry
-		// Worker requests that logs its ratio of the allowance stops.
-		const estimate = ACCOUNT_USAGE_POLICY.logEstimate!;
-		const floodRequests = Math.ceil((monthly.logBytes * ratio) / (estimate.workerEventBytes * estimate.sampleRate));
-		const overLogs = accountUsageSnapshotFromResult(result({ monthWorkers: [{ sum: { requests: floodRequests, cpuTimeUs: 0 } }] }), Date.now());
-		expect(overLogs.month?.logBytes).toBeGreaterThanOrEqual(monthly.logBytes * ratio);
-		expect(exceededAllowances(overLogs)).toContain("monthly.logBytes");
-		const overDay = accountUsageSnapshotFromResult(result({
-			workersInvocationsAdaptive: [{ sum: { requests: ACCOUNT_USAGE_POLICY.daily.workerRequests } }],
-		}), Date.now());
-		expect(exceededAllowances(overDay)).toEqual(["daily.workerRequests"]);
 		expect(() => accountUsageSnapshotFromResult(result({ monthWorkers: undefined }), Date.now())).toThrow();
+		if (!billCap()) return;
+		// CPU earlier in the month: 1.3 billion ms past the inclusion, $26.
+		const overMonth = accountUsageSnapshotFromResult(result({
+			monthWorkers: [{ sum: { requests: 1, cpuTimeUs: (monthly.workerCpuMs + 1_300_000_000) * 1_000 } }],
+		}), Date.now());
+		expect(overMonth).toMatchObject({ stop: true, exceeded: ["month overage $26 over $25"] });
+		expect(snapshotBill(overMonth)?.items).toEqual([["workerCpuMs", 26]]);
+		// Log bytes are estimated from invocations, sampled, and priced by the GB.
+		const estimate = ACCOUNT_USAGE_POLICY.logEstimate!;
+		const floodRequests = Math.ceil((monthly.logBytes * 2) / (estimate.workerEventBytes * estimate.sampleRate));
+		const overLogs = accountUsageSnapshotFromResult(result({ monthWorkers: [{ sum: { requests: floodRequests, cpuTimeUs: 0 } }] }), Date.now());
+		// Twice the 50 GB included, rounded up to the next GB past it: 51 GB, $12.75.
+		expect(snapshotBill(overLogs)?.items).toContainEqual(["logBytes", 12.75]);
 	});
 
-	it("counts R2 operations by class, free ones aside, and stops at R2's shares", () => {
+	it("counts R2 operations by class, free ones aside, and prices them", () => {
 		const r2 = ACCOUNT_USAGE_POLICY.r2;
 		const snapshot = accountUsageSnapshotFromResult(result(), Date.now());
 		if (!r2) return expect(snapshot.r2).toBeUndefined();
@@ -124,16 +142,16 @@ describe("account usage snapshots", () => {
 		expect(snapshot.r2).toEqual({ classAOperations: 4, classBOperations: 5, storedBytes: 111 });
 		expect(snapshot.month?.r2).toEqual({ classAOperations: 30, classBOperations: 50 });
 		expect(exceededAllowances(snapshot)).toEqual([]);
-		const reads = accountUsageSnapshotFromResult(result({
-			r2Operations: [{ dimensions: { actionType: "GetObject" }, sum: { requests: Math.ceil(r2.classBOperationsMonthly / 31) } }],
-		}), Date.now());
-		expect(exceededAllowances(reads)).toEqual(["daily.r2ClassBOperations"]);
+		if (!billCap()) return;
+		// Six million Class A operations this month, five past the inclusion: $22.50.
 		const month = accountUsageSnapshotFromResult(result({
-			monthR2Operations: [{ dimensions: { actionType: "PutObject" }, sum: { requests: r2.classAOperationsMonthly / 2 } }],
+			monthR2Operations: [{ dimensions: { actionType: "PutObject" }, sum: { requests: r2.classAOperationsMonthly * 6 } }],
 		}), Date.now());
-		expect(exceededAllowances(month)).toEqual(["monthly.r2ClassAOperations"]);
-		const stored = accountUsageSnapshotFromResult(result({ r2Storage: [{ max: { payloadSize: r2.storedBytes, metadataSize: 0 } }] }), Date.now());
-		expect(exceededAllowances(stored)).toEqual(["r2StoredBytes"]);
+		expect(snapshotBill(month)?.items).toEqual([["r2ClassAOperations", 22.5]]);
+		expect(month.stop).toBe(false);
+		// Storage past the inclusion is priced as if it stayed all month.
+		const stored = accountUsageSnapshotFromResult(result({ r2Storage: [{ max: { payloadSize: r2.storedBytes + 1, metadataSize: 0 } }] }), Date.now());
+		expect(snapshotBill(stored)?.items).toEqual([["storage", 0.015]]);
 	});
 
 	it("queries today and the month so far", async () => {
@@ -175,18 +193,20 @@ describe("account usage snapshots", () => {
 		const nextMonth = Date.parse("2026-10-01T00:10:00Z");
 		expect(accountUsageStops(null, sampled)).toBe(false);
 		expect(accountUsageStops(accountUsageSnapshotFromResult(result(), sampled), sampled)).toBe(false);
-		const overDay = accountUsageSnapshotFromResult(result({
-			workersInvocationsAdaptive: [{ sum: { requests: ACCOUNT_USAGE_POLICY.daily.workerRequests } }],
-		}), sampled);
+		const overDay = accountUsageSnapshotFromResult(result(billCap() ? workerRequests(30_000_000) : workerRequests(ACCOUNT_USAGE_POLICY.daily.workerRequests)), sampled);
 		expect(accountUsageStops(overDay, sampled)).toBe(true);
 		expect(accountUsageStops(overDay, nextDay)).toBe(false);
-		const { monthly, monthlyStopRatio: ratio } = ACCOUNT_USAGE_POLICY;
-		if (!monthly || !ratio) return;
-		const overMonth = accountUsageSnapshotFromResult(result({
-			monthWorkers: [{ sum: { requests: 1, cpuTimeUs: monthly.workerCpuMs * ratio * 1_000 } }],
-		}), sampled);
+		if (!billCap()) return;
+		const overMonth = accountUsageSnapshotFromResult(result(workerRequests(1, 100_000_000)), sampled);
+		expect(overMonth.exceeded).toEqual(["month overage $35 over $25"]);
 		expect(accountUsageStops(overMonth, nextDay)).toBe(true);
 		expect(accountUsageStops(overMonth, nextMonth)).toBe(false);
+		// A snapshot saved before its reasons were kept is judged again: a
+		// month past its cap still stops, a share-based day stop no longer does.
+		const { exceeded: _saved, ...legacy } = overMonth;
+		expect(accountUsageStops(legacy, nextDay)).toBe(true);
+		const { exceeded: _none, ...shareStop } = accountUsageSnapshotFromResult(result(workerRequests(ACCOUNT_USAGE_POLICY.daily.workerRequests)), sampled);
+		expect(accountUsageStops({ ...shareStop, stop: true }, sampled)).toBe(false);
 	});
 
 	it("persists the snapshot in existing Durable Object metadata", async () => {
@@ -246,13 +266,17 @@ describe("account usage monitor", () => {
 		expect(fetcher).toHaveBeenCalledTimes(2);
 	});
 
-	it("stops on a reading past an allowance, and closes what is open", async () => {
+	it("stops on a reading past an allowance, and closes what is open once, as it starts", async () => {
 		const { usage, onStop } = monitor({
-			overrides: { workersInvocationsAdaptive: [{ sum: { requests: ACCOUNT_USAGE_POLICY.daily.workerRequests } }] },
+			overrides: billCap() ? workerRequests(100_000_000) : workerRequests(ACCOUNT_USAGE_POLICY.daily.workerRequests),
 		});
 		expect(usage.stops(start)).toBe(false);
 		await usage.refresh(start, false);
 		expect(usage.stops(start)).toBe(true);
+		expect(onStop).toHaveBeenCalledOnce();
+		// A later reading that still stops (an admin's `/status`) closes nothing more.
+		await usage.refresh(start + ACCOUNT_USAGE_POLICY.minimumRefreshIntervalMs, true);
+		expect(usage.stops(start + ACCOUNT_USAGE_POLICY.minimumRefreshIntervalMs)).toBe(true);
 		expect(onStop).toHaveBeenCalledOnce();
 	});
 

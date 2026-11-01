@@ -74,83 +74,8 @@ it('reopens accounting a storage failure left uncertain on the next wake, chargi
 	});
 });
 
-it('persists an overrun stop across object eviction', async () => {
-	const stub = env.DEMO.getByName('budget-overrun-restart');
-	const now = Date.now() + 2_000;
-	await runInDurableObject(stub, (_instance, state) => {
-		const store = new Store(state, {}, { now: () => now });
-		store.initialize();
-		state.storage.transactionSync(() => {
-			for (let index = 1; index <= 100; index += 1) {
-				state.storage.sql.exec(
-					`INSERT INTO rooms (room_id, parent_room_id, created_log_id, record_log_id, latest_log_id, fields_json, created_ms, updated_ms)
-					 VALUES (?, 'general', ?, ?, ?, ?, ?, ?)`,
-					`budget-thread-${index}`, index, index, index, JSON.stringify({ title: `Thread ${index}` }), now, now,
-				);
-			}
-		});
-
-		// The outer boundary deliberately reserves no operation rows while the
-		// nested room read is bounded but larger than that reservation. The guard
-		// latches unsafe and persists the marker before returning the error.
-		expect(() => store.withMeter('foreground', { reads: 0, writes: 0 }, () => store.listRooms(now), now))
-			.toThrow('storage cost exceeded its reservation');
-		expect(store.accountingStatus().unsafe).toBe(true);
-	});
-
-	await evictDurableObject(stub);
-	await runInDurableObject(stub, (_instance, state) => {
-		const restarted = new Store(state, {}, { now: () => now });
-		restarted.initialize();
-		expect(restarted.accountingStatus().unsafe).toBe(true);
-	});
-});
-
-it('clears a persisted accounting stop once per recovery value', async () => {
-	const stub = env.DEMO.getByName('budget-recovery');
-	const now = Date.now() + 3_000;
-	const marker = (state: DurableObjectState) => state.storage.sql.exec<{ value: string }>(
-		"SELECT value FROM _meta WHERE key = 'accounting_unsafe' LIMIT 1",
-	).one().value;
-	await runInDurableObject(stub, (_instance, state) => {
-		const store = new Store(state, {}, { now: () => now });
-		store.initialize();
-		state.storage.sql.exec("UPDATE _meta SET value = '1' WHERE key = 'accounting_unsafe'");
-	});
-
-	await evictDurableObject(stub);
-	await runInDurableObject(stub, (_instance, state) => {
-		// Without a recovery value the stop stays.
-		const latched = new Store(state, {}, { now: () => now });
-		latched.initialize();
-		expect(latched.accountingStatus().unsafe).toBe(true);
-
-		const before = state.storage.sql.exec<{ maintenance_writes: number }>(
-			'SELECT maintenance_writes FROM resource_budgets ORDER BY day DESC LIMIT 1',
-		).one().maintenance_writes;
-		const recovered = new Store(state, { accountingRecovery: 'first' }, { now: () => now });
-		recovered.initialize();
-		expect(recovered.accountingStatus().unsafe).toBe(false);
-		expect(marker(state)).toBe('0');
-		expect(() => recovered.getRoomState()).not.toThrow();
-		const after = state.storage.sql.exec<{ maintenance_writes: number }>(
-			'SELECT maintenance_writes FROM resource_budgets ORDER BY day DESC LIMIT 1',
-		).one().maintenance_writes;
-		expect(after).toBeGreaterThan(before);
-
-		// A stop latched later is not cleared by the value already used.
-		state.storage.sql.exec("UPDATE _meta SET value = '1' WHERE key = 'accounting_unsafe'");
-		const again = new Store(state, { accountingRecovery: 'first' }, { now: () => now });
-		again.initialize();
-		expect(again.accountingStatus().unsafe).toBe(true);
-		expect(() => again.getRoomState()).toThrow('storage accounting is unsafe');
-
-		const next = new Store(state, { accountingRecovery: 'second' }, { now: () => now });
-		next.initialize();
-		expect(next.accountingStatus().unsafe).toBe(false);
-		expect(marker(state)).toBe('0');
-	});
-});
+// An overrun no longer stops the server: test/tiers.integration.test.ts
+// covers how it is observed, the breaker, the pause and their persistence.
 
 it('writes an async operation\'s reservation before it awaits, and status writes the budget row once', async () => {
 	await runInDurableObject(env.DEMO.getByName('budget-async-and-status'), async (_instance, state) => {

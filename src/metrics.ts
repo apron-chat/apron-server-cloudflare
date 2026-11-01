@@ -14,12 +14,20 @@ export type MetricEvent =
 	| "alarm"
 	/** Pushes delivered: `sent`, `failed` or `gone`, valued by count. */
 	| "push"
-	/** Storage accounting closed (`overrun` or `uncertain`) or reopened (`recovered`). */
+	/** Storage accounting overran (`overrun`, observed), closed on a storage failure (`uncertain`), or reopened (`recovered`); with what happened where known. */
 	| "accounting"
 	/** An admin alert posted (notifyAdmins): `pushed` or `not_pushed`, valued by admins mentioned. */
 	| "admins_notified"
-	/** The edge stop turned on: `guard` or `flood`, and what was reached. */
-	| "edge_stop";
+	/** The edge stop turned on (`guard` or `flood`, and what was reached) or off (`lifted`). */
+	| "edge_stop"
+	/** The server changed tier (Store tiers, ApronDemoServer.evaluateTier): the new tier and the one before. */
+	| "tier"
+	/** A user tripped a long refusal (ApronDemoServer.noteTrip): its trigger and the method refused. */
+	| "throttle"
+	/** The attack pause (ApronDemoServer.pauseForAttack): its trigger (`flood`, `burn`, `breakers`), valued by the hold in minutes. */
+	| "attack"
+	/** A heavy burn of mostly admitted traffic alerted the admins, valued by shadow dollars an hour. */
+	| "burn";
 
 export function recordMetric(dataset: AnalyticsEngineDataset | undefined, event: MetricEvent, details: readonly string[] = [], value = 1): void {
 	if (!dataset) return;

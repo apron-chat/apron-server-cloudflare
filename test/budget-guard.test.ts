@@ -4,7 +4,8 @@ import worker from "../src/index";
 import * as guard from "../src/budget-guard";
 import * as notifier from "../src/notify";
 import { ACCOUNT_USAGE_POLICY as POLICY, PLAN } from "../src/budget";
-import { EDGE_STOP_RULE_REF, readEdgeStop, resetFloodWatch, runBudgetGuard, watchForFlood } from "../src/budget-guard";
+import { billCap } from "../src/pricing";
+import { EDGE_STOP_RULE_REF, readEdgeStop, resetFloodWatch, ruleHoldUntil, runBudgetGuard, setAttackStop, watchForFlood } from "../src/budget-guard";
 
 const env = { ACCOUNT_ID: "account", ACCOUNT_ANALYTICS_TOKEN: "analytics", ZONE_ID: "zone", EDGE_STOP_TOKEN: "edge" };
 const rule = { id: "rule-1", ref: EDGE_STOP_RULE_REF, action: "block", expression: 'http.host eq "server.apron.chat"', description: "Apron: budget stop" };
@@ -12,7 +13,7 @@ const rule = { id: "rule-1", ref: EDGE_STOP_RULE_REF, action: "block", expressio
 function usage(workerRequests = 1) {
 	return {
 		data: { viewer: { accounts: [{
-			workersInvocationsAdaptive: [{ sum: { requests: workerRequests } }],
+			workersInvocationsAdaptive: [{ sum: { requests: workerRequests, cpuTimeUs: 1 } }],
 			durableObjectsInvocationsAdaptiveGroups: [{ sum: { requests: 1 } }],
 			durableObjectsPeriodicGroups: [{ sum: { duration: 1, rowsRead: 1, rowsWritten: 1 } }],
 			durableObjectsStorageGroups: [{ max: { storedBytes: 1 } }],
@@ -46,16 +47,31 @@ function api({ workerRequests = 1, enabled = false, rules, analyticsStatus = 200
 	return { fetcher: fetcher as unknown as typeof fetch, updates, calls: fetcher.mock.calls };
 }
 
-const overDaily = POLICY.daily.workerRequests;
+// A day and month of 100 million Worker requests, all of it today: 90
+// million past the inclusion ($27), and their sampled logs, about 82 GB
+// against 50 GB included ($8 billed, $7.98 prorated for the day's stop).
+const overDaily = 100_000_000;
 
 describe("budget guard", () => {
-	it("turns the edge stop on once usage reaches an allowance, keeping the rule as it was", async () => {
+	it("turns the edge stop on once the overage passes the bill cap, keeping the rule as it was", async () => {
 		const { fetcher, updates } = api({ workerRequests: overDaily });
-		expect(await runBudgetGuard(env, Date.now(), fetcher)).toEqual({ outcome: "changed", stop: true, exceeded: ["daily.workerRequests"] });
+		expect(await runBudgetGuard(env, Date.now(), fetcher)).toEqual({ outcome: "changed", stop: true, exceeded: ["day overage $34.98 over $5", "month overage $35 over $25"] });
 		expect(updates).toEqual([{ ref: rule.ref, action: rule.action, expression: rule.expression, description: rule.description, enabled: true }]);
 	});
 
-	it("turns the edge stop off once usage is back under every allowance", async () => {
+	it.runIf(billCap())("runs on through a day past its daily share that costs nothing, and follows BILL_CAP_*", async () => {
+		// Three days' share of requests in one, still inside the month's inclusion.
+		const busy = api({ workerRequests: POLICY.daily.workerRequests * 3 });
+		expect(await runBudgetGuard(env, Date.now(), busy.fetcher)).toEqual({ outcome: "unchanged", stop: false, exceeded: [] });
+		const raised = api({ workerRequests: overDaily });
+		expect(await runBudgetGuard({ ...env, BILL_CAP_DAY: "40", BILL_CAP_MONTH: "40" }, Date.now(), raised.fetcher)).toEqual({ outcome: "unchanged", stop: false, exceeded: [] });
+		const lowered = api({ workerRequests: overDaily });
+		expect(await runBudgetGuard({ ...env, BILL_CAP_DAY: "40", BILL_CAP_MONTH: "34.5" }, Date.now(), lowered.fetcher)).toMatchObject({ outcome: "changed", stop: true, exceeded: ["month overage $35 over $34.50"] });
+		const invalid = api({ workerRequests: overDaily });
+		expect(await runBudgetGuard({ ...env, BILL_CAP_DAY: "lots" }, Date.now(), invalid.fetcher)).toEqual({ outcome: "usage_failed" });
+	});
+
+	it("turns the edge stop off once the overage is back under the cap", async () => {
 		const { fetcher, updates } = api({ enabled: true });
 		expect(await runBudgetGuard(env, Date.now(), fetcher)).toMatchObject({ outcome: "changed", stop: false });
 		expect(updates).toEqual([expect.objectContaining({ enabled: false })]);
@@ -78,6 +94,38 @@ describe("budget guard", () => {
 		const old = api({ rules: [{ ...rule, enabled: true, last_updated: new Date(now - hold).toISOString() }] });
 		expect(await runBudgetGuard(env, now, old.fetcher)).toMatchObject({ outcome: "changed", stop: false });
 		expect(old.updates).toEqual([expect.objectContaining({ enabled: false })]);
+	});
+
+	it("holds an attack pause's edge stop until its hold ends, whatever the bill, then clears it", async () => {
+		const now = Date.parse("2026-11-02T12:00:00Z");
+		const until = now + 30 * 60_000;
+		const on = api();
+		expect(await setAttackStop(env, until, "flood", now, on.fetcher)).toBe("changed");
+		expect(on.updates).toEqual([expect.objectContaining({ enabled: true, description: `${rule.description} [attack hold until 2026-11-02T12:30:00.000Z]` })]);
+		const held = { ...rule, enabled: true, description: `${rule.description} [attack hold until 2026-11-02T12:30:00.000Z]`, last_updated: new Date(now - 2 * 60 * 60_000).toISOString() };
+		expect(ruleHoldUntil(held.description)).toBe(until);
+		// A longer hold extends it on a rule already on; a shorter one changes nothing.
+		const extend = api({ rules: [held] });
+		expect(await setAttackStop(env, until + 60_000, "burn", now, extend.fetcher)).toBe("changed");
+		expect(extend.updates).toEqual([expect.objectContaining({ enabled: true, description: `${rule.description} [attack hold until 2026-11-02T12:31:00.000Z]` })]);
+		expect(await setAttackStop(env, until - 60_000, "burn", now, api({ rules: [held] }).fetcher)).toBe("unchanged");
+		// The guard keeps it on through the hold, though the bill is under its cap.
+		const during = api({ rules: [held] });
+		expect(await runBudgetGuard(env, until - 1, during.fetcher)).toMatchObject({ outcome: "held", stop: false });
+		expect(during.updates).toEqual([]);
+		const after = api({ rules: [held] });
+		expect(await runBudgetGuard(env, until, after.fetcher)).toMatchObject({ outcome: "changed", stop: false });
+		expect(after.updates).toEqual([expect.objectContaining({ enabled: false, description: rule.description })]);
+		expect(await readEdgeStop(env, api({ rules: [held] }).fetcher)).toMatchObject({ state: "on", holdUntil: until });
+		expect(await setAttackStop({ ...env, ZONE_ID: undefined }, until, "flood", now, on.fetcher)).toBe("unconfigured");
+		// A rule with no description, trimmed by the API, still carries its hold.
+		const bare = api({ rules: [{ ...rule, description: undefined }] });
+		expect(await setAttackStop(env, until, "flood", now, bare.fetcher)).toBe("changed");
+		expect(bare.updates).toEqual([expect.objectContaining({ description: "[attack hold until 2026-11-02T12:30:00.000Z]" })]);
+		expect(ruleHoldUntil("[attack hold until 2026-11-02T12:30:00.000Z] ")).toBe(until);
+		// ATTACK_PAUSE=false lifts it at once, hold or not.
+		const off = api({ rules: [held] });
+		expect(await runBudgetGuard({ ...env, ATTACK_PAUSE: "false" }, until - 60_000, off.fetcher)).toMatchObject({ outcome: "changed", stop: false });
 	});
 
 	it("reads a rule without enabled as enabled", async () => {
@@ -115,14 +163,15 @@ describe("budget guard", () => {
 		} finally { run.mockRestore(); }
 	});
 
-	it("tells the operators when its run turns the stop on, and only then", async () => {
+	it("tells the operators when its run turns the stop on or off, and only then", async () => {
 		const notify = vi.spyOn(notifier, "notifyTrigger").mockResolvedValue(undefined);
 		const run = vi.spyOn(guard, "runBudgetGuard");
 		try {
-			const cases: Array<[Awaited<ReturnType<typeof runBudgetGuard>>, boolean]> = [
-				[{ outcome: "changed", stop: true, exceeded: ["monthly.workerRequests"] }, true],
-				[{ outcome: "changed", stop: false, exceeded: [] }, false],
-				[{ outcome: "unchanged", stop: true, exceeded: ["monthly.workerRequests"] }, false],
+			const cases: Array<[Awaited<ReturnType<typeof runBudgetGuard>>, unknown]> = [
+				[{ outcome: "changed", stop: true, exceeded: ["monthly.workerRequests"] }, { kind: "edge_stop", exceeded: ["monthly.workerRequests"] }],
+				[{ outcome: "changed", stop: false, exceeded: [] }, { kind: "edge_stop_lifted" }],
+				[{ outcome: "unchanged", stop: true, exceeded: ["monthly.workerRequests"] }, undefined],
+				[{ outcome: "held", stop: false, exceeded: [] }, undefined],
 			];
 			for (const [result, told] of cases) {
 				notify.mockClear();
@@ -130,7 +179,7 @@ describe("budget guard", () => {
 				const ctx = createExecutionContext();
 				worker.scheduled(createScheduledController({ cron: "* * * * *", scheduledTime: 2_000 }), testEnv, ctx);
 				await waitOnExecutionContext(ctx);
-				if (told) expect(notify).toHaveBeenCalledWith({ kind: "edge_stop", exceeded: ["monthly.workerRequests"] }, expect.objectContaining({ admins: expect.any(Function) }));
+				if (told) expect(notify).toHaveBeenCalledWith(told, expect.objectContaining({ admins: expect.any(Function) }));
 				else expect(notify).not.toHaveBeenCalled();
 			}
 		} finally { run.mockRestore(); notify.mockRestore(); }
@@ -221,8 +270,9 @@ describe.runIf(PLAN.edgeStop)("flood trip", () => {
 	});
 
 	it("is sized so ordinary traffic cannot trip it", () => {
-		// A quarter of a day's admissions, arriving at one location in one minute, stays under it.
-		expect(policy.floodRequestsPerColoMinute).toBeGreaterThan(PLAN.limits.connectionAdmissionsPerDay / 4);
+		// Ten times what one location may send the object in a minute (its
+		// admissions are capped there), leaving room for probes and media.
+		expect(policy.floodRequestsPerColoMinute).toBeGreaterThan(PLAN.admission.objectRequestsPerLocationMinute * 10);
 		expect(policy.holdSeconds).toBeGreaterThanOrEqual(15 * 60);
 	});
 });

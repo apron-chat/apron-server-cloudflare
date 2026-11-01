@@ -104,11 +104,26 @@ what the plan includes. Incoming WebSocket messages, which analytics report as
 bills them, and as a whole one on Free. On Paid it also reads usage since the
 start of the calendar month against the plan's `monthly` allowances.
 
-At 90% of any daily allowance or of stored bytes, or `monthlyStopRatio` of a
-monthly allowance, the object persists a stop, rejects new connections, and
-closes live sockets. A daily stop holds for that UTC day, and a monthly one
-for that calendar month, even while a refresh in the new day is pending or
-failing. This is an early-stop signal, not an exact remaining-quota meter:
+On a plan that fails closed (Free), the stop is at 90% of any daily
+allowance or of stored bytes. On a plan that bills past its inclusions
+(Paid), the stop is in dollars: `src/pricing.ts` prices the month's usage
+past each inclusion at Cloudflare's list prices (rounded up to whole billing
+units, as Cloudflare does), and the server stops when the overage added
+today passes `BILL_CAP_DAY` (default $5) or the month's passes
+`BILL_CAP_MONTH` (default $25), on top of the $5 plan. Today's share is
+prorated, so a day that only crosses into a billing unit (a whole $4.50 of
+R2 Class A, as Cloudflare rounds it) counts what it used of it. A day well past its
+31st share of the month costs nothing while the month stays inside its
+inclusions, so a busy day no longer stops the server. Set either variable
+in `wrangler.production.toml` as a dollar amount (`"0"` stops at the first
+billed unit); a value that is not one fails startup.
+
+At its stop line the object persists a stop, rejects new connections, and
+closes live sockets once. A daily stop holds for that UTC day, and a monthly
+one (`monthly.*` on Free, the month's bill cap on Paid) for that calendar
+month, even while a refresh in the new day is pending or failing. `/status`
+shows the estimated bill for the month ($5 plus the overage, by resource),
+the overage added today, and both caps. This is an early-stop signal, not an exact remaining-quota meter:
 analytics lag, sampling, and other account workloads can still cause an
 earlier or later platform limit.
 
@@ -132,23 +147,27 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
 - The production Worker's cron trigger runs it every minute. It reads the
   account's usage for today and for the calendar month so far, the same way
   the account-usage stop does (above).
-- While usage has reached 90% of any daily share, or `monthlyStopRatio` (one
-  half) of any monthly allowance, it turns on the zone custom rule
-  `apron_budget_stop`, which blocks `server.apron.chat` (and, with uploads,
-  `media.apron.chat`) at the edge. Blocked
-  requests never invoke the Worker and are not billed. It turns the rule off
-  once usage is back under every allowance: at the next UTC day for a daily
-  share, or the next month for a monthly one. It touches no other rule, so
+- While the estimated overage passes the bill cap (`BILL_CAP_DAY` for the
+  day, `BILL_CAP_MONTH` for the month; see the account-usage stop above), it
+  turns on the zone custom rule `apron_budget_stop`, which blocks
+  `server.apron.chat` (and, with uploads, `media.apron.chat`) at the edge.
+  Blocked requests never invoke the Worker and are not billed. It turns the
+  rule off once the overage is back under both caps: at the next UTC day for
+  the day's cap, or the next month for the month's. The worst a billing
+  cycle can cost is the plan plus two months' caps ($55 at the defaults),
+  plus what runs up during the minute or so analytics lag behind. It touches no other rule, so
   `apron_admission_off` stays yours to use by hand.
 - **Admin alert.** When the guard or the flood trip (below) turns the rule
-  on, and when a cost overrun closes storage accounting, the server posts a
-  message in `general` as the `admin` user that mentions and pushes to every
-  user with the `admin` role (up to `wakesPerMessage`, 10); see
+  on or off, when the server changes tier or an action's breaker opens or
+  closes (see [Server tiers](#server-tiers)), and at the day's first storage
+  overrun, the server posts a public message in `general` as the `admin`
+  user that mentions and pushes to every user with the `admin` role (up to
+  `wakesPerMessage`, 10); see
   [SPEC section 10](../SPEC.md#10-degradation-and-public-demo-behavior).
   Give yourself the role (`/admin <user_id>`) and allow notifications in your
   client to get it on your phone; muting `general` or choosing `dnd`
-  silences it. Nothing is sent when the stop lifts. An alert that fails is
-  logged (`trigger_notice_failed`) and never undoes the stop.
+  silences it. An alert that fails is logged (`trigger_notice_failed`) and
+  never undoes what it tells of.
 - The monthly allowances are Worker requests, Worker CPU, Durable Object
   requests and duration, SQL rows read and written, and Workers Logs bytes
   (estimated; below), plus R2's free tier for uploads: Class A and Class B operations (each day
@@ -186,10 +205,13 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   unsampled data point per event worth counting: stale connections closed
   (`stale_close`: `pinged` or `unpinged`, and the origin), alarms (`alarm`:
   `light` for status changes only, or `full`), pushes delivered (`push`:
-  `sent`, `failed` or `gone`), accounting closing and reopening
-  (`accounting`: `overrun`, `uncertain` or `recovered`; the log line
-  `accounting_closed` carries what failed), admin alerts (`admins_notified`)
-  and the edge stop turning on (`edge_stop`: `guard` or `flood`). Each point
+  `sent`, `failed` or `gone`), storage overruns and accounting closing and
+  reopening (`accounting`: `overrun` with the operation and its rows, as the
+  log line `accounting_overrun` says; `uncertain` with what failed, as
+  `accounting_closed` says; or `recovered`), tier changes (`tier`: the new
+  tier and the one before), throttle trips (`throttle`: the trigger and the
+  method refused; see Server tiers), admin alerts (`admins_notified`) and the edge
+  stop turning on or off (`edge_stop`: `guard` or `flood`, or `lifted`). Each point
   is `blob1` the event, `blob2` and `blob3` its details and `double1` its
   value. Writing never awaits or throws, and without the binding nothing is
   written. Workers Paid includes 10 million data points a month; this server
@@ -694,22 +716,136 @@ implementation and recalibrating its resource model.
 | `ZONE_ID` | The zone holding `apron_budget_stop`; a Wrangler var (see [Budget guard](#budget-guard)) |
 | `EDGE_STOP_TOKEN` | Secret: an API token with Zone WAF edit permission on `ZONE_ID`, which the budget guard and the flood trip use |
 | `ADMISSION_OFF` | `true` or `false`: operator admission switch; `true` rejects new sockets in the entry Worker with 503 before the limiter or DO call; existing sockets remain subject to DO budgets |
-| `ACCOUNTING_RECOVERY` | 1 to 64 letters, digits, `.`, `_`, `:` or `-`: reopens a persisted accounting stop after a reservation overrun (see below) |
 | `ENVIRONMENT` | Set to `development` to enable local origin defaults when `ALLOWED_ORIGINS` and `RP_ORIGINS` are omitted |
 | `NODE_ENV` | Set to `test` to enable the same local origin defaults for tests; production-like deployments must configure origins explicitly |
 
-**Accounting recovery.** A reservation overrun closes storage accounting for
-good: every connection is refused with `Server closed: storage accounting
-stopped after a cost overrun, until an operator reopens it`, and the admins
-are alerted. To reopen it, set `ACCOUNTING_RECOVERY` to a value it has not
-used before, in `wrangler.production.toml` or once with
-`npm run deploy -- --var ACCOUNTING_RECOVERY:<value>`, and deploy. The
-Durable Object clears the stop when it next starts and logs
-`accounting_unsafe_cleared`; leaving a used value set changes nothing, so a
-stop latched later needs a new value. What the failure left unwritten is not
-charged. A stop left by a storage failure (`Server storage is unavailable;
-try again shortly`) needs none of this: it clears itself once storage works
-(`accounting_uncertain_recovered`).
+### Server tiers
+
+The server refuses work in tiers, each scoped and timed by what fires it,
+and each lifting by itself (`src/store.ts`, `ApronDemoServer.currentTier`):
+
+| Tier | Fires on | Does | Lifts |
+| --- | --- | --- | --- |
+| open | | Everything works | |
+| degraded | Today's foreground SQL reads or writes, or frames, at `DEGRADE_SHARE` (70%) of their ceiling | Live text, uploads and older history (`history` with `before`) get `retry_after` (`data.reason` `degraded`); chat works | UTC midnight |
+| exhausted | One of those at 99% (`EXHAUSTED_SHARE`; the ledger refuses work just short of 100%) | New work is refused with `retry_after` until the reset; open connections stay; admins' frames and `/status` still answer | UTC midnight |
+| account stop | The estimated overage past `BILL_CAP_DAY` ($5) today or `BILL_CAP_MONTH` ($25) this month (the account-usage stop; on Free, 90% of a daily allowance) | 503 and sockets closed once, as it starts | The day's or month's end |
+| paused (attack) | The attack pause (below): traffic burning $1 an hour or more and mostly refused, or breakers open on three actions | Everything refused with 503, every socket closed (admins' too), and the edge stop turned on for the hold | When the hold ends: 30 minutes, doubling with each pause that UTC day, at most 4 hours; at once with `ATTACK_PAUSE=false` |
+
+Every change of tier is announced to the admins (see the admin alert above),
+going up and coming down, with why. It is evaluated at most once a minute on
+frames and alarms, and at once after an overrun or a fresh usage reading, so
+a change while nobody is connected is told at the next event. The edge stop
+(budget guard) sits past these and is announced on and off by the guard.
+
+**Attack pause.** The object prices recent traffic in *shadow dollars*:
+each billed event at its overage rate, as if every inclusion were spent
+(`src/burn.ts`). It counts its own fetches (each an entry Worker request
+and an object request), WebSocket messages (a twentieth of a request),
+alarms and RPCs, plus the requests the entry Worker answers without it
+(refusals by the attempt limiters, media, assets), which each isolate
+samples one in 100 and reports at most once a second (`noteEntrySamples`).
+Each event's sampled log is priced too; SQL rows and duration are left
+out, since the app's ceilings bound them. Over a rolling 10 minutes:
+
+- $1 an hour or more over the last 2 minutes, with 80% or more of the
+  requests refused, is a flood: the server pauses.
+- $1 an hour or more over the 10 minutes, with half or more refused, is
+  sustained abuse: the server pauses.
+- $1 an hour or more mostly admitted is a busy day, not an attack: the
+  admins are told (at most once an hour, `burn` metric) and the server
+  stays open; the bill cap bounds what it costs.
+- Breakers open on three actions at once (one of them new since the last
+  such pause) mean something systematic: the server pauses.
+
+For scale, a deploy's reconnect wave or a front-page peak (2,300 sockets,
+a few thousand frames a minute) burns a few cents an hour; $1 an hour is
+about 30,000 refused requests a minute. The pause closes every
+connection, refuses every request with 503 and a `Retry-After` of the
+hold, and turns on the edge stop with the hold written into the rule's
+description (`[attack hold until …]`), which the budget guard honours
+before it lifts the rule. Its 503 carries `Apron-Server-Paused` (the end,
+in epoch milliseconds), so each entry Worker isolate refuses by itself for
+up to 5 minutes at a time and a flood costs no object requests even if the
+edge stop fails; the admins are told when it could not be turned on. The
+first pause in a UTC day holds 30 minutes, and each later one twice as long
+as the one before, at most 4 hours. Breakers already paused for never
+pause the server again while they stay open. It is logged
+(`attack_paused`), counted (`attack` metric) and announced as the `paused`
+tier; a wake stays paused. The meter itself is in memory, so it starts
+empty after a wake.
+
+To turn it off, set `ATTACK_PAUSE = "false"` in `wrangler.production.toml`
+and deploy: what would pause then only tells the admins (at most once an
+hour), a pause in force ends, and the budget guard lifts the edge stop at
+its next run whatever hold it carries. The bill cap still applies.
+
+**Launch profile.** Paid's limits are sized for a front-page day (about
+40,000 visitors, a tenth of them registering): 500 open connections (the
+memory bound: 64 KiB of incoming frames queued per connection, 8 small or 4
+of the largest, within 32 MiB; load-test the broadcast before raising it
+further), 100,000 admissions, 2 million frames (5,000 a minute), 400,000
+history pages, 5,000 registrations (20 per
+address), 50,000 accounts, 600 posts a minute and 60,000 a day, and 3
+million foreground rows written. A day at every ceiling costs about $3.40
+past the month's inclusions, under the daily bill cap. Pings stay at 45
+seconds (150 to go stale): the runtime answers them without waking the
+object, which is not billed, and a dead socket must be found quickly, since
+it holds a slot, shows its user online, and keeps their mentions from
+being pushed until it goes stale. Guest visits cost less: a guest cannot scroll back (`before`
+alone), its history is charged to its address only, and a full server
+closes the guest idle longest (10 minutes without a frame, close code
+4000) to admit a newcomer, once that newcomer passes every other check
+(never for a status probe). Registered accounts nobody came back to are
+removed after 30 days (`Store.pruneDormantIdentities`, once a UTC day):
+signed up with a passkey and active only that first day by their recorded
+`seen`, with no role, chosen status, push subscription, upload or bot. An
+account with no `seen` recorded (from before it was kept, or carried over
+a schema reset) is kept, and nothing is removed until user status has kept
+`seen` for 30 days without a break: turning user status off (or push
+unconfigured) restarts that wait. Their content is past retention by then;
+their `user_id` is retired as `/purge` retires it, and `/status` counts
+them.
+
+**Storage overruns.** Every operation reserves the SQL rows it may read and
+write before it runs. One that uses more is an *overrun*: a wrong estimate,
+not a cost emergency. It is observed: the operation finishes, its excess is
+charged to the day's budget (so the ceilings above stay true), and it is
+logged (`accounting_overrun`) and counted (`accounting` metric) under the
+operation's name with the user and address it acted for. The day's first
+overrun is announced to the admins. Three overruns of one foreground
+operation within an hour, or one past a hundredth of a day's SQL ceilings
+(an estimate that wrong may be unbounded), open its *breaker*: that one
+operation gets `retry_after` (`data.reason` `operation_paused`) for an hour
+(`BREAKER_MS`), announced as it opens and closes; everything else works.
+An operation is named by the Store method that made its reservation.
+Maintenance work, operator alerts, admin commands and the operations every
+request passes through (frames, admission, room lookup) are never refused
+by a breaker; their overruns are still charged, logged and told. Nor are
+the operations people cannot use the server without (`BREAKER_ALERT_ONLY`:
+signing in and registering, the room list and members, and history): their
+overruns are told to the admins at most once an hour each instead, so a
+wrong estimate there is fixed rather than locking everyone out. Breakers
+survive a wake, and `/status` lists them.
+
+**Throttle trips.** A refusal that lasts five minutes or more
+(`LONG_THROTTLE_SECONDS`: the tiers above, daily limits, an open breaker)
+is a *trip*. The user is told once an hour per connection and trigger, in
+a `~private` message saying what happened, until when, and a code and time
+to report to an admin. It is then logged (`throttle_tripped`, with the
+trigger, method and user), written to the `throttle` metric for later
+analysis, and counted in `/status` ("Throttles tripped in the last 24
+hours", by trigger). A trigger is the refusal's `data.reason`, else its
+message as a slug (`daily_posting_limit_reached`). A connection refused at
+admission for as long is counted once an hour per address, with no
+message. Repeats within the hour are refused as usual, uncounted.
+
+Earlier versions closed the server for good on any overrun until an operator
+deployed a new `ACCOUNTING_RECOVERY`; that variable is no longer read, and a
+stop such a version left is cleared on the next wake
+(`accounting_unsafe_retired`). A storage failure (`Server storage is
+unavailable; try again shortly`) still refuses work until storage works again
+and clears itself (`accounting_uncertain_recovered`).
 
 Numeric values are positive safe integer counts. Values named `Bytes` count
 UTF-8 bytes, `CodePoints` count Unicode code points, and values named `Seconds`
@@ -827,7 +963,7 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `historyBurstPerIp` | 120 | 60 |
 | `historyRequestsPerUserDay` | 3000 | 1000 |
 | `historyRequestsPerIpDay` | 6000 | 2000 |
-| `historyRequestsPerDay` | 40000 | 5000 |
+| `historyRequestsPerDay` | 400000 | 5000 |
 | `concurrentHistoryPerConnection` | 1 |  |
 | `anonymousPostsPerMinute` | 5 |  |
 | `anonymousPostsPerDay` | 200 | 100 |
@@ -837,26 +973,26 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `trustedPostsPerDay` | 4000 | 2000 |
 | `ipPostsPerMinute` | 30 |  |
 | `ipPostsPerDay` | 2000 | 1000 |
-| `globalPostsPerMinute` | 120 | 60 |
-| `globalPostsPerDay` | 10000 | 5000 |
-| `registrationsPerIpDay` | 5 | 3 |
-| `registrationsPerDay` | 300 | 100 |
-| `registeredIdentityCount` | 10000 |  |
+| `globalPostsPerMinute` | 600 | 60 |
+| `globalPostsPerDay` | 60000 | 5000 |
+| `registrationsPerIpDay` | 20 | 3 |
+| `registrationsPerDay` | 5000 | 100 |
+| `registeredIdentityCount` | 50000 | 10000 |
 | `authAttemptsPerIpMinute` | 10 |  |
-| `openConnections` | 100 |  |
+| `openConnections` | 500 | 100 |
 | `anonymousConnectionsPerIp` | 6 | 2 |
 | `registeredConnectionsPerUser` | 3 |  |
 | `connectionsPerIp` | 10 |  |
 | `connectionAdmissionsPerIpMinute` | 12 | 5 |
-| `connectionAdmissionsPerDay` | 4000 | 2000 |
+| `connectionAdmissionsPerDay` | 100000 | 2000 |
 | `unauthenticatedTimeoutSeconds` | 30 |  |
 | `pendingFramesPerConnection` | 8 |  |
-| `pendingBytesPerConnection` | 131072 |  |
+| `pendingBytesPerConnection` | 65536 | 131072 |
 | `framesPerConnectionMinute` | 60 |  |
 | `framesPerIpMinute` | 120 |  |
-| `processedFramesPerDay` | 150000 | 100000 |
+| `processedFramesPerDay` | 2000000 | 100000 |
 | `repeatedPolicyViolations` | 3 |  |
-| `globalFramesPerMinute` | 600 | 300 |
+| `globalFramesPerMinute` | 5000 | 300 |
 | `activityBroadcastsPerUserMinute` | 10 |  |
 | `roomListRequestsPerUserMinute` | 6 |  |
 | `activityMaxTypingSeconds` | 30 |  |
@@ -870,11 +1006,11 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `offlineGraceSeconds` | 60 |  |
 | `presenceAlarmSeconds` | 15 | 60 |
 | `guestPresenceAlarmSeconds` | 60 |  |
-| `sqlWritesPerDay` | 800000 | 80000 |
-| `sqlReadsPerDay` | 30000000 | 3000000 |
-| `foregroundWritesPerDay` | 700000 | 60000 |
+| `sqlWritesPerDay` | 3100000 | 80000 |
+| `sqlReadsPerDay` | 105000000 | 3000000 |
+| `foregroundWritesPerDay` | 3000000 | 60000 |
 | `maintenanceWritesPerDay` | 100000 | 20000 |
-| `foregroundReadsPerDay` | 25000000 | 2500000 |
+| `foregroundReadsPerDay` | 100000000 | 2500000 |
 | `maintenanceReadsPerDay` | 5000000 | 500000 |
 | `databaseHighWaterBytes` | 805306368 | 100663296 |
 | `databaseHardTargetBytes` | 1073741824 | 134217728 |
@@ -889,6 +1025,6 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `reactionUsersPerMessage` | 32 |  |
 | `reactionEmojisPerUser` | 8 |  |
 | `dedupTtlSeconds` | 86400 |  |
-| `limiterRecordCap` | 10000 |  |
+| `limiterRecordCap` | 50000 | 10000 |
 | `maxCredentialBytes` | 16384 |  |
 | `maxChallengeBytes` | 16384 |  |
