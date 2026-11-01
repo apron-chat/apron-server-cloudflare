@@ -57,6 +57,12 @@ function streamTo(url: string) {
 	};
 }
 
+/** The url that the snapshot adding it carries once the write of message_id's live embed starts (§4.8.5). */
+async function startedUrl(socket: Parameters<typeof until>[0], messageId: string): Promise<string> {
+	const started = (await until(socket, (f) => isMessage(messageId)(f) && typeof f.params.body?.embeds?.[0]?.url === 'string')).frame.params;
+	return started.body.embeds[0].url;
+}
+
 /** A reader of a live url: what it got so far, and a wait for text in it. */
 async function readerOf(url: string) {
 	const response = await SELF.fetch(url, { headers: { 'CF-Connecting-IP': ip() } });
@@ -197,9 +203,11 @@ describe('live text end to end', () => {
 		const writer = await signedIn(userId, ['mod']);
 		try {
 			const { frame, skipped } = await exchange(writer, 'revise', 'message', { body: { text: 'Plan:', format: 'markdown', embeds: [{ kind: 'append' }] } });
-			const url = skipped.find(isMessage(frame.result.message_id))!.params.body.embeds[0].url;
-			const early = await readerOf(url);
+			// The embed has no url until its write starts (§4.8.5).
+			expect(skipped.find(isMessage(frame.result.message_id))!.params.body.embeds[0].url).toBeUndefined();
 			const put = streamTo(frame.result.embeds[0].write_url);
+			const url = await startedUrl(writer, frame.result.message_id);
+			const early = await readerOf(url);
 			// Backspaces with nothing before them in the live text leave body.text alone.
 			await put.send('\b\b first draft\f');
 			await put.send(' Hello wrold\b\b\b\b');
@@ -220,7 +228,7 @@ describe('live text end to end', () => {
 			// Clients apply the edits: the early reader got them as sent.
 			expect(early.text()).toBe('\b\b first draft\f Hello wrold\b\b\b\borld, caf\u00e9\be \u{1F680}\b!');
 			expect(late.text()).toBe(' Hello world, cafe \u{1F680}\b!');
-			const merged = (await until(writer, (f) => isMessage(frame.result.message_id)(f) && f.params.prev_log_id !== undefined)).frame.params;
+			const merged = (await until(writer, (f) => isMessage(frame.result.message_id)(f) && !f.params.body?.embeds)).frame.params;
 			expect(merged.body).toEqual({ text: 'Plan: Hello world, cafe !', format: 'markdown' });
 		} finally { writer.close(); }
 	});
@@ -303,7 +311,7 @@ describe('live text end to end', () => {
 			await rest.send('ok');
 			await rest.end();
 			await rest.response;
-			expect((await until(writer, (f) => isMessage(sent.result.message_id)(f) && f.params.prev_log_id !== undefined)).frame.params.body.text).toBe('logs:ok');
+			expect((await until(writer, (f) => isMessage(sent.result.message_id)(f) && !f.params.body?.embeds)).frame.params.body.text).toBe('logs:ok');
 		} finally { writer.close(); }
 	});
 
@@ -313,20 +321,22 @@ describe('live text end to end', () => {
 		try {
 			const { frame, skipped } = await exchange(writer, 'post', 'message', { body: { text: 'Build:', embeds: [{ kind: 'terminal', title: 'ci' }] } });
 			const posted = skipped.find(isMessage(frame.result.message_id))!.params;
-			const url = posted.body.embeds[0].url;
+			// The embed waits for its writer, without url, until the write starts (§4.8.5).
+			expect(posted.body.embeds[0]).toEqual({ embed_id: expect.any(String), kind: 'terminal', title: 'ci' });
 			expect(frame.result.embeds).toEqual([{ embed_id: posted.body.embeds[0].embed_id, kind: 'terminal', write_url: expect.stringMatching(/\/w\/l\./) }]);
-			// A reader before the write waits for it.
+			const put = streamTo(frame.result.embeds[0].write_url);
+			const url = await startedUrl(writer, frame.result.message_id);
+			// A reader that connects before any text waits for it.
 			const early = await readerOf(url);
 			expect(early.response.status).toBe(200);
 			await sleep(50);
 			expect(early.done()).toBe(false);
-			const put = streamTo(frame.result.embeds[0].write_url);
 			await put.send('step 1\n');
 			await early.waitFor('step 1\n');
 			await put.end();
 			await put.response;
 			await early.ended();
-			const finished = (await until(writer, isMessage(frame.result.message_id))).frame.params;
+			const finished = (await until(writer, (f) => isMessage(frame.result.message_id)(f) && f.params.body?.embeds?.[0]?.output !== undefined)).frame.params;
 			expect(finished.body).toEqual({ text: 'Build:', format: 'plain', embeds: [{ embed_id: posted.body.embeds[0].embed_id, kind: 'terminal', title: 'ci', output: 'step 1\n' }] });
 			// A terminal or append in any other command is invalid_params.
 			expect((await command(writer, 'avatar', '/avatar', { body: { text: '/avatar', embeds: [{ kind: 'append' }] } })).frame.error).toBeTruthy();
