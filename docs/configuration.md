@@ -400,6 +400,13 @@ the [cost report](cost-report.md#live-text). In production, the edge rule
 `apron_invalid_request` must let live text through (see
 [edge admission](edge-admission.md)).
 
+`TERMINAL_VIEWER_URL` is the page a browser goes to when it opens a
+terminal's `url` as a page: `https://terminal.apron.chat/` unless set, and
+none when set empty (`TERMINAL_VIEWER_URL=""`), when browsers get the plain
+text too. The `url` and the embed's title go in the fragment, which never
+reaches the viewer's host. It must be an http(s) URL without a fragment or
+user info, or the configuration check fails.
+
 ## Server title, description and avatar
 
 The `server` frame's `title`, `description` and `avatar` (protocol §3.1) say

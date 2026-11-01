@@ -1549,7 +1549,11 @@ async function handleLiveRead(request: Request, env: Env, id: string): Promise<R
 	if (!config.liveText || !env.DEMO || !LIVE_ID_PATTERN.test(id)) return liveAnswer(404, "Not found");
 	const admitted = await liveAdmission(request, env);
 	if ("refused" in admitted) return admitted.refused;
-	const forwarded = new Request(`https://live.internal${LIVE_READ_PATH}${id}`, { method: request.method, headers: { [INTERNAL_IP_HEADER]: admitted.ipKey } });
+	// A browser opening it as a page goes to the terminal viewer, if there is one (§4.8.5).
+	const headers = new Headers({ [INTERNAL_IP_HEADER]: admitted.ipKey });
+	if (request.headers.get("Sec-Fetch-Mode") === "navigate") headers.set("Sec-Fetch-Mode", "navigate");
+	// manual: the object's redirect to the viewer is the browser's to follow, not this fetch's.
+	const forwarded = new Request(`https://live.internal${LIVE_READ_PATH}${id}`, { method: request.method, headers, redirect: "manual" });
 	try {
 		return await env.DEMO.getByName(OBJECT_NAME).fetch(forwarded);
 	} catch {
@@ -5904,7 +5908,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		try {
 			await this.recoverLiveTexts();
-			if (path.startsWith(LIVE_READ_PATH)) return this.liveRead(path.slice(LIVE_READ_PATH.length), request.method === "HEAD");
+			if (path.startsWith(LIVE_READ_PATH)) {
+				const navigate = request.method === "GET" && request.headers.get("Sec-Fetch-Mode") === "navigate";
+				return this.liveRead(path.slice(LIVE_READ_PATH.length), request.method === "HEAD", navigate);
+			}
 			if (request.method !== "PUT" || !request.body) return liveAnswer(405, "Method not allowed");
 			return await this.liveWrite(decodeURIComponent(path.slice(LIVE_WRITE_PATH.length)), request.body);
 		} catch (error) {
@@ -5927,10 +5934,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * every chunk as it arrives, from memory, until the text ends. A text a
 	 * message announced whose write has not started yet has its readers wait
 	 * for it. Each text has at most `readersPerText` readers at once and
-	 * `readsPerText` reads over its life; an ended or unknown one is 404.
+	 * `readsPerText` reads over its life; an ended or unknown one is 404. A
+	 * browser that opens a terminal's `url` as a page (`navigate`) goes to the
+	 * terminal viewer instead, if there is one, with the `url` and title in
+	 * the fragment, which never reaches the viewer's host (§4.8.5); that is
+	 * no read.
 	 */
-	private liveRead(id: string, head: boolean): Response {
-		const policy = this.config.liveText!.policy;
+	private liveRead(id: string, head: boolean, navigate = false): Response {
+		const { policy, viewerUrl, publicOrigin } = this.config.liveText!;
 		let session = this.liveSessions.get(id);
 		if (!session) {
 			const entry = this.store.openLiveTexts(nowMs()).find((candidate) => candidate.id === id);
@@ -5938,10 +5949,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 			session = { entry, readers: new LiveReaders() };
 			this.liveSessions.set(id, session);
 		}
-		if (head) return new Response(null, { headers: liveTextHeaders() });
+		const viewer = session.entry.kind === "terminal" ? viewerUrl : undefined;
+		if (viewer && navigate) {
+			const title = this.store.liveEmbedTitle(session.entry.messageId!, session.entry.embedId);
+			const fragment = new URLSearchParams({ stream: `${publicOrigin}/live/${id}`, ...(title ? { title } : {}) });
+			return new Response(null, { status: 302, headers: { Location: `${viewer.split("#")[0]}#${fragment}`, "Cache-Control": "no-store", Vary: "Sec-Fetch-Mode" } });
+		}
+		const headers = liveTextHeaders();
+		// Readers that fetch it get the text; a browser opening it as a page, the viewer.
+		if (viewer) headers.set("Vary", "Sec-Fetch-Mode");
+		if (head) return new Response(null, { headers });
 		if (session.readers.served >= policy.readsPerText) return liveAnswer(403, "This live text has been read as often as it may be");
 		if (session.readers.size >= policy.readersPerText) return liveAnswer(429, "This live text has as many readers as it may have", 10_000);
-		return new Response(session.readers.open(session.buffer?.kept() ?? new Uint8Array(0)), { headers: liveTextHeaders() });
+		return new Response(session.readers.open(session.buffer?.kept() ?? new Uint8Array(0)), { headers });
 	}
 
 	/**

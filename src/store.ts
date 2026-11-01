@@ -424,6 +424,22 @@ function liveUrl(live: Pick<StoreLiveTextConfig, "publicOrigin">, entry: Pick<Li
   return `${live.publicOrigin}/live/${entry.id}`;
 }
 
+/** What a terminal's `og` says it is, as it goes: waiting for its writer, live, then finished. */
+const TERMINAL_DESCRIPTIONS = {
+  waiting: "A terminal, waiting for its program's output.",
+  live: "Live terminal output. Open it to watch.",
+  finished: "Terminal output.",
+} as const;
+
+/**
+ * A terminal embed's `og` (protocol §4.8.6): what it is, for a client that
+ * doesn't render terminal embeds and shows it as the card its `og`
+ * describes, which opens its `url`. Titled as the embed is.
+ */
+export function terminalOg(title: unknown, state: keyof typeof TERMINAL_DESCRIPTIONS): { title: string; description: string } {
+  return { title: typeof title === "string" && title ? title : "Terminal", description: TERMINAL_DESCRIPTIONS[state] };
+}
+
 function isLiveEntry(value: unknown): value is LiveEntry {
   if (!isPlainObject(value)) return false;
   return typeof value.key === "string" && /^l\/[A-Za-z0-9_-]{22}$/.test(value.key) && typeof value.id === "string" &&
@@ -4776,11 +4792,14 @@ export class Store {
         }
         kept.add(embedId as string);
         if (isLive(before.kind)) {
-          // The server owns `url` and `output` (§4.8.2); a terminal takes a new title.
-          const { title: _title, ...owned } = before;
+          // The server owns `url`, `output`, and a terminal's `og` (§4.8.2, §4.8.6); a terminal takes a new title.
+          const { title: _title, og: _og, ...owned } = before;
           void _title;
-          const title = before.kind === "terminal" ? uploadTitle(fields.title) : undefined;
-          return { ...owned, ...(title ? { title } : {}) };
+          void _og;
+          if (before.kind !== "terminal") return owned;
+          const title = uploadTitle(fields.title);
+          const state = owned.output !== undefined ? "finished" : owned.url !== undefined ? "live" : "waiting";
+          return { ...owned, ...(title ? { title } : {}), og: terminalOg(title, state) };
         }
         if (before.kind !== "upload" || !this.config.uploads) return { embed_id: embedId, ...fields };
         const title = uploadTitle(fields.title);
@@ -4798,7 +4817,10 @@ export class Store {
           writes.push(liveResultEmbed(entry, live!));
         }
         // Its `url` waits for the write (§4.8.5): a command's message is posted with it then, and a message's republished.
-        return { embed_id: id, kind, ...(title ? { title } : {}), ...(liveClaim ? { url: liveUrl(live!, entry) } : {}) };
+        return {
+          embed_id: id, kind, ...(title ? { title } : {}), ...(liveClaim ? { url: liveUrl(live!, entry) } : {}),
+          ...(kind === "terminal" ? { og: terminalOg(title, liveClaim ? "live" : "waiting") } : {}),
+        };
       }
       if (fields.kind !== "upload" || !this.config.uploads) return { embed_id: id, ...fields };
       const upload = this.startUpload("file", userId, now, { messageId, embedId: id });
@@ -5070,7 +5092,8 @@ export class Store {
           const embed = embeds.find((candidate) => candidate.embed_id === entry.embedId);
           if (current && snapshot && embed) {
             this.ensureGrowthCapacity(this.config.maxSnapshotBytes);
-            broadcasts = this.rewriteEmbed(current, snapshot, entry.embedId, { ...embed, url: liveUrl(this.config.liveText!, entry) }, effective);
+            const og = entry.kind === "terminal" ? { og: terminalOg(embed.title, "live") } : {};
+            broadcasts = this.rewriteEmbed(current, snapshot, entry.embedId, { ...embed, url: liveUrl(this.config.liveText!, entry), ...og }, effective);
           }
         }
         entry.state = "live";
@@ -5149,7 +5172,7 @@ export class Store {
       // Its `url` ends with the text: the output is the embed's now (§4.8.6).
       const { url: _url, ...rest } = embed;
       void _url;
-      return this.rewriteEmbed(message, snapshot, entry.embedId, output ? { ...rest, output } : null, now);
+      return this.rewriteEmbed(message, snapshot, entry.embedId, output ? { ...rest, output, og: terminalOg(rest.title, "finished") } : null, now);
     }
     const base = typeof snapshot.body?.text === "string" ? snapshot.body.text : "";
     // A save may have lengthened the text while it streamed: the body stays within the text limit.
@@ -5983,6 +6006,18 @@ export class Store {
   messageAuthor(messageId: string, now = this.clock.now()): string | null {
     this.ensureReady();
     return this.reserved({ reads: 8 }, false, now, () => this.currentMessage(messageId, this.logState().history_floor)?.author_id ?? null);
+  }
+
+  /**
+   * A live embed's title as its message has it now, for the terminal viewer
+   * that a browser opening its `url` goes to (protocol §4.8.5): one metered
+   * lookup. Undefined without one.
+   */
+  liveEmbedTitle(messageId: string, embedId: string, now = this.clock.now()): string | undefined {
+    const snapshot = this.pushedMessage(messageId, now);
+    const embeds = snapshot && Array.isArray(snapshot.body?.embeds) ? snapshot.body.embeds : [];
+    const embed = embeds.find((candidate) => isPlainObject(candidate) && candidate.embed_id === embedId);
+    return isPlainObject(embed) && typeof embed.title === "string" && embed.title ? embed.title : undefined;
   }
 
   /**

@@ -162,6 +162,13 @@ interface LiveTextConfig {
 	publicOrigin: string;
 	/** Signs `write_url` tokens (upload-token.ts); at least 32 characters. */
 	signingKey: string;
+	/**
+	 * A page that shows a terminal's live text (`TERMINAL_VIEWER_URL`,
+	 * https://terminal.apron.chat/ unless set; empty for none): a browser
+	 * that opens a terminal's `url` as a page goes there, with the `url` in
+	 * the fragment, which never reaches the viewer's host (protocol §4.8.5).
+	 */
+	viewerUrl?: string;
 }
 
 interface UploadConfig {
@@ -204,6 +211,7 @@ type EnvLike = {
 	GUEST_POSTING?: string;
 	PRESENCE?: string;
 	LIVE_TEXT?: string;
+	TERMINAL_VIEWER_URL?: string;
 	APRON_ADMIN_TOKEN?: string;
 	MEDIA_ORIGIN?: string;
 	PUBLIC_ORIGIN?: string;
@@ -559,7 +567,31 @@ function loadLiveText(env: EnvLike, limits: Limits): LiveTextConfig | undefined 
 	if (!publicOrigin || !signingKey) return undefined;
 	if (!validOrigin(publicOrigin)) throw new ConfigError("PUBLIC_ORIGIN must be an exact HTTP(S) origin");
 	if (signingKey.length < 32) throw new ConfigError("UPLOAD_SIGNING_KEY must be at least 32 characters");
-	return { policy, publicOrigin, signingKey };
+	const viewerUrl = terminalViewerUrl(env.TERMINAL_VIEWER_URL);
+	return { policy, publicOrigin, signingKey, ...(viewerUrl ? { viewerUrl } : {}) };
+}
+
+/** Apron's stand-alone terminal viewer, where a browser opening a terminal's `url` goes unless `TERMINAL_VIEWER_URL` says otherwise. */
+export const DEFAULT_TERMINAL_VIEWER_URL = "https://terminal.apron.chat/";
+
+/**
+ * The terminal viewer from `TERMINAL_VIEWER_URL`: the default when unset,
+ * none when empty, else an http(s) URL without a fragment or user info.
+ */
+function terminalViewerUrl(raw: string | undefined): string | undefined {
+	if (raw === undefined) return DEFAULT_TERMINAL_VIEWER_URL;
+	const value = raw.trim();
+	if (!value) return undefined;
+	let url: URL;
+	try {
+		url = new URL(value);
+	} catch {
+		throw new ConfigError("TERMINAL_VIEWER_URL must be an http(s) URL, or empty for none");
+	}
+	if ((url.protocol !== "https:" && url.protocol !== "http:") || url.hash || url.username || url.password) {
+		throw new ConfigError("TERMINAL_VIEWER_URL must be an http(s) URL without a fragment or user info, or empty for none");
+	}
+	return value;
 }
 
 /**
