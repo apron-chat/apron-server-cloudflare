@@ -101,7 +101,7 @@ After final authentication, reply with `result.you`, a complete user object (Mes
 
 ### Extension `ext:settings`
 
-[`ext:settings`](https://github.com/shazow/apron/blob/main/EXTENSIONS.md#extsettings) carries server-wide settings that clients adapt their interface to, beyond what the capabilities say. The `server` frame lists it in `capabilities` and carries its data under its name in the frame's `ext` ([PROTOCOL.md §4.12](https://github.com/shazow/apron/blob/main/PROTOCOL.md#412-ext)): `server.ext.settings`. It needs only its own capability, not `ext`, and defines no other name. This server always sends these keys (`read_receipts` is this server's own, not yet in EXTENSIONS.md):
+[`ext:settings`](https://github.com/shazow/apron/blob/main/EXTENSIONS.md#extsettings) carries server-wide settings that clients adapt their interface to, beyond what the capabilities say. The `server` frame lists it in `capabilities` and carries its data under its name in the frame's `ext` ([PROTOCOL.md §4.12](https://github.com/shazow/apron/blob/main/PROTOCOL.md#412-ext)): `server.ext.settings`. It needs only its own capability, not `ext`, and defines no other name. This server always sends these keys:
 
 | Key | Default when absent | Meaning |
 | --- | --- | --- |
