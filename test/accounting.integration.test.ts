@@ -1,7 +1,7 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { MAX_ROOM_MUTES_PER_USER, MUTE_FOREVER, Store, StoreError, WAKE_SCOPES, defaultStoreConfig } from '../src/store';
-import { DEFAULT_LIMITS, PUSH_POLICY, SEEN_WRITE_GRANULARITY_MS } from '../src/budget';
+import { DEFAULT_LIMITS, PUSH_POLICY, SEEN_WRITE_GRANULARITY_MS, UPLOAD_POLICY } from '../src/budget';
 import { expectRetryAfter, messagesOf } from './helpers/store';
 
 // A day's retention with hourly cleanup, for tests that watch records expire.
@@ -806,6 +806,107 @@ describe('measured storage accounting', () => {
 			fill('private_eleven', 11);
 			const found = store.roomReadCursors(['private_large', 'private_ten', 'private_eleven'], 'm001', clock.now());
 			expect([...found]).toEqual([['private_ten', [['m009', '309']]]]);
+			expect(store.accountingStatus().unsafe).toBe(false);
+		});
+	});
+
+	// The 2026-11-01 overrun: `room_list` `not_joined` read every public
+	// thread under a reservation sized for the 17 top-level rooms.
+	it('reads the top-level rooms within their reservation however many threads there are', async () => {
+		const stub = env.DEMO.getByName('accounting-top-level-rooms-v1');
+		await runInDurableObject(stub, async (_instance, state) => {
+			const clock = new FakeClock(futureUtcNoon());
+			const store = new Store(state, defaultStoreConfig(), clock);
+			store.initialize();
+			state.storage.transactionSync(() => {
+				const room = (roomId: string, parent: string | null, logId: number) => state.storage.sql.exec(
+					`INSERT INTO rooms (room_id, parent_room_id, created_log_id, record_log_id, latest_log_id, fields_json, created_ms, updated_ms)
+					 VALUES (?, ?, ?, ?, ?, '{}', ?, ?)`,
+					roomId, parent, logId, logId, logId, clock.now(), clock.now(),
+				);
+				// Every created top-level room, and more threads than the cap allows: the scan reads them all.
+				for (let index = 1; index <= 16; index += 1) room(`top-${index}`, null, clock.now() + index);
+				for (let index = 1; index <= 120; index += 1) room(`thread-${index}`, 'general', clock.now() + 100 + index);
+			});
+			const ids = store.topLevelRoomIds(clock.now());
+			expect(ids).toHaveLength(17);
+			expect(ids[0]).toBe('general');
+			expect(store.accountingStatus().unsafe).toBe(false);
+		});
+	});
+
+	it('finds an avatar upload within its reservation however many files its owner uploaded', async () => {
+		const stub = env.DEMO.getByName('accounting-avatar-scan-v1');
+		await runInDurableObject(stub, async (_instance, state) => {
+			const clock = new FakeClock(futureUtcNoon());
+			const store = new Store(state, defaultStoreConfig({ uploads: { ...UPLOAD_POLICY!, mediaOrigin: 'https://media.test' } }), clock);
+			store.initialize();
+			const sql = state.storage.sql;
+			const upload = (key: string, purpose: string, uploadState: string) => sql.exec(
+				`INSERT INTO uploads (upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms, created_ms)
+				 VALUES (?, 'heavy', ?, NULL, NULL, ?, 1024, ?, ?, ?)`,
+				key, purpose, uploadState, clock.now() + HOUR, clock.now() + 7 * DAY, clock.now(),
+			);
+			state.storage.transactionSync(() => {
+				sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES ('heavy', 'heavy', 'Heavy', 'registered', 0, 0)");
+				// A week of posts with files at the per-user daily cap, and an avatar.
+				for (let index = 0; index < 8 * UPLOAD_POLICY!.uploadsPerUserDay; index += 1) upload(`f/file-${index}`, 'file', 'done');
+				upload('a/old', 'avatar', 'done');
+				upload('a/new', 'avatar', 'writing');
+			});
+			const replaced = store.finishUpload({ key: 'a/new', ok: true, bytes: 512, contentType: 'image/png' }, clock.now());
+			expect(replaced.accepted).toBe(true);
+			expect(replaced.deletedUploads).toEqual(['a/old']);
+			expect(store.accountingStatus().unsafe).toBe(false);
+			expect(store.clearAvatar({ userId: 'heavy', now: clock.now() })).toEqual({ changed: true, deletedUploads: ['a/new'] });
+			expect(store.accountingStatus().unsafe).toBe(false);
+		});
+	});
+
+	it('finds the server avatar upload within its reservation however many admins started one', async () => {
+		const stub = env.DEMO.getByName('accounting-server-avatar-scan-v1');
+		await runInDurableObject(stub, async (_instance, state) => {
+			const clock = new FakeClock(futureUtcNoon());
+			const store = new Store(state, defaultStoreConfig({ uploads: { ...UPLOAD_POLICY!, mediaOrigin: 'https://media.test' } }), clock);
+			store.initialize();
+			const sql = state.storage.sql;
+			const upload = (key: string, uploadState: string) => sql.exec(
+				`INSERT INTO uploads (upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms, created_ms)
+				 VALUES (?, '~server', 'server', NULL, NULL, ?, 1024, ?, ?, ?)`,
+				key, uploadState, clock.now() + HOUR, clock.now() + 30 * DAY, clock.now(),
+			);
+			state.storage.transactionSync(() => {
+				// Each admin's own daily limit charges what they start, so three admins leave 60 pending for the server.
+				for (let index = 0; index < 3 * UPLOAD_POLICY!.uploadsPerUserDay; index += 1) upload(`a/pending-${index}`, 'writing');
+				upload('a/server-old', 'done');
+			});
+			expect(store.finishUpload({ key: 'a/pending-0', ok: true, bytes: 512, contentType: 'image/png' }, clock.now()).deletedUploads).toEqual(['a/server-old']);
+			expect(store.accountingStatus().unsafe).toBe(false);
+			expect(store.clearServerAvatar(clock.now()).deletedUploads).toEqual(['a/pending-0']);
+			expect(store.accountingStatus().unsafe).toBe(false);
+		});
+	});
+
+	it('finds idle bots within the reservation however many are idle', async () => {
+		const stub = env.DEMO.getByName('accounting-idle-bots-v1');
+		await runInDurableObject(stub, async (_instance, state) => {
+			const clock = new FakeClock(futureUtcNoon());
+			const store = new Store(state, defaultStoreConfig(), clock);
+			store.initialize();
+			state.storage.transactionSync(() => {
+				for (let index = 0; index < 60; index += 1) {
+					state.storage.sql.exec(
+						"INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES (?, '', 'Bot', 'bot', 1, ?, '[\"bot\"]')",
+						`bot-${index}`, 1 + index,
+					);
+				}
+				state.storage.sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', '60')");
+			});
+			const sweep = { before: clock.now(), limit: 4, intervalMs: DAY, graceMs: HOUR };
+			// The first sweep only schedules the next, a grace later.
+			expect(store.idleBots({ now: clock.now(), ...sweep })).toEqual([]);
+			clock.set(clock.now() + 2 * HOUR);
+			expect(store.idleBots({ now: clock.now(), ...sweep })).toEqual(['bot-0', 'bot-1', 'bot-2', 'bot-3']);
 			expect(store.accountingStatus().unsafe).toBe(false);
 		});
 	});

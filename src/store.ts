@@ -3234,6 +3234,23 @@ export class Store {
   }
 
   /**
+   * The most upload rows `owner` can hold: a day's uploads for every day the
+   * longest-kept kind stays, with the lifecycle's lag, and one more day. A
+   * user's day is `uploadsPerUserDay`. The server's own avatar uploads
+   * (SERVER_OWNER) are charged to the admins who start them, so only the
+   * server-wide `uploadsPerDay` bounds them. A scan of an owner's rows by
+   * `uploads_owner_idx` reads up to this many, whatever its other conditions
+   * and LIMIT, since the index holds only `owner_id`.
+   */
+  private uploadsPerOwner(owner: string): number {
+    const policy = this.config.uploads;
+    if (!policy) return 0;
+    const perDay = owner === SERVER_OWNER ? policy.uploadsPerDay : policy.uploadsPerUserDay;
+    const keptSeconds = Math.max(policy.fileRetentionSeconds, policy.avatarRetentionSeconds) + policy.lifecycleLagSeconds;
+    return perDay * (Math.ceil(keptSeconds / 86_400) + 1);
+  }
+
+  /**
    * `/purge`: removes users and everything they left, silently, with no new
    * records: their message snapshots and current messages, with every
    * reaction set on those messages; their reaction sets elsewhere; their
@@ -3257,10 +3274,8 @@ export class Store {
     // The scans below read at most this many rows each. Only an admin can
     // purge, so it is charged to the day's budget but never refused by it.
     const records = this.retainedRecords(now, true);
-    const policy = this.config.uploads;
-    const uploadsPerOwner = policy
-      ? policy.uploadsPerUserDay * (Math.ceil((policy.avatarRetentionSeconds + policy.lifecycleLagSeconds) / 86_400) + 1)
-      : 0;
+    // The most any one of them holds: purged ids are users, never SERVER_OWNER.
+    const uploadsPerOwner = Math.max(...ids.map((id) => this.uploadsPerOwner(id)));
     // Per user: memberships (live and awaiting a room purge), a day's dedup
     // rows, limiter rows, push subscriptions, credential and identity; each
     // deletion also updates its indexes.
@@ -4114,11 +4129,15 @@ export class Store {
 
   /**
    * The top-level rooms' IDs, `general` first, for `room_list`'s shortcut.
-   * At most MAX_CREATED_ROOMS + 1, and they are never removed.
+   * At most MAX_CREATED_ROOMS + 1, and they are never removed. No index
+   * holds `parent_room_id`, so the scan reads every public row, threads
+   * included, and the sort reads the top-level ones again: it is reserved
+   * as the listing of every public room (roomListingReads), not by the rows
+   * it returns.
    */
   topLevelRoomIds(now = this.clock.now()): string[] {
     this.ensureReady();
-    return this.reserved({ reads: 4 + MAX_CREATED_ROOMS }, false, now, () => this.rawRows<{ room_id: string }>(
+    return this.reserved({ reads: this.roomListingReads() }, false, now, () => this.rawRows<{ room_id: string }>(
       `SELECT room_id FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IS NULL ORDER BY created_log_id ASC LIMIT ?`, MAX_CREATED_ROOMS + 1,
     ).map((row) => row.room_id));
   }
@@ -4285,8 +4304,9 @@ export class Store {
       due: this.metaValue(META_BOT_SWEEP), identities: this.metaNumber("identity_count"),
     }));
     if (due !== "" && this.effectiveNow(input.now) < Number(due)) return null;
-    // A scan of every identity row, and the next due time.
-    return this.reserved({ reads: 16 + identities, writes: 4 }, true, input.now, () => {
+    // A scan of every identity row, the sort reading each idle bot's again,
+    // and the next due time.
+    return this.reserved({ reads: 16 + 2 * identities, writes: 4 }, true, input.now, () => {
       const effective = this.effectiveNow(input.now);
       const idle = due === "" ? [] : this.rawRows<{ user_id: string }>(
         `SELECT user_id FROM identities WHERE roles_json = '["bot"]' AND updated_ms > 0 AND updated_ms < ? ORDER BY updated_ms LIMIT ?`, input.before, input.limit,
@@ -5268,7 +5288,8 @@ export class Store {
    */
   clearServerAvatar(now = this.clock.now()): { changed: boolean; deletedUploads: string[] } {
     this.ensureReady();
-    return this.reserved({ reads: 32, writes: 32 }, false, now, () => this.transaction(() => {
+    // Its upload is found by a scan of every upload the server owns (uploadsPerOwner).
+    return this.reserved({ reads: 32 + this.uploadsPerOwner(SERVER_OWNER), writes: 32 }, false, now, () => this.transaction(() => {
       const changed = this.loadServerMetadata().avatar !== undefined;
       if (changed) this.writeServerField("avatar", undefined);
       const rows = this.rawRows<RawUploadRow>(
@@ -5416,7 +5437,10 @@ export class Store {
    */
   finishUpload(write: UploadWrite, now = this.clock.now()): UploadFinish {
     this.ensureReady();
-    return this.reserved({ reads: 96, writes: 64 + UPLOAD_WRITES }, false, now, () => this.transaction(() => {
+    // A user's or the server's avatar write scans its owner's uploads for the
+    // one it replaces, so the reservation is sized by the owner, read first.
+    const owner = this.reserved({ reads: 4 }, false, now, () => this.uploadRow(write.key)?.owner_id ?? "");
+    return this.reserved({ reads: 96 + this.uploadsPerOwner(owner), writes: 64 + UPLOAD_WRITES }, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       const row = this.uploadRow(write.key);
       if (!row || row.state !== "writing" || effective > row.write_expires_ms + UPLOAD_WRITE_GRACE_MS) {
@@ -5633,7 +5657,8 @@ export class Store {
   clearAvatar(input: { userId: string; now?: number }): { changed: boolean; deletedUploads: string[] } {
     this.ensureReady();
     const now = input.now ?? this.clock.now();
-    return this.reserved({ reads: 32, writes: 32 }, false, now, () => this.transaction(() => {
+    // The avatar's upload is found by a scan of every upload the user owns (uploadsPerOwner).
+    return this.reserved({ reads: 32 + this.uploadsPerOwner(input.userId), writes: 32 }, false, now, () => this.transaction(() => {
       const identity = this.identityRow(input.userId);
       const rows = this.rawRows<RawUploadRow>(
         `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
