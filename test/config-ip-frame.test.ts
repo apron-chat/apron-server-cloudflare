@@ -212,7 +212,7 @@ describe('configuration policy boundaries', () => {
 	});
 
 	it('keeps the free plan as it was and valid, and the paid plan inside its allowances', () => {
-		expect(FREE_PLAN.features).toEqual({ activity: false, guestPosting: false, presence: true });
+		expect(FREE_PLAN.features).toEqual({ activity: false, guestPosting: false, presence: true, liveText: false });
 		expect(PAID_PLAN.features.presence).toBe(true);
 		expect(FREE_PLAN.limits).toMatchObject({ globalFramesPerMinute: 300, processedFramesPerDay: 100_000, globalPostsPerDay: 5_000, registrationsPerDay: 100, sqlWritesPerDay: 80_000, sqlReadsPerDay: 3_000_000 });
 		expect(FREE_PLAN.account.daily.sqlRowsWritten).toBe(100_000);
@@ -227,7 +227,9 @@ describe('configuration policy boundaries', () => {
 			// from every open connection every pingSeconds, at 20 incoming WebSocket
 			// messages a request, plus admissions and a cleanup alarm an hour.
 			const messages = plan.limits.processedFramesPerDay + plan.limits.openConnections * Math.ceil(86_400 / plan.limits.pingSeconds);
-			const requests = messages / 20 + plan.limits.connectionAdmissionsPerDay + 24;
+			// Live text, where on: each text's write and its reads, at the daily cap.
+			const live = plan.liveText && plan.features.liveText ? plan.liveText.startsPerDay * (1 + plan.liveText.readsPerText) : 0;
+			const requests = messages / 20 + plan.limits.connectionAdmissionsPerDay + 24 + live;
 			expect(requests).toBeLessThan(daily.durableObjectRequests * ACCOUNT_USAGE_POLICY.stopRatio);
 		}
 	});
@@ -267,7 +269,6 @@ describe('configuration policy boundaries', () => {
 		expect(() => config({ ALLOWED_ORIGINS: '*' })).toThrow(ConfigError);
 		expect(() => config({ ALLOWED_ORIGINS: '*', RP_ORIGINS: '*' })).toThrow(ConfigError);
 		expect(() => config({ ALLOWED_ORIGINS: '*,http://localhost:5173', RP_ORIGINS: 'http://localhost:5173' })).toThrow(ConfigError);
-		expect(() => config({ ALLOWED_ORIGINS: '*', RP_ORIGINS: 'https://unrelated.example', RP_ID: 'apron.chat' })).toThrow(ConfigError);
 		const restricted = config();
 		expect(isAllowedOrigin(restricted, 'http://localhost:5173')).toBe(true);
 		expect(isAllowedOrigin(restricted, null)).toBe(true);
@@ -313,5 +314,22 @@ describe('configuration policy boundaries', () => {
 			RP_ID: 'example.test',
 		})).toThrow(ConfigError);
 		expect(() => config({ RP_NAME: 'x'.repeat(DEFAULT_LIMITS.maxNameCodePoints + 1) })).toThrow(ConfigError);
+	});
+
+	it('accepts passkey origins outside RP_ID as related origins', () => {
+		// A self-hosted server whose RP ID is its own host, used from a shared client elsewhere.
+		const related = config({
+			ALLOWED_ORIGINS: 'https://apron.shazow.net,https://web.apron.chat',
+			RP_ORIGINS: 'https://apron.shazow.net,https://web.apron.chat',
+			RP_ID: 'apron.shazow.net',
+		});
+		expect(related.rpId).toBe('apron.shazow.net');
+		expect(related.rpOrigins).toEqual(['https://apron.shazow.net', 'https://web.apron.chat']);
+		expect(config({ ALLOWED_ORIGINS: '*', RP_ORIGINS: 'https://unrelated.example', RP_ID: 'apron.chat' }).rpOrigins).toEqual(['https://unrelated.example']);
+		// The other rules still hold: exact origins, no wildcards, within ALLOWED_ORIGINS.
+		expect(() => config({ ALLOWED_ORIGINS: 'https://apron.shazow.net', RP_ORIGINS: 'https://apron.shazow.net,https://web.apron.chat', RP_ID: 'apron.shazow.net' })).toThrow(/subset of ALLOWED_ORIGINS/);
+		expect(() => config({ ALLOWED_ORIGINS: '*', RP_ORIGINS: 'https://*.apron.chat', RP_ID: 'apron.shazow.net' })).toThrow(ConfigError);
+		expect(() => config({ ALLOWED_ORIGINS: '*', RP_ORIGINS: 'https://web.apron.chat/app', RP_ID: 'apron.shazow.net' })).toThrow(ConfigError);
+		expect(() => config({ ALLOWED_ORIGINS: '*', RP_ORIGINS: 'https://web.apron.chat', RP_ID: 'https://apron.shazow.net' })).toThrow(/RP_ID must be a host name/);
 	});
 });

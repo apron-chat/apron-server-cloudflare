@@ -9,7 +9,7 @@ one, and must match the account's plan.
 
 | File | Plan | Features on by default |
 | --- | --- | --- |
-| [`src/plans/paid.ts`](../src/plans/paid.ts) (selected) | Workers Paid, $5/month | `activity` (typing), presence (user status, with push) |
+| [`src/plans/paid.ts`](../src/plans/paid.ts) (selected) | Workers Paid, $5/month | `activity` (typing), presence (user status, with push), live text (with `PUBLIC_ORIGIN` and `UPLOAD_SIGNING_KEY`) |
 | [`src/plans/free.ts`](../src/plans/free.ts) | Workers Free | presence (user status, with push) |
 
 The paid plan starts from the free one and raises only what Paid's included
@@ -349,6 +349,57 @@ Upload writes and their claims use the Worker and Durable Object allowances
 above: two Durable Object requests and one Worker request each, at most
 500 a day. Deletes are free.
 
+## Live text
+
+Live text (protocol §4.8.3, caps `embed:terminal` and `embed:append`): a
+sender streams a terminal or an append with an HTTP `PUT` to a `write_url`,
+and readers `GET` its `url` as it grows
+([policy](policy.md), [limits](limits.md#live-text)). It needs no R2 and no
+other service: the Durable Object holds each text in memory while it
+streams. It is configured where the plan has a `liveText` policy and the
+deployment sets `PUBLIC_ORIGIN` and the `UPLOAD_SIGNING_KEY` secret (the
+same key signs upload and live `write_url`s), and on where the plan's
+`features.liveText` or `LIVE_TEXT` says so; an admin's `/toggle livetext`
+turns it off and on without a deploy (texts already streaming finish).
+
+| Setting | Workers Paid | Workers Free | Ceiling |
+| --- | ---: | ---: | ---: |
+| On by default (`features.liveText`) | yes | no | |
+| `maxSeconds` (streaming time from the `PUT`; at it the text ends) | 120 | 120 | 120 |
+| `moderatorMaxSeconds` (the same for the role `admin` or `mod`) | 300 | 300 | 300 |
+| `writeWindowSeconds` (an unused `write_url` expires) | 120 | 120 | 300 |
+| `terminalKeepBytes` (a terminal's `output`, `keep_last`) | 32 KB | 16 KB | 32 KB |
+| `maxInputBytes` (one `PUT` in all; at it the text ends) | 2 MB | 1 MB | 4 MB |
+| `appendMaxBytes` (an append adds at most this, and never past `maxTextBytes`) | 4,096 | 4,096 | `maxTextBytes` |
+| `startsPerUser` (a burst, then this many per `startWindowMinutes`; a guest's by IP) | 3 | 3 | `startsPerIp` |
+| `startsPerIp` | 6 | 6 | |
+| `startWindowMinutes` | 10 | 10 | a day |
+| `startsPerUserDay` | 20 | 10 | `startsPerDay` |
+| `startsPerDay` (server-wide) | 100 | 30 | 500 |
+| `concurrent` (open texts server-wide, unused `write_url`s included) | 4 | 2 | 8 |
+| `readersPerText` (at once) | 10 | 5 | 32 |
+| `readsPerText` (over a text's life, reconnects included) | 30 | 15 | 100 |
+
+One user has one live text open at a time, an unused `write_url` included,
+and each start also counts as a post. The starts are `live` rows in
+`principal_limits` (the user's or a guest's IP's, the IP's, and the
+server's), like any other limiter; the open texts are one `_meta` row
+(`live_texts`), read once a wake and kept in memory. A text whose instance
+was evicted or redeployed while it streamed is ended, with its embed
+removed, by the next instance's first live text work or by the alarm at its
+time limit plus 30 seconds. Readers and the writer are counted against the
+Worker's per-address and per-location attempt limiters, as connections are.
+The time limit is a one-shot timer that exists only while its `PUT` does;
+nothing else of live text keeps the object awake.
+
+Each value can be lowered for a test or an incident with a
+`LIVE_TEXT_<KEY>` variable in uppercase snake case, such as
+`LIVE_TEXT_MAX_SECONDS=30` or `LIVE_TEXT_CONCURRENT=1`; values past the
+ceilings above fail the configuration check. The cost of the defaults is in
+the [cost report](cost-report.md#live-text). In production, the edge rule
+`apron_invalid_request` must let live text through (see
+[edge admission](edge-admission.md)).
+
 ## Server title, description and avatar
 
 The `server` frame's `title`, `description` and `avatar` (protocol §3.1) say
@@ -579,20 +630,21 @@ implementation and recalibrating its resource model.
 
 | Variable | Meaning |
 | --- | --- |
-| `RP_ID` | Explicit passkey relying-party hostname; local default `localhost`; every `RP_ORIGINS` host must be it or its subdomain |
-| `RP_ORIGINS` | Comma-separated exact WebAuthn origins; defaults to `ALLOWED_ORIGINS` and must be a subset of it, but is required explicitly with wildcard guest admission; never accepts wildcards |
+| `RP_ID` | Explicit passkey relying-party hostname: the server's host or a domain it is under (clients check this); local default `localhost`. On the host that is `RP_ID`, the Worker answers `GET /.well-known/webauthn` with `{"origins": RP_ORIGINS}`; with a parent-domain `RP_ID`, or a Worker not on its host, nothing serves that file, so serve it there yourself |
+| `RP_ORIGINS` | Comma-separated exact WebAuthn origins; defaults to `ALLOWED_ORIGINS` and must be a subset of it, but is required explicitly with wildcard guest admission; never accepts wildcards. An origin outside `RP_ID` (such as `https://web.apron.chat` with `RP_ID=apron.shazow.net`) is a [related origin](https://www.w3.org/TR/webauthn-3/#sctn-related-origins): browsers allow it only where `https://<RP_ID>/.well-known/webauthn` lists it, which the Worker serves when it is on `RP_ID`'s host; otherwise serve that file there yourself. Startup checks only that each origin is exact and in `ALLOWED_ORIGINS`, not that it sits under `RP_ID`, so a mistyped origin fails only in the browser, as a refused passkey. Browsers without related origins refuse passkeys on such a frontend, whose users then sign in another way ([guide](guide.md#passkeys-on-your-own-server)) |
 | `ALLOWED_ORIGINS` | Exact browser-origin allowlist, or standalone `*` to admit every guest origin (including opaque/missing Origin); cannot mix `*` with explicit origins; all clients remain subject to quotas |
 | `RP_NAME` | Bounded display name for browser passkey prompts, default `Apron Demo`; WebAuthn only, never the `server` frame's `title` |
 | `ACTIVITY` | `true` advertises and relays typing (cap `activity`, section 4.2 of the spec); `false` turns it off. Unset, the plan decides: on for Workers Paid, off for Free. An admin's `/toggle activity` overrides it until toggled back. With it, registered users' read cursors are kept too (`ext.settings.read_cursors`) |
 | `PRESENCE` | `true` or `false`: whether others see each user's `status` (protocol §4.5); needs push. The status users choose with `me` and their mutes are taken whatever it says. Unset, the plan decides: on for both. An admin's `/toggle presence` overrides it until toggled back. See [User status](#user-status-presence) |
+| `LIVE_TEXT` | `true` or `false`: whether live text (`embed:terminal`, `embed:append`) is on where it is configured (`PUBLIC_ORIGIN` and `UPLOAD_SIGNING_KEY`). Unset, the plan decides: on for Workers Paid, off for Free. An admin's `/toggle livetext` overrides it until toggled back. `LIVE_TEXT_<KEY>` variables set its limits within their ceilings (see [Live text](#live-text)) |
 | `GUEST_POSTING` | `true` lets guests post, react, join and leave rooms, and create threads under the guest quotas; default off in both plans, so guests only list rooms and read history until they sign in with a passkey. Announced in each guest's own `you`: `ext.permissions` is `{"write": false}` while guests only read (extension `ext:permissions`) |
 | `SERVER_TITLE` | The `server` frame's `title` (protocol §3.1), a one-line plain name within the display-name policy (80 code points); unset or empty, left out, and clients show the server's address. The public demo sets it in `wrangler.production.toml`. An admin's `/server title` overrides it (see [Server title, description and avatar](#server-title-description-and-avatar)) |
 | `SERVER_DESCRIPTION` | The `server` frame's `description`, a few words of CommonMark (at most 500 bytes) saying what the server is about; unset or empty, `general`'s description where it fits, else left out. The public demo sets it in `wrangler.production.toml`. An admin's `/server description` overrides it |
 | `SERVER_AVATAR` | The `server` frame's `avatar`, the server's square icon: an `https:` URL, or a small `data:image/{png,jpeg,gif,webp};base64,` URL (at most 8 KiB); unset or empty, left out. The public demo sets it in `wrangler.production.toml`, to apron-web's icon. An admin's `/server avatar` overrides it |
 | `APRON_ADMIN_TOKEN` | Optional secret, unset by default: 24 to 256 of `A-Z a-z 0-9 - _`, not starting `apron_bot_`, `apron_invite_`, `apron_join_`, or `apron_device_`. `auth` with `scheme: "token"` and this token signs in as the registered user `admin`, who is always an admin, from any origin and without a passkey ([SPEC section 5, Admins](../SPEC.md#admins)). Anyone holding it can act as the admin, so never put it in a Wrangler var or source: `npx wrangler secret put APRON_ADMIN_TOKEN --config wrangler.production.toml`. Delete the secret (`npx wrangler secret delete …`) to turn it off; the `admin` user never holds a passkey. A malformed value makes every request fail its configuration check. Locally, use `npx wrangler dev --var APRON_ADMIN_TOKEN:…` or `.dev.vars` |
 | `MEDIA_ORIGIN` | Exact https origin where the upload bucket serves objects, such as `https://media.apron.chat`; with `PUBLIC_ORIGIN`, `UPLOAD_SIGNING_KEY` and the `MEDIA` binding, turns uploads on for a plan that has them. Announced as `ext.media.origins` (extension `ext:media`) when it is not `PUBLIC_ORIGIN` |
-| `PUBLIC_ORIGIN` | This Worker's exact public origin, which `write_url`s point at |
-| `UPLOAD_SIGNING_KEY` | Secret of at least 32 characters that signs `write_url`s; set with `npx wrangler secret put UPLOAD_SIGNING_KEY --config wrangler.production.toml` |
+| `PUBLIC_ORIGIN` | This Worker's exact public origin, which `write_url`s and live text `url`s point at; with `UPLOAD_SIGNING_KEY`, configures live text |
+| `UPLOAD_SIGNING_KEY` | Secret of at least 32 characters that signs `write_url`s, of uploads and of live text; set with `npx wrangler secret put UPLOAD_SIGNING_KEY --config wrangler.production.toml` |
 | `VAPID_PUBLIC_KEY` | Uncompressed P-256 public key, unpadded base64url (`node scripts/vapid-keys.mjs`); with `VAPID_PRIVATE_KEY` and `VAPID_SUBJECT`, turns push on and is advertised as `server.push.webpush.key` |
 | `VAPID_PRIVATE_KEY` | Secret: the matching 32-byte private key, unpadded base64url; set with `npx wrangler secret put VAPID_PRIVATE_KEY --config wrangler.production.toml` |
 | `VAPID_SUBJECT` | `mailto:` address or `https:` URL sent to push services in each VAPID token as the operator's contact |

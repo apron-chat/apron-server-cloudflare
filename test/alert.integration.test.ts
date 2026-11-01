@@ -118,6 +118,33 @@ it('counts alarms and accounting changes in METRICS, and logs why accounting clo
 	expect(closed).toEqual([{ event: 'accounting_closed', kind: 'uncertain', message: expect.stringContaining('injected budget reservation failure') }]);
 });
 
+it('runs the full alarm for a live text past its deadline, or open texts a lost instance left, and not otherwise', async () => {
+	type LiveRuntime = Runtime & { alarm(): Promise<void>; liveDeadlineAt: number | undefined };
+	await runInDurableObject(env.DEMO.getByName('live-deadline-alarm'), async (instance, state) => {
+		const runtime = instance as unknown as LiveRuntime;
+		state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', Date.now() + 3_600_000);
+		runtime.store.forgetCleanupDue();
+		const expire = vi.spyOn(runtime.store, 'expireLiveTexts');
+		// No open text to recover: a light alarm.
+		await runtime.alarm();
+		expect(expire).not.toHaveBeenCalled();
+		// A text past its deadline: the full alarm ends it (the time limit).
+		runtime.liveDeadlineAt = Date.now() - 1;
+		await runtime.alarm();
+		expect(expire).toHaveBeenCalledTimes(1);
+	});
+	await runInDurableObject(env.DEMO.getByName('live-lost-alarm'), async (instance, state) => {
+		const runtime = instance as unknown as LiveRuntime;
+		state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', Date.now() + 3_600_000);
+		runtime.store.forgetCleanupDue();
+		// Open in storage, from an instance that was evicted or redeployed.
+		vi.spyOn(runtime.store, 'openLiveTexts').mockReturnValue([{} as ReturnType<Store['openLiveTexts']>[number]]);
+		const expire = vi.spyOn(runtime.store, 'expireLiveTexts').mockReturnValue({ broadcasts: [], ended: [], next: undefined } as unknown as ReturnType<Store['expireLiveTexts']>);
+		await runtime.alarm();
+		expect(expire).toHaveBeenCalledTimes(1);
+	});
+});
+
 it('runs the full alarm for an upload deadline stored before a wake, which the instance never saw', async () => {
 	await runInDurableObject(env.DEMO.getByName('upload-deadline-wake'), async (instance, state) => {
 		const runtime = instance as unknown as Runtime & { alarm(): Promise<void> };

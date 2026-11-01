@@ -14,9 +14,10 @@ Edit limits in the selected plan file under `src/plans/`, then run
 `npm run budget:generate` and review
 [`edge-rules.generated.json`](edge-rules.generated.json). The server hostname
 is read from the production Wrangler custom domain, and, for a plan with
-uploads, the media hostname from its `MEDIA_ORIGIN`. This file contains rule
-definitions grouped by phase; it is not a payload for replacing an entire zone
-ruleset.
+uploads, the media hostname from its `MEDIA_ORIGIN`; where its `RP_ID` is
+that same hostname, the rules let passkey related origins through. This file
+contains rule definitions grouped by phase; it is not a payload for replacing
+an entire zone ruleset.
 
 During an authorized deployment:
 
@@ -27,8 +28,17 @@ During an authorized deployment:
    the generated expression and Block action. It is scoped to the server hostname
    and rejects unsupported paths, non-GET requests, and missing/non-WebSocket
    Upgrade headers, except for the explicit `apron_connection_status=1` HTTP
-   diagnostic probe and, with uploads, `write_url` requests (`PUT` and `OPTIONS`
-   on `/w/`). Probes retain Worker rate limiting and origin checks.
+   diagnostic probe, with uploads or live text, `write_url` requests (`PUT`
+   and `OPTIONS` on `/w/`), with live text the reads of a live `url`
+   (`GET`, `HEAD` and `OPTIONS` on `/live/`), and where `RP_ID` is the
+   server hostname, `GET` and `HEAD` of `/.well-known/webauthn`, the
+   passkey [related origins](guide.md#passkeys-on-your-own-server). Probes
+   retain Worker rate limiting and origin checks; live text requests are
+   counted against the same per-address and per-location attempt limiters
+   as connections. The related origins are answered from configuration
+   without the Durable Object, like the Worker's other cheap answers, so
+   they spend no attempt; like every request, they count toward the flood
+   trip.
    Header comparison is case insensitive. Have Cloudflare validate
    the expression before saving. Place it before any applicable Skip rule.
 3. Optionally create `apron_admission_off`, disabled, as an emergency Block rule.
@@ -72,6 +82,8 @@ After applying rules, use a handful of requests, not a quota-exhaustion load tes
 - Confirm `GET /ws?apron_connection_status=1` reaches the Worker and exposes
   capacity errors, `Retry-After`, and the `Apron-Connection-Status: 1` marker to
   the frontend through CORS.
+- Where `RP_ID` is the server hostname, confirm
+  `GET /.well-known/webauthn` returns `RP_ORIGINS` as `{"origins": [...]}`.
 - With uploads, confirm an uploaded image loads from the media hostname, and
   a query string or a path outside `/f/`, `/a/` and `/e/` there is blocked.
 - Confirm the web and documentation hosts are unaffected by the custom rules.

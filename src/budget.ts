@@ -281,6 +281,12 @@ export interface Features {
 	 * chose. Needs push, like capability `status`.
 	 */
 	presence: boolean;
+	/**
+	 * Live text (`embed:terminal`, `embed:append`, protocol §4.8.3), where the
+	 * plan has a live text policy and the deployment sets `PUBLIC_ORIGIN` and
+	 * `UPLOAD_SIGNING_KEY`. `LIVE_TEXT` overrides it.
+	 */
+	liveText: boolean;
 }
 
 /**
@@ -394,6 +400,50 @@ export interface PushPolicy {
 	ttlSeconds: number;
 }
 
+/**
+ * Live text (protocol §4.8.3, caps `embed:terminal` and `embed:append`): a
+ * sender streams text with an HTTP `PUT` to a `write_url`, and readers
+ * `GET` its `url` as it grows. The Durable Object holds each text in memory
+ * while it streams and keeps the object awake meanwhile, so every limit
+ * here bounds a cost: how many texts start (requests, rows, stored bytes),
+ * how long each streams (duration), how many read it (requests), and how
+ * much is kept (stored bytes).
+ */
+export interface LiveTextPolicy {
+	/** Longest an ordinary user's text streams, from its `PUT`; at the limit it ends. */
+	maxSeconds: number;
+	/** The same for a registered user with the role `admin` or `mod`. */
+	moderatorMaxSeconds: number;
+	/** How long a `write_url` waits for its `PUT`; an unused one expires. */
+	writeWindowSeconds: number;
+	/** A terminal keeps the last this many bytes (§4.8.6 `keep_last`), as `output` when it ends. */
+	terminalKeepBytes: number;
+	/** Bytes one write may send in all; past it the text ends. Bounds the object's work. */
+	maxInputBytes: number;
+	/**
+	 * Most bytes an append adds to its message's `body.text`, which stays
+	 * within `maxTextBytes` whatever the opening text (§4.8.5: the first part
+	 * is kept). At most `maxTextBytes`.
+	 */
+	appendMaxBytes: number;
+	/** Texts one user (a guest: their IP) may start: a burst, then this many per `startWindowMinutes`. */
+	startsPerUser: number;
+	/** Texts one IP may start, across its users, per `startWindowMinutes`. */
+	startsPerIp: number;
+	/** The window the two rates above refill over, in minutes. */
+	startWindowMinutes: number;
+	/** Texts one user may start a UTC day. */
+	startsPerUserDay: number;
+	/** Texts the whole server may start a UTC day. */
+	startsPerDay: number;
+	/** Texts open at once server-wide, pending writes included. */
+	concurrent: number;
+	/** Readers one text may have at once. */
+	readersPerText: number;
+	/** `GET`s of one text's `url` over its life, reconnects included; past it they are refused. */
+	readsPerText: number;
+}
+
 export interface Plan {
 	name: string;
 	limits: Readonly<Limits>;
@@ -403,6 +453,7 @@ export interface Plan {
 	edgeStop?: Readonly<EdgeStop>;
 	uploads?: Readonly<UploadPolicy>;
 	push?: Readonly<PushPolicy>;
+	liveText?: Readonly<LiveTextPolicy>;
 }
 
 // Match the account's Workers plan. To switch back to Free, import FREE_PLAN
@@ -413,6 +464,7 @@ export const DEFAULT_LIMITS: Readonly<Limits> = PLAN.limits;
 export const DEFAULT_FEATURES: Readonly<Features> = PLAN.features;
 export const UPLOAD_POLICY: Readonly<UploadPolicy> | undefined = PLAN.uploads;
 export const PUSH_POLICY: Readonly<PushPolicy> | undefined = PLAN.push;
+export const LIVE_TEXT_POLICY: Readonly<LiveTextPolicy> | undefined = PLAN.liveText;
 
 // Calibrated implementation bounds remain explicit: raising a payload or parser
 // bound requires rechecking its consumers. Resource ceilings below instead use
@@ -499,6 +551,21 @@ export const MAX_PUSH_CANDIDATES = 32;
 // its snapshot in memory; past it a wake pushes without waiting. Posts are
 // limited server-wide well below this in any `delaySeconds`.
 export const MAX_PENDING_WAKES = 256;
+// Live text (LiveTextPolicy). The owner's ceilings: 120 seconds of streaming
+// for ordinary users and 300 for admins and mods. A finished terminal's
+// `output` is one record, which must fit one history response however its
+// control characters escape (`\u001b` is six bytes of JSON for one), and
+// texts open at once and their readers are in-memory state of the one object.
+export const MAX_LIVE_TEXT_SECONDS = 120;
+export const MAX_LIVE_TEXT_MODERATOR_SECONDS = 300;
+export const MAX_TERMINAL_KEEP_BYTES = 32 * 1024;
+export const MAX_LIVE_INPUT_BYTES = 4 * 1024 * 1024;
+export const MAX_LIVE_TEXTS = 8;
+export const MAX_LIVE_READERS_PER_TEXT = 32;
+export const MAX_LIVE_WRITE_WINDOW_SECONDS = 300;
+// Each text a day costs a write and its reads in Durable Object requests.
+export const MAX_LIVE_TEXTS_PER_DAY = 500;
+export const MAX_LIVE_READS_PER_TEXT = 100;
 export const MAX_SQL_WRITES = DEFAULT_LIMITS.sqlWritesPerDay;
 export const MAX_SQL_READS = DEFAULT_LIMITS.sqlReadsPerDay;
 export const MAX_DATABASE_HIGH_WATER_BYTES = DEFAULT_LIMITS.databaseHighWaterBytes;

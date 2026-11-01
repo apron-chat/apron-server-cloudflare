@@ -4,8 +4,8 @@
     "rules": [
       {
         "ref": "apron_invalid_request",
-        "description": "Apron: allow WebSocket handshakes, connection status probes, and upload writes",
-        "expression": "(http.host eq \"server.apron.chat\") and not (http.request.method in {\"PUT\" \"OPTIONS\"} and starts_with(http.request.uri.path, \"/w/\")) and (http.request.method ne \"GET\" or not http.request.uri.path in {\"/\" \"/ws\"} or (not any(lower(http.request.headers[\"upgrade\"][*])[*] eq \"websocket\") and not any(http.request.uri.args[\"apron_connection_status\"][*] eq \"1\")))",
+        "description": "Apron: allow WebSocket handshakes, connection status probes, upload writes, and live text",
+        "expression": "(http.host eq \"server.apron.chat\") and not (http.request.method in {\"PUT\" \"OPTIONS\"} and starts_with(http.request.uri.path, \"/w/\")) and not (http.request.method in {\"GET\" \"HEAD\" \"OPTIONS\"} and starts_with(http.request.uri.path, \"/live/\")) and (http.request.method ne \"GET\" or not http.request.uri.path in {\"/\" \"/ws\"} or (not any(lower(http.request.headers[\"upgrade\"][*])[*] eq \"websocket\") and not any(http.request.uri.args[\"apron_connection_status\"][*] eq \"1\")))",
         "action": "block",
         "enabled": true
       },

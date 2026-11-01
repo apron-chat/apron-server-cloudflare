@@ -78,11 +78,18 @@ ${end}`;
  * The zone rules for the server's hostname. With `mediaHostname`, the
  * bucket's public domain for uploads, `write_url` requests (`PUT` and its
  * preflight on `/w/`) are allowed and the budget stop blocks both hosts.
+ * With `liveText`, `write_url` requests are allowed too, and the reads of a
+ * live text's `url` (`GET`, `HEAD` and a preflight on `/live/`). With
+ * `relatedOrigins`, where the server's hostname is its `RP_ID`, `GET` and
+ * `HEAD` of `/.well-known/webauthn`, the passkey related origins, are too.
  */
-export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHostname = undefined) {
+export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHostname = undefined, liveText = false, relatedOrigins = false) {
 	validateAdmission(admission);
 	const host = `http.host eq ${JSON.stringify(hostname)}`;
-	const writes = mediaHostname ? ' and not (http.request.method in {"PUT" "OPTIONS"} and starts_with(http.request.uri.path, "/w/"))' : '';
+	const writes = (mediaHostname || liveText ? ' and not (http.request.method in {"PUT" "OPTIONS"} and starts_with(http.request.uri.path, "/w/"))' : '') +
+		(liveText ? ' and not (http.request.method in {"GET" "HEAD" "OPTIONS"} and starts_with(http.request.uri.path, "/live/"))' : '') +
+		(relatedOrigins ? ' and not (http.request.method in {"GET" "HEAD"} and http.request.uri.path eq "/.well-known/webauthn")' : '');
+	const allowed = ['WebSocket handshakes', 'connection status probes', ...(mediaHostname ? ['upload writes'] : []), ...(liveText ? ['live text'] : []), ...(relatedOrigins ? ['passkey related origins'] : [])];
 	const stopped = mediaHostname ? `http.host in {${JSON.stringify(hostname)} ${JSON.stringify(mediaHostname)}}` : host;
 	return {
 		custom: {
@@ -90,7 +97,7 @@ export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHos
 			rules: [
 				{
 					ref: 'apron_invalid_request',
-					description: mediaHostname ? 'Apron: allow WebSocket handshakes, connection status probes, and upload writes' : 'Apron: allow WebSocket handshakes and connection status probes',
+					description: `Apron: allow ${allowed.slice(0, -1).join(', ')}${allowed.length > 2 ? ',' : ''} and ${allowed[allowed.length - 1]}`,
 					expression: `(${host})${writes} and (http.request.method ne "GET" or not http.request.uri.path in {"/" "/ws"} or (not any(lower(http.request.headers["upgrade"][*])[*] eq "websocket") and not any(http.request.uri.args["apron_connection_status"][*] eq "1")))`,
 					action: 'block', enabled: true,
 				},
@@ -218,6 +225,11 @@ export function mediaHostname(source) {
 	return source.match(/^MEDIA_ORIGIN\s*=\s*"https:\/\/([a-z0-9.-]+)"\s*(?:#.*)?$/m)?.[1];
 }
 
+/** A Wrangler config's `RP_ID` var, if it sets one, lowercased as the Worker reads it. */
+export function relyingPartyId(source) {
+	return source.match(/^RP_ID\s*=\s*"([A-Za-z0-9.-]+)"\s*(?:#.*)?$/m)?.[1].toLowerCase();
+}
+
 function main() {
 	const check = process.argv[2] === '--check';
 	if (process.argv.length > (check ? 3 : 2)) throw new Error('Usage: node scripts/budget.mjs [--check]');
@@ -246,7 +258,11 @@ function main() {
 	const hosts = [...production.matchAll(/pattern\s*=\s*"([a-z0-9.-]+)"\s*,\s*custom_domain\s*=\s*true/g)];
 	if (hosts.length !== 1) throw new Error('Expected exactly one production custom domain');
 	const media = PLAN.uploads ? mediaHostname(production) : undefined;
-	outputs.push(['docs/edge-rules.generated.json', JSON.stringify(renderEdgeRules(hosts[0][1], ADMISSION_BUDGET, media), null, 2) + '\n']);
+	const liveText = Boolean(PLAN.liveText && PLAN.features.liveText);
+	// The Worker answers /.well-known/webauthn only on RP_ID's host, so the
+	// rule lets it through only where that is the server's own hostname.
+	const relatedOrigins = relyingPartyId(production) === hosts[0][1];
+	outputs.push(['docs/edge-rules.generated.json', JSON.stringify(renderEdgeRules(hosts[0][1], ADMISSION_BUDGET, media, liveText, relatedOrigins), null, 2) + '\n']);
 	let stale = false;
 	for (const [file, expected] of outputs) {
 		const path = new URL(file, root);

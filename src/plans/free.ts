@@ -169,6 +169,34 @@ export const FREE_PLAN: Plan = Object.freeze({
 		registersPerUserMinute: 10,
 		ttlSeconds: 24 * 60 * 60,
 	}),
+	// Live text (embed:terminal, embed:append), off by default here (features
+	// below; LIVE_TEXT=true turns it on). A text keeps the one object awake
+	// while it streams, which the duration allowance covers (one object awake
+	// all day is 10,800 of its 13,000 GB-s), and costs a Durable Object
+	// request for its write and for each read: at most 30 texts a day of 15
+	// reads each is 480 of the 100,000. Its rows are two or three posts'
+	// worth, and its kept text at most 3 MB of a day's retention.
+	liveText: Object.freeze({
+		// The owner's ceilings: 120 seconds, and 300 for admins and mods.
+		maxSeconds: 120,
+		moderatorMaxSeconds: 300,
+		// A command's write_url waits two minutes for its PUT.
+		writeWindowSeconds: 120,
+		terminalKeepBytes: 16 * 1024,
+		maxInputBytes: 1024 * 1024,
+		// The message text limit: the body never grows past it.
+		appendMaxBytes: 4_096,
+		// Three texts at once, then one every 3 minutes and 20 seconds; an
+		// IP twice that, for two people behind one address.
+		startsPerUser: 3,
+		startsPerIp: 6,
+		startWindowMinutes: 10,
+		startsPerUserDay: 10,
+		startsPerDay: 30,
+		concurrent: 2,
+		readersPerText: 5,
+		readsPerText: 15,
+	}),
 	features: Object.freeze({
 		activity: false,
 		guestPosting: false,
@@ -187,5 +215,7 @@ export const FREE_PLAN: Plan = Object.freeze({
 		// foreground writes). Requests are already this plan's
 		// scarcest allowance after SQL writes; status adds none.
 		presence: true,
+		// Live text: off on Free, where the demo is meant to hibernate.
+		liveText: false,
 	}),
 });

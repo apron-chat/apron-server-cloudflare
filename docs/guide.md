@@ -92,6 +92,23 @@ With `MEDIA_ORIGIN` equal to `PUBLIC_ORIGIN`, the Worker serves `GET` and
 from any origin; in production the bucket's own domain serves them and the
 Worker does not.
 
+The same `PUBLIC_ORIGIN` and `UPLOAD_SIGNING_KEY` turn live text on
+(`embed:terminal` and `embed:append`; [configuration](configuration.md#live-text)).
+To try it, sign in (the admin token above is an `admin`, so its texts may
+stream for 300 seconds; a user from `/invite-token <user_id>` or a passkey
+gets 120, as does a guest with `--var GUEST_POSTING:true`), send
+`/embed-terminal make test` or `/embed-append **Plan:**`, and run the
+recipe in the `~private` notice, such as:
+
+```sh
+script -qfc 'stty cols 80 rows 40; ls --color=always -l /' /dev/null | curl -sT - '<write_url>'
+for word in One two three; do printf '%s ' "$word"; sleep 1; done | curl -sT - '<write_url>'
+```
+
+Then `curl -s <url>` of the message's embed shows the text as it grows. The
+`PUT` is answered when the text has ended and its last snapshot is out.
+`LIVE_TEXT_MAX_SECONDS=10` and the like shorten the limits for a quick try.
+
 ```sh
 npm run typecheck
 npm test
@@ -224,6 +241,13 @@ signs in nor posts for a week is signed out and taken out of its rooms (what
 it posted stays); run `/invite-bot` again for a new token. See
 [SPEC section 5](../SPEC.md#bots).
 
+A bot streams an LLM's reply as it generates with live text: a `message`
+whose body has `{"kind": "append"}` in `embeds` gets a `write_url` in its
+result, and the bot `PUT`s the text there as a streaming body; everyone sees
+the message grow, and when the body ends the text joins `body.text`. A bot
+has one open at a time, for at most two minutes and the message text limit
+(see [live text](limits.md#live-text)).
+
 This repository runs one: the [Announce workflow](../.github/workflows/announce.yml)
 posts each pull request merged into `main` to `general`, with a link preview
 (`og` title, description, and site name) built from the pull request, using
@@ -282,6 +306,14 @@ consume them. A retried request with an `id` accepted in the last 24 hours
 does not post again. See [posting and other writes](limits.md#posting-and-other-writes)
 for the numbers.
 
+Live text (a terminal or an append, streamed with `curl -T` to a
+`write_url`) streams for at most two minutes, five for admins and mods; a
+user has one open at a time, a handful a day, and the server a hundred a
+day. It lives only in the server's memory while it streams and is stored
+once, when it ends, kept with its message for the retention window: a
+deploy or an eviction mid-stream ends it without its text. See
+[live text](limits.md#live-text).
+
 Temporary limits return `retry_after`, and clients back off (see
 [how a limit reaches you](limits.md#how-a-limit-reaches-you)). Daily
 posting/write exhaustion makes the demo read-only while affordable reads
@@ -290,6 +322,39 @@ not revoke existing passkeys. Permanent identity/thread-room caps return
 `denied`. Storage pressure suspends growth and retains the published history
 boundary; it never shortens history to accept another post. Global frame
 exhaustion closes sockets and rejects new admissions until replenishment.
+
+## Passkeys on your own server
+
+A self-hosted server sets `RP_ID` to its own host or a domain it is under;
+Apron clients refuse any other ([PROTOCOL.md §4.10](https://github.com/shazow/apron/blob/main/PROTOCOL.md#410-webauthn-authentication)).
+Each frontend offered passkeys is listed in `RP_ORIGINS` (and in
+`ALLOWED_ORIGINS`, unless that is `*`). One on the RP ID's domain needs
+nothing more; one elsewhere, such as the shared client at
+`https://web.apron.chat`, works as a WebAuthn
+[related origin](https://www.w3.org/TR/webauthn-3/#sctn-related-origins):
+
+```toml
+[vars]
+RP_ID = "apron.shazow.net"
+RP_ORIGINS = "https://apron.shazow.net,https://web.apron.chat"
+ALLOWED_ORIGINS = "https://apron.shazow.net,https://web.apron.chat"
+```
+
+The browser on `web.apron.chat` fetches
+`https://apron.shazow.net/.well-known/webauthn` and takes the RP ID only if
+that lists its origin. The Worker answers it with `RP_ORIGINS`, cached for
+five minutes, when it serves the RP ID's own host, as here, without waking
+the Durable Object. Where it does not, as with the Worker on
+`chat.example.com` and `RP_ID = "example.com"`, serve
+`{"origins": [...]}` as JSON at `https://example.com/.well-known/webauthn`
+yourself: nothing else does. Startup does not check `RP_ORIGINS` against
+`RP_ID`, so a mistyped origin fails only in the browser, which refuses the
+passkey there. With edge rules, regenerate them: `apron_invalid_request`
+lets the path through when the production custom domain is `RP_ID`
+([edge admission](edge-admission.md)). Browsers without related origins
+refuse passkeys on such a frontend; there its users sign in another way,
+such as with a token from `/invite-device` ([other devices](#other-devices)).
+Changing `RP_ID` strands the passkeys registered under the old one.
 
 ## Operations and secrets
 
@@ -408,6 +473,10 @@ For direct Wrangler production commands, always pass
    domain, cache rule and signing key first ([uploads](configuration.md#uploads));
    deploying fails without the bucket. For push, set the VAPID keys and
    contact ([push](configuration.md#push)); without them push stays off.
+   Live text needs only `PUBLIC_ORIGIN` and `UPLOAD_SIGNING_KEY`, and the
+   regenerated `apron_invalid_request` rule, which lets `/w/` writes and
+   `/live/` reads through ([live text](configuration.md#live-text)); until
+   the rule is updated, the edge blocks them.
 3. Set `ALLOWED_ORIGINS = "*"` for the public reference server. Keep the
    passkey RP ID `apron.chat` and the explicit, exact `RP_ORIGINS` allowlist;
    wildcard guest admission never enables wildcard passkey verification.
@@ -438,8 +507,10 @@ For direct Wrangler production commands, always pass
    and merge the matching frontend in apron-chat/apron-web, which deploys it.
    Verify guest access, passkey registration/login, edits, threads, private
    rooms, reactions, history, duplicate retries, custom-origin guest access,
-   and rejection of passkey requests from unapproved origins against the
-   deployed endpoint.
+   rejection of passkey requests from unapproved origins, and a short
+   `/embed-terminal` and `/embed-append` stream (its readers, its time limit,
+   and that the `PUT`'s answer arrives after the final snapshot through the
+   edge) against the deployed endpoint.
 7. Exercise idle **hibernation and wake**, then a real redeploy/reconnect. Check
    identity attachments, challenges, persistent quotas, room head/floor, alarm
    scheduling, and recovery. A local reconnect test alone does not establish
