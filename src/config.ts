@@ -567,8 +567,11 @@ function loadLiveText(env: EnvLike, limits: Limits): LiveTextConfig | undefined 
 	if (!publicOrigin || !signingKey) return undefined;
 	if (!validOrigin(publicOrigin)) throw new ConfigError("PUBLIC_ORIGIN must be an exact HTTP(S) origin");
 	if (signingKey.length < 32) throw new ConfigError("UPLOAD_SIGNING_KEY must be at least 32 characters");
-	const viewerUrl = terminalViewerUrl(env.TERMINAL_VIEWER_URL);
-	return { policy, publicOrigin, signingKey, ...(viewerUrl ? { viewerUrl } : {}) };
+	let viewerUrl = terminalViewerUrl(env.TERMINAL_VIEWER_URL);
+	// The viewer reads only https, so an http origin (such as `wrangler dev`)
+	// serves its terminals' text to browsers too, unless the viewer is http.
+	if (viewerUrl?.startsWith("https:") && !publicOrigin.startsWith("https:")) viewerUrl = undefined;
+	return { policy, publicOrigin, signingKey, viewerUrl };
 }
 
 /** Apron's stand-alone terminal viewer, where a browser opening a terminal's `url` goes unless `TERMINAL_VIEWER_URL` says otherwise. */
@@ -588,7 +591,7 @@ function terminalViewerUrl(raw: string | undefined): string | undefined {
 	} catch {
 		throw new ConfigError("TERMINAL_VIEWER_URL must be an http(s) URL, or empty for none");
 	}
-	if ((url.protocol !== "https:" && url.protocol !== "http:") || url.hash || url.username || url.password) {
+	if ((url.protocol !== "https:" && url.protocol !== "http:") || value.includes("#") || url.username || url.password) {
 		throw new ConfigError("TERMINAL_VIEWER_URL must be an http(s) URL without a fragment or user info, or empty for none");
 	}
 	return value;

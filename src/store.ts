@@ -437,7 +437,15 @@ const TERMINAL_DESCRIPTIONS = {
  * describes, which opens its `url`. Titled as the embed is.
  */
 export function terminalOg(title: unknown, state: keyof typeof TERMINAL_DESCRIPTIONS): { title: string; description: string } {
-  return { title: typeof title === "string" && title ? title : "Terminal", description: TERMINAL_DESCRIPTIONS[state] };
+  return { title: typeof title === "string" && title ? boundTitle(title) : "Terminal", description: TERMINAL_DESCRIPTIONS[state] };
+}
+
+/** At most this many code points of a terminal's title go in its `og` and the viewer's link. */
+export const MAX_TERMINAL_TITLE = 200;
+
+/** A terminal's title cut to `MAX_TERMINAL_TITLE` code points. */
+export function boundTitle(title: string): string {
+  return title.length <= MAX_TERMINAL_TITLE ? title : Array.from(title).slice(0, MAX_TERMINAL_TITLE).join("");
 }
 
 function isLiveEntry(value: unknown): value is LiveEntry {

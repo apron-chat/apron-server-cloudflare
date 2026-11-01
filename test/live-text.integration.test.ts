@@ -353,6 +353,63 @@ describe('live text end to end', () => {
 		} finally { writer.close(); }
 	});
 
+	it('drops a sender\'s og on a terminal, links the viewer with any title, and redirects only a terminal\'s page (§4.8.5, §4.8.6)', async () => {
+		const userId = unique('linker');
+		const writer = await signedIn(userId, ['mod']);
+		const title = 'a&b #c+d ü 🚀%';
+		const navigate = (url: string, method = 'GET') => SELF.fetch(url, { method, headers: { 'CF-Connecting-IP': ip(), 'Sec-Fetch-Mode': 'navigate' }, redirect: 'manual' });
+		try {
+			const { frame, skipped } = await exchange(writer, 'post', 'message', { body: { text: 'Build:', embeds: [{ kind: 'terminal', title, og: { title: 'forged' } }] } });
+			const id = frame.result.message_id;
+			const embedId = skipped.find(isMessage(id))!.params.body.embeds[0].embed_id;
+			expect(skipped.find(isMessage(id))!.params.body.embeds[0].og).toEqual(terminalOg(title, 'waiting'));
+			const put = streamTo(frame.result.embeds[0].write_url);
+			const url = await startedUrl(writer, id);
+			// A save while it is live keeps the server's og too.
+			const saved = await exchange(writer, 'save', 'message', { message_id: id, body: { text: 'Build:', embeds: [{ embed_id: embedId, kind: 'terminal', title, og: { title: 'forged' } }] } });
+			expect(saved.frame.error).toBeUndefined();
+			const resaved = saved.skipped.find((f) => isMessage(id)(f) && f.params.body?.embeds?.[0]?.og !== undefined)
+				?? (await until(writer, (f) => isMessage(id)(f) && f.params.body?.embeds?.[0]?.og !== undefined)).frame;
+			expect(resaved.params.body.embeds[0]).toMatchObject({ url, og: terminalOg(title, 'live') });
+			// Redirects aren't reads: more of them than readsPerText leave a reader its read.
+			const { readsPerText } = await runInDurableObject(stub(), (instance) => (instance as unknown as { config: { liveText: { policy: { readsPerText: number } } } }).config.liveText.policy);
+			for (let index = 0; index <= readsPerText; index++) {
+				const page = await navigate(url);
+				expect(page.status).toBe(302);
+				const fragment = new URLSearchParams(new URL(page.headers.get('Location')!).hash.slice(1));
+				expect([fragment.get('stream'), fragment.get('title')]).toEqual([url, title]);
+			}
+			// HEAD, even from a page, gets the text's headers.
+			const head = await navigate(url, 'HEAD');
+			expect([head.status, head.headers.get('Content-Type')]).toEqual([200, 'text/plain; charset=utf-8']);
+			// Without a viewer, a page gets the text.
+			const { liveText } = await runInDurableObject(stub(), (instance) => (instance as unknown as { config: { liveText: Record<string, unknown> } }).config);
+			await setConfig({ liveText: { ...liveText, viewerUrl: undefined } });
+			try {
+				const page = await navigate(url);
+				expect([page.status, page.headers.get('Location')]).toEqual([200, null]);
+				await page.body?.cancel();
+			} finally { await setConfig({ liveText }); }
+			const reader = await readerOf(url);
+			expect(reader.response.status).toBe(200);
+			await put.send('ok\n');
+			await reader.waitFor('ok\n');
+			await put.end();
+			await put.response;
+			await reader.ended();
+
+			// An append's url is never redirected.
+			const append = await exchange(writer, 'append', 'message', { body: { text: 'logs:', format: 'markdown', embeds: [{ kind: 'append' }] } });
+			const rest = streamTo(append.frame.result.embeds[0].write_url);
+			const appendUrl = await startedUrl(writer, append.frame.result.message_id);
+			const page = await navigate(appendUrl);
+			expect([page.status, page.headers.get('Location'), page.headers.get('Vary')]).toEqual([200, null, null]);
+			await page.body?.cancel();
+			await rest.end();
+			await rest.response;
+		} finally { writer.close(); }
+	});
+
 	it('keeps streaming a write whose claim an expiry queued behind', async () => {
 		const userId = unique('racer');
 		const writer = await signedIn(userId, ['mod']);

@@ -239,10 +239,19 @@ describe('live text policy', () => {
 		expect(configured.liveText!.viewerUrl).toBe('https://terminal.apron.chat/');
 		expect(loadConfig({ ...env, TERMINAL_VIEWER_URL: 'https://terminal.example/view' }).liveText!.viewerUrl).toBe('https://terminal.example/view');
 		expect(loadConfig({ ...env, TERMINAL_VIEWER_URL: '' }).liveText!.viewerUrl).toBeUndefined();
-		for (const bad of ['terminal.apron.chat', 'javascript:alert(1)', 'https://terminal.example/#stream=', 'https://user@terminal.example/']) {
+		// The viewer reads only https, so an http origin has none, unless the viewer is http too.
+		expect(loadConfig({ ...env, PUBLIC_ORIGIN: 'http://localhost:8787' }).liveText!.viewerUrl).toBeUndefined();
+		expect(loadConfig({ ...env, PUBLIC_ORIGIN: 'http://localhost:8787', TERMINAL_VIEWER_URL: ' http://localhost:8000/ ' }).liveText!.viewerUrl).toBe('http://localhost:8000/');
+		for (const bad of ['terminal.apron.chat', 'javascript:alert(1)', 'https://terminal.example/#stream=', 'https://terminal.example/#', 'https://user@terminal.example/']) {
 			expect(() => loadConfig({ ...env, TERMINAL_VIEWER_URL: bad }), bad).toThrow(ConfigError);
 		}
 		expect(() => loadConfig({ ...env, LIVE_TEXT: 'maybe' })).toThrow(ConfigError);
+	});
+
+	it('describes a terminal in its og, with its title cut to 200 code points', () => {
+		expect(terminalOg(undefined, 'waiting')).toEqual({ title: 'Terminal', description: 'A terminal, waiting for its program\'s output.' });
+		const long = '🚀'.repeat(250);
+		expect(terminalOg(long, 'finished').title).toBe('🚀'.repeat(200));
 	});
 
 	it('words the command notice with the write URL and this user\'s limits', () => {

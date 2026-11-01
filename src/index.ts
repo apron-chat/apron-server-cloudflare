@@ -85,6 +85,7 @@ import {
 	type UploadFinish,
 	type UploadWrite,
 	STORAGE_UNAVAILABLE,
+	boundTitle,
 } from "./store";
 import { isProtocolId } from "./domain";
 
@@ -5951,9 +5952,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		const viewer = session.entry.kind === "terminal" ? viewerUrl : undefined;
 		if (viewer && navigate) {
-			const title = this.store.liveEmbedTitle(session.entry.messageId!, session.entry.embedId);
-			const fragment = new URLSearchParams({ stream: `${publicOrigin}/live/${id}`, ...(title ? { title } : {}) });
-			return new Response(null, { status: 302, headers: { Location: `${viewer.split("#")[0]}#${fragment}`, "Cache-Control": "no-store", Vary: "Sec-Fetch-Mode" } });
+			const { messageId, embedId } = session.entry;
+			const title = messageId === undefined ? undefined : this.store.liveEmbedTitle(messageId, embedId);
+			const fragment = new URLSearchParams({ stream: `${publicOrigin}/live/${id}`, ...(title ? { title: boundTitle(title) } : {}) });
+			return new Response(null, { status: 302, headers: { Location: `${viewer}#${fragment}`, "Cache-Control": "no-store", Vary: "Sec-Fetch-Mode" } });
 		}
 		const headers = liveTextHeaders();
 		// Readers that fetch it get the text; a browser opening it as a page, the viewer.
