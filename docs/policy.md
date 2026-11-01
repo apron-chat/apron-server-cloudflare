@@ -96,8 +96,9 @@ within it:
 - Activity (where on): typing is relayed to the room's other
   members and never stored, at most 10 relays per user per minute; past that, updates are dropped and the
   sender gets one `~private` notice a minute saying so. A registered user's
-  read cursor (`read_message_id`) is relayed to their own other connections
-  only, never to others (no read receipts), and kept for the rooms they
+  read cursor (`read_message_id`) is relayed to their own other connections,
+  and in a private room of at most 10 members to its other members unless they chose `invisible`
+  (read receipts; none in other rooms), and kept for the rooms they
   joined: written at most once a minute per connection and when it closes,
   and sent back after their next listing, so another device, or a reload,
   shows the same rooms read. A guest's is dropped. Activity has no part in
@@ -417,7 +418,9 @@ Every extension the frame advertises is defined in
 [EXTENSIONS.md](https://github.com/shazow/apron/blob/main/EXTENSIONS.md):
 
 - `ext:settings` carries `server.params.ext.settings`: `read_cursors`,
-  whether a registered user's read cursors are kept (with activity), and
+  whether a registered user's read cursors are kept (with activity),
+  `read_receipts`, `"private"` where private rooms' members see each
+  other's (with activity) and otherwise `false`, and
   `private_rooms`, the number of private rooms one user may be in.
 - `ext:media`, where uploads are configured, carries
   `server.params.ext.media`: the media origin when it is not the server's,

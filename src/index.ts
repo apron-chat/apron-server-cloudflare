@@ -67,6 +67,7 @@ import {
 	liveDeadline,
 	liveResultEmbed,
 	isPrivateRoomId,
+	MAX_READ_RECEIPT_MEMBERS,
 	seenStands,
 	type Broadcast,
 	type ClaimedPush,
@@ -2204,11 +2205,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// Extension `ext:settings` (EXTENSIONS.md): server-wide settings.
 				// `read_cursors`: an `activity` `read_message_id` is kept; a
 				// registered user's are, with `activity` (handleActivity), so
-				// `false` only without it. `private_rooms`: the most private rooms
-				// one user may be in. What each user may do is in `you`
-				// (permissions).
+				// `false` only without it. `read_receipts`: where a member's
+				// cursor is shown to the room's other members, `"private"`
+				// (private rooms only) with `activity`, else `false`.
+				// `private_rooms`: the most private rooms one user may be in.
+				// What each user may do is in `you` (permissions).
 				ext: {
-					settings: { read_cursors: this.activityOn(), private_rooms: this.config.limits.privateMembershipsPerUser },
+					settings: { read_cursors: this.activityOn(), read_receipts: this.activityOn() ? "private" : false, private_rooms: this.config.limits.privateMembershipsPerUser },
 					...(this.config.uploads ? { media: this.mediaSettings(this.config.uploads) } : {}),
 					// Extension `ext:emoji`: where clients fetch the catalog, which
 					// changes with it (publishEmoji).
@@ -3683,8 +3686,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * A registered user's `read_message_id` in a room they see (§4.6): relayed
 	 * at once to their other connections, so each of their devices shows the
-	 * room read, within an allowance of its own as large as typing's (a cursor past it is
-	 * kept, and its devices learn of it at their next listing). For a room
+	 * room read, and in a private room to its other members' connections too
+	 * (read receipts, `ext.settings.read_receipts`) unless they chose
+	 * `invisible`, within an allowance of its own as large as typing's (a
+	 * cursor past it is kept, and the others learn of it at their next
+	 * listing). For a room
 	 * they joined, it is kept on this connection until written (flushReads)
 	 * rather than written now: a reader's cursors cost about one write a
 	 * minute and a room, however often their client sends them. One not past
@@ -3702,8 +3708,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Read through `read`: what waits or is held to push for the room up to it is not needed.
 		this.dropWakes(identity.user_id, roomId, read);
 		this.dropHeld(identity.user_id, roomId, read);
-		const peers = this.connectionsOf(identity.user_id, socket);
-		if (peers.length && this.takeThrottle(socket, identity.user_id, "read", this.config.limits.activityBroadcastsPerUserMinute, now)) {
+		const peers = new Set(this.connectionsOf(identity.user_id, socket));
+		// Read receipts: a small private room's other members (only they see it) get it too, unless the reader is invisible.
+		// The room's size is read only when another member is connected to receive it, and within the allowance.
+		const members = isPrivateRoomId(roomId) && (connectionAttachment(socket) ?? attachment).choice !== "invisible"
+			? this.ctx.getWebSockets().filter((ws) => {
+				const state = connectionAttachment(ws as WebSocketConnection);
+				return ws !== socket && state?.userId !== identity.user_id && state?.rooms?.includes(roomId);
+			}) as WebSocketConnection[]
+			: [];
+		if ((peers.size || members.length) && this.takeThrottle(socket, identity.user_id, "read", this.config.limits.activityBroadcastsPerUserMinute, now)) {
+			if (members.length && this.receiptsRoom(roomId, now)) for (const peer of members) peers.add(peer);
 			const frame = { method: "activity", params: { room_id: roomId, from: identity, read_message_id: read } };
 			for (const peer of peers) this.deliverTo(peer, frame);
 		}
@@ -3712,6 +3727,21 @@ export class ApronDemoServer extends DurableObject<Env> {
 		latest.reads = { ...latest.reads, [roomId]: read };
 		if (now - (latest.readsAt ?? 0) >= READ_CURSOR_FLUSH_MS || Object.keys(latest.reads).length > MAX_ATTACHED_ROOMS) this.flushReads(latest, now, socket);
 		else writeAttachment(socket, latest);
+	}
+
+	/**
+	 * Whether a private room is small enough for read receipts, at most
+	 * MAX_READ_RECEIPT_MEMBERS registered members (Store.roomMemberCount, one
+	 * read). One the store cannot read for now is not: the cursor still goes
+	 * to the reader's own connections.
+	 */
+	private receiptsRoom(roomId: string, now: number): boolean {
+		try {
+			const count = this.store.roomMemberCount(roomId, now);
+			return count !== undefined && count <= MAX_READ_RECEIPT_MEMBERS;
+		} catch {
+			return false;
+		}
 	}
 
 	/**
@@ -3740,7 +3770,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * the joined rooms in it, as `activity` from them, each the one kept
 	 * (Store.readCursors, one range read) or, if further, one their
 	 * connections hold unwritten. A cursor the store cannot read for now (an
-	 * exhausted budget) is not sent: the client keeps the one it has.
+	 * exhausted budget) is not sent: the client keeps the one it has. Then
+	 * the read receipts of the private rooms in it (sendReadReceipts).
 	 */
 	private sendReadCursors(socket: WebSocketConnection, attachment: ConnectionAttachment, roomIds: readonly string[]): void {
 		const identity = publicIdentity(attachment);
@@ -3760,6 +3791,45 @@ export class ApronDemoServer extends DurableObject<Env> {
 		for (const roomId of roomIds) {
 			const read = cursors.get(roomId);
 			if (read !== undefined) this.deliverTo(socket, { method: "activity", params: { room_id: roomId, from: identity, read_message_id: read } });
+		}
+		this.sendReadReceipts(socket, identity.user_id, roomIds.filter(isPrivateRoomId));
+	}
+
+	/**
+	 * Read receipts after a listing (`ext.settings.read_receipts`
+	 * `"private"`): for each private room listed of at most
+	 * MAX_READ_RECEIPT_MEMBERS members, the other members' read cursors, as
+	 * `activity` from each (`from` holds only their `user_id`: the client
+	 * knows the members), the one kept (Store.roomReadCursors) or, if
+	 * further, one their connections hold unwritten. A member who chose `invisible` shows no
+	 * cursor (Store.roomReadCursors leaves theirs out too). Those the store
+	 * cannot read for now are not sent, as for the user's own.
+	 */
+	private sendReadReceipts(socket: WebSocketConnection, userId: string, roomIds: readonly string[]): void {
+		if (!roomIds.length) return;
+		let kept: Map<string, Array<[string, string]>>;
+		try {
+			kept = this.store.roomReadCursors(roomIds, userId, nowMs());
+		} catch {
+			return;
+		}
+		// The rooms small enough for receipts are those the store answered for.
+		const cursors = new Map([...kept].map(([roomId, rows]) => [roomId, new Map(rows)]));
+		for (const ws of this.ctx.getWebSockets()) {
+			const state = connectionAttachment(ws as WebSocketConnection);
+			if (state?.tier !== "registered" || !state.userId || !state.reads || state.choice === "invisible") continue;
+			for (const [roomId, read] of Object.entries(state.reads)) {
+				// Held for a room the connection has since left (a leave, a kick): not a member's any more.
+				if (!state.rooms?.includes(roomId)) continue;
+				const room = cursors.get(roomId);
+				const current = room?.get(state.userId);
+				if (room && (current === undefined || Number(read) > Number(current))) room.set(state.userId, read);
+			}
+		}
+		for (const [roomId, room] of cursors) {
+			for (const [member, read] of room) {
+				if (member !== userId) this.deliverTo(socket, { method: "activity", params: { room_id: roomId, from: { user_id: member }, read_message_id: read } });
+			}
 		}
 	}
 

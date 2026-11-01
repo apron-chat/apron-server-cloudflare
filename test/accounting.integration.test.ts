@@ -779,6 +779,37 @@ describe('measured storage accounting', () => {
 		console.info('accounting-maintenance-reserve', JSON.stringify(result));
 	});
 
+	it('reads read receipts only for private rooms of at most 10 members, within their reservation however large the room', async () => {
+		const stub = env.DEMO.getByName('accounting-read-receipts-room-size-v1');
+		await runInDurableObject(stub, async (_instance, state) => {
+			const clock = new FakeClock(futureUtcNoon());
+			const store = new Store(state, defaultStoreConfig(), clock);
+			store.initialize();
+			const sql = state.storage.sql;
+			const fill = (roomId: string, count: number) => {
+				for (let index = 0; index < count; index += 1) sql.exec('INSERT INTO memberships (room_id, user_id) VALUES (?, ?)', roomId, `m${String(index).padStart(3, '0')}`);
+			};
+			// 150 members, most without a cursor and the first ten invisible with one: too large, and read within budget.
+			fill('private_large', 150);
+			for (let index = 0; index < 10; index += 1) {
+				const userId = `m${String(index).padStart(3, '0')}`;
+				sql.exec('INSERT INTO read_cursors (user_id, room_id, message_id) VALUES (?, ?, ?)', userId, 'private_large', 100 + index);
+				sql.exec("INSERT OR REPLACE INTO user_status (user_id, status) VALUES (?, 'invisible')", userId);
+			}
+			sql.exec('INSERT INTO read_cursors (user_id, room_id, message_id) VALUES (?, ?, ?)', 'm020', 'private_large', 220);
+			// Ten members: the lister (m001) left out, the invisible ones (m000 to m009) too, m009's visible twin shows.
+			fill('private_ten', 10);
+			sql.exec("DELETE FROM user_status WHERE user_id = 'm009'");
+			sql.exec('INSERT INTO read_cursors (user_id, room_id, message_id) VALUES (?, ?, ?)', 'm009', 'private_ten', 309);
+			sql.exec('INSERT INTO read_cursors (user_id, room_id, message_id) VALUES (?, ?, ?)', 'm001', 'private_ten', 301);
+			// Eleven members: too large.
+			fill('private_eleven', 11);
+			const found = store.roomReadCursors(['private_large', 'private_ten', 'private_eleven'], 'm001', clock.now());
+			expect([...found]).toEqual([['private_ten', [['m009', '309']]]]);
+			expect(store.accountingStatus().unsafe).toBe(false);
+		});
+	});
+
 	it('measures every Store reservation boundary used by runtime operations', async () => {
 		const stub = env.DEMO.getByName('accounting-operation-matrix-v1');
 		const config = defaultStoreConfig({ push: { ...PUSH_POLICY! } });
@@ -935,12 +966,19 @@ describe('measured storage accounting', () => {
 			measure('read cursor written, not past the one kept', () => store.saveReadCursors({ userId: 'matrix-user', cursors: [['general', read]], now: clock.now() }));
 			measure('read cursor written, a room not joined', () => store.saveReadCursors({ userId: 'matrix-user', cursors: [['matrix-not-joined', read]], now: clock.now() }));
 			expect(measure('read cursors at a listing', () => store.readCursors('matrix-user', clock.now()))).toEqual(new Map([['general', String(Number(read) + 1)]]));
+			// Read receipts: a private room's members joined to their cursors, by primary key.
+			const privateRoom = String(store.mutate({
+				userId: 'matrix-user', ipKey: 'matrix-ip', requestId: 'matrix-private', method: 'room_set', now: clock.now(), identity: { user_id: 'matrix-user' }, params: { private: true },
+			}).result.room_id);
+			store.saveReadCursors({ userId: 'matrix-user', cursors: [[privateRoom, read]], now: clock.now() });
+			expect(measure('read receipts at a listing, one private room', () => store.roomReadCursors([privateRoom], 'matrix-other', clock.now()))).toEqual(new Map([[privateRoom, [['matrix-user', read]]]]));
+			measure('room member count (read receipts, live)', () => store.roomMemberCount(privateRoom, clock.now()));
 			clock.set(clock.now() + DAY + HOUR + 1);
 			measure('cleanup', () => store.runCleanup(clock.now()));
 			await measureAsync('alarm scheduling', () => store.scheduleAlarm(clock.now() + 1_000, clock.now()));
 
 			expect(create.result.message_id).toBeTruthy();
-			expect(costs).toHaveLength(68);
+			expect(costs).toHaveLength(70);
 			expect(store.accountingStatus().unsafe).toBe(false);
 			return { costs };
 		});
