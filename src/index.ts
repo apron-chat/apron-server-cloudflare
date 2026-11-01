@@ -6020,8 +6020,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async endLiveText(session: LiveSession, end: LiveEnd): Promise<Response> {
 		const entry = session.entry;
-		// An append's last incomplete character, if any, reads as U+FFFD, for its readers too.
-		if (session.buffer) session.readers.send(session.buffer.end());
+		// An append's last incomplete character, if any, reads as U+FFFD, for its readers too;
+		// cut at the input limit, it is dropped, so the text ends at a whole character (§4.8.5).
+		if (session.buffer) session.readers.send(session.buffer.end(end === "size"));
 		const kept = session.buffer?.kept() ?? new Uint8Array(0);
 		let published = false;
 		try {

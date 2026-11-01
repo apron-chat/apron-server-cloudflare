@@ -152,6 +152,21 @@ describe('LiveBuffer', () => {
 		expect(buffer.kept()).toEqual(encode('ab\ufffd'));
 	});
 
+	it('drops the start of a character cut at the input limit, so the text ends at a whole character', () => {
+		// Limit 8: "ab\b\bxyz" is 7 bytes of input, so the cap leaves 1 byte of "\u00e9" (C3 A9).
+		const cut = new LiveBuffer('append', 8);
+		cut.push(encode('ab\b\bxyz'));
+		expect(cut.push(bytes(0xc3)).send).toEqual(new Uint8Array(0));
+		expect(cut.end(true)).toEqual(new Uint8Array(0));
+		expect(cut.kept()).toEqual(encode('xyz'));
+		// A clean end still reads it as U+FFFD.
+		const clean = new LiveBuffer('append', 8);
+		clean.push(encode('ab\b\bxyz'));
+		clean.push(bytes(0xc3));
+		expect(clean.end()).toEqual(encode('\ufffd'));
+		expect(clean.kept()).toEqual(encode('xyz\ufffd'));
+	});
+
 	it('counts the edited text against an append\'s limit', () => {
 		// Raw, "abcd\b\befgh" passes 4 bytes at once; edited, "abef" fits and "g" ends it.
 		const buffer = new LiveBuffer('append', 4);
@@ -164,7 +179,9 @@ describe('LiveBuffer', () => {
 		const cut = new LiveBuffer('append', 4);
 		expect(cut.push(encode('xy\f\u00e9a\u20acz'))).toEqual({ send: encode('xy\f\u00e9a'), full: true });
 		expect(cut.kept()).toEqual(encode('\u00e9a'));
-		// Long drafts erased as they go never fill it.
+		// The buffer alone: drafts erased as they go never fill it. A write is
+		// stopped sooner, at its input limit (liveInputLimit), as the
+		// integration test of that limit checks.
 		const drafts = new LiveBuffer('append', 4);
 		for (let index = 0; index < 1_000; index++) expect(drafts.push(encode('four\f')).full).toBe(false);
 		expect(drafts.kept()).toEqual(new Uint8Array(0));

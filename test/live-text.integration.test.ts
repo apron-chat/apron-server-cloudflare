@@ -225,6 +225,46 @@ describe('live text end to end', () => {
 		} finally { writer.close(); }
 	});
 
+	it('stops an append\'s write at the bytes it keeps, though its edits keep less (liveInputLimit)', async () => {
+		const userId = unique('drafter');
+		const writer = await signedIn(userId, ['mod']);
+		try {
+			const { frame } = await command(writer, 'drafts', '/embed-append');
+			const put = streamTo(frame.result.embeds[0].write_url);
+			// 6,000 bytes whose edited text is 2,000: the 4 KB cap takes the 1,000 "a",
+			// then 3,096 bytes of "b" erased as they go, and nothing of the "c".
+			await put.send('a'.repeat(1_000));
+			const id = (await until(writer, fromUser(userId))).frame.params.message_id;
+			for (let index = 0; index < 4; index++) await put.send('b\b'.repeat(500));
+			await put.send('c'.repeat(1_000));
+			await put.end();
+			expect(await (await put.response).text()).toBe('Stopped at the 4 KB limit; what was kept is posted.\n');
+			const merged = (await until(writer, (f) => isMessage(id)(f) && f.params.prev_log_id !== undefined)).frame.params;
+			expect(merged.body).toEqual({ text: 'a'.repeat(1_000), format: 'markdown' });
+		} finally { writer.close(); }
+	});
+
+	it('drops a character cut at an append\'s input limit, for readers and the snapshot', async () => {
+		const userId = unique('cutter');
+		const writer = await signedIn(userId, ['mod']);
+		try {
+			const { frame } = await command(writer, 'cut', '/embed-append');
+			const put = streamTo(frame.result.embeds[0].write_url);
+			// 4,095 bytes that edit to "x", so the cap keeps only the first byte of "\u00e9" (C3 A9).
+			await put.send('a\b'.repeat(2_047) + 'x');
+			const posted = (await until(writer, fromUser(userId))).frame.params;
+			const reader = await readerOf(posted.body.embeds[0].url);
+			await reader.waitFor('x');
+			await put.send('\u00e9 and more');
+			await put.end();
+			expect(await (await put.response).text()).toBe('Stopped at the 4 KB limit; what was kept is posted.\n');
+			await reader.ended();
+			expect(reader.text()).toBe('x');
+			const merged = (await until(writer, (f) => isMessage(posted.message_id)(f) && f.params.prev_log_id !== undefined)).frame.params;
+			expect(merged.body).toEqual({ text: 'x', format: 'markdown' });
+		} finally { writer.close(); }
+	});
+
 	it('keeps a terminal\'s backspace and form feed in its output', async () => {
 		const userId = unique('typist');
 		const writer = await signedIn(userId, ['mod']);

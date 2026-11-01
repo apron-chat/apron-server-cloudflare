@@ -116,11 +116,15 @@ export class LiveBuffer {
 
 	/**
 	 * Ends an append's text: a character left incomplete reads as U+FFFD
-	 * (§4.8.3). Returns what readers get of it.
+	 * (§4.8.3), unless the write was `cut` at its input limit, which keeps
+	 * the text up to a whole character (§4.8.5) and drops the start of the
+	 * one it cut. Returns what readers get of it.
 	 */
-	end(): Uint8Array {
+	end(cut = false): Uint8Array {
 		if (!this.decoder || this.full) return NOTHING;
-		return this.append(this.decoder.decode()).send;
+		// Decoding with no more input flushes what waits, and resets the decoder either way.
+		const rest = this.decoder.decode();
+		return cut ? NOTHING : this.append(rest).send;
 	}
 
 	/**
