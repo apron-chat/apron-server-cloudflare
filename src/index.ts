@@ -489,6 +489,7 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "invite-purge", usage: "/invite-purge <user_id>", help: "sign a user out everywhere, remove their passkeys and tokens, and get a new token for them", audience: "admins" },
 	{ name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", audience: "admins" },
 	{ name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", audience: "admins" },
+	{ name: "move-thread", usage: "/move-thread <room_id>", help: "move this thread, with its messages and members, under another room", audience: "owners", roles: MODERATOR_ROLES },
 	{ name: "passkeys", usage: "/passkeys [remove <n>]", help: "list your account's passkeys, or remove one of them", audience: "owners" },
 	{ name: "purge", usage: "/purge <user_id>", help: "disconnect a user and delete their account, bot, and everything they posted or uploaded", audience: "admins" },
 	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
@@ -5556,6 +5557,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 			return;
 		}
+		if (command.name === "move-thread") {
+			try {
+				// A room may be written `#room_id`, as a channel is.
+				const target = words[1]?.replace(/^#/, "");
+				if (!target || words.length !== 2) throw { name: "invalid_params", message: `Usage: ${command.usage}, sent in the thread` } satisfies ProtocolError;
+				await this.moveThread(socket, attachment, request, roomId, target);
+			} catch (error) {
+				const protocol = errorToProtocol(error);
+				if (protocol.name !== "invalid_params") throw error;
+				this.fail(socket, request, protocol);
+			}
+			return;
+		}
 		if (command.name === "passkeys") {
 			try {
 				this.passkeysCommand(socket, attachment, request, roomId, words.slice(1));
@@ -5734,6 +5748,31 @@ export class ApronDemoServer extends DurableObject<Env> {
 		};
 		this.sendNotice(socket, roomId, notices[chosen][on ? 0 : 1]);
 		this.reply(socket, request, {});
+	}
+
+	/**
+	 * `/move-thread <room_id>`, sent in a thread: gives it a new parent, a
+	 * public top-level room (Store.commitRoomMove has who may, and where).
+	 * The thread keeps its room_id, messages and members. Its new record goes
+	 * as `room_update` `updated` to the members of the thread and of both
+	 * parents, the old one's so their clients stop listing it there, and to
+	 * the mover; then a `~private` notice and the result (§1).
+	 */
+	private async moveThread(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, parentRoomId: string): Promise<void> {
+		const identity = identityOf(attachment)!;
+		await this.runMutation(async () => {
+			const result = this.store.mutate({
+				userId: identity.user_id, tier: identity.tier, ipKey: attachment.ipKey,
+				method: "room_move", now: nowMs(), params: { room_id: roomId, parent_room_id: parentRoomId }, identity,
+			});
+			const room = result.room!;
+			this.noteRoom(room.room_id, true);
+			const scope = [room.room_id, parentRoomId, ...(result.previousParentRoomId !== undefined ? [result.previousParentRoomId] : [])];
+			this.deliver(roomUpdate("updated", room), scope, (state) => state.userId !== identity.user_id);
+			this.sendToUser(identity.user_id, roomUpdate("updated", room));
+			this.sendNotice(socket, roomId, `Moved this thread to **${result.parent?.title ?? parentRoomId}**.`);
+			this.reply(socket, request, {});
+		});
 	}
 
 	/**

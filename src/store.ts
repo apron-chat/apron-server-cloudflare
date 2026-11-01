@@ -644,7 +644,8 @@ export interface Broadcast {
   rooms: string[];
 }
 
-type MutationMethod = "message" | "room_set" | "reactions" | "me";
+/** `room_move` is the server's own (`/move-thread`), never a client method: no frame names it. */
+type MutationMethod = "message" | "room_set" | "room_move" | "reactions" | "me";
 
 export interface StoreMutationInput {
   userId: string;
@@ -686,7 +687,7 @@ export interface StoreMutationResult {
   broadcasts: Broadcast[];
   /** The saved message snapshot, for message operations. */
   message?: MessageSnapshot;
-  /** The saved room record, for `room_set`. */
+  /** The saved room record, for `room_set` and `room_move`. */
   room?: RoomRecord;
   /** Uploads this operation started; their `write_url`s go in the result (§4.8.3). */
   uploads?: PendingUpload[];
@@ -696,6 +697,9 @@ export interface StoreMutationResult {
   liveStarted?: LiveEntry[];
   /** Live texts this operation ended by removing their embed or message (§4.8.3, `edit`), by write key. */
   liveEnded?: string[];
+  /** For `room_move`: the thread's parent before the move, whose members are told too, and its new one. */
+  previousParentRoomId?: string;
+  parent?: RoomRecord;
   /** Whether `room_set` created the room, which joins its creator (§4.2.4). */
   created?: boolean;
   /** The creator's logged membership, for a registered creator (§4.2.4). */
@@ -6575,6 +6579,45 @@ export class Store {
     return { result: { room_id: row.room_id }, broadcasts: [], room: record, created, ...(membership ? { membership } : {}) };
   }
 
+  /**
+   * `room_move` (`/move-thread`): gives a thread a new parent, a public
+   * top-level room other than its current one. Only a registered user with
+   * a moderator role (MODERATOR_ROLES) may. The thread keeps its room_id,
+   * client fields, members and history, all of which are keyed by its own
+   * room_id; only its row's `parent_room_id` changes, and a new room record
+   * is logged in its log as a save's is. It counts against no ceiling: it
+   * is still one thread.
+   */
+  private commitRoomMove(input: StoreMutationInput, context: CommitContext, floor: number, registered: boolean): StoreMutationResult {
+    const { room_id: roomId, parent_room_id: parentId } = input.params;
+    if (typeof roomId !== "string" || roomId.length === 0) throw new StoreError("invalid_params", "room_id must be a non-empty string");
+    if (typeof parentId !== "string" || parentId.length === 0) throw new StoreError("invalid_params", "parent_room_id must be a non-empty string");
+    if (!registered || !this.isModerator(input.userId)) throw new StoreError("denied", "Only an admin, mod or threader may move a thread");
+    const existing = this.visibleRoomRow(roomId, input.userId);
+    if (!existing) throw new StoreError("invalid_params", "unknown room");
+    if (existing.parent_room_id === null) throw new StoreError("invalid_params", "Only a thread can be moved, and this room is not one");
+    const parent = this.visibleRoomRow(parentId, input.userId);
+    if (!parent) throw new StoreError("invalid_params", "unknown parent_room_id");
+    if (parent.parent_room_id !== null) throw new StoreError("denied", "Threads cannot be nested on this demo");
+    if (isPrivateRoomId(parent.room_id)) throw new StoreError("denied", "A private room has no threads on this demo");
+    if (parent.room_id === existing.parent_room_id) throw new StoreError("invalid_params", "The thread is already in that room");
+    const logId = this.allocateLogId(context);
+    this.rawExec(
+      "UPDATE rooms SET parent_room_id = ?, record_log_id = ?, latest_log_id = ?, updated_ms = ? WHERE room_id = ?",
+      parent.room_id, logId, logId, context.commitMs, existing.room_id,
+    );
+    const row: RawRoomRow = { ...existing, parent_room_id: parent.room_id, record_log_id: logId, latest_log_id: logId, updated_ms: context.commitMs };
+    // Delivery fields describe a client's view and are not logged.
+    const { latest_log_id: _latest, history_log_id: _history, ...logged } = this.roomRecord(row, floor);
+    void _latest; void _history;
+    this.rawExec(
+      "INSERT INTO records (room_id, log_id, commit_ms, kind, record_json) VALUES (?, ?, ?, 'room', ?)",
+      row.room_id, logId, context.commitMs, JSON.stringify(logged),
+    );
+    // Room records are not broadcast: the caller sends room_update (§4.2.3).
+    return { result: { room_id: row.room_id }, broadcasts: [], room: this.roomRecord(row, floor), previousParentRoomId: existing.parent_room_id, parent: this.roomRecord(parent, floor) };
+  }
+
   /** Thread rooms `userId` created that are still live: not removed, and with a retained log. One scan of the capped rooms table's public range. */
   private liveThreadsCreatedBy(userId: string, floor: number): number {
     return integerColumn(this.rawRows<{ count: number }>(
@@ -6730,7 +6773,7 @@ export class Store {
 
   private mutationMethod(method: string | undefined): MutationMethod {
     if (method === undefined || method === "message") return "message";
-    if (method === "room_set" || method === "reactions" || method === "me") return method;
+    if (method === "room_set" || method === "room_move" || method === "reactions" || method === "me") return method;
     throw new StoreError("unsupported", "Unsupported mutation");
   }
 
@@ -6818,6 +6861,7 @@ export class Store {
           const floor = state.history_floor;
           committed = method === "message" ? this.commitMessage(input, context, floor)
             : method === "room_set" ? this.commitRoom(input, context, floor, tier === "registered")
+            : method === "room_move" ? this.commitRoomMove(input, context, floor, tier === "registered")
             : this.commitReactions(input, context, floor);
           // Within the transaction: a move its sender cannot pay for is refused whole.
           if (context.extraPosts && !input.system) this.chargePosting({ userId: input.userId, tier, ipKey: input.ipKey, now: effective, weight: context.extraPosts });

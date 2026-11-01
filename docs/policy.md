@@ -54,7 +54,11 @@ within it:
   room's, and only an admin `general`'s. Threads and public rooms always
   carry a title (`Thread` or `Room` by default). Created top-level rooms are
   permanent like `general`; at most 16 are created, and they count against
-  the 100-thread ceiling.
+  the 100-thread ceiling. A save never changes a thread's parent; an
+  `admin`, `mod` or `threader` moves a thread under another public
+  top-level room with `/move-thread <room_id>`, sent in the thread. It keeps
+  its id, fields, members and messages, and the members of the thread and
+  of both parents get its new record.
 - `ext`: `me`, and saves of messages and rooms, merge `ext` one level deep:
   each key sent replaces its value, an empty one (`""`, `[]`, `{}`) removes
   it, and keys left out stay; the size limits apply to the merged result. A
@@ -110,7 +114,8 @@ within it:
   live text, `/embed-terminal [title]` and `/embed-append [markdown]`
   (below); those with the role `admin`,
   `mod`, or `friend` also have `/emoji add|remove :name:` (custom emoji,
-  below). Admins have their own (see [SPEC section 5](../SPEC.md#admins)),
+  below), and those with `admin`, `mod` or `threader` `/move-thread
+  <room_id>` (Rooms, above). Admins have their own (see [SPEC section 5](../SPEC.md#admins)),
   among them `/server`, which sets the server's title, description and
   avatar (below), `/toggle activity|uploads|presence|addmember|livetext`, and
   `/invite-purge <user_id>`, which signs a user out everywhere, removes

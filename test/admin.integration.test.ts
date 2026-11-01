@@ -1367,3 +1367,61 @@ it('an admin creates a top-level room that others find with room_list and join, 
 		expect(exists).toBe(true);
 	} finally { admin.close(); guest.close(); }
 });
+
+it('/move-thread lets an admin, mod or threader move a thread, with its messages and members, under another top-level room', async () => {
+	const admin = await signedInAdmin();
+	const tiaId = unique('tia');
+	const tia = await signedIn(tiaId);
+	const bobId = unique('bob');
+	const bob = await signedIn(bobId);
+	const carolId = unique('carol');
+	const carol = await signedIn(carolId);
+	const movedRecord = (threadId: string, parent?: string) => (frame: Frame) => frame.method === 'room_update' &&
+		frame.params.updated?.some((room: { room_id: string; parent_room_id?: string }) => room.room_id === threadId && (parent === undefined || room.parent_room_id === parent));
+	try {
+		const lobby = (await request(admin, 'lobby', 'room_set', { title: 'Lobby' })).result.room_id as string;
+		const threadId = (await request(bob, 'thread', 'room_set', { parent_room_id: 'general', title: 'Wanders' })).result.room_id as string;
+		const posted = (await request(bob, 'post', 'message', { room_id: threadId, body: { text: 'kept' } })).result.message_id;
+
+		// Only a moderator role may, and /help lists it to them alone.
+		expect((await command(bob, 'help', '/help')).notice!.params.body.text).not.toContain('/move-thread');
+		expect((await command(bob, 'not-yet', `/move-thread ${lobby}`, threadId)).frame.error.code).toBe(-32001);
+		await command(admin, 'give-threader', `/role ${tiaId} threader`);
+		expect((await command(tia, 'help', '/help')).notice!.params.body.text).toContain('- `/move-thread <room_id>`: move this thread');
+
+		// Bad targets are errors to show: not in a thread, no room, an unknown, nested or current parent.
+		expect((await command(tia, 'usage', '/move-thread', threadId)).frame.error.code).toBe(-32602);
+		expect((await command(tia, 'top-level', `/move-thread ${lobby}`)).frame.error.code).toBe(-32602);
+		expect((await command(tia, 'unknown', '/move-thread nowhere', threadId)).frame.error.code).toBe(-32602);
+		expect((await command(tia, 'same', '/move-thread general', threadId)).frame.error.message).toBe('The thread is already in that room');
+		const other = (await request(bob, 'other', 'room_set', { parent_room_id: 'general', title: 'Other' })).result.room_id as string;
+		expect((await command(tia, 'nested', `/move-thread ${other}`, threadId)).frame.error.code).toBe(-32001);
+
+		// The move, written `#room_id`: the mover is told, before the result.
+		const moved = await command(tia, 'move', `/move-thread #${lobby}`, threadId);
+		expect(moved.frame.result).toEqual({});
+		expect(moved.notice!.params).toMatchObject({ room_id: threadId, body: { text: 'Moved this thread to **Lobby**.' } });
+		expect(moved.skipped.find(movedRecord(threadId))!.params.updated[0]).toMatchObject({ room_id: threadId, parent_room_id: lobby, title: 'Wanders' });
+		// The thread's members, the old parent's and the new one's all get its new record.
+		for (const peer of [bob, carol, admin]) {
+			expect((await until(peer, movedRecord(threadId, lobby))).frame.params.updated[0]).toMatchObject({ room_id: threadId, title: 'Wanders' });
+		}
+
+		// Its history and members stay; listings find it under the new parent only.
+		const page = await request(bob, 'history', 'history', { room_id: threadId });
+		expect(page.result.messages.map((message: { message_id: string }) => message.message_id)).toContain(posted);
+		const listed = (await request(bob, 'list', 'room_list', { room_id: threadId, members: true })).result.joined[0];
+		expect(listed).toMatchObject({ room_id: threadId, parent_room_id: lobby, members: [{ user_id: bobId }] });
+		const under = async (parent: string) => {
+			const result = (await request(carol, unique('under'), 'room_list', { parent_room_id: parent })).result;
+			return [...(result.joined ?? []), ...(result.not_joined ?? [])].map((room: { room_id: string }) => room.room_id);
+		};
+		expect(await under(lobby)).toContain(threadId);
+		expect(await under('general')).not.toContain(threadId);
+
+		// And back, with the role; without it, no more.
+		expect((await command(tia, 'back', '/move-thread general', threadId)).frame.result).toEqual({});
+		await command(admin, 'take-threader', `/role ${tiaId} threader`);
+		expect((await command(tia, 'after', `/move-thread ${lobby}`, threadId)).frame.error.code).toBe(-32001);
+	} finally { admin.close(); tia.close(); bob.close(); carol.close(); }
+});

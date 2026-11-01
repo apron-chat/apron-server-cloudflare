@@ -735,6 +735,48 @@ it("lets a threader move anyone's messages in and out of threads, create threads
 	});
 });
 
+it("moves a thread under another top-level room (room_move) for a moderator only, keeping its id, fields, messages and members", async () => {
+	await withStore("room-move", (store, clock) => {
+		for (const userId of ["tia", "mia", "reg"]) store.createInvitedIdentity({ userId, name: userId, now: clock.value, ipKey: "ip-test" });
+		store.setRole({ userId: "tia", role: "threader", on: true, now: clock.value });
+		store.setRole({ userId: "mia", role: "mod", on: true, now: clock.value });
+		const move = (userId: string, requestId: string, params: Record<string, unknown>) => store.mutate(op(clock, userId, requestId, "room_move", params));
+		const lobby = String(store.mutate(op(clock, "mia", "lobby", "room_set", { title: "Lobby" })).result.room_id);
+		const threadId = thread(store, clock, "thread", { title: "Wanders", description: "Off topic", ext: { x: 1 } });
+		const posted = store.mutate(op(clock, "alice", "in-thread", "message", { room_id: threadId, body: { text: "kept" } }));
+		const before = store.getRoom(threadId)!;
+
+		// Guests and plain registered users may not; nor may a client's room_set.
+		expect(errorCode(() => move("alice", "guest", { room_id: threadId, parent_room_id: lobby }))).toBe("denied");
+		expect(errorCode(() => move("reg", "plain", { room_id: threadId, parent_room_id: lobby }))).toBe("denied");
+		expect(store.mutate(op(clock, "reg", "save", "room_set", { room_id: threadId, title: "Wanders", description: "Off topic", parent_room_id: lobby })).room?.parent_room_id).toBe("general");
+
+		// Only a thread moves, only to another public top-level room.
+		const other = thread(store, clock, "other");
+		const secret = String(store.mutate(op(clock, "tia", "secret", "room_set", { private: true })).result.room_id);
+		expect(errorCode(() => move("tia", "top", { room_id: lobby, parent_room_id: "general" }))).toBe("invalid_params");
+		expect(errorCode(() => move("tia", "missing", { room_id: threadId, parent_room_id: "nowhere" }))).toBe("invalid_params");
+		expect(errorCode(() => move("tia", "same", { room_id: threadId, parent_room_id: "general" }))).toBe("invalid_params");
+		expect(errorCode(() => move("tia", "nested", { room_id: threadId, parent_room_id: other }))).toBe("denied");
+		expect(errorCode(() => move("tia", "private", { room_id: threadId, parent_room_id: secret }))).toBe("denied");
+
+		const moved = move("tia", "move", { room_id: threadId, parent_room_id: lobby });
+		expect(moved.previousParentRoomId).toBe("general");
+		expect(moved.parent).toMatchObject({ room_id: lobby, title: "Lobby" });
+		expect(moved.room).toMatchObject({ room_id: threadId, parent_room_id: lobby, title: "Wanders", description: "Off topic", ext: { x: 1 } });
+		expect(Number(moved.room!.log_id)).toBeGreaterThan(Number(before.log_id));
+		expect(store.getRoom(threadId)).toMatchObject({ parent_room_id: lobby, log_id: moved.room!.log_id });
+		// The messages stay in the thread's history, after which comes its new record.
+		const page = store.historyPage({ roomId: threadId, after: "0", limit: 50, now: clock.value });
+		expect(messagesOf(page).map((message) => message.message_id)).toContain(posted.message!.message_id);
+		expect(store.listRooms(clock.value).filter((room) => room.parent_room_id === lobby).map((room) => room.room_id)).toEqual([threadId]);
+		// A mod may move it back; without the role, the threader may not again.
+		expect(move("mia", "back", { room_id: threadId, parent_room_id: "general" }).room?.parent_room_id).toBe("general");
+		store.setRole({ userId: "tia", role: "threader", on: false, now: clock.value });
+		expect(errorCode(() => move("tia", "after", { room_id: threadId, parent_room_id: lobby }))).toBe("denied");
+	});
+});
+
 it("lets every moderator role, the built-in admin included, move anyone's message with embeds, an upload and ext, thread to thread", async () => {
 	await withStore("move-any-content", (store, clock) => {
 		store.createInvitedIdentity({ userId: "mia", name: "mia", now: clock.value, ipKey: "ip-test" });
