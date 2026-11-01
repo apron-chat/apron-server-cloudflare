@@ -174,8 +174,7 @@ These keep the socket open and answer requests with `retry_after`, with
 | `degraded` | The day's budget is 70% spent: live text, uploads and loading older history (`history` with `before`) are off; chat works | Until the next UTC day |
 | `frame_budget` | The day's frames are spent: requests and new connections are refused | Until the next UTC day |
 | `daily_budget` | The day's storage budget is spent | Until the next UTC day |
-| `operation_paused` | That one action used more storage than expected three times in an hour and is paused | An hour |
-| `server_paused` | One action used far more storage than expected: everything is paused | An hour |
+| `operation_paused` | That one action used more storage than expected (three times in an hour, or once by far) and is paused for everyone; other actions work | An hour |
 
 Any refusal that lasts five minutes or more (these, and daily limits such as
 "Daily posting limit reached") is also explained once an hour per

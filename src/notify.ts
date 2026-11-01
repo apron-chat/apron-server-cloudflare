@@ -1,7 +1,7 @@
 /**
  * Something the operators must hear of at once, posted publicly in
  * `general` with every admin mentioned: the server changing tier (open,
- * degraded, exhausted, paused, account stop), an operation's breaker opening
+ * degraded, exhausted, account stop), an operation's breaker opening
  * or closing, the day's first storage overrun, and the edge stop turning on
  * (by the budget guard, or by the flood trip, `exceeded: ["flood"]`) or off.
  * New kinds of notice, and new ways to tell one, join here.
@@ -16,15 +16,14 @@ export type TriggerNotice =
 /**
  * How far the server refuses work, least to most (docs/configuration.md,
  * Server tiers). Each lifts by itself: degraded and exhausted at UTC
- * midnight, paused after an hour, account stop at the day's or month's end.
+ * midnight, account stop at the day's or month's end.
  */
-export type ServerTier = "open" | "degraded" | "exhausted" | "paused" | "account_stop";
+export type ServerTier = "open" | "degraded" | "exhausted" | "account_stop";
 
 export const TIER_LABEL: Record<ServerTier, string> = {
 	open: "open",
 	degraded: "degraded",
 	exhausted: "exhausted",
-	paused: "paused",
 	account_stop: "account stop",
 };
 
@@ -32,7 +31,6 @@ const TIER_MEANING: Record<ServerTier, string> = {
 	open: "Everything works.",
 	degraded: "Live text, uploads and older history are off until UTC midnight; chat works.",
 	exhausted: "The day's storage or frame budget is spent: new work is refused until UTC midnight; open connections stay.",
-	paused: "One action used far more storage than expected: all work is refused for an hour.",
 	account_stop: "Cloudflare usage reached its stop line: the server is closed until the day's or month's end.",
 };
 
@@ -64,7 +62,7 @@ export function noticeText(notice: TriggerNotice): string {
 		}
 		case "breaker":
 			return notice.open
-				? `**Paused one action: \`${notice.operation}\`.** It used more storage than it reserved three times within an hour, so it is refused until ${notice.until ? utcTime(notice.until) : "an hour from now"}; everything else works.`
+				? `**Paused one action: \`${notice.operation}\`.** It used more storage than it reserved, three times within an hour or once by far, so it is refused until ${notice.until ? utcTime(notice.until) : "an hour from now"}; everything else works.`
 				: `**Resumed \`${notice.operation}\`.** Its pause ended.`;
 		case "overrun": {
 			const who = notice.users.length ? ` for ${notice.users.map((user) => `\`${user}\``).join(", ")}` : "";

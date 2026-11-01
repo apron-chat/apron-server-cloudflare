@@ -930,13 +930,10 @@ const ACCOUNTING_UNCERTAIN = "uncertain";
 export const STORAGE_UNAVAILABLE = "storage_unavailable";
 /** `data.reason` of the `retry_after` an operation gets while its breaker is open (assertAccounting). */
 export const OPERATION_PAUSED = "operation_paused";
-/** `data.reason` of the `retry_after` every operation gets while the server is paused (assertAccounting). */
-export const SERVER_PAUSED = "server_paused";
 /**
  * Overruns are observed, not fatal (noteOverrun): this one `_meta` row holds
  * what they have set off. The UTC day and its overrun count, so the first of
- * a day is told; each operation's recent overruns, its breaker's end, and
- * the server pause's end.
+ * a day is told; each operation's recent overruns, and its breaker's end.
  */
 const META_ACCOUNTING_GUARD = "accounting_guard";
 /** Throttle trips by trigger in hourly buckets over the last TRIP_WINDOW_MS (noteThrottleTrip). */
@@ -950,14 +947,18 @@ export const BREAKER_OVERRUNS = 3;
 export const BREAKER_WINDOW_MS = 60 * 60 * 1000;
 /** How long an open breaker refuses its operation. */
 export const BREAKER_MS = 60 * 60 * 1000;
-/** How long one overrun past a hundredth of a day's SQL ceilings pauses the server. */
-export const PAUSE_MS = 60 * 60 * 1000;
 /**
  * The share of a daily ceiling (foreground SQL reads or writes, frames) at
  * which the server degrades: live text, uploads and older history are
  * refused until UTC midnight, so what is left goes to chat (assertNotDegraded).
  */
 export const DEGRADE_SHARE = 0.7;
+/**
+ * The share at which the server counts a ceiling as spent (the exhausted
+ * tier): the ledger refuses a reservation that would pass the ceiling, so a
+ * share stops short of 1 while work is already refused.
+ */
+export const EXHAUSTED_SHARE = 0.99;
 /** `data.reason` of the `retry_after` a feature the degraded tier turns off gets. */
 export const DEGRADED = "degraded";
 
@@ -966,8 +967,6 @@ export interface AccountingGuard {
   day: string;
   /** Overruns this UTC day. */
   overruns: number;
-  /** The server is paused until then (0: not paused). */
-  pausedUntil: number;
   /** Open breakers: operation name to when it closes. */
   breakers: Record<string, number>;
   /** Each operation's overruns within BREAKER_WINDOW_MS, oldest first. */
@@ -984,12 +983,12 @@ export interface OverrunNotice {
   firstToday: boolean;
   /** It opened its operation's breaker. */
   breaker: boolean;
-  /** It paused the server (an excess past a hundredth of a day's SQL ceilings). */
-  paused: boolean;
+  /** Its excess passed a hundredth of a day's SQL ceilings, which opens the breaker at once. */
+  huge: boolean;
 }
 
 function emptyGuard(): AccountingGuard {
-  return { day: "", overruns: 0, pausedUntil: 0, breakers: {}, recent: {} };
+  return { day: "", overruns: 0, breakers: {}, recent: {} };
 }
 
 function parseGuard(raw: string): AccountingGuard {
@@ -998,7 +997,6 @@ function parseGuard(raw: string): AccountingGuard {
     const value = JSON.parse(raw) as Partial<AccountingGuard>;
     if (typeof value.day === "string") guard.day = value.day;
     if (Number.isSafeInteger(value.overruns)) guard.overruns = value.overruns!;
-    if (Number.isFinite(value.pausedUntil)) guard.pausedUntil = value.pausedUntil!;
     for (const [op, end] of Object.entries(value.breakers ?? {})) if (Number.isFinite(end)) guard.breakers[op] = end;
     for (const [op, times] of Object.entries(value.recent ?? {})) if (Array.isArray(times)) guard.recent[op] = times.filter((time) => Number.isFinite(time));
   } catch {
@@ -1007,11 +1005,20 @@ function parseGuard(raw: string): AccountingGuard {
   return guard;
 }
 
-/** Store methods that wrap the operation an overrun or breaker is named after (operationName). */
+/**
+ * Store methods between an operation and its reservation (reserveCost), so
+ * not what an overrun or breaker is named after (operationName).
+ */
 const OPERATION_WRAPPERS = new Set([
-  "reserved", "reserveCost", "withMeter", "withMeterAsync", "settleReservation", "assertReservation", "assertAccounting",
-  "noteOverrun", "operationName", "transaction", "reserveMaintenanceControl", "alert", "breakerFor",
+  "captureSite", "reserveCost", "reserveMaintenanceControl", "reserved", "withMeter", "withMeterAsync",
+  "transaction", "transactionInner", "alert",
 ]);
+/**
+ * Operations every request or connection passes through, which a breaker
+ * never refuses: refusing them would refuse everything (an overrun in one is
+ * still charged, logged and told).
+ */
+const BREAKER_EXEMPT = new Set(["reserveFrames", "reserveConnection", "getRoom", "unknown"]);
 const META_ACCOUNT_USAGE = "account_usage_snapshot";
 /** The highest guest number ever reserved (see reserveGuestNumbers); absent means none. */
 const META_GUEST_NUMBER_MARK = "guest_number_mark";
@@ -1998,6 +2005,8 @@ export class Store {
   private guard: AccountingGuard = emptyGuard();
   /** The guard as last read or written, so it is written only when it changes. */
   private guardMarker = "";
+  /** Set while persistAccountingMarker writes, so a failure inside it does not re-enter it. */
+  private persisting = false;
   /** Overruns' excess rows, charged once the operation's transaction has ended (persistAccountingMarker). */
   private overrunCharges: Array<{ day: string; delta: BudgetDelta }> = [];
   private deferredCleanupUntil = 0;
@@ -2394,59 +2403,61 @@ export class Store {
     if (this.accountingUncertain && !this.recoverUncertain()) {
       throw new StoreError("internal_error", "storage is unavailable", { data: { reason: STORAGE_UNAVAILABLE } });
     }
-    const now = this.clock.now();
-    if (this.guard.pausedUntil > now) {
-      throw new StoreError("retry_after", "The server is paused after one action used far more storage than expected; an operator has been told", {
-        retryAfterMs: Math.max(1_000, this.guard.pausedUntil - now),
-        data: { reason: SERVER_PAUSED },
-      });
-    }
-    const until = this.breakerFor(now);
-    if (until > 0) {
-      throw new StoreError("retry_after", "This action is paused after it used more storage than expected; try again later", {
-        retryAfterMs: Math.max(1_000, until - now),
-        data: { reason: OPERATION_PAUSED },
-      });
-    }
-  }
-
-  /** When the open breaker of the operation starting now closes, or 0 when it has none. */
-  private breakerFor(now: number): number {
-    const breakers = this.guard.breakers;
-    let open = false;
-    for (const end of Object.values(breakers)) if (end > now) open = true;
-    if (!open) return 0;
-    const end = breakers[this.operationName()];
-    return end !== undefined && end > now ? end : 0;
   }
 
   /**
-   * The Store method an overrun or breaker is named after: the innermost
-   * method on the stack that is not one of the wrappers every operation
-   * passes through (OPERATION_WRAPPERS). Read from the stack only when
-   * needed (an overrun, or a breaker open), so ordinary work pays nothing.
+   * Refuses a foreground reservation whose operation's breaker is open, by
+   * the name its reservation site carries (operationName). Maintenance work,
+   * operator alerts and admin (`unchecked`) work are never refused, nor the
+   * operations every request passes through (BREAKER_EXEMPT).
    */
-  private operationName(): string {
+  private assertBreaker(site: Error, now: number): void {
+    let open = false;
+    for (const end of Object.values(this.guard.breakers)) if (end > now) open = true;
+    if (!open) return;
+    const operation = this.operationName(site);
+    const until = this.guard.breakers[operation];
+    if (until === undefined || until <= now || BREAKER_EXEMPT.has(operation)) return;
+    throw new StoreError("retry_after", "This action is paused after it used more storage than expected; try again later", {
+      retryAfterMs: Math.max(1_000, until - now),
+      data: { reason: OPERATION_PAUSED },
+    });
+  }
+
+  /**
+   * Where a reservation is made: a stack captured (not yet formatted) as it
+   * starts, so an overrun noted later and a breaker checked at the start
+   * name the same operation (operationName).
+   */
+  private captureSite(): Error {
     const errors = Error as unknown as { stackTraceLimit: number };
     const limit = errors.stackTraceLimit;
-    errors.stackTraceLimit = 40;
-    const stack = new Error().stack ?? "";
+    errors.stackTraceLimit = 12;
+    const site = new Error("reservation site");
     errors.stackTraceLimit = limit;
-    for (const match of stack.matchAll(/at (?:async )?\w*Store\.(\w+)/g)) {
+    return site;
+  }
+
+  /**
+   * The Store method a reservation belongs to: the innermost method on its
+   * site's stack that is not a wrapper (OPERATION_WRAPPERS). The stack is
+   * formatted only here, for an overrun or while a breaker is open.
+   */
+  private operationName(site: Error | undefined): string {
+    for (const match of (site?.stack ?? "").matchAll(/at (?:async )?\w*Store\.(\w+)/g)) {
       if (!OPERATION_WRAPPERS.has(match[1])) return match[1];
     }
     return "unknown";
   }
 
   /** What overruns have set off now, for the runtime's tier and `/status`. */
-  accountingGuard(now = this.clock.now()): { day: string; overruns: number; pausedUntil: number; breakers: Record<string, number> } {
+  accountingGuard(now = this.clock.now()): { day: string; overruns: number; breakers: Record<string, number> } {
     const breakers: Record<string, number> = {};
     for (const [op, end] of Object.entries(this.guard.breakers)) if (end > now) breakers[op] = end;
     const today = dayFor(Math.max(this.lastEffectiveMs, now));
     return {
       day: today,
       overruns: this.guard.day === today ? this.guard.overruns : 0,
-      pausedUntil: this.guard.pausedUntil > now ? this.guard.pausedUntil : 0,
       breakers,
     };
   }
@@ -2455,17 +2466,15 @@ export class Store {
    * Records an overrun: an operation read or wrote more rows than it
    * reserved. Its excess is charged to the day's budget once its transaction
    * ends, so the ceilings stay true; it is logged and counted under the
-   * operation's name, with whom it acted for. Three of one foreground
-   * operation within an hour open that operation's breaker for an hour. An
-   * excess past a hundredth of a day's SQL ceilings, which may be unbounded,
-   * pauses the server for an hour; the caller then fails the operation.
-   * Returns whether it paused.
+   * operation's name, with whom it acted for, and the operation finishes.
+   * Three of one foreground operation within an hour, or one whose excess
+   * passes a hundredth of a day's SQL ceilings (an estimate that wrong may be
+   * unbounded), open that operation's breaker for an hour.
    */
-  private noteOverrun(reserved: BudgetCost, actualReads: number, actualWrites: number): boolean {
-    const operation = this.operationName();
+  private noteOverrun(reserved: BudgetCost, actualReads: number, actualWrites: number, excess: { reads: number; writes: number }): void {
+    const operation = this.operationName(reserved.site);
     const now = Math.max(this.lastEffectiveMs, this.clock.now());
     const day = dayFor(now);
-    const excess = { reads: Math.max(0, actualReads - reserved.reads), writes: Math.max(0, actualWrites - reserved.writes) };
     const message = `${operation}: ${actualReads}/${reserved.reads} reads, ${actualWrites}/${reserved.writes} writes`;
     const maintenance = reserved.maintenance === true;
     const guard = this.guard;
@@ -2481,10 +2490,11 @@ export class Store {
       if (kept.length) guard.recent[op] = kept;
       else delete guard.recent[op];
     }
+    const huge = excess.reads > this.config.sqlReadsPerDay / 100 || excess.writes > this.config.sqlWritesPerDay / 100;
     let breaker = false;
-    if (!maintenance && !this.alerting) {
+    if (!maintenance && !this.alerting && !BREAKER_EXEMPT.has(operation)) {
       const times = [...(guard.recent[operation] ?? []), now];
-      if (times.length >= BREAKER_OVERRUNS) {
+      if (huge || times.length >= BREAKER_OVERRUNS) {
         guard.breakers[operation] = now + BREAKER_MS;
         delete guard.recent[operation];
         breaker = true;
@@ -2492,23 +2502,27 @@ export class Store {
         guard.recent[operation] = times;
       }
     }
-    const paused = excess.reads > this.config.sqlReadsPerDay / 100 || excess.writes > this.config.sqlWritesPerDay / 100;
-    if (paused) guard.pausedUntil = Math.max(guard.pausedUntil, now + PAUSE_MS);
-    // What the reservation did not cover, charged as it was spent.
-    this.overrunCharges.push({
-      day: reserved.day ?? day,
-      delta: maintenance ? maintenanceDelta(excess) : { reads_reserved: excess.reads, writes_reserved: excess.writes, foreground_reads: excess.reads, foreground_writes: excess.writes },
-    });
-    this.persistAccountingMarker();
+    this.chargeOverrun(reserved, excess, day);
     const principals = [...new Set(this.actor?.() ?? [])];
-    console.error(JSON.stringify({ event: "accounting_overrun", operation, message, principals, excess, breaker, paused }));
+    console.error(JSON.stringify({ event: "accounting_overrun", operation, message, principals, excess, breaker, huge }));
     try { this.onAccounting?.("overrun", message); } catch { /* a metric never breaks accounting */ }
     const notify = this.onOverrun;
     if (notify) {
-      const notice: OverrunNotice = { operation, message, principals, maintenance, firstToday, breaker, paused };
+      const notice: OverrunNotice = { operation, message, principals, maintenance, firstToday, breaker, huge };
       queueMicrotask(() => { try { notify(notice); } catch { /* a notice never breaks accounting */ } });
     }
-    return paused;
+  }
+
+  /** Queues `excess` rows to charge to the reservation's day and kind, once its transaction ends (persistAccountingMarker). */
+  private chargeOverrun(reserved: BudgetCost, excess: { reads: number; writes: number }, day: string): void {
+    if (!excess.reads && !excess.writes) return;
+    this.overrunCharges.push({
+      day: reserved.day ?? day,
+      delta: reserved.maintenance
+        ? maintenanceDelta(excess)
+        : { reads_reserved: excess.reads, writes_reserved: excess.writes, foreground_reads: excess.reads, foreground_writes: excess.writes },
+    });
+    this.persistAccountingMarker();
   }
 
   /**
@@ -2549,8 +2563,7 @@ export class Store {
    * bootstrap reservation is added to that row without a capacity check, so
    * the reset itself can never fail on, or be blocked by, an exhausted budget;
    * an exhausted day simply stays exhausted until UTC midnight. The
-   * accounting-unsafe latch is not carried: a reset is the operator's recovery
-   * path for it. Callers must hold the object's input gate (the runtime uses
+   * overrun guard (breakers) is not carried. Callers must hold the object's input gate (the runtime uses
    * blockConcurrencyWhile) so no request observes the empty storage.
    */
   async resetStorage(): Promise<void> {
@@ -2812,8 +2825,19 @@ export class Store {
    * transaction has ended, so a rollback cannot erase them.
    */
   private persistAccountingMarker(): void {
-    if (this.inTransaction) return;
-    const guard = this.guard.day || this.guard.pausedUntil || Object.keys(this.guard.breakers).length || Object.keys(this.guard.recent).length
+    // A storage failure while writing here marks accounting uncertain, which
+    // comes back here: the outer call finishes, the inner one does nothing.
+    if (this.inTransaction || this.persisting) return;
+    this.persisting = true;
+    try {
+      this.persistAccountingState();
+    } finally {
+      this.persisting = false;
+    }
+  }
+
+  private persistAccountingState(): void {
+    const guard = this.guard.day || Object.keys(this.guard.breakers).length || Object.keys(this.guard.recent).length
       ? JSON.stringify(this.guard) : "";
     if (guard !== this.guardMarker) {
       try {
@@ -2826,7 +2850,7 @@ export class Store {
     while (this.overrunCharges.length) {
       const charge = this.overrunCharges[0];
       try {
-        this.ledger.addUnchecked(charge.day, charge.delta);
+        this.ledger.chargeUnchecked(charge.day, charge.delta);
       } catch {
         break; // Kept for the next transaction to charge.
       }
@@ -2902,7 +2926,10 @@ export class Store {
   private reserveCost(costInput: CostEstimate, maintenance = false, now = this.clock.now(), unchecked = false): BudgetCost {
     this.ensureReady();
     this.assertAccounting();
+    const site = this.captureSite();
+    if (!maintenance && !unchecked && !this.alerting) this.assertBreaker(site, now);
     const cost = this.ledger.reserve(costInput, Math.max(Math.trunc(now), this.lastEffectiveMs), now, maintenance, unchecked || this.alerting);
+    cost.site = site;
     this.countReservation(cost);
     return cost;
   }
@@ -2912,6 +2939,7 @@ export class Store {
     this.ensureReady();
     this.assertAccounting();
     const cost = this.ledger.reserveControl(costInput, Math.max(Math.trunc(now), this.lastEffectiveMs));
+    cost.site = this.captureSite();
     this.countReservation(cost);
     return cost;
   }
@@ -2962,8 +2990,7 @@ export class Store {
       return fn();
     } finally {
       // A platform cursor can reveal more rows than a static estimate
-      // predicted. Keep accepted state durable, latch accounting unsafe, and
-      // fail closed so an underestimated operation cannot continue.
+      // predicted: the overrun is charged and noted (assertReservation).
       this.settleReservation(reserved, beforeReads, beforeWrites);
     }
   }
@@ -2989,26 +3016,19 @@ export class Store {
   private assertReservation(reserved: BudgetCost, beforeReads: number, beforeWrites: number): void {
     const actualReads = this.observed.reads - beforeReads;
     const actualWrites = this.observed.writes - beforeWrites;
-    if (actualReads > reserved.reads || actualWrites > reserved.writes) {
-      // Asserted again when it settles (after an in-transaction check): one
-      // overrun is noted once, at its first and smallest count.
-      if (reserved.overran) return;
-      reserved.overran = true;
-      // An ordinary overrun is observed: charged, logged, and the operation
-      // finishes. Only one past a hundredth of a day's ceilings fails it, and
-      // pauses the server (noteOverrun).
-      if (!this.noteOverrun(reserved, actualReads, actualWrites)) return;
-      throw new StoreError("retry_after", "The server is paused after one action used far more storage than expected; an operator has been told", {
-        retryAfterMs: PAUSE_MS,
-        data: {
-          reason: SERVER_PAUSED,
-          reserved_reads: reserved.reads,
-          reserved_writes: reserved.writes,
-          actual_reads: actualReads,
-          actual_writes: actualWrites,
-        },
-      });
+    if (actualReads <= reserved.reads && actualWrites <= reserved.writes) return;
+    // An overrun is observed: charged, logged, and the operation finishes
+    // (noteOverrun). A reservation checked again (in a later transaction, or
+    // as it settles) is noted once; only rows past what was charged are added.
+    const excess = { reads: Math.max(0, actualReads - reserved.reads), writes: Math.max(0, actualWrites - reserved.writes) };
+    const charged = reserved.overrun;
+    reserved.overrun = { reads: Math.max(excess.reads, charged?.reads ?? 0), writes: Math.max(excess.writes, charged?.writes ?? 0) };
+    if (!charged) {
+      this.noteOverrun(reserved, actualReads, actualWrites, excess);
+      return;
     }
+    const day = dayFor(Math.max(this.lastEffectiveMs, this.clock.now()));
+    this.chargeOverrun(reserved, { reads: Math.max(0, excess.reads - charged.reads), writes: Math.max(0, excess.writes - charged.writes) }, day);
   }
 
   /** The final check on a finished operation: assert it stayed within its reservation, then refund the rest. */
@@ -3036,11 +3056,11 @@ export class Store {
   }
 
   /**
-   * `unsafe`: all work is refused for accounting (the server is paused after
-   * a huge overrun); `uncertain`: a storage failure has not cleared yet.
+   * `uncertain`: a storage failure has not cleared yet, so work is refused.
+   * `unsafe` is always false: nothing latches the server any more.
    */
-  accountingStatus(now = this.clock.now()): { unsafe: boolean; uncertain: boolean; database_bytes: number | null } {
-    return { unsafe: this.guard.pausedUntil > now, uncertain: this.accountingUncertain, database_bytes: this.databaseSize() };
+  accountingStatus(): { unsafe: boolean; uncertain: boolean; database_bytes: number | null } {
+    return { unsafe: false, uncertain: this.accountingUncertain, database_bytes: this.databaseSize() };
   }
 
   accountUsageSnapshot(): AccountUsageSnapshot | null {
@@ -4072,7 +4092,8 @@ export class Store {
         const global = this.limitRow("frames", "global", effective);
         const day = dayFor(effective);
         const globalCount = global.day === day ? global.posts_day : 0;
-        if (globalCount + count > this.config.processedFramesPerDay) {
+        // An admin's frames (alert) are counted but never refused, so `/status` answers on a spent day.
+        if (!this.alerting && globalCount + count > this.config.processedFramesPerDay) {
           throw new StoreError("retry_after", "Daily frame budget exhausted", { retryAfterMs: 86_400_000, data: { reason: "frame_budget" } });
         }
         this.updateLimitRow(global, { day, posts_day: globalCount + count }, effective);
@@ -7166,8 +7187,6 @@ export class Store {
   history(query: StoreHistoryQuery): StoreHistoryResult {
     this.ensureReady();
     const operationNow = query.now ?? this.clock.now();
-    // Scrolling back, the costliest reads, is the history the degraded tier turns off.
-    if (query.before !== undefined) this.assertNotDegraded("Loading older history", operationNow);
     const charged = Boolean(query.userId && query.ipKey);
     return this.reserved({
       ...this.config.historyCost,
@@ -7179,6 +7198,9 @@ export class Store {
     }, false, operationNow, (unused) => {
       try {
         const now = this.effectiveNow(operationNow);
+        // Scrolling back, the costliest reads, is the history the degraded
+        // tier turns off; checked here, where today's budget is in memory.
+        if (query.before !== undefined) this.assertNotDegraded("Loading older history", operationNow);
         return this.transaction(() => {
           if (charged) {
             this.chargeEvent("history", `user:${query.userId}`, now,

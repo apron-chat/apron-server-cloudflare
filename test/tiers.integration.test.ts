@@ -1,7 +1,7 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { afterEach, expect, it, vi } from 'vitest';
 import { DEFAULT_LIMITS, UPLOAD_POLICY } from '../src/budget';
-import { BREAKER_MS, DEGRADED, OPERATION_PAUSED, PAUSE_MS, SERVER_PAUSED, Store, StoreError, type OverrunNotice, type StoreConfig } from '../src/store';
+import { BREAKER_MS, DEGRADED, OPERATION_PAUSED, Store, StoreError, type OverrunNotice, type StoreConfig } from '../src/store';
 
 afterEach(() => { vi.restoreAllMocks(); });
 
@@ -60,10 +60,10 @@ it('observes an ordinary overrun: the operation finishes, its excess is charged,
 		// Charged as spent: the 100-odd rows the reservation left out are on the books.
 		expect(foregroundReads(state) - before).toBeGreaterThanOrEqual(100);
 		expect(store.accountingStatus()).toMatchObject({ unsafe: false, uncertain: false });
-		expect(store.accountingGuard(clock.now)).toMatchObject({ overruns: 1, pausedUntil: 0, breakers: {} });
+		expect(store.accountingGuard(clock.now)).toMatchObject({ overruns: 1, breakers: {} });
 		expect(() => store.getRoomState()).not.toThrow();
 		await Promise.resolve();
-		expect(notices).toEqual([expect.objectContaining({ operation: 'leakyListing', firstToday: true, breaker: false, paused: false, principals: ['ip:observed-ip', 'user:observed'] })]);
+		expect(notices).toEqual([expect.objectContaining({ operation: 'leakyListing', firstToday: true, breaker: false, huge: false, principals: ['ip:observed-ip', 'user:observed'] })]);
 		expect(error.mock.calls.map(([line]) => String(line))).toContainEqual(expect.stringContaining('"event":"accounting_overrun","operation":"leakyListing"'));
 	});
 });
@@ -104,32 +104,69 @@ it('opens a breaker on the third overrun of one operation within an hour, refusi
 	});
 });
 
-it('pauses the whole server for an hour when one overrun exceeds a hundredth of the day, and lifts it on its own', async () => {
-	const stub = env.DEMO.getByName('tier-pause');
-	const clock = { now: Date.now() + 3_000 };
-	// A ceiling small enough that reading 100 threads is more than a hundredth of it.
-	const config = { sqlReadsPerDay: 5_000, foregroundReadsPerDay: 4_000, maintenanceReadsPerDay: 1_000 };
-	await runInDurableObject(stub, (_instance, state) => {
-		const store = leakyStore(state, clock, config);
+it('opens the breaker at once when one overrun exceeds a hundredth of the day, and the rest of the server works', async () => {
+	await runInDurableObject(env.DEMO.getByName('tier-huge'), async (_instance, state) => {
+		const clock = { now: Date.now() + 3_000 };
+		// A ceiling small enough that reading 100 threads is more than a hundredth of it.
+		const store = leakyStore(state, clock, { sqlReadsPerDay: 5_000, foregroundReadsPerDay: 4_000, maintenanceReadsPerDay: 1_000 });
+		const notices: OverrunNotice[] = [];
+		store.onOverrun = (notice) => notices.push(notice);
 		seedThreads(state, clock.now);
-		const failed = refusal(() => store.leakyListing(clock.now));
-		expect(failed.data?.reason).toBe(SERVER_PAUSED);
-		expect(store.accountingStatus().unsafe).toBe(true);
-		const refused = refusal(() => store.getRoomState());
-		expect(refused.code).toBe('retry_after');
-		expect(refused.data?.reason).toBe(SERVER_PAUSED);
-		expect(refused.retryAfterMs).toBe(PAUSE_MS);
-		// An operator's alert and /status still run.
-		expect(() => store.alert(() => store.getRoomState())).not.toThrow();
-		expect(() => store.status(clock.now)).not.toThrow();
+		// The overrun still finishes: its rows are already read.
+		expect(store.leakyListing(clock.now)).toBe(101);
+		await Promise.resolve();
+		expect(notices).toEqual([expect.objectContaining({ operation: 'leakyListing', huge: true, breaker: true })]);
+		expect(refusal(() => store.leakyListing(clock.now)).data?.reason).toBe(OPERATION_PAUSED);
+		expect(() => store.getRoomState()).not.toThrow();
+		expect(store.accountingStatus().unsafe).toBe(false);
 	});
-	await evictDurableObject(stub);
-	await runInDurableObject(stub, (_instance, state) => {
-		const woken = leakyStore(state, clock, config);
-		expect(refusal(() => woken.getRoomState()).data?.reason).toBe(SERVER_PAUSED);
-		clock.now += PAUSE_MS;
-		expect(() => woken.getRoomState()).not.toThrow();
-		expect(woken.accountingStatus().unsafe).toBe(false);
+});
+
+it('charges rows found past an overrun already noted, and counts it once', async () => {
+	await runInDurableObject(env.DEMO.getByName('tier-incremental'), (_instance, state) => {
+		const now = Date.now() + 3_000;
+		const store = new Store(state, {}, { now: () => now });
+		store.initialize();
+		seedThreads(state, now);
+		// As runCleanup does: one reservation checked after each of two transactions.
+		const internals = store as unknown as {
+			observed: { reads: number; writes: number };
+			reserveCost(cost: object, maintenance: boolean, now: number): object;
+			assertReservation(reserved: object, reads: number, writes: number): void;
+		};
+		const before = foregroundReads(state);
+		const start = { reads: internals.observed.reads, writes: internals.observed.writes };
+		const reservation = internals.reserveCost({ reads: 0 }, false, now);
+		store.listRooms(now);
+		internals.assertReservation(reservation, start.reads, start.writes);
+		const afterFirst = foregroundReads(state);
+		store.listRooms(now);
+		internals.assertReservation(reservation, start.reads, start.writes);
+		const afterSecond = foregroundReads(state);
+		expect(afterFirst - before).toBeGreaterThanOrEqual(100);
+		// The second listing's rows are charged too, not lost to the first count.
+		expect(afterSecond - afterFirst).toBeGreaterThanOrEqual(100);
+		expect(store.accountingGuard(now).overruns).toBe(1);
+	});
+});
+
+it('keeps an overrun charge for later when storage fails while charging it, without looping', async () => {
+	await runInDurableObject(env.DEMO.getByName('tier-charge-failure'), (_instance, state) => {
+		const clock = { now: Date.now() + 3_000 };
+		const store = leakyStore(state, clock);
+		seedThreads(state, clock.now);
+		const before = foregroundReads(state);
+		state.storage.sql.exec(`CREATE TRIGGER fail_overrun_charge
+			BEFORE UPDATE OF foreground_reads ON resource_budgets
+			BEGIN SELECT RAISE(ABORT, 'injected budget failure'); END`);
+		// The charge fails: accounting closes as uncertain, once, and the call returns.
+		expect(store.leakyListing(clock.now)).toBe(101);
+		expect(store.accountingStatus().uncertain).toBe(true);
+		state.storage.sql.exec('DROP TRIGGER fail_overrun_charge');
+		// Storage works again: the next operation recovers and the kept charge lands.
+		expect(() => store.getRoomState()).not.toThrow();
+		expect(store.accountingStatus().uncertain).toBe(false);
+		expect(foregroundReads(state) - before).toBeGreaterThanOrEqual(100);
 	});
 });
 

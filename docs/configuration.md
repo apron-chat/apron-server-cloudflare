@@ -710,8 +710,7 @@ and each lifting by itself (`src/store.ts`, `ApronDemoServer.currentTier`):
 | --- | --- | --- | --- |
 | open | | Everything works | |
 | degraded | Today's foreground SQL reads or writes, or frames, at `DEGRADE_SHARE` (70%) of their ceiling | Live text, uploads and older history (`history` with `before`) get `retry_after` (`data.reason` `degraded`); chat works | UTC midnight |
-| exhausted | One of those at 100% | New work is refused with `retry_after` until the reset; open connections stay | UTC midnight |
-| paused | One storage overrun past a hundredth of a day's SQL ceilings | All work gets `retry_after` (`data.reason` `server_paused`), except admin alerts and `/status` | 1 hour (`PAUSE_MS`) |
+| exhausted | One of those at 99% (`EXHAUSTED_SHARE`; the ledger refuses work just short of 100%) | New work is refused with `retry_after` until the reset; open connections stay; admins' frames and `/status` still answer | UTC midnight |
 | account stop | Cloudflare usage at 90% of a daily share or 50% of the month (the account-usage stop) | 503 and sockets closed once, as it starts | The day's or month's end |
 
 Every change of tier is announced to the admins (see the admin alert above),
@@ -727,11 +726,15 @@ charged to the day's budget (so the ceilings above stay true), and it is
 logged (`accounting_overrun`) and counted (`accounting` metric) under the
 operation's name with the user and address it acted for. The day's first
 overrun is announced to the admins. Three overruns of one foreground
-operation within an hour open its *breaker*: that one operation gets
-`retry_after` (`data.reason` `operation_paused`) for an hour
-(`BREAKER_MS`), announced as it opens and closes. Only one overrun past a
-hundredth of a day's SQL ceilings, which may be unbounded, fails and pauses
-the server. Breakers and pauses survive a wake. `/status` lists both.
+operation within an hour, or one past a hundredth of a day's SQL ceilings
+(an estimate that wrong may be unbounded), open its *breaker*: that one
+operation gets `retry_after` (`data.reason` `operation_paused`) for an hour
+(`BREAKER_MS`), announced as it opens and closes; everything else works.
+An operation is named by the Store method that made its reservation.
+Maintenance work, operator alerts, admin commands and the operations every
+request passes through (frames, admission, room lookup) are never refused
+by a breaker; their overruns are still charged, logged and told. Breakers
+survive a wake, and `/status` lists them.
 
 **Throttle trips.** A refusal that lasts five minutes or more
 (`LONG_THROTTLE_SECONDS`: the tiers above, daily limits, an open breaker)

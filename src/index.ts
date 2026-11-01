@@ -40,6 +40,7 @@ import {
 import {
 	ADMIN_USER_ID,
 	DEGRADE_SHARE,
+	EXHAUSTED_SHARE,
 	DEFAULT_JOINED_ROOMS,
 	MAX_PASSKEYS_PER_USER,
 	MAX_PUSH_URL_BYTES,
@@ -1022,8 +1023,7 @@ const TRIP_NOTICE_MS = 60 * 60 * 1000;
 /** What a long refusal means for the person who met it, by `data.reason`. */
 const TRIP_EXPLANATIONS: Record<string, string> = {
 	degraded: "The server is busy today, so live text, uploads and older history are off until the daily reset. Chat still works.",
-	operation_paused: "This action used more storage than the server expected several times in an hour, so it is paused for everyone while the admins look into it.",
-	server_paused: "One action used far more storage than the server expected, so the server is paused for an hour while the admins look into it.",
+	operation_paused: "This action used more storage than the server expected, so it is paused for everyone for an hour while the admins look into it.",
 	frame_budget: "The server has handled as many messages and requests as it allows in a day.",
 	daily_budget: "The server has used its storage budget for the day.",
 };
@@ -1886,10 +1886,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.runtimeEnv = env;
 		this.config = loadConfig(env);
 		this.store = new Store(ctx as unknown as ConstructorParameters<typeof Store>[0], asStoreConfig(this.config));
-		// An overrun is observed, not fatal: the day's first is told, and what it
-		// set off (a breaker, a pause) changes the tier, which is told too.
+		// An overrun is observed, not fatal: the day's first is told, and a
+		// breaker it opened is told by the tier evaluation that follows.
 		this.store.onOverrun = (notice) => {
-			if (notice.firstToday && !notice.paused) {
+			if (notice.firstToday) {
 				const users = notice.principals.filter((principal) => principal.startsWith("user:")).map((principal) => principal.slice(5));
 				this.announce({ kind: "overrun", operation: notice.operation, message: notice.message, users });
 			}
@@ -2597,7 +2597,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				const count = this.config.limits.frameLease;
 				const reserve = () => this.store.reserveFrames({ ipKey: attachment.ipKey, now, count });
 				// An admin's frames are charged but never refused, so `/status`
-				// still answers while the server is paused or out of frames.
+				// still answers on a day whose budgets or frames are spent.
 				if (latest.tier === "registered" && latest.roles?.includes("admin")) this.store.alert(reserve);
 				else reserve();
 				latest.frameLease = { day, remaining: count - 1 };
@@ -2607,12 +2607,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return true;
 		} catch (error) {
 			const failure = errorToProtocol(error);
-			// Refusals that hold for everyone (the day's frames spent, a pause)
+			// Refusals that hold for everyone (the day's frames or budget spent, a breaker)
 			// refuse the frame and keep the socket, so readers stay connected and
 			// nobody reconnects into the same refusal; anything else is this
 			// connection's own limit and closes it.
 			const reason = failure.data?.reason;
-			if (failure.name === "retry_after" && (reason === "frame_budget" || reason === "server_paused" || reason === "daily_budget")) {
+			if (failure.name === "retry_after" && (reason === "frame_budget" || reason === "operation_paused" || reason === "daily_budget")) {
 				if (request && !isNotification(request.method, request.id)) this.fail(socket, request, failure);
 			} else this.closePolicy(socket, connectionAttachment(socket) ?? attachment, 1013, failure.message);
 			return false;
@@ -5381,27 +5381,25 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * The server's tier now, least to most refused, with why: account stop
-	 * (Cloudflare usage reached its stop line), paused (a huge overrun),
-	 * exhausted (a foreground SQL or frame ceiling spent today), degraded
-	 * (one at DEGRADE_SHARE), else open; and the open breakers. Null while
-	 * today's budget is not yet in memory and nothing else applies.
+	 * (Cloudflare usage reached its stop line), exhausted (a foreground SQL or
+	 * frame ceiling all but spent today: the ledger refuses a reservation
+	 * before a share reaches 1), degraded (one at DEGRADE_SHARE), else open;
+	 * and the open breakers. The tier is null while today's budget is not in
+	 * memory (before the day's first reservation, or just after an overrun's
+	 * charge), so callers keep the one they had.
 	 */
-	private currentTier(now: number): { tier: ServerTier; reasons: string[]; breakers: Record<string, number> } | null {
-		const guard = this.store.accountingGuard(now);
-		const breakers = guard.breakers;
+	private currentTier(now: number): { tier: ServerTier | null; reasons: string[]; breakers: Record<string, number> } {
+		const breakers = this.store.accountingGuard(now).breakers;
 		if (this.accountUsage.stops(now)) {
 			const snapshot = this.accountUsage.snapshot;
 			const reached = snapshot ? exceededAllowances(snapshot) : [];
 			return { tier: "account_stop", reasons: [`Cloudflare usage reached ${reached.length ? reached.join(", ") : "a stop line"}`], breakers };
 		}
-		if (guard.pausedUntil) {
-			return { tier: "paused", reasons: [`until ${new Date(guard.pausedUntil).toISOString().slice(11, 16)} UTC`], breakers };
-		}
 		const shares = this.store.budgetShares(now);
-		if (!shares) return null;
+		if (!shares) return { tier: null, reasons: [], breakers };
 		const named: Array<[string, number]> = [["foreground SQL reads", shares.reads], ["foreground SQL writes", shares.writes], ["frames", shares.frames]];
 		const highest = Math.max(...named.map(([, share]) => share));
-		const tier: ServerTier = highest >= 1 ? "exhausted" : highest >= DEGRADE_SHARE ? "degraded" : "open";
+		const tier: ServerTier = highest >= EXHAUSTED_SHARE ? "exhausted" : highest >= DEGRADE_SHARE ? "degraded" : "open";
 		const reasons = tier === "open" ? [] : named.filter(([, share]) => share >= DEGRADE_SHARE).map(([name, share]) => `${name} at ${Math.round(share * 100)}% of today's ceiling`);
 		return { tier, reasons, breakers };
 	}
@@ -5427,7 +5425,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 		let state: ReturnType<ApronDemoServer["currentTier"]>;
 		try {
 			state = this.currentTier(now);
-			if (!state) return;
 			if (!this.announcedTier) {
 				const raw = this.store.announcedTier(now);
 				let parsed: { tier?: unknown; breakers?: unknown } = {};
@@ -5441,15 +5438,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return;
 		}
 		const before = this.announcedTier;
+		// Unknown (budget not in memory): the tier stays as announced, and breakers are still compared.
+		const tier = state.tier ?? before.tier;
 		const open = Object.keys(state.breakers).sort();
 		const notices: TriggerNotice[] = [];
-		if (state.tier !== before.tier) notices.push({ kind: "tier", from: before.tier, to: state.tier, reasons: state.reasons });
+		if (tier !== before.tier) notices.push({ kind: "tier", from: before.tier, to: tier, reasons: state.reasons });
 		for (const operation of open) if (!before.breakers.includes(operation)) notices.push({ kind: "breaker", operation, open: true, until: state.breakers[operation] });
 		for (const operation of before.breakers) if (!open.includes(operation)) notices.push({ kind: "breaker", operation, open: false });
 		if (!notices.length) return;
-		this.announcedTier = { tier: state.tier, breakers: open };
+		this.announcedTier = { tier, breakers: open };
 		try { this.store.setAnnouncedTier(JSON.stringify(this.announcedTier), now); } catch { /* told again after a wake, rather than not at all */ }
-		if (state.tier !== before.tier) recordMetric(this.runtimeEnv.METRICS, "tier", [state.tier, before.tier]);
+		if (tier !== before.tier) recordMetric(this.runtimeEnv.METRICS, "tier", [tier, before.tier]);
 		for (const notice of notices) this.announce(notice);
 	}
 
@@ -6949,9 +6948,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// stop that is not a quota (Store.accountingGuard).
 		const tier = this.currentTier(now);
 		const guard = this.store.accountingGuard(now);
-		lines.push(`**State: ${tier ? TIER_LABEL[tier.tier] : "open"}**${tier?.reasons.length ? `: ${tier.reasons.join("; ")}` : ""}`);
-		if (this.store.accountingStatus(now).uncertain) lines.push("- **Storage failing**: a budget write failed; work is refused until one succeeds");
-		for (const [operation, until] of Object.entries(guard.breakers)) lines.push(`- **Paused action** \`${operation}\` until ${utc(until)}: it overran its storage reservation 3 times within an hour`);
+		const shown = tier.tier ?? this.announcedTier?.tier ?? "open";
+		lines.push(`**State: ${TIER_LABEL[shown]}**${tier.reasons.length ? `: ${tier.reasons.join("; ")}` : ""}`);
+		if (this.store.accountingStatus().uncertain) lines.push("- **Storage failing**: a budget write failed; work is refused until one succeeds");
+		for (const [operation, until] of Object.entries(guard.breakers)) lines.push(`- **Paused action** \`${operation}\` until ${utc(until)}: it overran its storage reservation 3 times within an hour, or once by far`);
 		lines.push(`- Storage overruns today: ${guard.overruns} (each charged and logged)`);
 		const trips = this.store.throttleTrips(now);
 		lines.push(`- Throttles tripped in the last 24 hours: ${trips.length ? trips.map(([trigger, times]) => `\`${trigger}\` ${times}`).join(", ") : "none"}`);
