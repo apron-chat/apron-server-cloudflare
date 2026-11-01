@@ -314,6 +314,14 @@ describe('configuration policy boundaries', () => {
 		for (const value of ['-1', 'five', 'Infinity']) expect(() => config({ BILL_CAP_MONTH: value })).toThrow(ConfigError);
 	});
 
+	it('bounds queued frames by count and by bytes, holding at least two of the largest', () => {
+		const { maxFrameBytes } = DEFAULT_LIMITS;
+		expect(() => config({}, { pendingFramesPerConnection: 8, pendingBytesPerConnection: 4 * maxFrameBytes, openConnections: 100 })).not.toThrow();
+		expect(() => config({}, { pendingBytesPerConnection: 2 * maxFrameBytes - 1, openConnections: 100 })).toThrow(ConfigError);
+		// Every connection's queue together within the memory allocation.
+		expect(DEFAULT_LIMITS.openConnections * DEFAULT_LIMITS.pendingBytesPerConnection).toBeLessThanOrEqual(32 * 1024 * 1024);
+	});
+
 	it('turns the attack pause off only with ATTACK_PAUSE=false', () => {
 		expect(config().attackPause).toBe(true);
 		expect(config({ ATTACK_PAUSE: 'false' }).attackPause).toBe(false);

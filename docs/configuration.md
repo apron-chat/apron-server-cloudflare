@@ -780,15 +780,18 @@ hour), a pause in force ends, and the budget guard lifts the edge stop at
 its next run whatever hold it carries. The bill cap still applies.
 
 **Launch profile.** Paid's limits are sized for a front-page day (about
-40,000 visitors, a tenth of them registering): 250 open connections (the
-memory bound of 128 KiB queued per connection within 32 MiB; more needs a
-shared queue budget and a broadcast load test), 100,000 admissions, 2
-million frames, 400,000 history pages, 5,000 registrations (20 per
+40,000 visitors, a tenth of them registering): 500 open connections (the
+memory bound: 64 KiB of incoming frames queued per connection, 8 small or 4
+of the largest, within 32 MiB; load-test the broadcast before raising it
+further), 100,000 admissions, 2 million frames (5,000 a minute), 400,000
+history pages, 5,000 registrations (20 per
 address), 50,000 accounts, 600 posts a minute and 60,000 a day, and 3
 million foreground rows written. A day at every ceiling costs about $3.40
-past the month's inclusions, under the daily bill cap. Clients ping every
-120 seconds (`pingSeconds`), so an idle tab costs about 12 billed requests
-a day. Guest visits cost less: a guest cannot scroll back (`before`
+past the month's inclusions, under the daily bill cap. Pings stay at 45
+seconds (150 to go stale): the runtime answers them without waking the
+object, which is not billed, and a dead socket must be found quickly, since
+it holds a slot, shows its user online, and keeps their mentions from
+being pushed until it goes stale. Guest visits cost less: a guest cannot scroll back (`before`
 alone), its history is charged to its address only, and a full server
 closes the guest idle longest (10 minutes without a frame, close code
 4000) to admit a newcomer, once that newcomer passes every other check
@@ -975,7 +978,7 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `registrationsPerDay` | 5000 | 100 |
 | `registeredIdentityCount` | 50000 | 10000 |
 | `authAttemptsPerIpMinute` | 10 |  |
-| `openConnections` | 250 | 100 |
+| `openConnections` | 500 | 100 |
 | `anonymousConnectionsPerIp` | 6 | 2 |
 | `registeredConnectionsPerUser` | 3 |  |
 | `connectionsPerIp` | 10 |  |
@@ -983,19 +986,19 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `connectionAdmissionsPerDay` | 100000 | 2000 |
 | `unauthenticatedTimeoutSeconds` | 30 |  |
 | `pendingFramesPerConnection` | 8 |  |
-| `pendingBytesPerConnection` | 131072 |  |
+| `pendingBytesPerConnection` | 65536 | 131072 |
 | `framesPerConnectionMinute` | 60 |  |
 | `framesPerIpMinute` | 120 |  |
 | `processedFramesPerDay` | 2000000 | 100000 |
 | `repeatedPolicyViolations` | 3 |  |
-| `globalFramesPerMinute` | 3000 | 300 |
+| `globalFramesPerMinute` | 5000 | 300 |
 | `activityBroadcastsPerUserMinute` | 10 |  |
 | `roomListRequestsPerUserMinute` | 6 |  |
 | `activityMaxTypingSeconds` | 30 |  |
 | `frameLease` | 10 |  |
 | `roomListMembers` | 200 | 100 |
-| `pingSeconds` | 120 | 45 |
-| `pingTimeoutSeconds` | 300 | 150 |
+| `pingSeconds` | 45 |  |
+| `pingTimeoutSeconds` | 150 |  |
 | `unpingedTimeoutSeconds` | 900 |  |
 | `guestNumberBlock` | 10 |  |
 | `statusCoalesceSeconds` | 60 |  |

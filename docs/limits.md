@@ -62,7 +62,7 @@ A limit can reach a client in four ways:
 | ---: | --- | --- | ---: | --- |
 | 429 | Connection attempts exceeded | 20 upgrade attempts a minute per address (IPv6 grouped by /56), 60 per IPv6 /48 | 60 | A reconnect loop without backoff. Probes and refused attempts count too. |
 | 503 | Demo is busy; try again shortly | 200 attempts a minute from everyone at one Cloudflare location | 60 | Other clients, or many of yours, near the same location. |
-| 429 | Demo capacity reached (with `Apron-Server-Full: 1`) | 250 open sockets on the server | 120 to 300, at random | The server is full. The entry Worker then refuses by itself for 30 seconds, so retries cost the server nothing; wait the `Retry-After` before retrying. |
+| 429 | Demo capacity reached (with `Apron-Server-Full: 1`) | 500 open sockets on the server | 120 to 300, at random | The server is full. The entry Worker then refuses by itself for 30 seconds, so retries cost the server nothing; wait the `Retry-After` before retrying. |
 | 429 | Demo capacity reached | 10 open sockets per address; 6 per address that are not signed in to an account (guests and sockets still authenticating) | 60 | Sockets left open: extra tabs, hot reload, reconnect that never closes the old socket. |
 | 429 | Connection admission limit reached | 12 admitted connections a minute per address; 100,000 a day on the server | the bucket's wait, or until the next day | Reconnecting on every error or page view. A passkey sign-in on a fresh page uses up to three admissions (guest, sign-in, signed-in reconnect). |
 | 429 | Daily demo capacity reached / Daily frame budget exhausted | The server's daily SQL or frame budget | until the next day | The whole demo is used up for the day. |
@@ -82,11 +82,11 @@ still holds a slot until it goes stale; see
 
 | Code | Reason | Cause | What to do |
 | ---: | --- | --- | --- |
-| 1001 | Connection idle; reconnect to recover | No ping or frame for 300 seconds after the connection had pinged, or for 15 minutes if it never pinged | Reconnect. If you see it while the tab is live, your ping is not being sent. |
+| 1001 | Connection idle; reconnect to recover | No ping or frame for 150 seconds after the connection had pinged, or for 15 minutes if it never pinged | Reconnect. If you see it while the tab is live, your ping is not being sent. |
 | 1003 | Binary application frames are not supported | A binary frame | Send text frames only. |
 | 1008 | Authentication timed out | No successful `auth` within 30 seconds of connecting | Authenticate right after the `server` frame. |
 | 1008 | Frame rate limit reached | More than 60 frames in a minute on this connection (the exact ping bytes do not count) | Batch or throttle. Typing and read cursors count as frames. |
-| 1008 | Too many pending frames | More than 8 frames (or 128 KiB) sent and not yet processed | Wait for responses; do not pipeline bursts. |
+| 1008 | Too many pending frames | More than 8 frames (or 64 KiB, four of the largest) sent and not yet processed | Wait for responses; do not pipeline bursts. |
 | 1008 | Repeated policy violations | Three malformed or oversized requests within 60 seconds | Fix the request; do not retry it unchanged. |
 | 1008 | Removed by an admin; Device token replaced…; Bot token replaced…; Signed out after a week without signing in or posting | Account changes | Do not reconnect with the same credentials in a loop. |
 | 1009 | Frame exceeds the maximum size | A frame over 16,384 UTF-8 bytes | Check sizes before sending. |
@@ -98,14 +98,14 @@ still holds a slot until it goes stale; see
 
 ### Liveness and stale connections
 
-The `server` frame advertises `ping` (120 seconds). Send the text frame
+The `server` frame advertises `ping` (45 seconds). Send the text frame
 `{"method":"ping"}`, byte for byte, at that interval. The runtime answers
 `{"method":"pong"}` without waking the server, and these pings do not count
 against any frame limit. A ping with other spacing, or with an `id`, is
 answered too, but as an ordinary frame that counts.
 
 The server cannot ping clients, so it uses your pings to find dead sockets.
-A connection that has pinged is closed as stale after 300 seconds without a
+A connection that has pinged is closed as stale after 150 seconds without a
 ping or frame. One that never pinged gets 15 minutes, and a `~private` notice
 ("Did not receive `{"method":"ping"}` in 15 minutes, closing stale
 connection.") just before its 1001 close. Until a vanished socket is found
@@ -166,7 +166,7 @@ are kept for 7 days.
 ### Server-wide spikes
 
 "Demo is busy with too many requests" (`retry_after`) means the whole server
-passed 3,000 frames in a minute. The socket stays open. Notifications sent
+passed 5,000 frames in a minute. The socket stays open. Notifications sent
 meanwhile are dropped without a reply.
 
 ### Busy days and pauses

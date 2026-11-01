@@ -88,9 +88,9 @@ simple = { limit = 60, period = 60 }
 [[ratelimits]]
 name = "LOCATION_ATTEMPTS"
 namespace_id = "73008"
-simple = { limit = 500, period = 60 }
+simple = { limit = 1000, period = 60 }
 [[ratelimits]]
 name = "FLOOD_WATCH"
 namespace_id = "73004"
-simple = { limit = 300, period = 60 }
+simple = { limit = 600, period = 60 }
 # END GENERATED ADMISSION BUDGET

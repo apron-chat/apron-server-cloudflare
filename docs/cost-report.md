@@ -16,7 +16,7 @@ Since 2026-11-01 the Paid account stop is a bill cap in dollars of overage
 not 90% of a daily share or half the month's inclusion. Sections below that
 say "daily stop" or "monthly stop at 50%" describe the stops in force when
 they were measured; their usage figures still hold. The same day Paid's
-limits moved to a launch profile (250 connections, 3.1 million rows written
+limits moved to a launch profile (500 connections, 3.1 million rows written
 and 105 million read a day, 2 million frames; `src/plans/paid.ts`): a day at
 every ceiling is about $3.40 past the inclusions, and the per-operation
 costs measured below are unchanged.

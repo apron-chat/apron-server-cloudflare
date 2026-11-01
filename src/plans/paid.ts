@@ -12,9 +12,9 @@
 // - SQL rows written: the application's own ceiling, 3.1 million, $3.10.
 //   Posts, frames, and admissions all charge it and fail closed at it.
 // - SQL rows read: 105 million, about $0.11.
-// - Durable Object requests: about 210,000, from 2 million frames and 250
-//   connections pinging every 120 seconds at 20 incoming WebSocket messages
-//   a request, and 100,000 admissions: about $0.03. Rejected connection
+// - Durable Object requests: about 200,000, from 2 million frames at 20
+//   incoming WebSocket messages a request and 100,000 admissions: about
+//   $0.03. Pings are answered by the runtime and not billed. Rejected connection
 //   attempts also reach the object, at most `objectRequestsPerLocationMinute`
 //   a minute from each location; the attack pause weighs the rest.
 // - Durable Object duration: one object awake all day is 10,800 GB-s, about
@@ -78,14 +78,18 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// thousands of addresses and users.
 		limiterRecordCap: 50_000,
 		// The memory bound: each open connection may queue
-		// pendingBytesPerConnection (128 KiB) of incoming frames, and all of
-		// them together at most MAX_SOCKET_QUEUE_ALLOCATION (32 MiB). More
-		// needs a shared queue budget and a broadcast load test first.
-		openConnections: 250,
-		// Idle sockets ping half as often (each ping is a billed request when
-		// it reaches the object): a hidden tab costs about 12 a day, not 32.
-		pingSeconds: 120,
-		pingTimeoutSeconds: 300,
+		// pendingBytesPerConnection of incoming frames, and all of them
+		// together at most MAX_SOCKET_QUEUE_ALLOCATION (32 MiB): 500 at 64 KiB.
+		// Each post to a room is sent to every member's socket, so load-test
+		// the broadcast before raising it further.
+		openConnections: 500,
+		// Up to 8 small frames in flight (pendingFramesPerConnection), or 4 of
+		// the largest (16 KiB).
+		pendingBytesPerConnection: 64 * 1024,
+		// Pings stay at Free's 45 seconds (150 to go stale): the runtime answers
+		// them without waking the object, which is not billed, and a dead
+		// socket is found (freeing its slot, its user shown offline and pushed
+		// again) within 150 seconds, well inside Cloudflare's idle timeout.
 		// Room for two browsers on one address, such as a second account in a
 		// private window: each has a guest connection while signed out, a
 		// sign-in opens one more beside it, and a reload's replacement is
@@ -99,8 +103,9 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// A front-page day: 40,000 visitors, two or three connections each.
 		connectionAdmissionsPerDay: 100_000,
 		processedFramesPerDay: 2_000_000,
-		// A busy minute with the server full: 250 connections, a few frames each.
-		globalFramesPerMinute: 3_000,
+		// A busy minute with the server full, or a deploy's reconnect wave: 500
+		// connections, a few frames each.
+		globalFramesPerMinute: 5_000,
 		// The calibrated ceiling; members cost only reads.
 		roomListMembers: 200,
 		// Past the month's inclusion a day at these costs $3.10 in writes,
@@ -125,8 +130,8 @@ export const PAID_PLAN: Plan = Object.freeze({
 		requestsPerIpMinute: 20,
 		// Three busy /56s' worth, as on Free.
 		requestsPerIpv6PrefixMinute: 60,
-		// Twice a full reconnect of the 250 open connections, as on Free.
-		objectRequestsPerLocationMinute: 500,
+		// Twice a full reconnect of the 500 open connections, as on Free.
+		objectRequestsPerLocationMinute: 1_000,
 	}),
 	// Monthly included usage divided by 31 days, rounded down, so stopping
 	// under the daily share every day keeps the month inside what $5 covers.
@@ -183,12 +188,12 @@ export const PAID_PLAN: Plan = Object.freeze({
 	}),
 	edgeStop: Object.freeze({
 		// A front-page day at one location is a few thousand requests a minute
-		// at most (connections, probes, media), so 100 a second is a flood.
+		// at most (connections, probes, media), so 200 a second is a flood.
 		// Spread thinner than that over every location, the attack pause
 		// (src/burn.ts) weighs what it costs.
-		floodRequestsPerColoMinute: 6_000,
+		floodRequestsPerColoMinute: 12_000,
 		// Sampling keeps the per-request cost to one random number; the rate
-		// limiter counts 300 sampled requests a minute.
+		// limiter counts 600 sampled requests a minute.
 		floodSampleEvery: 20,
 		// Long enough for analytics to show the flood, so the guard's bill cap
 		// takes over before the hold ends if the flood ran up the bill.

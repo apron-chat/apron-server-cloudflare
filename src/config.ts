@@ -309,7 +309,10 @@ function validateLimits(limits: Limits): void {
 	if (limits.pendingFramesPerConnection > budget.MAX_PENDING_FRAMES || limits.pendingBytesPerConnection > budget.MAX_PENDING_BYTES) {
 		fail("socket pending-work policy exceeds calibrated bounds");
 	}
-	if (limits.pendingBytesPerConnection < limits.maxFrameBytes || limits.pendingFramesPerConnection > Math.floor(limits.pendingBytesPerConnection / limits.maxFrameBytes)) {
+	// The byte budget must hold at least two maximum-size frames. Past that the
+	// two bounds work together: small frames pipeline up to the frame count,
+	// large ones up to the bytes, whichever is reached first.
+	if (limits.pendingBytesPerConnection < 2 * limits.maxFrameBytes) {
 		fail("pending socket budget cannot hold its configured frames");
 	}
 	if (limits.openConnections > budget.MAX_OPEN_CONNECTIONS || limits.openConnections * limits.pendingBytesPerConnection > budget.MAX_SOCKET_QUEUE_ALLOCATION) {
