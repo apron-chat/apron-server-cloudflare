@@ -3234,17 +3234,20 @@ export class Store {
   }
 
   /**
-   * The most upload rows one owner can hold: a day's uploads for every day
-   * the longest-kept kind (avatars) stays, with the lifecycle's lag, and one
-   * more day. A scan of an owner's rows by `uploads_owner_idx` reads up to
-   * this many, whatever its other conditions and LIMIT, since the index
-   * holds only `owner_id`.
+   * The most upload rows `owner` can hold: a day's uploads for every day the
+   * longest-kept kind stays, with the lifecycle's lag, and one more day. A
+   * user's day is `uploadsPerUserDay`. The server's own avatar uploads
+   * (SERVER_OWNER) are charged to the admins who start them, so only the
+   * server-wide `uploadsPerDay` bounds them. A scan of an owner's rows by
+   * `uploads_owner_idx` reads up to this many, whatever its other conditions
+   * and LIMIT, since the index holds only `owner_id`.
    */
-  private uploadsPerOwner(): number {
+  private uploadsPerOwner(owner: string): number {
     const policy = this.config.uploads;
-    return policy
-      ? policy.uploadsPerUserDay * (Math.ceil((policy.avatarRetentionSeconds + policy.lifecycleLagSeconds) / 86_400) + 1)
-      : 0;
+    if (!policy) return 0;
+    const perDay = owner === SERVER_OWNER ? policy.uploadsPerDay : policy.uploadsPerUserDay;
+    const keptSeconds = Math.max(policy.fileRetentionSeconds, policy.avatarRetentionSeconds) + policy.lifecycleLagSeconds;
+    return perDay * (Math.ceil(keptSeconds / 86_400) + 1);
   }
 
   /**
@@ -3271,7 +3274,8 @@ export class Store {
     // The scans below read at most this many rows each. Only an admin can
     // purge, so it is charged to the day's budget but never refused by it.
     const records = this.retainedRecords(now, true);
-    const uploadsPerOwner = this.uploadsPerOwner();
+    // The most any one of them holds: purged ids are users, never SERVER_OWNER.
+    const uploadsPerOwner = Math.max(...ids.map((id) => this.uploadsPerOwner(id)));
     // Per user: memberships (live and awaiting a room purge), a day's dedup
     // rows, limiter rows, push subscriptions, credential and identity; each
     // deletion also updates its indexes.
@@ -5284,7 +5288,8 @@ export class Store {
    */
   clearServerAvatar(now = this.clock.now()): { changed: boolean; deletedUploads: string[] } {
     this.ensureReady();
-    return this.reserved({ reads: 32, writes: 32 }, false, now, () => this.transaction(() => {
+    // Its upload is found by a scan of every upload the server owns (uploadsPerOwner).
+    return this.reserved({ reads: 32 + this.uploadsPerOwner(SERVER_OWNER), writes: 32 }, false, now, () => this.transaction(() => {
       const changed = this.loadServerMetadata().avatar !== undefined;
       if (changed) this.writeServerField("avatar", undefined);
       const rows = this.rawRows<RawUploadRow>(
@@ -5432,8 +5437,10 @@ export class Store {
    */
   finishUpload(write: UploadWrite, now = this.clock.now()): UploadFinish {
     this.ensureReady();
-    // An avatar's write scans its owner's uploads for the one it replaces.
-    return this.reserved({ reads: 96 + this.uploadsPerOwner(), writes: 64 + UPLOAD_WRITES }, false, now, () => this.transaction(() => {
+    // A user's or the server's avatar write scans its owner's uploads for the
+    // one it replaces, so the reservation is sized by the owner, read first.
+    const owner = this.reserved({ reads: 4 }, false, now, () => this.uploadRow(write.key)?.owner_id ?? "");
+    return this.reserved({ reads: 96 + this.uploadsPerOwner(owner), writes: 64 + UPLOAD_WRITES }, false, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       const row = this.uploadRow(write.key);
       if (!row || row.state !== "writing" || effective > row.write_expires_ms + UPLOAD_WRITE_GRACE_MS) {
@@ -5651,7 +5658,7 @@ export class Store {
     this.ensureReady();
     const now = input.now ?? this.clock.now();
     // The avatar's upload is found by a scan of every upload the user owns (uploadsPerOwner).
-    return this.reserved({ reads: 32 + this.uploadsPerOwner(), writes: 32 }, false, now, () => this.transaction(() => {
+    return this.reserved({ reads: 32 + this.uploadsPerOwner(input.userId), writes: 32 }, false, now, () => this.transaction(() => {
       const identity = this.identityRow(input.userId);
       const rows = this.rawRows<RawUploadRow>(
         `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms

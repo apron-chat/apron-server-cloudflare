@@ -824,7 +824,7 @@ describe('measured storage accounting', () => {
 					 VALUES (?, ?, ?, ?, ?, '{}', ?, ?)`,
 					roomId, parent, logId, logId, logId, clock.now(), clock.now(),
 				);
-				// Every created top-level room, and threads past the cap (expired ones cleanup has yet to remove).
+				// Every created top-level room, and more threads than the cap allows: the scan reads them all.
 				for (let index = 1; index <= 16; index += 1) room(`top-${index}`, null, clock.now() + index);
 				for (let index = 1; index <= 120; index += 1) room(`thread-${index}`, 'general', clock.now() + 100 + index);
 			});
@@ -859,6 +859,30 @@ describe('measured storage accounting', () => {
 			expect(replaced.deletedUploads).toEqual(['a/old']);
 			expect(store.accountingStatus().unsafe).toBe(false);
 			expect(store.clearAvatar({ userId: 'heavy', now: clock.now() })).toEqual({ changed: true, deletedUploads: ['a/new'] });
+			expect(store.accountingStatus().unsafe).toBe(false);
+		});
+	});
+
+	it('finds the server avatar upload within its reservation however many admins started one', async () => {
+		const stub = env.DEMO.getByName('accounting-server-avatar-scan-v1');
+		await runInDurableObject(stub, async (_instance, state) => {
+			const clock = new FakeClock(futureUtcNoon());
+			const store = new Store(state, defaultStoreConfig({ uploads: { ...UPLOAD_POLICY!, mediaOrigin: 'https://media.test' } }), clock);
+			store.initialize();
+			const sql = state.storage.sql;
+			const upload = (key: string, uploadState: string) => sql.exec(
+				`INSERT INTO uploads (upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms, created_ms)
+				 VALUES (?, '~server', 'server', NULL, NULL, ?, 1024, ?, ?, ?)`,
+				key, uploadState, clock.now() + HOUR, clock.now() + 30 * DAY, clock.now(),
+			);
+			state.storage.transactionSync(() => {
+				// Each admin's own daily limit charges what they start, so three admins leave 60 pending for the server.
+				for (let index = 0; index < 3 * UPLOAD_POLICY!.uploadsPerUserDay; index += 1) upload(`a/pending-${index}`, 'writing');
+				upload('a/server-old', 'done');
+			});
+			expect(store.finishUpload({ key: 'a/pending-0', ok: true, bytes: 512, contentType: 'image/png' }, clock.now()).deletedUploads).toEqual(['a/server-old']);
+			expect(store.accountingStatus().unsafe).toBe(false);
+			expect(store.clearServerAvatar(clock.now()).deletedUploads).toEqual(['a/pending-0']);
 			expect(store.accountingStatus().unsafe).toBe(false);
 		});
 	});
