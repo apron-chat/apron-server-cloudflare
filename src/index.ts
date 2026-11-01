@@ -65,6 +65,7 @@ import {
 	UPLOAD_WRITE_GRACE_MS,
 	uploadResultEmbed,
 	liveDeadline,
+	liveInputLimit,
 	liveResultEmbed,
 	isPrivateRoomId,
 	MAX_READ_RECEIPT_MEMBERS,
@@ -1448,7 +1449,7 @@ export function liveCommandNotice(kind: LiveKind, writeUrl: string, entry: Pick<
 		].join("\n");
 	}
 	return [
-		`Stream text into this room within ${window} (up to ${seconds} seconds and ${byteSize(entry.limit)}; it is appended to your message as markdown):`,
+		`Stream text into this room within ${window} (up to ${seconds} seconds and ${byteSize(entry.limit)}; it is appended to your message as markdown, revised by backspace and form feed):`,
 		"",
 		"```sh",
 		`your-llm-command | curl -sT - ${url}`,
@@ -5988,7 +5989,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			reader.cancel().catch(() => undefined);
 		};
 		const timer = setTimeout(() => session.stop!("time"), Math.max(0, (entry.startedMs ?? nowMs()) + entry.maxMs - nowMs()));
-		const maxInput = this.config.liveText!.policy.maxInputBytes;
+		// An append takes no more input than it keeps, as before edits; a terminal, maxInputBytes.
+		const maxInput = liveInputLimit(entry, this.config.liveText!.policy);
 		try {
 			for (;;) {
 				const { done, value } = await reader.read();
@@ -6018,6 +6020,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async endLiveText(session: LiveSession, end: LiveEnd): Promise<Response> {
 		const entry = session.entry;
+		// An append's last incomplete character, if any, reads as U+FFFD, for its readers too;
+		// cut at the input limit, it is dropped, so the text ends at a whole character (§4.8.5).
+		if (session.buffer) session.readers.send(session.buffer.end(end === "size"));
 		const kept = session.buffer?.kept() ?? new Uint8Array(0);
 		let published = false;
 		try {
@@ -6039,7 +6044,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			complete: "Done: the text is posted.",
 			time: `Stopped at the ${Math.round(entry.maxMs / 1_000)}-second limit; what was kept is posted.`,
 			size: entry.kind === "append"
-				? `Stopped at the ${byteSize(entry.limit)} limit; the first ${byteSize(entry.limit)} is posted.`
+				? `Stopped at the ${byteSize(entry.limit)} limit; what was kept is posted.`
 				: `Stopped at the ${byteSize(policy.maxInputBytes)} limit; the last ${byteSize(entry.limit)} is posted.`,
 			disconnected: "The write was interrupted; what arrived is posted.",
 			removed: "Stopped: the message or its embed was removed.",

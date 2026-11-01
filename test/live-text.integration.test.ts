@@ -52,7 +52,7 @@ function streamTo(url: string) {
 	const response = SELF.fetch(url, { method: 'PUT', body: readable, headers: { 'CF-Connecting-IP': ip() }, duplex: 'half' } as RequestInit);
 	return {
 		response,
-		send: (text: string) => writer.write(encode(text)).catch(() => undefined),
+		send: (text: string | Uint8Array) => writer.write(typeof text === 'string' ? encode(text) : text).catch(() => undefined),
 		end: () => writer.close().catch(() => undefined),
 	};
 }
@@ -189,6 +189,98 @@ describe('live text end to end', () => {
 			const merged = (await until(writer, isMessage(posted.message_id))).frame.params;
 			expect(merged.body).toEqual({ text: '**Plan:**\n\n1. Roll back.\n2. Renew the *cert*.\n', format: 'markdown' });
 			expect(reader.text()).toBe('1. Roll back.\n2. Renew the *cert*.\n');
+		} finally { writer.close(); }
+	});
+
+	it('revises an append with backspace and form feed: readers follow the edits, a late one gets the edited text, and the snapshot holds it', async () => {
+		const userId = unique('reviser');
+		const writer = await signedIn(userId, ['mod']);
+		try {
+			const { frame, skipped } = await exchange(writer, 'revise', 'message', { body: { text: 'Plan:', format: 'markdown', embeds: [{ kind: 'append' }] } });
+			const url = skipped.find(isMessage(frame.result.message_id))!.params.body.embeds[0].url;
+			const early = await readerOf(url);
+			const put = streamTo(frame.result.embeds[0].write_url);
+			// Backspaces with nothing before them in the live text leave body.text alone.
+			await put.send('\b\b first draft\f');
+			await put.send(' Hello wrold\b\b\b\b');
+			await early.waitFor('wrold\b\b\b\b');
+			// "é" (C3 A9) split across two chunks.
+			await put.send(new Uint8Array([0x6f, 0x72, 0x6c, 0x64, 0x2c, 0x20, 0x63, 0x61, 0x66, 0xc3]));
+			await put.send(new Uint8Array([0xa9, 0x08, 0x65]));
+			await early.waitFor('caf\u00e9\be');
+			// A reader that connects now gets the edited text so far, with no erased draft, then what follows.
+			const late = await readerOf(url);
+			await late.waitFor(' Hello world, cafe');
+			await put.send(' \u{1F680}\b!');
+			await late.waitFor('!');
+			await put.end();
+			expect(await (await put.response).text()).toBe('Done: the text is posted.\n');
+			await early.ended();
+			await late.ended();
+			// Clients apply the edits: the early reader got them as sent.
+			expect(early.text()).toBe('\b\b first draft\f Hello wrold\b\b\b\borld, caf\u00e9\be \u{1F680}\b!');
+			expect(late.text()).toBe(' Hello world, cafe \u{1F680}\b!');
+			const merged = (await until(writer, (f) => isMessage(frame.result.message_id)(f) && f.params.prev_log_id !== undefined)).frame.params;
+			expect(merged.body).toEqual({ text: 'Plan: Hello world, cafe !', format: 'markdown' });
+		} finally { writer.close(); }
+	});
+
+	it('stops an append\'s write at the bytes it keeps, though its edits keep less (liveInputLimit)', async () => {
+		const userId = unique('drafter');
+		const writer = await signedIn(userId, ['mod']);
+		try {
+			const { frame } = await command(writer, 'drafts', '/embed-append');
+			const put = streamTo(frame.result.embeds[0].write_url);
+			// 6,000 bytes whose edited text is 2,000: the 4 KB cap takes the 1,000 "a",
+			// then 3,096 bytes of "b" erased as they go, and nothing of the "c".
+			await put.send('a'.repeat(1_000));
+			const id = (await until(writer, fromUser(userId))).frame.params.message_id;
+			for (let index = 0; index < 4; index++) await put.send('b\b'.repeat(500));
+			await put.send('c'.repeat(1_000));
+			await put.end();
+			expect(await (await put.response).text()).toBe('Stopped at the 4 KB limit; what was kept is posted.\n');
+			const merged = (await until(writer, (f) => isMessage(id)(f) && f.params.prev_log_id !== undefined)).frame.params;
+			expect(merged.body).toEqual({ text: 'a'.repeat(1_000), format: 'markdown' });
+		} finally { writer.close(); }
+	});
+
+	it('drops a character cut at an append\'s input limit, for readers and the snapshot', async () => {
+		const userId = unique('cutter');
+		const writer = await signedIn(userId, ['mod']);
+		try {
+			const { frame } = await command(writer, 'cut', '/embed-append');
+			const put = streamTo(frame.result.embeds[0].write_url);
+			// 4,095 bytes that edit to "x", so the cap keeps only the first byte of "\u00e9" (C3 A9).
+			await put.send('a\b'.repeat(2_047) + 'x');
+			const posted = (await until(writer, fromUser(userId))).frame.params;
+			const reader = await readerOf(posted.body.embeds[0].url);
+			await reader.waitFor('x');
+			await put.send('\u00e9 and more');
+			await put.end();
+			expect(await (await put.response).text()).toBe('Stopped at the 4 KB limit; what was kept is posted.\n');
+			await reader.ended();
+			expect(reader.text()).toBe('x');
+			const merged = (await until(writer, (f) => isMessage(posted.message_id)(f) && f.params.prev_log_id !== undefined)).frame.params;
+			expect(merged.body).toEqual({ text: 'x', format: 'markdown' });
+		} finally { writer.close(); }
+	});
+
+	it('keeps a terminal\'s backspace and form feed in its output', async () => {
+		const userId = unique('typist');
+		const writer = await signedIn(userId, ['mod']);
+		try {
+			const { frame } = await command(writer, 'term-edits', '/embed-terminal');
+			const put = streamTo(frame.result.embeds[0].write_url);
+			await put.send('abc\b\bd\fpage two\r\n');
+			const posted = (await until(writer, fromUser(userId))).frame.params;
+			const reader = await readerOf(posted.body.embeds[0].url);
+			await reader.waitFor('page two');
+			await put.end();
+			await put.response;
+			await reader.ended();
+			expect(reader.text()).toBe('abc\b\bd\fpage two\r\n');
+			const finished = (await until(writer, isMessage(posted.message_id))).frame.params;
+			expect(finished.body.embeds[0].output).toBe('abc\b\bd\fpage two\r\n');
 		} finally { writer.close(); }
 	});
 

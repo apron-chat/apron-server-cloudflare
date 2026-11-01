@@ -809,6 +809,10 @@ object's, which Durable Objects do not bill beyond duration, and local
 workerd's own proxying; production CPU will differ, and the figures are an
 upper bound for the work, not a billing figure.
 
+An append's backspace and form feed edits (§4.8.5) leave its rows as they
+were. An append's writer may send no more bytes than the append keeps
+(4,096), edits included, so an append costs what it did before edits.
+
 ### Worst-case month
 
 At the Workers Paid limits, 100 texts a day start server-wide; the worst

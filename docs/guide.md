@@ -244,7 +244,9 @@ it posted stays); run `/invite-bot` again for a new token. See
 A bot streams an LLM's reply as it generates with live text: a `message`
 whose body has `{"kind": "append"}` in `embeds` gets a `write_url` in its
 result, and the bot `PUT`s the text there as a streaming body; everyone sees
-the message grow, and when the body ends the text joins `body.text`. A bot
+the message grow, and when the body ends the text joins `body.text`. A
+backspace in the text removes the character before it, and a form feed
+clears the text so far, so a bot can revise what it streamed. A bot
 has one open at a time, for at most two minutes and the message text limit
 (see [live text](limits.md#live-text)).
 

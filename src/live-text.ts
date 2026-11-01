@@ -5,8 +5,9 @@
  * publishes what was kept once, when the text ends (Store.finishLiveText).
  *
  * A terminal keeps its last `terminalKeepBytes` (§4.8.6 `keep_last`), an
- * append its first `appendMaxBytes` up to a whole character (§4.8.5). A
- * reader that connects gets what is kept, then every chunk as it arrives.
+ * append its text as decoded and edited (backspace and form feed, §4.8.5),
+ * the first `appendMaxBytes` of it up to a whole character. A reader that
+ * connects gets what is kept, then every chunk as it arrives.
  */
 
 export type LiveKind = "terminal" | "append";
@@ -30,16 +31,11 @@ export function keepLast(output: Uint8Array, limit: number): Uint8Array {
 	return tail.subarray(start);
 }
 
-/** §4.8.5: the first `limit` bytes, cut back to a whole UTF-8 character. */
-export function keepFirst(text: Uint8Array, limit: number): Uint8Array {
-	if (text.length <= limit) return text;
-	let end = Math.max(0, limit);
-	// A continuation byte at the cut belongs to a character that starts before it.
-	while (end > 0 && (text[end] & 0xc0) === 0x80) end -= 1;
-	return text.subarray(0, end);
-}
-
 const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+const encoder = new TextEncoder();
+/** The two characters that edit an append's text (§4.8.5): backspace and form feed. */
+const EDITS = /[\x08\x0c]/g;
+const NOTHING = new Uint8Array(0);
 
 /**
  * Kept bytes as text, with WHATWG's UTF-8 decode without BOM (§4.8.3): each
@@ -53,7 +49,22 @@ export function liveTextString(bytes: Uint8Array): string {
 /** Bytes a reader may fall behind before it is dropped, so a stalled one cannot grow the object's memory. */
 export const MAX_READER_BACKLOG_BYTES = 256 * 1024;
 
-/** The kept bytes of one text: the last part for a terminal, the first for an append. */
+/**
+ * §4.8.5: an append's text as kept, from any bytes: decoded, edited, and
+ * cut to its first `limit` bytes up to a whole character. Text kept already
+ * comes back as it is.
+ */
+export function keepAppend(bytes: Uint8Array, limit: number): Uint8Array {
+	const buffer = new LiveBuffer("append", limit);
+	buffer.push(bytes);
+	buffer.end();
+	return buffer.kept();
+}
+
+/**
+ * The kept bytes of one text: the last part for a terminal; for an append,
+ * its edited text so far, re-encoded as UTF-8, the first part.
+ */
 export class LiveBuffer {
 	readonly kind: LiveKind;
 	/** The most kept: `terminalKeepBytes`, or the bytes an append may add. */
@@ -64,6 +75,8 @@ export class LiveBuffer {
 	full = false;
 	private bytes: Uint8Array;
 	private length = 0;
+	/** An append's streaming decoder: it holds a character split across chunks. */
+	private readonly decoder?: TextDecoder;
 
 	constructor(kind: LiveKind, limit: number) {
 		this.kind = kind;
@@ -72,11 +85,14 @@ export class LiveBuffer {
 		// each byte is copied a bounded number of times (keepLast is stable:
 		// cutting early and again later keeps what one cut at the end keeps).
 		this.bytes = new Uint8Array(kind === "terminal" ? 2 * this.limit : this.limit);
+		if (kind === "append") this.decoder = new TextDecoder("utf-8", { ignoreBOM: true });
 	}
 
 	/**
-	 * Takes a chunk; returns the bytes readers get now (all of a terminal's
-	 * chunk; an append's up to its limit), and whether an append is full.
+	 * Takes a chunk; returns the bytes readers get now, and whether an append
+	 * is full. A terminal's readers get its chunk; an append's get the whole
+	 * characters it decoded, up to its limit, edits included (clients apply
+	 * them), so a reader that connects later can follow the edited text.
 	 */
 	push(chunk: Uint8Array): { send: Uint8Array; full: boolean } {
 		this.received += chunk.length;
@@ -94,21 +110,63 @@ export class LiveBuffer {
 			}
 			return { send: chunk, full: false };
 		}
-		if (this.full) return { send: new Uint8Array(0), full: true };
-		if (this.length + chunk.length <= this.limit) {
-			this.bytes.set(chunk, this.length);
-			this.length += chunk.length;
-			return { send: chunk, full: false };
-		}
-		const joined = new Uint8Array(this.length + chunk.length);
-		joined.set(this.bytes.subarray(0, this.length));
-		joined.set(chunk, this.length);
-		const kept = keepFirst(joined, this.limit);
+		if (this.full) return { send: NOTHING, full: true };
+		return this.append(this.decoder!.decode(chunk, { stream: true }));
+	}
+
+	/**
+	 * Ends an append's text: a character left incomplete reads as U+FFFD
+	 * (§4.8.3), unless the write was `cut` at its input limit, which keeps
+	 * the text up to a whole character (§4.8.5) and drops the start of the
+	 * one it cut. Returns what readers get of it.
+	 */
+	end(cut = false): Uint8Array {
+		if (!this.decoder || this.full) return NOTHING;
+		// Decoding with no more input flushes what waits, and resets the decoder either way.
+		const rest = this.decoder.decode();
+		return cut ? NOTHING : this.append(rest).send;
+	}
+
+	/**
+	 * Adds decoded text to an append (§4.8.5): backspace removes the code
+	 * point before it, never reaching before the live text; form feed removes
+	 * all of it. The text is kept as UTF-8, so a code point is one lead byte
+	 * and its continuation bytes, and the limit counts the edited text: at
+	 * the first character that does not fit, the append is full.
+	 */
+	private append(text: string): { send: Uint8Array; full: boolean } {
 		const before = this.length;
-		this.bytes.set(kept);
-		this.length = kept.length;
-		this.full = true;
-		return { send: kept.slice(Math.min(before, kept.length)), full: true };
+		let edited = false;
+		let start = 0;
+		EDITS.lastIndex = 0;
+		for (;;) {
+			const edit = EDITS.exec(text);
+			const stop = edit ? edit.index : text.length;
+			if (stop > start) {
+				const part = stop - start === text.length ? text : text.slice(start, stop);
+				const { read, written } = encoder.encodeInto(part, this.bytes.subarray(this.length));
+				this.length += written;
+				if (read < part.length) {
+					this.full = true;
+					start += read;
+					break;
+				}
+			}
+			if (!edit) {
+				start = text.length;
+				break;
+			}
+			edited = true;
+			if (text.charCodeAt(stop) === 0x0c) this.length = 0;
+			else if (this.length > 0) {
+				do this.length -= 1;
+				while (this.length > 0 && (this.bytes[this.length] & 0xc0) === 0x80);
+			}
+			start = stop + 1;
+		}
+		// Without edits, what readers get is what was added; with them, the text that was read, edits and all.
+		const send = !edited ? this.bytes.slice(before, this.length) : encoder.encode(start === text.length ? text : text.slice(0, start));
+		return { send, full: this.full };
 	}
 
 	/** What is kept now: what a reader that connects gets first, and what the text publishes when it ends. */

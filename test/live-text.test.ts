@@ -2,10 +2,10 @@ import { describe, expect, it } from 'vitest';
 import { DEFAULT_LIMITS, LIVE_TEXT_POLICY } from '../src/budget';
 import { ConfigError, loadConfig, validateLiveTextPolicy } from '../src/config';
 import { liveCommandNotice } from '../src/index';
-import { keepFirst, keepLast, LiveBuffer, liveTextString } from '../src/live-text';
+import { keepAppend, keepLast, LiveBuffer, liveTextString } from '../src/live-text';
 import { FREE_PLAN } from '../src/plans/free';
 import { PAID_PLAN } from '../src/plans/paid';
-import { LIVE_ORPHAN_GRACE_MS, MAX_TERMINAL_OUTPUT_JSON_BYTES, Store, type LiveEntry, type StoreLiveTextConfig } from '../src/store';
+import { LIVE_ORPHAN_GRACE_MS, liveInputLimit, liveResultEmbed, MAX_TERMINAL_OUTPUT_JSON_BYTES, Store, type LiveEntry, type StoreLiveTextConfig } from '../src/store';
 import { errorCode, expectRetryAfter, withStore, type TestClock } from './helpers/store';
 
 const encode = (text: string) => new TextEncoder().encode(text);
@@ -34,7 +34,7 @@ describe('liveTextString', () => {
 	});
 });
 
-describe('keep_last and keep_first', () => {
+describe('keep_last and the append\'s first part', () => {
 	it('cuts a terminal at its first control character in the last part (§4.8.6)', () => {
 		expect(keepLast(encode('abc\x1b[31mdef'), 100)).toEqual(encode('abc\x1b[31mdef'));
 		// The last 8 bytes are "[31mdef\n"? No: "1mdef\nxy"; it starts at the line feed.
@@ -60,10 +60,12 @@ describe('keep_last and keep_first', () => {
 	});
 
 	it('keeps an append\'s first part up to a whole character (§4.8.5)', () => {
-		expect(keepFirst(encode('héllo'), 2)).toEqual(encode('h'));
-		expect(keepFirst(encode('héllo'), 3)).toEqual(encode('hé'));
-		expect(keepFirst(encode('abc'), 5)).toEqual(encode('abc'));
-		expect(keepFirst(encode('€'), 2)).toEqual(new Uint8Array(0));
+		expect(keepAppend(encode('héllo'), 2)).toEqual(encode('h'));
+		expect(keepAppend(encode('héllo'), 3)).toEqual(encode('hé'));
+		expect(keepAppend(encode('abc'), 5)).toEqual(encode('abc'));
+		expect(keepAppend(encode('€'), 2)).toEqual(new Uint8Array(0));
+		// Kept as decoded: an invalid byte is U+FFFD's three bytes, and so is an incomplete character at the end.
+		expect(keepAppend(bytes(0x61, 0xff, 0xe2, 0x82), 10)).toEqual(encode('a\ufffd\ufffd'));
 	});
 });
 
@@ -92,6 +94,116 @@ describe('LiveBuffer', () => {
 		expect(last).toEqual({ send: encode('cé'), full: true });
 		expect(buffer.kept()).toEqual(encode('abcé'));
 		expect(buffer.push(encode('more')).send).toEqual(new Uint8Array(0));
+	});
+
+	it('applies an append\'s backspace to the code point before it, "é" and an astral emoji included (§4.8.5)', () => {
+		const buffer = new LiveBuffer('append', 64);
+		buffer.push(encode('caf\u00e9\b'));
+		expect(liveTextString(buffer.kept())).toBe('caf');
+		// One backspace removes a surrogate pair's one code point, not half of it.
+		buffer.push(encode('e \u{1F680}\b\u{1F600}'));
+		expect(liveTextString(buffer.kept())).toBe('cafe \u{1F600}');
+		buffer.push(encode('\b\b'));
+		expect(liveTextString(buffer.kept())).toBe('cafe');
+		// U+FFFD from an invalid byte is one code point too.
+		buffer.push(bytes(0xff, 0x08, 0x21));
+		expect(liveTextString(buffer.kept())).toBe('cafe!');
+	});
+
+	it('clears an append\'s text with form feed, and a backspace with nothing before it does nothing', () => {
+		const buffer = new LiveBuffer('append', 64);
+		buffer.push(encode('draft one\fdraft two'));
+		expect(liveTextString(buffer.kept())).toBe('draft two');
+		buffer.push(encode('\f\b\b\bHello wrold\b\b\b\borld, caf\u00e9\be'));
+		expect(liveTextString(buffer.kept())).toBe('Hello world, cafe');
+		buffer.push(encode('\f'));
+		expect(buffer.kept()).toEqual(new Uint8Array(0));
+		buffer.end();
+		expect(keepAppend(encode('\b\bok'), 10)).toEqual(encode('ok'));
+	});
+
+	it('edits the same however the bytes are split, a character split across chunks included', () => {
+		const text = encode('ab\u00e9\u20ac\u{1F680}\bx\fy\u00e9\u{1F600}\b\u{1F431}\x08z\u00e9');
+		const whole = keepAppend(text, 64);
+		expect(liveTextString(whole)).toBe('y\u00e9z\u00e9');
+		for (let cut = 0; cut <= text.length; cut++) {
+			const buffer = new LiveBuffer('append', 64);
+			const sent: number[] = [];
+			sent.push(...buffer.push(text.subarray(0, cut)).send);
+			sent.push(...buffer.push(text.subarray(cut)).send);
+			sent.push(...buffer.end());
+			expect(buffer.kept()).toEqual(whole);
+			// Readers get whole characters, edits included: applied, they show the kept text.
+			expect(new TextDecoder().decode(Uint8Array.from(sent))).toBe(new TextDecoder().decode(text));
+		}
+	});
+
+	it('sends readers whole characters only, and the edited text so far to a reader that connects late', () => {
+		const buffer = new LiveBuffer('append', 64);
+		// "é" is C3 A9: the half that arrives waits for the rest.
+		expect(buffer.push(bytes(0x61, 0xc3)).send).toEqual(encode('a'));
+		expect(buffer.kept()).toEqual(encode('a'));
+		expect(buffer.push(bytes(0xa9, 0x08, 0x62)).send).toEqual(encode('\u00e9\bb'));
+		// A late reader starts from the edited text, with no erased draft.
+		expect(buffer.kept()).toEqual(encode('ab'));
+		// An incomplete character at the end reads as U+FFFD, for the readers too.
+		expect(buffer.push(bytes(0xe2, 0x82)).send).toEqual(new Uint8Array(0));
+		expect(buffer.end()).toEqual(encode('\ufffd'));
+		expect(buffer.kept()).toEqual(encode('ab\ufffd'));
+	});
+
+	it('drops the start of a character cut at the input limit, so the text ends at a whole character', () => {
+		// Limit 8: "ab\b\bxyz" is 7 bytes of input, so the cap leaves 1 byte of "\u00e9" (C3 A9).
+		const cut = new LiveBuffer('append', 8);
+		cut.push(encode('ab\b\bxyz'));
+		expect(cut.push(bytes(0xc3)).send).toEqual(new Uint8Array(0));
+		expect(cut.end(true)).toEqual(new Uint8Array(0));
+		expect(cut.kept()).toEqual(encode('xyz'));
+		// A clean end still reads it as U+FFFD.
+		const clean = new LiveBuffer('append', 8);
+		clean.push(encode('ab\b\bxyz'));
+		clean.push(bytes(0xc3));
+		expect(clean.end()).toEqual(encode('\ufffd'));
+		expect(clean.kept()).toEqual(encode('xyz\ufffd'));
+	});
+
+	it('counts the edited text against an append\'s limit', () => {
+		// Raw, "abcd\b\befgh" passes 4 bytes at once; edited, "abef" fits and "g" ends it.
+		const buffer = new LiveBuffer('append', 4);
+		expect(buffer.push(encode('abcd\b\bef')).full).toBe(false);
+		expect(buffer.kept()).toEqual(encode('abef'));
+		const last = buffer.push(encode('gh'));
+		expect(last).toEqual({ send: new Uint8Array(0), full: true });
+		expect(buffer.kept()).toEqual(encode('abef'));
+		// A cut inside a chunk with edits sends readers the text read up to the cut.
+		const cut = new LiveBuffer('append', 4);
+		expect(cut.push(encode('xy\f\u00e9a\u20acz'))).toEqual({ send: encode('xy\f\u00e9a'), full: true });
+		expect(cut.kept()).toEqual(encode('\u00e9a'));
+		// The buffer alone: drafts erased as they go never fill it. A write is
+		// stopped sooner, at its input limit (liveInputLimit), as the
+		// integration test of that limit checks.
+		const drafts = new LiveBuffer('append', 4);
+		for (let index = 0; index < 1_000; index++) expect(drafts.push(encode('four\f')).full).toBe(false);
+		expect(drafts.kept()).toEqual(new Uint8Array(0));
+	});
+
+	it('leaves a terminal\'s backspace and form feed as they are', () => {
+		const buffer = new LiveBuffer('terminal', 64);
+		const output = encode('abc\b\bde\fclear\x08');
+		expect(buffer.push(output).send).toEqual(output);
+		expect(buffer.end()).toEqual(new Uint8Array(0));
+		expect(buffer.kept()).toEqual(output);
+	});
+});
+
+describe('the input a write may send', () => {
+	it('is what an append keeps, so its edits never let it send more, and maxInputBytes for a terminal', () => {
+		const policy = { maxInputBytes: 2_000_000 };
+		expect(liveInputLimit({ kind: 'append', limit: 4_096 }, policy)).toBe(4_096);
+		expect(liveInputLimit({ kind: 'append', limit: 100 }, policy)).toBe(100);
+		expect(liveInputLimit({ kind: 'terminal', limit: 32_768 }, policy)).toBe(2_000_000);
+		const entry = { embedId: 'e1', kind: 'append', key: 'l/1', limit: 4_096, writeExpiresMs: 1 } as LiveEntry;
+		expect(liveResultEmbed(entry, policy)).toMatchObject({ write: { max_bytes: 4_096 } });
 	});
 });
 
@@ -132,7 +244,8 @@ describe('live text policy', () => {
 		expect(terminal).toContain('within 2 minutes (80×40, up to 300 seconds and 2 MB; the last 32 KB is kept)');
 		expect(terminal).toContain("script -qfc 'stty cols 80 rows 40; YOUR_COMMAND' /dev/null | curl -sT - 'https://demo.test/w/l.x'");
 		const append = liveCommandNotice('append', 'https://demo.test/w/l.y', { maxMs: 120_000, limit: 4_000 }, policy);
-		expect(append).toContain('up to 120 seconds and 4,000 bytes');
+		expect(append).toContain('up to 120 seconds and 4,000 bytes; it is appended to your message as markdown, revised by backspace and form feed):');
+		expect(terminal).not.toContain('backspace');
 		expect(append).toContain("your-llm-command | curl -sT - 'https://demo.test/w/l.y'");
 		// The link is a bearer credential, good for one write.
 		for (const notice of [terminal, append]) expect(notice).toContain("The link works once, and anyone with it can stream as you, so don't share it.");
@@ -201,6 +314,24 @@ describe('store live text', () => {
 			const twice = () => post(store, clock, 'bob', { message_id: open.result.message_id, body: { text: 'x', embeds: [keptAppend, { kind: 'append' }] } });
 			expect(errorCode(twice)).toBe('invalid_params');
 			expect(twice).toThrow('A message has at most one append embed');
+		});
+	});
+
+	it('appends the text after its edits, which never reach into body.text (§4.8.5)', async () => {
+		await withStore('live-append-edits', { liveText: LIVE, maxTextBytes: 24 }, (store, clock) => {
+			register(store, clock, 'ed');
+			const created = post(store, clock, 'ed', { body: { text: 'Plan:', format: 'markdown', embeds: [{ kind: 'append' }] } });
+			const key = writeOf(created.result).write.key;
+			store.claimLiveText(key, clock.value);
+			// The store edits whatever it is given: backspaces before the live text do nothing.
+			const finished = store.finishLiveText(key, encode('\b\b\b\bfirst draft\f\b ok caf\u00e9\be \u{1F680}\b!'), clock.value);
+			expect(bodyOf(finished).body).toEqual({ text: 'Plan: ok cafe !', format: 'markdown' });
+			// The limit counts the edited text: 23 bytes of room, of which an erased draft takes none.
+			const next = post(store, clock, 'ed', { body: { text: 'x', embeds: [{ kind: 'append' }] } });
+			const nextKey = writeOf(next.result).write.key;
+			store.claimLiveText(nextKey, clock.value);
+			const long = store.finishLiveText(nextKey, encode(`${'draft '.repeat(3)}\f${'0123456789'.repeat(3)}`), clock.value);
+			expect(bodyOf(long).body!.text).toBe('x01234567890123456789012');
 		});
 	});
 

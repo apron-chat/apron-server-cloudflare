@@ -23,7 +23,7 @@ import {
   type UploadPolicy,
 } from "./budget";
 import { hostListAllowed } from "./config";
-import { keepFirst, keepLast, liveTextString, type LiveKind } from "./live-text";
+import { keepAppend, keepLast, liveTextString, type LiveKind } from "./live-text";
 import type { AccountUsageSnapshot } from "./account-usage";
 import {
   BudgetLedger,
@@ -395,8 +395,17 @@ export function liveResultEmbed(entry: LiveEntry, policy: Pick<LiveTextPolicy, "
   return {
     embed_id: entry.embedId,
     kind: entry.kind,
-    write: { key: entry.key, max_bytes: policy.maxInputBytes, expires_ms: entry.writeExpiresMs },
+    write: { key: entry.key, max_bytes: liveInputLimit(entry, policy), expires_ms: entry.writeExpiresMs },
   };
+}
+
+/**
+ * The most bytes a write may send: for an append, the bytes it keeps (its
+ * `limit`), so edits never let it stream more than an append without them;
+ * for a terminal, `maxInputBytes`.
+ */
+export function liveInputLimit(entry: Pick<LiveEntry, "kind" | "limit">, policy: Pick<LiveTextPolicy, "maxInputBytes">): number {
+  return entry.kind === "append" ? Math.min(entry.limit, policy.maxInputBytes) : policy.maxInputBytes;
 }
 
 /**
@@ -5045,9 +5054,9 @@ export class Store {
   /**
    * Ends a live text exactly once (§4.8.3) and publishes what it kept: a
    * terminal's message gets its embed with `output` (§4.8.6), and an
-   * append's the kept text appended to `body.text` and its embed removed
-   * (§4.8.5); with nothing kept, the embed is removed (a message left with
-   * nothing is a tombstone). A text already ended, or whose message or
+   * append's the kept text, after its edits, appended to `body.text` and
+   * its embed removed (§4.8.5); with nothing kept, the embed is removed (a
+   * message left with nothing is a tombstone). A text already ended, or whose message or
    * embed is gone, publishes nothing. Finishing work already admitted, it is
    * charged as maintenance, so an exhausted foreground budget cannot lose it.
    */
@@ -5099,9 +5108,8 @@ export class Store {
     const embed = embeds.find((candidate) => candidate.embed_id === entry.embedId);
     if (!message || !snapshot || !embed) return [];
     // What the entry keeps, whatever the caller held: the last part of a terminal, the first of an append.
-    const bytes = entry.kind === "terminal" ? keepLast(kept ?? new Uint8Array(0), entry.limit) : keepFirst(kept ?? new Uint8Array(0), entry.limit);
     if (entry.kind === "terminal") {
-      const output = terminalOutput(bytes);
+      const output = terminalOutput(keepLast(kept ?? new Uint8Array(0), entry.limit));
       // Its `url` ends with the text: the output is the embed's now (§4.8.6).
       const { url: _url, ...rest } = embed;
       void _url;
@@ -5109,9 +5117,9 @@ export class Store {
     }
     const base = typeof snapshot.body?.text === "string" ? snapshot.body.text : "";
     // A save may have lengthened the text while it streamed: the body stays within the text limit.
+    // The edits (§4.8.5) apply to the appended text only, never to `base`.
     const room = Math.max(0, this.config.maxTextBytes - utf8Bytes(base));
-    let added: Uint8Array = new TextEncoder().encode(liveTextString(keepFirst(bytes, room)));
-    if (added.length > room) added = keepFirst(added, room);
+    const added = keepAppend(kept ?? new Uint8Array(0), Math.min(entry.limit, room));
     return this.rewriteEmbed(message, snapshot, entry.embedId, null, now, base + liveTextString(added));
   }
 

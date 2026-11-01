@@ -159,7 +159,9 @@ within it:
   text ends (its body ends, the writer goes, or a limit is reached), the
   message gets one more snapshot: a terminal keeps its last 32 KB as
   `output`, and an append's text joins `body.text` (its first part, so the
-  body stays within 4,096 bytes), without changing mentions. A save that
+  body stays within 4,096 bytes), without changing mentions. In an append,
+  a backspace removes the character before it and a form feed clears the
+  text so far, never the message's own text. A save that
   removes the embed, or deletes the message, ends it early, publishing
   nothing more. Nothing is stored while the text streams: if the server
   restarts meanwhile (a deploy), the text ends and its embed is removed.
