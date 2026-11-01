@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { PUSH_POLICY } from '../src/budget';
 import { ConfigError, DEFAULT_OG_MEDIA_HOSTS, DEFAULT_PUSH_HOSTS, hostListAllowed, loadConfig, pushHostAllowed, validatePushPolicy } from '../src/config';
+import { asStoreConfig } from '../src/index';
 import { FREE_PLAN } from '../src/plans/free';
 import { PAID_PLAN } from '../src/plans/paid';
 import {
@@ -168,6 +169,9 @@ describe('push configuration', () => {
 		for (const host of ['www.youtube.com', 'youtube.com', 'raw.githubusercontent.com', 'i.scdn.co', 'miro.medium.com']) {
 			expect(hostListAllowed(DEFAULT_OG_MEDIA_HOSTS, host), host).toBe(false);
 		}
+		// The store's own default keeps none, so the runtime must pass the list on.
+		expect(asStoreConfig(loadConfig(base)).ogMediaHosts).toEqual(DEFAULT_OG_MEDIA_HOSTS);
+		expect(asStoreConfig(loadConfig({ ...base, OG_MEDIA_HOSTS: '' })).ogMediaHosts).toEqual([]);
 	});
 
 	it('waits the plan\'s push.delaySeconds before a wake pushes, or PUSH_DELAY_SECONDS from 0 to 60', () => {

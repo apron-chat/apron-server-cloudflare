@@ -733,7 +733,7 @@ function nowMs(): number {
 	return Date.now();
 }
 
-function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
+export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 	const limits = config.limits;
 	return {
 		retentionMs: limits.retentionSeconds * 1_000,

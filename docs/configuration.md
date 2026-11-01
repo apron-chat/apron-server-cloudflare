@@ -460,8 +460,9 @@ from any host, and an empty value keeps none. Unset, it is the image CDNs in
 None of these serves a site's player pages, so `og.video` such as YouTube's
 `https://www.youtube.com/embed/…` is dropped: a link keeps its thumbnail but
 no inline player. Clients still sanitize and sandbox what they render. A
-malformed list fails the configuration check. Media of this server's own
-uploads are not client-built and are always kept.
+malformed list fails the configuration check. This list does not apply to
+the `og` media the server itself builds when one of its own uploads
+completes.
 
 ## Push
 

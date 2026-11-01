@@ -121,10 +121,15 @@ it("keeps og media only from ogMediaHosts, over https without credentials or a p
 			og: { title: "Example", image: { url: "https://i.ytimg.com/vi/abc/hq.jpg", type: "image/png", width: 320, alt: "An example" } },
 		});
 		expect((sent(store, clock, "ogm2", { url: "https://x.cdn.example/a.png" }).og as Record<string, unknown>).image).toEqual({ url: "https://x.cdn.example/a.png" });
+		// A backslash ends the host: the client loads the same canonical URL the server checked.
+		expect((sent(store, clock, "ogm3", { url: "https://i.ytimg.com\\@evil.example/a.png" }).og as Record<string, unknown>).image).toEqual({ url: "https://i.ytimg.com/@evil.example/a.png" });
 		for (const [i, url] of [
 			"https://evil.example/a.png", // not listed
 			"https://cdn.example/a.png", // `*.cdn.example` is subdomains only
 			"https://i.ytimg.com.evil.example/a.png",
+			"https://i.ytimg.com./a.png", // a trailing dot is another host name
+			"https://i.ytimg.com%2e/a.png",
+			"https://evil.example\\@i.ytimg.com/a.png",
 			"http://i.ytimg.com/a.png", // https only
 			"https://user@i.ytimg.com/a.png",
 			"https://i.ytimg.com:8443/a.png",
@@ -133,7 +138,7 @@ it("keeps og media only from ogMediaHosts, over https without credentials or a p
 		}
 	}, { ...ROOMY, ogMediaHosts: ["i.ytimg.com", "*.cdn.example"] });
 	await withStore("og-media-off", (store, clock) => {
-		expect(sent(store, clock, "ogm3", og.image)).toEqual({ kind: "link", url: "https://example.com", og: { title: "Example" } });
+		expect(sent(store, clock, "ogm4", og.image)).toEqual({ kind: "link", url: "https://example.com", og: { title: "Example" } });
 	});
 });
 
