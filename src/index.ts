@@ -734,7 +734,7 @@ function nowMs(): number {
 	return Date.now();
 }
 
-function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
+export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 	const limits = config.limits;
 	return {
 		retentionMs: limits.retentionSeconds * 1_000,
@@ -789,6 +789,7 @@ function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		storageHardTargetBytes: limits.databaseHardTargetBytes,
 		storageLowWaterBytes: limits.databaseResumeLowWaterBytes,
 		admissionEnabled: !config.admissionOff,
+		ogMediaHosts: config.ogMediaHosts,
 		...(config.accountingRecovery !== undefined ? { accountingRecovery: config.accountingRecovery } : {}),
 		uploads: config.uploads && UPLOAD_POLICY ? { ...UPLOAD_POLICY, mediaOrigin: config.uploads.mediaOrigin } : null,
 		push: config.push && PUSH_POLICY ? { ...PUSH_POLICY } : null,

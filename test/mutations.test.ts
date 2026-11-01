@@ -104,27 +104,42 @@ it("keeps an embed's og as plain text fields and drops the rest", async () => {
 	});
 });
 
-it("keeps og media from other servers only with ogRemoteMedia", async () => {
+it("keeps og media only from ogMediaHosts, over https without credentials or a port", async () => {
+	const og = {
+		title: "Example",
+		image: { url: "https://i.ytimg.com/vi/abc/hq.jpg", type: "image/png", width: 320, height: -1, alt: "An\nexample", extra: true },
+		video: { url: "javascript:alert(1)" },
+		audio: "https://cdn.example/a.mp3",
+	};
+	const sent = (store: Store, clock: TestClock, id: string, image: unknown) => {
+		const created = post(store, clock, "alice", id, { body: { text: "look", embeds: [{ kind: "link", url: "https://example.com", og: { ...og, image } }] } });
+		return (created.message?.body?.embeds as Record<string, unknown>[])[0];
+	};
 	await withStore("og-media", (store, clock) => {
-		const created = post(store, clock, "alice", "ogm1", {
-			body: {
-				text: "look",
-				embeds: [{
-					kind: "link", url: "https://example.com",
-					og: {
-						title: "Example",
-						image: { url: "https://cdn.example/a.png", type: "image/png", width: 320, height: -1, alt: "An\nexample", extra: true },
-						video: { url: "javascript:alert(1)" },
-						audio: "https://cdn.example/a.mp3",
-					},
-				}],
-			},
-		});
-		expect((created.message?.body?.embeds as unknown[])[0]).toEqual({
+		expect(sent(store, clock, "ogm1", og.image)).toEqual({
 			kind: "link", url: "https://example.com",
-			og: { title: "Example", image: { url: "https://cdn.example/a.png", type: "image/png", width: 320, alt: "An example" } },
+			og: { title: "Example", image: { url: "https://i.ytimg.com/vi/abc/hq.jpg", type: "image/png", width: 320, alt: "An example" } },
 		});
-	}, { ...ROOMY, ogRemoteMedia: true });
+		expect((sent(store, clock, "ogm2", { url: "https://x.cdn.example/a.png" }).og as Record<string, unknown>).image).toEqual({ url: "https://x.cdn.example/a.png" });
+		// A backslash ends the host: the client loads the same canonical URL the server checked.
+		expect((sent(store, clock, "ogm3", { url: "https://i.ytimg.com\\@evil.example/a.png" }).og as Record<string, unknown>).image).toEqual({ url: "https://i.ytimg.com/@evil.example/a.png" });
+		for (const [i, url] of [
+			"https://evil.example/a.png", // not listed
+			"https://cdn.example/a.png", // `*.cdn.example` is subdomains only
+			"https://i.ytimg.com.evil.example/a.png",
+			"https://i.ytimg.com./a.png", // a trailing dot is another host name
+			"https://i.ytimg.com%2e/a.png",
+			"https://evil.example\\@i.ytimg.com/a.png",
+			"http://i.ytimg.com/a.png", // https only
+			"https://user@i.ytimg.com/a.png",
+			"https://i.ytimg.com:8443/a.png",
+		].entries()) {
+			expect(sent(store, clock, `ogm-bad-${i}`, { url }), url).toEqual({ kind: "link", url: "https://example.com", og: { title: "Example" } });
+		}
+	}, { ...ROOMY, ogMediaHosts: ["i.ytimg.com", "*.cdn.example"] });
+	await withStore("og-media-off", (store, clock) => {
+		expect(sent(store, clock, "ogm4", og.image)).toEqual({ kind: "link", url: "https://example.com", og: { title: "Example" } });
+	});
 });
 
 it("broadcasts flat self-describing snapshots and enforces replacement semantics", async () => {

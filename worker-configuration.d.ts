@@ -23,6 +23,7 @@ declare global {
 		VAPID_SUBJECT?: string;
 		PUSH_HOSTS?: string;
 		PUSH_DELAY_SECONDS?: string;
+		OG_MEDIA_HOSTS?: string;
 		ASSETS?: Fetcher;
 		ALLOWED_ORIGINS?: string;
 		RP_ID?: string;
@@ -63,6 +64,7 @@ declare global {
 			VAPID_SUBJECT?: string;
 			PUSH_HOSTS?: string;
 			PUSH_DELAY_SECONDS?: string;
+			OG_MEDIA_HOSTS?: string;
 			ASSETS?: Fetcher;
 			ALLOWED_ORIGINS?: string;
 			RP_ID?: string;

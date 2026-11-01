@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { PUSH_POLICY } from '../src/budget';
-import { ConfigError, DEFAULT_PUSH_HOSTS, loadConfig, pushHostAllowed, validatePushPolicy } from '../src/config';
+import { ConfigError, DEFAULT_OG_MEDIA_HOSTS, DEFAULT_PUSH_HOSTS, hostListAllowed, loadConfig, pushHostAllowed, validatePushPolicy } from '../src/config';
+import { asStoreConfig } from '../src/index';
 import { FREE_PLAN } from '../src/plans/free';
 import { PAID_PLAN } from '../src/plans/paid';
 import {
@@ -152,6 +153,25 @@ describe('push configuration', () => {
 			expect(pushHostAllowed(defaults, host), host).toBe(false);
 		}
 		expect(pushHostAllowed('*', 'anything.example')).toBe(true);
+	});
+
+	it('keeps og media from the default image CDNs, or the hosts OG_MEDIA_HOSTS lists', () => {
+		expect(loadConfig(base).ogMediaHosts).toEqual(DEFAULT_OG_MEDIA_HOSTS);
+		expect(loadConfig({ ...base, OG_MEDIA_HOSTS: '' }).ogMediaHosts).toEqual([]);
+		expect(loadConfig({ ...base, OG_MEDIA_HOSTS: '*' }).ogMediaHosts).toBe('*');
+		expect(loadConfig({ ...base, OG_MEDIA_HOSTS: 'I.YTimg.com, *.cdn.example' }).ogMediaHosts).toEqual(['i.ytimg.com', '*.cdn.example']);
+		for (const bad of ['*, i.ytimg.com', 'https://i.ytimg.com', 'ytimg', '*.', 'i.ytimg.com/vi', 'i.ytimg.com:443', 'user@i.ytimg.com', 'i.ytimg.com.', '*.*.ytimg.com', '[::1]', '0x7f.1', 'ｉ.ytimg.com', 'i ytimg.com']) {
+			expect(() => loadConfig({ ...base, OG_MEDIA_HOSTS: bad }), bad).toThrow(ConfigError);
+		}
+		for (const host of ['i.ytimg.com', 'pbs.twimg.com', 'upload.wikimedia.org', 'opengraph.githubassets.com']) {
+			expect(hostListAllowed(DEFAULT_OG_MEDIA_HOSTS, host), host).toBe(true);
+		}
+		for (const host of ['www.youtube.com', 'youtube.com', 'raw.githubusercontent.com', 'i.scdn.co', 'miro.medium.com']) {
+			expect(hostListAllowed(DEFAULT_OG_MEDIA_HOSTS, host), host).toBe(false);
+		}
+		// The store's own default keeps none, so the runtime must pass the list on.
+		expect(asStoreConfig(loadConfig(base)).ogMediaHosts).toEqual(DEFAULT_OG_MEDIA_HOSTS);
+		expect(asStoreConfig(loadConfig({ ...base, OG_MEDIA_HOSTS: '' })).ogMediaHosts).toEqual([]);
 	});
 
 	it('waits the plan\'s push.delaySeconds before a wake pushes, or PUSH_DELAY_SECONDS from 0 to 60', () => {

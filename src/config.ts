@@ -73,6 +73,12 @@ export interface RuntimeConfig {
 	 * plan's `push.delaySeconds`, or `PUSH_DELAY_SECONDS` (0 pushes at once).
 	 */
 	pushDelaySeconds: number;
+	/**
+	 * The hosts whose media a client-built `og` may keep (`OG_MEDIA_HOSTS`):
+	 * exact hosts, or `*.host` for its subdomains; `"*"` allows any host, and
+	 * an empty list keeps no remote media.
+	 */
+	ogMediaHosts: readonly string[] | "*";
 }
 
 /** The browsers' own push services, allowed when `PUSH_HOSTS` is unset. */
@@ -84,11 +90,55 @@ export const DEFAULT_PUSH_HOSTS: readonly string[] = [
 	"*.notify.windows.com",
 ];
 
-/** Whether `PUSH_HOSTS` allows an endpoint host (lowercase, no trailing dot). */
-export function pushHostAllowed(hosts: RuntimeConfig["pushHosts"], host: string): boolean {
+/**
+ * Whether a host list (`PUSH_HOSTS`, `OG_MEDIA_HOSTS`) allows `host`
+ * (lowercase, no trailing dot): an exact entry, or a `*.host` entry for its
+ * subdomains only.
+ */
+export function hostListAllowed(hosts: readonly string[] | "*", host: string): boolean {
 	if (hosts === "*") return true;
 	return hosts.some((entry) => entry.startsWith("*.") ? host.endsWith(entry.slice(1)) : host === entry);
 }
+
+/** Whether `PUSH_HOSTS` allows an endpoint host (lowercase, no trailing dot). */
+export function pushHostAllowed(hosts: RuntimeConfig["pushHosts"], host: string): boolean {
+	return hostListAllowed(hosts, host);
+}
+
+/**
+ * Media hosts a client-built `og` may point at when `OG_MEDIA_HOSTS` is
+ * unset: big platforms' own image CDNs, where whoever posts a link cannot
+ * read the access logs (so viewers' fetches tell them nothing) and which do
+ * not redirect elsewhere. Not their main sites, and no shared hosting where
+ * anyone can run a server.
+ */
+export const DEFAULT_OG_MEDIA_HOSTS: readonly string[] = [
+	// YouTube thumbnails
+	"i.ytimg.com",
+	"img.youtube.com",
+	// Vimeo
+	"i.vimeocdn.com",
+	// GitHub
+	"opengraph.githubassets.com",
+	"repository-images.githubusercontent.com",
+	"avatars.githubusercontent.com",
+	// X/Twitter
+	"pbs.twimg.com",
+	// Bluesky
+	"cdn.bsky.app",
+	// Reddit
+	"i.redd.it",
+	"preview.redd.it",
+	"external-preview.redd.it",
+	// Wikipedia and Wikimedia Commons
+	"upload.wikimedia.org",
+	// Imgur
+	"i.imgur.com",
+	// Twitch
+	"static-cdn.jtvnw.net",
+	// Substack
+	"substackcdn.com",
+];
 
 export interface ServerMetadata {
 	title?: string;
@@ -164,6 +214,7 @@ type EnvLike = {
 	VAPID_SUBJECT?: string;
 	PUSH_HOSTS?: string;
 	PUSH_DELAY_SECONDS?: string;
+	OG_MEDIA_HOSTS?: string;
 	ENVIRONMENT?: string;
 	NODE_ENV?: string;
 };
@@ -404,6 +455,7 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 	const push = loadPush(env);
 	const pushHosts = loadPushHosts(env.PUSH_HOSTS);
 	const pushDelaySeconds = loadPushDelay(env.PUSH_DELAY_SECONDS);
+	const ogMediaHosts = loadOgMediaHosts(env.OG_MEDIA_HOSTS);
 	const rpName = String(env.RP_NAME ?? "Apron Demo");
 	if (!rpName.trim() || [...rpName].length > limits.maxNameCodePoints || new TextEncoder().encode(rpName).byteLength > limits.maxNameBytes) {
 		throw new ConfigError("RP_NAME exceeds the configured display-name policy");
@@ -428,6 +480,7 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 		...(push ? { push } : {}),
 		pushHosts,
 		pushDelaySeconds,
+		ogMediaHosts,
 	};
 }
 
@@ -585,16 +638,47 @@ function loadPush(env: EnvLike): VapidKeys | undefined {
 	return { publicKey, privateKey, subject };
 }
 
-/** `PUSH_HOSTS`: comma-separated hosts or `*.` suffixes, or a standalone `*`; unset or empty, the browsers' services. */
-function loadPushHosts(raw: string | undefined): RuntimeConfig["pushHosts"] {
-	const hosts = splitList(raw === undefined || raw.trim() === "" ? undefined : raw.toLowerCase(), [...DEFAULT_PUSH_HOSTS]);
+/**
+ * Whether `entry` (lowercase) is a host list entry: a host name of at least
+ * two labels, optionally after `*.`, that the URL parser reads back
+ * unchanged, so it compares equal to a parsed URL's `hostname`. Anything
+ * else the parser would rewrite or reject (a scheme, path, port,
+ * credentials, an IPv4 spelling it normalizes, or a non-ASCII name) fails,
+ * as do IPv6 literals, a trailing dot, and any other `*`.
+ */
+function hostListEntry(entry: string): boolean {
+	const host = entry.startsWith("*.") ? entry.slice(2) : entry;
+	// The parser keeps `*` in a host name, so only the leading `*.` may have one.
+	if (!host.includes(".") || host.endsWith(".") || host.startsWith("[") || host.includes("*")) return false;
+	try {
+		return new URL(`https://${host}/`).hostname === host;
+	} catch {
+		return false;
+	}
+}
+
+/** A host list's entries, lowercased: host names or `*.` suffixes, or a standalone `*`. */
+function parseHostList(hosts: string[], name: string): readonly string[] | "*" {
 	if (hosts.length === 1 && hosts[0] === "*") return "*";
 	for (const host of hosts) {
-		if (!/^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(host)) {
-			throw new ConfigError("PUSH_HOSTS must list host names, *.host suffixes, or a standalone *");
-		}
+		if (!hostListEntry(host)) throw new ConfigError(`${name} must list host names, *.host suffixes, or a standalone *`);
 	}
 	return hosts;
+}
+
+/** `PUSH_HOSTS`: comma-separated hosts or `*.` suffixes, or a standalone `*`; unset or empty, the browsers' services. */
+function loadPushHosts(raw: string | undefined): RuntimeConfig["pushHosts"] {
+	return parseHostList(splitList(raw === undefined || raw.trim() === "" ? undefined : raw.toLowerCase(), [...DEFAULT_PUSH_HOSTS]), "PUSH_HOSTS");
+}
+
+/**
+ * `OG_MEDIA_HOSTS`: comma-separated hosts or `*.` suffixes, or a standalone
+ * `*`; unset, DEFAULT_OG_MEDIA_HOSTS; empty, none (no remote `og` media).
+ */
+function loadOgMediaHosts(raw: string | undefined): RuntimeConfig["ogMediaHosts"] {
+	if (raw === undefined) return DEFAULT_OG_MEDIA_HOSTS;
+	if (raw.trim() === "") return [];
+	return parseHostList(splitList(raw.toLowerCase(), []), "OG_MEDIA_HOSTS");
 }
 
 /** `PUSH_DELAY_SECONDS`: whole seconds from 0 to MAX_STATUS_DELAY_SECONDS; unset or empty, the plan's `push.delaySeconds`. */
