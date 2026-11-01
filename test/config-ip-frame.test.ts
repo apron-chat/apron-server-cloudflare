@@ -327,6 +327,11 @@ describe('configuration policy boundaries', () => {
 		expect(DEFAULT_LIMITS.openConnections * DEFAULT_LIMITS.pendingBytesPerConnection).toBeLessThanOrEqual(32 * 1024 * 1024);
 	});
 
+	it('lets an address sign in every connection it may hold', () => {
+		expect(DEFAULT_LIMITS.authAttemptsPerIpMinute).toBeGreaterThanOrEqual(DEFAULT_LIMITS.connectionsPerIp);
+		expect(() => config({}, { authAttemptsPerIpMinute: DEFAULT_LIMITS.connectionsPerIp - 1 })).toThrow(ConfigError);
+	});
+
 	it('turns the attack pause off only with ATTACK_PAUSE=false', () => {
 		expect(config().attackPause).toBe(true);
 		expect(config({ ATTACK_PAUSE: 'false' }).attackPause).toBe(false);

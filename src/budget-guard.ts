@@ -107,17 +107,22 @@ async function setEdgeStop(env: StopRuleEnvironment, stop: boolean, exceeded: st
 		const enabled = ruleEnabled(rule);
 		const held = ignoreHold ? 0 : ruleHoldUntil(rule.description);
 		const extend = stop && holdUntil > held;
-		if (enabled === stop && !extend) return "unchanged";
+		// A stop confirmed (by the bill cap) after its attack hold passed drops
+		// the mark, so a later analytics failure cannot lift it as a passed hold.
+		const stale = stop && enabled && holdUntil === 0 && ruleHoldUntil(rule.description) > 0 && ruleHoldUntil(rule.description) <= now;
+		if (enabled === stop && !extend && !stale) return "unchanged";
 		const holdMs = (PLAN.edgeStop?.holdSeconds ?? 0) * 1_000;
 		const updatedAt = Date.parse(rule.last_updated ?? "");
 		if (!stop && (now - updatedAt < holdMs || now < held)) return "held";
-		const description = stop ? withHold(rule.description, Math.max(held, holdUntil)) : withHold(rule.description, 0);
+		const description = stop && !stale ? withHold(rule.description, Math.max(held, holdUntil)) : withHold(rule.description, 0);
 		const update = await fetcher(`${api}/${encodeURIComponent(rulesetId)}/rules/${encodeURIComponent(rule.id)}`, {
 			method: "PATCH",
 			headers,
 			body: JSON.stringify({ ref: rule.ref, action: rule.action, expression: rule.expression, description, enabled: stop }),
 		});
 		if (!update.ok) throw new Error(`rule update HTTP ${update.status}`);
+		// Only the mark changed: the stop was already on, so nothing to announce.
+		if (enabled === stop) return "unchanged";
 	} catch (error) {
 		log("budget_guard_rule_failed", { message: message(error), stop, exceeded }, "error");
 		return "rule_failed";

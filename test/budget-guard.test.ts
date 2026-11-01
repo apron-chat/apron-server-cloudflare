@@ -106,7 +106,8 @@ describe("budget guard", () => {
 		expect(ruleHoldUntil(held.description)).toBe(until);
 		// A longer hold extends it on a rule already on; a shorter one changes nothing.
 		const extend = api({ rules: [held] });
-		expect(await setAttackStop(env, until + 60_000, "burn", now, extend.fetcher)).toBe("changed");
+		// The stop was already on, so nothing changed to announce; only its mark moved.
+		expect(await setAttackStop(env, until + 60_000, "burn", now, extend.fetcher)).toBe("unchanged");
 		expect(extend.updates).toEqual([expect.objectContaining({ enabled: true, description: `${rule.description} [attack hold until 2026-11-02T12:31:00.000Z]` })]);
 		expect(await setAttackStop(env, until - 60_000, "burn", now, api({ rules: [held] }).fetcher)).toBe("unchanged");
 		// The guard keeps it on through the hold, though the bill is under its cap.
@@ -119,10 +120,14 @@ describe("budget guard", () => {
 		expect(await readEdgeStop(env, api({ rules: [held] }).fetcher)).toMatchObject({ state: "on", holdUntil: until });
 		expect(await setAttackStop({ ...env, ZONE_ID: undefined }, until, "flood", now, on.fetcher)).toBe("unconfigured");
 		// A rule with no description, trimmed by the API, still carries its hold.
-		const bare = api({ rules: [{ ...rule, description: undefined }] });
+		const bare = api({ rules: [{ ...rule, enabled: false, description: undefined }] });
 		expect(await setAttackStop(env, until, "flood", now, bare.fetcher)).toBe("changed");
 		expect(bare.updates).toEqual([expect.objectContaining({ description: "[attack hold until 2026-11-02T12:30:00.000Z]" })]);
 		expect(ruleHoldUntil("[attack hold until 2026-11-02T12:30:00.000Z] ")).toBe(until);
+		// The bill cap confirming the stop after its hold passed drops the mark, quietly.
+		const confirmed = api({ workerRequests: overDaily, rules: [held] });
+		expect(await runBudgetGuard(env, until + 60_000, confirmed.fetcher)).toMatchObject({ outcome: "unchanged", stop: true });
+		expect(confirmed.updates).toEqual([expect.objectContaining({ enabled: true, description: rule.description })]);
 		// With analytics failing, a passed hold is still lifted; one not yet passed is kept.
 		const unreadable = api({ rules: [held], analyticsStatus: 500 });
 		expect(await runBudgetGuard(env, until - 1, unreadable.fetcher)).toEqual({ outcome: "usage_failed" });

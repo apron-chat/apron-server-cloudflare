@@ -792,8 +792,8 @@ a known one, so a front-page day's connections write about 2 million.
 Early in a month these cost nothing; a day at every ceiling once the
 month's inclusions are spent would cost about $11, and the daily bill cap
 stops it at $5. Per address, for an office or campus behind one: 24 guest
-connections (32 in all), 30 admissions and 60 upgrade attempts a minute,
-and 480 frames a minute. The server-wide frame minute exempts `auth`, so a
+connections (32 in all), 30 admissions, 60 upgrade attempts and 64 sign-in
+attempts a minute, 480 frames a minute, and 30,000 history pages a day. The server-wide frame minute exempts `auth`, so a
 reconnect wave signs in before its deadline. Daily refusals ask clients to
 wait until UTC midnight. Pings stay at 45
 seconds (150 to go stale): the runtime answers them without waking the
@@ -971,7 +971,7 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `historyBurstPerUser` | 60 | 30 |
 | `historyBurstPerIp` | 120 | 60 |
 | `historyRequestsPerUserDay` | 3000 | 1000 |
-| `historyRequestsPerIpDay` | 6000 | 2000 |
+| `historyRequestsPerIpDay` | 30000 | 2000 |
 | `historyRequestsPerDay` | 400000 | 5000 |
 | `concurrentHistoryPerConnection` | 1 |  |
 | `anonymousPostsPerMinute` | 5 |  |
@@ -987,7 +987,7 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `registrationsPerIpDay` | 20 | 3 |
 | `registrationsPerDay` | 5000 | 100 |
 | `registeredIdentityCount` | 50000 | 10000 |
-| `authAttemptsPerIpMinute` | 10 |  |
+| `authAttemptsPerIpMinute` | 64 | 10 |
 | `openConnections` | 500 | 100 |
 | `anonymousConnectionsPerIp` | 24 | 2 |
 | `registeredConnectionsPerUser` | 3 |  |

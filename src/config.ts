@@ -315,6 +315,10 @@ function validateLimits(limits: Limits): void {
 	if (limits.pendingBytesPerConnection < 2 * limits.maxFrameBytes) {
 		fail("pending socket budget cannot hold its configured frames");
 	}
+	// Every connection's `auth` is an attempt: an address must be able to sign in all it may hold.
+	if (limits.authAttemptsPerIpMinute < limits.connectionsPerIp) {
+		fail("authAttemptsPerIpMinute must allow every connection an address may hold to sign in");
+	}
 	if (limits.openConnections > budget.MAX_OPEN_CONNECTIONS || limits.openConnections * limits.pendingBytesPerConnection > budget.MAX_SOCKET_QUEUE_ALLOCATION) {
 		fail("socket queues exceed the demo memory allocation");
 	}

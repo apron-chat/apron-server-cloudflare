@@ -45,7 +45,7 @@ export const PAID_PLAN: Plan = Object.freeze({
 		...FREE_PLAN.limits,
 		retentionSeconds: 7 * 24 * 60 * 60,
 		// Registered users' statuses at most 15 s late: at most 5,760 presence
-		// wakes a day, about 52,000 maintenance writes of Paid's 100,000.
+		// wakes a day, about 52,000 maintenance writes of Paid's 1.5 million.
 		presenceAlarmSeconds: 15,
 		cleanupSeconds: 24 * 60 * 60,
 		// A first visit opens every joined room's newest page at once: room
@@ -59,7 +59,8 @@ export const PAID_PLAN: Plan = Object.freeze({
 		historyBurstPerUser: 60,
 		historyBurstPerIp: 120,
 		historyRequestsPerUserDay: 3_000,
-		historyRequestsPerIpDay: 6_000,
+		// A campus behind one address reads a lot of pages in a day.
+		historyRequestsPerIpDay: 30_000,
 		// A front-page day: about 40,000 visitors, each opening a few pages.
 		historyRequestsPerDay: 400_000,
 		anonymousPostsPerDay: 200,
@@ -99,6 +100,10 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// below bound what they can spend.
 		anonymousConnectionsPerIp: 24,
 		connectionsPerIp: 32,
+		// Every connection's `auth` is an attempt, guest and token sign-ins
+		// too: twice every connection an address may hold, so a reconnect wave
+		// signs them all in before the 30-second auth deadline.
+		authAttemptsPerIpMinute: 64,
 		// A sign-in costs three admissions (guest, sign-in connection, the
 		// signed-in reconnect): ten people signing in at once from one address.
 		connectionAdmissionsPerIpMinute: 30,

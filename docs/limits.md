@@ -118,7 +118,7 @@ minutes after a few unclean reconnects.
 | Error | Limit | Usual cause |
 | --- | --- | --- |
 | `retry_after` "Connection limit reached for this account" (`retry_after` 60) | 3 signed-in connections per account, across all devices and addresses | More tabs, devices or test instances on one account than 3, or old sockets not yet closed or stale (see above). Bots count too: 3 per bot. |
-| `retry_after` "Authentication attempts limited" | 10 auth attempts a minute per address, failed ones included | Retrying a failing `auth` in a loop. |
+| `retry_after` "Authentication attempts limited" | 64 auth attempts a minute per address, failed ones included (each connection's `auth` is one, guests too) | Retrying a failing `auth` in a loop. |
 | `retry_after` "Registration limit reached for this network" / "Registration limit reached" | 20 registrations a day per address; 5,000 a day on the server. Adding a passkey and a first `/invite-bot` each count as one. | Creating test accounts from one network. |
 | `unsupported` "Passkeys are not offered to this origin"; `denied` "Frontend origin is not configured for passkeys" (a passkey session `token`) | Passkeys and passkey session resume work only from the configured origin (`https://web.apron.chat` on the demo) | A third-party client on another origin, or a native client. Use a guest, a bot token (`/invite-bot`) or a device token (`/invite-device`), which work from any origin or none. |
 | `denied` "Session expired; sign in with your passkey" | A passkey session lasts 30 days, renewed on a resume once half has passed; it resumes only from the origin it was made on | A stale stored token, or a token from another origin. |
@@ -157,7 +157,7 @@ mutation with the **same** `id`.
 | History request already in progress (`retry_after` 1) | 1 `history` request at a time per connection | Wait for the previous page. |
 | Sign in to load older history (`denied`) | Guests get the newest page, `after`, and windows bounded by both, but not `before` alone | Scrolling back is for accounts. |
 | History request limit reached | 20 a minute per account (burst 60); 60 a minute per address (burst 120); a guest counts only against its address | `ext.limits` `read`. |
-| Daily history limit reached / …for this network / …for the server | 3,000 a day per account; 6,000 per address; 400,000 on the server | `ext.limits` `read`. |
+| Daily history limit reached / …for this network / …for the server | 3,000 a day per account; 30,000 per address; 400,000 on the server | `ext.limits` `read`. |
 | Room listing limited | 6 `room_list` a minute per account | The first `filter: "joined"` listing after each sign-in is free. Keep the list current from `room_update` rather than polling. |
 
 A history page holds at most 50 records (20 by default) and 256 KiB. Records

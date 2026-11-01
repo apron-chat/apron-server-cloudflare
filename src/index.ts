@@ -1818,6 +1818,11 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 	if (config.admissionOff) return responseError(503, "Demo admission is closed");
 	const key = await hashIpKey(clientIp);
 	const prefixKey = await hashIpv6PrefixKey(clientIp);
+	// The object said it was full or paused moments ago: refuse here, before
+	// the attempt limiters, so a crowd's retries cost no object request and
+	// spend no address's or location's attempts.
+	if (Date.now() < objectFullUntil) return serverFull();
+	if (Date.now() < objectPausedUntil) return serverPaused(objectPausedUntil);
 	// This counts attempts, including connections subsequently rejected by the DO.
 	// Fail closed if a binding is absent or unavailable; never bypass admission.
 	// The address is counted first, so an address over its own limit spends
@@ -1834,10 +1839,6 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 		return responseError(503, "Demo admission unavailable", UNAVAILABLE_RETRY_MS);
 	}
 	if (!env.DEMO) return responseError(503, "Demo capacity unavailable");
-	// The object said it was full moments ago: refuse here, which costs no
-	// object request, rather than let a crowd's retries reach it.
-	if (Date.now() < objectFullUntil) return serverFull();
-	if (Date.now() < objectPausedUntil) return serverPaused(objectPausedUntil);
 	const headers = stripForwardingHeaders(request.headers);
 	headers.set(INTERNAL_IP_HEADER, key);
 	headers.delete("content-length");
@@ -2158,7 +2159,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const full = sockets.length >= this.config.limits.openConnections;
 			// An address whose guest was just evicted does not evict another
 			// (that tab coming back would turn every idle guest over in turn).
-			const idle = full && !this.recentlyEvicted(ipKey, now) ? this.idlestGuest(sockets, now) : undefined;
+			const evictedHere = full && this.recentlyEvicted(ipKey, now);
+			const idle = full && !evictedHere ? this.idlestGuest(sockets, now) : undefined;
+			// That address alone is refused: without the full marker, so the entry
+			// isolate does not refuse everyone else, whom an idle guest may yet admit.
+			if (evictedHere) return responseError(429, "Demo capacity reached", fullRetryMs());
 			if (full && !idle) return serverFull();
 			if (peers.length >= this.config.limits.connectionsPerIp ||
 				peers.filter(peer => peer?.tier !== "registered").length >= this.config.limits.anonymousConnectionsPerIp) {
