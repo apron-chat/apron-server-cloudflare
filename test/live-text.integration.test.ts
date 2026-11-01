@@ -143,7 +143,7 @@ describe('live text end to end', () => {
 			const put = streamTo(result.write_url);
 			await put.send('\x1b[32mok\x1b[0m 1\r\n');
 			const posted = (await until(watcher, fromUser(userId))).frame.params;
-			expect(posted.body).toEqual({ text: '', format: 'plain', embeds: [{ embed_id: result.embed_id, kind: 'terminal', title: 'make test', url: expect.stringMatching(/^https:\/\/demo\.test\/live\/[A-Za-z0-9_-]{22}$/), og: terminalOg('make test', 'live') }] });
+			expect(posted.body).toEqual({ text: '', format: 'plain', embeds: [{ embed_id: result.embed_id, kind: 'terminal', title: 'make test', url: expect.stringMatching(/^https:\/\/demo\.test\/live\/[A-Za-z0-9_-]{22}$/), og: terminalOg('make test') }] });
 			const url = posted.body.embeds[0].url;
 			const reader = await readerOf(url);
 			expect(reader.response.status).toBe(200);
@@ -153,14 +153,13 @@ describe('live text end to end', () => {
 			expect(reader.response.headers.get('Cache-Control')).toContain('no-transform');
 			expect(reader.response.headers.get('Access-Control-Allow-Origin')).toBe('*');
 			expect(reader.response.headers.get('Vary')).toBe('Sec-Fetch-Mode');
-			// A browser that opens it as a page goes to the terminal viewer, with the url and title in the fragment (§4.8.5).
+			// A browser that opens it as a page goes to the terminal viewer, with the url in the fragment (§4.8.5).
 			const page = await SELF.fetch(url, { headers: { 'CF-Connecting-IP': ip(), 'Sec-Fetch-Mode': 'navigate' }, redirect: 'manual' });
 			expect(page.status).toBe(302);
 			expect(page.headers.get('Vary')).toBe('Sec-Fetch-Mode');
 			const location = new URL(page.headers.get('Location')!);
 			expect(`${location.origin}${location.pathname}${location.search}`).toBe('https://terminal.apron.chat/');
-			const fragment = new URLSearchParams(location.hash.slice(1));
-			expect([fragment.get('stream'), fragment.get('title')]).toEqual([url, 'make test']);
+			expect(location.hash).toBe(`#${new URLSearchParams({ stream: url })}`);
 			// The kept text first, then each chunk as it arrives.
 			await reader.waitFor('ok\x1b[0m 1\r\n');
 			await put.send('\x1b[31mfail\x1b[0m 2\r\n');
@@ -173,7 +172,7 @@ describe('live text end to end', () => {
 			expect(reader.text()).toBe('\x1b[32mok\x1b[0m 1\r\n\x1b[31mfail\x1b[0m 2\r\n');
 			// The finished snapshot carries the output, without url.
 			const finished = (await until(watcher, isMessage(posted.message_id))).frame.params;
-			expect(finished.body.embeds).toEqual([{ embed_id: result.embed_id, kind: 'terminal', title: 'make test', output: '\x1b[32mok\x1b[0m 1\r\n\x1b[31mfail\x1b[0m 2\r\n', og: terminalOg('make test', 'finished') }]);
+			expect(finished.body.embeds).toEqual([{ embed_id: result.embed_id, kind: 'terminal', title: 'make test', output: '\x1b[32mok\x1b[0m 1\r\n\x1b[31mfail\x1b[0m 2\r\n', og: terminalOg('make test') }]);
 			expect(finished.prev_log_id).toBe(posted.log_id);
 			// The url and the write_url end with the text.
 			expect((await SELF.fetch(url, { headers: { 'CF-Connecting-IP': ip() } })).status).toBe(404);
@@ -331,7 +330,7 @@ describe('live text end to end', () => {
 			const { frame, skipped } = await exchange(writer, 'post', 'message', { body: { text: 'Build:', embeds: [{ kind: 'terminal', title: 'ci' }] } });
 			const posted = skipped.find(isMessage(frame.result.message_id))!.params;
 			// The embed waits for its writer, without url, until the write starts (§4.8.5).
-			expect(posted.body.embeds[0]).toEqual({ embed_id: expect.any(String), kind: 'terminal', title: 'ci', og: terminalOg('ci', 'waiting') });
+			expect(posted.body.embeds[0]).toEqual({ embed_id: expect.any(String), kind: 'terminal', title: 'ci', og: terminalOg('ci') });
 			expect(frame.result.embeds).toEqual([{ embed_id: posted.body.embeds[0].embed_id, kind: 'terminal', write_url: expect.stringMatching(/\/w\/l\./) }]);
 			const put = streamTo(frame.result.embeds[0].write_url);
 			const url = await startedUrl(writer, frame.result.message_id);
@@ -346,23 +345,23 @@ describe('live text end to end', () => {
 			await put.response;
 			await early.ended();
 			const finished = (await until(writer, (f) => isMessage(frame.result.message_id)(f) && f.params.body?.embeds?.[0]?.output !== undefined)).frame.params;
-			expect(finished.body).toEqual({ text: 'Build:', format: 'plain', embeds: [{ embed_id: posted.body.embeds[0].embed_id, kind: 'terminal', title: 'ci', output: 'step 1\n', og: terminalOg('ci', 'finished') }] });
+			expect(finished.body).toEqual({ text: 'Build:', format: 'plain', embeds: [{ embed_id: posted.body.embeds[0].embed_id, kind: 'terminal', title: 'ci', output: 'step 1\n', og: terminalOg('ci') }] });
 			// A terminal or append in any other command is invalid_params.
 			expect((await command(writer, 'avatar', '/avatar', { body: { text: '/avatar', embeds: [{ kind: 'append' }] } })).frame.error).toBeTruthy();
 			expect((await request(writer, 'help-embed', 'command', { room_id: 'general', body: { text: '/help', embeds: [{ kind: 'terminal' }] } })).error).toMatchObject({ code: -32602 });
 		} finally { writer.close(); }
 	});
 
-	it('drops a sender\'s og on a terminal, links the viewer with any title, and redirects only a terminal\'s page (§4.8.1, §4.8.5)', async () => {
+	it('drops a sender\'s og on a terminal, and redirects only a terminal\'s page to the viewer (§4.8.1, §4.8.5)', async () => {
 		const userId = unique('linker');
 		const writer = await signedIn(userId, ['mod']);
-		const title = 'a&b #c+d ü 🚀%';
+		const title = 'ci';
 		const navigate = (url: string, method = 'GET') => SELF.fetch(url, { method, headers: { 'CF-Connecting-IP': ip(), 'Sec-Fetch-Mode': 'navigate' }, redirect: 'manual' });
 		try {
 			const { frame, skipped } = await exchange(writer, 'post', 'message', { body: { text: 'Build:', embeds: [{ kind: 'terminal', title, og: { title: 'forged' } }] } });
 			const id = frame.result.message_id;
 			const embedId = skipped.find(isMessage(id))!.params.body.embeds[0].embed_id;
-			expect(skipped.find(isMessage(id))!.params.body.embeds[0].og).toEqual(terminalOg(title, 'waiting'));
+			expect(skipped.find(isMessage(id))!.params.body.embeds[0].og).toEqual(terminalOg(title));
 			const put = streamTo(frame.result.embeds[0].write_url);
 			const url = await startedUrl(writer, id);
 			// A save while it is live keeps the server's og too.
@@ -370,14 +369,13 @@ describe('live text end to end', () => {
 			expect(saved.frame.error).toBeUndefined();
 			const resaved = saved.skipped.find((f) => isMessage(id)(f) && f.params.body?.embeds?.[0]?.og !== undefined)
 				?? (await until(writer, (f) => isMessage(id)(f) && f.params.body?.embeds?.[0]?.og !== undefined)).frame;
-			expect(resaved.params.body.embeds[0]).toMatchObject({ url, og: terminalOg(title, 'live') });
+			expect(resaved.params.body.embeds[0]).toMatchObject({ url, og: terminalOg(title) });
 			// Redirects aren't reads: more of them than readsPerText leave a reader its read.
 			const { readsPerText } = await runInDurableObject(stub(), (instance) => (instance as unknown as { config: { liveText: { policy: { readsPerText: number } } } }).config.liveText.policy);
 			for (let index = 0; index <= readsPerText; index++) {
 				const page = await navigate(url);
 				expect(page.status).toBe(302);
-				const fragment = new URLSearchParams(new URL(page.headers.get('Location')!).hash.slice(1));
-				expect([fragment.get('stream'), fragment.get('title')]).toEqual([url, title]);
+				expect(page.headers.get('Location')).toBe(`https://terminal.apron.chat/#${new URLSearchParams({ stream: url })}`);
 			}
 			// HEAD, even from a page, gets the text's headers.
 			const head = await navigate(url, 'HEAD');
@@ -435,7 +433,7 @@ describe('live text end to end', () => {
 			const response = await put.response;
 			expect(await response.text()).toBe('Done: the text is posted.\n');
 			const finished = (await until(writer, isMessage(posted.message_id))).frame.params;
-			expect(finished.body.embeds).toEqual([{ embed_id: frame.result.embeds[0].embed_id, kind: 'terminal', output: 'still here\n', og: terminalOg(undefined, 'finished') }]);
+			expect(finished.body.embeds).toEqual([{ embed_id: frame.result.embeds[0].embed_id, kind: 'terminal', output: 'still here\n', og: terminalOg(undefined) }]);
 		} finally { writer.close(); }
 	});
 

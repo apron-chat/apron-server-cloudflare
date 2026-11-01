@@ -404,9 +404,8 @@ the [cost report](cost-report.md#live-text). In production, the edge rule
 terminal's `url` as a page: `https://terminal.apron.chat/` unless set, and
 none when set empty (`TERMINAL_VIEWER_URL=""`), when browsers get the plain
 text too. An `https` viewer is none for an `http` `PUBLIC_ORIGIN`, such as
-`wrangler dev`'s, since the viewer reads only `https`. The `url` and the
-embed's title (at most 200 characters) go in the fragment, which never
-reaches the viewer's host. It must be an http(s) URL without a fragment or
+`wrangler dev`'s, since the viewer reads only `https`. The `url` goes in
+the fragment, which never reaches the viewer's host. It must be an http(s) URL without a fragment or
 user info, or the configuration check fails.
 
 ## Server title, description and avatar

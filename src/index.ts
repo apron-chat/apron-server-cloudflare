@@ -85,7 +85,6 @@ import {
 	type UploadFinish,
 	type UploadWrite,
 	STORAGE_UNAVAILABLE,
-	boundTitle,
 } from "./store";
 import { isProtocolId } from "./domain";
 
@@ -5937,7 +5936,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * for it. Each text has at most `readersPerText` readers at once and
 	 * `readsPerText` reads over its life; an ended or unknown one is 404. A
 	 * browser that opens a terminal's `url` as a page (`navigate`) goes to the
-	 * terminal viewer instead, if there is one, with the `url` and title in
+	 * terminal viewer instead, if there is one, with the `url` in
 	 * the fragment, which never reaches the viewer's host (§4.8.5); that is
 	 * no read.
 	 */
@@ -5952,9 +5951,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		const viewer = session.entry.kind === "terminal" ? viewerUrl : undefined;
 		if (viewer && navigate) {
-			const { messageId, embedId } = session.entry;
-			const title = messageId === undefined ? undefined : this.store.liveEmbedTitle(messageId, embedId);
-			const fragment = new URLSearchParams({ stream: `${publicOrigin}/live/${id}`, ...(title ? { title: boundTitle(title) } : {}) });
+			const fragment = new URLSearchParams({ stream: `${publicOrigin}/live/${id}` });
 			return new Response(null, { status: 302, headers: { Location: `${viewer}#${fragment}`, "Cache-Control": "no-store", Vary: "Sec-Fetch-Mode" } });
 		}
 		const headers = liveTextHeaders();

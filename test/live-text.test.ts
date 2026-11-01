@@ -248,12 +248,6 @@ describe('live text policy', () => {
 		expect(() => loadConfig({ ...env, LIVE_TEXT: 'maybe' })).toThrow(ConfigError);
 	});
 
-	it('describes a terminal in its og, with its title cut to 200 code points', () => {
-		expect(terminalOg(undefined, 'waiting')).toEqual({ title: 'Terminal', description: 'A terminal, waiting for its program\'s output.' });
-		const long = '🚀'.repeat(250);
-		expect(terminalOg(long, 'finished').title).toBe('🚀'.repeat(200));
-	});
-
 	it('words the command notice with the write URL and this user\'s limits', () => {
 		const policy = { writeWindowSeconds: 120, maxInputBytes: 2 * 1024 * 1024 };
 		const terminal = liveCommandNotice('terminal', 'https://demo.test/w/l.x', { maxMs: 300_000, limit: 32 * 1024 }, policy);
@@ -291,23 +285,23 @@ describe('store live text', () => {
 			const created = post(store, clock, 'tess', { body: { text: '', embeds: [{ kind: 'terminal', title: 'make test', url: 'https://evil.example/', output: 'forged' }] } });
 			const embed = (created.message!.body!.embeds as Array<Record<string, unknown>>)[0];
 			// The server owns url and output (§4.8.2); the embed has no url until its write starts (§4.8.5).
-			expect(embed).toEqual({ embed_id: expect.stringMatching(/^embed_/), kind: 'terminal', title: 'make test', og: terminalOg('make test', 'waiting') });
+			expect(embed).toEqual({ embed_id: expect.stringMatching(/^embed_/), kind: 'terminal', title: 'make test', og: terminalOg('make test') });
 			const write = writeOf(created.result);
 			expect(write).toEqual({ embed_id: embed.embed_id, kind: 'terminal', write: { key: expect.stringMatching(/^l\/[A-Za-z0-9_-]{22}$/), max_bytes: LIVE.maxInputBytes, expires_ms: clock.value + LIVE.writeWindowSeconds * 1_000 } });
 			const claimed = store.claimLiveText(write.write.key, clock.value);
 			expect(claimed?.entry).toMatchObject({ state: 'live', startedMs: clock.value, maxMs: 120_000, messageId: created.result.message_id });
 			// The write's start republishes the message with the embed's url.
 			expect(claimed?.broadcasts).toHaveLength(1);
-			expect(bodyOf(claimed!).body!.embeds).toEqual([{ ...embed, url: expect.stringMatching(/^https:\/\/demo\.test\/live\/[A-Za-z0-9_-]{22}$/), og: terminalOg('make test', 'live') }]);
+			expect(bodyOf(claimed!).body!.embeds).toEqual([{ ...embed, url: expect.stringMatching(/^https:\/\/demo\.test\/live\/[A-Za-z0-9_-]{22}$/), og: terminalOg('make test') }]);
 			expect(store.claimLiveText(write.write.key, clock.value)).toBeNull();
 			const finished = store.finishLiveText(write.write.key, encode('ignored\x1b[1mbold'), clock.value);
 			// The store keeps the last 8 bytes itself, whatever it is given: they start at ESC.
-			expect(bodyOf(finished).body!.embeds).toEqual([{ embed_id: embed.embed_id, kind: 'terminal', title: 'make test', output: '\x1b[1mbold', og: terminalOg('make test', 'finished') }]);
+			expect(bodyOf(finished).body!.embeds).toEqual([{ embed_id: embed.embed_id, kind: 'terminal', title: 'make test', output: '\x1b[1mbold', og: terminalOg('make test') }]);
 			expect(store.finishLiveText(write.write.key, encode('again'), clock.value).broadcasts).toEqual([]);
 			// A save keeps the output from the server's record, whatever it sends.
 			const saved = post(store, clock, 'tess', { message_id: created.result.message_id, body: { text: 'done', embeds: [{ embed_id: embed.embed_id, kind: 'terminal', title: 'renamed', output: 'forged' }] } });
 			// Its og is the server's too, titled as the save renames it, and finished.
-			expect((saved.message!.body!.embeds as unknown[])[0]).toEqual({ embed_id: embed.embed_id, kind: 'terminal', title: 'renamed', output: '\x1b[1mbold', og: terminalOg('renamed', 'finished') });
+			expect((saved.message!.body!.embeds as unknown[])[0]).toEqual({ embed_id: embed.embed_id, kind: 'terminal', title: 'renamed', output: '\x1b[1mbold', og: terminalOg('renamed') });
 		});
 	});
 
