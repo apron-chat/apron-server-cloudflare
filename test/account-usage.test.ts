@@ -246,13 +246,17 @@ describe("account usage monitor", () => {
 		expect(fetcher).toHaveBeenCalledTimes(2);
 	});
 
-	it("stops on a reading past an allowance, and closes what is open", async () => {
+	it("stops on a reading past an allowance, and closes what is open once, as it starts", async () => {
 		const { usage, onStop } = monitor({
 			overrides: { workersInvocationsAdaptive: [{ sum: { requests: ACCOUNT_USAGE_POLICY.daily.workerRequests } }] },
 		});
 		expect(usage.stops(start)).toBe(false);
 		await usage.refresh(start, false);
 		expect(usage.stops(start)).toBe(true);
+		expect(onStop).toHaveBeenCalledOnce();
+		// A later reading that still stops (an admin's `/status`) closes nothing more.
+		await usage.refresh(start + ACCOUNT_USAGE_POLICY.minimumRefreshIntervalMs, true);
+		expect(usage.stops(start + ACCOUNT_USAGE_POLICY.minimumRefreshIntervalMs)).toBe(true);
 		expect(onStop).toHaveBeenCalledOnce();
 	});
 

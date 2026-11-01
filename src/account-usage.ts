@@ -241,8 +241,10 @@ interface AccountUsageMonitorOptions {
 	persist(snapshot: AccountUsageSnapshot, now: number): void;
 	/** Keeps a refresh an event started alive after the event's response. */
 	waitUntil(promise: Promise<unknown>): void;
-	/** Called when a fresh snapshot stops the server, to close what is open. */
+	/** Called when a fresh snapshot newly stops the server (it did not stop before), to close what is open. */
 	onStop(): void;
+	/** Called after every fresh snapshot, once it is current, so the runtime can re-evaluate its tier. */
+	onSnapshot?(): void;
 	fetcher?: typeof fetch;
 }
 
@@ -322,10 +324,14 @@ export class AccountUsageMonitor {
 			}
 			this.verified = true;
 			try { this.options.persist(snapshot, now); } catch { /* retain the in-memory safety stop */ }
+			// Only a newly stopping reading closes what is open: an admin's
+			// `/status` refresh while stopped would otherwise close their own socket.
+			const stopping = this.stops(now);
 			this.current = snapshot;
 			this.failures = 0;
 			this.retryAt = 0;
-			if (snapshot.stop) this.options.onStop();
+			if (snapshot.stop && !stopping) this.options.onStop();
+			try { this.options.onSnapshot?.(); } catch { /* the tier is re-evaluated at the next event */ }
 		} catch {
 			this.failures += 1;
 			const delay = Math.min(ACCOUNT_USAGE_POLICY.maxRetryMs, ACCOUNT_USAGE_POLICY.initialRetryMs * 2 ** Math.min(this.failures - 1, 4));

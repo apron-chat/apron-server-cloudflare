@@ -166,9 +166,9 @@ describe('configuration policy boundaries', () => {
 		expect(() => config({}, { historyMaxResponseBytes: DEFAULT_LIMITS.maxSnapshotBytes + 511 })).toThrow(ConfigError);
 		expect(() => config({}, { maintenanceReadsPerDay: 8 })).toThrow(ConfigError);
 		expect(() => config({}, { maintenanceWritesPerDay: 8 })).toThrow(ConfigError);
-		expect(() => config({}, { maintenanceReadsPerDay: 519 })).toThrow(ConfigError);
-		expect(() => config({}, { maintenanceWritesPerDay: 519 })).toThrow(ConfigError);
-		expect(config({}, { maintenanceReadsPerDay: 520, maintenanceWritesPerDay: 520 }).limits.maintenanceReadsPerDay).toBe(520);
+		expect(() => config({}, { maintenanceReadsPerDay: 543 })).toThrow(ConfigError);
+		expect(() => config({}, { maintenanceWritesPerDay: 543 })).toThrow(ConfigError);
+		expect(config({}, { maintenanceReadsPerDay: 544, maintenanceWritesPerDay: 544 }).limits.maintenanceReadsPerDay).toBe(544);
 	});
 
 	it('bounds reaction sets so a moved message fits one history response', () => {
@@ -289,13 +289,6 @@ describe('configuration policy boundaries', () => {
 		expect(() => config({ LIMIT_UNPINGED_TIMEOUT_SECONDS: '149' })).toThrow(ConfigError);
 	});
 
-	it('reads ACCOUNTING_RECOVERY as an optional short value', () => {
-		expect(config().accountingRecovery).toBeUndefined();
-		expect(config({ ACCOUNTING_RECOVERY: '' }).accountingRecovery).toBeUndefined();
-		expect(config({ ACCOUNTING_RECOVERY: '2026-10-29' }).accountingRecovery).toBe('2026-10-29');
-		expect(() => config({ ACCOUNTING_RECOVERY: 'has space' })).toThrow(ConfigError);
-		expect(() => config({ ACCOUNTING_RECOVERY: 'x'.repeat(65) })).toThrow(ConfigError);
-	});
 
 	it('requires exact origins and bounds the browser display name', () => {
 		expect(() => loadConfig({})).toThrow(ConfigError);

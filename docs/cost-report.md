@@ -498,7 +498,7 @@ back.
 primary-key delete per gone registration (2/2), whatever other accounts share
 the endpoint: deleting by endpoint alone would read and write every account's
 row for it, which an attacker can multiply by registering one endpoint from
-many accounts, and would overrun the reservation and latch accounting unsafe.
+many accounts, and would overrun the reservation (charged, and counted toward its breaker).
 Many accounts sharing one endpoint otherwise cost what as many separate
 registrations do: a wake claims at most `wakesPerMessage` users of
 `subscriptionsPerUser` each.

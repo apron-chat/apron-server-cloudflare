@@ -14,12 +14,14 @@ export type MetricEvent =
 	| "alarm"
 	/** Pushes delivered: `sent`, `failed` or `gone`, valued by count. */
 	| "push"
-	/** Storage accounting closed (`overrun` or `uncertain`), paused one user (`quarantined`), or reopened (`recovered`); with what failed where known. */
+	/** Storage accounting overran (`overrun`, observed), closed on a storage failure (`uncertain`), or reopened (`recovered`); with what happened where known. */
 	| "accounting"
 	/** An admin alert posted (notifyAdmins): `pushed` or `not_pushed`, valued by admins mentioned. */
 	| "admins_notified"
-	/** The edge stop turned on: `guard` or `flood`, and what was reached. */
-	| "edge_stop";
+	/** The edge stop turned on (`guard` or `flood`, and what was reached) or off (`lifted`). */
+	| "edge_stop"
+	/** The server changed tier (Store tiers, ApronDemoServer.evaluateTier): the new tier and the one before. */
+	| "tier";
 
 export function recordMetric(dataset: AnalyticsEngineDataset | undefined, event: MetricEvent, details: readonly string[] = [], value = 1): void {
 	if (!dataset) return;

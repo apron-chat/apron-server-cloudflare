@@ -144,18 +144,22 @@ it('/kick removes a registered user or a guest from the room of the command', as
 	} finally { admin.close(); bob.close(); guest.close(); }
 });
 
-it('/status sends the caller the Cloudflare usage and the demo budgets', async () => {
+it('/status leads with the server state, then the Cloudflare usage and the demo budgets', async () => {
 	const admin = await signedInAdmin();
 	try {
 		const status = await command(admin, 'status', '/status');
 		expect(status.frame.result).toEqual({});
 		const text: string = status.notice!.params.body.text;
 		expect(status.notice!.params.body.format).toBe('markdown');
+		// Why the server refuses work comes first: here, nothing.
+		expect(text).toMatch(/^\*\*State: open\*\*\n- Storage overruns today: 0 \(each charged and logged\)/);
 		// Tests configure no account analytics, so only the object's budgets show.
 		expect(text).toContain('no usage sample');
 		// Lists, not GFM tables, so strict CommonMark clients render it.
 		expect(text).not.toContain('|');
-		expect(text).toMatch(new RegExp(`^- SQL rows written: [\\d,]+ / ${DEFAULT_LIMITS.sqlWritesPerDay.toLocaleString('en-US')} \\(\\d+%\\)$`, 'm'));
+		// Each against the ceiling that refuses work, and from the counter that does.
+		expect(text).toMatch(new RegExp(`^- Foreground SQL rows written: [\\d,]+ / ${DEFAULT_LIMITS.foregroundWritesPerDay.toLocaleString('en-US')} \\(\\d+%\\)$`, 'm'));
+		expect(text).toMatch(new RegExp(`^- Frames: [1-9][\\d,]* / ${DEFAULT_LIMITS.processedFramesPerDay.toLocaleString('en-US')} \\(\\d+%\\)$`, 'm'));
 		expect(text).toMatch(/^- Registered users: [\d,]+ \/ 10,000/m);
 		expect(text).toMatch(/^- Database: /m);
 		// Nor the budget guard's zone and token: a plan that relies on the guard says it can't work.

@@ -115,14 +115,15 @@ describe("budget guard", () => {
 		} finally { run.mockRestore(); }
 	});
 
-	it("tells the operators when its run turns the stop on, and only then", async () => {
+	it("tells the operators when its run turns the stop on or off, and only then", async () => {
 		const notify = vi.spyOn(notifier, "notifyTrigger").mockResolvedValue(undefined);
 		const run = vi.spyOn(guard, "runBudgetGuard");
 		try {
-			const cases: Array<[Awaited<ReturnType<typeof runBudgetGuard>>, boolean]> = [
-				[{ outcome: "changed", stop: true, exceeded: ["monthly.workerRequests"] }, true],
-				[{ outcome: "changed", stop: false, exceeded: [] }, false],
-				[{ outcome: "unchanged", stop: true, exceeded: ["monthly.workerRequests"] }, false],
+			const cases: Array<[Awaited<ReturnType<typeof runBudgetGuard>>, unknown]> = [
+				[{ outcome: "changed", stop: true, exceeded: ["monthly.workerRequests"] }, { kind: "edge_stop", exceeded: ["monthly.workerRequests"] }],
+				[{ outcome: "changed", stop: false, exceeded: [] }, { kind: "edge_stop_lifted" }],
+				[{ outcome: "unchanged", stop: true, exceeded: ["monthly.workerRequests"] }, undefined],
+				[{ outcome: "held", stop: false, exceeded: [] }, undefined],
 			];
 			for (const [result, told] of cases) {
 				notify.mockClear();
@@ -130,7 +131,7 @@ describe("budget guard", () => {
 				const ctx = createExecutionContext();
 				worker.scheduled(createScheduledController({ cron: "* * * * *", scheduledTime: 2_000 }), testEnv, ctx);
 				await waitOnExecutionContext(ctx);
-				if (told) expect(notify).toHaveBeenCalledWith({ kind: "edge_stop", exceeded: ["monthly.workerRequests"] }, expect.objectContaining({ admins: expect.any(Function) }));
+				if (told) expect(notify).toHaveBeenCalledWith(told, expect.objectContaining({ admins: expect.any(Function) }));
 				else expect(notify).not.toHaveBeenCalled();
 			}
 		} finally { run.mockRestore(); notify.mockRestore(); }

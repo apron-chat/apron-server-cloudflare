@@ -1,5 +1,5 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import { ACCOUNT_USAGE_POLICY, DEFAULT_LIMITS } from '../src/budget';
 import type { AccountUsageMonitor, AccountUsageSnapshot } from '../src/account-usage';
 import { Store } from '../src/store';
@@ -67,8 +67,8 @@ it('closes a socket on its next frame once the account-usage stop holds', async 
 	expect(await peer.closed).toEqual({ code: 1013, reason: 'Demo account capacity reached; try later' });
 });
 
-it('closes every socket when the daily frame budget runs out', async () => {
-	const stub = env.DEMO.getByName('frame-budget-close-all');
+it('keeps every socket open when the daily frame budget runs out, refusing requests until the reset', async () => {
+	const stub = env.DEMO.getByName('frame-budget-keep-open');
 	const first = await open(stub);
 	const second = await open(stub);
 	await runInDurableObject(stub, (_instance, state) => {
@@ -78,8 +78,18 @@ it('closes every socket when the daily frame budget runs out', async () => {
 		);
 		expect(cursor.rowsWritten).toBe(1);
 	});
+	const replies: Array<{ id?: string; error?: { code: number; message: string; data?: { retry_after?: number } } }> = [];
+	first.socket.addEventListener('message', (event) => {
+		const frame = JSON.parse(String(event.data));
+		if (frame.id === 'over-budget') replies.push(frame);
+	});
 	first.socket.send(JSON.stringify({ id: 'over-budget', method: 'auth', params: { scheme: 'guest' } }));
-	const reason = 'Demo capacity reached; try after daily reset';
-	expect(await first.closed).toEqual({ code: 1013, reason });
-	expect(await second.closed).toEqual({ code: 1013, reason });
+	await vi.waitFor(() => expect(replies).toHaveLength(1));
+	expect(replies[0].error?.message).toBe('Daily frame budget exhausted');
+	expect(replies[0].error?.data?.retry_after).toBeGreaterThan(0);
+	// Neither socket is closed: readers stay connected, and nobody reconnects into the same refusal.
+	const closed = await Promise.race([first.closed, second.closed, new Promise((resolve) => setTimeout(() => resolve('open'), 200))]);
+	expect(closed).toBe('open');
+	first.socket.close();
+	second.socket.close();
 });

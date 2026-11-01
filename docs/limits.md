@@ -90,7 +90,7 @@ still holds a slot until it goes stale; see
 | 1009 | Frame exceeds the maximum size | A frame over 16,384 UTF-8 bytes | Check sizes before sending. |
 | 1011 | Delivery failed / Delivery interrupted; reconnect to recover | The server could not deliver to the socket | Reconnect with backoff, then fetch history to catch up. |
 | 1013 | Frame rate limit reached | More than 120 frames a minute from your address, all connections together. Each connection reserves frames 10 at a time, so many short-lived connections spend this fast | Back off; fewer connections. |
-| 1013 | Demo capacity reached; try after daily reset / Demo account capacity reached; try later | Server-wide budgets | Back off for minutes, not seconds. |
+| 1013 | Demo account capacity reached; try later | The Cloudflare account's usage reached its stop line | Back off for minutes, not seconds. |
 
 ### Liveness and stale connections
 
@@ -163,6 +163,19 @@ are kept for 7 days.
 "Demo is busy with too many requests" (`retry_after`) means the whole server
 passed 600 frames in a minute. The socket stays open. Notifications sent
 meanwhile are dropped without a reply.
+
+### Busy days and pauses
+
+These keep the socket open and answer requests with `retry_after`, with
+`data.reason` saying why; notifications sent meanwhile are dropped.
+
+| `data.reason` | Means | Lasts |
+| --- | --- | --- |
+| `degraded` | The day's budget is 70% spent: live text, uploads and loading older history (`history` with `before`) are off; chat works | Until the next UTC day |
+| `frame_budget` | The day's frames are spent: requests and new connections are refused | Until the next UTC day |
+| `daily_budget` | The day's storage budget is spent | Until the next UTC day |
+| `operation_paused` | That one action used more storage than expected three times in an hour and is paused | An hour |
+| `server_paused` | One action used far more storage than expected: everything is paused | An hour |
 
 ### Typing, status and push
 

@@ -5,10 +5,10 @@ import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllo
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
 import { LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
-import { AccountUsageMonitor } from "./account-usage";
+import { AccountUsageMonitor, exceededAllowances } from "./account-usage";
 import { EDGE_STOP_RULE_REF, readEdgeStop, runBudgetGuard, watchForFlood } from "./budget-guard";
 import { recordMetric } from "./metrics";
-import { notifyTrigger, type NoticeChannels } from "./notify";
+import { notifyTrigger, TIER_LABEL, type NoticeChannels, type ServerTier, type TriggerNotice } from "./notify";
 import { AUDIO_TYPES, sniffAudio } from "./audio";
 import { IMAGE_TYPES, sniffImage } from "./image";
 import { isEmojiKey, MAX_EMOJI_NAME_CHARS } from "./emoji";
@@ -38,8 +38,8 @@ import {
 	type RequestFrame,
 } from "./protocol";
 import {
-	ACCOUNTING_OVERRUN,
 	ADMIN_USER_ID,
+	DEGRADE_SHARE,
 	DEFAULT_JOINED_ROOMS,
 	MAX_PASSKEYS_PER_USER,
 	MAX_PUSH_URL_BYTES,
@@ -792,7 +792,6 @@ export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		storageLowWaterBytes: limits.databaseResumeLowWaterBytes,
 		admissionEnabled: !config.admissionOff,
 		ogMediaHosts: config.ogMediaHosts,
-		...(config.accountingRecovery !== undefined ? { accountingRecovery: config.accountingRecovery } : {}),
 		uploads: config.uploads && UPLOAD_POLICY ? { ...UPLOAD_POLICY, mediaOrigin: config.uploads.mediaOrigin } : null,
 		push: config.push && PUSH_POLICY ? { ...PUSH_POLICY } : null,
 		liveText: config.liveText ? { ...config.liveText.policy, publicOrigin: config.liveText.publicOrigin, enabled: config.liveTextEnabled } : null,
@@ -1012,9 +1011,9 @@ function writeSessionAttachment(socket: WebSocketConnection, attachment: Connect
 
 /**
  * Who the event running now acts for (Store.actor): a frame, close or
- * request runs inside `ACTOR.run`, so an overrun in its storage work
- * quarantines its user and address instead of closing the server
- * (Store.quarantineActor). The server's own work (alarms, presence sweeps)
+ * request runs inside `ACTOR.run`, so an overrun in its storage work is
+ * logged with its user and address (Store.noteOverrun). The server's own
+ * work (alarms, presence sweeps, admin notices)
  * runs outside it and has none. Read when asked, so a frame that signs in
  * is held to the user it signed in as.
  */
@@ -1035,7 +1034,6 @@ function attachmentPrincipals(attachment: Pick<ConnectionAttachment, "ipKey" | "
  * says why the server refuses.
  */
 function internalErrorMessage(reason: unknown): string {
-	if (reason === ACCOUNTING_OVERRUN) return "Server closed: storage accounting stopped after a cost overrun, until an operator reopens it";
 	if (reason === STORAGE_UNAVAILABLE) return "Server storage is unavailable; try again shortly";
 	return "Server temporarily unavailable";
 }
@@ -1693,7 +1691,11 @@ export default {
 		// The stop is set first; only a stop just turned on is told, and the
 		// telling never throws (notifyTrigger).
 		ctx.waitUntil(runBudgetGuard(env, controller.scheduledTime).then((result) => {
-			if (result.outcome !== "changed" || !result.stop) return;
+			if (result.outcome !== "changed") return;
+			if (!result.stop) {
+				recordMetric(env.METRICS, "edge_stop", ["lifted"]);
+				return notifyTrigger({ kind: "edge_stop_lifted" }, adminChannels(env));
+			}
 			recordMetric(env.METRICS, "edge_stop", ["guard", result.exceeded.join(",")]);
 			return notifyTrigger({ kind: "edge_stop", exceeded: result.exceeded }, adminChannels(env));
 		}));
@@ -1719,6 +1721,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly store: Store;
 	private readonly webAuthn: WebAuthnService;
 	private mutationTail: Promise<void> = Promise.resolve();
+	/** The tier and open breakers last announced (Store.announcedTier), read once per instance. */
+	private announcedTier?: { tier: ServerTier; breakers: string[] };
+	/** When the tier was last evaluated (maybeEvaluateTier). */
+	private tierCheckedAt = 0;
 	private alarmTail: Promise<void> = Promise.resolve();
 	private alarmFailures = 0;
 	private alarmKnown = false;
@@ -1844,11 +1850,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.runtimeEnv = env;
 		this.config = loadConfig(env);
 		this.store = new Store(ctx as unknown as ConstructorParameters<typeof Store>[0], asStoreConfig(this.config));
-		// An overrun closes accounting until an operator clears it: tell them.
-		this.store.onOverrun = () => ctx.waitUntil(notifyTrigger({ kind: "accounting_overrun" }, { admins: (text) => this.notifyAdmins(text) }));
-		// An overrun one user or address caused pauses them instead: tell the operators who.
-		// The notice is the server's own work, never refused as the paused user's.
-		this.store.onQuarantine = (detail) => ctx.waitUntil(ACTOR.run(() => [], () => notifyTrigger({ kind: "accounting_quarantine", ...detail }, { admins: (text) => this.notifyAdmins(text) })));
+		// An overrun is observed, not fatal: the day's first is told, and what it
+		// set off (a breaker, a pause) changes the tier, which is told too.
+		this.store.onOverrun = (notice) => {
+			if (notice.firstToday && !notice.paused) {
+				const users = notice.principals.filter((principal) => principal.startsWith("user:")).map((principal) => principal.slice(5));
+				this.announce({ kind: "overrun", operation: notice.operation, message: notice.message, users });
+			}
+			this.evaluateTier(nowMs());
+		};
 		// With what overran: the log line saying so may be sampled away.
 		this.store.onAccounting = (change, message) => recordMetric(this.runtimeEnv.METRICS, "accounting", message ? [change, message] : [change]);
 		this.store.actor = () => ACTOR.getStore()?.();
@@ -1862,6 +1872,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 					if (state) this.closePolicy(peer as WebSocketConnection, state, 1013, "Demo account capacity reached; try later");
 				}
 			},
+			// A fresh reading may stop the server or lift its stop: the tier says which.
+			onSnapshot: () => this.evaluateTier(nowMs()),
 		});
 		this.webAuthn = new WebAuthnService(this.config);
 		// Answered by the runtime without waking the object or reaching
@@ -1994,6 +2006,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const prior = this.queues.get(socket) ?? Promise.resolve();
 		const actor = connectionActor(socket, attachment);
 		const next = prior.catch(() => undefined).then(() => ACTOR.run(actor, () => this.processFrame(socket, message))).catch((error) => this.handleFrameFailure(socket, error)).finally(() => {
+			this.maybeEvaluateTier(nowMs());
 			const latest = connectionAttachment(socket);
 			if (latest) {
 				latest.pendingFrames = Math.max(0, latest.pendingFrames - 1);
@@ -2054,6 +2067,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// their own work, as they did before presence used the alarm.
 		const full = this.alarmWorkDue(now);
 		recordMetric(this.runtimeEnv.METRICS, "alarm", [full ? "full" : "light"]);
+		this.maybeEvaluateTier(now);
 		if (!full) {
 			await this.rescheduleAlarm();
 			return;
@@ -2435,7 +2449,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 			return;
 		}
-		if (!this.chargeFrame(socket, attachment)) return;
+		if (!this.chargeFrame(socket, attachment, parsed?.request)) return;
 		// The charge updated the attachment; handlers must not write back the copy read before it.
 		const current = connectionAttachment(socket) ?? attachment;
 		if (!parsed) {
@@ -2486,7 +2500,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * granted twice: it lives only in this connection's attachment, and an
 	 * unspent one is burned when the connection closes or the UTC day ends.
 	 */
-	private chargeFrame(socket: WebSocketConnection, attachment: ConnectionAttachment): boolean {
+	private chargeFrame(socket: WebSocketConnection, attachment: ConnectionAttachment, request?: RequestFrame): boolean {
 		const now = nowMs();
 		try {
 			const latest = connectionAttachment(socket) ?? attachment;
@@ -2496,7 +2510,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 				latest.frameLease = { day, remaining: lease - 1 };
 			} else {
 				const count = this.config.limits.frameLease;
-				this.store.reserveFrames({ ipKey: attachment.ipKey, now, count });
+				const reserve = () => this.store.reserveFrames({ ipKey: attachment.ipKey, now, count });
+				// An admin's frames are charged but never refused, so `/status`
+				// still answers while the server is paused or out of frames.
+				if (latest.tier === "registered" && latest.roles?.includes("admin")) this.store.alert(reserve);
+				else reserve();
 				latest.frameLease = { day, remaining: count - 1 };
 			}
 			if (latest.frameLease.remaining === 0) delete latest.frameLease;
@@ -2504,11 +2522,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return true;
 		} catch (error) {
 			const failure = errorToProtocol(error);
-			if (failure.data?.reason === "frame_budget") {
-				for (const peer of this.ctx.getWebSockets()) {
-					const state = connectionAttachment(peer);
-					if (state) this.closePolicy(peer, state, 1013, "Demo capacity reached; try after daily reset");
-				}
+			// Refusals that hold for everyone (the day's frames spent, a pause)
+			// refuse the frame and keep the socket, so readers stay connected and
+			// nobody reconnects into the same refusal; anything else is this
+			// connection's own limit and closes it.
+			const reason = failure.data?.reason;
+			if (failure.name === "retry_after" && (reason === "frame_budget" || reason === "server_paused" || reason === "daily_budget")) {
+				if (request && !isNotification(request.method, request.id)) this.fail(socket, request, failure);
 			} else this.closePolicy(socket, connectionAttachment(socket) ?? attachment, 1013, failure.message);
 			return false;
 		}
@@ -5275,6 +5295,85 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
+	 * The server's tier now, least to most refused, with why: account stop
+	 * (Cloudflare usage reached its stop line), paused (a huge overrun),
+	 * exhausted (a foreground SQL or frame ceiling spent today), degraded
+	 * (one at DEGRADE_SHARE), else open; and the open breakers. Null while
+	 * today's budget is not yet in memory and nothing else applies.
+	 */
+	private currentTier(now: number): { tier: ServerTier; reasons: string[]; breakers: Record<string, number> } | null {
+		const guard = this.store.accountingGuard(now);
+		const breakers = guard.breakers;
+		if (this.accountUsage.stops(now)) {
+			const snapshot = this.accountUsage.snapshot;
+			const reached = snapshot ? exceededAllowances(snapshot) : [];
+			return { tier: "account_stop", reasons: [`Cloudflare usage reached ${reached.length ? reached.join(", ") : "a stop line"}`], breakers };
+		}
+		if (guard.pausedUntil) {
+			return { tier: "paused", reasons: [`until ${new Date(guard.pausedUntil).toISOString().slice(11, 16)} UTC`], breakers };
+		}
+		const shares = this.store.budgetShares(now);
+		if (!shares) return null;
+		const named: Array<[string, number]> = [["foreground SQL reads", shares.reads], ["foreground SQL writes", shares.writes], ["frames", shares.frames]];
+		const highest = Math.max(...named.map(([, share]) => share));
+		const tier: ServerTier = highest >= 1 ? "exhausted" : highest >= DEGRADE_SHARE ? "degraded" : "open";
+		const reasons = tier === "open" ? [] : named.filter(([, share]) => share >= DEGRADE_SHARE).map(([name, share]) => `${name} at ${Math.round(share * 100)}% of today's ceiling`);
+		return { tier, reasons, breakers };
+	}
+
+	/**
+	 * Evaluates the tier at most once a minute (evaluateTier): on frames and
+	 * alarms, never on a connection attempt, whose refusals must cost no SQL.
+	 */
+	private maybeEvaluateTier(now: number): void {
+		if (now - this.tierCheckedAt < 60_000) return;
+		this.evaluateTier(now);
+	}
+
+	/**
+	 * Announces every change since the last announcement: the tier, and each
+	 * breaker opening or closing, in a public post in `general` mentioning
+	 * every admin (notifyAdmins). The record of what was announced is kept in
+	 * storage, so a wake does not announce again what was already told; a
+	 * change while nobody is connected is told at the next event or alarm.
+	 */
+	private evaluateTier(now: number): void {
+		this.tierCheckedAt = now;
+		let state: ReturnType<ApronDemoServer["currentTier"]>;
+		try {
+			state = this.currentTier(now);
+			if (!state) return;
+			if (!this.announcedTier) {
+				const raw = this.store.announcedTier(now);
+				let parsed: { tier?: unknown; breakers?: unknown } = {};
+				try { parsed = raw ? JSON.parse(raw) : {}; } catch { /* a bad record starts from open */ }
+				const tier = typeof parsed.tier === "string" && parsed.tier in TIER_LABEL ? parsed.tier as ServerTier : "open";
+				const breakers = Array.isArray(parsed.breakers) ? parsed.breakers.filter((op): op is string => typeof op === "string") : [];
+				this.announcedTier = { tier, breakers };
+			}
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "tier_evaluation_failed", message: error instanceof Error ? error.message : String(error) }));
+			return;
+		}
+		const before = this.announcedTier;
+		const open = Object.keys(state.breakers).sort();
+		const notices: TriggerNotice[] = [];
+		if (state.tier !== before.tier) notices.push({ kind: "tier", from: before.tier, to: state.tier, reasons: state.reasons });
+		for (const operation of open) if (!before.breakers.includes(operation)) notices.push({ kind: "breaker", operation, open: true, until: state.breakers[operation] });
+		for (const operation of before.breakers) if (!open.includes(operation)) notices.push({ kind: "breaker", operation, open: false });
+		if (!notices.length) return;
+		this.announcedTier = { tier: state.tier, breakers: open };
+		try { this.store.setAnnouncedTier(JSON.stringify(this.announcedTier), now); } catch { /* told again after a wake, rather than not at all */ }
+		if (state.tier !== before.tier) recordMetric(this.runtimeEnv.METRICS, "tier", [state.tier, before.tier]);
+		for (const notice of notices) this.announce(notice);
+	}
+
+	/** Posts a notice for the admins as the server's own work (ACTOR: no principal), after the event that raised it. */
+	private announce(notice: TriggerNotice): void {
+		this.ctx.waitUntil(ACTOR.run(() => [], () => notifyTrigger(notice, { admins: (text) => this.notifyAdmins(text) })));
+	}
+
+	/**
 	 * Posts `text` in `general` as the admin user, mentioning every other
 	 * user with the `admin` role (at most MAX_ALERT_ADMINS), and pushes it to
 	 * them at once, attended or not, skipping the wait: a mention is how the
@@ -6754,17 +6853,30 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async sendStatus(socket: WebSocketConnection, request: RequestFrame, roomId: string): Promise<void> {
 		const now = nowMs();
 		await this.accountUsage.refresh(now, true);
-		const { budget, identities, databaseBytes } = this.store.status(now);
+		const { budget, identities, databaseBytes, counts } = this.store.status(now);
 		const limits = this.config.limits;
 		const count = (value: number) => Math.round(value).toLocaleString("en-US");
 		const share = (used: number, limit: number) => `${count(used)} / ${count(limit)} (${limit > 0 ? Math.round((100 * used) / limit) : 0}%)`;
 		const mib = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+		const utc = (ms: number) => `${new Date(ms).toISOString().slice(11, 16)} UTC`;
 		const lines: string[] = [];
+		// Why the server refuses work, first: the tier, its reasons, and every
+		// stop that is not a quota (Store.accountingGuard).
+		const tier = this.currentTier(now);
+		const guard = this.store.accountingGuard(now);
+		lines.push(`**State: ${tier ? TIER_LABEL[tier.tier] : "open"}**${tier?.reasons.length ? `: ${tier.reasons.join("; ")}` : ""}`);
+		if (this.store.accountingStatus(now).uncertain) lines.push("- **Storage failing**: a budget write failed; work is refused until one succeeds");
+		for (const [operation, until] of Object.entries(guard.breakers)) lines.push(`- **Paused action** \`${operation}\` until ${utc(until)}: it overran its storage reservation 3 times within an hour`);
+		lines.push(`- Storage overruns today: ${guard.overruns} (each charged and logged)`);
+		if (this.config.admissionOff) lines.push("- `ADMISSION_OFF` is set: new connections are refused");
+		lines.push("");
 		const usage = this.accountUsage.snapshot;
 		const daily = ACCOUNT_USAGE_POLICY.daily;
 		if (usage) {
+			const stopping = this.accountUsage.stops(now);
+			const reached = stopping ? exceededAllowances(usage) : [];
 			lines.push(
-				`**Cloudflare account, ${usage.day}** (sampled ${new Date(usage.sampledAt).toISOString().slice(11, 16)} UTC${usage.stop ? ", **stopped**: over " + Math.round(ACCOUNT_USAGE_POLICY.stopRatio * 100) + "% of a limit" : ""})`,
+				`**Cloudflare account, ${usage.day}** (sampled ${utc(usage.sampledAt)}; stops at ${Math.round(ACCOUNT_USAGE_POLICY.stopRatio * 100)}% of a daily share${stopping ? `; **stopped**: reached ${reached.join(", ")}` : ""})`,
 				"",
 				`Used / ${PLAN.name} daily allowance:`,
 				`- Worker requests: ${share(usage.workerRequests, daily.workerRequests)}`,
@@ -6810,14 +6922,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (ACCOUNT_USAGE_POLICY.monthly) lines.push("", await this.edgeStopLine());
 		lines.push(
 			"",
-			`**Demo budgets, ${budget.day}** (reserved by this object)`,
+			`**Demo budgets, ${budget.day}** (used / the ceiling that refuses work; ${DEGRADE_SHARE * 100}% degrades)`,
 			"",
-			"Reserved / budget:",
-			`- SQL rows read: ${share(budget.reads, limits.sqlReadsPerDay)}`,
-			`- SQL rows written: ${share(budget.writes, limits.sqlWritesPerDay)}`,
-			`- Frames: ${share(budget.frames, limits.processedFramesPerDay)}`,
-			`- Connection admissions: ${share(budget.admissions, limits.connectionAdmissionsPerDay)}`,
-			`- Posts: ${share(budget.posts, limits.globalPostsPerDay)}`,
+			`- Foreground SQL rows read: ${share(budget.foreground_reads, limits.foregroundReadsPerDay)}`,
+			`- Foreground SQL rows written: ${share(budget.foreground_writes, limits.foregroundWritesPerDay)}`,
+			`- Maintenance SQL rows read / written: ${count(budget.maintenance_reads)} / ${count(budget.maintenance_writes)}`,
+			`- Frames: ${share(counts.frames, limits.processedFramesPerDay)}`,
+			`- Connection admissions: ${share(counts.admissions, limits.connectionAdmissionsPerDay)}`,
+			`- Posts: ${share(counts.posts, limits.globalPostsPerDay)}`,
 			`- Registrations: ${share(budget.registrations, limits.registrationsPerDay)}`,
 			...(this.config.push && PUSH_POLICY ? [`- Pushes: ${share(this.store.pushesToday(now), PUSH_POLICY.pushesPerDay)}`] : []),
 			`- Registered users: ${share(identities, limits.registeredIdentityCount)}`,

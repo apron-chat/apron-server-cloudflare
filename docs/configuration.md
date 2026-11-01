@@ -141,15 +141,16 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   share, or the next month for a monthly one. It touches no other rule, so
   `apron_admission_off` stays yours to use by hand.
 - **Admin alert.** When the guard or the flood trip (below) turns the rule
-  on, and when a cost overrun closes storage accounting or pauses one user,
-  the server posts a
-  message in `general` as the `admin` user that mentions and pushes to every
-  user with the `admin` role (up to `wakesPerMessage`, 10); see
+  on or off, when the server changes tier or an action's breaker opens or
+  closes (see [Server tiers](#server-tiers)), and at the day's first storage
+  overrun, the server posts a public message in `general` as the `admin`
+  user that mentions and pushes to every user with the `admin` role (up to
+  `wakesPerMessage`, 10); see
   [SPEC section 10](../SPEC.md#10-degradation-and-public-demo-behavior).
   Give yourself the role (`/admin <user_id>`) and allow notifications in your
   client to get it on your phone; muting `general` or choosing `dnd`
-  silences it. Nothing is sent when the stop lifts. An alert that fails is
-  logged (`trigger_notice_failed`) and never undoes the stop.
+  silences it. An alert that fails is logged (`trigger_notice_failed`) and
+  never undoes what it tells of.
 - The monthly allowances are Worker requests, Worker CPU, Durable Object
   requests and duration, SQL rows read and written, and Workers Logs bytes
   (estimated; below), plus R2's free tier for uploads: Class A and Class B operations (each day
@@ -187,11 +188,12 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   unsampled data point per event worth counting: stale connections closed
   (`stale_close`: `pinged` or `unpinged`, and the origin), alarms (`alarm`:
   `light` for status changes only, or `full`), pushes delivered (`push`:
-  `sent`, `failed` or `gone`), accounting closing and reopening
-  (`accounting`: `overrun`, `uncertain`, `quarantined` or `recovered`, and
-  for the first three what failed, as the log lines `accounting_closed` and
-  `accounting_quarantined` say), admin alerts (`admins_notified`)
-  and the edge stop turning on (`edge_stop`: `guard` or `flood`). Each point
+  `sent`, `failed` or `gone`), storage overruns and accounting closing and
+  reopening (`accounting`: `overrun` with the operation and its rows, as the
+  log line `accounting_overrun` says; `uncertain` with what failed, as
+  `accounting_closed` says; or `recovered`), tier changes (`tier`: the new
+  tier and the one before), admin alerts (`admins_notified`) and the edge
+  stop turning on or off (`edge_stop`: `guard` or `flood`, or `lifted`). Each point
   is `blob1` the event, `blob2` and `blob3` its details and `double1` its
   value. Writing never awaits or throws, and without the binding nothing is
   written. Workers Paid includes 10 million data points a month; this server
@@ -695,35 +697,47 @@ implementation and recalibrating its resource model.
 | `ZONE_ID` | The zone holding `apron_budget_stop`; a Wrangler var (see [Budget guard](#budget-guard)) |
 | `EDGE_STOP_TOKEN` | Secret: an API token with Zone WAF edit permission on `ZONE_ID`, which the budget guard and the flood trip use |
 | `ADMISSION_OFF` | `true` or `false`: operator admission switch; `true` rejects new sockets in the entry Worker with 503 before the limiter or DO call; existing sockets remain subject to DO budgets |
-| `ACCOUNTING_RECOVERY` | 1 to 64 letters, digits, `.`, `_`, `:` or `-`: reopens a persisted accounting stop after a reservation overrun (see below) |
 | `ENVIRONMENT` | Set to `development` to enable local origin defaults when `ALLOWED_ORIGINS` and `RP_ORIGINS` are omitted |
 | `NODE_ENV` | Set to `test` to enable the same local origin defaults for tests; production-like deployments must configure origins explicitly |
 
-**Accounting quarantine.** A reservation overrun in a user's own request (a
-frame, a connection closing, a connection attempt, a live text or upload
-write) pauses only that user and address for a day: their requests get
-`retry_after` (`data.reason` `accounting_quarantined`), the overrun's excess
-rows are charged to the day's budget, the admins are told who and what
-overran, and everyone else carries on. The pause survives a wake. An
-overrun closes storage accounting for everyone instead (below) when it has
-no user (the server's own alarm and sweeps), when it ran over by more than a
-hundredth of the day's SQL ceilings, or once the UTC day has paused three
-(`QUARANTINES_PER_DAY` in `src/store.ts`): past that, the estimate is wrong
-for more than one person's data. A new `ACCOUNTING_RECOVERY` value lifts
-every pause too.
+### Server tiers
 
-**Accounting recovery.** Otherwise a reservation overrun closes storage
-accounting for good: every connection is refused with `Server closed:
-storage accounting stopped after a cost overrun, until an operator reopens
-it`, and the admins are alerted. To reopen it, set `ACCOUNTING_RECOVERY` to a value it has not
-used before, in `wrangler.production.toml` or once with
-`npm run deploy -- --var ACCOUNTING_RECOVERY:<value>`, and deploy. The
-Durable Object clears the stop when it next starts and logs
-`accounting_unsafe_cleared`; leaving a used value set changes nothing, so a
-stop latched later needs a new value. What the failure left unwritten is not
-charged. A stop left by a storage failure (`Server storage is unavailable;
-try again shortly`) needs none of this: it clears itself once storage works
-(`accounting_uncertain_recovered`).
+The server refuses work in tiers, each scoped and timed by what fires it,
+and each lifting by itself (`src/store.ts`, `ApronDemoServer.currentTier`):
+
+| Tier | Fires on | Does | Lifts |
+| --- | --- | --- | --- |
+| open | | Everything works | |
+| degraded | Today's foreground SQL reads or writes, or frames, at `DEGRADE_SHARE` (70%) of their ceiling | Live text, uploads and older history (`history` with `before`) get `retry_after` (`data.reason` `degraded`); chat works | UTC midnight |
+| exhausted | One of those at 100% | New work is refused with `retry_after` until the reset; open connections stay | UTC midnight |
+| paused | One storage overrun past a hundredth of a day's SQL ceilings | All work gets `retry_after` (`data.reason` `server_paused`), except admin alerts and `/status` | 1 hour (`PAUSE_MS`) |
+| account stop | Cloudflare usage at 90% of a daily share or 50% of the month (the account-usage stop) | 503 and sockets closed once, as it starts | The day's or month's end |
+
+Every change of tier is announced to the admins (see the admin alert above),
+going up and coming down, with why. It is evaluated at most once a minute on
+frames and alarms, and at once after an overrun or a fresh usage reading, so
+a change while nobody is connected is told at the next event. The edge stop
+(budget guard) sits past these and is announced on and off by the guard.
+
+**Storage overruns.** Every operation reserves the SQL rows it may read and
+write before it runs. One that uses more is an *overrun*: a wrong estimate,
+not a cost emergency. It is observed: the operation finishes, its excess is
+charged to the day's budget (so the ceilings above stay true), and it is
+logged (`accounting_overrun`) and counted (`accounting` metric) under the
+operation's name with the user and address it acted for. The day's first
+overrun is announced to the admins. Three overruns of one foreground
+operation within an hour open its *breaker*: that one operation gets
+`retry_after` (`data.reason` `operation_paused`) for an hour
+(`BREAKER_MS`), announced as it opens and closes. Only one overrun past a
+hundredth of a day's SQL ceilings, which may be unbounded, fails and pauses
+the server. Breakers and pauses survive a wake. `/status` lists both.
+
+Earlier versions closed the server for good on any overrun until an operator
+deployed a new `ACCOUNTING_RECOVERY`; that variable is no longer read, and a
+stop such a version left is cleared on the next wake
+(`accounting_unsafe_retired`). A storage failure (`Server storage is
+unavailable; try again shortly`) still refuses work until storage works again
+and clears itself (`accounting_uncertain_recovered`).
 
 Numeric values are positive safe integer counts. Values named `Bytes` count
 UTF-8 bytes, `CodePoints` count Unicode code points, and values named `Seconds`

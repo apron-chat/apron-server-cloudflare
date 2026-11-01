@@ -37,6 +37,8 @@ export interface BudgetCost {
   /** Set on a reservation charged to a day's budget row, so its unused part can be refunded. */
   day?: string;
   maintenance?: boolean;
+  /** Set once its overrun is noted (Store.assertReservation), so a second check does not note it again. */
+  overran?: boolean;
 }
 
 export interface BudgetSnapshot extends BudgetCost {
@@ -194,6 +196,11 @@ export class BudgetLedger {
     this.host.exec("INSERT OR IGNORE INTO resource_budgets (day) VALUES (?)", day);
     this.update(day, delta, false);
     this.forget();
+  }
+
+  /** A day's counters from the cached copy only, with no SQL; null before the day's first reservation here. */
+  cachedSnapshot(day: string): BudgetSnapshot | null {
+    return this.cachedDay === day && this.cached ? this.snapshot(day) : null;
   }
 
   /** A day's counters, creating its row if it has none. The cached copy, which holds what is staged, needs no SQL. */

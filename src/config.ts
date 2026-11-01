@@ -18,12 +18,6 @@ export interface RuntimeConfig {
 	 */
 	server: ServerMetadata;
 	admissionOff: boolean;
-	/**
-	 * Clears a persisted accounting stop once (`ACCOUNTING_RECOVERY`): the
-	 * Durable Object clears it on its next start, once per value
-	 * (Store.recoverAccounting). Unset, a stop stays until a reset.
-	 */
-	accountingRecovery?: string;
 	/** Advertise and relay typing (cap `activity`); `ACTIVITY` overrides the plan's default. */
 	activityEnabled: boolean;
 	/** Let guests post, react, join and leave rooms, and create threads; `GUEST_POSTING` overrides the plan's default. Off, guests only read. */
@@ -199,7 +193,6 @@ type EnvLike = {
 	SERVER_DESCRIPTION?: string;
 	SERVER_AVATAR?: string;
 	ADMISSION_OFF?: string;
-	ACCOUNTING_RECOVERY?: string;
 	ACTIVITY?: string;
 	GUEST_POSTING?: string;
 	PRESENCE?: string;
@@ -440,8 +433,6 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 	// answers when it serves RP_ID's host (handleRelatedOrigins).
 	if (env.ADMISSION_OFF !== undefined && !["true", "false"].includes(String(env.ADMISSION_OFF).toLowerCase())) throw new ConfigError("ADMISSION_OFF must be true or false");
 	const admissionOff = String(env.ADMISSION_OFF ?? "").toLowerCase() === "true";
-	const accountingRecovery = env.ACCOUNTING_RECOVERY === undefined || env.ACCOUNTING_RECOVERY === "" ? undefined : String(env.ACCOUNTING_RECOVERY);
-	if (accountingRecovery !== undefined && !/^[A-Za-z0-9._:-]{1,64}$/.test(accountingRecovery)) throw new ConfigError("ACCOUNTING_RECOVERY must be 1 to 64 letters, digits, ., _, : or -");
 	const activityEnabled = parseSwitch(env.ACTIVITY, "ACTIVITY", DEFAULT_FEATURES.activity);
 	const guestPosting = parseSwitch(env.GUEST_POSTING, "GUEST_POSTING", DEFAULT_FEATURES.guestPosting);
 	const presence = parseSwitch(env.PRESENCE, "PRESENCE", DEFAULT_FEATURES.presence);
@@ -469,7 +460,6 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 		rpName,
 		server,
 		admissionOff,
-		...(accountingRecovery !== undefined ? { accountingRecovery } : {}),
 		activityEnabled,
 		guestPosting,
 		presence,

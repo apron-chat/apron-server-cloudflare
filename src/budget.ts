@@ -570,7 +570,9 @@ export const MAX_SQL_WRITES = DEFAULT_LIMITS.sqlWritesPerDay;
 export const MAX_SQL_READS = DEFAULT_LIMITS.sqlReadsPerDay;
 export const MAX_DATABASE_HIGH_WATER_BYTES = DEFAULT_LIMITS.databaseHighWaterBytes;
 export const MAX_DATABASE_HARD_TARGET_BYTES = DEFAULT_LIMITS.databaseHardTargetBytes;
-export const MAINTENANCE_CONTROL_RESERVE = 8;
+// Withheld from ordinary maintenance for deferCleanup (8) and the alarm
+// that resets it (24), each with headroom over what it measures (2 and 6).
+export const MAINTENANCE_CONTROL_RESERVE = 32;
 export const BOOTSTRAP_ROW_RESERVATION = 512;
 export const MAX_SOCKET_QUEUE_ALLOCATION = 32 * 1024 * 1024;
 export const ADMISSION_BUDGET: Readonly<AdmissionBudget> = PLAN.admission;
