@@ -107,8 +107,8 @@ const PUBLIC_ROOMS = "(room_id < 'private_' OR room_id >= 'private`')";
 const MAX_ROOM_ROWS = MAX_THREAD_LIMIT + 1 + MAX_PRIVATE_ROOM_LIMIT;
 /** Most rooms one registered user can be in: every public room, and their share of private ones. */
 const MAX_USER_ROOMS = MAX_THREAD_LIMIT + 1 + MAX_PRIVATE_MEMBERSHIPS_PER_USER;
-/** The most members of one private room whose read cursors a listing reads back (roomReadCursors). */
-export const MAX_READ_RECEIPT_MEMBERS = 32;
+/** The most members a private room may have for its members to see each other's read cursors (read receipts). */
+export const MAX_READ_RECEIPT_MEMBERS = 10;
 const MAX_SAFE_ID = Number.MAX_SAFE_INTEGER;
 export const RETENTION_MS = DEFAULT_LIMITS.retentionSeconds * 1000;
 const DEDUP_TTL_MS = DEFAULT_LIMITS.dedupTtlSeconds * 1000;
@@ -6135,34 +6135,48 @@ export class Store {
 
   /**
    * The read cursors of a private room's members (read receipts, protocol
-   * §4.6): for each room, the users with a cursor kept there and the
-   * `read_message_id` each read through, from the first
-   * MAX_READ_RECEIPT_MEMBERS members by `user_id` other than `except` (the
-   * lister), leaving out members who chose `invisible`. A range of the room's
-   * memberships, each joined to its cursor and its `user_status` row by
-   * primary key, so a member without a cursor costs its membership read
-   * alone.
+   * §4.6), for the rooms of at most MAX_READ_RECEIPT_MEMBERS members: for
+   * each, the members other than `except` (the lister) with a cursor kept
+   * there and the `read_message_id` each read through, leaving out members
+   * who chose `invisible`. A larger room is absent from the result; one with
+   * no cursor to show is present, empty. Per room, a range of at most one
+   * more membership than the limit, by key, then each member's cursor and
+   * `user_status` row by primary key: bounded whatever the room's size.
    */
   roomReadCursors(roomIds: readonly string[], except: string, now = this.clock.now()): Map<string, Array<[userId: string, messageId: string]>> {
     const rooms = roomIds.filter(isPrivateRoomId).slice(0, MAX_PRIVATE_MEMBERSHIPS_PER_USER);
     const found = new Map<string, Array<[string, string]>>();
     if (!rooms.length) return found;
     this.ensureReady();
-    return this.reserved({ reads: 8 + rooms.length * (4 + 3 * MAX_READ_RECEIPT_MEMBERS) }, false, now, () => {
+    const limit = MAX_READ_RECEIPT_MEMBERS;
+    return this.reserved({ reads: 8 + rooms.length * (4 + (limit + 1) + 3 * limit) }, false, now, () => {
       for (const roomId of rooms) {
-        // The scan itself is bounded: at most MAX_READ_RECEIPT_MEMBERS memberships, by key, whatever the room's size
-        // and however many of them have no cursor or are invisible (a LIMIT on the joined rows would not bound it).
+        const members = this.rawRows<{ user_id: string }>("SELECT user_id FROM memberships WHERE room_id = ? LIMIT ?", roomId, limit + 1);
+        if (members.length > limit) continue;
         const rows = this.rawRows<{ user_id: string; message_id: number }>(
           `SELECT read_cursors.user_id, read_cursors.message_id
-           FROM (SELECT user_id FROM memberships WHERE room_id = ? AND user_id != ? ORDER BY user_id LIMIT ?) AS members
+           FROM (SELECT user_id FROM memberships WHERE room_id = ? AND user_id != ? LIMIT ?) AS members
            JOIN read_cursors ON read_cursors.user_id = members.user_id AND read_cursors.room_id = ?
            LEFT JOIN user_status ON user_status.user_id = members.user_id
            WHERE user_status.status IS NULL OR user_status.status != 'invisible'`,
-          roomId, except, MAX_READ_RECEIPT_MEMBERS, roomId,
+          roomId, except, limit, roomId,
         );
-        if (rows.length) found.set(roomId, rows.map((row) => [row.user_id, idString(integerColumn(row.message_id))]));
+        found.set(roomId, rows.map((row) => [row.user_id, idString(integerColumn(row.message_id))]));
       }
       return found;
+    });
+  }
+
+  /**
+   * How many registered members a room has (its row's `member_count`),
+   * undefined for an unknown room: one primary-key read. Read receipts go
+   * only to rooms of at most MAX_READ_RECEIPT_MEMBERS (roomReadCursors).
+   */
+  roomMemberCount(roomId: string, now = this.clock.now()): number | undefined {
+    this.ensureReady();
+    return this.reserved({ reads: 8 + 2 }, false, now, () => {
+      const row = this.rawRows<{ member_count: number }>("SELECT member_count FROM rooms WHERE room_id = ? LIMIT 1", roomId)[0];
+      return row ? integerColumn(row.member_count) : undefined;
     });
   }
 

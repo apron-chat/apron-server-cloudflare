@@ -97,7 +97,7 @@ within it:
   members and never stored, at most 10 relays per user per minute; past that, updates are dropped and the
   sender gets one `~private` notice a minute saying so. A registered user's
   read cursor (`read_message_id`) is relayed to their own other connections,
-  and in a private room to its other members unless they chose `invisible`
+  and in a private room of at most 10 members to its other members unless they chose `invisible`
   (read receipts; none in other rooms), and kept for the rooms they
   joined: written at most once a minute per connection and when it closes,
   and sent back after their next listing, so another device, or a reload,

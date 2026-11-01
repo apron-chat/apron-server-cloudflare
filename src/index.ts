@@ -67,6 +67,7 @@ import {
 	liveDeadline,
 	liveResultEmbed,
 	isPrivateRoomId,
+	MAX_READ_RECEIPT_MEMBERS,
 	seenStands,
 	type Broadcast,
 	type ClaimedPush,
@@ -3708,12 +3709,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.dropWakes(identity.user_id, roomId, read);
 		this.dropHeld(identity.user_id, roomId, read);
 		const peers = new Set(this.connectionsOf(identity.user_id, socket));
-		// Read receipts: a private room's other members (only they see it) get it too, unless the reader is invisible.
+		// Read receipts: a small private room's other members (only they see it) get it too, unless the reader is invisible.
+		// The room's size is read only when another member is connected to receive it.
 		if (isPrivateRoomId(roomId) && (connectionAttachment(socket) ?? attachment).choice !== "invisible") {
-			for (const ws of this.ctx.getWebSockets()) {
-				const peer = ws as WebSocketConnection;
-				if (peer !== socket && connectionAttachment(peer)?.rooms?.includes(roomId)) peers.add(peer);
-			}
+			const members = this.ctx.getWebSockets().filter((ws) => {
+				const state = connectionAttachment(ws as WebSocketConnection);
+				return ws !== socket && state?.userId !== identity.user_id && state?.rooms?.includes(roomId);
+			}) as WebSocketConnection[];
+			if (members.length && this.receiptsRoom(roomId, now)) for (const peer of members) peers.add(peer);
 		}
 		if (peers.size && this.takeThrottle(socket, identity.user_id, "read", this.config.limits.activityBroadcastsPerUserMinute, now)) {
 			const frame = { method: "activity", params: { room_id: roomId, from: identity, read_message_id: read } };
@@ -3724,6 +3727,21 @@ export class ApronDemoServer extends DurableObject<Env> {
 		latest.reads = { ...latest.reads, [roomId]: read };
 		if (now - (latest.readsAt ?? 0) >= READ_CURSOR_FLUSH_MS || Object.keys(latest.reads).length > MAX_ATTACHED_ROOMS) this.flushReads(latest, now, socket);
 		else writeAttachment(socket, latest);
+	}
+
+	/**
+	 * Whether a private room is small enough for read receipts, at most
+	 * MAX_READ_RECEIPT_MEMBERS registered members (Store.roomMemberCount, one
+	 * read). One the store cannot read for now is not: the cursor still goes
+	 * to the reader's own connections.
+	 */
+	private receiptsRoom(roomId: string, now: number): boolean {
+		try {
+			const count = this.store.roomMemberCount(roomId, now);
+			return count !== undefined && count <= MAX_READ_RECEIPT_MEMBERS;
+		} catch {
+			return false;
+		}
 	}
 
 	/**
@@ -3779,11 +3797,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Read receipts after a listing (`ext.settings.read_receipts`
-	 * `"private"`): for each private room listed, the other members' read
-	 * cursors, as `activity` from each (`from` holds only their `user_id`:
-	 * the client knows the members), the one kept (Store.roomReadCursors, at
-	 * most MAX_READ_RECEIPT_MEMBERS a room) or, if further, one their
-	 * connections hold unwritten. A member who chose `invisible` shows no
+	 * `"private"`): for each private room listed of at most
+	 * MAX_READ_RECEIPT_MEMBERS members, the other members' read cursors, as
+	 * `activity` from each (`from` holds only their `user_id`: the client
+	 * knows the members), the one kept (Store.roomReadCursors) or, if
+	 * further, one their connections hold unwritten. A member who chose `invisible` shows no
 	 * cursor (Store.roomReadCursors leaves theirs out too). Those the store
 	 * cannot read for now are not sent, as for the user's own.
 	 */
@@ -3795,7 +3813,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		} catch {
 			return;
 		}
-		const cursors = new Map(roomIds.map((roomId) => [roomId, new Map(kept.get(roomId) ?? [])]));
+		// The rooms small enough for receipts are those the store answered for.
+		const cursors = new Map([...kept].map(([roomId, rows]) => [roomId, new Map(rows)]));
 		for (const ws of this.ctx.getWebSockets()) {
 			const state = connectionAttachment(ws as WebSocketConnection);
 			if (state?.tier !== "registered" || !state.userId || !state.reads || state.choice === "invisible") continue;

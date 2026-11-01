@@ -94,11 +94,13 @@ an expired room and `/purge` delete the row by its key, with the membership.
 The costs are the read cursor rows of the [matrix](#reservation-accounting):
 each written figure includes the day's budget row, and a cursor not past the
 one kept is charged one row, as every statement is, though SQLite reports
-none. A listing's read receipts read, for each private room listed, its
-memberships joined to their cursors and `user_status` rows (to leave out
-invisible members) by primary key, at most 32 members a room: a reservation
-of `8 + rooms × (4 + 3 × 32)` reads, about two rows a member with a
-cursor.
+none. Read receipts are for private rooms of at most 10 members. A
+listing's read, for each private room listed, at most 11 memberships to
+tell its size, then for one small enough its members' cursors and
+`user_status` rows (to leave out invisible members) by primary key: a
+reservation of `8 + rooms × (4 + 11 + 3 × 10)` reads, bounded whatever the
+room's size. A cursor relayed live reads the room's `member_count` (one
+row), only when another member is connected to the room.
 
 ## Limiter rows and the budget row
 
@@ -255,7 +257,8 @@ upper bounds can be compared with the measured worst case:
 | Read cursor written, not past the one kept (no row changes) | 2 | 2 | 20 | 20 |
 | Read cursor written for a room not joined (the probe alone) | 2 | 1 | 20 | 20 |
 | Read cursors at a listing (one range of the user's rows) | 2 | 1 | 518 | 8 |
-| Read receipts at a listing, one private room with one cursor (its memberships joined to their cursors and status rows) | 3 | 1 | 116 | 8 |
+| Read receipts at a listing, one private room with one cursor (its size, then its members' cursors and status rows) | 4 | 1 | 61 | 8 |
+| Room member count, for a read receipt relayed live | 2 | 1 | 18 | 8 |
 | Cleanup (matrix, one day later) | 121 | 42 | 1,874 | 1,058 |
 | Alarm scheduling | 6 | 3 | 24 | 12 |
 
