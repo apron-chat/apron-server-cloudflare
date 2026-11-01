@@ -177,6 +177,11 @@ These keep the socket open and answer requests with `retry_after`, with
 | `operation_paused` | That one action used more storage than expected three times in an hour and is paused | An hour |
 | `server_paused` | One action used far more storage than expected: everything is paused | An hour |
 
+Any refusal that lasts five minutes or more (these, and daily limits such as
+"Daily posting limit reached") is also explained once an hour per
+connection in a `~private` message: what happened, until when, and a code
+and time to quote to an admin. Show it like any other `~private` message.
+
 ### Typing, status and push
 
 | Method | Limit | Over the limit |

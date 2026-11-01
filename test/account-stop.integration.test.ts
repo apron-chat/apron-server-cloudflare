@@ -67,7 +67,7 @@ it('closes a socket on its next frame once the account-usage stop holds', async 
 	expect(await peer.closed).toEqual({ code: 1013, reason: 'Demo account capacity reached; try later' });
 });
 
-it('keeps every socket open when the daily frame budget runs out, refusing requests until the reset', async () => {
+it('keeps every socket open when the daily frame budget runs out, refusing requests until the reset and telling the user once', async () => {
 	const stub = env.DEMO.getByName('frame-budget-keep-open');
 	const first = await open(stub);
 	const second = await open(stub);
@@ -79,14 +79,31 @@ it('keeps every socket open when the daily frame budget runs out, refusing reque
 		expect(cursor.rowsWritten).toBe(1);
 	});
 	const replies: Array<{ id?: string; error?: { code: number; message: string; data?: { retry_after?: number } } }> = [];
+	const notices: string[] = [];
 	first.socket.addEventListener('message', (event) => {
 		const frame = JSON.parse(String(event.data));
-		if (frame.id === 'over-budget') replies.push(frame);
+		if (typeof frame.id === 'string' && frame.id.startsWith('over-budget')) replies.push(frame);
+		if (frame.method === 'message' && frame.params?.from?.user_id === '~private' && !String(frame.params.body.text).startsWith('Welcome')) notices.push(frame.params.body.text);
 	});
+	const warn = vi.spyOn(console, 'warn');
 	first.socket.send(JSON.stringify({ id: 'over-budget', method: 'auth', params: { scheme: 'guest' } }));
 	await vi.waitFor(() => expect(replies).toHaveLength(1));
 	expect(replies[0].error?.message).toBe('Daily frame budget exhausted');
 	expect(replies[0].error?.data?.retry_after).toBeGreaterThan(0);
+	// A refusal that lasts is explained once, in a ~private notice asking for a report.
+	await vi.waitFor(() => expect(notices).toHaveLength(1));
+	expect(notices[0]).toMatch(/^\*\*Daily frame budget exhausted\.\*\* The server has handled as many messages and requests as it allows in a day\. This lasts until/);
+	expect(notices[0]).toMatch(/please report it to an admin with the code `frame_budget` and the time \d{4}-\d\d-\d\d \d\d:\d\d UTC\.$/);
+	// Retrying is refused again, without another notice or count.
+	first.socket.send(JSON.stringify({ id: 'over-budget-again', method: 'auth', params: { scheme: 'guest' } }));
+	await vi.waitFor(() => expect(replies).toHaveLength(2));
+	await runInDurableObject(stub, (instance) => {
+		expect((instance as unknown as { store: Store }).store.throttleTrips()).toEqual([['frame_budget', 1]]);
+	});
+	expect(notices).toHaveLength(1);
+	expect(warn.mock.calls.map(([line]) => String(line)).filter((line) => line.includes('"throttle_tripped"'))).toEqual([
+		expect.stringContaining('"trigger":"frame_budget","method":"auth"'),
+	]);
 	// Neither socket is closed: readers stay connected, and nobody reconnects into the same refusal.
 	const closed = await Promise.race([first.closed, second.closed, new Promise((resolve) => setTimeout(() => resolve('open'), 200))]);
 	expect(closed).toBe('open');

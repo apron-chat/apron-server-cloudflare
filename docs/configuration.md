@@ -192,7 +192,8 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   reopening (`accounting`: `overrun` with the operation and its rows, as the
   log line `accounting_overrun` says; `uncertain` with what failed, as
   `accounting_closed` says; or `recovered`), tier changes (`tier`: the new
-  tier and the one before), admin alerts (`admins_notified`) and the edge
+  tier and the one before), throttle trips (`throttle`: the trigger and the
+  method refused; see Server tiers), admin alerts (`admins_notified`) and the edge
   stop turning on or off (`edge_stop`: `guard` or `flood`, or `lifted`). Each point
   is `blob1` the event, `blob2` and `blob3` its details and `double1` its
   value. Writing never awaits or throws, and without the binding nothing is
@@ -731,6 +732,18 @@ operation within an hour open its *breaker*: that one operation gets
 (`BREAKER_MS`), announced as it opens and closes. Only one overrun past a
 hundredth of a day's SQL ceilings, which may be unbounded, fails and pauses
 the server. Breakers and pauses survive a wake. `/status` lists both.
+
+**Throttle trips.** A refusal that lasts five minutes or more
+(`LONG_THROTTLE_SECONDS`: the tiers above, daily limits, an open breaker)
+is a *trip*. The user is told once an hour per connection and trigger, in
+a `~private` message saying what happened, until when, and a code and time
+to report to an admin. It is then logged (`throttle_tripped`, with the
+trigger, method and user), written to the `throttle` metric for later
+analysis, and counted in `/status` ("Throttles tripped in the last 24
+hours", by trigger). A trigger is the refusal's `data.reason`, else its
+message as a slug (`daily_posting_limit_reached`). A connection refused at
+admission for as long is counted once an hour per address, with no
+message. Repeats within the hour are refused as usual, uncounted.
 
 Earlier versions closed the server for good on any overrun until an operator
 deployed a new `ACCOUNTING_RECOVERY`; that variable is no longer read, and a

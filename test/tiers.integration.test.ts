@@ -206,3 +206,19 @@ it('announces every tier change and breaker to the admins, once', async () => {
 		expect(announced[0].body.mentions).toEqual(['tier_boss']);
 	});
 });
+
+it('counts throttle trips by trigger over the last 24 hours', async () => {
+	await runInDurableObject(env.DEMO.getByName('tier-trips'), (_instance, state) => {
+		const clock = { now: Date.now() + 3_000 };
+		const store = new Store(state, {}, { now: () => clock.now });
+		store.initialize();
+		store.noteThrottleTrip('degraded', clock.now);
+		clock.now += 2 * 60 * 60 * 1000;
+		store.noteThrottleTrip('degraded', clock.now);
+		store.noteThrottleTrip('daily_posting_limit_reached', clock.now);
+		expect(store.throttleTrips(clock.now)).toEqual([['degraded', 2], ['daily_posting_limit_reached', 1]]);
+		// The first hour's trip leaves the window a day later; the rest stay.
+		clock.now += 23 * 60 * 60 * 1000;
+		expect(store.throttleTrips(clock.now)).toEqual([['daily_posting_limit_reached', 1], ['degraded', 1]]);
+	});
+});

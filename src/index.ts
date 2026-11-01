@@ -1010,6 +1010,40 @@ function writeSessionAttachment(socket: WebSocketConnection, attachment: Connect
 }
 
 /**
+ * A refusal whose `retry_after` is at least this long does not lift by
+ * itself in a moment: the user is told why in a `~private` notice and asked
+ * to report it, and it is logged and counted as a trip (noteTrip). Shorter
+ * ones are ordinary rate limits that clients wait out.
+ */
+const LONG_THROTTLE_SECONDS = 300;
+/** A connection is told of one trigger at most this often (noteTrip). */
+const TRIP_NOTICE_MS = 60 * 60 * 1000;
+
+/** What a long refusal means for the person who met it, by `data.reason`. */
+const TRIP_EXPLANATIONS: Record<string, string> = {
+	degraded: "The server is busy today, so live text, uploads and older history are off until the daily reset. Chat still works.",
+	operation_paused: "This action used more storage than the server expected several times in an hour, so it is paused for everyone while the admins look into it.",
+	server_paused: "One action used far more storage than the server expected, so the server is paused for an hour while the admins look into it.",
+	frame_budget: "The server has handled as many messages and requests as it allows in a day.",
+	daily_budget: "The server has used its storage budget for the day.",
+};
+
+/** A refusal's name for logs, metrics and `/status`: its `data.reason`, else its message as a short slug. */
+function tripTrigger(error: ProtocolError): string {
+	const reason = error.data?.reason;
+	if (typeof reason === "string" && /^[a-z_]{1,48}$/.test(reason)) return reason;
+	return error.message.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 48) || "limit";
+}
+
+/** The `~private` notice for a long refusal: what happened, until when, and how to report it. */
+function tripNotice(error: ProtocolError, trigger: string, retrySeconds: number, now: number): string {
+	const until = new Date(now + retrySeconds * 1_000);
+	const when = retrySeconds >= 86_400 ? "until tomorrow" : `until about ${until.toISOString().slice(11, 16)} UTC`;
+	const explanation = TRIP_EXPLANATIONS[trigger] ?? "You reached a limit that does not reset right away.";
+	return `**${error.message}.** ${explanation} This lasts ${when}.\n\nIf this looks wrong, please report it to an admin with the code \`${trigger}\` and the time ${new Date(now).toISOString().slice(0, 16).replace("T", " ")} UTC.`;
+}
+
+/**
  * Who the event running now acts for (Store.actor): a frame, close or
  * request runs inside `ACTOR.run`, so an overrun in its storage work is
  * logged with its user and address (Store.noteOverrun). The server's own
@@ -1725,6 +1759,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private announcedTier?: { tier: ServerTier; breakers: string[] };
 	/** When the tier was last evaluated (maybeEvaluateTier). */
 	private tierCheckedAt = 0;
+	/** When each connection or address was last told of each trip trigger (claimTrip); in memory only. */
+	private readonly trips = new Map<string, number>();
 	private alarmTail: Promise<void> = Promise.resolve();
 	private alarmFailures = 0;
 	private alarmKnown = false;
@@ -1963,6 +1999,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 			this.store.reserveConnection({ ipKey, now: nowMs() });
 		} catch (error) {
+			// A long refusal of a connection is a trip too; with no socket yet, it is only counted.
+			const protocol = errorToProtocol(error);
+			const retry = protocol.data?.retry_after;
+			if (!status && protocol.name === "retry_after" && typeof retry === "number" && retry >= LONG_THROTTLE_SECONDS) {
+				const trigger = tripTrigger(protocol);
+				if (this.claimTrip(`ip:${ipKey}`, trigger, nowMs())) this.recordTrip(trigger, nowMs(), { method: "connect", retryAfter: retry });
+			}
 			return this.storeResponseError(error);
 		}
 		return undefined;
@@ -2401,6 +2444,48 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private fail(socket: WebSocketConnection, request: RequestFrame | null, error: ProtocolError): void {
 		if (request && request.id === undefined) return;
 		this.send(socket, protocolError(request?.id, error));
+		const retry = error.data?.retry_after;
+		if (error.name === "retry_after" && typeof retry === "number" && retry >= LONG_THROTTLE_SECONDS) this.noteTrip(socket, request, error, retry);
+	}
+
+	/**
+	 * A user ran into a long refusal (LONG_THROTTLE_SECONDS or more): tells
+	 * them once an hour per trigger on this connection, in a `~private`
+	 * notice saying what happened and how to report it, and logs and counts
+	 * it then (`throttle_tripped`, the `throttle` metric, and
+	 * Store.noteThrottleTrip for `/status`). Repeats within the hour are
+	 * refused as usual, unannounced and uncounted, so a client retrying in a
+	 * loop costs no more than one.
+	 */
+	private noteTrip(socket: WebSocketConnection, request: RequestFrame | null, error: ProtocolError, retrySeconds: number): void {
+		const attachment = connectionAttachment(socket);
+		if (!attachment) return;
+		const now = nowMs();
+		const trigger = tripTrigger(error);
+		if (!this.claimTrip(`conn:${attachment.connId}`, trigger, now)) return;
+		const roomId = typeof request?.params?.room_id === "string" && request.params.room_id ? request.params.room_id : ROOM_ID;
+		this.sendNotice(socket, roomId, tripNotice(error, trigger, retrySeconds, now));
+		this.recordTrip(trigger, now, { method: request?.method, user: attachment.userId, retryAfter: retrySeconds });
+	}
+
+	/** Whether `key` has not been told of `trigger` within TRIP_NOTICE_MS, claiming it if so. */
+	private claimTrip(key: string, trigger: string, now: number): boolean {
+		const seen = `${key} ${trigger}`;
+		const last = this.trips.get(seen);
+		if (last !== undefined && now - last < TRIP_NOTICE_MS) return false;
+		if (this.trips.size >= 4_096) {
+			for (const [entry, at] of this.trips) if (now - at >= TRIP_NOTICE_MS) this.trips.delete(entry);
+			if (this.trips.size >= 4_096) this.trips.clear();
+		}
+		this.trips.set(seen, now);
+		return true;
+	}
+
+	/** Logs and counts one trip; neither ever throws. */
+	private recordTrip(trigger: string, now: number, details: { method?: string; user?: string; retryAfter: number }): void {
+		console.warn(JSON.stringify({ event: "throttle_tripped", trigger, ...details }));
+		recordMetric(this.runtimeEnv.METRICS, "throttle", [trigger, details.method ?? ""], 1);
+		try { this.store.noteThrottleTrip(trigger, now); } catch { /* the log and metric still hold it */ }
 	}
 
 	private closePolicy(socket: WebSocketConnection, attachment: ConnectionAttachment, code: number, reason: string): void {
@@ -6868,6 +6953,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (this.store.accountingStatus(now).uncertain) lines.push("- **Storage failing**: a budget write failed; work is refused until one succeeds");
 		for (const [operation, until] of Object.entries(guard.breakers)) lines.push(`- **Paused action** \`${operation}\` until ${utc(until)}: it overran its storage reservation 3 times within an hour`);
 		lines.push(`- Storage overruns today: ${guard.overruns} (each charged and logged)`);
+		const trips = this.store.throttleTrips(now);
+		lines.push(`- Throttles tripped in the last 24 hours: ${trips.length ? trips.map(([trigger, times]) => `\`${trigger}\` ${times}`).join(", ") : "none"}`);
 		if (this.config.admissionOff) lines.push("- `ADMISSION_OFF` is set: new connections are refused");
 		lines.push("");
 		const usage = this.accountUsage.snapshot;

@@ -21,7 +21,9 @@ export type MetricEvent =
 	/** The edge stop turned on (`guard` or `flood`, and what was reached) or off (`lifted`). */
 	| "edge_stop"
 	/** The server changed tier (Store tiers, ApronDemoServer.evaluateTier): the new tier and the one before. */
-	| "tier";
+	| "tier"
+	/** A user tripped a long refusal (ApronDemoServer.noteTrip): its trigger and the method refused. */
+	| "throttle";
 
 export function recordMetric(dataset: AnalyticsEngineDataset | undefined, event: MetricEvent, details: readonly string[] = [], value = 1): void {
 	if (!dataset) return;

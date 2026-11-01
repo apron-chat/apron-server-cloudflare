@@ -939,6 +939,10 @@ export const SERVER_PAUSED = "server_paused";
  * the server pause's end.
  */
 const META_ACCOUNTING_GUARD = "accounting_guard";
+/** Throttle trips by trigger in hourly buckets over the last TRIP_WINDOW_MS (noteThrottleTrip). */
+const META_THROTTLE_TRIPS = "throttle_trips";
+/** How far back `/status` counts throttle trips (throttleTrips). */
+export const TRIP_WINDOW_MS = 24 * 60 * 60 * 1000;
 /** The server tier the runtime last announced to the admins (announcedTier). */
 const META_ANNOUNCED_TIER = "announced_tier";
 /** Overruns of one operation within BREAKER_WINDOW_MS that open its breaker. */
@@ -3122,6 +3126,53 @@ export class Store {
       retryAfterMs: Math.max(1_000, 86_400_000 - (now % 86_400_000)),
       data: { reason: DEGRADED },
     });
+  }
+
+  /**
+   * Counts one throttle trip (a long refusal a user ran into, told to them
+   * once: ApronDemoServer.noteTrip) under `trigger`, in hourly buckets kept
+   * for TRIP_WINDOW_MS. Charged but never refused: counting a refusal must
+   * not itself be refused.
+   */
+  noteThrottleTrip(trigger: string, now = this.clock.now()): void {
+    this.ensureReady();
+    this.alert(() => this.reserved({ reads: 4, writes: 4 }, false, now, () => {
+      const buckets = this.tripBuckets(now);
+      const hour = String(Math.floor(now / 3_600_000) * 3_600_000);
+      const bucket = buckets[hour] ??= {};
+      // Bounded: a trigger is a reason or a short slug, and the window is a day of hours.
+      if (bucket[trigger] !== undefined || Object.keys(bucket).length < 64) bucket[trigger] = (bucket[trigger] ?? 0) + 1;
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_THROTTLE_TRIPS, JSON.stringify(buckets));
+    }, true));
+  }
+
+  /** Throttle trips by trigger over the last TRIP_WINDOW_MS (noteThrottleTrip), most first. */
+  throttleTrips(now = this.clock.now()): Array<[trigger: string, count: number]> {
+    this.ensureReady();
+    return this.alert(() => this.reserved({ reads: 4 }, false, now, () => {
+      const totals = new Map<string, number>();
+      for (const bucket of Object.values(this.tripBuckets(now))) {
+        for (const [trigger, count] of Object.entries(bucket)) totals.set(trigger, (totals.get(trigger) ?? 0) + count);
+      }
+      return [...totals].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    }, true));
+  }
+
+  /** The stored trip buckets still inside the window. */
+  private tripBuckets(now: number): Record<string, Record<string, number>> {
+    const kept: Record<string, Record<string, number>> = {};
+    try {
+      const stored = JSON.parse(this.metaValue(META_THROTTLE_TRIPS) || "{}") as Record<string, Record<string, unknown>>;
+      for (const [hour, bucket] of Object.entries(stored)) {
+        if (Number(hour) <= now - TRIP_WINDOW_MS || !bucket || typeof bucket !== "object") continue;
+        const counts: Record<string, number> = {};
+        for (const [trigger, count] of Object.entries(bucket)) if (Number.isSafeInteger(count) && (count as number) > 0) counts[trigger] = count as number;
+        kept[hour] = counts;
+      }
+    } catch {
+      // An unreadable record starts the window afresh.
+    }
+    return kept;
   }
 
   /** The server tier last announced to the admins (the runtime's record), or "" before any. */

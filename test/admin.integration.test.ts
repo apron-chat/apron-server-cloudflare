@@ -153,6 +153,7 @@ it('/status leads with the server state, then the Cloudflare usage and the demo 
 		expect(status.notice!.params.body.format).toBe('markdown');
 		// Why the server refuses work comes first: here, nothing.
 		expect(text).toMatch(/^\*\*State: open\*\*\n- Storage overruns today: 0 \(each charged and logged\)/);
+		expect(text).toMatch(/^- Throttles tripped in the last 24 hours: (none|.+)$/m);
 		// Tests configure no account analytics, so only the object's budgets show.
 		expect(text).toContain('no usage sample');
 		// Lists, not GFM tables, so strict CommonMark clients render it.
