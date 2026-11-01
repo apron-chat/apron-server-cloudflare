@@ -6,8 +6,9 @@ import { mediaHostname, relyingPartyId, renderBinding, renderEdgeRules, replaceB
 const namespaces = { attempts: '123', prefix: '124', location: '125' };
 
 test('changed admission limits propagate to both Worker and optional edge policy', () => {
-	const changed = { ...ADMISSION_BUDGET, requestsPerIpMinute: 25, edgeRequestsPerIpWindow: 20 };
-	assert.match(renderBinding(namespaces, changed), /limit = 25, period = 60/);
+	const requests = ADMISSION_BUDGET.requestsPerIpMinute + 5;
+	const changed = { ...ADMISSION_BUDGET, requestsPerIpMinute: requests, edgeRequestsPerIpWindow: 20 };
+	assert.match(renderBinding(namespaces, changed), new RegExp(`limit = ${requests}, period = 60`));
 	const edge = renderEdgeRules('chat.example.test', changed);
 	assert.equal(edge.optionalZoneRateLimit.rules[0].ratelimit.requests_per_period, 20);
 	assert.equal(edge.optionalZoneRateLimit.rules[0].enabled, false);

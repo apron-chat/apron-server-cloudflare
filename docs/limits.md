@@ -60,11 +60,11 @@ A limit can reach a client in four ways:
 
 | Status | `error` | Limit | Retry-After | Usual cause |
 | ---: | --- | --- | ---: | --- |
-| 429 | Connection attempts exceeded | 20 upgrade attempts a minute per address (IPv6 grouped by /56), 60 per IPv6 /48 | 60 | A reconnect loop without backoff. Probes and refused attempts count too. |
-| 503 | Demo is busy; try again shortly | 200 attempts a minute from everyone at one Cloudflare location | 60 | Other clients, or many of yours, near the same location. |
+| 429 | Connection attempts exceeded | 60 upgrade attempts a minute per address (IPv6 grouped by /56), 180 per IPv6 /48 | 60 | A reconnect loop without backoff. Probes and refused attempts count too. |
+| 503 | Demo is busy; try again shortly | 1,000 attempts a minute from everyone at one Cloudflare location | 60 | Other clients, or many of yours, near the same location. |
 | 429 | Demo capacity reached (with `Apron-Server-Full: 1`) | 500 open sockets on the server | 120 to 300, at random | The server is full. The entry Worker then refuses by itself for 30 seconds, so retries cost the server nothing; wait the `Retry-After` before retrying. |
-| 429 | Demo capacity reached | 10 open sockets per address; 6 per address that are not signed in to an account (guests and sockets still authenticating) | 60 | Sockets left open: extra tabs, hot reload, reconnect that never closes the old socket. |
-| 429 | Connection admission limit reached | 12 admitted connections a minute per address; 100,000 a day on the server | the bucket's wait, or until the next day | Reconnecting on every error or page view. A passkey sign-in on a fresh page uses up to three admissions (guest, sign-in, signed-in reconnect). |
+| 429 | Demo capacity reached | 32 open sockets per address; 24 per address that are not signed in to an account (guests and sockets still authenticating) | 60 | Sockets left open: extra tabs, hot reload, reconnect that never closes the old socket. |
+| 429 | Connection admission limit reached | 30 admitted connections a minute per address; 300,000 a day on the server | the bucket's wait, or until UTC midnight | Reconnecting on every error or page view. A passkey sign-in on a fresh page uses up to three admissions (guest, sign-in, signed-in reconnect). |
 | 429 | Daily demo capacity reached / Daily frame budget exhausted | The server's daily SQL or frame budget | until the next day | The whole demo is used up for the day. |
 | 503 | Demo account capacity reached | The Cloudflare account's usage stop | 300 | Same; the operator's account passed its bill cap. |
 | 503 | Server paused: unusual traffic; try later (with `Apron-Server-Paused`) | The attack pause | the hold left, up to 4 hours (5 minutes at most when the entry Worker answers for it) | Not your client: a flood of traffic. Open sockets close with 1013 and the same reason. |
@@ -91,10 +91,10 @@ still holds a slot until it goes stale; see
 | 1008 | Removed by an admin; Device token replaced…; Bot token replaced…; Signed out after a week without signing in or posting | Account changes | Do not reconnect with the same credentials in a loop. |
 | 1009 | Frame exceeds the maximum size | A frame over 16,384 UTF-8 bytes | Check sizes before sending. |
 | 1011 | Delivery failed / Delivery interrupted; reconnect to recover | The server could not deliver to the socket | Reconnect with backoff, then fetch history to catch up. |
-| 1013 | Frame rate limit reached | More than 120 frames a minute from your address, all connections together. Each connection reserves frames 10 at a time, so many short-lived connections spend this fast | Back off; fewer connections. |
+| 1013 | Frame rate limit reached | More than 480 frames a minute from your address, all connections together. Each connection reserves frames 10 at a time, so many short-lived connections spend this fast | Back off; fewer connections. |
 | 1013 | Demo account capacity reached; try later | The Cloudflare account's usage reached its stop line | Back off for minutes, not seconds. |
 | 1013 | Server paused: unusual traffic; try later | The attack pause | Back off for half an hour or more. |
-| 4000 | Idle guest connection closed to make room; reconnect when you're back | A guest connection with no frame (pings aside) for 10 minutes, closed when the full server needs its slot | Reconnect when the user returns to the tab, not at once. |
+| 4000 | Idle guest connection closed to make room; reconnect when you're back | A guest connection whose client sent `status` `idle` 10 minutes or more ago, with no frame since, closed when the full server needs its slot (never twice in 10 minutes for the same address's newcomer) | Reconnect when the user returns to the tab, not at once. |
 
 ### Liveness and stale connections
 

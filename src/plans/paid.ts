@@ -9,12 +9,12 @@
 // stops the server on the estimated overage in dollars. Worst cases at these
 // values, per UTC day, priced as if the month's inclusions were spent:
 //
-// - SQL rows written: the application's own ceiling, 3.1 million, $3.10.
+// - SQL rows written: the application's own ceiling, 10.5 million, $10.50.
 //   Posts, frames, and admissions all charge it and fail closed at it.
-// - SQL rows read: 105 million, about $0.11.
-// - Durable Object requests: about 200,000, from 2 million frames at 20
-//   incoming WebSocket messages a request and 100,000 admissions: about
-//   $0.03. Pings are answered by the runtime and not billed. Rejected connection
+// - SQL rows read: 120 million, about $0.12.
+// - Durable Object requests: about 600,000, from 6 million frames at 20
+//   incoming WebSocket messages a request and 300,000 admissions: about
+//   $0.09. Pings are answered by the runtime and not billed. Rejected connection
 //   attempts also reach the object, at most `objectRequestsPerLocationMinute`
 //   a minute from each location; the attack pause weighs the rest.
 // - Durable Object duration: one object awake all day is 10,800 GB-s, about
@@ -26,7 +26,8 @@
 //   included. Cleanup runs daily; it removes the same rows a day as hourly
 //   would, in batches that continue until it is caught up.
 //
-// That is about $3.40 a day in all, under the daily cap's $5.
+// That is about $11 a day in all, and the daily cap stops the server at $5
+// first; early in a month the inclusions cover it (50 million rows written).
 //
 // None of that bounds hostile traffic that never gets past the entry Worker,
 // which is billed per request. An edge block rule stops requests before they
@@ -74,9 +75,11 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// About 2 KB an identity with its passkey: 100 MB at the cap. Dormant
 		// accounts are pruned (cleanup), so the cap is not spent for good.
 		registeredIdentityCount: 50_000,
-		// Every slot is room for one limiter's counters; a busy day has tens of
-		// thousands of addresses and users.
-		limiterRecordCap: 50_000,
+		// Every slot is room for one limiter's counters. A new address takes
+		// four (admission, frames, auth, history), so this is about 125,000
+		// addresses in a day: past it, a new address cannot connect until
+		// cleanup. About 75 MB at the cap, well under the database watermarks.
+		limiterRecordCap: 500_000,
 		// The memory bound: each open connection may queue
 		// pendingBytesPerConnection of incoming frames, and all of them
 		// together at most MAX_SOCKET_QUEUE_ALLOCATION (32 MiB): 500 at 64 KiB.
@@ -90,46 +93,56 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// them without waking the object, which is not billed, and a dead
 		// socket is found (freeing its slot, its user shown offline and pushed
 		// again) within 150 seconds, well inside Cloudflare's idle timeout.
-		// Room for two browsers on one address, such as a second account in a
-		// private window: each has a guest connection while signed out, a
-		// sign-in opens one more beside it, and a reload's replacement is
-		// unauthenticated until it resumes. Free's 2 refused the second
-		// browser's sign-in. These are fairness limits; openConnections and
-		// the daily admissions below bound what they can spend.
-		anonymousConnectionsPerIp: 6,
+		// Room for an office or a campus behind one address: twenty-odd people
+		// opening a shared link together, each a guest until they sign in.
+		// These are fairness limits; openConnections and the daily admissions
+		// below bound what they can spend.
+		anonymousConnectionsPerIp: 24,
+		connectionsPerIp: 32,
 		// A sign-in costs three admissions (guest, sign-in connection, the
-		// signed-in reconnect), so Free's 5 a minute ran out on two browsers.
-		connectionAdmissionsPerIpMinute: 12,
-		// A front-page day: 40,000 visitors, two or three connections each.
-		connectionAdmissionsPerDay: 100_000,
-		processedFramesPerDay: 2_000_000,
+		// signed-in reconnect): ten people signing in at once from one address.
+		connectionAdmissionsPerIpMinute: 30,
+		// Each connection's first frame leases 10, so this is a few dozen
+		// connections from one address starting in the same minute.
+		framesPerIpMinute: 480,
+		// A front-page day: 40,000 visitors, two or three connections each,
+		// with room for reconnects after deploys and evictions.
+		connectionAdmissionsPerDay: 300_000,
+		// Every connection that sends a frame leases 10, so admissions alone
+		// can spend 3 million.
+		processedFramesPerDay: 6_000_000,
 		// A busy minute with the server full, or a deploy's reconnect wave: 500
 		// connections, a few frames each.
 		globalFramesPerMinute: 5_000,
 		// The calibrated ceiling; members cost only reads.
 		roomListMembers: 200,
-		// Past the month's inclusion a day at these costs $3.10 in writes,
-		// about $3.40 in all: the daily bill cap ($5) still bounds the worst day.
-		sqlWritesPerDay: 3_100_000,
-		sqlReadsPerDay: 105_000_000,
-		foregroundWritesPerDay: 3_000_000,
-		maintenanceWritesPerDay: 100_000,
+		// A guest visit from a new address writes about 30 rows and a repeat
+		// one about 15, so a front-page day's connections alone write about 2
+		// million; these leave room for the day's chat. Early in a month these
+		// cost nothing (50 million rows written are included); a day at them
+		// once the month's inclusions are spent would cost about $11, and the
+		// daily bill cap stops the server at $5 first.
+		sqlWritesPerDay: 10_500_000,
+		sqlReadsPerDay: 120_000_000,
+		foregroundWritesPerDay: 9_000_000,
+		// Cleanup deletes a day's limiter rows (two writes each) besides presence
+		// (about 52,000) and retention.
+		maintenanceWritesPerDay: 1_500_000,
 		foregroundReadsPerDay: 100_000_000,
-		maintenanceReadsPerDay: 5_000_000,
+		maintenanceReadsPerDay: 20_000_000,
 		databaseHighWaterBytes: 768 * 1024 * 1024,
 		databaseHardTargetBytes: 1024 * 1024 * 1024,
 		databaseResumeLowWaterBytes: 640 * 1024 * 1024,
 	}),
-	// The attempt limiters still guard Durable Object requests, which Paid
-	// includes fewer of than Free, so only the per-address ones move: enough
-	// over the 12 admissions for a refused upgrade's status probe and retry.
-	// One address at its limit all day is 28,800 Durable Object requests,
-	// still under the per-location limit that bounds them.
+	// The attempt limiters still guard Durable Object requests: enough over
+	// the 30 admissions for refused upgrades' status probes and retries. One
+	// address at its limit all day is 86,400 Durable Object requests, still
+	// under the per-location limit that bounds them.
 	admission: Object.freeze({
 		...FREE_PLAN.admission,
-		requestsPerIpMinute: 20,
+		requestsPerIpMinute: 60,
 		// Three busy /56s' worth, as on Free.
-		requestsPerIpv6PrefixMinute: 60,
+		requestsPerIpv6PrefixMinute: 180,
 		// Twice a full reconnect of the 500 open connections, as on Free.
 		objectRequestsPerLocationMinute: 1_000,
 	}),

@@ -657,8 +657,9 @@ it('limits the frames the whole server processes in a minute without closing soc
 	await configure((config) => { config.limits.globalFramesPerMinute = 4; });
 	const peer = await connect();
 	try {
+		// `auth` is exempt: a connection must be able to sign in before its deadline.
 		await authenticate(peer);
-		for (let index = 0; index < 3; index += 1) {
+		for (let index = 0; index < 4; index += 1) {
 			expect((await request(peer, `sync-${index}`, 'me', {})).result.you).toBeTruthy();
 		}
 		const busy = (await request(peer, 'busy', 'me', {})).error;

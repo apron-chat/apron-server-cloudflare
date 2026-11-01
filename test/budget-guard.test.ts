@@ -123,6 +123,13 @@ describe("budget guard", () => {
 		expect(await setAttackStop(env, until, "flood", now, bare.fetcher)).toBe("changed");
 		expect(bare.updates).toEqual([expect.objectContaining({ description: "[attack hold until 2026-11-02T12:30:00.000Z]" })]);
 		expect(ruleHoldUntil("[attack hold until 2026-11-02T12:30:00.000Z] ")).toBe(until);
+		// With analytics failing, a passed hold is still lifted; one not yet passed is kept.
+		const unreadable = api({ rules: [held], analyticsStatus: 500 });
+		expect(await runBudgetGuard(env, until - 1, unreadable.fetcher)).toEqual({ outcome: "usage_failed" });
+		expect(unreadable.updates).toEqual([]);
+		const passed = api({ rules: [held], analyticsStatus: 500 });
+		expect(await runBudgetGuard(env, until, passed.fetcher)).toMatchObject({ outcome: "changed", stop: false });
+		expect(passed.updates).toEqual([expect.objectContaining({ enabled: false, description: rule.description })]);
 		// ATTACK_PAUSE=false lifts it at once, hold or not.
 		const off = api({ rules: [held] });
 		expect(await runBudgetGuard({ ...env, ATTACK_PAUSE: "false" }, until - 60_000, off.fetcher)).toMatchObject({ outcome: "changed", stop: false });
@@ -135,9 +142,11 @@ describe("budget guard", () => {
 	});
 
 	it("keeps the rule's state when usage cannot be read, and never touches another rule", async () => {
-		const { fetcher, calls } = api({ enabled: true, analyticsStatus: 500 });
+		const { fetcher, calls, updates } = api({ enabled: true, analyticsStatus: 500 });
 		expect(await runBudgetGuard(env, Date.now(), fetcher)).toEqual({ outcome: "usage_failed" });
-		expect(calls).toHaveLength(1);
+		// It reads the rule (for a passed attack hold), but changes nothing.
+		expect(calls).toHaveLength(2);
+		expect(updates).toEqual([]);
 		const missing = api({ workerRequests: overDaily, rules: [] });
 		expect(await runBudgetGuard(env, Date.now(), missing.fetcher)).toEqual({ outcome: "rule_missing" });
 		expect(missing.updates).toEqual([]);

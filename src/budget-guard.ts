@@ -155,6 +155,17 @@ export async function runBudgetGuard(env: BudgetGuardEnvironment, now = Date.now
 		exceeded = snapshotReasons(await fetchAccountUsage(env, now, undefined, fetcher));
 	} catch (error) {
 		log("budget_guard_usage_failed", { message: message(error) }, "error");
+		// An attack pause whose hold has passed is lifted even so: otherwise an
+		// analytics outage would keep the server blocked for as long as it lasts.
+		// A stop the bill cap set carries no hold mark and stays as it is.
+		try {
+			const { rule } = await readStopRule({ ...env, ZONE_ID, EDGE_STOP_TOKEN }, fetcher);
+			const held = rule ? ruleHoldUntil(rule.description) : 0;
+			if (rule && ruleEnabled(rule) && held && held <= now) {
+				const outcome = await setEdgeStop({ ...env, ZONE_ID, EDGE_STOP_TOKEN }, false, ["attack hold passed"], now, fetcher);
+				if (outcome === "changed") return { outcome, stop: false, exceeded: [] };
+			}
+		} catch { /* the rule keeps its state */ }
 		return { outcome: "usage_failed" };
 	}
 	const stop = exceeded.length > 0;

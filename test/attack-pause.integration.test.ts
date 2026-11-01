@@ -93,19 +93,15 @@ it('keeps admitted heavy traffic open, telling the admins once an hour', async (
 	peer.socket.close();
 });
 
-it('pauses when breakers are open on three actions, once for the same ones', async () => {
+it('never pauses the server for breakers, however many are open: each refuses only its own action', async () => {
 	const stub = env.DEMO.getByName('attack-pause-breakers');
 	await runInDurableObject(stub, (instance) => {
 		const runtime = instance as unknown as Runtime;
 		vi.spyOn(runtime, 'notifyAdmins').mockImplementation(async () => {});
 		const until = Date.now() + BREAKER_MS;
-		vi.spyOn(runtime.store, 'accountingGuard').mockReturnValue({ day: '', overruns: 3, breakers: { a: until, b: until, c: until } } as never);
+		vi.spyOn(runtime.store, 'accountingGuard').mockReturnValue({ day: '', overruns: 9, breakers: { a: until, b: until, c: until, d: until } } as never);
 		runtime.evaluateTier(Date.now());
-		expect(runtime.attackPauseRecord).toMatchObject({ trigger: 'breakers', count: 1 });
-		// The hold passes with the same three still open: no second pause.
-		runtime.attackPauseRecord = { ...runtime.attackPauseRecord!, until: Date.now() - 1 };
-		runtime.evaluateTier(Date.now());
-		expect(runtime.attackPauseRecord).toMatchObject({ count: 1 });
+		expect(runtime.attackPauseRecord ?? null).toBeNull();
 	});
 });
 
@@ -146,21 +142,4 @@ it('with ATTACK_PAUSE=false, only tells the admins, and a pause in force ends', 
 	const closed = await Promise.race([peer.closed, new Promise((resolve) => setTimeout(() => resolve('open'), 100))]);
 	expect(closed).toBe('open');
 	peer.socket.close();
-});
-
-it('never pauses twice for the same open breakers, across a later pause or a new day', async () => {
-	const stub = env.DEMO.getByName('attack-pause-breakers-carry');
-	await runInDurableObject(stub, (instance) => {
-		const runtime = instance as unknown as Runtime;
-		vi.spyOn(runtime, 'notifyAdmins').mockImplementation(async () => {});
-		const until = Date.now() + BREAKER_MS;
-		vi.spyOn(runtime.store, 'accountingGuard').mockReturnValue({ day: '', overruns: 3, breakers: { a: until, b: until, c: until } } as never);
-		runtime.evaluateTier(Date.now());
-		expect(runtime.attackPauseRecord).toMatchObject({ trigger: 'breakers', count: 1 });
-		// A burn pause in between, then a new UTC day: the same three breakers stay known.
-		(runtime as unknown as { pauseForAttack(trigger: string, summary: string, now: number): void }).pauseForAttack('burn', 'test', Date.now());
-		runtime.attackPauseRecord = { ...runtime.attackPauseRecord!, until: Date.now() - 1, day: '2000-01-01' } as never;
-		runtime.evaluateTier(Date.now());
-		expect(runtime.attackPauseRecord).toMatchObject({ trigger: 'burn' });
-	});
 });

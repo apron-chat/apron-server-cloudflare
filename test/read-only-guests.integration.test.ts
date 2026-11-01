@@ -282,6 +282,8 @@ it('makes room on a full server by closing the guest idle longest, never a regis
 	try {
 		await greeting(idle);
 		await request(idle, 'auth', 'auth', { scheme: 'guest' });
+		// Its client says nobody attends it: a tab in the background.
+		expect((await request(idle, 'idle', 'status', { idle: 60 })).result).toEqual({});
 		const closed = new Promise<{ code: number; reason: string }>((resolve) => idle.socket.addEventListener('close', (event) => resolve({ code: event.code, reason: event.reason })));
 		const evicted = await runInDurableObject(stub(), (instance, state) => {
 			const runtime = instance as unknown as { evictIdleGuest(sockets: WebSocket[], now: number): boolean };
@@ -302,6 +304,7 @@ it('evicts an idle guest only for an upgrade that passes every check, never for 
 	try {
 		await greeting(idle);
 		await request(idle, 'auth', 'auth', { scheme: 'guest' });
+		expect((await request(idle, 'idle', 'status', { idle: 60 })).result).toEqual({});
 		let closedWith: number | undefined;
 		idle.socket.addEventListener('close', (event) => { closedWith = event.code; });
 		await runInDurableObject(stub(), (instance, state) => {
@@ -323,4 +326,32 @@ it('evicts an idle guest only for an upgrade that passes every check, never for 
 		});
 		await vi.waitFor(() => expect(closedWith).toBe(4000));
 	} finally { idle.close(); }
+});
+
+it('never evicts a guest who is reading (no `idle`), and an evicted address does not evict in turn', async () => {
+	const reader = await connect();
+	const idle = await connect();
+	try {
+		await greeting(reader);
+		await request(reader, 'auth', 'auth', { scheme: 'guest' });
+		await greeting(idle);
+		await request(idle, 'auth', 'auth', { scheme: 'guest' });
+		expect((await request(idle, 'idle', 'status', { idle: 60 })).result).toEqual({});
+		await runInDurableObject(stub(), (instance, state) => {
+			const runtime = instance as unknown as {
+				idlestGuest(sockets: WebSocket[], now: number): { state: { connId: string } } | undefined;
+				closeIdleGuest(idle: unknown): void;
+				recentlyEvicted(ipKey: string, now: number): boolean;
+			};
+			const later = Date.now() + 60 * 60_000;
+			const found = runtime.idlestGuest(state.getWebSockets(), later);
+			const readerId = (state.getWebSockets().map((socket) => socket.deserializeAttachment() as { connId: string; idle?: boolean }).find((attachment) => !attachment.idle))?.connId;
+			// Silent for an hour, but its client never said idle: the reader is not a candidate.
+			expect(found?.state.connId).not.toBe(readerId);
+			const ipKey = (found!.state as unknown as { ipKey: string }).ipKey;
+			runtime.closeIdleGuest(found);
+			expect(runtime.recentlyEvicted(ipKey, Date.now())).toBe(true);
+			expect(runtime.recentlyEvicted(ipKey, Date.now() + 11 * 60_000)).toBe(false);
+		});
+	} finally { reader.close(); idle.close(); }
 });

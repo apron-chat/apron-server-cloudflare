@@ -729,7 +729,7 @@ and each lifting by itself (`src/store.ts`, `ApronDemoServer.currentTier`):
 | degraded | Today's foreground SQL reads or writes, or frames, at `DEGRADE_SHARE` (70%) of their ceiling | Live text, uploads and older history (`history` with `before`) get `retry_after` (`data.reason` `degraded`); chat works | UTC midnight |
 | exhausted | One of those at 99% (`EXHAUSTED_SHARE`; the ledger refuses work just short of 100%) | New work is refused with `retry_after` until the reset; open connections stay; admins' frames and `/status` still answer | UTC midnight |
 | account stop | The estimated overage past `BILL_CAP_DAY` ($5) today or `BILL_CAP_MONTH` ($25) this month (the account-usage stop; on Free, 90% of a daily allowance) | 503 and sockets closed once, as it starts | The day's or month's end |
-| paused (attack) | The attack pause (below): traffic burning $1 an hour or more and mostly refused, or breakers open on three actions | Everything refused with 503, every socket closed (admins' too), and the edge stop turned on for the hold | When the hold ends: 30 minutes, doubling with each pause that UTC day, at most 4 hours; at once with `ATTACK_PAUSE=false` |
+| paused (attack) | The attack pause (below): traffic burning $1 an hour or more and mostly refused | Everything refused with 503, every socket closed (admins' too), and the edge stop turned on for the hold | When the hold ends: 30 minutes, doubling with each pause that UTC day, at most 4 hours; at once with `ATTACK_PAUSE=false` |
 
 Every change of tier is announced to the admins (see the admin alert above),
 going up and coming down, with why. It is evaluated at most once a minute on
@@ -754,10 +754,10 @@ out, since the app's ceilings bound them. Over a rolling 10 minutes:
 - $1 an hour or more mostly admitted is a busy day, not an attack: the
   admins are told (at most once an hour, `burn` metric) and the server
   stays open; the bill cap bounds what it costs.
-- Breakers open on three actions at once (one of them new since the last
-  such pause) mean something systematic: the server pauses.
+- Breakers never pause the server, however many are open: each refuses
+  only its own action, and each is announced.
 
-For scale, a deploy's reconnect wave or a front-page peak (2,300 sockets,
+For scale, a deploy's reconnect wave or a front-page peak (500 sockets,
 a few thousand frames a minute) burns a few cents an hour; $1 an hour is
 about 30,000 refused requests a minute. The pause closes every
 connection, refuses every request with 503 and a `Retry-After` of the
@@ -768,8 +768,8 @@ in epoch milliseconds), so each entry Worker isolate refuses by itself for
 up to 5 minutes at a time and a flood costs no object requests even if the
 edge stop fails; the admins are told when it could not be turned on. The
 first pause in a UTC day holds 30 minutes, and each later one twice as long
-as the one before, at most 4 hours. Breakers already paused for never
-pause the server again while they stay open. It is logged
+as the one before, at most 4 hours. Should analytics fail, the guard still
+lifts an edge stop whose attack hold has passed. It is logged
 (`attack_paused`), counted (`attack` metric) and announced as the `paused`
 tier; a wake stays paused. The meter itself is in memory, so it starts
 empty after a wake.
@@ -783,19 +783,29 @@ its next run whatever hold it carries. The bill cap still applies.
 40,000 visitors, a tenth of them registering): 500 open connections (the
 memory bound: 64 KiB of incoming frames queued per connection, 8 small or 4
 of the largest, within 32 MiB; load-test the broadcast before raising it
-further), 100,000 admissions, 2 million frames (5,000 a minute), 400,000
-history pages, 5,000 registrations (20 per
-address), 50,000 accounts, 600 posts a minute and 60,000 a day, and 3
-million foreground rows written. A day at every ceiling costs about $3.40
-past the month's inclusions, under the daily bill cap. Pings stay at 45
+further), 300,000 admissions, 6 million frames (5,000 a minute), 400,000
+history pages, 5,000 registrations (20 per address), 50,000 accounts, 600
+posts a minute and 60,000 a day, 9 million foreground rows written, and
+500,000 limiter rows (a new address takes four, so about 125,000 addresses
+a day). A guest visit writes about 30 rows from a new address and 15 from
+a known one, so a front-page day's connections write about 2 million.
+Early in a month these cost nothing; a day at every ceiling once the
+month's inclusions are spent would cost about $11, and the daily bill cap
+stops it at $5. Per address, for an office or campus behind one: 24 guest
+connections (32 in all), 30 admissions and 60 upgrade attempts a minute,
+and 480 frames a minute. The server-wide frame minute exempts `auth`, so a
+reconnect wave signs in before its deadline. Daily refusals ask clients to
+wait until UTC midnight. Pings stay at 45
 seconds (150 to go stale): the runtime answers them without waking the
 object, which is not billed, and a dead socket must be found quickly, since
 it holds a slot, shows its user online, and keeps their mentions from
 being pushed until it goes stale. Guest visits cost less: a guest cannot scroll back (`before`
 alone), its history is charged to its address only, and a full server
-closes the guest idle longest (10 minutes without a frame, close code
-4000) to admit a newcomer, once that newcomer passes every other check
-(never for a status probe). Registered accounts nobody came back to are
+closes the guest whose client said nobody attends it (`status` `idle`) for
+10 minutes or more, with no frame since (close code 4000), to admit a
+newcomer that passes every other check: never for a status probe, never a
+guest who is reading, and never for an address whose own guest was evicted
+in the last 10 minutes, so evictions cannot cascade. Registered accounts nobody came back to are
 removed after 30 days (`Store.pruneDormantIdentities`, once a UTC day):
 signed up with a passkey and active only that first day by their recorded
 `seen`, with no role, chosen status, push subscription, upload or bot. An
@@ -979,17 +989,17 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `registeredIdentityCount` | 50000 | 10000 |
 | `authAttemptsPerIpMinute` | 10 |  |
 | `openConnections` | 500 | 100 |
-| `anonymousConnectionsPerIp` | 6 | 2 |
+| `anonymousConnectionsPerIp` | 24 | 2 |
 | `registeredConnectionsPerUser` | 3 |  |
-| `connectionsPerIp` | 10 |  |
-| `connectionAdmissionsPerIpMinute` | 12 | 5 |
-| `connectionAdmissionsPerDay` | 100000 | 2000 |
+| `connectionsPerIp` | 32 | 10 |
+| `connectionAdmissionsPerIpMinute` | 30 | 5 |
+| `connectionAdmissionsPerDay` | 300000 | 2000 |
 | `unauthenticatedTimeoutSeconds` | 30 |  |
 | `pendingFramesPerConnection` | 8 |  |
 | `pendingBytesPerConnection` | 65536 | 131072 |
 | `framesPerConnectionMinute` | 60 |  |
-| `framesPerIpMinute` | 120 |  |
-| `processedFramesPerDay` | 2000000 | 100000 |
+| `framesPerIpMinute` | 480 | 120 |
+| `processedFramesPerDay` | 6000000 | 100000 |
 | `repeatedPolicyViolations` | 3 |  |
 | `globalFramesPerMinute` | 5000 | 300 |
 | `activityBroadcastsPerUserMinute` | 10 |  |
@@ -1005,12 +1015,12 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `offlineGraceSeconds` | 60 |  |
 | `presenceAlarmSeconds` | 15 | 60 |
 | `guestPresenceAlarmSeconds` | 60 |  |
-| `sqlWritesPerDay` | 3100000 | 80000 |
-| `sqlReadsPerDay` | 105000000 | 3000000 |
-| `foregroundWritesPerDay` | 3000000 | 60000 |
-| `maintenanceWritesPerDay` | 100000 | 20000 |
+| `sqlWritesPerDay` | 10500000 | 80000 |
+| `sqlReadsPerDay` | 120000000 | 3000000 |
+| `foregroundWritesPerDay` | 9000000 | 60000 |
+| `maintenanceWritesPerDay` | 1500000 | 20000 |
 | `foregroundReadsPerDay` | 100000000 | 2500000 |
-| `maintenanceReadsPerDay` | 5000000 | 500000 |
+| `maintenanceReadsPerDay` | 20000000 | 500000 |
 | `databaseHighWaterBytes` | 805306368 | 100663296 |
 | `databaseHardTargetBytes` | 1073741824 | 134217728 |
 | `databaseResumeLowWaterBytes` | 671088640 | 83886080 |
@@ -1024,6 +1034,6 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `reactionUsersPerMessage` | 32 |  |
 | `reactionEmojisPerUser` | 8 |  |
 | `dedupTtlSeconds` | 86400 |  |
-| `limiterRecordCap` | 50000 | 10000 |
+| `limiterRecordCap` | 500000 | 10000 |
 | `maxCredentialBytes` | 16384 |  |
 | `maxChallengeBytes` | 16384 |  |

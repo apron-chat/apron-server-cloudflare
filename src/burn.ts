@@ -27,8 +27,6 @@ export const BURN_POLICY = Object.freeze({
 	/** The first pause; each later one in the same UTC day doubles it. */
 	firstHoldMs: 30 * 60_000,
 	maxHoldMs: 4 * 60 * 60_000,
-	/** Open breakers on this many operations at once pause the server. */
-	pauseBreakers: 3,
 	/** A high burn of mostly admitted traffic alerts the admins at most this often. */
 	alertEveryMs: 60 * 60_000,
 });

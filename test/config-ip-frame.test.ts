@@ -237,15 +237,20 @@ describe('configuration policy boundaries', () => {
 				expect(requests).toBeLessThan(daily.durableObjectRequests * ACCOUNT_USAGE_POLICY.stopRatio);
 				continue;
 			}
-			// A plan that bills past its inclusions keeps a day at every ceiling
-			// under the daily bill cap, even with the month's inclusions spent:
-			// SQL rows, object requests (each also an entry Worker request with
-			// its CPU) and one object awake all day.
+			// A plan that bills past its inclusions keeps a day at every ceiling,
+			// priced as if the month's inclusions were spent, under the month's
+			// bill cap; the day's cap stops such a day before it ends. Early in
+			// a month the inclusions cover it. SQL rows, object requests (each
+			// also an entry Worker request with its CPU) and one object awake
+			// all day.
 			const price = (field: 'sqlRowsWritten' | 'sqlRowsRead' | 'durableObjectRequests' | 'workerRequests' | 'workerCpuMs' | 'durableObjectDurationGbSeconds', used: number) => used * PRICES[field].usd / PRICES[field].unit;
 			const worstDay = price('sqlRowsWritten', plan.limits.sqlWritesPerDay) + price('sqlRowsRead', plan.limits.sqlReadsPerDay)
 				+ price('durableObjectRequests', requests) + price('workerRequests', plan.limits.connectionAdmissionsPerDay) + price('workerCpuMs', plan.limits.connectionAdmissionsPerDay * 2)
 				+ price('durableObjectDurationGbSeconds', 86_400 * 0.125);
-			expect(worstDay).toBeLessThan(cap.dayUsd);
+			expect(worstDay).toBeLessThan(cap.monthUsd);
+			// And a front-page day (about 2 million rows written by connections
+			// alone) fits the ceilings with room to spare.
+			expect(plan.limits.foregroundWritesPerDay).toBeGreaterThan(2 * 2_000_000);
 		}
 	});
 

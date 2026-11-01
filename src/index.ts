@@ -697,12 +697,11 @@ function utcMinute(ms: number): string {
 }
 
 /** Why the server paused (ApronDemoServer.pauseForAttack). */
-type AttackTrigger = "flood" | "burn" | "breakers";
+type AttackTrigger = "flood" | "burn";
 
 const ATTACK_TRIGGER_LABEL: Record<string, string> = {
 	flood: "A flood of refused requests",
 	burn: "Sustained costly traffic, mostly refused",
-	breakers: "Storage overruns on several actions",
 };
 
 const ATTACK_CLOSE_REASON = "Server paused: unusual traffic; try later";
@@ -718,8 +717,6 @@ interface AttackPause {
 	until: number;
 	trigger: string;
 	summary: string;
-	/** The breakers open when `trigger` is `breakers`, so the same ones do not pause again. */
-	breakers?: string[];
 }
 
 function parseAttackPause(raw: string): AttackPause | null {
@@ -727,10 +724,7 @@ function parseAttackPause(raw: string): AttackPause | null {
 	try {
 		const value = JSON.parse(raw) as Partial<AttackPause>;
 		if (typeof value.day !== "string" || typeof value.count !== "number" || typeof value.until !== "number" || typeof value.trigger !== "string") return null;
-		return {
-			day: value.day, count: value.count, until: value.until, trigger: value.trigger, summary: typeof value.summary === "string" ? value.summary : "",
-			...(Array.isArray(value.breakers) ? { breakers: value.breakers.filter((op): op is string => typeof op === "string") } : {}),
-		};
+		return { day: value.day, count: value.count, until: value.until, trigger: value.trigger, summary: typeof value.summary === "string" ? value.summary : "" };
 	} catch {
 		return null;
 	}
@@ -1910,6 +1904,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private burnAlertedAt = -Infinity;
 	/** The latest attack pause (pauseForAttack), once read: undefined before, null with none. */
 	private attackPauseRecord?: AttackPause | null;
+	/** Addresses whose idle guest was evicted (closeIdleGuest), and when; in memory only. */
+	private readonly evicted = new Map<string, number>();
 	/** When the next dormant-account prune may run (pruneDormant): daily, or at the next full alarm while more remain. */
 	private dormantPruneAt = 0;
 	private alarmTail: Promise<void> = Promise.resolve();
@@ -2160,7 +2156,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// A full server may make room by closing an idle guest, but only for
 			// an upgrade that passes every other check below (evicted last).
 			const full = sockets.length >= this.config.limits.openConnections;
-			const idle = full ? this.idlestGuest(sockets, now) : undefined;
+			// An address whose guest was just evicted does not evict another
+			// (that tab coming back would turn every idle guest over in turn).
+			const idle = full && !this.recentlyEvicted(ipKey, now) ? this.idlestGuest(sockets, now) : undefined;
 			if (full && !idle) return serverFull();
 			if (peers.length >= this.config.limits.connectionsPerIp ||
 				peers.filter(peer => peer?.tier !== "registered").length >= this.config.limits.anonymousConnectionsPerIp) {
@@ -2188,8 +2186,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * A full server makes room for a newcomer by closing the guest connection
-	 * longest without an application frame, once it has had none for
-	 * GUEST_IDLE_MS (a tab left open in the background): closed with 4000 so
+	 * whose client said nobody attends it (`status` `idle`, §4.5) longest
+	 * ago, once at least GUEST_IDLE_MS ago with no application frame since:
+	 * a tab left in the background, never one being read. Closed with 4000 so
 	 * a client reconnects when its user comes back, not at once. False when
 	 * no guest is that idle. Registered users are never evicted.
 	 */
@@ -2199,20 +2198,30 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return !!idle;
 	}
 
-	/** The guest connection longest without a frame, once past GUEST_IDLE_MS (evictIdleGuest). */
+	/** The guest connection idle longest, once past GUEST_IDLE_MS (evictIdleGuest). */
 	private idlestGuest(sockets: WebSocket[], now: number): { socket: WebSocketConnection; state: ConnectionAttachment; at: number } | undefined {
 		let idlest: { socket: WebSocketConnection; state: ConnectionAttachment; at: number } | undefined;
 		for (const peer of sockets) {
 			const state = connectionAttachment(peer);
-			if (!state || state.closing || state.tier === "registered") continue;
-			const at = state.lastFrameAt ?? state.openedAt ?? 0;
+			if (!state || state.closing || state.tier === "registered" || !state.idle) continue;
+			const at = Math.max(state.idleAt ?? 0, state.lastFrameAt ?? 0);
 			if (now - at >= GUEST_IDLE_MS && (!idlest || at < idlest.at)) idlest = { socket: peer as WebSocketConnection, state, at };
 		}
 		return idlest;
 	}
 
 	private closeIdleGuest(idle: { socket: WebSocketConnection; state: ConnectionAttachment }): void {
+		const now = nowMs();
+		if (this.evicted.size >= 4_096) for (const [key, at] of this.evicted) if (now - at >= GUEST_IDLE_MS) this.evicted.delete(key);
+		if (this.evicted.size >= 4_096) this.evicted.clear();
+		this.evicted.set(idle.state.ipKey, now);
 		this.closePolicy(idle.socket, idle.state, 4000, "Idle guest connection closed to make room; reconnect when you're back");
+	}
+
+	/** Whether a guest from this address was evicted in the last GUEST_IDLE_MS (in memory). */
+	private recentlyEvicted(ipKey: string, now: number): boolean {
+		const at = this.evicted.get(ipKey);
+		return at !== undefined && now - at < GUEST_IDLE_MS;
 	}
 
 	webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
@@ -2740,7 +2749,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		// A server-wide spike limit, checked before any SQL. Over it, a request
 		// gets retry_after and a notification is dropped; the socket stays open.
-		const busy = this.takeServerFrame(nowMs());
+		// `auth` is exempt: a connection that cannot sign in within its auth
+		// deadline is closed and reconnects, which costs more than its frame.
+		const busy = parsed?.request.method === "auth" ? undefined : this.takeServerFrame(nowMs());
 		if (busy !== undefined) {
 			if (parsed && !isNotification(parsed.request.method, parsed.request.id)) {
 				this.fail(socket, parsed.request, { name: "retry_after", message: "Demo is busy with too many requests", data: { retry_after: busy } });
@@ -5649,7 +5660,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private evaluateTier(now: number): void {
 		this.tierCheckedAt = now;
-		if (this.maybePauseForBreakers(now)) return;
 		let state: ReturnType<ApronDemoServer["currentTier"]>;
 		try {
 			state = this.currentTier(now);
@@ -5728,27 +5738,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Breakers open on BURN_POLICY.pauseBreakers operations at once, one of
-	 * them opened since the last pause for breakers: something systematic
-	 * (an attack on costly work, or a bad deploy), so the server pauses as for
-	 * an attack. True when it paused.
-	 */
-	private maybePauseForBreakers(now: number): boolean {
-		try {
-			if (!this.config.attackPause || this.pausedUntil(now)) return false;
-			const open = Object.keys(this.store.accountingGuard(now).breakers).sort();
-			if (open.length < BURN_POLICY.pauseBreakers) return false;
-			// Breakers already paused for, kept across later pauses and days while they stay open.
-			const known = this.attackPauseRecord?.breakers ?? [];
-			if (open.every((operation) => known.includes(operation))) return false;
-			this.pauseForAttack("breakers", `${open.length} actions paused at once: ${open.map((operation) => `\`${operation}\``).join(", ")}`, now, open);
-			return true;
-		} catch {
-			return false;
-		}
-	}
-
-	/**
 	 * The attack pause: refuses everything for a hold (30 minutes, doubling
 	 * with each pause that UTC day), closes every connection, admins' too,
 	 * turns on the edge stop held as long (setAttackStop: the budget guard
@@ -5757,16 +5746,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * holds it in memory. The pause ends by itself; the guard lifts the edge
 	 * stop once the hold has passed and the bill is under its cap.
 	 */
-	private pauseForAttack(trigger: AttackTrigger, summary: string, now: number, breakers?: string[]): void {
+	private pauseForAttack(trigger: AttackTrigger, summary: string, now: number): void {
 		this.pausedUntil(now);
 		const previous = this.attackPauseRecord;
 		const day = utcDay(now);
 		const count = previous?.day === day ? previous.count + 1 : 1;
 		const hold = attackHoldMs(count);
-		// The breakers paused for so far, still open, so the same ones never pause again.
-		const open = Object.keys(this.store.accountingGuard(now).breakers);
-		const known = [...new Set([...(breakers ?? []), ...(previous?.breakers ?? [])])].filter((operation) => open.includes(operation)).sort();
-		const record: AttackPause = { day, count, until: now + hold, trigger, summary, ...(known.length ? { breakers: known } : {}) };
+		const record: AttackPause = { day, count, until: now + hold, trigger, summary };
 		this.attackPauseRecord = record;
 		try { this.store.setAttackPause(JSON.stringify(record), now); } catch { /* held in memory for this instance */ }
 		console.warn(JSON.stringify({ event: "attack_paused", trigger, summary, count, until: new Date(record.until).toISOString() }));

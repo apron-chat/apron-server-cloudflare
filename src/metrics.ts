@@ -24,7 +24,7 @@ export type MetricEvent =
 	| "tier"
 	/** A user tripped a long refusal (ApronDemoServer.noteTrip): its trigger and the method refused. */
 	| "throttle"
-	/** The attack pause (ApronDemoServer.pauseForAttack): its trigger (`flood`, `burn`, `breakers`), valued by the hold in minutes. */
+	/** The attack pause (ApronDemoServer.pauseForAttack): its trigger (`flood` or `burn`), valued by the hold in minutes. */
 	| "attack"
 	/** A heavy burn of mostly admitted traffic alerted the admins, valued by shadow dollars an hour. */
 	| "burn";

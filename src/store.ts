@@ -4278,7 +4278,7 @@ export class Store {
         const globalCount = global.day === day ? global.posts_day : 0;
         // An admin's frames (alert) are counted but never refused, so `/status` answers on a spent day.
         if (!this.alerting && globalCount + count > this.config.processedFramesPerDay) {
-          throw new StoreError("retry_after", "Daily frame budget exhausted", { retryAfterMs: 86_400_000, data: { reason: "frame_budget" } });
+          throw new StoreError("retry_after", "Daily frame budget exhausted", { retryAfterMs: Math.max(1_000, 86_400_000 - effective % 86_400_000), data: { reason: "frame_budget" } });
         }
         this.updateLimitRow(global, { day, posts_day: globalCount + count }, effective);
       });
@@ -4565,7 +4565,9 @@ export class Store {
         // IP permanently consume global capacity independently.
         const global = this.limitRow("admission", "global", now);
         const admissions = global.day === day ? global.posts_day : 0;
-        if (admissions >= this.config.connectionAdmissionsPerDay) throw new StoreError("retry_after", "Connection admission limit reached", { retryAfterMs: 86_400_000 });
+        // Until the UTC day ends, when the counts reset.
+        const untilReset = Math.max(1_000, 86_400_000 - now % 86_400_000);
+        if (admissions >= this.config.connectionAdmissionsPerDay) throw new StoreError("retry_after", "Connection admission limit reached", { retryAfterMs: untilReset });
         this.updateLimitRow(global, { day, posts_day: admissions + 1 }, now);
         // Live connection caps are authoritative in ctx.getWebSockets(), which
         // includes closing sockets and survives object hibernation.  Durable
@@ -4575,7 +4577,7 @@ export class Store {
         const frames = this.limitRow("frames", "global", now);
         const frameCount = frames.day === day ? frames.posts_day : 0;
         if (frameCount >= this.config.processedFramesPerDay) {
-          throw new StoreError("retry_after", "Daily frame budget exhausted", { retryAfterMs: 86_400_000, data: { reason: "frame_budget" } });
+          throw new StoreError("retry_after", "Daily frame budget exhausted", { retryAfterMs: untilReset, data: { reason: "frame_budget" } });
         }
       });
     });
