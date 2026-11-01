@@ -176,6 +176,19 @@ test('with live text, write URLs and live reads pass the invalid-request rule', 
 	assert.match(renderEdgeRules('chat.example.test', ADMISSION_BUDGET, undefined, true).custom.rules[0].expression, /"\/w\/"/);
 });
 
+test('with live text, the edge streams write_url bodies rather than buffering them', () => {
+	assert.equal(renderEdgeRules('chat.example.test', ADMISSION_BUDGET, 'media.example.test').config, undefined);
+	const { config } = renderEdgeRules('chat.example.test', ADMISSION_BUDGET, undefined, true);
+	assert.equal(config.phase, 'http_config_settings');
+	assert.deepEqual(config.rules, [{
+		ref: 'apron_write_streaming',
+		description: 'Apron: stream write_url bodies to the Worker as they arrive (live text)',
+		expression: '(http.host eq "chat.example.test") and http.request.method eq "PUT" and starts_with(http.request.uri.path, "/w/")',
+		action: 'set_config', enabled: true,
+		action_parameters: { request_body_buffering: 'none' },
+	}]);
+});
+
 test('where the server hostname is its RP ID, passkey related origins pass the invalid-request rule', () => {
 	const plain = renderEdgeRules('chat.example.test', ADMISSION_BUDGET, 'media.example.test', true);
 	assert.doesNotMatch(plain.custom.rules[0].expression, /well-known/);

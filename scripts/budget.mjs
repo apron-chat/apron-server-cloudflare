@@ -82,6 +82,9 @@ ${end}`;
  * live text's `url` (`GET`, `HEAD` and a preflight on `/live/`). With
  * `relatedOrigins`, where the server's hostname is its `RP_ID`, `GET` and
  * `HEAD` of `/.well-known/webauthn`, the passkey related origins, are too.
+ * With `liveText`, a configuration rule turns off the edge's request body
+ * buffering for `PUT` on `/w/`, which would otherwise hold a slow writer's
+ * first bytes, such as typed keys, until more arrive.
  */
 export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHostname = undefined, liveText = false, relatedOrigins = false) {
 	validateAdmission(admission);
@@ -121,6 +124,18 @@ export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHos
 				},
 			],
 		},
+		...(liveText ? {
+			config: {
+				phase: 'http_config_settings',
+				rules: [{
+					ref: 'apron_write_streaming',
+					description: 'Apron: stream write_url bodies to the Worker as they arrive (live text)',
+					expression: `(${host}) and http.request.method eq "PUT" and starts_with(http.request.uri.path, "/w/")`,
+					action: 'set_config', enabled: true,
+					action_parameters: { request_body_buffering: 'none' },
+				}],
+			},
+		} : {}),
 		// Free WAF cannot scope a rate-limiting rule by hostname. Keep this
 		// optional rule disabled until its effect on the entire zone is approved.
 		optionalZoneRateLimit: {

@@ -397,7 +397,8 @@ Each value can be lowered for a test or an incident with a
 `LIVE_TEXT_MAX_SECONDS=30` or `LIVE_TEXT_CONCURRENT=1`; values past the
 ceilings above fail the configuration check. The cost of the defaults is in
 the [cost report](cost-report.md#live-text). In production, the edge rule
-`apron_invalid_request` must let live text through (see
+`apron_invalid_request` must let live text through, and
+`apron_write_streaming` must stream its writes rather than buffer them (see
 [edge admission](edge-admission.md)).
 
 ## Server title, description and avatar
