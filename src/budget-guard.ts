@@ -14,6 +14,8 @@ const FLOOD_RETRY_MS = 60_000;
 
 interface BudgetGuardEnvironment extends AccountUsageEnvironment {
 	ZONE_ID?: string;
+	/** `false` turns the attack pause off: the guard then lifts the edge stop whatever hold it carries. */
+	ATTACK_PAUSE?: string;
 	/** An API token with Zone WAF edit permission on `ZONE_ID`. */
 	EDGE_STOP_TOKEN?: string;
 	/** Counts sampled requests per Cloudflare location for the flood trip. */
@@ -71,7 +73,7 @@ function ruleEnabled(rule: RulesetRule): boolean {
  * The attack pause's hold, kept in the rule's description so the guard
  * honours it without asking the object: ` [attack hold until <ISO time>]`.
  */
-const HOLD_MARK = / \[attack hold until ([^\]]+)\]$/;
+const HOLD_MARK = /\s*\[attack hold until ([^\]]+)\]\s*$/;
 
 /** When the attack hold written into a rule's description ends; 0 without one. */
 export function ruleHoldUntil(description: string | undefined): number {
@@ -82,8 +84,9 @@ export function ruleHoldUntil(description: string | undefined): number {
 
 /** A description with the hold mark set to `until`, or removed (0). */
 function withHold(description: string | undefined, until: number): string {
-	const base = (description ?? "").replace(HOLD_MARK, "");
-	return until ? `${base} [attack hold until ${new Date(until).toISOString()}]` : base;
+	const base = (description ?? "").replace(HOLD_MARK, "").trim();
+	const mark = `[attack hold until ${new Date(until).toISOString()}]`;
+	return until ? (base ? `${base} ${mark}` : mark) : base;
 }
 
 /**
@@ -93,7 +96,7 @@ function withHold(description: string | undefined, until: number): string {
  * off; turning it off clears the hold. Turning it on with a later hold than
  * the rule has extends the hold even when it is already on.
  */
-async function setEdgeStop(env: StopRuleEnvironment, stop: boolean, exceeded: string[], now: number, fetcher: typeof fetch, holdUntil = 0): Promise<EdgeStopOutcome> {
+async function setEdgeStop(env: StopRuleEnvironment, stop: boolean, exceeded: string[], now: number, fetcher: typeof fetch, holdUntil = 0, ignoreHold = false): Promise<EdgeStopOutcome> {
 	const { api, headers } = rulesetsApi(env);
 	try {
 		const { rulesetId, rule } = await readStopRule(env, fetcher);
@@ -102,7 +105,7 @@ async function setEdgeStop(env: StopRuleEnvironment, stop: boolean, exceeded: st
 			return "rule_missing";
 		}
 		const enabled = ruleEnabled(rule);
-		const held = ruleHoldUntil(rule.description);
+		const held = ignoreHold ? 0 : ruleHoldUntil(rule.description);
 		const extend = stop && holdUntil > held;
 		if (enabled === stop && !extend) return "unchanged";
 		const holdMs = (PLAN.edgeStop?.holdSeconds ?? 0) * 1_000;
@@ -155,7 +158,8 @@ export async function runBudgetGuard(env: BudgetGuardEnvironment, now = Date.now
 		return { outcome: "usage_failed" };
 	}
 	const stop = exceeded.length > 0;
-	const outcome = await setEdgeStop({ ...env, ZONE_ID, EDGE_STOP_TOKEN }, stop, exceeded, now, fetcher);
+	const ignoreHold = String(env.ATTACK_PAUSE ?? "").trim().toLowerCase() === "false";
+	const outcome = await setEdgeStop({ ...env, ZONE_ID, EDGE_STOP_TOKEN }, stop, exceeded, now, fetcher, 0, ignoreHold);
 	if (outcome === "rule_failed" || outcome === "rule_missing") return { outcome };
 	return { outcome, stop, exceeded };
 }

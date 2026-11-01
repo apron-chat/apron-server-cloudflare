@@ -89,12 +89,17 @@ function included(field: PricedField): number {
 	return monthly?.[field] ?? 0;
 }
 
-/** The overage, per field, of a month's usage: billable units rounded up, then priced. */
-export function usageOverage(usage: MeteredUsage): Record<PricedField, number> {
+/**
+ * The overage, per field, of a month's usage: billable units rounded up, as
+ * Cloudflare bills them, then priced; or, `rounded` false, prorated, for
+ * what a day adds (estimateBill).
+ */
+export function usageOverage(usage: MeteredUsage, rounded = true): Record<PricedField, number> {
 	const out = {} as Record<PricedField, number>;
 	for (const field of FIELDS) {
 		const { unit, usd } = PRICES[field];
-		out[field] = exact(Math.ceil(Math.max(0, usage[field] - included(field)) / unit) * usd);
+		const units = Math.max(0, usage[field] - included(field)) / unit;
+		out[field] = exact((rounded ? Math.ceil(units) : units) * usd);
 	}
 	return out;
 }
@@ -110,7 +115,11 @@ export function storageOverage(storedBytes: number, r2StoredBytes: number): numb
 export interface BillEstimate {
 	/** Overage so far this calendar month, storage included. */
 	monthUsd: number;
-	/** The part of `monthUsd` added today: the month's overage less what it was before today. */
+	/**
+	 * What today added: the month's overage less what it was before today,
+	 * prorated, so a day that only crosses into a billing unit (a whole $4.50
+	 * of R2 Class A, rounded) is charged for what it used of it.
+	 */
 	dayUsd: number;
 	/** The month's overage per field (and storage), largest first, zeros left out. */
 	items: Array<[PricedField | "storage", number]>;
@@ -136,7 +145,7 @@ export function estimateBill(month: MeteredUsage, today: Partial<MeteredUsage>, 
 	const now = usageOverage(month);
 	const storage = storageOverage(storedBytes, r2StoredBytes);
 	const monthUsd = exact(total(now) + storage);
-	const dayUsd = Math.max(0, exact(total(now) - total(usageOverage(before))));
+	const dayUsd = Math.max(0, exact(total(usageOverage(month, false)) - total(usageOverage(before, false))));
 	const items = ([...Object.entries(now), ["storage", storage]] as Array<[PricedField | "storage", number]>)
 		.filter(([, usd]) => usd > 0)
 		.sort((a, b) => b[1] - a[1]);

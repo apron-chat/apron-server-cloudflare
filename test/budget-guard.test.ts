@@ -49,13 +49,13 @@ function api({ workerRequests = 1, enabled = false, rules, analyticsStatus = 200
 
 // A day and month of 100 million Worker requests, all of it today: 90
 // million past the inclusion ($27), and their sampled logs, about 82 GB
-// against 50 GB included ($8).
+// against 50 GB included ($8 billed, $7.98 prorated for the day's stop).
 const overDaily = 100_000_000;
 
 describe("budget guard", () => {
 	it("turns the edge stop on once the overage passes the bill cap, keeping the rule as it was", async () => {
 		const { fetcher, updates } = api({ workerRequests: overDaily });
-		expect(await runBudgetGuard(env, Date.now(), fetcher)).toEqual({ outcome: "changed", stop: true, exceeded: ["day overage $35 over $5", "month overage $35 over $25"] });
+		expect(await runBudgetGuard(env, Date.now(), fetcher)).toEqual({ outcome: "changed", stop: true, exceeded: ["day overage $34.98 over $5", "month overage $35 over $25"] });
 		expect(updates).toEqual([{ ref: rule.ref, action: rule.action, expression: rule.expression, description: rule.description, enabled: true }]);
 	});
 
@@ -118,6 +118,14 @@ describe("budget guard", () => {
 		expect(after.updates).toEqual([expect.objectContaining({ enabled: false, description: rule.description })]);
 		expect(await readEdgeStop(env, api({ rules: [held] }).fetcher)).toMatchObject({ state: "on", holdUntil: until });
 		expect(await setAttackStop({ ...env, ZONE_ID: undefined }, until, "flood", now, on.fetcher)).toBe("unconfigured");
+		// A rule with no description, trimmed by the API, still carries its hold.
+		const bare = api({ rules: [{ ...rule, description: undefined }] });
+		expect(await setAttackStop(env, until, "flood", now, bare.fetcher)).toBe("changed");
+		expect(bare.updates).toEqual([expect.objectContaining({ description: "[attack hold until 2026-11-02T12:30:00.000Z]" })]);
+		expect(ruleHoldUntil("[attack hold until 2026-11-02T12:30:00.000Z] ")).toBe(until);
+		// ATTACK_PAUSE=false lifts it at once, hold or not.
+		const off = api({ rules: [held] });
+		expect(await runBudgetGuard({ ...env, ATTACK_PAUSE: "false" }, until - 60_000, off.fetcher)).toMatchObject({ outcome: "changed", stop: false });
 	});
 
 	it("reads a rule without enabled as enabled", async () => {

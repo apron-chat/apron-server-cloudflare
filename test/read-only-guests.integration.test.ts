@@ -1,5 +1,5 @@
 import { env, runInDurableObject } from 'cloudflare:test';
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import { connect as open, exchange, greeting, request, until, type Frame, type Peer } from './helpers/socket';
 
 let nextIp = 1;
@@ -295,4 +295,32 @@ it('makes room on a full server by closing the guest idle longest, never a regis
 		// The registered user is still served.
 		expect((await request(busy, 'after', 'room_list', {})).result).toBeTruthy();
 	} finally { idle.close(); busy.close(); }
+});
+
+it('evicts an idle guest only for an upgrade that passes every check, never for a status probe', async () => {
+	const idle = await connect();
+	try {
+		await greeting(idle);
+		await request(idle, 'auth', 'auth', { scheme: 'guest' });
+		let closedWith: number | undefined;
+		idle.socket.addEventListener('close', (event) => { closedWith = event.code; });
+		await runInDurableObject(stub(), (instance, state) => {
+			const runtime = instance as unknown as { config: { limits: Record<string, number> }; admit(ipKey: string, status: boolean): Response | undefined };
+			const limits = runtime.config.limits;
+			runtime.config = { ...runtime.config, limits: { ...limits, openConnections: state.getWebSockets().length } };
+			const later = Date.now() + 11 * 60_000;
+			const now = vi.spyOn(Date, 'now').mockReturnValue(later);
+			try {
+				// The probe says a slot is free, and closes nobody.
+				expect(runtime.admit('probe-ip', true)?.status).toBe(200);
+				expect(state.getWebSockets().some((socket) => (socket.deserializeAttachment() as { closing?: boolean })?.closing)).toBe(false);
+				// The upgrade takes it.
+				expect(runtime.admit('upgrade-ip', false)).toBeUndefined();
+			} finally {
+				now.mockRestore();
+				runtime.config = { ...runtime.config, limits };
+			}
+		});
+		await vi.waitFor(() => expect(closedWith).toBe(4000));
+	} finally { idle.close(); }
 });

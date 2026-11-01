@@ -190,9 +190,13 @@ export function snapshotReasons(snapshot: AccountUsageSnapshot): string[] {
  */
 export function accountUsageStops(snapshot: AccountUsageSnapshot | null, now: number): boolean {
 	if (!snapshot?.stop) return false;
+	// One saved by an older version, without its reasons, is judged again
+	// under the stop lines in force (a share-based stop no longer stops).
+	const reasons = snapshotReasons(snapshot);
+	if (!reasons.length) return false;
 	const today = dayFor(now);
 	if (snapshot.day === today) return true;
-	return snapshot.day.slice(0, 7) === today.slice(0, 7) && snapshotReasons(snapshot).some((name) => name.startsWith("month"));
+	return snapshot.day.slice(0, 7) === today.slice(0, 7) && reasons.some((name) => name.startsWith("month"));
 }
 
 export function accountUsageSnapshotFromResult(result: unknown, sampledAt: number, cap: BillCap | null = billCap()): AccountUsageSnapshot {

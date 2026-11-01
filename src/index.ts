@@ -1414,9 +1414,25 @@ function serverFull(): Response {
 /** Until when this isolate refuses connections itself (fetchConnection): the object said it was full. */
 let objectFullUntil = 0;
 
+/**
+ * The attack pause's 503 carries its end (epoch ms), so each entry isolate
+ * refuses by itself until then, at most PAUSE_MEMORY_MS at a time: should
+ * the edge stop fail, a flood still costs no object requests.
+ */
+const PAUSED_HEADER = "Apron-Server-Paused";
+const PAUSE_MEMORY_MS = 5 * 60_000;
+let objectPausedUntil = 0;
+
+function serverPaused(until: number): Response {
+	const response = responseError(503, "Server paused: unusual traffic; try later", until - Date.now());
+	response.headers.set(PAUSED_HEADER, String(until));
+	return response;
+}
+
 /** Forgets that the object was full, for tests. */
 export function resetObjectFull(): void {
 	objectFullUntil = 0;
+	objectPausedUntil = 0;
 }
 
 /** Responses the object made, which its own burn meter counted (fetchEntry leaves them out of its samples). */
@@ -1827,6 +1843,7 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 	// The object said it was full moments ago: refuse here, which costs no
 	// object request, rather than let a crowd's retries reach it.
 	if (Date.now() < objectFullUntil) return serverFull();
+	if (Date.now() < objectPausedUntil) return serverPaused(objectPausedUntil);
 	const headers = stripForwardingHeaders(request.headers);
 	headers.set(INTERNAL_IP_HEADER, key);
 	headers.delete("content-length");
@@ -1835,6 +1852,8 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 	try {
 		const response = fromObject(await stub.fetch(forwarded));
 		if (response.status === 429 && response.headers.get(FULL_HEADER) === "1") objectFullUntil = Date.now() + FULL_MEMORY_MS;
+		const paused = response.status === 503 ? Number(response.headers.get(PAUSED_HEADER)) : NaN;
+		if (Number.isFinite(paused) && paused > Date.now()) objectPausedUntil = Math.min(paused, Date.now() + PAUSE_MEMORY_MS);
 		return response;
 	}
 	// The object threw: a platform failure, not capacity.
@@ -2076,7 +2095,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async fetchRequest(request: Request): Promise<Response> {
 		// Paused, everything is refused before any work.
 		const paused = this.pausedUntil(nowMs());
-		if (paused) return responseError(503, "Server paused: unusual traffic; try later", paused - nowMs());
+		if (paused) {
+			const response = responseError(503, "Server paused: unusual traffic; try later", paused - nowMs());
+			response.headers.set(PAUSED_HEADER, String(paused));
+			return response;
+		}
 		const path = new URL(request.url).pathname;
 		if (path.startsWith(LIVE_WRITE_PATH) || path.startsWith(LIVE_READ_PATH)) return this.liveFetch(request, path);
 		const status = isConnectionStatus(request);
@@ -2134,7 +2157,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const now = nowMs();
 			this.closeStale(now);
 			const peers = sockets.filter(socket => !this.isStale(socket, now)).map(socket => connectionAttachment(socket)).filter(peer => peer?.ipKey === ipKey);
-			if (sockets.length >= this.config.limits.openConnections && !this.evictIdleGuest(sockets, now)) return serverFull();
+			// A full server may make room by closing an idle guest, but only for
+			// an upgrade that passes every other check below (evicted last).
+			const full = sockets.length >= this.config.limits.openConnections;
+			const idle = full ? this.idlestGuest(sockets, now) : undefined;
+			if (full && !idle) return serverFull();
 			if (peers.length >= this.config.limits.connectionsPerIp ||
 				peers.filter(peer => peer?.tier !== "registered").length >= this.config.limits.anonymousConnectionsPerIp) {
 				return responseError(429, "Demo capacity reached", 60_000);
@@ -2145,6 +2172,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return Response.json({ available: true });
 			}
 			this.store.reserveConnection({ ipKey, now: nowMs() });
+			if (idle) this.closeIdleGuest(idle);
 		} catch (error) {
 			// A long refusal of a connection is a trip too; with no socket yet, it is only counted.
 			const protocol = errorToProtocol(error);
@@ -2166,6 +2194,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * no guest is that idle. Registered users are never evicted.
 	 */
 	private evictIdleGuest(sockets: WebSocket[], now: number): boolean {
+		const idle = this.idlestGuest(sockets, now);
+		if (idle) this.closeIdleGuest(idle);
+		return !!idle;
+	}
+
+	/** The guest connection longest without a frame, once past GUEST_IDLE_MS (evictIdleGuest). */
+	private idlestGuest(sockets: WebSocket[], now: number): { socket: WebSocketConnection; state: ConnectionAttachment; at: number } | undefined {
 		let idlest: { socket: WebSocketConnection; state: ConnectionAttachment; at: number } | undefined;
 		for (const peer of sockets) {
 			const state = connectionAttachment(peer);
@@ -2173,9 +2208,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const at = state.lastFrameAt ?? state.openedAt ?? 0;
 			if (now - at >= GUEST_IDLE_MS && (!idlest || at < idlest.at)) idlest = { socket: peer as WebSocketConnection, state, at };
 		}
-		if (!idlest) return false;
-		this.closePolicy(idlest.socket, idlest.state, 4000, "Idle guest connection closed to make room; reconnect when you're back");
-		return true;
+		return idlest;
+	}
+
+	private closeIdleGuest(idle: { socket: WebSocketConnection; state: ConnectionAttachment }): void {
+		this.closePolicy(idle.socket, idle.state, 4000, "Idle guest connection closed to make room; reconnect when you're back");
 	}
 
 	webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
@@ -2317,8 +2354,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				await this.expireBot(userId);
 			}
 		} catch { /* a bot not yet signed out is found again by the next sweep */ }
-		// Only user status keeps `seen` current, which is how a dormant account is told from a returning one.
-		if (this.config.presence && now >= this.dormantPruneAt) await this.pruneDormant(now);
+		if (now >= this.dormantPruneAt) await this.pruneDormant(now);
 		let result: ReturnType<Store["runCleanup"]> | undefined;
 		try {
 			result = this.store.runCleanup(now);
@@ -5646,6 +5682,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** When the attack pause holds until, if it holds at `now`; else 0. Its record is read as the instance starts. */
 	private pausedUntil(now: number): number {
+		if (!this.config.attackPause) return 0;
 		if (this.attackPauseRecord === undefined) {
 			try {
 				this.attackPauseRecord = parseAttackPause(this.store.attackPause());
@@ -5676,14 +5713,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		try {
 			if (this.pausedUntil(now)) return;
 			const decision = this.burn.decide(now);
-			if (decision.action === "pause") {
+			if (decision.action === "pause" && this.config.attackPause) {
 				this.pauseForAttack(decision.trigger, burnSummary(decision.window), now);
-			} else if (decision.action === "alert" && now - this.burnAlertedAt >= BURN_POLICY.alertEveryMs) {
+			} else if (decision.action !== "none" && now - this.burnAlertedAt >= BURN_POLICY.alertEveryMs) {
 				this.burnAlertedAt = now;
 				const summary = burnSummary(decision.window);
-				console.warn(JSON.stringify({ event: "burn_alert", summary }));
+				console.warn(JSON.stringify({ event: "burn_alert", summary, attack: decision.action === "pause" }));
 				recordMetric(this.runtimeEnv.METRICS, "burn", [summary], decision.window.usdPerHour);
-				this.announce({ kind: "burn", summary });
+				this.announce({ kind: "burn", summary, ...(decision.action === "pause" ? { paused: false as const } : {}) });
 			}
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "burn_check_failed", message: error instanceof Error ? error.message : String(error) }));
@@ -5698,11 +5735,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private maybePauseForBreakers(now: number): boolean {
 		try {
-			if (this.pausedUntil(now)) return false;
+			if (!this.config.attackPause || this.pausedUntil(now)) return false;
 			const open = Object.keys(this.store.accountingGuard(now).breakers).sort();
 			if (open.length < BURN_POLICY.pauseBreakers) return false;
-			const record = this.attackPauseRecord;
-			const known = record?.trigger === "breakers" && record.day === utcDay(now) ? record.breakers ?? [] : [];
+			// Breakers already paused for, kept across later pauses and days while they stay open.
+			const known = this.attackPauseRecord?.breakers ?? [];
 			if (open.every((operation) => known.includes(operation))) return false;
 			this.pauseForAttack("breakers", `${open.length} actions paused at once: ${open.map((operation) => `\`${operation}\``).join(", ")}`, now, open);
 			return true;
@@ -5726,7 +5763,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const day = utcDay(now);
 		const count = previous?.day === day ? previous.count + 1 : 1;
 		const hold = attackHoldMs(count);
-		const record: AttackPause = { day, count, until: now + hold, trigger, summary, ...(breakers ? { breakers } : {}) };
+		// The breakers paused for so far, still open, so the same ones never pause again.
+		const open = Object.keys(this.store.accountingGuard(now).breakers);
+		const known = [...new Set([...(breakers ?? []), ...(previous?.breakers ?? [])])].filter((operation) => open.includes(operation)).sort();
+		const record: AttackPause = { day, count, until: now + hold, trigger, summary, ...(known.length ? { breakers: known } : {}) };
 		this.attackPauseRecord = record;
 		try { this.store.setAttackPause(JSON.stringify(record), now); } catch { /* held in memory for this instance */ }
 		console.warn(JSON.stringify({ event: "attack_paused", trigger, summary, count, until: new Date(record.until).toISOString() }));
@@ -5737,7 +5777,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		const env = this.runtimeEnv;
 		this.ctx.waitUntil((async () => {
-			try { await setAttackStop(env, record.until, trigger, now); } catch { /* the object's own refusal still holds */ }
+			let outcome: string;
+			try { outcome = await setAttackStop(env, record.until, trigger, now); } catch { outcome = "rule_failed"; }
+			// The object's own refusal still holds, but each request is still billed at the Worker.
+			if (outcome !== "changed" && outcome !== "unchanged") this.announce({ kind: "edge_failed", outcome });
 		})());
 		this.evaluateTier(now);
 	}
@@ -6856,8 +6899,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Removes registered accounts nobody came back to (Store.pruneDormantIdentities),
-	 * never one connected now, and revokes their tokens. Runs once a day, or at
-	 * each full alarm while a full batch suggests more; a failure waits an hour.
+	 * never one connected now, and revokes their tokens. The store runs it at
+	 * most once a UTC day (kept in storage); this instance asks again at the
+	 * next full alarm while a full batch suggests more, else in an hour.
 	 */
 	private async pruneDormant(now: number): Promise<void> {
 		const connected = new Set<string>();
@@ -6866,9 +6910,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (userId) connected.add(userId);
 		}
 		try {
-			// One synchronous transaction: nothing interleaves with it.
-			const result = this.store.pruneDormantIdentities(now, connected);
-			this.dormantPruneAt = result.more ? now : now + 86_400_000;
+			// One synchronous transaction: nothing interleaves with it. Only user
+			// status keeps `seen` current, which tells a dormant account from a
+			// returning one: while it is off, the store restarts its wait.
+			const result = this.store.pruneDormantIdentities(now, connected, this.presenceMode());
+			this.dormantPruneAt = result.more ? now : now + 3_600_000;
 			if (result.pruned.length) await this.forgetTokens(result.pruned);
 		} catch {
 			this.dormantPruneAt = now + 3_600_000;

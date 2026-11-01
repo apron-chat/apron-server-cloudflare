@@ -26,7 +26,7 @@ export const BURN_POLICY = Object.freeze({
 	checkEveryMs: 5_000,
 	/** The first pause; each later one in the same UTC day doubles it. */
 	firstHoldMs: 30 * 60_000,
-	maxHoldMs: 24 * 60 * 60_000,
+	maxHoldMs: 4 * 60 * 60_000,
 	/** Open breakers on this many operations at once pause the server. */
 	pauseBreakers: 3,
 	/** A high burn of mostly admitted traffic alerts the admins at most this often. */
@@ -145,7 +145,7 @@ export class BurnMeter {
 	}
 }
 
-/** The hold for the `count`th pause of a UTC day: 30 minutes, doubling, at most a day. */
+/** The hold for the `count`th pause of a UTC day: 30 minutes, doubling, at most 4 hours. */
 export function attackHoldMs(count: number): number {
 	return Math.min(BURN_POLICY.maxHoldMs, BURN_POLICY.firstHoldMs * 2 ** Math.max(0, count - 1));
 }

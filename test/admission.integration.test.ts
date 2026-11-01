@@ -125,3 +125,20 @@ it('refuses at the entry Worker for 30 seconds after the object says it is full,
 	expect(calls).toBe(3);
 	resetObjectFull();
 });
+
+it('refuses at the entry Worker while the object says it is paused, for at most 5 minutes at a time', async () => {
+	resetObjectFull();
+	let calls = 0;
+	const until = Date.now() + 30 * 60_000;
+	const paused = { getByName: () => ({ fetch: async () => {
+		calls += 1;
+		return new Response('{}', { status: 503, headers: { 'Apron-Server-Paused': String(until), 'Retry-After': '1800' } });
+	} }) };
+	expect((await fetchEntry(upgrade('198.18.9.11'), withoutObject({ DEMO: paused as never }))).status).toBe(503);
+	const second = await fetchEntry(upgrade('198.18.9.12'), withoutObject({ DEMO: paused as never }));
+	expect(second.status).toBe(503);
+	expect(Number(second.headers.get('Retry-After'))).toBeLessThanOrEqual(5 * 60);
+	expect(await second.json()).toEqual({ error: 'Server paused: unusual traffic; try later' });
+	expect(calls).toBe(1);
+	resetObjectFull();
+});

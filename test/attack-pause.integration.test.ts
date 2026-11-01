@@ -43,7 +43,10 @@ it('pauses on a flood of refused entry requests: closes every socket, refuses ev
 	expect(refused.status).toBe(503);
 	expect(Number(refused.headers.get('Retry-After'))).toBeGreaterThan(29 * 60);
 	expect(await refused.json()).toEqual({ error: 'Server paused: unusual traffic; try later' });
-	await vi.waitFor(() => expect(told).toHaveLength(1));
+	// The tier, and that the edge stop could not be turned on: tests set no zone.
+	await vi.waitFor(() => expect(told).toHaveLength(2));
+	expect(told.find((text) => text.startsWith('**The attack pause could not turn on the edge stop** (unconfigured)'))).toBeTruthy();
+	told.sort((a, b) => Number(b.startsWith('**Server tier')) - Number(a.startsWith('**Server tier')));
 	expect(told[0]).toMatch(/^\*\*Server tier: paused \(attack\)\*\* \(was open\)\. A flood of refused requests: \$\d+\.\d\d\/h, 95% of 200,00\d requests refused; held until \d{4}-\d\d-\d\d \d\d:\d\d UTC\. Traffic is costing money fast/);
 	await evictDurableObject(stub);
 	const afterWake = await stub.fetch('https://demo.test/ws', { headers: { ...headers, Upgrade: 'websocket' } });
@@ -123,4 +126,41 @@ it('samples the entry Worker\'s own answers, not the object\'s, and reports at m
 	// A request the object answered is its own to count.
 	const fromObject = await worker.fetch(new Request('https://server.example/ws', { headers: { Origin: 'http://localhost:5173' } }), env, ctx as never);
 	expect(fromObject.status).toBeGreaterThanOrEqual(400);
+});
+
+it('with ATTACK_PAUSE=false, only tells the admins, and a pause in force ends', async () => {
+	const stub = env.DEMO.getByName('attack-pause-off');
+	const told: string[] = [];
+	await runInDurableObject(stub, (instance) => {
+		const runtime = instance as unknown as Runtime & { config: { attackPause: boolean } };
+		runtime.config = { ...runtime.config, attackPause: false };
+		runtime.attackPauseRecord = { until: Date.now() + 60 * 60_000, count: 1, trigger: 'flood' };
+		runtime.burnCheckedAt = 0;
+		vi.spyOn(runtime, 'notifyAdmins').mockImplementation(async (text) => { told.push(text); });
+	});
+	const peer = await open(stub);
+	await runInDurableObject(stub, (instance) => { (instance as unknown as Runtime).burnCheckedAt = 0; });
+	await (stub as unknown as { noteEntrySamples(seen: number, refused: number): Promise<void> }).noteEntrySamples(200_000, 190_000);
+	await vi.waitFor(() => expect(told).toHaveLength(1));
+	expect(told[0]).toMatch(/^\*\*Attack-like traffic\*\* .*`ATTACK_PAUSE` is `false`, so the server stays open/);
+	const closed = await Promise.race([peer.closed, new Promise((resolve) => setTimeout(() => resolve('open'), 100))]);
+	expect(closed).toBe('open');
+	peer.socket.close();
+});
+
+it('never pauses twice for the same open breakers, across a later pause or a new day', async () => {
+	const stub = env.DEMO.getByName('attack-pause-breakers-carry');
+	await runInDurableObject(stub, (instance) => {
+		const runtime = instance as unknown as Runtime;
+		vi.spyOn(runtime, 'notifyAdmins').mockImplementation(async () => {});
+		const until = Date.now() + BREAKER_MS;
+		vi.spyOn(runtime.store, 'accountingGuard').mockReturnValue({ day: '', overruns: 3, breakers: { a: until, b: until, c: until } } as never);
+		runtime.evaluateTier(Date.now());
+		expect(runtime.attackPauseRecord).toMatchObject({ trigger: 'breakers', count: 1 });
+		// A burn pause in between, then a new UTC day: the same three breakers stay known.
+		(runtime as unknown as { pauseForAttack(trigger: string, summary: string, now: number): void }).pauseForAttack('burn', 'test', Date.now());
+		runtime.attackPauseRecord = { ...runtime.attackPauseRecord!, until: Date.now() - 1, day: '2000-01-01' } as never;
+		runtime.evaluateTier(Date.now());
+		expect(runtime.attackPauseRecord).toMatchObject({ trigger: 'burn' });
+	});
 });

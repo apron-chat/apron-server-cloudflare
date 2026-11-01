@@ -963,6 +963,13 @@ const DORMANT_BATCH = 100;
 const BOT_PREFIX = "bot_";
 /** Dormant accounts pruned: today's count and the total (dormantPruned). */
 const META_DORMANT_PRUNED = "dormant_pruned";
+/**
+ * Since when `seen_ms` has been kept current without a break (user status
+ * on), and the last UTC day a prune finished: nothing is pruned until it has
+ * been kept for DORMANT_AFTER_MS, so `seen` stopped by a reset, an older
+ * version, or user status turned off never reads as dormant.
+ */
+const META_DORMANT_TRACKING = "dormant_tracking";
 /** The runtime's attack pause: its UTC day, count that day, hold end, and why (attackPause). */
 const META_ATTACK_PAUSE = "attack_pause";
 /** Overruns of one operation within BREAKER_WINDOW_MS that open its breaker. */
@@ -3737,7 +3744,10 @@ export class Store {
 
   /**
    * Removes up to DORMANT_BATCH registered accounts nobody came back to
-   * (DORMANT_AFTER_MS), except `connected` ones: their identity, passkeys,
+   * (DORMANT_AFTER_MS), except `connected` ones, once a UTC day and only once
+   * `seen` has been kept (`tracking`: user status on) for DORMANT_AFTER_MS
+   * without a break; `tracking` false restarts that wait. An account whose
+   * `seen` was never recorded (0) is kept. It removes their identity, passkeys,
    * memberships (lowering their rooms' member counts), read cursors, status,
    * mutes, push wakes, dedup and limiter rows, and their rooms' creator. As
    * with `/purge`, each `user_id` is retired, never reissued. Their content
@@ -3747,15 +3757,35 @@ export class Store {
    * first, then reserves them, and a refusal leaves the rest for a later
    * run. Returns the removed ids, and whether more may remain.
    */
-  pruneDormantIdentities(now = this.clock.now(), connected: ReadonlySet<string> = new Set()): { pruned: string[]; more: boolean } {
+  pruneDormantIdentities(now = this.clock.now(), connected: ReadonlySet<string> = new Set(), tracking = true): { pruned: string[]; more: boolean } {
     this.ensureReady();
+    const today = dayFor(now);
+    const due = this.reserved({ reads: 4, writes: 4 }, true, now, () => {
+      let record: { since?: number; done?: string } = {};
+      try { record = JSON.parse(this.metaValue(META_DORMANT_TRACKING) || "{}"); } catch { /* starts again */ }
+      if (!tracking) {
+        if (record.since !== undefined) this.rawExec("DELETE FROM _meta WHERE key = ?", META_DORMANT_TRACKING);
+        return false;
+      }
+      if (typeof record.since !== "number" || !Number.isFinite(record.since)) {
+        this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_DORMANT_TRACKING, JSON.stringify({ since: now }));
+        return false;
+      }
+      return now - record.since >= DORMANT_AFTER_MS && record.done !== today;
+    }, false);
+    if (!due) return { pruned: [], more: false };
+    const finishDay = () => this.reserved({ reads: 4, writes: 4 }, true, now, () => {
+      let record: { since?: number } = {};
+      try { record = JSON.parse(this.metaValue(META_DORMANT_TRACKING) || "{}"); } catch { /* kept below */ }
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_DORMANT_TRACKING, JSON.stringify({ since: record.since ?? now, done: today }));
+    }, false);
     const cutoff = now - DORMANT_AFTER_MS;
     // Finding them reads every identity (no index on created_ms) and, for each
     // candidate, its credentials, subscriptions, uploads and bot.
     const found = this.reserved({ reads: 64 + this.config.registeredIdentityCount + 8 * DORMANT_BATCH * 4 }, true, now, () => {
       const candidates = this.rawRows<{ user_id: string }>(
         `SELECT i.user_id FROM identities i
-         WHERE i.tier = 'registered' AND i.roles_json = '[]' AND i.created_ms < ? AND i.seen_ms < i.created_ms + ? AND i.user_id != ?
+         WHERE i.tier = 'registered' AND i.roles_json = '[]' AND i.created_ms < ? AND i.seen_ms > 0 AND i.seen_ms < i.created_ms + ? AND i.user_id != ?
            AND EXISTS (SELECT 1 FROM credentials c INDEXED BY credentials_user_idx WHERE c.user_id = i.user_id)
            AND NOT EXISTS (SELECT 1 FROM credentials c INDEXED BY credentials_user_idx WHERE c.user_id = i.user_id AND c.updated_ms >= i.created_ms + ?)
            AND NOT EXISTS (SELECT 1 FROM push_subscriptions p WHERE p.user_id = i.user_id)
@@ -3773,7 +3803,10 @@ export class Store {
       }
       return { ids: candidates, rows, full: candidates.length === DORMANT_BATCH };
     }, false);
-    if (!found.ids.length) return { pruned: [], more: false };
+    if (!found.ids.length) {
+      finishDay();
+      return { pruned: [], more: false };
+    }
     const ids = found.ids;
     const marks = ids.map(() => "?").join(", ");
     // Each row deleted (and its index entries), the rooms rescanned for counts
@@ -3810,6 +3843,7 @@ export class Store {
       this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_DORMANT_PRUNED, JSON.stringify(record));
     }), false);
     console.log(JSON.stringify({ event: "dormant_pruned", count: ids.length }));
+    if (!found.full) finishDay();
     return { pruned: ids, more: found.full };
   }
 

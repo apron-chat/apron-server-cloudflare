@@ -12,7 +12,8 @@ export type TriggerNotice =
 	| { kind: "tier"; from: ServerTier; to: ServerTier; reasons: readonly string[] }
 	| { kind: "breaker"; operation: string; open: boolean; until?: number }
 	| { kind: "overrun"; operation: string; message: string; users: readonly string[]; essential?: boolean }
-	| { kind: "burn"; summary: string };
+	| { kind: "burn"; summary: string; paused?: false }
+	| { kind: "edge_failed"; outcome: string };
 
 /**
  * How far the server refuses work, least to most (docs/configuration.md,
@@ -73,7 +74,10 @@ export function noticeText(notice: TriggerNotice): string {
 			if (notice.essential) return `**Storage overrun: \`${notice.operation}\`** used more rows than it reserved${who} (${notice.message}). It is essential (signing in, rooms or history), so it keeps working with no pause; its rows are charged. Told at most once an hour while it goes on: its estimate needs fixing.`;
 			return `**Storage overrun: \`${notice.operation}\`** used more rows than it reserved${who} (${notice.message}). It finished and its rows are charged; the server stays open. Further overruns today are counted without a notice.`;
 		}
+		case "edge_failed":
+			return `**The attack pause could not turn on the edge stop** (${notice.outcome}). The server still refuses everything, but each request still reaches the Worker and is billed: check \`ZONE_ID\`, \`EDGE_STOP_TOKEN\` and the \`apron_budget_stop\` rule.`;
 		case "burn":
+			if (notice.paused === false) return `**Attack-like traffic** (${notice.summary}, priced as if past the plan's inclusions). \`ATTACK_PAUSE\` is \`false\`, so the server stays open; the bill cap still stops it if the overage passes the cap. Told at most once an hour.`;
 			return `**Heavy traffic** (${notice.summary}, priced as if past the plan's inclusions). Most of it is admitted, so it looks like a busy day, not an attack: the server stays open, and the bill cap stops it if the overage passes the cap. Told at most once an hour.`;
 	}
 }

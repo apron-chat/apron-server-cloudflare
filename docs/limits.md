@@ -67,7 +67,7 @@ A limit can reach a client in four ways:
 | 429 | Connection admission limit reached | 12 admitted connections a minute per address; 100,000 a day on the server | the bucket's wait, or until the next day | Reconnecting on every error or page view. A passkey sign-in on a fresh page uses up to three admissions (guest, sign-in, signed-in reconnect). |
 | 429 | Daily demo capacity reached / Daily frame budget exhausted | The server's daily SQL or frame budget | until the next day | The whole demo is used up for the day. |
 | 503 | Demo account capacity reached | The Cloudflare account's usage stop | 300 | Same; the operator's account passed its bill cap. |
-| 503 | Server paused: unusual traffic; try later | The attack pause | the hold left, 30 minutes or more | Not your client: a flood of traffic. Open sockets close with 1013 and the same reason. |
+| 503 | Server paused: unusual traffic; try later (with `Apron-Server-Paused`) | The attack pause | the hold left, up to 4 hours (5 minutes at most when the entry Worker answers for it) | Not your client: a flood of traffic. Open sockets close with 1013 and the same reason. |
 | 503 | Demo admission is closed | Operator switch | none | Maintenance or an incident. |
 | 503 | Server unavailable; try again shortly | Platform failure | 60 | Not your client. |
 | 403 | Origin not allowed | `ALLOWED_ORIGINS` (the demo allows any) | none | Only on a deployment that restricts origins. |

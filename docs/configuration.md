@@ -110,7 +110,9 @@ allowance or of stored bytes. On a plan that bills past its inclusions
 past each inclusion at Cloudflare's list prices (rounded up to whole billing
 units, as Cloudflare does), and the server stops when the overage added
 today passes `BILL_CAP_DAY` (default $5) or the month's passes
-`BILL_CAP_MONTH` (default $25), on top of the $5 plan. A day well past its
+`BILL_CAP_MONTH` (default $25), on top of the $5 plan. Today's share is
+prorated, so a day that only crosses into a billing unit (a whole $4.50 of
+R2 Class A, as Cloudflare rounds it) counts what it used of it. A day well past its
 31st share of the month costs nothing while the month stays inside its
 inclusions, so a busy day no longer stops the server. Set either variable
 in `wrangler.production.toml` as a dollar amount (`"0"` stops at the first
@@ -727,7 +729,7 @@ and each lifting by itself (`src/store.ts`, `ApronDemoServer.currentTier`):
 | degraded | Today's foreground SQL reads or writes, or frames, at `DEGRADE_SHARE` (70%) of their ceiling | Live text, uploads and older history (`history` with `before`) get `retry_after` (`data.reason` `degraded`); chat works | UTC midnight |
 | exhausted | One of those at 99% (`EXHAUSTED_SHARE`; the ledger refuses work just short of 100%) | New work is refused with `retry_after` until the reset; open connections stay; admins' frames and `/status` still answer | UTC midnight |
 | account stop | The estimated overage past `BILL_CAP_DAY` ($5) today or `BILL_CAP_MONTH` ($25) this month (the account-usage stop; on Free, 90% of a daily allowance) | 503 and sockets closed once, as it starts | The day's or month's end |
-| paused (attack) | The attack pause (below): traffic burning $1 an hour or more and mostly refused, or breakers open on three actions | Everything refused with 503, every socket closed (admins' too), and the edge stop turned on for the hold | When the hold ends: 30 minutes, doubling with each pause that UTC day |
+| paused (attack) | The attack pause (below): traffic burning $1 an hour or more and mostly refused, or breakers open on three actions | Everything refused with 503, every socket closed (admins' too), and the edge stop turned on for the hold | When the hold ends: 30 minutes, doubling with each pause that UTC day, at most 4 hours; at once with `ATTACK_PAUSE=false` |
 
 Every change of tier is announced to the admins (see the admin alert above),
 going up and coming down, with why. It is evaluated at most once a minute on
@@ -761,11 +763,21 @@ about 30,000 refused requests a minute. The pause closes every
 connection, refuses every request with 503 and a `Retry-After` of the
 hold, and turns on the edge stop with the hold written into the rule's
 description (`[attack hold until …]`), which the budget guard honours
-before it lifts the rule. The first pause in a UTC day holds 30 minutes,
-and each later one twice as long as the one before, at most a day. It is
-logged (`attack_paused`), counted (`attack` metric) and announced as the
-`paused` tier; a wake stays paused. The meter itself is in memory, so it
-starts empty after a wake.
+before it lifts the rule. Its 503 carries `Apron-Server-Paused` (the end,
+in epoch milliseconds), so each entry Worker isolate refuses by itself for
+up to 5 minutes at a time and a flood costs no object requests even if the
+edge stop fails; the admins are told when it could not be turned on. The
+first pause in a UTC day holds 30 minutes, and each later one twice as long
+as the one before, at most 4 hours. Breakers already paused for never
+pause the server again while they stay open. It is logged
+(`attack_paused`), counted (`attack` metric) and announced as the `paused`
+tier; a wake stays paused. The meter itself is in memory, so it starts
+empty after a wake.
+
+To turn it off, set `ATTACK_PAUSE = "false"` in `wrangler.production.toml`
+and deploy: what would pause then only tells the admins (at most once an
+hour), a pause in force ends, and the budget guard lifts the edge stop at
+its next run whatever hold it carries. The bill cap still applies.
 
 **Launch profile.** Paid's limits are sized for a front-page day (about
 40,000 visitors, a tenth of them registering): 250 open connections (the
@@ -779,12 +791,17 @@ past the month's inclusions, under the daily bill cap. Clients ping every
 a day. Guest visits cost less: a guest cannot scroll back (`before`
 alone), its history is charged to its address only, and a full server
 closes the guest idle longest (10 minutes without a frame, close code
-4000) to admit a newcomer. With user status on, registered accounts nobody
-came back to are removed after 30 days (`Store.pruneDormantIdentities`):
-signed up with a passkey and active only that first day, with no role,
-chosen status, push subscription, upload or bot. Their content is past
-retention by then; their `user_id` is retired as `/purge` retires it, and
-`/status` counts them.
+4000) to admit a newcomer, once that newcomer passes every other check
+(never for a status probe). Registered accounts nobody came back to are
+removed after 30 days (`Store.pruneDormantIdentities`, once a UTC day):
+signed up with a passkey and active only that first day by their recorded
+`seen`, with no role, chosen status, push subscription, upload or bot. An
+account with no `seen` recorded (from before it was kept, or carried over
+a schema reset) is kept, and nothing is removed until user status has kept
+`seen` for 30 days without a break: turning user status off (or push
+unconfigured) restarts that wait. Their content is past retention by then;
+their `user_id` is retired as `/purge` retires it, and `/status` counts
+them.
 
 **Storage overruns.** Every operation reserves the SQL rows it may read and
 write before it runs. One that uses more is an *overrun*: a wrong estimate,

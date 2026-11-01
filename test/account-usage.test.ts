@@ -201,9 +201,12 @@ describe("account usage snapshots", () => {
 		expect(overMonth.exceeded).toEqual(["month overage $35 over $25"]);
 		expect(accountUsageStops(overMonth, nextDay)).toBe(true);
 		expect(accountUsageStops(overMonth, nextMonth)).toBe(false);
-		// A snapshot saved before its reasons were kept is judged again.
+		// A snapshot saved before its reasons were kept is judged again: a
+		// month past its cap still stops, a share-based day stop no longer does.
 		const { exceeded: _saved, ...legacy } = overMonth;
 		expect(accountUsageStops(legacy, nextDay)).toBe(true);
+		const { exceeded: _none, ...shareStop } = accountUsageSnapshotFromResult(result(workerRequests(ACCOUNT_USAGE_POLICY.daily.workerRequests)), sampled);
+		expect(accountUsageStops({ ...shareStop, stop: true }, sampled)).toBe(false);
 	});
 
 	it("persists the snapshot in existing Durable Object metadata", async () => {

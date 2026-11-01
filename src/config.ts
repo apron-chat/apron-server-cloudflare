@@ -53,6 +53,12 @@ export interface RuntimeConfig {
 	 */
 	liveTextEnabled: boolean;
 	/**
+	 * Whether the attack pause may pause the server (src/burn.ts):
+	 * `ATTACK_PAUSE`, on unless `false`. Off, what would pause only alerts the
+	 * admins, a pause in force ends, and the budget guard ignores its hold.
+	 */
+	attackPause: boolean;
+	/**
 	 * Web Push (protocol §4.9, push kind `webpush`), on when the plan has a
 	 * push policy and the deployment sets `VAPID_PUBLIC_KEY`, `VAPID_SUBJECT`,
 	 * and the `VAPID_PRIVATE_KEY` secret.
@@ -206,6 +212,7 @@ type EnvLike = {
 	GUEST_POSTING?: string;
 	PRESENCE?: string;
 	LIVE_TEXT?: string;
+	ATTACK_PAUSE?: string;
 	APRON_ADMIN_TOKEN?: string;
 	MEDIA_ORIGIN?: string;
 	PUBLIC_ORIGIN?: string;
@@ -451,6 +458,7 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 	const uploads = loadUploads(env);
 	const liveText = loadLiveText(env, limits);
 	const liveTextEnabled = parseSwitch(env.LIVE_TEXT, "LIVE_TEXT", DEFAULT_FEATURES.liveText);
+	const attackPause = parseSwitch(env.ATTACK_PAUSE, "ATTACK_PAUSE", true);
 	if (PUSH_POLICY) validatePushPolicy(PUSH_POLICY);
 	const push = loadPush(env);
 	const pushHosts = loadPushHosts(env.PUSH_HOSTS);
@@ -487,6 +495,7 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 		pushDelaySeconds,
 		ogMediaHosts,
 		billCap: cap,
+		attackPause,
 	};
 }
 

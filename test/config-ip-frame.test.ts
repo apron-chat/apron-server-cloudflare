@@ -314,6 +314,12 @@ describe('configuration policy boundaries', () => {
 		for (const value of ['-1', 'five', 'Infinity']) expect(() => config({ BILL_CAP_MONTH: value })).toThrow(ConfigError);
 	});
 
+	it('turns the attack pause off only with ATTACK_PAUSE=false', () => {
+		expect(config().attackPause).toBe(true);
+		expect(config({ ATTACK_PAUSE: 'false' }).attackPause).toBe(false);
+		expect(() => config({ ATTACK_PAUSE: 'off' })).toThrow(ConfigError);
+	});
+
 	it('requires exact origins and bounds the browser display name', () => {
 		expect(() => loadConfig({})).toThrow(ConfigError);
 		expect(config({ ENVIRONMENT: 'development' }).allowedOrigins).toEqual([

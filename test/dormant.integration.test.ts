@@ -29,20 +29,31 @@ it('removes accounts nobody came back to, and keeps every account in use', async
 		user('subscribed', signedUp, signedUp);
 		sql.exec("INSERT INTO push_subscriptions (user_id, url, p256dh, auth, push_id, wake, created_ms, updated_ms) VALUES ('subscribed', 'https://push.example/1', 'k', 'a', 'p', 0, ?, ?)", signedUp, signedUp);
 		user('online', signedUp, signedUp);
+		// Nothing goes until `seen` has been kept for 30 days without a break:
+		// the first run starts that wait, and user status off restarts it.
+		expect(store.pruneDormantIdentities(now, new Set(['online']))).toEqual({ pruned: [], more: false });
+		const tracked = (since: number) => sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('dormant_tracking', ?)", JSON.stringify({ since }));
+		tracked(now - DORMANT_AFTER_MS);
+		expect(store.pruneDormantIdentities(now, new Set(['online']), false)).toEqual({ pruned: [], more: false });
+		expect(store.pruneDormantIdentities(now, new Set(['online']))).toEqual({ pruned: [], more: false });
+		tracked(now - DORMANT_AFTER_MS);
 		const result = store.pruneDormantIdentities(now, new Set(['online']));
-		expect(result).toEqual({ pruned: expect.arrayContaining(['passerby', 'never-offline']), more: false });
-		expect(result.pruned).toHaveLength(2);
+		// `never-offline` has no `seen` at all (an account from before it was kept, or carried over a reset): kept.
+		expect(result).toEqual({ pruned: ['passerby'], more: false });
 		const left = sql.exec<{ user_id: string }>('SELECT user_id FROM identities ORDER BY user_id').toArray().map((row) => row.user_id);
-		expect(left).toEqual(expect.arrayContaining(['came-back', 'passkey-later', 'recent', 'moderator', 'subscribed', 'online']));
+		expect(left).toEqual(expect.arrayContaining(['never-offline', 'came-back', 'passkey-later', 'recent', 'moderator', 'subscribed', 'online']));
 		expect(left).not.toContain('passerby');
 		for (const table of ['credentials', 'memberships']) {
-			expect(sql.exec<{ count: number }>(`SELECT COUNT(*) AS count FROM ${table} WHERE user_id IN ('passerby', 'never-offline')`).one().count).toBe(0);
+			expect(sql.exec<{ count: number }>(`SELECT COUNT(*) AS count FROM ${table} WHERE user_id = 'passerby'`).one().count).toBe(0);
 		}
-		expect(sql.exec<{ member_count: number }>("SELECT member_count FROM rooms WHERE room_id = 'general'").one().member_count).toBe(before + 6);
-		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'identity_count'").one().value).toBe('6');
+		expect(sql.exec<{ member_count: number }>("SELECT member_count FROM rooms WHERE room_id = 'general'").one().member_count).toBe(before + 7);
+		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'identity_count'").one().value).toBe('7');
 		// Retired, as /purge retires them: the user_id is never issued again.
-		expect(sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM _meta WHERE key IN ('purged:passerby', 'purged:never-offline')").one().count).toBe(2);
-		expect(store.dormantPruned(now)).toEqual({ today: 2, total: 2 });
+		expect(sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM _meta WHERE key = 'purged:passerby'").one().count).toBe(1);
+		expect(store.dormantPruned(now)).toEqual({ today: 1, total: 1 });
+		// Once a UTC day, whatever wakes in between: a second account gone dormant waits for tomorrow.
+		user('passerby-2', signedUp, signedUp + 60_000);
 		expect(store.pruneDormantIdentities(now, new Set(['online']))).toEqual({ pruned: [], more: false });
+		expect(store.pruneDormantIdentities(now + day, new Set(['online']))).toEqual({ pruned: ['passerby-2'], more: false });
 	});
 });
