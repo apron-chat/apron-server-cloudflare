@@ -274,13 +274,15 @@ describe('store live text', () => {
 			register(store, clock, 'tess');
 			const created = post(store, clock, 'tess', { body: { text: '', embeds: [{ kind: 'terminal', title: 'make test', url: 'https://evil.example/', output: 'forged' }] } });
 			const embed = (created.message!.body!.embeds as Array<Record<string, unknown>>)[0];
-			// The server owns url and output (§4.8.2); the broadcast that creates it carries url.
-			expect(embed).toEqual({ embed_id: expect.stringMatching(/^embed_/), kind: 'terminal', title: 'make test', url: expect.stringMatching(/^https:\/\/demo\.test\/live\/[A-Za-z0-9_-]{22}$/) });
+			// The server owns url and output (§4.8.2); the embed has no url until its write starts (§4.8.5).
+			expect(embed).toEqual({ embed_id: expect.stringMatching(/^embed_/), kind: 'terminal', title: 'make test' });
 			const write = writeOf(created.result);
 			expect(write).toEqual({ embed_id: embed.embed_id, kind: 'terminal', write: { key: expect.stringMatching(/^l\/[A-Za-z0-9_-]{22}$/), max_bytes: LIVE.maxInputBytes, expires_ms: clock.value + LIVE.writeWindowSeconds * 1_000 } });
 			const claimed = store.claimLiveText(write.write.key, clock.value);
 			expect(claimed?.entry).toMatchObject({ state: 'live', startedMs: clock.value, maxMs: 120_000, messageId: created.result.message_id });
-			expect(claimed?.broadcasts).toEqual([]);
+			// The write's start republishes the message with the embed's url.
+			expect(claimed?.broadcasts).toHaveLength(1);
+			expect(bodyOf(claimed!).body!.embeds).toEqual([{ ...embed, url: expect.stringMatching(/^https:\/\/demo\.test\/live\/[A-Za-z0-9_-]{22}$/) }]);
 			expect(store.claimLiveText(write.write.key, clock.value)).toBeNull();
 			const finished = store.finishLiveText(write.write.key, encode('ignored\x1b[1mbold'), clock.value);
 			// The store keeps the last 8 bytes itself, whatever it is given: they start at ESC.
@@ -303,9 +305,9 @@ describe('store live text', () => {
 			expect(claimed.entry.limit).toBe(14);
 			const finished = store.finishLiveText(write.write.key, encode('roll back @carol'), clock.value);
 			const params = finished.broadcasts[0].params as { body: Record<string, unknown>; prev_log_id: string };
-			// The appended text does not change mentions.
+			// The appended text does not change mentions. It follows the snapshot that added the url.
 			expect(params.body).toEqual({ text: 'Plan: roll back @car', format: 'markdown', mentions: ['bob'] });
-			expect(params.prev_log_id).toBe(created.result.message_id);
+			expect(params.prev_log_id).toBe(claimed.broadcasts[0].params.log_id);
 			// At most one append in a message (§4.8.5, invalid_params), and one live text per message (policy).
 			expect(errorCode(() => post(store, clock, 'bob', { body: { embeds: [{ kind: 'append' }, { kind: 'append' }] } }))).toBe('invalid_params');
 			expect(errorCode(() => post(store, clock, 'bob', { body: { embeds: [{ kind: 'terminal' }, { kind: 'append' }] } }))).toBe('denied');
