@@ -290,6 +290,14 @@ describe('configuration policy boundaries', () => {
 	});
 
 
+	it('reads the bill cap in dollars from BILL_CAP_DAY and BILL_CAP_MONTH', () => {
+		const cap = ACCOUNT_USAGE_POLICY.billCap;
+		if (!cap) return expect(config({ BILL_CAP_DAY: '1' }).billCap).toBeNull();
+		expect(config().billCap).toEqual({ dayUsd: cap.dayUsd, monthUsd: cap.monthUsd });
+		expect(config({ BILL_CAP_DAY: '0', BILL_CAP_MONTH: '12.50' }).billCap).toEqual({ dayUsd: 0, monthUsd: 12.5 });
+		for (const value of ['-1', 'five', 'Infinity']) expect(() => config({ BILL_CAP_MONTH: value })).toThrow(ConfigError);
+	});
+
 	it('requires exact origins and bounds the browser display name', () => {
 		expect(() => loadConfig({})).toThrow(ConfigError);
 		expect(config({ ENVIRONMENT: 'development' }).allowedOrigins).toEqual([

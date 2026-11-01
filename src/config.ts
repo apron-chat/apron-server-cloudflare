@@ -1,5 +1,6 @@
 import * as budget from "./budget.ts";
 import { DEFAULT_FEATURES, DEFAULT_LIMITS, LIVE_TEXT_POLICY, MAX_PUSH_CANDIDATES, MAX_PUSHES_PER_MESSAGE, MAX_STATUS_DELAY_SECONDS, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits, type LiveTextPolicy, type PushPolicy } from "./budget.ts";
+import { billCap, type BillCap } from "./pricing.ts";
 import { base64UrlDecode, P256_PRIVATE_KEY_BYTES, P256_PUBLIC_KEY_BYTES, vapidKeysMatch, type VapidKeys } from "./webpush.ts";
 export { DEFAULT_LIMITS } from "./budget.ts";
 
@@ -73,6 +74,12 @@ export interface RuntimeConfig {
 	 * an empty list keeps no remote media.
 	 */
 	ogMediaHosts: readonly string[] | "*";
+	/**
+	 * The overage in dollars the server may run up before the account stop
+	 * (`BILL_CAP_DAY`, `BILL_CAP_MONTH`, else the plan's `billCap`); null on
+	 * a plan that fails closed at its allowances.
+	 */
+	billCap: BillCap | null;
 }
 
 /** The browsers' own push services, allowed when `PUSH_HOSTS` is unset. */
@@ -185,6 +192,8 @@ export class ConfigError extends Error {
 }
 
 type EnvLike = {
+	BILL_CAP_DAY?: string;
+	BILL_CAP_MONTH?: string;
 	ALLOWED_ORIGINS?: string;
 	RP_ID?: string;
 	RP_ORIGINS?: string;
@@ -452,6 +461,12 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 		throw new ConfigError("RP_NAME exceeds the configured display-name policy");
 	}
 	const server = loadServerMetadata(env, limits);
+	let cap: BillCap | null;
+	try {
+		cap = billCap({ BILL_CAP_DAY: env.BILL_CAP_DAY === undefined ? undefined : String(env.BILL_CAP_DAY), BILL_CAP_MONTH: env.BILL_CAP_MONTH === undefined ? undefined : String(env.BILL_CAP_MONTH) });
+	} catch (error) {
+		throw new ConfigError((error as Error).message);
+	}
 	return {
 		limits,
 		allowedOrigins,
@@ -471,6 +486,7 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 		pushHosts,
 		pushDelaySeconds,
 		ogMediaHosts,
+		billCap: cap,
 	};
 }
 

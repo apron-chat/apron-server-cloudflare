@@ -11,6 +11,12 @@ guarantee work is in
 budgets are in `src/plans/` ([configuration](configuration.md#plans)).
 Production runs Workers Paid; Free figures are given where they differ.
 
+Since 2026-11-01 the Paid account stop is a bill cap in dollars of overage
+($5 added in a day, $25 in a month; [budget guard](configuration.md#budget-guard)),
+not 90% of a daily share or half the month's inclusion. Sections below that
+say "daily stop" or "monthly stop at 50%" describe the stops in force when
+they were measured; their usage figures still hold.
+
 Reproduce with the repository's workerd launcher:
 
 ```sh

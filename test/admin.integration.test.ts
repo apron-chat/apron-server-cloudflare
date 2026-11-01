@@ -169,6 +169,34 @@ it('/status leads with the server state, then the Cloudflare usage and the demo 
 	} finally { admin.close(); }
 });
 
+it.runIf(ACCOUNT_USAGE_POLICY.billCap)('/status estimates the bill against the bill cap', async () => {
+	const now = Date.now();
+	const day = new Date(now).toISOString().slice(0, 10);
+	const zero = { workerRequests: 0, durableObjectRequests: 0, durableObjectDurationGbSeconds: 0, sqlRowsRead: 0, sqlRowsWritten: 0 };
+	// 30 million Worker requests this month, one million of them today: $6 of overage, $0.30 of it today.
+	const snapshot = {
+		day, sampledAt: now, ...zero, workerRequests: 1_000_000, storedBytes: 0, workerCpuMs: 0, logBytes: 0,
+		month: { month: day.slice(0, 7), ...zero, workerRequests: 30_000_000, workerCpuMs: 0, logBytes: 0 },
+		stop: false, exceeded: [],
+	};
+	await runInDurableObject(stub(), (instance) => {
+		(instance as unknown as { accountUsage: { restore(snapshot: unknown): void } }).accountUsage.restore(snapshot);
+	});
+	const admin = await signedInAdmin();
+	try {
+		const text: string = (await command(admin, 'status', '/status')).notice!.params.body.text;
+		expect(text).toContain('stops past $5 of overage in a UTC day or $25 in a month');
+		expect(text).toContain(`- Estimated bill for ${day.slice(0, 7)}: $11 ($5 plan + $6 overage: Worker requests $6)`);
+		expect(text).toContain('- Overage added today: $0.30 of $5');
+		expect(text).toContain('- Overage this month: $6 of $25');
+	} finally {
+		admin.close();
+		await runInDurableObject(stub(), (instance) => {
+			(instance as unknown as { accountUsage: { restore(snapshot: unknown): void } }).accountUsage.restore(null);
+		});
+	}
+});
+
 it('/rename moves a registered user, their passkey, rooms and admin status to a new user_id', async () => {
 	const admin = await signedInAdmin();
 	const fromId = unique('dave');

@@ -104,11 +104,24 @@ what the plan includes. Incoming WebSocket messages, which analytics report as
 bills them, and as a whole one on Free. On Paid it also reads usage since the
 start of the calendar month against the plan's `monthly` allowances.
 
-At 90% of any daily allowance or of stored bytes, or `monthlyStopRatio` of a
-monthly allowance, the object persists a stop, rejects new connections, and
-closes live sockets. A daily stop holds for that UTC day, and a monthly one
-for that calendar month, even while a refresh in the new day is pending or
-failing. This is an early-stop signal, not an exact remaining-quota meter:
+On a plan that fails closed (Free), the stop is at 90% of any daily
+allowance or of stored bytes. On a plan that bills past its inclusions
+(Paid), the stop is in dollars: `src/pricing.ts` prices the month's usage
+past each inclusion at Cloudflare's list prices (rounded up to whole billing
+units, as Cloudflare does), and the server stops when the overage added
+today passes `BILL_CAP_DAY` (default $5) or the month's passes
+`BILL_CAP_MONTH` (default $25), on top of the $5 plan. A day well past its
+31st share of the month costs nothing while the month stays inside its
+inclusions, so a busy day no longer stops the server. Set either variable
+in `wrangler.production.toml` as a dollar amount (`"0"` stops at the first
+billed unit); a value that is not one fails startup.
+
+At its stop line the object persists a stop, rejects new connections, and
+closes live sockets once. A daily stop holds for that UTC day, and a monthly
+one (`monthly.*` on Free, the month's bill cap on Paid) for that calendar
+month, even while a refresh in the new day is pending or failing. `/status`
+shows the estimated bill for the month ($5 plus the overage, by resource),
+the overage added today, and both caps. This is an early-stop signal, not an exact remaining-quota meter:
 analytics lag, sampling, and other account workloads can still cause an
 earlier or later platform limit.
 
@@ -132,13 +145,15 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
 - The production Worker's cron trigger runs it every minute. It reads the
   account's usage for today and for the calendar month so far, the same way
   the account-usage stop does (above).
-- While usage has reached 90% of any daily share, or `monthlyStopRatio` (one
-  half) of any monthly allowance, it turns on the zone custom rule
-  `apron_budget_stop`, which blocks `server.apron.chat` (and, with uploads,
-  `media.apron.chat`) at the edge. Blocked
-  requests never invoke the Worker and are not billed. It turns the rule off
-  once usage is back under every allowance: at the next UTC day for a daily
-  share, or the next month for a monthly one. It touches no other rule, so
+- While the estimated overage passes the bill cap (`BILL_CAP_DAY` for the
+  day, `BILL_CAP_MONTH` for the month; see the account-usage stop above), it
+  turns on the zone custom rule `apron_budget_stop`, which blocks
+  `server.apron.chat` (and, with uploads, `media.apron.chat`) at the edge.
+  Blocked requests never invoke the Worker and are not billed. It turns the
+  rule off once the overage is back under both caps: at the next UTC day for
+  the day's cap, or the next month for the month's. The worst a billing
+  cycle can cost is the plan plus two months' caps ($55 at the defaults),
+  plus what runs up during the minute or so analytics lag behind. It touches no other rule, so
   `apron_admission_off` stays yours to use by hand.
 - **Admin alert.** When the guard or the flood trip (below) turns the rule
   on or off, when the server changes tier or an action's breaker opens or

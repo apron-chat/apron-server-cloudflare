@@ -221,11 +221,21 @@ interface AccountAllowance {
 	/** Incoming WebSocket messages billed as one Durable Object request. */
 	webSocketMessagesPerRequest: number;
 	/**
-	 * Included usage per month, for a plan that bills past it. Usage since the
-	 * start of the UTC calendar month stops at `monthlyStopRatio` of any of it.
+	 * Included usage per month, for a plan that bills past it. With a
+	 * `billCap` the stop is in dollars of overage (src/pricing.ts); without
+	 * one, usage since the start of the UTC calendar month stops at
+	 * `monthlyStopRatio` of any of it.
 	 */
 	monthly?: Readonly<MonthlyAllowance>;
 	monthlyStopRatio?: number;
+	/**
+	 * Dollars of overage past the monthly inclusions the server may run up
+	 * before it stops: added today (`dayUsd`, lifts at midnight UTC) or this
+	 * calendar month (`monthUsd`, lifts on the 1st). It replaces the daily
+	 * shares and `monthlyStopRatio` as the stop. `BILL_CAP_DAY` and
+	 * `BILL_CAP_MONTH` override it.
+	 */
+	billCap?: Readonly<{ dayUsd: number; monthUsd: number }>;
 	/** How the monthly stop estimates `logBytes`, for a plan with monthly allowances. */
 	logEstimate?: Readonly<LogEstimate>;
 	/**

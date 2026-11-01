@@ -5,7 +5,8 @@ import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllo
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
 import { LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
-import { AccountUsageMonitor, exceededAllowances } from "./account-usage";
+import { AccountUsageMonitor, snapshotBill, snapshotReasons } from "./account-usage";
+import { PRICED_LABEL, PRICES, usd } from "./pricing";
 import { EDGE_STOP_RULE_REF, readEdgeStop, runBudgetGuard, watchForFlood } from "./budget-guard";
 import { recordMetric } from "./metrics";
 import { notifyTrigger, TIER_LABEL, type NoticeChannels, type ServerTier, type TriggerNotice } from "./notify";
@@ -5392,8 +5393,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const breakers = this.store.accountingGuard(now).breakers;
 		if (this.accountUsage.stops(now)) {
 			const snapshot = this.accountUsage.snapshot;
-			const reached = snapshot ? exceededAllowances(snapshot) : [];
-			return { tier: "account_stop", reasons: [`Cloudflare usage reached ${reached.length ? reached.join(", ") : "a stop line"}`], breakers };
+			const reached = snapshot ? snapshotReasons(snapshot) : [];
+			const lead = this.config.billCap ? "Cloudflare bill cap reached" : "Cloudflare usage reached";
+			return { tier: "account_stop", reasons: [`${lead}: ${reached.length ? reached.join(", ") : "a stop line"}`], breakers };
 		}
 		const shares = this.store.budgetShares(now);
 		if (!shares) return { tier: null, reasons: [], breakers };
@@ -6961,11 +6963,21 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const daily = ACCOUNT_USAGE_POLICY.daily;
 		if (usage) {
 			const stopping = this.accountUsage.stops(now);
-			const reached = stopping ? exceededAllowances(usage) : [];
+			const reached = stopping ? snapshotReasons(usage) : [];
+			const cap = this.config.billCap;
+			const bill = cap ? snapshotBill(usage) : null;
+			const stopLine = cap ? `stops past ${usd(cap.dayUsd)} of overage in a UTC day or ${usd(cap.monthUsd)} in a month` : `stops at ${Math.round(ACCOUNT_USAGE_POLICY.stopRatio * 100)}% of a daily share`;
+			lines.push(`**Cloudflare account, ${usage.day}** (sampled ${utc(usage.sampledAt)}; ${stopLine}${stopping ? `; **stopped**: ${reached.join(", ")}` : ""})`, "");
+			if (cap && bill) {
+				lines.push(
+					`- Estimated bill for ${usage.month?.month ?? usage.day.slice(0, 7)}: ${usd(PRICES.baseUsd + bill.monthUsd)} (${usd(PRICES.baseUsd)} plan + ${usd(bill.monthUsd)} overage${bill.items.length ? `: ${bill.items.map(([field, amount]) => `${PRICED_LABEL[field]} ${usd(amount)}`).join(", ")}` : ""})`,
+					`- Overage added today: ${usd(bill.dayUsd)} of ${usd(cap.dayUsd)}`,
+					`- Overage this month: ${usd(bill.monthUsd)} of ${usd(cap.monthUsd)}`,
+					"",
+				);
+			}
 			lines.push(
-				`**Cloudflare account, ${usage.day}** (sampled ${utc(usage.sampledAt)}; stops at ${Math.round(ACCOUNT_USAGE_POLICY.stopRatio * 100)}% of a daily share${stopping ? `; **stopped**: reached ${reached.join(", ")}` : ""})`,
-				"",
-				`Used / ${PLAN.name} daily allowance:`,
+				`Used / ${PLAN.name} daily ${cap ? "share of the month's inclusion (past it is billed, not stopped)" : "allowance"}:`,
 				`- Worker requests: ${share(usage.workerRequests, daily.workerRequests)}`,
 				`- Durable Object requests: ${share(usage.durableObjectRequests, daily.durableObjectRequests)}`,
 				`- Durable Object duration (GB-s): ${share(usage.durableObjectDurationGbSeconds, daily.durableObjectDurationGbSeconds)}`,
@@ -6986,7 +6998,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				const month = usage.month;
 				lines.push(
 					"",
-					`**${month.month}**, used / ${PLAN.name} monthly allowance (stops at ${Math.round((ACCOUNT_USAGE_POLICY.monthlyStopRatio ?? ACCOUNT_USAGE_POLICY.stopRatio) * 100)}%):`,
+					cap ? `**${month.month}**, used / ${PLAN.name} monthly inclusion:` : `**${month.month}**, used / ${PLAN.name} monthly allowance (stops at ${Math.round((ACCOUNT_USAGE_POLICY.monthlyStopRatio ?? ACCOUNT_USAGE_POLICY.stopRatio) * 100)}%):`,
 					`- Worker requests: ${share(month.workerRequests, monthly.workerRequests)}`,
 					`- Worker CPU (ms): ${share(month.workerCpuMs, monthly.workerCpuMs)}`,
 					`- Durable Object requests: ${share(month.durableObjectRequests, monthly.durableObjectRequests)}`,

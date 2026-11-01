@@ -32,9 +32,10 @@
 // None of that bounds hostile traffic that never gets past the entry Worker,
 // which is billed per request. An edge block rule stops requests before they
 // invoke the Worker (src/budget-guard.ts). The Worker turns it on within
-// seconds of a flood; the budget guard, every minute, turns it on when usage
-// reaches the daily share or `monthlyStopRatio` of the month's included
-// usage, and off once usage is back under every allowance.
+// seconds of a flood; the budget guard, every minute, turns it on when the
+// estimated overage (src/pricing.ts) passes the bill cap below, and off once
+// it is back under. Usage past a daily share costs nothing while the month
+// stays inside its inclusions, so a busy day runs on instead of stopping.
 import type { Plan } from "../budget.ts";
 import { FREE_PLAN } from "./free.ts";
 
@@ -119,12 +120,8 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// Paid bills 20 incoming WebSocket messages as one request; analytics
 		// report each message.
 		webSocketMessagesPerRequest: 20,
-		// Paid bills past these instead of failing. The daily shares keep any 31
-		// days under 90% of them, but each daily stop lands a detection lag
-		// late; stopping usage since the start of the calendar month at
-		// monthlyStopRatio bounds those overshoots too. A billing cycle overlaps
-		// at most two calendar months, so at one half the cycle stays inside
-		// what the plan includes even when it does not start on the 1st.
+		// Paid bills past these instead of failing; src/pricing.ts prices what
+		// runs over them, and billCap stops the server on the estimate.
 		monthly: Object.freeze({
 			workerRequests: 10_000_000,
 			workerCpuMs: 30_000_000,
@@ -142,7 +139,12 @@ export const PAID_PLAN: Plan = Object.freeze({
 			// request stop comes long before its 12 million Durable Object ones.
 			logBytes: 50_000_000_000,
 		}),
-		monthlyStopRatio: 0.5,
+		// The overage the server may run up: $5 added in one UTC day, or $25 in
+		// a calendar month, past the $5 plan. A billing cycle overlaps at most
+		// two calendar months, so a cycle costs at most $55 more than the plan.
+		// Each stop lands a detection lag (a minute or so of analytics) late;
+		// the attack pause (src/index.ts) stops a flood long before either.
+		billCap: Object.freeze({ dayUsd: 5, monthUsd: 25 }),
 		// Measured on the demo in October 2026: Durable Object events about
 		// 1 KB, entry Worker events up to 6.3 KB with their request headers.
 		logEstimate: Object.freeze({
@@ -165,8 +167,8 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// Sampling keeps the per-request cost to one random number; the rate
 		// limiter counts 60 sampled requests a minute.
 		floodSampleEvery: 20,
-		// Long enough for analytics to show the flood, so the guard's daily or
-		// monthly stop takes over before the hold ends.
+		// Long enough for analytics to show the flood, so the guard's bill cap
+		// takes over before the hold ends if the flood ran up the bill.
 		holdSeconds: 30 * 60,
 	}),
 	// Images and voice clips kept in R2 and served from its public bucket

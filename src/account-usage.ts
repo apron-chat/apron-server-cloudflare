@@ -1,4 +1,5 @@
 import { ACCOUNT_USAGE_POLICY } from "./budget";
+import { billCap, billReasons, estimateBill, type BillCap, type BillCapEnvironment, type BillEstimate } from "./pricing";
 
 export interface AccountUsageSnapshot {
 	day: string;
@@ -9,11 +10,20 @@ export interface AccountUsageSnapshot {
 	sqlRowsRead: number;
 	sqlRowsWritten: number;
 	storedBytes: number;
+	/** Worker CPU today, for a plan that bills past its included usage. */
+	workerCpuMs?: number;
+	/** Log bytes today, estimated like the month's (`logEstimate`). */
+	logBytes?: number;
 	/** Usage since the start of the UTC calendar month, for a plan that bills past its included usage. */
 	month?: AccountUsageMonth;
 	/** R2 today, for a plan with R2 allowances: operations by class, and bytes stored across buckets. */
 	r2?: R2Usage & { storedBytes: number };
 	stop: boolean;
+	/**
+	 * Why it stops (exceededAllowances under the cap it was read with); a
+	 * snapshot saved before this field was kept is judged again on read.
+	 */
+	exceeded?: string[];
 }
 
 interface R2Usage {
@@ -60,7 +70,7 @@ function r2StoredBytes(groups: unknown): number {
 	}, 0);
 }
 
-export interface AccountUsageEnvironment {
+export interface AccountUsageEnvironment extends BillCapEnvironment {
 	ACCOUNT_ID?: string;
 	ACCOUNT_ANALYTICS_TOKEN?: string;
 }
@@ -110,10 +120,40 @@ function max(groups: unknown, field: string): number {
 }
 
 /**
- * The allowances usage has reached its stop ratio of, as `daily.<field>`,
- * `storedBytes`, or `monthly.<field>`; empty while it may continue.
+ * The estimated bill for a snapshot's month and its share from today, for a
+ * plan that bills past its inclusions; null without the month's usage.
  */
-export function exceededAllowances(usage: Omit<AccountUsageSnapshot, "stop">): string[] {
+export function snapshotBill(usage: Omit<AccountUsageSnapshot, "stop">): BillEstimate | null {
+	const month = usage.month;
+	if (!month) return null;
+	return estimateBill(
+		{ ...month, r2ClassAOperations: month.r2?.classAOperations ?? 0, r2ClassBOperations: month.r2?.classBOperations ?? 0 },
+		{
+			workerRequests: usage.workerRequests,
+			workerCpuMs: usage.workerCpuMs ?? 0,
+			durableObjectRequests: usage.durableObjectRequests,
+			durableObjectDurationGbSeconds: usage.durableObjectDurationGbSeconds,
+			sqlRowsRead: usage.sqlRowsRead,
+			sqlRowsWritten: usage.sqlRowsWritten,
+			logBytes: usage.logBytes ?? 0,
+			r2ClassAOperations: usage.r2?.classAOperations ?? 0,
+			r2ClassBOperations: usage.r2?.classBOperations ?? 0,
+		},
+		usage.storedBytes,
+		usage.r2?.storedBytes ?? 0,
+	);
+}
+
+/**
+ * Why usage stops the server, empty while it may continue. On a plan with a
+ * bill cap, in dollars: `day overage $5.20 over $5`, `month overage $26.10
+ * over $25` (billReasons). On a plan that fails closed at its allowances,
+ * the allowances reached at their stop ratio: `daily.<field>`,
+ * `storedBytes`, or `monthly.<field>`.
+ */
+export function exceededAllowances(usage: Omit<AccountUsageSnapshot, "stop">, cap: BillCap | null = billCap()): string[] {
+	const bill = cap ? snapshotBill(usage) : null;
+	if (cap && bill) return billReasons(bill, cap);
 	const { daily, monthly, monthlyStopRatio, stopRatio, storedBytes, r2 } = ACCOUNT_USAGE_POLICY;
 	const ratio = monthlyStopRatio ?? stopRatio;
 	const exceeded = (Object.keys(daily) as (keyof typeof daily)[])
@@ -137,20 +177,25 @@ export function exceededAllowances(usage: Omit<AccountUsageSnapshot, "stop">): s
 	return exceeded;
 }
 
+/** Why a snapshot stops (its saved reasons, or judged now for an older one). */
+export function snapshotReasons(snapshot: AccountUsageSnapshot): string[] {
+	return snapshot.exceeded ?? exceededAllowances(snapshot);
+}
+
 /**
  * Whether a snapshot still stops the server at `now`: through its UTC day,
- * or, when it reached a monthly allowance, through its calendar month, so a
- * monthly stop does not lift at midnight while the next reading is pending
- * or failing.
+ * or, when it reached a monthly line (`monthly.<field>`, or the month's
+ * bill cap), through its calendar month, so a monthly stop does not lift at
+ * midnight while the next reading is pending or failing.
  */
 export function accountUsageStops(snapshot: AccountUsageSnapshot | null, now: number): boolean {
 	if (!snapshot?.stop) return false;
 	const today = dayFor(now);
 	if (snapshot.day === today) return true;
-	return snapshot.day.slice(0, 7) === today.slice(0, 7) && exceededAllowances(snapshot).some((name) => name.startsWith("monthly."));
+	return snapshot.day.slice(0, 7) === today.slice(0, 7) && snapshotReasons(snapshot).some((name) => name.startsWith("month"));
 }
 
-export function accountUsageSnapshotFromResult(result: unknown, sampledAt: number): AccountUsageSnapshot {
+export function accountUsageSnapshotFromResult(result: unknown, sampledAt: number, cap: BillCap | null = billCap()): AccountUsageSnapshot {
 	if (!result || typeof result !== "object") throw new AccountUsageError("analytics result is missing");
 	const data = (result as { data?: unknown; errors?: unknown[] }).data;
 	const errors = (result as { errors?: unknown[] }).errors;
@@ -159,19 +204,25 @@ export function accountUsageSnapshotFromResult(result: unknown, sampledAt: numbe
 	const viewer = (data as { viewer?: { accounts?: unknown[] } }).viewer;
 	const account = viewer?.accounts?.[0] as Record<string, unknown> | undefined;
 	if (!account) throw new AccountUsageError("analytics account is missing");
+	const workerRequests = sum(account.workersInvocationsAdaptive, "requests");
 	const usage = {
 		day: dayFor(sampledAt),
 		sampledAt,
-		workerRequests: sum(account.workersInvocationsAdaptive, "requests"),
+		workerRequests,
 		durableObjectRequests: sum(account.durableObjectsInvocationsAdaptiveGroups, "requests", billedRequestWeight),
 		durableObjectDurationGbSeconds: sum(account.durableObjectsPeriodicGroups, "duration"),
 		sqlRowsRead: sum(account.durableObjectsPeriodicGroups, "rowsRead"),
 		sqlRowsWritten: sum(account.durableObjectsPeriodicGroups, "rowsWritten"),
 		storedBytes: max(account.durableObjectsStorageGroups, "storedBytes"),
-		...(ACCOUNT_USAGE_POLICY.monthly ? { month: monthUsage(account, sampledAt) } : {}),
+		...(ACCOUNT_USAGE_POLICY.monthly ? {
+			workerCpuMs: sum(account.workersInvocationsAdaptive, "cpuTimeUs") / 1_000,
+			logBytes: logBytes(workerRequests, sum(account.durableObjectsInvocationsAdaptiveGroups, "requests")),
+			month: monthUsage(account, sampledAt),
+		} : {}),
 		...(ACCOUNT_USAGE_POLICY.r2 ? { r2: { ...r2Operations(account.r2Operations), storedBytes: r2StoredBytes(account.r2Storage) } } : {}),
 	};
-	return { ...usage, stop: exceededAllowances(usage).length > 0 };
+	const exceeded = exceededAllowances(usage, cap);
+	return { ...usage, stop: exceeded.length > 0, exceeded };
 }
 
 /**
@@ -220,7 +271,7 @@ export async function fetchAccountUsage(env: AccountUsageEnvironment, sampledAt 
 		r2Storage: r2StorageAdaptiveGroups(${day}) { dimensions { bucketName } max { payloadSize metadataSize } }${ACCOUNT_USAGE_POLICY.monthly ? `
 		monthR2Operations: r2OperationsAdaptiveGroups(${month}) { dimensions { actionType } sum { requests } }` : ""}` : "";
 	const query = `query { viewer { accounts(filter: { accountTag: ${JSON.stringify(env.ACCOUNT_ID)} }) {
-		workersInvocationsAdaptive(${day}) { sum { requests } }
+		workersInvocationsAdaptive(${day}) { sum { requests${ACCOUNT_USAGE_POLICY.monthly ? " cpuTimeUs" : ""} } }
 		durableObjectsInvocationsAdaptiveGroups(${day}) { dimensions { type } sum { requests } }
 		durableObjectsPeriodicGroups(${day}) { sum { duration rowsRead rowsWritten } }
 		durableObjectsStorageGroups(${day}) { max { storedBytes } }${monthly}${r2}
@@ -232,7 +283,7 @@ export async function fetchAccountUsage(env: AccountUsageEnvironment, sampledAt 
 		signal,
 	});
 	if (!response.ok) throw new AccountUsageError(`analytics HTTP ${response.status}`);
-	return accountUsageSnapshotFromResult(await response.json(), sampledAt);
+	return accountUsageSnapshotFromResult(await response.json(), sampledAt, billCap(env));
 }
 
 interface AccountUsageMonitorOptions {

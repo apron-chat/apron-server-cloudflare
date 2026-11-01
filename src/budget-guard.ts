@@ -1,4 +1,4 @@
-import { exceededAllowances, fetchAccountUsage, type AccountUsageEnvironment } from "./account-usage";
+import { fetchAccountUsage, snapshotReasons, type AccountUsageEnvironment } from "./account-usage";
 import { PLAN } from "./budget";
 
 /**
@@ -99,8 +99,9 @@ async function setEdgeStop(env: StopRuleEnvironment, stop: boolean, exceeded: st
 }
 
 /**
- * Compares account usage with the plan's allowances and turns the edge stop
- * rule on while any is reached, off once none is and the hold has passed.
+ * Compares account usage with the plan's stop lines (the bill cap, on a plan
+ * that bills past its inclusions) and turns the edge stop rule on while any
+ * is passed, off once none is and the hold has passed.
  * Runs from the Worker's cron trigger, which the edge rule does not block.
  * When usage or the rule cannot be read, the rule keeps its current state.
  */
@@ -112,7 +113,7 @@ export async function runBudgetGuard(env: BudgetGuardEnvironment, now = Date.now
 	}
 	let exceeded: string[];
 	try {
-		exceeded = exceededAllowances(await fetchAccountUsage(env, now, undefined, fetcher));
+		exceeded = snapshotReasons(await fetchAccountUsage(env, now, undefined, fetcher));
 	} catch (error) {
 		log("budget_guard_usage_failed", { message: message(error) }, "error");
 		return { outcome: "usage_failed" };

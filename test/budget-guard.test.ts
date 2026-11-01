@@ -4,6 +4,7 @@ import worker from "../src/index";
 import * as guard from "../src/budget-guard";
 import * as notifier from "../src/notify";
 import { ACCOUNT_USAGE_POLICY as POLICY, PLAN } from "../src/budget";
+import { billCap } from "../src/pricing";
 import { EDGE_STOP_RULE_REF, readEdgeStop, resetFloodWatch, runBudgetGuard, watchForFlood } from "../src/budget-guard";
 
 const env = { ACCOUNT_ID: "account", ACCOUNT_ANALYTICS_TOKEN: "analytics", ZONE_ID: "zone", EDGE_STOP_TOKEN: "edge" };
@@ -12,7 +13,7 @@ const rule = { id: "rule-1", ref: EDGE_STOP_RULE_REF, action: "block", expressio
 function usage(workerRequests = 1) {
 	return {
 		data: { viewer: { accounts: [{
-			workersInvocationsAdaptive: [{ sum: { requests: workerRequests } }],
+			workersInvocationsAdaptive: [{ sum: { requests: workerRequests, cpuTimeUs: 1 } }],
 			durableObjectsInvocationsAdaptiveGroups: [{ sum: { requests: 1 } }],
 			durableObjectsPeriodicGroups: [{ sum: { duration: 1, rowsRead: 1, rowsWritten: 1 } }],
 			durableObjectsStorageGroups: [{ max: { storedBytes: 1 } }],
@@ -46,16 +47,31 @@ function api({ workerRequests = 1, enabled = false, rules, analyticsStatus = 200
 	return { fetcher: fetcher as unknown as typeof fetch, updates, calls: fetcher.mock.calls };
 }
 
-const overDaily = POLICY.daily.workerRequests;
+// A day and month of 100 million Worker requests, all of it today: 90
+// million past the inclusion ($27), and their sampled logs, about 82 GB
+// against 50 GB included ($8).
+const overDaily = 100_000_000;
 
 describe("budget guard", () => {
-	it("turns the edge stop on once usage reaches an allowance, keeping the rule as it was", async () => {
+	it("turns the edge stop on once the overage passes the bill cap, keeping the rule as it was", async () => {
 		const { fetcher, updates } = api({ workerRequests: overDaily });
-		expect(await runBudgetGuard(env, Date.now(), fetcher)).toEqual({ outcome: "changed", stop: true, exceeded: ["daily.workerRequests"] });
+		expect(await runBudgetGuard(env, Date.now(), fetcher)).toEqual({ outcome: "changed", stop: true, exceeded: ["day overage $35 over $5", "month overage $35 over $25"] });
 		expect(updates).toEqual([{ ref: rule.ref, action: rule.action, expression: rule.expression, description: rule.description, enabled: true }]);
 	});
 
-	it("turns the edge stop off once usage is back under every allowance", async () => {
+	it.runIf(billCap())("runs on through a day past its daily share that costs nothing, and follows BILL_CAP_*", async () => {
+		// Three days' share of requests in one, still inside the month's inclusion.
+		const busy = api({ workerRequests: POLICY.daily.workerRequests * 3 });
+		expect(await runBudgetGuard(env, Date.now(), busy.fetcher)).toEqual({ outcome: "unchanged", stop: false, exceeded: [] });
+		const raised = api({ workerRequests: overDaily });
+		expect(await runBudgetGuard({ ...env, BILL_CAP_DAY: "40", BILL_CAP_MONTH: "40" }, Date.now(), raised.fetcher)).toEqual({ outcome: "unchanged", stop: false, exceeded: [] });
+		const lowered = api({ workerRequests: overDaily });
+		expect(await runBudgetGuard({ ...env, BILL_CAP_DAY: "40", BILL_CAP_MONTH: "34.5" }, Date.now(), lowered.fetcher)).toMatchObject({ outcome: "changed", stop: true, exceeded: ["month overage $35 over $34.50"] });
+		const invalid = api({ workerRequests: overDaily });
+		expect(await runBudgetGuard({ ...env, BILL_CAP_DAY: "lots" }, Date.now(), invalid.fetcher)).toEqual({ outcome: "usage_failed" });
+	});
+
+	it("turns the edge stop off once the overage is back under the cap", async () => {
 		const { fetcher, updates } = api({ enabled: true });
 		expect(await runBudgetGuard(env, Date.now(), fetcher)).toMatchObject({ outcome: "changed", stop: false });
 		expect(updates).toEqual([expect.objectContaining({ enabled: false })]);

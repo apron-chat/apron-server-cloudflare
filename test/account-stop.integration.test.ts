@@ -19,7 +19,7 @@ async function open(stub: DurableObjectStub) {
 }
 
 /**
- * A snapshot that stops the server: past a monthly allowance and sampled on
+ * A snapshot that stops the server: past the month's bill cap ($26 of CPU) and sampled on
  * the 1st, when the plan has monthly allowances, so it must hold on every
  * later day of the month (on the 1st itself it is today's); past a daily
  * one, sampled today, otherwise.
@@ -36,7 +36,7 @@ function stopSnapshot(now = Date.now()): AccountUsageSnapshot {
 		...zero,
 		month: {
 			month: today.slice(0, 7),
-			workerRequests: 0, workerCpuMs: monthly.workerCpuMs, durableObjectRequests: 0, durableObjectDurationGbSeconds: 0,
+			workerRequests: 0, workerCpuMs: monthly.workerCpuMs + 1_300_000_000, durableObjectRequests: 0, durableObjectDurationGbSeconds: 0,
 			sqlRowsRead: 0, sqlRowsWritten: 0, logBytes: 0,
 		},
 		stop: true,
