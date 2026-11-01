@@ -3710,15 +3710,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.dropHeld(identity.user_id, roomId, read);
 		const peers = new Set(this.connectionsOf(identity.user_id, socket));
 		// Read receipts: a small private room's other members (only they see it) get it too, unless the reader is invisible.
-		// The room's size is read only when another member is connected to receive it.
-		if (isPrivateRoomId(roomId) && (connectionAttachment(socket) ?? attachment).choice !== "invisible") {
-			const members = this.ctx.getWebSockets().filter((ws) => {
+		// The room's size is read only when another member is connected to receive it, and within the allowance.
+		const members = isPrivateRoomId(roomId) && (connectionAttachment(socket) ?? attachment).choice !== "invisible"
+			? this.ctx.getWebSockets().filter((ws) => {
 				const state = connectionAttachment(ws as WebSocketConnection);
 				return ws !== socket && state?.userId !== identity.user_id && state?.rooms?.includes(roomId);
-			}) as WebSocketConnection[];
+			}) as WebSocketConnection[]
+			: [];
+		if ((peers.size || members.length) && this.takeThrottle(socket, identity.user_id, "read", this.config.limits.activityBroadcastsPerUserMinute, now)) {
 			if (members.length && this.receiptsRoom(roomId, now)) for (const peer of members) peers.add(peer);
-		}
-		if (peers.size && this.takeThrottle(socket, identity.user_id, "read", this.config.limits.activityBroadcastsPerUserMinute, now)) {
 			const frame = { method: "activity", params: { room_id: roomId, from: identity, read_message_id: read } };
 			for (const peer of peers) this.deliverTo(peer, frame);
 		}

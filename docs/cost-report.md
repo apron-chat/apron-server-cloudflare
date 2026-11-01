@@ -100,7 +100,8 @@ tell its size, then for one small enough its members' cursors and
 `user_status` rows (to leave out invisible members) by primary key: a
 reservation of `8 + rooms × (4 + 11 + 3 × 10)` reads, bounded whatever the
 room's size. A cursor relayed live reads the room's `member_count` (one
-row), only when another member is connected to the room.
+row), only when another member is connected to the room and the relay is
+within the per-user allowance, so at most 10 a minute per user.
 
 ## Limiter rows and the budget row
 
