@@ -65,6 +65,7 @@ import {
 	UPLOAD_WRITE_GRACE_MS,
 	uploadResultEmbed,
 	liveDeadline,
+	liveInputLimit,
 	liveResultEmbed,
 	isPrivateRoomId,
 	MAX_READ_RECEIPT_MEMBERS,
@@ -5988,7 +5989,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			reader.cancel().catch(() => undefined);
 		};
 		const timer = setTimeout(() => session.stop!("time"), Math.max(0, (entry.startedMs ?? nowMs()) + entry.maxMs - nowMs()));
-		const maxInput = this.config.liveText!.policy.maxInputBytes;
+		// An append takes no more input than it keeps, as before edits; a terminal, maxInputBytes.
+		const maxInput = liveInputLimit(entry, this.config.liveText!.policy);
 		try {
 			for (;;) {
 				const { done, value } = await reader.read();
@@ -6041,7 +6043,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			complete: "Done: the text is posted.",
 			time: `Stopped at the ${Math.round(entry.maxMs / 1_000)}-second limit; what was kept is posted.`,
 			size: entry.kind === "append"
-				? `Stopped at the ${byteSize(entry.limit)} limit; the first ${byteSize(entry.limit)} is posted.`
+				? `Stopped at the ${byteSize(entry.limit)} limit; what was kept is posted.`
 				: `Stopped at the ${byteSize(policy.maxInputBytes)} limit; the last ${byteSize(entry.limit)} is posted.`,
 			disconnected: "The write was interrupted; what arrived is posted.",
 			removed: "Stopped: the message or its embed was removed.",

@@ -810,14 +810,8 @@ workerd's own proxying; production CPU will differ, and the figures are an
 upper bound for the work, not a billing figure.
 
 An append's backspace and form feed edits (§4.8.5) leave its rows as they
-were, but an append that keeps erasing what it wrote no longer fills at
-4 KB: like a terminal, it can stream until the input cap or the time limit,
-so the terminal's columns above are the worst case for either kind. The
-edits themselves are a native decode and encode per chunk and a native
-search for the two characters: in Node on the same container, 2 MB of
-alternating "a" and backspace (the worst case, an edit every other byte)
-took about 0.2 s of CPU in 66-byte chunks, 0.1 s in 4 KB ones, and text
-without edits costs what it did.
+were. An append's writer may send no more bytes than the append keeps
+(4,096), edits included, so an append costs what it did before edits.
 
 ### Worst-case month
 

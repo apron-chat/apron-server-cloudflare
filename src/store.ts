@@ -395,8 +395,17 @@ export function liveResultEmbed(entry: LiveEntry, policy: Pick<LiveTextPolicy, "
   return {
     embed_id: entry.embedId,
     kind: entry.kind,
-    write: { key: entry.key, max_bytes: policy.maxInputBytes, expires_ms: entry.writeExpiresMs },
+    write: { key: entry.key, max_bytes: liveInputLimit(entry, policy), expires_ms: entry.writeExpiresMs },
   };
+}
+
+/**
+ * The most bytes a write may send: for an append, the bytes it keeps (its
+ * `limit`), so edits never let it stream more than an append without them;
+ * for a terminal, `maxInputBytes`.
+ */
+export function liveInputLimit(entry: Pick<LiveEntry, "kind" | "limit">, policy: Pick<LiveTextPolicy, "maxInputBytes">): number {
+  return entry.kind === "append" ? Math.min(entry.limit, policy.maxInputBytes) : policy.maxInputBytes;
 }
 
 /**

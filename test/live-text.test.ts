@@ -5,7 +5,7 @@ import { liveCommandNotice } from '../src/index';
 import { keepAppend, keepLast, LiveBuffer, liveTextString } from '../src/live-text';
 import { FREE_PLAN } from '../src/plans/free';
 import { PAID_PLAN } from '../src/plans/paid';
-import { LIVE_ORPHAN_GRACE_MS, MAX_TERMINAL_OUTPUT_JSON_BYTES, Store, type LiveEntry, type StoreLiveTextConfig } from '../src/store';
+import { LIVE_ORPHAN_GRACE_MS, liveInputLimit, liveResultEmbed, MAX_TERMINAL_OUTPUT_JSON_BYTES, Store, type LiveEntry, type StoreLiveTextConfig } from '../src/store';
 import { errorCode, expectRetryAfter, withStore, type TestClock } from './helpers/store';
 
 const encode = (text: string) => new TextEncoder().encode(text);
@@ -176,6 +176,17 @@ describe('LiveBuffer', () => {
 		expect(buffer.push(output).send).toEqual(output);
 		expect(buffer.end()).toEqual(new Uint8Array(0));
 		expect(buffer.kept()).toEqual(output);
+	});
+});
+
+describe('the input a write may send', () => {
+	it('is what an append keeps, so its edits never let it send more, and maxInputBytes for a terminal', () => {
+		const policy = { maxInputBytes: 2_000_000 };
+		expect(liveInputLimit({ kind: 'append', limit: 4_096 }, policy)).toBe(4_096);
+		expect(liveInputLimit({ kind: 'append', limit: 100 }, policy)).toBe(100);
+		expect(liveInputLimit({ kind: 'terminal', limit: 32_768 }, policy)).toBe(2_000_000);
+		const entry = { embedId: 'e1', kind: 'append', key: 'l/1', limit: 4_096, writeExpiresMs: 1 } as LiveEntry;
+		expect(liveResultEmbed(entry, policy)).toMatchObject({ write: { max_bytes: 4_096 } });
 	});
 });
 
