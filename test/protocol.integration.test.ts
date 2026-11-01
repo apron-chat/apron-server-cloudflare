@@ -47,7 +47,7 @@ async function authenticate(peer: Peer, scheme = 'guest', extraCaps: string[] = 
 	expect(server.params.apron).toBe(10);
 	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'embed:terminal', 'embed:append', 'status', 'ext', 'ext:settings', 'ext:limits', 'ext:media', 'ext:permissions']);
 	expect(server.params.auth).toContain('webauthn');
-	expect(server.params.ping).toBe(45);
+	expect(server.params.ping).toBe(DEFAULT_LIMITS.pingSeconds);
 	// The extensions `ext:settings` and `ext:media` keep their data under their names in ext (§4, §4.12).
 	expect(Object.keys(server.params.ext)).toEqual(['settings', 'media']);
 	peer.send({ method: 'auth', id: 'auth', params: { scheme } });
@@ -221,7 +221,7 @@ it('answers the liveness ping before and after authentication', async () => {
 	const peer = await connect();
 	try {
 		const { server } = await greeting(peer);
-		expect(server.params.ping).toBe(45);
+		expect(server.params.ping).toBe(DEFAULT_LIMITS.pingSeconds);
 		// The exact bytes are answered by the runtime, before auth too (§1).
 		peer.socket.send('{"method":"ping"}');
 		expect(await peer.next()).toEqual({ method: 'pong' });

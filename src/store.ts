@@ -720,6 +720,11 @@ interface StoreHistoryQuery {
   /** Request identity for history quota accounting. */
   userId?: string;
   ipKey?: string;
+  /**
+   * A guest: charged to its address alone, which bounds every guest there,
+   * so a crowd of guests writes no limiter row each.
+   */
+  guest?: boolean;
   maxBytes?: number;
 }
 
@@ -942,6 +947,22 @@ const META_THROTTLE_TRIPS = "throttle_trips";
 export const TRIP_WINDOW_MS = 24 * 60 * 60 * 1000;
 /** The server tier the runtime last announced to the admins (announcedTier). */
 const META_ANNOUNCED_TIER = "announced_tier";
+/**
+ * Registered accounts nobody came back to are removed (pruneDormantIdentities)
+ * once this old: signed up with a passkey, active only on their first day
+ * (DORMANT_ACTIVE_MS), with no role, push subscription, chosen status or
+ * mute (an `invisible` user's `seen` stays put), upload or bot. By
+ * then everything they posted is past retention, so nothing logged names
+ * them, and the identity cap is not spent for good by passersby.
+ */
+export const DORMANT_AFTER_MS = 30 * 86_400_000;
+const DORMANT_ACTIVE_MS = 86_400_000;
+/** Accounts one prune removes at most; the next alarm continues. */
+const DORMANT_BATCH = 100;
+/** The bot of a user (`bot_<user_id>`, as the runtime names it): a user with one is in use. */
+const BOT_PREFIX = "bot_";
+/** Dormant accounts pruned: today's count and the total (dormantPruned). */
+const META_DORMANT_PRUNED = "dormant_pruned";
 /** The runtime's attack pause: its UTC day, count that day, hold end, and why (attackPause). */
 const META_ATTACK_PAUSE = "attack_pause";
 /** Overruns of one operation within BREAKER_WINDOW_MS that open its breaker. */
@@ -3712,6 +3733,102 @@ export class Store {
       if (identities) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(Math.max(0, this.metaNumber("identity_count") - identities)));
       return { messages: messages.length, reactions: integerColumn(reactions), deletedUploads };
     }), true);
+  }
+
+  /**
+   * Removes up to DORMANT_BATCH registered accounts nobody came back to
+   * (DORMANT_AFTER_MS), except `connected` ones: their identity, passkeys,
+   * memberships (lowering their rooms' member counts), read cursors, status,
+   * mutes, push wakes, dedup and limiter rows, and their rooms' creator. As
+   * with `/purge`, each `user_id` is retired, never reissued. Their content
+   * is past retention, so no logged record is read or rewritten; a record of
+   * someone else's (an admin adding them to a room within retention) may
+   * still name them until it expires. Maintenance work: it measures the rows
+   * first, then reserves them, and a refusal leaves the rest for a later
+   * run. Returns the removed ids, and whether more may remain.
+   */
+  pruneDormantIdentities(now = this.clock.now(), connected: ReadonlySet<string> = new Set()): { pruned: string[]; more: boolean } {
+    this.ensureReady();
+    const cutoff = now - DORMANT_AFTER_MS;
+    // Finding them reads every identity (no index on created_ms) and, for each
+    // candidate, its credentials, subscriptions, uploads and bot.
+    const found = this.reserved({ reads: 64 + this.config.registeredIdentityCount + 8 * DORMANT_BATCH * 4 }, true, now, () => {
+      const candidates = this.rawRows<{ user_id: string }>(
+        `SELECT i.user_id FROM identities i
+         WHERE i.tier = 'registered' AND i.roles_json = '[]' AND i.created_ms < ? AND i.seen_ms < i.created_ms + ? AND i.user_id != ?
+           AND EXISTS (SELECT 1 FROM credentials c INDEXED BY credentials_user_idx WHERE c.user_id = i.user_id)
+           AND NOT EXISTS (SELECT 1 FROM credentials c INDEXED BY credentials_user_idx WHERE c.user_id = i.user_id AND c.updated_ms >= i.created_ms + ?)
+           AND NOT EXISTS (SELECT 1 FROM push_subscriptions p WHERE p.user_id = i.user_id)
+           AND NOT EXISTS (SELECT 1 FROM user_status s WHERE s.user_id = i.user_id)
+           AND NOT EXISTS (SELECT 1 FROM uploads u INDEXED BY uploads_owner_idx WHERE u.owner_id = i.user_id)
+           AND NOT EXISTS (SELECT 1 FROM identities b WHERE b.user_id = ? || i.user_id)
+         LIMIT ?`,
+        cutoff, DORMANT_ACTIVE_MS, ADMIN_USER_ID, DORMANT_ACTIVE_MS, BOT_PREFIX, DORMANT_BATCH + connected.size,
+      ).map((row) => row.user_id).filter((id) => !connected.has(id)).slice(0, DORMANT_BATCH);
+      if (!candidates.length) return { ids: [] as string[], rows: 0, full: false };
+      const marks = candidates.map(() => "?").join(", ");
+      let rows = 0;
+      for (const table of ["memberships", "read_cursors", "credentials", "push_wakes", "user_status", "room_mutes", "accepted_requests"]) {
+        rows += integerColumn(this.rawRows<{ count: number }>(`SELECT COUNT(*) AS count FROM ${table} WHERE user_id IN (${marks})`, ...candidates)[0]?.count);
+      }
+      return { ids: candidates, rows, full: candidates.length === DORMANT_BATCH };
+    }, false);
+    if (!found.ids.length) return { pruned: [], more: false };
+    const ids = found.ids;
+    const marks = ids.map(() => "?").join(", ");
+    // Each row deleted (and its index entries), the rooms rescanned for counts
+    // and creators, limiter rows, and the identity rows and their markers.
+    const limiterRows = ids.length * USER_LIMIT_SCOPES.length;
+    const roomRows = MAX_ROOM_ROWS + MAX_PURGE_ROOMS;
+    const cost = {
+      reads: 64 + 2 * found.rows + 2 * roomRows + 2 * limiterRows + 4 * ids.length,
+      writes: 64 + 4 * found.rows + 2 * roomRows + 2 * limiterRows + 8 * ids.length,
+    };
+    this.reserved(cost, true, now, () => this.transaction(() => {
+      this.rawExec(
+        `UPDATE rooms SET member_count = MAX(0, member_count - (SELECT COUNT(*) FROM memberships m WHERE m.room_id = rooms.room_id AND m.user_id IN (${marks})))
+         WHERE room_id IN (SELECT room_id FROM memberships INDEXED BY memberships_user_idx WHERE user_id IN (${marks}))`,
+        ...ids, ...ids,
+      );
+      this.rawExec(`UPDATE rooms SET fields_json = json_remove(fields_json, '$.creator_id') WHERE json_extract(fields_json, '$.creator_id') IN (${marks})`, ...ids);
+      for (const table of ["memberships", "read_cursors", "credentials", "push_wakes", "user_status", "room_mutes", "accepted_requests", "identities"]) {
+        this.rawExec(`DELETE FROM ${table} WHERE user_id IN (${marks})`, ...ids);
+      }
+      const limiterWhere = `scope IN (${USER_LIMIT_SCOPES.map(() => "?").join(", ")}) AND principal_key IN (${marks})`;
+      const limiterKeys = [...USER_LIMIT_SCOPES, ...ids.map((id) => `user:${id}`)];
+      const limiters = integerColumn(this.rawRows<{ count: number }>(`SELECT COUNT(*) AS count FROM principal_limits WHERE ${limiterWhere}`, ...limiterKeys)[0]?.count);
+      if (limiters) {
+        this.rawExec(`DELETE FROM principal_limits WHERE ${limiterWhere}`, ...limiterKeys);
+        this.rawExec("UPDATE _meta SET value = ? WHERE key = 'principal_limit_count'", String(Math.max(0, this.metaNumber("principal_limit_count") - limiters)));
+      }
+      for (const id of ids) this.limiters.dropPrincipal(`user:${id}`);
+      for (const id of ids) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, '1')", META_PURGED_PREFIX + id);
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(Math.max(0, this.metaNumber("identity_count") - ids.length)));
+      const day = dayFor(now);
+      const previous = this.dormantPrunedRaw();
+      const record = { day, today: (previous.day === day ? previous.today : 0) + ids.length, total: previous.total + ids.length };
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_DORMANT_PRUNED, JSON.stringify(record));
+    }), false);
+    console.log(JSON.stringify({ event: "dormant_pruned", count: ids.length }));
+    return { pruned: ids, more: found.full };
+  }
+
+  private dormantPrunedRaw(): { day: string; today: number; total: number } {
+    try {
+      const value = JSON.parse(this.metaValue(META_DORMANT_PRUNED) || "{}") as { day?: unknown; today?: unknown; total?: unknown };
+      return { day: typeof value.day === "string" ? value.day : "", today: integerColumn(value.today), total: integerColumn(value.total) };
+    } catch {
+      return { day: "", today: 0, total: 0 };
+    }
+  }
+
+  /** Dormant accounts pruned today and in all (pruneDormantIdentities), for `/status`: charged, never refused. */
+  dormantPruned(now = this.clock.now()): { today: number; total: number } {
+    this.ensureReady();
+    return this.alert(() => this.reserved({ reads: 4 }, false, now, () => {
+      const record = this.dormantPrunedRaw();
+      return { today: record.day === dayFor(now) ? record.today : 0, total: record.total };
+    }, true));
   }
 
   /**
@@ -7235,11 +7352,13 @@ export class Store {
         // tier turns off; checked here, where today's budget is in memory.
         if (query.before !== undefined) this.assertNotDegraded("Loading older history", operationNow);
         return this.transaction(() => {
-          if (charged) {
+          if (charged && !query.guest) {
             this.chargeEvent("history", `user:${query.userId}`, now,
               { perMinute: this.config.historyRequestsPerUserMinute, burst: this.config.historyBurstPerUser },
               "History request limit reached",
               { limit: this.config.historyRequestsPerUserDay, message: "Daily history limit reached" }, "read");
+          }
+          if (charged) {
             this.chargeEvent("history", `ip:${query.ipKey}`, now,
               { perMinute: this.config.historyRequestsPerIpMinute, burst: this.config.historyBurstPerIp },
               "History request limit reached",

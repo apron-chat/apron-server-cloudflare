@@ -161,7 +161,7 @@ it('/status leads with the server state, then the Cloudflare usage and the demo 
 		// Each against the ceiling that refuses work, and from the counter that does.
 		expect(text).toMatch(new RegExp(`^- Foreground SQL rows written: [\\d,]+ / ${DEFAULT_LIMITS.foregroundWritesPerDay.toLocaleString('en-US')} \\(\\d+%\\)$`, 'm'));
 		expect(text).toMatch(new RegExp(`^- Frames: [1-9][\\d,]* / ${DEFAULT_LIMITS.processedFramesPerDay.toLocaleString('en-US')} \\(\\d+%\\)$`, 'm'));
-		expect(text).toMatch(/^- Registered users: [\d,]+ \/ 10,000/m);
+		expect(text).toMatch(new RegExp(`^- Registered users: [\\d,]+ / ${DEFAULT_LIMITS.registeredIdentityCount.toLocaleString('en-US')}`, 'm'));
 		expect(text).toMatch(/^- Database: /m);
 		// Nor the budget guard's zone and token: a plan that relies on the guard says it can't work.
 		if (ACCOUNT_USAGE_POLICY.monthly) expect(text).toMatch(/^\*\*Edge stop\*\* \(`apron_budget_stop`\): \*\*not working\*\*: `ZONE_ID` or `EDGE_STOP_TOKEN` is not set/m);

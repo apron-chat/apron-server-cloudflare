@@ -174,6 +174,8 @@ interface ConnectionAttachment {
 	policyViolations: number[];
 	historyInFlight: number;
 	frameTimes: number[];
+	/** When this connection last sent an application frame (pings aside); absent before its first. */
+	lastFrameAt?: number;
 	/** Per-type throttle events from this connection, oldest first (budget.ts). */
 	throttles?: Partial<Record<ThrottledType, number[]>>;
 	/** When this connection last got a `~private` throttle notice, per type. */
@@ -704,6 +706,9 @@ const ATTACK_TRIGGER_LABEL: Record<string, string> = {
 };
 
 const ATTACK_CLOSE_REASON = "Server paused: unusual traffic; try later";
+
+/** A guest connection this long without an application frame may make room on a full server (evictIdleGuest). */
+const GUEST_IDLE_MS = 10 * 60_000;
 
 /** The stored attack pause (Store.attackPause). */
 interface AttackPause {
@@ -1886,6 +1891,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private burnAlertedAt = -Infinity;
 	/** The latest attack pause (pauseForAttack), once read: undefined before, null with none. */
 	private attackPauseRecord?: AttackPause | null;
+	/** When the next dormant-account prune may run (pruneDormant): daily, or at the next full alarm while more remain. */
+	private dormantPruneAt = 0;
 	private alarmTail: Promise<void> = Promise.resolve();
 	private alarmFailures = 0;
 	private alarmKnown = false;
@@ -2127,7 +2134,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const now = nowMs();
 			this.closeStale(now);
 			const peers = sockets.filter(socket => !this.isStale(socket, now)).map(socket => connectionAttachment(socket)).filter(peer => peer?.ipKey === ipKey);
-			if (sockets.length >= this.config.limits.openConnections) return serverFull();
+			if (sockets.length >= this.config.limits.openConnections && !this.evictIdleGuest(sockets, now)) return serverFull();
 			if (peers.length >= this.config.limits.connectionsPerIp ||
 				peers.filter(peer => peer?.tier !== "registered").length >= this.config.limits.anonymousConnectionsPerIp) {
 				return responseError(429, "Demo capacity reached", 60_000);
@@ -2149,6 +2156,26 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return this.storeResponseError(error);
 		}
 		return undefined;
+	}
+
+	/**
+	 * A full server makes room for a newcomer by closing the guest connection
+	 * longest without an application frame, once it has had none for
+	 * GUEST_IDLE_MS (a tab left open in the background): closed with 4000 so
+	 * a client reconnects when its user comes back, not at once. False when
+	 * no guest is that idle. Registered users are never evicted.
+	 */
+	private evictIdleGuest(sockets: WebSocket[], now: number): boolean {
+		let idlest: { socket: WebSocketConnection; state: ConnectionAttachment; at: number } | undefined;
+		for (const peer of sockets) {
+			const state = connectionAttachment(peer);
+			if (!state || state.closing || state.tier === "registered") continue;
+			const at = state.lastFrameAt ?? state.openedAt ?? 0;
+			if (now - at >= GUEST_IDLE_MS && (!idlest || at < idlest.at)) idlest = { socket: peer as WebSocketConnection, state, at };
+		}
+		if (!idlest) return false;
+		this.closePolicy(idlest.socket, idlest.state, 4000, "Idle guest connection closed to make room; reconnect when you're back");
+		return true;
 	}
 
 	webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
@@ -2184,6 +2211,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return Promise.resolve();
 		}
 		attachment.frameTimes.push(now);
+		attachment.lastFrameAt = now;
 		const bytes = utf8Bytes(message);
 		if (attachment.pendingFrames >= this.config.limits.pendingFramesPerConnection || attachment.pendingBytes + bytes > this.config.limits.pendingBytesPerConnection) {
 			this.closePolicy(socket, attachment, 1008, "Too many pending frames");
@@ -2289,6 +2317,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 				await this.expireBot(userId);
 			}
 		} catch { /* a bot not yet signed out is found again by the next sweep */ }
+		// Only user status keeps `seen` current, which is how a dormant account is told from a returning one.
+		if (this.config.presence && now >= this.dormantPruneAt) await this.pruneDormant(now);
 		let result: ReturnType<Store["runCleanup"]> | undefined;
 		try {
 			result = this.store.runCleanup(now);
@@ -3537,6 +3567,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const after = asDecimalId(params.after, "after");
 		const before = asDecimalId(params.before, "before");
 		const limit = positiveIntParam(params, "limit");
+		// Scrolling back (`before` alone) is the costliest history, and a crowd
+		// of guests can spend it all: older pages are for accounts. The newest
+		// page, catching up with `after`, and a window bounded by both stay
+		// open to guests.
+		const guest = attachment.tier !== "registered";
+		if (guest && before !== undefined && after === undefined) throw { name: "denied", message: "Sign in to load older history" } satisfies ProtocolError;
 		attachment.historyInFlight += 1;
 		writeAttachment(socket, attachment);
 		try {
@@ -3549,6 +3585,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				now: nowMs(),
 				userId: attachment.userId,
 				ipKey: attachment.ipKey,
+				guest,
 			});
 			this.reply(socket, request, page);
 		} finally {
@@ -6817,6 +6854,27 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.reply(socket, request, {});
 	}
 
+	/**
+	 * Removes registered accounts nobody came back to (Store.pruneDormantIdentities),
+	 * never one connected now, and revokes their tokens. Runs once a day, or at
+	 * each full alarm while a full batch suggests more; a failure waits an hour.
+	 */
+	private async pruneDormant(now: number): Promise<void> {
+		const connected = new Set<string>();
+		for (const peer of this.ctx.getWebSockets()) {
+			const userId = connectionAttachment(peer)?.userId;
+			if (userId) connected.add(userId);
+		}
+		try {
+			// One synchronous transaction: nothing interleaves with it.
+			const result = this.store.pruneDormantIdentities(now, connected);
+			this.dormantPruneAt = result.more ? now : now + 86_400_000;
+			if (result.pruned.length) await this.forgetTokens(result.pruned);
+		} catch {
+			this.dormantPruneAt = now + 3_600_000;
+		}
+	}
+
 	/** Revokes bot, invite and device tokens, so purged users cannot sign in again. */
 	private async forgetTokens(userIds: readonly string[]): Promise<void> {
 		if (!userIds.length) return;
@@ -7203,6 +7261,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const now = nowMs();
 		await this.accountUsage.refresh(now, true);
 		const { budget, identities, databaseBytes, counts } = this.store.status(now);
+		const pruned = this.store.dormantPruned(now);
 		const limits = this.config.limits;
 		const count = (value: number) => Math.round(value).toLocaleString("en-US");
 		const share = (used: number, limit: number) => `${count(used)} / ${count(limit)} (${limit > 0 ? Math.round((100 * used) / limit) : 0}%)`;
@@ -7294,7 +7353,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			`- Posts: ${share(counts.posts, limits.globalPostsPerDay)}`,
 			`- Registrations: ${share(budget.registrations, limits.registrationsPerDay)}`,
 			...(this.config.push && PUSH_POLICY ? [`- Pushes: ${share(this.store.pushesToday(now), PUSH_POLICY.pushesPerDay)}`] : []),
-			`- Registered users: ${share(identities, limits.registeredIdentityCount)}`,
+			`- Registered users: ${share(identities, limits.registeredIdentityCount)}${pruned.total ? ` (dormant accounts removed: ${count(pruned.today)} today, ${count(pruned.total)} in all)` : ""}`,
 			`- Open connections: ${share(this.ctx.getWebSockets().length, limits.openConnections)}`,
 			`- Database: ${databaseBytes === null ? "unknown" : mib(databaseBytes)} / ${mib(limits.databaseHardTargetBytes)}`,
 		);

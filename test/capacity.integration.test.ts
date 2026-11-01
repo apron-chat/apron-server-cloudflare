@@ -1,19 +1,20 @@
 import { SELF } from 'cloudflare:test';
 import { expect, it } from 'vitest';
+import { DEFAULT_LIMITS } from '../src/budget';
 import { connect, greeting, type Peer } from './helpers/socket';
 
-it('bounds admission at 100 live sockets and delivers one ordered maximum fan-out', async () => {
+it('bounds admission at openConnections live sockets and delivers one ordered maximum fan-out', async () => {
 	const peers: Peer[] = [];
 	try {
-		for (let index = 1; index <= 100; index++) {
-			const peer = await connect({ ip: `198.51.100.${index}`, origin: null, host: 'capacity.test' });
+		for (let index = 1; index <= DEFAULT_LIMITS.openConnections; index++) {
+			const peer = await connect({ ip: `198.51.${100 + Math.floor(index / 250)}.${index % 250}`, origin: null, host: 'capacity.test' });
 			peers.push(peer);
 			await greeting(peer);
 			peer.send({ id: 'auth', method: 'auth', params: { scheme: 'guest' } });
 			expect((await peer.next()).result.you.user_id).toBeTruthy();
 		}
 		const rejected = await SELF.fetch('https://capacity.test/ws', { headers: {
-			Upgrade: 'websocket', 'CF-Connecting-IP': '198.51.100.101',
+			Upgrade: 'websocket', 'CF-Connecting-IP': '198.51.110.1',
 		} });
 		expect(rejected.status).toBe(429);
 		// A full server spreads its crowd's retries over two to five minutes.
@@ -37,4 +38,4 @@ it('bounds admission at 100 live sockets and delivers one ordered maximum fan-ou
 	} finally {
 		for (const peer of peers) peer.close();
 	}
-}, 30_000);
+}, 60_000);

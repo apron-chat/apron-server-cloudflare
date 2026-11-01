@@ -62,9 +62,9 @@ A limit can reach a client in four ways:
 | ---: | --- | --- | ---: | --- |
 | 429 | Connection attempts exceeded | 20 upgrade attempts a minute per address (IPv6 grouped by /56), 60 per IPv6 /48 | 60 | A reconnect loop without backoff. Probes and refused attempts count too. |
 | 503 | Demo is busy; try again shortly | 200 attempts a minute from everyone at one Cloudflare location | 60 | Other clients, or many of yours, near the same location. |
-| 429 | Demo capacity reached (with `Apron-Server-Full: 1`) | 100 open sockets on the server | 120 to 300, at random | The server is full. The entry Worker then refuses by itself for 30 seconds, so retries cost the server nothing; wait the `Retry-After` before retrying. |
+| 429 | Demo capacity reached (with `Apron-Server-Full: 1`) | 250 open sockets on the server | 120 to 300, at random | The server is full. The entry Worker then refuses by itself for 30 seconds, so retries cost the server nothing; wait the `Retry-After` before retrying. |
 | 429 | Demo capacity reached | 10 open sockets per address; 6 per address that are not signed in to an account (guests and sockets still authenticating) | 60 | Sockets left open: extra tabs, hot reload, reconnect that never closes the old socket. |
-| 429 | Connection admission limit reached | 12 admitted connections a minute per address; 4,000 a day on the server | the bucket's wait, or until the next day | Reconnecting on every error or page view. A passkey sign-in on a fresh page uses up to three admissions (guest, sign-in, signed-in reconnect). |
+| 429 | Connection admission limit reached | 12 admitted connections a minute per address; 100,000 a day on the server | the bucket's wait, or until the next day | Reconnecting on every error or page view. A passkey sign-in on a fresh page uses up to three admissions (guest, sign-in, signed-in reconnect). |
 | 429 | Daily demo capacity reached / Daily frame budget exhausted | The server's daily SQL or frame budget | until the next day | The whole demo is used up for the day. |
 | 503 | Demo account capacity reached | The Cloudflare account's usage stop | 300 | Same; the operator's account passed its bill cap. |
 | 503 | Server paused: unusual traffic; try later | The attack pause | the hold left, 30 minutes or more | Not your client: a flood of traffic. Open sockets close with 1013 and the same reason. |
@@ -82,7 +82,7 @@ still holds a slot until it goes stale; see
 
 | Code | Reason | Cause | What to do |
 | ---: | --- | --- | --- |
-| 1001 | Connection idle; reconnect to recover | No ping or frame for 150 seconds after the connection had pinged, or for 15 minutes if it never pinged | Reconnect. If you see it while the tab is live, your ping is not being sent. |
+| 1001 | Connection idle; reconnect to recover | No ping or frame for 300 seconds after the connection had pinged, or for 15 minutes if it never pinged | Reconnect. If you see it while the tab is live, your ping is not being sent. |
 | 1003 | Binary application frames are not supported | A binary frame | Send text frames only. |
 | 1008 | Authentication timed out | No successful `auth` within 30 seconds of connecting | Authenticate right after the `server` frame. |
 | 1008 | Frame rate limit reached | More than 60 frames in a minute on this connection (the exact ping bytes do not count) | Batch or throttle. Typing and read cursors count as frames. |
@@ -93,17 +93,19 @@ still holds a slot until it goes stale; see
 | 1011 | Delivery failed / Delivery interrupted; reconnect to recover | The server could not deliver to the socket | Reconnect with backoff, then fetch history to catch up. |
 | 1013 | Frame rate limit reached | More than 120 frames a minute from your address, all connections together. Each connection reserves frames 10 at a time, so many short-lived connections spend this fast | Back off; fewer connections. |
 | 1013 | Demo account capacity reached; try later | The Cloudflare account's usage reached its stop line | Back off for minutes, not seconds. |
+| 1013 | Server paused: unusual traffic; try later | The attack pause | Back off for half an hour or more. |
+| 4000 | Idle guest connection closed to make room; reconnect when you're back | A guest connection with no frame (pings aside) for 10 minutes, closed when the full server needs its slot | Reconnect when the user returns to the tab, not at once. |
 
 ### Liveness and stale connections
 
-The `server` frame advertises `ping` (45 seconds). Send the text frame
+The `server` frame advertises `ping` (120 seconds). Send the text frame
 `{"method":"ping"}`, byte for byte, at that interval. The runtime answers
 `{"method":"pong"}` without waking the server, and these pings do not count
 against any frame limit. A ping with other spacing, or with an `id`, is
 answered too, but as an ordinary frame that counts.
 
 The server cannot ping clients, so it uses your pings to find dead sockets.
-A connection that has pinged is closed as stale after 150 seconds without a
+A connection that has pinged is closed as stale after 300 seconds without a
 ping or frame. One that never pinged gets 15 minutes, and a `~private` notice
 ("Did not receive `{"method":"ping"}` in 15 minutes, closing stale
 connection.") just before its 1001 close. Until a vanished socket is found
@@ -117,7 +119,7 @@ minutes after a few unclean reconnects.
 | --- | --- | --- |
 | `retry_after` "Connection limit reached for this account" (`retry_after` 60) | 3 signed-in connections per account, across all devices and addresses | More tabs, devices or test instances on one account than 3, or old sockets not yet closed or stale (see above). Bots count too: 3 per bot. |
 | `retry_after` "Authentication attempts limited" | 10 auth attempts a minute per address, failed ones included | Retrying a failing `auth` in a loop. |
-| `retry_after` "Registration limit reached for this network" / "Registration limit reached" | 5 registrations a day per address; 300 a day on the server. Adding a passkey and a first `/invite-bot` each count as one. | Creating test accounts from one network. |
+| `retry_after` "Registration limit reached for this network" / "Registration limit reached" | 20 registrations a day per address; 5,000 a day on the server. Adding a passkey and a first `/invite-bot` each count as one. | Creating test accounts from one network. |
 | `unsupported` "Passkeys are not offered to this origin"; `denied` "Frontend origin is not configured for passkeys" (a passkey session `token`) | Passkeys and passkey session resume work only from the configured origin (`https://web.apron.chat` on the demo) | A third-party client on another origin, or a native client. Use a guest, a bot token (`/invite-bot`) or a device token (`/invite-device`), which work from any origin or none. |
 | `denied` "Session expired; sign in with your passkey" | A passkey session lasts 30 days, renewed on a resume once half has passed; it resumes only from the origin it was made on | A stale stored token, or a token from another origin. |
 | `denied` "Identity switching requires reconnect" | One identity per connection once signed in | Calling `auth` again on a signed-in socket. Open a new connection instead. |
@@ -140,9 +142,9 @@ join or leave that changes nothing is free). Refusals carry `ext.limits`
 | Message | Limit |
 | --- | --- |
 | Guest posting limit reached | Guests (when the deployment lets them post): 5 a minute per address |
-| Posting limit reached | 20 a minute per account (50 with any role); 30 a minute per address; 120 a minute on the server |
+| Posting limit reached | 20 a minute per account (50 with any role); 30 a minute per address; 600 a minute on the server |
 | Daily posting limit reached | 1,000 a day per account (4,000 with any role); 200 per guest address; 2,000 per address |
-| Daily posting limit reached for the server | 10,000 a day on the server |
+| Daily posting limit reached for the server | 60,000 a day on the server |
 
 A request with an `id` that matches one accepted in the last 24 hours is
 answered again without posting twice, and does not use posting quota. Retry a
@@ -153,8 +155,9 @@ mutation with the **same** `id`.
 | Message | Limit | Notes |
 | --- | --- | --- |
 | History request already in progress (`retry_after` 1) | 1 `history` request at a time per connection | Wait for the previous page. |
-| History request limit reached | 20 a minute per account (burst 60); 60 a minute per address (burst 120) | `ext.limits` `read`. |
-| Daily history limit reached / …for this network / …for the server | 3,000 a day per account; 6,000 per address; 40,000 on the server | `ext.limits` `read`. |
+| Sign in to load older history (`denied`) | Guests get the newest page, `after`, and windows bounded by both, but not `before` alone | Scrolling back is for accounts. |
+| History request limit reached | 20 a minute per account (burst 60); 60 a minute per address (burst 120); a guest counts only against its address | `ext.limits` `read`. |
+| Daily history limit reached / …for this network / …for the server | 3,000 a day per account; 6,000 per address; 400,000 on the server | `ext.limits` `read`. |
 | Room listing limited | 6 `room_list` a minute per account | The first `filter: "joined"` listing after each sign-in is free. Keep the list current from `room_update` rather than polling. |
 
 A history page holds at most 50 records (20 by default) and 256 KiB. Records
@@ -163,7 +166,7 @@ are kept for 7 days.
 ### Server-wide spikes
 
 "Demo is busy with too many requests" (`retry_after`) means the whole server
-passed 600 frames in a minute. The socket stays open. Notifications sent
+passed 3,000 frames in a minute. The socket stays open. Notifications sent
 meanwhile are dropped without a reply.
 
 ### Busy days and pauses
@@ -270,7 +273,7 @@ first.
 | Users with a reaction on one message ("reaction limit reached for this message") | 32 |
 | Emoji in one user's reaction set on one message | 8 |
 | Room mutes per user | 100 |
-| Registered accounts on the server | 10,000 |
+| Registered accounts on the server | 50,000 (accounts never used again within 30 days of signing up are removed) |
 
 A thread stops counting when everyone has left it or its history expires.
 

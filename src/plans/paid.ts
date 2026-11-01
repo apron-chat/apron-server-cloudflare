@@ -2,32 +2,31 @@
 // allowances pay for. Select a plan in src/budget.ts, then run
 // npm run budget:generate.
 //
-// Paid bills overage instead of failing closed, so every change below is
-// sized against the monthly included usage spread over a 31-day month (the
-// `account.daily` allowances) with room to spare. Paid gives 16x the SQL rows
-// written and 160x the rows read of Free, but only a third of its Durable
-// Object requests (1 million a month against 100,000 a day), so frame and
-// connection budgets move much less than SQL ones. Worst cases at these
-// values, per UTC day:
+// Paid bills overage instead of failing closed. The limits below are sized
+// for a front-page day (about 40,000 visitors, a tenth registering) rather
+// than a 31st of the month's inclusions: a busy day past its share costs
+// nothing while the month stays inside them, and the bill cap (`billCap`)
+// stops the server on the estimated overage in dollars. Worst cases at these
+// values, per UTC day, priced as if the month's inclusions were spent:
 //
-// - SQL rows written: the application's own ceiling, 800,000 (half the
-//   1.6 million daily share). Posts, frames, and admissions all charge it
-//   and fail closed at it.
-// - SQL rows read: 30 million (under 4% of the 800 million daily share).
-// - Durable Object requests: about 21,000 of the 32,000 daily share, from
-//   150,000 frames at 20 incoming WebSocket messages a request (7,500), a full
-//   100 connections pinging every 45 seconds (9,600), 4,000 admissions, and
-//   alarms. Rejected connection attempts also reach the object, at most
-//   `objectRequestsPerLocationMinute` a minute from each location; the
-//   account-usage stop at 90% covers the rest.
-// - Durable Object duration: one object awake all day is 10,800 GB-s, under
-//   the 12,900 daily share, so duration cannot run over. User status spends
+// - SQL rows written: the application's own ceiling, 3.1 million, $3.10.
+//   Posts, frames, and admissions all charge it and fail closed at it.
+// - SQL rows read: 105 million, about $0.11.
+// - Durable Object requests: about 210,000, from 2 million frames and 250
+//   connections pinging every 120 seconds at 20 incoming WebSocket messages
+//   a request, and 100,000 admissions: about $0.03. Rejected connection
+//   attempts also reach the object, at most `objectRequestsPerLocationMinute`
+//   a minute from each location; the attack pause weighs the rest.
+// - Durable Object duration: one object awake all day is 10,800 GB-s, about
+//   $0.14, under the 12,900 daily share. User status spends
 //   it rather than requests: one timer keeps the object awake up to a minute
 //   after its last event while a status change waits to be announced.
 // - Storage: history is kept 7 days, matching uploaded images, so the
 //   database watermarks rise to 768 MB (1 GB hard), a fifth of the 5 GB-month
 //   included. Cleanup runs daily; it removes the same rows a day as hourly
 //   would, in batches that continue until it is caught up.
+//
+// That is about $3.40 a day in all, under the daily cap's $5.
 //
 // None of that bounds hostile traffic that never gets past the entry Worker,
 // which is billed per request. An edge block rule stops requests before they
@@ -60,15 +59,33 @@ export const PAID_PLAN: Plan = Object.freeze({
 		historyBurstPerIp: 120,
 		historyRequestsPerUserDay: 3_000,
 		historyRequestsPerIpDay: 6_000,
-		historyRequestsPerDay: 40_000,
+		// A front-page day: about 40,000 visitors, each opening a few pages.
+		historyRequestsPerDay: 400_000,
 		anonymousPostsPerDay: 200,
 		registeredPostsPerDay: 1_000,
 		trustedPostsPerDay: 4_000,
 		ipPostsPerDay: 2_000,
-		globalPostsPerMinute: 120,
-		globalPostsPerDay: 10_000,
-		registrationsPerIpDay: 5,
-		registrationsPerDay: 300,
+		globalPostsPerMinute: 600,
+		globalPostsPerDay: 60_000,
+		// A conference or office behind one address can sign up together.
+		registrationsPerIpDay: 20,
+		// A front-page day: up to 10% of 40,000 visitors register.
+		registrationsPerDay: 5_000,
+		// About 2 KB an identity with its passkey: 100 MB at the cap. Dormant
+		// accounts are pruned (cleanup), so the cap is not spent for good.
+		registeredIdentityCount: 50_000,
+		// Every slot is room for one limiter's counters; a busy day has tens of
+		// thousands of addresses and users.
+		limiterRecordCap: 50_000,
+		// The memory bound: each open connection may queue
+		// pendingBytesPerConnection (128 KiB) of incoming frames, and all of
+		// them together at most MAX_SOCKET_QUEUE_ALLOCATION (32 MiB). More
+		// needs a shared queue budget and a broadcast load test first.
+		openConnections: 250,
+		// Idle sockets ping half as often (each ping is a billed request when
+		// it reaches the object): a hidden tab costs about 12 a day, not 32.
+		pingSeconds: 120,
+		pingTimeoutSeconds: 300,
 		// Room for two browsers on one address, such as a second account in a
 		// private window: each has a guest connection while signed out, a
 		// sign-in opens one more beside it, and a reload's replacement is
@@ -79,17 +96,20 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// A sign-in costs three admissions (guest, sign-in connection, the
 		// signed-in reconnect), so Free's 5 a minute ran out on two browsers.
 		connectionAdmissionsPerIpMinute: 12,
-		connectionAdmissionsPerDay: 4_000,
-		processedFramesPerDay: 150_000,
-		// Twice Free's spike: 20 active users among 50 connected.
-		globalFramesPerMinute: 600,
+		// A front-page day: 40,000 visitors, two or three connections each.
+		connectionAdmissionsPerDay: 100_000,
+		processedFramesPerDay: 2_000_000,
+		// A busy minute with the server full: 250 connections, a few frames each.
+		globalFramesPerMinute: 3_000,
 		// The calibrated ceiling; members cost only reads.
 		roomListMembers: 200,
-		sqlWritesPerDay: 800_000,
-		sqlReadsPerDay: 30_000_000,
-		foregroundWritesPerDay: 700_000,
+		// Past the month's inclusion a day at these costs $3.10 in writes,
+		// about $3.40 in all: the daily bill cap ($5) still bounds the worst day.
+		sqlWritesPerDay: 3_100_000,
+		sqlReadsPerDay: 105_000_000,
+		foregroundWritesPerDay: 3_000_000,
 		maintenanceWritesPerDay: 100_000,
-		foregroundReadsPerDay: 25_000_000,
+		foregroundReadsPerDay: 100_000_000,
 		maintenanceReadsPerDay: 5_000_000,
 		databaseHighWaterBytes: 768 * 1024 * 1024,
 		databaseHardTargetBytes: 1024 * 1024 * 1024,
@@ -105,6 +125,8 @@ export const PAID_PLAN: Plan = Object.freeze({
 		requestsPerIpMinute: 20,
 		// Three busy /56s' worth, as on Free.
 		requestsPerIpv6PrefixMinute: 60,
+		// Twice a full reconnect of the 250 open connections, as on Free.
+		objectRequestsPerLocationMinute: 500,
 	}),
 	// Monthly included usage divided by 31 days, rounded down, so stopping
 	// under the daily share every day keeps the month inside what $5 covers.
@@ -160,12 +182,13 @@ export const PAID_PLAN: Plan = Object.freeze({
 		}),
 	}),
 	edgeStop: Object.freeze({
-		// Legitimate traffic is a few hundred requests a day in all, so 20 a
-		// second at one location is a flood. Spread thinner than that over every
-		// location, an attack stays within what the minute guard stops in time.
-		floodRequestsPerColoMinute: 1_200,
+		// A front-page day at one location is a few thousand requests a minute
+		// at most (connections, probes, media), so 100 a second is a flood.
+		// Spread thinner than that over every location, the attack pause
+		// (src/burn.ts) weighs what it costs.
+		floodRequestsPerColoMinute: 6_000,
 		// Sampling keeps the per-request cost to one random number; the rate
-		// limiter counts 60 sampled requests a minute.
+		// limiter counts 300 sampled requests a minute.
 		floodSampleEvery: 20,
 		// Long enough for analytics to show the flood, so the guard's bill cap
 		// takes over before the hold ends if the flood ran up the bill.

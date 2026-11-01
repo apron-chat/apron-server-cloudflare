@@ -767,6 +767,25 @@ logged (`attack_paused`), counted (`attack` metric) and announced as the
 `paused` tier; a wake stays paused. The meter itself is in memory, so it
 starts empty after a wake.
 
+**Launch profile.** Paid's limits are sized for a front-page day (about
+40,000 visitors, a tenth of them registering): 250 open connections (the
+memory bound of 128 KiB queued per connection within 32 MiB; more needs a
+shared queue budget and a broadcast load test), 100,000 admissions, 2
+million frames, 400,000 history pages, 5,000 registrations (20 per
+address), 50,000 accounts, 600 posts a minute and 60,000 a day, and 3
+million foreground rows written. A day at every ceiling costs about $3.40
+past the month's inclusions, under the daily bill cap. Clients ping every
+120 seconds (`pingSeconds`), so an idle tab costs about 12 billed requests
+a day. Guest visits cost less: a guest cannot scroll back (`before`
+alone), its history is charged to its address only, and a full server
+closes the guest idle longest (10 minutes without a frame, close code
+4000) to admit a newcomer. With user status on, registered accounts nobody
+came back to are removed after 30 days (`Store.pruneDormantIdentities`):
+signed up with a passkey and active only that first day, with no role,
+chosen status, push subscription, upload or bot. Their content is past
+retention by then; their `user_id` is retired as `/purge` retires it, and
+`/status` counts them.
+
 **Storage overruns.** Every operation reserves the SQL rows it may read and
 write before it runs. One that uses more is an *overrun*: a wrong estimate,
 not a cost emergency. It is observed: the operation finishes, its excess is
@@ -923,7 +942,7 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `historyBurstPerIp` | 120 | 60 |
 | `historyRequestsPerUserDay` | 3000 | 1000 |
 | `historyRequestsPerIpDay` | 6000 | 2000 |
-| `historyRequestsPerDay` | 40000 | 5000 |
+| `historyRequestsPerDay` | 400000 | 5000 |
 | `concurrentHistoryPerConnection` | 1 |  |
 | `anonymousPostsPerMinute` | 5 |  |
 | `anonymousPostsPerDay` | 200 | 100 |
@@ -933,44 +952,44 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `trustedPostsPerDay` | 4000 | 2000 |
 | `ipPostsPerMinute` | 30 |  |
 | `ipPostsPerDay` | 2000 | 1000 |
-| `globalPostsPerMinute` | 120 | 60 |
-| `globalPostsPerDay` | 10000 | 5000 |
-| `registrationsPerIpDay` | 5 | 3 |
-| `registrationsPerDay` | 300 | 100 |
-| `registeredIdentityCount` | 10000 |  |
+| `globalPostsPerMinute` | 600 | 60 |
+| `globalPostsPerDay` | 60000 | 5000 |
+| `registrationsPerIpDay` | 20 | 3 |
+| `registrationsPerDay` | 5000 | 100 |
+| `registeredIdentityCount` | 50000 | 10000 |
 | `authAttemptsPerIpMinute` | 10 |  |
-| `openConnections` | 100 |  |
+| `openConnections` | 250 | 100 |
 | `anonymousConnectionsPerIp` | 6 | 2 |
 | `registeredConnectionsPerUser` | 3 |  |
 | `connectionsPerIp` | 10 |  |
 | `connectionAdmissionsPerIpMinute` | 12 | 5 |
-| `connectionAdmissionsPerDay` | 4000 | 2000 |
+| `connectionAdmissionsPerDay` | 100000 | 2000 |
 | `unauthenticatedTimeoutSeconds` | 30 |  |
 | `pendingFramesPerConnection` | 8 |  |
 | `pendingBytesPerConnection` | 131072 |  |
 | `framesPerConnectionMinute` | 60 |  |
 | `framesPerIpMinute` | 120 |  |
-| `processedFramesPerDay` | 150000 | 100000 |
+| `processedFramesPerDay` | 2000000 | 100000 |
 | `repeatedPolicyViolations` | 3 |  |
-| `globalFramesPerMinute` | 600 | 300 |
+| `globalFramesPerMinute` | 3000 | 300 |
 | `activityBroadcastsPerUserMinute` | 10 |  |
 | `roomListRequestsPerUserMinute` | 6 |  |
 | `activityMaxTypingSeconds` | 30 |  |
 | `frameLease` | 10 |  |
 | `roomListMembers` | 200 | 100 |
-| `pingSeconds` | 45 |  |
-| `pingTimeoutSeconds` | 150 |  |
+| `pingSeconds` | 120 | 45 |
+| `pingTimeoutSeconds` | 300 | 150 |
 | `unpingedTimeoutSeconds` | 900 |  |
 | `guestNumberBlock` | 10 |  |
 | `statusCoalesceSeconds` | 60 |  |
 | `offlineGraceSeconds` | 60 |  |
 | `presenceAlarmSeconds` | 15 | 60 |
 | `guestPresenceAlarmSeconds` | 60 |  |
-| `sqlWritesPerDay` | 800000 | 80000 |
-| `sqlReadsPerDay` | 30000000 | 3000000 |
-| `foregroundWritesPerDay` | 700000 | 60000 |
+| `sqlWritesPerDay` | 3100000 | 80000 |
+| `sqlReadsPerDay` | 105000000 | 3000000 |
+| `foregroundWritesPerDay` | 3000000 | 60000 |
 | `maintenanceWritesPerDay` | 100000 | 20000 |
-| `foregroundReadsPerDay` | 25000000 | 2500000 |
+| `foregroundReadsPerDay` | 100000000 | 2500000 |
 | `maintenanceReadsPerDay` | 5000000 | 500000 |
 | `databaseHighWaterBytes` | 805306368 | 100663296 |
 | `databaseHardTargetBytes` | 1073741824 | 134217728 |
@@ -985,6 +1004,6 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `reactionUsersPerMessage` | 32 |  |
 | `reactionEmojisPerUser` | 8 |  |
 | `dedupTtlSeconds` | 86400 |  |
-| `limiterRecordCap` | 10000 |  |
+| `limiterRecordCap` | 50000 | 10000 |
 | `maxCredentialBytes` | 16384 |  |
 | `maxChallengeBytes` | 16384 |  |

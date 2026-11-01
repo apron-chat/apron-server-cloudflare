@@ -517,7 +517,7 @@ export const MAX_REACTION_EMOJIS_PER_USER = 16;
 export const MAX_EMOJI_BYTES = 64;
 export const MAX_CONNECTION_FRAME_RATE = 120;
 // The server-wide frame window is one in-memory timestamp per frame.
-export const MAX_GLOBAL_FRAMES_PER_MINUTE = 1_000;
+export const MAX_GLOBAL_FRAMES_PER_MINUTE = 3_000;
 // Throttle windows live in connection attachments, one timestamp per event.
 export const MAX_TYPE_THROTTLE_PER_MINUTE = 60;
 // A block counts against the IP's frame minute all at once.

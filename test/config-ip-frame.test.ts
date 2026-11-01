@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { ConfigError, DEFAULT_LIMITS, isAllowedOrigin, loadConfig } from '../src/config';
-import { ACCOUNT_USAGE_POLICY, DEFAULT_FEATURES, PLAN } from '../src/budget';
+import { ACCOUNT_USAGE_POLICY, DEFAULT_FEATURES, MAX_GLOBAL_FRAMES_PER_MINUTE, PLAN } from '../src/budget';
+import { PRICES } from '../src/pricing';
 import { FREE_PLAN } from '../src/plans/free';
 import { PAID_PLAN } from '../src/plans/paid';
 import { canonicalizeIp, extractClientIp, hashIpKey, hashIpv6PrefixKey } from '../src/ip';
@@ -220,8 +221,6 @@ describe('configuration policy boundaries', () => {
 		for (const plan of new Set([FREE_PLAN, PLAN])) expect(() => config({}, plan.limits)).not.toThrow();
 		for (const plan of [FREE_PLAN, PAID_PLAN]) {
 			const { daily, storedBytes } = plan.account;
-			expect(plan.limits.sqlWritesPerDay).toBeLessThan(daily.sqlRowsWritten * ACCOUNT_USAGE_POLICY.stopRatio);
-			expect(plan.limits.sqlReadsPerDay).toBeLessThan(daily.sqlRowsRead * ACCOUNT_USAGE_POLICY.stopRatio);
 			expect(plan.limits.databaseHardTargetBytes).toBeLessThan(storedBytes * ACCOUNT_USAGE_POLICY.stopRatio);
 			// Worst-case billed Durable Object requests: processed frames and pings
 			// from every open connection every pingSeconds, at 20 incoming WebSocket
@@ -230,7 +229,23 @@ describe('configuration policy boundaries', () => {
 			// Live text, where on: each text's write and its reads, at the daily cap.
 			const live = plan.liveText && plan.features.liveText ? plan.liveText.startsPerDay * (1 + plan.liveText.readsPerText) : 0;
 			const requests = messages / 20 + plan.limits.connectionAdmissionsPerDay + 24 + live;
-			expect(requests).toBeLessThan(daily.durableObjectRequests * ACCOUNT_USAGE_POLICY.stopRatio);
+			const cap = plan.account.billCap;
+			if (!cap) {
+				// A plan that fails closed fits each day inside its daily allowances.
+				expect(plan.limits.sqlWritesPerDay).toBeLessThan(daily.sqlRowsWritten * ACCOUNT_USAGE_POLICY.stopRatio);
+				expect(plan.limits.sqlReadsPerDay).toBeLessThan(daily.sqlRowsRead * ACCOUNT_USAGE_POLICY.stopRatio);
+				expect(requests).toBeLessThan(daily.durableObjectRequests * ACCOUNT_USAGE_POLICY.stopRatio);
+				continue;
+			}
+			// A plan that bills past its inclusions keeps a day at every ceiling
+			// under the daily bill cap, even with the month's inclusions spent:
+			// SQL rows, object requests (each also an entry Worker request with
+			// its CPU) and one object awake all day.
+			const price = (field: 'sqlRowsWritten' | 'sqlRowsRead' | 'durableObjectRequests' | 'workerRequests' | 'workerCpuMs' | 'durableObjectDurationGbSeconds', used: number) => used * PRICES[field].usd / PRICES[field].unit;
+			const worstDay = price('sqlRowsWritten', plan.limits.sqlWritesPerDay) + price('sqlRowsRead', plan.limits.sqlReadsPerDay)
+				+ price('durableObjectRequests', requests) + price('workerRequests', plan.limits.connectionAdmissionsPerDay) + price('workerCpuMs', plan.limits.connectionAdmissionsPerDay * 2)
+				+ price('durableObjectDurationGbSeconds', 86_400 * 0.125);
+			expect(worstDay).toBeLessThan(cap.dayUsd);
 		}
 	});
 
@@ -246,7 +261,7 @@ describe('configuration policy boundaries', () => {
 	});
 	it('bounds the server-wide frame minute', () => {
 		expect(() => config({}, { globalFramesPerMinute: DEFAULT_LIMITS.framesPerIpMinute - 1 })).toThrow(ConfigError);
-		expect(() => config({}, { globalFramesPerMinute: 1_001 })).toThrow(ConfigError);
+		expect(() => config({}, { globalFramesPerMinute: MAX_GLOBAL_FRAMES_PER_MINUTE + 1 })).toThrow(ConfigError);
 		expect(config().limits.frameLease).toBe(10);
 		expect(() => config({}, { frameLease: 21 })).toThrow(ConfigError);
 		expect(() => config({}, { frameLease: 20, framesPerIpMinute: 39 })).toThrow(ConfigError);
@@ -284,9 +299,10 @@ describe('configuration policy boundaries', () => {
 	});
 
 	it('requires the timeout for connections that never pinged to outlast the ping timeout', () => {
+		const timeout = DEFAULT_LIMITS.pingTimeoutSeconds;
 		expect(config().limits.unpingedTimeoutSeconds).toBe(900);
-		expect(config({ LIMIT_UNPINGED_TIMEOUT_SECONDS: '150' }).limits.unpingedTimeoutSeconds).toBe(150);
-		expect(() => config({ LIMIT_UNPINGED_TIMEOUT_SECONDS: '149' })).toThrow(ConfigError);
+		expect(config({ LIMIT_UNPINGED_TIMEOUT_SECONDS: String(timeout) }).limits.unpingedTimeoutSeconds).toBe(timeout);
+		expect(() => config({ LIMIT_UNPINGED_TIMEOUT_SECONDS: String(timeout - 1) })).toThrow(ConfigError);
 	});
 
 

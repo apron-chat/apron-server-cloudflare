@@ -262,8 +262,9 @@ describe.runIf(PLAN.edgeStop)("flood trip", () => {
 	});
 
 	it("is sized so ordinary traffic cannot trip it", () => {
-		// A quarter of a day's admissions, arriving at one location in one minute, stays under it.
-		expect(policy.floodRequestsPerColoMinute).toBeGreaterThan(PLAN.limits.connectionAdmissionsPerDay / 4);
+		// Ten times what one location may send the object in a minute (its
+		// admissions are capped there), leaving room for probes and media.
+		expect(policy.floodRequestsPerColoMinute).toBeGreaterThan(PLAN.admission.objectRequestsPerLocationMinute * 10);
 		expect(policy.holdSeconds).toBeGreaterThanOrEqual(15 * 60);
 	});
 });
