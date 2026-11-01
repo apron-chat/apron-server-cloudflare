@@ -3791,7 +3791,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!roomIds.length) return;
 		let kept: Map<string, Array<[string, string]>>;
 		try {
-			kept = this.store.roomReadCursors(roomIds, nowMs());
+			kept = this.store.roomReadCursors(roomIds, userId, nowMs());
 		} catch {
 			return;
 		}
@@ -3800,6 +3800,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const state = connectionAttachment(ws as WebSocketConnection);
 			if (state?.tier !== "registered" || !state.userId || !state.reads || state.choice === "invisible") continue;
 			for (const [roomId, read] of Object.entries(state.reads)) {
+				// Held for a room the connection has since left (a leave, a kick): not a member's any more.
+				if (!state.rooms?.includes(roomId)) continue;
 				const room = cursors.get(roomId);
 				const current = room?.get(state.userId);
 				if (room && (current === undefined || Number(read) > Number(current))) room.set(state.userId, read);

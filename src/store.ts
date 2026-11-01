@@ -6136,25 +6136,29 @@ export class Store {
   /**
    * The read cursors of a private room's members (read receipts, protocol
    * §4.6): for each room, the users with a cursor kept there and the
-   * `read_message_id` each read through, at most MAX_READ_RECEIPT_MEMBERS a
-   * room, leaving out members who chose `invisible`. A range of the room's
+   * `read_message_id` each read through, from the first
+   * MAX_READ_RECEIPT_MEMBERS members by `user_id` other than `except` (the
+   * lister), leaving out members who chose `invisible`. A range of the room's
    * memberships, each joined to its cursor and its `user_status` row by
    * primary key, so a member without a cursor costs its membership read
    * alone.
    */
-  roomReadCursors(roomIds: readonly string[], now = this.clock.now()): Map<string, Array<[userId: string, messageId: string]>> {
+  roomReadCursors(roomIds: readonly string[], except: string, now = this.clock.now()): Map<string, Array<[userId: string, messageId: string]>> {
     const rooms = roomIds.filter(isPrivateRoomId).slice(0, MAX_PRIVATE_MEMBERSHIPS_PER_USER);
     const found = new Map<string, Array<[string, string]>>();
     if (!rooms.length) return found;
     this.ensureReady();
     return this.reserved({ reads: 8 + rooms.length * (4 + 3 * MAX_READ_RECEIPT_MEMBERS) }, false, now, () => {
       for (const roomId of rooms) {
+        // The scan itself is bounded: at most MAX_READ_RECEIPT_MEMBERS memberships, by key, whatever the room's size
+        // and however many of them have no cursor or are invisible (a LIMIT on the joined rows would not bound it).
         const rows = this.rawRows<{ user_id: string; message_id: number }>(
-          `SELECT read_cursors.user_id, read_cursors.message_id FROM memberships
-           JOIN read_cursors ON read_cursors.user_id = memberships.user_id AND read_cursors.room_id = memberships.room_id
-           LEFT JOIN user_status ON user_status.user_id = memberships.user_id
-           WHERE memberships.room_id = ? AND (user_status.status IS NULL OR user_status.status != 'invisible') LIMIT ?`,
-          roomId, MAX_READ_RECEIPT_MEMBERS,
+          `SELECT read_cursors.user_id, read_cursors.message_id
+           FROM (SELECT user_id FROM memberships WHERE room_id = ? AND user_id != ? ORDER BY user_id LIMIT ?) AS members
+           JOIN read_cursors ON read_cursors.user_id = members.user_id AND read_cursors.room_id = ?
+           LEFT JOIN user_status ON user_status.user_id = members.user_id
+           WHERE user_status.status IS NULL OR user_status.status != 'invisible'`,
+          roomId, except, MAX_READ_RECEIPT_MEMBERS, roomId,
         );
         if (rows.length) found.set(roomId, rows.map((row) => [row.user_id, idString(integerColumn(row.message_id))]));
       }
