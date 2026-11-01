@@ -424,6 +424,15 @@ function liveUrl(live: Pick<StoreLiveTextConfig, "publicOrigin">, entry: Pick<Li
   return `${live.publicOrigin}/live/${entry.id}`;
 }
 
+/**
+ * A terminal embed's `og` (protocol §4.8.1): what it is, for a client that
+ * doesn't render terminal embeds and shows it as the card its `og`
+ * describes, which opens its `url`. Titled as the embed is.
+ */
+export function terminalOg(title: unknown): { title: string; description: string } {
+  return { title: typeof title === "string" && title ? title : "Terminal", description: "Terminal output. Open it to watch." };
+}
+
 function isLiveEntry(value: unknown): value is LiveEntry {
   if (!isPlainObject(value)) return false;
   return typeof value.key === "string" && /^l\/[A-Za-z0-9_-]{22}$/.test(value.key) && typeof value.id === "string" &&
@@ -4776,11 +4785,13 @@ export class Store {
         }
         kept.add(embedId as string);
         if (isLive(before.kind)) {
-          // The server owns `url` and `output` (§4.8.2); a terminal takes a new title.
-          const { title: _title, ...owned } = before;
+          // The server owns `url`, `output`, and a terminal's `og` (§4.8.1, §4.8.2); a terminal takes a new title.
+          const { title: _title, og: _og, ...owned } = before;
           void _title;
-          const title = before.kind === "terminal" ? uploadTitle(fields.title) : undefined;
-          return { ...owned, ...(title ? { title } : {}) };
+          void _og;
+          if (before.kind !== "terminal") return owned;
+          const title = uploadTitle(fields.title);
+          return { ...owned, ...(title ? { title } : {}), og: terminalOg(title) };
         }
         if (before.kind !== "upload" || !this.config.uploads) return { embed_id: embedId, ...fields };
         const title = uploadTitle(fields.title);
@@ -4798,7 +4809,10 @@ export class Store {
           writes.push(liveResultEmbed(entry, live!));
         }
         // Its `url` waits for the write (§4.8.5): a command's message is posted with it then, and a message's republished.
-        return { embed_id: id, kind, ...(title ? { title } : {}), ...(liveClaim ? { url: liveUrl(live!, entry) } : {}) };
+        return {
+          embed_id: id, kind, ...(title ? { title } : {}), ...(liveClaim ? { url: liveUrl(live!, entry) } : {}),
+          ...(kind === "terminal" ? { og: terminalOg(title) } : {}),
+        };
       }
       if (fields.kind !== "upload" || !this.config.uploads) return { embed_id: id, ...fields };
       const upload = this.startUpload("file", userId, now, { messageId, embedId: id });
