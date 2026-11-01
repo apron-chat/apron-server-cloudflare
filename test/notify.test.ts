@@ -9,6 +9,18 @@ describe("trigger notices", () => {
 		expect(noticeText({ kind: "accounting_overrun" })).toContain("ACCOUNTING_RECOVERY");
 	});
 
+	it("names the paused user, never the hashed address, and how many more pauses the day allows", () => {
+		const message = "storage cost exceeded its reservation: 29/28 reads, 0/8 writes";
+		const first = noticeText({ kind: "accounting_quarantine", principals: ["ip:abc123", "user:mallory"], message, count: 1, limit: 3 });
+		expect(first).toContain("`mallory` and their address");
+		expect(first).toContain(message);
+		expect(first).toContain("Today 2 more can be paused");
+		expect(first).not.toContain("abc123");
+		const guest = noticeText({ kind: "accounting_quarantine", principals: ["ip:abc123"], message, count: 3, limit: 3 });
+		expect(guest).toContain("for one address");
+		expect(guest).toContain("The next overrun today closes the server for everyone.");
+	});
+
 	it("never throws or rejects, whatever a channel does, and logs the failure", async () => {
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 		await expect(notifyTrigger({ kind: "edge_stop", exceeded: ["flood"] }, { admins: () => Promise.reject(new Error("object down")) })).resolves.toBeUndefined();

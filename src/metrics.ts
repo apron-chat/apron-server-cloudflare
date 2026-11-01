@@ -14,7 +14,7 @@ export type MetricEvent =
 	| "alarm"
 	/** Pushes delivered: `sent`, `failed` or `gone`, valued by count. */
 	| "push"
-	/** Storage accounting closed (`overrun` or `uncertain`) or reopened (`recovered`). */
+	/** Storage accounting closed (`overrun` or `uncertain`), paused one user (`quarantined`), or reopened (`recovered`); with what failed where known. */
 	| "accounting"
 	/** An admin alert posted (notifyAdmins): `pushed` or `not_pushed`, valued by admins mentioned. */
 	| "admins_notified"

@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
@@ -1010,6 +1011,25 @@ function writeSessionAttachment(socket: WebSocketConnection, attachment: Connect
 }
 
 /**
+ * Who the event running now acts for (Store.actor): a frame, close or
+ * request runs inside `ACTOR.run`, so an overrun in its storage work
+ * quarantines its user and address instead of closing the server
+ * (Store.quarantineActor). The server's own work (alarms, presence sweeps)
+ * runs outside it and has none. Read when asked, so a frame that signs in
+ * is held to the user it signed in as.
+ */
+const ACTOR = new AsyncLocalStorage<() => readonly string[]>();
+
+/** The principals a connection's events act for: its address, and its user once it has one. */
+function connectionActor(socket: WebSocketConnection, fallback: ConnectionAttachment): () => readonly string[] {
+	return () => attachmentPrincipals(connectionAttachment(socket) ?? fallback);
+}
+
+function attachmentPrincipals(attachment: Pick<ConnectionAttachment, "ipKey" | "userId">): string[] {
+	return [`ip:${attachment.ipKey}`, ...(attachment.userId ? [`user:${attachment.userId}`] : [])];
+}
+
+/**
  * What people are told of an internal error, by its cause where the store
  * names one (Store.assertAccounting), so a connection status probe alone
  * says why the server refuses.
@@ -1826,7 +1846,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.store = new Store(ctx as unknown as ConstructorParameters<typeof Store>[0], asStoreConfig(this.config));
 		// An overrun closes accounting until an operator clears it: tell them.
 		this.store.onOverrun = () => ctx.waitUntil(notifyTrigger({ kind: "accounting_overrun" }, { admins: (text) => this.notifyAdmins(text) }));
-		this.store.onAccounting = (change) => recordMetric(this.runtimeEnv.METRICS, "accounting", [change]);
+		// An overrun one user or address caused pauses them instead: tell the operators who.
+		// The notice is the server's own work, never refused as the paused user's.
+		this.store.onQuarantine = (detail) => ctx.waitUntil(ACTOR.run(() => [], () => notifyTrigger({ kind: "accounting_quarantine", ...detail }, { admins: (text) => this.notifyAdmins(text) })));
+		// With what overran: the log line saying so may be sampled away.
+		this.store.onAccounting = (change, message) => recordMetric(this.runtimeEnv.METRICS, "accounting", message ? [change, message] : [change]);
+		this.store.actor = () => ACTOR.getStore()?.();
 		this.accountUsage = new AccountUsageMonitor({
 			env,
 			persist: (snapshot, now) => this.store.persistAccountUsageSnapshot(snapshot, now),
@@ -1870,26 +1895,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (this.accountUsage.stops(nowMs())) return responseError(503, "Demo account capacity reached", 300_000);
 		const origin = request.headers.get("Origin");
 		if (!isAllowedOrigin(this.config, origin)) return responseError(403, "Origin not allowed");
-		try {
-			const sockets = this.ctx.getWebSockets();
-			// A vanished peer's socket still takes a slot until the runtime lets go
-			// of it, but it must not lock its own IP out of reconnecting.
-			const now = nowMs();
-			this.closeStale(now);
-			const peers = sockets.filter(socket => !this.isStale(socket, now)).map(socket => connectionAttachment(socket)).filter(peer => peer?.ipKey === ipKey);
-			if (sockets.length >= this.config.limits.openConnections || peers.length >= this.config.limits.connectionsPerIp ||
-				peers.filter(peer => peer?.tier !== "registered").length >= this.config.limits.anonymousConnectionsPerIp) {
-				return responseError(429, "Demo capacity reached", 60_000);
-			}
-			if (status) {
-				this.store.checkConnectionBudget(nowMs());
-				// This is advisory; the real upgrade still checks all admission gates.
-				return Response.json({ available: true });
-			}
-			this.store.reserveConnection({ ipKey, now: nowMs() });
-		} catch (error) {
-			return this.storeResponseError(error);
-		}
+		const refused = ACTOR.run(() => [`ip:${ipKey}`], () => this.admit(ipKey, status));
+		if (refused) return refused;
 		const pair = new WebSocketPair();
 		const server = pair[1] as WebSocketConnection;
 		const endpoint = endpointOf(request);
@@ -1918,6 +1925,35 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.send(server, this.welcome(origin));
 		await this.rescheduleAlarm();
 		return new Response(null, { status: 101, webSocket: pair[0] });
+	}
+
+	/**
+	 * Admission's checks and its reservation, for `fetch`: a refusal, or
+	 * undefined once the connection may be accepted. A connection status probe
+	 * answers here. Runs as the address it admits (ACTOR).
+	 */
+	private admit(ipKey: string, status: boolean): Response | undefined {
+		try {
+			const sockets = this.ctx.getWebSockets();
+			// A vanished peer's socket still takes a slot until the runtime lets go
+			// of it, but it must not lock its own IP out of reconnecting.
+			const now = nowMs();
+			this.closeStale(now);
+			const peers = sockets.filter(socket => !this.isStale(socket, now)).map(socket => connectionAttachment(socket)).filter(peer => peer?.ipKey === ipKey);
+			if (sockets.length >= this.config.limits.openConnections || peers.length >= this.config.limits.connectionsPerIp ||
+				peers.filter(peer => peer?.tier !== "registered").length >= this.config.limits.anonymousConnectionsPerIp) {
+				return responseError(429, "Demo capacity reached", 60_000);
+			}
+			if (status) {
+				this.store.checkConnectionBudget(nowMs());
+				// This is advisory; the real upgrade still checks all admission gates.
+				return Response.json({ available: true });
+			}
+			this.store.reserveConnection({ ipKey, now: nowMs() });
+		} catch (error) {
+			return this.storeResponseError(error);
+		}
+		return undefined;
 	}
 
 	webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
@@ -1956,7 +1992,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.pendingBytes += bytes;
 		writeAttachment(socket, attachment);
 		const prior = this.queues.get(socket) ?? Promise.resolve();
-		const next = prior.catch(() => undefined).then(() => this.processFrame(socket, message)).catch((error) => this.handleFrameFailure(socket, error)).finally(() => {
+		const actor = connectionActor(socket, attachment);
+		const next = prior.catch(() => undefined).then(() => ACTOR.run(actor, () => this.processFrame(socket, message))).catch((error) => this.handleFrameFailure(socket, error)).finally(() => {
 			const latest = connectionAttachment(socket);
 			if (latest) {
 				latest.pendingFrames = Math.max(0, latest.pendingFrames - 1);
@@ -1977,7 +2014,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.closing = true;
 		writeAttachment(socket, attachment);
 		try { socket.close(code === 1005 || code === 1006 ? 1000 : code); } catch { /* already closed */ }
-		if (!closed) this.connectionGone(attachment);
+		if (!closed) ACTOR.run(() => attachmentPrincipals(attachment), () => this.connectionGone(attachment));
 		await this.rescheduleAlarm();
 	}
 
@@ -1990,7 +2027,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.closing = true;
 		writeAttachment(socket, attachment);
 		try { socket.close(1011, "Connection failed"); } catch { /* already closed */ }
-		if (!closed) this.connectionGone(attachment);
+		if (!closed) ACTOR.run(() => attachmentPrincipals(attachment), () => this.connectionGone(attachment));
 		await this.rescheduleAlarm();
 	}
 
@@ -5895,7 +5932,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** A live text request the entry Worker forwarded (§4.8.3): a write's `PUT` or a reader's `GET`. */
 	private async liveFetch(request: Request, path: string): Promise<Response> {
-		if (!this.config.liveText || !trustedIpKey(request)) return liveAnswer(404, "Not found");
+		const ipKey = trustedIpKey(request);
+		if (!this.config.liveText || !ipKey) return liveAnswer(404, "Not found");
+		return ACTOR.run(() => [`ip:${ipKey}`], () => this.liveRequest(request, path));
+	}
+
+	private async liveRequest(request: Request, path: string): Promise<Response> {
 		const now = nowMs();
 		this.accountUsage.noteActivity(now);
 		if (this.accountUsage.stops(now)) {
@@ -7495,7 +7537,18 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * this upload is waiting for one. Only one request may write it.
 	 */
 	async claimUpload(key: string): Promise<boolean | "closed"> {
-		return !!this.config.uploads && this.store.claimUpload(key, nowMs());
+		return !!this.config.uploads && this.asUploadOwner(key, () => this.store.claimUpload(key, nowMs()));
+	}
+
+	/**
+	 * Runs an upload write's storage work as the user who started it (ACTOR),
+	 * so an overrun there pauses them rather than the server. The server's
+	 * own uploads (its avatar, custom emoji) have no user and run as the server.
+	 */
+	private asUploadOwner<T>(key: string, fn: () => T): T {
+		let owner: string | undefined;
+		try { owner = this.store.uploadOwner(key, nowMs()); } catch { /* fn meets the same refusal */ }
+		return ACTOR.run(() => (owner && !owner.startsWith("~") ? [`user:${owner}`] : []), fn);
 	}
 
 	/**
@@ -7508,10 +7561,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!this.config.uploads) return false;
 		if (write.key.startsWith("e/")) return this.finishEmoji(write);
 		let finished: UploadFinish = { accepted: false, broadcasts: [], deletedUploads: [] };
-		await this.runMutation(async () => {
+		await this.asUploadOwner(write.key, () => this.runMutation(async () => {
 			finished = this.store.finishUpload(write, nowMs());
 			for (const record of finished.broadcasts) this.broadcastRecord(record);
-		});
+		}));
 		this.deleteMedia(finished.deletedUploads);
 		if (finished.avatar) this.announceAvatar(finished.avatar.userId, finished.avatar.url);
 		return finished.accepted;

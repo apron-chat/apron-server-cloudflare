@@ -141,7 +141,8 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   share, or the next month for a monthly one. It touches no other rule, so
   `apron_admission_off` stays yours to use by hand.
 - **Admin alert.** When the guard or the flood trip (below) turns the rule
-  on, and when a cost overrun closes storage accounting, the server posts a
+  on, and when a cost overrun closes storage accounting or pauses one user,
+  the server posts a
   message in `general` as the `admin` user that mentions and pushes to every
   user with the `admin` role (up to `wakesPerMessage`, 10); see
   [SPEC section 10](../SPEC.md#10-degradation-and-public-demo-behavior).
@@ -187,8 +188,9 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   (`stale_close`: `pinged` or `unpinged`, and the origin), alarms (`alarm`:
   `light` for status changes only, or `full`), pushes delivered (`push`:
   `sent`, `failed` or `gone`), accounting closing and reopening
-  (`accounting`: `overrun`, `uncertain` or `recovered`; the log line
-  `accounting_closed` carries what failed), admin alerts (`admins_notified`)
+  (`accounting`: `overrun`, `uncertain`, `quarantined` or `recovered`, and
+  for the first three what failed, as the log lines `accounting_closed` and
+  `accounting_quarantined` say), admin alerts (`admins_notified`)
   and the edge stop turning on (`edge_stop`: `guard` or `flood`). Each point
   is `blob1` the event, `blob2` and `blob3` its details and `double1` its
   value. Writing never awaits or throws, and without the binding nothing is
@@ -697,10 +699,23 @@ implementation and recalibrating its resource model.
 | `ENVIRONMENT` | Set to `development` to enable local origin defaults when `ALLOWED_ORIGINS` and `RP_ORIGINS` are omitted |
 | `NODE_ENV` | Set to `test` to enable the same local origin defaults for tests; production-like deployments must configure origins explicitly |
 
-**Accounting recovery.** A reservation overrun closes storage accounting for
-good: every connection is refused with `Server closed: storage accounting
-stopped after a cost overrun, until an operator reopens it`, and the admins
-are alerted. To reopen it, set `ACCOUNTING_RECOVERY` to a value it has not
+**Accounting quarantine.** A reservation overrun in a user's own request (a
+frame, a connection closing, a connection attempt, a live text or upload
+write) pauses only that user and address for a day: their requests get
+`retry_after` (`data.reason` `accounting_quarantined`), the overrun's excess
+rows are charged to the day's budget, the admins are told who and what
+overran, and everyone else carries on. The pause survives a wake. An
+overrun closes storage accounting for everyone instead (below) when it has
+no user (the server's own alarm and sweeps), when it ran over by more than a
+hundredth of the day's SQL ceilings, or once the UTC day has paused three
+(`QUARANTINES_PER_DAY` in `src/store.ts`): past that, the estimate is wrong
+for more than one person's data. A new `ACCOUNTING_RECOVERY` value lifts
+every pause too.
+
+**Accounting recovery.** Otherwise a reservation overrun closes storage
+accounting for good: every connection is refused with `Server closed:
+storage accounting stopped after a cost overrun, until an operator reopens
+it`, and the admins are alerted. To reopen it, set `ACCOUNTING_RECOVERY` to a value it has not
 used before, in `wrangler.production.toml` or once with
 `npm run deploy -- --var ACCOUNTING_RECOVERY:<value>`, and deploy. The
 Durable Object clears the stop when it next starts and logs

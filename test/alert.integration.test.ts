@@ -113,7 +113,8 @@ it('counts alarms and accounting changes in METRICS, and logs why accounting clo
 		delete runtime.runtimeEnv.METRICS;
 		return writeDataPoint.mock.calls.map(([point]) => (point as { blobs: string[] }).blobs);
 	});
-	expect(points).toEqual([['alarm', 'light'], ['alarm', 'full'], ['accounting', 'uncertain'], ['accounting', 'recovered']]);
+	// The accounting change carries what failed: the log line saying so may be sampled away.
+	expect(points).toEqual([['alarm', 'light'], ['alarm', 'full'], ['accounting', 'uncertain', expect.stringContaining('injected budget reservation failure')], ['accounting', 'recovered']]);
 	const closed = error.mock.calls.map(([line]) => String(line)).filter((line) => line.includes('"accounting_closed"')).map((line) => JSON.parse(line));
 	expect(closed).toEqual([{ event: 'accounting_closed', kind: 'uncertain', message: expect.stringContaining('injected budget reservation failure') }]);
 });

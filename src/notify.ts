@@ -2,11 +2,13 @@
  * Something the operators must hear of at once: the edge stop turned on (by
  * the budget guard, or by the flood trip, `exceeded: ["flood"]`), or storage
  * accounting closed by an overrun, which stays closed until an operator
- * clears it. New kinds of notice, and new ways to tell one, join here.
+ * clears it, or an overrun that paused only the user or address it acted
+ * for (Store.quarantineActor). New kinds of notice, and new ways to tell one, join here.
  */
 export type TriggerNotice =
 	| { kind: "edge_stop"; exceeded: readonly string[] }
-	| { kind: "accounting_overrun" };
+	| { kind: "accounting_overrun" }
+	| { kind: "accounting_quarantine"; principals: readonly string[]; message: string; count: number; limit: number };
 
 /**
  * The ways a notice can be told, each optional. `admins` posts the text in
@@ -26,6 +28,13 @@ export function noticeText(notice: TriggerNotice): string {
 		}
 		case "accounting_overrun":
 			return "**Storage accounting closed.** An operation used more rows than it reserved, so the server refuses all work until an operator deploys a new `ACCOUNTING_RECOVERY` value.";
+		case "accounting_quarantine": {
+			// Addresses are hashed keys, which say nothing to a reader; users are named.
+			const users = notice.principals.filter((principal) => principal.startsWith("user:")).map((principal) => `\`${principal.slice(5)}\``);
+			const who = users.length ? `${users.join(", ")} and their address` : "one address";
+			const left = Math.max(0, notice.limit - notice.count);
+			return `**Storage accounting overran for ${who}** (${notice.message}). They are paused for a day; the server stays open. ${left ? `Today ${left} more can be paused like this; the overrun after that closes the server for everyone.` : "The next overrun today closes the server for everyone."} A new \`ACCOUNTING_RECOVERY\` value lifts every pause.`;
+		}
 	}
 }
 
