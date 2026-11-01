@@ -23,7 +23,11 @@ export type MetricEvent =
 	/** The server changed tier (Store tiers, ApronDemoServer.evaluateTier): the new tier and the one before. */
 	| "tier"
 	/** A user tripped a long refusal (ApronDemoServer.noteTrip): its trigger and the method refused. */
-	| "throttle";
+	| "throttle"
+	/** The attack pause (ApronDemoServer.pauseForAttack): its trigger (`flood`, `burn`, `breakers`), valued by the hold in minutes. */
+	| "attack"
+	/** A heavy burn of mostly admitted traffic alerted the admins, valued by shadow dollars an hour. */
+	| "burn";
 
 export function recordMetric(dataset: AnalyticsEngineDataset | undefined, event: MetricEvent, details: readonly string[] = [], value = 1): void {
 	if (!dataset) return;

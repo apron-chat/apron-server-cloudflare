@@ -942,6 +942,8 @@ const META_THROTTLE_TRIPS = "throttle_trips";
 export const TRIP_WINDOW_MS = 24 * 60 * 60 * 1000;
 /** The server tier the runtime last announced to the admins (announcedTier). */
 const META_ANNOUNCED_TIER = "announced_tier";
+/** The runtime's attack pause: its UTC day, count that day, hold end, and why (attackPause). */
+const META_ATTACK_PAUSE = "attack_pause";
 /** Overruns of one operation within BREAKER_WINDOW_MS that open its breaker. */
 export const BREAKER_OVERRUNS = 3;
 export const BREAKER_WINDOW_MS = 60 * 60 * 1000;
@@ -3206,6 +3208,24 @@ export class Store {
     this.ensureReady();
     this.alert(() => this.reserved({ reads: 4, writes: 4 }, false, now, () => {
       this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ANNOUNCED_TIER, value);
+    }, true));
+  }
+
+  /**
+   * The runtime's attack pause record (ApronDemoServer.pauseForAttack), or ""
+   * before any. Read once as an instance starts, uncharged like the usage
+   * snapshot, so a paused server's refusals cost no SQL.
+   */
+  attackPause(): string {
+    this.ensureReady();
+    return this.metaValue(META_ATTACK_PAUSE) ?? "";
+  }
+
+  /** Records an attack pause (attackPause): charged, never refused. */
+  setAttackPause(value: string, now = this.clock.now()): void {
+    this.ensureReady();
+    this.alert(() => this.reserved({ reads: 4, writes: 4 }, false, now, () => {
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ATTACK_PAUSE, value);
     }, true));
   }
 

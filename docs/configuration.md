@@ -726,13 +726,46 @@ and each lifting by itself (`src/store.ts`, `ApronDemoServer.currentTier`):
 | open | | Everything works | |
 | degraded | Today's foreground SQL reads or writes, or frames, at `DEGRADE_SHARE` (70%) of their ceiling | Live text, uploads and older history (`history` with `before`) get `retry_after` (`data.reason` `degraded`); chat works | UTC midnight |
 | exhausted | One of those at 99% (`EXHAUSTED_SHARE`; the ledger refuses work just short of 100%) | New work is refused with `retry_after` until the reset; open connections stay; admins' frames and `/status` still answer | UTC midnight |
-| account stop | Cloudflare usage at 90% of a daily share or 50% of the month (the account-usage stop) | 503 and sockets closed once, as it starts | The day's or month's end |
+| account stop | The estimated overage past `BILL_CAP_DAY` ($5) today or `BILL_CAP_MONTH` ($25) this month (the account-usage stop; on Free, 90% of a daily allowance) | 503 and sockets closed once, as it starts | The day's or month's end |
+| paused (attack) | The attack pause (below): traffic burning $1 an hour or more and mostly refused, or breakers open on three actions | Everything refused with 503, every socket closed (admins' too), and the edge stop turned on for the hold | When the hold ends: 30 minutes, doubling with each pause that UTC day |
 
 Every change of tier is announced to the admins (see the admin alert above),
 going up and coming down, with why. It is evaluated at most once a minute on
 frames and alarms, and at once after an overrun or a fresh usage reading, so
 a change while nobody is connected is told at the next event. The edge stop
 (budget guard) sits past these and is announced on and off by the guard.
+
+**Attack pause.** The object prices recent traffic in *shadow dollars*:
+each billed event at its overage rate, as if every inclusion were spent
+(`src/burn.ts`). It counts its own fetches (each an entry Worker request
+and an object request), WebSocket messages (a twentieth of a request),
+alarms and RPCs, plus the requests the entry Worker answers without it
+(refusals by the attempt limiters, media, assets), which each isolate
+samples one in 100 and reports at most once a second (`noteEntrySamples`).
+Each event's sampled log is priced too; SQL rows and duration are left
+out, since the app's ceilings bound them. Over a rolling 10 minutes:
+
+- $1 an hour or more over the last 2 minutes, with 80% or more of the
+  requests refused, is a flood: the server pauses.
+- $1 an hour or more over the 10 minutes, with half or more refused, is
+  sustained abuse: the server pauses.
+- $1 an hour or more mostly admitted is a busy day, not an attack: the
+  admins are told (at most once an hour, `burn` metric) and the server
+  stays open; the bill cap bounds what it costs.
+- Breakers open on three actions at once (one of them new since the last
+  such pause) mean something systematic: the server pauses.
+
+For scale, a deploy's reconnect wave or a front-page peak (2,300 sockets,
+a few thousand frames a minute) burns a few cents an hour; $1 an hour is
+about 30,000 refused requests a minute. The pause closes every
+connection, refuses every request with 503 and a `Retry-After` of the
+hold, and turns on the edge stop with the hold written into the rule's
+description (`[attack hold until …]`), which the budget guard honours
+before it lifts the rule. The first pause in a UTC day holds 30 minutes,
+and each later one twice as long as the one before, at most a day. It is
+logged (`attack_paused`), counted (`attack` metric) and announced as the
+`paused` tier; a wake stays paused. The meter itself is in memory, so it
+starts empty after a wake.
 
 **Storage overruns.** Every operation reserves the SQL rows it may read and
 write before it runs. One that uses more is an *overrun*: a wrong estimate,

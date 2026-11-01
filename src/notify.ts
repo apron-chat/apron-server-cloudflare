@@ -11,20 +11,23 @@ export type TriggerNotice =
 	| { kind: "edge_stop_lifted" }
 	| { kind: "tier"; from: ServerTier; to: ServerTier; reasons: readonly string[] }
 	| { kind: "breaker"; operation: string; open: boolean; until?: number }
-	| { kind: "overrun"; operation: string; message: string; users: readonly string[] };
+	| { kind: "overrun"; operation: string; message: string; users: readonly string[] }
+	| { kind: "burn"; summary: string };
 
 /**
  * How far the server refuses work, least to most (docs/configuration.md,
  * Server tiers). Each lifts by itself: degraded and exhausted at UTC
- * midnight, account stop at the day's or month's end.
+ * midnight, account stop at the day's or month's end, paused when its hold
+ * ends.
  */
-export type ServerTier = "open" | "degraded" | "exhausted" | "account_stop";
+export type ServerTier = "open" | "degraded" | "exhausted" | "account_stop" | "paused";
 
 export const TIER_LABEL: Record<ServerTier, string> = {
 	open: "open",
 	degraded: "degraded",
 	exhausted: "exhausted",
 	account_stop: "account stop",
+	paused: "paused (attack)",
 };
 
 const TIER_MEANING: Record<ServerTier, string> = {
@@ -32,6 +35,7 @@ const TIER_MEANING: Record<ServerTier, string> = {
 	degraded: "Live text, uploads and older history are off until UTC midnight; chat works.",
 	exhausted: "The day's storage or frame budget is spent: new work is refused until UTC midnight; open connections stay.",
 	account_stop: "Cloudflare usage reached its stop line: the server is closed until the day's or month's end.",
+	paused: "Traffic is costing money fast and is mostly refused, which looks like an attack: every connection is closed and Cloudflare's edge blocks the server until the hold ends. It lifts by itself; a repeat the same UTC day holds twice as long.",
 };
 
 /**
@@ -68,6 +72,8 @@ export function noticeText(notice: TriggerNotice): string {
 			const who = notice.users.length ? ` for ${notice.users.map((user) => `\`${user}\``).join(", ")}` : "";
 			return `**Storage overrun: \`${notice.operation}\`** used more rows than it reserved${who} (${notice.message}). It finished and its rows are charged; the server stays open. Further overruns today are counted without a notice.`;
 		}
+		case "burn":
+			return `**Heavy traffic** (${notice.summary}, priced as if past the plan's inclusions). Most of it is admitted, so it looks like a busy day, not an attack: the server stays open, and the bill cap stops it if the overage passes the cap. Told at most once an hour.`;
 	}
 }
 

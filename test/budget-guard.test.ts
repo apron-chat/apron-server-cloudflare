@@ -5,7 +5,7 @@ import * as guard from "../src/budget-guard";
 import * as notifier from "../src/notify";
 import { ACCOUNT_USAGE_POLICY as POLICY, PLAN } from "../src/budget";
 import { billCap } from "../src/pricing";
-import { EDGE_STOP_RULE_REF, readEdgeStop, resetFloodWatch, runBudgetGuard, watchForFlood } from "../src/budget-guard";
+import { EDGE_STOP_RULE_REF, readEdgeStop, resetFloodWatch, ruleHoldUntil, runBudgetGuard, setAttackStop, watchForFlood } from "../src/budget-guard";
 
 const env = { ACCOUNT_ID: "account", ACCOUNT_ANALYTICS_TOKEN: "analytics", ZONE_ID: "zone", EDGE_STOP_TOKEN: "edge" };
 const rule = { id: "rule-1", ref: EDGE_STOP_RULE_REF, action: "block", expression: 'http.host eq "server.apron.chat"', description: "Apron: budget stop" };
@@ -94,6 +94,30 @@ describe("budget guard", () => {
 		const old = api({ rules: [{ ...rule, enabled: true, last_updated: new Date(now - hold).toISOString() }] });
 		expect(await runBudgetGuard(env, now, old.fetcher)).toMatchObject({ outcome: "changed", stop: false });
 		expect(old.updates).toEqual([expect.objectContaining({ enabled: false })]);
+	});
+
+	it("holds an attack pause's edge stop until its hold ends, whatever the bill, then clears it", async () => {
+		const now = Date.parse("2026-11-02T12:00:00Z");
+		const until = now + 30 * 60_000;
+		const on = api();
+		expect(await setAttackStop(env, until, "flood", now, on.fetcher)).toBe("changed");
+		expect(on.updates).toEqual([expect.objectContaining({ enabled: true, description: `${rule.description} [attack hold until 2026-11-02T12:30:00.000Z]` })]);
+		const held = { ...rule, enabled: true, description: `${rule.description} [attack hold until 2026-11-02T12:30:00.000Z]`, last_updated: new Date(now - 2 * 60 * 60_000).toISOString() };
+		expect(ruleHoldUntil(held.description)).toBe(until);
+		// A longer hold extends it on a rule already on; a shorter one changes nothing.
+		const extend = api({ rules: [held] });
+		expect(await setAttackStop(env, until + 60_000, "burn", now, extend.fetcher)).toBe("changed");
+		expect(extend.updates).toEqual([expect.objectContaining({ enabled: true, description: `${rule.description} [attack hold until 2026-11-02T12:31:00.000Z]` })]);
+		expect(await setAttackStop(env, until - 60_000, "burn", now, api({ rules: [held] }).fetcher)).toBe("unchanged");
+		// The guard keeps it on through the hold, though the bill is under its cap.
+		const during = api({ rules: [held] });
+		expect(await runBudgetGuard(env, until - 1, during.fetcher)).toMatchObject({ outcome: "held", stop: false });
+		expect(during.updates).toEqual([]);
+		const after = api({ rules: [held] });
+		expect(await runBudgetGuard(env, until, after.fetcher)).toMatchObject({ outcome: "changed", stop: false });
+		expect(after.updates).toEqual([expect.objectContaining({ enabled: false, description: rule.description })]);
+		expect(await readEdgeStop(env, api({ rules: [held] }).fetcher)).toMatchObject({ state: "on", holdUntil: until });
+		expect(await setAttackStop({ ...env, ZONE_ID: undefined }, until, "flood", now, on.fetcher)).toBe("unconfigured");
 	});
 
 	it("reads a rule without enabled as enabled", async () => {
