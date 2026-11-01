@@ -427,6 +427,42 @@ custom emoji (above). Each change sends every connection a new `server`
 frame, and so does a `room_set` of `general` that changes its description
 while that is the server's.
 
+## Link preview media
+
+A link embed's `og` is built by the client that posts it; the server never
+fetches a URL (protocol §4.8.1, [SPEC section 4](../SPEC.md)). It keeps the
+`og` text (`title`, `description`, `site_name`) and keeps `og.image`,
+`og.video` and `og.audio` only when their `url` is `https:`, has no
+credentials or port, and names a host `OG_MEDIA_HOSTS` allows; other media
+are dropped. Every viewer's client loads a kept URL, so a host belongs on the
+list only when whoever posts a link cannot read its access logs and it does
+not redirect elsewhere: a big platform's own media CDN, not its main site,
+and no shared hosting where anyone can run a server.
+
+`OG_MEDIA_HOSTS` lists them comma-separated, as exact hosts or `*.` and a
+host for its subdomains only, like `PUSH_HOSTS`; a standalone `*` keeps media
+from any host, and an empty value keeps none. Unset, it is the image CDNs in
+`DEFAULT_OG_MEDIA_HOSTS` (`src/config.ts`):
+
+| Service | Hosts |
+|---|---|
+| YouTube thumbnails | `i.ytimg.com`, `img.youtube.com` |
+| Vimeo | `i.vimeocdn.com` |
+| GitHub | `opengraph.githubassets.com`, `repository-images.githubusercontent.com`, `avatars.githubusercontent.com` |
+| X/Twitter | `pbs.twimg.com` |
+| Bluesky | `cdn.bsky.app` |
+| Reddit | `i.redd.it`, `preview.redd.it`, `external-preview.redd.it` |
+| Wikipedia | `upload.wikimedia.org` |
+| Imgur | `i.imgur.com` |
+| Twitch | `static-cdn.jtvnw.net` |
+| Substack | `substackcdn.com` |
+
+None of these serves a site's player pages, so `og.video` such as YouTube's
+`https://www.youtube.com/embed/…` is dropped: a link keeps its thumbnail but
+no inline player. Clients still sanitize and sandbox what they render. A
+malformed list fails the configuration check. Media of this server's own
+uploads are not client-built and are always kept.
+
 ## Push
 
 Mentions, replies, and messages in their private rooms wake registered users
@@ -649,6 +685,7 @@ implementation and recalibrating its resource model.
 | `VAPID_PRIVATE_KEY` | Secret: the matching 32-byte private key, unpadded base64url; set with `npx wrangler secret put VAPID_PRIVATE_KEY --config wrangler.production.toml` |
 | `VAPID_SUBJECT` | `mailto:` address or `https:` URL sent to push services in each VAPID token as the operator's contact |
 | `PUSH_HOSTS` | Comma-separated push service hosts registrations may name, `*.host` for a host's subdomains, or a standalone `*` for any public host; unset, the browsers' own services (see [Push](#push)) |
+| `OG_MEDIA_HOSTS` | Comma-separated hosts whose `og` media (`image`, `video`, `audio`) a link embed keeps, `*.host` for a host's subdomains, a standalone `*` for any host, or empty for none; unset, big platforms' image CDNs (see [Link preview media](#link-preview-media)) |
 | `PUSH_DELAY_SECONDS` | Whole seconds, 0 to 60, a message's wake waits before it pushes; unset, the plan's `push.delaySeconds`; `0` pushes at once |
 | `ACCOUNT_ID` | The Cloudflare account whose analytics the account-usage stop and the budget guard read; a Wrangler var (see [Editing the deployment budget](#editing-the-deployment-budget)) |
 | `ACCOUNT_ANALYTICS_TOKEN` | Secret: a read-only account analytics token; with `ACCOUNT_ID`, turns the account-usage stop on |
