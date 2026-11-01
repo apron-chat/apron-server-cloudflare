@@ -353,7 +353,7 @@ describe('live text end to end', () => {
 		} finally { writer.close(); }
 	});
 
-	it('drops a sender\'s og on a terminal, links the viewer with any title, and redirects only a terminal\'s page (§4.8.5, §4.8.6)', async () => {
+	it('drops a sender\'s og on a terminal, links the viewer with any title, and redirects only a terminal\'s page (§4.8.1, §4.8.5)', async () => {
 		const userId = unique('linker');
 		const writer = await signedIn(userId, ['mod']);
 		const title = 'a&b #c+d ü 🚀%';

@@ -432,7 +432,7 @@ const TERMINAL_DESCRIPTIONS = {
 } as const;
 
 /**
- * A terminal embed's `og` (protocol §4.8.6): what it is, for a client that
+ * A terminal embed's `og` (protocol §4.8.1): what it is, for a client that
  * doesn't render terminal embeds and shows it as the card its `og`
  * describes, which opens its `url`. Titled as the embed is.
  */
@@ -4800,7 +4800,7 @@ export class Store {
         }
         kept.add(embedId as string);
         if (isLive(before.kind)) {
-          // The server owns `url`, `output`, and a terminal's `og` (§4.8.2, §4.8.6); a terminal takes a new title.
+          // The server owns `url`, `output`, and a terminal's `og` (§4.8.1, §4.8.2); a terminal takes a new title.
           const { title: _title, og: _og, ...owned } = before;
           void _title;
           void _og;
