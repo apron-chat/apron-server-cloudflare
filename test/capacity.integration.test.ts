@@ -16,6 +16,11 @@ it('bounds admission at 100 live sockets and delivers one ordered maximum fan-ou
 			Upgrade: 'websocket', 'CF-Connecting-IP': '198.51.100.101',
 		} });
 		expect(rejected.status).toBe(429);
+		// A full server spreads its crowd's retries over two to five minutes.
+		expect(rejected.headers.get('Apron-Server-Full')).toBe('1');
+		const retry = Number(rejected.headers.get('Retry-After'));
+		expect(retry).toBeGreaterThanOrEqual(120);
+		expect(retry).toBeLessThanOrEqual(300);
 		const text = 'x'.repeat(4096);
 		peers[0].send({ id: 'fanout', method: 'message', params: { room_id: 'general', body: { text } } });
 		// Every member gets the broadcast; the sender's comes before its result (§1).

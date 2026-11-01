@@ -11,7 +11,7 @@ export type TriggerNotice =
 	| { kind: "edge_stop_lifted" }
 	| { kind: "tier"; from: ServerTier; to: ServerTier; reasons: readonly string[] }
 	| { kind: "breaker"; operation: string; open: boolean; until?: number }
-	| { kind: "overrun"; operation: string; message: string; users: readonly string[] }
+	| { kind: "overrun"; operation: string; message: string; users: readonly string[]; essential?: boolean }
 	| { kind: "burn"; summary: string };
 
 /**
@@ -70,6 +70,7 @@ export function noticeText(notice: TriggerNotice): string {
 				: `**Resumed \`${notice.operation}\`.** Its pause ended.`;
 		case "overrun": {
 			const who = notice.users.length ? ` for ${notice.users.map((user) => `\`${user}\``).join(", ")}` : "";
+			if (notice.essential) return `**Storage overrun: \`${notice.operation}\`** used more rows than it reserved${who} (${notice.message}). It is essential (signing in, rooms or history), so it keeps working with no pause; its rows are charged. Told at most once an hour while it goes on: its estimate needs fixing.`;
 			return `**Storage overrun: \`${notice.operation}\`** used more rows than it reserved${who} (${notice.message}). It finished and its rows are charged; the server stays open. Further overruns today are counted without a notice.`;
 		}
 		case "burn":

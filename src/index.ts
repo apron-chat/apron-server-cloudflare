@@ -1385,6 +1385,35 @@ function adminChannels(env: Env): NoticeChannels {
 	} };
 }
 
+/**
+ * A full server (every `openConnections` slot taken) asks clients to wait
+ * 120 to 300 seconds, spread at random so a crowd's retries do not land
+ * together, and marks the answer (FULL_HEADER) so the entry Worker can
+ * refuse for it a while without asking the object again.
+ */
+const FULL_RETRY_MS = { min: 120_000, spread: 180_000 };
+const FULL_HEADER = "Apron-Server-Full";
+/** How long an isolate refuses by itself after the object said it is full. */
+const FULL_MEMORY_MS = 30_000;
+
+function fullRetryMs(random = Math.random): number {
+	return FULL_RETRY_MS.min + Math.floor(random() * FULL_RETRY_MS.spread);
+}
+
+function serverFull(): Response {
+	const response = responseError(429, "Demo capacity reached", fullRetryMs());
+	response.headers.set(FULL_HEADER, "1");
+	return response;
+}
+
+/** Until when this isolate refuses connections itself (fetchConnection): the object said it was full. */
+let objectFullUntil = 0;
+
+/** Forgets that the object was full, for tests. */
+export function resetObjectFull(): void {
+	objectFullUntil = 0;
+}
+
 /** Responses the object made, which its own burn meter counted (fetchEntry leaves them out of its samples). */
 const OBJECT_RESPONSES = new WeakSet<Response>();
 
@@ -1790,12 +1819,19 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 		return responseError(503, "Demo admission unavailable", UNAVAILABLE_RETRY_MS);
 	}
 	if (!env.DEMO) return responseError(503, "Demo capacity unavailable");
+	// The object said it was full moments ago: refuse here, which costs no
+	// object request, rather than let a crowd's retries reach it.
+	if (Date.now() < objectFullUntil) return serverFull();
 	const headers = stripForwardingHeaders(request.headers);
 	headers.set(INTERNAL_IP_HEADER, key);
 	headers.delete("content-length");
 	const forwarded = new Request(request, { headers });
 	const stub = env.DEMO.getByName(OBJECT_NAME);
-	try { return fromObject(await stub.fetch(forwarded)); }
+	try {
+		const response = fromObject(await stub.fetch(forwarded));
+		if (response.status === 429 && response.headers.get(FULL_HEADER) === "1") objectFullUntil = Date.now() + FULL_MEMORY_MS;
+		return response;
+	}
 	// The object threw: a platform failure, not capacity.
 	catch { return responseError(503, "Server unavailable; try again shortly", UNAVAILABLE_RETRY_MS); }
 }
@@ -1978,9 +2014,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// An overrun is observed, not fatal: the day's first is told, and a
 		// breaker it opened is told by the tier evaluation that follows.
 		this.store.onOverrun = (notice) => {
-			if (notice.firstToday) {
+			// The day's first, and an essential operation's at most once an hour (it never pauses).
+			const essential = notice.essential && !notice.maintenance && this.claimTrip("server", `overrun:${notice.operation}`, nowMs());
+			if (notice.firstToday || essential) {
 				const users = notice.principals.filter((principal) => principal.startsWith("user:")).map((principal) => principal.slice(5));
-				this.announce({ kind: "overrun", operation: notice.operation, message: notice.message, users });
+				this.announce({ kind: "overrun", operation: notice.operation, message: notice.message, users, ...(notice.essential ? { essential: true } : {}) });
 			}
 			this.evaluateTier(nowMs());
 		};
@@ -2089,7 +2127,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const now = nowMs();
 			this.closeStale(now);
 			const peers = sockets.filter(socket => !this.isStale(socket, now)).map(socket => connectionAttachment(socket)).filter(peer => peer?.ipKey === ipKey);
-			if (sockets.length >= this.config.limits.openConnections || peers.length >= this.config.limits.connectionsPerIp ||
+			if (sockets.length >= this.config.limits.openConnections) return serverFull();
+			if (peers.length >= this.config.limits.connectionsPerIp ||
 				peers.filter(peer => peer?.tier !== "registered").length >= this.config.limits.anonymousConnectionsPerIp) {
 				return responseError(429, "Demo capacity reached", 60_000);
 			}

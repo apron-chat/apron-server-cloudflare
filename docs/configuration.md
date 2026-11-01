@@ -781,7 +781,11 @@ operation gets `retry_after` (`data.reason` `operation_paused`) for an hour
 An operation is named by the Store method that made its reservation.
 Maintenance work, operator alerts, admin commands and the operations every
 request passes through (frames, admission, room lookup) are never refused
-by a breaker; their overruns are still charged, logged and told. Breakers
+by a breaker; their overruns are still charged, logged and told. Nor are
+the operations people cannot use the server without (`BREAKER_ALERT_ONLY`:
+signing in and registering, the room list and members, and history): their
+overruns are told to the admins at most once an hour each instead, so a
+wrong estimate there is fixed rather than locking everyone out. Breakers
 survive a wake, and `/status` lists them.
 
 **Throttle trips.** A refusal that lasts five minutes or more

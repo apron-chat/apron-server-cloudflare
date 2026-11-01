@@ -1,7 +1,7 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { afterEach, expect, it, vi } from 'vitest';
 import { DEFAULT_LIMITS, UPLOAD_POLICY } from '../src/budget';
-import { BREAKER_MS, DEGRADED, OPERATION_PAUSED, Store, StoreError, type OverrunNotice, type StoreConfig } from '../src/store';
+import { BREAKER_ALERT_ONLY, BREAKER_MS, DEGRADED, OPERATION_PAUSED, Store, StoreError, type OverrunNotice, type StoreConfig } from '../src/store';
 
 afterEach(() => { vi.restoreAllMocks(); });
 
@@ -102,6 +102,32 @@ it('opens a breaker on the third overrun of one operation within an hour, refusi
 		expect(woken.accountingGuard(clock.now).breakers).toEqual({});
 		expect(woken.leakyListing(clock.now)).toBe(101);
 	});
+});
+
+it('never opens a breaker on an essential operation, however often or far it overruns', async () => {
+	const stub = env.DEMO.getByName('tier-essential');
+	const clock = { now: Date.now() + 3_000 };
+	const essential = BREAKER_ALERT_ONLY as Set<string>;
+	essential.add('leakyListing');
+	try {
+		await runInDurableObject(stub, async (_instance, state) => {
+			const store = leakyStore(state, clock, { sqlReadsPerDay: 5_000, foregroundReadsPerDay: 4_000, maintenanceReadsPerDay: 1_000 });
+			const notices: OverrunNotice[] = [];
+			store.onOverrun = (notice) => notices.push(notice);
+			seedThreads(state, clock.now);
+			for (let index = 0; index < 4; index += 1) {
+				expect(store.leakyListing(clock.now)).toBe(101);
+				clock.now += 60_000;
+			}
+			await Promise.resolve();
+			expect(notices.every((notice) => notice.essential && !notice.breaker)).toBe(true);
+			expect(notices[0].huge).toBe(true);
+			expect(store.accountingGuard(clock.now).breakers).toEqual({});
+		});
+	} finally {
+		essential.delete('leakyListing');
+	}
+	expect([...BREAKER_ALERT_ONLY]).toEqual(expect.arrayContaining(['registerIdentity', 'listRooms', 'roomMembers', 'history']));
 });
 
 it('opens the breaker at once when one overrun exceeds a hundredth of the day, and the rest of the server works', async () => {

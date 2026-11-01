@@ -1,7 +1,7 @@
 import { env } from 'cloudflare:test';
 import { expect, it } from 'vitest';
 import { ADMISSION_BUDGET } from '../src/budget';
-import { fetchEntry } from '../src/index';
+import { fetchEntry, resetObjectFull } from '../src/index';
 
 function upgrade(ip: string, path = '/') {
 	return new Request(`https://demo.test${path}`, {
@@ -101,4 +101,27 @@ it('rejects malformed upgrades without consuming valid connection attempts', asy
 		expect((await fetchEntry(invalid, withoutObject())).status).toBe(400);
 	}
 	expect(await (await fetchEntry(upgrade(ip), withoutObject())).text()).toContain('Demo capacity unavailable');
+});
+
+it('refuses at the entry Worker for 30 seconds after the object says it is full, sparing it the retries', async () => {
+	resetObjectFull();
+	let calls = 0;
+	const full = { getByName: () => ({ fetch: async () => {
+		calls += 1;
+		return new Response(JSON.stringify({ error: 'Demo capacity reached' }), { status: 429, headers: { 'Apron-Server-Full': '1', 'Retry-After': '200' } });
+	} }) };
+	const first = await fetchEntry(upgrade('198.18.9.1'), withoutObject({ DEMO: full as never }));
+	expect(first.status).toBe(429);
+	const second = await fetchEntry(upgrade('198.18.9.2'), withoutObject({ DEMO: full as never }));
+	expect(second.status).toBe(429);
+	expect(second.headers.get('Apron-Server-Full')).toBe('1');
+	expect(Number(second.headers.get('Retry-After'))).toBeGreaterThanOrEqual(120);
+	expect(calls).toBe(1);
+	// Any other refusal from the object, such as one address's own limit, is not remembered.
+	resetObjectFull();
+	const perIp = { getByName: () => ({ fetch: async () => { calls += 1; return new Response('{}', { status: 429 }); } }) };
+	await fetchEntry(upgrade('198.18.9.3'), withoutObject({ DEMO: perIp as never }));
+	await fetchEntry(upgrade('198.18.9.4'), withoutObject({ DEMO: perIp as never }));
+	expect(calls).toBe(3);
+	resetObjectFull();
 });

@@ -987,6 +987,8 @@ export interface OverrunNotice {
   breaker: boolean;
   /** Its excess passed a hundredth of a day's SQL ceilings, which opens the breaker at once. */
   huge: boolean;
+  /** An essential operation (BREAKER_ALERT_ONLY): no breaker, the admins are told instead. */
+  essential: boolean;
 }
 
 function emptyGuard(): AccountingGuard {
@@ -1021,6 +1023,16 @@ const OPERATION_WRAPPERS = new Set([
  * still charged, logged and told).
  */
 const BREAKER_EXEMPT = new Set(["reserveFrames", "reserveConnection", "getRoom", "unknown"]);
+/**
+ * Operations people cannot use the server without: signing in and
+ * registering, and the room list, members and history a client loads first.
+ * An overrun of one never opens a breaker; it is told to the admins at most
+ * once an hour instead (OverrunNotice.essential), and its excess is charged.
+ */
+export const BREAKER_ALERT_ONLY: ReadonlySet<string> = new Set([
+  "reserveAuthAttempt", "registerIdentity", "addCredential", "getCredential", "getIdentity", "updateCredentialCounter",
+  "listRooms", "roomMembers", "history",
+]);
 const META_ACCOUNT_USAGE = "account_usage_snapshot";
 /** The highest guest number ever reserved (see reserveGuestNumbers); absent means none. */
 const META_GUEST_NUMBER_MARK = "guest_number_mark";
@@ -2494,7 +2506,8 @@ export class Store {
     }
     const huge = excess.reads > this.config.sqlReadsPerDay / 100 || excess.writes > this.config.sqlWritesPerDay / 100;
     let breaker = false;
-    if (!maintenance && !this.alerting && !BREAKER_EXEMPT.has(operation)) {
+    const essential = BREAKER_ALERT_ONLY.has(operation);
+    if (!maintenance && !this.alerting && !BREAKER_EXEMPT.has(operation) && !essential) {
       const times = [...(guard.recent[operation] ?? []), now];
       if (huge || times.length >= BREAKER_OVERRUNS) {
         guard.breakers[operation] = now + BREAKER_MS;
@@ -2510,7 +2523,7 @@ export class Store {
     try { this.onAccounting?.("overrun", message); } catch { /* a metric never breaks accounting */ }
     const notify = this.onOverrun;
     if (notify) {
-      const notice: OverrunNotice = { operation, message, principals, maintenance, firstToday, breaker, huge };
+      const notice: OverrunNotice = { operation, message, principals, maintenance, firstToday, breaker, huge, essential };
       queueMicrotask(() => { try { notify(notice); } catch { /* a notice never breaks accounting */ } });
     }
   }

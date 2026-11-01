@@ -62,7 +62,8 @@ A limit can reach a client in four ways:
 | ---: | --- | --- | ---: | --- |
 | 429 | Connection attempts exceeded | 20 upgrade attempts a minute per address (IPv6 grouped by /56), 60 per IPv6 /48 | 60 | A reconnect loop without backoff. Probes and refused attempts count too. |
 | 503 | Demo is busy; try again shortly | 200 attempts a minute from everyone at one Cloudflare location | 60 | Other clients, or many of yours, near the same location. |
-| 429 | Demo capacity reached | 100 open sockets on the server; 10 per address; 6 per address that are not signed in to an account (guests and sockets still authenticating) | 60 | Sockets left open: extra tabs, hot reload, reconnect that never closes the old socket. |
+| 429 | Demo capacity reached (with `Apron-Server-Full: 1`) | 100 open sockets on the server | 120 to 300, at random | The server is full. The entry Worker then refuses by itself for 30 seconds, so retries cost the server nothing; wait the `Retry-After` before retrying. |
+| 429 | Demo capacity reached | 10 open sockets per address; 6 per address that are not signed in to an account (guests and sockets still authenticating) | 60 | Sockets left open: extra tabs, hot reload, reconnect that never closes the old socket. |
 | 429 | Connection admission limit reached | 12 admitted connections a minute per address; 4,000 a day on the server | the bucket's wait, or until the next day | Reconnecting on every error or page view. A passkey sign-in on a fresh page uses up to three admissions (guest, sign-in, signed-in reconnect). |
 | 429 | Daily demo capacity reached / Daily frame budget exhausted | The server's daily SQL or frame budget | until the next day | The whole demo is used up for the day. |
 | 503 | Demo account capacity reached | The Cloudflare account's usage stop | 300 | Same; the operator's account passed its bill cap. |
