@@ -160,7 +160,7 @@ describe('push configuration', () => {
 		expect(loadConfig({ ...base, OG_MEDIA_HOSTS: '' }).ogMediaHosts).toEqual([]);
 		expect(loadConfig({ ...base, OG_MEDIA_HOSTS: '*' }).ogMediaHosts).toBe('*');
 		expect(loadConfig({ ...base, OG_MEDIA_HOSTS: 'I.YTimg.com, *.cdn.example' }).ogMediaHosts).toEqual(['i.ytimg.com', '*.cdn.example']);
-		for (const bad of ['*, i.ytimg.com', 'https://i.ytimg.com', 'ytimg', '*.', 'i.ytimg.com/vi']) {
+		for (const bad of ['*, i.ytimg.com', 'https://i.ytimg.com', 'ytimg', '*.', 'i.ytimg.com/vi', 'i.ytimg.com:443', 'user@i.ytimg.com', 'i.ytimg.com.', '*.*.ytimg.com', '[::1]', '0x7f.1', 'ｉ.ytimg.com', 'i ytimg.com']) {
 			expect(() => loadConfig({ ...base, OG_MEDIA_HOSTS: bad }), bad).toThrow(ConfigError);
 		}
 		for (const host of ['i.ytimg.com', 'pbs.twimg.com', 'upload.wikimedia.org', 'opengraph.githubassets.com']) {

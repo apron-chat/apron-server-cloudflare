@@ -638,13 +638,30 @@ function loadPush(env: EnvLike): VapidKeys | undefined {
 	return { publicKey, privateKey, subject };
 }
 
-const HOST_LIST_ENTRY = /^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
+/**
+ * Whether `entry` (lowercase) is a host list entry: a host name of at least
+ * two labels, optionally after `*.`, that the URL parser reads back
+ * unchanged, so it compares equal to a parsed URL's `hostname`. Anything
+ * else the parser would rewrite or reject (a scheme, path, port,
+ * credentials, an IPv4 spelling it normalizes, or a non-ASCII name) fails,
+ * as do IPv6 literals, a trailing dot, and any other `*`.
+ */
+function hostListEntry(entry: string): boolean {
+	const host = entry.startsWith("*.") ? entry.slice(2) : entry;
+	// The parser keeps `*` in a host name, so only the leading `*.` may have one.
+	if (!host.includes(".") || host.endsWith(".") || host.startsWith("[") || host.includes("*")) return false;
+	try {
+		return new URL(`https://${host}/`).hostname === host;
+	} catch {
+		return false;
+	}
+}
 
 /** A host list's entries, lowercased: host names or `*.` suffixes, or a standalone `*`. */
 function parseHostList(hosts: string[], name: string): readonly string[] | "*" {
 	if (hosts.length === 1 && hosts[0] === "*") return "*";
 	for (const host of hosts) {
-		if (!HOST_LIST_ENTRY.test(host)) throw new ConfigError(`${name} must list host names, *.host suffixes, or a standalone *`);
+		if (!hostListEntry(host)) throw new ConfigError(`${name} must list host names, *.host suffixes, or a standalone *`);
 	}
 	return hosts;
 }
