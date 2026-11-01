@@ -201,7 +201,7 @@ Both ways share these limits:
 | Streaming time, from the `PUT` | 120 s; 300 s for `admin` and `mod` | the text ends, and the `PUT` is answered |
 | Bytes one `PUT` may send | 2 MB | the text ends |
 | Terminal output kept (`keep_last`) | the last 32 KB | the rest scrolls away |
-| Appended text kept | what keeps `body.text` within 4,096 bytes | the text ends with the first part |
+| Appended text kept, after its backspace and form feed edits | what keeps `body.text` within 4,096 bytes | the text ends with the first part |
 | Readers of one text at once / over its life | 10 / 30 | `GET` 429 with `Retry-After: 10` / 403 |
 
 Every one of these limits is server-wide policy: `retry_after` refusals carry

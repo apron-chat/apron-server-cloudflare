@@ -1448,7 +1448,7 @@ export function liveCommandNotice(kind: LiveKind, writeUrl: string, entry: Pick<
 		].join("\n");
 	}
 	return [
-		`Stream text into this room within ${window} (up to ${seconds} seconds and ${byteSize(entry.limit)}; it is appended to your message as markdown):`,
+		`Stream text into this room within ${window} (up to ${seconds} seconds and ${byteSize(entry.limit)}; it is appended to your message as markdown, revised by backspace and form feed):`,
 		"",
 		"```sh",
 		`your-llm-command | curl -sT - ${url}`,
@@ -6018,6 +6018,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async endLiveText(session: LiveSession, end: LiveEnd): Promise<Response> {
 		const entry = session.entry;
+		// An append's last incomplete character, if any, reads as U+FFFD, for its readers too.
+		if (session.buffer) session.readers.send(session.buffer.end());
 		const kept = session.buffer?.kept() ?? new Uint8Array(0);
 		let published = false;
 		try {
