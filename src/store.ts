@@ -636,6 +636,35 @@ function storedCreator(fieldsJson: string): string | undefined {
   return typeof creator === "string" ? creator : undefined;
 }
 
+/**
+ * The retention floor a kept room's history starts from (`/keep`), kept in
+ * its row's `fields_json` as `kept_from` beside `creator_id`, outside the
+ * client fields and the room record, or undefined for a room that expires.
+ */
+function storedKeptFrom(fieldsJson: string): number | undefined {
+  const keptFrom = parseJson<{ kept_from?: unknown }>(fieldsJson, {}).kept_from;
+  return typeof keptFrom === "number" && Number.isSafeInteger(keptFrom) ? keptFrom : undefined;
+}
+
+/**
+ * A room's client fields as its row keeps them: with the server's own,
+ * `creator_id` and `kept_from`, carried over from its stored `fields_json`.
+ */
+function withServerFields(fields: Record<string, unknown>, storedJson: string): string {
+  const creator = storedCreator(storedJson);
+  const keptFrom = storedKeptFrom(storedJson);
+  return JSON.stringify({ ...fields, ...(creator !== undefined ? { creator_id: creator } : {}), ...(keptFrom !== undefined ? { kept_from: keptFrom } : {}) });
+}
+
+/**
+ * The retention floor that applies to one room: the server-wide floor F, or
+ * for a kept room the floor when it was kept, which retention no longer
+ * raises (`/keep`).
+ */
+function keptFloor(keptFrom: unknown, floor: number): number {
+  return typeof keptFrom === "number" && Number.isSafeInteger(keptFrom) ? Math.min(floor, keptFrom) : floor;
+}
+
 /** One logged membership change of a registered user (protocol §4.2.2). */
 interface MembershipRecord {
   log_id: string;
@@ -671,6 +700,12 @@ export interface StoreMutationInput {
   digest?: string;
   /** An operator alert the server posts itself (Store.alert): no posting limits or storage high-water apply. */
   system?: boolean;
+  /**
+   * For `room_set`: an admin's or mod's `/keep` of the room `params.room_id`
+   * names, which turns its `ext.keep` on or off and changes nothing else
+   * (Store.commitKeep).
+   */
+  toggleKeep?: boolean;
 }
 
 /** Embed kinds that carry live text (§4.8.3). */
@@ -807,6 +842,8 @@ interface RawMessageRow {
   latest_log_id: number;
   snapshot_json: string;
   author_id: string;
+  /** The `kept_from` of the message's room (storedKeptFrom), or null where it expires. */
+  kept_from?: number | null;
 }
 
 interface RawReactionRow {
@@ -929,6 +966,23 @@ const META_EFFECTIVE_NOW = "effective_now_ms";
 const META_PURGE_ROOMS = "purge_rooms";
 /** Most removed rooms awaiting purge; cleanup removes no further room past it. */
 const MAX_PURGE_ROOMS = MAX_THREAD_LIMIT;
+/**
+ * Kept rooms (`/keep`) as a JSON array of room IDs, for cleanup, which skips
+ * their records: each room's row says so too (`kept_from`, storedKeptFrom),
+ * which is what everything else reads.
+ */
+const META_KEPT_ROOMS = "kept_rooms";
+/**
+ * Where cleanup's next deletion batch starts in the log, below the floor:
+ * past the kept rooms' records it has stepped over, so it does not read them
+ * again. Absent (0) until a batch steps over one; a room no longer kept moves
+ * it back to that room's oldest record.
+ */
+const META_DELETE_FROM = "delete_from";
+/** Most rooms kept at once (`/keep`), so kept history stays a small part of storage. */
+export const MAX_KEPT_ROOMS = 16;
+/** SQL: a `rooms` row is kept (`/keep`): retention neither expires its records nor removes it. */
+const KEPT_ROOM = "(json_extract(fields_json, '$.kept_from') IS NOT NULL)";
 /**
  * Reads for privateRoomCounts(): the private range of the rooms table for
  * the creator's live rooms, an index entry and a row each, and the
@@ -1619,15 +1673,17 @@ function integerColumn(value: unknown, fallback = 0): number {
 
 /**
  * A room's inclusive history lower bound. It is the server-wide retention
- * floor F, raised to the room's creation record. It never decreases: F is
- * monotonic, and a room reports null (effective bound latest + 1) only while
- * F > latest, so any later record in the room is at least F.
+ * floor F, or for a kept room (`/keep`) the floor F was when it was kept,
+ * raised to the room's creation record. It never decreases: F is monotonic,
+ * a kept room's stays put until it is no longer kept, and a room reports null
+ * (effective bound latest + 1) only while F > latest, so any later record in
+ * the room is at least F.
  */
-function roomHistoryFloor(room: Pick<RawRoomRow, "created_log_id">, floor: number): number {
-  return Math.max(floor, room.created_log_id);
+function roomHistoryFloor(room: Pick<RawRoomRow, "created_log_id" | "fields_json">, floor: number): number {
+  return Math.max(keptFloor(storedKeptFrom(room.fields_json), floor), room.created_log_id);
 }
 
-function roomHistoryLogId(room: Pick<RawRoomRow, "created_log_id" | "latest_log_id">, floor: number): string | null {
+function roomHistoryLogId(room: Pick<RawRoomRow, "created_log_id" | "latest_log_id" | "fields_json">, floor: number): string | null {
   const lower = roomHistoryFloor(room, floor);
   return lower <= room.latest_log_id ? idString(lower) : null;
 }
@@ -4615,14 +4671,15 @@ export class Store {
     // A message in a thread removed while it was still retained (removeEmptyThread) is gone with it.
     const rows = this.rawRows<RawMessageRow>(
       // The current snapshot is the message's latest record, in the room it is in.
-      `SELECT m.message_id, m.room_id, m.latest_log_id, rec.record_json AS snapshot_json, m.author_id
+      `SELECT m.message_id, m.room_id, m.latest_log_id, rec.record_json AS snapshot_json, m.author_id,
+         json_extract(r.fields_json, '$.kept_from') AS kept_from
        FROM message_state m JOIN rooms r ON r.room_id = m.room_id
        JOIN records rec ON rec.room_id = m.room_id AND rec.log_id = m.latest_log_id
        WHERE m.message_id = ? LIMIT 1`,
       messageId,
     );
     if (!rows.length) return null;
-    if (floor !== undefined && rows[0].latest_log_id < floor) return null;
+    if (floor !== undefined && rows[0].latest_log_id < keptFloor(rows[0].kept_from, floor)) return null;
     return rows[0];
   }
 
@@ -5055,6 +5112,8 @@ export class Store {
       // A private room goes the same way, freeing its slot among the private ones.
       const isPrivate = room !== null && isPrivateRoomId(room.room_id);
       if (!room || (room.parent_room_id === null && !isPrivate)) return false;
+      // A kept room (`/keep`) stays, whoever is left in it.
+      if (storedKeptFrom(room.fields_json) !== undefined) return false;
       if (this.rawRows("SELECT user_id FROM memberships WHERE room_id = ? LIMIT 1", roomId).length) return false;
       this.rawExec("DELETE FROM rooms WHERE room_id = ?", roomId);
       const counter = isPrivate ? "private_count" : "thread_count";
@@ -5230,7 +5289,7 @@ export class Store {
       const rows = this.rawRows<RawReactionRow>(
         `SELECT message_id, user_id, log_id, from_json, emojis_json FROM reaction_state
          WHERE message_id = ? AND log_id >= ? ORDER BY log_id, user_id LIMIT ?`,
-        messageId, floor, this.config.reactionUsersPerMessage,
+        messageId, keptFloor(current!.kept_from, floor), this.config.reactionUsersPerMessage,
       );
       if (rows.length) {
         context.extraPosts = Math.floor(rows.length / MOVE_REACTION_SETS_PER_POST);
@@ -5243,7 +5302,7 @@ export class Store {
         };
         this.appendRecord(context, [roomId], "reactions", reactionLogId, JSON.stringify(record));
         // The sets' latest record is now the moved copy; retention follows it.
-        this.rawExec("UPDATE reaction_state SET log_id = ? WHERE message_id = ? AND log_id >= ?", reactionLogId, messageId, floor);
+        this.rawExec("UPDATE reaction_state SET log_id = ? WHERE message_id = ? AND log_id >= ?", reactionLogId, messageId, keptFloor(current!.kept_from, floor));
         broadcasts.push({ method: "reactions", params: clone(record) as unknown as Record<string, unknown>, rooms: [roomId] });
       }
     }
@@ -6939,7 +6998,7 @@ export class Store {
       "SELECT message_id, user_id, log_id, from_json, emojis_json FROM reaction_state WHERE message_id = ? AND user_id = ? LIMIT 1",
       message.message_id, input.userId,
     )[0];
-    const currentSet = existing && existing.log_id >= floor ? parseJson<string[]>(existing.emojis_json, []) : [];
+    const currentSet = existing && existing.log_id >= keptFloor(message.kept_from, floor) ? parseJson<string[]>(existing.emojis_json, []) : [];
     // A custom emoji key (extension `ext:emoji`) must be in the catalog, or
     // already in the user's current set on this message: a request carries
     // the whole set, so a removed emoji must not stop the user from changing
@@ -7017,6 +7076,8 @@ export class Store {
     const descriptionParam = params.description;
     if (descriptionParam !== undefined && typeof descriptionParam !== "string") throw new StoreError("invalid_params", "description must be a string");
     const write = this.optionalExt(params.ext);
+    // `ext.keep` is the server's (`/keep`): a client's write leaves it as it is.
+    if (write) delete write.keep;
     // A private room someone is not in is unknown to them, as one that does not exist.
     const existing = roomIdParam === undefined ? undefined : this.visibleRoomRow(roomIdParam, input.userId);
     const isPrivate = makePrivate || (existing ? isPrivateRoomId(existing.room_id) : false);
@@ -7097,9 +7158,8 @@ export class Store {
       const fields = roomFields(parseJson<{ ext?: unknown }>(existing.fields_json, {}).ext);
       this.checkRoomFields(fields);
       logId = this.allocateLogId(context);
-      // A save replaces the client fields; the creator stays.
-      const creator = storedCreator(existing.fields_json);
-      const fieldsJson = JSON.stringify(creator === undefined ? fields : { ...fields, creator_id: creator });
+      // A save replaces the client fields; the creator and a kept room's floor stay.
+      const fieldsJson = withServerFields(fields, existing.fields_json);
       this.rawExec(
         "UPDATE rooms SET record_log_id = ?, latest_log_id = ?, fields_json = ?, updated_ms = ? WHERE room_id = ?",
         logId, logId, fieldsJson, context.commitMs, existing.room_id,
@@ -7130,10 +7190,64 @@ export class Store {
     return { result: { room_id: row.room_id }, broadcasts: [], room: record, created, ...(membership ? { membership } : {}) };
   }
 
+  /**
+   * `/keep` (Store.commitMutation with `toggleKeep`): an admin keeps any room
+   * they see, a mod any but `general`. Keeping a room sets its `ext.keep` to
+   * `true` and keeps the retention floor of then as its own (`kept_from`):
+   * cleanup no longer deletes its records nor removes it, nor does its
+   * emptying, and its history stays from there. Again, it removes both: its
+   * history starts at the server's floor once more, and cleanup's next batch
+   * starts at its oldest record (META_DELETE_FROM). Either way the room's
+   * other fields stay as they are, and its record is logged as a save's is.
+   * At most MAX_KEPT_ROOMS rooms are kept at once.
+   */
+  private commitKeep(input: StoreMutationInput, context: CommitContext, floor: number, registered: boolean): StoreMutationResult {
+    const roomIdParam = input.params.room_id;
+    if (typeof roomIdParam !== "string" || roomIdParam.length === 0) throw new StoreError("invalid_params", "room_id must be a non-empty string");
+    const existing = this.visibleRoomRow(roomIdParam, input.userId);
+    if (!existing) throw new StoreError("invalid_params", "unknown room");
+    if (existing.room_id === ROOM_ID ? !registered || !this.holdsRole(input.userId, ["admin"]) : !registered || !this.holdsRole(input.userId, ROOM_CREATOR_ROLES)) {
+      throw new StoreError("denied", existing.room_id === ROOM_ID ? "Only an admin may keep the general room" : "Only an admin or mod may keep a room");
+    }
+    const stored = parseJson<{ title?: unknown; description?: unknown; ext?: unknown }>(existing.fields_json, {});
+    const keptFrom = storedKeptFrom(existing.fields_json);
+    const keep = keptFrom === undefined;
+    const kept = roomIdList(this.metaValue(META_KEPT_ROOMS)).filter((roomId) => roomId !== existing.room_id);
+    if (keep && kept.length >= MAX_KEPT_ROOMS) {
+      throw new StoreError("denied", `At most ${MAX_KEPT_ROOMS} rooms are kept at once; use /keep in one of them to let it expire again`);
+    }
+    const ext = mergeExt(stored.ext, { keep: keep ? true : "" });
+    const fields: Record<string, unknown> = {
+      ...(typeof stored.title === "string" ? { title: stored.title } : {}),
+      ...(typeof stored.description === "string" ? { description: stored.description } : {}),
+      ...(ext ? { ext } : {}),
+    };
+    this.checkRoomFields(fields);
+    if (keep) kept.push(existing.room_id);
+    // Its records below the floor are cleanup's again, from its oldest on.
+    else if (keptFrom < this.metaNumber(META_DELETE_FROM)) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_DELETE_FROM, String(keptFrom));
+    this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_KEPT_ROOMS, JSON.stringify(kept));
+    const logId = this.allocateLogId(context);
+    const creator = storedCreator(existing.fields_json);
+    const fieldsJson = JSON.stringify({ ...fields, ...(creator !== undefined ? { creator_id: creator } : {}), ...(keep ? { kept_from: floor } : {}) });
+    this.rawExec(
+      "UPDATE rooms SET record_log_id = ?, latest_log_id = ?, fields_json = ?, updated_ms = ? WHERE room_id = ?",
+      logId, logId, fieldsJson, context.commitMs, existing.room_id,
+    );
+    const row: RawRoomRow = { ...existing, record_log_id: logId, latest_log_id: logId, fields_json: fieldsJson, updated_ms: context.commitMs };
+    const { latest_log_id: _latest, history_log_id: _history, ...logged } = this.roomRecord(row, floor);
+    void _latest; void _history;
+    this.rawExec(
+      "INSERT INTO records (room_id, log_id, commit_ms, kind, record_json) VALUES (?, ?, ?, 'room', ?)",
+      row.room_id, logId, context.commitMs, JSON.stringify(logged),
+    );
+    return { result: { room_id: row.room_id }, broadcasts: [], room: this.roomRecord(row, floor), created: false };
+  }
+
   /** Thread rooms `userId` created that are still live: not removed, and with a retained log. One scan of the capped rooms table's public range. */
   private liveThreadsCreatedBy(userId: string, floor: number): number {
     return integerColumn(this.rawRows<{ count: number }>(
-      `SELECT COUNT(*) AS count FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IS NOT NULL AND latest_log_id >= ? AND json_extract(fields_json, '$.creator_id') = ?`,
+      `SELECT COUNT(*) AS count FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IS NOT NULL AND (latest_log_id >= ? OR ${KEPT_ROOM}) AND json_extract(fields_json, '$.creator_id') = ?`,
       floor, userId,
     )[0]?.count);
   }
@@ -7146,7 +7260,7 @@ export class Store {
    */
   private privateRoomCounts(userId: string, floor: number): { created: number; memberships: number } {
     const created = integerColumn(this.rawRows<{ count: number }>(
-      `SELECT COUNT(*) AS count FROM rooms WHERE ${PRIVATE_ROOMS} AND latest_log_id >= ? AND json_extract(fields_json, '$.creator_id') = ?`,
+      `SELECT COUNT(*) AS count FROM rooms WHERE ${PRIVATE_ROOMS} AND (latest_log_id >= ? OR ${KEPT_ROOM}) AND json_extract(fields_json, '$.creator_id') = ?`,
       floor, userId,
     )[0]?.count);
     return { created, memberships: this.privateMembershipCount(userId) };
@@ -7372,6 +7486,7 @@ export class Store {
           const context: CommitContext = { state, commitMs: Math.max(effective, state.last_commit_ms), touched: new Map() };
           const floor = state.history_floor;
           committed = method === "message" ? this.commitMessage(input, context, floor)
+            : method === "room_set" && input.toggleKeep ? this.commitKeep(input, context, floor, tier === "registered")
             : method === "room_set" ? this.commitRoom(input, context, floor, tier === "registered")
             : this.commitReactions(input, context, floor);
           // Within the transaction: a move its sender cannot pay for is refused whole.
@@ -7511,7 +7626,8 @@ export class Store {
     // fetched from the room its prev_room_id names.
     const windows = new Map<string, { lower: number; upper: number }>();
     for (const room of sources) {
-      const lower = Math.max(roomHistoryFloor(room, floor), after ?? 0);
+      // Together, a kept room's older records stay below where the joined log starts: its own history has them.
+      const lower = Math.max(roomHistoryFloor(room, floor), multiple ? lowerBound : 0, after ?? 0);
       const upper = Math.min(room.latest_log_id, before ?? room.latest_log_id);
       if (lower <= upper && roomHistoryLogId(room, floor) !== null) windows.set(room.room_id, { lower, upper });
     }
@@ -7627,7 +7743,7 @@ export class Store {
    */
   private cleanupHasWork(floor: number, cutoff: number, effective: number, limiterCutoff: number): boolean {
     return roomIdList(this.metaValue(META_PURGE_ROOMS)).length > 0 ||
-      this.rawRows("SELECT log_id FROM records INDEXED BY records_log_idx WHERE log_id < ? ORDER BY log_id LIMIT 1", floor).length > 0 ||
+      this.rawRows("SELECT log_id FROM records INDEXED BY records_log_idx WHERE log_id >= ? AND log_id < ? ORDER BY log_id LIMIT 1", this.metaNumber(META_DELETE_FROM), floor).length > 0 ||
       // Commit times are nondecreasing in log order, so the oldest record from the floor on says whether any expired.
       this.rawRows<{ commit_ms: number }>("SELECT commit_ms FROM records INDEXED BY records_log_idx WHERE log_id >= ? ORDER BY log_id LIMIT 1", floor)
         .some((row) => integerColumn(row.commit_ms) < cutoff) ||
@@ -7740,7 +7856,7 @@ export class Store {
     // expired set is always a prefix of the one server-wide log.
     this.transaction(() => {
       const pending = this.rawRows<{ log_id: number }>(
-        "SELECT log_id FROM records INDEXED BY records_log_idx WHERE log_id < ? ORDER BY log_id LIMIT 1", floor,
+        "SELECT log_id FROM records INDEXED BY records_log_idx WHERE log_id >= ? AND log_id < ? ORDER BY log_id LIMIT 1", this.metaNumber(META_DELETE_FROM), floor,
       );
       // The expired records are the prefix of the log from the floor on whose commit time is before the cutoff.
       const oldest = pending.length ? [] : this.rawRows<{ log_id: number; commit_ms: number }>(
@@ -7758,10 +7874,14 @@ export class Store {
     });
     const result = this.transaction(() => {
       let remaining = batch;
+      // Kept rooms' records (`/keep`) stay below the floor; a batch steps
+      // over them, and the next starts past them (META_DELETE_FROM).
+      const deleteFrom = this.metaNumber(META_DELETE_FROM);
+      const kept = new Set(roomIdList(this.metaValue(META_KEPT_ROOMS)));
       const expiring = this.rawRows<{ room_id: string; log_id: number; kind: string; message_id: string | null; reactions_json: string | null }>(
         `SELECT room_id, log_id, kind, json_extract(record_json, '$.message_id') AS message_id,
            CASE WHEN kind = 'reactions' THEN record_json END AS reactions_json
-         FROM records INDEXED BY records_log_idx WHERE log_id < ? ORDER BY log_id LIMIT ?`, floor, remaining,
+         FROM records INDEXED BY records_log_idx WHERE log_id >= ? AND log_id < ? ORDER BY log_id LIMIT ?`, deleteFrom, floor, remaining,
       );
       // Current state survives while its latest record is retained, so it
       // goes with that record: a message's state row with its latest
@@ -7774,7 +7894,15 @@ export class Store {
       const records: typeof expiring = [];
       let messages = 0;
       let reactions = 0;
+      let skipped = false;
+      let next = deleteFrom;
       for (const row of expiring) {
+        if (kept.has(row.room_id)) {
+          skipped = true;
+          next = row.log_id + 1;
+          remaining -= 1;
+          continue;
+        }
         const users = row.kind === "reactions" && row.message_id !== null && row.reactions_json !== null
           ? parseJson<ReactionsRecord>(row.reactions_json).reactions.map((set) => set.from.user_id)
           : [];
@@ -7782,6 +7910,7 @@ export class Store {
         if (records.length > 0 && 1 + state > remaining) break;
         this.rawExec("DELETE FROM records WHERE room_id = ? AND log_id = ?", row.room_id, row.log_id);
         records.push(row);
+        next = row.log_id + 1;
         remaining -= 1 + state;
         if (row.message_id === null) continue;
         if (row.kind === "message") {
@@ -7792,6 +7921,9 @@ export class Store {
           }
         }
       }
+      // Only once a batch steps over a kept room's record: until then the
+      // deleted prefix itself keeps the next batch from reading it again.
+      if (skipped) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_DELETE_FROM, String(next));
       remaining = Math.max(0, remaining);
       // A thread or private room whose entire log (creation record included)
       // has been discarded leaves the visible set. No message, reaction, or
@@ -7801,15 +7933,15 @@ export class Store {
       // below, in batches; until then the join with `rooms` hides them.
       let purge = roomIdList(this.metaValue(META_PURGE_ROOMS));
       const threads = remaining > 0 && purge.length < MAX_PURGE_ROOMS ? this.rawRows<{ room_id: string }>(
-        `SELECT room_id FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IS NOT NULL AND latest_log_id < ? ORDER BY created_log_id LIMIT ?`, floor, Math.min(remaining, MAX_PURGE_ROOMS - purge.length),
+        `SELECT room_id FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IS NOT NULL AND latest_log_id < ? AND NOT ${KEPT_ROOM} ORDER BY created_log_id LIMIT ?`, floor, Math.min(remaining, MAX_PURGE_ROOMS - purge.length),
       ) : [];
       const roomCapacity = Math.min(remaining - threads.length, MAX_PURGE_ROOMS - purge.length - threads.length);
       // In key order, which is creation order: the IDs carry log IDs of one length.
       const privates = roomCapacity > 0 ? this.rawRows<{ room_id: string }>(
-        `SELECT room_id FROM rooms WHERE ${PRIVATE_ROOMS} AND latest_log_id < ? ORDER BY room_id LIMIT ?`, floor, roomCapacity,
+        `SELECT room_id FROM rooms WHERE ${PRIVATE_ROOMS} AND latest_log_id < ? AND NOT ${KEPT_ROOM} ORDER BY room_id LIMIT ?`, floor, roomCapacity,
       ) : [];
       const rooms = [...threads, ...privates];
-      for (const row of rooms) this.rawExec("DELETE FROM rooms WHERE room_id = ? AND latest_log_id < ?", row.room_id, floor);
+      for (const row of rooms) this.rawExec(`DELETE FROM rooms WHERE room_id = ? AND latest_log_id < ? AND NOT ${KEPT_ROOM}`, row.room_id, floor);
       if (threads.length) this.rawExec("UPDATE _meta SET value = ? WHERE key = 'thread_count'", String(Math.max(0, this.metaNumber("thread_count") - threads.length)));
       if (privates.length) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('private_count', ?)", String(Math.max(0, this.metaNumber("private_count") - privates.length)));
       remaining -= rooms.length;
@@ -7867,8 +7999,8 @@ export class Store {
       ) : [];
       for (const row of wakes) this.rawExec("DELETE FROM push_wakes WHERE user_id = ? AND room_id = ?", row.user_id, row.room_id);
       const hasMore = this.cleanupHasWork(floor, cutoff, effective, limiterCutoff) ||
-        this.rawRows(`SELECT room_id FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IS NOT NULL AND latest_log_id < ? LIMIT 1`, floor).length > 0 ||
-        this.rawRows(`SELECT room_id FROM rooms WHERE ${PRIVATE_ROOMS} AND latest_log_id < ? LIMIT 1`, floor).length > 0;
+        this.rawRows(`SELECT room_id FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IS NOT NULL AND latest_log_id < ? AND NOT ${KEPT_ROOM} LIMIT 1`, floor).length > 0 ||
+        this.rawRows(`SELECT room_id FROM rooms WHERE ${PRIVATE_ROOMS} AND latest_log_id < ? AND NOT ${KEPT_ROOM} LIMIT 1`, floor).length > 0;
       const nextDue = effective + (hasMore ? 1000 : this.config.cleanupIntervalMs);
       this.rawExec("UPDATE maintenance SET next_cleanup_ms = ?, cleanup_cutoff_ms = ?, cleanup_cursor = ? WHERE id = 1", nextDue, hasMore ? cutoff : null, hasMore ? floor : null);
       this.cleanupDueCache = undefined;
