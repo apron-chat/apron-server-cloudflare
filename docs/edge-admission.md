@@ -41,6 +41,13 @@ During an authorized deployment:
    trip.
    Header comparison is case insensitive. Have Cloudflare validate
    the expression before saving. Place it before any applicable Skip rule.
+   With live text, also add `apron_write_streaming` as a Configuration Rule
+   (phase `http_config_settings`) that sets Request Body Buffering to None
+   for `PUT` on `/w/`. On the default, Standard, the edge may hold a
+   writer's first bytes until more arrive, so typed keys or a slow
+   command's output reach readers late. The bodies it streams are opaque
+   to the WAF anyway; the Worker checks each write's signed token before it
+   reads the body, and live text's limits bound what a writer can send.
 3. Optionally create `apron_admission_off`, disabled, as an emergency Block rule.
    Enabling it prevents new requests from invoking the Worker. It does not close
    already upgraded sockets. Never replace unrelated rules with this file.

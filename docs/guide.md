@@ -478,7 +478,9 @@ For direct Wrangler production commands, always pass
    Live text needs only `PUBLIC_ORIGIN` and `UPLOAD_SIGNING_KEY`, and the
    regenerated `apron_invalid_request` rule, which lets `/w/` writes and
    `/live/` reads through ([live text](configuration.md#live-text)); until
-   the rule is updated, the edge blocks them.
+   the rule is updated, the edge blocks them. Add the `apron_write_streaming`
+   configuration rule too, or the edge may hold a slow writer's first bytes,
+   such as typed keys, until more arrive ([edge admission](edge-admission.md)).
 3. Set `ALLOWED_ORIGINS = "*"` for the public reference server. Keep the
    passkey RP ID `apron.chat` and the explicit, exact `RP_ORIGINS` allowlist;
    wildcard guest admission never enables wildcard passkey verification.

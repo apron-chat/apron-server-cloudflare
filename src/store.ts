@@ -417,6 +417,20 @@ export function liveDeadline(entry: LiveEntry): number {
 /** Roles whose holders stream for `moderatorMaxSeconds` rather than `maxSeconds`. */
 const LIVE_TEXT_LONG_ROLES: readonly string[] = ["admin", "mod"];
 
+/** A live text's `url` (§4.8.5), which its embed carries once its write starts. */
+function liveUrl(live: Pick<StoreLiveTextConfig, "publicOrigin">, entry: Pick<LiveEntry, "id">): string {
+  return `${live.publicOrigin}/live/${entry.id}`;
+}
+
+/**
+ * A terminal embed's `og` (protocol §4.8.1): what it is, for a client that
+ * doesn't render terminal embeds and shows it as the card its `og`
+ * describes, which opens its `url`. Titled as the embed is.
+ */
+export function terminalOg(title: unknown): { title: string; description: string } {
+  return { title: typeof title === "string" && title ? title : "Terminal", description: "Terminal output. Open it to watch." };
+}
+
 function isLiveEntry(value: unknown): value is LiveEntry {
   if (!isPlainObject(value)) return false;
   return typeof value.key === "string" && /^l\/[A-Za-z0-9_-]{22}$/.test(value.key) && typeof value.id === "string" &&
@@ -5288,11 +5302,13 @@ export class Store {
         }
         kept.add(embedId as string);
         if (isLive(before.kind)) {
-          // The server owns `url` and `output` (§4.8.2); a terminal takes a new title.
-          const { title: _title, ...owned } = before;
+          // The server owns `url`, `output`, and a terminal's `og` (§4.8.1, §4.8.2); a terminal takes a new title.
+          const { title: _title, og: _og, ...owned } = before;
           void _title;
-          const title = before.kind === "terminal" ? uploadTitle(fields.title) : undefined;
-          return { ...owned, ...(title ? { title } : {}) };
+          void _og;
+          if (before.kind !== "terminal") return owned;
+          const title = uploadTitle(fields.title);
+          return { ...owned, ...(title ? { title } : {}), og: terminalOg(title) };
         }
         if (before.kind !== "upload" || !this.config.uploads) return { embed_id: embedId, ...fields };
         const title = uploadTitle(fields.title);
@@ -5309,7 +5325,11 @@ export class Store {
           liveStarted.push(entry);
           writes.push(liveResultEmbed(entry, live!));
         }
-        return { embed_id: id, kind, ...(title ? { title } : {}), url: `${live!.publicOrigin}/live/${entry.id}` };
+        // Its `url` waits for the write (§4.8.5): a command's message is posted with it then, and a message's republished.
+        return {
+          embed_id: id, kind, ...(title ? { title } : {}), ...(liveClaim ? { url: liveUrl(live!, entry) } : {}),
+          ...(kind === "terminal" ? { og: terminalOg(title) } : {}),
+        };
       }
       if (fields.kind !== "upload" || !this.config.uploads) return { embed_id: id, ...fields };
       const upload = this.startUpload("file", userId, now, { messageId, embedId: id });
@@ -5538,7 +5558,8 @@ export class Store {
 
   /**
    * The write of a live text arrived (§4.8.3): a pending one within its
-   * window starts streaming, once. A command's message is posted now. Null
+   * window starts streaming, once. A command's message is posted now, with
+   * the embed's `url`; a message's is republished with it (§4.8.5). Null
    * when the write cannot start: unknown, used, or expired. A command's
    * message that can no longer be posted (its room or reply gone) throws,
    * and its text is forgotten.
@@ -5575,6 +5596,15 @@ export class Store {
           message = committed.message;
           entry.messageId = message!.message_id;
           delete entry.post;
+        } else if (entry.messageId) {
+          const current = this.currentMessage(entry.messageId);
+          const snapshot = current ? parseJson<MessageSnapshot>(current.snapshot_json) : null;
+          const embeds = snapshot && !snapshot.deleted && Array.isArray(snapshot.body?.embeds) ? snapshot.body.embeds as Record<string, unknown>[] : [];
+          const embed = embeds.find((candidate) => candidate.embed_id === entry.embedId);
+          if (current && snapshot && embed) {
+            this.ensureGrowthCapacity(this.config.maxSnapshotBytes);
+            broadcasts = this.rewriteEmbed(current, snapshot, entry.embedId, { ...embed, url: liveUrl(this.config.liveText!, entry) }, effective);
+          }
         }
         entry.state = "live";
         entry.startedMs = effective;

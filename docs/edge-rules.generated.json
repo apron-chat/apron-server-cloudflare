@@ -32,6 +32,21 @@
       }
     ]
   },
+  "config": {
+    "phase": "http_config_settings",
+    "rules": [
+      {
+        "ref": "apron_write_streaming",
+        "description": "Apron: stream write_url bodies to the Worker as they arrive (live text)",
+        "expression": "(http.host eq \"server.apron.chat\") and http.request.method eq \"PUT\" and starts_with(http.request.uri.path, \"/w/\")",
+        "action": "set_config",
+        "enabled": true,
+        "action_parameters": {
+          "request_body_buffering": "none"
+        }
+      }
+    ]
+  },
   "optionalZoneRateLimit": {
     "phase": "http_ratelimit",
     "rules": [

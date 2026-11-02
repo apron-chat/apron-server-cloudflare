@@ -419,8 +419,17 @@ Each value can be lowered for a test or an incident with a
 `LIVE_TEXT_MAX_SECONDS=30` or `LIVE_TEXT_CONCURRENT=1`; values past the
 ceilings above fail the configuration check. The cost of the defaults is in
 the [cost report](cost-report.md#live-text). In production, the edge rule
-`apron_invalid_request` must let live text through (see
+`apron_invalid_request` must let live text through, and
+`apron_write_streaming` must stream its writes rather than buffer them (see
 [edge admission](edge-admission.md)).
+
+`TERMINAL_VIEWER_URL` is the page a browser goes to when it opens a
+terminal's `url` as a page: `https://terminal.apron.chat/` unless set, and
+none when set empty (`TERMINAL_VIEWER_URL=""`), when browsers get the plain
+text too. An `https` viewer is none for an `http` `PUBLIC_ORIGIN`, such as
+`wrangler dev`'s, since the viewer reads only `https`. The `url` goes in
+the fragment, which never reaches the viewer's host. It must be an http(s) URL without a fragment or
+user info, or the configuration check fails.
 
 ## Server title, description and avatar
 
