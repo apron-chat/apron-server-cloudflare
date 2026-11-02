@@ -4,12 +4,16 @@ import { MUTE_FOREVER, Store } from '../src/store';
 
 const day = 86_400_000;
 
-/** A store with `config`, over its own object, on a fixed clock. */
-async function withStore<T>(name: string, config: Record<string, number>, fn: (store: Store, sql: SqlStorage, clock: { now: number }) => T): Promise<T> {
+/**
+ * A store with `config`, over its own object, on a fixed clock. Activity
+ * has been recorded long enough for the idle prune to act, unless `fresh`.
+ */
+async function withStore<T>(name: string, config: Record<string, number>, fn: (store: Store, sql: SqlStorage, clock: { now: number }) => T, fresh = false): Promise<T> {
 	return runInDurableObject(env.DEMO.getByName(name), (_instance, state) => {
 		const clock = { now: Date.now() };
 		const store = new Store(state, config, { now: () => clock.now });
 		store.initialize();
+		if (!fresh) state.storage.sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('idle_activity_since', ?)", String(clock.now - 365 * day));
 		return fn(store, state.storage.sql, clock);
 	});
 }
@@ -67,6 +71,28 @@ it('removes accounts idle past the cutoff, whatever their first day, with their 
 		user('later', { created: 90 * day, seen: 80 * day });
 		expect(store.pruneIdleIdentities(now, new Set(['online'])).pruned).toEqual([]);
 		expect(store.pruneIdleIdentities(now + day, new Set(['online'])).pruned).toEqual(['later']);
+	});
+});
+
+it('removes nothing until activity has been recorded for the idle cutoff', async () => {
+	await withStore('idle-grace', { idleAccountMs: 30 * day, keptActiveAccounts: 1 }, (store, sql, clock) => {
+		const user = seed(sql, clock.now);
+		user('active-before', { created: 300 * day, seen: 200 * day });
+		user('recent', { created: day });
+		// The first prune after this version starts the record: sign-ins before it left none.
+		expect(store.pruneIdleIdentities(clock.now).pruned).toEqual([]);
+		expect(store.pruneIdleIdentities(clock.now + 29 * day).pruned).toEqual([]);
+		expect(store.pruneIdleIdentities(clock.now + 30 * day).pruned).toEqual(['active-before']);
+	}, true);
+});
+
+it('keeps an owner whose bot holds a role of its own', async () => {
+	await withStore('idle-bot-role', { idleAccountMs: 30 * day, keptActiveAccounts: 1 }, (store, sql, clock) => {
+		const user = seed(sql, clock.now);
+		user('owner', { created: 300 * day, seen: 200 * day });
+		sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json, seen_ms) VALUES ('bot_owner', '', 'bot', 'registered', ?, 0, '[\"bot\",\"mod\"]', 0)", clock.now - 200 * day);
+		user('recent', { created: day });
+		expect(store.pruneIdleIdentities(clock.now).pruned).toEqual([]);
 	});
 });
 

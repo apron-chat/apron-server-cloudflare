@@ -839,14 +839,17 @@ in the last 10 minutes, so evictions cannot cascade.
 **Account upkeep.** The alarm removes registered accounts inactive for
 `idleAccountSeconds` (30 days; `Store.pruneIdleIdentities`), least recently
 active first, 100 a run and at most 10 runs a UTC day, so a backlog spreads
-over days. Activity is an account's creation, profile changes and sign-ins
+over days. It removes none until activity has been recorded for that long
+(`idle_activity_since` in `_meta`, set by its first run): sign-ins were not
+recorded before it, so an account active only by session resume or while
+invisible is never taken for idle. Activity is an account's creation, profile changes and sign-ins
 (a passkey, a session resume or a token, recorded at most once a day, and
 hourly for those connected), its last departure (`seen`), a passkey's last
 use, and its bot's activity, so it holds whether or not user status is on.
 Receiving pushes alone is not activity. It never removes one of the
 `keptActiveAccounts` (100) most recently active, one with a role, the admin
-user, one connected now or whose bot is, or one with a live upload (its
-avatar expires first). Its bot goes with it, and its passkeys, memberships,
+user, one connected now or whose bot is, one whose bot holds a role of its
+own, or one with a live upload (its avatar expires first). Its bot goes with it, and its passkeys, memberships,
 read cursors, status, mutes, push subscriptions, tokens and limiter rows. Its
 content is past retention by then. Its `user_id` is retired, as `/purge`
 retires one, for `retiredUserIdSeconds` (the message retention), then may be

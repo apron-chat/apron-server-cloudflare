@@ -976,6 +976,14 @@ const IDLE_PRUNE_BATCH = 100;
 const BOT_PREFIX = "bot_";
 /** Idle accounts pruned: today's count and the total (idlePruned). */
 const META_IDLE_PRUNED = "idle_pruned";
+/**
+ * Since when every kind of activity the idle prune reads has been recorded
+ * (sign-ins, by noteActive, came with it): nothing is pruned until that is
+ * `idleAccountMs` ago, so an account active before then by a way that left
+ * no record (a session resume, a token, while invisible) is never taken for
+ * idle. Absent before the first prune asks.
+ */
+const META_IDLE_ACTIVITY_SINCE = "idle_activity_since";
 /** Today's idle prune runs, and whether the day's prune is done (pruneIdleIdentities). */
 const META_IDLE_PRUNE_DAY = "idle_prune_day";
 /** A sign-in records an account's activity at most this often (noteActive). */
@@ -992,7 +1000,7 @@ function lastActiveSql(alias: string): string {
     COALESCE((SELECT b.updated_ms FROM identities b WHERE b.user_id = '${BOT_PREFIX}' || ${alias}.user_id), 0))`;
 }
 /** Retired user ids freed at most per call (dueRetiredUserIds). */
-const RETIRED_SWEEP_BATCH = 500;
+export const RETIRED_SWEEP_BATCH = 500;
 /** Idle prune batches a UTC day at most: a backlog spreads over days. */
 const IDLE_PRUNE_RUNS_PER_DAY = 10;
 /** The runtime's attack pause: its UTC day, count that day, hold end, and why (attackPause). */
@@ -3789,9 +3797,11 @@ export class Store {
    * Removes up to IDLE_PRUNE_BATCH registered accounts inactive for
    * `idleAccountMs` (lastActiveSql: created, profile change or sign-in,
    * departure, passkey use, or their bot's activity), least recently active
-   * first, in at most IDLE_PRUNE_RUNS_PER_DAY runs a UTC day. It never removes one of the `keptActiveAccounts`
+   * first, in at most IDLE_PRUNE_RUNS_PER_DAY runs a UTC day, and none until
+   * activity has been recorded for `idleAccountMs` (META_IDLE_ACTIVITY_SINCE). It never removes one of the `keptActiveAccounts`
    * most recently active, one with a role (admins, mods, friends), the admin
-   * user, one `connected` now or whose bot is, or one with a live upload (its avatar or
+   * user, one `connected` now or whose bot is, one whose bot holds a role
+   * of its own, or one with a live upload (its avatar or
    * files expire first). With each goes its bot. It removes their identity,
    * passkeys, memberships (lowering their rooms' member counts), read
    * cursors, status, mutes, push subscriptions and wakes, dedup and limiter
@@ -3814,8 +3824,15 @@ export class Store {
       } catch { /* a day afresh */ }
       return { day: today, runs: 0, done: false };
     };
-    const state = this.reserved({ reads: 4 }, true, now, progress, false);
-    if (state.done || state.runs >= IDLE_PRUNE_RUNS_PER_DAY) return { pruned: [], more: false };
+    const state = this.reserved({ reads: 8, writes: 4 }, true, now, () => {
+      const since = Number(this.metaValue(META_IDLE_ACTIVITY_SINCE));
+      if (!Number.isFinite(since) || since <= 0) {
+        this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_IDLE_ACTIVITY_SINCE, String(now));
+        return { ...progress(), waiting: true };
+      }
+      return { ...progress(), waiting: now - since < this.config.idleAccountMs };
+    }, false);
+    if (state.waiting || state.done || state.runs >= IDLE_PRUNE_RUNS_PER_DAY) return { pruned: [], more: false };
     const record = (done: boolean) => this.reserved({ reads: 4, writes: 4 }, true, now, () => {
       const current = progress();
       this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_IDLE_PRUNE_DAY,
@@ -3830,6 +3847,7 @@ export class Store {
         `SELECT i.user_id FROM identities i
          WHERE i.roles_json = '[]' AND i.user_id != ? AND ${lastActiveSql("i")} < ?
            AND NOT EXISTS (SELECT 1 FROM uploads u INDEXED BY uploads_owner_idx WHERE u.owner_id = i.user_id)
+           AND NOT EXISTS (SELECT 1 FROM identities b WHERE b.user_id = '${BOT_PREFIX}' || i.user_id AND b.roles_json != '["bot"]')
            AND i.user_id NOT IN (SELECT k.user_id FROM identities k WHERE k.roles_json = '[]' ORDER BY ${lastActiveSql("k")} DESC LIMIT ?)
          ORDER BY ${lastActiveSql("i")} LIMIT ?`,
         ADMIN_USER_ID, cutoff, this.config.keptActiveAccounts, IDLE_PRUNE_BATCH + connected.size,
@@ -3901,7 +3919,8 @@ export class Store {
       throw error;
     }
     console.log(JSON.stringify({ event: "idle_accounts_pruned", count: ids.length }));
-    record(!found.full);
+    // Committed: a failure to record progress only means one more run.
+    try { record(!found.full); } catch { /* counted again next time */ }
     return { pruned: ids, more: found.full };
   }
 

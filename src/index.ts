@@ -45,6 +45,7 @@ import {
 	EXHAUSTED_SHARE,
 	DEFAULT_JOINED_ROOMS,
 	MAX_PASSKEYS_PER_USER,
+	RETIRED_SWEEP_BATCH,
 	MAX_PUSH_URL_BYTES,
 	MAX_ROLES_PER_USER,
 	MAX_MUTE_SECONDS,
@@ -722,8 +723,6 @@ function liveRefused(response: Response, kind: LiveRefusal): Response {
 /** A guest connection this long without an application frame may make room on a full server (evictIdleGuest). */
 const GUEST_IDLE_MS = 10 * 60_000;
 
-/** Retired user ids one call frees at most (Store.dueRetiredUserIds): a full batch means more. */
-const RETIRED_SWEEP_BATCH = 500;
 
 /** The stored attack pause (Store.attackPause). */
 interface AttackPause {
@@ -7064,8 +7063,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 				this.idlePruneAt = now;
 				this.maintenanceSoon(now);
 			}
-			if (result.pruned.length) await this.forgetTokens(result.pruned);
-		} catch { /* retried in an hour */ }
+			if (result.pruned.length) await this.forgetTokens(result.pruned, "maintenance");
+		} catch { /* retried in an hour; tokens are revoked again before an id is freed */ }
 		const day = utcDay(now);
 		if (this.upkeepDay === day) return;
 		let done = true;
@@ -7073,7 +7072,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const due = this.store.dueRetiredUserIds(now);
 			if (due.length) {
 				// Revoke first: a failure leaves the ids retired, retried next time.
-				await this.forgetTokens([...due, ...due.map((userId) => BOT_ID_PREFIX + userId)]);
+				await this.forgetTokens([...due, ...due.filter((userId) => !isBotId(userId)).map((userId) => BOT_ID_PREFIX + userId)], "maintenance");
 				this.store.freeRetiredUserIds(due, now);
 			}
 			if (due.length >= RETIRED_SWEEP_BATCH) {
@@ -7106,10 +7105,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		} catch { /* the token is refused all the same */ }
 	}
 
-	/** Revokes bot, invite and device tokens, so purged users cannot sign in again. */
-	private async forgetTokens(userIds: readonly string[]): Promise<void> {
+	/** Revokes bot, invite and device tokens, so purged users cannot sign in again; upkeep charges it as maintenance. */
+	private async forgetTokens(userIds: readonly string[], kind: "foreground" | "maintenance" = "foreground"): Promise<void> {
 		if (!userIds.length) return;
-		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 3 * userIds.length, writes: (5 + MAX_DEVICE_TOKENS) * userIds.length }, async () => {
+		await this.withSessionLock(() => this.store.withMeterAsync(kind, { reads: 3 * userIds.length, writes: (5 + MAX_DEVICE_TOKENS) * userIds.length }, async () => {
 			for (const userId of userIds) {
 				for (const pointer of [BOT_KEY_PREFIX + userId, INVITE_KEY_PREFIX + userId]) {
 					const stored = await this.ctx.storage.get<StoredBot>(pointer);
