@@ -1285,7 +1285,7 @@ it('/role shows a user\'s roles and toggles one, any name a label, admin also th
 	} finally { admin.close(); labeled.close(); mate.close(); }
 });
 
-it('tells only a user their own permissions (ext:permissions): admin, mod and threader move others\' messages, admin and mod get push for joined, but not an owner\'s bot', async () => {
+it('tells only a user their own permissions (ext:permissions): admin, mod and threader move others\' messages, admin and mod get push for joined, and an owner\'s bot only moves with threader', async () => {
 	const admin = await signedInAdmin();
 	const tiaId = unique('tia');
 	const tia = await signedIn(tiaId);
@@ -1325,6 +1325,14 @@ it('tells only a user their own permissions (ext:permissions): admin, mod and th
 			await command(admin, 'bot-mod', `/role bot_${tiaId} mod`);
 			expect((await ownYou(bot)).ext).toEqual({ permissions: {} });
 			expect((await move(bot, 'bot-move', threadId)).error.code).toBe(-32001);
+			// With `threader` it may re-thread others' messages, and is told so.
+			await command(admin, 'bot-threader', `/role bot_${tiaId} threader`);
+			expect((await ownYou(bot)).ext).toEqual({ permissions: { move_any: true } });
+			expect((await move(bot, 'bot-threader-in', threadId)).result).toBeDefined();
+			expect((await move(bot, 'bot-threader-out', 'general')).result).toBeDefined();
+			await command(admin, 'bot-unthreader', `/role bot_${tiaId} threader`);
+			expect((await ownYou(bot)).ext).toEqual({ permissions: {} });
+			expect((await move(bot, 'bot-unthreader-move', threadId)).error.code).toBe(-32001);
 		} finally { bot.close(); }
 	} finally { admin.close(); tia.close(); mate.close(); }
 });
