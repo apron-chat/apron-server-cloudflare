@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ADMISSION_BUDGET, DEFAULT_LIMITS } from '../src/budget.ts';
-import { mediaHostname, relyingPartyId, renderBinding, renderEdgeRules, replaceBinding, validateAdmission, validateDeploymentConfiguration, validateEdgeStop } from './budget.mjs';
+import { mediaHostname, relyingPartyId, renderBinding, renderEdgeRules, replaceBinding, validateAdmission, validateDeploymentConfiguration, validateEdgeStop, webClientTarget } from './budget.mjs';
 
 const namespaces = { attempts: '123', prefix: '124', location: '125', live: '126' };
 
@@ -17,6 +17,28 @@ test('changed admission limits propagate to both Worker and optional edge policy
 	assert.deepEqual(edge.custom.rules.map((rule) => rule.ref), ['apron_invalid_request', 'apron_admission_off', 'apron_budget_stop']);
 	assert.equal(edge.custom.rules[2].enabled, false);
 	assert.equal(edge.custom.rules[2].expression, 'http.host eq "chat.example.test"');
+});
+
+test('a browser opening the server as a page is redirected to the web client with its own host', () => {
+	assert.equal(renderEdgeRules('chat.example.test').redirect, undefined);
+	const edge = renderEdgeRules('chat.example.test', ADMISSION_BUDGET, undefined, false, false, 'https://web.example.test/');
+	assert.equal(edge.redirect.phase, 'http_request_dynamic_redirect');
+	const [rule] = edge.redirect.rules;
+	assert.equal(rule.ref, 'apron_browser_redirect');
+	assert.equal(rule.enabled, true);
+	assert.match(rule.expression, /^\(http.host eq "chat.example.test"\) and http.request.method eq "GET" and http.request.uri.path eq "\/" /);
+	// It redirects exactly the plain page loads apron_invalid_request blocks.
+	assert.match(rule.expression, /and not any\(lower\(http.request.headers\["upgrade"\]\[\*\]\)\[\*\] eq "websocket"\) and not any\(http.request.uri.args\["apron_connection_status"\]\[\*\] eq "1"\)$/);
+	assert.ok(edge.custom.rules[0].expression.includes('not any(lower(http.request.headers["upgrade"][*])[*] eq "websocket") and not any(http.request.uri.args["apron_connection_status"][*] eq "1")'));
+	assert.deepEqual(rule.action_parameters.from_value, {
+		status_code: 302,
+		target_url: { expression: 'concat("https://web.example.test/#server=wss://", http.host, "/")' },
+		preserve_query_string: false,
+	});
+	assert.doesNotMatch(rule.action_parameters.from_value.target_url.expression, /chat\.example\.test/);
+	for (const bad of ['http://web.example.test/', 'https://web.example.test/#x', 'https://u:p@web.example.test/', 'not a url']) {
+		assert.throws(() => webClientTarget(bad));
+	}
 });
 
 test('generation is idempotent and preserves unrelated Wrangler settings', () => {

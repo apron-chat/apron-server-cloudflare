@@ -48,6 +48,14 @@ During an authorized deployment:
    command's output reach readers late. The bodies it streams are opaque
    to the WAF anyway; the Worker checks each write's signed token before it
    reads the body, and live text's limits bound what a writer can send.
+   Add `apron_browser_redirect` as a Single Redirect (phase
+   `http_request_dynamic_redirect`), which runs before the custom rules: a
+   browser opening the server's address as a page (a `GET /` that is neither
+   a WebSocket handshake nor a status probe, which `apron_invalid_request`
+   would block) is sent with a 302 to the web client (`WEB_CLIENT` in
+   `scripts/budget.mjs`, `https://web.apron.chat/`) with
+   `#server=wss://<the request's host>/` prefilled. The target is built from
+   `http.host`, so it names no server; the redirect never invokes the Worker.
 3. Optionally create `apron_admission_off`, disabled, as an emergency Block rule.
    Enabling it prevents new requests from invoking the Worker. It does not close
    already upgraded sockets. Never replace unrelated rules with this file.
@@ -84,8 +92,10 @@ After applying rules, use a handful of requests, not a quota-exhaustion load tes
 
 - Confirm a normal handshake on both `/` and `/ws` succeeds, including a custom
   browser origin and an originless client. The app's normal connection caps apply.
-- Confirm plain HTTP GET, POST, and invalid paths on the server hostname are
-  blocked at the edge; check the matching rule in Security Events.
+- Confirm a plain HTTP `GET /` on the server hostname redirects to the web
+  client with `#server=wss://<hostname>/`, and that POST, other paths, and
+  `GET /ws` without an upgrade are blocked at the edge; check the matching
+  rule in Security Events.
 - Confirm `GET /ws?apron_connection_status=1` reaches the Worker and exposes
   capacity errors, `Retry-After`, and the `Apron-Connection-Status: 1` marker to
   the frontend through CORS.
