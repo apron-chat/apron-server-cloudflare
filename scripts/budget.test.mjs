@@ -56,6 +56,8 @@ test('invalid windows and inconsistent attempt budgets cannot be generated', () 
 		assert.throws(() => validateAdmission({ ...ADMISSION_BUDGET, requestsPerIpMinute }));
 	}
 	assert.throws(() => validateAdmission({ ...ADMISSION_BUDGET, workerWindowSeconds: 10 }));
+	assert.throws(() => validateAdmission({ ...ADMISSION_BUDGET, liveReadsPerLocationMinute: undefined }));
+	assert.throws(() => validateAdmission({ ...ADMISSION_BUDGET, liveReadsPerLocationMinute: ADMISSION_BUDGET.requestsPerIpMinute - 1 }));
 	assert.throws(() => validateAdmission({ ...ADMISSION_BUDGET, edgeWindowSeconds: 60 }));
 	assert.throws(() => validateAdmission({ ...ADMISSION_BUDGET, edgeBlockSeconds: 60 }));
 	assert.throws(() => validateAdmission(ADMISSION_BUDGET, {

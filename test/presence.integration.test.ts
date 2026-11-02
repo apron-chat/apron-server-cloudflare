@@ -18,7 +18,7 @@ type Runtime = {
 	store: Store;
 	config: { presence: boolean };
 	announcedAt: Map<string, number>;
-	issueSession(userId: string, origin: string, now: number): Promise<string>;
+	issueSession(userId: string, origin: string, now: number, handle?: string): Promise<string>;
 	flushPresence(now?: number): void;
 };
 type Attachment = { userId?: string; closing?: boolean; pres?: { s: string; a: number; h?: number }; owed?: Array<[string, string, string, number, number?]>; choice?: string; muteUntil?: number; roomMuteNext?: number; seen?: number };
@@ -59,9 +59,10 @@ async function register(userId: string): Promise<void> {
  * `existing`), which says at once that it is attended. Its auth result and
  * the frames after it are in `afterAuth`.
  */
-async function signIn(userId: string, { existing = false } = {}): Promise<{ peer: Peer; auth: Frame; afterAuth: Frame[] }> {
+async function signIn(userId: string, { existing = false, handle }: { existing?: boolean; handle?: string } = {}): Promise<{ peer: Peer; auth: Frame; afterAuth: Frame[] }> {
 	if (!existing) await register(userId);
-	const token = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).issueSession(userId, 'http://localhost:5173', Date.now()));
+	// Given its handle, as a passkey sign-in issues it, issuing reads no identity.
+	const token = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).issueSession(userId, 'http://localhost:5173', Date.now(), handle));
 	const peer = await connect();
 	await peer.next();
 	await peer.next();
@@ -72,7 +73,7 @@ async function signIn(userId: string, { existing = false } = {}): Promise<{ peer
 	return { peer, auth, afterAuth };
 }
 
-async function signedIn(userId: string, options: { existing?: boolean } = {}): Promise<Peer> {
+async function signedIn(userId: string, options: { existing?: boolean; handle?: string } = {}): Promise<Peer> {
 	return (await signIn(userId, options)).peer;
 }
 
@@ -1756,15 +1757,16 @@ describe('seen is written at most once in SEEN_WRITE_GRANULARITY_MS', () => {
 		const recorded = Date.now() - 60_000;
 		await runInDurableObject(stub(), (instance) => { (instance as unknown as Runtime).store.settleSeen({ userId, at: recorded, now: Date.now() }); });
 		const sql = await recordSql();
-		const peer = await signedIn(userId, { existing: true });
+		const peer = await signedIn(userId, { existing: true, handle: `handle-${userId}` });
 		try {
 			const identityReads = sql.filter((entry) => /\bFROM identities WHERE user_id = \?/.test(entry.query) && entry.bindings[0] === userId);
 			// The identity row reads a sign-in did before seen (the identity
 			// lookup, and the avatar refresh check after the reply), the column
-			// now among the ones they read, and nothing else of `identities`.
+			// now among the ones they read, and nothing else of `identities` but
+			// the sign-in's activity (noteActive), at most once a day.
 			const row = 'SELECT user_id, user_handle, name, tier, created_ms, updated_ms, avatar_url, avatar_expires_ms, roles_json, ext_json, seen_ms FROM identities WHERE user_id = ? LIMIT 1';
 			expect(identityReads.map((entry) => entry.query)).toEqual([row, row]);
-			expect(sql.filter((entry) => /\bidentities\b/.test(entry.query)).length).toBe(2);
+			expect(sql.filter((entry) => /\bidentities\b/.test(entry.query) && !entry.query.startsWith('UPDATE identities SET updated_ms')).length).toBe(2);
 			expect(sql.some((entry) => /^SELECT seen_ms FROM identities WHERE/.test(entry.query))).toBe(false);
 			expect(await held(userId)).toEqual([recorded]);
 		} finally { peer.close(); }

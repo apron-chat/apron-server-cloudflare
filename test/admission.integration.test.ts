@@ -70,13 +70,16 @@ it('limits a native IPv6 /48 across its /56s', async () => {
 
 it('stops passing attempts to the Durable Object past the location limit', async () => {
 	// A stand-in for the location's limiter, so the suite's other attempts
-	// in this minute do not count against it.
-	let count = 0;
+	// in this minute do not count against it. It starts a few attempts short
+	// of the limit: a thousand real attempts in a row take as long as the
+	// test may on a slow runner, and the limit itself is the limiter's.
+	const before = 3;
+	let count = ADMISSION_BUDGET.objectRequestsPerLocationMinute - before;
 	const LOCATION_ATTEMPTS = { limit: async ({ key }: { key: string }) => {
 		expect(key).toBe('location');
 		return { success: ++count <= ADMISSION_BUDGET.objectRequestsPerLocationMinute };
 	} } as unknown as RateLimit;
-	for (let i = 0; i < ADMISSION_BUDGET.objectRequestsPerLocationMinute; i++) {
+	for (let i = 0; i < before; i++) {
 		const response = await fetchEntry(upgrade(`198.19.${Math.floor(i / 250)}.${(i % 250) + 1}`), withoutObject({ LOCATION_ATTEMPTS }));
 		expect(await response.text()).toContain('Demo capacity unavailable');
 	}

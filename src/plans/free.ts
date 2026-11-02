@@ -11,6 +11,10 @@ export const FREE_PLAN: Plan = Object.freeze({
 		cleanupSeconds: 3_600,
 		challengeTtlSeconds: 120,
 		sessionTtlSeconds: 30 * 24 * 60 * 60,
+		idleAccountSeconds: 30 * 24 * 60 * 60,
+		keptActiveAccounts: 100,
+		// As long as messages are kept (retentionSeconds).
+		retiredUserIdSeconds: 86_400,
 		maxFrameBytes: 16_384,
 		maxTextBytes: 4_096,
 		maxSnapshotBytes: 8_192,
@@ -201,6 +205,7 @@ export const FREE_PLAN: Plan = Object.freeze({
 		concurrent: 2,
 		readersPerText: 5,
 		readers: 10,
+		readersPerAddress: 3,
 	}),
 	features: Object.freeze({
 		activity: false,

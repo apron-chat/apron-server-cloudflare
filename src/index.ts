@@ -45,6 +45,7 @@ import {
 	EXHAUSTED_SHARE,
 	DEFAULT_JOINED_ROOMS,
 	MAX_PASSKEYS_PER_USER,
+	RETIRED_SWEEP_BATCH,
 	MAX_PUSH_URL_BYTES,
 	MAX_ROLES_PER_USER,
 	MAX_MUTE_SECONDS,
@@ -616,6 +617,13 @@ interface StoredDeviceToken {
 	usedMs?: number;
 }
 
+/**
+ * Since when every session carries its account's user handle (#60, deployed
+ * 2026-10-30): a session without one is from before, so only an account from
+ * before then may resume it, never one created later under a freed user_id.
+ */
+const SESSION_HANDLES_SINCE = Date.parse("2026-10-31T00:00:00Z");
+
 /** A user's last `/invite-purge`, under AUTH_RESET_KEY_PREFIX. */
 interface StoredAuthReset {
 	v: 1;
@@ -715,6 +723,7 @@ function liveRefused(response: Response, kind: LiveRefusal): Response {
 /** A guest connection this long without an application frame may make room on a full server (evictIdleGuest). */
 const GUEST_IDLE_MS = 10 * 60_000;
 
+
 /** The stored attack pause (Store.attackPause). */
 interface AttackPause {
 	day: string;
@@ -790,6 +799,9 @@ export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 	const limits = config.limits;
 	return {
 		retentionMs: limits.retentionSeconds * 1_000,
+		idleAccountMs: limits.idleAccountSeconds * 1_000,
+		keptActiveAccounts: limits.keptActiveAccounts,
+		retiredUserIdMs: limits.retiredUserIdSeconds * 1_000,
 		dedupTtlMs: limits.dedupTtlSeconds * 1_000,
 		cleanupIntervalMs: limits.cleanupSeconds * 1_000,
 		cleanupBatch: limits.cleanupBatch,
@@ -1658,9 +1670,11 @@ function liveAnswer(status: number, message: string, retryAfterMs?: number): Res
 }
 
 /**
- * Charges a live text request to its address's and its location's
- * connection-attempt limiters, as a WebSocket upgrade is, before it can
- * cost a Durable Object request. Null when it may go on.
+ * Charges a live text request to its address's and its IPv6 /48's attempt
+ * limiters, as a WebSocket upgrade is, and to its location's share: a
+ * write's to the connection attempts, a read's to the live reads
+ * (LIVE_READS), so a crowd reading a text leaves connections alone. All
+ * before it can cost a Durable Object request. Null when it may go on.
  */
 async function liveAdmission(request: Request, env: Env, read = false): Promise<{ refused: Response } | { ipKey: string }> {
 	const clientIp = extractClientIp(request.headers);
@@ -1669,11 +1683,14 @@ async function liveAdmission(request: Request, env: Env, read = false): Promise<
 	try {
 		// A read spends its location's live-read share, not its connection
 		// attempts, so a crowd reading a text leaves WebSocket admission alone.
-		const { CONNECTION_ATTEMPTS } = env;
+		const { CONNECTION_ATTEMPTS, PREFIX_ATTEMPTS } = env;
 		const location = read ? env.LIVE_READS : env.LOCATION_ATTEMPTS;
-		if (!CONNECTION_ATTEMPTS || !location) return { refused: liveAnswer(503, "Demo admission unavailable", UNAVAILABLE_RETRY_MS) };
+		if (!CONNECTION_ATTEMPTS || !PREFIX_ATTEMPTS || !location) return { refused: liveAnswer(503, "Demo admission unavailable", UNAVAILABLE_RETRY_MS) };
 		const window = ADMISSION_BUDGET.workerWindowSeconds * 1_000;
 		if (!(await CONNECTION_ATTEMPTS.limit({ key })).success) return { refused: liveAnswer(429, "Too many requests from your address", window) };
+		// One host may hold a whole IPv6 /48, 256 addresses of the per-address limit.
+		const prefixKey = await hashIpv6PrefixKey(clientIp);
+		if (prefixKey && !(await PREFIX_ATTEMPTS.limit({ key: prefixKey })).success) return { refused: liveAnswer(429, "Too many requests from your network", window) };
 		if (!(await location.limit({ key: "location" })).success) return { refused: liveAnswer(503, "Demo is busy; try again shortly", window) };
 	} catch {
 		return { refused: liveAnswer(503, "Demo admission unavailable", UNAVAILABLE_RETRY_MS) };
@@ -1979,8 +1996,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private attackPauseRecord?: AttackPause | null;
 	/** Addresses whose idle guest was evicted (closeIdleGuest), and when; in memory only. */
 	private readonly evicted = new Map<string, number>();
-	/** When the next dormant-account prune may run (pruneDormant): daily, or at the next full alarm while more remain. */
-	private dormantPruneAt = 0;
+	/** When the next idle-account prune may run (pruneIdle): hourly (the store runs it once a day), or soon while more remain. */
+	private idlePruneAt = 0;
+	/** The UTC day this instance last finished the daily part of the account upkeep (pruneIdle). */
+	private upkeepDay = "";
+	/** When batched maintenance left work behind (a full session sweep or prune batch) and should run again; in memory. */
+	private maintenanceAt: number | undefined;
 	private alarmTail: Promise<void> = Promise.resolve();
 	private alarmFailures = 0;
 	private alarmKnown = false;
@@ -2433,6 +2454,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// A full batch may have left more behind; sweep again on the next alarm.
 				const full = await this.sweepSessions(now);
 				this.nextSessionSweepAt = full ? 0 : now + SESSION_SWEEP_INTERVAL_MS;
+				// A quiet server's full alarms may be a day apart: come back soon for the rest.
+				if (full) this.maintenanceSoon(now);
 			} catch { /* retried on the next alarm */ }
 		}
 		try {
@@ -2440,7 +2463,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 				await this.expireBot(userId);
 			}
 		} catch { /* a bot not yet signed out is found again by the next sweep */ }
-		if (now >= this.dormantPruneAt) await this.pruneDormant(now);
+		if (this.maintenanceAt !== undefined && this.maintenanceAt <= now) this.maintenanceAt = undefined;
+		if (now >= this.idlePruneAt) await this.pruneIdle(now);
 		let result: ReturnType<Store["runCleanup"]> | undefined;
 		try {
 			result = this.store.runCleanup(now);
@@ -2462,7 +2486,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 				});
 				// A full batch may have left more behind: sweep again shortly rather
 				// than a cleanup interval later, so released bytes do not pile up.
-				if (this.store.cleanupUploads(now) >= UPLOAD_SWEEP_BATCH) {
+				const swept = this.store.cleanupUploads(now);
+				// Expired files and avatars go from R2 too, not only by its lifecycle rules.
+				this.deleteMedia(swept.deleted);
+				if (swept.count >= UPLOAD_SWEEP_BATCH) {
 					const next = now + 1_000;
 					this.uploadDeadline = this.uploadDeadline === undefined ? next : Math.min(this.uploadDeadline, next);
 				}
@@ -2523,6 +2550,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 		}
 		if (this.liveDeadlineAt !== undefined && this.liveDeadlineAt <= now) return true;
+		if (this.maintenanceAt !== undefined && this.maintenanceAt <= now) return true;
 		return this.store.cleanupDue(now);
 	}
 
@@ -3198,6 +3226,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (attachment.reads) this.flushReads(attachment, nowMs());
 		attachment.tier = "registered";
 		attachment.userId = finished.identity.user_id;
+		this.store.noteActive(finished.identity.user_id, nowMs());
 		attachment.name = finished.identity.name;
 		setAvatar(attachment, avatar);
 		attachment.roles = roles;
@@ -3307,22 +3336,32 @@ export class ApronDemoServer extends DurableObject<Env> {
 			throw expired;
 		}
 		const identity = this.store.getIdentity(session.userId);
+		const lifetimeMs = this.config.limits.sessionTtlSeconds * 1_000;
 		// A session carries the user handle it was issued under, which
-		// `/invite-purge` clears. One from before sessions carried it is
-		// checked against the purge's marker instead: an extra read that goes
-		// once all such sessions have expired, 30 days (the longest lifetime)
-		// after the change.
-		const reset = !identity ? false : session.handle !== undefined
+		// `/invite-purge` clears, and an account later created under a freed
+		// `user_id` never has. One from before sessions carried it is checked
+		// against the purge's marker instead, and only for an account from
+		// before then (SESSION_HANDLES_SINCE): a new account under a retired id
+		// never resumes it. Its handle is added below, so this goes once such
+		// sessions are resumed or expire.
+		const legacy = session.handle === undefined;
+		const reset = !identity ? false : !legacy
 			? session.handle !== identity.userHandle
-			: !!await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredAuthReset>(AUTH_RESET_KEY_PREFIX + identity.userId));
+			: (identity.createdMs ?? 0) >= SESSION_HANDLES_SINCE ||
+				!!await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredAuthReset>(AUTH_RESET_KEY_PREFIX + identity.userId));
 		if (!identity || reset) {
 			await this.store.withMeterAsync("foreground", { writes: 1 }, () => this.ctx.storage.delete(key));
 			throw expired;
 		}
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
 		this.assertRegisteredCapacity(socket, identity.userId);
-		const lifetimeMs = this.config.limits.sessionTtlSeconds * 1_000;
-		const renewed = { ...session, expiresMs: now + lifetimeMs };
+		const renewed = { ...session, expiresMs: now + lifetimeMs, ...(legacy && identity.userHandle ? { handle: identity.userHandle } : {}) };
+		if (legacy && identity.userHandle && session.expiresMs - now >= lifetimeMs / 2) {
+			// Carries its handle from now on, renewed or not.
+			try {
+				await this.store.withMeterAsync("foreground", { writes: 1 }, () => this.ctx.storage.put<StoredSession>(key, { ...session, handle: identity.userHandle }));
+			} catch { /* checked the old way next time */ }
+		}
 		if (session.expiresMs - now < lifetimeMs / 2) {
 			await this.store.withMeterAsync("foreground", { writes: 3 }, async () => {
 				// The index is advisory. Writing it first means a crash cannot leave a
@@ -3347,6 +3386,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.name = identity.name;
 		setAvatar(attachment, identity.avatar);
 		attachment.roles = identity.roles;
+		this.store.noteActive(identity.userId, nowMs());
 		setExt(attachment, identity.ext);
 		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
 		delete attachment.listedJoined;
@@ -3411,11 +3451,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const stored = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredDeviceToken>(key));
 			const invalid = { name: "denied", message: "This device token is not valid; get a new one with /invite-device add on a signed-in device" } satisfies ProtocolError;
 			if (!stored || stored.v !== 1 || typeof stored.userId !== "string" || typeof stored.device !== "string") throw invalid;
+			// A token unused as long as an account may idle is forgotten, as an
+			// idle account would be: from its last use, else when it was minted.
+			// One from before either was kept starts counting at its next use.
+			const now = nowMs();
+			const last = stored.usedMs ?? stored.createdMs;
+			if (last !== undefined && now - last > this.config.limits.idleAccountSeconds * 1_000) {
+				await this.forgetDeviceToken(stored.userId, key);
+				throw { name: "denied", message: "This device token expired after going unused; get a new one with /invite-device add on a signed-in device" } satisfies ProtocolError;
+			}
 			const identity = this.store.getIdentity(stored.userId);
 			if (!identity) throw invalid;
 			await this.signInKeyless(socket, attachment, request, identity, undefined, false, key);
 			// When it was last used, at most once a UTC day, for `/invite-device list`.
-			const now = nowMs();
 			if (stored.usedMs === undefined || utcDay(stored.usedMs) !== utcDay(now)) {
 				// Best effort: the sign-in has been answered, and a budget refusal only leaves the day unrecorded.
 				try {
@@ -3464,6 +3512,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.name = identity.name;
 		setAvatar(attachment, identity.avatar);
 		attachment.roles = identity.roles;
+		this.store.noteActive(identity.userId, nowMs());
 		setExt(attachment, identity.ext);
 		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
 		delete attachment.listedJoined;
@@ -3593,7 +3642,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return this.withSessionLock(() => this.issueSessionLocked(userId, origin, now, handle));
 	}
 
-	private async issueSessionLocked(userId: string, origin: string, now: number, handle: string | undefined): Promise<string> {
+	private async issueSessionLocked(userId: string, origin: string, now: number, given: string | undefined): Promise<string> {
+		// Every session carries its account's handle (a caller that has none at hand gets the stored one).
+		const handle = given ?? this.store.getIdentity(userId)?.userHandle;
 		const token = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 		const key = await sessionKey(token);
 		const expiresMs = now + this.config.limits.sessionTtlSeconds * 1_000;
@@ -6539,7 +6590,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await this.recoverLiveTexts();
 			if (path.startsWith(LIVE_READ_PATH)) {
 				const navigate = request.method === "GET" && request.headers.get("Sec-Fetch-Mode") === "navigate";
-				return this.liveRead(path.slice(LIVE_READ_PATH.length), request.method === "HEAD", navigate);
+				return this.liveRead(path.slice(LIVE_READ_PATH.length), request.method === "HEAD", navigate, trustedIpKey(request) ?? undefined);
 			}
 			if (request.method !== "PUT" || !request.body) return liveAnswer(405, "Method not allowed");
 			return await this.liveWrite(decodeURIComponent(path.slice(LIVE_WRITE_PATH.length)), request.body);
@@ -6562,14 +6613,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * A reader's `GET` of a live text's `url` (§4.8.3): what is kept, then
 	 * every chunk as it arrives, from memory, until the text ends. A text a
 	 * message announced whose write has not started yet has its readers wait
-	 * for it. Each text has at most `readersPerText` readers at once, and
-	 * every text together `readers`; an ended or unknown one is 404. A
+	 * for it. Each text has at most `readersPerText` readers at once, every
+	 * text together `readers`, and one address `readersPerAddress`; an ended
+	 * or unknown one is 404. A
 	 * browser that opens a terminal's `url` as a page (`navigate`) goes to the
 	 * terminal viewer instead, if there is one, with the `url` in
 	 * the fragment, which never reaches the viewer's host (§4.8.5); that is
 	 * no read.
 	 */
-	private liveRead(id: string, head: boolean, navigate = false): Response {
+	private liveRead(id: string, head: boolean, navigate = false, ipKey?: string): Response {
 		const { policy, viewerUrl, publicOrigin } = this.config.liveText!;
 		let session = this.liveSessions.get(id);
 		if (!session) {
@@ -6589,9 +6641,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (head) return new Response(null, { headers });
 		if (session.readers.size >= policy.readersPerText) return liveRefused(liveAnswer(429, "This live text has as many readers as it may have", 10_000), "readers");
 		let readers = 0;
-		for (const open of this.liveSessions.values()) readers += open.readers.size;
+		let fromAddress = 0;
+		for (const open of this.liveSessions.values()) {
+			readers += open.readers.size;
+			if (ipKey) fromAddress += open.readers.fromAddress(ipKey);
+		}
 		if (readers >= policy.readers) return liveRefused(liveAnswer(429, "Live text has as many readers as the server allows", 10_000), "readers");
-		return new Response(session.readers.open(session.buffer?.kept() ?? new Uint8Array(0)), { headers });
+		// This address's own limit: not marked, so the entry Worker never repeats it to others.
+		if (fromAddress >= policy.readersPerAddress) return liveAnswer(429, "Too many live text readers from your address", 10_000);
+		return new Response(session.readers.open(session.buffer?.kept() ?? new Uint8Array(0), ipKey), { headers });
 	}
 
 	/**
@@ -6978,33 +7036,80 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Removes registered accounts nobody came back to (Store.pruneDormantIdentities),
-	 * never one connected now, and revokes their tokens. The store runs it at
-	 * most once a UTC day (kept in storage); this instance asks again at the
-	 * next full alarm while a full batch suggests more, else in an hour.
+	 * The account upkeep, asked hourly: records that connected users are
+	 * active (a connection longer than idleAccountSeconds must not leave them
+	 * idle when it ends), removes idle accounts (Store.pruneIdleIdentities;
+	 * never one connected now, the store pacing its runs within a day) and
+	 * revokes their tokens. Once a UTC day per instance it frees retired
+	 * `user_id`s, only after revoking every token of each and its bot, so none
+	 * can sign in to a later account under the id (Store.dueRetiredUserIds),
+	 * and clears mutes that ran out (Store.clearExpiredMutes). It comes back
+	 * soon while a full batch left more.
 	 */
-	private async pruneDormant(now: number): Promise<void> {
+	private async pruneIdle(now: number): Promise<void> {
 		const connected = new Set<string>();
+		const signedIn = new Set<string>();
 		for (const peer of this.ctx.getWebSockets()) {
-			const userId = connectionAttachment(peer)?.userId;
-			if (userId) connected.add(userId);
+			const state = connectionAttachment(peer);
+			if (!state?.userId) continue;
+			connected.add(state.userId);
+			if (state.tier === "registered") signedIn.add(state.userId);
 		}
+		this.idlePruneAt = now + 3_600_000;
+		for (const userId of signedIn) this.store.noteActive(userId, now);
 		try {
-			// One synchronous transaction: nothing interleaves with it. Only user
-			// status keeps `seen` current, which tells a dormant account from a
-			// returning one: while it is off, the store restarts its wait.
-			const result = this.store.pruneDormantIdentities(now, connected, this.presenceMode());
-			this.dormantPruneAt = result.more ? now : now + 3_600_000;
-			if (result.pruned.length) await this.forgetTokens(result.pruned);
-		} catch {
-			this.dormantPruneAt = now + 3_600_000;
-		}
+			// One synchronous transaction: nothing interleaves with it.
+			const result = this.store.pruneIdleIdentities(now, connected);
+			if (result.more) {
+				this.idlePruneAt = now;
+				this.maintenanceSoon(now);
+			}
+			if (result.pruned.length) await this.forgetTokens(result.pruned, "maintenance");
+		} catch { /* retried in an hour; tokens are revoked again before an id is freed */ }
+		const day = utcDay(now);
+		if (this.upkeepDay === day) return;
+		let done = true;
+		try {
+			const due = this.store.dueRetiredUserIds(now);
+			if (due.length) {
+				// Revoke first: a failure leaves the ids retired, retried next time.
+				await this.forgetTokens([...due, ...due.filter((userId) => !isBotId(userId)).map((userId) => BOT_ID_PREFIX + userId)], "maintenance");
+				this.store.freeRetiredUserIds(due, now);
+			}
+			if (due.length >= RETIRED_SWEEP_BATCH) {
+				done = false;
+				this.idlePruneAt = now;
+				this.maintenanceSoon(now);
+			}
+		} catch { done = false; }
+		try { this.store.clearExpiredMutes(now); } catch { done = false; }
+		if (done) this.upkeepDay = day;
 	}
 
-	/** Revokes bot, invite and device tokens, so purged users cannot sign in again. */
-	private async forgetTokens(userIds: readonly string[]): Promise<void> {
+	/** Runs the alarm's maintenance again shortly: batched work left more behind. */
+	private maintenanceSoon(now: number): void {
+		const next = now + 1_000;
+		this.maintenanceAt = this.maintenanceAt === undefined ? next : Math.min(this.maintenanceAt, next);
+	}
+
+	/** Deletes one device token and its entry in its user's list (an expired one); never throws. */
+	private async forgetDeviceToken(userId: string, tokenKey: string): Promise<void> {
+		try {
+			await this.store.withMeterAsync("foreground", { reads: 1, writes: 2 }, async () => {
+				await this.ctx.storage.delete(tokenKey);
+				const devices = storedDevices(await this.ctx.storage.get<StoredDevices>(DEVICES_KEY_PREFIX + userId));
+				const kept = devices.filter((device) => device.tokenKey !== tokenKey);
+				if (kept.length === devices.length) return;
+				if (kept.length) await this.ctx.storage.put<StoredDevices>(DEVICES_KEY_PREFIX + userId, { v: 1, devices: kept });
+				else await this.ctx.storage.delete(DEVICES_KEY_PREFIX + userId);
+			});
+		} catch { /* the token is refused all the same */ }
+	}
+
+	/** Revokes bot, invite and device tokens, so purged users cannot sign in again; upkeep charges it as maintenance. */
+	private async forgetTokens(userIds: readonly string[], kind: "foreground" | "maintenance" = "foreground"): Promise<void> {
 		if (!userIds.length) return;
-		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 3 * userIds.length, writes: (5 + MAX_DEVICE_TOKENS) * userIds.length }, async () => {
+		await this.withSessionLock(() => this.store.withMeterAsync(kind, { reads: 3 * userIds.length, writes: (5 + MAX_DEVICE_TOKENS) * userIds.length }, async () => {
 			for (const userId of userIds) {
 				for (const pointer of [BOT_KEY_PREFIX + userId, INVITE_KEY_PREFIX + userId]) {
 					const stored = await this.ctx.storage.get<StoredBot>(pointer);
@@ -7387,7 +7492,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const now = nowMs();
 		await this.accountUsage.refresh(now, true);
 		const { budget, identities, databaseBytes, counts } = this.store.status(now);
-		const pruned = this.store.dormantPruned(now);
+		const pruned = this.store.idlePruned(now);
 		const limits = this.config.limits;
 		const count = (value: number) => Math.round(value).toLocaleString("en-US");
 		const share = (used: number, limit: number) => `${count(used)} / ${count(limit)} (${limit > 0 ? Math.round((100 * used) / limit) : 0}%)`;
@@ -7479,7 +7584,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			`- Posts: ${share(counts.posts, limits.globalPostsPerDay)}`,
 			`- Registrations: ${share(budget.registrations, limits.registrationsPerDay)}`,
 			...(this.config.push && PUSH_POLICY ? [`- Pushes: ${share(this.store.pushesToday(now), PUSH_POLICY.pushesPerDay)}`] : []),
-			`- Registered users: ${share(identities, limits.registeredIdentityCount)}${pruned.total ? ` (dormant accounts removed: ${count(pruned.today)} today, ${count(pruned.total)} in all)` : ""}`,
+			`- Registered users: ${share(identities, limits.registeredIdentityCount)}${pruned.total ? ` (idle accounts removed: ${count(pruned.today)} today, ${count(pruned.total)} in all)` : ""}`,
 			`- Open connections: ${share(this.ctx.getWebSockets().length, limits.openConnections)}`,
 			`- Database: ${databaseBytes === null ? "unknown" : mib(databaseBytes)} / ${mib(limits.databaseHardTargetBytes)}`,
 		);
@@ -8364,6 +8469,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 			if (this.uploadDeadline !== undefined) deadline = deadline === undefined ? this.uploadDeadline : Math.min(deadline, this.uploadDeadline);
 			if (this.liveDeadlineAt !== undefined) deadline = deadline === undefined ? this.liveDeadlineAt : Math.min(deadline, this.liveDeadlineAt);
+			if (this.maintenanceAt !== undefined) deadline = deadline === undefined ? this.maintenanceAt : Math.min(deadline, this.maintenanceAt);
 			if (Number.isFinite(this.presenceAlarmAt)) deadline = deadline === undefined ? this.presenceAlarmAt : Math.min(deadline, this.presenceAlarmAt);
 			await this.store.scheduleAlarm(deadline, nowMs());
 			this.alarmKnown = true;

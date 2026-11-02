@@ -63,7 +63,7 @@ for (const storedVersion of [UPGRADABLE_SCHEMA_VERSION - 1, SCHEMA_VERSION + 1])
 			expect(general).toEqual({ room_id: 'general', log_id: general.log_id, title: 'General', latest_log_id: general.log_id, history_log_id: general.log_id });
 			expect(store.listRooms()).toEqual([general]);
 			expect(store.getIdentity('user_before_reset')).toEqual({
-				userId: 'user_before_reset', name: 'Before', userHandle: 'handle', credentialCount: 1, rooms: ['general'],
+				userId: 'user_before_reset', name: 'Before', userHandle: 'handle', createdMs: expect.any(Number), credentialCount: 1, rooms: ['general'],
 				roles: ['admin', 'friend'],
 			});
 			expect(store.getIdentity('user_left_general')?.rooms).toEqual([]);

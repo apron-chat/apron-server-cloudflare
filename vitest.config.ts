@@ -17,6 +17,7 @@ export default defineConfig({
 				// test/admission.integration.test.ts covers it with a stand-in.
 				ratelimits: {
 					LOCATION_ATTEMPTS: { namespace_id: "73007", simple: { limit: 1_000_000, period: 60 } },
+					LIVE_READS: { namespace_id: "73009", simple: { limit: 1_000_000, period: 60 } },
 				},
 				bindings: {
 					GUEST_POSTING: "true",

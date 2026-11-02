@@ -74,8 +74,8 @@ async function startedUrl(socket: Parameters<typeof until>[0], messageId: string
 }
 
 /** A reader of a live url: what it got so far, and a wait for text in it. */
-async function readerOf(url: string) {
-	const response = await SELF.fetch(url, { headers: { 'CF-Connecting-IP': ip() } });
+async function readerOf(url: string, address = ip()) {
+	const response = await SELF.fetch(url, { headers: { 'CF-Connecting-IP': address } });
 	const decoder = new TextDecoder();
 	let text = '';
 	let done = false;
@@ -553,6 +553,31 @@ describe('live text end to end', () => {
 });
 
 describe('live text readers server-wide', () => {
+	it('limits the readers one address has at once, and never repeats that limit to others', async () => {
+		const userId = unique('office');
+		const peer = await signedIn(userId, ['mod']);
+		try {
+			const { frame } = await command(peer, 'start', '/embed-terminal');
+			const put = streamTo(frame.result.embeds[0].write_url);
+			await put.send('x');
+			const url = (await until(peer, fromUser(userId))).frame.params.body.embeds[0].url;
+			await withLivePolicy({ readersPerText: 10, readers: 400, readersPerAddress: 2 }, async () => {
+				const office = '198.51.100.250';
+				const readers = [await readerOf(url, office), await readerOf(url, office)];
+				for (const reader of readers) expect(reader.response.status).toBe(200);
+				const third = await SELF.fetch(url, { headers: { 'CF-Connecting-IP': office } });
+				expect([third.status, third.headers.get('Retry-After'), third.headers.get('Apron-Live-Refused')]).toEqual([429, '10', null]);
+				expect(await third.text()).toBe('Too many live text readers from your address\n');
+				// Another address still reads.
+				const other = await readerOf(url);
+				expect(other.response.status).toBe(200);
+				await put.end();
+				await put.response;
+				for (const reader of [...readers, other]) await reader.ended();
+			});
+		} finally { peer.close(); }
+	});
+
 	it('refuses a reader past the server-wide count, whatever text it reads', async () => {
 		const userId = unique('crowd');
 		const peer = await signedIn(userId, ['mod']);

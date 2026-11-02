@@ -23,6 +23,9 @@ export function validateAdmission(admission = ADMISSION_BUDGET, limits = DEFAULT
 	if (admission.objectRequestsPerLocationMinute < Math.max(admission.requestsPerIpv6PrefixMinute, limits.openConnections)) {
 		throw new Error('A location must be allowed a /48\'s attempts and a reconnect of every open connection');
 	}
+	if (!Number.isSafeInteger(admission.liveReadsPerLocationMinute) || admission.liveReadsPerLocationMinute < admission.requestsPerIpMinute) {
+		throw new Error('A location must be allowed at least one address\'s live text reads');
+	}
 	if (admission.edgeWindowSeconds !== 10 || admission.edgeBlockSeconds !== 10) {
 		throw new Error('Free WAF supports only 10-second counting and mitigation windows');
 	}

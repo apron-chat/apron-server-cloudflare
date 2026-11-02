@@ -334,6 +334,11 @@ function validateLimits(limits: Limits): void {
 		fail("socket queues exceed the demo memory allocation");
 	}
 
+	// Nothing logged may still name a user_id when it can be issued again.
+	if (limits.retiredUserIdSeconds < limits.retentionSeconds) fail("retiredUserIdSeconds must be at least retentionSeconds");
+	// An account idle past the dormancy age must also be past retention, and past a day.
+	if (limits.idleAccountSeconds < Math.max(86_400, limits.retentionSeconds)) fail("idleAccountSeconds must be at least a day and retentionSeconds");
+	if (limits.keptActiveAccounts > limits.registeredIdentityCount) fail("keptActiveAccounts must be at most registeredIdentityCount");
 	if (limits.registeredIdentityCount > budget.MAX_REGISTERED_IDENTITIES || limits.limiterRecordCap > budget.MAX_LIMITER_RECORDS) {
 		fail("identity or limiter records exceed the calibrated bound");
 	}
@@ -644,6 +649,9 @@ export function validateLiveTextPolicy(policy: LiveTextPolicy, limits: Pick<Limi
 	if (policy.concurrent > budget.MAX_LIVE_TEXTS) throw new ConfigError(`liveText.concurrent must be at most ${budget.MAX_LIVE_TEXTS}`);
 	if (policy.readersPerText > budget.MAX_LIVE_READERS_PER_TEXT) {
 		throw new ConfigError(`liveText.readersPerText must be at most ${budget.MAX_LIVE_READERS_PER_TEXT}`);
+	}
+	if (policy.readersPerAddress > policy.readersPerText) {
+		throw new ConfigError("liveText.readersPerAddress must be at most readersPerText");
 	}
 	if (policy.readers > budget.MAX_LIVE_READERS || policy.readers < policy.readersPerText) {
 		throw new ConfigError(`liveText.readers must be readersPerText to ${budget.MAX_LIVE_READERS}`);

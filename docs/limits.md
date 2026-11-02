@@ -225,6 +225,7 @@ Both ways share these limits:
 | Terminal output kept (`keep_last`) | the last 32 KB | the rest scrolls away |
 | Appended text kept, after its backspace and form feed edits | what keeps `body.text` within 4,096 bytes | the text ends with the first part |
 | Readers of one text at once | 200 | `GET` 429 with `Retry-After: 10`, marked `Apron-Live-Refused: readers` (an ended text's 404, `ended`) |
+| Readers from one address, every live text together, at once | 16 | `GET` 429 "Too many live text readers from your address" with `Retry-After: 10` (not marked: it is that address's own) |
 | Readers of every live text together, at once | 400 | `GET` 429 "Live text has as many readers as the server allows" with `Retry-After: 10`, marked `readers` |
 | Reads of live texts from one Cloudflare location | 1,000 a minute, apart from connection attempts | `GET` 503 "Demo is busy; try again shortly" with `Retry-After: 60` |
 
@@ -235,12 +236,12 @@ where guests may post. A terminal or append embed in any other command is
 `invalid_params`.
 
 The `PUT` and the `GET`s are plain HTTP, counted against the same per-address
-attempt limit as WebSocket connections (60 a minute). The `PUT` also counts
+and IPv6 /48 attempt limits as WebSocket connections (60 and 180 a minute). The `PUT` also counts
 against its location's connection attempts; the `GET`s have their own
 location share, so a crowd reading one text never holds up connections. A
 refusal marked `Apron-Live-Refused` is repeated by the entry Worker for
-other readers (until its `Retry-After`, or 10 minutes for `reads` and
-`ended`) without reaching the server: retrying sooner gets the same answer. The `PUT` is answered
+other readers (until its `Retry-After`, or 10 minutes for `ended`) without
+reaching the server: retrying sooner gets the same answer. The `PUT` is answered
 in plain text when the text has ended and its last snapshot is published:
 `200` "Done: the text is posted.", "Stopped at the 120-second limit; what was
 kept is posted.", "Stopped at the 2 MB limit; …", or "Stopped: the message
@@ -280,7 +281,7 @@ first.
 | Users with a reaction on one message ("reaction limit reached for this message") | 32 |
 | Emoji in one user's reaction set on one message | 8 |
 | Room mutes per user | 100 |
-| Registered accounts on the server | 50,000 (accounts never used again within 30 days of signing up are removed) |
+| Registered accounts on the server | 50,000 (an account inactive for 30 days is removed, unless among the 100 most recently active or holding a role; a device token unused for 30 days stops working) |
 
 A thread stops counting when everyone has left it or its history expires.
 
