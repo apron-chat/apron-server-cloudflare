@@ -6589,6 +6589,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (head) return new Response(null, { headers });
 		if (session.readers.served >= policy.readsPerText) return liveRefused(liveAnswer(403, "This live text has been read as often as it may be"), "reads");
 		if (session.readers.size >= policy.readersPerText) return liveRefused(liveAnswer(429, "This live text has as many readers as it may have", 10_000), "readers");
+		let readers = 0;
+		for (const open of this.liveSessions.values()) readers += open.readers.size;
+		if (readers >= policy.readers) return liveRefused(liveAnswer(429, "Live text has as many readers as the server allows", 10_000), "readers");
 		return new Response(session.readers.open(session.buffer?.kept() ?? new Uint8Array(0)), { headers });
 	}
 

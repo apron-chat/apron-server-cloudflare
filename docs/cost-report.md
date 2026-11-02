@@ -747,7 +747,12 @@ duration: at 30 seconds each the duration rows halve.
 
 Live text (`embed:terminal`, `embed:append`; [SPEC section 4.5](../SPEC.md#45-live-text),
 [configuration](configuration.md#live-text)) was measured on 2026-10-30 in two
-ways, both local, never against the deployed server:
+ways, both local, never against the deployed server. Since 2026-11-02 Paid
+allows 200 readers a text (400 across texts) and 1,000 reads a text, up from
+10 and 30: each read is one Worker and one object request, so a day of 100
+texts read to the limit is about 100,000 of each (under $0.10 past the
+inclusions), and readers are bounded by the object's memory instead
+(configuration). The figures below are at the earlier limits.
 
 - Rows and bytes: [`test/live-text-cost.integration.test.ts`](../test/live-text-cost.integration.test.ts),
   with the Workers Paid and Free policies, on native SQLite in the test

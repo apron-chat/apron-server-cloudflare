@@ -25,6 +25,16 @@ async function setConfig(change: Record<string, unknown>): Promise<void> {
 	});
 }
 
+/**
+ * Runs `fn` with the live text policy's `change` in force, then restores it:
+ * the plan's reader limits are too large to reach within a test's text.
+ */
+async function withLivePolicy<T>(change: Record<string, number>, fn: () => Promise<T>): Promise<T> {
+	const { liveText } = await runInDurableObject(stub(), (instance) => (instance as unknown as { config: { liveText: { policy: Record<string, number> } } }).config);
+	await setConfig({ liveText: { ...liveText, policy: { ...liveText.policy, ...change } } });
+	try { return await fn(); } finally { await setConfig({ liveText }); }
+}
+
 /** A registered user, signed in on a new connection, with `roles`. */
 async function signedIn(userId: string, roles: string[] = []): Promise<Peer> {
 	const token = await runInDurableObject(stub(), async (instance) => {
@@ -371,12 +381,14 @@ describe('live text end to end', () => {
 				?? (await until(writer, (f) => isMessage(id)(f) && f.params.body?.embeds?.[0]?.og !== undefined)).frame;
 			expect(resaved.params.body.embeds[0]).toMatchObject({ url, og: terminalOg(title) });
 			// Redirects aren't reads: more of them than readsPerText leave a reader its read.
-			const { readsPerText } = await runInDurableObject(stub(), (instance) => (instance as unknown as { config: { liveText: { policy: { readsPerText: number } } } }).config.liveText.policy);
-			for (let index = 0; index <= readsPerText; index++) {
-				const page = await navigate(url);
-				expect(page.status).toBe(302);
-				expect(page.headers.get('Location')).toBe(`https://terminal.apron.chat/#${new URLSearchParams({ stream: url })}`);
-			}
+			const readsPerText = 5;
+			await withLivePolicy({ readersPerText: 5, readsPerText }, async () => {
+				for (let index = 0; index <= readsPerText; index++) {
+					const page = await navigate(url);
+					expect(page.status).toBe(302);
+					expect(page.headers.get('Location')).toBe(`https://terminal.apron.chat/#${new URLSearchParams({ stream: url })}`);
+				}
+			});
 			// HEAD, even from a page, gets the text's headers.
 			const head = await navigate(url, 'HEAD');
 			expect([head.status, head.headers.get('Content-Type')]).toEqual([200, 'text/plain; charset=utf-8']);
@@ -500,11 +512,15 @@ describe('live text end to end', () => {
 				await put.send('x');
 				url = (await until(peer, fromUser(userId))).frame.params.body.embeds[0].url;
 				// Ten readers at once; the eleventh is refused.
-				const readers = await Promise.all(Array.from({ length: 10 }, () => readerOf(url)));
-				for (const reader of readers) expect(reader.response.status).toBe(200);
-				const extra = await SELF.fetch(url, { headers: { 'CF-Connecting-IP': ip() } });
-				expect(extra.status).toBe(429);
-				expect(extra.headers.get('Retry-After')).toBe('10');
+				const readers = await withLivePolicy({ readersPerText: 10, readers: 400 }, async () => {
+					const opened = await Promise.all(Array.from({ length: 10 }, () => readerOf(url)));
+					for (const reader of opened) expect(reader.response.status).toBe(200);
+					const extra = await SELF.fetch(url, { headers: { 'CF-Connecting-IP': ip() } });
+					expect(extra.status).toBe(429);
+					expect(extra.headers.get('Retry-After')).toBe('10');
+					expect(extra.headers.get('Apron-Live-Refused')).toBe('readers');
+					return opened;
+				});
 				await put.end();
 				await put.response;
 				for (const reader of readers) await reader.ended();
@@ -533,5 +549,31 @@ describe('live text end to end', () => {
 		expect((await SELF.fetch('https://demo.test/live/AAAAAAAAAAAAAAAAAAAAAA', { method: 'POST', body: 'x', headers: { 'CF-Connecting-IP': ip() } })).status).toBe(405);
 		const forged = 'https://demo.test/w/l.AAAAAAAAAAAAAAAAAAAAAA.2097152.9999999999.AAAA';
 		expect((await SELF.fetch(forged, { method: 'PUT', body: 'x', headers: { 'CF-Connecting-IP': ip() } })).status).toBe(403);
+	});
+});
+
+describe('live text readers server-wide', () => {
+	it('refuses a reader past the server-wide count, whatever text it reads', async () => {
+		const userId = unique('crowd');
+		const peer = await signedIn(userId, ['mod']);
+		try {
+			const { frame } = await command(peer, 'start', '/embed-terminal');
+			const put = streamTo(frame.result.embeds[0].write_url);
+			await put.send('x');
+			const url = (await until(peer, fromUser(userId))).frame.params.body.embeds[0].url;
+			await withLivePolicy({ readersPerText: 3, readers: 3 }, async () => {
+				const readers = await Promise.all(Array.from({ length: 3 }, () => readerOf(url)));
+				for (const reader of readers) expect(reader.response.status).toBe(200);
+				// The text's own limit and the server's are both 3 here; make the text's larger.
+				await withLivePolicy({ readersPerText: 10, readers: 3 }, async () => {
+					const extra = await SELF.fetch(url, { headers: { 'CF-Connecting-IP': ip() } });
+					expect(extra.status).toBe(429);
+					expect(await extra.text()).toBe('Live text has as many readers as the server allows\n');
+				});
+				await put.end();
+				await put.response;
+				for (const reader of readers) await reader.ended();
+			});
+		} finally { peer.close(); }
 	});
 });

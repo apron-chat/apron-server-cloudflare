@@ -642,6 +642,9 @@ export function validateLiveTextPolicy(policy: LiveTextPolicy, limits: Pick<Limi
 	if (policy.readersPerText > budget.MAX_LIVE_READERS_PER_TEXT || policy.readsPerText < policy.readersPerText || policy.readsPerText > budget.MAX_LIVE_READS_PER_TEXT) {
 		throw new ConfigError(`liveText.readersPerText must be at most ${budget.MAX_LIVE_READERS_PER_TEXT} and readsPerText, at most ${budget.MAX_LIVE_READS_PER_TEXT}`);
 	}
+	if (policy.readers > budget.MAX_LIVE_READERS || policy.readers < policy.readersPerText) {
+		throw new ConfigError(`liveText.readers must be readersPerText to ${budget.MAX_LIVE_READERS}`);
+	}
 	if (policy.startsPerDay > budget.MAX_LIVE_TEXTS_PER_DAY) throw new ConfigError(`liveText.startsPerDay must be at most ${budget.MAX_LIVE_TEXTS_PER_DAY}`);
 	if (policy.startsPerUser > policy.startsPerIp || policy.startsPerUserDay > policy.startsPerDay || policy.startsPerUser > policy.startsPerUserDay) {
 		throw new ConfigError("a user's live text allowance cannot exceed its IP's or the server's");

@@ -457,6 +457,13 @@ export interface LiveTextPolicy {
 	concurrent: number;
 	/** Readers one text may have at once. */
 	readersPerText: number;
+	/**
+	 * Readers every text together may have at once. Each holds a copy of what
+	 * its text kept when it joined (up to `terminalKeepBytes`) and its stream's
+	 * buffers in the object's memory; chunks are shared by all of a text's
+	 * readers, and one too far behind is dropped (MAX_READER_BACKLOG_BYTES).
+	 */
+	readers: number;
 	/** `GET`s of one text's `url` over its life, reconnects included; past it they are refused. */
 	readsPerText: number;
 }
@@ -578,11 +585,14 @@ export const MAX_LIVE_TEXT_MODERATOR_SECONDS = 300;
 export const MAX_TERMINAL_KEEP_BYTES = 32 * 1024;
 export const MAX_LIVE_INPUT_BYTES = 4 * 1024 * 1024;
 export const MAX_LIVE_TEXTS = 8;
-export const MAX_LIVE_READERS_PER_TEXT = 32;
+export const MAX_LIVE_READERS_PER_TEXT = 200;
+// About 100 KiB each at worst (a kept-text copy and stream buffers): 40 MB,
+// beside the 32 MiB of socket queues, in the object's 128 MB.
+export const MAX_LIVE_READERS = 400;
 export const MAX_LIVE_WRITE_WINDOW_SECONDS = 300;
 // Each text a day costs a write and its reads in Durable Object requests.
 export const MAX_LIVE_TEXTS_PER_DAY = 500;
-export const MAX_LIVE_READS_PER_TEXT = 100;
+export const MAX_LIVE_READS_PER_TEXT = 1_000;
 export const MAX_SQL_WRITES = DEFAULT_LIMITS.sqlWritesPerDay;
 export const MAX_SQL_READS = DEFAULT_LIMITS.sqlReadsPerDay;
 export const MAX_DATABASE_HIGH_WATER_BYTES = DEFAULT_LIMITS.databaseHighWaterBytes;

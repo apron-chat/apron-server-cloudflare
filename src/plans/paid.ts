@@ -262,8 +262,12 @@ export const PAID_PLAN: Plan = Object.freeze({
 		startsPerUserDay: 20,
 		startsPerDay: 100,
 		concurrent: 4,
-		readersPerText: 10,
-		readsPerText: 30,
+		// A text a crowd opens: readers cost the object memory, not money (each
+		// read is one billed request, however long it streams), so the bound is
+		// the server-wide one, at its ceiling.
+		readersPerText: 200,
+		readsPerText: 1_000,
+		readers: 400,
 	}),
 	features: Object.freeze({
 		// Typing costs about 5 frames a typing minute, inside the frame budget.

@@ -224,7 +224,8 @@ Both ways share these limits:
 | Bytes one `PUT` may send | 2 MB; an append, what it keeps (4,096 at most) | the text ends |
 | Terminal output kept (`keep_last`) | the last 32 KB | the rest scrolls away |
 | Appended text kept, after its backspace and form feed edits | what keeps `body.text` within 4,096 bytes | the text ends with the first part |
-| Readers of one text at once / over its life | 10 / 30 | `GET` 429 with `Retry-After: 10` / 403, marked `Apron-Live-Refused: readers` / `reads` (an ended text's 404, `ended`) |
+| Readers of one text at once / over its life | 200 / 1,000 | `GET` 429 with `Retry-After: 10` / 403, marked `Apron-Live-Refused: readers` / `reads` (an ended text's 404, `ended`) |
+| Readers of every live text together, at once | 400 | `GET` 429 "Live text has as many readers as the server allows" with `Retry-After: 10`, marked `readers` |
 | Reads of live texts from one Cloudflare location | 1,000 a minute, apart from connection attempts | `GET` 503 "Demo is busy; try again shortly" with `Retry-After: 60` |
 
 Every one of these limits is server-wide policy: `retry_after` refusals carry
