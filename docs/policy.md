@@ -281,8 +281,8 @@ within it:
   because viewers would otherwise load a URL the sender chose. Other `og`
   properties are dropped, and an `og` left empty is removed. The server
   never fetches embed URLs. Author-only edit, delete, restore, and move, except
-  that an `admin`, `mod` or `threader` may move anyone's message (into a thread or back
-  out) with a save that changes nothing but its room. `reply_to`
+  that an `admin`, `mod` or `threader` (for an owner's bot, `threader` alone) may
+  move anyone's message (into a thread or back out) with a save that changes nothing but its room. `reply_to`
   must name a retained message when set or changed; resubmitting
   an unchanged reference stays valid after its target expires, and expiration
   never invalidates an accepted snapshot. The server keeps references bare.
@@ -432,7 +432,8 @@ Every extension the frame advertises is defined in
   object of the keys that differ from their defaults: `write: false` for a
   guest while guests only read, `add_members` for an admin, or any
   registered user but a bot while `addmember` is on, and `move_any` for a
-  registered user with `admin`, `mod` or `threader` (not an owner's bot). It
+  registered user with `admin`, `mod` or `threader`, or an owner's bot with
+  `threader`. It
   is the server's: `me` ignores an `ext.permissions` it writes.
 - `ext:emoji`, once a custom emoji has been added, carries
   `server.params.ext.emoji.catalog_url`, the catalog's URL on the media

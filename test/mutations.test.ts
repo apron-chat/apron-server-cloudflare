@@ -735,6 +735,29 @@ it("lets a threader move anyone's messages in and out of threads, create threads
 	});
 });
 
+it("lets an owner's bot move anyone's messages with threader, but not with mod or admin", async () => {
+	await withStore("bot-threader", (store, clock) => {
+		store.createInvitedIdentity({ userId: "owner", name: "owner", now: clock.value, ipKey: "ip-test" });
+		store.registerBot({ ownerId: "owner", botId: "bot_owner", name: "Bot of owner", now: clock.value, ipKey: "ip-test" });
+		const posted = post(store, clock, "alice", "start", { body: { text: "start" } }).message!;
+		const threadId = thread(store, clock, "side");
+		const move = (requestId: string, roomId: string) => store.mutate(op(clock, "bot_owner", requestId, "message", { message_id: posted.message_id, room_id: roomId, body: posted.body }));
+
+		// `mod` is a label on an owner's bot.
+		store.setRole({ userId: "bot_owner", role: "mod", on: true, now: clock.value });
+		expect(errorCode(() => move("as-mod", threadId))).toBe("denied");
+
+		// `threader` moves anyone's message, still theirs, and changes nothing else.
+		store.setRole({ userId: "bot_owner", role: "threader", on: true, now: clock.value });
+		expect(move("in", threadId).message).toMatchObject({ room_id: threadId, prev_room_id: "general", from: { user_id: "alice" }, body: posted.body });
+		expect(errorCode(() => store.mutate(op(clock, "bot_owner", "edit", "message", { message_id: posted.message_id, room_id: "general", body: { text: "bot edit" } })))).toBe("denied");
+		expect(move("out", "general").message).toMatchObject({ room_id: "general", prev_room_id: threadId, from: { user_id: "alice" } });
+
+		store.setRole({ userId: "bot_owner", role: "threader", on: false, now: clock.value });
+		expect(errorCode(() => move("after", threadId))).toBe("denied");
+	});
+});
+
 it("lets every moderator role, the built-in admin included, move anyone's message with embeds, an upload and ext, thread to thread", async () => {
 	await withStore("move-any-content", (store, clock) => {
 		store.createInvitedIdentity({ userId: "mia", name: "mia", now: clock.value, ipKey: "ip-test" });

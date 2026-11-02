@@ -1122,6 +1122,12 @@ export const MAX_CARRIED_PASSKEYS = 100;
  */
 export const MODERATOR_ROLES: readonly string[] = ["admin", "mod", "threader"];
 /**
+ * The moderator roles an owner's bot (tier `bot`, `bot_…`) acts on: an admin
+ * may give one `threader` so a script re-threads conversations. Its owner
+ * holds its token, so `admin` and `mod` stay labels on it.
+ */
+export const BOT_MODERATOR_ROLES: readonly string[] = ["threader"];
+/**
  * Roles whose registered holders may create top-level rooms beside
  * `general`, and save their client fields (§4.2.4); only `admin` may save
  * `general`'s. Such rooms are
@@ -4760,9 +4766,16 @@ export class Store {
     return row && isPrivateRoomId(row.room_id) && !this.isMember(row.room_id, userId) ? null : row;
   }
 
-  /** Whether a registered user holds a moderator role (MODERATOR_ROLES), from the identity row. */
+  /**
+   * Whether a user may move others' messages, from the identity row: a
+   * registered user with a moderator role (MODERATOR_ROLES), or an owner's
+   * bot with one it acts on (BOT_MODERATOR_ROLES).
+   */
   private isModerator(userId: string): boolean {
-    return this.holdsRole(userId, MODERATOR_ROLES);
+    const identity = this.identityRow(userId);
+    if (!identity) return false;
+    const roles = identity.tier === "registered" ? MODERATOR_ROLES : identity.tier === "bot" ? BOT_MODERATOR_ROLES : [];
+    return parseRoles(identity.roles_json).some((role) => roles.includes(role));
   }
 
   /**
@@ -5267,7 +5280,7 @@ export class Store {
     if (messageIdParam !== undefined && typeof messageIdParam !== "string") throw new StoreError("invalid_params", "message_id must be a string");
     const current = messageIdParam === undefined ? null : this.visibleMessage(ensureText(messageIdParam, "message_id", 256), input.userId, floor);
     if (messageIdParam !== undefined && !current) throw new StoreError("invalid_params", "unknown or expired message");
-    // Someone else's message may only be moved, and only by a moderator (MODERATOR_ROLES).
+    // Someone else's message may only be moved, and only by a moderator (MODERATOR_ROLES, BOT_MODERATOR_ROLES).
     const moving = current !== null && current.author_id !== input.userId;
     if (moving && (current.room_id === roomId || !this.isModerator(input.userId))) throw new StoreError("denied", "Only the original author may edit this message");
     // Posting needs no join, except in a private room, which only its members see.

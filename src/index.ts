@@ -61,6 +61,7 @@ import {
 	JOINED_WAKE_ROLES,
 	EMOJI_ROLES,
 	MODERATOR_ROLES,
+	BOT_MODERATOR_ROLES,
 	clientUserExt,
 	mergeExt,
 	userExtFits,
@@ -4619,8 +4620,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * with `room_join` and a `user_id`, for an admin and, while `addmember` is
 	 * on, any other registered user not a bot (assertMayManage); `move_any`,
 	 * moving others' messages between rooms, for a registered user with a
-	 * moderator role (MODERATOR_ROLES, which the store checks) but an owner's
-	 * bot, whose identity tier is `bot`. Who may wake for scope `joined` is
+	 * moderator role (MODERATOR_ROLES, which the store checks), and for an
+	 * owner's bot, whose identity tier is `bot`, only with `threader`
+	 * (BOT_MODERATOR_ROLES). Who may wake for scope `joined` is
 	 * in the connection's `server` frame instead (wakesJoined). Adding one's
 	 * own bot, and adding others to a private room one is in, needs no
 	 * permission. Every `you` carries it,
@@ -4631,7 +4633,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (attachment.tier !== "registered") return this.config.guestPosting ? {} : { write: false };
 		return {
 			...(!hasRole(attachment, "bot") && (hasRole(attachment, "admin") || this.addMemberOn()) ? { add_members: true } : {}),
-			...(!isBotId(attachment.userId) && MODERATOR_ROLES.some((role) => hasRole(attachment, role)) ? { move_any: true } : {}),
+			...((isBotId(attachment.userId) ? BOT_MODERATOR_ROLES : MODERATOR_ROLES).some((role) => hasRole(attachment, role)) ? { move_any: true } : {}),
 		};
 	}
 
