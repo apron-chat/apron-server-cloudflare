@@ -32,6 +32,8 @@ export const FREE_PLAN: Plan = Object.freeze({
 		// About one charged written row a page: about 6,000 rows, a tenth of
 		// the foreground writes, and 5% of the frames, at most.
 		historyRequestsPerDay: 5_000,
+		// Four 50-record pages back from the head of each room.
+		guestHistoryDepth: 200,
 		concurrentHistoryPerConnection: 1,
 		anonymousPostsPerMinute: 5,
 		anonymousPostsPerDay: 100,

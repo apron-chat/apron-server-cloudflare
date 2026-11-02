@@ -187,6 +187,37 @@ it("rejects unknown rooms and returns a known empty thread's creation record", a
 	});
 });
 
+it("lets a guest page back guestHistoryDepth records from each room's head, and no further", async () => {
+	await withStore("guest-depth", { ...ROOMY, guestHistoryDepth: 4 }, (store, clock) => {
+		const created = store.mutate(op(clock, "guest-thread", "room_set", { parent_room_id: "general", title: "Look around" }));
+		const thread = String(created.result.room_id);
+		const logs: bigint[] = [];
+		for (let index = 0; index < 8; index += 1) {
+			logs.push(logId(store.mutate(messageInput(clock, `guest-${index}`, { body: { format: "plain", text: `entry-${index}` } }))));
+		}
+		store.mutate(messageInput(clock, "in-thread", { room_id: thread, body: { format: "plain", text: "in the thread" } }));
+		const head = logs[logs.length - 1];
+		const guest = { roomId: "general", limit: 2, now: clock.value, guest: true };
+		// The newest page, as a client without a checkpoint asks for it: `before` the head (§4.3.5).
+		const newest = store.history({ ...guest, before: head });
+		expect(messagesOf(newest).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(-2));
+		// A head the client captured a little earlier is still the newest page.
+		expect(messagesOf(store.history({ ...guest, before: logs[6] })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(5, 7));
+		// Scrolling back while fewer than four records lie past `before`.
+		expect(messagesOf(store.history({ ...guest, before: logs[4] })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(3, 5));
+		// Four past it is as far as a guest goes: older pages are for accounts.
+		const denied = (() => { try { store.history({ ...guest, before: logs[3] }); } catch (error) { return error as { code: string; message: string }; } })();
+		expect(denied).toMatchObject({ code: "denied", message: "Sign in to load older history" });
+		expect(messagesOf(store.history({ roomId: "general", limit: 2, now: clock.value, before: logs[3] })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(2, 4));
+		// A window bounded by both, and catching up with `after`, stay open.
+		expect(messagesOf(store.history({ ...guest, after: logs[0], before: logs[1] })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(0, 2));
+		// Every room is measured from its own head: a quiet thread opens however busy general is.
+		const threadPage = store.history({ roomId: thread, limit: 2, now: clock.value, guest: true, before: logs[0] });
+		expect(threadPage.rooms?.map((room) => room.room_id)).toEqual([thread]);
+		expect(errorCode(() => store.history({ ...guest, roomId: "missing", before: head }))).toBe("invalid_params");
+	});
+});
+
 it("advances a fully expired head past the room and keeps future IDs valid", async () => {
 	await withStore("expired-head", {}, (store, clock) => {
 		const logs = [0, 1, 2].map((index) => logId(store.mutate(messageInput(clock, `expired-${index}`, {

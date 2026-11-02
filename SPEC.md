@@ -716,7 +716,7 @@ Use the same scheduler for unauthenticated socket deadlines, batching deadlines 
 | Registration count/durable identity cap | Stop registration; existing logins and guest use continue if affordable |
 | Storage high-water | Stop growth, clean expired data using reserve, resume only when safe |
 | Socket/admission cap | Reject upgrade; existing sockets continue if affordable |
-| Daily foreground SQL or frames at 70% (degraded tier) | Refuse live text, uploads and older history with `retry_after` (`data.reason` `degraded`) until the reset; chat continues |
+| Daily foreground SQL or frames at 70% (degraded tier) | Refuse live text, uploads and older history (but not the newest page, `before` the head) with `retry_after` (`data.reason` `degraded`) until the reset; chat continues |
 | Global frame budget | Refuse new frames and admissions with `retry_after` until reset; keep open sockets |
 | Accounting overrun (an operation's rows exceeded its reservation) | Observe it: the operation finishes, the excess is charged, it is logged under the operation's name, and the day's first is told to the admins. Three of one foreground operation within an hour refuse that operation for an hour (`retry_after`, `data.reason` `operation_paused`) |
 | One overrun past a hundredth of a day's SQL ceilings | Open that operation's breaker at once, for an hour; the operation itself finishes |

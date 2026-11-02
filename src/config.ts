@@ -306,6 +306,9 @@ function validateLimits(limits: Limits): void {
 	if (limits.historyMaxResponseBytes > budget.MAX_HISTORY_RESPONSE_BYTES || limits.maxSnapshotBytes + 1024 > limits.historyMaxResponseBytes) {
 		fail("history response cap cannot contain one snapshot");
 	}
+	if (limits.guestHistoryDepth > budget.MAX_GUEST_HISTORY_DEPTH) {
+		fail("guest history depth exceeds the calibrated read bound");
+	}
 	if (limits.concurrentHistoryPerConnection > budget.MAX_CONCURRENT_HISTORY) {
 		fail("concurrent history is limited to one request per connection");
 	}

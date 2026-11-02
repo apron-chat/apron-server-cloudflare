@@ -1,5 +1,6 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it, vi } from 'vitest';
+import { DEFAULT_LIMITS } from '../src/budget';
 import { connect as open, exchange, greeting, request, until, type Frame, type Peer } from './helpers/socket';
 
 let nextIp = 1;
@@ -267,8 +268,20 @@ it('keeps scrolling back for accounts: a guest gets the newest page, charged to 
 		expect((await request(guest, 'auth', 'auth', { scheme: 'guest' })).result.you.user_id).toMatch(/^guest_/);
 		const newest = await request(guest, 'newest', 'history', { room_id: 'general', limit: 5 });
 		expect(newest.result).toBeTruthy();
-		const older = await request(guest, 'older', 'history', { room_id: 'general', before: '999999999999999' });
+		// The newest page as the web client asks for it, `before` the head (§4.3.5), and past it.
+		expect((await request(guest, 'at-head', 'history', { room_id: 'general', before: newest.result.latest_log_id, limit: 5 })).result).toBeTruthy();
+		expect((await request(guest, 'past-head', 'history', { room_id: 'general', before: '999999999999999' })).result).toBeTruthy();
+		// Scrolling back more than guestHistoryDepth records from the head is for accounts.
+		await runInDurableObject(stub(), (instance) => {
+			const runtime = instance as unknown as { store: { config: { guestHistoryDepth: number } } };
+			runtime.store.config.guestHistoryDepth = 1;
+		});
+		const older = await request(guest, 'older', 'history', { room_id: 'general', before: '1', limit: 1 });
 		expect(older.error).toMatchObject({ code: -32001, message: 'Sign in to load older history' });
+		await runInDurableObject(stub(), (instance) => {
+			const runtime = instance as unknown as { store: { config: { guestHistoryDepth: number } } };
+			runtime.store.config.guestHistoryDepth = DEFAULT_LIMITS.guestHistoryDepth;
+		});
 		// A guest's pages write no limiter row of its own.
 		const rows = await runInDurableObject(stub(), (_instance, state) =>
 			state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM principal_limits WHERE scope = 'history' AND principal_key LIKE 'user:guest_%'").one().count);

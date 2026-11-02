@@ -34,6 +34,13 @@ export interface Limits {
 	historyRequestsPerUserDay: number;
 	historyRequestsPerIpDay: number;
 	historyRequestsPerDay: number;
+	/**
+	 * How far back from a room's head, in records, a guest may scroll with
+	 * `before` alone, enough to look around every public room before signing
+	 * up; older pages are for accounts. Each such page reads up to this many
+	 * rows to measure it.
+	 */
+	guestHistoryDepth: number;
 	concurrentHistoryPerConnection: number;
 	anonymousPostsPerMinute: number;
 	anonymousPostsPerDay: number;
@@ -505,6 +512,7 @@ export const MAX_HISTORY_RESPONSE_BYTES = 256 * 1024;
 export const MAX_PENDING_FRAMES = 8;
 export const MAX_PENDING_BYTES = 128 * 1024;
 export const MAX_CONCURRENT_HISTORY = 1;
+export const MAX_GUEST_HISTORY_DEPTH = 1_000;
 export const MAX_CREDENTIAL_BYTES = 16 * 1024;
 export const MAX_CHALLENGE_BYTES = 16 * 1024;
 export const MAX_OPEN_CONNECTIONS = DEFAULT_LIMITS.openConnections;

@@ -751,7 +751,7 @@ and each lifting by itself (`src/store.ts`, `ApronDemoServer.currentTier`):
 | Tier | Fires on | Does | Lifts |
 | --- | --- | --- | --- |
 | open | | Everything works | |
-| degraded | Today's foreground SQL reads or writes, or frames, at `DEGRADE_SHARE` (70%) of their ceiling | Live text, uploads and older history (`history` with `before`) get `retry_after` (`data.reason` `degraded`); chat works | UTC midnight |
+| degraded | Today's foreground SQL reads or writes, or frames, at `DEGRADE_SHARE` (70%) of their ceiling | Live text, uploads and older history (`history` with `before`, except the newest page: `before` alone within a page of the head) get `retry_after` (`data.reason` `degraded`); chat works | UTC midnight |
 | exhausted | One of those at 99% (`EXHAUSTED_SHARE`; the ledger refuses work just short of 100%) | New work is refused with `retry_after` until the reset; open connections stay; admins' frames and `/status` still answer | UTC midnight |
 | account stop | The estimated overage past `BILL_CAP_DAY` ($5) today or `BILL_CAP_MONTH` ($25) this month (the account-usage stop; on Free, 90% of a daily allowance) | 503 and sockets closed once, as it starts | The day's or month's end |
 | paused (attack) | The attack pause (below): traffic burning $1 an hour or more and mostly refused | Everything refused with 503, every socket closed (admins' too), and the edge stop turned on for the hold | When the hold ends: 30 minutes, doubling with each pause that UTC day, at most 4 hours; at once with `ATTACK_PAUSE=false` |
@@ -824,8 +824,8 @@ wait until UTC midnight. Pings stay at 45
 seconds (150 to go stale): the runtime answers them without waking the
 object, which is not billed, and a dead socket must be found quickly, since
 it holds a slot, shows its user online, and keeps their mentions from
-being pushed until it goes stale. Guest visits cost less: a guest cannot scroll back (`before`
-alone), its history is charged to its address only, and a full server
+being pushed until it goes stale. Guest visits cost less: a guest scrolls back (`before`
+alone) at most `guestHistoryDepth` records from a room's head, its history is charged to its address only, and a full server
 closes the guest whose client said nobody attends it (`status` `idle`) for
 10 minutes or more, with no frame since (close code 4000), to admit a
 newcomer that passes every other check: never for a status probe, never a
@@ -937,7 +937,7 @@ The numeric rows are grouped by their unit and enforcement scope:
   `maxChallengeBytes`.
 - Parser, item, and concurrency counts: `maxJsonDepth`, `maxJsonNodes`,
   `maxNameCodePoints`, `maxEmbeds`,
-  `historyDefaultLimit`, `historyMaxLimit`, `concurrentHistoryPerConnection`,
+  `historyDefaultLimit`, `historyMaxLimit`, `guestHistoryDepth`, `concurrentHistoryPerConnection`,
   `registeredIdentityCount`, `openConnections`, `anonymousConnectionsPerIp`,
   `registeredConnectionsPerUser`, `connectionsPerIp`,
   `pendingFramesPerConnection`, `repeatedPolicyViolations`, `cleanupBatch`,
@@ -952,7 +952,12 @@ The numeric rows are grouped by their unit and enforcement scope:
   order, besides every connected member; each costs two indexed reads per
   listed room. A room with more says how many members it has in
   `member_count`. `guestNumberBlock` is how many guest numbers (`guest_<n>`) one
-  durable write reserves; see above.
+  durable write reserves; see above. `guestHistoryDepth` is how many records
+  back from a room's head a guest may page with `before` alone (at most
+  1,000; a page within a page of the head, the newest, is always open): enough
+  to look around every public room and thread before signing up, while
+  scrolling further back is for accounts. Measuring a page reads up to that
+  many rows.
 - Minute budgets: `historyRequestsPerUserMinute` and
   `historyRequestsPerIpMinute` (after bursts of `historyBurstPerUser` and
   `historyBurstPerIp`, which must drain within the hour cleanup keeps an idle
@@ -998,6 +1003,7 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `historyRequestsPerUserDay` | 3000 | 1000 |
 | `historyRequestsPerIpDay` | 30000 | 2000 |
 | `historyRequestsPerDay` | 400000 | 5000 |
+| `guestHistoryDepth` | 200 |  |
 | `concurrentHistoryPerConnection` | 1 |  |
 | `anonymousPostsPerMinute` | 5 |  |
 | `anonymousPostsPerDay` | 200 | 100 |
