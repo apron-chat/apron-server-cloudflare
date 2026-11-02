@@ -44,9 +44,9 @@ export function validateEdgeStop(edgeStop) {
  */
 export function renderBinding(namespaces, admission = ADMISSION_BUDGET, flood = undefined) {
 	validateAdmission(admission);
-	const ids = [namespaces?.attempts, namespaces?.prefix, namespaces?.location];
+	const ids = [namespaces?.attempts, namespaces?.prefix, namespaces?.location, namespaces?.live];
 	if (!ids.every((id) => typeof id === 'string' && /^[1-9]\d*$/.test(id)) || new Set(ids).size !== ids.length) {
-		throw new Error('The attempt limits need three distinct integer namespace IDs');
+		throw new Error('The attempt limits need four distinct integer namespace IDs');
 	}
 	let floodBinding = '';
 	if (flood) {
@@ -70,7 +70,11 @@ simple = { limit = ${admission.requestsPerIpv6PrefixMinute}, period = ${admissio
 [[ratelimits]]
 name = "LOCATION_ATTEMPTS"
 namespace_id = "${namespaces.location}"
-simple = { limit = ${admission.objectRequestsPerLocationMinute}, period = ${admission.workerWindowSeconds} }${floodBinding}
+simple = { limit = ${admission.objectRequestsPerLocationMinute}, period = ${admission.workerWindowSeconds} }
+[[ratelimits]]
+name = "LIVE_READS"
+namespace_id = "${namespaces.live}"
+simple = { limit = ${admission.liveReadsPerLocationMinute}, period = ${admission.workerWindowSeconds} }${floodBinding}
 ${end}`;
 }
 
@@ -262,13 +266,13 @@ function main() {
 		logSampleRate: ACCOUNT_USAGE_POLICY.logEstimate?.sampleRate,
 	});
 	const outputs = [];
-	for (const [file, attempts, floodNamespace, prefix, location] of [
-		['wrangler.toml', '73001', '73003', '73005', '73007'],
-		['wrangler.production.toml', '73002', '73004', '73006', '73008'],
+	for (const [file, attempts, floodNamespace, prefix, location, live] of [
+		['wrangler.toml', '73001', '73003', '73005', '73007', '73009'],
+		['wrangler.production.toml', '73002', '73004', '73006', '73008', '73010'],
 	]) {
 		const source = readFileSync(new URL(file, root), 'utf8');
 		const flood = PLAN.edgeStop ? { namespace: floodNamespace, edgeStop: PLAN.edgeStop } : undefined;
-		outputs.push([file, replaceBinding(source, renderBinding({ attempts, prefix, location }, ADMISSION_BUDGET, flood))]);
+		outputs.push([file, replaceBinding(source, renderBinding({ attempts, prefix, location, live }, ADMISSION_BUDGET, flood))]);
 	}
 	const hosts = [...production.matchAll(/pattern\s*=\s*"([a-z0-9.-]+)"\s*,\s*custom_domain\s*=\s*true/g)];
 	if (hosts.length !== 1) throw new Error('Expected exactly one production custom domain');

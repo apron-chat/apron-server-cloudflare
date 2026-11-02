@@ -150,6 +150,9 @@ export const PAID_PLAN: Plan = Object.freeze({
 		requestsPerIpv6PrefixMinute: 180,
 		// Twice a full reconnect of the 500 open connections, as on Free.
 		objectRequestsPerLocationMinute: 1_000,
+		// Live text readers have their own location share, so a crowd reading
+		// one text cannot crowd out connections there.
+		liveReadsPerLocationMinute: 1_000,
 	}),
 	// Monthly included usage divided by 31 days, rounded down, so stopping
 	// under the daily share every day keeps the month inside what $5 covers.
@@ -259,8 +262,13 @@ export const PAID_PLAN: Plan = Object.freeze({
 		startsPerUserDay: 20,
 		startsPerDay: 100,
 		concurrent: 4,
-		readersPerText: 10,
-		readsPerText: 30,
+		// A text a crowd opens: readers cost the object memory, not money (each
+		// read is one billed request, however long it streams), so the bound is
+		// readers at once, server-wide at its ceiling. Reads over a text's life
+		// are not counted: the attempt limiters bound reconnects, and a text
+		// streams 300 seconds at most.
+		readersPerText: 200,
+		readers: 400,
 	}),
 	features: Object.freeze({
 		// Typing costs about 5 frames a typing minute, inside the frame budget.

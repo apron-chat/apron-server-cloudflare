@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { ADMISSION_BUDGET, DEFAULT_LIMITS } from '../src/budget.ts';
 import { mediaHostname, relyingPartyId, renderBinding, renderEdgeRules, replaceBinding, validateAdmission, validateDeploymentConfiguration, validateEdgeStop } from './budget.mjs';
 
-const namespaces = { attempts: '123', prefix: '124', location: '125' };
+const namespaces = { attempts: '123', prefix: '124', location: '125', live: '126' };
 
 test('changed admission limits propagate to both Worker and optional edge policy', () => {
 	const requests = ADMISSION_BUDGET.requestsPerIpMinute + 5;
@@ -23,7 +23,7 @@ test('generation is idempotent and preserves unrelated Wrangler settings', () =>
 	const original = 'name = "example"\n[vars]\nADMISSION_OFF = "true"\n';
 	const initial = replaceBinding(original, renderBinding(namespaces));
 	assert.equal(replaceBinding(initial, renderBinding(namespaces)), initial);
-	const changed = replaceBinding(initial, renderBinding({ attempts: '456', prefix: '457', location: '458' }));
+	const changed = replaceBinding(initial, renderBinding({ attempts: '456', prefix: '457', location: '458', live: '459' }));
 	assert.ok(changed.startsWith(original));
 	assert.match(changed, /namespace_id = "456"/);
 	assert.doesNotMatch(changed, /namespace_id = "123"/);

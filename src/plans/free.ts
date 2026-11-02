@@ -119,6 +119,9 @@ export const FREE_PLAN: Plan = Object.freeze({
 		// under the flood trip spends a sixth of the Durable Object requests
 		// it could before.
 		objectRequestsPerLocationMinute: 200,
+		// A text's readers at a location, reconnects included, apart from
+		// connection attempts.
+		liveReadsPerLocationMinute: 200,
 		workerWindowSeconds: 60,
 		// Free WAF supports only 10-second windows; this optional rule is zone-wide.
 		edgeRequestsPerIpWindow: 10,
@@ -195,7 +198,7 @@ export const FREE_PLAN: Plan = Object.freeze({
 		startsPerDay: 30,
 		concurrent: 2,
 		readersPerText: 5,
-		readsPerText: 15,
+		readers: 10,
 	}),
 	features: Object.freeze({
 		activity: false,

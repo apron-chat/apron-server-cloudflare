@@ -747,7 +747,13 @@ duration: at 30 seconds each the duration rows halve.
 
 Live text (`embed:terminal`, `embed:append`; [SPEC section 4.5](../SPEC.md#45-live-text),
 [configuration](configuration.md#live-text)) was measured on 2026-10-30 in two
-ways, both local, never against the deployed server:
+ways, both local, never against the deployed server. Since 2026-11-02 Paid
+allows 200 readers a text at once (400 across texts), up from 10, and no
+longer counts reads over a text's life (30 before). Each read is one
+Worker and one object request, so even 100,000 reads a day are under $0.10
+past the inclusions; readers are bounded by the object's memory instead
+(configuration), reconnects by the attempt limiters. The figures below are
+at the earlier limits.
 
 - Rows and bytes: [`test/live-text-cost.integration.test.ts`](../test/live-text-cost.integration.test.ts),
   with the Workers Paid and Free policies, on native SQLite in the test
@@ -862,7 +868,7 @@ then blocks the hostname, so the included usage is still never billed past;
 that stop is how the plan guarantee is kept (section 7), and live text moves
 it three days earlier only in that all-out case. The 120- and 300-second
 limits are the owner's maximums and are kept; the counts above are the
-levers, and halving `readsPerText` or `startsPerDay` halves live text's share.
+levers, and halving `startsPerDay` halves live text's share.
 
 On Workers Free (off by default; `LIVE_TEXT=true`), at its limits a day is
 30 texts × (1 + 15 + 1) = 510 Durable Object requests of 100,000, about 1,100

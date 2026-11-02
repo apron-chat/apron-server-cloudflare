@@ -90,6 +90,10 @@ name = "LOCATION_ATTEMPTS"
 namespace_id = "73008"
 simple = { limit = 1000, period = 60 }
 [[ratelimits]]
+name = "LIVE_READS"
+namespace_id = "73010"
+simple = { limit = 1000, period = 60 }
+[[ratelimits]]
 name = "FLOOD_WATCH"
 namespace_id = "73004"
 simple = { limit = 600, period = 60 }

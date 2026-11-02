@@ -1,7 +1,7 @@
 import { env } from 'cloudflare:test';
-import { expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { ADMISSION_BUDGET } from '../src/budget';
-import { fetchEntry, resetObjectFull } from '../src/index';
+import { fetchEntry, resetLiveRefusals, resetObjectFull } from '../src/index';
 
 function upgrade(ip: string, path = '/') {
 	return new Request(`https://demo.test${path}`, {
@@ -141,4 +141,45 @@ it('refuses at the entry Worker while the object says it is paused, for at most 
 	expect(await second.json()).toEqual({ error: 'Server paused: unusual traffic; try later' });
 	expect(calls).toBe(1);
 	resetObjectFull();
+});
+
+describe('live text reads at the entry Worker', () => {
+	const id = 'BBBBBBBBBBBBBBBBBBBBBB';
+	const read = (address: string, init: RequestInit = {}) => new Request(`https://demo.test/live/${id}`, { ...init, headers: { 'CF-Connecting-IP': address, ...(init.headers as Record<string, string> ?? {}) } });
+	const counter = () => { const calls: string[] = []; return { calls, limit: async ({ key }: { key: string }) => { calls.push(key); return { success: true }; } }; };
+
+	it('spend their own location share, never the connection attempts there', async () => {
+		resetLiveRefusals();
+		const connections = counter();
+		const reads = counter();
+		const demo = { getByName: () => ({ fetch: async () => new Response('text', { status: 200 }) }) };
+		const response = await fetchEntry(read('198.18.20.1'), { ...env, DEMO: demo, LOCATION_ATTEMPTS: connections, LIVE_READS: reads } as never);
+		expect(response.status).toBe(200);
+		expect(reads.calls).toEqual(['location']);
+		expect(connections.calls).toEqual([]);
+	});
+
+	it('repeat a refusal the object made for a full or finished text, without asking it or spending attempts', async () => {
+		for (const [kind, status] of [['readers', 429], ['ended', 404]] as const) {
+			resetLiveRefusals();
+			let objectCalls = 0;
+			const reads = counter();
+			const demo = { getByName: () => ({ fetch: async () => {
+				objectCalls += 1;
+				return new Response('refused\n', { status, headers: { 'Apron-Live-Refused': kind, ...(kind === 'readers' ? { 'Retry-After': '10' } : {}) } });
+			} }) };
+			const bindings = { ...env, DEMO: demo, LIVE_READS: reads } as never;
+			expect((await fetchEntry(read('198.18.20.2'), bindings)).status).toBe(status);
+			const again = await fetchEntry(read('198.18.20.3'), bindings);
+			expect(again.status).toBe(status);
+			expect(again.headers.get('Apron-Live-Refused')).toBe(kind);
+			if (kind === 'readers') expect(Number(again.headers.get('Retry-After'))).toBeLessThanOrEqual(10);
+			expect(objectCalls).toBe(1);
+			expect(reads.calls).toHaveLength(1);
+			// A browser opening the url as a page is no read: only `ended` applies to it.
+			await fetchEntry(read('198.18.20.4', { headers: { 'Sec-Fetch-Mode': 'navigate' } }), bindings);
+			expect(objectCalls).toBe(kind === 'ended' ? 1 : 2);
+		}
+		resetLiveRefusals();
+	});
 });

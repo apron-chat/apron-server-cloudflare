@@ -6,6 +6,7 @@ declare global {
 		CONNECTION_ATTEMPTS: RateLimit;
 		PREFIX_ATTEMPTS: RateLimit;
 		LOCATION_ATTEMPTS: RateLimit;
+		LIVE_READS?: RateLimit;
 		FLOOD_WATCH?: RateLimit;
 		/** Workers Analytics Engine dataset for exact counters (src/metrics.ts); optional. */
 		METRICS?: AnalyticsEngineDataset;
@@ -47,6 +48,7 @@ declare global {
 			CONNECTION_ATTEMPTS: RateLimit;
 			PREFIX_ATTEMPTS: RateLimit;
 			LOCATION_ATTEMPTS: RateLimit;
+			LIVE_READS?: RateLimit;
 			FLOOD_WATCH?: RateLimit;
 			/** Workers Analytics Engine dataset for exact counters (src/metrics.ts); optional. */
 			METRICS?: AnalyticsEngineDataset;

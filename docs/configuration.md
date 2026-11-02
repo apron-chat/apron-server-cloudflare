@@ -71,16 +71,18 @@ limiter namespaces; additional deployments must use distinct namespace IDs too.
 Two more limits, counted only for attempts their address's own limit let
 through, stop the per-address limit from being multiplied:
 
-- `requestsPerIpv6PrefixMinute` (60; Free: 30) is shared by a native IPv6 /48 at one
+- `requestsPerIpv6PrefixMinute` (180; Free: 30) is shared by a native IPv6 /48 at one
   location, across all its /56s. One host can hold a whole /48, which would
   otherwise give it 256 address limits. Past it, attempts get 429.
-- `objectRequestsPerLocationMinute` (200) is shared by every address at one
-  location: at most that many attempts a minute pass from there to the Durable
-  Object. Each costs a Durable Object request, the allowance Paid includes the
-  fewest of (32,000 a day), while a rejection before it costs only a Worker
-  request (320,000 a day). It is twice a reconnect of every open connection,
-  so a deploy or a wake does not reach it. Past it, attempts there get 503 with
-  `Retry-After: 60`, while other locations go on.
+- `objectRequestsPerLocationMinute` (1,000; Free: 200) is shared by every
+  address at one location: at most that many attempts a minute pass from
+  there to the Durable Object. Each costs a Durable Object request, while a
+  rejection before it costs only a Worker request. It is twice a reconnect of
+  every open connection, so a deploy or a wake does not reach it. Past it,
+  attempts there get 503 with `Retry-After: 60`, while other locations go on.
+- `liveReadsPerLocationMinute` (1,000; Free: 200) is the same for reads of
+  live text `url`s, kept apart (the `LIVE_READS` binding), so a crowd reading
+  one text never spends the connection attempts at its location.
 
 Generation refuses a per-address limit below `connectionAdmissionsPerIpMinute`,
 a /48 limit below the per-address one, and a location limit below the /48's
@@ -399,8 +401,17 @@ turns it off and on without a deploy (texts already streaming finish).
 | `startsPerUserDay` | 20 | 10 | `startsPerDay` |
 | `startsPerDay` (server-wide) | 100 | 30 | 500 |
 | `concurrent` (open texts server-wide, unused `write_url`s included) | 4 | 2 | 8 |
-| `readersPerText` (at once) | 10 | 5 | 32 |
-| `readsPerText` (over a text's life, reconnects included) | 30 | 15 | 100 |
+| `readersPerText` (at once) | 200 | 5 | 200 |
+| `readers` (at once, every text together) | 400 | 10 | 400 |
+
+A reader costs one billed request however long it streams, and its bytes
+nothing; what bounds readers is the object's memory, so only readers at
+once are limited. Reads over a text's life are not counted: the attempt
+limiters bound reconnects, and a text streams 300 seconds at most. Chunks are shared by
+all of a text's readers, and one more than 256 KiB behind is dropped, so
+each reader holds about a copy of what its text kept when it joined and its
+stream's buffers: about 100 KiB at worst, 40 MB at `readers`' ceiling,
+beside the 32 MiB of socket queues in the object's 128 MB.
 
 One user has one live text open at a time, an unused `write_url` included,
 and each start also counts as a post. The starts are `live` rows in
@@ -410,7 +421,12 @@ server's), like any other limiter; the open texts are one `_meta` row
 was evicted or redeployed while it streamed is ended, with its embed
 removed, by the next instance's first live text work or by the alarm at its
 time limit plus 30 seconds. Readers and the writer are counted against the
-Worker's per-address and per-location attempt limiters, as connections are.
+Worker's per-address attempt limiter, as connections are; the writer against
+the per-location one too, and readers against their own location share
+(`liveReadsPerLocationMinute`, the `LIVE_READS` binding), so a crowd reading
+a text cannot spend the connection attempts there. The entry Worker repeats
+a read refusal the object marked (`Apron-Live-Refused`: a text full of
+readers, read out, or ended) without asking it again or spending attempts.
 The time limit is a one-shot timer that exists only while its `PUT` does;
 nothing else of live text keeps the object awake.
 
