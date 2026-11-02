@@ -114,7 +114,7 @@ it("defers exhausted cleanup to the next UTC day and schedules one reset alarm",
 		// Leave only the control reserve available. Reconstructing Store makes
 		// the native wake path load this durable budget rather than a stale cache.
 		sql.exec(
-			"UPDATE resource_budgets SET reads_reserved = 1_080, writes_reserved = 1_080, maintenance_reads = 1_080, maintenance_writes = 1_080 WHERE day = ?",
+			"UPDATE resource_budgets SET reads_reserved = 1_068, writes_reserved = 1_068, maintenance_reads = 1_068, maintenance_writes = 1_068 WHERE day = ?",
 			day,
 		);
 		sql.exec("UPDATE maintenance SET next_cleanup_ms = ?, cleanup_cutoff_ms = NULL, cleanup_cursor = NULL WHERE id = 1", clock.value);
@@ -131,15 +131,15 @@ it("defers exhausted cleanup to the next UTC day and schedules one reset alarm",
 		expectRetryAfter(failure);
 		const maintenance = rowValue<{ next_cleanup_ms: number }>(state, "SELECT next_cleanup_ms FROM maintenance WHERE id = 1");
 		expect(maintenance.next_cleanup_ms).toBe(resetAt);
-		expect(store.budget(clock.value).maintenance_reads).toBe(1_082);
-		expect(store.budget(clock.value).maintenance_writes).toBe(1_082);
+		expect(store.budget(clock.value).maintenance_reads).toBe(1_076);
+		expect(store.budget(clock.value).maintenance_writes).toBe(1_076);
 
 		await store.scheduleAlarm(undefined, clock.value);
 		expect(await state.storage.getAlarm()).toBe(resetAt);
 		// Ordinary scheduling no longer fits in the tiny budget, so it uses its
-		// six-row control reservation exactly once and does not spin at +1s.
-		expect(store.budget(clock.value).maintenance_reads).toBe(1_088);
-		expect(store.budget(clock.value).maintenance_writes).toBe(1_088);
+		// 24-row control reservation exactly once and does not spin at +1s.
+		expect(store.budget(clock.value).maintenance_reads).toBe(1_100);
+		expect(store.budget(clock.value).maintenance_writes).toBe(1_100);
 		await store.scheduleAlarm(undefined, clock.value);
 		expect(await state.storage.getAlarm()).toBe(resetAt);
 	});

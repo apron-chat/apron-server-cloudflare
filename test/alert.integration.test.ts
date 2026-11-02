@@ -6,7 +6,7 @@ type Runtime = { store: Store };
 
 afterEach(() => { vi.restoreAllMocks(); });
 
-it('tells the admins when an overrun closes accounting, and a status probe then says why and when to retry', async () => {
+it('tells the admins of the day\'s first overrun, and the server stays open', async () => {
 	const stub = env.DEMO.getByName('overrun-alert');
 	const warn = vi.spyOn(console, 'warn');
 	const bossId = 'overrun_boss';
@@ -27,26 +27,25 @@ it('tells the admins when an overrun closes accounting, and a status probe then 
 				);
 			}
 		});
-		// Reserving nothing for a read of many rooms overruns: accounting closes for good.
-		expect(() => store.withMeter('foreground', { reads: 0, writes: 0 }, () => store.listRooms(now), now)).toThrow('storage cost exceeded its reservation');
-		expect(store.accountingStatus().unsafe).toBe(true);
+		// Reserving nothing for a read of many rooms overruns: observed, charged, and the work finishes.
+		expect(store.withMeter('foreground', { reads: 0, writes: 0 }, () => store.listRooms(now), now)).toHaveLength(101);
+		expect(store.accountingStatus().unsafe).toBe(false);
 	});
 
-	// The alert runs once the failed operation has unwound, past closed accounting.
+	// The notice runs once the operation has unwound.
 	await vi.waitFor(() => expect(warn.mock.calls.map(([line]) => String(line))).toContainEqual(expect.stringContaining('"admins_notified"')));
 	await runInDurableObject(stub, (instance, state) => {
-		expect((instance as unknown as Runtime).store.accountingStatus().unsafe).toBe(true);
+		expect((instance as unknown as Runtime).store.accountingStatus().unsafe).toBe(false);
 		const [latest] = state.storage.sql.exec<{ record_json: string }>("SELECT record_json FROM records WHERE room_id = 'general' ORDER BY log_id DESC LIMIT 1").toArray();
 		const record = JSON.parse(latest.record_json) as { from: { user_id: string }; body: { text: string; mentions: string[] } };
 		expect(record.from.user_id).toBe('admin');
 		expect(record.body.mentions).toEqual([bossId]);
-		expect(record.body.text).toMatch(new RegExp(`^\\*\\*Storage accounting closed\\.\\*\\*[^]*\\n\\n@${bossId}$`));
+		expect(record.body.text).toMatch(new RegExp(`^\\*\\*Storage overrun: \`\\w+\`\\*\\* used more rows than it reserved[^]*the server stays open[^]*\\n\\n@${bossId}$`));
 	});
 
 	const probe = await stub.fetch(new Request('https://demo.test/?apron_connection_status=1', { headers: { Origin: 'http://localhost:5173', 'X-Apron-Trusted-IP-Key': 'probe-key-for-the-test' } }));
-	expect(probe.status).toBe(503);
-	expect(probe.headers.get('retry-after')).toBe('60');
-	expect(await probe.json()).toEqual({ error: 'Server closed: storage accounting stopped after a cost overrun, until an operator reopens it' });
+	expect(probe.status).toBe(200);
+	expect(await probe.json()).toEqual({ available: true });
 });
 
 it('answers a status probe with storage unavailable while budget writes fail, and opens again once they work', async () => {
@@ -113,7 +112,8 @@ it('counts alarms and accounting changes in METRICS, and logs why accounting clo
 		delete runtime.runtimeEnv.METRICS;
 		return writeDataPoint.mock.calls.map(([point]) => (point as { blobs: string[] }).blobs);
 	});
-	expect(points).toEqual([['alarm', 'light'], ['alarm', 'full'], ['accounting', 'uncertain'], ['accounting', 'recovered']]);
+	// The accounting change carries what failed: the log line saying so may be sampled away.
+	expect(points).toEqual([['alarm', 'light'], ['alarm', 'full'], ['accounting', 'uncertain', expect.stringContaining('injected budget reservation failure')], ['accounting', 'recovered']]);
 	const closed = error.mock.calls.map(([line]) => String(line)).filter((line) => line.includes('"accounting_closed"')).map((line) => JSON.parse(line));
 	expect(closed).toEqual([{ event: 'accounting_closed', kind: 'uncertain', message: expect.stringContaining('injected budget reservation failure') }]);
 });

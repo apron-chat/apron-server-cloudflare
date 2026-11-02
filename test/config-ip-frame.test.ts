@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { ConfigError, DEFAULT_LIMITS, isAllowedOrigin, loadConfig } from '../src/config';
-import { ACCOUNT_USAGE_POLICY, DEFAULT_FEATURES, PLAN } from '../src/budget';
+import { ACCOUNT_USAGE_POLICY, DEFAULT_FEATURES, MAX_GLOBAL_FRAMES_PER_MINUTE, PLAN } from '../src/budget';
+import { PRICES } from '../src/pricing';
 import { FREE_PLAN } from '../src/plans/free';
 import { PAID_PLAN } from '../src/plans/paid';
 import { canonicalizeIp, extractClientIp, hashIpKey, hashIpv6PrefixKey } from '../src/ip';
@@ -166,9 +167,9 @@ describe('configuration policy boundaries', () => {
 		expect(() => config({}, { historyMaxResponseBytes: DEFAULT_LIMITS.maxSnapshotBytes + 511 })).toThrow(ConfigError);
 		expect(() => config({}, { maintenanceReadsPerDay: 8 })).toThrow(ConfigError);
 		expect(() => config({}, { maintenanceWritesPerDay: 8 })).toThrow(ConfigError);
-		expect(() => config({}, { maintenanceReadsPerDay: 519 })).toThrow(ConfigError);
-		expect(() => config({}, { maintenanceWritesPerDay: 519 })).toThrow(ConfigError);
-		expect(config({}, { maintenanceReadsPerDay: 520, maintenanceWritesPerDay: 520 }).limits.maintenanceReadsPerDay).toBe(520);
+		expect(() => config({}, { maintenanceReadsPerDay: 543 })).toThrow(ConfigError);
+		expect(() => config({}, { maintenanceWritesPerDay: 543 })).toThrow(ConfigError);
+		expect(config({}, { maintenanceReadsPerDay: 544, maintenanceWritesPerDay: 544 }).limits.maintenanceReadsPerDay).toBe(544);
 	});
 
 	it('bounds reaction sets so a moved message fits one history response', () => {
@@ -220,8 +221,6 @@ describe('configuration policy boundaries', () => {
 		for (const plan of new Set([FREE_PLAN, PLAN])) expect(() => config({}, plan.limits)).not.toThrow();
 		for (const plan of [FREE_PLAN, PAID_PLAN]) {
 			const { daily, storedBytes } = plan.account;
-			expect(plan.limits.sqlWritesPerDay).toBeLessThan(daily.sqlRowsWritten * ACCOUNT_USAGE_POLICY.stopRatio);
-			expect(plan.limits.sqlReadsPerDay).toBeLessThan(daily.sqlRowsRead * ACCOUNT_USAGE_POLICY.stopRatio);
 			expect(plan.limits.databaseHardTargetBytes).toBeLessThan(storedBytes * ACCOUNT_USAGE_POLICY.stopRatio);
 			// Worst-case billed Durable Object requests: processed frames and pings
 			// from every open connection every pingSeconds, at 20 incoming WebSocket
@@ -230,7 +229,28 @@ describe('configuration policy boundaries', () => {
 			// Live text, where on: each text's write and its reads, at the daily cap.
 			const live = plan.liveText && plan.features.liveText ? plan.liveText.startsPerDay * (1 + plan.liveText.readsPerText) : 0;
 			const requests = messages / 20 + plan.limits.connectionAdmissionsPerDay + 24 + live;
-			expect(requests).toBeLessThan(daily.durableObjectRequests * ACCOUNT_USAGE_POLICY.stopRatio);
+			const cap = plan.account.billCap;
+			if (!cap) {
+				// A plan that fails closed fits each day inside its daily allowances.
+				expect(plan.limits.sqlWritesPerDay).toBeLessThan(daily.sqlRowsWritten * ACCOUNT_USAGE_POLICY.stopRatio);
+				expect(plan.limits.sqlReadsPerDay).toBeLessThan(daily.sqlRowsRead * ACCOUNT_USAGE_POLICY.stopRatio);
+				expect(requests).toBeLessThan(daily.durableObjectRequests * ACCOUNT_USAGE_POLICY.stopRatio);
+				continue;
+			}
+			// A plan that bills past its inclusions keeps a day at every ceiling,
+			// priced as if the month's inclusions were spent, under the month's
+			// bill cap; the day's cap stops such a day before it ends. Early in
+			// a month the inclusions cover it. SQL rows, object requests (each
+			// also an entry Worker request with its CPU) and one object awake
+			// all day.
+			const price = (field: 'sqlRowsWritten' | 'sqlRowsRead' | 'durableObjectRequests' | 'workerRequests' | 'workerCpuMs' | 'durableObjectDurationGbSeconds', used: number) => used * PRICES[field].usd / PRICES[field].unit;
+			const worstDay = price('sqlRowsWritten', plan.limits.sqlWritesPerDay) + price('sqlRowsRead', plan.limits.sqlReadsPerDay)
+				+ price('durableObjectRequests', requests) + price('workerRequests', plan.limits.connectionAdmissionsPerDay) + price('workerCpuMs', plan.limits.connectionAdmissionsPerDay * 2)
+				+ price('durableObjectDurationGbSeconds', 86_400 * 0.125);
+			expect(worstDay).toBeLessThan(cap.monthUsd);
+			// And a front-page day (about 2 million rows written by connections
+			// alone) fits the ceilings with room to spare.
+			expect(plan.limits.foregroundWritesPerDay).toBeGreaterThan(2 * 2_000_000);
 		}
 	});
 
@@ -246,7 +266,7 @@ describe('configuration policy boundaries', () => {
 	});
 	it('bounds the server-wide frame minute', () => {
 		expect(() => config({}, { globalFramesPerMinute: DEFAULT_LIMITS.framesPerIpMinute - 1 })).toThrow(ConfigError);
-		expect(() => config({}, { globalFramesPerMinute: 1_001 })).toThrow(ConfigError);
+		expect(() => config({}, { globalFramesPerMinute: MAX_GLOBAL_FRAMES_PER_MINUTE + 1 })).toThrow(ConfigError);
 		expect(config().limits.frameLease).toBe(10);
 		expect(() => config({}, { frameLease: 21 })).toThrow(ConfigError);
 		expect(() => config({}, { frameLease: 20, framesPerIpMinute: 39 })).toThrow(ConfigError);
@@ -284,17 +304,38 @@ describe('configuration policy boundaries', () => {
 	});
 
 	it('requires the timeout for connections that never pinged to outlast the ping timeout', () => {
+		const timeout = DEFAULT_LIMITS.pingTimeoutSeconds;
 		expect(config().limits.unpingedTimeoutSeconds).toBe(900);
-		expect(config({ LIMIT_UNPINGED_TIMEOUT_SECONDS: '150' }).limits.unpingedTimeoutSeconds).toBe(150);
-		expect(() => config({ LIMIT_UNPINGED_TIMEOUT_SECONDS: '149' })).toThrow(ConfigError);
+		expect(config({ LIMIT_UNPINGED_TIMEOUT_SECONDS: String(timeout) }).limits.unpingedTimeoutSeconds).toBe(timeout);
+		expect(() => config({ LIMIT_UNPINGED_TIMEOUT_SECONDS: String(timeout - 1) })).toThrow(ConfigError);
 	});
 
-	it('reads ACCOUNTING_RECOVERY as an optional short value', () => {
-		expect(config().accountingRecovery).toBeUndefined();
-		expect(config({ ACCOUNTING_RECOVERY: '' }).accountingRecovery).toBeUndefined();
-		expect(config({ ACCOUNTING_RECOVERY: '2026-10-29' }).accountingRecovery).toBe('2026-10-29');
-		expect(() => config({ ACCOUNTING_RECOVERY: 'has space' })).toThrow(ConfigError);
-		expect(() => config({ ACCOUNTING_RECOVERY: 'x'.repeat(65) })).toThrow(ConfigError);
+
+	it('reads the bill cap in dollars from BILL_CAP_DAY and BILL_CAP_MONTH', () => {
+		const cap = ACCOUNT_USAGE_POLICY.billCap;
+		if (!cap) return expect(config({ BILL_CAP_DAY: '1' }).billCap).toBeNull();
+		expect(config().billCap).toEqual({ dayUsd: cap.dayUsd, monthUsd: cap.monthUsd });
+		expect(config({ BILL_CAP_DAY: '0', BILL_CAP_MONTH: '12.50' }).billCap).toEqual({ dayUsd: 0, monthUsd: 12.5 });
+		for (const value of ['-1', 'five', 'Infinity']) expect(() => config({ BILL_CAP_MONTH: value })).toThrow(ConfigError);
+	});
+
+	it('bounds queued frames by count and by bytes, holding at least two of the largest', () => {
+		const { maxFrameBytes } = DEFAULT_LIMITS;
+		expect(() => config({}, { pendingFramesPerConnection: 8, pendingBytesPerConnection: 4 * maxFrameBytes, openConnections: 100 })).not.toThrow();
+		expect(() => config({}, { pendingBytesPerConnection: 2 * maxFrameBytes - 1, openConnections: 100 })).toThrow(ConfigError);
+		// Every connection's queue together within the memory allocation.
+		expect(DEFAULT_LIMITS.openConnections * DEFAULT_LIMITS.pendingBytesPerConnection).toBeLessThanOrEqual(32 * 1024 * 1024);
+	});
+
+	it('lets an address sign in every connection it may hold', () => {
+		expect(DEFAULT_LIMITS.authAttemptsPerIpMinute).toBeGreaterThanOrEqual(DEFAULT_LIMITS.connectionsPerIp);
+		expect(() => config({}, { authAttemptsPerIpMinute: DEFAULT_LIMITS.connectionsPerIp - 1 })).toThrow(ConfigError);
+	});
+
+	it('turns the attack pause off only with ATTACK_PAUSE=false', () => {
+		expect(config().attackPause).toBe(true);
+		expect(config({ ATTACK_PAUSE: 'false' }).attackPause).toBe(false);
+		expect(() => config({ ATTACK_PAUSE: 'off' })).toThrow(ConfigError);
 	});
 
 	it('requires exact origins and bounds the browser display name', () => {

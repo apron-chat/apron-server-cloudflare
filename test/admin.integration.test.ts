@@ -144,24 +144,57 @@ it('/kick removes a registered user or a guest from the room of the command', as
 	} finally { admin.close(); bob.close(); guest.close(); }
 });
 
-it('/status sends the caller the Cloudflare usage and the demo budgets', async () => {
+it('/status leads with the server state, then the Cloudflare usage and the demo budgets', async () => {
 	const admin = await signedInAdmin();
 	try {
 		const status = await command(admin, 'status', '/status');
 		expect(status.frame.result).toEqual({});
 		const text: string = status.notice!.params.body.text;
 		expect(status.notice!.params.body.format).toBe('markdown');
+		// Why the server refuses work comes first: here, nothing.
+		expect(text).toMatch(/^\*\*State: open\*\*\n- Storage overruns today: 0 \(each charged and logged\)/);
+		expect(text).toMatch(/^- Throttles tripped in the last 24 hours: (none|.+)$/m);
 		// Tests configure no account analytics, so only the object's budgets show.
 		expect(text).toContain('no usage sample');
 		// Lists, not GFM tables, so strict CommonMark clients render it.
 		expect(text).not.toContain('|');
-		expect(text).toMatch(new RegExp(`^- SQL rows written: [\\d,]+ / ${DEFAULT_LIMITS.sqlWritesPerDay.toLocaleString('en-US')} \\(\\d+%\\)$`, 'm'));
-		expect(text).toMatch(/^- Registered users: [\d,]+ \/ 10,000/m);
+		// Each against the ceiling that refuses work, and from the counter that does.
+		expect(text).toMatch(new RegExp(`^- Foreground SQL rows written: [\\d,]+ / ${DEFAULT_LIMITS.foregroundWritesPerDay.toLocaleString('en-US')} \\(\\d+%\\)$`, 'm'));
+		expect(text).toMatch(new RegExp(`^- Frames: [1-9][\\d,]* / ${DEFAULT_LIMITS.processedFramesPerDay.toLocaleString('en-US')} \\(\\d+%\\)$`, 'm'));
+		expect(text).toMatch(new RegExp(`^- Registered users: [\\d,]+ / ${DEFAULT_LIMITS.registeredIdentityCount.toLocaleString('en-US')}`, 'm'));
 		expect(text).toMatch(/^- Database: /m);
 		// Nor the budget guard's zone and token: a plan that relies on the guard says it can't work.
 		if (ACCOUNT_USAGE_POLICY.monthly) expect(text).toMatch(/^\*\*Edge stop\*\* \(`apron_budget_stop`\): \*\*not working\*\*: `ZONE_ID` or `EDGE_STOP_TOKEN` is not set/m);
 		else expect(text).not.toContain('Edge stop');
 	} finally { admin.close(); }
+});
+
+it.runIf(ACCOUNT_USAGE_POLICY.billCap)('/status estimates the bill against the bill cap', async () => {
+	const now = Date.now();
+	const day = new Date(now).toISOString().slice(0, 10);
+	const zero = { workerRequests: 0, durableObjectRequests: 0, durableObjectDurationGbSeconds: 0, sqlRowsRead: 0, sqlRowsWritten: 0 };
+	// 30 million Worker requests this month, one million of them today: $6 of overage, $0.30 of it today.
+	const snapshot = {
+		day, sampledAt: now, ...zero, workerRequests: 1_000_000, storedBytes: 0, workerCpuMs: 0, logBytes: 0,
+		month: { month: day.slice(0, 7), ...zero, workerRequests: 30_000_000, workerCpuMs: 0, logBytes: 0 },
+		stop: false, exceeded: [],
+	};
+	await runInDurableObject(stub(), (instance) => {
+		(instance as unknown as { accountUsage: { restore(snapshot: unknown): void } }).accountUsage.restore(snapshot);
+	});
+	const admin = await signedInAdmin();
+	try {
+		const text: string = (await command(admin, 'status', '/status')).notice!.params.body.text;
+		expect(text).toContain('stops past $5 of overage in a UTC day or $25 in a month');
+		expect(text).toContain(`- Estimated bill for ${day.slice(0, 7)}: $11 ($5 plan + $6 overage: Worker requests $6)`);
+		expect(text).toContain('- Overage added today: $0.30 of $5');
+		expect(text).toContain('- Overage this month: $6 of $25');
+	} finally {
+		admin.close();
+		await runInDurableObject(stub(), (instance) => {
+			(instance as unknown as { accountUsage: { restore(snapshot: unknown): void } }).accountUsage.restore(null);
+		});
+	}
 });
 
 it('/rename moves a registered user, their passkey, rooms and admin status to a new user_id', async () => {

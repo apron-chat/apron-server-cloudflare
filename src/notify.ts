@@ -1,12 +1,43 @@
 /**
- * Something the operators must hear of at once: the edge stop turned on (by
- * the budget guard, or by the flood trip, `exceeded: ["flood"]`), or storage
- * accounting closed by an overrun, which stays closed until an operator
- * clears it. New kinds of notice, and new ways to tell one, join here.
+ * Something the operators must hear of at once, posted publicly in
+ * `general` with every admin mentioned: the server changing tier (open,
+ * degraded, exhausted, account stop), an operation's breaker opening
+ * or closing, the day's first storage overrun, and the edge stop turning on
+ * (by the budget guard, or by the flood trip, `exceeded: ["flood"]`) or off.
+ * New kinds of notice, and new ways to tell one, join here.
  */
 export type TriggerNotice =
 	| { kind: "edge_stop"; exceeded: readonly string[] }
-	| { kind: "accounting_overrun" };
+	| { kind: "edge_stop_lifted" }
+	| { kind: "tier"; from: ServerTier; to: ServerTier; reasons: readonly string[] }
+	| { kind: "breaker"; operation: string; open: boolean; until?: number }
+	| { kind: "overrun"; operation: string; message: string; users: readonly string[]; essential?: boolean }
+	| { kind: "burn"; summary: string; paused?: false }
+	| { kind: "edge_failed"; outcome: string };
+
+/**
+ * How far the server refuses work, least to most (docs/configuration.md,
+ * Server tiers). Each lifts by itself: degraded and exhausted at UTC
+ * midnight, account stop at the day's or month's end, paused when its hold
+ * ends.
+ */
+export type ServerTier = "open" | "degraded" | "exhausted" | "account_stop" | "paused";
+
+export const TIER_LABEL: Record<ServerTier, string> = {
+	open: "open",
+	degraded: "degraded",
+	exhausted: "exhausted",
+	account_stop: "account stop",
+	paused: "paused (attack)",
+};
+
+const TIER_MEANING: Record<ServerTier, string> = {
+	open: "Everything works.",
+	degraded: "Live text, uploads and older history are off until UTC midnight; chat works.",
+	exhausted: "The day's storage or frame budget is spent: new work is refused until UTC midnight; open connections stay.",
+	account_stop: "Cloudflare usage reached its stop line: the server is closed until the day's or month's end.",
+	paused: "Traffic is costing money fast and is mostly refused, which looks like an attack: every connection is closed and Cloudflare's edge blocks the server until the hold ends. It lifts by itself; a repeat the same UTC day holds twice as long.",
+};
 
 /**
  * The ways a notice can be told, each optional. `admins` posts the text in
@@ -17,6 +48,10 @@ export interface NoticeChannels {
 	admins?: (text: string) => Promise<unknown>;
 }
 
+function utcTime(ms: number): string {
+	return `${new Date(ms).toISOString().slice(11, 16)} UTC`;
+}
+
 /** What a notice says, as the admins read it. */
 export function noticeText(notice: TriggerNotice): string {
 	switch (notice.kind) {
@@ -24,8 +59,26 @@ export function noticeText(notice: TriggerNotice): string {
 			const reached = notice.exceeded.length ? notice.exceeded.join(", ") : "an allowance";
 			return `**Budget stop is on.** Cloudflare's edge now blocks the server, reached: ${reached}. The budget guard lifts it once usage is back under every allowance.`;
 		}
-		case "accounting_overrun":
-			return "**Storage accounting closed.** An operation used more rows than it reserved, so the server refuses all work until an operator deploys a new `ACCOUNTING_RECOVERY` value.";
+		case "edge_stop_lifted":
+			return "**Budget stop is off.** Cloudflare's edge lets requests through again.";
+		case "tier": {
+			const why = notice.reasons.length ? ` ${notice.reasons.join("; ")}.` : "";
+			return `**Server tier: ${TIER_LABEL[notice.to]}** (was ${TIER_LABEL[notice.from]}).${why} ${TIER_MEANING[notice.to]}`;
+		}
+		case "breaker":
+			return notice.open
+				? `**Paused one action: \`${notice.operation}\`.** It used more storage than it reserved, three times within an hour or once by far, so it is refused until ${notice.until ? utcTime(notice.until) : "an hour from now"}; everything else works.`
+				: `**Resumed \`${notice.operation}\`.** Its pause ended.`;
+		case "overrun": {
+			const who = notice.users.length ? ` for ${notice.users.map((user) => `\`${user}\``).join(", ")}` : "";
+			if (notice.essential) return `**Storage overrun: \`${notice.operation}\`** used more rows than it reserved${who} (${notice.message}). It is essential (signing in, rooms or history), so it keeps working with no pause; its rows are charged. Told at most once an hour while it goes on: its estimate needs fixing.`;
+			return `**Storage overrun: \`${notice.operation}\`** used more rows than it reserved${who} (${notice.message}). It finished and its rows are charged; the server stays open. Further overruns today are counted without a notice.`;
+		}
+		case "edge_failed":
+			return `**The attack pause could not turn on the edge stop** (${notice.outcome}). The server still refuses everything, but each request still reaches the Worker and is billed: check \`ZONE_ID\`, \`EDGE_STOP_TOKEN\` and the \`apron_budget_stop\` rule.`;
+		case "burn":
+			if (notice.paused === false) return `**Attack-like traffic** (${notice.summary}, priced as if past the plan's inclusions). \`ATTACK_PAUSE\` is \`false\`, so the server stays open; the bill cap still stops it if the overage passes the cap. Told at most once an hour.`;
+			return `**Heavy traffic** (${notice.summary}, priced as if past the plan's inclusions). Most of it is admitted, so it looks like a busy day, not an attack: the server stays open, and the bill cap stops it if the overage passes the cap. Told at most once an hour.`;
 	}
 }
 

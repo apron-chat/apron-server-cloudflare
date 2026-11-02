@@ -1,5 +1,5 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import { ACCOUNT_USAGE_POLICY, DEFAULT_LIMITS } from '../src/budget';
 import type { AccountUsageMonitor, AccountUsageSnapshot } from '../src/account-usage';
 import { Store } from '../src/store';
@@ -19,7 +19,7 @@ async function open(stub: DurableObjectStub) {
 }
 
 /**
- * A snapshot that stops the server: past a monthly allowance and sampled on
+ * A snapshot that stops the server: past the month's bill cap ($26 of CPU) and sampled on
  * the 1st, when the plan has monthly allowances, so it must hold on every
  * later day of the month (on the 1st itself it is today's); past a daily
  * one, sampled today, otherwise.
@@ -36,7 +36,7 @@ function stopSnapshot(now = Date.now()): AccountUsageSnapshot {
 		...zero,
 		month: {
 			month: today.slice(0, 7),
-			workerRequests: 0, workerCpuMs: monthly.workerCpuMs, durableObjectRequests: 0, durableObjectDurationGbSeconds: 0,
+			workerRequests: 0, workerCpuMs: monthly.workerCpuMs + 1_300_000_000, durableObjectRequests: 0, durableObjectDurationGbSeconds: 0,
 			sqlRowsRead: 0, sqlRowsWritten: 0, logBytes: 0,
 		},
 		stop: true,
@@ -67,8 +67,8 @@ it('closes a socket on its next frame once the account-usage stop holds', async 
 	expect(await peer.closed).toEqual({ code: 1013, reason: 'Demo account capacity reached; try later' });
 });
 
-it('closes every socket when the daily frame budget runs out', async () => {
-	const stub = env.DEMO.getByName('frame-budget-close-all');
+it('keeps every socket open when the daily frame budget runs out, refusing requests until the reset and telling the user once', async () => {
+	const stub = env.DEMO.getByName('frame-budget-keep-open');
 	const first = await open(stub);
 	const second = await open(stub);
 	await runInDurableObject(stub, (_instance, state) => {
@@ -78,8 +78,35 @@ it('closes every socket when the daily frame budget runs out', async () => {
 		);
 		expect(cursor.rowsWritten).toBe(1);
 	});
+	const replies: Array<{ id?: string; error?: { code: number; message: string; data?: { retry_after?: number } } }> = [];
+	const notices: string[] = [];
+	first.socket.addEventListener('message', (event) => {
+		const frame = JSON.parse(String(event.data));
+		if (typeof frame.id === 'string' && frame.id.startsWith('over-budget')) replies.push(frame);
+		if (frame.method === 'message' && frame.params?.from?.user_id === '~private' && !String(frame.params.body.text).startsWith('Welcome')) notices.push(frame.params.body.text);
+	});
+	const warn = vi.spyOn(console, 'warn');
 	first.socket.send(JSON.stringify({ id: 'over-budget', method: 'auth', params: { scheme: 'guest' } }));
-	const reason = 'Demo capacity reached; try after daily reset';
-	expect(await first.closed).toEqual({ code: 1013, reason });
-	expect(await second.closed).toEqual({ code: 1013, reason });
+	await vi.waitFor(() => expect(replies).toHaveLength(1));
+	expect(replies[0].error?.message).toBe('Daily frame budget exhausted');
+	expect(replies[0].error?.data?.retry_after).toBeGreaterThan(0);
+	// A refusal that lasts is explained once, in a ~private notice asking for a report.
+	await vi.waitFor(() => expect(notices).toHaveLength(1));
+	expect(notices[0]).toMatch(/^\*\*Daily frame budget exhausted\.\*\* The server has handled as many messages and requests as it allows in a day\. This lasts until/);
+	expect(notices[0]).toMatch(/please report it to an admin with the code `frame_budget` and the time \d{4}-\d\d-\d\d \d\d:\d\d UTC\.$/);
+	// Retrying is refused again, without another notice or count.
+	first.socket.send(JSON.stringify({ id: 'over-budget-again', method: 'auth', params: { scheme: 'guest' } }));
+	await vi.waitFor(() => expect(replies).toHaveLength(2));
+	await runInDurableObject(stub, (instance) => {
+		expect((instance as unknown as { store: Store }).store.throttleTrips()).toEqual([['frame_budget', 1]]);
+	});
+	expect(notices).toHaveLength(1);
+	expect(warn.mock.calls.map(([line]) => String(line)).filter((line) => line.includes('"throttle_tripped"'))).toEqual([
+		expect.stringContaining('"trigger":"frame_budget","method":"auth"'),
+	]);
+	// Neither socket is closed: readers stay connected, and nobody reconnects into the same refusal.
+	const closed = await Promise.race([first.closed, second.closed, new Promise((resolve) => setTimeout(() => resolve('open'), 200))]);
+	expect(closed).toBe('open');
+	first.socket.close();
+	second.socket.close();
 });
