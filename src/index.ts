@@ -722,7 +722,7 @@ function liveRefused(response: Response, kind: LiveRefusal): Response {
 /** A guest connection this long without an application frame may make room on a full server (evictIdleGuest). */
 const GUEST_IDLE_MS = 10 * 60_000;
 
-/** Retired user ids one sweep reads at most (Store.sweepRetiredUserIds): a full batch means more. */
+/** Retired user ids one call frees at most (Store.dueRetiredUserIds): a full batch means more. */
 const RETIRED_SWEEP_BATCH = 500;
 
 /** The stored attack pause (Store.attackPause). */
@@ -1998,6 +1998,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly evicted = new Map<string, number>();
 	/** When the next idle-account prune may run (pruneIdle): hourly (the store runs it once a day), or soon while more remain. */
 	private idlePruneAt = 0;
+	/** The UTC day this instance last finished the daily part of the account upkeep (pruneIdle). */
+	private upkeepDay = "";
 	/** When batched maintenance left work behind (a full session sweep or prune batch) and should run again; in memory. */
 	private maintenanceAt: number | undefined;
 	private alarmTail: Promise<void> = Promise.resolve();
@@ -3450,8 +3452,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const invalid = { name: "denied", message: "This device token is not valid; get a new one with /invite-device add on a signed-in device" } satisfies ProtocolError;
 			if (!stored || stored.v !== 1 || typeof stored.userId !== "string" || typeof stored.device !== "string") throw invalid;
 			// A token unused as long as an account may idle is forgotten, as an
-			// idle account would be: from its last use, else when it was minted;
-			// one from before either was kept starts counting now.
+			// idle account would be: from its last use, else when it was minted.
+			// One from before either was kept starts counting at its next use.
 			const now = nowMs();
 			const last = stored.usedMs ?? stored.createdMs;
 			if (last !== undefined && now - last > this.config.limits.idleAccountSeconds * 1_000) {
@@ -7034,19 +7036,27 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * The daily account upkeep: removes idle accounts (Store.pruneIdleIdentities;
-	 * never one connected now) and revokes their tokens, frees `user_id`s
-	 * retired long enough (Store.sweepRetiredUserIds), and clears mutes that
-	 * ran out (Store.clearExpiredMutes). The store runs the prune once a UTC
-	 * day; this instance asks hourly, or soon while a full batch left more.
+	 * The account upkeep, asked hourly: records that connected users are
+	 * active (a connection longer than idleAccountSeconds must not leave them
+	 * idle when it ends), removes idle accounts (Store.pruneIdleIdentities;
+	 * never one connected now, the store pacing its runs within a day) and
+	 * revokes their tokens. Once a UTC day per instance it frees retired
+	 * `user_id`s, only after revoking every token of each and its bot, so none
+	 * can sign in to a later account under the id (Store.dueRetiredUserIds),
+	 * and clears mutes that ran out (Store.clearExpiredMutes). It comes back
+	 * soon while a full batch left more.
 	 */
 	private async pruneIdle(now: number): Promise<void> {
 		const connected = new Set<string>();
+		const signedIn = new Set<string>();
 		for (const peer of this.ctx.getWebSockets()) {
-			const userId = connectionAttachment(peer)?.userId;
-			if (userId) connected.add(userId);
+			const state = connectionAttachment(peer);
+			if (!state?.userId) continue;
+			connected.add(state.userId);
+			if (state.tier === "registered") signedIn.add(state.userId);
 		}
 		this.idlePruneAt = now + 3_600_000;
+		for (const userId of signedIn) this.store.noteActive(userId, now);
 		try {
 			// One synchronous transaction: nothing interleaves with it.
 			const result = this.store.pruneIdleIdentities(now, connected);
@@ -7056,10 +7066,24 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 			if (result.pruned.length) await this.forgetTokens(result.pruned);
 		} catch { /* retried in an hour */ }
+		const day = utcDay(now);
+		if (this.upkeepDay === day) return;
+		let done = true;
 		try {
-			if (this.store.sweepRetiredUserIds(now) >= RETIRED_SWEEP_BATCH) this.maintenanceSoon(now);
-		} catch { /* retried at the next prune */ }
-		try { this.store.clearExpiredMutes(now); } catch { /* retried at the next prune */ }
+			const due = this.store.dueRetiredUserIds(now);
+			if (due.length) {
+				// Revoke first: a failure leaves the ids retired, retried next time.
+				await this.forgetTokens([...due, ...due.map((userId) => BOT_ID_PREFIX + userId)]);
+				this.store.freeRetiredUserIds(due, now);
+			}
+			if (due.length >= RETIRED_SWEEP_BATCH) {
+				done = false;
+				this.idlePruneAt = now;
+				this.maintenanceSoon(now);
+			}
+		} catch { done = false; }
+		try { this.store.clearExpiredMutes(now); } catch { done = false; }
+		if (done) this.upkeepDay = day;
 	}
 
 	/** Runs the alarm's maintenance again shortly: batched work left more behind. */

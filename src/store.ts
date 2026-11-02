@@ -164,7 +164,7 @@ export interface StoreConfig {
   idleAccountMs: number;
   /** The most recently active accounts pruneIdleIdentities always keeps. */
   keptActiveAccounts: number;
-  /** How long a removed account's `user_id` stays retired (sweepRetiredUserIds). */
+  /** How long a removed account's `user_id` stays retired (dueRetiredUserIds). */
   retiredUserIdMs: number;
   dedupTtlMs: number;
   cleanupIntervalMs: number;
@@ -976,7 +976,7 @@ const IDLE_PRUNE_BATCH = 100;
 const BOT_PREFIX = "bot_";
 /** Idle accounts pruned: today's count and the total (idlePruned). */
 const META_IDLE_PRUNED = "idle_pruned";
-/** The last UTC day an idle prune finished (pruneIdleIdentities): it runs once a day. */
+/** Today's idle prune runs, and whether the day's prune is done (pruneIdleIdentities). */
 const META_IDLE_PRUNE_DAY = "idle_prune_day";
 /** A sign-in records an account's activity at most this often (noteActive). */
 const ACTIVITY_GRANULARITY_MS = 86_400_000;
@@ -991,8 +991,10 @@ function lastActiveSql(alias: string): string {
     COALESCE((SELECT MAX(c.updated_ms) FROM credentials c INDEXED BY credentials_user_idx WHERE c.user_id = ${alias}.user_id), 0),
     COALESCE((SELECT b.updated_ms FROM identities b WHERE b.user_id = '${BOT_PREFIX}' || ${alias}.user_id), 0))`;
 }
-/** Retired user ids swept at most per call (sweepRetiredUserIds). */
+/** Retired user ids freed at most per call (dueRetiredUserIds). */
 const RETIRED_SWEEP_BATCH = 500;
+/** Idle prune batches a UTC day at most: a backlog spreads over days. */
+const IDLE_PRUNE_RUNS_PER_DAY = 10;
 /** The runtime's attack pause: its UTC day, count that day, hold end, and why (attackPause). */
 const META_ATTACK_PAUSE = "attack_pause";
 /** Overruns of one operation within BREAKER_WINDOW_MS that open its breaker. */
@@ -3507,8 +3509,8 @@ export class Store {
 
   /**
    * Whether a `user_id` may not be issued: an identity has it, `/rename`
-   * retired it, or `/purge` or the idle prune retired it within
-   * `retiredUserIdMs` (sweepRetiredUserIds). Registration picks ids with it.
+   * retired it, or `/purge` or the idle prune retired it and it is not yet
+   * freed (dueRetiredUserIds). Registration picks ids with it.
    */
   userIdTaken(userId: string): boolean {
     this.ensureReady();
@@ -3787,14 +3789,14 @@ export class Store {
    * Removes up to IDLE_PRUNE_BATCH registered accounts inactive for
    * `idleAccountMs` (lastActiveSql: created, profile change or sign-in,
    * departure, passkey use, or their bot's activity), least recently active
-   * first, once a UTC day. It never removes one of the `keptActiveAccounts`
+   * first, in at most IDLE_PRUNE_RUNS_PER_DAY runs a UTC day. It never removes one of the `keptActiveAccounts`
    * most recently active, one with a role (admins, mods, friends), the admin
-   * user, one `connected` now, or one with a live upload (its avatar or
+   * user, one `connected` now or whose bot is, or one with a live upload (its avatar or
    * files expire first). With each goes its bot. It removes their identity,
    * passkeys, memberships (lowering their rooms' member counts), read
    * cursors, status, mutes, push subscriptions and wakes, dedup and limiter
    * rows, and their rooms' creator; each `user_id` is retired for
-   * `retiredUserIdMs` (sweepRetiredUserIds). Idle past retention, nothing
+   * `retiredUserIdMs` (dueRetiredUserIds). Idle past retention, nothing
    * of theirs is still logged. Maintenance work: it measures the rows first,
    * then reserves them, and a refusal leaves the rest for a later run.
    * Returns the removed ids (bots included), and whether more may remain.
@@ -3802,14 +3804,28 @@ export class Store {
   pruneIdleIdentities(now = this.clock.now(), connected: ReadonlySet<string> = new Set()): { pruned: string[]; more: boolean } {
     this.ensureReady();
     const today = dayFor(now);
-    const due = this.reserved({ reads: 4 }, true, now, () => this.metaValue(META_IDLE_PRUNE_DAY) !== today, false);
-    if (!due) return { pruned: [], more: false };
-    const finishDay = () => this.reserved({ reads: 4, writes: 4 }, true, now, () => {
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_IDLE_PRUNE_DAY, today);
+    // Today's runs (one batch each) and whether the day is done: at most
+    // IDLE_PRUNE_RUNS_PER_DAY, so a backlog spreads over days rather than
+    // spending the day's maintenance reads on scans.
+    const progress = (): { day: string; runs: number; done: boolean } => {
+      try {
+        const value = JSON.parse(this.metaValue(META_IDLE_PRUNE_DAY) || "{}") as { day?: unknown; runs?: unknown; done?: unknown };
+        if (value.day === today) return { day: today, runs: integerColumn(value.runs), done: value.done === true };
+      } catch { /* a day afresh */ }
+      return { day: today, runs: 0, done: false };
+    };
+    const state = this.reserved({ reads: 4 }, true, now, progress, false);
+    if (state.done || state.runs >= IDLE_PRUNE_RUNS_PER_DAY) return { pruned: [], more: false };
+    const record = (done: boolean) => this.reserved({ reads: 4, writes: 4 }, true, now, () => {
+      const current = progress();
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_IDLE_PRUNE_DAY,
+        JSON.stringify({ day: today, runs: current.runs + 1, done: done || current.runs + 1 >= IDLE_PRUNE_RUNS_PER_DAY }));
     }, false);
     const cutoff = now - this.config.idleAccountMs;
-    // Ranking reads every identity twice, with a passkey and a bot lookup each.
-    const found = this.reserved({ reads: 64 + 8 * this.config.registeredIdentityCount + 16 * IDLE_PRUNE_BATCH }, true, now, () => {
+    // Ranking reads every identity twice, each with its passkeys and a bot
+    // lookup; bots and the admin are identities beyond the cap.
+    const perIdentity = 2 * (3 + MAX_PASSKEYS_PER_USER);
+    const found = this.reserved({ reads: 64 + perIdentity * (2 * this.config.registeredIdentityCount + 1) + 16 * IDLE_PRUNE_BATCH }, true, now, () => {
       const candidates = this.rawRows<{ user_id: string }>(
         `SELECT i.user_id FROM identities i
          WHERE i.roles_json = '[]' AND i.user_id != ? AND ${lastActiveSql("i")} < ?
@@ -3817,26 +3833,30 @@ export class Store {
            AND i.user_id NOT IN (SELECT k.user_id FROM identities k WHERE k.roles_json = '[]' ORDER BY ${lastActiveSql("k")} DESC LIMIT ?)
          ORDER BY ${lastActiveSql("i")} LIMIT ?`,
         ADMIN_USER_ID, cutoff, this.config.keptActiveAccounts, IDLE_PRUNE_BATCH + connected.size,
-      ).map((row) => row.user_id).filter((id) => !connected.has(id)).slice(0, IDLE_PRUNE_BATCH);
+      ).map((row) => row.user_id)
+        // Never one connected now, nor the owner of a bot connected now.
+        .filter((id) => !connected.has(id) && !connected.has(BOT_PREFIX + id))
+        .slice(0, IDLE_PRUNE_BATCH);
       if (!candidates.length) return { ids: [] as string[], rows: 0, full: false };
+      // Every list is bound as one JSON parameter: SQLite takes at most 100.
       const bots = this.rawRows<{ user_id: string }>(
-        `SELECT user_id FROM identities WHERE user_id IN (${candidates.map(() => "?").join(", ")})`,
-        ...candidates.map((id) => BOT_PREFIX + id),
-      ).map((row) => row.user_id).filter((id) => !connected.has(id));
+        "SELECT user_id FROM identities WHERE user_id IN (SELECT value FROM json_each(?))",
+        JSON.stringify(candidates.map((id) => BOT_PREFIX + id)),
+      ).map((row) => row.user_id);
       const ids = [...candidates, ...bots];
-      const marks = ids.map(() => "?").join(", ");
+      const list = JSON.stringify(ids);
       let rows = 0;
       for (const table of ["memberships", "read_cursors", "credentials", "push_subscriptions", "push_wakes", "user_status", "room_mutes", "accepted_requests"]) {
-        rows += integerColumn(this.rawRows<{ count: number }>(`SELECT COUNT(*) AS count FROM ${table} WHERE user_id IN (${marks})`, ...ids)[0]?.count);
+        rows += integerColumn(this.rawRows<{ count: number }>(`SELECT COUNT(*) AS count FROM ${table} WHERE user_id IN (SELECT value FROM json_each(?))`, list)[0]?.count);
       }
       return { ids, rows, full: candidates.length === IDLE_PRUNE_BATCH };
     }, false);
     if (!found.ids.length) {
-      finishDay();
+      record(true);
       return { pruned: [], more: false };
     }
     const ids = found.ids;
-    const marks = ids.map(() => "?").join(", ");
+    const list = JSON.stringify(ids);
     // Each row deleted (and its index entries), the rooms rescanned for counts
     // and creators, limiter rows, and the identity rows and their markers.
     const limiterRows = ids.length * USER_LIMIT_SCOPES.length;
@@ -3845,33 +3865,43 @@ export class Store {
       reads: 64 + 2 * found.rows + 2 * roomRows + 2 * limiterRows + 4 * ids.length,
       writes: 64 + 4 * found.rows + 2 * roomRows + 2 * limiterRows + 8 * ids.length,
     };
-    this.reserved(cost, true, now, () => this.transaction(() => {
-      this.rawExec(
-        `UPDATE rooms SET member_count = MAX(0, member_count - (SELECT COUNT(*) FROM memberships m WHERE m.room_id = rooms.room_id AND m.user_id IN (${marks})))
-         WHERE room_id IN (SELECT room_id FROM memberships INDEXED BY memberships_user_idx WHERE user_id IN (${marks}))`,
-        ...ids, ...ids,
-      );
-      this.rawExec(`UPDATE rooms SET fields_json = json_remove(fields_json, '$.creator_id') WHERE json_extract(fields_json, '$.creator_id') IN (${marks})`, ...ids);
-      for (const table of ["memberships", "read_cursors", "credentials", "push_subscriptions", "push_wakes", "user_status", "room_mutes", "accepted_requests", "identities"]) {
-        this.rawExec(`DELETE FROM ${table} WHERE user_id IN (${marks})`, ...ids);
+    try {
+      this.reserved(cost, true, now, () => this.transaction(() => {
+        this.rawExec(
+          `UPDATE rooms SET member_count = MAX(0, member_count - (SELECT COUNT(*) FROM memberships m WHERE m.room_id = rooms.room_id AND m.user_id IN (SELECT value FROM json_each(?))))
+           WHERE room_id IN (SELECT room_id FROM memberships INDEXED BY memberships_user_idx WHERE user_id IN (SELECT value FROM json_each(?)))`,
+          list, list,
+        );
+        this.rawExec("UPDATE rooms SET fields_json = json_remove(fields_json, '$.creator_id') WHERE json_extract(fields_json, '$.creator_id') IN (SELECT value FROM json_each(?))", list);
+        for (const table of ["memberships", "read_cursors", "credentials", "push_subscriptions", "push_wakes", "user_status", "room_mutes", "accepted_requests", "identities"]) {
+          this.rawExec(`DELETE FROM ${table} WHERE user_id IN (SELECT value FROM json_each(?))`, list);
+        }
+        const limiterWhere = `scope IN (${USER_LIMIT_SCOPES.map(() => "?").join(", ")}) AND principal_key IN (SELECT value FROM json_each(?))`;
+        const limiterKeys = [...USER_LIMIT_SCOPES, JSON.stringify(ids.map((id) => `user:${id}`))];
+        const limiters = integerColumn(this.rawRows<{ count: number }>(`SELECT COUNT(*) AS count FROM principal_limits WHERE ${limiterWhere}`, ...limiterKeys)[0]?.count);
+        if (limiters) {
+          this.rawExec(`DELETE FROM principal_limits WHERE ${limiterWhere}`, ...limiterKeys);
+          this.rawExec("UPDATE _meta SET value = ? WHERE key = 'principal_limit_count'", String(Math.max(0, this.metaNumber("principal_limit_count") - limiters)));
+        }
+        for (const id of ids) this.limiters.dropPrincipal(`user:${id}`);
+        for (const id of ids) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_PURGED_PREFIX + id, String(now));
+        this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(Math.max(0, this.metaNumber("identity_count") - ids.length)));
+        const day = dayFor(now);
+        const previous = this.idlePrunedRaw();
+        const counts = { day, today: (previous.day === day ? previous.today : 0) + ids.length, total: previous.total + ids.length };
+        this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_IDLE_PRUNED, JSON.stringify(counts));
+      }), false);
+    } catch (error) {
+      // A batch the day's budget refuses would be refused at every hourly
+      // retry, each rescanning every identity: the day is done instead.
+      if (error instanceof StoreError && error.code === "retry_after") {
+        try { record(true); } catch { /* retried in an hour */ }
+        return { pruned: [], more: false };
       }
-      const limiterWhere = `scope IN (${USER_LIMIT_SCOPES.map(() => "?").join(", ")}) AND principal_key IN (${marks})`;
-      const limiterKeys = [...USER_LIMIT_SCOPES, ...ids.map((id) => `user:${id}`)];
-      const limiters = integerColumn(this.rawRows<{ count: number }>(`SELECT COUNT(*) AS count FROM principal_limits WHERE ${limiterWhere}`, ...limiterKeys)[0]?.count);
-      if (limiters) {
-        this.rawExec(`DELETE FROM principal_limits WHERE ${limiterWhere}`, ...limiterKeys);
-        this.rawExec("UPDATE _meta SET value = ? WHERE key = 'principal_limit_count'", String(Math.max(0, this.metaNumber("principal_limit_count") - limiters)));
-      }
-      for (const id of ids) this.limiters.dropPrincipal(`user:${id}`);
-      for (const id of ids) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_PURGED_PREFIX + id, String(now));
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(Math.max(0, this.metaNumber("identity_count") - ids.length)));
-      const day = dayFor(now);
-      const previous = this.idlePrunedRaw();
-      const record = { day, today: (previous.day === day ? previous.today : 0) + ids.length, total: previous.total + ids.length };
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_IDLE_PRUNED, JSON.stringify(record));
-    }), false);
+      throw error;
+    }
     console.log(JSON.stringify({ event: "idle_accounts_pruned", count: ids.length }));
-    if (!found.full) finishDay();
+    record(!found.full);
     return { pruned: ids, more: found.full };
   }
 
@@ -3894,26 +3924,35 @@ export class Store {
   }
 
   /**
-   * Frees `user_id`s retired (`purged:<id>`, by `/purge` or the idle prune)
-   * more than `retiredUserIdMs` ago, so they may be issued again: by then
-   * nothing logged names them. A marker from before markers kept their time
-   * (`1`) starts its time now. At most RETIRED_SWEEP_BATCH a call; returns
-   * how many it read, so a full batch means more may remain.
+   * The `user_id`s retired (`purged:<id>`, by `/purge` or the idle prune)
+   * more than `retiredUserIdMs` ago, at most RETIRED_SWEEP_BATCH, which may
+   * be freed: by then nothing logged names them. A marker from before
+   * markers kept their time (`1`) starts its time now. The caller revokes
+   * every token of each (and of its bot) before freeRetiredUserIds frees it,
+   * so no token of the old account can sign in to a new one under the id.
    */
-  sweepRetiredUserIds(now = this.clock.now()): number {
+  dueRetiredUserIds(now = this.clock.now()): string[] {
     this.ensureReady();
-    return this.reserved({ reads: 16 + 2 * RETIRED_SWEEP_BATCH, writes: 8 + 4 * RETIRED_SWEEP_BATCH }, true, now, () => this.transaction(() => {
-      const rows = this.rawRows<{ key: string; value: string }>(
-        "SELECT key, value FROM _meta WHERE key >= ? AND key < ? ORDER BY key LIMIT ?", META_PURGED_PREFIX, META_PURGED_PREFIX.slice(0, -1) + ";", RETIRED_SWEEP_BATCH,
+    const end = META_PURGED_PREFIX.slice(0, -1) + ";";
+    return this.reserved({ reads: 16 + 4 * this.config.registeredIdentityCount, writes: 8 + 4 * RETIRED_SWEEP_BATCH }, true, now, () => this.transaction(() => {
+      const legacy = this.rawRows<{ key: string }>(
+        "SELECT key FROM _meta WHERE key >= ? AND key < ? AND CAST(value AS INTEGER) <= 1 LIMIT ?", META_PURGED_PREFIX, end, RETIRED_SWEEP_BATCH,
       );
-      const cutoff = now - this.config.retiredUserIdMs;
-      for (const row of rows) {
-        const at = Number(row.value);
-        if (!Number.isFinite(at) || at <= 1) this.rawExec("UPDATE _meta SET value = ? WHERE key = ?", String(now), row.key);
-        else if (at < cutoff) this.rawExec("DELETE FROM _meta WHERE key = ?", row.key);
-      }
-      return rows.length;
+      for (const row of legacy) this.rawExec("UPDATE _meta SET value = ? WHERE key = ?", String(now), row.key);
+      return this.rawRows<{ key: string }>(
+        "SELECT key FROM _meta WHERE key >= ? AND key < ? AND CAST(value AS INTEGER) > 1 AND CAST(value AS INTEGER) < ? ORDER BY CAST(value AS INTEGER) LIMIT ?",
+        META_PURGED_PREFIX, end, now - this.config.retiredUserIdMs, RETIRED_SWEEP_BATCH,
+      ).map((row) => row.key.slice(META_PURGED_PREFIX.length));
     }), false);
+  }
+
+  /** Frees retired `user_id`s (dueRetiredUserIds), their tokens revoked: they may be issued again. */
+  freeRetiredUserIds(userIds: readonly string[], now = this.clock.now()): void {
+    if (!userIds.length) return;
+    this.ensureReady();
+    this.reserved({ reads: 8 + 2 * userIds.length, writes: 8 + 4 * userIds.length }, true, now, () => {
+      this.rawExec("DELETE FROM _meta WHERE key IN (SELECT ? || value FROM json_each(?))", META_PURGED_PREFIX, JSON.stringify(userIds));
+    }, false);
   }
 
   /**

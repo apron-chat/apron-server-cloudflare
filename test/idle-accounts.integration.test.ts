@@ -80,17 +80,38 @@ it('always keeps the keptActiveAccounts most recently active, however idle', asy
 	});
 });
 
-it('frees retired user ids after retiredUserIdMs, a marker without its time starting now', async () => {
+it('frees retired user ids after retiredUserIdMs, in two steps, a marker without its time starting now', async () => {
 	await withStore('retired-ids', { retiredUserIdMs: 7 * day }, (store, sql, clock) => {
 		const now = clock.now;
 		sql.exec("INSERT INTO _meta (key, value) VALUES ('purged:fresh', ?), ('purged:stale', ?), ('purged:legacy', '1'), ('renamed:kept', '1')", String(now - day), String(now - 8 * day));
-		expect(store.userIdTaken('stale')).toBe(true);
-		expect(store.sweepRetiredUserIds(now)).toBe(3);
 		const markers = () => Object.fromEntries(sql.exec<{ key: string; value: string }>("SELECT key, value FROM _meta WHERE key LIKE 'purged:%' OR key LIKE 'renamed:%'").toArray().map((row) => [row.key, row.value]));
-		expect(markers()).toEqual({ 'purged:fresh': String(now - day), 'purged:legacy': String(now), 'renamed:kept': '1' });
+		// The due ids, still retired until the caller has revoked their tokens and frees them.
+		expect(store.dueRetiredUserIds(now)).toEqual(['stale']);
+		expect(store.userIdTaken('stale')).toBe(true);
+		expect(markers()).toEqual({ 'purged:fresh': String(now - day), 'purged:stale': String(now - 8 * day), 'purged:legacy': String(now), 'renamed:kept': '1' });
+		store.freeRetiredUserIds(['stale'], now);
 		expect(store.userIdTaken('stale')).toBe(false);
-		store.sweepRetiredUserIds(now + 7 * day + 1);
+		const later = now + 7 * day + 1;
+		const due = store.dueRetiredUserIds(later);
+		expect(new Set(due)).toEqual(new Set(['fresh', 'legacy']));
+		store.freeRetiredUserIds(due, later);
 		expect(markers()).toEqual({ 'renamed:kept': '1' });
+	});
+});
+
+it('prunes a batch past SQLite\'s 100 bound parameters, and keeps the owner of a connected bot', async () => {
+	await withStore('idle-many', { idleAccountMs: 30 * day, keptActiveAccounts: 1 }, (store, sql, clock) => {
+		const user = seed(sql, clock.now);
+		for (let index = 0; index < 80; index++) {
+			user(`many-${index}`, { created: 90 * day, seen: 60 * day });
+			sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json, seen_ms) VALUES (?, '', 'bot', 'registered', ?, 0, '[\"bot\"]', 0)", `bot_many-${index}`, clock.now - 60 * day);
+		}
+		user('recent', { created: day });
+		const result = store.pruneIdleIdentities(clock.now, new Set(['bot_many-0']));
+		// 79 owners and their bots; many-0's bot is connected, so many-0 stays.
+		expect(result.pruned).toHaveLength(158);
+		expect(result.pruned).not.toContain('many-0');
+		expect(sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM identities WHERE user_id LIKE '%many-%'").one().count).toBe(2);
 	});
 });
 
@@ -122,5 +143,22 @@ it('records a sign-in as activity at most once a day, and never revives a signed
 		expect(updated('person')).toBe(now);
 		store.noteActive('bot_person', now);
 		expect(updated('bot_person')).toBe(0);
+	});
+});
+
+it('revokes every token of a retired id, and of its bot, before freeing it', async () => {
+	await runInDurableObject(env.DEMO.getByName('retired-tokens'), async (instance, state) => {
+		const runtime = instance as unknown as { pruneIdle(now: number): Promise<void>; store: Store; upkeepDay: string };
+		const now = Date.now();
+		const retired = now - 30 * day;
+		state.storage.sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('purged:gone', ?)", String(retired));
+		await state.storage.put('invite:gone', { v: 1, tokenKey: 'invite-token:abc' });
+		await state.storage.put('invite-token:abc', { v: 1, userId: 'gone' });
+		await state.storage.put('bot:bot_gone', { v: 1, tokenKey: 'bot-token:def' });
+		await state.storage.put('bot-token:def', { v: 1, userId: 'bot_gone' });
+		runtime.upkeepDay = '';
+		await runtime.pruneIdle(now);
+		for (const key of ['invite:gone', 'invite-token:abc', 'bot:bot_gone', 'bot-token:def']) expect(await state.storage.get(key)).toBeUndefined();
+		expect(runtime.store.userIdTaken('gone')).toBe(false);
 	});
 });

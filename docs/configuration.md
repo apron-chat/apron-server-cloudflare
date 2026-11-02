@@ -836,23 +836,25 @@ newcomer that passes every other check: never for a status probe, never a
 guest who is reading, and never for an address whose own guest was evicted
 in the last 10 minutes, so evictions cannot cascade.
 
-**Account upkeep.** Once a UTC day the alarm removes registered accounts
-inactive for `idleAccountSeconds` (30 days; `Store.pruneIdleIdentities`),
-least recently active first, at most 100 a run (the next alarm continues).
-Activity is an account's creation, profile changes and sign-ins (a passkey,
-a session resume or a token, recorded at most once a day), its last
-departure (`seen`), a passkey's last use, and its bot's activity, so it
-holds whether or not user status is on. It never removes one of the
+**Account upkeep.** The alarm removes registered accounts inactive for
+`idleAccountSeconds` (30 days; `Store.pruneIdleIdentities`), least recently
+active first, 100 a run and at most 10 runs a UTC day, so a backlog spreads
+over days. Activity is an account's creation, profile changes and sign-ins
+(a passkey, a session resume or a token, recorded at most once a day, and
+hourly for those connected), its last departure (`seen`), a passkey's last
+use, and its bot's activity, so it holds whether or not user status is on.
+Receiving pushes alone is not activity. It never removes one of the
 `keptActiveAccounts` (100) most recently active, one with a role, the admin
-user, one connected now, or one with a live upload (its avatar expires
-first). Its bot goes with it, and its passkeys, memberships, read cursors,
-status, mutes, push subscriptions, tokens and limiter rows. Its content is
-past retention by then. Its `user_id` is retired, as `/purge` retires one,
-for `retiredUserIdSeconds` (the message retention), then may be issued
-again: nothing logged names it any more, and a session carries the user
-handle it was issued under, so a new account under the id never resumes an
-old one's (a session from before sessions carried handles resumes only
-for an account from before then). The same pass clears mutes that ran out.
+user, one connected now or whose bot is, or one with a live upload (its
+avatar expires first). Its bot goes with it, and its passkeys, memberships,
+read cursors, status, mutes, push subscriptions, tokens and limiter rows. Its
+content is past retention by then. Its `user_id` is retired, as `/purge`
+retires one, for `retiredUserIdSeconds` (the message retention), then may be
+issued again, once every token of the old account and its bot is revoked:
+nothing logged names it any more, and a session carries the user handle it
+was issued under, so a new account under the id never resumes an old one's
+(a session from before sessions carried handles resumes only for an account
+from before then). Once a day the same upkeep clears mutes that ran out.
 A device token unused for `idleAccountSeconds` stops working and is
 forgotten. Expired attached files and avatars are deleted from R2 by the
 server when cleanup forgets them, not only by the bucket's lifecycle rules.
