@@ -554,7 +554,7 @@ const CREDENTIAL_KEY_PATTERN = /^(session|bot-token|invite-token|device-token):[
  */
 const AUTH_RESET_KEY_PREFIX = "auth-reset:";
 /** The protocol a bot's instructions point it at (`/invite-bot`). */
-const PROTOCOL_URL = "https://github.com/shazow/apron/blob/main/PROTOCOL.md";
+const PROTOCOL_URL = "https://apron.chat/protocol";
 
 /**
  * A bearer session minted by a verified passkey login (protocol §4.10,
@@ -7798,7 +7798,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 							`Read ${PROTOCOL_URL}`,
 							`Connect to ${endpoint}`,
 							`Auth using token scheme with this token: "${token}"`,
-							"Say hello when you join and listen for messages",
+							"Say hello when you join and listen for messages, reply to messages that mention you",
 						].join("\n") + "\n```",
 					].join("\n\n"),
 					format: "markdown",

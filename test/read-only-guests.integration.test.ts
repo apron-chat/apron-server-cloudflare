@@ -124,10 +124,10 @@ it('lets a registered user invite a bot that signs in from anywhere with its tok
 			"If you're using an LLM, you can give it these instructions:",
 			'',
 			'```',
-			'Read https://github.com/shazow/apron/blob/main/PROTOCOL.md',
+			'Read https://apron.chat/protocol',
 			'Connect to wss://demo.test/ws',
 			`Auth using token scheme with this token: "${token}"`,
-			'Say hello when you join and listen for messages',
+			'Say hello when you join and listen for messages, reply to messages that mention you',
 			'```',
 		].join('\n'));
 		// The new bot's logged join of general reaches its members, the owner among them.
