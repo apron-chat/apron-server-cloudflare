@@ -1400,3 +1400,30 @@ it('an admin creates a top-level room that others find with room_list and join, 
 		expect(exists).toBe(true);
 	} finally { admin.close(); guest.close(); }
 });
+
+it('forgets a device token unused as long as an account may idle', async () => {
+	const userId = unique('forgetful');
+	const owner = await signedIn(userId);
+	try {
+		const minted = await command(owner, 'device-old', '/invite-device add old');
+		const token = minted.notice!.params.body.text.match(/apron_device_[A-Za-z0-9_-]{43}/)![0] as string;
+		const digest = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token))), (byte) => byte.toString(16).padStart(2, '0')).join('');
+		const key = `device-token:${digest}`;
+		await runInDurableObject(stub(), async (_instance, state) => {
+			const stored = await state.storage.get<Record<string, unknown>>(key);
+			expect(stored).toBeTruthy();
+			const long = DEFAULT_LIMITS.idleAccountSeconds * 1_000 + 60_000;
+			await state.storage.put(key, { ...stored, createdMs: Date.now() - long, usedMs: Date.now() - long });
+		});
+		const peer = await connect(null);
+		try {
+			await peer.next();
+			const refused = await request(peer, 'auth', 'auth', { scheme: 'token', token });
+			expect(refused.error.message).toBe('This device token expired after going unused; get a new one with /invite-device add on a signed-in device');
+		} finally { peer.close(); }
+		await runInDurableObject(stub(), async (_instance, state) => {
+			expect(await state.storage.get(key)).toBeUndefined();
+			expect(await state.storage.get(`devices:${userId}`)).toBeUndefined();
+		});
+	} finally { owner.close(); }
+});

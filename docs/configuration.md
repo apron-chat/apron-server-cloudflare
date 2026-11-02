@@ -684,7 +684,9 @@ defaults:
   registration, identity, and processed-frame caps are fixed demo ceilings.
   Low, high, and hard storage watermarks must be strictly ordered.
 - `retentionSeconds` is at least `cleanupSeconds`; `sessionTtlSeconds` is at
-  most 30 days.
+  most 30 days; `retiredUserIdSeconds` is at least `retentionSeconds`;
+  `idleAccountSeconds` is at least a day and `retentionSeconds`;
+  `keptActiveAccounts` is at most `registeredIdentityCount`.
 - A moved message re-logs every reaction set in one record, so
   `reactionUsersPerMessage` times the per-user bound (emoji at most 64 UTF-8
   bytes each, escaped, plus the user's name) must fit `historyMaxResponseBytes`.
@@ -832,16 +834,29 @@ closes the guest whose client said nobody attends it (`status` `idle`) for
 10 minutes or more, with no frame since (close code 4000), to admit a
 newcomer that passes every other check: never for a status probe, never a
 guest who is reading, and never for an address whose own guest was evicted
-in the last 10 minutes, so evictions cannot cascade. Registered accounts nobody came back to are
-removed after 30 days (`Store.pruneDormantIdentities`, once a UTC day):
-signed up with a passkey and active only that first day by their recorded
-`seen`, with no role, chosen status, push subscription, upload or bot. An
-account with no `seen` recorded (from before it was kept, or carried over
-a schema reset) is kept, and nothing is removed until user status has kept
-`seen` for 30 days without a break: turning user status off (or push
-unconfigured) restarts that wait. Their content is past retention by then;
-their `user_id` is retired as `/purge` retires it, and `/status` counts
-them.
+in the last 10 minutes, so evictions cannot cascade.
+
+**Account upkeep.** Once a UTC day the alarm removes registered accounts
+inactive for `idleAccountSeconds` (30 days; `Store.pruneIdleIdentities`),
+least recently active first, at most 100 a run (the next alarm continues).
+Activity is an account's creation, profile changes and sign-ins (a passkey,
+a session resume or a token, recorded at most once a day), its last
+departure (`seen`), a passkey's last use, and its bot's activity, so it
+holds whether or not user status is on. It never removes one of the
+`keptActiveAccounts` (100) most recently active, one with a role, the admin
+user, one connected now, or one with a live upload (its avatar expires
+first). Its bot goes with it, and its passkeys, memberships, read cursors,
+status, mutes, push subscriptions, tokens and limiter rows. Its content is
+past retention by then. Its `user_id` is retired, as `/purge` retires one,
+for `retiredUserIdSeconds` (the message retention), then may be issued
+again: nothing logged names it any more, and a session carries the user
+handle it was issued under, so a new account under the id never resumes an
+old one's (a session from before sessions carried handles resumes only
+for an account from before then). The same pass clears mutes that ran out.
+A device token unused for `idleAccountSeconds` stops working and is
+forgotten. Expired attached files and avatars are deleted from R2 by the
+server when cleanup forgets them, not only by the bucket's lifecycle rules.
+`/status` counts the accounts removed.
 
 **Storage overruns.** Every operation reserves the SQL rows it may read and
 write before it runs. One that uses more is an *overrun*: a wrong estimate,
@@ -928,7 +943,8 @@ The numeric rows are grouped by their unit and enforcement scope:
 
 - Durations: `retentionSeconds`, `cleanupSeconds`, `challengeTtlSeconds`,
   `sessionTtlSeconds` (a passkey session token's lifetime, renewed on each
-  resume), `unauthenticatedTimeoutSeconds`, `dedupTtlSeconds`, and
+  resume), `idleAccountSeconds` and `retiredUserIdSeconds` (account upkeep,
+  above), `unauthenticatedTimeoutSeconds`, `dedupTtlSeconds`, and
   `statusCoalesceSeconds`, `offlineGraceSeconds`, `presenceAlarmSeconds` and
   `guestPresenceAlarmSeconds` (each at most 60, the last a multiple of the one
   before; see [User status](#user-status-presence)).
@@ -981,6 +997,9 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `cleanupSeconds` | 86400 | 3600 |
 | `challengeTtlSeconds` | 120 |  |
 | `sessionTtlSeconds` | 2592000 |  |
+| `idleAccountSeconds` | 2592000 |  |
+| `keptActiveAccounts` | 100 |  |
+| `retiredUserIdSeconds` | 604800 | 86400 |
 | `maxFrameBytes` | 16384 |  |
 | `maxTextBytes` | 4096 |  |
 | `maxSnapshotBytes` | 8192 |  |

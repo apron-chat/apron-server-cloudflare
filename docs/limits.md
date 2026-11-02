@@ -281,7 +281,7 @@ first.
 | Users with a reaction on one message ("reaction limit reached for this message") | 32 |
 | Emoji in one user's reaction set on one message | 8 |
 | Room mutes per user | 100 |
-| Registered accounts on the server | 50,000 (accounts never used again within 30 days of signing up are removed) |
+| Registered accounts on the server | 50,000 (an account inactive for 30 days is removed, unless among the 100 most recently active or holding a role; a device token unused for 30 days stops working) |
 
 A thread stops counting when everyone has left it or its history expires.
 

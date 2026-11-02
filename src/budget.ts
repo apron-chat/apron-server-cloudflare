@@ -9,6 +9,22 @@ export interface Limits {
 	challengeTtlSeconds: number;
 	/** Lifetime of a passkey session token, renewed on every successful resume. */
 	sessionTtlSeconds: number;
+	/**
+	 * A registered account inactive this long (no sign-in, resume, profile
+	 * change, connection or its bot's activity) is removed, unless it is
+	 * among the `keptActiveAccounts` most recently active, has a role, or has
+	 * a live upload (Store.pruneIdleIdentities).
+	 */
+	idleAccountSeconds: number;
+	/** The most recently active accounts the idle prune always keeps, however idle. */
+	keptActiveAccounts: number;
+	/**
+	 * How long a removed account's `user_id` stays retired, never reissued:
+	 * at least `retentionSeconds`, so nothing logged still names it when it
+	 * may be taken again. Sessions carry the user handle they were issued
+	 * under, so a new account under the id never resumes an old one's.
+	 */
+	retiredUserIdSeconds: number;
 	maxFrameBytes: number;
 	maxTextBytes: number;
 	maxSnapshotBytes: number;

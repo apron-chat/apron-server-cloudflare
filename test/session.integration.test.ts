@@ -454,3 +454,43 @@ it('sends a rename only to users who share a room with the renamed user', async 
 		expect((await exchange(apart, 'sync', 'me', {})).skipped.filter((frame) => frame.method === 'user')).toEqual([]);
 	} finally { tab.close(); sharing.close(); apart.close(); }
 });
+
+it('resumes a session from before sessions carried a handle only for an account from before then, and gives it the handle', async () => {
+	const userId = `legacy_${crypto.randomUUID().slice(0, 8)}`;
+	await registerIdentity(userId);
+	const token = await issueSession(userId, 'http://localhost:5173');
+	const key = await runInDurableObject(stub(), async (_instance, state) => {
+		const sessions = await state.storage.list<StoredSessionTest & { handle?: string }>({ prefix: 'session:' });
+		const [found] = [...sessions].find(([, session]) => session.userId === userId)!;
+		const { handle: _handle, ...legacy } = (await state.storage.get<StoredSessionTest & { handle?: string }>(found))!;
+		await state.storage.put(found, legacy);
+		return found;
+	});
+	const resume = async () => {
+		const peer = await connect();
+		try {
+			await greeting(peer);
+			return await request(peer, 'auth', 'auth', { scheme: 'token', token });
+		} finally { peer.close(); }
+	};
+	// The account was created now, after sessions began carrying handles: it may be one under a freed user_id.
+	expect((await resume()).error.message).toBe('Session expired; sign in with your passkey');
+	// An account from before then resumes its own, which gains the handle.
+	const legacy = await runInDurableObject(stub(), async (_instance, state) => {
+		state.storage.sql.exec('UPDATE identities SET created_ms = ? WHERE user_id = ?', Date.parse('2026-10-01T00:00:00Z'), userId);
+		const token2 = await (_instance as unknown as { issueSession(userId: string, origin: string, now: number): Promise<string> }).issueSession(userId, 'http://localhost:5173', Date.now());
+		const sessions = await state.storage.list<StoredSessionTest & { handle?: string }>({ prefix: 'session:' });
+		const [found] = [...sessions].find(([name, session]) => session.userId === userId && name !== key)!;
+		const { handle: _handle, ...stripped } = (await state.storage.get<StoredSessionTest & { handle?: string }>(found))!;
+		await state.storage.put(found, stripped);
+		return { token: token2, key: found };
+	});
+	const peer = await connect();
+	try {
+		await greeting(peer);
+		expect((await request(peer, 'auth', 'auth', { scheme: 'token', token: legacy.token })).result.you.user_id).toBe(userId);
+	} finally { peer.close(); }
+	await runInDurableObject(stub(), async (_instance, state) => {
+		expect((await state.storage.get<{ handle?: string }>(legacy.key))?.handle).toBe(`handle-${userId}`);
+	});
+});

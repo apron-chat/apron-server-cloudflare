@@ -44,6 +44,8 @@ export const PAID_PLAN: Plan = Object.freeze({
 	limits: Object.freeze({
 		...FREE_PLAN.limits,
 		retentionSeconds: 7 * 24 * 60 * 60,
+		// A removed account's user_id may be taken again once its messages are gone.
+		retiredUserIdSeconds: 7 * 24 * 60 * 60,
 		// Registered users' statuses at most 15 s late: at most 5,760 presence
 		// wakes a day, about 52,000 maintenance writes of Paid's 1.5 million.
 		presenceAlarmSeconds: 15,

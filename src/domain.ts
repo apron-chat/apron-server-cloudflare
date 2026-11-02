@@ -21,6 +21,8 @@ export interface StoredIdentity {
 	userId: string;
 	name: string;
 	userHandle: string;
+	/** When the identity was created, where it was read from its row. */
+	createdMs?: number;
 	credentialCount: number;
 	/** Rooms the identity has joined (protocol §4.2.2), kept across connections. */
 	rooms: string[];

@@ -160,6 +160,12 @@ interface StoreClock {
 
 export interface StoreConfig {
   retentionMs: number;
+  /** Inactivity past which an account is removed (pruneIdleIdentities). */
+  idleAccountMs: number;
+  /** The most recently active accounts pruneIdleIdentities always keeps. */
+  keptActiveAccounts: number;
+  /** How long a removed account's `user_id` stays retired (sweepRetiredUserIds). */
+  retiredUserIdMs: number;
   dedupTtlMs: number;
   cleanupIntervalMs: number;
   cleanupBatch: number;
@@ -477,6 +483,9 @@ export interface UploadWrite {
 
 const DEFAULT_CONFIG: StoreConfig = {
   retentionMs: RETENTION_MS,
+  idleAccountMs: DEFAULT_LIMITS.idleAccountSeconds * 1000,
+  keptActiveAccounts: DEFAULT_LIMITS.keptActiveAccounts,
+  retiredUserIdMs: DEFAULT_LIMITS.retiredUserIdSeconds * 1000,
   dedupTtlMs: DEDUP_TTL_MS,
   cleanupIntervalMs: DEFAULT_LIMITS.cleanupSeconds * 1000,
   cleanupBatch: DEFAULT_LIMITS.cleanupBatch,
@@ -961,29 +970,29 @@ const META_THROTTLE_TRIPS = "throttle_trips";
 export const TRIP_WINDOW_MS = 24 * 60 * 60 * 1000;
 /** The server tier the runtime last announced to the admins (announcedTier). */
 const META_ANNOUNCED_TIER = "announced_tier";
-/**
- * Registered accounts nobody came back to are removed (pruneDormantIdentities)
- * once this old: signed up with a passkey, active only on their first day
- * (DORMANT_ACTIVE_MS), with no role, push subscription, chosen status or
- * mute (an `invisible` user's `seen` stays put), upload or bot. By
- * then everything they posted is past retention, so nothing logged names
- * them, and the identity cap is not spent for good by passersby.
- */
-export const DORMANT_AFTER_MS = 30 * 86_400_000;
-const DORMANT_ACTIVE_MS = 86_400_000;
-/** Accounts one prune removes at most; the next alarm continues. */
-const DORMANT_BATCH = 100;
-/** The bot of a user (`bot_<user_id>`, as the runtime names it): a user with one is in use. */
+/** Accounts one idle prune removes at most (pruneIdleIdentities); the next alarm continues. */
+const IDLE_PRUNE_BATCH = 100;
+/** A user's bot (`bot_<user_id>`, as the runtime names it): it goes with its owner, and its activity is theirs. */
 const BOT_PREFIX = "bot_";
-/** Dormant accounts pruned: today's count and the total (dormantPruned). */
-const META_DORMANT_PRUNED = "dormant_pruned";
+/** Idle accounts pruned: today's count and the total (idlePruned). */
+const META_IDLE_PRUNED = "idle_pruned";
+/** The last UTC day an idle prune finished (pruneIdleIdentities): it runs once a day. */
+const META_IDLE_PRUNE_DAY = "idle_prune_day";
+/** A sign-in records an account's activity at most this often (noteActive). */
+const ACTIVITY_GRANULARITY_MS = 86_400_000;
 /**
- * Since when `seen_ms` has been kept current without a break (user status
- * on), and the last UTC day a prune finished: nothing is pruned until it has
- * been kept for DORMANT_AFTER_MS, so `seen` stopped by a reset, an older
- * version, or user status turned off never reads as dormant.
+ * An account's last activity, as SQL over `identities` row `alias`: its
+ * creation, profile changes and sign-ins (`updated_ms`, noteActive), its
+ * last departure (`seen_ms`), a passkey's last use, and its bot's last
+ * activity (`updated_ms` of `bot_<user_id>`; a signed-out bot's is 0).
  */
-const META_DORMANT_TRACKING = "dormant_tracking";
+function lastActiveSql(alias: string): string {
+  return `MAX(${alias}.created_ms, ${alias}.updated_ms, ${alias}.seen_ms,
+    COALESCE((SELECT MAX(c.updated_ms) FROM credentials c INDEXED BY credentials_user_idx WHERE c.user_id = ${alias}.user_id), 0),
+    COALESCE((SELECT b.updated_ms FROM identities b WHERE b.user_id = '${BOT_PREFIX}' || ${alias}.user_id), 0))`;
+}
+/** Retired user ids swept at most per call (sweepRetiredUserIds). */
+const RETIRED_SWEEP_BATCH = 500;
 /** The runtime's attack pause: its UTC day, count that day, hold end, and why (attackPause). */
 const META_ATTACK_PAUSE = "attack_pause";
 /** Overruns of one operation within BREAKER_WINDOW_MS that open its breaker. */
@@ -3497,8 +3506,9 @@ export class Store {
   }
 
   /**
-   * Whether a `user_id` may not be issued: an identity has it, or `/rename`
-   * or `/purge` retired it. Registration picks ids with it.
+   * Whether a `user_id` may not be issued: an identity has it, `/rename`
+   * retired it, or `/purge` or the idle prune retired it within
+   * `retiredUserIdMs` (sweepRetiredUserIds). Registration picks ids with it.
    */
   userIdTaken(userId: string): boolean {
     this.ensureReady();
@@ -3663,8 +3673,9 @@ export class Store {
    * passkey, push subscription, status, mute, limiter and dedup rows. A logged record that
    * lists them beside others (a move's reaction sets) is rewritten without
    * them. Rooms they created stay, without a creator. Each purged identity's
-   * `user_id` is retired (META_PURGED_PREFIX), never reissued, so neither a
-   * session still held for it nor a room it created carries over to anyone.
+   * `user_id` is retired (META_PURGED_PREFIX) for `retiredUserIdMs`, past
+   * the retention of anything that names it; sessions carry the user handle
+   * they were issued under, so none carries over to a later account.
    * Removing the threads it leaves empty is the caller's (removeIfEmpty), as
    * it knows the connections still in them. Clients that already have their content
    * keep it until they load history again. Returns what went, and the R2
@@ -3750,72 +3761,75 @@ export class Store {
         this.rawExec("UPDATE _meta SET value = ? WHERE key = 'principal_limit_count'", String(Math.max(0, this.metaNumber("principal_limit_count") - limiters)));
       }
       for (const id of ids) this.limiters.dropPrincipal(`user:${id}`);
-      for (const userId of retired) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, '1')", META_PURGED_PREFIX + userId);
+      for (const userId of retired) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_PURGED_PREFIX + userId, String(now));
       if (identities) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(Math.max(0, this.metaNumber("identity_count") - identities)));
       return { messages: messages.length, reactions: integerColumn(reactions), deletedUploads };
     }), true);
   }
 
   /**
-   * Removes up to DORMANT_BATCH registered accounts nobody came back to
-   * (DORMANT_AFTER_MS), except `connected` ones, once a UTC day and only once
-   * `seen` has been kept (`tracking`: user status on) for DORMANT_AFTER_MS
-   * without a break; `tracking` false restarts that wait. An account whose
-   * `seen` was never recorded (0) is kept. It removes their identity, passkeys,
-   * memberships (lowering their rooms' member counts), read cursors, status,
-   * mutes, push wakes, dedup and limiter rows, and their rooms' creator. As
-   * with `/purge`, each `user_id` is retired, never reissued. Their content
-   * is past retention, so no logged record is read or rewritten; a record of
-   * someone else's (an admin adding them to a room within retention) may
-   * still name them until it expires. Maintenance work: it measures the rows
-   * first, then reserves them, and a refusal leaves the rest for a later
-   * run. Returns the removed ids, and whether more may remain.
+   * Records that a user signed in (a passkey, a session resume, a token),
+   * at most once per ACTIVITY_GRANULARITY_MS: the identity's `updated_ms`,
+   * which the idle prune reads as activity whether or not user status keeps
+   * `seen`. One conditional row update; never throws.
    */
-  pruneDormantIdentities(now = this.clock.now(), connected: ReadonlySet<string> = new Set(), tracking = true): { pruned: string[]; more: boolean } {
+  noteActive(userId: string, now = this.clock.now()): void {
+    try {
+      this.ensureReady();
+      this.reserved({ reads: 4, writes: 4 }, false, now, () => {
+        const effective = this.effectiveNow(now);
+        this.rawExec("UPDATE identities SET updated_ms = ? WHERE user_id = ? AND updated_ms < ? AND updated_ms > 0", effective, userId, effective - ACTIVITY_GRANULARITY_MS);
+      });
+    } catch { /* a refused or failed write only leaves the day unrecorded */ }
+  }
+
+  /**
+   * Removes up to IDLE_PRUNE_BATCH registered accounts inactive for
+   * `idleAccountMs` (lastActiveSql: created, profile change or sign-in,
+   * departure, passkey use, or their bot's activity), least recently active
+   * first, once a UTC day. It never removes one of the `keptActiveAccounts`
+   * most recently active, one with a role (admins, mods, friends), the admin
+   * user, one `connected` now, or one with a live upload (its avatar or
+   * files expire first). With each goes its bot. It removes their identity,
+   * passkeys, memberships (lowering their rooms' member counts), read
+   * cursors, status, mutes, push subscriptions and wakes, dedup and limiter
+   * rows, and their rooms' creator; each `user_id` is retired for
+   * `retiredUserIdMs` (sweepRetiredUserIds). Idle past retention, nothing
+   * of theirs is still logged. Maintenance work: it measures the rows first,
+   * then reserves them, and a refusal leaves the rest for a later run.
+   * Returns the removed ids (bots included), and whether more may remain.
+   */
+  pruneIdleIdentities(now = this.clock.now(), connected: ReadonlySet<string> = new Set()): { pruned: string[]; more: boolean } {
     this.ensureReady();
     const today = dayFor(now);
-    const due = this.reserved({ reads: 4, writes: 4 }, true, now, () => {
-      let record: { since?: number; done?: string } = {};
-      try { record = JSON.parse(this.metaValue(META_DORMANT_TRACKING) || "{}"); } catch { /* starts again */ }
-      if (!tracking) {
-        if (record.since !== undefined) this.rawExec("DELETE FROM _meta WHERE key = ?", META_DORMANT_TRACKING);
-        return false;
-      }
-      if (typeof record.since !== "number" || !Number.isFinite(record.since)) {
-        this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_DORMANT_TRACKING, JSON.stringify({ since: now }));
-        return false;
-      }
-      return now - record.since >= DORMANT_AFTER_MS && record.done !== today;
-    }, false);
+    const due = this.reserved({ reads: 4 }, true, now, () => this.metaValue(META_IDLE_PRUNE_DAY) !== today, false);
     if (!due) return { pruned: [], more: false };
     const finishDay = () => this.reserved({ reads: 4, writes: 4 }, true, now, () => {
-      let record: { since?: number } = {};
-      try { record = JSON.parse(this.metaValue(META_DORMANT_TRACKING) || "{}"); } catch { /* kept below */ }
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_DORMANT_TRACKING, JSON.stringify({ since: record.since ?? now, done: today }));
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_IDLE_PRUNE_DAY, today);
     }, false);
-    const cutoff = now - DORMANT_AFTER_MS;
-    // Finding them reads every identity (no index on created_ms) and, for each
-    // candidate, its credentials, subscriptions, uploads and bot.
-    const found = this.reserved({ reads: 64 + this.config.registeredIdentityCount + 8 * DORMANT_BATCH * 4 }, true, now, () => {
+    const cutoff = now - this.config.idleAccountMs;
+    // Ranking reads every identity twice, with a passkey and a bot lookup each.
+    const found = this.reserved({ reads: 64 + 8 * this.config.registeredIdentityCount + 16 * IDLE_PRUNE_BATCH }, true, now, () => {
       const candidates = this.rawRows<{ user_id: string }>(
         `SELECT i.user_id FROM identities i
-         WHERE i.tier = 'registered' AND i.roles_json = '[]' AND i.created_ms < ? AND i.seen_ms > 0 AND i.seen_ms < i.created_ms + ? AND i.user_id != ?
-           AND EXISTS (SELECT 1 FROM credentials c INDEXED BY credentials_user_idx WHERE c.user_id = i.user_id)
-           AND NOT EXISTS (SELECT 1 FROM credentials c INDEXED BY credentials_user_idx WHERE c.user_id = i.user_id AND c.updated_ms >= i.created_ms + ?)
-           AND NOT EXISTS (SELECT 1 FROM push_subscriptions p WHERE p.user_id = i.user_id)
-           AND NOT EXISTS (SELECT 1 FROM user_status s WHERE s.user_id = i.user_id)
+         WHERE i.roles_json = '[]' AND i.user_id != ? AND ${lastActiveSql("i")} < ?
            AND NOT EXISTS (SELECT 1 FROM uploads u INDEXED BY uploads_owner_idx WHERE u.owner_id = i.user_id)
-           AND NOT EXISTS (SELECT 1 FROM identities b WHERE b.user_id = ? || i.user_id)
-         LIMIT ?`,
-        cutoff, DORMANT_ACTIVE_MS, ADMIN_USER_ID, DORMANT_ACTIVE_MS, BOT_PREFIX, DORMANT_BATCH + connected.size,
-      ).map((row) => row.user_id).filter((id) => !connected.has(id)).slice(0, DORMANT_BATCH);
+           AND i.user_id NOT IN (SELECT k.user_id FROM identities k WHERE k.roles_json = '[]' ORDER BY ${lastActiveSql("k")} DESC LIMIT ?)
+         ORDER BY ${lastActiveSql("i")} LIMIT ?`,
+        ADMIN_USER_ID, cutoff, this.config.keptActiveAccounts, IDLE_PRUNE_BATCH + connected.size,
+      ).map((row) => row.user_id).filter((id) => !connected.has(id)).slice(0, IDLE_PRUNE_BATCH);
       if (!candidates.length) return { ids: [] as string[], rows: 0, full: false };
-      const marks = candidates.map(() => "?").join(", ");
+      const bots = this.rawRows<{ user_id: string }>(
+        `SELECT user_id FROM identities WHERE user_id IN (${candidates.map(() => "?").join(", ")})`,
+        ...candidates.map((id) => BOT_PREFIX + id),
+      ).map((row) => row.user_id).filter((id) => !connected.has(id));
+      const ids = [...candidates, ...bots];
+      const marks = ids.map(() => "?").join(", ");
       let rows = 0;
-      for (const table of ["memberships", "read_cursors", "credentials", "push_wakes", "user_status", "room_mutes", "accepted_requests"]) {
-        rows += integerColumn(this.rawRows<{ count: number }>(`SELECT COUNT(*) AS count FROM ${table} WHERE user_id IN (${marks})`, ...candidates)[0]?.count);
+      for (const table of ["memberships", "read_cursors", "credentials", "push_subscriptions", "push_wakes", "user_status", "room_mutes", "accepted_requests"]) {
+        rows += integerColumn(this.rawRows<{ count: number }>(`SELECT COUNT(*) AS count FROM ${table} WHERE user_id IN (${marks})`, ...ids)[0]?.count);
       }
-      return { ids: candidates, rows, full: candidates.length === DORMANT_BATCH };
+      return { ids, rows, full: candidates.length === IDLE_PRUNE_BATCH };
     }, false);
     if (!found.ids.length) {
       finishDay();
@@ -3838,7 +3852,7 @@ export class Store {
         ...ids, ...ids,
       );
       this.rawExec(`UPDATE rooms SET fields_json = json_remove(fields_json, '$.creator_id') WHERE json_extract(fields_json, '$.creator_id') IN (${marks})`, ...ids);
-      for (const table of ["memberships", "read_cursors", "credentials", "push_wakes", "user_status", "room_mutes", "accepted_requests", "identities"]) {
+      for (const table of ["memberships", "read_cursors", "credentials", "push_subscriptions", "push_wakes", "user_status", "room_mutes", "accepted_requests", "identities"]) {
         this.rawExec(`DELETE FROM ${table} WHERE user_id IN (${marks})`, ...ids);
       }
       const limiterWhere = `scope IN (${USER_LIMIT_SCOPES.map(() => "?").join(", ")}) AND principal_key IN (${marks})`;
@@ -3849,34 +3863,75 @@ export class Store {
         this.rawExec("UPDATE _meta SET value = ? WHERE key = 'principal_limit_count'", String(Math.max(0, this.metaNumber("principal_limit_count") - limiters)));
       }
       for (const id of ids) this.limiters.dropPrincipal(`user:${id}`);
-      for (const id of ids) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, '1')", META_PURGED_PREFIX + id);
+      for (const id of ids) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_PURGED_PREFIX + id, String(now));
       this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(Math.max(0, this.metaNumber("identity_count") - ids.length)));
       const day = dayFor(now);
-      const previous = this.dormantPrunedRaw();
+      const previous = this.idlePrunedRaw();
       const record = { day, today: (previous.day === day ? previous.today : 0) + ids.length, total: previous.total + ids.length };
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_DORMANT_PRUNED, JSON.stringify(record));
+      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_IDLE_PRUNED, JSON.stringify(record));
     }), false);
-    console.log(JSON.stringify({ event: "dormant_pruned", count: ids.length }));
+    console.log(JSON.stringify({ event: "idle_accounts_pruned", count: ids.length }));
     if (!found.full) finishDay();
     return { pruned: ids, more: found.full };
   }
 
-  private dormantPrunedRaw(): { day: string; today: number; total: number } {
+  private idlePrunedRaw(): { day: string; today: number; total: number } {
     try {
-      const value = JSON.parse(this.metaValue(META_DORMANT_PRUNED) || "{}") as { day?: unknown; today?: unknown; total?: unknown };
+      const value = JSON.parse(this.metaValue(META_IDLE_PRUNED) || "{}") as { day?: unknown; today?: unknown; total?: unknown };
       return { day: typeof value.day === "string" ? value.day : "", today: integerColumn(value.today), total: integerColumn(value.total) };
     } catch {
       return { day: "", today: 0, total: 0 };
     }
   }
 
-  /** Dormant accounts pruned today and in all (pruneDormantIdentities), for `/status`: charged, never refused. */
-  dormantPruned(now = this.clock.now()): { today: number; total: number } {
+  /** Idle accounts pruned today and in all (pruneIdleIdentities), for `/status`: charged, never refused. */
+  idlePruned(now = this.clock.now()): { today: number; total: number } {
     this.ensureReady();
     return this.alert(() => this.reserved({ reads: 4 }, false, now, () => {
-      const record = this.dormantPrunedRaw();
+      const record = this.idlePrunedRaw();
       return { today: record.day === dayFor(now) ? record.today : 0, total: record.total };
     }, true));
+  }
+
+  /**
+   * Frees `user_id`s retired (`purged:<id>`, by `/purge` or the idle prune)
+   * more than `retiredUserIdMs` ago, so they may be issued again: by then
+   * nothing logged names them. A marker from before markers kept their time
+   * (`1`) starts its time now. At most RETIRED_SWEEP_BATCH a call; returns
+   * how many it read, so a full batch means more may remain.
+   */
+  sweepRetiredUserIds(now = this.clock.now()): number {
+    this.ensureReady();
+    return this.reserved({ reads: 16 + 2 * RETIRED_SWEEP_BATCH, writes: 8 + 4 * RETIRED_SWEEP_BATCH }, true, now, () => this.transaction(() => {
+      const rows = this.rawRows<{ key: string; value: string }>(
+        "SELECT key, value FROM _meta WHERE key >= ? AND key < ? ORDER BY key LIMIT ?", META_PURGED_PREFIX, META_PURGED_PREFIX.slice(0, -1) + ";", RETIRED_SWEEP_BATCH,
+      );
+      const cutoff = now - this.config.retiredUserIdMs;
+      for (const row of rows) {
+        const at = Number(row.value);
+        if (!Number.isFinite(at) || at <= 1) this.rawExec("UPDATE _meta SET value = ? WHERE key = ?", String(now), row.key);
+        else if (at < cutoff) this.rawExec("DELETE FROM _meta WHERE key = ?", row.key);
+      }
+      return rows.length;
+    }), false);
+  }
+
+  /**
+   * Clears mutes that ran out: an account's (`user_status`, deleted when
+   * nothing else is left in it) and its rooms' (`room_mutes`). Otherwise
+   * they stay until the user mutes again. Returns the rows changed.
+   */
+  clearExpiredMutes(now = this.clock.now()): number {
+    this.ensureReady();
+    const cap = this.config.registeredIdentityCount;
+    return this.reserved({ reads: 16 + 2 * cap + 2 * MAX_ROOM_MUTES_PER_USER * 64, writes: 16 + 4 * 1_000 }, true, now, () => this.transaction(() => {
+      const effective = this.effectiveNow(now);
+      let changed = 0;
+      changed += this.rawExec("UPDATE user_status SET mute_until_ms = NULL WHERE user_id IN (SELECT user_id FROM user_status WHERE mute_until_ms IS NOT NULL AND mute_until_ms <= ? LIMIT 1000)", effective).rowsWritten ?? 0;
+      changed += this.rawExec("DELETE FROM user_status WHERE user_id IN (SELECT user_id FROM user_status WHERE status = 'online' AND mute_until_ms IS NULL LIMIT 1000)").rowsWritten ?? 0;
+      changed += this.rawExec("DELETE FROM room_mutes WHERE (user_id, room_id) IN (SELECT user_id, room_id FROM room_mutes WHERE mute_until_ms <= ? LIMIT 1000)", effective).rowsWritten ?? 0;
+      return changed;
+    }), false);
   }
 
   /**
@@ -3912,6 +3967,7 @@ export class Store {
         userId: row.user_id,
         name: row.name,
         userHandle: row.user_handle,
+        createdMs: integerColumn(row.created_ms),
         credentialCount,
         rooms: this.userRooms(userId),
         roles: parseRoles(row.roles_json),
@@ -6150,14 +6206,15 @@ export class Store {
   }
 
   /**
-   * Forgets uploads past their expiry plus the lifecycle lag, when R2 has
-   * deleted them, freeing their bytes; an expired avatar leaves its owner.
-   * Maintenance work, a bounded batch per call.
+   * Forgets uploads past their expiry plus the lifecycle lag, freeing their
+   * bytes, and returns their keys for the caller to delete from R2 (a
+   * bucket lifecycle rule may already have); an expired avatar leaves its
+   * owner. Maintenance work, a bounded batch per call.
    */
-  cleanupUploads(now = this.clock.now()): number {
+  cleanupUploads(now = this.clock.now()): { count: number; deleted: string[] } {
     this.ensureReady();
     const policy = this.config.uploads;
-    if (!policy) return 0;
+    if (!policy) return { count: 0, deleted: [] };
     return this.reserved({ reads: 16 + 4 * UPLOAD_SWEEP_BATCH, writes: 8 + 12 * UPLOAD_SWEEP_BATCH }, true, now, () => this.transaction(() => {
       const rows = this.rawRows<RawUploadRow>(
         `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
@@ -6171,8 +6228,10 @@ export class Store {
           row.owner_id, `${policy.mediaOrigin}/${row.upload_key}`,
         );
       }
-      this.releaseUploadRows(rows);
-      return rows.length;
+      // The caller deletes them from R2 as well (deleteMedia), so expired files
+      // go even where the bucket has no lifecycle rule; custom emoji and the
+      // server's avatar never expire here.
+      return { count: rows.length, deleted: this.releaseUploadRows(rows) };
     }));
   }
 

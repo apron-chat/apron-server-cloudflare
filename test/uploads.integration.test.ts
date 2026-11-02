@@ -232,7 +232,8 @@ describe('store uploads', () => {
 			expect(store.getIdentity('erin')!.avatar).toBeUndefined();
 			expect(store.avatarRefreshDue('erin', clock.value)).toBeNull();
 			clock.value += UPLOADS.lifecycleLagSeconds * 1_000;
-			expect(store.cleanupUploads(clock.value)).toBe(1);
+			// Its key comes back for the caller to delete from R2.
+			expect(store.cleanupUploads(clock.value)).toEqual({ count: 1, deleted: [second.upload.key] });
 			// Clearing removes a live one.
 			setAvatar();
 			expect(store.clearAvatar({ userId: 'erin', now: clock.value }).changed).toBe(true);
