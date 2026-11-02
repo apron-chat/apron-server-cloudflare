@@ -402,11 +402,12 @@ turns it off and on without a deploy (texts already streaming finish).
 | `startsPerDay` (server-wide) | 100 | 30 | 500 |
 | `concurrent` (open texts server-wide, unused `write_url`s included) | 4 | 2 | 8 |
 | `readersPerText` (at once) | 200 | 5 | 200 |
-| `readsPerText` (over a text's life, reconnects included) | 1,000 | 15 | 1,000 |
 | `readers` (at once, every text together) | 400 | 10 | 400 |
 
 A reader costs one billed request however long it streams, and its bytes
-nothing; what bounds readers is the object's memory. Chunks are shared by
+nothing; what bounds readers is the object's memory, so only readers at
+once are limited. Reads over a text's life are not counted: the attempt
+limiters bound reconnects, and a text streams 300 seconds at most. Chunks are shared by
 all of a text's readers, and one more than 256 KiB behind is dropped, so
 each reader holds about a copy of what its text kept when it joined and its
 stream's buffers: about 100 KiB at worst, 40 MB at `readers`' ceiling,

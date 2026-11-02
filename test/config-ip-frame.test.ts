@@ -227,7 +227,10 @@ describe('configuration policy boundaries', () => {
 			// messages a request, plus admissions and a cleanup alarm an hour.
 			const messages = plan.limits.processedFramesPerDay + plan.limits.openConnections * Math.ceil(86_400 / plan.limits.pingSeconds);
 			// Live text, where on: each text's write and its reads, at the daily cap.
-			const live = plan.liveText && plan.features.liveText ? plan.liveText.startsPerDay * (1 + plan.liveText.readsPerText) : 0;
+			// Reads are bounded by the location's live-read share over a text's
+			// longest life (as if read from one location).
+			const live = plan.liveText && plan.features.liveText
+				? plan.liveText.startsPerDay * (1 + plan.admission.liveReadsPerLocationMinute * plan.liveText.moderatorMaxSeconds / 60) : 0;
 			const requests = messages / 20 + plan.limits.connectionAdmissionsPerDay + 24 + live;
 			const cap = plan.account.billCap;
 			if (!cap) {

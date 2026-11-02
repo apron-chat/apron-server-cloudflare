@@ -464,8 +464,6 @@ export interface LiveTextPolicy {
 	 * readers, and one too far behind is dropped (MAX_READER_BACKLOG_BYTES).
 	 */
 	readers: number;
-	/** `GET`s of one text's `url` over its life, reconnects included; past it they are refused. */
-	readsPerText: number;
 }
 
 export interface Plan {
@@ -592,7 +590,6 @@ export const MAX_LIVE_READERS = 400;
 export const MAX_LIVE_WRITE_WINDOW_SECONDS = 300;
 // Each text a day costs a write and its reads in Durable Object requests.
 export const MAX_LIVE_TEXTS_PER_DAY = 500;
-export const MAX_LIVE_READS_PER_TEXT = 1_000;
 export const MAX_SQL_WRITES = DEFAULT_LIMITS.sqlWritesPerDay;
 export const MAX_SQL_READS = DEFAULT_LIMITS.sqlReadsPerDay;
 export const MAX_DATABASE_HIGH_WATER_BYTES = DEFAULT_LIMITS.databaseHighWaterBytes;

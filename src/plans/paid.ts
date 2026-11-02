@@ -264,9 +264,10 @@ export const PAID_PLAN: Plan = Object.freeze({
 		concurrent: 4,
 		// A text a crowd opens: readers cost the object memory, not money (each
 		// read is one billed request, however long it streams), so the bound is
-		// the server-wide one, at its ceiling.
+		// readers at once, server-wide at its ceiling. Reads over a text's life
+		// are not counted: the attempt limiters bound reconnects, and a text
+		// streams 300 seconds at most.
 		readersPerText: 200,
-		readsPerText: 1_000,
 		readers: 400,
 	}),
 	features: Object.freeze({

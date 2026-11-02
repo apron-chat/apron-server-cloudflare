@@ -193,8 +193,6 @@ export class LiveReaders {
 	private pending: Uint8Array[] = [];
 	private pendingBytes = 0;
 	private timer: ReturnType<typeof setTimeout> | undefined;
-	/** Reads the text has served over its life, reconnects included. */
-	served = 0;
 
 	get size(): number {
 		return this.controllers.size;
@@ -207,7 +205,6 @@ export class LiveReaders {
 	 */
 	open(initial: Uint8Array): ReadableStream<Uint8Array> {
 		this.flush();
-		this.served += 1;
 		let own: ReadableStreamDefaultController<Uint8Array> | undefined;
 		return new ReadableStream<Uint8Array>({
 			start: (controller) => {

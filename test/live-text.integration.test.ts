@@ -380,10 +380,10 @@ describe('live text end to end', () => {
 			const resaved = saved.skipped.find((f) => isMessage(id)(f) && f.params.body?.embeds?.[0]?.og !== undefined)
 				?? (await until(writer, (f) => isMessage(id)(f) && f.params.body?.embeds?.[0]?.og !== undefined)).frame;
 			expect(resaved.params.body.embeds[0]).toMatchObject({ url, og: terminalOg(title) });
-			// Redirects aren't reads: more of them than readsPerText leave a reader its read.
-			const readsPerText = 5;
-			await withLivePolicy({ readersPerText: 5, readsPerText }, async () => {
-				for (let index = 0; index <= readsPerText; index++) {
+			// Redirects aren't reads: more of them than readersPerText leave a reader its read.
+			const readersPerText = 5;
+			await withLivePolicy({ readersPerText }, async () => {
+				for (let index = 0; index <= readersPerText; index++) {
 					const page = await navigate(url);
 					expect(page.status).toBe(302);
 					expect(page.headers.get('Location')).toBe(`https://terminal.apron.chat/#${new URLSearchParams({ stream: url })}`);

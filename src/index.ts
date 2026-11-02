@@ -1758,20 +1758,19 @@ async function handleLiveRead(request: Request, env: Env, id: string): Promise<R
 
 /**
  * A live text read the object refused, and why (`Apron-Live-Refused`):
- * `ended` (or never existed), `reads` (read as often as it may be), both for
- * good, or `readers` (as many at once as it may have), for its
+ * `ended` (or never existed), for good, or `readers` (as many at once as it,
+ * or every text together, may have), for its
  * `Retry-After`. Each entry Worker isolate repeats it for LIVE_REFUSAL_MS
  * at most (`readers`: its `Retry-After`), keeping at most LIVE_REFUSALS.
  */
 const LIVE_REFUSED_HEADER = "Apron-Live-Refused";
 const LIVE_REFUSAL_MS = 10 * 60_000;
 const LIVE_REFUSALS = 1_024;
-type LiveRefusal = "ended" | "reads" | "readers";
+type LiveRefusal = "ended" | "readers";
 const liveRefusals = new Map<string, { kind: LiveRefusal; until: number }>();
 
 function liveRefusalResponse(kind: LiveRefusal, until: number): Response {
 	const response = kind === "ended" ? liveAnswer(404, "This live text has ended, or never existed")
-		: kind === "reads" ? liveAnswer(403, "This live text has been read as often as it may be")
 		: liveAnswer(429, "This live text has as many readers as it may have", Math.max(1_000, until - Date.now()));
 	response.headers.set(LIVE_REFUSED_HEADER, kind);
 	return response;
@@ -1779,7 +1778,7 @@ function liveRefusalResponse(kind: LiveRefusal, until: number): Response {
 
 function rememberLiveRefusal(id: string, response: Response): void {
 	const kind = response.headers.get(LIVE_REFUSED_HEADER);
-	if (kind !== "ended" && kind !== "reads" && kind !== "readers") return;
+	if (kind !== "ended" && kind !== "readers") return;
 	const now = Date.now();
 	const retry = Number(response.headers.get("Retry-After"));
 	const until = now + (kind === "readers" ? Math.min(LIVE_REFUSAL_MS, (Number.isFinite(retry) && retry > 0 ? retry : 10) * 1_000) : LIVE_REFUSAL_MS);
@@ -1790,7 +1789,7 @@ function rememberLiveRefusal(id: string, response: Response): void {
 	liveRefusals.set(id, { kind, until });
 }
 
-/** The refusal to repeat for a read of `id`, if one is remembered; the caps (`reads`, `readers`) apply to `capped` reads only. */
+/** The refusal to repeat for a read of `id`, if one is remembered; `readers` applies to `capped` reads only. */
 function rememberedLiveRefusal(id: string, capped: boolean): Response | undefined {
 	const entry = liveRefusals.get(id);
 	if (!entry) return undefined;
@@ -6562,8 +6561,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * A reader's `GET` of a live text's `url` (§4.8.3): what is kept, then
 	 * every chunk as it arrives, from memory, until the text ends. A text a
 	 * message announced whose write has not started yet has its readers wait
-	 * for it. Each text has at most `readersPerText` readers at once and
-	 * `readsPerText` reads over its life; an ended or unknown one is 404. A
+	 * for it. Each text has at most `readersPerText` readers at once, and
+	 * every text together `readers`; an ended or unknown one is 404. A
 	 * browser that opens a terminal's `url` as a page (`navigate`) goes to the
 	 * terminal viewer instead, if there is one, with the `url` in
 	 * the fragment, which never reaches the viewer's host (§4.8.5); that is
@@ -6587,7 +6586,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Readers that fetch it get the text; a browser opening it as a page, the viewer.
 		if (viewer) headers.set("Vary", "Sec-Fetch-Mode");
 		if (head) return new Response(null, { headers });
-		if (session.readers.served >= policy.readsPerText) return liveRefused(liveAnswer(403, "This live text has been read as often as it may be"), "reads");
 		if (session.readers.size >= policy.readersPerText) return liveRefused(liveAnswer(429, "This live text has as many readers as it may have", 10_000), "readers");
 		let readers = 0;
 		for (const open of this.liveSessions.values()) readers += open.readers.size;

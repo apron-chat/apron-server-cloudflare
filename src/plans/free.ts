@@ -198,7 +198,6 @@ export const FREE_PLAN: Plan = Object.freeze({
 		startsPerDay: 30,
 		concurrent: 2,
 		readersPerText: 5,
-		readsPerText: 15,
 		readers: 10,
 	}),
 	features: Object.freeze({

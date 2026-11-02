@@ -160,7 +160,7 @@ describe('live text reads at the entry Worker', () => {
 	});
 
 	it('repeat a refusal the object made for a full or finished text, without asking it or spending attempts', async () => {
-		for (const [kind, status] of [['readers', 429], ['reads', 403], ['ended', 404]] as const) {
+		for (const [kind, status] of [['readers', 429], ['ended', 404]] as const) {
 			resetLiveRefusals();
 			let objectCalls = 0;
 			const reads = counter();

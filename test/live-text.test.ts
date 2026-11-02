@@ -226,7 +226,7 @@ describe('live text policy', () => {
 		// Readers are bounded server-wide, at least one text's worth, at most the memory ceiling.
 		expect(() => validateLiveTextPolicy({ ...PAID_PLAN.liveText!, readers: PAID_PLAN.liveText!.readersPerText - 1 }, limits)).toThrow(ConfigError);
 		expect(() => validateLiveTextPolicy({ ...PAID_PLAN.liveText!, readers: 401 }, limits)).toThrow(ConfigError);
-		expect(() => validateLiveTextPolicy({ ...PAID_PLAN.liveText!, readsPerText: 1_001 }, limits)).toThrow(ConfigError);
+		expect(() => validateLiveTextPolicy({ ...PAID_PLAN.liveText!, readersPerText: 201 }, limits)).toThrow(ConfigError);
 		// A finished terminal's output always fits one history response.
 		expect(MAX_TERMINAL_OUTPUT_JSON_BYTES + limits.maxSnapshotBytes + 1024).toBeLessThanOrEqual(limits.historyMaxResponseBytes);
 	});
