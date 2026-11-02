@@ -6,6 +6,8 @@ import { loadConfig } from '../src/config.ts';
 const root = new URL('../', import.meta.url);
 const begin = '# BEGIN GENERATED ADMISSION BUDGET';
 const end = '# END GENERATED ADMISSION BUDGET';
+/** The web client a browser opening the server's address is sent to (renderEdgeRules). */
+const WEB_CLIENT = 'https://web.apron.chat/';
 
 export function validateAdmission(admission = ADMISSION_BUDGET, limits = DEFAULT_LIMITS) {
 	for (const [name, value] of Object.entries(admission)) {
@@ -89,10 +91,17 @@ ${end}`;
  * With `liveText`, a configuration rule turns off the edge's request body
  * buffering for `PUT` on `/w/`, which would otherwise hold a slow writer's
  * first bytes, such as typed keys, until more arrive.
+ * With `webClient`, a web client's URL, a redirect rule sends a browser that
+ * opens the server's address as a page (a `GET /` that is neither a WebSocket
+ * handshake nor a connection status probe, which `apron_invalid_request`
+ * would block) to that client with the server prefilled, before the block
+ * and without invoking the Worker.
  */
-export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHostname = undefined, liveText = false, relatedOrigins = false) {
+export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHostname = undefined, liveText = false, relatedOrigins = false, webClient = undefined) {
 	validateAdmission(admission);
 	const host = `http.host eq ${JSON.stringify(hostname)}`;
+	const handshake = 'any(lower(http.request.headers["upgrade"][*])[*] eq "websocket")';
+	const probe = 'any(http.request.uri.args["apron_connection_status"][*] eq "1")';
 	const writes = (mediaHostname || liveText ? ' and not (http.request.method in {"PUT" "OPTIONS"} and starts_with(http.request.uri.path, "/w/"))' : '') +
 		(liveText ? ' and not (http.request.method in {"GET" "HEAD" "OPTIONS"} and starts_with(http.request.uri.path, "/live/"))' : '') +
 		(relatedOrigins ? ' and not (http.request.method in {"GET" "HEAD"} and http.request.uri.path eq "/.well-known/webauthn")' : '');
@@ -105,7 +114,7 @@ export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHos
 				{
 					ref: 'apron_invalid_request',
 					description: `Apron: allow ${allowed.slice(0, -1).join(', ')}${allowed.length > 2 ? ',' : ''} and ${allowed[allowed.length - 1]}`,
-					expression: `(${host})${writes} and (http.request.method ne "GET" or not http.request.uri.path in {"/" "/ws"} or (not any(lower(http.request.headers["upgrade"][*])[*] eq "websocket") and not any(http.request.uri.args["apron_connection_status"][*] eq "1")))`,
+					expression: `(${host})${writes} and (http.request.method ne "GET" or not http.request.uri.path in {"/" "/ws"} or (not ${handshake} and not ${probe}))`,
 					action: 'block', enabled: true,
 				},
 				{
@@ -140,6 +149,24 @@ export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHos
 				}],
 			},
 		} : {}),
+		...(webClient ? {
+			redirect: {
+				phase: 'http_request_dynamic_redirect',
+				rules: [{
+					ref: 'apron_browser_redirect',
+					description: 'Apron: send a browser opening the server as a page to the web client, with the server prefilled',
+					expression: `(${host}) and http.request.method eq "GET" and http.request.uri.path eq "/" and not ${handshake} and not ${probe}`,
+					action: 'redirect', enabled: true,
+					action_parameters: {
+						from_value: {
+							status_code: 302,
+							target_url: { expression: webClientTarget(webClient) },
+							preserve_query_string: false,
+						},
+					},
+				}],
+			},
+		} : {}),
 		// Free WAF cannot scope a rate-limiting rule by hostname. Keep this
 		// optional rule disabled until its effect on the entire zone is approved.
 		optionalZoneRateLimit: {
@@ -158,6 +185,20 @@ export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHos
 			}],
 		},
 	};
+}
+
+/**
+ * The redirect target, as a rules expression: the web client with the
+ * request's own host prefilled as the server, so the rule names no host.
+ * The client reads `server`, a `wss:` URL, from the fragment, which never
+ * reaches its host.
+ */
+export function webClientTarget(webClient) {
+	const url = new URL(webClient);
+	if (url.protocol !== 'https:' || url.hash || url.username || url.password || /["\\]/.test(url.href)) {
+		throw new Error('The web client must be an https URL without a fragment or user info');
+	}
+	return `concat(${JSON.stringify(`${url.href}#server=wss://`)}, http.host, "/")`;
 }
 
 export function replaceBinding(source, binding) {
@@ -281,7 +322,7 @@ function main() {
 	// The Worker answers /.well-known/webauthn only on RP_ID's host, so the
 	// rule lets it through only where that is the server's own hostname.
 	const relatedOrigins = relyingPartyId(production) === hosts[0][1];
-	outputs.push(['docs/edge-rules.generated.json', JSON.stringify(renderEdgeRules(hosts[0][1], ADMISSION_BUDGET, media, liveText, relatedOrigins), null, 2) + '\n']);
+	outputs.push(['docs/edge-rules.generated.json', JSON.stringify(renderEdgeRules(hosts[0][1], ADMISSION_BUDGET, media, liveText, relatedOrigins, WEB_CLIENT), null, 2) + '\n']);
 	let stale = false;
 	for (const [file, expected] of outputs) {
 		const path = new URL(file, root);
