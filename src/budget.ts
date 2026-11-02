@@ -202,6 +202,13 @@ interface AdmissionBudget {
 	 * get 503 with a `Retry-After` of `workerWindowSeconds`.
 	 */
 	objectRequestsPerLocationMinute: number;
+	/**
+	 * Reads of live text `url`s (§4.8.3) one Cloudflare location may pass to
+	 * the Durable Object a minute, apart from connection attempts, so a text
+	 * read by a crowd never spends the WebSocket admissions there. Past it,
+	 * reads there get 503 with a `Retry-After` of `workerWindowSeconds`.
+	 */
+	liveReadsPerLocationMinute: number;
 	workerWindowSeconds: number;
 	edgeRequestsPerIpWindow: number;
 	edgeWindowSeconds: number;

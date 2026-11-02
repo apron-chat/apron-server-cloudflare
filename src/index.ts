@@ -706,6 +706,12 @@ const ATTACK_TRIGGER_LABEL: Record<string, string> = {
 
 const ATTACK_CLOSE_REASON = "Server paused: unusual traffic; try later";
 
+/** Marks a live text refusal for the entry Worker to repeat (rememberLiveRefusal). */
+function liveRefused(response: Response, kind: LiveRefusal): Response {
+	response.headers.set(LIVE_REFUSED_HEADER, kind);
+	return response;
+}
+
 /** A guest connection this long without an application frame may make room on a full server (evictIdleGuest). */
 const GUEST_IDLE_MS = 10 * 60_000;
 
@@ -1655,16 +1661,19 @@ function liveAnswer(status: number, message: string, retryAfterMs?: number): Res
  * connection-attempt limiters, as a WebSocket upgrade is, before it can
  * cost a Durable Object request. Null when it may go on.
  */
-async function liveAdmission(request: Request, env: Env): Promise<{ refused: Response } | { ipKey: string }> {
+async function liveAdmission(request: Request, env: Env, read = false): Promise<{ refused: Response } | { ipKey: string }> {
 	const clientIp = extractClientIp(request.headers);
 	if (!clientIp) return { refused: liveAnswer(403, "Trusted client address unavailable") };
 	const key = await hashIpKey(clientIp);
 	try {
-		const { CONNECTION_ATTEMPTS, LOCATION_ATTEMPTS } = env;
-		if (!CONNECTION_ATTEMPTS || !LOCATION_ATTEMPTS) return { refused: liveAnswer(503, "Demo admission unavailable", UNAVAILABLE_RETRY_MS) };
+		// A read spends its location's live-read share, not its connection
+		// attempts, so a crowd reading a text leaves WebSocket admission alone.
+		const { CONNECTION_ATTEMPTS } = env;
+		const location = read ? env.LIVE_READS : env.LOCATION_ATTEMPTS;
+		if (!CONNECTION_ATTEMPTS || !location) return { refused: liveAnswer(503, "Demo admission unavailable", UNAVAILABLE_RETRY_MS) };
 		const window = ADMISSION_BUDGET.workerWindowSeconds * 1_000;
 		if (!(await CONNECTION_ATTEMPTS.limit({ key })).success) return { refused: liveAnswer(429, "Too many requests from your address", window) };
-		if (!(await LOCATION_ATTEMPTS.limit({ key: "location" })).success) return { refused: liveAnswer(503, "Demo is busy; try again shortly", window) };
+		if (!(await location.limit({ key: "location" })).success) return { refused: liveAnswer(503, "Demo is busy; try again shortly", window) };
 	} catch {
 		return { refused: liveAnswer(503, "Demo admission unavailable", UNAVAILABLE_RETRY_MS) };
 	}
@@ -1725,7 +1734,13 @@ async function handleLiveRead(request: Request, env: Env, id: string): Promise<R
 		return liveAnswer(503, "Configuration unavailable");
 	}
 	if (!config.liveText || !env.DEMO || !LIVE_ID_PATTERN.test(id)) return liveAnswer(404, "Not found");
-	const admitted = await liveAdmission(request, env);
+	const navigate = request.headers.get("Sec-Fetch-Mode") === "navigate";
+	// A refusal the object made moments ago for this text is repeated here,
+	// before the attempt limiters: a crowd retrying a full or finished text
+	// costs no object request and spends no attempts.
+	const remembered = rememberedLiveRefusal(id, request.method === "GET" && !navigate);
+	if (remembered) return remembered;
+	const admitted = await liveAdmission(request, env, true);
 	if ("refused" in admitted) return admitted.refused;
 	// A browser opening it as a page goes to the terminal viewer, if there is one (§4.8.5).
 	const headers = new Headers({ [INTERNAL_IP_HEADER]: admitted.ipKey });
@@ -1733,10 +1748,63 @@ async function handleLiveRead(request: Request, env: Env, id: string): Promise<R
 	// manual: the object's redirect to the viewer is the browser's to follow, not this fetch's.
 	const forwarded = new Request(`https://live.internal${LIVE_READ_PATH}${id}`, { method: request.method, headers, redirect: "manual" });
 	try {
-		return fromObject(await env.DEMO.getByName(OBJECT_NAME).fetch(forwarded));
+		const response = fromObject(await env.DEMO.getByName(OBJECT_NAME).fetch(forwarded));
+		rememberLiveRefusal(id, response);
+		return response;
 	} catch {
 		return liveAnswer(503, "Server unavailable; try again shortly", UNAVAILABLE_RETRY_MS);
 	}
+}
+
+/**
+ * A live text read the object refused, and why (`Apron-Live-Refused`):
+ * `ended` (or never existed), `reads` (read as often as it may be), both for
+ * good, or `readers` (as many at once as it may have), for its
+ * `Retry-After`. Each entry Worker isolate repeats it for LIVE_REFUSAL_MS
+ * at most (`readers`: its `Retry-After`), keeping at most LIVE_REFUSALS.
+ */
+const LIVE_REFUSED_HEADER = "Apron-Live-Refused";
+const LIVE_REFUSAL_MS = 10 * 60_000;
+const LIVE_REFUSALS = 1_024;
+type LiveRefusal = "ended" | "reads" | "readers";
+const liveRefusals = new Map<string, { kind: LiveRefusal; until: number }>();
+
+function liveRefusalResponse(kind: LiveRefusal, until: number): Response {
+	const response = kind === "ended" ? liveAnswer(404, "This live text has ended, or never existed")
+		: kind === "reads" ? liveAnswer(403, "This live text has been read as often as it may be")
+		: liveAnswer(429, "This live text has as many readers as it may have", Math.max(1_000, until - Date.now()));
+	response.headers.set(LIVE_REFUSED_HEADER, kind);
+	return response;
+}
+
+function rememberLiveRefusal(id: string, response: Response): void {
+	const kind = response.headers.get(LIVE_REFUSED_HEADER);
+	if (kind !== "ended" && kind !== "reads" && kind !== "readers") return;
+	const now = Date.now();
+	const retry = Number(response.headers.get("Retry-After"));
+	const until = now + (kind === "readers" ? Math.min(LIVE_REFUSAL_MS, (Number.isFinite(retry) && retry > 0 ? retry : 10) * 1_000) : LIVE_REFUSAL_MS);
+	if (liveRefusals.size >= LIVE_REFUSALS) {
+		for (const [key, entry] of liveRefusals) if (entry.until <= now) liveRefusals.delete(key);
+		if (liveRefusals.size >= LIVE_REFUSALS) liveRefusals.clear();
+	}
+	liveRefusals.set(id, { kind, until });
+}
+
+/** The refusal to repeat for a read of `id`, if one is remembered; the caps (`reads`, `readers`) apply to `capped` reads only. */
+function rememberedLiveRefusal(id: string, capped: boolean): Response | undefined {
+	const entry = liveRefusals.get(id);
+	if (!entry) return undefined;
+	if (entry.until <= Date.now()) {
+		liveRefusals.delete(id);
+		return undefined;
+	}
+	if (entry.kind !== "ended" && !capped) return undefined;
+	return liveRefusalResponse(entry.kind, entry.until);
+}
+
+/** Forgets remembered live text refusals, for tests. */
+export function resetLiveRefusals(): void {
+	liveRefusals.clear();
 }
 
 /** The object keys a media origin serves: attachments, avatars, custom emoji and their catalogs, and the server's avatar (`e/`). */
@@ -6506,7 +6574,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		let session = this.liveSessions.get(id);
 		if (!session) {
 			const entry = this.store.openLiveTexts(nowMs()).find((candidate) => candidate.id === id);
-			if (!entry || entry.state !== "pending" || entry.messageId === undefined) return liveAnswer(404, "This live text has ended, or never existed");
+			if (!entry || entry.state !== "pending" || entry.messageId === undefined) return liveRefused(liveAnswer(404, "This live text has ended, or never existed"), "ended");
 			session = { entry, readers: new LiveReaders() };
 			this.liveSessions.set(id, session);
 		}
@@ -6519,8 +6587,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Readers that fetch it get the text; a browser opening it as a page, the viewer.
 		if (viewer) headers.set("Vary", "Sec-Fetch-Mode");
 		if (head) return new Response(null, { headers });
-		if (session.readers.served >= policy.readsPerText) return liveAnswer(403, "This live text has been read as often as it may be");
-		if (session.readers.size >= policy.readersPerText) return liveAnswer(429, "This live text has as many readers as it may have", 10_000);
+		if (session.readers.served >= policy.readsPerText) return liveRefused(liveAnswer(403, "This live text has been read as often as it may be"), "reads");
+		if (session.readers.size >= policy.readersPerText) return liveRefused(liveAnswer(429, "This live text has as many readers as it may have", 10_000), "readers");
 		return new Response(session.readers.open(session.buffer?.kept() ?? new Uint8Array(0)), { headers });
 	}
 

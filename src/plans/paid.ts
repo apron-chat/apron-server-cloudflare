@@ -150,6 +150,9 @@ export const PAID_PLAN: Plan = Object.freeze({
 		requestsPerIpv6PrefixMinute: 180,
 		// Twice a full reconnect of the 500 open connections, as on Free.
 		objectRequestsPerLocationMinute: 1_000,
+		// Live text readers have their own location share, so a crowd reading
+		// one text cannot crowd out connections there.
+		liveReadsPerLocationMinute: 1_000,
 	}),
 	// Monthly included usage divided by 31 days, rounded down, so stopping
 	// under the daily share every day keeps the month inside what $5 covers.
