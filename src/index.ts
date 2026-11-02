@@ -816,6 +816,7 @@ export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		historyRequestsPerUserDay: limits.historyRequestsPerUserDay,
 		historyRequestsPerIpDay: limits.historyRequestsPerIpDay,
 		historyRequestsPerDay: limits.historyRequestsPerDay,
+		guestHistoryDepth: limits.guestHistoryDepth,
 		anonymousPostsPerMinute: limits.anonymousPostsPerMinute,
 		anonymousPostsPerDay: limits.anonymousPostsPerDay,
 		registeredPostsPerMinute: limits.registeredPostsPerMinute,
@@ -3691,11 +3692,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const before = asDecimalId(params.before, "before");
 		const limit = positiveIntParam(params, "limit");
 		// Scrolling back (`before` alone) is the costliest history, and a crowd
-		// of guests can spend it all: older pages are for accounts. The newest
-		// page, catching up with `after`, and a window bounded by both stay
-		// open to guests.
+		// of guests can spend it all: a guest's reaches `guestHistoryDepth`
+		// records back from the head, the store decides (Store.history), and
+		// older pages are for accounts. The newest page, `before` the head,
+		// catching up with `after`, and a window bounded by both stay open.
 		const guest = attachment.tier !== "registered";
-		if (guest && before !== undefined && after === undefined) throw { name: "denied", message: "Sign in to load older history" } satisfies ProtocolError;
 		attachment.historyInFlight += 1;
 		writeAttachment(socket, attachment);
 		try {

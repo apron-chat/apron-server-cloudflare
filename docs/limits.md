@@ -155,7 +155,7 @@ mutation with the **same** `id`.
 | Message | Limit | Notes |
 | --- | --- | --- |
 | History request already in progress (`retry_after` 1) | 1 `history` request at a time per connection | Wait for the previous page. |
-| Sign in to load older history (`denied`) | Guests get the newest page, `after`, and windows bounded by both, but not `before` alone | Scrolling back is for accounts. |
+| Sign in to load older history (`denied`) | Guests get the newest page (with or without `before` the head), `after`, windows bounded by both, and `before` alone up to `guestHistoryDepth` (200) records back from a room's head, but not further | Scrolling further back is for accounts. |
 | History request limit reached | 20 a minute per account (burst 60); 60 a minute per address (burst 120); a guest counts only against its address | `ext.limits` `read`. |
 | Daily history limit reached / …for this network / …for the server | 3,000 a day per account; 30,000 per address; 400,000 on the server | `ext.limits` `read`. |
 | Room listing limited | 6 `room_list` a minute per account | The first `filter: "joined"` listing after each sign-in is free. Keep the list current from `room_update` rather than polling. |
@@ -176,7 +176,7 @@ These keep the socket open and answer requests with `retry_after`, with
 
 | `data.reason` | Means | Lasts |
 | --- | --- | --- |
-| `degraded` | The day's budget is 70% spent: live text, uploads and loading older history (`history` with `before`) are off; chat works | Until the next UTC day |
+| `degraded` | The day's budget is 70% spent: live text, uploads and loading older history (`history` with `before`, but not the newest page) are off; chat works | Until the next UTC day |
 | `frame_budget` | The day's frames are spent: requests and new connections are refused | Until the next UTC day |
 | `daily_budget` | The day's storage budget is spent | Until the next UTC day |
 | `operation_paused` | That one action used more storage than expected (three times in an hour, or once by far) and is paused for everyone; other actions work | An hour |

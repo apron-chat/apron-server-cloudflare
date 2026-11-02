@@ -230,10 +230,15 @@ it('degrades at 70% of a daily ceiling: live text, uploads and older history are
 		expect(busy.budgetShares(now)?.writes).toBeGreaterThanOrEqual(0.7);
 		const upload = refusal(() => busy.startAvatarUpload({ userId: 'degrade_user', now }));
 		expect(upload.data?.reason).toBe(DEGRADED);
-		const older = refusal(() => busy.history({ roomId: 'general', before: '9007199254740990', now, userId: 'degrade_user', ipKey: 'ip-degrade' }));
+		// A page more than a page back from the head is older history.
+		const older = refusal(() => busy.history({ roomId: 'general', before: '1', limit: 1, now, userId: 'degrade_user', ipKey: 'ip-degrade' }));
 		expect(older.data?.reason).toBe(DEGRADED);
-		// The latest page still loads.
-		expect(() => busy.history({ roomId: 'general', now, userId: 'degrade_user', ipKey: 'ip-degrade' })).not.toThrow();
+		// The latest page still loads, asked for with no bound or with `before` the head (§4.3.5).
+		const latest = busy.history({ roomId: 'general', now, userId: 'degrade_user', ipKey: 'ip-degrade' });
+		expect(() => busy.history({ roomId: 'general', before: latest.latest_log_id, now, userId: 'degrade_user', ipKey: 'ip-degrade' })).not.toThrow();
+		expect(() => busy.history({ roomId: 'general', before: '9007199254740990', now, userId: 'degrade_user', ipKey: 'ip-degrade' })).not.toThrow();
+		// A window bounded by both stays off, as before.
+		expect(refusal(() => busy.history({ roomId: 'general', after: '1', before: latest.latest_log_id, now, userId: 'degrade_user', ipKey: 'ip-degrade' })).data?.reason).toBe(DEGRADED);
 	});
 });
 

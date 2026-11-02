@@ -192,6 +192,11 @@ export interface StoreConfig {
   historyRequestsPerUserDay: number;
   historyRequestsPerIpDay: number;
   historyRequestsPerDay: number;
+  /**
+   * How far back from a room's head, in records, a guest may page with
+   * `before` alone: the records past `before` must be fewer than this.
+   */
+  guestHistoryDepth: number;
   anonymousPostsPerMinute: number;
   anonymousPostsPerDay: number;
   registeredPostsPerMinute: number;
@@ -503,6 +508,7 @@ const DEFAULT_CONFIG: StoreConfig = {
   historyRequestsPerUserDay: DEFAULT_LIMITS.historyRequestsPerUserDay,
   historyRequestsPerIpDay: DEFAULT_LIMITS.historyRequestsPerIpDay,
   historyRequestsPerDay: DEFAULT_LIMITS.historyRequestsPerDay,
+  guestHistoryDepth: DEFAULT_LIMITS.guestHistoryDepth,
   anonymousPostsPerMinute: DEFAULT_LIMITS.anonymousPostsPerMinute,
   anonymousPostsPerDay: DEFAULT_LIMITS.anonymousPostsPerDay,
   registeredPostsPerMinute: DEFAULT_LIMITS.registeredPostsPerMinute,
@@ -3197,12 +3203,17 @@ export class Store {
    * DEGRADE_SHARE of their ceiling (budgetShares), until UTC midnight.
    */
   private assertNotDegraded(feature: string, now: number): void {
-    const shares = this.budgetShares(now);
-    if (!shares || Math.max(shares.reads, shares.writes, shares.frames) < DEGRADE_SHARE) return;
+    if (!this.degraded(now)) return;
     throw new StoreError("retry_after", `${feature} is off while the server is busy; try after the daily reset`, {
       retryAfterMs: Math.max(1_000, 86_400_000 - (now % 86_400_000)),
       data: { reason: DEGRADED },
     });
+  }
+
+  /** Whether today's foreground SQL or frames have reached DEGRADE_SHARE of their ceiling. */
+  private degraded(now: number): boolean {
+    const shares = this.budgetShares(now);
+    return Boolean(shares && Math.max(shares.reads, shares.writes, shares.frames) >= DEGRADE_SHARE);
   }
 
   /**
@@ -7404,20 +7415,41 @@ export class Store {
     this.ensureReady();
     const operationNow = query.now ?? this.clock.now();
     const charged = Boolean(query.userId && query.ipKey);
+    // `before` alone pages back from the head: how far back it starts, in
+    // records past `before`, decides whether a guest may have it and whether
+    // the degraded tier counts it as older history. The newest page is
+    // neither: its `before` is the head, give or take the records since.
+    const backward = query.before !== undefined && query.after === undefined;
+    const limit = this.historyLimit(query);
+    // The degraded tier lets through a page within two pages of the head: a
+    // room viewed without joining knows its head only from a listing.
+    const newestReach = 2 * limit;
+    const guestReach = Math.max(this.config.guestHistoryDepth, limit);
+    const depthCap = Math.max(newestReach, query.guest ? guestReach : 0);
     return this.reserved({
       ...this.config.historyCost,
-      reads: this.historyReads(query),
+      // Measuring a backward page reads the rooms again (a private one's
+      // membership too) and at most `depthCap` records and one more a room.
+      reads: this.historyReads(query) + (backward ? depthCap + 3 * this.historyRoomCount(query) : 0),
       // A page writes only its two limiter rows and the budget row: about 20
       // rows for a first request, which creates both limiter rows.
       writes: Math.max(32, this.config.historyCost.writes ?? 0),
       history: charged ? 1 : 0,
     }, false, operationNow, (unused) => {
+      // A page refused once measured read rows to find out: it stays charged,
+      // to the user's and IP's limiters and the server's count, so refusals
+      // cost what a page does and cannot be repeated for free.
+      let measuredRefusal: StoreError | undefined;
       try {
         const now = this.effectiveNow(operationNow);
         // Scrolling back, the costliest reads, is the history the degraded
-        // tier turns off; checked here, where today's budget is in memory.
-        if (query.before !== undefined) this.assertNotDegraded("Loading older history", operationNow);
-        return this.transaction(() => {
+        // tier turns off (today's budget is in memory), and a guest's
+        // reaches only `guestHistoryDepth` records back: past that, older
+        // pages are for accounts. A page near the head is the newest, open
+        // to everyone in every tier.
+        const degraded = query.before !== undefined && this.degraded(operationNow);
+        if (degraded && !backward) this.assertNotDegraded("Loading older history", operationNow);
+        const page = this.transaction(() => {
           if (charged && !query.guest) {
             this.chargeEvent("history", `user:${query.userId}`, now,
               { perMinute: this.config.historyRequestsPerUserMinute, burst: this.config.historyBurstPerUser },
@@ -7430,11 +7462,24 @@ export class Store {
               "History request limit reached",
               { limit: this.config.historyRequestsPerIpDay, message: "Daily history limit reached for this network" }, "read");
           }
+          if (backward && (query.guest || degraded)) {
+            const depth = this.recordsAfter(query, depthCap);
+            try {
+              if (degraded && depth >= newestReach) this.assertNotDegraded("Loading older history", operationNow);
+              if (query.guest && depth >= guestReach) throw new StoreError("denied", "Sign in to load older history");
+            } catch (error) {
+              // Returned rather than thrown, so the transaction keeps the charges.
+              measuredRefusal = error as StoreError;
+              return undefined;
+            }
+          }
           return this.historyPageInternal({ ...query, now });
         });
+        if (measuredRefusal) throw measuredRefusal;
+        return page!;
       } catch (error) {
         // No page was served, and the rollback undid the user's and IP's charges: the server-wide count goes back too.
-        unused.history = 1;
+        if (error !== measuredRefusal) unused.history = 1;
         throw error;
       }
     });
@@ -7462,9 +7507,49 @@ export class Store {
   private historyReads(query: StoreHistoryQuery): number {
     const single = Math.max(256, this.config.historyCost.reads ?? 0);
     if (query.roomId !== undefined || !query.roomIds) return single;
-    const limit = query.limit !== undefined && Number.isInteger(query.limit) && query.limit > 0 ? Math.min(query.limit, this.config.maxHistoryLimit) : this.config.historyDefaultLimit;
+    const limit = this.historyLimit(query);
     // The scan of the log reads an index entry and a row for each record.
     return Math.max(single, 64 + 2 * HISTORY_SCAN_PAGES * (limit + 1) + new Set(query.roomIds).size * (limit + 3));
+  }
+
+  private historyLimit(query: StoreHistoryQuery): number {
+    return query.limit !== undefined && Number.isInteger(query.limit) && query.limit > 0 ? Math.min(query.limit, this.config.maxHistoryLimit) : this.config.historyDefaultLimit;
+  }
+
+  /** The rooms a history query names: one, or its distinct `roomIds`. */
+  private historyRoomCount(query: StoreHistoryQuery): number {
+    return query.roomId === undefined && query.roomIds !== undefined ? new Set(query.roomIds).size : 1;
+  }
+
+  /** The rooms whose log a history query reads, the requester's visible ones (see historyPageInternal). */
+  private historySources(query: StoreHistoryQuery): { multiple: boolean; sources: RawRoomRow[] } {
+    const multiple = query.roomId === undefined && query.roomIds !== undefined;
+    const roomIds = multiple ? [...new Set(query.roomIds)] : [query.roomId === undefined ? ROOM_ID : query.roomId];
+    for (const roomId of roomIds) {
+      if (typeof roomId !== "string" || roomId.length === 0) throw new StoreError("invalid_params", "room_id must be a non-empty string");
+    }
+    // A requester's private room only if they are in it; internal pages, with no requester, see every room.
+    const visible = (roomId: string) => query.userId === undefined ? this.roomRow(roomId) : this.visibleRoomRow(roomId, query.userId);
+    return { multiple, sources: roomIds.map(visible).filter((room): room is RawRoomRow => room !== null) };
+  }
+
+  /**
+   * How many records the query's rooms hold past its `before`, counted up to
+   * `cap`: how far back from the head a page that ends there starts. At most
+   * `cap` rows and one a room are read.
+   */
+  private recordsAfter(query: StoreHistoryQuery, cap: number): number {
+    const before = this.historyBound(query.before, "before");
+    if (before === undefined) return 0;
+    let total = 0;
+    for (const room of this.historySources(query).sources) {
+      if (total >= cap || before >= room.latest_log_id) continue;
+      total += this.rawRows<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM (SELECT 1 FROM records WHERE room_id = ? AND log_id > ? LIMIT ?)",
+        room.room_id, before, cap - total,
+      )[0]?.count ?? 0;
+    }
+    return total;
   }
 
   private historyBound(value: string | bigint | undefined, field: string): number | undefined {
@@ -7473,14 +7558,7 @@ export class Store {
   }
 
   private historyPageInternal(query: StoreHistoryQuery): StoreHistoryResult {
-    const multiple = query.roomId === undefined && query.roomIds !== undefined;
-    const roomIds = multiple ? [...new Set(query.roomIds)] : [query.roomId === undefined ? ROOM_ID : query.roomId];
-    for (const roomId of roomIds) {
-      if (typeof roomId !== "string" || roomId.length === 0) throw new StoreError("invalid_params", "room_id must be a non-empty string");
-    }
-    // A requester's private room only if they are in it; internal pages, with no requester, see every room.
-    const visible = (roomId: string) => query.userId === undefined ? this.roomRow(roomId) : this.visibleRoomRow(roomId, query.userId);
-    const sources = roomIds.map(visible).filter((room): room is RawRoomRow => room !== null);
+    const { multiple, sources } = this.historySources(query);
     if (!multiple && !sources.length) throw new StoreError("invalid_params", "unknown room");
     const floor = this.logState().history_floor;
     const after = this.historyBound(query.after, "after");
