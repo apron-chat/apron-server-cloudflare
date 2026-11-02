@@ -7421,7 +7421,11 @@ export class Store {
     // neither: its `before` is the head, give or take the records since.
     const backward = query.before !== undefined && query.after === undefined;
     const limit = this.historyLimit(query);
-    const depthCap = query.guest ? Math.max(this.config.guestHistoryDepth, limit) : limit;
+    // The degraded tier lets through a page within two pages of the head: a
+    // room viewed without joining knows its head only from a listing.
+    const newestReach = 2 * limit;
+    const guestReach = Math.max(this.config.guestHistoryDepth, limit);
+    const depthCap = Math.max(newestReach, query.guest ? guestReach : 0);
     return this.reserved({
       ...this.config.historyCost,
       // Measuring a backward page reads the rooms again (a private one's
@@ -7432,23 +7436,20 @@ export class Store {
       writes: Math.max(32, this.config.historyCost.writes ?? 0),
       history: charged ? 1 : 0,
     }, false, operationNow, (unused) => {
+      // A page refused once measured read rows to find out: it stays charged,
+      // to the user's and IP's limiters and the server's count, so refusals
+      // cost what a page does and cannot be repeated for free.
+      let measuredRefusal: StoreError | undefined;
       try {
         const now = this.effectiveNow(operationNow);
         // Scrolling back, the costliest reads, is the history the degraded
         // tier turns off (today's budget is in memory), and a guest's
         // reaches only `guestHistoryDepth` records back: past that, older
-        // pages are for accounts. A page within one page of the head is the
-        // newest, open to everyone in every tier.
+        // pages are for accounts. A page near the head is the newest, open
+        // to everyone in every tier.
         const degraded = query.before !== undefined && this.degraded(operationNow);
         if (degraded && !backward) this.assertNotDegraded("Loading older history", operationNow);
-        return this.transaction(() => {
-          if (backward && (query.guest || degraded)) {
-            const depth = this.recordsAfter(query, depthCap);
-            if (degraded && depth >= limit) this.assertNotDegraded("Loading older history", operationNow);
-            if (query.guest && depth >= Math.max(this.config.guestHistoryDepth, limit)) {
-              throw new StoreError("denied", "Sign in to load older history");
-            }
-          }
+        const page = this.transaction(() => {
           if (charged && !query.guest) {
             this.chargeEvent("history", `user:${query.userId}`, now,
               { perMinute: this.config.historyRequestsPerUserMinute, burst: this.config.historyBurstPerUser },
@@ -7461,11 +7462,24 @@ export class Store {
               "History request limit reached",
               { limit: this.config.historyRequestsPerIpDay, message: "Daily history limit reached for this network" }, "read");
           }
+          if (backward && (query.guest || degraded)) {
+            const depth = this.recordsAfter(query, depthCap);
+            try {
+              if (degraded && depth >= newestReach) this.assertNotDegraded("Loading older history", operationNow);
+              if (query.guest && depth >= guestReach) throw new StoreError("denied", "Sign in to load older history");
+            } catch (error) {
+              // Returned rather than thrown, so the transaction keeps the charges.
+              measuredRefusal = error as StoreError;
+              return undefined;
+            }
+          }
           return this.historyPageInternal({ ...query, now });
         });
+        if (measuredRefusal) throw measuredRefusal;
+        return page!;
       } catch (error) {
         // No page was served, and the rollback undid the user's and IP's charges: the server-wide count goes back too.
-        unused.history = 1;
+        if (error !== measuredRefusal) unused.history = 1;
         throw error;
       }
     });

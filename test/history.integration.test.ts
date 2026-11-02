@@ -218,6 +218,21 @@ it("lets a guest page back guestHistoryDepth records from each room's head, and 
 	});
 });
 
+it("keeps a refused guest page charged to its address, since measuring it read rows", async () => {
+	await withStore("guest-depth-charge", { ...ROOMY, guestHistoryDepth: 2 }, (store, clock, state) => {
+		const logs: bigint[] = [];
+		for (let index = 0; index < 4; index += 1) {
+			logs.push(logId(store.mutate(messageInput(clock, `charge-${index}`, { body: { format: "plain", text: `entry-${index}` } }))));
+		}
+		const ipRows = () => state.storage.sql.exec<{ count: number }>(
+			"SELECT COUNT(*) AS count FROM principal_limits WHERE scope = 'history' AND principal_key = 'ip:guest-ip'").one().count;
+		const guest = { roomId: "general", limit: 1, now: clock.value, guest: true, userId: "guest_1", ipKey: "guest-ip" };
+		expect(ipRows()).toBe(0);
+		expect(errorCode(() => store.history({ ...guest, before: logs[0] }))).toBe("denied");
+		expect(ipRows()).toBe(1);
+	});
+});
+
 it("advances a fully expired head past the room and keeps future IDs valid", async () => {
 	await withStore("expired-head", {}, (store, clock) => {
 		const logs = [0, 1, 2].map((index) => logId(store.mutate(messageInput(clock, `expired-${index}`, {

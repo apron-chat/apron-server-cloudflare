@@ -272,16 +272,14 @@ it('keeps scrolling back for accounts: a guest gets the newest page, charged to 
 		expect((await request(guest, 'at-head', 'history', { room_id: 'general', before: newest.result.latest_log_id, limit: 5 })).result).toBeTruthy();
 		expect((await request(guest, 'past-head', 'history', { room_id: 'general', before: '999999999999999' })).result).toBeTruthy();
 		// Scrolling back more than guestHistoryDepth records from the head is for accounts.
-		await runInDurableObject(stub(), (instance) => {
-			const runtime = instance as unknown as { store: { config: { guestHistoryDepth: number } } };
-			runtime.store.config.guestHistoryDepth = 1;
+		const setDepth = (depth: number) => runInDurableObject(stub(), (instance) => {
+			(instance as unknown as { store: { config: { guestHistoryDepth: number } } }).store.config.guestHistoryDepth = depth;
 		});
-		const older = await request(guest, 'older', 'history', { room_id: 'general', before: '1', limit: 1 });
-		expect(older.error).toMatchObject({ code: -32001, message: 'Sign in to load older history' });
-		await runInDurableObject(stub(), (instance) => {
-			const runtime = instance as unknown as { store: { config: { guestHistoryDepth: number } } };
-			runtime.store.config.guestHistoryDepth = DEFAULT_LIMITS.guestHistoryDepth;
-		});
+		await setDepth(1);
+		try {
+			const older = await request(guest, 'older', 'history', { room_id: 'general', before: '1', limit: 1 });
+			expect(older.error).toMatchObject({ code: -32001, message: 'Sign in to load older history' });
+		} finally { await setDepth(DEFAULT_LIMITS.guestHistoryDepth); }
 		// A guest's pages write no limiter row of its own.
 		const rows = await runInDurableObject(stub(), (_instance, state) =>
 			state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM principal_limits WHERE scope = 'history' AND principal_key LIKE 'user:guest_%'").one().count);

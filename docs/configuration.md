@@ -751,7 +751,7 @@ and each lifting by itself (`src/store.ts`, `ApronDemoServer.currentTier`):
 | Tier | Fires on | Does | Lifts |
 | --- | --- | --- | --- |
 | open | | Everything works | |
-| degraded | Today's foreground SQL reads or writes, or frames, at `DEGRADE_SHARE` (70%) of their ceiling | Live text, uploads and older history (`history` with `before`, except the newest page: `before` alone within a page of the head) get `retry_after` (`data.reason` `degraded`); chat works | UTC midnight |
+| degraded | Today's foreground SQL reads or writes, or frames, at `DEGRADE_SHARE` (70%) of their ceiling | Live text, uploads and older history (`history` with `before`, except the newest page: `before` alone within two pages of the head) get `retry_after` (`data.reason` `degraded`); chat works | UTC midnight |
 | exhausted | One of those at 99% (`EXHAUSTED_SHARE`; the ledger refuses work just short of 100%) | New work is refused with `retry_after` until the reset; open connections stay; admins' frames and `/status` still answer | UTC midnight |
 | account stop | The estimated overage past `BILL_CAP_DAY` ($5) today or `BILL_CAP_MONTH` ($25) this month (the account-usage stop; on Free, 90% of a daily allowance) | 503 and sockets closed once, as it starts | The day's or month's end |
 | paused (attack) | The attack pause (below): traffic burning $1 an hour or more and mostly refused | Everything refused with 503, every socket closed (admins' too), and the edge stop turned on for the hold | When the hold ends: 30 minutes, doubling with each pause that UTC day, at most 4 hours; at once with `ATTACK_PAUSE=false` |
@@ -954,10 +954,10 @@ The numeric rows are grouped by their unit and enforcement scope:
   `member_count`. `guestNumberBlock` is how many guest numbers (`guest_<n>`) one
   durable write reserves; see above. `guestHistoryDepth` is how many records
   back from a room's head a guest may page with `before` alone (at most
-  1,000; a page within a page of the head, the newest, is always open): enough
-  to look around every public room and thread before signing up, while
-  scrolling further back is for accounts. Measuring a page reads up to that
-  many rows.
+  1,000; the newest page is always open): enough to look around every public
+  room and thread before signing up, while scrolling further back is for
+  accounts. Measuring a page reads up to that many rows, so a refused page is
+  still charged to the guest's address like a served one.
 - Minute budgets: `historyRequestsPerUserMinute` and
   `historyRequestsPerIpMinute` (after bursts of `historyBurstPerUser` and
   `historyBurstPerIp`, which must drain within the hour cleanup keeps an idle
