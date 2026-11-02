@@ -269,6 +269,10 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// streams 300 seconds at most.
 		readersPerText: 200,
 		readers: 400,
+		// An office reading a text together, but not one host holding the
+		// server's readers: it would need 25 addresses (a /48's /56s, which
+		// the prefix limiter slows to 180 attempts a minute).
+		readersPerAddress: 16,
 	}),
 	features: Object.freeze({
 		// Typing costs about 5 frames a typing minute, inside the frame budget.

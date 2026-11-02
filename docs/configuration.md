@@ -403,6 +403,7 @@ turns it off and on without a deploy (texts already streaming finish).
 | `concurrent` (open texts server-wide, unused `write_url`s included) | 4 | 2 | 8 |
 | `readersPerText` (at once) | 200 | 5 | 200 |
 | `readers` (at once, every text together) | 400 | 10 | 400 |
+| `readersPerAddress` (at once, every text together, from one address) | 16 | 3 | `readersPerText` |
 
 A reader costs one billed request however long it streams, and its bytes
 nothing; what bounds readers is the object's memory, so only readers at
@@ -421,12 +422,13 @@ server's), like any other limiter; the open texts are one `_meta` row
 was evicted or redeployed while it streamed is ended, with its embed
 removed, by the next instance's first live text work or by the alarm at its
 time limit plus 30 seconds. Readers and the writer are counted against the
-Worker's per-address attempt limiter, as connections are; the writer against
-the per-location one too, and readers against their own location share
-(`liveReadsPerLocationMinute`, the `LIVE_READS` binding), so a crowd reading
-a text cannot spend the connection attempts there. The entry Worker repeats
-a read refusal the object marked (`Apron-Live-Refused`: a text full of
-readers, read out, or ended) without asking it again or spending attempts.
+Worker's per-address and IPv6 /48 attempt limiters, as connections are; the
+writer against the per-location one too, and readers against their own
+location share (`liveReadsPerLocationMinute`, the `LIVE_READS` binding), so a
+crowd reading a text cannot spend the connection attempts there. The entry
+Worker repeats a read refusal the object marked (`Apron-Live-Refused`: a
+text, or the server, full of readers, or a text ended) without asking it
+again or spending attempts; one address's own limit is not marked.
 The time limit is a one-shot timer that exists only while its `PUT` does;
 nothing else of live text keeps the object awake.
 

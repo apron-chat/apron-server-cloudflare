@@ -1657,9 +1657,11 @@ function liveAnswer(status: number, message: string, retryAfterMs?: number): Res
 }
 
 /**
- * Charges a live text request to its address's and its location's
- * connection-attempt limiters, as a WebSocket upgrade is, before it can
- * cost a Durable Object request. Null when it may go on.
+ * Charges a live text request to its address's and its IPv6 /48's attempt
+ * limiters, as a WebSocket upgrade is, and to its location's share: a
+ * write's to the connection attempts, a read's to the live reads
+ * (LIVE_READS), so a crowd reading a text leaves connections alone. All
+ * before it can cost a Durable Object request. Null when it may go on.
  */
 async function liveAdmission(request: Request, env: Env, read = false): Promise<{ refused: Response } | { ipKey: string }> {
 	const clientIp = extractClientIp(request.headers);
@@ -1668,11 +1670,14 @@ async function liveAdmission(request: Request, env: Env, read = false): Promise<
 	try {
 		// A read spends its location's live-read share, not its connection
 		// attempts, so a crowd reading a text leaves WebSocket admission alone.
-		const { CONNECTION_ATTEMPTS } = env;
+		const { CONNECTION_ATTEMPTS, PREFIX_ATTEMPTS } = env;
 		const location = read ? env.LIVE_READS : env.LOCATION_ATTEMPTS;
-		if (!CONNECTION_ATTEMPTS || !location) return { refused: liveAnswer(503, "Demo admission unavailable", UNAVAILABLE_RETRY_MS) };
+		if (!CONNECTION_ATTEMPTS || !PREFIX_ATTEMPTS || !location) return { refused: liveAnswer(503, "Demo admission unavailable", UNAVAILABLE_RETRY_MS) };
 		const window = ADMISSION_BUDGET.workerWindowSeconds * 1_000;
 		if (!(await CONNECTION_ATTEMPTS.limit({ key })).success) return { refused: liveAnswer(429, "Too many requests from your address", window) };
+		// One host may hold a whole IPv6 /48, 256 addresses of the per-address limit.
+		const prefixKey = await hashIpv6PrefixKey(clientIp);
+		if (prefixKey && !(await PREFIX_ATTEMPTS.limit({ key: prefixKey })).success) return { refused: liveAnswer(429, "Too many requests from your network", window) };
 		if (!(await location.limit({ key: "location" })).success) return { refused: liveAnswer(503, "Demo is busy; try again shortly", window) };
 	} catch {
 		return { refused: liveAnswer(503, "Demo admission unavailable", UNAVAILABLE_RETRY_MS) };
@@ -6538,7 +6543,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await this.recoverLiveTexts();
 			if (path.startsWith(LIVE_READ_PATH)) {
 				const navigate = request.method === "GET" && request.headers.get("Sec-Fetch-Mode") === "navigate";
-				return this.liveRead(path.slice(LIVE_READ_PATH.length), request.method === "HEAD", navigate);
+				return this.liveRead(path.slice(LIVE_READ_PATH.length), request.method === "HEAD", navigate, trustedIpKey(request) ?? undefined);
 			}
 			if (request.method !== "PUT" || !request.body) return liveAnswer(405, "Method not allowed");
 			return await this.liveWrite(decodeURIComponent(path.slice(LIVE_WRITE_PATH.length)), request.body);
@@ -6561,14 +6566,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * A reader's `GET` of a live text's `url` (§4.8.3): what is kept, then
 	 * every chunk as it arrives, from memory, until the text ends. A text a
 	 * message announced whose write has not started yet has its readers wait
-	 * for it. Each text has at most `readersPerText` readers at once, and
-	 * every text together `readers`; an ended or unknown one is 404. A
+	 * for it. Each text has at most `readersPerText` readers at once, every
+	 * text together `readers`, and one address `readersPerAddress`; an ended
+	 * or unknown one is 404. A
 	 * browser that opens a terminal's `url` as a page (`navigate`) goes to the
 	 * terminal viewer instead, if there is one, with the `url` in
 	 * the fragment, which never reaches the viewer's host (§4.8.5); that is
 	 * no read.
 	 */
-	private liveRead(id: string, head: boolean, navigate = false): Response {
+	private liveRead(id: string, head: boolean, navigate = false, ipKey?: string): Response {
 		const { policy, viewerUrl, publicOrigin } = this.config.liveText!;
 		let session = this.liveSessions.get(id);
 		if (!session) {
@@ -6588,9 +6594,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (head) return new Response(null, { headers });
 		if (session.readers.size >= policy.readersPerText) return liveRefused(liveAnswer(429, "This live text has as many readers as it may have", 10_000), "readers");
 		let readers = 0;
-		for (const open of this.liveSessions.values()) readers += open.readers.size;
+		let fromAddress = 0;
+		for (const open of this.liveSessions.values()) {
+			readers += open.readers.size;
+			if (ipKey) fromAddress += open.readers.fromAddress(ipKey);
+		}
 		if (readers >= policy.readers) return liveRefused(liveAnswer(429, "Live text has as many readers as the server allows", 10_000), "readers");
-		return new Response(session.readers.open(session.buffer?.kept() ?? new Uint8Array(0)), { headers });
+		// This address's own limit: not marked, so the entry Worker never repeats it to others.
+		if (fromAddress >= policy.readersPerAddress) return liveAnswer(429, "Too many live text readers from your address", 10_000);
+		return new Response(session.readers.open(session.buffer?.kept() ?? new Uint8Array(0), ipKey), { headers });
 	}
 
 	/**

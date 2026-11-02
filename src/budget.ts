@@ -458,6 +458,12 @@ export interface LiveTextPolicy {
 	/** Readers one text may have at once. */
 	readersPerText: number;
 	/**
+	 * Readers one address (an IP, IPv6 by /56) may have at once, every text
+	 * together: one host cannot take the server's `readers`, while an office
+	 * behind one address still reads together.
+	 */
+	readersPerAddress: number;
+	/**
 	 * Readers every text together may have at once. Each holds a copy of what
 	 * its text kept when it joined (up to `terminalKeepBytes`) and its stream's
 	 * buffers in the object's memory; chunks are shared by all of a text's

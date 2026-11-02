@@ -642,6 +642,9 @@ export function validateLiveTextPolicy(policy: LiveTextPolicy, limits: Pick<Limi
 	if (policy.readersPerText > budget.MAX_LIVE_READERS_PER_TEXT) {
 		throw new ConfigError(`liveText.readersPerText must be at most ${budget.MAX_LIVE_READERS_PER_TEXT}`);
 	}
+	if (policy.readersPerAddress > policy.readersPerText) {
+		throw new ConfigError("liveText.readersPerAddress must be at most readersPerText");
+	}
 	if (policy.readers > budget.MAX_LIVE_READERS || policy.readers < policy.readersPerText) {
 		throw new ConfigError(`liveText.readers must be readersPerText to ${budget.MAX_LIVE_READERS}`);
 	}

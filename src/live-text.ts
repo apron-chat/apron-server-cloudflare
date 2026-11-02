@@ -188,7 +188,8 @@ export const READER_FLUSH_BYTES = 16 * 1024;
 
 /** One text's readers: response streams fed from memory, in batches. */
 export class LiveReaders {
-	private readonly controllers = new Set<ReadableStreamDefaultController<Uint8Array>>();
+	/** Each reader's stream, and the address it reads from (an IP key), if known. */
+	private readonly controllers = new Map<ReadableStreamDefaultController<Uint8Array>, string | undefined>();
 	/** Bytes not yet sent to the readers, and the one timer that sends them. */
 	private pending: Uint8Array[] = [];
 	private pendingBytes = 0;
@@ -198,18 +199,25 @@ export class LiveReaders {
 		return this.controllers.size;
 	}
 
+	/** Readers from one address. */
+	fromAddress(ipKey: string): number {
+		let count = 0;
+		for (const owner of this.controllers.values()) if (owner === ipKey) count += 1;
+		return count;
+	}
+
 	/**
 	 * A new reader's stream, starting with `initial`, what is kept now: the
 	 * bytes still waiting go to the other readers first, since `initial`
 	 * already holds them.
 	 */
-	open(initial: Uint8Array): ReadableStream<Uint8Array> {
+	open(initial: Uint8Array, ipKey?: string): ReadableStream<Uint8Array> {
 		this.flush();
 		let own: ReadableStreamDefaultController<Uint8Array> | undefined;
 		return new ReadableStream<Uint8Array>({
 			start: (controller) => {
 				own = controller;
-				this.controllers.add(controller);
+				this.controllers.set(controller, ipKey);
 				if (initial.length) controller.enqueue(initial.slice());
 			},
 			cancel: () => {
@@ -242,7 +250,7 @@ export class LiveReaders {
 		}
 		this.pending = [];
 		this.pendingBytes = 0;
-		for (const controller of [...this.controllers]) {
+		for (const controller of [...this.controllers.keys()]) {
 			const desired = controller.desiredSize;
 			if (desired !== null && desired < -MAX_READER_BACKLOG_BYTES) {
 				this.controllers.delete(controller);
@@ -256,7 +264,7 @@ export class LiveReaders {
 	/** Ends every reader's response, after what waits: the text ended. No timer is left. */
 	close(): void {
 		this.flush();
-		for (const controller of this.controllers) {
+		for (const controller of this.controllers.keys()) {
 			try { controller.close(); } catch { /* already closed or errored */ }
 		}
 		this.controllers.clear();
