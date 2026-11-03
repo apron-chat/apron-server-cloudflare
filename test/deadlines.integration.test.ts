@@ -69,3 +69,20 @@ it('schedules the alarm for the end of an attack pause, so the change back is to
 	expect(alarm).not.toBeNull();
 	expect(alarm!).toBeLessThanOrEqual(until);
 });
+
+it('opens a connection with the deployment\'s defaults when the admins\' toggles cannot be read', async () => {
+	const stub = env.DEMO.getByName(`toggles-unread-${crypto.randomUUID()}`);
+	await runInDurableObject(stub, (instance) => {
+		const runtime = instance as unknown as { toggles: Map<string, unknown>; store: { toggle(): unknown; presenceToggle(): unknown } };
+		runtime.toggles.clear();
+		vi.spyOn(runtime.store, 'toggle').mockImplementation(() => { throw new Error('storage unavailable'); });
+		vi.spyOn(runtime.store, 'presenceToggle').mockImplementation(() => { throw new Error('storage unavailable'); });
+	});
+	const peer = await open(stub);
+	const first = await new Promise<{ method?: string }>((resolve) => peer.socket.addEventListener('message', (event) => resolve(JSON.parse(String(event.data))), { once: true }));
+	expect(first.method).toBe('server');
+	// Not cached: once the store answers, the toggles are read.
+	const read = await runInDurableObject(stub, (instance) => (instance as unknown as { toggles: Map<string, unknown> }).toggles.size);
+	expect(read).toBe(0);
+	peer.socket.close();
+});

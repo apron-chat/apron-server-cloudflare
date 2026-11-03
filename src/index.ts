@@ -4810,14 +4810,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** Presence as configured and toggled: off without push, which capability `status` needs. */
 	private presenceMode(): boolean {
 		if (!this.config.push) return false;
-		let toggled: boolean | undefined;
-		try {
-			toggled = this.toggled("presence");
-		} catch {
-			// The toggle is read once per wake; if it cannot be, the default applies.
-			toggled = undefined;
-		}
-		return toggled ?? this.config.presence;
+		return this.toggled("presence") ?? this.config.presence;
 	}
 
 	/**
@@ -6407,13 +6400,21 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** An admin's `/toggle` of a feature, read once and then kept in memory with every change. */
 	private toggled(feature: ToggleFeature): boolean | undefined {
 		if (!this.toggles.has(feature)) {
-			if (feature === "presence") {
-				// With when it was last turned on (seenFloor), in the same read.
-				const read = this.store.presenceToggle(nowMs());
-				this.presenceSince = read.since ?? 0;
-				this.toggles.set(feature, read.on);
-			} else {
-				this.toggles.set(feature, this.store.toggle(feature, nowMs()));
+			try {
+				if (feature === "presence") {
+					// With when it was last turned on (seenFloor), in the same read.
+					const read = this.store.presenceToggle(nowMs());
+					this.presenceSince = read.since ?? 0;
+					this.toggles.set(feature, read.on);
+				} else {
+					this.toggles.set(feature, this.store.toggle(feature, nowMs()));
+				}
+			} catch {
+				// Read once per wake. One that cannot be read now (an exhausted
+				// budget) is the deployment's default until a later call reads it;
+				// so no caller, such as a connection's `server` frame, fails on it.
+				// The store enforces the uploads and live text toggles itself.
+				return undefined;
 			}
 		}
 		return this.toggles.get(feature);
