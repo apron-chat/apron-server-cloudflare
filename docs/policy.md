@@ -107,8 +107,9 @@ within it:
   push: attendance is the separate `status` request (below).
 - Commands: `/help` replies with a `~private` notice listing the commands the
   sender may run. Registered users other than bots have `/invite-bot` (a bot
-  token), `/invite-device list|add|remove [<id>]` (tokens for other devices), `/passkeys`,
-  and, with uploads, `/avatar` (all below); anyone who may post has, with
+  token), `/invite-device list|add|remove [<id>]` (tokens for other devices) and
+  `/passkeys`, and all registered users, bots included, have `/avatar` with
+  uploads (all below); anyone who may post has, with
   live text, `/embed-terminal [title]` and `/embed-append [markdown]`
   (below); those with the role `admin`,
   `mod`, or `friend` also have `/emoji add|remove :name:` (custom emoji,

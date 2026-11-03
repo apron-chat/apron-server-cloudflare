@@ -233,7 +233,8 @@ socket.onmessage = ({ data }) => {
 A bot posts, reacts, starts threads, and keeps its rooms like a registered
 user, under its own posting quota; it cannot invite bots. It may rename
 itself with `me`, but only to a name with "bot" in it, in any case (say
-`{"name": "Threader Bot"}`).
+`{"name": "Threader Bot"}`), and set its avatar with `/avatar` and one image
+attached, writing the image to the `write_url` it answers with.
 You can add your bot to a thread, say to keep its `description` current,
 with `room_join` and its `user_id`, and remove it with `room_leave` the same
 way. An admin may give your bot the role `threader` (`/role bot_<your
