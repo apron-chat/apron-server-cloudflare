@@ -480,15 +480,17 @@ function roomServerDescription(description: string | undefined): string | undefi
 
 /**
  * The commands this server provides (§4.1), as `/help` lists them to those
- * who may run them: `everyone`, `owners` (registered users other than bots),
- * or `admins` (the `APRON_ADMIN_TOKEN` user and those given the `admin` role).
+ * who may run them: `everyone`, `registered` (registered users, bots
+ * included), `owners` (registered users other than bots, so a bot neither
+ * invites nor manages sign-ins), or `admins` (the `APRON_ADMIN_TOKEN` user
+ * and those given the `admin` role).
  * An `owners` command with `roles` is for owners who hold one of them.
  * Kept in alphabetical order, the order `/help` lists them in, admins'
  * marked "(admin-only)".
  */
-const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audience: "everyone" | "owners" | "admins"; roles?: readonly string[] }> = [
+const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audience: "everyone" | "registered" | "owners" | "admins"; roles?: readonly string[] }> = [
 	{ name: "admin", usage: "/admin [remove] <user_id>", help: "make a registered user an admin, or no longer one", audience: "admins" },
-	{ name: "avatar", usage: "/avatar", help: "set your avatar: send this command with one image attached", audience: "owners" },
+	{ name: "avatar", usage: "/avatar", help: "set your avatar: send this command with one image attached", audience: "registered" },
 	{ name: "embed-append", usage: "/embed-append [markdown]", help: "get a link to stream text into a message that starts with [markdown], such as an LLM's reply: the message appears when the stream starts", audience: "everyone" },
 	{ name: "embed-terminal", usage: "/embed-terminal [title]", help: "get a link to stream a terminal (80×40) into this room, such as a build: the message appears when the stream starts", audience: "everyone" },
 	{ name: "emoji", usage: "/emoji add|remove :name:", help: "add a custom emoji, or replace its image: send /emoji add :name: with one image attached; /emoji remove :name: removes it", audience: "owners", roles: EMOJI_ROLES },
@@ -6197,6 +6199,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return;
 		}
 		const owner = attachment.tier === "registered" && !hasRole(attachment, "bot");
+		if (command.audience === "registered" && attachment.tier !== "registered") throw { name: "denied", message: `Sign in with a passkey to use /${name}` } satisfies ProtocolError;
 		if (command.audience === "owners" && !owner) {
 			throw { name: "denied", message: hasRole(attachment, "bot") ? `A bot can't use /${name}` : `Sign in with a passkey to use /${name}` } satisfies ProtocolError;
 		}
@@ -6302,7 +6305,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		// The reply a command causes comes before its result (§1).
 		const writes = attachment.tier !== "anonymous" || this.config.guestPosting;
-		const available = this.commands().filter((candidate) => (candidate.audience === "everyone" && (writes || !candidate.name.startsWith("embed-"))) || (candidate.audience === "owners" && owner && (!candidate.roles || candidate.roles.some((role) => hasRole(attachment, role)))) || admin);
+		const available = this.commands().filter((candidate) => (candidate.audience === "everyone" && (writes || !candidate.name.startsWith("embed-"))) || (candidate.audience === "registered" && attachment.tier === "registered") || (candidate.audience === "owners" && owner && (!candidate.roles || candidate.roles.some((role) => hasRole(attachment, role)))) || admin);
 		this.send(socket, {
 			method: "message",
 			params: {

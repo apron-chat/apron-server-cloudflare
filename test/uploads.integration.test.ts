@@ -678,6 +678,41 @@ describe('uploads end to end', () => {
 		} finally { peer.close(); }
 	});
 
+	it('lets a bot set its avatar with /avatar and stream live text, but not invite bots or devices', async () => {
+		const ownerId = unique('owner');
+		const owner = await signedIn(ownerId);
+		const bot = await connect(null);
+		try {
+			const invited = await exchange(owner, 'invite', 'command', { body: { text: '/invite-bot' } });
+			const notice = invited.skipped.find((frame) => frame.method === 'message' && frame.params.from?.user_id === '~private')!;
+			const token = /```\n(apron_bot_[A-Za-z0-9_-]+)\n```/.exec(notice.params.body.text)![1];
+			await bot.next();
+			const botId = (await request(bot, 'auth', 'auth', { scheme: 'token', token })).result.you.user_id;
+			expect(botId).toBe(`bot_${ownerId}`);
+
+			// /help lists what it may run: /avatar and live text, not the commands for owners.
+			const help = await exchange(bot, 'help', 'command', { body: { text: '/help' } });
+			const listed = help.skipped.find((frame) => frame.method === 'message')!.params.body.text;
+			for (const name of ['/avatar', '/embed-append', '/embed-terminal']) expect(listed).toContain(`\`${name}`);
+			for (const name of ['/invite-bot', '/invite-device', '/passkeys']) expect(listed).not.toContain(`\`${name}`);
+			for (const text of ['/invite-bot', '/invite-device add laptop', '/passkeys']) {
+				expect((await request(bot, `deny-${text}`, 'command', { body: { text } })).error).toMatchObject({ code: -32001, message: `A bot can't use /${text.slice(1).split(' ')[0]}` });
+			}
+
+			// Its avatar is set like anyone's, and its owner sees it.
+			const started = await request(bot, 'avatar', 'command', { body: { text: '/avatar', embeds: [{ kind: 'upload' }] } });
+			expect((await put(started.result.embeds[0].write_url, png())).status).toBe(204);
+			const you = (await until(bot, (frame) => frame.method === 'user' && frame.params.you?.avatar !== undefined)).frame.params.you;
+			expect(you).toMatchObject({ user_id: botId, avatar: expect.stringMatching(/^https:\/\/media\.test\/a\//) });
+			expect((await until(owner, (frame) => frame.method === 'user' && frame.params.new?.user_id === botId)).frame.params.new.avatar).toBe(you.avatar);
+
+			// Live text: /embed-append starts one, and /embed-terminal is refused only
+			// by the one-open-at-a-time rule everyone has, not for being a bot.
+			expect((await request(bot, 'live-append', 'command', { body: { text: '/embed-append' } })).result).toBeDefined();
+			expect((await request(bot, 'live-terminal', 'command', { body: { text: '/embed-terminal build' } })).error.message).toMatch(/^You already have a live text open/);
+		} finally { owner.close(); bot.close(); }
+	});
+
 	it('sets an avatar with /avatar, shows it in current user objects, and removes it with me', async () => {
 		const userId = unique('avatar');
 		const peer = await signedIn(userId);
