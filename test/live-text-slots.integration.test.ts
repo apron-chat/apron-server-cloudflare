@@ -31,3 +31,26 @@ it('frees a live text\'s slots once its write_url expires, before the alarm ends
 		expect(expired.ended).toHaveLength(1);
 	});
 });
+
+it('rewrites no message below the retention floor that cleanup has not yet deleted', async () => {
+	await withStore('live-floor', { liveText: LIVE }, (store, clock, state) => {
+		store.registerIdentity({
+			userId: 'owner', name: 'Owner', userHandle: 'handle-owner', now: clock.value, ipKey: 'ip-owner',
+			credential: { credentialId: 'cred-owner', userId: 'owner', publicKey: 'AAAA', counter: 0 },
+		});
+		const posted = store.commitMutation({
+			userId: 'owner', ipKey: 'ip-owner', method: 'message', now: clock.value,
+			params: { body: { text: 'waits', embeds: [{ kind: 'terminal' }] } }, identity: { user_id: 'owner' },
+		});
+		const key = (posted.result.embeds as Array<{ write: { key: string } }>)[0].write.key;
+		const latest = () => Number(state.storage.sql.exec<{ latest_log_id: number }>('SELECT latest_log_id FROM message_state WHERE message_id = ?', posted.result.message_id).one().latest_log_id);
+		const before = latest();
+		// Cleanup has moved the floor past the message (its first step), and not yet deleted it (the next).
+		state.storage.sql.exec('UPDATE log_state SET history_floor = ? WHERE id = 1', before + 1);
+		const fresh = new (store.constructor as typeof import('../src/store').Store)(state, { liveText: LIVE }, clock.clock);
+		fresh.initialize();
+		const claimed = fresh.claimLiveText(key, clock.value);
+		expect(claimed?.broadcasts ?? []).toEqual([]);
+		expect(latest()).toBe(before);
+	});
+});

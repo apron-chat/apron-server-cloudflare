@@ -4837,6 +4837,22 @@ export class Store {
   }
 
   /**
+   * An embed of a message still retained, for a write that ends in its
+   * message (an upload's, a live text's) to rewrite (rewriteEmbed): the
+   * message's current snapshot, unless it is deleted or below the
+   * retention floor, and its embed `embedId`. A message cleanup has
+   * expired but not yet deleted is gone here too: rewriting it would
+   * append a fresh record and make it current again.
+   */
+  private retainedEmbed(messageId: string, embedId: string): { message: RawMessageRow; snapshot: MessageSnapshot; embed: Record<string, unknown> } | null {
+    const message = this.currentMessage(messageId, this.logState().history_floor);
+    const snapshot = message ? parseJson<MessageSnapshot>(message.snapshot_json) : null;
+    if (!message || !snapshot || snapshot.deleted || !Array.isArray(snapshot.body?.embeds)) return null;
+    const embed = (snapshot.body.embeds as Record<string, unknown>[]).find((candidate) => candidate.embed_id === embedId);
+    return embed ? { message, snapshot, embed } : null;
+  }
+
+  /**
    * A current message `userId` may see: currentMessage, less one in a
    * private room they are not in, which reads as unknown (§5.3).
    */
@@ -5816,13 +5832,10 @@ export class Store {
           entry.messageId = message!.message_id;
           delete entry.post;
         } else if (entry.messageId) {
-          const current = this.currentMessage(entry.messageId);
-          const snapshot = current ? parseJson<MessageSnapshot>(current.snapshot_json) : null;
-          const embeds = snapshot && !snapshot.deleted && Array.isArray(snapshot.body?.embeds) ? snapshot.body.embeds as Record<string, unknown>[] : [];
-          const embed = embeds.find((candidate) => candidate.embed_id === entry.embedId);
-          if (current && snapshot && embed) {
+          const found = this.retainedEmbed(entry.messageId, entry.embedId);
+          if (found) {
             this.ensureGrowthCapacity(this.config.maxSnapshotBytes);
-            broadcasts = this.rewriteEmbed(current, snapshot, entry.embedId, { ...embed, url: liveUrl(this.config.liveText!, entry) }, effective);
+            broadcasts = this.rewriteEmbed(found.message, found.snapshot, entry.embedId, { ...found.embed, url: liveUrl(this.config.liveText!, entry) }, effective);
           }
         }
         entry.state = "live";
@@ -5890,11 +5903,9 @@ export class Store {
   /** The snapshot that ends a live text (finishLiveText). */
   private publishLiveText(entry: LiveEntry, kept: Uint8Array | null, now: number): Broadcast[] {
     if (!entry.messageId) return [];
-    const message = this.currentMessage(entry.messageId);
-    const snapshot = message ? parseJson<MessageSnapshot>(message.snapshot_json) : null;
-    const embeds = snapshot && !snapshot.deleted && Array.isArray(snapshot.body?.embeds) ? snapshot.body.embeds as Record<string, unknown>[] : [];
-    const embed = embeds.find((candidate) => candidate.embed_id === entry.embedId);
-    if (!message || !snapshot || !embed) return [];
+    const found = this.retainedEmbed(entry.messageId, entry.embedId);
+    if (!found) return [];
+    const { message, snapshot, embed } = found;
     // What the entry keeps, whatever the caller held: the last part of a terminal, the first of an append.
     if (entry.kind === "terminal") {
       const output = terminalOutput(keepLast(kept ?? new Uint8Array(0), entry.limit));
@@ -6279,11 +6290,9 @@ export class Store {
       this.writeServerField("avatar", url);
       return { accepted: true, broadcasts: [], serverAvatar: url, deletedUploads: this.releaseUploadRows(replaced) };
     }
-    const message = row.message_id ? this.currentMessage(row.message_id) : null;
-    const snapshot = message ? parseJson<MessageSnapshot>(message.snapshot_json) : null;
-    const embeds = snapshot && !snapshot.deleted && Array.isArray(snapshot.body?.embeds) ? snapshot.body.embeds as Record<string, unknown>[] : [];
-    const embed = embeds.find((candidate) => candidate.embed_id === row.embed_id);
-    if (!message || !snapshot || !embed) return { accepted: false, broadcasts: [], deletedUploads: this.releaseUploadRows([row]) };
+    const found = row.message_id && row.embed_id ? this.retainedEmbed(row.message_id, row.embed_id) : null;
+    if (!found) return { accepted: false, broadcasts: [], deletedUploads: this.releaseUploadRows([row]) };
+    const { message, snapshot, embed } = found;
     let replacement: Record<string, unknown> | null = null;
     let deletedUploads: string[] = [];
     if (ok) {
