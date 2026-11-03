@@ -1978,16 +1978,23 @@ export default {
 } satisfies ExportedHandler<Env>;
 
 /**
- * A live text this instance holds (§4.8.3): one that streams, with its kept
- * bytes, or one a message announced whose readers wait for its write.
+ * A live text this instance holds (§4.8.3), in one of two phases:
+ *
+ * - `waiting`: a message announced it, and its readers wait for its write.
+ *   Nothing streams, so ending it closes the readers and forgets it.
+ * - `streaming`: its write was claimed (Store.claimLiveText), in the same
+ *   mutation that made this session, so a queued expiry never takes it for
+ *   lost. It ends exactly once, by `stop`: the first reason wins, whether it
+ *   comes from the write itself, its time limit, or a save or purge that
+ *   removed it, even one that arrives before the write starts reading.
  */
-interface LiveSession {
-	entry: LiveEntry;
-	readers: LiveReaders;
-	/** The kept bytes, once the write streams. */
-	buffer?: LiveBuffer;
-	/** Ends the write early, as for its time limit or a save that removed its embed. */
-	stop?: (reason: LiveEnd) => void;
+type LiveSession =
+	| { phase: "waiting"; entry: LiveEntry; readers: LiveReaders }
+	| { phase: "streaming"; entry: LiveEntry; readers: LiveReaders; buffer: LiveBuffer; stop: AbortController };
+
+/** Why a streaming live text was stopped, if it was. */
+function liveStopped(session: Extract<LiveSession, { phase: "streaming" }>): LiveEnd | undefined {
+	return session.stop.signal.aborted ? session.stop.signal.reason as LiveEnd : undefined;
 }
 
 export class ApronDemoServer extends DurableObject<Env> {
@@ -6556,30 +6563,43 @@ export class ApronDemoServer extends DurableObject<Env> {
 		await this.runMutation(async () => {
 			// Read inside the mutation: a write claimed before it is streaming by now (liveWrite).
 			const streaming = new Set<string>();
-			for (const session of this.liveSessions.values()) if (session.buffer) streaming.add(session.entry.key);
+			for (const session of this.liveSessions.values()) if (session.phase === "streaming") streaming.add(session.entry.key);
 			const expired = this.store.expireLiveTexts(streaming, now);
 			for (const record of expired.broadcasts) this.broadcastRecord(record);
 			for (const entry of expired.ended) {
 				const session = this.liveSessions.get(entry.id);
-				if (session && !session.buffer) {
-					session.readers.close();
-					this.liveSessions.delete(entry.id);
-				}
+				if (session?.phase === "waiting") this.forgetWaitingLive(session);
 			}
 			this.liveDeadlineAt = expired.next;
 		});
 	}
 
-	/** Stops a streaming write early: a save removed its embed, or its owner was purged. */
+	/** Stops a live text early: a save removed its embed, or its owner was purged. */
 	private stopLiveText(key: string, reason: LiveEnd): void {
 		for (const session of this.liveSessions.values()) {
 			if (session.entry.key !== key) continue;
-			if (session.stop) session.stop(reason);
-			else {
-				session.readers.close();
-				this.liveSessions.delete(session.entry.id);
-			}
+			if (session.phase === "streaming") session.stop.abort(reason);
+			else this.forgetWaitingLive(session);
 		}
+	}
+
+	/** Forgets the waiting sessions of a live text the store no longer holds open. */
+	private forgetEndedLive(key: string): void {
+		let open: ReadonlySet<string>;
+		try {
+			open = new Set(this.store.openLiveTexts(nowMs()).map((entry) => entry.key));
+		} catch {
+			return; // Unknown: the alarm's expiry ends them if their text went.
+		}
+		for (const session of this.liveSessions.values()) {
+			if (session.phase === "waiting" && session.entry.key === key && !open.has(key)) this.forgetWaitingLive(session);
+		}
+	}
+
+	/** Ends a live text's wait for its write: its readers are closed, and it is no longer held. */
+	private forgetWaitingLive(session: Extract<LiveSession, { phase: "waiting" }>): void {
+		session.readers.close();
+		this.liveSessions.delete(session.entry.id);
 	}
 
 	/** Ends the live texts of purged users: their messages are gone, so nothing is published. */
@@ -6588,7 +6608,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const entries = this.store.openLiveTexts(nowMs()).filter((entry) => userIds.includes(entry.owner));
 		for (const entry of entries) {
 			const session = this.liveSessions.get(entry.id);
-			if (session?.stop) session.stop("removed");
+			if (session?.phase === "streaming") session.stop.abort("removed");
 			else {
 				await this.runMutation(async () => { this.store.finishLiveText(entry.key, null, nowMs()); });
 				this.stopLiveText(entry.key, "removed");
@@ -6651,7 +6671,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!session) {
 			const entry = this.store.openLiveTexts(nowMs()).find((candidate) => candidate.id === id);
 			if (!entry || entry.state !== "pending" || entry.messageId === undefined) return liveRefused(liveAnswer(404, "This live text has ended, or never existed"), "ended");
-			session = { entry, readers: new LiveReaders() };
+			session = { phase: "waiting", entry, readers: new LiveReaders() };
 			this.liveSessions.set(id, session);
 		}
 		const viewer = session.entry.kind === "terminal" ? viewerUrl : undefined;
@@ -6673,7 +6693,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (readers >= policy.readers) return liveRefused(liveAnswer(429, "Live text has as many readers as the server allows", 10_000), "readers");
 		// This address's own limit: not marked, so the entry Worker never repeats it to others.
 		if (fromAddress >= policy.readersPerAddress) return liveAnswer(429, "Too many live text readers from your address", 10_000);
-		return new Response(session.readers.open(session.buffer?.kept() ?? new Uint8Array(0), ipKey), { headers });
+		return new Response(session.readers.open(session.phase === "streaming" ? session.buffer.kept() : new Uint8Array(0), ipKey), { headers });
 	}
 
 	/**
@@ -6686,16 +6706,28 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async liveWrite(key: string, body: ReadableStream<Uint8Array>): Promise<Response> {
 		let claimed: ReturnType<Store["claimLiveText"]> = null;
-		let streaming: LiveSession | undefined;
+		let streaming: Extract<LiveSession, { phase: "streaming" }> | undefined;
 		await this.runMutation(async () => {
-			claimed = this.store.claimLiveText(key, nowMs());
+			try {
+				claimed = this.store.claimLiveText(key, nowMs());
+			} catch (error) {
+				// A refused claim may end the text (Store.claimLiveText): its waiting readers go with it.
+				this.forgetEndedLive(key);
+				throw error;
+			}
 			if (!claimed) return;
 			for (const record of claimed.broadcasts) this.broadcastRecord(record);
-			// Streaming from its claim, in the same mutation, so an expiry queued behind it does not end it as lost.
+			// Streaming from its claim, in the same mutation, so an expiry queued behind it does not end it as lost,
+			// and a stop that comes before the read loop below starts is kept until it does.
 			const entry = claimed.entry;
-			streaming = this.liveSessions.get(entry.id) ?? { entry, readers: new LiveReaders() };
-			streaming.entry = entry;
-			streaming.buffer = new LiveBuffer(entry.kind, entry.limit);
+			const waiting = this.liveSessions.get(entry.id);
+			streaming = {
+				phase: "streaming",
+				entry,
+				readers: waiting?.readers ?? new LiveReaders(),
+				buffer: new LiveBuffer(entry.kind, entry.limit),
+				stop: new AbortController(),
+			};
 			this.liveSessions.set(entry.id, streaming);
 		});
 		if (!claimed || !streaming) {
@@ -6709,40 +6741,36 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.dropHeld(entry.owner, message.room_id);
 			if (this.store.identityExists(entry.owner)) this.wakeFor(message);
 		}
-		const session: LiveSession = streaming;
-		const buffer = session.buffer!;
+		const session = streaming as Extract<LiveSession, { phase: "streaming" }>;
+		const buffer = session.buffer;
 		// The alarm ends it should this instance be lost meanwhile, and no longer waits for its write.
 		await this.refreshLiveDeadline().catch(() => undefined);
 		const reader = body.getReader();
 		reader.closed.catch(() => undefined);
-		let end: LiveEnd | undefined;
-		session.stop = (reason) => {
-			end ??= reason;
-			reader.cancel().catch(() => undefined);
-		};
-		const timer = setTimeout(() => session.stop!("time"), Math.max(0, (entry.startedMs ?? nowMs()) + entry.maxMs - nowMs()));
+		const cancel = () => { reader.cancel().catch(() => undefined); };
+		// A stop that came while the deadline was refreshed cancels at once: the signal kept it.
+		if (session.stop.signal.aborted) cancel();
+		else session.stop.signal.addEventListener("abort", cancel, { once: true });
+		const timer = setTimeout(() => session.stop.abort("time"), Math.max(0, (entry.startedMs ?? nowMs()) + entry.maxMs - nowMs()));
 		// An append takes no more input than it keeps, as before edits; a terminal, maxInputBytes.
 		const maxInput = liveInputLimit(entry, this.config.liveText!.policy);
 		try {
-			for (;;) {
+			while (!session.stop.signal.aborted) {
 				const { done, value } = await reader.read();
-				if (done || end) break;
+				if (done || session.stop.signal.aborted) break;
 				const room = maxInput - buffer.received;
 				const pushed = buffer.push(value.length > room ? value.subarray(0, room) : value);
 				session.readers.send(pushed.send);
-				if (pushed.full || buffer.received >= maxInput) {
-					end = "size";
-					break;
-				}
+				if (pushed.full || buffer.received >= maxInput) session.stop.abort("size");
 			}
 		} catch {
-			end ??= "disconnected";
+			session.stop.abort("disconnected");
 		} finally {
 			clearTimeout(timer);
 		}
-		end ??= "complete";
-		reader.cancel().catch(() => undefined);
-		return this.endLiveText(session, end);
+		session.stop.abort("complete");
+		cancel();
+		return this.endLiveText(session, liveStopped(session)!);
 	}
 
 	/**
@@ -6750,12 +6778,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * (Store.finishLiveText; nothing after a save that removed it), ends its
 	 * readers, and tells the writer why it ended, after the snapshot.
 	 */
-	private async endLiveText(session: LiveSession, end: LiveEnd): Promise<Response> {
+	private async endLiveText(session: Extract<LiveSession, { phase: "streaming" }>, end: LiveEnd): Promise<Response> {
 		const entry = session.entry;
 		// An append's last incomplete character, if any, reads as U+FFFD, for its readers too;
 		// cut at the input limit, it is dropped, so the text ends at a whole character (§4.8.5).
-		if (session.buffer) session.readers.send(session.buffer.end(end === "size"));
-		const kept = session.buffer?.kept() ?? new Uint8Array(0);
+		session.readers.send(session.buffer.end(end === "size"));
+		const kept = session.buffer.kept();
 		let published = false;
 		try {
 			await this.runMutation(async () => {

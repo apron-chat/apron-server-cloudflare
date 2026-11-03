@@ -1,6 +1,7 @@
 import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
 import { Store, defaultStoreConfig } from '../src/store';
+import { PUSH_POLICY } from '../src/budget';
 import { expectRetryAfter } from './helpers/store';
 
 const MIB = 1024 * 1024;
@@ -154,3 +155,48 @@ it('stops growth near the hard target, reuses pages without VACUUM, and resumes 
 	expect(resumed.databaseSize).toBeLessThan(config.storageLowWaterBytes);
 // It writes over 120 MiB of SQLite: about 2 s alone, past 5 s on a loaded machine.
 }, 30_000);
+
+it('keeps the storage-pressure latch set by a refusal inside a transaction, which rolls back', async () => {
+	const stub = env.DEMO.getByName(`storage-pressure-latch-${crypto.randomUUID()}`);
+	await runInDurableObject(stub, async (_instance, state) => {
+		const config = defaultStoreConfig({ push: { ...PUSH_POLICY! } });
+		const now = Date.now() + 86_400_000;
+		const store = new Store(state, config, { now: () => now });
+		store.initialize();
+		store.registerIdentity({
+			userId: 'latch-user',
+			name: 'Latch user',
+			userHandle: 'latch-handle',
+			credential: { credentialId: 'latch-credential', userId: 'latch-user', publicKey: 'latch-key', counter: 0 },
+			now,
+			ipKey: 'latch-ip',
+		});
+		const latch = () => state.storage.sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'storage_pressure'").toArray()[0]?.value;
+		expect(latch() ?? '0').toBe('0');
+		// Every size is now past the high-water mark. Registering for push
+		// checks capacity inside its own transaction, which the refusal rolls back.
+		const size = store.databaseSize()!;
+		Object.assign(store.config, { storageLowWaterBytes: 1, storageHighWaterBytes: 2, storageHardTargetBytes: size + 64 * MIB });
+		let error: unknown;
+		try {
+			store.registerPushSubscription({ userId: 'latch-user', url: 'https://push.example.net/latch', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), now });
+		} catch (candidate) {
+			error = candidate;
+		}
+		expectRetryAfter(error);
+		expect(latch()).toBe('1');
+		// Between the marks the latch holds: growth stays refused.
+		Object.assign(store.config, { storageLowWaterBytes: 1, storageHighWaterBytes: size * 2 });
+		error = undefined;
+		try {
+			store.registerPushSubscription({ userId: 'latch-user', url: 'https://push.example.net/latch', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), now });
+		} catch (candidate) {
+			error = candidate;
+		}
+		expectRetryAfter(error);
+		// Below the low-water mark it clears, and the registration goes through.
+		Object.assign(store.config, { storageLowWaterBytes: size * 2 });
+		store.registerPushSubscription({ userId: 'latch-user', url: 'https://push.example.net/latch', p256dh: 'p'.repeat(87), auth: 'a'.repeat(22), now });
+		expect(latch()).toBe('0');
+	});
+});

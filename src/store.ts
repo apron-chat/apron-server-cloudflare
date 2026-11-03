@@ -39,6 +39,7 @@ import {
 import { StoreError, limitData, type LimitCategory } from "./store-error";
 import { bucketHorizonMs, chargeBucket, type Bucket, type Rate } from "./limiter";
 import { LimiterCache, type RawLimitRow } from "./limiter-cache";
+import { SettledMeta } from "./settled-meta";
 import { isStatusChoice, type StatusChoice } from "./presence";
 import { isProtocolId, type StoredCredential, type StoredIdentity } from "./domain.js";
 // @ts-expect-error Workers' nodejs_compat runtime supplies this module; the
@@ -423,6 +424,15 @@ export function liveInputLimit(entry: Pick<LiveEntry, "kind" | "limit">, policy:
  */
 export function liveDeadline(entry: LiveEntry): number {
   return entry.state === "pending" ? entry.writeExpiresMs : (entry.startedMs ?? 0) + entry.maxMs + LIVE_ORPHAN_GRACE_MS;
+}
+
+/**
+ * Whether a live text still holds its slot at `now`: its write can still be
+ * claimed (Store.claimLiveText's window), or it streams within its time and
+ * the orphan grace. Past that it only awaits the alarm that ends it.
+ */
+export function liveHolds(entry: LiveEntry, now: number): boolean {
+  return now <= liveDeadline(entry);
 }
 
 /** Roles whose holders stream for `moderatorMaxSeconds` rather than `maxSeconds`. */
@@ -970,6 +980,12 @@ export const OPERATION_PAUSED = "operation_paused";
  * a day is told; each operation's recent overruns, and its breaker's end.
  */
 const META_ACCOUNTING_GUARD = "accounting_guard";
+/**
+ * Storage pressure (ensureGrowthCapacity): `1` from when occupied storage
+ * reaches the high-water mark until it falls to the low-water mark, during
+ * which every growing operation is refused; `0` or absent otherwise.
+ */
+const META_STORAGE_PRESSURE = "storage_pressure";
 /** Throttle trips by trigger in hourly buckets over the last TRIP_WINDOW_MS (noteThrottleTrip). */
 const META_THROTTLE_TRIPS = "throttle_trips";
 /** How far back `/status` counts throttle trips (throttleTrips). */
@@ -2029,6 +2045,13 @@ const SCHEMA_DDL = `
   );
 `;
 
+/** A SettledMeta that starts out known to hold `initial`, as a freshly bootstrapped store does. */
+function settledMeta(key: string, initial: string): SettledMeta {
+  const meta = new SettledMeta(key);
+  meta.load(initial);
+  return meta;
+}
+
 export class Store {
   readonly config: StoreConfig;
   readonly sql: SqlStorageLike;
@@ -2075,8 +2098,8 @@ export class Store {
    * it reopens.
    */
   private lostOnWake = false;
-  /** The accounting marker as last read or written (`0`, `1`, or `uncertain`), so it is written only when it changes. */
-  private accountingMarker = "0";
+  /** The accounting marker (`0`, `1`, or `uncertain`), written only when it changes and never rolled back (persistSettled). */
+  private readonly accountingMarker = settledMeta(META_ACCOUNTING_UNSAFE, "0");
   /** Set while an operator alert runs (alert): reservations are charged, never refused, even with accounting closed. */
   private alerting = false;
   /**
@@ -2098,11 +2121,13 @@ export class Store {
   actor?: () => readonly string[] | undefined;
   /** What overruns have set off, read on wake (META_ACCOUNTING_GUARD). */
   private guard: AccountingGuard = emptyGuard();
-  /** The guard as last read or written, so it is written only when it changes. */
-  private guardMarker = "";
-  /** Set while persistAccountingMarker writes, so a failure inside it does not re-enter it. */
+  /** The guard as stored, written only when it changes and never rolled back (persistSettled). */
+  private readonly guardMarker = settledMeta(META_ACCOUNTING_GUARD, "");
+  /** The storage-pressure latch, set on the way to a refusal and so never rolled back (persistSettled). */
+  private readonly storagePressure = new SettledMeta(META_STORAGE_PRESSURE);
+  /** Set while persistSettled writes, so a failure inside it does not re-enter it. */
   private persisting = false;
-  /** Overruns' excess rows, charged once the operation's transaction has ended (persistAccountingMarker). */
+  /** Overruns' excess rows, charged once the operation's transaction has ended (persistSettled). */
   private overrunCharges: Array<{ day: string; delta: BudgetDelta }> = [];
   private deferredCleanupUntil = 0;
   /**
@@ -2185,12 +2210,12 @@ export class Store {
     if (version === SCHEMA_VERSION) {
       this.lastEffectiveMs = Math.max(this.lastEffectiveMs, this.storedEffectiveMs());
       const unsafeMarker = this.metaValue(META_ACCOUNTING_UNSAFE).trim().toLowerCase();
-      this.accountingMarker = unsafeMarker || "0";
-      this.guardMarker = this.metaValue(META_ACCOUNTING_GUARD);
-      this.guard = parseGuard(this.guardMarker);
+      this.accountingMarker.load(unsafeMarker || "0");
+      this.guardMarker.load(this.metaValue(META_ACCOUNTING_GUARD));
+      this.guard = parseGuard(this.guardMarker.persisted!);
       if (unsafeMarker === "1" || unsafeMarker === "true") {
         // The permanent overrun stop of earlier versions: overruns no longer
-        // stop the server, so the marker is cleared (persistAccountingMarker,
+        // stop the server, so the marker is cleared (persistSettled,
         // with the next transaction) and its stop is not kept.
         console.warn(JSON.stringify({ event: "accounting_unsafe_retired" }));
       } else if (unsafeMarker === ACCOUNTING_UNCERTAIN) {
@@ -2477,7 +2502,7 @@ export class Store {
       return false;
     }
     this.accountingUncertain = false;
-    this.persistAccountingMarker();
+    this.persistSettled();
     console.warn(JSON.stringify({ event: "accounting_uncertain_recovered", ...(charged ? { charged } : {}) }));
     try { this.onAccounting?.("recovered"); } catch { /* a metric never breaks recovery */ }
     return true;
@@ -2493,7 +2518,8 @@ export class Store {
    */
   private assertAccounting(): void {
     // The retired permanent stop's marker (initialize) is cleared by the first operation after the wake.
-    if (this.accountingMarker === "1" || this.accountingMarker === "true") this.persistAccountingMarker();
+    const marker = this.accountingMarker.persisted;
+    if (marker === "1" || marker === "true") this.persistSettled();
     if (this.alerting) return;
     if (this.accountingUncertain && !this.recoverUncertain()) {
       throw new StoreError("internal_error", "storage is unavailable", { data: { reason: STORAGE_UNAVAILABLE } });
@@ -2609,7 +2635,7 @@ export class Store {
     }
   }
 
-  /** Queues `excess` rows to charge to the reservation's day and kind, once its transaction ends (persistAccountingMarker). */
+  /** Queues `excess` rows to charge to the reservation's day and kind, once its transaction ends (persistSettled). */
   private chargeOverrun(reserved: BudgetCost, excess: { reads: number; writes: number }, day: string): void {
     if (!excess.reads && !excess.writes) return;
     this.overrunCharges.push({
@@ -2618,7 +2644,7 @@ export class Store {
         ? maintenanceDelta(excess)
         : { reads_reserved: excess.reads, writes_reserved: excess.writes, foreground_reads: excess.reads, foreground_writes: excess.writes },
     });
-    this.persistAccountingMarker();
+    this.persistSettled();
   }
 
   /**
@@ -2692,9 +2718,10 @@ export class Store {
     this.logCache = null;
     this.accountingUncertain = false;
     this.lostOnWake = false;
-    this.accountingMarker = "0";
+    this.accountingMarker.load("0");
     this.guard = emptyGuard();
-    this.guardMarker = "";
+    this.guardMarker.load("");
+    this.storagePressure.forget();
     this.overrunCharges = [];
     this.lastEffectiveMs = 0;
     this.cleanupDueCache = undefined;
@@ -2889,11 +2916,11 @@ export class Store {
       try {
         const result = this.transactionSync(fn);
         this.inTransaction = false;
-        this.persistAccountingMarker();
+        this.persistSettled();
         return result;
       } catch (error) {
         this.inTransaction = false;
-        this.persistAccountingMarker();
+        this.persistSettled();
         throw error;
       }
     }
@@ -2905,44 +2932,46 @@ export class Store {
     try {
       const result = fn();
       this.inTransaction = false;
-      this.persistAccountingMarker();
+      this.persistSettled();
       return result;
     } catch (error) {
       this.inTransaction = false;
-      this.persistAccountingMarker();
+      this.persistSettled();
       throw error;
     }
   }
 
   /**
-   * Writes the accounting marker when it changed (`uncertain` after a
-   * storage failure, `0` once clear), the overrun guard when it changed, and
-   * the excess of overruns. All are written after any enclosing native
-   * transaction has ended, so a rollback cannot erase them.
+   * Writes the values a rollback must not erase (SettledMeta) when they
+   * changed: the overrun guard, the storage-pressure latch and the
+   * accounting marker (`uncertain` after a storage failure, `0` once clear),
+   * and charges the excess of overruns. Runs after any enclosing native
+   * transaction has ended, committed or rolled back, and at once outside one.
    */
-  private persistAccountingMarker(): void {
+  private persistSettled(): void {
     // A storage failure while writing here marks accounting uncertain, which
     // comes back here: the outer call finishes, the inner one does nothing.
     if (this.inTransaction || this.persisting) return;
     this.persisting = true;
     try {
-      this.persistAccountingState();
+      this.persistSettledState();
     } finally {
       this.persisting = false;
     }
   }
 
-  private persistAccountingState(): void {
-    const guard = this.guard.day || Object.keys(this.guard.breakers).length || Object.keys(this.guard.recent).length
-      ? JSON.stringify(this.guard) : "";
-    if (guard !== this.guardMarker) {
-      try {
-        this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ACCOUNTING_GUARD, guard);
-        this.guardMarker = guard;
-      } catch {
-        // The in-memory guard still holds; the next transaction tries again.
-      }
-    }
+  /** Sets a SettledMeta value, written now outside a transaction, else once the transaction has ended. */
+  private settle(meta: SettledMeta, value: string): void {
+    meta.set(value);
+    this.persistSettled();
+  }
+
+  private persistSettledState(): void {
+    // A failed write keeps the in-memory value; the next transaction tries again.
+    const write = (key: string, value: string) => { this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", key, value); };
+    this.guardMarker.set(this.guard.day || Object.keys(this.guard.breakers).length || Object.keys(this.guard.recent).length
+      ? JSON.stringify(this.guard) : "");
+    this.guardMarker.flush(write);
     while (this.overrunCharges.length) {
       const charge = this.overrunCharges[0];
       try {
@@ -2952,15 +2981,10 @@ export class Store {
       }
       this.overrunCharges.shift();
     }
-    const value = this.accountingUncertain ? ACCOUNTING_UNCERTAIN : "0";
-    if (value === this.accountingMarker) return;
-    try {
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ACCOUNTING_UNSAFE, value);
-      this.accountingMarker = value;
-    } catch {
-      // The in-memory state still holds. A native storage failure may also
-      // prevent the marker write; the next transaction tries it again.
-    }
+    this.storagePressure.flush(write);
+    // A native storage failure may also prevent the marker write; the next transaction tries it again.
+    this.accountingMarker.set(this.accountingUncertain ? ACCOUNTING_UNCERTAIN : "0");
+    this.accountingMarker.flush(write);
   }
 
   /**
@@ -2974,7 +2998,7 @@ export class Store {
       try { this.onAccounting?.(kind, message); } catch { /* a metric never breaks the stop */ }
     }
     this.accountingUncertain = true;
-    this.persistAccountingMarker();
+    this.persistSettled();
   }
 
   /**
@@ -3353,18 +3377,20 @@ export class Store {
     // workerd's databaseSize subtracts freelist pages, so this is occupied
     // SQLite space, including indexes, rather than the filesystem's high-water
     // size. No unbounded COUNT/SUM scan or VACUUM is needed to observe reuse.
-    const paused = this.metaValue("storage_pressure") === "1";
+    // The latch is a SettledMeta: it is set on the way to a refusal, whose
+    // throw would roll a plain write back with the caller's transaction.
+    const paused = this.storagePressure.value((key) => this.metaValue(key)) === "1";
     // Cover snapshot copies, indexed inserts/splits and control rows before
     // entering the transaction. The post-write target check also runs before
     // commit; one unexpectedly large operation cannot cross the hard target.
     const growthAllowance = Math.max(1024 * 1024, Math.max(0, additionalBytes) * 16);
     if (size >= this.config.storageHighWaterBytes || size + growthAllowance > this.config.storageHardTargetBytes) {
-      if (!paused) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('storage_pressure', '1')");
+      if (!paused) this.settle(this.storagePressure, "1");
       throw new StoreError("retry_after", "Demo capacity reached", { retryAfterMs: this.config.cleanupIntervalMs });
     }
     if (paused) {
       if (size > this.config.storageLowWaterBytes) throw new StoreError("retry_after", "Demo capacity reached", { retryAfterMs: this.config.cleanupIntervalMs });
-      this.rawExec("UPDATE _meta SET value = '0' WHERE key = 'storage_pressure'");
+      this.settle(this.storagePressure, "0");
     }
   }
 
@@ -5632,11 +5658,16 @@ export class Store {
     this.assertNotDegraded("Live text", now);
     // A command's write that never came leaves nothing to publish: it goes now.
     const entries = this.liveTexts().filter((entry) => entry.post === undefined || entry.writeExpiresMs >= now);
-    if (entries.some((entry) => entry.owner === input.userId)) {
+    // Only a text that can still stream holds a slot (liveHolds). One whose
+    // write_url expired stays listed until the alarm ends its message
+    // (expireLiveTexts), but no longer counts against its owner or the server;
+    // the list itself stays bounded, at twice the concurrent texts.
+    const holding = entries.filter((entry) => liveHolds(entry, now));
+    if (holding.some((entry) => entry.owner === input.userId)) {
       throw new StoreError("denied", "You already have a live text open; finish it, or let its write_url expire, before you start another");
     }
-    if (entries.length >= policy.concurrent) {
-      const soonest = Math.min(...entries.map(liveDeadline));
+    if (holding.length >= policy.concurrent || entries.length >= 2 * policy.concurrent) {
+      const soonest = Math.min(...(holding.length ? holding : entries).map(liveDeadline));
       throw new StoreError("retry_after", "Live text is busy on this server; try again shortly", { retryAfterMs: Math.max(1_000, soonest - now) });
     }
     const limit = kind === "terminal" ? policy.terminalKeepBytes : Math.min(policy.appendMaxBytes, this.config.maxTextBytes - utf8Bytes(link.text));
