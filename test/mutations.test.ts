@@ -758,6 +758,26 @@ it("lets an owner's bot move anyone's messages with threader, but not with mod o
 	});
 });
 
+it("keeps a creator who may remove members for threads and private rooms only, and lets no bot own a bot", async () => {
+	await withStore("room-creator-scope", (store, clock) => {
+		store.createInvitedIdentity({ userId: "mia", name: "mia", now: clock.value, ipKey: "ip-test" });
+		store.setRole({ userId: "mia", role: "mod", on: true, now: clock.value });
+		const create = (requestId: string, params: Record<string, unknown>) => String(store.mutate(op(clock, "mia", requestId, "room_set", params)).result.room_id);
+		// A mod's top-level room has no creator who may remove members; their thread and private room do.
+		expect(store.roomCreator(create("top", { title: "Random" }))).toBeUndefined();
+		expect(store.roomCreator(create("side", { parent_room_id: "general", title: "Side" }))).toBe("mia");
+		expect(store.roomCreator(create("dm", { private: true }))).toBe("mia");
+		expect(store.roomCreator("general")).toBeUndefined();
+
+		// A user made a bot with /role owns no bot of its own.
+		store.createInvitedIdentity({ userId: "script", name: "script", now: clock.value, ipKey: "ip-test" });
+		store.setRole({ userId: "script", role: "bot", on: true, now: clock.value });
+		expect(errorCode(() => store.registerBot({ ownerId: "script", botId: "bot_script", name: "Bot of script", now: clock.value, ipKey: "ip-test" }))).toBe("denied");
+		store.registerBot({ ownerId: "mia", botId: "bot_mia", name: "Bot of mia", now: clock.value, ipKey: "ip-test" });
+		expect(errorCode(() => store.registerBot({ ownerId: "bot_mia", botId: "bot_bot_mia", name: "Bot of bot", now: clock.value, ipKey: "ip-test" }))).toBe("denied");
+	});
+});
+
 it("lets a bot rename itself only to a name with \"bot\" in it, in any case", async () => {
 	await withStore("bot-name", (store, clock) => {
 		store.createInvitedIdentity({ userId: "owner", name: "owner", now: clock.value, ipKey: "ip-test" });
