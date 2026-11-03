@@ -3201,20 +3201,16 @@ export class Store {
 
   accountUsageSnapshot(): AccountUsageSnapshot | null {
     this.ensureReady();
-    const raw = this.metaValue(META_ACCOUNT_USAGE);
-    if (!raw) return null;
-    try {
-      const parsed = JSON.parse(raw) as Partial<AccountUsageSnapshot>;
+    return this.metaJson<AccountUsageSnapshot | null>(META_ACCOUNT_USAGE, (value) => {
+      const parsed = value as Partial<AccountUsageSnapshot>;
       const sampledAt = parsed.sampledAt;
       if (typeof parsed.day !== "string" || typeof sampledAt !== "number" || !Number.isSafeInteger(sampledAt) || sampledAt < 0 ||
         ["workerRequests", "durableObjectRequests", "durableObjectDurationGbSeconds", "sqlRowsRead", "sqlRowsWritten", "storedBytes"].some(key => {
           const value = parsed[key as keyof AccountUsageSnapshot];
           return typeof value !== "number" || !Number.isFinite(value) || value < 0;
-        }) || typeof parsed.stop !== "boolean") return null;
+        }) || typeof parsed.stop !== "boolean") return undefined;
       return parsed as AccountUsageSnapshot;
-    } catch {
-      return null;
-    }
+    }, null);
   }
 
   persistAccountUsageSnapshot(snapshot: AccountUsageSnapshot, now = this.clock.now()): void {
@@ -3321,19 +3317,17 @@ export class Store {
 
   /** The stored trip buckets still inside the window. */
   private tripBuckets(now: number): Record<string, Record<string, number>> {
-    const kept: Record<string, Record<string, number>> = {};
-    try {
-      const stored = JSON.parse(this.metaValue(META_THROTTLE_TRIPS) || "{}") as Record<string, Record<string, unknown>>;
-      for (const [hour, bucket] of Object.entries(stored)) {
+    // An unreadable record starts the window afresh.
+    return this.metaJson(META_THROTTLE_TRIPS, (stored) => {
+      const kept: Record<string, Record<string, number>> = {};
+      for (const [hour, bucket] of Object.entries(stored as Record<string, unknown>)) {
         if (Number(hour) <= now - TRIP_WINDOW_MS || !bucket || typeof bucket !== "object") continue;
         const counts: Record<string, number> = {};
         for (const [trigger, count] of Object.entries(bucket)) if (Number.isSafeInteger(count) && (count as number) > 0) counts[trigger] = count as number;
         kept[hour] = counts;
       }
-    } catch {
-      // An unreadable record starts the window afresh.
-    }
-    return kept;
+      return kept;
+    }, {});
   }
 
   /** The server tier last announced to the admins (the runtime's record), or "" before any. */
@@ -3888,13 +3882,11 @@ export class Store {
     // Today's runs (one batch each) and whether the day is done: at most
     // IDLE_PRUNE_RUNS_PER_DAY, so a backlog spreads over days rather than
     // spending the day's maintenance reads on scans.
-    const progress = (): { day: string; runs: number; done: boolean } => {
-      try {
-        const value = JSON.parse(this.metaValue(META_IDLE_PRUNE_DAY) || "{}") as { day?: unknown; runs?: unknown; done?: unknown };
-        if (value.day === today) return { day: today, runs: integerColumn(value.runs), done: value.done === true };
-      } catch { /* a day afresh */ }
-      return { day: today, runs: 0, done: false };
-    };
+    // Another day's record, or none readable, is a day afresh.
+    const progress = (): { day: string; runs: number; done: boolean } => this.metaJson(META_IDLE_PRUNE_DAY, (stored) => {
+      const value = stored as { day?: unknown; runs?: unknown; done?: unknown };
+      return value.day === today ? { day: today, runs: integerColumn(value.runs), done: value.done === true } : undefined;
+    }, { day: today, runs: 0, done: false });
     const state = this.reserved({ reads: 8, writes: 4 }, true, now, () => {
       const since = Number(this.metaValue(META_IDLE_ACTIVITY_SINCE));
       if (!Number.isFinite(since) || since <= 0) {
@@ -3996,12 +3988,10 @@ export class Store {
   }
 
   private idlePrunedRaw(): { day: string; today: number; total: number } {
-    try {
-      const value = JSON.parse(this.metaValue(META_IDLE_PRUNED) || "{}") as { day?: unknown; today?: unknown; total?: unknown };
+    return this.metaJson(META_IDLE_PRUNED, (stored) => {
+      const value = stored as { day?: unknown; today?: unknown; total?: unknown };
       return { day: typeof value.day === "string" ? value.day : "", today: integerColumn(value.today), total: integerColumn(value.total) };
-    } catch {
-      return { day: "", today: 0, total: 0 };
-    }
+    }, { day: "", today: 0, total: 0 });
   }
 
   /** Idle accounts pruned today and in all (pruneIdleIdentities), for `/status`: charged, never refused. */
@@ -4798,6 +4788,23 @@ export class Store {
     const next = Math.max(0, this.metaNumber(key) + delta);
     this.writeMeta(key, String(next));
     return next;
+  }
+
+  /**
+   * A JSON `_meta` record, as `decode` makes it from what parses: one that
+   * is absent, does not parse, or that `decode` refuses (returning
+   * undefined, or throwing) reads as `fallback`. Every JSON record in
+   * `_meta` is read through here, so none can throw on a bad row.
+   */
+  private metaJson<T>(key: string, decode: (value: unknown) => T | undefined, fallback: T): T {
+    const raw = this.metaValue(key);
+    if (!raw) return fallback;
+    try {
+      const value = JSON.parse(raw) as unknown;
+      return value !== null && typeof value === "object" ? decode(value) ?? fallback : fallback;
+    } catch {
+      return fallback;
+    }
   }
 
   private metaNumber(key: string): number {
@@ -5645,9 +5652,7 @@ export class Store {
   /** The open live texts (META_LIVE_TEXTS): one `_meta` row, absent while there are none. */
   private liveTexts(): LiveEntry[] {
     if (!this.liveCache) {
-      const raw = this.metaValue(META_LIVE_TEXTS);
-      const parsed = raw ? parseJson<unknown>(raw, []) : [];
-      this.liveCache = Array.isArray(parsed) ? parsed.filter(isLiveEntry) : [];
+      this.liveCache = this.metaJson(META_LIVE_TEXTS, (value) => Array.isArray(value) ? value.filter(isLiveEntry) : undefined, []);
     }
     // Callers change what they get before they save it.
     return clone(this.liveCache) as LiveEntry[];
