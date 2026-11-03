@@ -236,7 +236,9 @@ itself with `me`, but only to a name with "bot" in it, in any case (say
 `{"name": "Threader Bot"}`).
 You can add your bot to a thread, say to keep its `description` current,
 with `room_join` and its `user_id`, and remove it with `room_leave` the same
-way. The token does not expire. Running `/invite-bot` again replaces it,
+way. An admin may give your bot the role `threader` (`/role bot_<your
+user_id> threader`): it may then move anyone's messages into a thread or back
+out, and add anyone to a thread with `room_join` and their `user_id`. The token does not expire. Running `/invite-bot` again replaces it,
 signs out connections that used the old one, and renames the bot after your
 current name. The first invite counts as a registration. A bot that neither
 signs in nor posts for a week is signed out and taken out of its rooms (what

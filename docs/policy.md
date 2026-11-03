@@ -73,8 +73,10 @@ within it:
   `room_update` before the result. With another user's `user_id`, an admin
   adds or removes anyone, and a registered user their own bot; while
   `/toggle addmember` is on (the default), any registered user but a bot may
-  also add anyone, and a thread's creator may remove anyone from it. Others are
-  `denied`. Only registered users can be added. A thread's messages go to its
+  also add anyone, and a thread's creator may remove anyone from it. An
+  `admin`, `mod` or `threader` (for an owner's bot, `threader` alone) may add
+  anyone to a thread whatever the toggle says, but not to a top-level room.
+  Others are `denied`. Only registered users can be added. A thread's messages go to its
   members only. A thread is removed, with its messages, when the last one in
   it leaves. Joins and leaves that change something count as posts, a
   guest's included. A guest's rooms last for its connection and are not
@@ -434,7 +436,7 @@ Every extension the frame advertises is defined in
   guest while guests only read, `add_members` for an admin, or any
   registered user but a bot while `addmember` is on, and `move_any` for a
   registered user with `admin`, `mod` or `threader`, or an owner's bot with
-  `threader`. It
+  `threader`, who may also add anyone to a thread. It
   is the server's: `me` ignores an `ext.permissions` it writes.
 - `ext:emoji`, once a custom emoji has been added, carries
   `server.params.ext.emoji.catalog_url`, the catalog's URL on the media

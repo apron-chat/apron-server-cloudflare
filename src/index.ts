@@ -1227,6 +1227,16 @@ function hasRole(attachment: ConnectionAttachment, role: string): boolean {
 	return attachment.tier === "registered" && (attachment.roles ?? []).includes(role);
 }
 
+/**
+ * Whether a connection's user may move others' messages (`move_any`), as
+ * the store checks it: a moderator role (MODERATOR_ROLES), or for an
+ * owner's bot only those it acts on (BOT_MODERATOR_ROLES). They may also
+ * add anyone to a thread (assertMayManage).
+ */
+function mayMoveAny(attachment: ConnectionAttachment): boolean {
+	return (isBotId(attachment.userId) ? BOT_MODERATOR_ROLES : MODERATOR_ROLES).some((role) => hasRole(attachment, role));
+}
+
 /** Keeps a live avatar on a connection's attachment, or none; the caller writes the attachment. */
 function setAvatar(attachment: ConnectionAttachment, avatar: string | undefined): void {
 	if (avatar) attachment.avatar = avatar;
@@ -4053,20 +4063,25 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * them from one (§4.2.2): an admin may for anyone, and a registered user
 	 * for their own bot, say to have it keep a thread's `description` current.
 	 * While `addmember` is on (the default), any registered user may also add
-	 * anyone. The room's creator may remove anyone from it; others may not.
+	 * anyone. Whoever may move others' messages (mayMoveAny), a threader bot
+	 * included, may add anyone to a thread (`thread`), whatever `addmember`
+	 * says, to bring people into a conversation it moved there. The room's
+	 * creator may remove anyone from it; others may not.
 	 */
-	private assertMayManage(attachment: ConnectionAttachment, userId: string, roomId: string, adding: boolean): void {
+	private assertMayManage(attachment: ConnectionAttachment, userId: string, roomId: string, adding: boolean, thread = false): void {
 		const owner = attachment.tier === "registered" && !hasRole(attachment, "bot");
 		if (owner && (userId === BOT_ID_PREFIX + attachment.userId || hasRole(attachment, "admin"))) return;
 		if (owner && adding && this.addMemberOn()) return;
+		if (adding && thread && mayMoveAny(attachment)) return;
 		if (owner && !adding && this.store.roomCreator(roomId, nowMs()) === attachment.userId) return;
-		throw { name: "denied", message: adding ? "Only an admin, or a bot's owner, can add someone else here" : "Only an admin, the room's creator, or a bot's owner, can remove someone else" } satisfies ProtocolError;
+		throw { name: "denied", message: adding ? "Only an admin, a threader in a thread, or a bot's owner, can add someone else here" : "Only an admin, the room's creator, or a bot's owner, can remove someone else" } satisfies ProtocolError;
 	}
 
 	/**
 	 * `room_join` with another user's `user_id` (§4.2.2): an admin, the owner
-	 * of the bot named, or while `addmember` is on any registered user (not a
-	 * bot), adds a registered user to the room as if they
+	 * of the bot named, while `addmember` is on any registered user (not a
+	 * bot), or in a thread whoever may move others' messages (a threader bot
+	 * included; assertMayManage), adds a registered user to the room as if they
 	 * had joined it. The join is stored and logged, charged to the adder's
 	 * posting limits, and its membership goes to the room's members; the
 	 * added user's connections then get `room_update` `joined`. Guests' rooms
@@ -4077,7 +4092,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Adding is the only way into a private room, so its members (the
 		// caller is one: handleRoomJoin checked) may add anyone, whether or not
 		// `addmember` is on. A bot may not.
-		if (!room.private) this.assertMayManage(attachment, userId, room.room_id, true);
+		if (!room.private) this.assertMayManage(attachment, userId, room.room_id, true, room.parent_room_id !== undefined);
 		else if (attachment.tier !== "registered" || hasRole(attachment, "bot")) throw { name: "denied", message: "Only a signed-in member who is not a bot can add someone to a private room" } satisfies ProtocolError;
 		if (!this.store.identityExists(userId)) throw { name: "invalid_params", message: `${userId} is not a registered user`.slice(0, 200) } satisfies ProtocolError;
 		const totals = new Map<string, number>();
@@ -4637,7 +4652,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (attachment.tier !== "registered") return this.config.guestPosting ? {} : { write: false };
 		return {
 			...(!hasRole(attachment, "bot") && (hasRole(attachment, "admin") || this.addMemberOn()) ? { add_members: true } : {}),
-			...((isBotId(attachment.userId) ? BOT_MODERATOR_ROLES : MODERATOR_ROLES).some((role) => hasRole(attachment, role)) ? { move_any: true } : {}),
+			...(mayMoveAny(attachment) ? { move_any: true } : {}),
 		};
 	}
 
