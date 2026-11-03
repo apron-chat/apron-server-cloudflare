@@ -284,7 +284,7 @@ export interface StoreLiveTextConfig extends LiveTextPolicy {
 /**
  * A live text that is open (protocol §4.8.3): waiting for its `PUT`
  * (`pending`) or streaming (`live`). All of them are one `_meta` row
- * (META_LIVE_TEXTS), at most `concurrent` entries; the bytes themselves are
+ * (META_LIVE_TEXTS), at most twice `concurrent` entries (startLiveText); the bytes themselves are
  * only in the object's memory while they stream.
  */
 export interface LiveEntry {
@@ -5697,7 +5697,7 @@ export class Store {
 
   /**
    * Starts a live text (§4.8.3) within the policy: one open text per user,
-   * pending writes included; at most `concurrent` server-wide; and the
+   * unexpired pending writes included; at most `concurrent` server-wide (liveHolds); and the
    * user's (a guest's: their IP's), the IP's and the server's starts,
    * charged as `live` limiter rows (a burst, then a rate, and a count a UTC
    * day). Its time limit is the owner's: `moderatorMaxSeconds` for an
@@ -5879,8 +5879,8 @@ export class Store {
    * window's end (its message, if posted, loses the embed), and a text
    * marked streaming that `streaming` (the runtime's own) does not hold:
    * the object that streamed it was evicted or redeployed and its bytes are
-   * gone, so its embed is removed. Maintenance work, bounded by `concurrent`
-   * entries; `next` is when the next one falls due.
+   * gone, so its embed is removed. Maintenance work, bounded by twice
+   * `concurrent` entries (startLiveText), which its reservation covers; `next` is when the next one falls due.
    */
   expireLiveTexts(streaming: ReadonlySet<string>, now = this.clock.now()): { broadcasts: Broadcast[]; ended: LiveEntry[]; next?: number } {
     this.ensureReady();

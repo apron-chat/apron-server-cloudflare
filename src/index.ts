@@ -3090,7 +3090,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return;
 			case "activity":
 				// Off unless the plan or `ACTIVITY` enables it: typing then gets the unsupported-method path.
-				if (!this.activityOn()) break;
+				if (!this.activityOn(true)) break;
 				await this.handleActivity(socket, request);
 				return;
 			case "status":
@@ -4154,7 +4154,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private assertMayManage(attachment: ConnectionAttachment, userId: string, roomId: string, adding: boolean, thread = false): void {
 		const owner = attachment.tier === "registered" && !hasRole(attachment, "bot");
 		if (owner && (userId === BOT_ID_PREFIX + attachment.userId || hasRole(attachment, "admin"))) return;
-		if (owner && adding && this.addMemberOn()) return;
+		if (owner && adding && this.addMemberOn(true)) return;
 		if (adding && thread && mayMoveAny(attachment)) return;
 		if (owner && !adding && this.store.roomCreator(roomId, nowMs()) === attachment.userId) return;
 		throw { name: "denied", message: adding ? "Only an admin, a threader in a thread, or a bot's owner, can add someone else here" : "Only an admin, the room's creator, or a bot's owner, can remove someone else" } satisfies ProtocolError;
@@ -4330,9 +4330,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		const latest = connectionAttachment(socket) ?? attachment;
 		if (!latest.rooms?.includes(roomId)) return;
+		const holding = !latest.reads;
 		latest.reads = { ...latest.reads, [roomId]: read };
 		if (now - (latest.readsAt ?? 0) >= READ_CURSOR_FLUSH_MS || Object.keys(latest.reads).length > MAX_ATTACHED_ROOMS) this.flushReads(latest, now, socket);
-		else writeAttachment(socket, latest);
+		else {
+			writeAttachment(socket, latest);
+			// A connection that starts holding cursors has a new deadline (connectionDeadlines): schedule it.
+			if (holding) void this.rescheduleAlarm();
+		}
 	}
 
 	/**
@@ -4381,7 +4386,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private sendReadCursors(socket: WebSocketConnection, attachment: ConnectionAttachment, roomIds: readonly string[]): void {
 		const identity = publicIdentity(attachment);
-		if (attachment.tier !== "registered" || !identity || !roomIds.length || !this.activityOn()) return;
+		if (attachment.tier !== "registered" || !identity || !roomIds.length || !this.activityOn(true)) return;
 		let cursors: Map<string, string>;
 		try {
 			cursors = this.store.readCursors(identity.user_id, nowMs());
@@ -6397,27 +6402,41 @@ export class ApronDemoServer extends DurableObject<Env> {
 			(!command.name.startsWith("embed-") || this.liveTextOn()));
 	}
 
-	/** An admin's `/toggle` of a feature, read once and then kept in memory with every change. */
-	private toggled(feature: ToggleFeature): boolean | undefined {
+	/**
+	 * An admin's `/toggle` of a feature, read once per wake and then kept in
+	 * memory with every change: on, off, or undefined for the deployment's
+	 * default. Throws when the store cannot read it now (an exhausted budget).
+	 */
+	private readToggle(feature: ToggleFeature): boolean | undefined {
 		if (!this.toggles.has(feature)) {
-			try {
-				if (feature === "presence") {
-					// With when it was last turned on (seenFloor), in the same read.
-					const read = this.store.presenceToggle(nowMs());
-					this.presenceSince = read.since ?? 0;
-					this.toggles.set(feature, read.on);
-				} else {
-					this.toggles.set(feature, this.store.toggle(feature, nowMs()));
-				}
-			} catch {
-				// Read once per wake. One that cannot be read now (an exhausted
-				// budget) is the deployment's default until a later call reads it;
-				// so no caller, such as a connection's `server` frame, fails on it.
-				// The store enforces the uploads and live text toggles itself.
-				return undefined;
+			if (feature === "presence") {
+				// With when it was last turned on (seenFloor), in the same read.
+				const read = this.store.presenceToggle(nowMs());
+				this.presenceSince = read.since ?? 0;
+				this.toggles.set(feature, read.on);
+			} else {
+				this.toggles.set(feature, this.store.toggle(feature, nowMs()));
 			}
 		}
 		return this.toggles.get(feature);
+	}
+
+	/**
+	 * A feature's toggle as readToggle reads it, or `unreadable` when it
+	 * cannot be read now, which is not kept, so a later call reads it again.
+	 * Every use of a toggle but `/toggle` itself comes through here and
+	 * never throws: one that shows a feature (the `server` frame,
+	 * `permissions`, the command list) leaves `unreadable` undefined, the
+	 * deployment's default; one that allows something the store does not
+	 * check itself (typing, adding members) passes false, so it fails
+	 * closed. The store enforces the uploads and live text toggles itself.
+	 */
+	private toggled(feature: ToggleFeature, unreadable?: boolean): boolean | undefined {
+		try {
+			return this.readToggle(feature);
+		} catch {
+			return unreadable;
+		}
 	}
 
 	/** Uploads: configured, and not turned off by an admin. */
@@ -6431,13 +6450,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/** Activity (typing): the deployment's default (plan or `ACTIVITY`) unless an admin toggled it. */
-	private activityOn(): boolean {
-		return this.toggled("activity") ?? this.config.activityEnabled;
+	private activityOn(enforce = false): boolean {
+		return this.toggled("activity", enforce ? false : undefined) ?? this.config.activityEnabled;
 	}
 
 	/** Registered users adding others to rooms (`room_join` with a `user_id`): on unless an admin turned it off. */
-	private addMemberOn(): boolean {
-		return this.toggled("addmember") ?? true;
+	private addMemberOn(enforce = false): boolean {
+		return this.toggled("addmember", enforce ? false : undefined) ?? true;
 	}
 
 	/**
@@ -6463,6 +6482,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const features: ToggleFeature[] = ["activity", ...(this.config.uploads ? ["uploads" as const] : []), ...(this.config.push ? ["presence" as const] : []), "addmember", ...(this.config.liveText ? ["livetext" as const] : [])];
 		const chosen = features.find((candidate) => candidate === feature);
 		if (!chosen) throw { name: "invalid_params", message: `Usage: /toggle ${features.join("|")}` } satisfies ProtocolError;
+		// Flipped from what is stored, never from a default stood in for it: one that cannot be read refuses the command.
+		this.readToggle(chosen);
 		const on = !(chosen === "uploads" ? this.uploadsOn() : chosen === "presence" ? this.presenceMode() : chosen === "addmember" ? this.addMemberOn() : chosen === "livetext" ? this.liveTextOn() : this.activityOn());
 		const fallback = chosen === "uploads" || chosen === "addmember" ? true : chosen === "presence" ? this.config.presence : chosen === "livetext" ? this.config.liveTextEnabled : this.config.activityEnabled;
 		const override = on === fallback ? undefined : on;
@@ -8615,7 +8636,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				const state = connectionAttachment(socket);
 				if (state) for (const [, at] of connectionDeadlines(state)) consider(at);
 			}
-			for (const deadline of Object.values(this.deadlines)) consider(deadline.at);
+			for (const due of Object.values(this.deadlines)) consider(due.at);
 			// The end of an attack pause, so the change back is announced then, not at the next event.
 			consider(this.pausedUntil(nowMs()) || undefined);
 			await this.store.scheduleAlarm(deadline, nowMs());

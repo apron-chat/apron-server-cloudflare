@@ -81,8 +81,12 @@ it('opens a connection with the deployment\'s defaults when the admins\' toggles
 	const peer = await open(stub);
 	const first = await new Promise<{ method?: string }>((resolve) => peer.socket.addEventListener('message', (event) => resolve(JSON.parse(String(event.data))), { once: true }));
 	expect(first.method).toBe('server');
+	const read = await runInDurableObject(stub, (instance) => {
+		const runtime = instance as unknown as { toggles: Map<string, unknown>; addMemberOn(enforce?: boolean): boolean; activityOn(enforce?: boolean): boolean };
+		// Shown as the deployment's default, but nothing the store does not check is allowed on it.
+		return { size: runtime.toggles.size, shown: runtime.addMemberOn(), allowed: [runtime.addMemberOn(true), runtime.activityOn(true)] };
+	});
 	// Not cached: once the store answers, the toggles are read.
-	const read = await runInDurableObject(stub, (instance) => (instance as unknown as { toggles: Map<string, unknown> }).toggles.size);
-	expect(read).toBe(0);
+	expect(read).toEqual({ size: 0, shown: true, allowed: [false, false] });
 	peer.socket.close();
 });
