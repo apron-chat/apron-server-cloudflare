@@ -1482,3 +1482,29 @@ it('forgets a device token unused as long as an account may idle', async () => {
 		});
 	} finally { owner.close(); }
 });
+
+// Last in the file: the top-level room it creates is permanent, and would show in
+// earlier tests' listings.
+it('lets no creator of a top-level room remove its members, a mod or a former one, though a thread creator may', async () => {
+	const admin = await signedInAdmin();
+	const bobId = unique('bob');
+	const bob = await signedIn(bobId);
+	const carolId = unique('carol');
+	await registered(carolId);
+	try {
+		await command(admin, 'bob-mod', `/role ${bobId} mod`);
+		const roomId = (await request(bob, 'room', 'room_set', { title: unique('Lounge') })).result.room_id;
+		const threadId = (await request(bob, 'thread', 'room_set', { parent_room_id: 'general', title: 'Side' })).result.room_id;
+		for (const target of [roomId, threadId]) await request(admin, `add-${target}`, 'room_join', { room_id: target, user_id: carolId });
+		await request(admin, 'admin-joins', 'room_join', { room_id: roomId });
+		const remove = (id: string, target: string, userId: string) => request(bob, id, 'room_leave', { room_id: target, user_id: userId });
+
+		// As a mod, and after losing the role, Bob removes nobody from his top-level room.
+		expect((await remove('as-mod', roomId, carolId)).error.code).toBe(-32001);
+		await command(admin, 'bob-unmod', `/role ${bobId} mod`);
+		expect((await remove('carol', roomId, carolId)).error.code).toBe(-32001);
+		expect((await remove('admin', roomId, 'admin')).error.code).toBe(-32001);
+		// His thread is his to tidy, as any thread's creator's is.
+		expect((await remove('thread', threadId, carolId)).result).toEqual({});
+	} finally { admin.close(); bob.close(); }
+});

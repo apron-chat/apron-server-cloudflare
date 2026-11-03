@@ -3479,15 +3479,19 @@ export class Store {
   }
 
   /**
-   * The registered user who created a room with `room_set`, kept beside the
-   * room's client fields (`creator_id` in `fields_json`) but never in its
-   * record, or undefined for `general`, a guest's room, or an unknown room.
+   * The registered user who created a thread or private room with
+   * `room_set`, who may remove its members (§4.2.2), kept beside the room's
+   * client fields (`creator_id` in `fields_json`) but never in its record.
+   * Undefined for `general`, a guest's room, an unknown room, and a public
+   * top-level room: its creator was an admin or mod when they made it, and
+   * gets no lasting power over its members from that, losing the role or not.
    */
   roomCreator(roomId: string, now = this.clock.now()): string | undefined {
     this.ensureReady();
     return this.reserved({ reads: 16 }, false, now, () => {
       const row = this.roomRow(roomId);
-      return row ? storedCreator(row.fields_json) : undefined;
+      if (!row || (row.parent_room_id === null && !isPrivateRoomId(row.room_id))) return undefined;
+      return storedCreator(row.fields_json);
     });
   }
 
@@ -4881,7 +4885,8 @@ export class Store {
     if ([...input.name].length > this.config.maxNameCodePoints) throw new StoreError("too_large", "name is too long");
     const existing = this.reserved({ reads: 16 }, false, input.now, () => {
       const owner = this.identityRow(input.ownerId);
-      if (!owner || owner.tier !== "registered") throw new StoreError("denied", "Only registered users may invite a bot");
+      // A bot, an owner's or one made by `/role … bot`, owns no bot of its own.
+      if (!owner || owner.tier !== "registered" || parseRoles(owner.roles_json).includes("bot")) throw new StoreError("denied", "Only registered users may invite a bot");
       return this.identityRow(input.botId);
     });
     if (existing) {
