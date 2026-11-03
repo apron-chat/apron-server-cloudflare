@@ -95,6 +95,7 @@ import {
 	STORAGE_UNAVAILABLE,
 } from "./store";
 import { isProtocolId } from "./domain";
+import { Deadline } from "./deadline";
 
 const OBJECT_NAME = "public-demo-v1";
 const INTERNAL_IP_HEADER = "X-Apron-Trusted-IP-Key";
@@ -2086,8 +2087,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private idlePruneAt = 0;
 	/** The UTC day this instance last finished the daily part of the account upkeep (pruneIdle). */
 	private upkeepDay = "";
-	/** When batched maintenance left work behind (a full session sweep or prune batch) and should run again; in memory. */
-	private maintenanceAt: number | undefined;
+	/**
+	 * When each kind of the server's own alarm work next falls due, in
+	 * memory: the alarm is scheduled for the earliest of these and of every
+	 * connection's own deadlines (connectionDeadlines), so none can be acted
+	 * on without being scheduled.
+	 *
+	 * - `maintenance`: batched maintenance left work behind (a full session
+	 *   sweep or prune batch) and runs again.
+	 * - `uploads`: the earliest pending upload's write window closes
+	 *   (§4.8.3); after a wake, read from storage once (uploadDeadlineRead).
+	 * - `live`: the earliest open live text falls due (liveDeadline, §4.8.3).
+	 * - `presence`: waiting status changes are to be announced (armPresence).
+	 */
+	private readonly deadlines = { maintenance: new Deadline(), uploads: new Deadline(), live: new Deadline(), presence: new Deadline() };
 	private alarmTail: Promise<void> = Promise.resolve();
 	private alarmFailures = 0;
 	private alarmKnown = false;
@@ -2097,10 +2110,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly botActiveAt = new Map<string, number>();
 	/** Admins' `/toggle`s, once read: a feature absent here has not been read yet. */
 	private readonly toggles = new Map<ToggleFeature, boolean | undefined>();
-	/** When the earliest pending upload's write window closes, if one is known (§4.8.3). */
-	private uploadDeadline: number | undefined;
-	/** When the earliest open live text falls due (liveDeadline), if one is known (§4.8.3). */
-	private liveDeadlineAt: number | undefined;
 	/**
 	 * Live texts this instance holds, by the id in their `url`: in memory
 	 * only, so an evicted or redeployed instance loses them, and the next one
@@ -2186,12 +2195,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly pendingWakes = new Set<PendingWake>();
 	/** Pushes claimed with an `unread` by this instance, so a sign-in can tell whether one came while it read (afterSignIn). */
 	private unreadClaims = 0;
-	/**
-	 * When the alarm is asked to announce waiting status changes
-	 * (armPresence), infinity for not. In memory: a wake forgets it, and the
-	 * alarm that woke the object sweeps from the attachments anyway.
-	 */
-	private presenceAlarmAt = Number.POSITIVE_INFINITY;
 	/** The earliest alarm time asked for (askPresenceAlarm), rounded, kept for a sign-in to ask again. */
 	private presenceAlarmDue = Number.POSITIVE_INFINITY;
 	/** While the alarm handler runs, which sets the next alarm itself when done. */
@@ -2544,7 +2547,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				await this.expireBot(userId);
 			}
 		} catch { /* a bot not yet signed out is found again by the next sweep */ }
-		if (this.maintenanceAt !== undefined && this.maintenanceAt <= now) this.maintenanceAt = undefined;
+		if (this.deadlines.maintenance.passed(now)) this.deadlines.maintenance.clear();
 		if (now >= this.idlePruneAt) await this.pruneIdle(now);
 		let result: ReturnType<Store["runCleanup"]> | undefined;
 		try {
@@ -2562,7 +2565,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 					const expired = this.store.expirePendingUploads(now);
 					for (const record of expired.broadcasts) this.broadcastRecord(record);
 					this.deleteMedia(expired.deletedUploads);
-					this.uploadDeadline = expired.next;
+					this.deadlines.uploads.set(expired.next);
 					this.uploadDeadlineRead = true;
 				});
 				// A full batch may have left more behind: sweep again shortly rather
@@ -2571,8 +2574,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// Expired files and avatars go from R2 too, not only by its lifecycle rules.
 				this.deleteMedia(swept.deleted);
 				if (swept.count >= UPLOAD_SWEEP_BATCH) {
-					const next = now + 1_000;
-					this.uploadDeadline = this.uploadDeadline === undefined ? next : Math.min(this.uploadDeadline, next);
+					this.deadlines.uploads.soonest(now + 1_000);
 				}
 			} catch { /* a metered maintenance failure is retried on the next alarm */ }
 		}
@@ -2631,13 +2633,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (this.config.uploads && !this.uploadDeadlineRead) {
 			try {
 				const stored = this.store.nextUploadDeadline(now);
-				if (stored !== undefined) this.uploadDeadline = this.uploadDeadline === undefined ? stored : Math.min(this.uploadDeadline, stored);
+				if (stored !== undefined) this.deadlines.uploads.soonest(stored);
 				this.uploadDeadlineRead = true;
 			} catch {
 				return true;
 			}
 		}
-		if (this.uploadDeadline !== undefined && this.uploadDeadline <= now) return true;
+		if (this.deadlines.uploads.passed(now)) return true;
 		// Live texts that a lost instance left open, read once (recoverLiveTexts), or one past its deadline.
 		if (this.config.liveText && !this.liveRecovered) {
 			try {
@@ -2647,8 +2649,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return true;
 			}
 		}
-		if (this.liveDeadlineAt !== undefined && this.liveDeadlineAt <= now) return true;
-		if (this.maintenanceAt !== undefined && this.maintenanceAt <= now) return true;
+		if (this.deadlines.live.passed(now)) return true;
+		if (this.deadlines.maintenance.passed(now)) return true;
 		return this.store.cleanupDue(now);
 	}
 
@@ -4847,7 +4849,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** Forgets every announced status and pending change (`/toggle presence`). */
 	private resetPresence(): void {
-		this.presenceAlarmAt = Number.POSITIVE_INFINITY;
+		this.deadlines.presence.clear();
 		this.presenceAlarmDue = Number.POSITIVE_INFINITY;
 		this.presenceDueAt = Number.POSITIVE_INFINITY;
 		this.announcedAt.clear();
@@ -5161,8 +5163,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private askPresenceAlarm(at: number): void {
 		if (!Number.isFinite(at)) return;
 		this.presenceAlarmDue = Math.min(this.presenceAlarmDue, at);
-		if (at >= this.presenceAlarmAt || !this.anySignedIn()) return;
-		this.presenceAlarmAt = at;
+		if (!this.deadlines.presence.isSooner(at) || !this.anySignedIn()) return;
+		this.deadlines.presence.soonest(at);
 		// The alarm handler sets the next alarm itself once it is done.
 		if (!this.inAlarm) void this.rescheduleAlarm();
 	}
@@ -5200,7 +5202,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	flushPresence(now = nowMs(), live?: WebSocket): void {
 		this.presenceSweptAt = now;
-		this.presenceAlarmAt = Number.POSITIVE_INFINITY;
+		this.deadlines.presence.clear();
 		this.presenceAlarmDue = Number.POSITIVE_INFINITY;
 		this.presenceDueAt = Number.POSITIVE_INFINITY;
 		if (!this.config.push) return;
@@ -6596,16 +6598,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async refreshLiveDeadline(): Promise<void> {
 		const entries = this.store.openLiveTexts(nowMs());
 		const next = entries.length ? Math.min(...entries.map(liveDeadline)) : undefined;
-		if (next === this.liveDeadlineAt) return;
-		this.liveDeadlineAt = next;
+		if (!this.deadlines.live.set(next)) return;
 		await this.rescheduleAlarm();
 	}
 
 	/** Notes when an open live text falls due; true when that moves the alarm earlier. */
 	private noteLiveDeadline(due: number): boolean {
-		if (this.liveDeadlineAt !== undefined && this.liveDeadlineAt <= due) return false;
-		this.liveDeadlineAt = due;
-		return true;
+		return this.deadlines.live.soonest(due);
 	}
 
 	/**
@@ -6616,7 +6615,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async recoverLiveTexts(): Promise<void> {
 		if (!this.config.liveText) return;
-		if (this.liveRecovered && (this.liveDeadlineAt === undefined || this.liveDeadlineAt > nowMs())) return;
+		if (this.liveRecovered && !this.deadlines.live.passed(nowMs())) return;
 		this.liveRecovered = true;
 		await this.expireLive(nowMs());
 		await this.rescheduleAlarm();
@@ -6634,7 +6633,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				const session = this.liveSessions.get(entry.id);
 				if (session?.phase === "waiting") this.forgetWaitingLive(session);
 			}
-			this.liveDeadlineAt = expired.next;
+			this.deadlines.live.set(expired.next);
 		});
 	}
 
@@ -7204,8 +7203,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** Runs the alarm's maintenance again shortly: batched work left more behind. */
 	private maintenanceSoon(now: number): void {
-		const next = now + 1_000;
-		this.maintenanceAt = this.maintenanceAt === undefined ? next : Math.min(this.maintenanceAt, next);
+		this.deadlines.maintenance.soonest(now + 1_000);
 	}
 
 	/** Deletes one device token and its entry in its user's list (an expired one); never throws. */
@@ -8341,8 +8339,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.deleteMedia(result.deletedUploads ?? []);
 		let started = false;
 		for (const upload of result.uploads ?? []) {
-			const due = upload.writeExpiresMs + UPLOAD_WRITE_GRACE_MS;
-			this.uploadDeadline = this.uploadDeadline === undefined ? due : Math.min(this.uploadDeadline, due);
+			this.deadlines.uploads.soonest(upload.writeExpiresMs + UPLOAD_WRITE_GRACE_MS);
 			started = true;
 		}
 		return started;
@@ -8583,10 +8580,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				const state = connectionAttachment(socket);
 				if (state) for (const [, at] of connectionDeadlines(state)) consider(at);
 			}
-			consider(this.uploadDeadline);
-			consider(this.liveDeadlineAt);
-			consider(this.maintenanceAt);
-			consider(this.presenceAlarmAt);
+			for (const deadline of Object.values(this.deadlines)) consider(deadline.at);
 			// The end of an attack pause, so the change back is announced then, not at the next event.
 			consider(this.pausedUntil(nowMs()) || undefined);
 			await this.store.scheduleAlarm(deadline, nowMs());

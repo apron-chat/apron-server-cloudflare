@@ -119,7 +119,7 @@ it('counts alarms and accounting changes in METRICS, and logs why accounting clo
 });
 
 it('runs the full alarm for a live text past its deadline, or open texts a lost instance left, and not otherwise', async () => {
-	type LiveRuntime = Runtime & { alarm(): Promise<void>; liveDeadlineAt: number | undefined };
+	type LiveRuntime = Runtime & { alarm(): Promise<void>; deadlines: { live: { set(at: number | undefined): boolean } } };
 	await runInDurableObject(env.DEMO.getByName('live-deadline-alarm'), async (instance, state) => {
 		const runtime = instance as unknown as LiveRuntime;
 		state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1', Date.now() + 3_600_000);
@@ -129,7 +129,7 @@ it('runs the full alarm for a live text past its deadline, or open texts a lost 
 		await runtime.alarm();
 		expect(expire).not.toHaveBeenCalled();
 		// A text past its deadline: the full alarm ends it (the time limit).
-		runtime.liveDeadlineAt = Date.now() - 1;
+		runtime.deadlines.live.set(Date.now() - 1);
 		await runtime.alarm();
 		expect(expire).toHaveBeenCalledTimes(1);
 	});

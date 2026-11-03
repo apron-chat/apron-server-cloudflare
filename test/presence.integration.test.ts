@@ -585,14 +585,14 @@ describe('user status timing', () => {
 		const watcherId = unique('watcher');
 		const watcher = await signedIn(watcherId);
 		const visitor = await guest();
-		type Pending = Runtime & { presenceAlarmAt: number; presenceDueAt: number; alarmTail: Promise<void> };
+		type Pending = Runtime & { deadlines: { presence: { at?: number } }; presenceDueAt: number; alarmTail: Promise<void> };
 		try {
 			await drain(watcher);
 			await status(visitor.peer, { idle: 0 });
 			const pending = await runInDurableObject(stub(), async (instance) => {
 				const runtime = instance as unknown as Pending;
 				await runtime.alarmTail;
-				return { alarm: runtime.presenceAlarmAt, due: runtime.presenceDueAt };
+				return { alarm: runtime.deadlines.presence.at!, due: runtime.presenceDueAt };
 			});
 			// Rounded up to guestPresenceAlarmSeconds, at most that much late.
 			const round = DEFAULT_LIMITS.guestPresenceAlarmSeconds * 1_000;
@@ -631,14 +631,14 @@ describe('user status timing', () => {
 		const leaverId = unique('leaver');
 		const watcher = await signedIn(watcherId);
 		const leaver = await signedIn(leaverId);
-		type AlarmRuntime = Runtime & { presenceAlarmAt: number; alarmTail: Promise<void>; alarm(): Promise<void>; accountUsage: { refresh(now: number, forced: boolean): Promise<void> } };
+		type AlarmRuntime = Runtime & { deadlines: { presence: { at?: number } }; alarmTail: Promise<void>; alarm(): Promise<void>; accountUsage: { refresh(now: number, forced: boolean): Promise<void> } };
 		try {
 			await drain(watcher);
 			await hangUp(leaver, leaverId);
 			const pending = await runInDurableObject(stub(), async (instance, state) => {
 				const runtime = instance as unknown as AlarmRuntime;
 				await runtime.alarmTail;
-				return { at: runtime.presenceAlarmAt, alarm: await state.storage.getAlarm() };
+				return { at: runtime.deadlines.presence.at!, alarm: await state.storage.getAlarm() };
 			});
 			// Asked for the grace, never more than MAX_STATUS_DELAY_SECONDS ahead,
 			// and the object's alarm is set no later than that.
@@ -659,19 +659,19 @@ describe('user status timing', () => {
 				const refresh = vi.spyOn(runtime.accountUsage, 'refresh');
 				await runtime.alarm();
 				await runtime.alarmTail;
-				return { cleanup: cleanup.mock.calls.length, refresh: refresh.mock.calls.length, at: runtime.presenceAlarmAt, alarm: await state.storage.getAlarm() };
+				return { cleanup: cleanup.mock.calls.length, refresh: refresh.mock.calls.length, at: runtime.deadlines.presence.at, alarm: await state.storage.getAlarm() };
 			});
 			// It announced the change and set the next alarm, skipping the usage
 			// refresh and cleanup, which the alarms with their own work run.
-			expect(fired).toMatchObject({ cleanup: 0, refresh: 0, at: Number.POSITIVE_INFINITY });
+			expect(fired).toMatchObject({ cleanup: 0, refresh: 0, at: undefined });
 			expect(fired.alarm).not.toBeNull();
 			expect(told(await drain(watcher), leaverId)).toEqual(['offline']);
 			// A mute that runs out in an hour asks for nothing: an event sweeps for it.
 			await status(watcher, { mute: 3600 });
-			expect(await runInDurableObject(stub(), (instance) => (instance as unknown as AlarmRuntime).presenceAlarmAt)).toBe(Number.POSITIVE_INFINITY);
+			expect(await runInDurableObject(stub(), (instance) => (instance as unknown as AlarmRuntime).deadlines.presence.at)).toBeUndefined();
 			// With no connection to tell of changes, nothing is asked of the alarm.
 			await hangUp(watcher, watcherId);
-			expect(await runInDurableObject(stub(), (instance) => (instance as unknown as AlarmRuntime).presenceAlarmAt)).toBe(Number.POSITIVE_INFINITY);
+			expect(await runInDurableObject(stub(), (instance) => (instance as unknown as AlarmRuntime).deadlines.presence.at)).toBeUndefined();
 		} finally { watcher.close(); leaver.close(); }
 	});
 
