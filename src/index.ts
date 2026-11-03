@@ -1108,27 +1108,37 @@ function connectionDeadlines(attachment: ConnectionAttachment): Array<[Connectio
 	return due;
 }
 
-/** Async ceremonies must not overwrite counters for frames queued meanwhile. */
-function writeSessionAttachment(socket: WebSocketConnection, attachment: ConnectionAttachment): void {
+/**
+ * The fields a sign-in sets (ApronDemoServer.becomeRegistered): who the
+ * connection now is, its rooms and credential, and the read cursors it
+ * wrote for the user before.
+ */
+const SIGN_IN_FIELDS = ["tier", "userId", "name", "avatar", "roles", "ext", "rooms", "listedJoined", "credential", "reads", "readsAt"] as const satisfies ReadonlyArray<keyof ConnectionAttachment>;
+
+/**
+ * Writes the fields `owned` of a copy of a connection's attachment read
+ * before an await (an async ceremony: a passkey's verification, a session
+ * renewal) onto the attachment as it is now, and makes the copy match it.
+ * Everything else comes from the attachment as stored, which other events
+ * kept current meanwhile (frame counters and leases, presence, mutes, held
+ * wakes, the time of the last frame, the closing mark), so no field the
+ * ceremony did not set can be rolled back to what it was when it began.
+ */
+function writeSessionAttachment(socket: WebSocketConnection, attachment: ConnectionAttachment, owned: ReadonlyArray<keyof ConnectionAttachment> = SIGN_IN_FIELDS): void {
 	const current = connectionAttachment(socket);
-	if (current) {
-		attachment.pendingFrames = current.pendingFrames;
-		attachment.pendingBytes = current.pendingBytes;
-		attachment.frameTimes = current.frameTimes;
-		attachment.policyViolations = current.policyViolations;
-		attachment.throttles = current.throttles;
-		attachment.notices = current.notices;
-		attachment.frameLease = current.frameLease;
-		attachment.closing = current.closing;
-		if (current.idle) attachment.idle = true;
-		else delete attachment.idle;
-		// Kept current by this connection's and other connections' events meanwhile.
-		for (const key of ["idleAt", "held", "choice", "muteUntil", "roomMuteNext", "pres", "owed", "unreadOwed"] as const) {
-			if (current[key] !== undefined) (attachment as unknown as Record<string, unknown>)[key] = current[key];
-			else delete attachment[key];
-		}
+	if (!current) {
+		writeAttachment(socket, attachment);
+		return;
 	}
-	writeAttachment(socket, attachment);
+	const merged = current as unknown as Record<string, unknown>;
+	const copy = attachment as unknown as Record<string, unknown>;
+	for (const key of owned) {
+		if (copy[key] !== undefined) merged[key] = copy[key];
+		else delete merged[key];
+	}
+	writeAttachment(socket, current);
+	for (const key of Object.keys(copy)) if (!(key in merged)) delete copy[key];
+	Object.assign(copy, merged);
 }
 
 /**
@@ -3209,7 +3219,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			});
 			if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
 			attachment.challenge = begun.challenge;
-			writeSessionAttachment(socket, attachment);
+			writeSessionAttachment(socket, attachment, ["challenge"]);
 			this.reply(socket, request, { challenge_id: begun.challenge.challengeId, public_key: begun.publicKey });
 			await this.rescheduleAlarm();
 			return;
@@ -3310,19 +3320,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			throw { name: "denied", message: "This passkey is no longer on the account" } satisfies ProtocolError;
 		}
 		const previous = this.guestBefore(socket, attachment);
-		// Read cursors still unwritten are the previous user's.
-		if (attachment.reads) this.flushReads(attachment, nowMs());
-		attachment.tier = "registered";
-		attachment.userId = finished.identity.user_id;
-		this.store.noteActive(finished.identity.user_id, nowMs());
-		attachment.name = finished.identity.name;
-		setAvatar(attachment, avatar);
-		attachment.roles = roles;
-		setExt(attachment, ext);
-		attachment.rooms = this.registeredRooms(socket, finished.identity.user_id);
-		delete attachment.listedJoined;
-		attachment.credential = sessionCredential;
-		writeSessionAttachment(socket, attachment);
+		this.becomeRegistered(socket, attachment, { userId: finished.identity.user_id, name: finished.identity.name, avatar, roles, ext },
+			this.registeredRooms(socket, finished.identity.user_id), sessionCredential);
 		this.prepareStatus(socket, stored);
 		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), token });
 		this.releaseDeliveries(socket);
@@ -3467,19 +3466,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Read before the connection changes, with no await after, so a failure leaves it as it was.
 		const stored = this.readStatusInputs(identity.userId, identity.seen);
 		const previous = this.guestBefore(socket, attachment);
-		// Read cursors still unwritten are the previous user's.
-		if (attachment.reads) this.flushReads(attachment, nowMs());
-		attachment.tier = "registered";
-		attachment.userId = identity.userId;
-		attachment.name = identity.name;
-		setAvatar(attachment, identity.avatar);
-		attachment.roles = identity.roles;
-		this.store.noteActive(identity.userId, nowMs());
-		setExt(attachment, identity.ext);
-		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
-		delete attachment.listedJoined;
-		attachment.credential = key;
-		writeSessionAttachment(socket, attachment);
+		this.becomeRegistered(socket, attachment, identity, this.liveRoomsOf(identity.userId, socket) ?? identity.rooms, key);
 		this.prepareStatus(socket, stored);
 		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), token });
 		this.guestLeaves(socket, attachment, previous, false);
@@ -3582,6 +3569,30 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
+	 * Makes a connection `identity`, registered: the one place a sign-in
+	 * (passkey, session token, or keyless token) changes who a connection
+	 * is. Its read cursors still unwritten are the previous user's, so they
+	 * are written first; then its identity, rooms and `credential` (none for
+	 * APRON_ADMIN_TOKEN) are stored, and nothing else (SIGN_IN_FIELDS).
+	 */
+	private becomeRegistered(socket: WebSocketConnection, attachment: ConnectionAttachment,
+		identity: { userId: string; name?: string; avatar?: string; roles: string[]; ext?: Record<string, unknown> }, rooms: string[], credential: string | undefined): void {
+		if (attachment.reads) this.flushReads(attachment, nowMs());
+		attachment.tier = "registered";
+		attachment.userId = identity.userId;
+		this.store.noteActive(identity.userId, nowMs());
+		attachment.name = identity.name;
+		setAvatar(attachment, identity.avatar);
+		attachment.roles = identity.roles;
+		setExt(attachment, identity.ext);
+		attachment.rooms = rooms;
+		delete attachment.listedJoined;
+		if (credential !== undefined) attachment.credential = credential;
+		else delete attachment.credential;
+		writeSessionAttachment(socket, attachment);
+	}
+
+	/**
 	 * Finishes a bearer-token sign-in that has no passkey session behind it
 	 * (a bot, the admin user, an invited user, one `created` by a sign-up
 	 * invite, or a user's other `device`): the connection becomes the
@@ -3593,20 +3604,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Read before the connection changes, so a failure leaves it as it was.
 		const stored = this.readStatusInputs(identity.userId, identity.seen);
 		const previous = this.guestBefore(socket, attachment);
-		// Read cursors still unwritten are the previous user's.
-		if (attachment.reads) this.flushReads(attachment, nowMs());
-		attachment.tier = "registered";
-		attachment.userId = identity.userId;
-		attachment.name = identity.name;
-		setAvatar(attachment, identity.avatar);
-		attachment.roles = identity.roles;
-		this.store.noteActive(identity.userId, nowMs());
-		setExt(attachment, identity.ext);
-		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
-		delete attachment.listedJoined;
-		if (credential !== undefined) attachment.credential = credential;
-		else delete attachment.credential;
-		writeSessionAttachment(socket, attachment);
+		this.becomeRegistered(socket, attachment, identity, this.liveRoomsOf(identity.userId, socket) ?? identity.rooms, credential);
 		this.prepareStatus(socket, stored);
 		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), ...(token ? { token } : {}) });
 		this.releaseDeliveries(socket);

@@ -1667,6 +1667,19 @@ function cursorRows<T>(cursor: SqlCursorLike<T>): T[] {
   return [];
 }
 
+/** The per-day counts of a limiter row (`principal_limits`), each meaning "so far on the row's `day`". */
+type DayColumn = "posts_day" | "registrations_day" | "uploads_day";
+
+/**
+ * A limiter row's count for `day`: its stored count if the row is that
+ * day's, else 0, since a row's day counts start over lazily, when the next
+ * event writes it. Every read of a day count goes through here, so none can
+ * forget the rollover; a missing row counts 0.
+ */
+function dayCount(row: { day: string } & Partial<Record<DayColumn, unknown>> | null | undefined, column: DayColumn, day: string): number {
+  return row && row.day === day ? integerColumn(row[column]) : 0;
+}
+
 function integerColumn(value: unknown, fallback = 0): number {
   const number = typeof value === "number" ? value : Number(value);
   return Number.isFinite(number) ? Math.trunc(number) : fallback;
@@ -2044,6 +2057,9 @@ const SCHEMA_DDL = `
     schema_version INTEGER NOT NULL
   );
 `;
+
+/** The counts kept in `_meta` instead of counted by a scan; changed only by Store.adjustCount. */
+type MetaCount = "identity_count" | "thread_count" | "private_count" | "principal_limit_count";
 
 /** A SettledMeta that starts out known to hold `initial`, as a freshly bootstrapped store does. */
 function settledMeta(key: string, initial: string): SettledMeta {
@@ -2731,7 +2747,7 @@ export class Store {
     if (guestNumberMark > 0) {
       // Guest numbers outlive the wipe, so none is ever reissued. Like the
       // budget row, this is one uncharged control write.
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_GUEST_NUMBER_MARK, String(guestNumberMark));
+      this.writeMeta(META_GUEST_NUMBER_MARK, String(guestNumberMark));
     }
     const writeStart = { reads: this.observed.reads, writes: this.observed.writes };
     if (passkeys.length) this.writeCarriedPasskeys(passkeys);
@@ -2805,7 +2821,7 @@ export class Store {
         this.rawExec("UPDATE rooms SET member_count = (SELECT COUNT(*) FROM memberships WHERE room_id = ?) WHERE room_id = ?", ROOM_ID, ROOM_ID);
       }
       const count = this.rawRows<{ count: number }>("SELECT COUNT(*) AS count FROM identities")[0];
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(integerColumn(count?.count)));
+      this.writeMeta("identity_count", String(integerColumn(count?.count)));
     });
   }
 
@@ -2968,7 +2984,7 @@ export class Store {
 
   private persistSettledState(): void {
     // A failed write keeps the in-memory value; the next transaction tries again.
-    const write = (key: string, value: string) => { this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", key, value); };
+    const write = (key: string, value: string) => this.writeMeta(key, value);
     this.guardMarker.set(this.guard.day || Object.keys(this.guard.breakers).length || Object.keys(this.guard.recent).length
       ? JSON.stringify(this.guard) : "");
     this.guardMarker.flush(write);
@@ -3204,7 +3220,7 @@ export class Store {
   persistAccountUsageSnapshot(snapshot: AccountUsageSnapshot, now = this.clock.now()): void {
     this.ensureReady();
     this.reserved({ reads: 8, writes: 8 }, true, now, () => {
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ACCOUNT_USAGE, JSON.stringify(snapshot));
+      this.writeMeta(META_ACCOUNT_USAGE, JSON.stringify(snapshot));
     });
   }
 
@@ -3227,7 +3243,7 @@ export class Store {
       const rows = this.rawRows<{ scope: string; day: string; posts_day: number }>(
         "SELECT scope, day, posts_day FROM principal_limits WHERE principal_key = 'global' AND scope IN ('frames', 'admission', 'post')",
       );
-      const today = (scope: string) => integerColumn(rows.find((row) => row.scope === scope && row.day === day)?.posts_day ?? 0);
+      const today = (scope: string) => dayCount(rows.find((row) => row.scope === scope), "posts_day", day);
       return {
         budget: this.budgetValue(now),
         identities: this.metaNumber("identity_count"),
@@ -3287,7 +3303,7 @@ export class Store {
       const bucket = buckets[hour] ??= {};
       // Bounded: a trigger is a reason or a short slug, and the window is a day of hours.
       if (bucket[trigger] !== undefined || Object.keys(bucket).length < 64) bucket[trigger] = (bucket[trigger] ?? 0) + 1;
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_THROTTLE_TRIPS, JSON.stringify(buckets));
+      this.writeMeta(META_THROTTLE_TRIPS, JSON.stringify(buckets));
     }, true));
   }
 
@@ -3330,7 +3346,7 @@ export class Store {
   setAnnouncedTier(value: string, now = this.clock.now()): void {
     this.ensureReady();
     this.alert(() => this.reserved({ reads: 4, writes: 4 }, false, now, () => {
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ANNOUNCED_TIER, value);
+      this.writeMeta(META_ANNOUNCED_TIER, value);
     }, true));
   }
 
@@ -3348,7 +3364,7 @@ export class Store {
   setAttackPause(value: string, now = this.clock.now()): void {
     this.ensureReady();
     this.alert(() => this.reserved({ reads: 4, writes: 4 }, false, now, () => {
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_ATTACK_PAUSE, value);
+      this.writeMeta(META_ATTACK_PAUSE, value);
     }, true));
   }
 
@@ -3684,7 +3700,7 @@ export class Store {
       for (const scope of USER_LIMIT_SCOPES) {
         this.rawExec("UPDATE principal_limits SET principal_key = ? WHERE scope = ? AND principal_key = ?", `user:${to}`, scope, `user:${from}`);
       }
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_RENAMED_PREFIX + from, to);
+      this.writeMeta(META_RENAMED_PREFIX + from, to);
       const avatar = liveAvatar(found.identity, now);
       const ext = parseUserExt(found.identity.ext_json);
       return { name: found.identity.name, ...(avatar ? { avatar } : {}), ...(ext ? { ext } : {}), rooms: this.userRooms(to), roles: parseRoles(found.identity.roles_json) };
@@ -3823,11 +3839,11 @@ export class Store {
       const limiters = integerColumn(this.rawRows<{ count: number }>(`SELECT COUNT(*) AS count FROM principal_limits WHERE ${limiterWhere}`, ...limiterKeys)[0]?.count);
       if (limiters) {
         this.rawExec(`DELETE FROM principal_limits WHERE ${limiterWhere}`, ...limiterKeys);
-        this.rawExec("UPDATE _meta SET value = ? WHERE key = 'principal_limit_count'", String(Math.max(0, this.metaNumber("principal_limit_count") - limiters)));
+        this.adjustCount("principal_limit_count", -limiters);
       }
       for (const id of ids) this.limiters.dropPrincipal(`user:${id}`);
-      for (const userId of retired) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_PURGED_PREFIX + userId, String(now));
-      if (identities) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(Math.max(0, this.metaNumber("identity_count") - identities)));
+      for (const userId of retired) this.writeMeta(META_PURGED_PREFIX + userId, String(now));
+      if (identities) this.adjustCount("identity_count", -identities);
       return { messages: messages.length, reactions: integerColumn(reactions), deletedUploads };
     }), true);
   }
@@ -3882,7 +3898,7 @@ export class Store {
     const state = this.reserved({ reads: 8, writes: 4 }, true, now, () => {
       const since = Number(this.metaValue(META_IDLE_ACTIVITY_SINCE));
       if (!Number.isFinite(since) || since <= 0) {
-        this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_IDLE_ACTIVITY_SINCE, String(now));
+        this.writeMeta(META_IDLE_ACTIVITY_SINCE, String(now));
         return { ...progress(), waiting: true };
       }
       return { ...progress(), waiting: now - since < this.config.idleAccountMs };
@@ -3890,7 +3906,7 @@ export class Store {
     if (state.waiting || state.done || state.runs >= IDLE_PRUNE_RUNS_PER_DAY) return { pruned: [], more: false };
     const record = (done: boolean) => this.reserved({ reads: 4, writes: 4 }, true, now, () => {
       const current = progress();
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_IDLE_PRUNE_DAY,
+      this.writeMeta(META_IDLE_PRUNE_DAY,
         JSON.stringify({ day: today, runs: current.runs + 1, done: done || current.runs + 1 >= IDLE_PRUNE_RUNS_PER_DAY }));
     }, false);
     const cutoff = now - this.config.idleAccountMs;
@@ -3954,15 +3970,15 @@ export class Store {
         const limiters = integerColumn(this.rawRows<{ count: number }>(`SELECT COUNT(*) AS count FROM principal_limits WHERE ${limiterWhere}`, ...limiterKeys)[0]?.count);
         if (limiters) {
           this.rawExec(`DELETE FROM principal_limits WHERE ${limiterWhere}`, ...limiterKeys);
-          this.rawExec("UPDATE _meta SET value = ? WHERE key = 'principal_limit_count'", String(Math.max(0, this.metaNumber("principal_limit_count") - limiters)));
+          this.adjustCount("principal_limit_count", -limiters);
         }
         for (const id of ids) this.limiters.dropPrincipal(`user:${id}`);
-        for (const id of ids) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_PURGED_PREFIX + id, String(now));
-        this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(Math.max(0, this.metaNumber("identity_count") - ids.length)));
+        for (const id of ids) this.writeMeta(META_PURGED_PREFIX + id, String(now));
+        this.adjustCount("identity_count", -ids.length);
         const day = dayFor(now);
         const previous = this.idlePrunedRaw();
         const counts = { day, today: (previous.day === day ? previous.today : 0) + ids.length, total: previous.total + ids.length };
-        this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_IDLE_PRUNED, JSON.stringify(counts));
+        this.writeMeta(META_IDLE_PRUNED, JSON.stringify(counts));
       }), false);
     } catch (error) {
       // A batch the day's budget refuses would be refused at every hourly
@@ -4268,11 +4284,7 @@ export class Store {
       day,
       now,
     );
-    const count = String(this.metaNumber("principal_limit_count") + 1);
-    // Every schema seeds the count; one missing (an operator's edit) is written back, so the cap still applies.
-    if (this.rawExec("UPDATE _meta SET value = ? WHERE key = 'principal_limit_count'", count).rowsWritten === 0) {
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('principal_limit_count', ?)", count);
-    }
+    this.adjustCount("principal_limit_count", 1);
     const row: RawLimitRow = {
       scope,
       principal_key: principalKey,
@@ -4372,7 +4384,7 @@ export class Store {
       } else {
         charged.push(minute.bucket);
       }
-      const count = row.day === daily ? row.posts_day : 0;
+      const count = dayCount(row, "posts_day", daily);
       if (count + weight > dailyAllowance) {
         const retry = Math.max(1, 86_400_000 - now % 86_400_000);
         if (retry > retryAfterMs) {
@@ -4384,7 +4396,7 @@ export class Store {
     if (retryAfterMs > 0) throw new StoreError("retry_after", reason, { retryAfterMs, ...(input.uncategorized ? {} : { data: limitData("write") }) });
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index];
-      const dailyCount = (row.day === daily ? row.posts_day : 0) + weight;
+      const dailyCount = dayCount(row, "posts_day", daily) + weight;
       this.updateLimitRow(row, { ...bucketRow(charged[index]), day: daily, posts_day: dailyCount }, now, weight);
     }
   }
@@ -4399,7 +4411,7 @@ export class Store {
     const data = category ? limitData(category) : undefined;
     const row = this.limitRow(scope, principalKey, now);
     const day = dayFor(now);
-    const count = row.day === day ? row.posts_day : 0;
+    const count = dayCount(row, "posts_day", day);
     if (perDay && count >= perDay.limit) {
       throw new StoreError("retry_after", perDay.message, { retryAfterMs: Math.max(1000, 86_400_000 - now % 86_400_000), data });
     }
@@ -4436,7 +4448,7 @@ export class Store {
     return this.reserved(GUEST_NUMBER_BLOCK_COST, false, now, () => this.transaction(() => {
       const mark = this.metaNumber(META_GUEST_NUMBER_MARK);
       if (mark > MAX_SAFE_ID - count - 1) throw new StoreError("internal_error", "guest numbers are exhausted");
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_GUEST_NUMBER_MARK, String(mark + count));
+      this.writeMeta(META_GUEST_NUMBER_MARK, String(mark + count));
       return { first: mark + 1, limit: mark + count + 1 };
     }));
   }
@@ -4458,7 +4470,7 @@ export class Store {
         this.updateLimitRow(row, bucketRow(charged.bucket), effective, count);
         const global = this.limitRow("frames", "global", effective);
         const day = dayFor(effective);
-        const globalCount = global.day === day ? global.posts_day : 0;
+        const globalCount = dayCount(global, "posts_day", day);
         // An admin's frames (alert) are counted but never refused, so `/status` answers on a spent day.
         if (!this.alerting && globalCount + count > this.config.processedFramesPerDay) {
           throw new StoreError("retry_after", "Daily frame budget exhausted", { retryAfterMs: Math.max(1_000, 86_400_000 - effective % 86_400_000), data: { reason: "frame_budget" } });
@@ -4472,8 +4484,8 @@ export class Store {
     const day = dayFor(now);
     const ip = this.limitRow("registration", `ip:${ipKey}`, now);
     const global = this.limitRow("registration", "global", now);
-    const ipCount = ip.day === day ? ip.registrations_day : 0;
-    const globalCount = global.day === day ? global.registrations_day : 0;
+    const ipCount = dayCount(ip, "registrations_day", day);
+    const globalCount = dayCount(global, "registrations_day", day);
     const retryAfterMs = Math.max(1, 86_400_000 - now % 86_400_000);
     if (ipCount >= this.config.registrationsPerIpDay) {
       throw new StoreError("retry_after", "Registration limit reached for this network", { retryAfterMs });
@@ -4550,7 +4562,7 @@ export class Store {
           effective,
           effective,
         );
-        this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(this.metaNumber("identity_count") + 1));
+        this.adjustCount("identity_count", 1);
         this.rawExec(
           `INSERT INTO credentials
            (credential_id, user_id, public_key_json, sign_count, transports_json, created_ms, updated_ms)
@@ -4747,7 +4759,7 @@ export class Store {
         // rolling minute gate; using it as a daily counter would make a quiet
         // IP permanently consume global capacity independently.
         const global = this.limitRow("admission", "global", now);
-        const admissions = global.day === day ? global.posts_day : 0;
+        const admissions = dayCount(global, "posts_day", day);
         // Until the UTC day ends, when the counts reset.
         const untilReset = Math.max(1_000, 86_400_000 - now % 86_400_000);
         if (admissions >= this.config.connectionAdmissionsPerDay) throw new StoreError("retry_after", "Connection admission limit reached", { retryAfterMs: untilReset });
@@ -4758,12 +4770,34 @@ export class Store {
         // deny admission, so only the durable admission/day and frame budget
         // controls are maintained here.
         const frames = this.limitRow("frames", "global", now);
-        const frameCount = frames.day === day ? frames.posts_day : 0;
+        const frameCount = dayCount(frames, "posts_day", day);
         if (frameCount >= this.config.processedFramesPerDay) {
           throw new StoreError("retry_after", "Daily frame budget exhausted", { retryAfterMs: untilReset, data: { reason: "frame_budget" } });
         }
       });
     });
+  }
+
+  /**
+   * Writes one `_meta` value, or removes its row for `null`: every plain
+   * `_meta` write goes through here. (A value a refusal must leave behind is
+   * a SettledMeta instead, written by persistSettled.)
+   */
+  private writeMeta(key: string, value: string | null): void {
+    if (value === null) this.rawExec("DELETE FROM _meta WHERE key = ?", key);
+    else this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", key, value);
+  }
+
+  /**
+   * Adds `delta` to one of the denormalised counts (MetaCount), never below
+   * 0, writing the row back if it is missing (an operator's edit): every
+   * change to a count goes through here, so each is kept the same way, and
+   * a missing row reads, and is rewritten, as 0 plus the change.
+   */
+  private adjustCount(key: MetaCount, delta: number): number {
+    const next = Math.max(0, this.metaNumber(key) + delta);
+    this.writeMeta(key, String(next));
+    return next;
   }
 
   private metaNumber(key: string): number {
@@ -5020,7 +5054,7 @@ export class Store {
         `SELECT user_id FROM identities WHERE roles_json = '["bot"]' AND updated_ms > 0 AND updated_ms < ? ORDER BY updated_ms LIMIT ?`, input.before, input.limit,
       ).map((row) => row.user_id);
       const next = due === "" ? effective + input.graceMs : idle.length >= input.limit ? effective : effective + input.intervalMs;
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_BOT_SWEEP, String(next));
+      this.writeMeta(META_BOT_SWEEP, String(next));
       return idle;
     });
   }
@@ -5083,7 +5117,7 @@ export class Store {
           "INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES (?, '', ?, ?, ?, ?, ?)",
           input.userId, input.name, input.tier, effective, effective, JSON.stringify(input.roles ?? []),
         );
-        this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('identity_count', ?)", String(this.metaNumber("identity_count") + 1));
+        this.adjustCount("identity_count", 1);
         const broadcasts: Broadcast[] = [];
         const joined = this.existingRooms(DEFAULT_JOINED_ROOMS);
         if (joined.length) {
@@ -5234,8 +5268,7 @@ export class Store {
       if (!room || (room.parent_room_id === null && !isPrivate)) return false;
       if (this.rawRows("SELECT user_id FROM memberships WHERE room_id = ? LIMIT 1", roomId).length) return false;
       this.rawExec("DELETE FROM rooms WHERE room_id = ?", roomId);
-      const counter = isPrivate ? "private_count" : "thread_count";
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", counter, String(Math.max(0, this.metaNumber(counter) - 1)));
+      this.adjustCount(isPrivate ? "private_count" : "thread_count", -1);
       return true;
     }));
   }
@@ -5542,7 +5575,7 @@ export class Store {
     const maxBytes = purpose === "file" ? policy.maxFileBytes : purpose === "emoji" ? policy.maxEmojiBytes : policy.maxAvatarBytes;
     const day = dayFor(now);
     const rows = [this.limitRow("upload", `user:${userId}`, now), this.limitRow("upload", "global", now)];
-    const counts = rows.map((row) => (row.day === day ? row.uploads_day : 0));
+    const counts = rows.map((row) => dayCount(row, "uploads_day", day));
     const untilReset = Math.max(1, 86_400_000 - now % 86_400_000);
     if (counts[1] >= policy.uploadsPerDay) throw new StoreError("retry_after", "Daily upload limit reached for the server", { retryAfterMs: untilReset, data: limitData("upload") });
     if (counts[0] >= policy.uploadsPerUserDay) throw new StoreError("retry_after", "Daily upload limit reached", { retryAfterMs: untilReset, data: limitData("upload") });
@@ -5569,7 +5602,7 @@ export class Store {
   }
 
   private setUploadBytes(bytes: number): void {
-    this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_UPLOAD_BYTES, String(Math.max(0, bytes)));
+    this.writeMeta(META_UPLOAD_BYTES, String(Math.max(0, bytes)));
   }
 
   private uploadRow(key: string): RawUploadRow | null {
@@ -5621,8 +5654,7 @@ export class Store {
   }
 
   private saveLiveTexts(entries: readonly LiveEntry[]): void {
-    if (entries.length) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_LIVE_TEXTS, JSON.stringify(entries));
-    else this.rawExec("DELETE FROM _meta WHERE key = ?", META_LIVE_TEXTS);
+    this.writeMeta(META_LIVE_TEXTS, entries.length ? JSON.stringify(entries) : null);
     this.liveCache = clone(entries) as LiveEntry[];
   }
 
@@ -5907,9 +5939,8 @@ export class Store {
   setToggle(feature: string, on: boolean | undefined, now = this.clock.now(), since?: number): void {
     this.ensureReady();
     this.reserved({ reads: 4, writes: 8 }, false, now, () => this.transaction(() => {
-      if (on === undefined) this.rawExec("DELETE FROM _meta WHERE key = ?", META_TOGGLE_PREFIX + feature);
-      else this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_TOGGLE_PREFIX + feature, on ? "on" : "off");
-      if (since !== undefined) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_PRESENCE_ON, String(since));
+      this.writeMeta(META_TOGGLE_PREFIX + feature, on === undefined ? null : on ? "on" : "off");
+      if (since !== undefined) this.writeMeta(META_PRESENCE_ON, String(since));
     }));
   }
 
@@ -5993,10 +6024,10 @@ export class Store {
   private writeServerField(field: (typeof SERVER_FIELDS)[number], value: string | undefined): void {
     const stored = { ...this.loadServerMetadata() };
     if (value === undefined) {
-      this.rawExec("DELETE FROM _meta WHERE key = ?", META_SERVER_PREFIX + field);
+      this.writeMeta(META_SERVER_PREFIX + field, null);
       delete stored[field];
     } else {
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_SERVER_PREFIX + field, value);
+      this.writeMeta(META_SERVER_PREFIX + field, value);
       stored[field] = value;
     }
     this.serverCache = stored;
@@ -6144,14 +6175,13 @@ export class Store {
         name,
       ).filter((candidate) => candidate.upload_key !== row?.upload_key);
       for (const candidate of replaced) this.rawExec("UPDATE uploads SET state = 'superseded' WHERE upload_key = ?", candidate.upload_key);
-      if (draft.json) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_EMOJI_CATALOG, draft.json);
-      else this.rawExec("DELETE FROM _meta WHERE key = ?", META_EMOJI_CATALOG);
+      this.writeMeta(META_EMOJI_CATALOG, draft.json || null);
       // The catalog before this one stays until the next change; the one
       // before that goes now.
       const previous = this.metaValue(META_EMOJI_PREVIOUS);
       if (previous && previous !== draft.key && previous !== before.key) deletedUploads.push(previous);
-      if (before.key && before.key !== draft.key) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_EMOJI_PREVIOUS, before.key);
-      else if (previous) this.rawExec("DELETE FROM _meta WHERE key = ?", META_EMOJI_PREVIOUS);
+      if (before.key && before.key !== draft.key) this.writeMeta(META_EMOJI_PREVIOUS, before.key);
+      else if (previous) this.writeMeta(META_EMOJI_PREVIOUS, null);
       return deletedUploads;
     }));
     if (!result) return { applied: false, deletedUploads: [] };
@@ -6205,7 +6235,7 @@ export class Store {
       if (policy) {
         const day = dayFor(effective);
         const global = this.limitRow("upload", "global", effective);
-        const count = global.day === day ? global.uploads_day : 0;
+        const count = dayCount(global, "uploads_day", day);
         if (count >= policy.uploadsPerDay) return "closed";
         this.updateLimitRow(global, { day, uploads_day: count + 1 }, effective);
       }
@@ -6603,17 +6633,17 @@ export class Store {
         if (!counters) {
           const server = this.limitRow("push", "global", effective);
           const sender = this.limitRow("push", `user:${input.senderId}`, effective);
-          const charged = sender.day === day ? integerColumn(sender.posts_day) : 0;
-          counters = { server, sender, sent: server.day === day ? integerColumn(server.posts_day) : 0, charged, chargedBefore: charged };
+          const charged = dayCount(sender, "posts_day", day);
+          counters = { server, sender, sent: dayCount(server, "posts_day", day), charged, chargedBefore: charged };
         }
         const recipientScope = joinedOnly ? "push_joined_recipient" : PUSH_UNREAD_SCOPE;
         const recipient = this.rawRows<{ day: string; posts_day: number; uploads_day: number }>(
           "SELECT day, posts_day, uploads_day FROM principal_limits WHERE scope = ? AND principal_key = ? LIMIT 1", recipientScope, `user:${userId}`,
         )[0];
-        const received = recipient?.day === day ? integerColumn(recipient.posts_day) : 0;
+        const received = dayCount(recipient, "posts_day", day);
         // The same row's `uploads_day` is the user's `unread` (PUSH_UNREAD_SCOPE). A push for `joined` alone
         // counts none, nor does an operator alert, which goes to admins attended or not.
-        const unread = !joinedOnly && !input.alert ? (recipient?.day === day ? integerColumn(recipient.uploads_day) : 0) + 1 : undefined;
+        const unread = !joinedOnly && !input.alert ? dayCount(recipient, "uploads_day", day) + 1 : undefined;
         const allowed = input.alert ? rows.length : Math.max(0, Math.min(
           rows.length,
           policy.pushesPerDay - counters.sent,
@@ -7079,7 +7109,7 @@ export class Store {
         "push",
         "global",
       );
-      return rows.length && rows[0].day === dayFor(this.effectiveNow(now)) ? integerColumn(rows[0].posts_day) : 0;
+      return dayCount(rows[0], "posts_day", dayFor(this.effectiveNow(now)));
     });
   }
 
@@ -7266,7 +7296,7 @@ export class Store {
         `INSERT INTO rooms (${ROOM_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
         roomId, parentRoomId, logId, logId, logId, fieldsJson, context.commitMs, context.commitMs,
       );
-      this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", counter, String(this.metaNumber(counter) + 1));
+      this.adjustCount(counter, 1);
       row = {
         room_id: roomId, parent_room_id: parentRoomId, created_log_id: logId, record_log_id: logId, latest_log_id: logId,
         fields_json: fieldsJson, created_ms: context.commitMs, updated_ms: context.commitMs, member_count: 0,
@@ -8064,8 +8094,8 @@ export class Store {
       ) : [];
       const rooms = [...threads, ...privates];
       for (const row of rooms) this.rawExec("DELETE FROM rooms WHERE room_id = ? AND latest_log_id < ?", row.room_id, floor);
-      if (threads.length) this.rawExec("UPDATE _meta SET value = ? WHERE key = 'thread_count'", String(Math.max(0, this.metaNumber("thread_count") - threads.length)));
-      if (privates.length) this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('private_count', ?)", String(Math.max(0, this.metaNumber("private_count") - privates.length)));
+      if (threads.length) this.adjustCount("thread_count", -threads.length);
+      if (privates.length) this.adjustCount("private_count", -privates.length);
       remaining -= rooms.length;
       const purgeBefore = purge.length;
       purge = [...purge, ...rooms.map((row) => row.room_id)];
@@ -8085,7 +8115,7 @@ export class Store {
         purge.shift();
       }
       if (rooms.length || purge.length !== purgeBefore) {
-        this.rawExec("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", META_PURGE_ROOMS, JSON.stringify(purge));
+        this.writeMeta(META_PURGE_ROOMS, JSON.stringify(purge));
       }
       const requests = remaining > 0 ? this.rawRows<{ user_id: string; request_id: string }>(
         "SELECT user_id, request_id FROM accepted_requests WHERE expires_ms <= ? ORDER BY expires_ms LIMIT ?", effective, remaining,
@@ -8107,7 +8137,7 @@ export class Store {
         this.rawExec("DELETE FROM principal_limits WHERE scope = ? AND principal_key = ?", row.scope, row.principal_key);
         deletedLimiters += 1;
       }
-      if (deletedLimiters) this.rawExec("UPDATE _meta SET value = ? WHERE key = 'principal_limit_count'", String(Math.max(0, this.metaNumber("principal_limit_count") - deletedLimiters)));
+      if (deletedLimiters) this.adjustCount("principal_limit_count", -deletedLimiters);
       remaining -= limiters.length;
       // Expired push registrations and wake times past coalescing (protocol §4.9).
       const pushCutoffs = this.pushCutoffs(effective);
