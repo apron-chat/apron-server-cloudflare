@@ -1337,6 +1337,52 @@ it('tells only a user their own permissions (ext:permissions): admin, mod and th
 	} finally { admin.close(); tia.close(); mate.close(); }
 });
 
+it('lets a threader, a threader bot included, add anyone to a thread whatever addmember says, but not to a top-level room', async () => {
+	const admin = await signedInAdmin();
+	const tiaId = unique('tia');
+	const tia = await signedIn(tiaId);
+	const ownerId = unique('owner');
+	const owner = await signedIn(ownerId);
+	const guests = [unique('carol'), unique('dave'), unique('erin')];
+	for (const userId of guests) await registered(userId);
+	const threadId = (await request(admin, unique('thread'), 'room_set', { parent_room_id: 'general', title: 'Rethreaded' })).result.room_id;
+	const add = (peer: Peer, id: string, roomId: string, userId: string) => request(peer, id, 'room_join', { room_id: roomId, user_id: userId });
+	const invited = await command(owner, 'invite-bot', '/invite-bot');
+	const token = /```\n(apron_bot_[A-Za-z0-9_-]+)\n```/.exec(invited.notice!.params.body.text)![1];
+	const bot = await connect(null);
+	await command(admin, 'addmember-off', '/toggle addmember');
+	try {
+		await bot.next();
+		await request(bot, 'auth', 'auth', { scheme: 'token', token });
+		const botId = `bot_${ownerId}`;
+
+		// Without a role, neither may add anyone while addmember is off.
+		expect((await add(tia, 'tia-before', threadId, guests[0])).error.code).toBe(-32001);
+		expect((await add(bot, 'bot-before', threadId, guests[0])).error.code).toBe(-32001);
+		// `mod` is a label on an owner's bot, so it adds nobody either.
+		await command(admin, 'bot-mod', `/role ${botId} mod`);
+		expect((await add(bot, 'bot-mod', threadId, guests[0])).error.code).toBe(-32001);
+
+		// A threader adds anyone to a thread, and a threader bot too.
+		await command(admin, 'tia-threader', `/role ${tiaId} threader`);
+		await command(admin, 'bot-threader', `/role ${botId} threader`);
+		expect((await add(tia, 'tia-thread', threadId, guests[0])).result).toEqual({});
+		expect((await add(bot, 'bot-thread', threadId, guests[1])).result).toEqual({});
+		// But not to a top-level room, which only addmember opens.
+		expect((await add(tia, 'tia-general', 'general', guests[2])).error.code).toBe(-32001);
+		expect((await add(bot, 'bot-general', 'general', guests[2])).error.code).toBe(-32001);
+		// Nor remove anyone from a thread they did not create.
+		expect((await request(bot, 'bot-remove', 'room_leave', { room_id: threadId, user_id: guests[0] })).error.code).toBe(-32001);
+
+		// Without the role again, the bot adds nobody.
+		await command(admin, 'bot-unthreader', `/role ${botId} threader`);
+		expect((await add(bot, 'bot-after', threadId, guests[2])).error.code).toBe(-32001);
+	} finally {
+		await command(admin, 'addmember-on', '/toggle addmember');
+		admin.close(); tia.close(); owner.close(); bot.close();
+	}
+});
+
 it('/role <user_id> bot makes a token user a bot in full, but not a passkey holder or an admin', async () => {
 	const admin = await signedInAdmin();
 	const userId = unique('announcer');
