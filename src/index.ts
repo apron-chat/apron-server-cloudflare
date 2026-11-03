@@ -430,6 +430,14 @@ class MinuteRateLimit {
 		if (this.events.size > RATE_LIMIT_KEYS) this.events.delete(this.events.keys().next().value!);
 		return true;
 	}
+
+	/** Moves `from`'s events to `to` (a renamed user), so a rename resets no limit. */
+	move(from: string, to: string): void {
+		const events = this.events.get(from);
+		if (!events) return;
+		this.events.delete(from);
+		this.events.set(to, [...(this.events.get(to) ?? []), ...events].sort((a, b) => a - b));
+	}
 }
 
 const RATE_LIMIT_KEYS = 10_000;
@@ -7567,15 +7575,35 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (to === ADMIN_USER_ID) throw { name: "invalid_params", message: `The user_id ${to} is taken` } satisfies ProtocolError;
 		assertIssuableUserId(to);
 		const renamed = this.store.renameIdentity({ from, to, now: nowMs() });
+		// Before any await: from the commit on, nothing on this object acts as the retired user_id.
+		this.moveUserState(from, to);
 		await this.moveInviteToken(from, to);
 		await this.moveDeviceTokens(from, to);
+		// Clients keep nothing yet for the new `user_id`, so the object carries
+		// every profile field (§3.3), not only the one that changed.
+		const identity = { user_id: to, ...(renamed.name ? { name: renamed.name } : {}), ...(renamed.avatar ? { avatar: renamed.avatar } : {}), roles: renamed.roles, ...(renamed.ext ? { ext: renamed.ext } : {}) };
+		const old = { user_id: from, ...(renamed.name ? { name: renamed.name } : {}) };
+		this.announceUser(null, identity, this.liveRoomsOf(to) ?? renamed.rooms, old);
+		this.sendNotice(socket, roomId, `Renamed \`${from}\` to \`${to}\`.`);
+		this.reply(socket, request, {});
+	}
+
+	/**
+	 * Moves everything this object keeps for a user under their `user_id`
+	 * to their new one (`/rename`): the one place a user's state on this
+	 * object is re-keyed, so a rename leaves none of it behind under the
+	 * retired id. That is their connections' identity; their status (when it
+	 * was announced, a departure being waited out, and changes others are
+	 * owed of it); the wakes waiting to push to them; and the per-user rate
+	 * limits and bot activity, so a rename resets neither.
+	 */
+	private moveUserState(from: string, to: string): void {
 		for (const peer of this.connectionsOf(from)) {
 			const state = connectionAttachment(peer);
 			if (!state) continue;
 			state.userId = to;
 			writeAttachment(peer, state);
 		}
-		// Their status moves with them: when it was announced, and changes others are owed.
 		const announced = this.announcedAt.get(from);
 		this.announcedAt.delete(from);
 		if (announced !== undefined) this.noteAnnounced(to, announced);
@@ -7586,13 +7614,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 			state.owed = state.owed.map((entry) => entry[0] === from ? [to, ...entry.slice(1)] as OwedStatus : entry);
 			writeAttachment(ws as WebSocketConnection, state);
 		}
-		// Clients keep nothing yet for the new `user_id`, so the object carries
-		// every profile field (§3.3), not only the one that changed.
-		const identity = { user_id: to, ...(renamed.name ? { name: renamed.name } : {}), ...(renamed.avatar ? { avatar: renamed.avatar } : {}), roles: renamed.roles, ...(renamed.ext ? { ext: renamed.ext } : {}) };
-		const old = { user_id: from, ...(renamed.name ? { name: renamed.name } : {}) };
-		this.announceUser(null, identity, this.liveRoomsOf(to) ?? renamed.rooms, old);
-		this.sendNotice(socket, roomId, `Renamed \`${from}\` to \`${to}\`.`);
-		this.reply(socket, request, {});
+		for (const wake of this.pendingWakes) {
+			const reasons = wake.reasons.get(from);
+			if (reasons === undefined) continue;
+			wake.reasons.delete(from);
+			wake.reasons.set(to, (wake.reasons.get(to) ?? 0) | reasons);
+		}
+		this.statusChanges.move(from, to);
+		this.pushRegisters.move(from, to);
+		const active = this.botActiveAt.get(from);
+		if (active !== undefined) {
+			this.botActiveAt.delete(from);
+			this.botActiveAt.set(to, active);
+		}
 	}
 
 	/**
