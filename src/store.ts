@@ -1128,6 +1128,14 @@ export const MODERATOR_ROLES: readonly string[] = ["admin", "mod", "threader"];
  */
 export const BOT_MODERATOR_ROLES: readonly string[] = ["threader"];
 /**
+ * A bot (an owner's bot, or a user with the role `bot`) may change its name
+ * with `me`, but only to one that says it is a bot: "bot" anywhere in it,
+ * in any case. An owner's bot's default, "Bot of <owner>", already does.
+ */
+export const BOT_NAME_PATTERN = /bot/i;
+/** Why a bot's `me` with another name is `denied`. */
+export const BOT_NAME_RULE = "A bot's name must contain \"bot\"";
+/**
  * Roles whose registered holders may create top-level rooms beside
  * `general`, and save their client fields (§4.2.4); only `admin` may save
  * `general`'s. Such rooms are
@@ -7332,7 +7340,7 @@ export class Store {
 
   /**
    * A `me` profile write (§3.3) of a registered user: `name`, where `""`
-   * removes it, and `ext`, but for the keys the server owns
+   * removes it (a bot's must contain "bot": BOT_NAME_PATTERN), and `ext`, but for the keys the server owns
    * (SERVER_USER_EXT_KEYS), merged into the stored one (§4.12) and at most
    * MAX_USER_EXT_BYTES after the merge. One identity row update, or none
    * when neither changes. `profile` has the user's whole `ext` after the
@@ -7348,6 +7356,8 @@ export class Store {
     const write = clientUserExt(this.optionalExt(input.params.ext));
     const existing = this.identityRow(input.userId);
     if (!existing) throw new StoreError("denied", "Only registered users may change their profile");
+    const bot = existing.tier === "bot" || parseRoles(existing.roles_json).includes("bot");
+    if (typeof name === "string" && bot && !BOT_NAME_PATTERN.test(name)) throw new StoreError("denied", BOT_NAME_RULE);
     const before = parseUserExt(existing.ext_json);
     const ext = mergeExt(before, write);
     if (!userExtFits(ext)) throw new StoreError("too_large", `ext is at most ${MAX_USER_EXT_BYTES} bytes`);

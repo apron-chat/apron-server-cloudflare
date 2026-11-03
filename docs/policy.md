@@ -297,7 +297,8 @@ within it:
   Free budgets). Past that, requests get `retry_after` and notifications are
   dropped; sockets stay open. Every other limit is in
   [limits](limits.md).
-- `me` renames registered users other than bots; given fields replace, omitted ones stay,
+- `me` renames registered users, a bot only to a name with "bot" in it (any
+  case); given fields replace, omitted ones stay,
   and `name: ""` removes the name (announced as `name: ""`). Registered
   users, bots included, keep an `ext` of at most 512 bytes, merged as above;
   complete user objects carry it whole, and `user` notifications only the
@@ -375,8 +376,8 @@ user_id>` named "Bot of <their name>", and returns its bearer token in a
 `scheme: "token"` from any origin, or none; it does not expire, and the next
 `/invite-bot` replaces it and closes connections that used the old one. The
 first invite counts as a registration against the per-IP, daily, and identity
-caps. A bot posts under the registered quotas, keeps its rooms, cannot rename
-itself with `me`, and cannot invite bots. An account whose only role is
+caps. A bot posts under the registered quotas, keeps its rooms, renames itself
+with `me` only to a name with "bot" in it (any case), and cannot invite bots. An account whose only role is
 `bot` that neither signs in nor posts for 7 days is signed out: its tokens
 are revoked and it leaves its rooms, while its account and posts stay. See
 [SPEC section 5](../SPEC.md#bots).

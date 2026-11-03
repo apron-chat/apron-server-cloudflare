@@ -148,8 +148,11 @@ it('lets a registered user invite a bot that signs in from anywhere with its tok
 		const delivered = await until(owner, (frame) => frame.method === 'message' && frame.params.message_id === posted.result.message_id);
 		expect(delivered.frame.params.from).toEqual({ user_id: 'bot_u_owner', name: 'Bot of Name of u_owner' });
 
-		// A bot keeps its owner's name and cannot invite bots of its own.
-		expect((await request(bot, 'rename', 'me', { name: 'Evil' })).error.code).toBe(-32001);
+		// A bot names itself, but only with "bot" in the name, in any case; it cannot invite bots of its own.
+		for (const name of ['Evil', '']) expect((await request(bot, `rename-${name}`, 'me', { name })).error).toMatchObject({ code: -32001, message: 'A bot\'s name must contain "bot"' });
+		for (const name of ['Threader Bot', 'roBOTic']) expect((await request(bot, `rename-${name}`, 'me', { name })).result.you.name).toBe(name);
+		const renamed = await until(owner, (frame) => frame.method === 'user' && frame.params.new?.name === 'roBOTic');
+		expect(renamed.frame.params.new.user_id).toBe('bot_u_owner');
 		const botHelp = await exchange(bot, 'bot-help', 'command', { body: { text: '/help' } });
 		expect(botHelp.skipped.find((frame) => frame.method === 'message')!.params.body.text).not.toContain('/invite-bot');
 		expect((await request(bot, 'bot-invite', 'command', { body: { text: '/invite-bot' } })).error.code).toBe(-32001);

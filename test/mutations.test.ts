@@ -758,6 +758,24 @@ it("lets an owner's bot move anyone's messages with threader, but not with mod o
 	});
 });
 
+it("lets a bot rename itself only to a name with \"bot\" in it, in any case", async () => {
+	await withStore("bot-name", (store, clock) => {
+		store.createInvitedIdentity({ userId: "owner", name: "owner", now: clock.value, ipKey: "ip-test" });
+		store.registerBot({ ownerId: "owner", botId: "bot_owner", name: "Bot of owner", now: clock.value, ipKey: "ip-test" });
+		store.createInvitedIdentity({ userId: "script", name: "script", now: clock.value, ipKey: "ip-test" });
+		store.setRole({ userId: "script", role: "bot", on: true, now: clock.value });
+		const rename = (userId: string, requestId: string, name: string) => store.mutate(op(clock, userId, requestId, "me", { name }));
+		for (const userId of ["bot_owner", "script"]) {
+			for (const name of ["Threader", ""]) expect(errorCode(() => rename(userId, `${userId}-no-${name}`, name))).toBe("denied");
+			rename(userId, `${userId}-yes`, "Threader BOT");
+			expect(store.getIdentity(userId)?.name).toBe("Threader BOT");
+		}
+		// Anyone else names themselves freely.
+		rename("owner", "owner-rename", "Owner");
+		expect(store.getIdentity("owner")?.name).toBe("Owner");
+	});
+});
+
 it("lets every moderator role, the built-in admin included, move anyone's message with embeds, an upload and ext, thread to thread", async () => {
 	await withStore("move-any-content", (store, clock) => {
 		store.createInvitedIdentity({ userId: "mia", name: "mia", now: clock.value, ipKey: "ip-test" });
