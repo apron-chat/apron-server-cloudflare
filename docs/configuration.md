@@ -400,7 +400,7 @@ turns it off and on without a deploy (texts already streaming finish).
 | `startWindowMinutes` | 10 | 10 | a day |
 | `startsPerUserDay` | 20 | 10 | `startsPerDay` |
 | `startsPerDay` (server-wide) | 100 | 30 | 500 |
-| `concurrent` (open texts server-wide, unused `write_url`s included) | 4 | 2 | 8 |
+| `concurrent` (open texts server-wide, unused `write_url`s included until they expire) | 4 | 2 | 8 |
 | `readersPerText` (at once) | 200 | 5 | 200 |
 | `readers` (at once, every text together) | 400 | 10 | 400 |
 | `readersPerAddress` (at once, every text together, from one address) | 16 | 3 | `readersPerText` |
@@ -414,7 +414,9 @@ each reader holds about a copy of what its text kept when it joined and its
 stream's buffers: about 100 KiB at worst, 40 MB at `readers`' ceiling,
 beside the 32 MiB of socket queues in the object's 128 MB.
 
-One user has one live text open at a time, an unused `write_url` included,
+One user has one live text open at a time, an unused `write_url` included
+until it expires (an expired one frees its slots at once, though the alarm
+ends its message later),
 and each start also counts as a post. The starts are `live` rows in
 `principal_limits` (the user's or a guest's IP's, the IP's, and the
 server's), like any other limiter; the open texts are one `_meta` row

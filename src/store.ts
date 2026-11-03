@@ -8147,6 +8147,16 @@ export class Store {
    * Socket deadlines live in bounded hibernation attachments, so this method
    * deliberately does not create one durable row per connection.
    */
+  /**
+   * The object's alarm fired. The runtime deletes it once the handler
+   * returns, so the alarm this instance last set (scheduledAlarmAt, which
+   * lets scheduleAlarm skip a call that would not move it) is no longer set:
+   * forgotten here, on every alarm, so the next scheduleAlarm sets one.
+   */
+  alarmFired(): void {
+    this.scheduledAlarmAt = undefined;
+  }
+
   async scheduleAlarm(socketDeadline?: number, now = this.clock.now()): Promise<void> {
     this.ensureReady();
     const candidateTime = Math.max(Math.trunc(now), this.lastEffectiveMs);

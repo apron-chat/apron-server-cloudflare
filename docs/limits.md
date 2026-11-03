@@ -91,6 +91,7 @@ still holds a slot until it goes stale; see
 | 1008 | Removed by an admin; Device token replaced…; Bot token replaced…; Signed out after a week without signing in or posting | Account changes | Do not reconnect with the same credentials in a loop. |
 | 1009 | Frame exceeds the maximum size | A frame over 16,384 UTF-8 bytes | Check sizes before sending. |
 | 1011 | Delivery failed / Delivery interrupted; reconnect to recover | The server could not deliver to the socket | Reconnect with backoff, then fetch history to catch up. |
+| 1011 | Connection state too large; reconnect | This connection's state (its rooms, unwritten read cursors, waiting status changes) outgrew what a connection may hold; only this connection is closed | Reconnect with backoff, then fetch history to catch up. |
 | 1013 | Frame rate limit reached | More than 480 frames a minute from your address, all connections together. Each connection reserves frames 10 at a time, so many short-lived connections spend this fast | Back off; fewer connections. |
 | 1013 | Demo account capacity reached; try later | The Cloudflare account's usage reached its stop line | Back off for minutes, not seconds. |
 | 1013 | Server paused: unusual traffic; try later | The attack pause | Back off for half an hour or more. |

@@ -450,6 +450,8 @@ const PING_RESPONSE = '{"method":"pong"}';
 const MAX_ATTACHED_ROOMS = 2 * (MAX_THREAD_LIMIT + 1 + MAX_PRIVATE_MEMBERSHIPS_PER_USER);
 /** How often one connection writes the read cursors it was sent (flushReads): a reader writes about once a minute, however often their client sends. */
 const READ_CURSOR_FLUSH_MS = 60_000;
+/** The close reason of a connection that did not sign in within `unauthenticatedTimeoutSeconds`. */
+const AUTH_TIMEOUT_REASON = "Authentication timed out";
 /** At most how many frames a connection's sign-in holds for it (holdDeliveries). */
 const MAX_HELD_FRAMES = 256;
 /**
@@ -1034,13 +1036,44 @@ function throttleState(attachment: Partial<ConnectionAttachment>): Pick<Connecti
 	return out;
 }
 
-function writeAttachment(socket: WebSocketConnection, attachment: ConnectionAttachment): void {
-	// The attachment is intentionally limited to connection state. The runtime
-	// rejects oversized attachments; keeping this assertion near serialization
-	// makes that failure visible during development.
-	const serialized = JSON.stringify(attachment);
-	if (utf8Bytes(serialized) > 12_000) throw new Error("connection attachment exceeds safety budget");
-	socket.serializeAttachment?.(attachment);
+/** The most bytes a connection attachment may serialize to: below the runtime's own limit, with room to spare. */
+const ATTACHMENT_SAFETY_BYTES = 12_000;
+/** The close reason of a connection whose state outgrew its attachment (writeAttachment). */
+const ATTACHMENT_OVERFLOW_REASON = "Connection state too large; reconnect";
+
+/**
+ * Stores a connection's state on its socket, and returns whether it did. A
+ * state too large to store (ATTACHMENT_SAFETY_BYTES) is not stored: the
+ * connection is closed instead, with 1011, so its client reconnects and
+ * recovers, while the attachment keeps its last state, which fit, for the
+ * close's own handling (webSocketClose, noteClosedSockets).
+ *
+ * The `closing` mark is always stored, whatever the budget: a closing
+ * connection's state only ever gains that mark and a violation's time, which
+ * the runtime's own limit (16 KiB) has room for over the budget, and the
+ * mark is what tells every later event its close was handled. Were it lost,
+ * the next event would handle the close again, and again.
+ *
+ * It never throws. A throw here would abort whatever loop was storing it,
+ * over the user's or a room's other connections, halfway; inside a
+ * mutation (runMutation) it would even read as an uncertain commit and
+ * close every connection on the server. One connection's state is that
+ * connection's problem alone.
+ */
+function writeAttachment(socket: WebSocketConnection, attachment: ConnectionAttachment): boolean {
+	const bytes = utf8Bytes(JSON.stringify(attachment));
+	if (bytes <= ATTACHMENT_SAFETY_BYTES || attachment.closing) {
+		try {
+			socket.serializeAttachment?.(attachment);
+			return true;
+		} catch (error) {
+			if (bytes <= ATTACHMENT_SAFETY_BYTES) throw error;
+			// Past even the runtime's limit: the close below is all that is left.
+		}
+	}
+	console.warn(JSON.stringify({ event: "attachment_overflow", bytes }));
+	try { socket.close(1011, ATTACHMENT_OVERFLOW_REASON); } catch { /* already closed */ }
+	return false;
 }
 
 /** Seconds as said in a notice: whole minutes as minutes, else seconds. */
@@ -1052,6 +1085,27 @@ function spokenSeconds(seconds: number): string {
 
 function openSocket(socket: WebSocketConnection): boolean {
 	return socket.readyState === 1;
+}
+
+/** What falls due on a connection by itself, with no frame from it: see connectionDeadlines. */
+type ConnectionDue = "auth" | "challenge" | "reads";
+
+/**
+ * When each piece of a connection's own state falls due, from its attachment
+ * alone: a pending connection's sign-in deadline, its passkey challenge's
+ * expiry, and when its unwritten read cursors are written (flushReads). The
+ * one list that schedules the alarm (rescheduleAlarm) and that the alarm
+ * works through (runConnectionDeadlines), so no deadline can be acted on
+ * but never scheduled, or scheduled but never acted on. A closing
+ * connection has none.
+ */
+function connectionDeadlines(attachment: ConnectionAttachment): Array<[ConnectionDue, number]> {
+	if (attachment.closing) return [];
+	const due: Array<[ConnectionDue, number]> = [];
+	if (attachment.tier === "pending") due.push(["auth", attachment.authDeadline]);
+	if (attachment.challenge) due.push(["challenge", attachment.challenge.expiresAt]);
+	if (attachment.reads) due.push(["reads", (attachment.readsAt ?? 0) + READ_CURSOR_FLUSH_MS]);
+	return due;
 }
 
 /** Async ceremonies must not overwrite counters for frames queued meanwhile. */
@@ -2357,6 +2411,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.sweepPresence(nowMs(), socket);
 		const attachment = connectionAttachment(socket);
 		if (!attachment || attachment.closing) return Promise.resolve();
+		// The sign-in deadline holds whether or not the alarm that enforces it has run.
+		if (attachment.tier === "pending" && attachment.authDeadline <= nowMs()) {
+			this.closePolicy(socket, attachment, 1008, AUTH_TIMEOUT_REASON);
+			return Promise.resolve();
+		}
 		this.accountUsage.noteActivity(nowMs());
 		if (this.accountUsage.stops(nowMs())) {
 			this.closePolicy(socket, attachment, 1013, "Demo account capacity reached; try later");
@@ -2443,6 +2502,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	private async runAlarm(): Promise<void> {
 		this.alarmKnown = false;
+		// Light or full, the alarm that fired is gone once this returns.
+		this.store.alarmFired();
 		const now = nowMs();
 		this.noteBurn("alarm");
 		this.sweepPresence(now);
@@ -2451,26 +2512,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// their own work, as they did before presence used the alarm.
 		const full = this.alarmWorkDue(now);
 		recordMetric(this.runtimeEnv.METRICS, "alarm", [full ? "full" : "light"]);
+		// Every alarm, light or full: what fell due on a connection needs only its attachment.
+		this.runConnectionDeadlines(now);
 		this.maybeEvaluateTier(now);
 		if (!full) {
 			await this.rescheduleAlarm();
 			return;
 		}
 		await this.accountUsage.refresh(now, false);
-		for (const ws of this.ctx.getWebSockets()) {
-			const socket = ws as WebSocketConnection;
-			const attachment = connectionAttachment(socket);
-			if (!attachment) continue;
-			if (attachment.tier === "pending" && attachment.authDeadline <= now) {
-				this.closePolicy(socket, attachment, 1008, "Authentication timed out");
-				continue;
-			}
-			if (attachment.challenge && attachment.challenge.expiresAt <= now) {
-				delete attachment.challenge;
-				writeAttachment(socket, attachment);
-			}
-			if (attachment.reads && !attachment.closing && now - (attachment.readsAt ?? 0) >= READ_CURSOR_FLUSH_MS) this.flushReads(attachment, now, socket);
-		}
 		if (now >= this.nextSessionSweepAt) {
 			try {
 				// A full batch may have left more behind; sweep again on the next alarm.
@@ -2539,19 +2588,36 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Whether an alarm has work besides announcing status changes: a
-	 * connection's auth deadline, challenge expiry or read cursor to write,
-	 * an upload deadline (read from storage once after a wake, which forgets
-	 * it), or storage cleanup (Store.cleanupDue).
+	 * Acts on each connection's deadlines that have passed (connectionDeadlines):
+	 * closes a connection that never signed in, drops an expired passkey
+	 * challenge, and writes read cursors held for a minute.
+	 */
+	private runConnectionDeadlines(now: number): void {
+		for (const ws of this.ctx.getWebSockets()) {
+			const socket = ws as WebSocketConnection;
+			const attachment = connectionAttachment(socket);
+			if (!attachment) continue;
+			const due = new Set(connectionDeadlines(attachment).filter(([, at]) => at <= now).map(([kind]) => kind));
+			if (due.has("auth")) {
+				this.closePolicy(socket, attachment, 1008, AUTH_TIMEOUT_REASON);
+				continue;
+			}
+			if (due.has("challenge")) {
+				delete attachment.challenge;
+				writeAttachment(socket, attachment);
+			}
+			if (due.has("reads")) this.flushReads(attachment, now, socket);
+		}
+	}
+
+	/**
+	 * Whether an alarm has server work besides announcing status changes and
+	 * its connections' own deadlines (runConnectionDeadlines, done on every
+	 * alarm): an upload deadline (read from storage once after a wake, which
+	 * forgets it), a live text's, maintenance, or storage cleanup
+	 * (Store.cleanupDue).
 	 */
 	private alarmWorkDue(now: number): boolean {
-		for (const ws of this.ctx.getWebSockets()) {
-			const attachment = connectionAttachment(ws as WebSocketConnection);
-			if (!attachment) continue;
-			if (attachment.tier === "pending" && attachment.authDeadline <= now) return true;
-			if (attachment.challenge && attachment.challenge.expiresAt <= now) return true;
-			if (attachment.reads && !attachment.closing && now - (attachment.readsAt ?? 0) >= READ_CURSOR_FLUSH_MS) return true;
-		}
 		if (this.config.uploads && !this.uploadDeadlineRead) {
 			try {
 				const stored = this.store.nextUploadDeadline(now);
@@ -8512,17 +8578,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private rescheduleAlarm(): Promise<void> {
 		const task = this.alarmTail.catch(() => undefined).then(async () => {
 			let deadline: number | undefined;
+			const consider = (at: number | undefined) => {
+				if (at !== undefined && Number.isFinite(at)) deadline = deadline === undefined ? at : Math.min(deadline, at);
+			};
 			for (const socket of this.ctx.getWebSockets()) {
 				const state = connectionAttachment(socket);
-				if (!state || state.closing) continue;
-				const due = [state.tier === "pending" ? state.authDeadline : undefined, state.challenge?.expiresAt]
-					.filter((value): value is number => value !== undefined);
-				for (const value of due) deadline = deadline === undefined ? value : Math.min(deadline, value);
+				if (state) for (const [, at] of connectionDeadlines(state)) consider(at);
 			}
-			if (this.uploadDeadline !== undefined) deadline = deadline === undefined ? this.uploadDeadline : Math.min(deadline, this.uploadDeadline);
-			if (this.liveDeadlineAt !== undefined) deadline = deadline === undefined ? this.liveDeadlineAt : Math.min(deadline, this.liveDeadlineAt);
-			if (this.maintenanceAt !== undefined) deadline = deadline === undefined ? this.maintenanceAt : Math.min(deadline, this.maintenanceAt);
-			if (Number.isFinite(this.presenceAlarmAt)) deadline = deadline === undefined ? this.presenceAlarmAt : Math.min(deadline, this.presenceAlarmAt);
+			consider(this.uploadDeadline);
+			consider(this.liveDeadlineAt);
+			consider(this.maintenanceAt);
+			consider(this.presenceAlarmAt);
+			// The end of an attack pause, so the change back is announced then, not at the next event.
+			consider(this.pausedUntil(nowMs()) || undefined);
 			await this.store.scheduleAlarm(deadline, nowMs());
 			this.alarmKnown = true;
 		});

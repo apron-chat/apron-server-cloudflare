@@ -716,13 +716,12 @@ describe('user status timing', () => {
 			// The connection is as it was: not signed in, and nobody was told of it.
 			expect((await request(peer, 'me-failed', 'me', {})).error.code).toBe(-32001);
 			expect((await attachments()).filter((attachment) => attachment.userId === userId && !attachment.closing)).toEqual([]);
-			await advance(COALESCE);
-			expect(told(await drain(watcher), userId)).toEqual([]);
-			// Tried again, it signs in with both.
+			// Tried again, within its sign-in deadline, it signs in with both.
 			const { frame: auth, skipped } = await exchange(peer, 'auth-again', 'auth', { scheme: 'token', token });
 			expect(auth.result.you).toMatchObject({ user_id: userId, status: 'invisible' });
 			expect(skipped.filter((frame) => frame.method === 'status')).toEqual([]);
 			expect((await drain(peer)).filter((frame) => frame.method === 'status').map((frame) => frame.params)).toEqual([{ mute: expect.any(Number) }]);
+			// Nobody was told of either sign-in: the failed one, or the invisible user's.
 			await advance(COALESCE);
 			expect(told(await drain(watcher), userId)).toEqual([]);
 		} finally { watcher.close(); first.close(); peer.close(); }
@@ -2007,7 +2006,7 @@ describe('seen is written at most once in SEEN_WRITE_GRANULARITY_MS', () => {
 				expect(written.owed).toHaveLength(32);
 				return new TextEncoder().encode(JSON.stringify(written)).length;
 			});
-			expect(warn.mock.calls.flat().some((line) => /presence_failed|exceeds safety budget/.test(String(line)))).toBe(false);
+			expect(warn.mock.calls.flat().some((line) => /presence_failed|attachment_overflow/.test(String(line)))).toBe(false);
 			console.info('attachment-bytes', bytes);
 			expect(bytes).toBeLessThanOrEqual(12_000);
 		} finally {
