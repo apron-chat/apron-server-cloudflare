@@ -1351,9 +1351,10 @@ it('/role <user_id> bot makes a token user a bot in full, but not a passkey hold
 
 		expect((await command(admin, 'make-bot', `/role ${userId} bot`)).notice!.params.body.text).toMatch(/now has the role `bot`/);
 		expect((await until(bot, (frame) => frame.method === 'user' && frame.params.you !== undefined)).frame.params.you.roles).toEqual(['bot']);
-		// It acts as a bot: no passkey, no commands for owners, a fixed name and user_id, and never an admin.
+		// It acts as a bot: no passkey, no commands for owners, a name that says it is one, a fixed user_id, and never an admin.
 		expect((await command(bot, 'invite-bot', '/invite-bot')).frame.error.message).toBe("A bot can't use /invite-bot");
 		expect((await request(bot, 'rename-self', 'me', { name: 'Other' })).error.code).toBe(-32001);
+		expect((await request(bot, 'rename-bot', 'me', { name: 'Announcer bot' })).result.you.name).toBe('Announcer bot');
 		// Its connection has no Origin, so passkeys are not offered to it at all: unsupported (§3.2).
 		expect((await request(bot, 'passkey', 'auth', { scheme: 'webauthn', action: 'register', step: 'begin' })).error.code).toBe(-32601);
 		expect((await command(admin, 'bot-admin', `/admin ${userId}`)).frame.error.message).toBe("A bot can't be an admin");

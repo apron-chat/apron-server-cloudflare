@@ -62,6 +62,8 @@ import {
 	EMOJI_ROLES,
 	MODERATOR_ROLES,
 	BOT_MODERATOR_ROLES,
+	BOT_NAME_PATTERN,
+	BOT_NAME_RULE,
 	clientUserExt,
 	mergeExt,
 	userExtFits,
@@ -3776,7 +3778,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Profile update (§3.3): a given field replaces its value, an omitted one
 	 * is unchanged, and an empty one removes it. Only registered users may
-	 * change their name; `name: ""` removes it, so the user falls back to
+	 * change their name, and a bot only to one with "bot" in it
+	 * (BOT_NAME_PATTERN); `name: ""` removes it, so the user falls back to
 	 * `user_id`. With uploads, `avatar: ""` removes a registered user's
 	 * avatar; a new one comes only through `/avatar` (§4.8.7), so other values
 	 * are declined. `ext` (§4.12) merges one level deep into the user's kept
@@ -3801,8 +3804,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (name !== undefined && attachment.tier !== "registered") {
 			throw { name: "denied", message: "Only registered users may change their name" } satisfies ProtocolError;
 		}
-		if (name !== undefined && hasRole(attachment, "bot")) {
-			throw { name: "denied", message: isBotId(identity.user_id) ? "A bot is named after its owner, who can rename it with /invite-bot" : "A bot can't change its name" } satisfies ProtocolError;
+		// A bot names itself, so long as the name says it is one (BOT_NAME_PATTERN).
+		if (name !== undefined && hasRole(attachment, "bot") && !BOT_NAME_PATTERN.test(name)) {
+			throw { name: "denied", message: BOT_NAME_RULE } satisfies ProtocolError;
 		}
 		if (writesExt && attachment.tier !== "registered") {
 			throw { name: "denied", message: "Only registered users keep ext" } satisfies ProtocolError;

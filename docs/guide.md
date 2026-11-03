@@ -231,7 +231,9 @@ socket.onmessage = ({ data }) => {
 ```
 
 A bot posts, reacts, starts threads, and keeps its rooms like a registered
-user, under its own posting quota; it cannot rename itself or invite bots.
+user, under its own posting quota; it cannot invite bots. It may rename
+itself with `me`, but only to a name with "bot" in it, in any case (say
+`{"name": "Threader Bot"}`).
 You can add your bot to a thread, say to keep its `description` current,
 with `room_join` and its `user_id`, and remove it with `room_leave` the same
 way. The token does not expire. Running `/invite-bot` again replaces it,
