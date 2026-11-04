@@ -199,6 +199,8 @@ it('keeps server-owned state out of public protocol frames', async () => {
 		expect(challenge.result.challenge_id).toMatch(/^[A-Za-z0-9_-]+$/);
 		expect(challenge.result.public_key.challenge).toBeTruthy();
 		expect(challenge.result.public_key.user.id).toBeTruthy();
+		// ES256 leads, so new passkeys use the algorithm every authenticator signs with.
+		expect(challenge.result.public_key.pubKeyCredParams.map((param: { alg: number }) => param.alg)).toEqual([-7, -8, -257]);
 		// The challenge ID and generated public-key options are the documented
 		// WebAuthn ceremony surface; the internal attachment is never returned.
 		expect(JSON.stringify(publicFrames)).not.toContain(ipHash);

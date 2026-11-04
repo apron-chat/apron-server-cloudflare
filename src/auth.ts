@@ -232,6 +232,13 @@ export class WebAuthnService {
 				userID: base64UrlToBytes(candidateUserHandle!),
 				challenge,
 				attestationType: "none",
+				// ES256 first: an authenticator takes the first algorithm it supports, and
+				// ES256 is the one every authenticator can sign with. SimpleWebAuthn's default
+				// puts EdDSA first, so a passkey manager that creates Ed25519 keys on one device
+				// may be unable to sign with them on another running an older build (Proton
+				// Pass before its August 2026 update fails with CTAP2 0x26, unsupported
+				// algorithm). Verification accepts all three either way.
+				supportedAlgorithmIDs: [-7, -8, -257],
 				authenticatorSelection: { residentKey: "required", requireResidentKey: true, userVerification: "required" },
 				excludeCredentials: existingCredentialIds.slice(0, 10).map((id) => ({ id })),
 				timeout: this.config.limits.challengeTtlSeconds * 1_000,
