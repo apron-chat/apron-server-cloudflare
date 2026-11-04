@@ -225,37 +225,40 @@ to sign in instead. On a connection signed in to an account, the proposal
 adds the address to it (replacing the account's one address).
 See [SPEC section 5, Email](../SPEC.md#email).
 
-**Email sign-in in a client: one tab, not two.** A link opens a new tab,
-but the tab that asked should finish the sign-in: it has the user's place,
-and a guest's registration approves only on its connection. Hand the link's
-token back over a `BroadcastChannel` on your origin:
+**Email sign-in in a client: one tab, not two.** A link opens a new tab
+while the tab that asked still waits for its code. The new tab is where the
+user is looking, so it takes over; the old one goes dormant. The old tab
+still approves, since a code works only on the connection that proposed,
+and a guest's registration only on that guest's connection: hand the
+link's token back to it over a `BroadcastChannel` on your origin
+(apron-web's `src/lib/ui/tab-handoff.ts` does this):
 
-1. The asking tab keeps its `state` and listens on
-   `BroadcastChannel("apron-email")` until the proposal expires (10
-   minutes).
-2. The tab the link opens reads `#server=…&token=…&state=…`, posts
-   `{state, token, server}` on the channel, and waits about half a second.
-   Only your origin's tabs hear it, and only the one holding that `state`
-   acts on it.
-3. The asking tab presents the token with `scheme: "email"` on its own
-   connection, then answers `{state, ok: true}` or `{state, error}`: the
-   outcome, not merely that it took the token, so a failure such as an
-   expired link is shown rather than lost in a closed tab.
-4. The link's tab then calls `window.close()`, which browsers allow for a
-   tab opened from a link with one history entry; where it is refused, it
-   shows "Signed in in your other tab; you can close this one".
+1. The tab the link opens reads `#server=…&token=…&state=…`, posts
+   `{state, token}` on the channel, and waits about half a second for a
+   tab to take it.
+2. The tab holding that `state`'s open proposal (only it acts on it: the
+   `state` is unguessable) answers that it took it, presents the token on
+   its own connection, and answers with the outcome: on success, the room
+   it had open and the session `token` it now holds (storage reaches other
+   tabs a moment late, so it comes along; the channel reaches only your
+   origin's tabs, which can read that storage anyway), else the error.
+3. It then goes dormant: it closes its connection, which also keeps the
+   account under its connection limit, and shows "Apron is open in another
+   tab", with a way to use Apron there again. Browsers refuse
+   `window.close()` for a tab the user opened, so it doesn't close.
+4. The new tab resumes with that token (`scheme: "token"`), as a reload
+   would, and opens the room the old tab had open; or shows the error.
 5. With no answer, nobody is waiting: a sign-in link signs in right there,
    on that tab's own connection not signed in; a guest's registration link
-   shows "This link only works in the tab where you asked; type the code
-   there, or ask for a new email".
+   says to type the code in the tab where it was asked for, or to ask for
+   a new email.
 
 `BroadcastChannel` reaches only tabs on the same origin in the same
 browser, so the link must land on your origin: `https://link.apron.chat/`
 (the default) has to send the user on to your client with the fragment, or
 a deployment for one client sets `EMAIL_LINK_URL` to it. A mail app's
 in-app browser or another browser hears nothing; the code works there, so
-always offer it. Optionally, after signing in, post that on the channel too,
-so the client's other open tabs pick up the session.
+always offer it.
 A user who signed up with a token can add a passkey by registering one while
 signed in. `web.apron.chat` additionally receives `webauthn`, and its `token`
 also resumes passkey sessions; inspect each connection's
