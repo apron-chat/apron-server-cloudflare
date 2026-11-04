@@ -129,7 +129,7 @@ minutes after a few unclean reconnects.
 | `retry_after` "No more sign-in emails to this address today" / "Sign-in emails are used up for today on this server" | 3 emails a day to one email address, whoever asks; 95 a day on the server | Asking again instead of waiting for the email (check spam), or a busy day. |
 | `denied` "This code or link is not valid or has expired; ask for a new email" / "That code is not the one emailed" | A code or link lasts 10 minutes and works once; a code only on the connection that asked; 5 wrong tries cancel it; a new proposal replaces the last | A typo, an old email, or typing the code into another tab. |
 | `denied` "Session expired; sign in with your email again" | An email session lasts 30 days like a passkey's, and resumes only from the origin it was made on (or with no Origin, where it had none) | A stale stored token, or a token from another origin. |
-| `denied` "An account holds one email address; …" | 1 address per account on the demo (a deployment may allow more) | Adding a second address; remove yours with `/email remove` first. |
+| `denied` "That address is your only way to sign in again; …" | An account keeps its last way to sign in: `/email remove` of the last address of an account with no passkey or token | Add a passkey, or approve another address (with 1 address an account, that replaces it), first. |
 
 Guests get a new `guest_<n>` identity on every connection, and on the demo
 they can only read: writes are `denied` ("Guests can only read here; sign in

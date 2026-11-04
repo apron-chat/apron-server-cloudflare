@@ -77,6 +77,14 @@ async function approve(peer: Peer, token: string, scheme = 'email'): Promise<Fra
 	return request(peer, `approve-${crypto.randomUUID()}`, 'auth', { scheme, token });
 }
 
+/** Another connection signed in as an existing user, with a fresh session. */
+async function signedInAgain(userId: string): Promise<Peer> {
+	const token = await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).issueSession(userId, 'http://localhost:5173', Date.now()));
+	const peer = await fresh();
+	expect((await approve(peer, token, 'token')).result.you.user_id).toBe(userId);
+	return peer;
+}
+
 /** Registers a passkey user straight into the store and signs a connection in with a session token. */
 async function signedIn(userId: string): Promise<Peer> {
 	const token = await runInDurableObject(stub(), (instance) => {
@@ -131,6 +139,34 @@ it('signs up an unknown address with the emailed code, and the session resumes o
 		}
 		const { notices } = await command(peer, '/email');
 		expect(notices[0]).toContain(email);
+		// The address is this account's only way back in: it stays.
+		expect((await command(peer, `/email remove ${email}`)).reply.error)
+			.toMatchObject({ code: -32001, message: 'That address is your only way to sign in again; add a passkey or another address first' });
+	} finally { peer.close(); }
+});
+
+it('uses a sign-up\'s proposal up before the account exists, so a failure after it never signs up a second account', async () => {
+	const email = address();
+	const peer = await fresh();
+	try {
+		const mail = await propose(peer, email, { name: 'Orphan Test' });
+		await runInDurableObject(stub(), (_instance, state) => {
+			const put = state.storage.put.bind(state.storage);
+			let failed = false;
+			vi.spyOn(state.storage, 'put').mockImplementation(((entries: unknown, ...rest: unknown[]) => {
+				if (!failed && entries && typeof entries === 'object' && Object.keys(entries).some((key) => key.startsWith('emails:'))) {
+					failed = true;
+					throw new Error('storage unavailable');
+				}
+				return (put as (...args: unknown[]) => unknown)(entries, ...rest);
+			}) as typeof state.storage.put);
+		});
+		expect((await approve(peer, mail.code)).error).toBeDefined();
+		const again = await fresh();
+		try { expect((await approve(again, mail.token ?? mail.code)).error.code).toBe(-32001); } finally { again.close(); }
+		expect((await approve(peer, mail.code)).error.code).toBe(-32001);
+		const made = await runInDurableObject(stub(), (_instance, state) => [...state.storage.sql.exec("SELECT user_id FROM identities WHERE name = 'Orphan Test'")].length);
+		expect(made).toBeLessThanOrEqual(1);
 	} finally { peer.close(); }
 });
 
@@ -208,11 +244,22 @@ it('adds an address to the signed-in account, which then signs in with it', asyn
 		expect((await approve(stranger, mail.token!)).error.code).toBe(-32001);
 		expect(await approve(peer, mail.code)).toMatchObject({ result: {} });
 		expect((await command(peer, '/email')).notices[0]).toContain(email);
-		// One address an account: another is refused before anything is sent.
-		const sent = outbox.length;
-		expect((await request(peer, 'second', 'auth', { scheme: 'email', email: address() })).error)
-			.toMatchObject({ code: -32001, message: 'An account holds one email address; remove yours with /email remove first' });
-		expect(outbox.length).toBe(sent);
+		// One address an account: approving another replaces it, and the
+		// account's other connections are told.
+		const watcher = await signedInAgain(userId);
+		try {
+			const replacement = address();
+			const second = await propose(peer, replacement);
+			expect(await approve(peer, second.code)).toMatchObject({ result: {} });
+			const notices = (await command(peer, '/email')).notices[0];
+			expect(notices).toContain(replacement);
+			expect(notices).not.toContain(email);
+			const told = await until(watcher, (frame) => frame.params?.from?.user_id === '~private' && /was added/.test(frame.params.body.text));
+			expect(told.frame.params.body.text).toContain(`replacing ${email}`);
+			// The replaced address signs up anew; the account's own address is back for the rest of this test.
+			const back = await propose(peer, email);
+			expect(await approve(peer, back.code)).toMatchObject({ result: {} });
+		} finally { watcher.close(); }
 		const later = await fresh();
 		try {
 			const signIn = await propose(later, email);

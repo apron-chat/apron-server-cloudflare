@@ -720,11 +720,13 @@ interface StoredEmailProposal {
 	adds?: string;
 }
 
-/** Why an account at its address cap cannot add another. */
-function addressCapError(cap: number): ProtocolError {
-	return { name: "denied", message: cap === 1
-		? "An account holds one email address; remove yours with /email remove first"
-		: `An account holds at most ${cap} email addresses; remove one with /email remove first` };
+/**
+ * An address as text in a CommonMark notice: the characters that start
+ * inline markup (emphasis, code, links, autolinks, HTML, tables) escaped, so
+ * a local part with `*`, `_` or a backtick shows as typed.
+ */
+function markdownAddress(address: string): string {
+	return address.replace(/[\\`*_[\]<>~|]/g, (char) => `\\${char}`);
 }
 
 /** A stored address list, type-checked: none when absent or malformed. */
@@ -885,7 +887,9 @@ function botName(owner: string, limits: { maxNameCodePoints: number; maxNameByte
 function sessionExpiryKey(expiresMs: number, sessionKeyValue: string): string {
 	// Date.now() plus the configured lifetime is well below 16 decimal digits;
 	// the fixed width keeps lexicographic KV listing ordered by expiry.
-	return `${SESSION_EXPIRY_PREFIX}${Math.max(0, Math.trunc(expiresMs)).toString().padStart(16, "0")}:${sessionKeyValue.slice(SESSION_KEY_PREFIX.length)}`;
+	// A session's entry names its digest; an email proposal's (same shape, same sweep) its whole key.
+	const named = sessionKeyValue.startsWith(SESSION_KEY_PREFIX) ? sessionKeyValue.slice(SESSION_KEY_PREFIX.length) : sessionKeyValue;
+	return `${SESSION_EXPIRY_PREFIX}${Math.max(0, Math.trunc(expiresMs)).toString().padStart(16, "0")}:${named}`;
 }
 
 function nowMs(): number {
@@ -3730,20 +3734,23 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const codeDigest = await sha256Hex(code);
 		const purpose = await this.withSessionLock(async (): Promise<EmailPurpose | null> => {
 			const now = nowMs();
-			const owner = await this.store.withMeterAsync("foreground", { reads: 2 }, async () => {
+			const owner = await this.store.withMeterAsync("foreground", { reads: 1 }, async () => {
 				const stored = await this.ctx.storage.get<StoredEmail>(addressKey);
-				const holder = stored?.v === 1 && typeof stored.userId === "string" && this.store.identityExists(stored.userId) ? stored.userId : null;
-				if (adds && holder !== adds) {
-					const held = storedEmails(await this.ctx.storage.get<StoredEmails>(EMAILS_KEY_PREFIX + adds));
-					if (held.length >= email.policy.addressesPerUser) throw addressCapError(email.policy.addressesPerUser);
-				}
-				return holder;
+				return stored?.v === 1 && typeof stored.userId === "string" && this.store.identityExists(stored.userId) ? stored.userId : null;
 			});
-			// Already this account's: nothing to send, and nobody else learns anything from it.
-			if (adds && owner === adds) return null;
+			const previous = connectionAttachment(socket)?.emailProposal;
+			// Already this account's: nothing to send, and nobody else learns
+			// anything from it; it still replaces the connection's proposal (§4.11.1).
+			if (adds && owner === adds) {
+				if (previous) {
+					await this.store.withMeterAsync("foreground", { writes: 1 }, () => this.ctx.storage.delete(previous));
+					delete attachment.emailProposal;
+					writeSessionAttachment(socket, attachment, ["emailProposal"]);
+				}
+				return null;
+			}
 			this.store.chargeEmailSend({ ipKey: attachment.ipKey, addressKey: digest, now, policy: email.policy });
 			const expiresMs = now + email.policy.proposalSeconds * 1_000;
-			const previous = connectionAttachment(socket)?.emailProposal;
 			await this.store.withMeterAsync("foreground", { writes: 3 }, async () => {
 				if (previous && previous !== key) await this.ctx.storage.delete(previous);
 				// The session sweep deletes the proposal once it expires.
@@ -3830,7 +3837,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 				await this.store.withMeterAsync("foreground", { writes: 1 }, () => this.ctx.storage.put<StoredEmailProposal>(key, { ...proposal, failures }));
 				throw error;
 			};
-			if (typed && (proposal.connId !== attachment.connId || await sha256Hex(token) !== proposal.code)) {
+			// A code is only looked up through the presenting connection's own
+			// proposal, so one typed elsewhere finds none and is `invalid` above.
+			if (typed && await sha256Hex(token) !== proposal.code) {
 				await failed({ name: "denied", message: "That code is not the one emailed" });
 			}
 			const addressKey = EMAIL_KEY_PREFIX + await sha256Hex(proposal.address);
@@ -3850,13 +3859,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 					await forget();
 					throw { name: "denied", message: "That address belongs to another account" } satisfies ProtocolError;
 				}
-				await this.addEmail(proposal.adds, proposal.address, addressKey, now, email.policy.addressesPerUser);
+				const replaced = await this.addEmail(proposal.adds, proposal.address, addressKey, now, email.policy.addressesPerUser);
 				await forget();
-				for (const peer of this.connectionsOf(proposal.adds, socket)) {
-					this.deliverTo(peer, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: {
-						text: `The email address ${proposal.address} was added to your account from another connection. If it wasn't you, remove it with \`/email remove ${proposal.address}\`.`, format: "markdown",
-					} } });
-				}
+				const instead = replaced.length ? `, replacing ${replaced.map(markdownAddress).join(", ")},` : "";
+				this.tellOthers(proposal.adds, socket, `The email address ${markdownAddress(proposal.address)} was added to your account${instead} from another connection. If it wasn't you, remove it with \`/email remove\` and the address.`);
 				this.reply(socket, request, {});
 				return;
 			}
@@ -3869,23 +3875,38 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// Sign-up: an address no account holds (§4.11.4: server policy).
 				const name = proposal.name ?? JOIN_DEFAULT_NAME;
 				const chosen = candidateUserIdFor(name, (candidate) => this.store.userIdTaken(candidate));
-				// The new user's logged joins reach this connection after its
-				// `auth` result (§3.2); signInKeyless releases them.
-				this.holdDeliveries(socket);
-				await this.runMutation(async () => {
-					const made = this.store.createInvitedIdentity({ userId: chosen, name, now: nowMs(), ipKey: attachment.ipKey });
-					for (const record of made.broadcasts) this.broadcastHeld(socket, record);
+				// The whole key-value cost (the proposal's delete, then the address
+				// and its list) is reserved before the account exists, so a budget
+				// refusal cannot strand an account without its address. The
+				// proposal goes first: whatever fails after it, no retry of the
+				// same code or link signs up a second account.
+				await this.store.withMeterAsync("foreground", { writes: 3 }, async () => {
+					await this.ctx.storage.delete(key);
+					// The new user's logged joins reach this connection after its
+					// `auth` result (§3.2); signInKeyless releases them.
+					this.holdDeliveries(socket);
+					await this.runMutation(async () => {
+						const made = this.store.createInvitedIdentity({ userId: chosen, name, now: nowMs(), ipKey: attachment.ipKey });
+						for (const record of made.broadcasts) this.broadcastHeld(socket, record);
+					});
+					// One put, with no await between the account's creation and it.
+					await this.ctx.storage.put({
+						[addressKey]: { v: 1, userId: chosen, address: proposal.address, addedMs: now } satisfies StoredEmail,
+						[EMAILS_KEY_PREFIX + chosen]: { v: 1, emails: [{ address: proposal.address, key: addressKey, addedMs: now }] } satisfies StoredEmails,
+					});
 				});
-				// With no await between the account's creation and the address's
-				// put but the metered write itself, nothing else can claim it first.
-				await this.addEmail(chosen, proposal.address, addressKey, now, email.policy.addressesPerUser);
+				if (connectionAttachment(socket)?.emailProposal === key) {
+					delete attachment.emailProposal;
+					writeSessionAttachment(socket, attachment, ["emailProposal"]);
+				}
 				userId = chosen;
 				created = true;
+			} else {
+				// An account at its connection limit refuses before the proposal is used up.
+				this.assertRegisteredCapacity(socket, userId);
+				// Approval uses the proposal up (§4.11.1).
+				await forget();
 			}
-			// An account at its connection limit refuses before the proposal is used up.
-			if (!created) this.assertRegisteredCapacity(socket, userId);
-			// Approval uses the proposal up (§4.11.1).
-			await forget();
 			const identity = this.store.getIdentity(userId);
 			if (!identity) throw { name: "internal_error", message: "The account is missing" } satisfies ProtocolError;
 			// Every session carries its account's user handle, which `/invite-purge` clears to end them.
@@ -3895,17 +3916,37 @@ export class ApronDemoServer extends DurableObject<Env> {
 		});
 	}
 
-	/** Records that `userId` holds `address` (under `addressKey`), in its list too; called with the session lock held. */
-	private async addEmail(userId: string, address: string, addressKey: string, now: number, cap: number): Promise<void> {
-		await this.store.withMeterAsync("foreground", { reads: 1, writes: 2 }, async () => {
+	/**
+	 * Records that `userId` holds `address` (under `addressKey`), in its list
+	 * too. An account at `cap` gives up its oldest addresses for it: the
+	 * approval proved the new one, so an account with one address changes it
+	 * in one step. Returns the addresses replaced. Called with the session
+	 * lock held.
+	 */
+	private async addEmail(userId: string, address: string, addressKey: string, now: number, cap: number): Promise<string[]> {
+		return this.store.withMeterAsync("foreground", { reads: 1 + MAX_EMAILS_PER_USER, writes: 2 + MAX_EMAILS_PER_USER }, async () => {
 			const listKey = EMAILS_KEY_PREFIX + userId;
-			const held = storedEmails(await this.ctx.storage.get<StoredEmails>(listKey)).filter((entry) => entry.key !== addressKey);
-			if (held.length >= cap) throw addressCapError(cap);
+			const held = storedEmails(await this.ctx.storage.get<StoredEmails>(listKey)).filter((entry) => entry.key !== addressKey).slice(-MAX_EMAILS_PER_USER);
+			const dropped = held.slice(0, Math.max(0, held.length - cap + 1));
+			const kept = held.slice(dropped.length);
+			if (dropped.length) {
+				const stored = await this.ctx.storage.get<StoredEmail>(dropped.map((entry) => entry.key));
+				const owned = dropped.filter((entry) => stored.get(entry.key)?.userId === userId).map((entry) => entry.key);
+				if (owned.length) await this.ctx.storage.delete(owned);
+			}
 			await this.ctx.storage.put({
 				[addressKey]: { v: 1, userId, address, addedMs: now } satisfies StoredEmail,
-				[listKey]: { v: 1, emails: [...held, { address, key: addressKey, addedMs: now }] } satisfies StoredEmails,
+				[listKey]: { v: 1, emails: [...kept, { address, key: addressKey, addedMs: now }] } satisfies StoredEmails,
 			});
+			return dropped.map((entry) => entry.address);
 		});
+	}
+
+	/** A `~private` notice to `userId`'s connections but `except`, such as of a change to how they sign in. */
+	private tellOthers(userId: string, except: WebSocketConnection, text: string): void {
+		for (const peer of this.connectionsOf(userId, except)) {
+			this.deliverTo(peer, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text, format: "markdown" } } });
+		}
 	}
 
 	/**
@@ -3921,7 +3962,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const held = await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1 }, async () => storedEmails(await this.ctx.storage.get<StoredEmails>(listKey))));
 			const how = this.config.email ? "Add one by signing in with email on this connection." : "This server doesn't offer email sign-in now.";
 			this.sendNotice(socket, roomId, held.length
-				? ["Your email addresses, which sign you in and recover your account:", ...held.map((entry) => `- ${entry.address}, added ${utcDay(entry.addedMs)}`)].join("\n")
+				? ["Your email addresses, which sign you in and recover your account:", ...held.map((entry) => `- ${markdownAddress(entry.address)}, added ${utcDay(entry.addedMs)}`)].join("\n")
 				: `You have no email addresses. ${how}`);
 			this.reply(socket, request, {});
 			return;
@@ -3929,16 +3970,26 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const address = words.length === 3 && words[1] === "remove" ? normalizeEmail(words[2]) : null;
 		if (!address) throw { name: "invalid_params", message: "Usage: /email [list | remove <address>]" } satisfies ProtocolError;
 		const addressKey = EMAIL_KEY_PREFIX + await sha256Hex(address);
-		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 2, writes: 2 }, async () => {
+		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 4, writes: 2 }, async () => {
 			const held = storedEmails(await this.ctx.storage.get<StoredEmails>(listKey));
 			if (!held.some((entry) => entry.key === addressKey)) throw { name: "invalid_params", message: `${address} is not one of your email addresses; /email lists them` } satisfies ProtocolError;
 			const rest = held.filter((entry) => entry.key !== addressKey);
+			// The last address of an account with no passkey or token is its only
+			// way back in once its sessions end, as `/passkeys` keeps a last passkey.
+			if (!rest.length && !this.store.credentialIdsForUser(userId).length) {
+				const invite = await this.ctx.storage.get<StoredBot>(INVITE_KEY_PREFIX + userId);
+				const devices = storedDevices(await this.ctx.storage.get<StoredDevices>(DEVICES_KEY_PREFIX + userId));
+				if (invite?.v !== 1 && !devices.length) {
+					throw { name: "denied", message: "That address is your only way to sign in again; add a passkey or another address first" } satisfies ProtocolError;
+				}
+			}
 			const stored = await this.ctx.storage.get<StoredEmail>(addressKey);
 			if (stored?.userId === userId) await this.ctx.storage.delete(addressKey);
 			if (rest.length) await this.ctx.storage.put<StoredEmails>(listKey, { v: 1, emails: rest });
 			else await this.ctx.storage.delete(listKey);
 		}));
-		this.sendNotice(socket, roomId, `Removed ${address}: it no longer signs you in.`);
+		this.tellOthers(userId, socket, `The email address ${markdownAddress(address)} was removed from your account from another connection.`);
+		this.sendNotice(socket, roomId, `Removed ${markdownAddress(address)}: it no longer signs you in.`);
 		this.reply(socket, request, {});
 	}
 
@@ -3947,8 +3998,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1, writes: MAX_EMAILS_PER_USER + 2 }, async () => {
 			const held = storedEmails(await this.ctx.storage.get<StoredEmails>(EMAILS_KEY_PREFIX + from));
 			if (!held.length) return;
-			await this.ctx.storage.put(Object.fromEntries(held.map((entry) => [entry.key, { v: 1, userId: to, address: entry.address, addedMs: entry.addedMs } satisfies StoredEmail])));
-			await this.ctx.storage.put<StoredEmails>(EMAILS_KEY_PREFIX + to, { v: 1, emails: held });
+			// One put: the addresses never name `to` without its list naming them.
+			await this.ctx.storage.put({
+				...Object.fromEntries(held.map((entry) => [entry.key, { v: 1, userId: to, address: entry.address, addedMs: entry.addedMs } satisfies StoredEmail])),
+				[EMAILS_KEY_PREFIX + to]: { v: 1, emails: held } satisfies StoredEmails,
+			});
 			await this.ctx.storage.delete(EMAILS_KEY_PREFIX + from);
 		}));
 	}

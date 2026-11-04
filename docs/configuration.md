@@ -657,7 +657,9 @@ replaces that page, for a deployment with a link page of its own. A
 malformed `EMAIL_FROM`,
 `EMAIL_LINK_URL` or `EMAIL_SERVER` fails the configuration check; either
 of `EMAIL_FROM` and the binding alone leaves email off. Removing either
-turns it off; stored addresses stay, unused, until it is back.
+turns it off; stored addresses stay, unused, until it is back, and email
+sessions issued on an origin outside `RP_ORIGINS` stop resuming meanwhile
+(those on a passkey origin still do).
 
 Locally, `wrangler dev` with the binding and `EMAIL_FROM` (in `.dev.vars`
 or `--var`) simulates the binding: it logs each message and saves its text

@@ -391,8 +391,9 @@ resumes like a passkey's. A connection already signed in cannot approve a
 sign-in; a guest's can. On a signed-in connection, a proposal instead adds
 the address to the account, approved only on a connection of that account;
 an address another account holds is refused. An account holds one address
-on the demo (`EMAIL_ADDRESSES_PER_USER` allows more); `/email` lists it and
-`/email remove <address>` removes it.
+on the demo (`EMAIL_ADDRESSES_PER_USER` allows more), and approving another
+replaces it; `/email` lists it and `/email remove <address>` removes it,
+except the last way in of an account with no passkey or token.
 Sign-in emails are limited to 3 a day per address, 10 a day per IP (a
 burst of 3, then one a minute), and 95 a day for the server. Bots and the
 `admin` user take no address. `/rename` moves addresses; `/purge` and
