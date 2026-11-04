@@ -56,6 +56,16 @@ VAPID_SUBJECT = "https://server.apron.chat"
 # push.stupidtech.net.
 PUSH_HOSTS = "fcm.googleapis.com,*.push.services.mozilla.com,web.push.apple.com,*.push.apple.com,*.notify.windows.com,push.stupidtech.net"
 
+# Email sign-in (src/email.ts, docs/configuration.md#email-sign-in): off
+# until the sending domain is onboarded to Email Service and both of these
+# are uncommented. EMAIL_LINK_URL points links at a client that opens them
+# with their state; without it they go to https://link.apron.chat/.
+# [[send_email]]
+# name = "EMAIL"
+# and under [vars]:
+# EMAIL_FROM = "login@apron.chat"
+# EMAIL_LINK_URL = "https://web.apron.chat/"
+
 # Uploaded images (src/budget.ts). The bucket needs lifecycle rules deleting
 # f/ after 7 days and a/ after 30 (none for e/, custom emoji), a custom domain
 # for MEDIA_ORIGIN, and a CORS policy allowing GET from any origin for the

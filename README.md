@@ -2,7 +2,7 @@
 
 The public demo server for the [Apron](https://github.com/shazow/apron) chat
 protocol. It runs the whole chat — rooms, threads, reactions,
-history, passkeys, and bots — in a single SQLite Durable Object, and stays
+history, passkeys, email sign-in, and bots — in a single SQLite Durable Object, and stays
 inside the usage included with the **Cloudflare Workers Paid** ($5/month) plan.
 The **Workers Free** budgets are kept in [`src/plans/free.ts`](src/plans/free.ts)
 for a zero-overage deployment.
@@ -15,8 +15,12 @@ for a zero-overage deployment.
 - **One Durable Object, hibernating WebSockets.** A permanent `general` room,
   rooms admins and mods create, and thread rooms, with complete-snapshot
   history, edits, moves, and emoji reactions.
-- **Guests and passkeys.** Anyone can read as a guest; sign in with a passkey
-  to post, and run `/invite-bot` to get a token for your own bot.
+- **Guests, passkeys and email.** Anyone can read as a guest; sign in with a
+  passkey to post, and run `/invite-bot` to get a token for your own bot.
+  With a sender configured, email sign-in (`email`) mails a code and a link
+  that sign in, sign up a new address, or add an address to an account,
+  within Workers Paid's included emails (see
+  [configuration](docs/configuration.md#email-sign-in)).
 - **Private rooms for DMs.** Signed-in users start private rooms
   (`private: true`) that only their members see, and add people to them;
   everyone else is answered as if the room did not exist. A room goes when

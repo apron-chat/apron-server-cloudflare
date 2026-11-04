@@ -1128,11 +1128,11 @@ it('advertises which schemes create accounts in server.signup (§3.2)', async ()
 	const plain = await connect(null);
 	try {
 		const server = (await withPasskeys.next()).params;
-		expect(server.auth).toEqual(['webauthn', 'token', 'guest']);
-		expect(server.signup).toEqual(['webauthn', 'token']);
+		expect(server.auth).toEqual(['webauthn', 'email', 'token', 'guest']);
+		expect(server.signup).toEqual(['webauthn', 'email', 'token']);
 		expect(server.welcome).toMatch(/invite token/);
 		const other = (await plain.next()).params;
-		expect([other.auth, other.signup]).toEqual([['token', 'guest'], ['token']]);
+		expect([other.auth, other.signup]).toEqual([['email', 'token', 'guest'], ['email', 'token']]);
 	} finally { withPasskeys.close(); plain.close(); }
 });
 

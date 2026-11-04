@@ -135,7 +135,7 @@ it('lets a registered user invite a bot that signs in from anywhere with its tok
 		expect(joined?.members).toEqual([{ user: { user_id: 'bot_u_owner', name: 'Bot of Name of u_owner' }, joined: true }]);
 
 		// A bot has no Origin: it is offered `token`, and its token needs none.
-		expect((await bot.next()).params.auth).toEqual(['token', 'guest']);
+		expect((await bot.next()).params.auth).toEqual(['email', 'token', 'guest']);
 		const auth = await request(bot, 'auth', 'auth', { scheme: 'token', token });
 		// A bot may neither move others' messages nor add others (ext:permissions).
 		expect(auth.result).toEqual({ you: { user_id: 'bot_u_owner', name: 'Bot of Name of u_owner', roles: ['bot'], ext: { permissions: {} }, status: 'online' } });

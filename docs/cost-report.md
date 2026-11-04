@@ -743,6 +743,26 @@ and 84% of Paid's daily 12,900 (334,800 GB-s in a 31-day month, under Paid's
 `offlineGraceSeconds` and `statusCoalesceSeconds` trade staleness for
 duration: at 30 seconds each the duration rows halve.
 
+## Email sign-in
+
+Email sign-in (SPEC section 5, Email) costs no Worker requests of its own:
+a proposal and an approval are `auth` frames on an open socket. A proposal
+is one auth attempt, up to two key-value reads (the address's owner and,
+for an addition, the account's list), the three `email` limiter rows
+(server, IP, address) in one reserved transaction, and three key-value
+writes (the replaced proposal's delete, the expiry index entry, the
+proposal); the session sweep deletes an expired proposal later in its
+batch. An approval reads the proposal and the address and writes at most
+the proposal's failure count or delete, the address and its list, and a
+session's two rows; a sign-up adds a registration's SQL
+(Store.createInvitedIdentity). Each email is one Email Service send:
+Workers Paid includes 3,000 a month, then $0.35 per 1,000, and
+`sendsPerDay` (95) keeps a 31-day month at 2,945, inside the inclusion, so
+the bill cap never sees email. The limits that matter more are the
+per-address (3 a day) and per-IP (10 a day) caps, which keep the server
+from mailing strangers in bulk and so protect the sending domain's
+reputation.
+
 ## Live text
 
 Live text (`embed:terminal`, `embed:append`; [SPEC section 4.5](../SPEC.md#45-live-text),

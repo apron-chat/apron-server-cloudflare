@@ -106,35 +106,33 @@ const ids = (rooms: Array<{ room_id: string }> | undefined) => (rooms ?? []).map
 it('admits clients without Origin as guests without advertising or allowing passkeys', async () => {
 	const peer = await connect({ path: '/', origin: null });
 	try {
-		// `token` is for bot tokens (/invite-bot); passkey sessions stay on their origin.
-		expect((await greeting(peer)).server.params.auth).toEqual(['token', 'guest']);
+		// `token` is for bot tokens (/invite-bot); passkey sessions stay on their
+		// origin. Email sign-in works without one (§4.11).
+		expect((await greeting(peer)).server.params.auth).toEqual(['email', 'token', 'guest']);
 		peer.send({ id: 'auth', method: 'auth', params: { scheme: 'guest' } });
 		expect((await peer.next()).result.you.user_id).toMatch(/^guest_/);
-		// A scheme the server defines but does not offer this connection is unsupported (§3.2), as are email and external.
+		// A scheme the server defines but does not offer this connection is unsupported (§3.2), as is external.
 		peer.send({ id: 'passkey', method: 'auth', params: { scheme: 'webauthn', action: 'register', step: 'begin' } });
-		expect((await peer.next()).error.code).toBe(-32601);
-		peer.send({ id: 'email', method: 'auth', params: { scheme: 'email', email: 'ada@example.com' } });
 		expect((await peer.next()).error.code).toBe(-32601);
 		peer.send({ id: 'external', method: 'auth', params: { scheme: 'external' } });
 		expect((await peer.next()).error.code).toBe(-32601);
 	} finally { peer.close(); }
 });
 
-it('rejects an auth scheme the spec does not define as invalid_params, and email and external as unsupported', async () => {
+it('rejects an auth scheme the spec does not define as invalid_params, and external as unsupported', async () => {
 	const peer = await connect({ path: '/' });
 	try {
 		const { auth } = (await greeting(peer)).server.params;
-		expect(auth).not.toContain('email');
+		// Email is offered here (test/email.integration.test.ts covers it, and its absence where unconfigured).
+		expect(auth).toContain('email');
 		expect(auth).not.toContain('external');
 		// An unknown name that the request depends on is invalid_params (§1), before and after sign-in.
 		peer.send({ id: 'ext', method: 'auth', params: { scheme: 'ext:foo' } });
 		expect((await peer.next()).error.code).toBe(-32602);
-		// `email` and `external` are defined, but not offered here: unsupported (§3.2),
-		// proposals and approvals alike.
-		peer.send({ id: 'email', method: 'auth', params: { scheme: 'email', email: 'ada@example.com', state: 'q8Rz' } });
-		expect((await peer.next()).error.code).toBe(-32601);
+		// `external` is defined, but not offered here: unsupported (§3.2),
+		// proposals and approvals alike. A token no proposal emailed is denied.
 		peer.send({ id: 'email-token', method: 'auth', params: { scheme: 'email', token: 'Hk41x9' } });
-		expect((await peer.next()).error.code).toBe(-32601);
+		expect((await peer.next()).error.code).toBe(-32001);
 		peer.send({ id: 'external', method: 'auth', params: { scheme: 'external', return_url: 'https://web.apron.chat/', state: 'q8Rz' } });
 		expect((await peer.next()).error.code).toBe(-32601);
 		peer.send({ id: 'external-token', method: 'auth', params: { scheme: 'external', token: 'Hk41x9' } });
@@ -158,7 +156,7 @@ it('keeps server-owned state out of public protocol frames', async () => {
 		const { server } = await greeting(peer);
 		publicFrames.push(server);
 		expectPublicFrame(server);
-		expect(server.params.auth).toEqual(['webauthn', 'token', 'guest']);
+		expect(server.params.auth).toEqual(['webauthn', 'email', 'token', 'guest']);
 
 		peer.send({ id: 'auth', method: 'auth', params: { scheme: 'guest' } });
 		const auth = await peer.next();
@@ -1017,19 +1015,20 @@ it('advertises the extensions ext:settings, ext:limits, ext:media and ext:permis
 	} finally { peer.close(); }
 });
 
-it('speaks protocol v10: a sign-in welcome, no email sign-in, and ~private notices', async () => {
+it('speaks protocol v10: a sign-in welcome, email sign-in, and ~private notices', async () => {
 	const withPasskeys = await connect();
 	const bot = await connect({ origin: null });
 	try {
 		const { server, welcome } = await greeting(withPasskeys);
-		expect(server.params).toMatchObject({ apron: 10, agent: 'apron-cloudflare-demo/10', auth: ['webauthn', 'token', 'guest'] });
+		expect(server.params).toMatchObject({ apron: 10, agent: 'apron-cloudflare-demo/10', auth: ['webauthn', 'email', 'token', 'guest'], signup: ['webauthn', 'email', 'token'] });
 		// `server.welcome` is for the sign-in screen (§3.2), worded for this origin.
 		expect(server.params.welcome).toMatch(/Create a passkey/);
 		expect(server.params.welcome).toContain(`kept for ${Math.round(DEFAULT_LIMITS.retentionSeconds / 86_400)} days`);
 		expect(welcome.params.from).toEqual({ user_id: '~private', name: 'System message to you' });
 		const other = (await greeting(bot)).server.params;
-		expect(other.auth).toEqual(['token', 'guest']);
+		expect(other.auth).toEqual(['email', 'token', 'guest']);
 		expect(other.welcome).toMatch(/Passkeys work on the demo's own site/);
+		expect(other.welcome).toMatch(/sign in with email/);
 	} finally { withPasskeys.close(); bot.close(); }
 });
 

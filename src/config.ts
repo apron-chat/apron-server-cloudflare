@@ -1,6 +1,7 @@
 import * as budget from "./budget.ts";
-import { DEFAULT_FEATURES, DEFAULT_LIMITS, LIVE_TEXT_POLICY, MAX_PUSH_CANDIDATES, MAX_PUSHES_PER_MESSAGE, MAX_STATUS_DELAY_SECONDS, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits, type LiveTextPolicy, type PushPolicy } from "./budget.ts";
+import { DEFAULT_FEATURES, DEFAULT_LIMITS, EMAIL_POLICY, LIVE_TEXT_POLICY, MAX_PUSH_CANDIDATES, MAX_PUSHES_PER_MESSAGE, MAX_STATUS_DELAY_SECONDS, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits, type LiveTextPolicy, type PushPolicy, type EmailPolicy } from "./budget.ts";
 import { billCap, type BillCap } from "./pricing.ts";
+import { DEFAULT_EMAIL_LINK_URL, normalizeEmail } from "./email.ts";
 import { base64UrlDecode, P256_PRIVATE_KEY_BYTES, P256_PUBLIC_KEY_BYTES, vapidKeysMatch, type VapidKeys } from "./webpush.ts";
 export { DEFAULT_LIMITS } from "./budget.ts";
 
@@ -74,6 +75,12 @@ export interface RuntimeConfig {
 	 * plan's `push.delaySeconds`, or `PUSH_DELAY_SECONDS` (0 pushes at once).
 	 */
 	pushDelaySeconds: number;
+	/**
+	 * Email sign-in (protocol §4.11, scheme `email`), on when the plan has an
+	 * email policy and the deployment sets `EMAIL_FROM` and the `EMAIL`
+	 * send_email binding; a deployment without either has none.
+	 */
+	email?: EmailConfig;
 	/**
 	 * The hosts whose media a client-built `og` may keep (`OG_MEDIA_HOSTS`):
 	 * exact hosts, or `*.host` for its subdomains; `"*"` allows any host, and
@@ -178,6 +185,25 @@ interface LiveTextConfig {
 	viewerUrl?: string;
 }
 
+export interface EmailConfig {
+	/** The plan's email policy. */
+	policy: EmailPolicy;
+	/** The address emails come from (`EMAIL_FROM`), on a domain onboarded to Email Sending. */
+	from: string;
+	/**
+	 * The page sign-in links open (`EMAIL_LINK_URL`, else
+	 * https://link.apron.chat/), with the token, `state` and server in its
+	 * fragment (§4.11.2).
+	 */
+	linkUrl: string;
+	/**
+	 * The server's address in those links (`EMAIL_SERVER`, else
+	 * `wss://` and PUBLIC_ORIGIN's host): built from configuration, never
+	 * from a request (§4.11.4).
+	 */
+	server: string;
+}
+
 interface UploadConfig {
 	/** Where the bucket serves objects, such as `https://media.apron.chat`. */
 	mediaOrigin: string;
@@ -193,7 +219,7 @@ interface UploadConfig {
  */
 function adminTokenError(token: string): string | null {
 	if (!/^[A-Za-z0-9_-]{24,256}$/.test(token)) return "APRON_ADMIN_TOKEN must be 24 to 256 letters, digits, - or _";
-	if (["apron_bot_", "apron_invite_", "apron_join_", "apron_device_"].some((prefix) => token.startsWith(prefix))) return "APRON_ADMIN_TOKEN must not start with apron_bot_, apron_invite_, apron_join_, or apron_device_";
+	if (["apron_bot_", "apron_invite_", "apron_join_", "apron_device_", "apron_email_"].some((prefix) => token.startsWith(prefix))) return "APRON_ADMIN_TOKEN must not start with apron_bot_, apron_invite_, apron_join_, apron_device_, or apron_email_";
 	return null;
 }
 
@@ -232,6 +258,10 @@ type EnvLike = {
 	PUSH_HOSTS?: string;
 	PUSH_DELAY_SECONDS?: string;
 	OG_MEDIA_HOSTS?: string;
+	EMAIL?: unknown;
+	EMAIL_FROM?: string;
+	EMAIL_LINK_URL?: string;
+	EMAIL_SERVER?: string;
 	ENVIRONMENT?: string;
 	NODE_ENV?: string;
 };
@@ -487,6 +517,7 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 	const pushHosts = loadPushHosts(env.PUSH_HOSTS);
 	const pushDelaySeconds = loadPushDelay(env.PUSH_DELAY_SECONDS);
 	const ogMediaHosts = loadOgMediaHosts(env.OG_MEDIA_HOSTS);
+	const email = loadEmail(env);
 	const rpName = String(env.RP_NAME ?? "Apron Demo");
 	if (!rpName.trim() || [...rpName].length > limits.maxNameCodePoints || new TextEncoder().encode(rpName).byteLength > limits.maxNameBytes) {
 		throw new ConfigError("RP_NAME exceeds the configured display-name policy");
@@ -516,6 +547,7 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 		...(push ? { push } : {}),
 		pushHosts,
 		pushDelaySeconds,
+		...(email ? { email } : {}),
 		ogMediaHosts,
 		billCap: cap,
 		attackPause,
@@ -572,6 +604,58 @@ function loadUploads(env: EnvLike): UploadConfig | undefined {
 	if (!validOrigin(publicOrigin)) throw new ConfigError("PUBLIC_ORIGIN must be an exact HTTP(S) origin");
 	if (signingKey.length < 32) throw new ConfigError("UPLOAD_SIGNING_KEY must be at least 32 characters");
 	return { mediaOrigin, publicOrigin, signingKey };
+}
+
+/**
+ * Email sign-in settings, when the plan has an email policy and the
+ * deployment sets both `EMAIL_FROM` and the `EMAIL` send_email binding;
+ * either alone leaves email off. The links' server is `EMAIL_SERVER`, else
+ * derived from `PUBLIC_ORIGIN`, one of which must be set; malformed values
+ * fail the configuration check.
+ */
+function loadEmail(env: EnvLike): EmailConfig | undefined {
+	const rawFrom = env.EMAIL_FROM?.trim() ?? "";
+	if (!EMAIL_POLICY || !env.EMAIL || !rawFrom) return undefined;
+	validateEmailPolicy(EMAIL_POLICY);
+	const from = normalizeEmail(rawFrom);
+	if (!from) throw new ConfigError("EMAIL_FROM must be a plain email address, such as login@example.com");
+	const rawLink = env.EMAIL_LINK_URL?.trim() || DEFAULT_EMAIL_LINK_URL;
+	let linkUrl: string;
+	try {
+		const parsed = new URL(rawLink);
+		const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname);
+		if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) throw new Error();
+		if (parsed.username || parsed.password) throw new Error();
+		linkUrl = `${parsed.origin}${parsed.pathname}${parsed.search}`;
+	} catch {
+		throw new ConfigError("EMAIL_LINK_URL must be an https: URL (http: only on a loopback host)");
+	}
+	let server = env.EMAIL_SERVER?.trim() ?? "";
+	if (server) {
+		let parsed: URL | undefined;
+		try { parsed = new URL(server); } catch { /* refused below */ }
+		if (!parsed || (parsed.protocol !== "wss:" && parsed.protocol !== "ws:") || parsed.username || parsed.password || parsed.hash) {
+			throw new ConfigError("EMAIL_SERVER must be the server's ws: or wss: address");
+		}
+	} else {
+		const publicOrigin = env.PUBLIC_ORIGIN?.trim() ?? "";
+		if (!publicOrigin) throw new ConfigError("EMAIL_FROM needs PUBLIC_ORIGIN or EMAIL_SERVER, the server address sign-in links name");
+		if (!validOrigin(publicOrigin)) throw new ConfigError("PUBLIC_ORIGIN must be an exact HTTP(S) origin");
+		server = `${publicOrigin.startsWith("http:") ? "ws:" : "wss:"}//${new URL(publicOrigin).host}/`;
+	}
+	return { policy: EMAIL_POLICY, from, linkUrl, server };
+}
+
+/** Throws unless the plan's email policy is within its calibrated bounds. */
+export function validateEmailPolicy(policy: EmailPolicy): void {
+	for (const [key, value] of Object.entries(policy)) {
+		if (!Number.isSafeInteger(value) || value <= 0) throw new ConfigError(`email.${key} must be a positive safe integer`);
+	}
+	if (policy.sendsPerIpDay > policy.sendsPerDay || policy.sendsPerAddressDay > policy.sendsPerDay) throw new ConfigError("email.sendsPerIpDay and email.sendsPerAddressDay must fit sendsPerDay");
+	// §4.11.1: a proposal expires within minutes, and a few failures cancel it.
+	if (policy.proposalSeconds > 30 * 60) throw new ConfigError("email.proposalSeconds must be at most 30 minutes");
+	if (policy.maxFailures > 10) throw new ConfigError("email.maxFailures must be at most 10");
+	if (policy.addressesPerUser > 10) throw new ConfigError("email.addressesPerUser must be at most 10");
 }
 
 /**

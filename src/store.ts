@@ -4424,6 +4424,29 @@ export class Store {
   }
 
   /**
+   * Charges one sign-in email (protocol §4.11.4) to the proposing IP, to the
+   * address (by `addressKey`, its digest), and to the server, each a count
+   * for the UTC day, or none when any is full: `retry_after` until the day
+   * ends. The IP also may send only one a minute after a burst of three,
+   * so one network cannot spend the server's day at once.
+   */
+  chargeEmailSend(input: { ipKey: string; addressKey: string; now: number; policy: { sendsPerDay: number; sendsPerIpDay: number; sendsPerAddressDay: number } }): void {
+    this.ensureReady();
+    const { policy } = input;
+    this.reserved({ reads: 32, writes: 16 }, false, input.now, () => {
+      const effective = this.effectiveNow(input.now);
+      this.transaction(() => {
+        this.chargeEvent("email", "global", effective, { perMinute: policy.sendsPerDay }, "Sign-in emails are used up for today on this server",
+          { limit: policy.sendsPerDay, message: "Sign-in emails are used up for today on this server" });
+        this.chargeEvent("email", `ip:${input.ipKey}`, effective, { perMinute: 1, burst: 3 }, "Sign-in emails limited; wait a minute",
+          { limit: policy.sendsPerIpDay, message: "Sign-in emails limited for this network today" });
+        this.chargeEvent("email", `address:${input.addressKey}`, effective, { perMinute: policy.sendsPerAddressDay }, "No more sign-in emails to this address today",
+          { limit: policy.sendsPerAddressDay, message: "No more sign-in emails to this address today" });
+      });
+    });
+  }
+
+  /**
    * Durably reserve the next `count` guest numbers and return them as the
    * half-open range [first, limit). The stored high-water mark advances by
    * `count` in one write, so numbers handed out from the range are never

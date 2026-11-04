@@ -198,10 +198,25 @@ including the posting, listing and frame quotas and the thread and private
 room caps, and ends with a checklist for a well-behaved client.
 
 The `server` frame's `welcome` is CommonMark for your sign-in screen. The server
-advertises `token` (for bot tokens) and `guest` to custom frontends, and never
-`email` or `external`; `signup` names the schemes that create an account
-(`webauthn` on the demo's own site, and `token` for an admin's `/invite-code`
+advertises `token` (for bot tokens) and `guest` to custom frontends, `email`
+where the deployment has a sender, and never `external`; `signup` names the
+schemes that create an account (`webauthn` on the demo's own site, `email`
+for an address no account holds, and `token` for an admin's `/invite-code`
 sign-up token, whose `auth` result carries the new user's own token to save).
+
+Email sign-in (protocol §4.11) works in any client: send
+`{"method": "auth", "params": {"scheme": "email", "email": "ada@example.com", "state": "<random>", "name": "Ada"}}`,
+which answers `{}`, then have the user type the six-digit code from the
+email with `{"scheme": "email", "token": "418092"}` on the same connection.
+The result carries `you` and a session `token`, bound to your origin (or to
+no Origin, for a native client), to save and resume with `scheme: "token"`.
+With `state`, the email also has a link,
+`https://link.apron.chat/#server=…&token=apron_email_…&state=…` (or the
+deployment's `EMAIL_LINK_URL`): when its `state` is the one your client
+proposed with, present its token with `scheme: "email"` on any connection
+not signed in; otherwise ask the user first (§4.11.2). On a signed-in
+connection, the same proposal adds the address to the account instead.
+See [SPEC section 5, Email](../SPEC.md#email).
 A user who signed up with a token can add a passkey by registering one while
 signed in. `web.apron.chat` additionally receives `webauthn`, and its `token`
 also resumes passkey sessions; inspect each connection's
