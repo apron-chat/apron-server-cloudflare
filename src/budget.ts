@@ -495,6 +495,30 @@ export interface LiveTextPolicy {
 	readers: number;
 }
 
+/**
+ * Email sign-in (protocol §4.11, scheme `email`): a proposal emails a
+ * six-digit code and a sign-in link, and approving it signs in, signs up an
+ * unknown address, or adds the address to the signed-in account. Every
+ * email sent costs against the account's monthly allowance (3,000 on
+ * Workers Paid, then $0.35 per 1,000), so the daily caps bound the bill and
+ * keep the server from mailing strangers in bulk: the sender's reputation,
+ * not money, is what a flood would cost.
+ */
+export interface EmailPolicy {
+	/** Emails the whole server sends a UTC day. */
+	sendsPerDay: number;
+	/** Emails one IP's proposals may send a UTC day. */
+	sendsPerIpDay: number;
+	/** Emails one address may be sent a UTC day, whoever asks. */
+	sendsPerAddressDay: number;
+	/** How long a proposal, and the code and link it sends, lasts. */
+	proposalSeconds: number;
+	/** Wrong codes that cancel a proposal (§4.11.1). */
+	maxFailures: number;
+	/** Addresses one account may hold. */
+	addressesPerUser: number;
+}
+
 export interface Plan {
 	name: string;
 	limits: Readonly<Limits>;
@@ -505,6 +529,7 @@ export interface Plan {
 	uploads?: Readonly<UploadPolicy>;
 	push?: Readonly<PushPolicy>;
 	liveText?: Readonly<LiveTextPolicy>;
+	email?: Readonly<EmailPolicy>;
 }
 
 // Match the account's Workers plan. To switch back to Free, import FREE_PLAN
@@ -516,6 +541,7 @@ export const DEFAULT_FEATURES: Readonly<Features> = PLAN.features;
 export const UPLOAD_POLICY: Readonly<UploadPolicy> | undefined = PLAN.uploads;
 export const PUSH_POLICY: Readonly<PushPolicy> | undefined = PLAN.push;
 export const LIVE_TEXT_POLICY: Readonly<LiveTextPolicy> | undefined = PLAN.liveText;
+export const EMAIL_POLICY: Readonly<EmailPolicy> | undefined = PLAN.email;
 
 // Calibrated implementation bounds remain explicit: raising a payload or parser
 // bound requires rechecking its consumers. Resource ceilings below instead use

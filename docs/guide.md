@@ -198,10 +198,67 @@ including the posting, listing and frame quotas and the thread and private
 room caps, and ends with a checklist for a well-behaved client.
 
 The `server` frame's `welcome` is CommonMark for your sign-in screen. The server
-advertises `token` (for bot tokens) and `guest` to custom frontends, and never
-`email` or `external`; `signup` names the schemes that create an account
-(`webauthn` on the demo's own site, and `token` for an admin's `/invite-code`
+advertises `token` (for bot tokens) and `guest` to custom frontends, `email`
+where the deployment has a sender, and never `external`; `signup` names the
+schemes that create an account (`webauthn` on the demo's own site, `email`
+for an address no account holds, and `token` for an admin's `/invite-code`
 sign-up token, whose `auth` result carries the new user's own token to save).
+
+Email sign-in (protocol §4.11) works in any client. To sign in or sign up,
+use a connection that has not signed in, not even as a guest: send
+`{"method": "auth", "params": {"scheme": "email", "email": "ada@example.com", "state": "<random>", "name": "Ada"}}`,
+which answers `{}`, then have the user type the six-digit code from the
+email with `{"scheme": "email", "token": "418092"}` on the same connection.
+The result carries `you` and a session `token`, bound to your origin (or to
+no Origin, for a native client), to save and resume with `scheme: "token"`.
+With `state`, the email also has a link,
+`https://link.apron.chat/#server=…&token=apron_email_…&state=…`, the
+universal link any client may handle (a deployment's `EMAIL_LINK_URL` may
+replace the page): when its `state` is the one your client
+proposed with, present its token with `scheme: "email"` on any connection
+not signed in; otherwise ask the user first (§4.11.2). On a guest's
+connection, the same proposal registers instead: its code or link token,
+presented on that guest connection only, turns the guest into a new
+account holding the address, keeping its rooms, as a passkey registration
+does; for an address that already has an account, the email tells the user
+to sign in instead. On a connection signed in to an account, the proposal
+adds the address to it (replacing the account's one address).
+See [SPEC section 5, Email](../SPEC.md#email).
+
+**Email sign-in in a client: one tab, not two.** A link opens a new tab
+while the tab that asked still waits for its code. The new tab is where the
+user is looking, so it takes over; the old one goes dormant. The old tab
+still approves, since a code works only on the connection that proposed,
+and a guest's registration only on that guest's connection: hand the
+link's token back to it over a `BroadcastChannel` on your origin
+(apron-web's `src/lib/ui/tab-handoff.ts` does this):
+
+1. The tab the link opens reads `#server=…&token=…&state=…`, posts
+   `{state, token}` on the channel, and waits about half a second for a
+   tab to take it.
+2. The tab holding that `state`'s open proposal (only it acts on it: the
+   `state` is unguessable) answers that it took it, presents the token on
+   its own connection, and answers with the outcome: on success, the room
+   it had open and the session `token` it now holds (storage reaches other
+   tabs a moment late, so it comes along; the channel reaches only your
+   origin's tabs, which can read that storage anyway), else the error.
+3. It then goes dormant: it closes its connection, which also keeps the
+   account under its connection limit, and shows "Apron is open in another
+   tab", with a way to use Apron there again. Browsers refuse
+   `window.close()` for a tab the user opened, so it doesn't close.
+4. The new tab resumes with that token (`scheme: "token"`), as a reload
+   would, and opens the room the old tab had open; or shows the error.
+5. With no answer, nobody is waiting: a sign-in link signs in right there,
+   on that tab's own connection not signed in; a guest's registration link
+   says to type the code in the tab where it was asked for, or to ask for
+   a new email.
+
+`BroadcastChannel` reaches only tabs on the same origin in the same
+browser, so the link must land on your origin: `https://link.apron.chat/`
+(the default) has to send the user on to your client with the fragment, or
+a deployment for one client sets `EMAIL_LINK_URL` to it. A mail app's
+in-app browser or another browser hears nothing; the code works there, so
+always offer it.
 A user who signed up with a token can add a passkey by registering one while
 signed in. `web.apron.chat` additionally receives `webauthn`, and its `token`
 also resumes passkey sessions; inspect each connection's

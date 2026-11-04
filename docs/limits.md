@@ -125,6 +125,12 @@ minutes after a few unclean reconnects.
 | `denied` "Session expired; sign in with your passkey" | A passkey session lasts 30 days, renewed on a resume once half has passed; it resumes only from the origin it was made on | A stale stored token, or a token from another origin. |
 | `denied` "Identity switching requires reconnect" | One identity per connection once signed in | Calling `auth` again on a signed-in socket. Open a new connection instead. |
 | `denied` "An account holds at most 8 passkeys" | 8 passkeys; 5 device tokens per account | Registering a new passkey on every sign-in. |
+| `retry_after` "Sign-in emails limited; wait a minute" / "Sign-in emails limited for this network today" | Email sign-in (where offered): 10 emails a day per network address, a burst of 3 then one a minute | Asking for many codes from one network. |
+| `retry_after` "No more sign-in emails to this address today" / "Sign-in emails are used up for today on this server" | 3 emails a day to one email address, whoever asks; 190 a day on the server | Asking again instead of waiting for the email (check spam), or a busy day. |
+| `denied` "Sign in to an account on a new connection, not a guest's" / "Approve this registration on the guest connection that asked for it" | Only a connection not signed in at all signs in by email; a guest's connection registers a new account instead, by its own code | Opening a sign-in link in a tab connected as a guest, or typing a guest's code elsewhere. |
+| `denied` "This code or link is not valid or has expired; ask for a new email" / "That code is not the one emailed" | A code or link lasts 10 minutes and works once; a code only on the connection that asked; 5 wrong tries cancel it; a new proposal replaces the last | A typo, an old email, or typing the code into another tab. |
+| `denied` "Session expired; sign in with your email again" | An email session lasts 30 days like a passkey's, and resumes only from the origin it was made on (or with no Origin, where it had none) | A stale stored token, or a token from another origin. |
+| `denied` "That address is your only way to sign in again; …" | An account keeps its last way to sign in: `/email remove` of the last address of an account with no passkey or token | Add a passkey, or approve another address (with 1 address an account, that replaces it), first. |
 
 Guests get a new `guest_<n>` identity on every connection, and on the demo
 they can only read: writes are `denied` ("Guests can only read here; sign in

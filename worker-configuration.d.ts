@@ -25,6 +25,11 @@ declare global {
 		PUSH_HOSTS?: string;
 		PUSH_DELAY_SECONDS?: string;
 		OG_MEDIA_HOSTS?: string;
+		/** Email sign-in (src/email.ts): the Email Service send binding, the sender address, and where links point; off unless EMAIL and EMAIL_FROM are both set. */
+		EMAIL?: SendEmail;
+		EMAIL_FROM?: string;
+		EMAIL_LINK_URL?: string;
+		EMAIL_SERVER?: string;
 		ASSETS?: Fetcher;
 		ALLOWED_ORIGINS?: string;
 		RP_ID?: string;
@@ -67,6 +72,11 @@ declare global {
 			PUSH_HOSTS?: string;
 			PUSH_DELAY_SECONDS?: string;
 			OG_MEDIA_HOSTS?: string;
+			/** Email sign-in (src/email.ts): the Email Service send binding, the sender address, and where links point; off unless EMAIL and EMAIL_FROM are both set. */
+			EMAIL?: SendEmail;
+			EMAIL_FROM?: string;
+			EMAIL_LINK_URL?: string;
+			EMAIL_SERVER?: string;
 			ASSETS?: Fetcher;
 			ALLOWED_ORIGINS?: string;
 			RP_ID?: string;

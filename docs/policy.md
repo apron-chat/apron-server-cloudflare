@@ -341,7 +341,8 @@ passkeys and removes any but the last. A registered
 identity must reconnect before signing in as another.
 
 `server.signup` lists the schemes that create accounts: `webauthn` where
-passkeys are offered, and `token`, which creates one only with an admin's
+passkeys are offered, `email` where the deployment has a sender (an address
+no account holds signs up), and `token`, which creates one only with an admin's
 sign-up invite (`/invite-code <uses>`, at most 50 sign-ups within 7 days, one
 live invite at a time). Each sign-up gets its own `apron_invite_` token in
 the `auth` result to sign in with afterwards. Other tokens only sign in, and
@@ -371,7 +372,38 @@ right after the `server` frame, before any `auth`, with no `room_id`
 they do. The `server` frame's `welcome`, for the sign-in screen, is
 `general`'s description; while it has none, it is a summary of how guests,
 passkeys, invites, and bot tokens fit together, and how long messages are
-kept. There is no email or external sign-in.
+kept. There is no external sign-in.
+
+Where the deployment has a sender (`EMAIL_FROM` and the `EMAIL` binding;
+see [configuration](configuration.md#email-sign-in)), `email` sign-in
+(protocol [§4.11](https://github.com/shazow/apron/blob/main/PROTOCOL.md#411-email-and-external-sign-in))
+is offered on every connection. A proposal (`auth` with `scheme: "email"`
+and `email`) always returns `{}`, so it never says whether an address has
+an account. It emails a six-digit code, which works only on the connection
+that asked, and, when the proposal carries `state`, a link whose token
+works anywhere; both last 10 minutes and work once, five wrong tries cancel
+them, and a new proposal replaces the connection's last. Approving with
+the code or link (`auth` with `token`, scheme `email` or `token`) signs in
+to the account that holds the address, or creates one for an address none
+holds (charged as a registration, named as the proposal asked, else
+"Member"), and returns a 30-day session token bound to that origin, which
+resumes like a passkey's. Only a connection not signed in at all approves a
+sign-in, never a guest's or an account's, so a link cannot move someone
+into another account. A guest instead registers: its proposal creates a
+new account holding the address, approved by its code or link token on
+that guest connection only, which becomes the account and keeps the guest's rooms,
+as a passkey registration does; for an address that already has an
+account, the email says to sign in instead and has no code. On a
+signed-in connection, a proposal instead adds the address to the account,
+approved only on a connection of that account;
+an address another account holds is refused. An account holds one address
+on the demo (`EMAIL_ADDRESSES_PER_USER` allows more), and approving another
+replaces it; `/email` lists it and `/email remove <address>` removes it,
+except the last way in of an account with no passkey or token.
+Sign-in emails are limited to 3 a day per address, 10 a day per IP (a
+burst of 3, then one a minute), and 190 a day for the server. Bots and the
+`admin` user take no address. `/rename` moves addresses; `/purge` and
+`/invite-purge` remove them. See [SPEC section 5](../SPEC.md#email).
 
 A registered user's `/invite-bot` creates or renames their bot, `bot_<their
 user_id>` named "Bot of <their name>", and returns its bearer token in a

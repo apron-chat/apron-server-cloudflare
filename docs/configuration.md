@@ -9,7 +9,7 @@ one, and must match the account's plan.
 
 | File | Plan | Features on by default |
 | --- | --- | --- |
-| [`src/plans/paid.ts`](../src/plans/paid.ts) (selected) | Workers Paid, $5/month | `activity` (typing), presence (user status, with push), live text (with `PUBLIC_ORIGIN` and `UPLOAD_SIGNING_KEY`) |
+| [`src/plans/paid.ts`](../src/plans/paid.ts) (selected) | Workers Paid, $5/month | `activity` (typing), presence (user status, with push), live text (with `PUBLIC_ORIGIN` and `UPLOAD_SIGNING_KEY`), email sign-in (with `EMAIL_FROM` and the `EMAIL` binding) |
 | [`src/plans/free.ts`](../src/plans/free.ts) | Workers Free | presence (user status, with push) |
 
 The paid plan starts from the free one and raises only what Paid's included
@@ -598,6 +598,79 @@ Pushes are outbound requests from the Durable Object, which no Worker or
 Durable Object allowance counts and no edge rule needs to allow. Their SQL is
 in the [cost report](cost-report.md#push); `/status` shows the day's pushes.
 
+## Email sign-in
+
+Email sign-in (protocol §4.11, scheme `email`; see
+[SPEC section 5, Email](../SPEC.md#email)) emails a six-digit code, and a
+sign-in link when the client's proposal carries `state`. It signs in to the
+account that holds the address, signs up a new account for an address none
+holds, or adds the address to the signed-in account. Only Workers Paid has
+an `email` policy (Free cannot send to arbitrary addresses), in
+`src/plans/paid.ts`. A deployment replaces any of its values with an
+`EMAIL_<KEY>` variable, such as `EMAIL_ADDRESSES_PER_USER=3` or
+`EMAIL_SENDS_PER_DAY=50`, within the ceilings the configuration check
+enforces (a malformed or out-of-bounds value fails it):
+
+| Setting (variable) | Workers Paid |
+| --- | ---: |
+| `sendsPerDay` (`EMAIL_SENDS_PER_DAY`; server-wide, UTC day) | 190 |
+| `sendsPerIpDay` (`EMAIL_SENDS_PER_IP_DAY`; one IP's proposals, after a burst of 3 then one a minute) | 10 |
+| `sendsPerAddressDay` (`EMAIL_SENDS_PER_ADDRESS_DAY`; to one address, whoever asks) | 3 |
+| `proposalSeconds` (`EMAIL_PROPOSAL_SECONDS`; how long a code and link last, at most 30 minutes) | 600 |
+| `maxFailures` (`EMAIL_MAX_FAILURES`; wrong codes and misplaced links that cancel a proposal, at most 10) | 5 |
+| `addressesPerUser` (`EMAIL_ADDRESSES_PER_USER`; addresses one account holds, at most 10) | 1 |
+
+Workers Paid includes 3,000 emails a month, then $0.35 per 1,000
+([pricing](https://developers.cloudflare.com/email-service/platform/pricing/));
+190 a day is at most 5,890 in a 31-day month, so email adds at most about
+$1.05 a month to the bill (96 a day or fewer adds nothing). The bill cap's
+estimate does not count email, so keep `EMAIL_SENDS_PER_DAY` in proportion.
+Emails Cloudflare rejects for a suppressed recipient do not count. A send
+the limits refuse is `retry_after` and sends nothing.
+
+Email is off, and `email` absent from `server.auth` and `server.signup`,
+until the deployment sets both:
+
+1. **A sending domain.** In the Cloudflare dashboard, go to **Compute** >
+   **Email Service** > **Email Sending** and onboard the domain (it must
+   use Cloudflare DNS). Cloudflare adds SPF, DKIM and bounce MX records on
+   `cf-bounce.<domain>` and a DMARC record at `_dmarc.<domain>`; check
+   first for a DMARC record of your own. New accounts start with a small
+   daily quota that grows with the domain's reputation.
+2. **The binding.** Add to the Wrangler file:
+
+   ```toml
+   [[send_email]]
+   name = "EMAIL"
+   ```
+
+3. **The sender.** Set `EMAIL_FROM`, a plain address on that domain such as
+   `login@apron.chat`, in `[vars]`. Mail comes from it, named with the
+   server's title (`/server title`, else `SERVER_TITLE`, else `RP_NAME`).
+
+The links name the server as `EMAIL_SERVER` when set (a `wss:` or `ws:`
+address), else `wss://` and the host of `PUBLIC_ORIGIN`; one of the two is
+required. They open `https://link.apron.chat/`, the protocol's universal
+link (Appendix A.4), with the token, `state` and server in the fragment, so
+a link opens in whichever Apron client the user has, not one this server
+picks; the code works in any client, links or not. `EMAIL_LINK_URL`
+replaces that page, for a deployment with a link page of its own. A
+malformed `EMAIL_FROM`,
+`EMAIL_LINK_URL` or `EMAIL_SERVER` fails the configuration check; either
+of `EMAIL_FROM` and the binding alone leaves email off. Removing either
+turns it off; stored addresses stay, unused, until it is back, and email
+sessions issued on an origin outside `RP_ORIGINS` stop resuming meanwhile
+(those on a passkey origin still do).
+
+Locally, `wrangler dev` with the binding and `EMAIL_FROM` (in `.dev.vars`
+or `--var`) simulates the binding: it logs each message and saves its text
+to a local file instead of delivering it, so the code and link are in the
+console. `remote = true` on the binding sends real mail through Email
+Service instead
+([local development](https://developers.cloudflare.com/email-service/observability/local-development/sending/)).
+The tests turn email on with a stand-in sender (`vitest.config.ts`) and
+capture each message.
+
 ## User status (presence)
 
 With push on, the server advertises capability `status` (protocol §4.5):
@@ -731,7 +804,7 @@ implementation and recalibrating its resource model.
 | `SERVER_TITLE` | The `server` frame's `title` (protocol §3.1), a one-line plain name within the display-name policy (80 code points); unset or empty, left out, and clients show the server's address. The public demo sets it in `wrangler.production.toml`. An admin's `/server title` overrides it (see [Server title, description and avatar](#server-title-description-and-avatar)) |
 | `SERVER_DESCRIPTION` | The `server` frame's `description`, a few words of CommonMark (at most 500 bytes) saying what the server is about; unset or empty, `general`'s description where it fits, else left out. The public demo sets it in `wrangler.production.toml`. An admin's `/server description` overrides it |
 | `SERVER_AVATAR` | The `server` frame's `avatar`, the server's square icon: an `https:` URL, or a small `data:image/{png,jpeg,gif,webp};base64,` URL (at most 8 KiB); unset or empty, left out. The public demo sets it in `wrangler.production.toml`, to apron-web's icon. An admin's `/server avatar` overrides it |
-| `APRON_ADMIN_TOKEN` | Optional secret, unset by default: 24 to 256 of `A-Z a-z 0-9 - _`, not starting `apron_bot_`, `apron_invite_`, `apron_join_`, or `apron_device_`. `auth` with `scheme: "token"` and this token signs in as the registered user `admin`, who is always an admin, from any origin and without a passkey ([SPEC section 5, Admins](../SPEC.md#admins)). Anyone holding it can act as the admin, so never put it in a Wrangler var or source: `npx wrangler secret put APRON_ADMIN_TOKEN --config wrangler.production.toml`. Delete the secret (`npx wrangler secret delete …`) to turn it off; the `admin` user never holds a passkey. A malformed value makes every request fail its configuration check. Locally, use `npx wrangler dev --var APRON_ADMIN_TOKEN:…` or `.dev.vars` |
+| `APRON_ADMIN_TOKEN` | Optional secret, unset by default: 24 to 256 of `A-Z a-z 0-9 - _`, not starting `apron_bot_`, `apron_invite_`, `apron_join_`, `apron_device_`, or `apron_email_`. `auth` with `scheme: "token"` and this token signs in as the registered user `admin`, who is always an admin, from any origin and without a passkey ([SPEC section 5, Admins](../SPEC.md#admins)). Anyone holding it can act as the admin, so never put it in a Wrangler var or source: `npx wrangler secret put APRON_ADMIN_TOKEN --config wrangler.production.toml`. Delete the secret (`npx wrangler secret delete …`) to turn it off; the `admin` user never holds a passkey. A malformed value makes every request fail its configuration check. Locally, use `npx wrangler dev --var APRON_ADMIN_TOKEN:…` or `.dev.vars` |
 | `MEDIA_ORIGIN` | Exact https origin where the upload bucket serves objects, such as `https://media.apron.chat`; with `PUBLIC_ORIGIN`, `UPLOAD_SIGNING_KEY` and the `MEDIA` binding, turns uploads on for a plan that has them. Announced as `ext.media.origins` (extension `ext:media`) when it is not `PUBLIC_ORIGIN` |
 | `PUBLIC_ORIGIN` | This Worker's exact public origin, which `write_url`s and live text `url`s point at; with `UPLOAD_SIGNING_KEY`, configures live text |
 | `UPLOAD_SIGNING_KEY` | Secret of at least 32 characters that signs `write_url`s, of uploads and of live text; set with `npx wrangler secret put UPLOAD_SIGNING_KEY --config wrangler.production.toml` |
@@ -740,6 +813,10 @@ implementation and recalibrating its resource model.
 | `VAPID_SUBJECT` | `mailto:` address or `https:` URL sent to push services in each VAPID token as the operator's contact |
 | `PUSH_HOSTS` | Comma-separated push service hosts registrations may name, `*.host` for a host's subdomains, or a standalone `*` for any public host; unset, the browsers' own services (see [Push](#push)) |
 | `OG_MEDIA_HOSTS` | Comma-separated hosts whose `og` media (`image`, `video`, `audio`) a link embed keeps, `*.host` for a host's subdomains, a standalone `*` for any host, or empty for none; unset, big platforms' image CDNs (see [Link preview media](#link-preview-media)) |
+| `EMAIL_FROM` | Plain sender address on a domain onboarded to Email Sending, such as `login@apron.chat`; with the `EMAIL` `send_email` binding, turns email sign-in on for a plan that has it (see [Email sign-in](#email-sign-in)) |
+| `EMAIL_LINK_URL` | The page sign-in links open, an `https:` URL (`http:` only on a loopback host); unset, `https://link.apron.chat/`, the universal link that opens in any Apron client, which most deployments keep |
+| `EMAIL_<KEY>` | Replaces one value of the plan's email policy, such as `EMAIL_ADDRESSES_PER_USER` or `EMAIL_SENDS_PER_DAY`, within its ceilings (see [Email sign-in](#email-sign-in)) |
+| `EMAIL_SERVER` | The server's `wss:` or `ws:` address in sign-in links; unset, `wss://` and the host of `PUBLIC_ORIGIN` |
 | `PUSH_DELAY_SECONDS` | Whole seconds, 0 to 60, a message's wake waits before it pushes; unset, the plan's `push.delaySeconds`; `0` pushes at once |
 | `ACCOUNT_ID` | The Cloudflare account whose analytics the account-usage stop and the budget guard read; a Wrangler var (see [Editing the deployment budget](#editing-the-deployment-budget)) |
 | `ACCOUNT_ANALYTICS_TOKEN` | Secret: a read-only account analytics token; with `ACCOUNT_ID`, turns the account-usage stop on |

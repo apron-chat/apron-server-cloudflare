@@ -16,6 +16,7 @@ import { IMAGE_TYPES, sniffImage } from "./image";
 import { isEmojiKey, MAX_EMOJI_NAME_CHARS } from "./emoji";
 import { limitData } from "./store-error";
 import { signUploadToken, verifyUploadToken } from "./upload-token";
+import { EMAIL_LINK_TOKEN_PREFIX, emailCode, emailLink, emailMessage, isEmailCode, normalizeEmail, validEmailState, type EmailPurpose } from "./email";
 import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
 import { extractClientIp, hashIpKey, hashIpv6PrefixKey, stripForwardingHeaders } from "./ip";
 import {
@@ -171,6 +172,11 @@ interface ConnectionAttachment {
 	 */
 	credential?: string;
 	challenge?: ChallengeRecord;
+	/**
+	 * The key of this connection's pending email proposal (§4.11.1): a new
+	 * proposal replaces it, and only this connection may type its code.
+	 */
+	emailProposal?: string;
 	/** When the connection was accepted, which a connection that never pings is judged stale from (staleAfter). */
 	openedAt?: number;
 	authDeadline: number;
@@ -502,6 +508,7 @@ function roomServerDescription(description: string | undefined): string | undefi
 const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audience: "everyone" | "registered" | "owners" | "admins"; roles?: readonly string[] }> = [
 	{ name: "admin", usage: "/admin [remove] <user_id>", help: "make a registered user an admin, or no longer one", audience: "admins" },
 	{ name: "avatar", usage: "/avatar", help: "set your avatar: send this command with one image attached", audience: "registered" },
+	{ name: "email", usage: "/email [list | remove <address>]", help: "list the email addresses that sign you in, or remove one", audience: "owners" },
 	{ name: "embed-append", usage: "/embed-append [markdown]", help: "get a link to stream text into a message that starts with [markdown], such as an LLM's reply: the message appears when the stream starts", audience: "everyone" },
 	{ name: "embed-terminal", usage: "/embed-terminal [title]", help: "get a link to stream a terminal (80×40) into this room, such as a build: the message appears when the stream starts", audience: "everyone" },
 	{ name: "emoji", usage: "/emoji add|remove :name:", help: "add a custom emoji, or replace its image: send /emoji add :name: with one image attached; /emoji remove :name: removes it", audience: "owners", roles: EMOJI_ROLES },
@@ -509,7 +516,7 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "invite-bot", usage: "/invite-bot", help: "get a sign-in token for your bot; a new one replaces the last", audience: "owners" },
 	{ name: "invite-code", usage: "/invite-code <uses>", help: `get a token that signs up to <uses> new users (at most ${MAX_JOIN_USES}) for a week, replacing the last one; /invite-code 0 revokes it`, audience: "admins" },
 	{ name: "invite-device", usage: "/invite-device list|add|remove [<id>]", help: "list, get or revoke tokens that sign in as you on another device", audience: "owners" },
-	{ name: "invite-purge", usage: "/invite-purge <user_id>", help: "sign a user out everywhere, remove their passkeys and tokens, and get a new token for them", audience: "admins" },
+	{ name: "invite-purge", usage: "/invite-purge <user_id>", help: "sign a user out everywhere, remove their passkeys, tokens and email addresses, and get a new token for them", audience: "admins" },
 	{ name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", audience: "admins" },
 	{ name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", audience: "admins" },
 	{ name: "passkeys", usage: "/passkeys [remove <n>]", help: "list your account's passkeys, or remove one of them", audience: "owners" },
@@ -561,6 +568,17 @@ const DEVICE_TOKEN_PREFIX = "apron_device_";
 const DEVICE_TOKEN_KEY_PREFIX = "device-token:";
 const DEVICES_KEY_PREFIX = "devices:";
 /** A device id: 1 to 32 letters, digits, `_`, `.` or `-`, starting with a letter or digit. */
+/**
+ * Email sign-in (§4.11): who holds an address, under the SHA-256 of the
+ * address; each user's addresses; and pending proposals, under the SHA-256
+ * of the link token each emailed.
+ */
+const EMAIL_KEY_PREFIX = "email:";
+const EMAILS_KEY_PREFIX = "emails:";
+const EMAIL_PROPOSAL_KEY_PREFIX = "email-proposal:";
+const EMAIL_PROPOSAL_KEY_PATTERN = /^email-proposal:[0-9a-f]{64}$/;
+/** Addresses an account's storage is metered for when its addresses are moved or removed: the bound validateEmailPolicy allows. */
+const MAX_EMAILS_PER_USER = 10;
 const DEVICE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$/;
 /** A credential's storage key, as a connection keeps it (ConnectionAttachment.credential): its prefix and a SHA-256. */
 const CREDENTIAL_KEY_PATTERN = /^(session|bot-token|invite-token|device-token):[0-9a-f]{64}$/;
@@ -589,6 +607,12 @@ interface StoredSession {
 	 * issued before this was stored have none.
 	 */
 	handle?: string;
+	/**
+	 * `email` for a session an email sign-in issued (§4.11.3): it resumes on
+	 * the origin it was issued to, or with none where none was sent, rather
+	 * than only on a passkey origin.
+	 */
+	via?: "email";
 }
 
 /**
@@ -655,6 +679,70 @@ interface StoredAuthReset {
 interface StoredDevices {
 	v: 1;
 	devices: Array<{ name: string; tokenKey: string }>;
+}
+
+/**
+ * Who holds an address (§4.11), under EMAIL_KEY_PREFIX and the SHA-256 of
+ * the address as normalizeEmail spells it. The address itself is kept, for
+ * `/email` and for mail the server may send later.
+ */
+interface StoredEmail {
+	v: 1;
+	userId: string;
+	address: string;
+	addedMs: number;
+}
+
+/** A user's addresses, under EMAILS_KEY_PREFIX, oldest first, each with its StoredEmail key. */
+interface StoredEmails {
+	v: 1;
+	emails: Array<{ address: string; key: string; addedMs: number }>;
+}
+
+/**
+ * A pending email proposal (§4.11.1), under EMAIL_PROPOSAL_KEY_PREFIX and
+ * the SHA-256 of the link token it emailed: the connection that made it
+ * (the only one its code works on), the address, the SHA-256 of the code,
+ * failed attempts so far, and, for an addition, the account it adds to.
+ * Shaped like a session (`v`, `expiresMs`), so the session expiry sweep
+ * deletes it once it expires.
+ */
+interface StoredEmailProposal {
+	v: 1;
+	expiresMs: number;
+	connId: string;
+	address: string;
+	code: string;
+	failures: number;
+	state?: string;
+	/** The display name a sign-up asked for. */
+	name?: string;
+	adds?: string;
+	/**
+	 * The guest (`guest_<n>`) whose connection proposed: a registration,
+	 * approved only on that connection, which becomes the new account.
+	 */
+	guest?: string;
+}
+
+/**
+ * An address as text in a CommonMark notice: the characters that start
+ * inline markup (emphasis, code, links, autolinks, HTML, tables) escaped, so
+ * a local part with `*`, `_` or a backtick shows as typed.
+ */
+function markdownAddress(address: string): string {
+	return address.replace(/[\\`*_[\]<>~|]/g, (char) => `\\${char}`);
+}
+
+/** A stored address list, type-checked: none when absent or malformed. */
+function storedEmails(value: StoredEmails | undefined): StoredEmails["emails"] {
+	if (value?.v !== 1 || !Array.isArray(value.emails)) return [];
+	return value.emails.filter((entry) => !!entry && typeof entry.address === "string" && typeof entry.key === "string" && entry.key.startsWith(EMAIL_KEY_PREFIX));
+}
+
+function storedEmailProposal(value: StoredEmailProposal | undefined): StoredEmailProposal | null {
+	if (value?.v !== 1 || !Number.isSafeInteger(value.expiresMs) || typeof value.connId !== "string" || typeof value.address !== "string" || typeof value.code !== "string") return null;
+	return { ...value, failures: Number.isSafeInteger(value.failures) ? value.failures : 0 };
 }
 
 /**
@@ -804,7 +892,9 @@ function botName(owner: string, limits: { maxNameCodePoints: number; maxNameByte
 function sessionExpiryKey(expiresMs: number, sessionKeyValue: string): string {
 	// Date.now() plus the configured lifetime is well below 16 decimal digits;
 	// the fixed width keeps lexicographic KV listing ordered by expiry.
-	return `${SESSION_EXPIRY_PREFIX}${Math.max(0, Math.trunc(expiresMs)).toString().padStart(16, "0")}:${sessionKeyValue.slice(SESSION_KEY_PREFIX.length)}`;
+	// A session's entry names its digest; an email proposal's (same shape, same sweep) its whole key.
+	const named = sessionKeyValue.startsWith(SESSION_KEY_PREFIX) ? sessionKeyValue.slice(SESSION_KEY_PREFIX.length) : sessionKeyValue;
+	return `${SESSION_EXPIRY_PREFIX}${Math.max(0, Math.trunc(expiresMs)).toString().padStart(16, "0")}:${named}`;
 }
 
 function nowMs(): number {
@@ -930,6 +1020,7 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			...(typeof attachment.endpoint === "string" && attachment.endpoint.length <= MAX_ENDPOINT_CHARS ? { endpoint: attachment.endpoint } : {}),
 			...(typeof attachment.credential === "string" && CREDENTIAL_KEY_PATTERN.test(attachment.credential) ? { credential: attachment.credential } : {}),
 			...(challenge ? { challenge } : {}),
+			...(typeof attachment.emailProposal === "string" && EMAIL_PROPOSAL_KEY_PATTERN.test(attachment.emailProposal) ? { emailProposal: attachment.emailProposal } : {}),
 			...(Array.isArray(attachment.rooms) ? {
 				rooms: attachment.rooms.filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 64).slice(0, MAX_ATTACHED_ROOMS),
 			} : {}),
@@ -2707,15 +2798,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 					...(emoji ? ["ext:emoji"] : []),
 				],
 				// Passkeys and their session tokens only where passkeys are offered;
-				// bot tokens (`/invite-bot`) from anywhere, since bots are not browsers.
-				// No `email` (the demo has no way to send mail) and no `external`
-				// (no sign-in page).
-				auth: this.passkeysOffered(origin) ? ["webauthn", "token", "guest"] : ["token", "guest"],
-				// Schemes that create an account (§3.2): a passkey registration, and
-				// a token only as an admin's sign-up invite (`/invite-code`); other tokens
-				// sign in to existing users. A guest is a throwaway identity for one
-				// connection, not an account, so `guest` is listed only in `auth`.
-				signup: this.passkeysOffered(origin) ? ["webauthn", "token"] : ["token"],
+				// email sign-in (§4.11) wherever the deployment has a sender, since a
+				// code or a link works in any client; bot tokens (`/invite-bot`) from
+				// anywhere, since bots are not browsers. No `external` (no sign-in page).
+				auth: [...(this.passkeysOffered(origin) ? ["webauthn"] : []), ...(this.config.email ? ["email"] : []), "token", "guest"],
+				// Schemes that create an account (§3.2): a passkey registration, an
+				// email sign-in for an address no account holds, and a token only as
+				// an admin's sign-up invite (`/invite-code`); other tokens sign in to
+				// existing users. A guest is a throwaway identity for one connection,
+				// not an account, so `guest` is listed only in `auth`.
+				signup: [...(this.passkeysOffered(origin) ? ["webauthn"] : []), ...(this.config.email ? ["email"] : []), "token"],
 				// For the sign-in screen (§3.2); the `~private` welcome below goes in a room.
 				welcome: general ?? this.signInWelcome(origin),
 				// What the server is, for lists of servers (§3.1): what admins set
@@ -2839,8 +2931,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const signIn = this.passkeysOffered(origin)
 			? "**Create a passkey** to post, react, and start threads; it signs you in on your next visit too."
 			: "Passkeys work on the demo's own site; here, sign in with a bot token from `/invite-bot` there, or an invite token from an admin.";
+		const email = this.config.email ? " Or **sign in with email**: you get a code, and a new address gets a new account." : "";
 		const invites = "An admin's invite token also creates an account; add a passkey once you're in, so you can sign in again without it.";
-		return `**Apron public demo.** ${guests} ${signIn} ${invites} Bots sign in with a token their owner gets from \`/invite-bot\`. ${history}`;
+		return `**Apron public demo.** ${guests} ${signIn}${email} ${invites} Bots sign in with a token their owner gets from \`/invite-bot\`. ${history}`;
 	}
 
 	/** The `~private` welcome, after the `server` frame; where guests only read, it says so (Appendix B). */
@@ -3150,13 +3243,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		// Before an attempt is charged: a scheme the spec does not define (such
 		// as an `ext:` name) is `invalid_params` (§1), and one it defines that
-		// this server does not offer the connection, `email` (no mail here),
-		// `external` (no sign-in page), or `webauthn` from an origin not
-		// configured for passkeys, is `unsupported` (§3.2).
+		// this server does not offer the connection, `email` where the
+		// deployment has no sender, `external` (no sign-in page), or `webauthn`
+		// from an origin not configured for passkeys, is `unsupported` (§3.2).
 		const offered = request.params.scheme;
 		if (typeof offered === "string") {
 			if (!DEFINED_AUTH_SCHEMES.has(offered)) throw { name: "invalid_params", message: "Unknown authentication scheme" } satisfies ProtocolError;
-			if (offered === "email") throw { name: "unsupported", message: "Email sign-in is not offered" } satisfies ProtocolError;
+			if (offered === "email" && !this.config.email) throw { name: "unsupported", message: "Email sign-in is not offered" } satisfies ProtocolError;
 			if (offered === "external") throw { name: "unsupported", message: "External sign-in is not offered" } satisfies ProtocolError;
 			if (offered === "webauthn" && !this.passkeysOffered(this.requestOrigin(socket))) throw { name: "unsupported", message: "Passkeys are not offered to this origin" } satisfies ProtocolError;
 		}
@@ -3191,7 +3284,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 			else if (token.startsWith(INVITE_TOKEN_PREFIX)) await this.handleInviteToken(socket, attachment, request, token);
 			else if (token.startsWith(DEVICE_TOKEN_PREFIX)) await this.handleDeviceToken(socket, attachment, request, token);
 			else if (token.startsWith(JOIN_TOKEN_PREFIX)) await this.handleJoinToken(socket, attachment, request, token);
+			// An email link's token, or a code typed for this connection's
+			// proposal, approves it with `token` as with `email` (§4.11.3).
+			else if (this.config.email && (token.startsWith(EMAIL_LINK_TOKEN_PREFIX) || isEmailCode(token))) await this.handleEmailApproval(socket, attachment, request, token);
 			else await this.handleTokenResume(socket, attachment, request);
+			return;
+		}
+		if (scheme === "email") {
+			const token = optionalString(params, "token");
+			if (token !== undefined) await this.handleEmailApproval(socket, attachment, request, token);
+			else await this.handleEmailProposal(socket, attachment, request);
 			return;
 		}
 		if (scheme !== "webauthn") throw { name: "invalid_params", message: "Unknown authentication scheme" } satisfies ProtocolError;
@@ -3419,14 +3521,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async handleTokenResumeLocked(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		if (attachment.tier === "registered") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
 		const origin = this.requestOrigin(socket);
-		if (!origin || !this.config.rpOrigins.includes(origin)) throw { name: "denied", message: "Frontend origin is not configured for passkeys" } satisfies ProtocolError;
+		// Only email sessions resume elsewhere than a passkey origin, so without email there is nothing to look up.
+		if (!this.config.email && (!origin || !this.config.rpOrigins.includes(origin))) throw { name: "denied", message: "Frontend origin is not configured for passkeys" } satisfies ProtocolError;
 		const token = requiredString(request.params, "token");
 		if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "too_large", message: "token is too long" } satisfies ProtocolError;
 		const key = await sessionKey(token);
 		const session = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredSession>(key));
 		const now = nowMs();
-		const expired = { name: "denied", message: "Session expired; sign in with your passkey" } satisfies ProtocolError;
-		if (!session || session.v !== 1 || session.origin !== origin || session.expiresMs <= now) {
+		const expired = { name: "denied", message: session?.via === "email" ? "Session expired; sign in with your email again" : "Session expired; sign in with your passkey" } satisfies ProtocolError;
+		// A passkey session resumes on its passkey origin; an email session on
+		// the origin it was issued to, or with no Origin where it had none.
+		const bound = !!session && (session.via === "email"
+			? session.origin === (origin ?? "")
+			: !!origin && this.config.rpOrigins.includes(origin) && session.origin === origin);
+		if (!session || session.v !== 1 || !bound || session.expiresMs <= now) {
 			if (session && session.expiresMs <= now) {
 				await this.store.withMeterAsync("foreground", { writes: 1 }, () => this.ctx.storage.delete(key));
 			}
@@ -3576,6 +3684,377 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!identity) throw { name: "internal_error", message: "Admin user is missing" } satisfies ProtocolError;
 			await this.signInKeyless(socket, attachment, request, identity);
 		});
+	}
+
+	/**
+	 * The server's name in its emails: what an admin set with `/server
+	 * title`, else SERVER_TITLE, else RP_NAME.
+	 */
+	private emailServerName(): string {
+		return { ...this.config.server, ...this.storedServerMetadata() }.title ?? this.config.rpName;
+	}
+
+	/**
+	 * Sends one email through the `EMAIL` binding (Cloudflare Email Service).
+	 * A method of its own so the tests can stand in for the mail service.
+	 */
+	private async deliverEmail(to: string, message: { subject: string; text: string }): Promise<void> {
+		const binding = this.runtimeEnv.EMAIL;
+		const email = this.config.email;
+		if (!binding || !email) throw new Error("email is not configured");
+		await binding.send({ to, from: { email: email.from, name: this.emailServerName() }, subject: message.subject, text: message.text });
+	}
+
+	/**
+	 * An email proposal (§4.11.1, §4.11.4): `auth` with `scheme: "email"`,
+	 * `email` and no `token`. On a connection signed in to an account it
+	 * proposes adding the address to that account. On a guest's it proposes
+	 * registering: a new account holding the address, which the guest
+	 * becomes; for an address an account already holds, the email says to
+	 * sign in instead and carries no code. On a connection not signed in it
+	 * proposes signing in, or signing up when no account holds the address.
+	 * The result is `{}` either way. It emails a six-digit code that works
+	 * only on this connection and, when the proposal carries `state`, a link
+	 * whose token works wherever the proposal approves (a guest's: only on
+	 * its own connection), both for `proposalSeconds`. A new proposal
+	 * replaces the connection's last. Each email is charged to the IP, the
+	 * address and the server (Store.chargeEmailSend), and past any of those
+	 * the proposal is `retry_after` and sends nothing.
+	 */
+	private async handleEmailProposal(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
+		const email = this.config.email!;
+		const params = request.params;
+		if (params.email === undefined) throw { name: "invalid_params", message: "email is required, or token to approve a proposal" } satisfies ProtocolError;
+		const address = normalizeEmail(optionalString(params, "email"));
+		if (!address) throw { name: "invalid_params", message: "email must be an email address, such as ada@example.com" } satisfies ProtocolError;
+		const state = optionalString(params, "state");
+		if (state !== undefined && !validEmailState(state)) throw { name: "invalid_params", message: "state must be 1 to 256 printable ASCII characters" } satisfies ProtocolError;
+		const adds = attachment.tier === "registered" ? attachment.userId! : undefined;
+		// A guest's proposal is a registration (§4.11.1: it adds to the guest),
+		// approved on its own connection only.
+		const guest = attachment.tier === "anonymous" ? attachment.userId : undefined;
+		if (adds && hasRole(attachment, "bot")) throw { name: "denied", message: "A bot signs in with its token and takes no email address" } satisfies ProtocolError;
+		// An address would outlive the token: deleting APRON_ADMIN_TOKEN must turn `admin` off.
+		if (adds === ADMIN_USER_ID) throw { name: "denied", message: "The admin user signs in with APRON_ADMIN_TOKEN only; make your own account an admin with /admin" } satisfies ProtocolError;
+		const name = adds ? undefined : this.requestedName(params);
+		const digest = await sha256Hex(address);
+		const addressKey = EMAIL_KEY_PREFIX + digest;
+		const token = EMAIL_LINK_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+		const key = EMAIL_PROPOSAL_KEY_PREFIX + await sha256Hex(token);
+		const code = emailCode();
+		const codeDigest = await sha256Hex(code);
+		const purpose = await this.withSessionLock(async (): Promise<EmailPurpose | null> => {
+			const now = nowMs();
+			const owner = await this.store.withMeterAsync("foreground", { reads: 1 }, async () => {
+				const stored = await this.ctx.storage.get<StoredEmail>(addressKey);
+				return stored?.v === 1 && typeof stored.userId === "string" && this.store.identityExists(stored.userId) ? stored.userId : null;
+			});
+			const previous = connectionAttachment(socket)?.emailProposal;
+			// Already this account's: nothing to send, and nobody else learns
+			// anything from it; it still replaces the connection's proposal (§4.11.1).
+			if (adds && owner === adds) {
+				if (previous) {
+					await this.store.withMeterAsync("foreground", { writes: 1 }, () => this.ctx.storage.delete(previous));
+					delete attachment.emailProposal;
+					writeSessionAttachment(socket, attachment, ["emailProposal"]);
+				}
+				return null;
+			}
+			this.store.chargeEmailSend({ ipKey: attachment.ipKey, addressKey: digest, now, policy: email.policy });
+			// A guest is never switched into an existing account: the email
+			// says so, with no code, and the connection's last proposal goes.
+			if (guest && owner) {
+				if (previous) {
+					await this.store.withMeterAsync("foreground", { writes: 1 }, () => this.ctx.storage.delete(previous));
+					delete attachment.emailProposal;
+					writeSessionAttachment(socket, attachment, ["emailProposal"]);
+				}
+				return { kind: "exists", userId: owner };
+			}
+			const expiresMs = now + email.policy.proposalSeconds * 1_000;
+			await this.store.withMeterAsync("foreground", { writes: 3 }, async () => {
+				if (previous && previous !== key) await this.ctx.storage.delete(previous);
+				// The session sweep deletes the proposal once it expires.
+				await this.ctx.storage.put<SessionExpiryEntry>(sessionExpiryKey(expiresMs, key), { v: 1, sessionKey: key, expiresMs });
+				await this.ctx.storage.put<StoredEmailProposal>(key, {
+					v: 1, expiresMs, connId: attachment.connId, address, code: codeDigest, failures: 0,
+					...(state !== undefined ? { state } : {}), ...(name !== undefined ? { name } : {}), ...(adds ? { adds } : {}), ...(guest ? { guest } : {}),
+				});
+			});
+			attachment.emailProposal = key;
+			// A connection not signed in waits for its code as long as the
+			// proposal lasts, not only the sign-in deadline; each such wait
+			// costs an email, which the limits above bound.
+			const current = connectionAttachment(socket);
+			if (current?.tier === "pending") attachment.authDeadline = Math.max(current.authDeadline, expiresMs);
+			writeSessionAttachment(socket, attachment, current?.tier === "pending" ? ["emailProposal", "authDeadline"] : ["emailProposal"]);
+			// For the email's wording only; approval decides again.
+			return adds ? { kind: "add", userId: adds } : owner ? { kind: "sign-in", userId: owner } : { kind: "sign-up" };
+		});
+		if (purpose) {
+			// A guest's registration approves only on its own connection, so its
+			// link works only once the tab it opens hands the token back to the
+			// one that asked (docs/guide.md, Email sign-in in a client).
+			const link = state !== undefined ? emailLink(email.linkUrl, { server: email.server, token, state }) : undefined;
+			const message = emailMessage({ server: this.emailServerName(), ...(purpose.kind === "exists" ? {} : { code }), ...(link ? { link } : {}), purpose, minutes: Math.max(1, Math.round(email.policy.proposalSeconds / 60)) });
+			try {
+				await this.deliverEmail(address, message);
+			} catch (error) {
+				console.warn(JSON.stringify({ event: "email_send_failed", error: String((error as Error)?.message ?? error).slice(0, 200) }));
+				throw { name: "internal_error", message: "The email could not be sent; try again later" } satisfies ProtocolError;
+			}
+			recordMetric(this.runtimeEnv.METRICS, "email", [purpose.kind]);
+		}
+		this.reply(socket, request, {});
+		await this.rescheduleAlarm();
+	}
+
+	/**
+	 * Approves an email proposal (§4.11.3): `auth` with `token` and `scheme`
+	 * `email` or `token`. A six-digit code works only for this connection's
+	 * own proposal; a link token for its proposal on any connection. A
+	 * wrong code, or a link presented where it cannot be approved, counts
+	 * against the proposal, and `maxFailures` of them cancel it.
+	 *
+	 * - An addition adds the address to the account that proposed it, on a
+	 *   connection signed in to that account only, and returns `{}`; one the
+	 *   account already holds changes nothing, and one another account holds
+	 *   is `denied`.
+	 * - A guest's registration, on that guest's connection only, creates an
+	 *   account holding the address (named as the proposal asked, else as the
+	 *   guest), in the guest's rooms, which the connection becomes, as a
+	 *   passkey registration does.
+	 * - A sign-in, on a connection not signed in at all (not a guest's: a
+	 *   link must not move one into another account, §4.11.3), signs in as
+	 *   the account that holds the address, or signs up a new one holding it
+	 *   (named as the proposal asked, else "Member").
+	 * - Either is charged as a registration when it creates an account. The
+	 *   result carries `you` and a session `token` bound to this connection's
+	 *   origin (none where it sent none), which resumes for
+	 *   `sessionTtlSeconds` like a passkey's.
+	 */
+	private async handleEmailApproval(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, token: string): Promise<void> {
+		const email = this.config.email!;
+		if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "too_large", message: "token is too long" } satisfies ProtocolError;
+		const typed = isEmailCode(token);
+		const invalid = { name: "denied", message: "This code or link is not valid or has expired; ask for a new email" } satisfies ProtocolError;
+		if (!typed && !token.startsWith(EMAIL_LINK_TOKEN_PREFIX)) throw invalid;
+		return this.withSessionLock(async () => {
+			const now = nowMs();
+			// A code works only on the connection that proposed (§4.11.2).
+			const key = typed ? connectionAttachment(socket)?.emailProposal : EMAIL_PROPOSAL_KEY_PREFIX + await sha256Hex(token);
+			if (!key) throw invalid;
+			const proposal = storedEmailProposal(await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredEmailProposal>(key)));
+			const forget = async () => {
+				await this.store.withMeterAsync("foreground", { writes: 1 }, () => this.ctx.storage.delete(key));
+				if (connectionAttachment(socket)?.emailProposal === key) {
+					delete attachment.emailProposal;
+					writeSessionAttachment(socket, attachment, ["emailProposal"]);
+				}
+			};
+			if (!proposal || proposal.expiresMs <= now || proposal.failures >= email.policy.maxFailures) {
+				if (proposal) await forget();
+				throw invalid;
+			}
+			// A failed attempt counts against the proposal, whichever connection
+			// makes it, and the last one allowed cancels it (§4.11.1).
+			const failed = async (error: ProtocolError): Promise<never> => {
+				const failures = proposal.failures + 1;
+				if (failures >= email.policy.maxFailures) {
+					await forget();
+					throw { name: "denied", message: `${error.message}; that was the last try, so ask for a new email` } satisfies ProtocolError;
+				}
+				await this.store.withMeterAsync("foreground", { writes: 1 }, () => this.ctx.storage.put<StoredEmailProposal>(key, { ...proposal, failures }));
+				throw error;
+			};
+			// A code is only looked up through the presenting connection's own
+			// proposal, so one typed elsewhere finds none and is `invalid` above.
+			if (typed && await sha256Hex(token) !== proposal.code) {
+				await failed({ name: "denied", message: "That code is not the one emailed" });
+			}
+			// A guest's registration only on that guest's connection; a sign-in
+			// only on a connection not signed in at all, guests included
+			// (§4.11.3), so no link moves a connection into someone's account.
+			if (proposal.guest) {
+				if (attachment.tier !== "anonymous" || attachment.connId !== proposal.connId || attachment.userId !== proposal.guest) {
+					await failed({ name: "denied", message: "Approve this registration on the guest connection that asked for it" });
+				}
+			} else if (!proposal.adds && attachment.tier !== "pending") {
+				await failed({ name: "denied", message: attachment.tier === "anonymous"
+					? "Sign in to an account on a new connection, not a guest's"
+					: "Identity switching requires reconnect" });
+			}
+			const addressKey = EMAIL_KEY_PREFIX + await sha256Hex(proposal.address);
+			const stored = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredEmail>(addressKey));
+			const holder = stored?.v === 1 && typeof stored.userId === "string" && this.store.identityExists(stored.userId) ? stored.userId : null;
+			if (proposal.adds) {
+				if (attachment.tier !== "registered" || attachment.userId !== proposal.adds) {
+					await failed({ name: "denied", message: "Open this on a connection signed in to the account that asked to add the address" });
+				}
+				if (holder === proposal.adds) {
+					await forget();
+					this.reply(socket, request, {});
+					return;
+				}
+				if (holder) {
+					// It can never be approved now: it is used up.
+					await forget();
+					throw { name: "denied", message: "That address belongs to another account" } satisfies ProtocolError;
+				}
+				const replaced = await this.addEmail(proposal.adds, proposal.address, addressKey, now, email.policy.addressesPerUser);
+				await forget();
+				const instead = replaced.length ? `, replacing ${replaced.map(markdownAddress).join(", ")},` : "";
+				this.tellOthers(proposal.adds, socket, `The email address ${markdownAddress(proposal.address)} was added to your account${instead} from another connection. If it wasn't you, remove it with \`/email remove\` and the address.`);
+				this.reply(socket, request, {});
+				return;
+			}
+			if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
+			if (proposal.guest && holder) {
+				// Taken since the proposal: it can never be approved now.
+				await forget();
+				throw { name: "denied", message: "That address already has an account; sign in with it on a new connection" } satisfies ProtocolError;
+			}
+			let userId = holder;
+			let created = false;
+			if (!userId) {
+				// Sign-up: an address no account holds (§4.11.4: server policy).
+				// A guest's registration is named as it asked, else as the guest,
+				// with a `user_id` from the name it asked for, and keeps the rooms
+				// the guest joined, as a passkey registration does.
+				const current = connectionAttachment(socket) ?? attachment;
+				const name = proposal.name ?? (proposal.guest ? current.name : undefined) ?? JOIN_DEFAULT_NAME;
+				const chosen = candidateUserIdFor(proposal.guest ? proposal.name : name, (candidate) => this.store.userIdTaken(candidate));
+				const rooms = proposal.guest ? current.rooms : undefined;
+				// The whole key-value cost (the proposal's delete, then the address
+				// and its list) is reserved before the account exists, so a budget
+				// refusal cannot strand an account without its address. The
+				// proposal goes first: whatever fails after it, no retry of the
+				// same code or link signs up a second account.
+				await this.store.withMeterAsync("foreground", { writes: 3 }, async () => {
+					await this.ctx.storage.delete(key);
+					// The new user's logged joins reach this connection after its
+					// `auth` result (§3.2); signInKeyless releases them.
+					this.holdDeliveries(socket);
+					await this.runMutation(async () => {
+						const made = this.store.createInvitedIdentity({ userId: chosen, name, now: nowMs(), ipKey: attachment.ipKey, ...(rooms ? { rooms } : {}) });
+						for (const record of made.broadcasts) this.broadcastHeld(socket, record);
+					});
+					// One put, with no await between the account's creation and it.
+					await this.ctx.storage.put({
+						[addressKey]: { v: 1, userId: chosen, address: proposal.address, addedMs: now } satisfies StoredEmail,
+						[EMAILS_KEY_PREFIX + chosen]: { v: 1, emails: [{ address: proposal.address, key: addressKey, addedMs: now }] } satisfies StoredEmails,
+					});
+				});
+				if (connectionAttachment(socket)?.emailProposal === key) {
+					delete attachment.emailProposal;
+					writeSessionAttachment(socket, attachment, ["emailProposal"]);
+				}
+				userId = chosen;
+				created = true;
+			} else {
+				// An account at its connection limit refuses before the proposal is used up.
+				this.assertRegisteredCapacity(socket, userId);
+				// Approval uses the proposal up (§4.11.1).
+				await forget();
+			}
+			const identity = this.store.getIdentity(userId);
+			if (!identity) throw { name: "internal_error", message: "The account is missing" } satisfies ProtocolError;
+			// Every session carries its account's user handle, which `/invite-purge` clears to end them.
+			const handle = identity.userHandle || this.store.ensureUserHandle(userId, bytesToBase64Url(crypto.getRandomValues(new Uint8Array(16))), nowMs()) || undefined;
+			const session = await this.issueSessionLocked(userId, this.requestOrigin(socket) ?? "", nowMs(), handle, "email");
+			await this.signInKeyless(socket, attachment, request, identity, session, created, await sessionKey(session));
+		});
+	}
+
+	/**
+	 * Records that `userId` holds `address` (under `addressKey`), in its list
+	 * too. An account at `cap` gives up its oldest addresses for it: the
+	 * approval proved the new one, so an account with one address changes it
+	 * in one step. Returns the addresses replaced. Called with the session
+	 * lock held.
+	 */
+	private async addEmail(userId: string, address: string, addressKey: string, now: number, cap: number): Promise<string[]> {
+		return this.store.withMeterAsync("foreground", { reads: 1 + MAX_EMAILS_PER_USER, writes: 2 + MAX_EMAILS_PER_USER }, async () => {
+			const listKey = EMAILS_KEY_PREFIX + userId;
+			const held = storedEmails(await this.ctx.storage.get<StoredEmails>(listKey)).filter((entry) => entry.key !== addressKey).slice(-MAX_EMAILS_PER_USER);
+			const dropped = held.slice(0, Math.max(0, held.length - cap + 1));
+			const kept = held.slice(dropped.length);
+			if (dropped.length) {
+				const stored = await this.ctx.storage.get<StoredEmail>(dropped.map((entry) => entry.key));
+				const owned = dropped.filter((entry) => stored.get(entry.key)?.userId === userId).map((entry) => entry.key);
+				if (owned.length) await this.ctx.storage.delete(owned);
+			}
+			await this.ctx.storage.put({
+				[addressKey]: { v: 1, userId, address, addedMs: now } satisfies StoredEmail,
+				[listKey]: { v: 1, emails: [...kept, { address, key: addressKey, addedMs: now }] } satisfies StoredEmails,
+			});
+			return dropped.map((entry) => entry.address);
+		});
+	}
+
+	/** A `~private` notice to `userId`'s connections but `except`, such as of a change to how they sign in. */
+	private tellOthers(userId: string, except: WebSocketConnection, text: string): void {
+		for (const peer of this.connectionsOf(userId, except)) {
+			this.deliverTo(peer, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text, format: "markdown" } } });
+		}
+	}
+
+	/**
+	 * `/email`: the sender's email addresses, oldest first, in a `~private`
+	 * notice before the result (§1); `/email remove <address>` removes one,
+	 * so it no longer signs in or recovers the account. Sessions it signed in
+	 * stay; `/invite-purge` ends those.
+	 */
+	private async emailCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, words: readonly string[]): Promise<void> {
+		const userId = attachment.userId!;
+		const listKey = EMAILS_KEY_PREFIX + userId;
+		if (words.length === 1 || (words.length === 2 && words[1] === "list")) {
+			const held = await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1 }, async () => storedEmails(await this.ctx.storage.get<StoredEmails>(listKey))));
+			const how = this.config.email ? "Add one by signing in with email on this connection." : "This server doesn't offer email sign-in now.";
+			this.sendNotice(socket, roomId, held.length
+				? ["Your email addresses, which sign you in and recover your account:", ...held.map((entry) => `- ${markdownAddress(entry.address)}, added ${utcDay(entry.addedMs)}`)].join("\n")
+				: `You have no email addresses. ${how}`);
+			this.reply(socket, request, {});
+			return;
+		}
+		const address = words.length === 3 && words[1] === "remove" ? normalizeEmail(words[2]) : null;
+		if (!address) throw { name: "invalid_params", message: "Usage: /email [list | remove <address>]" } satisfies ProtocolError;
+		const addressKey = EMAIL_KEY_PREFIX + await sha256Hex(address);
+		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 4, writes: 2 }, async () => {
+			const held = storedEmails(await this.ctx.storage.get<StoredEmails>(listKey));
+			if (!held.some((entry) => entry.key === addressKey)) throw { name: "invalid_params", message: `${address} is not one of your email addresses; /email lists them` } satisfies ProtocolError;
+			const rest = held.filter((entry) => entry.key !== addressKey);
+			// The last address of an account with no passkey or token is its only
+			// way back in once its sessions end, as `/passkeys` keeps a last passkey.
+			if (!rest.length && !this.store.credentialIdsForUser(userId).length) {
+				const invite = await this.ctx.storage.get<StoredBot>(INVITE_KEY_PREFIX + userId);
+				const devices = storedDevices(await this.ctx.storage.get<StoredDevices>(DEVICES_KEY_PREFIX + userId));
+				if (invite?.v !== 1 && !devices.length) {
+					throw { name: "denied", message: "That address is your only way to sign in again; add a passkey or another address first" } satisfies ProtocolError;
+				}
+			}
+			const stored = await this.ctx.storage.get<StoredEmail>(addressKey);
+			if (stored?.userId === userId) await this.ctx.storage.delete(addressKey);
+			if (rest.length) await this.ctx.storage.put<StoredEmails>(listKey, { v: 1, emails: rest });
+			else await this.ctx.storage.delete(listKey);
+		}));
+		this.tellOthers(userId, socket, `The email address ${markdownAddress(address)} was removed from your account from another connection.`);
+		this.sendNotice(socket, roomId, `Removed ${markdownAddress(address)}: it no longer signs you in.`);
+		this.reply(socket, request, {});
+	}
+
+	/** After `/rename`, points the user's email addresses, if any, at the new `user_id`. */
+	private async moveEmails(from: string, to: string): Promise<void> {
+		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { reads: 1, writes: MAX_EMAILS_PER_USER + 2 }, async () => {
+			const held = storedEmails(await this.ctx.storage.get<StoredEmails>(EMAILS_KEY_PREFIX + from));
+			if (!held.length) return;
+			// One put: the addresses never name `to` without its list naming them.
+			await this.ctx.storage.put({
+				...Object.fromEntries(held.map((entry) => [entry.key, { v: 1, userId: to, address: entry.address, addedMs: entry.addedMs } satisfies StoredEmail])),
+				[EMAILS_KEY_PREFIX + to]: { v: 1, emails: held } satisfies StoredEmails,
+			});
+			await this.ctx.storage.delete(EMAILS_KEY_PREFIX + from);
+		}));
 	}
 
 	/**
@@ -3738,7 +4217,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return this.withSessionLock(() => this.issueSessionLocked(userId, origin, now, handle));
 	}
 
-	private async issueSessionLocked(userId: string, origin: string, now: number, given: string | undefined): Promise<string> {
+	private async issueSessionLocked(userId: string, origin: string, now: number, given: string | undefined, via?: "email"): Promise<string> {
 		// Every session carries its account's handle (a caller that has none at hand gets the stored one).
 		const handle = given ?? this.store.getIdentity(userId)?.userHandle;
 		const token = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
@@ -3746,7 +4225,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const expiresMs = now + this.config.limits.sessionTtlSeconds * 1_000;
 		await this.store.withMeterAsync("foreground", { writes: 2 }, async () => {
 			await this.ctx.storage.put<SessionExpiryEntry>(sessionExpiryKey(expiresMs, key), { v: 1, sessionKey: key, expiresMs });
-			await this.ctx.storage.put<StoredSession>(key, { v: 1, userId, origin, expiresMs, ...(handle ? { handle } : {}) });
+			await this.ctx.storage.put<StoredSession>(key, { v: 1, userId, origin, expiresMs, ...(handle ? { handle } : {}), ...(via ? { via } : {}) });
 		});
 		return token;
 	}
@@ -6314,6 +6793,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 			return;
 		}
+		if (command.name === "email") {
+			try {
+				await this.emailCommand(socket, attachment, request, roomId, words);
+			} catch (error) {
+				const protocol = errorToProtocol(error);
+				if (protocol.name !== "invalid_params") throw error;
+				this.fail(socket, request, protocol);
+			}
+			return;
+		}
 		if (command.name === "avatar") {
 			await this.startAvatar(socket, attachment, request, body);
 			return;
@@ -7250,10 +7739,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		} catch { /* the token is refused all the same */ }
 	}
 
-	/** Revokes bot, invite and device tokens, so purged users cannot sign in again; upkeep charges it as maintenance. */
+	/**
+	 * Revokes bot, invite and device tokens and forgets email addresses, so
+	 * purged users cannot sign in again and their addresses may sign up
+	 * anew; upkeep charges it as maintenance.
+	 */
 	private async forgetTokens(userIds: readonly string[], kind: "foreground" | "maintenance" = "foreground"): Promise<void> {
 		if (!userIds.length) return;
-		await this.withSessionLock(() => this.store.withMeterAsync(kind, { reads: 3 * userIds.length, writes: (5 + MAX_DEVICE_TOKENS) * userIds.length }, async () => {
+		await this.withSessionLock(() => this.store.withMeterAsync(kind, { reads: (4 + MAX_EMAILS_PER_USER) * userIds.length, writes: (6 + MAX_DEVICE_TOKENS + MAX_EMAILS_PER_USER) * userIds.length }, async () => {
 			for (const userId of userIds) {
 				for (const pointer of [BOT_KEY_PREFIX + userId, INVITE_KEY_PREFIX + userId]) {
 					const stored = await this.ctx.storage.get<StoredBot>(pointer);
@@ -7261,12 +7754,28 @@ export class ApronDemoServer extends DurableObject<Env> {
 					await this.ctx.storage.delete(stored.tokenKey);
 					await this.ctx.storage.delete(pointer);
 				}
+				await this.forgetEmailsLocked(userId);
 				const devices = storedDevices(await this.ctx.storage.get<StoredDevices>(DEVICES_KEY_PREFIX + userId));
 				if (!devices.length) continue;
 				await this.ctx.storage.delete(devices.map((device) => device.tokenKey));
 				await this.ctx.storage.delete(DEVICES_KEY_PREFIX + userId);
 			}
 		}));
+	}
+
+	/**
+	 * Deletes a user's email addresses (and their list), each only while it
+	 * still names the user, so an address another account took since stays
+	 * theirs. Called with the session lock held, inside the caller's meter:
+	 * at most 1 + MAX_EMAILS_PER_USER reads and as many writes.
+	 */
+	private async forgetEmailsLocked(userId: string): Promise<void> {
+		const listKey = EMAILS_KEY_PREFIX + userId;
+		const held = storedEmails(await this.ctx.storage.get<StoredEmails>(listKey)).slice(0, MAX_EMAILS_PER_USER);
+		if (!held.length) return;
+		const stored = await this.ctx.storage.get<StoredEmail>(held.map((entry) => entry.key));
+		const owned = held.filter((entry) => stored.get(entry.key)?.userId === userId).map((entry) => entry.key);
+		await this.ctx.storage.delete([...owned, listKey]);
 	}
 
 	/**
@@ -7303,8 +7812,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * `/invite-purge <user_id>` (a leading `@` is allowed): takes away every
-	 * way a registered user signs in (their passkeys, passkey sessions,
-	 * device tokens and invite token), closes their connections, deletes
+	 * way a registered user signs in (their passkeys, sessions, device
+	 * tokens, invite token and email addresses), closes their connections, deletes
 	 * their push registrations, and mints them a new invite token, which the
 	 * sender gets in a `~private` notice before the result (§1), as
 	 * `/invite-token` gives it. Their account, posts and bot stay. Not the
@@ -7326,7 +7835,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 				const now = nowMs();
 				// The tokens first: a failure after them leaves no way in but the
 				// passkeys, which the admin's next try removes.
-				await this.store.withMeterAsync("foreground", { reads: 2, writes: MAX_DEVICE_TOKENS + 5 }, async () => {
+				await this.store.withMeterAsync("foreground", { reads: 3 + MAX_EMAILS_PER_USER, writes: MAX_DEVICE_TOKENS + MAX_EMAILS_PER_USER + 6 }, async () => {
+					// An address someone else added would sign them back in.
+					await this.forgetEmailsLocked(userId);
 					const invite = await this.ctx.storage.get<StoredBot>(INVITE_KEY_PREFIX + userId);
 					const devices = storedDevices(await this.ctx.storage.get<StoredDevices>(DEVICES_KEY_PREFIX + userId));
 					const revoked = [...(invite?.v === 1 && typeof invite.tokenKey === "string" ? [invite.tokenKey] : []), ...devices.map((device) => device.tokenKey)];
@@ -7349,7 +7860,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (this.config.push) this.store.clearPushSubscriptions(userId, nowMs());
 		this.sendNotice(socket, roomId, [
-			`Signed \`${userId}\` out everywhere and removed ${passkeys} passkey${passkeys === 1 ? "" : "s"} and every token they had. This new token signs in as them; it does not expire, and anyone who has it signs in as \`${userId}\`, so hand it over privately.`,
+			`Signed \`${userId}\` out everywhere and removed ${passkeys} passkey${passkeys === 1 ? "" : "s"} and every token and email address they had. This new token signs in as them; it does not expire, and anyone who has it signs in as \`${userId}\`, so hand it over privately.`,
 			"```\n" + token + "\n```",
 			...this.tokenLink(socket, token, "Or send them this link, which signs them in with any Apron app", attachment.endpoint),
 			`To sign in, authenticate with the token scheme: \`{"method": "auth", "params": {"scheme": "token", "token": "${token}"}}\``,
@@ -7601,6 +8112,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.moveUserState(from, to);
 		await this.moveInviteToken(from, to);
 		await this.moveDeviceTokens(from, to);
+		await this.moveEmails(from, to);
 		// Clients keep nothing yet for the new `user_id`, so the object carries
 		// every profile field (§3.3), not only the one that changed.
 		const identity = { user_id: to, ...(renamed.name ? { name: renamed.name } : {}), ...(renamed.avatar ? { avatar: renamed.avatar } : {}), roles: renamed.roles, ...(renamed.ext ? { ext: renamed.ext } : {}) };

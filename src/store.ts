@@ -4424,6 +4424,29 @@ export class Store {
   }
 
   /**
+   * Charges one sign-in email (protocol §4.11.4) to the proposing IP, to the
+   * address (by `addressKey`, its digest), and to the server, each a count
+   * for the UTC day, or none when any is full: `retry_after` until the day
+   * ends. The IP also may send only one a minute after a burst of three,
+   * so one network cannot spend the server's day at once.
+   */
+  chargeEmailSend(input: { ipKey: string; addressKey: string; now: number; policy: { sendsPerDay: number; sendsPerIpDay: number; sendsPerAddressDay: number } }): void {
+    this.ensureReady();
+    const { policy } = input;
+    this.reserved({ reads: 32, writes: 16 }, false, input.now, () => {
+      const effective = this.effectiveNow(input.now);
+      this.transaction(() => {
+        this.chargeEvent("email", "global", effective, { perMinute: policy.sendsPerDay }, "Sign-in emails are used up for today on this server",
+          { limit: policy.sendsPerDay, message: "Sign-in emails are used up for today on this server" });
+        this.chargeEvent("email", `ip:${input.ipKey}`, effective, { perMinute: 1, burst: 3 }, "Sign-in emails limited; wait a minute",
+          { limit: policy.sendsPerIpDay, message: "Sign-in emails limited for this network today" });
+        this.chargeEvent("email", `address:${input.addressKey}`, effective, { perMinute: policy.sendsPerAddressDay }, "No more sign-in emails to this address today",
+          { limit: policy.sendsPerAddressDay, message: "No more sign-in emails to this address today" });
+      });
+    });
+  }
+
+  /**
    * Durably reserve the next `count` guest numbers and return them as the
    * half-open range [first, limit). The stored high-water mark advances by
    * `count` in one write, so numbers handed out from the range are never
@@ -5101,9 +5124,10 @@ export class Store {
    * `/invite-token`: a registered user with no passkey, who signs in with a
    * bearer token an admin hands out. The `user_id` must be free: no identity
    * has it and `/rename` never retired it. Charged as a registration, and
-   * starts in `general` like any other identity.
+   * starts in `general` like any other identity, or in the given `rooms`
+   * that still exist (a guest's it replaces, for an email registration).
    */
-  createInvitedIdentity(input: { userId: string; name: string; now: number; ipKey: string }): { broadcasts: Broadcast[] } {
+  createInvitedIdentity(input: { userId: string; name: string; now: number; ipKey: string; rooms?: readonly string[] }): { broadcasts: Broadcast[] } {
     this.ensureReady();
     if (this.reserved({ reads: 8 }, false, input.now, () => this.idTaken(input.userId))) {
       throw new StoreError("invalid_params", `The user_id ${input.userId} is taken`.slice(0, 200));
@@ -5116,15 +5140,17 @@ export class Store {
    * credential, charged as a registration, and starts it in `general` with a
    * logged membership (§4.2.2) returned in `broadcasts`.
    */
-  private createKeylessIdentity(input: { userId: string; name: string; tier: "bot" | "registered"; roles?: string[]; now: number; ipKey: string }): { broadcasts: Broadcast[] } {
+  private createKeylessIdentity(input: { userId: string; name: string; tier: "bot" | "registered"; roles?: string[]; now: number; ipKey: string; rooms?: readonly string[] }): { broadcasts: Broadcast[] } {
     ensureText(input.name, "name", this.config.maxNameBytes);
     if ([...input.name].length > this.config.maxNameCodePoints) throw new StoreError("too_large", "name is too long");
     this.assertAccounting();
     const beforeReads = this.observed.reads;
     const beforeWrites = this.observed.writes;
     // The limiter and meta rows, the identity row, and one membership row and
-    // logged record in `general`.
-    const reservation = this.reserveCost({ reads: 128, writes: 72, registrations: 1 }, false, input.now);
+    // logged record in each starting room (`general`, or at most the capped
+    // rooms table's, checked against it, as registerIdentity reserves).
+    const starting = input.rooms ? MAX_THREAD_LIMIT + 1 : 1;
+    const reservation = this.reserveCost(input.rooms ? { reads: 128 + 2 * starting, writes: 64 + 8 * starting, registrations: 1 } : { reads: 128, writes: 72, registrations: 1 }, false, input.now);
     // An operator alert creating the admin user it posts as (alert) is not
     // held to the registration cap, limits, or storage high-water.
     const alerting = this.alerting;
@@ -5142,7 +5168,7 @@ export class Store {
         );
         this.adjustCount("identity_count", 1);
         const broadcasts: Broadcast[] = [];
-        const joined = this.existingRooms(DEFAULT_JOINED_ROOMS);
+        const joined = this.existingRooms(input.rooms ?? DEFAULT_JOINED_ROOMS);
         if (joined.length) {
           const state = this.logState();
           const startLogId = state.last_log_id;

@@ -27,7 +27,9 @@ export type MetricEvent =
 	/** The attack pause (ApronDemoServer.pauseForAttack): its trigger (`flood` or `burn`), valued by the hold in minutes. */
 	| "attack"
 	/** A heavy burn of mostly admitted traffic alerted the admins, valued by shadow dollars an hour. */
-	| "burn";
+	| "burn"
+	/** A sign-in email sent (ApronDemoServer.handleEmailProposal): `sign-in`, `sign-up` or `add`. */
+	| "email";
 
 export function recordMetric(dataset: AnalyticsEngineDataset | undefined, event: MetricEvent, details: readonly string[] = [], value = 1): void {
 	if (!dataset) return;

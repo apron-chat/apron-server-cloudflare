@@ -19,7 +19,11 @@ export default defineConfig({
 					LOCATION_ATTEMPTS: { namespace_id: "73007", simple: { limit: 1_000_000, period: 60 } },
 					LIVE_READS: { namespace_id: "73009", simple: { limit: 1_000_000, period: 60 } },
 				},
+				// Email sign-in on, from a stand-in sender: test/email.integration.test.ts
+				// stands in for the mail service, so nothing is sent.
+				email: { send_email: [{ name: "EMAIL" }] },
 				bindings: {
+					EMAIL_FROM: "login@demo.test",
 					GUEST_POSTING: "true",
 					ACTIVITY: "false",
 					MEDIA_ORIGIN: "https://media.test",
