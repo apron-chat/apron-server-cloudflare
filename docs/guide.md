@@ -204,7 +204,8 @@ schemes that create an account (`webauthn` on the demo's own site, `email`
 for an address no account holds, and `token` for an admin's `/invite-code`
 sign-up token, whose `auth` result carries the new user's own token to save).
 
-Email sign-in (protocol §4.11) works in any client: send
+Email sign-in (protocol §4.11) works in any client. To sign in or sign up,
+use a connection that has not signed in, not even as a guest: send
 `{"method": "auth", "params": {"scheme": "email", "email": "ada@example.com", "state": "<random>", "name": "Ada"}}`,
 which answers `{}`, then have the user type the six-digit code from the
 email with `{"scheme": "email", "token": "418092"}` on the same connection.
@@ -215,8 +216,13 @@ With `state`, the email also has a link,
 universal link any client may handle (a deployment's `EMAIL_LINK_URL` may
 replace the page): when its `state` is the one your client
 proposed with, present its token with `scheme: "email"` on any connection
-not signed in; otherwise ask the user first (§4.11.2). On a signed-in
-connection, the same proposal adds the address to the account instead.
+not signed in; otherwise ask the user first (§4.11.2). On a guest's
+connection, the same proposal registers instead: the code (there is no
+link) turns the guest into a new account holding the address, keeping its
+rooms, as a passkey registration does; for an address that already has an
+account, the email tells the user to sign in instead. On a connection
+signed in to an account, the proposal adds the address to it (replacing
+the account's one address).
 See [SPEC section 5, Email](../SPEC.md#email).
 A user who signed up with a token can add a passkey by registering one while
 signed in. `web.apron.chat` additionally receives `webauthn`, and its `token`

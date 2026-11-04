@@ -387,9 +387,15 @@ the code or link (`auth` with `token`, scheme `email` or `token`) signs in
 to the account that holds the address, or creates one for an address none
 holds (charged as a registration, named as the proposal asked, else
 "Member"), and returns a 30-day session token bound to that origin, which
-resumes like a passkey's. A connection already signed in cannot approve a
-sign-in; a guest's can. On a signed-in connection, a proposal instead adds
-the address to the account, approved only on a connection of that account;
+resumes like a passkey's. Only a connection not signed in at all approves a
+sign-in, never a guest's or an account's, so a link cannot move someone
+into another account. A guest instead registers: its proposal creates a
+new account holding the address, approved by the code on that guest
+connection only, which becomes the account and keeps the guest's rooms,
+as a passkey registration does; for an address that already has an
+account, the email says to sign in instead and has no code. On a
+signed-in connection, a proposal instead adds the address to the account,
+approved only on a connection of that account;
 an address another account holds is refused. An account holds one address
 on the demo (`EMAIL_ADDRESSES_PER_USER` allows more), and approving another
 replaces it; `/email` lists it and `/email remove <address>` removes it,

@@ -718,6 +718,11 @@ interface StoredEmailProposal {
 	/** The display name a sign-up asked for. */
 	name?: string;
 	adds?: string;
+	/**
+	 * The guest (`guest_<n>`) whose connection proposed: a registration,
+	 * approved only on that connection, which becomes the new account.
+	 */
+	guest?: string;
 }
 
 /**
@@ -3703,12 +3708,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * An email proposal (§4.11.1, §4.11.4): `auth` with `scheme: "email"`,
 	 * `email` and no `token`. On a connection signed in to an account it
-	 * proposes adding the address to that account; otherwise, a guest's
-	 * included (a guest is not an account here), signing in, or signing up
-	 * when no account holds the address. The result is `{}` whether or not
-	 * one does. It emails a six-digit code that works only on this
-	 * connection and, when the proposal carries `state`, a link whose token
-	 * works on any connection, both for `proposalSeconds`. A new proposal
+	 * proposes adding the address to that account. On a guest's it proposes
+	 * registering: a new account holding the address, which the guest
+	 * becomes; for an address an account already holds, the email says to
+	 * sign in instead and carries no code. On a connection not signed in it
+	 * proposes signing in, or signing up when no account holds the address.
+	 * The result is `{}` either way. It emails a six-digit code that works
+	 * only on this connection and, when the proposal carries `state` (and is
+	 * not a guest's), a link whose token works on any connection not signed
+	 * in, both for `proposalSeconds`. A new proposal
 	 * replaces the connection's last. Each email is charged to the IP, the
 	 * address and the server (Store.chargeEmailSend), and past any of those
 	 * the proposal is `retry_after` and sends nothing.
@@ -3722,6 +3730,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const state = optionalString(params, "state");
 		if (state !== undefined && !validEmailState(state)) throw { name: "invalid_params", message: "state must be 1 to 256 printable ASCII characters" } satisfies ProtocolError;
 		const adds = attachment.tier === "registered" ? attachment.userId! : undefined;
+		// A guest's proposal is a registration (§4.11.1: it adds to the guest),
+		// approved on its own connection only.
+		const guest = attachment.tier === "anonymous" ? attachment.userId : undefined;
 		if (adds && hasRole(attachment, "bot")) throw { name: "denied", message: "A bot signs in with its token and takes no email address" } satisfies ProtocolError;
 		// An address would outlive the token: deleting APRON_ADMIN_TOKEN must turn `admin` off.
 		if (adds === ADMIN_USER_ID) throw { name: "denied", message: "The admin user signs in with APRON_ADMIN_TOKEN only; make your own account an admin with /admin" } satisfies ProtocolError;
@@ -3750,6 +3761,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return null;
 			}
 			this.store.chargeEmailSend({ ipKey: attachment.ipKey, addressKey: digest, now, policy: email.policy });
+			// A guest is never switched into an existing account: the email
+			// says so, with no code, and the connection's last proposal goes.
+			if (guest && owner) {
+				if (previous) {
+					await this.store.withMeterAsync("foreground", { writes: 1 }, () => this.ctx.storage.delete(previous));
+					delete attachment.emailProposal;
+					writeSessionAttachment(socket, attachment, ["emailProposal"]);
+				}
+				return { kind: "exists", userId: owner };
+			}
 			const expiresMs = now + email.policy.proposalSeconds * 1_000;
 			await this.store.withMeterAsync("foreground", { writes: 3 }, async () => {
 				if (previous && previous !== key) await this.ctx.storage.delete(previous);
@@ -3757,7 +3778,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				await this.ctx.storage.put<SessionExpiryEntry>(sessionExpiryKey(expiresMs, key), { v: 1, sessionKey: key, expiresMs });
 				await this.ctx.storage.put<StoredEmailProposal>(key, {
 					v: 1, expiresMs, connId: attachment.connId, address, code: codeDigest, failures: 0,
-					...(state !== undefined ? { state } : {}), ...(name !== undefined ? { name } : {}), ...(adds ? { adds } : {}),
+					...(state !== undefined ? { state } : {}), ...(name !== undefined ? { name } : {}), ...(adds ? { adds } : {}), ...(guest ? { guest } : {}),
 				});
 			});
 			attachment.emailProposal = key;
@@ -3771,8 +3792,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return adds ? { kind: "add", userId: adds } : owner ? { kind: "sign-in", userId: owner } : { kind: "sign-up" };
 		});
 		if (purpose) {
-			const link = state !== undefined ? emailLink(email.linkUrl, { server: email.server, token, state }) : undefined;
-			const message = emailMessage({ server: this.emailServerName(), code, ...(link ? { link } : {}), purpose, minutes: Math.max(1, Math.round(email.policy.proposalSeconds / 60)) });
+			// A guest's registration works only on its own connection, so its
+			// email has the code alone: a link would open somewhere else.
+			const link = state !== undefined && !guest ? emailLink(email.linkUrl, { server: email.server, token, state }) : undefined;
+			const message = emailMessage({ server: this.emailServerName(), ...(purpose.kind === "exists" ? {} : { code }), ...(link ? { link } : {}), purpose, minutes: Math.max(1, Math.round(email.policy.proposalSeconds / 60)) });
 			try {
 				await this.deliverEmail(address, message);
 			} catch (error) {
@@ -3796,12 +3819,18 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 *   connection signed in to that account only, and returns `{}`; one the
 	 *   account already holds changes nothing, and one another account holds
 	 *   is `denied`.
-	 * - A sign-in, on a connection not signed in to an account (a guest's
-	 *   included), signs in as the account that holds the address, or signs
-	 *   up a new one holding it (named as the proposal asked, else
-	 *   "Member"), charged as a registration. The result carries `you` and a
-	 *   session `token` bound to this connection's origin (none where it sent
-	 *   none), which resumes for `sessionTtlSeconds` like a passkey's.
+	 * - A guest's registration, on that guest's connection only, creates an
+	 *   account holding the address (named as the proposal asked, else as the
+	 *   guest), in the guest's rooms, which the connection becomes, as a
+	 *   passkey registration does.
+	 * - A sign-in, on a connection not signed in at all (not a guest's: a
+	 *   link must not move one into another account, §4.11.3), signs in as
+	 *   the account that holds the address, or signs up a new one holding it
+	 *   (named as the proposal asked, else "Member").
+	 * - Either is charged as a registration when it creates an account. The
+	 *   result carries `you` and a session `token` bound to this connection's
+	 *   origin (none where it sent none), which resumes for
+	 *   `sessionTtlSeconds` like a passkey's.
 	 */
 	private async handleEmailApproval(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, token: string): Promise<void> {
 		const email = this.config.email!;
@@ -3842,6 +3871,18 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (typed && await sha256Hex(token) !== proposal.code) {
 				await failed({ name: "denied", message: "That code is not the one emailed" });
 			}
+			// A guest's registration only on that guest's connection; a sign-in
+			// only on a connection not signed in at all, guests included
+			// (§4.11.3), so no link moves a connection into someone's account.
+			if (proposal.guest) {
+				if (attachment.tier !== "anonymous" || attachment.connId !== proposal.connId || attachment.userId !== proposal.guest) {
+					await failed({ name: "denied", message: "Approve this registration on the guest connection that asked for it" });
+				}
+			} else if (!proposal.adds && attachment.tier !== "pending") {
+				await failed({ name: "denied", message: attachment.tier === "anonymous"
+					? "Sign in to an account on a new connection, not a guest's"
+					: "Identity switching requires reconnect" });
+			}
 			const addressKey = EMAIL_KEY_PREFIX + await sha256Hex(proposal.address);
 			const stored = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredEmail>(addressKey));
 			const holder = stored?.v === 1 && typeof stored.userId === "string" && this.store.identityExists(stored.userId) ? stored.userId : null;
@@ -3866,15 +3907,23 @@ export class ApronDemoServer extends DurableObject<Env> {
 				this.reply(socket, request, {});
 				return;
 			}
-			// A link cannot silently switch a signed-in connection to another account (§5.2).
-			if (attachment.tier === "registered") await failed({ name: "denied", message: "Identity switching requires reconnect" });
 			if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
+			if (proposal.guest && holder) {
+				// Taken since the proposal: it can never be approved now.
+				await forget();
+				throw { name: "denied", message: "That address already has an account; sign in with it on a new connection" } satisfies ProtocolError;
+			}
 			let userId = holder;
 			let created = false;
 			if (!userId) {
 				// Sign-up: an address no account holds (§4.11.4: server policy).
-				const name = proposal.name ?? JOIN_DEFAULT_NAME;
-				const chosen = candidateUserIdFor(name, (candidate) => this.store.userIdTaken(candidate));
+				// A guest's registration is named as it asked, else as the guest,
+				// with a `user_id` from the name it asked for, and keeps the rooms
+				// the guest joined, as a passkey registration does.
+				const current = connectionAttachment(socket) ?? attachment;
+				const name = proposal.name ?? (proposal.guest ? current.name : undefined) ?? JOIN_DEFAULT_NAME;
+				const chosen = candidateUserIdFor(proposal.guest ? proposal.name : name, (candidate) => this.store.userIdTaken(candidate));
+				const rooms = proposal.guest ? current.rooms : undefined;
 				// The whole key-value cost (the proposal's delete, then the address
 				// and its list) is reserved before the account exists, so a budget
 				// refusal cannot strand an account without its address. The
@@ -3886,7 +3935,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 					// `auth` result (§3.2); signInKeyless releases them.
 					this.holdDeliveries(socket);
 					await this.runMutation(async () => {
-						const made = this.store.createInvitedIdentity({ userId: chosen, name, now: nowMs(), ipKey: attachment.ipKey });
+						const made = this.store.createInvitedIdentity({ userId: chosen, name, now: nowMs(), ipKey: attachment.ipKey, ...(rooms ? { rooms } : {}) });
 						for (const record of made.broadcasts) this.broadcastHeld(socket, record);
 					});
 					// One put, with no await between the account's creation and it.

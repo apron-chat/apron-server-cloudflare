@@ -81,21 +81,41 @@ export function emailLink(page: string, keys: { server: string; token: string; s
 	return `${base}#${(["server", "token", "state"] as const).map((key) => `${key}=${encode(keys[key])}`).join("&")}`;
 }
 
-/** What a proposal is for, as the email tells its reader. */
+/**
+ * What a proposal is for, as the email tells its reader: signing in to the
+ * account that holds the address, signing up a new one, adding the address
+ * to an account, or a guest's registration for an address that already has
+ * an account (`exists`), which sends no code: a guest is never switched
+ * into an existing account.
+ */
 export type EmailPurpose =
 	| { kind: "sign-in"; userId: string }
 	| { kind: "sign-up" }
-	| { kind: "add"; userId: string };
+	| { kind: "add"; userId: string }
+	| { kind: "exists"; userId: string };
 
 /**
  * The email a proposal sends: a subject, and a plain-text body with the
  * code, the link (when the proposal carried `state`), what approving it
- * does, and when it expires. Plain text only, so nothing in it is markup a
- * mail client renders, and the server title, which an admin sets, cannot
- * add any.
+ * does, and when it expires; for `exists`, how to sign in instead, and no
+ * code. Plain text only, so nothing in it is markup a mail client renders,
+ * and the server title, which an admin sets, cannot add any.
  */
-export function emailMessage(input: { server: string; code: string; link?: string; purpose: EmailPurpose; minutes: number }): { subject: string; text: string } {
+export function emailMessage(input: { server: string; code?: string; link?: string; purpose: EmailPurpose; minutes: number }): { subject: string; text: string } {
 	const server = input.server.replace(/[\r\n]+/g, " ").trim() || "Apron";
+	if (input.purpose.kind === "exists" || input.code === undefined) {
+		const userId = input.purpose.kind === "sign-up" ? "" : ` (${input.purpose.userId})`;
+		return {
+			subject: `You already have an account on ${server}`,
+			text: [
+				`Someone asked to create an account on ${server} with this address, which already has one${userId}.`,
+				"",
+				"To use it, sign in with this address instead, from the app's sign-in screen rather than as a guest. Nothing was changed.",
+				"",
+				"If you didn't ask for this, ignore this email.",
+			].join("\n"),
+		};
+	}
 	const action = input.purpose.kind === "sign-in"
 		? `sign in to ${server} as ${input.purpose.userId}`
 		: input.purpose.kind === "sign-up"
