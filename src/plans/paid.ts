@@ -278,13 +278,14 @@ export const PAID_PLAN: Plan = Object.freeze({
 	}),
 	// Email sign-in (scheme `email`), on once the deployment has a sender
 	// (EMAIL_FROM and the EMAIL send_email binding). Workers Paid includes
-	// 3,000 emails a month, then $0.35 per 1,000; 95 a day stays inside it
-	// even in a 31-day month, so email adds nothing to the bill. Free has no
+	// 3,000 emails a month, then $0.35 per 1,000. 190 a day is at most 5,890
+	// in a 31-day month, 2,890 past the inclusion: at most about $1.05 (three
+	// started thousands), outside the bill cap's estimate. Free has no
 	// policy: it cannot send to arbitrary addresses. A proposal is about
 	// three key-value writes and a limiter row or two, and an approval a
 	// registration's worth for a new account, all inside the budgets above.
 	email: Object.freeze({
-		sendsPerDay: 95,
+		sendsPerDay: 190,
 		// A household or office behind one address signs a few people up; a
 		// script that mails strangers from it stops at ten.
 		sendsPerIpDay: 10,

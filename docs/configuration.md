@@ -613,7 +613,7 @@ enforces (a malformed or out-of-bounds value fails it):
 
 | Setting (variable) | Workers Paid |
 | --- | ---: |
-| `sendsPerDay` (`EMAIL_SENDS_PER_DAY`; server-wide, UTC day) | 95 |
+| `sendsPerDay` (`EMAIL_SENDS_PER_DAY`; server-wide, UTC day) | 190 |
 | `sendsPerIpDay` (`EMAIL_SENDS_PER_IP_DAY`; one IP's proposals, after a burst of 3 then one a minute) | 10 |
 | `sendsPerAddressDay` (`EMAIL_SENDS_PER_ADDRESS_DAY`; to one address, whoever asks) | 3 |
 | `proposalSeconds` (`EMAIL_PROPOSAL_SECONDS`; how long a code and link last, at most 30 minutes) | 600 |
@@ -622,8 +622,9 @@ enforces (a malformed or out-of-bounds value fails it):
 
 Workers Paid includes 3,000 emails a month, then $0.35 per 1,000
 ([pricing](https://developers.cloudflare.com/email-service/platform/pricing/));
-95 a day stays inside it in any month, so email adds nothing to the bill;
-an `EMAIL_SENDS_PER_DAY` above 96 can.
+190 a day is at most 5,890 in a 31-day month, so email adds at most about
+$1.05 a month to the bill (96 a day or fewer adds nothing). The bill cap's
+estimate does not count email, so keep `EMAIL_SENDS_PER_DAY` in proportion.
 Emails Cloudflare rejects for a suppressed recipient do not count. A send
 the limits refuse is `retry_after` and sends nothing.
 

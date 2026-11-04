@@ -757,8 +757,9 @@ the proposal's failure count or delete, the address and its list, and a
 session's two rows; a sign-up adds a registration's SQL
 (Store.createInvitedIdentity). Each email is one Email Service send:
 Workers Paid includes 3,000 a month, then $0.35 per 1,000, and
-`sendsPerDay` (95) keeps a 31-day month at 2,945, inside the inclusion, so
-the bill cap never sees email. The limits that matter more are the
+`sendsPerDay` (190) bounds a 31-day month at 5,890: 2,890 past the
+inclusion, at most about $1.05, which the bill cap's estimate does not
+count. The limits that matter more are the
 per-address (3 a day) and per-IP (10 a day) caps, which keep the server
 from mailing strangers in bulk and so protect the sending domain's
 reputation.

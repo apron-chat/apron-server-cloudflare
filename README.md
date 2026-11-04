@@ -19,8 +19,8 @@ for a zero-overage deployment.
   passkey to post, and run `/invite-bot` to get a token for your own bot.
   With a sender configured, email sign-in (`email`) mails a code and a link
   that sign in, sign up a new address, or add an address to an account,
-  within Workers Paid's included emails (see
-  [configuration](docs/configuration.md#email-sign-in)).
+  capped at 190 emails a day (about $1 a month past Workers Paid's included
+  emails at most; see [configuration](docs/configuration.md#email-sign-in)).
 - **Private rooms for DMs.** Signed-in users start private rooms
   (`private: true`) that only their members see, and add people to them;
   everyone else is answered as if the room did not exist. A room goes when

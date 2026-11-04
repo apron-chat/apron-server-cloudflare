@@ -395,7 +395,7 @@ on the demo (`EMAIL_ADDRESSES_PER_USER` allows more), and approving another
 replaces it; `/email` lists it and `/email remove <address>` removes it,
 except the last way in of an account with no passkey or token.
 Sign-in emails are limited to 3 a day per address, 10 a day per IP (a
-burst of 3, then one a minute), and 95 a day for the server. Bots and the
+burst of 3, then one a minute), and 190 a day for the server. Bots and the
 `admin` user take no address. `/rename` moves addresses; `/purge` and
 `/invite-purge` remove them. See [SPEC section 5](../SPEC.md#email).
 
