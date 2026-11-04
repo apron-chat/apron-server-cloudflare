@@ -449,6 +449,32 @@ describe('live text end to end', () => {
 		} finally { writer.close(); }
 	});
 
+	it('stops a write that is removed as it starts streaming, without waiting for its time limit', async () => {
+		const userId = unique('removed');
+		const writer = await signedIn(userId);
+		try {
+			const { frame } = await exchange(writer, 'post', 'message', { body: { text: 'Build:', embeds: [{ kind: 'terminal' }] } });
+			// The removal (a save that dropped the embed) lands while the write
+			// refreshes its deadline: claimed, but not yet reading its body.
+			await runInDurableObject(stub(), (instance) => {
+				const runtime = instance as unknown as { store: Store; refreshLiveDeadline(): Promise<void>; stopLiveText(key: string, reason: string): void };
+				const refresh = runtime.refreshLiveDeadline.bind(runtime);
+				vi.spyOn(runtime, 'refreshLiveDeadline').mockImplementationOnce(async () => {
+					const live = runtime.store.openLiveTexts(Date.now()).find((entry) => entry.owner === userId)!;
+					runtime.stopLiveText(live.key, 'removed');
+					await refresh();
+				});
+			});
+			const put = streamTo(frame.result.embeds[0].write_url);
+			await put.send('never kept\n');
+			const started = Date.now();
+			const response = await put.response;
+			expect(Date.now() - started).toBeLessThan(ORDINARY_MS - 500);
+			expect(await response.text()).toBe('Stopped: the message or its embed was removed.\n');
+			await put.end();
+		} finally { writer.close(); }
+	});
+
 	it('ends a text at the owner\'s time limit: 2 seconds here for others, 3 for admins and mods', async () => {
 		for (const [roles, limit] of [[[], ORDINARY_MS], [['mod'], MODERATOR_MS]] as const) {
 			const peer = await signedIn(unique('slow'), [...roles]);

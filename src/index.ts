@@ -95,6 +95,7 @@ import {
 	STORAGE_UNAVAILABLE,
 } from "./store";
 import { isProtocolId } from "./domain";
+import { Deadline } from "./deadline";
 
 const OBJECT_NAME = "public-demo-v1";
 const INTERNAL_IP_HEADER = "X-Apron-Trusted-IP-Key";
@@ -429,6 +430,14 @@ class MinuteRateLimit {
 		if (this.events.size > RATE_LIMIT_KEYS) this.events.delete(this.events.keys().next().value!);
 		return true;
 	}
+
+	/** Moves `from`'s events to `to` (a renamed user), so a rename resets no limit. */
+	move(from: string, to: string): void {
+		const events = this.events.get(from);
+		if (!events) return;
+		this.events.delete(from);
+		this.events.set(to, [...(this.events.get(to) ?? []), ...events].sort((a, b) => a - b));
+	}
 }
 
 const RATE_LIMIT_KEYS = 10_000;
@@ -450,6 +459,8 @@ const PING_RESPONSE = '{"method":"pong"}';
 const MAX_ATTACHED_ROOMS = 2 * (MAX_THREAD_LIMIT + 1 + MAX_PRIVATE_MEMBERSHIPS_PER_USER);
 /** How often one connection writes the read cursors it was sent (flushReads): a reader writes about once a minute, however often their client sends. */
 const READ_CURSOR_FLUSH_MS = 60_000;
+/** The close reason of a connection that did not sign in within `unauthenticatedTimeoutSeconds`. */
+const AUTH_TIMEOUT_REASON = "Authentication timed out";
 /** At most how many frames a connection's sign-in holds for it (holdDeliveries). */
 const MAX_HELD_FRAMES = 256;
 /**
@@ -1034,13 +1045,44 @@ function throttleState(attachment: Partial<ConnectionAttachment>): Pick<Connecti
 	return out;
 }
 
-function writeAttachment(socket: WebSocketConnection, attachment: ConnectionAttachment): void {
-	// The attachment is intentionally limited to connection state. The runtime
-	// rejects oversized attachments; keeping this assertion near serialization
-	// makes that failure visible during development.
-	const serialized = JSON.stringify(attachment);
-	if (utf8Bytes(serialized) > 12_000) throw new Error("connection attachment exceeds safety budget");
-	socket.serializeAttachment?.(attachment);
+/** The most bytes a connection attachment may serialize to: below the runtime's own limit, with room to spare. */
+const ATTACHMENT_SAFETY_BYTES = 12_000;
+/** The close reason of a connection whose state outgrew its attachment (writeAttachment). */
+const ATTACHMENT_OVERFLOW_REASON = "Connection state too large; reconnect";
+
+/**
+ * Stores a connection's state on its socket, and returns whether it did. A
+ * state too large to store (ATTACHMENT_SAFETY_BYTES) is not stored: the
+ * connection is closed instead, with 1011, so its client reconnects and
+ * recovers, while the attachment keeps its last state, which fit, for the
+ * close's own handling (webSocketClose, noteClosedSockets).
+ *
+ * The `closing` mark is always stored, whatever the budget: a closing
+ * connection's state only ever gains that mark and a violation's time, which
+ * the runtime's own limit (16 KiB) has room for over the budget, and the
+ * mark is what tells every later event its close was handled. Were it lost,
+ * the next event would handle the close again, and again.
+ *
+ * It never throws. A throw here would abort whatever loop was storing it,
+ * over the user's or a room's other connections, halfway; inside a
+ * mutation (runMutation) it would even read as an uncertain commit and
+ * close every connection on the server. One connection's state is that
+ * connection's problem alone.
+ */
+function writeAttachment(socket: WebSocketConnection, attachment: ConnectionAttachment): boolean {
+	const bytes = utf8Bytes(JSON.stringify(attachment));
+	if (bytes <= ATTACHMENT_SAFETY_BYTES || attachment.closing) {
+		try {
+			socket.serializeAttachment?.(attachment);
+			return true;
+		} catch (error) {
+			if (bytes <= ATTACHMENT_SAFETY_BYTES) throw error;
+			// Past even the runtime's limit: the close below is all that is left.
+		}
+	}
+	console.warn(JSON.stringify({ event: "attachment_overflow", bytes }));
+	try { socket.close(1011, ATTACHMENT_OVERFLOW_REASON); } catch { /* already closed */ }
+	return false;
 }
 
 /** Seconds as said in a notice: whole minutes as minutes, else seconds. */
@@ -1054,27 +1096,58 @@ function openSocket(socket: WebSocketConnection): boolean {
 	return socket.readyState === 1;
 }
 
-/** Async ceremonies must not overwrite counters for frames queued meanwhile. */
-function writeSessionAttachment(socket: WebSocketConnection, attachment: ConnectionAttachment): void {
+/** What falls due on a connection by itself, with no frame from it: see connectionDeadlines. */
+type ConnectionDue = "auth" | "challenge" | "reads";
+
+/**
+ * When each piece of a connection's own state falls due, from its attachment
+ * alone: a pending connection's sign-in deadline, its passkey challenge's
+ * expiry, and when its unwritten read cursors are written (flushReads). The
+ * one list that schedules the alarm (rescheduleAlarm) and that the alarm
+ * works through (runConnectionDeadlines), so no deadline can be acted on
+ * but never scheduled, or scheduled but never acted on. A closing
+ * connection has none.
+ */
+function connectionDeadlines(attachment: ConnectionAttachment): Array<[ConnectionDue, number]> {
+	if (attachment.closing) return [];
+	const due: Array<[ConnectionDue, number]> = [];
+	if (attachment.tier === "pending") due.push(["auth", attachment.authDeadline]);
+	if (attachment.challenge) due.push(["challenge", attachment.challenge.expiresAt]);
+	if (attachment.reads) due.push(["reads", (attachment.readsAt ?? 0) + READ_CURSOR_FLUSH_MS]);
+	return due;
+}
+
+/**
+ * The fields a sign-in sets (ApronDemoServer.becomeRegistered): who the
+ * connection now is, its rooms and credential, and the read cursors it
+ * wrote for the user before.
+ */
+const SIGN_IN_FIELDS = ["tier", "userId", "name", "avatar", "roles", "ext", "rooms", "listedJoined", "credential", "reads", "readsAt"] as const satisfies ReadonlyArray<keyof ConnectionAttachment>;
+
+/**
+ * Writes the fields `owned` of a copy of a connection's attachment read
+ * before an await (an async ceremony: a passkey's verification, a session
+ * renewal) onto the attachment as it is now, and makes the copy match it.
+ * Everything else comes from the attachment as stored, which other events
+ * kept current meanwhile (frame counters and leases, presence, mutes, held
+ * wakes, the time of the last frame, the closing mark), so no field the
+ * ceremony did not set can be rolled back to what it was when it began.
+ */
+function writeSessionAttachment(socket: WebSocketConnection, attachment: ConnectionAttachment, owned: ReadonlyArray<keyof ConnectionAttachment> = SIGN_IN_FIELDS): void {
 	const current = connectionAttachment(socket);
-	if (current) {
-		attachment.pendingFrames = current.pendingFrames;
-		attachment.pendingBytes = current.pendingBytes;
-		attachment.frameTimes = current.frameTimes;
-		attachment.policyViolations = current.policyViolations;
-		attachment.throttles = current.throttles;
-		attachment.notices = current.notices;
-		attachment.frameLease = current.frameLease;
-		attachment.closing = current.closing;
-		if (current.idle) attachment.idle = true;
-		else delete attachment.idle;
-		// Kept current by this connection's and other connections' events meanwhile.
-		for (const key of ["idleAt", "held", "choice", "muteUntil", "roomMuteNext", "pres", "owed", "unreadOwed"] as const) {
-			if (current[key] !== undefined) (attachment as unknown as Record<string, unknown>)[key] = current[key];
-			else delete attachment[key];
-		}
+	if (!current) {
+		writeAttachment(socket, attachment);
+		return;
 	}
-	writeAttachment(socket, attachment);
+	const merged = current as unknown as Record<string, unknown>;
+	const copy = attachment as unknown as Record<string, unknown>;
+	for (const key of owned) {
+		if (copy[key] !== undefined) merged[key] = copy[key];
+		else delete merged[key];
+	}
+	writeAttachment(socket, current);
+	for (const key of Object.keys(copy)) if (!(key in merged)) delete copy[key];
+	Object.assign(copy, merged);
 }
 
 /**
@@ -1978,16 +2051,23 @@ export default {
 } satisfies ExportedHandler<Env>;
 
 /**
- * A live text this instance holds (§4.8.3): one that streams, with its kept
- * bytes, or one a message announced whose readers wait for its write.
+ * A live text this instance holds (§4.8.3), in one of two phases:
+ *
+ * - `waiting`: a message announced it, and its readers wait for its write.
+ *   Nothing streams, so ending it closes the readers and forgets it.
+ * - `streaming`: its write was claimed (Store.claimLiveText), in the same
+ *   mutation that made this session, so a queued expiry never takes it for
+ *   lost. It ends exactly once, by `stop`: the first reason wins, whether it
+ *   comes from the write itself, its time limit, or a save or purge that
+ *   removed it, even one that arrives before the write starts reading.
  */
-interface LiveSession {
-	entry: LiveEntry;
-	readers: LiveReaders;
-	/** The kept bytes, once the write streams. */
-	buffer?: LiveBuffer;
-	/** Ends the write early, as for its time limit or a save that removed its embed. */
-	stop?: (reason: LiveEnd) => void;
+type LiveSession =
+	| { phase: "waiting"; entry: LiveEntry; readers: LiveReaders }
+	| { phase: "streaming"; entry: LiveEntry; readers: LiveReaders; buffer: LiveBuffer; stop: AbortController };
+
+/** Why a streaming live text was stopped, if it was. */
+function liveStopped(session: Extract<LiveSession, { phase: "streaming" }>): LiveEnd | undefined {
+	return session.stop.signal.aborted ? session.stop.signal.reason as LiveEnd : undefined;
 }
 
 export class ApronDemoServer extends DurableObject<Env> {
@@ -2015,8 +2095,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private idlePruneAt = 0;
 	/** The UTC day this instance last finished the daily part of the account upkeep (pruneIdle). */
 	private upkeepDay = "";
-	/** When batched maintenance left work behind (a full session sweep or prune batch) and should run again; in memory. */
-	private maintenanceAt: number | undefined;
+	/**
+	 * When each kind of the server's own alarm work next falls due, in
+	 * memory: the alarm is scheduled for the earliest of these and of every
+	 * connection's own deadlines (connectionDeadlines), so none can be acted
+	 * on without being scheduled.
+	 *
+	 * - `maintenance`: batched maintenance left work behind (a full session
+	 *   sweep or prune batch) and runs again.
+	 * - `uploads`: the earliest pending upload's write window closes
+	 *   (§4.8.3); after a wake, read from storage once (uploadDeadlineRead).
+	 * - `live`: the earliest open live text falls due (liveDeadline, §4.8.3).
+	 * - `presence`: waiting status changes are to be announced (armPresence).
+	 */
+	private readonly deadlines = { maintenance: new Deadline(), uploads: new Deadline(), live: new Deadline(), presence: new Deadline() };
 	private alarmTail: Promise<void> = Promise.resolve();
 	private alarmFailures = 0;
 	private alarmKnown = false;
@@ -2026,10 +2118,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly botActiveAt = new Map<string, number>();
 	/** Admins' `/toggle`s, once read: a feature absent here has not been read yet. */
 	private readonly toggles = new Map<ToggleFeature, boolean | undefined>();
-	/** When the earliest pending upload's write window closes, if one is known (§4.8.3). */
-	private uploadDeadline: number | undefined;
-	/** When the earliest open live text falls due (liveDeadline), if one is known (§4.8.3). */
-	private liveDeadlineAt: number | undefined;
 	/**
 	 * Live texts this instance holds, by the id in their `url`: in memory
 	 * only, so an evicted or redeployed instance loses them, and the next one
@@ -2115,12 +2203,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly pendingWakes = new Set<PendingWake>();
 	/** Pushes claimed with an `unread` by this instance, so a sign-in can tell whether one came while it read (afterSignIn). */
 	private unreadClaims = 0;
-	/**
-	 * When the alarm is asked to announce waiting status changes
-	 * (armPresence), infinity for not. In memory: a wake forgets it, and the
-	 * alarm that woke the object sweeps from the attachments anyway.
-	 */
-	private presenceAlarmAt = Number.POSITIVE_INFINITY;
 	/** The earliest alarm time asked for (askPresenceAlarm), rounded, kept for a sign-in to ask again. */
 	private presenceAlarmDue = Number.POSITIVE_INFINITY;
 	/** While the alarm handler runs, which sets the next alarm itself when done. */
@@ -2350,6 +2432,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.sweepPresence(nowMs(), socket);
 		const attachment = connectionAttachment(socket);
 		if (!attachment || attachment.closing) return Promise.resolve();
+		// The sign-in deadline holds whether or not the alarm that enforces it has run.
+		if (attachment.tier === "pending" && attachment.authDeadline <= nowMs()) {
+			this.closePolicy(socket, attachment, 1008, AUTH_TIMEOUT_REASON);
+			return Promise.resolve();
+		}
 		this.accountUsage.noteActivity(nowMs());
 		if (this.accountUsage.stops(nowMs())) {
 			this.closePolicy(socket, attachment, 1013, "Demo account capacity reached; try later");
@@ -2436,6 +2523,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	private async runAlarm(): Promise<void> {
 		this.alarmKnown = false;
+		// Light or full, the alarm that fired is gone once this returns.
+		this.store.alarmFired();
 		const now = nowMs();
 		this.noteBurn("alarm");
 		this.sweepPresence(now);
@@ -2444,26 +2533,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// their own work, as they did before presence used the alarm.
 		const full = this.alarmWorkDue(now);
 		recordMetric(this.runtimeEnv.METRICS, "alarm", [full ? "full" : "light"]);
+		// Every alarm, light or full: what fell due on a connection needs only its attachment.
+		this.runConnectionDeadlines(now);
 		this.maybeEvaluateTier(now);
 		if (!full) {
 			await this.rescheduleAlarm();
 			return;
 		}
 		await this.accountUsage.refresh(now, false);
-		for (const ws of this.ctx.getWebSockets()) {
-			const socket = ws as WebSocketConnection;
-			const attachment = connectionAttachment(socket);
-			if (!attachment) continue;
-			if (attachment.tier === "pending" && attachment.authDeadline <= now) {
-				this.closePolicy(socket, attachment, 1008, "Authentication timed out");
-				continue;
-			}
-			if (attachment.challenge && attachment.challenge.expiresAt <= now) {
-				delete attachment.challenge;
-				writeAttachment(socket, attachment);
-			}
-			if (attachment.reads && !attachment.closing && now - (attachment.readsAt ?? 0) >= READ_CURSOR_FLUSH_MS) this.flushReads(attachment, now, socket);
-		}
 		if (now >= this.nextSessionSweepAt) {
 			try {
 				// A full batch may have left more behind; sweep again on the next alarm.
@@ -2478,7 +2555,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				await this.expireBot(userId);
 			}
 		} catch { /* a bot not yet signed out is found again by the next sweep */ }
-		if (this.maintenanceAt !== undefined && this.maintenanceAt <= now) this.maintenanceAt = undefined;
+		if (this.deadlines.maintenance.passed(now)) this.deadlines.maintenance.clear();
 		if (now >= this.idlePruneAt) await this.pruneIdle(now);
 		let result: ReturnType<Store["runCleanup"]> | undefined;
 		try {
@@ -2496,7 +2573,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 					const expired = this.store.expirePendingUploads(now);
 					for (const record of expired.broadcasts) this.broadcastRecord(record);
 					this.deleteMedia(expired.deletedUploads);
-					this.uploadDeadline = expired.next;
+					this.deadlines.uploads.set(expired.next);
 					this.uploadDeadlineRead = true;
 				});
 				// A full batch may have left more behind: sweep again shortly rather
@@ -2505,8 +2582,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				// Expired files and avatars go from R2 too, not only by its lifecycle rules.
 				this.deleteMedia(swept.deleted);
 				if (swept.count >= UPLOAD_SWEEP_BATCH) {
-					const next = now + 1_000;
-					this.uploadDeadline = this.uploadDeadline === undefined ? next : Math.min(this.uploadDeadline, next);
+					this.deadlines.uploads.soonest(now + 1_000);
 				}
 			} catch { /* a metered maintenance failure is retried on the next alarm */ }
 		}
@@ -2532,29 +2608,46 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Whether an alarm has work besides announcing status changes: a
-	 * connection's auth deadline, challenge expiry or read cursor to write,
-	 * an upload deadline (read from storage once after a wake, which forgets
-	 * it), or storage cleanup (Store.cleanupDue).
+	 * Acts on each connection's deadlines that have passed (connectionDeadlines):
+	 * closes a connection that never signed in, drops an expired passkey
+	 * challenge, and writes read cursors held for a minute.
+	 */
+	private runConnectionDeadlines(now: number): void {
+		for (const ws of this.ctx.getWebSockets()) {
+			const socket = ws as WebSocketConnection;
+			const attachment = connectionAttachment(socket);
+			if (!attachment) continue;
+			const due = new Set(connectionDeadlines(attachment).filter(([, at]) => at <= now).map(([kind]) => kind));
+			if (due.has("auth")) {
+				this.closePolicy(socket, attachment, 1008, AUTH_TIMEOUT_REASON);
+				continue;
+			}
+			if (due.has("challenge")) {
+				delete attachment.challenge;
+				writeAttachment(socket, attachment);
+			}
+			if (due.has("reads")) this.flushReads(attachment, now, socket);
+		}
+	}
+
+	/**
+	 * Whether an alarm has server work besides announcing status changes and
+	 * its connections' own deadlines (runConnectionDeadlines, done on every
+	 * alarm): an upload deadline (read from storage once after a wake, which
+	 * forgets it), a live text's, maintenance, or storage cleanup
+	 * (Store.cleanupDue).
 	 */
 	private alarmWorkDue(now: number): boolean {
-		for (const ws of this.ctx.getWebSockets()) {
-			const attachment = connectionAttachment(ws as WebSocketConnection);
-			if (!attachment) continue;
-			if (attachment.tier === "pending" && attachment.authDeadline <= now) return true;
-			if (attachment.challenge && attachment.challenge.expiresAt <= now) return true;
-			if (attachment.reads && !attachment.closing && now - (attachment.readsAt ?? 0) >= READ_CURSOR_FLUSH_MS) return true;
-		}
 		if (this.config.uploads && !this.uploadDeadlineRead) {
 			try {
 				const stored = this.store.nextUploadDeadline(now);
-				if (stored !== undefined) this.uploadDeadline = this.uploadDeadline === undefined ? stored : Math.min(this.uploadDeadline, stored);
+				if (stored !== undefined) this.deadlines.uploads.soonest(stored);
 				this.uploadDeadlineRead = true;
 			} catch {
 				return true;
 			}
 		}
-		if (this.uploadDeadline !== undefined && this.uploadDeadline <= now) return true;
+		if (this.deadlines.uploads.passed(now)) return true;
 		// Live texts that a lost instance left open, read once (recoverLiveTexts), or one past its deadline.
 		if (this.config.liveText && !this.liveRecovered) {
 			try {
@@ -2564,8 +2657,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return true;
 			}
 		}
-		if (this.liveDeadlineAt !== undefined && this.liveDeadlineAt <= now) return true;
-		if (this.maintenanceAt !== undefined && this.maintenanceAt <= now) return true;
+		if (this.deadlines.live.passed(now)) return true;
+		if (this.deadlines.maintenance.passed(now)) return true;
 		return this.store.cleanupDue(now);
 	}
 
@@ -2997,7 +3090,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return;
 			case "activity":
 				// Off unless the plan or `ACTIVITY` enables it: typing then gets the unsupported-method path.
-				if (!this.activityOn()) break;
+				if (!this.activityOn(true)) break;
 				await this.handleActivity(socket, request);
 				return;
 			case "status":
@@ -3136,7 +3229,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			});
 			if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
 			attachment.challenge = begun.challenge;
-			writeSessionAttachment(socket, attachment);
+			writeSessionAttachment(socket, attachment, ["challenge"]);
 			this.reply(socket, request, { challenge_id: begun.challenge.challengeId, public_key: begun.publicKey });
 			await this.rescheduleAlarm();
 			return;
@@ -3237,19 +3330,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			throw { name: "denied", message: "This passkey is no longer on the account" } satisfies ProtocolError;
 		}
 		const previous = this.guestBefore(socket, attachment);
-		// Read cursors still unwritten are the previous user's.
-		if (attachment.reads) this.flushReads(attachment, nowMs());
-		attachment.tier = "registered";
-		attachment.userId = finished.identity.user_id;
-		this.store.noteActive(finished.identity.user_id, nowMs());
-		attachment.name = finished.identity.name;
-		setAvatar(attachment, avatar);
-		attachment.roles = roles;
-		setExt(attachment, ext);
-		attachment.rooms = this.registeredRooms(socket, finished.identity.user_id);
-		delete attachment.listedJoined;
-		attachment.credential = sessionCredential;
-		writeSessionAttachment(socket, attachment);
+		this.becomeRegistered(socket, attachment, { userId: finished.identity.user_id, name: finished.identity.name, avatar, roles, ext },
+			this.registeredRooms(socket, finished.identity.user_id), sessionCredential);
 		this.prepareStatus(socket, stored);
 		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), token });
 		this.releaseDeliveries(socket);
@@ -3394,19 +3476,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Read before the connection changes, with no await after, so a failure leaves it as it was.
 		const stored = this.readStatusInputs(identity.userId, identity.seen);
 		const previous = this.guestBefore(socket, attachment);
-		// Read cursors still unwritten are the previous user's.
-		if (attachment.reads) this.flushReads(attachment, nowMs());
-		attachment.tier = "registered";
-		attachment.userId = identity.userId;
-		attachment.name = identity.name;
-		setAvatar(attachment, identity.avatar);
-		attachment.roles = identity.roles;
-		this.store.noteActive(identity.userId, nowMs());
-		setExt(attachment, identity.ext);
-		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
-		delete attachment.listedJoined;
-		attachment.credential = key;
-		writeSessionAttachment(socket, attachment);
+		this.becomeRegistered(socket, attachment, identity, this.liveRoomsOf(identity.userId, socket) ?? identity.rooms, key);
 		this.prepareStatus(socket, stored);
 		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), token });
 		this.guestLeaves(socket, attachment, previous, false);
@@ -3509,6 +3579,30 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
+	 * Makes a connection `identity`, registered: the one place a sign-in
+	 * (passkey, session token, or keyless token) changes who a connection
+	 * is. Its read cursors still unwritten are the previous user's, so they
+	 * are written first; then its identity, rooms and `credential` (none for
+	 * APRON_ADMIN_TOKEN) are stored, and nothing else (SIGN_IN_FIELDS).
+	 */
+	private becomeRegistered(socket: WebSocketConnection, attachment: ConnectionAttachment,
+		identity: { userId: string; name?: string; avatar?: string; roles: string[]; ext?: Record<string, unknown> }, rooms: string[], credential: string | undefined): void {
+		if (attachment.reads) this.flushReads(attachment, nowMs());
+		attachment.tier = "registered";
+		attachment.userId = identity.userId;
+		this.store.noteActive(identity.userId, nowMs());
+		attachment.name = identity.name;
+		setAvatar(attachment, identity.avatar);
+		attachment.roles = identity.roles;
+		setExt(attachment, identity.ext);
+		attachment.rooms = rooms;
+		delete attachment.listedJoined;
+		if (credential !== undefined) attachment.credential = credential;
+		else delete attachment.credential;
+		writeSessionAttachment(socket, attachment);
+	}
+
+	/**
 	 * Finishes a bearer-token sign-in that has no passkey session behind it
 	 * (a bot, the admin user, an invited user, one `created` by a sign-up
 	 * invite, or a user's other `device`): the connection becomes the
@@ -3520,20 +3614,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Read before the connection changes, so a failure leaves it as it was.
 		const stored = this.readStatusInputs(identity.userId, identity.seen);
 		const previous = this.guestBefore(socket, attachment);
-		// Read cursors still unwritten are the previous user's.
-		if (attachment.reads) this.flushReads(attachment, nowMs());
-		attachment.tier = "registered";
-		attachment.userId = identity.userId;
-		attachment.name = identity.name;
-		setAvatar(attachment, identity.avatar);
-		attachment.roles = identity.roles;
-		this.store.noteActive(identity.userId, nowMs());
-		setExt(attachment, identity.ext);
-		attachment.rooms = this.liveRoomsOf(identity.userId, socket) ?? identity.rooms;
-		delete attachment.listedJoined;
-		if (credential !== undefined) attachment.credential = credential;
-		else delete attachment.credential;
-		writeSessionAttachment(socket, attachment);
+		this.becomeRegistered(socket, attachment, identity, this.liveRoomsOf(identity.userId, socket) ?? identity.rooms, credential);
 		this.prepareStatus(socket, stored);
 		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), ...(token ? { token } : {}) });
 		this.releaseDeliveries(socket);
@@ -4073,7 +4154,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private assertMayManage(attachment: ConnectionAttachment, userId: string, roomId: string, adding: boolean, thread = false): void {
 		const owner = attachment.tier === "registered" && !hasRole(attachment, "bot");
 		if (owner && (userId === BOT_ID_PREFIX + attachment.userId || hasRole(attachment, "admin"))) return;
-		if (owner && adding && this.addMemberOn()) return;
+		if (owner && adding && this.addMemberOn(true)) return;
 		if (adding && thread && mayMoveAny(attachment)) return;
 		if (owner && !adding && this.store.roomCreator(roomId, nowMs()) === attachment.userId) return;
 		throw { name: "denied", message: adding ? "Only an admin, a threader in a thread, or a bot's owner, can add someone else here" : "Only an admin, the room's creator, or a bot's owner, can remove someone else" } satisfies ProtocolError;
@@ -4249,9 +4330,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		const latest = connectionAttachment(socket) ?? attachment;
 		if (!latest.rooms?.includes(roomId)) return;
+		const holding = !latest.reads;
 		latest.reads = { ...latest.reads, [roomId]: read };
 		if (now - (latest.readsAt ?? 0) >= READ_CURSOR_FLUSH_MS || Object.keys(latest.reads).length > MAX_ATTACHED_ROOMS) this.flushReads(latest, now, socket);
-		else writeAttachment(socket, latest);
+		else {
+			writeAttachment(socket, latest);
+			// A connection that starts holding cursors has a new deadline (connectionDeadlines): schedule it.
+			if (holding) void this.rescheduleAlarm();
+		}
 	}
 
 	/**
@@ -4300,7 +4386,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private sendReadCursors(socket: WebSocketConnection, attachment: ConnectionAttachment, roomIds: readonly string[]): void {
 		const identity = publicIdentity(attachment);
-		if (attachment.tier !== "registered" || !identity || !roomIds.length || !this.activityOn()) return;
+		if (attachment.tier !== "registered" || !identity || !roomIds.length || !this.activityOn(true)) return;
 		let cursors: Map<string, string>;
 		try {
 			cursors = this.store.readCursors(identity.user_id, nowMs());
@@ -4729,14 +4815,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** Presence as configured and toggled: off without push, which capability `status` needs. */
 	private presenceMode(): boolean {
 		if (!this.config.push) return false;
-		let toggled: boolean | undefined;
-		try {
-			toggled = this.toggled("presence");
-		} catch {
-			// The toggle is read once per wake; if it cannot be, the default applies.
-			toggled = undefined;
-		}
-		return toggled ?? this.config.presence;
+		return this.toggled("presence") ?? this.config.presence;
 	}
 
 	/**
@@ -4776,7 +4855,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** Forgets every announced status and pending change (`/toggle presence`). */
 	private resetPresence(): void {
-		this.presenceAlarmAt = Number.POSITIVE_INFINITY;
+		this.deadlines.presence.clear();
 		this.presenceAlarmDue = Number.POSITIVE_INFINITY;
 		this.presenceDueAt = Number.POSITIVE_INFINITY;
 		this.announcedAt.clear();
@@ -5090,8 +5169,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private askPresenceAlarm(at: number): void {
 		if (!Number.isFinite(at)) return;
 		this.presenceAlarmDue = Math.min(this.presenceAlarmDue, at);
-		if (at >= this.presenceAlarmAt || !this.anySignedIn()) return;
-		this.presenceAlarmAt = at;
+		if (!this.deadlines.presence.isSooner(at) || !this.anySignedIn()) return;
+		this.deadlines.presence.soonest(at);
 		// The alarm handler sets the next alarm itself once it is done.
 		if (!this.inAlarm) void this.rescheduleAlarm();
 	}
@@ -5129,7 +5208,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	flushPresence(now = nowMs(), live?: WebSocket): void {
 		this.presenceSweptAt = now;
-		this.presenceAlarmAt = Number.POSITIVE_INFINITY;
+		this.deadlines.presence.clear();
 		this.presenceAlarmDue = Number.POSITIVE_INFINITY;
 		this.presenceDueAt = Number.POSITIVE_INFINITY;
 		if (!this.config.push) return;
@@ -6323,8 +6402,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 			(!command.name.startsWith("embed-") || this.liveTextOn()));
 	}
 
-	/** An admin's `/toggle` of a feature, read once and then kept in memory with every change. */
-	private toggled(feature: ToggleFeature): boolean | undefined {
+	/**
+	 * An admin's `/toggle` of a feature, read once per wake and then kept in
+	 * memory with every change: on, off, or undefined for the deployment's
+	 * default. Throws when the store cannot read it now (an exhausted budget).
+	 */
+	private readToggle(feature: ToggleFeature): boolean | undefined {
 		if (!this.toggles.has(feature)) {
 			if (feature === "presence") {
 				// With when it was last turned on (seenFloor), in the same read.
@@ -6338,6 +6421,24 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return this.toggles.get(feature);
 	}
 
+	/**
+	 * A feature's toggle as readToggle reads it, or `unreadable` when it
+	 * cannot be read now, which is not kept, so a later call reads it again.
+	 * Every use of a toggle but `/toggle` itself comes through here and
+	 * never throws: one that shows a feature (the `server` frame,
+	 * `permissions`, the command list) leaves `unreadable` undefined, the
+	 * deployment's default; one that allows something the store does not
+	 * check itself (typing, adding members) passes false, so it fails
+	 * closed. The store enforces the uploads and live text toggles itself.
+	 */
+	private toggled(feature: ToggleFeature, unreadable?: boolean): boolean | undefined {
+		try {
+			return this.readToggle(feature);
+		} catch {
+			return unreadable;
+		}
+	}
+
 	/** Uploads: configured, and not turned off by an admin. */
 	private uploadsOn(): boolean {
 		return !!this.config.uploads && (this.toggled("uploads") ?? true);
@@ -6349,13 +6450,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/** Activity (typing): the deployment's default (plan or `ACTIVITY`) unless an admin toggled it. */
-	private activityOn(): boolean {
-		return this.toggled("activity") ?? this.config.activityEnabled;
+	private activityOn(enforce = false): boolean {
+		return this.toggled("activity", enforce ? false : undefined) ?? this.config.activityEnabled;
 	}
 
 	/** Registered users adding others to rooms (`room_join` with a `user_id`): on unless an admin turned it off. */
-	private addMemberOn(): boolean {
-		return this.toggled("addmember") ?? true;
+	private addMemberOn(enforce = false): boolean {
+		return this.toggled("addmember", enforce ? false : undefined) ?? true;
 	}
 
 	/**
@@ -6381,6 +6482,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const features: ToggleFeature[] = ["activity", ...(this.config.uploads ? ["uploads" as const] : []), ...(this.config.push ? ["presence" as const] : []), "addmember", ...(this.config.liveText ? ["livetext" as const] : [])];
 		const chosen = features.find((candidate) => candidate === feature);
 		if (!chosen) throw { name: "invalid_params", message: `Usage: /toggle ${features.join("|")}` } satisfies ProtocolError;
+		// Flipped from what is stored, never from a default stood in for it: one that cannot be read refuses the command.
+		this.readToggle(chosen);
 		const on = !(chosen === "uploads" ? this.uploadsOn() : chosen === "presence" ? this.presenceMode() : chosen === "addmember" ? this.addMemberOn() : chosen === "livetext" ? this.liveTextOn() : this.activityOn());
 		const fallback = chosen === "uploads" || chosen === "addmember" ? true : chosen === "presence" ? this.config.presence : chosen === "livetext" ? this.config.liveTextEnabled : this.config.activityEnabled;
 		const override = on === fallback ? undefined : on;
@@ -6525,16 +6628,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async refreshLiveDeadline(): Promise<void> {
 		const entries = this.store.openLiveTexts(nowMs());
 		const next = entries.length ? Math.min(...entries.map(liveDeadline)) : undefined;
-		if (next === this.liveDeadlineAt) return;
-		this.liveDeadlineAt = next;
+		if (!this.deadlines.live.set(next)) return;
 		await this.rescheduleAlarm();
 	}
 
 	/** Notes when an open live text falls due; true when that moves the alarm earlier. */
 	private noteLiveDeadline(due: number): boolean {
-		if (this.liveDeadlineAt !== undefined && this.liveDeadlineAt <= due) return false;
-		this.liveDeadlineAt = due;
-		return true;
+		return this.deadlines.live.soonest(due);
 	}
 
 	/**
@@ -6545,7 +6645,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async recoverLiveTexts(): Promise<void> {
 		if (!this.config.liveText) return;
-		if (this.liveRecovered && (this.liveDeadlineAt === undefined || this.liveDeadlineAt > nowMs())) return;
+		if (this.liveRecovered && !this.deadlines.live.passed(nowMs())) return;
 		this.liveRecovered = true;
 		await this.expireLive(nowMs());
 		await this.rescheduleAlarm();
@@ -6556,30 +6656,43 @@ export class ApronDemoServer extends DurableObject<Env> {
 		await this.runMutation(async () => {
 			// Read inside the mutation: a write claimed before it is streaming by now (liveWrite).
 			const streaming = new Set<string>();
-			for (const session of this.liveSessions.values()) if (session.buffer) streaming.add(session.entry.key);
+			for (const session of this.liveSessions.values()) if (session.phase === "streaming") streaming.add(session.entry.key);
 			const expired = this.store.expireLiveTexts(streaming, now);
 			for (const record of expired.broadcasts) this.broadcastRecord(record);
 			for (const entry of expired.ended) {
 				const session = this.liveSessions.get(entry.id);
-				if (session && !session.buffer) {
-					session.readers.close();
-					this.liveSessions.delete(entry.id);
-				}
+				if (session?.phase === "waiting") this.forgetWaitingLive(session);
 			}
-			this.liveDeadlineAt = expired.next;
+			this.deadlines.live.set(expired.next);
 		});
 	}
 
-	/** Stops a streaming write early: a save removed its embed, or its owner was purged. */
+	/** Stops a live text early: a save removed its embed, or its owner was purged. */
 	private stopLiveText(key: string, reason: LiveEnd): void {
 		for (const session of this.liveSessions.values()) {
 			if (session.entry.key !== key) continue;
-			if (session.stop) session.stop(reason);
-			else {
-				session.readers.close();
-				this.liveSessions.delete(session.entry.id);
-			}
+			if (session.phase === "streaming") session.stop.abort(reason);
+			else this.forgetWaitingLive(session);
 		}
+	}
+
+	/** Forgets the waiting sessions of a live text the store no longer holds open. */
+	private forgetEndedLive(key: string): void {
+		let open: ReadonlySet<string>;
+		try {
+			open = new Set(this.store.openLiveTexts(nowMs()).map((entry) => entry.key));
+		} catch {
+			return; // Unknown: the alarm's expiry ends them if their text went.
+		}
+		for (const session of this.liveSessions.values()) {
+			if (session.phase === "waiting" && session.entry.key === key && !open.has(key)) this.forgetWaitingLive(session);
+		}
+	}
+
+	/** Ends a live text's wait for its write: its readers are closed, and it is no longer held. */
+	private forgetWaitingLive(session: Extract<LiveSession, { phase: "waiting" }>): void {
+		session.readers.close();
+		this.liveSessions.delete(session.entry.id);
 	}
 
 	/** Ends the live texts of purged users: their messages are gone, so nothing is published. */
@@ -6588,7 +6701,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const entries = this.store.openLiveTexts(nowMs()).filter((entry) => userIds.includes(entry.owner));
 		for (const entry of entries) {
 			const session = this.liveSessions.get(entry.id);
-			if (session?.stop) session.stop("removed");
+			if (session?.phase === "streaming") session.stop.abort("removed");
 			else {
 				await this.runMutation(async () => { this.store.finishLiveText(entry.key, null, nowMs()); });
 				this.stopLiveText(entry.key, "removed");
@@ -6651,7 +6764,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!session) {
 			const entry = this.store.openLiveTexts(nowMs()).find((candidate) => candidate.id === id);
 			if (!entry || entry.state !== "pending" || entry.messageId === undefined) return liveRefused(liveAnswer(404, "This live text has ended, or never existed"), "ended");
-			session = { entry, readers: new LiveReaders() };
+			session = { phase: "waiting", entry, readers: new LiveReaders() };
 			this.liveSessions.set(id, session);
 		}
 		const viewer = session.entry.kind === "terminal" ? viewerUrl : undefined;
@@ -6673,7 +6786,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (readers >= policy.readers) return liveRefused(liveAnswer(429, "Live text has as many readers as the server allows", 10_000), "readers");
 		// This address's own limit: not marked, so the entry Worker never repeats it to others.
 		if (fromAddress >= policy.readersPerAddress) return liveAnswer(429, "Too many live text readers from your address", 10_000);
-		return new Response(session.readers.open(session.buffer?.kept() ?? new Uint8Array(0), ipKey), { headers });
+		return new Response(session.readers.open(session.phase === "streaming" ? session.buffer.kept() : new Uint8Array(0), ipKey), { headers });
 	}
 
 	/**
@@ -6686,16 +6799,28 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async liveWrite(key: string, body: ReadableStream<Uint8Array>): Promise<Response> {
 		let claimed: ReturnType<Store["claimLiveText"]> = null;
-		let streaming: LiveSession | undefined;
+		let streaming: Extract<LiveSession, { phase: "streaming" }> | undefined;
 		await this.runMutation(async () => {
-			claimed = this.store.claimLiveText(key, nowMs());
+			try {
+				claimed = this.store.claimLiveText(key, nowMs());
+			} catch (error) {
+				// A refused claim may end the text (Store.claimLiveText): its waiting readers go with it.
+				this.forgetEndedLive(key);
+				throw error;
+			}
 			if (!claimed) return;
 			for (const record of claimed.broadcasts) this.broadcastRecord(record);
-			// Streaming from its claim, in the same mutation, so an expiry queued behind it does not end it as lost.
+			// Streaming from its claim, in the same mutation, so an expiry queued behind it does not end it as lost,
+			// and a stop that comes before the read loop below starts is kept until it does.
 			const entry = claimed.entry;
-			streaming = this.liveSessions.get(entry.id) ?? { entry, readers: new LiveReaders() };
-			streaming.entry = entry;
-			streaming.buffer = new LiveBuffer(entry.kind, entry.limit);
+			const waiting = this.liveSessions.get(entry.id);
+			streaming = {
+				phase: "streaming",
+				entry,
+				readers: waiting?.readers ?? new LiveReaders(),
+				buffer: new LiveBuffer(entry.kind, entry.limit),
+				stop: new AbortController(),
+			};
 			this.liveSessions.set(entry.id, streaming);
 		});
 		if (!claimed || !streaming) {
@@ -6709,40 +6834,36 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.dropHeld(entry.owner, message.room_id);
 			if (this.store.identityExists(entry.owner)) this.wakeFor(message);
 		}
-		const session: LiveSession = streaming;
-		const buffer = session.buffer!;
+		const session = streaming as Extract<LiveSession, { phase: "streaming" }>;
+		const buffer = session.buffer;
 		// The alarm ends it should this instance be lost meanwhile, and no longer waits for its write.
 		await this.refreshLiveDeadline().catch(() => undefined);
 		const reader = body.getReader();
 		reader.closed.catch(() => undefined);
-		let end: LiveEnd | undefined;
-		session.stop = (reason) => {
-			end ??= reason;
-			reader.cancel().catch(() => undefined);
-		};
-		const timer = setTimeout(() => session.stop!("time"), Math.max(0, (entry.startedMs ?? nowMs()) + entry.maxMs - nowMs()));
+		const cancel = () => { reader.cancel().catch(() => undefined); };
+		// A stop that came while the deadline was refreshed cancels at once: the signal kept it.
+		if (session.stop.signal.aborted) cancel();
+		else session.stop.signal.addEventListener("abort", cancel, { once: true });
+		const timer = setTimeout(() => session.stop.abort("time"), Math.max(0, (entry.startedMs ?? nowMs()) + entry.maxMs - nowMs()));
 		// An append takes no more input than it keeps, as before edits; a terminal, maxInputBytes.
 		const maxInput = liveInputLimit(entry, this.config.liveText!.policy);
 		try {
-			for (;;) {
+			while (!session.stop.signal.aborted) {
 				const { done, value } = await reader.read();
-				if (done || end) break;
+				if (done || session.stop.signal.aborted) break;
 				const room = maxInput - buffer.received;
 				const pushed = buffer.push(value.length > room ? value.subarray(0, room) : value);
 				session.readers.send(pushed.send);
-				if (pushed.full || buffer.received >= maxInput) {
-					end = "size";
-					break;
-				}
+				if (pushed.full || buffer.received >= maxInput) session.stop.abort("size");
 			}
 		} catch {
-			end ??= "disconnected";
+			session.stop.abort("disconnected");
 		} finally {
 			clearTimeout(timer);
 		}
-		end ??= "complete";
-		reader.cancel().catch(() => undefined);
-		return this.endLiveText(session, end);
+		session.stop.abort("complete");
+		cancel();
+		return this.endLiveText(session, liveStopped(session)!);
 	}
 
 	/**
@@ -6750,12 +6871,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * (Store.finishLiveText; nothing after a save that removed it), ends its
 	 * readers, and tells the writer why it ended, after the snapshot.
 	 */
-	private async endLiveText(session: LiveSession, end: LiveEnd): Promise<Response> {
+	private async endLiveText(session: Extract<LiveSession, { phase: "streaming" }>, end: LiveEnd): Promise<Response> {
 		const entry = session.entry;
 		// An append's last incomplete character, if any, reads as U+FFFD, for its readers too;
 		// cut at the input limit, it is dropped, so the text ends at a whole character (§4.8.5).
-		if (session.buffer) session.readers.send(session.buffer.end(end === "size"));
-		const kept = session.buffer?.kept() ?? new Uint8Array(0);
+		session.readers.send(session.buffer.end(end === "size"));
+		const kept = session.buffer.kept();
 		let published = false;
 		try {
 			await this.runMutation(async () => {
@@ -7112,8 +7233,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** Runs the alarm's maintenance again shortly: batched work left more behind. */
 	private maintenanceSoon(now: number): void {
-		const next = now + 1_000;
-		this.maintenanceAt = this.maintenanceAt === undefined ? next : Math.min(this.maintenanceAt, next);
+		this.deadlines.maintenance.soonest(now + 1_000);
 	}
 
 	/** Deletes one device token and its entry in its user's list (an expired one); never throws. */
@@ -7477,15 +7597,35 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (to === ADMIN_USER_ID) throw { name: "invalid_params", message: `The user_id ${to} is taken` } satisfies ProtocolError;
 		assertIssuableUserId(to);
 		const renamed = this.store.renameIdentity({ from, to, now: nowMs() });
+		// Before any await: from the commit on, nothing on this object acts as the retired user_id.
+		this.moveUserState(from, to);
 		await this.moveInviteToken(from, to);
 		await this.moveDeviceTokens(from, to);
+		// Clients keep nothing yet for the new `user_id`, so the object carries
+		// every profile field (§3.3), not only the one that changed.
+		const identity = { user_id: to, ...(renamed.name ? { name: renamed.name } : {}), ...(renamed.avatar ? { avatar: renamed.avatar } : {}), roles: renamed.roles, ...(renamed.ext ? { ext: renamed.ext } : {}) };
+		const old = { user_id: from, ...(renamed.name ? { name: renamed.name } : {}) };
+		this.announceUser(null, identity, this.liveRoomsOf(to) ?? renamed.rooms, old);
+		this.sendNotice(socket, roomId, `Renamed \`${from}\` to \`${to}\`.`);
+		this.reply(socket, request, {});
+	}
+
+	/**
+	 * Moves everything this object keeps for a user under their `user_id`
+	 * to their new one (`/rename`): the one place a user's state on this
+	 * object is re-keyed, so a rename leaves none of it behind under the
+	 * retired id. That is their connections' identity; their status (when it
+	 * was announced, a departure being waited out, and changes others are
+	 * owed of it); the wakes waiting to push to them; and the per-user rate
+	 * limits and bot activity, so a rename resets neither.
+	 */
+	private moveUserState(from: string, to: string): void {
 		for (const peer of this.connectionsOf(from)) {
 			const state = connectionAttachment(peer);
 			if (!state) continue;
 			state.userId = to;
 			writeAttachment(peer, state);
 		}
-		// Their status moves with them: when it was announced, and changes others are owed.
 		const announced = this.announcedAt.get(from);
 		this.announcedAt.delete(from);
 		if (announced !== undefined) this.noteAnnounced(to, announced);
@@ -7496,13 +7636,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 			state.owed = state.owed.map((entry) => entry[0] === from ? [to, ...entry.slice(1)] as OwedStatus : entry);
 			writeAttachment(ws as WebSocketConnection, state);
 		}
-		// Clients keep nothing yet for the new `user_id`, so the object carries
-		// every profile field (§3.3), not only the one that changed.
-		const identity = { user_id: to, ...(renamed.name ? { name: renamed.name } : {}), ...(renamed.avatar ? { avatar: renamed.avatar } : {}), roles: renamed.roles, ...(renamed.ext ? { ext: renamed.ext } : {}) };
-		const old = { user_id: from, ...(renamed.name ? { name: renamed.name } : {}) };
-		this.announceUser(null, identity, this.liveRoomsOf(to) ?? renamed.rooms, old);
-		this.sendNotice(socket, roomId, `Renamed \`${from}\` to \`${to}\`.`);
-		this.reply(socket, request, {});
+		for (const wake of this.pendingWakes) {
+			const reasons = wake.reasons.get(from);
+			if (reasons === undefined) continue;
+			wake.reasons.delete(from);
+			wake.reasons.set(to, (wake.reasons.get(to) ?? 0) | reasons);
+		}
+		this.statusChanges.move(from, to);
+		this.pushRegisters.move(from, to);
+		const active = this.botActiveAt.get(from);
+		if (active !== undefined) {
+			this.botActiveAt.delete(from);
+			this.botActiveAt.set(to, active);
+		}
 	}
 
 	/**
@@ -8249,8 +8395,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.deleteMedia(result.deletedUploads ?? []);
 		let started = false;
 		for (const upload of result.uploads ?? []) {
-			const due = upload.writeExpiresMs + UPLOAD_WRITE_GRACE_MS;
-			this.uploadDeadline = this.uploadDeadline === undefined ? due : Math.min(this.uploadDeadline, due);
+			this.deadlines.uploads.soonest(upload.writeExpiresMs + UPLOAD_WRITE_GRACE_MS);
 			started = true;
 		}
 		return started;
@@ -8484,17 +8629,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private rescheduleAlarm(): Promise<void> {
 		const task = this.alarmTail.catch(() => undefined).then(async () => {
 			let deadline: number | undefined;
+			const consider = (at: number | undefined) => {
+				if (at !== undefined && Number.isFinite(at)) deadline = deadline === undefined ? at : Math.min(deadline, at);
+			};
 			for (const socket of this.ctx.getWebSockets()) {
 				const state = connectionAttachment(socket);
-				if (!state || state.closing) continue;
-				const due = [state.tier === "pending" ? state.authDeadline : undefined, state.challenge?.expiresAt]
-					.filter((value): value is number => value !== undefined);
-				for (const value of due) deadline = deadline === undefined ? value : Math.min(deadline, value);
+				if (state) for (const [, at] of connectionDeadlines(state)) consider(at);
 			}
-			if (this.uploadDeadline !== undefined) deadline = deadline === undefined ? this.uploadDeadline : Math.min(deadline, this.uploadDeadline);
-			if (this.liveDeadlineAt !== undefined) deadline = deadline === undefined ? this.liveDeadlineAt : Math.min(deadline, this.liveDeadlineAt);
-			if (this.maintenanceAt !== undefined) deadline = deadline === undefined ? this.maintenanceAt : Math.min(deadline, this.maintenanceAt);
-			if (Number.isFinite(this.presenceAlarmAt)) deadline = deadline === undefined ? this.presenceAlarmAt : Math.min(deadline, this.presenceAlarmAt);
+			for (const due of Object.values(this.deadlines)) consider(due.at);
+			// The end of an attack pause, so the change back is announced then, not at the next event.
+			consider(this.pausedUntil(nowMs()) || undefined);
 			await this.store.scheduleAlarm(deadline, nowMs());
 			this.alarmKnown = true;
 		});

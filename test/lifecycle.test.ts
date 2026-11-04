@@ -303,3 +303,33 @@ it("keeps a pending ceremony for a different challenge id and consumes it on act
 		await peer.close();
 	}
 });
+
+it("keeps what other events changed on a connection while a passkey ceremony awaited, writing only its challenge", async () => {
+	const stub = env.DEMO.getByName("public-demo-v1");
+	const peer = await pendingSocket();
+	try {
+		// Meanwhile, while the ceremony's options are made, another event
+		// changes fields of this connection's attachment the ceremony does not own.
+		await runInDurableObject(stub, async (instance) => {
+			const runtime = instance as unknown as { webAuthn: { begin(...args: unknown[]): Promise<unknown> } };
+			const begin = runtime.webAuthn.begin.bind(runtime.webAuthn);
+			const sockets = socketsOf(instance);
+			runtime.webAuthn.begin = async (...args: unknown[]) => {
+				const begun = await begin(...args);
+				for (const socket of sockets) {
+					const attachment = socket.deserializeAttachment();
+					if (attachment.tier === "pending" && !attachment.closing) socket.serializeAttachment({ ...attachment, seen: 1_700_000_000_000, wakeJoined: true });
+				}
+				runtime.webAuthn.begin = begin;
+				return begun;
+			};
+		});
+		peer.socket.send(JSON.stringify({ id: "begin-meanwhile", method: "auth", params: { scheme: "webauthn", action: "register", step: "begin" } }));
+		const begun = await peer.next();
+		expect(begun.result?.challenge_id).toEqual(expect.any(String));
+		const mine = (await attachments(stub)).find((attachment) => attachment.challenge?.challengeId === begun.result.challenge_id);
+		expect(mine).toMatchObject({ seen: 1_700_000_000_000, wakeJoined: true });
+	} finally {
+		await peer.close();
+	}
+});
