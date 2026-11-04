@@ -390,8 +390,8 @@ holds (charged as a registration, named as the proposal asked, else
 resumes like a passkey's. Only a connection not signed in at all approves a
 sign-in, never a guest's or an account's, so a link cannot move someone
 into another account. A guest instead registers: its proposal creates a
-new account holding the address, approved by the code on that guest
-connection only, which becomes the account and keeps the guest's rooms,
+new account holding the address, approved by its code or link token on
+that guest connection only, which becomes the account and keeps the guest's rooms,
 as a passkey registration does; for an address that already has an
 account, the email says to sign in instead and has no code. On a
 signed-in connection, a proposal instead adds the address to the account,

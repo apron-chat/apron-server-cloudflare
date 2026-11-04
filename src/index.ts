@@ -3714,9 +3714,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * sign in instead and carries no code. On a connection not signed in it
 	 * proposes signing in, or signing up when no account holds the address.
 	 * The result is `{}` either way. It emails a six-digit code that works
-	 * only on this connection and, when the proposal carries `state` (and is
-	 * not a guest's), a link whose token works on any connection not signed
-	 * in, both for `proposalSeconds`. A new proposal
+	 * only on this connection and, when the proposal carries `state`, a link
+	 * whose token works wherever the proposal approves (a guest's: only on
+	 * its own connection), both for `proposalSeconds`. A new proposal
 	 * replaces the connection's last. Each email is charged to the IP, the
 	 * address and the server (Store.chargeEmailSend), and past any of those
 	 * the proposal is `retry_after` and sends nothing.
@@ -3792,9 +3792,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return adds ? { kind: "add", userId: adds } : owner ? { kind: "sign-in", userId: owner } : { kind: "sign-up" };
 		});
 		if (purpose) {
-			// A guest's registration works only on its own connection, so its
-			// email has the code alone: a link would open somewhere else.
-			const link = state !== undefined && !guest ? emailLink(email.linkUrl, { server: email.server, token, state }) : undefined;
+			// A guest's registration approves only on its own connection, so its
+			// link works only once the tab it opens hands the token back to the
+			// one that asked (docs/guide.md, Email sign-in in a client).
+			const link = state !== undefined ? emailLink(email.linkUrl, { server: email.server, token, state }) : undefined;
 			const message = emailMessage({ server: this.emailServerName(), ...(purpose.kind === "exists" ? {} : { code }), ...(link ? { link } : {}), purpose, minutes: Math.max(1, Math.round(email.policy.proposalSeconds / 60)) });
 			try {
 				await this.deliverEmail(address, message);

@@ -200,14 +200,16 @@ it('registers a guest with email, keeping its rooms, and never moves a guest or 
 		return { peer, guestId };
 	};
 	try {
-		// A guest's proposal registers: code only (a link would open elsewhere), and the guest becomes the account.
+		// A guest's proposal registers, and the guest becomes the account. Its
+		// link works only once handed back to the guest's own connection.
 		const { peer: guest, guestId } = await asGuest();
 		const thread = (await request(guest, 'thread', 'room_set', { parent_room_id: 'general', title: 'Guest thread' })).result.room_id;
 		const mail = await propose(guest, email, { name: 'Grace', state: 'g1' });
 		expect(mail.text).toContain('create an account on Apron Demo');
-		expect(mail.link).toBeUndefined();
+		expect(mail.link).toMatch(/&state=g1$/);
+		expect((await approve(await open(), mail.token!)).error).toMatchObject({ code: -32001, message: 'Approve this registration on the guest connection that asked for it' });
 		const watcher = await asGuest();
-		const registered = await approve(guest, mail.code);
+		const registered = await approve(guest, mail.token!);
 		const userId: string = registered.result.you.user_id;
 		expect(userId).toMatch(/^grace_/);
 		expect(registered.result.token).toBeTruthy();

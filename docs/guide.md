@@ -217,13 +217,45 @@ universal link any client may handle (a deployment's `EMAIL_LINK_URL` may
 replace the page): when its `state` is the one your client
 proposed with, present its token with `scheme: "email"` on any connection
 not signed in; otherwise ask the user first (§4.11.2). On a guest's
-connection, the same proposal registers instead: the code (there is no
-link) turns the guest into a new account holding the address, keeping its
-rooms, as a passkey registration does; for an address that already has an
-account, the email tells the user to sign in instead. On a connection
-signed in to an account, the proposal adds the address to it (replacing
-the account's one address).
+connection, the same proposal registers instead: its code or link token,
+presented on that guest connection only, turns the guest into a new
+account holding the address, keeping its rooms, as a passkey registration
+does; for an address that already has an account, the email tells the user
+to sign in instead. On a connection signed in to an account, the proposal
+adds the address to it (replacing the account's one address).
 See [SPEC section 5, Email](../SPEC.md#email).
+
+**Email sign-in in a client: one tab, not two.** A link opens a new tab,
+but the tab that asked should finish the sign-in: it has the user's place,
+and a guest's registration approves only on its connection. Hand the link's
+token back over a `BroadcastChannel` on your origin:
+
+1. The asking tab keeps its `state` and listens on
+   `BroadcastChannel("apron-email")` until the proposal expires (10
+   minutes).
+2. The tab the link opens reads `#server=…&token=…&state=…`, posts
+   `{state, token, server}` on the channel, and waits about half a second.
+   Only your origin's tabs hear it, and only the one holding that `state`
+   acts on it.
+3. The asking tab presents the token with `scheme: "email"` on its own
+   connection, then answers `{state, ok: true}` or `{state, error}`: the
+   outcome, not merely that it took the token, so a failure such as an
+   expired link is shown rather than lost in a closed tab.
+4. The link's tab then calls `window.close()`, which browsers allow for a
+   tab opened from a link with one history entry; where it is refused, it
+   shows "Signed in in your other tab; you can close this one".
+5. With no answer, nobody is waiting: a sign-in link signs in right there,
+   on that tab's own connection not signed in; a guest's registration link
+   shows "This link only works in the tab where you asked; type the code
+   there, or ask for a new email".
+
+`BroadcastChannel` reaches only tabs on the same origin in the same
+browser, so the link must land on your origin: `https://link.apron.chat/`
+(the default) has to send the user on to your client with the fragment, or
+a deployment for one client sets `EMAIL_LINK_URL` to it. A mail app's
+in-app browser or another browser hears nothing; the code works there, so
+always offer it. Optionally, after signing in, post that on the channel too,
+so the client's other open tabs pick up the session.
 A user who signed up with a token can add a passkey by registering one while
 signed in. `web.apron.chat` additionally receives `webauthn`, and its `token`
 also resumes passkey sessions; inspect each connection's
