@@ -720,6 +720,13 @@ interface StoredEmailProposal {
 	adds?: string;
 }
 
+/** Why an account at its address cap cannot add another. */
+function addressCapError(cap: number): ProtocolError {
+	return { name: "denied", message: cap === 1
+		? "An account holds one email address; remove yours with /email remove first"
+		: `An account holds at most ${cap} email addresses; remove one with /email remove first` };
+}
+
 /** A stored address list, type-checked: none when absent or malformed. */
 function storedEmails(value: StoredEmails | undefined): StoredEmails["emails"] {
 	if (value?.v !== 1 || !Array.isArray(value.emails)) return [];
@@ -3728,9 +3735,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				const holder = stored?.v === 1 && typeof stored.userId === "string" && this.store.identityExists(stored.userId) ? stored.userId : null;
 				if (adds && holder !== adds) {
 					const held = storedEmails(await this.ctx.storage.get<StoredEmails>(EMAILS_KEY_PREFIX + adds));
-					if (held.length >= email.policy.addressesPerUser) {
-						throw { name: "denied", message: `An account holds at most ${email.policy.addressesPerUser} email addresses; remove one with /email remove first` } satisfies ProtocolError;
-					}
+					if (held.length >= email.policy.addressesPerUser) throw addressCapError(email.policy.addressesPerUser);
 				}
 				return holder;
 			});
@@ -3895,7 +3900,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		await this.store.withMeterAsync("foreground", { reads: 1, writes: 2 }, async () => {
 			const listKey = EMAILS_KEY_PREFIX + userId;
 			const held = storedEmails(await this.ctx.storage.get<StoredEmails>(listKey)).filter((entry) => entry.key !== addressKey);
-			if (held.length >= cap) throw { name: "denied", message: `An account holds at most ${cap} email addresses; remove one with /email remove first` } satisfies ProtocolError;
+			if (held.length >= cap) throw addressCapError(cap);
 			await this.ctx.storage.put({
 				[addressKey]: { v: 1, userId, address, addedMs: now } satisfies StoredEmail,
 				[listKey]: { v: 1, emails: [...held, { address, key: addressKey, addedMs: now }] } satisfies StoredEmails,

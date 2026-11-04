@@ -208,6 +208,11 @@ it('adds an address to the signed-in account, which then signs in with it', asyn
 		expect((await approve(stranger, mail.token!)).error.code).toBe(-32001);
 		expect(await approve(peer, mail.code)).toMatchObject({ result: {} });
 		expect((await command(peer, '/email')).notices[0]).toContain(email);
+		// One address an account: another is refused before anything is sent.
+		const sent = outbox.length;
+		expect((await request(peer, 'second', 'auth', { scheme: 'email', email: address() })).error)
+			.toMatchObject({ code: -32001, message: 'An account holds one email address; remove yours with /email remove first' });
+		expect(outbox.length).toBe(sent);
 		const later = await fresh();
 		try {
 			const signIn = await propose(later, email);

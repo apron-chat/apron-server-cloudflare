@@ -186,14 +186,15 @@ interface LiveTextConfig {
 }
 
 export interface EmailConfig {
-	/** The plan's email policy. */
+	/** The plan's email policy, with any `EMAIL_<KEY>` variable in place of its value. */
 	policy: EmailPolicy;
 	/** The address emails come from (`EMAIL_FROM`), on a domain onboarded to Email Sending. */
 	from: string;
 	/**
 	 * The page sign-in links open (`EMAIL_LINK_URL`, else
-	 * https://link.apron.chat/), with the token, `state` and server in its
-	 * fragment (§4.11.2).
+	 * https://link.apron.chat/, the protocol's universal link, which opens in
+	 * whichever Apron client the user has), with the token, `state` and
+	 * server in its fragment (§4.11.2).
 	 */
 	linkUrl: string;
 	/**
@@ -616,7 +617,19 @@ function loadUploads(env: EnvLike): UploadConfig | undefined {
 function loadEmail(env: EnvLike): EmailConfig | undefined {
 	const rawFrom = env.EMAIL_FROM?.trim() ?? "";
 	if (!EMAIL_POLICY || !env.EMAIL || !rawFrom) return undefined;
-	validateEmailPolicy(EMAIL_POLICY);
+	// Each `EMAIL_<KEY>` variable (such as EMAIL_ADDRESSES_PER_USER) replaces
+	// the plan's value, within the calibrated bounds.
+	const policy = { ...EMAIL_POLICY } as EmailPolicy;
+	const values = env as EnvLike & Record<string, unknown>;
+	for (const key of Object.keys(policy) as (keyof EmailPolicy)[]) {
+		const name = `EMAIL_${key.replace(/[A-Z]/g, (letter) => `_${letter}`).toUpperCase()}`;
+		const raw = values[name];
+		if (raw === undefined || raw === "") continue;
+		const value = typeof raw === "number" ? raw : Number(raw);
+		if (!Number.isSafeInteger(value) || value <= 0) throw new ConfigError(`${name} must be a positive safe integer`);
+		policy[key] = value;
+	}
+	validateEmailPolicy(policy);
 	const from = normalizeEmail(rawFrom);
 	if (!from) throw new ConfigError("EMAIL_FROM must be a plain email address, such as login@example.com");
 	const rawLink = env.EMAIL_LINK_URL?.trim() || DEFAULT_EMAIL_LINK_URL;
@@ -643,7 +656,7 @@ function loadEmail(env: EnvLike): EmailConfig | undefined {
 		if (!validOrigin(publicOrigin)) throw new ConfigError("PUBLIC_ORIGIN must be an exact HTTP(S) origin");
 		server = `${publicOrigin.startsWith("http:") ? "ws:" : "wss:"}//${new URL(publicOrigin).host}/`;
 	}
-	return { policy: EMAIL_POLICY, from, linkUrl, server };
+	return { policy, from, linkUrl, server };
 }
 
 /** Throws unless the plan's email policy is within its calibrated bounds. */

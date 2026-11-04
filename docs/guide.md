@@ -211,8 +211,9 @@ email with `{"scheme": "email", "token": "418092"}` on the same connection.
 The result carries `you` and a session `token`, bound to your origin (or to
 no Origin, for a native client), to save and resume with `scheme: "token"`.
 With `state`, the email also has a link,
-`https://link.apron.chat/#server=…&token=apron_email_…&state=…` (or the
-deployment's `EMAIL_LINK_URL`): when its `state` is the one your client
+`https://link.apron.chat/#server=…&token=apron_email_…&state=…`, the
+universal link any client may handle (a deployment's `EMAIL_LINK_URL` may
+replace the page): when its `state` is the one your client
 proposed with, present its token with `scheme: "email"` on any connection
 not signed in; otherwise ask the user first (§4.11.2). On a signed-in
 connection, the same proposal adds the address to the account instead.

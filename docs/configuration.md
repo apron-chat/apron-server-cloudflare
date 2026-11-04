@@ -606,20 +606,24 @@ sign-in link when the client's proposal carries `state`. It signs in to the
 account that holds the address, signs up a new account for an address none
 holds, or adds the address to the signed-in account. Only Workers Paid has
 an `email` policy (Free cannot send to arbitrary addresses), in
-`src/plans/paid.ts`:
+`src/plans/paid.ts`. A deployment replaces any of its values with an
+`EMAIL_<KEY>` variable, such as `EMAIL_ADDRESSES_PER_USER=3` or
+`EMAIL_SENDS_PER_DAY=50`, within the ceilings the configuration check
+enforces (a malformed or out-of-bounds value fails it):
 
-| Setting | Workers Paid |
+| Setting (variable) | Workers Paid |
 | --- | ---: |
-| `sendsPerDay` (server-wide, UTC day) | 95 |
-| `sendsPerIpDay` (one IP's proposals, after a burst of 3 then one a minute) | 10 |
-| `sendsPerAddressDay` (to one address, whoever asks) | 3 |
-| `proposalSeconds` (how long a code and link last) | 600 |
-| `maxFailures` (wrong codes and misplaced links that cancel a proposal) | 5 |
-| `addressesPerUser` | 3 |
+| `sendsPerDay` (`EMAIL_SENDS_PER_DAY`; server-wide, UTC day) | 95 |
+| `sendsPerIpDay` (`EMAIL_SENDS_PER_IP_DAY`; one IP's proposals, after a burst of 3 then one a minute) | 10 |
+| `sendsPerAddressDay` (`EMAIL_SENDS_PER_ADDRESS_DAY`; to one address, whoever asks) | 3 |
+| `proposalSeconds` (`EMAIL_PROPOSAL_SECONDS`; how long a code and link last, at most 30 minutes) | 600 |
+| `maxFailures` (`EMAIL_MAX_FAILURES`; wrong codes and misplaced links that cancel a proposal, at most 10) | 5 |
+| `addressesPerUser` (`EMAIL_ADDRESSES_PER_USER`; addresses one account holds, at most 10) | 1 |
 
 Workers Paid includes 3,000 emails a month, then $0.35 per 1,000
 ([pricing](https://developers.cloudflare.com/email-service/platform/pricing/));
-95 a day stays inside it in any month, so email adds nothing to the bill.
+95 a day stays inside it in any month, so email adds nothing to the bill;
+an `EMAIL_SENDS_PER_DAY` above 96 can.
 Emails Cloudflare rejects for a suppressed recipient do not count. A send
 the limits refuse is `retry_after` and sends nothing.
 
@@ -645,11 +649,12 @@ until the deployment sets both:
 
 The links name the server as `EMAIL_SERVER` when set (a `wss:` or `ws:`
 address), else `wss://` and the host of `PUBLIC_ORIGIN`; one of the two is
-required. They open `EMAIL_LINK_URL`, else `https://link.apron.chat/`, the
-protocol's universal link (Appendix A.4), with the token, `state` and
-server in the fragment. Point it at a client that handles sign-in links
-(`#token=…&state=…&server=…`), such as `https://web.apron.chat/`, so the
-link opens where the proposal's `state` is kept. A malformed `EMAIL_FROM`,
+required. They open `https://link.apron.chat/`, the protocol's universal
+link (Appendix A.4), with the token, `state` and server in the fragment, so
+a link opens in whichever Apron client the user has, not one this server
+picks; the code works in any client, links or not. `EMAIL_LINK_URL`
+replaces that page, for a deployment with a link page of its own. A
+malformed `EMAIL_FROM`,
 `EMAIL_LINK_URL` or `EMAIL_SERVER` fails the configuration check; either
 of `EMAIL_FROM` and the binding alone leaves email off. Removing either
 turns it off; stored addresses stay, unused, until it is back.
@@ -806,7 +811,8 @@ implementation and recalibrating its resource model.
 | `PUSH_HOSTS` | Comma-separated push service hosts registrations may name, `*.host` for a host's subdomains, or a standalone `*` for any public host; unset, the browsers' own services (see [Push](#push)) |
 | `OG_MEDIA_HOSTS` | Comma-separated hosts whose `og` media (`image`, `video`, `audio`) a link embed keeps, `*.host` for a host's subdomains, a standalone `*` for any host, or empty for none; unset, big platforms' image CDNs (see [Link preview media](#link-preview-media)) |
 | `EMAIL_FROM` | Plain sender address on a domain onboarded to Email Sending, such as `login@apron.chat`; with the `EMAIL` `send_email` binding, turns email sign-in on for a plan that has it (see [Email sign-in](#email-sign-in)) |
-| `EMAIL_LINK_URL` | The page sign-in links open, an `https:` URL (`http:` only on a loopback host); unset, `https://link.apron.chat/` |
+| `EMAIL_LINK_URL` | The page sign-in links open, an `https:` URL (`http:` only on a loopback host); unset, `https://link.apron.chat/`, the universal link that opens in any Apron client, which most deployments keep |
+| `EMAIL_<KEY>` | Replaces one value of the plan's email policy, such as `EMAIL_ADDRESSES_PER_USER` or `EMAIL_SENDS_PER_DAY`, within its ceilings (see [Email sign-in](#email-sign-in)) |
 | `EMAIL_SERVER` | The server's `wss:` or `ws:` address in sign-in links; unset, `wss://` and the host of `PUBLIC_ORIGIN` |
 | `PUSH_DELAY_SECONDS` | Whole seconds, 0 to 60, a message's wake waits before it pushes; unset, the plan's `push.delaySeconds`; `0` pushes at once |
 | `ACCOUNT_ID` | The Cloudflare account whose analytics the account-usage stop and the budget guard read; a Wrangler var (see [Editing the deployment budget](#editing-the-deployment-budget)) |

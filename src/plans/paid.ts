@@ -292,7 +292,8 @@ export const PAID_PLAN: Plan = Object.freeze({
 		sendsPerAddressDay: 3,
 		proposalSeconds: 10 * 60,
 		maxFailures: 5,
-		addressesPerUser: 3,
+		// One address an account for now; EMAIL_ADDRESSES_PER_USER raises it.
+		addressesPerUser: 1,
 	}),
 	features: Object.freeze({
 		// Typing costs about 5 frames a typing minute, inside the frame budget.

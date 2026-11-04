@@ -85,6 +85,16 @@ describe('email configuration', () => {
 			.toMatchObject({ server: 'ws://localhost:8787/', linkUrl: 'http://localhost:5173/' });
 	});
 
+	it('takes the plan\'s email policy, with EMAIL_<KEY> variables in place of its values', () => {
+		const on = { EMAIL: binding, EMAIL_FROM: 'login@example.com', PUBLIC_ORIGIN: 'https://chat.example' };
+		expect(EMAIL_POLICY!.addressesPerUser).toBe(1);
+		expect(config({ ...on, EMAIL_ADDRESSES_PER_USER: '3', EMAIL_SENDS_PER_DAY: '50', EMAIL_PROPOSAL_SECONDS: '' }).email!.policy)
+			.toEqual({ ...EMAIL_POLICY, addressesPerUser: 3, sendsPerDay: 50 });
+		for (const [name, value] of [['EMAIL_ADDRESSES_PER_USER', '0'], ['EMAIL_ADDRESSES_PER_USER', '11'], ['EMAIL_MAX_FAILURES', 'x'], ['EMAIL_PROPOSAL_SECONDS', '3600'], ['EMAIL_SENDS_PER_DAY', '2']]) {
+			expect(() => config({ ...on, [name]: value }), name).toThrow(ConfigError);
+		}
+	});
+
 	it('refuses a malformed sender, link page or server', () => {
 		const on = { EMAIL: binding, EMAIL_FROM: 'login@example.com', PUBLIC_ORIGIN: 'https://chat.example' };
 		expect(() => config({ ...on, EMAIL_FROM: 'Login <login@example.com>' })).toThrow(ConfigError);
