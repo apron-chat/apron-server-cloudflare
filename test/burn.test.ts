@@ -81,7 +81,7 @@ describe('shadow burn meter', () => {
 	});
 
 	it('holds 30 minutes, doubling per pause in a day, at most 4 hours', () => {
-		expect([1, 2, 3, 4].map(attackHoldMs)).toEqual([30, 60, 120, 240].map((minutes) => minutes * minute));
+		expect([1, 2, 3, 4, 5].map(attackHoldMs)).toEqual([10, 20, 40, 80, 160].map((minutes) => minutes * minute));
 		expect(attackHoldMs(20)).toBe(4 * 60 * minute);
 	});
 });

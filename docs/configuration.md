@@ -186,12 +186,16 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   (60) a minute at each Cloudflare location. Past it, that Worker turns the
   rule on at once. Counting writes nothing; the one write is turning the rule
   on, and each isolate tries at most once a minute. The trip writes a hold of
-  `holdSeconds` (30 minutes) into the rule's description, as the attack pause
+  `holdSeconds` (5 minutes) into the rule's description, as the attack pause
   does (`[attack hold until …]`): the guard keeps the rule on until it passes,
   long enough for analytics to show the flood and the daily or monthly stop
   to take over, and lifts it once passed even while analytics cannot be read,
   so an outage never leaves a flood's stop on. A trip while the rule is
-  already on changes nothing. These settings are in the plan's `edgeStop`.
+  already on changes nothing. A flood still going trips it again within a
+  minute of the lift, so the stop lasts as long as the flood, at the cost
+  of about a minute of it (12,000 requests or so) each time, while a burst
+  from one address costs everyone five minutes. These settings are in the
+  plan's `edgeStop`.
 - **Log sampling.** Every invocation writes a Workers Logs event. From
   2026-12-01 logs bill by the GB ([Cloudflare Observability
   pricing](https://developers.cloudflare.com/observability/pricing/): 50 GB
@@ -763,7 +767,7 @@ and each lifting by itself (`src/store.ts`, `ApronDemoServer.currentTier`):
 | degraded | Today's foreground SQL reads or writes, or frames, at `DEGRADE_SHARE` (70%) of their ceiling | Live text, uploads and older history (`history` with `before`, except the newest page: `before` alone within two pages of the head) get `retry_after` (`data.reason` `degraded`); chat works | UTC midnight |
 | exhausted | One of those at 99% (`EXHAUSTED_SHARE`; the ledger refuses work just short of 100%) | New work is refused with `retry_after` until the reset; open connections stay; admins' frames and `/status` still answer | UTC midnight |
 | account stop | The estimated overage past `BILL_CAP_DAY` ($5) today or `BILL_CAP_MONTH` ($25) this month (the account-usage stop; on Free, 90% of a daily allowance) | 503 and sockets closed once, as it starts | The day's or month's end |
-| paused (attack) | The attack pause (below): traffic burning $1 an hour or more and mostly refused | Everything refused with 503, every socket closed (admins' too), and the edge stop turned on for the hold | When the hold ends: 30 minutes, doubling with each pause that UTC day, at most 4 hours; at once with `ATTACK_PAUSE=false` |
+| paused (attack) | The attack pause (below): traffic burning $1 an hour or more and mostly refused | Everything refused with 503, every socket closed (admins' too), and the edge stop turned on for the hold | When the hold ends: 10 minutes, doubling with each pause that UTC day, at most 4 hours; at once with `ATTACK_PAUSE=false` |
 
 Every change of tier is announced to the admins (see the admin alert above),
 going up and coming down, with why. It is evaluated at most once a minute on
@@ -801,8 +805,10 @@ before it lifts the rule. Its 503 carries `Apron-Server-Paused` (the end,
 in epoch milliseconds), so each entry Worker isolate refuses by itself for
 up to 5 minutes at a time and a flood costs no object requests even if the
 edge stop fails; the admins are told when it could not be turned on. The
-first pause in a UTC day holds 30 minutes, and each later one twice as long
-as the one before, at most 4 hours. Should analytics fail, the guard still
+first pause in a UTC day holds 10 minutes, and each later one twice as long
+as the one before, at most 4 hours: a flood still going pauses again within
+minutes of the lift and escalates, while a short burst costs everyone ten
+minutes. Should analytics fail, the guard still
 lifts an edge stop whose attack hold has passed. It is logged
 (`attack_paused`), counted (`attack` metric) and announced as the `paused`
 tier; a wake stays paused. The meter itself is in memory, so it starts

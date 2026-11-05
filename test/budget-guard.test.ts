@@ -296,6 +296,9 @@ describe.runIf(PLAN.edgeStop)("flood trip", () => {
 		// Ten times what one location may send the object in a minute (its
 		// admissions are capped there), leaving room for probes and media.
 		expect(policy.floodRequestsPerColoMinute).toBeGreaterThan(PLAN.admission.objectRequestsPerLocationMinute * 10);
-		expect(policy.holdSeconds).toBeGreaterThanOrEqual(15 * 60);
+		// Long enough that a flood still going re-trips at most a few times an
+		// hour, short enough that a burst does not take the server away for long.
+		expect(policy.holdSeconds).toBeGreaterThanOrEqual(5 * 60);
+		expect(policy.holdSeconds).toBeLessThanOrEqual(15 * 60);
 	});
 });
