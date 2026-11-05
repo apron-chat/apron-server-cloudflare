@@ -13,6 +13,19 @@ interface UploadGrant {
 
 const encoder = new TextEncoder();
 const KEY_PATTERN = /^[fael]\/[A-Za-z0-9_-]{22}$/;
+/** The whole token's shape: the key's two parts, the size, the expiry, and a 32-byte signature. */
+const TOKEN_PATTERN = /^[fael]\.[A-Za-z0-9_-]{22}\.\d{1,10}\.\d{1,12}\.[A-Za-z0-9_-]{43}$/;
+
+/**
+ * Whether a token has the shape of one this module signed and has not
+ * expired: a string test, before the configuration is read or the signature
+ * checked, so a flood of guessed or stale write_urls costs the Worker
+ * nothing but the request itself. It proves nothing about the signature.
+ */
+export function looksLikeUploadToken(token: string, now = Date.now()): boolean {
+	if (token.length > 120 || !TOKEN_PATTERN.test(token)) return false;
+	return Number(token.split(".")[3]) * 1_000 > now;
+}
 
 function base64Url(bytes: Uint8Array): string {
 	return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");

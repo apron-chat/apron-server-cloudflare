@@ -15,7 +15,7 @@ import { AUDIO_TYPES, sniffAudio } from "./audio";
 import { IMAGE_TYPES, sniffImage } from "./image";
 import { isEmojiKey, MAX_EMOJI_NAME_CHARS } from "./emoji";
 import { limitData } from "./store-error";
-import { signUploadToken, verifyUploadToken } from "./upload-token";
+import { looksLikeUploadToken, signUploadToken, verifyUploadToken } from "./upload-token";
 import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
 import { extractClientIp, hashIpKey, hashIpv6PrefixKey, stripForwardingHeaders } from "./ip";
 import {
@@ -1613,6 +1613,10 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 	};
 	if (request.method === "OPTIONS") return answer(204);
 	if (request.method !== "PUT") return answer(405, "Method not allowed");
+	// A token of the wrong shape, or past its expiry, is refused before the
+	// configuration is read or its signature checked: the answer a bad
+	// signature gets, so the refusal says nothing of why.
+	if (!looksLikeUploadToken(token)) return answer(403, "This write_url is not valid or has expired");
 	let config: RuntimeConfig;
 	try {
 		config = loadConfig(env);
@@ -1834,13 +1838,15 @@ async function handleLiveRead(request: Request, env: Env, id: string): Promise<R
 		return new Response(null, { status: 204, headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS", "Access-Control-Max-Age": "86400" } });
 	}
 	if (request.method !== "GET" && request.method !== "HEAD") return liveAnswer(405, "Method not allowed");
+	// An id of the wrong shape is refused before the configuration is read.
+	if (!LIVE_ID_PATTERN.test(id) || !env.DEMO) return liveAnswer(404, "Not found");
 	let config: RuntimeConfig;
 	try {
 		config = loadConfig(env);
 	} catch {
 		return liveAnswer(503, "Configuration unavailable");
 	}
-	if (!config.liveText || !env.DEMO || !LIVE_ID_PATTERN.test(id)) return liveAnswer(404, "Not found");
+	if (!config.liveText) return liveAnswer(404, "Not found");
 	const navigate = request.headers.get("Sec-Fetch-Mode") === "navigate";
 	// A refusal the object made moments ago for this text is repeated here,
 	// before the attempt limiters: a crowd retrying a full or finished text
@@ -1980,13 +1986,10 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 		if (env.ASSETS) return env.ASSETS.fetch(request);
 		return responseError(404, "Not found");
 	}
-	let config: RuntimeConfig;
-	try {
-		config = loadConfig(env);
-	} catch {
-		return responseError(503, "Configuration unavailable");
-	}
-	if (!originAllowed(config, request)) return responseError(403, "Origin not allowed");
+	// What needs no configuration is checked first: a request of the wrong
+	// shape, or without a trusted address, is refused at the cost of the
+	// request alone. The edge rule (docs/edge-admission.md) refuses most of
+	// these before the Worker runs; this is for the rest, and for development.
 	if (request.method !== "GET") return responseError(405, "Method not allowed");
 	if (request.body !== null || (request.headers.has("Content-Length") && request.headers.get("Content-Length") !== "0") || request.headers.has("Transfer-Encoding")) {
 		return responseError(400, "WebSocket upgrade must not contain a body");
@@ -1994,6 +1997,13 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 	if (!isUpgrade(request) && !status) return responseError(400, "WebSocket upgrade required");
 	const clientIp = extractClientIp(request.headers);
 	if (!clientIp) return responseError(403, "Trusted client address unavailable");
+	let config: RuntimeConfig;
+	try {
+		config = loadConfig(env);
+	} catch {
+		return responseError(503, "Configuration unavailable");
+	}
+	if (!originAllowed(config, request)) return responseError(403, "Origin not allowed");
 	if (config.admissionOff) return responseError(503, "Demo admission is closed");
 	const key = await hashIpKey(clientIp);
 	const prefixKey = await hashIpv6PrefixKey(clientIp);

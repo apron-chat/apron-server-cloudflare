@@ -442,8 +442,27 @@ function validateLimits(limits: Limits): void {
 	}
 }
 
+/**
+ * Parsed configurations by environment object, so an isolate parses its
+ * deployment once: the parse checks every variable and signs and verifies
+ * with the VAPID keys, most of the CPU of a request the Worker answers
+ * without the object (a refusal, a probe, a bad write_url). Keyed by the
+ * object's identity, so another object parses again, and overrides, which
+ * tests pass, never cache. A parse that throws caches nothing.
+ */
+const parsedConfigs = new WeakMap<object, RuntimeConfig>();
+
 /** Load and validate immutable deployment policy before accepting a socket. */
 export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): RuntimeConfig {
+	if (Object.keys(overrides).length || typeof env !== "object" || env === null) return buildConfig(env, overrides);
+	const cached = parsedConfigs.get(env);
+	if (cached) return cached;
+	const config = buildConfig(env, overrides);
+	parsedConfigs.set(env, config);
+	return config;
+}
+
+function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 	const limits = { ...DEFAULT_LIMITS } as Limits;
 	for (const key of Object.keys(limits) as (keyof Limits)[]) {
 		limits[key] = parsePositiveInt(env, key, limits[key]);
