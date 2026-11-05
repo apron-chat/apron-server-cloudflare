@@ -185,10 +185,13 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   `FLOOD_WATCH` rate limiter, which allows `floodRequestsPerColoMinute / floodSampleEvery`
   (60) a minute at each Cloudflare location. Past it, that Worker turns the
   rule on at once. Counting writes nothing; the one write is turning the rule
-  on, and each isolate tries at most once a minute. The guard then keeps the
-  rule on for at least `holdSeconds` (30 minutes) after it was turned on,
+  on, and each isolate tries at most once a minute. The trip writes a hold of
+  `holdSeconds` (30 minutes) into the rule's description, as the attack pause
+  does (`[attack hold until …]`): the guard keeps the rule on until it passes,
   long enough for analytics to show the flood and the daily or monthly stop
-  to take over. These settings are in the plan's `edgeStop`.
+  to take over, and lifts it once passed even while analytics cannot be read,
+  so an outage never leaves a flood's stop on. A trip while the rule is
+  already on changes nothing. These settings are in the plan's `edgeStop`.
 - **Log sampling.** Every invocation writes a Workers Logs event. From
   2026-12-01 logs bill by the GB ([Cloudflare Observability
   pricing](https://developers.cloudflare.com/observability/pricing/): 50 GB

@@ -129,6 +129,11 @@ describe('configuration policy boundaries', () => {
 		expect(loaded.limits.historyMaxLimit).toBe(49);
 	});
 
+	it('refuses a LIMIT_ or LIVE_TEXT_ override that names no limit, so a misspelling cannot pass silently', () => {
+		expect(() => config({ LIMIT_HISTORY_MAX_LIMT: '49' })).toThrow(ConfigError);
+		expect(() => config({ LIVE_TEXT_MAX_SECOND: '2' })).toThrow(ConfigError);
+	});
+
 	it('takes an optional APRON_ADMIN_TOKEN that is long, token-safe, and not a bot token', () => {
 		expect(config().adminToken).toBeUndefined();
 		expect(config({ APRON_ADMIN_TOKEN: '' }).adminToken).toBeUndefined();

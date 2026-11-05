@@ -160,6 +160,9 @@ test('a plan with an edge stop also generates the sampled flood counter', () => 
 	assert.match(binding, /name = "FLOOD_WATCH"\nnamespace_id = "456"\nsimple = \{ limit = 60, period = 60 \}/);
 	assert.doesNotMatch(renderBinding(namespaces), /FLOOD_WATCH/);
 	assert.throws(() => validateEdgeStop({ ...edgeStop, floodSampleEvery: 7 }), /whole number/);
+	// Its namespace is checked like the attempt limits' four.
+	assert.throws(() => renderBinding(namespaces, ADMISSION_BUDGET, { namespace: namespaces.location, edgeStop }), /distinct/);
+	assert.throws(() => renderBinding(namespaces, ADMISSION_BUDGET, { namespace: 'abc', edgeStop }), /distinct/);
 	assert.throws(() => validateEdgeStop({ ...edgeStop, holdSeconds: 0 }));
 });
 

@@ -241,6 +241,10 @@ function logBytes(workerRequests: number, invocations: number): number {
 }
 
 function monthUsage(account: Record<string, unknown>, sampledAt: number): AccountUsageMonth {
+	// The month so far is never empty while this Worker runs (its cron is an
+	// invocation): no groups is analytics lagging or failing, not zero usage,
+	// which would lift a month's stop and resume billing.
+	if (Array.isArray(account.monthWorkers) && account.monthWorkers.length === 0) throw new AccountUsageError("analytics month data is empty");
 	const workerRequests = sum(account.monthWorkers, "requests");
 	const invocations = sum(account.monthInvocations, "requests");
 	return {

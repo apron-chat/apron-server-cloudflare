@@ -10,7 +10,7 @@ User-facing behaviour and its rationale are in [docs/policy.md](docs/policy.md);
 
 ## 1. Objective and instructions to the coding harness
 
-A usable, publicly accessible Apron demo backend on native Cloudflare Workers, one SQLite-backed Durable Object (DO), and hibernating WebSockets: guest use and passkey authentication, bounded posting and history, and graceful resource exhaustion. It runs on Workers Paid ($5/month) within its included usage, and must still run on the Workers Free plan without paid services when its free budgets are selected (`src/plans/free.ts`).
+A usable, publicly accessible Apron demo backend on native Cloudflare Workers, one SQLite-backed Durable Object (DO), and hibernating WebSockets: guest use and passkey authentication, bounded posting and history, and graceful resource exhaustion. It runs on Workers Paid ($5/month), its budgets sized against the plan's per-day share of included usage and its bill bounded by the budget guard's cap (section 7; the Paid budgets in `src/plans/paid.ts` run past the share by design), and must still run on the Workers Free plan without paid services when its free budgets are selected (`src/plans/free.ts`).
 
 This specification defines deployment policies within the base chat protocol; preserve the protocol's mandatory behavior and document material differences. MUST marks required behavior and SHOULD preferences. All limits live in validated configuration with the defaults below; do not silently raise them to make tests pass. Client changes (passkeys, rolling-history recovery) belong in the frontend repository. Do not deploy, switch billing plans, or create paid resources as part of a change.
 
@@ -527,6 +527,8 @@ Current planning baseline, checked 2026-10-29. Each plan's budgets live in `src/
 DO incoming WebSocket messages have a 20:1 request-metering ratio; handshakes/RPC/alarms also count. Outgoing messages have no request charge. These are shared allowances, not per-object allocations. Free-plan exhaustion fails operations; a paid plan's included allowance is not a spending cap, so the Paid budgets are sized against its per-day share with headroom, and the account-usage stop acts on the estimated overage in dollars (the bill cap), not on the share: a day past its share costs nothing while the month stays inside its inclusions. Paid includes fewer DO requests than Free, so frame and connection budgets rise much less than SQL ones. See [DO pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/) and [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/); the [deployment checklist](docs/guide.md#deployment-checklist) rechecks them.
 
 ### Application allocations
+
+The ceilings below are the original planning baseline. The Workers Paid budgets in force (`src/plans/paid.ts`) set larger daily ceilings, past the plan's per-day share of included usage, and rely on the bill cap for the guarantee; [configuration](docs/configuration.md#plans) has the current numbers.
 
 | Budget | Ceiling | Allocation |
 | --- | ---: | --- |

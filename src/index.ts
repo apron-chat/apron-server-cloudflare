@@ -1797,6 +1797,7 @@ async function handleLiveWrite(request: Request, env: Env, key: string): Promise
 	// sends none, others application/x-www-form-urlencoded), and the bytes
 	// are read as UTF-8 whatever it says.
 	if (!request.body) return liveAnswer(400, "Send the text as the request body");
+	if (Date.now() < objectPausedUntil) return serverPaused(objectPausedUntil);
 	const admitted = await liveAdmission(request, env);
 	if ("refused" in admitted) return admitted.refused;
 	// Piped natively (an IdentityTransformStream: no JavaScript runs per
@@ -1846,6 +1847,7 @@ async function handleLiveRead(request: Request, env: Env, id: string): Promise<R
 	// costs no object request and spends no attempts.
 	const remembered = rememberedLiveRefusal(id, request.method === "GET" && !navigate);
 	if (remembered) return remembered;
+	if (Date.now() < objectPausedUntil) return serverPaused(objectPausedUntil);
 	const admitted = await liveAdmission(request, env, true);
 	if ("refused" in admitted) return admitted.refused;
 	// A browser opening it as a page goes to the terminal viewer, if there is one (§4.8.5).
@@ -2587,8 +2589,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 			} catch { /* a metered maintenance failure is retried on the next alarm */ }
 		}
 		if (this.config.liveText) {
-			this.liveRecovered = true;
-			try { await this.expireLive(now); } catch { /* a metered maintenance failure is retried on the next alarm */ }
+			// Recovered only once the expiry ran: a failure (the maintenance budget
+			// run out) leaves the lost texts to the next alarm or live request.
+			try {
+				await this.expireLive(now);
+				this.liveRecovered = true;
+			} catch { /* a metered maintenance failure is retried on the next alarm */ }
 		}
 		const removed = result?.removed_rooms ?? [];
 		for (const roomId of removed) this.noteRoom(roomId, false);
@@ -3587,6 +3593,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private becomeRegistered(socket: WebSocketConnection, attachment: ConnectionAttachment,
 		identity: { userId: string; name?: string; avatar?: string; roles: string[]; ext?: Record<string, unknown> }, rooms: string[], credential: string | undefined): void {
+		// The identity was read before the sign-in awaited storage; a `/purge` or
+		// `/rename` meanwhile must not leave this connection signed in as it.
+		if (!this.store.identityExists(identity.userId)) throw { name: "denied", message: "That account changed; try again" } satisfies ProtocolError;
 		if (attachment.reads) this.flushReads(attachment, nowMs());
 		attachment.tier = "registered";
 		attachment.userId = identity.userId;
@@ -4278,6 +4287,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (read !== undefined) this.noteRead(socket, attachment, roomId, read, now);
 		// A guest who only reads has nothing to be typing.
 		if (typing === undefined || (attachment.tier === "anonymous" && !this.config.guestPosting)) return;
+		// A status that hides being connected (connectedMembers) hides typing too: it would show they are.
+		const choice = (connectionAttachment(socket) ?? attachment).choice;
+		if (this.config.push && (choice === "invisible" || choice === "")) return;
 		const limit = this.config.limits.activityBroadcastsPerUserMinute;
 		if (!this.takeThrottle(socket, identity.user_id, "activity", limit, now)) {
 			this.noticeThrottled(socket, identity.user_id, "activity", roomId, now,
@@ -6646,8 +6658,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async recoverLiveTexts(): Promise<void> {
 		if (!this.config.liveText) return;
 		if (this.liveRecovered && !this.deadlines.live.passed(nowMs())) return;
-		this.liveRecovered = true;
 		await this.expireLive(nowMs());
+		this.liveRecovered = true;
 		await this.rescheduleAlarm();
 	}
 
@@ -7175,6 +7187,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// A text left open by a failure here ends at its time limit, publishing nothing.
 		await this.endLiveOf(userIds).catch(() => undefined);
 		await this.forgetTokens(userIds);
+		// A sign-in that read the identity before the purge and finished after
+		// the closes above would stay connected as a deleted user: close again.
+		for (const id of userIds) {
+			for (const peer of this.connectionsOf(id)) {
+				const state = connectionAttachment(peer);
+				if (state) this.closePolicy(peer, state, 1008, "Removed by an admin");
+			}
+		}
 		const uploads = purged.deletedUploads.length;
 		this.sendNotice(socket, roomId, `Purged \`${userId}\`: ${purged.messages} message${purged.messages === 1 ? "" : "s"}, ${purged.reactions} reaction set${purged.reactions === 1 ? "" : "s"}, ${uploads} upload${uploads === 1 ? "" : "s"}.`);
 		this.reply(socket, request, {});

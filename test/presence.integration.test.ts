@@ -1760,12 +1760,13 @@ describe('seen is written at most once in SEEN_WRITE_GRANULARITY_MS', () => {
 		try {
 			const identityReads = sql.filter((entry) => /\bFROM identities WHERE user_id = \?/.test(entry.query) && entry.bindings[0] === userId);
 			// The identity row reads a sign-in did before seen (the identity
-			// lookup, and the avatar refresh check after the reply), the column
-			// now among the ones they read, and nothing else of `identities` but
-			// the sign-in's activity (noteActive), at most once a day.
+			// lookup, the check that no `/purge` or `/rename` took it meanwhile
+			// (becomeRegistered), and the avatar refresh check after the reply),
+			// the column now among the ones they read, and nothing else of
+			// `identities` but the sign-in's activity (noteActive), at most once a day.
 			const row = 'SELECT user_id, user_handle, name, tier, created_ms, updated_ms, avatar_url, avatar_expires_ms, roles_json, ext_json, seen_ms FROM identities WHERE user_id = ? LIMIT 1';
-			expect(identityReads.map((entry) => entry.query)).toEqual([row, row]);
-			expect(sql.filter((entry) => /\bidentities\b/.test(entry.query) && !entry.query.startsWith('UPDATE identities SET updated_ms')).length).toBe(2);
+			expect(identityReads.map((entry) => entry.query)).toEqual([row, row, row]);
+			expect(sql.filter((entry) => /\bidentities\b/.test(entry.query) && !entry.query.startsWith('UPDATE identities SET updated_ms')).length).toBe(3);
 			expect(sql.some((entry) => /^SELECT seen_ms FROM identities WHERE/.test(entry.query))).toBe(false);
 			expect(await held(userId)).toEqual([recorded]);
 		} finally { peer.close(); }

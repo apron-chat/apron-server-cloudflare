@@ -717,6 +717,29 @@ it('with ACTIVITY on, relays typing to room members, throttles per user, and tel
 	} finally { alice.close(); bob.close(); carol.close(); await configure((config) => { config.activityEnabled = false; }); }
 });
 
+it('with ACTIVITY on, relays no typing of a user whose status hides that they are connected', async () => {
+	await configure((config) => { config.activityEnabled = true; });
+	const alice = await connect();
+	const bob = await connect();
+	try {
+		const aliceId = await authenticate(alice, 'guest', ['activity']);
+		await authenticate(bob, 'guest', ['activity']);
+		// Invisible, then no status at all (""): others see offline either way, so typing would give them away.
+		for (const status of ['invisible', '']) {
+			expect((await request(alice, `status-${status}`, 'me', { status })).result.you.status).toBe(status);
+			alice.send({ method: 'activity', params: { room_id: 'general', typing: 5 } });
+			alice.send({ id: `after-${status}`, method: 'message', params: { room_id: 'general', body: { text: `posted ${status}` } } });
+			const done = await until(bob, (frame) => frame.method === 'message' && frame.params.body?.text === `posted ${status}`);
+			expect(done.skipped.filter((frame) => frame.method === 'activity' && frame.params.from?.user_id === aliceId)).toEqual([]);
+		}
+		// Shown again, typing is relayed.
+		expect((await request(alice, 'status-dnd', 'me', { status: 'dnd' })).result.you.status).toBe('dnd');
+		alice.send({ method: 'activity', params: { room_id: 'general', typing: 5 } });
+		const relayed = await until(bob, (frame) => frame.method === 'activity');
+		expect(relayed.frame.params).toEqual({ room_id: 'general', from: aliceId, typing: 5 });
+	} finally { alice.close(); bob.close(); await configure((config) => { config.activityEnabled = false; }); }
+});
+
 it('answers /help with a private notice and rejects other commands without closing the socket', async () => {
 	const peer = await connect();
 	try {

@@ -257,10 +257,15 @@ function validOrigin(origin: string): boolean {
 	}
 }
 
+/** The environment variable spelling of a camelCase limit name. */
+function envName(name: string): string {
+	return name.replace(/[A-Z]/g, (letter) => `_${letter}`).toUpperCase();
+}
+
 function parsePositiveInt(env: EnvLike, name: string, fallback: number): number {
-	const envName = name.replace(/[A-Z]/g, (letter) => `_${letter}`).toUpperCase();
+	const upper = envName(name);
 	const values = env as EnvLike & Record<string, unknown>;
-	const raw = values[`LIMIT_${envName}`] ?? values[envName] ?? values[name];
+	const raw = values[`LIMIT_${upper}`] ?? values[upper] ?? values[name];
 	if (raw === undefined || raw === "") return fallback;
 	const value = typeof raw === "number" ? raw : Number(raw);
 	if (!Number.isSafeInteger(value) || value <= 0) throw new ConfigError(`${name} must be a positive safe integer`);
@@ -443,6 +448,11 @@ export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): Runti
 	for (const key of Object.keys(limits) as (keyof Limits)[]) {
 		limits[key] = parsePositiveInt(env, key, limits[key]);
 	}
+	// A misspelled override would silently leave the default in force.
+	const limitNames = new Set(Object.keys(limits).map((key) => `LIMIT_${envName(key)}`));
+	for (const name of Object.keys(env)) {
+		if (name.startsWith("LIMIT_") && !limitNames.has(name)) throw new ConfigError(`${name} is not a limit (docs/configuration.md)`);
+	}
 	Object.assign(limits, overrides);
 	for (const [key, value] of Object.entries(limits)) {
 		if (!Number.isSafeInteger(value) || value <= 0) throw new ConfigError(`${key} must be a positive safe integer`);
@@ -590,6 +600,10 @@ function loadLiveText(env: EnvLike, limits: Limits): LiveTextConfig | undefined 
 		const value = typeof raw === "number" ? raw : Number(raw);
 		if (!Number.isSafeInteger(value) || value <= 0) throw new ConfigError(`${name} must be a positive safe integer`);
 		policy[key] = value;
+	}
+	const policyNames = new Set(Object.keys(policy).map((key) => `LIVE_TEXT_${envName(key)}`));
+	for (const name of Object.keys(values)) {
+		if (name.startsWith("LIVE_TEXT_") && !policyNames.has(name)) throw new ConfigError(`${name} is not a live text limit (docs/configuration.md)`);
 	}
 	validateLiveTextPolicy(policy, limits);
 	const publicOrigin = env.PUBLIC_ORIGIN?.trim() ?? "";
