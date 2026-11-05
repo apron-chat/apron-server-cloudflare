@@ -41,7 +41,7 @@ it('pauses on a flood of refused entry requests: closes every socket, refuses ev
 	expect(await peer.closed).toEqual({ code: 1013, reason: 'Server paused: unusual traffic; try later' });
 	const refused = await stub.fetch('https://demo.test/ws', { headers: { ...headers, Upgrade: 'websocket' } });
 	expect(refused.status).toBe(503);
-	expect(Number(refused.headers.get('Retry-After'))).toBeGreaterThan(29 * 60);
+	expect(Number(refused.headers.get('Retry-After'))).toBeGreaterThan(9 * 60);
 	expect(await refused.json()).toEqual({ error: 'Server paused: unusual traffic; try later' });
 	// The tier, and that the edge stop could not be turned on: tests set no zone.
 	await vi.waitFor(() => expect(told).toHaveLength(2));
@@ -68,7 +68,8 @@ it('pauses on a flood of refused entry requests: closes every socket, refuses ev
 	await runInDurableObject(stub, (instance) => {
 		const record = (instance as unknown as Runtime).attackPauseRecord!;
 		expect(record.count).toBe(2);
-		expect(record.until - Date.now()).toBeGreaterThan(59 * 60_000);
+		// The second pause of the day: twice the first hold.
+		expect(record.until - Date.now()).toBeGreaterThan(19 * 60_000);
 	});
 });
 

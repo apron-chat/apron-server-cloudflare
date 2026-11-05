@@ -50,7 +50,9 @@ for a zero-overage deployment.
 - **Bring your own frontend.** Guest connections are accepted from any
   origin — even `localhost` or a browser console.
 - **Built to stay inside its plan.** Every operation is metered against
-  budgets sized under the plan's included usage, with rolling retention
+  daily budgets, a budget guard caps the month's bill (on Workers Paid, $5 a
+  day and $25 a month past the plan's $5; see
+  [configuration](docs/configuration.md#budget-guard)), with rolling retention
   (7 days on Workers Paid, which production runs, and one day on Workers
   Free) and graceful read-only degradation when budgets run out.
 

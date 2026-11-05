@@ -15,7 +15,7 @@ import { AUDIO_TYPES, sniffAudio } from "./audio";
 import { IMAGE_TYPES, sniffImage } from "./image";
 import { isEmojiKey, MAX_EMOJI_NAME_CHARS } from "./emoji";
 import { limitData } from "./store-error";
-import { signUploadToken, verifyUploadToken } from "./upload-token";
+import { looksLikeUploadToken, signUploadToken, verifyUploadToken } from "./upload-token";
 import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
 import { extractClientIp, hashIpKey, hashIpv6PrefixKey, stripForwardingHeaders } from "./ip";
 import {
@@ -1613,6 +1613,10 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 	};
 	if (request.method === "OPTIONS") return answer(204);
 	if (request.method !== "PUT") return answer(405, "Method not allowed");
+	// A token of the wrong shape, or past its expiry, is refused before the
+	// configuration is read or its signature checked: the answer a bad
+	// signature gets, so the refusal says nothing of why.
+	if (!looksLikeUploadToken(token)) return answer(403, "This write_url is not valid or has expired");
 	let config: RuntimeConfig;
 	try {
 		config = loadConfig(env);
@@ -1797,6 +1801,7 @@ async function handleLiveWrite(request: Request, env: Env, key: string): Promise
 	// sends none, others application/x-www-form-urlencoded), and the bytes
 	// are read as UTF-8 whatever it says.
 	if (!request.body) return liveAnswer(400, "Send the text as the request body");
+	if (Date.now() < objectPausedUntil) return serverPaused(objectPausedUntil);
 	const admitted = await liveAdmission(request, env);
 	if ("refused" in admitted) return admitted.refused;
 	// Piped natively (an IdentityTransformStream: no JavaScript runs per
@@ -1833,19 +1838,22 @@ async function handleLiveRead(request: Request, env: Env, id: string): Promise<R
 		return new Response(null, { status: 204, headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS", "Access-Control-Max-Age": "86400" } });
 	}
 	if (request.method !== "GET" && request.method !== "HEAD") return liveAnswer(405, "Method not allowed");
+	// An id of the wrong shape is refused before the configuration is read.
+	if (!LIVE_ID_PATTERN.test(id) || !env.DEMO) return liveAnswer(404, "Not found");
 	let config: RuntimeConfig;
 	try {
 		config = loadConfig(env);
 	} catch {
 		return liveAnswer(503, "Configuration unavailable");
 	}
-	if (!config.liveText || !env.DEMO || !LIVE_ID_PATTERN.test(id)) return liveAnswer(404, "Not found");
+	if (!config.liveText) return liveAnswer(404, "Not found");
 	const navigate = request.headers.get("Sec-Fetch-Mode") === "navigate";
 	// A refusal the object made moments ago for this text is repeated here,
 	// before the attempt limiters: a crowd retrying a full or finished text
 	// costs no object request and spends no attempts.
 	const remembered = rememberedLiveRefusal(id, request.method === "GET" && !navigate);
 	if (remembered) return remembered;
+	if (Date.now() < objectPausedUntil) return serverPaused(objectPausedUntil);
 	const admitted = await liveAdmission(request, env, true);
 	if ("refused" in admitted) return admitted.refused;
 	// A browser opening it as a page goes to the terminal viewer, if there is one (§4.8.5).
@@ -1978,13 +1986,10 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 		if (env.ASSETS) return env.ASSETS.fetch(request);
 		return responseError(404, "Not found");
 	}
-	let config: RuntimeConfig;
-	try {
-		config = loadConfig(env);
-	} catch {
-		return responseError(503, "Configuration unavailable");
-	}
-	if (!originAllowed(config, request)) return responseError(403, "Origin not allowed");
+	// What needs no configuration is checked first: a request of the wrong
+	// shape, or without a trusted address, is refused at the cost of the
+	// request alone. The edge rule (docs/edge-admission.md) refuses most of
+	// these before the Worker runs; this is for the rest, and for development.
 	if (request.method !== "GET") return responseError(405, "Method not allowed");
 	if (request.body !== null || (request.headers.has("Content-Length") && request.headers.get("Content-Length") !== "0") || request.headers.has("Transfer-Encoding")) {
 		return responseError(400, "WebSocket upgrade must not contain a body");
@@ -1992,6 +1997,13 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 	if (!isUpgrade(request) && !status) return responseError(400, "WebSocket upgrade required");
 	const clientIp = extractClientIp(request.headers);
 	if (!clientIp) return responseError(403, "Trusted client address unavailable");
+	let config: RuntimeConfig;
+	try {
+		config = loadConfig(env);
+	} catch {
+		return responseError(503, "Configuration unavailable");
+	}
+	if (!originAllowed(config, request)) return responseError(403, "Origin not allowed");
 	if (config.admissionOff) return responseError(503, "Demo admission is closed");
 	const key = await hashIpKey(clientIp);
 	const prefixKey = await hashIpv6PrefixKey(clientIp);
@@ -2587,8 +2599,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 			} catch { /* a metered maintenance failure is retried on the next alarm */ }
 		}
 		if (this.config.liveText) {
-			this.liveRecovered = true;
-			try { await this.expireLive(now); } catch { /* a metered maintenance failure is retried on the next alarm */ }
+			// Recovered only once the expiry ran: a failure (the maintenance budget
+			// run out) leaves the lost texts to the next alarm or live request.
+			try {
+				await this.expireLive(now);
+				this.liveRecovered = true;
+			} catch { /* a metered maintenance failure is retried on the next alarm */ }
 		}
 		const removed = result?.removed_rooms ?? [];
 		for (const roomId of removed) this.noteRoom(roomId, false);
@@ -3587,6 +3603,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private becomeRegistered(socket: WebSocketConnection, attachment: ConnectionAttachment,
 		identity: { userId: string; name?: string; avatar?: string; roles: string[]; ext?: Record<string, unknown> }, rooms: string[], credential: string | undefined): void {
+		// The identity was read before the sign-in awaited storage; a `/purge` or
+		// `/rename` meanwhile must not leave this connection signed in as it.
+		if (!this.store.identityExists(identity.userId)) throw { name: "denied", message: "That account changed; try again" } satisfies ProtocolError;
 		if (attachment.reads) this.flushReads(attachment, nowMs());
 		attachment.tier = "registered";
 		attachment.userId = identity.userId;
@@ -4278,6 +4297,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (read !== undefined) this.noteRead(socket, attachment, roomId, read, now);
 		// A guest who only reads has nothing to be typing.
 		if (typing === undefined || (attachment.tier === "anonymous" && !this.config.guestPosting)) return;
+		// A status that hides being connected (connectedMembers) hides typing too: it would show they are.
+		const choice = (connectionAttachment(socket) ?? attachment).choice;
+		if (this.config.push && (choice === "invisible" || choice === "")) return;
 		const limit = this.config.limits.activityBroadcastsPerUserMinute;
 		if (!this.takeThrottle(socket, identity.user_id, "activity", limit, now)) {
 			this.noticeThrottled(socket, identity.user_id, "activity", roomId, now,
@@ -6646,8 +6668,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async recoverLiveTexts(): Promise<void> {
 		if (!this.config.liveText) return;
 		if (this.liveRecovered && !this.deadlines.live.passed(nowMs())) return;
-		this.liveRecovered = true;
 		await this.expireLive(nowMs());
+		this.liveRecovered = true;
 		await this.rescheduleAlarm();
 	}
 
@@ -7175,6 +7197,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// A text left open by a failure here ends at its time limit, publishing nothing.
 		await this.endLiveOf(userIds).catch(() => undefined);
 		await this.forgetTokens(userIds);
+		// A sign-in that read the identity before the purge and finished after
+		// the closes above would stay connected as a deleted user: close again.
+		for (const id of userIds) {
+			for (const peer of this.connectionsOf(id)) {
+				const state = connectionAttachment(peer);
+				if (state) this.closePolicy(peer, state, 1008, "Removed by an admin");
+			}
+		}
 		const uploads = purged.deletedUploads.length;
 		this.sendNotice(socket, roomId, `Purged \`${userId}\`: ${purged.messages} message${purged.messages === 1 ? "" : "s"}, ${purged.reactions} reaction set${purged.reactions === 1 ? "" : "s"}, ${uploads} upload${uploads === 1 ? "" : "s"}.`);
 		this.reply(socket, request, {});

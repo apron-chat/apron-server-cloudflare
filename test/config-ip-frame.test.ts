@@ -129,6 +129,23 @@ describe('configuration policy boundaries', () => {
 		expect(loaded.limits.historyMaxLimit).toBe(49);
 	});
 
+	it('parses an environment object once, and overrides or another object again', () => {
+		const env = { ...base, LIMIT_HISTORY_MAX_LIMIT: '49' } as Parameters<typeof loadConfig>[0];
+		const first = loadConfig(env);
+		expect(loadConfig(env)).toBe(first);
+		expect(loadConfig({ ...env })).not.toBe(first);
+		expect(loadConfig({ ...env }).limits.historyMaxLimit).toBe(49);
+		const overridden = loadConfig(env, { historyMaxLimit: 48 });
+		expect(overridden).not.toBe(first);
+		expect(overridden.limits.historyMaxLimit).toBe(48);
+		expect(loadConfig(env)).toBe(first);
+	});
+
+	it('refuses a LIMIT_ or LIVE_TEXT_ override that names no limit, so a misspelling cannot pass silently', () => {
+		expect(() => config({ LIMIT_HISTORY_MAX_LIMT: '49' })).toThrow(ConfigError);
+		expect(() => config({ LIVE_TEXT_MAX_SECOND: '2' })).toThrow(ConfigError);
+	});
+
 	it('takes an optional APRON_ADMIN_TOKEN that is long, token-safe, and not a bot token', () => {
 		expect(config().adminToken).toBeUndefined();
 		expect(config({ APRON_ADMIN_TOKEN: '' }).adminToken).toBeUndefined();

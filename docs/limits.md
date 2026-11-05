@@ -94,7 +94,7 @@ still holds a slot until it goes stale; see
 | 1011 | Connection state too large; reconnect | This connection's state (its rooms, unwritten read cursors, waiting status changes) outgrew what a connection may hold; only this connection is closed | Reconnect with backoff, then fetch history to catch up. |
 | 1013 | Frame rate limit reached | More than 480 frames a minute from your address, all connections together. Each connection reserves frames 10 at a time, so many short-lived connections spend this fast | Back off; fewer connections. |
 | 1013 | Demo account capacity reached; try later | The Cloudflare account's usage reached its stop line | Back off for minutes, not seconds. |
-| 1013 | Server paused: unusual traffic; try later | The attack pause | Back off for half an hour or more. |
+| 1013 | Server paused: unusual traffic; try later | The attack pause | Back off for ten minutes or more. |
 | 4000 | Idle guest connection closed to make room; reconnect when you're back | A guest connection whose client sent `status` `idle` 10 minutes or more ago, with no frame since, closed when the full server needs its slot (never twice in 10 minutes for the same address's newcomer) | Reconnect when the user returns to the tab, not at once. |
 
 ### Liveness and stale connections

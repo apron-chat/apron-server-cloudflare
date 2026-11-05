@@ -24,8 +24,13 @@ export const BURN_POLICY = Object.freeze({
 	entryReportMs: 1_000,
 	/** How often the object weighs the meter, at most. */
 	checkEveryMs: 5_000,
-	/** The first pause; each later one in the same UTC day doubles it. */
-	firstHoldMs: 30 * 60_000,
+	/**
+	 * The first pause; each later one in the same UTC day doubles it. Ten
+	 * minutes: a flood still going trips it again within minutes of the lift,
+	 * so repeats escalate, while two minutes of burst from one address cost
+	 * everyone ten minutes, not thirty.
+	 */
+	firstHoldMs: 10 * 60_000,
 	maxHoldMs: 4 * 60 * 60_000,
 	/** A high burn of mostly admitted traffic alerts the admins at most this often. */
 	alertEveryMs: 60 * 60_000,

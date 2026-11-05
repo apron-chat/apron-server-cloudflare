@@ -135,9 +135,15 @@ describe("budget guard", () => {
 		const passed = api({ rules: [held], analyticsStatus: 500 });
 		expect(await runBudgetGuard(env, until, passed.fetcher)).toMatchObject({ outcome: "changed", stop: false });
 		expect(passed.updates).toEqual([expect.objectContaining({ enabled: false, description: rule.description })]);
-		// ATTACK_PAUSE=false lifts it at once, hold or not.
+		// ATTACK_PAUSE=false lifts it at once, hold or not, however recently the rule changed.
 		const off = api({ rules: [held] });
 		expect(await runBudgetGuard({ ...env, ATTACK_PAUSE: "false" }, until - 60_000, off.fetcher)).toMatchObject({ outcome: "changed", stop: false });
+		const fresh = api({ rules: [{ ...held, last_updated: new Date(now - 60_000).toISOString() }] });
+		expect(await runBudgetGuard({ ...env, ATTACK_PAUSE: "false" }, now, fresh.fetcher)).toMatchObject({ outcome: "changed", stop: false });
+		expect(fresh.updates).toEqual([expect.objectContaining({ enabled: false, description: rule.description })]);
+		// Without it, a rule turned on a minute ago is held though its mark passed.
+		const recent = api({ rules: [{ ...held, last_updated: new Date(until - 60_000).toISOString() }] });
+		expect(await runBudgetGuard(env, until, recent.fetcher)).toMatchObject({ outcome: "held", stop: false });
 	});
 
 	it("reads a rule without enabled as enabled", async () => {
@@ -250,7 +256,10 @@ describe.runIf(PLAN.edgeStop)("flood trip", () => {
 		const now = Date.parse("2026-09-27T12:00:00Z");
 		const first = api();
 		await watch({ random: 0, success: false, now, fetcher: first.fetcher });
-		expect(first.updates).toEqual([expect.objectContaining({ enabled: true })]);
+		// Held by a mark for the plan's holdSeconds, like an attack pause, so an
+		// analytics outage lifts it once passed (runBudgetGuard) and a bill under
+		// the cap does not lift it before.
+		expect(first.updates).toEqual([expect.objectContaining({ enabled: true, description: `${rule.description} [attack hold until ${new Date(now + policy.holdSeconds * 1_000).toISOString()}]` })]);
 		const soon = api();
 		const again = await watch({ random: 0, success: false, now: now + 59_000, fetcher: soon.fetcher });
 		expect(again.limit).not.toHaveBeenCalled();
@@ -267,7 +276,7 @@ describe.runIf(PLAN.edgeStop)("flood trip", () => {
 		await watch({ random: 0, success: false, now, fetcher: tripped.fetcher, onStop });
 		expect(tripped.updates).toEqual([expect.objectContaining({ enabled: true })]);
 		expect(onStop).toHaveBeenCalledTimes(1);
-		// Already on: nothing changed, so nothing is told.
+		// Already on: nothing changed, not even its hold mark, so nothing is told.
 		const already = api({ enabled: true });
 		await watch({ random: 0, success: false, now: now + 60_000, fetcher: already.fetcher, onStop });
 		expect(already.updates).toEqual([]);
@@ -287,6 +296,9 @@ describe.runIf(PLAN.edgeStop)("flood trip", () => {
 		// Ten times what one location may send the object in a minute (its
 		// admissions are capped there), leaving room for probes and media.
 		expect(policy.floodRequestsPerColoMinute).toBeGreaterThan(PLAN.admission.objectRequestsPerLocationMinute * 10);
-		expect(policy.holdSeconds).toBeGreaterThanOrEqual(15 * 60);
+		// Long enough that a flood still going re-trips at most a few times an
+		// hour, short enough that a burst does not take the server away for long.
+		expect(policy.holdSeconds).toBeGreaterThanOrEqual(5 * 60);
+		expect(policy.holdSeconds).toBeLessThanOrEqual(15 * 60);
 	});
 });

@@ -56,6 +56,9 @@ export function renderBinding(namespaces, admission = ADMISSION_BUDGET, flood = 
 	let floodBinding = '';
 	if (flood) {
 		validateEdgeStop(flood.edgeStop);
+		if (typeof flood.namespace !== 'string' || !/^[1-9]\d*$/.test(flood.namespace) || ids.includes(flood.namespace)) {
+			throw new Error('The flood counter needs a distinct integer namespace ID');
+		}
 		floodBinding = `
 [[ratelimits]]
 name = "FLOOD_WATCH"

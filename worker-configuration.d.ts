@@ -34,7 +34,11 @@ declare global {
 		SERVER_DESCRIPTION?: string;
 		SERVER_AVATAR?: string;
 		ADMISSION_OFF?: string;
-		ACCOUNTING_RECOVERY?: string;
+		ATTACK_PAUSE?: string;
+		BILL_CAP_DAY?: string;
+		BILL_CAP_MONTH?: string;
+		LIVE_TEXT?: string;
+		TERMINAL_VIEWER_URL?: string;
 		ACTIVITY?: string;
 		GUEST_POSTING?: string;
 		PRESENCE?: string;
@@ -76,7 +80,11 @@ declare global {
 			SERVER_DESCRIPTION?: string;
 			SERVER_AVATAR?: string;
 			ADMISSION_OFF?: string;
-			ACCOUNTING_RECOVERY?: string;
+			ATTACK_PAUSE?: string;
+			BILL_CAP_DAY?: string;
+			BILL_CAP_MONTH?: string;
+			LIVE_TEXT?: string;
+			TERMINAL_VIEWER_URL?: string;
 			ACTIVITY?: string;
 			GUEST_POSTING?: string;
 			PRESENCE?: string;

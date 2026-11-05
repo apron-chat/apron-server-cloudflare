@@ -257,10 +257,15 @@ function validOrigin(origin: string): boolean {
 	}
 }
 
+/** The environment variable spelling of a camelCase limit name. */
+function envName(name: string): string {
+	return name.replace(/[A-Z]/g, (letter) => `_${letter}`).toUpperCase();
+}
+
 function parsePositiveInt(env: EnvLike, name: string, fallback: number): number {
-	const envName = name.replace(/[A-Z]/g, (letter) => `_${letter}`).toUpperCase();
+	const upper = envName(name);
 	const values = env as EnvLike & Record<string, unknown>;
-	const raw = values[`LIMIT_${envName}`] ?? values[envName] ?? values[name];
+	const raw = values[`LIMIT_${upper}`] ?? values[upper] ?? values[name];
 	if (raw === undefined || raw === "") return fallback;
 	const value = typeof raw === "number" ? raw : Number(raw);
 	if (!Number.isSafeInteger(value) || value <= 0) throw new ConfigError(`${name} must be a positive safe integer`);
@@ -437,11 +442,35 @@ function validateLimits(limits: Limits): void {
 	}
 }
 
+/**
+ * Parsed configurations by environment object, so an isolate parses its
+ * deployment once: the parse checks every variable and signs and verifies
+ * with the VAPID keys, most of the CPU of a request the Worker answers
+ * without the object (a refusal, a probe, a bad write_url). Keyed by the
+ * object's identity, so another object parses again, and overrides, which
+ * tests pass, never cache. A parse that throws caches nothing.
+ */
+const parsedConfigs = new WeakMap<object, RuntimeConfig>();
+
 /** Load and validate immutable deployment policy before accepting a socket. */
 export function loadConfig(env: EnvLike, overrides: Partial<Limits> = {}): RuntimeConfig {
+	if (Object.keys(overrides).length || typeof env !== "object" || env === null) return buildConfig(env, overrides);
+	const cached = parsedConfigs.get(env);
+	if (cached) return cached;
+	const config = buildConfig(env, overrides);
+	parsedConfigs.set(env, config);
+	return config;
+}
+
+function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 	const limits = { ...DEFAULT_LIMITS } as Limits;
 	for (const key of Object.keys(limits) as (keyof Limits)[]) {
 		limits[key] = parsePositiveInt(env, key, limits[key]);
+	}
+	// A misspelled override would silently leave the default in force.
+	const limitNames = new Set(Object.keys(limits).map((key) => `LIMIT_${envName(key)}`));
+	for (const name of Object.keys(env)) {
+		if (name.startsWith("LIMIT_") && !limitNames.has(name)) throw new ConfigError(`${name} is not a limit (docs/configuration.md)`);
 	}
 	Object.assign(limits, overrides);
 	for (const [key, value] of Object.entries(limits)) {
@@ -590,6 +619,10 @@ function loadLiveText(env: EnvLike, limits: Limits): LiveTextConfig | undefined 
 		const value = typeof raw === "number" ? raw : Number(raw);
 		if (!Number.isSafeInteger(value) || value <= 0) throw new ConfigError(`${name} must be a positive safe integer`);
 		policy[key] = value;
+	}
+	const policyNames = new Set(Object.keys(policy).map((key) => `LIVE_TEXT_${envName(key)}`));
+	for (const name of Object.keys(values)) {
+		if (name.startsWith("LIVE_TEXT_") && !policyNames.has(name)) throw new ConfigError(`${name} is not a live text limit (docs/configuration.md)`);
 	}
 	validateLiveTextPolicy(policy, limits);
 	const publicOrigin = env.PUBLIC_ORIGIN?.trim() ?? "";

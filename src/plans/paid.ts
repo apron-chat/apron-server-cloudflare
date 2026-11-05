@@ -218,9 +218,12 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// Sampling keeps the per-request cost to one random number; the rate
 		// limiter counts 600 sampled requests a minute.
 		floodSampleEvery: 20,
-		// Long enough for analytics to show the flood, so the guard's bill cap
-		// takes over before the hold ends if the flood ran up the bill.
-		holdSeconds: 30 * 60,
+		// Five minutes: a flood still going re-trips within a minute of the
+		// lift, so the stop lasts as long as the flood does and the bill cap
+		// takes over if it ran up the bill, while a one-minute burst from one
+		// address costs everyone five minutes, not thirty. Each re-trip lets
+		// about a minute of flood through, 12,000 requests or so.
+		holdSeconds: 5 * 60,
 	}),
 	// Images and voice clips kept in R2 and served from its public bucket
 	// domain, counted together. At most 500 uploads a day are about 16,000

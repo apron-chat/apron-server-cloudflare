@@ -94,9 +94,11 @@ function withHold(description: string | undefined, until: number): string {
  * A rule turned on less than the plan's `holdSeconds` ago, or within an
  * attack hold (`holdUntil`, written into its description), is not turned
  * off; turning it off clears the hold. Turning it on with a later hold than
- * the rule has extends the hold even when it is already on.
+ * the rule has extends the hold even when it is already on, unless `extend`
+ * is false (the flood trip: it would rewrite the rule once a minute an isolate).
  */
-async function setEdgeStop(env: StopRuleEnvironment, stop: boolean, exceeded: string[], now: number, fetcher: typeof fetch, holdUntil = 0, ignoreHold = false): Promise<EdgeStopOutcome> {
+async function setEdgeStop(env: StopRuleEnvironment, stop: boolean, exceeded: string[], now: number, fetcher: typeof fetch, options: { holdUntil?: number; ignoreHold?: boolean; extend?: boolean } = {}): Promise<EdgeStopOutcome> {
+	const { holdUntil = 0, ignoreHold = false } = options;
 	const { api, headers } = rulesetsApi(env);
 	try {
 		const { rulesetId, rule } = await readStopRule(env, fetcher);
@@ -106,14 +108,14 @@ async function setEdgeStop(env: StopRuleEnvironment, stop: boolean, exceeded: st
 		}
 		const enabled = ruleEnabled(rule);
 		const held = ignoreHold ? 0 : ruleHoldUntil(rule.description);
-		const extend = stop && holdUntil > held;
+		const extend = stop && holdUntil > held && options.extend !== false;
 		// A stop confirmed (by the bill cap) after its attack hold passed drops
 		// the mark, so a later analytics failure cannot lift it as a passed hold.
 		const stale = stop && enabled && holdUntil === 0 && ruleHoldUntil(rule.description) > 0 && ruleHoldUntil(rule.description) <= now;
 		if (enabled === stop && !extend && !stale) return "unchanged";
 		const holdMs = (PLAN.edgeStop?.holdSeconds ?? 0) * 1_000;
 		const updatedAt = Date.parse(rule.last_updated ?? "");
-		if (!stop && (now - updatedAt < holdMs || now < held)) return "held";
+		if (!stop && !ignoreHold && (now - updatedAt < holdMs || now < held)) return "held";
 		const description = stop && !stale ? withHold(rule.description, Math.max(held, holdUntil)) : withHold(rule.description, 0);
 		const update = await fetcher(`${api}/${encodeURIComponent(rulesetId)}/rules/${encodeURIComponent(rule.id)}`, {
 			method: "PATCH",
@@ -139,7 +141,7 @@ async function setEdgeStop(env: StopRuleEnvironment, stop: boolean, exceeded: st
 export async function setAttackStop(env: BudgetGuardEnvironment, until: number, trigger: string, now = Date.now(), fetcher: typeof fetch = fetch): Promise<EdgeStopOutcome | "unconfigured"> {
 	const { ZONE_ID, EDGE_STOP_TOKEN } = env;
 	if (!ZONE_ID || !EDGE_STOP_TOKEN) return "unconfigured";
-	return setEdgeStop({ ...env, ZONE_ID, EDGE_STOP_TOKEN }, true, [`attack:${trigger}`], now, fetcher, until);
+	return setEdgeStop({ ...env, ZONE_ID, EDGE_STOP_TOKEN }, true, [`attack:${trigger}`], now, fetcher, { holdUntil: until });
 }
 
 /**
@@ -160,8 +162,8 @@ export async function runBudgetGuard(env: BudgetGuardEnvironment, now = Date.now
 		exceeded = snapshotReasons(await fetchAccountUsage(env, now, undefined, fetcher));
 	} catch (error) {
 		log("budget_guard_usage_failed", { message: message(error) }, "error");
-		// An attack pause whose hold has passed is lifted even so: otherwise an
-		// analytics outage would keep the server blocked for as long as it lasts.
+		// An attack pause's or flood trip's stop whose hold has passed is lifted even so:
+		// otherwise an analytics outage would keep the server blocked for as long as it lasts.
 		// A stop the bill cap set carries no hold mark and stays as it is.
 		try {
 			const { rule } = await readStopRule({ ...env, ZONE_ID, EDGE_STOP_TOKEN }, fetcher);
@@ -175,7 +177,7 @@ export async function runBudgetGuard(env: BudgetGuardEnvironment, now = Date.now
 	}
 	const stop = exceeded.length > 0;
 	const ignoreHold = String(env.ATTACK_PAUSE ?? "").trim().toLowerCase() === "false";
-	const outcome = await setEdgeStop({ ...env, ZONE_ID, EDGE_STOP_TOKEN }, stop, exceeded, now, fetcher, 0, ignoreHold);
+	const outcome = await setEdgeStop({ ...env, ZONE_ID, EDGE_STOP_TOKEN }, stop, exceeded, now, fetcher, { ignoreHold });
 	if (outcome === "rule_failed" || outcome === "rule_missing") return { outcome };
 	return { outcome, stop, exceeded };
 }
@@ -226,7 +228,9 @@ export function watchForFlood(env: BudgetGuardEnvironment, ctx: Pick<ExecutionCo
 		}
 		if (now - floodTrippedAt < FLOOD_RETRY_MS) return;
 		floodTrippedAt = now;
-		if (await setEdgeStop({ ...env, ZONE_ID, EDGE_STOP_TOKEN }, true, ["flood"], now, fetcher) !== "changed") return;
+		// Held for the plan's holdSeconds by a mark in the rule, as the attack
+		// pause's is, so the guard lifts it once passed even while analytics fail.
+		if (await setEdgeStop({ ...env, ZONE_ID, EDGE_STOP_TOKEN }, true, ["flood"], now, fetcher, { holdUntil: now + policy.holdSeconds * 1_000, extend: false }) !== "changed") return;
 		try { await onStop?.(); } catch { /* a notice never breaks the stop */ }
 	})());
 }

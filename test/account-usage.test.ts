@@ -176,6 +176,8 @@ describe("account usage snapshots", () => {
 	it("fails closed on API errors or missing datasets instead of treating them as zero", () => {
 		expect(() => accountUsageSnapshotFromResult({ errors: [{ message: "denied" }] }, Date.now())).toThrow();
 		expect(() => accountUsageSnapshotFromResult({ data: { viewer: { accounts: [{}] } } }, Date.now())).toThrow();
+		// A month with no groups is analytics lagging, not zero usage: it would lift a month's stop.
+		expect(() => accountUsageSnapshotFromResult(result({ monthWorkers: [] }), Date.now())).toThrow(/month/);
 	});
 
 	it("rejects negative or non-numeric usage values", () => {

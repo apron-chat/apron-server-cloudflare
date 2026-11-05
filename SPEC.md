@@ -10,7 +10,7 @@ User-facing behaviour and its rationale are in [docs/policy.md](docs/policy.md);
 
 ## 1. Objective and instructions to the coding harness
 
-A usable, publicly accessible Apron demo backend on native Cloudflare Workers, one SQLite-backed Durable Object (DO), and hibernating WebSockets: guest use and passkey authentication, bounded posting and history, and graceful resource exhaustion. It runs on Workers Paid ($5/month) within its included usage, and must still run on the Workers Free plan without paid services when its free budgets are selected (`src/plans/free.ts`).
+A usable, publicly accessible Apron demo backend on native Cloudflare Workers, one SQLite-backed Durable Object (DO), and hibernating WebSockets: guest use and passkey authentication, bounded posting and history, and graceful resource exhaustion. It runs on Workers Paid ($5/month), its budgets sized against the plan's per-day share of included usage and its bill bounded by the budget guard's cap (section 7; the Paid budgets in `src/plans/paid.ts` run past the share by design), and must still run on the Workers Free plan without paid services when its free budgets are selected (`src/plans/free.ts`).
 
 This specification defines deployment policies within the base chat protocol; preserve the protocol's mandatory behavior and document material differences. MUST marks required behavior and SHOULD preferences. All limits live in validated configuration with the defaults below; do not silently raise them to make tests pass. Client changes (passkeys, rolling-history recovery) belong in the frontend repository. Do not deploy, switch billing plans, or create paid resources as part of a change.
 
@@ -528,6 +528,8 @@ DO incoming WebSocket messages have a 20:1 request-metering ratio; handshakes/RP
 
 ### Application allocations
 
+The ceilings below are the original planning baseline. The Workers Paid budgets in force (`src/plans/paid.ts`) set larger daily ceilings, past the plan's per-day share of included usage, and rely on the bill cap for the guarantee; [configuration](docs/configuration.md#plans) has the current numbers.
+
 | Budget | Ceiling | Allocation |
 | --- | ---: | --- |
 | SQL writes/day | 800,000 (Free: 80,000) | Up to 700,000 foreground; 100,000 reserved maintenance/control (Free: 60,000 and 20,000) |
@@ -722,7 +724,7 @@ Use the same scheduler for unauthenticated socket deadlines, batching deadlines 
 | One overrun past a hundredth of a day's SQL ceilings | Open that operation's breaker at once, for an hour; the operation itself finishes |
 | Storage failure leaving accounting uncertain (a budget read or write failed) | Fail closed only while it fails ("Server storage is unavailable; try again shortly"); reopen once the staged budget write lands, with no operator. Where it can be written, a marker (`uncertain`) survives an eviction: the first operation after the next wake charges a hundredth of the day's SQL ceilings for what the lost instance left unwritten, then reopens |
 | Estimated overage past the bill cap (Paid: `BILL_CAP_DAY` $5 today, `BILL_CAP_MONTH` $25 this month) | Account stop: 503 and sockets closed once; the budget guard turns on the edge stop until the day's or month's end |
-| Shadow burn of $1 an hour or more, mostly refused (a flood) | Attack pause: refuse everything with 503 and `Retry-After`, close every socket, edge stop held 30 minutes (doubling with each pause that UTC day, at most 4 hours); lifts by itself, or at once with `ATTACK_PAUSE=false` |
+| Shadow burn of $1 an hour or more, mostly refused (a flood) | Attack pause: refuse everything with 503 and `Retry-After`, close every socket, edge stop held 10 minutes (doubling with each pause that UTC day, at most 4 hours); lifts by itself, or at once with `ATTACK_PAUSE=false` |
 | Cloudflare hard limit | Fail closed; no automatic paid fallback |
 
 Every 503 for a failure or overload carries `Retry-After`: its own delay where it has one, else 60 seconds (an operator's admission switch and a configuration error carry none), so an outage is not met with every client retrying at once. An internal error says its cause where it has one (storage unavailable, or "Server unavailable; try again shortly" when the object itself throws), so a connection status probe alone tells why the server refuses.

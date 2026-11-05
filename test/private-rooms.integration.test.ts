@@ -89,6 +89,8 @@ it('answers every request about a private room someone is not in exactly as for 
 			['room_list', { parent_room_id: room }],
 			['history', { room_id: room }],
 			['message', { room_id: room, body: { text: 'hello?' } }],
+			// An empty message is answered without posting; the room check must still hide the room.
+			['message', { room_id: room, body: { text: '' } }],
 			['message', { message_id: message, body: { text: 'mine now' } }],
 			['message', { room_id: 'general', body: { text: 'replying' }, reply_to: { message_id: message } }],
 			['reactions', { message_id: message, emojis: ['👍'] }],

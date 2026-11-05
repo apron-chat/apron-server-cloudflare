@@ -7538,7 +7538,7 @@ export class Store {
       // Nothing is logged, charged, or recorded; only the room is checked.
       return this.reserved({ reads: 8 }, false, operationNow, () => {
         const roomId = input.params.room_id === undefined ? ROOM_ID : input.params.room_id;
-        if (typeof roomId !== "string" || !this.roomRow(roomId)) throw new StoreError("invalid_params", "unknown room");
+        if (typeof roomId !== "string" || !this.visibleRoomRow(roomId, input.userId)) throw new StoreError("invalid_params", "unknown room");
         return { result: {}, broadcasts: [] };
       });
     }
