@@ -380,6 +380,16 @@ const MAX_HELD_WAKES = 8;
  */
 const HELD_WAKE_SECONDS = 10 * 60;
 
+/**
+ * A held wake's reasons for `userId` as its message reads now: `mentions`
+ * only while it still mentions them, since an edit may have taken the
+ * mention out after it was held (a mention is what gets through a room mute).
+ */
+function stillMentioned(message: MessageSnapshot, userId: string, reasons: number): number {
+	const mentions = Array.isArray(message.body?.mentions) ? message.body.mentions : [];
+	return mentions.includes(userId) ? reasons : reasons & ~WAKE_SCOPES.mentions;
+}
+
 /** A held wake standing by in a release (PendingWake.others): its message, room, and the user's reasons for it. */
 type HeldOther = [messageId: string, roomId: string, reasons: number];
 
@@ -5712,10 +5722,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (this.pushWake(message, reasons) || !others.length) return;
 			message = null;
 			while (!message && others.length) {
-				const [messageId, , why] = others.shift()!;
-				message = this.heldMessage(messageId, nowMs());
-				// Held wakes are one user's: the next stands in with its own reasons.
-				reasons = new Map([...wake.reasons.keys()].map((userId) => [userId, why]));
+				const [messageId, , held] = others.shift()!;
+				const next = this.heldMessage(messageId, nowMs());
+				if (!next) continue;
+				// Held wakes are one user's: the next stands in with its own reasons, as it reads now.
+				reasons = new Map([...wake.reasons.keys()].flatMap((userId) => {
+					const why = stillMentioned(next, userId, held);
+					return why ? [[userId, why] as [string, number]] : [];
+				}));
+				if (reasons.size) message = next;
 			}
 		}
 	}
@@ -5854,9 +5869,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private scheduleHeld(userId: string, ids: HeldOther[], now: number): void {
 		const rest = [...ids];
 		while (rest.length) {
-			const [messageId, , why] = rest.shift()!;
+			const [messageId, , held] = rest.shift()!;
 			const message = this.heldMessage(messageId, now);
-			if (!message) continue;
+			const why = message ? stillMentioned(message, userId, held) : 0;
+			if (!message || !why) continue;
 			this.scheduleWake(message, new Map([[userId, why]]), rest);
 			return;
 		}

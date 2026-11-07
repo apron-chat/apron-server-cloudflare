@@ -1428,6 +1428,29 @@ describe('held wakes', () => {
 		} finally { alice.close(); bob.close(); }
 	});
 
+	it('releases a held mention through a room mute, unless an edit took the mention out', async () => {
+		const pushes = capturePushes();
+		const [aliceId, bobId] = [unique('alice'), unique('bob')];
+		const alice = await signedIn(aliceId);
+		const bob = await signedIn(bobId);
+		try {
+			const bobSub = await subscribe(bob, 'bob');
+			const threads = [];
+			for (const title of ['Kept', 'Edited']) threads.push((await request(alice, `thread-${title}`, 'room_set', { parent_room_id: 'general', title })).result.room_id);
+			// Bob is attended, so both mentions are held; both rooms are muted.
+			for (const thread of threads) expect((await status(bob, { room_id: thread, mute: true })).frame.result).toEqual({});
+			await post(alice, 'kept', { room_id: threads[0], body: { text: 'kept', mentions: [bobId] } });
+			const edited = await post(alice, 'edited', { room_id: threads[1], body: { text: 'edited', mentions: [bobId] } });
+			// The newest takes the mention out: it no longer gets through the mute, and the older one stands in.
+			await post(alice, 'edit', { message_id: edited.result.message_id, body: { text: 'edited, no mention' } });
+			await idleFor(bob, 60);
+			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
+			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.body.text).toBe('kept');
+			await settleFor();
+			expect(pushes).toHaveLength(1);
+		} finally { alice.close(); bob.close(); }
+	});
+
 	it('holds no joined wake for an attended moderator, so a busy room cannot crowd out their mention', async () => {
 		const pushes = capturePushes();
 		const [aliceId, modId] = [unique('alice'), unique('hmod')];
