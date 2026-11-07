@@ -885,45 +885,54 @@ describe('status mute', () => {
 		} finally { peer.close(); other.close(); }
 	});
 
-	it('silences a room and its threads, mentions and replies included, and nothing else', async () => {
+	it('silences a room and its threads but for mentions, which still wake, and nothing else', async () => {
 		const pushes = capturePushes();
 		const [aliceId, bobId] = [unique('alice'), unique('bob')];
 		const alice = await signedIn(aliceId);
 		const bob = await signedIn(bobId);
+		/** The texts of the pushes so far, in any order. */
+		const texts = async () => (await Promise.all(pushes.map(async (push) => JSON.parse((await decryptPush(push.body, bobSub.browser)).plaintext).message.body.text as string))).sort();
+		let bobSub!: Awaited<ReturnType<typeof subscribe>>;
 		try {
-			const bobSub = await subscribe(bob, 'bob');
+			bobSub = await subscribe(bob, 'bob');
 			const thread = (await request(alice, 'thread', 'room_set', { parent_room_id: 'general', title: 'Muted thread' })).result.room_id;
 			const other = (await request(alice, 'other', 'room_set', { parent_room_id: 'general', title: 'Other thread' })).result.room_id;
 			const bobsMessage = await post(bob, 'bobs', { room_id: thread, body: { text: 'reply to me' } });
 			await setIdle(bob, true);
-			// The thread is muted: a mention and a reply there wake no one.
+			// The thread is muted: a reply there wakes no one, a mention still does. The reply goes first, so
+			// the mention's push isn't coalesced away by one for the reply.
 			bob.send({ id: statusId(), method: 'status', params: { room_id: thread, mute: true } });
 			expect(mutesOf(await drainTo(bob, 'sync-thread'))).toEqual([{ room_id: thread, mute: true }]);
-			await post(alice, 'mention-thread', { room_id: thread, body: { text: 'hi', mentions: [bobId] } });
 			await post(alice, 'reply-thread', { room_id: thread, reply_to: { message_id: bobsMessage.result.message_id }, body: { text: 'answer' } });
+			await post(alice, 'mention-thread', { room_id: thread, body: { text: 'hi', mentions: [bobId] } });
 			// Another thread is not muted.
 			await post(alice, 'mention-other', { room_id: other, body: { text: 'over here', mentions: [bobId] } });
-			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
-			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.body.text).toBe('over here');
-			// Muting the parent silences its threads too, and the parent itself.
+			await vi.waitFor(() => expect(pushes).toHaveLength(2), { timeout: 5_000 });
+			expect(await texts()).toEqual(['hi', 'over here']);
+			// Muting the parent silences replies in its threads too, but not mentions there or in the parent.
 			pushes.length = 0;
 			bob.send({ id: statusId(), method: 'status', params: { room_id: thread, mute: false } });
 			bob.send({ id: statusId(), method: 'status', params: { room_id: 'general', mute: 600 } });
 			await drainTo(bob, 'sync-general');
 			const third = (await request(alice, 'third', 'room_set', { parent_room_id: 'general', title: 'Third thread' })).result.room_id;
+			const bobsThird = await post(bob, 'bobs-third', { room_id: third, body: { text: 'reply here' } });
+			await setIdle(bob, true);
+			await post(alice, 'reply-third', { room_id: third, reply_to: { message_id: bobsThird.result.message_id }, body: { text: 'silenced' } });
 			await post(alice, 'mention-third', { room_id: third, body: { text: 'in a thread', mentions: [bobId] } });
 			await post(alice, 'mention-general', { room_id: 'general', body: { text: 'in general', mentions: [bobId] } });
-			await post(alice, 'mention-thread-again', { room_id: thread, body: { text: 'in the first thread', mentions: [bobId] } });
+			await vi.waitFor(() => expect(pushes).toHaveLength(2), { timeout: 5_000 });
+			expect(await texts()).toEqual(['in a thread', 'in general']);
 			// A room that does not exist cannot be muted: invalid_params, and nothing is sent.
 			const unknown = await status(bob, { room_id: 'no-such-room', mute: true });
 			expect(unknown.frame.error.code).toBe(-32602);
 			expect(mutesOf(unknown.skipped)).toEqual([]);
+			pushes.length = 0;
 			bob.send({ id: statusId(), method: 'status', params: { room_id: 'general', mute: false } });
 			await drainTo(bob, 'sync-unmuted');
 			const fourth = (await request(alice, 'fourth', 'room_set', { parent_room_id: 'general', title: 'Fourth thread' })).result.room_id;
 			await post(alice, 'mention-fourth', { room_id: fourth, body: { text: 'unmuted', mentions: [bobId] } });
 			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
-			expect(JSON.parse((await decryptPush(pushes[0].body, bobSub.browser)).plaintext).message.body.text).toBe('unmuted');
+			expect(await texts()).toEqual(['unmuted']);
 		} finally { alice.close(); bob.close(); }
 	});
 
@@ -1401,12 +1410,13 @@ describe('held wakes', () => {
 			const bobSub = await subscribe(bob, 'bob');
 			const threads = [];
 			for (const title of ['One', 'Two', 'Three']) threads.push((await request(alice, `thread-${title}`, 'room_set', { parent_room_id: 'general', title })).result.room_id);
+			const bobs = await post(bob, 'bobs', { room_id: threads[1], body: { text: 'mine' } });
 			await post(alice, 'first', { room_id: threads[0], body: { text: 'first', mentions: [bobId] } });
-			await post(alice, 'second', { room_id: threads[1], body: { text: 'second', mentions: [bobId] } });
+			await post(alice, 'second', { room_id: threads[1], reply_to: { message_id: bobs.result.message_id }, body: { text: 'second' } });
 			const third = await post(alice, 'third', { room_id: threads[2], body: { text: 'third', mentions: [bobId] } });
 			// The newest is deleted: the next newest stands for them.
 			await post(alice, 'delete', { message_id: third.result.message_id, deleted: true });
-			// Bob muted the second's room: the one before stands in for it.
+			// Bob muted the second's room, which silences its reply: the one before stands in for it.
 			expect((await status(bob, { room_id: threads[1], mute: true })).frame.result).toEqual({});
 			await idleFor(bob, 60);
 			await vi.waitFor(() => expect(pushes).toHaveLength(1), { timeout: 5_000 });
@@ -1939,11 +1949,16 @@ describe('push subscriptions in the store', () => {
 				identity: { user_id: 'rho' }, params: { parent_room_id: 'general', title: 'A thread' },
 			}).result.room_id as string;
 			expect(store.setRoomMute({ userId: 'rho', roomId: 'general', untilMs: clock.value + 10_000, now: clock.value })).toEqual({ changed: true, untilMs: clock.value + 10_000 });
-			// The parent's mute silences the thread.
-			expect(claim(store, clock, ['rho'], thread)).toEqual({ subscriptions: [], skipped: 0 });
+			// The parent's mute silences the thread, but for a mention, which gets through with only `mentions`.
+			const reply = () => store.claimPushes({ senderId: 'sender', roomId: thread, candidates: [{ userId: 'rho', reasons: WAKE_SCOPES.replies }], now: clock.value });
+			expect(reply()).toEqual({ subscriptions: [], skipped: 0 });
+			const mentioned = store.claimPushes({ senderId: 'sender', roomId: thread, candidates: [{ userId: 'rho', reasons: WAKE_SCOPES.mentions | WAKE_SCOPES.replies }], now: clock.value });
+			expect(mentioned.subscriptions.map((subscription) => subscription.reasons)).toEqual([WAKE_SCOPES.mentions]);
 			expect(store.setRoomMute({ userId: 'rho', roomId: 'general', untilMs: null, now: clock.value })).toEqual({ changed: true });
 			expect(store.setRoomMute({ userId: 'rho', roomId: 'general', untilMs: null, now: clock.value })).toEqual({ changed: false });
-			expect(claim(store, clock, ['rho'], thread).subscriptions).toHaveLength(1);
+			// Unmuted, past the mention's coalescing window, the reply wakes.
+			clock.value += POLICY.coalesceSeconds * 1_000;
+			expect(reply().subscriptions).toHaveLength(1);
 			// Up to the cap; past it, refused unless one ran out.
 			for (let index = 0; index < MAX_ROOM_MUTES_PER_USER; index += 1) {
 				expect(store.setRoomMute({ userId: 'rho', roomId: `room-${index}`, untilMs: index === 0 ? clock.value + 1_000 : MUTE_FOREVER, now: clock.value }).changed).toBe(true);

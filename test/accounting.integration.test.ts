@@ -1045,8 +1045,8 @@ describe('measured storage accounting', () => {
 			expect(measure('status set to invisible, the stored seen standing', () => store.setStatus({ userId: 'matrix-user', choice: 'invisible', seenAt: later + 60_000, now: clock.now() }))).toEqual({ changed: true, seen: later });
 			expect(store.getIdentity('matrix-user')?.seen).toBe(later);
 			store.setStatus({ userId: 'matrix-user', choice: 'online', now: clock.now() });
-			// The thread's parent is muted: a wake for the thread is silenced by it.
-			expect(measure('push wake claim, the thread\'s parent muted', () => store.claimPushes({ senderId: 'matrix-sender', roomId: threadId, candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.mentions }], now: clock.now() }))).toEqual({ subscriptions: [], skipped: 0 });
+			// The thread's parent is muted: a wake for the thread is silenced by it, but for a mention.
+			expect(measure('push wake claim, the thread\'s parent muted', () => store.claimPushes({ senderId: 'matrix-sender', roomId: threadId, candidates: [{ userId: 'matrix-user', reasons: WAKE_SCOPES.replies }], now: clock.now() }))).toEqual({ subscriptions: [], skipped: 0 });
 			// The most room mutes a user may hold: the sign-in reads them all.
 			state.storage.transactionSync(() => {
 				for (let index = 1; index < MAX_ROOM_MUTES_PER_USER; index += 1) {
