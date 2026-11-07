@@ -380,6 +380,19 @@ const MAX_HELD_WAKES = 8;
  */
 const HELD_WAKE_SECONDS = 10 * 60;
 
+/**
+ * A held wake's reasons for `userId` as its message reads now: `mentions`
+ * only while it still mentions them, since an edit may have taken the
+ * mention out after it was held (a mention is what gets through a room mute).
+ */
+function stillMentioned(message: MessageSnapshot, userId: string, reasons: number): number {
+	const mentions = Array.isArray(message.body?.mentions) ? message.body.mentions : [];
+	return mentions.includes(userId) ? reasons : reasons & ~WAKE_SCOPES.mentions;
+}
+
+/** A held wake standing by in a release (PendingWake.others): its message, room, and the user's reasons for it. */
+type HeldOther = [messageId: string, roomId: string, reasons: number];
+
 /** A message's wake waiting `pushDelaySeconds` to push: the users still to consider, with their wake reasons. */
 interface PendingWake {
 	message: MessageSnapshot;
@@ -387,10 +400,12 @@ interface PendingWake {
 	timer?: ReturnType<typeof setTimeout>;
 	/**
 	 * For held wakes released together as one push (releaseHeld): the older
-	 * messages and their rooms, newest first, to push instead when `message`
-	 * wakes no one (its room muted, or woken for already) or is read first.
+	 * messages, their rooms and the user's reasons for each, newest first, to
+	 * push instead when `message` wakes no one (its room muted, or woken for
+	 * already) or is read first. Each keeps its own reasons, so a reply in a
+	 * muted room never borrows another message's mention to get through.
 	 */
-	others?: Array<[messageId: string, roomId: string]>;
+	others?: HeldOther[];
 }
 
 /** Pending status changes one connection may hold; more are delivered at once. */
@@ -5655,7 +5670,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * (see pendingWakes), with the message as it is then (keepReasons), or at
 	 * once without a wait.
 	 */
-	private scheduleWake(message: MessageSnapshot, reasons: Map<string, number>, others?: Array<[string, string]>): void {
+	private scheduleWake(message: MessageSnapshot, reasons: Map<string, number>, others?: HeldOther[]): void {
 		const wake: PendingWake = { message, reasons, ...(others ? { others } : {}) };
 		const delay = this.config.pushDelaySeconds * 1_000;
 		// Past the bound, a wake goes at once, as it would with no wait.
@@ -5701,11 +5716,22 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private sendWake(wake: PendingWake): void {
 		let message: MessageSnapshot | null = wake.message;
+		let reasons = wake.reasons;
 		const others = [...(wake.others ?? [])];
 		while (message) {
-			if (this.pushWake(message, wake.reasons) || !others.length) return;
+			if (this.pushWake(message, reasons) || !others.length) return;
 			message = null;
-			while (!message && others.length) message = this.heldMessage(others.shift()![0], nowMs());
+			while (!message && others.length) {
+				const [messageId, , held] = others.shift()!;
+				const next = this.heldMessage(messageId, nowMs());
+				if (!next) continue;
+				// Held wakes are one user's: the next stands in with its own reasons, as it reads now.
+				reasons = new Map([...wake.reasons.keys()].flatMap((userId) => {
+					const why = stillMentioned(next, userId, held);
+					return why ? [[userId, why] as [string, number]] : [];
+				}));
+				if (reasons.size) message = next;
+			}
 		}
 	}
 
@@ -5730,7 +5756,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (wake.reasons.size) continue;
 			clearTimeout(wake.timer);
 			this.pendingWakes.delete(wake);
-			if (roomId !== undefined && wake.others?.length) this.scheduleHeld(userId, reasons, wake.others, nowMs());
+			if (roomId !== undefined && wake.others?.length) this.scheduleHeld(userId, wake.others, nowMs());
 		}
 	}
 
@@ -5820,20 +5846,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!states.some(({ state }) => state.held?.length)) return;
 		if (states.some(({ socket, state }) => this.attendedConnection(socket, state, now))) return;
 		const attendedUntil = Math.max(now - HELD_WAKE_SECONDS * 1_000, ...states.map(({ state }) => state.idleAt ?? state.frameTimes[state.frameTimes.length - 1] ?? 0));
-		const due = new Map<string, { at: number; roomId: string }>();
-		let reasons = 0;
+		const due = new Map<string, { at: number; roomId: string; why: number }>();
 		for (const { state } of states) {
 			for (const [messageId, roomId, why, at] of state.held ?? []) {
 				if (at <= attendedUntil) continue;
-				due.set(messageId, { at: Math.max(due.get(messageId)?.at ?? 0, at), roomId });
-				reasons |= why;
+				const kept = due.get(messageId);
+				due.set(messageId, { at: Math.max(kept?.at ?? 0, at), roomId, why: (kept?.why ?? 0) | why });
 			}
 		}
 		this.dropHeld(userId);
 		// One push for them all, as each push costs: the newest; the rest stand by in case it wakes no one.
 		// At most MAX_HELD_WAKES of them, so the lookups and claims a release may try stay bounded.
-		const ids = [...due].sort((a, b) => b[1].at - a[1].at).slice(0, MAX_HELD_WAKES).map(([messageId, { roomId }]) => [messageId, roomId] as [string, string]);
-		this.scheduleHeld(userId, reasons, ids, now);
+		const ids = [...due].sort((a, b) => b[1].at - a[1].at).slice(0, MAX_HELD_WAKES).map(([messageId, { roomId, why }]): HeldOther => [messageId, roomId, why]);
+		this.scheduleHeld(userId, ids, now);
 	}
 
 	/**
@@ -5841,12 +5866,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * of `ids` whose message is still there (one metered lookup each), the
 	 * rest standing by (`others`).
 	 */
-	private scheduleHeld(userId: string, reasons: number, ids: Array<[string, string]>, now: number): void {
+	private scheduleHeld(userId: string, ids: HeldOther[], now: number): void {
 		const rest = [...ids];
 		while (rest.length) {
-			const message = this.heldMessage(rest.shift()![0], now);
-			if (!message) continue;
-			this.scheduleWake(message, new Map([[userId, reasons]]), rest);
+			const [messageId, , held] = rest.shift()!;
+			const message = this.heldMessage(messageId, now);
+			const why = message ? stillMentioned(message, userId, held) : 0;
+			if (!message || !why) continue;
+			this.scheduleWake(message, new Map([[userId, why]]), rest);
 			return;
 		}
 	}

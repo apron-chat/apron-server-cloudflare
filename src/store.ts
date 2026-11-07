@@ -6557,7 +6557,8 @@ export class Store {
    * mute or a `dnd` status silences (protocol §4.9: a silenced push
    * goes only to `badge` registrations, which this server does not have):
    * its unscoped mute, or its mute of the room or, for a thread, of the
-   * thread's parent; one woken for this room within `coalesceSeconds` is
+   * thread's parent, which lets only `mentions` through, as in other chat
+   * apps; one woken for this room within `coalesceSeconds` is
    * passed over too; the rest are woken, up to
    * `wakesPerMessage` users, on each of their registrations (most recently
    * registered first). Pushes are charged as they are claimed, delivered
@@ -6577,8 +6578,9 @@ export class Store {
    * passed over before it counts. Each woken user's time for the room is kept for coalescing.
    * Each claimed registration carries the scopes it is pushed for. An
    * operator `alert` (ApronDemoServer.notifyAdmins) skips the coalescing
-   * window and the allowances, though it is counted against them; a mute
-   * or `dnd` still silences it (§4.9).
+   * window and the allowances, though it is counted against them; the
+   * unscoped mute or `dnd` still silences it (§4.9), and a room's mute lets
+   * it through, as it mentions them.
    */
   claimPushes(input: { senderId: string; roomId: string; candidates: readonly PushCandidate[]; allowed?: (url: string) => boolean; now?: number; alert?: boolean }): PushClaim {
     this.ensureReady();
@@ -6623,7 +6625,7 @@ export class Store {
         // Filtered after the bounded read, so the read stays one primary-key
         // range of the user's registrations, at most `subscriptionsPerUser`,
         // whatever the scopes.
-        const rows = this.rawRows<RawPushRow>(
+        let rows = this.rawRows<RawPushRow>(
           `SELECT url, p256dh, auth, push_id, wake FROM push_subscriptions
            WHERE user_id = ? AND wake != 0 AND updated_ms >= ? ORDER BY updated_ms DESC LIMIT ?`,
           userId, live, policy.subscriptionsPerUser,
@@ -6634,7 +6636,12 @@ export class Store {
           `SELECT mute_until_ms FROM room_mutes WHERE user_id = ? AND room_id IN (${rooms.map(() => "?").join(", ")}) AND mute_until_ms > ? LIMIT 1`,
           userId, ...rooms, effective,
         );
-        if (roomMuted.length) continue;
+        // A room's mute lets a mention through, as in other chat apps, and nothing else.
+        if (roomMuted.length) {
+          why &= WAKE_SCOPES.mentions;
+          rows = rows.filter((row) => (integerColumn(row.wake) & why) !== 0);
+          if (!rows.length) continue;
+        }
         // Pushed only for `joined`: its own window and recipient allowance, and no sender's.
         const joinedOnly = rows.every((row) => (integerColumn(row.wake) & why) === WAKE_SCOPES.joined);
         const last = this.rawRows<{ woken_ms: number }>("SELECT woken_ms FROM push_wakes WHERE user_id = ? AND room_id = ? LIMIT 1", userId, input.roomId)[0];
