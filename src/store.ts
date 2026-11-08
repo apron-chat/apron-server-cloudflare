@@ -5455,14 +5455,18 @@ export class Store {
       if (params.body === undefined) throw new StoreError("invalid_params", "message body is required");
       // An editor's save keeps every other field of the body.
       body = editor ? this.sharedTextBody(previous!, params.body) : this.normalizedBody(params.body);
+      // Emptied, a message whose last embed then fails or ends with nothing is a tombstone (rewriteEmbed): only its sender deletes it.
+      if (editor && body.text === "") throw new StoreError("invalid_params", "Only the sender may empty this message's text");
       if (body.text === "" && (body.embeds as unknown[]).length === 0) throw new StoreError("invalid_params", "message cannot be empty");
     }
     // A save merges `ext` into the current snapshot's (§4.12); a tombstone carries none (§4.4),
     // so a creation, or a save of a tombstone, merges into an empty `ext`.
     // An editor's save keeps ext too, and edited_by names who saved a
     // snapshot when not its sender (ext:editors); requests do not set it.
+    // A moderator's move changes no content, so it keeps the edited_by of the text it moves.
     const write = editor ? undefined : this.optionalExt(params.ext);
-    const ext = deleted ? undefined : withEditedBy(mergeExt(previous?.ext, write), editor ? input.userId : undefined);
+    const merged = deleted ? undefined : mergeExt(previous?.ext, write);
+    const ext = moving ? merged : withEditedBy(merged, editor ? input.userId : undefined);
     const from = previous ? previous.from : this.identityForMessage(input);
     if (!from || typeof from.user_id !== "string") throw new StoreError("internal_error", "message author is missing");
 
@@ -5473,7 +5477,8 @@ export class Store {
     let writes: Record<string, unknown>[] = [];
     let liveStarted: LiveEntry[] = [];
     let liveEnded: string[] = [];
-    if (this.config.uploads || this.config.liveText) {
+    // An editor's save keeps the embeds as they are stored: it starts no upload or live text, and releases none (ext:editors).
+    if ((this.config.uploads || this.config.liveText) && !editor) {
       const identified = this.identifyEmbeds(body ? body.embeds as Record<string, unknown>[] : [], previous, input, messageId, logId, context.commitMs, typeof body?.text === "string" ? body.text : "", liveClaim);
       if (body) body.embeds = identified.embeds;
       uploads = identified.uploads;
@@ -6377,8 +6382,11 @@ export class Store {
     const { prev_room_id: _moved, body: previousBody, ...rest } = snapshot;
     const next: MessageSnapshot = { ...rest, log_id: idString(logId), prev_log_id: idString(message.latest_log_id) };
     const nextText = text ?? previousBody?.text;
-    if (nextText === "" && !embeds.length) next.deleted = true;
-    else {
+    // A tombstone carries no body and no ext (§4.4).
+    if (nextText === "" && !embeds.length) {
+      next.deleted = true;
+      delete next.ext;
+    } else {
       next.body = { ...previousBody, ...(text !== undefined ? { text } : {}), embeds };
       // An append that moved into the text leaves an ordinary message (§4.8.5).
       if (text !== undefined && !embeds.length) delete next.body.embeds;

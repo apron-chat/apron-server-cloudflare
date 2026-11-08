@@ -1469,7 +1469,11 @@ const MAX_PUSH_PAYLOAD_BYTES = 2048;
  */
 export function pushPayload(message: MessageSnapshot, pushId?: string, unread?: number): string {
 	const body = message.body ?? {};
-	const points = typeof body.text === "string" ? [...body.text] : [];
+	// Text a mentioned user saved (ext:editors) is theirs, not the sender's that `from` names: a push sent after such a
+	// save, delayed or held, leaves it out.
+	const editors = message.ext?.editors;
+	const editedByOther = typeof editors === "object" && editors !== null && typeof (editors as Record<string, unknown>).edited_by === "string" && (editors as Record<string, unknown>).edited_by !== message.from.user_id;
+	const points = typeof body.text === "string" && !editedByOther ? [...body.text] : [];
 	const text = points.length > PUSH_TEXT_CODE_POINTS ? points.slice(0, PUSH_TEXT_CODE_POINTS - 1).join("") + "…" : points.join("");
 	const tail = message.reply_to ? { reply_to: message.reply_to } : {};
 	const shortFrom = { user_id: message.from.user_id, ...(typeof message.from.name === "string" ? { name: message.from.name } : {}) };
