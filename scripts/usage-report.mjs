@@ -94,13 +94,26 @@ const since = start.toISOString().slice(0, 19).replace("T", " ");
 try {
 	const rows = await analyticsSql(`SELECT toStartOfDay(timestamp) AS day, blob1 AS event, blob2 AS detail,
 		SUM(_sample_interval) AS points, SUM(_sample_interval * double1) AS value
-		FROM ${dataset} WHERE timestamp >= toDateTime('${since}') AND blob1 != 'refusal'
+		FROM ${dataset} WHERE timestamp >= toDateTime('${since}') AND blob1 NOT IN ('refusal', 'db_bytes')
 		GROUP BY day, event, detail ORDER BY day, event, detail FORMAT JSON`);
 	console.log(`\nCounters in ${dataset}, per UTC day (Analytics Engine, unsampled)\n`);
 	if (!rows.length) console.log("(none yet)");
 	else console.table(rows.map((row) => ({ day: String(row.day).slice(0, 10), event: row.event, detail: row.detail, count: Number(row.points), value: Number(row.value) })));
 } catch (error) {
 	console.log(`\nCounters in ${dataset}: unavailable (${error.message}). The dataset exists once the server has written to it.`);
+}
+
+// The database's size (src/metrics.ts db_bytes), recorded hourly from an
+// alarm: its largest each day, against the storage watermarks.
+try {
+	const rows = await analyticsSql(`SELECT toStartOfDay(timestamp) AS day, MAX(double1) AS bytes, COUNT() AS samples
+		FROM ${dataset} WHERE timestamp >= toDateTime('${since}') AND blob1 = 'db_bytes'
+		GROUP BY day ORDER BY day FORMAT JSON`);
+	console.log(`\nDatabase size in ${dataset}, per UTC day (largest of the hourly samples)\n`);
+	if (!rows.length) console.log("(none yet)");
+	else console.table(rows.map((row) => ({ day: String(row.day).slice(0, 10), "MB": Math.round(Number(row.bytes) / 1e5) / 10, samples: Number(row.samples) })));
+} catch (error) {
+	console.log(`\nDatabase size in ${dataset}: unavailable (${error.message}).`);
 }
 
 // Refusals (src/refusals.ts): one point holds many repeats, so the count is

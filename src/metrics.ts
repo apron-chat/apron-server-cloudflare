@@ -35,7 +35,13 @@ export type MetricEvent =
 	 * and message); then the reason, and the method or path. Valued by count,
 	 * so sum `double1`, not the points.
 	 */
-	| "refusal";
+	| "refusal"
+	/**
+	 * The SQLite database's occupied bytes (Store.databaseSize), valued by
+	 * the size: at most one an hour per instance, from an alarm
+	 * (ApronDemoServer.maybeRecordDatabaseSize). Take its max, not its sum.
+	 */
+	| "db_bytes";
 
 export function recordMetric(dataset: AnalyticsEngineDataset | undefined, event: MetricEvent, details: readonly string[] = [], value = 1): void {
 	if (!dataset) return;

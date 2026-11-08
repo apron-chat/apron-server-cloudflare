@@ -334,3 +334,32 @@ it("keeps what other events changed on a connection while a passkey ceremony awa
 		await peer.close();
 	}
 });
+
+it("records the database's size from an alarm, at most once an hour", async () => {
+	const stub = env.DEMO.getByName("public-demo-v1");
+	type Metered = { runtimeEnv: { METRICS?: unknown }; databaseSizeRecordedAt: number };
+	const calls: Array<{ indexes: string[]; blobs: string[]; doubles: number[] }> = [];
+	const sizes = () => calls.filter((point) => point.indexes[0] === "db_bytes");
+	// A pending socket's sign-in deadline schedules a real alarm.
+	const peer = await pendingSocket();
+	try {
+		await runInDurableObject(stub, async (instance) => {
+			const metered = instance as unknown as Metered;
+			metered.runtimeEnv.METRICS = { writeDataPoint: (point: (typeof calls)[number]) => { calls.push(point); } };
+			// Other suites' alarms may have recorded it within the hour.
+			metered.databaseSizeRecordedAt = -Infinity;
+		});
+		expect(await runDurableObjectAlarm(stub)).toBe(true);
+		expect(sizes()).toHaveLength(1);
+		expect(sizes()[0].blobs).toEqual(["db_bytes"]);
+		expect(sizes()[0].doubles[0]).toBeGreaterThan(0);
+
+		// A later alarm within the hour records nothing more.
+		await runInDurableObject(stub, async (_instance, state) => { if ((await state.storage.getAlarm()) === null) await state.storage.setAlarm(Date.now()); });
+		expect(await runDurableObjectAlarm(stub)).toBe(true);
+		expect(sizes()).toHaveLength(1);
+	} finally {
+		await runInDurableObject(stub, async (instance) => { delete (instance as unknown as Metered).runtimeEnv.METRICS; });
+		await peer.close();
+	}
+});

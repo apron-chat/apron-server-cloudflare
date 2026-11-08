@@ -1173,6 +1173,8 @@ function writeSessionAttachment(socket: WebSocketConnection, attachment: Connect
  * ones are ordinary rate limits that clients wait out.
  */
 const LONG_THROTTLE_SECONDS = 300;
+/** How often an alarm records the database's size (ApronDemoServer.maybeRecordDatabaseSize). */
+const DATABASE_SIZE_METRIC_MS = 60 * 60 * 1_000;
 /** A connection is told of one trigger at most this often (noteTrip). */
 const TRIP_NOTICE_MS = 60 * 60 * 1000;
 
@@ -2130,6 +2132,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private tierCheckedAt = 0;
 	/** When each connection or address was last told of each trip trigger (claimTrip); in memory only. */
 	private readonly trips = new Map<string, number>();
+	/** When the database's size was last recorded (maybeRecordDatabaseSize); in memory only. */
+	private databaseSizeRecordedAt = -Infinity;
 	/** Refusals counted for the `refusal` metric (src/refusals.ts), written at most twice a minute per kind. */
 	private readonly refusals = new RefusalMeter((kind, reason, detail, count) => recordMetric(this.runtimeEnv.METRICS, "refusal", [kind, reason, detail], count));
 	/** Shadow dollars spent by recent traffic, for the attack pause (src/burn.ts); in memory only. */
@@ -2584,6 +2588,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// their own work, as they did before presence used the alarm.
 		const full = this.alarmWorkDue(now);
 		recordMetric(this.runtimeEnv.METRICS, "alarm", [full ? "full" : "light"]);
+		this.maybeRecordDatabaseSize(now);
 		// Every alarm, light or full: what fell due on a connection needs only its attachment.
 		this.runConnectionDeadlines(now);
 		this.maybeEvaluateTier(now);
@@ -6028,6 +6033,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		const until = this.attackPauseRecord?.until ?? 0;
 		return until > now ? until : 0;
+	}
+
+	/**
+	 * Records the database's size in the `db_bytes` metric at most once an
+	 * hour (DATABASE_SIZE_METRIC_MS), so its trend toward the storage
+	 * watermarks shows in npm run usage:report long before they refuse
+	 * anything. Reading the size is a property of the SQL handle: no query.
+	 */
+	private maybeRecordDatabaseSize(now: number): void {
+		if (now - this.databaseSizeRecordedAt < DATABASE_SIZE_METRIC_MS) return;
+		const size = this.store.databaseSize();
+		if (size === null) return;
+		this.databaseSizeRecordedAt = now;
+		recordMetric(this.runtimeEnv.METRICS, "db_bytes", [], size);
 	}
 
 	/** Counts a billed event toward the burn meter, then weighs it (maybeCheckBurn). */

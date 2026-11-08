@@ -220,8 +220,10 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   `accounting_closed` says; or `recovered`), tier changes (`tier`: the new
   tier and the one before), throttle trips (`throttle`: the trigger and the
   method refused; see Server tiers), admin alerts (`admins_notified`), the edge
-  stop turning on or off (`edge_stop`: `guard` or `flood`, or `lifted`), and
-  refusals (`refusal`, `src/refusals.ts`): `error` for a JSON-RPC error (a
+  stop turning on or off (`edge_stop`: `guard` or `flood`, or `lifted`), the
+  database's occupied bytes (`db_bytes`, valued by the size, at most once an
+  hour from an alarm, so take the max, not the sum: its trend toward the
+  storage watermarks), and refusals (`refusal`, `src/refusals.ts`): `error` for a JSON-RPC error (a
   `retry_after` by its message and `data.reason`, any other by its name
   alone, since those messages may name users) with the method when the
   server knows it, else `other`; `close` for a policy close, with its code
@@ -240,7 +242,8 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   `CLOUDFLARE_ACCOUNT_ID` and a `CLOUDFLARE_API_TOKEN` that has Account
   Analytics Read) prints each UTC day's Durable Object awake time, billed
   duration, peak sockets and busiest hour from GraphQL analytics, the
-  counters from the dataset, and the refusals by kind, reason and method.
+  counters from the dataset, each day's largest database size, and the
+  refusals by kind, reason and method.
 
 Set it up once per deployment:
 
