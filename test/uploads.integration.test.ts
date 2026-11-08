@@ -1,6 +1,6 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { UPLOAD_POLICY } from '../src/budget';
+import { DEFAULT_LIMITS, UPLOAD_POLICY } from '../src/budget';
 import { sniffAudio } from '../src/audio';
 import { sniffImage } from '../src/image';
 import { fetchEntry } from '../src/index';
@@ -226,6 +226,28 @@ describe('store uploads', () => {
 			clock.value = created + (UPLOADS.fileRetentionSeconds + UPLOADS.lifecycleLagSeconds) * 1_000 + 1;
 			expect(store.cleanupUploads(clock.value)).toEqual({ count: 1, deleted: [written] });
 			expect(expires(written)).toBeUndefined();
+		});
+	});
+
+	it('keeps an avatar past its owner\'s last sign-in for as long as anything they posted is kept', async () => {
+		// The plan's invariant: a sign-in anywhere in the message retention window refreshes.
+		expect(UPLOADS.avatarRefreshSeconds).toBeGreaterThanOrEqual(DEFAULT_LIMITS.retentionSeconds);
+		expect(UPLOADS.avatarRetentionSeconds).toBeGreaterThan(UPLOADS.avatarRefreshSeconds);
+		await withStore('uploads-avatar-active', { uploads: UPLOADS }, (store, clock) => {
+			register(store, clock, 'ivy');
+			const upload = store.startAvatarUpload({ userId: 'ivy', now: clock.value });
+			store.claimUpload(upload.key, clock.value);
+			store.finishUpload({ key: upload.key, ok: true, bytes: 100, contentType: 'image/webp' }, clock.value);
+			// A sign-in with less than the retention window left refreshes it.
+			clock.value += (UPLOADS.avatarRetentionSeconds - DEFAULT_LIMITS.retentionSeconds) * 1_000 + 1;
+			expect(store.avatarRefreshDue('ivy', clock.value)).toBe(upload.key);
+			store.renewAvatar({ userId: 'ivy', key: upload.key, now: clock.value });
+			// Nobody signs in again: it is still shown for the whole retention window after that sign-in.
+			clock.value += DEFAULT_LIMITS.retentionSeconds * 1_000;
+			expect(store.getIdentity('ivy')!.avatar).toBe(`${MEDIA}/${upload.key}`);
+			// And gone once its owner has stayed away the whole avatar retention.
+			clock.value += (UPLOADS.avatarRetentionSeconds - DEFAULT_LIMITS.retentionSeconds) * 1_000;
+			expect(store.getIdentity('ivy')!.avatar).toBeUndefined();
 		});
 	});
 

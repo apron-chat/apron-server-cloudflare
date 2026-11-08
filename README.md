@@ -24,7 +24,8 @@ for a zero-overage deployment.
   [limits](docs/limits.md#hard-caps) for how many each user may have.
 - **Images, voice clips and avatars.** Signed-in users attach images and
   voice clips and set avatars (`embed:upload`), stored in R2 within its free
-  tier for a month, as long as their messages. Admins, mods and friends add custom
+  tier: attachments for a month, as long as their messages, and
+  avatars while their owners keep signing in. Admins, mods and friends add custom
   emoji with `/emoji add :name:`, which everyone can react with
   (`ext:emoji`).
 - **Live terminals and streamed replies.** `/embed-terminal` and

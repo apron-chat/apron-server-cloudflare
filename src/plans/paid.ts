@@ -279,8 +279,17 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// As long as the messages they are attached to (retentionSeconds). The
 		// bucket's lifecycle rule for f/ must match: 30 days.
 		fileRetentionSeconds: 30 * 24 * 60 * 60,
-		avatarRetentionSeconds: 30 * 24 * 60 * 60,
-		avatarRefreshSeconds: 7 * 24 * 60 * 60,
+		// An avatar is kept while its owner signs in: any sign-in within
+		// avatarRefreshSeconds of its expiry writes it again (refreshAvatar).
+		// The refresh window is at least retentionSeconds, so an avatar always
+		// outlasts its owner's last sign-in by as long as anything they posted
+		// is kept; one nobody signs in to for 60 days goes. An idle account is
+		// not pruned while its avatar lives, so one with an avatar goes after
+		// up to 60 days rather than idleAccountSeconds' 30. The bucket's
+		// lifecycle rule for a/ must be at least this: 61 days or more leaves
+		// R2's asynchronous deletes a margin.
+		avatarRetentionSeconds: 60 * 24 * 60 * 60,
+		avatarRefreshSeconds: 30 * 24 * 60 * 60,
 		lifecycleLagSeconds: 24 * 60 * 60,
 		storedBytesCap: 5 * 1024 * 1024 * 1024,
 	}),

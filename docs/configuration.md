@@ -319,8 +319,8 @@ in `src/plans/paid.ts` sets the limits:
 | `uploadsPerUserDay` (counted when an upload starts) | 30 |
 | `writeWindowSeconds` | 10 minutes |
 | `fileRetentionSeconds` | 30 days |
-| `avatarRetentionSeconds` | 30 days |
-| `avatarRefreshSeconds` | 7 days |
+| `avatarRetentionSeconds` | 60 days |
+| `avatarRefreshSeconds` | 30 days |
 | `lifecycleLagSeconds` | 1 day |
 | `storedBytesCap` | 5 GB |
 
@@ -330,8 +330,10 @@ are set; set up all of these first:
 1. **Bucket.** Create an R2 bucket named `apron-media` (the `MEDIA` binding
    in `wrangler.production.toml`). Deploying fails while it does not exist.
 2. **Lifecycle rules.** On the bucket, delete objects with prefix `f/` 30 days
-   after upload and prefix `a/` 30 days after upload. They must match
-   `fileRetentionSeconds` and `avatarRetentionSeconds`. Add no rule for
+   after upload and prefix `a/` 61 days after upload. They must be at least
+   `fileRetentionSeconds` and `avatarRetentionSeconds` (a day more leaves
+   R2's asynchronous deletes a margin); the server deletes expired objects
+   itself, so a longer rule only keeps them longer. Add no rule for
    `e/`: custom emoji images (`e/<id>`), their catalogs (`e/c/<sha256>.json`)
    and the server's avatar (`e/<id>`, `/server avatar`) stay until the
    server deletes them.
