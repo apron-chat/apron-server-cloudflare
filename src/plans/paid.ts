@@ -21,9 +21,12 @@
 //   $0.14, under the 12,900 daily share. User status spends
 //   it rather than requests: one timer keeps the object awake up to a minute
 //   after its last event while a status change waits to be announced.
-// - Storage: history is kept 7 days, matching uploaded images, so the
-//   database watermarks rise to 768 MB (1 GB hard), a fifth of the 5 GB-month
-//   included. Cleanup runs daily; it removes the same rows a day as hourly
+// - Storage: history is kept 30 days, matching uploaded images, and the
+//   database watermarks stop it at 768 MB (1 GB hard), a fifth of the 5
+//   GB-month included. A week of the demo's traffic in November 2026 was
+//   about 800 message records and a 1.5 MB database, so 30 days is a few MB;
+//   only a flood reaches the watermark, and then posting waits until enough
+//   of its records expire (up to 30 days) or an admin purges the flooder. Cleanup runs daily; it removes the same rows a day as hourly
 //   would, in batches that continue until it is caught up.
 //
 // That is about $11 a day in all, and the daily cap stops the server at $5
@@ -43,9 +46,12 @@ export const PAID_PLAN: Plan = Object.freeze({
 	name: "Workers Paid",
 	limits: Object.freeze({
 		...FREE_PLAN.limits,
-		retentionSeconds: 7 * 24 * 60 * 60,
+		// A month of history (November 2026; a week before): storage is no
+		// constraint at the demo's traffic (above), and idleAccountSeconds (30
+		// days) bounds it, since retention may not outlast an account.
+		retentionSeconds: 30 * 24 * 60 * 60,
 		// A removed account's user_id may be taken again once its messages are gone.
-		retiredUserIdSeconds: 7 * 24 * 60 * 60,
+		retiredUserIdSeconds: 30 * 24 * 60 * 60,
 		// Room for a long writeup in one message (about 2,500 words) rather
 		// than Free's 4 KiB. A post is kept once, as its record (message_state
 		// points at it, and a request's dedup row keeps a digest and the small
@@ -257,7 +263,8 @@ export const PAID_PLAN: Plan = Object.freeze({
 	// domain, counted together. At most 500 uploads a day are about 16,000
 	// writes a month (1 million free), and the stored-bytes cap keeps storage
 	// at half the free 10 GB-month whatever the mix of types and sizes: 500
-	// full-size files a day for a week would be 17.5 GB.
+	// full-size files a day for a month would be 75 GB. In November 2026 the
+	// bucket held 68 objects, 8 MB.
 	uploads: Object.freeze({
 		maxFileBytes: 5 * 1024 * 1024,
 		maxAvatarBytes: 256 * 1024,
@@ -269,7 +276,9 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// still bound the server's writes and storage.
 		uploadsPerUserDay: 30,
 		writeWindowSeconds: 10 * 60,
-		fileRetentionSeconds: 7 * 24 * 60 * 60,
+		// As long as the messages they are attached to (retentionSeconds). The
+		// bucket's lifecycle rule for f/ must match: 30 days.
+		fileRetentionSeconds: 30 * 24 * 60 * 60,
 		avatarRetentionSeconds: 30 * 24 * 60 * 60,
 		avatarRefreshSeconds: 7 * 24 * 60 * 60,
 		lifecycleLagSeconds: 24 * 60 * 60,
@@ -286,9 +295,9 @@ export const PAID_PLAN: Plan = Object.freeze({
 	// more texts a day, more readers, and more kept. A day at these limits is
 	// at most 3,200 Durable Object requests (100 writes, 30 reads each, and an
 	// alarm), a tenth of the 32,000 daily share; about 3,600 SQL rows written;
-	// and the kept text of a week at most about 90 MB of SQLite (each
-	// terminal's output at most 128 KiB of JSON), an eighth of the high-water
-	// mark. Streaming keeps the object awake, which the duration bound above
+	// and the kept text of 30 days at most about 390 MB of SQLite (each
+	// terminal's output at most 128 KiB of JSON), half the high-water mark,
+	// which still bounds it (typically 45 KB each, about 130 MB). Streaming keeps the object awake, which the duration bound above
 	// already covers (docs/cost-report.md, Live text).
 	liveText: Object.freeze({
 		...FREE_PLAN.liveText!,

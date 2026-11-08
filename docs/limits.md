@@ -162,7 +162,7 @@ mutation with the **same** `id`.
 | Room listing limited | 6 `room_list` a minute per account | The first `filter: "joined"` listing after each sign-in is free. Keep the list current from `room_update` rather than polling. |
 
 A history page holds at most 50 records (20 by default) and 256 KiB. Records
-are kept for 7 days.
+are kept for 30 days.
 
 ### Server-wide spikes
 

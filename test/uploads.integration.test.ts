@@ -204,6 +204,31 @@ describe('store uploads', () => {
 		});
 	});
 
+	it('keeps a written file as long as the current fileRetentionSeconds, though it was uploaded under a shorter one', async () => {
+		await withStore('uploads-retention-raised', { uploads: UPLOADS }, (store, clock, state) => {
+			register(store, clock, 'olga');
+			const upload = (text: string) => writeOf(post(store, clock, 'olga', { body: { text, embeds: [{ kind: 'upload', title: 'dot.png' }] } }).result).write.key;
+			const written = upload('written');
+			expect(store.claimUpload(written, clock.value)).toBe(true);
+			store.finishUpload({ key: written, ok: true, bytes: 64, contentType: 'image/png' }, clock.value);
+			const unwritten = upload('never written');
+			// Both as a week-long retention would have left them.
+			const week = 7 * 86_400_000;
+			state.storage.sql.exec('UPDATE uploads SET expires_ms = created_ms + ?', week);
+			clock.value += week + UPLOADS.lifecycleLagSeconds * 1_000 + 1;
+			// The written file is kept on, to its expiry under the current setting; the unwritten one goes.
+			expect(store.cleanupUploads(clock.value)).toEqual({ count: 2, deleted: [unwritten] });
+			const expires = (key: string) => state.storage.sql.exec<{ expires_ms: number }>('SELECT expires_ms FROM uploads WHERE upload_key = ?', key).toArray()[0]?.expires_ms;
+			const created = state.storage.sql.exec<{ created_ms: number }>('SELECT created_ms FROM uploads WHERE upload_key = ?', written).one().created_ms;
+			expect(expires(written)).toBe(created + UPLOADS.fileRetentionSeconds * 1_000);
+			expect(store.cleanupUploads(clock.value)).toEqual({ count: 0, deleted: [] });
+			// Past that expiry and the lifecycle lag, it goes as usual.
+			clock.value = created + (UPLOADS.fileRetentionSeconds + UPLOADS.lifecycleLagSeconds) * 1_000 + 1;
+			expect(store.cleanupUploads(clock.value)).toEqual({ count: 1, deleted: [written] });
+			expect(expires(written)).toBeUndefined();
+		});
+	});
+
 	it('sets, replaces, refreshes, clears, and expires avatars, shown in identities and member lists', async () => {
 		await withStore('uploads-avatar', { uploads: UPLOADS }, (store, clock) => {
 			register(store, clock, 'erin');

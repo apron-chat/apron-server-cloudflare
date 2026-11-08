@@ -20,7 +20,7 @@ This specification defines deployment policies within the base chat protocol; pr
 - `history`, `edit`, `rooms`, `reactions` and `command` (section 4); `activity` (section 4.2); `embed:upload` with the Workers Paid budgets (section 4.3); live text, `embed:terminal` and `embed:append`, with the Workers Paid budgets (section 4.5); push (`webpush` only) and `status` where VAPID keys are configured (section 4.4).
 - Guest authentication, read-only unless `GUEST_POSTING=true`; verified WebAuthn registration and login; bot, device, admin and invite tokens (section 5).
 - Persistent request deduplication for mutating operations (section 8).
-- Rolling history with permanent room IDs: 7 days with daily cleanup on Workers Paid, 24 hours with hourly cleanup on Workers Free; base-protocol availability boundaries and client recovery (section 9).
+- Rolling history with permanent room IDs: 30 days with daily cleanup on Workers Paid, 24 hours with hourly cleanup on Workers Free; base-protocol availability boundaries and client recovery (section 9).
 - Enforced application budgets, including cleanup, auth, and quota bookkeeping (section 7).
 - System identities use the `~` prefix (notices come from `~private`, sent to one connection only); no user is given a `user_id` starting with `~`.
 
@@ -35,7 +35,7 @@ No public workspace creation, top-level public room creation except by admins an
 3. A visitor creates a passkey or signs in with one. Successful authentication grants the registered allowance of twenty posts per minute, subject to IP and global limits.
 4. A user reconnects after losing a mutation reply. A retry with the same request ID and authenticated identity returns a result reflecting the current state without another mutation or broadcast.
 5. A connected client watches a room while another client loads history. Neither misses entries at the history/live boundary.
-6. A user returns after more than the retention window (7 days; Free: a day). The client notices the retention boundary, clears stale recovery state, and rebuilds the available room view.
+6. A user returns after more than the retention window (30 days; Free: a day). The client notices the retention boundary, clears stale recovery state, and rebuilds the available room view.
 7. An old message edited within the retained window remains recoverable from its complete recent snapshot even after its creation record is purged.
 8. A bot floods requests or creates identities. Per-principal controls and global budgets reject work without unbounded database, memory, or object creation.
 9. A resource budget runs out. Posting, history, registration, or admission becomes unavailable as appropriate; accepted messages remain recoverable while resources permit.
@@ -260,7 +260,7 @@ With the Workers Paid budgets (`uploads` in `src/plans/paid.ts`) and a deploymen
 - Serving: the bucket's custom domain (`MEDIA_ORIGIN`) serves uploads, not the Worker. Where `MEDIA_ORIGIN` equals `PUBLIC_ORIGIN`, as for local development, the Worker serves `GET` and `HEAD` of upload keys (`f/<id>`, `a/<id>`, `e/<id>`, `e/c/<sha256>.json`) from the bucket itself, with their stored type and cache headers, `Access-Control-Allow-Origin: *`, `X-Content-Type-Options: nosniff` and `Content-Security-Policy: default-src 'none'`.
 - Custom emoji images (`e/<id>`) are section 4, Extension `ext:emoji`.
 - Limits: 5 MB per attached file, image or audio, and 256 KB per avatar or custom emoji; images, audio and custom emoji share one budget: 500 uploads a UTC day server-wide, counted as writes are claimed, so uploads started and never written close nothing for others, and 30 per user, counted as they start (avatars and custom emoji included); live upload bytes, pending writes counted at their largest, at most 5 GB, custom emoji and the server's avatar included for as long as they stay; at most 500 custom emoji (`maxEmoji`). Past a daily count, `retry_after` until the reset; past the byte cap, `retry_after` of an hour.
-- Retention: attached files live 7 days and avatars 30, matching the bucket's lifecycle rules (custom emoji and the server's avatar, `e/`, have none), and still count as stored for a day after, since R2 deletes them asynchronously; the server then deletes them itself as cleanup forgets them, so a missing lifecycle rule leaks nothing. An avatar whose owner signs in during its last week is written again, restarting its 30 days. Messages are kept as long as their images (7 days on Workers Paid); cleanup removes a message up to a day after its image expires, so R2 can delete an image during its message's last day.
+- Retention: attached files and avatars live 30 days, matching the bucket's lifecycle rules (custom emoji and the server's avatar, `e/`, have none), and still count as stored for a day after, since R2 deletes them asynchronously; the server then deletes them itself as cleanup forgets them, so a missing lifecycle rule leaks nothing. An avatar whose owner signs in during its last week is written again, restarting its 30 days. Messages are kept as long as their images (30 days on Workers Paid); cleanup removes a message up to a day after its image expires, so R2 can delete an image during its message's last day. A file's expiry is set when it is uploaded; cleanup gives a written file that a since-raised `fileRetentionSeconds` still keeps that later expiry instead of forgetting it, so files uploaded before a raise last as long as their messages.
 - Cost: the daily counts and byte cap keep uploads within R2's free tier; the budget guard counts R2 operations against their daily and monthly shares and blocks the media host with the server's ([configuration](docs/configuration.md#uploads)).
 
 ### 4.4 Push
@@ -629,7 +629,7 @@ Check an unexpired duplicate before applying new-post quotas or deciding an old 
 
 ## 9. Rolling history and base-protocol availability
 
-Keep `general` unchanged. Every cleanup interval (`cleanupSeconds`), expire the prefix of the server-wide log committed more than `retentionSeconds` earlier: 7 days once a day on Workers Paid, 24 hours every hour on Workers Free. Healthy operation normally exposes the retention window plus up to one interval of records (7 to 8 days on Paid); scheduling delay or quota exhaustion can delay physical cleanup. This is a demo history policy, not a secure-erasure SLA or a guarantee about backups, provider recovery, or copies on clients.
+Keep `general` unchanged. Every cleanup interval (`cleanupSeconds`), expire the prefix of the server-wide log committed more than `retentionSeconds` earlier: 30 days once a day on Workers Paid, 24 hours every hour on Workers Free. Healthy operation normally exposes the retention window plus up to one interval of records (30 to 31 days on Paid); scheduling delay or quota exhaustion can delay physical cleanup. This is a demo history policy, not a secure-erasure SLA or a guarantee about backups, provider recovery, or copies on clients.
 
 ### Retention semantics
 
@@ -794,7 +794,7 @@ Use unit tests for pure logic and Cloudflare's Workers/Vitest integration for ru
 ### Capacity, accounting, and lifecycle
 
 - Measure rows read/written per operation with the actual indexes, including quota writes, auth, alarms, failure paths, and deletion. Produce a cost table and test every claimed upper bound.
-- Exercise at least three simulated UTC days: accepted traffic plus previous-day cleanup, midnight double bursts, worst-case snapshots, frequent edits, reconnect/history load, and invalid traffic. A retention window spans more than one daily posting allowance (two for 24–25 hours, eight for 7 days); never assume it contains at most one day's post ceiling of records.
+- Exercise at least three simulated UTC days: accepted traffic plus previous-day cleanup, midnight double bursts, worst-case snapshots, frequent edits, reconnect/history load, and invalid traffic. A retention window spans more than one daily posting allowance (two for 24–25 hours, 31 for 30 days); never assume it contains at most one day's post ceiling of records.
 - Verify metered work stops below configured ceilings with maintenance reserve intact. Include budget leases lost during crash, rollover while a handler is in flight, and accounting update failures. No allowance is reissued after a restart.
 - Demonstrate pressure control at the hard storage target (1 GiB; Free: 128 MiB) and SQLite page reuse under repeated delete/reinsert cycles. No unmetered VACUUM/DDL/full scan or accidental account-wide delete.
 - Hibernation wake restores socket auth/challenges and budget authority without reannouncing sessions, losing IP counters, resetting IDs, storing history in attachments, or losing a status change still to be announced.

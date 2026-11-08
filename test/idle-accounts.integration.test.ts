@@ -1,6 +1,7 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
 import { MUTE_FOREVER, Store } from '../src/store';
+import { DEFAULT_LIMITS } from '../src/budget';
 
 const day = 86_400_000;
 
@@ -176,7 +177,8 @@ it('revokes every token of a retired id, and of its bot, before freeing it', asy
 	await runInDurableObject(env.DEMO.getByName('retired-tokens'), async (instance, state) => {
 		const runtime = instance as unknown as { pruneIdle(now: number): Promise<void>; store: Store; upkeepDay: string };
 		const now = Date.now();
-		const retired = now - 30 * day;
+		// Retired longer ago than a retired id is held.
+		const retired = now - DEFAULT_LIMITS.retiredUserIdSeconds * 1_000 - day;
 		state.storage.sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('purged:gone', ?)", String(retired));
 		await state.storage.put('invite:gone', { v: 1, tokenKey: 'invite-token:abc' });
 		await state.storage.put('invite-token:abc', { v: 1, userId: 'gone' });

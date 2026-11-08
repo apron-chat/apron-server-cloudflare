@@ -925,6 +925,8 @@ interface RawUploadRow {
   bytes: number;
   write_expires_ms: number;
   expires_ms: number;
+  /** Read only where needed (cleanupUploads). */
+  created_ms?: number;
 }
 
 /** A limiter row's token bucket (limiter.ts). */
@@ -6447,6 +6449,11 @@ export class Store {
    * bytes, and returns their keys for the caller to delete from R2 (a
    * bucket lifecycle rule may already have); an expired avatar leaves its
    * owner. Maintenance work, a bounded batch per call.
+   *
+   * An attached file's expiry is fixed when it is uploaded, so a longer
+   * `fileRetentionSeconds` would not reach files uploaded before it: their
+   * messages would outlive them. A written file that the current setting
+   * still keeps is given that expiry instead of being forgotten.
    */
   cleanupUploads(now = this.clock.now()): { count: number; deleted: string[] } {
     this.ensureReady();
@@ -6454,11 +6461,17 @@ export class Store {
     if (!policy) return { count: 0, deleted: [] };
     return this.reserved({ reads: 16 + 4 * UPLOAD_SWEEP_BATCH, writes: 8 + 12 * UPLOAD_SWEEP_BATCH }, true, now, () => this.transaction(() => {
       const rows = this.rawRows<RawUploadRow>(
-        `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
+        `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms, created_ms
          FROM uploads INDEXED BY uploads_expiry_idx WHERE expires_ms < ? ORDER BY expires_ms LIMIT ?`,
         this.effectiveNow(now) - policy.lifecycleLagSeconds * 1_000, UPLOAD_SWEEP_BATCH,
       );
+      const expired: RawUploadRow[] = [];
       for (const row of rows) {
+        const kept = row.purpose === "file" && row.state === "done" ? integerColumn(row.created_ms) + policy.fileRetentionSeconds * 1_000 : 0;
+        if (kept > row.expires_ms) this.rawExec("UPDATE uploads SET expires_ms = ? WHERE upload_key = ?", kept, row.upload_key);
+        else expired.push(row);
+      }
+      for (const row of expired) {
         if (row.purpose !== "avatar") continue;
         this.rawExec(
           "UPDATE identities SET avatar_url = '', avatar_expires_ms = 0 WHERE user_id = ? AND avatar_url = ?",
@@ -6468,7 +6481,7 @@ export class Store {
       // The caller deletes them from R2 as well (deleteMedia), so expired files
       // go even where the bucket has no lifecycle rule; custom emoji and the
       // server's avatar never expire here.
-      return { count: rows.length, deleted: this.releaseUploadRows(rows) };
+      return { count: rows.length, deleted: this.releaseUploadRows(expired) };
     }));
   }
 

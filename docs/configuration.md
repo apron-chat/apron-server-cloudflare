@@ -16,7 +16,7 @@ The paid plan starts from the free one and raises only what Paid's included
 usage pays for, sized against its monthly allowances divided by 31 days with
 headroom. Paid includes 16 times the SQL rows written and 160 times the rows
 read, so the SQL ceilings rise tenfold, and posts, registrations, admissions,
-history pages, and member listings with them. History is kept 7 days instead
+history pages, and member listings with them. History is kept 30 days instead
 of 24 hours, matching uploaded images, with daily cleanup; the database
 watermarks rise to 768 MiB (1 GiB hard), a fifth of the 5 GB-month included.
 
@@ -318,7 +318,7 @@ in `src/plans/paid.ts` sets the limits:
 | `uploadsPerDay` (server-wide, avatars and custom emoji included; counted when a write is claimed) | 500 |
 | `uploadsPerUserDay` (counted when an upload starts) | 30 |
 | `writeWindowSeconds` | 10 minutes |
-| `fileRetentionSeconds` | 7 days |
+| `fileRetentionSeconds` | 30 days |
 | `avatarRetentionSeconds` | 30 days |
 | `avatarRefreshSeconds` | 7 days |
 | `lifecycleLagSeconds` | 1 day |
@@ -329,7 +329,7 @@ are set; set up all of these first:
 
 1. **Bucket.** Create an R2 bucket named `apron-media` (the `MEDIA` binding
    in `wrangler.production.toml`). Deploying fails while it does not exist.
-2. **Lifecycle rules.** On the bucket, delete objects with prefix `f/` 7 days
+2. **Lifecycle rules.** On the bucket, delete objects with prefix `f/` 30 days
    after upload and prefix `a/` 30 days after upload. They must match
    `fileRetentionSeconds` and `avatarRetentionSeconds`. Add no rule for
    `e/`: custom emoji images (`e/<id>`), their catalogs (`e/c/<sha256>.json`)
@@ -1029,13 +1029,13 @@ The numeric rows are grouped by their unit and enforcement scope:
 
 | Variable | Workers Paid default | Workers Free, where different |
 | --- | ---: | ---: |
-| `retentionSeconds` | 604800 | 86400 |
+| `retentionSeconds` | 2592000 | 86400 |
 | `cleanupSeconds` | 86400 | 3600 |
 | `challengeTtlSeconds` | 120 |  |
 | `sessionTtlSeconds` | 2592000 |  |
 | `idleAccountSeconds` | 2592000 |  |
 | `keptActiveAccounts` | 100 |  |
-| `retiredUserIdSeconds` | 604800 | 86400 |
+| `retiredUserIdSeconds` | 2592000 | 86400 |
 | `maxFrameBytes` | 32768 | 16384 |
 | `maxTextBytes` | 16384 | 4096 |
 | `maxSnapshotBytes` | 24576 | 8192 |
