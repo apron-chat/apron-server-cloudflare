@@ -85,11 +85,11 @@ still holds a slot until it goes stale; see
 | 1001 | Connection idle; reconnect to recover | No ping or frame for 150 seconds after the connection had pinged, or for 15 minutes if it never pinged | Reconnect. If you see it while the tab is live, your ping is not being sent. |
 | 1003 | Binary application frames are not supported | A binary frame | Send text frames only. |
 | 1008 | Authentication timed out | No successful `auth` within 30 seconds of connecting | Authenticate right after the `server` frame. |
-| 1008 | Frame rate limit reached | More than 60 frames in a minute on this connection (the exact ping bytes do not count) | Batch or throttle. Typing and read cursors count as frames. |
-| 1008 | Too many pending frames | More than 8 frames (or 64 KiB, four of the largest) sent and not yet processed | Wait for responses; do not pipeline bursts. |
+| 1008 | Frame rate limit reached | More than 120 frames in a minute on this connection (the exact ping bytes do not count) | Batch or throttle. Typing and read cursors count as frames. |
+| 1008 | Too many pending frames | More than 8 frames (or 64 KiB, two of the largest) sent and not yet processed | Wait for responses; do not pipeline bursts. |
 | 1008 | Repeated policy violations | Three malformed or oversized requests within 60 seconds | Fix the request; do not retry it unchanged. |
 | 1008 | Removed by an admin; Device token replaced…; Bot token replaced…; Signed out after a week without signing in or posting | Account changes | Do not reconnect with the same credentials in a loop. |
-| 1009 | Frame exceeds the maximum size | A frame over 16,384 UTF-8 bytes | Check sizes before sending. |
+| 1009 | Frame exceeds the maximum size | A frame over 32,768 UTF-8 bytes | Check sizes before sending. Text counts as it is escaped in JSON: a quote, backslash or newline takes two bytes, so a 16 KiB text of mostly those can exceed the frame. |
 | 1011 | Delivery failed / Delivery interrupted; reconnect to recover | The server could not deliver to the socket | Reconnect with backoff, then fetch history to catch up. |
 | 1011 | Connection state too large; reconnect | This connection's state (its rooms, unwritten read cursors, waiting status changes) outgrew what a connection may hold; only this connection is closed | Reconnect with backoff, then fetch history to catch up. |
 | 1013 | Frame rate limit reached | More than 480 frames a minute from your address, all connections together. Each connection reserves frames 10 at a time, so many short-lived connections spend this fast | Back off; fewer connections. |
@@ -118,7 +118,7 @@ minutes after a few unclean reconnects.
 
 | Error | Limit | Usual cause |
 | --- | --- | --- |
-| `retry_after` "Connection limit reached for this account" (`retry_after` 60) | 3 signed-in connections per account, across all devices and addresses | More tabs, devices or test instances on one account than 3, or old sockets not yet closed or stale (see above). Bots count too: 3 per bot. |
+| `retry_after` "Connection limit reached for this account" (`retry_after` 60) | 5 signed-in connections per account, across all devices and addresses | More tabs, devices or test instances on one account than 5, or old sockets not yet closed or stale (see above). Bots count too: 5 per bot. |
 | `retry_after` "Authentication attempts limited" | 64 auth attempts a minute per address, failed ones included (each connection's `auth` is one, guests too) | Retrying a failing `auth` in a loop. |
 | `retry_after` "Registration limit reached for this network" / "Registration limit reached" | 20 registrations a day per address; 5,000 a day on the server. Adding a passkey and a first `/invite-bot` each count as one. | Creating test accounts from one network. |
 | `unsupported` "Passkeys are not offered to this origin"; `denied` "Frontend origin is not configured for passkeys" (a passkey session `token`) | Passkeys and passkey session resume work only from the configured origin (`https://web.apron.chat` on the demo) | A third-party client on another origin, or a native client. Use a guest, a bot token (`/invite-bot`) or a device token (`/invite-device`), which work from any origin or none. |
@@ -202,7 +202,7 @@ and time to quote to an admin. Show it like any other `~private` message.
 `server.ext.media` lists the accepted types and `max_bytes`: 5 MiB for
 attachments and 256 KiB for avatars and custom emoji. A write URL is valid for
 10 minutes. Refusals carry `ext.limits` `upload`: "Daily upload limit reached"
-(20 a day per account), "Daily upload limit reached for the server" (500 a
+(30 a day per account), "Daily upload limit reached for the server" (500 a
 day), and "Upload storage is full" (retry in an hour).
 
 ### Live text
@@ -224,7 +224,7 @@ Both ways share these limits:
 | Streaming time, from the `PUT` | 120 s; 300 s for `admin` and `mod` | the text ends, and the `PUT` is answered |
 | Bytes one `PUT` may send | 2 MB; an append, what it keeps (4,096 at most) | the text ends |
 | Terminal output kept (`keep_last`) | the last 32 KB | the rest scrolls away |
-| Appended text kept, after its backspace and form feed edits | what keeps `body.text` within 4,096 bytes | the text ends with the first part |
+| Appended text kept, after its backspace and form feed edits | 4,096 bytes at most, and what keeps `body.text` within 16,384 | the text ends with the first part |
 | Readers of one text at once | 200 | `GET` 429 with `Retry-After: 10`, marked `Apron-Live-Refused: readers` (an ended text's 404, `ended`) |
 | Readers from one address, every live text together, at once | 16 | `GET` 429 "Too many live text readers from your address" with `Retry-After: 10` (not marked: it is that address's own) |
 | Readers of every live text together, at once | 400 | `GET` 429 "Live text has as many readers as the server allows" with `Retry-After: 10`, marked `readers` |
@@ -258,9 +258,9 @@ Oversized fields get `too_large`; a frame over the limit closes the socket
 
 | Bound | Limit |
 | --- | ---: |
-| Frame | 16,384 UTF-8 bytes |
-| Message text | 4,096 UTF-8 bytes |
-| Message snapshot as stored | 8,192 bytes |
+| Frame | 32,768 UTF-8 bytes |
+| Message text | 16,384 UTF-8 bytes |
+| Message snapshot as stored | 24,576 bytes |
 | JSON depth / values | 8 levels / 2,048 values |
 | Request `id` | 128 bytes |
 | Name | 80 code points and 320 bytes |
@@ -293,7 +293,7 @@ A thread stops counting when everyone has left it or its history expires.
 - [ ] Open one connection per signed-in client instance, and close it
       (`socket.close()`) before opening its replacement: on reconnect, sign
       out, component unmount, hot reload, and `pagehide`.
-- [ ] Keep at most 3 connections per account across all tabs and devices.
+- [ ] Keep at most 5 connections per account across all tabs and devices.
       Share one connection between views where you can, and use separate
       accounts for test instances.
 - [ ] Reconnect with exponential backoff and jitter (for example 1 s doubling
@@ -334,7 +334,7 @@ A thread stops counting when everyone has left it or its history expires.
 
 - [ ] Wait for responses: keep fewer than 8 requests outstanding per
       connection, and at most one `history` at a time.
-- [ ] Stay well under 60 frames a minute per connection. Throttle typing
+- [ ] Stay well under 120 frames a minute per connection. Throttle typing
       (it is a notification, at most 10 relayed a minute) and read cursors
       locally.
 - [ ] Send read cursors (`activity` `read_message_id`) only when signed in
@@ -342,7 +342,7 @@ A thread stops counting when everyone has left it or its history expires.
       `ext.settings.read_cursors` isn't `false`: a guest's are dropped
       without an error. Send one a room at most every few seconds, the
       latest, and any still waiting when the page is hidden.
-- [ ] Check sizes before sending: frames under 16 KiB, text under 4 KiB,
+- [ ] Check sizes before sending: frames under 32 KiB, text under 16 KiB,
       request `id`s under 128 bytes, text frames only.
 - [ ] Retry only `retry_after` errors, and retry a mutation with the same
       `id` so it is deduplicated. Do not resend a request that failed with

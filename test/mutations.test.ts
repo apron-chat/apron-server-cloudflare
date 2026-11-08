@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 import { ADMIN_USER_ID, MAX_CREATED_ROOMS, MOVE_REACTION_SETS_PER_POST, RETENTION_MS, Store, StoreError, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
-import { UPLOAD_POLICY } from "../src/budget";
+import { DEFAULT_LIMITS, UPLOAD_POLICY } from "../src/budget";
 import { errorCode, expectRetryAfter, messagesOf, withStore as withNamedStore, type TestClock } from "./helpers/store";
 
 // Semantics tests use roomy posting windows; quota tests below use tiny ones.
@@ -286,7 +286,8 @@ it("merges ext one level deep on message saves and room_set (§4.12)", async () 
 		expect(JSON.parse(JSON.stringify(kept.message!.ext))).toEqual(JSON.parse('{"__proto__": {"polluted": true}, "safe": 2}'));
 
 		// The size check runs on the merged snapshot: a write that fits alone fails merged.
-		const half = "x".repeat(3_000);
+		// Two of these fit a snapshot; three do not.
+		const half = "x".repeat(Math.floor(DEFAULT_LIMITS.maxSnapshotBytes * 3 / 8));
 		post(store, clock, "alice", "e7", { message_id: messageId, body: { text: "z" }, ext: { a: half } });
 		post(store, clock, "alice", "e8", { message_id: messageId, body: { text: "z" }, ext: { a: "", b: half } });
 		expect(errorCode(() => post(store, clock, "alice", "e9", { message_id: messageId, body: { text: "z" }, ext: { a: half, c: half } }))).toBe("too_large");
@@ -691,8 +692,8 @@ it("answers count limits with denied and size limits with too_large (§1.1)", as
 		const embeds = Array.from({ length: 5 }, () => ({ kind: "link", url: "https://example.com" }));
 		expect(errorCode(() => post(store, clock, "alice", "embeds", { body: { text: "x", embeds } }))).toBe("denied");
 		expect(errorCode(() => post(store, clock, "alice", "mention", { body: { text: "x", mentions: ["u".repeat(257)] } }))).toBe("too_large");
-		expect(errorCode(() => post(store, clock, "alice", "text", { body: { text: "x".repeat(5_000) } }))).toBe("too_large");
-		expect(errorCode(() => post(store, clock, "alice", "snapshot", { body: { text: "x" }, ext: { big: "y".repeat(9_000) } }))).toBe("too_large");
+		expect(errorCode(() => post(store, clock, "alice", "text", { body: { text: "x".repeat(DEFAULT_LIMITS.maxTextBytes + 1) } }))).toBe("too_large");
+		expect(errorCode(() => post(store, clock, "alice", "snapshot", { body: { text: "x" }, ext: { big: "y".repeat(DEFAULT_LIMITS.maxSnapshotBytes + 1) } }))).toBe("too_large");
 		expect(errorCode(() => store.mutate(op(clock, "alice", "room", "room_set", { parent_room_id: "general", title: "T", ext: { big: "y".repeat(2_100) } })))).toBe("too_large");
 	});
 });

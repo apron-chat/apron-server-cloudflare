@@ -289,6 +289,11 @@ bookkeeping is one written row, the budget row with the effective clock.
   and produced an 8,154-byte serialized snapshot. Its maximum observed
   accepted mutation was 28/31 (a schema 9 figure), below the 304/128
   request-ID create reservation of the first operation after a handover.
+  Re-run in November 2026 at Paid's raised bounds (16,384-byte text, a
+  24,442-byte snapshot), its largest accepted mutation measured 22/22, the
+  same rows as a small one: rows are counted, not bytes. Its 18 transitions
+  no longer fit one history response (256 KiB), which holds about ten
+  maximum snapshots, so the test pages through them.
 
 The worst move was measured at the calibrated reaction ceilings rather than
 the defaults: 64 reacting users, each with 16 distinct 64-byte emoji and a

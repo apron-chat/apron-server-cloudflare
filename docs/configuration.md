@@ -219,16 +219,31 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   log line `accounting_overrun` says; `uncertain` with what failed, as
   `accounting_closed` says; or `recovered`), tier changes (`tier`: the new
   tier and the one before), throttle trips (`throttle`: the trigger and the
-  method refused; see Server tiers), admin alerts (`admins_notified`) and the edge
-  stop turning on or off (`edge_stop`: `guard` or `flood`, or `lifted`). Each point
-  is `blob1` the event, `blob2` and `blob3` its details and `double1` its
+  method refused; see Server tiers), admin alerts (`admins_notified`), the edge
+  stop turning on or off (`edge_stop`: `guard` or `flood`, or `lifted`), the
+  database's occupied bytes (`db_bytes`, valued by the size, at most once an
+  hour from an alarm, so take the max, not the sum: its trend toward the
+  storage watermarks), and refusals (`refusal`, `src/refusals.ts`): `error` for a JSON-RPC error (a
+  `retry_after` by its message and `data.reason`, any other by its name
+  alone, since those messages may name users) with the method when the
+  server knows it, else `other`; `close` for a policy close, with its code
+  and reason; and `http` for a refusal the object answers before an upgrade,
+  with its status and message and `upgrade`, `probe`, `live_write` or
+  `live_read`. Refusals the entry Worker answers by itself (the attempt
+  limits, a full or paused server it already knows of) are not counted. A
+  refusal's first in a minute is written at once and its repeats summed
+  into one point when the minute has passed, so its `double1` is a count and
+  a flood of refusals writes no more than a quiet minute (64 kinds a minute
+  at most, the rest summed as `overflow`). Each point
+  is `blob1` the event, `blob2` onward its details and `double1` its
   value. Writing never awaits or throws, and without the binding nothing is
   written. Workers Paid includes 10 million data points a month; this server
-  writes a few thousand a day. `npm run usage:report -- --days 3` (with
+  writes a few thousand a day, and refusals at most 130 a minute. `npm run usage:report -- --days 3` (with
   `CLOUDFLARE_ACCOUNT_ID` and a `CLOUDFLARE_API_TOKEN` that has Account
   Analytics Read) prints each UTC day's Durable Object awake time, billed
-  duration, peak sockets and busiest hour from GraphQL analytics, and the
-  counters from the dataset.
+  duration, peak sockets and busiest hour from GraphQL analytics, the
+  counters from the dataset, each day's largest database size, and the
+  refusals by kind, reason and method.
 
 Set it up once per deployment:
 
@@ -301,7 +316,7 @@ in `src/plans/paid.ts` sets the limits:
 | `maxEmojiBytes` (a custom emoji's image, `/emoji add`) | 256 KB |
 | `maxEmoji` (custom emoji in the catalog, kept until removed) | 500 |
 | `uploadsPerDay` (server-wide, avatars and custom emoji included; counted when a write is claimed) | 500 |
-| `uploadsPerUserDay` (counted when an upload starts) | 20 |
+| `uploadsPerUserDay` (counted when an upload starts) | 30 |
 | `writeWindowSeconds` | 10 minutes |
 | `fileRetentionSeconds` | 7 days |
 | `avatarRetentionSeconds` | 30 days |
@@ -704,8 +719,8 @@ defaults:
   Each maintenance budget is at least 520 operations, covering the one-time
   512-row bootstrap reservation and eight control rows for deferred cleanup.
 
-The calibrated hard ceilings are `maxFrameBytes` 16 KiB, `maxTextBytes` 4 KiB,
-`maxSnapshotBytes` 8 KiB, JSON depth 8, JSON nodes 2,048, request IDs 128
+The calibrated hard ceilings are `maxFrameBytes` 32 KiB, `maxTextBytes` 16 KiB,
+`maxSnapshotBytes` 24 KiB, JSON depth 8, JSON nodes 2,048, request IDs 128
 bytes, names 80 Unicode code points/320 UTF-8 bytes, embeds 4, history limit
 50, history response 256 KiB, one concurrent history request per connection,
 pending work 8 frames/128 KiB, open sockets 100,
@@ -821,7 +836,7 @@ its next run whatever hold it carries. The bill cap still applies.
 
 **Launch profile.** Paid's limits are sized for a front-page day (about
 40,000 visitors, a tenth of them registering): 500 open connections (the
-memory bound: 64 KiB of incoming frames queued per connection, 8 small or 4
+memory bound: 64 KiB of incoming frames queued per connection, 8 small or 2
 of the largest, within 32 MiB; load-test the broadcast before raising it
 further), 300,000 admissions, 6 million frames (5,000 a minute), 400,000
 history pages, 5,000 registrations (20 per address), 50,000 accounts, 600
@@ -1021,9 +1036,9 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `idleAccountSeconds` | 2592000 |  |
 | `keptActiveAccounts` | 100 |  |
 | `retiredUserIdSeconds` | 604800 | 86400 |
-| `maxFrameBytes` | 16384 |  |
-| `maxTextBytes` | 4096 |  |
-| `maxSnapshotBytes` | 8192 |  |
+| `maxFrameBytes` | 32768 | 16384 |
+| `maxTextBytes` | 16384 | 4096 |
+| `maxSnapshotBytes` | 24576 | 8192 |
 | `maxJsonDepth` | 8 |  |
 | `maxJsonNodes` | 2048 |  |
 | `maxRequestIdBytes` | 128 |  |
@@ -1058,14 +1073,14 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `authAttemptsPerIpMinute` | 64 | 10 |
 | `openConnections` | 500 | 100 |
 | `anonymousConnectionsPerIp` | 24 | 2 |
-| `registeredConnectionsPerUser` | 3 |  |
+| `registeredConnectionsPerUser` | 5 | 3 |
 | `connectionsPerIp` | 32 | 10 |
 | `connectionAdmissionsPerIpMinute` | 30 | 5 |
 | `connectionAdmissionsPerDay` | 300000 | 2000 |
 | `unauthenticatedTimeoutSeconds` | 30 |  |
 | `pendingFramesPerConnection` | 8 |  |
 | `pendingBytesPerConnection` | 65536 | 131072 |
-| `framesPerConnectionMinute` | 60 |  |
+| `framesPerConnectionMinute` | 120 | 60 |
 | `framesPerIpMinute` | 480 | 120 |
 | `processedFramesPerDay` | 6000000 | 100000 |
 | `repeatedPolicyViolations` | 3 |  |

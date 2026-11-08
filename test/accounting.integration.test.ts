@@ -647,14 +647,14 @@ describe('measured storage accounting', () => {
 			const { costs, measure, measureFailure } = costLog(store);
 			const maximumText = 'x'.repeat(config.maxTextBytes);
 			// Preserve a large extension field as part of the snapshot so this
-			// calibration reaches the 8 KiB snapshot ceiling instead of measuring
-			// only the 4 KiB body-text limit.
-			const maximumExtensions = { ext: { padding: 'p'.repeat(3_850) } };
+			// calibration reaches the snapshot ceiling instead of measuring only
+			// the body-text limit; the rest of the snapshot is about 250 bytes.
+			const maximumExtensions = { ext: { padding: 'p'.repeat(config.maxSnapshotBytes - config.maxTextBytes - 342) } };
 			const first = measure('maximum snapshot create', () => store.commitMutation(messageInput(clock, 'calibration-user', maximumText, 'maximum-create', undefined, maximumExtensions)));
 			const messageId = first.result.message_id as string | undefined;
 			expect(messageId).toBeTruthy();
 			const snapshotBytes = JSON.stringify(first.message).length;
-			expect(snapshotBytes).toBeGreaterThan(8_000);
+			expect(snapshotBytes).toBeGreaterThan(config.maxSnapshotBytes - 512);
 			expect(snapshotBytes).toBeLessThanOrEqual(config.maxSnapshotBytes);
 
 			// Five accepted operations fit the default anonymous minute window. The
@@ -680,10 +680,18 @@ describe('measured storage accounting', () => {
 				}
 			}
 
-			const history = store.historyPage({ roomId: 'general', limit: 50, now: clock.now() });
+			// Maximum snapshots fill a history response before its record limit,
+			// so the 18 accepted transitions span pages.
+			const accepted: ReturnType<typeof messagesOf> = [];
+			let page = store.historyPage({ roomId: 'general', limit: 50, now: clock.now() });
+			accepted.push(...messagesOf(page));
+			while (page.more && page.first_log_id) {
+				page = store.historyPage({ roomId: 'general', limit: 50, before: page.first_log_id, now: clock.now() });
+				accepted.push(...messagesOf(page));
+			}
 			// As the store holds it: a principal's row is written at most once a minute.
 			const limiter = store.limiterDay('post', 'anonymous:audit-ip', clock.now());
-			expect(messagesOf(history)).toHaveLength(18);
+			expect(new Set(accepted.map((entry) => entry.log_id)).size).toBe(18);
 			expect(limiter.posts_day).toBe(13);
 			expect(limiter.day).toBe(new Date(clock.now()).toISOString().slice(0, 10));
 			for (const operation of costs) {
@@ -692,7 +700,7 @@ describe('measured storage accounting', () => {
 			return {
 				midnight,
 				snapshotBytes,
-				acceptedTransitions: messagesOf(history).length,
+				acceptedTransitions: new Set(accepted.map((entry) => entry.log_id)).size,
 				postDay: limiter,
 				maximumObservedReads: Math.max(...costs.map((operation) => operation.observed.reads)),
 				maximumObservedWrites: Math.max(...costs.map((operation) => operation.observed.writes)),

@@ -143,7 +143,7 @@ it("closes binary and oversized application frames with bounded policy codes", a
 	const oversized = await pendingSocket();
 	try {
 		const closed = waitForClose(oversized.socket);
-		oversized.socket.send("x".repeat(16_385));
+		oversized.socket.send("x".repeat(DEFAULT_LIMITS.maxFrameBytes + 1));
 		expect((await closed).code).toBe(1009);
 	} finally {
 		await oversized.close();
@@ -156,9 +156,10 @@ it("enforces the per-connection frame budget independently of the IP budget", as
 		// Requests from an unauthenticated socket are denied, yet still spend
 		// the application frame budget, which keeps this test independent of
 		// posting/authentication quotas.  Each reply drains the native DO
-		// queue, so the 61st frame tests the cap without leaving work in
+		// queue, so the frame past the limit tests the cap without leaving work in
 		// flight for the next hibernation scenario.
-		for (let index = 0; index < 60; index += 1) {
+		const limit = DEFAULT_LIMITS.framesPerConnectionMinute;
+		for (let index = 0; index < limit; index += 1) {
 			peer.socket.send(JSON.stringify({ id: `frame-${index}`, method: "lifecycle-noop" }));
 			const reply = await peer.next();
 			expect(reply.id).toBe(`frame-${index}`);
@@ -166,7 +167,7 @@ it("enforces the per-connection frame budget independently of the IP budget", as
 			expect(reply.error?.code).toBe(-32001);
 		}
 		const closed = waitForClose(peer.socket);
-		peer.socket.send(JSON.stringify({ id: "frame-60", method: "lifecycle-noop" }));
+		peer.socket.send(JSON.stringify({ id: `frame-${limit}`, method: "lifecycle-noop" }));
 		expect((await closed).code).toBe(1008);
 	} finally {
 		await peer.close();
@@ -330,6 +331,35 @@ it("keeps what other events changed on a connection while a passkey ceremony awa
 		const mine = (await attachments(stub)).find((attachment) => attachment.challenge?.challengeId === begun.result.challenge_id);
 		expect(mine).toMatchObject({ seen: 1_700_000_000_000, wakeJoined: true });
 	} finally {
+		await peer.close();
+	}
+});
+
+it("records the database's size from an alarm, at most once an hour", async () => {
+	const stub = env.DEMO.getByName("public-demo-v1");
+	type Metered = { runtimeEnv: { METRICS?: unknown }; databaseSizeRecordedAt: number };
+	const calls: Array<{ indexes: string[]; blobs: string[]; doubles: number[] }> = [];
+	const sizes = () => calls.filter((point) => point.indexes[0] === "db_bytes");
+	// A pending socket's sign-in deadline schedules a real alarm.
+	const peer = await pendingSocket();
+	try {
+		await runInDurableObject(stub, async (instance) => {
+			const metered = instance as unknown as Metered;
+			metered.runtimeEnv.METRICS = { writeDataPoint: (point: (typeof calls)[number]) => { calls.push(point); } };
+			// Other suites' alarms may have recorded it within the hour.
+			metered.databaseSizeRecordedAt = -Infinity;
+		});
+		expect(await runDurableObjectAlarm(stub)).toBe(true);
+		expect(sizes()).toHaveLength(1);
+		expect(sizes()[0].blobs).toEqual(["db_bytes"]);
+		expect(sizes()[0].doubles[0]).toBeGreaterThan(0);
+
+		// A later alarm within the hour records nothing more.
+		await runInDurableObject(stub, async (_instance, state) => { if ((await state.storage.getAlarm()) === null) await state.storage.setAlarm(Date.now()); });
+		expect(await runDurableObjectAlarm(stub)).toBe(true);
+		expect(sizes()).toHaveLength(1);
+	} finally {
+		await runInDurableObject(stub, async (instance) => { delete (instance as unknown as Metered).runtimeEnv.METRICS; });
 		await peer.close();
 	}
 });

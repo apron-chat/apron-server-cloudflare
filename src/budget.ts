@@ -520,9 +520,16 @@ export const LIVE_TEXT_POLICY: Readonly<LiveTextPolicy> | undefined = PLAN.liveT
 // Calibrated implementation bounds remain explicit: raising a payload or parser
 // bound requires rechecking its consumers. Resource ceilings below instead use
 // the selected defaults, so changing a budget does not require editing it twice.
-export const MAX_FRAME_BYTES = 16 * 1024;
-export const MAX_TEXT_BYTES = 4 * 1024;
-export const MAX_SNAPSHOT_BYTES = 8 * 1024;
+// Rechecked for 16 KiB text, 24 KiB snapshots and 32 KiB frames (November
+// 2026): parseFrame checks bytes before parsing; pendingBytesPerConnection
+// must still hold two frames; a history response holds a snapshot with room
+// to spare; push payloads are cut to fit; live text appends stay at
+// appendMaxBytes; ensureGrowthCapacity's floor (1 MB) still exceeds 16
+// snapshots; SQL accounting counts rows, not bytes; and the maximum-snapshot
+// calibration (test/accounting.integration.test.ts) measures at these.
+export const MAX_FRAME_BYTES = 32 * 1024;
+export const MAX_TEXT_BYTES = 16 * 1024;
+export const MAX_SNAPSHOT_BYTES = 24 * 1024;
 export const MAX_JSON_DEPTH = 8;
 export const MAX_JSON_NODES = 2_048;
 export const MAX_REQUEST_ID_BYTES = 128;

@@ -46,6 +46,21 @@ export const PAID_PLAN: Plan = Object.freeze({
 		retentionSeconds: 7 * 24 * 60 * 60,
 		// A removed account's user_id may be taken again once its messages are gone.
 		retiredUserIdSeconds: 7 * 24 * 60 * 60,
+		// Room for a long writeup in one message (about 2,500 words) rather
+		// than Free's 4 KiB. A post is kept once, as its record (message_state
+		// points at it, and a request's dedup row keeps a digest and the small
+		// result), but each edit logs a whole new snapshot, so a flood of the
+		// largest posts and edits reaches the database watermarks about three
+		// times sooner than at 8 KiB; they still bound it, and rows, not
+		// bytes, are what is billed. The snapshot leaves 8 KiB for embeds,
+		// mentions and ext beside the text. The frame is twice the text: room
+		// for ordinary prose's escapes, but a text of nothing but quotes,
+		// backslashes or newlines (two bytes each once escaped) can pass the
+		// frame bound and close the socket (1009) rather than be refused
+		// too_large. pendingBytesPerConnection still holds two such frames.
+		maxFrameBytes: 32 * 1024,
+		maxTextBytes: 16 * 1024,
+		maxSnapshotBytes: 24 * 1024,
 		// Registered users' statuses at most 15 s late: at most 5,760 presence
 		// wakes a day, about 52,000 maintenance writes of Paid's 1.5 million.
 		presenceAlarmSeconds: 15,
@@ -89,8 +104,8 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// Each post to a room is sent to every member's socket, so load-test
 		// the broadcast before raising it further.
 		openConnections: 500,
-		// Up to 8 small frames in flight (pendingFramesPerConnection), or 4 of
-		// the largest (16 KiB).
+		// Up to 8 small frames in flight (pendingFramesPerConnection), or 2 of
+		// the largest (32 KiB, maxFrameBytes above).
 		pendingBytesPerConnection: 64 * 1024,
 		// Pings stay at Free's 45 seconds (150 to go stale): the runtime answers
 		// them without waking the object, which is not billed, and a dead
@@ -102,6 +117,13 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// below bound what they can spend.
 		anonymousConnectionsPerIp: 24,
 		connectionsPerIp: 32,
+		// A phone, a desktop and a tab or two, with room for a socket whose
+		// peer vanished (sleep, a network change) and still counts until it
+		// goes stale, up to 150 seconds. Before November 2026 this was Free's
+		// 3, and about one connection in fifteen ended as such a socket, so a
+		// phone waking up could lock its own account out for a minute. Cost
+		// is bounded by connectionsPerIp, openConnections and the admissions.
+		registeredConnectionsPerUser: 5,
 		// Every connection's `auth` is an attempt, guest and token sign-ins
 		// too: twice every connection an address may hold, so a reconnect wave
 		// signs them all in before the 30-second auth deadline.
@@ -112,6 +134,12 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// Each connection's first frame leases 10, so this is a few dozen
 		// connections from one address starting in the same minute.
 		framesPerIpMinute: 480,
+		// Past this a connection is closed (1008), not slowed, so it sits at
+		// the ceiling (MAX_CONNECTION_FRAME_RATE): a fresh connection spending
+		// its history burst (historyBurstPerUser, 60 pages) plus its `auth`,
+		// `room_list` and status would trip Free's 60. Frames stay bounded by
+		// framesPerIpMinute, globalFramesPerMinute and processedFramesPerDay.
+		framesPerConnectionMinute: 120,
 		// A front-page day: 40,000 visitors, two or three connections each,
 		// with room for reconnects after deploys and evictions.
 		connectionAdmissionsPerDay: 300_000,
@@ -237,7 +265,9 @@ export const PAID_PLAN: Plan = Object.freeze({
 		maxEmojiBytes: 256 * 1024,
 		maxEmoji: 500,
 		uploadsPerDay: 500,
-		uploadsPerUserDay: 20,
+		// Screenshots in a busy day's chat; uploadsPerDay and storedBytesCap
+		// still bound the server's writes and storage.
+		uploadsPerUserDay: 30,
 		writeWindowSeconds: 10 * 60,
 		fileRetentionSeconds: 7 * 24 * 60 * 60,
 		avatarRetentionSeconds: 30 * 24 * 60 * 60,

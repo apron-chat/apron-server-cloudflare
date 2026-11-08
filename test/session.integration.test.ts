@@ -1,5 +1,6 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
+import { DEFAULT_LIMITS } from '../src/budget';
 import { connect as open, exchange, greeting, reply, request, until, type Frame, type Peer } from './helpers/socket';
 
 let nextIp = 40;
@@ -307,12 +308,12 @@ it('does not count a closing connection against the per-user limit on resume', a
 	await registerIdentity(userId, 'session-capacity-ip');
 	const token = await issueSession(userId, 'http://localhost:5173');
 	const open = [];
-	for (const id of ['one', 'two', 'three']) {
-		const { peer, reply } = await resume(token, id);
+	for (let index = 0; index < DEFAULT_LIMITS.registeredConnectionsPerUser; index += 1) {
+		const { peer, reply } = await resume(token, `open-${index}`);
 		expect(reply.result.you.user_id).toBe(userId);
 		open.push(peer);
 	}
-	const refused = await resume(token, 'four');
+	const refused = await resume(token, 'one-too-many');
 	expect(refused.reply.error).toEqual(expect.objectContaining({ code: -32002, message: 'Connection limit reached for this account', data: { retry_after: 60 } }));
 	refused.peer.close();
 

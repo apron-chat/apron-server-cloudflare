@@ -2,8 +2,8 @@
  * Exact operational counters in Workers Analytics Engine (the `METRICS`
  * dataset binding), beside the sampled Workers Logs: a data point is never
  * sampled away by `head_sampling_rate`, and one SQL query counts them
- * (`npm run usage:report`). Each point is `blob1` the event, `blob2` and
- * `blob3` its details, and `double1` its value (1 for a plain count), with
+ * (`npm run usage:report`). Each point is `blob1` the event, `blob2`
+ * onward its details, and `double1` its value (1 for a plain count), with
  * the event as its index. Writing is fire-and-forget: it neither awaits nor
  * throws, and without the binding nothing is written.
  */
@@ -27,7 +27,21 @@ export type MetricEvent =
 	/** The attack pause (ApronDemoServer.pauseForAttack): its trigger (`flood` or `burn`), valued by the hold in minutes. */
 	| "attack"
 	/** A heavy burn of mostly admitted traffic alerted the admins, valued by shadow dollars an hour. */
-	| "burn";
+	| "burn"
+	/**
+	 * Refusals (src/refusals.ts): `error` (a JSON-RPC error: a `retry_after`'s
+	 * message, else the error's name), `close` (a policy close: its code and
+	 * reason) or `http` (the object's refusal of an upgrade or probe: status
+	 * and message); then the reason, and the method or path. Valued by count,
+	 * so sum `double1`, not the points.
+	 */
+	| "refusal"
+	/**
+	 * The SQLite database's occupied bytes (Store.databaseSize), valued by
+	 * the size: at most one an hour per instance, from an alarm
+	 * (ApronDemoServer.maybeRecordDatabaseSize). Take its max, not its sum.
+	 */
+	| "db_bytes";
 
 export function recordMetric(dataset: AnalyticsEngineDataset | undefined, event: MetricEvent, details: readonly string[] = [], value = 1): void {
 	if (!dataset) return;

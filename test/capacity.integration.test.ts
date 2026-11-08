@@ -22,7 +22,8 @@ it('bounds admission at openConnections live sockets and delivers one ordered ma
 		const retry = Number(rejected.headers.get('Retry-After'));
 		expect(retry).toBeGreaterThanOrEqual(120);
 		expect(retry).toBeLessThanOrEqual(300);
-		const text = 'x'.repeat(4096);
+		// The largest text a message may carry, to every socket the server holds.
+		const text = 'x'.repeat(DEFAULT_LIMITS.maxTextBytes);
 		peers[0].send({ id: 'fanout', method: 'message', params: { room_id: 'general', body: { text } } });
 		// Every member gets the broadcast; the sender's comes before its result (§1).
 		const frames = await Promise.all(peers.map(peer => peer.next()));
