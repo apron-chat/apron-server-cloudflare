@@ -2729,7 +2729,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const message = protocol.data?.reason === "daily_budget" ? "Daily demo capacity reached" : protocol.message;
 		// A 503 without its own delay still asks clients to wait, so an outage
 		// is not met with every client retrying at once.
-		return responseError(status, message, typeof retry === "number" ? retry * 1_000 : status === 503 ? UNAVAILABLE_RETRY_MS : undefined);
+		const response = responseError(status, message, typeof retry === "number" ? retry * 1_000 : status === 503 ? UNAVAILABLE_RETRY_MS : undefined);
+		// The refusal metric keeps a `retry_after`'s message, which names a limit, and only the name of
+		// any other: those messages may name users, ids or fields (noteRefusal).
+		return protocol.name === "retry_after" ? response : remembered(response, protocol.name);
 	}
 
 	private serverAnnouncement(origin: string | null, wakeJoined = false): Record<string, unknown> {
@@ -6858,8 +6861,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const protocol = errorToProtocol(error);
 		const retry = typeof protocol.data?.retry_after === "number" ? protocol.data.retry_after * 1_000 : undefined;
 		if (protocol.name === "retry_after") return liveAnswer(429, protocol.data?.reason === "daily_budget" ? "Daily demo capacity reached" : protocol.message, retry);
-		if (protocol.name === "denied" || protocol.name === "invalid_params" || protocol.name === "too_large") return liveAnswer(410, `This text can no longer be posted: ${protocol.message}`);
-		return liveAnswer(503, protocol.message, retry ?? UNAVAILABLE_RETRY_MS);
+		// The refusal metric keeps only the error's name: these messages may name users, ids or fields (noteRefusal).
+		if (protocol.name === "denied" || protocol.name === "invalid_params" || protocol.name === "too_large") return remembered(liveAnswer(410, `This text can no longer be posted: ${protocol.message}`), protocol.name);
+		return remembered(liveAnswer(503, protocol.message, retry ?? UNAVAILABLE_RETRY_MS), protocol.name);
 	}
 
 	/**

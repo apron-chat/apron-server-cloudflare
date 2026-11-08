@@ -2,8 +2,8 @@
  * Exact operational counters in Workers Analytics Engine (the `METRICS`
  * dataset binding), beside the sampled Workers Logs: a data point is never
  * sampled away by `head_sampling_rate`, and one SQL query counts them
- * (`npm run usage:report`). Each point is `blob1` the event, `blob2` and
- * `blob3` its details, and `double1` its value (1 for a plain count), with
+ * (`npm run usage:report`). Each point is `blob1` the event, `blob2`
+ * onward its details, and `double1` its value (1 for a plain count), with
  * the event as its index. Writing is fire-and-forget: it neither awaits nor
  * throws, and without the binding nothing is written.
  */

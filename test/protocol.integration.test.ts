@@ -2,6 +2,8 @@ import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { expect, it, vi } from 'vitest';
 import { DEFAULT_LIMITS, UPLOAD_POLICY } from '../src/budget';
 import { canonicalizeIp, hashIpKey } from '../src/ip';
+import { recordMetric } from '../src/metrics';
+import { RefusalMeter } from '../src/refusals';
 import { connect as open, exchange, greeting, reply, request, until, type ConnectOptions, type Frame, type Peer } from './helpers/socket';
 
 let nextIp = 1;
@@ -973,10 +975,13 @@ it('counts refusals for the refusal metric: errors by name and known method, and
 	const metrics = (instance: unknown) => (instance as { runtimeEnv: { METRICS?: unknown } }).runtimeEnv;
 	try {
 		await authenticate(peer);
-		// A fresh window, so each key's first refusal is written at once.
-		vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 120_000);
 		const writeDataPoint = vi.fn();
-		await runInDurableObject(env.DEMO.getByName('public-demo-v1'), (instance) => { metrics(instance).METRICS = { writeDataPoint }; });
+		await runInDurableObject(env.DEMO.getByName('public-demo-v1'), (instance) => {
+			metrics(instance).METRICS = { writeDataPoint };
+			// A fresh meter, so each key's first refusal is written at once whatever ran before.
+			// The same writer the object builds, through the real recordMetric.
+			(instance as unknown as { refusals: RefusalMeter }).refusals = new RefusalMeter((kind, reason, detail, count) => recordMetric(metrics(instance).METRICS as AnalyticsEngineDataset | undefined, 'refusal', [kind, reason, detail], count));
+		});
 		expect((await request(peer, 'unknown', 'no_such_method', {})).error.code).toBe(-32601);
 		const closed = new Promise<number>((resolve) => peer.socket.addEventListener('close', (event) => resolve(event.code)));
 		peer.socket.send('x'.repeat(DEFAULT_LIMITS.maxFrameBytes + 1));

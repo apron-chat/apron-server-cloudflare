@@ -53,8 +53,11 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// largest posts and edits reaches the database watermarks about three
 		// times sooner than at 8 KiB; they still bound it, and rows, not
 		// bytes, are what is billed. The snapshot leaves 8 KiB for embeds,
-		// mentions and ext beside the text, and the frame room for the text's
-		// JSON escapes. pendingBytesPerConnection still holds two such frames.
+		// mentions and ext beside the text. The frame is twice the text: room
+		// for ordinary prose's escapes, but a text of nothing but quotes,
+		// backslashes or newlines (two bytes each once escaped) can pass the
+		// frame bound and close the socket (1009) rather than be refused
+		// too_large. pendingBytesPerConnection still holds two such frames.
 		maxFrameBytes: 32 * 1024,
 		maxTextBytes: 16 * 1024,
 		maxSnapshotBytes: 24 * 1024,
@@ -101,8 +104,8 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// Each post to a room is sent to every member's socket, so load-test
 		// the broadcast before raising it further.
 		openConnections: 500,
-		// Up to 8 small frames in flight (pendingFramesPerConnection), or 4 of
-		// the largest (16 KiB).
+		// Up to 8 small frames in flight (pendingFramesPerConnection), or 2 of
+		// the largest (32 KiB, maxFrameBytes above).
 		pendingBytesPerConnection: 64 * 1024,
 		// Pings stay at Free's 45 seconds (150 to go stale): the runtime answers
 		// them without waking the object, which is not billed, and a dead

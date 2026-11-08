@@ -89,7 +89,7 @@ still holds a slot until it goes stale; see
 | 1008 | Too many pending frames | More than 8 frames (or 64 KiB, two of the largest) sent and not yet processed | Wait for responses; do not pipeline bursts. |
 | 1008 | Repeated policy violations | Three malformed or oversized requests within 60 seconds | Fix the request; do not retry it unchanged. |
 | 1008 | Removed by an admin; Device token replaced…; Bot token replaced…; Signed out after a week without signing in or posting | Account changes | Do not reconnect with the same credentials in a loop. |
-| 1009 | Frame exceeds the maximum size | A frame over 32,768 UTF-8 bytes | Check sizes before sending. |
+| 1009 | Frame exceeds the maximum size | A frame over 32,768 UTF-8 bytes | Check sizes before sending. Text counts as it is escaped in JSON: a quote, backslash or newline takes two bytes, so a 16 KiB text of mostly those can exceed the frame. |
 | 1011 | Delivery failed / Delivery interrupted; reconnect to recover | The server could not deliver to the socket | Reconnect with backoff, then fetch history to catch up. |
 | 1011 | Connection state too large; reconnect | This connection's state (its rooms, unwritten read cursors, waiting status changes) outgrew what a connection may hold; only this connection is closed | Reconnect with backoff, then fetch history to catch up. |
 | 1013 | Frame rate limit reached | More than 480 frames a minute from your address, all connections together. Each connection reserves frames 10 at a time, so many short-lived connections spend this fast | Back off; fewer connections. |
@@ -224,7 +224,7 @@ Both ways share these limits:
 | Streaming time, from the `PUT` | 120 s; 300 s for `admin` and `mod` | the text ends, and the `PUT` is answered |
 | Bytes one `PUT` may send | 2 MB; an append, what it keeps (4,096 at most) | the text ends |
 | Terminal output kept (`keep_last`) | the last 32 KB | the rest scrolls away |
-| Appended text kept, after its backspace and form feed edits | what keeps `body.text` within 16,384 bytes | the text ends with the first part |
+| Appended text kept, after its backspace and form feed edits | 4,096 bytes at most, and what keeps `body.text` within 16,384 | the text ends with the first part |
 | Readers of one text at once | 200 | `GET` 429 with `Retry-After: 10`, marked `Apron-Live-Refused: readers` (an ended text's 404, `ended`) |
 | Readers from one address, every live text together, at once | 16 | `GET` 429 "Too many live text readers from your address" with `Retry-After: 10` (not marked: it is that address's own) |
 | Readers of every live text together, at once | 400 | `GET` 429 "Live text has as many readers as the server allows" with `Retry-After: 10`, marked `readers` |

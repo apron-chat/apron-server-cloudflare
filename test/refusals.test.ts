@@ -46,6 +46,7 @@ describe('RefusalMeter', () => {
 		const seen: string[] = [];
 		const refusals = new RefusalMeter((_kind, reason, detail) => { seen.push(reason, detail); throw new Error('dataset down'); });
 		expect(() => refusals.note('close', long, long, 0)).not.toThrow();
+		expect(seen).toHaveLength(2);
 		expect(seen.every((part) => part.length === 96)).toBe(true);
 	});
 });
