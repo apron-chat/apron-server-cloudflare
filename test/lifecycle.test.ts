@@ -156,9 +156,10 @@ it("enforces the per-connection frame budget independently of the IP budget", as
 		// Requests from an unauthenticated socket are denied, yet still spend
 		// the application frame budget, which keeps this test independent of
 		// posting/authentication quotas.  Each reply drains the native DO
-		// queue, so the 61st frame tests the cap without leaving work in
+		// queue, so the frame past the limit tests the cap without leaving work in
 		// flight for the next hibernation scenario.
-		for (let index = 0; index < 60; index += 1) {
+		const limit = DEFAULT_LIMITS.framesPerConnectionMinute;
+		for (let index = 0; index < limit; index += 1) {
 			peer.socket.send(JSON.stringify({ id: `frame-${index}`, method: "lifecycle-noop" }));
 			const reply = await peer.next();
 			expect(reply.id).toBe(`frame-${index}`);
@@ -166,7 +167,7 @@ it("enforces the per-connection frame budget independently of the IP budget", as
 			expect(reply.error?.code).toBe(-32001);
 		}
 		const closed = waitForClose(peer.socket);
-		peer.socket.send(JSON.stringify({ id: "frame-60", method: "lifecycle-noop" }));
+		peer.socket.send(JSON.stringify({ id: `frame-${limit}`, method: "lifecycle-noop" }));
 		expect((await closed).code).toBe(1008);
 	} finally {
 		await peer.close();

@@ -968,6 +968,26 @@ it('never closes the connection whose frame starts a sweep as stale, though it l
 	} finally { vi.restoreAllMocks(); alice.close(); bob.close(); await configure((config) => { config.limits.pingTimeoutSeconds = 150; }); }
 });
 
+it('counts refusals for the refusal metric: errors by name and known method, and policy closes by code and reason', async () => {
+	const peer = await connect();
+	const metrics = (instance: unknown) => (instance as { runtimeEnv: { METRICS?: unknown } }).runtimeEnv;
+	try {
+		await authenticate(peer);
+		// A fresh window, so each key's first refusal is written at once.
+		vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 120_000);
+		const writeDataPoint = vi.fn();
+		await runInDurableObject(env.DEMO.getByName('public-demo-v1'), (instance) => { metrics(instance).METRICS = { writeDataPoint }; });
+		expect((await request(peer, 'unknown', 'no_such_method', {})).error.code).toBe(-32601);
+		const closed = new Promise<number>((resolve) => peer.socket.addEventListener('close', (event) => resolve(event.code)));
+		peer.socket.send('x'.repeat(DEFAULT_LIMITS.maxFrameBytes + 1));
+		expect(await closed).toBe(1009);
+		await runInDurableObject(env.DEMO.getByName('public-demo-v1'), (instance) => { delete metrics(instance).METRICS; });
+		// The method is the client's own text, so an unknown one is only `other`.
+		expect(writeDataPoint).toHaveBeenCalledWith({ indexes: ['refusal'], blobs: ['refusal', 'error', 'unsupported', 'other'], doubles: [1] });
+		expect(writeDataPoint).toHaveBeenCalledWith({ indexes: ['refusal'], blobs: ['refusal', 'close', '1009 Frame exceeds the maximum size', ''], doubles: [1] });
+	} finally { vi.restoreAllMocks(); peer.close(); }
+});
+
 it('tells a connection that never pinged why, then closes it as stale once unpingedTimeoutSeconds pass without a frame', async () => {
 	const bob = await connect();
 	const carol = await connect();

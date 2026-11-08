@@ -487,13 +487,13 @@ The smaller frame limit is a documented demo exception to the protocol's advisor
 | --- | ---: |
 | open_connections | 100 total, including pending auth and closing sockets |
 | anonymous_connections_per_ip | 6, including unauthenticated sockets (Free: 2) |
-| registered_connections_per_user | 3 |
+| registered_connections_per_user | 5 (Free: 3) |
 | connections_per_ip | 10 total |
 | connection_admissions_per_ip_minute | 12 (Free: 5) |
 | connection_admissions_per_day | 4,000 globally (Free: 2,000) |
 | unauthenticated_timeout_seconds | 30 |
 | pending_frames_per_connection | 8, additionally bounded to 128 KiB |
-| frames_per_connection_minute | 60 |
+| frames_per_connection_minute | 120 (Free: 60) |
 | frames_per_ip_minute | 120 |
 | global_frames_per_minute | 600 server-wide, in memory, before SQL (Free: 300) |
 | frame_lease | 10 frames reserved per block, per connection |

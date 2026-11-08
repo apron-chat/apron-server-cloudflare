@@ -27,7 +27,15 @@ export type MetricEvent =
 	/** The attack pause (ApronDemoServer.pauseForAttack): its trigger (`flood` or `burn`), valued by the hold in minutes. */
 	| "attack"
 	/** A heavy burn of mostly admitted traffic alerted the admins, valued by shadow dollars an hour. */
-	| "burn";
+	| "burn"
+	/**
+	 * Refusals (src/refusals.ts): `error` (a JSON-RPC error: a `retry_after`'s
+	 * message, else the error's name), `close` (a policy close: its code and
+	 * reason) or `http` (the object's refusal of an upgrade or probe: status
+	 * and message); then the reason, and the method or path. Valued by count,
+	 * so sum `double1`, not the points.
+	 */
+	| "refusal";
 
 export function recordMetric(dataset: AnalyticsEngineDataset | undefined, event: MetricEvent, details: readonly string[] = [], value = 1): void {
 	if (!dataset) return;

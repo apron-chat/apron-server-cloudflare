@@ -10,6 +10,7 @@ import { PRICED_LABEL, PRICES, usd } from "./pricing";
 import { EDGE_STOP_RULE_REF, readEdgeStop, runBudgetGuard, setAttackStop, watchForFlood } from "./budget-guard";
 import { attackHoldMs, BURN_POLICY, BurnMeter, burnSummary, type BurnKind } from "./burn";
 import { recordMetric } from "./metrics";
+import { RefusalMeter } from "./refusals";
 import { notifyTrigger, TIER_LABEL, type NoticeChannels, type ServerTier, type TriggerNotice } from "./notify";
 import { AUDIO_TYPES, sniffAudio } from "./audio";
 import { IMAGE_TYPES, sniffImage } from "./image";
@@ -1257,7 +1258,15 @@ function originAllowed(config: RuntimeConfig, request: Request): boolean {
 function responseError(status: number, message: string, retryAfter?: number): Response {
 	const headers = new Headers({ "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
 	if (retryAfter !== undefined) headers.set("retry-after", String(Math.max(1, Math.ceil(retryAfter / 1_000))));
-	return new Response(JSON.stringify({ error: message }), { status, headers });
+	return remembered(new Response(JSON.stringify({ error: message }), { status, headers }), message);
+}
+
+/** The message of each refusal responseError and liveAnswer made, for the refusal metric (ApronDemoServer.fetch). */
+const REFUSAL_MESSAGES = new WeakMap<Response, string>();
+
+function remembered(response: Response, message: string): Response {
+	REFUSAL_MESSAGES.set(response, message);
+	return response;
 }
 
 function asDecimalId(value: unknown, field: string, allowZero = true): string | undefined {
@@ -1777,7 +1786,15 @@ function liveAnswer(status: number, message: string, retryAfterMs?: number): Res
 		"Access-Control-Expose-Headers": "Retry-After",
 	});
 	if (retryAfterMs !== undefined) headers.set("Retry-After", String(Math.max(1, Math.ceil(retryAfterMs / 1_000))));
-	return new Response(`${message}\n`, { status, headers });
+	return remembered(new Response(`${message}\n`, { status, headers }), message);
+}
+
+/** What a refused request to the object was, for the refusal metric: never its URL, which a client chooses. */
+function refusedPath(request: Request): string {
+	const path = new URL(request.url).pathname;
+	if (path.startsWith(LIVE_WRITE_PATH)) return "live_write";
+	if (path.startsWith(LIVE_READ_PATH)) return "live_read";
+	return isConnectionStatus(request) ? "probe" : "upgrade";
 }
 
 /**
@@ -2113,6 +2130,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private tierCheckedAt = 0;
 	/** When each connection or address was last told of each trip trigger (claimTrip); in memory only. */
 	private readonly trips = new Map<string, number>();
+	/** Refusals counted for the `refusal` metric (src/refusals.ts), written at most twice a minute per kind. */
+	private readonly refusals = new RefusalMeter((kind, reason, detail, count) => recordMetric(this.runtimeEnv.METRICS, "refusal", [kind, reason, detail], count));
 	/** Shadow dollars spent by recent traffic, for the attack pause (src/burn.ts); in memory only. */
 	private readonly burn = new BurnMeter();
 	/** When the burn was last weighed (maybeCheckBurn), and when a heavy admitted burn was last told. */
@@ -2307,6 +2326,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const response = await this.fetchRequest(request);
 		// Each one an entry Worker request and an object request, billed whatever it answers.
 		this.noteBurn("fetch", 1, response.status >= 400 ? 1 : 0);
+		if (response.status >= 400) this.refusals.note("http", `${response.status} ${REFUSAL_MESSAGES.get(response) ?? ""}`.trim(), refusedPath(request), nowMs());
 		return response;
 	}
 
@@ -2914,10 +2934,27 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	private fail(socket: WebSocketConnection, request: RequestFrame | null, error: ProtocolError): void {
+		this.noteRefusal(request, error);
 		if (request && request.id === undefined) return;
 		this.send(socket, protocolError(request?.id, error));
 		const retry = error.data?.retry_after;
 		if (error.name === "retry_after" && typeof retry === "number" && retry >= LONG_THROTTLE_SECONDS) this.noteTrip(socket, request, error, retry);
+	}
+
+	/**
+	 * Counts a JSON-RPC error for the refusal metric: a `retry_after` by its
+	 * message (which names the limit, never an amount) and `data.reason`;
+	 * any other error by its name alone, since `denied` and `too_large`
+	 * messages may name users, ids or fields. The method is kept only when
+	 * the server knows it, so a client cannot write arbitrary text.
+	 */
+	private noteRefusal(request: RequestFrame | null, error: ProtocolError): void {
+		const reason = error.name === "retry_after"
+			? `${error.message}${typeof error.data?.reason === "string" ? ` (${error.data.reason})` : ""}`
+			: error.name;
+		const method = request?.method;
+		const detail = method === undefined ? "" : REQUEST_METHODS.has(method) || notificationOnly(method) ? method : "other";
+		this.refusals.note("error", reason, detail, nowMs());
 	}
 
 	/**
@@ -2966,7 +3003,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.closing = true;
 		writeAttachment(socket, attachment);
 		try { socket.close(code, reason.slice(0, 120)); } catch { /* already closed */ }
-		if (!closed) this.connectionGone(attachment);
+		if (!closed) {
+			this.refusals.note("close", `${code} ${reason}`, "", nowMs());
+			this.connectionGone(attachment);
+		}
 	}
 
 	private handleFrameFailure(socket: WebSocketConnection, error: unknown): void {
@@ -5993,6 +6033,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** Counts a billed event toward the burn meter, then weighs it (maybeCheckBurn). */
 	private noteBurn(kind: BurnKind, count = 1, refused = 0): void {
 		const now = nowMs();
+		// Every fetch, message and alarm passes here: repeats held over a finished window are written.
+		this.refusals.flush(now);
 		this.burn.note(kind, now, count, refused);
 		this.maybeCheckBurn(now);
 	}

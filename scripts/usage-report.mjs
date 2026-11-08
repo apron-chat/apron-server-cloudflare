@@ -4,7 +4,8 @@
 // account: these analytics cannot filter by Worker), peak open sockets and busiest hour
 // (GraphQL analytics, exact), its invocations and those that threw (GraphQL
 // adaptive analytics, sampled at high volume), and the counters in the
-// METRICS Analytics Engine dataset (src/metrics.ts), unsampled.
+// METRICS Analytics Engine dataset (src/metrics.ts), unsampled, with the
+// refusals (src/refusals.ts) in a table of their own.
 //
 //   CLOUDFLARE_ACCOUNT_ID=... CLOUDFLARE_API_TOKEN=... npm run usage:report -- --days 3
 //
@@ -89,14 +90,30 @@ console.table([...perDay].sort(([a], [b]) => a.localeCompare(b)).map(([date, day
 	threw: day.threw,
 })));
 
+const since = start.toISOString().slice(0, 19).replace("T", " ");
 try {
 	const rows = await analyticsSql(`SELECT toStartOfDay(timestamp) AS day, blob1 AS event, blob2 AS detail,
 		SUM(_sample_interval) AS points, SUM(_sample_interval * double1) AS value
-		FROM ${dataset} WHERE timestamp >= toDateTime('${start.toISOString().slice(0, 19).replace("T", " ")}')
+		FROM ${dataset} WHERE timestamp >= toDateTime('${since}') AND blob1 != 'refusal'
 		GROUP BY day, event, detail ORDER BY day, event, detail FORMAT JSON`);
 	console.log(`\nCounters in ${dataset}, per UTC day (Analytics Engine, unsampled)\n`);
 	if (!rows.length) console.log("(none yet)");
 	else console.table(rows.map((row) => ({ day: String(row.day).slice(0, 10), event: row.event, detail: row.detail, count: Number(row.points), value: Number(row.value) })));
 } catch (error) {
 	console.log(`\nCounters in ${dataset}: unavailable (${error.message}). The dataset exists once the server has written to it.`);
+}
+
+// Refusals (src/refusals.ts): one point holds many repeats, so the count is
+// the sum of double1. Those the entry Worker answers by itself (attempt
+// limits, a full or paused server it already knows of) are not counted.
+try {
+	const rows = await analyticsSql(`SELECT toStartOfDay(timestamp) AS day, blob2 AS kind, blob3 AS reason, blob4 AS detail,
+		SUM(_sample_interval * double1) AS refusals
+		FROM ${dataset} WHERE timestamp >= toDateTime('${since}') AND blob1 = 'refusal'
+		GROUP BY day, kind, reason, detail ORDER BY day, refusals DESC FORMAT JSON`);
+	console.log(`\nRefusals in ${dataset}, per UTC day (errors, policy closes, and the object's HTTP refusals)\n`);
+	if (!rows.length) console.log("(none yet)");
+	else console.table(rows.map((row) => ({ day: String(row.day).slice(0, 10), kind: row.kind, reason: row.reason, detail: row.detail, refusals: Number(row.refusals) })));
+} catch (error) {
+	console.log(`\nRefusals in ${dataset}: unavailable (${error.message}).`);
 }

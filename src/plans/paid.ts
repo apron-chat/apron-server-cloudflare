@@ -102,6 +102,13 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// below bound what they can spend.
 		anonymousConnectionsPerIp: 24,
 		connectionsPerIp: 32,
+		// A phone, a desktop and a tab or two, with room for a socket whose
+		// peer vanished (sleep, a network change) and still counts until it
+		// goes stale, up to 150 seconds. Before November 2026 this was Free's
+		// 3, and about one connection in fifteen ended as such a socket, so a
+		// phone waking up could lock its own account out for a minute. Cost
+		// is bounded by connectionsPerIp, openConnections and the admissions.
+		registeredConnectionsPerUser: 5,
 		// Every connection's `auth` is an attempt, guest and token sign-ins
 		// too: twice every connection an address may hold, so a reconnect wave
 		// signs them all in before the 30-second auth deadline.
@@ -112,6 +119,12 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// Each connection's first frame leases 10, so this is a few dozen
 		// connections from one address starting in the same minute.
 		framesPerIpMinute: 480,
+		// Past this a connection is closed (1008), not slowed, so it sits at
+		// the ceiling (MAX_CONNECTION_FRAME_RATE): a fresh connection spending
+		// its history burst (historyBurstPerUser, 60 pages) plus its `auth`,
+		// `room_list` and status would trip Free's 60. Frames stay bounded by
+		// framesPerIpMinute, globalFramesPerMinute and processedFramesPerDay.
+		framesPerConnectionMinute: 120,
 		// A front-page day: 40,000 visitors, two or three connections each,
 		// with room for reconnects after deploys and evictions.
 		connectionAdmissionsPerDay: 300_000,
@@ -237,7 +250,9 @@ export const PAID_PLAN: Plan = Object.freeze({
 		maxEmojiBytes: 256 * 1024,
 		maxEmoji: 500,
 		uploadsPerDay: 500,
-		uploadsPerUserDay: 20,
+		// Screenshots in a busy day's chat; uploadsPerDay and storedBytesCap
+		// still bound the server's writes and storage.
+		uploadsPerUserDay: 30,
 		writeWindowSeconds: 10 * 60,
 		fileRetentionSeconds: 7 * 24 * 60 * 60,
 		avatarRetentionSeconds: 30 * 24 * 60 * 60,
