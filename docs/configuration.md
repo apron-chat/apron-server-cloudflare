@@ -716,8 +716,8 @@ defaults:
   Each maintenance budget is at least 520 operations, covering the one-time
   512-row bootstrap reservation and eight control rows for deferred cleanup.
 
-The calibrated hard ceilings are `maxFrameBytes` 16 KiB, `maxTextBytes` 4 KiB,
-`maxSnapshotBytes` 8 KiB, JSON depth 8, JSON nodes 2,048, request IDs 128
+The calibrated hard ceilings are `maxFrameBytes` 32 KiB, `maxTextBytes` 16 KiB,
+`maxSnapshotBytes` 24 KiB, JSON depth 8, JSON nodes 2,048, request IDs 128
 bytes, names 80 Unicode code points/320 UTF-8 bytes, embeds 4, history limit
 50, history response 256 KiB, one concurrent history request per connection,
 pending work 8 frames/128 KiB, open sockets 100,
@@ -833,7 +833,7 @@ its next run whatever hold it carries. The bill cap still applies.
 
 **Launch profile.** Paid's limits are sized for a front-page day (about
 40,000 visitors, a tenth of them registering): 500 open connections (the
-memory bound: 64 KiB of incoming frames queued per connection, 8 small or 4
+memory bound: 64 KiB of incoming frames queued per connection, 8 small or 2
 of the largest, within 32 MiB; load-test the broadcast before raising it
 further), 300,000 admissions, 6 million frames (5,000 a minute), 400,000
 history pages, 5,000 registrations (20 per address), 50,000 accounts, 600
@@ -1033,9 +1033,9 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `idleAccountSeconds` | 2592000 |  |
 | `keptActiveAccounts` | 100 |  |
 | `retiredUserIdSeconds` | 604800 | 86400 |
-| `maxFrameBytes` | 16384 |  |
-| `maxTextBytes` | 4096 |  |
-| `maxSnapshotBytes` | 8192 |  |
+| `maxFrameBytes` | 32768 | 16384 |
+| `maxTextBytes` | 16384 | 4096 |
+| `maxSnapshotBytes` | 24576 | 8192 |
 | `maxJsonDepth` | 8 |  |
 | `maxJsonNodes` | 2048 |  |
 | `maxRequestIdBytes` | 128 |  |

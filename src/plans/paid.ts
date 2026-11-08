@@ -46,6 +46,17 @@ export const PAID_PLAN: Plan = Object.freeze({
 		retentionSeconds: 7 * 24 * 60 * 60,
 		// A removed account's user_id may be taken again once its messages are gone.
 		retiredUserIdSeconds: 7 * 24 * 60 * 60,
+		// Room for a long writeup in one message (about 2,500 words) rather
+		// than Free's 4 KiB. A post is kept about three times (its record,
+		// its current state, and its request's result for a day), so a
+		// flood of the largest reaches the database watermarks about three
+		// times sooner than at 8 KiB; they still bound it, and rows, not
+		// bytes, are what is billed. The snapshot leaves 8 KiB for embeds,
+		// mentions and ext beside the text, and the frame room for the text's
+		// JSON escapes. pendingBytesPerConnection still holds two such frames.
+		maxFrameBytes: 32 * 1024,
+		maxTextBytes: 16 * 1024,
+		maxSnapshotBytes: 24 * 1024,
 		// Registered users' statuses at most 15 s late: at most 5,760 presence
 		// wakes a day, about 52,000 maintenance writes of Paid's 1.5 million.
 		presenceAlarmSeconds: 15,

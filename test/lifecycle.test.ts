@@ -143,7 +143,7 @@ it("closes binary and oversized application frames with bounded policy codes", a
 	const oversized = await pendingSocket();
 	try {
 		const closed = waitForClose(oversized.socket);
-		oversized.socket.send("x".repeat(16_385));
+		oversized.socket.send("x".repeat(DEFAULT_LIMITS.maxFrameBytes + 1));
 		expect((await closed).code).toBe(1009);
 	} finally {
 		await oversized.close();

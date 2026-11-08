@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ConfigError, DEFAULT_LIMITS, isAllowedOrigin, loadConfig } from '../src/config';
-import { ACCOUNT_USAGE_POLICY, DEFAULT_FEATURES, MAX_GLOBAL_FRAMES_PER_MINUTE, PLAN } from '../src/budget';
+import { ACCOUNT_USAGE_POLICY, DEFAULT_FEATURES, MAX_GLOBAL_FRAMES_PER_MINUTE, MAX_TEXT_BYTES, PLAN } from '../src/budget';
 import { PRICES } from '../src/pricing';
 import { FREE_PLAN } from '../src/plans/free';
 import { PAID_PLAN } from '../src/plans/paid';
@@ -70,7 +70,7 @@ describe('frame policy boundaries', () => {
 		}
 	});
 	it('bounds raw UTF-8 bytes before parsing and rejects binary', () => {
-		expect(() => parseFrame('"' + 'é'.repeat(8192) + '"')).toThrow(FrameError);
+		expect(() => parseFrame('"' + 'é'.repeat(DEFAULT_LIMITS.maxFrameBytes / 2) + '"')).toThrow(FrameError);
 		expect(() => parseFrame(new ArrayBuffer(0))).toThrow(expect.objectContaining({ closeCode: 1003 }));
 	});
 	it('marks failures of notification-only methods as notifications, whatever their id (server policy; §1.1 lists them)', () => {
@@ -178,7 +178,7 @@ describe('configuration policy boundaries', () => {
 
 	it('rejects unsafe payload, queue, history, and maintenance combinations', () => {
 		expect(() => config({}, { historyMaxLimit: 51 })).toThrow(ConfigError);
-		expect(() => config({}, { maxTextBytes: 4_097 })).toThrow(ConfigError);
+		expect(() => config({}, { maxTextBytes: MAX_TEXT_BYTES + 1 })).toThrow(ConfigError);
 		expect(() => config({}, { pendingFramesPerConnection: 9 })).toThrow(ConfigError);
 		expect(() => config({}, { pendingBytesPerConnection: DEFAULT_LIMITS.maxFrameBytes - 1 })).toThrow(ConfigError);
 		expect(() => config({}, { historyMaxResponseBytes: DEFAULT_LIMITS.maxSnapshotBytes + 511 })).toThrow(ConfigError);

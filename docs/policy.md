@@ -162,7 +162,7 @@ within it:
   text ends (its body ends, the writer goes, or a limit is reached), the
   message gets one more snapshot: a terminal keeps its last 32 KB as
   `output`, and an append's text joins `body.text` (its first part, so the
-  body stays within 4,096 bytes), without changing mentions. In an append,
+  body stays within 16,384 bytes), without changing mentions. In an append,
   a backspace removes the character before it and a form feed clears the
   text so far, never the message's own text. A save that
   removes the embed, or deletes the message, ends it early, publishing
@@ -450,7 +450,7 @@ Every extension the frame advertises is defined in
 
 ## Errors
 
-The demo's 16 KiB frame policy is an explicit exception to the base protocol's
+The demo's 32 KiB frame policy is an explicit exception to the base protocol's
 advisory 256 KiB recommendation. Payload lengths count UTF-8 bytes. Errors use
 the base protocol codes; `retry_after` includes `data.retry_after`, whole
 seconds rounded up, and, when a reading, posting or upload limit refused the
