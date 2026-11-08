@@ -2734,6 +2734,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 					"ext:settings", "ext:limits",
 					...(this.config.uploads ? ["ext:media"] : []),
 					"ext:permissions",
+					// Mentioned users may save the text its sender shares (Store.commitMessage).
+					"ext:editors",
 					// Custom emoji (ext:emoji), once an admin has added one.
 					...(emoji ? ["ext:emoji"] : []),
 				],
