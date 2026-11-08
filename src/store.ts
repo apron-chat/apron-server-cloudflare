@@ -964,8 +964,9 @@ const MAX_PURGE_ROOMS = MAX_THREAD_LIMIT;
 const PRIVATE_ROOM_COUNT_READS = 16 + 2 * MAX_PRIVATE_ROOM_LIMIT + 2 * (MAX_USER_ROOMS + MAX_PURGE_ROOMS);
 /**
  * Most retained records a budget-checked log scan (`/rename`) reserves for:
- * above a week of the paid plan's posts, and a small share of the day's
- * foreground reads. Counting reads one index entry per record, refunded past
+ * past it `/rename` is refused. At the paid plan's 30-day retention that is
+ * an average of about 3,300 records a day (the demo kept about 115 a day in
+ * November 2026), and a small share of the day's foreground reads. Counting reads one index entry per record, refunded past
  * what is found.
  */
 const RETAINED_SCAN_CAP = 100_000;
@@ -6453,13 +6454,16 @@ export class Store {
    * An attached file's expiry is fixed when it is uploaded, so a longer
    * `fileRetentionSeconds` would not reach files uploaded before it: their
    * messages would outlive them. A written file that the current setting
-   * still keeps is given that expiry instead of being forgotten.
+   * still keeps, and whose message is still kept, is given that expiry
+   * instead of being forgotten. Retention cleanup removes a message without
+   * releasing its uploads, so a file whose message is gone is not kept on.
    */
   cleanupUploads(now = this.clock.now()): { count: number; deleted: string[] } {
     this.ensureReady();
     const policy = this.config.uploads;
     if (!policy) return { count: 0, deleted: [] };
-    return this.reserved({ reads: 16 + 4 * UPLOAD_SWEEP_BATCH, writes: 8 + 12 * UPLOAD_SWEEP_BATCH }, true, now, () => this.transaction(() => {
+    // Five reads a row: the four of its release, or the message lookup of an extension.
+    return this.reserved({ reads: 16 + 5 * UPLOAD_SWEEP_BATCH, writes: 8 + 12 * UPLOAD_SWEEP_BATCH }, true, now, () => this.transaction(() => {
       const rows = this.rawRows<RawUploadRow>(
         `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms, created_ms
          FROM uploads INDEXED BY uploads_expiry_idx WHERE expires_ms < ? ORDER BY expires_ms LIMIT ?`,
@@ -6467,8 +6471,10 @@ export class Store {
       );
       const expired: RawUploadRow[] = [];
       for (const row of rows) {
-        const kept = row.purpose === "file" && row.state === "done" ? integerColumn(row.created_ms) + policy.fileRetentionSeconds * 1_000 : 0;
-        if (kept > row.expires_ms) this.rawExec("UPDATE uploads SET expires_ms = ? WHERE upload_key = ?", kept, row.upload_key);
+        const kept = row.purpose === "file" && row.state === "done" && row.message_id ? integerColumn(row.created_ms) + policy.fileRetentionSeconds * 1_000 : 0;
+        const messageKept = kept > row.expires_ms
+          && this.rawRows<{ found: number }>("SELECT 1 AS found FROM message_state WHERE message_id = ? LIMIT 1", row.message_id).length > 0;
+        if (messageKept) this.rawExec("UPDATE uploads SET expires_ms = ? WHERE upload_key = ?", kept, row.upload_key);
         else expired.push(row);
       }
       for (const row of expired) {

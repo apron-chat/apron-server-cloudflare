@@ -263,7 +263,10 @@ export const PAID_PLAN: Plan = Object.freeze({
 	// domain, counted together. At most 500 uploads a day are about 16,000
 	// writes a month (1 million free), and the stored-bytes cap keeps storage
 	// at half the free 10 GB-month whatever the mix of types and sizes: 500
-	// full-size files a day for a month would be 75 GB. In November 2026 the
+	// full-size files a day for a month would be 75 GB. Uploads at that rate
+	// fill the cap in two days, and new uploads are then refused until enough
+	// expire, up to 31 days now rather than 8: /purge of the uploader frees
+	// theirs at once. In November 2026 the
 	// bucket held 68 objects, 8 MB.
 	uploads: Object.freeze({
 		maxFileBytes: 5 * 1024 * 1024,
@@ -281,15 +284,16 @@ export const PAID_PLAN: Plan = Object.freeze({
 		fileRetentionSeconds: 30 * 24 * 60 * 60,
 		// An avatar is kept while its owner signs in: any sign-in within
 		// avatarRefreshSeconds of its expiry writes it again (refreshAvatar).
-		// The refresh window is at least retentionSeconds, so an avatar always
-		// outlasts its owner's last sign-in by as long as anything they posted
-		// is kept; one nobody signs in to for 60 days goes. An idle account is
-		// not pruned while its avatar lives, so one with an avatar goes after
-		// up to 60 days rather than idleAccountSeconds' 30. The bucket's
+		// The refresh window covers retentionSeconds, the day cleanup may lag
+		// behind it, and a few days of one connection staying open (refresh
+		// runs at sign-in), so an avatar outlasts what its owner posted; one
+		// nobody signs in to for 60 days goes. An idle account is not pruned
+		// while its avatar lives, so one with an avatar goes after up to 61
+		// days (with the lifecycle lag) rather than idleAccountSeconds' 30. The bucket's
 		// lifecycle rule for a/ must be at least this: 61 days or more leaves
 		// R2's asynchronous deletes a margin.
 		avatarRetentionSeconds: 60 * 24 * 60 * 60,
-		avatarRefreshSeconds: 30 * 24 * 60 * 60,
+		avatarRefreshSeconds: 35 * 24 * 60 * 60,
 		lifecycleLagSeconds: 24 * 60 * 60,
 		storedBytesCap: 5 * 1024 * 1024 * 1024,
 	}),
@@ -304,7 +308,7 @@ export const PAID_PLAN: Plan = Object.freeze({
 	// more texts a day, more readers, and more kept. A day at these limits is
 	// at most 3,200 Durable Object requests (100 writes, 30 reads each, and an
 	// alarm), a tenth of the 32,000 daily share; about 3,600 SQL rows written;
-	// and the kept text of 30 days at most about 390 MB of SQLite (each
+	// and the kept text of 31 days (with cleanup's day) at most about 400 MB of SQLite (each
 	// terminal's output at most 128 KiB of JSON), half the high-water mark,
 	// which still bounds it (typically 45 KB each, about 130 MB). Streaming keeps the object awake, which the duration bound above
 	// already covers (docs/cost-report.md, Live text).

@@ -391,7 +391,7 @@ binding.
 | --- | --- | --- |
 | Storage | 5 GB (the byte cap, including a day of lifecycle lag) | 10 GB-month |
 | Class A (writes, avatar refreshes) | about 16,000 uploads and a few thousand refreshes a month | 1 million a month |
-| Class B (views that miss the cache) | about once per object per data center | 10 million a month |
+| Class B (views that miss the cache) | about once per object per data center a week (attachments are cached 7 days and kept 30) | 10 million a month |
 
 Upload writes and their claims use the Worker and Durable Object allowances
 above: two Durable Object requests and one Worker request each, at most
@@ -877,9 +877,10 @@ use, and its bot's activity, so it holds whether or not user status is on.
 Receiving pushes alone is not activity. It never removes one of the
 `keptActiveAccounts` (100) most recently active, one with a role, the admin
 user, one connected now or whose bot is, one whose bot holds a role of its
-own, or one with a live upload (its avatar expires first). Its bot goes with it, and its passkeys, memberships,
+own, or one with a live upload (its avatar expires first, up to 61 days after its
+owner's last sign-in). Its bot goes with it, and its passkeys, memberships,
 read cursors, status, mutes, push subscriptions, tokens and limiter rows. Its
-content is past retention by then. Its `user_id` is retired, as `/purge`
+content is past retention by then, or within the day cleanup may take. Its `user_id` is retired, as `/purge`
 retires one, for `retiredUserIdSeconds` (the message retention), then may be
 issued again, once every token of the old account and its bot is revoked:
 nothing logged names it any more, and a session carries the user handle it

@@ -207,17 +207,29 @@ describe('store uploads', () => {
 	it('keeps a written file as long as the current fileRetentionSeconds, though it was uploaded under a shorter one', async () => {
 		await withStore('uploads-retention-raised', { uploads: UPLOADS }, (store, clock, state) => {
 			register(store, clock, 'olga');
-			const upload = (text: string) => writeOf(post(store, clock, 'olga', { body: { text, embeds: [{ kind: 'upload', title: 'dot.png' }] } }).result).write.key;
-			const written = upload('written');
-			expect(store.claimUpload(written, clock.value)).toBe(true);
-			store.finishUpload({ key: written, ok: true, bytes: 64, contentType: 'image/png' }, clock.value);
-			const unwritten = upload('never written');
-			// Both as a week-long retention would have left them.
+			const upload = (text: string) => {
+				const result = post(store, clock, 'olga', { body: { text, embeds: [{ kind: 'upload', title: 'dot.png' }] } }).result;
+				return { key: writeOf(result).write.key, messageId: result.message_id as string };
+			};
+			const write = (key: string) => {
+				expect(store.claimUpload(key, clock.value)).toBe(true);
+				store.finishUpload({ key, ok: true, bytes: 64, contentType: 'image/png' }, clock.value);
+			};
+			const written = upload('written').key;
+			write(written);
+			const unwritten = upload('never written').key;
+			// A written file whose message retention cleanup already removed (it does not release uploads).
+			const orphan = upload('message gone');
+			write(orphan.key);
+			state.storage.sql.exec('DELETE FROM message_state WHERE message_id = ?', orphan.messageId);
+			// All as a week-long retention would have left them.
 			const week = 7 * 86_400_000;
 			state.storage.sql.exec('UPDATE uploads SET expires_ms = created_ms + ?', week);
 			clock.value += week + UPLOADS.lifecycleLagSeconds * 1_000 + 1;
-			// The written file is kept on, to its expiry under the current setting; the unwritten one goes.
-			expect(store.cleanupUploads(clock.value)).toEqual({ count: 2, deleted: [unwritten] });
+			// The written file is kept on, to its expiry under the current setting; the unwritten one and the orphan go.
+			const swept = store.cleanupUploads(clock.value);
+			expect(swept.count).toBe(3);
+			expect([...swept.deleted].sort()).toEqual([unwritten, orphan.key].sort());
 			const expires = (key: string) => state.storage.sql.exec<{ expires_ms: number }>('SELECT expires_ms FROM uploads WHERE upload_key = ?', key).toArray()[0]?.expires_ms;
 			const created = state.storage.sql.exec<{ created_ms: number }>('SELECT created_ms FROM uploads WHERE upload_key = ?', written).one().created_ms;
 			expect(expires(written)).toBe(created + UPLOADS.fileRetentionSeconds * 1_000);
@@ -230,23 +242,25 @@ describe('store uploads', () => {
 	});
 
 	it('keeps an avatar past its owner\'s last sign-in for as long as anything they posted is kept', async () => {
-		// The plan's invariant: a sign-in anywhere in the message retention window refreshes.
-		expect(UPLOADS.avatarRefreshSeconds).toBeGreaterThanOrEqual(DEFAULT_LIMITS.retentionSeconds);
+		// The plan's invariant: a sign-in anywhere in the message retention window, and the day cleanup may lag, refreshes.
+		const kept = DEFAULT_LIMITS.retentionSeconds + DEFAULT_LIMITS.cleanupSeconds;
+		expect(UPLOADS.avatarRefreshSeconds).toBeGreaterThanOrEqual(kept);
 		expect(UPLOADS.avatarRetentionSeconds).toBeGreaterThan(UPLOADS.avatarRefreshSeconds);
 		await withStore('uploads-avatar-active', { uploads: UPLOADS }, (store, clock) => {
 			register(store, clock, 'ivy');
 			const upload = store.startAvatarUpload({ userId: 'ivy', now: clock.value });
 			store.claimUpload(upload.key, clock.value);
 			store.finishUpload({ key: upload.key, ok: true, bytes: 100, contentType: 'image/webp' }, clock.value);
-			// A sign-in with less than the retention window left refreshes it.
-			clock.value += (UPLOADS.avatarRetentionSeconds - DEFAULT_LIMITS.retentionSeconds) * 1_000 + 1;
+			// A sign-in with no more than the message retention and cleanup's day left refreshes it.
+			clock.value += (UPLOADS.avatarRetentionSeconds - kept) * 1_000 + 1;
 			expect(store.avatarRefreshDue('ivy', clock.value)).toBe(upload.key);
 			store.renewAvatar({ userId: 'ivy', key: upload.key, now: clock.value });
-			// Nobody signs in again: it is still shown for the whole retention window after that sign-in.
-			clock.value += DEFAULT_LIMITS.retentionSeconds * 1_000;
+			const signedIn = clock.value;
+			// Nobody signs in again: it is still shown as long as anything posted then is kept.
+			clock.value = signedIn + kept * 1_000;
 			expect(store.getIdentity('ivy')!.avatar).toBe(`${MEDIA}/${upload.key}`);
 			// And gone once its owner has stayed away the whole avatar retention.
-			clock.value += (UPLOADS.avatarRetentionSeconds - DEFAULT_LIMITS.retentionSeconds) * 1_000;
+			clock.value = signedIn + UPLOADS.avatarRetentionSeconds * 1_000;
 			expect(store.getIdentity('ivy')!.avatar).toBeUndefined();
 		});
 	});
@@ -268,7 +282,7 @@ describe('store uploads', () => {
 			// A new avatar replaces the old one, whose object goes.
 			const second = setAvatar();
 			expect(second.finished.deletedUploads).toEqual([first.upload.key]);
-			// Not due for a refresh until the last week before it expires.
+			// Not due for a refresh until avatarRefreshSeconds before it expires.
 			expect(store.avatarRefreshDue('erin', clock.value)).toBeNull();
 			clock.value += (UPLOADS.avatarRetentionSeconds - UPLOADS.avatarRefreshSeconds) * 1_000 + 1;
 			expect(store.avatarRefreshDue('erin', clock.value)).toBe(second.upload.key);
@@ -799,7 +813,7 @@ describe('uploads end to end', () => {
 	});
 	const avatarExpiry = (userId: string) => runInDurableObject(stub(), (_instance, state) => state.storage.sql.exec<{ avatar_url: string; avatar_expires_ms: number }>('SELECT avatar_url, avatar_expires_ms FROM identities WHERE user_id = ?', userId).one());
 
-	it('writes an avatar again when its owner signs in during its last week, and drops one whose object is gone', async () => {
+	it('writes an avatar again when its owner signs in within avatarRefreshSeconds of its expiry, and drops one whose object is gone', async () => {
 		const userId = unique('regular');
 		const first = await signedIn(userId);
 		const started = await request(first, 'avatar', 'command', { body: { text: '/avatar', embeds: [{ kind: 'upload' }] } });
@@ -810,7 +824,7 @@ describe('uploads end to end', () => {
 		const key = url.slice('https://media.test/'.length);
 		const uploaded = (await media().head(key))!.uploaded.getTime();
 		const second = await resume(userId);
-		await expect.poll(async () => (await avatarExpiry(userId)).avatar_expires_ms).toBeGreaterThan(Date.now() + 29 * 86_400_000);
+		await expect.poll(async () => (await avatarExpiry(userId)).avatar_expires_ms).toBeGreaterThan(Date.now() + (UPLOADS.avatarRetentionSeconds - 86_400) * 1_000);
 		expect((await media().head(key))!.uploaded.getTime()).toBeGreaterThanOrEqual(uploaded);
 		second.close();
 		// The bucket already deleted it: signing in removes the avatar.

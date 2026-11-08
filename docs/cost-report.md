@@ -854,7 +854,7 @@ included usage and this server's own budgets
 | Durable Object duration | 400,000 GB-s | daily stop at 90% of 12,900; monthly stop at 50% | one object awake all day: 10,800 (334,800) | 100 × (300 + 120) s at 128 MB: 5,250 (162,750) alone; 3,000 for ordinary users | still at most 10,800 (334,800): one object cannot be awake longer than the day |
 | SQL rows written | 50,000,000 | 800,000 a day (fails closed) | up to the ceiling | about 3,600 | within the same ceiling |
 | SQL rows read | 25,000,000,000 | 30,000,000 a day (fails closed) | up to the ceiling | about 5,000 | within the same ceiling |
-| SQL storage | 5 GB-month | 768 MiB high-water (growth stops) | up to the watermark | the kept text of 30 days: at most 3,000 × 132 KiB ≈ 387 MiB (typical 45 KB each: about 130 MB) | within the same watermark |
+| SQL storage | 5 GB-month | 768 MiB high-water (growth stops) | up to the watermark | the kept text of 31 days (30 and cleanup's day): at most 3,100 × 132 KiB ≈ 400 MiB (typical 45 KB each: about 130 MB) | within the same watermark |
 | Logs (from 2026-12-01) | 50 GB | monthly stop at 50% | | about 32 invocations a text, sampled at 0.1: under 100 MB | + under 0.2% |
 
 So live text fits the plan: alone its worst month is a tenth of the included
