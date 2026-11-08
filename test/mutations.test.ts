@@ -197,6 +197,60 @@ it("broadcasts flat self-describing snapshots and enforces replacement semantics
 	});
 });
 
+it("lets mentioned users save only the text that the sender shares (ext:editors)", async () => {
+	await withStore("editors", (store, clock) => {
+		const target = post(store, clock, "alice", "e0", { body: { text: "lunch?" } });
+		const grant = { "body.text": "mentioned" };
+		const created = post(store, clock, "alice", "e1", {
+			reply_to: { message_id: target.result.message_id },
+			body: { text: "Lunch, @bob:\n- [ ] soup", format: "markdown", mentions: ["bob"] },
+			// Requests do not set edited_by.
+			ext: { editors: { ...grant, edited_by: "carol" }, irc: "x" },
+		});
+		const messageId = String(created.result.message_id);
+		expect(created.message?.ext).toEqual({ editors: grant, irc: "x" });
+
+		// Bob saves the text; the server keeps every other field, ext included.
+		const saved = post(store, clock, "bob", "e2", {
+			message_id: messageId,
+			body: { text: "Lunch, @bob:\n- [x] soup", mentions: ["bob", "carol"] },
+			ext: { editors: { ...grant, edited_by: "alice" }, irc: "" },
+		});
+		expect(saved.message).toMatchObject({
+			message_id: messageId, room_id: "general", from: { user_id: "alice" },
+			reply_to: { message_id: target.result.message_id },
+			body: { text: "Lunch, @bob:\n- [x] soup", format: "markdown", mentions: ["bob"], embeds: [] },
+			ext: { editors: { ...grant, edited_by: "bob" }, irc: "x" },
+		});
+		// He may not delete it, and carol, who is not mentioned, may not save it.
+		expect(errorCode(() => post(store, clock, "bob", "e3", { message_id: messageId, deleted: true }))).toBe("denied");
+		expect(errorCode(() => post(store, clock, "carol", "e4", { message_id: messageId, body: { text: "mine" } }))).toBe("denied");
+
+		// He may not empty it either: a failed embed would then delete it.
+		expect(errorCode(() => post(store, clock, "bob", "e3b", { message_id: messageId, body: { text: "" } }))).toBe("invalid_params");
+
+		// A moderator's move keeps edited_by: the text is still Bob's.
+		const threadId = thread(store, clock, "e-thread");
+		store.createInvitedIdentity({ userId: "mia", name: "mia", now: clock.value, ipKey: "ip-test" });
+		store.setRole({ userId: "mia", role: "mod", on: true, now: clock.value });
+		store.mutate(op(clock, "mia", "e-move", "message", {
+			message_id: messageId, room_id: threadId, body: saved.message!.body, reply_to: saved.message!.reply_to,
+		}));
+		const moved = store.mutate(op(clock, "mia", "e-back", "message", {
+			message_id: messageId, room_id: "general", body: saved.message!.body, reply_to: saved.message!.reply_to,
+		}));
+		expect(moved.message?.ext).toEqual({ editors: { ...grant, edited_by: "bob" }, irc: "x" });
+
+		// The sender's save removes edited_by, also when it leaves ext out.
+		const kept = post(store, clock, "alice", "e5a", { message_id: messageId, body: { text: "still open", mentions: ["bob"] } });
+		expect(kept.message?.ext).toEqual({ editors: grant, irc: "x" });
+		const own = post(store, clock, "alice", "e5", { message_id: messageId, body: { text: "closed", mentions: ["bob"] }, ext: { editors: { "body.text": "everyone" } } });
+		expect(own.message?.ext).toEqual({ editors: { "body.text": "everyone" }, irc: "x" });
+		// A value the server does not know shares nothing.
+		expect(errorCode(() => post(store, clock, "bob", "e6", { message_id: messageId, body: { text: "open" } }))).toBe("denied");
+	});
+});
+
 it("merges ext one level deep on message saves and room_set (§4.12)", async () => {
 	await withStore("ext-merge", (store, clock) => {
 		const created = post(store, clock, "alice", "e1", {

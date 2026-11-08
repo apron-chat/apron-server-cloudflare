@@ -437,6 +437,12 @@ describe('push over the socket', () => {
 		expect(JSON.parse(bodyless).message).toEqual({ message_id: message.message_id, room_id: message.room_id, from: { user_id: 'u', name: 'n'.repeat(1_200) }, reply_to: message.reply_to });
 	});
 
+	it('leaves out text that a mentioned user saved (ext:editors): `from` names the sender, not them', () => {
+		const message = { message_id: '1', log_id: '2', room_id: 'general', from: { user_id: 'alice', name: 'Alice' }, body: { text: '- [x] soup', mentions: ['bob'] } };
+		expect(JSON.parse(pushPayload({ ...message, ext: { editors: { 'body.text': 'mentioned' } } } as never)).message.body).toEqual({ text: '- [x] soup', mentions: ['bob'] });
+		expect(JSON.parse(pushPayload({ ...message, ext: { editors: { 'body.text': 'mentioned', edited_by: 'bob' } } } as never)).message.body).toEqual({ mentions: ['bob'] });
+	});
+
 	it('keeps every payload within 2048 bytes, dropping mentions first', async () => {
 		const pushes = capturePushes();
 		const [aliceId, bobId] = [unique('alice'), unique('bob')];

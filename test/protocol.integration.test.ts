@@ -45,7 +45,7 @@ const connect = ({ ip = `192.0.2.${nextIp++}`, ...options }: Partial<ConnectOpti
 async function authenticate(peer: Peer, scheme = 'guest', extraCaps: string[] = []) {
 	const { server } = await greeting(peer);
 	expect(server.params.apron).toBe(10);
-	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'embed:terminal', 'embed:append', 'status', 'ext', 'ext:settings', 'ext:limits', 'ext:media', 'ext:permissions']);
+	expect(server.params.capabilities).toEqual(['history', 'edit', 'rooms', 'reactions', 'command', ...extraCaps, 'embed:upload', 'embed:terminal', 'embed:append', 'status', 'ext', 'ext:settings', 'ext:limits', 'ext:media', 'ext:permissions', 'ext:editors']);
 	expect(server.params.auth).toContain('webauthn');
 	expect(server.params.ping).toBe(DEFAULT_LIMITS.pingSeconds);
 	// The extensions `ext:settings` and `ext:media` keep their data under their names in ext (§4, §4.12).

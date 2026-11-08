@@ -1556,6 +1556,43 @@ export function mergeExt(stored: unknown, write: Record<string, unknown> | undef
 }
 
 /**
+ * ext:editors (apron's EXTENSIONS.md): whether `userId`, who did not send
+ * the message, may save its `body.text`. Its sender shares it with
+ * `ext.editors {"body.text": "mentioned"}`, and then each user in the current
+ * `body.mentions` may save it. Any other key or value shares nothing.
+ */
+export function sharesText(snapshot: MessageSnapshot, userId: string): boolean {
+  if (snapshot.deleted) return false;
+  const editors = snapshot.ext?.editors;
+  if (!isPlainObject(editors) || editors["body.text"] !== "mentioned") return false;
+  const mentions = snapshot.body?.mentions;
+  return Array.isArray(mentions) && mentions.includes(userId);
+}
+
+/** Whether a message's body has an `append` embed, whose live text writes into `body.text` (§4.8.5). */
+function hasAppend(snapshot: MessageSnapshot): boolean {
+  const embeds = snapshot.body?.embeds;
+  return Array.isArray(embeds) && embeds.some((embed) => isPlainObject(embed) && embed.kind === "append");
+}
+
+/**
+ * `ext` with `ext.editors.edited_by` set to `userId`, or removed without one
+ * (ext:editors): the server sets it on a save by someone other than the
+ * sender, removes it on the sender's saves, and ignores it in requests.
+ */
+export function withEditedBy(ext: Record<string, unknown> | undefined, userId: string | undefined): Record<string, unknown> | undefined {
+  const editors = ext?.editors;
+  if (!ext || !isPlainObject(editors) || (userId === undefined && !Object.hasOwn(editors, "edited_by"))) return ext;
+  const { edited_by: _, ...grants } = editors;
+  void _;
+  const next = userId === undefined ? grants : { ...grants, edited_by: userId };
+  const { editors: _old, ...rest } = ext;
+  void _old;
+  if (Object.keys(next).length) return { ...rest, editors: next };
+  return Object.keys(rest).length ? rest : undefined;
+}
+
+/**
  * The keys of a user's `ext` that a write changed (protocol §4.12), as a
  * `user` notification carries them: each new or replaced value, and `""`
  * for each key it cleared. Undefined when nothing changed.
@@ -4946,6 +4983,16 @@ export class Store {
     return { ...clone(body), text, format, embeds: (clone(embeds) as Record<string, unknown>[]).map((embed) => withCleanOg(embed, this.config.ogMediaHosts)), ...(mentions ? { mentions } : {}) };
   }
 
+  /**
+   * The body of an editor's save (ext:editors): the current snapshot's body,
+   * with the text that the request carries, checked as any text is.
+   */
+  private sharedTextBody(previous: MessageSnapshot, value: unknown): Record<string, unknown> {
+    const body = jsonObject(value, "body");
+    const text = body.text === undefined ? "" : ensureText(body.text, "body.text", this.config.maxTextBytes);
+    return { ...clone(previous.body ?? {}), text };
+  }
+
   /** A new message with no text and no embeds, which is neither logged nor broadcast (§3.5). */
   private emptyNewMessage(params: Record<string, unknown>): boolean {
     if (params.message_id !== undefined || (params.deleted !== undefined && params.deleted !== false) || !isPlainObject(params.body)) return false;
@@ -5375,8 +5422,17 @@ export class Store {
     if (messageIdParam !== undefined && typeof messageIdParam !== "string") throw new StoreError("invalid_params", "message_id must be a string");
     const current = messageIdParam === undefined ? null : this.visibleMessage(ensureText(messageIdParam, "message_id", 256), input.userId, floor);
     if (messageIdParam !== undefined && !current) throw new StoreError("invalid_params", "unknown or expired message");
-    // Someone else's message may only be moved, and only by a moderator (MODERATOR_ROLES, BOT_MODERATOR_ROLES).
-    const moving = current !== null && current.author_id !== input.userId;
+    const previous = current ? parseJson<MessageSnapshot>(current.snapshot_json) : null;
+    // A save of someone else's message in its own room may change only the
+    // text that its sender shares with the users it mentions (ext:editors).
+    const editor = current !== null && current.author_id !== input.userId && current.room_id === roomId && sharesText(previous!, input.userId);
+    if (editor) {
+      if (params.deleted !== undefined && params.deleted !== false) throw new StoreError("denied", "Only the original author may delete this message");
+      // Live text is still writing into body.text (§4.8.5).
+      if (hasAppend(previous!)) throw new StoreError("denied", "The message's text is still being written");
+    }
+    // Someone else's message may otherwise only be moved, and only by a moderator (MODERATOR_ROLES, BOT_MODERATOR_ROLES).
+    const moving = current !== null && current.author_id !== input.userId && !editor;
     if (moving && (current.room_id === roomId || !this.isModerator(input.userId))) throw new StoreError("denied", "Only the original author may edit this message");
     // Posting needs no join, except in a private room, which only its members see.
     if (!this.visibleRoomRow(roomId, input.userId)) throw new StoreError("invalid_params", "unknown room");
@@ -5387,8 +5443,8 @@ export class Store {
     const deleted = params.deleted === undefined ? false : params.deleted;
     if (typeof deleted !== "boolean") throw new StoreError("invalid_params", "deleted must be boolean");
     if (!current && deleted) throw new StoreError("invalid_params", "a message cannot be created deleted");
-    const previous = current ? parseJson<MessageSnapshot>(current.snapshot_json) : null;
-    const replyId = this.messageReference(params.reply_to, "reply_to", floor, {
+    // An editor's save keeps the reply.
+    const replyId = editor ? previous!.reply_to?.message_id : this.messageReference(params.reply_to, "reply_to", floor, {
       viewer: input.userId,
       roomId,
       ...(typeof messageIdParam === "string" ? { self: messageIdParam } : {}),
@@ -5397,13 +5453,20 @@ export class Store {
     let body: Record<string, unknown> | undefined;
     if (!deleted) {
       if (params.body === undefined) throw new StoreError("invalid_params", "message body is required");
-      body = this.normalizedBody(params.body);
+      // An editor's save keeps every other field of the body.
+      body = editor ? this.sharedTextBody(previous!, params.body) : this.normalizedBody(params.body);
+      // Emptied, a message whose last embed then fails or ends with nothing is a tombstone (rewriteEmbed): only its sender deletes it.
+      if (editor && body.text === "") throw new StoreError("invalid_params", "Only the sender may empty this message's text");
       if (body.text === "" && (body.embeds as unknown[]).length === 0) throw new StoreError("invalid_params", "message cannot be empty");
     }
     // A save merges `ext` into the current snapshot's (§4.12); a tombstone carries none (§4.4),
     // so a creation, or a save of a tombstone, merges into an empty `ext`.
-    const write = this.optionalExt(params.ext);
-    const ext = deleted ? undefined : mergeExt(previous?.ext, write);
+    // An editor's save keeps ext too, and edited_by names who saved a
+    // snapshot when not its sender (ext:editors); requests do not set it.
+    // A moderator's move changes no content, so it keeps the edited_by of the text it moves.
+    const write = editor ? undefined : this.optionalExt(params.ext);
+    const merged = deleted ? undefined : mergeExt(previous?.ext, write);
+    const ext = moving ? merged : withEditedBy(merged, editor ? input.userId : undefined);
     const from = previous ? previous.from : this.identityForMessage(input);
     if (!from || typeof from.user_id !== "string") throw new StoreError("internal_error", "message author is missing");
 
@@ -5414,7 +5477,8 @@ export class Store {
     let writes: Record<string, unknown>[] = [];
     let liveStarted: LiveEntry[] = [];
     let liveEnded: string[] = [];
-    if (this.config.uploads || this.config.liveText) {
+    // An editor's save keeps the embeds as they are stored: it starts no upload or live text, and releases none (ext:editors).
+    if ((this.config.uploads || this.config.liveText) && !editor) {
       const identified = this.identifyEmbeds(body ? body.embeds as Record<string, unknown>[] : [], previous, input, messageId, logId, context.commitMs, typeof body?.text === "string" ? body.text : "", liveClaim);
       if (body) body.embeds = identified.embeds;
       uploads = identified.uploads;
@@ -6318,8 +6382,11 @@ export class Store {
     const { prev_room_id: _moved, body: previousBody, ...rest } = snapshot;
     const next: MessageSnapshot = { ...rest, log_id: idString(logId), prev_log_id: idString(message.latest_log_id) };
     const nextText = text ?? previousBody?.text;
-    if (nextText === "" && !embeds.length) next.deleted = true;
-    else {
+    // A tombstone carries no body and no ext (§4.4).
+    if (nextText === "" && !embeds.length) {
+      next.deleted = true;
+      delete next.ext;
+    } else {
       next.body = { ...previousBody, ...(text !== undefined ? { text } : {}), embeds };
       // An append that moved into the text leaves an ordinary message (§4.8.5).
       if (text !== undefined && !embeds.length) delete next.body.embeds;
