@@ -77,9 +77,10 @@ export function noticeText(notice: TriggerNotice): string {
 			return `**Storage overrun: \`${notice.operation}\`** used more rows than it reserved${who} (${notice.message}). It finished and its rows are charged; the server stays open. Further overruns today are counted without a notice.`;
 		}
 		case "storage": {
-			const mb = (bytes: number) => `${Math.round(bytes / (1024 * 1024))} MB`;
+			const mib = (bytes: number) => `${Math.round(bytes / (1024 * 1024))} MiB`;
 			const percent = Math.round((notice.bytes / notice.highWaterBytes) * 100);
-			return `**The database is at ${mb(notice.bytes)}, ${percent}% of the ${mb(notice.highWaterBytes)} where posting stops.** Nothing is refused yet. It holds the retained history, so it shrinks only as records expire; \`/purge\` frees a flooder's at once, and \`npm run usage:report\` shows the trend. Measured hourly; told again only after it falls under ${mb(notice.rearmBytes)}.`;
+			const now = notice.bytes >= notice.highWaterBytes ? "Posting that grows it is refused now." : "Nothing is refused yet.";
+			return `**The database is at ${mib(notice.bytes)}, ${percent}% of the ${mib(notice.highWaterBytes)} where posting stops.** ${now} It holds the retained history, so it shrinks only as records expire; \`/purge\` frees a flooder's at once, and \`npm run usage:report\` shows the trend. Measured hourly; told again only after it falls under ${mib(notice.rearmBytes)}.`;
 		}
 		case "edge_failed":
 			return `**The attack pause could not turn on the edge stop** (${notice.outcome}). The server still refuses everything, but each request still reaches the Worker and is billed: check \`ZONE_ID\`, \`EDGE_STOP_TOKEN\` and the \`apron_budget_stop\` rule.`;

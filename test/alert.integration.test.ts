@@ -189,8 +189,8 @@ it('tells the admins once when the database passes half its high-water mark, and
 		expect(told).toEqual([]);
 		await reading(Math.ceil(high * 0.55));
 		expect(told).toHaveLength(1);
-		expect(told[0]).toMatch(/^\*\*The database is at 422 MB, 55% of the 768 MB where posting stops\.\*\*/);
-		expect(told[0]).toContain('told again only after it falls under 307 MB');
+		expect(told[0]).toMatch(/^\*\*The database is at 422 MiB, 55% of the 768 MiB where posting stops\.\*\* Nothing is refused yet\./);
+		expect(told[0]).toContain('told again only after it falls under 307 MiB');
 		// Still high, an hour later and after the instance restarts (the flag is kept in storage): no repeat.
 		await reading(Math.ceil(high * 0.6));
 		delete runtime.storageAlerted;
@@ -201,5 +201,9 @@ it('tells the admins once when the database passes half its high-water mark, and
 		await reading(Math.floor(high * 0.35));
 		await reading(Math.ceil(high * 0.5));
 		expect(told).toHaveLength(2);
+		// Past the mark itself (a deploy onto a full database), it says posting is refused.
+		await reading(Math.floor(high * 0.35));
+		await reading(high);
+		expect(told[2]).toContain('Posting that grows it is refused now.');
 	});
 });

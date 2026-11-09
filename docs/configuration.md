@@ -162,9 +162,10 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
 - **Admin alert.** When the guard or the flood trip (below) turns the rule
   on or off, when the server changes tier or an action's breaker opens or
   closes (see [Server tiers](#server-tiers)), at the day's first storage
-  overrun, and when the database passes half its high-water mark (384 MiB of
-  768 on Paid: read from the hourly `db_bytes` sample, so it costs no query;
-  told once, and again only after the size falls under 40%), the server posts a public message in `general` as the `admin`
+  overrun, and when the database passes half its high-water mark (384 MiB
+  of 768 on Paid; the size comes from the `db_bytes` reading, taken at most
+  hourly from an alarm, and the told-once flag is one `_meta` row; told
+  again only after the size falls under 40%), the server posts a public message in `general` as the `admin`
   user that mentions and pushes to every user with the `admin` role (up to
   `wakesPerMessage`, 10); see
   [SPEC section 10](../SPEC.md#10-degradation-and-public-demo-behavior).

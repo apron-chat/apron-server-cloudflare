@@ -6072,8 +6072,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const rearmBytes = Math.floor(highWaterBytes * STORAGE_REARM_SHARE);
 			this.storageAlerted ??= this.store.storageAlerted();
 			if (!this.storageAlerted && size >= highWaterBytes * STORAGE_ALERT_SHARE) {
-				this.store.setStorageAlerted(true, now);
 				this.storageAlerted = true;
+				try { this.store.setStorageAlerted(true, now); } catch { /* told again after a wake, rather than not at all */ }
 				console.warn(JSON.stringify({ event: "storage_alert", bytes: size, high_water_bytes: highWaterBytes }));
 				this.announce({ kind: "storage", bytes: size, highWaterBytes, rearmBytes });
 			} else if (this.storageAlerted && size < rearmBytes) {
