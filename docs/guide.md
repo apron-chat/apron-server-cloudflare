@@ -281,9 +281,9 @@ used the old one; `/invite-device remove <id>` revokes it, and
 
 ## User-visible policies
 
-Only the last 7 days of records (messages, reactions, room changes, and
+Only the last 30 days of records (messages, reactions, room changes, and
 registered users' memberships) are retained, 24 hours on Workers Free. Cleanup
-once a day (hourly on Free) normally exposes 7 to 8 days; quota exhaustion may
+once a day (hourly on Free) normally exposes 30 to 31 days; quota exhaustion may
 delay physical deletion. The `general` room ID, the top-level rooms admins
 and mods create, and the log head never rotate. Recent edits can keep old
 messages visible. Rooms keep their current record after its log entry

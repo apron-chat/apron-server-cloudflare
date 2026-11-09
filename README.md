@@ -24,7 +24,8 @@ for a zero-overage deployment.
   [limits](docs/limits.md#hard-caps) for how many each user may have.
 - **Images, voice clips and avatars.** Signed-in users attach images and
   voice clips and set avatars (`embed:upload`), stored in R2 within its free
-  tier for a week (avatars a month). Admins, mods and friends add custom
+  tier: attachments for a month, as long as their messages, and
+  avatars while their owners keep signing in. Admins, mods and friends add custom
   emoji with `/emoji add :name:`, which everyone can react with
   (`ext:emoji`).
 - **Live terminals and streamed replies.** `/embed-terminal` and
@@ -53,7 +54,7 @@ for a zero-overage deployment.
   daily budgets, a budget guard caps the month's bill (on Workers Paid, $5 a
   day and $25 a month past the plan's $5; see
   [configuration](docs/configuration.md#budget-guard)), with rolling retention
-  (7 days on Workers Paid, which production runs, and one day on Workers
+  (30 days on Workers Paid, which production runs, and one day on Workers
   Free) and graceful read-only degradation when budgets run out.
 
 ## Quick start

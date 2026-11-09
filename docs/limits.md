@@ -162,7 +162,7 @@ mutation with the **same** `id`.
 | Room listing limited | 6 `room_list` a minute per account | The first `filter: "joined"` listing after each sign-in is free. Keep the list current from `room_update` rather than polling. |
 
 A history page holds at most 50 records (20 by default) and 256 KiB. Records
-are kept for 7 days.
+are kept for 30 days.
 
 ### Server-wide spikes
 
@@ -282,7 +282,7 @@ first.
 | Users with a reaction on one message ("reaction limit reached for this message") | 32 |
 | Emoji in one user's reaction set on one message | 8 |
 | Room mutes per user | 100 |
-| Registered accounts on the server | 50,000 (an account inactive for 30 days is removed, unless among the 100 most recently active or holding a role; a device token unused for 30 days stops working) |
+| Registered accounts on the server | 50,000 (an account inactive for 30 days is removed, or up to 61 if it has an avatar, unless among the 100 most recently active or holding a role; a device token unused for 30 days stops working) |
 
 A thread stops counting when everyone has left it or its history expires.
 

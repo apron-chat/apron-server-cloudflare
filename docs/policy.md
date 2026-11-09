@@ -127,9 +127,9 @@ within it:
   [SPEC section 4.3](../SPEC.md#43-uploads-and-avatars)). Only PNG, JPEG, GIF,
   and WebP images and WebM, Ogg, and MP4 audio are kept (avatars are images
   only), at most 5 MB each (avatars and custom emoji 256 KB), 30 a day per
-  user and 500 a day in all, all kinds together. Attachments last a week and
-  avatars a month; an avatar lasts
-  while its owner keeps signing in. Every embed gets an `embed_id`, and saves
+  user and 500 a day in all, all kinds together. Attachments last a month, as
+  their messages do; an avatar lasts while its owner keeps signing in, and
+  goes 60 days after their last sign-in at most. Every embed gets an `embed_id`, and saves
   keep embeds by it. Admins can turn uploads off and on with
   `/toggle uploads`. Clients should resize images and strip their metadata
   (such as location) before uploading: the server stores the bytes as sent.
@@ -170,7 +170,7 @@ within it:
   restarts meanwhile (a deploy), the text ends and its embed is removed.
   Why these limits: each text keeps the one server object awake and costs a
   request for its write and for each reader, and its kept text is stored for
-  the week its message is ([cost report](cost-report.md#live-text)).
+  the 30 days its message is ([cost report](cost-report.md#live-text)).
 - Status (cap `status`, with push): a user chooses a status with `me`
   `{"status": …}`: `online` (the default), `dnd` (busy: no pushes),
   `invisible` (appear `offline` to everyone), or `""` (none: show no

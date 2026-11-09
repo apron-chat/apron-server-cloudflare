@@ -857,8 +857,11 @@ describe('measured storage accounting', () => {
 			);
 			state.storage.transactionSync(() => {
 				sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms) VALUES ('heavy', 'heavy', 'Heavy', 'registered', 0, 0)");
-				// A week of posts with files at the per-user daily cap, and an avatar.
-				for (let index = 0; index < 8 * UPLOAD_POLICY!.uploadsPerUserDay; index += 1) upload(`f/file-${index}`, 'file', 'done');
+				// As many uploads as one owner can hold (Store.uploadsPerOwner: the
+				// daily cap over the longest retention, its lag and a day), and an avatar.
+				const policy = UPLOAD_POLICY!;
+				const days = Math.ceil((Math.max(policy.fileRetentionSeconds, policy.avatarRetentionSeconds) + policy.lifecycleLagSeconds) / 86_400) + 1;
+				for (let index = 0; index < days * policy.uploadsPerUserDay - 2; index += 1) upload(`f/file-${index}`, 'file', 'done');
 				upload('a/old', 'avatar', 'done');
 				upload('a/new', 'avatar', 'writing');
 			});

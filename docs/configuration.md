@@ -16,7 +16,7 @@ The paid plan starts from the free one and raises only what Paid's included
 usage pays for, sized against its monthly allowances divided by 31 days with
 headroom. Paid includes 16 times the SQL rows written and 160 times the rows
 read, so the SQL ceilings rise tenfold, and posts, registrations, admissions,
-history pages, and member listings with them. History is kept 7 days instead
+history pages, and member listings with them. History is kept 30 days instead
 of 24 hours, matching uploaded images, with daily cleanup; the database
 watermarks rise to 768 MiB (1 GiB hard), a fifth of the 5 GB-month included.
 
@@ -318,9 +318,9 @@ in `src/plans/paid.ts` sets the limits:
 | `uploadsPerDay` (server-wide, avatars and custom emoji included; counted when a write is claimed) | 500 |
 | `uploadsPerUserDay` (counted when an upload starts) | 30 |
 | `writeWindowSeconds` | 10 minutes |
-| `fileRetentionSeconds` | 7 days |
-| `avatarRetentionSeconds` | 30 days |
-| `avatarRefreshSeconds` | 7 days |
+| `fileRetentionSeconds` | 30 days |
+| `avatarRetentionSeconds` | 60 days |
+| `avatarRefreshSeconds` | 30 days |
 | `lifecycleLagSeconds` | 1 day |
 | `storedBytesCap` | 5 GB |
 
@@ -329,9 +329,11 @@ are set; set up all of these first:
 
 1. **Bucket.** Create an R2 bucket named `apron-media` (the `MEDIA` binding
    in `wrangler.production.toml`). Deploying fails while it does not exist.
-2. **Lifecycle rules.** On the bucket, delete objects with prefix `f/` 7 days
-   after upload and prefix `a/` 30 days after upload. They must match
-   `fileRetentionSeconds` and `avatarRetentionSeconds`. Add no rule for
+2. **Lifecycle rules.** On the bucket, delete objects with prefix `f/` 30 days
+   after upload and prefix `a/` 61 days after upload. They must be at least
+   `fileRetentionSeconds` and `avatarRetentionSeconds` (a day more leaves
+   R2's asynchronous deletes a margin); the server deletes expired objects
+   itself, so a longer rule only keeps them longer. Add no rule for
    `e/`: custom emoji images (`e/<id>`), their catalogs (`e/c/<sha256>.json`)
    and the server's avatar (`e/<id>`, `/server avatar`) stay until the
    server deletes them.
@@ -389,7 +391,7 @@ binding.
 | --- | --- | --- |
 | Storage | 5 GB (the byte cap, including a day of lifecycle lag) | 10 GB-month |
 | Class A (writes, avatar refreshes) | about 16,000 uploads and a few thousand refreshes a month | 1 million a month |
-| Class B (views that miss the cache) | about once per object per data center | 10 million a month |
+| Class B (views that miss the cache) | about once per object per data center a week (attachments are cached 7 days and kept 30) | 10 million a month |
 
 Upload writes and their claims use the Worker and Durable Object allowances
 above: two Durable Object requests and one Worker request each, at most
@@ -875,9 +877,10 @@ use, and its bot's activity, so it holds whether or not user status is on.
 Receiving pushes alone is not activity. It never removes one of the
 `keptActiveAccounts` (100) most recently active, one with a role, the admin
 user, one connected now or whose bot is, one whose bot holds a role of its
-own, or one with a live upload (its avatar expires first). Its bot goes with it, and its passkeys, memberships,
+own, or one with a live upload (its avatar expires first, up to 61 days after its
+owner's last sign-in). Its bot goes with it, and its passkeys, memberships,
 read cursors, status, mutes, push subscriptions, tokens and limiter rows. Its
-content is past retention by then. Its `user_id` is retired, as `/purge`
+content is past retention by then, or within the day cleanup may take. Its `user_id` is retired, as `/purge`
 retires one, for `retiredUserIdSeconds` (the message retention), then may be
 issued again, once every token of the old account and its bot is revoked:
 nothing logged names it any more, and a session carries the user handle it
@@ -1029,13 +1032,13 @@ The numeric rows are grouped by their unit and enforcement scope:
 
 | Variable | Workers Paid default | Workers Free, where different |
 | --- | ---: | ---: |
-| `retentionSeconds` | 604800 | 86400 |
+| `retentionSeconds` | 2592000 | 86400 |
 | `cleanupSeconds` | 86400 | 3600 |
 | `challengeTtlSeconds` | 120 |  |
 | `sessionTtlSeconds` | 2592000 |  |
 | `idleAccountSeconds` | 2592000 |  |
 | `keptActiveAccounts` | 100 |  |
-| `retiredUserIdSeconds` | 604800 | 86400 |
+| `retiredUserIdSeconds` | 2592000 | 86400 |
 | `maxFrameBytes` | 32768 | 16384 |
 | `maxTextBytes` | 16384 | 4096 |
 | `maxSnapshotBytes` | 24576 | 8192 |
