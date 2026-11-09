@@ -1,6 +1,7 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, expect, it, vi } from 'vitest';
 import type { Store } from '../src/store';
+import { DEFAULT_LIMITS } from '../src/budget';
 
 type Runtime = { store: Store };
 
@@ -160,5 +161,45 @@ it('runs the full alarm for an upload deadline stored before a wake, which the i
 		// Read once per instance: the next alarm goes by what the sweep found.
 		await runtime.alarm();
 		expect(stored).toHaveBeenCalledTimes(1);
+	});
+});
+
+it('tells the admins once when the database passes half its high-water mark, and again only after it falls under 40%', async () => {
+	type Sized = Runtime & {
+		maybeRecordDatabaseSize(now: number): void;
+		notifyAdmins(text: string): Promise<void>;
+		databaseSizeRecordedAt: number;
+		storageAlerted?: boolean;
+	};
+	const told: string[] = [];
+	let size = 0;
+	const high = DEFAULT_LIMITS.databaseHighWaterBytes;
+	await runInDurableObject(env.DEMO.getByName('storage-alert'), async (instance) => {
+		const runtime = instance as unknown as Sized;
+		vi.spyOn(runtime.store, 'databaseSize').mockImplementation(() => size);
+		vi.spyOn(runtime, 'notifyAdmins').mockImplementation(async (text) => { told.push(text); });
+		// One hourly reading at `bytes`.
+		const reading = async (bytes: number) => {
+			size = bytes;
+			runtime.databaseSizeRecordedAt = -Infinity;
+			runtime.maybeRecordDatabaseSize(Date.now());
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		};
+		await reading(Math.floor(high * 0.3));
+		expect(told).toEqual([]);
+		await reading(Math.ceil(high * 0.55));
+		expect(told).toHaveLength(1);
+		expect(told[0]).toMatch(/^\*\*The database is at 422 MB, 55% of the 768 MB where posting stops\.\*\*/);
+		expect(told[0]).toContain('told again only after it falls under 307 MB');
+		// Still high, an hour later and after the instance restarts (the flag is kept in storage): no repeat.
+		await reading(Math.ceil(high * 0.6));
+		delete runtime.storageAlerted;
+		await reading(Math.ceil(high * 0.6));
+		await reading(Math.floor(high * 0.45));
+		expect(told).toHaveLength(1);
+		// Under 40% it is armed again, and the next crossing tells again.
+		await reading(Math.floor(high * 0.35));
+		await reading(Math.ceil(high * 0.5));
+		expect(told).toHaveLength(2);
 	});
 });

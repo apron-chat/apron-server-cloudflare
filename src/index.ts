@@ -1175,6 +1175,10 @@ function writeSessionAttachment(socket: WebSocketConnection, attachment: Connect
 const LONG_THROTTLE_SECONDS = 300;
 /** How often an alarm records the database's size (ApronDemoServer.maybeRecordDatabaseSize). */
 const DATABASE_SIZE_METRIC_MS = 60 * 60 * 1_000;
+/** The share of the database high-water mark past which the admins are told (maybeAlertStorage). */
+const STORAGE_ALERT_SHARE = 0.5;
+/** The share under which that alert is armed again, so a size hovering at the line tells once. */
+const STORAGE_REARM_SHARE = 0.4;
 /** A connection is told of one trigger at most this often (noteTrip). */
 const TRIP_NOTICE_MS = 60 * 60 * 1000;
 
@@ -2134,6 +2138,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly trips = new Map<string, number>();
 	/** When the database's size was last recorded (maybeRecordDatabaseSize); in memory only. */
 	private databaseSizeRecordedAt = -Infinity;
+	/** Whether the storage alert stands (Store.storageAlerted), once read. */
+	private storageAlerted?: boolean;
 	/** Refusals counted for the `refusal` metric (src/refusals.ts), written at most twice a minute per kind. */
 	private readonly refusals = new RefusalMeter((kind, reason, detail, count) => recordMetric(this.runtimeEnv.METRICS, "refusal", [kind, reason, detail], count));
 	/** Shadow dollars spent by recent traffic, for the attack pause (src/burn.ts); in memory only. */
@@ -6050,6 +6056,33 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (size === null) return;
 		this.databaseSizeRecordedAt = now;
 		recordMetric(this.runtimeEnv.METRICS, "db_bytes", [], size);
+		this.maybeAlertStorage(size, now);
+	}
+
+	/**
+	 * Tells the admins once the database passes STORAGE_ALERT_SHARE of its
+	 * high-water mark (where posting is refused), from the hourly size reading
+	 * above, so it costs no query. Told once: the flag is kept in `_meta`,
+	 * written only when it flips, and read once an instance; it is armed again
+	 * once the size falls under STORAGE_REARM_SHARE. Never throws.
+	 */
+	private maybeAlertStorage(size: number, now: number): void {
+		try {
+			const highWaterBytes = this.config.limits.databaseHighWaterBytes;
+			const rearmBytes = Math.floor(highWaterBytes * STORAGE_REARM_SHARE);
+			this.storageAlerted ??= this.store.storageAlerted();
+			if (!this.storageAlerted && size >= highWaterBytes * STORAGE_ALERT_SHARE) {
+				this.store.setStorageAlerted(true, now);
+				this.storageAlerted = true;
+				console.warn(JSON.stringify({ event: "storage_alert", bytes: size, high_water_bytes: highWaterBytes }));
+				this.announce({ kind: "storage", bytes: size, highWaterBytes, rearmBytes });
+			} else if (this.storageAlerted && size < rearmBytes) {
+				this.store.setStorageAlerted(false, now);
+				this.storageAlerted = false;
+			}
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "storage_alert_failed", message: error instanceof Error ? error.message : String(error) }));
+		}
 	}
 
 	/** Counts a billed event toward the burn meter, then weighs it (maybeCheckBurn). */

@@ -1030,6 +1030,8 @@ export const RETIRED_SWEEP_BATCH = 500;
 const IDLE_PRUNE_RUNS_PER_DAY = 10;
 /** The runtime's attack pause: its UTC day, count that day, hold end, and why (attackPause). */
 const META_ATTACK_PAUSE = "attack_pause";
+/** "1" while the admins have been told the database passed half its high-water mark (ApronDemoServer.maybeAlertStorage). */
+const META_STORAGE_ALERTED = "storage_alerted";
 /** Overruns of one operation within BREAKER_WINDOW_MS that open its breaker. */
 export const BREAKER_OVERRUNS = 3;
 export const BREAKER_WINDOW_MS = 60 * 60 * 1000;
@@ -3392,6 +3394,24 @@ export class Store {
   attackPause(): string {
     this.ensureReady();
     return this.metaValue(META_ATTACK_PAUSE) ?? "";
+  }
+
+  /**
+   * Whether the admins have been told the database passed half its
+   * high-water mark (ApronDemoServer.maybeAlertStorage). Read once as an
+   * instance needs it, uncharged like attackPause.
+   */
+  storageAlerted(): boolean {
+    this.ensureReady();
+    return this.metaValue(META_STORAGE_ALERTED) === "1";
+  }
+
+  /** Records whether that alert stands (storageAlerted): charged, never refused, written only when it flips. */
+  setStorageAlerted(alerted: boolean, now = this.clock.now()): void {
+    this.ensureReady();
+    this.alert(() => this.reserved({ reads: 4, writes: 4 }, false, now, () => {
+      this.writeMeta(META_STORAGE_ALERTED, alerted ? "1" : "0");
+    }, true));
   }
 
   /** Records an attack pause (attackPause): charged, never refused. */
