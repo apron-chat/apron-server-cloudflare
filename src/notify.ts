@@ -3,7 +3,8 @@
  * `general` with every admin mentioned: the server changing tier (open,
  * degraded, exhausted, account stop), an operation's breaker opening
  * or closing, the day's first storage overrun, and the edge stop turning on
- * (by the budget guard, or by the flood trip, `exceeded: ["flood"]`) or off.
+ * (by the budget guard, or by the flood trip, `exceeded: ["flood"]`) or off,
+ * and the database passing half its high-water mark (`storage`).
  * New kinds of notice, and new ways to tell one, join here.
  */
 export type TriggerNotice =
@@ -13,7 +14,8 @@ export type TriggerNotice =
 	| { kind: "breaker"; operation: string; open: boolean; until?: number }
 	| { kind: "overrun"; operation: string; message: string; users: readonly string[]; essential?: boolean }
 	| { kind: "burn"; summary: string; paused?: false }
-	| { kind: "edge_failed"; outcome: string };
+	| { kind: "edge_failed"; outcome: string }
+	| { kind: "storage"; bytes: number; highWaterBytes: number; rearmBytes: number };
 
 /**
  * How far the server refuses work, least to most (docs/configuration.md,
@@ -73,6 +75,12 @@ export function noticeText(notice: TriggerNotice): string {
 			const who = notice.users.length ? ` for ${notice.users.map((user) => `\`${user}\``).join(", ")}` : "";
 			if (notice.essential) return `**Storage overrun: \`${notice.operation}\`** used more rows than it reserved${who} (${notice.message}). It is essential (signing in, rooms or history), so it keeps working with no pause; its rows are charged. Told at most once an hour while it goes on: its estimate needs fixing.`;
 			return `**Storage overrun: \`${notice.operation}\`** used more rows than it reserved${who} (${notice.message}). It finished and its rows are charged; the server stays open. Further overruns today are counted without a notice.`;
+		}
+		case "storage": {
+			const mib = (bytes: number) => `${Math.round(bytes / (1024 * 1024))} MiB`;
+			const percent = Math.round((notice.bytes / notice.highWaterBytes) * 100);
+			const now = notice.bytes >= notice.highWaterBytes ? "Posting that grows it is refused now." : "Nothing is refused yet.";
+			return `**The database is at ${mib(notice.bytes)}, ${percent}% of the ${mib(notice.highWaterBytes)} where posting stops.** ${now} It holds the retained history, so it shrinks only as records expire; \`/purge\` frees a flooder's at once, and \`npm run usage:report\` shows the trend. Measured hourly; told again only after it falls under ${mib(notice.rearmBytes)}.`;
 		}
 		case "edge_failed":
 			return `**The attack pause could not turn on the edge stop** (${notice.outcome}). The server still refuses everything, but each request still reaches the Worker and is billed: check \`ZONE_ID\`, \`EDGE_STOP_TOKEN\` and the \`apron_budget_stop\` rule.`;
