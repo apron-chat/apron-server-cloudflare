@@ -259,7 +259,7 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// about a minute of flood through, 12,000 requests or so.
 		holdSeconds: 5 * 60,
 	}),
-	// Images and voice clips kept in R2 and served from its public bucket
+	// Images, voice clips and Markdown files kept in R2 and served from its public bucket
 	// domain, counted together. At most 500 uploads a day are about 16,000
 	// writes a month (1 million free), and the stored-bytes cap keeps storage
 	// at half the free 10 GB-month whatever the mix of types and sizes: 500

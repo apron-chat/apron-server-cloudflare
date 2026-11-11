@@ -343,12 +343,12 @@ interface EdgeStop {
 }
 
 /**
- * Uploads (protocol §4.8.3, cap `embed:upload`): images and voice clips
+ * Uploads (protocol §4.8.3, cap `embed:upload`): images, voice clips and Markdown files
  * registered users attach to messages, and images they set as avatars, stored in R2 and served from its
  * public bucket domain.
  */
 export interface UploadPolicy {
-	/** Largest attached file, image or audio. */
+	/** Largest attached file: image, audio or text. */
 	maxFileBytes: number;
 	/** Largest avatar image. */
 	maxAvatarBytes: number;

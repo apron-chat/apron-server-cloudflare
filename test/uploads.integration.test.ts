@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { DEFAULT_LIMITS, UPLOAD_POLICY } from '../src/budget';
 import { sniffAudio } from '../src/audio';
 import { sniffImage } from '../src/image';
+import { sniffText } from '../src/text';
 import { fetchEntry } from '../src/index';
 import { signUploadToken, verifyUploadToken } from '../src/upload-token';
 import { Store, UPLOAD_WRITE_GRACE_MS, type EmojiDraft, type StoreError } from '../src/store';
@@ -611,6 +612,18 @@ describe('upload tokens and image sniffing', () => {
 		expect(sniffAudio(png())).toBeNull();
 		expect(sniffAudio(encode('<html><script>alert(1)</script>'))).toBeNull();
 	});
+
+	it('keeps any UTF-8 text without a NUL byte as Markdown', () => {
+		const encode = (text: string) => new TextEncoder().encode(text);
+		expect(sniffText(encode('# Plan\n\n- canary 🐤'))).toEqual({ type: 'text/markdown' });
+		// It is served as Markdown, which no browser runs, whatever it holds.
+		expect(sniffText(encode('<html><script>alert(1)</script>'))).toEqual({ type: 'text/markdown' });
+		expect(sniffText(new Uint8Array())).toBeNull();
+		expect(sniffText(encode('a\0b'))).toBeNull();
+		expect(sniffText(new Uint8Array([0x23, 0x20, 0xff, 0xfe]))).toBeNull();
+		expect(sniffText(png())).toBeNull();
+		expect(sniffText(webm())).toBeNull();
+	});
 });
 
 describe('uploads end to end', () => {
@@ -694,6 +707,23 @@ describe('uploads end to end', () => {
 		} finally { peer.close(); }
 	});
 
+	it('writes a Markdown file as UTF-8 text with only its title, which an avatar refuses', async () => {
+		const peer = await signedIn(unique('writer'));
+		try {
+			const { frame } = await exchange(peer, 'post', 'message', { body: { embeds: [{ kind: 'upload', title: 'message.md' }] } });
+			const messageId = frame.result.message_id;
+			const body = new TextEncoder().encode('# Plan\n\n- canary 🐤\n');
+			const written = await SELF.fetch(frame.result.embeds[0].write_url, { method: 'PUT', body: body as Uint8Array<ArrayBuffer>, headers: { 'Content-Length': String(body.byteLength), 'Content-Type': 'text/markdown' } });
+			expect(written.status).toBe(204);
+			const completed = (await until(peer, isMessage(messageId))).frame.params.body.embeds[0];
+			expect(completed).toEqual({ embed_id: frame.result.embeds[0].embed_id, kind: 'upload', title: 'message.md', url: expect.stringMatching(/^https:\/\/media\.test\/f\//), og: { title: 'message.md' } });
+			expect((await media().get(completed.url.slice('https://media.test/'.length)))?.httpMetadata?.contentType).toBe('text/markdown; charset=utf-8');
+
+			const avatar = await request(peer, 'avatar', 'command', { body: { text: '/avatar', embeds: [{ kind: 'upload' }] } });
+			expect((await put(avatar.result.embeds[0].write_url, body)).status).toBe(415);
+		} finally { peer.close(); }
+	});
+
 	it('refuses a write with 429 while the day\'s uploads are spent, leaving it pending to write after', async () => {
 		const peer = await signedIn(unique('uploader'));
 		// The server's daily count, as claimed writes charge it.
@@ -723,7 +753,7 @@ describe('uploads end to end', () => {
 		}
 	});
 
-	it('refuses what is not an image and publishes the message without it', async () => {
+	it('refuses what it does not keep and publishes the message without it', async () => {
 		const peer = await signedIn(unique('uploader'));
 		try {
 			const { frame } = await exchange(peer, 'post', 'message', { body: { text: 'not an image', embeds: [{ kind: 'upload' }] } });
@@ -734,7 +764,8 @@ describe('uploads end to end', () => {
 			const typed = (type: string, body: Uint8Array) => SELF.fetch(frame.result.embeds[0].write_url, { method: 'PUT', body: body as Uint8Array<ArrayBuffer>, headers: { 'Content-Length': String(body.byteLength), 'Content-Type': type } });
 			expect((await typed('text/plain', png())).status).toBe(415);
 			expect((await typed('image/svg+xml', png())).status).toBe(415);
-			expect((await put(frame.result.embeds[0].write_url, new TextEncoder().encode('<script>alert(1)</script>'))).status).toBe(415);
+			// A ZIP: neither an image, audio, nor text.
+			expect((await put(frame.result.embeds[0].write_url, new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x14, 0, 0, 0]))).status).toBe(415);
 			expect((await until(peer, isMessage(frame.result.message_id))).frame.params.body.embeds).toEqual([]);
 		} finally { peer.close(); }
 	});

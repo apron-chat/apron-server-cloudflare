@@ -1058,7 +1058,7 @@ it('advertises the extensions ext:settings, ext:limits, ext:media and ext:permis
 			// MEDIA_ORIGIN is not PUBLIC_ORIGIN, and every type the write keeps, exactly.
 			media: {
 				origins: ['https://media.test'],
-				upload: { 'image/png': file, 'image/jpeg': file, 'image/gif': file, 'image/webp': file, 'audio/webm': file, 'audio/ogg': file, 'audio/mp4': file },
+				upload: { 'image/png': file, 'image/jpeg': file, 'image/gif': file, 'image/webp': file, 'audio/webm': file, 'audio/ogg': file, 'audio/mp4': file, 'text/markdown': file },
 				avatar: { 'image/png': avatar, 'image/jpeg': avatar, 'image/gif': avatar, 'image/webp': avatar },
 				// This server's own: images for /emoji add (ext:emoji).
 				emoji: { 'image/png': emoji, 'image/jpeg': emoji, 'image/gif': emoji, 'image/webp': emoji },

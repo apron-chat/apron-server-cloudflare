@@ -6385,7 +6385,8 @@ export class Store {
     if (ok) {
       this.completeUploadRow(row, write.bytes!);
       const size = write.width && write.height ? { width: write.width, height: write.height } : {};
-      const media = write.contentType!.startsWith("audio/") ? { audio: { url, type: write.contentType } } : { image: { url, type: write.contentType, ...size } };
+      // A text file has no media to preview: its embed is its title and url.
+      const media = write.contentType!.startsWith("audio/") ? { audio: { url, type: write.contentType } } : write.contentType!.startsWith("image/") ? { image: { url, type: write.contentType, ...size } } : {};
       replacement = { ...embed, url, og: { ...(typeof embed.title === "string" ? { title: embed.title } : {}), ...media } };
     } else deletedUploads = this.releaseUploadRows([row]);
     return { accepted: ok, broadcasts: this.rewriteEmbed(message, snapshot, row.embed_id!, replacement, now), deletedUploads };
