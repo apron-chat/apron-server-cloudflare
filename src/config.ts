@@ -411,6 +411,11 @@ function validateLimits(limits: Limits): void {
 	if (limits.cleanupBatch > budget.MAX_CLEANUP_BATCH || limits.threadLimit > budget.MAX_THREAD_LIMIT || limits.threadMetadataBytes > budget.MAX_THREAD_METADATA_BYTES) {
 		fail("metadata or cleanup exceeds calibrated bounds");
 	}
+	// A room_set carries the fields in one frame, with its envelope.
+	if (limits.threadMetadataBytes + 1024 > limits.maxFrameBytes) fail("threadMetadataBytes must fit one frame");
+	if (limits.roomMetadataTotalBytes > budget.MAX_ROOM_METADATA_TOTAL_BYTES || limits.roomMetadataTotalBytes < limits.threadMetadataBytes) {
+		fail("roomMetadataTotalBytes must be between threadMetadataBytes and the calibrated ceiling");
+	}
 	if (!Number.isSafeInteger(limits.threadsPerUser) || limits.threadsPerUser < 1 || limits.threadsPerUser > limits.threadLimit) {
 		fail("threadsPerUser must be between 1 and threadLimit");
 	}

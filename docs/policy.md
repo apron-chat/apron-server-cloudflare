@@ -50,7 +50,7 @@ within it:
   `admin` or `mod` may also create a top-level room (others' are `denied`, as
   are nested threads); creating joins the creator. Any participant may save a
   thread's `title`, `description` (CommonMark by convention), and `ext`,
-  together at most 2 KiB; an `admin` or `mod` may save a created top-level
+  together at most 8 KiB, and every room's together at most 256 KiB; an `admin` or `mod` may save a created top-level
   room's, and only an admin `general`'s. Threads and public rooms always
   carry a title (`Thread` or `Room` by default). Created top-level rooms are
   permanent like `general`; at most 16 are created, and they count against

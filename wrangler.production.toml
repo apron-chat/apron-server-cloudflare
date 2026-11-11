@@ -39,6 +39,11 @@ SERVER_TITLE = "Apron Demo"
 SERVER_DESCRIPTION = "The public demo of [Apron](https://github.com/shazow/apron), an open chat protocol."
 # The Apron icon, square at 512px, served by apron-web.
 SERVER_AVATAR = "https://web.apron.chat/icon-512.png"
+# Room titles and descriptions (docs/configuration.md, Runtime overrides): a
+# room's serialized client fields, and every room's together, in bytes. The
+# total bounds a listing of every room; a save past it is refused.
+THREAD_METADATA_BYTES = "8192"
+ROOM_METADATA_TOTAL_BYTES = "262144"
 ACCOUNT_ID = "2bfd32937c0c07a923c79f6bb1a17253"
 # The apron.chat zone, where the budget guard turns the apron_budget_stop rule
 # on and off (with the EDGE_STOP_TOKEN secret).

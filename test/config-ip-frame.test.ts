@@ -146,6 +146,16 @@ describe('configuration policy boundaries', () => {
 		expect(() => config({ LIVE_TEXT_MAX_SECOND: '2' })).toThrow(ConfigError);
 	});
 
+	it('takes room field sizes from the wrangler vars, within one frame and the calibrated total', () => {
+		expect(config().limits).toMatchObject({ threadMetadataBytes: 8 * 1024, roomMetadataTotalBytes: 256 * 1024 });
+		expect(config({ THREAD_METADATA_BYTES: '4096', ROOM_METADATA_TOTAL_BYTES: '65536' }).limits).toMatchObject({ threadMetadataBytes: 4096, roomMetadataTotalBytes: 65536 });
+		// A room's fields stay within the calibrated 16 KiB and one frame, the total at least one room and at most 256 KiB.
+		expect(() => config({ THREAD_METADATA_BYTES: '16385', ROOM_METADATA_TOTAL_BYTES: '65536' })).toThrow(/metadata or cleanup/);
+		expect(() => config({ THREAD_METADATA_BYTES: '16384', MAX_FRAME_BYTES: '16384', MAX_SNAPSHOT_BYTES: '8192', MAX_TEXT_BYTES: '4096' })).toThrow(/fit one frame/);
+		expect(() => config({ ROOM_METADATA_TOTAL_BYTES: '4096' })).toThrow(ConfigError);
+		expect(() => config({ ROOM_METADATA_TOTAL_BYTES: String(256 * 1024 + 1) })).toThrow(ConfigError);
+	});
+
 	it('takes an optional APRON_ADMIN_TOKEN that is long, token-safe, and not a bot token', () => {
 		expect(config().adminToken).toBeUndefined();
 		expect(config({ APRON_ADMIN_TOKEN: '' }).adminToken).toBeUndefined();

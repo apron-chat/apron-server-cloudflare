@@ -181,6 +181,8 @@ export interface StoreConfig {
   maxThreadsPerUser: number;
   /** Serialized client fields of one room record. */
   maxThreadMetadataBytes: number;
+  /** Serialized client fields of every room together (roomMetadataTotalBytes). */
+  maxRoomMetadataTotalBytes: number;
   /** Private rooms (§4.2.4) that may exist at once, beside the threads. */
   maxPrivateRooms: number;
   /** Live private rooms one registered user may have created (`creator_id`) at once. */
@@ -512,6 +514,7 @@ const DEFAULT_CONFIG: StoreConfig = {
   maxThreads: DEFAULT_LIMITS.threadLimit,
   maxThreadsPerUser: DEFAULT_LIMITS.threadsPerUser,
   maxThreadMetadataBytes: DEFAULT_LIMITS.threadMetadataBytes,
+  maxRoomMetadataTotalBytes: DEFAULT_LIMITS.roomMetadataTotalBytes,
   maxPrivateRooms: DEFAULT_LIMITS.privateRoomLimit,
   maxPrivateRoomsPerUser: DEFAULT_LIMITS.privateRoomsPerUser,
   maxPrivateMembershipsPerUser: DEFAULT_LIMITS.privateMembershipsPerUser,
@@ -653,6 +656,13 @@ interface ReactionsRecord {
   message_id: string;
   room_id: string;
   reactions: Array<{ from: Identity; emojis: string[] }>;
+}
+
+/** A room row's client fields (`title`, `description`, `ext`): its stored fields without the creator. */
+function clientRoomFields(fieldsJson: string): Record<string, unknown> {
+  const { creator_id: _creator, ...fields } = parseJson<Record<string, unknown>>(fieldsJson, {});
+  void _creator;
+  return fields;
 }
 
 /** The `creator_id` kept in a room row's `fields_json`, if any (Store.roomCreator). */
@@ -954,6 +964,11 @@ const META_EFFECTIVE_NOW = "effective_now_ms";
  * see a purged room's rows.
  */
 const META_PURGE_ROOMS = "purge_rooms";
+/**
+ * Reads for checkRoomFieldsTotal(): every row of the capped rooms table,
+ * public and private, with slack for index pages.
+ */
+const ROOM_FIELDS_TOTAL_READS = 16 + 2 * MAX_ROOM_ROWS;
 /** Most removed rooms awaiting purge; cleanup removes no further room past it. */
 const MAX_PURGE_ROOMS = MAX_THREAD_LIMIT;
 /**
@@ -7415,6 +7430,7 @@ export class Store {
       if (!makePrivate && this.metaNumber(counter) >= this.config.maxThreads) throw new StoreError("denied", "thread_limit");
       const fields = roomFields(undefined);
       this.checkRoomFields(fields);
+      this.checkRoomFieldsTotal(fields);
       logId = this.allocateLogId(context);
       const roomId = (makePrivate ? PRIVATE_ROOM_PREFIX : "") + idString(logId);
       // A registered creator is kept with the fields, outside the client's
@@ -7439,6 +7455,7 @@ export class Store {
       // parent_room_id is fixed at creation; a submitted value is ignored.
       const fields = roomFields(parseJson<{ ext?: unknown }>(existing.fields_json, {}).ext);
       this.checkRoomFields(fields);
+      this.checkRoomFieldsTotal(fields, existing);
       logId = this.allocateLogId(context);
       // A save replaces the client fields; the creator stays.
       const creator = storedCreator(existing.fields_json);
@@ -7530,6 +7547,28 @@ export class Store {
   /** A room's client fields (`title`, `description`, `ext`) fit maxThreadMetadataBytes serialized. */
   private checkRoomFields(fields: Record<string, unknown>): void {
     if (utf8Bytes(JSON.stringify(fields)) > this.config.maxThreadMetadataBytes) throw new StoreError("too_large", "room metadata is too large");
+  }
+
+  /**
+   * Every room's client fields together, with `fields` in place of the
+   * `existing` room's (or added, for a new room), fit
+   * maxRoomMetadataTotalBytes serialized, so a listing of every room stays
+   * bounded. A save that does not grow its room is never refused, so rooms
+   * can still shrink while the total is past a lowered limit. One scan of
+   * the capped rooms table (ROOM_FIELDS_TOTAL_READS), only for a save that
+   * grows its room.
+   */
+  private checkRoomFieldsTotal(fields: Record<string, unknown>, existing?: RawRoomRow): void {
+    const bytes = utf8Bytes(JSON.stringify(fields));
+    if (existing && bytes <= utf8Bytes(JSON.stringify(clientRoomFields(existing.fields_json)))) return;
+    // The stored JSON less the creator, as JSON.stringify writes it: SQLite keeps strings as written.
+    const others = integerColumn(this.rawRows<{ bytes: number }>(
+      "SELECT COALESCE(SUM(length(CAST(json_remove(fields_json, '$.creator_id') AS BLOB))), 0) AS bytes FROM rooms WHERE room_id != ?",
+      existing?.room_id ?? "",
+    )[0]?.bytes);
+    if (others + bytes > this.config.maxRoomMetadataTotalBytes) {
+      throw new StoreError("too_large", `The rooms' titles and descriptions together are at this server's limit (${Math.round(this.config.maxRoomMetadataTotalBytes / 1024)} KiB); shorten this one or another room's`);
+    }
   }
 
   /**
@@ -7683,7 +7722,8 @@ export class Store {
     // private room's counts the private range and the creator's memberships
     // (privateRoomCounts). Any mutation may check a private room's membership.
     const creating = method === "room_set" && input.params.room_id === undefined;
-    const roomScan = !creating ? 0 : input.params.private === true ? PRIVATE_ROOM_COUNT_READS : MAX_THREAD_LIMIT + MAX_CREATED_ROOMS + 2;
+    const roomScan = (!creating ? 0 : input.params.private === true ? PRIVATE_ROOM_COUNT_READS : MAX_THREAD_LIMIT + MAX_CREATED_ROOMS + 2) +
+      (method === "room_set" ? ROOM_FIELDS_TOTAL_READS : 0);
     const mutationCost = {
       ...this.config.mutationCost,
       reads: Math.max(256, this.config.mutationCost.reads ?? 0) + roomScan,

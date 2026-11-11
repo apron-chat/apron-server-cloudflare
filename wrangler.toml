@@ -29,6 +29,11 @@ bucket_name = "apron-media-dev"
 RP_ID = "localhost"
 RP_ORIGINS = "http://localhost:5173,http://localhost:8787"
 ALLOWED_ORIGINS = "http://localhost:5173,http://localhost:8787"
+# Room titles and descriptions (docs/configuration.md, Runtime overrides): a
+# room's serialized client fields, and every room's together, in bytes. The
+# total bounds a listing of every room; a save past it is refused.
+THREAD_METADATA_BYTES = "8192"
+ROOM_METADATA_TOTAL_BYTES = "262144"
 
 # BEGIN GENERATED ADMISSION BUDGET
 # Edit src/budget.ts, then run npm run budget:generate.
