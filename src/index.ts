@@ -1629,6 +1629,14 @@ export async function fetchEntry(request: Request, env: Env, ctx?: ExecutionCont
 }
 
 /**
+ * The types an attachment's write keeps, and so `ext:media` lists: images,
+ * audio, and text where the media origin is never sniffed (`textFiles`).
+ */
+export function attachmentTypes(uploads: Pick<NonNullable<RuntimeConfig["uploads"]>, "textFiles">): readonly string[] {
+	return [...IMAGE_TYPES, ...AUDIO_TYPES, ...(uploads.textFiles ? TEXT_TYPES : [])];
+}
+
+/**
  * `PUT /w/<token>`: a `write_url` (§4.8.3). The token's signature is checked
  * before the body is read, the Durable Object claims the upload so a URL
  * writes once, and the bytes must be a PNG, JPEG, GIF, or WebP image, or for
@@ -1675,7 +1683,7 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 	const emoji = grant.key.startsWith("e/");
 	// Text only where the media origin is never sniffed (`textFiles`).
 	const text = attachment && uploads.textFiles;
-	const kept: readonly string[] = attachment ? [...IMAGE_TYPES, ...AUDIO_TYPES, ...(text ? TEXT_TYPES : [])] : IMAGE_TYPES;
+	const kept: readonly string[] = attachment ? attachmentTypes(uploads) : IMAGE_TYPES;
 	// `e/` holds custom emoji and the server's avatar (`/server avatar`).
 	const refusal = attachment ? `Only PNG, JPEG, GIF, and WebP images${text ? "," : " and"} WebM, Ogg, and MP4 audio${text ? ", and Markdown text" : ""} can be uploaded` : `Only PNG, JPEG, GIF, and WebP images can be ${emoji ? "custom emoji or the server's avatar" : "avatars"}`;
 	const declared = request.headers.get("Content-Type")?.split(";")[0].trim().toLowerCase();
@@ -1703,7 +1711,7 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 	}
 	if (body.byteLength !== length || body.byteLength > grant.maxBytes) return fail(400, "The body does not match its Content-Length");
 	// Declared Markdown is kept only as text, whatever its first bytes look like ("GIF89a is…").
-	const sniffed = declared === "text/markdown" ? sniffText(body) : sniffImage(body) ?? (attachment ? sniffAudio(body) ?? (text ? sniffText(body) : null) : null);
+	const sniffed = text && declared === "text/markdown" ? sniffText(body) : sniffImage(body) ?? (attachment ? sniffAudio(body) ?? (text ? sniffText(body) : null) : null);
 	if (!sniffed) return fail(415, refusal);
 	try {
 		await media.put(grant.key, body, {
@@ -2866,7 +2874,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return {
 			...(uploads.mediaOrigin !== uploads.publicOrigin ? { origins: [uploads.mediaOrigin] } : {}),
 			...(this.uploadsOn() && UPLOAD_POLICY ? {
-				upload: sized([...IMAGE_TYPES, ...AUDIO_TYPES, ...(uploads.textFiles ? TEXT_TYPES : [])], UPLOAD_POLICY.maxFileBytes),
+				upload: sized(attachmentTypes(uploads), UPLOAD_POLICY.maxFileBytes),
 				avatar: sized(IMAGE_TYPES, UPLOAD_POLICY.maxAvatarBytes),
 				emoji: sized(IMAGE_TYPES, UPLOAD_POLICY.maxEmojiBytes),
 			} : {}),

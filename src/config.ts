@@ -610,7 +610,9 @@ function loadUploads(env: EnvLike): UploadConfig | undefined {
 	if (!validOrigin(mediaOrigin)) throw new ConfigError("MEDIA_ORIGIN must be an exact HTTP(S) origin");
 	if (!validOrigin(publicOrigin)) throw new ConfigError("PUBLIC_ORIGIN must be an exact HTTP(S) origin");
 	if (signingKey.length < 32) throw new ConfigError("UPLOAD_SIGNING_KEY must be at least 32 characters");
-	const textFiles = mediaOrigin === publicOrigin || parseSwitch(env.MEDIA_NOSNIFF, "MEDIA_NOSNIFF", false);
+	// Parsed even where it isn't needed, so a malformed value fails the configuration check.
+	const nosniff = parseSwitch(env.MEDIA_NOSNIFF, "MEDIA_NOSNIFF", false);
+	const textFiles = mediaOrigin === publicOrigin || nosniff;
 	return { mediaOrigin, publicOrigin, signingKey, textFiles };
 }
 

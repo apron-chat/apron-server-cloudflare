@@ -5,7 +5,7 @@ import { sniffAudio } from '../src/audio';
 import { sniffImage } from '../src/image';
 import { sniffText } from '../src/text';
 import { loadConfig } from '../src/config';
-import { fetchEntry } from '../src/index';
+import { attachmentTypes, fetchEntry } from '../src/index';
 import { signUploadToken, verifyUploadToken } from '../src/upload-token';
 import { Store, UPLOAD_WRITE_GRACE_MS, type EmojiDraft, type StoreError } from '../src/store';
 import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
@@ -740,6 +740,11 @@ describe('uploads end to end', () => {
 		expect(textFiles({ MEDIA_NOSNIFF: 'false' })).toBe(false);
 		expect(textFiles({ MEDIA_NOSNIFF: undefined, MEDIA_ORIGIN: 'https://demo.test' })).toBe(true);
 		expect(() => textFiles({ MEDIA_NOSNIFF: 'yes' })).toThrow('MEDIA_NOSNIFF must be true or false');
+		// Malformed fails even where the Worker serves its own uploads and doesn't need it.
+		expect(() => textFiles({ MEDIA_NOSNIFF: 'yes', MEDIA_ORIGIN: 'https://demo.test' })).toThrow('MEDIA_NOSNIFF must be true or false');
+		// What writes keep and ext:media lists.
+		expect(attachmentTypes({ textFiles: false })).not.toContain('text/markdown');
+		expect(attachmentTypes({ textFiles: true })).toContain('text/markdown');
 
 		// A media host that may sniff takes no text, declared or not.
 		const peer = await signedIn(unique('writer'));

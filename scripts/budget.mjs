@@ -299,6 +299,11 @@ export function validateDeploymentConfiguration({ development, production, packa
 			throw new Error('Production Wrangler config must set PUBLIC_ORIGIN for upload write URLs');
 		}
 	}
+	// MEDIA_NOSNIFF says the media host's apron_media_nosniff rule is on; a typo would fail every request instead.
+	const nosniff = production.match(/^MEDIA_NOSNIFF\s*=\s*"([^"]*)"\s*(?:#.*)?$/m)?.[1];
+	if (nosniff !== undefined && nosniff !== 'true' && nosniff !== 'false') {
+		throw new Error('Production Wrangler config must set MEDIA_NOSNIFF to "true" or "false"');
+	}
 }
 
 /** The host of a Wrangler config's `MEDIA_ORIGIN` var, if it sets an https one. */

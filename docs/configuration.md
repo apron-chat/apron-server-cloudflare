@@ -307,8 +307,8 @@ What the guard cannot promise:
 
 ## Uploads
 
-With the Workers Paid budgets, registered users attach images, voice clips and
-Markdown files to messages and set avatars (protocol §4.8, cap `embed:upload`; see
+With the Workers Paid budgets, registered users attach images, voice clips and,
+where `MEDIA_NOSNIFF` is set (step 6), Markdown files to messages and set avatars (protocol §4.8, cap `embed:upload`; see
 [SPEC section 4.3](../SPEC.md#43-uploads-and-avatars)). The plan's `uploads`
 in `src/plans/paid.ts` sets the limits:
 

@@ -244,4 +244,7 @@ test('a plan with uploads requires the bucket binding and both origins', () => {
 	assert.throws(() => check(base + vars), /MEDIA bucket/);
 	assert.throws(() => check(base + bucket + '[vars]\nPUBLIC_ORIGIN = "https://server.apron.chat"\n'), /MEDIA_ORIGIN/);
 	assert.throws(() => check(base + bucket + '[vars]\nMEDIA_ORIGIN = "https://media.apron.chat"\n'), /PUBLIC_ORIGIN/);
+	// MEDIA_NOSNIFF, when set, is a switch: a typo would fail every request once deployed.
+	assert.doesNotThrow(() => check(base + vars + 'MEDIA_NOSNIFF = "true"\n' + bucket));
+	assert.throws(() => check(base + vars + 'MEDIA_NOSNIFF = "ture"\n' + bucket), /MEDIA_NOSNIFF/);
 });
