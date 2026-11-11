@@ -1,4 +1,4 @@
-// Uploads are images, and voice clips (./audio.ts): the type comes from the bytes, never from the
+// Uploads are images, voice clips (./audio.ts), and Markdown text (./text.ts): the type comes from the bytes, never from the
 // sender, so the public bucket serves nothing a browser would run as a
 // document. Dimensions go in `og.image` when the header gives them cheaply.
 

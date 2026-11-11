@@ -122,11 +122,11 @@ within it:
   unknown command is `invalid_params`, and one the sender may not run
   `denied`.
 - Uploads (cap `embed:upload`, Workers Paid budgets): registered users attach
-  images and voice clips as `upload` embeds, written to the `write_url` in their result and
+  images, voice clips and Markdown files as `upload` embeds, written to the `write_url` in their result and
   served from the media domain once finished (see
   [SPEC section 4.3](../SPEC.md#43-uploads-and-avatars)). Only PNG, JPEG, GIF,
-  and WebP images and WebM, Ogg, and MP4 audio are kept (avatars are images
-  only), at most 5 MB each (avatars and custom emoji 256 KB), 30 a day per
+  and WebP images, WebM, Ogg, and MP4 audio, and UTF-8 text (kept as Markdown)
+  are kept (avatars are images only), at most 5 MB each (avatars and custom emoji 256 KB), 30 a day per
   user and 500 a day in all, all kinds together. Attachments last a month, as
   their messages do; an avatar lasts while its owner keeps signing in, and
   goes 60 days after their last sign-in at most. Every embed gets an `embed_id`, and saves

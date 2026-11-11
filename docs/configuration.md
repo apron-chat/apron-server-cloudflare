@@ -307,8 +307,8 @@ What the guard cannot promise:
 
 ## Uploads
 
-With the Workers Paid budgets, registered users attach images and voice clips
-to messages and set avatars (protocol §4.8, cap `embed:upload`; see
+With the Workers Paid budgets, registered users attach images, voice clips and
+Markdown files to messages and set avatars (protocol §4.8, cap `embed:upload`; see
 [SPEC section 4.3](../SPEC.md#43-uploads-and-avatars)). The plan's `uploads`
 in `src/plans/paid.ts` sets the limits:
 
@@ -356,8 +356,8 @@ are set; set up all of these first:
    `apron_invalid_request` lets `write_url` requests (`PUT` and `OPTIONS` on
    `/w/`) through, `apron_budget_stop` blocks the media host too, and
    `apron_media_invalid` allows `f/`, `a/` and `e/`.
-7. **CORS.** Clients fetch the custom emoji catalog with `fetch()`, from
-   their own origin, so the bucket needs a CORS policy (bucket Settings, CORS
+7. **CORS.** Clients fetch the custom emoji catalog, and Markdown files to
+   preview them, with `fetch()`, from their own origin, so the bucket needs a CORS policy (bucket Settings, CORS
    Policy) that allows `GET` and `HEAD` from the client origins, `*` for a
    server that admits any origin as this one does:
 
@@ -365,7 +365,7 @@ are set; set up all of these first:
    [{"AllowedOrigins": ["*"], "AllowedMethods": ["GET", "HEAD"], "MaxAgeSeconds": 86400}]
    ```
 
-   Images load without it; only the catalog's `fetch()` needs it. Keep the
+   Images and audio load without it; only `fetch()` needs it. Keep the
    methods to `GET` and `HEAD`: `apron_media_invalid` blocks the rest, a CORS
    preflight included, and a plain `GET` needs none.
 
