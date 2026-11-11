@@ -47,6 +47,9 @@ ZONE_ID = "d7467571c212da5b57bbc92afeb967b7"
 # off until the UPLOAD_SIGNING_KEY secret is set too.
 MEDIA_ORIGIN = "https://media.apron.chat"
 PUBLIC_ORIGIN = "https://server.apron.chat"
+# The media host sends X-Content-Type-Options: nosniff (the apron_media_nosniff
+# edge rule, docs/edge-rules.generated.json), so attachments may be text.
+MEDIA_NOSNIFF = "true"
 # Push (src/webpush.ts): on only with the VAPID_PRIVATE_KEY secret set too.
 # The private key must match this public key.
 VAPID_PUBLIC_KEY = "BF-ztm22-yk6-AvyxkBGWzxaiA_CnO1c9vDAe1-RMg0WJ_EuNgmPhxxTyUq6J0nhaFxNxmcFsAc6KVfWLkdDl0M"

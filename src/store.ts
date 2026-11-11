@@ -6295,7 +6295,8 @@ export class Store {
   /**
    * Finishes a write exactly once (protocol §4.8.3). A file's message gets a
    * new snapshot, with the embed completed (`url`, and `og.image` or, for a
-   * voice clip, `og.audio` describing it) or, for a failed write, without it; an avatar becomes its owner's.
+   * voice clip, `og.audio` describing it; a text file gets neither) or, for a
+   * failed write, without it; an avatar becomes its owner's.
    * A write that is not pending, came too late, or whose embed or message is
    * gone is not accepted, and its object is the caller's to delete.
    */

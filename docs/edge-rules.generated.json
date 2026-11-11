@@ -32,6 +32,26 @@
       }
     ]
   },
+  "headers": {
+    "phase": "http_response_headers_transform",
+    "rules": [
+      {
+        "ref": "apron_media_nosniff",
+        "description": "Apron: the upload bucket's files are never sniffed, so a text upload can't run as a script",
+        "expression": "http.host eq \"media.apron.chat\"",
+        "action": "rewrite",
+        "enabled": true,
+        "action_parameters": {
+          "headers": {
+            "X-Content-Type-Options": {
+              "operation": "set",
+              "value": "nosniff"
+            }
+          }
+        }
+      }
+    ]
+  },
   "config": {
     "phase": "http_config_settings",
     "rules": [

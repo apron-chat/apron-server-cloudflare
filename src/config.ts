@@ -185,6 +185,15 @@ interface UploadConfig {
 	publicOrigin: string;
 	/** Signs `write_url` tokens (upload-token.ts); at least 32 characters. */
 	signingKey: string;
+	/**
+	 * Whether attachments may be text (src/text.ts): only where every stored
+	 * file is served with `X-Content-Type-Options: nosniff`, so that no page
+	 * can load an uploaded text as a script. The Worker serves its own media
+	 * origin so (MEDIA_ORIGIN equal to PUBLIC_ORIGIN); a bucket's own domain
+	 * does only once the `apron_media_nosniff` edge rule is on, which the
+	 * deployment states with `MEDIA_NOSNIFF`.
+	 */
+	textFiles: boolean;
 }
 
 /**
@@ -223,6 +232,7 @@ type EnvLike = {
 	ATTACK_PAUSE?: string;
 	APRON_ADMIN_TOKEN?: string;
 	MEDIA_ORIGIN?: string;
+	MEDIA_NOSNIFF?: string;
 	PUBLIC_ORIGIN?: string;
 	UPLOAD_SIGNING_KEY?: string;
 	MEDIA?: unknown;
@@ -600,7 +610,10 @@ function loadUploads(env: EnvLike): UploadConfig | undefined {
 	if (!validOrigin(mediaOrigin)) throw new ConfigError("MEDIA_ORIGIN must be an exact HTTP(S) origin");
 	if (!validOrigin(publicOrigin)) throw new ConfigError("PUBLIC_ORIGIN must be an exact HTTP(S) origin");
 	if (signingKey.length < 32) throw new ConfigError("UPLOAD_SIGNING_KEY must be at least 32 characters");
-	return { mediaOrigin, publicOrigin, signingKey };
+	// Parsed even where it isn't needed, so a malformed value fails the configuration check.
+	const nosniff = parseSwitch(env.MEDIA_NOSNIFF, "MEDIA_NOSNIFF", false);
+	const textFiles = mediaOrigin === publicOrigin || nosniff;
+	return { mediaOrigin, publicOrigin, signingKey, textFiles };
 }
 
 /**

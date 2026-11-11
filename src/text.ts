@@ -1,10 +1,13 @@
 // Text attachments beside images and voice clips (never as avatars or
 // emoji): Markdown, as a client's "Embed as attachment" sends a long draft.
 // Bytes can't tell Markdown from any other text, so any UTF-8 text without
-// a NUL byte is kept as Markdown. It is served as `text/markdown;
-// charset=utf-8`, a type browsers show or download but never run as a
-// document: they sniff a response only when it has no type, or an unknown
-// one, and the bucket keeps the type it was written with.
+// a NUL byte is kept as Markdown, served as `text/markdown; charset=utf-8`.
+// Opened as a page, browsers show or download that, never run it. But a
+// page can load any URL with `<script src>`, and without
+// `X-Content-Type-Options: nosniff` a browser runs a text that parses as
+// JavaScript (it refuses only image, audio, video and CSV types). So text is
+// kept only where the media origin sends nosniff (`textFiles`,
+// src/config.ts: MEDIA_NOSNIFF and the apron_media_nosniff edge rule).
 
 /** The text types sniffText recognizes, and so the only ones kept. */
 export const TEXT_TYPES = ["text/markdown"] as const;
