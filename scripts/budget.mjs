@@ -89,7 +89,10 @@ ${end}`;
 /**
  * The zone rules for the server's hostname. With `mediaHostname`, the
  * bucket's public domain for uploads, `write_url` requests (`PUT` and its
- * preflight on `/w/`) are allowed and the budget stop blocks both hosts.
+ * preflight on `/w/`) are allowed and the budget stop blocks both hosts,
+ * and a response header rule sends `X-Content-Type-Options: nosniff` with
+ * every file the bucket serves, so that no page can load an uploaded text as
+ * a script (the deployment then sets `MEDIA_NOSNIFF`, src/config.ts).
  * With `liveText`, `write_url` requests are allowed too, and the reads of a
  * live text's `url` (`GET`, `HEAD` and a preflight on `/live/`). With
  * `relatedOrigins`, where the server's hostname is its `RP_ID`, `GET` and
@@ -143,6 +146,18 @@ export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHos
 				},
 			],
 		},
+		...(mediaHostname ? {
+			headers: {
+				phase: 'http_response_headers_transform',
+				rules: [{
+					ref: 'apron_media_nosniff',
+					description: 'Apron: the upload bucket\'s files are never sniffed, so a text upload can\'t run as a script',
+					expression: `http.host eq ${JSON.stringify(mediaHostname)}`,
+					action: 'rewrite', enabled: true,
+					action_parameters: { headers: { 'X-Content-Type-Options': { operation: 'set', value: 'nosniff' } } },
+				}],
+			},
+		} : {}),
 		...(liveText ? {
 			config: {
 				phase: 'http_config_settings',

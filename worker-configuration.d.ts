@@ -17,6 +17,7 @@ declare global {
 		EDGE_STOP_TOKEN?: string;
 		MEDIA?: R2Bucket;
 		MEDIA_ORIGIN?: string;
+		MEDIA_NOSNIFF?: string;
 		PUBLIC_ORIGIN?: string;
 		UPLOAD_SIGNING_KEY?: string;
 		VAPID_PUBLIC_KEY?: string;
@@ -63,6 +64,7 @@ declare global {
 			EDGE_STOP_TOKEN?: string;
 			MEDIA?: R2Bucket;
 			MEDIA_ORIGIN?: string;
+			MEDIA_NOSNIFF?: string;
 			PUBLIC_ORIGIN?: string;
 			UPLOAD_SIGNING_KEY?: string;
 			VAPID_PUBLIC_KEY?: string;

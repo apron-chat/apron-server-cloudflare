@@ -22,8 +22,9 @@ for a zero-overage deployment.
   everyone else is answered as if the room did not exist. A room goes when
   its last member leaves or its history expires; see
   [limits](docs/limits.md#hard-caps) for how many each user may have.
-- **Images, voice clips and avatars.** Signed-in users attach images and
-  voice clips and set avatars (`embed:upload`), stored in R2 within its free
+- **Images, voice clips, Markdown files and avatars.** Signed-in users
+  attach images, voice clips and Markdown files and set avatars
+  (`embed:upload`), stored in R2 within its free
   tier: attachments for a month, as long as their messages, and
   avatars while their owners keep signing in. Admins, mods and friends add custom
   emoji with `/emoji add :name:`, which everyone can react with

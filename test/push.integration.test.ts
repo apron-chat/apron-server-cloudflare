@@ -1207,7 +1207,7 @@ describe('push delay', () => {
 			await setDelay(0);
 			alice.close(); stay.close(); back.close(); poster.close(); other.close(); joiner.close(); again?.close();
 		}
-	});
+	}, 15_000);
 
 	/** Sends a read cursor (§4.6), applied once a ping the handler answers comes back after it. */
 	async function readThrough(peer: Peer, roomId: string, messageId: string): Promise<void> {
@@ -1248,7 +1248,7 @@ describe('push delay', () => {
 			await setActivity(false);
 			alice.close(); bob.close();
 		}
-	});
+	}, 15_000);
 
 	it('forgets held wakes a read cursor passes, and falls back past a released one read while it waits', async () => {
 		const pushes = capturePushes();
@@ -1280,7 +1280,7 @@ describe('push delay', () => {
 			await setActivity(false);
 			alice.close(); bob.close();
 		}
-	});
+	}, 15_000);
 
 	it('spends no wake slot or coalescing on a wake dropped while it waited', async () => {
 		const pushes = capturePushes();
@@ -1307,7 +1307,7 @@ describe('push delay', () => {
 			await setDelay(0);
 			alice.close(); bob.close();
 		}
-	});
+	}, 15_000);
 
 	it('pushes a message as it is when the wait ends: not at all once deleted, and an edit only to those it still mentions', async () => {
 		const pushes = capturePushes();

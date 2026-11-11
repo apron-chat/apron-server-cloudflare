@@ -314,7 +314,7 @@ in `src/plans/paid.ts` sets the limits:
 
 | Setting | Value |
 | --- | ---: |
-| `maxFileBytes` (an attached image or voice clip) | 5 MB |
+| `maxFileBytes` (an attached image, voice clip or Markdown file) | 5 MB |
 | `maxAvatarBytes` | 256 KB |
 | `maxEmojiBytes` (a custom emoji's image, `/emoji add`) | 256 KB |
 | `maxEmoji` (custom emoji in the catalog, kept until removed) | 500 |
@@ -351,11 +351,17 @@ are set; set up all of these first:
    UPLOAD_SIGNING_KEY --config wrangler.production.toml`. Rotating it
    invalidates `write_url`s already issued, nothing else.
 6. **Edge rules.** Update `apron_invalid_request` and `apron_budget_stop`,
-   and create `apron_media_invalid`, from
+   and create `apron_media_invalid` and `apron_media_nosniff`, from
    [the generated definitions](edge-rules.generated.json). With uploads,
    `apron_invalid_request` lets `write_url` requests (`PUT` and `OPTIONS` on
-   `/w/`) through, `apron_budget_stop` blocks the media host too, and
-   `apron_media_invalid` allows `f/`, `a/` and `e/`.
+   `/w/`) through, `apron_budget_stop` blocks the media host too,
+   `apron_media_invalid` allows `f/`, `a/` and `e/`, and
+   `apron_media_nosniff` (a Response Header Transform Rule) sends
+   `X-Content-Type-Options: nosniff` with every file the bucket serves.
+   Once that rule is on, set `MEDIA_NOSNIFF = "true"` in
+   `wrangler.production.toml`: only then are Markdown files kept as
+   attachments, since without `nosniff` any page could load an uploaded text
+   as a script from the media host.
 7. **CORS.** Clients fetch the custom emoji catalog, and Markdown files to
    preview them, with `fetch()`, from their own origin, so the bucket needs a CORS policy (bucket Settings, CORS
    Policy) that allows `GET` and `HEAD` from the client origins, `*` for a
@@ -760,6 +766,7 @@ implementation and recalibrating its resource model.
 | `SERVER_AVATAR` | The `server` frame's `avatar`, the server's square icon: an `https:` URL, or a small `data:image/{png,jpeg,gif,webp};base64,` URL (at most 8 KiB); unset or empty, left out. The public demo sets it in `wrangler.production.toml`, to apron-web's icon. An admin's `/server avatar` overrides it |
 | `APRON_ADMIN_TOKEN` | Optional secret, unset by default: 24 to 256 of `A-Z a-z 0-9 - _`, not starting `apron_bot_`, `apron_invite_`, `apron_join_`, or `apron_device_`. `auth` with `scheme: "token"` and this token signs in as the registered user `admin`, who is always an admin, from any origin and without a passkey ([SPEC section 5, Admins](../SPEC.md#admins)). Anyone holding it can act as the admin, so never put it in a Wrangler var or source: `npx wrangler secret put APRON_ADMIN_TOKEN --config wrangler.production.toml`. Delete the secret (`npx wrangler secret delete …`) to turn it off; the `admin` user never holds a passkey. A malformed value makes every request fail its configuration check. Locally, use `npx wrangler dev --var APRON_ADMIN_TOKEN:…` or `.dev.vars` |
 | `MEDIA_ORIGIN` | Exact https origin where the upload bucket serves objects, such as `https://media.apron.chat`; with `PUBLIC_ORIGIN`, `UPLOAD_SIGNING_KEY` and the `MEDIA` binding, turns uploads on for a plan that has them. Announced as `ext.media.origins` (extension `ext:media`) when it is not `PUBLIC_ORIGIN` |
+| `MEDIA_NOSNIFF` | `true` once the media host sends `X-Content-Type-Options: nosniff` (the `apron_media_nosniff` edge rule): attachments may then be Markdown text, listed as `text/markdown` in `ext.media.upload`. Unset or `false`, text is refused, as nothing would stop a page loading an uploaded text as a script. Not needed where `MEDIA_ORIGIN` is `PUBLIC_ORIGIN`: the Worker serves its uploads with `nosniff` itself |
 | `PUBLIC_ORIGIN` | This Worker's exact public origin, which `write_url`s and live text `url`s point at; with `UPLOAD_SIGNING_KEY`, configures live text |
 | `UPLOAD_SIGNING_KEY` | Secret of at least 32 characters that signs `write_url`s, of uploads and of live text; set with `npx wrangler secret put UPLOAD_SIGNING_KEY --config wrangler.production.toml` |
 | `VAPID_PUBLIC_KEY` | Uncompressed P-256 public key, unpadded base64url (`node scripts/vapid-keys.mjs`); with `VAPID_PRIVATE_KEY` and `VAPID_SUBJECT`, turns push on and is advertised as `server.push.webpush.key` |

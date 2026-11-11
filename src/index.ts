@@ -1632,10 +1632,12 @@ export async function fetchEntry(request: Request, env: Env, ctx?: ExecutionCont
  * `PUT /w/<token>`: a `write_url` (§4.8.3). The token's signature is checked
  * before the body is read, the Durable Object claims the upload so a URL
  * writes once, and the bytes must be a PNG, JPEG, GIF, or WebP image, or for
- * an attachment (not an avatar or custom emoji) WebM, Ogg, or MP4 audio, within the token's
- * size. The object is stored in R2 with the type its bytes
- * show, then the Durable Object finishes the write; one it no longer wants
- * is deleted again.
+ * an attachment (not an avatar or custom emoji) WebM, Ogg, or MP4 audio, or
+ * UTF-8 text where the media origin is never sniffed (`textFiles`), kept as
+ * Markdown, within the token's size. The object is stored in R2 with the
+ * type its bytes show (text declared as Markdown is only ever text), then
+ * the Durable Object finishes the write; one it no longer wants is deleted
+ * again.
  */
 async function handleUploadWrite(request: Request, env: Env, token: string): Promise<Response> {
 	// Any origin may write: the token is the credential, and no cookie is sent.
@@ -1671,9 +1673,11 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 	// keeps (extension `ext:media`); what is kept is typed from its bytes.
 	const attachment = grant.key.startsWith("f/");
 	const emoji = grant.key.startsWith("e/");
-	const kept: readonly string[] = attachment ? [...IMAGE_TYPES, ...AUDIO_TYPES, ...TEXT_TYPES] : IMAGE_TYPES;
+	// Text only where the media origin is never sniffed (`textFiles`).
+	const text = attachment && uploads.textFiles;
+	const kept: readonly string[] = attachment ? [...IMAGE_TYPES, ...AUDIO_TYPES, ...(text ? TEXT_TYPES : [])] : IMAGE_TYPES;
 	// `e/` holds custom emoji and the server's avatar (`/server avatar`).
-	const refusal = attachment ? "Only PNG, JPEG, GIF, and WebP images, WebM, Ogg, and MP4 audio, and Markdown text can be uploaded" : `Only PNG, JPEG, GIF, and WebP images can be ${emoji ? "custom emoji or the server's avatar" : "avatars"}`;
+	const refusal = attachment ? `Only PNG, JPEG, GIF, and WebP images${text ? "," : " and"} WebM, Ogg, and MP4 audio${text ? ", and Markdown text" : ""} can be uploaded` : `Only PNG, JPEG, GIF, and WebP images can be ${emoji ? "custom emoji or the server's avatar" : "avatars"}`;
 	const declared = request.headers.get("Content-Type")?.split(";")[0].trim().toLowerCase();
 	if (declared && !kept.includes(declared)) return answer(415, refusal);
 	const length = Number(request.headers.get("Content-Length") ?? NaN);
@@ -1698,7 +1702,8 @@ async function handleUploadWrite(request: Request, env: Env, token: string): Pro
 		return fail(400, "The upload was interrupted");
 	}
 	if (body.byteLength !== length || body.byteLength > grant.maxBytes) return fail(400, "The body does not match its Content-Length");
-	const sniffed = sniffImage(body) ?? (attachment ? sniffAudio(body) ?? sniffText(body) : null);
+	// Declared Markdown is kept only as text, whatever its first bytes look like ("GIF89a is…").
+	const sniffed = declared === "text/markdown" ? sniffText(body) : sniffImage(body) ?? (attachment ? sniffAudio(body) ?? (text ? sniffText(body) : null) : null);
 	if (!sniffed) return fail(415, refusal);
 	try {
 		await media.put(grant.key, body, {
@@ -2850,8 +2855,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Extension `ext:media` (EXTENSIONS.md): the origin uploads are served
 	 * from, where it is not this server's own, and while uploads are on, the
-	 * types a write keeps (sniffImage and, for attachments, sniffAudio and
-	 * sniffText), each
+	 * types a write keeps (sniffImage and, for attachments, sniffAudio and,
+	 * where the media origin is never sniffed, sniffText), each
 	 * with its largest size, for attachments, avatars, and this server's
 	 * `emoji` (`/emoji add`). No `max_side` is sent: images are kept as
 	 * written, never scaled.
@@ -2861,7 +2866,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return {
 			...(uploads.mediaOrigin !== uploads.publicOrigin ? { origins: [uploads.mediaOrigin] } : {}),
 			...(this.uploadsOn() && UPLOAD_POLICY ? {
-				upload: sized([...IMAGE_TYPES, ...AUDIO_TYPES, ...TEXT_TYPES], UPLOAD_POLICY.maxFileBytes),
+				upload: sized([...IMAGE_TYPES, ...AUDIO_TYPES, ...(uploads.textFiles ? TEXT_TYPES : [])], UPLOAD_POLICY.maxFileBytes),
 				avatar: sized(IMAGE_TYPES, UPLOAD_POLICY.maxAvatarBytes),
 				emoji: sized(IMAGE_TYPES, UPLOAD_POLICY.maxEmojiBytes),
 			} : {}),

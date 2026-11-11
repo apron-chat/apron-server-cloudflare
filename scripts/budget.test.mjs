@@ -191,6 +191,9 @@ test('with uploads, write URLs pass the invalid-request rule and the budget stop
 	assert.match(edge.custom.rules[2].expression, /^\(http\.host eq "media\.example\.test"\) and \(not http\.request\.method in \{"GET" "HEAD"\} or http\.request\.uri\.query ne ""/);
 	assert.equal(edge.custom.rules[2].enabled, true);
 	assert.equal(edge.custom.rules[3].expression, 'http.host in {"chat.example.test" "media.example.test"}');
+	// Every file the bucket serves is never sniffed: an uploaded text can't run as a script.
+	assert.deepEqual(edge.headers, { phase: 'http_response_headers_transform', rules: [{ ref: 'apron_media_nosniff', description: edge.headers.rules[0].description, expression: 'http.host eq "media.example.test"', action: 'rewrite', enabled: true, action_parameters: { headers: { 'X-Content-Type-Options': { operation: 'set', value: 'nosniff' } } } }] });
+	assert.equal(plain.headers, undefined);
 	assert.equal(mediaHostname('MEDIA_ORIGIN = "https://media.example.test"\n'), 'media.example.test');
 	assert.equal(mediaHostname('MEDIA_ORIGIN = "http://media.example.test"\n'), undefined);
 });

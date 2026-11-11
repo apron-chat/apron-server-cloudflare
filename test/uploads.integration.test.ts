@@ -4,6 +4,7 @@ import { DEFAULT_LIMITS, UPLOAD_POLICY } from '../src/budget';
 import { sniffAudio } from '../src/audio';
 import { sniffImage } from '../src/image';
 import { sniffText } from '../src/text';
+import { loadConfig } from '../src/config';
 import { fetchEntry } from '../src/index';
 import { signUploadToken, verifyUploadToken } from '../src/upload-token';
 import { Store, UPLOAD_WRITE_GRACE_MS, type EmojiDraft, type StoreError } from '../src/store';
@@ -721,6 +722,34 @@ describe('uploads end to end', () => {
 
 			const avatar = await request(peer, 'avatar', 'command', { body: { text: '/avatar', embeds: [{ kind: 'upload' }] } });
 			expect((await put(avatar.result.embeds[0].write_url, body)).status).toBe(415);
+
+			// Declared Markdown stays text, even where its first bytes look like an image's.
+			const gif = await request(peer, 'gif', 'message', { body: { embeds: [{ kind: 'upload', title: 'formats.md' }] } });
+			const lookalike = new TextEncoder().encode('GIF89a is the animated one.\n');
+			expect((await SELF.fetch(gif.result.embeds[0].write_url, { method: 'PUT', body: lookalike as Uint8Array<ArrayBuffer>, headers: { 'Content-Length': String(lookalike.byteLength), 'Content-Type': 'text/markdown' } })).status).toBe(204);
+			const kept = (await until(peer, isMessage(gif.result.message_id))).frame.params.body.embeds[0];
+			expect(kept.og).toEqual({ title: 'formats.md' });
+			expect((await media().get(kept.url.slice('https://media.test/'.length)))?.httpMetadata?.contentType).toBe('text/markdown; charset=utf-8');
+		} finally { peer.close(); }
+	});
+
+	it('takes text only where the media origin is never sniffed: MEDIA_NOSNIFF, or the Worker serving its own uploads', async () => {
+		const textFiles = (overrides: Record<string, string | undefined>) => loadConfig({ ...env, ...overrides } as Env).uploads?.textFiles;
+		expect(textFiles({})).toBe(true);
+		expect(textFiles({ MEDIA_NOSNIFF: undefined })).toBe(false);
+		expect(textFiles({ MEDIA_NOSNIFF: 'false' })).toBe(false);
+		expect(textFiles({ MEDIA_NOSNIFF: undefined, MEDIA_ORIGIN: 'https://demo.test' })).toBe(true);
+		expect(() => textFiles({ MEDIA_NOSNIFF: 'yes' })).toThrow('MEDIA_NOSNIFF must be true or false');
+
+		// A media host that may sniff takes no text, declared or not.
+		const peer = await signedIn(unique('writer'));
+		try {
+			const { frame } = await exchange(peer, 'post', 'message', { body: { text: 'notes', embeds: [{ kind: 'upload', title: 'notes.md' }] } });
+			const sniffed = { ...env, MEDIA_NOSNIFF: undefined } as Env;
+			const body = new TextEncoder().encode('# Notes\n');
+			const write = (type?: string) => fetchEntry(new Request(frame.result.embeds[0].write_url, { method: 'PUT', body, headers: { 'Content-Length': String(body.byteLength), ...(type ? { 'Content-Type': type } : {}) } }), sniffed);
+			expect((await write('text/markdown')).status).toBe(415);
+			expect((await write()).status).toBe(415);
 		} finally { peer.close(); }
 	});
 

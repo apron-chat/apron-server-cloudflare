@@ -67,6 +67,12 @@ During an authorized deployment:
    - With uploads, `apron_media_invalid`, enabled, which lets the media
      hostname serve only `GET` and `HEAD` of keys under `/f/`, `/a/` and `/e/`,
      without a query string that would skip the cache.
+   - With uploads, `apron_media_nosniff`, enabled, as a Response Header
+     Transform Rule (phase `http_response_headers_transform`), which sets
+     `X-Content-Type-Options: nosniff` on everything the media hostname
+     serves, so that no page can run an uploaded text as a script.
+     `MEDIA_NOSNIFF` tells the server it is on; text attachments are taken
+     only then.
 
    Place these before any applicable Skip rule.
 4. The optional rate rule `apron_connection_attempts` is **disabled by design**.
