@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
-import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
+import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
 import { LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor, snapshotBill, snapshotReasons } from "./account-usage";
@@ -845,7 +845,9 @@ export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		maxEmbeds: limits.maxEmbeds,
 		maxThreads: limits.threadLimit,
 		maxThreadsPerUser: limits.threadsPerUser,
-		maxThreadMetadataBytes: limits.threadMetadataBytes,
+		roomMetadataLimit: limits.roomMetadataLimit,
+		roomMetadataMinLimit: limits.roomMetadataMinLimit,
+		roomMetadataTotalLimit: limits.roomMetadataTotalLimit,
 		maxPrivateRooms: limits.privateRoomLimit,
 		maxPrivateRoomsPerUser: limits.privateRoomsPerUser,
 		maxPrivateMembershipsPerUser: limits.privateMembershipsPerUser,
@@ -1180,6 +1182,8 @@ const DATABASE_SIZE_METRIC_MS = 60 * 60 * 1_000;
 const STORAGE_ALERT_SHARE = 0.5;
 /** The share under which that alert is armed again, so a size hovering at the line tells once. */
 const STORAGE_REARM_SHARE = 0.4;
+/** The share of roomMetadataTotalLimit under which the room notes alert is armed again (maybeAlertRoomNotes). */
+const ROOM_NOTES_REARM_SHARE = 0.75;
 /** A connection is told of one trigger at most this often (noteTrip). */
 const TRIP_NOTICE_MS = 60 * 60 * 1000;
 
@@ -2154,6 +2158,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private databaseSizeRecordedAt = -Infinity;
 	/** Whether the storage alert stands (Store.storageAlerted), once read. */
 	private storageAlerted?: boolean;
+	/** Whether the room notes alert stands (Store.roomNotesAlerted), once read. */
+	private roomNotesAlerted?: boolean;
 	/** Refusals counted for the `refusal` metric (src/refusals.ts), written at most twice a minute per kind. */
 	private readonly refusals = new RefusalMeter((kind, reason, detail, count) => recordMetric(this.runtimeEnv.METRICS, "refusal", [kind, reason, detail], count));
 	/** Shadow dollars spent by recent traffic, for the attack pause (src/burn.ts); in memory only. */
@@ -4164,10 +4170,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// The server's description follows `general`'s while nothing else
 			// sets it (serverMetadata): read before a save of `general`.
 			const describedBefore = request.params.room_id === ROOM_ID ? this.serverMetadata().description : undefined;
-			const result = this.store.mutate({
-				userId: identity.user_id, tier: identity.tier, ipKey: attachment.ipKey,
-				requestId: request.id, method: "room_set", now: nowMs(), params: request.params, identity,
-			});
+			let result: StoreMutationResult | undefined;
+			try {
+				result = this.store.mutate({
+					userId: identity.user_id, tier: identity.tier, ipKey: attachment.ipKey,
+					requestId: request.id, method: "room_set", now: nowMs(), params: request.params, identity,
+				});
+			} finally {
+				// Refused or not: a refusal for the total is what tells the admins.
+				this.maybeAlertRoomNotes(nowMs(), result !== undefined);
+			}
 			const room = result.room;
 			if (room && !result.deduplicated) {
 				this.noteRoom(room.room_id, true);
@@ -6100,6 +6112,42 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 	}
 
+	/**
+	 * Tells the admins once a `room_set` is refused because long room
+	 * descriptions filled roomMetadataTotalLimit, naming the public rooms
+	 * holding the most past the minimum, from what the save's own check read
+	 * (Store.takeRoomNotesCheck), so it costs no query. Told once, as the
+	 * storage alert is: the flag is kept in `_meta`, written only when it
+	 * flips, and read once an instance; a later committed save whose check
+	 * saw the total under ROOM_NOTES_REARM_SHARE arms it again (`committed`:
+	 * a save rolled back after its check saw a total that never was). Never
+	 * throws.
+	 */
+	private maybeAlertRoomNotes(now: number, committed: boolean): void {
+		try {
+			const check = this.store.takeRoomNotesCheck();
+			if (!check) return;
+			// The store's limits, which the check applied (asStoreConfig sets them from the plan).
+			const limits = this.store.config;
+			const rearmBytes = Math.floor(limits.roomMetadataTotalLimit * ROOM_NOTES_REARM_SHARE);
+			this.roomNotesAlerted ??= this.store.roomNotesAlerted();
+			if (check.full && !this.roomNotesAlerted) {
+				this.roomNotesAlerted = true;
+				try { this.store.setRoomNotesAlerted(true, now); } catch { /* told again after a wake, rather than not at all */ }
+				console.warn(JSON.stringify({ event: "room_notes_alert", bytes: check.total, limit_bytes: limits.roomMetadataTotalLimit }));
+				this.announce({
+					kind: "room_notes", totalBytes: check.total, limitBytes: limits.roomMetadataTotalLimit, ceilingBytes: MAX_ROOM_METADATA_TOTAL_LIMIT,
+					minBytes: limits.roomMetadataMinLimit, rearmBytes, rooms: check.rooms ?? [],
+				});
+			} else if (committed && !check.full && this.roomNotesAlerted && check.total < rearmBytes) {
+				this.store.setRoomNotesAlerted(false, now);
+				this.roomNotesAlerted = false;
+			}
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "room_notes_alert_failed", message: error instanceof Error ? error.message : String(error) }));
+		}
+	}
+
 	/** Counts a billed event toward the burn meter, then weighs it (maybeCheckBurn). */
 	private noteBurn(kind: BurnKind, count = 1, refused = 0): void {
 		const now = nowMs();
@@ -6400,10 +6448,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Keeps a listing within the history response cap: `joined` is never
-	 * truncated, and every room's client fields fit in 2 KiB, so for a
-	 * listing no realistic room reaches, `members`, `member_count`, and
-	 * `users` are left out.
+	 * Keeps a listing near the history response cap: `joined` is never
+	 * truncated, and its rooms' client fields are at most roomMetadataMinLimit
+	 * each plus roomMetadataTotalLimit together, so past the cap `members`,
+	 * `member_count`, and `users` are left out and the rooms are sent whole.
 	 */
 	private boundedListing(result: ListingResult): ListingResult {
 		const limit = this.config.limits.historyMaxResponseBytes;

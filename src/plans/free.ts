@@ -99,7 +99,12 @@ export const FREE_PLAN: Plan = Object.freeze({
 		threadLimit: 100,
 		// So one account cannot take every thread slot: a quarter of them.
 		threadsPerUser: 25,
-		threadMetadataBytes: 2 * 1024,
+		// Room notes: a description long enough for an evergreen document;
+		// every room may hold 1 KiB whatever the total, and what rooms hold
+		// past it is bounded together, so a listing of every room stays bounded.
+		roomMetadataLimit: 8 * 1024,
+		roomMetadataMinLimit: 1024,
+		roomMetadataTotalLimit: 256 * 1024,
 		privateRoomLimit: 100,
 		// Private rooms one account may have started that are still live, and
 		// may be in at once: started by them or by someone who added them.

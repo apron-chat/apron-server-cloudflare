@@ -165,7 +165,10 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   overrun, and when the database passes half its high-water mark (384 MiB
   of 768 on Paid; the size comes from the `db_bytes` reading, taken at most
   hourly from an alarm, and the told-once flag is one `_meta` row; told
-  again only after the size falls under 40%), the server posts a public message in `general` as the `admin`
+  again only after the size falls under 40%), and when long room
+  descriptions fill `roomMetadataTotalLimit` (at the first save it refuses,
+  naming the public rooms holding the most past the minimum; told again only
+  after a later save's check sees the total under 75%), the server posts a public message in `general` as the `admin`
   user that mentions and pushes to every user with the `admin` role (up to
   `wakesPerMessage`, 10); see
   [SPEC section 10](../SPEC.md#10-degradation-and-public-demo-behavior).
@@ -722,6 +725,10 @@ defaults:
   most 30 days; `retiredUserIdSeconds` is at least `retentionSeconds`;
   `idleAccountSeconds` is at least a day and `retentionSeconds`;
   `keptActiveAccounts` is at most `registeredIdentityCount`.
+- `roomMetadataLimit` plus 1 KiB of envelope must fit `maxFrameBytes`;
+  `roomMetadataMinLimit` is at most `roomMetadataLimit`; and
+  `roomMetadataTotalLimit` is at least `roomMetadataLimit` less
+  `roomMetadataMinLimit` and at most 256 KiB.
 - A moved message re-logs every reaction set in one record, so
   `reactionUsersPerMessage` times the per-user bound (emoji at most 64 UTF-8
   bytes each, escaped, plus the user's name) must fit `historyMaxResponseBytes`.
@@ -743,7 +750,8 @@ IP's minute), per-type throttles 60/minute, frame blocks
 minute), `room_list` registered members 200 per room, guest-number blocks
 10,000 numbers, SQL writes 800,000/day, SQL reads 30,000,000/day,
 database high-water 768 MiB and hard target 1 GiB, cleanup 100 records,
-thread rooms 100 with 2 KiB of client fields, private rooms 200 and 50
+thread rooms 100, a room's client fields 16 KiB and every room's past the
+minimum together 256 KiB, private rooms 200 and 50
 memberships per user, reactions 64 users per message
 and 16 emoji per user, and credentials/challenges 16 KiB. The ceilings for
 open sockets, identities, limiter records, processed frames, global posts,
@@ -964,8 +972,24 @@ threads; `privateRoomsPerUser` caps the live private rooms one registered
 user has started, and `privateMembershipsPerUser` (at most 50, and at least
 `privateRoomsPerUser`) the private rooms one user is in, theirs and those
 others added them to, which `ext.settings.private_rooms` advertises.
-`threadMetadataBytes` bounds a room's serialized client fields (`title`,
-`description`, `ext`). A user's `ext` is at most 512 bytes serialized
+`roomMetadataLimit` (8 KiB) bounds a room's serialized client fields
+(`title`, `description`, `ext`), so a description can hold room notes or
+another evergreen document. Every bulk path carries every room's fields:
+the joined `room_list` at every connection, a parent's thread listing, and
+the retention `room_update`. So what rooms hold past `roomMetadataMinLimit`
+(1 KiB) counts against `roomMetadataTotalLimit` (256 KiB), all rooms
+together, private rooms included. A `room_set` that would grow that total
+past it is `too_large`. A room within the minimum, or a save that does not
+grow its room's excess, is always accepted: a full total stops only long
+room notes, never a new or renamed room (a title and a thread's quoted first
+message fit 1 KiB), and rooms can shrink under a lowered limit. A listing
+of every room is then at most the minimum per room plus the total. The
+check is one scan of the capped rooms table, made only by a save that grows
+its excess. The first save it refuses tells the admins (see Admin alert
+under [Budget guard](#budget-guard)), naming the public rooms holding the
+most past the minimum, so they know which to shorten. All three are set in the `[vars]` of `wrangler.toml` and
+`wrangler.production.toml` (`ROOM_METADATA_LIMIT`, `ROOM_METADATA_MIN_LIMIT`,
+`ROOM_METADATA_TOTAL_LIMIT`). A user's `ext` is at most 512 bytes serialized
 (`MAX_USER_EXT_BYTES` in `src/store.ts`, not configurable: every connection
 of the user carries it in its attachment). The `anonymous*` variables
 configure the guest tier (the `guest` auth scheme).
@@ -995,7 +1019,8 @@ The numeric rows are grouped by their unit and enforcement scope:
 - Payload/storage bytes: `maxFrameBytes`, `maxTextBytes`, `maxSnapshotBytes`,
   `maxRequestIdBytes`, `maxNameBytes`, `historyMaxResponseBytes`, `pendingBytesPerConnection`,
   `databaseHighWaterBytes`, `databaseHardTargetBytes`,
-  `databaseResumeLowWaterBytes`, `threadMetadataBytes`, `maxCredentialBytes`,
+  `databaseResumeLowWaterBytes`, `roomMetadataLimit`, `roomMetadataMinLimit`,
+  `roomMetadataTotalLimit`, `maxCredentialBytes`,
   `maxChallengeBytes`.
 - Parser, item, and concurrency counts: `maxJsonDepth`, `maxJsonNodes`,
   `maxNameCodePoints`, `maxEmbeds`,
@@ -1123,7 +1148,9 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `cleanupBatch` | 100 |  |
 | `threadLimit` | 100 |  |
 | `threadsPerUser` | 25 |  |
-| `threadMetadataBytes` | 2048 |  |
+| `roomMetadataLimit` | 8192 |  |
+| `roomMetadataMinLimit` | 1024 |  |
+| `roomMetadataTotalLimit` | 262144 |  |
 | `privateRoomLimit` | 100 |  |
 | `privateRoomsPerUser` | 5 |  |
 | `privateMembershipsPerUser` | 20 |  |

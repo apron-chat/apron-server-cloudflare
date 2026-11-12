@@ -146,6 +146,20 @@ describe('configuration policy boundaries', () => {
 		expect(() => config({ LIVE_TEXT_MAX_SECOND: '2' })).toThrow(ConfigError);
 	});
 
+	it('takes room field sizes from the wrangler vars, within one frame and the calibrated total', () => {
+		expect(config().limits).toMatchObject({ roomMetadataLimit: 8 * 1024, roomMetadataMinLimit: 1024, roomMetadataTotalLimit: 256 * 1024 });
+		expect(config({ ROOM_METADATA_LIMIT: '4096', ROOM_METADATA_MIN_LIMIT: '512', ROOM_METADATA_TOTAL_LIMIT: '65536' }).limits)
+			.toMatchObject({ roomMetadataLimit: 4096, roomMetadataMinLimit: 512, roomMetadataTotalLimit: 65536 });
+		// A room's fields stay within the calibrated 16 KiB and one frame.
+		expect(() => config({ ROOM_METADATA_LIMIT: '16385', ROOM_METADATA_TOTAL_LIMIT: '65536' })).toThrow(/metadata or cleanup/);
+		expect(() => config({ ROOM_METADATA_LIMIT: '16384', MAX_FRAME_BYTES: '16384', MAX_SNAPSHOT_BYTES: '8192', MAX_TEXT_BYTES: '4096' })).toThrow(/fit one frame/);
+		// The minimum is at most a room's limit; the total holds one full room past it, and at most 256 KiB.
+		expect(() => config({ ROOM_METADATA_MIN_LIMIT: '8193' })).toThrow(/roomMetadataMinLimit/);
+		expect(config({ ROOM_METADATA_TOTAL_LIMIT: '7168' }).limits.roomMetadataTotalLimit).toBe(7168);
+		expect(() => config({ ROOM_METADATA_TOTAL_LIMIT: '7167' })).toThrow(/roomMetadataTotalLimit/);
+		expect(() => config({ ROOM_METADATA_TOTAL_LIMIT: String(256 * 1024 + 1) })).toThrow(/roomMetadataTotalLimit/);
+	});
+
 	it('takes an optional APRON_ADMIN_TOKEN that is long, token-safe, and not a bot token', () => {
 		expect(config().adminToken).toBeUndefined();
 		expect(config({ APRON_ADMIN_TOKEN: '' }).adminToken).toBeUndefined();

@@ -180,7 +180,11 @@ export interface StoreConfig {
   /** Live thread rooms one registered user may have created (`creator_id`) at once. */
   maxThreadsPerUser: number;
   /** Serialized client fields of one room record. */
-  maxThreadMetadataBytes: number;
+  roomMetadataLimit: number;
+  /** Serialized client fields every room may hold whatever the total (roomMetadataMinLimit). */
+  roomMetadataMinLimit: number;
+  /** Serialized client fields past roomMetadataMinLimit, of every room together (roomMetadataTotalLimit). */
+  roomMetadataTotalLimit: number;
   /** Private rooms (§4.2.4) that may exist at once, beside the threads. */
   maxPrivateRooms: number;
   /** Live private rooms one registered user may have created (`creator_id`) at once. */
@@ -511,7 +515,9 @@ const DEFAULT_CONFIG: StoreConfig = {
   maxEmbeds: DEFAULT_LIMITS.maxEmbeds,
   maxThreads: DEFAULT_LIMITS.threadLimit,
   maxThreadsPerUser: DEFAULT_LIMITS.threadsPerUser,
-  maxThreadMetadataBytes: DEFAULT_LIMITS.threadMetadataBytes,
+  roomMetadataLimit: DEFAULT_LIMITS.roomMetadataLimit,
+  roomMetadataMinLimit: DEFAULT_LIMITS.roomMetadataMinLimit,
+  roomMetadataTotalLimit: DEFAULT_LIMITS.roomMetadataTotalLimit,
   maxPrivateRooms: DEFAULT_LIMITS.privateRoomLimit,
   maxPrivateRoomsPerUser: DEFAULT_LIMITS.privateRoomsPerUser,
   maxPrivateMembershipsPerUser: DEFAULT_LIMITS.privateMembershipsPerUser,
@@ -653,6 +659,13 @@ interface ReactionsRecord {
   message_id: string;
   room_id: string;
   reactions: Array<{ from: Identity; emojis: string[] }>;
+}
+
+/** A room row's client fields (`title`, `description`, `ext`): its stored fields without the creator. */
+function clientRoomFields(fieldsJson: string): Record<string, unknown> {
+  const { creator_id: _creator, ...fields } = parseJson<Record<string, unknown>>(fieldsJson, {});
+  void _creator;
+  return fields;
 }
 
 /** The `creator_id` kept in a room row's `fields_json`, if any (Store.roomCreator). */
@@ -954,6 +967,11 @@ const META_EFFECTIVE_NOW = "effective_now_ms";
  * see a purged room's rows.
  */
 const META_PURGE_ROOMS = "purge_rooms";
+/**
+ * Reads for checkRoomFieldsTotal(): every row of the capped rooms table,
+ * public and private, with slack for index pages.
+ */
+const ROOM_FIELDS_TOTAL_READS = 16 + 2 * MAX_ROOM_ROWS;
 /** Most removed rooms awaiting purge; cleanup removes no further room past it. */
 const MAX_PURGE_ROOMS = MAX_THREAD_LIMIT;
 /**
@@ -1032,6 +1050,10 @@ const IDLE_PRUNE_RUNS_PER_DAY = 10;
 const META_ATTACK_PAUSE = "attack_pause";
 /** "1" while the admins have been told the database passed half its high-water mark (ApronDemoServer.maybeAlertStorage). */
 const META_STORAGE_ALERTED = "storage_alerted";
+/** "1" while the admins have been told the room notes total is full (ApronDemoServer.maybeAlertRoomNotes). */
+const META_ROOM_NOTES_ALERTED = "room_notes_alerted";
+/** Rooms a full room notes total names to the admins, the largest first. */
+const ROOM_NOTES_NAMED = 3;
 /** Overruns of one operation within BREAKER_WINDOW_MS that open its breaker. */
 export const BREAKER_OVERRUNS = 3;
 export const BREAKER_WINDOW_MS = 60 * 60 * 1000;
@@ -2110,6 +2132,16 @@ function settledMeta(key: string, initial: string): SettledMeta {
   return meta;
 }
 
+/** What a room_set's total check saw (Store.takeRoomNotesCheck). */
+export interface RoomNotesCheck {
+  /** What rooms hold past roomMetadataMinLimit, together: with the save, or on a refusal as they are. */
+  total: number;
+  /** The save was refused: the total was past roomMetadataTotalLimit. */
+  full?: true;
+  /** On a refusal, the public rooms holding the most past the minimum. */
+  rooms?: Array<{ room_id: string; title?: string; bytes: number }>;
+}
+
 export class Store {
   readonly config: StoreConfig;
   readonly sql: SqlStorageLike;
@@ -2117,6 +2149,8 @@ export class Store {
   private readonly durableStorage?: DurableStateLike["storage"];
   private readonly transactionSync?: <T>(closure: () => T) => T;
   private initialized = false;
+  /** What the last room_set's total check saw, until taken (takeRoomNotesCheck). */
+  private roomNotesCheck?: RoomNotesCheck;
   private inTransaction = false;
   private observed = {
     reads: 0,
@@ -3412,6 +3446,38 @@ export class Store {
     this.alert(() => this.reserved({ reads: 4, writes: 4 }, false, now, () => {
       this.writeMeta(META_STORAGE_ALERTED, alerted ? "1" : "0");
     }, true));
+  }
+
+  /**
+   * Whether the admins have been told the room notes total is full
+   * (ApronDemoServer.maybeAlertRoomNotes). Read once as an instance needs
+   * it, uncharged like storageAlerted.
+   */
+  roomNotesAlerted(): boolean {
+    this.ensureReady();
+    return this.metaValue(META_ROOM_NOTES_ALERTED) === "1";
+  }
+
+  /** Records whether that alert stands (roomNotesAlerted): charged, never refused, written only when it flips. */
+  setRoomNotesAlerted(alerted: boolean, now = this.clock.now()): void {
+    this.ensureReady();
+    this.alert(() => this.reserved({ reads: 4, writes: 4 }, false, now, () => {
+      this.writeMeta(META_ROOM_NOTES_ALERTED, alerted ? "1" : "0");
+    }, true));
+  }
+
+  /**
+   * What the last room_set's total check saw (checkRoomFieldsTotal), then
+   * forgotten: the total of what rooms hold past roomMetadataMinLimit, with
+   * this save's room, and on a refusal `full` with the public rooms holding
+   * the most past it. Undefined when that save ran no check (it did not grow
+   * its room past the minimum). Kept outside the transaction, which a
+   * refusal rolls back, so the caller can tell the admins.
+   */
+  takeRoomNotesCheck(): RoomNotesCheck | undefined {
+    const check = this.roomNotesCheck;
+    this.roomNotesCheck = undefined;
+    return check;
   }
 
   /** Records an attack pause (attackPause): charged, never refused. */
@@ -7416,6 +7482,7 @@ export class Store {
       if (!makePrivate && this.metaNumber(counter) >= this.config.maxThreads) throw new StoreError("denied", "thread_limit");
       const fields = roomFields(undefined);
       this.checkRoomFields(fields);
+      this.checkRoomFieldsTotal(fields);
       logId = this.allocateLogId(context);
       const roomId = (makePrivate ? PRIVATE_ROOM_PREFIX : "") + idString(logId);
       // A registered creator is kept with the fields, outside the client's
@@ -7440,6 +7507,7 @@ export class Store {
       // parent_room_id is fixed at creation; a submitted value is ignored.
       const fields = roomFields(parseJson<{ ext?: unknown }>(existing.fields_json, {}).ext);
       this.checkRoomFields(fields);
+      this.checkRoomFieldsTotal(fields, existing);
       logId = this.allocateLogId(context);
       // A save replaces the client fields; the creator stays.
       const creator = storedCreator(existing.fields_json);
@@ -7528,9 +7596,47 @@ export class Store {
   }
 
 
-  /** A room's client fields (`title`, `description`, `ext`) fit maxThreadMetadataBytes serialized. */
+  /** A room's client fields (`title`, `description`, `ext`) fit roomMetadataLimit serialized. */
   private checkRoomFields(fields: Record<string, unknown>): void {
-    if (utf8Bytes(JSON.stringify(fields)) > this.config.maxThreadMetadataBytes) throw new StoreError("too_large", "room metadata is too large");
+    if (utf8Bytes(JSON.stringify(fields)) > this.config.roomMetadataLimit) throw new StoreError("too_large", "room metadata is too large");
+  }
+
+  /**
+   * Every room's client fields past roomMetadataMinLimit, together, with
+   * `fields` in place of the `existing` room's (or added, for a new room),
+   * fit roomMetadataTotalLimit serialized, so a listing of every room stays
+   * bounded. A room within roomMetadataMinLimit, or a save that does not
+   * grow its room's excess, is never refused: a full total stops only long
+   * room notes, and rooms can still shrink while the total is past a
+   * lowered limit. One scan of the capped rooms table
+   * (ROOM_FIELDS_TOTAL_READS), only for a save that grows its excess.
+   */
+  private checkRoomFieldsTotal(fields: Record<string, unknown>, existing?: RawRoomRow): void {
+    const floor = this.config.roomMetadataMinLimit;
+    const excess = (bytes: number) => Math.max(0, bytes - floor);
+    const added = excess(utf8Bytes(JSON.stringify(fields)));
+    const before = existing ? excess(utf8Bytes(JSON.stringify(clientRoomFields(existing.fields_json)))) : 0;
+    if (added === 0 || added <= before) return;
+    // The rooms past the minimum, with what each holds past it: the stored JSON
+    // less the creator, as JSON.stringify writes it (SQLite keeps strings as written).
+    const rows = this.rawRows<{ room_id: string; title: unknown; excess: number }>(
+      `SELECT room_id, json_extract(fields_json, '$.title') AS title, excess FROM (
+         SELECT room_id, fields_json, length(CAST(json_remove(fields_json, '$.creator_id') AS BLOB)) - ? AS excess FROM rooms WHERE room_id != ?
+       ) WHERE excess > 0`,
+      floor, existing?.room_id ?? "",
+    );
+    const others = rows.reduce((sum, row) => sum + integerColumn(row.excess), 0);
+    if (others + added <= this.config.roomMetadataTotalLimit) {
+      this.roomNotesCheck = { total: others + added };
+      return;
+    }
+    // Private rooms are never named: the alert is a post in `general`.
+    const rooms = rows.filter((row) => !isPrivateRoomId(row.room_id))
+      .map((row) => ({ room_id: row.room_id, ...(typeof row.title === "string" ? { title: row.title } : {}), bytes: integerColumn(row.excess) }))
+      .sort((a, b) => b.bytes - a.bytes || a.room_id.localeCompare(b.room_id))
+      .slice(0, ROOM_NOTES_NAMED);
+    this.roomNotesCheck = { total: others + before, full: true, rooms };
+    throw new StoreError("too_large", `Long room descriptions together are at this server's limit; keep this one within ${Math.floor(floor / 1024 * 10) / 10} KiB, or shorten another room's`);
   }
 
   /**
@@ -7684,7 +7790,8 @@ export class Store {
     // private room's counts the private range and the creator's memberships
     // (privateRoomCounts). Any mutation may check a private room's membership.
     const creating = method === "room_set" && input.params.room_id === undefined;
-    const roomScan = !creating ? 0 : input.params.private === true ? PRIVATE_ROOM_COUNT_READS : MAX_THREAD_LIMIT + MAX_CREATED_ROOMS + 2;
+    const roomScan = (!creating ? 0 : input.params.private === true ? PRIVATE_ROOM_COUNT_READS : MAX_THREAD_LIMIT + MAX_CREATED_ROOMS + 2) +
+      (method === "room_set" ? ROOM_FIELDS_TOTAL_READS : 0);
     const mutationCost = {
       ...this.config.mutationCost,
       reads: Math.max(256, this.config.mutationCost.reads ?? 0) + roomScan,

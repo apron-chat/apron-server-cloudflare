@@ -192,7 +192,22 @@ export interface Limits {
 	threadLimit: number;
 	/** Live threads one registered user may have created; removed and expired ones do not count. */
 	threadsPerUser: number;
-	threadMetadataBytes: number;
+	/** One room's serialized client fields (`title`, `description`, `ext`). */
+	roomMetadataLimit: number;
+	/**
+	 * What every room may always hold of roomMetadataLimit, whatever the
+	 * total: enough for a title and a thread's quoted first message. Only
+	 * the bytes past it count against roomMetadataTotalLimit, so a full
+	 * total never stops a room from being created or renamed.
+	 */
+	roomMetadataMinLimit: number;
+	/**
+	 * Every room's serialized client fields past roomMetadataMinLimit,
+	 * together, private rooms included: the long room notes a full
+	 * `room_list` or the retention `room_update` can carry. A save that would
+	 * grow the total past it is refused.
+	 */
+	roomMetadataTotalLimit: number;
 	/** Private rooms (§4.2.4) that may exist at once; they do not count against threadLimit. */
 	privateRoomLimit: number;
 	/** Live private rooms one registered user may have created; removed and expired ones do not count. */
@@ -553,7 +568,13 @@ export const MAX_GLOBAL_POSTS_PER_DAY = DEFAULT_LIMITS.globalPostsPerDay;
 export const MAX_REGISTRATIONS_PER_DAY = DEFAULT_LIMITS.registrationsPerDay;
 export const MAX_CLEANUP_BATCH = 100;
 export const MAX_THREAD_LIMIT = 100;
-export const MAX_THREAD_METADATA_BYTES = 2 * 1024;
+// A room's client fields must fit one frame (validateLimits). What rooms hold
+// past roomMetadataMinLimit is bounded together by at most one history
+// response, so a listing of every room is at most the minimum per room plus
+// that (about 121 KiB + 256 KiB for one connection at the defaults); a
+// listing is never cut to fit (ApronDemoServer.boundedListing).
+export const MAX_ROOM_METADATA_LIMIT = 16 * 1024;
+export const MAX_ROOM_METADATA_TOTAL_LIMIT = MAX_HISTORY_RESPONSE_BYTES;
 // Private rooms share the rooms table with the threads, outside the ranges the
 // public scans read (store.ts, PUBLIC_ROOMS): the ceiling bounds the scans of
 // the private range, and the per-user ceiling the rooms one user can be in.

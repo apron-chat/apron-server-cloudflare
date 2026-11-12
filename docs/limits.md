@@ -265,6 +265,8 @@ Oversized fields get `too_large`; a frame over the limit closes the socket
 | Request `id` | 128 bytes |
 | Name | 80 code points and 320 bytes |
 | Embeds per message | 4 |
+| A room's `title`, `description` and `ext`, serialized | 8,192 bytes |
+| What every room's past 1,024 bytes adds up to, serialized (a save that would grow its room's share past it; a room within 1,024 bytes is always accepted) | 262,144 bytes |
 
 Sizes are UTF-8 bytes, not JavaScript string length.
 
