@@ -7,6 +7,10 @@ describe("trigger notices", () => {
 	it("says what tripped and what lifts it", () => {
 		expect(noticeText({ kind: "edge_stop", exceeded: ["monthly.workerRequests", "flood"] })).toContain("reached: monthly.workerRequests, flood");
 		expect(noticeText({ kind: "edge_stop_lifted" })).toContain("**Budget stop is off.**");
+		// Raising the room notes total is advised only below its ceiling.
+		const notes = { kind: "room_notes", totalBytes: 200_000, minBytes: 1_024, rearmBytes: 150_000, ceilingBytes: 262_144, rooms: [] } as const;
+		expect(noticeText({ ...notes, limitBytes: 204_800 })).toContain("Shorten one with its Edit, or raise `ROOM_METADATA_TOTAL_LIMIT` (at most 256 KiB).");
+		expect(noticeText({ ...notes, limitBytes: 262_144 })).toContain("Shorten one with its Edit. Told again");
 	});
 
 	it("names each tier change, why, and what it means for people", () => {

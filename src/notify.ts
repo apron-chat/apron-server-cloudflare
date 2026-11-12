@@ -17,7 +17,7 @@ export type TriggerNotice =
 	| { kind: "burn"; summary: string; paused?: false }
 	| { kind: "edge_failed"; outcome: string }
 	| { kind: "storage"; bytes: number; highWaterBytes: number; rearmBytes: number }
-	| { kind: "room_notes"; totalBytes: number; limitBytes: number; minBytes: number; rearmBytes: number; rooms: readonly { room_id: string; title?: string; bytes: number }[] };
+	| { kind: "room_notes"; totalBytes: number; limitBytes: number; ceilingBytes: number; minBytes: number; rearmBytes: number; rooms: readonly { room_id: string; title?: string; bytes: number }[] };
 
 /**
  * How far the server refuses work, least to most (docs/configuration.md,
@@ -94,7 +94,9 @@ export function noticeText(notice: TriggerNotice): string {
 			const largest = notice.rooms.length
 				? ` The most past it: ${notice.rooms.map((room) => `${room.title ? `\`${shown(room.title)}\` ` : ""}(\`${room.room_id}\`, ${kib(room.bytes)})`).join(", ")}.`
 				: "";
-			return `**Long room descriptions are full: ${kib(notice.totalBytes)} past ${kib(notice.minBytes)} a room, of the ${kib(notice.limitBytes)} they may hold together.** A room's title and description can no longer grow past ${kib(notice.minBytes)}; rooms within it, new ones included, still save.${largest} Shorten one with its Edit, or raise \`ROOM_METADATA_TOTAL_LIMIT\` (at most 256 KiB). Told again only after it falls under ${kib(notice.rearmBytes)}.`;
+			// Raising the limit is advice only below its calibrated ceiling.
+			const raise = notice.limitBytes < notice.ceilingBytes ? `, or raise \`ROOM_METADATA_TOTAL_LIMIT\` (at most ${kib(notice.ceilingBytes)})` : "";
+			return `**Long room descriptions are full: ${kib(notice.totalBytes)} past ${kib(notice.minBytes)} a room, of the ${kib(notice.limitBytes)} they may hold together.** A room's title and description can no longer grow past ${kib(notice.minBytes)}; rooms within it, new ones included, still save.${largest} Shorten one with its Edit${raise}. Told again only after it falls under ${kib(notice.rearmBytes)}.`;
 		}
 		case "edge_failed":
 			return `**The attack pause could not turn on the edge stop** (${notice.outcome}). The server still refuses everything, but each request still reaches the Worker and is billed: check \`ZONE_ID\`, \`EDGE_STOP_TOKEN\` and the \`apron_budget_stop\` rule.`;

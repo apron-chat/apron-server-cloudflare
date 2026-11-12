@@ -568,8 +568,11 @@ export const MAX_GLOBAL_POSTS_PER_DAY = DEFAULT_LIMITS.globalPostsPerDay;
 export const MAX_REGISTRATIONS_PER_DAY = DEFAULT_LIMITS.registrationsPerDay;
 export const MAX_CLEANUP_BATCH = 100;
 export const MAX_THREAD_LIMIT = 100;
-// A room's client fields must fit one frame (validateLimits); together they
-// are bounded so that a listing of every room fits about one history response.
+// A room's client fields must fit one frame (validateLimits). What rooms hold
+// past roomMetadataMinLimit is bounded together by at most one history
+// response, so a listing of every room is at most the minimum per room plus
+// that (about 121 KiB + 256 KiB for one connection at the defaults); a
+// listing is never cut to fit (ApronDemoServer.boundedListing).
 export const MAX_ROOM_METADATA_LIMIT = 16 * 1024;
 export const MAX_ROOM_METADATA_TOTAL_LIMIT = MAX_HISTORY_RESPONSE_BYTES;
 // Private rooms share the rooms table with the threads, outside the ranges the
