@@ -207,3 +207,60 @@ it('tells the admins once when the database passes half its high-water mark, and
 		expect(told[2]).toContain('Posting that grows it is refused now.');
 	});
 });
+
+it('tells the admins once when long room descriptions fill their total, naming the largest public rooms, and again only after it falls under 75%', async () => {
+	type Noted = Runtime & {
+		maybeAlertRoomNotes(now: number): void;
+		notifyAdmins(text: string): Promise<void>;
+		roomNotesAlerted?: boolean;
+	};
+	const told: string[] = [];
+	await runInDurableObject(env.DEMO.getByName('room-notes-alert'), async (instance) => {
+		const runtime = instance as unknown as Noted;
+		const store = runtime.store;
+		vi.spyOn(runtime, 'notifyAdmins').mockImplementation(async (text) => { told.push(text); });
+		// Small limits, so a few rooms fill the total.
+		Object.assign(store.config, { roomMetadataLimit: 1_000, roomMetadataMinLimit: 200, roomMetadataTotalLimit: 1_800 });
+		const now = Date.now();
+		store.createInvitedIdentity({ userId: 'mia', name: 'mia', now, ipKey: 'ip-test' });
+		let request = 0;
+		// A room_set as handleRoomSet makes it, then the alert check it runs either way; the error code, if any.
+		const save = async (params: Record<string, unknown>): Promise<string> => {
+			let outcome = 'ok';
+			try {
+				const result = store.mutate({ userId: 'mia', ipKey: 'ip-test', requestId: `r${++request}`, method: 'room_set', now: Date.now(), params, identity: { user_id: 'mia', name: 'mia' } });
+				outcome = String(result.result.room_id);
+			} catch (error) {
+				outcome = (error as { code?: string }).code ?? 'error';
+			} finally {
+				runtime.maybeAlertRoomNotes(Date.now());
+			}
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			return outcome;
+		};
+		const text = (length: number) => 'x'.repeat(length);
+		await save({ private: true, title: 'Secret plans', description: text(900) });
+		const big = await save({ parent_room_id: 'general', title: 'Big `notes`', description: text(900) });
+		const mid = await save({ parent_room_id: 'general', title: 'Mid', description: text(400) });
+		expect(told).toEqual([]);
+		// Past the total: refused, and the admins are told once, of the public rooms only.
+		expect(await save({ parent_room_id: 'general', title: 'More', description: text(400) })).toBe('too_large');
+		expect(told).toHaveLength(1);
+		expect(told[0]).toMatch(/^\*\*Long room descriptions are full: 1\.\d KiB past 0\.2 KiB a room, of the 1\.8 KiB they may hold together\.\*\*/);
+		expect(told[0]).toContain(`The most past it: \`Big 'notes'\` (\`${big}\`, 0.7 KiB), \`Mid\` (\`${mid}\`, 0.2 KiB).`);
+		expect(told[0]).not.toContain('Secret');
+		expect(told[0]).toContain('Told again only after it falls under 1.3 KiB.');
+		// A short room still saves; later refusals, and a new instance (the flag is kept in storage), tell nothing more.
+		expect(await save({ parent_room_id: 'general', title: 'Short' })).not.toBe('too_large');
+		expect(await save({ parent_room_id: 'general', title: 'More', description: text(400) })).toBe('too_large');
+		delete runtime.roomNotesAlerted;
+		expect(await save({ room_id: mid, title: 'Mid', description: text(700) })).toBe('too_large');
+		expect(told).toHaveLength(1);
+		// Shrinking checks nothing; the next save that grows a room sees the total under 75%, which arms it again.
+		await save({ room_id: big, title: 'Big', description: text(100) });
+		expect(await save({ room_id: mid, title: 'Mid', description: text(650) })).toBe(mid);
+		expect(store.roomNotesAlerted()).toBe(false);
+		expect(await save({ room_id: big, title: 'Big', description: text(900) })).toBe('too_large');
+		expect(told).toHaveLength(2);
+	});
+});

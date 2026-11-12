@@ -1182,6 +1182,8 @@ const DATABASE_SIZE_METRIC_MS = 60 * 60 * 1_000;
 const STORAGE_ALERT_SHARE = 0.5;
 /** The share under which that alert is armed again, so a size hovering at the line tells once. */
 const STORAGE_REARM_SHARE = 0.4;
+/** The share of roomMetadataTotalLimit under which the room notes alert is armed again (maybeAlertRoomNotes). */
+const ROOM_NOTES_REARM_SHARE = 0.75;
 /** A connection is told of one trigger at most this often (noteTrip). */
 const TRIP_NOTICE_MS = 60 * 60 * 1000;
 
@@ -2143,6 +2145,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private databaseSizeRecordedAt = -Infinity;
 	/** Whether the storage alert stands (Store.storageAlerted), once read. */
 	private storageAlerted?: boolean;
+	/** Whether the room notes alert stands (Store.roomNotesAlerted), once read. */
+	private roomNotesAlerted?: boolean;
 	/** Refusals counted for the `refusal` metric (src/refusals.ts), written at most twice a minute per kind. */
 	private readonly refusals = new RefusalMeter((kind, reason, detail, count) => recordMetric(this.runtimeEnv.METRICS, "refusal", [kind, reason, detail], count));
 	/** Shadow dollars spent by recent traffic, for the attack pause (src/burn.ts); in memory only. */
@@ -4153,10 +4157,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// The server's description follows `general`'s while nothing else
 			// sets it (serverMetadata): read before a save of `general`.
 			const describedBefore = request.params.room_id === ROOM_ID ? this.serverMetadata().description : undefined;
-			const result = this.store.mutate({
-				userId: identity.user_id, tier: identity.tier, ipKey: attachment.ipKey,
-				requestId: request.id, method: "room_set", now: nowMs(), params: request.params, identity,
-			});
+			let result: StoreMutationResult;
+			try {
+				result = this.store.mutate({
+					userId: identity.user_id, tier: identity.tier, ipKey: attachment.ipKey,
+					requestId: request.id, method: "room_set", now: nowMs(), params: request.params, identity,
+				});
+			} finally {
+				this.maybeAlertRoomNotes(nowMs());
+			}
 			const room = result.room;
 			if (room && !result.deduplicated) {
 				this.noteRoom(room.room_id, true);
@@ -6086,6 +6095,40 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "storage_alert_failed", message: error instanceof Error ? error.message : String(error) }));
+		}
+	}
+
+	/**
+	 * Tells the admins once a `room_set` is refused because long room
+	 * descriptions filled roomMetadataTotalLimit, naming the public rooms
+	 * holding the most past the minimum, from what the save's own check read
+	 * (Store.takeRoomNotesCheck), so it costs no query. Told once, as the
+	 * storage alert is: the flag is kept in `_meta`, written only when it
+	 * flips, and read once an instance; a later check that sees the total
+	 * under ROOM_NOTES_REARM_SHARE arms it again. Never throws.
+	 */
+	private maybeAlertRoomNotes(now: number): void {
+		try {
+			const check = this.store.takeRoomNotesCheck();
+			if (!check) return;
+			// The store's limits, which the check applied (asStoreConfig sets them from the plan).
+			const limits = this.store.config;
+			const rearmBytes = Math.floor(limits.roomMetadataTotalLimit * ROOM_NOTES_REARM_SHARE);
+			this.roomNotesAlerted ??= this.store.roomNotesAlerted();
+			if (check.full && !this.roomNotesAlerted) {
+				this.roomNotesAlerted = true;
+				try { this.store.setRoomNotesAlerted(true, now); } catch { /* told again after a wake, rather than not at all */ }
+				console.warn(JSON.stringify({ event: "room_notes_alert", bytes: check.total, limit_bytes: limits.roomMetadataTotalLimit }));
+				this.announce({
+					kind: "room_notes", totalBytes: check.total, limitBytes: limits.roomMetadataTotalLimit,
+					minBytes: limits.roomMetadataMinLimit, rearmBytes, rooms: check.rooms ?? [],
+				});
+			} else if (!check.full && this.roomNotesAlerted && check.total < rearmBytes) {
+				this.store.setRoomNotesAlerted(false, now);
+				this.roomNotesAlerted = false;
+			}
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "room_notes_alert_failed", message: error instanceof Error ? error.message : String(error) }));
 		}
 	}
 

@@ -165,7 +165,10 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   overrun, and when the database passes half its high-water mark (384 MiB
   of 768 on Paid; the size comes from the `db_bytes` reading, taken at most
   hourly from an alarm, and the told-once flag is one `_meta` row; told
-  again only after the size falls under 40%), the server posts a public message in `general` as the `admin`
+  again only after the size falls under 40%), and when long room
+  descriptions fill `roomMetadataTotalLimit` (at the first save it refuses,
+  naming the public rooms holding the most past the minimum; told again only
+  after a later save's check sees the total under 75%), the server posts a public message in `general` as the `admin`
   user that mentions and pushes to every user with the `admin` role (up to
   `wakesPerMessage`, 10); see
   [SPEC section 10](../SPEC.md#10-degradation-and-public-demo-behavior).
@@ -975,7 +978,9 @@ room notes, never a new or renamed room (a title and a thread's quoted first
 message fit 1 KiB), and rooms can shrink under a lowered limit. A listing
 of every room is then at most the minimum per room plus the total. The
 check is one scan of the capped rooms table, made only by a save that grows
-its excess. All three are set in the `[vars]` of `wrangler.toml` and
+its excess. The first save it refuses tells the admins (see Admin alert
+under [Budget guard](#budget-guard)), naming the public rooms holding the
+most past the minimum, so they know which to shorten. All three are set in the `[vars]` of `wrangler.toml` and
 `wrangler.production.toml` (`ROOM_METADATA_LIMIT`, `ROOM_METADATA_MIN_LIMIT`,
 `ROOM_METADATA_TOTAL_LIMIT`). A user's `ext` is at most 512 bytes serialized
 (`MAX_USER_EXT_BYTES` in `src/store.ts`, not configurable: every connection

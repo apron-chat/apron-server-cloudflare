@@ -1050,6 +1050,10 @@ const IDLE_PRUNE_RUNS_PER_DAY = 10;
 const META_ATTACK_PAUSE = "attack_pause";
 /** "1" while the admins have been told the database passed half its high-water mark (ApronDemoServer.maybeAlertStorage). */
 const META_STORAGE_ALERTED = "storage_alerted";
+/** "1" while the admins have been told the room notes total is full (ApronDemoServer.maybeAlertRoomNotes). */
+const META_ROOM_NOTES_ALERTED = "room_notes_alerted";
+/** Rooms a full room notes total names to the admins, the largest first. */
+const ROOM_NOTES_NAMED = 3;
 /** Overruns of one operation within BREAKER_WINDOW_MS that open its breaker. */
 export const BREAKER_OVERRUNS = 3;
 export const BREAKER_WINDOW_MS = 60 * 60 * 1000;
@@ -2128,6 +2132,16 @@ function settledMeta(key: string, initial: string): SettledMeta {
   return meta;
 }
 
+/** What a room_set's total check saw (Store.takeRoomNotesCheck). */
+export interface RoomNotesCheck {
+  /** What rooms hold past roomMetadataMinLimit, together: with the save, or on a refusal as they are. */
+  total: number;
+  /** The save was refused: the total was past roomMetadataTotalLimit. */
+  full?: true;
+  /** On a refusal, the public rooms holding the most past the minimum. */
+  rooms?: Array<{ room_id: string; title?: string; bytes: number }>;
+}
+
 export class Store {
   readonly config: StoreConfig;
   readonly sql: SqlStorageLike;
@@ -2135,6 +2149,8 @@ export class Store {
   private readonly durableStorage?: DurableStateLike["storage"];
   private readonly transactionSync?: <T>(closure: () => T) => T;
   private initialized = false;
+  /** What the last room_set's total check saw, until taken (takeRoomNotesCheck). */
+  private roomNotesCheck?: RoomNotesCheck;
   private inTransaction = false;
   private observed = {
     reads: 0,
@@ -3430,6 +3446,38 @@ export class Store {
     this.alert(() => this.reserved({ reads: 4, writes: 4 }, false, now, () => {
       this.writeMeta(META_STORAGE_ALERTED, alerted ? "1" : "0");
     }, true));
+  }
+
+  /**
+   * Whether the admins have been told the room notes total is full
+   * (ApronDemoServer.maybeAlertRoomNotes). Read once as an instance needs
+   * it, uncharged like storageAlerted.
+   */
+  roomNotesAlerted(): boolean {
+    this.ensureReady();
+    return this.metaValue(META_ROOM_NOTES_ALERTED) === "1";
+  }
+
+  /** Records whether that alert stands (roomNotesAlerted): charged, never refused, written only when it flips. */
+  setRoomNotesAlerted(alerted: boolean, now = this.clock.now()): void {
+    this.ensureReady();
+    this.alert(() => this.reserved({ reads: 4, writes: 4 }, false, now, () => {
+      this.writeMeta(META_ROOM_NOTES_ALERTED, alerted ? "1" : "0");
+    }, true));
+  }
+
+  /**
+   * What the last room_set's total check saw (checkRoomFieldsTotal), then
+   * forgotten: the total of what rooms hold past roomMetadataMinLimit, with
+   * this save's room, and on a refusal `full` with the public rooms holding
+   * the most past it. Undefined when that save ran no check (it did not grow
+   * its room past the minimum). Kept outside the transaction, which a
+   * refusal rolls back, so the caller can tell the admins.
+   */
+  takeRoomNotesCheck(): RoomNotesCheck | undefined {
+    const check = this.roomNotesCheck;
+    this.roomNotesCheck = undefined;
+    return check;
   }
 
   /** Records an attack pause (attackPause): charged, never refused. */
@@ -7566,15 +7614,28 @@ export class Store {
     const floor = this.config.roomMetadataMinLimit;
     const excess = (bytes: number) => Math.max(0, bytes - floor);
     const added = excess(utf8Bytes(JSON.stringify(fields)));
-    if (added === 0 || (existing && added <= excess(utf8Bytes(JSON.stringify(clientRoomFields(existing.fields_json)))))) return;
-    // The stored JSON less the creator, as JSON.stringify writes it: SQLite keeps strings as written.
-    const others = integerColumn(this.rawRows<{ bytes: number }>(
-      "SELECT COALESCE(SUM(max(0, length(CAST(json_remove(fields_json, '$.creator_id') AS BLOB)) - ?)), 0) AS bytes FROM rooms WHERE room_id != ?",
+    const before = existing ? excess(utf8Bytes(JSON.stringify(clientRoomFields(existing.fields_json)))) : 0;
+    if (added === 0 || added <= before) return;
+    // The rooms past the minimum, with what each holds past it: the stored JSON
+    // less the creator, as JSON.stringify writes it (SQLite keeps strings as written).
+    const rows = this.rawRows<{ room_id: string; title: unknown; excess: number }>(
+      `SELECT room_id, json_extract(fields_json, '$.title') AS title, excess FROM (
+         SELECT room_id, fields_json, length(CAST(json_remove(fields_json, '$.creator_id') AS BLOB)) - ? AS excess FROM rooms WHERE room_id != ?
+       ) WHERE excess > 0`,
       floor, existing?.room_id ?? "",
-    )[0]?.bytes);
-    if (others + added > this.config.roomMetadataTotalLimit) {
-      throw new StoreError("too_large", `Long room descriptions together are at this server's limit; keep this one within ${Math.floor(floor / 1024 * 10) / 10} KiB, or shorten another room's`);
+    );
+    const others = rows.reduce((sum, row) => sum + integerColumn(row.excess), 0);
+    if (others + added <= this.config.roomMetadataTotalLimit) {
+      this.roomNotesCheck = { total: others + added };
+      return;
     }
+    // Private rooms are never named: the alert is a post in `general`.
+    const rooms = rows.filter((row) => !isPrivateRoomId(row.room_id))
+      .map((row) => ({ room_id: row.room_id, ...(typeof row.title === "string" ? { title: row.title } : {}), bytes: integerColumn(row.excess) }))
+      .sort((a, b) => b.bytes - a.bytes || a.room_id.localeCompare(b.room_id))
+      .slice(0, ROOM_NOTES_NAMED);
+    this.roomNotesCheck = { total: others + before, full: true, rooms };
+    throw new StoreError("too_large", `Long room descriptions together are at this server's limit; keep this one within ${Math.floor(floor / 1024 * 10) / 10} KiB, or shorten another room's`);
   }
 
   /**

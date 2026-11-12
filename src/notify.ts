@@ -4,7 +4,8 @@
  * degraded, exhausted, account stop), an operation's breaker opening
  * or closing, the day's first storage overrun, and the edge stop turning on
  * (by the budget guard, or by the flood trip, `exceeded: ["flood"]`) or off,
- * and the database passing half its high-water mark (`storage`).
+ * the database passing half its high-water mark (`storage`), and long room
+ * descriptions filling their total (`room_notes`).
  * New kinds of notice, and new ways to tell one, join here.
  */
 export type TriggerNotice =
@@ -15,7 +16,8 @@ export type TriggerNotice =
 	| { kind: "overrun"; operation: string; message: string; users: readonly string[]; essential?: boolean }
 	| { kind: "burn"; summary: string; paused?: false }
 	| { kind: "edge_failed"; outcome: string }
-	| { kind: "storage"; bytes: number; highWaterBytes: number; rearmBytes: number };
+	| { kind: "storage"; bytes: number; highWaterBytes: number; rearmBytes: number }
+	| { kind: "room_notes"; totalBytes: number; limitBytes: number; minBytes: number; rearmBytes: number; rooms: readonly { room_id: string; title?: string; bytes: number }[] };
 
 /**
  * How far the server refuses work, least to most (docs/configuration.md,
@@ -81,6 +83,18 @@ export function noticeText(notice: TriggerNotice): string {
 			const percent = Math.round((notice.bytes / notice.highWaterBytes) * 100);
 			const now = notice.bytes >= notice.highWaterBytes ? "Posting that grows it is refused now." : "Nothing is refused yet.";
 			return `**The database is at ${mib(notice.bytes)}, ${percent}% of the ${mib(notice.highWaterBytes)} where posting stops.** ${now} It holds the retained history, so it shrinks only as records expire; \`/purge\` frees a flooder's at once, and \`npm run usage:report\` shows the trend. Measured hourly; told again only after it falls under ${mib(notice.rearmBytes)}.`;
+		}
+		case "room_notes": {
+			const kib = (bytes: number) => `${Math.round((bytes / 1024) * 10) / 10} KiB`;
+			// A title is anyone's text: shown as code, on one line, shortened.
+			const shown = (title: string) => {
+				const line = [...title.replace(/`/g, "'").replace(/[\r\n]+/g, " ").trim()];
+				return line.length > 60 ? `${line.slice(0, 59).join("")}…` : line.join("");
+			};
+			const largest = notice.rooms.length
+				? ` The most past it: ${notice.rooms.map((room) => `${room.title ? `\`${shown(room.title)}\` ` : ""}(\`${room.room_id}\`, ${kib(room.bytes)})`).join(", ")}.`
+				: "";
+			return `**Long room descriptions are full: ${kib(notice.totalBytes)} past ${kib(notice.minBytes)} a room, of the ${kib(notice.limitBytes)} they may hold together.** A room's title and description can no longer grow past ${kib(notice.minBytes)}; rooms within it, new ones included, still save.${largest} Shorten one with its Edit, or raise \`ROOM_METADATA_TOTAL_LIMIT\` (at most 256 KiB). Told again only after it falls under ${kib(notice.rearmBytes)}.`;
 		}
 		case "edge_failed":
 			return `**The attack pause could not turn on the edge stop** (${notice.outcome}). The server still refuses everything, but each request still reaches the Worker and is billed: check \`ZONE_ID\`, \`EDGE_STOP_TOKEN\` and the \`apron_budget_stop\` rule.`;
