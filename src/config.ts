@@ -408,13 +408,15 @@ function validateLimits(limits: Limits): void {
 	if (!Number.isSafeInteger(limits.sessionTtlSeconds) || limits.sessionTtlSeconds <= 0 || limits.sessionTtlSeconds > 30 * 24 * 60 * 60) {
 		fail("session lifetime must be between one second and thirty days");
 	}
-	if (limits.cleanupBatch > budget.MAX_CLEANUP_BATCH || limits.threadLimit > budget.MAX_THREAD_LIMIT || limits.threadMetadataBytes > budget.MAX_THREAD_METADATA_BYTES) {
+	if (limits.cleanupBatch > budget.MAX_CLEANUP_BATCH || limits.threadLimit > budget.MAX_THREAD_LIMIT || limits.roomMetadataLimit > budget.MAX_ROOM_METADATA_LIMIT) {
 		fail("metadata or cleanup exceeds calibrated bounds");
 	}
 	// A room_set carries the fields in one frame, with its envelope.
-	if (limits.threadMetadataBytes + 1024 > limits.maxFrameBytes) fail("threadMetadataBytes must fit one frame");
-	if (limits.roomMetadataTotalBytes > budget.MAX_ROOM_METADATA_TOTAL_BYTES || limits.roomMetadataTotalBytes < limits.threadMetadataBytes) {
-		fail("roomMetadataTotalBytes must be between threadMetadataBytes and the calibrated ceiling");
+	if (limits.roomMetadataLimit + 1024 > limits.maxFrameBytes) fail("roomMetadataLimit must fit one frame");
+	if (limits.roomMetadataMinLimit > limits.roomMetadataLimit) fail("roomMetadataMinLimit cannot exceed roomMetadataLimit");
+	// One room filled to its limit fits the total.
+	if (limits.roomMetadataTotalLimit > budget.MAX_ROOM_METADATA_TOTAL_LIMIT || limits.roomMetadataTotalLimit < limits.roomMetadataLimit - limits.roomMetadataMinLimit) {
+		fail("roomMetadataTotalLimit must be between roomMetadataLimit less roomMetadataMinLimit and the calibrated ceiling");
 	}
 	if (!Number.isSafeInteger(limits.threadsPerUser) || limits.threadsPerUser < 1 || limits.threadsPerUser > limits.threadLimit) {
 		fail("threadsPerUser must be between 1 and threadLimit");

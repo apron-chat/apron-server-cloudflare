@@ -845,8 +845,9 @@ export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		maxEmbeds: limits.maxEmbeds,
 		maxThreads: limits.threadLimit,
 		maxThreadsPerUser: limits.threadsPerUser,
-		maxThreadMetadataBytes: limits.threadMetadataBytes,
-		maxRoomMetadataTotalBytes: limits.roomMetadataTotalBytes,
+		roomMetadataLimit: limits.roomMetadataLimit,
+		roomMetadataMinLimit: limits.roomMetadataMinLimit,
+		roomMetadataTotalLimit: limits.roomMetadataTotalLimit,
 		maxPrivateRooms: limits.privateRoomLimit,
 		maxPrivateRoomsPerUser: limits.privateRoomsPerUser,
 		maxPrivateMembershipsPerUser: limits.privateMembershipsPerUser,
@@ -6389,8 +6390,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * Keeps a listing within the history response cap: `joined` is never
-	 * truncated, and every room's client fields together fit
-	 * roomMetadataTotalBytes, so for a listing no realistic room reaches,
+	 * truncated, and every room's client fields fit roomMetadataMinLimit
+	 * but for roomMetadataTotalLimit together, so for a listing no realistic room reaches,
 	 * `members`, `member_count`, and `users` are left out.
 	 */
 	private boundedListing(result: ListingResult): ListingResult {

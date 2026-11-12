@@ -298,7 +298,7 @@ it("merges ext one level deep on message saves and room_set (§4.12)", async () 
 		expect(saved.room?.ext).toEqual({ demo: { color: "blue" }, more: true });
 		const keptRoom = store.mutate(op(clock, "alice", "r3", "room_set", { room_id: roomId, title: "T" }));
 		expect(keptRoom.room?.ext).toEqual({ demo: { color: "blue" }, more: true });
-		const big = "y".repeat(Math.ceil(DEFAULT_LIMITS.threadMetadataBytes * 0.6));
+		const big = "y".repeat(Math.ceil(DEFAULT_LIMITS.roomMetadataLimit * 0.6));
 		store.mutate(op(clock, "alice", "r4", "room_set", { room_id: roomId, title: "T", ext: { big } }));
 		expect(errorCode(() => store.mutate(op(clock, "alice", "r5", "room_set", { room_id: roomId, title: "T", ext: { bigger: big } })))).toBe("too_large");
 		const emptied = store.mutate(op(clock, "alice", "r6", "room_set", { room_id: roomId, title: "T", ext: { demo: {}, more: "", big: "" } }));
@@ -353,7 +353,7 @@ it("creates only thread rooms and replaces their client fields on save", async (
 		expect(errorCode(() => store.mutate(op(clock, "alice", "orphan", "room_set", { parent_room_id: "missing", title: "x" })))).toBe("invalid_params");
 		expect(errorCode(() => store.mutate(op(clock, "alice", "bad-title", "room_set", { parent_room_id: "general", title: 7 })))).toBe("invalid_params");
 		expect(errorCode(() => store.mutate(op(clock, "alice", "bad-description", "room_set", { parent_room_id: "general", description: { text: "x" } })))).toBe("invalid_params");
-		expect(errorCode(() => store.mutate(op(clock, "alice", "long-description", "room_set", { parent_room_id: "general", description: "x".repeat(DEFAULT_LIMITS.threadMetadataBytes) })))).toBe("too_large");
+		expect(errorCode(() => store.mutate(op(clock, "alice", "long-description", "room_set", { parent_room_id: "general", description: "x".repeat(DEFAULT_LIMITS.roomMetadataLimit) })))).toBe("too_large");
 		// A private room is never a thread, and only a registered user starts one (§4.2.4).
 		expect(errorCode(() => store.mutate(op(clock, "alice", "private", "room_set", { parent_room_id: "general", private: true })))).toBe("denied");
 		expect(errorCode(() => store.mutate(op(clock, "alice", "bad-private", "room_set", { parent_room_id: "general", private: "yes" })))).toBe("invalid_params");
@@ -687,34 +687,42 @@ it("deduplicates canonical retries before quotas, survives restart, and expires 
 	}, DEDUP_CONFIG);
 });
 
-it("bounds every room's client fields together, refusing only a save that grows its room past the total", async () => {
+it("bounds every room's client fields past the minimum together, refusing only a save that grows its room's excess past the total", async () => {
 	const per = 1_000;
+	const floor = 200;
 	await withStore("room-fields-total", (store, clock, state) => {
 		const bytes = (fields: Record<string, unknown>) => new TextEncoder().encode(JSON.stringify(fields)).length;
+		const excess = (fields: Record<string, unknown>) => Math.max(0, bytes(fields) - floor);
 		const { title, description, ext } = store.getRoomState() as unknown as Record<string, unknown>;
-		const general = bytes({ ...(title !== undefined ? { title } : {}), ...(description !== undefined ? { description } : {}), ...(ext !== undefined ? { ext } : {}) });
+		const general = excess({ ...(title !== undefined ? { title } : {}), ...(description !== undefined ? { description } : {}), ...(ext !== undefined ? { ext } : {}) });
 		// Quotes, a newline and a non-ASCII letter are counted as JSON.stringify writes them, and a creator not at all.
 		store.createInvitedIdentity({ userId: "mia", name: "mia", now: clock.value, ipKey: "ip-test" });
 		const note = (length: number) => `"é"\n${"x".repeat(length - 6)}`;
 		const fields = (length: number) => ({ title: "Notes", description: note(length) });
 		const first = String(store.mutate(op(clock, "mia", "first", "room_set", { parent_room_id: "general", ...fields(900) })).result.room_id);
-		const used = general + bytes(fields(900));
-		const limited = new Store(state, { ...ROOMY, maxThreadMetadataBytes: per, maxRoomMetadataTotalBytes: used + bytes(fields(800)) }, clock.clock);
+		const config = (total: number) => ({ ...ROOMY, roomMetadataLimit: per, roomMetadataMinLimit: floor, roomMetadataTotalLimit: total });
+		const limited = new Store(state, config(general + excess(fields(900)) + excess(fields(800))), clock.clock);
 		limited.initialize();
 		expect(errorCode(() => limited.mutate(op(clock, "alice", "over", "room_set", { parent_room_id: "general", ...fields(801) })))).toBe("too_large");
 		const second = String(limited.mutate(op(clock, "alice", "exact", "room_set", { parent_room_id: "general", ...fields(800) })).result.room_id);
-		// At the total: growing either room is refused, a save of the same size or smaller is not.
+		// At the total: rooms within the minimum are still created, and kept at or under it.
+		expect(bytes(fields(100))).toBeLessThanOrEqual(floor);
+		const short = String(limited.mutate(op(clock, "alice", "short", "room_set", { parent_room_id: "general", ...fields(100) })).result.room_id);
+		expect(limited.mutate(op(clock, "alice", "short-grow", "room_set", { room_id: short, ...fields(floor - 40) })).room?.description).toBe(note(floor - 40));
+		expect(errorCode(() => limited.mutate(op(clock, "alice", "short-past", "room_set", { room_id: short, ...fields(floor) })))).toBe("too_large");
+		// Growing a long room is refused; a save of the same size or smaller is not.
 		expect(errorCode(() => limited.mutate(op(clock, "mia", "grow", "room_set", { room_id: first, ...fields(901) })))).toBe("too_large");
 		expect(limited.mutate(op(clock, "mia", "same", "room_set", { room_id: first, title: "Notez", description: note(900) })).room?.title).toBe("Notez");
 		limited.mutate(op(clock, "mia", "shrink", "room_set", { room_id: first, ...fields(500) }));
 		expect(limited.mutate(op(clock, "alice", "grow-into", "room_set", { room_id: second, ...fields(950) })).room?.description).toBe(note(950));
 
-		// Under a lowered total, rooms past it still shrink, or save at their size.
-		const lowered = new Store(state, { ...ROOMY, maxThreadMetadataBytes: per, maxRoomMetadataTotalBytes: per }, clock.clock);
+		// Under a lowered total, rooms past it still shrink, or save at their size, and short rooms are still made.
+		const lowered = new Store(state, config(1), clock.clock);
 		lowered.initialize();
 		expect(errorCode(() => lowered.mutate(op(clock, "alice", "grow-low", "room_set", { room_id: second, ...fields(951) })))).toBe("too_large");
-		expect(lowered.mutate(op(clock, "alice", "shrink-low", "room_set", { room_id: second, ...fields(100) })).room?.description).toBe(note(100));
+		expect(lowered.mutate(op(clock, "alice", "shrink-low", "room_set", { room_id: second, ...fields(400) })).room?.description).toBe(note(400));
 		expect(errorCode(() => lowered.mutate(op(clock, "alice", "new-low", "room_set", { parent_room_id: "general", ...fields(400) })))).toBe("too_large");
+		expect(lowered.mutate(op(clock, "alice", "short-low", "room_set", { parent_room_id: "general", title: "T" })).room?.title).toBe("T");
 	});
 });
 
@@ -725,7 +733,7 @@ it("answers count limits with denied and size limits with too_large (§1.1)", as
 		expect(errorCode(() => post(store, clock, "alice", "mention", { body: { text: "x", mentions: ["u".repeat(257)] } }))).toBe("too_large");
 		expect(errorCode(() => post(store, clock, "alice", "text", { body: { text: "x".repeat(DEFAULT_LIMITS.maxTextBytes + 1) } }))).toBe("too_large");
 		expect(errorCode(() => post(store, clock, "alice", "snapshot", { body: { text: "x" }, ext: { big: "y".repeat(DEFAULT_LIMITS.maxSnapshotBytes + 1) } }))).toBe("too_large");
-		expect(errorCode(() => store.mutate(op(clock, "alice", "room", "room_set", { parent_room_id: "general", title: "T", ext: { big: "y".repeat(DEFAULT_LIMITS.threadMetadataBytes + 1) } })))).toBe("too_large");
+		expect(errorCode(() => store.mutate(op(clock, "alice", "room", "room_set", { parent_room_id: "general", title: "T", ext: { big: "y".repeat(DEFAULT_LIMITS.roomMetadataLimit + 1) } })))).toBe("too_large");
 	});
 });
 

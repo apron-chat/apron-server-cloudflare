@@ -180,9 +180,11 @@ export interface StoreConfig {
   /** Live thread rooms one registered user may have created (`creator_id`) at once. */
   maxThreadsPerUser: number;
   /** Serialized client fields of one room record. */
-  maxThreadMetadataBytes: number;
-  /** Serialized client fields of every room together (roomMetadataTotalBytes). */
-  maxRoomMetadataTotalBytes: number;
+  roomMetadataLimit: number;
+  /** Serialized client fields every room may hold whatever the total (roomMetadataMinLimit). */
+  roomMetadataMinLimit: number;
+  /** Serialized client fields past roomMetadataMinLimit, of every room together (roomMetadataTotalLimit). */
+  roomMetadataTotalLimit: number;
   /** Private rooms (§4.2.4) that may exist at once, beside the threads. */
   maxPrivateRooms: number;
   /** Live private rooms one registered user may have created (`creator_id`) at once. */
@@ -513,8 +515,9 @@ const DEFAULT_CONFIG: StoreConfig = {
   maxEmbeds: DEFAULT_LIMITS.maxEmbeds,
   maxThreads: DEFAULT_LIMITS.threadLimit,
   maxThreadsPerUser: DEFAULT_LIMITS.threadsPerUser,
-  maxThreadMetadataBytes: DEFAULT_LIMITS.threadMetadataBytes,
-  maxRoomMetadataTotalBytes: DEFAULT_LIMITS.roomMetadataTotalBytes,
+  roomMetadataLimit: DEFAULT_LIMITS.roomMetadataLimit,
+  roomMetadataMinLimit: DEFAULT_LIMITS.roomMetadataMinLimit,
+  roomMetadataTotalLimit: DEFAULT_LIMITS.roomMetadataTotalLimit,
   maxPrivateRooms: DEFAULT_LIMITS.privateRoomLimit,
   maxPrivateRoomsPerUser: DEFAULT_LIMITS.privateRoomsPerUser,
   maxPrivateMembershipsPerUser: DEFAULT_LIMITS.privateMembershipsPerUser,
@@ -7544,30 +7547,33 @@ export class Store {
   }
 
 
-  /** A room's client fields (`title`, `description`, `ext`) fit maxThreadMetadataBytes serialized. */
+  /** A room's client fields (`title`, `description`, `ext`) fit roomMetadataLimit serialized. */
   private checkRoomFields(fields: Record<string, unknown>): void {
-    if (utf8Bytes(JSON.stringify(fields)) > this.config.maxThreadMetadataBytes) throw new StoreError("too_large", "room metadata is too large");
+    if (utf8Bytes(JSON.stringify(fields)) > this.config.roomMetadataLimit) throw new StoreError("too_large", "room metadata is too large");
   }
 
   /**
-   * Every room's client fields together, with `fields` in place of the
-   * `existing` room's (or added, for a new room), fit
-   * maxRoomMetadataTotalBytes serialized, so a listing of every room stays
-   * bounded. A save that does not grow its room is never refused, so rooms
-   * can still shrink while the total is past a lowered limit. One scan of
-   * the capped rooms table (ROOM_FIELDS_TOTAL_READS), only for a save that
-   * grows its room.
+   * Every room's client fields past roomMetadataMinLimit, together, with
+   * `fields` in place of the `existing` room's (or added, for a new room),
+   * fit roomMetadataTotalLimit serialized, so a listing of every room stays
+   * bounded. A room within roomMetadataMinLimit, or a save that does not
+   * grow its room's excess, is never refused: a full total stops only long
+   * room notes, and rooms can still shrink while the total is past a
+   * lowered limit. One scan of the capped rooms table
+   * (ROOM_FIELDS_TOTAL_READS), only for a save that grows its excess.
    */
   private checkRoomFieldsTotal(fields: Record<string, unknown>, existing?: RawRoomRow): void {
-    const bytes = utf8Bytes(JSON.stringify(fields));
-    if (existing && bytes <= utf8Bytes(JSON.stringify(clientRoomFields(existing.fields_json)))) return;
+    const floor = this.config.roomMetadataMinLimit;
+    const excess = (bytes: number) => Math.max(0, bytes - floor);
+    const added = excess(utf8Bytes(JSON.stringify(fields)));
+    if (added === 0 || (existing && added <= excess(utf8Bytes(JSON.stringify(clientRoomFields(existing.fields_json)))))) return;
     // The stored JSON less the creator, as JSON.stringify writes it: SQLite keeps strings as written.
     const others = integerColumn(this.rawRows<{ bytes: number }>(
-      "SELECT COALESCE(SUM(length(CAST(json_remove(fields_json, '$.creator_id') AS BLOB))), 0) AS bytes FROM rooms WHERE room_id != ?",
-      existing?.room_id ?? "",
+      "SELECT COALESCE(SUM(max(0, length(CAST(json_remove(fields_json, '$.creator_id') AS BLOB)) - ?)), 0) AS bytes FROM rooms WHERE room_id != ?",
+      floor, existing?.room_id ?? "",
     )[0]?.bytes);
-    if (others + bytes > this.config.maxRoomMetadataTotalBytes) {
-      throw new StoreError("too_large", `The rooms' titles and descriptions together are at this server's limit (${Math.round(this.config.maxRoomMetadataTotalBytes / 1024)} KiB); shorten this one or another room's`);
+    if (others + added > this.config.roomMetadataTotalLimit) {
+      throw new StoreError("too_large", `Long room descriptions together are at this server's limit; keep this one within ${Math.floor(floor / 1024 * 10) / 10} KiB, or shorten another room's`);
     }
   }
 
