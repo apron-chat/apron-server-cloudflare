@@ -323,7 +323,7 @@ it('closes the oldest connection past the per-user limit, telling it and the new
 	await expect.poll(() => open[0].closed()).toEqual({ code: 1008, reason: 'Signed in on a newer connection' });
 	const { frame: notice } = await until(newest.peer, (frame) => frame.method === 'message' && frame.params.from?.user_id === '~private' && /oldest connection/.test(frame.params.body.text));
 	expect(notice.params.room_id).toBeUndefined();
-	expect(notice.params.body.text).toMatch(new RegExp(`^\\*\\*Signed out your oldest connection\\.\\*\\* This account had ${limit + 1} connections open, more than the ${limit} this server allows at once, so the oldest \\(opened \\d\\d:\\d\\d UTC\\) was closed to make room for this one\\.\\n\\nIf you didn't expect that many, please report it to the server admin with the time \\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d UTC\\.$`));
+	expect(notice.params.body.text).toMatch(new RegExp(`^\\*\\*Signed out your oldest connection\\.\\*\\* This account had ${limit + 1} connections open, more than the ${limit} this server allows at once, so the oldest \\(opened \\d\\d:\\d\\d UTC\\) was closed to make room for this one\\.\\n\\nIf this doesn't sound right then it could be a bug, please report it to the server admin with the time \\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d UTC\\.$`));
 	for (const peer of open.slice(1)) expect(peer.closed()).toBeUndefined();
 
 	newest.peer.close();

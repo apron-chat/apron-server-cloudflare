@@ -1223,7 +1223,7 @@ function evictionNotice(open: number, limit: number, opened: number[], now: numb
 	const times = opened.map(at);
 	const list = times.length <= 2 ? times.join(" and ") : `${times.slice(0, -1).join(", ")} and ${times[times.length - 1]}`;
 	const which = opened.length === 1 ? `the oldest (opened ${list} UTC) was` : `the ${opened.length} oldest (opened ${list} UTC) were`;
-	return `**Signed out your oldest connection.** This account had ${open} connections open, more than the ${limit} this server allows at once, so ${which} closed to make room for this one.\n\nIf you didn't expect that many, please report it to the server admin with the time ${new Date(now).toISOString().slice(0, 16).replace("T", " ")} UTC.`;
+	return `**Signed out your oldest connection.** This account had ${open} connections open, more than the ${limit} this server allows at once, so ${which} closed to make room for this one.\n\nIf this doesn't sound right then it could be a bug, please report it to the server admin with the time ${new Date(now).toISOString().slice(0, 16).replace("T", " ")} UTC.`;
 }
 
 /**
