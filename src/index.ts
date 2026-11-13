@@ -1210,20 +1210,35 @@ function tripNotice(error: ProtocolError, trigger: string, retrySeconds: number,
 	return `**${error.message}.** ${explanation} This lasts ${when}.\n\nIf this looks wrong, please report it to an admin with the code \`${trigger}\` and the time ${new Date(now).toISOString().slice(0, 16).replace("T", " ")} UTC.`;
 }
 
+/** A connection closed to make room for a sign-in (ApronDemoServer.makeRoomFor): when it opened and was last heard. */
+type EvictedConnection = { opened: number; heard: number; quiet: boolean };
+
 /**
- * The `~private` notice to a connection whose sign-in closed the account's
- * oldest (ApronDemoServer.makeRoomFor): how many were open, when the closed
- * ones opened, and how to report it.
+ * The `~private` notice to a connection whose sign-in closed others of the
+ * account's (ApronDemoServer.makeRoomFor): how many were open, which closed,
+ * and how to report it. A time on another UTC day than now carries its date.
  */
-function evictionNotice(open: number, limit: number, opened: number[], now: number): string {
+function evictionNotice(open: number, limit: number, evicted: EvictedConnection[], now: number): string {
+	const day = new Date(now).toISOString().slice(0, 10);
 	const at = (ms: number) => {
 		const iso = new Date(ms).toISOString();
-		return now - ms < 86_400_000 ? iso.slice(11, 16) : iso.slice(0, 16).replace("T", " ");
+		return iso.slice(0, 10) === day ? iso.slice(11, 16) : iso.slice(0, 16).replace("T", " ");
 	};
-	const times = opened.map(at);
-	const list = times.length <= 2 ? times.join(" and ") : `${times.slice(0, -1).join(", ")} and ${times[times.length - 1]}`;
-	const which = opened.length === 1 ? `the oldest (opened ${list} UTC) was` : `the ${opened.length} oldest (opened ${list} UTC) were`;
-	return `**Signed out your oldest connection.** This account had ${open} connections open, more than the ${limit} this server allows at once, so ${which} closed to make room for this one.\n\nIf this doesn't sound right then it could be a bug, please report it to the server admin with the time ${new Date(now).toISOString().slice(0, 16).replace("T", " ")} UTC.`;
+	const list = (times: string[]) => times.length <= 2 ? times.join(" and ") : `${times.slice(0, -1).join(", ")} and ${times[times.length - 1]}`;
+	const opened = list(evicted.map(({ opened }) => at(opened)));
+	const quiet = evicted.every(({ quiet }) => quiet);
+	let headline: string;
+	let which: string;
+	if (evicted.length === 1) {
+		const [one] = evicted;
+		headline = quiet ? "Signed out a connection that stopped answering." : "Signed out your oldest connection.";
+		which = quiet ? `one not heard from since ${at(one.heard)} UTC (opened ${opened} UTC) was` : `the oldest (opened ${opened} UTC) was`;
+	} else {
+		const oldest = evicted.every(({ quiet }) => !quiet);
+		headline = quiet ? `Signed out ${evicted.length} connections that stopped answering.` : oldest ? `Signed out your ${evicted.length} oldest connections.` : `Signed out ${evicted.length} of your connections.`;
+		which = quiet ? `${evicted.length} not heard from lately (opened ${opened} UTC) were` : oldest ? `the ${evicted.length} oldest (opened ${opened} UTC) were` : `those that stopped answering, then the oldest (opened ${opened} UTC), were`;
+	}
+	return `**${headline}** This account had ${open} connections open, more than the ${limit} this server allows at once, so ${which} closed to make room for this one.\n\nIf this doesn't sound right then it could be a bug, please report it to the server admin with the time ${new Date(now).toISOString().slice(0, 16).replace("T", " ")} UTC.`;
 }
 
 /**
@@ -3524,8 +3539,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Makes room for `socket`, just signed in as `userId`, within
 	 * registeredConnectionsPerUser. Stale connections close first, as they
-	 * would at the next sweep (closeStale); past the limit the user's oldest
-	 * other connections then close. Each is sent a `denied` error first (§1.1),
+	 * would at the next sweep (closeStale); past the limit the user's other
+	 * connections then close: first those that have missed a ping (nothing
+	 * heard for more than one and a half intervals, as a socket whose peer
+	 * vanished goes quiet long before it is stale), least recently heard
+	 * first, then the oldest by when they opened. Each is sent a `denied` error first (§1.1),
 	 * so its client shows it signed out and waits for Sign in rather than
 	 * reconnecting and closing another in turn. `socket` is told how many
 	 * there were and when the closed ones opened, in a `~private` notice after
@@ -3541,25 +3559,34 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const state = connectionAttachment(peer);
 			return state?.openedAt ?? state?.authDeadline ?? 0;
 		};
+		const quietAfter = this.config.limits.pingSeconds * 1_500;
+		// When it was last heard from (a ping or a frame), and whether it has missed a ping since. One that never
+		// pinged is never taken for quiet: an idle bot that doesn't ping is not gone.
+		const contact = (peer: WebSocketConnection): EvictedConnection => {
+			const frames = connectionAttachment(peer)?.frameTimes ?? [];
+			const pinged = this.ctx.getWebSocketAutoResponseTimestamp(peer)?.getTime();
+			const heard = Math.max(pinged ?? opened(peer), frames[frames.length - 1] ?? 0);
+			return { opened: opened(peer), heard, quiet: pinged !== undefined && now - heard > quietAfter };
+		};
 		// A dropped socket lingers here until its close is processed: it is going already.
 		const others = this.ctx.getWebSockets().filter(peer => {
 			if (peer === socket || !openSocket(peer)) return false;
 			const state = connectionAttachment(peer);
 			return !!state && !state.closing && state.userId === userId;
-		}).sort((a, b) => opened(a) - opened(b));
+		}).map(peer => ({ peer, ...contact(peer) })).sort((a, b) =>
+			a.quiet !== b.quiet ? (a.quiet ? -1 : 1) : a.quiet ? a.heard - b.heard : a.opened - b.opened);
 		const excess = others.length + 1 - limit;
 		if (excess <= 0) return;
 		const evicted = others.slice(0, excess);
-		const times = evicted.map(peer => opened(peer));
 		const denied = { name: "denied", message: `Signed out here: this account signed in on a newer connection, and at most ${limit} may be open at once. Sign in to use it here again.` } satisfies ProtocolError;
-		for (const peer of evicted) {
+		for (const { peer } of evicted) {
 			const state = connectionAttachment(peer);
 			if (!state) continue;
 			this.send(peer, protocolError(undefined, denied));
 			this.closePolicy(peer, state, 1008, "Signed in on a newer connection");
 		}
-		console.log(JSON.stringify({ event: "connections_evicted", user: userId, open: others.length + 1, limit, evicted: evicted.length, opened: times.map(at => new Date(at).toISOString()) }));
-		this.deliverTo(socket, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text: evictionNotice(others.length + 1, limit, times, now), format: "markdown" } } });
+		console.log(JSON.stringify({ event: "connections_evicted", user: userId, open: others.length + 1, limit, evicted: evicted.length, quiet: evicted.filter(({ quiet }) => quiet).length, opened: evicted.map(({ opened }) => new Date(opened).toISOString()) }));
+		this.deliverTo(socket, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text: evictionNotice(others.length + 1, limit, evicted.map(({ opened, heard, quiet }) => ({ opened, heard, quiet })), now), format: "markdown" } } });
 	}
 
 	/**

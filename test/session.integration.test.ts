@@ -1,5 +1,5 @@
 import { env, runInDurableObject } from 'cloudflare:test';
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import { DEFAULT_LIMITS } from '../src/budget';
 import { connect as open, exchange, greeting, reply, request, until, type Frame, type Peer } from './helpers/socket';
 
@@ -328,6 +328,46 @@ it('closes the oldest connection past the per-user limit, telling it and the new
 
 	newest.peer.close();
 	for (const peer of open) peer.close();
+});
+
+it('closes a connection that missed a ping before the oldest, and counts none already closing', async () => {
+	const userId = 'user_session_quiet';
+	await registerIdentity(userId, 'session-quiet-ip');
+	const token = await issueSession(userId, 'http://localhost:5173');
+	const limit = DEFAULT_LIMITS.registeredConnectionsPerUser;
+	const open: Peer[] = [];
+	try {
+		for (let index = 0; index < limit; index += 1) open.push((await resume(token, `open-${index}`)).peer);
+		// One of them is going already: its replacement makes room for nobody.
+		await runInDurableObject(stub(), async (_instance, state) => {
+			const socket = state.getWebSockets().find((ws) => (ws.deserializeAttachment() as { userId?: string } | null)?.userId === userId)!;
+			socket.serializeAttachment({ ...(socket.deserializeAttachment() as object), closing: true });
+		});
+		const replacement = await resume(token, 'replacement');
+		expect(replacement.reply.result.you.user_id).toBe(userId);
+		open.push(replacement.peer);
+		for (const peer of open) expect(peer.closed()).toBeUndefined();
+
+		// The middle one pinged, then went quiet for more than an interval and a half (its peer vanished), short of stale.
+		const quiet = open[2];
+		quiet.socket.send('{"method":"ping"}');
+		await until(quiet, (frame) => frame.method === 'pong');
+		const pinged = await runInDurableObject(stub(), (_instance, state) => {
+			const times = state.getWebSockets().map((ws) => state.getWebSocketAutoResponseTimestamp(ws)?.getTime()).filter((at): at is number => at !== undefined);
+			return Math.max(...times);
+		});
+		vi.spyOn(Date, 'now').mockReturnValue(pinged + DEFAULT_LIMITS.pingSeconds * 1_500 + 1_000);
+		const newest = await resume(token, 'one-too-many');
+		expect(newest.reply.result.you.user_id).toBe(userId);
+		await expect.poll(() => quiet.closed()).toEqual({ code: 1008, reason: 'Signed in on a newer connection' });
+		const { frame: notice } = await until(newest.peer, (frame) => frame.method === 'message' && frame.params.from?.user_id === '~private' && /stopped answering/.test(frame.params.body.text));
+		expect(notice.params.body.text).toMatch(new RegExp(`^\\*\\*Signed out a connection that stopped answering\\.\\*\\* This account had ${limit + 1} connections open, more than the ${limit} this server allows at once, so one not heard from since \\d\\d:\\d\\d UTC \\(opened \\d\\d:\\d\\d UTC\\) was closed to make room for this one\\.\\n\\n`));
+		for (const peer of open) if (peer !== quiet) expect(peer.closed()).toBeUndefined();
+		open.push(newest.peer);
+	} finally {
+		vi.restoreAllMocks();
+		for (const peer of open) peer.close();
+	}
 });
 
 it('logs a registered user\'s joins and leaves as memberships, delivered around the change and kept in history', async () => {
