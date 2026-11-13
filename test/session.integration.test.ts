@@ -303,29 +303,30 @@ it('sends user notifications for renames, and no old link for a guest signing in
 	} finally { watcher.close(); tab.close(); second.close(); }
 });
 
-it('does not count a closing connection against the per-user limit on resume', async () => {
+it('closes the oldest connection past the per-user limit, telling it and the new one why', async () => {
 	const userId = 'user_session_capacity';
 	await registerIdentity(userId, 'session-capacity-ip');
 	const token = await issueSession(userId, 'http://localhost:5173');
-	const open = [];
-	for (let index = 0; index < DEFAULT_LIMITS.registeredConnectionsPerUser; index += 1) {
+	const limit = DEFAULT_LIMITS.registeredConnectionsPerUser;
+	const open: Peer[] = [];
+	for (let index = 0; index < limit; index += 1) {
 		const { peer, reply } = await resume(token, `open-${index}`);
 		expect(reply.result.you.user_id).toBe(userId);
 		open.push(peer);
 	}
-	const refused = await resume(token, 'one-too-many');
-	expect(refused.reply.error).toEqual(expect.objectContaining({ code: -32002, message: 'Connection limit reached for this account', data: { retry_after: 60 } }));
-	refused.peer.close();
 
-	// One of them dropped and its close is on the way: its replacement resumes.
-	await runInDurableObject(stub(), async (instance) => {
-		const sockets = (instance as unknown as { ctx: DurableObjectState }).ctx.getWebSockets();
-		const dropped = sockets.find((socket) => (socket.deserializeAttachment() as { userId?: string } | null)?.userId === userId)!;
-		dropped.serializeAttachment({ ...(dropped.deserializeAttachment() as object), closing: true });
-	});
-	const replacement = await resume(token, 'replacement');
-	expect(replacement.reply.result.you.user_id).toBe(userId);
-	replacement.peer.close();
+	// One more than the limit: it signs in, and the oldest is signed out in its place.
+	const newest = await resume(token, 'one-too-many');
+	expect(newest.reply.result.you.user_id).toBe(userId);
+	const { frame: evicted } = await until(open[0], (frame) => frame.id === undefined && frame.error !== undefined);
+	expect(evicted.error).toEqual({ code: -32001, message: `Signed out here: this account signed in on a newer connection, and at most ${limit} may be open at once. Sign in to use it here again.` });
+	await expect.poll(() => open[0].closed()).toEqual({ code: 1008, reason: 'Signed in on a newer connection' });
+	const { frame: notice } = await until(newest.peer, (frame) => frame.method === 'message' && frame.params.from?.user_id === '~private' && /oldest connection/.test(frame.params.body.text));
+	expect(notice.params.room_id).toBeUndefined();
+	expect(notice.params.body.text).toMatch(new RegExp(`^\\*\\*Signed out your oldest connection\\.\\*\\* This account had ${limit + 1} connections open, more than the ${limit} this server allows at once, so the oldest \\(opened \\d\\d:\\d\\d UTC\\) was closed to make room for this one\\.\\n\\nIf you didn't expect that many, please report it to the server admin with the time \\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d UTC\\.$`));
+	for (const peer of open.slice(1)) expect(peer.closed()).toBeUndefined();
+
+	newest.peer.close();
 	for (const peer of open) peer.close();
 });
 

@@ -110,15 +110,14 @@ A connection that has pinged is closed as stale after 150 seconds without a
 ping or frame. One that never pinged gets 15 minutes, and a `~private` notice
 ("Did not receive `{"method":"ping"}` in 15 minutes, closing stale
 connection.") just before its 1001 close. Until a vanished socket is found
-stale it keeps counting against its address's and its account's connection
-limits. A client that never pings can lock its own account out for up to 15
-minutes after a few unclean reconnects.
+stale it keeps counting against its address's connection limits. Past the
+account's limit, a sign-in closes stale sockets first, then the oldest.
 
 ## Signing in
 
 | Error | Limit | Usual cause |
 | --- | --- | --- |
-| `retry_after` "Connection limit reached for this account" (`retry_after` 60) | 5 signed-in connections per account, across all devices and addresses | More tabs, devices or test instances on one account than 5, or old sockets not yet closed or stale (see above). Bots count too: 5 per bot. |
+| `denied` "Signed out here: this account signed in on a newer connection, and at most 5 may be open at once. Sign in to use it here again." (an error with no `id`, then a 1008 close) | 5 signed-in connections per account, across all devices and addresses. A sign-in past it is not refused: the account's oldest connection is closed instead, and the new one gets a `~private` notice saying how many were open and when the closed one opened. | More tabs, devices or test instances on one account than 5, or old sockets not yet closed or stale (see above). Bots count too: 5 per bot. Don't reconnect automatically after this error, or two clients will take turns closing each other. |
 | `retry_after` "Authentication attempts limited" | 64 auth attempts a minute per address, failed ones included (each connection's `auth` is one, guests too) | Retrying a failing `auth` in a loop. |
 | `retry_after` "Registration limit reached for this network" / "Registration limit reached" | 20 registrations a day per address; 5,000 a day on the server. Adding a passkey and a first `/invite-bot` each count as one. | Creating test accounts from one network. |
 | `unsupported` "Passkeys are not offered to this origin"; `denied` "Frontend origin is not configured for passkeys" (a passkey session `token`) | Passkeys and passkey session resume work only from the configured origin (`https://web.apron.chat` on the demo) | A third-party client on another origin, or a native client. Use a guest, a bot token (`/invite-bot`) or a device token (`/invite-device`), which work from any origin or none. |

@@ -487,7 +487,7 @@ The smaller frame limit is a documented demo exception to the protocol's advisor
 | --- | ---: |
 | open_connections | 100 total, including pending auth and closing sockets |
 | anonymous_connections_per_ip | 6, including unauthenticated sockets (Free: 2) |
-| registered_connections_per_user | 5 (Free: 3) |
+| registered_connections_per_user | 5 (Free: 3); a sign-in past it closes the account's oldest connections, stale ones first (below) |
 | connections_per_ip | 10 total |
 | connection_admissions_per_ip_minute | 12 (Free: 5) |
 | connection_admissions_per_day | 4,000 globally (Free: 2,000) |
@@ -509,6 +509,8 @@ The smaller frame limit is a documented demo exception to the protocol's advisor
 | repeated_policy_violations | Close after 3 within 60 seconds; severe oversized/binary input closes immediately |
 
 Minute limits other than posting may use a documented token bucket with a burst no greater than the listed minute allowance. First-check cheap frame/connection gates precede JSON parsing, SQL queries, and cryptographic work. WebSocket control frames are not application frames.
+
+A sign-in that would put an account past `registered_connections_per_user` succeeds, and the account's oldest other connections close in its place, by when they opened, once stale ones have been closed as at admission; a connection already closing does not count. After the `auth` result, each one closed gets an error with no `id` (§1.1), `denied` "Signed out here: this account signed in on a newer connection, and at most <limit> may be open at once. Sign in to use it here again.", so its client holds reconnecting rather than closing another in turn, and then closes with 1008 "Signed in on a newer connection" (counted as a `refusal` close). The new connection gets a `~private` notice with no `room_id`: "**Signed out your oldest connection.** This account had <n> connections open, more than the <limit> this server allows at once, so the oldest (opened <HH:MM> UTC) was closed to make room for this one." and a paragraph asking to report it to the server admin with the time, if unexpected. Workers Logs record each such sign-in (`connections_evicted`, with the user, counts and opening times).
 
 Use a staged handshake for registered reconnects: pending sockets initially obey the anonymous/pending limits and upgrade to registered limits only after verification. This can limit simultaneous registrations from a NAT; it must not be circumvented by accepting a client-claimed registered tier before auth.
 

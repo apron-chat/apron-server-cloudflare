@@ -1211,6 +1211,22 @@ function tripNotice(error: ProtocolError, trigger: string, retrySeconds: number,
 }
 
 /**
+ * The `~private` notice to a connection whose sign-in closed the account's
+ * oldest (ApronDemoServer.makeRoomFor): how many were open, when the closed
+ * ones opened, and how to report it.
+ */
+function evictionNotice(open: number, limit: number, opened: number[], now: number): string {
+	const at = (ms: number) => {
+		const iso = new Date(ms).toISOString();
+		return now - ms < 86_400_000 ? iso.slice(11, 16) : iso.slice(0, 16).replace("T", " ");
+	};
+	const times = opened.map(at);
+	const list = times.length <= 2 ? times.join(" and ") : `${times.slice(0, -1).join(", ")} and ${times[times.length - 1]}`;
+	const which = opened.length === 1 ? `the oldest (opened ${list} UTC) was` : `the ${opened.length} oldest (opened ${list} UTC) were`;
+	return `**Signed out your oldest connection.** This account had ${open} connections open, more than the ${limit} this server allows at once, so ${which} closed to make room for this one.\n\nIf you didn't expect that many, please report it to the server admin with the time ${new Date(now).toISOString().slice(0, 16).replace("T", " ")} UTC.`;
+}
+
+/**
  * Who the event running now acts for (Store.actor): a frame, close or
  * request runs inside `ACTOR.run`, so an overrun in its storage work is
  * logged with its user and address (Store.noteOverrun). The server's own
@@ -3426,7 +3442,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await this.rescheduleAlarm();
 			return;
 		}
-		this.assertRegisteredCapacity(socket, finished.identity.user_id);
 		// Read before the session is issued and before the connection changes,
 		// so a failure leaves neither an orphan session nor a changed
 		// connection. The storage writes awaited in between hold the input
@@ -3448,6 +3463,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), token });
 		this.releaseDeliveries(socket);
 		this.guestLeaves(socket, attachment, previous, challenge.action === "register");
+		this.makeRoomFor(socket, finished.identity.user_id);
 		this.afterSignIn(socket, stored);
 		this.refreshAvatar(finished.identity.user_id);
 		await this.rescheduleAlarm();
@@ -3505,15 +3521,45 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return this.liveRoomsOf(userId, socket) ?? this.store.getIdentity(userId)?.rooms ?? [...DEFAULT_JOINED_ROOMS];
 	}
 
-	private assertRegisteredCapacity(socket: WebSocketConnection, userId: string): void {
-		// A dropped socket lingers here until its close is processed; counting it
-		// would refuse the reconnect that replaces it.
-		const activeForUser = this.ctx.getWebSockets().filter(peer => {
+	/**
+	 * Makes room for `socket`, just signed in as `userId`, within
+	 * registeredConnectionsPerUser. Stale connections close first, as they
+	 * would at the next sweep (closeStale); past the limit the user's oldest
+	 * other connections then close. Each is sent a `denied` error first (§1.1),
+	 * so its client shows it signed out and waits for Sign in rather than
+	 * reconnecting and closing another in turn. `socket` is told how many
+	 * there were and when the closed ones opened, in a `~private` notice after
+	 * its `auth` result. Refusing the newest instead locked a person out of the
+	 * tab in front of them for the sake of one left open elsewhere, or a dead
+	 * one not yet found stale.
+	 */
+	private makeRoomFor(socket: WebSocketConnection, userId: string): void {
+		const now = nowMs();
+		this.closeStale(now, socket);
+		const limit = this.config.limits.registeredConnectionsPerUser;
+		const opened = (peer: WebSocketConnection): number => {
+			const state = connectionAttachment(peer);
+			return state?.openedAt ?? state?.authDeadline ?? 0;
+		};
+		// A dropped socket lingers here until its close is processed: it is going already.
+		const others = this.ctx.getWebSockets().filter(peer => {
 			if (peer === socket || !openSocket(peer)) return false;
 			const state = connectionAttachment(peer);
 			return !!state && !state.closing && state.userId === userId;
-		}).length;
-		if (activeForUser >= this.config.limits.registeredConnectionsPerUser) throw { name: "retry_after", message: "Connection limit reached for this account", data: { retry_after: 60 } } satisfies ProtocolError;
+		}).sort((a, b) => opened(a) - opened(b));
+		const excess = others.length + 1 - limit;
+		if (excess <= 0) return;
+		const evicted = others.slice(0, excess);
+		const times = evicted.map(peer => opened(peer));
+		const denied = { name: "denied", message: `Signed out here: this account signed in on a newer connection, and at most ${limit} may be open at once. Sign in to use it here again.` } satisfies ProtocolError;
+		for (const peer of evicted) {
+			const state = connectionAttachment(peer);
+			if (!state) continue;
+			this.send(peer, protocolError(undefined, denied));
+			this.closePolicy(peer, state, 1008, "Signed in on a newer connection");
+		}
+		console.log(JSON.stringify({ event: "connections_evicted", user: userId, open: others.length + 1, limit, evicted: evicted.length, opened: times.map(at => new Date(at).toISOString()) }));
+		this.deliverTo(socket, { method: "message", params: { from: { ...PRIVATE_IDENTITY }, body: { text: evictionNotice(others.length + 1, limit, times, now), format: "markdown" } } });
 	}
 
 	/**
@@ -3563,7 +3609,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 			throw expired;
 		}
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
-		this.assertRegisteredCapacity(socket, identity.userId);
 		const renewed = { ...session, expiresMs: now + lifetimeMs, ...(legacy && identity.userHandle ? { handle: identity.userHandle } : {}) };
 		if (legacy && identity.userHandle && session.expiresMs - now >= lifetimeMs / 2) {
 			// Carries its handle from now on, renewed or not.
@@ -3592,6 +3637,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.prepareStatus(socket, stored);
 		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), token });
 		this.guestLeaves(socket, attachment, previous, false);
+		this.makeRoomFor(socket, identity.userId);
 		this.afterSignIn(socket, stored);
 		this.refreshAvatar(identity.userId);
 		await this.rescheduleAlarm();
@@ -3725,7 +3771,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async signInKeyless(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, identity: { userId: string; name: string; rooms: string[]; avatar?: string; roles: string[]; ext?: Record<string, unknown>; seen?: number }, token?: string, created = false, credential?: string): Promise<void> {
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
-		this.assertRegisteredCapacity(socket, identity.userId);
 		// Read before the connection changes, so a failure leaves it as it was.
 		const stored = this.readStatusInputs(identity.userId, identity.seen);
 		const previous = this.guestBefore(socket, attachment);
@@ -3734,6 +3779,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), ...(token ? { token } : {}) });
 		this.releaseDeliveries(socket);
 		this.guestLeaves(socket, attachment, previous, created);
+		this.makeRoomFor(socket, identity.userId);
 		this.afterSignIn(socket, stored);
 		this.refreshAvatar(identity.userId);
 		this.noteBotActive(identity.userId, identity.roles);
