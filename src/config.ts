@@ -65,7 +65,8 @@ export interface RuntimeConfig {
 	 */
 	push?: VapidKeys;
 	/**
-	 * The push services endpoints may name (`PUSH_HOSTS`): exact hosts, or
+	 * The push services endpoints may name (`PUSH_HOSTS`, plus
+	 * `PUSH_HOSTS_EXTRA`): exact hosts, or
 	 * `*.host` for its subdomains; `"*"` allows any public host.
 	 */
 	pushHosts: readonly string[] | "*";
@@ -75,7 +76,8 @@ export interface RuntimeConfig {
 	 */
 	pushDelaySeconds: number;
 	/**
-	 * The hosts whose media a client-built `og` may keep (`OG_MEDIA_HOSTS`):
+	 * The hosts whose media a client-built `og` may keep (`OG_MEDIA_HOSTS`,
+	 * plus `OG_MEDIA_HOSTS_EXTRA`):
 	 * exact hosts, or `*.host` for its subdomains; `"*"` allows any host, and
 	 * an empty list keeps no remote media.
 	 */
@@ -120,9 +122,11 @@ export function pushHostAllowed(hosts: RuntimeConfig["pushHosts"], host: string)
  * anyone can run a server.
  */
 export const DEFAULT_OG_MEDIA_HOSTS: readonly string[] = [
-	// YouTube thumbnails
+	// YouTube thumbnails and channel avatars
 	"i.ytimg.com",
 	"img.youtube.com",
+	"yt3.ggpht.com",
+	"yt3.googleusercontent.com",
 	// Vimeo
 	"i.vimeocdn.com",
 	// GitHub
@@ -240,8 +244,10 @@ type EnvLike = {
 	VAPID_PRIVATE_KEY?: string;
 	VAPID_SUBJECT?: string;
 	PUSH_HOSTS?: string;
+	PUSH_HOSTS_EXTRA?: string;
 	PUSH_DELAY_SECONDS?: string;
 	OG_MEDIA_HOSTS?: string;
+	OG_MEDIA_HOSTS_EXTRA?: string;
 	ENVIRONMENT?: string;
 	NODE_ENV?: string;
 };
@@ -530,9 +536,9 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 	const attackPause = parseSwitch(env.ATTACK_PAUSE, "ATTACK_PAUSE", true);
 	if (PUSH_POLICY) validatePushPolicy(PUSH_POLICY);
 	const push = loadPush(env);
-	const pushHosts = loadPushHosts(env.PUSH_HOSTS);
+	const pushHosts = withExtraHosts(loadPushHosts(env.PUSH_HOSTS), env.PUSH_HOSTS_EXTRA, "PUSH_HOSTS_EXTRA");
 	const pushDelaySeconds = loadPushDelay(env.PUSH_DELAY_SECONDS);
-	const ogMediaHosts = loadOgMediaHosts(env.OG_MEDIA_HOSTS);
+	const ogMediaHosts = withExtraHosts(loadOgMediaHosts(env.OG_MEDIA_HOSTS), env.OG_MEDIA_HOSTS_EXTRA, "OG_MEDIA_HOSTS_EXTRA");
 	const rpName = String(env.RP_NAME ?? "Apron Demo");
 	if (!rpName.trim() || [...rpName].length > limits.maxNameCodePoints || new TextEncoder().encode(rpName).byteLength > limits.maxNameBytes) {
 		throw new ConfigError("RP_NAME exceeds the configured display-name policy");
@@ -803,6 +809,19 @@ function loadOgMediaHosts(raw: string | undefined): RuntimeConfig["ogMediaHosts"
 	if (raw === undefined) return DEFAULT_OG_MEDIA_HOSTS;
 	if (raw.trim() === "") return [];
 	return parseHostList(splitList(raw.toLowerCase(), []), "OG_MEDIA_HOSTS");
+}
+
+/**
+ * `hosts` with the ones an `_EXTRA` variable (`PUSH_HOSTS_EXTRA`,
+ * `OG_MEDIA_HOSTS_EXTRA`) adds, written like the list it extends: so a
+ * deployment adds to the defaults, or to its own list, without copying them.
+ * Unset or empty, `hosts` as they are; a standalone `*`, any host.
+ */
+function withExtraHosts(hosts: readonly string[] | "*", raw: string | undefined, name: string): readonly string[] | "*" {
+	if (raw === undefined || raw.trim() === "") return hosts;
+	const extra = parseHostList(splitList(raw.toLowerCase(), []), name);
+	if (hosts === "*" || extra === "*") return "*";
+	return [...new Set([...hosts, ...extra])];
 }
 
 /** `PUSH_DELAY_SECONDS`: whole seconds from 0 to MAX_STATUS_DELAY_SECONDS; unset or empty, the plan's `push.delaySeconds`. */
