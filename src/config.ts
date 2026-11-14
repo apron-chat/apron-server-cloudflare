@@ -120,9 +120,11 @@ export function pushHostAllowed(hosts: RuntimeConfig["pushHosts"], host: string)
  * anyone can run a server.
  */
 export const DEFAULT_OG_MEDIA_HOSTS: readonly string[] = [
-	// YouTube thumbnails
+	// YouTube thumbnails and channel avatars
 	"i.ytimg.com",
 	"img.youtube.com",
+	"yt3.ggpht.com",
+	"yt3.googleusercontent.com",
 	// Vimeo
 	"i.vimeocdn.com",
 	// GitHub

@@ -533,7 +533,7 @@ from any host, and an empty value keeps none. Unset, it is the image CDNs in
 
 | Service | Hosts |
 |---|---|
-| YouTube thumbnails | `i.ytimg.com`, `img.youtube.com` |
+| YouTube thumbnails and channel avatars | `i.ytimg.com`, `img.youtube.com`, `yt3.ggpht.com`, `yt3.googleusercontent.com` |
 | Vimeo | `i.vimeocdn.com` |
 | GitHub | `opengraph.githubassets.com`, `repository-images.githubusercontent.com`, `avatars.githubusercontent.com` |
 | X/Twitter | `pbs.twimg.com` |
