@@ -529,7 +529,10 @@ and no shared hosting where anyone can run a server.
 `OG_MEDIA_HOSTS` lists them comma-separated, as exact hosts or `*.` and a
 host for its subdomains only, like `PUSH_HOSTS`; a standalone `*` keeps media
 from any host, and an empty value keeps none. Unset, it is the image CDNs in
-`DEFAULT_OG_MEDIA_HOSTS` (`src/config.ts`):
+`DEFAULT_OG_MEDIA_HOSTS` (`src/config.ts`) below. To add hosts without
+copying that list, set `OG_MEDIA_HOSTS_EXTRA` instead, written the same way:
+its hosts are added to whatever `OG_MEDIA_HOSTS` gives, the defaults or a
+list of its own, and a standalone `*` there allows any host.
 
 | Service | Hosts |
 |---|---|
@@ -598,7 +601,9 @@ standalone `*` allows any public host. Unset or empty, it is the browsers'
 own push services: `fcm.googleapis.com` (Chrome, Edge on Android, and other
 Chromium browsers), `*.push.services.mozilla.com` (Firefox),
 `web.push.apple.com` and `*.push.apple.com` (Safari), and
-`*.notify.windows.com` (Edge on Windows). Any other endpoint is refused with
+`*.notify.windows.com` (Edge on Windows). `PUSH_HOSTS_EXTRA`, written the
+same way, adds hosts to that list, the defaults or a list of its own,
+without copying it. Any other endpoint is refused with
 `invalid_params` "push service not allowed here", after the checks that
 refuse IP literals, internal names, credentials and ports, which apply
 whatever the list says. A malformed list fails the configuration check.
@@ -781,7 +786,9 @@ implementation and recalibrating its resource model.
 | `VAPID_PRIVATE_KEY` | Secret: the matching 32-byte private key, unpadded base64url; set with `npx wrangler secret put VAPID_PRIVATE_KEY --config wrangler.production.toml` |
 | `VAPID_SUBJECT` | `mailto:` address or `https:` URL sent to push services in each VAPID token as the operator's contact |
 | `PUSH_HOSTS` | Comma-separated push service hosts registrations may name, `*.host` for a host's subdomains, or a standalone `*` for any public host; unset, the browsers' own services (see [Push](#push)) |
+| `PUSH_HOSTS_EXTRA` | Push service hosts added to `PUSH_HOSTS` (or its defaults), written the same way; unset, none |
 | `OG_MEDIA_HOSTS` | Comma-separated hosts whose `og` media (`image`, `video`, `audio`) a link embed keeps, `*.host` for a host's subdomains, a standalone `*` for any host, or empty for none; unset, big platforms' image CDNs (see [Link preview media](#link-preview-media)) |
+| `OG_MEDIA_HOSTS_EXTRA` | Hosts added to `OG_MEDIA_HOSTS` (or its defaults), written the same way; unset, none |
 | `PUSH_DELAY_SECONDS` | Whole seconds, 0 to 60, a message's wake waits before it pushes; unset, the plan's `push.delaySeconds`; `0` pushes at once |
 | `ACCOUNT_ID` | The Cloudflare account whose analytics the account-usage stop and the budget guard read; a Wrangler var (see [Editing the deployment budget](#editing-the-deployment-budget)) |
 | `ACCOUNT_ANALYTICS_TOKEN` | Secret: a read-only account analytics token; with `ACCOUNT_ID`, turns the account-usage stop on |

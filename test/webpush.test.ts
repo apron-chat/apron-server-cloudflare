@@ -155,6 +155,17 @@ describe('push configuration', () => {
 		expect(pushHostAllowed('*', 'anything.example')).toBe(true);
 	});
 
+	it('adds PUSH_HOSTS_EXTRA to PUSH_HOSTS or its defaults', () => {
+		expect(loadConfig({ ...base, PUSH_HOSTS_EXTRA: '' }).pushHosts).toEqual(DEFAULT_PUSH_HOSTS);
+		expect(loadConfig({ ...base, PUSH_HOSTS_EXTRA: 'Push.Example.NET, fcm.googleapis.com' }).pushHosts).toEqual([...DEFAULT_PUSH_HOSTS, 'push.example.net']);
+		expect(loadConfig({ ...base, PUSH_HOSTS: 'a.example', PUSH_HOSTS_EXTRA: '*.b.example' }).pushHosts).toEqual(['a.example', '*.b.example']);
+		expect(loadConfig({ ...base, PUSH_HOSTS_EXTRA: '*' }).pushHosts).toBe('*');
+		expect(loadConfig({ ...base, PUSH_HOSTS: '*', PUSH_HOSTS_EXTRA: 'a.example' }).pushHosts).toBe('*');
+		for (const bad of ['*, push.example.net', 'https://push.example.net', 'push']) {
+			expect(() => loadConfig({ ...base, PUSH_HOSTS_EXTRA: bad }), bad).toThrow(/PUSH_HOSTS_EXTRA/);
+		}
+	});
+
 	it('keeps og media from the default image CDNs, or the hosts OG_MEDIA_HOSTS lists', () => {
 		expect(loadConfig(base).ogMediaHosts).toEqual(DEFAULT_OG_MEDIA_HOSTS);
 		expect(loadConfig({ ...base, OG_MEDIA_HOSTS: '' }).ogMediaHosts).toEqual([]);
@@ -172,6 +183,17 @@ describe('push configuration', () => {
 		// The store's own default keeps none, so the runtime must pass the list on.
 		expect(asStoreConfig(loadConfig(base)).ogMediaHosts).toEqual(DEFAULT_OG_MEDIA_HOSTS);
 		expect(asStoreConfig(loadConfig({ ...base, OG_MEDIA_HOSTS: '' })).ogMediaHosts).toEqual([]);
+	});
+
+	it('adds OG_MEDIA_HOSTS_EXTRA to OG_MEDIA_HOSTS or its defaults', () => {
+		expect(loadConfig({ ...base, OG_MEDIA_HOSTS_EXTRA: ' ' }).ogMediaHosts).toEqual(DEFAULT_OG_MEDIA_HOSTS);
+		expect(loadConfig({ ...base, OG_MEDIA_HOSTS_EXTRA: 'CDN.example, i.ytimg.com' }).ogMediaHosts).toEqual([...DEFAULT_OG_MEDIA_HOSTS, 'cdn.example']);
+		expect(loadConfig({ ...base, OG_MEDIA_HOSTS: '', OG_MEDIA_HOSTS_EXTRA: '*.cdn.example' }).ogMediaHosts).toEqual(['*.cdn.example']);
+		expect(loadConfig({ ...base, OG_MEDIA_HOSTS_EXTRA: '*' }).ogMediaHosts).toBe('*');
+		for (const bad of ['*, cdn.example', 'https://cdn.example', 'cdn.example:443']) {
+			expect(() => loadConfig({ ...base, OG_MEDIA_HOSTS_EXTRA: bad }), bad).toThrow(/OG_MEDIA_HOSTS_EXTRA/);
+		}
+		expect(asStoreConfig(loadConfig({ ...base, OG_MEDIA_HOSTS_EXTRA: 'cdn.example' })).ogMediaHosts).toContain('cdn.example');
 	});
 
 	it('waits the plan\'s push.delaySeconds before a wake pushes, or PUSH_DELAY_SECONDS from 0 to 60', () => {

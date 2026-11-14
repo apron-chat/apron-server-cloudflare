@@ -24,8 +24,10 @@ declare global {
 		VAPID_PRIVATE_KEY?: string;
 		VAPID_SUBJECT?: string;
 		PUSH_HOSTS?: string;
+		PUSH_HOSTS_EXTRA?: string;
 		PUSH_DELAY_SECONDS?: string;
 		OG_MEDIA_HOSTS?: string;
+		OG_MEDIA_HOSTS_EXTRA?: string;
 		ASSETS?: Fetcher;
 		ALLOWED_ORIGINS?: string;
 		RP_ID?: string;
@@ -71,8 +73,10 @@ declare global {
 			VAPID_PRIVATE_KEY?: string;
 			VAPID_SUBJECT?: string;
 			PUSH_HOSTS?: string;
+			PUSH_HOSTS_EXTRA?: string;
 			PUSH_DELAY_SECONDS?: string;
 			OG_MEDIA_HOSTS?: string;
+			OG_MEDIA_HOSTS_EXTRA?: string;
 			ASSETS?: Fetcher;
 			ALLOWED_ORIGINS?: string;
 			RP_ID?: string;
