@@ -100,21 +100,29 @@ ${end}`;
  * With `liveText`, a configuration rule turns off the edge's request body
  * buffering for `PUT` on `/w/`, which would otherwise hold a slow writer's
  * first bytes, such as typed keys, until more arrive.
+ * With `signIn`, where the server's hostname is its `RP_ID` or under it and
+ * the passkey page is on (`PASSKEY_PAGE`), the sign-in pages are allowed
+ * too: `GET` of `/passkey` and `POST` of its begin and finish, and with
+ * `signIn.external` (`EXTERNAL_SIGN_IN`) `GET` of `/oauth/authorize`, the
+ * token endpoint (`POST` and its preflight) and the authorization server
+ * metadata (`GET`, `HEAD` and a preflight).
  * With `webClient`, a web client's URL, a redirect rule sends a browser that
  * opens the server's address as a page (a `GET /` that is neither a WebSocket
  * handshake nor a connection status probe, which `apron_invalid_request`
  * would block) to that client with the server prefilled, before the block
  * and without invoking the Worker.
  */
-export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHostname = undefined, liveText = false, relatedOrigins = false, webClient = undefined) {
+export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHostname = undefined, liveText = false, relatedOrigins = false, webClient = undefined, signIn = undefined) {
 	validateAdmission(admission);
 	const host = `http.host eq ${JSON.stringify(hostname)}`;
 	const handshake = 'any(lower(http.request.headers["upgrade"][*])[*] eq "websocket")';
 	const probe = 'any(http.request.uri.args["apron_connection_status"][*] eq "1")';
 	const writes = (mediaHostname || liveText ? ' and not (http.request.method in {"PUT" "OPTIONS"} and starts_with(http.request.uri.path, "/w/"))' : '') +
 		(liveText ? ' and not (http.request.method in {"GET" "HEAD" "OPTIONS"} and starts_with(http.request.uri.path, "/live/"))' : '') +
-		(relatedOrigins ? ' and not (http.request.method in {"GET" "HEAD"} and http.request.uri.path eq "/.well-known/webauthn")' : '');
-	const allowed = ['WebSocket handshakes', 'connection status probes', ...(mediaHostname ? ['upload writes'] : []), ...(liveText ? ['live text'] : []), ...(relatedOrigins ? ['passkey related origins'] : [])];
+		(relatedOrigins ? ' and not (http.request.method in {"GET" "HEAD"} and http.request.uri.path eq "/.well-known/webauthn")' : '') +
+		(signIn ? ' and not (http.request.method eq "GET" and http.request.uri.path eq "/passkey") and not (http.request.method eq "POST" and http.request.uri.path in {"/passkey/begin" "/passkey/finish"})' : '') +
+		(signIn?.external ? ' and not (http.request.method eq "GET" and http.request.uri.path eq "/oauth/authorize") and not (http.request.method in {"POST" "OPTIONS"} and http.request.uri.path eq "/oauth/token") and not (http.request.method in {"GET" "HEAD" "OPTIONS"} and http.request.uri.path eq "/.well-known/oauth-authorization-server")' : '');
+	const allowed = ['WebSocket handshakes', 'connection status probes', ...(mediaHostname ? ['upload writes'] : []), ...(liveText ? ['live text'] : []), ...(relatedOrigins ? ['passkey related origins'] : []), ...(signIn ? ['the passkey page'] : []), ...(signIn?.external ? ['external sign-in'] : [])];
 	const stopped = mediaHostname ? `http.host in {${JSON.stringify(hostname)} ${JSON.stringify(mediaHostname)}}` : host;
 	return {
 		custom: {
@@ -316,6 +324,23 @@ export function relyingPartyId(source) {
 	return source.match(/^RP_ID\s*=\s*"([A-Za-z0-9.-]+)"\s*(?:#.*)?$/m)?.[1].toLowerCase();
 }
 
+/** A `true`/`false` Wrangler var in `source`, else `fallback`. */
+export function wranglerSwitch(source, name, fallback) {
+	const value = source.match(new RegExp(`^${name}\\s*=\\s*"(true|false)"\\s*(?:#.*)?$`, 'im'))?.[1].toLowerCase();
+	return value === undefined ? fallback : value === 'true';
+}
+
+/**
+ * The sign-in pages the Worker serves on `hostname` (src/index.ts,
+ * handleSignIn): with the passkey page on, where the hostname is the RP ID
+ * or under it; `external` too with EXTERNAL_SIGN_IN. Undefined for none.
+ */
+export function signInPages(source, hostname) {
+	const rpId = relyingPartyId(source);
+	if (!rpId || !wranglerSwitch(source, 'PASSKEY_PAGE', true) || (hostname !== rpId && !hostname.endsWith(`.${rpId}`))) return undefined;
+	return { external: wranglerSwitch(source, 'EXTERNAL_SIGN_IN', false) };
+}
+
 function main() {
 	const check = process.argv[2] === '--check';
 	if (process.argv.length > (check ? 3 : 2)) throw new Error('Usage: node scripts/budget.mjs [--check]');
@@ -348,7 +373,7 @@ function main() {
 	// The Worker answers /.well-known/webauthn only on RP_ID's host, so the
 	// rule lets it through only where that is the server's own hostname.
 	const relatedOrigins = relyingPartyId(production) === hosts[0][1];
-	outputs.push(['docs/edge-rules.generated.json', JSON.stringify(renderEdgeRules(hosts[0][1], ADMISSION_BUDGET, media, liveText, relatedOrigins, WEB_CLIENT), null, 2) + '\n']);
+	outputs.push(['docs/edge-rules.generated.json', JSON.stringify(renderEdgeRules(hosts[0][1], ADMISSION_BUDGET, media, liveText, relatedOrigins, WEB_CLIENT, signInPages(production, hosts[0][1])), null, 2) + '\n']);
 	let stale = false;
 	for (const [file, expected] of outputs) {
 		const path = new URL(file, root);

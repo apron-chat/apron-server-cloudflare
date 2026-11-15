@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ADMISSION_BUDGET, DEFAULT_LIMITS } from '../src/budget.ts';
-import { mediaHostname, relyingPartyId, renderBinding, renderEdgeRules, replaceBinding, validateAdmission, validateDeploymentConfiguration, validateEdgeStop, webClientTarget } from './budget.mjs';
+import { mediaHostname, relyingPartyId, renderBinding, signInPages, renderEdgeRules, replaceBinding, validateAdmission, validateDeploymentConfiguration, validateEdgeStop, webClientTarget } from './budget.mjs';
 
 const namespaces = { attempts: '123', prefix: '124', location: '125', live: '126' };
 
@@ -230,6 +230,31 @@ test('where the server hostname is its RP ID, passkey related origins pass the i
 	assert.deepEqual(edge.custom.rules.slice(1), plain.custom.rules.slice(1));
 	assert.equal(relyingPartyId('[vars]\nRP_ID = "Chat.Example.Test" # the server\n'), 'chat.example.test');
 	assert.equal(relyingPartyId('[vars]\nRP_ORIGINS = "https://chat.example.test"\n'), undefined);
+});
+
+test('where the server hostname serves the passkey page, its paths pass the invalid-request rule, and external\'s with EXTERNAL_SIGN_IN', () => {
+	const plain = renderEdgeRules('chat.example.test', ADMISSION_BUDGET, undefined, true);
+	assert.doesNotMatch(plain.custom.rules[0].expression, /passkey|oauth/);
+	const page = renderEdgeRules('chat.example.test', ADMISSION_BUDGET, undefined, true, false, undefined, { external: false });
+	const passkey = ' and not (http.request.method eq "GET" and http.request.uri.path eq "/passkey") and not (http.request.method eq "POST" and http.request.uri.path in {"/passkey/begin" "/passkey/finish"})';
+	assert.equal(page.custom.rules[0].expression, plain.custom.rules[0].expression.replace(' and (http.request.method ne "GET"', `${passkey} and (http.request.method ne "GET"`));
+	assert.equal(page.custom.rules[0].description, 'Apron: allow WebSocket handshakes, connection status probes, live text, and the passkey page');
+	assert.doesNotMatch(page.custom.rules[0].expression, /oauth/);
+	const external = renderEdgeRules('chat.example.test', ADMISSION_BUDGET, undefined, true, false, undefined, { external: true });
+	assert.match(external.custom.rules[0].expression, /"\/oauth\/authorize"/);
+	assert.match(external.custom.rules[0].expression, /\{"POST" "OPTIONS"\} and http\.request\.uri\.path eq "\/oauth\/token"/);
+	assert.match(external.custom.rules[0].expression, /"\/\.well-known\/oauth-authorization-server"/);
+	assert.match(external.custom.rules[0].description, /the passkey page, and external sign-in$/);
+	assert.deepEqual(external.custom.rules.slice(1), plain.custom.rules.slice(1));
+	// The production host is under RP_ID: the page is on unless PASSKEY_PAGE says otherwise.
+	const production = '[vars]\nRP_ID = "example.test"\n';
+	assert.deepEqual(signInPages(production, 'chat.example.test'), { external: false });
+	assert.deepEqual(signInPages(production, 'example.test'), { external: false });
+	assert.deepEqual(signInPages(`${production}EXTERNAL_SIGN_IN = "true"\n`, 'chat.example.test'), { external: true });
+	assert.equal(signInPages(`${production}PASSKEY_PAGE = "false"\n`, 'chat.example.test'), undefined);
+	assert.equal(signInPages(production, 'chat.other.test'), undefined);
+	assert.equal(signInPages(production, 'badexample.test'), undefined);
+	assert.equal(signInPages('[vars]\n', 'chat.example.test'), undefined);
 });
 
 test('a plan with uploads requires the bucket binding and both origins', () => {
