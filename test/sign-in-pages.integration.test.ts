@@ -1,0 +1,486 @@
+import { env, runInDurableObject, SELF } from 'cloudflare:test';
+import { afterEach, expect, it } from 'vitest';
+import { fetchEntry } from '../src/index';
+import { connect as open, greeting, request, type Frame, type Peer } from './helpers/socket';
+import { softPasskey } from './helpers/webauthn';
+
+// The passkey page (PLAN_WEBAUTHN_EXTERNAL.md) and `external` (protocol
+// §4.12) are served on a host that is the RP ID or under it. The suites'
+// RP ID is `localhost`, so these connect to https://localhost, whose origin
+// the page runs on; other suites reach demo.test, where nothing changes.
+const ORIGIN = 'https://localhost';
+const APP = 'com.example.myapp';
+const APP_REDIRECT = `${APP}:/signed-in`;
+
+let nextIp = 1;
+const stub = () => env.DEMO.getByName('public-demo-v1');
+const ip = () => `192.0.2.${nextIp++}`;
+/** A connection to this host: `null` origin, as a native app sends; or the local web client's. */
+const connect = (origin: string | null = null) => open({ ip: ip(), origin, host: 'localhost' });
+type Passkey = Awaited<ReturnType<typeof softPasskey>>;
+/** Each passkey's signature counter, which must move forward at each use. */
+const counters = new WeakMap<Passkey, number>();
+const nextCounter = (passkey: Passkey) => { const next = (counters.get(passkey) ?? 0) + 1; counters.set(passkey, next); return next; };
+
+async function setExternal(on: boolean): Promise<void> {
+	await runInDurableObject(stub(), (instance) => {
+		const server = instance as unknown as { config: { externalSignIn: boolean } };
+		server.config = { ...server.config, externalSignIn: on };
+	});
+}
+
+afterEach(() => setExternal(false));
+
+/** The Worker's environment with EXTERNAL_SIGN_IN on, for what it answers from its own configuration. */
+const withExternal = () => ({ ...env, EXTERNAL_SIGN_IN: 'true' }) as unknown as Env;
+
+const b64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+
+/** A client's side of an authorization request (protocol §4.12.2): PKCE, state, and the query it adds. */
+async function client(redirectUri = APP_REDIRECT, clientId = APP) {
+	const verifier = b64(crypto.getRandomValues(new Uint8Array(32)));
+	const challenge = b64(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))));
+	const state = b64(crypto.getRandomValues(new Uint8Array(12)));
+	const params = {
+		response_type: 'code', client_id: clientId, redirect_uri: redirectUri,
+		code_challenge: challenge, code_challenge_method: 'S256', state, resource: ORIGIN,
+	};
+	return {
+		verifier, state, redirectUri, clientId, params,
+		/** `external.url` with the client's parameters added, keeping its own query. */
+		url(base: string, overrides: Record<string, string | null> = {}) {
+			const url = new URL(base);
+			for (const [key, value] of Object.entries({ ...params, ...overrides })) {
+				if (value === null) url.searchParams.delete(key);
+				else url.searchParams.set(key, value);
+			}
+			return url;
+		},
+		/** What `auth` sends to redeem a code. */
+		redeem(code: string, extra: Record<string, unknown> = {}) {
+			return { code, code_verifier: verifier, redirect_uri: redirectUri, client_id: clientId, ...extra };
+		},
+	};
+}
+
+type Client = Awaited<ReturnType<typeof client>>;
+
+const page = (url: URL, init: RequestInit = {}) => SELF.fetch(url.href, { ...init, headers: { 'CF-Connecting-IP': ip(), ...init.headers } });
+const pagePost = (path: string, body: unknown, origin: string | null = ORIGIN) => SELF.fetch(`${ORIGIN}${path}`, {
+	method: 'POST', body: JSON.stringify(body),
+	headers: { 'CF-Connecting-IP': ip(), 'Content-Type': 'application/json', ...(origin ? { Origin: origin } : {}) },
+});
+
+/**
+ * What the page's script does: begin, run the passkey on the server's
+ * origin, finish. `client` adds to the client data, as a frame would.
+ */
+async function ceremony(url: URL, passkey: Passkey, options: { page?: 'passkey' | 'authorize'; action?: 'login' | 'register'; client?: Record<string, unknown> } = {}) {
+	const pageName = options.page ?? 'passkey';
+	const begun = await pagePost('/passkey/begin', { page: pageName, query: url.searchParams.toString(), ...(options.action ? { action: options.action } : {}) });
+	expect(begun.status).toBe(200);
+	const { challenge_id, public_key } = await begun.json() as { challenge_id: string; public_key: any };
+	const action = options.action ?? url.searchParams.get('action');
+	const credential = action === 'login' ? await passkey.assert(public_key, nextCounter(passkey), options.client) : await passkey.register(public_key, options.client);
+	const finished = await pagePost('/passkey/finish', { challenge_id, credential });
+	return { status: finished.status, body: await finished.json() as { redirect?: string; account?: { user_id: string; name?: string }; error?: string }, publicKey: public_key };
+}
+
+/** The code and state the page sent back to the client's redirect. */
+function returned(redirect: string, to: Client) {
+	expect(redirect.startsWith(`${to.redirectUri}?`)).toBe(true);
+	const url = new URL(redirect);
+	expect(url.searchParams.get('state')).toBe(to.state);
+	expect(url.searchParams.get('iss')).toBe(ORIGIN);
+	return url.searchParams.get('code')!;
+}
+
+/** A `webauthn` begin on `peer`, which returns the passkey page's URL. */
+async function begin(peer: Peer, action: 'login' | 'register', extra: Record<string, unknown> = {}): Promise<Frame> {
+	return request(peer, `begin-${crypto.randomUUID()}`, 'auth', { scheme: 'webauthn', action, step: 'begin', ...extra });
+}
+
+/** Creates an account through the passkey page and signs `peer` in with its code. */
+async function registerThroughPage(name = 'Ada'): Promise<{ peer: Peer; passkey: Passkey; userId: string; token: string }> {
+	const peer = await connect();
+	await greeting(peer);
+	const begun = await begin(peer, 'register', { name });
+	const app = await client();
+	const passkey = await softPasskey(ORIGIN);
+	const done = await ceremony(app.url(begun.result.external.url), passkey);
+	expect(done.status).toBe(200);
+	expect(done.body.account).toBeUndefined();
+	const finished = await request(peer, 'finish', 'auth', { scheme: 'webauthn', action: 'register', step: 'finish', ...app.redeem(returned(done.body.redirect!, app)) });
+	expect(finished.result.you.name).toBe(name);
+	return { peer, passkey, userId: finished.result.you.user_id, token: finished.result.token };
+}
+
+/** Rewrites every stored code to have expired. */
+async function expireCodes(): Promise<void> {
+	await runInDurableObject(stub(), async (_instance, state) => {
+		const codes = await state.storage.list<{ expiresMs: number }>({ prefix: 'signin-code:' });
+		for (const [key, value] of codes) await state.storage.put(key, { ...value, expiresMs: Date.now() - 1 });
+	});
+}
+
+it('offers the passkey page in webauthn begin results, to every client on a host under the RP ID', async () => {
+	// The local web client: a ceremony in the client, and the page besides.
+	const web = await connect('http://localhost:5173');
+	// A native app: no Origin, so no ceremony of its own; the page only.
+	const app = await connect();
+	// Where the host is not under the RP ID, nothing changes.
+	const elsewhere = await open({ ip: ip(), origin: null });
+	try {
+		expect((await greeting(web)).server.params.auth).toEqual(['webauthn', 'token', 'guest']);
+		const local = await begin(web, 'login');
+		expect(local.result).toMatchObject({ challenge_id: expect.any(String), public_key: { rpId: 'localhost', userVerification: 'required' } });
+		expect(local.result.external).toEqual({ url: `${ORIGIN}/passkey?action=login` });
+		const named = await begin(web, 'register', { name: 'Ada Lovelace' });
+		expect(named.result.external.url).toBe(`${ORIGIN}/passkey?action=register&name=Ada+Lovelace`);
+
+		const { server, welcome } = await greeting(app);
+		expect(server.params.auth).toEqual(['webauthn', 'token', 'guest']);
+		expect(server.params.signup).toEqual(['webauthn', 'token']);
+		expect(server.params.welcome).toMatch(/Create a passkey/);
+		expect(welcome.params.body.text).toMatch(/^Welcome to Apron Chat/);
+		const remote = await begin(app, 'register');
+		expect(remote.result).toEqual({ external: { url: `${ORIGIN}/passkey?action=register` } });
+		// A credential finish still needs one of RP_ORIGINS.
+		const finish = await request(app, 'f', 'auth', { scheme: 'webauthn', action: 'login', step: 'finish', challenge_id: 'x', credential: {} });
+		expect(finish.error.code).toBe(-32001);
+
+		expect((await greeting(elsewhere)).server.params.auth).toEqual(['token', 'guest']);
+		expect((await begin(elsewhere, 'login')).error.code).toBe(-32601);
+	} finally { web.close(); app.close(); elsewhere.close(); }
+});
+
+it('creates an account and signs in through the passkey page, with a bearer token that resumes from any client', async () => {
+	const { peer, passkey, userId, token } = await registerThroughPage('Ada');
+	peer.close();
+	expect(userId).toMatch(/^ada_\d{4}$/);
+	expect(token).toMatch(/^apron_session_/);
+	// Not bound to an origin (PLAN_WEBAUTHN_EXTERNAL.md "Rules"): no Origin, or the web client's.
+	for (const origin of [null, 'http://localhost:5173']) {
+		const again = await connect(origin);
+		try {
+			await greeting(again);
+			expect((await request(again, 'resume', 'auth', { scheme: 'token', token })).result.you.user_id).toBe(userId);
+		} finally { again.close(); }
+	}
+
+	// Signing in: the page answers the account to allow, then the code signs in on any connection.
+	const app = await client();
+	const done = await ceremony(app.url(`${ORIGIN}/passkey?action=login`), passkey);
+	expect(done.status).toBe(200);
+	expect(done.body.account).toEqual({ user_id: userId, name: 'Ada' });
+	const other = await connect();
+	try {
+		await greeting(other);
+		// A guest connection signs in, as a passkey in the client would (§4.10).
+		expect((await request(other, 'guest', 'auth', { scheme: 'guest' })).result.you.user_id).toMatch(/^guest_/);
+		const signedIn = await request(other, 'finish', 'auth', { scheme: 'webauthn', action: 'login', step: 'finish', ...app.redeem(returned(done.body.redirect!, app)) });
+		expect(signedIn.result.you).toMatchObject({ user_id: userId, name: 'Ada' });
+		expect(signedIn.result.token).toMatch(/^apron_session_/);
+	} finally { other.close(); }
+});
+
+it('validates the authorization request on the page itself, and never redirects an invalid one', async () => {
+	const app = await client();
+	const base = `${ORIGIN}/passkey?action=login`;
+	const refused = async (overrides: Record<string, string | null>, text: RegExp) => {
+		const response = await page(app.url(base, overrides), { redirect: 'manual' });
+		expect(response.status).toBe(400);
+		expect(response.headers.get('Location')).toBeNull();
+		expect(response.headers.get('Content-Security-Policy')).toContain("frame-ancestors 'none'");
+		expect(response.headers.get('X-Frame-Options')).toBe('DENY');
+		const body = await response.text();
+		expect(body).toMatch(text);
+		expect(body).not.toContain('<script nonce');
+	};
+	await refused({ redirect_uri: 'http://evil.example/callback' }, /return address \(redirect_uri\) is not one/);
+	await refused({ redirect_uri: 'myapp:/no-dot' }, /redirect_uri/);
+	await refused({ redirect_uri: 'https://chat.alice.dev/cb#fragment' }, /redirect_uri/);
+	await refused({ redirect_uri: null }, /no return address/);
+	await refused({ resource: 'https://other.example' }, /for another server \(https:\/\/other\.example\)/);
+	await refused({ resource: null }, /must name this server/);
+	await refused({ code_challenge: null }, /PKCE with S256/);
+	await refused({ code_challenge_method: 'plain' }, /PKCE with S256/);
+	await refused({ response_type: 'token' }, /response_type=code/);
+	await refused({ state: null }, /state/);
+	await refused({ client_id: null }, /client_id/);
+	await refused({ action: 'switch' }, /action/);
+	await refused({ action: 'register', request: 'rq_not-a-handle' }, /add a passkey is not valid/);
+	await refused({ name: 'Ada' }, /mixes a sign-in with a new passkey/);
+
+	// A valid request: the page, which names the client and is never framed or cached.
+	const shown = await page(app.url(base));
+	expect(shown.status).toBe(200);
+	expect(shown.headers.get('Content-Type')).toBe('text/html; charset=utf-8');
+	expect(shown.headers.get('Content-Security-Policy')).toMatch(/frame-ancestors 'none'.*|.*frame-ancestors 'none'/);
+	expect(shown.headers.get('X-Frame-Options')).toBe('DENY');
+	expect(shown.headers.get('Cache-Control')).toBe('no-store');
+	expect(shown.headers.get('Referrer-Policy')).toBe('no-referrer');
+	const html = await shown.text();
+	expect(html).toContain('<strong>An app on this device (com.example.myapp)</strong> wants to sign in to your account on <strong>localhost</strong>. It will be able to read and send messages as you.');
+	expect(html).toContain('localhost has not verified this app.');
+	expect(html).toContain('Only continue if you just started signing in on an app on this device.');
+	expect(html).toContain('Continue with passkey');
+	expect(html).toContain('Not you? <button type="button" class="link" id="another">Use another passkey</button>');
+	// Cancel goes back with access_denied, state, and iss.
+	const deny = new URL(JSON.parse(/<script type="application\/json" id="config">(.*?)<\/script>/.exec(html)![1]).deny);
+	expect(deny.href.startsWith(`${APP_REDIRECT}?`)).toBe(true);
+	expect(Object.fromEntries(deny.searchParams)).toEqual({ error: 'access_denied', state: app.state, iss: ORIGIN });
+
+	// Who is asking, by the redirect: an https host; a loopback address.
+	const web = await client('https://chat.alice.dev/callback', 'https://chat.alice.dev/client.json');
+	expect(await (await page(web.url(base))).text()).toContain('<strong>chat.alice.dev</strong> wants to sign in');
+	const loopback = await client('http://127.0.0.1:53682/callback');
+	const loopbackHtml = await (await page(loopback.url(base))).text();
+	expect(loopbackHtml).toContain('<strong>An app on this device</strong> wants to sign in');
+	const registerHtml = await (await page(app.url(`${ORIGIN}/passkey?action=register&name=Ada`))).text();
+	expect(registerHtml).toContain('wants to create an account for you on <strong>localhost</strong>, with a new passkey.');
+
+	// The page's own requests are checked again, and must come from the page.
+	expect((await pagePost('/passkey/begin', { page: 'passkey', query: app.url(base, { resource: 'https://other.example' }).searchParams.toString() })).status).toBe(400);
+	expect((await pagePost('/passkey/begin', { page: 'passkey', query: app.url(base).searchParams.toString() }, 'https://evil.example')).status).toBe(403);
+	expect((await pagePost('/passkey/begin', { page: 'passkey', query: app.url(base).searchParams.toString() }, null)).status).toBe(403);
+	expect((await pagePost('/passkey/finish', { challenge_id: 'missing', credential: {} })).status).toBe(400);
+	// Elsewhere (a host not under the RP ID), there is no page.
+	expect((await SELF.fetch(app.url(base).href.replace(ORIGIN, 'https://demo.test'), { headers: { 'CF-Connecting-IP': ip() } })).status).toBe(404);
+});
+
+it('refuses a ceremony run in a frame on another site: crossOrigin or topOrigin in the client data', async () => {
+	const app = await client();
+	const passkey = await softPasskey(ORIGIN);
+	for (const framed of [{ crossOrigin: true }, { topOrigin: 'https://evil.example' }, { crossOrigin: false, topOrigin: ORIGIN }]) {
+		const done = await ceremony(app.url(`${ORIGIN}/passkey?action=register&name=Framed`), passkey, { client: framed });
+		expect(done.status).toBe(400);
+		expect(done.body.redirect).toBeUndefined();
+	}
+	// The same passkey, not framed, works; crossOrigin: false alone is fine.
+	const done = await ceremony(app.url(`${ORIGIN}/passkey?action=register&name=Framed`), passkey, { client: { crossOrigin: false } });
+	expect(done.status).toBe(200);
+	// A ceremony refused is used up.
+	const begun = await pagePost('/passkey/begin', { page: 'passkey', query: app.url(`${ORIGIN}/passkey?action=login`).searchParams.toString() });
+	const { challenge_id, public_key } = await begun.json() as { challenge_id: string; public_key: any };
+	expect((await pagePost('/passkey/finish', { challenge_id, credential: await passkey.assert(public_key, nextCounter(passkey), { topOrigin: 'https://evil.example' }) })).status).toBe(400);
+	expect((await pagePost('/passkey/finish', { challenge_id, credential: await passkey.assert(public_key, nextCounter(passkey)) })).status).toBe(400);
+});
+
+it('binds codes to their action, client, redirect, verifier and page, once, until they expire', async () => {
+	const { peer, passkey, userId } = await registerThroughPage('Bea');
+	peer.close();
+	const signIn = async () => {
+		const app = await client();
+		const done = await ceremony(app.url(`${ORIGIN}/passkey?action=login`), passkey);
+		return { app, code: returned(done.body.redirect!, app) };
+	};
+	const finish = (target: Peer, params: Record<string, unknown>, action = 'login') =>
+		request(target, `finish-${crypto.randomUUID()}`, 'auth', { scheme: 'webauthn', action, step: 'finish', ...params });
+	const fresh = async () => { const target = await connect(); await greeting(target); return target; };
+
+	const target = await fresh();
+	try {
+		// Each mismatch is denied, and uses the code up.
+		const wrongAction = await signIn();
+		expect((await finish(target, wrongAction.app.redeem(wrongAction.code), 'register')).error.code).toBe(-32001);
+		expect((await finish(target, wrongAction.app.redeem(wrongAction.code))).error.code).toBe(-32001);
+		for (const wrong of [{ code_verifier: b64(crypto.getRandomValues(new Uint8Array(32))) }, { redirect_uri: 'com.example.other:/signed-in' }, { client_id: 'com.example.other' }]) {
+			const attempt = await signIn();
+			expect((await finish(target, attempt.app.redeem(attempt.code, wrong))).error.code).toBe(-32001);
+			expect((await finish(target, attempt.app.redeem(attempt.code))).error.code).toBe(-32001);
+		}
+		// Expired.
+		const late = await signIn();
+		await expireCodes();
+		expect((await finish(target, late.app.redeem(late.code))).error.code).toBe(-32001);
+		// Once only: the second use is denied, also on another connection.
+		const once = await signIn();
+		expect((await finish(target, once.app.redeem(once.code))).result.you.user_id).toBe(userId);
+		const second = await fresh();
+		try {
+			expect((await finish(second, once.app.redeem(once.code))).error.code).toBe(-32001);
+		} finally { second.close(); }
+		// A signed-in connection does not switch accounts with a code.
+		const switching = await signIn();
+		expect((await finish(target, switching.app.redeem(switching.code))).error.code).toBe(-32001);
+	} finally { target.close(); }
+
+	// The page binds: a passkey-page code does not finish `external`, nor an `/oauth/authorize` code `webauthn`.
+	await setExternal(true);
+	const crossed = await fresh();
+	try {
+		const passkeyCode = await signIn();
+		expect((await request(crossed, 'ext', 'auth', { scheme: 'external', ...passkeyCode.app.redeem(passkeyCode.code) })).error.code).toBe(-32001);
+		const app = await client();
+		const authorized = await ceremony(app.url(`${ORIGIN}/oauth/authorize`), passkey, { page: 'authorize', action: 'login' });
+		expect(authorized.status).toBe(200);
+		expect((await finish(crossed, app.redeem(returned(authorized.body.redirect!, app)))).error.code).toBe(-32001);
+	} finally { crossed.close(); }
+});
+
+it('adds a passkey through the page only to the account whose connection began it', async () => {
+	const { peer: owner, userId } = await registerThroughPage('Cy');
+	const { peer: stranger } = await registerThroughPage('Dee');
+	try {
+		const begun = await begin(owner, 'register');
+		const url = new URL(begun.result.external.url);
+		expect(url.searchParams.get('action')).toBe('register');
+		expect(url.searchParams.get('request')).toMatch(/^rq_[A-Za-z0-9_-]{43}$/);
+		expect(url.searchParams.has('name')).toBe(false);
+
+		// The page names the account, on one screen.
+		const app = await client();
+		const html = await (await page(app.url(url.href))).text();
+		expect(html).toContain(`<strong>An app on this device (com.example.myapp)</strong> wants to add a passkey to <strong>Cy (@${userId})</strong>’s account on <strong>localhost</strong>.`);
+		expect(html).toContain('Create passkey');
+
+		const passkey = await softPasskey(ORIGIN);
+		const add = async () => {
+			const done = await ceremony(app.url(url.href), passkey);
+			expect(done.status).toBe(200);
+			expect(done.body.account).toBeUndefined();
+			return returned(done.body.redirect!, app);
+		};
+		const finish = (target: Peer, code: string) => request(target, `add-${crypto.randomUUID()}`, 'auth', { scheme: 'webauthn', action: 'register', step: 'finish', ...app.redeem(code) });
+		// Another account's connection, and a connection that is not signed in, are denied.
+		expect((await finish(stranger, await add())).error.code).toBe(-32001);
+		const anonymous = await connect();
+		try {
+			await greeting(anonymous);
+			expect((await finish(anonymous, await add())).error.code).toBe(-32001);
+		} finally { anonymous.close(); }
+		// The account's own connection adds it, and answers `you` only.
+		const added = await finish(owner, await add());
+		expect(added.result).toEqual({ you: expect.objectContaining({ user_id: userId }) });
+		const credentials = await runInDurableObject(stub(), (instance) => (instance as unknown as { store: { credentialIdsForUser(id: string): string[] } }).store.credentialIdsForUser(userId));
+		expect(credentials).toHaveLength(2);
+		expect(credentials).toContain(passkey.id);
+		// The new passkey signs in through the page.
+		const login = await client();
+		const done = await ceremony(login.url(`${ORIGIN}/passkey?action=login`), passkey);
+		expect(done.body.account?.user_id).toBe(userId);
+	} finally { owner.close(); stranger.close(); }
+});
+
+it('offers external with EXTERNAL_SIGN_IN: metadata, /oauth/authorize with a passkey, codes on the connection or at /oauth/token', async () => {
+	// Off by default: no metadata, no authorize page, and `external` is unsupported.
+	expect((await SELF.fetch(`${ORIGIN}/.well-known/oauth-authorization-server`)).status).toBe(404);
+	const off = await connect();
+	try {
+		expect((await greeting(off)).server.params.auth).not.toContain('external');
+		expect((await request(off, 'ext', 'auth', { scheme: 'external' })).error.code).toBe(-32601);
+	} finally { off.close(); }
+
+	await setExternal(true);
+	const metadata = await fetchEntry(new Request(`${ORIGIN}/.well-known/oauth-authorization-server`), withExternal());
+	expect(metadata.status).toBe(200);
+	expect(metadata.headers.get('Access-Control-Allow-Origin')).toBe('*');
+	expect(await metadata.json()).toEqual({
+		issuer: ORIGIN,
+		authorization_endpoint: `${ORIGIN}/oauth/authorize`,
+		token_endpoint: `${ORIGIN}/oauth/token`,
+		response_types_supported: ['code'],
+		grant_types_supported: ['authorization_code'],
+		code_challenge_methods_supported: ['S256'],
+		token_endpoint_auth_methods_supported: ['none'],
+		authorization_response_iss_parameter_supported: true,
+	});
+	// Only on a host the page serves.
+	expect((await fetchEntry(new Request('https://demo.test/.well-known/oauth-authorization-server'), withExternal())).status).toBe(404);
+
+	const peer = await connect();
+	try {
+		const { server } = await greeting(peer);
+		expect(server.params.auth).toEqual(['webauthn', 'token', 'external', 'guest']);
+		expect(server.params.signup).toEqual(['webauthn', 'token', 'external']);
+		expect((await request(peer, 'begin', 'auth', { scheme: 'external' })).result).toEqual({ external: { url: `${ORIGIN}/oauth/authorize` } });
+		// This server's own tokens are for `token`.
+		expect((await request(peer, 'token', 'auth', { scheme: 'external', token: 'anything' })).error.code).toBe(-32001);
+
+		// A new account on /oauth/authorize, redeemed on the connection.
+		const app = await client();
+		const shown = await fetchEntry(new Request(app.url(`${ORIGIN}/oauth/authorize`).href, { headers: { 'CF-Connecting-IP': ip() } }), withExternal());
+		expect(shown.status).toBe(200);
+		expect(shown.headers.get('X-Frame-Options')).toBe('DENY');
+		const html = await shown.text();
+		expect(html).toContain('Sign in to');
+		expect(html).toContain('Create an account');
+		const passkey = await softPasskey(ORIGIN);
+		const created = await ceremony(app.url(`${ORIGIN}/oauth/authorize`), passkey, { page: 'authorize', action: 'register' });
+		expect(created.status).toBe(200);
+		const signedUp = await request(peer, 'redeem', 'auth', { scheme: 'external', ...app.redeem(returned(created.body.redirect!, app)) });
+		const userId = signedUp.result.you.user_id;
+		expect(signedUp.result.token).toMatch(/^apron_session_/);
+
+		// On the signed-in connection, a code for the same account only answers `you`.
+		const again = await client();
+		const same = await ceremony(again.url(`${ORIGIN}/oauth/authorize`), passkey, { page: 'authorize', action: 'login' });
+		expect(same.body.account?.user_id).toBe(userId);
+		expect((await request(peer, 'same', 'auth', { scheme: 'external', ...again.redeem(returned(same.body.redirect!, again)) })).result).toEqual({ you: expect.objectContaining({ user_id: userId }) });
+
+		// Another account's identity is denied on a signed-in connection, and on a guest's.
+		const { peer: other } = await registerThroughPage('Eve');
+		const guest = await connect();
+		try {
+			await greeting(guest);
+			await request(guest, 'guest', 'auth', { scheme: 'guest' });
+			for (const target of [other, guest]) {
+				const attempt = await client();
+				const done = await ceremony(attempt.url(`${ORIGIN}/oauth/authorize`), passkey, { page: 'authorize', action: 'login' });
+				expect((await request(target, 'cross', 'auth', { scheme: 'external', ...attempt.redeem(returned(done.body.redirect!, attempt)) })).error.code).toBe(-32001);
+			}
+		} finally { other.close(); guest.close(); }
+
+		// The token endpoint: form-encoded, open to any origin, an Apron token for `token`.
+		const tokenRequest = (params: Record<string, string>) => fetchEntry(new Request(`${ORIGIN}/oauth/token`, {
+			method: 'POST', body: new URLSearchParams(params).toString(),
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'CF-Connecting-IP': ip(), Origin: 'https://chat.alice.dev' },
+		}), withExternal());
+		const library = await client('https://chat.alice.dev/callback', 'https://chat.alice.dev/client.json');
+		const done = await ceremony(library.url(`${ORIGIN}/oauth/authorize`), passkey, { page: 'authorize', action: 'login' });
+		const code = returned(done.body.redirect!, library);
+		const form = { grant_type: 'authorization_code', code, code_verifier: library.verifier, redirect_uri: library.redirectUri, client_id: library.clientId };
+		const wrongResource = await tokenRequest({ ...form, resource: 'https://other.example' });
+		expect(wrongResource.status).toBe(400);
+		expect(await wrongResource.json()).toEqual({ error: 'invalid_target' });
+		expect(await (await tokenRequest({ ...form, grant_type: 'password' })).json()).toEqual({ error: 'unsupported_grant_type' });
+		const issued = await tokenRequest({ ...form, resource: ORIGIN });
+		expect(issued.status).toBe(200);
+		expect(issued.headers.get('Access-Control-Allow-Origin')).toBe('*');
+		expect(issued.headers.get('Cache-Control')).toBe('no-store');
+		const body = await issued.json() as { access_token: string; token_type: string; expires_in: number };
+		expect(body).toMatchObject({ token_type: 'Bearer', expires_in: expect.any(Number) });
+		expect(body.access_token).toMatch(/^apron_session_/);
+		const reused = await tokenRequest(form);
+		expect(reused.status).toBe(400);
+		expect(await reused.json()).toEqual({ error: 'invalid_grant' });
+		const resumed = await connect();
+		try {
+			await greeting(resumed);
+			expect((await request(resumed, 'resume', 'auth', { scheme: 'token', token: body.access_token })).result.you.user_id).toBe(userId);
+		} finally { resumed.close(); }
+		// A passkey-page code is not for the token endpoint.
+		const pageClient = await client();
+		const pageDone = await ceremony(pageClient.url(`${ORIGIN}/passkey?action=login`), passkey);
+		const pageCode = returned(pageDone.body.redirect!, pageClient);
+		expect(await (await tokenRequest({ grant_type: 'authorization_code', code: pageCode, code_verifier: pageClient.verifier, redirect_uri: pageClient.redirectUri, client_id: pageClient.clientId })).json()).toEqual({ error: 'invalid_grant' });
+	} finally { peer.close(); }
+});
+
+it('sweeps expired codes, ceremonies and addition handles from their expiry index', async () => {
+	const app = await client();
+	// A ceremony begun and never finished, and a code never redeemed.
+	await pagePost('/passkey/begin', { page: 'passkey', query: app.url(`${ORIGIN}/passkey?action=login`).searchParams.toString() });
+	const done = await ceremony(app.url(`${ORIGIN}/passkey?action=register&name=Swept`), await softPasskey(ORIGIN));
+	expect(done.status).toBe(200);
+	const records = () => runInDurableObject(stub(), async (_instance, state) => [...(await state.storage.list({ prefix: 'signin-' })).keys()]);
+	expect((await records()).some((key) => key.startsWith('signin-code:'))).toBe(true);
+	expect((await records()).some((key) => key.startsWith('signin-ceremony:'))).toBe(true);
+	// Past the longest lifetime (an addition handle's 10 minutes), every record and entry goes.
+	await runInDurableObject(stub(), async (instance) => {
+		const sweep = (instance as unknown as { sweepSignIn(now: number): Promise<boolean> }).sweepSignIn.bind(instance);
+		while (await sweep(Date.now() + 11 * 60_000)) { /* a full batch may leave more */ }
+	});
+	expect(await records()).toEqual([]);
+});

@@ -32,25 +32,29 @@ function derSignature(raw: Uint8Array): Uint8Array<ArrayBuffer> {
 	return join(new Uint8Array([0x30, content.length]), content);
 }
 
-/** One passkey: `register` answers creation options, `assert` request options, both for `origin`. */
+/**
+ * One passkey: `register` answers creation options, `assert` request options,
+ * both for `origin`. `client` adds to the client data, such as the
+ * `crossOrigin` and `topOrigin` of a ceremony run in a frame.
+ */
 export async function softPasskey(origin: string) {
 	const key = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']) as CryptoKeyPair;
 	const jwk = await crypto.subtle.exportKey('jwk', key.publicKey);
 	const rawId = crypto.getRandomValues(new Uint8Array(32));
 	const id = b64(rawId);
 	const cose = cbor(new Map<number, any>([[1, 2], [3, -7], [-1, 1], [-2, unb64(jwk.x!)], [-3, unb64(jwk.y!)]]));
-	const clientData = (challenge: string, type: string) => encode(JSON.stringify({ type, challenge, origin }));
+	const clientData = (challenge: string, type: string, client: Record<string, unknown> = {}) => encode(JSON.stringify({ type, challenge, origin, ...client }));
 	return {
 		id,
-		async register(options: { challenge: string; rp: { id: string } }) {
+		async register(options: { challenge: string; rp: { id: string } }, client: Record<string, unknown> = {}) {
 			const authData = join(await hash(encode(options.rp.id)), new Uint8Array([0x45, 0, 0, 0, 0]), new Uint8Array(16), new Uint8Array([0, rawId.length]), rawId, cose);
 			return { id, rawId: id, type: 'public-key', response: {
-				clientDataJSON: b64(clientData(options.challenge, 'webauthn.create')),
+				clientDataJSON: b64(clientData(options.challenge, 'webauthn.create', client)),
 				attestationObject: b64(cbor(new Map<string, any>([['fmt', 'none'], ['attStmt', new Map()], ['authData', authData]]))),
 			}, clientExtensionResults: { credProps: { rk: true } } };
 		},
-		async assert(options: { challenge: string; rpId: string }, counter = 1) {
-			const data = clientData(options.challenge, 'webauthn.get');
+		async assert(options: { challenge: string; rpId: string }, counter = 1, client: Record<string, unknown> = {}) {
+			const data = clientData(options.challenge, 'webauthn.get', client);
 			const authData = join(await hash(encode(options.rpId)), new Uint8Array([5, 0, 0, 0, counter]));
 			const raw = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key.privateKey, join(authData, await hash(data))));
 			return { id, rawId: id, type: 'public-key', response: {
