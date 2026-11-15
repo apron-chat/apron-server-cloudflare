@@ -3,22 +3,25 @@
  * `external` is offered, `/oauth/authorize`. Both are one server-rendered
  * page with a small inline script that runs `navigator.credentials` on the
  * server's own origin, so the passkey's RP ID always fits. The wording is
- * PLAN_WEBAUTHN_EXTERNAL.md's "Confirmation": who is asking and what they
- * get before the passkey, then the account and Allow after it.
+ * PLAN_WEBAUTHN_EXTERNAL.md's "Confirmation", on one screen: who is asking
+ * and what they get, before the passkey. A verified passkey goes straight
+ * back to the client with its code; the device's passkey sheet has already
+ * shown which account it is.
  */
 import { PAGE_BEGIN_PATH, PAGE_FINISH_PATH, type SignInPage } from "./oauth";
 
 /** What a sign-in page shows: everything is text, escaped here. */
 export interface SignInPageView {
 	page: SignInPage;
-	/** `login` and `register` start on that screen; `add` is an addition, for `account`. */
+	/** The page's one screen: `login`, `register`, or `add`, an addition for `account`. */
 	start: "login" | "register" | "add";
-	/** The server's title, as in the `server` frame ("Sign in to Apron Demo"). */
+	/** The server's title, as in the `server` frame ("Apron Demo"). */
 	title: string;
 	/** The server's host, such as `server.apron.chat`. */
 	host: string;
-	/** Who is asking (clientLabel). */
+	/** Who is asking, at the start of a sentence and within one, and where they started (clientLabel). */
 	who: string;
+	client: string;
 	where: string;
 	/** Whether the server recognises the client, which drops "has not verified this app". */
 	recognised: boolean;
@@ -67,27 +70,26 @@ button { font: inherit; border-radius: 8px; padding: 8px 16px; cursor: pointer; 
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
 button.link { border: 0; padding: 0; background: none; color: var(--accent); text-decoration: underline; }
 button:disabled { opacity: 0.6; cursor: default; }
-[hidden] { display: none !important; }
 #status:empty { display: none; }
 #status, .switch { margin-top: 16px; }
 `;
 
 /**
- * The page's script: prepares a ceremony as each passkey screen shows (so
- * the click that the browser needs goes straight to the passkey prompt),
- * runs it, sends the credential to the server, and then shows the account
- * to allow (a sign-in) or goes back to the client (a new passkey). Cancel
- * goes back with `error=access_denied`.
+ * The page's script: prepares the screen's ceremony as it shows (so the
+ * click that the browser needs goes straight to the passkey prompt), runs
+ * it, sends the credential to the server, and goes back to the client with
+ * the code. On `/oauth/authorize`, "Create an account" runs a new passkey's
+ * ceremony instead, begun on its click. Cancel goes back with
+ * `error=access_denied`.
  */
 const SCRIPT = `
 "use strict";
 const config = JSON.parse(document.getElementById("config").textContent);
 const $ = (id) => document.getElementById(id);
 const status = (text) => { $("status").textContent = text; };
-let action = config.start === "login" ? "login" : "register";
+const primary = config.start === "login" ? "login" : "register";
 let prepared = null;
 let preparing = null;
-let allowTo = null;
 
 const fromB64 = (text) => Uint8Array.from(atob(text.replaceAll("-", "+").replaceAll("_", "/")), (c) => c.charCodeAt(0));
 const toB64 = (buffer) => btoa(String.fromCharCode(...new Uint8Array(buffer))).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
@@ -121,24 +123,31 @@ async function post(path, body) {
 	}
 }
 
-function prepare() {
+function prepare(action) {
 	prepared = null;
-	const mine = preparing = post(${JSON.stringify(PAGE_BEGIN_PATH)}, { page: config.page, query: config.query, action }).then((result) => {
+	const mine = { action };
+	preparing = mine;
+	mine.done = post(${JSON.stringify(PAGE_BEGIN_PATH)}, { page: config.page, query: config.query, action }).then((result) => {
 		if (preparing !== mine) return;
 		preparing = null;
 		if (result.error) { status(result.error); return; }
-		prepared = result;
+		prepared = { action, options: result };
 	});
-	return mine;
+	return mine.done;
 }
 
 function busy(on) { for (const button of document.querySelectorAll("button")) button.disabled = on; }
 
-async function passkey() {
+async function passkey(action) {
 	status("");
 	if (!window.PublicKeyCredential || !navigator.credentials) { status("This browser cannot use passkeys."); return; }
-	if (!prepared) { busy(true); await (preparing || prepare()); busy(false); if (!prepared) return; }
-	const options = prepared;
+	if (!prepared || prepared.action !== action) {
+		busy(true);
+		await (preparing && preparing.action === action ? preparing.done : prepare(action));
+		busy(false);
+		if (!prepared || prepared.action !== action) return;
+	}
+	const options = prepared.options;
 	prepared = null;
 	busy(true);
 	let credential;
@@ -149,41 +158,17 @@ async function passkey() {
 	} catch (error) {
 		busy(false);
 		status(error && error.name === "NotAllowedError" ? "No passkey was used. Try again when you're ready." : "Your browser could not use a passkey" + (error && error.message ? ": " + error.message : "."));
-		prepare();
+		prepare(primary);
 		return;
 	}
 	const result = await post(${JSON.stringify(PAGE_FINISH_PATH)}, { challenge_id: options.challenge_id, credential: credentialJson(credential) });
-	busy(false);
-	if (result.error) { status(result.error); prepare(); return; }
-	if (result.account) {
-		allowTo = result.redirect;
-		$("account").textContent = result.account.name ? result.account.name + " (@" + result.account.user_id + ")" : "@" + result.account.user_id;
-		show("allow");
-		prepare();
-		return;
-	}
-	busy(true);
+	if (result.error) { busy(false); status(result.error); prepare(primary); return; }
 	location.assign(result.redirect);
 }
 
-function show(screen) {
-	for (const section of document.querySelectorAll("section")) section.hidden = section.id !== screen;
-	status("");
-}
-
-function switchTo(next) {
-	action = next;
-	show(next === "login" ? "start-login" : "start-register");
-	prepare();
-}
-
-for (const button of document.querySelectorAll("[data-passkey]")) button.addEventListener("click", passkey);
+for (const button of document.querySelectorAll("[data-passkey]")) button.addEventListener("click", () => passkey(button.dataset.passkey || primary));
 for (const button of document.querySelectorAll("[data-cancel]")) button.addEventListener("click", () => { busy(true); location.assign(config.deny); });
-for (const button of document.querySelectorAll("[data-switch]")) button.addEventListener("click", () => switchTo(button.dataset.switch));
-$("allow-button").addEventListener("click", () => { if (allowTo) { busy(true); location.assign(allowTo); } });
-$("another").addEventListener("click", () => { action = "login"; passkey(); });
-show(config.start === "add" ? "start-add" : config.start === "login" ? "start-login" : "start-register");
-prepare();
+prepare(primary);
 `;
 
 /** A sign-in page, ready for `navigator.credentials` on the server's origin. */
@@ -194,36 +179,23 @@ export function renderSignInPage(view: SignInPageView, nonce: string): string {
 	const caution = `${view.recognised ? "" : `<p class="warn">${e(view.host)} has not verified this app.</p>`}
 <p class="muted">Only continue if you just started signing in on ${e(view.where)}.</p>`;
 	const cancel = `<button type="button" data-cancel>Cancel</button>`;
-	const authorize = view.page === "authorize";
 	const account = view.account ? `${view.account.name} (@${view.account.userId})` : "";
-	const sections = [
-		`<section id="start-login" hidden>
-<h1>Sign in to ${e(view.title)}</h1>
-<p>${who} wants to sign in to your account on ${host}. It will be able to read and send messages as you.</p>
+	const screens = {
+		// `/oauth/authorize` is always this screen, with a new account's passkey besides.
+		login: `<h1>Sign in to ${e(view.title)} on ${e(view.client)}?</h1>
+<p>It will be able to read and send messages as you.</p>
 ${caution}
 <div class="actions"><button type="button" class="primary" data-passkey>Continue with passkey</button>${cancel}</div>
-${authorize ? `<p class="muted switch">New here? <button type="button" class="link" data-switch="register">Create an account</button></p>` : ""}
-</section>`,
-		`<section id="start-register" hidden>
-<h1>Create an account on ${e(view.title)}</h1>
+${view.page === "authorize" ? `<p class="muted switch">New here? <button type="button" class="link" data-passkey="register">Create an account</button></p>` : ""}`,
+		register: `<h1>Create an account on ${e(view.title)}</h1>
 <p>${who} wants to create an account for you on ${host}, with a new passkey. It will be able to read and send messages as you.</p>
 ${caution}
-<div class="actions"><button type="button" class="primary" data-passkey>Create passkey</button>${cancel}</div>
-${authorize ? `<p class="muted switch">Already have an account? <button type="button" class="link" data-switch="login">Sign in</button></p>` : ""}
-</section>`,
-		...(view.start === "add" ? [`<section id="start-add" hidden>
-<h1>Add a passkey</h1>
+<div class="actions"><button type="button" class="primary" data-passkey>Create passkey</button>${cancel}</div>`,
+		add: `<h1>Add a passkey</h1>
 <p>${who} wants to add a passkey to <strong>${e(account)}</strong>’s account on ${host}.</p>
 ${caution}
-<div class="actions"><button type="button" class="primary" data-passkey>Create passkey</button>${cancel}</div>
-</section>`] : []),
-		`<section id="allow" hidden>
-<h1>Allow access</h1>
-<p>Allow ${who} to use <strong id="account"></strong>’s account?</p>
-<p class="muted">Not you? <button type="button" class="link" id="another">Use another passkey</button></p>
-<div class="actions"><button type="button" class="primary" id="allow-button">Allow</button>${cancel}</div>
-</section>`,
-	];
+<div class="actions"><button type="button" class="primary" data-passkey>Create passkey</button>${cancel}</div>`,
+	};
 	const pageTitle = view.start === "add" ? "Add a passkey" : view.start === "register" ? `Create an account on ${view.title}` : `Sign in to ${view.title}`;
 	return `<!doctype html>
 <html lang="en">
@@ -236,7 +208,7 @@ ${caution}
 </head>
 <body>
 <main>
-${sections.join("\n")}
+${screens[view.start]}
 <noscript><p>This page needs JavaScript to use your passkey.</p></noscript>
 <p id="status" class="warn" role="status" aria-live="polite"></p>
 </main>

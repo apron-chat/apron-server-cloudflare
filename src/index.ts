@@ -3972,13 +3972,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 			account = { userId: found.identity.userId, name: found.identity.name || found.identity.userId };
 		}
 		const redirect = redirectTarget(value.redirectUri)!;
-		const { who, where } = clientLabel(redirect);
+		const { who, client, where } = clientLabel(redirect);
 		const view: SignInPageView = {
 			page,
 			start: account ? "add" : value.action,
 			title: this.serverMetadata().title ?? this.config.rpName,
 			host: new URL(origin).host,
-			who, where,
+			who, client, where,
 			recognised: recognisedClient(redirect, this.config.rpOrigins),
 			...(account ? { account } : {}),
 			query: query.toString(),
@@ -4035,9 +4035,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * The page's finish: the ceremony is used up, verified on the server's
 	 * origin (no frame, user verification), and a code issued for its
-	 * request. A sign-in answers the account too, for the page to ask Allow
-	 * with; a new account's passkey is kept with the code, and the account
-	 * created when it is redeemed.
+	 * request, which the page sends straight back to the client: its one
+	 * screen asked before the passkey. A new account's passkey is kept with
+	 * the code, and the account created when it is redeemed.
 	 */
 	private async pageFinish(body: Record<string, unknown>, origin: string, ipKey: string): Promise<Response> {
 		const challengeId = typeof body.challenge_id === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(body.challenge_id) ? body.challenge_id : undefined;
@@ -4083,10 +4083,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			expiresMs: nowMs() + CODE_TTL_MS,
 		};
 		await this.putSignInRecord(SIGN_IN_CODE_KEY_PREFIX + await sha256Hex(code), record);
-		const redirect = redirectWith(ceremony.request.redirectUri, { code, state: ceremony.request.state, iss: origin });
-		// A sign-in asks Allow with the account (screen 2); a new passkey's single screen already asked.
-		if (action === "login") return pageJson(200, { redirect, account: { user_id: finished.identity.user_id, ...(finished.identity.name ? { name: finished.identity.name } : {}) } });
-		return pageJson(200, { redirect });
+		return pageJson(200, { redirect: redirectWith(ceremony.request.redirectUri, { code, state: ceremony.request.state, iss: origin }) });
 	}
 
 	/**

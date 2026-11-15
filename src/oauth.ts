@@ -92,13 +92,15 @@ function isLoopback(hostname: string): boolean {
  * Who is asking, in the page's words (PLAN_WEBAUTHN_EXTERNAL.md,
  * "Confirmation"): an `https` redirect's host; an app scheme as "An app on
  * this device (com.example.myapp)"; a loopback address as "An app on this
- * device". `where` is how "Only continue if you just started signing in on
- * …" ends.
+ * device". `who` starts a sentence and `client` is the same within one
+ * ("Sign in to … on …?"); `where` is how "Only continue if you just started
+ * signing in on …" ends.
  */
-export function clientLabel(redirect: URL): { who: string; where: string } {
-	if (redirect.protocol === "https:") return { who: redirect.host, where: redirect.host };
-	if (redirect.protocol === "http:") return { who: "An app on this device", where: "an app on this device" };
-	return { who: `An app on this device (${redirect.protocol.slice(0, -1)})`, where: "an app on this device" };
+export function clientLabel(redirect: URL): { who: string; client: string; where: string } {
+	if (redirect.protocol === "https:") return { who: redirect.host, client: redirect.host, where: redirect.host };
+	if (redirect.protocol === "http:") return { who: "An app on this device", client: "an app on this device", where: "an app on this device" };
+	const scheme = redirect.protocol.slice(0, -1);
+	return { who: `An app on this device (${scheme})`, client: `an app on this device (${scheme})`, where: "an app on this device" };
 }
 
 /**

@@ -384,9 +384,12 @@ on any connection.
   loopback `http`; no PKCE `S256`; a `resource` other than this server.
 - It says who is asking (the redirect's host, or "An app on this device"),
   that the server has not verified the app (unless its redirect is on one of
-  `RP_ORIGINS`), and to continue only if you just started signing in there.
-  A login asks again after the passkey, naming the account ("Allow …?",
-  "Not you? Use another passkey"). Cancel returns `error=access_denied`.
+  `RP_ORIGINS`), and to continue only if you just started signing in there,
+  all on one screen before the passkey: "Sign in to … on …?" with "Continue
+  with passkey" for a login, "Create passkey" for a new account or an
+  addition (which names the account). A verified passkey goes straight back
+  to the client with the code; the device's passkey sheet has shown the
+  account. Cancel returns `error=access_denied`.
 - It cannot be framed (`frame-ancestors 'none'`, `X-Frame-Options: DENY`),
   refuses a ceremony whose client data says it ran in a frame
   (`crossOrigin` or `topOrigin`), and requires user verification.
@@ -399,8 +402,9 @@ on any connection.
 - `PASSKEY_PAGE=false` turns the page off ([configuration](configuration.md)).
 
 `EXTERNAL_SIGN_IN=true` also offers `external` (protocol §4.12 as revised on shazow/apron#115), for clients
-that implement only that scheme: `/oauth/authorize` is the same page for a
-sign-in, with a link to create an account, and its codes finish only
+that implement only that scheme: `/oauth/authorize` is the same one screen
+as a sign-in, whose "Create an account" makes a new account's passkey from
+that screen, and its codes finish only
 `external`, on a connection or at `POST /oauth/token`. The metadata is at
 `/.well-known/oauth-authorization-server`. It is off by default: every
 client that implements the passkey page reaches this server through
