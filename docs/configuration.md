@@ -65,8 +65,10 @@ upgrade is followed by a status probe. `/` and `/ws` share a bucket. IPv4-mapped
 share their IPv4 bucket; native IPv6 shares a /56. Missing or failed limiter
 bindings reject admission with 503. Exhaustion returns 429 and `Retry-After`.
 The binding is approximate and local to each Cloudflare location, not a global
-daily counter. NAT users share this limit. Development and production use distinct
-limiter namespaces; additional deployments must use distinct namespace IDs too.
+daily counter. NAT users share this limit. Development, production and
+production's [Previews](guide.md#previews) (`[[previews.ratelimits]]`) use
+distinct limiter namespaces; additional deployments must use distinct namespace
+IDs too (`npm run budget:check` refuses a shared one).
 
 Two more limits, counted only for attempts their address's own limit let
 through, stop the per-address limit from being multiplied:
@@ -292,6 +294,10 @@ What the guard cannot promise:
 - **Open sockets.** The edge rule stops new requests, not WebSockets already
   open. The Durable Object's own account-usage stop closes them when it next
   refreshes, and its per-connection limits bound them until then.
+- **Previews.** The server's [Previews](guide.md#previews) run no crons,
+  and are counted with everything else; `apron_budget_stop` blocks their
+  hosts (`*.previews.apron.chat`) with the server's. Each Preview's Durable
+  Object has the plan's daily budgets of its own.
 - **Other Workers.** Allowances are account-wide. The guard counts every
   Worker's usage but blocks only this server. Another Worker reachable on
   `workers.dev` or preview URLs, where zone WAF rules do not apply, can still

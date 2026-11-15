@@ -95,7 +95,7 @@ socket.onmessage = ({ data }) => {
 
 | | |
 | --- | --- |
-| [Developer and operator guide](docs/guide.md) | Local development, custom frontends, bots, user-visible policies, deployment, and operations |
+| [Developer and operator guide](docs/guide.md) | Local development, custom frontends, bots, user-visible policies, deployment, Previews, and operations |
 | [Implementation specification](SPEC.md) | The protocol contract, architecture, and limits |
 | [Authentication and policy](docs/policy.md) | Guests, passkeys, and demo policy |
 | [Limits for client developers](docs/limits.md) | Every limit a client can hit, how it shows up, and a checklist for a well-behaved client |

@@ -15,7 +15,12 @@ Edit limits in the selected plan file under `src/plans/`, then run
 [`edge-rules.generated.json`](edge-rules.generated.json). The server hostname
 is read from the production Wrangler custom domain, and, for a plan with
 uploads, the media hostname from its `MEDIA_ORIGIN`; where its `RP_ID` is
-that same hostname, the rules let passkey related origins through. This file
+that same hostname, the rules let passkey related origins through. With
+[Previews](guide.md#previews), a custom domain with `previews_enabled`
+(`previews.apron.chat`), every rule scoped to the server hostname also covers
+the Preview hosts (`ends_with(http.host, ".previews.apron.chat")`), letting
+through on them what the `previews` block serves, so a Preview is no less
+protected than production. This file
 contains rule definitions grouped by phase; it is not a payload for replacing
 an entire zone ruleset.
 
@@ -38,7 +43,13 @@ During an authorized deployment:
    /passkey`, and `POST` of `/passkey/begin` and `/passkey/finish`. With
    `EXTERNAL_SIGN_IN` it also lets through `GET /oauth/authorize`, `POST` and
    `OPTIONS` of `/oauth/token`, and `GET`, `HEAD` and `OPTIONS` of
-   `/.well-known/oauth-authorization-server`. The sign-in pages are counted
+   `/.well-known/oauth-authorization-server`. With Previews, the same rule
+   covers the Preview hosts, each host with what its own configuration
+   serves: production's `EXTERNAL_SIGN_IN` is off and the Previews' on, so
+   only the Preview hosts let the `external` paths through, and the Preview
+   hosts, which have no uploads or live text, never let `/w/` or `/live/`
+   through. Both share one rule, as a Free zone has five custom rules. The
+   sign-in pages are counted
    against the same per-address and per-location attempt limiters as
    connections, except the metadata, which is answered from configuration. Probes
    retain Worker rate limiting and origin checks; live text requests are
@@ -62,14 +73,15 @@ During an authorized deployment:
    a WebSocket handshake nor a status probe, which `apron_invalid_request`
    would block) is sent with a 302 to the web client (`WEB_CLIENT` in
    `scripts/budget.mjs`, `https://web.apron.chat/`) with
-   `#server=wss://<the request's host>/` prefilled. The target is built from
+   `#server=wss://<the request's host>/` prefilled, a Preview's included. The target is built from
    `http.host`, so it names no server; the redirect never invokes the Worker.
 3. Optionally create `apron_admission_off`, disabled, as an emergency Block rule.
-   Enabling it prevents new requests from invoking the Worker. It does not close
+   Enabling it prevents new requests from invoking the Worker, on the
+   Preview hosts too. It does not close
    already upgraded sockets. Never replace unrelated rules with this file.
    On Workers Paid, also create:
-   - `apron_budget_stop`, disabled, which blocks the server hostname and, with
-     uploads, the media hostname. The
+   - `apron_budget_stop`, disabled, which blocks the server hostname, the
+     Preview hosts, and, with uploads, the media hostname. The
      [budget guard](configuration.md#budget-guard) turns it on and off; do not
      change it by hand or reuse it for anything else.
    - With uploads, `apron_media_invalid`, enabled, which lets the media
@@ -120,6 +132,10 @@ After applying rules, use a handful of requests, not a quota-exhaustion load tes
   work" (400), with `X-Frame-Options: DENY`.
 - With uploads, confirm an uploaded image loads from the media hostname, and
   a query string or a path outside `/f/`, `/a/` and `/e/` there is blocked.
+- With Previews, confirm a handshake to `wss://<preview>.previews.apron.chat/`
+  succeeds, `GET /oauth/authorize` there reaches the Worker, and a `POST /`
+  there is blocked; and that `GET /oauth/authorize` on the server hostname is
+  still blocked at the edge.
 - Confirm the web and documentation hosts are unaffected by the custom rules.
 - Review aggregate Worker/DO metrics and active edge definitions against the
   generated policy. Local tests verify admission behavior, not live WAF billing.
