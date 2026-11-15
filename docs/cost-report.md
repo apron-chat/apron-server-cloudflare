@@ -347,6 +347,18 @@ posts.
   `/passkeys` reads at most 8 credential rows; `/passkeys remove` adds one
   delete with its index. Adding a passkey to an account without a WebAuthn
   user handle writes it at `begin` (one conditional row update).
+- The passkey page (`/passkey`, [policy](policy.md#passkey-page)) keeps its
+  short-lived records in KV, each charged at its bound: a page's begin
+  writes its ceremony (2 writes with its expiry entry); its finish reads and
+  deletes the ceremony (1 read, 1 write) and writes the code (2 writes); a
+  redemption reads and deletes the code (1 read, 1 write), then costs what
+  a passkey sign-in, registration or addition costs, plus the session's 2
+  writes. An addition's begin writes its `request` handle (2 writes), which
+  the page reads once to show the account and once at its begin. Each page
+  request is also one entry Worker and one Durable Object request, charged
+  to the connection attempt limiters first; begin and finish are
+  authentication attempts. The hourly session sweep also probes the sign-in
+  expiry index (1 read) and deletes up to 16 due records with their entries.
 - A sign-up with an `/invite-code` token is an `/invite-token` registration, plus
   up to 8 `user_id` availability probes (8 reads each, reserved), the new
   user's identity read, and one KV read and three KV writes (in one put),

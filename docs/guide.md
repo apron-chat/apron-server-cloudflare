@@ -198,14 +198,21 @@ including the posting, listing and frame quotas and the thread and private
 room caps, and ends with a checklist for a well-behaved client.
 
 The `server` frame's `welcome` is CommonMark for your sign-in screen. The server
-advertises `token` (for bot tokens) and `guest` to custom frontends, and never
-`email` or `external`; `signup` names the schemes that create an account
-(`webauthn` on the demo's own site, and `token` for an admin's `/invite-code`
+advertises `webauthn`, `token` (for bot tokens and passkey-page sessions) and
+`guest` to custom frontends, and never `email` (nor `external`, unless the
+deployment sets `EXTERNAL_SIGN_IN`); `signup` names the schemes that create an account
+(`webauthn`, and `token` for an admin's `/invite-code`
 sign-up token, whose `auth` result carries the new user's own token to save).
 A user who signed up with a token can add a passkey by registering one while
-signed in. `web.apron.chat` additionally receives `webauthn`, and its `token`
-also resumes passkey sessions; inspect each connection's
-`server.params.auth` rather than assuming passkeys are available everywhere.
+signed in. `web.apron.chat` runs the passkey ceremony itself; every other
+frontend gets only `external` in its `webauthn` begin result: the passkey
+page on `https://server.apron.chat/passkey`, which it opens with an OAuth
+authorization request (PKCE, `state`, `resource=https://server.apron.chat`)
+and whose code it sends back in the `webauthn` finish
+([policy](policy.md#passkey-page)). The `token` from that finish resumes
+from any origin; `web.apron.chat`'s own passkey sessions resume only there.
+Inspect each connection's `server.params.auth` rather than assuming passkeys
+are available everywhere.
 A frontend with a Content Security Policy must permit the endpoint in
 `connect-src` (for example, `connect-src wss://server.apron.chat`). Wildcard
 admission cannot override the frontend's own browser policies.
@@ -359,8 +366,10 @@ yourself: nothing else does. Startup does not check `RP_ORIGINS` against
 passkey there. With edge rules, regenerate them: `apron_invalid_request`
 lets the path through when the production custom domain is `RP_ID`
 ([edge admission](edge-admission.md)). Browsers without related origins
-refuse passkeys on such a frontend; there its users sign in another way,
-such as with a token from `/invite-device` ([other devices](#other-devices)).
+refuse passkeys on such a frontend; there a client that implements the
+passkey page uses it instead: the Worker serves it on its own host when that
+is `RP_ID` or under it (`PASSKEY_PAGE`, on by default). Otherwise users sign
+in another way, such as with a token from `/invite-device` ([other devices](#other-devices)).
 Changing `RP_ID` strands the passkeys registered under the old one.
 
 ## Operations and secrets

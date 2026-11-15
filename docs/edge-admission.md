@@ -32,7 +32,15 @@ During an authorized deployment:
    and `OPTIONS` on `/w/`), with live text the reads of a live `url`
    (`GET`, `HEAD` and `OPTIONS` on `/live/`), and where `RP_ID` is the
    server hostname, `GET` and `HEAD` of `/.well-known/webauthn`, the
-   passkey [related origins](guide.md#passkeys-on-your-own-server). Probes
+   passkey [related origins](guide.md#passkeys-on-your-own-server), and
+   where the server hostname is `RP_ID` or under it with `PASSKEY_PAGE` on
+   (the default), the [passkey page](policy.md#passkey-page): `GET
+   /passkey`, and `POST` of `/passkey/begin` and `/passkey/finish`. With
+   `EXTERNAL_SIGN_IN` it also lets through `GET /oauth/authorize`, `POST` and
+   `OPTIONS` of `/oauth/token`, and `GET`, `HEAD` and `OPTIONS` of
+   `/.well-known/oauth-authorization-server`. The sign-in pages are counted
+   against the same per-address and per-location attempt limiters as
+   connections, except the metadata, which is answered from configuration. Probes
    retain Worker rate limiting and origin checks; live text requests are
    counted against the same per-address and per-location attempt limiters
    as connections. The related origins are answered from configuration
@@ -107,6 +115,9 @@ After applying rules, use a handful of requests, not a quota-exhaustion load tes
   the frontend through CORS.
 - Where `RP_ID` is the server hostname, confirm
   `GET /.well-known/webauthn` returns `RP_ORIGINS` as `{"origins": [...]}`.
+- With the passkey page, confirm `GET /passkey?action=login` without the
+  OAuth parameters reaches the Worker and shows "This sign-in link doesn't
+  work" (400), with `X-Frame-Options: DENY`.
 - With uploads, confirm an uploaded image loads from the media hostname, and
   a query string or a path outside `/f/`, `/a/` and `/e/` there is blocked.
 - Confirm the web and documentation hosts are unaffected by the custom rules.

@@ -25,9 +25,12 @@ negotiation. See
 [retention implementation specification](../SPEC.md#9-rolling-history-and-base-protocol-availability).
 
 WebAuthn uses the canonical [optional authentication scheme](https://github.com/shazow/apron/blob/main/PROTOCOL.md#410-webauthn-authentication),
-advertised through `auth: ["webauthn", "token", "guest"]` only on connections whose
-origin is in `RP_ORIGINS`. Other connections advertise `auth: ["token", "guest"]`,
-where `token` takes bot, device, and invite tokens but not passkey sessions
+advertised through `auth: ["webauthn", "token", "guest"]` on connections whose
+origin is in `RP_ORIGINS`, and on every connection to a host that serves the
+[passkey page](#passkey-page) (`RP_ID` or a host under it, as
+server.apron.chat is under `apron.chat`). Other connections advertise
+`auth: ["token", "guest"]`, where `token` takes bot, device, and invite
+tokens and sessions from the passkey page but not other passkey sessions
 (below), and reject WebAuthn requests as `unsupported`. Guest user IDs are
 `guest_<n>` from a server-wide counter, with the name `Guest <n>`; a
 requested `user_id` or `name` is ignored. Numbers are never reissued, so they
@@ -342,7 +345,7 @@ passkeys and removes any but the last. A registered
 identity must reconnect before signing in as another.
 
 `server.signup` lists the schemes that create accounts: `webauthn` where
-passkeys are offered, and `token`, which creates one only with an admin's
+passkeys are offered, `external` where it is, and `token`, which creates one only with an admin's
 sign-up invite (`/invite-code <uses>`, at most 50 sign-ups within 7 days, one
 live invite at a time). Each sign-up gets its own `apron_invite_` token in
 the `auth` result to sign in with afterwards. Other tokens only sign in, and
@@ -360,6 +363,51 @@ than half of its 30 days remain, the resume renews it for another 30. The token
 itself does not change. Sessions are stored hashed. Signing out is local to
 the client: it drops the stored token, and the connection returns as a fresh
 guest.
+
+### Passkey page
+
+A client that cannot use the RP ID (a web client on another domain, a native
+app, a terminal with a browser) signs in with a passkey on the server's own
+page instead ([PLAN_WEBAUTHN_EXTERNAL.md](https://github.com/shazow/apron/pull/116)).
+Each `webauthn` begin result carries `external: {url}`, the page at
+`https://<host>/passkey` with `action` (and a new account's `name`, or an
+addition's opaque `request` handle) in its query. Connections that cannot
+run a ceremony themselves get only `external`. The client adds an OAuth
+authorization request with PKCE (`response_type=code`, `client_id`,
+`redirect_uri`, `code_challenge`, `code_challenge_method=S256`, `state`,
+`resource=https://<host>`), opens the page, and finishes `webauthn` with the
+`code` that comes back, its `code_verifier`, `redirect_uri` and `client_id`,
+on any connection.
+
+- The page refuses a request it cannot honour on the page itself: a
+  `redirect_uri` that is not `https`, a private-use scheme with a `.`, or
+  loopback `http`; no PKCE `S256`; a `resource` other than this server.
+- It says who is asking (the redirect's host, or "An app on this device"),
+  that the server has not verified the app (unless its redirect is on one of
+  `RP_ORIGINS`), and to continue only if you just started signing in there.
+  A login asks again after the passkey, naming the account ("Allow …?",
+  "Not you? Use another passkey"). Cancel returns `error=access_denied`.
+- It cannot be framed (`frame-ancestors 'none'`, `X-Frame-Options: DENY`),
+  refuses a ceremony whose client data says it ran in a frame
+  (`crossOrigin` or `topOrigin`), and requires user verification.
+- A code lasts 5 minutes, works once, and only for `webauthn` with its
+  action, client, return address and PKCE verifier. A new account is created
+  when its code is redeemed, by the usual registration limits. An addition's
+  code works only on a connection signed in to the account that began it.
+- The token from a code is a bearer token (`apron_session_…`), not bound to
+  an origin: it resumes with `scheme: "token"` from any client.
+- `PASSKEY_PAGE=false` turns the page off ([configuration](configuration.md)).
+
+`EXTERNAL_SIGN_IN=true` also offers `external` (protocol §4.12 as revised on shazow/apron#115), for clients
+that implement only that scheme: `/oauth/authorize` is the same page for a
+sign-in, with a link to create an account, and its codes finish only
+`external`, on a connection or at `POST /oauth/token`. The metadata is at
+`/.well-known/oauth-authorization-server`. It is off by default: every
+client that implements the passkey page reaches this server through
+`webauthn`, and offering `external` changes `server.auth`. A code redeemed
+on a signed-in connection answers `you` for the same account and is
+`denied` for another; on a guest connection, it may only create a new
+account (`external` never signs in to another account).
 
 Guests only read unless the deployment sets `GUEST_POSTING=true` (a guest's
 own `you` says which, with `ext.permissions` `{"write": false}`): they can list rooms, read any room's
@@ -465,6 +513,7 @@ entries, invite uses, passkeys, roles, room mutes, threads) is `denied`; a
 value past its size limit is `too_large`; other rejected values are
 `invalid_params`. A request method sent without an `id`, and an `id` on
 `activity` or `ping`, are ignored. An `auth` scheme the server does not
-offer the connection (`email` and `external` always, `webauthn` from an
-origin not configured for passkeys) is `unsupported`. Each limit, its error
+offer the connection (`email` always, `external` without `EXTERNAL_SIGN_IN`,
+`webauthn` from an origin not configured for passkeys on a host without the
+passkey page) is `unsupported`. Each limit, its error
 text, and what a client should do about it are in [limits](limits.md).
