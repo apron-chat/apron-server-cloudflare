@@ -127,11 +127,13 @@ const tokenRequest = (params: Record<string, string>, headers: Record<string, st
 /** HTTP Basic for a public client (RFC 6749 §2.3.1): its form-urlencoded `client_id`, and an empty password. */
 const basic = (clientId: string) => ({ Authorization: `Basic ${btoa(`${encodeURIComponent(clientId).replaceAll('%20', '+')}:`)}` });
 
-/** Rewrites every stored code to have expired. */
+/** Rewrites every stored code, and the new passkeys codes hold, to have expired. */
 async function expireCodes(): Promise<void> {
 	await runInDurableObject(stub(), async (_instance, state) => {
-		const codes = await state.storage.list<{ expiresMs: number }>({ prefix: 'signin-code:' });
-		for (const [key, value] of codes) await state.storage.put(key, { ...value, expiresMs: Date.now() - 1 });
+		for (const prefix of ['signin-code:', 'signin-pending:']) {
+			const records = await state.storage.list<{ expiresMs: number }>({ prefix });
+			for (const [key, value] of records) await state.storage.put(key, { ...value, expiresMs: Date.now() - 1 });
+		}
 	});
 }
 
@@ -385,6 +387,58 @@ it('adds a passkey through the page only to the account whose connection began i
 			expect((await request(signingIn, 'login', 'auth', { scheme: 'webauthn', action: 'login', step: 'finish', ...login.redeem(returned(done.body.redirect!, login)) })).result.you.user_id).toBe(userId);
 		} finally { signingIn.close(); }
 	} finally { owner.close(); stranger.close(); }
+});
+
+it('tells the page of a passkey no account has, only when no code may still give it one', async () => {
+	const login = async (passkey: Passkey) => ceremony((await client()).url(`${ORIGIN}/passkey?action=login`), passkey);
+	const unknown = { error: "This passkey isn't for an account here. Try another passkey, or cancel to go back.", unknown_credential: true };
+	const generic = { error: "That passkey didn't work here. Try again, or use another passkey." };
+	type Server = { config: { signalUnknownPasskeys: boolean }; store: { getCredential(id: string): unknown }; pendingCredential(id: string): Promise<boolean> };
+
+	// A passkey made on the page whose code was never redeemed: pending while its code may be.
+	const orphan = await softPasskey(ORIGIN);
+	expect((await ceremony((await client()).url(`${ORIGIN}/passkey?action=register&name=Orphan`), orphan)).status).toBe(200);
+	expect(await login(orphan)).toMatchObject({ status: 400, body: generic });
+	// Once the code has expired, no account will have it.
+	await expireCodes();
+	expect(await login(orphan)).toMatchObject({ status: 400, body: unknown });
+	// Nor one this server never saw.
+	expect(await login(await softPasskey(ORIGIN))).toMatchObject({ status: 400, body: unknown });
+
+	// An assertion for another origin or RP ID, unsigned as it is without a key, is not classified.
+	expect(await login(await softPasskey('https://evil.example'))).toMatchObject({ status: 400, body: generic });
+	const elsewhere = await softPasskey(ORIGIN);
+	expect(await login({ ...elsewhere, assert: (options, counter, extra) => elsewhere.assert({ ...options, rpId: 'example.com' }, counter, extra) })).toMatchObject({ status: 400, body: generic });
+
+	// A known passkey that fails verification: another key's signature under its credential ID.
+	const { peer, passkey } = await registerThroughPage('Known');
+	peer.close();
+	const forger = await softPasskey(ORIGIN);
+	const forged = { ...forger, assert: async (options: any, counter?: number) => ({ ...await forger.assert(options, counter), id: passkey.id, rawId: passkey.id }) };
+	expect(await login(forged as Passkey)).toMatchObject({ status: 400, body: generic });
+	expect((await login(passkey)).body).toEqual({ redirect: expect.any(String) });
+
+	// A failed lookup, or a failed read of pending passkeys, is the usual error.
+	const stranger = await softPasskey(ORIGIN);
+	const broken = async (patch: (server: Server) => () => void) => {
+		const restore = await runInDurableObject(stub(), (instance) => patch(instance as unknown as Server));
+		try { return await login(stranger); } finally { await runInDurableObject(stub(), () => restore()); }
+	};
+	expect(await broken((server) => {
+		const store = server.store;
+		const original = store.getCredential;
+		store.getCredential = () => { throw new Error('storage unavailable'); };
+		return () => { store.getCredential = original; };
+	})).toMatchObject({ status: 503, body: { error: 'Something went wrong. Try again.' } });
+	expect(await broken((server) => {
+		server.pendingCredential = async () => { throw new Error('storage unavailable'); };
+		return () => { delete (server as Partial<Server>).pendingCredential; };
+	})).toMatchObject({ status: 503, body: { error: 'Something went wrong. Try again.' } });
+	expect(await broken((server) => {
+		server.config = { ...server.config, signalUnknownPasskeys: false };
+		return () => { server.config = { ...server.config, signalUnknownPasskeys: true }; };
+	})).toMatchObject({ status: 400, body: generic });
+	expect(await login(stranger)).toMatchObject({ status: 400, body: unknown });
 });
 
 it('offers external with EXTERNAL_SIGN_IN: metadata, /oauth/authorize with a passkey, codes on the connection or at /oauth/token', async () => {

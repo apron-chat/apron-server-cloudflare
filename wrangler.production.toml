@@ -104,6 +104,10 @@ RP_ID = "previews.apron.chat"
 # web.apron.chat and apron-web Previews included, signs in through the passkey
 # page. (RP_ORIGINS must list one exact origin when ALLOWED_ORIGINS is *.)
 RP_ORIGINS = "https://previews.apron.chat"
+# Every Preview shares that RP ID with its own storage, so another Preview's
+# passkey is unknown here but not stale: the page must not ask the device to
+# drop it.
+SIGNAL_UNKNOWN_PASSKEYS = "false"
 ALLOWED_ORIGINS = "*"
 SERVER_TITLE = "Apron Demo (preview)"
 SERVER_DESCRIPTION = "The public demo of [Apron](https://github.com/shazow/apron), an open chat protocol."

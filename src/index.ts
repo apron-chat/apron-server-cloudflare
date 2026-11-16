@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { AuthError, AuthTooLargeError, candidateUserIdFor, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
+import { AuthError, AuthTooLargeError, candidateUserIdFor, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
 import { LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
@@ -154,8 +154,15 @@ const SESSION_TOKEN_PREFIX = "apron_session_";
 const SIGN_IN_CODE_KEY_PREFIX = "signin-code:";
 const PAGE_CEREMONY_KEY_PREFIX = "signin-ceremony:";
 const REQUEST_HANDLE_KEY_PREFIX = "signin-request:";
+/** A new passkey that a code from the passkey page holds, under the SHA-256 of its credential ID (pendingCredential). */
+const PENDING_CREDENTIAL_KEY_PREFIX = "signin-pending:";
+/**
+ * How long a pending passkey outlasts its code: a redemption takes the code
+ * before it writes the passkey, so the passkey is never unknown in between.
+ */
+const PENDING_CREDENTIAL_GRACE_MS = 60_000;
 const SIGN_IN_EXPIRY_PREFIX = "signin-expiry:";
-const SIGN_IN_RECORD_KEY = /^signin-(code|ceremony|request):[0-9a-f]{64}$/;
+const SIGN_IN_RECORD_KEY = /^signin-(code|ceremony|request|pending):[0-9a-f]{64}$/;
 /**
  * The path the entry Worker forwards the sign-in pages' requests to the
  * object on, with the route after it, and the header that carries the
@@ -772,6 +779,12 @@ interface StoredPageCeremony {
 	request: AuthorizationRequest;
 	/** An addition's account, from its `request` handle. */
 	addsUserId?: string;
+	expiresMs: number;
+}
+
+/** A new passkey a code holds, until its code (and a grace) expires: not yet an account's, but it may become one. */
+interface StoredPendingCredential {
+	v: 1;
 	expiresMs: number;
 }
 
@@ -3812,8 +3825,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Puts a short-lived sign-in record (a code, a page ceremony, an
-	 * addition's handle) with its entry in the expiry index, which
+	 * Puts a short-lived sign-in record (a code, its pending passkey, a page
+	 * ceremony, an addition's handle) with its entry in the expiry index, which
 	 * sweepSignIn reads. Keys are SHA-256s of the secrets, as sessions' are.
 	 */
 	private async putSignInRecord<T extends { expiresMs: number }>(key: string, value: T): Promise<void> {
@@ -4076,7 +4089,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * origin (no frame, user verification), and a code issued for its
 	 * request, which the page sends straight back to the client: its one
 	 * screen asked before the passkey. A new account's passkey is kept with
-	 * the code, and the account created when it is redeemed.
+	 * the code, and the account created when it is redeemed; until then it is
+	 * pending (pendingCredential). A login with a passkey that is neither
+	 * an account's nor pending answers `unknown_credential`.
 	 */
 	private async pageFinish(body: Record<string, unknown>, origin: string, ipKey: string): Promise<Response> {
 		const challengeId = typeof body.challenge_id === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(body.challenge_id) ? body.challenge_id : undefined;
@@ -4109,9 +4124,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 			},
 			updateCredentialCounter: (credentialId, counter) => this.store.updateCredentialCounter(credentialId, counter),
 		};
-		const finished = await this.webAuthn.finish(ceremony.challenge, challengeId, credential, repository, {
-			now, ipKey, ...(ceremony.addsUserId ? { identity: { user_id: ceremony.addsUserId, tier: "registered" as const } } : {}),
-		});
+		let finished: Awaited<ReturnType<WebAuthnService["finish"]>>;
+		try {
+			finished = await this.webAuthn.finish(ceremony.challenge, challengeId, credential, repository, {
+				now, ipKey, ...(ceremony.addsUserId ? { identity: { user_id: ceremony.addsUserId, tier: "registered" as const } } : {}),
+			});
+		} catch (error) {
+			// A passkey no account has, nor a code about to give it one, such as
+			// one made here whose code was never redeemed: the script asks the
+			// device to drop it. Anything else, or a failed read, is the usual error.
+			if (error instanceof UnknownCredentialError && this.config.signalUnknownPasskeys && !await this.pendingCredential(error.credentialId)) {
+				return pageJson(400, { error: "This passkey isn't for an account here. Try another passkey, or cancel to go back.", unknown_credential: true });
+			}
+			throw error;
+		}
 		const code = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 		const record: StoredSignInCode = {
 			v: 1, page: ceremony.page, action, ...ceremony.request,
@@ -4121,8 +4147,26 @@ export class ApronDemoServer extends DurableObject<Env> {
 			...(ceremony.addsUserId ? { adds: true } : {}),
 			expiresMs: nowMs() + CODE_TTL_MS,
 		};
+		// Before the code, so no code holds a passkey that is not marked pending.
+		if (created) {
+			await this.putSignInRecord(PENDING_CREDENTIAL_KEY_PREFIX + await sha256Hex(created.credential.credentialId), {
+				v: 1, expiresMs: record.expiresMs + PENDING_CREDENTIAL_GRACE_MS,
+			} satisfies StoredPendingCredential);
+		}
 		await this.putSignInRecord(SIGN_IN_CODE_KEY_PREFIX + await sha256Hex(code), record);
 		return pageJson(200, { redirect: redirectWith(ceremony.request.redirectUri, { code, state: ceremony.request.state, iss: origin }) });
+	}
+
+	/**
+	 * Whether a code from the passkey page that may still be redeemed holds
+	 * a new passkey with this credential ID (pageFinish). Any record but an
+	 * expired one counts; a failed read throws.
+	 */
+	private async pendingCredential(credentialId: string): Promise<boolean> {
+		const key = PENDING_CREDENTIAL_KEY_PREFIX + await sha256Hex(credentialId);
+		const record = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredPendingCredential>(key));
+		if (record === undefined) return false;
+		return !(record?.v === 1 && typeof record.expiresMs === "number" && record.expiresMs <= nowMs());
 	}
 
 	/**
@@ -4179,7 +4223,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return new Response(JSON.stringify({ access_token: token, token_type: "Bearer", expires_in: this.config.limits.sessionTtlSeconds }), { headers: tokenHeaders() });
 	}
 
-	/** Drops expired sign-in records (codes, page ceremonies, addition handles) from their expiry index; whether a full batch was processed. */
+	/** Drops expired sign-in records (codes, their pending passkeys, page ceremonies, addition handles) from their expiry index; whether a full batch was processed. */
 	private async sweepSignIn(now: number): Promise<boolean> {
 		const end = `${SIGN_IN_EXPIRY_PREFIX}${Math.max(0, Math.trunc(now)).toString().padStart(16, "0")}￿`;
 		const dueProbe = await this.store.withMeterAsync("maintenance", { reads: 1 }, () => this.ctx.storage.list<SignInExpiryEntry>({ prefix: SIGN_IN_EXPIRY_PREFIX, end, limit: 1 }), now);

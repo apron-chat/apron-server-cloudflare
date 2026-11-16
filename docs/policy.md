@@ -399,6 +399,15 @@ on any connection.
   code works only on a connection signed in to the account that began it.
 - The token from a code is a bearer token (`apron_session_…`), not bound to
   an origin: it resumes with `scheme: "token"` from any client.
+- A sign-in with a passkey no account has, such as one made on the page whose
+  code was never redeemed, says "This passkey isn't for an account here." and
+  stays on the page; the page asks the browser to hide or remove that passkey
+  (WebAuthn's `signalUnknownCredential`, where the browser has it). A passkey
+  whose code may still be redeemed (until a minute after its 5 minutes) is not
+  unknown, and neither is anything the server is unsure of: a failed lookup,
+  or an assertion not for this page's challenge, origin and RP ID. Those get
+  the usual error. `SIGNAL_UNKNOWN_PASSKEYS=false` turns the signal off
+  ([configuration](configuration.md)).
 - `PASSKEY_PAGE=false` turns the page off ([configuration](configuration.md)).
 
 `EXTERNAL_SIGN_IN=true` also offers `external` (protocol §4.12 as revised on shazow/apron#115), for clients

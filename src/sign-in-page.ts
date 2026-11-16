@@ -80,7 +80,8 @@ button:disabled { opacity: 0.6; cursor: default; }
  * it, sends the credential to the server, and goes back to the client with
  * the code. On `/oauth/authorize`, "Create an account" runs a new passkey's
  * ceremony instead, begun on its click. Cancel goes back with
- * `error=access_denied`.
+ * `error=access_denied`. A sign-in with a passkey no account here has stays
+ * on the page, and asks the device to drop that passkey.
  */
 const SCRIPT = `
 "use strict";
@@ -116,7 +117,7 @@ async function post(path, body) {
 	try {
 		const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), credentials: "omit" });
 		const json = await response.json().catch(() => ({}));
-		if (!response.ok) return { error: json.error || "Something went wrong. Try again." };
+		if (!response.ok) return { error: json.error || "Something went wrong. Try again.", unknownCredential: json.unknown_credential === true };
 		return json;
 	} catch {
 		return { error: "Could not reach the server. Check your connection and try again." };
@@ -134,6 +135,15 @@ function prepare(action) {
 		prepared = { action, options: result };
 	});
 	return mine.done;
+}
+
+// A passkey no account here has, such as one made here whose sign-up was
+// never finished: the device may hide or remove it. Its ID is the one the
+// device just used, never one from the server.
+function forget(rpId, credentialId) {
+	try {
+		if (PublicKeyCredential.signalUnknownCredential) PublicKeyCredential.signalUnknownCredential({ rpId, credentialId }).catch(() => {});
+	} catch {}
 }
 
 function busy(on) { for (const button of document.querySelectorAll("button")) button.disabled = on; }
@@ -162,6 +172,7 @@ async function passkey(action) {
 		return;
 	}
 	const result = await post(${JSON.stringify(PAGE_FINISH_PATH)}, { challenge_id: options.challenge_id, credential: credentialJson(credential) });
+	if (result.unknownCredential && action === "login") forget(options.public_key.rpId, credential.id);
 	if (result.error) { busy(false); status(result.error); prepare(primary); return; }
 	location.assign(result.redirect);
 }

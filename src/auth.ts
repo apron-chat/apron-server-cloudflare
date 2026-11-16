@@ -79,6 +79,20 @@ export class AuthError extends Error {
 	}
 }
 
+/**
+ * A login whose passkey no account here has (its lookup found none). It is
+ * an AuthError, and answers as one everywhere; only the passkey page tells
+ * it apart, so the device can drop the passkey (signalUnknownCredential).
+ * Without a key the assertion is unsigned, so it is thrown only for one
+ * addressed to this ceremony (assertionAddressed); `credentialId` is the
+ * assertion's own.
+ */
+export class UnknownCredentialError extends AuthError {
+	constructor(readonly credentialId: string) {
+		super();
+	}
+}
+
 export class AuthTooLargeError extends AuthError {
 	constructor(message = "Passkey credential is too large") {
 		super(message);
@@ -185,6 +199,24 @@ function asCredentialResponse(value: unknown, maxBytes: number): RegistrationRes
 function reportsNonDiscoverableCredential(response: RegistrationResponseJSON | AuthenticationResponseJSON): boolean {
 	if (!isObject(response.clientExtensionResults) || !isObject(response.clientExtensionResults.credProps)) return false;
 	return response.clientExtensionResults.credProps.rk === false;
+}
+
+/**
+ * Whether an assertion is addressed to `challenge`, as far as its unsigned
+ * parts say: a `webauthn.get` for its challenge and origin, from an
+ * authenticator for its RP ID. Anything unreadable is not.
+ */
+async function assertionAddressed(response: AuthenticationResponseJSON, challenge: ChallengeRecord): Promise<boolean> {
+	try {
+		const decode = (value: string) => Uint8Array.from(atob(value.replaceAll("-", "+").replaceAll("_", "/") + "=".repeat((4 - value.length % 4) % 4)), (char) => char.charCodeAt(0));
+		const data = JSON.parse(new TextDecoder().decode(decode(response.response.clientDataJSON))) as Record<string, unknown>;
+		if (data.type !== "webauthn.get" || data.challenge !== challenge.challenge || data.origin !== challenge.origin) return false;
+		const authenticatorData = decode(response.response.authenticatorData);
+		const rpIdHash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(challenge.rpId)));
+		return authenticatorData.length >= 37 && rpIdHash.every((byte, index) => authenticatorData[index] === byte);
+	} catch {
+		return false;
+	}
 }
 
 function toWebAuthnCredential(record: StoredCredential): WebAuthnCredential {
@@ -345,6 +377,7 @@ export class WebAuthnService {
 		}
 		const credentialId = normalizedCredentialId((response as AuthenticationResponseJSON).id);
 		const stored = await repository.getCredential(credentialId);
+		if (stored === null && await assertionAddressed(response as AuthenticationResponseJSON, challenge)) throw new UnknownCredentialError(credentialId);
 		if (!stored) throw new AuthError();
 		let verified: Awaited<ReturnType<typeof verifyAuthenticationResponse>>;
 		try {

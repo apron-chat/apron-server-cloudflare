@@ -36,6 +36,15 @@ export interface RuntimeConfig {
 	 */
 	passkeyPage: boolean;
 	/**
+	 * Whether the passkey page tells the device to drop a passkey that no
+	 * account here has, and no unredeemed code is about to give one
+	 * (WebAuthn's signalUnknownCredential). Only for a server whose storage
+	 * holds every passkey of its RP ID: Previews share one RP ID, each with
+	 * its own storage, so turn it off there. `SIGNAL_UNKNOWN_PASSKEYS`,
+	 * default on.
+	 */
+	signalUnknownPasskeys: boolean;
+	/**
 	 * The `external` scheme (protocol §4.12), with this server as its own
 	 * authorization server: `/oauth/authorize` signs in with a passkey, and
 	 * `/.well-known/oauth-authorization-server` and `/oauth/token` are
@@ -247,6 +256,7 @@ type EnvLike = {
 	GUEST_POSTING?: string;
 	PRESENCE?: string;
 	PASSKEY_PAGE?: string;
+	SIGNAL_UNKNOWN_PASSKEYS?: string;
 	EXTERNAL_SIGN_IN?: string;
 	LIVE_TEXT?: string;
 	TERMINAL_VIEWER_URL?: string;
@@ -545,6 +555,7 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 	const guestPosting = parseSwitch(env.GUEST_POSTING, "GUEST_POSTING", DEFAULT_FEATURES.guestPosting);
 	const presence = parseSwitch(env.PRESENCE, "PRESENCE", DEFAULT_FEATURES.presence);
 	const passkeyPage = parseSwitch(env.PASSKEY_PAGE, "PASSKEY_PAGE", true);
+	const signalUnknownPasskeys = parseSwitch(env.SIGNAL_UNKNOWN_PASSKEYS, "SIGNAL_UNKNOWN_PASSKEYS", true);
 	const externalSignIn = parseSwitch(env.EXTERNAL_SIGN_IN, "EXTERNAL_SIGN_IN", false);
 	if (externalSignIn && !passkeyPage) throw new ConfigError("EXTERNAL_SIGN_IN needs PASSKEY_PAGE, whose passkey ceremony its page runs");
 	const adminToken = env.APRON_ADMIN_TOKEN === undefined || env.APRON_ADMIN_TOKEN === "" ? undefined : String(env.APRON_ADMIN_TOKEN);
@@ -582,6 +593,7 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 		guestPosting,
 		presence,
 		passkeyPage,
+		signalUnknownPasskeys,
 		externalSignIn,
 		...(adminToken !== undefined ? { adminToken } : {}),
 		...(uploads ? { uploads } : {}),

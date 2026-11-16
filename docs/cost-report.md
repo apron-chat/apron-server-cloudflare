@@ -350,7 +350,9 @@ posts.
 - The passkey page (`/passkey`, [policy](policy.md#passkey-page)) keeps its
   short-lived records in KV, each charged at its bound: a page's begin
   writes its ceremony (2 writes with its expiry entry); its finish reads and
-  deletes the ceremony (1 read, 1 write) and writes the code (2 writes); a
+  deletes the ceremony (1 read, 1 write) and writes the code (2 writes),
+  and for a new passkey its pending record (2 writes); a login whose passkey
+  no account has reads the pending record (1 read); a
   redemption reads and deletes the code (1 read, 1 write), then costs what
   a passkey sign-in, registration or addition costs, plus the session's 2
   writes. An addition's begin writes its `request` handle (2 writes), which
