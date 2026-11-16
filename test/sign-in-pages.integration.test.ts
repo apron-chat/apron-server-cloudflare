@@ -115,6 +115,18 @@ async function registerThroughPage(name = 'Ada'): Promise<{ peer: Peer; passkey:
 	return { peer, passkey, userId: finished.result.you.user_id, token: finished.result.token };
 }
 
+/**
+ * A `POST /oauth/token` from another site's client, form-encoded, through the
+ * Worker with EXTERNAL_SIGN_IN on; `headers` adds to its own, such as HTTP Basic.
+ */
+const tokenRequest = (params: Record<string, string>, headers: Record<string, string> = {}) => fetchEntry(new Request(`${ORIGIN}/oauth/token`, {
+	method: 'POST', body: new URLSearchParams(params).toString(),
+	headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'CF-Connecting-IP': ip(), Origin: 'https://chat.alice.dev', ...headers },
+}), withExternal());
+
+/** HTTP Basic for a public client (RFC 6749 §2.3.1): its form-urlencoded `client_id`, and an empty password. */
+const basic = (clientId: string) => ({ Authorization: `Basic ${btoa(`${encodeURIComponent(clientId).replaceAll('%20', '+')}:`)}` });
+
 /** Rewrites every stored code to have expired. */
 async function expireCodes(): Promise<void> {
 	await runInDurableObject(stub(), async (_instance, state) => {
@@ -380,7 +392,9 @@ it('offers external with EXTERNAL_SIGN_IN: metadata, /oauth/authorize with a pas
 	expect((await SELF.fetch(`${ORIGIN}/.well-known/oauth-authorization-server`)).status).toBe(404);
 	const off = await connect();
 	try {
-		expect((await greeting(off)).server.params.auth).not.toContain('external');
+		const { server } = await greeting(off);
+		expect(server.params.auth).not.toContain('external');
+		expect(server.params.capabilities).not.toContain('ext:oauth');
 		expect((await request(off, 'ext', 'auth', { scheme: 'external' })).error.code).toBe(-32601);
 	} finally { off.close(); }
 
@@ -406,6 +420,8 @@ it('offers external with EXTERNAL_SIGN_IN: metadata, /oauth/authorize with a pas
 		const { server } = await greeting(peer);
 		expect(server.params.auth).toEqual(['webauthn', 'token', 'external', 'guest']);
 		expect(server.params.signup).toEqual(['webauthn', 'token', 'external']);
+		// The metadata, the token endpoint and their CORS are `ext:oauth`'s.
+		expect(server.params.capabilities).toContain('ext:oauth');
 		expect((await request(peer, 'begin', 'auth', { scheme: 'external' })).result).toEqual({ external: { url: `${ORIGIN}/oauth/authorize` } });
 		// This server's own tokens are for `token`.
 		expect((await request(peer, 'token', 'auth', { scheme: 'external', token: 'anything' })).error.code).toBe(-32001);
@@ -449,10 +465,6 @@ it('offers external with EXTERNAL_SIGN_IN: metadata, /oauth/authorize with a pas
 		} finally { other.close(); guest.close(); }
 
 		// The token endpoint: form-encoded, open to any origin, an Apron token for `token`.
-		const tokenRequest = (params: Record<string, string>) => fetchEntry(new Request(`${ORIGIN}/oauth/token`, {
-			method: 'POST', body: new URLSearchParams(params).toString(),
-			headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'CF-Connecting-IP': ip(), Origin: 'https://chat.alice.dev' },
-		}), withExternal());
 		const library = await client('https://chat.alice.dev/callback', 'https://chat.alice.dev/client.json');
 		const done = await ceremony(library.url(`${ORIGIN}/oauth/authorize`), passkey, { page: 'authorize', action: 'login' });
 		const code = returned(done.body.redirect!, library);
@@ -482,6 +494,86 @@ it('offers external with EXTERNAL_SIGN_IN: metadata, /oauth/authorize with a pas
 		const pageCode = returned(pageDone.body.redirect!, pageClient);
 		expect(await (await tokenRequest({ grant_type: 'authorization_code', code: pageCode, code_verifier: pageClient.verifier, redirect_uri: pageClient.redirectUri, client_id: pageClient.clientId })).json()).toEqual({ error: 'invalid_grant' });
 	} finally { peer.close(); }
+});
+
+it('takes a public client\'s client_id at /oauth/token in the body or with HTTP Basic, and keeps a code it refuses before redeeming', async () => {
+	await setExternal(true);
+	const { peer, passkey, userId } = await registerThroughPage('Ada');
+	peer.close();
+	// The client ID is a URL, so its `:` and `/` are form-urlencoded in Basic.
+	const signIn = async () => {
+		const library = await client('https://chat.alice.dev/callback', 'https://chat.alice.dev/client.json');
+		const done = await ceremony(library.url(`${ORIGIN}/oauth/authorize`), passkey, { page: 'authorize', action: 'login' });
+		const code = returned(done.body.redirect!, library);
+		/** What every request sends but the client: x/oauth2's `Exchange` with PKCE and `resource`. */
+		const form = { grant_type: 'authorization_code', code, code_verifier: library.verifier, redirect_uri: library.redirectUri, resource: ORIGIN };
+		return { library, form };
+	};
+	const signsIn = async (response: Response) => {
+		expect(response.status).toBe(200);
+		const body = await response.json() as { access_token: string };
+		const resumed = await connect();
+		try {
+			await greeting(resumed);
+			expect((await request(resumed, 'resume', 'auth', { scheme: 'token', token: body.access_token })).result.you.user_id).toBe(userId);
+		} finally { resumed.close(); }
+	};
+
+	// A browser client may send Basic across origins.
+	const preflight = await fetchEntry(new Request(`${ORIGIN}/oauth/token`, { method: 'OPTIONS', headers: { Origin: 'https://chat.alice.dev', 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'authorization, content-type' } }), withExternal());
+	expect(preflight.status).toBe(204);
+	expect(preflight.headers.get('Access-Control-Allow-Headers')).toBe('Authorization, Content-Type');
+
+	// Basic alone.
+	const alone = await signIn();
+	await signsIn(await tokenRequest(alone.form, basic(alone.library.clientId)));
+
+	// Basic and the body, when they agree.
+	const both = await signIn();
+	await signsIn(await tokenRequest({ ...both.form, client_id: both.library.clientId }, basic(both.library.clientId)));
+
+	// Refused before the code is looked up, it stays usable: Basic for another client than the body's, a password,
+	// another scheme, a malformed credential, no client at all, a repeated client_id, or another grant type.
+	const refused = await signIn();
+	const withBody = { ...refused.form, client_id: refused.library.clientId };
+	for (const [form, headers, status, error] of [
+		[withBody, basic('https://evil.example/client.json'), 401, 'invalid_client'],
+		[refused.form, { Authorization: `Basic ${btoa(`${encodeURIComponent(refused.library.clientId)}:secret`)}` }, 401, 'invalid_client'],
+		[withBody, { Authorization: 'Bearer anything' }, 401, 'invalid_client'],
+		[refused.form, { Authorization: 'Basic not-base64!' }, 401, 'invalid_client'],
+		[refused.form, { Authorization: `Basic ${btoa(':')}` }, 401, 'invalid_client'],
+		[refused.form, {}, 400, 'invalid_request'],
+		[{ ...withBody, client_id: '' }, {}, 400, 'invalid_request'],
+		[{ ...withBody, grant_type: 'password' }, basic(refused.library.clientId), 400, 'unsupported_grant_type'],
+	] as const) {
+		const response = await tokenRequest(form, headers);
+		expect(response.status).toBe(status);
+		expect(await response.json()).toEqual({ error });
+		if (status === 401) expect(response.headers.get('WWW-Authenticate')).toBe('Basic realm="token"');
+	}
+	const repeated = new URLSearchParams(withBody);
+	repeated.append('client_id', refused.library.clientId);
+	expect(await (await fetchEntry(new Request(`${ORIGIN}/oauth/token`, {
+		method: 'POST', body: repeated.toString(), headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'CF-Connecting-IP': ip() },
+	}), withExternal())).json()).toEqual({ error: 'invalid_request' });
+	await signsIn(await tokenRequest(withBody));
+	// A redemption attempt uses the code up, Basic or not.
+	expect(await (await tokenRequest(refused.form, basic(refused.library.clientId))).json()).toEqual({ error: 'invalid_grant' });
+
+	// x/oauth2's AutoDetect: Basic with url.QueryEscape'd credentials and no client_id in the body, then, only
+	// if that fails, the client_id in the body. The first now succeeds; had it been refused, the code would
+	// have been kept for the second (above).
+	const detect = await signIn();
+	const queryEscape = (value: string) => encodeURIComponent(value).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`).replaceAll('%20', '+');
+	const attempts: string[] = [];
+	let response = await tokenRequest(detect.form, { Authorization: `Basic ${btoa(`${queryEscape(detect.library.clientId)}:${queryEscape('')}`)}` });
+	attempts.push(`header ${response.status}`);
+	if (!response.ok) {
+		response = await tokenRequest({ ...detect.form, client_id: detect.library.clientId });
+		attempts.push(`params ${response.status}`);
+	}
+	expect(attempts).toEqual(['header 200']);
+	await signsIn(response);
 });
 
 it('sweeps expired codes, ceremonies and addition handles from their expiry index', async () => {

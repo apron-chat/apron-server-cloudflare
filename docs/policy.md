@@ -406,7 +406,12 @@ that implement only that scheme: `/oauth/authorize` is the same one screen
 as a sign-in, whose "Create an account" makes a new account's passkey from
 that screen, and its codes finish only
 `external`, on a connection or at `POST /oauth/token`. The metadata is at
-`/.well-known/oauth-authorization-server`. It is off by default: every
+`/.well-known/oauth-authorization-server`. The token endpoint, the metadata
+and their CORS are the extension `ext:oauth` (EXTENSIONS.md on
+shazow/apron#115), which the `server` frame then lists: a client sends its
+`client_id` in the form, or with HTTP Basic and an empty password, and a
+request refused before the code is redeemed, such as Basic for another client
+than the form's, leaves the code usable. It is off by default: every
 client that implements the passkey page reaches this server through
 `webauthn`, and offering `external` changes `server.auth`. A code redeemed
 on a signed-in connection answers `you` for the same account and is

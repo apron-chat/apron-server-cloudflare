@@ -221,7 +221,11 @@ export async function pkceMatches(verifier: string, challenge: string): Promise<
 	return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "") === challenge;
 }
 
-/** The server's authorization server metadata (RFC 8414), for `external` (protocol §4.12.3). */
+/**
+ * The server's authorization server metadata (RFC 8414), for `external`, as
+ * `ext:oauth` adds it. Clients are public: `none`, though the token endpoint
+ * also takes a `client_id` sent with HTTP Basic and an empty password.
+ */
 export function authorizationServerMetadata(origin: string): Record<string, unknown> {
 	return {
 		issuer: origin,

@@ -936,14 +936,45 @@ function pageJson(status: number, body: Record<string, unknown>): Response {
 	return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" } });
 }
 
-/** What the token endpoint and the metadata send (RFC 6749 §5.1, protocol §4.12.3: open to any origin). */
+/** What the token endpoint and the metadata send (RFC 6749 §5.1; open to any origin, as `ext:oauth` asks). */
 function tokenHeaders(): Headers {
 	return new Headers({ "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "Pragma": "no-cache", "Access-Control-Allow-Origin": "*", "X-Content-Type-Options": "nosniff" });
 }
 
-/** A token endpoint error (RFC 6749 §5.2). */
+/**
+ * A token endpoint error (RFC 6749 §5.2). `invalid_client` for credentials
+ * sent with HTTP Basic is a 401 that names the scheme, as §5.2 asks.
+ */
 function tokenError(status: number, error: string): Response {
-	return new Response(JSON.stringify({ error }), { status, headers: tokenHeaders() });
+	const headers = tokenHeaders();
+	if (status === 401) headers.set("WWW-Authenticate", 'Basic realm="token"');
+	return new Response(JSON.stringify({ error }), { status, headers });
+}
+
+/**
+ * The `client_id` a token request's `Authorization` header carries, as a
+ * public client sends it with HTTP Basic (RFC 6749 §2.3.1, `ext:oauth`): the
+ * form-urlencoded `client_id`, a `:`, and an empty password. Undefined
+ * without the header; null for any other scheme, a malformed credential, or
+ * a password, since this server's clients have none.
+ */
+function basicClientId(header: string | null): string | null | undefined {
+	if (header === null) return undefined;
+	const match = /^basic +([A-Za-z0-9+/]+={0,2}) *$/i.exec(header);
+	if (!match) return null;
+	let credential: string;
+	try {
+		credential = new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(atob(match[1]!), (char) => char.charCodeAt(0)));
+	} catch {
+		return null;
+	}
+	const colon = credential.indexOf(":");
+	if (colon <= 0 || colon !== credential.length - 1) return null;
+	try {
+		return decodeURIComponent(credential.slice(0, colon).replaceAll("+", " ")) || null;
+	} catch {
+		return null;
+	}
 }
 
 function nowMs(): number {
@@ -2218,11 +2249,12 @@ async function handleSignIn(request: Request, env: Env, url: URL): Promise<Respo
 	const origin = url.origin;
 	if (!config.passkeyPage || !pageOriginServes(origin, config.rpId)) return null;
 	if ((route === "metadata" || route === "authorize" || route === "token") && !config.externalSignIn) return null;
-	// Open to any origin (protocol §4.12.3): the metadata, and the token endpoint.
+	// Open to any origin (`ext:oauth`): the metadata, and the token endpoint,
+	// whose clients may send their `client_id` with HTTP Basic.
 	if (request.method === "OPTIONS" && (route === "metadata" || route === "token")) {
 		return new Response(null, { status: 204, headers: {
 			"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
-			"Access-Control-Allow-Headers": "Content-Type", "Access-Control-Max-Age": "86400",
+			"Access-Control-Allow-Headers": "Authorization, Content-Type", "Access-Control-Max-Age": "86400",
 		} });
 	}
 	if (route === "metadata") {
@@ -2247,6 +2279,9 @@ async function handleSignIn(request: Request, env: Env, url: URL): Promise<Respo
 	const headers = new Headers({ [INTERNAL_IP_HEADER]: admitted.ipKey, [SERVER_ORIGIN_HEADER]: origin });
 	const requestOrigin = request.headers.get("Origin");
 	if (requestOrigin) headers.set("Origin", requestOrigin);
+	// A token request's client may authenticate with HTTP Basic (ApronDemoServer.tokenEndpoint).
+	const authorization = route === "token" ? request.headers.get("Authorization") : null;
+	if (authorization !== null) headers.set("Authorization", authorization);
 	const forwarded = new Request(`https://signin.internal${SIGN_IN_PATH}${route}${url.search}`, { method, headers, ...(body !== undefined ? { body } : {}) });
 	try {
 		return fromObject(await env.DEMO.getByName(OBJECT_NAME).fetch(forwarded));
@@ -3025,6 +3060,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 					"ext:editors",
 					// Custom emoji (ext:emoji), once an admin has added one.
 					...(emoji ? ["ext:emoji"] : []),
+					// With `external`, this server is its own authorization server
+					// with the standard OAuth parts (ext:oauth): the metadata, the
+					// token endpoint (tokenEndpoint), and CORS on both.
+					...(external ? ["ext:oauth"] : []),
 				],
 				// Passkeys where they are offered: in the client on RP_ORIGINS, and
 				// through the passkey page for every client where the host serves it;
@@ -3886,7 +3925,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const origin = this.externalOrigin(attachment);
 		if (!origin) throw { name: "unsupported", message: "External sign-in is not offered" } satisfies ProtocolError;
 		const params = request.params;
-		// This server's own access tokens are Apron tokens, for `token` (§4.12.2).
+		// This server's own access tokens are Apron tokens, for `token` (ext:oauth).
 		if (params.token !== undefined) throw { name: "denied", message: "Sign in with this server's tokens through the token scheme" } satisfies ProtocolError;
 		if (params.code === undefined) {
 			this.reply(socket, request, { external: { url: `${origin}${AUTHORIZE_PATH}` } });
@@ -4087,20 +4126,33 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `POST /oauth/token` (protocol §4.12.2, RFC 6749 §4.1.3): an
+	 * `POST /oauth/token` (`ext:oauth`, RFC 6749 §4.1.3): an
 	 * `/oauth/authorize` code for an Apron bearer token, which signs in with
 	 * `scheme: "token"` from any origin. A new account's code creates it
 	 * here. Passkey-page codes finish only `webauthn`, so are refused.
+	 * The public client's `client_id` comes in the body or with HTTP Basic
+	 * and an empty password (basicClientId), or both if they agree. A
+	 * request refused before the code is looked up (its form, grant type,
+	 * client or `resource`) leaves the code usable, so a client that tries
+	 * Basic first and then the body, as x/oauth2's AutoDetect does, keeps
+	 * its code; any attempt to redeem it uses it up (takeSignInCode).
 	 */
 	private async tokenEndpoint(request: Request, origin: string, ipKey: string): Promise<Response> {
 		const form = new URLSearchParams(await request.text());
 		if (form.get("grant_type") !== "authorization_code") return tokenError(400, "unsupported_grant_type");
 		const params: Record<string, unknown> = {};
-		for (const name of ["code", "code_verifier", "redirect_uri", "client_id"]) {
+		for (const name of ["code", "code_verifier", "redirect_uri"]) {
 			const values = form.getAll(name);
 			if (values.length !== 1 || !values[0]) return tokenError(400, "invalid_request");
 			params[name] = values[0];
 		}
+		const inBody = form.getAll("client_id");
+		if (inBody.length > 1 || (inBody.length === 1 && !inBody[0])) return tokenError(400, "invalid_request");
+		const basic = basicClientId(request.headers.get("Authorization"));
+		if (basic === null || (basic !== undefined && inBody.length === 1 && inBody[0] !== basic)) return tokenError(401, "invalid_client");
+		const clientId = basic ?? inBody[0];
+		if (!clientId) return tokenError(400, "invalid_request");
+		params.client_id = clientId;
 		const resource = form.getAll("resource");
 		if (resource.length > 1 || (resource.length === 1 && resource[0] !== origin)) return tokenError(400, "invalid_target");
 		this.store.reserveAuthAttempt({ ipKey, now: nowMs() });

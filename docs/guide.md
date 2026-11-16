@@ -23,7 +23,10 @@ It speaks protocol 9 and advertises:
 - `embed:upload` and `ext:media` when uploads are configured, and
   `ext:emoji` once an admin, mod or friend adds a custom emoji with
   `/emoji add`;
-- `status` and push when VAPID keys are set.
+- `status` and push when VAPID keys are set;
+- `external` and `ext:oauth` (its token endpoint, which takes a public
+  client's `client_id` in the form or with HTTP Basic and an empty password,
+  and its metadata) with `EXTERNAL_SIGN_IN`, on the passkey page's host.
 
 See [authentication and policy](policy.md) and [the implementation
 specification](../SPEC.md).
