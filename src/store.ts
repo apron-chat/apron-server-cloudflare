@@ -37,6 +37,7 @@ import {
   type RawBudgetRow,
 } from "./budget-ledger";
 import { StoreError, limitData, type LimitCategory } from "./store-error";
+import { MAX_REMOTE_LINKS, REMOTE_LINK_PREFIX, isShadowUserId, withoutRemote, type RemoteLink, type RemoteUser } from "./remote";
 import { bucketHorizonMs, chargeBucket, type Bucket, type Rate } from "./limiter";
 import { LimiterCache, type RawLimitRow } from "./limiter-cache";
 import { SettledMeta } from "./settled-meta";
@@ -620,6 +621,8 @@ export interface Identity {
   user_id: string;
   name?: string;
   tier?: Tier;
+  /** A shadow user's `remote` (extension `ext:remote`), which recorded objects carry too. */
+  ext?: { remote: RemoteUser };
 }
 
 /** A flat, self-describing message snapshot (protocol §3.5). */
@@ -709,6 +712,14 @@ export interface StoreMutationInput {
   digest?: string;
   /** An operator alert the server posts itself (Store.alert): no posting limits or storage high-water apply. */
   system?: boolean;
+  /**
+   * A link's act-as request (extension `ext:remote`): `userId` is the shadow
+   * of `remote`, `link` the link account's `user_id`. The shadow is charged at
+   * the trusted limits, and the link's bucket in place of the IP's
+   * (chargePosting); a message's `ext.remote` is the server's (commitMessage).
+   */
+  link?: string;
+  remote?: RemoteUser;
 }
 
 /** Embed kinds that carry live text (§4.8.3). */
@@ -1227,6 +1238,12 @@ const META_RENAMED_PREFIX = "renamed:";
 const META_PURGED_PREFIX = "purged:";
 /** `_meta` key: when the daily idle bot sweep (idleBots) is next due. */
 const META_BOT_SWEEP = "bot_sweep_ms";
+/**
+ * `_meta` key: the link accounts (extension `ext:remote`), a JSON object of
+ * RemoteLink by the link's `user_id`, at most MAX_REMOTE_LINKS. Additive:
+ * absent, there are none. Links are never signed out as idle bots.
+ */
+const META_REMOTE_LINKS = "remote_links";
 
 /** The limiter scopes keyed by a registered user (`user:<user_id>`), which `/rename` moves. */
 const USER_LIMIT_SCOPES = ["post", "history", "upload", "push", "push_recipient", "push_joined_recipient"] as const;
@@ -1772,8 +1789,17 @@ function roomIdList(value: string | null | undefined): string[] {
 }
 
 /** A membership's recorded user (§3.3): `user_id` and a non-empty `name`. */
-function recordedUser(userId: string, name: string | null | undefined): Identity {
-  return { user_id: userId, ...(name ? { name } : {}) };
+function recordedUser(userId: string, name: string | null | undefined, remote?: RemoteUser): Identity {
+  return { user_id: userId, ...(name ? { name } : {}), ...(remote ? { ext: { remote: clone(remote) } } : {}) };
+}
+
+/** A shadow user's `remote` from its identity row's `ext_json` (ext:remote); undefined for anyone else. */
+function shadowRemote(userId: string, extJson: string | null | undefined): RemoteUser | undefined {
+  if (!isShadowUserId(userId)) return undefined;
+  const remote = parseUserExt(extJson)?.remote;
+  return isPlainObject(remote) && typeof remote.server === "string" && typeof remote.user_id === "string"
+    ? { server: remote.server, user_id: remote.user_id }
+    : undefined;
 }
 
 /**
@@ -2167,6 +2193,8 @@ export class Store {
    * moves it, which keeps them where every record they covered is gone.
    */
   private logCache: RawLogState | null = null;
+  /** `_meta` `remote_links` as last read (Store.remoteLinks); undefined until read, and after a change. */
+  private remoteLinksCache: Record<string, RemoteLink> | undefined;
   /**
    * The open live texts (META_LIVE_TEXTS) as last read or saved, undefined
    * until read: every change goes through this instance, and a rolled-back
@@ -2808,6 +2836,7 @@ export class Store {
     this.serverCache = null;
     this.initialized = false;
     this.logCache = null;
+    this.remoteLinksCache = undefined;
     this.accountingUncertain = false;
     this.lostOnWake = false;
     this.accountingMarker.load("0");
@@ -3991,7 +4020,8 @@ export class Store {
    * first, in at most IDLE_PRUNE_RUNS_PER_DAY runs a UTC day, and none until
    * activity has been recorded for `idleAccountMs` (META_IDLE_ACTIVITY_SINCE). It never removes one of the `keptActiveAccounts`
    * most recently active, one with a role (admins, mods, friends), the admin
-   * user, one `connected` now or whose bot is, one whose bot holds a role
+   * user, a shadow user (ext:remote: an `@` in its id, whose activity is on
+   * its own server), one `connected` now or whose bot is, one whose bot holds a role
    * of its own, or one with a live upload (its avatar or
    * files expire first). With each goes its bot. It removes their identity,
    * passkeys, memberships (lowering their rooms' member counts), read
@@ -4035,6 +4065,7 @@ export class Store {
       const candidates = this.rawRows<{ user_id: string }>(
         `SELECT i.user_id FROM identities i
          WHERE i.roles_json = '[]' AND i.user_id != ? AND ${lastActiveSql("i")} < ?
+           AND instr(i.user_id, '@') = 0
            AND NOT EXISTS (SELECT 1 FROM uploads u INDEXED BY uploads_owner_idx WHERE u.owner_id = i.user_id)
            AND NOT EXISTS (SELECT 1 FROM identities b WHERE b.user_id = '${BOT_PREFIX}' || i.user_id AND b.roles_json != '["bot"]')
            AND i.user_id NOT IN (SELECT k.user_id FROM identities k WHERE k.roles_json = '[]' ORDER BY ${lastActiveSql("k")} DESC LIMIT ?)
@@ -4464,10 +4495,12 @@ export class Store {
    * `write` category (extension `ext:limits`), unless `uncategorized`: a
    * `me` request, which the `write` row does not list.
    */
-  private chargePosting(input: { userId: string; tier: Tier; ipKey: string; now: number; weight?: number; uncategorized?: boolean }): void {
+  private chargePosting(input: { userId: string; tier: Tier; ipKey: string; now: number; weight?: number; uncategorized?: boolean; link?: string }): void {
     const { userId, tier, ipKey, now } = input;
     const weight = Math.max(1, input.weight ?? 1);
-    const trusted = tier === "registered" && this.holdsAnyRole(userId);
+    // A link's shadow (ext:remote) posts at the trusted limits, and its link's
+    // bucket, shared by all of the link's shadows, stands in for the IP's.
+    const trusted = input.link !== undefined || (tier === "registered" && this.holdsAnyRole(userId));
     const perUser = trusted
       ? { minute: this.config.trustedPostsPerMinute, day: this.config.trustedPostsPerDay }
       : tier === "registered"
@@ -4479,7 +4512,7 @@ export class Store {
     const principal = tier === "registered" ? `user:${userId}` : `anonymous:${ipKey}`;
     const rows = [
       this.limitRow("post", principal, now),
-      this.limitRow("post", `ip:${ipKey}`, now),
+      this.limitRow("post", input.link !== undefined ? `link:${input.link}` : `ip:${ipKey}`, now),
       this.limitRow("post", "global", now),
     ];
     const daily = dayFor(now);
@@ -5034,7 +5067,27 @@ export class Store {
 
   private identityForMessage(input: StoreMutationInput): Identity {
     const name = typeof input.identity.name === "string" ? input.identity.name : undefined;
-    return { user_id: input.identity.user_id, ...(name ? { name } : {}) };
+    return recordedUser(input.identity.user_id, name, input.remote);
+  }
+
+  /**
+   * A message write's `ext` (§4.13) without `remote`, which only the server
+   * sets (ext:remote). A link's act-as write (`remote`) gets
+   * `{server, user_id, room_id, message_id}`: the shadow's server and user,
+   * and the remote IDs the request's `ext.remote` gives as strings, else
+   * those the message kept.
+   */
+  private messageExtWrite(value: unknown, remote: RemoteUser | undefined, previous: MessageSnapshot | null): Record<string, unknown> | undefined {
+    const write = withoutRemote(this.optionalExt(value));
+    if (!remote) return write;
+    const requested = isPlainObject(value) && isPlainObject(value.remote) ? value.remote : {};
+    const kept = isPlainObject(previous?.ext?.remote) ? previous.ext.remote : {};
+    const ids: Record<string, string> = {};
+    for (const key of ["room_id", "message_id"]) {
+      const id = typeof requested[key] === "string" && requested[key] !== "" ? requested[key] : kept[key];
+      if (typeof id === "string" && id !== "") ids[key] = ensureText(id, `ext.remote.${key}`, 256);
+    }
+    return { ...write, remote: { server: remote.server, user_id: remote.user_id, ...ids } };
   }
 
   private normalizedBody(value: unknown): Record<string, unknown> {
@@ -5192,7 +5245,7 @@ export class Store {
 
   /**
    * The daily idle bot sweep, once its `_meta` due time has passed: up to
-   * `limit` accounts whose only role is `bot` and that have not been active
+   * `limit` accounts whose only role is `bot`, other than links (ext:remote), and that have not been active
    * (markBotActive) since `before`, oldest first, and are not yet signed out
    * (markBotSignedOut), for the caller to sign out.
    * The next sweep is due `intervalMs` later, or at once after a full batch.
@@ -5210,7 +5263,10 @@ export class Store {
     return this.reserved({ reads: 16 + 2 * identities, writes: 4 }, true, input.now, () => {
       const effective = this.effectiveNow(input.now);
       const idle = due === "" ? [] : this.rawRows<{ user_id: string }>(
-        `SELECT user_id FROM identities WHERE roles_json = '["bot"]' AND updated_ms > 0 AND updated_ms < ? ORDER BY updated_ms LIMIT ?`, input.before, input.limit,
+        // Link accounts (ext:remote) are never idle bots: their bridge may be quiet for weeks.
+        `SELECT user_id FROM identities WHERE roles_json = '["bot"]' AND updated_ms > 0 AND updated_ms < ?
+           AND user_id NOT IN (SELECT key FROM json_each(COALESCE((SELECT value FROM _meta WHERE key = '${META_REMOTE_LINKS}'), '{}')))
+         ORDER BY updated_ms LIMIT ?`, input.before, input.limit,
       ).map((row) => row.user_id);
       const next = due === "" ? effective + input.graceMs : idle.length >= input.limit ? effective : effective + input.intervalMs;
       this.writeMeta(META_BOT_SWEEP, String(next));
@@ -5248,11 +5304,126 @@ export class Store {
   }
 
   /**
+   * The link accounts (extension `ext:remote`) by `user_id`: `_meta`
+   * `remote_links`, read once and then kept in memory with every change.
+   */
+  remoteLinks(now = this.clock.now()): Readonly<Record<string, RemoteLink>> {
+    this.ensureReady();
+    return this.remoteLinksCache ??= this.reserved({ reads: 2 }, false, now, () => this.readRemoteLinks());
+  }
+
+  /** The remote server a link account is bound to, or undefined for any other user (remoteLinks). */
+  remoteLink(userId: string, now = this.clock.now()): string | undefined {
+    return Object.hasOwn(this.remoteLinks(now), userId) ? this.remoteLinks(now)[userId].server : undefined;
+  }
+
+  private readRemoteLinks(): Record<string, RemoteLink> {
+    return this.metaJson(META_REMOTE_LINKS, (stored) => {
+      const links: Record<string, RemoteLink> = {};
+      for (const [userId, link] of Object.entries(stored as Record<string, unknown>)) {
+        if (isPlainObject(link) && typeof link.server === "string") links[userId] = { server: link.server, created_ms: integerColumn(link.created_ms) };
+      }
+      return links;
+    }, {});
+  }
+
+  private writeRemoteLinks(links: Record<string, RemoteLink>): void {
+    this.writeMeta(META_REMOTE_LINKS, Object.keys(links).length ? JSON.stringify(links) : null);
+    // Read again next time: the transaction writing this may still roll back.
+    this.remoteLinksCache = undefined;
+  }
+
+  /**
+   * `/remote invite`: a link account (ext:remote) bound to `server`, the
+   * first free `link_<n>`: a registered user with the role `bot` and no
+   * passkey, who signs in with a token the caller mints, charged as a
+   * registration like `/invite-token`. It starts in `roomId` alone (a
+   * private room included: the admin who runs the command is in it), with
+   * a logged membership returned in `broadcasts`. At most MAX_REMOTE_LINKS.
+   */
+  createRemoteLink(input: { server: string; name: string; roomId: string; now: number; ipKey: string }): { userId: string; broadcasts: Broadcast[] } {
+    this.ensureReady();
+    const userId = this.reserved({ reads: 8 + 4 * MAX_REMOTE_LINKS }, false, input.now, () => {
+      const links = this.readRemoteLinks();
+      if (Object.keys(links).length >= MAX_REMOTE_LINKS) throw new StoreError("denied", `This server keeps at most ${MAX_REMOTE_LINKS} links; /remote revoke one first`);
+      for (let n = Object.keys(links).length + 1; n <= 2 * MAX_REMOTE_LINKS + 1; n += 1) {
+        if (!Object.hasOwn(links, REMOTE_LINK_PREFIX + n) && !this.idTaken(REMOTE_LINK_PREFIX + n)) return REMOTE_LINK_PREFIX + n;
+      }
+      throw new StoreError("denied", "No link user_id is free");
+    });
+    const created = this.createKeylessIdentity({
+      userId, name: input.name, tier: "registered", roles: ["bot"], now: input.now, ipKey: input.ipKey, rooms: [input.roomId],
+      onCreate: () => this.writeRemoteLinks({ ...this.readRemoteLinks(), [userId]: { server: input.server, created_ms: input.now } }),
+    });
+    return { userId, broadcasts: created.broadcasts };
+  }
+
+  /** `/remote revoke`: unbinds a link account (ext:remote); its account and posts stay. Whether it was one. */
+  removeRemoteLink(userId: string, now = this.clock.now()): boolean {
+    this.ensureReady();
+    return this.reserved({ reads: 4, writes: 4 }, false, now, () => this.transaction(() => {
+      const links = this.readRemoteLinks();
+      if (!Object.hasOwn(links, userId)) return false;
+      delete links[userId];
+      this.writeRemoteLinks(links);
+      return true;
+    }));
+  }
+
+  /**
+   * The shadow user `userId` (ext:remote) of user `remote.user_id` of
+   * `remote.server`, created on a link's first act-as request for it: a
+   * registered user with no role, no passkey and no token, whose `ext` holds
+   * the server-owned `remote`. Its creation is not charged as a
+   * registration and joins no room, but counts against the identity cap.
+   * An identity under the id that stands for another server's user (two
+   * addresses with one authority) is `denied`, and so is a shadow an admin
+   * purged, until its id is freed. Returns its name.
+   */
+  ensureShadow(input: { userId: string; remote: RemoteUser; name: string; now: number; ipKey: string }): { name: string; created: boolean } {
+    this.ensureReady();
+    const found = this.reserved({ reads: 8 }, false, input.now, () => ({
+      row: this.identityRow(input.userId), purged: this.metaValue(META_PURGED_PREFIX + input.userId) !== "",
+    }));
+    if (found.row) {
+      const remote = shadowRemote(found.row.user_id, found.row.ext_json);
+      if (!remote || remote.server !== input.remote.server || remote.user_id !== input.remote.user_id) {
+        throw new StoreError("denied", `${input.userId} stands for a user of another server`.slice(0, 200));
+      }
+      return { name: found.row.name, created: false };
+    }
+    if (found.purged) throw new StoreError("denied", `${input.userId} was removed here`.slice(0, 200));
+    this.createKeylessIdentity({
+      userId: input.userId, name: input.name, tier: "registered", now: input.now, ipKey: input.ipKey,
+      rooms: [], ext: { remote: { server: input.remote.server, user_id: input.remote.user_id } }, uncharged: true,
+    });
+    return { name: input.name, created: true };
+  }
+
+  /** The room a retained message is in now, whoever may see it; null when unknown or expired. One indexed read. */
+  messageRoom(messageId: string, now = this.clock.now()): string | null {
+    this.ensureReady();
+    return this.reserved({ reads: 8 }, false, now, () => this.currentMessage(messageId, this.logState().history_floor)?.room_id ?? null);
+  }
+
+  /** Whether a registered user is in a room: its membership row, one read. */
+  isRoomMember(roomId: string, userId: string, now = this.clock.now()): boolean {
+    this.ensureReady();
+    return this.reserved({ reads: 4 }, false, now, () => this.isMember(roomId, userId));
+  }
+
+  /**
    * Inserts an identity that signs in by bearer token rather than a
    * credential, charged as a registration, and starts it in `general` with a
-   * logged membership (§4.2.2) returned in `broadcasts`.
+   * logged membership (§4.2.2) returned in `broadcasts`. With `rooms`, it
+   * starts in those that exist instead (a link's private room included);
+   * `uncharged`, it is no registration (a shadow, ext:remote); `ext` is its
+   * stored `ext`; `onCreate` runs in the same transaction.
    */
-  private createKeylessIdentity(input: { userId: string; name: string; tier: "bot" | "registered"; roles?: string[]; now: number; ipKey: string }): { broadcasts: Broadcast[] } {
+  private createKeylessIdentity(input: {
+    userId: string; name: string; tier: "bot" | "registered"; roles?: string[]; now: number; ipKey: string;
+    rooms?: readonly string[]; ext?: Record<string, unknown>; uncharged?: boolean; onCreate?: () => void;
+  }): { broadcasts: Broadcast[] } {
     ensureText(input.name, "name", this.config.maxNameBytes);
     if ([...input.name].length > this.config.maxNameCodePoints) throw new StoreError("too_large", "name is too long");
     this.assertAccounting();
@@ -5260,7 +5431,7 @@ export class Store {
     const beforeWrites = this.observed.writes;
     // The limiter and meta rows, the identity row, and one membership row and
     // logged record in `general`.
-    const reservation = this.reserveCost({ reads: 128, writes: 72, registrations: 1 }, false, input.now);
+    const reservation = this.reserveCost({ reads: 128, writes: 72, registrations: input.uncharged ? 0 : 1 }, false, input.now);
     // An operator alert creating the admin user it posts as (alert) is not
     // held to the registration cap, limits, or storage high-water.
     const alerting = this.alerting;
@@ -5271,14 +5442,15 @@ export class Store {
       return this.transaction(() => {
         if (this.identityRow(input.userId)) throw new StoreError("invalid_params", "identity already exists");
         if (!alerting && this.metaNumber("identity_count") >= this.config.registeredIdentityCount) throw new StoreError("denied", "registration_closed");
-        if (!alerting) this.chargeRegistration(input.ipKey, effective);
+        if (!alerting && !input.uncharged) this.chargeRegistration(input.ipKey, effective);
         this.rawExec(
-          "INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES (?, '', ?, ?, ?, ?, ?)",
-          input.userId, input.name, input.tier, effective, effective, JSON.stringify(input.roles ?? []),
+          "INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json, ext_json) VALUES (?, '', ?, ?, ?, ?, ?, ?)",
+          input.userId, input.name, input.tier, effective, effective, JSON.stringify(input.roles ?? []), input.ext ? JSON.stringify(input.ext) : "",
         );
         this.adjustCount("identity_count", 1);
+        input.onCreate?.();
         const broadcasts: Broadcast[] = [];
-        const joined = this.existingRooms(DEFAULT_JOINED_ROOMS);
+        const joined = input.rooms ? input.rooms.filter((roomId) => this.roomRow(roomId) !== null) : this.existingRooms(DEFAULT_JOINED_ROOMS);
         if (joined.length) {
           const state = this.logState();
           const startLogId = state.last_log_id;
@@ -5339,7 +5511,7 @@ export class Store {
    * are the user's own, or `actorId`'s when someone else makes the change
    * (an admin's `/kick`); `ipKey` is the requesting connection's.
    */
-  changeMembership(input: { userId: string; ipKey: string; roomId: string; join: boolean; now?: number; actorId?: string }): {
+  changeMembership(input: { userId: string; ipKey: string; roomId: string; join: boolean; now?: number; actorId?: string; link?: string }): {
     rooms: string[]; changed: boolean; membership?: Broadcast; room?: RoomRecord;
   } {
     this.ensureReady();
@@ -5367,7 +5539,8 @@ export class Store {
         if (privateJoin && this.privateMembershipCount(input.userId) >= this.config.maxPrivateMembershipsPerUser) {
           throw new StoreError("denied", `${input.userId} is in as many private rooms as anyone may be, so cannot be added to another`.slice(0, 200));
         }
-        this.chargePosting({ userId: input.actorId ?? input.userId, tier: "registered", ipKey: input.ipKey, now: effective });
+        // A link's shadow (ext:remote) pays for its own join or leave, at its link's limits.
+        this.chargePosting({ userId: input.link !== undefined ? input.userId : input.actorId ?? input.userId, tier: "registered", ipKey: input.ipKey, now: effective, link: input.link });
         if (input.join) this.rawExec("INSERT INTO memberships (room_id, user_id) VALUES (?, ?)", input.roomId, input.userId);
         else {
           this.rawExec("DELETE FROM memberships WHERE room_id = ? AND user_id = ?", input.roomId, input.userId);
@@ -5376,7 +5549,7 @@ export class Store {
         const state = this.logState();
         const startLogId = state.last_log_id;
         const context: CommitContext = { state, commitMs: Math.max(effective, state.last_commit_ms), touched: new Map() };
-        const membership = this.logMembership(context, input.roomId, recordedUser(input.userId, identity.name), input.join);
+        const membership = this.logMembership(context, input.roomId, recordedUser(input.userId, identity.name, shadowRemote(input.userId, identity.ext_json)), input.join);
         this.finishCommit(context, startLogId);
         const updated = { ...room, latest_log_id: Math.max(room.latest_log_id, context.state.last_log_id) };
         const record = this.roomRecord(updated, state.history_floor);
@@ -5553,7 +5726,8 @@ export class Store {
     // An editor's save keeps ext too, and edited_by names who saved a
     // snapshot when not its sender (ext:editors); requests do not set it.
     // A moderator's move changes no content, so it keeps the edited_by of the text it moves.
-    const write = editor ? undefined : this.optionalExt(params.ext);
+    // `ext.remote` is the server's (ext:remote): set for a link's shadow, else kept.
+    const write = editor ? undefined : this.messageExtWrite(params.ext, input.remote, previous);
     const merged = deleted ? undefined : mergeExt(previous?.ext, write);
     const ext = moving ? merged : withEditedBy(merged, editor ? input.userId : undefined);
     const from = previous ? previous.from : this.identityForMessage(input);
@@ -7426,7 +7600,8 @@ export class Store {
     if (titleParam !== undefined && typeof titleParam !== "string") throw new StoreError("invalid_params", "title must be a string");
     const descriptionParam = params.description;
     if (descriptionParam !== undefined && typeof descriptionParam !== "string") throw new StoreError("invalid_params", "description must be a string");
-    const write = this.optionalExt(params.ext);
+    // `remote` is the server's (ext:remote), and never a room's.
+    const write = withoutRemote(this.optionalExt(params.ext));
     // A private room someone is not in is unknown to them, as one that does not exist.
     const existing = roomIdParam === undefined ? undefined : this.visibleRoomRow(roomIdParam, input.userId);
     const isPrivate = makePrivate || (existing ? isPrivateRoomId(existing.room_id) : false);
@@ -7654,7 +7829,8 @@ export class Store {
       ensureText(name, "name", this.config.maxNameBytes);
       if ([...name].length > this.config.maxNameCodePoints) throw new StoreError("too_large", "name is too long");
     }
-    const write = clientUserExt(this.optionalExt(input.params.ext));
+    // A shadow's `remote` is the server's (ext:remote): a write of it is ignored, and the stored one kept.
+    const write = withoutRemote(clientUserExt(this.optionalExt(input.params.ext)));
     const existing = this.identityRow(input.userId);
     if (!existing) throw new StoreError("denied", "Only registered users may change their profile");
     const bot = existing.tier === "bot" || parseRoles(existing.roles_json).includes("bot");
@@ -7815,7 +7991,7 @@ export class Store {
           return value;
         };
         const tier: Tier = this.identityRow(input.userId) ? "registered" : "anonymous";
-        if (!input.system) this.chargePosting({ userId: input.userId, tier, ipKey: input.ipKey, now: effective, uncategorized: method === "me" });
+        if (!input.system) this.chargePosting({ userId: input.userId, tier, ipKey: input.ipKey, now: effective, uncategorized: method === "me", link: input.link });
         let committed: StoreMutationResult;
         if (method === "me") {
           committed = this.commitMeMutation(input, effective);
@@ -7828,7 +8004,7 @@ export class Store {
             : method === "room_set" ? this.commitRoom(input, context, floor, tier === "registered")
             : this.commitReactions(input, context, floor);
           // Within the transaction: a move its sender cannot pay for is refused whole.
-          if (context.extraPosts && !input.system) this.chargePosting({ userId: input.userId, tier, ipKey: input.ipKey, now: effective, weight: context.extraPosts });
+          if (context.extraPosts && !input.system) this.chargePosting({ userId: input.userId, tier, ipKey: input.ipKey, now: effective, weight: context.extraPosts, link: input.link });
           this.finishCommit(context, startLogId);
         }
         this.commitStoredResult(input.userId, input.requestId, digest, committed.result, effective + this.config.dedupTtlMs);

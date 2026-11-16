@@ -1,0 +1,250 @@
+import { env, runInDurableObject } from 'cloudflare:test';
+import { afterEach, beforeEach, expect, it } from 'vitest';
+import { Store } from '../src/store';
+import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
+
+// Link accounts (extension `ext:remote`): an admin's `/remote invite` binds an
+// account to a remote server, whose bridge then posts as that server's users.
+
+let nextIp = 1;
+const stub = () => env.DEMO.getByName('public-demo-v1');
+const ADMIN_TOKEN = 'admin-token-0123456789abcdef';
+const connect = () => open({ ip: `203.0.113.${nextIp++}`, origin: null });
+const unique = (prefix: string) => `${prefix}_${crypto.randomUUID().slice(0, 8)}`;
+const DENIED = -32001;
+const INVALID_PARAMS = -32602;
+
+async function setAdminToken(value: string | undefined): Promise<void> {
+	await runInDurableObject(stub(), (instance) => {
+		const server = instance as unknown as { config: { adminToken?: string } };
+		server.config = { ...server.config, adminToken: value };
+	});
+}
+
+beforeEach(() => setAdminToken(ADMIN_TOKEN));
+afterEach(() => setAdminToken(undefined));
+
+async function signIn(token: string): Promise<{ peer: Peer; you: Record<string, any> }> {
+	const peer = await connect();
+	await peer.next();
+	const reply = await request(peer, 'auth', 'auth', { scheme: 'token', token });
+	expect(reply.result?.you).toBeDefined();
+	return { peer, you: reply.result.you };
+}
+
+async function command(peer: Peer, id: string, text: string, roomId: string): Promise<{ frame: Frame; notice?: Frame; skipped: Frame[] }> {
+	const { frame, skipped } = await exchange(peer, id, 'command', { room_id: roomId, body: { text } });
+	const notice = skipped.find((candidate) => candidate.method === 'message' && candidate.params.from.user_id === '~private');
+	return { frame, notice, skipped };
+}
+
+/**
+ * The admin in a new private room, and a link to `server` invited into it:
+ * the link's connection, its user_id, and the invite notice's text.
+ */
+async function linked(server: string): Promise<{ admin: Peer; link: Peer; linkId: string; roomId: string; text: string }> {
+	const admin = (await signIn(ADMIN_TOKEN)).peer;
+	const roomId = (await request(admin, 'room', 'room_set', { private: true })).result.room_id as string;
+	const invited = await command(admin, 'invite', `/remote invite ${server}`, roomId);
+	expect(invited.frame.result).toEqual({});
+	const text: string = invited.notice!.params.body.text;
+	const token = text.match(/&token=(apron_invite_[A-Za-z0-9_-]{43})/)![1];
+	const { peer: link, you } = await signIn(token);
+	return { admin, link, linkId: you.user_id, roomId, text };
+}
+
+const messageFrom = (userId: string) => (frame: Frame) => frame.method === 'message' && frame.params.from?.user_id === userId;
+
+it('/remote invite creates a link bound to the address, in the private room, with an A.4 link', async () => {
+	const { admin, link, linkId, roomId, text } = await linked('WS://127.0.0.1:8081/ws');
+	try {
+		expect(linkId).toMatch(/^link_\d+$/);
+		// The address is normalized (scheme and host lowercased), and the link names this server, the room and the token.
+		expect(text).toContain(`Created the link \`${linkId}\` to ws://127.0.0.1:8081/ws`);
+		expect(text).toMatch(new RegExp(`https://link\\.apron\\.chat/#server=wss://demo\\.test/ws&room=${roomId}&token=apron_invite_`));
+		// Signed in, the link is a bot in that private room only.
+		const joined = await request(link, 'joined', 'room_list', { filter: 'joined' });
+		expect(joined.result.joined.map((room: { room_id: string }) => room.room_id)).toEqual([roomId]);
+		const me = await request(link, 'me', 'me', {});
+		expect(me.result.you).toMatchObject({ user_id: linkId, roles: ['bot'] });
+		// The admin saw it join.
+		const members = await request(admin, 'members', 'room_list', { room_id: roomId, members: true });
+		expect(members.result.joined[0].members.map((member: { user_id: string }) => member.user_id)).toContain(linkId);
+		const listed = await command(admin, 'list', '/remote list', roomId);
+		expect(listed.notice!.params.body.text).toContain(`\`${linkId}\`: ws://127.0.0.1:8081/ws`);
+		// Bad addresses are refused.
+		for (const address of ['http://127.0.0.1:8081/ws', 'ws://user@host/ws', 'chat.example', 'wss://demo.test/ws']) {
+			expect((await command(admin, `bad-${address}`, `/remote invite ${address}`, roomId)).frame.error.code).toBe(INVALID_PARAMS);
+		}
+	} finally { admin.close(); link.close(); }
+});
+
+it('runs a link\'s message as a shadow user that joins the room, and keeps ext.remote across saves', async () => {
+	const server = 'ws://127.0.0.1:8081/ws';
+	const { admin, link, linkId, roomId } = await linked(server);
+	const remoteId = unique('carol');
+	const shadowId = `${remoteId}@127.0.0.1:8081`;
+	try {
+		link.send({ id: 'post', method: 'message', params: {
+			room_id: roomId, body: { text: 'hello from A' },
+			ext: { remote: { server: 'wss://forged.example/ws', user_id: remoteId, room_id: 'ops', message_id: '1724803599120' }, other: 1 },
+		} });
+		// The shadow's logged join, then the message, reach the room's members.
+		const join = await until(admin, (frame) => frame.method === 'room_update' && frame.params.memberships?.[0]?.members?.[0]?.user?.user_id === shadowId);
+		expect(join.frame.params.memberships[0].members[0]).toEqual({
+			user: { user_id: shadowId, name: remoteId, ext: { remote: { server, user_id: remoteId } } }, joined: true,
+		});
+		const posted = (await until(admin, messageFrom(shadowId))).frame.params;
+		expect(posted.from).toEqual({ user_id: shadowId, name: remoteId, ext: { remote: { server, user_id: remoteId } } });
+		expect(posted.ext).toEqual({ remote: { server, user_id: remoteId, room_id: 'ops', message_id: '1724803599120' }, other: 1 });
+		const reply = await until(link, (frame) => frame.id === 'post');
+		expect(reply.frame.result).toEqual({ message_id: posted.message_id });
+
+		// The shadow is a member with the server-owned ext.remote.
+		const members = await request(admin, 'members', 'room_list', { room_id: roomId, members: true });
+		expect(members.result.joined[0].members.map((member: { user_id: string }) => member.user_id)).toContain(shadowId);
+		const shadow = members.result.users.find((member: { user_id: string }) => member.user_id === shadowId);
+		expect(shadow).toMatchObject({ user_id: shadowId, roles: [], ext: { remote: { server, user_id: remoteId } } });
+
+		// A save as the shadow keeps from and the remote IDs; the link itself is not the author.
+		const saved = await request(link, 'save', 'message', { message_id: posted.message_id, room_id: roomId, body: { text: 'edited on A' }, ext: { remote: { user_id: remoteId } } });
+		expect(saved.result).toEqual({ message_id: posted.message_id });
+		const edit = (await until(admin, (frame) => frame.method === 'message' && frame.params.message_id === posted.message_id && frame.params.body?.text === 'edited on A')).frame.params;
+		expect(edit.from).toEqual(posted.from);
+		expect(edit.ext.remote).toEqual({ server, user_id: remoteId, room_id: 'ops', message_id: '1724803599120' });
+		const notAuthor = await request(link, 'link-save', 'message', { message_id: posted.message_id, room_id: roomId, body: { text: 'as the link' } });
+		expect(notAuthor.error.code).toBe(DENIED);
+		// Another remote user is not the author either.
+		const otherSave = await request(link, 'other-save', 'message', { message_id: posted.message_id, room_id: roomId, body: { text: 'x' }, ext: { remote: { user_id: unique('mallory') } } });
+		expect(otherSave.error.code).toBe(DENIED);
+
+		// A delete as the shadow is a tombstone, which carries no ext (§4.13).
+		const deleted = await request(link, 'delete', 'message', { message_id: posted.message_id, room_id: roomId, deleted: true, ext: { remote: { user_id: remoteId } } });
+		expect(deleted.result).toEqual({ message_id: posted.message_id });
+		const tombstone = (await until(admin, (frame) => frame.method === 'message' && frame.params.message_id === posted.message_id && frame.params.deleted === true)).frame.params;
+		expect(tombstone.from.user_id).toBe(shadowId);
+		expect(tombstone).not.toHaveProperty('ext');
+
+		// An act-as user_id must be a non-empty protocol id (two: a third invalid_params closes the connection).
+		for (const [id, userId] of [['empty', ''], ['system', '~server']] as const) {
+			const refused = await request(link, `bad-${id}`, 'message', { room_id: roomId, body: { text: 'x' }, ext: { remote: { user_id: userId } } });
+			expect(refused.error.code).toBe(INVALID_PARAMS);
+		}
+		expect(linkId).toMatch(/^link_/);
+	} finally { admin.close(); link.close(); }
+});
+
+it('strips ext.remote from everyone but a link acting as a remote user', async () => {
+	const { admin, link, linkId, roomId } = await linked('ws://127.0.0.1:8082/ws');
+	const forged = { server: 'wss://b.example/ws', user_id: 'carol' };
+	try {
+		const posted = await exchange(admin, 'post', 'message', { room_id: roomId, body: { text: 'hi' }, ext: { remote: forged, kept: true } });
+		const snapshot = posted.skipped.find((frame) => frame.method === 'message' && frame.params.message_id === posted.frame.result.message_id)!.params;
+		expect(snapshot.from).toEqual({ user_id: 'admin', name: 'Admin' });
+		expect(snapshot.ext).toEqual({ kept: true });
+		const me = await request(admin, 'me', 'me', { ext: { remote: forged } });
+		expect(me.result.you.ext?.remote).toBeUndefined();
+		const room = await exchange(admin, 'room-save', 'room_set', { room_id: roomId, ext: { remote: forged, topic: 'x' } });
+		expect(room.frame.error).toBeUndefined();
+		const listed = await request(admin, 'listed', 'room_list', { room_id: roomId });
+		expect(listed.result.joined[0].ext).toEqual({ topic: 'x' });
+		// A link without ext.remote.user_id posts as itself, and its ext.remote is dropped too.
+		const own = await exchange(link, 'own', 'message', { room_id: roomId, body: { text: 'link bot here' }, ext: { remote: { room_id: 'ops' } } });
+		const ownSnapshot = own.skipped.find((frame) => frame.method === 'message' && frame.params.message_id === own.frame.result.message_id)!.params;
+		expect(ownSnapshot.from.user_id).toBe(linkId);
+		expect(ownSnapshot).not.toHaveProperty('ext');
+	} finally { admin.close(); link.close(); }
+});
+
+it('sets a shadow\'s reactions, renames it with me, and lets it leave', async () => {
+	const server = 'ws://127.0.0.1:8083/ws';
+	const { admin, link, linkId, roomId } = await linked(server);
+	const carol = unique('carol');
+	const dave = unique('dave');
+	const daveId = `${dave}@127.0.0.1:8083`;
+	try {
+		const posted = await request(link, 'post', 'message', { room_id: roomId, body: { text: 'react to me' }, ext: { remote: { user_id: carol } } });
+		const messageId = posted.result.message_id as string;
+		const reacted = await request(link, 'react', 'reactions', { message_id: messageId, emojis: ['👍'], ext: { remote: { user_id: dave } } });
+		expect(reacted.result).toEqual({});
+		const reactions = (await until(admin, (frame) => frame.method === 'reactions' && frame.params.message_id === messageId)).frame.params;
+		expect(reactions.reactions).toEqual([{ from: { user_id: daveId, name: dave, ext: { remote: { server, user_id: dave } } }, emojis: ['👍'] }]);
+
+		// `me` renames the shadow, not the link, and others are told.
+		const renamed = await exchange(link, 'rename', 'me', { name: 'Dave D', ext: { remote: { user_id: dave } } });
+		expect(renamed.frame.result.you).toMatchObject({ user_id: daveId, name: 'Dave D', roles: [], ext: { remote: { server, user_id: dave } } });
+		const told = await until(admin, (frame) => frame.method === 'user' && frame.params.new?.user_id === daveId);
+		expect(told.frame.params.new).toEqual({ user_id: daveId, name: 'Dave D', roles: [] });
+		expect((await request(link, 'self', 'me', {})).result.you).toMatchObject({ user_id: linkId });
+		expect((await request(link, 'self', 'me', {})).result.you.name).not.toBe('Dave D');
+
+		// The shadow leaves the room.
+		const left = await request(link, 'leave', 'room_leave', { room_id: roomId, ext: { remote: { user_id: dave } } });
+		expect(left.result).toEqual({});
+		const membership = await until(admin, (frame) => frame.method === 'room_update' && frame.params.memberships?.[0]?.members?.[0]?.user?.user_id === daveId && frame.params.memberships[0].members[0].joined === false);
+		expect(membership.frame.params.memberships[0].room_id).toBe(roomId);
+	} finally { admin.close(); link.close(); }
+});
+
+it('refuses act-as writes in a room the link is not in', async () => {
+	const { admin, link, roomId } = await linked('ws://127.0.0.1:8084/ws');
+	try {
+		// `general` is public, and the link is not in it: denied.
+		const general = await request(link, 'general', 'message', { room_id: 'general', body: { text: 'x' }, ext: { remote: { user_id: 'carol' } } });
+		expect(general.error.code).toBe(DENIED);
+		// A private room the link is not in is unknown to it.
+		const other = (await request(admin, 'other', 'room_set', { private: true })).result.room_id as string;
+		const hidden = await request(link, 'hidden', 'message', { room_id: other, body: { text: 'x' }, ext: { remote: { user_id: 'carol' } } });
+		expect(hidden.error.code).toBe(INVALID_PARAMS);
+		// In its own room it may.
+		const ok = await request(link, 'ok', 'message', { room_id: roomId, body: { text: 'x' }, ext: { remote: { user_id: 'carol' } } });
+		expect(ok.result.message_id).toBeDefined();
+	} finally { admin.close(); link.close(); }
+});
+
+it('keeps shadow user_ids from being issued, renamed, or acted as by anyone but a link', async () => {
+	const { admin, link, roomId } = await linked('ws://127.0.0.1:8085/ws');
+	const carol = unique('carol');
+	const shadowId = `${carol}@127.0.0.1:8085`;
+	try {
+		expect((await request(link, 'post', 'message', { room_id: roomId, body: { text: 'x' }, ext: { remote: { user_id: carol } } })).result.message_id).toBeDefined();
+		expect((await command(admin, 'claim', `/invite-token ${shadowId}`, roomId)).frame.error.code).toBe(INVALID_PARAMS);
+		expect((await command(admin, 'claim-new', `/invite-token new@127.0.0.1:8085`, roomId)).frame.error.code).toBe(INVALID_PARAMS);
+		expect((await command(admin, 'rename', `/rename ${shadowId} ${unique('x')}`, roomId)).frame.error.code).toBe(DENIED);
+		// The admin is no link: its ext.remote.user_id is dropped, and it posts as itself.
+		const own = await exchange(admin, 'own', 'message', { room_id: roomId, body: { text: 'me' }, ext: { remote: { user_id: carol } } });
+		expect(own.skipped.find((frame) => frame.method === 'message' && frame.params.message_id === own.frame.result.message_id)!.params.from.user_id).toBe('admin');
+		// Revoked, the link signs in no more and no longer acts as anyone.
+		const linkId = (await request(link, 'whoami', 'me', {})).result.you.user_id as string;
+		const revoked = await command(admin, 'revoke', `/remote revoke ${linkId}`, roomId);
+		expect(revoked.notice!.params.body.text).toContain(`Revoked the link \`${linkId}\``);
+		expect((await command(admin, 'list', '/remote list', roomId)).notice!.params.body.text).not.toContain(`\`${linkId}\``);
+	} finally { admin.close(); link.close(); }
+});
+
+it('never signs a link out as an idle bot, nor prunes a shadow as an idle account', async () => {
+	const day = 86_400_000;
+	await runInDurableObject(env.DEMO.getByName('remote-idle'), (_instance, state) => {
+		const clock = { now: Date.now() };
+		const store = new Store(state, { idleAccountMs: 30 * day, keptActiveAccounts: 1 }, { now: () => clock.now });
+		store.initialize();
+		const sql = state.storage.sql;
+		sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('idle_activity_since', ?)", String(clock.now - 365 * day));
+		const { userId: linkId } = store.createRemoteLink({ server: 'ws://a.example/ws', name: 'Link bot', roomId: 'general', now: clock.now, ipKey: 'ip' });
+		expect(store.remoteLink(linkId)).toBe('ws://a.example/ws');
+		const shadow = store.ensureShadow({ userId: 'carol@a.example', remote: { server: 'ws://a.example/ws', user_id: 'carol' }, name: 'carol', now: clock.now, ipKey: 'ip' });
+		expect(shadow).toEqual({ name: 'carol', created: true });
+		// The same id for another server's user is refused (two addresses, one authority).
+		expect(() => store.ensureShadow({ userId: 'carol@a.example', remote: { server: 'wss://a.example/ws', user_id: 'carol' }, name: 'carol', now: clock.now, ipKey: 'ip' })).toThrow(/another server/);
+		// An ordinary bot and an ordinary account, idle as long as the link and the shadow.
+		sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES ('plain_bot', '', 'bot', 'registered', ?, ?, '[\"bot\"]')", clock.now - 90 * day, clock.now - 90 * day);
+		sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES ('plain', '', 'plain', 'registered', ?, ?, '[]')", clock.now - 90 * day, clock.now - 90 * day);
+		sql.exec("UPDATE identities SET created_ms = ?, updated_ms = ? WHERE user_id IN (?, 'carol@a.example')", clock.now - 90 * day, clock.now - 90 * day, linkId);
+		sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES ('recent', '', 'recent', 'registered', ?, ?, '[]')", clock.now, clock.now);
+		sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('bot_sweep_ms', '1')");
+		expect(store.idleBots({ now: clock.now, before: clock.now - 7 * day, limit: 10, intervalMs: day, graceMs: day })).toEqual(['plain_bot']);
+		expect(store.pruneIdleIdentities(clock.now).pruned).toEqual(['plain']);
+		expect(store.removeRemoteLink(linkId)).toBe(true);
+		expect(store.remoteLink(linkId)).toBeUndefined();
+	});
+});

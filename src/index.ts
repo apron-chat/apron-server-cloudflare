@@ -123,6 +123,7 @@ import {
 } from "./oauth";
 import { pageHeaders, renderErrorPage, renderSignInPage, type SignInPageView } from "./sign-in-page";
 import { Deadline } from "./deadline";
+import { actAsUserId, isShadowUserId, normalizeRemoteAddress, remoteAuthority, remoteUserIdError, shadowUserId, withoutRemote, type RemoteUser } from "./remote";
 
 const OBJECT_NAME = "public-demo-v1";
 const INTERNAL_IP_HEADER = "X-Apron-Trusted-IP-Key";
@@ -595,6 +596,7 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", audience: "admins" },
 	{ name: "passkeys", usage: "/passkeys [remove <n>]", help: "list your account's passkeys, or remove one of them", audience: "owners" },
 	{ name: "purge", usage: "/purge <user_id>", help: "disconnect a user and delete their account, bot, and everything they posted or uploaded", audience: "admins" },
+	{ name: "remote", usage: "/remote invite <address> | list | revoke <link_id>", help: "link another Apron server to this room: get a token for its bridge, which then posts here as that server's users; list or revoke links", audience: "admins" },
 	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
 	{ name: "role", usage: "/role <user_id> [<role>]", help: "show a user's roles, or give or take away one (admin, mod, threader and bot act as such; friend, like any role, raises their posting limits, and admin, mod and friend may use /emoji)", audience: "admins" },
 	{ name: "server", usage: "/server [title|description [<text>] | avatar]", help: "show this server's title, description and avatar; set one, the avatar with one image attached; or clear one, back to the deployment's", audience: "admins" },
@@ -938,9 +940,24 @@ function isBotId(userId: string | undefined): boolean {
 
 /** "Bot of <owner>", cut to the name limits by whole code points. */
 function botName(owner: string, limits: { maxNameCodePoints: number; maxNameBytes: number }): string {
-	const points = [...`Bot of ${owner}`].slice(0, limits.maxNameCodePoints);
+	return fitName(`Bot of ${owner}`, limits);
+}
+
+/** `text` cut to the name limits by whole code points. */
+function fitName(text: string, limits: { maxNameCodePoints: number; maxNameBytes: number }): string {
+	const points = [...text].slice(0, limits.maxNameCodePoints);
 	while (utf8Bytes(points.join("")) > limits.maxNameBytes) points.pop();
 	return points.join("");
+}
+
+/**
+ * Who a link's act-as request (extension `ext:remote`) runs as: the shadow
+ * user's identity, the link account's `user_id`, and the shadow's `remote`.
+ */
+interface ActAs {
+	identity: IdentityShape;
+	link: string;
+	remote: RemoteUser;
 }
 
 function sessionExpiryKey(expiresMs: number, sessionKeyValue: string): string {
@@ -3082,6 +3099,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 					"ext:editors",
 					// Custom emoji (ext:emoji), once an admin has added one.
 					...(emoji ? ["ext:emoji"] : []),
+					// Link accounts, whose requests may run as shadow users of
+					// their remote server (actAs), and `remote` on those users and
+					// their messages.
+					"ext:remote",
 					// With `external`, this server is its own authorization server
 					// with the standard OAuth parts (ext:oauth): the metadata, the
 					// token endpoint (tokenEndpoint), and CORS on both.
@@ -3467,6 +3488,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// A frame from a connection not idle is its user attended (see attended),
 		// a stale one resuming included: what was pushed is unread no longer.
 		if (!attachment.idle) this.clearUnread(attachment);
+		if (await this.actAs(socket, attachment, request)) return;
 		switch (request.method) {
 			case "auth":
 				await this.handleAuth(socket, attachment, request);
@@ -4852,8 +4874,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const name = optionalString(request.params, "name");
 		const avatar = optionalString(request.params, "avatar");
 		const status = optionalString(request.params, "status");
-		// The keys the server owns, `permissions`, are ignored like `roles`.
-		const ext = clientUserExt(objectParam(request.params, "ext", false));
+		// The keys the server owns, `permissions` and `remote` (ext:remote), are ignored like `roles`.
+		const ext = withoutRemote(clientUserExt(objectParam(request.params, "ext", false)));
 		const writesExt = ext !== undefined && Object.keys(ext).length > 0;
 		if (name !== undefined && attachment.tier !== "registered") {
 			throw { name: "denied", message: "Only registered users may change their name" } satisfies ProtocolError;
@@ -4934,8 +4956,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/** Shared path for logged mutations: dedup, quotas, commit, reply, broadcast. */
-	private async commitAndBroadcast(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, method: "message" | "reactions", action: string): Promise<void> {
-		const identity = identityOf(attachment);
+	private async commitAndBroadcast(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, method: "message" | "reactions", action: string, actor?: ActAs): Promise<void> {
+		// A link's act-as request runs as its shadow (ext:remote).
+		const identity = actor?.identity ?? identityOf(attachment);
 		if (!identity) throw { name: "denied", message: `Authenticate before ${action}` } satisfies ProtocolError;
 		const input: StoreMutationInput = {
 			userId: identity.user_id,
@@ -4946,6 +4969,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			now: nowMs(),
 			params: request.params,
 			identity,
+			...(actor ? { link: actor.link, remote: actor.remote } : {}),
 		};
 		let started = false;
 		let liveEnded = false;
@@ -4966,7 +4990,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// Only a new message wakes anyone: not an edit, move, or retry (§4.9).
 			if (method === "message" && !result.deduplicated && result.message?.prev_log_id === undefined) created = result.message;
 		});
-		this.noteBotActive(identity.user_id, attachment.roles ?? []);
+		this.noteBotActive(attachment.userId ?? identity.user_id, attachment.roles ?? []);
 		if (created) {
 			// Posting in a room shows its poster saw it: their waiting and held wakes for it go.
 			this.dropWakes(identity.user_id, created.room_id);
@@ -4979,7 +5003,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (liveEnded) await this.refreshLiveDeadline().catch(() => undefined);
 	}
 
-	private async handleMessage(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
+	private async handleMessage(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, actor?: ActAs): Promise<void> {
 		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate before posting" } satisfies ProtocolError;
 		this.assertMayWrite(attachment);
 		// Without room_id a message goes to the default room (§3.5). Posting does
@@ -4991,12 +5015,142 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const messageId = optionalString(request.params, "message_id");
 		if (messageId === undefined && request.params.body === undefined) throw { name: "invalid_params", message: "Missing body" } satisfies ProtocolError;
 		if (request.params.body !== undefined) objectParam(request.params, "body");
-		await this.commitAndBroadcast(socket, attachment, request, "message", "posting");
+		// A shadow first joins the room it posts in, if its link is in it (ext:remote).
+		if (actor) await this.shadowJoins(socket, attachment, actor, optionalString(request.params, "room_id") ?? ROOM_ID);
+		await this.commitAndBroadcast(socket, attachment, request, "message", "posting", actor);
 	}
 
-	private async handleReactions(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
+	private async handleReactions(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, actor?: ActAs): Promise<void> {
 		if (identityOf(attachment)) this.assertMayWrite(attachment);
-		await this.commitAndBroadcast(socket, attachment, request, "reactions", "reacting");
+		// A shadow first joins the message's room, if its link is in it (ext:remote).
+		const messageId = request.params.message_id;
+		const roomId = actor && typeof messageId === "string" && messageId !== "" ? this.store.messageRoom(messageId, nowMs()) : null;
+		if (actor && roomId !== null) {
+			// A message in a private room the link is not in is unknown, as it is to anyone else (§5.3).
+			if (!this.sees(connectionAttachment(socket) ?? attachment, roomId)) throw { name: "invalid_params", message: "unknown or expired message" } satisfies ProtocolError;
+			await this.shadowJoins(socket, attachment, actor, roomId);
+		}
+		await this.commitAndBroadcast(socket, attachment, request, "reactions", "reacting", actor);
+	}
+
+	/**
+	 * A link's act-as request (extension `ext:remote`): from a connection
+	 * signed in as a link account (Store.remoteLink), a `message`,
+	 * `reactions`, `me` or `room_leave` whose `params.ext.remote.user_id` is
+	 * a string runs as the shadow user of that user of the link's server
+	 * (shadowUserId), created on first use (Store.ensureShadow). The
+	 * request's `ext.remote.server` is ignored: the link's binding is the
+	 * server. A `user_id` that is empty, too long, a system identity's, or
+	 * has whitespace is `invalid_params`. Results and deliveries reach the
+	 * link's connection as usual. False for any other request, which runs
+	 * as the connection's own user, and whose `ext.remote` the store drops.
+	 */
+	private async actAs(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<boolean> {
+		const method = request.method;
+		if (method !== "message" && method !== "reactions" && method !== "me" && method !== "room_leave") return false;
+		const remoteUserId = actAsUserId(request.params);
+		const link = attachment.tier === "registered" ? attachment.userId : undefined;
+		if (remoteUserId === undefined || link === undefined) return false;
+		const server = this.store.remoteLink(link, nowMs());
+		if (server === undefined) return false;
+		const problem = remoteUserIdError(remoteUserId);
+		if (problem) throw { name: "invalid_params", message: problem } satisfies ProtocolError;
+		this.assertMayWrite(attachment);
+		const remote = { server, user_id: remoteUserId };
+		const userId = shadowUserId(server, remoteUserId);
+		if (method === "room_leave") {
+			await this.shadowLeaves(socket, attachment, request, { identity: { user_id: userId, tier: "registered" }, link, remote });
+			return true;
+		}
+		// Created on first use, named as its remote user_id until a `me` names it.
+		const shadow = this.store.ensureShadow({ userId, remote, name: fitName(remoteUserId, this.config.limits), now: nowMs(), ipKey: attachment.ipKey });
+		const actor: ActAs = { identity: { user_id: userId, ...(shadow.name ? { name: shadow.name } : {}), tier: "registered" }, link, remote };
+		if (method === "message") await this.handleMessage(socket, attachment, request, actor);
+		else if (method === "reactions") await this.handleReactions(socket, attachment, request, actor);
+		else await this.shadowMe(socket, attachment, request, actor);
+		return true;
+	}
+
+	/**
+	 * Joins a link's shadow (ext:remote) to the room it writes in, with a
+	 * logged membership charged to the shadow at its link's limits, unless it
+	 * is in it already. Only into a room the link is in: one the link cannot
+	 * see is unknown (`invalid_params`), and any other is `denied`.
+	 */
+	private async shadowJoins(socket: WebSocketConnection, attachment: ConnectionAttachment, actor: ActAs, roomId: string): Promise<void> {
+		const current = connectionAttachment(socket) ?? attachment;
+		if (!this.roomExists(roomId) || !this.sees(current, roomId)) throw { name: "invalid_params", message: "unknown room" } satisfies ProtocolError;
+		if (!(current.rooms ?? []).includes(roomId)) throw { name: "denied", message: "This link is not in that room, so its remote users may not write there" } satisfies ProtocolError;
+		const userId = actor.identity.user_id;
+		if (this.store.isRoomMember(roomId, userId, nowMs())) return;
+		await this.runMutation(async () => {
+			const change = this.store.changeMembership({ userId, ipKey: attachment.ipKey, roomId, join: true, now: nowMs(), actorId: actor.link, link: actor.link });
+			if (change.membership) this.broadcastRecord(change.membership);
+		});
+	}
+
+	/**
+	 * A link's act-as `room_leave` (ext:remote): the shadow leaves the room,
+	 * logged and charged as its join was; `user_id` in the request is
+	 * ignored. A shadow that does not exist or is not in the room changes
+	 * nothing.
+	 */
+	private async shadowLeaves(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, actor: ActAs): Promise<void> {
+		const roomId = requiredString(request.params, "room_id");
+		if (!this.roomExists(roomId) || !this.sees(connectionAttachment(socket) ?? attachment, roomId)) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
+		const userId = actor.identity.user_id;
+		if (!this.store.isRoomMember(roomId, userId, nowMs())) {
+			this.reply(socket, request, {});
+			return;
+		}
+		await this.runMutation(async () => {
+			const change = this.store.changeMembership({ userId, ipKey: attachment.ipKey, roomId, join: false, now: nowMs(), link: actor.link });
+			if (change.membership) this.broadcastRecord(change.membership);
+			if (change.changed) this.removeIfEmpty(roomId);
+			this.reply(socket, request, {});
+		});
+	}
+
+	/**
+	 * A link's act-as `me` (ext:remote): sets the shadow's `name` and `ext`
+	 * (but `remote`, the server's) as `me` does, charged to the shadow at its
+	 * link's limits; `avatar` and `status` are ignored. The result's `you` is
+	 * the shadow, a complete object; a change goes to those who share a room
+	 * with the shadow, the link's connection included, as `user` `new`. The
+	 * link's own profile does not change.
+	 */
+	private async shadowMe(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, actor: ActAs): Promise<void> {
+		const userId = actor.identity.user_id;
+		const name = optionalString(request.params, "name");
+		optionalString(request.params, "avatar");
+		optionalString(request.params, "status");
+		const ext = withoutRemote(clientUserExt(objectParam(request.params, "ext", false)));
+		if (name !== undefined) {
+			const { maxNameCodePoints, maxNameBytes } = this.config.limits;
+			if (utf8Bytes(name) > maxNameBytes) throw { name: "too_large", message: "name is too large" } satisfies ProtocolError;
+			if ([...name].length > maxNameCodePoints) throw { name: "too_large", message: "name is too long" } satisfies ProtocolError;
+		}
+		const shadowObject = (stored: { name?: string; ext?: Record<string, unknown> } | null): PublicUser => ({
+			user_id: userId, name: stored?.name ?? "", roles: [], ...(stored?.ext ? { ext: stored.ext } : {}),
+		});
+		const before = this.store.getIdentity(userId);
+		if (name === undefined && !(ext && Object.keys(ext).length)) {
+			this.reply(socket, request, { you: shadowObject(before) });
+			return;
+		}
+		await this.runMutation(async () => {
+			const result = this.store.commitMutation({
+				userId, ipKey: attachment.ipKey, requestId: request.id, method: "me", now: nowMs(),
+				params: request.params, identity: actor.identity, link: actor.link, remote: actor.remote,
+			});
+			const after = this.store.getIdentity(userId);
+			const changed = result.profile?.changed;
+			// The change comes before the result on the link's connection, which shares the rooms (§1).
+			if (!result.deduplicated && after && ((name !== undefined && name !== before?.name) || changed)) {
+				this.announceUser(null, { user_id: userId, name: after.name ?? "", roles: [], ...(changed ? { ext: changed } : {}) }, after.rooms);
+			}
+			this.reply(socket, request, { you: shadowObject(after) });
+		});
 	}
 
 	/**
@@ -7409,6 +7563,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 			return;
 		}
+		if (command.name === "remote") {
+			try {
+				await this.remoteCommand(socket, attachment, request, roomId, words.slice(1));
+			} catch (error) {
+				const protocol = errorToProtocol(error);
+				if (protocol.name !== "invalid_params") throw error;
+				this.fail(socket, request, protocol);
+			}
+			return;
+		}
 		if (["admin", "role", "kick", "rename", "purge", "toggle", "invite-token", "invite-code", "invite-purge"].includes(command.name)) {
 			try {
 				if (command.name === "role") {
@@ -8372,6 +8536,68 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
+	 * `/remote` (extension `ext:remote`), for admins:
+	 * - `invite <address>`: creates a link account bound to the remote server
+	 *   at `address` (a `ws` or `wss` URI, normalizeRemoteAddress), in this
+	 *   room alone (Store.createRemoteLink), with an invite token like
+	 *   `/invite-token`'s. The sender gets a `~private` notice before the
+	 *   result (§1) with an Appendix A.4 link to this server, this room and
+	 *   the token, which the remote server's bridge signs in with.
+	 * - `list`: the links and their servers.
+	 * - `revoke <link_id>`: unbinds a link, revokes its tokens and closes its
+	 *   connections; its account, its shadows and their posts stay.
+	 */
+	private async remoteCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, args: string[]): Promise<void> {
+		const usage = { name: "invalid_params", message: "Usage: /remote invite <address> | list | revoke <link_id>" } satisfies ProtocolError;
+		const [action, argument] = args;
+		if (action === "list" && args.length === 1) {
+			const links = Object.entries(this.store.remoteLinks(nowMs()));
+			this.sendNotice(socket, roomId, links.length
+				? links.map(([userId, link]) => `- \`${userId}\`: ${link.server}, since ${new Date(link.created_ms).toISOString().slice(0, 10)}`).join("\n")
+				: "No links. `/remote invite <address>` creates one.");
+			this.reply(socket, request, {});
+			return;
+		}
+		if (action === "revoke" && args.length === 2) {
+			const userId = argument.replace(/^@/, "");
+			const server = this.store.remoteLink(userId, nowMs());
+			if (server === undefined || !this.store.removeRemoteLink(userId, nowMs())) throw { name: "invalid_params", message: `No link has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
+			await this.forgetTokens([userId]);
+			for (const peer of this.connectionsOf(userId)) {
+				const state = connectionAttachment(peer);
+				if (state) this.closePolicy(peer, state, 1008, "This link was revoked");
+			}
+			this.sendNotice(socket, roomId, `Revoked the link \`${userId}\` to ${server}: its token no longer signs in, and nobody posts as that server's users any more. Its account, its remote users and their posts stay; \`/purge\` removes them.`);
+			this.reply(socket, request, {});
+			return;
+		}
+		if (action !== "invite" || args.length !== 2) throw usage;
+		const server = normalizeRemoteAddress(argument);
+		if (!server) throw { name: "invalid_params", message: "The address is the remote server's WebSocket URL, ws:// or wss://, such as wss://chat.example/ws" } satisfies ProtocolError;
+		const endpoint = connectionAttachment(socket)?.endpoint ?? attachment.endpoint;
+		if (endpoint !== undefined && normalizeRemoteAddress(endpoint) === server) throw { name: "invalid_params", message: "That is this server's own address" } satisfies ProtocolError;
+		let userId = "";
+		await this.runMutation(async () => {
+			const created = this.store.createRemoteLink({ server, name: fitName(`Link bot for ${remoteAuthority(server)}`, this.config.limits), roomId, now: nowMs(), ipKey: attachment.ipKey });
+			userId = created.userId;
+			// The link's logged join of this room goes to its members (§4.2.2).
+			for (const record of created.broadcasts) this.broadcastRecord(record);
+		});
+		const token = INVITE_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+		const key = INVITE_TOKEN_KEY_PREFIX + await sha256Hex(token);
+		await this.withSessionLock(() => this.store.withMeterAsync("foreground", { writes: 2 }, async () => {
+			await this.ctx.storage.put<StoredInviteToken>(key, { v: 1, userId });
+			await this.ctx.storage.put<StoredBot>(INVITE_KEY_PREFIX + userId, { v: 1, tokenKey: key });
+		}));
+		this.sendNotice(socket, roomId, [
+			`Created the link \`${userId}\` to ${server}, in this room. Give this link to the operator of that server for its bridge: it signs in as \`${userId}\`, and then posts here as that server's users. Anyone who has it can, so hand it over privately. \`/remote revoke ${userId}\` revokes it; a member adds the link to another room with \`room_join\`.`,
+			endpoint ? "```\n" + apronLink(endpoint, { room: roomId, token }) + "\n```" : "",
+			`The token alone, for the \`token\` scheme: \`${token}\``,
+		].filter(Boolean).join("\n\n"));
+		this.reply(socket, request, {});
+	}
+
+	/**
 	 * `/invite-purge <user_id>` (a leading `@` is allowed): takes away every
 	 * way a registered user signs in (their passkeys, passkey sessions,
 	 * device tokens and invite token), closes their connections, deletes
@@ -8664,6 +8890,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async rename(socket: WebSocketConnection, request: RequestFrame, roomId: string, from: string, to: string): Promise<void> {
 		if (from === ADMIN_USER_ID) throw { name: "denied", message: "The admin user's user_id is fixed" } satisfies ProtocolError;
+		// A shadow's user_id is its remote user's, and a link's is its binding's key (ext:remote).
+		if (isShadowUserId(from) || this.store.remoteLink(from, nowMs()) !== undefined) throw { name: "denied", message: "A link's or remote user's user_id is fixed" } satisfies ProtocolError;
 		if (to === ADMIN_USER_ID) throw { name: "invalid_params", message: `The user_id ${to} is taken` } satisfies ProtocolError;
 		assertIssuableUserId(to);
 		const renamed = this.store.renameIdentity({ from, to, now: nowMs() });

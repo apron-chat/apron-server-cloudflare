@@ -289,6 +289,24 @@ again with the same id replaces that token and signs out connections that
 used the old one; `/invite-device remove <id>` revokes it, and
 `/invite-device list` shows your ids with when each was added and last used. See [SPEC section 5](../SPEC.md#devices).
 
+## Linking another server
+
+This server never connects out, but it can share a room with another Apron
+server whose bridge connects in (extension `ext:remote`; [SPEC section
+4](../SPEC.md#extension-extremote)). As an admin, in the room to share (a
+private one works: create it with `room_set` and `private: true`), run
+`/remote invite <address of the other server>`, such as
+`/remote invite wss://go.example/ws`. The `~private` notice holds a link,
+`https://link.apron.chat/#server=<this server>&room=<room>&token=<token>`,
+for the other server's bridge: it signs in as the new link account
+(`link_1`, a bot) and posts here as the other server's users, which appear as
+`carol@go.example` with `ext.remote` naming their server. Hand it over
+privately. `/remote list` shows the links, and `/remote revoke <link_id>`
+signs one out for good. Locally, with `--var APRON_ADMIN_TOKEN:<token>`, the
+WebSocket path is `ws://127.0.0.1:8787/ws` for `wrangler dev --port 8787`.
+A private room is removed once nothing has been posted in it for the
+retention period, link or not.
+
 ## User-visible policies
 
 Only the last 30 days of records (messages, reactions, room changes, and
