@@ -29,7 +29,7 @@ export interface RuntimeConfig {
 	 */
 	presence: boolean;
 	/**
-	 * The passkey page (`/passkey`, PLAN_WEBAUTHN_EXTERNAL.md): a `webauthn`
+	 * The passkey page (`/passkey`, protocol §4.10.1): a `webauthn`
 	 * begin carries `external` with its URL, so clients that cannot use the RP
 	 * ID sign in with a passkey on the server's own origin. Served only on a
 	 * host that is the RP ID or under it. `PASSKEY_PAGE`, default on.

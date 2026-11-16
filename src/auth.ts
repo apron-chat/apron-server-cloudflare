@@ -28,7 +28,7 @@ export interface ChallengeRecord {
 	/** A registration that adds a passkey to the signed-in identity (§4.10), which is `userId`. */
 	adds?: boolean;
 	/**
-	 * A ceremony on the passkey page (PLAN_WEBAUTHN_EXTERNAL.md): `origin` is
+	 * A ceremony on the passkey page (protocol §4.10.1): `origin` is
 	 * the server's own, under the RP ID, rather than one of `RP_ORIGINS`, and
 	 * client data from a frame on another site is refused.
 	 */

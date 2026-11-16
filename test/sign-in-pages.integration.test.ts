@@ -4,7 +4,7 @@ import { fetchEntry } from '../src/index';
 import { connect as open, greeting, request, type Frame, type Peer } from './helpers/socket';
 import { softPasskey } from './helpers/webauthn';
 
-// The passkey page (PLAN_WEBAUTHN_EXTERNAL.md) and `external` (protocol
+// The passkey page (protocol §4.10.1) and `external` (protocol
 // §4.12) are served on a host that is the RP ID or under it. The suites'
 // RP ID is `localhost`, so these connect to https://localhost, whose origin
 // the page runs on; other suites reach demo.test, where nothing changes.
@@ -185,7 +185,7 @@ it('creates an account and signs in through the passkey page, with a bearer toke
 	peer.close();
 	expect(userId).toMatch(/^ada_\d{4}$/);
 	expect(token).toMatch(/^apron_session_/);
-	// Not bound to an origin (PLAN_WEBAUTHN_EXTERNAL.md "Rules"): no Origin, or the web client's.
+	// Not bound to an origin (protocol §4.10.1): no Origin, or the web client's.
 	for (const origin of [null, 'http://localhost:5173']) {
 		const again = await connect(origin);
 		try {

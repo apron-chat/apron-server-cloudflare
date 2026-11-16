@@ -141,8 +141,8 @@ const SESSION_KEY_PREFIX = "session:";
 /** Ordered, advisory expiry entries. The session record remains authoritative. */
 const SESSION_EXPIRY_PREFIX = "session-expiry:";
 /**
- * A session token from a sign-in page's code (PLAN_WEBAUTHN_EXTERNAL.md,
- * protocol §4.12): a bearer token bound to no origin, so it resumes from any
+ * A session token from a sign-in page's code (protocol §4.10.1, §4.12.4):
+ * a bearer token bound to no origin, so it resumes from any
  * client, unlike a token from a ceremony in the client (§4.10).
  */
 const SESSION_TOKEN_PREFIX = "apron_session_";
@@ -764,7 +764,7 @@ interface SignInExpiryEntry {
 
 /**
  * A code a sign-in page issued, bound to its page, its action, and the
- * client's request (protocol §4.12.3, PLAN_WEBAUTHN_EXTERNAL.md "Rules"):
+ * client's request (protocol §4.12.3, §4.10.1):
  * the account it signs in to, or for a new account the passkey to create it
  * with, or for an addition the passkey to add to `userId`.
  */
@@ -3618,7 +3618,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const step = requiredString(params, "step");
 		const origin = this.requestOrigin(socket);
 		// A ceremony in the client needs one of RP_ORIGINS; the passkey page
-		// serves every other client, on the server's own origin (PLAN_WEBAUTHN_EXTERNAL.md).
+		// serves every other client, on the server's own origin (protocol §4.10.1).
 		const local = origin !== null && this.config.rpOrigins.includes(origin);
 		const pageOrigin = this.passkeyPageOrigin(attachment);
 		if (!local && !pageOrigin) throw { name: "denied", message: "Frontend origin is not configured for passkeys" } satisfies ProtocolError;
@@ -3649,7 +3649,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 			// The passkey page, for a client that cannot use the RP ID: its query
 			// carries the action, a new account's name, or an addition's handle,
-			// which the client keeps (PLAN_WEBAUTHN_EXTERNAL.md, "Wire").
+			// which the client keeps (protocol §4.10.1, §4.12.1).
 			if (pageOrigin) {
 				const url = new URL(PASSKEY_PAGE_PATH, pageOrigin);
 				url.searchParams.set("action", action);
@@ -3666,7 +3666,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const signIn = this.passkeySignIn(socket, attachment);
 		if (params.code !== undefined) {
 			// A code from the passkey page finishes the exchange instead of a
-			// credential, on any connection (PLAN_WEBAUTHN_EXTERNAL.md, "Rules").
+			// credential, on any connection (protocol §4.10.1).
 			if (!pageOrigin) throw { name: "denied", message: "Sign-in code is invalid or expired" } satisfies ProtocolError;
 			const code = await this.takeSignInCode(params, "passkey", pageOrigin);
 			if (code.action !== action) throw { name: "denied", message: "Sign-in code is invalid or expired" } satisfies ProtocolError;
@@ -3755,7 +3755,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * a sign-in page: an addition answers `you` and tells the account's other
 	 * connections; anything else signs the connection in with a new session
 	 * token, bound to `origin` for a ceremony in the client (§4.10) and a
-	 * plain bearer token for a code (PLAN_WEBAUTHN_EXTERNAL.md, "Rules").
+	 * plain bearer token for a code (protocol §4.10.1).
 	 * Deliveries are held from before the account was written.
 	 */
 	private async completePasskeySignIn(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame,
@@ -3860,8 +3860,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * An addition's `request` handle (PLAN_WEBAUTHN_EXTERNAL.md, "Adding a
-	 * passkey"): unguessable, bound to the account and its user handle, and
+	 * An addition's `request` handle (protocol §4.10.1; SPEC.md section 5,
+	 * Passkey page): unguessable, bound to the account and its user handle, and
 	 * expiring. The passkey page reads it to name the account and to create
 	 * the passkey for it; its code then works only on that account's
 	 * connections.

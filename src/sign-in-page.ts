@@ -3,7 +3,7 @@
  * `external` is offered, `/oauth/authorize`. Both are one server-rendered
  * page with a small inline script that runs `navigator.credentials` on the
  * server's own origin, so the passkey's RP ID always fits. The wording is
- * PLAN_WEBAUTHN_EXTERNAL.md's "Confirmation", on one screen: who is asking
+ * SPEC.md's (section 5, Passkey page), on one screen: who is asking
  * and what they get, before the passkey. A verified passkey goes straight
  * back to the client with its code; the device's passkey sheet has already
  * shown which account it is.

@@ -1,14 +1,11 @@
 /*
  * The authorization server pieces of the sign-in pages: the passkey page of
- * the `webauthn` scheme (PLAN_WEBAUTHN_EXTERNAL.md, on shazow/apron#116), and
- * the `/oauth/authorize` page of `external` (protocol §4.12.3). Both take an
+ * the `webauthn` scheme (protocol §4.10.1), and the `/oauth/authorize` page
+ * of `external` (protocol §4.12.3). Both take an
  * OAuth 2.1 authorization request with PKCE from any client, and end in a
  * code that the client redeems on its connection (or, for `external`, at
  * `/oauth/token`). Pure helpers only: what is kept, and when, is the Durable
  * Object's (index.ts, "Sign-in pages").
- *
- * Section numbers in these files are PROTOCOL.md's on shazow/apron#115,
- * where §4.12 is external sign-in (v10's §4.12 `ext` is §4.13 there).
  */
 
 /** Which page issued a code: a passkey-page code finishes only `webauthn`, an `/oauth/authorize` code only `external`. */
@@ -89,8 +86,8 @@ function isLoopback(hostname: string): boolean {
 }
 
 /**
- * Who is asking, in the page's words (PLAN_WEBAUTHN_EXTERNAL.md,
- * "Confirmation"): an `https` redirect's host; an app scheme as "An app on
+ * Who is asking, in the page's words (protocol §4.12.3; SPEC.md section 5,
+ * Passkey page): an `https` redirect's host; an app scheme as "An app on
  * this device (com.example.myapp)"; a loopback address as "An app on this
  * device". `who` starts a sentence and `client` is the same within one
  * ("Sign in to … on …?"); `where` is how "Only continue if you just started
@@ -104,8 +101,8 @@ export function clientLabel(redirect: URL): { who: string; client: string; where
 }
 
 /**
- * Whether the server recognises the client (PLAN_WEBAUTHN_EXTERNAL.md,
- * "Confirmation"), so the page leaves out "has not verified this app": only
+ * Whether the server recognises the client (SPEC.md section 5, Passkey
+ * page), so the page leaves out "has not verified this app": only
  * an `https` redirect on one of the server's own passkey origins
  * (`RP_ORIGINS`), its first-party clients. App schemes and loopback
  * addresses never are; nor is any `client_id`.
