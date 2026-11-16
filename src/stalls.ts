@@ -54,7 +54,7 @@ export const STALL_DEFAULTS: Readonly<StallOptions> = Object.freeze({
 	awakeMs: 15 * 60_000,
 });
 
-/** What else an awake report counts: open sockets, live texts, waiting pushes. */
+/** What else an awake report counts: open sockets, and any other counts by name (guests, live texts, waiting pushes). */
 export interface AwakeSnapshot {
 	sockets: number;
 	[kind: string]: number;

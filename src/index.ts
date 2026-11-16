@@ -2920,9 +2920,22 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 	}
 
-	/** What an `awake` report counts besides the waits in flight (src/stalls.ts). */
+	/**
+	 * What an `awake` report counts besides the waits in flight
+	 * (src/stalls.ts): open sockets, and of them guests (`anonymous`) and
+	 * those not signed in yet (`pending`), so an influx of visitors tells
+	 * from a stall; live texts, and pushes waiting out their delay.
+	 */
 	private awakeSnapshot(): AwakeSnapshot {
-		return { sockets: this.ctx.getWebSockets().length, live: this.liveSessions.size, wakes: this.pendingWakes.size };
+		const sockets = this.ctx.getWebSockets();
+		let anonymous = 0;
+		let pending = 0;
+		for (const socket of sockets) {
+			const tier = connectionAttachment(socket as WebSocketConnection)?.tier;
+			if (tier === "anonymous") anonymous += 1;
+			else if (tier === "pending") pending += 1;
+		}
+		return { sockets: sockets.length, anonymous, pending, live: this.liveSessions.size, wakes: this.pendingWakes.size };
 	}
 
 	private async runAlarm(): Promise<void> {

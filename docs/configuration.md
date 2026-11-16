@@ -238,7 +238,8 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   flush after each alarm `storage`; summed a minute at a time like refusals,
   so `double1` is a count, `double2` the worst and `double3` the total
   milliseconds), an instance in memory 15 minutes or more without hibernating
-  (`awake`, at most four points an hour: what it had in flight, its age in
+  (`awake`, at most four points an hour: what it had in flight and how many
+  of its sockets are guests or not signed in yet, its age in
   minutes, the events it handled since the last point and its open sockets;
   few events with something in flight is a stall, many is traffic), and
   refusals (`refusal`, `src/refusals.ts`): `error` for a JSON-RPC error (a

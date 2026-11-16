@@ -54,7 +54,8 @@ export type MetricEvent =
 	/**
 	 * An instance stayed in memory 15 minutes or more without hibernating
 	 * (src/stalls.ts), at most once per 15: what it had in flight (`none`, or
-	 * `kind=count` pairs); valued by its age in minutes, with the events it
+	 * `kind=count` pairs, with its guest (`anonymous`) and not yet signed in
+	 * (`pending`) sockets); valued by its age in minutes, with the events it
 	 * handled since its last report and its open sockets in `double2` and
 	 * `double3`.
 	 */
