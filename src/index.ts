@@ -222,7 +222,7 @@ interface ConnectionAttachment {
 	 */
 	roles?: string[];
 	/**
-	 * The user's `ext` (§4.12), read with the identity at sign-in and kept
+	 * The user's `ext` (§4.13), read with the identity at sign-in and kept
 	 * equal across their connections by `me`: for complete user objects,
 	 * which then need no storage read. Guests have none.
 	 */
@@ -1559,7 +1559,7 @@ function setAvatar(attachment: ConnectionAttachment, avatar: string | undefined)
 	else delete attachment.avatar;
 }
 
-/** Keeps a user's `ext` (§4.12) on a connection's attachment, or none; the caller writes the attachment. */
+/** Keeps a user's `ext` (§4.13) on a connection's attachment, or none; the caller writes the attachment. */
 function setExt(attachment: ConnectionAttachment, ext: Record<string, unknown> | undefined): void {
 	if (ext && Object.keys(ext).length) attachment.ext = ext;
 	else delete attachment.ext;
@@ -3069,7 +3069,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 					// which decide pushes (§4.9, §4.5).
 					...(this.config.push ? ["status"] : []),
 					// The `ext` clients write on users, messages, and rooms is kept,
-					// and writes merge it one level deep (§4.12).
+					// and writes merge it one level deep (§4.13).
 					"ext",
 					// This server's extensions: `ext.settings` below, `ext.limits`
 					// on `retry_after` errors (limitData), `ext.media` below where
@@ -4836,7 +4836,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * (BOT_NAME_PATTERN); `name: ""` removes it, so the user falls back to
 	 * `user_id`. With uploads, `avatar: ""` removes a registered user's
 	 * avatar; a new one comes only through `/avatar` (§4.8.7), so other values
-	 * are declined. `ext` (§4.12) merges one level deep into the user's kept
+	 * are declined. `ext` (§4.13) merges one level deep into the user's kept
 	 * one, at most MAX_USER_EXT_BYTES after the merge (else `too_large`); only
 	 * registered users keep one, so a guest's `ext` with keys is `denied`, and
 	 * `"ext": {}` changes nothing. `roles` is not settable (§3.3) and is
@@ -4918,7 +4918,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.reply(socket, request, { you: { ...this.you(current), ...cleared } });
 			if (result.deduplicated || (name === undefined && !changed)) return;
 			// §3.3: `you` to the user's other connections, `new` to those who share
-			// a room with the user, with the ext keys that changed (§4.12).
+			// a room with the user, with the ext keys that changed (§4.13).
 			const user = { ...this.current(current)!, ...(current.name ? {} : { name: "" }), ...(changed ? { ext: changed } : {}) };
 			this.announceUser(socket, user, current.rooms ?? []);
 		});
@@ -8477,7 +8477,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * A connection's user as a complete object (§3.3), as `you` in results
 	 * and room `users` carry it: its current object with the user's whole
-	 * `ext` (§4.12), from the attachment. Notifications of a change carry
+	 * `ext` (§4.13), from the attachment. Notifications of a change carry
 	 * only the `ext` keys it changed, so they use current.
 	 */
 	private complete(attachment: ConnectionAttachment): PublicUser | null {

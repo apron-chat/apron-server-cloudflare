@@ -30,7 +30,7 @@ export interface StoredIdentity {
 	avatar?: string;
 	/** The identity's roles (protocol §3.3), kept in its row: `admin`, `bot`, or labels. */
 	roles: string[];
-	/** The identity's `ext` (protocol §4.12), kept in its row; absent when empty. */
+	/** The identity's `ext` (protocol §4.13), kept in its row; absent when empty. */
 	ext?: Record<string, unknown>;
 	/**
 	 * When the status others see of the identity last became `offline`

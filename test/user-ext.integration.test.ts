@@ -3,7 +3,7 @@ import { expect, it } from 'vitest';
 import { MAX_USER_EXT_BYTES } from '../src/store';
 import { connect as open, exchange, greeting, request, until, type Frame, type Peer } from './helpers/socket';
 
-// Capability `ext` (§4.12) on users: `me` merges it one level deep, complete
+// Capability `ext` (§4.13) on users: `me` merges it one level deep, complete
 // user objects carry it whole, and `user` notifications carry the keys that changed.
 
 let nextIp = 1;
@@ -48,7 +48,7 @@ it('advertises capability ext', async () => {
 	} finally { peer.close(); }
 });
 
-it('merges a user ext one level deep, sends it whole in complete objects, and only what changed in notifications (§4.12)', async () => {
+it('merges a user ext one level deep, sends it whole in complete objects, and only what changed in notifications (§4.13)', async () => {
 	const aliceId = unique('alice');
 	const bobId = unique('bob');
 	const aliceToken = await register(aliceId);

@@ -194,7 +194,7 @@ it('updates a registered name and ext with me, declines avatar, and treats name 
 
 	peer.send({ id: 'rename', method: 'me', params: { name: 'Ada' } });
 	expect((await reply(peer, 'rename')).result).toEqual({ you: { user_id: 'user_session_me', name: 'Ada', roles: [], ext: { permissions: { add_members: true } }, status: 'online' } });
-	// Omitted fields stay unchanged; avatars come only from uploads, and ext is kept (§4.12).
+	// Omitted fields stay unchanged; avatars come only from uploads, and ext is kept (§4.13).
 	peer.send({ id: 'profile', method: 'me', params: { avatar: 'https://example.test/a.png', ext: { demo: true } } });
 	expect((await reply(peer, 'profile')).result).toEqual({ you: { user_id: 'user_session_me', name: 'Ada', roles: [], ext: { demo: true, permissions: { add_members: true } }, status: 'online' } });
 	peer.send({ id: 'no-ext', method: 'me', params: { ext: { demo: '' } } });
