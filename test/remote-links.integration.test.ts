@@ -268,7 +268,7 @@ it('gives a link\'s own user object ext.remote with its server and no user_id', 
 	} finally { admin.close(); link.close(); }
 });
 
-it('does not join a remote user again to a room it left or was removed from', async () => {
+it('joins a remote user that left a room again on its next write, but not one another user removed', async () => {
 	const { admin, link, roomId } = await linked('ws://127.0.0.1:8088/ws');
 	const carol = unique('carol');
 	const dave = unique('dave');
@@ -278,16 +278,20 @@ it('does not join a remote user again to a room it left or was removed from', as
 	try {
 		expect((await post('carol-1', carol)).result.message_id).toBeDefined();
 		const reacted = (await post('dave-1', dave)).result.message_id as string;
-		// Carol leaves through her link: her next write is refused, a reaction too.
+		// Carol leaves through her link: her next write joins her again.
 		expect((await request(link, 'leave', 'room_leave', { room_id: roomId, ext: { remote: { user_id: carol } } })).result).toEqual({});
-		expect((await post('carol-2', carol)).error.code).toBe(DENIED);
-		expect((await request(link, 'carol-react', 'reactions', { message_id: reacted, emojis: ['👍'], ext: { remote: { user_id: carol } } })).error.code).toBe(DENIED);
-		// The admin removes Dave: the same.
-		expect((await command(admin, 'kick', `/kick ${daveId}`, roomId)).frame.result).toEqual({});
+		const rejoined = await exchange(link, 'carol-2', 'message', { room_id: roomId, body: { text: 'back' }, ext: { remote: { user_id: carol } } });
+		expect(rejoined.frame.result.message_id).toBeDefined();
+		expect(rejoined.skipped.some((frame) => frame.method === 'room_update' && frame.params.memberships?.[0]?.members?.[0]?.user?.user_id === carolId && frame.params.memberships[0].members[0].joined)).toBe(true);
+		// The admin removes Carol and Dave: their writes and reactions are refused.
+		expect((await command(admin, 'kick-carol', `/kick ${carolId}`, roomId)).frame.result).toEqual({});
+		expect((await command(admin, 'kick-dave', `/kick ${daveId}`, roomId)).frame.result).toEqual({});
+		expect((await post('carol-3', carol)).error.code).toBe(DENIED);
 		expect((await post('dave-2', dave)).error.code).toBe(DENIED);
+		expect((await request(link, 'carol-react', 'reactions', { message_id: reacted, emojis: ['👍'], ext: { remote: { user_id: carol } } })).error.code).toBe(DENIED);
 		// Added back by the admin, Carol writes again.
 		expect((await request(admin, 'add', 'room_join', { room_id: roomId, user_id: carolId })).result).toEqual({});
-		expect((await post('carol-3', carol)).result.message_id).toBeDefined();
+		expect((await post('carol-4', carol)).result.message_id).toBeDefined();
 	} finally { admin.close(); link.close(); }
 });
 

@@ -5109,8 +5109,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * logged membership charged to the shadow at its link's limits, unless it
 	 * is in it already. Only into a room the link is in: one the link cannot
 	 * see is unknown (`invalid_params`), and any other is `denied`. A shadow
-	 * that left the room or was removed from it is not joined again
-	 * (`denied`), until someone adds it back.
+	 * that left the room by itself is joined again; one another user removed
+	 * is not (`denied`), until someone adds it back.
 	 */
 	private async shadowJoins(socket: WebSocketConnection, attachment: ConnectionAttachment, actor: ActAs, roomId: string): Promise<void> {
 		const current = connectionAttachment(socket) ?? attachment;
@@ -5118,7 +5118,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!(current.rooms ?? []).includes(roomId)) throw { name: "denied", message: "This link is not in that room, so its remote users may not write there" } satisfies ProtocolError;
 		const userId = actor.identity.user_id;
 		if (this.store.isRoomMember(roomId, userId, nowMs())) return;
-		if (this.store.remoteUserLeft(userId, roomId, nowMs())) throw { name: "denied", message: "This remote user left that room or was removed from it, so may not write there again" } satisfies ProtocolError;
+		if (this.store.remoteUserLeft(userId, roomId, nowMs())) throw { name: "denied", message: "This remote user was removed from that room, so may not write there again" } satisfies ProtocolError;
 		await this.runMutation(async () => {
 			const change = this.store.changeMembership({ userId, ipKey: attachment.ipKey, roomId, join: true, now: nowMs(), actorId: actor.link, link: actor.link });
 			if (change.membership) this.broadcastRecord(change.membership);

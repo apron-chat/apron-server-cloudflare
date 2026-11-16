@@ -1987,7 +1987,7 @@ const SCHEMA_10_COPIED_COLUMNS: Record<string, readonly string[]> = {
  * `message_state.remote_key` is a link's message's key, the link and the
  * remote room and message IDs (remoteMessageKey), indexed where present, so
  * a link's repeated create finds its copy; it goes with the message's state.
- * `remote_left` keeps each room a remote user left or was removed from,
+ * `remote_left` keeps each room another user removed a remote user from,
  * keyed by user, so a later write from its link does not join it again.
  */
 const SCHEMA_DDL = `
@@ -5429,7 +5429,7 @@ export class Store {
     return this.reserved({ reads: 4 }, false, now, () => this.remoteDuplicateRow(remoteMessageKey(link, { room_id: remoteRoomId, message_id: remoteMessageId })!));
   }
 
-  /** Whether a remote user left or was removed from a room (ext:remote: `remote_left`), so its link may not join it again. */
+  /** Whether another user removed a remote user from a room (ext:remote: `remote_left`), so its link may not join it again. */
   remoteUserLeft(userId: string, roomId: string, now = this.clock.now()): boolean {
     this.ensureReady();
     return this.reserved({ reads: 4 }, false, now, () => this.rawRows("SELECT 1 FROM remote_left WHERE user_id = ? AND room_id = ? LIMIT 1", userId, roomId).length > 0);
@@ -5648,11 +5648,12 @@ export class Store {
           this.rawExec("DELETE FROM memberships WHERE room_id = ? AND user_id = ?", input.roomId, input.userId);
           this.rawExec("DELETE FROM read_cursors WHERE user_id = ? AND room_id = ?", input.userId, input.roomId);
         }
-        // A remote user who leaves or is removed is not joined again by its link's
-        // writes (ext:remote); someone who adds it back lifts that.
+        // A remote user another user removes is not joined again by its link's
+        // writes (ext:remote), until someone adds it back; one that left by
+        // itself (its link's act-as leave) is.
         if (isShadowUserId(input.userId)) {
           if (input.join) this.rawExec("DELETE FROM remote_left WHERE user_id = ? AND room_id = ?", input.userId, input.roomId);
-          else this.rawExec("INSERT OR IGNORE INTO remote_left (user_id, room_id) VALUES (?, ?)", input.userId, input.roomId);
+          else if (input.actorId !== undefined && input.actorId !== input.userId) this.rawExec("INSERT OR IGNORE INTO remote_left (user_id, room_id) VALUES (?, ?)", input.userId, input.roomId);
         }
         const state = this.logState();
         const startLogId = state.last_log_id;
