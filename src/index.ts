@@ -165,9 +165,11 @@ const SIGN_IN_EXPIRY_PREFIX = "signin-expiry:";
 /**
  * The records sweepSignIn deletes with their expiry entries. An older
  * version's sweep, without `pending`, deletes a pending record's entry but
- * keeps the record: a rollback past it leaves the pending records not yet
- * swept (about 6 minutes' worth of the page's new passkeys) for good. Each is
- * small, and any later version reads one as expired.
+ * keeps the record: a rollback past it leaves for good every pending record
+ * whose entry is still indexed, those of the page's new passkeys since the
+ * last sweep (at most hourly, SESSION_SWEEP_INTERVAL_MS, but a quiet server's
+ * full alarms may be a day apart). Each is small, and any later version
+ * reads one as expired.
  */
 const SIGN_IN_RECORD_KEY = /^signin-(code|ceremony|request|pending):[0-9a-f]{64}$/;
 /**

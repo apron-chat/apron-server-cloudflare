@@ -598,8 +598,9 @@ For direct Wrangler production commands, always pass
    carried over. See [SPEC section 8](../SPEC.md#schema-versions). Deploy the
    matching frontend together with this backend. Rolling back to a version
    from before the passkey page's pending records (`signin-pending:`) leaves
-   those of its last few minutes in storage for good: the older sweep drops
-   their expiry entries but not them. They are small, and read as expired.
+   those written since the last sign-in sweep (at most hourly, but a day
+   apart on a quiet server) in storage for good: the older sweep drops their
+   expiry entries but not them. They are small, and read as expired.
 6. When deployment is authorized, merge to `main` (or run the Deploy workflow)
    and merge the matching frontend in apron-chat/apron-web, which deploys it.
    Verify guest access, passkey registration/login, edits, threads, private
