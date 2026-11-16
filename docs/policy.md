@@ -446,7 +446,8 @@ right after the `server` frame, before any `auth`, with no `room_id`
 they do. The `server` frame's `welcome`, for the sign-in screen, is
 `general`'s description; while it has none, it is a summary of how guests,
 passkeys, invites, and bot tokens fit together, and how long messages are
-kept. There is no email or external sign-in.
+kept. There is no email sign-in, and `external` only with
+`EXTERNAL_SIGN_IN` (above).
 
 A registered user's `/invite-bot` creates or renames their bot, `bot_<their
 user_id>` named "Bot of <their name>", and returns its bearer token in a
