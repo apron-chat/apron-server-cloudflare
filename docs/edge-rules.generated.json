@@ -4,15 +4,15 @@
     "rules": [
       {
         "ref": "apron_invalid_request",
-        "description": "Apron: allow WebSocket handshakes, connection status probes, upload writes, and live text",
-        "expression": "(http.host eq \"server.apron.chat\") and not (http.request.method in {\"PUT\" \"OPTIONS\"} and starts_with(http.request.uri.path, \"/w/\")) and not (http.request.method in {\"GET\" \"HEAD\" \"OPTIONS\"} and starts_with(http.request.uri.path, \"/live/\")) and (http.request.method ne \"GET\" or not http.request.uri.path in {\"/\" \"/ws\"} or (not any(lower(http.request.headers[\"upgrade\"][*])[*] eq \"websocket\") and not any(http.request.uri.args[\"apron_connection_status\"][*] eq \"1\")))",
+        "description": "Apron: allow WebSocket handshakes, connection status probes, upload writes, live text, and the passkey page; on Previews, WebSocket handshakes, connection status probes, the passkey page, and external sign-in",
+        "expression": "(((http.host eq \"server.apron.chat\") and not (http.request.method in {\"PUT\" \"OPTIONS\"} and starts_with(http.request.uri.path, \"/w/\")) and not (http.request.method in {\"GET\" \"HEAD\" \"OPTIONS\"} and starts_with(http.request.uri.path, \"/live/\")) and not (http.request.method eq \"GET\" and http.request.uri.path eq \"/passkey\") and not (http.request.method eq \"POST\" and http.request.uri.path in {\"/passkey/begin\" \"/passkey/finish\"})) or ((ends_with(http.host, \".previews.apron.chat\")) and not (http.request.method eq \"GET\" and http.request.uri.path eq \"/passkey\") and not (http.request.method eq \"POST\" and http.request.uri.path in {\"/passkey/begin\" \"/passkey/finish\"}) and not (http.request.method eq \"GET\" and http.request.uri.path eq \"/oauth/authorize\") and not (http.request.method in {\"POST\" \"OPTIONS\"} and http.request.uri.path eq \"/oauth/token\") and not (http.request.method in {\"GET\" \"HEAD\" \"OPTIONS\"} and http.request.uri.path eq \"/.well-known/oauth-authorization-server\"))) and (http.request.method ne \"GET\" or not http.request.uri.path in {\"/\" \"/ws\"} or (not any(lower(http.request.headers[\"upgrade\"][*])[*] eq \"websocket\") and not any(http.request.uri.args[\"apron_connection_status\"][*] eq \"1\")))",
         "action": "block",
         "enabled": true
       },
       {
         "ref": "apron_admission_off",
         "description": "Apron: emergency admission shutdown (enable manually)",
-        "expression": "http.host eq \"server.apron.chat\"",
+        "expression": "http.host eq \"server.apron.chat\" or ends_with(http.host, \".previews.apron.chat\")",
         "action": "block",
         "enabled": false
       },
@@ -26,7 +26,7 @@
       {
         "ref": "apron_budget_stop",
         "description": "Apron: budget stop (the budget guard turns it on and off; leave it to the guard)",
-        "expression": "http.host in {\"server.apron.chat\" \"media.apron.chat\"}",
+        "expression": "http.host in {\"server.apron.chat\" \"media.apron.chat\"} or ends_with(http.host, \".previews.apron.chat\")",
         "action": "block",
         "enabled": false
       }
@@ -73,7 +73,7 @@
       {
         "ref": "apron_browser_redirect",
         "description": "Apron: send a browser opening the server as a page to the web client, with the server prefilled",
-        "expression": "(http.host eq \"server.apron.chat\") and http.request.method eq \"GET\" and http.request.uri.path eq \"/\" and not any(lower(http.request.headers[\"upgrade\"][*])[*] eq \"websocket\") and not any(http.request.uri.args[\"apron_connection_status\"][*] eq \"1\")",
+        "expression": "(http.host eq \"server.apron.chat\" or ends_with(http.host, \".previews.apron.chat\")) and http.request.method eq \"GET\" and http.request.uri.path eq \"/\" and not any(lower(http.request.headers[\"upgrade\"][*])[*] eq \"websocket\") and not any(http.request.uri.args[\"apron_connection_status\"][*] eq \"1\")",
         "action": "redirect",
         "enabled": true,
         "action_parameters": {

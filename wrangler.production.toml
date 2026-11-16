@@ -4,8 +4,12 @@ compatibility_date = "2026-08-15"
 compatibility_flags = ["nodejs_compat"]
 workers_dev = false
 preview_urls = false
+# Previews are served only at <preview>.previews.apron.chat (enabled = false:
+# never production); Cloudflare adds the wildcard DNS record and certificate
+# with the first Preview. See [previews.vars] below and docs/guide.md, Previews.
 routes = [
-  { pattern = "server.apron.chat", custom_domain = true }
+  { pattern = "server.apron.chat", custom_domain = true },
+  { pattern = "previews.apron.chat", custom_domain = true, previews_enabled = true, enabled = false }
 ]
 
 [observability]
@@ -30,6 +34,11 @@ tag = "v1"
 new_sqlite_classes = ["ApronDemoServer"]
 
 [vars]
+# A parent domain of this server's host: anything else on apron.chat may issue
+# passkeys for it, which this server cannot see. Leave SIGNAL_UNKNOWN_PASSKEYS
+# unset (off) unless this server is the sole user of this RP ID, or the
+# passkey page would ask devices to drop those passkeys
+# (docs/configuration.md).
 RP_ID = "apron.chat"
 RP_ORIGINS = "https://web.apron.chat"
 ALLOWED_ORIGINS = "*"
@@ -84,6 +93,65 @@ dataset = "apron_server_metrics"
 [triggers]
 crons = ["* * * * *"]
 
+# Previews (docs/guide.md, Previews): `npx wrangler preview --config
+# wrangler.production.toml`. They inherit no vars or bindings, so these repeat
+# production's where a Preview needs them; each Preview has its own Durable
+# Object and storage, its own rate limiters (generated below) and metrics
+# dataset, and no crons: production's budget guard watches the account, and
+# its apron_budget_stop rule covers the Preview hosts. Observability (one log
+# in ten) is inherited. No Preview secrets are needed; production's are not
+# inherited (`npx wrangler preview base-config secret put` adds them).
+[previews.vars]
+# Preview passkeys belong to their own RP ID, never to production's
+# apron.chat; every Preview host is under it, so each serves the passkey page.
+RP_ID = "previews.apron.chat"
+# No client is on that RP ID's own origin, which nothing serves: every client,
+# web.apron.chat and apron-web Previews included, signs in through the passkey
+# page. (RP_ORIGINS must list one exact origin when ALLOWED_ORIGINS is *.)
+RP_ORIGINS = "https://previews.apron.chat"
+# Every Preview shares that RP ID with its own storage, so another Preview's
+# passkey is unknown here but not stale: the page must not ask the device to
+# drop it.
+SIGNAL_UNKNOWN_PASSKEYS = "false"
+ALLOWED_ORIGINS = "*"
+SERVER_TITLE = "Apron Demo (preview)"
+SERVER_DESCRIPTION = "The public demo of [Apron](https://github.com/shazow/apron), an open chat protocol."
+SERVER_AVATAR = "https://web.apron.chat/icon-512.png"
+# Off in production; on here so Previews exercise external sign-in too.
+EXTERNAL_SIGN_IN = "true"
+ROOM_METADATA_LIMIT = "8192"
+ROOM_METADATA_MIN_LIMIT = "1024"
+ROOM_METADATA_TOTAL_LIMIT = "262144"
+# Inert without the ACCOUNT_ANALYTICS_TOKEN and EDGE_STOP_TOKEN secrets, which
+# Previews lack: the budget guard runs only in production.
+ACCOUNT_ID = "2bfd32937c0c07a923c79f6bb1a17253"
+ZONE_ID = "d7467571c212da5b57bbc92afeb967b7"
+# Uploads, live text and push are off, empty here so that `wrangler preview`
+# sees them set: PUBLIC_ORIGIN is one fixed origin, where each Preview has its
+# own (npm run budget:check refuses one here), and push needs VAPID keys of
+# its own. Without uploads no MEDIA bucket is bound, which `wrangler preview`
+# lists as missing; that is expected.
+MEDIA_ORIGIN = ""
+PUBLIC_ORIGIN = ""
+MEDIA_NOSNIFF = ""
+VAPID_PUBLIC_KEY = ""
+VAPID_SUBJECT = ""
+# For when push is on.
+PUSH_HOSTS_EXTRA = "push.stupidtech.net"
+
+[previews.version_metadata]
+binding = "CF_VERSION_METADATA"
+
+[previews.durable_objects]
+bindings = [
+  { name = "DEMO", class_name = "ApronDemoServer" }
+]
+
+# Created on its first write, apart from production's counters.
+[[previews.analytics_engine_datasets]]
+binding = "METRICS"
+dataset = "apron_server_metrics_preview"
+
 # BEGIN GENERATED ADMISSION BUDGET
 # Edit src/budget.ts, then run npm run budget:generate.
 [[ratelimits]]
@@ -105,5 +173,26 @@ simple = { limit = 1000, period = 60 }
 [[ratelimits]]
 name = "FLOOD_WATCH"
 namespace_id = "73004"
+simple = { limit = 600, period = 60 }
+# Previews: the same limits, counted apart from production's.
+[[previews.ratelimits]]
+name = "CONNECTION_ATTEMPTS"
+namespace_id = "73011"
+simple = { limit = 60, period = 60 }
+[[previews.ratelimits]]
+name = "PREFIX_ATTEMPTS"
+namespace_id = "73013"
+simple = { limit = 180, period = 60 }
+[[previews.ratelimits]]
+name = "LOCATION_ATTEMPTS"
+namespace_id = "73014"
+simple = { limit = 1000, period = 60 }
+[[previews.ratelimits]]
+name = "LIVE_READS"
+namespace_id = "73015"
+simple = { limit = 1000, period = 60 }
+[[previews.ratelimits]]
+name = "FLOOD_WATCH"
+namespace_id = "73012"
 simple = { limit = 600, period = 60 }
 # END GENERATED ADMISSION BUDGET

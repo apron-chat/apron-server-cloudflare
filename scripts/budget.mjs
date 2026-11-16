@@ -45,45 +45,66 @@ export function validateEdgeStop(edgeStop) {
  * (`namespaces.attempts`), per IPv6 /48 (`prefix`) and per location
  * (`location`), all three always, since the Worker refuses every connection
  * without any of them. `flood`, for a plan with an edge stop, adds the sampled
- * per-location counter the Worker trips the stop on.
+ * per-location counter the Worker trips the stop on. `previews`, for a Worker
+ * with Previews, repeats them all under `[[previews.ratelimits]]`, since
+ * Previews inherit no bindings, in namespaces of their own
+ * (`previews.namespaces`, and `previews.flood` for the flood counter), so a
+ * Preview's traffic never spends production's limits.
  */
-export function renderBinding(namespaces, admission = ADMISSION_BUDGET, flood = undefined) {
+export function renderBinding(namespaces, admission = ADMISSION_BUDGET, flood = undefined, previews = undefined) {
 	validateAdmission(admission);
+	const ids = checkNamespaces(namespaces, flood && flood.namespace, flood);
+	let previewTables = '';
+	if (previews) {
+		const previewIds = checkNamespaces(previews.namespaces, flood && previews.flood, flood);
+		if (previewIds.some((id) => ids.includes(id))) throw new Error('Previews need namespace IDs distinct from production\'s');
+		previewTables = `
+# Previews: the same limits, counted apart from production's.
+${limitTables('previews.ratelimits', previews.namespaces, admission, flood && { ...flood, namespace: previews.flood })}`;
+	}
+	return `${begin}
+# Edit src/budget.ts, then run npm run budget:generate.
+${limitTables('ratelimits', namespaces, admission, flood)}${previewTables}
+${end}`;
+}
+
+/** The namespace IDs of one set of limiters, checked: integers, all distinct. */
+function checkNamespaces(namespaces, floodNamespace, flood) {
 	const ids = [namespaces?.attempts, namespaces?.prefix, namespaces?.location, namespaces?.live];
 	if (!ids.every((id) => typeof id === 'string' && /^[1-9]\d*$/.test(id)) || new Set(ids).size !== ids.length) {
 		throw new Error('The attempt limits need four distinct integer namespace IDs');
 	}
-	let floodBinding = '';
-	if (flood) {
-		validateEdgeStop(flood.edgeStop);
-		if (typeof flood.namespace !== 'string' || !/^[1-9]\d*$/.test(flood.namespace) || ids.includes(flood.namespace)) {
-			throw new Error('The flood counter needs a distinct integer namespace ID');
-		}
-		floodBinding = `
-[[ratelimits]]
+	if (!flood) return ids;
+	validateEdgeStop(flood.edgeStop);
+	if (typeof floodNamespace !== 'string' || !/^[1-9]\d*$/.test(floodNamespace) || ids.includes(floodNamespace)) {
+		throw new Error('The flood counter needs a distinct integer namespace ID');
+	}
+	return [...ids, floodNamespace];
+}
+
+/** The rate-limiter tables of one set of limiters, under `table` (`ratelimits` or `previews.ratelimits`). */
+function limitTables(table, namespaces, admission, flood) {
+	const floodTable = flood ? `
+[[${table}]]
 name = "FLOOD_WATCH"
 namespace_id = "${flood.namespace}"
-simple = { limit = ${flood.edgeStop.floodRequestsPerColoMinute / flood.edgeStop.floodSampleEvery}, period = 60 }`;
-	}
-	return `${begin}
-# Edit src/budget.ts, then run npm run budget:generate.
-[[ratelimits]]
+simple = { limit = ${flood.edgeStop.floodRequestsPerColoMinute / flood.edgeStop.floodSampleEvery}, period = 60 }` : '';
+	return `[[${table}]]
 name = "CONNECTION_ATTEMPTS"
 namespace_id = "${namespaces.attempts}"
 simple = { limit = ${admission.requestsPerIpMinute}, period = ${admission.workerWindowSeconds} }
-[[ratelimits]]
+[[${table}]]
 name = "PREFIX_ATTEMPTS"
 namespace_id = "${namespaces.prefix}"
 simple = { limit = ${admission.requestsPerIpv6PrefixMinute}, period = ${admission.workerWindowSeconds} }
-[[ratelimits]]
+[[${table}]]
 name = "LOCATION_ATTEMPTS"
 namespace_id = "${namespaces.location}"
 simple = { limit = ${admission.objectRequestsPerLocationMinute}, period = ${admission.workerWindowSeconds} }
-[[ratelimits]]
+[[${table}]]
 name = "LIVE_READS"
 namespace_id = "${namespaces.live}"
-simple = { limit = ${admission.liveReadsPerLocationMinute}, period = ${admission.workerWindowSeconds} }${floodBinding}
-${end}`;
+simple = { limit = ${admission.liveReadsPerLocationMinute}, period = ${admission.workerWindowSeconds} }${floodTable}`;
 }
 
 /**
@@ -100,36 +121,54 @@ ${end}`;
  * With `liveText`, a configuration rule turns off the edge's request body
  * buffering for `PUT` on `/w/`, which would otherwise hold a slow writer's
  * first bytes, such as typed keys, until more arrive.
+ * With `signIn`, where the server's hostname is its `RP_ID` or under it and
+ * the passkey page is on (`PASSKEY_PAGE`), the sign-in pages are allowed
+ * too: `GET` of `/passkey` and `POST` of its begin and finish, and with
+ * `signIn.external` (`EXTERNAL_SIGN_IN`) `GET` of `/oauth/authorize`, the
+ * token endpoint (`POST` and its preflight) and the authorization server
+ * metadata (`GET`, `HEAD` and a preflight).
  * With `webClient`, a web client's URL, a redirect rule sends a browser that
  * opens the server's address as a page (a `GET /` that is neither a WebSocket
  * handshake nor a connection status probe, which `apron_invalid_request`
  * would block) to that client with the server prefilled, before the block
  * and without invoking the Worker.
+ * With `previews`, the Worker's Previews on a custom domain
+ * (`previews.hostname`, served as `<preview>.<hostname>`), every rule
+ * scoped to the server's hostname covers the Preview hosts too, so a
+ * Preview is no less protected than production: `apron_invalid_request`
+ * lets through on them what their own configuration serves
+ * (`previews.liveText`, `previews.signIn`, as above), and the admission
+ * shutdown, the budget stop and the browser redirect take them as well.
  */
-export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHostname = undefined, liveText = false, relatedOrigins = false, webClient = undefined) {
+export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHostname = undefined, liveText = false, relatedOrigins = false, webClient = undefined, signIn = undefined, previews = undefined) {
 	validateAdmission(admission);
 	const host = `http.host eq ${JSON.stringify(hostname)}`;
+	if (previews && !/^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/.test(previews.hostname ?? '')) throw new Error('Previews need a custom domain host name');
+	const previewHost = previews && `ends_with(http.host, ${JSON.stringify(`.${previews.hostname}`)})`;
+	const everyHost = previewHost ? `${host} or ${previewHost}` : host;
 	const handshake = 'any(lower(http.request.headers["upgrade"][*])[*] eq "websocket")';
 	const probe = 'any(http.request.uri.args["apron_connection_status"][*] eq "1")';
-	const writes = (mediaHostname || liveText ? ' and not (http.request.method in {"PUT" "OPTIONS"} and starts_with(http.request.uri.path, "/w/"))' : '') +
-		(liveText ? ' and not (http.request.method in {"GET" "HEAD" "OPTIONS"} and starts_with(http.request.uri.path, "/live/"))' : '') +
-		(relatedOrigins ? ' and not (http.request.method in {"GET" "HEAD"} and http.request.uri.path eq "/.well-known/webauthn")' : '');
-	const allowed = ['WebSocket handshakes', 'connection status probes', ...(mediaHostname ? ['upload writes'] : []), ...(liveText ? ['live text'] : []), ...(relatedOrigins ? ['passkey related origins'] : [])];
-	const stopped = mediaHostname ? `http.host in {${JSON.stringify(hostname)} ${JSON.stringify(mediaHostname)}}` : host;
+	const { writes, allowed } = edgeAllowances({ mediaHostname, liveText, relatedOrigins, signIn });
+	const previewAllowances = previews && edgeAllowances({ liveText: previews.liveText, signIn: previews.signIn });
+	// Each host with what it lets through, both in one rule: a Free zone has five custom rules.
+	const scoped = (hostExpression, hostWrites) => hostWrites ? `((${hostExpression})${hostWrites})` : `(${hostExpression})`;
+	const scope = previews ? `(${scoped(host, writes)} or ${scoped(previewHost, previewAllowances.writes)})` : `(${host})${writes}`;
+	const list = (names) => `${names.slice(0, -1).join(', ')}${names.length > 2 ? ',' : ''} and ${names[names.length - 1]}`;
+	const stopped = (mediaHostname ? `http.host in {${JSON.stringify(hostname)} ${JSON.stringify(mediaHostname)}}` : host) + (previewHost ? ` or ${previewHost}` : '');
 	return {
 		custom: {
 			phase: 'http_request_firewall_custom',
 			rules: [
 				{
 					ref: 'apron_invalid_request',
-					description: `Apron: allow ${allowed.slice(0, -1).join(', ')}${allowed.length > 2 ? ',' : ''} and ${allowed[allowed.length - 1]}`,
-					expression: `(${host})${writes} and (http.request.method ne "GET" or not http.request.uri.path in {"/" "/ws"} or (not ${handshake} and not ${probe}))`,
+					description: `Apron: allow ${list(allowed)}${previews ? `; on Previews, ${list(previewAllowances.allowed)}` : ''}`,
+					expression: `${scope} and (http.request.method ne "GET" or not http.request.uri.path in {"/" "/ws"} or (not ${handshake} and not ${probe}))`,
 					action: 'block', enabled: true,
 				},
 				{
 					ref: 'apron_admission_off',
 					description: 'Apron: emergency admission shutdown (enable manually)',
-					expression: host,
+					expression: everyHost,
 					action: 'block', enabled: false,
 				},
 				...(mediaHostname ? [{
@@ -164,7 +203,7 @@ export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHos
 				rules: [{
 					ref: 'apron_write_streaming',
 					description: 'Apron: stream write_url bodies to the Worker as they arrive (live text)',
-					expression: `(${host}) and http.request.method eq "PUT" and starts_with(http.request.uri.path, "/w/")`,
+					expression: `(${previews?.liveText ? everyHost : host}) and http.request.method eq "PUT" and starts_with(http.request.uri.path, "/w/")`,
 					action: 'set_config', enabled: true,
 					action_parameters: { request_body_buffering: 'none' },
 				}],
@@ -176,7 +215,7 @@ export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHos
 				rules: [{
 					ref: 'apron_browser_redirect',
 					description: 'Apron: send a browser opening the server as a page to the web client, with the server prefilled',
-					expression: `(${host}) and http.request.method eq "GET" and http.request.uri.path eq "/" and not ${handshake} and not ${probe}`,
+					expression: `(${everyHost}) and http.request.method eq "GET" and http.request.uri.path eq "/" and not ${handshake} and not ${probe}`,
 					action: 'redirect', enabled: true,
 					action_parameters: {
 						from_value: {
@@ -209,6 +248,20 @@ export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHos
 }
 
 /**
+ * What `apron_invalid_request` lets through on a host, as `and not (...)`
+ * clauses (`writes`), and their names for its description (`allowed`).
+ */
+function edgeAllowances({ mediaHostname, liveText, relatedOrigins, signIn }) {
+	const writes = (mediaHostname || liveText ? ' and not (http.request.method in {"PUT" "OPTIONS"} and starts_with(http.request.uri.path, "/w/"))' : '') +
+		(liveText ? ' and not (http.request.method in {"GET" "HEAD" "OPTIONS"} and starts_with(http.request.uri.path, "/live/"))' : '') +
+		(relatedOrigins ? ' and not (http.request.method in {"GET" "HEAD"} and http.request.uri.path eq "/.well-known/webauthn")' : '') +
+		(signIn ? ' and not (http.request.method eq "GET" and http.request.uri.path eq "/passkey") and not (http.request.method eq "POST" and http.request.uri.path in {"/passkey/begin" "/passkey/finish"})' : '') +
+		(signIn?.external ? ' and not (http.request.method eq "GET" and http.request.uri.path eq "/oauth/authorize") and not (http.request.method in {"POST" "OPTIONS"} and http.request.uri.path eq "/oauth/token") and not (http.request.method in {"GET" "HEAD" "OPTIONS"} and http.request.uri.path eq "/.well-known/oauth-authorization-server")' : '');
+	const allowed = ['WebSocket handshakes', 'connection status probes', ...(mediaHostname ? ['upload writes'] : []), ...(liveText ? ['live text'] : []), ...(relatedOrigins ? ['passkey related origins'] : []), ...(signIn ? ['the passkey page'] : []), ...(signIn?.external ? ['external sign-in'] : [])];
+	return { writes, allowed };
+}
+
+/**
  * The redirect target, as a rules expression: the web client with the
  * request's own host prefilled as the server, so the rule names no host.
  * The client reads `server`, a `wss:` URL, from the fragment, which never
@@ -232,6 +285,46 @@ export function replaceBinding(source, binding) {
 	return `${source.trimEnd()}\n\n${binding}\n`;
 }
 
+/**
+ * A Wrangler config split in two: `production`, everything but the
+ * `[previews.*]` tables, and `previews`, those tables with their headers
+ * as they would be at the top level (`[previews.vars]` as `[vars]`), so
+ * the checks here read either alike; undefined where there are none.
+ * Previews are written as tables only, never as an inline `previews = {}`.
+ */
+export function splitPreviews(source) {
+	const production = [];
+	const previews = [];
+	let target = production;
+	for (const line of source.split('\n')) {
+		const header = line.match(/^(\[\[?)\s*([A-Za-z0-9_.-]+)\s*(\]\]?)\s*(?:#.*)?$/);
+		if (header) {
+			const preview = header[2] === 'previews' || header[2].startsWith('previews.');
+			target = preview ? previews : production;
+			if (preview) {
+				target.push(header[2] === 'previews' ? '' : `${header[1]}${header[2].slice('previews.'.length)}${header[3]}`);
+				continue;
+			}
+		}
+		target.push(line);
+	}
+	if (/^previews\s*=/m.test(topLevelConfig(production.join('\n')))) throw new Error('Write previews as [previews.*] tables, not an inline table');
+	return { production: production.join('\n'), previews: previews.length ? `${previews.join('\n')}\n` : undefined };
+}
+
+/**
+ * The custom domains in a Wrangler config's top-level `routes`: each
+ * `pattern`, whether it serves production (`enabled`, default true) and
+ * whether it serves Previews (`previews_enabled`, default false).
+ */
+export function customDomains(source) {
+	const routes = topLevelConfig(source).match(/^routes\s*=\s*\[([^\]]*)\]/m)?.[1] ?? '';
+	return [...routes.matchAll(/\{([^}]*)\}/g)]
+		.map(([, body]) => Object.fromEntries([...body.matchAll(/([a-z_]+)\s*=\s*("[^"]*"|true|false)/g)].map(([, key, value]) => [key, JSON.parse(value)])))
+		.filter((route) => route.custom_domain === true && typeof route.pattern === 'string')
+		.map((route) => ({ pattern: route.pattern, enabled: route.enabled !== false, previews: route.previews_enabled === true }));
+}
+
 function topLevelConfig(source) {
 	const firstTable = source.search(/^\s*\[/m);
 	return source.slice(0, firstTable < 0 ? source.length : firstTable);
@@ -243,7 +336,10 @@ function configName(source, file) {
 	return match[1];
 }
 
-export function validateDeploymentConfiguration({ development, production, packageJson, workflow, budgetGuard = false, uploads = false, logSampleRate }) {
+export function validateDeploymentConfiguration({ development, production: config, packageJson, workflow, budgetGuard = false, uploads = false, logSampleRate }) {
+	// Production's own settings; the Previews' are checked apart (validatePreviews).
+	const { production, previews } = splitPreviews(config);
+	validatePreviews(production, previews);
 	const developmentName = configName(development, 'wrangler.toml');
 	const productionName = configName(production, 'wrangler.production.toml');
 	const productionTopLevel = topLevelConfig(production);
@@ -306,6 +402,31 @@ export function validateDeploymentConfiguration({ development, production, packa
 	}
 }
 
+/**
+ * Throws unless a config's Previews, if it has any, can work, and work
+ * apart from production: a custom domain that serves only Previews (their
+ * URLs, since workers.dev and preview URLs stay off), and their own copy
+ * of the Durable Object binding, which they do not inherit. They never
+ * write to production's bucket or dataset, and leave PUBLIC_ORIGIN and
+ * MEDIA_ORIGIN empty: each Preview has its own origin, so one fixed origin
+ * would send its write_urls elsewhere.
+ */
+function validatePreviews(production, previews) {
+	const domains = customDomains(production).filter((domain) => domain.previews);
+	if (!previews && !domains.length) return;
+	if (!previews) throw new Error('A custom domain with previews_enabled needs a previews block with the Worker\'s bindings');
+	if (domains.length !== 1) throw new Error('Previews need exactly one custom domain with previews_enabled');
+	if (domains[0].enabled) throw new Error('The Previews custom domain must serve only Previews (enabled = false)');
+	if (!/^\[durable_objects\]\s*(?:#.*)?\n(?:(?:[^\[\n].*)?\n)*?[^\[\n].*name\s*=\s*"DEMO"/m.test(previews)) {
+		throw new Error('Previews must bind the DEMO Durable Object in [previews.durable_objects]');
+	}
+	if (/^(?:PUBLIC_ORIGIN|MEDIA_ORIGIN)\s*=\s*"[^"\s]/m.test(previews)) throw new Error('Previews must leave PUBLIC_ORIGIN and MEDIA_ORIGIN empty: each Preview has its own origin');
+	const names = (source, key) => [...source.matchAll(new RegExp(`^${key}\\s*=\\s*"([^"]+)"`, 'gm'))].map((match) => match[1]);
+	for (const key of ['bucket_name', 'dataset']) {
+		if (names(previews, key).some((name) => names(production, key).includes(name))) throw new Error(`Previews must not share production's ${key}`);
+	}
+}
+
 /** The host of a Wrangler config's `MEDIA_ORIGIN` var, if it sets an https one. */
 export function mediaHostname(source) {
 	return source.match(/^MEDIA_ORIGIN\s*=\s*"https:\/\/([a-z0-9.-]+)"\s*(?:#.*)?$/m)?.[1];
@@ -314,6 +435,29 @@ export function mediaHostname(source) {
 /** A Wrangler config's `RP_ID` var, if it sets one, lowercased as the Worker reads it. */
 export function relyingPartyId(source) {
 	return source.match(/^RP_ID\s*=\s*"([A-Za-z0-9.-]+)"\s*(?:#.*)?$/m)?.[1].toLowerCase();
+}
+
+/** The `[vars]` table of a Wrangler config (or of its Previews, from splitPreviews), as the Worker's env gets them. */
+export function wranglerVars(source) {
+	const table = source.match(/^\[vars\]\s*(?:#.*)?\n((?:[^\[\n].*\n?|\n)*)/m)?.[1] ?? '';
+	return Object.fromEntries([...table.matchAll(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*("(?:[^"\\]|\\.)*")\s*(?:#.*)?$/gm)].map(([, name, value]) => [name, JSON.parse(value)]));
+}
+
+/** A `true`/`false` Wrangler var in `source`, else `fallback`. */
+export function wranglerSwitch(source, name, fallback) {
+	const value = source.match(new RegExp(`^${name}\\s*=\\s*"(true|false)"\\s*(?:#.*)?$`, 'im'))?.[1].toLowerCase();
+	return value === undefined ? fallback : value === 'true';
+}
+
+/**
+ * The sign-in pages the Worker serves on `hostname` (src/index.ts,
+ * handleSignIn): with the passkey page on, where the hostname is the RP ID
+ * or under it; `external` too with EXTERNAL_SIGN_IN. Undefined for none.
+ */
+export function signInPages(source, hostname) {
+	const rpId = relyingPartyId(source);
+	if (!rpId || !wranglerSwitch(source, 'PASSKEY_PAGE', true) || (hostname !== rpId && !hostname.endsWith(`.${rpId}`))) return undefined;
+	return { external: wranglerSwitch(source, 'EXTERNAL_SIGN_IN', false) };
 }
 
 function main() {
@@ -332,23 +476,35 @@ function main() {
 		uploads: Boolean(PLAN.uploads),
 		logSampleRate: ACCOUNT_USAGE_POLICY.logEstimate?.sampleRate,
 	});
+	// Previews are on where a custom domain serves them (validatePreviews).
+	const previewDomain = customDomains(production).find((domain) => domain.previews)?.pattern;
 	const outputs = [];
-	for (const [file, attempts, floodNamespace, prefix, location, live] of [
+	for (const [file, attempts, floodNamespace, prefix, location, live, previews] of [
 		['wrangler.toml', '73001', '73003', '73005', '73007', '73009'],
-		['wrangler.production.toml', '73002', '73004', '73006', '73008', '73010'],
+		['wrangler.production.toml', '73002', '73004', '73006', '73008', '73010', previewDomain && { namespaces: { attempts: '73011', prefix: '73013', location: '73014', live: '73015' }, flood: '73012' }],
 	]) {
 		const source = readFileSync(new URL(file, root), 'utf8');
 		const flood = PLAN.edgeStop ? { namespace: floodNamespace, edgeStop: PLAN.edgeStop } : undefined;
-		outputs.push([file, replaceBinding(source, renderBinding({ attempts, prefix, location, live }, ADMISSION_BUDGET, flood))]);
+		outputs.push([file, replaceBinding(source, renderBinding({ attempts, prefix, location, live }, ADMISSION_BUDGET, flood, previews || undefined))]);
 	}
-	const hosts = [...production.matchAll(/pattern\s*=\s*"([a-z0-9.-]+)"\s*,\s*custom_domain\s*=\s*true/g)];
+	// Namespace IDs are the account's: no two configs may share one.
+	const ids = outputs.flatMap(([, source]) => [...source.matchAll(/^namespace_id\s*=\s*"(\d+)"/gm)].map((match) => match[1]));
+	if (new Set(ids).size !== ids.length) throw new Error('Every rate limiter in every config needs its own namespace ID');
+	const { production: main, previews } = splitPreviews(production);
+	// Both sets of vars must load as the Worker loads them, or it would fail every request.
+	for (const vars of [wranglerVars(main), ...(previews ? [wranglerVars(previews)] : [])]) loadConfig(vars);
+	const hosts = customDomains(main).filter((domain) => domain.enabled);
 	if (hosts.length !== 1) throw new Error('Expected exactly one production custom domain');
-	const media = PLAN.uploads ? mediaHostname(production) : undefined;
+	const hostname = hosts[0].pattern;
+	const media = PLAN.uploads ? mediaHostname(main) : undefined;
 	const liveText = Boolean(PLAN.liveText && PLAN.features.liveText);
 	// The Worker answers /.well-known/webauthn only on RP_ID's host, so the
-	// rule lets it through only where that is the server's own hostname.
-	const relatedOrigins = relyingPartyId(production) === hosts[0][1];
-	outputs.push(['docs/edge-rules.generated.json', JSON.stringify(renderEdgeRules(hosts[0][1], ADMISSION_BUDGET, media, liveText, relatedOrigins, WEB_CLIENT), null, 2) + '\n']);
+	// rule lets it through only where that is the server's own hostname. A
+	// Preview's host is never the domain itself, nor has PUBLIC_ORIGIN for
+	// live text (validatePreviews).
+	const relatedOrigins = relyingPartyId(main) === hostname;
+	const previewRules = previewDomain && { hostname: previewDomain, liveText: false, signIn: signInPages(previews, previewDomain) };
+	outputs.push(['docs/edge-rules.generated.json', JSON.stringify(renderEdgeRules(hostname, ADMISSION_BUDGET, media, liveText, relatedOrigins, WEB_CLIENT, signInPages(main, hostname), previewRules), null, 2) + '\n']);
 	let stale = false;
 	for (const [file, expected] of outputs) {
 		const path = new URL(file, root);

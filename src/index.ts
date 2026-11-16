@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { AuthError, AuthTooLargeError, candidateUserIdFor, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
+import { AuthError, AuthTooLargeError, candidateUserIdFor, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
 import { LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
@@ -96,7 +96,32 @@ import {
 	type UploadWrite,
 	STORAGE_UNAVAILABLE,
 } from "./store";
-import { isProtocolId } from "./domain";
+import { isProtocolId, type StoredCredential } from "./domain";
+import {
+	authorizationServerMetadata,
+	AUTHORIZE_PATH,
+	clientLabel,
+	CODE_TTL_MS,
+	METADATA_PATH,
+	originOfEndpoint,
+	PAGE_BEGIN_PATH,
+	PAGE_FINISH_PATH,
+	pageOriginServes,
+	parseAuthorizationRequest,
+	parsePasskeyPageRequest,
+	PASSKEY_PAGE_PATH,
+	pkceMatches,
+	recognisedClient,
+	redirectTarget,
+	redirectWith,
+	REQUEST_HANDLE_TTL_MS,
+	TOKEN_PATH,
+	type AuthorizationRequest,
+	type PasskeyAction,
+	type PasskeyPageRequest,
+	type SignInPage,
+} from "./oauth";
+import { pageHeaders, renderErrorPage, renderSignInPage, type SignInPageView } from "./sign-in-page";
 import { Deadline } from "./deadline";
 
 const OBJECT_NAME = "public-demo-v1";
@@ -115,6 +140,45 @@ const ATTACHMENT_VERSION = 1;
 const SESSION_KEY_PREFIX = "session:";
 /** Ordered, advisory expiry entries. The session record remains authoritative. */
 const SESSION_EXPIRY_PREFIX = "session-expiry:";
+/**
+ * A session token from a sign-in page's code (protocol §4.10.1, §4.12.4):
+ * a bearer token bound to no origin, so it resumes from any
+ * client, unlike a token from a ceremony in the client (§4.10).
+ */
+const SESSION_TOKEN_PREFIX = "apron_session_";
+/**
+ * The sign-in pages' short-lived records in key-value storage, each under the
+ * SHA-256 of its secret: codes, ceremonies on the page, and additions'
+ * `request` handles, with an ordered expiry index that sweepSignIn reads.
+ */
+const SIGN_IN_CODE_KEY_PREFIX = "signin-code:";
+const PAGE_CEREMONY_KEY_PREFIX = "signin-ceremony:";
+const REQUEST_HANDLE_KEY_PREFIX = "signin-request:";
+/** A new passkey that a code from the passkey page holds, under the SHA-256 of its credential ID (pendingCredential). */
+const PENDING_CREDENTIAL_KEY_PREFIX = "signin-pending:";
+/**
+ * How long a pending passkey outlasts its code: a redemption takes the code
+ * before it writes the passkey, so the passkey is never unknown in between.
+ */
+const PENDING_CREDENTIAL_GRACE_MS = 60_000;
+const SIGN_IN_EXPIRY_PREFIX = "signin-expiry:";
+/**
+ * The records sweepSignIn deletes with their expiry entries. An older
+ * version's sweep, without `pending`, deletes a pending record's entry but
+ * keeps the record: a rollback past it leaves for good every pending record
+ * whose entry is still indexed, those of the page's new passkeys since the
+ * last sweep (at most hourly, SESSION_SWEEP_INTERVAL_MS, but a quiet server's
+ * full alarms may be a day apart). Each is small, and any later version
+ * reads one as expired.
+ */
+const SIGN_IN_RECORD_KEY = /^signin-(code|ceremony|request|pending):[0-9a-f]{64}$/;
+/**
+ * The path the entry Worker forwards the sign-in pages' requests to the
+ * object on, with the route after it, and the header that carries the
+ * server's origin (the host the request reached).
+ */
+const SIGN_IN_PATH = "/__signin/";
+const SERVER_ORIGIN_HEADER = "X-Apron-Server-Origin";
 const SESSION_CLEANUP_BATCH = 16;
 /**
  * How often an alarm sweeps expired sessions. Every connection wakes the alarm
@@ -158,7 +222,7 @@ interface ConnectionAttachment {
 	 */
 	roles?: string[];
 	/**
-	 * The user's `ext` (§4.12), read with the identity at sign-in and kept
+	 * The user's `ext` (§4.13), read with the identity at sign-in and kept
 	 * equal across their connections by `me`: for complete user objects,
 	 * which then need no storage read. Guests have none.
 	 */
@@ -598,7 +662,8 @@ const PROTOCOL_URL = "https://apron.chat/protocol";
 interface StoredSession {
 	v: 1;
 	userId: string;
-	origin: string;
+	/** The origin of the ceremony in the client (§4.10); none for a bearer session from a sign-in page's code. */
+	origin?: string;
 	expiresMs: number;
 	/**
 	 * The account's WebAuthn user handle when the session was issued: once
@@ -688,6 +753,66 @@ interface SessionExpiryEntry {
 	v: 1;
 	sessionKey: string;
 	expiresMs: number;
+}
+
+/** A sign-in record's entry in the expiry index (SIGN_IN_EXPIRY_PREFIX). */
+interface SignInExpiryEntry {
+	v: 1;
+	key: string;
+	expiresMs: number;
+}
+
+/**
+ * A code a sign-in page issued, bound to its page, its action, and the
+ * client's request (protocol §4.12.3, §4.10.1):
+ * the account it signs in to, or for a new account the passkey to create it
+ * with, or for an addition the passkey to add to `userId`.
+ */
+interface StoredSignInCode extends AuthorizationRequest {
+	v: 1;
+	page: SignInPage;
+	action: PasskeyAction;
+	userId: string;
+	/** A sign-in's passkey, which must still be on the account when the code is redeemed. */
+	credentialId?: string;
+	register?: { name: string; userHandle: string; credential: StoredCredential };
+	adds?: boolean;
+	expiresMs: number;
+}
+
+/** A ceremony on a sign-in page, from its begin to its finish, with the request it is for. */
+interface StoredPageCeremony {
+	v: 1;
+	page: SignInPage;
+	challenge: ChallengeRecord;
+	request: AuthorizationRequest;
+	/** An addition's account, from its `request` handle. */
+	addsUserId?: string;
+	expiresMs: number;
+}
+
+/** A new passkey a code holds, until its code (and a grace) expires: not yet an account's, but it may become one. */
+interface StoredPendingCredential {
+	v: 1;
+	expiresMs: number;
+}
+
+/** An addition's `request` handle: the account it adds a passkey to, under its user handle then. */
+interface StoredRequestHandle {
+	v: 1;
+	userId: string;
+	userHandle?: string;
+	expiresMs: number;
+}
+
+/** What a passkey sign-in read of its account on the way, through its repository (ApronDemoServer.passkeySignIn). */
+interface PasskeySignIn {
+	repository: CredentialRepository;
+	avatar?: string;
+	roles: string[];
+	ext?: Record<string, unknown>;
+	seen?: number;
+	handle?: string;
 }
 
 interface IdentityShape {
@@ -822,6 +947,56 @@ function sessionExpiryKey(expiresMs: number, sessionKeyValue: string): string {
 	// Date.now() plus the configured lifetime is well below 16 decimal digits;
 	// the fixed width keeps lexicographic KV listing ordered by expiry.
 	return `${SESSION_EXPIRY_PREFIX}${Math.max(0, Math.trunc(expiresMs)).toString().padStart(16, "0")}:${sessionKeyValue.slice(SESSION_KEY_PREFIX.length)}`;
+}
+
+function signInExpiryKey(expiresMs: number, key: string): string {
+	return `${SIGN_IN_EXPIRY_PREFIX}${Math.max(0, Math.trunc(expiresMs)).toString().padStart(16, "0")}:${key}`;
+}
+
+/** A sign-in page script's answer: JSON, never cached. */
+function pageJson(status: number, body: Record<string, unknown>): Response {
+	return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" } });
+}
+
+/** What the token endpoint and the metadata send (RFC 6749 §5.1; open to any origin, as `ext:oauth` asks). */
+function tokenHeaders(): Headers {
+	return new Headers({ "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "Pragma": "no-cache", "Access-Control-Allow-Origin": "*", "X-Content-Type-Options": "nosniff" });
+}
+
+/**
+ * A token endpoint error (RFC 6749 §5.2). `invalid_client` for credentials
+ * sent with HTTP Basic is a 401 that names the scheme, as §5.2 asks.
+ */
+function tokenError(status: number, error: string): Response {
+	const headers = tokenHeaders();
+	if (status === 401) headers.set("WWW-Authenticate", 'Basic realm="token"');
+	return new Response(JSON.stringify({ error }), { status, headers });
+}
+
+/**
+ * The `client_id` a token request's `Authorization` header carries, as a
+ * public client sends it with HTTP Basic (RFC 6749 §2.3.1, `ext:oauth`): the
+ * form-urlencoded `client_id`, a `:`, and an empty password. Undefined
+ * without the header; null for any other scheme, a malformed credential, or
+ * a password, since this server's clients have none.
+ */
+function basicClientId(header: string | null): string | null | undefined {
+	if (header === null) return undefined;
+	const match = /^basic +([A-Za-z0-9+/]+={0,2}) *$/i.exec(header);
+	if (!match) return null;
+	let credential: string;
+	try {
+		credential = new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(atob(match[1]!), (char) => char.charCodeAt(0)));
+	} catch {
+		return null;
+	}
+	const colon = credential.indexOf(":");
+	if (colon <= 0 || colon !== credential.length - 1) return null;
+	try {
+		return decodeURIComponent(credential.slice(0, colon).replaceAll("+", " ")) || null;
+	} catch {
+		return null;
+	}
 }
 
 function nowMs(): number {
@@ -1384,7 +1559,7 @@ function setAvatar(attachment: ConnectionAttachment, avatar: string | undefined)
 	else delete attachment.avatar;
 }
 
-/** Keeps a user's `ext` (§4.12) on a connection's attachment, or none; the caller writes the attachment. */
+/** Keeps a user's `ext` (§4.13) on a connection's attachment, or none; the caller writes the attachment. */
 function setExt(attachment: ConnectionAttachment, ext: Record<string, unknown> | undefined): void {
 	if (ext && Object.keys(ext).length) attachment.ext = ext;
 	else delete attachment.ext;
@@ -1849,6 +2024,7 @@ function refusedPath(request: Request): string {
 	const path = new URL(request.url).pathname;
 	if (path.startsWith(LIVE_WRITE_PATH)) return "live_write";
 	if (path.startsWith(LIVE_READ_PATH)) return "live_read";
+	if (path.startsWith(SIGN_IN_PATH)) return "sign_in";
 	return isConnectionStatus(request) ? "probe" : "upgrade";
 }
 
@@ -2063,12 +2239,87 @@ function handleRelatedOrigins(request: Request, env: Env, url: URL): Response | 
 	return new Response(request.method === "HEAD" ? null : JSON.stringify({ origins: config.rpOrigins }), { headers });
 }
 
+/** The sign-in pages' paths, and the route each takes to the object (ApronDemoServer.signInFetch). */
+const SIGN_IN_ROUTES: ReadonlyMap<string, string> = new Map([
+	[PASSKEY_PAGE_PATH, "passkey"],
+	[PAGE_BEGIN_PATH, "begin"],
+	[PAGE_FINISH_PATH, "finish"],
+	[AUTHORIZE_PATH, "authorize"],
+	[TOKEN_PATH, "token"],
+]);
+/** The most a sign-in page's `POST` may carry: a passkey's answer, or a token request, is far smaller. */
+const MAX_SIGN_IN_BODY_BYTES = 32 * 1024;
+
+/**
+ * The sign-in pages, on a host they serve (the passkey page is on, and the
+ * host is the RP ID or under it; `external`'s also need EXTERNAL_SIGN_IN):
+ * the authorization server metadata, answered here from configuration; the
+ * passkey page, `/oauth/authorize`, their ceremonies, and the token
+ * endpoint, forwarded to the object after the attempt limiters, as a
+ * WebSocket upgrade is charged. Null, so the request goes on as for any
+ * other path, elsewhere.
+ */
+async function handleSignIn(request: Request, env: Env, url: URL): Promise<Response | null> {
+	const route = url.pathname === METADATA_PATH ? "metadata" : SIGN_IN_ROUTES.get(url.pathname);
+	if (!route) return null;
+	let config: RuntimeConfig;
+	try {
+		config = loadConfig(env);
+	} catch {
+		return null;
+	}
+	const origin = url.origin;
+	if (!config.passkeyPage || !pageOriginServes(origin, config.rpId)) return null;
+	if ((route === "metadata" || route === "authorize" || route === "token") && !config.externalSignIn) return null;
+	// Open to any origin (`ext:oauth`): the metadata, and the token endpoint,
+	// whose clients may send their `client_id` with HTTP Basic.
+	if (request.method === "OPTIONS" && (route === "metadata" || route === "token")) {
+		return new Response(null, { status: 204, headers: {
+			"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
+			"Access-Control-Allow-Headers": "Authorization, Content-Type", "Access-Control-Max-Age": "86400",
+		} });
+	}
+	if (route === "metadata") {
+		if (request.method !== "GET" && request.method !== "HEAD") return responseError(405, "Method not allowed");
+		const headers = tokenHeaders();
+		headers.set("Cache-Control", "public, max-age=300");
+		headers.delete("Pragma");
+		return new Response(request.method === "HEAD" ? null : JSON.stringify(authorizationServerMetadata(origin)), { headers });
+	}
+	const method = route === "passkey" || route === "authorize" ? "GET" : "POST";
+	if (request.method !== method) return responseError(405, "Method not allowed");
+	let body: ArrayBuffer | undefined;
+	if (method === "POST") {
+		if (Number(request.headers.get("Content-Length") ?? 0) > MAX_SIGN_IN_BODY_BYTES) return responseError(413, "Request too large");
+		body = await request.arrayBuffer();
+		if (body.byteLength > MAX_SIGN_IN_BODY_BYTES) return responseError(413, "Request too large");
+	}
+	if (Date.now() < objectPausedUntil) return serverPaused(objectPausedUntil);
+	const admitted = await liveAdmission(request, env);
+	if ("refused" in admitted) return admitted.refused;
+	if (!env.DEMO) return responseError(503, "Server unavailable");
+	const headers = new Headers({ [INTERNAL_IP_HEADER]: admitted.ipKey, [SERVER_ORIGIN_HEADER]: origin });
+	const requestOrigin = request.headers.get("Origin");
+	if (requestOrigin) headers.set("Origin", requestOrigin);
+	// A token request's client may authenticate with HTTP Basic (ApronDemoServer.tokenEndpoint).
+	const authorization = route === "token" ? request.headers.get("Authorization") : null;
+	if (authorization !== null) headers.set("Authorization", authorization);
+	const forwarded = new Request(`https://signin.internal${SIGN_IN_PATH}${route}${url.search}`, { method, headers, ...(body !== undefined ? { body } : {}) });
+	try {
+		return fromObject(await env.DEMO.getByName(OBJECT_NAME).fetch(forwarded));
+	} catch {
+		return responseError(503, "Server unavailable; try again shortly", UNAVAILABLE_RETRY_MS);
+	}
+}
+
 async function fetchConnection(request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url);
 	if (url.pathname.startsWith("/w/")) return handleUploadWrite(request, env, url.pathname.slice(3));
 	if (url.pathname.startsWith("/live/")) return handleLiveRead(request, env, url.pathname.slice(6));
 	const relatedOrigins = handleRelatedOrigins(request, env, url);
 	if (relatedOrigins) return relatedOrigins;
+	const signIn = await handleSignIn(request, env, url);
+	if (signIn) return signIn;
 	const media = await handleMediaRead(request, env, url.pathname.slice(1));
 	if (media) return media;
 	const status = isConnectionStatus(request);
@@ -2401,6 +2652,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		const path = new URL(request.url).pathname;
 		if (path.startsWith(LIVE_WRITE_PATH) || path.startsWith(LIVE_READ_PATH)) return this.liveFetch(request, path);
+		if (path.startsWith(SIGN_IN_PATH)) return this.signInFetch(request, path.slice(SIGN_IN_PATH.length));
 		const status = isConnectionStatus(request);
 		if (request.method !== "GET" || (!isUpgrade(request) && !status)) return responseError(400, "WebSocket upgrade required");
 		const ipKey = trustedIpKey(request);
@@ -2433,12 +2685,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		};
 		this.ctx.acceptWebSocket(server);
 		writeAttachment(server, attachment);
-		this.send(server, this.serverAnnouncement(origin));
+		this.send(server, this.serverAnnouncement(origin, endpoint));
 		// A welcome with the deployed version, before any auth (§3.2,
 		// Appendix B): to this connection only, with no room_id, since the
 		// client knows no rooms yet. A deploy closes every socket, so each
 		// reconnect after one shows the new version.
-		this.send(server, this.welcome(origin));
+		this.send(server, this.welcome(origin, endpoint));
 		await this.rescheduleAlarm();
 		return new Response(null, { status: 101, webSocket: pair[0] });
 	}
@@ -2657,7 +2909,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (now >= this.nextSessionSweepAt) {
 			try {
 				// A full batch may have left more behind; sweep again on the next alarm.
-				const full = await this.sweepSessions(now);
+				const sessions = await this.sweepSessions(now);
+				const full = await this.sweepSignIn(now) || sessions;
 				this.nextSessionSweepAt = full ? 0 : now + SESSION_SWEEP_INTERVAL_MS;
 				// A quiet server's full alarms may be a day apart: come back soon for the rest.
 				if (full) this.maintenanceSoon(now);
@@ -2792,11 +3045,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return protocol.name === "retry_after" ? response : remembered(response, protocol.name);
 	}
 
-	private serverAnnouncement(origin: string | null, wakeJoined = false): Record<string, unknown> {
+	private serverAnnouncement(origin: string | null, endpoint: string | undefined, wakeJoined = false): Record<string, unknown> {
 		const limits = this.config.limits;
 		const presence = this.presenceMode();
 		const emoji = this.emojiCatalogUrl();
 		const general = this.generalDescription();
+		const server = originOfEndpoint(endpoint);
+		const external = this.config.externalSignIn && server !== undefined && this.pageServes(server);
 		return {
 			method: "server",
 			params: {
@@ -2814,7 +3069,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 					// which decide pushes (§4.9, §4.5).
 					...(this.config.push ? ["status"] : []),
 					// The `ext` clients write on users, messages, and rooms is kept,
-					// and writes merge it one level deep (§4.12).
+					// and writes merge it one level deep (§4.13).
 					"ext",
 					// This server's extensions: `ext.settings` below, `ext.limits`
 					// on `retry_after` errors (limitData), `ext.media` below where
@@ -2827,19 +3082,25 @@ export class ApronDemoServer extends DurableObject<Env> {
 					"ext:editors",
 					// Custom emoji (ext:emoji), once an admin has added one.
 					...(emoji ? ["ext:emoji"] : []),
+					// With `external`, this server is its own authorization server
+					// with the standard OAuth parts (ext:oauth): the metadata, the
+					// token endpoint (tokenEndpoint), and CORS on both.
+					...(external ? ["ext:oauth"] : []),
 				],
-				// Passkeys and their session tokens only where passkeys are offered;
-				// bot tokens (`/invite-bot`) from anywhere, since bots are not browsers.
-				// No `email` (the demo has no way to send mail) and no `external`
-				// (no sign-in page).
-				auth: this.passkeysOffered(origin) ? ["webauthn", "token", "guest"] : ["token", "guest"],
-				// Schemes that create an account (§3.2): a passkey registration, and
-				// a token only as an admin's sign-up invite (`/invite-code`); other tokens
-				// sign in to existing users. A guest is a throwaway identity for one
+				// Passkeys where they are offered: in the client on RP_ORIGINS, and
+				// through the passkey page for every client where the host serves it;
+				// tokens from anywhere (bots, invites, sessions from the page). No
+				// `email` (the demo has no way to send mail); `external` only with
+				// EXTERNAL_SIGN_IN, for clients that implement nothing else.
+				auth: [...(this.passkeysOfferedTo(origin, endpoint) ? ["webauthn"] : []), "token", ...(external ? ["external"] : []), "guest"],
+				// Schemes that create an account (§3.2): a passkey registration (or
+				// `external`, whose page can create one), and a token only as an
+				// admin's sign-up invite (`/invite-code`); other tokens sign in to
+				// existing users. A guest is a throwaway identity for one
 				// connection, not an account, so `guest` is listed only in `auth`.
-				signup: this.passkeysOffered(origin) ? ["webauthn", "token"] : ["token"],
+				signup: [...(this.passkeysOfferedTo(origin, endpoint) ? ["webauthn"] : []), "token", ...(external ? ["external"] : [])],
 				// For the sign-in screen (§3.2); the `~private` welcome below goes in a room.
-				welcome: general ?? this.signInWelcome(origin),
+				welcome: general ?? this.signInWelcome(origin, endpoint),
 				// What the server is, for lists of servers (§3.1): what admins set
 				// with `/server`, else SERVER_TITLE, SERVER_DESCRIPTION and
 				// SERVER_AVATAR (config.ts), else for the description `general`'s.
@@ -2955,11 +3216,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * demo's sign-in schemes fit together, for the sign-in screen, worded for
 	 * what this origin can sign in with.
 	 */
-	private signInWelcome(origin: string | null): string {
+	private signInWelcome(origin: string | null, endpoint: string | undefined): string {
 		const days = Math.max(1, Math.round(this.config.limits.retentionSeconds / 86_400));
 		const history = `Messages are kept for ${days === 1 ? "a day" : `${days} days`}.`;
 		const guests = this.config.guestPosting ? "Guests can post under a new name each visit." : "Guests can read along.";
-		const signIn = this.passkeysOffered(origin)
+		const signIn = this.passkeysOfferedTo(origin, endpoint)
 			? "**Create a passkey** to post, react, and start threads; it signs you in on your next visit too."
 			: "Passkeys work on the demo's own site; here, sign in with a bot token from `/invite-bot` there, or an invite token from an admin.";
 		const invites = "An admin's invite token also creates an account; add a passkey once you're in, so you can sign in again without it.";
@@ -2967,10 +3228,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/** The `~private` welcome, after the `server` frame; where guests only read, it says so (Appendix B). */
-	private welcome(origin: string | null): Record<string, unknown> {
+	private welcome(origin: string | null, endpoint: string | undefined): Record<string, unknown> {
 		const lines = [`Welcome to Apron Chat. Server version: \`${this.serverVersion()}\``];
 		if (!this.config.guestPosting) {
-			lines.push(this.passkeysOffered(origin)
+			lines.push(this.passkeysOfferedTo(origin, endpoint)
 				? "Guests can read. *Sign in with passkey* to participate."
 				: "Guests can read. *Sign in with passkey* on the demo's own site, or use a bot token from `/invite-bot` there, to participate.");
 		}
@@ -3294,14 +3555,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// Before an attempt is charged: a scheme the spec does not define (such
 		// as an `ext:` name) is `invalid_params` (§1), and one it defines that
 		// this server does not offer the connection, `email` (no mail here),
-		// `external` (no sign-in page), or `webauthn` from an origin not
-		// configured for passkeys, is `unsupported` (§3.2).
+		// `external` (unless EXTERNAL_SIGN_IN), or `webauthn` from an origin not
+		// configured for passkeys without the passkey page, is `unsupported` (§3.2).
 		const offered = request.params.scheme;
 		if (typeof offered === "string") {
 			if (!DEFINED_AUTH_SCHEMES.has(offered)) throw { name: "invalid_params", message: "Unknown authentication scheme" } satisfies ProtocolError;
 			if (offered === "email") throw { name: "unsupported", message: "Email sign-in is not offered" } satisfies ProtocolError;
-			if (offered === "external") throw { name: "unsupported", message: "External sign-in is not offered" } satisfies ProtocolError;
-			if (offered === "webauthn" && !this.passkeysOffered(this.requestOrigin(socket))) throw { name: "unsupported", message: "Passkeys are not offered to this origin" } satisfies ProtocolError;
+			if (offered === "external" && !this.externalOrigin(attachment)) throw { name: "unsupported", message: "External sign-in is not offered" } satisfies ProtocolError;
+			if (offered === "webauthn" && !this.passkeysOfferedTo(this.requestOrigin(socket), attachment.endpoint)) throw { name: "unsupported", message: "Passkeys are not offered to this origin" } satisfies ProtocolError;
 		}
 		this.store.reserveAuthAttempt({ ipKey: attachment.ipKey, now: nowMs() });
 		const params = request.params;
@@ -3334,7 +3595,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			else if (token.startsWith(INVITE_TOKEN_PREFIX)) await this.handleInviteToken(socket, attachment, request, token);
 			else if (token.startsWith(DEVICE_TOKEN_PREFIX)) await this.handleDeviceToken(socket, attachment, request, token);
 			else if (token.startsWith(JOIN_TOKEN_PREFIX)) await this.handleJoinToken(socket, attachment, request, token);
-			else await this.handleTokenResume(socket, attachment, request);
+			else await this.handleTokenResume(socket, attachment, request, token.startsWith(SESSION_TOKEN_PREFIX));
+			return;
+		}
+		if (scheme === "external") {
+			await this.handleExternal(socket, attachment, request);
 			return;
 		}
 		if (scheme !== "webauthn") throw { name: "invalid_params", message: "Unknown authentication scheme" } satisfies ProtocolError;
@@ -3352,7 +3617,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		const step = requiredString(params, "step");
 		const origin = this.requestOrigin(socket);
-		if (!origin || !this.config.rpOrigins.includes(origin)) throw { name: "denied", message: "Frontend origin is not configured for passkeys" } satisfies ProtocolError;
+		// A ceremony in the client needs one of RP_ORIGINS; the passkey page
+		// serves every other client, on the server's own origin (protocol §4.10.1).
+		const local = origin !== null && this.config.rpOrigins.includes(origin);
+		const pageOrigin = this.passkeyPageOrigin(attachment);
+		if (!local && !pageOrigin) throw { name: "denied", message: "Frontend origin is not configured for passkeys" } satisfies ProtocolError;
 		if (step === "begin") {
 			const identity = action === "register" ? identityOf(attachment) : undefined;
 			const name = action === "register" && !adding ? this.requestedName(params) : undefined;
@@ -3365,19 +3634,54 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// concurrent ceremonies for it share it.
 			const shared = !stored ? null : stored.userHandle || this.store.ensureUserHandle(stored.userId, bytesToBase64Url(crypto.getRandomValues(new Uint8Array(16))), nowMs());
 			const handle = shared && /^[A-Za-z0-9_-]{16,64}$/.test(shared) && shared.length % 4 !== 1 ? shared : undefined;
-			const begun = await this.webAuthn.begin(action, origin, nowMs(), identity ?? undefined, existing, attachment.connId, {
-				...(name !== undefined ? { name } : {}),
-				userIdTaken: (userId) => this.store.userIdTaken(userId),
-				...(adding ? { adds: handle ? { userHandle: handle } : {} } : {}),
-			});
-			if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
-			attachment.challenge = begun.challenge;
-			writeSessionAttachment(socket, attachment, ["challenge"]);
-			this.reply(socket, request, { challenge_id: begun.challenge.challengeId, public_key: begun.publicKey });
+			const result: Record<string, unknown> = {};
+			if (local) {
+				const begun = await this.webAuthn.begin(action, origin, nowMs(), identity ?? undefined, existing, attachment.connId, {
+					...(name !== undefined ? { name } : {}),
+					userIdTaken: (userId) => this.store.userIdTaken(userId),
+					...(adding ? { adds: handle ? { userHandle: handle } : {} } : {}),
+				});
+				if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
+				attachment.challenge = begun.challenge;
+				writeSessionAttachment(socket, attachment, ["challenge"]);
+				result.challenge_id = begun.challenge.challengeId;
+				result.public_key = begun.publicKey;
+			}
+			// The passkey page, for a client that cannot use the RP ID: its query
+			// carries the action, a new account's name, or an addition's handle,
+			// which the client keeps (protocol §4.10.1, §4.12.1).
+			if (pageOrigin) {
+				const url = new URL(PASSKEY_PAGE_PATH, pageOrigin);
+				url.searchParams.set("action", action);
+				if (name !== undefined) url.searchParams.set("name", name);
+				if (adding) url.searchParams.set("request", await this.createRequestHandle(attachment.userId!, handle, nowMs()));
+				if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
+				result.external = { url: url.href };
+			}
+			this.reply(socket, request, result);
 			await this.rescheduleAlarm();
 			return;
 		}
 		if (step !== "finish") throw { name: "invalid_params", message: "Passkey step must be begin or finish" } satisfies ProtocolError;
+		const signIn = this.passkeySignIn(socket, attachment);
+		if (params.code !== undefined) {
+			// A code from the passkey page finishes the exchange instead of a
+			// credential, on any connection (protocol §4.10.1).
+			if (!pageOrigin) throw { name: "denied", message: "Sign-in code is invalid or expired" } satisfies ProtocolError;
+			const code = await this.takeSignInCode(params, "passkey", pageOrigin);
+			if (code.action !== action) throw { name: "denied", message: "Sign-in code is invalid or expired" } satisfies ProtocolError;
+			// An addition's code works only on a connection of its account; any
+			// other registration starts an account, which a signed-in connection
+			// cannot switch to.
+			if (code.adds ? attachment.userId !== code.userId || !adding : adding) {
+				throw { name: "denied", message: code.adds ? "That passkey is for another account" : "Identity switching requires reconnect" } satisfies ProtocolError;
+			}
+			this.holdDeliveries(socket);
+			const finished = await this.redeemPasskeyCode(code, signIn.repository, attachment.ipKey);
+			await this.completePasskeySignIn(socket, attachment, request, finished, signIn, { adds: code.adds === true, newAccount: code.action === "register" });
+			return;
+		}
+		if (!local) throw { name: "denied", message: "Frontend origin is not configured for passkeys" } satisfies ProtocolError;
 		const challengeId = requiredString(params, "challenge_id");
 		const challenge = attachment.challenge;
 		// A matching finish consumes the pending ceremony before any proof work,
@@ -3394,23 +3698,31 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// wait for the `auth` result (§3.2). processFrame releases them if the
 		// step fails.
 		this.holdDeliveries(socket);
-		// A signed-in user's avatar, roles and ext, for the connection's current object (§3.3).
-		let avatar: string | undefined;
-		let roles: string[] = [];
-		let ext: Record<string, unknown> | undefined;
-		// And their `seen` (§4.5.2), from the same row, for the connection's status state.
-		let seen: number | undefined;
-		// And their user handle, which the session they get carries.
-		let handle: string | undefined;
-		const repository: CredentialRepository = {
+		const finished = await this.webAuthn.finish(challenge, challengeId, credential, signIn.repository, {
+			now: nowMs(),
+			ipKey: attachment.ipKey,
+			identity: identityOf(attachment) ?? undefined,
+			connectionId: attachment.connId,
+		});
+		await this.completePasskeySignIn(socket, attachment, request, finished, signIn, { adds: challenge.adds === true, newAccount: challenge.action === "register", origin });
+	}
+
+	/**
+	 * The credential repository a passkey sign-in on `socket` writes through,
+	 * and what it read of the account on the way (avatar, roles, ext, seen,
+	 * user handle), for completePasskeySignIn.
+	 */
+	private passkeySignIn(socket: WebSocketConnection, attachment: ConnectionAttachment): PasskeySignIn {
+		const signIn: PasskeySignIn = { roles: [], repository: undefined as unknown as CredentialRepository };
+		signIn.repository = {
 			getCredential: (credentialId) => this.store.getCredential(credentialId),
 			getIdentity: (userId) => {
 				const identity = this.store.getIdentity(userId);
-				avatar = identity?.avatar;
-				roles = identity?.roles ?? [];
-				ext = identity?.ext;
-				seen = identity?.seen;
-				handle = identity?.userHandle;
+				signIn.avatar = identity?.avatar;
+				signIn.roles = identity?.roles ?? [];
+				signIn.ext = identity?.ext;
+				signIn.seen = identity?.seen;
+				signIn.handle = identity?.userHandle;
 				return identity ? { user_id: identity.userId, name: identity.name, tier: "registered" } : null;
 			},
 			registerCredential: (input) => {
@@ -3424,7 +3736,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 					const added = this.store.addCredential({ userId: input.userId, userHandle: input.userHandle, credential: input.credential, now: input.now, ipKey: input.ipKey });
 					return { user_id: added.userId, name: added.name };
 				}
-				handle = input.userHandle;
+				signIn.handle = input.userHandle;
 				// A guest registering on its connection keeps the rooms it had joined.
 				const identity = this.store.registerIdentity({ ...input, ...(attachment.tier === "anonymous" && attachment.rooms ? { rooms: attachment.rooms } : {}) });
 				// Each starting room's logged join goes to the room's other members
@@ -3435,15 +3747,23 @@ export class ApronDemoServer extends DurableObject<Env> {
 			},
 			updateCredentialCounter: (credentialId, counter) => this.store.updateCredentialCounter(credentialId, counter),
 		};
-		const finished = await this.webAuthn.finish(challenge, challengeId, credential, repository, {
-			now: nowMs(),
-			ipKey: attachment.ipKey,
-			identity: identityOf(attachment) ?? undefined,
-			connectionId: attachment.connId,
-		});
+		return signIn;
+	}
+
+	/**
+	 * After a verified passkey, from a ceremony in the client or a code from
+	 * a sign-in page: an addition answers `you` and tells the account's other
+	 * connections; anything else signs the connection in with a new session
+	 * token, bound to `origin` for a ceremony in the client (§4.10) and a
+	 * plain bearer token for a code (protocol §4.10.1).
+	 * Deliveries are held from before the account was written.
+	 */
+	private async completePasskeySignIn(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame,
+		finished: { identity: { user_id: string; name?: string }; credential?: StoredCredential }, signIn: PasskeySignIn,
+		options: { adds: boolean; newAccount: boolean; origin?: string }): Promise<void> {
 		const latest = connectionAttachment(socket);
 		if (!latest || latest.closing || !openSocket(socket)) return;
-		if (challenge.adds) {
+		if (options.adds) {
 			// The connection stays signed in as it was, now with one more passkey.
 			// The account's other connections are told, so an unexpected passkey
 			// can be spotted and removed with /passkeys.
@@ -3461,8 +3781,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// so a failure leaves neither an orphan session nor a changed
 		// connection. The storage writes awaited in between hold the input
 		// gate, so no other event changes the user's status or mutes meanwhile.
-		const stored = this.readStatusInputs(finished.identity.user_id, seen);
-		const token = await this.issueSession(finished.identity.user_id, origin, nowMs(), handle);
+		const stored = this.readStatusInputs(finished.identity.user_id, signIn.seen);
+		const token = await this.issueSession(finished.identity.user_id, options.origin, nowMs(), signIn.handle);
 		const sessionCredential = await sessionKey(token);
 		if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
 		// A passkey `/invite-purge` removed while the ceremony was verifying
@@ -3472,16 +3792,458 @@ export class ApronDemoServer extends DurableObject<Env> {
 			throw { name: "denied", message: "This passkey is no longer on the account" } satisfies ProtocolError;
 		}
 		const previous = this.guestBefore(socket, attachment);
-		this.becomeRegistered(socket, attachment, { userId: finished.identity.user_id, name: finished.identity.name, avatar, roles, ext },
+		this.becomeRegistered(socket, attachment, { userId: finished.identity.user_id, name: finished.identity.name, avatar: signIn.avatar, roles: signIn.roles, ext: signIn.ext },
 			this.registeredRooms(socket, finished.identity.user_id), sessionCredential);
 		this.prepareStatus(socket, stored);
 		this.reply(socket, request, { you: this.you(connectionAttachment(socket) ?? attachment), token });
 		this.releaseDeliveries(socket);
-		this.guestLeaves(socket, attachment, previous, challenge.action === "register");
+		this.guestLeaves(socket, attachment, previous, options.newAccount);
 		this.makeRoomFor(socket, finished.identity.user_id);
 		this.afterSignIn(socket, stored);
 		this.refreshAvatar(finished.identity.user_id);
 		await this.rescheduleAlarm();
+	}
+
+	// --- Sign-in pages: the passkey page and `external` (oauth.ts) ---
+
+	/**
+	 * The server's origin for the passkey page, from the WebSocket address
+	 * this connection reached (protocol §4.12.1), where the page can run
+	 * ceremonies for the RP ID there; else undefined.
+	 */
+	private passkeyPageOrigin(attachment: ConnectionAttachment): string | undefined {
+		const origin = originOfEndpoint(attachment.endpoint);
+		return origin && this.pageServes(origin) ? origin : undefined;
+	}
+
+	/** Whether the sign-in pages are served on `origin`: the passkey page is on, and its host is the RP ID or under it. */
+	private pageServes(origin: string): boolean {
+		return this.config.passkeyPage && pageOriginServes(origin, this.config.rpId);
+	}
+
+	/** The server's origin for `external` on this connection, where it is offered (EXTERNAL_SIGN_IN); else undefined. */
+	private externalOrigin(attachment: ConnectionAttachment): string | undefined {
+		return this.config.externalSignIn ? this.passkeyPageOrigin(attachment) : undefined;
+	}
+
+	/** Whether this connection is offered `webauthn`: in the client from one of RP_ORIGINS, or through the passkey page. */
+	private passkeysOfferedTo(origin: string | null, endpoint: string | undefined): boolean {
+		if (this.passkeysOffered(origin)) return true;
+		const server = originOfEndpoint(endpoint);
+		return server !== undefined && this.pageServes(server);
+	}
+
+	/**
+	 * Puts a short-lived sign-in record (a code, its pending passkey, a page
+	 * ceremony, an addition's handle) with its entry in the expiry index, which
+	 * sweepSignIn reads. Keys are SHA-256s of the secrets, as sessions' are.
+	 */
+	private async putSignInRecord<T extends { expiresMs: number }>(key: string, value: T): Promise<void> {
+		await this.store.withMeterAsync("foreground", { writes: 2 }, async () => {
+			await this.ctx.storage.put<SignInExpiryEntry>(signInExpiryKey(value.expiresMs, key), { v: 1, key, expiresMs: value.expiresMs });
+			await this.ctx.storage.put(key, value);
+		});
+	}
+
+	/**
+	 * Takes a single-use sign-in record: read, then deleted, and returned
+	 * only to the caller whose delete removed it, so two requests racing with
+	 * one code cannot both have it. Expired records are taken too, and
+	 * refused by the caller. Its expiry entry is the sweep's to delete.
+	 */
+	private async takeSignInRecord<T extends { expiresMs: number }>(key: string): Promise<T | undefined> {
+		return await this.store.withMeterAsync("foreground", { reads: 1, writes: 1 }, async () => {
+			const value = await this.ctx.storage.get<T>(key);
+			if (value === undefined) return undefined;
+			return await this.ctx.storage.delete(key) ? value : undefined;
+		});
+	}
+
+	/**
+	 * An addition's `request` handle (protocol §4.10.1; SPEC.md section 5,
+	 * Passkey page): unguessable, bound to the account and its user handle, and
+	 * expiring. The passkey page reads it to name the account and to create
+	 * the passkey for it; its code then works only on that account's
+	 * connections.
+	 */
+	private async createRequestHandle(userId: string, userHandle: string | undefined, now: number): Promise<string> {
+		const handle = `rq_${bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)))}`;
+		await this.putSignInRecord(REQUEST_HANDLE_KEY_PREFIX + await sha256Hex(handle), {
+			v: 1, userId, ...(userHandle ? { userHandle } : {}), expiresMs: now + REQUEST_HANDLE_TTL_MS,
+		} satisfies StoredRequestHandle);
+		return handle;
+	}
+
+	/** An addition's handle, still good, and the account it names, which may still take a passkey; else undefined. */
+	private async readRequestHandle(handle: string, now: number): Promise<{ record: StoredRequestHandle; identity: NonNullable<ReturnType<Store["getIdentity"]>> } | undefined> {
+		const key = REQUEST_HANDLE_KEY_PREFIX + await sha256Hex(handle);
+		const record = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredRequestHandle>(key));
+		if (record?.v !== 1 || typeof record.userId !== "string" || !(record.expiresMs > now)) return undefined;
+		const identity = this.store.getIdentity(record.userId);
+		// The account must still be one that adds passkeys (§4.10): not a bot or
+		// `admin`, and still under its user handle, which `/invite-purge` changes.
+		if (!identity || identity.userId === ADMIN_USER_ID || (identity.roles ?? []).includes("bot") || isBotId(identity.userId)) return undefined;
+		if (record.userHandle && identity.userHandle !== record.userHandle) return undefined;
+		return { record, identity };
+	}
+
+	/**
+	 * Redeems a sign-in page's code, as `auth` sends it (`code`,
+	 * `code_verifier`, `redirect_uri`, `client_id`) or the token endpoint
+	 * does: single use, unexpired, from `page`, for this server's `origin`
+	 * (its `resource`), with the same client and return address, and a
+	 * verifier that answers its PKCE challenge. Anything else is `denied`,
+	 * and a code that was tried is gone either way.
+	 */
+	private async takeSignInCode(params: Record<string, unknown>, page: SignInPage, origin: string): Promise<StoredSignInCode> {
+		const code = requiredString(params, "code");
+		const verifier = requiredString(params, "code_verifier");
+		const redirectUri = requiredString(params, "redirect_uri");
+		const clientId = requiredString(params, "client_id");
+		const invalid = { name: "denied", message: "Sign-in code is invalid or expired" } satisfies ProtocolError;
+		if (code.length > MAX_SESSION_TOKEN_CHARS) throw invalid;
+		const record = await this.takeSignInRecord<StoredSignInCode>(SIGN_IN_CODE_KEY_PREFIX + await sha256Hex(code));
+		if (record?.v !== 1 || record.page !== page || !(record.expiresMs > nowMs()) || record.resource !== origin ||
+			record.clientId !== clientId || record.redirectUri !== redirectUri || !await pkceMatches(verifier, record.codeChallenge)) {
+			throw invalid;
+		}
+		return record;
+	}
+
+	/**
+	 * What a code's passkey did, now on the account: a sign-in's passkey,
+	 * still on its account; a new account, created now by the usual policy
+	 * (under its `user_id` from the page, or a new one if that was taken
+	 * since); or the passkey added to an addition's account.
+	 */
+	private async redeemPasskeyCode(code: StoredSignInCode, repository: CredentialRepository, ipKey: string): Promise<{ identity: { user_id: string; name?: string }; credential?: StoredCredential }> {
+		const gone = { name: "denied", message: "This passkey is no longer on the account" } satisfies ProtocolError;
+		if (code.action === "login") {
+			const credential = code.credentialId ? this.store.getCredential(code.credentialId) : null;
+			if (!credential || credential.userId !== code.userId) throw gone;
+			const identity = await repository.getIdentity!(code.userId);
+			if (!identity) throw gone;
+			return { identity, credential };
+		}
+		const created = code.register;
+		if (!created) throw { name: "denied", message: "Sign-in code is invalid or expired" } satisfies ProtocolError;
+		const userId = code.adds || !this.store.userIdTaken(code.userId) ? code.userId : candidateUserIdFor(created.name, (candidate) => this.store.userIdTaken(candidate));
+		const identity = await repository.registerCredential({
+			userId, name: created.name, userHandle: created.userHandle, credential: { ...created.credential, userId }, ipKey, now: nowMs(),
+			...(code.adds ? { adds: true } : {}),
+		});
+		return { identity };
+	}
+
+	/**
+	 * `external` (protocol §4.12), with this server as its own authorization
+	 * server: a begin returns `/oauth/authorize`; a `code` from that page signs
+	 * in, or on a signed-in connection adds the identity, which here is the
+	 * account itself, so it answers `you` only for the same account. An
+	 * identity that belongs to another account is `denied`, guests' included:
+	 * `external` never signs in to another account (§4.12.4).
+	 */
+	private async handleExternal(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
+		const origin = this.externalOrigin(attachment);
+		if (!origin) throw { name: "unsupported", message: "External sign-in is not offered" } satisfies ProtocolError;
+		const params = request.params;
+		// This server's own access tokens are Apron tokens, for `token` (ext:oauth).
+		if (params.token !== undefined) throw { name: "denied", message: "Sign in with this server's tokens through the token scheme" } satisfies ProtocolError;
+		if (params.code === undefined) {
+			this.reply(socket, request, { external: { url: `${origin}${AUTHORIZE_PATH}` } });
+			return;
+		}
+		const code = await this.takeSignInCode(params, "authorize", origin);
+		if (attachment.tier === "registered" || attachment.tier === "anonymous") {
+			const same = attachment.tier === "registered" && code.action === "login" && code.userId === attachment.userId &&
+				!!code.credentialId && this.store.getCredential(code.credentialId)?.userId === code.userId;
+			// A guest is not an account yet: a new account's code makes it one,
+			// as a passkey registration on a guest connection does (§4.10).
+			if (!same && !(attachment.tier === "anonymous" && code.action === "register")) {
+				throw { name: "denied", message: "That sign-in belongs to another account; sign in on a new connection" } satisfies ProtocolError;
+			}
+			if (same) {
+				this.reply(socket, request, { you: this.you(attachment) });
+				return;
+			}
+		}
+		const signIn = this.passkeySignIn(socket, attachment);
+		this.holdDeliveries(socket);
+		const finished = await this.redeemPasskeyCode(code, signIn.repository, attachment.ipKey);
+		await this.completePasskeySignIn(socket, attachment, request, finished, signIn, { adds: false, newAccount: code.action === "register" });
+	}
+
+	/**
+	 * The sign-in pages' requests, which the Worker forwards here for a host
+	 * the pages serve, with the server's origin and the client's address:
+	 * the passkey page and `/oauth/authorize` (`GET`), their ceremonies
+	 * (`POST` begin and finish), and the token endpoint.
+	 */
+	private async signInFetch(request: Request, route: string): Promise<Response> {
+		const ipKey = trustedIpKey(request);
+		if (!ipKey) return responseError(403, "Trusted client address unavailable");
+		const origin = request.headers.get(SERVER_ORIGIN_HEADER) ?? "";
+		const external = route === "authorize" || route === "token";
+		if (!this.pageServes(origin) || (external && !this.config.externalSignIn)) return responseError(404, "Not found");
+		const nonce = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(16)));
+		try {
+			if (route === "passkey" || route === "authorize") return await this.signInPage(new URL(request.url).searchParams, route === "passkey" ? "passkey" : "authorize", origin, nonce);
+			if (route === "token") return await this.tokenEndpoint(request, origin, ipKey);
+			// The page's own requests come from the page: same origin, JSON.
+			if (request.headers.get("Origin") !== origin) return pageJson(403, { error: "This request must come from the sign-in page." });
+			let body: Record<string, unknown>;
+			try {
+				const parsed: unknown = JSON.parse(await request.text());
+				if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+				body = parsed as Record<string, unknown>;
+			} catch {
+				return pageJson(400, { error: "The request was not understood." });
+			}
+			if (route === "begin") return await this.pageBegin(body, origin, ipKey);
+			if (route === "finish") return await this.pageFinish(body, origin, ipKey);
+			return responseError(404, "Not found");
+		} catch (error) {
+			const failure = error as { name?: string; code?: string; message?: string; retryAfterMs?: number };
+			const kind = failure instanceof StoreError ? failure.code : failure.name;
+			if (route === "token") return tokenError(kind === "retry_after" ? 429 : 400, kind === "retry_after" ? "slow_down" : "invalid_grant");
+			if (route === "passkey" || route === "authorize") return new Response(renderErrorPage("Try again later", "The server cannot take this sign-in right now.", nonce), { status: 503, headers: pageHeaders(nonce) });
+			if (kind === "retry_after") return pageJson(429, { error: "Too many attempts. Wait a minute, then try again." });
+			if (error instanceof AuthError) return pageJson(400, { error: "That passkey didn't work here. Try again, or use another passkey." });
+			return pageJson(kind === "denied" || kind === "invalid_params" || kind === "too_large" ? 400 : 503, {
+				error: kind === "denied" && failure.message && !(failure instanceof StoreError) ? failure.message : "Something went wrong. Try again.",
+			});
+		}
+	}
+
+	/**
+	 * A sign-in page: the passkey page, or `/oauth/authorize`, for a valid
+	 * request; otherwise an error shown on the page itself, never sent to an
+	 * unchecked return address.
+	 */
+	private async signInPage(query: URLSearchParams, page: SignInPage, origin: string, nonce: string): Promise<Response> {
+		const refuse = (message: string, title = "This sign-in link doesn't work") =>
+			new Response(renderErrorPage(title, message, nonce), { status: 400, headers: pageHeaders(nonce) });
+		const parsed = page === "passkey" ? parsePasskeyPageRequest(query, origin) : parseAuthorizationRequest(query, origin);
+		if (!parsed.ok) return refuse(parsed.error);
+		const value: PasskeyPageRequest = { action: "login", ...parsed.value };
+		let account: { userId: string; name: string } | undefined;
+		if (value.request) {
+			const found = await this.readRequestHandle(value.request, nowMs());
+			if (!found) return refuse("This link to add a passkey has expired. Start again from the app.", "This link has expired");
+			account = { userId: found.identity.userId, name: found.identity.name || found.identity.userId };
+		}
+		const redirect = redirectTarget(value.redirectUri)!;
+		const { who, client, where } = clientLabel(redirect);
+		const view: SignInPageView = {
+			page,
+			start: account ? "add" : value.action,
+			title: this.serverMetadata().title ?? this.config.rpName,
+			host: new URL(origin).host,
+			who, client, where,
+			recognised: recognisedClient(redirect, this.config.rpOrigins),
+			...(account ? { account } : {}),
+			query: query.toString(),
+			deny: redirectWith(value.redirectUri, { error: "access_denied", state: value.state, iss: origin }),
+		};
+		return new Response(renderSignInPage(view, nonce), { headers: pageHeaders(nonce) });
+	}
+
+	/**
+	 * The page's begin: its request checked again, then a ceremony on the
+	 * server's own origin, kept until finish with the request it is for.
+	 * Charged as an `auth` attempt.
+	 */
+	private async pageBegin(body: Record<string, unknown>, origin: string, ipKey: string): Promise<Response> {
+		const page = body.page === "authorize" && this.config.externalSignIn ? "authorize" : body.page === "passkey" ? "passkey" : undefined;
+		const query = typeof body.query === "string" && body.query.length <= 8_192 ? new URLSearchParams(body.query) : undefined;
+		if (!page || !query) return pageJson(400, { error: "The request was not understood." });
+		const parsed = page === "passkey" ? parsePasskeyPageRequest(query, origin) : parseAuthorizationRequest(query, origin);
+		if (!parsed.ok) return pageJson(400, { error: parsed.error });
+		// The passkey page's action is its link's; `/oauth/authorize` lets the person choose.
+		const action = page === "passkey" ? (parsed.value as PasskeyPageRequest).action : body.action === "register" ? "register" : "login";
+		const value: PasskeyPageRequest = { ...parsed.value, action };
+		const { maxNameCodePoints, maxNameBytes } = this.config.limits;
+		if (value.name !== undefined && ([...value.name].length > maxNameCodePoints || utf8Bytes(value.name) > maxNameBytes)) {
+			return pageJson(400, { error: "The name for the new account is too long. Start again from the app with a shorter one." });
+		}
+		const now = nowMs();
+		this.store.reserveAuthAttempt({ ipKey, now });
+		let adds: { userId: string; name: string; userHandle?: string; existing: string[] } | undefined;
+		if (value.request) {
+			const found = await this.readRequestHandle(value.request, now);
+			if (!found) return pageJson(400, { error: "This link to add a passkey has expired. Start again from the app." });
+			const existing = this.store.credentialIdsForUser(found.identity.userId);
+			if (existing.length >= MAX_PASSKEYS_PER_USER) return pageJson(400, { error: `An account holds at most ${MAX_PASSKEYS_PER_USER} passkeys.` });
+			adds = { userId: found.identity.userId, name: found.identity.name || found.identity.userId, existing, ...(found.record.userHandle ? { userHandle: found.record.userHandle } : {}) };
+		}
+		const begun = await this.webAuthn.begin(action, origin, now,
+			adds ? { user_id: adds.userId, name: adds.name, tier: "registered" } : undefined, adds?.existing ?? [], undefined, {
+				...(value.name !== undefined ? { name: value.name } : {}),
+				userIdTaken: (userId) => this.store.userIdTaken(userId),
+				...(adds ? { adds: adds.userHandle ? { userHandle: adds.userHandle } : {} } : {}),
+			}, { page: true });
+		const ceremony: StoredPageCeremony = {
+			v: 1, page, challenge: begun.challenge,
+			request: { clientId: value.clientId, redirectUri: value.redirectUri, codeChallenge: value.codeChallenge, state: value.state, resource: value.resource },
+			...(adds ? { addsUserId: adds.userId } : {}),
+			expiresMs: begun.challenge.expiresAt,
+		};
+		await this.putSignInRecord(PAGE_CEREMONY_KEY_PREFIX + await sha256Hex(begun.challenge.challengeId), ceremony);
+		await this.rescheduleAlarm();
+		return pageJson(200, { challenge_id: begun.challenge.challengeId, public_key: begun.publicKey });
+	}
+
+	/**
+	 * The page's finish: the ceremony is used up, verified on the server's
+	 * origin (no frame, user verification), and a code issued for its
+	 * request, which the page sends straight back to the client: its one
+	 * screen asked before the passkey. A new account's passkey is kept with
+	 * the code, and the account created when it is redeemed; until then it is
+	 * pending (pendingCredential). A login with a passkey that is neither
+	 * an account's nor pending answers `unknown_credential`.
+	 */
+	private async pageFinish(body: Record<string, unknown>, origin: string, ipKey: string): Promise<Response> {
+		const challengeId = typeof body.challenge_id === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(body.challenge_id) ? body.challenge_id : undefined;
+		if (!challengeId) return pageJson(400, { error: "The request was not understood." });
+		const now = nowMs();
+		this.store.reserveAuthAttempt({ ipKey, now });
+		const ceremony = await this.takeSignInRecord<StoredPageCeremony>(PAGE_CEREMONY_KEY_PREFIX + await sha256Hex(challengeId));
+		if (ceremony?.v !== 1 || !(ceremony.expiresMs > now) || ceremony.challenge.challengeId !== challengeId || ceremony.request.resource !== origin) {
+			return pageJson(400, { error: "This passkey request expired. Try again." });
+		}
+		const action = ceremony.challenge.action;
+		let credential: Record<string, unknown>;
+		try {
+			credential = passkeyCredentialParam(body, action);
+		} catch {
+			return pageJson(400, { error: "The passkey's answer was not understood. Try again." });
+		}
+		let created: { userId: string; name: string; userHandle: string; credential: StoredCredential } | undefined;
+		const repository: CredentialRepository = {
+			getCredential: (credentialId) => this.store.getCredential(credentialId),
+			getIdentity: (userId) => {
+				const identity = this.store.getIdentity(userId);
+				return identity ? { user_id: identity.userId, name: identity.name } : null;
+			},
+			// Kept with the code, not written: the account, or the addition, is the redeemer's.
+			registerCredential: (input) => {
+				if (this.store.getCredential(input.credential.credentialId)) throw new AuthError("credential is already registered");
+				created = { userId: input.userId, name: input.name, userHandle: input.userHandle, credential: input.credential };
+				return { user_id: input.userId, name: input.name };
+			},
+			updateCredentialCounter: (credentialId, counter) => this.store.updateCredentialCounter(credentialId, counter),
+		};
+		let finished: Awaited<ReturnType<WebAuthnService["finish"]>>;
+		try {
+			finished = await this.webAuthn.finish(ceremony.challenge, challengeId, credential, repository, {
+				now, ipKey, ...(ceremony.addsUserId ? { identity: { user_id: ceremony.addsUserId, tier: "registered" as const } } : {}),
+			});
+		} catch (error) {
+			// A passkey no account has, nor a code about to give it one, such as
+			// one made here whose code was never redeemed: the script asks the
+			// device to drop it. Anything else, or a failed read, is the usual error.
+			if (error instanceof UnknownCredentialError && this.config.signalUnknownPasskeys && !await this.pendingCredential(error.credentialId)) {
+				return pageJson(400, { error: "This passkey isn't for an account here. Try another passkey, or cancel to go back.", unknown_credential: true });
+			}
+			throw error;
+		}
+		const code = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+		const record: StoredSignInCode = {
+			v: 1, page: ceremony.page, action, ...ceremony.request,
+			userId: finished.identity.user_id,
+			...(finished.credential ? { credentialId: finished.credential.credentialId } : {}),
+			...(created ? { register: { name: created.name, userHandle: created.userHandle, credential: created.credential } } : {}),
+			...(ceremony.addsUserId ? { adds: true } : {}),
+			expiresMs: nowMs() + CODE_TTL_MS,
+		};
+		// Before the code, so no code holds a passkey that is not marked pending.
+		if (created) {
+			await this.putSignInRecord(PENDING_CREDENTIAL_KEY_PREFIX + await sha256Hex(created.credential.credentialId), {
+				v: 1, expiresMs: record.expiresMs + PENDING_CREDENTIAL_GRACE_MS,
+			} satisfies StoredPendingCredential);
+		}
+		await this.putSignInRecord(SIGN_IN_CODE_KEY_PREFIX + await sha256Hex(code), record);
+		return pageJson(200, { redirect: redirectWith(ceremony.request.redirectUri, { code, state: ceremony.request.state, iss: origin }) });
+	}
+
+	/**
+	 * Whether a code from the passkey page that may still be redeemed holds
+	 * a new passkey with this credential ID (pageFinish). Any record but an
+	 * expired one counts; a failed read throws.
+	 */
+	private async pendingCredential(credentialId: string): Promise<boolean> {
+		const key = PENDING_CREDENTIAL_KEY_PREFIX + await sha256Hex(credentialId);
+		const record = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredPendingCredential>(key));
+		if (record === undefined) return false;
+		return !(record?.v === 1 && typeof record.expiresMs === "number" && record.expiresMs <= nowMs());
+	}
+
+	/**
+	 * `POST /oauth/token` (`ext:oauth`, RFC 6749 §4.1.3): an
+	 * `/oauth/authorize` code for an Apron bearer token, which signs in with
+	 * `scheme: "token"` from any origin. A new account's code creates it
+	 * here. Passkey-page codes finish only `webauthn`, so are refused.
+	 * The public client's `client_id` comes in the body or with HTTP Basic
+	 * and an empty password (basicClientId), or both if they agree. A
+	 * request refused before the code is looked up (its form, grant type,
+	 * client or `resource`) leaves the code usable, so a client that tries
+	 * Basic first and then the body, as x/oauth2's AutoDetect does, keeps
+	 * its code; any attempt to redeem it uses it up (takeSignInCode).
+	 */
+	private async tokenEndpoint(request: Request, origin: string, ipKey: string): Promise<Response> {
+		const form = new URLSearchParams(await request.text());
+		if (form.get("grant_type") !== "authorization_code") return tokenError(400, "unsupported_grant_type");
+		const params: Record<string, unknown> = {};
+		for (const name of ["code", "code_verifier", "redirect_uri"]) {
+			const values = form.getAll(name);
+			if (values.length !== 1 || !values[0]) return tokenError(400, "invalid_request");
+			params[name] = values[0];
+		}
+		const inBody = form.getAll("client_id");
+		if (inBody.length > 1 || (inBody.length === 1 && !inBody[0])) return tokenError(400, "invalid_request");
+		const basic = basicClientId(request.headers.get("Authorization"));
+		if (basic === null || (basic !== undefined && inBody.length === 1 && inBody[0] !== basic)) return tokenError(401, "invalid_client");
+		const clientId = basic ?? inBody[0];
+		if (!clientId) return tokenError(400, "invalid_request");
+		params.client_id = clientId;
+		const resource = form.getAll("resource");
+		if (resource.length > 1 || (resource.length === 1 && resource[0] !== origin)) return tokenError(400, "invalid_target");
+		this.store.reserveAuthAttempt({ ipKey, now: nowMs() });
+		const code = await this.takeSignInCode(params, "authorize", origin);
+		let handle: string | undefined;
+		const repository: CredentialRepository = {
+			getCredential: (credentialId) => this.store.getCredential(credentialId),
+			getIdentity: (userId) => {
+				const identity = this.store.getIdentity(userId);
+				handle = identity?.userHandle;
+				return identity ? { user_id: identity.userId, name: identity.name } : null;
+			},
+			registerCredential: (input) => {
+				handle = input.userHandle;
+				const identity = this.store.registerIdentity(input);
+				for (const record of identity.broadcasts) this.broadcastRecord(record);
+				return { user_id: identity.userId, name: identity.name };
+			},
+			updateCredentialCounter: (credentialId, counter) => this.store.updateCredentialCounter(credentialId, counter),
+		};
+		const finished = await this.redeemPasskeyCode(code, repository, ipKey);
+		const token = await this.issueSession(finished.identity.user_id, undefined, nowMs(), handle);
+		await this.rescheduleAlarm();
+		return new Response(JSON.stringify({ access_token: token, token_type: "Bearer", expires_in: this.config.limits.sessionTtlSeconds }), { headers: tokenHeaders() });
+	}
+
+	/** Drops expired sign-in records (codes, their pending passkeys, page ceremonies, addition handles) from their expiry index; whether a full batch was processed. */
+	private async sweepSignIn(now: number): Promise<boolean> {
+		const end = `${SIGN_IN_EXPIRY_PREFIX}${Math.max(0, Math.trunc(now)).toString().padStart(16, "0")}￿`;
+		const dueProbe = await this.store.withMeterAsync("maintenance", { reads: 1 }, () => this.ctx.storage.list<SignInExpiryEntry>({ prefix: SIGN_IN_EXPIRY_PREFIX, end, limit: 1 }), now);
+		if (dueProbe.size === 0) return false;
+		return await this.store.withMeterAsync("maintenance", { reads: SESSION_CLEANUP_BATCH + 1, writes: 2 * SESSION_CLEANUP_BATCH }, async () => {
+			const indexed = await this.ctx.storage.list<SignInExpiryEntry>({ prefix: SIGN_IN_EXPIRY_PREFIX, end, limit: SESSION_CLEANUP_BATCH });
+			// A record is written once and never renewed, so its entry's time is its own: both go.
+			const keys = [...indexed].flatMap(([indexKey, entry]) => entry?.v === 1 && typeof entry.key === "string" && SIGN_IN_RECORD_KEY.test(entry.key) ? [indexKey, entry.key] : [indexKey]);
+			if (keys.length) await this.ctx.storage.delete(keys);
+			return indexed.size >= SESSION_CLEANUP_BATCH;
+		}, now);
 	}
 
 	/**
@@ -3597,21 +4359,27 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * writes charged at their bound on every reload, tab and reconnect. The
 	 * token is not rotated, so several tabs may share one persisted token.
 	 */
-	private async handleTokenResume(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
-		return this.withSessionLock(() => this.handleTokenResumeLocked(socket, attachment, request));
+	/**
+	 * Resumes a passkey session (§3.2.1). One from a ceremony in the client is
+	 * bound to that client's origin (§4.10), and resumes only from it; one
+	 * from a sign-in page's code (`bearer`, SESSION_TOKEN_PREFIX) from any
+	 * origin, or none.
+	 */
+	private async handleTokenResume(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, bearer: boolean): Promise<void> {
+		return this.withSessionLock(() => this.handleTokenResumeLocked(socket, attachment, request, bearer));
 	}
 
-	private async handleTokenResumeLocked(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
+	private async handleTokenResumeLocked(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, bearer: boolean): Promise<void> {
 		if (attachment.tier === "registered") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
 		const origin = this.requestOrigin(socket);
-		if (!origin || !this.config.rpOrigins.includes(origin)) throw { name: "denied", message: "Frontend origin is not configured for passkeys" } satisfies ProtocolError;
+		if (!bearer && (!origin || !this.config.rpOrigins.includes(origin))) throw { name: "denied", message: "Frontend origin is not configured for passkeys" } satisfies ProtocolError;
 		const token = requiredString(request.params, "token");
 		if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "too_large", message: "token is too long" } satisfies ProtocolError;
 		const key = await sessionKey(token);
 		const session = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<StoredSession>(key));
 		const now = nowMs();
 		const expired = { name: "denied", message: "Session expired; sign in with your passkey" } satisfies ProtocolError;
-		if (!session || session.v !== 1 || session.origin !== origin || session.expiresMs <= now) {
+		if (!session || session.v !== 1 || (bearer ? session.origin !== undefined : session.origin !== origin) || session.expiresMs <= now) {
 			if (session && session.expiresMs <= now) {
 				await this.store.withMeterAsync("foreground", { writes: 1 }, () => this.ctx.storage.delete(key));
 			}
@@ -3922,19 +4690,24 @@ export class ApronDemoServer extends DurableObject<Env> {
 		});
 	}
 
-	private async issueSession(userId: string, origin: string, now: number, handle: string | undefined): Promise<string> {
+	/**
+	 * A new passkey session's token: bound to `origin` for a ceremony in the
+	 * client (§4.10); without one, from a sign-in page's code, a bearer token
+	 * for any client, which says so by its prefix (SESSION_TOKEN_PREFIX).
+	 */
+	private async issueSession(userId: string, origin: string | undefined, now: number, handle: string | undefined): Promise<string> {
 		return this.withSessionLock(() => this.issueSessionLocked(userId, origin, now, handle));
 	}
 
-	private async issueSessionLocked(userId: string, origin: string, now: number, given: string | undefined): Promise<string> {
+	private async issueSessionLocked(userId: string, origin: string | undefined, now: number, given: string | undefined): Promise<string> {
 		// Every session carries its account's handle (a caller that has none at hand gets the stored one).
 		const handle = given ?? this.store.getIdentity(userId)?.userHandle;
-		const token = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+		const token = `${origin === undefined ? SESSION_TOKEN_PREFIX : ""}${bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)))}`;
 		const key = await sessionKey(token);
 		const expiresMs = now + this.config.limits.sessionTtlSeconds * 1_000;
 		await this.store.withMeterAsync("foreground", { writes: 2 }, async () => {
 			await this.ctx.storage.put<SessionExpiryEntry>(sessionExpiryKey(expiresMs, key), { v: 1, sessionKey: key, expiresMs });
-			await this.ctx.storage.put<StoredSession>(key, { v: 1, userId, origin, expiresMs, ...(handle ? { handle } : {}) });
+			await this.ctx.storage.put<StoredSession>(key, { v: 1, userId, ...(origin !== undefined ? { origin } : {}), expiresMs, ...(handle ? { handle } : {}) });
 		});
 		return token;
 	}
@@ -4063,7 +4836,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * (BOT_NAME_PATTERN); `name: ""` removes it, so the user falls back to
 	 * `user_id`. With uploads, `avatar: ""` removes a registered user's
 	 * avatar; a new one comes only through `/avatar` (§4.8.7), so other values
-	 * are declined. `ext` (§4.12) merges one level deep into the user's kept
+	 * are declined. `ext` (§4.13) merges one level deep into the user's kept
 	 * one, at most MAX_USER_EXT_BYTES after the merge (else `too_large`); only
 	 * registered users keep one, so a guest's `ext` with keys is `denied`, and
 	 * `"ext": {}` changes nothing. `roles` is not settable (§3.3) and is
@@ -4145,7 +4918,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.reply(socket, request, { you: { ...this.you(current), ...cleared } });
 			if (result.deduplicated || (name === undefined && !changed)) return;
 			// §3.3: `you` to the user's other connections, `new` to those who share
-			// a room with the user, with the ext keys that changed (§4.12).
+			// a room with the user, with the ext keys that changed (§4.13).
 			const user = { ...this.current(current)!, ...(current.name ? {} : { name: "" }), ...(changed ? { ext: changed } : {}) };
 			this.announceUser(socket, user, current.rooms ?? []);
 		});
@@ -7389,10 +8162,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!state || state.closing) continue;
 			const origin = state.origin ?? null;
 			const joined = this.wakesJoined(state);
-			const cacheKey = `${joined ? 1 : 0}${origin ?? ""}`;
+			const cacheKey = `${joined ? 1 : 0} ${originOfEndpoint(state.endpoint) ?? ""} ${origin ?? ""}`;
 			let frame = frames.get(cacheKey);
 			if (!frame) {
-				frame = this.serverAnnouncement(origin, joined);
+				frame = this.serverAnnouncement(origin, state.endpoint, joined);
 				frames.set(cacheKey, frame);
 			}
 			this.sendServer(socket, state, frame, joined);
@@ -7427,7 +8200,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!state || state.closing) return;
 		const joined = this.wakesJoined(state);
 		if (joined === (state.wakeJoined === true)) return;
-		this.sendServer(socket, state, this.serverAnnouncement(state.origin ?? null, joined), joined);
+		this.sendServer(socket, state, this.serverAnnouncement(state.origin ?? null, state.endpoint, joined), joined);
 	}
 
 	/**
@@ -7704,7 +8477,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * A connection's user as a complete object (§3.3), as `you` in results
 	 * and room `users` carry it: its current object with the user's whole
-	 * `ext` (§4.12), from the attachment. Notifications of a change carry
+	 * `ext` (§4.13), from the attachment. Notifications of a change carry
 	 * only the `ext` keys it changed, so they use current.
 	 */
 	private complete(attachment: ConnectionAttachment): PublicUser | null {

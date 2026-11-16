@@ -120,6 +120,11 @@ describe('configuration policy boundaries', () => {
 		return loadConfig({ ...base, ...extra } as Parameters<typeof loadConfig>[0], overrides);
 	}
 
+	it('keeps the passkey page from signalling unknown passkeys unless SIGNAL_UNKNOWN_PASSKEYS is true', () => {
+		expect(config().signalUnknownPasskeys).toBe(false);
+		expect(config({ SIGNAL_UNKNOWN_PASSKEYS: 'true' }).signalUnknownPasskeys).toBe(true);
+	});
+
 	it('accepts the documented aliases in prefixed precedence order', () => {
 		const loaded = config({
 			LIMIT_HISTORY_MAX_LIMIT: '49',

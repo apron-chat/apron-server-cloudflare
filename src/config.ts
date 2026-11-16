@@ -29,6 +29,39 @@ export interface RuntimeConfig {
 	 */
 	presence: boolean;
 	/**
+	 * The passkey page (`/passkey`, protocol §4.10.1): a `webauthn`
+	 * begin carries `external` with its URL, so clients that cannot use the RP
+	 * ID sign in with a passkey on the server's own origin. Served only on a
+	 * host that is the RP ID or under it. `PASSKEY_PAGE`, default on.
+	 */
+	passkeyPage: boolean;
+	/**
+	 * Whether the passkey page tells the device to drop a passkey that no
+	 * account here has, and no unredeemed code is about to give one
+	 * (WebAuthn's signalUnknownCredential), saying the passkey isn't for an
+	 * account here. Off, such a login gets the page's usual error, the same
+	 * as a known passkey that fails: the distinct answer tells anyone who
+	 * posts a made-up assertion whether a credential ID is registered, which
+	 * is worth it only for the signal. Only for a server whose storage holds
+	 * every passkey of its RP ID: Previews share one RP ID, each with its
+	 * own storage, so it stays off there. `SIGNAL_UNKNOWN_PASSKEYS`, default
+	 * off.
+	 *
+	 * FIXME: keep off until Apple fixes https://bugs.webkit.org/show_bug.cgi?id=302624
+	 * and https://bugs.webkit.org/show_bug.cgi?id=322267 (signalUnknownCredential
+	 * can delete other accounts' passkeys on iOS/macOS 26). Check again on
+	 * 2027-02-16. Turn on only where this server is the sole user of its RP ID.
+	 */
+	signalUnknownPasskeys: boolean;
+	/**
+	 * The `external` scheme (protocol §4.12), with this server as its own
+	 * authorization server: `/oauth/authorize` signs in with a passkey, and
+	 * `/.well-known/oauth-authorization-server` and `/oauth/token` are
+	 * served. For clients that implement only `external`; it needs the
+	 * passkey page's host. `EXTERNAL_SIGN_IN`, default off.
+	 */
+	externalSignIn: boolean;
+	/**
 	 * A fixed bearer token that signs in as the admin user
 	 * (`APRON_ADMIN_TOKEN`), who can run the admin commands. Set it as a
 	 * secret, never in source. Unset, no such token exists.
@@ -206,7 +239,7 @@ interface UploadConfig {
  */
 function adminTokenError(token: string): string | null {
 	if (!/^[A-Za-z0-9_-]{24,256}$/.test(token)) return "APRON_ADMIN_TOKEN must be 24 to 256 letters, digits, - or _";
-	if (["apron_bot_", "apron_invite_", "apron_join_", "apron_device_"].some((prefix) => token.startsWith(prefix))) return "APRON_ADMIN_TOKEN must not start with apron_bot_, apron_invite_, apron_join_, or apron_device_";
+	if (["apron_bot_", "apron_invite_", "apron_join_", "apron_device_", "apron_session_"].some((prefix) => token.startsWith(prefix))) return "APRON_ADMIN_TOKEN must not start with apron_bot_, apron_invite_, apron_join_, apron_device_, or apron_session_";
 	return null;
 }
 
@@ -231,6 +264,9 @@ type EnvLike = {
 	ACTIVITY?: string;
 	GUEST_POSTING?: string;
 	PRESENCE?: string;
+	PASSKEY_PAGE?: string;
+	SIGNAL_UNKNOWN_PASSKEYS?: string;
+	EXTERNAL_SIGN_IN?: string;
 	LIVE_TEXT?: string;
 	TERMINAL_VIEWER_URL?: string;
 	ATTACK_PAUSE?: string;
@@ -527,6 +563,10 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 	const activityEnabled = parseSwitch(env.ACTIVITY, "ACTIVITY", DEFAULT_FEATURES.activity);
 	const guestPosting = parseSwitch(env.GUEST_POSTING, "GUEST_POSTING", DEFAULT_FEATURES.guestPosting);
 	const presence = parseSwitch(env.PRESENCE, "PRESENCE", DEFAULT_FEATURES.presence);
+	const passkeyPage = parseSwitch(env.PASSKEY_PAGE, "PASSKEY_PAGE", true);
+	const signalUnknownPasskeys = parseSwitch(env.SIGNAL_UNKNOWN_PASSKEYS, "SIGNAL_UNKNOWN_PASSKEYS", false);
+	const externalSignIn = parseSwitch(env.EXTERNAL_SIGN_IN, "EXTERNAL_SIGN_IN", false);
+	if (externalSignIn && !passkeyPage) throw new ConfigError("EXTERNAL_SIGN_IN needs PASSKEY_PAGE, whose passkey ceremony its page runs");
 	const adminToken = env.APRON_ADMIN_TOKEN === undefined || env.APRON_ADMIN_TOKEN === "" ? undefined : String(env.APRON_ADMIN_TOKEN);
 	const adminTokenProblem = adminToken === undefined ? null : adminTokenError(adminToken);
 	if (adminTokenProblem) throw new ConfigError(adminTokenProblem);
@@ -561,6 +601,9 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 		activityEnabled,
 		guestPosting,
 		presence,
+		passkeyPage,
+		signalUnknownPasskeys,
+		externalSignIn,
 		...(adminToken !== undefined ? { adminToken } : {}),
 		...(uploads ? { uploads } : {}),
 		...(liveText ? { liveText } : {}),

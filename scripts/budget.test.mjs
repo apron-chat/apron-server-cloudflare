@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ADMISSION_BUDGET, DEFAULT_LIMITS } from '../src/budget.ts';
-import { mediaHostname, relyingPartyId, renderBinding, renderEdgeRules, replaceBinding, validateAdmission, validateDeploymentConfiguration, validateEdgeStop, webClientTarget } from './budget.mjs';
+import { customDomains, mediaHostname, relyingPartyId, renderBinding, signInPages, renderEdgeRules, replaceBinding, splitPreviews, validateAdmission, validateDeploymentConfiguration, validateEdgeStop, webClientTarget, wranglerVars } from './budget.mjs';
 
 const namespaces = { attempts: '123', prefix: '124', location: '125', live: '126' };
 
@@ -232,6 +232,31 @@ test('where the server hostname is its RP ID, passkey related origins pass the i
 	assert.equal(relyingPartyId('[vars]\nRP_ORIGINS = "https://chat.example.test"\n'), undefined);
 });
 
+test('where the server hostname serves the passkey page, its paths pass the invalid-request rule, and external\'s with EXTERNAL_SIGN_IN', () => {
+	const plain = renderEdgeRules('chat.example.test', ADMISSION_BUDGET, undefined, true);
+	assert.doesNotMatch(plain.custom.rules[0].expression, /passkey|oauth/);
+	const page = renderEdgeRules('chat.example.test', ADMISSION_BUDGET, undefined, true, false, undefined, { external: false });
+	const passkey = ' and not (http.request.method eq "GET" and http.request.uri.path eq "/passkey") and not (http.request.method eq "POST" and http.request.uri.path in {"/passkey/begin" "/passkey/finish"})';
+	assert.equal(page.custom.rules[0].expression, plain.custom.rules[0].expression.replace(' and (http.request.method ne "GET"', `${passkey} and (http.request.method ne "GET"`));
+	assert.equal(page.custom.rules[0].description, 'Apron: allow WebSocket handshakes, connection status probes, live text, and the passkey page');
+	assert.doesNotMatch(page.custom.rules[0].expression, /oauth/);
+	const external = renderEdgeRules('chat.example.test', ADMISSION_BUDGET, undefined, true, false, undefined, { external: true });
+	assert.match(external.custom.rules[0].expression, /"\/oauth\/authorize"/);
+	assert.match(external.custom.rules[0].expression, /\{"POST" "OPTIONS"\} and http\.request\.uri\.path eq "\/oauth\/token"/);
+	assert.match(external.custom.rules[0].expression, /"\/\.well-known\/oauth-authorization-server"/);
+	assert.match(external.custom.rules[0].description, /the passkey page, and external sign-in$/);
+	assert.deepEqual(external.custom.rules.slice(1), plain.custom.rules.slice(1));
+	// The production host is under RP_ID: the page is on unless PASSKEY_PAGE says otherwise.
+	const production = '[vars]\nRP_ID = "example.test"\n';
+	assert.deepEqual(signInPages(production, 'chat.example.test'), { external: false });
+	assert.deepEqual(signInPages(production, 'example.test'), { external: false });
+	assert.deepEqual(signInPages(`${production}EXTERNAL_SIGN_IN = "true"\n`, 'chat.example.test'), { external: true });
+	assert.equal(signInPages(`${production}PASSKEY_PAGE = "false"\n`, 'chat.example.test'), undefined);
+	assert.equal(signInPages(production, 'chat.other.test'), undefined);
+	assert.equal(signInPages(production, 'badexample.test'), undefined);
+	assert.equal(signInPages('[vars]\n', 'chat.example.test'), undefined);
+});
+
 test('a plan with uploads requires the bucket binding and both origins', () => {
 	const packageJson = { scripts: { deploy: 'npm run budget:check && wrangler deploy --config wrangler.production.toml' } };
 	const workflow = '      - run: npm run deploy\n';
@@ -247,4 +272,116 @@ test('a plan with uploads requires the bucket binding and both origins', () => {
 	// MEDIA_NOSNIFF, when set, is a switch: a typo would fail every request once deployed.
 	assert.doesNotThrow(() => check(base + vars + 'MEDIA_NOSNIFF = "true"\n' + bucket));
 	assert.throws(() => check(base + vars + 'MEDIA_NOSNIFF = "ture"\n' + bucket), /MEDIA_NOSNIFF/);
+});
+
+test('Previews get the same rate limiters under previews.ratelimits, in namespaces of their own', () => {
+	const edgeStop = { floodRequestsPerColoMinute: 1200, floodSampleEvery: 20, holdSeconds: 1800 };
+	const flood = { namespace: '127', edgeStop };
+	const previews = { namespaces: { attempts: '223', prefix: '224', location: '225', live: '226' }, flood: '227' };
+	const binding = renderBinding(namespaces, ADMISSION_BUDGET, flood, previews);
+	// Production's tables are as without Previews; the Previews' follow, inside the generated block.
+	assert.ok(binding.startsWith(renderBinding(namespaces, ADMISSION_BUDGET, flood).replace(/\n# END GENERATED ADMISSION BUDGET$/, '')));
+	assert.match(binding, /\[\[previews\.ratelimits\]\]\nname = "CONNECTION_ATTEMPTS"\nnamespace_id = "223"/);
+	assert.match(binding, /\[\[previews\.ratelimits\]\]\nname = "FLOOD_WATCH"\nnamespace_id = "227"\nsimple = \{ limit = 60, period = 60 \}/);
+	assert.equal(binding.match(/^\[\[previews\.ratelimits\]\]$/gm).length, 5);
+	assert.match(binding, /# END GENERATED ADMISSION BUDGET$/);
+	assert.doesNotMatch(renderBinding({ ...namespaces }, ADMISSION_BUDGET, undefined, { namespaces: previews.namespaces }), /FLOOD_WATCH/);
+	// No namespace may be shared with production's, or within the Previews'.
+	assert.throws(() => renderBinding(namespaces, ADMISSION_BUDGET, flood, { ...previews, namespaces: { ...previews.namespaces, live: '123' } }), /distinct from production/);
+	assert.throws(() => renderBinding(namespaces, ADMISSION_BUDGET, flood, { ...previews, flood: '127' }), /distinct from production/);
+	assert.throws(() => renderBinding(namespaces, ADMISSION_BUDGET, flood, { ...previews, flood: '223' }), /flood counter/);
+	assert.throws(() => renderBinding(namespaces, ADMISSION_BUDGET, flood, { ...previews, namespaces: { ...previews.namespaces, prefix: '223' } }), /namespace IDs/);
+});
+
+test('with Previews, every rule scoped to the server hostname covers the Preview hosts too', () => {
+	const signIn = { external: false };
+	const plain = renderEdgeRules('chat.example.test', ADMISSION_BUDGET, 'media.example.test', true, false, 'https://web.example.test/', signIn);
+	const edge = renderEdgeRules('chat.example.test', ADMISSION_BUDGET, 'media.example.test', true, false, 'https://web.example.test/', signIn, { hostname: 'previews.example.test', liveText: false, signIn: { external: true } });
+	const preview = 'ends_with(http.host, ".previews.example.test")';
+	const [invalid, off, media, stop] = edge.custom.rules;
+	// Each host lets through what it serves: production its writes, live text and passkey page; Previews their passkey page and external sign-in.
+	const tail = ' and (http.request.method ne "GET"';
+	const productionPart = plain.custom.rules[0].expression.slice(0, plain.custom.rules[0].expression.indexOf(tail));
+	assert.ok(invalid.expression.startsWith(`((${productionPart}) or ((${preview}) and not (http.request.method eq "GET" and http.request.uri.path eq "/passkey")`));
+	assert.ok(invalid.expression.endsWith(plain.custom.rules[0].expression.slice(productionPart.length)));
+	assert.equal(productionPart.match(/oauth/g), null);
+	assert.match(invalid.expression.slice(invalid.expression.indexOf(preview)), /"\/oauth\/authorize"/);
+	assert.doesNotMatch(invalid.expression.slice(invalid.expression.indexOf(preview)), /"\/w\/"|"\/live\/"/);
+	assert.equal(invalid.description, `${plain.custom.rules[0].description}; on Previews, WebSocket handshakes, connection status probes, the passkey page, and external sign-in`);
+	assert.equal(off.expression, `http.host eq "chat.example.test" or ${preview}`);
+	assert.deepEqual(media, plain.custom.rules[2]);
+	assert.equal(stop.ref, 'apron_budget_stop');
+	assert.equal(stop.expression, `http.host in {"chat.example.test" "media.example.test"} or ${preview}`);
+	assert.ok(edge.redirect.rules[0].expression.startsWith(`(http.host eq "chat.example.test" or ${preview}) and http.request.method eq "GET"`));
+	// No live text on Previews: the write streaming rule stays production's; the media host's rules are unchanged.
+	assert.deepEqual(edge.config, plain.config);
+	assert.deepEqual(edge.headers, plain.headers);
+	assert.equal(renderEdgeRules('chat.example.test', ADMISSION_BUDGET, undefined, true, false, undefined, undefined, { hostname: 'previews.example.test', liveText: true }).config.rules[0].expression.startsWith(`(http.host eq "chat.example.test" or ${preview})`), true);
+	// Without media, the stop names the server host alone, then the Previews.
+	assert.equal(renderEdgeRules('chat.example.test', ADMISSION_BUDGET, undefined, false, false, undefined, undefined, { hostname: 'previews.example.test' }).custom.rules[2].expression, `http.host eq "chat.example.test" or ${preview}`);
+	assert.throws(() => renderEdgeRules('chat.example.test', ADMISSION_BUDGET, undefined, false, false, undefined, undefined, { hostname: '"x" or true' }), /host name/);
+});
+
+test('a Wrangler config\'s Previews are read apart from production\'s settings', () => {
+	const source = [
+		'name = "w"',
+		'routes = [',
+		'  { pattern = "chat.example.test", custom_domain = true },',
+		'  { pattern = "previews.example.test", custom_domain = true, previews_enabled = true, enabled = false }',
+		']',
+		'[vars]',
+		'RP_ID = "example.test"',
+		'',
+		'[previews.vars]',
+		'RP_ID = "previews.example.test" # their own',
+		'EXTERNAL_SIGN_IN = "true"',
+		'',
+		'[previews.durable_objects]',
+		'bindings = [{ name = "DEMO", class_name = "C" }]',
+		'[[ratelimits]]',
+		'name = "A"',
+		'[[previews.ratelimits]]',
+		'name = "B"',
+		'',
+	].join('\n');
+	const { production, previews } = splitPreviews(source);
+	assert.doesNotMatch(production, /previews\.example\.test"\s*#|EXTERNAL_SIGN_IN|name = "B"/);
+	assert.match(production, /name = "A"/);
+	assert.match(previews, /^\[vars\]\nRP_ID = "previews\.example\.test"/m);
+	assert.match(previews, /^\[\[ratelimits\]\]\nname = "B"/m);
+	assert.deepEqual(wranglerVars(previews), { RP_ID: 'previews.example.test', EXTERNAL_SIGN_IN: 'true' });
+	assert.deepEqual(wranglerVars(production), { RP_ID: 'example.test' });
+	// Production's switches are its own: the Previews' EXTERNAL_SIGN_IN does not reach its rule.
+	assert.deepEqual(signInPages(production, 'chat.example.test'), { external: false });
+	assert.deepEqual(signInPages(previews, 'previews.example.test'), { external: true });
+	assert.equal(relyingPartyId(production), 'example.test');
+	assert.deepEqual(customDomains(source), [
+		{ pattern: 'chat.example.test', enabled: true, previews: false },
+		{ pattern: 'previews.example.test', enabled: false, previews: true },
+	]);
+	assert.equal(splitPreviews('name = "w"\n').previews, undefined);
+	assert.throws(() => splitPreviews('name = "w"\npreviews = { }\n'), /tables/);
+});
+
+test('Previews need their own domain and DEMO binding, and share no bucket, dataset or origin with production', () => {
+	const packageJson = { scripts: { deploy: 'npm run budget:check && wrangler deploy --config wrangler.production.toml' } };
+	const workflow = '      - run: npm run deploy\n';
+	const development = 'name = "apron-cloudflare-demo-dev"\n';
+	const route = (preview) => `name = "apron-cloudflare-demo"\nworkers_dev = false\npreview_urls = false\nroutes = [\n  { pattern = "server.apron.chat", custom_domain = true },${preview ? `\n  ${preview}` : ''}\n]\n`;
+	const previewRoute = '{ pattern = "previews.apron.chat", custom_domain = true, previews_enabled = true, enabled = false }';
+	const production = '[vars]\nMEDIA_ORIGIN = "https://media.apron.chat"\nPUBLIC_ORIGIN = "https://server.apron.chat"\n[[r2_buckets]]\nbinding = "MEDIA"\nbucket_name = "apron-media"\n[[analytics_engine_datasets]]\nbinding = "METRICS"\ndataset = "apron_server_metrics"\n';
+	const previews = '[previews.vars]\nMEDIA_ORIGIN = ""\nPUBLIC_ORIGIN = ""\n[previews.durable_objects]\nbindings = [\n  { name = "DEMO", class_name = "ApronDemoServer" }\n]\n[[previews.analytics_engine_datasets]]\nbinding = "METRICS"\ndataset = "apron_server_metrics_preview"\n';
+	const check = (config) => validateDeploymentConfiguration({ development, production: config, packageJson, workflow, uploads: true });
+	assert.doesNotThrow(() => check(route(previewRoute) + production + previews));
+	assert.doesNotThrow(() => check(route() + production));
+	assert.throws(() => check(route() + production + previews), /exactly one custom domain/);
+	assert.throws(() => check(route(previewRoute) + production), /previews block/);
+	assert.throws(() => check(route(previewRoute.replace('enabled = false', 'enabled = true')) + production + previews), /only Previews/);
+	assert.throws(() => check(route(previewRoute) + production + previews.replace('name = "DEMO"', 'name = "OTHER"')), /DEMO/);
+	assert.throws(() => check(route(previewRoute) + production + previews.replace('PUBLIC_ORIGIN = ""', 'PUBLIC_ORIGIN = "https://server.apron.chat"')), /PUBLIC_ORIGIN/);
+	assert.throws(() => check(route(previewRoute) + production + previews.replace('_preview"', '"')), /dataset/);
+	assert.throws(() => check(route(previewRoute) + production + previews + '[[previews.r2_buckets]]\nbinding = "MEDIA"\nbucket_name = "apron-media"\n'), /bucket_name/);
+	assert.doesNotThrow(() => check(route(previewRoute) + production + previews + '[[previews.r2_buckets]]\nbinding = "MEDIA"\nbucket_name = "apron-media-preview"\n'));
+	// Production's own checks read production's settings only: a Preview's bucket does not stand in for its MEDIA binding.
+	assert.throws(() => check(route(previewRoute) + production.replace('binding = "MEDIA"', 'binding = "OTHER"') + previews + '[[previews.r2_buckets]]\nbinding = "MEDIA"\nbucket_name = "apron-media-preview"\n'), /MEDIA bucket/);
 });

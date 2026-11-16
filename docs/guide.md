@@ -23,7 +23,10 @@ It speaks protocol 9 and advertises:
 - `embed:upload` and `ext:media` when uploads are configured, and
   `ext:emoji` once an admin, mod or friend adds a custom emoji with
   `/emoji add`;
-- `status` and push when VAPID keys are set.
+- `status` and push when VAPID keys are set;
+- `external` and `ext:oauth` (its token endpoint, which takes a public
+  client's `client_id` in the form or with HTTP Basic and an empty password,
+  and its metadata) with `EXTERNAL_SIGN_IN`, on the passkey page's host.
 
 See [authentication and policy](policy.md) and [the implementation
 specification](../SPEC.md).
@@ -198,14 +201,21 @@ including the posting, listing and frame quotas and the thread and private
 room caps, and ends with a checklist for a well-behaved client.
 
 The `server` frame's `welcome` is CommonMark for your sign-in screen. The server
-advertises `token` (for bot tokens) and `guest` to custom frontends, and never
-`email` or `external`; `signup` names the schemes that create an account
-(`webauthn` on the demo's own site, and `token` for an admin's `/invite-code`
+advertises `webauthn`, `token` (for bot tokens and passkey-page sessions) and
+`guest` to custom frontends, and never `email` (nor `external`, unless the
+deployment sets `EXTERNAL_SIGN_IN`); `signup` names the schemes that create an account
+(`webauthn`, and `token` for an admin's `/invite-code`
 sign-up token, whose `auth` result carries the new user's own token to save).
 A user who signed up with a token can add a passkey by registering one while
-signed in. `web.apron.chat` additionally receives `webauthn`, and its `token`
-also resumes passkey sessions; inspect each connection's
-`server.params.auth` rather than assuming passkeys are available everywhere.
+signed in. `web.apron.chat` runs the passkey ceremony itself; every other
+frontend gets only `external` in its `webauthn` begin result: the passkey
+page on `https://server.apron.chat/passkey`, which it opens with an OAuth
+authorization request (PKCE, `state`, `resource=https://server.apron.chat`)
+and whose code it sends back in the `webauthn` finish
+([policy](policy.md#passkey-page)). The `token` from that finish resumes
+from any origin; `web.apron.chat`'s own passkey sessions resume only there.
+Inspect each connection's `server.params.auth` rather than assuming passkeys
+are available everywhere.
 A frontend with a Content Security Policy must permit the endpoint in
 `connect-src` (for example, `connect-src wss://server.apron.chat`). Wildcard
 admission cannot override the frontend's own browser policies.
@@ -354,13 +364,19 @@ five minutes, when it serves the RP ID's own host, as here, without waking
 the Durable Object. Where it does not, as with the Worker on
 `chat.example.com` and `RP_ID = "example.com"`, serve
 `{"origins": [...]}` as JSON at `https://example.com/.well-known/webauthn`
-yourself: nothing else does. Startup does not check `RP_ORIGINS` against
-`RP_ID`, so a mistyped origin fails only in the browser, which refuses the
-passkey there. With edge rules, regenerate them: `apron_invalid_request`
+yourself: nothing else does. With a parent-domain `RP_ID` such as
+`example.com`, keep `SIGNAL_UNKNOWN_PASSKEYS` off (the default) unless this
+server is the sole user of that RP ID: a passkey another service there issued
+is unknown to this server, and the passkey page would ask the browser to drop
+it ([configuration](configuration.md)). Startup does not check
+`RP_ORIGINS` against `RP_ID`, so a mistyped origin fails only in the
+browser, which refuses the passkey there. With edge rules, regenerate them: `apron_invalid_request`
 lets the path through when the production custom domain is `RP_ID`
 ([edge admission](edge-admission.md)). Browsers without related origins
-refuse passkeys on such a frontend; there its users sign in another way,
-such as with a token from `/invite-device` ([other devices](#other-devices)).
+refuse passkeys on such a frontend; there a client that implements the
+passkey page uses it instead: the Worker serves it on its own host when that
+is `RP_ID` or under it (`PASSKEY_PAGE`, on by default). Otherwise users sign
+in another way, such as with a token from `/invite-device` ([other devices](#other-devices)).
 Changing `RP_ID` strands the passkeys registered under the old one.
 
 ## Operations and secrets
@@ -417,6 +433,73 @@ environment to hold deploys for approval. Worker secrets such as
 `ACCOUNT_ANALYTICS_TOKEN` are provisioned once with `wrangler secret put` and
 persist across deploys.
 
+## Previews
+
+[Worker Previews](https://developers.cloudflare.com/workers/previews/) run
+a branch's code as the production Worker `apron-cloudflare-demo`, apart from
+production, to test against before merging. From a checkout of the branch,
+with a Cloudflare API token that can deploy the Worker (as for
+[continuous deployment](#continuous-deployment); `npx wrangler login` works
+too):
+
+```sh
+npm run budget:check
+npx wrangler preview --config wrangler.production.toml
+```
+
+This creates or updates the Preview named after the branch (`--name`
+chooses another) and prints its URL, `https://<preview>.previews.apron.chat`.
+Connect to `wss://<preview>.previews.apron.chat/` (or `/ws`); opening the
+URL in a browser sends it to the web client with the Preview prefilled, as
+`https://web.apron.chat/#server=wss://<preview>.previews.apron.chat/`. A
+Preview of apron-web takes the same `#server=` fragment. Delete a Preview
+you are done with: `npx wrangler preview delete --name <preview>`.
+
+Previews are served only on the `previews.apron.chat` custom domain
+(`previews_enabled = true`, `enabled = false` in `wrangler.production.toml`):
+workers.dev and preview URLs stay off, as the zone's edge rules do not reach
+them. The route takes effect with the next production deploy (or when added
+in the dashboard); Cloudflare creates the wildcard DNS record and
+certificate with the first Preview, which can take a while. Apply the
+regenerated [edge rules](edge-admission.md), which cover the Preview hosts
+too, before sharing a Preview.
+
+A Preview inherits no vars or bindings: the `previews` block repeats
+production's where it can, and `npm run budget:check` checks it. A Preview
+differs from production in:
+
+- **Its own storage.** Each Preview has its own Durable Object, starting
+  empty, with the same plan budgets; its own rate limiters (generated with
+  production's, `npm run budget:generate`); and its own metrics dataset,
+  `apron_server_metrics_preview`, shared by all Previews.
+- **Passkeys.** `RP_ID` is `previews.apron.chat`, so Preview passkeys never
+  mix with production's (`apron.chat`). No client is on that RP ID, so every
+  client, `web.apron.chat` included, signs in through the
+  [passkey page](policy.md#passkey-page) on the Preview's host, which warns
+  that the host has not verified the app. `EXTERNAL_SIGN_IN` is on too, so
+  Previews exercise the `external` scheme, which production leaves off.
+  `SIGNAL_UNKNOWN_PASSKEYS` is off, as everywhere by default (WebKit can
+  delete other accounts' passkeys with it; see
+  [configuration](configuration.md)), and set off explicitly: every Preview
+  shares the RP ID with its own storage, so one Preview must not ask the
+  browser to drop another's passkey.
+- **No uploads, live text or push.** `PUBLIC_ORIGIN` is one fixed origin,
+  and each Preview has its own, so it is left empty, as are `MEDIA_ORIGIN`
+  and the VAPID keys; no media bucket is bound (`wrangler preview` lists
+  `MEDIA` as missing, which is expected). Without push there is no
+  [presence](configuration.md#user-status-presence) either.
+- **No secrets.** Previews do not inherit production's secrets, and need
+  none. For an admin, add a token of its own to every new Preview with
+  `npx wrangler preview base-config secret put APRON_ADMIN_TOKEN --config
+  wrangler.production.toml`, or to one with `npx wrangler preview secret put
+  APRON_ADMIN_TOKEN --name <preview> --config wrangler.production.toml`.
+- **No crons.** Cron Triggers never run a Preview, and without
+  `ACCOUNT_ANALYTICS_TOKEN` and `EDGE_STOP_TOKEN` a Preview reads no account
+  usage. Production's [budget guard](configuration.md#budget-guard) counts
+  the whole account, Previews included, and its `apron_budget_stop` rule
+  blocks the Preview hosts with production's. Each Preview's object may
+  spend as much as production's in a day, so keep few Previews about.
+
 ## Deployment checklist
 
 The production backend at `wss://server.apron.chat/` uses
@@ -431,8 +514,10 @@ production, it binds no static assets: the frontend's development server
 proxies to it. Keep bindings, migrations, and compatibility settings in sync.
 The production Worker's Custom Domain configures DNS and HTTPS through
 Cloudflare, and its workers.dev and preview URLs are disabled (`npm run
-budget:check` refuses a production config without that). `wrangler.toml` sets
-neither, so turn them off before deploying it anywhere.
+budget:check` refuses a production config without that); its
+[Previews](#previews) are served only on `previews.apron.chat`, another custom
+domain. `wrangler.toml` sets neither, so turn them off before deploying it
+anywhere.
 
 The RP ID stays `apron.chat` to keep existing passkey credentials working.
 Guest connections accept every origin, including localhost, LAN frontends,
@@ -511,7 +596,11 @@ For direct Wrangler production commands, always pass
    100 of the most recently used passkeys (from schema 7 or later), the
    current day's resource reservations, and the guest-number mark are
    carried over. See [SPEC section 8](../SPEC.md#schema-versions). Deploy the
-   matching frontend together with this backend.
+   matching frontend together with this backend. Rolling back to a version
+   from before the passkey page's pending records (`signin-pending:`) leaves
+   those written since the last sign-in sweep (at most hourly, but a day
+   apart on a quiet server) in storage for good: the older sweep drops their
+   expiry entries but not them. They are small, and read as expired.
 6. When deployment is authorized, merge to `main` (or run the Deploy workflow)
    and merge the matching frontend in apron-chat/apron-web, which deploys it.
    Verify guest access, passkey registration/login, edits, threads, private

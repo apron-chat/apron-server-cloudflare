@@ -9,6 +9,7 @@ import {
 } from "@simplewebauthn/server";
 import type { RuntimeConfig } from "./config";
 import type { Identity, StoredCredential } from "./domain";
+import { clientDataFramed, pageOriginServes } from "./oauth";
 
 type WebAuthnAction = "register" | "login";
 
@@ -26,6 +27,12 @@ export interface ChallengeRecord {
 	userName?: string;
 	/** A registration that adds a passkey to the signed-in identity (§4.10), which is `userId`. */
 	adds?: boolean;
+	/**
+	 * A ceremony on the passkey page (protocol §4.10.1): `origin` is
+	 * the server's own, under the RP ID, rather than one of `RP_ORIGINS`, and
+	 * client data from a frame on another site is refused.
+	 */
+	page?: boolean;
 	expiresAt: number;
 }
 
@@ -69,6 +76,20 @@ export class AuthError extends Error {
 	constructor(message = "Passkey verification failed") {
 		super(message);
 		this.name = "denied";
+	}
+}
+
+/**
+ * A login whose passkey no account here has (its lookup found none). It is
+ * an AuthError, and answers as one everywhere; only the passkey page tells
+ * it apart, so the device can drop the passkey (signalUnknownCredential).
+ * Without a key the assertion cannot be verified, so it is thrown only for
+ * one whose unsigned fields name this ceremony (assertionAddressed), which a
+ * forger can match; `credentialId` is the assertion's own.
+ */
+export class UnknownCredentialError extends AuthError {
+	constructor(readonly credentialId: string) {
+		super();
 	}
 }
 
@@ -125,8 +146,9 @@ export function candidateUserIdFor(name: string | undefined, taken: (userId: str
 	return `u_${randomBase64Url(16)}`;
 }
 
-function base64UrlToBytes(value: string): Uint8Array<ArrayBuffer> {
-	if (!/^[A-Za-z0-9_-]{1,1024}$/.test(value)) throw new Error("credential id is malformed");
+/** Unpadded base64url of at most `maxLength` characters (a credential ID's 1024 by default), decoded. */
+function base64UrlToBytes(value: string, maxLength = 1024): Uint8Array<ArrayBuffer> {
+	if (value.length > maxLength || !/^[A-Za-z0-9_-]+$/.test(value)) throw new Error("base64url value is malformed");
 	const padded = value.replaceAll("-", "+").replaceAll("_", "/") + "=".repeat((4 - value.length % 4) % 4);
 	const binary = atob(padded);
 	const bytes = new Uint8Array(new ArrayBuffer(binary.length));
@@ -180,6 +202,27 @@ function reportsNonDiscoverableCredential(response: RegistrationResponseJSON | A
 	return response.clientExtensionResults.credProps.rk === false;
 }
 
+/**
+ * Whether an assertion's unsigned fields name this ceremony: client data of
+ * type `webauthn.get` with its challenge and origin, and authenticator data
+ * for its RP ID. Nothing here is verified, since a passkey no account has
+ * gives no key to check a signature with: it only keeps an honest assertion
+ * meant for another ceremony, origin or RP ID from being called unknown, and
+ * says nothing about one forged to match. Anything unreadable is not
+ * addressed. Fields are bounded by `maxLength`, the credential's own limit.
+ */
+async function assertionAddressed(response: AuthenticationResponseJSON, challenge: ChallengeRecord, maxLength: number): Promise<boolean> {
+	try {
+		const data = JSON.parse(new TextDecoder().decode(base64UrlToBytes(response.response.clientDataJSON, maxLength))) as Record<string, unknown>;
+		if (data.type !== "webauthn.get" || data.challenge !== challenge.challenge || data.origin !== challenge.origin) return false;
+		const authenticatorData = base64UrlToBytes(response.response.authenticatorData, maxLength);
+		const rpIdHash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(challenge.rpId)));
+		return authenticatorData.length >= 37 && rpIdHash.every((byte, index) => authenticatorData[index] === byte);
+	} catch {
+		return false;
+	}
+}
+
 function toWebAuthnCredential(record: StoredCredential): WebAuthnCredential {
 	return {
 		id: record.credentialId,
@@ -197,6 +240,11 @@ function identityWithTier(identity: Identity): AuthIdentity {
 export class WebAuthnService {
 	constructor(private readonly config: RuntimeConfig) {}
 
+	/** A ceremony's origin: one of `RP_ORIGINS`, or for the passkey page the server's own origin under the RP ID. */
+	private originAllowed(origin: string, page: boolean): boolean {
+		return page ? this.config.passkeyPage && pageOriginServes(origin, this.config.rpId) : this.config.rpOrigins.includes(origin);
+	}
+
 	async begin(
 		action: WebAuthnAction,
 		origin: string,
@@ -210,8 +258,10 @@ export class WebAuthnService {
 		 * authenticator replaces rather than duplicates its passkey for it.
 		 */
 		registration: { name?: string; userIdTaken?: (userId: string) => boolean; adds?: { userHandle?: string } } = {},
+		/** `page`: a ceremony on the passkey page, on the server's own origin. */
+		ceremony: { page?: boolean } = {},
 	): Promise<BeginResult> {
-		if (!this.config.rpOrigins.includes(origin)) throw new Error("origin is not configured for passkeys");
+		if (!this.originAllowed(origin, ceremony.page === true)) throw new Error("origin is not configured for passkeys");
 		const adds = action === "register" && identity?.tier === "registered" && registration.adds !== undefined;
 		if (action === "register" && identity?.tier === "registered" && !adds) throw new Error("identity switching requires reconnect");
 		const challengeId = randomBase64Url(18);
@@ -261,6 +311,7 @@ export class WebAuthnService {
 				...(action === "register" ? { identityUserId: identity?.user_id ?? null } : {}),
 				...(candidateUserId ? { userId: candidateUserId, userHandle: candidateUserHandle, userName: candidateName } : {}),
 				...(adds ? { adds: true } : {}),
+				...(ceremony.page ? { page: true } : {}),
 				expiresAt: now + this.config.limits.challengeTtlSeconds * 1_000,
 			},
 			publicKey: options as unknown as Record<string, unknown>,
@@ -277,10 +328,12 @@ export class WebAuthnService {
 		if (challenge.challengeId !== challengeId || input.now >= challenge.expiresAt) throw new AuthError("Passkey challenge is missing or expired");
 		if (challenge.connectionId !== undefined && challenge.connectionId !== input.connectionId) throw new AuthError("Passkey challenge is bound to another connection");
 		if (Object.hasOwn(challenge, "identityUserId") && challenge.identityUserId !== (input.identity?.user_id ?? null)) throw new AuthError("Passkey registration identity changed");
-		if (challenge.origin.length === 0 || !this.config.rpOrigins.includes(challenge.origin) || challenge.rpId !== this.config.rpId) {
+		if (challenge.origin.length === 0 || !this.originAllowed(challenge.origin, challenge.page === true) || challenge.rpId !== this.config.rpId) {
 			throw new AuthError("Passkey challenge binding is invalid");
 		}
 		if (serializedBytes(credentialValue) > this.config.limits.maxCredentialBytes) throw new AuthTooLargeError();
+		// The page refuses to be framed, and so refuses a ceremony that a frame on another site ran (WebAuthn Level 3 §13.4.9).
+		if (challenge.page && clientDataFramed(credentialValue)) throw new AuthError("Passkey ceremony ran in a frame");
 		let response: RegistrationResponseJSON | AuthenticationResponseJSON;
 		try {
 			response = asCredentialResponse(credentialValue, this.config.limits.maxCredentialBytes);
@@ -328,6 +381,7 @@ export class WebAuthnService {
 		}
 		const credentialId = normalizedCredentialId((response as AuthenticationResponseJSON).id);
 		const stored = await repository.getCredential(credentialId);
+		if (stored === null && await assertionAddressed(response as AuthenticationResponseJSON, challenge, this.config.limits.maxCredentialBytes)) throw new UnknownCredentialError(credentialId);
 		if (!stored) throw new AuthError();
 		let verified: Awaited<ReturnType<typeof verifyAuthenticationResponse>>;
 		try {

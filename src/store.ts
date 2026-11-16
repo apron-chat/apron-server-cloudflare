@@ -752,7 +752,7 @@ export interface StoreMutationResult {
   membership?: Broadcast;
   /** An accepted retry: the original result, with no new records. */
   deduplicated?: boolean;
-  /** For `me`: the user's `ext` after the write, and the keys it changed (§4.12). */
+  /** For `me`: the user's `ext` after the write, and the keys it changed (§4.13). */
   profile?: { ext?: Record<string, unknown>; changed?: Record<string, unknown> };
 }
 
@@ -1194,7 +1194,7 @@ export const MAX_CREATED_ROOMS = 16;
 /** Most roles one user holds, so the column stays small. */
 export const MAX_ROLES_PER_USER = 8;
 /**
- * Largest serialized `ext` a user keeps (protocol §4.12), after a write's
+ * Largest serialized `ext` a user keeps (protocol §4.13), after a write's
  * merge: room for an extension's few fields, such as a bridge's nick or a
  * time zone. Every connection of the user carries it in its attachment, and
  * every listing that shows the user carries it in `users`.
@@ -1560,13 +1560,13 @@ function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-/** An empty value (`""`, `[]`, `{}`), which clears a key in a merge (protocol §3.3, §4.12). */
+/** An empty value (`""`, `[]`, `{}`), which clears a key in a merge (protocol §3.3, §4.13). */
 function emptyValue(value: unknown): boolean {
   return value === "" || (Array.isArray(value) && value.length === 0) || (isPlainObject(value) && Object.keys(value).length === 0);
 }
 
 /**
- * Merges a write's `ext` into the stored one, one level deep (protocol §4.12):
+ * Merges a write's `ext` into the stored one, one level deep (protocol §4.13):
  * each key the write carries replaces the stored value whole, a key whose
  * value is empty (`""`, `[]`, `{}`) is removed, and keys it leaves out stay.
  * `null` is an ordinary value. Without a write, or with `{}`, the stored
@@ -1620,7 +1620,7 @@ export function withEditedBy(ext: Record<string, unknown> | undefined, userId: s
 }
 
 /**
- * The keys of a user's `ext` that a write changed (protocol §4.12), as a
+ * The keys of a user's `ext` that a write changed (protocol §4.13), as a
  * `user` notification carries them: each new or replaced value, and `""`
  * for each key it cleared. Undefined when nothing changed.
  */
@@ -5548,7 +5548,7 @@ export class Store {
       if (editor && body.text === "") throw new StoreError("invalid_params", "Only the sender may empty this message's text");
       if (body.text === "" && (body.embeds as unknown[]).length === 0) throw new StoreError("invalid_params", "message cannot be empty");
     }
-    // A save merges `ext` into the current snapshot's (§4.12); a tombstone carries none (§4.4),
+    // A save merges `ext` into the current snapshot's (§4.13); a tombstone carries none (§4.4),
     // so a creation, or a save of a tombstone, merges into an empty `ext`.
     // An editor's save keeps ext too, and edited_by names who saved a
     // snapshot when not its sender (ext:editors); requests do not set it.
@@ -7398,7 +7398,7 @@ export class Store {
 
   /**
    * `room_set`: create a room or thread, or replace one's client fields (§4.2.4),
-   * merging `ext` into the current one (§4.12).
+   * merging `ext` into the current one (§4.13).
    * Demo policy: anyone may create a thread under a public top-level room and
    * save any public thread; only an admin or mod (ROOM_CREATOR_ROLES) may
    * create a public top-level room or save one. Threads cannot be nested, and
@@ -7438,7 +7438,7 @@ export class Store {
     const fallbackTitle = isPrivate ? undefined : existing?.room_id === ROOM_ID ? ROOM_TITLE : topLevel ? DEFAULT_ROOM_TITLE : DEFAULT_THREAD_TITLE;
     const title = typeof titleParam === "string" && titleParam.trim() !== "" ? titleParam : fallbackTitle;
     const description = typeof descriptionParam === "string" && descriptionParam.trim() !== "" ? descriptionParam : undefined;
-    // `ext` merges into the room's current one (§4.12, §4.2.4); the size check runs on the result.
+    // `ext` merges into the room's current one (§4.13, §4.2.4); the size check runs on the result.
     const roomFields = (stored: unknown): Record<string, unknown> => {
       const ext = mergeExt(stored, write);
       return { ...(title !== undefined ? { title } : {}), ...(description !== undefined ? { description } : {}), ...(ext ? { ext } : {}) };
@@ -7642,7 +7642,7 @@ export class Store {
   /**
    * A `me` profile write (§3.3) of a registered user: `name`, where `""`
    * removes it (a bot's must contain "bot": BOT_NAME_PATTERN), and `ext`, but for the keys the server owns
-   * (SERVER_USER_EXT_KEYS), merged into the stored one (§4.12) and at most
+   * (SERVER_USER_EXT_KEYS), merged into the stored one (§4.13) and at most
    * MAX_USER_EXT_BYTES after the merge. One identity row update, or none
    * when neither changes. `profile` has the user's whole `ext` after the
    * write and the keys it changed (changedExt).

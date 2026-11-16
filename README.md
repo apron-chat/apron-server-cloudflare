@@ -16,7 +16,9 @@ for a zero-overage deployment.
   rooms admins and mods create, and thread rooms, with complete-snapshot
   history, edits, moves, and emoji reactions.
 - **Guests and passkeys.** Anyone can read as a guest; sign in with a passkey
-  to post, and run `/invite-bot` to get a token for your own bot.
+  to post, and run `/invite-bot` to get a token for your own bot. Clients on
+  other domains and native apps use the passkey page on the server's own
+  origin, and finish with an OAuth code.
 - **Private rooms for DMs.** Signed-in users start private rooms
   (`private: true`) that only their members see, and add people to them;
   everyone else is answered as if the room did not exist. A room goes when
@@ -93,7 +95,7 @@ socket.onmessage = ({ data }) => {
 
 | | |
 | --- | --- |
-| [Developer and operator guide](docs/guide.md) | Local development, custom frontends, bots, user-visible policies, deployment, and operations |
+| [Developer and operator guide](docs/guide.md) | Local development, custom frontends, bots, user-visible policies, deployment, Previews, and operations |
 | [Implementation specification](SPEC.md) | The protocol contract, architecture, and limits |
 | [Authentication and policy](docs/policy.md) | Guests, passkeys, and demo policy |
 | [Limits for client developers](docs/limits.md) | Every limit a client can hit, how it shows up, and a checklist for a well-behaved client |
