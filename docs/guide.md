@@ -202,10 +202,34 @@ room caps, and ends with a checklist for a well-behaved client.
 
 The `server` frame's `welcome` is CommonMark for your sign-in screen. The server
 advertises `webauthn`, `token` (for bot tokens and passkey-page sessions) and
-`guest` to custom frontends, and never `email` (nor `external`, unless the
-deployment sets `EXTERNAL_SIGN_IN`); `signup` names the schemes that create an account
-(`webauthn`, and `token` for an admin's `/invite-code`
+`guest` to custom frontends, `email` where the deployment has a sender, and
+`external` only where the deployment sets `EXTERNAL_SIGN_IN`; `signup` names
+the schemes that create an account (`webauthn`, `email` for an address no
+account holds, and `token` for an admin's `/invite-code`
 sign-up token, whose `auth` result carries the new user's own token to save).
+
+Email sign-in (protocol §4.11) works in any client. To sign in or sign up,
+use a connection that has not signed in, not even as a guest: send
+`{"method": "auth", "params": {"scheme": "email", "email": "ada@example.com", "state": "<random>", "name": "Ada"}}`,
+with a `state` of 16 to 256 printable characters that nobody can guess (32
+random bytes, base64url, is OAuth's practice). It answers `{}`; then have
+the user type the six-digit code from the email with
+`{"scheme": "email", "token": "418092", "state": "<the same>"}`: with the
+`state` it works on any connection not signed in, such as another tab's
+(§4.11.2), and without it only on the one that asked. The result carries
+`you` and a bearer session `token` (`apron_session_…`), to save and resume
+with `scheme: "token"` from any origin. With `state`, the email also has a
+link, `https://link.apron.chat/#server=…&token=apron_email_…&state=…`, the
+universal link any client may handle (a deployment's `EMAIL_LINK_URL` may
+replace the page): use it only when its `state` is your client's own and
+its `server` is the server you asked (§4.11.2), presenting its token with
+`scheme: "email"` on any connection not signed in; ask the user first about
+any other link. A guest's connection can't approve a sign-in, so a guest
+signs up or in by presenting the code (with `state`) or the link on a fresh
+connection. On a connection
+signed in to an account, the proposal adds the address to it (replacing
+the account's one address), and the approval answers with `you`.
+See [SPEC section 5, Email](../SPEC.md#email).
 A user who signed up with a token can add a passkey by registering one while
 signed in. `web.apron.chat` runs the passkey ceremony itself; every other
 frontend gets only `external` in its `webauthn` begin result: the passkey
