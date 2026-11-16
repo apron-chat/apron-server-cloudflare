@@ -34,6 +34,11 @@ tag = "v1"
 new_sqlite_classes = ["ApronDemoServer"]
 
 [vars]
+# A parent domain of this server's host: anything else on apron.chat may issue
+# passkeys for it, which this server cannot see. Leave SIGNAL_UNKNOWN_PASSKEYS
+# unset (off) unless this server is the sole user of this RP ID, or the
+# passkey page would ask devices to drop those passkeys
+# (docs/configuration.md).
 RP_ID = "apron.chat"
 RP_ORIGINS = "https://web.apron.chat"
 ALLOWED_ORIGINS = "*"

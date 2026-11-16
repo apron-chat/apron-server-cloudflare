@@ -364,9 +364,13 @@ five minutes, when it serves the RP ID's own host, as here, without waking
 the Durable Object. Where it does not, as with the Worker on
 `chat.example.com` and `RP_ID = "example.com"`, serve
 `{"origins": [...]}` as JSON at `https://example.com/.well-known/webauthn`
-yourself: nothing else does. Startup does not check `RP_ORIGINS` against
-`RP_ID`, so a mistyped origin fails only in the browser, which refuses the
-passkey there. With edge rules, regenerate them: `apron_invalid_request`
+yourself: nothing else does. With a parent-domain `RP_ID` such as
+`example.com`, keep `SIGNAL_UNKNOWN_PASSKEYS` off (the default) unless this
+server is the sole user of that RP ID: a passkey another service there issued
+is unknown to this server, and the passkey page would ask the browser to drop
+it ([configuration](configuration.md)). Startup does not check
+`RP_ORIGINS` against `RP_ID`, so a mistyped origin fails only in the
+browser, which refuses the passkey there. With edge rules, regenerate them: `apron_invalid_request`
 lets the path through when the production custom domain is `RP_ID`
 ([edge admission](edge-admission.md)). Browsers without related origins
 refuse passkeys on such a frontend; there a client that implements the
@@ -592,7 +596,10 @@ For direct Wrangler production commands, always pass
    100 of the most recently used passkeys (from schema 7 or later), the
    current day's resource reservations, and the guest-number mark are
    carried over. See [SPEC section 8](../SPEC.md#schema-versions). Deploy the
-   matching frontend together with this backend.
+   matching frontend together with this backend. Rolling back to a version
+   from before the passkey page's pending records (`signin-pending:`) leaves
+   those of its last few minutes in storage for good: the older sweep drops
+   their expiry entries but not them. They are small, and read as expired.
 6. When deployment is authorized, merge to `main` (or run the Deploy workflow)
    and merge the matching frontend in apron-chat/apron-web, which deploys it.
    Verify guest access, passkey registration/login, edits, threads, private
