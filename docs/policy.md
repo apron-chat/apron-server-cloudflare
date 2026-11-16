@@ -368,7 +368,7 @@ guest.
 
 A client that cannot use the RP ID (a web client on another domain, a native
 app, a terminal with a browser) signs in with a passkey on the server's own
-page instead ([PLAN_WEBAUTHN_EXTERNAL.md](https://github.com/shazow/apron/pull/116)).
+page instead ([PROTOCOL.md §4.10.1](https://github.com/shazow/apron/blob/main/PROTOCOL.md#4101-passkey-page)).
 Each `webauthn` begin result carries `external: {url}`, the page at
 `https://<host>/passkey` with `action` (and a new account's `name`, or an
 addition's opaque `request` handle) in its query. Connections that cannot
@@ -418,14 +418,14 @@ on any connection.
   where this server is the sole user of its RP ID.
 - `PASSKEY_PAGE=false` turns the page off ([configuration](configuration.md)).
 
-`EXTERNAL_SIGN_IN=true` also offers `external` (protocol §4.12 as revised on shazow/apron#115), for clients
+`EXTERNAL_SIGN_IN=true` also offers `external` (protocol §4.12), for clients
 that implement only that scheme: `/oauth/authorize` is the same one screen
 as a sign-in, whose "Create an account" makes a new account's passkey from
 that screen, and its codes finish only
 `external`, on a connection or at `POST /oauth/token`. The metadata is at
 `/.well-known/oauth-authorization-server`. The token endpoint, the metadata
-and their CORS are the extension `ext:oauth` (EXTENSIONS.md on
-shazow/apron#115), which the `server` frame then lists: a client sends its
+and their CORS are the extension `ext:oauth` (shazow/apron's
+`extensions/ext_oauth.md`), which the `server` frame then lists: a client sends its
 `client_id` in the form, or with HTTP Basic and an empty password, and a
 request refused before the code is redeemed, such as Basic for another client
 than the form's, leaves the code usable. It is off by default: every
