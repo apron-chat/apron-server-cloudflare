@@ -21,6 +21,12 @@ export interface RemoteLink {
 	created_ms: number;
 }
 
+/** The server-owned `remote` of a link (`user.ext.remote`): its server, with no `user_id`. */
+export interface RemoteOrigin {
+	server: string;
+	user_id?: string;
+}
+
 /** The server-owned `remote` of a shadow user (`user.ext.remote`). */
 export interface RemoteUser {
 	server: string;

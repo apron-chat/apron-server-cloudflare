@@ -339,6 +339,10 @@ A thread stops counting when everyone has left it or its history expires.
 - [ ] Stay well under 120 frames a minute per connection. Throttle typing
       (it is a notification, at most 10 relayed a minute) and read cursors
       locally.
+- [ ] A link's bridge (extension `ext:remote`) may send up to 600 frames a
+      minute on its connection, within the server's frames a minute (300 on
+      Workers Free, 5,000 on Paid) and its posting limits (60 posts a minute
+      server-wide on Free).
 - [ ] Send read cursors (`activity` `read_message_id`) only when signed in
       to an account, the server advertises `activity`, and
       `ext.settings.read_cursors` isn't `false`: a guest's are dropped

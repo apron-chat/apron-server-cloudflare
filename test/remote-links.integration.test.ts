@@ -248,3 +248,79 @@ it('never signs a link out as an idle bot, nor prunes a shadow as an idle accoun
 		expect(store.remoteLink(linkId)).toBeUndefined();
 	});
 });
+
+it('gives a link\'s own user object ext.remote with its server and no user_id', async () => {
+	const server = 'ws://127.0.0.1:8087/ws';
+	const { admin, link, linkId, roomId } = await linked(server);
+	try {
+		expect((await request(link, 'me', 'me', {})).result.you).toMatchObject({ user_id: linkId, ext: { remote: { server } } });
+		expect((await request(link, 'me2', 'me', {})).result.you.ext.remote).not.toHaveProperty('user_id');
+		const members = await request(admin, 'members', 'room_list', { room_id: roomId, members: true });
+		expect(members.result.users.find((user: { user_id: string }) => user.user_id === linkId)).toMatchObject({ ext: { remote: { server } } });
+		// Its own posts' recorded `from`, but not the message, carry it.
+		const own = await exchange(link, 'own', 'message', { room_id: roomId, body: { text: 'link bot here' } });
+		const snapshot = own.skipped.find((frame) => frame.method === 'message' && frame.params.message_id === own.frame.result.message_id)!.params;
+		expect(snapshot.from).toEqual({ user_id: linkId, name: expect.any(String), ext: { remote: { server } } });
+		expect(snapshot).not.toHaveProperty('ext');
+		// A `me` of its own keeps it.
+		const renamed = await request(link, 'rename', 'me', { name: 'Bridge bot', ext: { remote: { server: 'ws://forged/ws' } } });
+		expect(renamed.result.you).toMatchObject({ name: 'Bridge bot', ext: { remote: { server } } });
+	} finally { admin.close(); link.close(); }
+});
+
+it('does not join a remote user again to a room it left or was removed from', async () => {
+	const { admin, link, roomId } = await linked('ws://127.0.0.1:8088/ws');
+	const carol = unique('carol');
+	const dave = unique('dave');
+	const carolId = `${carol}@127.0.0.1:8088`;
+	const daveId = `${dave}@127.0.0.1:8088`;
+	const post = (id: string, user: string) => request(link, id, 'message', { room_id: roomId, body: { text: id }, ext: { remote: { user_id: user } } });
+	try {
+		expect((await post('carol-1', carol)).result.message_id).toBeDefined();
+		const reacted = (await post('dave-1', dave)).result.message_id as string;
+		// Carol leaves through her link: her next write is refused, a reaction too.
+		expect((await request(link, 'leave', 'room_leave', { room_id: roomId, ext: { remote: { user_id: carol } } })).result).toEqual({});
+		expect((await post('carol-2', carol)).error.code).toBe(DENIED);
+		expect((await request(link, 'carol-react', 'reactions', { message_id: reacted, emojis: ['👍'], ext: { remote: { user_id: carol } } })).error.code).toBe(DENIED);
+		// The admin removes Dave: the same.
+		expect((await command(admin, 'kick', `/kick ${daveId}`, roomId)).frame.result).toEqual({});
+		expect((await post('dave-2', dave)).error.code).toBe(DENIED);
+		// Added back by the admin, Carol writes again.
+		expect((await request(admin, 'add', 'room_join', { room_id: roomId, user_id: carolId })).result).toEqual({});
+		expect((await post('carol-3', carol)).result.message_id).toBeDefined();
+	} finally { admin.close(); link.close(); }
+});
+
+it('answers a link\'s repeated create of a remote message with the copy it already wrote', async () => {
+	const { admin, link, roomId } = await linked('ws://127.0.0.1:8089/ws');
+	const carol = unique('carol');
+	const remote = { user_id: carol, room_id: 'ops', message_id: '1724803599120' };
+	try {
+		const first = await request(link, 'first', 'message', { room_id: roomId, body: { text: 'once' }, ext: { remote } });
+		const messageId = first.result.message_id as string;
+		// Another request id, even as another remote user: the same message, and nothing logged.
+		const again = await exchange(link, 'again', 'message', { room_id: roomId, body: { text: 'twice' }, ext: { remote: { ...remote, user_id: unique('dave') } } });
+		expect(again.frame.result).toEqual({ message_id: messageId });
+		expect(again.skipped.filter((frame) => frame.method === 'message' || frame.method === 'room_update')).toEqual([]);
+		const page = await request(admin, 'history', 'history', { room_id: roomId });
+		expect(page.result.messages.filter((message: { body?: { text?: string } }) => message.body?.text === 'twice')).toEqual([]);
+		// A save is no create; another remote message id is another message.
+		expect((await request(link, 'save', 'message', { message_id: messageId, room_id: roomId, body: { text: 'saved' }, ext: { remote } })).result).toEqual({ message_id: messageId });
+		const other = await request(link, 'other', 'message', { room_id: roomId, body: { text: 'other' }, ext: { remote: { ...remote, message_id: '1724803599121' } } });
+		expect(other.result.message_id).not.toBe(messageId);
+		// Still a duplicate once deleted.
+		await request(link, 'delete', 'message', { message_id: messageId, room_id: roomId, deleted: true, ext: { remote } });
+		expect((await request(link, 'after-delete', 'message', { room_id: roomId, body: { text: 'x' }, ext: { remote } })).result).toEqual({ message_id: messageId });
+	} finally { admin.close(); link.close(); }
+});
+
+it('lets a link send past the per-connection frame limit, and keeps it open through invalid_params', async () => {
+	const { admin, link, linkId } = await linked('ws://127.0.0.1:8090/ws');
+	try {
+		for (let i = 0; i < 5; i += 1) {
+			expect((await request(link, `bad-${i}`, 'message', { room_id: 'nowhere', body: { text: 'x' } })).error.code).toBe(INVALID_PARAMS);
+		}
+		for (let i = 0; i < 70; i += 1) expect((await request(link, `me-${i}`, 'me', {})).result.you.user_id).toBe(linkId);
+		expect(link.closed()).toBeUndefined();
+	} finally { admin.close(); link.close(); }
+});

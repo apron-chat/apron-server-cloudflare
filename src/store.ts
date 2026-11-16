@@ -37,7 +37,7 @@ import {
   type RawBudgetRow,
 } from "./budget-ledger";
 import { StoreError, limitData, type LimitCategory } from "./store-error";
-import { MAX_REMOTE_LINKS, REMOTE_LINK_PREFIX, isShadowUserId, withoutRemote, type RemoteLink, type RemoteUser } from "./remote";
+import { MAX_REMOTE_LINKS, REMOTE_LINK_PREFIX, isShadowUserId, withoutRemote, type RemoteLink, type RemoteOrigin, type RemoteUser } from "./remote";
 import { bucketHorizonMs, chargeBucket, type Bucket, type Rate } from "./limiter";
 import { LimiterCache, type RawLimitRow } from "./limiter-cache";
 import { SettledMeta } from "./settled-meta";
@@ -67,8 +67,10 @@ const ROOM_TITLE = "General";
  * version. A schema 9 object from code before the identities' `seen_ms`
  * column gains it before its upgrade (ensureSeenColumn()); one from code
  * before `push_subscriptions_joined_idx` gains that with the rebuild.
+ * Schema 12 adds what links need (extension `ext:remote`): each linked
+ * message's remote key, and the rooms remote users left (upgradeFromSchema11).
  */
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 /** The oldest schema upgraded in place rather than reset; each one from it up to SCHEMA_VERSION is. */
 export const UPGRADABLE_SCHEMA_VERSION = 7;
 /**
@@ -621,8 +623,8 @@ export interface Identity {
   user_id: string;
   name?: string;
   tier?: Tier;
-  /** A shadow user's `remote` (extension `ext:remote`), which recorded objects carry too. */
-  ext?: { remote: RemoteUser };
+  /** A shadow user's or link's `remote` (extension `ext:remote`), which recorded objects carry too. */
+  ext?: { remote: RemoteOrigin };
 }
 
 /** A flat, self-describing message snapshot (protocol §3.5). */
@@ -1789,8 +1791,17 @@ function roomIdList(value: string | null | undefined): string[] {
 }
 
 /** A membership's recorded user (§3.3): `user_id` and a non-empty `name`. */
-function recordedUser(userId: string, name: string | null | undefined, remote?: RemoteUser): Identity {
+function recordedUser(userId: string, name: string | null | undefined, remote?: RemoteOrigin): Identity {
   return { user_id: userId, ...(name ? { name } : {}), ...(remote ? { ext: { remote: clone(remote) } } : {}) };
+}
+
+/**
+ * The key of a remote message a link wrote (ext:remote), as
+ * `message_state.remote_key` holds it: the link and the message's remote
+ * `room_id` and `message_id`; undefined unless both are strings.
+ */
+function remoteMessageKey(link: string, remote: Record<string, unknown>): string | undefined {
+  return typeof remote.room_id === "string" && typeof remote.message_id === "string" ? JSON.stringify([link, remote.room_id, remote.message_id]) : undefined;
 }
 
 /** A shadow user's `remote` from its identity row's `ext_json` (ext:remote); undefined for anyone else. */
@@ -1971,6 +1982,13 @@ const SCHEMA_10_COPIED_COLUMNS: Record<string, readonly string[]> = {
  * user's push registrations are their primary-key range, so only expiry
  * and the moderators' `joined` registrations are indexed; and uploads no
  * longer keep their content type, which nothing read.
+ *
+ * Schema 12 (upgradeFromSchema11), for links (extension `ext:remote`):
+ * `message_state.remote_key` is a link's message's key, the link and the
+ * remote room and message IDs (remoteMessageKey), indexed where present, so
+ * a link's repeated create finds its copy; it goes with the message's state.
+ * `remote_left` keeps each room a remote user left or was removed from,
+ * keyed by user, so a later write from its link does not join it again.
  */
 const SCHEMA_DDL = `
   CREATE TABLE IF NOT EXISTS _meta (
@@ -2007,7 +2025,14 @@ const SCHEMA_DDL = `
     message_id TEXT PRIMARY KEY,
     room_id TEXT NOT NULL,
     latest_log_id INTEGER NOT NULL,
-    author_id TEXT NOT NULL
+    author_id TEXT NOT NULL,
+    remote_key TEXT
+  ) WITHOUT ROWID;
+  CREATE INDEX IF NOT EXISTS message_state_remote_idx ON message_state (remote_key) WHERE remote_key IS NOT NULL;
+  CREATE TABLE IF NOT EXISTS remote_left (
+    user_id TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    PRIMARY KEY (user_id, room_id)
   ) WITHOUT ROWID;
   CREATE TABLE IF NOT EXISTS reaction_state (
     message_id TEXT NOT NULL,
@@ -2324,7 +2349,11 @@ export class Store {
     }
     if (version === 10) {
       this.upgradeFromSchema10();
-      version = SCHEMA_VERSION;
+      version = 11;
+    }
+    if (version === 11) {
+      this.upgradeFromSchema11();
+      version = 12;
     }
     if (version !== 0 && version !== SCHEMA_VERSION) throw new Error(`storage schema ${version} requires resetStorage()`);
     if (version === SCHEMA_VERSION) {
@@ -2528,9 +2557,29 @@ export class Store {
       this.dropExpiredState();
       for (const index of SCHEMA_10_DROPPED_INDEXES) this.rawExec(`DROP INDEX IF EXISTS ${index}`);
       this.rawExec("ALTER TABLE uploads DROP COLUMN content_type");
-      this.finishUpgrade(SCHEMA_VERSION, start, day);
+      this.finishUpgrade(11, start, day);
     });
-    console.warn(JSON.stringify({ event: "storage_schema_upgraded", from: 10, to: SCHEMA_VERSION }));
+    console.warn(JSON.stringify({ event: "storage_schema_upgraded", from: 10, to: 11 }));
+  }
+
+  /**
+   * Upgrades a schema 11 object to schema 12 in place, once, in one
+   * transaction, for links (extension `ext:remote`): adds the empty
+   * `message_state.remote_key` column and its partial index, which no row
+   * is in yet, and the empty `remote_left` table. Adding a column rewrites
+   * no row. Charged like upgradeFromSchema8 (finishUpgrade).
+   */
+  private upgradeFromSchema11(): void {
+    const start = { reads: this.observed.reads, writes: this.observed.writes };
+    const effective = Number(this.metaValue(META_EFFECTIVE_NOW));
+    const day = dayFor(Math.max(Number.isSafeInteger(effective) ? effective : 0, this.clock.now()));
+    this.transaction(() => {
+      this.rawExec("ALTER TABLE message_state ADD COLUMN remote_key TEXT");
+      this.rawExec("CREATE INDEX IF NOT EXISTS message_state_remote_idx ON message_state (remote_key) WHERE remote_key IS NOT NULL");
+      this.rawExec("CREATE TABLE IF NOT EXISTS remote_left (user_id TEXT NOT NULL, room_id TEXT NOT NULL, PRIMARY KEY (user_id, room_id)) WITHOUT ROWID");
+      this.finishUpgrade(12, start, day);
+    });
+    console.warn(JSON.stringify({ event: "storage_schema_upgraded", from: 11, to: 12 }));
   }
 
   /**
@@ -3851,7 +3900,7 @@ export class Store {
       }
       this.writeMeta(META_RENAMED_PREFIX + from, to);
       const avatar = liveAvatar(found.identity, now);
-      const ext = parseUserExt(found.identity.ext_json);
+      const ext = this.userExt(to, found.identity.ext_json);
       return { name: found.identity.name, ...(avatar ? { avatar } : {}), ...(ext ? { ext } : {}), rooms: this.userRooms(to), roles: parseRoles(found.identity.roles_json) };
     }));
   }
@@ -3979,7 +4028,7 @@ export class Store {
         ...ids, ...ids,
       );
       this.rawExec(`UPDATE rooms SET fields_json = json_remove(fields_json, '$.creator_id') WHERE json_extract(fields_json, '$.creator_id') IN (${marks})`, ...ids);
-      for (const table of ["memberships", "read_cursors", "credentials", "push_subscriptions", "push_wakes", "user_status", "room_mutes", "accepted_requests", "identities"]) {
+      for (const table of ["memberships", "read_cursors", "remote_left", "credentials", "push_subscriptions", "push_wakes", "user_status", "room_mutes", "accepted_requests", "identities"]) {
         this.rawExec(`DELETE FROM ${table} WHERE user_id IN (${marks})`, ...ids);
       }
       // Their limiter rows, by primary key, and the count the cap reads lowered by as many.
@@ -4111,7 +4160,7 @@ export class Store {
           list, list,
         );
         this.rawExec("UPDATE rooms SET fields_json = json_remove(fields_json, '$.creator_id') WHERE json_extract(fields_json, '$.creator_id') IN (SELECT value FROM json_each(?))", list);
-        for (const table of ["memberships", "read_cursors", "credentials", "push_subscriptions", "push_wakes", "user_status", "room_mutes", "accepted_requests", "identities"]) {
+        for (const table of ["memberships", "read_cursors", "remote_left", "credentials", "push_subscriptions", "push_wakes", "user_status", "room_mutes", "accepted_requests", "identities"]) {
           this.rawExec(`DELETE FROM ${table} WHERE user_id IN (SELECT value FROM json_each(?))`, list);
         }
         const limiterWhere = `scope IN (${USER_LIMIT_SCOPES.map(() => "?").join(", ")}) AND principal_key IN (SELECT value FROM json_each(?))`;
@@ -4237,7 +4286,7 @@ export class Store {
       const count = this.rawRows<{ count: number }>("SELECT COUNT(*) AS count FROM credentials WHERE user_id = ? LIMIT 1", userId)[0];
       const credentialCount = integerColumn(count?.count);
       const avatar = liveAvatar(row, this.clock.now());
-      const ext = parseUserExt(row.ext_json);
+      const ext = this.userExt(row.user_id, row.ext_json);
       const seen = seenColumn(row.seen_ms);
       return {
         userId: row.user_id,
@@ -4323,7 +4372,7 @@ export class Store {
       if (entry.rows.length) {
         members.set(roomId, entry.rows.map((row) => {
           const avatar = liveAvatar(row, now);
-          const ext = parseUserExt(row.ext_json);
+          const ext = this.userExt(row.user_id, row.ext_json);
           return {
             user_id: row.user_id, name: row.name ?? "", ...(avatar ? { avatar } : {}), roles: parseRoles(row.roles_json),
             ...(ext ? { ext } : {}),
@@ -4352,7 +4401,7 @@ export class Store {
       )[0];
       if (!row) return null;
       const avatar = liveAvatar(row, now);
-      const ext = parseUserExt(row.ext_json);
+      const ext = this.userExt(row.user_id, row.ext_json);
       return {
         user_id: row.user_id, name: row.name ?? "", ...(avatar ? { avatar } : {}), roles: parseRoles(row.roles_json),
         ...(ext ? { ext } : {}),
@@ -4602,7 +4651,11 @@ export class Store {
     }));
   }
 
-  reserveFrames(input: { ipKey: string; now: number; count?: number }): void {
+  /**
+   * Reserves `count` frames for a connection: its IP's minute limit, or with
+   * `link` the link's own (ext:remote), and the server's day.
+   */
+  reserveFrames(input: { ipKey: string; now: number; count?: number; link?: { id: string; perMinute: number } }): void {
     this.ensureReady();
     const count = Math.max(1, Math.floor(input.count ?? 1));
     if (count > this.config.framesPerIpMinute || count > this.config.processedFramesPerDay) {
@@ -4611,8 +4664,8 @@ export class Store {
     this.reserved({ reads: 16 + count * 4, writes: 16, frames: count }, false, input.now, () => {
       const effective = this.effectiveNow(input.now);
       this.transaction(() => {
-        const row = this.limitRow("frames", `ip:${input.ipKey}`, effective);
-        const charged = chargeBucket(bucketOf(row), effective, { perMinute: this.config.framesPerIpMinute }, count);
+        const row = this.limitRow("frames", input.link ? `link:${input.link.id}` : `ip:${input.ipKey}`, effective);
+        const charged = chargeBucket(bucketOf(row), effective, { perMinute: input.link?.perMinute ?? this.config.framesPerIpMinute }, count);
         if ("retryAfterMs" in charged) {
           throw new StoreError("retry_after", "Frame rate limit reached", { retryAfterMs: Math.max(1000, charged.retryAfterMs) });
         }
@@ -5067,7 +5120,7 @@ export class Store {
 
   private identityForMessage(input: StoreMutationInput): Identity {
     const name = typeof input.identity.name === "string" ? input.identity.name : undefined;
-    return recordedUser(input.identity.user_id, name, input.remote);
+    return recordedUser(input.identity.user_id, name, input.remote ?? this.linkRemote(input.identity.user_id));
   }
 
   /**
@@ -5333,6 +5386,55 @@ export class Store {
     this.remoteLinksCache = undefined;
   }
 
+  /** The link accounts, from memory, else one `_meta` read within the caller's reservation. */
+  private linksNow(): Record<string, RemoteLink> {
+    return this.remoteLinksCache ??= this.readRemoteLinks();
+  }
+
+  /** A link's own `remote` (ext:remote): `{server}` with no `user_id`; undefined for anyone else. */
+  private linkRemote(userId: string): RemoteOrigin | undefined {
+    if (isShadowUserId(userId)) return undefined;
+    const link = this.linksNow()[userId];
+    return link ? { server: link.server } : undefined;
+  }
+
+  /** The `remote` the server sets on a user (ext:remote): a shadow's stored one, or a link's server. */
+  private userRemote(userId: string, extJson: string | null | undefined): RemoteOrigin | undefined {
+    return isShadowUserId(userId) ? shadowRemote(userId, extJson) : this.linkRemote(userId);
+  }
+
+  /**
+   * A user's `ext` as others see it (parseUserExt), with `remote` the
+   * server's (ext:remote): a shadow's or link's, and none for anyone else,
+   * whatever was stored before the server owned it.
+   */
+  private userExt(userId: string, extJson: string | null | undefined): Record<string, unknown> | undefined {
+    const ext = withoutRemote(parseUserExt(extJson));
+    const remote = this.userRemote(userId, extJson);
+    return remote ? { ...ext, remote } : ext;
+  }
+
+  /** The message a link already wrote for a remote message (remoteMessageKey), or undefined: one indexed read. */
+  private remoteDuplicateRow(key: string): string | undefined {
+    return this.rawRows<{ message_id: string }>("SELECT message_id FROM message_state INDEXED BY message_state_remote_idx WHERE remote_key = ? LIMIT 1", key)[0]?.message_id;
+  }
+
+  /**
+   * A link's create of the remote message `remoteRoomId`/`remoteMessageId`
+   * (ext:remote) that it, as any of its shadows, already wrote: that
+   * message's `message_id`, tombstone included, or undefined.
+   */
+  remoteDuplicate(link: string, remoteRoomId: string, remoteMessageId: string, now = this.clock.now()): string | undefined {
+    this.ensureReady();
+    return this.reserved({ reads: 4 }, false, now, () => this.remoteDuplicateRow(remoteMessageKey(link, { room_id: remoteRoomId, message_id: remoteMessageId })!));
+  }
+
+  /** Whether a remote user left or was removed from a room (ext:remote: `remote_left`), so its link may not join it again. */
+  remoteUserLeft(userId: string, roomId: string, now = this.clock.now()): boolean {
+    this.ensureReady();
+    return this.reserved({ reads: 4 }, false, now, () => this.rawRows("SELECT 1 FROM remote_left WHERE user_id = ? AND room_id = ? LIMIT 1", userId, roomId).length > 0);
+  }
+
   /**
    * `/remote invite`: a link account (ext:remote) bound to `server`, the
    * first free `link_<n>`: a registered user with the role `bot` and no
@@ -5457,7 +5559,7 @@ export class Store {
           const context: CommitContext = { state, commitMs: Math.max(effective, state.last_commit_ms), touched: new Map() };
           for (const roomId of joined) {
             this.rawExec("INSERT OR IGNORE INTO memberships (room_id, user_id) VALUES (?, ?)", roomId, input.userId);
-            broadcasts.push(this.logMembership(context, roomId, recordedUser(input.userId, input.name), true));
+            broadcasts.push(this.logMembership(context, roomId, recordedUser(input.userId, input.name, this.userRemote(input.userId, input.ext ? JSON.stringify(input.ext) : "")), true));
           }
           this.finishCommit(context, startLogId);
         }
@@ -5546,10 +5648,16 @@ export class Store {
           this.rawExec("DELETE FROM memberships WHERE room_id = ? AND user_id = ?", input.roomId, input.userId);
           this.rawExec("DELETE FROM read_cursors WHERE user_id = ? AND room_id = ?", input.userId, input.roomId);
         }
+        // A remote user who leaves or is removed is not joined again by its link's
+        // writes (ext:remote); someone who adds it back lifts that.
+        if (isShadowUserId(input.userId)) {
+          if (input.join) this.rawExec("DELETE FROM remote_left WHERE user_id = ? AND room_id = ?", input.userId, input.roomId);
+          else this.rawExec("INSERT OR IGNORE INTO remote_left (user_id, room_id) VALUES (?, ?)", input.userId, input.roomId);
+        }
         const state = this.logState();
         const startLogId = state.last_log_id;
         const context: CommitContext = { state, commitMs: Math.max(effective, state.last_commit_ms), touched: new Map() };
-        const membership = this.logMembership(context, input.roomId, recordedUser(input.userId, identity.name, shadowRemote(input.userId, identity.ext_json)), input.join);
+        const membership = this.logMembership(context, input.roomId, recordedUser(input.userId, identity.name, this.userRemote(input.userId, identity.ext_json)), input.join);
         this.finishCommit(context, startLogId);
         const updated = { ...room, latest_log_id: Math.max(room.latest_log_id, context.state.last_log_id) };
         const record = this.roomRecord(updated, state.history_floor);
@@ -5728,6 +5836,12 @@ export class Store {
     // A moderator's move changes no content, so it keeps the edited_by of the text it moves.
     // `ext.remote` is the server's (ext:remote): set for a link's shadow, else kept.
     const write = editor ? undefined : this.messageExtWrite(params.ext, input.remote, previous);
+    // A link's create of a remote message it already wrote is a duplicate (ext:remote): nothing is logged.
+    const remoteKey = !previous && input.link !== undefined && isPlainObject(write?.remote) ? remoteMessageKey(input.link, write.remote) : undefined;
+    if (remoteKey !== undefined) {
+      const existing = this.remoteDuplicateRow(remoteKey);
+      if (existing) return { result: { message_id: existing }, broadcasts: [] };
+    }
     const merged = deleted ? undefined : mergeExt(previous?.ext, write);
     const ext = moving ? merged : withEditedBy(merged, editor ? input.userId : undefined);
     const from = previous ? previous.from : this.identityForMessage(input);
@@ -5774,12 +5888,12 @@ export class Store {
     // A move belongs to the source and destination logs (§4.3.1).
     this.appendRecord(context, moved ? [current.room_id, roomId] : [roomId], "message", logId, json);
     this.rawExec(
-      `INSERT INTO message_state (message_id, room_id, latest_log_id, author_id)
-       VALUES (?, ?, ?, ?)
+      `INSERT INTO message_state (message_id, room_id, latest_log_id, author_id, remote_key)
+       VALUES (?, ?, ?, ?, ?)
        ON CONFLICT (message_id) DO UPDATE SET
          room_id = excluded.room_id,
          latest_log_id = excluded.latest_log_id`,
-      messageId, roomId, logId, from.user_id,
+      messageId, roomId, logId, from.user_id, remoteKey ?? null,
     );
     const broadcasts: Broadcast[] = [{
       method: "message", params: clone(snapshot) as unknown as Record<string, unknown>, rooms: moved ? [current.room_id, roomId] : [roomId],
@@ -7835,7 +7949,7 @@ export class Store {
     if (!existing) throw new StoreError("denied", "Only registered users may change their profile");
     const bot = existing.tier === "bot" || parseRoles(existing.roles_json).includes("bot");
     if (typeof name === "string" && bot && !BOT_NAME_PATTERN.test(name)) throw new StoreError("denied", BOT_NAME_RULE);
-    const before = parseUserExt(existing.ext_json);
+    const before = this.userExt(input.userId, existing.ext_json);
     const ext = mergeExt(before, write);
     if (!userExtFits(ext)) throw new StoreError("too_large", `ext is at most ${MAX_USER_EXT_BYTES} bytes`);
     const changed = changedExt(before, ext);

@@ -2,7 +2,7 @@ import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
 import { BOOTSTRAP_ROW_RESERVATION } from '../src/budget';
 import { MAX_CARRIED_PASSKEYS, SCHEMA_VERSION, Store, UPGRADABLE_SCHEMA_VERSION, defaultStoreConfig } from '../src/store';
-import { toSchema10, toSchema9 } from './helpers/schema9';
+import { toSchema10, toSchema11, toSchema9 } from './helpers/schema9';
 import { messagesOf, pushSubscriptionsOf } from './helpers/store';
 
 type Runtime = { store: Store };
@@ -284,7 +284,7 @@ it('upgrades a schema 9 store to the current schema in place: every row kept, re
 		expect(sql.exec("SELECT name FROM sqlite_master WHERE name LIKE 'sqlite_autoindex_%' OR name LIKE '%_v9' OR name = 'records_retention_idx'").toArray()).toEqual([]);
 		// The indexes schema 9 had are rebuilt on the new tables, the partial one of `joined` registrations among them.
 		expect(sql.exec<{ tbl_name: string }>("SELECT tbl_name FROM sqlite_master WHERE name = 'push_subscriptions_joined_idx'").one().tbl_name).toBe('push_subscriptions');
-		expect(sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('message_state') ORDER BY cid").toArray().map((row) => row.name)).toEqual(['message_id', 'room_id', 'latest_log_id', 'author_id']);
+		expect(sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('message_state') ORDER BY cid").toArray().map((row) => row.name)).toEqual(['message_id', 'room_id', 'latest_log_id', 'author_id', 'remote_key']);
 		expect(sql.exec<{ count: number }>('SELECT COUNT(*) AS count FROM read_cursors').one().count).toBe(0);
 		// The rebuild read and wrote every row once, and none of it is charged: the wake's own few are.
 		expect(writesReserved(sql) - before.writes).toBeLessThanOrEqual(4);
@@ -385,6 +385,39 @@ it('upgrades a schema 10 store to 11 in place: the unread indexes and column go,
 		expect(sql.exec<{ message_id: string }>('SELECT message_id FROM message_state').toArray().map((row) => row.message_id)).toEqual([before.messageId]);
 		expect(sql.exec<{ message_id: string }>('SELECT message_id FROM reaction_state').toArray().map((row) => row.message_id)).toEqual([before.messageId]);
 		// A few rows, charged like the upgrades before it.
+		expect(writesReserved(sql) - before.writes).toBeGreaterThan(0);
+		expect(writesReserved(sql) - before.writes).toBeLessThan(64);
+	});
+});
+
+it('upgrades a schema 11 store to 12 in place: links\' remote key and remote_left are added, empty, and the rest stays', async () => {
+	const stub = env.DEMO.getByName(`schema-upgrade-11-${crypto.randomUUID()}`);
+	const now = Date.now();
+	const before = await runInDurableObject(stub, async (instance, state) => {
+		const { store } = instance as unknown as Runtime;
+		const sql = state.storage.sql;
+		store.registerIdentity({
+			userId: 'kept_user', name: 'Kept', userHandle: 'handle-kept_user', now, ipKey: 'ip-kept_user',
+			credential: { credentialId: 'cred-kept_user', userId: 'kept_user', publicKey: 'AAAA', counter: 0 },
+		});
+		const posted = store.mutate({
+			userId: 'kept_user', ipKey: 'ip-kept_user', requestId: 'kept', method: 'message', now,
+			identity: { user_id: 'kept_user' }, params: { room_id: 'general', body: { text: 'kept' } },
+		});
+		toSchema11(sql);
+		return { messageId: String(posted.result.message_id), writes: writesReserved(sql) };
+	});
+
+	await evictDurableObject(stub);
+	await runInDurableObject(stub, async (instance, state) => {
+		const { store } = instance as unknown as Runtime;
+		const sql = state.storage.sql;
+		expect(store.requiresReset()).toBe(false);
+		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'schema_version'").one().value).toBe(String(SCHEMA_VERSION));
+		expect(SCHEMA_VERSION).toBe(12);
+		expect(sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('message_state')").toArray().map((row) => row.name)).toContain('remote_key');
+		expect(sql.exec("SELECT name FROM sqlite_master WHERE name IN ('message_state_remote_idx', 'remote_left')").toArray()).toHaveLength(2);
+		expect(sql.exec('SELECT message_id, remote_key FROM message_state').toArray()).toEqual([{ message_id: before.messageId, remote_key: null }]);
 		expect(writesReserved(sql) - before.writes).toBeGreaterThan(0);
 		expect(writesReserved(sql) - before.writes).toBeLessThan(64);
 	});

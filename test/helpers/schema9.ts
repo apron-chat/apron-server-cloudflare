@@ -215,10 +215,23 @@ export function toSchema9(sql: SqlStorage): void {
 }
 
 /**
+ * Turns a fresh store's tables back into schema 11's: without schema 12's
+ * `message_state.remote_key` and its index, and `remote_left`.
+ */
+export function toSchema11(sql: SqlStorage): void {
+	sql.exec("DROP INDEX IF EXISTS message_state_remote_idx");
+	sql.exec("ALTER TABLE message_state DROP COLUMN remote_key");
+	sql.exec("DROP TABLE IF EXISTS remote_left");
+	sql.exec("UPDATE _meta SET value = '11' WHERE key = 'schema_version'");
+	sql.exec("UPDATE maintenance SET schema_version = 11 WHERE id = 1");
+}
+
+/**
  * Turns a fresh store's tables back into schema 10's: the indexes schema 11
  * dropped, and the uploads' `content_type`, empty.
  */
 export function toSchema10(sql: SqlStorage): void {
+	toSchema11(sql);
 	sql.exec("CREATE INDEX message_state_latest_idx ON message_state (latest_log_id)");
 	sql.exec("CREATE INDEX reaction_state_log_idx ON reaction_state (log_id)");
 	sql.exec("CREATE INDEX push_subscriptions_user_idx ON push_subscriptions (user_id, updated_ms)");

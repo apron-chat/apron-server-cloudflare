@@ -951,6 +951,23 @@ function fitName(text: string, limits: { maxNameCodePoints: number; maxNameBytes
 }
 
 /**
+ * A link's frames a minute (extension `ext:remote`), in place of the IP's
+ * and the connection's limits: one connection carries every remote user's
+ * writes. The server-wide frame limits still hold.
+ */
+const LINK_FRAMES_PER_MINUTE = 600;
+
+/**
+ * Whether a connection is signed in as a link (extension `ext:remote`): its
+ * user's `ext.remote` names a server and no `user_id`, which the server sets
+ * on links alone (Store.userExt), and the connection read at sign-in.
+ */
+function isLinkConnection(attachment: ConnectionAttachment): boolean {
+	const remote = attachment.tier === "registered" ? attachment.ext?.remote : undefined;
+	return !!remote && typeof remote === "object" && typeof (remote as Record<string, unknown>).server === "string" && !Object.hasOwn(remote, "user_id");
+}
+
+/**
  * Who a link's act-as request (extension `ext:remote`) runs as: the shadow
  * user's identity, the link account's `user_id`, and the shadow's `remote`.
  */
@@ -2833,11 +2850,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		const now = nowMs();
 		attachment.frameTimes = attachment.frameTimes.filter(time => time > now - 60_000);
-		if (attachment.frameTimes.length >= this.config.limits.framesPerConnectionMinute) {
+		// A link's frames are limited by its own bucket instead (chargeFrame), and only its latest are kept.
+		const link = isLinkConnection(attachment);
+		if (!link && attachment.frameTimes.length >= this.config.limits.framesPerConnectionMinute) {
 			this.closePolicy(socket, attachment, 1008, "Frame rate limit reached");
 			return Promise.resolve();
 		}
 		attachment.frameTimes.push(now);
+		if (link) attachment.frameTimes = attachment.frameTimes.slice(-this.config.limits.framesPerConnectionMinute);
 		attachment.lastFrameAt = now;
 		const bytes = utf8Bytes(message);
 		if (attachment.pendingFrames >= this.config.limits.pendingFramesPerConnection || attachment.pendingBytes + bytes > this.config.limits.pendingBytesPerConnection) {
@@ -3457,7 +3477,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 				latest.frameLease = { day, remaining: lease - 1 };
 			} else {
 				const count = this.config.limits.frameLease;
-				const reserve = () => this.store.reserveFrames({ ipKey: attachment.ipKey, now, count });
+				// A link's frames go to its own bucket, at LINK_FRAMES_PER_MINUTE, in place of its IP's.
+				const link = isLinkConnection(latest) && latest.userId ? { id: latest.userId, perMinute: LINK_FRAMES_PER_MINUTE } : undefined;
+				const reserve = () => this.store.reserveFrames({ ipKey: attachment.ipKey, now, count, link });
 				// An admin's frames are charged but never refused, so `/status`
 				// still answers on a day whose budgets or frames are spent.
 				if (latest.tier === "registered" && latest.roles?.includes("admin")) this.store.alert(reserve);
@@ -5015,6 +5037,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const messageId = optionalString(request.params, "message_id");
 		if (messageId === undefined && request.params.body === undefined) throw { name: "invalid_params", message: "Missing body" } satisfies ProtocolError;
 		if (request.params.body !== undefined) objectParam(request.params, "body");
+		if (actor && messageId === undefined) {
+			// A create of a remote message the link already wrote is a duplicate (ext:remote):
+			// nothing is logged, and the result names the copy.
+			const remote = (request.params.ext as Record<string, unknown>).remote as Record<string, unknown>;
+			const existing = typeof remote.room_id === "string" && remote.room_id !== "" && typeof remote.message_id === "string" && remote.message_id !== ""
+				? this.store.remoteDuplicate(actor.link, remote.room_id, remote.message_id, nowMs()) : undefined;
+			if (existing !== undefined) {
+				this.reply(socket, request, { message_id: existing });
+				return;
+			}
+		}
 		// A shadow first joins the room it posts in, if its link is in it (ext:remote).
 		if (actor) await this.shadowJoins(socket, attachment, actor, optionalString(request.params, "room_id") ?? ROOM_ID);
 		await this.commitAndBroadcast(socket, attachment, request, "message", "posting", actor);
@@ -5075,7 +5108,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * Joins a link's shadow (ext:remote) to the room it writes in, with a
 	 * logged membership charged to the shadow at its link's limits, unless it
 	 * is in it already. Only into a room the link is in: one the link cannot
-	 * see is unknown (`invalid_params`), and any other is `denied`.
+	 * see is unknown (`invalid_params`), and any other is `denied`. A shadow
+	 * that left the room or was removed from it is not joined again
+	 * (`denied`), until someone adds it back.
 	 */
 	private async shadowJoins(socket: WebSocketConnection, attachment: ConnectionAttachment, actor: ActAs, roomId: string): Promise<void> {
 		const current = connectionAttachment(socket) ?? attachment;
@@ -5083,6 +5118,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!(current.rooms ?? []).includes(roomId)) throw { name: "denied", message: "This link is not in that room, so its remote users may not write there" } satisfies ProtocolError;
 		const userId = actor.identity.user_id;
 		if (this.store.isRoomMember(roomId, userId, nowMs())) return;
+		if (this.store.remoteUserLeft(userId, roomId, nowMs())) throw { name: "denied", message: "This remote user left that room or was removed from it, so may not write there again" } satisfies ProtocolError;
 		await this.runMutation(async () => {
 			const change = this.store.changeMembership({ userId, ipKey: attachment.ipKey, roomId, join: true, now: nowMs(), actorId: actor.link, link: actor.link });
 			if (change.membership) this.broadcastRecord(change.membership);
@@ -9919,6 +9955,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!["parse_error", "invalid_request", "invalid_params", "too_large"].includes(error.name)) return;
 		const state = connectionAttachment(socket);
 		if (!state || state.closing) return;
+		// A link relays other servers' content, whose refusals are not its own misbehavior;
+		// only malformed frames count against it (ext:remote).
+		if ((error.name === "invalid_params" || error.name === "too_large") && isLinkConnection(state)) return;
 		state.policyViolations = [...state.policyViolations.filter(time => time > nowMs() - 60_000), nowMs()];
 		if (state.policyViolations.length >= this.config.limits.repeatedPolicyViolations) this.closePolicy(socket, state, 1008, "Repeated policy violations");
 		else writeAttachment(socket, state);
