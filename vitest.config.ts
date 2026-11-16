@@ -24,6 +24,7 @@ export default defineConfig({
 				email: { send_email: [{ name: "EMAIL" }] },
 				bindings: {
 					EMAIL_FROM: "login@demo.test",
+					EMAIL_SERVER: "wss://demo.test/",
 					GUEST_POSTING: "true",
 					// Off by default (src/config.ts); on here, to exercise the passkey page's signal.
 					SIGNAL_UNKNOWN_PASSKEYS: "true",

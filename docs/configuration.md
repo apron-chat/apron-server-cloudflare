@@ -676,7 +676,7 @@ Emails Cloudflare rejects for a suppressed recipient do not count. A send
 the limits refuse is `retry_after` and sends nothing.
 
 Email is off, and `email` absent from `server.auth` and `server.signup`,
-until the deployment sets both:
+until the deployment sets all three:
 
 1. **A sending domain.** In the Cloudflare dashboard, go to **Compute** >
    **Email Service** > **Email Sending** and onboard the domain (it must
@@ -695,19 +695,22 @@ until the deployment sets both:
    `login@apron.chat`, in `[vars]`. Mail comes from it, named with the
    server's title (`/server title`, else `SERVER_TITLE`, else `RP_NAME`).
 
-The links name the server as `EMAIL_SERVER` when set (a `wss:` or `ws:`
-address), else `wss://` and the host of `PUBLIC_ORIGIN`; one of the two is
-required. They open `https://link.apron.chat/`, the protocol's universal
-link (Appendix A.4), with the token, `state` and server in the fragment, so
-a link opens in whichever Apron client the user has, not one this server
+4. **The server's address.** Set `EMAIL_SERVER`, the `wss:` (or `ws:`)
+   address clients connect to, such as `wss://server.apron.chat/`, in
+   `[vars]`. Emails name it with the code, and links carry it. It is
+   required, never derived: clients drop a link whose `server` is not
+   exactly the address they connected to.
+
+Links open `https://link.apron.chat/`, the protocol's universal link
+(Appendix A.4), with the token, `state` and server in the fragment, so a
+link opens in whichever Apron client the user has, not one this server
 picks; the code works in any client, links or not. `EMAIL_LINK_URL`
 replaces that page, for a deployment with a link page of its own. A
-malformed `EMAIL_FROM`,
-`EMAIL_LINK_URL` or `EMAIL_SERVER` fails the configuration check; either
-of `EMAIL_FROM` and the binding alone leaves email off. Removing either
-turns it off; stored addresses stay, unused, until it is back, and email
-sessions issued on an origin outside `RP_ORIGINS` stop resuming meanwhile
-(those on a passkey origin still do).
+malformed `EMAIL_FROM`, `EMAIL_SERVER` or `EMAIL_LINK_URL`, or a missing
+`EMAIL_SERVER`, fails the configuration check; either of `EMAIL_FROM` and
+the binding alone leaves email off. Removing either turns it off; stored
+addresses stay, unused, until it is back, and sessions email signed in
+still resume, as bearer sessions.
 
 Locally, `wrangler dev` with the binding and `EMAIL_FROM` (in `.dev.vars`
 or `--var`) simulates the binding: it logs each message and saves its text
@@ -874,7 +877,7 @@ implementation and recalibrating its resource model.
 | `EMAIL_FROM` | Plain sender address on a domain onboarded to Email Sending, such as `login@apron.chat`; with the `EMAIL` `send_email` binding, turns email sign-in on for a plan that has it (see [Email sign-in](#email-sign-in)) |
 | `EMAIL_LINK_URL` | The page sign-in links open, an `https:` URL (`http:` only on a loopback host); unset, `https://link.apron.chat/`, the universal link that opens in any Apron client, which most deployments keep |
 | `EMAIL_<KEY>` | Replaces one value of the plan's email policy, such as `EMAIL_ADDRESSES_PER_USER` or `EMAIL_SENDS_PER_DAY`, within its ceilings (see [Email sign-in](#email-sign-in)) |
-| `EMAIL_SERVER` | The server's `wss:` or `ws:` address in sign-in links; unset, `wss://` and the host of `PUBLIC_ORIGIN` |
+| `EMAIL_SERVER` | Required with `EMAIL_FROM`: the `wss:` or `ws:` address clients connect to, which emails and sign-in links name |
 | `PUSH_DELAY_SECONDS` | Whole seconds, 0 to 60, a message's wake waits before it pushes; unset, the plan's `push.delaySeconds`; `0` pushes at once |
 | `ACCOUNT_ID` | The Cloudflare account whose analytics the account-usage stop and the budget guard read; a Wrangler var (see [Editing the deployment budget](#editing-the-deployment-budget)) |
 | `ACCOUNT_ANALYTICS_TOKEN` | Secret: a read-only account analytics token; with `ACCOUNT_ID`, turns the account-usage stop on |

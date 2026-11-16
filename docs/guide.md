@@ -224,11 +224,9 @@ universal link any client may handle (a deployment's `EMAIL_LINK_URL` may
 replace the page): use it only when its `state` is your client's own and
 its `server` is the server you asked (§4.11.2), presenting its token with
 `scheme: "email"` on any connection not signed in; ask the user first about
-any other link. On a guest's connection, the same proposal registers
-instead: its code or link token, presented on that guest connection only,
-turns the guest into a new account holding the address, keeping its rooms,
-as a passkey registration does; for an address that already has an
-account, the email tells the user to sign in instead. On a connection
+any other link. A guest's connection can't approve a sign-in, so a guest
+signs up or in by presenting the code (with `state`) or the link on a fresh
+connection. On a connection
 signed in to an account, the proposal adds the address to it (replacing
 the account's one address), and the approval answers with `you`.
 See [SPEC section 5, Email](../SPEC.md#email).

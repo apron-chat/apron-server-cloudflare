@@ -60,13 +60,6 @@ async function fresh(origin?: string | null, at?: string): Promise<Peer> {
 
 /** Proposes `email` on `peer` (§4.11.1) and returns the email it sent, with its code and any link token. */
 async function propose(peer: Peer, email: string, extra: Record<string, unknown> = {}): Promise<Mail & { code: string; link?: string; token?: string }> {
-	const mail = await proposeAny(peer, email, extra);
-	expect(mail.code).toMatch(/^[0-9]{6}$/);
-	return mail as Mail & { code: string };
-}
-
-/** Proposes `email` on `peer` and returns the email it sent, which may carry no code. */
-async function proposeAny(peer: Peer, email: string, extra: Record<string, unknown> = {}): Promise<Mail & { code?: string; link?: string; token?: string }> {
 	const before = outbox.length;
 	const reply = await request(peer, `propose-${crypto.randomUUID()}`, 'auth', { scheme: 'email', email, ...extra });
 	expect(reply.error).toBeUndefined();
@@ -74,10 +67,10 @@ async function proposeAny(peer: Peer, email: string, extra: Record<string, unkno
 	expect(outbox.length).toBe(before + 1);
 	const mail = outbox[outbox.length - 1];
 	expect(mail.to).toBe(email.trim().toLowerCase());
-	const code = /Your code for wss:\/\/demo\.test\/ is ([0-9]{6}),/.exec(mail.text)?.[1];
+	const code = /Your code for wss:\/\/demo\.test\/ is ([0-9]{6}),/.exec(mail.text)![1];
 	const link = /^(https:\/\/link\.apron\.chat\/#\S+)$/m.exec(mail.text)?.[1];
 	const token = link ? new URLSearchParams(link.split('#')[1]).get('token')! : undefined;
-	return { ...mail, ...(code ? { code } : {}), ...(link ? { link, token } : {}) };
+	return { ...mail, code, ...(link ? { link, token } : {}) };
 }
 
 async function approve(peer: Peer, token: string, scheme = 'email'): Promise<Frame> {
@@ -119,11 +112,6 @@ function pendingDeadlines(): Promise<number[]> {
 		.map((socket) => socket.deserializeAttachment() as { authDeadline: number; emailProposal?: string; tier: string })
 		.filter((attachment) => attachment.emailProposal && attachment.tier === 'pending')
 		.map((attachment) => attachment.authDeadline));
-}
-
-/** The rooms a registered user is stored in. */
-function storedRooms(userId: string): Promise<string[]> {
-	return runInDurableObject(stub(), (_instance, state) => [...state.storage.sql.exec('SELECT room_id FROM memberships WHERE user_id = ?', userId)].map((row) => String(row.room_id)));
 }
 
 /** Runs a command in `general` and returns the `~private` notices before its result. */
@@ -197,54 +185,36 @@ it('signs up and signs in by code and by link on connections not signed in, with
 	} finally { for (const peer of peers) peer.close(); }
 });
 
-it('registers a guest with email, keeping its rooms, and never moves a guest or account into another account', async () => {
+it('lets a guest sign up from a fresh connection, and never moves a guest or account into another account', async () => {
 	const email = address();
 	const peers: Peer[] = [];
 	const open = async () => { const peer = await fresh(); peers.push(peer); return peer; };
 	const asGuest = async () => {
 		const peer = await open();
-		const guestId: string = (await request(peer, 'guest', 'auth', { scheme: 'guest' })).result.you.user_id;
-		return { peer, guestId };
+		await request(peer, 'guest', 'auth', { scheme: 'guest' });
+		return peer;
 	};
 	try {
-		// A guest's proposal registers, and the guest becomes the account. Its
-		// link works only once handed back to the guest's own connection.
-		const { peer: guest, guestId } = await asGuest();
-		const thread = (await request(guest, 'thread', 'room_set', { parent_room_id: 'general', title: 'Guest thread' })).result.room_id;
+		// A guest is not an account here (§3.2): its proposal is a sign-in, which its own connection can't
+		// approve, while the code with the proposal's `state`, or the link, signs up on a fresh one (§4.11.2).
+		const guest = await asGuest();
 		const mail = await propose(guest, email, { name: 'Grace', state: 'guest-state-0123456789' });
 		expect(mail.text).toContain('create an account on Apron Demo');
-		expect(mail.link).toMatch(/&state=guest-state-0123456789$/);
-		expect((await approve(await open(), mail.token!)).error).toMatchObject({ code: -32001, message: 'Approve this registration on the guest connection that asked for it' });
-		const watcher = await asGuest();
-		const registered = await approve(guest, mail.token!);
-		const userId: string = registered.result.you.user_id;
+		expect((await approve(guest, mail.code)).error).toMatchObject({ code: -32001, message: "Sign in to an account on a new connection, not a guest's" });
+		const signedUp = await request(await open(), 'state', 'auth', { scheme: 'email', token: mail.code, state: 'guest-state-0123456789' });
+		const userId: string = signedUp.result.you.user_id;
 		expect(userId).toMatch(/^grace_/);
-		expect(registered.result.token).toBeTruthy();
-		expect(await storedRooms(userId)).toEqual(expect.arrayContaining(['general', thread]));
-		// Like a passkey registration, others learn the guest became the account (§3.3).
-		const renamed = await until(watcher.peer, (frame) => frame.method === 'user' && frame.params?.old?.user_id === guestId);
-		expect(renamed.frame.params.new.user_id).toBe(userId);
-
-		// A guest asking for an address that has an account gets no code: it would only switch accounts.
-		const other = await asGuest();
-		const exists = await proposeAny(other.peer, email);
-		expect(exists.subject).toBe('You already have an account on Apron Demo');
-		expect(exists.text).toContain(`already has one (${userId})`);
-		expect(exists.code).toBeUndefined();
+		expect(signedUp.result.token).toBeTruthy();
 
 		// A sign-in link moves neither a guest's connection nor a signed-in one into the account (§4.11.3, §5.2).
+		const other = await asGuest();
 		const signIn = await propose(await open(), email, { state: 'csrf-state-0123456789' });
-		expect((await approve(other.peer, signIn.token!, 'token')).error).toMatchObject({ code: -32001, message: "Sign in to an account on a new connection, not a guest's" });
+		expect((await approve(other, signIn.token!, 'token')).error).toMatchObject({ code: -32001, message: "Sign in to an account on a new connection, not a guest's" });
 		const busy = await signedIn(`busy_${crypto.randomUUID().slice(0, 6)}`);
 		peers.push(busy);
 		expect((await approve(busy, signIn.token!)).error).toMatchObject({ code: -32001, message: 'Identity switching requires reconnect' });
 		// Those failures counted, but the proposal stands for a connection not signed in.
 		expect((await approve(await open(), signIn.token!)).result.you.user_id).toBe(userId);
-		// A guest's registration works only on its own connection.
-		const { peer: third } = await asGuest();
-		const pending = await propose(third, address());
-		expect((await approve(await open(), pending.code)).error.code).toBe(-32001);
-		expect((await approve(third, pending.code)).result.you.user_id).not.toMatch(/^guest_/);
 	} finally { for (const peer of peers) peer.close(); }
 });
 

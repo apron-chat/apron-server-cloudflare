@@ -235,9 +235,9 @@ export interface EmailConfig {
 	 */
 	linkUrl: string;
 	/**
-	 * The server's address in those links (`EMAIL_SERVER`, else
-	 * `wss://` and PUBLIC_ORIGIN's host): built from configuration, never
-	 * from a request (§4.11.2).
+	 * The server's address that emails and links name (`EMAIL_SERVER`, as
+	 * clients connect to it): from configuration, never from a request
+	 * (§4.11.2).
 	 */
 	server: string;
 }
@@ -708,9 +708,9 @@ function loadUploads(env: EnvLike): UploadConfig | undefined {
 /**
  * Email sign-in settings, when the plan has an email policy and the
  * deployment sets both `EMAIL_FROM` and the `EMAIL` send_email binding;
- * either alone leaves email off. The links' server is `EMAIL_SERVER`, else
- * derived from `PUBLIC_ORIGIN`, one of which must be set; malformed values
- * fail the configuration check.
+ * either alone leaves email off. With them, `EMAIL_SERVER` is required:
+ * the address emails and links name. Malformed values fail the
+ * configuration check.
  */
 function loadEmail(env: EnvLike): EmailConfig | undefined {
 	const rawFrom = env.EMAIL_FROM?.trim() ?? "";
@@ -741,18 +741,15 @@ function loadEmail(env: EnvLike): EmailConfig | undefined {
 	} catch {
 		throw new ConfigError("EMAIL_LINK_URL must be an https: URL (http: only on a loopback host)");
 	}
-	let server = env.EMAIL_SERVER?.trim() ?? "";
-	if (server) {
-		let parsed: URL | undefined;
-		try { parsed = new URL(server); } catch { /* refused below */ }
-		if (!parsed || (parsed.protocol !== "wss:" && parsed.protocol !== "ws:") || parsed.username || parsed.password || parsed.hash) {
-			throw new ConfigError("EMAIL_SERVER must be the server's ws: or wss: address");
-		}
-	} else {
-		const publicOrigin = env.PUBLIC_ORIGIN?.trim() ?? "";
-		if (!publicOrigin) throw new ConfigError("EMAIL_FROM needs PUBLIC_ORIGIN or EMAIL_SERVER, the server address sign-in links name");
-		if (!validOrigin(publicOrigin)) throw new ConfigError("PUBLIC_ORIGIN must be an exact HTTP(S) origin");
-		server = `${publicOrigin.startsWith("http:") ? "ws:" : "wss:"}//${new URL(publicOrigin).host}/`;
+	// Stated, not derived: clients drop a link whose `server` isn't exactly the
+	// address they connected to (§4.11.2), so a guess that differs (a path, a
+	// port) would quietly break every link.
+	const server = env.EMAIL_SERVER?.trim() ?? "";
+	if (!server) throw new ConfigError("EMAIL_FROM needs EMAIL_SERVER, the ws: or wss: address clients connect to, which emails and links name");
+	let parsed: URL | undefined;
+	try { parsed = new URL(server); } catch { /* refused below */ }
+	if (!parsed || (parsed.protocol !== "wss:" && parsed.protocol !== "ws:") || parsed.username || parsed.password || parsed.hash) {
+		throw new ConfigError("EMAIL_SERVER must be the server's ws: or wss: address");
 	}
 	return { policy, from, linkUrl, server };
 }

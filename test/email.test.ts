@@ -39,10 +39,6 @@ describe('email sign-in building blocks (§4.11)', () => {
 		expect(signUp).toContain('The code expires in 10 minutes and works once.');
 		expect(signUp).not.toContain('link');
 		expect(emailMessage({ server: 'Demo', address: 'wss://chat.example/', code: '1', purpose: { kind: 'add', userId: 'ada_1' }, minutes: 10 }).text).toContain('add this address to ada_1 on Demo');
-		const exists = emailMessage({ server: 'Demo', address: 'wss://chat.example/', purpose: { kind: 'exists', userId: 'ada_1' }, minutes: 10 });
-		expect(exists.subject).toBe('You already have an account on Demo');
-		expect(exists.text).toContain('already has one (ada_1)');
-		expect(exists.text).not.toMatch(/[0-9]{6}/);
 		// A title cannot add header lines.
 		expect(emailMessage({ server: 'Evil\r\nBcc: x', address: 'wss://chat.example/', code: '1', purpose: { kind: 'sign-up' }, minutes: 1 }).subject).toBe('1 is your Evil Bcc: x code');
 	});
@@ -50,13 +46,13 @@ describe('email sign-in building blocks (§4.11)', () => {
 	it('is configured only with a sender and binding, from the plan with EMAIL_<KEY> overrides, and refuses malformed settings', () => {
 		const binding = { send: async () => ({ messageId: 'x' }) };
 		const config = (extra: Record<string, unknown>) => loadConfig({ NODE_ENV: 'test', ...extra } as Parameters<typeof loadConfig>[0]);
-		const on = { EMAIL: binding, EMAIL_FROM: 'Login@Example.com', PUBLIC_ORIGIN: 'https://chat.example' };
+		const on = { EMAIL: binding, EMAIL_FROM: 'Login@Example.com', EMAIL_SERVER: 'wss://chat.example/' };
 		expect(config({}).email).toBeUndefined();
 		expect(config({ EMAIL: binding }).email).toBeUndefined();
-		expect(config({ EMAIL_FROM: 'login@example.com', PUBLIC_ORIGIN: 'https://chat.example' }).email).toBeUndefined();
+		expect(config({ EMAIL_FROM: 'login@example.com', EMAIL_SERVER: 'wss://chat.example/' }).email).toBeUndefined();
 		expect(config(on).email).toEqual({ policy: EMAIL_POLICY, from: 'login@example.com', linkUrl: 'https://link.apron.chat/', server: 'wss://chat.example/' });
 		expect(config({ ...on, EMAIL_SERVER: 'wss://chat.example/ws', EMAIL_LINK_URL: 'https://web.example/#x' }).email).toMatchObject({ server: 'wss://chat.example/ws', linkUrl: 'https://web.example/' });
-		expect(config({ ...on, PUBLIC_ORIGIN: 'http://localhost:8787', EMAIL_LINK_URL: 'http://localhost:5173/' }).email).toMatchObject({ server: 'ws://localhost:8787/', linkUrl: 'http://localhost:5173/' });
+		expect(config({ ...on, EMAIL_SERVER: 'ws://localhost:8787/', EMAIL_LINK_URL: 'http://localhost:5173/' }).email).toMatchObject({ server: 'ws://localhost:8787/', linkUrl: 'http://localhost:5173/' });
 		expect(EMAIL_POLICY).toMatchObject({ addressesPerUser: 1, sendsPerDay: 190 });
 		expect(config({ ...on, EMAIL_ADDRESSES_PER_USER: '3', EMAIL_SENDS_PER_DAY: '50', EMAIL_PROPOSAL_SECONDS: '' }).email!.policy).toEqual({ ...EMAIL_POLICY, addressesPerUser: 3, sendsPerDay: 50 });
 		for (const extra of [
@@ -64,6 +60,7 @@ describe('email sign-in building blocks (§4.11)', () => {
 			{ EMAIL_SERVER: 'https://chat.example/' }, { EMAIL_ADDRESSES_PER_USER: '0' }, { EMAIL_ADDRESSES_PER_USER: '11' },
 			{ EMAIL_MAX_FAILURES: 'x' }, { EMAIL_PROPOSAL_SECONDS: '3600' }, { EMAIL_SENDS_PER_DAY: '2' },
 		]) expect(() => config({ ...on, ...extra }), JSON.stringify(extra)).toThrow(ConfigError);
-		expect(() => config({ EMAIL: binding, EMAIL_FROM: 'login@example.com' })).toThrow(/PUBLIC_ORIGIN or EMAIL_SERVER/);
+		// Stated, never derived, even with PUBLIC_ORIGIN: clients drop links for another address.
+		expect(() => config({ EMAIL: binding, EMAIL_FROM: 'login@example.com', PUBLIC_ORIGIN: 'https://chat.example' })).toThrow(/needs EMAIL_SERVER/);
 	});
 });

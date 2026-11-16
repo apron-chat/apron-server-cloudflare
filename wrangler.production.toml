@@ -75,13 +75,16 @@ VAPID_SUBJECT = "https://server.apron.chat"
 PUSH_HOSTS_EXTRA = "push.stupidtech.net"
 
 # Email sign-in (src/email.ts, docs/configuration.md#email-sign-in): off
-# until the sending domain is onboarded to Email Service and both of these
-# are uncommented. Links go to https://link.apron.chat/, which opens in any
-# Apron client, and the code works in any client too.
+# until the sending domain is onboarded to Email Service and these are
+# uncommented. EMAIL_SERVER is the address clients connect to, which emails
+# and links name: clients drop a link for another. Links go to
+# https://link.apron.chat/, which opens in any Apron client, and the code
+# works in any client too.
 # [[send_email]]
 # name = "EMAIL"
 # and under [vars]:
 # EMAIL_FROM = "login@apron.chat"
+# EMAIL_SERVER = "wss://server.apron.chat/"
 
 # Uploaded images (src/budget.ts). The bucket needs lifecycle rules deleting
 # f/ after 30 days and a/ after 61 or more (none for e/, custom emoji), a custom domain
