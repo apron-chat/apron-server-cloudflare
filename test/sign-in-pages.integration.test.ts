@@ -157,7 +157,8 @@ it('offers the passkey page in webauthn begin results, to every client on a host
 	// Where the host is not under the RP ID, nothing changes.
 	const elsewhere = await open({ ip: ip(), origin: null });
 	try {
-		expect((await greeting(web)).server.params.auth).toEqual(['webauthn', 'token', 'guest']);
+		// Email is on in the tests (vitest.config.ts).
+		expect((await greeting(web)).server.params.auth).toEqual(['webauthn', 'email', 'token', 'guest']);
 		const local = await begin(web, 'login');
 		expect(local.result).toMatchObject({ challenge_id: expect.any(String), public_key: { rpId: 'localhost', userVerification: 'required' } });
 		expect(local.result.external).toEqual({ url: `${ORIGIN}/passkey?action=login` });
@@ -165,8 +166,8 @@ it('offers the passkey page in webauthn begin results, to every client on a host
 		expect(named.result.external.url).toBe(`${ORIGIN}/passkey?action=register&name=Ada+Lovelace`);
 
 		const { server, welcome } = await greeting(app);
-		expect(server.params.auth).toEqual(['webauthn', 'token', 'guest']);
-		expect(server.params.signup).toEqual(['webauthn', 'token']);
+		expect(server.params.auth).toEqual(['webauthn', 'email', 'token', 'guest']);
+		expect(server.params.signup).toEqual(['webauthn', 'email', 'token']);
 		expect(server.params.welcome).toMatch(/Create a passkey/);
 		expect(welcome.params.body.text).toMatch(/^Welcome to Apron Chat/);
 		const remote = await begin(app, 'register');
@@ -175,7 +176,7 @@ it('offers the passkey page in webauthn begin results, to every client on a host
 		const finish = await request(app, 'f', 'auth', { scheme: 'webauthn', action: 'login', step: 'finish', challenge_id: 'x', credential: {} });
 		expect(finish.error.code).toBe(-32001);
 
-		expect((await greeting(elsewhere)).server.params.auth).toEqual(['token', 'guest']);
+		expect((await greeting(elsewhere)).server.params.auth).toEqual(['email', 'token', 'guest']);
 		expect((await begin(elsewhere, 'login')).error.code).toBe(-32601);
 	} finally { web.close(); app.close(); elsewhere.close(); }
 });
@@ -512,8 +513,8 @@ it('offers external with EXTERNAL_SIGN_IN: metadata, /oauth/authorize with a pas
 	const peer = await connect();
 	try {
 		const { server } = await greeting(peer);
-		expect(server.params.auth).toEqual(['webauthn', 'token', 'external', 'guest']);
-		expect(server.params.signup).toEqual(['webauthn', 'token', 'external']);
+		expect(server.params.auth).toEqual(['webauthn', 'email', 'token', 'external', 'guest']);
+		expect(server.params.signup).toEqual(['webauthn', 'email', 'token', 'external']);
 		// The metadata, the token endpoint and their CORS are `ext:oauth`'s.
 		expect(server.params.capabilities).toContain('ext:oauth');
 		expect((await request(peer, 'begin', 'auth', { scheme: 'external' })).result).toEqual({ external: { url: `${ORIGIN}/oauth/authorize` } });

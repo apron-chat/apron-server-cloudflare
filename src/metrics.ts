@@ -41,7 +41,9 @@ export type MetricEvent =
 	 * the size: at most one an hour per instance, from an alarm
 	 * (ApronDemoServer.maybeRecordDatabaseSize). Take its max, not its sum.
 	 */
-	| "db_bytes";
+	| "db_bytes"
+	/** A sign-in email sent (ApronDemoServer.handleEmailProposal): `sign-in`, `sign-up` or `add`. */
+	| "email";
 
 export function recordMetric(dataset: AnalyticsEngineDataset | undefined, event: MetricEvent, details: readonly string[] = [], value = 1): void {
 	if (!dataset) return;
