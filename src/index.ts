@@ -10,6 +10,7 @@ import { PRICED_LABEL, PRICES, usd } from "./pricing";
 import { EDGE_STOP_RULE_REF, readEdgeStop, runBudgetGuard, setAttackStop, watchForFlood } from "./budget-guard";
 import { attackHoldMs, BURN_POLICY, BurnMeter, burnSummary, type BurnKind } from "./burn";
 import { recordMetric } from "./metrics";
+import { StallMeter, type AwakeSnapshot } from "./stalls";
 import { RefusalMeter } from "./refusals";
 import { notifyTrigger, TIER_LABEL, type NoticeChannels, type ServerTier, type TriggerNotice } from "./notify";
 import { AUDIO_TYPES, sniffAudio } from "./audio";
@@ -1351,7 +1352,7 @@ function writeSessionAttachment(socket: WebSocketConnection, attachment: Connect
  * ones are ordinary rate limits that clients wait out.
  */
 const LONG_THROTTLE_SECONDS = 300;
-/** How often an alarm records the database's size (ApronDemoServer.maybeRecordDatabaseSize). */
+/** How often an instance checks the database's size against the storage alert, and records it from a full alarm (ApronDemoServer.checkDatabaseSize). */
 const DATABASE_SIZE_METRIC_MS = 60 * 60 * 1_000;
 /** The share of the database high-water mark past which the admins are told (maybeAlertStorage). */
 const STORAGE_ALERT_SHARE = 0.5;
@@ -2436,7 +2437,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private tierCheckedAt = 0;
 	/** When each connection or address was last told of each trip trigger (claimTrip); in memory only. */
 	private readonly trips = new Map<string, number>();
-	/** When the database's size was last recorded (maybeRecordDatabaseSize); in memory only. */
+	/** When this instance last checked the database's size, and last recorded it (checkDatabaseSize). */
+	private databaseSizeCheckedAt = -Infinity;
 	private databaseSizeRecordedAt = -Infinity;
 	/** Whether the storage alert stands (Store.storageAlerted), once read. */
 	private storageAlerted?: boolean;
@@ -2444,6 +2446,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private roomNotesAlerted?: boolean;
 	/** Refusals counted for the `refusal` metric (src/refusals.ts), written at most twice a minute per kind. */
 	private readonly refusals = new RefusalMeter((kind, reason, detail, count) => recordMetric(this.runtimeEnv.METRICS, "refusal", [kind, reason, detail], count));
+	/** Slow waits and long stays awake, for the `slow` and `awake` metrics (src/stalls.ts). */
+	private readonly stalls = new StallMeter((event, details, values) => recordMetric(this.runtimeEnv.METRICS, event, details, values), nowMs);
 	/** Shadow dollars spent by recent traffic, for the attack pause (src/burn.ts); in memory only. */
 	private readonly burn = new BurnMeter();
 	/** When the burn was last weighed (maybeCheckBurn), and when a heavy admitted burn was last told. */
@@ -2603,7 +2607,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.accountUsage = new AccountUsageMonitor({
 			env,
 			persist: (snapshot, now) => this.store.persistAccountUsageSnapshot(snapshot, now),
-			waitUntil: (promise) => ctx.waitUntil(promise),
+			waitUntil: (promise) => ctx.waitUntil(this.stalls.track("analytics", "", promise)),
 			onStop: () => {
 				for (const peer of this.ctx.getWebSockets()) {
 					const state = connectionAttachment(peer);
@@ -2635,10 +2639,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	async fetch(request: Request): Promise<Response> {
+		const start = nowMs();
+		this.stalls.event(() => this.awakeSnapshot(), start);
 		const response = await this.fetchRequest(request);
+		// A live text streams for minutes by design: its readers and writers
+		// are counted in flight (`live`) instead of timed.
+		const handler = refusedPath(request);
+		if (!handler.startsWith("live_")) this.stalls.note("handler", handler, nowMs() - start);
 		// Each one an entry Worker request and an object request, billed whatever it answers.
 		this.noteBurn("fetch", 1, response.status >= 400 ? 1 : 0);
-		if (response.status >= 400) this.refusals.note("http", `${response.status} ${REFUSAL_MESSAGES.get(response) ?? ""}`.trim(), refusedPath(request), nowMs());
+		if (response.status >= 400) this.refusals.note("http", `${response.status} ${REFUSAL_MESSAGES.get(response) ?? ""}`.trim(), handler, nowMs());
 		return response;
 	}
 
@@ -2784,6 +2794,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+		this.stalls.event(() => this.awakeSnapshot());
+		let work: Promise<void>;
+		try { work = this.socketMessage(ws, message); } catch (error) { work = Promise.reject(error); }
+		// From arrival to done, the wait behind the socket's earlier frames included.
+		return this.stalls.track("handler", "message", work);
+	}
+
+	private socketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
 		const socket = ws as WebSocketConnection;
 		this.noteBurn("message");
 		if (this.pausedUntil(nowMs())) {
@@ -2845,7 +2863,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return next;
 	}
 
-	async webSocketClose(ws: WebSocket, code = 1000): Promise<void> {
+	webSocketClose(ws: WebSocket, code = 1000): Promise<void> {
+		this.stalls.event(() => this.awakeSnapshot());
+		return this.stalls.track("handler", "close", this.socketClosed(ws, code));
+	}
+
+	private async socketClosed(ws: WebSocket, code: number): Promise<void> {
 		const socket = ws as WebSocketConnection;
 		this.sweepPresence();
 		const attachment = connectionAttachment(socket);
@@ -2858,7 +2881,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		await this.rescheduleAlarm();
 	}
 
-	async webSocketError(ws: WebSocket): Promise<void> {
+	webSocketError(ws: WebSocket): Promise<void> {
+		this.stalls.event(() => this.awakeSnapshot());
+		return this.stalls.track("handler", "error", this.socketFailed(ws));
+	}
+
+	private async socketFailed(ws: WebSocket): Promise<void> {
 		const socket = ws as WebSocketConnection;
 		this.sweepPresence();
 		const attachment = connectionAttachment(socket);
@@ -2872,17 +2900,29 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	async alarm(): Promise<void> {
+		const start = nowMs();
+		this.stalls.event(() => this.awakeSnapshot(), start);
 		this.inAlarm = true;
 		let done = false;
 		try {
 			await this.runAlarm();
 			done = true;
+			// How long its writes take to become durable: what every reply
+			// waits for before it leaves (the output gate), so a slow storage
+			// backend shows here even when the handlers themselves are quick.
+			await this.stalls.track("storage", "sync", Promise.resolve().then(() => this.ctx.storage.sync())).catch(() => undefined);
 		} finally {
 			this.inAlarm = false;
 			// A handler that threw before setting the next alarm still sets it,
 			// so a presence change asked for meanwhile is not left without one.
 			if (!done) await this.rescheduleAlarm();
+			this.stalls.note("handler", "alarm", nowMs() - start);
 		}
+	}
+
+	/** What an `awake` report counts besides the waits in flight (src/stalls.ts). */
+	private awakeSnapshot(): AwakeSnapshot {
+		return { sockets: this.ctx.getWebSockets().length, live: this.liveSessions.size, wakes: this.pendingWakes.size };
 	}
 
 	private async runAlarm(): Promise<void> {
@@ -2897,7 +2937,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// their own work, as they did before presence used the alarm.
 		const full = this.alarmWorkDue(now);
 		recordMetric(this.runtimeEnv.METRICS, "alarm", [full ? "full" : "light"]);
-		this.maybeRecordDatabaseSize(now);
+		this.checkDatabaseSize(now, full);
 		// Every alarm, light or full: what fell due on a connection needs only its attachment.
 		this.runConnectionDeadlines(now);
 		this.maybeEvaluateTier(now);
@@ -2905,7 +2945,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await this.rescheduleAlarm();
 			return;
 		}
-		await this.accountUsage.refresh(now, false);
+		await this.stalls.track("analytics", "", this.accountUsage.refresh(now, false));
 		if (now >= this.nextSessionSweepAt) {
 			try {
 				// A full batch may have left more behind; sweep again on the next alarm.
@@ -6918,18 +6958,29 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Records the database's size in the `db_bytes` metric at most once an
-	 * hour (DATABASE_SIZE_METRIC_MS), so its trend toward the storage
-	 * watermarks shows in npm run usage:report long before they refuse
-	 * anything. Reading the size is a property of the SQL handle: no query.
+	 * Checks the database's size against the storage alert at most once an
+	 * hour an instance (DATABASE_SIZE_METRIC_MS), and records it in the
+	 * `db_bytes` metric from a full alarm, at most as often, so its trend
+	 * toward the storage watermarks shows in npm run usage:report long before
+	 * they refuse anything. Only full alarms record it: a wake from
+	 * hibernation starts a new instance, so an hourly limit in memory alone
+	 * let nearly every light alarm record it, hundreds a day. Reading the
+	 * size is a property of the SQL handle: no query.
 	 */
-	private maybeRecordDatabaseSize(now: number): void {
-		if (now - this.databaseSizeRecordedAt < DATABASE_SIZE_METRIC_MS) return;
+	private checkDatabaseSize(now: number, full: boolean): void {
+		const check = now - this.databaseSizeCheckedAt >= DATABASE_SIZE_METRIC_MS;
+		const record = full && now - this.databaseSizeRecordedAt >= DATABASE_SIZE_METRIC_MS;
+		if (!check && !record) return;
 		const size = this.store.databaseSize();
 		if (size === null) return;
-		this.databaseSizeRecordedAt = now;
-		recordMetric(this.runtimeEnv.METRICS, "db_bytes", [], size);
-		this.maybeAlertStorage(size, now);
+		if (record) {
+			this.databaseSizeRecordedAt = now;
+			recordMetric(this.runtimeEnv.METRICS, "db_bytes", [], size);
+		}
+		if (check) {
+			this.databaseSizeCheckedAt = now;
+			this.maybeAlertStorage(size, now);
+		}
 	}
 
 	/**
@@ -7170,8 +7221,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		};
 		// Mentions, replies and private rooms are messages for this user, so
 		// `high`; one pushed only for `joined` is `normal` (§4.9).
-		const outcomes = await Promise.allSettled(subscriptions.map((subscription) =>
-			sendWebPush(subscription, payloadFor(subscription.pushId, subscription.unread), vapid, { ttlSeconds, urgency: subscription.reasons === WAKE_SCOPES.joined ? "normal" : "high", nowMs: nowMs() })));
+		const outcomes = await this.stalls.track("push", "", Promise.allSettled(subscriptions.map((subscription) =>
+			sendWebPush(subscription, payloadFor(subscription.pushId, subscription.unread), vapid, { ttlSeconds, urgency: subscription.reasons === WAKE_SCOPES.joined ? "normal" : "high", nowMs: nowMs() }))));
 		const gone: Array<{ userId: string; url: string; p256dh: string }> = [];
 		let failed = 0;
 		outcomes.forEach((outcome, index) => {
@@ -8133,7 +8184,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!media) return false;
 		if (draft.key) {
 			try {
-				await media.put(draft.key, draft.json, { httpMetadata: { contentType: "application/json", cacheControl: "public, max-age=31536000, immutable" } });
+				await this.stalls.track("r2", "put", media.put(draft.key, draft.json, { httpMetadata: { contentType: "application/json", cacheControl: "public, max-age=31536000, immutable" } }));
 			} catch {
 				return false;
 			}
@@ -9426,8 +9477,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const prior = this.mutationTail;
 		let release!: () => void;
 		this.mutationTail = new Promise<void>((resolve) => { release = resolve; });
-		await prior;
-		try { await fn(); }
+		// Time spent behind earlier changes, then this one's own (it awaits only R2 and signing).
+		await this.stalls.track("queue", "", prior);
+		try { await this.stalls.track("mutation", "", fn()); }
 		catch (error) {
 			if (!(error instanceof StoreError) || error.code === "internal_error") {
 				// A platform/accounting failure may make commit visibility uncertain.
@@ -9476,7 +9528,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const media = this.runtimeEnv.MEDIA;
 		if (!media || !keys.length) return;
 		for (let start = 0; start < keys.length; start += 1_000) {
-			this.ctx.waitUntil(media.delete(keys.slice(start, start + 1_000)).catch(() => undefined));
+			this.ctx.waitUntil(this.stalls.track("r2", "delete", media.delete(keys.slice(start, start + 1_000))).catch(() => undefined));
 		}
 	}
 
@@ -9491,7 +9543,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.ctx.waitUntil((async () => {
 			const key = this.store.avatarRefreshDue(userId, nowMs());
 			if (!key) return;
-			const object = await media.get(key);
+			const object = await this.stalls.track("r2", "get", media.get(key));
 			if (!object) {
 				const cleared = this.store.clearAvatar({ userId, now: nowMs() });
 				// This runs at sign-in: telling others of an invisible user's
@@ -9502,7 +9554,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (cleared.changed) this.announceAvatar(userId, "", !hidden);
 				return;
 			}
-			await media.put(key, await object.arrayBuffer(), { httpMetadata: object.httpMetadata });
+			await this.stalls.track("r2", "put", (async () => media.put(key, await object.arrayBuffer(), { httpMetadata: object.httpMetadata }))());
 			this.store.renewAvatar({ userId, key, now: nowMs() });
 		})().catch(() => undefined));
 	}

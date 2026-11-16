@@ -3,6 +3,8 @@ import { afterEach, expect, it, vi } from 'vitest';
 import type { Store } from '../src/store';
 import { connect, request } from './helpers/socket';
 import { DEFAULT_LIMITS } from '../src/budget';
+import { recordMetric } from '../src/metrics';
+import { StallMeter } from '../src/stalls';
 
 type Runtime = { store: Store };
 
@@ -114,11 +116,47 @@ it('counts alarms and accounting changes in METRICS, and logs why accounting clo
 		delete runtime.runtimeEnv.METRICS;
 		return writeDataPoint.mock.calls.map(([point]) => (point as { blobs: string[] }).blobs);
 	});
-	// The first alarm also records the database's size, once within the hour.
+	// Only the full alarm records the database's size.
 	// The accounting change carries what failed: the log line saying so may be sampled away.
-	expect(points).toEqual([['alarm', 'light'], ['db_bytes'], ['alarm', 'full'], ['accounting', 'uncertain', expect.stringContaining('injected budget reservation failure')], ['accounting', 'recovered']]);
+	expect(points).toEqual([['alarm', 'light'], ['alarm', 'full'], ['db_bytes'], ['accounting', 'uncertain', expect.stringContaining('injected budget reservation failure')], ['accounting', 'recovered']]);
 	const closed = error.mock.calls.map(([line]) => String(line)).filter((line) => line.includes('"accounting_closed"')).map((line) => JSON.parse(line));
 	expect(closed).toEqual([{ event: 'accounting_closed', kind: 'uncertain', message: expect.stringContaining('injected budget reservation failure') }]);
+});
+
+it('counts a slow alarm in METRICS with what it waited on, and an instance kept awake with what it had in flight', async () => {
+	const stub = env.DEMO.getByName('metrics-stalls');
+	const realNow = Date.now.bind(Date);
+	let offset = 0;
+	vi.spyOn(Date, 'now').mockImplementation(() => realNow() + offset);
+	try {
+		const points = await runInDurableObject(stub, async (instance, state) => {
+			type Stalled = Runtime & {
+				runtimeEnv: { METRICS?: { writeDataPoint(point: unknown): void } };
+				alarm(): Promise<void>;
+				accountUsage: { refresh(now: number, forced: boolean): Promise<void> };
+				stalls: StallMeter;
+			};
+			const runtime = instance as unknown as Stalled;
+			const writeDataPoint = vi.fn();
+			runtime.runtimeEnv.METRICS = { writeDataPoint };
+			// The usage reading takes 7 seconds of a full alarm.
+			state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1');
+			runtime.store.forgetCleanupDue();
+			vi.spyOn(runtime.accountUsage, 'refresh').mockImplementation(async () => { await Promise.resolve(); offset += 7_000; });
+			await runtime.alarm();
+			// An instance 16 minutes old reports itself awake at its next event.
+			runtime.stalls = new StallMeter((event, details, values) => recordMetric(runtime.runtimeEnv.METRICS, event, details, values), () => Date.now(), Date.now() - 16 * 60_000);
+			await runtime.alarm();
+			delete runtime.runtimeEnv.METRICS;
+			return writeDataPoint.mock.calls.map(([point]) => point as { blobs: string[]; doubles: number[] });
+		});
+		const slow = points.filter((point) => point.blobs[0] === 'slow');
+		expect(slow).toContainEqual({ indexes: ['slow'], blobs: ['slow', 'analytics', ''], doubles: [1, expect.any(Number), expect.any(Number)] });
+		expect(slow).toContainEqual({ indexes: ['slow'], blobs: ['slow', 'handler', 'alarm'], doubles: [1, expect.any(Number), expect.any(Number)] });
+		expect(slow.every((point) => point.doubles[1] >= 5_000)).toBe(true);
+		const awake = points.filter((point) => point.blobs[0] === 'awake');
+		expect(awake).toEqual([{ indexes: ['awake'], blobs: ['awake', expect.any(String)], doubles: [16, 1, 0] }]);
+	} finally { vi.restoreAllMocks(); }
 });
 
 it('runs the full alarm for a live text past its deadline, or open texts a lost instance left, and not otherwise', async () => {
@@ -167,9 +205,9 @@ it('runs the full alarm for an upload deadline stored before a wake, which the i
 
 it('tells the admins once when the database passes half its high-water mark, and again only after it falls under 40%', async () => {
 	type Sized = Runtime & {
-		maybeRecordDatabaseSize(now: number): void;
+		checkDatabaseSize(now: number, full: boolean): void;
 		notifyAdmins(text: string): Promise<void>;
-		databaseSizeRecordedAt: number;
+		databaseSizeCheckedAt: number;
 		storageAlerted?: boolean;
 	};
 	const told: string[] = [];
@@ -182,8 +220,8 @@ it('tells the admins once when the database passes half its high-water mark, and
 		// One hourly reading at `bytes`.
 		const reading = async (bytes: number) => {
 			size = bytes;
-			runtime.databaseSizeRecordedAt = -Infinity;
-			runtime.maybeRecordDatabaseSize(Date.now());
+			runtime.databaseSizeCheckedAt = -Infinity;
+			runtime.checkDatabaseSize(Date.now(), false);
 			await new Promise((resolve) => setTimeout(resolve, 10));
 		};
 		await reading(Math.floor(high * 0.3));
