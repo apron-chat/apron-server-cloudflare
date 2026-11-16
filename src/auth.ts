@@ -83,9 +83,9 @@ export class AuthError extends Error {
  * A login whose passkey no account here has (its lookup found none). It is
  * an AuthError, and answers as one everywhere; only the passkey page tells
  * it apart, so the device can drop the passkey (signalUnknownCredential).
- * Without a key the assertion is unsigned, so it is thrown only for one
- * addressed to this ceremony (assertionAddressed); `credentialId` is the
- * assertion's own.
+ * Without a key the assertion cannot be verified, so it is thrown only for
+ * one whose unsigned fields name this ceremony (assertionAddressed), which a
+ * forger can match; `credentialId` is the assertion's own.
  */
 export class UnknownCredentialError extends AuthError {
 	constructor(readonly credentialId: string) {
@@ -146,8 +146,9 @@ export function candidateUserIdFor(name: string | undefined, taken: (userId: str
 	return `u_${randomBase64Url(16)}`;
 }
 
-function base64UrlToBytes(value: string): Uint8Array<ArrayBuffer> {
-	if (!/^[A-Za-z0-9_-]{1,1024}$/.test(value)) throw new Error("credential id is malformed");
+/** Unpadded base64url of at most `maxLength` characters (a credential ID's 1024 by default), decoded. */
+function base64UrlToBytes(value: string, maxLength = 1024): Uint8Array<ArrayBuffer> {
+	if (value.length > maxLength || !/^[A-Za-z0-9_-]+$/.test(value)) throw new Error("base64url value is malformed");
 	const padded = value.replaceAll("-", "+").replaceAll("_", "/") + "=".repeat((4 - value.length % 4) % 4);
 	const binary = atob(padded);
 	const bytes = new Uint8Array(new ArrayBuffer(binary.length));
@@ -202,16 +203,19 @@ function reportsNonDiscoverableCredential(response: RegistrationResponseJSON | A
 }
 
 /**
- * Whether an assertion is addressed to `challenge`, as far as its unsigned
- * parts say: a `webauthn.get` for its challenge and origin, from an
- * authenticator for its RP ID. Anything unreadable is not.
+ * Whether an assertion's unsigned fields name this ceremony: client data of
+ * type `webauthn.get` with its challenge and origin, and authenticator data
+ * for its RP ID. Nothing here is verified, since a passkey no account has
+ * gives no key to check a signature with: it only keeps an honest assertion
+ * meant for another ceremony, origin or RP ID from being called unknown, and
+ * says nothing about one forged to match. Anything unreadable is not
+ * addressed. Fields are bounded by `maxLength`, the credential's own limit.
  */
-async function assertionAddressed(response: AuthenticationResponseJSON, challenge: ChallengeRecord): Promise<boolean> {
+async function assertionAddressed(response: AuthenticationResponseJSON, challenge: ChallengeRecord, maxLength: number): Promise<boolean> {
 	try {
-		const decode = (value: string) => Uint8Array.from(atob(value.replaceAll("-", "+").replaceAll("_", "/") + "=".repeat((4 - value.length % 4) % 4)), (char) => char.charCodeAt(0));
-		const data = JSON.parse(new TextDecoder().decode(decode(response.response.clientDataJSON))) as Record<string, unknown>;
+		const data = JSON.parse(new TextDecoder().decode(base64UrlToBytes(response.response.clientDataJSON, maxLength))) as Record<string, unknown>;
 		if (data.type !== "webauthn.get" || data.challenge !== challenge.challenge || data.origin !== challenge.origin) return false;
-		const authenticatorData = decode(response.response.authenticatorData);
+		const authenticatorData = base64UrlToBytes(response.response.authenticatorData, maxLength);
 		const rpIdHash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(challenge.rpId)));
 		return authenticatorData.length >= 37 && rpIdHash.every((byte, index) => authenticatorData[index] === byte);
 	} catch {
@@ -377,7 +381,7 @@ export class WebAuthnService {
 		}
 		const credentialId = normalizedCredentialId((response as AuthenticationResponseJSON).id);
 		const stored = await repository.getCredential(credentialId);
-		if (stored === null && await assertionAddressed(response as AuthenticationResponseJSON, challenge)) throw new UnknownCredentialError(credentialId);
+		if (stored === null && await assertionAddressed(response as AuthenticationResponseJSON, challenge, this.config.limits.maxCredentialBytes)) throw new UnknownCredentialError(credentialId);
 		if (!stored) throw new AuthError();
 		let verified: Awaited<ReturnType<typeof verifyAuthenticationResponse>>;
 		try {
