@@ -676,7 +676,7 @@ Emails Cloudflare rejects for a suppressed recipient do not count. A send
 the limits refuse is `retry_after` and sends nothing.
 
 Email is off, and `email` absent from `server.auth` and `server.signup`,
-until the deployment sets all three:
+until the deployment has all four:
 
 1. **A sending domain.** In the Cloudflare dashboard, go to **Compute** >
    **Email Service** > **Email Sending** and onboard the domain (it must
