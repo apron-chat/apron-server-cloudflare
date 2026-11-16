@@ -1,5 +1,5 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { fetchEntry } from '../src/index';
 import { connect as open, greeting, request, type Frame, type Peer } from './helpers/socket';
 import { softPasskey } from './helpers/webauthn';
@@ -133,6 +133,18 @@ async function expireCodes(): Promise<void> {
 		for (const prefix of ['signin-code:', 'signin-pending:']) {
 			const records = await state.storage.list<{ expiresMs: number }>({ prefix });
 			for (const [key, value] of records) await state.storage.put(key, { ...value, expiresMs: Date.now() - 1 });
+		}
+	});
+}
+
+/** Moves every stored code, and the new passkeys codes hold, back in time, until the newest code has just expired. */
+async function passCodeExpiry(): Promise<void> {
+	await runInDurableObject(stub(), async (_instance, state) => {
+		const codes = await state.storage.list<{ expiresMs: number }>({ prefix: 'signin-code:' });
+		const by = Math.max(...[...codes.values()].map((code) => code.expiresMs)) - Date.now() + 1_000;
+		for (const prefix of ['signin-code:', 'signin-pending:']) {
+			const records = await state.storage.list<{ expiresMs: number }>({ prefix });
+			for (const [key, value] of records) await state.storage.put(key, { ...value, expiresMs: value.expiresMs - by });
 		}
 	});
 }
@@ -399,20 +411,43 @@ it('tells the page of a passkey no account has, only when no code may still give
 	const orphan = await softPasskey(ORIGIN);
 	expect((await ceremony((await client()).url(`${ORIGIN}/passkey?action=register&name=Orphan`), orphan)).status).toBe(200);
 	expect(await login(orphan)).toMatchObject({ status: 400, body: generic });
-	// Once the code has expired, no account will have it.
+	// Just past its code's expiry, a redemption that took the code may still be writing it.
+	await passCodeExpiry();
+	expect(await login(orphan)).toMatchObject({ status: 400, body: generic });
+	// Once the grace has passed too, no account will have it.
 	await expireCodes();
 	expect(await login(orphan)).toMatchObject({ status: 400, body: unknown });
 	// Nor one this server never saw.
 	expect(await login(await softPasskey(ORIGIN))).toMatchObject({ status: 400, body: unknown });
 
-	// An assertion for another origin or RP ID, unsigned as it is without a key, is not classified.
+	// An assertion for another origin, RP ID or challenge, a registration's client data, or
+	// authenticator data that is only an RP ID hash, unsigned as it is without a key, is not classified.
 	expect(await login(await softPasskey('https://evil.example'))).toMatchObject({ status: 400, body: generic });
 	const elsewhere = await softPasskey(ORIGIN);
-	expect(await login({ ...elsewhere, assert: (options, counter, extra) => elsewhere.assert({ ...options, rpId: 'example.com' }, counter, extra) })).toMatchObject({ status: 400, body: generic });
+	const altered = (change: (options: { challenge: string; rpId: string }) => { challenge: string; rpId: string }, extra: Record<string, unknown> = {}): Passkey => ({
+		...elsewhere, assert: (options, counter, client) => elsewhere.assert(change(options), counter, { ...client, ...extra }),
+	});
+	expect(await login(altered((options) => ({ ...options, rpId: 'example.com' })))).toMatchObject({ status: 400, body: generic });
+	expect(await login(altered((options) => ({ ...options, challenge: b64(crypto.getRandomValues(new Uint8Array(32))) })))).toMatchObject({ status: 400, body: generic });
+	expect(await login(altered((options) => options, { type: 'webauthn.create' }))).toMatchObject({ status: 400, body: generic });
+	const rpIdHashOnly: Passkey = { ...elsewhere, assert: async (options, counter, client) => {
+		const assertion = await elsewhere.assert(options, counter, client);
+		const rpIdHash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(options.rpId)));
+		return { ...assertion, response: { ...assertion.response, authenticatorData: b64(rpIdHash) } };
+	} };
+	expect(await login(rpIdHashOnly)).toMatchObject({ status: 400, body: generic });
+	// The same passkey, unaltered, is unknown: each of those was the only difference.
+	expect(await login(elsewhere)).toMatchObject({ status: 400, body: unknown });
 
 	// A known passkey that fails verification: another key's signature under its credential ID.
 	const { peer, passkey } = await registerThroughPage('Known');
+	// A passkey an addition made, whose code was never redeemed, is pending as a new account's is.
+	const addition = await softPasskey(ORIGIN);
+	expect((await ceremony((await client()).url((await begin(peer, 'register')).result.external.url), addition)).status).toBe(200);
 	peer.close();
+	expect(await login(addition)).toMatchObject({ status: 400, body: generic });
+	await expireCodes();
+	expect(await login(addition)).toMatchObject({ status: 400, body: unknown });
 	const forger = await softPasskey(ORIGIN);
 	const forged = { ...forger, assert: async (options: any, counter?: number) => ({ ...await forger.assert(options, counter), id: passkey.id, rawId: passkey.id }) };
 	const knownFails = await login(forged as Passkey);
@@ -635,6 +670,49 @@ it('takes a public client\'s client_id at /oauth/token in the body or with HTTP 
 	await signsIn(response);
 });
 
+it('asks the device to drop the passkey it just used, only when the page says no account has it', async () => {
+	// The page's own script and configuration, run against the server with a stand-in browser.
+	const run = async (passkey: Passkey) => {
+		const html = await (await page((await client()).url(`${ORIGIN}/passkey?action=login`))).text();
+		const config = html.match(/<script type="application\/json" id="config">(.*?)<\/script>/s)![1];
+		const script = html.match(/<script nonce="[^"]*">(.*?)<\/script>/s)![1];
+		const status = { textContent: '' };
+		const clicks: (() => void)[] = [];
+		const button = { dataset: {}, disabled: false, addEventListener: (_type: string, listener: () => void) => clicks.push(listener) };
+		const document = {
+			getElementById: (id: string) => id === 'config' ? { textContent: config } : status,
+			querySelectorAll: (selector: string) => selector === '[data-cancel]' ? [] : [button],
+		};
+		const signals: unknown[] = [];
+		const PublicKeyCredential = {
+			parseRequestOptionsFromJSON: (json: unknown) => json,
+			signalUnknownCredential: async (options: unknown) => { signals.push(options); },
+		};
+		const navigator = { credentials: { get: async ({ publicKey }: { publicKey: { challenge: string; rpId: string } }) => {
+			const assertion = await passkey.assert(publicKey, nextCounter(passkey));
+			return { id: assertion.id, toJSON: () => assertion };
+		} } };
+		const begins: string[] = [];
+		const fetch = (path: string, init: { body: string }) => {
+			if (path === '/passkey/begin') begins.push(path);
+			return pagePost(path, JSON.parse(init.body));
+		};
+		new Function('window', 'document', 'navigator', 'PublicKeyCredential', 'fetch', 'location', script)(
+			{ PublicKeyCredential }, document, navigator, PublicKeyCredential, fetch, { assign: () => { throw new Error('left the page'); } },
+		);
+		clicks[0]();
+		await vi.waitFor(() => expect(status.textContent).not.toBe(''));
+		await vi.waitFor(() => expect(begins).toHaveLength(2));
+		return { status: status.textContent, signals };
+	};
+
+	// A passkey no account has: its own ID, for the page's RP ID.
+	const stranger = await softPasskey(ORIGIN);
+	expect(await run(stranger)).toEqual({ status: "This passkey isn't for an account here. Try another passkey, or cancel to go back.", signals: [{ rpId: 'localhost', credentialId: stranger.id }] });
+	// Any other error asks nothing.
+	expect(await run(await softPasskey('https://evil.example'))).toEqual({ status: "That passkey didn't work here. Try again, or use another passkey.", signals: [] });
+});
+
 it('sweeps expired codes, ceremonies and addition handles from their expiry index', async () => {
 	const app = await client();
 	// A ceremony begun and never finished, and a code never redeemed.
@@ -644,6 +722,7 @@ it('sweeps expired codes, ceremonies and addition handles from their expiry inde
 	const records = () => runInDurableObject(stub(), async (_instance, state) => [...(await state.storage.list({ prefix: 'signin-' })).keys()]);
 	expect((await records()).some((key) => key.startsWith('signin-code:'))).toBe(true);
 	expect((await records()).some((key) => key.startsWith('signin-ceremony:'))).toBe(true);
+	expect((await records()).some((key) => key.startsWith('signin-pending:'))).toBe(true);
 	// Past the longest lifetime (an addition handle's 10 minutes), every record and entry goes.
 	await runInDurableObject(stub(), async (instance) => {
 		const sweep = (instance as unknown as { sweepSignIn(now: number): Promise<boolean> }).sweepSignIn.bind(instance);
