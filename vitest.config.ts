@@ -21,6 +21,8 @@ export default defineConfig({
 				},
 				bindings: {
 					GUEST_POSTING: "true",
+					// Off in wrangler.toml for local development; on here, as in production.
+					SIGNAL_UNKNOWN_PASSKEYS: "true",
 					ACTIVITY: "false",
 					MEDIA_ORIGIN: "https://media.test",
 					// As if the media host's apron_media_nosniff rule were on: attachments may be text.
