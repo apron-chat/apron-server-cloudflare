@@ -136,17 +136,29 @@ export function pageOriginServes(origin: string, rpId: string): boolean {
 /**
  * The server's origin from the WebSocket address a connection reached
  * (protocol §4.12.1): `https://` and its host and port, or `http://` for a
- * plain `ws://` address, which only local development uses. Undefined for
- * anything else.
+ * `ws://` address on a loopback host, which only local development uses. A
+ * `ws://` address on any other host has an `https://` origin too, as
+ * clients work it out. Undefined for anything else.
  */
 export function originOfEndpoint(endpoint: string | undefined): string | undefined {
 	if (!endpoint) return undefined;
 	try {
 		const url = new URL(endpoint);
-		if (url.protocol === "wss:") return `https://${url.host}`;
-		if (url.protocol === "ws:") return `http://${url.host}`;
+		if (url.protocol === "ws:" && isLoopbackHost(url.hostname)) return `http://${url.host}`;
+		if (url.protocol === "wss:" || url.protocol === "ws:") return `https://${url.host}`;
 	} catch { /* not a URL */ }
 	return undefined;
+}
+
+/**
+ * Whether a host (as `URL.hostname` gives it) is a loopback host, for the
+ * server's origin: `localhost` and names under it, 127.0.0.0/8, and `[::1]`,
+ * as clients treat them. Wider than `redirectTarget`'s loopback, which a
+ * page may keep narrow.
+ */
+function isLoopbackHost(hostname: string): boolean {
+	const host = hostname.toLowerCase();
+	return host === "localhost" || host.endsWith(".localhost") || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host);
 }
 
 /** One value of a parameter that must appear at most once (RFC 6749 §3.1). */
