@@ -415,7 +415,9 @@ it('tells the page of a passkey no account has, only when no code may still give
 	peer.close();
 	const forger = await softPasskey(ORIGIN);
 	const forged = { ...forger, assert: async (options: any, counter?: number) => ({ ...await forger.assert(options, counter), id: passkey.id, rawId: passkey.id }) };
-	expect(await login(forged as Passkey)).toMatchObject({ status: 400, body: generic });
+	const knownFails = await login(forged as Passkey);
+	expect(knownFails.status).toBe(400);
+	expect(knownFails.body).toEqual(generic);
 	expect((await login(passkey)).body).toEqual({ redirect: expect.any(String) });
 
 	// A failed lookup, or a failed read of pending passkeys, is the usual error.
@@ -434,10 +436,13 @@ it('tells the page of a passkey no account has, only when no code may still give
 		server.pendingCredential = async () => { throw new Error('storage unavailable'); };
 		return () => { delete (server as Partial<Server>).pendingCredential; };
 	})).toMatchObject({ status: 503, body: { error: 'Something went wrong. Try again.' } });
-	expect(await broken((server) => {
+	// With the signal off, as by default (loadConfig), an unknown passkey's answer is exactly a
+	// known one's that fails: no message or flag tells a registered credential ID from another.
+	const off = await broken((server) => {
 		server.config = { ...server.config, signalUnknownPasskeys: false };
 		return () => { server.config = { ...server.config, signalUnknownPasskeys: true }; };
-	})).toMatchObject({ status: 400, body: generic });
+	});
+	expect({ status: off.status, body: off.body }).toEqual({ status: knownFails.status, body: knownFails.body });
 	expect(await login(stranger)).toMatchObject({ status: 400, body: unknown });
 });
 

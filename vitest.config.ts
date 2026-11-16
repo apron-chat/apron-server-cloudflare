@@ -21,7 +21,7 @@ export default defineConfig({
 				},
 				bindings: {
 					GUEST_POSTING: "true",
-					// Off in wrangler.toml for local development; on here, as in production.
+					// Off by default (src/config.ts); on here, to exercise the passkey page's signal.
 					SIGNAL_UNKNOWN_PASSKEYS: "true",
 					ACTIVITY: "false",
 					MEDIA_ORIGIN: "https://media.test",

@@ -474,9 +474,11 @@ differs from production in:
   [passkey page](policy.md#passkey-page) on the Preview's host, which warns
   that the host has not verified the app. `EXTERNAL_SIGN_IN` is on too, so
   Previews exercise the `external` scheme, which production leaves off.
-  `SIGNAL_UNKNOWN_PASSKEYS` is off: every Preview shares the RP ID with its
-  own storage, so one Preview must not ask the browser to drop another's
-  passkey.
+  `SIGNAL_UNKNOWN_PASSKEYS` is off, as everywhere by default (WebKit can
+  delete other accounts' passkeys with it; see
+  [configuration](configuration.md)), and set off explicitly: every Preview
+  shares the RP ID with its own storage, so one Preview must not ask the
+  browser to drop another's passkey.
 - **No uploads, live text or push.** `PUBLIC_ORIGIN` is one fixed origin,
   and each Preview has its own, so it is left empty, as are `MEDIA_ORIGIN`
   and the VAPID keys; no media bucket is bound (`wrangler preview` lists

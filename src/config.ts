@@ -38,10 +38,19 @@ export interface RuntimeConfig {
 	/**
 	 * Whether the passkey page tells the device to drop a passkey that no
 	 * account here has, and no unredeemed code is about to give one
-	 * (WebAuthn's signalUnknownCredential). Only for a server whose storage
-	 * holds every passkey of its RP ID: Previews share one RP ID, each with
-	 * its own storage, so turn it off there. `SIGNAL_UNKNOWN_PASSKEYS`,
-	 * default on.
+	 * (WebAuthn's signalUnknownCredential), saying the passkey isn't for an
+	 * account here. Off, such a login gets the page's usual error, the same
+	 * as a known passkey that fails: the distinct answer tells anyone who
+	 * posts a made-up assertion whether a credential ID is registered, which
+	 * is worth it only for the signal. Only for a server whose storage holds
+	 * every passkey of its RP ID: Previews share one RP ID, each with its
+	 * own storage, so it stays off there. `SIGNAL_UNKNOWN_PASSKEYS`, default
+	 * off.
+	 *
+	 * FIXME: keep off until Apple fixes https://bugs.webkit.org/show_bug.cgi?id=302624
+	 * and https://bugs.webkit.org/show_bug.cgi?id=322267 (signalUnknownCredential
+	 * can delete other accounts' passkeys on iOS/macOS 26). Check again on
+	 * 2027-02-16. Turn on only where this server is the sole user of its RP ID.
 	 */
 	signalUnknownPasskeys: boolean;
 	/**
@@ -555,7 +564,7 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 	const guestPosting = parseSwitch(env.GUEST_POSTING, "GUEST_POSTING", DEFAULT_FEATURES.guestPosting);
 	const presence = parseSwitch(env.PRESENCE, "PRESENCE", DEFAULT_FEATURES.presence);
 	const passkeyPage = parseSwitch(env.PASSKEY_PAGE, "PASSKEY_PAGE", true);
-	const signalUnknownPasskeys = parseSwitch(env.SIGNAL_UNKNOWN_PASSKEYS, "SIGNAL_UNKNOWN_PASSKEYS", true);
+	const signalUnknownPasskeys = parseSwitch(env.SIGNAL_UNKNOWN_PASSKEYS, "SIGNAL_UNKNOWN_PASSKEYS", false);
 	const externalSignIn = parseSwitch(env.EXTERNAL_SIGN_IN, "EXTERNAL_SIGN_IN", false);
 	if (externalSignIn && !passkeyPage) throw new ConfigError("EXTERNAL_SIGN_IN needs PASSKEY_PAGE, whose passkey ceremony its page runs");
 	const adminToken = env.APRON_ADMIN_TOKEN === undefined || env.APRON_ADMIN_TOKEN === "" ? undefined : String(env.APRON_ADMIN_TOKEN);

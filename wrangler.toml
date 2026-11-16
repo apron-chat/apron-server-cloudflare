@@ -29,8 +29,9 @@ bucket_name = "apron-media-dev"
 RP_ID = "localhost"
 RP_ORIGINS = "http://localhost:5173,http://localhost:8787"
 ALLOWED_ORIGINS = "http://localhost:5173,http://localhost:8787"
-# Every project on localhost shares that RP ID, so the passkey page must not
-# ask the browser to drop a passkey this server has never seen.
+# Off by default, and here above all: every project on localhost shares that
+# RP ID, so the passkey page must not ask the browser to drop a passkey this
+# server has never seen.
 SIGNAL_UNKNOWN_PASSKEYS = "false"
 # Room titles and descriptions (docs/configuration.md, Runtime overrides), in
 # serialized bytes: a room's limit; what every room may always hold; and the

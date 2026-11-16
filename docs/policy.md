@@ -399,15 +399,23 @@ on any connection.
   code works only on a connection signed in to the account that began it.
 - The token from a code is a bearer token (`apron_session_…`), not bound to
   an origin: it resumes with `scheme: "token"` from any client.
-- A sign-in with a passkey no account has, such as one made on the page whose
-  code was never redeemed, says "This passkey isn't for an account here." and
-  stays on the page; the page asks the browser to hide or remove that passkey
-  (WebAuthn's `signalUnknownCredential`, where the browser has it). A passkey
+- With `SIGNAL_UNKNOWN_PASSKEYS=true`, a sign-in with a passkey no account
+  has, such as one made on the page whose code was never redeemed, says "This
+  passkey isn't for an account here." and stays on the page; the page asks the
+  browser to hide or remove that passkey (WebAuthn's `signalUnknownCredential`,
+  where the browser has it) ([configuration](configuration.md)). A passkey
   whose code may still be redeemed (until a minute after its 5 minutes) is not
   unknown, and neither is anything the server is unsure of: a failed lookup,
   or an assertion not for this page's challenge, origin and RP ID. Those get
-  the usual error. `SIGNAL_UNKNOWN_PASSKEYS=false` turns the signal off
-  ([configuration](configuration.md)).
+  the usual error. Off, an unknown passkey gets the usual error too, the same
+  as a known passkey that fails, so the page tells no one which credential IDs
+  are registered here. The signal is off by default, and in production and
+  Previews: on iOS and macOS 26, `signalUnknownCredential` can delete other
+  accounts' passkeys
+  ([WebKit bug 302624](https://bugs.webkit.org/show_bug.cgi?id=302624),
+  [WebKit bug 322267](https://bugs.webkit.org/show_bug.cgi?id=322267)), so it
+  stays off until Apple fixes them (check again on 2027-02-16), and then only
+  where this server is the sole user of its RP ID.
 - `PASSKEY_PAGE=false` turns the page off ([configuration](configuration.md)).
 
 `EXTERNAL_SIGN_IN=true` also offers `external` (protocol §4.12 as revised on shazow/apron#115), for clients
