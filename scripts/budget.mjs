@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, DEFAULT_LIMITS, PLAN } from '../src/budget.ts';
 import { loadConfig } from '../src/config.ts';
+import { DATASET_PATTERN } from '../src/active-users.ts';
 
 const root = new URL('../', import.meta.url);
 const begin = '# BEGIN GENERATED ADMISSION BUDGET';
@@ -340,6 +341,8 @@ export function validateDeploymentConfiguration({ development, production: confi
 	// Production's own settings; the Previews' are checked apart (validatePreviews).
 	const { production, previews } = splitPreviews(config);
 	validatePreviews(production, previews);
+	validateMetricsDataset(production, 'production');
+	if (previews) validateMetricsDataset(previews, 'Previews');
 	const developmentName = configName(development, 'wrangler.toml');
 	const productionName = configName(production, 'wrangler.production.toml');
 	const productionTopLevel = topLevelConfig(production);
@@ -425,6 +428,23 @@ function validatePreviews(production, previews) {
 	for (const key of ['bucket_name', 'dataset']) {
 		if (names(previews, key).some((name) => names(production, key).includes(name))) throw new Error(`Previews must not share production's ${key}`);
 	}
+}
+
+/**
+ * Throws unless a config's `METRICS_DATASET` var, if it sets one, names the
+ * dataset its `METRICS` binding writes: /status reads active users back
+ * from that name (src/active-users.ts), which the binding does not give the
+ * Worker, so a mismatch would show another dataset's counts.
+ */
+function validateMetricsDataset(source, label) {
+	const named = wranglerVars(source).METRICS_DATASET;
+	if (named === undefined) return;
+	// What /status would refuse to put in its SQL, leaving the line out silently.
+	if (!DATASET_PATTERN.test(named)) throw new Error(`The ${label} METRICS_DATASET var (${named}) must be letters, digits and _`);
+	const bound = [...source.matchAll(/^\[\[analytics_engine_datasets\]\]\s*(?:#.*)?\n((?:[^\[\n].*\n?|\n)*)/gm)]
+		.map(([, table]) => ({ binding: table.match(/^binding\s*=\s*"([^"]+)"/m)?.[1], dataset: table.match(/^dataset\s*=\s*"([^"]+)"/m)?.[1] }))
+		.find((entry) => entry.binding === 'METRICS')?.dataset;
+	if (named !== bound) throw new Error(`The ${label} METRICS_DATASET var (${named}) must name the dataset its METRICS binding writes (${bound ?? 'none'})`);
 }
 
 /** The host of a Wrangler config's `MEDIA_ORIGIN` var, if it sets an https one. */

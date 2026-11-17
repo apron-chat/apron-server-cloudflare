@@ -278,7 +278,13 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   hour awake for 30 minutes or more; the counters from the dataset, each
   day's largest database size, the slow waits by kind, the latest long-awake
   instances, active users who read and who wrote by tier, each day and over
-  the last 7 and 30 days, and the refusals by kind, reason and method.
+  the last 7 and 30 days, and the refusals by kind, reason and method. An
+  admin's `/status` also shows active users (read / wrote) today, over the
+  last 7 days and over the last 30, and the day counting began while that is
+  within the 30, read back with four small queries through the
+  Analytics Engine SQL API (`ACCOUNT_ID`, `ACCOUNT_ANALYTICS_TOKEN`, whose
+  Account Analytics Read covers it, and `METRICS_DATASET`), or why they are
+  unavailable.
 
 Set it up once per deployment:
 
@@ -827,7 +833,8 @@ implementation and recalibrating its resource model.
 | `OG_MEDIA_HOSTS_EXTRA` | Hosts added to `OG_MEDIA_HOSTS` (or its defaults), written the same way; unset, none |
 | `PUSH_DELAY_SECONDS` | Whole seconds, 0 to 60, a message's wake waits before it pushes; unset, the plan's `push.delaySeconds`; `0` pushes at once |
 | `ACCOUNT_ID` | The Cloudflare account whose analytics the account-usage stop and the budget guard read; a Wrangler var (see [Editing the deployment budget](#editing-the-deployment-budget)) |
-| `ACCOUNT_ANALYTICS_TOKEN` | Secret: a read-only account analytics token; with `ACCOUNT_ID`, turns the account-usage stop on |
+| `ACCOUNT_ANALYTICS_TOKEN` | Secret: a read-only account analytics token; with `ACCOUNT_ID`, turns the account-usage stop on, and with `METRICS_DATASET` too, `/status`'s active users |
+| `METRICS_DATASET` | The Analytics Engine dataset the `METRICS` binding writes, for `/status` to read active users back (the binding does not tell the Worker its name; `npm run budget:check` holds the two equal); unset, `/status` leaves active users out |
 | `ZONE_ID` | The zone holding `apron_budget_stop`; a Wrangler var (see [Budget guard](#budget-guard)) |
 | `EDGE_STOP_TOKEN` | Secret: an API token with Zone WAF edit permission on `ZONE_ID`, which the budget guard and the flood trip use |
 | `ADMISSION_OFF` | `true` or `false`: operator admission switch; `true` rejects new sockets in the entry Worker with 503 before the limiter or DO call; existing sockets remain subject to DO budgets |

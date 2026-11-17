@@ -15,6 +15,8 @@
 // most 7: GraphQL serves a week), --dataset NAME (default
 // apron_server_metrics). Days are UTC.
 
+import { DATASET_PATTERN } from "../src/active-users.ts";
+
 const args = process.argv.slice(2);
 const option = (name, fallback) => {
 	const index = args.indexOf(`--${name}`);
@@ -28,7 +30,7 @@ if (!account || !token) {
 }
 const days = Math.min(7, Math.max(1, Number(option("days", "2")) || 2));
 const dataset = option("dataset", "apron_server_metrics");
-if (!/^[A-Za-z0-9_]+$/.test(dataset)) {
+if (!DATASET_PATTERN.test(dataset)) {
 	console.error("--dataset must be letters, digits and _");
 	process.exit(1);
 }

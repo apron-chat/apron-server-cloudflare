@@ -363,6 +363,22 @@ test('a Wrangler config\'s Previews are read apart from production\'s settings',
 	assert.throws(() => splitPreviews('name = "w"\npreviews = { }\n'), /tables/);
 });
 
+test('METRICS_DATASET, where set, names the dataset its METRICS binding writes, in production and in Previews', () => {
+	const packageJson = { scripts: { deploy: 'npm run budget:check && wrangler deploy --config wrangler.production.toml' } };
+	const workflow = '      - run: npm run deploy\n';
+	const development = 'name = "apron-cloudflare-demo-dev"\n';
+	const route = 'name = "apron-cloudflare-demo"\nworkers_dev = false\npreview_urls = false\nroutes = [\n  { pattern = "server.apron.chat", custom_domain = true },\n  { pattern = "previews.apron.chat", custom_domain = true, previews_enabled = true, enabled = false }\n]\n';
+	const production = (named) => `[vars]\nMEDIA_ORIGIN = "https://media.apron.chat"\nPUBLIC_ORIGIN = "https://server.apron.chat"\n${named ? `METRICS_DATASET = "${named}"\n` : ''}[[r2_buckets]]\nbinding = "MEDIA"\nbucket_name = "apron-media"\n[[analytics_engine_datasets]]\nbinding = "METRICS"\ndataset = "apron_server_metrics"\n`;
+	const previews = (named) => `[previews.vars]\nMEDIA_ORIGIN = ""\nPUBLIC_ORIGIN = ""\n${named ? `METRICS_DATASET = "${named}"\n` : ''}[previews.durable_objects]\nbindings = [\n  { name = "DEMO", class_name = "ApronDemoServer" }\n]\n[[previews.analytics_engine_datasets]]\nbinding = "METRICS"\ndataset = "apron_server_metrics_preview"\n`;
+	const check = (config) => validateDeploymentConfiguration({ development, production: config, packageJson, workflow, uploads: true });
+	assert.doesNotThrow(() => check(route + production('apron_server_metrics') + previews('apron_server_metrics_preview')));
+	assert.doesNotThrow(() => check(route + production() + previews()));
+	assert.throws(() => check(route + production('apron_server_metrics_preview') + previews()), /production METRICS_DATASET/);
+	assert.throws(() => check(route + production('apron_server_metrics') + previews('apron_server_metrics')), /Previews METRICS_DATASET/);
+	// A name /status would not put in its SQL, though it matches the binding.
+	assert.throws(() => check(route + production('apron-server-metrics').replace('dataset = "apron_server_metrics"', 'dataset = "apron-server-metrics"') + previews()), /letters, digits and _/);
+});
+
 test('Previews need their own domain and DEMO binding, and share no bucket, dataset or origin with production', () => {
 	const packageJson = { scripts: { deploy: 'npm run budget:check && wrangler deploy --config wrangler.production.toml' } };
 	const workflow = '      - run: npm run deploy\n';
