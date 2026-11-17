@@ -427,16 +427,19 @@ it('adds a passkey through the page only to the account whose connection began i
 			return returned(done.body.redirect!, app);
 		};
 		const finish = (target: Peer, code: string) => request(target, `add-${crypto.randomUUID()}`, 'auth', { scheme: 'webauthn', action: 'register', step: 'finish', ...app.redeem(code) });
-		// Another account's connection, and a connection that is not signed in, are denied.
-		expect((await finish(stranger, await add())).error.code).toBe(-32001);
+		// Another account's connection, and a connection that is not signed in, are denied,
+		// and the code is kept for the account's own connection.
+		const misplaced = await add();
+		expect((await finish(stranger, misplaced)).error.code).toBe(-32001);
 		const anonymous = await connect();
 		try {
 			await greeting(anonymous);
-			expect((await finish(anonymous, await add())).error.code).toBe(-32001);
+			expect((await finish(anonymous, misplaced)).error.code).toBe(-32001);
 		} finally { anonymous.close(); }
-		// The account's own connection adds it, and answers `you` only.
-		const added = await finish(owner, await add());
+		// The account's own connection adds it, and answers `you` only; then the code is used up.
+		const added = await finish(owner, misplaced);
 		expect(added.result).toEqual({ you: expect.objectContaining({ user_id: userId }) });
+		expect((await finish(owner, misplaced)).error.code).toBe(-32001);
 		const credentials = await runInDurableObject(stub(), (instance) => (instance as unknown as { store: { credentialIdsForUser(id: string): string[] } }).store.credentialIdsForUser(userId));
 		expect(credentials).toHaveLength(2);
 		expect(credentials).toContain(passkey.id);

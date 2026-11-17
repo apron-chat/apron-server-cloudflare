@@ -3832,14 +3832,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// A code from the passkey page finishes the exchange instead of a
 			// credential, on any connection (protocol §4.10.1).
 			if (!pageOrigin) throw { name: "denied", message: "Sign-in code is invalid or expired" } satisfies ProtocolError;
-			const code = await this.takeSignInCode(params, "passkey", pageOrigin);
-			if (code.action !== action) throw { name: "denied", message: "Sign-in code is invalid or expired" } satisfies ProtocolError;
 			// An addition's code works only on a connection of its account; any
 			// other registration starts an account, which a signed-in connection
-			// cannot switch to.
-			if (code.adds ? attachment.userId !== code.userId || !adding : adding) {
-				throw { name: "denied", message: code.adds ? "That passkey is for another account" : "Identity switching requires reconnect" } satisfies ProtocolError;
-			}
+			// cannot switch to. Such a code is refused before it is used up, so
+			// its passkey still reaches the connection that can take it; one for
+			// another action is used up, as any other mismatch is.
+			const code = await this.takeSignInCode(params, "passkey", pageOrigin, (record) => {
+				if (record.action === action && (record.adds ? attachment.userId !== record.userId || !adding : adding)) {
+					throw { name: "denied", message: record.adds ? "That passkey is for another account" : "Identity switching requires reconnect" } satisfies ProtocolError;
+				}
+			});
+			if (code.action !== action) throw { name: "denied", message: "Sign-in code is invalid or expired" } satisfies ProtocolError;
 			this.holdDeliveries(socket);
 			const finished = await this.redeemPasskeyCode(code, signIn.repository, attachment.ipKey);
 			await this.completePasskeySignIn(socket, attachment, request, finished, signIn, { adds: code.adds === true, newAccount: code.action === "register" });
