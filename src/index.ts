@@ -2925,19 +2925,38 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * What an `awake` report counts besides the waits in flight
 	 * (src/stalls.ts): open sockets, and of them guests (`anonymous`) and
-	 * those not signed in yet (`pending`), so an influx of visitors tells
-	 * from a stall; live texts, and pushes waiting out their delay.
+	 * those not signed in yet (`pending`, and `overdue` past their sign-in
+	 * deadline), so an influx of visitors tells from a stall; sockets this
+	 * object closed that the runtime still lists (`closing`), with the
+	 * minutes since the oldest of them opened (`closing_min`): a client lost
+	 * during its upgrade leaves one that may never get a close event; live
+	 * texts, and pushes waiting out their delay.
 	 */
 	private awakeSnapshot(): AwakeSnapshot {
+		const now = nowMs();
 		const sockets = this.ctx.getWebSockets();
 		let anonymous = 0;
 		let pending = 0;
+		let overdue = 0;
+		let closing = 0;
+		let oldestClosing = now;
 		for (const socket of sockets) {
-			const tier = connectionAttachment(socket as WebSocketConnection)?.tier;
-			if (tier === "anonymous") anonymous += 1;
-			else if (tier === "pending") pending += 1;
+			const state = connectionAttachment(socket as WebSocketConnection);
+			if (!state) continue;
+			if (state.closing) {
+				closing += 1;
+				oldestClosing = Math.min(oldestClosing, state.openedAt ?? now);
+			} else if (state.tier === "anonymous") anonymous += 1;
+			else if (state.tier === "pending") {
+				pending += 1;
+				if (state.authDeadline <= now) overdue += 1;
+			}
 		}
-		return { sockets: sockets.length, anonymous, pending, live: this.liveSessions.size, wakes: this.pendingWakes.size };
+		return {
+			sockets: sockets.length, anonymous, pending, overdue, closing,
+			closing_min: closing ? Math.max(1, Math.round((now - oldestClosing) / 60_000)) : 0,
+			live: this.liveSessions.size, wakes: this.pendingWakes.size,
+		};
 	}
 
 	private async runAlarm(): Promise<void> {
@@ -3044,7 +3063,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!attachment) continue;
 			const due = new Set(connectionDeadlines(attachment).filter(([, at]) => at <= now).map(([kind]) => kind));
 			if (due.has("auth")) {
-				this.closePolicy(socket, attachment, 1008, AUTH_TIMEOUT_REASON);
+				// One that never sent a frame, not even an answered ping, may have
+				// lost its client during the upgrade: counted apart, as `silent`.
+				const silent = attachment.lastFrameAt === undefined && !this.ctx.getWebSocketAutoResponseTimestamp(socket);
+				this.closePolicy(socket, attachment, 1008, AUTH_TIMEOUT_REASON, silent ? "silent" : "");
 				continue;
 			}
 			if (due.has("challenge")) {
@@ -3379,14 +3401,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		try { this.store.noteThrottleTrip(trigger, now); } catch { /* the log and metric still hold it */ }
 	}
 
-	private closePolicy(socket: WebSocketConnection, attachment: ConnectionAttachment, code: number, reason: string): void {
+	private closePolicy(socket: WebSocketConnection, attachment: ConnectionAttachment, code: number, reason: string, detail = ""): void {
 		const closed = attachment.closing === true || connectionAttachment(socket)?.closing === true;
 		attachment.policyViolations = [...attachment.policyViolations.filter((at) => at > nowMs() - 60_000), nowMs()];
 		attachment.closing = true;
 		writeAttachment(socket, attachment);
 		try { socket.close(code, reason.slice(0, 120)); } catch { /* already closed */ }
 		if (!closed) {
-			this.refusals.note("close", `${code} ${reason}`, "", nowMs());
+			this.refusals.note("close", `${code} ${reason}`, detail, nowMs());
 			this.connectionGone(attachment);
 		}
 	}

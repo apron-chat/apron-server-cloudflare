@@ -33,6 +33,34 @@ it('closes a connection that never signed in at its next frame past the deadline
 	expect(await peer.closed).toEqual({ code: 1008, reason: 'Authentication timed out' });
 });
 
+it('tags a sign-in timeout as silent when the connection never sent a frame, and counts closed sockets still listed when awake', async () => {
+	const stub = env.DEMO.getByName(`deadline-silent-${crypto.randomUUID()}`);
+	const peer = await open(stub);
+	const writeDataPoint = vi.fn();
+	const snapshot = await runInDurableObject(stub, async (instance, state) => {
+		const runtime = instance as unknown as Runtime & {
+			runtimeEnv: { METRICS?: unknown };
+			refusals: { flush(now: number): void };
+			awakeSnapshot(): Record<string, number>;
+		};
+		runtime.runtimeEnv.METRICS = { writeDataPoint };
+		const socket = state.getWebSockets()[0];
+		const attachment = socket.deserializeAttachment();
+		// A socket this object closed and the runtime still lists counts as closing, not pending.
+		socket.serializeAttachment({ ...attachment, closing: true });
+		const closing = runtime.awakeSnapshot();
+		socket.serializeAttachment({ ...attachment, authDeadline: Date.now() - 1 });
+		const overdue = runtime.awakeSnapshot();
+		await runtime.runAlarm();
+		delete runtime.runtimeEnv.METRICS;
+		return { closing, overdue };
+	});
+	expect(snapshot.closing).toMatchObject({ sockets: 1, pending: 0, closing: 1, closing_min: 1 });
+	expect(snapshot.overdue).toMatchObject({ sockets: 1, pending: 1, overdue: 1, closing: 0, closing_min: 0 });
+	expect(writeDataPoint).toHaveBeenCalledWith({ indexes: ['refusal'], blobs: ['refusal', 'close', '1008 Authentication timed out', 'silent'], doubles: [1] });
+	expect(await peer.closed).toEqual({ code: 1008, reason: 'Authentication timed out' });
+});
+
 it('schedules the alarm for read cursors a connection holds, and writes them on a light alarm', async () => {
 	const stub = env.DEMO.getByName(`deadline-reads-${crypto.randomUUID()}`);
 	const peer = await open(stub);

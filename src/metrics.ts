@@ -53,10 +53,12 @@ export type MetricEvent =
 	 */
 	| "slow"
 	/**
-	 * An instance stayed in memory 15 minutes or more without hibernating
-	 * (src/stalls.ts), at most once per 15: what it had in flight (`none`, or
-	 * `kind=count` pairs, with its guest (`anonymous`) and not yet signed in
-	 * (`pending`) sockets); valued by its age in minutes, with the events it
+	 * An instance stayed in memory 3 minutes or more without hibernating
+	 * (src/stalls.ts), then at most once per 15: what it had in flight
+	 * (`none`, or `kind=count` pairs, with its guest (`anonymous`), not yet
+	 * signed in (`pending`, `overdue` past the deadline) and closed but still
+	 * listed (`closing`, `closing_min` since the oldest opened) sockets);
+	 * valued by its age in minutes, with the events it
 	 * handled since its last report and its open sockets in `double2` and
 	 * `double3`.
 	 */

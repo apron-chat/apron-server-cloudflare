@@ -3,10 +3,14 @@
  * `awake` metrics (src/metrics.ts).
  *
  * On a normal day the object hibernates seconds after each event. Some days
- * it stayed awake for hours instead (on 2026-11-14 for eight), with alarms
- * running for minutes on a few milliseconds of CPU and upgrades cancelled at
- * 30 seconds. The sampled logs could not say what it was waiting on. This
- * meter can, at almost no cost:
+ * it stayed in memory for hours instead (on 2026-11-14 for eight). Each
+ * episode began about 30 seconds after a client aborted its WebSocket
+ * upgrade, when the sign-in timeout closed the socket it left; that a socket
+ * accepted for a client already gone then holds the object is a hypothesis,
+ * not yet reproduced. A Durable Object event's wall time runs until the next
+ * event while something holds the object, so the sampled logs showed
+ * minutes-long alarms that were really idle gaps. This meter tells a real
+ * wait from such a hold, at almost no cost:
  *
  * - `slow`: anything that took `slowMs` or longer. Time in the Workers
  *   runtime is the time of the last I/O, so a long duration is mostly a
@@ -17,10 +21,10 @@
  *   awaits: R2 (`r2`), pushes (`push`), the account usage reading
  *   (`analytics`), and the storage flush after an alarm (`storage`). Fast
  *   handlers with slow platform totals mean the platform waited, not us.
- * - `awake`: an instance alive for `awakeMs` without hibernating (a wake
+ * - `awake`: an instance alive `firstAwakeMs` without hibernating (a wake
  *   from hibernation builds a new one, so an instance's age is how long the
  *   object has been in memory; the runtime may keep an idle one that could
- *   hibernate, unbilled, a little longer), told at most once per `awakeMs`,
+ *   hibernate, unbilled, a little longer), told then and once per `awakeMs`,
  *   with how many events it handled since the last report and what was in
  *   flight, the handlers and RPC calls still running among them: busy
  *   traffic shows many events, a stall shows few events and something
@@ -46,6 +50,8 @@ export interface StallWriter {
 export interface StallOptions {
 	slowMs: number;
 	windowMs: number;
+	/** The first report, from the instance's start; then one every awakeMs. */
+	firstAwakeMs: number;
 	awakeMs: number;
 }
 
@@ -54,8 +60,10 @@ export const STALL_DEFAULTS: Readonly<StallOptions> = Object.freeze({
 	// or the usage reading is cut off at 10 or 5 seconds.
 	slowMs: 5_000,
 	windowMs: 60_000,
-	// Longer than any normal burst of traffic keeps the object up, short
-	// enough to catch an episode while it lasts: at most 4 points an hour.
+	// An instance normally hibernates seconds after its last event: three
+	// minutes up already says something holds it, and catches short episodes
+	// (one held 6.5 minutes). Then every 15, at most 4 points an hour.
+	firstAwakeMs: 3 * 60_000,
 	awakeMs: 15 * 60_000,
 });
 
@@ -73,6 +81,7 @@ export class StallMeter {
 	private readonly inFlight = new Map<string, number>();
 	private events = 0;
 	private awakeReportedAt: number;
+	private awakeReported = false;
 
 	constructor(
 		private readonly write: StallWriter,
@@ -121,14 +130,16 @@ export class StallMeter {
 
 	/**
 	 * Counts an event the object handles, and reports the instance as
-	 * `awake` once it has lived `awakeMs` since it started or last reported.
+	 * `awake` once it has lived `firstAwakeMs` since it started, then each
+	 * `awakeMs` after its last report.
 	 * `snapshot` is only called to report.
 	 */
 	event(snapshot: () => AwakeSnapshot, now = this.clock()): void {
 		this.flush(now);
 		this.events += 1;
-		if (now - this.awakeReportedAt < this.options.awakeMs) return;
+		if (now - this.awakeReportedAt < (this.awakeReported ? this.options.awakeMs : this.options.firstAwakeMs)) return;
 		this.awakeReportedAt = now;
+		this.awakeReported = true;
 		let state: AwakeSnapshot;
 		try { state = snapshot(); } catch { state = { sockets: -1 }; }
 		const { sockets, ...others } = state;

@@ -238,16 +238,20 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   operation, `push`, the account usage reading `analytics`, and the storage
   flush after each alarm `storage`; summed a minute at a time like refusals,
   so `double1` is a count, `double2` the worst and `double3` the total
-  milliseconds), an instance in memory 15 minutes or more without hibernating
-  (`awake`, at most four points an hour: what it had in flight and how many
-  of its sockets are guests or not signed in yet, its age in
+  milliseconds), an instance in memory 3 minutes or more without hibernating
+  (`awake`, then every 15 minutes, at most four points an hour: what it had
+  in flight, how many of its sockets are guests, not signed in yet or past
+  their sign-in deadline, and how many it closed that the runtime still
+  lists with the minutes since the oldest of those opened, its age in
   minutes, the events it handled since the last point and its open sockets;
   few events with something in flight is a stall, many is traffic), and
   refusals (`refusal`, `src/refusals.ts`): `error` for a JSON-RPC error (a
   `retry_after` by its message and `data.reason`, any other by its name
   alone, since those messages may name users) with the method when the
   server knows it, else `other`; `close` for a policy close, with its code
-  and reason; and `http` for a refusal the object answers before an upgrade,
+  and reason (a sign-in timeout on a connection that never sent a frame,
+  not even a ping, is `silent`: its client may have gone during the
+  upgrade); and `http` for a refusal the object answers before an upgrade,
   with its status and message and `upgrade`, `probe`, `live_write` or
   `live_read`. Refusals the entry Worker answers by itself (the attempt
   limits, a full or paused server it already knows of) are not counted. A

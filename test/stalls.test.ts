@@ -49,29 +49,29 @@ describe("StallMeter", () => {
 		expect(points).toEqual([["slow", ["r2", "get"], [1, 8_000, 8_000]]]);
 	});
 
-	it("reports an instance awake past 15 minutes, with what it had in flight, at most once per 15", async () => {
+	it("reports an instance awake 3 minutes after it started, then at most once per 15, with what it had in flight", async () => {
 		const { stalls, points, advance } = meter();
-		const snapshot = () => ({ sockets: 40, live: 0, wakes: 2 });
+		const snapshot = () => ({ sockets: 40, closing: 1, closing_min: 3, wakes: 2, live: 0 });
 		let release!: () => void;
 		const pending = stalls.track("queue", "", new Promise<void>((resolve) => { release = resolve; }));
 		stalls.event(snapshot);
-		advance(14 * 60_000);
+		advance(2 * 60_000);
 		stalls.event(snapshot);
 		expect(points).toEqual([]);
 		advance(60_000);
 		stalls.event(snapshot);
 		// Age in minutes, events since the last report, open sockets.
-		expect(points).toEqual([["awake", ["queue=1 wakes=2"], [15, 3, 40]]]);
+		expect(points).toEqual([["awake", ["closing=1 closing_min=3 queue=1 wakes=2"], [3, 3, 40]]]);
 		// Not again within 15 minutes; then again, counting only the events since.
 		advance(10 * 60_000);
 		stalls.event(snapshot);
 		release();
 		await pending;
-		// The queue wait took 25 minutes: that is written as slow too.
-		expect(points.at(-1)).toEqual(["slow", ["queue", ""], [1, 25 * 60_000, 25 * 60_000]]);
+		// The queue wait took 13 minutes: that is written as slow too.
+		expect(points.at(-1)).toEqual(["slow", ["queue", ""], [1, 13 * 60_000, 13 * 60_000]]);
 		advance(5 * 60_000);
 		stalls.event(() => ({ sockets: 3 }));
-		expect(points.at(-1)).toEqual(["awake", ["none"], [30, 2, 3]]);
+		expect(points.at(-1)).toEqual(["awake", ["none"], [18, 2, 3]]);
 	});
 
 	it("counts what is long by design in flight without timing it", async () => {

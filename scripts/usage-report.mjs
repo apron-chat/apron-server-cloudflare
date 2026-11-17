@@ -140,8 +140,8 @@ try {
 	console.log(`\nSlow waits in ${dataset}: unavailable (${error.message}).`);
 }
 
-// Instances that stayed in memory 15 minutes or more (src/stalls.ts), at
-// most four points an hour each: their age, the events they handled since
+// Instances that stayed in memory 3 minutes or more (src/stalls.ts), then
+// at most four points an hour each: their age, the events they handled since
 // the last report, open sockets, and what was in flight.
 try {
 	const rows = await analyticsSql(`SELECT timestamp, blob2 AS pending, double1 AS age, double2 AS events, double3 AS sockets
