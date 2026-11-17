@@ -95,7 +95,7 @@ console.table([...perDay].sort(([a], [b]) => a.localeCompare(b)).map(([date, day
 	invocations: Math.round(day.requests),
 	threw: day.threw,
 })));
-console.log("\nHours awake for 30 minutes or more (UTC)\n");
+console.log("\nHours awake for 30 minutes or more (UTC; every Durable Object in the account)\n");
 if (!awakeHours.length) console.log("(none)");
 else console.table(awakeHours);
 
@@ -130,12 +130,12 @@ try {
 // double3 the total milliseconds.
 try {
 	const rows = await analyticsSql(`SELECT toStartOfDay(timestamp) AS day, blob2 AS kind, blob3 AS detail,
-		SUM(_sample_interval * double1) AS count, MAX(double2) AS worst, SUM(_sample_interval * double3) AS total
+		SUM(_sample_interval * double1) AS slow_count, MAX(double2) AS worst, SUM(_sample_interval * double3) AS total
 		FROM ${dataset} WHERE timestamp >= toDateTime('${since}') AND blob1 = 'slow'
 		GROUP BY day, kind, detail ORDER BY day, total DESC FORMAT JSON`);
 	console.log(`\nSlow waits in ${dataset}, per UTC day (5 s or more: handlers, the change queue, R2, pushes, analytics, the storage flush)\n`);
 	if (!rows.length) console.log("(none)");
-	else console.table(rows.map((row) => ({ day: String(row.day).slice(0, 10), kind: row.kind, detail: row.detail, count: Number(row.count), "worst s": Math.round(Number(row.worst) / 1_000), "average s": Math.round(Number(row.total) / Number(row.count) / 1_000) })));
+	else console.table(rows.map((row) => ({ day: String(row.day).slice(0, 10), kind: row.kind, detail: row.detail, count: Number(row.slow_count), "worst s": Math.round(Number(row.worst) / 1_000), "average s": Math.round(Number(row.total) / Number(row.slow_count) / 1_000) })));
 } catch (error) {
 	console.log(`\nSlow waits in ${dataset}: unavailable (${error.message}).`);
 }

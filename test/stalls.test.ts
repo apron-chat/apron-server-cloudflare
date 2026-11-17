@@ -74,6 +74,18 @@ describe("StallMeter", () => {
 		expect(points.at(-1)).toEqual(["awake", ["none"], [30, 2, 3]]);
 	});
 
+	it("counts what is long by design in flight without timing it", async () => {
+		const { stalls, points, advance } = meter();
+		let finish!: () => void;
+		const stream = stalls.track("handler", "live_read", new Promise<void>((resolve) => { finish = resolve; }), false);
+		advance(15 * 60_000);
+		stalls.event(() => ({ sockets: 1 }));
+		expect(points).toEqual([["awake", ["handler:live_read=1"], [15, 1, 1]]]);
+		finish();
+		await stream;
+		expect(points).toHaveLength(1);
+	});
+
 	it("never throws, whatever the writer or the snapshot does", () => {
 		let now = 0;
 		const stalls = new StallMeter(() => { throw new Error("dataset down"); }, () => now);

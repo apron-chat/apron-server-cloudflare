@@ -39,9 +39,10 @@ export type MetricEvent =
 	| "refusal"
 	/**
 	 * The SQLite database's occupied bytes (Store.databaseSize), valued by
-	 * the size: from a full alarm (maintenance, a few to a few dozen a day),
-	 * at most once an hour per instance (ApronDemoServer.checkDatabaseSize).
-	 * Take its max, not its sum.
+	 * the size: from a full alarm (maintenance: about daily on a quiet Paid
+	 * server, so a day may have none; more with uploads, live text or
+	 * sweeps), at most once an hour per instance
+	 * (ApronDemoServer.checkDatabaseSize). Take its max, not its sum.
 	 */
 	| "db_bytes"
 	/**

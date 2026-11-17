@@ -230,8 +230,9 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   method refused; see Server tiers), admin alerts (`admins_notified`), the edge
   stop turning on or off (`edge_stop`: `guard` or `flood`, or `lifted`), the
   database's occupied bytes (`db_bytes`, valued by the size, from a full
-  alarm at most once an hour, so take the max, not the sum: its trend toward
-  the storage watermarks), anything that took 5 seconds or more (`slow`,
+  alarm at most once an hour, about daily on a quiet server, so a day may
+  have none; take the max, not the sum: its trend toward the storage
+  watermarks), anything that took 5 seconds or more (`slow`,
   `src/stalls.ts`: the object's own `handler` by event, the wait behind
   earlier changes `queue` and a change's own run `mutation`, `r2` by
   operation, `push`, the account usage reading `analytics`, and the storage
@@ -258,7 +259,7 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   value. Writing never awaits or throws, and without the binding nothing is
   written. Workers Paid includes 10 million data points a month; this server
   writes a few thousand a day, refusals at most 130 a minute, and slow waits
-  at most two a minute per kind even while every event is slow. `npm run usage:report -- --days 3` (with
+  at most two a minute per kind and detail even while every event is slow. `npm run usage:report -- --days 3` (with
   `CLOUDFLARE_ACCOUNT_ID` and a `CLOUDFLARE_API_TOKEN` that has Account
   Analytics Read) prints each UTC day's Durable Object awake time, billed
   duration, peak sockets and busiest hour from GraphQL analytics, and each

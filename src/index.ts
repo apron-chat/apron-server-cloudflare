@@ -2639,13 +2639,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	async fetch(request: Request): Promise<Response> {
-		const start = nowMs();
-		this.stalls.event(() => this.awakeSnapshot(), start);
-		const response = await this.fetchRequest(request);
+		this.stalls.event(() => this.awakeSnapshot());
 		// A live text streams for minutes by design: its readers and writers
-		// are counted in flight (`live`) instead of timed.
+		// are counted in flight, not timed.
 		const handler = refusedPath(request);
-		if (!handler.startsWith("live_")) this.stalls.note("handler", handler, nowMs() - start);
+		const response = await this.stalls.track("handler", handler, this.fetchRequest(request), !handler.startsWith("live_"));
 		// Each one an entry Worker request and an object request, billed whatever it answers.
 		this.noteBurn("fetch", 1, response.status >= 400 ? 1 : 0);
 		if (response.status >= 400) this.refusals.note("http", `${response.status} ${REFUSAL_MESSAGES.get(response) ?? ""}`.trim(), handler, nowMs());
@@ -2899,25 +2897,29 @@ export class ApronDemoServer extends DurableObject<Env> {
 		await this.rescheduleAlarm();
 	}
 
-	async alarm(): Promise<void> {
-		const start = nowMs();
-		this.stalls.event(() => this.awakeSnapshot(), start);
+	alarm(): Promise<void> {
+		this.stalls.event(() => this.awakeSnapshot());
+		return this.stalls.track("handler", "alarm", this.alarmRun());
+	}
+
+	private async alarmRun(): Promise<void> {
 		this.inAlarm = true;
 		let done = false;
 		try {
 			await this.runAlarm();
 			done = true;
-			// How long its writes take to become durable: what every reply
-			// waits for before it leaves (the output gate), so a slow storage
-			// backend shows here even when the handlers themselves are quick.
-			await this.stalls.track("storage", "sync", Promise.resolve().then(() => this.ctx.storage.sync())).catch(() => undefined);
 		} finally {
 			this.inAlarm = false;
 			// A handler that threw before setting the next alarm still sets it,
 			// so a presence change asked for meanwhile is not left without one.
 			if (!done) await this.rescheduleAlarm();
-			this.stalls.note("handler", "alarm", nowMs() - start);
 		}
+		// How long its writes take to become durable: what every reply waits
+		// for before it leaves (the output gate), so a slow storage backend
+		// shows here even when the handlers themselves are quick. Events are
+		// delivered during this wait, so it comes after inAlarm is cleared: a
+		// presence change meanwhile schedules its own alarm.
+		await this.stalls.track("storage", "sync", Promise.resolve().then(() => this.ctx.storage.sync()));
 	}
 
 	/**
@@ -7130,7 +7132,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * Burn samples from an entry Worker isolate (sampleEntry): requests it
 	 * answered without the object, scaled up, and how many it refused.
 	 */
-	async noteEntrySamples(seen: number, refused: number): Promise<void> {
+	noteEntrySamples(seen: number, refused: number): Promise<void> {
+		this.stalls.event(() => this.awakeSnapshot());
+		return this.stalls.track("handler", "rpc_samples", this.entrySamples(seen, refused));
+	}
+
+	private async entrySamples(seen: number, refused: number): Promise<void> {
 		const bounded = (value: number) => Number.isSafeInteger(value) && value >= 0 ? Math.min(value, 100_000_000) : 0;
 		const now = nowMs();
 		this.burn.note("rpc", now);
@@ -9606,6 +9613,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * this upload is waiting for one. Only one request may write it.
 	 */
 	async claimUpload(key: string): Promise<boolean | "closed"> {
+		this.stalls.event(() => this.awakeSnapshot());
 		return !!this.config.uploads && this.asUploadOwner(key, () => this.store.claimUpload(key, nowMs()));
 	}
 
@@ -9626,7 +9634,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * owner's. Returns whether the write was accepted; if not, the Worker
 	 * deletes what it stored.
 	 */
-	async finishUpload(write: UploadWrite): Promise<boolean> {
+	finishUpload(write: UploadWrite): Promise<boolean> {
+		this.stalls.event(() => this.awakeSnapshot());
+		return this.stalls.track("handler", "rpc_upload", this.uploadFinished(write));
+	}
+
+	private async uploadFinished(write: UploadWrite): Promise<boolean> {
 		if (!this.config.uploads) return false;
 		if (write.key.startsWith("e/")) return this.finishEmoji(write);
 		let finished: UploadFinish = { accepted: false, broadcasts: [], deletedUploads: [] };

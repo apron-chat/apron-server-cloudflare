@@ -9,8 +9,9 @@
  * meter can, at almost no cost:
  *
  * - `slow`: anything that took `slowMs` or longer. Time in the Workers
- *   runtime only moves across I/O, so a long duration is a long wait, never
- *   a long computation. It notes the object's own handlers (`handler`, by
+ *   runtime is the time of the last I/O, so a long duration is mostly a
+ *   long wait (with any computation before its last I/O, its own or other
+ *   events'), never computation alone. It notes the object's own handlers (`handler`, by
  *   event), the wait for earlier changes (`queue`) and a change's own run
  *   (`mutation`, which awaits only R2 and signing), and the I/O each
  *   awaits: R2 (`r2`), pushes (`push`), the account usage reading
@@ -18,10 +19,14 @@
  *   handlers with slow platform totals mean the platform waited, not us.
  * - `awake`: an instance alive for `awakeMs` without hibernating (a wake
  *   from hibernation builds a new one, so an instance's age is how long the
- *   object has been in memory, billed), told at most once per `awakeMs`,
+ *   object has been in memory; the runtime may keep an idle one that could
+ *   hibernate, unbilled, a little longer), told at most once per `awakeMs`,
  *   with how many events it handled since the last report and what was in
- *   flight: busy traffic shows many events, a stall shows few events and
- *   something pending.
+ *   flight, the handlers and RPC calls still running among them: busy
+ *   traffic shows many events, a stall shows few events and something
+ *   pending. It is told from the next event, so an instance stuck with no
+ *   new event at all reports nothing until one comes (an alarm, a message);
+ *   the `slow` point comes when the stuck work ends.
  *
  * A slow key's first in a minute is written at once, and its repeats are
  * summed into one point when the minute has passed (like src/refusals.ts),
@@ -99,8 +104,9 @@ export class StallMeter {
 	/**
 	 * Times a promise, counting it in flight until it settles. Returns a
 	 * promise that settles as it does; the timing never changes the outcome.
+	 * `timed` false only counts it in flight: for what is long by design.
 	 */
-	track<T>(kind: StallKind, detail: string, work: Promise<T>): Promise<T> {
+	track<T>(kind: StallKind, detail: string, work: Promise<T>, timed = true): Promise<T> {
 		const start = this.clock();
 		const key = detail ? `${kind}:${detail}` : kind;
 		this.inFlight.set(key, (this.inFlight.get(key) ?? 0) + 1);
@@ -108,7 +114,7 @@ export class StallMeter {
 			const left = (this.inFlight.get(key) ?? 1) - 1;
 			if (left > 0) this.inFlight.set(key, left);
 			else this.inFlight.delete(key);
-			this.note(kind, detail, this.clock() - start);
+			if (timed) this.note(kind, detail, this.clock() - start);
 		};
 		return work.then((value) => { settle(); return value; }, (error: unknown) => { settle(); throw error; });
 	}

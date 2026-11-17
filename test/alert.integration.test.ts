@@ -159,6 +159,19 @@ it('counts a slow alarm in METRICS with what it waited on, and an instance kept 
 	} finally { vi.restoreAllMocks(); }
 });
 
+it('waits for the storage flush after an alarm only once inAlarm is cleared, so a presence change meanwhile schedules its own alarm', async () => {
+	const stub = env.DEMO.getByName('metrics-sync');
+	await runInDurableObject(stub, async (instance, state) => {
+		const runtime = instance as unknown as Runtime & { alarm(): Promise<void>; inAlarm: boolean };
+		const during: boolean[] = [];
+		const sync = state.storage.sync.bind(state.storage);
+		vi.spyOn(state.storage, 'sync').mockImplementation(async () => { during.push(runtime.inAlarm); return sync(); });
+		await runtime.alarm();
+		expect(during).toEqual([false]);
+	});
+	vi.restoreAllMocks();
+});
+
 it('runs the full alarm for a live text past its deadline, or open texts a lost instance left, and not otherwise', async () => {
 	type LiveRuntime = Runtime & { alarm(): Promise<void>; deadlines: { live: { set(at: number | undefined): boolean } } };
 	await runInDurableObject(env.DEMO.getByName('live-deadline-alarm'), async (instance, state) => {
