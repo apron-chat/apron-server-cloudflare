@@ -1139,6 +1139,7 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			...presenceState(attachment),
 			...readState(attachment),
 			...(Number.isSafeInteger(attachment.openedAt) && (attachment.openedAt as number) > 0 ? { openedAt: attachment.openedAt } : {}),
+			...(Number.isSafeInteger(attachment.lastFrameAt) && (attachment.lastFrameAt as number) > 0 ? { lastFrameAt: attachment.lastFrameAt } : {}),
 			authDeadline: typeof attachment.authDeadline === "number" ? attachment.authDeadline : 0,
 			pendingFrames: typeof attachment.pendingFrames === "number" ? attachment.pendingFrames : 0,
 			pendingBytes: typeof attachment.pendingBytes === "number" ? attachment.pendingBytes : 0,
