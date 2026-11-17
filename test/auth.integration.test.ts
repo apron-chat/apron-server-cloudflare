@@ -114,6 +114,10 @@ it('verifies signed ceremonies against SQLite identities and rejects challenge, 
 		const crowded = await service.begin('register', 'https://chat.example.test', now, undefined, [], undefined, { name: 'Foo', userIdTaken: id => { tried.push(id); return true; } });
 		expect(tried).toHaveLength(8);
 		expect(crowded.challenge.userId).toMatch(/^u_/);
+		// Without a name, and no guest's to keep, a new account is a "Member" (not "Guest", which names guests).
+		const unnamed = await service.begin('register', 'https://chat.example.test', now, undefined, [], undefined, { userIdTaken: id => store.identityExists(id) });
+		expect(unnamed.challenge.userName).toBe('Member');
+		expect(unnamed.challenge.userId).toMatch(/^member_\d{4}$/);
 
 		const connectionBound = await service.begin('login', 'https://chat.example.test', now, undefined, [], 'connection-a');
 		await expect(service.finish(connectionBound.challenge, connectionBound.challenge.challengeId, {}, repository, {

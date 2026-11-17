@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { AuthError, AuthTooLargeError, candidateUserIdFor, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
+import { AuthError, AuthTooLargeError, candidateUserIdFor, MEMBER_NAME, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
 import { LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
@@ -561,7 +561,7 @@ const JOIN_INVITE_KEY = "join-invite";
 /** Sign-ups one `/invite-code` may allow, and how long it lasts. */
 const MAX_JOIN_USES = 50;
 /** The name of a user who signs up with an invite and asks for none: not "Guest", which names guests. */
-const JOIN_DEFAULT_NAME = "Member";
+const JOIN_DEFAULT_NAME = MEMBER_NAME;
 const JOIN_INVITE_TTL_MS = 7 * 86_400_000;
 /** Device tokens one user may hold at once, each under its own id. */
 const MAX_DEVICE_TOKENS = 5;
@@ -4057,30 +4057,39 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * does: single use, unexpired, from `page`, for this server's `origin`
 	 * (its `resource`), with the same client and return address, and a
 	 * verifier that answers its PKCE challenge. Anything else is `denied`,
-	 * and a code that was tried is gone either way.
+	 * and a code that was tried is gone either way, except one that `fits`
+	 * refuses: a valid code on a connection that cannot take it is kept for
+	 * one that can, so a new account's passkey is not left without one.
+	 * Read, then deleted, and returned only to the caller whose delete
+	 * removed it, as takeSignInRecord does.
 	 */
-	private async takeSignInCode(params: Record<string, unknown>, page: SignInPage, origin: string): Promise<StoredSignInCode> {
+	private async takeSignInCode(params: Record<string, unknown>, page: SignInPage, origin: string, fits?: (record: StoredSignInCode) => void): Promise<StoredSignInCode> {
 		const code = requiredString(params, "code");
 		const verifier = requiredString(params, "code_verifier");
 		const redirectUri = requiredString(params, "redirect_uri");
 		const clientId = requiredString(params, "client_id");
 		const invalid = { name: "denied", message: "Sign-in code is invalid or expired" } satisfies ProtocolError;
 		if (code.length > MAX_SESSION_TOKEN_CHARS) throw invalid;
-		const record = await this.takeSignInRecord<StoredSignInCode>(SIGN_IN_CODE_KEY_PREFIX + await sha256Hex(code));
-		if (record?.v !== 1 || record.page !== page || !(record.expiresMs > nowMs()) || record.resource !== origin ||
-			record.clientId !== clientId || record.redirectUri !== redirectUri || !await pkceMatches(verifier, record.codeChallenge)) {
-			throw invalid;
-		}
-		return record;
+		const key = SIGN_IN_CODE_KEY_PREFIX + await sha256Hex(code);
+		return await this.store.withMeterAsync("foreground", { reads: 1, writes: 1 }, async () => {
+			const record = await this.ctx.storage.get<StoredSignInCode>(key);
+			if (record === undefined) throw invalid;
+			const valid = record.v === 1 && record.page === page && record.expiresMs > nowMs() && record.resource === origin &&
+				record.clientId === clientId && record.redirectUri === redirectUri && await pkceMatches(verifier, record.codeChallenge);
+			if (valid) fits?.(record);
+			if (!await this.ctx.storage.delete(key) || !valid) throw invalid;
+			return record;
+		});
 	}
 
 	/**
 	 * What a code's passkey did, now on the account: a sign-in's passkey,
 	 * still on its account; a new account, created now by the usual policy
 	 * (under its `user_id` from the page, or a new one if that was taken
-	 * since); or the passkey added to an addition's account.
+	 * since, or for `requestedName`, which replaces the page's name); or the
+	 * passkey added to an addition's account.
 	 */
-	private async redeemPasskeyCode(code: StoredSignInCode, repository: CredentialRepository, ipKey: string): Promise<{ identity: { user_id: string; name?: string }; credential?: StoredCredential }> {
+	private async redeemPasskeyCode(code: StoredSignInCode, repository: CredentialRepository, ipKey: string, requestedName?: string): Promise<{ identity: { user_id: string; name?: string }; credential?: StoredCredential }> {
 		const gone = { name: "denied", message: "This passkey is no longer on the account" } satisfies ProtocolError;
 		if (code.action === "login") {
 			const credential = code.credentialId ? this.store.getCredential(code.credentialId) : null;
@@ -4091,9 +4100,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		const created = code.register;
 		if (!created) throw { name: "denied", message: "Sign-in code is invalid or expired" } satisfies ProtocolError;
-		const userId = code.adds || !this.store.userIdTaken(code.userId) ? code.userId : candidateUserIdFor(created.name, (candidate) => this.store.userIdTaken(candidate));
+		// A new account takes the name its redeemer asks for, else the page's.
+		const name = code.adds ? created.name : requestedName ?? created.name;
+		const userId = code.adds || (name === created.name && !this.store.userIdTaken(code.userId)) ? code.userId : candidateUserIdFor(name, (candidate) => this.store.userIdTaken(candidate));
 		const identity = await repository.registerCredential({
-			userId, name: created.name, userHandle: created.userHandle, credential: { ...created.credential, userId }, ipKey, now: nowMs(),
+			userId, name, userHandle: created.userHandle, credential: { ...created.credential, userId }, ipKey, now: nowMs(),
 			...(code.adds ? { adds: true } : {}),
 		});
 		return { identity };
@@ -4105,7 +4116,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * in, or on a signed-in connection adds the identity, which here is the
 	 * account itself, so it answers `you` only for the same account. An
 	 * identity that belongs to another account is `denied`, guests' included:
-	 * `external` never signs in to another account (§4.12.4).
+	 * `external` never signs in to another account (§4.12.4), and that code
+	 * is kept for a connection that can take it. A new account is named by
+	 * the request's `name` (§3.2), else by the page.
 	 */
 	private async handleExternal(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		const origin = this.externalOrigin(attachment);
@@ -4117,23 +4130,28 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.reply(socket, request, { external: { url: pageUrl(origin, AUTHORIZE_PATH) } });
 			return;
 		}
-		const code = await this.takeSignInCode(params, "authorize", origin);
-		if (attachment.tier === "registered" || attachment.tier === "anonymous") {
-			const same = attachment.tier === "registered" && code.action === "login" && code.userId === attachment.userId &&
-				!!code.credentialId && this.store.getCredential(code.credentialId)?.userId === code.userId;
+		// A new account's name (§3.2), checked before the code is used up.
+		const name = this.requestedName(params);
+		let same = false;
+		// A code this connection cannot take is refused before it is used up,
+		// so a new account's code still works on a new connection.
+		const code = await this.takeSignInCode(params, "authorize", origin, (record) => {
+			if (attachment.tier !== "registered" && attachment.tier !== "anonymous") return;
+			same = attachment.tier === "registered" && record.action === "login" && record.userId === attachment.userId &&
+				!!record.credentialId && this.store.getCredential(record.credentialId)?.userId === record.userId;
 			// A guest is not an account yet: a new account's code makes it one,
 			// as a passkey registration on a guest connection does (§4.10).
-			if (!same && !(attachment.tier === "anonymous" && code.action === "register")) {
+			if (!same && !(attachment.tier === "anonymous" && record.action === "register")) {
 				throw { name: "denied", message: "That sign-in belongs to another account; sign in on a new connection" } satisfies ProtocolError;
 			}
-			if (same) {
-				this.reply(socket, request, { you: this.you(attachment) });
-				return;
-			}
+		});
+		if (same) {
+			this.reply(socket, request, { you: this.you(attachment) });
+			return;
 		}
 		const signIn = this.passkeySignIn(socket, attachment);
 		this.holdDeliveries(socket);
-		const finished = await this.redeemPasskeyCode(code, signIn.repository, attachment.ipKey);
+		const finished = await this.redeemPasskeyCode(code, signIn.repository, attachment.ipKey, name);
 		await this.completePasskeySignIn(socket, attachment, request, finished, signIn, { adds: false, newAccount: code.action === "register" });
 	}
 
