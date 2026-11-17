@@ -169,6 +169,40 @@ it('/status leads with the server state, then the Cloudflare usage and the demo 
 	} finally { admin.close(); }
 });
 
+it('/status shows active users read back from the METRICS dataset where configured, or why not', async () => {
+	type Configured = { runtimeEnv: { ACCOUNT_ID?: string; ACCOUNT_ANALYTICS_TOKEN?: string; METRICS_DATASET?: string } };
+	const admin = await signedInAdmin();
+	const queries: string[] = [];
+	let status = 200;
+	// The account usage reading, now configured too, fails: only its section is affected.
+	vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+		const url = String(input instanceof Request ? input.url : input);
+		if (!url.endsWith('/analytics_engine/sql')) return new Response('{}', { status: 500 });
+		queries.push(String(init?.body));
+		return new Response(JSON.stringify({ data: [{ bucket: 'read', users: '12', first: '2026-11-17 18:01:30' }, { bucket: 'write', users: 3, first: '2026-11-17 19:00:00' }] }), { status });
+	});
+	const configure = (on: boolean) => runInDurableObject(stub(), (instance) => {
+		const runtime = (instance as unknown as Configured).runtimeEnv;
+		if (on) Object.assign(runtime, { ACCOUNT_ID: 'account-1', ACCOUNT_ANALYTICS_TOKEN: 'token-1', METRICS_DATASET: 'apron_server_metrics_test' });
+		else { delete runtime.ACCOUNT_ID; delete runtime.ACCOUNT_ANALYTICS_TOKEN; delete runtime.METRICS_DATASET; }
+	});
+	try {
+		// Not configured (as in every other test): no line, and no query.
+		expect((await command(admin, 'status-plain', '/status')).notice!.params.body.text).not.toContain('Active users');
+		expect(queries).toEqual([]);
+		await configure(true);
+		const text: string = (await command(admin, 'status-active', '/status')).notice!.params.body.text;
+		expect(text).toMatch(/^- Active users \(read \/ wrote\): today 12 \/ 3 · last 7 days 12 \/ 3 · last 30 days 12 \/ 3( \(counted since 2026-11-17\))?$/m);
+		expect(queries).toHaveLength(3);
+		expect(queries.every((sql) => sql.includes('FROM apron_server_metrics_test WHERE'))).toBe(true);
+		status = 403;
+		expect((await command(admin, 'status-refused', '/status')).notice!.params.body.text).toMatch(/^- Active users \(read \/ wrote\): unavailable \(Analytics Engine HTTP 403\)$/m);
+	} finally {
+		await configure(false);
+		admin.close();
+	}
+});
+
 it.runIf(ACCOUNT_USAGE_POLICY.billCap)('/status estimates the bill against the bill cap', async () => {
 	const now = Date.now();
 	const day = new Date(now).toISOString().slice(0, 10);

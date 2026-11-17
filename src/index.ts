@@ -7,6 +7,7 @@ import { LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind }
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor, snapshotBill, snapshotReasons } from "./account-usage";
 import { PRICED_LABEL, PRICES, usd } from "./pricing";
+import { activeUsersConfigured, activeUsersLine, fetchActiveUsers } from "./active-users";
 import { EDGE_STOP_RULE_REF, readEdgeStop, runBudgetGuard, setAttackStop, watchForFlood } from "./budget-guard";
 import { attackHoldMs, BURN_POLICY, BurnMeter, burnSummary, type BurnKind } from "./burn";
 import { recordMetric } from "./metrics";
@@ -8898,6 +8899,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async sendStatus(socket: WebSocketConnection, request: RequestFrame, roomId: string): Promise<void> {
 		const now = nowMs();
+		// Read alongside the usage refresh; left out where it is not configured.
+		const active = activeUsersConfigured(this.runtimeEnv) ? this.activeUsersStatus(now) : undefined;
 		await this.accountUsage.refresh(now, true);
 		const { budget, identities, databaseBytes, counts } = this.store.status(now);
 		const pruned = this.store.idlePruned(now);
@@ -8993,11 +8996,21 @@ export class ApronDemoServer extends DurableObject<Env> {
 			`- Registrations: ${share(budget.registrations, limits.registrationsPerDay)}`,
 			...(this.config.push && PUSH_POLICY ? [`- Pushes: ${share(this.store.pushesToday(now), PUSH_POLICY.pushesPerDay)}`] : []),
 			`- Registered users: ${share(identities, limits.registeredIdentityCount)}${pruned.total ? ` (idle accounts removed: ${count(pruned.today)} today, ${count(pruned.total)} in all)` : ""}`,
+			...(active ? [await active] : []),
 			`- Open connections: ${share(this.ctx.getWebSockets().length, limits.openConnections)}`,
 			`- Database: ${databaseBytes === null ? "unknown" : mib(databaseBytes)} / ${mib(limits.databaseHardTargetBytes)}`,
 		);
 		this.sendNotice(socket, roomId, lines.join("\n"));
 		this.reply(socket, request, {});
+	}
+
+	/** `/status`'s active users line (src/active-users.ts): never throws, and gives up after 5 seconds. */
+	private async activeUsersStatus(now: number): Promise<string> {
+		try {
+			return activeUsersLine(await this.stalls.track("analytics", "active", fetchActiveUsers(this.runtimeEnv, now, fetch, AbortSignal.timeout(5_000))));
+		} catch (error) {
+			return activeUsersLine(error instanceof Error ? error : new Error(String(error)));
+		}
 	}
 
 	/**

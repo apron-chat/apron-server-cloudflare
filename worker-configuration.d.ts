@@ -10,6 +10,8 @@ declare global {
 		FLOOD_WATCH?: RateLimit;
 		/** Workers Analytics Engine dataset for exact counters (src/metrics.ts); optional. */
 		METRICS?: AnalyticsEngineDataset;
+		/** The dataset METRICS writes, for reading the `active` metric back in /status (src/active-users.ts). */
+		METRICS_DATASET?: string;
 		CF_VERSION_METADATA?: WorkerVersionMetadata;
 		ACCOUNT_ID?: string;
 		ACCOUNT_ANALYTICS_TOKEN?: string;
@@ -59,6 +61,8 @@ declare global {
 			FLOOD_WATCH?: RateLimit;
 			/** Workers Analytics Engine dataset for exact counters (src/metrics.ts); optional. */
 			METRICS?: AnalyticsEngineDataset;
+			/** The dataset METRICS writes, for reading the `active` metric back in /status (src/active-users.ts). */
+			METRICS_DATASET?: string;
 			CF_VERSION_METADATA?: WorkerVersionMetadata;
 			ACCOUNT_ID?: string;
 			ACCOUNT_ANALYTICS_TOKEN?: string;
