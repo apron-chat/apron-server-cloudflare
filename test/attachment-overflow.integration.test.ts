@@ -42,9 +42,18 @@ it('closes only the connection whose state outgrows its attachment, even inside 
 				return attachment.userId === userId && !attachment.closing;
 			}).sort((a, b) => (a.deserializeAttachment() as { openedAt: number }).openedAt - (b.deserializeAttachment() as { openedAt: number }).openedAt)[0];
 			const attachment = socket.deserializeAttachment() as Record<string, unknown>;
+			const readsAt = Date.now();
+			const size = (reads: Record<string, string>) => JSON.stringify({ ...attachment, reads, readsAt }).length;
+			// Within the rename's 18 bytes of the 12,000-byte budget: it fits now, and the rename cannot.
+			const target = 11_990;
 			const reads: Record<string, string> = {};
-			for (let index = 0; JSON.stringify({ ...attachment, reads }).length < 11_900; index++) reads[`r${String(index).padStart(60, '0')}`] = '1';
-			socket.serializeAttachment({ ...attachment, reads, readsAt: Date.now() });
+			for (let index = 0; size(reads) + 68 <= target; index++) reads[`r${String(index).padStart(60, '0')}`] = '1';
+			// One last cursor, its id sized to land on the target.
+			const short = size({ ...reads, s: '1' });
+			if (short <= target) reads['s'.padEnd(1 + target - short, '0')] = '1';
+			expect(size(reads)).toBeGreaterThan(12_000 - 18);
+			expect(size(reads)).toBeLessThan(12_000);
+			socket.serializeAttachment({ ...attachment, reads, readsAt });
 		});
 		// A name change writes every connection of the user, in one mutation.
 		const renamed = await exchange(other, 'rename', 'me', { name: 'x'.repeat(40) });

@@ -1139,6 +1139,7 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			...presenceState(attachment),
 			...readState(attachment),
 			...(Number.isSafeInteger(attachment.openedAt) && (attachment.openedAt as number) > 0 ? { openedAt: attachment.openedAt } : {}),
+			...(Number.isSafeInteger(attachment.lastFrameAt) && (attachment.lastFrameAt as number) > 0 ? { lastFrameAt: attachment.lastFrameAt } : {}),
 			authDeadline: typeof attachment.authDeadline === "number" ? attachment.authDeadline : 0,
 			pendingFrames: typeof attachment.pendingFrames === "number" ? attachment.pendingFrames : 0,
 			pendingBytes: typeof attachment.pendingBytes === "number" ? attachment.pendingBytes : 0,
@@ -3067,8 +3068,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (due.has("auth")) {
 				// One that never sent a frame, not even an answered ping, may have
 				// lost its client during the upgrade: counted apart, as `silent`.
-				// frameTimes, not lastFrameAt: the stored attachment keeps the first
-				// (pruned only as new frames come), not the second.
+				// frameTimes is empty until the first frame (it is pruned only as
+				// new frames come), as lastFrameAt is unset.
 				const silent = attachment.frameTimes.length === 0 && !this.ctx.getWebSocketAutoResponseTimestamp(socket);
 				this.closePolicy(socket, attachment, 1008, AUTH_TIMEOUT_REASON, silent ? "silent" : "");
 				continue;
