@@ -1251,7 +1251,7 @@ const META_REMOTE_PAIRS = "remote_pairs";
 /** `_meta` key: each remote server's outbox (ext:remote), a JSON object of RemoteOutbox by server address. */
 const META_REMOTE_OUTBOX = "remote_outbox";
 /** The most room pairs a server keeps (ext:remote). */
-export const MAX_REMOTE_PAIRS = 64;
+export const MAX_REMOTE_PAIRS = 256;
 
 /** One of this server's rooms shared with a remote server (ext:remote; Store.remotePairs). */
 export interface RemotePair {
@@ -1262,6 +1262,15 @@ export interface RemotePair {
   created_ms: number;
   /** The head of the log when the pair was made: its room's records at or below it are never sent. */
   start_log_id: number;
+  /** For a thread of a shared room (a thread pair): its parent, whose pair it ends with. */
+  parent?: string;
+  /**
+   * For a thread the remote server refused: its messages go to the parent's
+   * remote room (`remote_room`) as replies to `anchor`, the thread's first
+   * message sent, once there is one.
+   */
+  fallback?: boolean;
+  anchor?: string;
 }
 
 /** A remote server's outbox (ext:remote): the log ID sent through, and why it stopped, if it did. */
@@ -5476,7 +5485,13 @@ export class Store {
     return this.metaJson(META_REMOTE_PAIRS, (stored) => Array.isArray(stored)
       ? stored.filter((pair): pair is RemotePair => isPlainObject(pair) && typeof pair.room_id === "string" && typeof pair.server === "string" &&
         typeof pair.remote_room === "string" && typeof pair.token === "string")
-        .map((pair) => ({ ...pair, start_log_id: integerColumn(pair.start_log_id) }))
+        .map((pair) => ({
+          room_id: pair.room_id, server: pair.server, remote_room: pair.remote_room, token: pair.token,
+          created_ms: integerColumn(pair.created_ms), start_log_id: integerColumn(pair.start_log_id),
+          ...(typeof pair.parent === "string" ? { parent: pair.parent } : {}),
+          ...(pair.fallback === true ? { fallback: true } : {}),
+          ...(typeof pair.anchor === "string" ? { anchor: pair.anchor } : {}),
+        }))
       : undefined, []);
   }
 
@@ -5486,12 +5501,12 @@ export class Store {
    * starts its outbox at the head of the log: nothing older is sent. A pair
    * also lifts a stop of the server's outbox (an earlier refused sign-in).
    */
-  setRemotePair(pair: Omit<RemotePair, "created_ms" | "start_log_id">, now = this.clock.now()): void {
+  setRemotePair(pair: Omit<RemotePair, "created_ms" | "start_log_id"> & { start_log_id?: number }, now = this.clock.now()): void {
     this.ensureReady();
     this.reserved({ reads: 8, writes: 8 }, false, now, () => this.transaction(() => {
       const pairs = this.readRemotePairs().filter((other) => !(other.room_id === pair.room_id && other.server === pair.server));
       if (pairs.length >= MAX_REMOTE_PAIRS) throw new StoreError("denied", `This server shares at most ${MAX_REMOTE_PAIRS} rooms`);
-      pairs.push({ ...pair, created_ms: this.effectiveNow(now), start_log_id: this.logState().last_log_id });
+      pairs.push({ ...pair, created_ms: this.effectiveNow(now), start_log_id: pair.start_log_id ?? this.logState().last_log_id });
       this.writeMeta(META_REMOTE_PAIRS, JSON.stringify(pairs));
       this.remotePairsCache = undefined;
       const outboxes = this.readOutboxes();
@@ -5501,11 +5516,41 @@ export class Store {
     }));
   }
 
-  /** Drops the pairs `drop` picks (ext:remote); the dropped ones. */
-  dropRemotePairs(drop: (pair: RemotePair) => boolean, now = this.clock.now()): RemotePair[] {
+  /** Sets a thread pair's anchor (ext:remote: the first message of a refused thread). */
+  setRemotePairAnchor(roomId: string, server: string, anchor: string, now = this.clock.now()): void {
+    this.ensureReady();
+    this.reserved({ reads: 4, writes: 4 }, false, now, () => this.transaction(() => {
+      const pairs = this.readRemotePairs().map((pair) => pair.room_id === roomId && pair.server === server && pair.anchor === undefined ? { ...pair, anchor } : pair);
+      this.writeMeta(META_REMOTE_PAIRS, JSON.stringify(pairs));
+      this.remotePairsCache = undefined;
+    }));
+  }
+
+  /**
+   * The threads of `parents` (ext:remote: a thread of a shared room is
+   * shared with it): each with its parent, the log ID it was made at, and
+   * who made it. A scan of the capped public range of the rooms table.
+   */
+  threadsOf(parents: readonly string[], now = this.clock.now()): Array<{ room_id: string; parent: string; created_log_id: number; creator?: string }> {
+    this.ensureReady();
+    if (!parents.length) return [];
+    return this.reserved({ reads: 8 + MAX_THREAD_LIMIT + 2 }, false, now, () => this.rawRows<{ room_id: string; parent_room_id: string; created_log_id: number; fields_json: string }>(
+      `SELECT room_id, parent_room_id, created_log_id, fields_json FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IN (SELECT value FROM json_each(?)) LIMIT ?`,
+      JSON.stringify([...new Set(parents)]), MAX_THREAD_LIMIT + 1,
+    ).map((row) => {
+      const creator = storedCreator(row.fields_json);
+      return { room_id: row.room_id, parent: row.parent_room_id, created_log_id: integerColumn(row.created_log_id), ...(creator ? { creator } : {}) };
+    }));
+  }
+
+  /** Drops the pairs `drop` picks, and the thread pairs of those (ext:remote); the dropped ones. */
+  dropRemotePairs(pick: (pair: RemotePair) => boolean, now = this.clock.now()): RemotePair[] {
     this.ensureReady();
     return this.reserved({ reads: 4, writes: 4 }, false, now, () => this.transaction(() => {
       const pairs = this.readRemotePairs();
+      const parents = new Set(pairs.filter(pick).map((pair) => `${pair.server}\n${pair.room_id}`));
+      // A thread's pair ends with its parent's.
+      const drop = (pair: RemotePair) => pick(pair) || (pair.parent !== undefined && parents.has(`${pair.server}\n${pair.parent}`));
       const dropped = pairs.filter(drop);
       if (dropped.length) {
         const kept = pairs.filter((pair) => !drop(pair));

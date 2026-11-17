@@ -37,7 +37,13 @@ export interface OutboxDeps {
 	 * The shared rooms with this remote server: local room → the remote room,
 	 * and the log ID the pair started at (its records at or below it are never sent).
 	 */
-	pairs(): Map<string, { remote: string; start: number }>;
+	pairs(): Map<string, SentPair>;
+	/** The threads of these local rooms: each one's parent, the log ID it was made at, and its creator, if known. */
+	threads(parents: readonly string[]): Array<{ room_id: string; parent: string; created_log_id: number; creator?: string }>;
+	/** Pairs a local thread of a shared room: with the remote thread, or as a fallback into the parent's remote room. */
+	setThreadPair(threadId: string, pair: { remote: string; parent: string; start: number; fallback: boolean }): void;
+	/** Sets a fallback thread's anchor: its first message sent, which its other messages reply to. */
+	setAnchor(threadId: string, messageId: string): void;
 	/** Whether this server's link for the remote server is in a local room: a pair holds only while it is. */
 	linkInRoom(roomId: string): boolean;
 	dropPair(roomId: string, why: string): void;
@@ -57,6 +63,15 @@ export interface OutboxDeps {
 	user(userId: string): Promise<{ id: string; name: string } | undefined>;
 	setUser(userId: string, value: { id: string; name: string }): Promise<void>;
 	log(event: string, data: Record<string, unknown>): void;
+}
+
+/** A shared room as the outbox sees it (Store.remotePairs): its remote room, the log ID it started at, and for a thread its parent. */
+export interface SentPair {
+	remote: string;
+	start: number;
+	parent?: string;
+	fallback?: boolean;
+	anchor?: string;
 }
 
 /** Error codes (§1.1) the outbox tells apart. */
@@ -184,7 +199,10 @@ export class Outbox {
 		for (;;) {
 			const pairs = this.deps.pairs();
 			if (!pairs.size) return;
-			const records = this.deps.records([...pairs.keys()], this.deps.cursor(), OUTBOX_BATCH);
+			// A thread of a shared room is shared with it: its creation pairs it.
+			this.unpaired = new Map(this.deps.threads([...pairs].filter(([, pair]) => pair.parent === undefined).map(([room]) => room))
+				.filter((thread) => !pairs.has(thread.room_id)).map((thread) => [thread.room_id, thread]));
+			const records = this.deps.records([...pairs.keys(), ...this.unpaired.keys()], this.deps.cursor(), OUTBOX_BATCH);
 			if (!records.length) return;
 			const groups = new Map<number, OutboxRecord[]>();
 			for (const record of records) groups.set(record.log_id, [...(groups.get(record.log_id) ?? []), record]);
@@ -218,24 +236,94 @@ export class Outbox {
 		}
 	}
 
+	/** The threads of shared rooms that have no pair yet (drain), by room. */
+	private unpaired = new Map<string, { room_id: string; parent: string; created_log_id: number; creator?: string }>();
+
 	private async sendRecord(row: OutboxRecord, call: LinkCall): Promise<void> {
-		const pair = this.deps.pairs().get(row.room_id);
-		// A pair starts where the log was when it was made: nothing older of its room is sent.
-		if (pair === undefined || row.log_id <= pair.start) return;
-		const remoteRoom = pair.remote;
-		if (!this.deps.linkInRoom(row.room_id)) {
-			this.deps.dropPair(row.room_id, "this server's link left the room");
+		const pairs = this.deps.pairs();
+		const pair = pairs.get(row.room_id);
+		if (pair === undefined) {
+			const thread = this.unpaired.get(row.room_id);
+			if (thread && row.kind === "room" && row.log_id === thread.created_log_id) await this.createThread(row, call, thread, pairs.get(thread.parent));
 			return;
 		}
-		const ops = new Ops(this, call, row, remoteRoom);
+		// A pair starts where the log was when it was made: nothing older of its room is sent.
+		if (row.log_id <= pair.start) return;
+		// The link a thread's records need is its parent's.
+		const shared = pair.parent ?? row.room_id;
+		if (!this.deps.linkInRoom(shared)) {
+			this.deps.dropPair(shared, "this server's link left the room");
+			return;
+		}
+		const ops = new Ops(this, call, row, pair.remote, pair);
 		try {
 			if (row.kind === "message") await this.sendMessage(ops, row.record);
 			else if (row.kind === "reactions") await this.sendReactions(ops, row.record);
-			else if (row.kind === "membership") await this.sendLeaves(ops, row.record);
+			else if (row.kind === "membership" && !pair.fallback) await this.sendLeaves(ops, row.record);
+			else if (row.kind === "room" && pair.parent !== undefined && !pair.fallback) await this.saveThread(ops, row.record);
 		} catch (error) {
 			if (!(error instanceof PairEnded)) throw error;
-			this.deps.dropPair(row.room_id, "the remote server's link is not in the room");
+			this.deps.dropPair(shared, "the remote server's link is not in the room");
 		}
+	}
+
+	/**
+	 * A local user's new thread of a shared room: a `room_set` through the
+	 * link makes it on the remote server, under the parent's remote room, as
+	 * its creator, and the two threads are a pair from its creation on. A
+	 * thread the remote server refuses (or one with no local creator to make
+	 * it as) still goes, as replies in the parent's remote room.
+	 */
+	private async createThread(row: OutboxRecord, call: LinkCall, thread: { room_id: string; parent: string; creator?: string }, parentPair: SentPair | undefined): Promise<void> {
+		if (!parentPair || parentPair.parent !== undefined || row.log_id <= parentPair.start) return;
+		if (!this.deps.linkInRoom(thread.parent)) {
+			this.deps.dropPair(thread.parent, "this server's link left the room");
+			return;
+		}
+		// A remote user's thread is that server's to send, never this one's.
+		if (thread.creator !== undefined && !this.deps.isLocalUser(thread.creator)) return;
+		const fallback = () => this.deps.setThreadPair(thread.room_id, { remote: parentPair.remote, parent: thread.parent, start: row.log_id, fallback: true });
+		const creator = thread.creator !== undefined && this.deps.isLocalUser(thread.creator) ? thread.creator : undefined;
+		if (!creator) return fallback();
+		const ops = new Ops(this, call, row, parentPair.remote, parentPair);
+		try {
+			await this.profile(ops, creator);
+			const room = row.record;
+			const result = await ops.send("room_set", "thread", {
+				parent_room_id: parentPair.remote,
+				...(typeof room.title === "string" ? { title: room.title } : {}),
+				...(typeof room.description === "string" ? { description: room.description } : {}),
+				ext: { remote: { user_id: creator, room_id: thread.room_id } },
+			});
+			if (typeof result?.room_id === "string") this.deps.setThreadPair(thread.room_id, { remote: result.room_id, parent: thread.parent, start: row.log_id, fallback: false });
+			else fallback();
+		} catch (error) {
+			if (!(error instanceof PairEnded)) throw error;
+			this.deps.dropPair(thread.parent, "the remote server's link is not in the room");
+		}
+	}
+
+	/**
+	 * A save of a shared thread's `title` or `description`: a `room_set` of
+	 * the remote thread, as its creator here (a room record names no saver),
+	 * when that is a local user.
+	 */
+	private async saveThread(ops: Ops, room: Record<string, unknown>): Promise<void> {
+		const creator = this.unpairedCreator(ops.row.room_id);
+		if (!creator) return;
+		await this.profile(ops, creator);
+		await ops.send("room_set", "thread-save", {
+			room_id: ops.remoteRoom,
+			...(typeof room.title === "string" ? { title: room.title } : {}),
+			...(typeof room.description === "string" ? { description: room.description } : {}),
+			ext: { remote: { user_id: creator } },
+		});
+	}
+
+	private unpairedCreator(threadId: string): string | undefined {
+		const pair = this.deps.pairs().get(threadId);
+		const thread = pair?.parent === undefined ? undefined : this.deps.threads([pair.parent]).find((candidate) => candidate.room_id === threadId);
+		return thread?.creator !== undefined && this.deps.isLocalUser(thread.creator) ? thread.creator : undefined;
 	}
 
 	/** Whether a record's author is one of this server's own users: never a remote user, a link, or a system identity. */
@@ -277,11 +365,17 @@ export class Outbox {
 		if (copy === undefined && !created && !movedIn && Number(messageId) <= start) return;
 		await this.profile(ops, author);
 		const fields = await this.clientFields(ops, snapshot);
+		// A refused thread's messages are replies to its first one, in the parent's remote room.
+		if (ops.pair?.fallback && fields.reply_to === undefined && ops.pair.anchor !== undefined && ops.pair.anchor !== messageId) {
+			const anchor = await this.deps.copy(ops.pair.anchor);
+			if (anchor !== undefined) fields.reply_to = { message_id: anchor };
+		}
 		if (copy === undefined) {
 			const result = await ops.send("message", "create", { room_id: ops.remoteRoom, ...fields, ext: { remote } });
 			const id = result?.message_id;
 			if (typeof id !== "string") return;
 			await this.deps.setCopy(messageId, id);
+			if (ops.pair?.fallback && ops.pair.anchor === undefined) this.deps.setAnchor(ops.row.room_id, messageId);
 			// A fresh message's create is all; otherwise the create may have
 			// returned a copy that exists, also one deleted since, which a save
 			// brings to the message's current state (and restores).
@@ -392,7 +486,7 @@ class PairEnded extends Error {}
 
 /** The requests of one record, each with an id made from the record and what it is. */
 class Ops {
-	constructor(private readonly outbox: Outbox, private readonly call: LinkCall, readonly row: OutboxRecord, readonly remoteRoom: string) {}
+	constructor(private readonly outbox: Outbox, private readonly call: LinkCall, readonly row: OutboxRecord, readonly remoteRoom: string, readonly pair?: SentPair) {}
 
 	/**
 	 * Sends one request and waits for its answer: the result, or undefined

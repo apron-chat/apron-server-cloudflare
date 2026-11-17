@@ -13,6 +13,9 @@ function world(records: OutboxRecord[]) {
 		cursor: 0,
 		pairs: new Map([['room', 'ops'], ['other', 'ops2']]),
 		starts: new Map<string, number>(),
+		threads: [] as Array<{ room_id: string; parent: string; created_log_id: number; creator?: string }>,
+		threadPairs: new Map<string, { remote: string; parent: string; start: number; fallback: boolean }>(),
+		anchors: new Map<string, string>(),
 		linkIn: new Set(['room', 'other']),
 		messages: new Map<string, Record<string, unknown>>(),
 		copies: new Map<string, string>(),
@@ -23,9 +26,15 @@ function world(records: OutboxRecord[]) {
 	};
 	const deps: OutboxDeps = {
 		self: SELF,
-		pairs: () => new Map([...state.pairs].filter(([room]) => !state.dropped.includes(room)).map(([room, remote]) => [room, { remote, start: state.starts.get(room) ?? 0 }])),
+		pairs: () => new Map([...state.pairs].filter(([room]) => !state.dropped.includes(room)).map(([room, remote]) => {
+			const thread = state.threadPairs.get(room);
+			return [room, { remote, start: thread?.start ?? state.starts.get(room) ?? 0, ...(thread ? { parent: thread.parent, ...(thread.fallback ? { fallback: true } : {}) } : {}), ...(state.anchors.has(room) ? { anchor: state.anchors.get(room) } : {}) }];
+		})),
 		linkInRoom: (room) => state.linkIn.has(room),
 		dropPair: (room) => { state.dropped.push(room); },
+		threads: (parents) => state.threads.filter((thread) => parents.includes(thread.parent)),
+		setThreadPair: (threadId, pair) => { state.pairs.set(threadId, pair.remote); state.threadPairs.set(threadId, pair); },
+		setAnchor: (threadId, messageId) => { state.anchors.set(threadId, messageId); },
 		cursor: () => state.cursor,
 		advance: (logId) => { state.cursor = Math.max(state.cursor, logId); },
 		records: (rooms, after, limit) => records.filter((record) => rooms.includes(record.room_id) && record.log_id > after).slice(0, limit),
@@ -179,6 +188,38 @@ describe('Outbox', () => {
 		await outbox.drain(call);
 		expect(sent.map((request) => [request.method, request.params.name, request.id.startsWith('fed-0-me-')])).toEqual([['me', 'Ada', true]]);
 		expect(outbox.profilesDue.size).toBe(0);
+	});
+
+	it('makes a local thread of a shared room on the remote server, and sends its records there', async () => {
+		const room = (logId: number, fields: Record<string, unknown>): OutboxRecord => ({ room_id: 't1', log_id: logId, kind: 'room', record: { room_id: 't1', log_id: String(logId), parent_room_id: 'room', title: 'Plans', ...fields } });
+		const { outbox, sent, call, state, answers } = world([room(2, {}), message(3, {}, 't1'), room(4, { title: 'Plans v2' })]);
+		state.threads.push({ room_id: 't1', parent: 'room', created_log_id: 2, creator: 'ada' });
+		answers.set('room_set', (request) => (request.params.room_id ? { result: {} } : { result: { room_id: 'remote-t1' } }));
+		await outbox.drain(call);
+		const sets = sent.filter((request) => request.method === 'room_set').map((request) => request.params);
+		expect(sets[0]).toEqual({ parent_room_id: 'ops', title: 'Plans', ext: { remote: { user_id: 'ada', room_id: 't1' } } });
+		expect(state.threadPairs.get('t1')).toEqual({ remote: 'remote-t1', parent: 'room', start: 2, fallback: false });
+		expect(sent.find((request) => request.method === 'message')!.params).toMatchObject({ room_id: 'remote-t1', ext: { remote: { room_id: 't1', message_id: '3' } } });
+		expect(sets[1]).toEqual({ room_id: 'remote-t1', title: 'Plans v2', ext: { remote: { user_id: 'ada' } } });
+	});
+
+	it('posts a refused thread\'s messages in the parent\'s remote room, as replies to its first', async () => {
+		const { outbox, sent, call, state, answers } = world([
+			{ room_id: 't1', log_id: 2, kind: 'room', record: { room_id: 't1', parent_room_id: 'room', title: 'Plans' } },
+			message(3, { body: { text: 'first' } }, 't1'),
+			message(4, { body: { text: 'second' } }, 't1'),
+			{ room_id: 't1', log_id: 5, kind: 'membership', record: { members: [{ user: { user_id: 'ada' }, joined: false }] } },
+		]);
+		state.threads.push({ room_id: 't1', parent: 'room', created_log_id: 2, creator: 'ada' });
+		answers.set('room_set', () => ({ error: { code: -32001, message: 'A private room has no threads on this demo' } }));
+		await outbox.drain(call);
+		expect(state.threadPairs.get('t1')).toMatchObject({ remote: 'ops', fallback: true });
+		const messages = sent.filter((request) => request.method === 'message').map((request) => request.params);
+		expect(messages[0]).toMatchObject({ room_id: 'ops', body: { text: 'first' } });
+		expect(messages[0]).not.toHaveProperty('reply_to');
+		expect(messages[1]).toMatchObject({ room_id: 'ops', body: { text: 'second' }, reply_to: { message_id: state.copies.get('3') } });
+		// Leaving the thread is not leaving the room.
+		expect(sent.some((request) => request.method === 'room_leave')).toBe(false);
 	});
 
 	it('sends a profile again when the name changed', async () => {

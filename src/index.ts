@@ -974,6 +974,8 @@ function isLinkConnection(attachment: ConnectionAttachment): boolean {
  * `ext:remote`), whatever its code: the sender ends its pair for the room.
  */
 const NOT_JOINED = { ext: { remote: "not_joined" } };
+/** The live threads one link may make here (extension `ext:remote`), so one partner cannot take the server's thread ceiling. */
+const MAX_REMOTE_THREADS = 25;
 /** Key prefix for the tokens minted for each link (extension `ext:remote`), so revoking it finds them all. */
 const LINK_TOKENS_KEY_PREFIX = "remote-tokens:";
 /** The tokens a link keeps: each invite mints one, and the oldest goes past this. */
@@ -2542,6 +2544,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly deadlines = { maintenance: new Deadline(), uploads: new Deadline(), live: new Deadline(), presence: new Deadline(), remote: new Deadline() };
 	/** Each remote server's sender (extension `ext:remote`; RemoteSender), while this instance runs. */
 	private readonly senders = new Map<string, RemoteSender>();
+	/** Each room's parent as read (parentOf): fixed at creation. */
+	private readonly roomParents = new Map<string, string | null>();
 	/** This server's address as an admin's connection reached it, for links in sent text when `REMOTE_SELF` is unset. */
 	private knownSelf: string | undefined;
 	private alarmTail: Promise<void> = Promise.resolve();
@@ -5126,7 +5130,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async actAs(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<boolean> {
 		const method = request.method;
-		if (method !== "message" && method !== "reactions" && method !== "me" && method !== "room_leave") return false;
+		if (method !== "message" && method !== "reactions" && method !== "me" && method !== "room_leave" && method !== "room_set") return false;
 		const remoteUserId = actAsUserId(request.params);
 		const link = attachment.tier === "registered" ? attachment.userId : undefined;
 		if (remoteUserId === undefined || link === undefined) return false;
@@ -5146,6 +5150,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const actor: ActAs = { identity: { user_id: userId, ...(shadow.name ? { name: shadow.name } : {}), tier: "registered" }, link, remote };
 		if (method === "message") await this.handleMessage(socket, attachment, request, actor);
 		else if (method === "reactions") await this.handleReactions(socket, attachment, request, actor);
+		else if (method === "room_set") await this.shadowRoomSet(socket, attachment, request, actor);
 		else await this.shadowMe(socket, attachment, request, actor);
 		return true;
 	}
@@ -5161,13 +5166,65 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async shadowJoins(socket: WebSocketConnection, attachment: ConnectionAttachment, actor: ActAs, roomId: string): Promise<void> {
 		const current = connectionAttachment(socket) ?? attachment;
 		if (!this.roomExists(roomId) || !this.sees(current, roomId)) throw { name: "invalid_params", message: "unknown room", data: NOT_JOINED } satisfies ProtocolError;
-		if (!(current.rooms ?? []).includes(roomId)) throw { name: "denied", message: "This link is not in that room, so its remote users may not write there", data: NOT_JOINED } satisfies ProtocolError;
+		// A link acts in the rooms it has joined, and in their threads.
+		const parent = this.parentOf(roomId);
+		const joined = current.rooms ?? [];
+		if (!joined.includes(roomId) && (parent === null || !joined.includes(parent))) throw { name: "denied", message: "This link is not in that room, so its remote users may not write there", data: NOT_JOINED } satisfies ProtocolError;
 		const userId = actor.identity.user_id;
 		if (this.store.isRoomMember(roomId, userId, nowMs())) return;
 		if (this.store.remoteUserLeft(userId, roomId, nowMs())) throw { name: "denied", message: "This remote user was removed from that room, so may not write there again" } satisfies ProtocolError;
 		await this.runMutation(async () => {
 			const change = this.store.changeMembership({ userId, ipKey: attachment.ipKey, roomId, join: true, now: nowMs(), actorId: actor.link, link: actor.link });
 			if (change.membership) this.broadcastRecord(change.membership);
+		});
+	}
+
+	/**
+	 * A link's act-as `room_set` (ext:remote): creates or saves a thread of a
+	 * room the link has joined, as the remote user, and nothing else. A new
+	 * thread is paired with the thread on the link's server that its
+	 * `ext.remote.room_id` names (the pair starts empty and ends with its
+	 * parent's). The usual rules hold: a private room has no threads here
+	 * (`denied`, so the other server sends the thread's messages as replies
+	 * in the room), each remote user may hold `threadsPerUser`, and the
+	 * server's thread ceiling counts them; a link may make at most
+	 * MAX_REMOTE_THREADS live threads, so one partner cannot take every slot.
+	 */
+	private async shadowRoomSet(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, actor: ActAs): Promise<void> {
+		const params = request.params;
+		if (params.private !== undefined && params.private !== false) throw { name: "denied", message: "A link creates and saves threads only" } satisfies ProtocolError;
+		const roomId = optionalString(params, "room_id");
+		const parentId = roomId === undefined ? optionalString(params, "parent_room_id") : this.parentOf(roomId) ?? undefined;
+		if (parentId === undefined) throw { name: "denied", message: "A link creates and saves threads only" } satisfies ProtocolError;
+		const current = connectionAttachment(socket) ?? attachment;
+		if (!this.roomExists(parentId) || !this.sees(current, parentId)) throw { name: "invalid_params", message: "unknown room", data: NOT_JOINED } satisfies ProtocolError;
+		if (!(current.rooms ?? []).includes(parentId)) throw { name: "denied", message: "This link is not in that room, so its remote users may not make threads there", data: NOT_JOINED } satisfies ProtocolError;
+		const remoteThread = ((params.ext as Record<string, unknown>).remote as Record<string, unknown>).room_id;
+		const pairs = this.store.remotePairs(nowMs());
+		if (roomId === undefined) {
+			if (typeof remoteThread !== "string" || remoteThread === "") throw { name: "invalid_params", message: "ext.remote.room_id must name the thread on the link's server" } satisfies ProtocolError;
+			const live = pairs.filter((pair) => pair.server === actor.remote.server && pair.parent !== undefined && !pair.fallback && this.roomExists(pair.room_id)).length;
+			if (live >= MAX_REMOTE_THREADS) throw { name: "denied", message: `A link makes at most ${MAX_REMOTE_THREADS} threads here at once` } satisfies ProtocolError;
+			// The remote user joins the room first, so the room's own rules answer (a private room has no threads).
+			await this.shadowJoins(socket, attachment, actor, parentId);
+		}
+		await this.runMutation(async () => {
+			const result = this.store.mutate({
+				userId: actor.identity.user_id, tier: "registered", ipKey: attachment.ipKey, requestId: request.id, method: "room_set", now: nowMs(),
+				params, identity: actor.identity, link: actor.link, remote: actor.remote,
+			});
+			const room = result.room;
+			if (room && !result.deduplicated) {
+				// Paired before anything is delivered, so this server's sender never takes it for a local thread.
+				const parentPair = pairs.find((pair) => pair.server === actor.remote.server && pair.room_id === parentId);
+				if (result.created && parentPair && typeof remoteThread === "string") {
+					this.store.setRemotePair({ room_id: room.room_id, server: actor.remote.server, remote_room: remoteThread, token: parentPair.token, parent: parentId }, nowMs());
+				}
+				this.noteRoom(room.room_id, true);
+				this.deliver(roomUpdate("updated", room), [room.room_id, parentId]);
+				if (result.membership) this.broadcastRecord(result.membership);
+			}
+			this.reply(socket, request, result.result);
 		});
 	}
 
@@ -8854,7 +8911,28 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return;
 		}
 		if (!pairs.length) return;
-		for (const server of new Set(pairs.filter((pair) => rooms.includes(pair.room_id)).map((pair) => pair.server))) this.kickSender(server);
+		// A thread of a shared room is shared with it, paired or not yet.
+		const shared = new Set(rooms);
+		for (const roomId of rooms) {
+			const parent = this.parentOf(roomId);
+			if (parent) shared.add(parent);
+		}
+		for (const server of new Set(pairs.filter((pair) => shared.has(pair.room_id)).map((pair) => pair.server))) this.kickSender(server);
+	}
+
+	/** A room's parent, if it is a thread (fixed at creation, so kept once read); null for a top-level room. */
+	private parentOf(roomId: string): string | null {
+		const known = this.roomParents.get(roomId);
+		if (known !== undefined) return known;
+		let parent: string | null = null;
+		try {
+			parent = this.store.getRoom(roomId, nowMs())?.parent_room_id ?? null;
+		} catch {
+			return null;
+		}
+		if (this.roomParents.size > 512) this.roomParents.clear();
+		this.roomParents.set(roomId, parent);
+		return parent;
 	}
 
 	/**
@@ -8874,7 +8952,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const sender = this.senderFor(server);
 			if (sender.running || (sender.retryAt !== undefined && sender.retryAt > now)) continue;
 			try {
-				const rooms = pairs.filter((pair) => pair.server === server).map((pair) => pair.room_id);
+				const paired = pairs.filter((pair) => pair.server === server);
+				// The threads of shared rooms too: a new one is sent with its creation.
+				const threads = this.store.threadsOf(paired.filter((pair) => pair.parent === undefined).map((pair) => pair.room_id), now).map((thread) => thread.room_id);
+				const rooms = [...paired.map((pair) => pair.room_id), ...threads];
 				if (sender.outbox.behind(this.store.roomHeads(rooms, now))) this.kickSender(server);
 			} catch { /* the next alarm looks again */ }
 		}
@@ -9020,7 +9101,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const known = () => this.knownSelf;
 		return {
 			get self() { return config.remoteSelf ?? known() ?? ""; },
-			pairs: () => new Map(store.remotePairs(nowMs()).filter((pair) => pair.server === server).map((pair) => [pair.room_id, { remote: pair.remote_room, start: pair.start_log_id }])),
+			pairs: () => new Map(store.remotePairs(nowMs()).filter((pair) => pair.server === server).map((pair) => [pair.room_id, {
+				remote: pair.remote_room, start: pair.start_log_id,
+				...(pair.parent !== undefined ? { parent: pair.parent } : {}), ...(pair.fallback ? { fallback: true } : {}), ...(pair.anchor !== undefined ? { anchor: pair.anchor } : {}),
+			}])),
+			threads: (parents) => store.threadsOf(parents, nowMs()),
+			setThreadPair: (threadId, pair) => {
+				// The thread signs in with its parent's token, as every pair with the server does: the newest.
+				const parent = store.remotePairs(nowMs()).find((candidate) => candidate.server === server && candidate.room_id === pair.parent);
+				if (!parent) return;
+				store.setRemotePair({ room_id: threadId, server, remote_room: pair.remote, token: parent.token, parent: pair.parent, start_log_id: pair.start, ...(pair.fallback ? { fallback: true } : {}) }, nowMs());
+				console.log(JSON.stringify({ event: "remote_thread_paired", server, room_id: threadId, remote_room: pair.remote, fallback: pair.fallback }));
+			},
+			setAnchor: (threadId, messageId) => store.setRemotePairAnchor(threadId, server, messageId, nowMs()),
 			linkInRoom: (roomId) => {
 				const linkId = store.remoteLinkFor(server, nowMs());
 				return linkId !== undefined && store.isRoomMember(roomId, linkId, nowMs());

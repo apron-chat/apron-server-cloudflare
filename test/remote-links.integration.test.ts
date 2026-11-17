@@ -445,3 +445,43 @@ it('ends a pair on an ext:remote request without link, and the link leaves the r
 		expect(general.error).toMatchObject({ code: DENIED, data: { ext: { remote: 'not_joined' } } });
 	} finally { admin.close(); link.close(); }
 });
+
+it('makes and saves a thread of a shared room as a remote user, and pairs it with the remote thread', async () => {
+	const server = 'ws://127.0.0.1:8096/ws';
+	const { peer: admin } = await freshAdmin();
+	const roomId = (await request(admin, unique('room'), 'room_set', { title: unique('Shared') })).result.room_id as string;
+	const invited = await command(admin, unique('invite'), `/remote invite ${server}`, roomId);
+	const token = invited.notice!.params.body.text.match(/&token=(apron_invite_[A-Za-z0-9_-]{43})/)![1];
+	const { peer: link } = await signIn(token);
+	const privateRoom = (await request(admin, unique('private'), 'room_set', { private: true })).result.room_id as string;
+	await command(admin, unique('invite2'), `/remote invite ${server}`, privateRoom);
+	try {
+		expect((await request(link, 'pair', 'ext:remote', { room_id: roomId, link: `https://link.apron.chat/#server=${server}&room=ops&token=t` })).result).toEqual({});
+		const carol = unique('carol');
+		const shadowId = `${carol}@127.0.0.1:8096`;
+		const made = await request(link, unique('thread'), 'room_set', { parent_room_id: roomId, title: 'Plans', ext: { remote: { user_id: carol, room_id: 'remote-thread' } } });
+		const threadId = made.result.room_id as string;
+		expect(threadId).toBeDefined();
+		const listed = await request(admin, unique('list'), 'room_list', { room_id: threadId, members: true });
+		const thread = [...listed.result.joined, ...listed.result.not_joined][0];
+		expect(thread).toMatchObject({ room_id: threadId, parent_room_id: roomId, title: 'Plans' });
+		expect(listed.result.users.map((user: { user_id: string }) => user.user_id)).toContain(shadowId);
+		expect((await command(admin, unique('list'), '/remote list', roomId)).notice!.params.body.text).toContain(`\`${threadId}\` ↔ \`remote-thread\``);
+		// The link acts in the thread of a room it has joined.
+		const posted = await request(link, unique('post'), 'message', { room_id: threadId, body: { text: 'in the thread' }, ext: { remote: { user_id: unique('dave'), message_id: 'm1' } } });
+		expect(posted.result.message_id).toBeDefined();
+		const saved = await request(link, unique('save'), 'room_set', { room_id: threadId, title: 'Plans v2', ext: { remote: { user_id: carol } } });
+		expect(saved.error).toBeUndefined();
+		expect((await request(admin, unique('list2'), 'room_list', { room_id: threadId })).result.not_joined?.[0]?.title ?? (await request(admin, unique('list3'), 'room_list', { room_id: threadId })).result.joined[0].title).toBe('Plans v2');
+		// Only threads: no top-level room, no private room; no thread under a private room here.
+		expect((await request(link, unique('top'), 'room_set', { title: 'x', ext: { remote: { user_id: carol, room_id: 'r' } } })).error.code).toBe(DENIED);
+		expect((await request(link, unique('priv'), 'room_set', { private: true, ext: { remote: { user_id: carol, room_id: 'r' } } })).error.code).toBe(DENIED);
+		expect((await request(link, unique('privthread'), 'room_set', { parent_room_id: privateRoom, title: 'x', ext: { remote: { user_id: carol, room_id: 'r2' } } })).error.code).toBe(DENIED);
+		// Not under a room the link has not joined.
+		const general = await request(link, unique('general'), 'room_set', { parent_room_id: 'general', title: 'x', ext: { remote: { user_id: carol, room_id: 'r3' } } });
+		expect(general.error).toMatchObject({ code: DENIED, data: { ext: { remote: 'not_joined' } } });
+		// Unsharing the parent ends the thread's pair too.
+		await command(admin, unique('unshare'), '/remote unshare', roomId);
+		expect((await command(admin, unique('list4'), '/remote list', roomId)).notice!.params.body.text).not.toContain(threadId);
+	} finally { admin.close(); link.close(); }
+});
