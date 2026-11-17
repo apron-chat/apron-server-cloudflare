@@ -3,7 +3,8 @@
  * dataset binding), beside the sampled Workers Logs: a data point is never
  * sampled away by `head_sampling_rate`, and one SQL query counts them
  * (`npm run usage:report`). Each point is `blob1` the event, `blob2`
- * onward its details, and `double1` its value (1 for a plain count), with
+ * onward its details, and `double1` its value (1 for a plain count; an
+ * event with more than one value has them in `double2` onward), with
  * the event as its index. Writing is fire-and-forget: it neither awaits nor
  * throws, and without the binding nothing is written.
  */
@@ -38,14 +39,34 @@ export type MetricEvent =
 	| "refusal"
 	/**
 	 * The SQLite database's occupied bytes (Store.databaseSize), valued by
-	 * the size: at most one an hour per instance, from an alarm
-	 * (ApronDemoServer.maybeRecordDatabaseSize). Take its max, not its sum.
+	 * the size: from a full alarm (maintenance: about daily on a quiet Paid
+	 * server, so a day may have none; more with uploads, live text or
+	 * sweeps), at most once an hour per instance
+	 * (ApronDemoServer.checkDatabaseSize). Take its max, not its sum.
 	 */
-	| "db_bytes";
+	| "db_bytes"
+	/**
+	 * Something took 5 seconds or more (src/stalls.ts): its kind (`handler`,
+	 * `queue`, `mutation`, `r2`, `push`, `analytics` or `storage`) and detail
+	 * (the event, or the R2 operation); valued by count, with the worst and
+	 * the total milliseconds in `double2` and `double3`.
+	 */
+	| "slow"
+	/**
+	 * An instance stayed in memory 3 minutes or more without hibernating
+	 * (src/stalls.ts), then at most once per 15: what it had in flight
+	 * (`none`, or `kind=count` pairs, with its guest (`anonymous`), not yet
+	 * signed in (`pending`, `overdue` past the deadline) and closed but still
+	 * listed (`closing`, `closing_min` since the oldest opened) sockets);
+	 * valued by its age in minutes, with the events it
+	 * handled since its last report and its open sockets in `double2` and
+	 * `double3`.
+	 */
+	| "awake";
 
-export function recordMetric(dataset: AnalyticsEngineDataset | undefined, event: MetricEvent, details: readonly string[] = [], value = 1): void {
+export function recordMetric(dataset: AnalyticsEngineDataset | undefined, event: MetricEvent, details: readonly string[] = [], value: number | readonly number[] = 1): void {
 	if (!dataset) return;
 	try {
-		dataset.writeDataPoint({ indexes: [event], blobs: [event, ...details], doubles: [value] });
+		dataset.writeDataPoint({ indexes: [event], blobs: [event, ...details], doubles: typeof value === "number" ? [value] : [...value] });
 	} catch { /* a metric never breaks what it counts */ }
 }

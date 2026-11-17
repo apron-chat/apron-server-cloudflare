@@ -5,7 +5,9 @@
 // (GraphQL analytics, exact), its invocations and those that threw (GraphQL
 // adaptive analytics, sampled at high volume), and the counters in the
 // METRICS Analytics Engine dataset (src/metrics.ts), unsampled, with the
-// refusals (src/refusals.ts) in a table of their own.
+// refusals (src/refusals.ts) in a table of their own. Hours the object was
+// awake for half or more are listed, with the slow waits and long-awake
+// instances (src/stalls.ts) that say what it was waiting on.
 //
 //   CLOUDFLARE_ACCOUNT_ID=... CLOUDFLARE_API_TOKEN=... npm run usage:report -- --days 3
 //
@@ -62,6 +64,9 @@ const durable = await graphql(`{ viewer { accounts(filter: { accountTag: ${JSON.
 } } }`);
 
 const perDay = new Map();
+// Hibernation keeps a normal hour to a few minutes awake: half an hour or
+// more is traffic or a stall, which the slow and awake tables tell apart.
+const awakeHours = [];
 const dayOf = (date) => perDay.get(date) ?? perDay.set(date, { awake: 0, gbSeconds: 0, sockets: 0, busiest: 0, requests: 0, threw: 0 }).get(date);
 for (const hour of durable.hours) {
 	const day = dayOf(hour.dimensions.datetimeHour.slice(0, 10));
@@ -70,6 +75,7 @@ for (const hour of durable.hours) {
 	day.gbSeconds += hour.sum.duration;
 	day.sockets = Math.max(day.sockets, hour.max.activeWebsocketConnections);
 	day.busiest = Math.max(day.busiest, awake / 3_600);
+	if (awake >= 1_800) awakeHours.push({ hour: hour.dimensions.datetimeHour.slice(0, 13).replace("T", " "), "awake min": Math.round(awake / 60), "peak sockets": hour.max.activeWebsocketConnections });
 }
 for (const group of durable.invocations) {
 	const day = dayOf(group.dimensions.date);
@@ -89,12 +95,15 @@ console.table([...perDay].sort(([a], [b]) => a.localeCompare(b)).map(([date, day
 	invocations: Math.round(day.requests),
 	threw: day.threw,
 })));
+console.log("\nHours awake for 30 minutes or more (UTC; every Durable Object in the account)\n");
+if (!awakeHours.length) console.log("(none)");
+else console.table(awakeHours);
 
 const since = start.toISOString().slice(0, 19).replace("T", " ");
 try {
 	const rows = await analyticsSql(`SELECT toStartOfDay(timestamp) AS day, blob1 AS event, blob2 AS detail,
 		SUM(_sample_interval) AS points, SUM(_sample_interval * double1) AS value
-		FROM ${dataset} WHERE timestamp >= toDateTime('${since}') AND blob1 NOT IN ('refusal', 'db_bytes')
+		FROM ${dataset} WHERE timestamp >= toDateTime('${since}') AND blob1 NOT IN ('refusal', 'db_bytes', 'slow', 'awake')
 		GROUP BY day, event, detail ORDER BY day, event, detail FORMAT JSON`);
 	console.log(`\nCounters in ${dataset}, per UTC day (Analytics Engine, unsampled)\n`);
 	if (!rows.length) console.log("(none yet)");
@@ -103,17 +112,46 @@ try {
 	console.log(`\nCounters in ${dataset}: unavailable (${error.message}). The dataset exists once the server has written to it.`);
 }
 
-// The database's size (src/metrics.ts db_bytes), recorded hourly from an
-// alarm: its largest each day, against the storage watermarks.
+// The database's size (src/metrics.ts db_bytes), recorded from full alarms
+// at most hourly: its largest each day, against the storage watermarks.
 try {
 	const rows = await analyticsSql(`SELECT toStartOfDay(timestamp) AS day, MAX(double1) AS bytes, COUNT() AS samples
 		FROM ${dataset} WHERE timestamp >= toDateTime('${since}') AND blob1 = 'db_bytes'
 		GROUP BY day ORDER BY day FORMAT JSON`);
-	console.log(`\nDatabase size in ${dataset}, per UTC day (largest of the hourly samples)\n`);
+	console.log(`\nDatabase size in ${dataset}, per UTC day (largest of the samples)\n`);
 	if (!rows.length) console.log("(none yet)");
 	else console.table(rows.map((row) => ({ day: String(row.day).slice(0, 10), "MB": Math.round(Number(row.bytes) / 1e5) / 10, samples: Number(row.samples) })));
 } catch (error) {
 	console.log(`\nDatabase size in ${dataset}: unavailable (${error.message}).`);
+}
+
+// What took 5 seconds or more (src/stalls.ts): one point holds a minute's
+// repeats, so the count is the sum of double1; double2 is the worst and
+// double3 the total milliseconds.
+try {
+	const rows = await analyticsSql(`SELECT toStartOfDay(timestamp) AS day, blob2 AS kind, blob3 AS detail,
+		SUM(_sample_interval * double1) AS slow_count, MAX(double2) AS worst, SUM(_sample_interval * double3) AS total
+		FROM ${dataset} WHERE timestamp >= toDateTime('${since}') AND blob1 = 'slow'
+		GROUP BY day, kind, detail ORDER BY day, total DESC FORMAT JSON`);
+	console.log(`\nSlow waits in ${dataset}, per UTC day (5 s or more: handlers, the change queue, R2, pushes, analytics, the storage flush)\n`);
+	if (!rows.length) console.log("(none)");
+	else console.table(rows.map((row) => ({ day: String(row.day).slice(0, 10), kind: row.kind, detail: row.detail, count: Number(row.slow_count), "worst s": Math.round(Number(row.worst) / 1_000), "average s": Math.round(Number(row.total) / Number(row.slow_count) / 1_000) })));
+} catch (error) {
+	console.log(`\nSlow waits in ${dataset}: unavailable (${error.message}).`);
+}
+
+// Instances that stayed in memory 3 minutes or more (src/stalls.ts), then
+// at most four points an hour each: their age, the events they handled since
+// the last report, open sockets, and what was in flight.
+try {
+	const rows = await analyticsSql(`SELECT timestamp, blob2 AS pending, double1 AS age, double2 AS events, double3 AS sockets
+		FROM ${dataset} WHERE timestamp >= toDateTime('${since}') AND blob1 = 'awake'
+		ORDER BY timestamp DESC LIMIT 48 FORMAT JSON`);
+	console.log(`\nLong-awake instances in ${dataset} (latest 48; few events with something in flight is a stall, many is traffic)\n`);
+	if (!rows.length) console.log("(none)");
+	else console.table(rows.reverse().map((row) => ({ at: String(row.timestamp).slice(0, 16), "age min": Number(row.age), events: Number(row.events), sockets: Number(row.sockets), "in flight": row.pending })));
+} catch (error) {
+	console.log(`\nLong-awake instances in ${dataset}: unavailable (${error.message}).`);
 }
 
 // Refusals (src/refusals.ts): one point holds many repeats, so the count is

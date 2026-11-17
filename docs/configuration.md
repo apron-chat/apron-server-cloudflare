@@ -165,8 +165,8 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   on or off, when the server changes tier or an action's breaker opens or
   closes (see [Server tiers](#server-tiers)), at the day's first storage
   overrun, and when the database passes half its high-water mark (384 MiB
-  of 768 on Paid; the size comes from the `db_bytes` reading, taken at most
-  hourly from an alarm, and the told-once flag is one `_meta` row; told
+  of 768 on Paid; the size is read from the SQL handle, no query, at most
+  hourly an instance from an alarm, and the told-once flag is one `_meta` row; told
   again only after the size falls under 40%), and when long room
   descriptions fill `roomMetadataTotalLimit` (at the first save it refuses,
   naming the public rooms holding the most past the minimum; told again only
@@ -229,13 +229,29 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   tier and the one before), throttle trips (`throttle`: the trigger and the
   method refused; see Server tiers), admin alerts (`admins_notified`), the edge
   stop turning on or off (`edge_stop`: `guard` or `flood`, or `lifted`), the
-  database's occupied bytes (`db_bytes`, valued by the size, at most once an
-  hour from an alarm, so take the max, not the sum: its trend toward the
-  storage watermarks), and refusals (`refusal`, `src/refusals.ts`): `error` for a JSON-RPC error (a
+  database's occupied bytes (`db_bytes`, valued by the size, from a full
+  alarm at most once an hour, about daily on a quiet server, so a day may
+  have none; take the max, not the sum: its trend toward the storage
+  watermarks), anything that took 5 seconds or more (`slow`,
+  `src/stalls.ts`: the object's own `handler` by event, the wait behind
+  earlier changes `queue` and a change's own run `mutation`, `r2` by
+  operation, `push`, the account usage reading `analytics`, and the storage
+  flush after each alarm `storage`; summed a minute at a time like refusals,
+  so `double1` is a count, `double2` the worst and `double3` the total
+  milliseconds), an instance in memory 3 minutes or more without hibernating
+  (`awake`, then every 15 minutes, at most four points an hour: what it had
+  in flight, how many of its sockets are guests, not signed in yet or past
+  their sign-in deadline, and how many it closed that the runtime still
+  lists with the minutes since the oldest of those opened, its age in
+  minutes, the events it handled since the last point and its open sockets;
+  few events with something in flight is a stall, many is traffic), and
+  refusals (`refusal`, `src/refusals.ts`): `error` for a JSON-RPC error (a
   `retry_after` by its message and `data.reason`, any other by its name
   alone, since those messages may name users) with the method when the
   server knows it, else `other`; `close` for a policy close, with its code
-  and reason; and `http` for a refusal the object answers before an upgrade,
+  and reason (a sign-in timeout on a connection that never sent a frame,
+  not even a ping, is `silent`: its client may have gone during the
+  upgrade); and `http` for a refusal the object answers before an upgrade,
   with its status and message and `upgrade`, `probe`, `live_write` or
   `live_read`. Refusals the entry Worker answers by itself (the attempt
   limits, a full or paused server it already knows of) are not counted. A
@@ -246,12 +262,14 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   is `blob1` the event, `blob2` onward its details and `double1` its
   value. Writing never awaits or throws, and without the binding nothing is
   written. Workers Paid includes 10 million data points a month; this server
-  writes a few thousand a day, and refusals at most 130 a minute. `npm run usage:report -- --days 3` (with
+  writes a few thousand a day, refusals at most 130 a minute, and slow waits
+  at most two a minute per kind and detail even while every event is slow. `npm run usage:report -- --days 3` (with
   `CLOUDFLARE_ACCOUNT_ID` and a `CLOUDFLARE_API_TOKEN` that has Account
   Analytics Read) prints each UTC day's Durable Object awake time, billed
-  duration, peak sockets and busiest hour from GraphQL analytics, the
-  counters from the dataset, each day's largest database size, and the
-  refusals by kind, reason and method.
+  duration, peak sockets and busiest hour from GraphQL analytics, and each
+  hour awake for 30 minutes or more; the counters from the dataset, each
+  day's largest database size, the slow waits by kind, the latest long-awake
+  instances, and the refusals by kind, reason and method.
 
 Set it up once per deployment:
 
