@@ -244,8 +244,16 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   their sign-in deadline, and how many it closed that the runtime still
   lists with the minutes since the oldest of those opened, its age in
   minutes, the events it handled since the last point and its open sockets;
-  few events with something in flight is a stall, many is traffic), and
-  refusals (`refusal`, `src/refusals.ts`): `error` for a JSON-RPC error (a
+  few events with something in flight is a stall, many is traffic), active
+  users (`active`: `read` at a connection's sign-in or its first frame of a
+  UTC day, `write` at its first new message of the day, at most one of each
+  a connection a day, with the tier, `registered`, `guest` or `bot`, and the
+  user_id, or for a guest, whose id is new at each sign-in, `g:` and an HMAC
+  of its address key under a key derived from `UPLOAD_SIGNING_KEY`, stable
+  across days but not traceable to an address without that secret (no guest
+  is recorded without it); count distinct users for daily, weekly and monthly
+  active users; the dataset is internal, read only with the account's API
+  token), and refusals (`refusal`, `src/refusals.ts`): `error` for a JSON-RPC error (a
   `retry_after` by its message and `data.reason`, any other by its name
   alone, since those messages may name users) with the method when the
   server knows it, else `other`; `close` for a policy close, with its code
@@ -269,7 +277,8 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   duration, peak sockets and busiest hour from GraphQL analytics, and each
   hour awake for 30 minutes or more; the counters from the dataset, each
   day's largest database size, the slow waits by kind, the latest long-awake
-  instances, and the refusals by kind, reason and method.
+  instances, active users who read and who wrote by tier, each day and over
+  the last 7 and 30 days, and the refusals by kind, reason and method.
 
 Set it up once per deployment:
 
