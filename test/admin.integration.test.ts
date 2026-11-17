@@ -178,8 +178,12 @@ it('/status shows active users read back from the METRICS dataset where configur
 	vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
 		const url = String(input instanceof Request ? input.url : input);
 		if (!url.endsWith('/analytics_engine/sql')) return new Response('{}', { status: 500 });
-		queries.push(String(init?.body));
-		return new Response(JSON.stringify({ data: [{ bucket: 'read', users: '12', first: '2026-11-17 18:01:30' }, { bucket: 'write', users: 3, first: '2026-11-17 19:00:00' }] }), { status });
+		const sql = String(init?.body);
+		queries.push(sql);
+		if (status !== 200) return new Response('denied', { status });
+		// The first point of all, a day ago; or each window's distinct users.
+		if (!sql.includes('COUNT(DISTINCT')) return new Response(JSON.stringify({ data: [{ first: new Date(Date.now() - 86_400_000).toISOString().slice(0, 19).replace('T', ' ') }] }));
+		return new Response(JSON.stringify({ data: [{ bucket: 'read', users: '12' }, { bucket: 'write', users: 3 }] }));
 	});
 	const configure = (on: boolean) => runInDurableObject(stub(), (instance) => {
 		const runtime = (instance as unknown as Configured).runtimeEnv;
@@ -192,12 +196,14 @@ it('/status shows active users read back from the METRICS dataset where configur
 		expect(queries).toEqual([]);
 		await configure(true);
 		const text: string = (await command(admin, 'status-active', '/status')).notice!.params.body.text;
-		expect(text).toMatch(/^- Active users \(read \/ wrote\): today 12 \/ 3 · last 7 days 12 \/ 3 · last 30 days 12 \/ 3( \(counted since 2026-11-17\))?$/m);
-		expect(queries).toHaveLength(3);
+		const since = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+		expect(text).toMatch(new RegExp(`^- Active users \\(read / wrote\\): today 12 / 3 · last 7 days 12 / 3 · last 30 days 12 / 3 \\(counted since ${since}\\)$`, 'm'));
+		expect(queries).toHaveLength(4);
 		expect(queries.every((sql) => sql.includes('FROM apron_server_metrics_test WHERE'))).toBe(true);
 		status = 403;
-		expect((await command(admin, 'status-refused', '/status')).notice!.params.body.text).toMatch(/^- Active users \(read \/ wrote\): unavailable \(Analytics Engine HTTP 403\)$/m);
+		expect((await command(admin, 'status-refused', '/status')).notice!.params.body.text).toMatch(/^- Active users \(read \/ wrote\): unavailable \(Analytics Engine HTTP 403: denied\)$/m);
 	} finally {
+		vi.restoreAllMocks();
 		await configure(false);
 		admin.close();
 	}

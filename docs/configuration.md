@@ -280,7 +280,8 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   instances, active users who read and who wrote by tier, each day and over
   the last 7 and 30 days, and the refusals by kind, reason and method. An
   admin's `/status` also shows active users (read / wrote) today, over the
-  last 7 days and over the last 30, read back with three queries through the
+  last 7 days and over the last 30, and the day counting began while that is
+  within the 30, read back with four small queries through the
   Analytics Engine SQL API (`ACCOUNT_ID`, `ACCOUNT_ANALYTICS_TOKEN`, whose
   Account Analytics Read covers it, and `METRICS_DATASET`), or why they are
   unavailable.

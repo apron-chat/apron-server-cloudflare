@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, DEFAULT_LIMITS, PLAN } from '../src/budget.ts';
 import { loadConfig } from '../src/config.ts';
+import { DATASET_PATTERN } from '../src/active-users.ts';
 
 const root = new URL('../', import.meta.url);
 const begin = '# BEGIN GENERATED ADMISSION BUDGET';
@@ -438,6 +439,8 @@ function validatePreviews(production, previews) {
 function validateMetricsDataset(source, label) {
 	const named = wranglerVars(source).METRICS_DATASET;
 	if (named === undefined) return;
+	// What /status would refuse to put in its SQL, leaving the line out silently.
+	if (!DATASET_PATTERN.test(named)) throw new Error(`The ${label} METRICS_DATASET var (${named}) must be letters, digits and _`);
 	const bound = [...source.matchAll(/^\[\[analytics_engine_datasets\]\]\s*(?:#.*)?\n((?:[^\[\n].*\n?|\n)*)/gm)]
 		.map(([, table]) => ({ binding: table.match(/^binding\s*=\s*"([^"]+)"/m)?.[1], dataset: table.match(/^dataset\s*=\s*"([^"]+)"/m)?.[1] }))
 		.find((entry) => entry.binding === 'METRICS')?.dataset;

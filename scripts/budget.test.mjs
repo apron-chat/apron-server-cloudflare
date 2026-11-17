@@ -375,6 +375,8 @@ test('METRICS_DATASET, where set, names the dataset its METRICS binding writes, 
 	assert.doesNotThrow(() => check(route + production() + previews()));
 	assert.throws(() => check(route + production('apron_server_metrics_preview') + previews()), /production METRICS_DATASET/);
 	assert.throws(() => check(route + production('apron_server_metrics') + previews('apron_server_metrics')), /Previews METRICS_DATASET/);
+	// A name /status would not put in its SQL, though it matches the binding.
+	assert.throws(() => check(route + production('apron-server-metrics').replace('dataset = "apron_server_metrics"', 'dataset = "apron-server-metrics"') + previews()), /letters, digits and _/);
 });
 
 test('Previews need their own domain and DEMO binding, and share no bucket, dataset or origin with production', () => {

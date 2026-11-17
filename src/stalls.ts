@@ -18,8 +18,8 @@
  *   events'), never computation alone. It notes the object's own handlers (`handler`, by
  *   event), the wait for earlier changes (`queue`) and a change's own run
  *   (`mutation`, which awaits only R2 and signing), and the I/O each
- *   awaits: R2 (`r2`), pushes (`push`), the account usage reading
- *   (`analytics`), and the storage flush after an alarm (`storage`). Fast
+ *   awaits: R2 (`r2`), pushes (`push`), the account usage reading and
+ *   `/status`'s active users (`analytics`), and the storage flush after an alarm (`storage`). Fast
  *   handlers with slow platform totals mean the platform waited, not us.
  * - `awake`: an instance alive `firstAwakeMs` without hibernating (a wake
  *   from hibernation builds a new one, so an instance's age is how long the
