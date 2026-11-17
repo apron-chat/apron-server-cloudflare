@@ -291,21 +291,39 @@ used the old one; `/invite-device remove <id>` revokes it, and
 
 ## Linking another server
 
-This server never connects out, but it can share a room with another Apron
-server whose bridge connects in (extension `ext:remote`; [SPEC section
-4](../SPEC.md#extension-extremote)). As an admin, in the room to share (a
-private one works: create it with `room_set` and `private: true`), run
-`/remote invite <address of the other server>`, such as
-`/remote invite wss://go.example/ws`. The `~private` notice holds a link,
-`https://link.apron.chat/#server=<this server>&room=<room>&token=<token>`,
-for the other server's bridge: it signs in as the new link account
-(`link_1`, a bot) and posts here as the other server's users, which appear as
-`carol@go.example` with `ext.remote` naming their server. Hand it over
-privately. `/remote list` shows the links, and `/remote revoke <link_id>`
-signs one out for good. Locally, with `--var APRON_ADMIN_TOKEN:<token>`, the
-WebSocket path is `ws://127.0.0.1:8787/ws` for `wrangler dev --port 8787`.
-A private room is removed once nothing has been posted in it for the
-retention period, link or not.
+Two Apron servers whose operators trust each other can share rooms (extension
+`ext:remote`, the [trusted federation](https://github.com/shazow/apron/blob/main/recipes/trusted_federation.md)
+recipe; [SPEC section 4](../SPEC.md#extension-extremote)). Set `REMOTE_SELF`
+to this server's address as others dial it, such as `wss://chat.example/ws`.
+As an admin, in the room to share (a private one works: create it with
+`room_set` and `private: true`), run `/remote invite <the other server's address>`.
+The `~private` notice holds an invite,
+`https://link.apron.chat/#server=<this server>&room=<room>&token=<token>`; hand
+it privately to an admin of the other server, who runs
+`/remote connect <invite>` in their room. Then each server sends its own
+users' messages, edits, deletes, reactions and leaves to the other as they
+happen, dialing out on demand and closing the connection after
+`REMOTE_LINGER_MS`. The other server's users appear here as
+`carol@go.example`, with `ext.remote` naming their server. Run the same two
+commands in another room to share it too; both use the same links.
+`/remote unshare` stops one room, `/remote revoke <address>` every room with a
+server, and `/remote list` shows what is shared.
+
+Locally, two instances share rooms like this (each with its own state and
+inspector port):
+
+```sh
+npx wrangler dev --port 8787 --ip 127.0.0.1 --persist-to .state-a --inspector-port 9787 \
+  --var APRON_ADMIN_TOKEN:dev-admin-token-0123456789abcdef --var REMOTE_SELF:ws://127.0.0.1:8787/ws --var REMOTE_LINGER_MS:2000
+npx wrangler dev --port 8788 --ip 127.0.0.1 --persist-to .state-b --inspector-port 9788 \
+  --var APRON_ADMIN_TOKEN:dev-admin-token-0123456789abcdef --var REMOTE_SELF:ws://127.0.0.1:8788/ws --var REMOTE_LINGER_MS:2000
+```
+
+A headless client signs in as the admin with `auth` `{"scheme": "token",
+"token": <APRON_ADMIN_TOKEN>}`, and makes users with `/invite-token <user_id>`,
+whose notice holds a token that signs in the same way. A private room is
+removed once nothing has been posted in it for the retention period, shared or
+not.
 
 ## User-visible policies
 

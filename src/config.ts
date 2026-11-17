@@ -1,3 +1,4 @@
+import { normalizeRemoteAddress } from "./remote.ts";
 import * as budget from "./budget.ts";
 import { DEFAULT_FEATURES, DEFAULT_LIMITS, LIVE_TEXT_POLICY, MAX_PUSH_CANDIDATES, MAX_PUSHES_PER_MESSAGE, MAX_STATUS_DELAY_SECONDS, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits, type LiveTextPolicy, type PushPolicy } from "./budget.ts";
 import { billCap, type BillCap } from "./pricing.ts";
@@ -67,6 +68,14 @@ export interface RuntimeConfig {
 	 * secret, never in source. Unset, no such token exists.
 	 */
 	adminToken?: string;
+	/**
+	 * This server's own address as other servers dial it (`REMOTE_SELF`,
+	 * extension `ext:remote`): the `server` of its `/remote` invites. Unset,
+	 * the WebSocket URL the admin's connection reached.
+	 */
+	remoteSelf?: string;
+	/** How long an outbound link connection stays open with nothing to send (`REMOTE_LINGER_MS`, default 30000). */
+	remoteLingerMs: number;
 	/**
 	 * Uploads (protocol §4.8.3, cap `embed:upload`), on when the plan has an
 	 * upload policy and the deployment sets `MEDIA_ORIGIN`, `PUBLIC_ORIGIN`,
@@ -271,6 +280,8 @@ type EnvLike = {
 	TERMINAL_VIEWER_URL?: string;
 	ATTACK_PAUSE?: string;
 	APRON_ADMIN_TOKEN?: string;
+	REMOTE_SELF?: string;
+	REMOTE_LINGER_MS?: string;
 	MEDIA_ORIGIN?: string;
 	MEDIA_NOSNIFF?: string;
 	PUBLIC_ORIGIN?: string;
@@ -570,6 +581,10 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 	const adminToken = env.APRON_ADMIN_TOKEN === undefined || env.APRON_ADMIN_TOKEN === "" ? undefined : String(env.APRON_ADMIN_TOKEN);
 	const adminTokenProblem = adminToken === undefined ? null : adminTokenError(adminToken);
 	if (adminTokenProblem) throw new ConfigError(adminTokenProblem);
+	const remoteSelf = env.REMOTE_SELF === undefined || env.REMOTE_SELF === "" ? undefined : normalizeRemoteAddress(String(env.REMOTE_SELF));
+	if (env.REMOTE_SELF !== undefined && env.REMOTE_SELF !== "" && remoteSelf === undefined) throw new ConfigError("REMOTE_SELF must be a ws:// or wss:// URI");
+	const remoteLingerMs = env.REMOTE_LINGER_MS === undefined || env.REMOTE_LINGER_MS === "" ? 30_000 : Number(env.REMOTE_LINGER_MS);
+	if (!Number.isSafeInteger(remoteLingerMs) || remoteLingerMs < 0 || remoteLingerMs > 600_000) throw new ConfigError("REMOTE_LINGER_MS must be 0 to 600000");
 	const uploads = loadUploads(env);
 	const liveText = loadLiveText(env, limits);
 	const liveTextEnabled = parseSwitch(env.LIVE_TEXT, "LIVE_TEXT", DEFAULT_FEATURES.liveText);
@@ -605,6 +620,8 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 		signalUnknownPasskeys,
 		externalSignIn,
 		...(adminToken !== undefined ? { adminToken } : {}),
+		...(remoteSelf !== undefined ? { remoteSelf } : {}),
+		remoteLingerMs,
 		...(uploads ? { uploads } : {}),
 		...(liveText ? { liveText } : {}),
 		liveTextEnabled,

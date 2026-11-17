@@ -1246,6 +1246,27 @@ const META_BOT_SWEEP = "bot_sweep_ms";
  * absent, there are none. Links are never signed out as idle bots.
  */
 const META_REMOTE_LINKS = "remote_links";
+/** `_meta` key: the room pairs (ext:remote), a JSON array of RemotePair, at most MAX_REMOTE_PAIRS. */
+const META_REMOTE_PAIRS = "remote_pairs";
+/** `_meta` key: each remote server's outbox (ext:remote), a JSON object of RemoteOutbox by server address. */
+const META_REMOTE_OUTBOX = "remote_outbox";
+/** The most room pairs a server keeps (ext:remote). */
+export const MAX_REMOTE_PAIRS = 64;
+
+/** One of this server's rooms shared with a remote server (ext:remote; Store.remotePairs). */
+export interface RemotePair {
+  room_id: string;
+  server: string;
+  remote_room: string;
+  token: string;
+  created_ms: number;
+}
+
+/** A remote server's outbox (ext:remote): the log ID sent through, and why it stopped, if it did. */
+export interface RemoteOutbox {
+  cursor: number;
+  stopped?: string;
+}
 
 /** The limiter scopes keyed by a registered user (`user:<user_id>`), which `/rename` moves. */
 const USER_LIMIT_SCOPES = ["post", "history", "upload", "push", "push_recipient", "push_joined_recipient"] as const;
@@ -1798,10 +1819,11 @@ function recordedUser(userId: string, name: string | null | undefined, remote?: 
 /**
  * The key of a remote message a link wrote (ext:remote), as
  * `message_state.remote_key` holds it: the link and the message's remote
- * `room_id` and `message_id`; undefined unless both are strings.
+ * `message_id`; undefined unless that is a string.
  */
 function remoteMessageKey(link: string, remote: Record<string, unknown>): string | undefined {
-  return typeof remote.room_id === "string" && typeof remote.message_id === "string" ? JSON.stringify([link, remote.room_id, remote.message_id]) : undefined;
+  // A message_id is unique across the remote server's rooms (§2.2), so the room is not part of it.
+  return typeof remote.message_id === "string" ? JSON.stringify([link, remote.message_id]) : undefined;
 }
 
 /** A shadow user's `remote` from its identity row's `ext_json` (ext:remote); undefined for anyone else. */
@@ -1985,7 +2007,7 @@ const SCHEMA_10_COPIED_COLUMNS: Record<string, readonly string[]> = {
  *
  * Schema 12 (upgradeFromSchema11), for links (extension `ext:remote`):
  * `message_state.remote_key` is a link's message's key, the link and the
- * remote room and message IDs (remoteMessageKey), indexed where present, so
+ * remote message ID (remoteMessageKey), indexed where present, so
  * a link's repeated create finds its copy; it goes with the message's state.
  * `remote_left` keeps each room another user removed a remote user from,
  * keyed by user, so a later write from its link does not join it again.
@@ -2220,6 +2242,8 @@ export class Store {
   private logCache: RawLogState | null = null;
   /** `_meta` `remote_links` as last read (Store.remoteLinks); undefined until read, and after a change. */
   private remoteLinksCache: Record<string, RemoteLink> | undefined;
+  /** `_meta` `remote_pairs` as last read (Store.remotePairs); undefined until read, and after a change. */
+  private remotePairsCache: RemotePair[] | undefined;
   /**
    * The open live texts (META_LIVE_TEXTS) as last read or saved, undefined
    * until read: every change goes through this instance, and a rolled-back
@@ -2886,6 +2910,7 @@ export class Store {
     this.initialized = false;
     this.logCache = null;
     this.remoteLinksCache = undefined;
+    this.remotePairsCache = undefined;
     this.accountingUncertain = false;
     this.lostOnWake = false;
     this.accountingMarker.load("0");
@@ -5424,9 +5449,130 @@ export class Store {
    * (ext:remote) that it, as any of its shadows, already wrote: that
    * message's `message_id`, tombstone included, or undefined.
    */
-  remoteDuplicate(link: string, remoteRoomId: string, remoteMessageId: string, now = this.clock.now()): string | undefined {
+  remoteDuplicate(link: string, remoteMessageId: string, now = this.clock.now()): string | undefined {
     this.ensureReady();
-    return this.reserved({ reads: 4 }, false, now, () => this.remoteDuplicateRow(remoteMessageKey(link, { room_id: remoteRoomId, message_id: remoteMessageId })!));
+    return this.reserved({ reads: 4 }, false, now, () => this.remoteDuplicateRow(remoteMessageKey(link, { message_id: remoteMessageId })!));
+  }
+
+  /** The link bound to `server` (ext:remote: one a remote server), or undefined. */
+  remoteLinkFor(server: string, now = this.clock.now()): string | undefined {
+    return Object.entries(this.remoteLinks(now)).find(([, link]) => link.server === server)?.[0];
+  }
+
+  /**
+   * The room pairs (ext:remote): each of this server's rooms shared with a
+   * remote server, that server's room, and the token of that server's link
+   * that this server signs in with to send there. `_meta` `remote_pairs`,
+   * read once and kept in memory. The tokens never leave the server.
+   */
+  remotePairs(now = this.clock.now()): readonly RemotePair[] {
+    this.ensureReady();
+    return this.remotePairsCache ??= this.reserved({ reads: 2 }, false, now, () => this.readRemotePairs());
+  }
+
+  private readRemotePairs(): RemotePair[] {
+    return this.metaJson(META_REMOTE_PAIRS, (stored) => Array.isArray(stored)
+      ? stored.filter((pair): pair is RemotePair => isPlainObject(pair) && typeof pair.room_id === "string" && typeof pair.server === "string" &&
+        typeof pair.remote_room === "string" && typeof pair.token === "string")
+      : undefined, []);
+  }
+
+  /**
+   * Stores the pair of `room_id` with `server`, replacing one there was
+   * (ext:remote), at most MAX_REMOTE_PAIRS. The first pair with a server
+   * starts its outbox at the head of the log: nothing older is sent. A pair
+   * also lifts a stop of the server's outbox (an earlier refused sign-in).
+   */
+  setRemotePair(pair: Omit<RemotePair, "created_ms">, now = this.clock.now()): void {
+    this.ensureReady();
+    this.reserved({ reads: 8, writes: 8 }, false, now, () => this.transaction(() => {
+      const pairs = this.readRemotePairs().filter((other) => !(other.room_id === pair.room_id && other.server === pair.server));
+      if (pairs.length >= MAX_REMOTE_PAIRS) throw new StoreError("denied", `This server shares at most ${MAX_REMOTE_PAIRS} rooms`);
+      pairs.push({ ...pair, created_ms: this.effectiveNow(now) });
+      this.writeMeta(META_REMOTE_PAIRS, JSON.stringify(pairs));
+      this.remotePairsCache = undefined;
+      const outboxes = this.readOutboxes();
+      const outbox = outboxes[pair.server];
+      outboxes[pair.server] = { cursor: outbox?.cursor ?? this.logState().last_log_id };
+      this.writeMeta(META_REMOTE_OUTBOX, JSON.stringify(outboxes));
+    }));
+  }
+
+  /** Drops the pairs `drop` picks (ext:remote); the dropped ones. */
+  dropRemotePairs(drop: (pair: RemotePair) => boolean, now = this.clock.now()): RemotePair[] {
+    this.ensureReady();
+    return this.reserved({ reads: 4, writes: 4 }, false, now, () => this.transaction(() => {
+      const pairs = this.readRemotePairs();
+      const dropped = pairs.filter(drop);
+      if (dropped.length) {
+        const kept = pairs.filter((pair) => !drop(pair));
+        this.writeMeta(META_REMOTE_PAIRS, kept.length ? JSON.stringify(kept) : null);
+        this.remotePairsCache = undefined;
+      }
+      return dropped;
+    }));
+  }
+
+  private readOutboxes(): Record<string, RemoteOutbox> {
+    return this.metaJson(META_REMOTE_OUTBOX, (stored) => {
+      const outboxes: Record<string, RemoteOutbox> = {};
+      for (const [server, value] of Object.entries(stored as Record<string, unknown>)) {
+        if (isPlainObject(value)) outboxes[server] = { cursor: integerColumn(value.cursor), ...(typeof value.stopped === "string" ? { stopped: value.stopped } : {}) };
+      }
+      return outboxes;
+    }, {});
+  }
+
+  /** A remote server's outbox (ext:remote): the log ID it has sent through, and why sending stopped, if it did. */
+  remoteOutbox(server: string, now = this.clock.now()): RemoteOutbox | undefined {
+    this.ensureReady();
+    return this.reserved({ reads: 2 }, false, now, () => this.readOutboxes()[server]);
+  }
+
+  /** Moves a remote server's outbox forward to `cursor`, never back, or sets why it stopped (null: going again). */
+  setRemoteOutbox(server: string, change: { cursor?: number; stopped?: string | null }, now = this.clock.now()): void {
+    this.ensureReady();
+    this.reserved({ reads: 2, writes: 2 }, false, now, () => this.transaction(() => {
+      const outboxes = this.readOutboxes();
+      const before = outboxes[server] ?? { cursor: this.logState().last_log_id };
+      const next: RemoteOutbox = { cursor: Math.max(before.cursor, change.cursor ?? 0) };
+      const stopped = change.stopped === undefined ? before.stopped : change.stopped ?? undefined;
+      if (stopped !== undefined) next.stopped = stopped.slice(0, 200);
+      outboxes[server] = next;
+      this.writeMeta(META_REMOTE_OUTBOX, JSON.stringify(outboxes));
+    }));
+  }
+
+  /**
+   * The records of `rooms` after `after`, in log order, at most `limit`
+   * (a move's record is in both of its rooms, so it may come twice, once
+   * for each): one primary-key range of each room. Records below the
+   * history floor are gone already.
+   */
+  outboxRecords(rooms: readonly string[], after: number, limit: number, now = this.clock.now()): Array<{ room_id: string; log_id: number; kind: string; record: Record<string, unknown> }> {
+    this.ensureReady();
+    const ids = [...new Set(rooms)].slice(0, MAX_REMOTE_PAIRS);
+    return this.reserved({ reads: 8 + ids.length * (limit + 2) }, false, now, () => {
+      const floor = this.logState().history_floor;
+      const rows = ids.flatMap((roomId) => this.rawRows<{ room_id: string; log_id: number; kind: string; record_json: string }>(
+        "SELECT room_id, log_id, kind, record_json FROM records WHERE room_id = ? AND log_id > ? ORDER BY log_id LIMIT ?", roomId, Math.max(after, floor - 1), limit,
+      ));
+      rows.sort((a, b) => a.log_id - b.log_id || a.room_id.localeCompare(b.room_id));
+      // Cut at a whole log ID, so a move's two rows go together.
+      const cut = rows.slice(0, limit);
+      if (rows.length > limit) {
+        const last = cut[cut.length - 1].log_id;
+        while (rows.length > cut.length && rows[cut.length].log_id === last) cut.push(rows[cut.length]);
+      }
+      return cut.map((row) => ({ room_id: row.room_id, log_id: integerColumn(row.log_id), kind: row.kind, record: parseJson<Record<string, unknown>>(row.record_json, {}) }));
+    });
+  }
+
+  /** The newest log ID of each of `rooms` (their heads): whether an outbox is behind. One read a room. */
+  roomHeads(rooms: readonly string[], now = this.clock.now()): number {
+    this.ensureReady();
+    const ids = [...new Set(rooms)].slice(0, MAX_REMOTE_PAIRS);
+    return this.reserved({ reads: 4 + 2 * ids.length }, false, now, () => Math.max(0, ...ids.map((roomId) => integerColumn(this.roomRow(roomId)?.latest_log_id ?? 0))));
   }
 
   /** Whether another user removed a remote user from a room (ext:remote: `remote_left`), so its link may not join it again. */

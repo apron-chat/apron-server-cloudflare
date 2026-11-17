@@ -2,6 +2,13 @@
 
 type CanonicalIp =
 	| { kind: "ipv4"; key: string; address: string }
+	/**
+	 * A Worker's subrequest (`CF-Worker`, which Cloudflare sets to the
+	 * calling Worker's zone and a Worker cannot set itself): the zone stands
+	 * for the address. Another Apron server on Workers dials this way to
+	 * send through its link (extension `ext:remote`).
+	 */
+	| { kind: "worker"; key: string; address: string }
 	/** `prefixKey` is the address's /48, which one host or site may hold whole. */
 	| { kind: "ipv6"; key: string; prefixKey: string; address: string };
 
@@ -123,6 +130,25 @@ export function canonicalizeIp(value: string): CanonicalIp | null {
 function isPseudoIpv4(value: string): boolean {
 	const parsed = parseIpv4(value);
 	return parsed !== null && parsed[0] >= 240;
+}
+
+/**
+ * Who a connection comes from: the visitor's address (extractClientIp), or
+ * for a Worker's subrequest its zone (`CF-Worker`), so another server on
+ * Workers can connect as its link to this one (extension `ext:remote`).
+ */
+export function extractClientPrincipal(headers: Headers): CanonicalIp | null {
+	const zone = headers.get("CF-Worker");
+	// Only a subrequest from Workers' own egress (or a loopback address, as in
+	// local development): a visitor who adds the header has their own
+	// address, and stays refused, so nobody picks their own rate-limit key.
+	const connecting = headers.get("CF-Connecting-IP") ?? headers.get("CF-Connecting-IPv6");
+	const from = connecting === null ? null : canonicalizeIp(connecting)?.address.toLowerCase();
+	if (zone !== null && (connecting === null || from === "2a06:98c0:3600::103" || from === "::1" || from?.startsWith("127.") === true)) {
+		const name = zone.trim().toLowerCase();
+		return /^[a-z0-9.-]{1,253}$/.test(name) ? { kind: "worker", key: `worker:${name}`, address: name } : null;
+	}
+	return extractClientIp(headers);
 }
 
 /** Cloudflare's canonical client address headers, with Pseudo IPv4 handling. */

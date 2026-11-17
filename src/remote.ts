@@ -115,3 +115,27 @@ export function actAsUserId(params: Record<string, unknown>): string | undefined
 	const userId = (remote as Record<string, unknown>).user_id;
 	return typeof userId === "string" ? userId : "";
 }
+
+/**
+ * The keys of an Apron link (Appendix A.4) that a `/remote invite` writes:
+ * `server` (normalized), `room` and `token`, from the `https` form
+ * (`https://link.apron.chat/#…`) or the `apron:?` form, the first value of
+ * each key. Undefined unless all three are there and `server` is an address.
+ */
+export function parseInvite(link: string): { server: string; room: string; token: string } | undefined {
+	const trimmed = link.trim().replace(/^<|>$/g, "").replace(/^`|`$/g, "");
+	const keys = trimmed.startsWith("https://link.apron.chat/#") ? trimmed.slice("https://link.apron.chat/#".length)
+		: trimmed.startsWith("apron:?") ? trimmed.slice("apron:?".length) : undefined;
+	if (keys === undefined || keys.length > 2048) return undefined;
+	let params: URLSearchParams;
+	try {
+		params = new URLSearchParams(keys);
+	} catch {
+		return undefined;
+	}
+	const server = normalizeRemoteAddress(params.get("server") ?? "");
+	const room = params.get("room") ?? "";
+	const token = params.get("token") ?? "";
+	if (!server || !room || !token || /[\s\p{Cc}]/u.test(room + token)) return undefined;
+	return { server, room, token };
+}

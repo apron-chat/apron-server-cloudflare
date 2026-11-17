@@ -4,7 +4,7 @@ import { ACCOUNT_USAGE_POLICY, DEFAULT_FEATURES, MAX_GLOBAL_FRAMES_PER_MINUTE, M
 import { PRICES } from '../src/pricing';
 import { FREE_PLAN } from '../src/plans/free';
 import { PAID_PLAN } from '../src/plans/paid';
-import { canonicalizeIp, extractClientIp, hashIpKey, hashIpv6PrefixKey } from '../src/ip';
+import { canonicalizeIp, extractClientIp, extractClientPrincipal, hashIpKey, hashIpv6PrefixKey } from '../src/ip';
 import { withStore } from './helpers/store';
 import { StoreError } from '../src/store';
 import { apronLink, DEFAULT_PARSE_OPTIONS, FrameError, parseFrame } from '../src/protocol';
@@ -49,6 +49,12 @@ describe('trusted IP boundaries', () => {
 		expect(extractClientIp(new Headers({ 'CF-Connecting-IPv6': '2001:db8::1' }))).toBeNull();
 		expect(extractClientIp(new Headers({ 'CF-Connecting-IP': '192.0.2.1', 'CF-Worker': 'example.test' }))).toBeNull();
 		expect(extractClientIp(new Headers({ 'CF-Connecting-IP': '2a06:98c0:3600::103' }))).toBeNull();
+	});
+	it('admits a Worker subrequest from Workers egress by its zone, and never a visitor who adds the header', () => {
+		expect(extractClientPrincipal(new Headers({ 'CF-Connecting-IP': '2a06:98c0:3600::103', 'CF-Worker': 'Chat.Example' }))).toEqual({ kind: 'worker', key: 'worker:chat.example', address: 'chat.example' });
+		expect(extractClientPrincipal(new Headers({ 'CF-Connecting-IP': '127.0.0.1', 'CF-Worker': 'dev.test' }))?.key).toBe('worker:dev.test');
+		expect(extractClientPrincipal(new Headers({ 'CF-Connecting-IP': '192.0.2.1', 'CF-Worker': 'example.test' }))).toBeNull();
+		expect(extractClientPrincipal(new Headers({ 'CF-Connecting-IP': '192.0.2.1' }))?.key).toBe(canonicalizeIp('192.0.2.1')?.key);
 	});
 });
 

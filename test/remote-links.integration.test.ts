@@ -42,15 +42,30 @@ async function command(peer: Peer, id: string, text: string, roomId: string): Pr
  * The admin in a new private room, and a link to `server` invited into it:
  * the link's connection, its user_id, and the invite notice's text.
  */
-async function linked(server: string): Promise<{ admin: Peer; link: Peer; linkId: string; roomId: string; text: string }> {
-	const admin = (await signIn(ADMIN_TOKEN)).peer;
-	const roomId = (await request(admin, 'room', 'room_set', { private: true })).result.room_id as string;
+async function linked(server: string): Promise<{ admin: Peer; adminId: string; link: Peer; linkId: string; roomId: string; text: string }> {
+	const { peer: admin, userId: adminId } = await freshAdmin();
+	// A request id of its own: an accepted request id is deduplicated for a day (§1.2).
+	const roomId = (await request(admin, unique('room'), 'room_set', { private: true })).result.room_id as string;
 	const invited = await command(admin, 'invite', `/remote invite ${server}`, roomId);
 	expect(invited.frame.result).toEqual({});
 	const text: string = invited.notice!.params.body.text;
 	const token = text.match(/&token=(apron_invite_[A-Za-z0-9_-]{43})/)![1];
 	const { peer: link, you } = await signIn(token);
-	return { admin, link, linkId: you.user_id, roomId, text };
+	return { admin, adminId, link, linkId: you.user_id, roomId, text };
+}
+
+/**
+ * A new admin of its own, so each test's private rooms count against its
+ * own limits: the `admin` user makes a token user and gives it the role.
+ */
+async function freshAdmin(): Promise<{ peer: Peer; userId: string }> {
+	const root = (await signIn(ADMIN_TOKEN)).peer;
+	const userId = unique('op');
+	const made = await command(root, unique('make'), `/invite-token ${userId}`, 'general');
+	const token = made.notice!.params.body.text.match(/```\n(apron_invite_[A-Za-z0-9_-]{43})\n```/)![1];
+	expect((await command(root, unique('grant'), `/admin ${userId}`, 'general')).frame.result).toEqual({});
+	root.close();
+	return { peer: (await signIn(token)).peer, userId };
 }
 
 const messageFrom = (userId: string) => (frame: Frame) => frame.method === 'message' && frame.params.from?.user_id === userId;
@@ -60,8 +75,10 @@ it('/remote invite creates a link bound to the address, in the private room, wit
 	try {
 		expect(linkId).toMatch(/^link_\d+$/);
 		// The address is normalized (scheme and host lowercased), and the link names this server, the room and the token.
-		expect(text).toContain(`Created the link \`${linkId}\` to ws://127.0.0.1:8081/ws`);
-		expect(text).toMatch(new RegExp(`https://link\\.apron\\.chat/#server=wss://demo\\.test/ws&room=${roomId}&token=apron_invite_`));
+		expect(text).toContain(`To share this room with ws://127.0.0.1:8081/ws`);
+		expect(text).toContain(`(\`${linkId}\`)`);
+		// The invite, in a code span: this server, this room and a token of the link.
+		expect(text).toMatch(new RegExp(`\n\`https://link\\.apron\\.chat/#server=wss://demo\\.test/ws&room=${roomId}&token=apron_invite_[A-Za-z0-9_-]{43}\``));
 		// Signed in, the link is a bot in that private room only.
 		const joined = await request(link, 'joined', 'room_list', { filter: 'joined' });
 		expect(joined.result.joined.map((room: { room_id: string }) => room.room_id)).toEqual([roomId]);
@@ -71,7 +88,7 @@ it('/remote invite creates a link bound to the address, in the private room, wit
 		const members = await request(admin, 'members', 'room_list', { room_id: roomId, members: true });
 		expect(members.result.joined[0].members.map((member: { user_id: string }) => member.user_id)).toContain(linkId);
 		const listed = await command(admin, 'list', '/remote list', roomId);
-		expect(listed.notice!.params.body.text).toContain(`\`${linkId}\`: ws://127.0.0.1:8081/ws`);
+		expect(listed.notice!.params.body.text).toContain(`- ws://127.0.0.1:8081/ws: link \`${linkId}\`; shared rooms: none`);
 		// Bad addresses are refused.
 		for (const address of ['http://127.0.0.1:8081/ws', 'ws://user@host/ws', 'chat.example', 'wss://demo.test/ws']) {
 			expect((await command(admin, `bad-${address}`, `/remote invite ${address}`, roomId)).frame.error.code).toBe(INVALID_PARAMS);
@@ -135,12 +152,12 @@ it('runs a link\'s message as a shadow user that joins the room, and keeps ext.r
 });
 
 it('strips ext.remote from everyone but a link acting as a remote user', async () => {
-	const { admin, link, linkId, roomId } = await linked('ws://127.0.0.1:8082/ws');
+	const { admin, adminId, link, linkId, roomId } = await linked('ws://127.0.0.1:8082/ws');
 	const forged = { server: 'wss://b.example/ws', user_id: 'carol' };
 	try {
 		const posted = await exchange(admin, 'post', 'message', { room_id: roomId, body: { text: 'hi' }, ext: { remote: forged, kept: true } });
 		const snapshot = posted.skipped.find((frame) => frame.method === 'message' && frame.params.message_id === posted.frame.result.message_id)!.params;
-		expect(snapshot.from).toEqual({ user_id: 'admin', name: 'Admin' });
+		expect(snapshot.from).toEqual({ user_id: adminId, name: adminId });
 		expect(snapshot.ext).toEqual({ kept: true });
 		const me = await request(admin, 'me', 'me', { ext: { remote: forged } });
 		expect(me.result.you.ext?.remote).toBeUndefined();
@@ -193,7 +210,7 @@ it('refuses act-as writes in a room the link is not in', async () => {
 		const general = await request(link, 'general', 'message', { room_id: 'general', body: { text: 'x' }, ext: { remote: { user_id: 'carol' } } });
 		expect(general.error.code).toBe(DENIED);
 		// A private room the link is not in is unknown to it.
-		const other = (await request(admin, 'other', 'room_set', { private: true })).result.room_id as string;
+		const other = (await request(admin, unique('other'), 'room_set', { private: true })).result.room_id as string;
 		const hidden = await request(link, 'hidden', 'message', { room_id: other, body: { text: 'x' }, ext: { remote: { user_id: 'carol' } } });
 		expect(hidden.error.code).toBe(INVALID_PARAMS);
 		// In its own room it may.
@@ -203,7 +220,7 @@ it('refuses act-as writes in a room the link is not in', async () => {
 });
 
 it('keeps shadow user_ids from being issued, renamed, or acted as by anyone but a link', async () => {
-	const { admin, link, roomId } = await linked('ws://127.0.0.1:8085/ws');
+	const { admin, adminId, link, roomId, text } = await linked('ws://127.0.0.1:8085/ws');
 	const carol = unique('carol');
 	const shadowId = `${carol}@127.0.0.1:8085`;
 	try {
@@ -213,12 +230,17 @@ it('keeps shadow user_ids from being issued, renamed, or acted as by anyone but 
 		expect((await command(admin, 'rename', `/rename ${shadowId} ${unique('x')}`, roomId)).frame.error.code).toBe(DENIED);
 		// The admin is no link: its ext.remote.user_id is dropped, and it posts as itself.
 		const own = await exchange(admin, 'own', 'message', { room_id: roomId, body: { text: 'me' }, ext: { remote: { user_id: carol } } });
-		expect(own.skipped.find((frame) => frame.method === 'message' && frame.params.message_id === own.frame.result.message_id)!.params.from.user_id).toBe('admin');
+		expect(own.skipped.find((frame) => frame.method === 'message' && frame.params.message_id === own.frame.result.message_id)!.params.from.user_id).toBe(adminId);
 		// Revoked, the link signs in no more and no longer acts as anyone.
 		const linkId = (await request(link, 'whoami', 'me', {})).result.you.user_id as string;
-		const revoked = await command(admin, 'revoke', `/remote revoke ${linkId}`, roomId);
-		expect(revoked.notice!.params.body.text).toContain(`Revoked the link \`${linkId}\``);
-		expect((await command(admin, 'list', '/remote list', roomId)).notice!.params.body.text).not.toContain(`\`${linkId}\``);
+		const revoked = await command(admin, 'revoke', `/remote revoke ws://127.0.0.1:8085/ws`, roomId);
+		expect(revoked.notice!.params.body.text).toContain(`Revoked the link \`${linkId}\` for ws://127.0.0.1:8085/ws`);
+		for (let i = 0; i < 100 && !link.closed(); i += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(link.closed()?.code).toBe(1008);
+		const again = await connect();
+		await again.next();
+		expect((await request(again, 'auth', 'auth', { scheme: 'token', token: text.match(/&token=(apron_invite_[A-Za-z0-9_-]{43})/)![1] })).error.code).toBe(DENIED);
+		again.close();
 	} finally { admin.close(); link.close(); }
 });
 
@@ -326,5 +348,82 @@ it('lets a link send past the per-connection frame limit, and keeps it open thro
 		}
 		for (let i = 0; i < 70; i += 1) expect((await request(link, `me-${i}`, 'me', {})).result.you.user_id).toBe(linkId);
 		expect(link.closed()).toBeUndefined();
+	} finally { admin.close(); link.close(); }
+});
+
+it('reuses one link a remote server across rooms, with a token for each invite', async () => {
+	const server = 'ws://127.0.0.1:8091/ws';
+	const first = await linked(server);
+	const { admin, link, linkId } = first;
+	try {
+		const second = (await request(admin, unique('room2'), 'room_set', { private: true })).result.room_id as string;
+		const invited = await command(admin, 'invite2', `/remote invite ${server}`, second);
+		const text: string = invited.notice!.params.body.text;
+		expect(text).toContain(`(\`${linkId}\`)`);
+		const token = text.match(/&token=(apron_invite_[A-Za-z0-9_-]{43})/)![1];
+		expect(text).toContain(`&room=${second}&`);
+		// The link joined the second room too; both tokens sign in as it.
+		await until(link, (frame) => frame.method === 'room_update' && frame.params.joined?.[0]?.room_id === second);
+		const again = await signIn(token);
+		expect(again.you.user_id).toBe(linkId);
+		const rooms = (await request(again.peer, 'joined', 'room_list', { filter: 'joined' })).result.joined.map((room: { room_id: string }) => room.room_id).sort();
+		expect(rooms).toEqual([first.roomId, second].sort());
+		again.peer.close();
+		// One link for the server.
+		const listing: string = (await command(admin, 'list', '/remote list', second)).notice!.params.body.text;
+		expect(listing.split('\n').filter((line) => line.startsWith(`- ${server}:`))).toEqual([`- ${server}: link \`${linkId}\`; shared rooms: none`]);
+	} finally { admin.close(); link.close(); }
+});
+
+it('pairs a room on an ext:remote request from its link, and refuses everything else', async () => {
+	const server = 'ws://127.0.0.1:8092/ws';
+	const { admin, link, roomId } = await linked(server);
+	const remoteLink = `https://link.apron.chat/#server=${server}&room=ops&token=apron_invite_secret`;
+	try {
+		// Not a link: denied.
+		expect((await request(admin, 'not-link', 'ext:remote', { room_id: roomId, link: remoteLink })).error.code).toBe(DENIED);
+		// A room the link has not joined, a link of another server, or none that parses: invalid_params.
+		expect((await request(link, 'general', 'ext:remote', { room_id: 'general', link: remoteLink })).error.code).toBe(INVALID_PARAMS);
+		expect((await request(link, 'other', 'ext:remote', { room_id: roomId, link: 'https://link.apron.chat/#server=ws://elsewhere/ws&room=ops&token=t' })).error.code).toBe(INVALID_PARAMS);
+		expect((await request(link, 'garbage', 'ext:remote', { room_id: roomId, link: 'hello' })).error.code).toBe(INVALID_PARAMS);
+	} finally { link.close(); }
+	// A new connection: three invalid_params count as policy violations only for others; it is still open anyway.
+	const fresh = await linked(server);
+	try {
+		const reply = await request(fresh.link, 'pair', 'ext:remote', { room_id: fresh.roomId, link: `apron:?server=WS://127.0.0.1:8092/ws&room=ops&token=apron_invite_secret` });
+		expect(reply.result).toEqual({});
+		const listing: string = (await command(fresh.admin, 'list', '/remote list', fresh.roomId)).notice!.params.body.text;
+		expect(listing).toContain(`\`${fresh.roomId}\` ↔ \`ops\``);
+		expect(listing).not.toContain('apron_invite_secret');
+		// The pair's token is on no user object.
+		const members = await request(fresh.admin, 'members', 'room_list', { room_id: fresh.roomId, members: true });
+		expect(JSON.stringify(members.result)).not.toContain('apron_invite_secret');
+		expect(roomId).not.toBe(fresh.roomId);
+	} finally { admin.close(); fresh.admin.close(); fresh.link.close(); }
+});
+
+it('takes a create for a remote message_id the link already wrote as a duplicate, whatever its room', async () => {
+	const { admin, link, roomId } = await linked('ws://127.0.0.1:8093/ws');
+	try {
+		const first = await request(link, 'first', 'message', { room_id: roomId, body: { text: 'once' }, ext: { remote: { user_id: 'carol', room_id: 'ops', message_id: '42' } } });
+		const again = await request(link, 'again', 'message', { room_id: roomId, body: { text: 'twice' }, ext: { remote: { user_id: 'carol', room_id: 'elsewhere', message_id: '42' } } });
+		expect(again.result).toEqual({ message_id: first.result.message_id });
+		const bare = await request(link, 'bare', 'message', { room_id: roomId, body: { text: 'thrice' }, ext: { remote: { user_id: 'carol', message_id: '42' } } });
+		expect(bare.result).toEqual({ message_id: first.result.message_id });
+	} finally { admin.close(); link.close(); }
+});
+
+it('/remote unshare takes the links out of the room and drops its pairs', async () => {
+	const server = 'ws://127.0.0.1:8094/ws';
+	const { admin, link, linkId, roomId } = await linked(server);
+	try {
+		expect((await request(link, 'pair', 'ext:remote', { room_id: roomId, link: `https://link.apron.chat/#server=${server}&room=ops&token=t` })).result).toEqual({});
+		const unshared = await command(admin, 'unshare', '/remote unshare', roomId);
+		expect(unshared.notice!.params.body.text).toBe(`This room is no longer shared with ${server}.`);
+		expect(unshared.skipped.some((frame) => frame.method === 'room_update' && frame.params.memberships?.[0]?.members?.[0]?.user?.user_id === linkId && frame.params.memberships[0].members[0].joined === false)).toBe(true);
+		expect((await command(admin, 'list', '/remote list', roomId)).notice!.params.body.text).toContain('shared rooms: none');
+		// The link may no longer write there: its pair has ended.
+		const refused = await request(link, 'post', 'message', { room_id: roomId, body: { text: 'x' }, ext: { remote: { user_id: 'carol' } } });
+		expect(refused.error.code).toBe(INVALID_PARAMS);
 	} finally { admin.close(); link.close(); }
 });
