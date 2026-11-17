@@ -248,6 +248,9 @@ interface ConnectionAttachment {
 	frameTimes: number[];
 	/** When this connection last sent an application frame (pings aside); absent before its first. */
 	lastFrameAt?: number;
+	/** The UTC day this connection last counted its user active (`active` read), and last posted (`active` write). */
+	activeDay?: string;
+	postedDay?: string;
 	/** Per-type throttle events from this connection, oldest first (budget.ts). */
 	throttles?: Partial<Record<ThrottledType, number[]>>;
 	/** When this connection last got a `~private` throttle notice, per type. */
@@ -854,6 +857,9 @@ function checkDeviceId(id: string | undefined): void {
 }
 
 /** The UTC day of an epoch-milliseconds time, `YYYY-MM-DD`. */
+/** A UTC day as utcDay writes it. */
+const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
 function utcDay(ms: number): string {
 	return new Date(ms).toISOString().slice(0, 10);
 }
@@ -1139,6 +1145,8 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			...presenceState(attachment),
 			...readState(attachment),
 			...(Number.isSafeInteger(attachment.openedAt) && (attachment.openedAt as number) > 0 ? { openedAt: attachment.openedAt } : {}),
+			...(typeof attachment.activeDay === "string" && DAY_PATTERN.test(attachment.activeDay) ? { activeDay: attachment.activeDay } : {}),
+			...(typeof attachment.postedDay === "string" && DAY_PATTERN.test(attachment.postedDay) ? { postedDay: attachment.postedDay } : {}),
 			authDeadline: typeof attachment.authDeadline === "number" ? attachment.authDeadline : 0,
 			pendingFrames: typeof attachment.pendingFrames === "number" ? attachment.pendingFrames : 0,
 			pendingBytes: typeof attachment.pendingBytes === "number" ? attachment.pendingBytes : 0,
@@ -2846,7 +2854,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		attachment.pendingFrames += 1;
 		attachment.pendingBytes += bytes;
+		const active = this.markActive(attachment, "read", now);
 		writeAttachment(socket, attachment);
+		if (active) recordMetric(this.runtimeEnv.METRICS, "active", active);
 		const prior = this.queues.get(socket) ?? Promise.resolve();
 		const actor = connectionActor(socket, attachment);
 		const next = prior.catch(() => undefined).then(() => ACTOR.run(actor, () => this.processFrame(socket, message))).catch((error) => this.handleFrameFailure(socket, error)).finally(() => {
@@ -2922,6 +2932,23 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// presence change meanwhile schedules its own alarm.
 		// A failed flush is not this alarm's failure: its work is done and the next one set.
 		await this.stalls.track("storage", "sync", Promise.resolve().then(() => this.ctx.storage.sync())).catch(() => undefined);
+	}
+
+	/**
+	 * Marks a signed-in connection's user active today for `bucket` (`read`:
+	 * a sign-in or any frame; `write`: a new message), once a day per
+	 * connection, kept in its attachment so hibernation does not repeat it.
+	 * Returns the `active` metric's details when this is the day's first, for
+	 * the caller to record once the attachment is written.
+	 */
+	private markActive(attachment: ConnectionAttachment, bucket: "read" | "write", now: number): string[] | undefined {
+		if (attachment.tier === "pending" || !attachment.userId) return undefined;
+		const day = utcDay(now);
+		const field = bucket === "read" ? "activeDay" : "postedDay";
+		if (attachment[field] === day) return undefined;
+		attachment[field] = day;
+		const tier = attachment.tier === "anonymous" ? "guest" : isBotId(attachment.userId) ? "bot" : "registered";
+		return [bucket, tier, tier === "guest" ? `ip:${attachment.ipKey}` : attachment.userId];
 	}
 
 	/**
@@ -5049,6 +5076,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		});
 		this.noteBotActive(identity.user_id, attachment.roles ?? []);
 		if (created) {
+			const latest = connectionAttachment(socket);
+			const active = latest && this.markActive(latest, "write", nowMs());
+			if (latest && active) {
+				writeAttachment(socket, latest);
+				recordMetric(this.runtimeEnv.METRICS, "active", active);
+			}
 			// Posting in a room shows its poster saw it: their waiting and held wakes for it go.
 			this.dropWakes(identity.user_id, created.room_id);
 			this.dropHeld(identity.user_id, created.room_id);
@@ -5675,9 +5708,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// counted it up again while the sign-in went on did not see this
 		// connection as theirs: it owes the zeroing too.
 		const signedIn = connectionAttachment(socket);
-		if (signedIn && stored && stored.unreadClaims !== this.unreadClaims) {
-			signedIn.unreadOwed = true;
+		if (signedIn) {
+			// A sign-in counts its user active today, even one this connection
+			// counted as someone else before.
+			delete signedIn.activeDay;
+			delete signedIn.postedDay;
+			const active = this.markActive(signedIn, "read", nowMs());
+			if (stored && stored.unreadClaims !== this.unreadClaims) signedIn.unreadOwed = true;
 			writeAttachment(socket, signedIn);
+			if (active) recordMetric(this.runtimeEnv.METRICS, "active", active);
 		}
 		this.syncServer(socket);
 		this.sendMutesInEffect(socket, stored);

@@ -103,7 +103,7 @@ const since = start.toISOString().slice(0, 19).replace("T", " ");
 try {
 	const rows = await analyticsSql(`SELECT toStartOfDay(timestamp) AS day, blob1 AS event, blob2 AS detail,
 		SUM(_sample_interval) AS points, SUM(_sample_interval * double1) AS value
-		FROM ${dataset} WHERE timestamp >= toDateTime('${since}') AND blob1 NOT IN ('refusal', 'db_bytes', 'slow', 'awake')
+		FROM ${dataset} WHERE timestamp >= toDateTime('${since}') AND blob1 NOT IN ('refusal', 'db_bytes', 'slow', 'awake', 'active')
 		GROUP BY day, event, detail ORDER BY day, event, detail FORMAT JSON`);
 	console.log(`\nCounters in ${dataset}, per UTC day (Analytics Engine, unsampled)\n`);
 	if (!rows.length) console.log("(none yet)");
@@ -152,6 +152,45 @@ try {
 	else console.table(rows.reverse().map((row) => ({ at: String(row.timestamp).slice(0, 16), "age min": Number(row.age), events: Number(row.events), sockets: Number(row.sockets), "in flight": row.pending })));
 } catch (error) {
 	console.log(`\nLong-awake instances in ${dataset}: unavailable (${error.message}).`);
+}
+
+// Active users (src/metrics.ts active): distinct users a UTC day, and over
+// the last 7 and 30 days, who read (signed in or sent any frame) or wrote (a
+// new message), by tier. A guest counts by its address key, since its id is
+// new each sign-in. Distinct counts ignore _sample_interval: the dataset is
+// not sampled at this volume.
+try {
+	const tiers = ["registered", "guest", "bot"];
+	const pivot = (rows, keyOf) => {
+		const table = new Map();
+		for (const row of rows) {
+			const key = keyOf(row);
+			const entry = table.get(key) ?? table.set(key, { read: 0, write: 0, ...Object.fromEntries(tiers.flatMap((tier) => [[`read ${tier}`, 0], [`write ${tier}`, 0]])) }).get(key);
+			const users = Number(row.users);
+			entry[row.bucket] += users;
+			entry[`${row.bucket} ${row.tier}`] = users;
+		}
+		return table;
+	};
+	const daily = await analyticsSql(`SELECT toStartOfDay(timestamp) AS day, blob2 AS bucket, blob3 AS tier, COUNT(DISTINCT blob4) AS users
+		FROM ${dataset} WHERE timestamp >= toDateTime('${since}') AND blob1 = 'active'
+		GROUP BY day, bucket, tier ORDER BY day FORMAT JSON`);
+	const windows = [];
+	for (const span of [7, 30]) {
+		const from = new Date(end.getTime() - span * 86_400_000).toISOString().slice(0, 19).replace("T", " ");
+		const rows = await analyticsSql(`SELECT blob2 AS bucket, blob3 AS tier, COUNT(DISTINCT blob4) AS users
+			FROM ${dataset} WHERE timestamp >= toDateTime('${from}') AND blob1 = 'active'
+			GROUP BY bucket, tier FORMAT JSON`);
+		windows.push([`last ${span} days`, pivot(rows, () => "all").get("all")]);
+	}
+	console.log(`\nActive users in ${dataset} (distinct; read = signed in or sent a frame, write = posted a message)\n`);
+	if (!daily.length && windows.every(([, row]) => !row)) console.log("(none yet)");
+	else console.table([
+		...[...pivot(daily, (row) => String(row.day).slice(0, 10))].map(([day, row]) => ({ when: day, ...row })),
+		...windows.filter(([, row]) => row).map(([when, row]) => ({ when, ...row })),
+	]);
+} catch (error) {
+	console.log(`\nActive users in ${dataset}: unavailable (${error.message}).`);
 }
 
 // Refusals (src/refusals.ts): one point holds many repeats, so the count is

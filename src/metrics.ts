@@ -62,7 +62,17 @@ export type MetricEvent =
 	 * handled since its last report and its open sockets in `double2` and
 	 * `double3`.
 	 */
-	| "awake";
+	| "awake"
+	/**
+	 * A user active on a UTC day (ApronDemoServer.noteActive): `read` the
+	 * first frame or sign-in of a connection's day, `write` its first new
+	 * message that day; then the tier (`registered`, `guest` or `bot`) and
+	 * who: the user_id, or for a guest (a new id each sign-in) `ip:` and its
+	 * hashed address key. At most one of each a connection a day; count
+	 * distinct `blob4` for daily, weekly and monthly active users. Internal:
+	 * the dataset is read only with the account's API token.
+	 */
+	| "active";
 
 export function recordMetric(dataset: AnalyticsEngineDataset | undefined, event: MetricEvent, details: readonly string[] = [], value: number | readonly number[] = 1): void {
 	if (!dataset) return;
