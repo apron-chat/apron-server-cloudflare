@@ -33,8 +33,11 @@ export type LinkCall = (method: string, params: Record<string, unknown>, id: str
 export interface OutboxDeps {
 	/** This server's address, for links in text without `server` (Appendix A.4). */
 	self: string;
-	/** The shared rooms with this remote server: local room → remote room. */
-	pairs(): Map<string, string>;
+	/**
+	 * The shared rooms with this remote server: local room → the remote room,
+	 * and the log ID the pair started at (its records at or below it are never sent).
+	 */
+	pairs(): Map<string, { remote: string; start: number }>;
 	/** Whether this server's link for the remote server is in a local room: a pair holds only while it is. */
 	linkInRoom(roomId: string): boolean;
 	dropPair(roomId: string, why: string): void;
@@ -75,23 +78,48 @@ export class SendingStopped extends Error {}
 const OUTBOX_BATCH = 32;
 
 /**
- * Request ids made from what is sent, so a record sent again after a close
- * is a duplicate on the remote server (§1.2). At most 128 bytes.
+ * JSON with object keys sorted at every level, so equal params hash the same
+ * whatever order they were built in.
  */
-function requestId(...parts: Array<string | number>): string {
-	const id = `x:${parts.join(":")}`;
-	if (id.length <= 120) return id;
-	// FNV-1a over the whole, with the start kept for logs.
-	let hash = 0x811c9dc5;
-	for (let index = 0; index < id.length; index += 1) hash = Math.imul(hash ^ id.charCodeAt(index), 0x01000193) >>> 0;
-	return `${id.slice(0, 100)}~${hash.toString(36)}`;
+function canonicalJson(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	if (value && typeof value === "object") {
+		return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`).join(",")}}`;
+	}
+	return JSON.stringify(value) ?? "null";
+}
+
+/** 53 bits of a string's hash (cyrb53), in hex. */
+function hash53(text: string): string {
+	let h1 = 0xdeadbeef;
+	let h2 = 0x41c6ce57;
+	for (let index = 0; index < text.length; index += 1) {
+		const code = text.charCodeAt(index);
+		h1 = Math.imul(h1 ^ code, 2654435761);
+		h2 = Math.imul(h2 ^ code, 1597334677);
+	}
+	h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+	h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+	return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16).padStart(14, "0");
+}
+
+/**
+ * A request id made from the record's log ID, the operation, and a hash of
+ * the method and params: `fed-<log_id>-<op>-<hash>`. A request sent again
+ * after a close is a duplicate on the remote server (§1.2); one whose params
+ * changed in between (a mention mapped since) is a new request.
+ */
+export function requestId(logId: number | string, op: string, method: string, params: Record<string, unknown>): string {
+	return `fed-${logId}-${op}-${hash53(canonicalJson({ method, params }))}`;
 }
 
 /** Whether a denied write was refused because the link has left that room (the pair has ended). */
 export function linkLeftRoom(error: ReplyFrame["error"]): boolean {
-	if (!error || error.code !== DENIED) return false;
-	if (error.data?.reason === "link_not_in_room") return true;
-	return /link (is not in|has not joined|isn't in)|not a member/i.test(error.message ?? "");
+	if (!error) return false;
+	// `data.ext.remote` "not_joined", whatever the code (`denied`, or `invalid_params` for a room it cannot see).
+	const ext = error.data?.ext as Record<string, unknown> | undefined;
+	if (ext && typeof ext === "object" && ext.remote === "not_joined") return true;
+	return error.data?.reason === "link_not_in_room";
 }
 
 /**
@@ -152,6 +180,7 @@ export class Outbox {
 	 * SendingStopped when it refuses the sign-in.
 	 */
 	async drain(call: LinkCall): Promise<void> {
+		await this.syncProfiles(call);
 		for (;;) {
 			const pairs = this.deps.pairs();
 			if (!pairs.size) return;
@@ -173,12 +202,27 @@ export class Outbox {
 	 * shared room. Whose they are is decided when they are read.
 	 */
 	behind(head: number): boolean {
-		return this.deps.pairs().size > 0 && head > this.deps.cursor();
+		return (this.deps.pairs().size > 0 && head > this.deps.cursor()) || this.profilesDue.size > 0;
+	}
+
+	/** Local users whose profile changed (`me`), to send before the next records: those this outbox has sent for. */
+	readonly profilesDue = new Set<string>();
+
+	private async syncProfiles(call: LinkCall): Promise<void> {
+		for (const userId of [...this.profilesDue]) {
+			if (await this.deps.user(userId)) {
+				const ops = new Ops(this, call, { room_id: "", log_id: 0, kind: "profile", record: {} }, "");
+				await this.profile(ops, userId);
+			}
+			this.profilesDue.delete(userId);
+		}
 	}
 
 	private async sendRecord(row: OutboxRecord, call: LinkCall): Promise<void> {
-		const remoteRoom = this.deps.pairs().get(row.room_id);
-		if (remoteRoom === undefined) return;
+		const pair = this.deps.pairs().get(row.room_id);
+		// A pair starts where the log was when it was made: nothing older of its room is sent.
+		if (pair === undefined || row.log_id <= pair.start) return;
+		const remoteRoom = pair.remote;
 		if (!this.deps.linkInRoom(row.room_id)) {
 			this.deps.dropPair(row.room_id, "this server's link left the room");
 			return;
@@ -208,28 +252,43 @@ export class Outbox {
 		const messageId = snapshot.message_id;
 		if (!author || typeof messageId !== "string") return;
 		const remote = { user_id: author, room_id: ops.row.room_id, message_id: messageId };
-		const movedOut = snapshot.room_id !== ops.row.room_id;
-		if (movedOut || snapshot.deleted === true) {
+		const pairs = this.deps.pairs();
+		if (snapshot.room_id !== ops.row.room_id) {
+			// A move out. Into another room shared with this server, the copy moves
+			// there (its destination's record saves it); out of the shared rooms, it goes.
+			if (typeof snapshot.room_id === "string" && pairs.has(snapshot.room_id)) return;
+			const copy = await this.deps.copy(messageId);
+			if (copy === undefined) return;
+			await ops.send("message", "delete", { message_id: copy, room_id: ops.remoteRoom, deleted: true, ext: { remote } });
+			return;
+		}
+		if (snapshot.deleted === true) {
 			// A copy that was never made has nothing to delete: skipped.
 			const copy = await this.deps.copy(messageId);
 			if (copy === undefined) return;
 			await ops.send("message", "delete", { message_id: copy, room_id: ops.remoteRoom, deleted: true, ext: { remote } });
 			return;
 		}
+		let copy = await this.deps.copy(messageId);
+		const movedIn = typeof snapshot.prev_room_id === "string";
+		const created = snapshot.prev_log_id === undefined;
+		// An edit of a message from before the pair, never sent, stays unsent.
+		const start = pairs.get(ops.row.room_id)?.start ?? 0;
+		if (copy === undefined && !created && !movedIn && Number(messageId) <= start) return;
 		await this.profile(ops, author);
 		const fields = await this.clientFields(ops, snapshot);
-		let copy = await this.deps.copy(messageId);
-		const fresh = snapshot.prev_log_id === undefined || snapshot.prev_room_id !== undefined;
 		if (copy === undefined) {
-			// A create; for an edit of a message whose copy this server does not
-			// know, the remote server answers a repeated create with the copy it has.
-			const created = await ops.send("message", "create", { room_id: ops.remoteRoom, ...fields, ext: { remote } });
-			const id = created?.message_id;
+			const result = await ops.send("message", "create", { room_id: ops.remoteRoom, ...fields, ext: { remote } });
+			const id = result?.message_id;
 			if (typeof id !== "string") return;
 			await this.deps.setCopy(messageId, id);
+			// A fresh message's create is all; otherwise the create may have
+			// returned a copy that exists, also one deleted since, which a save
+			// brings to the message's current state (and restores).
+			if (created) return;
 			copy = id;
-			if (fresh) return;
 		}
+		// A save of the copy; into this room's remote room, which moves a copy from another shared room.
 		await ops.send("message", "save", { message_id: copy, room_id: ops.remoteRoom, ...fields, ext: { remote } });
 	}
 
@@ -315,7 +374,7 @@ export class Outbox {
 		const known = await this.deps.user(userId);
 		const name = this.deps.userName(userId) ?? "";
 		if (known && known.name === name) return known.id;
-		const result = await ops.send("me", `me:${userId}:${name}`, { name, ext: { remote: { user_id: userId } } });
+		const result = await ops.send("me", "me", { name, ext: { remote: { user_id: userId } } });
 		const you = result?.you as Record<string, unknown> | undefined;
 		const id = typeof you?.user_id === "string" ? you.user_id : known?.id;
 		if (id !== undefined) await this.deps.setUser(userId, { id, name });
@@ -333,8 +392,6 @@ class PairEnded extends Error {}
 
 /** The requests of one record, each with an id made from the record and what it is. */
 class Ops {
-	private count = 0;
-
 	constructor(private readonly outbox: Outbox, private readonly call: LinkCall, readonly row: OutboxRecord, readonly remoteRoom: string) {}
 
 	/**
@@ -344,8 +401,7 @@ class Ops {
 	 * throws RetryLater; a refusal because the link left the room, PairEnded.
 	 */
 	async send(method: string, op: string, params: Record<string, unknown>): Promise<Record<string, unknown> | undefined> {
-		this.count += 1;
-		const frame = await this.call(method, params, requestId(this.row.log_id, this.row.room_id, op, this.count));
+		const frame = await this.call(method, params, requestId(this.row.log_id, op.replace(/:.*$/, ""), method, params));
 		if (frame.result) return frame.result;
 		const error = frame.error ?? { code: 0, message: "no result" };
 		if (error.code === RETRY_AFTER) {
@@ -415,7 +471,13 @@ export class LinkConnection {
 		});
 		socket.addEventListener("close", () => connection.fail("connection closed"));
 		socket.addEventListener("error", () => connection.fail("connection failed"));
-		await Promise.race([serverFrame, new Promise<void>((_, reject) => setTimeout(() => reject(new RetryLater(5_000, "no server frame")), timeoutMs))]);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const greeted = await Promise.race([serverFrame.then(() => true), new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); })]);
+		clearTimeout(timer);
+		if (!greeted) {
+			connection.close();
+			throw new RetryLater(5_000, "no server frame");
+		}
 		const auth = await connection.call("auth", { scheme: "token", token }, "auth", timeoutMs);
 		if (auth.error) {
 			connection.close();

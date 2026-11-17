@@ -969,6 +969,11 @@ function isLinkConnection(attachment: ConnectionAttachment): boolean {
 	return !!remote && typeof remote === "object" && typeof (remote as Record<string, unknown>).server === "string" && !Object.hasOwn(remote, "user_id");
 }
 
+/**
+ * The `data` of a link's error for a room it has not joined (extension
+ * `ext:remote`), whatever its code: the sender ends its pair for the room.
+ */
+const NOT_JOINED = { ext: { remote: "not_joined" } };
 /** Key prefix for the tokens minted for each link (extension `ext:remote`), so revoking it finds them all. */
 const LINK_TOKENS_KEY_PREFIX = "remote-tokens:";
 /** The tokens a link keeps: each invite mints one, and the oldest goes past this. */
@@ -5000,6 +5005,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const cleared = { ...(current.name ? {} : { name: "" }), ...(removeAvatar ? { avatar: "" } : {}) };
 			this.reply(socket, request, { you: { ...this.you(current), ...cleared } });
 			if (result.deduplicated || (name === undefined && !changed)) return;
+			// The servers this user's records went to get the new profile (ext:remote).
+			this.noteProfile(identity.user_id);
 			// §3.3: `you` to the user's other connections, `new` to those who share
 			// a room with the user, with the ext keys that changed (§4.13).
 			const user = { ...this.current(current)!, ...(current.name ? {} : { name: "" }), ...(changed ? { ext: changed } : {}) };
@@ -5099,7 +5106,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const roomId = actor && typeof messageId === "string" && messageId !== "" ? this.store.messageRoom(messageId, nowMs()) : null;
 		if (actor && roomId !== null) {
 			// A message in a private room the link is not in is unknown, as it is to anyone else (§5.3).
-			if (!this.sees(connectionAttachment(socket) ?? attachment, roomId)) throw { name: "invalid_params", message: "unknown or expired message" } satisfies ProtocolError;
+			if (!this.sees(connectionAttachment(socket) ?? attachment, roomId)) throw { name: "invalid_params", message: "unknown or expired message", data: NOT_JOINED } satisfies ProtocolError;
 			await this.shadowJoins(socket, attachment, actor, roomId);
 		}
 		await this.commitAndBroadcast(socket, attachment, request, "reactions", "reacting", actor);
@@ -5153,8 +5160,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async shadowJoins(socket: WebSocketConnection, attachment: ConnectionAttachment, actor: ActAs, roomId: string): Promise<void> {
 		const current = connectionAttachment(socket) ?? attachment;
-		if (!this.roomExists(roomId) || !this.sees(current, roomId)) throw { name: "invalid_params", message: "unknown room" } satisfies ProtocolError;
-		if (!(current.rooms ?? []).includes(roomId)) throw { name: "denied", message: "This link is not in that room, so its remote users may not write there", data: { reason: "link_not_in_room" } } satisfies ProtocolError;
+		if (!this.roomExists(roomId) || !this.sees(current, roomId)) throw { name: "invalid_params", message: "unknown room", data: NOT_JOINED } satisfies ProtocolError;
+		if (!(current.rooms ?? []).includes(roomId)) throw { name: "denied", message: "This link is not in that room, so its remote users may not write there", data: NOT_JOINED } satisfies ProtocolError;
 		const userId = actor.identity.user_id;
 		if (this.store.isRoomMember(roomId, userId, nowMs())) return;
 		if (this.store.remoteUserLeft(userId, roomId, nowMs())) throw { name: "denied", message: "This remote user was removed from that room, so may not write there again" } satisfies ProtocolError;
@@ -5172,7 +5179,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async shadowLeaves(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, actor: ActAs): Promise<void> {
 		const roomId = requiredString(request.params, "room_id");
-		if (!this.roomExists(roomId) || !this.sees(connectionAttachment(socket) ?? attachment, roomId)) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
+		if (!this.roomExists(roomId) || !this.sees(connectionAttachment(socket) ?? attachment, roomId)) throw { name: "invalid_params", message: "Unknown room", data: NOT_JOINED } satisfies ProtocolError;
 		const userId = actor.identity.user_id;
 		if (!this.store.isRoomMember(roomId, userId, nowMs())) {
 			this.reply(socket, request, {});
@@ -8643,8 +8650,23 @@ export class ApronDemoServer extends DurableObject<Env> {
 				removed.push(link.server);
 			}
 			const dropped = this.store.dropRemotePairs((pair) => pair.room_id === roomId, nowMs());
+			// Each other server is told, so its pair ends too and its link leaves its room.
+			const untold: string[] = [];
+			for (const pair of dropped) {
+				let connection: LinkConnection | undefined;
+				try {
+					connection = await LinkConnection.open(pair.server, pair.token);
+					const ended = await connection.call("ext:remote", { room_id: pair.remote_room }, `unpair:${pair.remote_room}:${Date.now()}`);
+					if (ended.error) untold.push(`${pair.server} (${ended.error.message ?? ended.error.code})`);
+				} catch (error) {
+					untold.push(`${pair.server} (${error instanceof Error ? error.message : String(error)})`);
+				} finally {
+					connection?.close();
+				}
+			}
 			const servers = [...new Set([...removed, ...dropped.map((pair) => pair.server)])];
-			this.sendNotice(socket, roomId, servers.length ? `This room is no longer shared with ${servers.join(", ")}.` : "This room is not shared.");
+			this.sendNotice(socket, roomId, (servers.length ? `This room is no longer shared with ${servers.join(", ")}.` : "This room is not shared.") +
+				(untold.length ? ` Could not tell ${untold.join(", ")}; it ends its side at its next write here.` : ""));
 			this.reply(socket, request, {});
 			return;
 		}
@@ -8707,14 +8729,23 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * records through. Anyone but a link is `denied`; a room the link has not
 	 * joined, a link that does not parse, or one of another server is
 	 * `invalid_params`. A later request for the room replaces the pair.
+	 * Without `link`, it ends the pair of the room, and the link leaves it:
+	 * either server may end a pair, only the room's own starts one.
 	 */
 	private async handlePair(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		const link = attachment.tier === "registered" ? attachment.userId : undefined;
 		const server = link === undefined ? undefined : this.store.remoteLink(link, nowMs());
 		if (server === undefined) throw { name: "denied", message: "Only a link may pair rooms" } satisfies ProtocolError;
 		const roomId = requiredString(request.params, "room_id");
+		if (request.params.link === undefined) {
+			// The other server ended the pair (its `/remote unshare`): so does this one, and its link leaves the room.
+			this.store.dropRemotePairs((pair) => pair.room_id === roomId && pair.server === server, nowMs());
+			if (this.store.isRoomMember(roomId, link!, nowMs())) await this.removeMember({ ipKey: attachment.ipKey, userId: link }, roomId, link!);
+			this.reply(socket, request, {});
+			return;
+		}
 		const invite = parseInvite(requiredString(request.params, "link"));
-		if (!((connectionAttachment(socket) ?? attachment).rooms ?? []).includes(roomId)) throw { name: "invalid_params", message: "This link has not joined that room" } satisfies ProtocolError;
+		if (!((connectionAttachment(socket) ?? attachment).rooms ?? []).includes(roomId)) throw { name: "invalid_params", message: "This link has not joined that room", data: NOT_JOINED } satisfies ProtocolError;
 		if (!invite) throw { name: "invalid_params", message: "link must be an Apron link with server, room and token" } satisfies ProtocolError;
 		if (invite.server !== server) throw { name: "invalid_params", message: "link is not of this link's server" } satisfies ProtocolError;
 		this.store.setRemotePair({ room_id: roomId, server, remote_room: invite.room, token: invite.token }, nowMs());
@@ -8849,6 +8880,24 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 	}
 
+	/**
+	 * After a local user's profile change, which is not in the log: each
+	 * remote server this server shares rooms with sends it, if it sent for
+	 * the user before (Outbox.profilesDue).
+	 */
+	private noteProfile(userId: string): void {
+		let pairs: readonly RemotePair[];
+		try {
+			pairs = this.store.remotePairs(nowMs());
+		} catch {
+			return;
+		}
+		for (const server of new Set(pairs.map((pair) => pair.server))) {
+			this.senderFor(server).outbox.profilesDue.add(userId);
+			this.kickSender(server);
+		}
+	}
+
 	/** The sender of one remote server, made on first use. */
 	private senderFor(server: string): RemoteSender {
 		let sender = this.senders.get(server);
@@ -8971,7 +9020,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const known = () => this.knownSelf;
 		return {
 			get self() { return config.remoteSelf ?? known() ?? ""; },
-			pairs: () => new Map(store.remotePairs(nowMs()).filter((pair) => pair.server === server).map((pair) => [pair.room_id, pair.remote_room])),
+			pairs: () => new Map(store.remotePairs(nowMs()).filter((pair) => pair.server === server).map((pair) => [pair.room_id, { remote: pair.remote_room, start: pair.start_log_id }])),
 			linkInRoom: (roomId) => {
 				const linkId = store.remoteLinkFor(server, nowMs());
 				return linkId !== undefined && store.isRoomMember(roomId, linkId, nowMs());

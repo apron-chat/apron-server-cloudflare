@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { addServerToLinks, linkLeftRoom, Outbox, RetryLater, rewriteMentions, type OutboxDeps, type OutboxRecord, type ReplyFrame } from '../src/sender';
+import { addServerToLinks, linkLeftRoom, Outbox, requestId, RetryLater, rewriteMentions, type OutboxDeps, type OutboxRecord, type ReplyFrame } from '../src/sender';
 
 // The sender's mapping and order (extension `ext:remote`), with a fake link connection.
 
@@ -12,6 +12,7 @@ function world(records: OutboxRecord[]) {
 	const state = {
 		cursor: 0,
 		pairs: new Map([['room', 'ops'], ['other', 'ops2']]),
+		starts: new Map<string, number>(),
 		linkIn: new Set(['room', 'other']),
 		messages: new Map<string, Record<string, unknown>>(),
 		copies: new Map<string, string>(),
@@ -22,7 +23,7 @@ function world(records: OutboxRecord[]) {
 	};
 	const deps: OutboxDeps = {
 		self: SELF,
-		pairs: () => new Map([...state.pairs].filter(([room]) => !state.dropped.includes(room))),
+		pairs: () => new Map([...state.pairs].filter(([room]) => !state.dropped.includes(room)).map(([room, remote]) => [room, { remote, start: state.starts.get(room) ?? 0 }])),
 		linkInRoom: (room) => state.linkIn.has(room),
 		dropPair: (room) => { state.dropped.push(room); },
 		cursor: () => state.cursor,
@@ -68,7 +69,10 @@ describe('Outbox', () => {
 		expect(state.copies.get('1')).toBe('100');
 		expect(state.cursor).toBe(1);
 		// Ids come from the record, so a resend is a duplicate.
-		expect(sent[1].id).toBe('x:1:room:create:2');
+		expect(sent[1].id).toMatch(/^fed-1-create-[0-9a-f]{14}$/);
+		// The same request again is the same id; other params, another.
+		expect(requestId(1, 'create', 'message', sent[1].params)).toBe(sent[1].id);
+		expect(requestId(1, 'create', 'message', { ...sent[1].params, body: { text: 'other' } })).not.toBe(sent[1].id);
 	});
 
 	it('saves the copy on an edit, deletes it on a delete or a move out, and skips a delete of an unknown copy', async () => {
@@ -143,6 +147,40 @@ describe('Outbox', () => {
 		expect(sent.filter((request) => request.method === 'room_leave').map((request) => request.params)).toEqual([{ room_id: 'ops', ext: { remote: { user_id: 'bob' } } }]);
 	});
 
+	it('moves the copy between two rooms shared with the server, and saves after a create of an edited message', async () => {
+		const { outbox, sent, call, state } = world([
+			message(1, {}),
+			// Moved from `room` to `other`: one record in both rooms.
+			message(2, { message_id: '1', prev_log_id: '1', room_id: 'other', prev_room_id: 'room' }, 'room'),
+			message(2, { message_id: '1', prev_log_id: '1', room_id: 'other', prev_room_id: 'room' }, 'other'),
+			// An edit of a message sent after the pair whose copy this server lost: a create (the remote server finds the copy), then a save.
+			message(3, { message_id: '9', prev_log_id: '9', body: { text: 'restored' } }),
+		]);
+		await outbox.drain(call);
+		const writes = sent.filter((request) => request.method === 'message').map((request) => [request.params.message_id, request.params.room_id, request.params.deleted]);
+		expect(writes).toEqual([[undefined, 'ops', undefined], ['100', 'ops2', undefined], [undefined, 'ops', undefined], ['101', 'ops', undefined]]);
+		expect(state.copies.get('9')).toBe('101');
+	});
+
+	it('never sends a record of a room at or before its pair started, nor an edit of a message from before it', async () => {
+		const { outbox, sent, call, state } = world([message(5, {}), message(6, { message_id: '3', prev_log_id: '4', body: { text: 'old edited' } }), message(7, {})]);
+		state.starts.set('room', 5);
+		await outbox.drain(call);
+		expect(sent.filter((request) => request.method === 'message').map((request) => request.params.ext.remote.message_id)).toEqual(['7']);
+		expect(state.cursor).toBe(7);
+	});
+
+	it('sends a changed profile of a user it sent for, before any record', async () => {
+		const { outbox, sent, call, state } = world([]);
+		state.users.set('ada', { id: 'ada@a.example', name: 'Old' });
+		outbox.profilesDue.add('ada');
+		outbox.profilesDue.add('bob');
+		expect(outbox.behind(0)).toBe(true);
+		await outbox.drain(call);
+		expect(sent.map((request) => [request.method, request.params.name, request.id.startsWith('fed-0-me-')])).toEqual([['me', 'Ada', true]]);
+		expect(outbox.profilesDue.size).toBe(0);
+	});
+
 	it('sends a profile again when the name changed', async () => {
 		const { outbox, sent, call, state } = world([message(1, {}), message(2, {})]);
 		state.users.set('ada', { id: 'ada@a.example', name: 'Old' });
@@ -164,7 +202,7 @@ describe('Outbox', () => {
 		expect(second.state.logs).toEqual(['remote_send_refused']);
 
 		const third = world([message(1, {}), message(2, {}, 'other')]);
-		third.answers.set('message', (request) => request.params.room_id === 'ops' ? { error: { code: -32001, message: 'x', data: { reason: 'link_not_in_room' } } } : { result: { message_id: 'c' } });
+		third.answers.set('message', (request) => request.params.room_id === 'ops' ? { error: { code: -32602, message: 'x', data: { ext: { remote: 'not_joined' } } } } : { result: { message_id: 'c' } });
 		await third.outbox.drain(third.call);
 		expect(third.state.dropped).toEqual(['room']);
 		expect(third.state.cursor).toBe(2);
@@ -189,7 +227,8 @@ describe('text', () => {
 	});
 
 	it('tells a refusal for a link not in the room', () => {
-		expect(linkLeftRoom({ code: -32001, message: 'x', data: { reason: 'link_not_in_room' } })).toBe(true);
+		expect(linkLeftRoom({ code: -32001, message: 'x', data: { ext: { remote: 'not_joined' } } })).toBe(true);
+		expect(linkLeftRoom({ code: -32602, message: 'Unknown room', data: { ext: { remote: 'not_joined' } } })).toBe(true);
 		expect(linkLeftRoom({ code: -32001, message: 'Only the original author may edit this message' })).toBe(false);
 	});
 });

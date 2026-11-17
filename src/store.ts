@@ -1260,6 +1260,8 @@ export interface RemotePair {
   remote_room: string;
   token: string;
   created_ms: number;
+  /** The head of the log when the pair was made: its room's records at or below it are never sent. */
+  start_log_id: number;
 }
 
 /** A remote server's outbox (ext:remote): the log ID sent through, and why it stopped, if it did. */
@@ -5474,6 +5476,7 @@ export class Store {
     return this.metaJson(META_REMOTE_PAIRS, (stored) => Array.isArray(stored)
       ? stored.filter((pair): pair is RemotePair => isPlainObject(pair) && typeof pair.room_id === "string" && typeof pair.server === "string" &&
         typeof pair.remote_room === "string" && typeof pair.token === "string")
+        .map((pair) => ({ ...pair, start_log_id: integerColumn(pair.start_log_id) }))
       : undefined, []);
   }
 
@@ -5483,12 +5486,12 @@ export class Store {
    * starts its outbox at the head of the log: nothing older is sent. A pair
    * also lifts a stop of the server's outbox (an earlier refused sign-in).
    */
-  setRemotePair(pair: Omit<RemotePair, "created_ms">, now = this.clock.now()): void {
+  setRemotePair(pair: Omit<RemotePair, "created_ms" | "start_log_id">, now = this.clock.now()): void {
     this.ensureReady();
     this.reserved({ reads: 8, writes: 8 }, false, now, () => this.transaction(() => {
       const pairs = this.readRemotePairs().filter((other) => !(other.room_id === pair.room_id && other.server === pair.server));
       if (pairs.length >= MAX_REMOTE_PAIRS) throw new StoreError("denied", `This server shares at most ${MAX_REMOTE_PAIRS} rooms`);
-      pairs.push({ ...pair, created_ms: this.effectiveNow(now) });
+      pairs.push({ ...pair, created_ms: this.effectiveNow(now), start_log_id: this.logState().last_log_id });
       this.writeMeta(META_REMOTE_PAIRS, JSON.stringify(pairs));
       this.remotePairsCache = undefined;
       const outboxes = this.readOutboxes();

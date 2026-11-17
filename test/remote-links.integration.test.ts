@@ -419,11 +419,29 @@ it('/remote unshare takes the links out of the room and drops its pairs', async 
 	try {
 		expect((await request(link, 'pair', 'ext:remote', { room_id: roomId, link: `https://link.apron.chat/#server=${server}&room=ops&token=t` })).result).toEqual({});
 		const unshared = await command(admin, 'unshare', '/remote unshare', roomId);
-		expect(unshared.notice!.params.body.text).toBe(`This room is no longer shared with ${server}.`);
+		// The other server (none listens here) could not be told.
+		expect(unshared.notice!.params.body.text).toMatch(new RegExp(`^This room is no longer shared with ${server.replace(/[.:/]/g, '\\$&')}\\. Could not tell `));
 		expect(unshared.skipped.some((frame) => frame.method === 'room_update' && frame.params.memberships?.[0]?.members?.[0]?.user?.user_id === linkId && frame.params.memberships[0].members[0].joined === false)).toBe(true);
 		expect((await command(admin, 'list', '/remote list', roomId)).notice!.params.body.text).toContain('shared rooms: none');
 		// The link may no longer write there: its pair has ended.
 		const refused = await request(link, 'post', 'message', { room_id: roomId, body: { text: 'x' }, ext: { remote: { user_id: 'carol' } } });
-		expect(refused.error.code).toBe(INVALID_PARAMS);
+		expect(refused.error).toMatchObject({ code: INVALID_PARAMS, data: { ext: { remote: 'not_joined' } } });
+	} finally { admin.close(); link.close(); }
+});
+
+it('ends a pair on an ext:remote request without link, and the link leaves the room', async () => {
+	const server = 'ws://127.0.0.1:8095/ws';
+	const { admin, link, linkId, roomId } = await linked(server);
+	try {
+		expect((await request(link, 'pair', 'ext:remote', { room_id: roomId, link: `https://link.apron.chat/#server=${server}&room=ops&token=t` })).result).toEqual({});
+		const ended = await exchange(link, 'end', 'ext:remote', { room_id: roomId });
+		expect(ended.frame.result).toEqual({});
+		expect(ended.skipped.some((frame) => frame.method === 'room_update' && frame.params.left?.[0]?.room_id === roomId)).toBe(true);
+		const left = await until(admin, (frame) => frame.method === 'room_update' && frame.params.memberships?.[0]?.members?.[0]?.user?.user_id === linkId && frame.params.memberships[0].members[0].joined === false);
+		expect(left.frame.params.memberships[0].room_id).toBe(roomId);
+		expect((await command(admin, 'list', '/remote list', roomId)).notice!.params.body.text).toContain('shared rooms: none');
+		// A link in a public room it has not joined is denied, with the same reason.
+		const general = await request(link, 'general', 'message', { room_id: 'general', body: { text: 'x' }, ext: { remote: { user_id: 'carol' } } });
+		expect(general.error).toMatchObject({ code: DENIED, data: { ext: { remote: 'not_joined' } } });
 	} finally { admin.close(); link.close(); }
 });
