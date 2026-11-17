@@ -64,11 +64,13 @@ export type MetricEvent =
 	 */
 	| "awake"
 	/**
-	 * A user active on a UTC day (ApronDemoServer.noteActive): `read` the
+	 * A user active on a UTC day (ApronDemoServer.markActive): `read` the
 	 * first frame or sign-in of a connection's day, `write` its first new
 	 * message that day; then the tier (`registered`, `guest` or `bot`) and
-	 * who: the user_id, or for a guest (a new id each sign-in) `ip:` and its
-	 * hashed address key. At most one of each a connection a day; count
+	 * who: the user_id, or for a guest (a new id each sign-in) `g:` and an
+	 * HMAC of its address key under a server secret, stable but not
+	 * traceable to an address (ApronDemoServer.recordActive). At most one of
+	 * each a connection a day; count
 	 * distinct `blob4` for daily, weekly and monthly active users. Internal:
 	 * the dataset is read only with the account's API token.
 	 */

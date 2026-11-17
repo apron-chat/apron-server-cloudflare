@@ -156,9 +156,11 @@ try {
 
 // Active users (src/metrics.ts active): distinct users a UTC day, and over
 // the last 7 and 30 days, who read (signed in or sent any frame) or wrote (a
-// new message), by tier. A guest counts by its address key, since its id is
-// new each sign-in. Distinct counts ignore _sample_interval: the dataset is
-// not sampled at this volume.
+// new message), by tier. A guest counts by a keyed hash of its address key,
+// since its id is new each sign-in: guests behind one address count once.
+// The read and write totals add the tiers, so a guest who signs in on the
+// same connection counts in both. Distinct counts ignore _sample_interval:
+// the dataset is not sampled at this volume.
 try {
 	const tiers = ["registered", "guest", "bot"];
 	const pivot = (rows, keyOf) => {

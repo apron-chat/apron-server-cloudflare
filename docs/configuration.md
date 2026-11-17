@@ -248,8 +248,10 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   users (`active`: `read` at a connection's sign-in or its first frame of a
   UTC day, `write` at its first new message of the day, at most one of each
   a connection a day, with the tier, `registered`, `guest` or `bot`, and the
-  user_id, or for a guest, whose id is new at each sign-in, `ip:` and its
-  hashed address key; count distinct users for daily, weekly and monthly
+  user_id, or for a guest, whose id is new at each sign-in, `g:` and an HMAC
+  of its address key under a key derived from `UPLOAD_SIGNING_KEY`, stable
+  across days but not traceable to an address without that secret (no guest
+  is recorded without it); count distinct users for daily, weekly and monthly
   active users; the dataset is internal, read only with the account's API
   token), and refusals (`refusal`, `src/refusals.ts`): `error` for a JSON-RPC error (a
   `retry_after` by its message and `data.reason`, any other by its name

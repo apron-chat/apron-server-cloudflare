@@ -48,8 +48,12 @@ it('counts a registered user active once a day per connection: read at sign-in o
 		expect(active()).toEqual([{ indexes: ['active'], blobs: ['active', 'read', 'registered', userId], doubles: [1] }]);
 		// More frames and messages the same day add nothing to read, and write once.
 		expect((await request(peer, 'list', 'room_list', {})).result).toBeTruthy();
-		expect((await request(peer, 'post-1', 'message', { room_id: 'general', body: { text: 'hello' } })).result.message_id).toEqual(expect.any(String));
+		const posted = (await request(peer, 'post-1', 'message', { room_id: 'general', body: { text: 'hello' } })).result.message_id;
+		expect(posted).toEqual(expect.any(String));
 		expect((await request(peer, 'post-2', 'message', { room_id: 'general', body: { text: 'again' } })).result.message_id).toEqual(expect.any(String));
+		// A retry and an edit are not new messages either.
+		expect((await request(peer, 'post-1', 'message', { room_id: 'general', body: { text: 'hello' } })).result.message_id).toBe(posted);
+		expect((await request(peer, 'edit', 'message', { message_id: posted, room_id: 'general', body: { text: 'edited' } })).result).toBeTruthy();
 		expect(active().map((point) => point.blobs.slice(1))).toEqual([['read', 'registered', userId], ['write', 'registered', userId]]);
 		// The next UTC day, the same connection counts again: its first frame, then its first message.
 		const realNow = Date.now.bind(Date);
@@ -63,17 +67,28 @@ it('counts a registered user active once a day per connection: read at sign-in o
 	} finally { peer.close(); }
 });
 
-it('counts a guest by its address key, since its id is new at each sign-in', async () => {
+it('counts a guest by a keyed hash of its address key: the same for two guests on one address, and not the key itself', async () => {
 	const active = await activePoints();
-	const guest = await connect({ ip: `198.51.100.${nextIp++ % 250 + 1}` });
+	const ip = `198.51.100.${nextIp++ % 250 + 1}`;
+	const guests = [await connect({ ip }), await connect({ ip })];
 	try {
-		await greeting(guest);
-		expect((await request(guest, 'auth', 'auth', { scheme: 'guest' })).result.you.user_id).toMatch(/^guest_/);
-		const ipKey = await runInDurableObject(stub(), (_instance, state) => {
-			const mine = state.getWebSockets().map((socket) => socket.deserializeAttachment() as { tier: string; activeDay?: string; ipKey: string })
-				.filter((attachment) => attachment.tier === 'anonymous' && attachment.activeDay);
-			return mine.at(-1)!.ipKey;
-		});
-		expect(active()).toEqual([{ indexes: ['active'], blobs: ['active', 'read', 'guest', `ip:${ipKey}`], doubles: [1] }]);
-	} finally { guest.close(); }
+		const ids: string[] = [];
+		for (const guest of guests) {
+			await greeting(guest);
+			ids.push((await request(guest, 'auth', 'auth', { scheme: 'guest' })).result.you.user_id);
+		}
+		expect(new Set(ids).size).toBe(2);
+		const ipKey = await runInDurableObject(stub(), (_instance, state) => state.getWebSockets()
+			.map((socket) => socket.deserializeAttachment() as { userId?: string; ipKey: string })
+			.find((attachment) => attachment.userId === ids[0])!.ipKey);
+		// A guest's point is recorded once its hash is made.
+		for (let tries = 0; tries < 50 && active().length < 2; tries++) await new Promise((resolve) => setTimeout(resolve, 10));
+		const points = active();
+		expect(points).toHaveLength(2);
+		expect(points.map((point) => point.blobs.slice(0, 3))).toEqual([['active', 'read', 'guest'], ['active', 'read', 'guest']]);
+		const [who, other] = points.map((point) => point.blobs[3]);
+		expect(who).toMatch(/^g:[A-Za-z0-9_-]{22}$/);
+		expect(other).toBe(who);
+		expect(who).not.toContain(ipKey);
+	} finally { for (const guest of guests) guest.close(); }
 });

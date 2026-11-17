@@ -856,10 +856,17 @@ function checkDeviceId(id: string | undefined): void {
 	}
 }
 
-/** The UTC day of an epoch-milliseconds time, `YYYY-MM-DD`. */
+/** A connection's user counted active (markActive): the bucket, the tier, and who (a guest's address key, hashed before it is recorded). */
+interface ActiveMark {
+	bucket: "read" | "write";
+	tier: "registered" | "guest" | "bot";
+	who: string;
+}
+
 /** A UTC day as utcDay writes it. */
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
+/** The UTC day of an epoch-milliseconds time, `YYYY-MM-DD`. */
 function utcDay(ms: number): string {
 	return new Date(ms).toISOString().slice(0, 10);
 }
@@ -2454,6 +2461,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private roomNotesAlerted?: boolean;
 	/** Refusals counted for the `refusal` metric (src/refusals.ts), written at most twice a minute per kind. */
 	private readonly refusals = new RefusalMeter((kind, reason, detail, count) => recordMetric(this.runtimeEnv.METRICS, "refusal", [kind, reason, detail], count));
+	/** The key that hashes a guest's address key for the `active` metric (recordActive), once made. */
+	private activeGuestKey?: Promise<CryptoKey>;
 	/** Slow waits and long stays awake, for the `slow` and `awake` metrics (src/stalls.ts). */
 	private readonly stalls = new StallMeter((event, details, values) => recordMetric(this.runtimeEnv.METRICS, event, details, values), nowMs);
 	/** Shadow dollars spent by recent traffic, for the attack pause (src/burn.ts); in memory only. */
@@ -2856,7 +2865,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.pendingBytes += bytes;
 		const active = this.markActive(attachment, "read", now);
 		writeAttachment(socket, attachment);
-		if (active) recordMetric(this.runtimeEnv.METRICS, "active", active);
+		if (active) this.recordActive(active);
 		const prior = this.queues.get(socket) ?? Promise.resolve();
 		const actor = connectionActor(socket, attachment);
 		const next = prior.catch(() => undefined).then(() => ACTOR.run(actor, () => this.processFrame(socket, message))).catch((error) => this.handleFrameFailure(socket, error)).finally(() => {
@@ -2938,17 +2947,39 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * Marks a signed-in connection's user active today for `bucket` (`read`:
 	 * a sign-in or any frame; `write`: a new message), once a day per
 	 * connection, kept in its attachment so hibernation does not repeat it.
-	 * Returns the `active` metric's details when this is the day's first, for
-	 * the caller to record once the attachment is written.
+	 * Returns what to record when this is the day's first, for the caller to
+	 * pass to recordActive once the attachment is written.
 	 */
-	private markActive(attachment: ConnectionAttachment, bucket: "read" | "write", now: number): string[] | undefined {
-		if (attachment.tier === "pending" || !attachment.userId) return undefined;
+	private markActive(attachment: ConnectionAttachment, bucket: "read" | "write", now: number): ActiveMark | undefined {
+		if (attachment.tier === "pending" || !attachment.userId || attachment.closing) return undefined;
 		const day = utcDay(now);
 		const field = bucket === "read" ? "activeDay" : "postedDay";
 		if (attachment[field] === day) return undefined;
 		attachment[field] = day;
 		const tier = attachment.tier === "anonymous" ? "guest" : isBotId(attachment.userId) ? "bot" : "registered";
-		return [bucket, tier, tier === "guest" ? `ip:${attachment.ipKey}` : attachment.userId];
+		return { bucket, tier, who: tier === "guest" ? attachment.ipKey : attachment.userId };
+	}
+
+	/**
+	 * Records an `active` point. A user counts by user_id; a guest, whose id
+	 * is new at each sign-in, by `g:` and an HMAC of its address key under a
+	 * key derived from UPLOAD_SIGNING_KEY: stable across days for weekly and
+	 * monthly counts, and unlike the address key itself (an unkeyed hash a
+	 * candidate address can be checked against), not traceable to an address
+	 * without the secret. Without that secret a guest is not recorded.
+	 */
+	private recordActive(mark: ActiveMark): void {
+		if (mark.tier !== "guest") {
+			recordMetric(this.runtimeEnv.METRICS, "active", [mark.bucket, mark.tier, mark.who]);
+			return;
+		}
+		const secret = this.runtimeEnv.UPLOAD_SIGNING_KEY;
+		if (!secret || !this.runtimeEnv.METRICS) return;
+		this.activeGuestKey ??= crypto.subtle.importKey("raw", new TextEncoder().encode(`apron active guests v1\u0000${secret}`), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+		void this.activeGuestKey
+			.then((key) => crypto.subtle.sign("HMAC", key, new TextEncoder().encode(mark.who)))
+			.then((digest) => recordMetric(this.runtimeEnv.METRICS, "active", [mark.bucket, "guest", `g:${base64UrlEncode(new Uint8Array(digest).slice(0, 16))}`]))
+			.catch(() => undefined);
 	}
 
 	/**
@@ -5080,7 +5111,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const active = latest && this.markActive(latest, "write", nowMs());
 			if (latest && active) {
 				writeAttachment(socket, latest);
-				recordMetric(this.runtimeEnv.METRICS, "active", active);
+				this.recordActive(active);
 			}
 			// Posting in a room shows its poster saw it: their waiting and held wakes for it go.
 			this.dropWakes(identity.user_id, created.room_id);
@@ -5716,7 +5747,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const active = this.markActive(signedIn, "read", nowMs());
 			if (stored && stored.unreadClaims !== this.unreadClaims) signedIn.unreadOwed = true;
 			writeAttachment(socket, signedIn);
-			if (active) recordMetric(this.runtimeEnv.METRICS, "active", active);
+			if (active) this.recordActive(active);
 		}
 		this.syncServer(socket);
 		this.sendMutesInEffect(socket, stored);
