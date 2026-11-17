@@ -2640,8 +2640,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	async fetch(request: Request): Promise<Response> {
 		this.stalls.event(() => this.awakeSnapshot());
-		// A live text streams for minutes by design: its readers and writers
-		// are counted in flight, not timed.
+		// A live text streams for minutes by design: its requests are counted
+		// in flight while the object answers them, not timed (a reader's
+		// stream outlives its request: `live` in the awake snapshot counts it).
 		const handler = refusedPath(request);
 		const response = await this.stalls.track("handler", handler, this.fetchRequest(request), !handler.startsWith("live_"));
 		// Each one an entry Worker request and an object request, billed whatever it answers.
@@ -2919,7 +2920,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// shows here even when the handlers themselves are quick. Events are
 		// delivered during this wait, so it comes after inAlarm is cleared: a
 		// presence change meanwhile schedules its own alarm.
-		await this.stalls.track("storage", "sync", Promise.resolve().then(() => this.ctx.storage.sync()));
+		// A failed flush is not this alarm's failure: its work is done and the next one set.
+		await this.stalls.track("storage", "sync", Promise.resolve().then(() => this.ctx.storage.sync())).catch(() => undefined);
 	}
 
 	/**
@@ -3065,7 +3067,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (due.has("auth")) {
 				// One that never sent a frame, not even an answered ping, may have
 				// lost its client during the upgrade: counted apart, as `silent`.
-				const silent = attachment.lastFrameAt === undefined && !this.ctx.getWebSocketAutoResponseTimestamp(socket);
+				// frameTimes, not lastFrameAt: the stored attachment keeps the first
+				// (pruned only as new frames come), not the second.
+				const silent = attachment.frameTimes.length === 0 && !this.ctx.getWebSocketAutoResponseTimestamp(socket);
 				this.closePolicy(socket, attachment, 1008, AUTH_TIMEOUT_REASON, silent ? "silent" : "");
 				continue;
 			}

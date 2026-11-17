@@ -168,6 +168,9 @@ it('waits for the storage flush after an alarm only once inAlarm is cleared, so 
 		vi.spyOn(state.storage, 'sync').mockImplementation(async () => { during.push(runtime.inAlarm); return sync(); });
 		await runtime.alarm();
 		expect(during).toEqual([false]);
+		// A failed flush does not fail the alarm: its work is done and the next one set.
+		vi.spyOn(state.storage, 'sync').mockRejectedValue(new Error('sync failed'));
+		await expect(runtime.alarm()).resolves.toBeUndefined();
 	});
 	vi.restoreAllMocks();
 });

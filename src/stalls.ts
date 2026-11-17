@@ -119,11 +119,14 @@ export class StallMeter {
 		const start = this.clock();
 		const key = detail ? `${kind}:${detail}` : kind;
 		this.inFlight.set(key, (this.inFlight.get(key) ?? 0) + 1);
+		// Never throws: runMutation's queue and the handlers settle through it.
 		const settle = () => {
-			const left = (this.inFlight.get(key) ?? 1) - 1;
-			if (left > 0) this.inFlight.set(key, left);
-			else this.inFlight.delete(key);
-			if (timed) this.note(kind, detail, this.clock() - start);
+			try {
+				const left = (this.inFlight.get(key) ?? 1) - 1;
+				if (left > 0) this.inFlight.set(key, left);
+				else this.inFlight.delete(key);
+				if (timed) this.note(kind, detail, this.clock() - start);
+			} catch { /* a metric never breaks what it counts */ }
 		};
 		return work.then((value) => { settle(); return value; }, (error: unknown) => { settle(); throw error; });
 	}
