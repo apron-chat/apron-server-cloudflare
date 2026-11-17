@@ -346,15 +346,15 @@ it('counts an idle guest idle from its last frame, not from when it said idle', 
 	const guest = await connect();
 	try {
 		await greeting(guest);
-		await request(guest, 'auth', 'auth', { scheme: 'guest' });
+		const me = (await request(guest, 'auth', 'auth', { scheme: 'guest' })).result.you.user_id;
 		expect((await request(guest, 'idle', 'status', { idle: 60 })).result).toEqual({});
 		// Its last frame, after it said idle: the one the frame handler stores.
 		await request(guest, 'list', 'room_list', {});
 		await runInDurableObject(stub(), (instance, state) => {
 			const runtime = instance as unknown as { idlestGuest(sockets: WebSocket[], now: number): unknown };
 			const mine = state.getWebSockets().filter((socket) => {
-				const attachment = socket.deserializeAttachment() as { idle?: boolean; lastFrameAt?: number };
-				return attachment.idle && attachment.lastFrameAt !== undefined && attachment.lastFrameAt >= Date.now() - 60_000;
+				const attachment = socket.deserializeAttachment() as { userId?: string; idle?: boolean; closing?: boolean; lastFrameAt?: number };
+				return attachment.userId === me && !attachment.closing && attachment.idle && attachment.lastFrameAt !== undefined;
 			});
 			expect(mine).toHaveLength(1);
 			const { idleAt, lastFrameAt } = mine[0].deserializeAttachment() as { idleAt: number; lastFrameAt: number };
