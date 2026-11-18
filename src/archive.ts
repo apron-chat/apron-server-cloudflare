@@ -109,6 +109,13 @@ export class Archive {
 		return row ? Number(row.log_id) : undefined;
 	}
 
+	/** How many archived records have log IDs in `lower`..`upper` - 1: those history serves, between the published and hot floors (`/status`). */
+	async count(lower: number, upper: number): Promise<number> {
+		await this.schema();
+		const row = await this.db.prepare("SELECT COUNT(*) AS count FROM records WHERE log_id >= ?1 AND log_id < ?2").bind(lower, upper).first<{ count: number }>();
+		return Number(row?.count ?? 0);
+	}
+
 	/** Deletes up to `limit` records below `floor`, oldest first; returns how many went. */
 	async deleteBelow(floor: number, limit: number): Promise<number> {
 		await this.schema();

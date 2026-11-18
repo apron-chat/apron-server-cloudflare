@@ -9193,9 +9193,46 @@ export class ApronDemoServer extends DurableObject<Env> {
 			...(active ? [await active] : []),
 			`- Open connections: ${share(this.ctx.getWebSockets().length, limits.openConnections)}`,
 			`- Database: ${databaseBytes === null ? "unknown" : mib(databaseBytes)} / ${mib(limits.databaseHardTargetBytes)}`,
+			...await this.historyStatus(now),
 		);
 		this.sendNotice(socket, roomId, lines.join("\n"));
 		this.reply(socket, request, {});
+	}
+
+	/**
+	 * `/status`'s history lines: the records the object's SQLite (the hot log)
+	 * holds against `retentionRecords`, and the archive's (D1) against
+	 * `archiveRecords`. A count over its limit is the minimum age keeping
+	 * records, or cleanup's day. Never throws; D1 gives up after 5 seconds.
+	 */
+	private async historyStatus(now: number): Promise<string[]> {
+		const limits = this.config.limits;
+		const count = (value: number) => Math.round(value).toLocaleString("en-US");
+		const against = (value: number, limit: number) => `${count(value)} / ${count(limit)} records (${limit > 0 ? Math.round((100 * value) / limit) : 0}%)`;
+		let hot: string;
+		try {
+			const records = this.store.hotRecords(now);
+			hot = limits.retentionRecords > 0 ? against(records, limits.retentionRecords) : `${count(records)} records (kept by age)`;
+		} catch {
+			hot = "unknown";
+		}
+		const lines = [`- History in SQLite: ${hot}`];
+		if (!this.archive) {
+			lines.push(`- History archive (D1): off${limits.archiveRecords > 0 ? " (no `ARCHIVE` binding)" : ""}`);
+			return lines;
+		}
+		try {
+			const { hot: floor, published } = this.store.archiveBounds(now);
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const archived = await this.stalls.track("d1", "count", Promise.race([
+				this.archive.count(published, floor),
+				new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("timeout")), 5_000); }),
+			]).finally(() => clearTimeout(timer)));
+			lines.push(`- History archive (D1): ${against(archived, limits.archiveRecords)}`);
+		} catch {
+			lines.push("- History archive (D1): unavailable");
+		}
+		return lines;
 	}
 
 	/** `/status`'s active users line (src/active-users.ts): never throws, and gives up after 5 seconds. */

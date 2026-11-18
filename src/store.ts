@@ -3806,6 +3806,19 @@ export class Store {
     return this.archiveFloorCache > 0 ? Math.min(this.archiveFloorCache, hot) : hot;
   }
 
+  /**
+   * The records the hot log holds from the hot floor on, for `/status`:
+   * counted up to RETAINED_SCAN_CAP (one index entry each, refunded past
+   * what is found), and that cap and one more past it.
+   */
+  hotRecords(now = this.clock.now()): number {
+    this.ensureReady();
+    return this.reserved({ reads: 16 + RETAINED_SCAN_CAP + 1 }, false, now, () => integerColumn(this.rawRows<{ count: number }>(
+      "SELECT COUNT(*) AS count FROM (SELECT 1 FROM records INDEXED BY records_log_idx WHERE log_id >= ? LIMIT ?)",
+      this.logState().history_floor, RETAINED_SCAN_CAP + 1,
+    )[0]?.count));
+  }
+
   /** The hot floor and the published floor (publishedFloor), for the runtime's archive upkeep. */
   archiveBounds(now = this.clock.now()): { hot: number; published: number } {
     this.ensureReady();
