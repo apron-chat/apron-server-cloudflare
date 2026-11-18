@@ -15,9 +15,12 @@ export interface Limits {
 	minRetentionSeconds: number;
 	/**
 	 * Records past the limits above that the history archive (D1, binding
-	 * ARCHIVE) keeps, newest first, before they expire: they leave the
-	 * object's SQLite, the hot log, but history still serves them. 0, or no
-	 * binding, keeps none: records past the limits expire at once.
+	 * ARCHIVE) keeps, newest first, before they expire. Archived records stay
+	 * in history but become read-only: they leave the object's SQLite, the
+	 * hot log, and history pages still serve them from D1, but their messages
+	 * can no longer be edited, reacted to or replied to, as an expired one
+	 * cannot. 0, or no binding, keeps none: records past the limits expire at
+	 * once.
 	 */
 	archiveRecords: number;
 	/**

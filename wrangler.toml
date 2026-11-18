@@ -25,9 +25,12 @@ new_sqlite_classes = ["ApronDemoServer"]
 binding = "MEDIA"
 bucket_name = "apron-media-dev"
 
-# The history archive (src/archive.ts): records past the hot log's
-# retentionRecords, kept for archiveRecords more. Local development and the
-# tests use a local database; the id is a placeholder.
+# The history archive (src/archive.ts). Archived records stay in history but
+# become read-only: past retentionRecords, the oldest move from the object's
+# SQLite to D1, where history pages still read them but their messages can
+# no longer be edited, reacted to or replied to; past archiveRecords more,
+# they expire. Local development and the tests use a local database; the id
+# is a placeholder.
 [[d1_databases]]
 binding = "ARCHIVE"
 database_name = "apron-archive-dev"

@@ -78,9 +78,14 @@ VAPID_SUBJECT = "https://server.apron.chat"
 PUSH_HOSTS_EXTRA = "push.stupidtech.net"
 
 # The history archive (src/archive.ts, docs/configuration.md, History
-# retention): records past the hot log's retentionRecords, kept for
-# archiveRecords more. Without it they expire at once. The object creates
-# its table on first use. Previews bind none (below), so theirs expire at once.
+# retention). Archived records stay in history but become read-only: once
+# the object's own SQLite holds more than retentionRecords (LIMIT_RETENTION_RECORDS),
+# the oldest move here, where history pages still read them, but their
+# messages can no longer be edited, reacted to or replied to. The archive
+# keeps archiveRecords (LIMIT_ARCHIVE_RECORDS) of them, then they expire.
+# Without this binding, records past retentionRecords expire at once. The
+# object creates its table on first use. Previews bind none (below), so
+# theirs expire at once.
 [[d1_databases]]
 binding = "ARCHIVE"
 database_name = "apron-archive"
