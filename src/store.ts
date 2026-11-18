@@ -1276,6 +1276,8 @@ export interface MirrorRoom {
   start: number;
   /** Set once the owner removed the link, or this server unshared it: the room takes no more writes. */
   unshared?: true;
+  /** Set once its members were seeded from the owner's member list (at its first connection). */
+  seeded?: true;
   /** The owner's threads of the room, each with its local thread. */
   threads: Record<string, string>;
 }

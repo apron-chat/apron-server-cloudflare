@@ -83,6 +83,10 @@ const ERROR_NAMES: Record<number, ProtocolError["name"]> = {
 };
 /** How long a forwarded write waits for the owner before its user is told to try again. */
 const FORWARD_TIMEOUT_MS = 10_000;
+/** How long an accepted `message` waits for its copy (reconnecting and catching up as needed) before an error. */
+const COPY_WAIT_MS = 60_000;
+/** The members of a room a link's leave looks through for its remote users. */
+const REMOTE_MEMBERS_LIMIT = 1_000;
 /** While anything is mirrored, the alarm reads every owner this often, in case a wake push was lost. */
 const MIRROR_CHECK_MS = 5 * 60_000;
 /** At most one wake push a link this often (the owner's debounce). */
@@ -344,7 +348,10 @@ export class RemoteRooms {
 	 * (the records between go with it), also while it is connected.
 	 */
 	onRecord(record: Broadcast): void {
-		if (record.method === "membership") this.forwardMembership(record);
+		if (record.method === "membership") {
+			this.forwardMembership(record);
+			this.linkLeaves(record);
+		}
 		const rooms = record.rooms;
 		if (this.wakeRegistrations?.size === 0) return;
 		void this.wakes().then((registrations) => {
@@ -366,6 +373,34 @@ export class RemoteRooms {
 				}, Math.max(0, slot.last + WAKE_INTERVAL_MS - Date.now()));
 			}
 		}, () => undefined);
+	}
+
+	/**
+	 * Owner hook, after a membership record: when a link leaves a room (its
+	 * own `room_leave`, an admin's removal, or `/remote unshare`), its
+	 * remote users leave the room and its threads too, as the system: they
+	 * may come back with the link, so nothing marks them removed.
+	 */
+	private linkLeaves(record: Broadcast): void {
+		const roomId = record.params.room_id;
+		if (typeof roomId !== "string") return;
+		for (const member of (record.params.members as Array<Record<string, unknown>> | undefined) ?? []) {
+			const linkId = (member.user as Record<string, unknown> | undefined)?.user_id;
+			if (member.joined !== false || typeof linkId !== "string") continue;
+			const server = this.store.remoteLink(linkId, this.now());
+			if (server === undefined) continue;
+			const suffix = `@${remoteAuthority(server)}`;
+			// After the mutation that logged the leave (this hook runs inside it).
+			void (async () => {
+				for (const room of [roomId, ...this.store.threadsOf([roomId], this.now()).map((thread) => thread.room_id)]) {
+					for (const user of this.store.roomMembers([room], REMOTE_MEMBERS_LIMIT, this.now()).get(room) ?? []) {
+						if (user.user_id.endsWith(suffix)) await this.host.removeMember({ ipKey: MIRROR_IP_KEY }, room, user.user_id);
+					}
+				}
+			})().catch((error) => {
+				console.warn(JSON.stringify({ event: "remote_users_not_removed", link: linkId, room_id: roomId, error: error instanceof Error ? error.message : String(error) }));
+			});
+		}
 	}
 
 	// ─────────────────────────── mirror: reading ───────────────────────────
@@ -403,6 +438,8 @@ export class RemoteRooms {
 	 */
 	async ensure(server: string): Promise<LinkConnection> {
 		const session = this.session(server);
+		// A dial in progress is still catching up (its live records held): wait for it, open or not.
+		if (session.connecting) return session.connecting;
 		if (session.connection?.open) return session.connection;
 		if (!this.host.mayDial()) throw new RetryLater(60_000, "this server is paused or out of capacity");
 		session.connecting ??= this.dial(session).finally(() => { session.connecting = undefined; });
@@ -496,34 +533,38 @@ export class RemoteRooms {
 	}
 
 	/**
-	 * The owner's members of each mirrored room join its mirror room as
-	 * remote users (§4.2.1: as many as the owner lists), so both servers list
-	 * the same people; this mirror's own users there are its local members,
-	 * whose joins go to the owner (forwardMembership) once an instance. The
-	 * mirror's own joins are not charged as posts; a remote user in as many
-	 * private rooms as anyone may be is left out.
+	 * Once, when a mirror room is made (its first connection): the owner's
+	 * members join it as remote users (§4.2.1: as many as the owner lists;
+	 * a list cut short only adds), and this mirror's own users there (the
+	 * connecting admin) join the owner's room as theirs. After that, both
+	 * sides follow membership records: the owner's, copied from history, and
+	 * this mirror's, sent as they happen (forwardMembership). The mirror's
+	 * own joins are not charged as posts; a remote user in as many private
+	 * rooms as anyone may be is left out.
 	 */
 	private async seedMembers(server: string, connection: LinkConnection): Promise<void> {
 		for (const mirror of this.store.mirrorState(this.now()).rooms) {
-			if (mirror.server !== server || mirror.unshared) continue;
+			if (mirror.server !== server || mirror.unshared || mirror.seeded) continue;
 			const listed = await connection.call("room_list", { room_id: mirror.owner_room, members: true }, `mirror-members:${mirror.owner_room}:${this.now()}`);
-			const record = [...((listed.result?.joined as unknown[]) ?? []), ...((listed.result?.not_joined as unknown[]) ?? [])][0] as Record<string, unknown> | undefined;
-			const users = new Map(((listed.result?.users as Array<Record<string, unknown>> | undefined) ?? []).map((user) => [user.user_id, user]));
+			if (listed.error || !listed.result) continue;
+			const record = [...((listed.result.joined as unknown[]) ?? []), ...((listed.result.not_joined as unknown[]) ?? [])][0] as Record<string, unknown> | undefined;
+			const users = new Map(((listed.result.users as Array<Record<string, unknown>> | undefined) ?? []).map((user) => [user.user_id, user]));
 			for (const member of (record?.members as Array<Record<string, unknown>> | undefined) ?? []) {
 				const user = users.get(member.user_id) ?? member;
 				await this.copyMember(server, mirror.room_id, user, true);
 			}
-			if (this.joinsSent.has(mirror.room_id)) continue;
-			this.joinsSent.add(mirror.room_id);
 			const local = this.store.roomMembers([mirror.room_id], 500, this.now()).get(mirror.room_id) ?? [];
 			for (const member of local) {
 				if (!isShadowUserId(member.user_id) && this.store.remoteLink(member.user_id, this.now()) === undefined) await this.sendMembership(connection, server, mirror.owner_room, member.user_id, member.name ?? "", true);
 			}
+			const state = this.store.mirrorState(this.now());
+			const stored = state.rooms.find((room) => room.room_id === mirror.room_id);
+			if (stored) {
+				stored.seeded = true;
+				this.store.setMirrorState(state, this.now());
+			}
 		}
 	}
-
-	/** The mirror rooms whose local members' joins this instance has sent to their owner. */
-	private readonly joinsSent = new Set<string>();
 
 	/**
 	 * A user of the owner's membership record in a local room: a remote user
@@ -898,7 +939,7 @@ export class RemoteRooms {
 			const answer = await connection.call(request.method, params, `${userId}:${request.id ?? this.now()}`.slice(0, 128), FORWARD_TIMEOUT_MS);
 			await connection.settled();
 			if (answer.error) throw this.ownerError(server, mirror.ownerRoom, answer.error);
-			this.host.reply(socket, request, this.mapResult(server, request, answer.result ?? {}));
+			this.host.reply(socket, request, await this.mapResult(server, request, answer.result ?? {}, Date.now() + COPY_WAIT_MS));
 			return true;
 		} finally {
 			session.inflight -= 1;
@@ -1015,11 +1056,24 @@ export class RemoteRooms {
 	}
 
 	/** The owner's result, with its IDs mapped back to this server's: the copy, or the mirror thread. */
-	private mapResult(server: string, request: RequestFrame, result: Record<string, unknown>): Record<string, unknown> {
+	private async mapResult(server: string, request: RequestFrame, result: Record<string, unknown>, deadline: number): Promise<Record<string, unknown>> {
 		if (request.method === "message" && typeof result.message_id === "string") {
-			const copy = this.store.copyOf(server, result.message_id, this.now());
-			if (!copy) throw { name: "retry_after", message: "The owner took it; it shows here in a moment", data: { retry_after: 1 } } satisfies ProtocolError;
-			return { message_id: copy };
+			// The owner took it: the answer waits for the copy, for a limited time. Its record comes before the
+			// result on a live connection, but one dialed meanwhile holds records while it catches up, and one
+			// that closed is dialed again (catching up from the cursor).
+			const ownerId = result.message_id;
+			for (;;) {
+				const copy = this.store.copyOf(server, ownerId, this.now());
+				if (copy) return { message_id: copy };
+				if (Date.now() >= deadline) break;
+				const session = this.sessions.get(server);
+				if (session?.connecting) await session.connecting.catch(() => undefined);
+				else if (!session?.connection?.open) await this.ensure(server).catch(() => new Promise((resolve) => setTimeout(resolve, 1_000)));
+				else await new Promise((resolve) => setTimeout(resolve, 100));
+			}
+			// Accepted, not copied in time: the copy comes with a later read, and a resend (same request id) is the owner's duplicate.
+			console.warn(JSON.stringify({ event: "remote_copy_late", server, message_id: ownerId }));
+			throw { name: "internal_error", message: "The owner took it, but its copy has not arrived here yet; sending it again with the same id is safe" } satisfies ProtocolError;
 		}
 		if (request.method === "room_set" && typeof result.room_id === "string") {
 			const local = this.store.mirrorState(this.now()).rooms.find((room) => room.server === server && room.threads[result.room_id as string]);

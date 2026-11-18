@@ -473,3 +473,33 @@ it('joins a remote user on a link\'s act-as room_join, but not one another user 
 		expect(general.error).toMatchObject({ code: DENIED, data: { ext: { remote: 'not_joined' } } });
 	} finally { admin.close(); link.close(); }
 });
+
+it('takes a link\'s remote users out of the room and its threads when the link leaves, and lets them back with it', async () => {
+	const server = 'ws://127.0.0.1:8095/ws';
+	const { peer: admin } = await freshAdmin();
+	const roomId = (await request(admin, unique('room'), 'room_set', { title: unique('Shared') })).result.room_id as string;
+	const thread = (await request(admin, unique('thread'), 'room_set', { parent_room_id: roomId, title: 'Side' })).result.room_id as string;
+	const invite = async () => (await command(admin, unique('invite'), `/remote invite ${server}`, roomId)).notice!.params.body.text.match(/&token=(apron_invite_[A-Za-z0-9_-]{43})/)![1];
+	const { peer: link } = await signIn(await invite());
+	const carol = unique('carol');
+	const carolId = `${carol}@127.0.0.1:8095`;
+	const members = async (room: string) => {
+		const listed = (await request(admin, unique('members'), 'room_list', { room_id: room, members: true })).result;
+		const record = [...(listed.joined ?? []), ...(listed.not_joined ?? [])][0];
+		return (record?.members ?? []).map((member: { user_id: string }) => member.user_id) as string[];
+	};
+	try {
+		for (const room of [roomId, thread]) expect((await request(link, unique('join'), 'room_join', { room_id: room, ext: { remote: { user_id: carol } } })).result).toEqual({});
+		expect(await members(roomId)).toContain(carolId);
+		expect(await members(thread)).toContain(carolId);
+		expect((await request(link, unique('leave'), 'room_leave', { room_id: roomId })).result).toEqual({});
+		for (let tries = 0; (await members(roomId)).includes(carolId) || (await members(thread)).includes(carolId); tries += 1) {
+			expect(tries).toBeLessThan(50);
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		// Not removed by another user: back with the link, carol may join again.
+		await invite();
+		const again = await request(link, unique('again'), 'room_join', { room_id: roomId, ext: { remote: { user_id: carol } } });
+		expect(again.result).toEqual({});
+	} finally { admin.close(); link.close(); }
+});
