@@ -533,7 +533,9 @@ const THROTTLE_WINDOW_MS = 60_000;
  * or digit, and `auth` never honors a requested `user_id`).
  */
 const PRIVATE_IDENTITY = { user_id: "~private", name: "System message to you" } as const;
-/** The room's system identity (Appendix A.1), for notices in a room, such as one about a thread that is not shared (ext:remote). */
+/** The IP key the server's own logged notices are charged to: no connection sends it. */
+const SYSTEM_IP_KEY = "system";
+/** The room's system identity (Appendix A.1), for logged notices in a room, such as one about a thread that is not shared (ext:remote). */
 const ROOM_IDENTITY = { user_id: "~room", name: "Room" } as const;
 /**
  * The liveness ping clients send every `server.ping` seconds, byte for byte,
@@ -9117,8 +9119,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 				store.setRemotePair({ room_id: threadId, server, remote_room: pair.remote, token: parent.token, parent: pair.parent, start_log_id: pair.start, ...(pair.refused ? { refused: true } : {}) }, nowMs());
 				console.log(JSON.stringify({ event: "remote_thread_paired", server, room_id: threadId, remote_room: pair.remote, refused: pair.refused }));
 			},
-			// A notice is not logged: the thread's members connected now see it.
-			roomNotice: (roomId, text) => this.deliver({ method: "message", params: { room_id: roomId, from: { ...ROOM_IDENTITY }, body: { text, format: "markdown" } } }, [roomId]),
+			// A logged `~room` message (Appendix A.1), so every member sees it, later and in history too.
+			roomNotice: (roomId, text) => {
+				void this.runMutation(async () => {
+					try {
+						const result = this.store.mutate({
+							userId: ROOM_IDENTITY.user_id, ipKey: SYSTEM_IP_KEY, method: "message", now: nowMs(), system: true,
+							params: { room_id: roomId, body: { text, format: "markdown" } }, identity: { ...ROOM_IDENTITY },
+						});
+						for (const record of result.broadcasts) this.broadcastRecord(record);
+					} catch (error) {
+						console.warn(JSON.stringify({ event: "remote_notice_failed", room_id: roomId, error: error instanceof Error ? error.message : String(error) }));
+					}
+				});
+			},
 			authorNotice: (userId, roomId, text) => {
 				const key = `${server}\n${roomId}\n${userId}`;
 				if (this.toldRemoved.has(key)) return;

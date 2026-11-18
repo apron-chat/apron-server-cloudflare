@@ -486,7 +486,7 @@ it('makes and saves a thread of a shared room as a remote user, and pairs it wit
 	} finally { admin.close(); link.close(); }
 });
 
-it('delivers the sender\'s notices: one ~room notice in a refused thread, one ~private notice an author gets once', async () => {
+it('delivers the sender\'s notices: one logged ~room notice in a refused thread, one ~private notice an author gets once', async () => {
 	const { peer: admin, userId: adminId } = await freshAdmin();
 	const roomId = (await request(admin, unique('room'), 'room_set', { title: unique('Notices') })).result.room_id as string;
 	try {
@@ -496,10 +496,21 @@ it('delivers the sender\'s notices: one ~room notice in a refused thread, one ~p
 			deps.authorNotice(adminId, roomId, 'Not sent to b.example: you were removed from this room there.');
 			deps.authorNotice(adminId, roomId, 'Not sent to b.example: you were removed from this room there.');
 		});
-		const room = await until(admin, (frame) => frame.method === 'message' && frame.params.from?.user_id === '~room');
-		expect(room.frame.params).toMatchObject({ room_id: roomId, body: { text: 'This thread is not shared with b.example.' } });
-		const told = await until(admin, (frame) => frame.method === 'message' && frame.params.from?.user_id === '~private');
-		expect(told.frame.params).toMatchObject({ room_id: roomId, body: { text: 'Not sent to b.example: you were removed from this room there.' } });
+		// The logged notice comes after its commit, the private one at once: either order.
+		const seen: Frame[] = [];
+		while (!seen.some((frame) => frame.params?.from?.user_id === '~room') || !seen.some((frame) => frame.params?.from?.user_id === '~private')) {
+			const frame = await admin.next();
+			if (frame.method === 'message') seen.push(frame);
+		}
+		const room = seen.find((frame) => frame.params.from.user_id === '~room')!;
+		expect(room.params).toMatchObject({ room_id: roomId, body: { text: 'This thread is not shared with b.example.' } });
+		// Logged: it has a log_id, and history holds it for members who were not connected.
+		expect(room.params.log_id).toBeDefined();
+		const page = await request(admin, unique('history'), 'history', { room_id: roomId });
+		expect(page.result.messages.find((message: { from: { user_id: string } }) => message.from.user_id === '~room')).toMatchObject({ body: { text: 'This thread is not shared with b.example.' } });
+		const told = seen.find((frame) => frame.params.from.user_id === '~private')!;
+		expect(told.params).toMatchObject({ room_id: roomId, body: { text: 'Not sent to b.example: you were removed from this room there.' } });
+		expect(seen.filter((frame) => frame.params.from.user_id === '~private')).toHaveLength(1);
 		// Once: the next frame is the reply to this request, with no second notice before it.
 		const next = await exchange(admin, unique('ping'), 'room_list', { room_id: roomId });
 		expect(next.skipped.filter((frame) => frame.method === 'message' && frame.params.from?.user_id === '~private')).toEqual([]);
