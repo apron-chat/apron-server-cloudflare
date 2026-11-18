@@ -376,11 +376,28 @@ export function newTerminalOutputKey(): string {
   return `f/${randomKey()}`;
 }
 
-/** The R2 keys of the terminal outputs a record refers to (TerminalOutputRef). */
+/** A terminal embed's TerminalOutputRef as the server writes it (storeTerminalOutput), or undefined. */
+function outputRef(embed: unknown): TerminalOutputRef | undefined {
+  if (!isPlainObject(embed) || embed.kind !== "terminal" || !isPlainObject(embed.output_ref)) return undefined;
+  const { key, bytes } = embed.output_ref;
+  return typeof key === "string" && /^f\/[A-Za-z0-9_-]{22}$/.test(key) && Number.isSafeInteger(bytes) && (bytes as number) >= 0 && (bytes as number) <= MAX_TERMINAL_OUTPUT_JSON_BYTES
+    ? { key, bytes: bytes as number } : undefined;
+}
+
+/** Whether a record has any `output_ref`, valid or not: one that must be resolved or removed before it is sent. */
+export function hasOutputRef(record: unknown): boolean {
+  const embeds = isPlainObject(record) && isPlainObject(record.body) ? record.body.embeds : undefined;
+  return Array.isArray(embeds) && embeds.some((embed) => isPlainObject(embed) && embed.output_ref !== undefined);
+}
+
+/** The R2 keys of the terminal outputs a record refers to (TerminalOutputRef); only well-formed refs on terminal embeds. */
 export function terminalOutputKeys(record: unknown): string[] {
   const embeds = isPlainObject(record) && isPlainObject(record.body) ? record.body.embeds : undefined;
   if (!Array.isArray(embeds)) return [];
-  return embeds.flatMap((embed) => isPlainObject(embed) && isPlainObject(embed.output_ref) && typeof embed.output_ref.key === "string" ? [embed.output_ref.key] : []);
+  return embeds.flatMap((embed) => {
+    const ref = outputRef(embed);
+    return ref ? [ref.key] : [];
+  });
 }
 
 /**
@@ -389,12 +406,13 @@ export function terminalOutputKeys(record: unknown): string[] {
  * output could not be read goes without it. The record itself is unchanged.
  */
 export function withTerminalOutputs<T>(record: T, outputs: (key: string) => string | undefined): T {
-  if (!terminalOutputKeys(record).length) return record;
+  if (!hasOutputRef(record)) return record;
   const value = record as unknown as Record<string, unknown> & { body: Record<string, unknown> & { embeds: unknown[] } };
   const embeds = value.body.embeds.map((embed) => {
-    if (!isPlainObject(embed) || !isPlainObject(embed.output_ref)) return embed;
-    const { output_ref: ref, ...rest } = embed;
-    const output = typeof ref.key === "string" ? outputs(ref.key) : undefined;
+    if (!isPlainObject(embed) || embed.output_ref === undefined) return embed;
+    const ref = outputRef(embed);
+    const { output_ref: _ref, ...rest } = embed;
+    const output = ref ? outputs(ref.key) : undefined;
     return output === undefined ? rest : { ...rest, output };
   });
   return { ...value, body: { ...value.body, embeds } } as unknown as T;
@@ -404,8 +422,7 @@ export function withTerminalOutputs<T>(record: T, outputs: (key: string) => stri
 function terminalOutputBytes(record: unknown): number {
   const embeds = isPlainObject(record) && isPlainObject(record.body) ? record.body.embeds : undefined;
   if (!Array.isArray(embeds)) return 0;
-  return embeds.reduce<number>((total, embed) => total +
-    (isPlainObject(embed) && isPlainObject(embed.output_ref) && typeof embed.output_ref.bytes === "number" ? embed.output_ref.bytes + 16 : 0), 0);
+  return embeds.reduce<number>((total, embed) => total + (outputRef(embed)?.bytes ?? -16) + 16, 0);
 }
 
 interface StoreUploadConfig extends UploadPolicy {
@@ -3896,6 +3913,26 @@ export class Store {
     });
   }
 
+  /**
+   * Deletes the hot log's reaction sets on `messageIds`, messages of purged
+   * users that only the archive held (Archive.apply): /purge found no current
+   * message for them, so their newer reaction records were left. Scans the
+   * retained log for them, as /purge does.
+   */
+  dropReactionsOn(messageIds: readonly string[], now = this.clock.now()): void {
+    this.ensureReady();
+    if (!messageIds.length) return;
+    const list = JSON.stringify([...new Set(messageIds)]);
+    const records = this.retainedRecords(now, true);
+    this.reserved({ reads: 64 + 2 * records, writes: 64 + 4 * records }, true, now, () => this.transaction(() => {
+      const rows = this.rawRows<{ room_id: string; log_id: number }>(
+        "SELECT room_id, log_id FROM records WHERE kind = 'reactions' AND json_extract(record_json, '$.message_id') IN (SELECT value FROM json_each(?))", list,
+      );
+      for (const row of rows) this.rewriteRecord(row, null);
+      this.rawExec("DELETE FROM reaction_state WHERE message_id IN (SELECT value FROM json_each(?))", list);
+    }), true);
+  }
+
   /** Queues what a `/purge` or `/rename` did to the hot log for the archive (archiveOps), within the operation's transaction. */
   private queueArchiveOp(op: ArchiveOp): void {
     if (!this.config.archive) return;
@@ -5326,7 +5363,9 @@ export class Store {
       }
       mentions = [...unique];
     }
-    return { ...clone(body), text, format, embeds: (clone(embeds) as Record<string, unknown>[]).map((embed) => withCleanOg(embed, this.config.ogMediaHosts)), ...(mentions ? { mentions } : {}) };
+    // `output_ref` is the server's alone (TerminalOutputRef): a client's is dropped.
+    const clientEmbeds = (clone(embeds) as Record<string, unknown>[]).map(({ output_ref: _ref, ...embed }) => withCleanOg(embed, this.config.ogMediaHosts));
+    return { ...clone(body), text, format, embeds: clientEmbeds, ...(mentions ? { mentions } : {}) };
   }
 
   /**
@@ -8675,7 +8714,16 @@ export class Store {
         published = Math.min(Math.max(previousPublished, this.metaNumber(META_ARCHIVE_TARGET)), floor);
         if (published !== this.metaNumber(META_ARCHIVE_FLOOR)) this.writeMeta(META_ARCHIVE_FLOOR, String(published));
         this.archiveFloorCache = published;
-      } else published = floor;
+      } else {
+        published = floor;
+        // An archive turned off forgets its floors and queue: turned on again,
+        // it starts at the hot floor, and what it held below is trimmed.
+        const stale = this.rawRows<{ key: string }>(
+          "SELECT key FROM _meta WHERE key IN (?, ?, ?, ?) LIMIT 4", META_ARCHIVE_FLOOR, META_ARCHIVE_TARGET, META_ARCHIVED_THROUGH, META_ARCHIVE_OPS,
+        );
+        for (const row of stale) this.writeMeta(row.key, null);
+        this.archiveFloorCache = undefined;
+      }
       const head = this.writeLogHead(floor);
       this.rawExec("UPDATE maintenance SET cleanup_cutoff_ms = ?, cleanup_cursor = ?, next_cleanup_ms = ? WHERE id = 1", cutoff, floor, effective + 1000);
       this.cleanupDueCache = undefined;

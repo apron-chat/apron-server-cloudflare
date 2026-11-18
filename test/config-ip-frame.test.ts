@@ -136,6 +136,9 @@ describe('configuration policy boundaries', () => {
 		expect(() => config({ LIMIT_RETENTION_SECONDS: '86400' })).toThrow(ConfigError);
 		expect(() => config({ LIMIT_MIN_RETENTION_SECONDS: '0' })).toThrow('minRetentionSeconds must be a positive safe integer');
 		expect(() => config({ LIMIT_RETENTION_SECONDS: '-1' })).toThrow('retentionSeconds must be a non-negative safe integer');
+		// By age alone, the minimum age (for the count) does not apply.
+		expect(config({ LIMIT_RETENTION_RECORDS: '0', LIMIT_RETENTION_SECONDS: '3600', LIMIT_CLEANUP_SECONDS: '3600' }).limits.retentionSeconds).toBe(3_600);
+		expect(() => config({ LIMIT_RETENTION_RECORDS: '0', LIMIT_RETENTION_SECONDS: '3600' })).toThrow('retentionSeconds must be at least one cleanup interval');
 	});
 
 	it('accepts the documented aliases in prefixed precedence order', () => {

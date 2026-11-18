@@ -813,6 +813,16 @@ it("keeps the ids of removed users a move logs again retired until the move expi
 	});
 });
 
+it("drops an output_ref a client sends: only the server refers to stored terminal output", async () => {
+	await withStore("client-output-ref", (store, clock) => {
+		const posted = post(store, clock, "alice", "forged", { body: { text: "x", embeds: [{ kind: "x", output_ref: { key: "f/AAAAAAAAAAAAAAAAAAAAAA", bytes: 1e12 } }] } });
+		expect(posted.message!.body!.embeds).toEqual([expect.objectContaining({ kind: "x" })]);
+		expect((posted.message!.body!.embeds as Array<Record<string, unknown>>)[0].output_ref).toBeUndefined();
+		const page = store.historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value });
+		expect(JSON.stringify(page)).not.toContain("output_ref");
+	});
+});
+
 it("lets a threader move anyone's messages in and out of threads, create threads and save any thread's title and description", async () => {
 	await withStore("threader-role", (store, clock) => {
 		store.createInvitedIdentity({ userId: "tia", name: "tia", now: clock.value, ipKey: "ip-test" });

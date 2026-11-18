@@ -830,9 +830,9 @@ defaults:
   Low, high, and hard storage watermarks must be strictly ordered.
 - At least one of `retentionRecords` and `retentionSeconds` is set;
   `retentionRecords` is at most 50,000 and `archiveRecords` at most 100,000;
-  `minRetentionSeconds` is at least
-  `cleanupSeconds`, and `retentionSeconds`, when set, at least
-  `minRetentionSeconds`. `sessionTtlSeconds` is at most 30 days;
+  `retentionSeconds`, when set, is at least `cleanupSeconds`; with
+  `retentionRecords` set, `minRetentionSeconds` is at least `cleanupSeconds`
+  and `retentionSeconds`, when set, at least `minRetentionSeconds`. `sessionTtlSeconds` is at most 30 days;
   `idleAccountSeconds` is at least a day; `keptActiveAccounts` is at most
   `registeredIdentityCount`.
 - `roomMetadataLimit` plus 1 KiB of envelope must fit `maxFrameBytes`;

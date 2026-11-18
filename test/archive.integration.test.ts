@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
-import { purgedRecord, renamedRecord } from '../src/archive';
+import { Archive, purgedRecord, renamedRecord, withOps } from '../src/archive';
 import type { Store } from '../src/store';
 import { connect, greeting, request } from './helpers/socket';
 
@@ -74,11 +74,18 @@ it('moves records past the hot log into D1, serves them in history, and expires 
 		const across = (await request(peer, 'across', 'history', { room_id: 'general', before: logs[7], limit: 3 })).result;
 		expect(across.messages.map((message: { log_id: string }) => message.log_id)).toEqual(logs.slice(5, 8));
 
-		// /purge reaches what the archive holds, on the next full alarm (the command asks for one in a second).
-		await runInDurableObject(stub(), async (instance, state) => {
+		// /purge: queued for the archive, and applied to pages that read it before D1 has it.
+		await runInDurableObject(stub(), (instance) => {
 			const runtime = instance as unknown as Runtime;
 			runtime.store.purgeUsers({ userIds: ['archive-victim'] });
 			expect(runtime.store.archiveOps()).toEqual([{ op: 'purge', userIds: ['archive-victim'], messageIds: [] }]);
+		});
+		expect((await archived()).map((row) => String(row.log_id))).toEqual(logs.slice(3, 7));
+		const early = (await request(peer, 'early', 'history', { room_id: 'general', limit: 50 })).result;
+		expect(early.messages.map((message: { log_id: string }) => message.log_id)).toEqual([logs[3], logs[4], ...logs.slice(6)]);
+		// The next full alarm applies it to D1 (the command asks for one in a second).
+		await runInDurableObject(stub(), async (instance, state) => {
+			const runtime = instance as unknown as Runtime;
 			state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1');
 			runtime.store.forgetCleanupDue();
 			await runtime.alarm();
@@ -104,4 +111,31 @@ it('rewrites archived records as /purge and /rename rewrite the hot log\'s', () 
 	expect(JSON.parse(renamedRecord(message, 'a', 'b')).from).toEqual({ user_id: 'b', name: 'A' });
 	expect(JSON.parse(renamedRecord(reactions, 'a', 'c')).reactions.map((set: { from: { user_id: string } }) => set.from.user_id)).toEqual(['c', 'b']);
 	expect(JSON.parse(renamedRecord(membership, 'a', 'd')).members[0].user.user_id).toBe('d');
+});
+
+it('counts an archive page by log ID, so a move\'s two rows take one place', async () => {
+	const archive = new Archive(env.ARCHIVE!);
+	const base = 9_000_000_000_000;
+	const row = (room: string, offset: number) => ({ room_id: room, log_id: base + offset, commit_ms: base + offset, kind: 'message', record_json: '{}' });
+	// Log IDs 1 and 2 are moves, a row in each room.
+	await archive.insert([row('page-a', 1), row('page-b', 1), row('page-a', 2), row('page-b', 2), row('page-a', 3), row('page-b', 4)]);
+	const forward = await archive.page({ roomIds: ['page-a', 'page-b'], lower: base, upper: base + 10, forward: true, limit: 3 });
+	expect([...new Set(forward.map((entry) => entry.log_id - base))]).toEqual([1, 2, 3]);
+	const backward = await archive.page({ roomIds: ['page-a', 'page-b'], lower: base, upper: base + 10, forward: false, limit: 3 });
+	expect([...new Set(backward.map((entry) => entry.log_id - base))]).toEqual([4, 3, 2]);
+});
+
+it('applies a pending /purge and /rename to a page that read the archive', () => {
+	const page = {
+		more: false,
+		messages: [{ message_id: 'm1', from: { user_id: 'gone' } }, { message_id: 'm2', from: { user_id: 'old' } }],
+		reactions: [{ message_id: 'm1', reactions: [{ from: { user_id: 'x' }, emojis: ['👍'] }] }, { message_id: 'm2', reactions: [{ from: { user_id: 'gone' }, emojis: ['👍'] }, { from: { user_id: 'old' }, emojis: ['🎉'] }] }],
+		memberships: [{ members: [{ user: { user_id: 'gone' }, joined: true }] }],
+	};
+	const result = withOps(page, [{ op: 'purge', userIds: ['gone'], messageIds: [] }, { op: 'rename', from: 'old', to: 'new' }]);
+	expect(result).toEqual({
+		more: false,
+		messages: [{ message_id: 'm2', from: { user_id: 'new' } }],
+		reactions: [{ message_id: 'm2', reactions: [{ from: { user_id: 'new' }, emojis: ['🎉'] }] }],
+	});
 });

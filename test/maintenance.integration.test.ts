@@ -326,3 +326,31 @@ it("with the archive, removes records from the hot log only once copied, and pub
 		expect("archive" in narrowed && narrowed.archive.lower).toBe(Number(logs[1]));
 	});
 });
+
+it("forgets the archive's floors and queue once it is off, so turning it on again starts at the hot floor", async () => {
+	await withStore("archive-off", { cleanupIntervalMs: 3_600_000 }, (_store, clock, state) => {
+		state.storage.sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('archive_floor', '5'), ('archive_floor_target', '6'), ('archived_through', '7'), ('archive_ops', '[]')");
+		const off = new Store(state, { ...BY_AGE, archive: false, cleanupIntervalMs: 3_600_000 }, clock.clock);
+		clock.value += DAY_MS;
+		state.storage.sql.exec("UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1");
+		off.forgetCleanupDue();
+		state.storage.sql.exec("INSERT INTO records (room_id, log_id, commit_ms, kind, record_json) VALUES ('general', 2, 0, 'membership', '{}')");
+		off.runCleanup(clock.value);
+		expect(state.storage.sql.exec("SELECT key FROM _meta WHERE key LIKE 'archive%'").toArray()).toEqual([]);
+		const on = new Store(state, { ...BY_AGE, archive: true }, clock.clock);
+		expect(on.logBounds().history_floor).toBe(off.logBounds().history_floor);
+	});
+});
+
+it("drops the hot log's reaction sets on messages that only the archive held, for /purge", async () => {
+	await withStore("drop-reactions", { anonymousPostsPerMinute: 1_000, ipPostsPerMinute: 1_000 }, (store, clock, state) => {
+		const posted = store.mutate(messageInput(clock, "reacted", "react to me"));
+		const messageId = String(posted.result.message_id);
+		store.mutate({ ...messageInput(clock, "reaction", ""), method: "reactions", params: { message_id: messageId, emojis: ["👍"] } });
+		const count = (sql: string) => Number(state.storage.sql.exec<{ count: number }>(sql).one().count);
+		expect(count("SELECT COUNT(*) AS count FROM records WHERE kind = 'reactions'")).toBe(1);
+		store.dropReactionsOn([messageId], clock.value);
+		expect(count("SELECT COUNT(*) AS count FROM records WHERE kind = 'reactions'")).toBe(0);
+		expect(count("SELECT COUNT(*) AS count FROM reaction_state")).toBe(0);
+	});
+});

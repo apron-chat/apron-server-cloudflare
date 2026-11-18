@@ -81,16 +81,22 @@ export class Archive {
 	}
 
 	/**
-	 * Up to `limit` records of `roomIds` with log IDs in `lower`..`upper`,
-	 * nearest the page's start first: oldest first `forward`, else newest.
+	 * The records of `roomIds` with the first `limit` distinct log IDs in
+	 * `lower`..`upper`, nearest the page's start first: oldest first
+	 * `forward`, else newest. A move's record is a row in each of its rooms,
+	 * so rows are counted by log ID: two rooms' copies take one place.
 	 */
 	async page(query: ArchiveQuery): Promise<ArchiveRow[]> {
 		if (!query.roomIds.length || query.lower > query.upper || query.limit <= 0) return [];
 		await this.schema();
+		const order = query.forward ? "ASC" : "DESC";
 		const result = await this.db.prepare(
 			`SELECT room_id, log_id, commit_ms, kind, record_json FROM records
-			 WHERE room_id IN (SELECT value FROM json_each(?1)) AND log_id >= ?2 AND log_id <= ?3
-			 ORDER BY log_id ${query.forward ? "ASC" : "DESC"} LIMIT ?4`,
+			 WHERE room_id IN (SELECT value FROM json_each(?1)) AND log_id IN (
+			   SELECT DISTINCT log_id FROM records
+			   WHERE room_id IN (SELECT value FROM json_each(?1)) AND log_id >= ?2 AND log_id <= ?3
+			   ORDER BY log_id ${order} LIMIT ?4)
+			 ORDER BY log_id ${order}`,
 		).bind(JSON.stringify(query.roomIds), query.lower, query.upper, query.limit).all<ArchiveRow>();
 		return result.results.map((row) => ({ ...row, log_id: Number(row.log_id), commit_ms: Number(row.commit_ms) }));
 	}
@@ -126,11 +132,16 @@ export class Archive {
 		return result.meta.changes ?? 0;
 	}
 
-	/** Applies what `/purge` or `/rename` did to the hot log to the archived records too. */
-	async apply(op: ArchiveOp): Promise<void> {
+	/**
+	 * Applies what `/purge` or `/rename` did to the hot log to the archived
+	 * records too. A purge returns the messages of the users it found here,
+	 * whose reaction sets the hot log may still hold (Store.dropReactionsOn).
+	 */
+	async apply(op: ArchiveOp): Promise<string[]> {
 		await this.schema();
-		if (op.op === "purge") await this.purge(op.userIds, op.messageIds);
-		else await this.rename(op.from, op.to);
+		if (op.op === "purge") return this.purge(op.userIds, op.messageIds);
+		await this.rename(op.from, op.to);
+		return [];
 	}
 
 	/**
@@ -140,7 +151,7 @@ export class Archive {
 	 * reaction sets and memberships are taken out of the records listing
 	 * them, a record left empty going.
 	 */
-	private async purge(userIds: readonly string[], messageIds: readonly string[]): Promise<void> {
+	private async purge(userIds: readonly string[], messageIds: readonly string[]): Promise<string[]> {
 		const ids = JSON.stringify(userIds);
 		const authored = await this.db.prepare(
 			`SELECT DISTINCT json_extract(record_json, '$.message_id') AS message_id FROM records
@@ -159,6 +170,7 @@ export class Archive {
 			`DELETE FROM records WHERE kind = 'message' AND json_extract(record_json, '$.from.user_id') IN (SELECT value FROM json_each(?1))`,
 		).bind(ids));
 		await this.run(statements);
+		return authored.results.map((row) => row.message_id);
 	}
 
 	/** `/rename` (Store.renameIdentity) of what is archived: every record naming `from` names `to`. */
@@ -180,25 +192,73 @@ export class Archive {
 	}
 }
 
+type RecordValue = Record<string, unknown>;
+
 /** A reactions or membership record without the purged users' entries (null if none is left), as Store.purgeUsers rewrites it. */
-export function purgedRecord(row: Pick<ArchiveRow, "kind" | "record_json">, userIds: readonly string[], messageIds: readonly string[]): string | null {
-	const record = JSON.parse(row.record_json) as Record<string, unknown>;
-	if (row.kind === "reactions") {
+function purgedValue(kind: string, record: RecordValue, userIds: readonly string[], messageIds: readonly string[]): RecordValue | null {
+	if (kind === "reactions") {
 		const sets = (record.reactions as Array<{ from: Identity }>) ?? [];
 		const kept = messageIds.includes(record.message_id as string) ? [] : sets.filter((set) => !userIds.includes(set.from.user_id));
-		return kept.length ? JSON.stringify({ ...record, reactions: kept }) : null;
+		return kept.length ? { ...record, reactions: kept } : null;
 	}
 	const members = ((record.members as Array<{ user: Identity }>) ?? []).filter((member) => !userIds.includes(member.user.user_id));
-	return members.length ? JSON.stringify({ ...record, members }) : null;
+	return members.length ? { ...record, members } : null;
 }
 
 /** A record naming `to` wherever it named `from`, as Store.renameIdentity rewrites it. */
-export function renamedRecord(row: Pick<ArchiveRow, "kind" | "record_json">, from: string, to: string): string {
+function renamedValue(kind: string, record: RecordValue, from: string, to: string): RecordValue {
 	const renamed = (user: Identity): Identity => user.user_id === from ? { ...user, user_id: to } : user;
-	const record = JSON.parse(row.record_json) as Record<string, unknown>;
-	if (row.kind === "message") return JSON.stringify({ ...record, from: renamed(record.from as Identity) });
-	if (row.kind === "reactions") {
-		return JSON.stringify({ ...record, reactions: (record.reactions as Array<{ from: Identity }>).map((set) => ({ ...set, from: renamed(set.from) })) });
+	if (kind === "message") return { ...record, from: renamed(record.from as Identity) };
+	if (kind === "reactions") return { ...record, reactions: (record.reactions as Array<{ from: Identity }>).map((set) => ({ ...set, from: renamed(set.from) })) };
+	return { ...record, members: (record.members as Array<{ user: Identity }>).map((member) => ({ ...member, user: renamed(member.user) })) };
+}
+
+/** purgedValue of a stored row, as JSON. */
+export function purgedRecord(row: Pick<ArchiveRow, "kind" | "record_json">, userIds: readonly string[], messageIds: readonly string[]): string | null {
+	const value = purgedValue(row.kind, JSON.parse(row.record_json) as RecordValue, userIds, messageIds);
+	return value ? JSON.stringify(value) : null;
+}
+
+/** renamedValue of a stored row, as JSON. */
+export function renamedRecord(row: Pick<ArchiveRow, "kind" | "record_json">, from: string, to: string): string {
+	return JSON.stringify(renamedValue(row.kind, JSON.parse(row.record_json) as RecordValue, from, to));
+}
+
+/** A history page's records, as Store.history returns them. */
+export interface PageRecords {
+	messages?: ReadonlyArray<{ message_id: string; from: { user_id: string } }>;
+	reactions?: readonly unknown[];
+	memberships?: readonly unknown[];
+}
+
+/**
+ * A history page with `/purge` and `/rename` applied that the archive may
+ * not hold yet (Store.archiveOps), or that came while the page waited for
+ * it: a purged user's messages leave it, with every reaction set on them,
+ * and their reaction sets and memberships; a renamed user is named anew.
+ * The page's bounds stay as they were, so paging goes on past what left.
+ */
+export function withOps<T extends PageRecords>(page: T, ops: readonly ArchiveOp[]): T {
+	let messages = (page.messages ?? []) as Array<{ message_id: string; from: { user_id: string } }>;
+	let reactions = (page.reactions ?? []) as unknown as RecordValue[];
+	let memberships = (page.memberships ?? []) as RecordValue[];
+	for (const op of ops) {
+		if (op.op === "purge") {
+			const purged = new Set([...op.messageIds, ...messages.filter((message) => op.userIds.includes(message.from.user_id)).map((message) => message.message_id)]);
+			messages = messages.filter((message) => !op.userIds.includes(message.from.user_id));
+			reactions = reactions.flatMap<RecordValue>((record) => purgedValue("reactions", record, op.userIds, [...purged]) ?? []);
+			memberships = memberships.flatMap<RecordValue>((record) => purgedValue("membership", record, op.userIds, []) ?? []);
+		} else {
+			messages = messages.map((message) => renamedValue("message", message as unknown as RecordValue, op.from, op.to) as unknown as typeof message);
+			reactions = reactions.map((record) => renamedValue("reactions", record, op.from, op.to));
+			memberships = memberships.map((record) => renamedValue("membership", record, op.from, op.to));
+		}
 	}
-	return JSON.stringify({ ...record, members: (record.members as Array<{ user: Identity }>).map((member) => ({ ...member, user: renamed(member.user) })) });
+	const { messages: _messages, reactions: _reactions, memberships: _memberships, ...rest } = page;
+	return {
+		...rest,
+		...(messages.length ? { messages } : {}),
+		...(reactions.length ? { reactions } : {}),
+		...(memberships.length ? { memberships } : {}),
+	} as T;
 }

@@ -3,7 +3,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits } from "./budget";
-import { Archive } from "./archive";
+import { Archive, withOps, type ArchiveOp } from "./archive";
 import { keepLast, LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, showsMorePresent, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor, snapshotBill, snapshotReasons } from "./account-usage";
@@ -87,6 +87,7 @@ import {
 	newTerminalOutputKey,
 	terminalOutput,
 	terminalOutputKeys,
+	hasOutputRef,
 	withTerminalOutputs,
 	type Broadcast,
 	type TerminalStored,
@@ -140,6 +141,8 @@ const OBJECT_NAME = "public-demo-v1";
 const TERMINAL_OUTPUT_CACHE_BYTES = 8 * 1024 * 1024;
 /** How long cleanup waits for the archive between copies while D1 fails (runArchive); a second otherwise. */
 const ARCHIVE_RETRY_MS = 5 * 60_000;
+/** How long a `/purge` or `/rename` is applied to history pages that read the archive, past its own queue (recentArchiveOps). */
+const ARCHIVE_RECENT_OPS_MS = 10 * 60_000;
 /** Archived records one alarm deletes below the published floor at most, in batches of a fifth. */
 const ARCHIVE_TRIM_ROWS = 2_500;
 const INTERNAL_IP_HEADER = "X-Apron-Trusted-IP-Key";
@@ -2568,6 +2571,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private archiveFloorChecked = false;
 	/** The published floor the archive was last trimmed to (Archive.deleteBelow), this wake. */
 	private archiveTrimmed = 0;
+	/** When the archive's queued work may be tried again after a failure (runArchive); 0 for now. */
+	private archiveRetryAt = 0;
+	/** Whether this wake knows the archive has no queued `/purge` or `/rename` (alarmWorkDue). */
+	private archiveOpsChecked = false;
+	/**
+	 * The `/purge` and `/rename` of the last ARCHIVE_RECENT_OPS_MS, applied to
+	 * a history page that read the archive (withOps): its hot records were
+	 * read before it waited for D1, and may predate one.
+	 */
+	private recentArchiveOps: Array<{ op: ArchiveOp; at: number }> = [];
 	private terminalOutputCacheBytes = 0;
 	/** Whether this instance has ended the live texts a lost one left open (recoverLiveTexts). */
 	private liveRecovered = false;
@@ -3218,6 +3231,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * (Store.cleanupDue).
 	 */
 	private alarmWorkDue(now: number): boolean {
+		// A `/purge` or `/rename` the archive has yet to apply, read once a wake.
+		if (this.archive && !this.archiveOpsChecked && now >= this.archiveRetryAt) {
+			try {
+				if (this.store.archiveOps(now).length) return true;
+				this.archiveOpsChecked = true;
+			} catch {
+				return true;
+			}
+		}
 		if (this.config.uploads && !this.uploadDeadlineRead) {
 			try {
 				const stored = this.store.nextUploadDeadline(now);
@@ -5039,7 +5061,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 				let rows: Awaited<ReturnType<Archive["page"]>>;
 				try { rows = await this.stalls.track("d1", "history", this.archive!.page(found.archive)); }
 				catch { throw { name: "retry_after", message: "Older history is unavailable for now", data: { retry_after: 60, ...limitData("read") } } satisfies ProtocolError; }
-				page = found.assemble(rows);
+				// Read after the wait: a `/purge` or `/rename` the archive has not
+				// applied, or that came while this page waited, applies to it too.
+				const now = nowMs();
+				const recent = this.recentArchiveOps.filter((entry) => entry.at > now - ARCHIVE_RECENT_OPS_MS).map((entry) => entry.op);
+				let pending: ArchiveOp[] = [];
+				try { pending = this.store.archiveOps(now); } catch { /* the recent ones still apply */ }
+				page = withOps(found.assemble(rows), [...pending, ...recent]);
 			}
 			this.reply(socket, request, await this.withPageOutputs(page));
 		} finally {
@@ -5070,12 +5098,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (batch.more) this.maintenanceSoon(now);
 			}
 			for (const op of this.store.archiveOps(now)) {
-				await this.stalls.track("d1", op.op, archive.apply(op));
+				const purged = await this.stalls.track("d1", op.op, archive.apply(op));
+				// Messages only the archive held: their newer reaction sets in the hot log go too.
+				this.store.dropReactionsOn(purged, now);
 				this.store.dropArchiveOp(now);
 			}
+			this.archiveOpsChecked = true;
 			this.archiveFailures = 0;
+			this.archiveRetryAt = 0;
 		} catch {
+			// Tried again on an alarm after ARCHIVE_RETRY_MS (alarmWorkDue), not on every one.
 			this.archiveFailures += 1;
+			this.archiveRetryAt = now + ARCHIVE_RETRY_MS;
+			this.archiveOpsChecked = false;
+			this.deadlines.maintenance.soonest(this.archiveRetryAt);
 		}
 	}
 
@@ -5114,7 +5150,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** A history page with its stored terminal outputs put back (loadTerminalOutputs). */
 	private async withPageOutputs<T extends { messages?: MessageSnapshot[] }>(page: T): Promise<T> {
-		if (!page.messages?.some((message) => terminalOutputKeys(message).length)) return page;
+		if (!page.messages?.some((message) => hasOutputRef(message))) return page;
 		await this.loadTerminalOutputs(page.messages);
 		return { ...page, messages: page.messages.map((message) => withTerminalOutputs(message, (key) => this.cachedOutput(key))) };
 	}
@@ -8589,7 +8625,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		for (const roomId of rooms) this.removeIfEmpty(roomId);
 		this.deleteMedia(purged.deletedUploads);
 		// The archive purges what it holds on the next alarm, in a second.
-		if (this.archive) this.archiveSoon();
+		if (this.archive) this.archiveSoon({ op: "purge", userIds, messageIds: [] });
 		// A text left open by a failure here ends at its time limit, publishing nothing.
 		await this.endLiveOf(userIds).catch(() => undefined);
 		await this.forgetTokens(userIds);
@@ -8662,9 +8698,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.deadlines.maintenance.soonest(now + 1_000);
 	}
 
-	/** Runs the archive's upkeep (runArchive) on an alarm in a second, for a `/purge` or `/rename` it has to apply. */
-	private archiveSoon(): void {
-		this.maintenanceSoon(nowMs());
+	/**
+	 * Runs the archive's upkeep (runArchive) on an alarm in a second, for a
+	 * `/purge` or `/rename` it has to apply, and applies it meanwhile to the
+	 * history pages that read the archive (recentArchiveOps).
+	 */
+	private archiveSoon(op: ArchiveOp): void {
+		const now = nowMs();
+		this.recentArchiveOps = [...this.recentArchiveOps.filter((recent) => recent.at > now - ARCHIVE_RECENT_OPS_MS), { op, at: now }];
+		this.archiveOpsChecked = false;
+		this.maintenanceSoon(now);
 		this.ctx.waitUntil(this.rescheduleAlarm().catch(() => undefined));
 	}
 
@@ -9031,7 +9074,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const renamed = this.store.renameIdentity({ from, to, now: nowMs() });
 		// Before any await: from the commit on, nothing on this object acts as the retired user_id.
 		this.moveUserState(from, to);
-		if (this.archive) this.archiveSoon();
+		if (this.archive) this.archiveSoon({ op: "rename", from, to });
 		await this.moveInviteToken(from, to);
 		await this.moveDeviceTokens(from, to);
 		// Clients keep nothing yet for the new `user_id`, so the object carries
@@ -10045,7 +10088,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** A record with its stored terminal outputs put back from the cache, or left out where not read (withTerminalOutputs). */
 	private withOutputs<T extends { params: Record<string, unknown> }>(record: T): T {
-		if (!terminalOutputKeys(record.params).length) return record;
+		if (!hasOutputRef(record.params)) return record;
 		return { ...record, params: withTerminalOutputs(record.params, (key) => this.cachedOutput(key)) };
 	}
 
