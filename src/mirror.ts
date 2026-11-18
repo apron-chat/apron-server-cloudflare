@@ -87,6 +87,8 @@ const FORWARD_TIMEOUT_MS = 10_000;
 const COPY_WAIT_MS = 60_000;
 /** The members of a room a link's leave looks through for its remote users. */
 const REMOTE_MEMBERS_LIMIT = 1_000;
+/** Local joins and leaves an owner's queue keeps while it cannot be reached (the oldest go first). */
+const MAX_QUEUED_MEMBERSHIPS = 200;
 /** While anything is mirrored, the alarm reads every owner this often, in case a wake push was lost. */
 const MIRROR_CHECK_MS = 5 * 60_000;
 /** At most one wake push a link this often (the owner's debounce). */
@@ -485,6 +487,8 @@ export class RemoteRooms {
 			for (const frame of held) await this.apply(session.server, frame);
 		}
 		this.touch(session.server);
+		// Joins and leaves that a close cut off go now (they wait for this dial to finish).
+		void this.flushMemberships(session.server);
 		return connection;
 	}
 
@@ -555,7 +559,7 @@ export class RemoteRooms {
 			}
 			const local = this.store.roomMembers([mirror.room_id], 500, this.now()).get(mirror.room_id) ?? [];
 			for (const member of local) {
-				if (!isShadowUserId(member.user_id) && this.store.remoteLink(member.user_id, this.now()) === undefined) await this.sendMembership(connection, server, mirror.owner_room, member.user_id, member.name ?? "", true);
+				if (!isShadowUserId(member.user_id) && this.store.remoteLink(member.user_id, this.now()) === undefined) this.queueMembership(server, mirror.owner_room, member.user_id, member.name ?? "", true);
 			}
 			const state = this.store.mirrorState(this.now());
 			const stored = state.rooms.find((room) => room.room_id === mirror.room_id);
@@ -618,18 +622,68 @@ export class RemoteRooms {
 			const userId = user?.user_id;
 			if (typeof userId !== "string" || userId.startsWith("~") || isShadowUserId(userId) || this.store.remoteLink(userId, this.now()) !== undefined) continue;
 			const name = typeof user!.name === "string" ? user!.name : "";
-			void this.ensure(mirror.room.server)
-				.then((connection) => this.sendMembership(connection, mirror.room.server, mirror.ownerRoom, userId, name, member.joined !== false))
-				.then(() => this.touch(mirror.room.server), (error) => {
-					console.warn(JSON.stringify({ event: "remote_membership_not_sent", room_id: roomId, user_id: userId, error: error instanceof Error ? error.message : String(error) }));
-				});
+			this.queueMembership(mirror.room.server, mirror.ownerRoom, userId, name, member.joined !== false);
+		}
+		void this.flushMemberships(mirror.room.server);
+	}
+
+	/**
+	 * A local join or leave for the owner, kept (in the mirror state) until
+	 * the owner answers it: a close, an outage or an eviction only delays
+	 * it to the next connection. A later change of the same user and room
+	 * replaces it.
+	 */
+	private queueMembership(server: string, ownerRoom: string, userId: string, name: string, joined: boolean): void {
+		const state = this.store.mirrorState(this.now());
+		const entry = state.servers[server] ??= { cursor: 0 };
+		entry.memberships = [...(entry.memberships ?? []).filter((item) => item.owner_room !== ownerRoom || item.user_id !== userId), { owner_room: ownerRoom, user_id: userId, name, joined }]
+			.slice(-MAX_QUEUED_MEMBERSHIPS);
+		this.store.setMirrorState(state, this.now());
+	}
+
+	private readonly membershipFlushes = new Map<string, Promise<void>>();
+
+	/** Sends the queued joins and leaves of one owner, one flush at a time, as work in flight (the linger waits for it). */
+	private flushMemberships(server: string): Promise<void> {
+		const next = (this.membershipFlushes.get(server) ?? Promise.resolve()).then(() => this.sendQueuedMemberships(server)).catch((error) => {
+			console.warn(JSON.stringify({ event: "remote_membership_not_sent", server, error: error instanceof Error ? error.message : String(error) }));
+		});
+		this.membershipFlushes.set(server, next);
+		return next;
+	}
+
+	private async sendQueuedMemberships(server: string): Promise<void> {
+		const queued = () => this.store.mirrorState(this.now()).servers[server]?.memberships ?? [];
+		if (!queued().length) return;
+		const session = this.session(server);
+		session.inflight += 1;
+		try {
+			const connection = await this.ensure(server);
+			for (let item = queued()[0]; item; item = queued()[0]) {
+				// No answer (the connection closed or timed out): the rest wait for the next connection.
+				if (!await this.sendMembership(connection, server, item.owner_room, item.user_id, item.name, item.joined)) return;
+				const state = this.store.mirrorState(this.now());
+				const entry = state.servers[server];
+				if (!entry?.memberships) return;
+				// Sent: off the queue, unless a newer change of the same user and room replaced it meanwhile.
+				const sent = item;
+				entry.memberships = entry.memberships.filter((other) => other.owner_room !== sent.owner_room || other.user_id !== sent.user_id || other.joined !== sent.joined);
+				if (!entry.memberships.length) delete entry.memberships;
+				this.store.setMirrorState(state, this.now());
+			}
+		} finally {
+			session.inflight -= 1;
+			this.touch(server);
 		}
 	}
 
-	private async sendMembership(connection: LinkConnection, server: string, ownerRoom: string, userId: string, name: string, joined: boolean): Promise<void> {
+	/** One join or leave as the user's remote user; false when the owner gave no answer (a closed connection, or none in time). */
+	private async sendMembership(connection: LinkConnection, server: string, ownerRoom: string, userId: string, name: string, joined: boolean): Promise<boolean> {
 		await this.ownerUser(connection, server, userId, name);
 		const answer = await connection.call(joined ? "room_join" : "room_leave", { room_id: ownerRoom, ext: { remote: { user_id: userId } } }, `${userId}:${joined ? "join" : "leave"}:${ownerRoom}:${this.now()}`);
+		if (answer.error && unanswered(connection, answer)) return false;
 		if (answer.error) console.warn(JSON.stringify({ event: "remote_membership_refused", server, owner_room: ownerRoom, user_id: userId, error: answer.error.message ?? answer.error.code }));
+		return true;
 	}
 
 	/** Pages forward through the owner's log from this mirror's place, writing each record (§4.3.5). */
@@ -980,6 +1034,8 @@ export class RemoteRooms {
 		const answer = await connection.call("me", { name, ext: { remote: { user_id: userId } } }, `${userId}:me:${this.now()}`);
 		const you = answer.result?.you as Record<string, unknown> | undefined;
 		const id = typeof you?.user_id === "string" ? you.user_id : known?.id ?? shadowUserId(this.host.self, userId);
+		// Unanswered, it is sent again next time (the act-as write still makes the remote user).
+		if (answer.error && unanswered(connection, answer)) return id;
 		await this.store.withMeterAsync("foreground", { writes: 1 }, () => this.host.storage.put(key, { id, name } satisfies OwnerUser));
 		return id;
 	}
@@ -1135,6 +1191,11 @@ export class RemoteRooms {
 		}
 		await this.host.wakeAt(now + MIRROR_CHECK_MS);
 	}
+}
+
+/** Whether a request's error is the connection's own (closed, or no answer in time), not the owner's answer. */
+function unanswered(connection: LinkConnection, answer: ReplyFrame): boolean {
+	return !connection.open || /^no answer to /.test(answer.error?.message ?? "");
 }
 
 /** Key prefix for a link's wake push (owner). */

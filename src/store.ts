@@ -1285,7 +1285,12 @@ export interface MirrorRoom {
 /** What this server mirrors (META_REMOTE_MIRROR): its mirror rooms, and per owner its place in the log and its wake. */
 export interface MirrorState {
   rooms: MirrorRoom[];
-  servers: Record<string, { cursor: number; wake?: { id: string; token: string } }>;
+  servers: Record<string, {
+    cursor: number;
+    wake?: { id: string; token: string };
+    /** Local joins and leaves of mirror rooms not yet answered by the owner (sent on the next connection). */
+    memberships?: Array<{ owner_room: string; user_id: string; name: string; joined: boolean }>;
+  }>;
 }
 
 /** The limiter scopes keyed by a registered user (`user:<user_id>`), which `/rename` moves. */
