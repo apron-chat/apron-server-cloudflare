@@ -109,6 +109,7 @@ import {
 	PAGE_BEGIN_PATH,
 	PAGE_FINISH_PATH,
 	pageOriginServes,
+	pageUrl,
 	parseAuthorizationRequest,
 	parsePasskeyPageRequest,
 	PASSKEY_PAGE_PATH,
@@ -1510,6 +1511,24 @@ function asDecimalId(value: unknown, field: string, allowZero = true): string | 
 	const number = Number(value);
 	if (!Number.isSafeInteger(number) || (!allowZero && number === 0)) throw { name: "invalid_params", message: `${field} is outside the supported range` } satisfies ProtocolError;
 	return String(number);
+}
+
+/**
+ * The refusal of a passkey ceremony or session in the client (protocol
+ * §4.10) to a connection whose origin is not one of RP_ORIGINS. It quotes
+ * the origin, or says the connection sent none, as a native app does, so a
+ * client can tell the two apart. `page`: the passkey page is the way in
+ * (protocol §4.10.1).
+ */
+function passkeyOriginRefusal(origin: string | null, page = false): ProtocolError {
+	const refused = origin === null ? "This connection sends no Origin" : `Origin ${quotedOrigin(origin)} is not configured for passkeys`;
+	const remedy = page ? "use a code from the passkey page in external.url" : origin === null ? "passkeys need a configured origin" : undefined;
+	return { name: "denied", message: remedy ? `${refused}; ${remedy}` : refused };
+}
+
+/** A connection's Origin as a refusal quotes it, bounded as other echoed values are. */
+function quotedOrigin(origin: string): string {
+	return JSON.stringify(origin.slice(0, 200));
 }
 
 function passkeyCredentialParam(params: Record<string, unknown>, action: "register" | "login"): Record<string, unknown> {
@@ -3703,7 +3722,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!DEFINED_AUTH_SCHEMES.has(offered)) throw { name: "invalid_params", message: "Unknown authentication scheme" } satisfies ProtocolError;
 			if (offered === "email") throw { name: "unsupported", message: "Email sign-in is not offered" } satisfies ProtocolError;
 			if (offered === "external" && !this.externalOrigin(attachment)) throw { name: "unsupported", message: "External sign-in is not offered" } satisfies ProtocolError;
-			if (offered === "webauthn" && !this.passkeysOfferedTo(this.requestOrigin(socket), attachment.endpoint)) throw { name: "unsupported", message: "Passkeys are not offered to this origin" } satisfies ProtocolError;
+			if (offered === "webauthn") {
+				const origin = this.requestOrigin(socket);
+				if (!this.passkeysOfferedTo(origin, attachment.endpoint)) {
+					throw { name: "unsupported", message: `Passkeys are not offered to ${origin === null ? "a connection that sends no Origin" : `origin ${quotedOrigin(origin)}`}` } satisfies ProtocolError;
+				}
+			}
 		}
 		this.store.reserveAuthAttempt({ ipKey: attachment.ipKey, now: nowMs() });
 		const params = request.params;
@@ -3762,7 +3786,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// serves every other client, on the server's own origin (protocol §4.10.1).
 		const local = origin !== null && this.config.rpOrigins.includes(origin);
 		const pageOrigin = this.passkeyPageOrigin(attachment);
-		if (!local && !pageOrigin) throw { name: "denied", message: "Frontend origin is not configured for passkeys" } satisfies ProtocolError;
+		if (!local && !pageOrigin) throw passkeyOriginRefusal(origin);
 		if (step === "begin") {
 			const identity = action === "register" ? identityOf(attachment) : undefined;
 			const name = action === "register" && !adding ? this.requestedName(params) : undefined;
@@ -3792,12 +3816,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// carries the action, a new account's name, or an addition's handle,
 			// which the client keeps (protocol §4.10.1, §4.12.1).
 			if (pageOrigin) {
-				const url = new URL(PASSKEY_PAGE_PATH, pageOrigin);
-				url.searchParams.set("action", action);
-				if (name !== undefined) url.searchParams.set("name", name);
-				if (adding) url.searchParams.set("request", await this.createRequestHandle(attachment.userId!, handle, nowMs()));
+				const query: Record<string, string> = { action };
+				if (name !== undefined) query.name = name;
+				if (adding) query.request = await this.createRequestHandle(attachment.userId!, handle, nowMs());
 				if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
-				result.external = { url: url.href };
+				result.external = { url: pageUrl(pageOrigin, PASSKEY_PAGE_PATH, query) };
 			}
 			this.reply(socket, request, result);
 			await this.rescheduleAlarm();
@@ -3822,7 +3845,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await this.completePasskeySignIn(socket, attachment, request, finished, signIn, { adds: code.adds === true, newAccount: code.action === "register" });
 			return;
 		}
-		if (!local) throw { name: "denied", message: "Frontend origin is not configured for passkeys" } satisfies ProtocolError;
+		if (!local) throw passkeyOriginRefusal(origin, pageOrigin !== undefined);
 		const challengeId = requiredString(params, "challenge_id");
 		const challenge = attachment.challenge;
 		// A matching finish consumes the pending ceremony before any proof work,
@@ -4091,7 +4114,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// This server's own access tokens are Apron tokens, for `token` (ext:oauth).
 		if (params.token !== undefined) throw { name: "denied", message: "Sign in with this server's tokens through the token scheme" } satisfies ProtocolError;
 		if (params.code === undefined) {
-			this.reply(socket, request, { external: { url: `${origin}${AUTHORIZE_PATH}` } });
+			this.reply(socket, request, { external: { url: pageUrl(origin, AUTHORIZE_PATH) } });
 			return;
 		}
 		const code = await this.takeSignInCode(params, "authorize", origin);
@@ -4513,7 +4536,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async handleTokenResumeLocked(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, bearer: boolean): Promise<void> {
 		if (attachment.tier === "registered") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
 		const origin = this.requestOrigin(socket);
-		if (!bearer && (!origin || !this.config.rpOrigins.includes(origin))) throw { name: "denied", message: "Frontend origin is not configured for passkeys" } satisfies ProtocolError;
+		if (!bearer && (!origin || !this.config.rpOrigins.includes(origin))) throw passkeyOriginRefusal(origin);
 		const token = requiredString(request.params, "token");
 		if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "too_large", message: "token is too long" } satisfies ProtocolError;
 		const key = await sessionKey(token);
