@@ -728,8 +728,11 @@ export const LIVE_ORPHAN_GRACE_MS = 30_000;
  * The largest finished terminal `output`, in bytes of JSON: a control
  * character escapes to six (`\u001b`), so the kept bytes are cut further when
  * escaping would pass it, and one record always fits a history response.
+ * Colored output escapes to about 1.4 times its bytes (32 KB of it was 45 KB
+ * of JSON), so this cuts only output dense in control characters, and it
+ * bounds what history by count (retentionRecords) can hold of terminals.
  */
-export const MAX_TERMINAL_OUTPUT_JSON_BYTES = 128 * 1024;
+export const MAX_TERMINAL_OUTPUT_JSON_BYTES = 64 * 1024;
 /** Rows one live text's bookkeeping may write: the `_meta` row, three limiter rows and their counter. */
 const LIVE_WRITES = 16;
 

@@ -815,8 +815,9 @@ as maintenance).
 Stored: the finished terminal is one record, its `output` JSON-escaped (32 KB
 of colored output was 45,457 bytes of JSON, and the database grew 45,056
 bytes); the creation snapshot with `url` stays beside it (a few hundred
-bytes). The `output` is cut further while its JSON passes 128 KiB, its worst
-case (every byte a control character, six bytes of JSON each). An append adds
+bytes). The `output` is cut further while its JSON passes 64 KiB: only
+output dense in control characters (six bytes of JSON each) reaches it, as
+colored output escapes to about 1.4 times its bytes. An append adds
 its kept text (at most 4 KB) to one record. The open-text row (`live_texts`)
 is at most a few kilobytes and is deleted when none is open. On Free (16 KB
 kept) the figures are the same rows, 22,754 bytes of JSON, and 24,576
@@ -870,7 +871,7 @@ included usage and this server's own budgets
 | Durable Object duration | 400,000 GB-s | daily stop at 90% of 12,900; monthly stop at 50% | one object awake all day: 10,800 (334,800) | 100 × (300 + 120) s at 128 MB: 5,250 (162,750) alone; 3,000 for ordinary users | still at most 10,800 (334,800): one object cannot be awake longer than the day |
 | SQL rows written | 50,000,000 | 800,000 a day (fails closed) | up to the ceiling | about 3,600 | within the same ceiling |
 | SQL rows read | 25,000,000,000 | 30,000,000 a day (fails closed) | up to the ceiling | about 5,000 | within the same ceiling |
-| SQL storage | 5 GB-month | 768 MiB high-water (growth stops) | up to the watermark | the kept text history holds, the latest 10,000 records: at the cap of 100 a day of 132 KiB, the watermark after about 58 days, when posting stops until an admin purges (typical 45 KB each: about 130 MB a month) | within the same watermark |
+| SQL storage | 5 GB-month | 768 MiB high-water (growth stops) | up to the watermark | the kept text history holds, the latest 10,000 records: at most 64 KiB of JSON a terminal (typical 45 KB each: about 130 MB a month); 100 a day at the cap for the 100 days 10,000 records would take is about 625 MiB, under the watermark | within the same watermark |
 | Logs (from 2026-12-01) | 50 GB | monthly stop at 50% | | about 32 invocations a text, sampled at 0.1: under 100 MB | + under 0.2% |
 
 So live text fits the plan: alone its worst month is a tenth of the included
