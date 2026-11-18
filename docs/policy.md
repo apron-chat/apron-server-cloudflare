@@ -214,9 +214,11 @@ within it:
   `offline` for an invisible user, and `""` for one who chose none,
   connected or not. After signing in, and after the `auth` result, a
   connection is told the status of each user it shares a room with, other
-  than those shown `offline` or `""`. Changes are coalesced to at
-  most one a minute per user, the latest winning, and a user who closes a
-  connection is shown offline (or idle) only after a minute without them,
+  than those shown `offline` or `""`. Changes towards idle or offline are
+  coalesced to at most one a minute per user, the latest winning, while
+  coming back (from offline, or idle to online) shows at once; a user who
+  closes a connection is shown offline (or idle) only after a minute
+  without them,
   so a reload or a phone reconnecting shows nothing. A peer that vanishes
   without closing (a sleeping laptop) counts as gone only once it is found
   stale (Listings, above), and then waits the same minute.

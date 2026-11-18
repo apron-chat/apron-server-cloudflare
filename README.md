@@ -48,8 +48,8 @@ for a zero-overage deployment.
 - **Who's around.** With push on, member lists show each user as online,
   idle, busy (`dnd`), or offline, with when they were last `seen`, and a
   user can choose `dnd`, `invisible`, or no status at all with `me`. A
-  chosen status shows at once; other changes are coalesced to one a minute
-  per user, and `seen` may be up to 10 minutes early (see
+  chosen status, or coming back online, shows at once; other changes are
+  coalesced to one a minute per user, and `seen` may be up to 10 minutes early (see
   [user status](docs/configuration.md#user-status-presence)).
 - **Bring your own frontend.** Guest connections are accepted from any
   origin — even `localhost` or a browser console.

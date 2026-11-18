@@ -4,7 +4,7 @@ import { AuthError, AuthTooLargeError, candidateUserIdFor, UnknownCredentialErro
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
 import { LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
-import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
+import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, showsMorePresent, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor, snapshotBill, snapshotReasons } from "./account-usage";
 import { PRICED_LABEL, PRICES, usd } from "./pricing";
 import { activeUsersConfigured, activeUsersLine, fetchActiveUsers } from "./active-users";
@@ -5928,9 +5928,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	// be announced survives hibernation. A change goes out at most once a
 	// `statusCoalesceSeconds` per user, the latest winning, and one a closed
 	// connection caused waits `offlineGraceSeconds` first, so a reload or a
-	// reconnect shows nothing; a change the user makes with `me` goes out at
-	// once. The object's alarm announces a change when it is due
-	// (armPresence), rounded up to `presenceAlarmSeconds` (a guest's to
+	// reconnect shows nothing; a change the user makes with `me`, and one
+	// that shows them more present than others were told (showsMorePresent:
+	// back from `offline`, or `idle` to `online`), goes out at once. The
+	// object's alarm announces a change when it is due (armPresence),
+	// rounded up to `presenceAlarmSeconds` (a guest's to
 	// `guestPresenceAlarmSeconds`), and lets the object hibernate meanwhile;
 	// events sweep too. Changes go as `user` `new` to others who share a room. The
 	// same sweep tells the user's connections of mutes that run out.
@@ -6104,7 +6106,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 					return;
 				}
 				const hold = Math.max(pres.h ?? 0, options.hold ? now + graceMs : 0);
-				const due = options.immediate ? now : Math.max(this.lastAnnounced(userId, pres) + coalesceMs, hold);
+				// Coming back (showsMorePresent) goes out at once, past the minute and any grace.
+				const due = options.immediate || showsMorePresent(pres.s, shown) ? now : Math.max(this.lastAnnounced(userId, pres) + coalesceMs, hold);
 				if (due <= now) {
 					this.announceStatus(userId, states, shown, now, options.seen);
 					return;
@@ -6373,7 +6376,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 					if (pres.h !== undefined) this.writePresence(states, { s: pres.s, a: pres.a });
 					continue;
 				}
-				const due = Math.max(this.lastAnnounced(userId, pres) + coalesceMs, pres.h ?? 0);
+				const due = showsMorePresent(pres.s, shown) ? now : Math.max(this.lastAnnounced(userId, pres) + coalesceMs, pres.h ?? 0);
 				if (due <= now) this.announceStatus(userId, states, shown, now);
 				else wait(userId, due);
 			}

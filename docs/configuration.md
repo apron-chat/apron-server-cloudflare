@@ -703,8 +703,11 @@ Two limits shape how fast changes are announced, both in seconds and at most
 60 (`MAX_STATUS_DELAY_SECONDS`), so what others see is never more than about
 a minute behind:
 
-- `statusCoalesceSeconds` (60): a user's status is announced at most once in
-  this long; changes in between wait, and only the latest goes out. Member
+- `statusCoalesceSeconds` (60): a user's change towards `idle` or `offline`
+  is announced at most once in this long after their last announcement;
+  changes in between wait, and only the latest goes out. Coming back (from
+  `offline`, or `idle` to `online`) is announced at once, so a user's
+  connections cause at most two announcements in this long. Member
   listings are also reused for up to this long, until something they read
   is written.
 - `offlineGraceSeconds` (60): a change caused by a closed connection waits

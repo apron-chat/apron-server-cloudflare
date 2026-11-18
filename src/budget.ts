@@ -156,8 +156,9 @@ export interface Limits {
 	/**
 	 * User `status` shown to others (protocol §4.5): a user's announced
 	 * status changes at most once in this many seconds; changes in between
-	 * wait, and the latest one wins. Also bounds how long a member listing
-	 * may be reused.
+	 * wait, and the latest one wins. A change that shows them more present
+	 * (back from `offline`, or `idle` to `online`) goes out at once. Also
+	 * bounds how long a member listing may be reused.
 	 */
 	statusCoalesceSeconds: number;
 	/**
