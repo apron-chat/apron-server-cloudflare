@@ -760,9 +760,9 @@ more. The minimum age
 keeps a flood from pushing out the last three days before an admin purges
 it; the database watermarks still bound what the flood stores.
 
-**The archive.** With a D1 database bound as `ARCHIVE` (`wrangler.toml`; for
-production, `wrangler d1 create apron-archive` and the commented block in
-`wrangler.production.toml`) and `archiveRecords` above 0, records leaving the
+**The archive.** With a D1 database bound as `ARCHIVE` (`wrangler.toml`, a
+local one; `wrangler.production.toml`, `apron-archive`; Previews bind none)
+and `archiveRecords` above 0, records leaving the
 hot log are copied there first (`src/archive.ts`), in batches of 100 on the
 cleanup job's alarms, a second apart, and removed from SQLite only once
 copied. History serves them as if they had never left: a page that reaches

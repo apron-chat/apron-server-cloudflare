@@ -79,12 +79,12 @@ PUSH_HOSTS_EXTRA = "push.stupidtech.net"
 
 # The history archive (src/archive.ts, docs/configuration.md, History
 # retention): records past the hot log's retentionRecords, kept for
-# archiveRecords more. Without it they expire at once. Create the database
-# (`wrangler d1 create apron-archive`) and put its id here to turn it on:
-# [[d1_databases]]
-# binding = "ARCHIVE"
-# database_name = "apron-archive"
-# database_id = "<id from wrangler d1 create>"
+# archiveRecords more. Without it they expire at once. The object creates
+# its table on first use. Previews bind none (below), so theirs expire at once.
+[[d1_databases]]
+binding = "ARCHIVE"
+database_name = "apron-archive"
+database_id = "67f4435a-f9d4-4c9a-89e0-c02f108d4fa2"
 
 # Uploaded images (src/budget.ts). The bucket needs lifecycle rules deleting
 # f/ after 120 days and a/ after 61 or more (none for e/, custom emoji), a custom domain
