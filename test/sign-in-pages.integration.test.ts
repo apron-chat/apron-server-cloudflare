@@ -173,11 +173,40 @@ it('offers the passkey page in webauthn begin results, to every client on a host
 		expect(remote.result).toEqual({ external: { url: `${ORIGIN}/passkey?action=register` } });
 		// A credential finish still needs one of RP_ORIGINS.
 		const finish = await request(app, 'f', 'auth', { scheme: 'webauthn', action: 'login', step: 'finish', challenge_id: 'x', credential: {} });
-		expect(finish.error.code).toBe(-32001);
+		expect(finish.error).toMatchObject({ code: -32001, message: 'This connection sends no Origin; use a code from the passkey page in external.url' });
 
 		expect((await greeting(elsewhere)).server.params.auth).toEqual(['token', 'guest']);
-		expect((await begin(elsewhere, 'login')).error.code).toBe(-32601);
+		expect((await begin(elsewhere, 'login')).error).toMatchObject({ code: -32601, message: 'Passkeys are not offered to a connection that sends no Origin' });
 	} finally { web.close(); app.close(); elsewhere.close(); }
+});
+
+it('says which origin it refuses passkeys in the client to', async () => {
+	const rpOrigins = async (origins?: string[]) => runInDurableObject(stub(), (instance) => {
+		const server = instance as unknown as { config: { rpOrigins: string[] } };
+		const kept = server.config.rpOrigins;
+		if (origins) server.config = { ...server.config, rpOrigins: origins };
+		return kept;
+	});
+	const kept = await rpOrigins();
+	const web = 'http://localhost:5173';
+	const token = await runInDurableObject(stub(), (instance) =>
+		(instance as unknown as { issueSession(userId: string, origin: string, now: number): Promise<string> }).issueSession('user_origin_refused', web, Date.now()));
+	await rpOrigins([]);
+	const paged = await connect(web);
+	const elsewhere = await open({ ip: ip(), origin: web });
+	try {
+		await greeting(paged);
+		await greeting(elsewhere);
+		const finish = await request(paged, 'f', 'auth', { scheme: 'webauthn', action: 'login', step: 'finish', challenge_id: 'x', credential: {} });
+		expect(finish.error.message).toBe('Origin "http://localhost:5173" is not configured for passkeys; use a code from the passkey page in external.url');
+		expect((await begin(elsewhere, 'login')).error).toMatchObject({ code: -32601, message: 'Passkeys are not offered to origin "http://localhost:5173"' });
+		const resumed = await request(elsewhere, 'resume', 'auth', { scheme: 'token', token });
+		expect(resumed.error).toMatchObject({ code: -32001, message: 'Origin "http://localhost:5173" is not configured for passkeys' });
+	} finally {
+		paged.close();
+		elsewhere.close();
+		await rpOrigins(kept);
+	}
 });
 
 it('writes spaces in the passkey page\'s query as %20, so a client that encodes it again keeps the name', async () => {
