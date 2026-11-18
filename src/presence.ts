@@ -54,3 +54,21 @@ export function shownStatus(inputs: StatusInputs): Status {
 	if (inputs.choice === "dnd") return "dnd";
 	return inputs.attended ? "online" : "idle";
 }
+
+/** How present each shown status says a user is; `""` tells nothing, so it is left out. */
+const PRESENCE_RANK: Readonly<Record<Exclude<Status, "">, number>> = { offline: 0, idle: 1, online: 2, dnd: 2 };
+
+/**
+ * Whether a change of what others see, `from` what they were told `to` what
+ * holds now, shows the user more present: `offline` to `idle`, `online` or
+ * `dnd`, or `idle` to `online` (or `dnd`, which only `me` makes, at once
+ * anyway). Such a change is announced at once rather than coalesced
+ * (§4.5.2 lets a server delay some changes and not others): coming back is
+ * what others want to see. At most two come in a row (`offline`, `idle`,
+ * `online`) between changes the other way, which are coalesced, so a
+ * user's connections cause at most three announcements a minute.
+ */
+export function showsMorePresent(from: Status, to: Status): boolean {
+	if (from === "" || to === "") return false;
+	return PRESENCE_RANK[to] > PRESENCE_RANK[from];
+}

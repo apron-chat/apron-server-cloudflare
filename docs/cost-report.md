@@ -699,9 +699,10 @@ rows per candidate with registrations, at most about 3,000 a day at
 `pushesPerDay` (1,000); storage is at most 100 rows a registered user; none
 of it uses requests.
 
-**Alarm and duration.** A change waits for the coalescing minute and, when
-a closed connection caused it, the 60-second grace; a mute running out
-within a minute waits the same way. The change asks the object's alarm for
+**Alarm and duration.** A change towards idle or offline waits for the
+coalescing minute and, when a closed connection caused it, the 60-second
+grace (coming back is announced within the event that caused it, and asks
+for no alarm); a mute running out within a minute waits the same way. The change asks the object's alarm for
 its time, only while a signed-in connection is open, rounded up so changes
 due in the same window share one wake: a registered user's to
 `presenceAlarmSeconds` (15 s; Free: 60 s), a guest's to the coarser

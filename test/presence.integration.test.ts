@@ -210,7 +210,7 @@ async function forgetAnnouncements(): Promise<void> {
 describe('the status a user chooses (§4.5)', () => {
 	beforeEach(forgetAnnouncements);
 
-	it('shows each status as others see it: chosen ones at once, derived changes coalesced to one a minute', async () => {
+	it('shows each status as others see it: chosen ones and coming back at once, derived changes away coalesced to one a minute', async () => {
 		const aliceId = unique('alice');
 		const bobId = unique('bob');
 		const alice = await signedIn(aliceId);
@@ -257,11 +257,10 @@ describe('the status a user chooses (§4.5)', () => {
 			const invalid = await choose(bob, 42);
 			expect(invalid.error.code).toBe(-32602);
 			expect((await request(bob, 'still', 'me', {})).result.you.status).toBe('');
-			// Attended again with online chosen: online, after the minute.
+			// Attended again with online chosen: online at once, coming back from idle.
 			await forgetAnnouncements();
 			await choose(bob, 'online');
 			await status(bob, { idle: false });
-			await advance(COALESCE);
 			expect(told(await drain(alice), bobId).slice(-1)).toEqual(['online']);
 			expect(await listed(alice, bobId)).toMatchObject({ status: 'online' });
 			// The choice outlasts the connections: a new one's `you` carries it.
@@ -479,7 +478,7 @@ describe('the status a user chooses (§4.5)', () => {
 describe('user status timing', () => {
 	beforeEach(forgetAnnouncements);
 
-	it('coalesces changes within the minute to the latest, and sends none when it is back to what was told', async () => {
+	it('coalesces changes away within the minute to the latest, sends none when it is back to what was told, and shows coming back at once', async () => {
 		const watcherId = unique('watcher');
 		const flipperId = unique('flipper');
 		const watcher = await signedIn(watcherId);
@@ -493,14 +492,21 @@ describe('user status timing', () => {
 			// Five changes, then a sixth, in the minute: only the latest goes out, once.
 			await advance(COALESCE);
 			expect(told(await drain(watcher), flipperId)).toEqual(['idle']);
-			// Back and forth within the next minute, ending where it was told: nothing.
-			mine.push(...await status(second, { idle: false }));
-			mine.push(...await status(second, { idle: 0 }));
-			await advance(COALESCE);
-			expect(told(await drain(watcher), flipperId)).toEqual([]);
+			// Coming back shows at once, without waiting out the minute.
 			await status(flipper, { idle: false });
-			await advance(COALESCE);
 			expect(told(await drain(watcher), flipperId)).toEqual(['online']);
+			// Away and back within the minute, ending where it was told: nothing.
+			await status(flipper, { idle: 0 });
+			await status(flipper, { idle: false });
+			await advance(COALESCE / 2);
+			expect(told(await drain(watcher), flipperId)).toEqual([]);
+			// Away again: waits out the minute since the online went out.
+			await status(flipper, { idle: 0 });
+			expect(told(await drain(watcher), flipperId)).toEqual([]);
+			await advance(COALESCE / 2 - 1_000);
+			expect(told(await drain(watcher), flipperId)).toEqual([]);
+			await advance(2_000);
+			expect(told(await drain(watcher), flipperId)).toEqual(['idle']);
 			// The user's own connections are not told what others see: `you` shows their choice.
 			mine.push(...await drain(second));
 			expect(own(mine)).toEqual([]);
@@ -540,6 +546,43 @@ describe('user status timing', () => {
 			expect(told(await drain(watcher), mobileId)).toEqual([]);
 			await advance(2_000);
 			expect(told(await drain(watcher), mobileId)).toEqual(['offline']);
+		} finally { watcher.close(); mobile.close(); }
+	});
+
+	it('shows a user back from offline at once, however soon after the offline went out, and coalesces their leaving again', async () => {
+		const watcherId = unique('watcher');
+		const mobileId = unique('mobile');
+		const watcher = await signedIn(watcherId);
+		let mobile = await signedIn(mobileId);
+		try {
+			expect(told(await drain(watcher), mobileId)).toEqual(['online']);
+			// The phone leaves the app and is shown offline once the grace is over.
+			await hangUp(mobile, mobileId);
+			await advance(GRACE + 1_000);
+			expect(told(await drain(watcher), mobileId)).toEqual(['offline']);
+			// Opened again 20 seconds later, well within the minute since the
+			// offline went out: online at once, not when the minute is up.
+			await advance(20_000);
+			mobile = await signedIn(mobileId, { existing: true });
+			expect(told(await drain(watcher), mobileId)).toEqual(['online']);
+			// A reply, then gone again: offline only after the grace, and the
+			// minute since the online went out.
+			await advance(10_000);
+			await hangUp(mobile, mobileId);
+			await advance(GRACE - 1_000);
+			expect(told(await drain(watcher), mobileId)).toEqual([]);
+			await advance(2_000);
+			expect(told(await drain(watcher), mobileId)).toEqual(['offline']);
+			// Back from idle is coming back too: online the moment a connection
+			// is attended again, within the minute since the idle went out.
+			mobile = await signedIn(mobileId, { existing: true });
+			expect(told(await drain(watcher), mobileId)).toEqual(['online']);
+			await status(mobile, { idle: 0 });
+			await advance(COALESCE);
+			expect(told(await drain(watcher), mobileId)).toEqual(['idle']);
+			await advance(5_000);
+			await status(mobile, { idle: false });
+			expect(told(await drain(watcher), mobileId)).toEqual(['online']);
 		} finally { watcher.close(); mobile.close(); }
 	});
 
@@ -1427,7 +1470,8 @@ describe('seen: when the shown status last became offline (§4.5.2)', () => {
 			// Back online: the kept seen is not shown, and never in their own you.
 			leaver = await signIn(leaverId, { existing: true });
 			expectNoOwnSeen([leaver.auth, ...leaver.afterAuth, await request(leaver.peer, 'me', 'me', {}), await choose(leaver.peer, 'dnd')]);
-			expect(shown(await drain(watcher), leaverId)).toEqual([{ user_id: leaverId, status: 'dnd' }]);
+			// Back from offline shows at once, then the dnd chosen with `me`.
+			expect(shown(await drain(watcher), leaverId)).toEqual([{ user_id: leaverId, status: 'online' }, { user_id: leaverId, status: 'dnd' }]);
 			const back = await listing(leaver.peer);
 			expect(back.get(leaverId)).toEqual(expect.objectContaining({ status: 'dnd' }));
 			expect(back.get(leaverId)).not.toHaveProperty('seen');
