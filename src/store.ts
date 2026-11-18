@@ -5139,6 +5139,12 @@ export class Store {
     return identity?.tier === "registered" && parseRoles(identity.roles_json).length > 0;
   }
 
+  /** Whether a user may delete anyone's message they can see (DELETE_ANY_ROLES): one identity read. */
+  mayDeleteAny(userId: string, now = this.clock.now()): boolean {
+    this.ensureReady();
+    return this.reserved({ reads: 4 }, false, now, () => this.holdsRole(userId, DELETE_ANY_ROLES));
+  }
+
   /** Whether a registered user holds one of `roles`, from the identity row. */
   private holdsRole(userId: string, roles: readonly string[]): boolean {
     const identity = this.identityRow(userId);

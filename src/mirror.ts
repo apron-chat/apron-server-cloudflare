@@ -736,6 +736,9 @@ export class RemoteRooms {
 		if (!mirror) return false;
 		// The mirror room's own title, description and members are this server's.
 		if (request.method === "room_set" && !mirror.thread && typeof request.params.room_id === "string") return false;
+		// An admin or mod here hides another user's copy for this server only: a local delete (copyMessage leaves it hidden).
+		if (request.method === "message" && request.params.deleted === true && typeof request.params.message_id === "string" && client.userId &&
+			this.store.messageAuthor(request.params.message_id, this.now()) !== client.userId && this.store.mayDeleteAny(client.userId, this.now())) return false;
 		if (mirror.room.unshared) throw { name: "denied", message: "This room is no longer shared by its owner; it takes no more writes" } satisfies ProtocolError;
 		if (client.tier !== "registered" || !client.userId) throw { name: "denied", message: "Sign in to write in a shared room" } satisfies ProtocolError;
 		const server = mirror.room.server;
