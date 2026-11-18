@@ -455,3 +455,21 @@ it('changes nothing while REMOTE_SELF is unset: no capability, no /remote, links
 		admin.close();
 	}
 });
+
+it('joins a remote user on a link\'s act-as room_join, but not one another user removed', async () => {
+	const { admin, link, roomId } = await linked('ws://127.0.0.1:8099/ws');
+	const carol = unique('carol');
+	const carolId = `${carol}@127.0.0.1:8099`;
+	try {
+		const joined = await exchange(link, unique('join'), 'room_join', { room_id: roomId, ext: { remote: { user_id: carol } } });
+		expect(joined.frame.result).toEqual({});
+		expect(joined.skipped.some((frame) => frame.method === 'room_update' && frame.params.memberships?.[0]?.members?.[0]?.user?.user_id === carolId && frame.params.memberships[0].members[0].joined)).toBe(true);
+		expect((await request(link, unique('leave'), 'room_leave', { room_id: roomId, ext: { remote: { user_id: carol } } })).result).toEqual({});
+		expect((await request(link, unique('again'), 'room_join', { room_id: roomId, ext: { remote: { user_id: carol } } })).result).toEqual({});
+		expect((await command(admin, unique('kick'), `/kick ${carolId}`, roomId)).frame.result).toEqual({});
+		const refused = await request(link, unique('rejoin'), 'room_join', { room_id: roomId, ext: { remote: { user_id: carol } } });
+		expect(refused.error).toMatchObject({ code: DENIED, data: { ext: { remote: 'removed' } } });
+		const general = await request(link, unique('general'), 'room_join', { room_id: 'general', ext: { remote: { user_id: carol } } });
+		expect(general.error).toMatchObject({ code: DENIED, data: { ext: { remote: 'not_joined' } } });
+	} finally { admin.close(); link.close(); }
+});

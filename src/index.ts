@@ -5142,7 +5142,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const method = request.method;
 		// ext:remote hook: off, a link is an ordinary bot, and the store drops `remote` from every request.
 		if (!this.remote) return false;
-		if (method !== "message" && method !== "reactions" && method !== "me" && method !== "room_leave" && method !== "room_set") return false;
+		if (method !== "message" && method !== "reactions" && method !== "me" && method !== "room_leave" && method !== "room_set" && method !== "room_join") return false;
 		const remoteUserId = actAsUserId(request.params);
 		const link = attachment.tier === "registered" ? attachment.userId : undefined;
 		if (remoteUserId === undefined || link === undefined) return false;
@@ -5163,6 +5163,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (method === "message") await this.handleMessage(socket, attachment, request, actor);
 		else if (method === "reactions") await this.handleReactions(socket, attachment, request, actor);
 		else if (method === "room_set") await this.shadowRoomSet(socket, attachment, request, actor);
+		else if (method === "room_join") {
+			// A remote user joins a room (or thread of one) its link is in; one another user removed is `denied` ("removed").
+			await this.shadowJoins(socket, attachment, actor, requiredString(request.params, "room_id"));
+			this.reply(socket, request, {});
+		}
 		else await this.shadowMe(socket, attachment, request, actor);
 		return true;
 	}
@@ -8763,6 +8768,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 			wakeAt: async (at) => {
 				if (this.deadlines.remote.soonest(at)) await this.rescheduleAlarm();
 			},
+			// A copy sends pushes like any message (§4.9).
+			pushFor: (message) => {
+				if (message.prev_log_id === undefined) this.wakeFor(message);
+			},
+			// Nothing is dialed while the server is paused or out of capacity.
+			mayDial: () => {
+				const now = nowMs();
+				return this.pausedUntil(now) <= now && !this.accountUsage.stops(now);
+			},
 		};
 	}
 
@@ -10055,7 +10069,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private broadcastRecord(record: Broadcast, exceptUser?: string): void {
 		this.deliver(recordFrame(record), record.rooms, exceptUser === undefined ? undefined : (state) => state.userId !== exceptUser);
 		// ext:remote hook: a record of a shared room wakes the mirrors that sleep.
-		this.remote?.onRecord(record.rooms);
+		this.remote?.onRecord(record);
 	}
 
 	/**

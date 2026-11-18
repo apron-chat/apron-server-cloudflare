@@ -57,6 +57,10 @@ export interface MirrorHost {
 	closeConnectionsOf(userId: string, reason: string): void;
 	/** Sets the alarm no later than `at`. */
 	wakeAt(at: number): Promise<void>;
+	/** A new copy wakes its readers by push, as any new message does (§4.9). */
+	pushFor(message: MessageSnapshot): void;
+	/** Whether the server may dial out now: not paused, not out of capacity. */
+	mayDial(): boolean;
 }
 
 /** A link's `relay` wake push (§4.9.4), as the owner keeps it. */
@@ -339,7 +343,9 @@ export class RemoteRooms {
 	 * of the record's rooms gets a push, at most one each WAKE_INTERVAL_MS
 	 * (the records between go with it), also while it is connected.
 	 */
-	onRecord(rooms: readonly string[]): void {
+	onRecord(record: Broadcast): void {
+		if (record.method === "membership") this.forwardMembership(record);
+		const rooms = record.rooms;
 		if (this.wakeRegistrations?.size === 0) return;
 		void this.wakes().then((registrations) => {
 			for (const [linkId, registration] of registrations) {
@@ -398,6 +404,7 @@ export class RemoteRooms {
 	async ensure(server: string): Promise<LinkConnection> {
 		const session = this.session(server);
 		if (session.connection?.open) return session.connection;
+		if (!this.host.mayDial()) throw new RetryLater(60_000, "this server is paused or out of capacity");
 		session.connecting ??= this.dial(session).finally(() => { session.connecting = undefined; });
 		return session.connecting;
 	}
@@ -432,6 +439,7 @@ export class RemoteRooms {
 		try {
 			await this.registerOwnWake(session.server, connection);
 			await this.checkJoined(session.server, connection);
+			await this.seedMembers(session.server, connection);
 			await this.catchUp(session, connection);
 		} finally {
 			// The records held while reading history, then live.
@@ -464,10 +472,123 @@ export class RemoteRooms {
 	private async checkJoined(server: string, connection: LinkConnection): Promise<void> {
 		const listed = await connection.call("room_list", { filter: "joined" }, `mirror-joined:${this.now()}`);
 		if (listed.error || !listed.result) return;
-		const joined = new Set(((listed.result.joined as Array<Record<string, unknown>> | undefined) ?? []).map((room) => room.room_id));
+		const rooms = (listed.result.joined as Array<Record<string, unknown>> | undefined) ?? [];
+		const joined = new Set(rooms.map((room) => room.room_id));
 		for (const room of this.store.mirrorState(this.now()).rooms) {
 			if (room.server === server && !room.unshared && !joined.has(room.owner_room)) this.markUnshared(server, room.owner_room);
 		}
+		for (const room of rooms) this.checkPrivacy(server, room);
+	}
+
+	/**
+	 * A mirror room's privacy is fixed when it is made (here a room's ID says
+	 * whether it is private): an owner room that became private while its
+	 * mirror is public stops being mirrored, so nothing private shows in a
+	 * public room. One that became public keeps its private mirror.
+	 */
+	private checkPrivacy(server: string, room: Record<string, unknown>): void {
+		if (room.private !== true || typeof room.room_id !== "string") return;
+		const mirror = this.store.mirrorState(this.now()).rooms.find((candidate) => candidate.server === server && candidate.owner_room === room.room_id && !candidate.unshared);
+		if (mirror && !mirror.room_id.startsWith("private_")) {
+			console.warn(JSON.stringify({ event: "remote_mirror_privacy_changed", server, owner_room: room.room_id, room_id: mirror.room_id }));
+			this.markUnshared(server, room.room_id);
+		}
+	}
+
+	/**
+	 * The owner's members of each mirrored room join its mirror room as
+	 * remote users (§4.2.1: as many as the owner lists), so both servers list
+	 * the same people; this mirror's own users there are its local members,
+	 * whose joins go to the owner (forwardMembership) once an instance. The
+	 * mirror's own joins are not charged as posts; a remote user in as many
+	 * private rooms as anyone may be is left out.
+	 */
+	private async seedMembers(server: string, connection: LinkConnection): Promise<void> {
+		for (const mirror of this.store.mirrorState(this.now()).rooms) {
+			if (mirror.server !== server || mirror.unshared) continue;
+			const listed = await connection.call("room_list", { room_id: mirror.owner_room, members: true }, `mirror-members:${mirror.owner_room}:${this.now()}`);
+			const record = [...((listed.result?.joined as unknown[]) ?? []), ...((listed.result?.not_joined as unknown[]) ?? [])][0] as Record<string, unknown> | undefined;
+			const users = new Map(((listed.result?.users as Array<Record<string, unknown>> | undefined) ?? []).map((user) => [user.user_id, user]));
+			for (const member of (record?.members as Array<Record<string, unknown>> | undefined) ?? []) {
+				const user = users.get(member.user_id) ?? member;
+				await this.copyMember(server, mirror.room_id, user, true);
+			}
+			if (this.joinsSent.has(mirror.room_id)) continue;
+			this.joinsSent.add(mirror.room_id);
+			const local = this.store.roomMembers([mirror.room_id], 500, this.now()).get(mirror.room_id) ?? [];
+			for (const member of local) {
+				if (!isShadowUserId(member.user_id) && this.store.remoteLink(member.user_id, this.now()) === undefined) await this.sendMembership(connection, server, mirror.owner_room, member.user_id, member.name ?? "", true);
+			}
+		}
+	}
+
+	/** The mirror rooms whose local members' joins this instance has sent to their owner. */
+	private readonly joinsSent = new Set<string>();
+
+	/**
+	 * A user of the owner's membership record in a local room: a remote user
+	 * joins or leaves it (not charged; a remote user removed here is not
+	 * joined again). Links, system identities, and this mirror's own users'
+	 * remote users (whose memberships are this server's own) are left out.
+	 */
+	private async copyMember(server: string, roomId: string, user: Record<string, unknown>, joined: boolean): Promise<void> {
+		const remote = (user.ext as Record<string, unknown> | undefined)?.remote as Record<string, unknown> | undefined;
+		if (remote && remote.user_id === undefined) return;
+		if (remote?.server === this.host.self) return;
+		const local = this.localUser(server, user);
+		if (!local?.remote) return;
+		if (joined === this.store.isRoomMember(roomId, local.userId, this.now())) return;
+		if (joined && this.store.remoteUserLeft(local.userId, roomId, this.now())) return;
+		await this.host.runMutation(async () => {
+			try {
+				const change = this.store.changeMembership({ userId: local.userId, ipKey: MIRROR_IP_KEY, roomId, join: joined, now: this.now(), system: true });
+				if (change.membership) this.host.broadcastRecord(change.membership);
+			} catch (error) {
+				// Past a limit (such as the private rooms one user may be in): left out.
+				if (!(error instanceof StoreError)) throw error;
+				console.warn(JSON.stringify({ event: "remote_member_skipped", server, room_id: roomId, user_id: local.userId, error: error.message }));
+			}
+		});
+	}
+
+	/** An owner's membership record: each entry copied (copyMember), and the link's own leave stops the mirror room. */
+	private async copyMembership(server: string, record: Record<string, unknown>): Promise<void> {
+		this.linkLeft(server, record);
+		if (typeof record.room_id !== "string") return;
+		const target = this.localRoom(this.store.mirrorState(this.now()), server, record.room_id);
+		if (!target || Number(record.log_id) <= target.mirror.start) return;
+		for (const member of (record.members as Array<Record<string, unknown>> | undefined) ?? []) {
+			const user = member.user as Record<string, unknown> | undefined;
+			if (user) await this.copyMember(server, target.roomId, user, member.joined !== false);
+		}
+	}
+
+	/**
+	 * Mirror hook, after a membership record here: a local user's join or
+	 * leave of a mirror room or thread goes to the owner as their remote
+	 * user's `room_join` or `room_leave`.
+	 */
+	private forwardMembership(record: Broadcast): void {
+		const roomId = record.params.room_id;
+		const mirror = typeof roomId === "string" ? this.mirrorOf(roomId) : undefined;
+		if (!mirror || mirror.room.unshared) return;
+		for (const member of (record.params.members as Array<Record<string, unknown>> | undefined) ?? []) {
+			const user = member.user as Record<string, unknown> | undefined;
+			const userId = user?.user_id;
+			if (typeof userId !== "string" || userId.startsWith("~") || isShadowUserId(userId) || this.store.remoteLink(userId, this.now()) !== undefined) continue;
+			const name = typeof user!.name === "string" ? user!.name : "";
+			void this.ensure(mirror.room.server)
+				.then((connection) => this.sendMembership(connection, mirror.room.server, mirror.ownerRoom, userId, name, member.joined !== false))
+				.then(() => this.touch(mirror.room.server), (error) => {
+					console.warn(JSON.stringify({ event: "remote_membership_not_sent", room_id: roomId, user_id: userId, error: error instanceof Error ? error.message : String(error) }));
+				});
+		}
+	}
+
+	private async sendMembership(connection: LinkConnection, server: string, ownerRoom: string, userId: string, name: string, joined: boolean): Promise<void> {
+		await this.ownerUser(connection, server, userId, name);
+		const answer = await connection.call(joined ? "room_join" : "room_leave", { room_id: ownerRoom, ext: { remote: { user_id: userId } } }, `${userId}:${joined ? "join" : "leave"}:${ownerRoom}:${this.now()}`);
+		if (answer.error) console.warn(JSON.stringify({ event: "remote_membership_refused", server, owner_room: ownerRoom, user_id: userId, error: answer.error.message ?? answer.error.code }));
 	}
 
 	/** Pages forward through the owner's log from this mirror's place, writing each record (§4.3.5). */
@@ -540,7 +661,7 @@ export class RemoteRooms {
 			if (kind === "messages") await this.copyMessage(server, record as unknown as MessageSnapshot);
 			else if (kind === "reactions") await this.copyReactions(server, record);
 			else if (kind === "rooms") await this.copyRoom(server, record);
-			else if (kind === "memberships") this.linkLeft(server, record);
+			else if (kind === "memberships") await this.copyMembership(server, record);
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "remote_copy_failed", server, kind, log_id: record.log_id, error: error instanceof Error ? error.message : String(error) }));
 		}
@@ -675,6 +796,7 @@ export class RemoteRooms {
 			};
 			const result = this.store.mutate(input);
 			for (const record of result.broadcasts) this.host.broadcastRecord(record);
+			if (result.message) this.host.pushFor(result.message);
 		});
 	}
 
@@ -714,6 +836,7 @@ export class RemoteRooms {
 	private async copyRoom(server: string, record: Record<string, unknown>): Promise<void> {
 		const ownerThread = record.room_id;
 		const parent = record.parent_room_id;
+		if (typeof ownerThread === "string" && parent === undefined) this.checkPrivacy(server, record);
 		if (typeof ownerThread !== "string" || typeof parent !== "string") return;
 		const state = this.store.mirrorState(this.now());
 		const mirror = state.rooms.find((room) => room.server === server && room.owner_room === parent && !room.unshared);

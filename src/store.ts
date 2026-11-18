@@ -5699,7 +5699,7 @@ export class Store {
    * are the user's own, or `actorId`'s when someone else makes the change
    * (an admin's `/kick`); `ipKey` is the requesting connection's.
    */
-  changeMembership(input: { userId: string; ipKey: string; roomId: string; join: boolean; now?: number; actorId?: string; link?: string }): {
+  changeMembership(input: { userId: string; ipKey: string; roomId: string; join: boolean; now?: number; actorId?: string; link?: string; system?: boolean }): {
     rooms: string[]; changed: boolean; membership?: Broadcast; room?: RoomRecord;
   } {
     this.ensureReady();
@@ -5720,7 +5720,8 @@ export class Store {
         if (!identity) throw new StoreError("denied", "Only registered identities keep rooms");
         // Only a private room's members see it, and only they add others to
         // it: nobody joins one by themselves (PRIVATE_ROOM_PREFIX).
-        const room = privateJoin ? this.visibleRoomRow(input.roomId, input.actorId ?? input.userId) : this.roomRow(input.roomId);
+        // A mirror's copy of an owner's membership (ext:remote, `system`) is the server's to write.
+        const room = privateJoin && !input.system ? this.visibleRoomRow(input.roomId, input.actorId ?? input.userId) : this.roomRow(input.roomId);
         if (!room) throw new StoreError("invalid_params", "Unknown room");
         const member = this.rawRows("SELECT user_id FROM memberships WHERE room_id = ? AND user_id = ? LIMIT 1", input.roomId, input.userId).length > 0;
         if (member === input.join) return { rooms: this.userRooms(input.userId), changed: false };
@@ -5728,7 +5729,7 @@ export class Store {
           throw new StoreError("denied", `${input.userId} is in as many private rooms as anyone may be, so cannot be added to another`.slice(0, 200));
         }
         // A link's shadow (ext:remote) pays for its own join or leave, at its link's limits.
-        this.chargePosting({ userId: input.link !== undefined ? input.userId : input.actorId ?? input.userId, tier: "registered", ipKey: input.ipKey, now: effective, link: input.link });
+        if (!input.system) this.chargePosting({ userId: input.link !== undefined ? input.userId : input.actorId ?? input.userId, tier: "registered", ipKey: input.ipKey, now: effective, link: input.link });
         if (input.join) this.rawExec("INSERT INTO memberships (room_id, user_id) VALUES (?, ?)", input.roomId, input.userId);
         else {
           this.rawExec("DELETE FROM memberships WHERE room_id = ? AND user_id = ?", input.roomId, input.userId);
