@@ -875,7 +875,7 @@ included usage and this server's own budgets
 | Durable Object duration | 400,000 GB-s | daily stop at 90% of 12,900; monthly stop at 50% | one object awake all day: 10,800 (334,800) | 100 × (300 + 120) s at 128 MB: 5,250 (162,750) alone; 3,000 for ordinary users | still at most 10,800 (334,800): one object cannot be awake longer than the day |
 | SQL rows written | 50,000,000 | 800,000 a day (fails closed) | up to the ceiling | about 3,600 | within the same ceiling |
 | SQL rows read | 25,000,000,000 | 30,000,000 a day (fails closed) | up to the ceiling | about 5,000 | within the same ceiling |
-| SQL storage | 5 GB-month | 768 MiB high-water (growth stops) | up to the watermark | the kept text history holds, the latest 10,000 records: at most 64 KiB of JSON a terminal (typical 45 KB each: about 130 MB a month); 100 a day at the cap for the 100 days 10,000 records would take is about 625 MiB, under the watermark | within the same watermark |
+| SQL storage | 5 GB-month | 768 MiB high-water (growth stops) | up to the watermark | the kept text the hot log holds, its latest 5,000 records: with uploads on, a reference a terminal (its output is in R2); without, at most 64 KiB of JSON a terminal (typical 45 KB each: about 130 MB a month), 5,000 at the cap about 312 MiB, under the watermark. The archive's records are in D1 | within the same watermark |
 | Logs (from 2026-12-01) | 50 GB | monthly stop at 50% | | about 32 invocations a text, sampled at 0.1: under 100 MB | + under 0.2% |
 
 So live text fits the plan: alone its worst month is a tenth of the included

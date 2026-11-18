@@ -315,7 +315,7 @@ function envName(name: string): string {
 }
 
 /** Limits where 0 turns the bound off (docs/configuration.md, History retention); every other limit is positive. */
-const OPTIONAL_LIMITS: ReadonlySet<string> = new Set<keyof Limits>(["retentionRecords", "retentionSeconds"]);
+const OPTIONAL_LIMITS: ReadonlySet<string> = new Set<keyof Limits>(["retentionRecords", "retentionSeconds", "archiveRecords"]);
 
 function limitError(name: string): ConfigError {
 	return new ConfigError(`${name} must be a ${OPTIONAL_LIMITS.has(name) ? "non-negative" : "positive"} safe integer`);
@@ -466,6 +466,7 @@ function validateLimits(limits: Limits): void {
 	}
 	if (limits.retentionRecords === 0 && limits.retentionSeconds === 0) fail("retentionRecords or retentionSeconds must be set");
 	if (limits.retentionRecords > budget.MAX_RETENTION_RECORDS) fail("retentionRecords exceeds the calibrated bound");
+	if (limits.archiveRecords > budget.MAX_ARCHIVE_RECORDS) fail("archiveRecords exceeds the calibrated bound");
 	if (limits.minRetentionSeconds < limits.cleanupSeconds || (limits.retentionSeconds > 0 && limits.retentionSeconds < limits.minRetentionSeconds)) {
 		fail("retention must be at least one cleanup interval, and retentionSeconds at least minRetentionSeconds");
 	}

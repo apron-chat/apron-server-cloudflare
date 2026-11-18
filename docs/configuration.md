@@ -17,8 +17,9 @@ usage pays for, sized against its monthly allowances divided by 31 days with
 headroom. Paid includes 16 times the SQL rows written and 160 times the rows
 read, so the SQL ceilings rise tenfold, and posts, registrations, admissions,
 history pages, and member listings with them. History keeps the latest
-10,000 records instead of 24 hours (see [History retention](#history-retention)),
-with daily cleanup, and uploaded files are kept 90 days to match; the database
+5,000 records in SQLite and 10,000 more in a D1 archive where it is bound,
+instead of 24 hours (see [History retention](#history-retention)),
+with daily cleanup, and uploaded files are kept 120 days to match; the database
 watermarks rise to 768 MiB (1 GiB hard), a fifth of the 5 GB-month included.
 
 Paid includes only a third of Free's Durable Object requests (1 million a
@@ -364,7 +365,7 @@ in `src/plans/paid.ts` sets the limits:
 | `uploadsPerDay` (server-wide, avatars and custom emoji included; counted when a write is claimed) | 500 |
 | `uploadsPerUserDay` (counted when an upload starts) | 30 |
 | `writeWindowSeconds` | 10 minutes |
-| `fileRetentionSeconds` | 90 days |
+| `fileRetentionSeconds` | 120 days |
 | `avatarRetentionSeconds` | 60 days |
 | `avatarRefreshSeconds` | 30 days |
 | `lifecycleLagSeconds` | 1 day |
@@ -375,7 +376,7 @@ are set; set up all of these first:
 
 1. **Bucket.** Create an R2 bucket named `apron-media` (the `MEDIA` binding
    in `wrangler.production.toml`). Deploying fails while it does not exist.
-2. **Lifecycle rules.** On the bucket, delete objects with prefix `f/` 90 days
+2. **Lifecycle rules.** On the bucket, delete objects with prefix `f/` 120 days
    after upload and prefix `a/` 61 days after upload. They must be at least
    `fileRetentionSeconds` and `avatarRetentionSeconds` (a day more leaves
    R2's asynchronous deletes a margin); the server deletes expired objects
@@ -732,29 +733,55 @@ maintenance writes (6 if the object was still in memory). See the
 
 ## History retention
 
-History (the server-wide log) is expired from its oldest end by three limits:
+History (the server-wide log) leaves the object's SQLite, the hot log, from
+its oldest end by three limits, and then, where the archive is bound, stays
+in D1 for a fourth:
 
 | Limit | Workers Paid | Workers Free |
 | --- | ---: | ---: |
-| `retentionRecords`: keep at least the latest this many records | 10000 | 0 (off) |
-| `minRetentionSeconds`: never expire a younger record by count | 3 days | 1 day |
-| `retentionSeconds`: expire an older record whatever the count | 0 (off) | 1 day |
+| `retentionRecords`: the hot log keeps at least the latest this many records | 5000 | 0 (off) |
+| `minRetentionSeconds`: never move a younger record out by count | 3 days | 1 day |
+| `retentionSeconds`: move an older record out whatever the count | 0 (off) | 1 day |
+| `archiveRecords`: the archive keeps the newest this many records that left | 10000 | 0 (off) |
 
-A record expires once it is past the latest `retentionRecords` and at least
-`minRetentionSeconds` old, or once it is older than `retentionSeconds`. Set
+A record leaves the hot log once it is past the latest `retentionRecords` and
+at least `minRetentionSeconds` old, or once it is older than
+`retentionSeconds`. Without the archive it expires then. Set
 `retentionRecords` to 0 for history by age alone, as on Free, or
 `retentionSeconds` to 0 for no age limit, as on Paid; at least one must be
 set. Each cleanup run reads up to `retentionRecords` index entries to find
 where the count ends, so it is at most 50,000.
 
 The count is of log records, not messages: edits, reactions, memberships and
-room changes count too, so 10,000 records are fewer messages. At the demo's
-traffic in November 2026 (about 115 records a day) they spanned about 12
-weeks; a busier stretch keeps less time, a quieter one more. The minimum age
+room changes count too, so 15,000 records are fewer messages. At the demo's
+traffic in November 2026 (about 115 records a day) they spanned about 18
+weeks, 5,000 of them about 6; a busier stretch keeps less time, a quieter one
+more. The minimum age
 keeps a flood from pushing out the last three days before an admin purges
 it; the database watermarks still bound what the flood stores.
 
-Uploaded files expire by age (`fileRetentionSeconds`, 90 days on Paid), since
+**The archive.** With a D1 database bound as `ARCHIVE` (`wrangler.toml`; for
+production, `wrangler d1 create apron-archive` and the commented block in
+`wrangler.production.toml`) and `archiveRecords` above 0, records leaving the
+hot log are copied there first (`src/archive.ts`), in batches of 100 on the
+cleanup job's alarms, a second apart, and removed from SQLite only once
+copied. History serves them as if they had never left: a page that reaches
+below the hot floor reads the rest from D1, so `history_log_id` starts at the
+archive's oldest record. Once copying is caught up, the object finds the
+archive's `archiveRecords`th newest record, publishes that as the history
+floor on the next cleanup, and deletes what is below it from D1, up to 2,500
+records an alarm. Rooms whose whole log is below the published floor go then,
+not when their records leave the hot log. `/purge` and `/rename` reach the
+archived records too, on an alarm a second later. Archived messages are
+history only: like expired ones, they cannot be edited, reacted to or replied
+to. Each cycle reads up to `archiveRecords` D1 index entries, so it is at
+most 100,000; each history page below the hot floor is a D1 query. If D1
+fails, cleanup waits five minutes between tries rather than a second, and
+records stay in the hot log meanwhile; a history page that needs the archive
+answers `retry_after`. Without the binding, or with `archiveRecords` 0,
+records expire as they leave the hot log, and only 5,000 are kept on Paid.
+
+Uploaded files expire by age (`fileRetentionSeconds`, 120 days on Paid), since
 the bucket's lifecycle rules can only expire by age: a message kept longer
 shows without its file. A removed account's `user_id` is retired until history
 has expired past the log position where it was removed (account upkeep,
@@ -769,8 +796,9 @@ uppercase snake case (`LIMIT_MAX_FRAME_BYTES`), plain uppercase snake case
 Wrangler deployments should use the uppercase form; local tests may use
 camelCase. Omitted variables use the defaults. Each value must be a positive
 JavaScript safe integer: `0`, fractions, negative values, and values above
-`Number.MAX_SAFE_INTEGER` fail startup. `retentionRecords` and
-`retentionSeconds` also take `0`, which turns that bound off.
+`Number.MAX_SAFE_INTEGER` fail startup. `retentionRecords`,
+`retentionSeconds` and `archiveRecords` also take `0`, which turns that bound
+off.
 
 Production should use the checked-in budget defaults; retain overrides for local
 tests or deliberate temporary reductions. Overrides do not regenerate the native
@@ -801,7 +829,8 @@ defaults:
   registration, identity, and processed-frame caps are fixed demo ceilings.
   Low, high, and hard storage watermarks must be strictly ordered.
 - At least one of `retentionRecords` and `retentionSeconds` is set;
-  `retentionRecords` is at most 50,000; `minRetentionSeconds` is at least
+  `retentionRecords` is at most 50,000 and `archiveRecords` at most 100,000;
+  `minRetentionSeconds` is at least
   `cleanupSeconds`, and `retentionSeconds`, when set, at least
   `minRetentionSeconds`. `sessionTtlSeconds` is at most 30 days;
   `idleAccountSeconds` is at least a day; `keptActiveAccounts` is at most
@@ -1099,7 +1128,7 @@ deployment that stays awake.
 
 The numeric rows are grouped by their unit and enforcement scope:
 
-- History: `retentionRecords` (a count of records, [above](#history-retention)).
+- History: `retentionRecords` and `archiveRecords` (counts of records, [above](#history-retention)).
 - Durations: `minRetentionSeconds` and `retentionSeconds` ([History
   retention](#history-retention)), `cleanupSeconds`, `challengeTtlSeconds`,
   `sessionTtlSeconds` (a passkey session token's lifetime, renewed on each
@@ -1158,9 +1187,10 @@ The numeric rows are grouped by their unit and enforcement scope:
 
 | Variable | Workers Paid default | Workers Free, where different |
 | --- | ---: | ---: |
-| `retentionRecords` | 10000 | 0 |
+| `retentionRecords` | 5000 | 0 |
 | `minRetentionSeconds` | 259200 | 86400 |
 | `retentionSeconds` | 0 | 86400 |
+| `archiveRecords` | 10000 | 0 |
 | `cleanupSeconds` | 86400 | 3600 |
 | `challengeTtlSeconds` | 120 |  |
 | `sessionTtlSeconds` | 2592000 |  |

@@ -25,6 +25,7 @@ import {
 import { hostListAllowed } from "./config";
 import { keepAppend, keepLast, liveTextString, type LiveKind } from "./live-text";
 import type { AccountUsageSnapshot } from "./account-usage";
+import type { ArchiveOp, ArchiveQuery, ArchiveRow } from "./archive";
 import {
   BudgetLedger,
   MAINTENANCE_CONTROL_READS,
@@ -165,6 +166,13 @@ export interface StoreConfig {
   retentionRecords: number;
   /** Records younger than this never expire by count. */
   minRetentionMs: number;
+  /**
+   * Records past the hot log's limits (above) that the archive (D1) keeps,
+   * newest first, before they expire; 0 keeps none. Only with `archive`.
+   */
+  archiveRecords: number;
+  /** Whether the runtime has the archive (its ARCHIVE binding and `archiveRecords`): records leaving the hot log go there first. */
+  archive: boolean;
   /** Inactivity past which an account is removed (pruneIdleIdentities). */
   idleAccountMs: number;
   /** The most recently active accounts pruneIdleIdentities always keeps. */
@@ -320,6 +328,20 @@ export interface LiveEntry {
 }
 
 /** What a finished live text published, if anything. */
+/**
+ * A history page that reaches below the hot floor (Store.historyWithArchive):
+ * the archived records it needs, and the page they complete.
+ */
+export interface PendingHistory {
+  archive: ArchiveQuery;
+  assemble(rows: readonly ArchiveRow[]): StoreHistoryResult;
+}
+
+/** Whether a history result still needs the archive. */
+export function isPendingHistory(result: StoreHistoryResult | PendingHistory): result is PendingHistory {
+  return "archive" in result && "assemble" in result;
+}
+
 export interface LiveFinish {
   broadcasts: Broadcast[];
   /** The entry that ended, if it was still open. */
@@ -567,6 +589,8 @@ const DEFAULT_CONFIG: StoreConfig = {
   retentionMs: DEFAULT_LIMITS.retentionSeconds * 1000,
   retentionRecords: DEFAULT_LIMITS.retentionRecords,
   minRetentionMs: DEFAULT_LIMITS.minRetentionSeconds * 1000,
+  archiveRecords: DEFAULT_LIMITS.archiveRecords,
+  archive: false,
   idleAccountMs: DEFAULT_LIMITS.idleAccountSeconds * 1000,
   keptActiveAccounts: DEFAULT_LIMITS.keptActiveAccounts,
   dedupTtlMs: DEDUP_TTL_MS,
@@ -848,7 +872,7 @@ interface StoreHistoryQuery {
 }
 
 /** A history page (§4.3): each array is omitted when empty, and the bounds with it. */
-interface StoreHistoryResult {
+export interface StoreHistoryResult {
   rooms?: RoomRecord[];
   messages?: MessageSnapshot[];
   reactions?: ReactionsRecord[];
@@ -1034,6 +1058,19 @@ const META_EFFECTIVE_NOW = "effective_now_ms";
  * see a purged room's rows.
  */
 const META_PURGE_ROOMS = "purge_rooms";
+/**
+ * `_meta` keys of the archive (D1, src/archive.ts): the published floor,
+ * below the hot floor while records between them are archived; the floor
+ * the archive's own limit allows (the runtime finds it in D1), which cleanup
+ * publishes; the newest log ID copied there; and the `/purge` and `/rename`
+ * the archive has yet to apply, in order.
+ */
+const META_ARCHIVE_FLOOR = "archive_floor";
+const META_ARCHIVE_TARGET = "archive_floor_target";
+const META_ARCHIVED_THROUGH = "archived_through";
+const META_ARCHIVE_OPS = "archive_ops";
+/** Records one archive copy carries at most (archiveCandidates). */
+export const ARCHIVE_BATCH = 100;
 /**
  * Reads for checkRoomFieldsTotal(): every row of the capped rooms table,
  * public and private, with slack for index pages.
@@ -2244,6 +2281,8 @@ export class Store {
    * moves it, which keeps them where every record they covered is gone.
    */
   private logCache: RawLogState | null = null;
+  /** The published floor as stored (META_ARCHIVE_FLOOR), 0 for none; read once a wake. */
+  private archiveFloorCache: number | undefined;
   /**
    * The open live texts (META_LIVE_TEXTS) as last read or saved, undefined
    * until read: every change goes through this instance, and a rolled-back
@@ -2885,6 +2924,7 @@ export class Store {
     this.serverCache = null;
     this.initialized = false;
     this.logCache = null;
+    this.archiveFloorCache = undefined;
     this.accountingUncertain = false;
     this.lostOnWake = false;
     this.accountingMarker.load("0");
@@ -2998,6 +3038,7 @@ export class Store {
       context.commitMs,
     );
     this.logCache = null;
+    this.archiveFloorCache = undefined;
   }
 
   private readSchemaVersion(): number {
@@ -3672,7 +3713,7 @@ export class Store {
     this.ensureReady();
     const withPrivate = options.withPrivate === true;
     return this.reserved({ reads: this.roomListingReads() + (withPrivate ? 4 * MAX_PRIVATE_ROOM_LIMIT : 0) }, options.maintenance === true, now, () => {
-      const floor = this.logState().history_floor;
+      const floor = this.publishedFloor();
       // The public range is capped at `general` plus the calibrated thread
       // ceiling, which created top-level rooms count against too, so this
       // ordered scan is bounded by that cap; the private range by its own.
@@ -3694,7 +3735,7 @@ export class Store {
     return this.reserved({ reads: 16 }, false, now, () => {
       const row = this.roomRow(roomId);
       if (!row) return null;
-      return this.roomRecord(row, this.logState().history_floor);
+      return this.roomRecord(row, this.publishedFloor());
     });
   }
 
@@ -3707,7 +3748,7 @@ export class Store {
   privateRoomsOf(userId: string, now = this.clock.now()): RoomRecord[] {
     this.ensureReady();
     return this.reserved({ reads: 16 + 3 * (MAX_USER_ROOMS + MAX_PURGE_ROOMS) }, false, now, () => {
-      const floor = this.logState().history_floor;
+      const floor = this.publishedFloor();
       return this.rawRows<RawRoomRow>(
         `SELECT ${ROOM_COLUMNS.split(", ").map((column) => `r.${column}`).join(", ")}
          FROM memberships m INDEXED BY memberships_user_idx JOIN rooms r ON r.room_id = m.room_id
@@ -3746,8 +3787,107 @@ export class Store {
     this.ensureReady();
     return this.reserved({ reads: 8 }, false, this.clock.now(), () => {
       const state = this.logState();
-      return { latest_log_id: idString(state.last_log_id), history_floor: idString(state.history_floor) };
+      return { latest_log_id: idString(state.last_log_id), history_floor: idString(this.publishedFloor()) };
     });
+  }
+
+  /**
+   * The published history floor F: history starts here (§4.3), rooms whose
+   * whole log is below it are gone, and retired ids are freed past it. It is
+   * the hot floor (log_state.history_floor), below which the object keeps no
+   * record, unless the archive (D1) holds the records between them: then the
+   * lower of the hot floor and META_ARCHIVE_FLOOR, which cleanup raises to
+   * what the archive's own limit allows (runCleanup).
+   */
+  private publishedFloor(): number {
+    const hot = this.logState().history_floor;
+    if (!this.config.archive) return hot;
+    this.archiveFloorCache ??= this.metaNumber(META_ARCHIVE_FLOOR);
+    return this.archiveFloorCache > 0 ? Math.min(this.archiveFloorCache, hot) : hot;
+  }
+
+  /** The hot floor and the published floor (publishedFloor), for the runtime's archive upkeep. */
+  archiveBounds(now = this.clock.now()): { hot: number; published: number } {
+    this.ensureReady();
+    return this.reserved({ reads: 8 }, true, now, () => ({ hot: this.logState().history_floor, published: this.publishedFloor() }));
+  }
+
+  /**
+   * The next records to copy to the archive before cleanup removes them from
+   * the hot log: those of the running cleanup job's prefix (its pinned
+   * cutoff) from past the last copy on, at most ARCHIVE_BATCH, ending at a
+   * whole log ID (a move's record is a row in each of its rooms); `through`
+   * is the newest log ID copied once they are, for noteArchived; `more` that
+   * a full batch may have left more. Nothing without the archive or a job.
+   */
+  archiveCandidates(now = this.clock.now()): { rows: Array<{ room_id: string; log_id: number; commit_ms: number; kind: string; record_json: string }>; through: number; more: boolean } {
+    this.ensureReady();
+    const none = { rows: [], through: 0, more: false };
+    if (!this.config.archive) return none;
+    return this.reserved({ reads: 24 + 2 * ARCHIVE_BATCH }, true, now, () => {
+      const maintenance = this.maintenanceRow();
+      if (maintenance.cleanup_cursor === null || maintenance.cleanup_cutoff_ms === null) return none;
+      const cutoff = maintenance.cleanup_cutoff_ms;
+      const start = Math.max(this.logState().history_floor, this.metaNumber(META_ARCHIVED_THROUGH) + 1);
+      const rows = this.rawRows<{ room_id: string; log_id: number; commit_ms: number; kind: string; record_json: string }>(
+        `SELECT room_id, log_id, commit_ms, kind, record_json FROM records INDEXED BY records_log_idx
+         WHERE log_id >= ? ORDER BY log_id LIMIT ?`, start, ARCHIVE_BATCH,
+      ).map((row) => ({ ...row, log_id: integerColumn(row.log_id), commit_ms: integerColumn(row.commit_ms) }));
+      const fresh = rows.findIndex((row) => row.commit_ms >= cutoff);
+      let copy = fresh === -1 ? rows : rows.slice(0, fresh);
+      if (!copy.length) return none;
+      const more = fresh === -1 && rows.length === ARCHIVE_BATCH;
+      let through = copy[copy.length - 1].log_id;
+      // A full batch may have cut the last log ID's rows short: it goes next time.
+      if (more && copy[0].log_id !== through) {
+        through -= 1;
+        copy = copy.filter((row) => row.log_id <= through);
+      }
+      return { rows: copy, through, more };
+    });
+  }
+
+  /** Notes that the archive holds every record through `through` (archiveCandidates), so cleanup may remove them. */
+  noteArchived(through: number, now = this.clock.now()): void {
+    this.ensureReady();
+    this.reserved({ reads: 4, writes: 4 }, true, now, () => {
+      if (through > this.metaNumber(META_ARCHIVED_THROUGH)) this.writeMeta(META_ARCHIVED_THROUGH, String(through));
+    });
+  }
+
+  /** The floor the archive's own limit allows (Archive.floor), for the next cleanup to publish (runCleanup). */
+  setArchiveTarget(floor: number, now = this.clock.now()): void {
+    this.ensureReady();
+    this.reserved({ reads: 4, writes: 4 }, true, now, () => {
+      if (floor > this.metaNumber(META_ARCHIVE_TARGET)) {
+        this.writeMeta(META_ARCHIVE_TARGET, String(floor));
+        this.cleanupDueCache = undefined;
+        this.rawExec("UPDATE maintenance SET next_cleanup_ms = MIN(next_cleanup_ms, ?) WHERE id = 1", this.effectiveNow(now));
+      }
+    });
+  }
+
+  /** The `/purge` and `/rename` the archive has yet to apply, oldest first (Archive.apply). */
+  archiveOps(now = this.clock.now()): ArchiveOp[] {
+    this.ensureReady();
+    if (!this.config.archive) return [];
+    return this.reserved({ reads: 4 }, true, now, () => this.metaJson(META_ARCHIVE_OPS, (value) => Array.isArray(value) ? value as ArchiveOp[] : undefined, []));
+  }
+
+  /** Forgets the oldest of archiveOps, once the archive applied it. */
+  dropArchiveOp(now = this.clock.now()): void {
+    this.ensureReady();
+    this.reserved({ reads: 4, writes: 4 }, true, now, () => {
+      const ops = this.metaJson(META_ARCHIVE_OPS, (value) => Array.isArray(value) ? value as ArchiveOp[] : undefined, []).slice(1);
+      this.writeMeta(META_ARCHIVE_OPS, ops.length ? JSON.stringify(ops) : null);
+    });
+  }
+
+  /** Queues what a `/purge` or `/rename` did to the hot log for the archive (archiveOps), within the operation's transaction. */
+  private queueArchiveOp(op: ArchiveOp): void {
+    if (!this.config.archive) return;
+    const ops = this.metaJson(META_ARCHIVE_OPS, (value) => Array.isArray(value) ? value as ArchiveOp[] : undefined, []);
+    this.writeMeta(META_ARCHIVE_OPS, JSON.stringify([...ops, op]));
   }
 
   private identityRow(userId: string): RawIdentityRow | null {
@@ -3876,6 +4016,7 @@ export class Store {
           this.rewriteRecord(row, JSON.stringify({ ...membership, members: membership.members.map((member) => ({ ...member, user: renamed(member.user) })) }));
         }
       }
+      this.queueArchiveOp({ op: "rename", from, to });
       // A message's current snapshot is its latest record, renamed above.
       for (const row of found.messages) this.rawExec("UPDATE message_state SET author_id = ? WHERE message_id = ?", to, row.message_id);
       for (const row of found.reactions) {
@@ -4014,6 +4155,8 @@ export class Store {
       this.rawExec(`DELETE FROM reaction_state WHERE user_id IN (${marks})`, ...ids);
       if (messages.length) this.rawExec(`DELETE FROM reaction_state WHERE message_id IN (${messageMarks})`, ...messages);
       this.rawExec(`DELETE FROM message_state WHERE author_id IN (${marks})`, ...ids);
+      // The archive does the same to what it holds (Archive.apply).
+      this.queueArchiveOp({ op: "purge", userIds: ids, messageIds: messages });
       const uploads = this.rawRows<RawUploadRow>(
         `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
          FROM uploads INDEXED BY uploads_owner_idx WHERE owner_id IN (${marks})`,
@@ -4229,7 +4372,9 @@ export class Store {
         "SELECT key FROM _meta WHERE key >= ? AND key < ? AND CAST(value AS INTEGER) <= 1 LIMIT ?", META_PURGED_PREFIX, end, RETIRED_SWEEP_BATCH,
       );
       for (const row of legacy) this.rawExec("UPDATE _meta SET value = ? WHERE key = ?", String(state.last_log_id), row.key);
-      const below = state.history_floor > state.last_log_id ? Number.MAX_SAFE_INTEGER : state.history_floor - RETIRED_MARKER_MARGIN;
+      // The published floor: archived records may still name them.
+      const floor = this.publishedFloor();
+      const below = floor > state.last_log_id ? Number.MAX_SAFE_INTEGER : floor - RETIRED_MARKER_MARGIN;
       return this.rawRows<{ key: string }>(
         "SELECT key FROM _meta WHERE key >= ? AND key < ? AND CAST(value AS INTEGER) > 1 AND CAST(value AS INTEGER) < ? ORDER BY CAST(value AS INTEGER) LIMIT ?",
         META_PURGED_PREFIX, end, below, RETIRED_SWEEP_BATCH,
@@ -5478,7 +5623,7 @@ export class Store {
         const membership = this.logMembership(context, input.roomId, recordedUser(input.userId, identity.name), input.join);
         this.finishCommit(context, startLogId);
         const updated = { ...room, latest_log_id: Math.max(room.latest_log_id, context.state.last_log_id) };
-        const record = this.roomRecord(updated, state.history_floor);
+        const record = this.roomRecord(updated, this.publishedFloor());
         const rooms = this.userRooms(input.userId);
         this.assertStorageTarget();
         this.assertReservation(reserved, beforeReads, beforeWrites);
@@ -7978,7 +8123,8 @@ export class Store {
           const context: CommitContext = { state, commitMs: Math.max(effective, state.last_commit_ms), touched: new Map() };
           const floor = state.history_floor;
           committed = method === "message" ? this.commitMessage(input, context, floor)
-            : method === "room_set" ? this.commitRoom(input, context, floor, tier === "registered")
+            // A room exists, and is counted, until its records leave the archive too.
+            : method === "room_set" ? this.commitRoom(input, context, this.publishedFloor(), tier === "registered")
             : this.commitReactions(input, context, floor);
           // Within the transaction: a move its sender cannot pay for is refused whole.
           if (context.extraPosts && !input.system) this.chargePosting({ userId: input.userId, tier, ipKey: input.ipKey, now: effective, weight: context.extraPosts });
@@ -8007,6 +8153,20 @@ export class Store {
    * cannot use up everyone's history for the day.
    */
   history(query: StoreHistoryQuery): StoreHistoryResult {
+    return this.historyImpl(query, false) as StoreHistoryResult;
+  }
+
+  /**
+   * history, for a runtime with the archive: a page that reaches below the
+   * hot floor is a PendingHistory, which the runtime completes with the
+   * archived records it asks for (Archive.page). Charged and checked as
+   * history is, before the archive is read.
+   */
+  historyWithArchive(query: StoreHistoryQuery): StoreHistoryResult | PendingHistory {
+    return this.historyImpl(query, true);
+  }
+
+  private historyImpl(query: StoreHistoryQuery, allowArchive: boolean): StoreHistoryResult | PendingHistory {
     this.ensureReady();
     const operationNow = query.now ?? this.clock.now();
     const charged = Boolean(query.userId && query.ipKey);
@@ -8068,7 +8228,7 @@ export class Store {
               return undefined;
             }
           }
-          return this.historyPageInternal({ ...query, now });
+          return this.historyPageInternal({ ...query, now }, allowArchive);
         });
         if (measuredRefusal) throw measuredRefusal;
         return page!;
@@ -8090,7 +8250,7 @@ export class Store {
       writes: Math.max(32, this.config.historyCost.writes ?? 0),
     }, false, operationNow, () => {
       const now = this.effectiveNow(operationNow);
-      return this.transaction(() => this.historyPageInternal({ ...query, now }));
+      return this.transaction(() => this.historyPageInternal({ ...query, now }) as StoreHistoryResult);
     });
   }
 
@@ -8152,10 +8312,13 @@ export class Store {
     return numericId(typeof value === "bigint" ? numericBigInt(value, field) : value, field);
   }
 
-  private historyPageInternal(query: StoreHistoryQuery): StoreHistoryResult {
+  private historyPageInternal(query: StoreHistoryQuery, allowArchive = false): StoreHistoryResult | PendingHistory {
     const { multiple, sources } = this.historySources(query);
     if (!multiple && !sources.length) throw new StoreError("invalid_params", "unknown room");
-    const floor = this.logState().history_floor;
+    // History starts at the published floor; the hot log holds records from
+    // the hot floor on, and the archive those between them.
+    const floor = this.publishedFloor();
+    const hot = this.logState().history_floor;
     const after = this.historyBound(query.after, "after");
     const before = this.historyBound(query.before, "before");
     const limit = positiveLimit(query.limit, this.config.historyDefaultLimit, this.config.maxHistoryLimit);
@@ -8194,21 +8357,25 @@ export class Store {
       const window = windows.get(row.room_id);
       if (window && row.log_id >= window.lower && row.log_id <= window.upper && !byLogId.has(row.log_id)) byLogId.set(row.log_id, row);
     };
+    // The hot log's part of each window.
+    const hotWindows = new Map([...windows].filter(([, window]) => window.upper >= hot).map(([roomId, window]) => [roomId, { lower: Math.max(window.lower, hot), upper: window.upper }]));
     const roomSlice = (roomId: string, window: { lower: number; upper: number }) => this.rawRows<RawRecordRow>(
       `SELECT room_id, log_id, kind, record_json FROM records
        WHERE room_id = ? AND log_id >= ? AND log_id <= ?
        ORDER BY log_id ${forward ? "ASC" : "DESC"} LIMIT ?`,
       roomId, window.lower, window.upper, limit + 1,
     );
-    if (!multiple || windows.size <= 1) {
-      for (const [roomId, window] of windows) for (const row of roomSlice(roomId, window)) take(row);
+    if (!hotWindows.size) {
+      // Nothing of the window is in the hot log.
+    } else if (!multiple || hotWindows.size <= 1) {
+      for (const [roomId, window] of hotWindows) for (const row of roomSlice(roomId, window)) take(row);
     } else {
       // Several rooms: first the log itself, by log_id across every room, at
       // most HISTORY_SCAN_PAGES pages of it. That is the cheapest read when
       // these rooms hold most of the log; when they hold little of it, each
       // room's slice is read instead, a page and one more at most.
-      const lower = Math.min(...[...windows.values()].map((window) => window.lower));
-      const upper = Math.max(...[...windows.values()].map((window) => window.upper));
+      const lower = Math.min(...[...hotWindows.values()].map((window) => window.lower));
+      const upper = Math.max(...[...hotWindows.values()].map((window) => window.upper));
       const scanned = this.rawRows<RawRecordRow>(
         `SELECT room_id, log_id, kind, record_json FROM records INDEXED BY records_log_idx
          WHERE log_id >= ? AND log_id <= ?
@@ -8218,65 +8385,84 @@ export class Store {
       for (const row of scanned) take(row);
       if (byLogId.size <= limit && scanned.length === HISTORY_SCAN_PAGES * (limit + 1)) {
         byLogId.clear();
-        for (const [roomId, window] of windows) for (const row of roomSlice(roomId, window)) take(row);
+        for (const [roomId, window] of hotWindows) for (const row of roomSlice(roomId, window)) take(row);
       }
     }
-    const rows = [...byLogId.values()].sort(order).slice(0, limit + 1);
-    if (rows.length === 0) return empty();
-    const roomFields = new Map(sources.map((room) => [room.room_id, { latest_log_id: idString(room.latest_log_id), history_log_id: roomHistoryLogId(room, floor) }]));
-    // The runtime wraps this result in a reply.  Reserve a fixed
-    // envelope allowance for id/result keys, decimal IDs, commas and
-    // first/last/more fields.  An empty page is always valid even when a
-    // caller supplies a tiny maxBytes value, so apply this allowance only
-    // while considering a non-empty entry.
-    // A 128-byte request ID can require 768 JSON bytes when escaped.
-    const responseOverhead = 1024;
-    let bytes = utf8Bytes(JSON.stringify({
-      rooms: [], messages: [], reactions: [], memberships: [], first_log_id: latestLogId, last_log_id: latestLogId,
-      more: false, latest_log_id: latestLogId, history_log_id: historyLogId,
-    }));
-    let stoppedForBytes = false;
-    const selected: Array<{ logId: number; kind: string; value: Record<string, unknown> }> = [];
-    for (const row of rows.slice(0, limit + 1)) {
-      const value = parseJson<Record<string, unknown>>(row.record_json);
-      // Room records carry this client's delivery fields, as `room_list` and `room_update` records do.
-      if (row.kind === "room") Object.assign(value, roomFields.get(row.room_id));
-      // A stored terminal's output is put back before the page is sent.
-      const entryBytes = utf8Bytes(JSON.stringify(value)) + terminalOutputBytes(value);
-      if (entryBytes + bytes + responseOverhead + 1 > maxBytes) {
-        if (selected.length === 0) throw new StoreError("too_large", "history record exceeds response budget");
-        stoppedForBytes = true;
-        break;
+    // The archive's part: below the hot floor. A forward page starts there;
+    // a backward one reaches it when the hot log has less than a page.
+    const archived = [...windows].filter(([, window]) => window.lower < hot);
+    if (allowArchive && this.config.archive && archived.length && (forward || byLogId.size <= limit)) {
+      const archive: ArchiveQuery = {
+        roomIds: archived.map(([roomId]) => roomId),
+        lower: Math.min(...archived.map(([, window]) => window.lower)),
+        upper: Math.min(hot - 1, Math.max(...archived.map(([, window]) => window.upper))),
+        forward,
+        limit: limit + 1,
+      };
+      return { archive, assemble: (archivedRows) => {
+        for (const row of archivedRows) take(row);
+        return assemble();
+      } };
+    }
+    return assemble();
+    function assemble(): StoreHistoryResult {
+      const rows = [...byLogId.values()].sort(order).slice(0, limit + 1);
+      if (rows.length === 0) return empty();
+      const roomFields = new Map(sources.map((room) => [room.room_id, { latest_log_id: idString(room.latest_log_id), history_log_id: roomHistoryLogId(room, floor) }]));
+      // The runtime wraps this result in a reply.  Reserve a fixed
+      // envelope allowance for id/result keys, decimal IDs, commas and
+      // first/last/more fields.  An empty page is always valid even when a
+      // caller supplies a tiny maxBytes value, so apply this allowance only
+      // while considering a non-empty entry.
+      // A 128-byte request ID can require 768 JSON bytes when escaped.
+      const responseOverhead = 1024;
+      let bytes = utf8Bytes(JSON.stringify({
+        rooms: [], messages: [], reactions: [], memberships: [], first_log_id: latestLogId, last_log_id: latestLogId,
+        more: false, latest_log_id: latestLogId, history_log_id: historyLogId,
+      }));
+      let stoppedForBytes = false;
+      const selected: Array<{ logId: number; kind: string; value: Record<string, unknown> }> = [];
+      for (const row of rows.slice(0, limit + 1)) {
+        const value = parseJson<Record<string, unknown>>(row.record_json);
+        // Room records carry this client's delivery fields, as `room_list` and `room_update` records do.
+        if (row.kind === "room") Object.assign(value, roomFields.get(row.room_id));
+        // A stored terminal's output is put back before the page is sent.
+        const entryBytes = utf8Bytes(JSON.stringify(value)) + terminalOutputBytes(value);
+        if (entryBytes + bytes + responseOverhead + 1 > maxBytes) {
+          if (selected.length === 0) throw new StoreError("too_large", "history record exceeds response budget");
+          stoppedForBytes = true;
+          break;
+        }
+        selected.push({ logId: row.log_id, kind: row.kind, value });
+        bytes += entryBytes + 1;
+        if (selected.length >= limit) break;
       }
-      selected.push({ logId: row.log_id, kind: row.kind, value });
-      bytes += entryBytes + 1;
-      if (selected.length >= limit) break;
+      const more = stoppedForBytes || rows.length > selected.length;
+      if (!forward) selected.reverse();
+      if (!selected.length) return empty();
+      const rooms: RoomRecord[] = [];
+      const messages: MessageSnapshot[] = [];
+      const reactions: ReactionsRecord[] = [];
+      const membership: MembershipRecord[] = [];
+      for (const record of selected) {
+        if (record.kind === "room") rooms.push(record.value as unknown as RoomRecord);
+        else if (record.kind === "reactions") reactions.push(record.value as unknown as ReactionsRecord);
+        else if (record.kind === "membership") membership.push(record.value as unknown as MembershipRecord);
+        else messages.push(record.value as unknown as MessageSnapshot);
+      }
+      // Records keep the user objects they were logged with; history carries no `users` (§3.3).
+      return {
+        ...(rooms.length ? { rooms } : {}),
+        ...(messages.length ? { messages } : {}),
+        ...(reactions.length ? { reactions } : {}),
+        ...(membership.length ? { memberships: membership } : {}),
+        first_log_id: idString(selected[0].logId),
+        last_log_id: idString(selected[selected.length - 1].logId),
+        more,
+        latest_log_id: latestLogId,
+        history_log_id: historyLogId,
+      };
     }
-    const more = stoppedForBytes || rows.length > selected.length;
-    if (!forward) selected.reverse();
-    if (!selected.length) return empty();
-    const rooms: RoomRecord[] = [];
-    const messages: MessageSnapshot[] = [];
-    const reactions: ReactionsRecord[] = [];
-    const membership: MembershipRecord[] = [];
-    for (const record of selected) {
-      if (record.kind === "room") rooms.push(record.value as unknown as RoomRecord);
-      else if (record.kind === "reactions") reactions.push(record.value as unknown as ReactionsRecord);
-      else if (record.kind === "membership") membership.push(record.value as unknown as MembershipRecord);
-      else messages.push(record.value as unknown as MessageSnapshot);
-    }
-    // Records keep the user objects they were logged with; history carries no `users` (§3.3).
-    return {
-      ...(rooms.length ? { rooms } : {}),
-      ...(messages.length ? { messages } : {}),
-      ...(reactions.length ? { reactions } : {}),
-      ...(membership.length ? { memberships: membership } : {}),
-      first_log_id: idString(selected[0].logId),
-      last_log_id: idString(selected[selected.length - 1].logId),
-      more,
-      latest_log_id: latestLogId,
-      history_log_id: historyLogId,
-    };
   }
 
   /** The withheld control rows can persist one deferral and its reset alarm. */
@@ -8301,6 +8487,8 @@ export class Store {
    */
   private cleanupHasWork(floor: number, cutoff: number, effective: number, limiterCutoff: number): boolean {
     return roomIdList(this.metaValue(META_PURGE_ROOMS)).length > 0 ||
+      // The archive's limit allows a higher published floor than cleanup published.
+      (this.config.archive && this.metaNumber(META_ARCHIVE_TARGET) > this.publishedFloor()) ||
       this.rawRows("SELECT log_id FROM records INDEXED BY records_log_idx WHERE log_id < ? ORDER BY log_id LIMIT 1", floor).length > 0 ||
       // Commit times are nondecreasing in log order, so the oldest record from the floor on says whether any expired.
       this.rawRows<{ commit_ms: number }>("SELECT commit_ms FROM records INDEXED BY records_log_idx WHERE log_id >= ? ORDER BY log_id LIMIT 1", floor)
@@ -8379,18 +8567,27 @@ export class Store {
     return this.config.retentionRecords > 0 ? this.config.retentionRecords + 4 : 0;
   }
 
-  runCleanup(now = this.clock.now()): StoreCleanupResult {
+  /**
+   * With the archive (`archive`), records leave the hot log only once it
+   * holds them (archiveCandidates, noteArchived): the hot floor stops at the
+   * last copied, and the job waits `archiveWaitMs` (a second by default; the
+   * runtime lengthens it while D1 fails) for the next copy. The published
+   * floor (publishedFloor) rises to the archive's target (setArchiveTarget),
+   * never past the hot floor, and rooms go when their whole log is below it.
+   */
+  runCleanup(now = this.clock.now(), options: { archiveWaitMs?: number } = {}): StoreCleanupResult {
     this.ensureReady();
     // An alarm may have fired, and cleanup may establish an earlier continuation.
     this.scheduledAlarmAt = undefined;
     // A challenge deadline is not an hourly cleanup. Its cheap due check must
     // not consume the reservation for a complete deletion batch.
-    let gate: { maintenance: RawMaintenanceRow; state: RawLogState; effective: number; cutoff?: number };
+    let gate: { maintenance: RawMaintenanceRow; state: RawLogState; effective: number; published: number; cutoff?: number };
     try {
-      gate = this.reserved({ reads: 18 + this.retentionCountReads(), writes: 2 }, true, now, () => {
+      gate = this.reserved({ reads: 24 + this.retentionCountReads(), writes: 2 }, true, now, () => {
         const maintenance = this.maintenanceRow();
         const state = this.logState();
         const effective = this.effectiveNow(now);
+        const published = this.publishedFloor();
         // A non-null cursor marks a job whose last batch reported more work
         // (including expired thread rooms, which the cheap probes below do not
         // cover). Continue it rather than letting the idle check end it.
@@ -8403,9 +8600,9 @@ export class Store {
             this.rawExec("UPDATE maintenance SET next_cleanup_ms = ?, cleanup_cutoff_ms = NULL, cleanup_cursor = NULL WHERE id = 1", maintenance.next_cleanup_ms);
             this.cleanupDueCache = undefined;
           }
-          return { maintenance, state, effective, cutoff };
+          return { maintenance, state, effective, published, cutoff };
         }
-        return { maintenance, state, effective };
+        return { maintenance, state, effective, published };
       });
     } catch (error) {
       if (error instanceof StoreError && error.code === "retry_after") this.deferCleanup(Math.max(now, this.lastEffectiveMs));
@@ -8413,9 +8610,10 @@ export class Store {
     }
     const { maintenance, state, effective } = gate;
     const previousFloor = state.history_floor;
+    const previousPublished = gate.published;
     const due = Math.max(maintenance.next_cleanup_ms, this.deferredCleanupUntil);
     const empty = (nextDue: number): StoreCleanupResult => ({
-      history_floor: idString(previousFloor), previous_floor: idString(previousFloor), latest_id: idString(state.last_log_id),
+      history_floor: idString(previousPublished), previous_floor: idString(previousPublished), latest_id: idString(state.last_log_id),
       deleted_records: 0, deleted_messages: 0, deleted_reactions: 0, deleted_memberships: 0, deleted_requests: 0, deleted_limiters: 0,
       removed_rooms: [], next_due_ms: nextDue, did_work: false,
     });
@@ -8438,6 +8636,9 @@ export class Store {
       ? maintenance.cleanup_cutoff_ms : gate.cutoff ?? this.retentionCutoff(effective);
     const batch = Math.min(100, this.config.cleanupBatch);
     let floor = previousFloor;
+    let published = previousPublished;
+    // With the archive, records leave the hot log only once it holds them.
+    let ceiling = Number.MAX_SAFE_INTEGER;
     // Commit the server-wide coverage boundary/job before physical deletion.
     // A failed deletion leaves logically expired rows hidden and an
     // idempotent job. Commit times are nondecreasing in log order, so the
@@ -8451,9 +8652,17 @@ export class Store {
         `SELECT log_id, commit_ms FROM records INDEXED BY records_log_idx
          WHERE log_id >= ? ORDER BY log_id LIMIT ?`, floor, batch,
       );
-      const fresh = oldest.findIndex((row) => integerColumn(row.commit_ms) >= cutoff);
+      if (this.config.archive) ceiling = this.metaNumber(META_ARCHIVED_THROUGH);
+      const fresh = oldest.findIndex((row) => integerColumn(row.commit_ms) >= cutoff || row.log_id > ceiling);
       const expired = fresh === -1 ? oldest : oldest.slice(0, fresh);
       if (expired.length) floor = Math.max(floor, expired[expired.length - 1].log_id + 1);
+      if (this.config.archive) {
+        // The archive holds what is between the published floor and the hot
+        // one, until its own limit lets the published floor rise.
+        published = Math.min(Math.max(previousPublished, this.metaNumber(META_ARCHIVE_TARGET)), floor);
+        if (published !== this.metaNumber(META_ARCHIVE_FLOOR)) this.writeMeta(META_ARCHIVE_FLOOR, String(published));
+        this.archiveFloorCache = published;
+      } else published = floor;
       const head = this.writeLogHead(floor);
       this.rawExec("UPDATE maintenance SET cleanup_cutoff_ms = ?, cleanup_cursor = ?, next_cleanup_ms = ? WHERE id = 1", cutoff, floor, effective + 1000);
       this.cleanupDueCache = undefined;
@@ -8504,16 +8713,17 @@ export class Store {
       // capped, bounding these scans. Its registered members' rows are purged
       // below, in batches; until then the join with `rooms` hides them.
       let purge = roomIdList(this.metaValue(META_PURGE_ROOMS));
+      // Below the published floor: a room's archived records keep it.
       const threads = remaining > 0 && purge.length < MAX_PURGE_ROOMS ? this.rawRows<{ room_id: string }>(
-        `SELECT room_id FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IS NOT NULL AND latest_log_id < ? ORDER BY created_log_id LIMIT ?`, floor, Math.min(remaining, MAX_PURGE_ROOMS - purge.length),
+        `SELECT room_id FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IS NOT NULL AND latest_log_id < ? ORDER BY created_log_id LIMIT ?`, published, Math.min(remaining, MAX_PURGE_ROOMS - purge.length),
       ) : [];
       const roomCapacity = Math.min(remaining - threads.length, MAX_PURGE_ROOMS - purge.length - threads.length);
       // In key order, which is creation order: the IDs carry log IDs of one length.
       const privates = roomCapacity > 0 ? this.rawRows<{ room_id: string }>(
-        `SELECT room_id FROM rooms WHERE ${PRIVATE_ROOMS} AND latest_log_id < ? ORDER BY room_id LIMIT ?`, floor, roomCapacity,
+        `SELECT room_id FROM rooms WHERE ${PRIVATE_ROOMS} AND latest_log_id < ? ORDER BY room_id LIMIT ?`, published, roomCapacity,
       ) : [];
       const rooms = [...threads, ...privates];
-      for (const row of rooms) this.rawExec("DELETE FROM rooms WHERE room_id = ? AND latest_log_id < ?", row.room_id, floor);
+      for (const row of rooms) this.rawExec("DELETE FROM rooms WHERE room_id = ? AND latest_log_id < ?", row.room_id, published);
       if (threads.length) this.adjustCount("thread_count", -threads.length);
       if (privates.length) this.adjustCount("private_count", -privates.length);
       remaining -= rooms.length;
@@ -8571,15 +8781,20 @@ export class Store {
       ) : [];
       for (const row of wakes) this.rawExec("DELETE FROM push_wakes WHERE user_id = ? AND room_id = ?", row.user_id, row.room_id);
       const hasMore = this.cleanupHasWork(floor, cutoff, effective, limiterCutoff) ||
-        this.rawRows(`SELECT room_id FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IS NOT NULL AND latest_log_id < ? LIMIT 1`, floor).length > 0 ||
-        this.rawRows(`SELECT room_id FROM rooms WHERE ${PRIVATE_ROOMS} AND latest_log_id < ? LIMIT 1`, floor).length > 0;
-      const nextDue = effective + (hasMore ? 1000 : this.config.cleanupIntervalMs);
+        this.rawRows(`SELECT room_id FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IS NOT NULL AND latest_log_id < ? LIMIT 1`, published).length > 0 ||
+        this.rawRows(`SELECT room_id FROM rooms WHERE ${PRIVATE_ROOMS} AND latest_log_id < ? LIMIT 1`, published).length > 0;
+      // Waiting for the archive to copy the next expired records: no sooner
+      // than the runtime can (archiveWaitMs).
+      const waiting = hasMore && this.config.archive && this.rawRows<{ log_id: number; commit_ms: number }>(
+        "SELECT log_id, commit_ms FROM records INDEXED BY records_log_idx WHERE log_id >= ? ORDER BY log_id LIMIT 1", floor,
+      ).some((row) => integerColumn(row.commit_ms) < cutoff && row.log_id > this.metaNumber(META_ARCHIVED_THROUGH));
+      const nextDue = effective + (!hasMore ? this.config.cleanupIntervalMs : waiting ? Math.max(1000, options.archiveWaitMs ?? 1000) : 1000);
       this.rawExec("UPDATE maintenance SET next_cleanup_ms = ?, cleanup_cutoff_ms = ?, cleanup_cursor = ? WHERE id = 1", nextDue, hasMore ? cutoff : null, hasMore ? floor : null);
       this.cleanupDueCache = undefined;
       this.assertReservation(reserved, beforeReads, beforeWrites);
       const deleted = records.length + messages + reactions + rooms.length + memberships + requests.length + limiters.length + subscriptions.length + wakes.length;
       return {
-        history_floor: idString(floor), previous_floor: idString(previousFloor), latest_id: idString(state.last_log_id),
+        history_floor: idString(published), previous_floor: idString(previousPublished), latest_id: idString(state.last_log_id),
         deleted_records: records.length, deleted_messages: messages, deleted_reactions: reactions,
         deleted_memberships: memberships, deleted_requests: requests.length, deleted_limiters: deletedLimiters,
         removed_rooms: rooms.map((row) => row.room_id),

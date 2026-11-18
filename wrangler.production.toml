@@ -77,8 +77,17 @@ VAPID_SUBJECT = "https://server.apron.chat"
 # src/config.ts DEFAULT_PUSH_HOSTS), and push.stupidtech.net added to them.
 PUSH_HOSTS_EXTRA = "push.stupidtech.net"
 
+# The history archive (src/archive.ts, docs/configuration.md, History
+# retention): records past the hot log's retentionRecords, kept for
+# archiveRecords more. Without it they expire at once. Create the database
+# (`wrangler d1 create apron-archive`) and put its id here to turn it on:
+# [[d1_databases]]
+# binding = "ARCHIVE"
+# database_name = "apron-archive"
+# database_id = "<id from wrangler d1 create>"
+
 # Uploaded images (src/budget.ts). The bucket needs lifecycle rules deleting
-# f/ after 30 days and a/ after 61 or more (none for e/, custom emoji), a custom domain
+# f/ after 120 days and a/ after 61 or more (none for e/, custom emoji), a custom domain
 # for MEDIA_ORIGIN, and a CORS policy allowing GET from any origin for the
 # custom emoji catalog (docs/configuration.md, Uploads).
 [[r2_buckets]]

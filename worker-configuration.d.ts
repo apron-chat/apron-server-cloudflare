@@ -18,6 +18,8 @@ declare global {
 		ZONE_ID?: string;
 		EDGE_STOP_TOKEN?: string;
 		MEDIA?: R2Bucket;
+		/** The history archive (src/archive.ts); without it, records past the hot log's limits expire at once. */
+		ARCHIVE?: D1Database;
 		MEDIA_ORIGIN?: string;
 		MEDIA_NOSNIFF?: string;
 		PUBLIC_ORIGIN?: string;
@@ -69,6 +71,7 @@ declare global {
 			ZONE_ID?: string;
 			EDGE_STOP_TOKEN?: string;
 			MEDIA?: R2Bucket;
+			ARCHIVE?: D1Database;
 			MEDIA_ORIGIN?: string;
 			MEDIA_NOSNIFF?: string;
 			PUBLIC_ORIGIN?: string;

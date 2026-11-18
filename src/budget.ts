@@ -14,6 +14,13 @@ export interface Limits {
 	/** Records younger than this never expire by count (`retentionRecords`): a flood cannot push out the last few days. */
 	minRetentionSeconds: number;
 	/**
+	 * Records past the limits above that the history archive (D1, binding
+	 * ARCHIVE) keeps, newest first, before they expire: they leave the
+	 * object's SQLite, the hot log, but history still serves them. 0, or no
+	 * binding, keeps none: records past the limits expire at once.
+	 */
+	archiveRecords: number;
+	/**
 	 * A record older than this expires whatever the count. 0 sets no age
 	 * limit; at least one of it and `retentionRecords` is set.
 	 */
@@ -579,6 +586,9 @@ export const MAX_CLEANUP_BATCH = 100;
 // ends; past it, history would also outgrow the log scans /rename and /purge
 // budget for (store.ts, RETAINED_SCAN_CAP).
 export const MAX_RETENTION_RECORDS = 50_000;
+// Each archive cycle reads this many D1 index entries to find where the
+// archive's own count ends (Archive.floor).
+export const MAX_ARCHIVE_RECORDS = 100_000;
 export const MAX_THREAD_LIMIT = 100;
 // A room's client fields must fit one frame (validateLimits). What rooms hold
 // past roomMetadataMinLimit is bounded together by at most one history

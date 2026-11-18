@@ -271,3 +271,58 @@ it("expires records past retentionSeconds whatever the count", async () => {
 		expect(messagesOf(store.historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value }))).toEqual([]);
 	});
 });
+
+it("with the archive, removes records from the hot log only once copied, and publishes the floor the archive's limit allows", async () => {
+	const archived: Partial<StoreConfig> = {
+		archive: true, retentionRecords: 3, minRetentionMs: DAY_MS, retentionMs: 0, archiveRecords: 4,
+		anonymousPostsPerMinute: 1_000, ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000,
+	};
+	await withStore("archive-floors", archived, (store, clock, state) => {
+		const general = BigInt(store.getRoomState().log_id);
+		const logs = Array.from({ length: 8 }, (_, index) => {
+			clock.value += 1_000;
+			return oneLog(store.mutate(messageInput(clock, `archive-${index}`, `message ${index}`)));
+		});
+		const hotRecords = () => Number(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM records").one().count);
+		const due = () => state.storage.sql.exec("UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1") && store.forgetCleanupDue();
+		clock.value += 2 * DAY_MS;
+
+		// Past the hot log's count, but nothing copied yet: nothing leaves it, and the job waits.
+		expect(store.archiveCandidates(clock.value).rows).toEqual([]);
+		const waiting = store.runCleanup(clock.value);
+		expect(waiting.deleted_records).toBe(0);
+		expect(waiting.next_due_ms).toBe(clock.value + 1_000);
+		expect(hotRecords()).toBe(9);
+
+		// The job's records, oldest first: the general room's and five messages.
+		const batch = store.archiveCandidates(clock.value);
+		expect(batch.rows.map((row) => BigInt(row.log_id))).toEqual([general, ...logs.slice(0, 5)]);
+		expect(batch).toMatchObject({ through: Number(logs[4]), more: false });
+		store.noteArchived(batch.through, clock.value);
+		due();
+		const moved = store.runCleanup(clock.value);
+		expect(moved.deleted_records).toBe(6);
+		// The published floor stays where it was: the archive holds what left.
+		expect(moved.history_floor).toBe(moved.previous_floor);
+		expect(store.archiveBounds(clock.value)).toEqual({ hot: Number(logs[4] + 1n), published: Number(moved.history_floor) });
+		expect(hotRecords()).toBe(3);
+
+		// History reads the hot log, and asks the archive for what is below it.
+		const pending = store.historyWithArchive({ roomId: "general", before: String(logs[7] + 1n), limit: 10, now: clock.value });
+		if (!("archive" in pending)) throw new Error("expected a page that reads the archive");
+		expect(pending.archive).toEqual({ roomIds: ["general"], lower: Number(general), upper: Number(logs[4]), forward: false, limit: 11 });
+		const page = pending.assemble([...batch.rows].reverse());
+		expect(messagesOf(page).map((entry) => BigInt(entry.log_id))).toEqual(logs);
+		expect(page.more).toBe(false);
+		// Without it, the hot log's part alone.
+		expect(messagesOf(store.history({ roomId: "general", before: String(logs[7] + 1n), limit: 10, now: clock.value })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(5));
+
+		// The archive's limit (its 4 newest) lets the published floor rise, never past the hot floor.
+		store.setArchiveTarget(Number(logs[1]), clock.value);
+		const raised = store.runCleanup(clock.value);
+		expect(raised.history_floor).toBe(String(logs[1]));
+		expect(store.logBounds().history_floor).toBe(String(logs[1]));
+		const narrowed = store.historyWithArchive({ roomId: "general", before: String(logs[7] + 1n), limit: 10, now: clock.value });
+		expect("archive" in narrowed && narrowed.archive.lower).toBe(Number(logs[1]));
+	});
+});

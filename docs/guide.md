@@ -291,11 +291,14 @@ used the old one; `/invite-device remove <id>` revokes it, and
 
 ## User-visible policies
 
-Only the latest 10,000 records (messages, edits, reactions, room changes, and
-registered users' memberships) are retained, however old, and none younger
-than three days expires; 24 hours on Workers Free. Cleanup runs once a day
+Only the latest 15,000 records (messages, edits, reactions, room changes, and
+registered users' memberships) are retained, however old, 5,000 in the
+server's own storage and 10,000 more in an archive, and none younger than
+three days expires; without the archive, 5,000; 24 hours on Workers Free.
+Archived messages can be read in history but not edited, reacted to or
+replied to. Cleanup runs once a day
 (hourly on Free), so up to a day's records more may show; quota exhaustion may
-delay physical deletion. Uploaded files are kept 90 days, so a message older
+delay physical deletion. Uploaded files are kept 120 days, so a message older
 than that shows without them. The `general` room ID, the top-level rooms admins
 and mods create, and the log head never rotate. Recent edits can keep old
 messages visible. Rooms keep their current record after its log entry

@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits } from "./budget";
+import { Archive } from "./archive";
 import { keepLast, LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, showsMorePresent, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor, snapshotBill, snapshotReasons } from "./account-usage";
@@ -82,6 +83,7 @@ import {
 	isPrivateRoomId,
 	MAX_READ_RECEIPT_MEMBERS,
 	seenStands,
+	isPendingHistory,
 	newTerminalOutputKey,
 	terminalOutput,
 	terminalOutputKeys,
@@ -98,6 +100,7 @@ import {
 	type StoreConfig,
 	type StoreMutationInput,
 	type StoreMutationResult,
+	type StoreHistoryResult,
 	type StoredServerMetadata,
 	type UploadFinish,
 	type UploadWrite,
@@ -135,6 +138,10 @@ import { Deadline } from "./deadline";
 const OBJECT_NAME = "public-demo-v1";
 /** Characters of finished terminals' outputs the object keeps in memory (Store.finishLiveText, withOutputs): about 8 MB. */
 const TERMINAL_OUTPUT_CACHE_BYTES = 8 * 1024 * 1024;
+/** How long cleanup waits for the archive between copies while D1 fails (runArchive); a second otherwise. */
+const ARCHIVE_RETRY_MS = 5 * 60_000;
+/** Archived records one alarm deletes below the published floor at most, in batches of a fifth. */
+const ARCHIVE_TRIM_ROWS = 2_500;
 const INTERNAL_IP_HEADER = "X-Apron-Trusted-IP-Key";
 /**
  * The paths the entry Worker forwards live text to the object on (§4.8.3):
@@ -1022,12 +1029,12 @@ function basicClientId(header: string | null): string | null | undefined {
 	}
 }
 
-/** How long history keeps messages, for the welcome: by count, by age, or both (the sooner). */
-export function historyPolicy(limits: Pick<Limits, "retentionRecords" | "retentionSeconds">): string {
+/** How long history keeps messages, for the welcome: by count (the archive's included where it is on), by age, or both (the sooner). */
+export function historyPolicy(limits: Pick<Limits, "retentionRecords" | "retentionSeconds" | "archiveRecords">, archived = false): string {
 	const days = Math.max(1, Math.round(limits.retentionSeconds / 86_400));
 	const age = days === 1 ? "a day" : `${days} days`;
 	if (limits.retentionRecords <= 0) return `Messages are kept for ${age}.`;
-	const count = `the latest ${limits.retentionRecords.toLocaleString("en-US")} messages`;
+	const count = `the latest ${(limits.retentionRecords + (archived ? limits.archiveRecords : 0)).toLocaleString("en-US")} messages`;
 	return limits.retentionSeconds > 0 ? `History keeps ${count}, for up to ${age}.` : `History keeps ${count}.`;
 }
 
@@ -1041,6 +1048,7 @@ export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		retentionMs: limits.retentionSeconds * 1_000,
 		retentionRecords: limits.retentionRecords,
 		minRetentionMs: limits.minRetentionSeconds * 1_000,
+		archiveRecords: limits.archiveRecords,
 		idleAccountMs: limits.idleAccountSeconds * 1_000,
 		keptActiveAccounts: limits.keptActiveAccounts,
 		dedupTtlMs: limits.dedupTtlSeconds * 1_000,
@@ -2552,6 +2560,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * again for the terminals people are looking at.
 	 */
 	private readonly terminalOutputs = new Map<string, string>();
+	/** The history archive (D1), where records past the hot log's limits go first (runArchive). */
+	private readonly archive?: Archive;
+	/** Archive upkeep that failed in a row: cleanup then waits longer for it (ARCHIVE_RETRY_MS). */
+	private archiveFailures = 0;
+	/** Whether this wake checked the archive's own limit (Archive.floor) since its last copy. */
+	private archiveFloorChecked = false;
+	/** The published floor the archive was last trimmed to (Archive.deleteBelow), this wake. */
+	private archiveTrimmed = 0;
 	private terminalOutputCacheBytes = 0;
 	/** Whether this instance has ended the live texts a lost one left open (recoverLiveTexts). */
 	private liveRecovered = false;
@@ -2652,7 +2668,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		super(ctx, env);
 		this.runtimeEnv = env;
 		this.config = loadConfig(env);
-		this.store = new Store(ctx as unknown as ConstructorParameters<typeof Store>[0], asStoreConfig(this.config));
+		// Records past the hot log's limits go to the archive where it is bound.
+		this.archive = env.ARCHIVE && this.config.limits.archiveRecords > 0 ? new Archive(env.ARCHIVE) : undefined;
+		this.store = new Store(ctx as unknown as ConstructorParameters<typeof Store>[0], { ...asStoreConfig(this.config), archive: !!this.archive });
 		// An overrun is observed, not fatal: the day's first is told, and a
 		// breaker it opened is told by the tier evaluation that follows.
 		this.store.onOverrun = (notice) => {
@@ -3103,9 +3121,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		} catch { /* a bot not yet signed out is found again by the next sweep */ }
 		if (this.deadlines.maintenance.passed(now)) this.deadlines.maintenance.clear();
 		if (now >= this.idlePruneAt) await this.pruneIdle(now);
+		// Records about to leave the hot log are copied to the archive first.
+		if (this.archive) await this.runArchive(now);
 		let result: ReturnType<Store["runCleanup"]> | undefined;
 		try {
-			result = this.store.runCleanup(now);
+			result = this.store.runCleanup(now, { archiveWaitMs: this.archiveFailures ? ARCHIVE_RETRY_MS : 1_000 });
 		} catch {
 			// A metered maintenance failure is deferred. Do not spin an alarm loop.
 			// The floor may already be durable even if a physical deletion failed,
@@ -3139,6 +3159,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 				await this.expireLive(now);
 				this.liveRecovered = true;
 			} catch { /* a metered maintenance failure is retried on the next alarm */ }
+		}
+		if (this.archive) {
+			// Records left the hot log: the archive's limit may now allow a higher floor.
+			if (result?.deleted_records) this.archiveFloorChecked = false;
+			await this.trimArchive(now);
 		}
 		const removed = result?.removed_rooms ?? [];
 		for (const roomId of removed) this.noteRoom(roomId, false);
@@ -3402,7 +3427,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * what this origin can sign in with.
 	 */
 	private signInWelcome(origin: string | null, endpoint: string | undefined): string {
-		const history = historyPolicy(this.config.limits);
+		const history = historyPolicy(this.config.limits, !!this.archive);
 		const guests = this.config.guestPosting ? "Guests can post under a new name each visit." : "Guests can read along.";
 		const signIn = this.passkeysOfferedTo(origin, endpoint)
 			? "**Create a passkey** to post, react, and start threads; it signs you in on your next visit too."
@@ -4996,7 +5021,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.historyInFlight += 1;
 		writeAttachment(socket, attachment);
 		try {
-			const page = this.store.history({
+			const found = this.store.historyWithArchive({
 				...(roomId !== undefined ? { roomId } : { roomIds: attachment.rooms ?? [] }),
 				after,
 				before,
@@ -5007,6 +5032,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 				ipKey: attachment.ipKey,
 				guest,
 			});
+			// A page below the hot floor reads the archive; without it, no page.
+			let page: StoreHistoryResult;
+			if (!isPendingHistory(found)) page = found;
+			else {
+				let rows: Awaited<ReturnType<Archive["page"]>>;
+				try { rows = await this.stalls.track("d1", "history", this.archive!.page(found.archive)); }
+				catch { throw { name: "retry_after", message: "Older history is unavailable for now", data: { retry_after: 60, ...limitData("read") } } satisfies ProtocolError; }
+				page = found.assemble(rows);
+			}
 			this.reply(socket, request, await this.withPageOutputs(page));
 		} finally {
 			const latest = connectionAttachment(socket);
@@ -5015,6 +5049,67 @@ export class ApronDemoServer extends DurableObject<Env> {
 				writeAttachment(socket, latest);
 			}
 		}
+	}
+
+	/**
+	 * The archive's upkeep before cleanup (Store.runCleanup) on a full alarm:
+	 * copies the next records the running cleanup job will remove from the
+	 * hot log (Store.archiveCandidates), and applies the `/purge` and
+	 * `/rename` queued since (Store.archiveOps). Each step may be repeated; a
+	 * failure waits for a later alarm, and cleanup waits longer for the
+	 * archive meanwhile (ARCHIVE_RETRY_MS).
+	 */
+	private async runArchive(now: number): Promise<void> {
+		const archive = this.archive!;
+		try {
+			const batch = this.store.archiveCandidates(now);
+			if (batch.rows.length) {
+				await this.stalls.track("d1", "copy", archive.insert(batch.rows));
+				this.store.noteArchived(batch.through, now);
+				this.archiveFloorChecked = false;
+				if (batch.more) this.maintenanceSoon(now);
+			}
+			for (const op of this.store.archiveOps(now)) {
+				await this.stalls.track("d1", op.op, archive.apply(op));
+				this.store.dropArchiveOp(now);
+			}
+			this.archiveFailures = 0;
+		} catch {
+			this.archiveFailures += 1;
+		}
+	}
+
+	/**
+	 * The archive's upkeep after cleanup: once what cleanup moved out of the
+	 * hot log is copied, finds where the archive's own limit ends
+	 * (Archive.floor) below the new hot floor, for the next cleanup to
+	 * publish (Store.setArchiveTarget, which makes it due); then deletes
+	 * archived records below the published floor, a bounded number an alarm.
+	 */
+	private async trimArchive(now: number): Promise<void> {
+		try {
+			if (!this.archiveFloorChecked) {
+				const { hot } = this.store.archiveBounds(now);
+				const floor = await this.stalls.track("d1", "floor", this.archive!.floor(hot, this.config.limits.archiveRecords));
+				if (floor !== undefined && floor > this.store.archiveBounds(now).published) {
+					this.store.setArchiveTarget(floor, now);
+					this.maintenanceSoon(now);
+				}
+				this.archiveFloorChecked = true;
+			}
+			const { published } = this.store.archiveBounds(now);
+			if (published <= this.archiveTrimmed) return;
+			let deleted = 0;
+			for (let batch = 0; batch < 5; batch += 1) {
+				const count = await this.stalls.track("d1", "trim", this.archive!.deleteBelow(published, ARCHIVE_TRIM_ROWS / 5));
+				deleted += count;
+				if (count < ARCHIVE_TRIM_ROWS / 5) {
+					this.archiveTrimmed = published;
+					return;
+				}
+			}
+			if (deleted) this.maintenanceSoon(now);
+		} catch { /* deleted on a later alarm */ }
 	}
 
 	/** A history page with its stored terminal outputs put back (loadTerminalOutputs). */
@@ -8493,6 +8588,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		});
 		for (const roomId of rooms) this.removeIfEmpty(roomId);
 		this.deleteMedia(purged.deletedUploads);
+		// The archive purges what it holds on the next alarm, in a second.
+		if (this.archive) this.archiveSoon();
 		// A text left open by a failure here ends at its time limit, publishing nothing.
 		await this.endLiveOf(userIds).catch(() => undefined);
 		await this.forgetTokens(userIds);
@@ -8563,6 +8660,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** Runs the alarm's maintenance again shortly: batched work left more behind. */
 	private maintenanceSoon(now: number): void {
 		this.deadlines.maintenance.soonest(now + 1_000);
+	}
+
+	/** Runs the archive's upkeep (runArchive) on an alarm in a second, for a `/purge` or `/rename` it has to apply. */
+	private archiveSoon(): void {
+		this.maintenanceSoon(nowMs());
+		this.ctx.waitUntil(this.rescheduleAlarm().catch(() => undefined));
 	}
 
 	/** Deletes one device token and its entry in its user's list (an expired one); never throws. */
@@ -8928,6 +9031,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const renamed = this.store.renameIdentity({ from, to, now: nowMs() });
 		// Before any await: from the commit on, nothing on this object acts as the retired user_id.
 		this.moveUserState(from, to);
+		if (this.archive) this.archiveSoon();
 		await this.moveInviteToken(from, to);
 		await this.moveDeviceTokens(from, to);
 		// Clients keep nothing yet for the new `user_id`, so the object carries

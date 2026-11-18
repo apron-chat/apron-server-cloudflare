@@ -11,6 +11,7 @@ export const FREE_PLAN: Plan = Object.freeze({
 		retentionRecords: 0,
 		minRetentionSeconds: 86_400,
 		retentionSeconds: 86_400,
+		archiveRecords: 0,
 		cleanupSeconds: 3_600,
 		challengeTtlSeconds: 120,
 		sessionTtlSeconds: 30 * 24 * 60 * 60,
