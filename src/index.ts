@@ -8714,9 +8714,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * mirror sends to the room's owner. True when handled here.
 	 */
 	private async remoteRequest(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<boolean> {
-		const link = attachment.tier === "registered" && attachment.userId !== undefined && this.store.remoteLink(attachment.userId, nowMs()) !== undefined;
-		if (request.method === "push_register" && link && request.params.kind === "relay") {
-			await this.remote!.registerWake(socket, attachment.userId!, request);
+		const server = attachment.tier === "registered" && attachment.userId !== undefined ? this.store.remoteLink(attachment.userId, nowMs()) : undefined;
+		const link = server !== undefined;
+		// A link's wake push, whether or not this server offers push.
+		if (request.method === "push_register" && server !== undefined && request.params.kind === "relay") {
+			await this.remote!.registerWake(socket, attachment.userId!, server, request);
 			return true;
 		}
 		if (link || !identityOf(attachment) || (request.method !== "message" && request.method !== "reactions" && request.method !== "room_set")) return false;

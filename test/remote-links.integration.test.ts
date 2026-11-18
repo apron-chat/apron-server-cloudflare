@@ -415,8 +415,9 @@ it('makes and saves a thread of a shared room as a remote user, and joins the li
 it('takes a link\'s relay wake push for ext:remote, and nobody else\'s', async () => {
 	const { admin, link, roomId } = await linked('ws://127.0.0.1:8097/ws');
 	try {
-		expect((await request(link, unique('wake'), 'push_register', { kind: 'relay', url: 'https://mirror.example/remote/wake/abcdefgh', token: 't0ken', wake: ['ext:remote'] })).result).toEqual({});
-		expect((await request(link, unique('dev'), 'push_register', { kind: 'relay', url: 'http://127.0.0.1:8788/remote/wake/abcdefgh', token: 't0ken', wake: ['ext:remote'] })).result).toEqual({});
+		// Only to the link's own server (127.0.0.1:8097 here), http there being a loopback host.
+		expect((await request(link, unique('dev'), 'push_register', { kind: 'relay', url: 'http://127.0.0.1:8097/remote/wake/abcdefgh', token: 't0ken', wake: ['ext:remote'] })).result).toEqual({});
+		expect((await request(link, unique('elsewhere'), 'push_register', { kind: 'relay', url: 'https://mirror.example/remote/wake/abcdefgh', token: 't0ken', wake: ['ext:remote'] })).error.code).toBe(INVALID_PARAMS);
 		expect((await request(link, unique('plain'), 'push_register', { kind: 'relay', url: 'http://mirror.example/x', token: 't', wake: ['ext:remote'] })).error.code).toBe(INVALID_PARAMS);
 		expect((await request(link, unique('scope'), 'push_register', { kind: 'relay', url: 'https://mirror.example/x', token: 't', wake: ['mentions'] })).error.code).toBe(INVALID_PARAMS);
 		// Anyone else's relay push is the server's ordinary push_register, which has no relay kind.

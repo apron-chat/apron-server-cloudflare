@@ -306,13 +306,15 @@ export class RemoteRooms {
 	 * <token>` for the records of its rooms. `url` is `https`, or `http` to a
 	 * loopback host for development. One a link, replacing the last.
 	 */
-	async registerWake(socket: unknown, linkId: string, request: RequestFrame): Promise<void> {
+	async registerWake(socket: unknown, linkId: string, server: string, request: RequestFrame): Promise<void> {
 		const params = request.params;
 		const wake = Array.isArray(params.wake) ? params.wake : [];
 		if (!wake.includes("ext:remote")) throw { name: "invalid_params", message: "A link's relay push wakes for ext:remote" } satisfies ProtocolError;
 		const url = typeof params.url === "string" && params.url.length <= 512 ? params.url : "";
 		const token = typeof params.token === "string" && params.token.length > 0 && params.token.length <= 512 ? params.token : "";
 		if (!wakeUrlAllowed(url) || !token) throw { name: "invalid_params", message: "A relay push needs an https url (or http to a loopback host) and a token" } satisfies ProtocolError;
+		// Only to the link's own server: a token holder may not make this server POST elsewhere.
+		if (new URL(url).host !== new URL(server.replace(/^ws/i, "http")).host) throw { name: "invalid_params", message: "A link's relay push goes to its own server" } satisfies ProtocolError;
 		const registration: WakeRegistration = { url, token, ...(typeof params.push_id === "string" ? { push_id: params.push_id.slice(0, 64) } : {}) };
 		await this.store.withMeterAsync("foreground", { writes: 1 }, () => this.host.storage.put(WAKE_KEY_PREFIX + linkId, registration));
 		(await this.wakes()).set(linkId, registration);
@@ -429,6 +431,7 @@ export class RemoteRooms {
 		console.log(JSON.stringify({ event: "remote_mirror_connected", server: session.server }));
 		try {
 			await this.registerOwnWake(session.server, connection);
+			await this.checkJoined(session.server, connection);
 			await this.catchUp(session, connection);
 		} finally {
 			// The records held while reading history, then live.
@@ -451,6 +454,20 @@ export class RemoteRooms {
 		const origin = this.host.self.replace(/^ws/i, "http").replace(/^(https?:\/\/[^/]+).*$/i, "$1");
 		const registered = await connection.call("push_register", { kind: "relay", url: `${origin}/remote/wake/${entry.wake.id}`, token: entry.wake.token, wake: ["ext:remote"] }, `mirror-wake:${this.now()}`);
 		if (registered.error) console.warn(JSON.stringify({ event: "remote_wake_register_failed", server, error: registered.error.message ?? registered.error.code }));
+	}
+
+	/**
+	 * The owner's rooms that the link is still in: a mirror room whose owner
+	 * room the link left while this mirror was away (an admin there removed
+	 * it) stops, as history without `room_id` cannot show the link's leave.
+	 */
+	private async checkJoined(server: string, connection: LinkConnection): Promise<void> {
+		const listed = await connection.call("room_list", { filter: "joined" }, `mirror-joined:${this.now()}`);
+		if (listed.error || !listed.result) return;
+		const joined = new Set(((listed.result.joined as Array<Record<string, unknown>> | undefined) ?? []).map((room) => room.room_id));
+		for (const room of this.store.mirrorState(this.now()).rooms) {
+			if (room.server === server && !room.unshared && !joined.has(room.owner_room)) this.markUnshared(server, room.owner_room);
+		}
 	}
 
 	/** Pages forward through the owner's log from this mirror's place, writing each record (§4.3.5). */
