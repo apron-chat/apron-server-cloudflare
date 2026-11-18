@@ -75,7 +75,7 @@ it('/remote invite creates a link bound to the address, in the private room, wit
 	try {
 		expect(linkId).toMatch(/^link_\d+$/);
 		// The address is normalized (scheme and host lowercased), and the link names this server, the room and the token.
-		expect(text).toContain(`To share this room with ws://127.0.0.1:8081/ws`);
+		expect(text).toContain(`To mirror this room on ws://127.0.0.1:8081/ws`);
 		expect(text).toContain(`(\`${linkId}\`)`);
 		// The invite, in a code span: this server, this room and a token of the link.
 		expect(text).toMatch(new RegExp(`\n\`https://link\\.apron\\.chat/#server=wss://demo\\.test/ws&room=${roomId}&token=apron_invite_[A-Za-z0-9_-]{43}\``));
@@ -88,7 +88,7 @@ it('/remote invite creates a link bound to the address, in the private room, wit
 		const members = await request(admin, 'members', 'room_list', { room_id: roomId, members: true });
 		expect(members.result.joined[0].members.map((member: { user_id: string }) => member.user_id)).toContain(linkId);
 		const listed = await command(admin, 'list', '/remote list', roomId);
-		expect(listed.notice!.params.body.text).toContain(`- ws://127.0.0.1:8081/ws: link \`${linkId}\`; shared rooms: none`);
+		expect(listed.notice!.params.body.text).toContain(`- Shared with ws://127.0.0.1:8081/ws: link \`${linkId}\`, in \`${roomId}\``);
 		// Bad addresses are refused.
 		for (const address of ['http://127.0.0.1:8081/ws', 'ws://user@host/ws', 'chat.example', 'wss://demo.test/ws']) {
 			expect((await command(admin, `bad-${address}`, `/remote invite ${address}`, roomId)).frame.error.code).toBe(INVALID_PARAMS);
@@ -113,7 +113,8 @@ it('runs a link\'s message as a shadow user that joins the room, and keeps ext.r
 		});
 		const posted = (await until(admin, messageFrom(shadowId))).frame.params;
 		expect(posted.from).toEqual({ user_id: shadowId, name: remoteId, ext: { remote: { server, user_id: remoteId } } });
-		expect(posted.ext).toEqual({ remote: { server, user_id: remoteId, room_id: 'ops', message_id: '1724803599120' }, other: 1 });
+		// The owner's copy names its author's server and user; room and message IDs a link sends are ignored.
+		expect(posted.ext).toEqual({ remote: { server, user_id: remoteId }, other: 1 });
 		const reply = await until(link, (frame) => frame.id === 'post');
 		expect(reply.frame.result).toEqual({ message_id: posted.message_id });
 
@@ -128,7 +129,7 @@ it('runs a link\'s message as a shadow user that joins the room, and keeps ext.r
 		expect(saved.result).toEqual({ message_id: posted.message_id });
 		const edit = (await until(admin, (frame) => frame.method === 'message' && frame.params.message_id === posted.message_id && frame.params.body?.text === 'edited on A')).frame.params;
 		expect(edit.from).toEqual(posted.from);
-		expect(edit.ext.remote).toEqual({ server, user_id: remoteId, room_id: 'ops', message_id: '1724803599120' });
+		expect(edit.ext.remote).toEqual({ server, user_id: remoteId });
 		const notAuthor = await request(link, 'link-save', 'message', { message_id: posted.message_id, room_id: roomId, body: { text: 'as the link' } });
 		expect(notAuthor.error.code).toBe(DENIED);
 		// Another remote user is not the author either.
@@ -317,29 +318,6 @@ it('joins a remote user that left a room again on its next write, but not one an
 	} finally { admin.close(); link.close(); }
 });
 
-it('answers a link\'s repeated create of a remote message with the copy it already wrote', async () => {
-	const { admin, link, roomId } = await linked('ws://127.0.0.1:8089/ws');
-	const carol = unique('carol');
-	const remote = { user_id: carol, room_id: 'ops', message_id: '1724803599120' };
-	try {
-		const first = await request(link, 'first', 'message', { room_id: roomId, body: { text: 'once' }, ext: { remote } });
-		const messageId = first.result.message_id as string;
-		// Another request id, even as another remote user: the same message, and nothing logged.
-		const again = await exchange(link, 'again', 'message', { room_id: roomId, body: { text: 'twice' }, ext: { remote: { ...remote, user_id: unique('dave') } } });
-		expect(again.frame.result).toEqual({ message_id: messageId });
-		expect(again.skipped.filter((frame) => frame.method === 'message' || frame.method === 'room_update')).toEqual([]);
-		const page = await request(admin, 'history', 'history', { room_id: roomId });
-		expect(page.result.messages.filter((message: { body?: { text?: string } }) => message.body?.text === 'twice')).toEqual([]);
-		// A save is no create; another remote message id is another message.
-		expect((await request(link, 'save', 'message', { message_id: messageId, room_id: roomId, body: { text: 'saved' }, ext: { remote } })).result).toEqual({ message_id: messageId });
-		const other = await request(link, 'other', 'message', { room_id: roomId, body: { text: 'other' }, ext: { remote: { ...remote, message_id: '1724803599121' } } });
-		expect(other.result.message_id).not.toBe(messageId);
-		// Still a duplicate once deleted.
-		await request(link, 'delete', 'message', { message_id: messageId, room_id: roomId, deleted: true, ext: { remote } });
-		expect((await request(link, 'after-delete', 'message', { room_id: roomId, body: { text: 'x' }, ext: { remote } })).result).toEqual({ message_id: messageId });
-	} finally { admin.close(); link.close(); }
-});
-
 it('lets a link send past the per-connection frame limit, and keeps it open through invalid_params', async () => {
 	const { admin, link, linkId } = await linked('ws://127.0.0.1:8090/ws');
 	try {
@@ -371,82 +349,36 @@ it('reuses one link a remote server across rooms, with a token for each invite',
 		again.peer.close();
 		// One link for the server.
 		const listing: string = (await command(admin, 'list', '/remote list', second)).notice!.params.body.text;
-		expect(listing.split('\n').filter((line) => line.startsWith(`- ${server}:`))).toEqual([`- ${server}: link \`${linkId}\`; shared rooms: none`]);
+		expect(listing.split('\n').filter((line) => line.startsWith(`- Shared with ${server}:`))).toHaveLength(1);
 	} finally { admin.close(); link.close(); }
 });
 
-it('pairs a room on an ext:remote request from its link, and refuses everything else', async () => {
-	const server = 'ws://127.0.0.1:8092/ws';
-	const { admin, link, roomId } = await linked(server);
-	const remoteLink = `https://link.apron.chat/#server=${server}&room=ops&token=apron_invite_secret`;
-	try {
-		// Not a link: denied.
-		expect((await request(admin, 'not-link', 'ext:remote', { room_id: roomId, link: remoteLink })).error.code).toBe(DENIED);
-		// A room the link has not joined, a link of another server, or none that parses: invalid_params.
-		expect((await request(link, 'general', 'ext:remote', { room_id: 'general', link: remoteLink })).error.code).toBe(INVALID_PARAMS);
-		expect((await request(link, 'other', 'ext:remote', { room_id: roomId, link: 'https://link.apron.chat/#server=ws://elsewhere/ws&room=ops&token=t' })).error.code).toBe(INVALID_PARAMS);
-		expect((await request(link, 'garbage', 'ext:remote', { room_id: roomId, link: 'hello' })).error.code).toBe(INVALID_PARAMS);
-	} finally { link.close(); }
-	// A new connection: three invalid_params count as policy violations only for others; it is still open anyway.
-	const fresh = await linked(server);
-	try {
-		const reply = await request(fresh.link, 'pair', 'ext:remote', { room_id: fresh.roomId, link: `apron:?server=WS://127.0.0.1:8092/ws&room=ops&token=apron_invite_secret` });
-		expect(reply.result).toEqual({});
-		const listing: string = (await command(fresh.admin, 'list', '/remote list', fresh.roomId)).notice!.params.body.text;
-		expect(listing).toContain(`\`${fresh.roomId}\` ↔ \`ops\``);
-		expect(listing).not.toContain('apron_invite_secret');
-		// The pair's token is on no user object.
-		const members = await request(fresh.admin, 'members', 'room_list', { room_id: fresh.roomId, members: true });
-		expect(JSON.stringify(members.result)).not.toContain('apron_invite_secret');
-		expect(roomId).not.toBe(fresh.roomId);
-	} finally { admin.close(); fresh.admin.close(); fresh.link.close(); }
-});
-
-it('takes a create for a remote message_id the link already wrote as a duplicate, whatever its room', async () => {
-	const { admin, link, roomId } = await linked('ws://127.0.0.1:8093/ws');
-	try {
-		const first = await request(link, 'first', 'message', { room_id: roomId, body: { text: 'once' }, ext: { remote: { user_id: 'carol', room_id: 'ops', message_id: '42' } } });
-		const again = await request(link, 'again', 'message', { room_id: roomId, body: { text: 'twice' }, ext: { remote: { user_id: 'carol', room_id: 'elsewhere', message_id: '42' } } });
-		expect(again.result).toEqual({ message_id: first.result.message_id });
-		const bare = await request(link, 'bare', 'message', { room_id: roomId, body: { text: 'thrice' }, ext: { remote: { user_id: 'carol', message_id: '42' } } });
-		expect(bare.result).toEqual({ message_id: first.result.message_id });
-	} finally { admin.close(); link.close(); }
-});
-
-it('/remote unshare takes the links out of the room and drops its pairs', async () => {
+it('/remote unshare in a shared room takes the links out of it and its threads', async () => {
 	const server = 'ws://127.0.0.1:8094/ws';
-	const { admin, link, linkId, roomId } = await linked(server);
+	const { peer: admin } = await freshAdmin();
+	const roomId = (await request(admin, unique('room'), 'room_set', { title: unique('Shared') })).result.room_id as string;
+	const thread = (await request(admin, unique('thread'), 'room_set', { parent_room_id: roomId, title: 'Before' })).result.room_id as string;
+	const invited = await command(admin, unique('invite'), `/remote invite ${server}`, roomId);
+	const token = invited.notice!.params.body.text.match(/&token=(apron_invite_[A-Za-z0-9_-]{43})/)![1];
+	const { peer: link, you } = await signIn(token);
 	try {
-		expect((await request(link, 'pair', 'ext:remote', { room_id: roomId, link: `https://link.apron.chat/#server=${server}&room=ops&token=t` })).result).toEqual({});
-		const unshared = await command(admin, 'unshare', '/remote unshare', roomId);
-		// The other server (none listens here) could not be told.
-		expect(unshared.notice!.params.body.text).toMatch(new RegExp(`^This room is no longer shared with ${server.replace(/[.:/]/g, '\\$&')}\\. Could not tell `));
-		expect(unshared.skipped.some((frame) => frame.method === 'room_update' && frame.params.memberships?.[0]?.members?.[0]?.user?.user_id === linkId && frame.params.memberships[0].members[0].joined === false)).toBe(true);
-		expect((await command(admin, 'list', '/remote list', roomId)).notice!.params.body.text).toContain('shared rooms: none');
-		// The link may no longer write there: its pair has ended.
-		const refused = await request(link, 'post', 'message', { room_id: roomId, body: { text: 'x' }, ext: { remote: { user_id: 'carol' } } });
-		expect(refused.error).toMatchObject({ code: INVALID_PARAMS, data: { ext: { remote: 'not_joined' } } });
+		// Invited, the link is in the room and its existing thread; a new thread takes it too.
+		const after = (await request(admin, unique('thread2'), 'room_set', { parent_room_id: roomId, title: 'After' })).result.room_id as string;
+		await until(link, (frame) => frame.method === 'room_update' && frame.params.joined?.[0]?.room_id === after);
+		const joined = (await request(link, unique('joined'), 'room_list', { filter: 'joined' })).result.joined.map((room: { room_id: string }) => room.room_id).sort();
+		expect(joined).toEqual([roomId, thread, after].sort());
+		const unshared = await command(admin, unique('unshare'), '/remote unshare', roomId);
+		expect(unshared.notice!.params.body.text).toBe(`This room is no longer shared with ${server}.`);
+		const left = (await request(link, unique('joined2'), 'room_list', { filter: 'joined' })).result.joined;
+		expect(left).toEqual([]);
+		// The link may no longer write there.
+		const refused = await request(link, unique('post'), 'message', { room_id: roomId, body: { text: 'x' }, ext: { remote: { user_id: 'carol' } } });
+		expect(refused.error).toMatchObject({ code: DENIED, data: { ext: { remote: 'not_joined' } } });
+		expect(you.user_id).toMatch(/^link_/);
 	} finally { admin.close(); link.close(); }
 });
 
-it('ends a pair on an ext:remote request without link, and the link leaves the room', async () => {
-	const server = 'ws://127.0.0.1:8095/ws';
-	const { admin, link, linkId, roomId } = await linked(server);
-	try {
-		expect((await request(link, 'pair', 'ext:remote', { room_id: roomId, link: `https://link.apron.chat/#server=${server}&room=ops&token=t` })).result).toEqual({});
-		const ended = await exchange(link, 'end', 'ext:remote', { room_id: roomId });
-		expect(ended.frame.result).toEqual({});
-		expect(ended.skipped.some((frame) => frame.method === 'room_update' && frame.params.left?.[0]?.room_id === roomId)).toBe(true);
-		const left = await until(admin, (frame) => frame.method === 'room_update' && frame.params.memberships?.[0]?.members?.[0]?.user?.user_id === linkId && frame.params.memberships[0].members[0].joined === false);
-		expect(left.frame.params.memberships[0].room_id).toBe(roomId);
-		expect((await command(admin, 'list', '/remote list', roomId)).notice!.params.body.text).toContain('shared rooms: none');
-		// A link in a public room it has not joined is denied, with the same reason.
-		const general = await request(link, 'general', 'message', { room_id: 'general', body: { text: 'x' }, ext: { remote: { user_id: 'carol' } } });
-		expect(general.error).toMatchObject({ code: DENIED, data: { ext: { remote: 'not_joined' } } });
-	} finally { admin.close(); link.close(); }
-});
-
-it('makes and saves a thread of a shared room as a remote user, and pairs it with the remote thread', async () => {
+it('makes and saves a thread of a shared room as a remote user, and joins the link to it', async () => {
 	const server = 'ws://127.0.0.1:8096/ws';
 	const { peer: admin } = await freshAdmin();
 	const roomId = (await request(admin, unique('room'), 'room_set', { title: unique('Shared') })).result.room_id as string;
@@ -456,63 +388,69 @@ it('makes and saves a thread of a shared room as a remote user, and pairs it wit
 	const privateRoom = (await request(admin, unique('private'), 'room_set', { private: true })).result.room_id as string;
 	await command(admin, unique('invite2'), `/remote invite ${server}`, privateRoom);
 	try {
-		expect((await request(link, 'pair', 'ext:remote', { room_id: roomId, link: `https://link.apron.chat/#server=${server}&room=ops&token=t` })).result).toEqual({});
 		const carol = unique('carol');
 		const shadowId = `${carol}@127.0.0.1:8096`;
-		const made = await request(link, unique('thread'), 'room_set', { parent_room_id: roomId, title: 'Plans', ext: { remote: { user_id: carol, room_id: 'remote-thread' } } });
-		const threadId = made.result.room_id as string;
-		expect(threadId).toBeDefined();
+		const made = await exchange(link, unique('thread'), 'room_set', { parent_room_id: roomId, title: 'Plans', ext: { remote: { user_id: carol } } });
+		const threadId = made.frame.result.room_id as string;
+		// The thread's record reached the link before the result (§1).
+		expect(made.skipped.some((frame) => frame.method === 'room_update' && frame.params.updated?.some((room: { room_id: string }) => room.room_id === threadId))).toBe(true);
 		const listed = await request(admin, unique('list'), 'room_list', { room_id: threadId, members: true });
-		const thread = [...listed.result.joined, ...listed.result.not_joined][0];
-		expect(thread).toMatchObject({ room_id: threadId, parent_room_id: roomId, title: 'Plans' });
+		expect([...listed.result.joined, ...listed.result.not_joined][0]).toMatchObject({ room_id: threadId, parent_room_id: roomId, title: 'Plans' });
 		expect(listed.result.users.map((user: { user_id: string }) => user.user_id)).toContain(shadowId);
-		expect((await command(admin, unique('list'), '/remote list', roomId)).notice!.params.body.text).toContain(`\`${threadId}\` ↔ \`remote-thread\``);
-		// The link acts in the thread of a room it has joined.
-		const posted = await request(link, unique('post'), 'message', { room_id: threadId, body: { text: 'in the thread' }, ext: { remote: { user_id: unique('dave'), message_id: 'm1' } } });
+		// The link joins its remote user's thread too.
+		await until(link, (frame) => frame.method === 'room_update' && frame.params.joined?.[0]?.room_id === threadId);
+		const posted = await request(link, unique('post'), 'message', { room_id: threadId, body: { text: 'in the thread' }, ext: { remote: { user_id: unique('dave') } } });
 		expect(posted.result.message_id).toBeDefined();
 		const saved = await request(link, unique('save'), 'room_set', { room_id: threadId, title: 'Plans v2', ext: { remote: { user_id: carol } } });
 		expect(saved.error).toBeUndefined();
-		expect((await request(admin, unique('list2'), 'room_list', { room_id: threadId })).result.not_joined?.[0]?.title ?? (await request(admin, unique('list3'), 'room_list', { room_id: threadId })).result.joined[0].title).toBe('Plans v2');
 		// Only threads: no top-level room, no private room; no thread under a private room here.
-		expect((await request(link, unique('top'), 'room_set', { title: 'x', ext: { remote: { user_id: carol, room_id: 'r' } } })).error.code).toBe(DENIED);
-		expect((await request(link, unique('priv'), 'room_set', { private: true, ext: { remote: { user_id: carol, room_id: 'r' } } })).error.code).toBe(DENIED);
-		expect((await request(link, unique('privthread'), 'room_set', { parent_room_id: privateRoom, title: 'x', ext: { remote: { user_id: carol, room_id: 'r2' } } })).error.code).toBe(DENIED);
-		// Not under a room the link has not joined.
-		const general = await request(link, unique('general'), 'room_set', { parent_room_id: 'general', title: 'x', ext: { remote: { user_id: carol, room_id: 'r3' } } });
+		expect((await request(link, unique('top'), 'room_set', { title: 'x', ext: { remote: { user_id: carol } } })).error.code).toBe(DENIED);
+		expect((await request(link, unique('priv'), 'room_set', { private: true, ext: { remote: { user_id: carol } } })).error.code).toBe(DENIED);
+		expect((await request(link, unique('privthread'), 'room_set', { parent_room_id: privateRoom, title: 'x', ext: { remote: { user_id: carol } } })).error.code).toBe(DENIED);
+		const general = await request(link, unique('general'), 'room_set', { parent_room_id: 'general', title: 'x', ext: { remote: { user_id: carol } } });
 		expect(general.error).toMatchObject({ code: DENIED, data: { ext: { remote: 'not_joined' } } });
-		// Unsharing the parent ends the thread's pair too.
-		await command(admin, unique('unshare'), '/remote unshare', roomId);
-		expect((await command(admin, unique('list4'), '/remote list', roomId)).notice!.params.body.text).not.toContain(threadId);
 	} finally { admin.close(); link.close(); }
 });
 
-it('delivers the sender\'s notices: one logged ~room notice in a refused thread, one ~private notice an author gets once', async () => {
-	const { peer: admin, userId: adminId } = await freshAdmin();
-	const roomId = (await request(admin, unique('room'), 'room_set', { title: unique('Notices') })).result.room_id as string;
+it('takes a link\'s relay wake push for ext:remote, and nobody else\'s', async () => {
+	const { admin, link, roomId } = await linked('ws://127.0.0.1:8097/ws');
 	try {
-		await runInDurableObject(stub(), (instance) => {
-			const deps = (instance as unknown as { outboxDeps(server: string): { roomNotice(roomId: string, text: string): void; authorNotice(userId: string, roomId: string, text: string): void } }).outboxDeps('ws://b.example/ws');
-			deps.roomNotice(roomId, 'This thread is not shared with b.example.');
-			deps.authorNotice(adminId, roomId, 'Not sent to b.example: you were removed from this room there.');
-			deps.authorNotice(adminId, roomId, 'Not sent to b.example: you were removed from this room there.');
-		});
-		// The logged notice comes after its commit, the private one at once: either order.
-		const seen: Frame[] = [];
-		while (!seen.some((frame) => frame.params?.from?.user_id === '~room') || !seen.some((frame) => frame.params?.from?.user_id === '~private')) {
-			const frame = await admin.next();
-			if (frame.method === 'message') seen.push(frame);
-		}
-		const room = seen.find((frame) => frame.params.from.user_id === '~room')!;
-		expect(room.params).toMatchObject({ room_id: roomId, body: { text: 'This thread is not shared with b.example.' } });
-		// Logged: it has a log_id, and history holds it for members who were not connected.
-		expect(room.params.log_id).toBeDefined();
-		const page = await request(admin, unique('history'), 'history', { room_id: roomId });
-		expect(page.result.messages.find((message: { from: { user_id: string } }) => message.from.user_id === '~room')).toMatchObject({ body: { text: 'This thread is not shared with b.example.' } });
-		const told = seen.find((frame) => frame.params.from.user_id === '~private')!;
-		expect(told.params).toMatchObject({ room_id: roomId, body: { text: 'Not sent to b.example: you were removed from this room there.' } });
-		expect(seen.filter((frame) => frame.params.from.user_id === '~private')).toHaveLength(1);
-		// Once: the next frame is the reply to this request, with no second notice before it.
-		const next = await exchange(admin, unique('ping'), 'room_list', { room_id: roomId });
-		expect(next.skipped.filter((frame) => frame.method === 'message' && frame.params.from?.user_id === '~private')).toEqual([]);
-	} finally { admin.close(); }
+		expect((await request(link, unique('wake'), 'push_register', { kind: 'relay', url: 'https://mirror.example/remote/wake/abcdefgh', token: 't0ken', wake: ['ext:remote'] })).result).toEqual({});
+		expect((await request(link, unique('dev'), 'push_register', { kind: 'relay', url: 'http://127.0.0.1:8788/remote/wake/abcdefgh', token: 't0ken', wake: ['ext:remote'] })).result).toEqual({});
+		expect((await request(link, unique('plain'), 'push_register', { kind: 'relay', url: 'http://mirror.example/x', token: 't', wake: ['ext:remote'] })).error.code).toBe(INVALID_PARAMS);
+		expect((await request(link, unique('scope'), 'push_register', { kind: 'relay', url: 'https://mirror.example/x', token: 't', wake: ['mentions'] })).error.code).toBe(INVALID_PARAMS);
+		// Anyone else's relay push is the server's ordinary push_register, which has no relay kind.
+		const other = await request(admin, unique('other'), 'push_register', { kind: 'relay', url: 'https://mirror.example/x', token: 't', wake: ['ext:remote'] });
+		expect(other.error).toBeDefined();
+		expect(roomId).toBeDefined();
+	} finally { admin.close(); link.close(); }
+});
+
+it('changes nothing while REMOTE_SELF is unset: no capability, no /remote, links act as bots, ext.remote dropped', async () => {
+	const { admin, link, linkId, roomId } = await linked('ws://127.0.0.1:8098/ws');
+	link.close();
+	type Remote = { config: { remoteSelf?: string }; remote: unknown; store: { config: { remote?: boolean } } };
+	const kept = await runInDurableObject(stub(), (instance) => (instance as unknown as Remote).remote);
+	const setRemote = (on: boolean) => runInDurableObject(stub(), (instance) => {
+		const server = instance as unknown as Remote;
+		server.config = { ...server.config, remoteSelf: on ? 'wss://demo.test/ws' : undefined };
+		server.store.config = { ...server.store.config, remote: on };
+		server.remote = on ? kept : undefined;
+	});
+	await setRemote(false);
+	try {
+		const peer = await connect();
+		const server = await peer.next();
+		expect(server.params.capabilities).not.toContain('ext:remote');
+		peer.close();
+		expect((await command(admin, unique('remote'), '/remote list', roomId)).frame.error.message).toMatch(/Unknown command \/remote/);
+		// ext.remote is dropped from every request, and a link's user object has none.
+		const posted = await exchange(admin, unique('post'), 'message', { room_id: roomId, body: { text: 'plain' }, ext: { remote: { user_id: 'carol', server: 'ws://x/ws' } } });
+		expect(posted.skipped.find((frame) => frame.method === 'message' && frame.params.message_id === posted.frame.result.message_id)!.params).not.toHaveProperty('ext');
+		const members = await request(admin, unique('members'), 'room_list', { room_id: roomId, members: true });
+		expect(members.result.users.find((user: { user_id: string }) => user.user_id === linkId)?.ext?.remote).toBeUndefined();
+	} finally {
+		await setRemote(true);
+		admin.close();
+	}
 });

@@ -108,7 +108,7 @@ export const NOTIFICATION_METHODS: ReadonlySet<string> = new Set(["ping", "activ
  */
 export const REQUEST_METHODS: ReadonlySet<string> = new Set([
 	"auth", "me", "message", "command", "history", "room_list", "room_join", "room_leave",
-	"room_set", "reactions", "status", "push_register", "push_unregister", "ext:remote",
+	"room_set", "reactions", "status", "push_register", "push_unregister",
 ]);
 
 /**

@@ -166,6 +166,8 @@ export interface StoreConfig {
   retentionMs: number;
   /** Inactivity past which an account is removed (pruneIdleIdentities). */
   idleAccountMs: number;
+  /** Extension `ext:remote` is on (`REMOTE_SELF`): links carry `ext.remote`. Off, a link is an ordinary bot. */
+  remote?: boolean;
   /** The most recently active accounts pruneIdleIdentities always keeps. */
   keptActiveAccounts: number;
   /** How long a removed account's `user_id` stays retired (dueRetiredUserIds). */
@@ -722,6 +724,15 @@ export interface StoreMutationInput {
    */
   link?: string;
   remote?: RemoteUser;
+  /**
+   * A mirror's copy of an owner's message (ext:remote, mirror.ts), written
+   * by the server (`system`) as its author here: its `ext.remote` is the
+   * original's, the room's visibility is not the author's to pass, and the
+   * copy is found again by its original (copyOf).
+   */
+  copy?: { remote: { server: string; room_id: string; message_id: string } };
+  /** A mirror room or thread the server makes (mirror.ts): its `ext.remote`, the owner's room. */
+  roomRemote?: { server: string; room_id: string };
 }
 
 /** Embed kinds that carry live text (§4.8.3). */
@@ -1246,32 +1257,31 @@ const META_BOT_SWEEP = "bot_sweep_ms";
  * absent, there are none. Links are never signed out as idle bots.
  */
 const META_REMOTE_LINKS = "remote_links";
-/** `_meta` key: the room pairs (ext:remote), a JSON array of RemotePair, at most MAX_REMOTE_PAIRS. */
-const META_REMOTE_PAIRS = "remote_pairs";
-/** `_meta` key: each remote server's outbox (ext:remote), a JSON object of RemoteOutbox by server address. */
-const META_REMOTE_OUTBOX = "remote_outbox";
-/** The most room pairs a server keeps (ext:remote). */
-export const MAX_REMOTE_PAIRS = 256;
+/**
+ * `_meta` key: what this server mirrors (extension `ext:remote`, mirror.ts):
+ * a JSON MirrorState, read once and kept in memory. Absent, nothing.
+ */
+const META_REMOTE_MIRROR = "remote_mirror";
 
-/** One of this server's rooms shared with a remote server (ext:remote; Store.remotePairs). */
-export interface RemotePair {
+/** One mirror room: a local room that shows `owner_room` of the owner `server` (mirror.ts). */
+export interface MirrorRoom {
   room_id: string;
   server: string;
-  remote_room: string;
+  owner_room: string;
+  /** The link's token on the owner, from the invite. */
   token: string;
-  created_ms: number;
-  /** The head of the log when the pair was made: its room's records at or below it are never sent. */
-  start_log_id: number;
-  /** For a thread of a shared room (a thread pair): its parent, whose pair it ends with. */
-  parent?: string;
-  /** For a thread the remote server refused: it stays here, and nothing more of it is sent. */
-  refused?: boolean;
+  /** The owner's log ID when mirroring began: older records are not copied. */
+  start: number;
+  /** Set once the owner removed the link, or this server unshared it: the room takes no more writes. */
+  unshared?: true;
+  /** The owner's threads of the room, each with its local thread. */
+  threads: Record<string, string>;
 }
 
-/** A remote server's outbox (ext:remote): the log ID sent through, and why it stopped, if it did. */
-export interface RemoteOutbox {
-  cursor: number;
-  stopped?: string;
+/** What this server mirrors (META_REMOTE_MIRROR): its mirror rooms, and per owner its place in the log and its wake. */
+export interface MirrorState {
+  rooms: MirrorRoom[];
+  servers: Record<string, { cursor: number; wake?: { id: string; token: string } }>;
 }
 
 /** The limiter scopes keyed by a registered user (`user:<user_id>`), which `/rename` moves. */
@@ -1823,13 +1833,12 @@ function recordedUser(userId: string, name: string | null | undefined, remote?: 
 }
 
 /**
- * The key of a remote message a link wrote (ext:remote), as
- * `message_state.remote_key` holds it: the link and the message's remote
- * `message_id`; undefined unless that is a string.
+ * The key of a copy (ext:remote, mirror.ts), as `message_state.remote_key`
+ * holds it: the owner server and the original's `message_id`, unique
+ * across the owner's rooms (§2.2).
  */
-function remoteMessageKey(link: string, remote: Record<string, unknown>): string | undefined {
-  // A message_id is unique across the remote server's rooms (§2.2), so the room is not part of it.
-  return typeof remote.message_id === "string" ? JSON.stringify([link, remote.message_id]) : undefined;
+function copyKey(server: string, messageId: string): string {
+  return JSON.stringify([server, messageId]);
 }
 
 /** A shadow user's `remote` from its identity row's `ext_json` (ext:remote); undefined for anyone else. */
@@ -2248,8 +2257,8 @@ export class Store {
   private logCache: RawLogState | null = null;
   /** `_meta` `remote_links` as last read (Store.remoteLinks); undefined until read, and after a change. */
   private remoteLinksCache: Record<string, RemoteLink> | undefined;
-  /** `_meta` `remote_pairs` as last read (Store.remotePairs); undefined until read, and after a change. */
-  private remotePairsCache: RemotePair[] | undefined;
+  /** `_meta` `remote_mirror` as last read (Store.mirrorState); undefined until read, and after a change. */
+  private mirrorCache: MirrorState | undefined;
   /**
    * The open live texts (META_LIVE_TEXTS) as last read or saved, undefined
    * until read: every change goes through this instance, and a rolled-back
@@ -2916,7 +2925,7 @@ export class Store {
     this.initialized = false;
     this.logCache = null;
     this.remoteLinksCache = undefined;
-    this.remotePairsCache = undefined;
+    this.mirrorCache = undefined;
     this.accountingUncertain = false;
     this.lostOnWake = false;
     this.accountingMarker.load("0");
@@ -5156,22 +5165,15 @@ export class Store {
 
   /**
    * A message write's `ext` (§4.13) without `remote`, which only the server
-   * sets (ext:remote). A link's act-as write (`remote`) gets
-   * `{server, user_id, room_id, message_id}`: the shadow's server and user,
-   * and the remote IDs the request's `ext.remote` gives as strings, else
-   * those the message kept.
+   * sets (ext:remote): `{server, user_id}` on a link's act-as write
+   * (`remote`), and the original's `{server, room_id, message_id}` on a
+   * mirror's copy (`copy`).
    */
-  private messageExtWrite(value: unknown, remote: RemoteUser | undefined, previous: MessageSnapshot | null): Record<string, unknown> | undefined {
+  private messageExtWrite(value: unknown, remote: RemoteUser | undefined, copy: StoreMutationInput["copy"]): Record<string, unknown> | undefined {
     const write = withoutRemote(this.optionalExt(value));
+    if (copy) return { ...write, remote: clone(copy.remote) };
     if (!remote) return write;
-    const requested = isPlainObject(value) && isPlainObject(value.remote) ? value.remote : {};
-    const kept = isPlainObject(previous?.ext?.remote) ? previous.ext.remote : {};
-    const ids: Record<string, string> = {};
-    for (const key of ["room_id", "message_id"]) {
-      const id = typeof requested[key] === "string" && requested[key] !== "" ? requested[key] : kept[key];
-      if (typeof id === "string" && id !== "") ids[key] = ensureText(id, `ext.remote.${key}`, 256);
-    }
-    return { ...write, remote: { server: remote.server, user_id: remote.user_id, ...ids } };
+    return { ...write, remote: { server: remote.server, user_id: remote.user_id } };
   }
 
   private normalizedBody(value: unknown): Record<string, unknown> {
@@ -5424,7 +5426,7 @@ export class Store {
 
   /** A link's own `remote` (ext:remote): `{server}` with no `user_id`; undefined for anyone else. */
   private linkRemote(userId: string): RemoteOrigin | undefined {
-    if (isShadowUserId(userId)) return undefined;
+    if (!this.config.remote || isShadowUserId(userId)) return undefined;
     const link = this.linksNow()[userId];
     return link ? { server: link.server } : undefined;
   }
@@ -5445,19 +5447,24 @@ export class Store {
     return remote ? { ...ext, remote } : ext;
   }
 
-  /** The message a link already wrote for a remote message (remoteMessageKey), or undefined: one indexed read. */
-  private remoteDuplicateRow(key: string): string | undefined {
-    return this.rawRows<{ message_id: string }>("SELECT message_id FROM message_state INDEXED BY message_state_remote_idx WHERE remote_key = ? LIMIT 1", key)[0]?.message_id;
+  /**
+   * The live threads that remote users of the server at `authority` made
+   * here (ext:remote: a link's thread cap): a scan of the capped rooms table.
+   */
+  remoteThreadCount(authority: string, now = this.clock.now()): number {
+    this.ensureReady();
+    return this.reserved({ reads: 8 + MAX_THREAD_LIMIT + 2 }, false, now, () => integerColumn(this.rawRows<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IS NOT NULL AND substr(json_extract(fields_json, '$.creator_id'), -?) = ?`,
+      authority.length + 1, `@${authority}`,
+    )[0]?.count));
   }
 
-  /**
-   * A link's create of the remote message `remoteRoomId`/`remoteMessageId`
-   * (ext:remote) that it, as any of its shadows, already wrote: that
-   * message's `message_id`, tombstone included, or undefined.
-   */
-  remoteDuplicate(link: string, remoteMessageId: string, now = this.clock.now()): string | undefined {
+  /** A mirror's copy of the owner `server`'s message `messageId` (ext:remote, mirror.ts), or undefined: one indexed read. */
+  copyOf(server: string, messageId: string, now = this.clock.now()): string | undefined {
     this.ensureReady();
-    return this.reserved({ reads: 4 }, false, now, () => this.remoteDuplicateRow(remoteMessageKey(link, { message_id: remoteMessageId })!));
+    return this.reserved({ reads: 4 }, false, now, () => this.rawRows<{ message_id: string }>(
+      "SELECT message_id FROM message_state INDEXED BY message_state_remote_idx WHERE remote_key = ? LIMIT 1", copyKey(server, messageId),
+    )[0]?.message_id);
   }
 
   /** The link bound to `server` (ext:remote: one a remote server), or undefined. */
@@ -5465,49 +5472,22 @@ export class Store {
     return Object.entries(this.remoteLinks(now)).find(([, link]) => link.server === server)?.[0];
   }
 
-  /**
-   * The room pairs (ext:remote): each of this server's rooms shared with a
-   * remote server, that server's room, and the token of that server's link
-   * that this server signs in with to send there. `_meta` `remote_pairs`,
-   * read once and kept in memory. The tokens never leave the server.
-   */
-  remotePairs(now = this.clock.now()): readonly RemotePair[] {
+  /** What this server mirrors (ext:remote, MirrorState), read once and kept in memory; a copy to change and pass to setMirrorState. */
+  mirrorState(now = this.clock.now()): MirrorState {
     this.ensureReady();
-    return this.remotePairsCache ??= this.reserved({ reads: 2 }, false, now, () => this.readRemotePairs());
+    this.mirrorCache ??= this.reserved({ reads: 2 }, false, now, () => this.metaJson(META_REMOTE_MIRROR, (stored) => {
+      const value = stored as Partial<MirrorState>;
+      return Array.isArray(value.rooms) && isPlainObject(value.servers) ? value as MirrorState : undefined;
+    }, { rooms: [], servers: {} }));
+    return clone(this.mirrorCache);
   }
 
-  private readRemotePairs(): RemotePair[] {
-    return this.metaJson(META_REMOTE_PAIRS, (stored) => Array.isArray(stored)
-      ? stored.filter((pair): pair is RemotePair => isPlainObject(pair) && typeof pair.room_id === "string" && typeof pair.server === "string" &&
-        typeof pair.remote_room === "string" && typeof pair.token === "string")
-        .map((pair) => ({
-          room_id: pair.room_id, server: pair.server, remote_room: pair.remote_room, token: pair.token,
-          created_ms: integerColumn(pair.created_ms), start_log_id: integerColumn(pair.start_log_id),
-          ...(typeof pair.parent === "string" ? { parent: pair.parent } : {}),
-          ...(pair.refused === true ? { refused: true } : {}),
-        }))
-      : undefined, []);
-  }
-
-  /**
-   * Stores the pair of `room_id` with `server`, replacing one there was
-   * (ext:remote), at most MAX_REMOTE_PAIRS. The first pair with a server
-   * starts its outbox at the head of the log: nothing older is sent. A pair
-   * also lifts a stop of the server's outbox (an earlier refused sign-in).
-   */
-  setRemotePair(pair: Omit<RemotePair, "created_ms" | "start_log_id"> & { start_log_id?: number }, now = this.clock.now()): void {
+  setMirrorState(state: MirrorState, now = this.clock.now()): void {
     this.ensureReady();
-    this.reserved({ reads: 8, writes: 8 }, false, now, () => this.transaction(() => {
-      const pairs = this.readRemotePairs().filter((other) => !(other.room_id === pair.room_id && other.server === pair.server));
-      if (pairs.length >= MAX_REMOTE_PAIRS) throw new StoreError("denied", `This server shares at most ${MAX_REMOTE_PAIRS} rooms`);
-      pairs.push({ ...pair, created_ms: this.effectiveNow(now), start_log_id: pair.start_log_id ?? this.logState().last_log_id });
-      this.writeMeta(META_REMOTE_PAIRS, JSON.stringify(pairs));
-      this.remotePairsCache = undefined;
-      const outboxes = this.readOutboxes();
-      const outbox = outboxes[pair.server];
-      outboxes[pair.server] = { cursor: outbox?.cursor ?? this.logState().last_log_id };
-      this.writeMeta(META_REMOTE_OUTBOX, JSON.stringify(outboxes));
-    }));
+    this.reserved({ reads: 2, writes: 2 }, false, now, () => {
+      this.writeMeta(META_REMOTE_MIRROR, state.rooms.length || Object.keys(state.servers).length ? JSON.stringify(state) : null);
+      this.mirrorCache = clone(state);
+    });
   }
 
   /**
@@ -5525,86 +5505,6 @@ export class Store {
       const creator = storedCreator(row.fields_json);
       return { room_id: row.room_id, parent: row.parent_room_id, created_log_id: integerColumn(row.created_log_id), ...(creator ? { creator } : {}) };
     }));
-  }
-
-  /** Drops the pairs `drop` picks, and the thread pairs of those (ext:remote); the dropped ones. */
-  dropRemotePairs(pick: (pair: RemotePair) => boolean, now = this.clock.now()): RemotePair[] {
-    this.ensureReady();
-    return this.reserved({ reads: 4, writes: 4 }, false, now, () => this.transaction(() => {
-      const pairs = this.readRemotePairs();
-      const parents = new Set(pairs.filter(pick).map((pair) => `${pair.server}\n${pair.room_id}`));
-      // A thread's pair ends with its parent's.
-      const drop = (pair: RemotePair) => pick(pair) || (pair.parent !== undefined && parents.has(`${pair.server}\n${pair.parent}`));
-      const dropped = pairs.filter(drop);
-      if (dropped.length) {
-        const kept = pairs.filter((pair) => !drop(pair));
-        this.writeMeta(META_REMOTE_PAIRS, kept.length ? JSON.stringify(kept) : null);
-        this.remotePairsCache = undefined;
-      }
-      return dropped;
-    }));
-  }
-
-  private readOutboxes(): Record<string, RemoteOutbox> {
-    return this.metaJson(META_REMOTE_OUTBOX, (stored) => {
-      const outboxes: Record<string, RemoteOutbox> = {};
-      for (const [server, value] of Object.entries(stored as Record<string, unknown>)) {
-        if (isPlainObject(value)) outboxes[server] = { cursor: integerColumn(value.cursor), ...(typeof value.stopped === "string" ? { stopped: value.stopped } : {}) };
-      }
-      return outboxes;
-    }, {});
-  }
-
-  /** A remote server's outbox (ext:remote): the log ID it has sent through, and why sending stopped, if it did. */
-  remoteOutbox(server: string, now = this.clock.now()): RemoteOutbox | undefined {
-    this.ensureReady();
-    return this.reserved({ reads: 2 }, false, now, () => this.readOutboxes()[server]);
-  }
-
-  /** Moves a remote server's outbox forward to `cursor`, never back, or sets why it stopped (null: going again). */
-  setRemoteOutbox(server: string, change: { cursor?: number; stopped?: string | null }, now = this.clock.now()): void {
-    this.ensureReady();
-    this.reserved({ reads: 2, writes: 2 }, false, now, () => this.transaction(() => {
-      const outboxes = this.readOutboxes();
-      const before = outboxes[server] ?? { cursor: this.logState().last_log_id };
-      const next: RemoteOutbox = { cursor: Math.max(before.cursor, change.cursor ?? 0) };
-      const stopped = change.stopped === undefined ? before.stopped : change.stopped ?? undefined;
-      if (stopped !== undefined) next.stopped = stopped.slice(0, 200);
-      outboxes[server] = next;
-      this.writeMeta(META_REMOTE_OUTBOX, JSON.stringify(outboxes));
-    }));
-  }
-
-  /**
-   * The records of `rooms` after `after`, in log order, at most `limit`
-   * (a move's record is in both of its rooms, so it may come twice, once
-   * for each): one primary-key range of each room. Records below the
-   * history floor are gone already.
-   */
-  outboxRecords(rooms: readonly string[], after: number, limit: number, now = this.clock.now()): Array<{ room_id: string; log_id: number; kind: string; record: Record<string, unknown> }> {
-    this.ensureReady();
-    const ids = [...new Set(rooms)].slice(0, MAX_REMOTE_PAIRS);
-    return this.reserved({ reads: 8 + ids.length * (limit + 2) }, false, now, () => {
-      const floor = this.logState().history_floor;
-      const rows = ids.flatMap((roomId) => this.rawRows<{ room_id: string; log_id: number; kind: string; record_json: string }>(
-        "SELECT room_id, log_id, kind, record_json FROM records WHERE room_id = ? AND log_id > ? ORDER BY log_id LIMIT ?", roomId, Math.max(after, floor - 1), limit,
-      ));
-      rows.sort((a, b) => a.log_id - b.log_id || a.room_id.localeCompare(b.room_id));
-      // Cut at a whole log ID, so a move's two rows go together.
-      const cut = rows.slice(0, limit);
-      if (rows.length > limit) {
-        const last = cut[cut.length - 1].log_id;
-        while (rows.length > cut.length && rows[cut.length].log_id === last) cut.push(rows[cut.length]);
-      }
-      return cut.map((row) => ({ room_id: row.room_id, log_id: integerColumn(row.log_id), kind: row.kind, record: parseJson<Record<string, unknown>>(row.record_json, {}) }));
-    });
-  }
-
-  /** The newest log ID of each of `rooms` (their heads): whether an outbox is behind. One read a room. */
-  roomHeads(rooms: readonly string[], now = this.clock.now()): number {
-    this.ensureReady();
-    const ids = [...new Set(rooms)].slice(0, MAX_REMOTE_PAIRS);
-    return this.reserved({ reads: 4 + 2 * ids.length }, false, now, () => Math.max(0, ...ids.map((roomId) => integerColumn(this.roomRow(roomId)?.latest_log_id ?? 0))));
   }
 
   /** Whether another user removed a remote user from a room (ext:remote: `remote_left`), so its link may not join it again. */
@@ -5906,7 +5806,7 @@ export class Store {
    * editable. A message in a private room is answered only in that room
    * (`roomId`), so a reply elsewhere never points into it.
    */
-  private messageReference(value: unknown, field: string, floor: number, options: { viewer: string; roomId: string; self?: string; unchanged?: string }): string | undefined {
+  private messageReference(value: unknown, field: string, floor: number, options: { viewer: string; roomId: string; self?: string; unchanged?: string; anyRoom?: boolean }): string | undefined {
     if (value === undefined) return undefined;
     if (!isPlainObject(value) || typeof value.message_id !== "string" || value.message_id.length === 0) {
       throw new StoreError("invalid_params", `${field}.message_id must be a non-empty string`);
@@ -5914,7 +5814,7 @@ export class Store {
     const messageId = ensureText(value.message_id, `${field}.message_id`, 256);
     if (options.self !== undefined && messageId === options.self) throw new StoreError("invalid_params", `${field} cannot name the message itself`);
     if (messageId !== options.unchanged) {
-      const target = this.visibleMessage(messageId, options.viewer, floor);
+      const target = options.anyRoom ? this.currentMessage(messageId, floor) : this.visibleMessage(messageId, options.viewer, floor);
       if (!target) throw new StoreError("invalid_params", `${field} names an unknown or expired message`);
       if (isPrivateRoomId(target.room_id) && target.room_id !== options.roomId) throw new StoreError("denied", `${field} names a message in a private room; reply there instead`);
     }
@@ -5969,7 +5869,9 @@ export class Store {
     if (typeof roomId !== "string" || roomId.length === 0) throw new StoreError("invalid_params", "room_id must be a non-empty string");
     const messageIdParam = params.message_id;
     if (messageIdParam !== undefined && typeof messageIdParam !== "string") throw new StoreError("invalid_params", "message_id must be a string");
-    const current = messageIdParam === undefined ? null : this.visibleMessage(ensureText(messageIdParam, "message_id", 256), input.userId, floor);
+    const current = messageIdParam === undefined ? null : input.copy
+      ? this.currentMessage(ensureText(messageIdParam, "message_id", 256), floor)
+      : this.visibleMessage(ensureText(messageIdParam, "message_id", 256), input.userId, floor);
     if (messageIdParam !== undefined && !current) throw new StoreError("invalid_params", "unknown or expired message");
     const previous = current ? parseJson<MessageSnapshot>(current.snapshot_json) : null;
     // A save of someone else's message in its own room may change only the
@@ -5983,8 +5885,8 @@ export class Store {
     // Someone else's message may otherwise only be moved, and only by a moderator (MODERATOR_ROLES, BOT_MODERATOR_ROLES).
     const moving = current !== null && current.author_id !== input.userId && !editor;
     if (moving && (current.room_id === roomId || !this.isModerator(input.userId))) throw new StoreError("denied", "Only the original author may edit this message");
-    // Posting needs no join, except in a private room, which only its members see.
-    if (!this.visibleRoomRow(roomId, input.userId)) throw new StoreError("invalid_params", "unknown room");
+    // Posting needs no join, except in a private room, which only its members see. A mirror's copy goes where its room is.
+    if (!(input.copy ? this.roomRow(roomId) : this.visibleRoomRow(roomId, input.userId))) throw new StoreError("invalid_params", "unknown room");
     // A private room's messages stay in it, and no other room's come in.
     if (current !== null && current.room_id !== roomId && (isPrivateRoomId(current.room_id) || isPrivateRoomId(roomId))) {
       throw new StoreError("denied", "Messages cannot be moved into or out of a private room");
@@ -5996,6 +5898,7 @@ export class Store {
     const replyId = editor ? previous!.reply_to?.message_id : this.messageReference(params.reply_to, "reply_to", floor, {
       viewer: input.userId,
       roomId,
+      ...(input.copy ? { anyRoom: true } : {}),
       ...(typeof messageIdParam === "string" ? { self: messageIdParam } : {}),
       ...(previous?.reply_to ? { unchanged: previous.reply_to.message_id } : {}),
     });
@@ -6014,13 +5917,9 @@ export class Store {
     // snapshot when not its sender (ext:editors); requests do not set it.
     // A moderator's move changes no content, so it keeps the edited_by of the text it moves.
     // `ext.remote` is the server's (ext:remote): set for a link's shadow, else kept.
-    const write = editor ? undefined : this.messageExtWrite(params.ext, input.remote, previous);
-    // A link's create of a remote message it already wrote is a duplicate (ext:remote): nothing is logged.
-    const remoteKey = !previous && input.link !== undefined && isPlainObject(write?.remote) ? remoteMessageKey(input.link, write.remote) : undefined;
-    if (remoteKey !== undefined) {
-      const existing = this.remoteDuplicateRow(remoteKey);
-      if (existing) return { result: { message_id: existing }, broadcasts: [] };
-    }
+    const write = editor ? undefined : this.messageExtWrite(params.ext, input.remote, input.copy);
+    // A mirror's copy is found again by its original (mirror.ts).
+    const remoteKey = !previous && input.copy ? copyKey(input.copy.remote.server, input.copy.remote.message_id) : undefined;
     const merged = deleted ? undefined : mergeExt(previous?.ext, write);
     const ext = moving ? merged : withEditedBy(merged, editor ? input.userId : undefined);
     const from = previous ? previous.from : this.identityForMessage(input);
@@ -7807,7 +7706,10 @@ export class Store {
     const messageIdParam = params.message_id;
     if (typeof messageIdParam !== "string" || messageIdParam.length === 0) throw new StoreError("invalid_params", "message_id must be a non-empty string");
     const emojis = this.normalizedEmojis(params.emojis);
-    const message = this.visibleMessage(ensureText(messageIdParam, "message_id", 256), input.userId, floor);
+    // A mirror's copy of a reaction set is the server's to write (ext:remote).
+    const message = input.copy
+      ? this.currentMessage(ensureText(messageIdParam, "message_id", 256), floor)
+      : this.visibleMessage(ensureText(messageIdParam, "message_id", 256), input.userId, floor);
     if (!message) throw new StoreError("invalid_params", "unknown or expired message");
     const snapshot = parseJson<MessageSnapshot>(message.snapshot_json);
     // Clients hide a tombstone's reactions; the demo stores no new ones.
@@ -7893,8 +7795,8 @@ export class Store {
     if (titleParam !== undefined && typeof titleParam !== "string") throw new StoreError("invalid_params", "title must be a string");
     const descriptionParam = params.description;
     if (descriptionParam !== undefined && typeof descriptionParam !== "string") throw new StoreError("invalid_params", "description must be a string");
-    // `remote` is the server's (ext:remote), and never a room's.
-    const write = withoutRemote(this.optionalExt(params.ext));
+    // `remote` is the server's (ext:remote): a mirror room's or thread's owner room (mirror.ts), and nobody else's.
+    const write = input.roomRemote ? { ...withoutRemote(this.optionalExt(params.ext)), remote: clone(input.roomRemote) } : withoutRemote(this.optionalExt(params.ext));
     // A private room someone is not in is unknown to them, as one that does not exist.
     const existing = roomIdParam === undefined ? undefined : this.visibleRoomRow(roomIdParam, input.userId);
     const isPrivate = makePrivate || (existing ? isPrivateRoomId(existing.room_id) : false);

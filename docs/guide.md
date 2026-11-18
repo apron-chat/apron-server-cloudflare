@@ -293,26 +293,27 @@ used the old one; `/invite-device remove <id>` revokes it, and
 
 Two Apron servers whose operators trust each other can share rooms (extension
 `ext:remote`, the [trusted federation](https://github.com/shazow/apron/blob/main/recipes/trusted_federation.md)
-recipe; [SPEC section 4](../SPEC.md#extension-extremote)). Set `REMOTE_SELF`
-to this server's address as others dial it, such as `wss://chat.example/ws`.
-As an admin, in the room to share (a private one works: create it with
-`room_set` and `private: true`), run `/remote invite <the other server's address>`.
-The `~private` notice holds an invite,
-`https://link.apron.chat/#server=<this server>&room=<room>&token=<token>`; hand
-it privately to an admin of the other server, who runs
-`/remote connect <invite>` in their room. Then each server sends its own
-users' messages, edits, deletes, reactions and leaves to the other as they
-happen, dialing out on demand and closing the connection after
-`REMOTE_LINGER_MS`. The other server's users appear here as
-`carol@go.example`, with `ext.remote` naming their server. Run the same two
-commands in another room to share it too; both use the same links. Threads
-of a shared room are shared with it; a private room here has no threads, so a
-thread the other server starts in it stays there, with a notice saying so.
-`/remote unshare` stops one room, `/remote revoke <address>` every room with a
-server, and `/remote list` shows what is shared.
+recipe; [SPEC section 4](../SPEC.md#extension-extremote)). It is off unless
+`REMOTE_SELF` is set to this server's address as others dial it, such as
+`wss://chat.example/ws`. One server hosts each shared room (the owner); the
+other mirrors it. On the owner, an admin runs `/remote invite <the mirror's
+address>` in the room (a private one works). The `~private` notice holds an
+invite, `https://link.apron.chat/#server=<this server>&room=<room>&token=<token>`;
+hand it privately to an admin of the mirror server, who runs
+`/remote connect <invite>` there. That makes a mirror room with the owner's
+title, which the admin then adds people to. The mirror reads the owner's room
+through the link and copies it in; its users' writes in the mirror room go to
+the owner, and come back as copies. The mirror connects when there is
+something to do (a write, the owner's wake push to `/remote/wake/<id>`, the
+alarm every five minutes) and closes after `REMOTE_LINGER_MS`. The owner's
+users appear on the mirror as `carol@owner.example`, with `ext.remote` naming
+their server. Threads of a shared public room are mirrored too; a private
+room here has no threads. `/remote unshare` stops a room (on the mirror, it
+keeps its copies and takes no more writes), `/remote revoke <address>` stops
+a mirror server, and `/remote list` shows what is shared.
 
-Locally, two instances share rooms like this (each with its own state and
-inspector port):
+Locally, two instances (an owner and a mirror) run like this, each with its
+own state and inspector port:
 
 ```sh
 npx wrangler dev --port 8787 --ip 127.0.0.1 --persist-to .state-a --inspector-port 9787 \

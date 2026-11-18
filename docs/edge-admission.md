@@ -24,6 +24,12 @@ protected than production. This file
 contains rule definitions grouped by phase; it is not a payload for replacing
 an entire zone ruleset.
 
+With `REMOTE_SELF` set (extension `ext:remote`, hosted rooms and mirrors),
+owners wake this server's mirror rooms with `POST /remote/wake/<id>`, which
+`apron_invalid_request` would block: add `(http.request.method eq "POST" and
+starts_with(http.request.uri.path, "/remote/wake/"))` to its exceptions by
+hand. The generator does not write it yet, as the extension is a prototype.
+
 During an authorized deployment:
 
 1. Verify the account's Workers plan matches `PLAN` in `src/budget.ts`, the zone's WAF capabilities,

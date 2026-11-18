@@ -91,7 +91,6 @@ import {
 	type StoreConfig,
 	type StoreMutationInput,
 	type StoreMutationResult,
-	type RemotePair,
 	type StoredServerMetadata,
 	type UploadFinish,
 	type UploadWrite,
@@ -125,7 +124,7 @@ import {
 import { pageHeaders, renderErrorPage, renderSignInPage, type SignInPageView } from "./sign-in-page";
 import { Deadline } from "./deadline";
 import { actAsUserId, isShadowUserId, normalizeRemoteAddress, parseInvite, remoteAuthority, remoteUserIdError, shadowUserId, withoutRemote, type RemoteUser } from "./remote";
-import { LinkConnection, Outbox, RetryLater, SendingStopped, type OutboxDeps } from "./sender";
+import { RemoteRooms, type MirrorClient, type MirrorHost } from "./mirror";
 
 const OBJECT_NAME = "public-demo-v1";
 const INTERNAL_IP_HEADER = "X-Apron-Trusted-IP-Key";
@@ -533,10 +532,6 @@ const THROTTLE_WINDOW_MS = 60_000;
  * or digit, and `auth` never honors a requested `user_id`).
  */
 const PRIVATE_IDENTITY = { user_id: "~private", name: "System message to you" } as const;
-/** The IP key the server's own logged notices are charged to: no connection sends it. */
-const SYSTEM_IP_KEY = "system";
-/** The room's system identity (Appendix A.1), for logged notices in a room, such as one about a thread that is not shared (ext:remote). */
-const ROOM_IDENTITY = { user_id: "~room", name: "Room" } as const;
 /**
  * The liveness ping clients send every `server.ping` seconds, byte for byte,
  * and its answer (§1). The runtime answers it without waking the object.
@@ -984,29 +979,6 @@ const MAX_REMOTE_THREADS = 25;
 const LINK_TOKENS_KEY_PREFIX = "remote-tokens:";
 /** The tokens a link keeps: each invite mints one, and the oldest goes past this. */
 const MAX_LINK_TOKENS = 16;
-/** While a sender runs, the alarm comes this soon, so an instance that stops mid-send leaves no outbox behind. */
-const REMOTE_WATCHDOG_MS = 60_000;
-/** The longest wait between a sender's tries. */
-const REMOTE_RETRY_MAX_MS = 10 * 60_000;
-
-/**
- * One remote server's sender in this instance (extension `ext:remote`):
- * its outbox, the connection it holds while it sends and lingers, and
- * when it tries again after a failure. `stopped` is why sending stopped
- * (a refused sign-in), null while it may send, undefined until read.
- */
-interface RemoteSender {
-	server: string;
-	outbox: Outbox;
-	connection?: LinkConnection;
-	running?: Promise<void>;
-	again: boolean;
-	lingerTimer?: ReturnType<typeof setTimeout>;
-	failures: number;
-	retryAt?: number;
-	stopped?: string | null;
-}
-
 /**
  * Who a link's act-as request (extension `ext:remote`) runs as: the shadow
  * user's identity, the link account's `user_id`, and the shadow's `remote`.
@@ -1082,6 +1054,8 @@ export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 	return {
 		retentionMs: limits.retentionSeconds * 1_000,
 		idleAccountMs: limits.idleAccountSeconds * 1_000,
+		// ext:remote: on with REMOTE_SELF (mirror.ts).
+		remote: config.remoteSelf !== undefined,
 		keptActiveAccounts: limits.keptActiveAccounts,
 		retiredUserIdMs: limits.retiredUserIdSeconds * 1_000,
 		dedupTtlMs: limits.dedupTtlSeconds * 1_000,
@@ -2174,6 +2148,43 @@ async function handleLiveWrite(request: Request, env: Env, key: string): Promise
  * arrives, from the Durable Object's memory, as `text/plain; charset=utf-8`
  * with `nosniff`. Charged as a connection attempt first.
  */
+/** The route an owner's wake push for this server's mirror reaches (extension `ext:remote`, mirror.ts). */
+const REMOTE_WAKE_ROUTE = "/remote/wake/";
+/** The object's path for a wake push, which only the entry Worker builds. */
+const REMOTE_WAKE_PATH = "/__remote/wake/";
+
+/**
+ * `POST /remote/wake/<id>` (extension `ext:remote`): an owner's `relay`
+ * push for a room this server mirrors, with the token it registered as
+ * `Authorization: Bearer`. Only while `REMOTE_SELF` is set; a small body,
+ * counted against the caller's connection attempts (a Worker's by its
+ * zone), then the object reads that owner. Answers 204, or 404.
+ */
+async function handleRemoteWake(request: Request, env: Env, id: string): Promise<Response> {
+	if (request.method !== "POST") return responseError(405, "Method not allowed");
+	if (!/^[A-Za-z0-9_-]{8,64}$/.test(id) || !env.DEMO) return responseError(404, "Not found");
+	let config: RuntimeConfig;
+	try {
+		config = loadConfig(env);
+	} catch {
+		return responseError(503, "Configuration unavailable");
+	}
+	if (!config.remoteSelf) return responseError(404, "Not found");
+	if (Number(request.headers.get("Content-Length") ?? "0") > 4_096) return responseError(413, "Too large");
+	const principal = extractClientPrincipal(request.headers);
+	if (!principal) return responseError(403, "Trusted client address unavailable");
+	try {
+		if (!env.CONNECTION_ATTEMPTS || !(await env.CONNECTION_ATTEMPTS.limit({ key: await hashIpKey(principal) })).success) return responseError(429, "Too many wakes", 60_000);
+	} catch {
+		return responseError(503, "Admission unavailable", UNAVAILABLE_RETRY_MS);
+	}
+	await request.body?.cancel();
+	const headers = new Headers();
+	const authorization = request.headers.get("Authorization");
+	if (authorization) headers.set("Authorization", authorization);
+	return fromObject(await env.DEMO.getByName(OBJECT_NAME).fetch(new Request(`https://remote.internal${REMOTE_WAKE_PATH}${id}`, { method: "POST", headers })));
+}
+
 async function handleLiveRead(request: Request, env: Env, id: string): Promise<Response> {
 	if (request.method === "OPTIONS") {
 		return new Response(null, { status: 204, headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS", "Access-Control-Max-Age": "86400" } });
@@ -2390,6 +2401,8 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url);
 	if (url.pathname.startsWith("/w/")) return handleUploadWrite(request, env, url.pathname.slice(3));
 	if (url.pathname.startsWith("/live/")) return handleLiveRead(request, env, url.pathname.slice(6));
+	// ext:remote hook: an owner's wake push for this server's mirror (mirror.ts).
+	if (url.pathname.startsWith(REMOTE_WAKE_ROUTE)) return handleRemoteWake(request, env, url.pathname.slice(REMOTE_WAKE_ROUTE.length));
 	const relatedOrigins = handleRelatedOrigins(request, env, url);
 	if (relatedOrigins) return relatedOrigins;
 	const signIn = await handleSignIn(request, env, url);
@@ -2546,14 +2559,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * - `presence`: waiting status changes are to be announced (armPresence).
 	 */
 	private readonly deadlines = { maintenance: new Deadline(), uploads: new Deadline(), live: new Deadline(), presence: new Deadline(), remote: new Deadline() };
-	/** Each remote server's sender (extension `ext:remote`; RemoteSender), while this instance runs. */
-	private readonly senders = new Map<string, RemoteSender>();
-	/** The authors already told that a remote server removed them from a room (ext:remote), by server, room and user. */
-	private readonly toldRemoved = new Set<string>();
 	/** Each room's parent as read (parentOf): fixed at creation. */
 	private readonly roomParents = new Map<string, string | null>();
-	/** This server's address as an admin's connection reached it, for links in sent text when `REMOTE_SELF` is unset. */
-	private knownSelf: string | undefined;
+	/** Extension `ext:remote` (mirror.ts): hosted rooms and their mirrors, on with `REMOTE_SELF`; undefined while off. */
+	private readonly remote: RemoteRooms | undefined;
 	private alarmTail: Promise<void> = Promise.resolve();
 	private alarmFailures = 0;
 	private alarmKnown = false;
@@ -2669,6 +2678,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.runtimeEnv = env;
 		this.config = loadConfig(env);
 		this.store = new Store(ctx as unknown as ConstructorParameters<typeof Store>[0], asStoreConfig(this.config));
+		// ext:remote hook: the feature exists only with REMOTE_SELF.
+		this.remote = this.config.remoteSelf ? new RemoteRooms(this.mirrorHost(this.config.remoteSelf)) : undefined;
 		// An overrun is observed, not fatal: the day's first is told, and a
 		// breaker it opened is told by the tier evaluation that follows.
 		this.store.onOverrun = (notice) => {
@@ -2735,9 +2746,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		const path = new URL(request.url).pathname;
 		if (path.startsWith(LIVE_WRITE_PATH) || path.startsWith(LIVE_READ_PATH)) return this.liveFetch(request, path);
+		// ext:remote hook: an owner's wake push (handleRemoteWake).
+		if (path.startsWith(REMOTE_WAKE_PATH)) {
+			return this.remote?.wake(path.slice(REMOTE_WAKE_PATH.length), request.headers.get("Authorization")) ? new Response(null, { status: 204 }) : responseError(404, "Not found");
+		}
 		if (path.startsWith(SIGN_IN_PATH)) return this.signInFetch(request, path.slice(SIGN_IN_PATH.length));
 		const status = isConnectionStatus(request);
 		if (request.method !== "GET" || (!isUpgrade(request) && !status)) return responseError(400, "WebSocket upgrade required");
+		// ext:remote hook: this instance's first connection reads each mirrored owner once.
+		this.remote?.startup();
 		const ipKey = trustedIpKey(request);
 		if (!ipKey) return responseError(403, "Trusted client address unavailable");
 		if (this.config.admissionOff) return responseError(503, "Demo admission is closed");
@@ -2978,8 +2995,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const now = nowMs();
 		this.noteBurn("alarm");
 		this.sweepPresence(now);
-		// Outboxes left behind (a failure, or an instance that stopped mid-send) go again.
-		this.resumeSenders(now);
+		// ext:remote hook: each mirrored owner is read now and then, in case a wake push was lost.
+		if (this.deadlines.remote.passed(now)) this.deadlines.remote.clear();
+		if (this.remote) await this.remote.onAlarm(now).catch(() => undefined);
 		// An alarm that only announced waiting status changes stops here: the
 		// usage refresh, sweeps and cleanup below run on the alarms that have
 		// their own work, as they did before presence used the alarm.
@@ -3170,10 +3188,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 					"ext:editors",
 					// Custom emoji (ext:emoji), once an admin has added one.
 					...(emoji ? ["ext:emoji"] : []),
-					// Link accounts, whose requests may run as shadow users of
-					// their remote server (actAs), and `remote` on those users and
-					// their messages.
-					"ext:remote",
+					// ext:remote hook: hosted rooms and mirrors (mirror.ts), with REMOTE_SELF only.
+					...(this.remote ? ["ext:remote"] : []),
 					// With `external`, this server is its own authorization server
 					// with the standard OAuth parts (ext:oauth): the metadata, the
 					// token endpoint (tokenEndpoint), and CORS on both.
@@ -3561,6 +3577,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// A frame from a connection not idle is its user attended (see attended),
 		// a stale one resuming included: what was pushed is unread no longer.
 		if (!attachment.idle) this.clearUnread(attachment);
+		// ext:remote hooks: a link's wake push, a local user's write in a mirror room, a link acting as a remote user.
+		if (this.remote && await this.remoteRequest(socket, attachment, request)) return;
 		if (await this.actAs(socket, attachment, request)) return;
 		switch (request.method) {
 			case "auth":
@@ -3609,9 +3627,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return;
 			case "command":
 				await this.handleCommand(socket, attachment, request);
-				return;
-			case "ext:remote":
-				await this.handlePair(socket, attachment, request);
 				return;
 			case "ping":
 				// The exact ping bytes are answered by the runtime; a ping with other
@@ -5015,8 +5030,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const cleared = { ...(current.name ? {} : { name: "" }), ...(removeAvatar ? { avatar: "" } : {}) };
 			this.reply(socket, request, { you: { ...this.you(current), ...cleared } });
 			if (result.deduplicated || (name === undefined && !changed)) return;
-			// The servers this user's records went to get the new profile (ext:remote).
-			this.noteProfile(identity.user_id);
+			// ext:remote hook: the owners of the rooms this user writes in mirrored get the new name.
+			if (name !== undefined) this.remote?.onProfile(identity.user_id, name);
 			// §3.3: `you` to the user's other connections, `new` to those who share
 			// a room with the user, with the ext keys that changed (§4.13).
 			const user = { ...this.current(current)!, ...(current.name ? {} : { name: "" }), ...(changed ? { ext: changed } : {}) };
@@ -5093,17 +5108,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const messageId = optionalString(request.params, "message_id");
 		if (messageId === undefined && request.params.body === undefined) throw { name: "invalid_params", message: "Missing body" } satisfies ProtocolError;
 		if (request.params.body !== undefined) objectParam(request.params, "body");
-		if (actor && messageId === undefined) {
-			// A create of a remote message the link already wrote is a duplicate (ext:remote):
-			// nothing is logged, and the result names the copy.
-			const remote = (request.params.ext as Record<string, unknown>).remote as Record<string, unknown>;
-			const existing = typeof remote.message_id === "string" && remote.message_id !== ""
-				? this.store.remoteDuplicate(actor.link, remote.message_id, nowMs()) : undefined;
-			if (existing !== undefined) {
-				this.reply(socket, request, { message_id: existing });
-				return;
-			}
-		}
 		// A shadow first joins the room it posts in, if its link is in it (ext:remote).
 		if (actor) await this.shadowJoins(socket, attachment, actor, optionalString(request.params, "room_id") ?? ROOM_ID);
 		await this.commitAndBroadcast(socket, attachment, request, "message", "posting", actor);
@@ -5136,6 +5140,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async actAs(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<boolean> {
 		const method = request.method;
+		// ext:remote hook: off, a link is an ordinary bot, and the store drops `remote` from every request.
+		if (!this.remote) return false;
 		if (method !== "message" && method !== "reactions" && method !== "me" && method !== "room_leave" && method !== "room_set") return false;
 		const remoteUserId = actAsUserId(request.params);
 		const link = attachment.tier === "registered" ? attachment.userId : undefined;
@@ -5205,12 +5211,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const current = connectionAttachment(socket) ?? attachment;
 		if (!this.roomExists(parentId) || !this.sees(current, parentId)) throw { name: "invalid_params", message: "unknown room", data: NOT_JOINED } satisfies ProtocolError;
 		if (!(current.rooms ?? []).includes(parentId)) throw { name: "denied", message: "This link is not in that room, so its remote users may not make threads there", data: NOT_JOINED } satisfies ProtocolError;
-		const remoteThread = ((params.ext as Record<string, unknown>).remote as Record<string, unknown>).room_id;
-		const pairs = this.store.remotePairs(nowMs());
 		if (roomId === undefined) {
-			if (typeof remoteThread !== "string" || remoteThread === "") throw { name: "invalid_params", message: "ext.remote.room_id must name the thread on the link's server" } satisfies ProtocolError;
-			const live = pairs.filter((pair) => pair.server === actor.remote.server && pair.parent !== undefined && !pair.refused && this.roomExists(pair.room_id)).length;
-			if (live >= MAX_REMOTE_THREADS) throw { name: "denied", message: `A link makes at most ${MAX_REMOTE_THREADS} threads here at once` } satisfies ProtocolError;
+			if (this.store.remoteThreadCount(remoteAuthority(actor.remote.server), nowMs()) >= MAX_REMOTE_THREADS) throw { name: "denied", message: `A link's remote users make at most ${MAX_REMOTE_THREADS} threads here at once` } satisfies ProtocolError;
 			// The remote user joins the room first, so the room's own rules answer (a private room has no threads).
 			await this.shadowJoins(socket, attachment, actor, parentId);
 		}
@@ -5221,16 +5223,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 			});
 			const room = result.room;
 			if (room && !result.deduplicated) {
-				// Paired before anything is delivered, so this server's sender never takes it for a local thread.
-				const parentPair = pairs.find((pair) => pair.server === actor.remote.server && pair.room_id === parentId);
-				if (result.created && parentPair && typeof remoteThread === "string") {
-					this.store.setRemotePair({ room_id: room.room_id, server: actor.remote.server, remote_room: remoteThread, token: parentPair.token, parent: parentId }, nowMs());
-				}
 				this.noteRoom(room.room_id, true);
 				this.deliver(roomUpdate("updated", room), [room.room_id, parentId]);
 				if (result.membership) this.broadcastRecord(result.membership);
 			}
 			this.reply(socket, request, result.result);
+			// The links in the room join its new thread, so their mirrors read it (queued after this mutation).
+			if (room && result.created && !result.deduplicated) void this.remote?.threadCreated(room.room_id, parentId).catch(() => undefined);
 		});
 	}
 
@@ -5330,6 +5329,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 				this.noteRoom(room.room_id, true);
 				const scope = [room.room_id, ...(room.parent_room_id !== undefined ? [room.parent_room_id] : [])];
 				if (result.created) {
+					// ext:remote hook: the links in the room join its new thread, so their mirrors read it.
+					if (room.parent_room_id !== undefined) void this.remote?.threadCreated(room.room_id, room.parent_room_id).catch(() => undefined);
 					if (room.parent_room_id === undefined && !room.private) this.topLevelRooms?.push(room.room_id);
 					this.setRooms(identity.user_id, [...(this.liveRoomsOf(identity.user_id) ?? []), room.room_id]);
 					// A new room's only member is its creator: no storage to read.
@@ -7710,7 +7711,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		if (command.name === "remote") {
 			try {
-				await this.remoteCommand(socket, attachment, request, roomId, words.slice(1));
+				// ext:remote hook: /remote exists only while the feature is on (commands()).
+				await this.remote!.command(socket, attachment as MirrorClient, request, roomId, words.slice(1));
 			} catch (error) {
 				const protocol = errorToProtocol(error);
 				if (protocol.name !== "invalid_params") throw error;
@@ -7769,6 +7771,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/** The commands this deployment offers: `/avatar` only while uploads are on, `/emoji` where they are configured, and `/embed-terminal` and `/embed-append` while live text is on. */
 	private commands(): typeof COMMANDS {
 		return COMMANDS.filter((command) => (command.name !== "avatar" || this.uploadsOn()) && (command.name !== "emoji" || !!this.config.uploads) &&
+			// ext:remote hook: /remote only while the feature is on.
+			(command.name !== "remote" || !!this.remote) &&
 			(!command.name.startsWith("embed-") || this.liveTextOn()));
 	}
 
@@ -8681,197 +8685,83 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `/remote` (extension `ext:remote`; the trusted federation recipe), for
-	 * admins, each answered by a `~private` notice before the result:
-	 * - `invite <address>`: joins this server's one link for the remote server
-	 *   at `address` to this room (made on first use, Store.createRemoteLink),
-	 *   mints it a new token, and gives the invite: an Appendix A.4 link with
-	 *   this server's address (selfAddress), this room and the token.
-	 * - `connect <invite>`: does the same for the invite's server, then dials
-	 *   it, signs in with the invite's token as its link for this server, and
-	 *   sends this server's own invite back with an `ext:remote` request,
-	 *   which pairs the two rooms there. On `{}` the pair is kept here too.
-	 * - `unshare`: removes every link from this room and drops its pairs.
-	 * - `list`: the links, the pairs and the outboxes.
-	 * - `revoke <address>`: revokes the link's tokens, closes its
-	 *   connections, and drops the pairs with that server. Its account, its
-	 *   remote users and their posts stay.
+	 * Adds a registered user (a link, ext:remote) to a room as `actor` would
+	 * with `room_join` and a `user_id`: a logged join charged to the actor
+	 * (or to `actor.ipKey` alone), its membership to the room's members, and
+	 * the user's connections the room with its members. A private room takes
+	 * it when the actor is in it.
 	 */
-	private async remoteCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, args: string[]): Promise<void> {
-		const usage = { name: "invalid_params", message: "Usage: /remote invite <address> | connect <invite> | unshare | list | revoke <address>" } satisfies ProtocolError;
-		const [action, argument] = args;
-		if (action === "list" && args.length === 1) {
-			this.sendNotice(socket, roomId, this.remoteListing());
-			this.reply(socket, request, {});
-			return;
-		}
-		if (action === "unshare" && args.length === 1) {
-			const removed: string[] = [];
-			for (const [linkId, link] of Object.entries(this.store.remoteLinks(nowMs()))) {
-				if (!this.store.isRoomMember(roomId, linkId, nowMs())) continue;
-				await this.removeMember(attachment, roomId, linkId);
-				removed.push(link.server);
-			}
-			const dropped = this.store.dropRemotePairs((pair) => pair.room_id === roomId, nowMs());
-			// Each other server is told, so its pair ends too and its link leaves its room.
-			const untold: string[] = [];
-			for (const pair of dropped) {
-				let connection: LinkConnection | undefined;
-				try {
-					connection = await LinkConnection.open(pair.server, pair.token);
-					const ended = await connection.call("ext:remote", { room_id: pair.remote_room }, `unpair:${pair.remote_room}:${Date.now()}`);
-					if (ended.error) untold.push(`${pair.server} (${ended.error.message ?? ended.error.code})`);
-				} catch (error) {
-					untold.push(`${pair.server} (${error instanceof Error ? error.message : String(error)})`);
-				} finally {
-					connection?.close();
-				}
-			}
-			const servers = [...new Set([...removed, ...dropped.map((pair) => pair.server)])];
-			this.sendNotice(socket, roomId, (servers.length ? `This room is no longer shared with ${servers.join(", ")}.` : "This room is not shared.") +
-				(untold.length ? ` Could not tell ${untold.join(", ")}; it ends its side at its next write here.` : ""));
-			this.reply(socket, request, {});
-			return;
-		}
-		if (action === "revoke" && args.length === 2) {
-			const server = normalizeRemoteAddress(argument);
-			const linkId = server === undefined ? undefined : this.store.remoteLinkFor(server, nowMs());
-			if (server === undefined || linkId === undefined) throw { name: "invalid_params", message: `No link is bound to ${argument}`.slice(0, 200) } satisfies ProtocolError;
-			await this.forgetLinkTokens(linkId);
-			for (const peer of this.connectionsOf(linkId)) {
-				const state = connectionAttachment(peer);
-				if (state) this.closePolicy(peer, state, 1008, "This link was revoked");
-			}
-			const dropped = this.store.dropRemotePairs((pair) => pair.server === server, nowMs());
-			this.closeSender(server);
-			this.sendNotice(socket, roomId, `Revoked the link \`${linkId}\` for ${server}: its tokens no longer sign in, and ${dropped.length} shared room${dropped.length === 1 ? "" : "s"} stopped. Its account, its remote users and their posts stay.`);
-			this.reply(socket, request, {});
-			return;
-		}
-		if ((action !== "invite" && action !== "connect") || args.length !== 2) throw usage;
-		const self = this.selfAddress(socket, attachment);
-		if (!self) throw { name: "invalid_params", message: "This server does not know its own address; set REMOTE_SELF" } satisfies ProtocolError;
-		const invite = action === "connect" ? parseInvite(argument) : undefined;
-		if (action === "connect" && !invite) throw { name: "invalid_params", message: "The invite is a link from /remote invite on the other server, with server, room and token" } satisfies ProtocolError;
-		const server = invite?.server ?? normalizeRemoteAddress(argument);
-		if (!server) throw { name: "invalid_params", message: "The address is the remote server's WebSocket URL, ws:// or wss://, such as wss://chat.example/ws" } satisfies ProtocolError;
-		if (server === self) throw { name: "invalid_params", message: "That is this server's own address" } satisfies ProtocolError;
-		const linkId = await this.linkInRoom(attachment, server, roomId);
-		const token = await this.mintLinkToken(linkId);
-		const own = apronLink(self, { room: roomId, token });
-		if (!invite) {
-			this.sendNotice(socket, roomId, [
-				`To share this room with ${server}, an admin there runs \`/remote connect\` with this invite in their room. It holds a token of this server's link for that server (\`${linkId}\`), which writes here as that server's users, so hand it over privately. \`/remote unshare\` stops sharing this room; \`/remote revoke ${server}\` stops every room.`,
-				"`" + own + "`",
-			].join("\n\n"));
-			this.reply(socket, request, {});
-			return;
-		}
-		let connection: LinkConnection | undefined;
-		let refusal: string | undefined;
-		try {
-			connection = await LinkConnection.open(server, invite.token);
-			const paired = await connection.call("ext:remote", { room_id: invite.room, link: own }, `pair:${roomId}:${Date.now()}`);
-			if (paired.error) refusal = paired.error.message ?? `error ${paired.error.code}`;
-		} catch (error) {
-			refusal = error instanceof Error ? error.message : String(error);
-		} finally {
-			connection?.close();
-		}
-		if (refusal !== undefined) throw { name: "invalid_params", message: `Could not connect to ${server}: ${refusal}`.slice(0, 200) } satisfies ProtocolError;
-		this.store.setRemotePair({ room_id: roomId, server, remote_room: invite.room, token: invite.token }, nowMs());
-		this.senderFor(server).stopped = undefined;
-		this.sendNotice(socket, roomId, `Connected: this room is shared with room \`${invite.room}\` on ${server}.`);
-		this.reply(socket, request, {});
-	}
-
-	/**
-	 * An `ext:remote` request (extension `ext:remote`): a link pairs one of
-	 * this server's rooms that it has joined with a room of its server, and
-	 * gives the link (Appendix A.4) that this server sends that room's
-	 * records through. Anyone but a link is `denied`; a room the link has not
-	 * joined, a link that does not parse, or one of another server is
-	 * `invalid_params`. A later request for the room replaces the pair.
-	 * Without `link`, it ends the pair of the room, and the link leaves it:
-	 * either server may end a pair, only the room's own starts one.
-	 */
-	private async handlePair(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
-		const link = attachment.tier === "registered" ? attachment.userId : undefined;
-		const server = link === undefined ? undefined : this.store.remoteLink(link, nowMs());
-		if (server === undefined) throw { name: "denied", message: "Only a link may pair rooms" } satisfies ProtocolError;
-		const roomId = requiredString(request.params, "room_id");
-		if (request.params.link === undefined) {
-			// The other server ended the pair (its `/remote unshare`): so does this one, and its link leaves the room.
-			this.store.dropRemotePairs((pair) => pair.room_id === roomId && pair.server === server, nowMs());
-			if (this.store.isRoomMember(roomId, link!, nowMs())) await this.removeMember({ ipKey: attachment.ipKey, userId: link }, roomId, link!);
-			this.reply(socket, request, {});
-			return;
-		}
-		const invite = parseInvite(requiredString(request.params, "link"));
-		if (!((connectionAttachment(socket) ?? attachment).rooms ?? []).includes(roomId)) throw { name: "invalid_params", message: "This link has not joined that room", data: NOT_JOINED } satisfies ProtocolError;
-		if (!invite) throw { name: "invalid_params", message: "link must be an Apron link with server, room and token" } satisfies ProtocolError;
-		if (invite.server !== server) throw { name: "invalid_params", message: "link is not of this link's server" } satisfies ProtocolError;
-		this.store.setRemotePair({ room_id: roomId, server, remote_room: invite.room, token: invite.token }, nowMs());
-		this.senderFor(server).stopped = undefined;
-		this.reply(socket, request, {});
-	}
-
-	/** `/remote list`: the links, the pairs, and each server's outbox. */
-	private remoteListing(): string {
-		const now = nowMs();
-		const links = Object.entries(this.store.remoteLinks(now));
-		const pairs = this.store.remotePairs(now);
-		if (!links.length && !pairs.length) return "No links. `/remote invite <address>` makes one.";
-		const lines = links.map(([userId, link]) => {
-			const outbox = this.store.remoteOutbox(link.server, now);
-			const shared = pairs.filter((pair) => pair.server === link.server).map((pair) => `\`${pair.room_id}\` ↔ \`${pair.remote_room}\``);
-			return `- ${link.server}: link \`${userId}\`; shared rooms: ${shared.length ? shared.join(", ") : "none"}${outbox ? `; sent through log ID ${outbox.cursor}${outbox.stopped ? ` (stopped: ${outbox.stopped})` : ""}` : ""}`;
-		});
-		return lines.join("\n");
-	}
-
-	/** This server's address for its invites (ext:remote): `REMOTE_SELF`, else the WebSocket URL this connection reached. */
-	private selfAddress(socket?: WebSocketConnection, attachment?: ConnectionAttachment): string | undefined {
-		if (this.config.remoteSelf) return this.config.remoteSelf;
-		const endpoint = (socket ? connectionAttachment(socket)?.endpoint : undefined) ?? attachment?.endpoint;
-		const self = endpoint === undefined ? undefined : normalizeRemoteAddress(endpoint);
-		if (self) this.knownSelf = self;
-		return self ?? this.knownSelf;
-	}
-
-	/**
-	 * Joins this server's link for `server` to a room, making the link first
-	 * if there is none (ext:remote: one link a remote server). The join is
-	 * logged and charged to the admin, as `room_join` with a `user_id` is,
-	 * and a private room takes it too: the admin is in it. Its `user_id`.
-	 */
-	private async linkInRoom(attachment: ConnectionAttachment, server: string, roomId: string): Promise<string> {
-		const existing = this.store.remoteLinkFor(server, nowMs());
-		if (existing === undefined) {
-			let created = "";
-			await this.runMutation(async () => {
-				const link = this.store.createRemoteLink({ server, name: fitName(`Link bot for ${remoteAuthority(server)}`, this.config.limits), roomId, now: nowMs(), ipKey: attachment.ipKey });
-				created = link.userId;
-				for (const record of link.broadcasts) this.broadcastRecord(record);
-			});
-			return created;
-		}
-		if (this.store.isRoomMember(roomId, existing, nowMs())) return existing;
+	private async joinMember(actor: { ipKey: string; userId?: string }, roomId: string, userId: string): Promise<void> {
 		const room = this.store.getRoom(roomId, nowMs());
 		if (!room) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
 		const totals = new Map<string, number>();
 		const before = this.membersOf([roomId], totals);
 		await this.runMutation(async () => {
-			const change = this.store.changeMembership({ userId: existing, ipKey: attachment.ipKey, roomId, join: true, now: nowMs(), actorId: attachment.userId });
+			const change = this.store.changeMembership({ userId, ipKey: actor.ipKey, roomId, join: true, now: nowMs(), ...(actor.userId ? { actorId: actor.userId } : {}) });
 			if (!change.changed) return;
-			this.setRooms(existing, change.rooms);
-			if (change.membership) this.broadcastRecord(change.membership, existing);
-			const peer = this.connectionsOf(existing)[0];
+			this.setRooms(userId, change.rooms);
+			if (change.membership) this.broadcastRecord(change.membership, userId);
+			const peer = this.connectionsOf(userId)[0];
 			const state = peer ? connectionAttachment(peer) : null;
 			const joiner = state ? this.complete(state) : null;
-			if (joiner) this.sendToUser(existing, this.joinedUpdate(change.room ?? room, before.get(roomId), joiner, totals.get(roomId), change.membership));
+			if (joiner) this.sendToUser(userId, this.joinedUpdate(change.room ?? room, before.get(roomId), joiner, totals.get(roomId), change.membership));
 		});
-		return existing;
+	}
+
+	/**
+	 * ext:remote hook (dispatch): a link's `relay` wake push, and a local
+	 * user's `message`, `reactions` or `room_set` in a mirror room, which the
+	 * mirror sends to the room's owner. True when handled here.
+	 */
+	private async remoteRequest(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<boolean> {
+		const link = attachment.tier === "registered" && attachment.userId !== undefined && this.store.remoteLink(attachment.userId, nowMs()) !== undefined;
+		if (request.method === "push_register" && link && request.params.kind === "relay") {
+			await this.remote!.registerWake(socket, attachment.userId!, request);
+			return true;
+		}
+		if (link || !identityOf(attachment) || (request.method !== "message" && request.method !== "reactions" && request.method !== "room_set")) return false;
+		return this.remote!.forward(socket, attachment as MirrorClient, request);
+	}
+
+	/** What the mirror (mirror.ts) uses of this object. */
+	private mirrorHost(self: string): MirrorHost {
+		return {
+			store: this.store,
+			self,
+			lingerMs: this.config.remoteLingerMs,
+			storage: this.ctx.storage,
+			runMutation: (fn) => this.runMutation(fn),
+			broadcastRecord: (record) => this.broadcastRecord(record),
+			roomChanged: (room) => {
+				this.noteRoom(room.room_id, true);
+				this.deliver(roomUpdate("updated", room), [room.room_id, ...(room.parent_room_id !== undefined ? [room.parent_room_id] : [])]);
+			},
+			roomJoined: (userId, room, membership) => {
+				this.noteRoom(room.room_id, true);
+				if (room.parent_room_id === undefined && !room.private) this.topLevelRooms?.push(room.room_id);
+				this.setRooms(userId, [...(this.liveRoomsOf(userId) ?? []), room.room_id]);
+				const peer = this.connectionsOf(userId)[0];
+				const state = peer ? connectionAttachment(peer) : null;
+				const creator = state ? this.complete(state) : null;
+				if (creator) this.sendToUser(userId, this.joinedUpdate(room, [creator], undefined, undefined, membership));
+				if (membership) this.broadcastRecord(membership, userId);
+			},
+			reply: (socket, request, result) => this.reply(socket as WebSocketConnection, request, result),
+			notice: (socket, roomId, text) => this.sendNotice(socket as WebSocketConnection, roomId, text),
+			addMember: (actor, roomId, userId) => this.joinMember(actor, roomId, userId),
+			removeMember: (actor, roomId, userId) => this.removeMember(actor, roomId, userId),
+			mintLinkToken: (linkId) => this.mintLinkToken(linkId),
+			forgetLinkTokens: (linkId) => this.forgetLinkTokens(linkId),
+			closeConnectionsOf: (userId, reason) => {
+				for (const peer of this.connectionsOf(userId)) {
+					const state = connectionAttachment(peer);
+					if (state) this.closePolicy(peer, state, 1008, reason);
+				}
+			},
+			wakeAt: async (at) => {
+				if (this.deadlines.remote.soonest(at)) await this.rescheduleAlarm();
+			},
+		};
 	}
 
 	/**
@@ -8904,28 +8794,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 		await this.forgetTokens([linkId]);
 	}
 
-	/**
-	 * After a record in `rooms`: wakes the sender of each remote server one
-	 * of them is shared with (ext:remote). What it sends is decided when it
-	 * reads the log, so records of remote users wake it too, and are skipped.
-	 */
-	private noteShared(rooms: readonly string[]): void {
-		let pairs: readonly RemotePair[];
-		try {
-			pairs = this.store.remotePairs(nowMs());
-		} catch {
-			return;
-		}
-		if (!pairs.length) return;
-		// A thread of a shared room is shared with it, paired or not yet.
-		const shared = new Set(rooms);
-		for (const roomId of rooms) {
-			const parent = this.parentOf(roomId);
-			if (parent) shared.add(parent);
-		}
-		for (const server of new Set(pairs.filter((pair) => shared.has(pair.room_id)).map((pair) => pair.server))) this.kickSender(server);
-	}
-
 	/** A room's parent, if it is a thread (fixed at creation, so kept once read); null for a top-level room. */
 	private parentOf(roomId: string): string | null {
 		const known = this.roomParents.get(roomId);
@@ -8939,232 +8807,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (this.roomParents.size > 512) this.roomParents.clear();
 		this.roomParents.set(roomId, parent);
 		return parent;
-	}
-
-	/**
-	 * On each alarm: a sender whose retry is due, or one that is behind with
-	 * no sender running (this instance is new: the last one stopped
-	 * mid-send, or its retry was lost with it), goes again.
-	 */
-	private resumeSenders(now: number): void {
-		let pairs: readonly RemotePair[];
-		try {
-			pairs = this.store.remotePairs(now);
-		} catch {
-			return;
-		}
-		if (this.deadlines.remote.passed(now)) this.deadlines.remote.clear();
-		for (const server of new Set(pairs.map((pair) => pair.server))) {
-			const sender = this.senderFor(server);
-			if (sender.running || (sender.retryAt !== undefined && sender.retryAt > now)) continue;
-			try {
-				const paired = pairs.filter((pair) => pair.server === server);
-				// The threads of shared rooms too: a new one is sent with its creation.
-				const threads = this.store.threadsOf(paired.filter((pair) => pair.parent === undefined).map((pair) => pair.room_id), now).map((thread) => thread.room_id);
-				const rooms = [...paired.map((pair) => pair.room_id), ...threads];
-				if (sender.outbox.behind(this.store.roomHeads(rooms, now))) this.kickSender(server);
-			} catch { /* the next alarm looks again */ }
-		}
-	}
-
-	/**
-	 * After a local user's profile change, which is not in the log: each
-	 * remote server this server shares rooms with sends it, if it sent for
-	 * the user before (Outbox.profilesDue).
-	 */
-	private noteProfile(userId: string): void {
-		let pairs: readonly RemotePair[];
-		try {
-			pairs = this.store.remotePairs(nowMs());
-		} catch {
-			return;
-		}
-		for (const server of new Set(pairs.map((pair) => pair.server))) {
-			this.senderFor(server).outbox.profilesDue.add(userId);
-			this.kickSender(server);
-		}
-	}
-
-	/** The sender of one remote server, made on first use. */
-	private senderFor(server: string): RemoteSender {
-		let sender = this.senders.get(server);
-		if (!sender) {
-			sender = { server, outbox: new Outbox(server, this.outboxDeps(server)), again: false, failures: 0 };
-			this.senders.set(server, sender);
-		}
-		return sender;
-	}
-
-	/**
-	 * Runs a remote server's sender unless it runs already (then it reads the
-	 * log once more when it is done), its outbox stopped, the server is
-	 * paused or stopped, or a retry is waiting. A new record ends the linger.
-	 */
-	private kickSender(server: string): void {
-		const sender = this.senderFor(server);
-		if (sender.lingerTimer !== undefined) {
-			clearTimeout(sender.lingerTimer);
-			sender.lingerTimer = undefined;
-		}
-		if (sender.running) {
-			sender.again = true;
-			return;
-		}
-		if (sender.retryAt !== undefined && sender.retryAt > nowMs()) return;
-		sender.running = this.runSender(sender).catch((error) => {
-			console.warn(JSON.stringify({ event: "remote_sender_failed", server, error: error instanceof Error ? error.message : String(error) }));
-		}).finally(() => {
-			sender.running = undefined;
-		});
-	}
-
-	private async runSender(sender: RemoteSender): Promise<void> {
-		const now = nowMs();
-		if (sender.stopped === undefined) {
-			try {
-				sender.stopped = this.store.remoteOutbox(sender.server, now)?.stopped ?? null;
-			} catch {
-				return this.retrySender(sender, 30_000, "storage unavailable");
-			}
-		}
-		if (sender.stopped) return;
-		// Nothing goes out while the server is paused or out of capacity.
-		if (this.pausedUntil(now) > now || this.accountUsage.stops(now)) return this.retrySender(sender, 60_000, "paused");
-		// Should this instance stop mid-send, the alarm finds the outbox behind.
-		if (this.deadlines.remote.soonest(now + REMOTE_WATCHDOG_MS)) await this.rescheduleAlarm();
-		do {
-			sender.again = false;
-			try {
-				await sender.outbox.drain((method, params, id) => this.linkCall(sender, method, params, id));
-				sender.failures = 0;
-				sender.retryAt = undefined;
-			} catch (error) {
-				this.closeConnection(sender);
-				if (error instanceof SendingStopped) {
-					sender.stopped = error.message;
-					console.warn(JSON.stringify({ event: "remote_sending_stopped", server: sender.server, reason: error.message }));
-					try { this.store.setRemoteOutbox(sender.server, { stopped: error.message }, nowMs()); } catch { /* stopped in memory until the next instance */ }
-					return;
-				}
-				const after = error instanceof RetryLater ? error.afterMs : 30_000;
-				return this.retrySender(sender, after, error instanceof Error ? error.message : String(error));
-			}
-		} while (sender.again);
-		// Caught up: the connection stays for the linger, unless another record comes.
-		if (sender.connection) {
-			sender.lingerTimer = setTimeout(() => {
-				sender.lingerTimer = undefined;
-				if (!sender.running) this.closeConnection(sender);
-			}, this.config.remoteLingerMs);
-		}
-		if (![...this.senders.values()].some((other) => other.running && other !== sender || other.retryAt !== undefined)) this.deadlines.remote.clear();
-	}
-
-	/** Tries a sender again after a growing delay, by the alarm (ext:remote). */
-	private async retrySender(sender: RemoteSender, afterMs: number, reason: string): Promise<void> {
-		sender.failures += 1;
-		const delay = Math.min(REMOTE_RETRY_MAX_MS, Math.max(afterMs, 1_000 * 2 ** Math.min(sender.failures, 9)));
-		sender.retryAt = nowMs() + delay;
-		console.warn(JSON.stringify({ event: "remote_send_retry", server: sender.server, in_ms: delay, reason: reason.slice(0, 200) }));
-		this.deadlines.remote.soonest(sender.retryAt);
-		await this.rescheduleAlarm();
-	}
-
-	/** Sends one request to a remote server on its sender's connection, dialing it first if it is not open. */
-	private async linkCall(sender: RemoteSender, method: string, params: Record<string, unknown>, id: string): Promise<{ result?: Record<string, unknown>; error?: { code: number; message?: string; data?: Record<string, unknown> } }> {
-		if (!sender.connection?.open) {
-			// The newest token for the server, from its newest pair.
-			const pair = [...this.store.remotePairs(nowMs())].filter((candidate) => candidate.server === sender.server).sort((a, b) => b.created_ms - a.created_ms)[0];
-			if (!pair) throw new RetryLater(60_000, "no pair");
-			sender.connection = await LinkConnection.open(sender.server, pair.token);
-			console.log(JSON.stringify({ event: "remote_link_connected", server: sender.server }));
-		}
-		return sender.connection.call(method, params, id);
-	}
-
-	private closeConnection(sender: RemoteSender): void {
-		if (!sender.connection) return;
-		sender.connection.close();
-		sender.connection = undefined;
-		console.log(JSON.stringify({ event: "remote_link_closed", server: sender.server }));
-	}
-
-	/** Forgets a remote server's sender after `/remote revoke`. */
-	private closeSender(server: string): void {
-		const sender = this.senders.get(server);
-		if (!sender) return;
-		if (sender.lingerTimer !== undefined) clearTimeout(sender.lingerTimer);
-		this.closeConnection(sender);
-		this.senders.delete(server);
-	}
-
-	/** What a remote server's outbox reads and keeps (OutboxDeps), from the store and key-value storage. */
-	private outboxDeps(server: string): OutboxDeps {
-		const store = this.store;
-		const key = (kind: string, id: string) => `remote-${kind}:${server}|${id}`;
-		const linkOf = (userId: string) => store.remoteLink(userId, nowMs()) !== undefined;
-		const config = this.config;
-		const known = () => this.knownSelf;
-		return {
-			get self() { return config.remoteSelf ?? known() ?? ""; },
-			pairs: () => new Map(store.remotePairs(nowMs()).filter((pair) => pair.server === server).map((pair) => [pair.room_id, {
-				remote: pair.remote_room, start: pair.start_log_id,
-				...(pair.parent !== undefined ? { parent: pair.parent } : {}), ...(pair.refused ? { refused: true } : {}),
-			}])),
-			threads: (parents) => store.threadsOf(parents, nowMs()),
-			setThreadPair: (threadId, pair) => {
-				// The thread signs in with its parent's token, as every pair with the server does: the newest.
-				const parent = store.remotePairs(nowMs()).find((candidate) => candidate.server === server && candidate.room_id === pair.parent);
-				if (!parent) return;
-				store.setRemotePair({ room_id: threadId, server, remote_room: pair.remote, token: parent.token, parent: pair.parent, start_log_id: pair.start, ...(pair.refused ? { refused: true } : {}) }, nowMs());
-				console.log(JSON.stringify({ event: "remote_thread_paired", server, room_id: threadId, remote_room: pair.remote, refused: pair.refused }));
-			},
-			// A logged `~room` message (Appendix A.1), so every member sees it, later and in history too.
-			roomNotice: (roomId, text) => {
-				void this.runMutation(async () => {
-					try {
-						const result = this.store.mutate({
-							userId: ROOM_IDENTITY.user_id, ipKey: SYSTEM_IP_KEY, method: "message", now: nowMs(), system: true,
-							params: { room_id: roomId, body: { text, format: "markdown" } }, identity: { ...ROOM_IDENTITY },
-						});
-						for (const record of result.broadcasts) this.broadcastRecord(record);
-					} catch (error) {
-						console.warn(JSON.stringify({ event: "remote_notice_failed", room_id: roomId, error: error instanceof Error ? error.message : String(error) }));
-					}
-				});
-			},
-			authorNotice: (userId, roomId, text) => {
-				const key = `${server}\n${roomId}\n${userId}`;
-				if (this.toldRemoved.has(key)) return;
-				if (this.toldRemoved.size > 1024) this.toldRemoved.clear();
-				this.toldRemoved.add(key);
-				this.sendToUser(userId, { method: "message", params: { room_id: roomId, from: { ...PRIVATE_IDENTITY }, body: { text, format: "markdown" } } });
-			},
-			linkInRoom: (roomId) => {
-				const linkId = store.remoteLinkFor(server, nowMs());
-				return linkId !== undefined && store.isRoomMember(roomId, linkId, nowMs());
-			},
-			dropPair: (roomId, why) => {
-				store.dropRemotePairs((pair) => pair.server === server && pair.room_id === roomId, nowMs());
-				console.warn(JSON.stringify({ event: "remote_pair_dropped", server, room_id: roomId, why }));
-			},
-			cursor: () => store.remoteOutbox(server, nowMs())?.cursor ?? 0,
-			advance: (logId) => store.setRemoteOutbox(server, { cursor: logId }, nowMs()),
-			records: (rooms, after, limit) => store.outboxRecords(rooms, after, limit, nowMs()),
-			message: (messageId) => store.pushedMessage(messageId, nowMs()) as unknown as Record<string, unknown> | null,
-			isLocalUser: (userId) => !isShadowUserId(userId) && !userId.startsWith("~") && !linkOf(userId) && (isGuestId(userId) || store.identityExists(userId)),
-			userName: (userId) => store.getIdentity(userId)?.name ?? (isGuestId(userId) ? "" : undefined),
-			remoteUserOf: (userId) => {
-				if (!isShadowUserId(userId)) return undefined;
-				const remote = store.getIdentity(userId)?.ext?.remote as Record<string, unknown> | undefined;
-				return remote?.server === server && typeof remote.user_id === "string" ? remote.user_id : undefined;
-			},
-			copy: (messageId) => store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<string>(key("copy", messageId))),
-			setCopy: (messageId, copyId) => store.withMeterAsync("foreground", { writes: 1 }, () => this.ctx.storage.put(key("copy", messageId), copyId)),
-			user: (userId) => store.withMeterAsync("foreground", { reads: 1 }, () => this.ctx.storage.get<{ id: string; name: string }>(key("user", userId))),
-			setUser: (userId, value) => store.withMeterAsync("foreground", { writes: 1 }, () => this.ctx.storage.put(key("user", userId), value)),
-			log: (event, data) => console.warn(JSON.stringify({ event, ...data })),
-		};
 	}
 
 	/**
@@ -10410,8 +10052,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private broadcastRecord(record: Broadcast, exceptUser?: string): void {
 		this.deliver(recordFrame(record), record.rooms, exceptUser === undefined ? undefined : (state) => state.userId !== exceptUser);
-		// A record in a shared room wakes the outboxes of its servers (ext:remote).
-		this.noteShared(record.rooms);
+		// ext:remote hook: a record of a shared room wakes the mirrors that sleep.
+		this.remote?.onRecord(record.rooms);
 	}
 
 	/**

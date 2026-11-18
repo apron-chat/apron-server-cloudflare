@@ -28,6 +28,8 @@ export default defineConfig({
 					// As if the media host's apron_media_nosniff rule were on: attachments may be text.
 					MEDIA_NOSNIFF: "true",
 					PUBLIC_ORIGIN: "https://demo.test",
+					// ext:remote is on (hosted rooms and mirrors); test/remote-links checks that it is off without this.
+					REMOTE_SELF: "wss://demo.test/ws",
 					UPLOAD_SIGNING_KEY: "test-upload-signing-key-0123456789abcdef",
 					VAPID_PUBLIC_KEY: "BDiU8ZnLVhCayOIihLkro6Di0XjZW7iK59umfbY--JzLTzNbhd94tTuBsIzrhXljFDqw5xn8gLqahSsSPDCauDM",
 					VAPID_PRIVATE_KEY: "64gdTp6zfZqSbwXmh7xaMx-kTVi4S34yCZxCZ2QT954",
