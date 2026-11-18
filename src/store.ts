@@ -324,6 +324,66 @@ export interface LiveFinish {
   broadcasts: Broadcast[];
   /** The entry that ended, if it was still open. */
   entry?: LiveEntry;
+  /** Whether the snapshot refers to the output the runtime stored in R2 (TerminalStored); if not, the runtime deletes it. */
+  stored?: boolean;
+}
+
+/**
+ * A finished terminal's output the runtime wrote to R2 before finishing it
+ * (finishLiveText): its key (`f/<id>`, kept like an attached file) and the
+ * output it holds, terminalOutput of what the text kept.
+ */
+export interface TerminalStored {
+  key: string;
+  output: string;
+}
+
+/**
+ * Where a stored terminal snapshot keeps its output instead of `output`:
+ * the R2 key and the output's size as JSON, so a history page budgets for
+ * it before the runtime puts it back (withTerminalOutputs). Never sent: the
+ * runtime replaces it with `output`, or leaves it out.
+ */
+export interface TerminalOutputRef {
+  key: string;
+  bytes: number;
+}
+
+/** The key of an R2 object for a terminal's output, an attached file's kind. */
+export function newTerminalOutputKey(): string {
+  return `f/${randomKey()}`;
+}
+
+/** The R2 keys of the terminal outputs a record refers to (TerminalOutputRef). */
+export function terminalOutputKeys(record: unknown): string[] {
+  const embeds = isPlainObject(record) && isPlainObject(record.body) ? record.body.embeds : undefined;
+  if (!Array.isArray(embeds)) return [];
+  return embeds.flatMap((embed) => isPlainObject(embed) && isPlainObject(embed.output_ref) && typeof embed.output_ref.key === "string" ? [embed.output_ref.key] : []);
+}
+
+/**
+ * A record with each stored terminal's output put back from `outputs` (by
+ * R2 key), and its TerminalOutputRef removed either way: a terminal whose
+ * output could not be read goes without it. The record itself is unchanged.
+ */
+export function withTerminalOutputs<T>(record: T, outputs: (key: string) => string | undefined): T {
+  if (!terminalOutputKeys(record).length) return record;
+  const value = record as unknown as Record<string, unknown> & { body: Record<string, unknown> & { embeds: unknown[] } };
+  const embeds = value.body.embeds.map((embed) => {
+    if (!isPlainObject(embed) || !isPlainObject(embed.output_ref)) return embed;
+    const { output_ref: ref, ...rest } = embed;
+    const output = typeof ref.key === "string" ? outputs(ref.key) : undefined;
+    return output === undefined ? rest : { ...rest, output };
+  });
+  return { ...value, body: { ...value.body, embeds } } as unknown as T;
+}
+
+/** What a record's stored terminal outputs add to it once put back, beyond their refs: for a history page's byte budget. */
+function terminalOutputBytes(record: unknown): number {
+  const embeds = isPlainObject(record) && isPlainObject(record.body) ? record.body.embeds : undefined;
+  if (!Array.isArray(embeds)) return 0;
+  return embeds.reduce<number>((total, embed) => total +
+    (isPlainObject(embed) && isPlainObject(embed.output_ref) && typeof embed.output_ref.bytes === "number" ? embed.output_ref.bytes + 16 : 0), 0);
 }
 
 interface StoreUploadConfig extends UploadPolicy {
@@ -466,14 +526,15 @@ function isLiveEntry(value: unknown): value is LiveEntry {
     Number.isSafeInteger(value.maxMs) && Number.isSafeInteger(value.limit) && typeof value.embedId === "string";
 }
 
-/** A snapshot without the server's finished terminal `output`s, for the client size policy. */
+/** A snapshot without the server's finished terminal `output`s (or their refs), for the client size policy. */
 function withoutOutputs(snapshot: MessageSnapshot): MessageSnapshot {
   const embeds = snapshot.body?.embeds;
-  if (!Array.isArray(embeds) || !embeds.some((embed) => isPlainObject(embed) && embed.output !== undefined)) return snapshot;
+  if (!Array.isArray(embeds) || !embeds.some((embed) => isPlainObject(embed) && (embed.output !== undefined || embed.output_ref !== undefined))) return snapshot;
   return { ...snapshot, body: { ...snapshot.body, embeds: embeds.map((embed) => {
-    if (!isPlainObject(embed) || embed.output === undefined) return embed;
-    const { output: _output, ...rest } = embed;
+    if (!isPlainObject(embed) || (embed.output === undefined && embed.output_ref === undefined)) return embed;
+    const { output: _output, output_ref: _ref, ...rest } = embed;
     void _output;
+    void _ref;
     return rest;
   }) } };
 }
@@ -483,7 +544,7 @@ function withoutOutputs(snapshot: MessageSnapshot): MessageSnapshot {
  * further with keep_last while their JSON passes
  * MAX_TERMINAL_OUTPUT_JSON_BYTES.
  */
-function terminalOutput(bytes: Uint8Array): string {
+export function terminalOutput(bytes: Uint8Array): string {
   let kept = bytes;
   for (;;) {
     const text = liveTextString(kept);
@@ -3868,7 +3929,8 @@ export class Store {
   /**
    * The most upload rows `owner` can hold: a day's uploads for every day the
    * longest-kept kind stays, with the lifecycle's lag, and one more day. A
-   * user's day is `uploadsPerUserDay`. The server's own avatar uploads
+   * user's day is `uploadsPerUserDay`, and their live texts' starts, each of
+   * which may keep a terminal's output. The server's own avatar uploads
    * (SERVER_OWNER) are charged to the admins who start them, so only the
    * server-wide `uploadsPerDay` bounds them. A scan of an owner's rows by
    * `uploads_owner_idx` reads up to this many, whatever its other conditions
@@ -3877,7 +3939,8 @@ export class Store {
   private uploadsPerOwner(owner: string): number {
     const policy = this.config.uploads;
     if (!policy) return 0;
-    const perDay = owner === SERVER_OWNER ? policy.uploadsPerDay : policy.uploadsPerUserDay;
+    // A user's finished terminals may each keep their output as a file too (storeTerminalOutput).
+    const perDay = owner === SERVER_OWNER ? policy.uploadsPerDay : policy.uploadsPerUserDay + (this.config.liveText?.startsPerUserDay ?? 0);
     const keptSeconds = Math.max(policy.fileRetentionSeconds, policy.avatarRetentionSeconds) + policy.lifecycleLagSeconds;
     return perDay * (Math.ceil(keptSeconds / 86_400) + 1);
   }
@@ -5773,8 +5836,9 @@ export class Store {
       const title = uploadTitle(fields.title);
       return { embed_id: id, kind: "upload", ...(title ? { title } : {}) };
     });
+    // An upload's file, or a finished terminal's output kept in R2 (storeTerminalOutput).
     const removed = [...earlier.values()]
-      .filter((embed) => embed.kind === "upload" && !kept.has(embed.embed_id as string))
+      .filter((embed) => (embed.kind === "upload" || embed.output_ref !== undefined) && !kept.has(embed.embed_id as string))
       .map((embed) => embed.embed_id as string);
     // A save that leaves out a live text's embed (or deletes its message) ends it early (§4.8.3).
     const endedIds = [...earlier.values()].filter((embed) => isLive(embed.kind) && !kept.has(embed.embed_id as string)).map((embed) => embed.embed_id as string);
@@ -5824,6 +5888,30 @@ export class Store {
       key, owner, purpose, link.messageId ?? null, link.embedId, maxBytes, writeExpiresMs, expiresMs, now,
     );
     return { key, purpose, embedId: link.embedId, maxBytes, writeExpiresMs };
+  }
+
+  /**
+   * Records a terminal's output stored in R2 (publishLiveText) as an attached
+   * file of its message and embed: written, kept `fileRetentionSeconds`,
+   * and released with them, so removing the embed, deleting the message or
+   * purging its owner deletes it, and the bucket's lifecycle rule for `f/`
+   * catches what is left. Counts toward `storedBytesCap`, not the upload
+   * counts; undefined, keeping the output in the snapshot, when uploads are
+   * off or the cap is reached.
+   */
+  private storeTerminalOutput(stored: TerminalStored, entry: LiveEntry, now: number): TerminalOutputRef | undefined {
+    const policy = this.config.uploads;
+    if (!policy || !entry.messageId || !/^f\/[A-Za-z0-9_-]{22}$/.test(stored.key)) return undefined;
+    const bytes = utf8Bytes(stored.output);
+    const total = this.metaNumber(META_UPLOAD_BYTES);
+    if (total + bytes > policy.storedBytesCap) return undefined;
+    this.setUploadBytes(total + bytes);
+    this.rawExec(
+      `INSERT INTO uploads (upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms, created_ms)
+       VALUES (?, ?, 'file', ?, ?, 'done', ?, ?, ?, ?)`,
+      stored.key, entry.owner, entry.messageId, entry.embedId, bytes, now, now + policy.fileRetentionSeconds * 1_000, now,
+    );
+    return { key: stored.key, bytes: utf8Bytes(JSON.stringify(stored.output)) };
   }
 
   private setUploadBytes(bytes: number): void {
@@ -6063,16 +6151,19 @@ export class Store {
    * embed is gone, publishes nothing. Finishing work already admitted, it is
    * charged as maintenance, so an exhausted foreground budget cannot lose it.
    */
-  finishLiveText(key: string, kept: Uint8Array | null, now = this.clock.now()): LiveFinish {
+  finishLiveText(key: string, kept: Uint8Array | null, now = this.clock.now(), stored?: TerminalStored): LiveFinish {
     this.ensureReady();
     if (!this.config.liveText) return { broadcasts: [] };
-    return this.reserved({ reads: 96, writes: 64 + LIVE_WRITES }, true, now, () => this.transaction(() => {
+    // A stored output adds its upload row and the stored-bytes count.
+    return this.reserved({ reads: 96 + (stored ? 16 : 0), writes: 64 + LIVE_WRITES + (stored ? 16 : 0) }, true, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
       const entries = this.liveTexts();
       const entry = entries.find((candidate) => candidate.key === key);
       if (!entry) return { broadcasts: [] };
       this.saveLiveTexts(entries.filter((candidate) => candidate !== entry));
-      return { entry, broadcasts: this.publishLiveText(entry, kept, effective) };
+      const published = { stored: false };
+      const broadcasts = this.publishLiveText(entry, kept, effective, stored, published);
+      return { entry, broadcasts, stored: published.stored };
     }));
   }
 
@@ -6102,8 +6193,14 @@ export class Store {
     }));
   }
 
-  /** The snapshot that ends a live text (finishLiveText). */
-  private publishLiveText(entry: LiveEntry, kept: Uint8Array | null, now: number): Broadcast[] {
+  /**
+   * The snapshot that ends a live text (finishLiveText). A terminal's output
+   * the runtime stored in R2 (`stored`) is kept there, the snapshot holding
+   * a TerminalOutputRef to it and its upload row counting its bytes like an
+   * attached file's, while uploads are on and their stored-bytes cap allows;
+   * otherwise in the snapshot, as `output`.
+   */
+  private publishLiveText(entry: LiveEntry, kept: Uint8Array | null, now: number, stored?: TerminalStored, published?: { stored: boolean }): Broadcast[] {
     if (!entry.messageId) return [];
     const found = this.retainedEmbed(entry.messageId, entry.embedId);
     if (!found) return [];
@@ -6114,7 +6211,10 @@ export class Store {
       // Its `url` ends with the text: the output is the embed's now (§4.8.6).
       const { url: _url, ...rest } = embed;
       void _url;
-      return this.rewriteEmbed(message, snapshot, entry.embedId, output ? { ...rest, output } : null, now);
+      if (!output) return this.rewriteEmbed(message, snapshot, entry.embedId, null, now);
+      const ref = stored && stored.output === output ? this.storeTerminalOutput(stored, entry, now) : undefined;
+      if (ref && published) published.stored = true;
+      return this.rewriteEmbed(message, snapshot, entry.embedId, ref ? { ...rest, output_ref: ref } : { ...rest, output }, now);
     }
     const base = typeof snapshot.body?.text === "string" ? snapshot.body.text : "";
     // A save may have lengthened the text while it streamed: the body stays within the text limit.
@@ -8141,7 +8241,8 @@ export class Store {
       const value = parseJson<Record<string, unknown>>(row.record_json);
       // Room records carry this client's delivery fields, as `room_list` and `room_update` records do.
       if (row.kind === "room") Object.assign(value, roomFields.get(row.room_id));
-      const entryBytes = utf8Bytes(JSON.stringify(value));
+      // A stored terminal's output is put back before the page is sent.
+      const entryBytes = utf8Bytes(JSON.stringify(value)) + terminalOutputBytes(value);
       if (entryBytes + bytes + responseOverhead + 1 > maxBytes) {
         if (selected.length === 0) throw new StoreError("too_large", "history record exceeds response budget");
         stoppedForBytes = true;

@@ -812,10 +812,14 @@ three posts' worth, whichever way it starts. Every operation stayed within
 its reservation (the claim reserves a post's 264 / 120, the finish 104 / 88
 as maintenance).
 
-Stored: the finished terminal is one record, its `output` JSON-escaped (32 KB
-of colored output was 45,457 bytes of JSON, and the database grew 45,056
-bytes); the creation snapshot with `url` stays beside it (a few hundred
-bytes). The `output` is cut further while its JSON passes 64 KiB: only
+Stored: the finished terminal is one record. Where uploads are on, its
+output is one R2 object (an attached file's, `f/<id>`: one Class A write a
+text, at most 100 a day, and a Class B read for each history page or save
+that needs it and finds it out of the object's 8 MB cache), and the record
+holds a reference to it, a few dozen bytes. Without uploads the record holds
+the `output` JSON-escaped (32 KB of colored output was 45,457 bytes of JSON,
+and the database grew 45,056 bytes). The creation snapshot with `url` stays
+beside it (a few hundred bytes). The `output` is cut further while its JSON passes 64 KiB: only
 output dense in control characters (six bytes of JSON each) reaches it, as
 colored output escapes to about 1.4 times its bytes. An append adds
 its kept text (at most 4 KB) to one record. The open-text row (`live_texts`)

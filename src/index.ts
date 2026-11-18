@@ -3,7 +3,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits } from "./budget";
-import { LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
+import { keepLast, LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, showsMorePresent, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor, snapshotBill, snapshotReasons } from "./account-usage";
 import { PRICED_LABEL, PRICES, usd } from "./pricing";
@@ -82,7 +82,12 @@ import {
 	isPrivateRoomId,
 	MAX_READ_RECEIPT_MEMBERS,
 	seenStands,
+	newTerminalOutputKey,
+	terminalOutput,
+	terminalOutputKeys,
+	withTerminalOutputs,
 	type Broadcast,
+	type TerminalStored,
 	type ClaimedPush,
 	type EmojiDraft,
 	type LiveEntry,
@@ -128,6 +133,8 @@ import { pageHeaders, renderErrorPage, renderSignInPage, type SignInPageView } f
 import { Deadline } from "./deadline";
 
 const OBJECT_NAME = "public-demo-v1";
+/** Characters of finished terminals' outputs the object keeps in memory (Store.finishLiveText, withOutputs): about 8 MB. */
+const TERMINAL_OUTPUT_CACHE_BYTES = 8 * 1024 * 1024;
 const INTERNAL_IP_HEADER = "X-Apron-Trusted-IP-Key";
 /**
  * The paths the entry Worker forwards live text to the object on (§4.8.3):
@@ -2538,6 +2545,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * ends them (recoverLiveTexts). Bounded by the policy's `concurrent`.
 	 */
 	private readonly liveSessions = new Map<string, LiveSession>();
+	/**
+	 * Finished terminals' outputs kept in R2 (Store.finishLiveText), by key,
+	 * most recently used last, up to TERMINAL_OUTPUT_CACHE_BYTES: what a
+	 * broadcast or a history page puts back (withOutputs) without reading R2
+	 * again for the terminals people are looking at.
+	 */
+	private readonly terminalOutputs = new Map<string, string>();
+	private terminalOutputCacheBytes = 0;
 	/** Whether this instance has ended the live texts a lost one left open (recoverLiveTexts). */
 	private liveRecovered = false;
 	/**
@@ -3102,7 +3117,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			try {
 				await this.runMutation(async () => {
 					const expired = this.store.expirePendingUploads(now);
-					for (const record of expired.broadcasts) this.broadcastRecord(record);
+					await this.broadcastRecords(expired.broadcasts);
 					this.deleteMedia(expired.deletedUploads);
 					this.deadlines.uploads.set(expired.next);
 					this.uploadDeadlineRead = true;
@@ -4992,7 +5007,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				ipKey: attachment.ipKey,
 				guest,
 			});
-			this.reply(socket, request, page);
+			this.reply(socket, request, await this.withPageOutputs(page));
 		} finally {
 			const latest = connectionAttachment(socket);
 			if (latest) {
@@ -5000,6 +5015,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 				writeAttachment(socket, latest);
 			}
 		}
+	}
+
+	/** A history page with its stored terminal outputs put back (loadTerminalOutputs). */
+	private async withPageOutputs<T extends { messages?: MessageSnapshot[] }>(page: T): Promise<T> {
+		if (!page.messages?.some((message) => terminalOutputKeys(message).length)) return page;
+		await this.loadTerminalOutputs(page.messages);
+		return { ...page, messages: page.messages.map((message) => withTerminalOutputs(message, (key) => this.cachedOutput(key))) };
 	}
 
 	/**
@@ -5129,7 +5151,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const result = this.store.mutate(input);
 			// A deduplicated retry carries no records and is never rebroadcast.
 			// The broadcast comes before the result on the sender's connection (§1).
-			for (const record of result.broadcasts) this.broadcastRecord(record);
+			await this.broadcastRecords(result.broadcasts);
 			this.reply(socket, request, await this.withWriteUrls(result.result));
 			started = this.afterUploads(result);
 			// A save that removed a live text's embed ended it (§4.8.3): its write stops.
@@ -7923,7 +7945,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const streaming = new Set<string>();
 			for (const session of this.liveSessions.values()) if (session.phase === "streaming") streaming.add(session.entry.key);
 			const expired = this.store.expireLiveTexts(streaming, now);
-			for (const record of expired.broadcasts) this.broadcastRecord(record);
+			await this.broadcastRecords(expired.broadcasts);
 			for (const entry of expired.ended) {
 				const session = this.liveSessions.get(entry.id);
 				if (session?.phase === "waiting") this.forgetWaitingLive(session);
@@ -8143,16 +8165,26 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// cut at the input limit, it is dropped, so the text ends at a whole character (§4.8.5).
 		session.readers.send(session.buffer.end(end === "size"));
 		const kept = session.buffer.kept();
+		// A terminal's output goes to R2, where uploads are on, and the snapshot
+		// refers to it: SQLite keeps a few bytes, not the output (TerminalStored).
+		const stored = entry.kind === "terminal" ? await this.storeTerminalOutput(kept, entry.limit) : undefined;
 		let published = false;
+		let used = false;
 		try {
 			await this.runMutation(async () => {
-				const finished = this.store.finishLiveText(entry.key, kept, nowMs());
-				for (const record of finished.broadcasts) this.broadcastRecord(record);
+				const finished = this.store.finishLiveText(entry.key, kept, nowMs(), stored);
+				used = !!finished.stored;
+				await this.broadcastRecords(finished.broadcasts);
 				published = !!finished.entry;
 			});
 		} catch {
 			// Left open: the alarm ends it, without what was kept.
 			end = "unavailable";
+		}
+		// Not referred to (the embed was removed, or the store kept it inline): not kept.
+		if (stored && !used) {
+			this.deleteMedia([stored.key]);
+			this.terminalOutputs.delete(stored.key);
 		}
 		session.readers.close();
 		this.liveSessions.delete(entry.id);
@@ -8171,6 +8203,29 @@ export class ApronDemoServer extends DurableObject<Env> {
 		};
 		if (end === "unavailable") return liveAnswer(503, messages.unavailable, UNAVAILABLE_RETRY_MS);
 		return liveAnswer(200, published || end === "removed" ? messages[end] : messages.removed);
+	}
+
+	/**
+	 * Writes a finished terminal's output (terminalOutput of what it kept) to
+	 * R2 as an attached file's kind, and remembers it for the broadcast that
+	 * follows; undefined, keeping it inline, without uploads, with nothing
+	 * kept, or when R2 fails.
+	 */
+	private async storeTerminalOutput(kept: Uint8Array, limit: number): Promise<TerminalStored | undefined> {
+		const media = this.runtimeEnv.MEDIA;
+		if (!this.config.uploads || !media) return undefined;
+		const output = terminalOutput(keepLast(kept, limit));
+		if (!output) return undefined;
+		const key = newTerminalOutputKey();
+		try {
+			await this.stalls.track("r2", "put", media.put(key, output, {
+				httpMetadata: { contentType: "text/plain; charset=utf-8", cacheControl: "public, max-age=604800, immutable" },
+			}));
+		} catch {
+			return undefined;
+		}
+		this.rememberOutput(key, output);
+		return { key, output };
 	}
 
 	private async startAvatar(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, body: Record<string, unknown>): Promise<void> {
@@ -9790,7 +9845,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		let finished: UploadFinish = { accepted: false, broadcasts: [], deletedUploads: [] };
 		await this.asUploadOwner(write.key, () => this.runMutation(async () => {
 			finished = this.store.finishUpload(write, nowMs());
-			for (const record of finished.broadcasts) this.broadcastRecord(record);
+			await this.broadcastRecords(finished.broadcasts);
 		}));
 		this.deleteMedia(finished.deletedUploads);
 		if (finished.avatar) this.announceAvatar(finished.avatar.userId, finished.avatar.url);
@@ -9834,7 +9889,60 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * connections, which get it together with their `joined` or `left`.
 	 */
 	private broadcastRecord(record: Broadcast, exceptUser?: string): void {
-		this.deliver(recordFrame(record), record.rooms, exceptUser === undefined ? undefined : (state) => state.userId !== exceptUser);
+		this.deliver(recordFrame(this.withOutputs(record)), record.rooms, exceptUser === undefined ? undefined : (state) => state.userId !== exceptUser);
+	}
+
+	/**
+	 * Broadcasts records in order (broadcastRecord) once the terminal outputs
+	 * they refer to are read from R2 (loadTerminalOutputs). Awaited inside
+	 * runMutation, so no other change's records come between.
+	 */
+	private async broadcastRecords(records: readonly Broadcast[]): Promise<void> {
+		await this.loadTerminalOutputs(records.map((record) => record.params));
+		for (const record of records) this.broadcastRecord(record);
+	}
+
+	/** A record with its stored terminal outputs put back from the cache, or left out where not read (withTerminalOutputs). */
+	private withOutputs<T extends { params: Record<string, unknown> }>(record: T): T {
+		if (!terminalOutputKeys(record.params).length) return record;
+		return { ...record, params: withTerminalOutputs(record.params, (key) => this.cachedOutput(key)) };
+	}
+
+	private cachedOutput(key: string): string | undefined {
+		const output = this.terminalOutputs.get(key);
+		if (output === undefined) return undefined;
+		// Most recently used last.
+		this.terminalOutputs.delete(key);
+		this.terminalOutputs.set(key, output);
+		return output;
+	}
+
+	private rememberOutput(key: string, output: string): void {
+		if (this.terminalOutputs.has(key)) return;
+		this.terminalOutputs.set(key, output);
+		this.terminalOutputCacheBytes += output.length;
+		for (const [oldest, kept] of this.terminalOutputs) {
+			if (this.terminalOutputCacheBytes <= TERMINAL_OUTPUT_CACHE_BYTES) break;
+			this.terminalOutputs.delete(oldest);
+			this.terminalOutputCacheBytes -= kept.length;
+		}
+	}
+
+	/**
+	 * Reads from R2 the stored terminal outputs `records` refer to that the
+	 * cache lacks, all at once. One that cannot be read (gone with its
+	 * lifecycle, or R2 unavailable) is left out of what is sent.
+	 */
+	private async loadTerminalOutputs(records: readonly unknown[]): Promise<void> {
+		const media = this.runtimeEnv.MEDIA;
+		const missing = [...new Set(records.flatMap(terminalOutputKeys))].filter((key) => !this.terminalOutputs.has(key));
+		if (!media || !missing.length) return;
+		await Promise.all(missing.map(async (key) => {
+			try {
+				const object = await this.stalls.track("r2", "get", media.get(key));
+				if (object) this.rememberOutput(key, await object.text());
+			} catch { /* sent without it */ }
+		}));
 	}
 
 	/**
@@ -9843,7 +9951,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * its `auth` result (§3.2), whether or not it was a member before.
 	 */
 	private broadcastHeld(socket: WebSocketConnection, record: Broadcast): void {
-		const frame = recordFrame(record);
+		const frame = recordFrame(this.withOutputs(record));
 		this.deliver(frame, record.rooms, undefined, socket);
 		const held = this.held.get(socket);
 		if (held) held.push(frame);
