@@ -17,7 +17,8 @@ usage pays for, sized against its monthly allowances divided by 31 days with
 headroom. Paid includes 16 times the SQL rows written and 160 times the rows
 read, so the SQL ceilings rise tenfold, and posts, registrations, admissions,
 history pages, and member listings with them. History keeps the latest
-5,000 records in SQLite and 10,000 more in a D1 archive where it is bound,
+4,000 records in SQLite and 8,000 more in a D1 archive where it is bound (80%
+of limits of 5,000 and 10,000),
 instead of 24 hours (see [History retention](#history-retention)),
 with daily cleanup, and uploaded files are kept 120 days to match; the database
 watermarks rise to 768 MiB (1 GiB hard), a fifth of the 5 GB-month included.
@@ -743,6 +744,7 @@ in D1 for a fourth:
 | `minRetentionSeconds`: never move a younger record out by count | 3 days | 1 day |
 | `retentionSeconds`: move an older record out whatever the count | 0 (off) | 1 day |
 | `archiveRecords`: the archive keeps the newest this many records that left | 10000 | 0 (off) |
+| `cleanupThresholdPercent`: the share of each count limit cleanup keeps | 80 | 80 |
 
 A record leaves the hot log once it is past the latest `retentionRecords` and
 at least `minRetentionSeconds` old, or once it is older than
@@ -752,10 +754,20 @@ at least `minRetentionSeconds` old, or once it is older than
 set. Each cleanup run reads up to `retentionRecords` index entries to find
 where the count ends, so it is at most 50,000.
 
+**The limits are ceilings.** Cleanup keeps `cleanupThresholdPercent` of each
+count limit (80%: 4,000 of the hot log's 5,000 and 8,000 of the archive's
+10,000, 12,000 in all), and runs as soon as the hot log passes its share
+rather than waiting for its interval: after a post, at most once an hour, the
+object counts the hot log (up to what it keeps, one index entry each) and
+makes cleanup due if it is past. The rest of each limit is headroom for what
+arrives before cleanup runs, so it is reached only when traffic outruns the
+hourly check or records are younger than the minimum age. 100 keeps each
+limit whole, as a floor rather than a ceiling.
+
 The count is of log records, not messages: edits, reactions, memberships and
-room changes count too, so 15,000 records are fewer messages. At the demo's
-traffic in November 2026 (about 115 records a day) they spanned about 18
-weeks, 5,000 of them about 6; a busier stretch keeps less time, a quieter one
+room changes count too, so 12,000 records are fewer messages. At the demo's
+traffic in November 2026 (about 115 records a day) they spanned about 15
+weeks, the hot log's 4,000 about 5; a busier stretch keeps less time, a quieter one
 more. The minimum age
 keeps a flood from pushing out the last three days before an admin purges
 it; the database watermarks still bound what the flood stores.
@@ -1128,7 +1140,8 @@ deployment that stays awake.
 
 The numeric rows are grouped by their unit and enforcement scope:
 
-- History: `retentionRecords` and `archiveRecords` (counts of records, [above](#history-retention)).
+- History: `retentionRecords` and `archiveRecords` (counts of records), and
+  `cleanupThresholdPercent` (a percent, at most 100; [above](#history-retention)).
 - Durations: `minRetentionSeconds` and `retentionSeconds` ([History
   retention](#history-retention)), `cleanupSeconds`, `challengeTtlSeconds`,
   `sessionTtlSeconds` (a passkey session token's lifetime, renewed on each

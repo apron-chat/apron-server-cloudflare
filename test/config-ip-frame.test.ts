@@ -129,6 +129,10 @@ describe('configuration policy boundaries', () => {
 		expect(config().limits).toMatchObject({ retentionRecords: 5_000, minRetentionSeconds: 3 * 86_400, retentionSeconds: 0, archiveRecords: 10_000 });
 		expect(config({ LIMIT_ARCHIVE_RECORDS: '0' }).limits.archiveRecords).toBe(0);
 		expect(() => config({ LIMIT_ARCHIVE_RECORDS: '100001' })).toThrow('archiveRecords exceeds the calibrated bound');
+		expect(config().limits.cleanupThresholdPercent).toBe(80);
+		expect(config({ LIMIT_CLEANUP_THRESHOLD_PERCENT: '100' }).limits.cleanupThresholdPercent).toBe(100);
+		expect(() => config({ LIMIT_CLEANUP_THRESHOLD_PERCENT: '101' })).toThrow('cleanupThresholdPercent is a share of the limits, at most 100');
+		expect(() => config({ LIMIT_CLEANUP_THRESHOLD_PERCENT: '0' })).toThrow(ConfigError);
 		expect(config({ LIMIT_RETENTION_RECORDS: '0', LIMIT_RETENTION_SECONDS: '604800' }).limits).toMatchObject({ retentionRecords: 0, retentionSeconds: 604_800 });
 		expect(() => config({ LIMIT_RETENTION_RECORDS: '0' })).toThrow('retentionRecords or retentionSeconds must be set');
 		expect(() => config({ LIMIT_RETENTION_RECORDS: '50001' })).toThrow(ConfigError);

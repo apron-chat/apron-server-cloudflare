@@ -230,7 +230,7 @@ it("publishes a floor before a failed physical delete and resumes after restart"
 });
 
 it("keeps the latest retentionRecords records however old, expiring older ones only once minRetentionMs old", async () => {
-	const byCount: Partial<StoreConfig> = { retentionRecords: 3, minRetentionMs: DAY_MS, retentionMs: 0 };
+	const byCount: Partial<StoreConfig> = { retentionRecords: 3, minRetentionMs: DAY_MS, retentionMs: 0, cleanupThresholdPercent: 100 };
 	await withStore("retention-count", byCount, (store, clock, state) => {
 		// The seeded general room record and five messages: six records, a
 		// second apart (the count ends at a commit time, and keeps any record
@@ -274,7 +274,7 @@ it("expires records past retentionSeconds whatever the count", async () => {
 
 it("with the archive, removes records from the hot log only once copied, and publishes the floor the archive's limit allows", async () => {
 	const archived: Partial<StoreConfig> = {
-		archive: true, retentionRecords: 3, minRetentionMs: DAY_MS, retentionMs: 0, archiveRecords: 4,
+		archive: true, retentionRecords: 3, minRetentionMs: DAY_MS, retentionMs: 0, archiveRecords: 4, cleanupThresholdPercent: 100,
 		anonymousPostsPerMinute: 1_000, ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000,
 	};
 	await withStore("archive-floors", archived, (store, clock, state) => {
@@ -352,5 +352,37 @@ it("drops the hot log's reaction sets on messages that only the archive held, fo
 		store.dropReactionsOn([messageId], clock.value);
 		expect(count("SELECT COUNT(*) AS count FROM records WHERE kind = 'reactions'")).toBe(0);
 		expect(count("SELECT COUNT(*) AS count FROM reaction_state")).toBe(0);
+	});
+});
+
+it("keeps cleanupThresholdPercent of retentionRecords, and makes cleanup due once the hot log passes it", async () => {
+	const config: Partial<StoreConfig> = {
+		retentionRecords: 10, cleanupThresholdPercent: 50, minRetentionMs: DAY_MS, retentionMs: 0,
+		anonymousPostsPerMinute: 1_000, ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000,
+	};
+	await withStore("threshold", config, (store, clock, state) => {
+		const count = () => Number(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM records").one().count);
+		// The general room's record and four messages: five, at the threshold, not past it.
+		for (let index = 0; index < 4; index += 1) {
+			clock.value += 1_000;
+			store.mutate(messageInput(clock, `threshold-${index}`, `message ${index}`));
+		}
+		expect(count()).toBe(5);
+		const due = () => Number(state.storage.sql.exec<{ next_cleanup_ms: number }>("SELECT next_cleanup_ms FROM maintenance").one().next_cleanup_ms);
+		const scheduled = due();
+		expect(store.cleanupPastThreshold(clock.value)).toBe(false);
+		expect(due()).toBe(scheduled);
+		// Past it: cleanup is due now, not on its interval.
+		clock.value += 1_000;
+		store.mutate(messageInput(clock, "threshold-past", "one more"));
+		expect(store.cleanupPastThreshold(clock.value)).toBe(true);
+		expect(due()).toBeLessThanOrEqual(clock.value);
+		// Once the records are old enough, cleanup keeps 5 (50% of 10), not 10.
+		clock.value += 2 * DAY_MS;
+		state.storage.sql.exec("UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1");
+		store.forgetCleanupDue();
+		store.runCleanup(clock.value);
+		expect(count()).toBe(5);
+		expect(store.cleanupPastThreshold(clock.value)).toBe(false);
 	});
 });

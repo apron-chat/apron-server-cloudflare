@@ -162,10 +162,10 @@ mutation with the **same** `id`.
 | Room listing limited | 6 `room_list` a minute per account | The first `filter: "joined"` listing after each sign-in is free. Keep the list current from `room_update` rather than polling. |
 
 A history page holds at most 50 records (20 by default) and 256 KiB. History
-keeps the latest 15,000 records (messages, edits, reactions and room changes),
-however old, the oldest 10,000 of them in an archive that history reads from
-as well (5,000 where the server has no archive); none younger than three days
-expires. Archived messages cannot be edited, reacted to or replied to.
+keeps the latest 12,000 records (messages, edits, reactions and room changes),
+however old, the oldest 8,000 of them in an archive that history reads from
+as well (4,000 where the server has no archive), trimmed back to that once
+past it; none younger than three days expires. Archived messages cannot be edited, reacted to or replied to.
 
 ### Server-wide spikes
 

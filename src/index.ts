@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
-import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits } from "./budget";
+import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, thresholdRecords, type Limits } from "./budget";
 import { Archive, withOps, type ArchiveOp } from "./archive";
 import { keepLast, LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, showsMorePresent, statusChoice, type Status, type StatusChoice } from "./presence";
@@ -141,6 +141,8 @@ const OBJECT_NAME = "public-demo-v1";
 const TERMINAL_OUTPUT_CACHE_BYTES = 8 * 1024 * 1024;
 /** How long cleanup waits for the archive between copies while D1 fails (runArchive); a second otherwise. */
 const ARCHIVE_RETRY_MS = 5 * 60_000;
+/** How often posts may count the hot log against what cleanup keeps (checkHistoryThreshold). */
+const HISTORY_THRESHOLD_CHECK_MS = 60 * 60_000;
 /** How long a `/purge` or `/rename` is applied to history pages that read the archive, past its own queue (recentArchiveOps). */
 const ARCHIVE_RECENT_OPS_MS = 10 * 60_000;
 /** Archived records one alarm deletes below the published floor at most, in batches of a fifth. */
@@ -1033,11 +1035,14 @@ function basicClientId(header: string | null): string | null | undefined {
 }
 
 /** How long history keeps messages, for the welcome: by count (the archive's included where it is on), by age, or both (the sooner). */
-export function historyPolicy(limits: Pick<Limits, "retentionRecords" | "retentionSeconds" | "archiveRecords">, archived = false): string {
+export function historyPolicy(limits: Pick<Limits, "retentionRecords" | "retentionSeconds" | "archiveRecords" | "cleanupThresholdPercent">, archived = false): string {
 	const days = Math.max(1, Math.round(limits.retentionSeconds / 86_400));
 	const age = days === 1 ? "a day" : `${days} days`;
 	if (limits.retentionRecords <= 0) return `Messages are kept for ${age}.`;
-	const count = `the latest ${(limits.retentionRecords + (archived ? limits.archiveRecords : 0)).toLocaleString("en-US")} messages`;
+	// What cleanup keeps of each limit (cleanupThresholdPercent).
+	const kept = thresholdRecords(limits.retentionRecords, limits.cleanupThresholdPercent) +
+		(archived ? thresholdRecords(limits.archiveRecords, limits.cleanupThresholdPercent) : 0);
+	const count = `the latest ${kept.toLocaleString("en-US")} messages`;
 	return limits.retentionSeconds > 0 ? `History keeps ${count}, for up to ${age}.` : `History keeps ${count}.`;
 }
 
@@ -1052,6 +1057,7 @@ export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		retentionRecords: limits.retentionRecords,
 		minRetentionMs: limits.minRetentionSeconds * 1_000,
 		archiveRecords: limits.archiveRecords,
+		cleanupThresholdPercent: limits.cleanupThresholdPercent,
 		idleAccountMs: limits.idleAccountSeconds * 1_000,
 		keptActiveAccounts: limits.keptActiveAccounts,
 		dedupTtlMs: limits.dedupTtlSeconds * 1_000,
@@ -2571,6 +2577,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private archiveFloorChecked = false;
 	/** The published floor the archive was last trimmed to (Archive.deleteBelow), this wake. */
 	private archiveTrimmed = 0;
+	/** When this wake last counted the hot log against what cleanup keeps (checkHistoryThreshold). */
+	private historyThresholdCheckedAt = 0;
 	/** When the archive's queued work may be tried again after a failure (runArchive); 0 for now. */
 	private archiveRetryAt = 0;
 	/** Whether this wake knows the archive has no queued `/purge` or `/rename` (alarmWorkDue). */
@@ -5126,7 +5134,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		try {
 			if (!this.archiveFloorChecked) {
 				const { hot } = this.store.archiveBounds(now);
-				const floor = await this.stalls.track("d1", "floor", this.archive!.floor(hot, this.config.limits.archiveRecords));
+				// The archive keeps its threshold's share of its limit, as the hot log does.
+				const keep = thresholdRecords(this.config.limits.archiveRecords, this.config.limits.cleanupThresholdPercent);
+				const floor = await this.stalls.track("d1", "floor", this.archive!.floor(hot, keep));
 				if (floor !== undefined && floor > this.store.archiveBounds(now).published) {
 					this.store.setArchiveTarget(floor, now);
 					this.maintenanceSoon(now);
@@ -5293,6 +5303,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (method === "message" && !result.deduplicated && result.message?.prev_log_id === undefined) created = result.message;
 		});
 		this.noteBotActive(identity.user_id, attachment.roles ?? []);
+		this.checkHistoryThreshold(nowMs());
 		if (created) {
 			const latest = connectionAttachment(socket);
 			const active = latest && this.markActive(latest, "write", nowMs());
@@ -8693,6 +8704,22 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (done) this.upkeepDay = day;
 	}
 
+	/**
+	 * After a post, at most once an hour (HISTORY_THRESHOLD_CHECK_MS): when the
+	 * hot log has passed what cleanup keeps (Store.cleanupPastThreshold), runs
+	 * cleanup now instead of on its interval, so it is trimmed back before it
+	 * reaches its limit. A quiet server never counts.
+	 */
+	private checkHistoryThreshold(now: number): void {
+		if (now - this.historyThresholdCheckedAt < HISTORY_THRESHOLD_CHECK_MS) return;
+		this.historyThresholdCheckedAt = now;
+		try {
+			if (!this.store.cleanupPastThreshold(now)) return;
+			this.maintenanceSoon(now);
+			this.ctx.waitUntil(this.rescheduleAlarm().catch(() => undefined));
+		} catch { /* counted again within the hour */ }
+	}
+
 	/** Runs the alarm's maintenance again shortly: batched work left more behind. */
 	private maintenanceSoon(now: number): void {
 		this.deadlines.maintenance.soonest(now + 1_000);
@@ -9251,7 +9278,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async historyStatus(now: number): Promise<string[]> {
 		const limits = this.config.limits;
 		const count = (value: number) => Math.round(value).toLocaleString("en-US");
-		const against = (value: number, limit: number) => `${count(value)} / ${count(limit)} records (${limit > 0 ? Math.round((100 * value) / limit) : 0}%)`;
+		// Against the limit, with what cleanup keeps of it (cleanupThresholdPercent).
+		const against = (value: number, limit: number) =>
+			`${count(value)} / ${count(limit)} records (${limit > 0 ? Math.round((100 * value) / limit) : 0}%; cleanup keeps ${count(thresholdRecords(limit, limits.cleanupThresholdPercent))})`;
 		let hot: string;
 		try {
 			const records = this.store.hotRecords(now);

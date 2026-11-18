@@ -28,10 +28,10 @@ it('moves records past the hot log into D1, serves them in history, and expires 
 			const runtime = instance as unknown as Runtime;
 			// Three records in the hot log, four more in the archive, with no minimum age.
 			runtime.store.config = {
-				...runtime.store.config, retentionRecords: 3, minRetentionMs: 0, archiveRecords: 4,
+				...runtime.store.config, retentionRecords: 3, minRetentionMs: 0, archiveRecords: 4, cleanupThresholdPercent: 100,
 				anonymousPostsPerMinute: 1_000, ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000,
 			};
-			runtime.config = { ...runtime.config, limits: { ...runtime.config.limits, retentionRecords: 3, archiveRecords: 4 } };
+			runtime.config = { ...runtime.config, limits: { ...runtime.config.limits, retentionRecords: 3, archiveRecords: 4, cleanupThresholdPercent: 100 } };
 			const logs: string[] = [];
 			for (let index = 0; index < 10; index += 1) {
 				// One sender's message among those the archive will hold, for /purge below.
@@ -94,7 +94,7 @@ it('moves records past the hot log into D1, serves them in history, and expires 
 		expect((await archived()).map((row) => String(row.log_id))).toEqual([logs[3], logs[4], logs[6]]);
 		// /status shows what each holds against its limit.
 		const status = await runInDurableObject(stub(), (instance) => (instance as unknown as { historyStatus(now: number): Promise<string[]> }).historyStatus(Date.now()));
-		expect(status).toEqual(['- History in SQLite: 3 / 3 records (100%)', '- History archive (D1): 3 / 4 records (75%)']);
+		expect(status).toEqual(['- History in SQLite: 3 / 3 records (100%; cleanup keeps 3)', '- History archive (D1): 3 / 4 records (75%; cleanup keeps 4)']);
 		const purged = (await request(peer, 'purged', 'history', { room_id: 'general', limit: 50 })).result;
 		expect(purged.messages.map((message: { log_id: string }) => message.log_id)).toEqual([logs[3], logs[4], ...logs.slice(6)]);
 	} finally { peer.close(); }

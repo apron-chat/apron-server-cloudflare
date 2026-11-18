@@ -18,6 +18,7 @@ import {
   MAX_PRIVATE_ROOM_LIMIT,
   MAX_THREAD_LIMIT,
   SEEN_WRITE_GRANULARITY_MS,
+  thresholdRecords,
   type LiveTextPolicy,
   type PushPolicy,
   type UploadPolicy,
@@ -173,6 +174,8 @@ export interface StoreConfig {
   archiveRecords: number;
   /** Whether the runtime has the archive (its ARCHIVE binding and `archiveRecords`): records leaving the hot log go there first. */
   archive: boolean;
+  /** The share of `retentionRecords` (and the archive's) that cleanup keeps, in percent (cleanupPastThreshold). */
+  cleanupThresholdPercent: number;
   /** Inactivity past which an account is removed (pruneIdleIdentities). */
   idleAccountMs: number;
   /** The most recently active accounts pruneIdleIdentities always keeps. */
@@ -608,6 +611,7 @@ const DEFAULT_CONFIG: StoreConfig = {
   minRetentionMs: DEFAULT_LIMITS.minRetentionSeconds * 1000,
   archiveRecords: DEFAULT_LIMITS.archiveRecords,
   archive: false,
+  cleanupThresholdPercent: DEFAULT_LIMITS.cleanupThresholdPercent,
   idleAccountMs: DEFAULT_LIMITS.idleAccountSeconds * 1000,
   keptActiveAccounts: DEFAULT_LIMITS.keptActiveAccounts,
   dedupTtlMs: DEDUP_TTL_MS,
@@ -8602,10 +8606,11 @@ export class Store {
    */
   private retentionCutoff(effective: number): number {
     const byAge = this.config.retentionMs > 0 ? effective - this.config.retentionMs : 0;
-    if (this.config.retentionRecords <= 0) return Math.max(0, byAge);
+    const keep = this.keptHotRecords();
+    if (keep <= 0) return Math.max(0, byAge);
     // The index alone finds the Nth newest record; one lookup reads its commit time.
     const nth = this.rawRows<{ log_id: number }>(
-      "SELECT log_id FROM records INDEXED BY records_log_idx ORDER BY log_id DESC LIMIT 1 OFFSET ?", this.config.retentionRecords - 1,
+      "SELECT log_id FROM records INDEXED BY records_log_idx ORDER BY log_id DESC LIMIT 1 OFFSET ?", keep - 1,
     );
     const commit = nth.length ? this.rawRows<{ commit_ms: number }>(
       "SELECT commit_ms FROM records INDEXED BY records_log_idx WHERE log_id = ? LIMIT 1", nth[0].log_id,
@@ -8616,7 +8621,36 @@ export class Store {
 
   /** The reads retentionCutoff may take. */
   private retentionCountReads(): number {
-    return this.config.retentionRecords > 0 ? this.config.retentionRecords + 4 : 0;
+    const keep = this.keptHotRecords();
+    return keep > 0 ? keep + 4 : 0;
+  }
+
+  /** The records cleanup keeps in the hot log: `cleanupThresholdPercent` of `retentionRecords`, 0 without a count. */
+  private keptHotRecords(): number {
+    return thresholdRecords(this.config.retentionRecords, this.config.cleanupThresholdPercent);
+  }
+
+  /**
+   * Whether the hot log holds more than cleanup keeps (keptHotRecords); if
+   * so, makes cleanup due now rather than on its interval, so the hot log is
+   * trimmed back before it reaches `retentionRecords`. The runtime asks after
+   * posts, at most hourly (ApronDemoServer.checkHistoryThreshold). Counts up
+   * to what it keeps and one more, one index entry each.
+   */
+  cleanupPastThreshold(now = this.clock.now()): boolean {
+    this.ensureReady();
+    const keep = this.keptHotRecords();
+    if (keep <= 0) return false;
+    return this.reserved({ reads: 24 + keep + 1, writes: 4 }, true, now, () => {
+      const count = integerColumn(this.rawRows<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM (SELECT 1 FROM records INDEXED BY records_log_idx WHERE log_id >= ? LIMIT ?)",
+        this.logState().history_floor, keep + 1,
+      )[0]?.count);
+      if (count <= keep) return false;
+      this.rawExec("UPDATE maintenance SET next_cleanup_ms = MIN(next_cleanup_ms, ?) WHERE id = 1", this.effectiveNow(now));
+      this.cleanupDueCache = undefined;
+      return true;
+    });
   }
 
   /**

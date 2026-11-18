@@ -24,6 +24,14 @@ export interface Limits {
 	 */
 	archiveRecords: number;
 	/**
+	 * The share, in percent, of `retentionRecords` and `archiveRecords` that
+	 * cleanup keeps: the limits are ceilings, and cleanup trims each back to
+	 * this share of it. Once the hot log passes its share, cleanup runs at
+	 * once rather than on its interval (checked after posts, at most hourly),
+	 * so the limit is left as headroom for what comes before it runs.
+	 */
+	cleanupThresholdPercent: number;
+	/**
 	 * A record older than this expires whatever the count. 0 sets no age
 	 * limit; at least one of it and `retentionRecords` is set.
 	 */
@@ -592,6 +600,11 @@ export const MAX_RETENTION_RECORDS = 50_000;
 // Each archive cycle reads this many D1 index entries to find where the
 // archive's own count ends (Archive.floor).
 export const MAX_ARCHIVE_RECORDS = 100_000;
+
+/** The records a count limit keeps once cleanup trims it to its threshold (cleanupThresholdPercent); 0 for no limit. */
+export function thresholdRecords(limit: number, percent: number): number {
+	return limit > 0 ? Math.max(1, Math.floor((limit * percent) / 100)) : 0;
+}
 export const MAX_THREAD_LIMIT = 100;
 // A room's client fields must fit one frame (validateLimits). What rooms hold
 // past roomMetadataMinLimit is bounded together by at most one history

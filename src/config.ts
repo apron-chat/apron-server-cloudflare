@@ -467,6 +467,7 @@ function validateLimits(limits: Limits): void {
 	if (limits.retentionRecords === 0 && limits.retentionSeconds === 0) fail("retentionRecords or retentionSeconds must be set");
 	if (limits.retentionRecords > budget.MAX_RETENTION_RECORDS) fail("retentionRecords exceeds the calibrated bound");
 	if (limits.archiveRecords > budget.MAX_ARCHIVE_RECORDS) fail("archiveRecords exceeds the calibrated bound");
+	if (limits.cleanupThresholdPercent > 100) fail("cleanupThresholdPercent is a share of the limits, at most 100");
 	if (limits.retentionSeconds > 0 && limits.retentionSeconds < limits.cleanupSeconds) fail("retentionSeconds must be at least one cleanup interval");
 	// The minimum age applies only to retention by count.
 	if (limits.retentionRecords > 0 && (limits.minRetentionSeconds < limits.cleanupSeconds || (limits.retentionSeconds > 0 && limits.retentionSeconds < limits.minRetentionSeconds))) {
