@@ -306,8 +306,8 @@ happen, dialing out on demand and closing the connection after
 `REMOTE_LINGER_MS`. The other server's users appear here as
 `carol@go.example`, with `ext.remote` naming their server. Run the same two
 commands in another room to share it too; both use the same links. Threads
-of a shared room are shared with it; a private room here has no threads, so
-the other server posts a thread's messages in the room as replies instead.
+of a shared room are shared with it; a private room here has no threads, so a
+thread the other server starts in it stays there, with a notice saying so.
 `/remote unshare` stops one room, `/remote revoke <address>` every room with a
 server, and `/remote list` shows what is shared.
 

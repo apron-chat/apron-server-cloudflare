@@ -1264,13 +1264,8 @@ export interface RemotePair {
   start_log_id: number;
   /** For a thread of a shared room (a thread pair): its parent, whose pair it ends with. */
   parent?: string;
-  /**
-   * For a thread the remote server refused: its messages go to the parent's
-   * remote room (`remote_room`) as replies to `anchor`, the thread's first
-   * message sent, once there is one.
-   */
-  fallback?: boolean;
-  anchor?: string;
+  /** For a thread the remote server refused: it stays here, and nothing more of it is sent. */
+  refused?: boolean;
 }
 
 /** A remote server's outbox (ext:remote): the log ID sent through, and why it stopped, if it did. */
@@ -5489,8 +5484,7 @@ export class Store {
           room_id: pair.room_id, server: pair.server, remote_room: pair.remote_room, token: pair.token,
           created_ms: integerColumn(pair.created_ms), start_log_id: integerColumn(pair.start_log_id),
           ...(typeof pair.parent === "string" ? { parent: pair.parent } : {}),
-          ...(pair.fallback === true ? { fallback: true } : {}),
-          ...(typeof pair.anchor === "string" ? { anchor: pair.anchor } : {}),
+          ...(pair.refused === true ? { refused: true } : {}),
         }))
       : undefined, []);
   }
@@ -5513,16 +5507,6 @@ export class Store {
       const outbox = outboxes[pair.server];
       outboxes[pair.server] = { cursor: outbox?.cursor ?? this.logState().last_log_id };
       this.writeMeta(META_REMOTE_OUTBOX, JSON.stringify(outboxes));
-    }));
-  }
-
-  /** Sets a thread pair's anchor (ext:remote: the first message of a refused thread). */
-  setRemotePairAnchor(roomId: string, server: string, anchor: string, now = this.clock.now()): void {
-    this.ensureReady();
-    this.reserved({ reads: 4, writes: 4 }, false, now, () => this.transaction(() => {
-      const pairs = this.readRemotePairs().map((pair) => pair.room_id === roomId && pair.server === server && pair.anchor === undefined ? { ...pair, anchor } : pair);
-      this.writeMeta(META_REMOTE_PAIRS, JSON.stringify(pairs));
-      this.remotePairsCache = undefined;
     }));
   }
 

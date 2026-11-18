@@ -485,3 +485,23 @@ it('makes and saves a thread of a shared room as a remote user, and pairs it wit
 		expect((await command(admin, unique('list4'), '/remote list', roomId)).notice!.params.body.text).not.toContain(threadId);
 	} finally { admin.close(); link.close(); }
 });
+
+it('delivers the sender\'s notices: one ~room notice in a refused thread, one ~private notice an author gets once', async () => {
+	const { peer: admin, userId: adminId } = await freshAdmin();
+	const roomId = (await request(admin, unique('room'), 'room_set', { title: unique('Notices') })).result.room_id as string;
+	try {
+		await runInDurableObject(stub(), (instance) => {
+			const deps = (instance as unknown as { outboxDeps(server: string): { roomNotice(roomId: string, text: string): void; authorNotice(userId: string, roomId: string, text: string): void } }).outboxDeps('ws://b.example/ws');
+			deps.roomNotice(roomId, 'This thread is not shared with b.example.');
+			deps.authorNotice(adminId, roomId, 'Not sent to b.example: you were removed from this room there.');
+			deps.authorNotice(adminId, roomId, 'Not sent to b.example: you were removed from this room there.');
+		});
+		const room = await until(admin, (frame) => frame.method === 'message' && frame.params.from?.user_id === '~room');
+		expect(room.frame.params).toMatchObject({ room_id: roomId, body: { text: 'This thread is not shared with b.example.' } });
+		const told = await until(admin, (frame) => frame.method === 'message' && frame.params.from?.user_id === '~private');
+		expect(told.frame.params).toMatchObject({ room_id: roomId, body: { text: 'Not sent to b.example: you were removed from this room there.' } });
+		// Once: the next frame is the reply to this request, with no second notice before it.
+		const next = await exchange(admin, unique('ping'), 'room_list', { room_id: roomId });
+		expect(next.skipped.filter((frame) => frame.method === 'message' && frame.params.from?.user_id === '~private')).toEqual([]);
+	} finally { admin.close(); }
+});

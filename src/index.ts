@@ -533,6 +533,8 @@ const THROTTLE_WINDOW_MS = 60_000;
  * or digit, and `auth` never honors a requested `user_id`).
  */
 const PRIVATE_IDENTITY = { user_id: "~private", name: "System message to you" } as const;
+/** The room's system identity (Appendix A.1), for notices in a room, such as one about a thread that is not shared (ext:remote). */
+const ROOM_IDENTITY = { user_id: "~room", name: "Room" } as const;
 /**
  * The liveness ping clients send every `server.ping` seconds, byte for byte,
  * and its answer (§1). The runtime answers it without waking the object.
@@ -2544,6 +2546,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly deadlines = { maintenance: new Deadline(), uploads: new Deadline(), live: new Deadline(), presence: new Deadline(), remote: new Deadline() };
 	/** Each remote server's sender (extension `ext:remote`; RemoteSender), while this instance runs. */
 	private readonly senders = new Map<string, RemoteSender>();
+	/** The authors already told that a remote server removed them from a room (ext:remote), by server, room and user. */
+	private readonly toldRemoved = new Set<string>();
 	/** Each room's parent as read (parentOf): fixed at creation. */
 	private readonly roomParents = new Map<string, string | null>();
 	/** This server's address as an admin's connection reached it, for links in sent text when `REMOTE_SELF` is unset. */
@@ -5172,7 +5176,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!joined.includes(roomId) && (parent === null || !joined.includes(parent))) throw { name: "denied", message: "This link is not in that room, so its remote users may not write there", data: NOT_JOINED } satisfies ProtocolError;
 		const userId = actor.identity.user_id;
 		if (this.store.isRoomMember(roomId, userId, nowMs())) return;
-		if (this.store.remoteUserLeft(userId, roomId, nowMs())) throw { name: "denied", message: "This remote user was removed from that room, so may not write there again" } satisfies ProtocolError;
+		if (this.store.remoteUserLeft(userId, roomId, nowMs())) throw { name: "denied", message: "This remote user was removed from that room, so may not write there again", data: { ext: { remote: "removed" } } } satisfies ProtocolError;
 		await this.runMutation(async () => {
 			const change = this.store.changeMembership({ userId, ipKey: attachment.ipKey, roomId, join: true, now: nowMs(), actorId: actor.link, link: actor.link });
 			if (change.membership) this.broadcastRecord(change.membership);
@@ -5203,7 +5207,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const pairs = this.store.remotePairs(nowMs());
 		if (roomId === undefined) {
 			if (typeof remoteThread !== "string" || remoteThread === "") throw { name: "invalid_params", message: "ext.remote.room_id must name the thread on the link's server" } satisfies ProtocolError;
-			const live = pairs.filter((pair) => pair.server === actor.remote.server && pair.parent !== undefined && !pair.fallback && this.roomExists(pair.room_id)).length;
+			const live = pairs.filter((pair) => pair.server === actor.remote.server && pair.parent !== undefined && !pair.refused && this.roomExists(pair.room_id)).length;
 			if (live >= MAX_REMOTE_THREADS) throw { name: "denied", message: `A link makes at most ${MAX_REMOTE_THREADS} threads here at once` } satisfies ProtocolError;
 			// The remote user joins the room first, so the room's own rules answer (a private room has no threads).
 			await this.shadowJoins(socket, attachment, actor, parentId);
@@ -9103,17 +9107,25 @@ export class ApronDemoServer extends DurableObject<Env> {
 			get self() { return config.remoteSelf ?? known() ?? ""; },
 			pairs: () => new Map(store.remotePairs(nowMs()).filter((pair) => pair.server === server).map((pair) => [pair.room_id, {
 				remote: pair.remote_room, start: pair.start_log_id,
-				...(pair.parent !== undefined ? { parent: pair.parent } : {}), ...(pair.fallback ? { fallback: true } : {}), ...(pair.anchor !== undefined ? { anchor: pair.anchor } : {}),
+				...(pair.parent !== undefined ? { parent: pair.parent } : {}), ...(pair.refused ? { refused: true } : {}),
 			}])),
 			threads: (parents) => store.threadsOf(parents, nowMs()),
 			setThreadPair: (threadId, pair) => {
 				// The thread signs in with its parent's token, as every pair with the server does: the newest.
 				const parent = store.remotePairs(nowMs()).find((candidate) => candidate.server === server && candidate.room_id === pair.parent);
 				if (!parent) return;
-				store.setRemotePair({ room_id: threadId, server, remote_room: pair.remote, token: parent.token, parent: pair.parent, start_log_id: pair.start, ...(pair.fallback ? { fallback: true } : {}) }, nowMs());
-				console.log(JSON.stringify({ event: "remote_thread_paired", server, room_id: threadId, remote_room: pair.remote, fallback: pair.fallback }));
+				store.setRemotePair({ room_id: threadId, server, remote_room: pair.remote, token: parent.token, parent: pair.parent, start_log_id: pair.start, ...(pair.refused ? { refused: true } : {}) }, nowMs());
+				console.log(JSON.stringify({ event: "remote_thread_paired", server, room_id: threadId, remote_room: pair.remote, refused: pair.refused }));
 			},
-			setAnchor: (threadId, messageId) => store.setRemotePairAnchor(threadId, server, messageId, nowMs()),
+			// A notice is not logged: the thread's members connected now see it.
+			roomNotice: (roomId, text) => this.deliver({ method: "message", params: { room_id: roomId, from: { ...ROOM_IDENTITY }, body: { text, format: "markdown" } } }, [roomId]),
+			authorNotice: (userId, roomId, text) => {
+				const key = `${server}\n${roomId}\n${userId}`;
+				if (this.toldRemoved.has(key)) return;
+				if (this.toldRemoved.size > 1024) this.toldRemoved.clear();
+				this.toldRemoved.add(key);
+				this.sendToUser(userId, { method: "message", params: { room_id: roomId, from: { ...PRIVATE_IDENTITY }, body: { text, format: "markdown" } } });
+			},
 			linkInRoom: (roomId) => {
 				const linkId = store.remoteLinkFor(server, nowMs());
 				return linkId !== undefined && store.isRoomMember(roomId, linkId, nowMs());

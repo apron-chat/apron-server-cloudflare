@@ -14,8 +14,9 @@ function world(records: OutboxRecord[]) {
 		pairs: new Map([['room', 'ops'], ['other', 'ops2']]),
 		starts: new Map<string, number>(),
 		threads: [] as Array<{ room_id: string; parent: string; created_log_id: number; creator?: string }>,
-		threadPairs: new Map<string, { remote: string; parent: string; start: number; fallback: boolean }>(),
-		anchors: new Map<string, string>(),
+		threadPairs: new Map<string, { remote: string; parent: string; start: number; refused: boolean }>(),
+		roomNotices: [] as Array<[string, string]>,
+		authorNotices: [] as Array<[string, string, string]>,
 		linkIn: new Set(['room', 'other']),
 		messages: new Map<string, Record<string, unknown>>(),
 		copies: new Map<string, string>(),
@@ -28,13 +29,14 @@ function world(records: OutboxRecord[]) {
 		self: SELF,
 		pairs: () => new Map([...state.pairs].filter(([room]) => !state.dropped.includes(room)).map(([room, remote]) => {
 			const thread = state.threadPairs.get(room);
-			return [room, { remote, start: thread?.start ?? state.starts.get(room) ?? 0, ...(thread ? { parent: thread.parent, ...(thread.fallback ? { fallback: true } : {}) } : {}), ...(state.anchors.has(room) ? { anchor: state.anchors.get(room) } : {}) }];
+			return [room, { remote, start: thread?.start ?? state.starts.get(room) ?? 0, ...(thread ? { parent: thread.parent, ...(thread.refused ? { refused: true } : {}) } : {}) }];
 		})),
 		linkInRoom: (room) => state.linkIn.has(room),
 		dropPair: (room) => { state.dropped.push(room); },
 		threads: (parents) => state.threads.filter((thread) => parents.includes(thread.parent)),
 		setThreadPair: (threadId, pair) => { state.pairs.set(threadId, pair.remote); state.threadPairs.set(threadId, pair); },
-		setAnchor: (threadId, messageId) => { state.anchors.set(threadId, messageId); },
+		roomNotice: (roomId, text) => { state.roomNotices.push([roomId, text]); },
+		authorNotice: (userId, roomId, text) => { state.authorNotices.push([userId, roomId, text]); },
 		cursor: () => state.cursor,
 		advance: (logId) => { state.cursor = Math.max(state.cursor, logId); },
 		records: (rooms, after, limit) => records.filter((record) => rooms.includes(record.room_id) && record.log_id > after).slice(0, limit),
@@ -198,28 +200,40 @@ describe('Outbox', () => {
 		await outbox.drain(call);
 		const sets = sent.filter((request) => request.method === 'room_set').map((request) => request.params);
 		expect(sets[0]).toEqual({ parent_room_id: 'ops', title: 'Plans', ext: { remote: { user_id: 'ada', room_id: 't1' } } });
-		expect(state.threadPairs.get('t1')).toEqual({ remote: 'remote-t1', parent: 'room', start: 2, fallback: false });
+		expect(state.threadPairs.get('t1')).toEqual({ remote: 'remote-t1', parent: 'room', start: 2, refused: false });
 		expect(sent.find((request) => request.method === 'message')!.params).toMatchObject({ room_id: 'remote-t1', ext: { remote: { room_id: 't1', message_id: '3' } } });
 		expect(sets[1]).toEqual({ room_id: 'remote-t1', title: 'Plans v2', ext: { remote: { user_id: 'ada' } } });
 	});
 
-	it('posts a refused thread\'s messages in the parent\'s remote room, as replies to its first', async () => {
+	it('keeps a refused thread here, with one ~room notice in it, and sends nothing more of it', async () => {
 		const { outbox, sent, call, state, answers } = world([
 			{ room_id: 't1', log_id: 2, kind: 'room', record: { room_id: 't1', parent_room_id: 'room', title: 'Plans' } },
 			message(3, { body: { text: 'first' } }, 't1'),
-			message(4, { body: { text: 'second' } }, 't1'),
-			{ room_id: 't1', log_id: 5, kind: 'membership', record: { members: [{ user: { user_id: 'ada' }, joined: false }] } },
+			{ room_id: 't1', log_id: 4, kind: 'membership', record: { members: [{ user: { user_id: 'ada' }, joined: false }] } },
+			message(5, { body: { text: 'in the room' } }),
 		]);
 		state.threads.push({ room_id: 't1', parent: 'room', created_log_id: 2, creator: 'ada' });
 		answers.set('room_set', () => ({ error: { code: -32001, message: 'A private room has no threads on this demo' } }));
 		await outbox.drain(call);
-		expect(state.threadPairs.get('t1')).toMatchObject({ remote: 'ops', fallback: true });
-		const messages = sent.filter((request) => request.method === 'message').map((request) => request.params);
-		expect(messages[0]).toMatchObject({ room_id: 'ops', body: { text: 'first' } });
-		expect(messages[0]).not.toHaveProperty('reply_to');
-		expect(messages[1]).toMatchObject({ room_id: 'ops', body: { text: 'second' }, reply_to: { message_id: state.copies.get('3') } });
-		// Leaving the thread is not leaving the room.
+		expect(state.threadPairs.get('t1')).toMatchObject({ refused: true });
+		expect(state.roomNotices).toEqual([['t1', 'This thread is not shared with b.example.']]);
+		// Only the parent room's message went; the thread's did not, nor its leave.
+		expect(sent.filter((request) => request.method === 'message').map((request) => request.params.body.text)).toEqual(['in the room']);
 		expect(sent.some((request) => request.method === 'room_leave')).toBe(false);
+		expect(state.cursor).toBe(5);
+	});
+
+	it('tells an author once when the other server removed them from the room, and nothing for other refusals', async () => {
+		const { outbox, call, state, answers } = world([message(1, {}), message(2, {}), message(3, { from: { user_id: 'bob' } })]);
+		answers.set('message', (request) => request.params.ext.remote.user_id === 'ada'
+			? { error: { code: -32001, message: 'ada@a.example was removed from Ops, so its link may not write there as it' } }
+			: { error: { code: -32001, message: 'Only the original author may edit this message' } });
+		await outbox.drain(call);
+		expect(state.authorNotices).toEqual([
+			['ada', 'room', 'Not sent to b.example: you were removed from this room there.'],
+			['ada', 'room', 'Not sent to b.example: you were removed from this room there.'],
+		]);
+		expect(state.cursor).toBe(3);
 	});
 
 	it('sends a profile again when the name changed', async () => {
