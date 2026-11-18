@@ -314,13 +314,24 @@ function envName(name: string): string {
 	return name.replace(/[A-Z]/g, (letter) => `_${letter}`).toUpperCase();
 }
 
+/** Limits where 0 turns the bound off (docs/configuration.md, History retention); every other limit is positive. */
+const OPTIONAL_LIMITS: ReadonlySet<string> = new Set<keyof Limits>(["retentionRecords", "retentionSeconds"]);
+
+function limitError(name: string): ConfigError {
+	return new ConfigError(`${name} must be a ${OPTIONAL_LIMITS.has(name) ? "non-negative" : "positive"} safe integer`);
+}
+
+function validLimitValue(name: string, value: unknown): boolean {
+	return typeof value === "number" && Number.isSafeInteger(value) && (value > 0 || (value === 0 && OPTIONAL_LIMITS.has(name)));
+}
+
 function parsePositiveInt(env: EnvLike, name: string, fallback: number): number {
 	const upper = envName(name);
 	const values = env as EnvLike & Record<string, unknown>;
 	const raw = values[`LIMIT_${upper}`] ?? values[upper] ?? values[name];
 	if (raw === undefined || raw === "") return fallback;
 	const value = typeof raw === "number" ? raw : Number(raw);
-	if (!Number.isSafeInteger(value) || value <= 0) throw new ConfigError(`${name} must be a positive safe integer`);
+	if (!validLimitValue(name, value)) throw limitError(name);
 	return value;
 }
 
@@ -391,10 +402,7 @@ function validateLimits(limits: Limits): void {
 		fail("socket queues exceed the demo memory allocation");
 	}
 
-	// Nothing logged may still name a user_id when it can be issued again.
-	if (limits.retiredUserIdSeconds < limits.retentionSeconds) fail("retiredUserIdSeconds must be at least retentionSeconds");
-	// An account idle past the dormancy age must also be past retention, and past a day.
-	if (limits.idleAccountSeconds < Math.max(86_400, limits.retentionSeconds)) fail("idleAccountSeconds must be at least a day and retentionSeconds");
+	if (limits.idleAccountSeconds < 86_400) fail("idleAccountSeconds must be at least a day");
 	if (limits.keptActiveAccounts > limits.registeredIdentityCount) fail("keptActiveAccounts must be at most registeredIdentityCount");
 	if (limits.registeredIdentityCount > budget.MAX_REGISTERED_IDENTITIES || limits.limiterRecordCap > budget.MAX_LIMITER_RECORDS) {
 		fail("identity or limiter records exceed the calibrated bound");
@@ -456,7 +464,11 @@ function validateLimits(limits: Limits): void {
 	if (limits.databaseHighWaterBytes > budget.MAX_DATABASE_HIGH_WATER_BYTES || limits.databaseHardTargetBytes > budget.MAX_DATABASE_HARD_TARGET_BYTES) {
 		fail("resource ceilings exceed the demo allocation");
 	}
-	if (limits.retentionSeconds < limits.cleanupSeconds) fail("retention must be at least one cleanup interval");
+	if (limits.retentionRecords === 0 && limits.retentionSeconds === 0) fail("retentionRecords or retentionSeconds must be set");
+	if (limits.retentionRecords > budget.MAX_RETENTION_RECORDS) fail("retentionRecords exceeds the calibrated bound");
+	if (limits.minRetentionSeconds < limits.cleanupSeconds || (limits.retentionSeconds > 0 && limits.retentionSeconds < limits.minRetentionSeconds)) {
+		fail("retention must be at least one cleanup interval, and retentionSeconds at least minRetentionSeconds");
+	}
 	if (!Number.isSafeInteger(limits.sessionTtlSeconds) || limits.sessionTtlSeconds <= 0 || limits.sessionTtlSeconds > 30 * 24 * 60 * 60) {
 		fail("session lifetime must be between one second and thirty days");
 	}
@@ -533,7 +545,7 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 	}
 	Object.assign(limits, overrides);
 	for (const [key, value] of Object.entries(limits)) {
-		if (!Number.isSafeInteger(value) || value <= 0) throw new ConfigError(`${key} must be a positive safe integer`);
+		if (!validLimitValue(key, value)) throw limitError(key);
 	}
 	validateLimits(limits);
 

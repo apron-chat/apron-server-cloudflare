@@ -173,8 +173,8 @@ within it:
   nothing more. Nothing is stored while the text streams: if the server
   restarts meanwhile (a deploy), the text ends and its embed is removed.
   Why these limits: each text keeps the one server object awake and costs a
-  request for its write and for each reader, and its kept text is stored for
-  the 30 days its message is ([cost report](cost-report.md#live-text)).
+  request for its write and for each reader, and its kept text is stored as
+  long as its message is ([cost report](cost-report.md#live-text)).
 - Status (cap `status`, with push): a user chooses a status with `me`
   `{"status": …}`: `online` (the default), `dnd` (busy: no pushes),
   `invisible` (appear `offline` to everyone), or `""` (none: show no

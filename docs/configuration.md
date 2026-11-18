@@ -16,8 +16,9 @@ The paid plan starts from the free one and raises only what Paid's included
 usage pays for, sized against its monthly allowances divided by 31 days with
 headroom. Paid includes 16 times the SQL rows written and 160 times the rows
 read, so the SQL ceilings rise tenfold, and posts, registrations, admissions,
-history pages, and member listings with them. History is kept 30 days instead
-of 24 hours, matching uploaded images, with daily cleanup; the database
+history pages, and member listings with them. History keeps the latest
+10,000 records instead of 24 hours (see [History retention](#history-retention)),
+with daily cleanup, and uploaded files are kept 90 days to match; the database
 watermarks rise to 768 MiB (1 GiB hard), a fifth of the 5 GB-month included.
 
 Paid includes only a third of Free's Durable Object requests (1 million a
@@ -363,7 +364,7 @@ in `src/plans/paid.ts` sets the limits:
 | `uploadsPerDay` (server-wide, avatars and custom emoji included; counted when a write is claimed) | 500 |
 | `uploadsPerUserDay` (counted when an upload starts) | 30 |
 | `writeWindowSeconds` | 10 minutes |
-| `fileRetentionSeconds` | 30 days |
+| `fileRetentionSeconds` | 90 days |
 | `avatarRetentionSeconds` | 60 days |
 | `avatarRefreshSeconds` | 30 days |
 | `lifecycleLagSeconds` | 1 day |
@@ -374,7 +375,7 @@ are set; set up all of these first:
 
 1. **Bucket.** Create an R2 bucket named `apron-media` (the `MEDIA` binding
    in `wrangler.production.toml`). Deploying fails while it does not exist.
-2. **Lifecycle rules.** On the bucket, delete objects with prefix `f/` 30 days
+2. **Lifecycle rules.** On the bucket, delete objects with prefix `f/` 90 days
    after upload and prefix `a/` 61 days after upload. They must be at least
    `fileRetentionSeconds` and `avatarRetentionSeconds` (a day more leaves
    R2's asynchronous deletes a margin); the server deletes expired objects
@@ -729,6 +730,36 @@ wake costs one alarm (a Durable Object request) and about 9 metered
 maintenance writes (6 if the object was still in memory). See the
 [cost report](cost-report.md#user-status).
 
+## History retention
+
+History (the server-wide log) is expired from its oldest end by three limits:
+
+| Limit | Workers Paid | Workers Free |
+| --- | ---: | ---: |
+| `retentionRecords`: keep at least the latest this many records | 10000 | 0 (off) |
+| `minRetentionSeconds`: never expire a younger record by count | 3 days | 1 day |
+| `retentionSeconds`: expire an older record whatever the count | 0 (off) | 1 day |
+
+A record expires once it is past the latest `retentionRecords` and at least
+`minRetentionSeconds` old, or once it is older than `retentionSeconds`. Set
+`retentionRecords` to 0 for history by age alone, as on Free, or
+`retentionSeconds` to 0 for no age limit, as on Paid; at least one must be
+set. Each cleanup run reads up to `retentionRecords` index entries to find
+where the count ends, so it is at most 50,000.
+
+The count is of log records, not messages: edits, reactions, memberships and
+room changes count too, so 10,000 records are fewer messages. At the demo's
+traffic in November 2026 (about 115 records a day) they spanned about 12
+weeks; a busier stretch keeps less time, a quieter one more. The minimum age
+keeps a flood from pushing out the last three days before an admin purges
+it; the database watermarks still bound what the flood stores.
+
+Uploaded files expire by age (`fileRetentionSeconds`, 90 days on Paid), since
+the bucket's lifecycle rules can only expire by age: a message kept longer
+shows without its file. A removed account's `user_id` is retired until history
+has expired past the log position where it was removed (account upkeep,
+below), not for a time, so it follows whichever limit moves the log.
+
 ## Runtime overrides
 
 Wrangler string variables use the exact names below. Every row of the numeric
@@ -738,7 +769,8 @@ uppercase snake case (`LIMIT_MAX_FRAME_BYTES`), plain uppercase snake case
 Wrangler deployments should use the uppercase form; local tests may use
 camelCase. Omitted variables use the defaults. Each value must be a positive
 JavaScript safe integer: `0`, fractions, negative values, and values above
-`Number.MAX_SAFE_INTEGER` fail startup.
+`Number.MAX_SAFE_INTEGER` fail startup. `retentionRecords` and
+`retentionSeconds` also take `0`, which turns that bound off.
 
 Production should use the checked-in budget defaults; retain overrides for local
 tests or deliberate temporary reductions. Overrides do not regenerate the native
@@ -768,10 +800,12 @@ defaults:
   posting limits are at least the registered ones. Global posting,
   registration, identity, and processed-frame caps are fixed demo ceilings.
   Low, high, and hard storage watermarks must be strictly ordered.
-- `retentionSeconds` is at least `cleanupSeconds`; `sessionTtlSeconds` is at
-  most 30 days; `retiredUserIdSeconds` is at least `retentionSeconds`;
-  `idleAccountSeconds` is at least a day and `retentionSeconds`;
-  `keptActiveAccounts` is at most `registeredIdentityCount`.
+- At least one of `retentionRecords` and `retentionSeconds` is set;
+  `retentionRecords` is at most 50,000; `minRetentionSeconds` is at least
+  `cleanupSeconds`, and `retentionSeconds`, when set, at least
+  `minRetentionSeconds`. `sessionTtlSeconds` is at most 30 days;
+  `idleAccountSeconds` is at least a day; `keptActiveAccounts` is at most
+  `registeredIdentityCount`.
 - `roomMetadataLimit` plus 1 KiB of envelope must fit `maxFrameBytes`;
   `roomMetadataMinLimit` is at most `roomMetadataLimit`; and
   `roomMetadataTotalLimit` is at least `roomMetadataLimit` less
@@ -951,10 +985,13 @@ user, one connected now or whose bot is, one whose bot holds a role of its
 own, or one with a live upload (its avatar expires first, up to 61 days after its
 owner's last sign-in). Its bot goes with it, and its passkeys, memberships,
 read cursors, status, mutes, push subscriptions, tokens and limiter rows. Its
-content is past retention by then, or within the day cleanup may take. Its `user_id` is retired, as `/purge`
-retires one, for `retiredUserIdSeconds` (the message retention), then may be
-issued again, once every token of the old account and its bot is revoked:
-nothing logged names it any more, and a session carries the user handle it
+content stays in history, under the name it was posted with, until it
+expires like anything else. Its `user_id` is retired, as `/purge` retires one,
+at the log head: once history has expired past that position (by an hour of
+log IDs), or the whole log has, it may be issued again, once every token of
+the old account and its bot is revoked. A move or an editor's save that logs
+the account's content again moves its position to that record. Nothing logged
+names it any more by then, and a session carries the user handle it
 was issued under, so a new account under the id never resumes an old one's
 (a session from before sessions carried handles resumes only for an account
 from before then). Once a day the same upkeep clears mutes that ran out.
@@ -1062,10 +1099,11 @@ deployment that stays awake.
 
 The numeric rows are grouped by their unit and enforcement scope:
 
-- Durations: `retentionSeconds`, `cleanupSeconds`, `challengeTtlSeconds`,
+- History: `retentionRecords` (a count of records, [above](#history-retention)).
+- Durations: `minRetentionSeconds` and `retentionSeconds` ([History
+  retention](#history-retention)), `cleanupSeconds`, `challengeTtlSeconds`,
   `sessionTtlSeconds` (a passkey session token's lifetime, renewed on each
-  resume), `idleAccountSeconds` and `retiredUserIdSeconds` (account upkeep,
-  above), `unauthenticatedTimeoutSeconds`, `dedupTtlSeconds`, and
+  resume), `idleAccountSeconds` (account upkeep, above), `unauthenticatedTimeoutSeconds`, `dedupTtlSeconds`, and
   `statusCoalesceSeconds`, `offlineGraceSeconds`, `presenceAlarmSeconds` and
   `guestPresenceAlarmSeconds` (each at most 60, the last a multiple of the one
   before; see [User status](#user-status-presence)).
@@ -1120,13 +1158,14 @@ The numeric rows are grouped by their unit and enforcement scope:
 
 | Variable | Workers Paid default | Workers Free, where different |
 | --- | ---: | ---: |
-| `retentionSeconds` | 2592000 | 86400 |
+| `retentionRecords` | 10000 | 0 |
+| `minRetentionSeconds` | 259200 | 86400 |
+| `retentionSeconds` | 0 | 86400 |
 | `cleanupSeconds` | 86400 | 3600 |
 | `challengeTtlSeconds` | 120 |  |
 | `sessionTtlSeconds` | 2592000 |  |
 | `idleAccountSeconds` | 2592000 |  |
 | `keptActiveAccounts` | 100 |  |
-| `retiredUserIdSeconds` | 2592000 | 86400 |
 | `maxFrameBytes` | 32768 | 16384 |
 | `maxTextBytes` | 16384 | 4096 |
 | `maxSnapshotBytes` | 24576 | 8192 |

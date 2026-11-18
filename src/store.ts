@@ -112,7 +112,6 @@ const MAX_USER_ROOMS = MAX_THREAD_LIMIT + 1 + MAX_PRIVATE_MEMBERSHIPS_PER_USER;
 /** The most members a private room may have for its members to see each other's read cursors (read receipts). */
 export const MAX_READ_RECEIPT_MEMBERS = 10;
 const MAX_SAFE_ID = Number.MAX_SAFE_INTEGER;
-export const RETENTION_MS = DEFAULT_LIMITS.retentionSeconds * 1000;
 const DEDUP_TTL_MS = DEFAULT_LIMITS.dedupTtlSeconds * 1000;
 const MINUTE_MS = 60 * 1000;
 /**
@@ -160,13 +159,16 @@ interface StoreClock {
 }
 
 export interface StoreConfig {
+  /** Records older than this have expired whatever the count; 0 sets no age limit (retentionCutoff). */
   retentionMs: number;
+  /** History keeps at least the latest this many records; 0 keeps no count (retentionCutoff). */
+  retentionRecords: number;
+  /** Records younger than this never expire by count. */
+  minRetentionMs: number;
   /** Inactivity past which an account is removed (pruneIdleIdentities). */
   idleAccountMs: number;
   /** The most recently active accounts pruneIdleIdentities always keeps. */
   keptActiveAccounts: number;
-  /** How long a removed account's `user_id` stays retired (dueRetiredUserIds). */
-  retiredUserIdMs: number;
   dedupTtlMs: number;
   cleanupIntervalMs: number;
   cleanupBatch: number;
@@ -501,10 +503,11 @@ export interface UploadWrite {
 }
 
 const DEFAULT_CONFIG: StoreConfig = {
-  retentionMs: RETENTION_MS,
+  retentionMs: DEFAULT_LIMITS.retentionSeconds * 1000,
+  retentionRecords: DEFAULT_LIMITS.retentionRecords,
+  minRetentionMs: DEFAULT_LIMITS.minRetentionSeconds * 1000,
   idleAccountMs: DEFAULT_LIMITS.idleAccountSeconds * 1000,
   keptActiveAccounts: DEFAULT_LIMITS.keptActiveAccounts,
-  retiredUserIdMs: DEFAULT_LIMITS.retiredUserIdSeconds * 1000,
   dedupTtlMs: DEDUP_TTL_MS,
   cleanupIntervalMs: DEFAULT_LIMITS.cleanupSeconds * 1000,
   cleanupBatch: DEFAULT_LIMITS.cleanupBatch,
@@ -579,8 +582,8 @@ const DEFAULT_CONFIG: StoreConfig = {
 
 export function defaultStoreConfig(overrides: Partial<StoreConfig> = {}): StoreConfig {
   const merged = { ...DEFAULT_CONFIG, ...overrides };
-  if (merged.retentionMs <= 0 || merged.dedupTtlMs <= 0) {
-    throw new Error("retention and dedup TTL must be positive");
+  if (merged.retentionMs < 0 || merged.retentionRecords < 0 || merged.minRetentionMs < 0 || (merged.retentionMs === 0 && merged.retentionRecords === 0) || merged.dedupTtlMs <= 0) {
+    throw new Error("retention needs an age or a count, and dedup TTL must be positive");
   }
   if (merged.maxSnapshotBytes <= 0 || merged.maxTextBytes <= 0) {
     throw new Error("snapshot and text limits must be positive");
@@ -1220,11 +1223,21 @@ function parseRoles(json: string | null | undefined): string[] {
  */
 const META_RENAMED_PREFIX = "renamed:";
 /**
- * `_meta` key prefix recording a `/purge`: `purged:<user_id>` retires the
- * id, never reissued, so a passkey session still held for it (sessions are
+ * `_meta` key prefix recording a `/purge` or an idle prune: `purged:<user_id>`
+ * retires the id, so a passkey session still held for it (sessions are
  * found by token, not by user) can never sign in as a later user given it.
+ * Its value is the log head when it was retired, raised when a move or an
+ * editor's save logs the account's content again (noteRetiredRelog): the
+ * id is freed once history has expired past it (dueRetiredUserIds).
  */
 const META_PURGED_PREFIX = "purged:";
+/**
+ * How far past a retired id's marker the history floor must be before the
+ * id is freed. Markers written before they held the log head held the
+ * time, and log IDs are commit-time milliseconds that run ahead of the
+ * clock only while commits come faster than one a millisecond.
+ */
+const RETIRED_MARKER_MARGIN = 60 * 60 * 1000;
 /** `_meta` key: when the daily idle bot sweep (idleBots) is next due. */
 const META_BOT_SWEEP = "bot_sweep_ms";
 
@@ -3874,8 +3887,8 @@ export class Store {
    * passkey, push subscription, status, mute, limiter and dedup rows. A logged record that
    * lists them beside others (a move's reaction sets) is rewritten without
    * them. Rooms they created stay, without a creator. Each purged identity's
-   * `user_id` is retired (META_PURGED_PREFIX) for `retiredUserIdMs`, past
-   * the retention of anything that names it; sessions carry the user handle
+   * `user_id` is retired (META_PURGED_PREFIX) until history has expired past
+   * the log head, and with it anything that named it; sessions carry the user handle
    * they were issued under, so none carries over to a later account.
    * Removing the threads it leaves empty is the caller's (removeIfEmpty), as
    * it knows the connections still in them. Clients that already have their content
@@ -3962,7 +3975,7 @@ export class Store {
         this.adjustCount("principal_limit_count", -limiters);
       }
       for (const id of ids) this.limiters.dropPrincipal(`user:${id}`);
-      for (const userId of retired) this.writeMeta(META_PURGED_PREFIX + userId, String(now));
+      for (const userId of retired) this.writeMeta(META_PURGED_PREFIX + userId, String(this.logState().last_log_id));
       if (identities) this.adjustCount("identity_count", -identities);
       return { messages: messages.length, reactions: integerColumn(reactions), deletedUploads };
     }), true);
@@ -3996,9 +4009,10 @@ export class Store {
    * files expire first). With each goes its bot. It removes their identity,
    * passkeys, memberships (lowering their rooms' member counts), read
    * cursors, status, mutes, push subscriptions and wakes, dedup and limiter
-   * rows, and their rooms' creator; each `user_id` is retired for
-   * `retiredUserIdMs` (dueRetiredUserIds). Idle past retention, nothing
-   * of theirs is still logged. Maintenance work: it measures the rows first,
+   * rows, and their rooms' creator; each `user_id` is retired until history
+   * has expired past the log head (dueRetiredUserIds). What they posted
+   * stays in history, under the name it was posted with, until it expires
+   * like anything else. Maintenance work: it measures the rows first,
    * then reserves them, and a refusal leaves the rest for a later run.
    * Returns the removed ids (bots included), and whether more may remain.
    */
@@ -4091,7 +4105,7 @@ export class Store {
           this.adjustCount("principal_limit_count", -limiters);
         }
         for (const id of ids) this.limiters.dropPrincipal(`user:${id}`);
-        for (const id of ids) this.writeMeta(META_PURGED_PREFIX + id, String(now));
+        for (const id of ids) this.writeMeta(META_PURGED_PREFIX + id, String(this.logState().last_log_id));
         this.adjustCount("identity_count", -ids.length);
         const day = dayFor(now);
         const previous = this.idlePrunedRaw();
@@ -4131,25 +4145,44 @@ export class Store {
 
   /**
    * The `user_id`s retired (`purged:<id>`, by `/purge` or the idle prune)
-   * more than `retiredUserIdMs` ago, at most RETIRED_SWEEP_BATCH, which may
-   * be freed: by then nothing logged names them. A marker from before
-   * markers kept their time (`1`) starts its time now. The caller revokes
-   * every token of each (and of its bot) before freeRetiredUserIds frees it,
-   * so no token of the old account can sign in to a new one under the id.
+   * whose marker the history floor has passed, by RETIRED_MARKER_MARGIN, or
+   * every one once the whole log has expired, at most RETIRED_SWEEP_BATCH:
+   * nothing retained names them, so they may be freed. The log is the
+   * clock: an id stays retired until the history that might name it is gone,
+   * however long that takes. A marker from before markers kept their time
+   * (`1`) starts at the log head. The caller revokes every token of each (and
+   * of its bot) before freeRetiredUserIds frees it, so no token of the old
+   * account can sign in to a new one under the id.
    */
   dueRetiredUserIds(now = this.clock.now()): string[] {
     this.ensureReady();
     const end = META_PURGED_PREFIX.slice(0, -1) + ";";
     return this.reserved({ reads: 16 + 4 * this.config.registeredIdentityCount, writes: 8 + 4 * RETIRED_SWEEP_BATCH }, true, now, () => this.transaction(() => {
+      const state = this.logState();
       const legacy = this.rawRows<{ key: string }>(
         "SELECT key FROM _meta WHERE key >= ? AND key < ? AND CAST(value AS INTEGER) <= 1 LIMIT ?", META_PURGED_PREFIX, end, RETIRED_SWEEP_BATCH,
       );
-      for (const row of legacy) this.rawExec("UPDATE _meta SET value = ? WHERE key = ?", String(now), row.key);
+      for (const row of legacy) this.rawExec("UPDATE _meta SET value = ? WHERE key = ?", String(state.last_log_id), row.key);
+      const below = state.history_floor > state.last_log_id ? Number.MAX_SAFE_INTEGER : state.history_floor - RETIRED_MARKER_MARGIN;
       return this.rawRows<{ key: string }>(
         "SELECT key FROM _meta WHERE key >= ? AND key < ? AND CAST(value AS INTEGER) > 1 AND CAST(value AS INTEGER) < ? ORDER BY CAST(value AS INTEGER) LIMIT ?",
-        META_PURGED_PREFIX, end, now - this.config.retiredUserIdMs, RETIRED_SWEEP_BATCH,
+        META_PURGED_PREFIX, end, below, RETIRED_SWEEP_BATCH,
       ).map((row) => row.key.slice(META_PURGED_PREFIX.length));
     }), false);
+  }
+
+  /**
+   * Raises to `logId` the marker of each retired id in `userIds`: a move or
+   * an editor's save has logged what they left again, so the id stays retired
+   * until that record expires too. One read a user; a write for each retired.
+   */
+  private noteRetiredRelog(userIds: readonly string[], logId: number): void {
+    const ids = [...new Set(userIds)];
+    if (!ids.length) return;
+    this.rawExec(
+      "UPDATE _meta SET value = ? WHERE key IN (SELECT ? || value FROM json_each(?)) AND CAST(value AS INTEGER) < ?",
+      String(logId), META_PURGED_PREFIX, JSON.stringify(ids), logId,
+    );
   }
 
   /** Frees retired `user_id`s (dueRetiredUserIds), their tokens revoked: they may be issued again. */
@@ -5610,6 +5643,13 @@ export class Store {
     const broadcasts: Broadcast[] = [{
       method: "message", params: clone(snapshot) as unknown as Record<string, unknown>, rooms: moved ? [current.room_id, roomId] : [roomId],
     }];
+    const relogged: string[] = [];
+    let relogLogId = logId;
+    if (editor || moving) {
+      relogged.push(from.user_id);
+      const editedBy = isPlainObject(ext?.editors) ? (ext.editors as Record<string, unknown>).edited_by : undefined;
+      if (typeof editedBy === "string") relogged.push(editedBy);
+    }
     if (moved) {
       // Reactions follow a moved message: one record in the destination with
       // every retained non-empty set. The per-message cap bounds this read.
@@ -5631,8 +5671,14 @@ export class Store {
         // The sets' latest record is now the moved copy; retention follows it.
         this.rawExec("UPDATE reaction_state SET log_id = ? WHERE message_id = ? AND log_id >= ?", reactionLogId, messageId, floor);
         broadcasts.push({ method: "reactions", params: clone(record) as unknown as Record<string, unknown>, rooms: [roomId] });
+        relogged.push(...rows.map((row) => row.user_id));
+        relogLogId = reactionLogId;
       }
     }
+    // Someone else's content logged again names its author, its last
+    // editor and, moved, its reactors, any of whom may have been removed
+    // since: their ids stay retired until these records expire too.
+    if (relogged.length) this.noteRetiredRelog(relogged, relogLogId);
     // New uploads' writes go in the result, in request order (§4.8.3); the
     // runtime signs each into a `write_url`, so a retry gets the same URLs.
     const result: Record<string, unknown> = { message_id: messageId };
@@ -7792,9 +7838,13 @@ export class Store {
     const creating = method === "room_set" && input.params.room_id === undefined;
     const roomScan = (!creating ? 0 : input.params.private === true ? PRIVATE_ROOM_COUNT_READS : MAX_THREAD_LIMIT + MAX_CREATED_ROOMS + 2) +
       (method === "room_set" ? ROOM_FIELDS_TOTAL_READS : 0);
+    // A move or an editor's save also raises the retired markers of the
+    // users it logs again (noteRetiredRelog): its author, last editor and
+    // reactors, each a key lookup and a row of the list it reads them from.
+    const relogReads = mayMove ? 2 * (this.config.reactionUsersPerMessage + 2) + 4 : 0;
     const mutationCost = {
       ...this.config.mutationCost,
-      reads: Math.max(256, this.config.mutationCost.reads ?? 0) + roomScan,
+      reads: Math.max(256, this.config.mutationCost.reads ?? 0) + roomScan + relogReads,
       writes: Math.max(mayMove ? 256 : 96, this.config.mutationCost.writes ?? 0) + uploadWrites,
     };
     this.assertAccounting();
@@ -8197,15 +8247,43 @@ export class Store {
     }
   }
 
+  /**
+   * The commit time before which records have expired (section 9): those
+   * past the latest `retentionRecords` once `minRetentionMs` old, and any
+   * `retentionMs` old. Commit times are nondecreasing in log order, so the
+   * count ends at a time too, the commit time of the Nth newest record. A
+   * move's record is stored in both of its rooms and counts twice. 0 when
+   * nothing has expired. Reads up to `retentionRecords` index entries
+   * (retentionCountReads).
+   */
+  private retentionCutoff(effective: number): number {
+    const byAge = this.config.retentionMs > 0 ? effective - this.config.retentionMs : 0;
+    if (this.config.retentionRecords <= 0) return Math.max(0, byAge);
+    // The index alone finds the Nth newest record; one lookup reads its commit time.
+    const nth = this.rawRows<{ log_id: number }>(
+      "SELECT log_id FROM records INDEXED BY records_log_idx ORDER BY log_id DESC LIMIT 1 OFFSET ?", this.config.retentionRecords - 1,
+    );
+    const commit = nth.length ? this.rawRows<{ commit_ms: number }>(
+      "SELECT commit_ms FROM records INDEXED BY records_log_idx WHERE log_id = ? LIMIT 1", nth[0].log_id,
+    ) : [];
+    const byCount = commit.length ? Math.min(integerColumn(commit[0].commit_ms), effective - this.config.minRetentionMs) : 0;
+    return Math.max(0, byAge, byCount);
+  }
+
+  /** The reads retentionCutoff may take. */
+  private retentionCountReads(): number {
+    return this.config.retentionRecords > 0 ? this.config.retentionRecords + 4 : 0;
+  }
+
   runCleanup(now = this.clock.now()): StoreCleanupResult {
     this.ensureReady();
     // An alarm may have fired, and cleanup may establish an earlier continuation.
     this.scheduledAlarmAt = undefined;
     // A challenge deadline is not an hourly cleanup. Its cheap due check must
     // not consume the reservation for a complete deletion batch.
-    let gate: { maintenance: RawMaintenanceRow; state: RawLogState; effective: number };
+    let gate: { maintenance: RawMaintenanceRow; state: RawLogState; effective: number; cutoff?: number };
     try {
-      gate = this.reserved({ reads: 18, writes: 2 }, true, now, () => {
+      gate = this.reserved({ reads: 18 + this.retentionCountReads(), writes: 2 }, true, now, () => {
         const maintenance = this.maintenanceRow();
         const state = this.logState();
         const effective = this.effectiveNow(now);
@@ -8214,13 +8292,14 @@ export class Store {
         // cover). Continue it rather than letting the idle check end it.
         const jobInProgress = maintenance.cleanup_cursor !== null && maintenance.cleanup_cutoff_ms !== null;
         if (!jobInProgress && effective >= Math.max(maintenance.next_cleanup_ms, this.deferredCleanupUntil)) {
-          const cutoff = effective - this.config.retentionMs;
+          const cutoff = this.retentionCutoff(effective);
           // Idle hours must not burn a full deletion reservation.
           if (!this.cleanupHasWork(state.history_floor, cutoff, effective, this.limiterCutoff(effective))) {
             maintenance.next_cleanup_ms = effective + this.config.cleanupIntervalMs;
             this.rawExec("UPDATE maintenance SET next_cleanup_ms = ?, cleanup_cutoff_ms = NULL, cleanup_cursor = NULL WHERE id = 1", maintenance.next_cleanup_ms);
             this.cleanupDueCache = undefined;
           }
+          return { maintenance, state, effective, cutoff };
         }
         return { maintenance, state, effective };
       });
@@ -8249,9 +8328,10 @@ export class Store {
       }
       throw error;
     }
-    // A job's retention cutoff is fixed until all of its bounded batches finish.
+    // A job's retention cutoff is fixed until all of its bounded batches
+    // finish; a new job's is the one the due check just found.
     const cutoff = maintenance.cleanup_cursor !== null && maintenance.cleanup_cutoff_ms !== null
-      ? maintenance.cleanup_cutoff_ms : effective - this.config.retentionMs;
+      ? maintenance.cleanup_cutoff_ms : gate.cutoff ?? this.retentionCutoff(effective);
     const batch = Math.min(100, this.config.cleanupBatch);
     let floor = previousFloor;
     // Commit the server-wide coverage boundary/job before physical deletion.

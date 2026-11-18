@@ -1,7 +1,6 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
 import { MUTE_FOREVER, Store } from '../src/store';
-import { DEFAULT_LIMITS } from '../src/budget';
 
 const day = 86_400_000;
 
@@ -65,8 +64,8 @@ it('removes accounts idle past the cutoff, whatever their first day, with their 
 		const left = sql.exec<{ user_id: string }>('SELECT user_id FROM identities').toArray().map((row) => row.user_id);
 		expect(new Set(left)).toEqual(new Set(['seen', 'passkey', 'resumed', 'new', 'botter', 'bot_botter', 'moderator', 'uploader', 'online']));
 		expect(sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM user_status WHERE user_id = 'muted'").one().count).toBe(0);
-		// Retired for retiredUserIdMs, from now.
-		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'purged:idle'").one().value).toBe(String(now));
+		// Retired until history has expired past the log head.
+		expect(sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'purged:idle'").one().value).toBe(store.logBounds().latest_log_id);
 		expect(store.idlePruned(now)).toEqual({ today: 5, total: 5 });
 		// Once a UTC day.
 		user('later', { created: 90 * day, seen: 80 * day });
@@ -107,21 +106,38 @@ it('always keeps the keptActiveAccounts most recently active, however idle', asy
 	});
 });
 
-it('frees retired user ids after retiredUserIdMs, in two steps, a marker without its time starting now', async () => {
-	await withStore('retired-ids', { retiredUserIdMs: 7 * day }, (store, sql, clock) => {
-		const now = clock.now;
-		sql.exec("INSERT INTO _meta (key, value) VALUES ('purged:fresh', ?), ('purged:stale', ?), ('purged:legacy', '1'), ('renamed:kept', '1')", String(now - day), String(now - 8 * day));
+it('frees a retired user id once history has expired past its marker, in two steps, a marker without one starting at the log head', async () => {
+	await withStore('retired-ids', { retentionRecords: 0, retentionMs: 7 * day, cleanupIntervalMs: 3_600_000 }, (store, sql, clock) => {
+		const post = (text: string) => store.mutate({
+			userId: 'poster', ipKey: 'poster-ip', requestId: text, method: 'message', now: clock.now,
+			params: { room_id: 'general', body: { format: 'plain', text } }, identity: { user_id: 'poster', name: 'Poster' },
+		});
 		const markers = () => Object.fromEntries(sql.exec<{ key: string; value: string }>("SELECT key, value FROM _meta WHERE key LIKE 'purged:%' OR key LIKE 'renamed:%'").toArray().map((row) => [row.key, row.value]));
+		post('first');
+		const retiredAt = store.logBounds().latest_log_id;
+		sql.exec("INSERT INTO _meta (key, value) VALUES ('purged:fresh', ?), ('purged:stale', '1000'), ('purged:legacy', '1'), ('renamed:kept', '1')", retiredAt);
+		// History has not moved: nothing is due. The marker without a position
+		// starts at the log head.
+		expect(store.dueRetiredUserIds(clock.now)).toEqual([]);
+		expect(markers()['purged:legacy']).toBe(retiredAt);
+
+		// The first post expires: the floor passes the old marker, not the one retired at it.
+		clock.now += 8 * day;
+		post('second');
+		store.runCleanup(clock.now);
 		// The due ids, still retired until the caller has revoked their tokens and frees them.
-		expect(store.dueRetiredUserIds(now)).toEqual(['stale']);
+		expect(store.dueRetiredUserIds(clock.now)).toEqual(['stale']);
 		expect(store.userIdTaken('stale')).toBe(true);
-		expect(markers()).toEqual({ 'purged:fresh': String(now - day), 'purged:stale': String(now - 8 * day), 'purged:legacy': String(now), 'renamed:kept': '1' });
-		store.freeRetiredUserIds(['stale'], now);
+		expect(markers()).toEqual({ 'purged:fresh': retiredAt, 'purged:stale': '1000', 'purged:legacy': retiredAt, 'renamed:kept': '1' });
+		store.freeRetiredUserIds(['stale'], clock.now);
 		expect(store.userIdTaken('stale')).toBe(false);
-		const later = now + 7 * day + 1;
-		const due = store.dueRetiredUserIds(later);
+
+		// Once the whole log has expired, nothing names any of them.
+		clock.now += 8 * day;
+		store.runCleanup(clock.now);
+		const due = store.dueRetiredUserIds(clock.now);
 		expect(new Set(due)).toEqual(new Set(['fresh', 'legacy']));
-		store.freeRetiredUserIds(due, later);
+		store.freeRetiredUserIds(due, clock.now);
 		expect(markers()).toEqual({ 'renamed:kept': '1' });
 	});
 });
@@ -177,9 +193,10 @@ it('revokes every token of a retired id, and of its bot, before freeing it', asy
 	await runInDurableObject(env.DEMO.getByName('retired-tokens'), async (instance, state) => {
 		const runtime = instance as unknown as { pruneIdle(now: number): Promise<void>; store: Store; upkeepDay: string };
 		const now = Date.now();
-		// Retired longer ago than a retired id is held.
-		const retired = now - DEFAULT_LIMITS.retiredUserIdSeconds * 1_000 - day;
-		state.storage.sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('purged:gone', ?)", String(retired));
+		// Retired at a log position history has expired past, by more than the margin.
+		state.storage.sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('purged:gone', '1000')");
+		state.storage.sql.exec("UPDATE log_state SET history_floor = 3700000 WHERE id = 1");
+		(runtime.store as unknown as { logCache: unknown }).logCache = null;
 		await state.storage.put('invite:gone', { v: 1, tokenKey: 'invite-token:abc' });
 		await state.storage.put('invite-token:abc', { v: 1, userId: 'gone' });
 		await state.storage.put('bot:bot_gone', { v: 1, tokenKey: 'bot-token:def' });

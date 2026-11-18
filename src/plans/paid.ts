@@ -21,13 +21,15 @@
 //   $0.14, under the 12,900 daily share. User status spends
 //   it rather than requests: one timer keeps the object awake up to a minute
 //   after its last event while a status change waits to be announced.
-// - Storage: history is kept 30 days, matching uploaded images, and the
-//   database watermarks stop it at 768 MB (1 GB hard), a fifth of the 5
-//   GB-month included. A week of the demo's traffic in November 2026 was
-//   about 800 message records and a 1.5 MB database, so 30 days is a few MB;
-//   only a flood reaches the watermark, and then posting waits until enough
-//   of its records expire (up to 30 days) or an admin purges the flooder. Cleanup runs daily; it removes the same rows a day as hourly
-//   would, in batches that continue until it is caught up.
+// - Storage: history keeps the latest 10,000 records, and the database
+//   watermarks stop it at 768 MB (1 GB hard), a fifth of the 5 GB-month
+//   included. A week of the demo's traffic in November 2026 was about 800
+//   message records and a 1.5 MB database, so 10,000 records are a few MB;
+//   only a flood reaches the watermark, and then posting waits until its
+//   records are three days old and past the count (minRetentionSeconds) or
+//   an admin purges the flooder. Cleanup runs daily; it removes the same
+//   rows a day as hourly would, in batches that continue until it is caught
+//   up.
 //
 // That is about $11 a day in all, and the daily cap stops the server at $5
 // first; early in a month the inclusions cover it (50 million rows written).
@@ -46,12 +48,16 @@ export const PAID_PLAN: Plan = Object.freeze({
 	name: "Workers Paid",
 	limits: Object.freeze({
 		...FREE_PLAN.limits,
-		// A month of history (November 2026; a week before): storage is no
-		// constraint at the demo's traffic (above), and idleAccountSeconds (30
-		// days) bounds it, since retention may not outlast an account.
-		retentionSeconds: 30 * 24 * 60 * 60,
-		// A removed account's user_id may be taken again once its messages are gone.
-		retiredUserIdSeconds: 30 * 24 * 60 * 60,
+		// The latest 10,000 records, however old (November 2026; 30 days
+		// before): about 12 weeks at the demo's traffic (above), a few MB.
+		// Records younger than three days stay whatever the count, so a flood
+		// cannot push out the last few days before an admin purges it; the
+		// database watermarks still bound what the flood itself stores. No age
+		// limit: a removed account's user_id is retired until the log has
+		// moved past it, not for a time (Store.dueRetiredUserIds).
+		retentionRecords: 10_000,
+		minRetentionSeconds: 3 * 24 * 60 * 60,
+		retentionSeconds: 0,
 		// Room for a long writeup in one message (about 2,500 words) rather
 		// than Free's 4 KiB. A post is kept once, as its record (message_state
 		// points at it, and a request's dedup row keeps a digest and the small
@@ -265,7 +271,7 @@ export const PAID_PLAN: Plan = Object.freeze({
 	// at half the free 10 GB-month whatever the mix of types and sizes: 500
 	// full-size files a day for a month would be 75 GB. Uploads at that rate
 	// fill the cap in two days, and new uploads are then refused until enough
-	// expire, up to 31 days now rather than 8: /purge of the uploader frees
+	// expire, up to 91 days now rather than 31: /purge of the uploader frees
 	// theirs at once. In November 2026 the
 	// bucket held 68 objects, 8 MB.
 	uploads: Object.freeze({
@@ -279,15 +285,17 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// still bound the server's writes and storage.
 		uploadsPerUserDay: 30,
 		writeWindowSeconds: 10 * 60,
-		// As long as the messages they are attached to (retentionSeconds). The
-		// bucket's lifecycle rule for f/ must match: 30 days.
-		fileRetentionSeconds: 30 * 24 * 60 * 60,
+		// About as long as history keeps its messages: 10,000 records
+		// (retentionRecords) were about 12 weeks of the demo's traffic in
+		// November 2026. A busier stretch expires messages sooner, and a
+		// quieter one leaves an older message without its image. The
+		// bucket's lifecycle rule for f/ must match: 90 days.
+		fileRetentionSeconds: 90 * 24 * 60 * 60,
 		// An avatar is kept while its owner signs in: any sign-in within
 		// avatarRefreshSeconds of its expiry writes it again (refreshAvatar).
-		// The refresh window covers retentionSeconds, the day cleanup may lag
-		// behind it, and a few days of one connection staying open (refresh
-		// runs at sign-in), so an avatar outlasts what its owner posted; one
-		// nobody signs in to for 60 days goes. An idle account is not pruned
+		// The refresh window covers a few days of one connection staying open
+		// (refresh runs at sign-in); one nobody signs in to for 60 days goes,
+		// though history may keep what its owner posted for longer. An idle account is not pruned
 		// while its avatar lives, so one with an avatar goes after up to 61
 		// days (with the lifecycle lag) rather than idleAccountSeconds' 30. The bucket's
 		// lifecycle rule for a/ must be at least this: 61 days or more leaves

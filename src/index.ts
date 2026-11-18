@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
-import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
+import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits } from "./budget";
 import { LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, showsMorePresent, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor, snapshotBill, snapshotReasons } from "./account-usage";
@@ -1015,6 +1015,15 @@ function basicClientId(header: string | null): string | null | undefined {
 	}
 }
 
+/** How long history keeps messages, for the welcome: by count, by age, or both (the sooner). */
+export function historyPolicy(limits: Pick<Limits, "retentionRecords" | "retentionSeconds">): string {
+	const days = Math.max(1, Math.round(limits.retentionSeconds / 86_400));
+	const age = days === 1 ? "a day" : `${days} days`;
+	if (limits.retentionRecords <= 0) return `Messages are kept for ${age}.`;
+	const count = `the latest ${limits.retentionRecords.toLocaleString("en-US")} messages`;
+	return limits.retentionSeconds > 0 ? `History keeps ${count}, for up to ${age}.` : `History keeps ${count}.`;
+}
+
 function nowMs(): number {
 	return Date.now();
 }
@@ -1023,9 +1032,10 @@ export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 	const limits = config.limits;
 	return {
 		retentionMs: limits.retentionSeconds * 1_000,
+		retentionRecords: limits.retentionRecords,
+		minRetentionMs: limits.minRetentionSeconds * 1_000,
 		idleAccountMs: limits.idleAccountSeconds * 1_000,
 		keptActiveAccounts: limits.keptActiveAccounts,
-		retiredUserIdMs: limits.retiredUserIdSeconds * 1_000,
 		dedupTtlMs: limits.dedupTtlSeconds * 1_000,
 		cleanupIntervalMs: limits.cleanupSeconds * 1_000,
 		cleanupBatch: limits.cleanupBatch,
@@ -3377,8 +3387,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * what this origin can sign in with.
 	 */
 	private signInWelcome(origin: string | null, endpoint: string | undefined): string {
-		const days = Math.max(1, Math.round(this.config.limits.retentionSeconds / 86_400));
-		const history = `Messages are kept for ${days === 1 ? "a day" : `${days} days`}.`;
+		const history = historyPolicy(this.config.limits);
 		const guests = this.config.guestPosting ? "Guests can post under a new name each visit." : "Guests can read along.";
 		const signIn = this.passkeysOfferedTo(origin, endpoint)
 			? "**Create a passkey** to post, react, and start threads; it signs you in on your next visit too."

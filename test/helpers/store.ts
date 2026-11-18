@@ -20,6 +20,11 @@ export function makeClock(): TestClock {
 	return testClock;
 }
 
+/** How long history keeps records in tests of expiry by age. */
+export const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+/** History by age alone (no count), as the tests of expiry by age run it. */
+export const BY_AGE: Partial<StoreConfig> = { retentionRecords: 0, retentionMs: RETENTION_MS };
+
 /** Runs `fn` against a fresh, initialized Store in its own Durable Object. */
 export async function withStore<T>(
 	name: string,

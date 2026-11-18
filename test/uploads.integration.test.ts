@@ -243,9 +243,10 @@ describe('store uploads', () => {
 		});
 	});
 
-	it('keeps an avatar past its owner\'s last sign-in for as long as anything they posted is kept', async () => {
-		// The plan's invariant: a sign-in anywhere in the message retention window, and the day cleanup may lag, refreshes.
-		const kept = DEFAULT_LIMITS.retentionSeconds + DEFAULT_LIMITS.cleanupSeconds;
+	it('keeps an avatar past its owner\'s last sign-in for at least as long as history surely keeps what they posted', async () => {
+		// History is kept by count, so this bounds only its minimum: a sign-in
+		// anywhere in it, and the day cleanup may lag, refreshes the avatar.
+		const kept = Math.max(DEFAULT_LIMITS.retentionSeconds, DEFAULT_LIMITS.minRetentionSeconds) + DEFAULT_LIMITS.cleanupSeconds;
 		expect(UPLOADS.avatarRefreshSeconds).toBeGreaterThanOrEqual(kept);
 		expect(UPLOADS.avatarRetentionSeconds).toBeGreaterThan(UPLOADS.avatarRefreshSeconds);
 		await withStore('uploads-avatar-active', { uploads: UPLOADS }, (store, clock) => {

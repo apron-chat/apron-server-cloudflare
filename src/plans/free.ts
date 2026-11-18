@@ -7,14 +7,15 @@ import type { Plan } from "../budget.ts";
 export const FREE_PLAN: Plan = Object.freeze({
 	name: "Workers Free",
 	limits: Object.freeze({
+		// A day of history, by age alone (no count).
+		retentionRecords: 0,
+		minRetentionSeconds: 86_400,
 		retentionSeconds: 86_400,
 		cleanupSeconds: 3_600,
 		challengeTtlSeconds: 120,
 		sessionTtlSeconds: 30 * 24 * 60 * 60,
 		idleAccountSeconds: 30 * 24 * 60 * 60,
 		keptActiveAccounts: 100,
-		// As long as messages are kept (retentionSeconds).
-		retiredUserIdSeconds: 86_400,
 		maxFrameBytes: 16_384,
 		maxTextBytes: 4_096,
 		maxSnapshotBytes: 8_192,

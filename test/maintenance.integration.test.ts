@@ -1,11 +1,11 @@
 import { expect, it } from "vitest";
-import { RETENTION_MS, Store, type StoreConfig, type StoreMutationInput } from "../src/store";
-import { expectRetryAfter, messagesOf, withStore as withNamedStore, type TestClock } from "./helpers/store";
+import { Store, type StoreConfig, type StoreMutationInput } from "../src/store";
+import { BY_AGE, expectRetryAfter, messagesOf, RETENTION_MS, withStore as withNamedStore, type TestClock } from "./helpers/store";
 
 const DAY_MS = 86_400_000;
 
 const withStore = <T>(name: string, config: Partial<StoreConfig>, fn: Parameters<typeof withNamedStore<T>>[2]) =>
-	withNamedStore(`maintenance-${name}`, config, fn);
+	withNamedStore(`maintenance-${name}`, { ...BY_AGE, ...config }, fn);
 
 function messageInput(clock: TestClock, requestId: string, text: string): StoreMutationInput {
 	return {
@@ -226,5 +226,48 @@ it("publishes a floor before a failed physical delete and resumes after restart"
 		expect(Number(rowValue<{ count: number }>(state, "SELECT COUNT(*) AS count FROM records").count)).toBe(0);
 		expect(Number(rowValue<{ count: number }>(state, "SELECT COUNT(*) AS count FROM message_state").count)).toBe(0);
 		expect(messagesOf(restarted.history({ roomId: "general", after: 0n, limit: 50, now: clock.value }))).toEqual([]);
+	});
+});
+
+it("keeps the latest retentionRecords records however old, expiring older ones only once minRetentionMs old", async () => {
+	const byCount: Partial<StoreConfig> = { retentionRecords: 3, minRetentionMs: DAY_MS, retentionMs: 0 };
+	await withStore("retention-count", byCount, (store, clock, state) => {
+		// The seeded general room record and five messages: six records, a
+		// second apart (the count ends at a commit time, and keeps any record
+		// committed in the same millisecond as the last one counted).
+		const logs = ["one", "two", "three", "four", "five"].map((text) => {
+			clock.value += 1_000;
+			return oneLog(store.mutate(messageInput(clock, `count-${text}`, text)));
+		});
+		const visible = () => messagesOf(store.historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value })).map((entry) => BigInt(entry.log_id));
+
+		// Past the count, but younger than minRetentionMs: nothing expires.
+		clock.value += 60 * 60 * 1000;
+		state.storage.sql.exec("UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1", clock.value);
+		expect(store.runCleanup(clock.value).deleted_records).toBe(0);
+		expect(visible()).toEqual(logs);
+
+		// A day on, all but the latest three go: the general room record and two messages.
+		clock.value += 2 * DAY_MS;
+		const expired = store.runCleanup(clock.value);
+		expect(expired.history_floor).toBe(String(logs[1] + 1n));
+		expect(expired.deleted_records).toBe(3);
+		expect(Number(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM records").one().count)).toBe(3);
+		expect(visible()).toEqual(logs.slice(2));
+
+		// However old, the latest three stay.
+		clock.value += 365 * DAY_MS;
+		expect(store.runCleanup(clock.value).deleted_records).toBe(0);
+		expect(visible()).toEqual(logs.slice(2));
+	});
+});
+
+it("expires records past retentionSeconds whatever the count", async () => {
+	await withStore("retention-ceiling", { retentionRecords: 100, minRetentionMs: DAY_MS, retentionMs: 7 * DAY_MS }, (store, clock) => {
+		const last = ["old", "older"].map((text) => oneLog(store.mutate(messageInput(clock, `ceiling-${text}`, text)))).at(-1)!;
+		clock.value += 8 * DAY_MS;
+		const expired = store.runCleanup(clock.value);
+		expect(expired.history_floor).toBe(String(last + 1n));
+		expect(messagesOf(store.historyPage({ roomId: "general", after: "0", limit: 50, now: clock.value }))).toEqual([]);
 	});
 });

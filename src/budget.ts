@@ -4,6 +4,19 @@
 import { PAID_PLAN } from "./plans/paid.ts";
 
 export interface Limits {
+	/**
+	 * Message history (the server-wide log) keeps at least the latest this
+	 * many records: messages, edits, reactions and room changes alike. Older
+	 * records expire once they are `minRetentionSeconds` old. 0 keeps no
+	 * count, leaving `retentionSeconds` alone to expire records.
+	 */
+	retentionRecords: number;
+	/** Records younger than this never expire by count (`retentionRecords`): a flood cannot push out the last few days. */
+	minRetentionSeconds: number;
+	/**
+	 * A record older than this expires whatever the count. 0 sets no age
+	 * limit; at least one of it and `retentionRecords` is set.
+	 */
 	retentionSeconds: number;
 	cleanupSeconds: number;
 	challengeTtlSeconds: number;
@@ -18,13 +31,6 @@ export interface Limits {
 	idleAccountSeconds: number;
 	/** The most recently active accounts the idle prune always keeps, however idle. */
 	keptActiveAccounts: number;
-	/**
-	 * How long a removed account's `user_id` stays retired, never reissued:
-	 * at least `retentionSeconds`, so nothing logged still names it when it
-	 * may be taken again. Sessions carry the user handle they were issued
-	 * under, so a new account under the id never resumes an old one's.
-	 */
-	retiredUserIdSeconds: number;
 	maxFrameBytes: number;
 	maxTextBytes: number;
 	maxSnapshotBytes: number;
@@ -569,6 +575,10 @@ export const MAX_GLOBAL_POSTS_PER_MINUTE = DEFAULT_LIMITS.globalPostsPerMinute;
 export const MAX_GLOBAL_POSTS_PER_DAY = DEFAULT_LIMITS.globalPostsPerDay;
 export const MAX_REGISTRATIONS_PER_DAY = DEFAULT_LIMITS.registrationsPerDay;
 export const MAX_CLEANUP_BATCH = 100;
+// Each cleanup run reads this many index entries to find where the count
+// ends; past it, history would also outgrow the log scans /rename and /purge
+// budget for (store.ts, RETAINED_SCAN_CAP).
+export const MAX_RETENTION_RECORDS = 50_000;
 export const MAX_THREAD_LIMIT = 100;
 // A room's client fields must fit one frame (validateLimits). What rooms hold
 // past roomMetadataMinLimit is bounded together by at most one history

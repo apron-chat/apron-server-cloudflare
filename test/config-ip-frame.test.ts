@@ -125,6 +125,17 @@ describe('configuration policy boundaries', () => {
 		expect(config({ SIGNAL_UNKNOWN_PASSKEYS: 'true' }).signalUnknownPasskeys).toBe(true);
 	});
 
+	it('keeps history by count, by age or both, but not by neither, and only the retention bounds take 0', () => {
+		expect(config().limits).toMatchObject({ retentionRecords: 10_000, minRetentionSeconds: 3 * 86_400, retentionSeconds: 0 });
+		expect(config({ LIMIT_RETENTION_RECORDS: '0', LIMIT_RETENTION_SECONDS: '604800' }).limits).toMatchObject({ retentionRecords: 0, retentionSeconds: 604_800 });
+		expect(() => config({ LIMIT_RETENTION_RECORDS: '0' })).toThrow('retentionRecords or retentionSeconds must be set');
+		expect(() => config({ LIMIT_RETENTION_RECORDS: '50001' })).toThrow(ConfigError);
+		// An age limit under the minimum age contradicts it.
+		expect(() => config({ LIMIT_RETENTION_SECONDS: '86400' })).toThrow(ConfigError);
+		expect(() => config({ LIMIT_MIN_RETENTION_SECONDS: '0' })).toThrow('minRetentionSeconds must be a positive safe integer');
+		expect(() => config({ LIMIT_RETENTION_SECONDS: '-1' })).toThrow('retentionSeconds must be a non-negative safe integer');
+	});
+
 	it('accepts the documented aliases in prefixed precedence order', () => {
 		const loaded = config({
 			LIMIT_HISTORY_MAX_LIMIT: '49',

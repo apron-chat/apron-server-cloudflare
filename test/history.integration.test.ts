@@ -1,9 +1,9 @@
 import { expect, it, vi } from "vitest";
-import { RETENTION_MS, Store, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
-import { errorCode, messagesOf, withStore as withNamedStore, type TestClock } from "./helpers/store";
+import { Store, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
+import { BY_AGE, errorCode, messagesOf, RETENTION_MS, withStore as withNamedStore, type TestClock } from "./helpers/store";
 
 const withStore = <T>(name: string, config: Partial<StoreConfig>, fn: Parameters<typeof withNamedStore<T>>[2]) =>
-	withNamedStore(`history-${name}`, config, fn);
+	withNamedStore(`history-${name}`, { ...BY_AGE, ...config }, fn);
 
 function op(
 	clock: TestClock,

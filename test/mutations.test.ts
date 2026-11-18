@@ -1,7 +1,7 @@
 import { expect, it } from "vitest";
-import { ADMIN_USER_ID, MAX_CREATED_ROOMS, MOVE_REACTION_SETS_PER_POST, RETENTION_MS, Store, StoreError, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
+import { ADMIN_USER_ID, MAX_CREATED_ROOMS, MOVE_REACTION_SETS_PER_POST, Store, StoreError, type StoreConfig, type StoreMutationInput, type StoreMutationResult } from "../src/store";
 import { DEFAULT_LIMITS, UPLOAD_POLICY } from "../src/budget";
-import { errorCode, expectRetryAfter, messagesOf, withStore as withNamedStore, type TestClock } from "./helpers/store";
+import { BY_AGE, errorCode, expectRetryAfter, messagesOf, RETENTION_MS, withStore as withNamedStore, type TestClock } from "./helpers/store";
 
 // Semantics tests use roomy posting windows; quota tests below use tiny ones.
 const ROOMY: Partial<StoreConfig> = {
@@ -14,7 +14,7 @@ const ROOMY: Partial<StoreConfig> = {
 };
 
 const withStore = <T>(name: string, fn: Parameters<typeof withNamedStore<T>>[2], config: Partial<StoreConfig> = ROOMY) =>
-	withNamedStore(`mutation-${name}`, config, fn);
+	withNamedStore(`mutation-${name}`, { ...BY_AGE, ...config }, fn);
 
 function op(clock: TestClock, userId: string, requestId: string, method: string, params: Record<string, unknown>): StoreMutationInput {
 	return {
@@ -793,6 +793,23 @@ it("lets an admin or a mod move someone else's message into a thread and back, b
 		// A role taken away takes the permission with it.
 		store.setRole({ userId: "mia", role: "mod", on: false, now: clock.value });
 		expect(errorCode(() => store.mutate(op(clock, "mia", "mia-after", "message", resubmit(back.message, threadId))))).toBe("denied");
+	});
+});
+
+it("keeps the ids of removed users a move logs again retired until the move expires", async () => {
+	await withStore("relog-retired", (store, clock, state) => {
+		store.createInvitedIdentity({ userId: "mia", name: "mia", now: clock.value, ipKey: "ip-test" });
+		store.setRole({ userId: "mia", role: "mod", on: true, now: clock.value });
+		const original = post(store, clock, "alice", "original", { body: { text: "misplaced" } });
+		store.mutate(op(clock, "bob", "react", "reactions", { message_id: original.result.message_id, emojis: ["👍"] }));
+		const threadId = thread(store, clock, "thread");
+		// As if alice and bob had since been removed, and carol too, long ago.
+		state.storage.sql.exec("INSERT INTO _meta (key, value) VALUES ('purged:alice', '1000'), ('purged:bob', '1000'), ('purged:carol', '1000')");
+		const moved = store.mutate(op(clock, "mia", "move", "message", { message_id: original.result.message_id, room_id: threadId, body: original.message!.body }));
+		const reactionsLog = String(moved.broadcasts[1].params.log_id);
+		const marker = (userId: string) => state.storage.sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = ?", `purged:${userId}`).one().value;
+		// The author and the reactor are named again by the move's records; carol is not.
+		expect([marker("alice"), marker("bob"), marker("carol")]).toEqual([reactionsLog, reactionsLog, "1000"]);
 	});
 });
 

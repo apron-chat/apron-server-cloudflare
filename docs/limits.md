@@ -161,8 +161,9 @@ mutation with the **same** `id`.
 | Daily history limit reached / …for this network / …for the server | 3,000 a day per account; 30,000 per address; 400,000 on the server | `ext.limits` `read`. |
 | Room listing limited | 6 `room_list` a minute per account | The first `filter: "joined"` listing after each sign-in is free. Keep the list current from `room_update` rather than polling. |
 
-A history page holds at most 50 records (20 by default) and 256 KiB. Records
-are kept for 30 days.
+A history page holds at most 50 records (20 by default) and 256 KiB. History
+keeps the latest 10,000 records (messages, edits, reactions and room changes),
+however old; none younger than three days expires.
 
 ### Server-wide spikes
 
