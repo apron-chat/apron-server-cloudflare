@@ -214,6 +214,19 @@ export function parsePasskeyPageRequest(query: URLSearchParams, origin: string):
 	return { ok: true, value: { ...parsed.value, action, ...(name !== undefined ? { name: name.trim() } : {}), ...(request !== undefined ? { request } : {}) } };
 }
 
+/**
+ * A sign-in page's URL, for `external.url`, with `params` as its query.
+ * Spaces are `%20`, not `+`: clients add their parameters to this query
+ * (protocol §4.12.1), and some decode it and encode it again, which keeps a
+ * `+` as a plus. URLSearchParams writes a `+` itself as `%2B`, so every `+`
+ * it writes is a space.
+ */
+export function pageUrl(origin: string, path: string, params: Record<string, string> = {}): string {
+	const url = new URL(path, origin);
+	url.search = new URLSearchParams(params).toString().replaceAll("+", "%20");
+	return url.href;
+}
+
 /** `uri` with `params` added to its query, as a code or an error goes back (RFC 6749 §4.1.2). */
 export function redirectWith(uri: string, params: Record<string, string>): string {
 	const url = new URL(uri);

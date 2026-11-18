@@ -109,6 +109,7 @@ import {
 	PAGE_BEGIN_PATH,
 	PAGE_FINISH_PATH,
 	pageOriginServes,
+	pageUrl,
 	parseAuthorizationRequest,
 	parsePasskeyPageRequest,
 	PASSKEY_PAGE_PATH,
@@ -3792,12 +3793,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// carries the action, a new account's name, or an addition's handle,
 			// which the client keeps (protocol §4.10.1, §4.12.1).
 			if (pageOrigin) {
-				const url = new URL(PASSKEY_PAGE_PATH, pageOrigin);
-				url.searchParams.set("action", action);
-				if (name !== undefined) url.searchParams.set("name", name);
-				if (adding) url.searchParams.set("request", await this.createRequestHandle(attachment.userId!, handle, nowMs()));
+				const query: Record<string, string> = { action };
+				if (name !== undefined) query.name = name;
+				if (adding) query.request = await this.createRequestHandle(attachment.userId!, handle, nowMs());
 				if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
-				result.external = { url: url.href };
+				result.external = { url: pageUrl(pageOrigin, PASSKEY_PAGE_PATH, query) };
 			}
 			this.reply(socket, request, result);
 			await this.rescheduleAlarm();
@@ -4091,7 +4091,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// This server's own access tokens are Apron tokens, for `token` (ext:oauth).
 		if (params.token !== undefined) throw { name: "denied", message: "Sign in with this server's tokens through the token scheme" } satisfies ProtocolError;
 		if (params.code === undefined) {
-			this.reply(socket, request, { external: { url: `${origin}${AUTHORIZE_PATH}` } });
+			this.reply(socket, request, { external: { url: pageUrl(origin, AUTHORIZE_PATH) } });
 			return;
 		}
 		const code = await this.takeSignInCode(params, "authorize", origin);

@@ -162,7 +162,7 @@ it('offers the passkey page in webauthn begin results, to every client on a host
 		expect(local.result).toMatchObject({ challenge_id: expect.any(String), public_key: { rpId: 'localhost', userVerification: 'required' } });
 		expect(local.result.external).toEqual({ url: `${ORIGIN}/passkey?action=login` });
 		const named = await begin(web, 'register', { name: 'Ada Lovelace' });
-		expect(named.result.external.url).toBe(`${ORIGIN}/passkey?action=register&name=Ada+Lovelace`);
+		expect(named.result.external.url).toBe(`${ORIGIN}/passkey?action=register&name=Ada%20Lovelace`);
 
 		const { server, welcome } = await greeting(app);
 		expect(server.params.auth).toEqual(['webauthn', 'token', 'guest']);
@@ -178,6 +178,28 @@ it('offers the passkey page in webauthn begin results, to every client on a host
 		expect((await greeting(elsewhere)).server.params.auth).toEqual(['token', 'guest']);
 		expect((await begin(elsewhere, 'login')).error.code).toBe(-32601);
 	} finally { web.close(); app.close(); elsewhere.close(); }
+});
+
+it('writes spaces in the passkey page\'s query as %20, so a client that encodes it again keeps the name', async () => {
+	const peer = await connect();
+	try {
+		await greeting(peer);
+		const begun = await begin(peer, 'register', { name: 'Sim Passkey+1' });
+		expect(begun.result.external.url).toBe(`${ORIGIN}/passkey?action=register&name=Sim%20Passkey%2B1`);
+		// A client that decodes each query item, with `+` as a plus, encodes
+		// it again, and adds its own (protocol §4.12.1), as Foundation's
+		// URLComponents does.
+		const app = await client();
+		const [base, query] = begun.result.external.url.split('?');
+		const items = [...query.split('&').map((item: string) => item.split('=').map(decodeURIComponent)), ...Object.entries(app.params)];
+		const url = new URL(`${base}?${items.map((item) => item.map(encodeURIComponent).join('=')).join('&')}`);
+		expect(url.searchParams.get('name')).toBe('Sim Passkey+1');
+		expect((await page(url)).status).toBe(200);
+		const done = await ceremony(url, await softPasskey(ORIGIN));
+		expect(done.status).toBe(200);
+		const finished = await request(peer, 'finish', 'auth', { scheme: 'webauthn', action: 'register', step: 'finish', ...app.redeem(returned(done.body.redirect!, app)) });
+		expect(finished.result.you.name).toBe('Sim Passkey+1');
+	} finally { peer.close(); }
 });
 
 it('creates an account and signs in through the passkey page, with a bearer token that resumes from any client', async () => {
