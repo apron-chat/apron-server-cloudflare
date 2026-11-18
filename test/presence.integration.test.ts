@@ -210,7 +210,7 @@ async function forgetAnnouncements(): Promise<void> {
 describe('the status a user chooses (§4.5)', () => {
 	beforeEach(forgetAnnouncements);
 
-	it('shows each status as others see it: chosen ones at once, derived changes coalesced to one a minute', async () => {
+	it('shows each status as others see it: chosen ones and coming back at once, derived changes away coalesced to one a minute', async () => {
 		const aliceId = unique('alice');
 		const bobId = unique('bob');
 		const alice = await signedIn(aliceId);
@@ -257,11 +257,10 @@ describe('the status a user chooses (§4.5)', () => {
 			const invalid = await choose(bob, 42);
 			expect(invalid.error.code).toBe(-32602);
 			expect((await request(bob, 'still', 'me', {})).result.you.status).toBe('');
-			// Attended again with online chosen: online, after the minute.
+			// Attended again with online chosen: online at once, coming back from idle.
 			await forgetAnnouncements();
 			await choose(bob, 'online');
 			await status(bob, { idle: false });
-			await advance(COALESCE);
 			expect(told(await drain(alice), bobId).slice(-1)).toEqual(['online']);
 			expect(await listed(alice, bobId)).toMatchObject({ status: 'online' });
 			// The choice outlasts the connections: a new one's `you` carries it.

@@ -707,7 +707,7 @@ a minute behind:
   is announced at most once in this long after their last announcement;
   changes in between wait, and only the latest goes out. Coming back (from
   `offline`, or `idle` to `online`) is announced at once, so a user's
-  connections cause at most two announcements in this long. Member
+  connections cause at most three announcements in this long. Member
   listings are also reused for up to this long, until something they read
   is written.
 - `offlineGraceSeconds` (60): a change caused by a closed connection waits

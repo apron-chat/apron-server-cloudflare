@@ -64,8 +64,9 @@ const PRESENCE_RANK: Readonly<Record<Exclude<Status, "">, number>> = { offline: 
  * `dnd`, or `idle` to `online` (or `dnd`, which only `me` makes, at once
  * anyway). Such a change is announced at once rather than coalesced
  * (§4.5.2 lets a server delay some changes and not others): coming back is
- * what others want to see, and each follows a change the other way, which
- * is coalesced, so a user's connections cause at most two a minute.
+ * what others want to see. At most two come in a row (`offline`, `idle`,
+ * `online`) between changes the other way, which are coalesced, so a
+ * user's connections cause at most three announcements a minute.
  */
 export function showsMorePresent(from: Status, to: Status): boolean {
 	if (from === "" || to === "") return false;
