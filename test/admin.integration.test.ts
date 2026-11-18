@@ -1508,3 +1508,24 @@ it('lets no creator of a top-level room remove its members, a mod or a former on
 		expect((await remove('thread', threadId, carolId)).result).toEqual({});
 	} finally { admin.close(); bob.close(); }
 });
+
+it('lets an admin or mod delete anyone\'s message they can see, but not change it', async () => {
+	const admin = await signedInAdmin();
+	const authorId = unique('author');
+	const author = await signedIn(authorId);
+	try {
+		const posted = await request(author, 'post', 'message', { room_id: 'general', body: { text: 'remove me' } });
+		const messageId = posted.result.message_id as string;
+		const save = await request(admin, unique('save'), 'message', { message_id: messageId, room_id: 'general', body: { text: 'changed' } });
+		expect(save.error.code).toBe(-32001);
+		const deleted = await exchange(admin, unique('delete'), 'message', { message_id: messageId, room_id: 'general', deleted: true });
+		expect(deleted.frame.result).toEqual({ message_id: messageId });
+		const tombstone = deleted.skipped.find((frame) => frame.method === 'message' && frame.params.message_id === messageId)!.params;
+		expect(tombstone).toMatchObject({ deleted: true, from: { user_id: authorId } });
+		// Others may not.
+		const other = await signedIn(unique('other'));
+		const second = await request(author, 'post2', 'message', { room_id: 'general', body: { text: 'keep me' } });
+		expect((await request(other, 'try', 'message', { message_id: second.result.message_id, room_id: 'general', deleted: true })).error.code).toBe(-32001);
+		other.close();
+	} finally { admin.close(); author.close(); }
+});

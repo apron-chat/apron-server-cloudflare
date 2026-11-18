@@ -1200,6 +1200,8 @@ export const BOT_MODERATOR_ROLES: readonly string[] = ["threader"];
  * in any case. An owner's bot's default, "Bot of <owner>", already does.
  */
 export const BOT_NAME_PATTERN = /bot/i;
+/** The roles whose holders may delete anyone's message they can see (Store.commitMessage): registered admins and mods. */
+const DELETE_ANY_ROLES: readonly string[] = ["admin", "mod"];
 /** Why a bot's `me` with another name is `denied`. */
 export const BOT_NAME_RULE = "A bot's name must contain \"bot\"";
 /**
@@ -5882,8 +5884,11 @@ export class Store {
       // Live text is still writing into body.text (§4.8.5).
       if (hasAppend(previous!)) throw new StoreError("denied", "The message's text is still being written");
     }
+    // An admin or mod may delete any message they can see, in its own room: a tombstone, as its sender's delete is.
+    const moderatorDelete = current !== null && current.author_id !== input.userId && !editor && params.deleted === true &&
+      current.room_id === roomId && this.holdsRole(input.userId, DELETE_ANY_ROLES);
     // Someone else's message may otherwise only be moved, and only by a moderator (MODERATOR_ROLES, BOT_MODERATOR_ROLES).
-    const moving = current !== null && current.author_id !== input.userId && !editor;
+    const moving = current !== null && current.author_id !== input.userId && !editor && !moderatorDelete;
     if (moving && (current.room_id === roomId || !this.isModerator(input.userId))) throw new StoreError("denied", "Only the original author may edit this message");
     // Posting needs no join, except in a private room, which only its members see. A mirror's copy goes where its room is.
     if (!(input.copy ? this.roomRow(roomId) : this.visibleRoomRow(roomId, input.userId))) throw new StoreError("invalid_params", "unknown room");
