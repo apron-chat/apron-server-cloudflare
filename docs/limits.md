@@ -84,7 +84,7 @@ still holds a slot until it goes stale; see
 | ---: | --- | --- | --- |
 | 1001 | Connection idle; reconnect to recover | No ping or frame for 150 seconds after the connection had pinged, or for 15 minutes if it never pinged | Reconnect. If you see it while the tab is live, your ping is not being sent. |
 | 1003 | Binary application frames are not supported | A binary frame | Send text frames only. |
-| 1008 | Authentication timed out | No successful `auth` within 30 seconds of connecting | Authenticate right after the `server` frame. |
+| 1008 | Authentication timed out | No successful `auth` within 30 seconds of connecting | Authenticate right after the `server` frame. A sign-in on the passkey page or an `external` sign-in page can outlast it: finish that sign-in on a new connection, since its code does not need the connection that began it. |
 | 1008 | Frame rate limit reached | More than 120 frames in a minute on this connection (the exact ping bytes do not count) | Batch or throttle. Typing and read cursors count as frames. |
 | 1008 | Too many pending frames | More than 8 frames (or 64 KiB, two of the largest) sent and not yet processed | Wait for responses; do not pipeline bursts. |
 | 1008 | Repeated policy violations | Three malformed or oversized requests within 60 seconds | Fix the request; do not retry it unchanged. |
