@@ -28,7 +28,8 @@ import { keepAppend, keepLast, liveTextString, type LiveKind } from "./live-text
 import type { AccountUsageSnapshot } from "./account-usage";
 import type { ChatRecord, HistoryOp, HistoryQuery, QueuedOp } from "./history/records";
 import type { TierState } from "./history/tier";
-import { type ArchivedRoom, type ArchivedUser, parseLogId, type ReplayedMembership, replayRecords, restorableUserId } from "@apron/archive";
+import { type ArchivedRoom, type ArchivedUser, parseLogId, type ReplayedMembership, replayRecords, roomClientFields, type ValidRecord, validateRecord, withClientUsers } from "@apron/archive";
+import { ADMIN_USER_ID, restorableUserId } from "./user-ids";
 import { SEGMENT_QUERY_ROWS, SqlSegmentIndex, type SqlPort } from "./history/blob/segments";
 import {
   BudgetLedger,
@@ -75,11 +76,8 @@ const ROOM_TITLE = "General";
 export const SCHEMA_VERSION = 11;
 /** The oldest schema upgraded in place rather than reset; each one from it up to SCHEMA_VERSION is. */
 export const UPGRADABLE_SCHEMA_VERSION = 7;
-/**
- * The registered user `APRON_ADMIN_TOKEN` signs in as, always an admin. It
- * never holds a passkey, so deleting the token turns it off completely.
- */
-export const ADMIN_USER_ID = "admin";
+/** The registered user `APRON_ADMIN_TOKEN` signs in as (src/user-ids.ts). */
+export { ADMIN_USER_ID };
 /** Passkeys one registered identity may hold (§4.10: a registration while signed in adds one). */
 export const MAX_PASSKEYS_PER_USER = 8;
 /** Rooms a new identity has joined: the permanent top-level room (§3.4). */
@@ -1954,15 +1952,6 @@ function recordedUser(userId: string, name: string | null | undefined): Identity
   return { user_id: userId, ...(name ? { name } : {}) };
 }
 
-/** The client fields (`title`, `description`, `ext`) of a room record or listing, as a room row keeps them. */
-function restoredRoomFields(value: Record<string, unknown>): Record<string, unknown> {
-  return {
-    ...(typeof value.title === "string" ? { title: value.title } : {}),
-    ...(typeof value.description === "string" && value.description.trim() !== "" ? { description: value.description } : {}),
-    ...(isPlainObject(value.ext) && Object.keys(value.ext).length ? { ext: clone(value.ext) } : {}),
-  };
-}
-
 /** An imported user's avatar: a plain `https:` URL without credentials, of bounded length, or undefined. */
 function restoredAvatar(value: unknown): string | undefined {
   if (typeof value !== "string" || !value || utf8Bytes(value) > MAX_RESTORED_AVATAR_BYTES) return undefined;
@@ -1975,39 +1964,14 @@ function restoredAvatar(value: unknown): string | undefined {
 }
 
 
-/** One record restoreRoom takes, checked, with its parsed wire value. */
-interface RestoredRecord extends ChatRecord {
-  kind: RecordKind;
-  value: Record<string, unknown>;
-}
+/** One record restoreRoom takes, checked (@apron/archive validateRecord), with its parsed wire value. */
+type RestoredRecord = ValidRecord;
 
-/** Whether `value` is a recorded user (`from`, a member's `user`): an object with a string `user_id`. */
-function isRecordedUser(value: unknown): value is Identity {
-  return isPlainObject(value) && typeof value.user_id === "string" && value.user_id.length > 0;
-}
-
-/**
- * An archived record of `roomId`, checked as restoreRoom stores it: a safe
- * positive log ID, one of the four kinds, and a wire value of that kind's
- * shape (a message's `message_id` and `from`, a reaction record's
- * `message_id` and sets, a membership record's members). Throws otherwise.
- */
+/** An archived record of `roomId`, checked as restoreRoom stores it (validateRecord). Throws otherwise. */
 function restoredRecord(roomId: string, record: ChatRecord): RestoredRecord {
-  const where = `Record ${String(record?.log_id)} of ${roomId}`;
-  if (record?.room_id !== roomId) throw new StoreError("invalid_params", `${where} belongs to another room`.slice(0, 200));
-  if (!Number.isSafeInteger(record.log_id) || record.log_id <= 0) throw new StoreError("invalid_params", `${where} has no valid log_id`.slice(0, 200));
-  const commitMs = Number.isFinite(record.commit_ms) && record.commit_ms > 0 ? Math.trunc(record.commit_ms) : record.log_id;
-  const kind = record.kind;
-  if (kind !== "room" && kind !== "message" && kind !== "reactions" && kind !== "membership") throw new StoreError("invalid_params", `${where} is of an unknown kind`.slice(0, 200));
-  const value = typeof record.record_json === "string" ? parseJson<unknown>(record.record_json, null) : null;
-  if (!isPlainObject(value)) throw new StoreError("invalid_params", `${where} is not a JSON object`.slice(0, 200));
-  const valid = kind === "room" ? true
-    : kind === "message" ? typeof value.message_id === "string" && value.message_id.length > 0 && isRecordedUser(value.from)
-    : kind === "reactions" ? typeof value.message_id === "string" && value.message_id.length > 0 && Array.isArray(value.reactions)
-      && value.reactions.every((set) => isPlainObject(set) && isRecordedUser(set.from) && Array.isArray(set.emojis) && set.emojis.every((emoji) => typeof emoji === "string"))
-    : Array.isArray(value.members) && value.members.every((member) => isPlainObject(member) && isRecordedUser(member.user) && typeof member.joined === "boolean");
-  if (!valid) throw new StoreError("invalid_params", `${where} is not a valid ${kind} record`.slice(0, 200));
-  return { room_id: roomId, log_id: record.log_id, commit_ms: commitMs, kind, record_json: record.record_json, value };
+  const checked = validateRecord(record, roomId);
+  if ("problem" in checked) throw new StoreError("invalid_params", `Record ${String(record?.log_id)} of ${roomId} ${checked.problem}`.slice(0, 200));
+  return checked.record;
 }
 
 /** The reaction sets and members a restored record holds (RESTORE_ENTRIES_BATCH). */
@@ -4247,15 +4211,9 @@ export class Store {
   restorableRecord(record: ChatRecord): ChatRecord | null {
     const value = typeof record?.record_json === "string" ? parseJson<unknown>(record.record_json, null) : null;
     if (!isPlainObject(value)) return null;
-    const user = (candidate: unknown): Identity | null => {
-      if (!isRecordedUser(candidate) || candidate.user_id.startsWith("~") || !isProtocolId(candidate.user_id) || utf8Bytes(candidate.user_id) > 256) return null;
-      const name = typeof candidate.name === "string" && candidate.name.trim() !== "" && utf8Bytes(candidate.name) <= this.config.maxNameBytes && [...candidate.name].length <= this.config.maxNameCodePoints ? candidate.name : undefined;
-      return recordedUser(candidate.user_id, name);
-    };
+    // Every recorded user a client's: bare, a protocol ID, a name within the limits (clientUser).
+    if (!withClientUsers(value, record.kind, this.config)) return null;
     if (record.kind === "message") {
-      const from = user(value.from);
-      if (!from) return null;
-      value.from = from;
       if (value.body !== undefined) {
         if (value.deleted === true) delete value.body;
         else {
@@ -4268,24 +4226,6 @@ export class Store {
         }
       }
       if (utf8Bytes(JSON.stringify(withoutOutputs(value as unknown as MessageSnapshot))) > this.config.maxSnapshotBytes + 1_024) return null;
-    } else if (record.kind === "reactions") {
-      if (!Array.isArray(value.reactions)) return null;
-      const sets: unknown[] = [];
-      for (const set of value.reactions) {
-        const from = isPlainObject(set) ? user(set.from) : null;
-        if (!from) return null;
-        sets.push({ ...set, from });
-      }
-      value.reactions = sets;
-    } else if (record.kind === "membership") {
-      if (!Array.isArray(value.members)) return null;
-      const members: unknown[] = [];
-      for (const member of value.members) {
-        const recorded = isPlainObject(member) ? user(member.user) : null;
-        if (!recorded) return null;
-        members.push({ ...member, user: recorded });
-      }
-      value.members = members;
     } else if (record.kind === "room") {
       if (utf8Bytes(record.record_json) > this.config.maxSnapshotBytes + 1_024) return null;
     }
@@ -4447,7 +4387,7 @@ export class Store {
         if (!known.length) throw new StoreError("invalid_params", "A restored room needs records or its listing's log_id");
         const createdLogId = Math.min(...known);
         const recordLogId = Math.max(createdLogId, listingLog ?? 0, latestRoom?.log_id ?? 0);
-        const fields = latestRoom && latestRoom.log_id >= (listingLog ?? 0) ? restoredRoomFields(latestRoom.fields) : restoredRoomFields(listing);
+        const fields = latestRoom && latestRoom.log_id >= (listingLog ?? 0) ? roomClientFields(latestRoom.fields) : roomClientFields(listing);
         if (isPrivate) {
           if (parentRoomId !== null) throw new StoreError("invalid_params", "A private room cannot be a thread on this server");
           if (this.config.maxPrivateRooms === 0) throw new StoreError("unsupported", "Private rooms are not supported on this server");
@@ -4478,7 +4418,7 @@ export class Store {
       } else {
         if (listingParent !== undefined && listingParent !== row.parent_room_id) throw new StoreError("invalid_params", `The room ${roomId} here has another parent`.slice(0, 200));
         if (latestRoom && latestRoom.log_id >= row.record_log_id) {
-          const fields = restoredRoomFields(latestRoom.fields);
+          const fields = roomClientFields(latestRoom.fields);
           this.checkRoomFields(fields);
           // The client fields are replaced; a creator kept beside them stays.
           const creator = storedCreator(row.fields_json);

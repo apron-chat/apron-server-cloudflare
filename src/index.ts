@@ -3,8 +3,9 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, thresholdRecords } from "./budget";
-import { type BackupKeys, type DecryptionStatus, linesFromStream, linesOf, resolveKeys } from "@apron/archive";
-import { archiveReader, type ImportReport, importArchive } from "./history/archive/import";
+import { linesFromStream, linesOf } from "@apron/archive";
+import { type BackupKeys, type DecryptionStatus, openArchive, resolveKeys } from "@apron/archive/crypto";
+import { type ImportReport, importArchive } from "./history/archive/import";
 import type { BlobStore } from "./history/blob/store";
 import { archivePipeline, blobStoreOf, buildHistoryPipeline, D1_TIER, d1Enabled, HEAD_TIER, hasLowerTiers } from "./history/config";
 import { backupKeyNames, type BackupKind, writeBackup } from "./history/exports";
@@ -9225,7 +9226,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				let report: ImportReport;
 				try {
 					const status: DecryptionStatus = {};
-					const reader = archiveReader(lines, this.backupKeys(), status);
+					const reader = openArchive(lines, this.backupKeys(), status);
 					await reader.header();
 					// Where backups are encrypted, a plain file is none of this server's (IMPORT_PLAINTEXT).
 					if (!status.encrypted && !this.config.backups.importPlaintext) throw new Error(`${key} is not encrypted, and this server imports only encrypted backups (IMPORT_PLAINTEXT)`);

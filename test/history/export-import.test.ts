@@ -1,8 +1,9 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { exportArchive } from "../../src/history/archive/export";
-import { type ArchivedUser, collectArchive, compareReplayed, encryptingSink, jsonlReader, jsonlWriter, linesOf, replayRecords, resolveKeys, writeArchiveToString } from "@apron/archive";
-import { archiveReader, importArchive, place, restoreBatches } from "../../src/history/archive/import";
+import { type ArchivedUser, collectArchive, compareReplayed, jsonlReader, jsonlWriter, linesOf, replayRecords, writeArchiveToString } from "@apron/archive";
+import { encryptingSink, openArchive, resolveKeys } from "@apron/archive/crypto";
+import { importArchive, place, restoreBatches } from "../../src/history/archive/import";
 import { MemoryBlobStore } from "./support/memory-blob-store";
 import { type BackupSettings, backupFamily, writeBackup } from "../../src/history/exports";
 import { MemorySegmentIndex } from "../../src/history/blob/segments";
@@ -204,12 +205,12 @@ describe("export and import", () => {
 		const encrypted = lines.map((line) => line.endsWith("\n") ? line : `${line}\n`).join("");
 		expect(encrypted).not.toContain("hello");
 		const target = pipelineOf("head", new TestClock(5_000_000));
-		const report = await importArchive(target.pipeline, archiveReader(linesOf(encrypted), keys), { clock: target.clock });
+		const report = await importArchive(target.pipeline, openArchive(linesOf(encrypted), keys), { clock: target.clock });
 		expect(report.roomsAdded.sort()).toEqual(["general", "random"]);
 		const plain = await exported(source.pipeline, source.clock);
 		expect(compareReplayed(await stateOf(plain), await stateOf(await exported(target.pipeline, target.clock))).differences).toEqual([]);
 		const keyless = pipelineOf("head", new TestClock(5_000_000));
-		await expect(importArchive(keyless.pipeline, archiveReader(linesOf(encrypted)), { clock: keyless.clock })).rejects.toThrow(/needs HISTORY_BACKUP_KEY/);
+		await expect(importArchive(keyless.pipeline, openArchive(linesOf(encrypted)), { clock: keyless.clock })).rejects.toThrow(/needs HISTORY_BACKUP_KEY/);
 		expect(keyless.head.all()).toEqual([]);
 	});
 
@@ -323,7 +324,7 @@ describe("export and import", () => {
 		expect(written.key).toBe("backups/srv-manual-20261119-120000.jsonl.enc");
 		const text = await (await store.get(written.key))!.text();
 		expect(text).not.toContain("hello 0");
-		const archive = await collectArchive(archiveReader(linesOf(text), resolveKeys(env, ["HISTORY_BACKUP_KEY"])));
+		const archive = await collectArchive(openArchive(linesOf(text), resolveKeys(env, ["HISTORY_BACKUP_KEY"])));
 		expect(archive.records.some((record) => record.record_json.includes("hello 0"))).toBe(true);
 	});
 

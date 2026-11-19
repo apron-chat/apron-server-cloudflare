@@ -30,6 +30,9 @@
  * runs the same in the Worker and in Node.
  */
 
+import { jsonlReader } from "./format.ts";
+import type { ArchiveReader } from "./types.ts";
+
 const HKDF_INFO = "apron history backup v1";
 /** The shortest secret a backup key is derived from: 32 bytes of its text. */
 const MIN_SECRET_BYTES = 32;
@@ -448,4 +451,15 @@ export async function* decryptingLines(lines: AsyncIterable<string>, keys: Pick<
 	}
 	if (!held) throw new ArchiveDecryptError("this backup was truncated: it has no chunks after its header");
 	yield* plainLines(await decrypt(held, true), true);
+}
+
+/**
+ * An archive reader over lines that may be an encrypted backup: decrypted
+ * chunk by chunk with the keys given (decryptingLines), and read as plain
+ * otherwise. Without keys, an encrypted archive fails naming the key it
+ * needs. `status.encrypted` says, once the header is read, whether it was
+ * decrypted (and so authenticated) with one of them.
+ */
+export function openArchive(lines: AsyncIterable<string>, keys?: Pick<BackupKeys, "lookup">, status?: DecryptionStatus): ArchiveReader {
+	return jsonlReader(decryptingLines(lines, keys ?? { lookup: async () => undefined }, status));
 }

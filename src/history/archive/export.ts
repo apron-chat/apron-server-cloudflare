@@ -1,28 +1,18 @@
 /*
  * exportArchive (PLAN §10.1): the whole server's history, or some rooms',
  * as one ARCHIVE.md v1 file, read across every tier of the pipeline (upper
- * tiers winning, as pages do).
- *
- * The file: a header (no `you`: a server export is no one's view), one
- * listing part with every room as `not_joined`, then each room's records in
- * log order, a page at a time, each page preceded by the users it names
- * that no earlier part did. Nothing past a page is held in memory.
- *
- * Further sections (uploads, ...) write their own parts after history's
- * (ArchiveSection); history is the only one so far.
+ * tiers winning, as pages do). The file's shape is @apron/archive's
+ * exportArchive; this module is its source over the pipeline
+ * (pipelineSource) and the server's options (clock, page size, `prepare`).
  */
 
-import { type ArchiveHeader, type ArchivedRoom, type ArchivedUser, type ArchiveReader, type ArchiveWriter, type ChatRecord, namedUsers } from "@apron/archive";
+import { type ArchiveSource, type ArchiveWriter, type ChatRecord, type ExportOptions as ArchiveExportOptions, type ExportReport, exportArchive as writeArchive } from "@apron/archive";
 import type { HistoryPipeline } from "../pipeline";
 import type { Clock } from "../records";
 
-export interface ExportOptions {
-	/** Only these rooms (default: every room). */
-	roomIds?: readonly string[];
-	/** Private rooms too (default true); without them, their records stay out. */
-	privateRooms?: boolean;
-	/** Header fields: `server` above all, and `media`. */
-	header?: Partial<ArchiveHeader>;
+export type { ExportReport };
+
+export interface ExportOptions extends Omit<ArchiveExportOptions, "exportedAt"> {
 	clock: Clock;
 	/** Log IDs read per page (default 500). */
 	pageSize?: number;
@@ -34,25 +24,7 @@ export interface ExportOptions {
 	prepare?: (records: ChatRecord[]) => Promise<ChatRecord[]>;
 }
 
-export interface ExportReport {
-	rooms: number;
-	users: number;
-	records: number;
-	sections: string[];
-}
-
-export interface ImportOptionsBase {
-	dryRun?: boolean;
-}
-
-/** One kind of content an archive carries (PLAN §5). History now; uploads and others later. */
-export interface ArchiveSection<Source, Target, Options = unknown, Report = unknown> {
-	readonly key: string;
-	write(source: Source, out: ArchiveWriter, options: ExportOptions): Promise<{ rooms: number; users: number; records: number }>;
-	read?(input: ArchiveReader, into: Target, options: Options): Promise<Report>;
-}
-
-/** Every record of one room from `from` on, through the pipeline, oldest first, a page at a time. */
+/** Every record of one room from the published floor on, through the pipeline, oldest first, a page at a time. */
 export async function* roomRecords(pipeline: HistoryPipeline, roomId: string, pageSize = 500): AsyncGenerator<ChatRecord[]> {
 	let lower = await pipeline.publishedFloor();
 	for (;;) {
@@ -63,58 +35,19 @@ export async function* roomRecords(pipeline: HistoryPipeline, roomId: string, pa
 	}
 }
 
-/** The history section: rooms, the users they name, and their records. */
-export const historySection: ArchiveSection<HistoryPipeline, HistoryPipeline> = {
-	key: "history",
-	async write(pipeline, out, options) {
-		const head = pipeline.head;
-		const all: ArchivedRoom[] = head.rooms ? await head.rooms() : [];
-		const wanted = options.roomIds ? new Set(options.roomIds) : undefined;
-		// A private room is marked so in its listing (PROTOCOL §4.2.4), its ID `private_<log id>`.
-		const isPrivate = (room: ArchivedRoom) => room.listing.private === true || room.listing.room_id.startsWith("private_");
-		const rooms = all.filter((room) => (!wanted || wanted.has(room.listing.room_id)) && (options.privateRooms !== false || !isPrivate(room)));
-		const published = await pipeline.publishedFloor();
-		const listings = rooms.map((room) => {
-			// History starts where the room's listing says (the head computes it
-			// from the room's creation and the floor), never below the published
-			// floor. A listing's `log_id` is its latest room record, not its
-			// creation: a retitle must not hide the records before it.
-			const listed = room.listing.history_log_id;
-			if (listed === null) return { ...room.listing, history_log_id: null };
-			const start = typeof listed === "string" && /^\d{1,16}$/.test(listed) ? Math.max(published, Number(listed)) : published;
-			return { ...room.listing, history_log_id: String(start) };
-		});
-		const named = new Set<string>();
-		for (const listing of listings) for (const member of listing.members ?? []) named.add(member.user_id);
-		const listed = new Set<string>();
-		const userPart = async (ids: Iterable<string>) => {
-			const fresh = [...new Set(ids)].filter((id) => !listed.has(id));
-			if (!fresh.length) return [];
-			for (const id of fresh) listed.add(id);
-			return head.users ? head.users(fresh) : [];
-		};
-		await out.listing({ not_joined: listings, users: await userPart(named) });
-		let records = 0;
-		for (const room of rooms) {
-			for await (const read of roomRecords(pipeline, room.listing.room_id, options.pageSize)) {
-				const page = options.prepare ? await options.prepare(read) : read;
-				const users: ArchivedUser[] = await userPart(page.flatMap(namedUsers));
-				if (users.length) await out.listing({ users });
-				await out.records(page);
-				records += page.length;
-			}
-		}
-		return { rooms: rooms.length, users: listed.size, records };
-	},
-};
+/** The pipeline as an export's source: its head's rooms and users, records across every tier, history from the published floor. */
+export function pipelineSource(pipeline: HistoryPipeline, pageSize?: number): ArchiveSource {
+	const head = pipeline.head;
+	return {
+		rooms: async () => (head.rooms ? head.rooms() : []),
+		users: async (userIds) => (head.users ? head.users(userIds) : []),
+		records: (roomId) => roomRecords(pipeline, roomId, pageSize),
+		floor: () => pipeline.publishedFloor(),
+	};
+}
 
-/**
- * Writes the pipeline's history as one ARCHIVE.md v1 file (PLAN §10.1).
- * The writer is closed at the end.
- */
+/** Writes the pipeline's history as one ARCHIVE.md v1 file (PLAN §10.1). The writer is closed at the end. */
 export async function exportArchive(pipeline: HistoryPipeline, out: ArchiveWriter, options: ExportOptions): Promise<ExportReport> {
-	await out.header({ ...options.header, apron_archive: 1, exported_at: new Date(options.clock.now()).toISOString() });
-	const written = await historySection.write(pipeline, out, options);
-	await out.close();
-	return { ...written, sections: [historySection.key] };
+	const { clock, pageSize, ...rest } = options;
+	return writeArchive(pipelineSource(pipeline, pageSize), out, { ...rest, exportedAt: new Date(clock.now()).toISOString() });
 }

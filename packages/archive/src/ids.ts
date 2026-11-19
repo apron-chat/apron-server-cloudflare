@@ -239,26 +239,3 @@ export function freeUserId(base: string, taken: (id: string) => boolean): string
 		if (!taken(id)) return id;
 	}
 }
-
-/** The user ID of this server's own administrator (who signs in with the admin token): never an archive's to take. */
-export const ADMIN_USER_ID = "admin";
-
-/**
- * Whether an archive's `user_id` may stand here as itself, matched or as a
- * placeholder account (PLAN §10.4): the shape an admin may issue
- * (`/invite-token`, `/rename`), and not a guest's, an owner's bot's, a
- * server notice's (`~…`) or the admin's.
- */
-export function restorableUserId(userId: unknown): userId is string {
-	return typeof userId === "string" && /^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9_])?$/.test(userId) && !/^(guest|bot)(_|$)/i.test(userId) && userId.toLowerCase() !== ADMIN_USER_ID;
-}
-
-/**
- * The placeholder ID an archive user whose ID cannot stand here starts from
- * (restorableUserId): `imported-` and the ID's letters, digits, `_` and
- * `-`, short enough that a `-<n>` suffix still fits (freeUserId).
- */
-export function placeholderBase(userId: string): string {
-	const cleaned = userId.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^[-_]+/, "").slice(0, 40).replace(/[-_]+$/, "");
-	return `imported-${cleaned || "user"}`;
-}

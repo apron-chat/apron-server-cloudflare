@@ -21,6 +21,9 @@
 		"./format": "./src/format.ts",
 		"./replay": "./src/replay.ts",
 		"./ids": "./src/ids.ts",
+		"./validate": "./src/validate.ts",
+		"./plan": "./src/plan.ts",
+		"./export": "./src/export.ts",
 		"./crypto": "./src/crypto.ts"
 	},
 	"files": [

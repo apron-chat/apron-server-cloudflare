@@ -9,7 +9,8 @@
  * nothing behind.
  */
 
-import { type ArchiveHeader, type BackupKeys, encryptingSink, jsonlWriter } from "@apron/archive";
+import { type ArchiveHeader, jsonlWriter } from "@apron/archive";
+import { type BackupKeys, encryptingSink } from "@apron/archive/crypto";
 import { type ExportOptions, type ExportReport, exportArchive } from "./archive/export";
 import type { BlobStore } from "./blob/store";
 import type { HistoryPipeline } from "./pipeline";
