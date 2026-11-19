@@ -13,22 +13,20 @@ and, later, apron-web.
 
 ## Installing
 
-Releases are compiled: ES modules with `.d.ts` declarations, so a consumer
-needs no TypeScript settings of its own. Each release is a tarball on the
-repository's GitHub releases:
+Published to npm as compiled ES modules with `.d.ts` declarations, so a
+consumer needs no TypeScript settings of its own:
 
 ```sh
-npm install https://github.com/apron-chat/apron-server-cloudflare/releases/download/archive-v0.1.0/apron-archive-0.1.0.tgz
+npm install @apron/archive
 ```
 
-and, once an `NPM_TOKEN` secret is set, `npm install @apron/archive`.
-
-To release: bump `version` in `package.json`, merge, and push the tag
-`archive-v<version>`. `.github/workflows/archive.yml` runs the package's
-tests, builds it (`npm run build -w @apron/archive`: `scripts/build.mjs`
-writes `dist/` with a publishable `package.json`), and attaches
-`npm pack dist` to a release. The workspace `package.json` stays `private`
-and points at `src/`: this repository imports the sources directly.
+To release, bump `version` in `package.json`: when `main` has a version
+npm doesn't, the `publish-archive` job in `.github/workflows/deploy.yml`
+builds it (`npm run build -w @apron/archive`: `scripts/build.mjs` writes
+`dist/` with a publishable `package.json`) and publishes `dist/` (with an
+`NPM_TOKEN` secret). No tags. The workspace `package.json` stays `private`
+and points at `src/`: this repository imports the sources directly. To try
+a build elsewhere before a release, `npm pack packages/archive/dist`.
 
 ## Modules
 

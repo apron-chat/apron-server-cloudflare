@@ -77,3 +77,51 @@ jobs:
           # Optional; the room the announcements are in, `general` when unset.
           room-id: ${{ vars.APRON_ROOM_ID }}
           reaction: ✅
+
+  # Publishes @apron/archive (packages/archive) when main has a version of it
+  # that npm doesn't: bumping `version` in its package.json is the release.
+  # No tags. The published package is the compiled build (dist/, see
+  # packages/archive/scripts/build.mjs). Without an NPM_TOKEN secret it only
+  # says what it would publish.
+  publish-archive:
+    needs: test
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: publish-archive
+      cancel-in-progress: false
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - id: version
+        name: Is this version published?
+        run: |
+          version=$(node -p "require('./packages/archive/package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if npm view "@apron/archive@$version" version >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.version.outputs.published == 'false'
+        run: npm ci
+      - if: steps.version.outputs.published == 'false'
+        run: npm run build -w @apron/archive
+      - if: steps.version.outputs.published == 'false' && env.NPM_TOKEN != ''
+        run: npm publish ./packages/archive/dist --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ env.NPM_TOKEN }}
+      - if: steps.version.outputs.published == 'false' && env.NPM_TOKEN == ''
+        run: echo "::notice::@apron/archive@${{ steps.version.outputs.version }} is not on npm; set the NPM_TOKEN secret to publish it."
