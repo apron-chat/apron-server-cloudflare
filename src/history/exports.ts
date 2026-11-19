@@ -8,7 +8,8 @@
  */
 
 import { type BackupKeys, encryptingSink } from "./archive/crypto";
-import { type ExportReport, exportArchive } from "./archive/export";
+import { type ExportOptions, type ExportReport, exportArchive } from "./archive/export";
+import type { ArchiveHeader } from "./archive/types";
 import { jsonlWriter } from "./archive/format";
 import type { BlobStore } from "./blob/store";
 import type { HistoryPipeline } from "./pipeline";
@@ -52,7 +53,7 @@ export interface BackupResult extends ExportReport {
  * export's backups past the newest `keep`. With `encrypt`, the first listed
  * key secret encrypts it; a missing key fails before anything is written.
  */
-export async function writeBackup(pipeline: HistoryPipeline, store: BlobStore, settings: ExportSettings, options: { server: string; clock: Clock; keys?: Pick<BackupKeys, "lookup">; roomIds?: string[] }): Promise<BackupResult> {
+export async function writeBackup(pipeline: HistoryPipeline, store: BlobStore, settings: ExportSettings, options: { server: string; clock: Clock; keys?: Pick<BackupKeys, "lookup">; roomIds?: string[]; header?: Partial<ArchiveHeader>; prepare?: ExportOptions["prepare"] }): Promise<BackupResult> {
 	const now = options.clock.now();
 	const key = exportKey(settings, options.server, now);
 	let encryptWith: { name: string; key: CryptoKey; fingerprint: string } | undefined;
@@ -68,7 +69,8 @@ export async function writeBackup(pipeline: HistoryPipeline, store: BlobStore, s
 		const plain = async (line: string) => writer.write(line.endsWith("\n") ? line : `${line}\n`);
 		const sink = encryptWith ? encryptingSink(plain, encryptWith) : undefined;
 		report = await exportArchive(pipeline, jsonlWriter(sink ?? plain), {
-			clock: options.clock, compact: settings.compact, header: { server: options.server }, ...(options.roomIds ? { roomIds: options.roomIds } : {}),
+			clock: options.clock, header: { server: options.server, ...options.header }, ...(options.roomIds ? { roomIds: options.roomIds } : {}),
+			...(options.prepare ? { prepare: options.prepare } : {}),
 		});
 		await sink?.close();
 		await writer.close();

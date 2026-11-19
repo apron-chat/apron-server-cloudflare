@@ -3,8 +3,8 @@
  * (src/history/blob/segments.ts): the HistoryTier conformance suite on the
  * memory tier and on the blob tier over memory and over miniflare's R2, then
  * what is particular to segments: their keys, each one a valid ARCHIVE.md
- * file, the index rebuilt from a listing or kept in SQLite, compaction and
- * its crashes, and objects gone missing.
+ * file, the index rebuilt from a listing or kept in SQLite, a retried
+ * append's merge and its crashes, and objects gone missing.
  */
 
 import { env, runInDurableObject } from "cloudflare:test";
@@ -17,21 +17,19 @@ import type { BlobStore } from "../../src/history/blob/store";
 import { BlobHistoryTier } from "../../src/history/blob/tier";
 import { MemoryHistoryTier } from "../../src/history/memory";
 import { type ChatRecord, byLog, toRange } from "../../src/history/records";
-import { compareRenderedState, renderedState } from "../../src/history/render";
+import { compareRenderedState, renderedState } from "./render";
 import { describeHistoryTier, sampleLog, wireRecord } from "./conformance/history-tier";
 
 const clock = { now: () => Date.UTC(2026, 10, 19, 12, 0, 0) };
 const runner = { describe, it, expect };
 const nonce = () => Math.floor(Math.random() * 0x100000000).toString(16).padStart(8, "0");
 
-function blobTier(options: { store?: BlobStore; index?: SegmentIndex; prefix?: string; segmentRecords?: number; compactRecords?: boolean; cacheBytes?: number } = {}) {
+function blobTier(options: { store?: BlobStore; index?: SegmentIndex; prefix?: string; cacheBytes?: number } = {}) {
 	const store = options.store ?? new MemoryBlobStore();
 	const index = options.index ?? new MemorySegmentIndex();
 	const prefix = options.prefix ?? "history/test/";
 	const tier = new BlobHistoryTier({
 		name: "cold", store, index, prefix, clock, header: { server: "wss://test.example/" },
-		segmentRecords: options.segmentRecords ?? 1_000, segmentBytes: 1_000_000,
-		...(options.compactRecords === undefined ? {} : { compactRecords: options.compactRecords }),
 		...(options.cacheBytes === undefined ? {} : { cacheBytes: options.cacheBytes }),
 	});
 	return { tier, store, index, prefix };
@@ -195,40 +193,8 @@ describe("BlobHistoryTier segments", () => {
 	});
 });
 
-describe("BlobHistoryTier compaction", () => {
-	it("merges a room's small final segments, preserving the rendered state", async () => {
-		const { tier, index } = blobTier({ segmentRecords: 20 });
-		const log = busyLog(60);
-		for (let i = 0; i < 60; i += 4) await tier.append(toRange(log.slice(i, i + 4)));
-		expect((index as MemorySegmentIndex).all().length).toBe(15);
-		const final = log[47].log_id + 1;
-		let rounds = 0;
-		while (await tier.upkeep({ steps: 1 }, { final })) rounds += 1;
-		expect(rounds).toBeGreaterThan(0);
-		// Idempotent: nothing more to do.
-		expect(await tier.upkeep({ steps: 5 }, { final })).toBe(false);
-		const refs = (index as MemorySegmentIndex).all();
-		// Final segments merged up to the target; the three past `final` untouched.
-		expect(refs.filter((ref) => ref.last >= final).map((ref) => ref.records)).toEqual([4, 4, 4]);
-		expect(refs.filter((ref) => ref.last < final).length).toBeLessThan(12);
-		for (const ref of refs) expect(ref.records).toBeLessThanOrEqual(20);
-		const served = await roomRecords(tier, "a");
-		expect(served.length).toBeLessThan(log.length);
-		expect(compareRenderedState(renderedState(served), renderedState(log))).toEqual({ equal: true, differences: [] });
-		// Segments stay contiguous and disjoint.
-		for (let i = 1; i < refs.length; i += 1) expect(refs[i].first).toBeGreaterThan(refs[i - 1].last);
-	});
-
-	it("leaves records as they are without compactRecords", async () => {
-		const { tier, index } = blobTier({ segmentRecords: 100, compactRecords: false });
-		const log = busyLog(30);
-		for (let i = 0; i < 30; i += 5) await tier.append(toRange(log.slice(i, i + 5)));
-		await tier.upkeep({ steps: 10 }, { final: Number.MAX_SAFE_INTEGER });
-		expect((index as MemorySegmentIndex).all().length).toBe(1);
-		expect(await roomRecords(tier, "a")).toEqual(log);
-	});
-
-	it("survives a crash after the new segment is indexed: reads de-duplicate, and the next upkeep cleans up", async () => {
+describe("BlobHistoryTier crashes", () => {
+	it("survive one during a retried append's merge: reads de-duplicate, and the next retry cleans up", async () => {
 		const store = new MemoryBlobStore();
 		const inner = new MemorySegmentIndex();
 		let failRemove = true;
@@ -238,19 +204,20 @@ describe("BlobHistoryTier compaction", () => {
 				return inner.remove(refs);
 			},
 		});
-		const { tier } = blobTier({ store, index, segmentRecords: 100, compactRecords: false });
+		const { tier } = blobTier({ store, index });
 		const log = busyLog(12);
 		for (let i = 0; i < 12; i += 4) await tier.append(toRange(log.slice(i, i + 4)));
 		const originals = inner.all().map((ref) => ref.key);
-		await expect(tier.upkeep({ steps: 1 }, { final: Number.MAX_SAFE_INTEGER })).rejects.toThrow("crash");
+		await expect(tier.append(toRange(log))).rejects.toThrow("crash");
 		// The merged segment replaced the first one's row; the others overlap it.
 		expect(inner.all().map((ref) => [ref.first, ref.last])).toEqual([[log[0].log_id, log[11].log_id], [log[4].log_id, log[7].log_id], [log[8].log_id, log[11].log_id]]);
 		expect(await roomRecords(tier, "a")).toEqual(log);
 		expect((await tier.scan(0, 100)).records).toEqual(log);
 		expect(await tier.read({ roomIds: ["a"], lower: 1, upper: Number.MAX_SAFE_INTEGER, forward: false, limit: 5 })).toEqual(log.slice(-5).reverse());
+		expect(await tier.lookup([log[5].log_id])).toEqual([log[5]]);
 		expect((await tier.stats()).records).toBeGreaterThan(12);
 		failRemove = false;
-		expect(await tier.upkeep({ steps: 5 }, { final: Number.MAX_SAFE_INTEGER })).toBe(true);
+		await tier.append(toRange(log));
 		expect(inner.all().map((ref) => [ref.first, ref.last, ref.records])).toEqual([[log[0].log_id, log[11].log_id, 12]]);
 		expect(await roomRecords(tier, "a")).toEqual(log);
 		// Left: the merged segment, and the first original's object, whose index row the merged one replaced
@@ -291,12 +258,10 @@ describe("SqlSegmentIndex", () => {
 
 			// A blob tier over it, and its index rebuilt into another table.
 			const store = new MemoryBlobStore();
-			const { tier } = blobTier({ store, index, segmentRecords: 10 });
+			const { tier } = blobTier({ store, index });
 			const log = busyLog(20);
 			for (let i = 0; i < 20; i += 4) await tier.append(toRange(log.slice(i, i + 4)));
 			expect(await roomRecords(tier, "a")).toEqual(log);
-			await tier.upkeep({ steps: 5 }, { final: Number.MAX_SAFE_INTEGER });
-			expect(compareRenderedState(renderedState(await roomRecords(tier, "a")), renderedState(log)).equal).toBe(true);
 			const other = new SqlSegmentIndex(port, { table: "history_segments_backup" });
 			other.ensureSchema();
 			expect(await other.rebuild(store, "history/test/")).toBe((await index.forRoom("a")).length);

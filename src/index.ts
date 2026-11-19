@@ -2691,6 +2691,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			track: (kind, method, call) => this.stalls.track(kind, method, call()),
 			segmentIndex: (tier) => this.store.segmentIndex(tier),
 			server: this.config.rpId,
+			serverUrl: this.archiveHeader().server,
 		}) : undefined;
 		// An overrun is observed, not fatal: the day's first is told, and a
 		// breaker it opened is told by the tier evaluation that follows.
@@ -8900,6 +8901,29 @@ export class ApronDemoServer extends DurableObject<Env> {
 		};
 	}
 
+	/**
+	 * What an archive's header says of this server (ARCHIVE.md §2): its
+	 * WebSocket URL, from PUBLIC_ORIGIN or else RP_ID, and the origins its
+	 * media loads from.
+	 */
+	private archiveHeader(): { server: string; media: string[] } {
+		const origin = this.config.uploads?.publicOrigin || this.config.liveText?.publicOrigin || `https://${this.config.rpId}`;
+		const host = new URL(origin).host;
+		const media = [...new Set([origin, ...(this.config.uploads?.mediaOrigin ? [this.config.uploads.mediaOrigin] : [])])];
+		return { server: `wss://${host}/`, media };
+	}
+
+	/** Exported records as clients get them: terminal output kept in R2 put back, its internal reference never written. */
+	private async exportRecords(records: ChatRecord[]): Promise<ChatRecord[]> {
+		const values = records.map((record) => record.kind === "message" && record.record_json.includes('"output_ref"') ? JSON.parse(record.record_json) as unknown : undefined);
+		if (!values.some((value) => value !== undefined && hasOutputRef(value))) return records;
+		await this.loadTerminalOutputs(values.filter((value) => value !== undefined));
+		return records.map((record, index) => {
+			const value = values[index];
+			return value !== undefined && hasOutputRef(value) ? { ...record, record_json: JSON.stringify(withTerminalOutputs(value, (key) => this.cachedOutput(key))) } : record;
+		});
+	}
+
 	/** The pipeline exports and imports go through: the history pipeline, or SQLite alone. */
 	private archivePipeline(): HistoryPipeline {
 		return archivePipeline(this.history, { store: this.store, limits: this.config.limits, clock: { now: nowMs }, settings: this.config.history });
@@ -8915,7 +8939,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const scheduled = this.config.history?.exports[0];
 		const settings: ExportSettings = scheduled
 			? { ...scheduled, name: "manual", keep: Math.max(scheduled.keep, 10) }
-			: { name: "manual", everySeconds: 0, store: { provider: "r2", binding: "HISTORY_BLOB", prefix: "backups/" }, key: "{server}-{name}-{date}.jsonl", keep: 10, compact: true };
+			: { name: "manual", everySeconds: 0, store: { provider: "r2", binding: "HISTORY_BLOB", prefix: "backups/" }, key: "{server}-{name}-{date}.jsonl", keep: 10 };
 		const store = blobStoreOf(settings.store, this.runtimeEnv);
 		return store ? { store, settings } : undefined;
 	}
@@ -8992,6 +9016,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				try {
 					result = await writeBackup(this.archivePipeline(), target.store, target.settings, {
 						server: this.config.rpId, clock: { now: nowMs }, keys: this.backupKeys(), ...(roomIds.length ? { roomIds } : {}),
+						header: this.archiveHeader(), prepare: (records) => this.exportRecords(records),
 					});
 				} catch (error) {
 					// A missing key or a failing store: said plainly; an upload begun is aborted.
@@ -9013,7 +9038,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				let report: ImportReport;
 				try {
 					report = await importArchive(this.archivePipeline(), archiveReader(lines, this.backupKeys()), {
-						clock: { now: nowMs }, server: this.config.rpId, dryRun: flags.has("dry-run"),
+						clock: { now: nowMs }, server: this.archiveHeader().server, dryRun: flags.has("dry-run"),
 						users: flags.has("match") ? "match" : flags.has("new") ? "new" : defaults?.users ?? "auto",
 						ids: flags.has("renumber") ? "renumber" : defaults?.ids ?? "original",
 						restart: flags.has("restart"),
@@ -9060,7 +9085,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 				this.historyJobRunning = true;
 				let result: Awaited<ReturnType<typeof writeBackup>>;
 				try {
-					result = await writeBackup(this.archivePipeline(), store, settings, { server: this.config.rpId, clock: { now: nowMs }, keys: this.backupKeys() });
+					result = await writeBackup(this.archivePipeline(), store, settings, {
+						server: this.config.rpId, clock: { now: nowMs }, keys: this.backupKeys(), header: this.archiveHeader(), prepare: (records) => this.exportRecords(records),
+					});
 				} finally {
 					this.historyJobRunning = false;
 				}

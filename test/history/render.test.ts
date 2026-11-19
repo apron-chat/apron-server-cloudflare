@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { collectArchive, jsonlReader, linesOf } from "../../src/history/archive/format";
 import type { ArchivedRoom } from "../../src/history/archive/types";
 import type { ChatRecord, RecordKind } from "../../src/history/records";
-import { compact, compareRenderedState, renderedState } from "../../src/history/render";
+import { compareRenderedState, renderedState } from "./render";
 import { sceneArchives } from "../fixtures/archives";
 
 /** A stored record; `storedIn` is the room the row is in, for a move's copy in its source room. */
@@ -111,64 +111,11 @@ describe("renderedState", () => {
 	});
 });
 
-describe("compact", () => {
-	it("keeps the last room record and snapshot, and folds reactions and memberships", () => {
-		const compacted = compact(log);
-		const shapes = compacted.map((entry) => [entry.kind, entry.room_id, entry.log_id]);
-		expect(shapes).toEqual([
-			["room", "thread", 101],
-			["message", "general", 112],
-			["message", "general", 120],
-			["message", "thread", 120],
-			["reactions", "thread", 121],
-			["reactions", "general", 131],
-			["message", "general", 132],
-			["membership", "thread", 141],
-			["room", "general", 150],
-			["reactions", "general", 115],
-			["membership", "general", 151],
-		].sort((a, b) => (a[2] as number) - (b[2] as number) || String(a[1]).localeCompare(String(b[1]))));
-		// Folded records carry each user's last entry, empty sets and leaves included, in order of first appearance.
-		const folded = (kind: string, logId: number) => JSON.parse(compacted.find((entry) => entry.kind === kind && entry.log_id === logId)!.record_json);
-		expect(folded("reactions", 115).reactions).toEqual([{ from: bob, emojis: [] }, { from: carol, emojis: ["🎉", "👍"] }]);
-		expect(folded("membership", 151).members).toEqual([{ user: ada, joined: true }, { user: bob, joined: false }, { user: carol, joined: true }]);
-		expect(folded("membership", 151).log_id).toBe("151");
-		// A group of one record is kept byte for byte.
-		const kept = compacted.find((entry) => entry.kind === "membership" && entry.log_id === 141)!;
-		expect(kept).toBe(log.find((entry) => entry.kind === "membership" && entry.log_id === 141));
-	});
-
-	it("preserves the rendered state, and is idempotent", () => {
-		const compacted = compact(log);
-		expect(compareRenderedState(renderedState(compacted), renderedState(log))).toEqual({ equal: true, differences: [] });
-		expect(compact(compacted)).toEqual(compacted);
-		expect(compact([])).toEqual([]);
-	});
-
-	it("preserves the rendered state of a log where reactions and memberships interleave at shared log IDs", () => {
-		const tricky: ChatRecord[] = [
-			message("a", 1, 1, { body: { text: "x" } }),
-			reactions("a", 2, 1, [[bob, ["👍"]], [carol, ["👀"]]]),
-			reactions("a", 3, 1, [[bob, ["👎"]]]),
-			reactions("a", 3, 1, [[carol, []]]),
-			membership("a", 4, [[bob, true], [carol, true]]),
-			membership("a", 5, [[carol, false]]),
-			message("a", 6, 1, { deleted: true }),
-			message("a", 6, 1, { body: { text: "racing edit" } }),
-			reactions("a", 7, 6, [[ada, ["✅"]]]),
-		];
-		expect(compareRenderedState(renderedState(compact(tricky)), renderedState(tricky)).differences).toEqual([]);
-		expect(compact(tricky).filter((entry) => entry.kind === "message").map((entry) => JSON.parse(entry.record_json).deleted)).toEqual([true]);
-	});
-
+describe("renderedState of the scenes", () => {
 	for (const name of Object.keys(sceneArchives).sort()) {
-		it(`preserves the rendered state of scene ${name}`, async () => {
+		it(`renders something in every kind scene ${name} holds`, async () => {
 			const archive = await collectArchive(jsonlReader(linesOf(sceneArchives[name])));
 			const full = renderedState(archive.records, archive.rooms, archive.users);
-			const compacted = compact(archive.records);
-			expect(compacted.length).toBeLessThanOrEqual(archive.records.length);
-			expect(compareRenderedState(renderedState(compacted, archive.rooms, archive.users), full).differences).toEqual([]);
-			// The scene renders something in every kind it holds.
 			expect(full.rooms.size).toBeGreaterThan(0);
 			expect(full.messages.size).toBeGreaterThan(0);
 			expect(full.users.size).toBeGreaterThan(0);

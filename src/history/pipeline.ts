@@ -75,7 +75,7 @@ export class HistoryPipeline {
 	/** What the running round of cycles has done: it ends when a cycle finds nothing to do. */
 	private round = HistoryPipeline.newRound();
 	private static newRound() {
-		return { targeted: new Set<number>(), advanced: new Map<number, number>(), upkept: new Set<number>(), worked: false };
+		return { targeted: new Set<number>(), advanced: new Map<number, number>(), worked: false };
 	}
 	/** What each lower tier's last target was found from (what the tier above held then), and when. */
 	private readonly targetBasis = new Map<number, { basis: string; at: number }>();
@@ -108,12 +108,11 @@ export class HistoryPipeline {
 			readable: this.readable[index],
 			rewritable: isRewritable(tier),
 			multiRoom: tier.multiRoom ?? true,
-			upkeep: typeof tier.upkeep === "function",
 			state: states[tier.name],
 		}));
 	}
 
-	async snapshot(progress: Pick<PipelineSnapshot, "targeted" | "advanced" | "upkept"> = { targeted: new Set(), advanced: new Map(), upkept: new Set() }): Promise<PipelineSnapshot> {
+	async snapshot(progress: Pick<PipelineSnapshot, "targeted" | "advanced"> = { targeted: new Set(), advanced: new Map() }): Promise<PipelineSnapshot> {
 		const [tiers, published, ops] = await Promise.all([this.views(), this.head.publishedFloor(), this.head.ops()]);
 		return { tiers, published, opsSeq: ops.length ? ops[ops.length - 1].seq : 0, trimmed: this.trimmed, ...progress };
 	}
@@ -167,7 +166,7 @@ export class HistoryPipeline {
 		return { more, report };
 	}
 
-	private async execute(step: Step, snapshot: PipelineSnapshot, progress: { targeted: Set<number>; advanced: Map<number, number>; upkept: Set<number>; worked: boolean }, report: CycleReport): Promise<void> {
+	private async execute(step: Step, snapshot: PipelineSnapshot, progress: { targeted: Set<number>; advanced: Map<number, number>; worked: boolean }, report: CycleReport): Promise<void> {
 		const now = this.clock.now();
 		switch (step.kind) {
 			case "ops":
@@ -224,13 +223,6 @@ export class HistoryPipeline {
 			case "publish":
 				await this.head.publish(step.floor);
 				return;
-			case "upkeep": {
-				const reach = rewritableReach(snapshot.tiers);
-				const final = snapshot.tiers[Math.max(0, reach - 1)].state.floor;
-				await this.tiers[step.tier].upkeep!({ steps: 1 }, { final });
-				progress.upkept.add(step.tier);
-				return;
-			}
 		}
 	}
 

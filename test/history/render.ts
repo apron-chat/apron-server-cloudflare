@@ -1,8 +1,7 @@
 /*
  * Rendered state (PLAN §5, §11): what a reader would show after replaying a
- * set of records (PROTOCOL §2.3), and PROTOCOL §4.3.4 compaction, which must
- * leave it unchanged. It is the oracle of every round trip: two histories
- * are the same when their rendered states compare equal.
+ * set of records (PROTOCOL §2.3). It is the oracle of every round trip: two
+ * histories are the same when their rendered states compare equal.
  *
  * Replay keeps, for each key, the record with the greatest log ID, whatever
  * the order the records come in:
@@ -42,8 +41,8 @@
  * Everything here is pure: no I/O, no clock.
  */
 
-import type { ArchivedRoom, ArchivedUser } from "./archive/types";
-import { byLog, canonicalJson, type ChatRecord } from "./records";
+import type { ArchivedRoom, ArchivedUser } from "../../src/history/archive/types";
+import { byLog, canonicalJson, type ChatRecord } from "../../src/history/records";
 
 type JsonObject = Record<string, unknown>;
 
@@ -71,7 +70,7 @@ export interface RenderedMessage {
 	deleted: boolean;
 }
 
-/** What a reader would render after replaying records (PROTOCOL §2.3) and compacting (§4.3.4). */
+/** What a reader would render after replaying records (PROTOCOL §2.3). */
 export interface RenderedState {
 	rooms: Map<string, RenderedRoom>;
 	/** Last snapshot per message_id, tombstones included. */
@@ -360,71 +359,4 @@ export function compareRenderedState(a: RenderedState, b: RenderedState, options
 	}
 
 	return { equal: differences.length === 0, differences };
-}
-
-/**
- * PROTOCOL §4.3.4 compaction of a set of records: the last room record of
- * each room and the last snapshot of each message (every room's copy of it,
- * and only tombstones when one ties a snapshot); the reaction sets of each
- * message folded into one record carrying each user's last set, and the
- * memberships of each room into one carrying each user's last membership,
- * both at the greatest folded log ID, in the room(s) the newest folded
- * record was stored in. Empty sets and leaves stay. Kept records keep their
- * log IDs and contents; a group of one record is kept as it is. Records of
- * other kinds, or that do not parse, are kept unchanged. Sorted by log
- * order. renderedState(compact(x)) equals renderedState(x).
- */
-export function compact(records: readonly ChatRecord[]): ChatRecord[] {
-	const sorted = [...records].sort(byLog);
-	const out: ChatRecord[] = [];
-	const groups = new Map<string, Array<{ record: ChatRecord; value: JsonObject }>>();
-	const group = (key: string, record: ChatRecord, value: JsonObject) => {
-		const list = groups.get(key);
-		if (list) list.push({ record, value });
-		else groups.set(key, [{ record, value }]);
-	};
-	for (const record of sorted) {
-		const value = parse(record);
-		const roomId = value && typeof value.room_id === "string" ? value.room_id : record.room_id;
-		if (!value) out.push(record);
-		else if (record.kind === "room") group(`room\u0000${roomId}`, record, value);
-		else if (record.kind === "message" && typeof value.message_id === "string") group(`message\u0000${value.message_id}`, record, value);
-		else if (record.kind === "reactions" && typeof value.message_id === "string" && Array.isArray(value.reactions)) group(`reactions\u0000${value.message_id}`, record, value);
-		else if (record.kind === "membership" && Array.isArray(value.members)) group(`membership\u0000${roomId}`, record, value);
-		else out.push(record);
-	}
-
-	for (const [key, list] of groups) {
-		const last = list[list.length - 1].record.log_id;
-		const newest = list.filter(({ record }) => record.log_id === last);
-		const kind = key.slice(0, key.indexOf("\u0000"));
-		if (kind === "room") {
-			out.push(...newest.map(({ record }) => record));
-		} else if (kind === "message") {
-			const tombstones = newest.filter(({ value }) => value.deleted === true);
-			out.push(...(tombstones.length ? tombstones : newest).map(({ record }) => record));
-		} else if (list.length === 1) {
-			out.push(list[0].record);
-		} else {
-			// Fold: each user's last entry, users in order of first appearance.
-			const field = kind === "reactions" ? "reactions" : "members";
-			const userOf = (entry: unknown): string | undefined => {
-				const user = kind === "reactions" ? (entry as ReactionEntry)?.from : (entry as MemberEntry)?.user;
-				return typeof user?.user_id === "string" ? user.user_id : undefined;
-			};
-			// Entries naming no user are dropped: replay ignores them.
-			const entries = new Map<string, unknown>();
-			for (const { value } of list) {
-				for (const entry of value[field] as unknown[]) {
-					const userId = userOf(entry);
-					if (userId !== undefined) entries.set(userId, entry);
-				}
-			}
-			const folded = [...entries.values()];
-			for (const { record, value } of newest) {
-				out.push({ ...record, record_json: JSON.stringify({ ...value, [field]: folded }) });
-			}
-		}
-	}
-	return out.sort(byLog);
 }

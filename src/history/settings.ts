@@ -21,7 +21,6 @@
  *   name = "cold"
  *   kind = "blob"
  *   store = { provider = "r2", binding = "HISTORY_BLOB", prefix = "history/" }
- *   segments = { records = 1_000, bytes = "1MB", compact = "off" }
  *   [[vars.HISTORY.exports]]
  *   name = "nightly"
  *   every = "1d"
@@ -62,7 +61,7 @@ export type TierSettings =
 	| { name: string; kind: "d1"; binding: string; retention: RetentionSettings }
 	| {
 		name: string; kind: "blob"; store: BlobStoreSettings; retention: RetentionSettings; readable: boolean;
-		segments: { records: number; bytes: number; compact: boolean }; cacheBytes: number;
+		cacheBytes: number;
 	};
 
 export interface ExportSettings {
@@ -72,7 +71,6 @@ export interface ExportSettings {
 	/** The object key, with `{server}`, `{name}` and `{date}` (UTC, YYYYMMDD-HHMMSS) filled in. */
 	key: string;
 	keep: number;
-	compact: boolean;
 	encrypt?: { keySecrets: string[] };
 }
 
@@ -189,21 +187,12 @@ function tier(value: unknown, index: number): TierSettings {
 			if (kept.bytes !== undefined || kept.minAgeSeconds !== undefined) throw new HistoryConfigError(`${where}.retention takes records and age only`);
 			return { name, kind: "d1", binding: text(raw.binding, `${where}.binding`, BINDING), retention: kept };
 		case "blob": {
-			only(raw, where, ["name", "kind", "store", "retention", "segments", "cache", "readable"]);
-			const segments = object(raw.segments, `${where}.segments`);
-			only(segments, `${where}.segments`, ["records", "bytes", "compact"]);
+			only(raw, where, ["name", "kind", "store", "retention", "cache", "readable"]);
 			const cache = object(raw.cache, `${where}.cache`);
 			only(cache, `${where}.cache`, ["bytes"]);
-			if (segments.compact !== undefined && segments.compact !== "final" && segments.compact !== "off") throw new HistoryConfigError(`${where}.segments.compact must be "final" or "off"`);
 			if (raw.readable !== undefined && typeof raw.readable !== "boolean") throw new HistoryConfigError(`${where}.readable must be true or false`);
 			return {
 				name, kind: "blob", store: blobStore(raw.store, `${where}.store`), retention: kept, readable: raw.readable !== false,
-				segments: {
-					records: segments.records === undefined ? 1_000 : integer(segments.records, `${where}.segments.records`, { min: 1, max: 100_000 }),
-					bytes: segments.bytes === undefined ? 1_000_000 : parseSize(segments.bytes, `${where}.segments.bytes`),
-					// Folding records is off unless asked for: see BlobHistoryTier on moves back and forth.
-					compact: segments.compact === "final",
-				},
 				cacheBytes: cache.bytes === undefined ? 8 * 1_048_576 : parseSize(cache.bytes, `${where}.cache.bytes`),
 			};
 		}
@@ -215,7 +204,7 @@ function tier(value: unknown, index: number): TierSettings {
 function exported(value: unknown, index: number): ExportSettings {
 	const where = `exports[${index}]`;
 	const raw = object(value, where);
-	only(raw, where, ["name", "every", "store", "key", "keep", "compact", "encrypt"]);
+	only(raw, where, ["name", "every", "store", "key", "keep", "encrypt"]);
 	const encrypt = raw.encrypt === undefined ? undefined : object(raw.encrypt, `${where}.encrypt`);
 	if (encrypt) only(encrypt, `${where}.encrypt`, ["key_secrets"]);
 	const key = raw.key === undefined ? "{server}-{name}-{date}.jsonl" : text(raw.key, `${where}.key`);
@@ -226,7 +215,6 @@ function exported(value: unknown, index: number): ExportSettings {
 		store: blobStore(raw.store, `${where}.store`),
 		key,
 		keep: raw.keep === undefined ? 14 : integer(raw.keep, `${where}.keep`, { min: 1, max: 1_000 }),
-		compact: raw.compact === undefined ? true : raw.compact === true,
 		...(encrypt ? { encrypt: { keySecrets: secrets(encrypt.key_secrets, `${where}.encrypt.key_secrets`) } } : {}),
 	};
 }

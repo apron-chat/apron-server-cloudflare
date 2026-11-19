@@ -6,9 +6,7 @@
  * The file: a header (no `you`: a server export is no one's view), one
  * listing part with every room as `not_joined`, then each room's records in
  * log order, a page at a time, each page preceded by the users it names
- * that no earlier part did. With `compact`, a room's records are compacted
- * (PROTOCOL §4.3.4) as a whole, so that room is held in memory while it is
- * written; without it, nothing past a page is.
+ * that no earlier part did. Nothing past a page is held in memory.
  *
  * Further sections (uploads, ...) write their own parts after history's
  * (ArchiveSection); history is the only one so far.
@@ -16,19 +14,22 @@
 
 import type { HistoryPipeline } from "../pipeline";
 import type { ChatRecord, Clock } from "../records";
-import { compact as compactRecords } from "../render";
 import type { ArchiveHeader, ArchivedRoom, ArchivedUser, ArchiveReader, ArchiveWriter } from "./types";
 
 export interface ExportOptions {
 	/** Only these rooms (default: every room). */
 	roomIds?: readonly string[];
-	/** Compact each room's records (PROTOCOL §4.3.4). */
-	compact?: boolean;
 	/** Header fields: `server` above all, and `media`. */
 	header?: Partial<ArchiveHeader>;
 	clock: Clock;
 	/** Log IDs read per page (default 500). */
 	pageSize?: number;
+	/**
+	 * Makes a page's records what clients would get: the runtime puts back
+	 * terminal output kept in R2 for its internal `output_ref`, which must
+	 * never leave the server.
+	 */
+	prepare?: (records: ChatRecord[]) => Promise<ChatRecord[]>;
 }
 
 export interface ExportReport {
@@ -102,22 +103,12 @@ export const historySection: ArchiveSection<HistoryPipeline, HistoryPipeline> = 
 		await out.listing({ not_joined: listings, users: await userPart(named) });
 		let records = 0;
 		for (const room of rooms) {
-			const pages: ChatRecord[][] = [];
-			for await (const page of roomRecords(pipeline, room.listing.room_id, options.pageSize)) {
-				if (options.compact) pages.push(page);
-				else {
-					const users: ArchivedUser[] = await userPart(page.flatMap(namedUsers));
-					if (users.length) await out.listing({ users });
-					await out.records(page);
-					records += page.length;
-				}
-			}
-			if (options.compact && pages.length) {
-				const compacted = compactRecords(pages.flat());
-				const users = await userPart(compacted.flatMap(namedUsers));
+			for await (const read of roomRecords(pipeline, room.listing.room_id, options.pageSize)) {
+				const page = options.prepare ? await options.prepare(read) : read;
+				const users: ArchivedUser[] = await userPart(page.flatMap(namedUsers));
 				if (users.length) await out.listing({ users });
-				await out.records(compacted);
-				records += compacted.length;
+				await out.records(page);
+				records += page.length;
 			}
 		}
 		return { rooms: rooms.length, users: listed.size, records };

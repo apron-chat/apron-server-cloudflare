@@ -10,8 +10,8 @@ import { type HistoryTier, MemoryTierStateStore, type TierState } from "../../sr
 import { Model, pick, prng, seeds, show } from "./model";
 
 const state = (floor: number, target = floor, through = floor - 1, ops = 0): TierState => ({ floor, target, through, ops });
-const view = (name: string, tierState: TierState, extra: Partial<TierView> = {}): TierView => ({ name, readable: true, rewritable: true, multiRoom: true, upkeep: false, state: tierState, ...extra });
-const progress = () => ({ targeted: new Set<number>(), advanced: new Map<number, number>(), trimmed: new Map<number, number>(), upkept: new Set<number>() });
+const view = (name: string, tierState: TierState, extra: Partial<TierView> = {}): TierView => ({ name, readable: true, rewritable: true, multiRoom: true, state: tierState, ...extra });
+const progress = () => ({ targeted: new Set<number>(), advanced: new Map<number, number>(), trimmed: new Map<number, number>() });
 
 describe("planStep", () => {
 	it("applies the op log first, to each rewritable tier below the head in turn", () => {
@@ -145,10 +145,10 @@ const compositions: Composition[] = [
 		{ tier: new MemoryHistoryTier("recent"), retention: { records: 8, thresholdPercent: 100 } },
 		{ tier: appendOnly("cold"), retention: { thresholdPercent: 100 } },
 	] },
-	// Small segments that compaction merges (records left as they are, so pages match the model's), trimmed by count.
+	// Small segments (one per room per copied batch), trimmed by count.
 	{ name: "head → recent (memory) → cold (blob over MemoryBlobStore)", headRetention: { records: 6, thresholdPercent: 80 }, rewritableOnly: false, stages: () => [
 		{ tier: new MemoryHistoryTier("recent"), retention: { records: 8, thresholdPercent: 100 } },
-		{ tier: new BlobHistoryTier({ name: "cold", store: new MemoryBlobStore(), index: new MemorySegmentIndex(), prefix: "history/model/", clock: { now: () => 0 }, segmentRecords: 6, compactRecords: false }), retention: { records: 30, thresholdPercent: 100 } },
+		{ tier: new BlobHistoryTier({ name: "cold", store: new MemoryBlobStore(), index: new MemorySegmentIndex(), prefix: "history/model/", clock: { now: () => 0 } }), retention: { records: 30, thresholdPercent: 100 } },
 	] },
 ];
 

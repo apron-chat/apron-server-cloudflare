@@ -60,6 +60,8 @@ export interface ImportReport {
 	records: number;
 	duplicates: number;
 	expired: number;
+	/** Records the file holds only as references (ARCHIVE.md §3.1): of rooms it does not list, or below a room's `history_log_id`. */
+	references: number;
 	/** Log and message IDs that moved (§10.3), and user IDs that changed (§10.4). */
 	remapped: { logIds: Record<string, string>; users: Record<string, string> };
 	/** Records placed per tier. */
@@ -129,6 +131,19 @@ function contentKey(record: ChatRecord): string {
 	return `${record.kind}\u0000${canonicalJson(rest)}`;
 }
 
+/** A message record without any embed's `output_ref`. */
+function withoutOutputRefs(record: ChatRecord): ChatRecord {
+	if (record.kind !== "message" || !record.record_json.includes('"output_ref"')) return record;
+	const value = JSON.parse(record.record_json) as { body?: { embeds?: unknown[] } };
+	if (!Array.isArray(value.body?.embeds)) return record;
+	value.body.embeds = value.body.embeds.map((embed) => {
+		if (!embed || typeof embed !== "object" || !("output_ref" in embed)) return embed;
+		const { output_ref: _ref, ...rest } = embed as Record<string, unknown>;
+		return rest;
+	});
+	return { ...record, record_json: JSON.stringify(value) };
+}
+
 /** Looks up existing records in batches, by log ID. */
 async function existing(pipeline: HistoryPipeline, ids: readonly number[]): Promise<Map<number, ChatRecord[]>> {
 	const found = new Map<number, ChatRecord[]>();
@@ -171,7 +186,7 @@ export async function importArchive(pipeline: HistoryPipeline, input: ArchiveRea
 	const archive = "parts" in input ? await collectArchive(input) : input;
 	const head = pipeline.head;
 	const report: ImportReport = {
-		roomsAdded: [], roomsSkipped: [], users: {}, records: 0, duplicates: 0, expired: 0,
+		roomsAdded: [], roomsSkipped: [], users: {}, records: 0, duplicates: 0, expired: 0, references: 0,
 		remapped: { logIds: {}, users: {} }, placed: {}, dryRun: Boolean(options.dryRun), resumed: false,
 	};
 	// An earlier run of this import that failed partway is finished with its own plan.
@@ -186,10 +201,22 @@ export async function importArchive(pipeline: HistoryPipeline, input: ArchiveRea
 		report.resumed = true;
 	}
 
-	// Rooms: the listed ones, and any that only records name.
+	// Rooms: the listed ones (a later listing replaces an earlier one). A
+	// record of a room the file does not list, or below its room's
+	// `history_log_id` (all of them where it is null), is a reference
+	// (ARCHIVE.md §3.1), there for a `reply_to`: not imported.
 	const rooms = new Map<string, ArchivedRoom>();
 	for (const room of archive.rooms) rooms.set(room.listing.room_id, room);
-	for (const record of archive.records) if (!rooms.has(record.room_id)) rooms.set(record.room_id, { listing: { room_id: record.room_id }, joined: false });
+	const stretchStart = (roomId: string): number | undefined => {
+		const listed = rooms.get(roomId)?.listing.history_log_id;
+		return listed === null ? Number.POSITIVE_INFINITY : listed === undefined ? undefined : Number(listed);
+	};
+	const inStretch = archive.records.filter((record) => {
+		if (!rooms.has(record.room_id)) return false;
+		const start = stretchStart(record.room_id);
+		return start === undefined || record.log_id >= start;
+	});
+	report.references = archive.records.length - inStretch.length;
 	// New rooms: those absent here, a room with nothing logged past its
 	// creation (a new server's `general`), and those an unfinished run began.
 	const fresh = new Set<string>();
@@ -200,9 +227,9 @@ export async function importArchive(pipeline: HistoryPipeline, input: ArchiveRea
 	// A move is read back once, in the room it moved to: its copy in the room
 	// it left is made again when that room is new, whether or not the room it
 	// went to is (else the message would show where it was before).
-	const all = [...archive.records];
+	const all = [...inStretch];
 	const held = new Set(all.map((record) => `${record.log_id}\u0000${record.room_id}`));
-	for (const record of archive.records) {
+	for (const record of inStretch) {
 		if (record.kind !== "message") continue;
 		const previous = (JSON.parse(record.record_json) as { prev_room_id?: string }).prev_room_id;
 		if (previous && previous !== record.room_id && fresh.has(previous) && !held.has(`${record.log_id}\u0000${previous}`)) {
@@ -210,7 +237,8 @@ export async function importArchive(pipeline: HistoryPipeline, input: ArchiveRea
 			held.add(`${record.log_id}\u0000${previous}`);
 		}
 	}
-	let records = all.filter((record) => fresh.has(record.room_id)).sort(byLog);
+	// An embed's `output_ref` names this server's own storage: never taken from a file, as a client's is dropped (Store.normalizedBody).
+	let records = all.filter((record) => fresh.has(record.room_id)).map(withoutOutputRefs).sort(byLog);
 	// A room's bounds where its listing lacks them: from its records, so its history starts and ends where they do.
 	for (const roomId of fresh) {
 		const own = records.filter((record) => record.room_id === roomId);

@@ -13,7 +13,6 @@ export interface TierView {
 	readable: boolean;
 	rewritable: boolean;
 	multiRoom: boolean;
-	upkeep: boolean;
 	state: TierState;
 }
 
@@ -30,8 +29,6 @@ export interface PipelineSnapshot {
 	advanced: ReadonlyMap<number, number>;
 	/** The floor each tier was last trimmed below, completely. */
 	trimmed: ReadonlyMap<number, number>;
-	/** Tiers whose upkeep ran this cycle. */
-	upkept: ReadonlySet<number>;
 }
 
 export type Step =
@@ -47,8 +44,6 @@ export type Step =
 	| { kind: "trim"; tier: number; below: number }
 	/** Raise the head's published floor. */
 	| { kind: "publish"; floor: number }
-	/** A tier's own upkeep (compaction). */
-	| { kind: "upkeep"; tier: number }
 	| { kind: "idle" };
 
 /** The rewritable tiers /purge and /rename reach: the head and each following one, up to the first that is not (decision 3). */
@@ -77,7 +72,7 @@ export function allowedFloor(tiers: readonly TierView[], index: number): number 
  * The next step of a cycle (PLAN §6): first the op log for the rewritable
  * tiers below the head; then bottom-up, so space is made before it is
  * filled, each tier's target, copy of what is below it to the next tier,
- * advance and trim; then the published floor; then upkeep.
+ * advance and trim; then the published floor.
  */
 export function planStep(snapshot: PipelineSnapshot): Step {
 	const { tiers } = snapshot;
@@ -104,9 +99,6 @@ export function planStep(snapshot: PipelineSnapshot): Step {
 			trimTo = Math.min(trimTo, snapshot.published);
 		}
 		if ((snapshot.trimmed.get(index) ?? 0) < trimTo) return { kind: "trim", tier: index, below: trimTo };
-	}
-	for (let index = 0; index <= last; index += 1) {
-		if (tiers[index].upkeep && !snapshot.upkept.has(index)) return { kind: "upkeep", tier: index };
 	}
 	return { kind: "idle" };
 }

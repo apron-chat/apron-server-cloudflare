@@ -51,8 +51,10 @@ export interface BuildOptions {
 	track?: HistoryTrack;
 	/** The segment index for a blob tier, by tier name (the Store's SQLite in the Durable Object). */
 	segmentIndex?: (tier: string) => SegmentIndex;
-	/** This server's name, in blob segments' headers. */
+	/** This server's name, in blob segments' keys. */
 	server?: string;
+	/** This server's WebSocket URL, in blob segments' headers (ARCHIVE.md §2). */
+	serverUrl?: string;
 }
 
 /** The head's retention, from the limits: its own count, age ceiling and minimum age. */
@@ -112,9 +114,8 @@ const TIER_FACTORIES: Record<Exclude<TierSettings["kind"], "sqlite">, Factory> =
 		if (!store || !options.segmentIndex) return undefined;
 		const tier = new BlobHistoryTier({
 			name: settings.name, store, index: options.segmentIndex(settings.name), prefix: `${settings.store.prefix}${options.server ?? "server"}/`,
-			header: { ...(options.server ? { server: options.server } : {}) }, clock: options.clock,
-			segmentRecords: settings.segments.records, segmentBytes: settings.segments.bytes, cacheBytes: settings.cacheBytes,
-			compactRecords: settings.segments.compact,
+			header: { ...(options.serverUrl ?? options.server ? { server: options.serverUrl ?? options.server } : {}) }, clock: options.clock,
+			cacheBytes: settings.cacheBytes,
 		});
 		return {
 			tier: instrument(tier, (method, call) => track(options)("r2", method, call)),

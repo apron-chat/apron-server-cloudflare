@@ -2,7 +2,7 @@ import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { encryptingSink, resolveKeys } from "../../src/history/archive/crypto";
 import { exportArchive } from "../../src/history/archive/export";
-import { collectArchive, jsonlReader, jsonlWriter, linesOf } from "../../src/history/archive/format";
+import { collectArchive, jsonlReader, jsonlWriter, linesOf, writeArchiveToString } from "../../src/history/archive/format";
 import { archiveReader, importArchive, place, restoreBatches } from "../../src/history/archive/import";
 import type { ArchivedUser } from "../../src/history/archive/types";
 import { MemoryBlobStore } from "../../src/history/blob/memory";
@@ -12,7 +12,7 @@ import { MemorySegmentIndex } from "../../src/history/blob/segments";
 import { BlobHistoryTier } from "../../src/history/blob/tier";
 import { MemoryHead, MemoryHistoryTier } from "../../src/history/memory";
 import { HistoryPipeline, type PipelineStage } from "../../src/history/pipeline";
-import { compareRenderedState, renderedState } from "../../src/history/render";
+import { compareRenderedState, renderedState } from "./render";
 import { MemoryTierStateStore } from "../../src/history/tier";
 import { sceneArchives } from "../fixtures/archives";
 
@@ -28,7 +28,7 @@ function pipelineOf(composition: Composition, clock = new TestClock()) {
 	const stages: PipelineStage[] = [];
 	if (composition !== "head") stages.push({ tier: new MemoryHistoryTier("recent"), retention: { records: 8, thresholdPercent: 100 } });
 	if (composition === "head+recent+cold") {
-		stages.push({ tier: new BlobHistoryTier({ name: "cold", store: new MemoryBlobStore(), index: new MemorySegmentIndex(), prefix: "history/test/", clock, segmentRecords: 5, compactRecords: false }), retention: { thresholdPercent: 100 } });
+		stages.push({ tier: new BlobHistoryTier({ name: "cold", store: new MemoryBlobStore(), index: new MemorySegmentIndex(), prefix: "history/test/", clock }), retention: { thresholdPercent: 100 } });
 	}
 	const pipeline = new HistoryPipeline({ head, headRetention: { records: 6, thresholdPercent: 100 }, stages, state: new MemoryTierStateStore(), clock, batch: 4 });
 	return { head, pipeline, clock };
@@ -72,9 +72,9 @@ function populate(head: MemoryHead, clock: TestClock): void {
 	head.commit("general", "membership", { members: [{ user: { user_id: "bob" }, joined: false }] });
 }
 
-async function exported(pipeline: HistoryPipeline, clock: TestClock, options: { compact?: boolean; server?: string } = {}): Promise<string> {
+async function exported(pipeline: HistoryPipeline, clock: TestClock, options: { server?: string } = {}): Promise<string> {
 	const lines: string[] = [];
-	await exportArchive(pipeline, jsonlWriter(async (line) => { lines.push(line); }), { clock, compact: options.compact, header: { server: options.server ?? "source.test" } });
+	await exportArchive(pipeline, jsonlWriter(async (line) => { lines.push(line); }), { clock, header: { server: options.server ?? "source.test" } });
 	return lines.join("");
 }
 
@@ -103,16 +103,6 @@ describe("export and import", () => {
 			});
 		}
 	}
-
-	it("keeps rendered state through compaction", async () => {
-		const source = pipelineOf("head+recent");
-		populate(source.head, source.clock);
-		await settle(source.pipeline);
-		const plain = await exported(source.pipeline, source.clock);
-		const compacted = await exported(source.pipeline, source.clock, { compact: true });
-		expect(compacted.length).toBeLessThan(plain.length);
-		expect(compareRenderedState(await stateOf(plain), await stateOf(compacted)).differences).toEqual([]);
-	});
 
 	it("adds nothing when the same archive is imported again", async () => {
 		const source = pipelineOf("head");
@@ -318,5 +308,24 @@ describe("export and import", () => {
 			"backups/srv-daily-20261120-000000.jsonl", "backups/srv-daily-20261121-000000.jsonl",
 			"backups/srv-daily-full-20261120-000000.jsonl", "backups/srv-daily-full-20261121-000000.jsonl",
 		]);
+	});
+
+	it("imports a room's stretch only: records of unlisted rooms or below history_log_id are references; output_ref is dropped", async () => {
+		const message = (room: string, logId: number, extra: Record<string, unknown> = {}) => JSON.stringify({ message_id: String(logId), log_id: String(logId), room_id: room, from: { user_id: "ada" }, body: { text: `m${logId}`, ...extra } });
+		const text = await writeArchiveToString(async (writer) => {
+			await writer.header({ apron_archive: 1, server: "wss://elsewhere.test/" });
+			await writer.listing({ not_joined: [{ room_id: "lobby", log_id: "100", history_log_id: "100", latest_log_id: "150" }] });
+			await writer.records([
+				{ room_id: "lobby", log_id: 50, commit_ms: 50, kind: "message", record_json: message("lobby", 50) },
+				{ room_id: "lobby", log_id: 150, commit_ms: 150, kind: "message", record_json: message("lobby", 150, { embeds: [{ kind: "terminal", output_ref: { key: "f/AAAAAAAAAAAAAAAAAAAAAA", bytes: 3 } }] }) },
+				{ room_id: "elsewhere", log_id: 120, commit_ms: 120, kind: "message", record_json: message("elsewhere", 120) },
+			]);
+		});
+		const target = pipelineOf("head", new TestClock(1));
+		const report = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock });
+		expect(report).toMatchObject({ roomsAdded: ["lobby"], records: 1, references: 2 });
+		const stored = target.head.all().filter((record) => record.kind === "message");
+		expect(stored.map((record) => record.log_id)).toEqual([150]);
+		expect(stored[0].record_json).not.toContain("output_ref");
 	});
 });

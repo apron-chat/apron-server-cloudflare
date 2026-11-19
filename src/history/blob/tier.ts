@@ -17,9 +17,9 @@
  *   joined-rooms pages here). Segments overlapping the window are fetched a
  *   few at a time, in page order, until the page is full; decoded segments
  *   are cached by key up to a byte cap. Where segments overlap (a crash
- *   during a merge leaves both), records are de-duplicated by room and log
- *   ID. An indexed segment whose object is missing reads as empty and is
- *   dropped from the index.
+ *   during an append's merge leaves both), records are de-duplicated by
+ *   room and log ID. An indexed segment whose object is missing reads as
+ *   empty and is dropped from the index.
  * - Retention: by count (`records`, counting each room's copy) and bytes
  *   over whole segments, and by age with a segment's `last` as its time
  *   (log IDs are commit times, PROTOCOL §2.1). floorFor returns a segment's
@@ -30,14 +30,11 @@
  * - Trimming removes a segment from the index, then deletes its object: a
  *   crash in between leaves an unindexed object, which reads never see; an
  *   index rebuilt with `floor` skips it (segments.ts, RebuildOptions).
- * - Compaction (upkeep): a room's adjacent small segments that are final
- *   (wholly below `final`, the floor of the last rewritable tier) merge into
- *   one up to `segmentRecords` / `segmentBytes`, compacted per PROTOCOL
- *   §4.3.4 unless `compactRecords` is false. Segments that overlap merge
- *   whatever their size. The new segment is written and indexed before the
- *   old ones leave the index and then the store, so a crash at any point
- *   leaves either both (reads de-duplicate, the next upkeep merges them) or
- *   the new one.
+ * - Segments stay as appended: nothing merges or compacts them later. An
+ *   append's merge writes and indexes the new segment before the old ones
+ *   leave the index and then the store, so a crash at any point leaves
+ *   either both (reads de-duplicate them, and the next append or trim over
+ *   that stretch merges them) or the new one.
  *
  * Deliberately not a RewritableTier: /purge and /rename stop above it
  * (decision 3).
@@ -49,20 +46,15 @@
 import { jsonlWriter, utf8Length } from "../archive/format";
 import type { ArchiveHeader, ArchivedUser, RoomListing } from "../archive/types";
 import { type ChatRecord, type Clock, type HistoryQuery, type RecordRange, type Retention, type TierStats, byLog, limitByLogId, thresholdCount, toRange } from "../records";
-import { compact } from "../render";
 import type { FloorContext, HistoryTier } from "../tier";
 import { type SegmentCursor, type SegmentIndex, type SegmentRef, decodeSegment, segmentKey } from "./segments";
 import type { BlobStore } from "./store";
 
-export const DEFAULT_SEGMENT_RECORDS = 1_000;
-export const DEFAULT_SEGMENT_BYTES = 1_000_000;
 export const DEFAULT_CACHE_BYTES = 8 * 1024 * 1024;
 /** Segments fetched at once by a read. */
 const READ_PARALLEL = 4;
 /** Segments a scan asks the index for at a time. */
 const SCAN_PAGE = 16;
-/** Rooms one upkeep step looks at for something to merge. */
-const UPKEEP_ROOMS = 32;
 
 export interface BlobHistoryTierOptions {
 	name: string;
@@ -73,13 +65,8 @@ export interface BlobHistoryTierOptions {
 	/** Each segment's header (`server` and the like); `apron_archive` and `exported_at` are set here. */
 	header?: Partial<ArchiveHeader>;
 	clock: Clock;
-	/** Compaction's targets for a merged segment. */
-	segmentRecords?: number;
-	segmentBytes?: number;
 	/** The decoded-segment cache's cap, by object size. 0 turns it off. */
 	cacheBytes?: number;
-	/** Whether compaction also folds records (PROTOCOL §4.3.4). Default true. */
-	compactRecords?: boolean;
 }
 
 /** A small LRU cache of decoded segments, by key, capped by object size. */
@@ -139,12 +126,7 @@ export class BlobHistoryTier implements HistoryTier {
 	private readonly prefix: string;
 	private readonly header: Partial<ArchiveHeader>;
 	private readonly clock: Clock;
-	private readonly segmentRecords: number;
-	private readonly segmentBytes: number;
-	private readonly compactRecords: boolean;
 	private readonly cache: SegmentCache;
-	/** Where upkeep looks for rooms to merge next. */
-	private upkeepRoom = "";
 
 	constructor(options: BlobHistoryTierOptions) {
 		this.name = options.name;
@@ -153,9 +135,6 @@ export class BlobHistoryTier implements HistoryTier {
 		this.prefix = options.prefix;
 		this.header = options.header ?? {};
 		this.clock = options.clock;
-		this.segmentRecords = options.segmentRecords ?? DEFAULT_SEGMENT_RECORDS;
-		this.segmentBytes = options.segmentBytes ?? DEFAULT_SEGMENT_BYTES;
-		this.compactRecords = options.compactRecords ?? true;
 		this.cache = new SegmentCache(options.cacheBytes ?? DEFAULT_CACHE_BYTES);
 	}
 
@@ -428,74 +407,6 @@ export class BlobHistoryTier implements HistoryTier {
 			removed += records.length - kept.length;
 		}
 		return removed;
-	}
-
-	/** Compaction: up to `budget.steps` merges, each of one room's run of final segments. Whether it merged any. */
-	async upkeep(budget: { steps: number }, context: { final: number }): Promise<boolean> {
-		let merged = false;
-		for (let step = 0; step < budget.steps; step += 1) {
-			const rooms = await this.index.rooms();
-			if (!rooms.length) break;
-			const start = rooms.findIndex((room) => room >= this.upkeepRoom);
-			const order = start <= 0 ? rooms : [...rooms.slice(start), ...rooms.slice(0, start)];
-			let did = false;
-			for (const roomId of order.slice(0, UPKEEP_ROOMS)) {
-				this.upkeepRoom = roomId;
-				if (await this.compact(roomId, { final: context.final })) {
-					did = true;
-					break;
-				}
-			}
-			if (!did) {
-				// Nothing in these rooms: start after them next time.
-				const after = order[Math.min(order.length, UPKEEP_ROOMS) % order.length];
-				this.upkeepRoom = after ?? "";
-				break;
-			}
-			merged = true;
-		}
-		return merged;
-	}
-
-	/** The first run of a room's segments that compaction would merge, or undefined. */
-	async mergeable(roomId: string, final: number): Promise<SegmentRef[] | undefined> {
-		const refs = (await this.index.forRoom(roomId)).filter((ref) => ref.last < final);
-		for (let start = 0; start < refs.length - 1; start += 1) {
-			const run = [refs[start]];
-			let records = refs[start].records;
-			let bytes = refs[start].bytes;
-			let reach = refs[start].last;
-			for (let next = start + 1; next < refs.length; next += 1) {
-				const ref = refs[next];
-				const overlaps = ref.first <= reach;
-				if (!overlaps && (records + ref.records > this.segmentRecords || bytes + ref.bytes > this.segmentBytes)) break;
-				run.push(ref);
-				records += ref.records;
-				bytes += ref.bytes;
-				reach = Math.max(reach, ref.last);
-			}
-			if (run.length > 1) return run;
-		}
-		return undefined;
-	}
-
-	/**
-	 * Merges the room's first mergeable run (see the top of the file); returns
-	 * how many segments it replaced (0: nothing to merge). Idempotent.
-	 */
-	async compact(roomId: string, options: { final: number }): Promise<number> {
-		const run = await this.mergeable(roomId, options.final);
-		if (!run) return 0;
-		const records = [...dedupe((await Promise.all(run.map((ref) => this.load(ref)))).flat()).values()].sort(byLog);
-		const bounds = { first: Math.min(...run.map((ref) => ref.first)), last: Math.max(...run.map((ref) => ref.last)) };
-		if (!records.length) {
-			await this.discard(run);
-			return run.length;
-		}
-		const ref = await this.write(roomId, this.compactRecords ? compact(records) : records, bounds);
-		await this.index.add([ref]);
-		await this.discard(run.filter((old) => old.key !== ref.key));
-		return run.length;
 	}
 
 	/** Restores a lost index from the store (segments.ts, rebuildSegmentIndex). */

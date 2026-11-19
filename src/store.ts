@@ -4327,7 +4327,7 @@ export class Store {
     if (records.length > RESTORE_RECORDS_BATCH) throw new StoreError("invalid_params", `At most ${RESTORE_RECORDS_BATCH} records are restored a call`);
     const batch = records.map((record) => restoredRecord(roomId, record)).sort((a, b) => a.log_id - b.log_id);
     if (batch.some((record, index) => index > 0 && record.log_id === batch[index - 1].log_id)) throw new StoreError("invalid_params", "Two restored records share a log_id");
-    // One record alone may hold more (a compacted export folds a room's memberships into one), up to RESTORE_ENTRIES_SINGLE.
+    // One record alone may hold more (an archive its writer compacted folds a room's memberships into one), up to RESTORE_ENTRIES_SINGLE.
     const entries = batch.reduce((sum, record) => sum + restoredEntries(record), 0);
     if (entries > (batch.length === 1 ? RESTORE_ENTRIES_SINGLE : RESTORE_ENTRIES_BATCH)) {
       throw new StoreError("invalid_params", `A call restores at most ${RESTORE_ENTRIES_BATCH} reaction sets and members, or one record of at most ${RESTORE_ENTRIES_SINGLE}`);

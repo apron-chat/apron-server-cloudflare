@@ -35,8 +35,6 @@ export interface HistoryTier {
 	floorFor(retention: Retention, context: FloorContext): Promise<number | undefined>;
 	/** Deletes records below `floor`, at most `max` (blob tiers: whole segments only); returns how many went. */
 	trimBelow(floor: number, max: number): Promise<number>;
-	/** Upkeep a tier may want when nothing else is due (the blob tier's compaction); returns whether it did any. */
-	upkeep?(budget: { steps: number }, context: { final: number }): Promise<boolean>;
 }
 
 /** What a purge found that the tiers above may still refer to. */

@@ -884,7 +884,6 @@ retention = { records = 100_000 }
 name = "cold"
 kind = "blob"
 store = { provider = "r2", binding = "HISTORY_BLOB", prefix = "history/" }
-segments = { records = 1_000, bytes = "1MB", compact = "off" }
 # cache = { bytes = "8MiB" }   # decoded segments kept in memory
 # readable = true              # false: written, never read by history
 
@@ -940,12 +939,10 @@ key_secrets = ["HISTORY_BACKUP_KEY_2025"]
   out, so the blob tier is off where no bucket is bound, as in production
   now; with no tier left below SQLite, records expire as they leave it.
   Exports whose store is missing are skipped.
-- **Blob segments.** `segments.records` (1 to 100,000; 1,000) and
-  `segments.bytes` (1 MB) are the sizes compaction merges a room's small
-  segments up to, once they are below every rewritable tier's floor;
-  `compact = "final"` also compacts their records (PROTOCOL.md §4.3.4), and
-  `"off"`, the default, keeps every record. `cache.bytes` (8 MiB) caps the
-  decoded segments a reading object keeps.
+- **Blob segments.** Each copy into a blob tier writes one segment per room
+  it names, and segments stay as written: they are never merged or
+  compacted later. `cache.bytes` (8 MiB) caps the decoded segments a
+  reading object keeps.
 - **Previews** read `[previews.vars]`, not `[vars]`; give them a `HISTORY` of
   their own there, if any. They bind no D1 database and no bucket.
 
@@ -954,9 +951,9 @@ key_secrets = ["HISTORY_BACKUP_KEY_2025"]
 A backup is the whole server's history, or some rooms', as one ARCHIVE.md
 v1 file in a blob store (`src/history/exports.ts`; [SPEC section
 9](../SPEC.md#backups-and-imports)): every room and its members, the users
-records name, and the records of every tier, compacted unless `compact =
-false`. It is written as a stream (an R2 multipart upload), and a failure
-leaves no object. Each backup is named after its export and the time,
+records name, and the records of every tier, as they are logged. It is
+written as a stream (an R2 multipart upload), and a failure leaves no
+object. Each backup is named after its export and the time,
 `<RP_ID>-<name>-<date>.jsonl` by default (`key`, which must contain `{date}`
 and may contain `{server}` and `{name}`), and after writing one, the export
 deletes its own backups past the newest `keep` (14 by default).

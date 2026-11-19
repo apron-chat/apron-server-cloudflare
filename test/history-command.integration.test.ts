@@ -48,7 +48,8 @@ it('backs history up to the backup store, and imports a foreign archive as a new
 		expect(key, exported.notice).toMatch(/^backups\/localhost-manual-\d{8}-\d{6}\.jsonl$/);
 		const object = await env.HISTORY_BLOB!.get(key!);
 		const archive = await collectArchive(jsonlReader(linesOf(await object!.text())));
-		expect(archive.header).toMatchObject({ apron_archive: 1, server: 'localhost' });
+		// ARCHIVE.md §2: the server's WebSocket URL, and the origins its media loads from.
+		expect(archive.header).toMatchObject({ apron_archive: 1, server: 'wss://demo.test/', media: ['https://demo.test', 'https://media.test'] });
 		expect(archive.records.some((record) => record.record_json.includes('backed up 2'))).toBe(true);
 
 		// This server's own backup: the room exists, so nothing is added.
@@ -89,4 +90,16 @@ it('backs history up to the backup store, and imports a foreign archive as a new
 	} finally {
 		admin.close();
 	}
+});
+
+it('puts terminal output kept in R2 back into exported records, never the internal reference', async () => {
+	await env.MEDIA!.put('f/AAAAAAAAAAAAAAAAAAAAAA', 'build ok');
+	const records = await runInDurableObject(stub(), (instance) => {
+		const runtime = instance as unknown as { exportRecords(records: unknown[]): Promise<Array<{ record_json: string }>> };
+		const embed = { kind: 'terminal', title: 'build', output_ref: { key: 'f/AAAAAAAAAAAAAAAAAAAAAA', bytes: 8 } };
+		return runtime.exportRecords([{ room_id: 'general', log_id: 5, commit_ms: 5, kind: 'message', record_json: JSON.stringify({ message_id: '5', log_id: '5', room_id: 'general', from: { user_id: 'ada' }, body: { text: '', embeds: [embed] } }) }]);
+	});
+	const embed = JSON.parse(records[0].record_json).body.embeds[0];
+	expect(embed.output_ref).toBeUndefined();
+	expect(embed.output).toBe('build ok');
 });
