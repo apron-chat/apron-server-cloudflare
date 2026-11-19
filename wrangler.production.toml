@@ -83,9 +83,9 @@ PUSH_HOSTS_EXTRA = "push.stupidtech.net"
 # the oldest move here, where history pages still read them, but their
 # messages can no longer be edited, reacted to or replied to. The archive
 # keeps archiveRecords (LIMIT_ARCHIVE_RECORDS) of them, then they expire.
-# Both counts are ceilings: cleanup keeps cleanupThresholdPercent
-# (LIMIT_CLEANUP_THRESHOLD_PERCENT, 80) of each, and runs early once the
-# object's SQLite passes its share.
+# Both counts are ceilings: once a day, cleanup moves what is past
+# cleanupThresholdPercent (LIMIT_CLEANUP_THRESHOLD_PERCENT, 80) of SQLite's
+# limit to D1, and expires what is past that share of D1's.
 # Without this binding, records past retentionRecords expire at once. The
 # object creates its table on first use. Previews bind none (below), so
 # theirs expire at once.

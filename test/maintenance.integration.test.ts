@@ -355,34 +355,26 @@ it("drops the hot log's reaction sets on messages that only the archive held, fo
 	});
 });
 
-it("keeps cleanupThresholdPercent of retentionRecords, and makes cleanup due once the hot log passes it", async () => {
+it("keeps cleanupThresholdPercent of retentionRecords: each daily cleanup trims back to it", async () => {
 	const config: Partial<StoreConfig> = {
 		retentionRecords: 10, cleanupThresholdPercent: 50, minRetentionMs: DAY_MS, retentionMs: 0,
 		anonymousPostsPerMinute: 1_000, ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000,
 	};
 	await withStore("threshold", config, (store, clock, state) => {
 		const count = () => Number(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM records").one().count);
-		// The general room's record and four messages: five, at the threshold, not past it.
-		for (let index = 0; index < 4; index += 1) {
+		// The general room's record and eight messages: nine, under the limit of 10 but past its 50%.
+		for (let index = 0; index < 8; index += 1) {
 			clock.value += 1_000;
 			store.mutate(messageInput(clock, `threshold-${index}`, `message ${index}`));
 		}
-		expect(count()).toBe(5);
-		const due = () => Number(state.storage.sql.exec<{ next_cleanup_ms: number }>("SELECT next_cleanup_ms FROM maintenance").one().next_cleanup_ms);
-		const scheduled = due();
-		expect(store.cleanupPastThreshold(clock.value)).toBe(false);
-		expect(due()).toBe(scheduled);
-		// Past it: cleanup is due now, not on its interval.
-		clock.value += 1_000;
-		store.mutate(messageInput(clock, "threshold-past", "one more"));
-		expect(store.cleanupPastThreshold(clock.value)).toBe(true);
-		expect(due()).toBeLessThanOrEqual(clock.value);
-		// Once the records are old enough, cleanup keeps 5 (50% of 10), not 10.
+		expect(count()).toBe(9);
+		// Once the records are old enough, the daily cleanup keeps 5 (50% of 10), not 10.
 		clock.value += 2 * DAY_MS;
 		state.storage.sql.exec("UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1");
 		store.forgetCleanupDue();
-		store.runCleanup(clock.value);
+		const cleaned = store.runCleanup(clock.value);
 		expect(count()).toBe(5);
-		expect(store.cleanupPastThreshold(clock.value)).toBe(false);
+		// And comes back a day later, not sooner.
+		expect(cleaned.next_due_ms).toBe(clock.value + DAY_MS);
 	});
 });

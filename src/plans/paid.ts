@@ -22,7 +22,7 @@
 //   it rather than requests: one timer keeps the object awake up to a minute
 //   after its last event while a status change waits to be announced.
 // - Storage: SQLite keeps the latest 4,000 records, 80% of its 5,000 limit
-//   (8,000 more go to the D1 archive where it is bound), and the database watermarks stop it at
+//   (80,000 more go to the D1 archive where it is bound), and the database watermarks stop it at
 //   768 MB (1 GB hard), a fifth of the 5 GB-month included. A week of the
 //   demo's traffic in November 2026 was about 800 message records and a
 //   1.5 MB database, so 5,000 records are a few MB;
@@ -49,9 +49,11 @@ export const PAID_PLAN: Plan = Object.freeze({
 	name: "Workers Paid",
 	limits: Object.freeze({
 		...FREE_PLAN.limits,
-		// The latest 5,000 records in the object's SQLite, however old, and
-		// 10,000 more in the history archive (D1) where it is bound: 15,000,
-		// about 18 weeks at the demo's traffic (above), a few MB each side.
+		// Limits of 5,000 records in the object's SQLite and 100,000 more in
+		// the history archive (D1) where it is bound, of which cleanup keeps
+		// 80% (below): 84,000, about two years at the demo's traffic (above).
+		// D1's share stays within its included 5 GB even were every archived
+		// record a maximum-size snapshot (80,000 × 24 KiB, about 1.9 GB).
 		// Records younger than three days stay whatever the count, so a flood
 		// cannot push out the last few days before an admin purges it; the
 		// database watermarks still bound what the flood itself stores. No age
@@ -60,10 +62,10 @@ export const PAID_PLAN: Plan = Object.freeze({
 		retentionRecords: 5_000,
 		minRetentionSeconds: 3 * 24 * 60 * 60,
 		retentionSeconds: 0,
-		archiveRecords: 10_000,
-		// Those are ceilings: cleanup keeps 80% of each (4,000 and 8,000, 12,000
-		// in all), and runs as soon as the hot log passes its 80%, so the rest
-		// is headroom for what arrives before it does.
+		archiveRecords: 100_000,
+		// Those are ceilings: each daily cleanup moves what is past 80% of
+		// SQLite's to D1, and expires what is past 80% of D1's (4,000 and
+		// 80,000 kept), so the rest is headroom for a day's records.
 		cleanupThresholdPercent: 80,
 		// Room for a long writeup in one message (about 2,500 words) rather
 		// than Free's 4 KiB. A post is kept once, as its record (message_state
@@ -292,11 +294,10 @@ export const PAID_PLAN: Plan = Object.freeze({
 		// still bound the server's writes and storage.
 		uploadsPerUserDay: 30,
 		writeWindowSeconds: 10 * 60,
-		// About as long as history keeps its messages: 12,000 to 15,000 records
-		// (retentionRecords and archiveRecords) were about 18 weeks of the
-		// demo's traffic in November 2026. A busier stretch expires messages
-		// sooner, and a quieter one leaves an older message without its image.
-		// The bucket's lifecycle rule for f/ must match: 120 days.
+		// About as long as the hot log keeps its messages and well into the
+		// archive's: history now spans about two years at the demo's traffic,
+		// so older messages show without their images. The bucket's
+		// lifecycle rule for f/ must match: 120 days.
 		fileRetentionSeconds: 120 * 24 * 60 * 60,
 		// An avatar is kept while its owner signs in: any sign-in within
 		// avatarRefreshSeconds of its expiry writes it again (refreshAvatar).

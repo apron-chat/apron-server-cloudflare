@@ -126,7 +126,7 @@ describe('configuration policy boundaries', () => {
 	});
 
 	it('keeps history by count, by age or both, but not by neither, and only the retention bounds take 0', () => {
-		expect(config().limits).toMatchObject({ retentionRecords: 5_000, minRetentionSeconds: 3 * 86_400, retentionSeconds: 0, archiveRecords: 10_000 });
+		expect(config().limits).toMatchObject({ retentionRecords: 5_000, minRetentionSeconds: 3 * 86_400, retentionSeconds: 0, archiveRecords: 100_000 });
 		expect(config({ LIMIT_ARCHIVE_RECORDS: '0' }).limits.archiveRecords).toBe(0);
 		expect(() => config({ LIMIT_ARCHIVE_RECORDS: '100001' })).toThrow('archiveRecords exceeds the calibrated bound');
 		expect(config().limits.cleanupThresholdPercent).toBe(80);

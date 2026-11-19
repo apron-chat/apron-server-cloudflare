@@ -141,8 +141,6 @@ const OBJECT_NAME = "public-demo-v1";
 const TERMINAL_OUTPUT_CACHE_BYTES = 8 * 1024 * 1024;
 /** How long cleanup waits for the archive between copies while D1 fails (runArchive); a second otherwise. */
 const ARCHIVE_RETRY_MS = 5 * 60_000;
-/** How often posts may count the hot log against what cleanup keeps (checkHistoryThreshold). */
-const HISTORY_THRESHOLD_CHECK_MS = 60 * 60_000;
 /** How long a `/purge` or `/rename` is applied to history pages that read the archive, past its own queue (recentArchiveOps). */
 const ARCHIVE_RECENT_OPS_MS = 10 * 60_000;
 /** Archived records one alarm deletes below the published floor at most, in batches of a fifth. */
@@ -2577,8 +2575,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private archiveFloorChecked = false;
 	/** The published floor the archive was last trimmed to (Archive.deleteBelow), this wake. */
 	private archiveTrimmed = 0;
-	/** When this wake last counted the hot log against what cleanup keeps (checkHistoryThreshold). */
-	private historyThresholdCheckedAt = 0;
 	/** When the archive's queued work may be tried again after a failure (runArchive); 0 for now. */
 	private archiveRetryAt = 0;
 	/** Whether this wake knows the archive has no queued `/purge` or `/rename` (alarmWorkDue). */
@@ -5303,7 +5299,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (method === "message" && !result.deduplicated && result.message?.prev_log_id === undefined) created = result.message;
 		});
 		this.noteBotActive(identity.user_id, attachment.roles ?? []);
-		this.checkHistoryThreshold(nowMs());
 		if (created) {
 			const latest = connectionAttachment(socket);
 			const active = latest && this.markActive(latest, "write", nowMs());
@@ -8702,22 +8697,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 		} catch { done = false; }
 		try { this.store.clearExpiredMutes(now); } catch { done = false; }
 		if (done) this.upkeepDay = day;
-	}
-
-	/**
-	 * After a post, at most once an hour (HISTORY_THRESHOLD_CHECK_MS): when the
-	 * hot log has passed what cleanup keeps (Store.cleanupPastThreshold), runs
-	 * cleanup now instead of on its interval, so it is trimmed back before it
-	 * reaches its limit. A quiet server never counts.
-	 */
-	private checkHistoryThreshold(now: number): void {
-		if (now - this.historyThresholdCheckedAt < HISTORY_THRESHOLD_CHECK_MS) return;
-		this.historyThresholdCheckedAt = now;
-		try {
-			if (!this.store.cleanupPastThreshold(now)) return;
-			this.maintenanceSoon(now);
-			this.ctx.waitUntil(this.rescheduleAlarm().catch(() => undefined));
-		} catch { /* counted again within the hour */ }
 	}
 
 	/** Runs the alarm's maintenance again shortly: batched work left more behind. */

@@ -1076,9 +1076,9 @@ it('speaks protocol v10: a sign-in welcome, no email sign-in, and ~private notic
 		expect(server.params).toMatchObject({ apron: 10, agent: 'apron-cloudflare-demo/10', auth: ['webauthn', 'token', 'guest'] });
 		// `server.welcome` is for the sign-in screen (§3.2), worded for this origin.
 		expect(server.params.welcome).toMatch(/Create a passkey/);
-		// The tests bind the archive (wrangler.toml): 80% of the hot log's 5,000 and of its 10,000.
+		// The tests bind the archive (wrangler.toml): 80% of the hot log's 5,000 and of its 100,000.
 		expect(server.params.welcome).toContain(historyPolicy(DEFAULT_LIMITS, true));
-		expect(historyPolicy(DEFAULT_LIMITS, true)).toBe('History keeps the latest 12,000 messages.');
+		expect(historyPolicy(DEFAULT_LIMITS, true)).toBe('History keeps the latest 84,000 messages.');
 		expect(historyPolicy(DEFAULT_LIMITS)).toBe('History keeps the latest 4,000 messages.');
 		expect(welcome.params.from).toEqual({ user_id: '~private', name: 'System message to you' });
 		const other = (await greeting(bot)).server.params;

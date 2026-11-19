@@ -17,8 +17,8 @@ usage pays for, sized against its monthly allowances divided by 31 days with
 headroom. Paid includes 16 times the SQL rows written and 160 times the rows
 read, so the SQL ceilings rise tenfold, and posts, registrations, admissions,
 history pages, and member listings with them. History keeps the latest
-4,000 records in SQLite and 8,000 more in a D1 archive where it is bound (80%
-of limits of 5,000 and 10,000),
+4,000 records in SQLite and 80,000 more in a D1 archive where it is bound
+(80% of limits of 5,000 and 100,000),
 instead of 24 hours (see [History retention](#history-retention)),
 with daily cleanup, and uploaded files are kept 120 days to match; the database
 watermarks rise to 768 MiB (1 GiB hard), a fifth of the 5 GB-month included.
@@ -743,7 +743,7 @@ in D1 for a fourth:
 | `retentionRecords`: the hot log keeps at least the latest this many records | 5000 | 0 (off) |
 | `minRetentionSeconds`: never move a younger record out by count | 3 days | 1 day |
 | `retentionSeconds`: move an older record out whatever the count | 0 (off) | 1 day |
-| `archiveRecords`: the archive keeps the newest this many records that left | 10000 | 0 (off) |
+| `archiveRecords`: the archive keeps the newest this many records that left | 100000 | 0 (off) |
 | `cleanupThresholdPercent`: the share of each count limit cleanup keeps | 80 | 80 |
 
 A record leaves the hot log once it is past the latest `retentionRecords` and
@@ -754,20 +754,19 @@ at least `minRetentionSeconds` old, or once it is older than
 set. Each cleanup run reads up to `retentionRecords` index entries to find
 where the count ends, so it is at most 50,000.
 
-**The limits are ceilings.** Cleanup keeps `cleanupThresholdPercent` of each
-count limit (80%: 4,000 of the hot log's 5,000 and 8,000 of the archive's
-10,000, 12,000 in all), and runs as soon as the hot log passes its share
-rather than waiting for its interval: after a post, at most once an hour, the
-object counts the hot log (up to what it keeps, one index entry each) and
-makes cleanup due if it is past. The rest of each limit is headroom for what
-arrives before cleanup runs, so it is reached only when traffic outruns the
-hourly check or records are younger than the minimum age. 100 keeps each
-limit whole, as a floor rather than a ceiling.
+**The limits are ceilings.** Each daily cleanup keeps `cleanupThresholdPercent`
+of each count limit (80%: 4,000 of the hot log's 5,000 and 80,000 of the
+archive's 100,000, 84,000 in all): it moves what is past the hot log's share
+to the archive, and expires what is past the archive's. The rest of each
+limit is headroom for a day's records, so the hot log reaches its limit only
+on a day that brings more than 1,000 records, or when records are younger
+than the minimum age. 100 keeps each limit whole, as a floor rather than a
+ceiling.
 
 The count is of log records, not messages: edits, reactions, memberships and
-room changes count too, so 12,000 records are fewer messages. At the demo's
-traffic in November 2026 (about 115 records a day) they spanned about 15
-weeks, the hot log's 4,000 about 5; a busier stretch keeps less time, a quieter one
+room changes count too, so 84,000 records are fewer messages. At the demo's
+traffic in November 2026 (about 115 records a day) they span about two
+years, the hot log's 4,000 about five weeks; a busier stretch keeps less time, a quieter one
 more. The minimum age
 keeps a flood from pushing out the last three days before an admin purges
 it; the database watermarks still bound what the flood stores.
@@ -786,12 +785,16 @@ records an alarm. Rooms whose whole log is below the published floor go then,
 not when their records leave the hot log. `/purge` and `/rename` reach the
 archived records too, on an alarm a second later. Archived messages are
 history only: like expired ones, they cannot be edited, reacted to or replied
-to. Each cycle reads up to `archiveRecords` D1 index entries, so it is at
-most 100,000; each history page below the hot floor is a D1 query. If D1
+to. Each daily cycle reads the D1 index entries of the records the archive
+keeps (80,000 on Paid), so `archiveRecords` is at most 100,000; that is
+about 2.4 million D1 rows read a month, of the 25 billion Workers Paid
+includes, and its 80,000 records stay within the included 5 GB even were
+each a maximum-size snapshot. Each history page below the hot floor is a D1
+query. If D1
 fails, cleanup waits five minutes between tries rather than a second, and
 records stay in the hot log meanwhile; a history page that needs the archive
 answers `retry_after`. Without the binding, or with `archiveRecords` 0,
-records expire as they leave the hot log, and only 5,000 are kept on Paid.
+records expire as they leave the hot log, and only 4,000 are kept on Paid.
 
 Uploaded files expire by age (`fileRetentionSeconds`, 120 days on Paid), since
 the bucket's lifecycle rules can only expire by age: a message kept longer
@@ -1203,7 +1206,7 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `retentionRecords` | 5000 | 0 |
 | `minRetentionSeconds` | 259200 | 86400 |
 | `retentionSeconds` | 0 | 86400 |
-| `archiveRecords` | 10000 | 0 |
+| `archiveRecords` | 100000 | 0 |
 | `cleanupSeconds` | 86400 | 3600 |
 | `challengeTtlSeconds` | 120 |  |
 | `sessionTtlSeconds` | 2592000 |  |

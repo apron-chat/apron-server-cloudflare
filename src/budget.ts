@@ -25,10 +25,9 @@ export interface Limits {
 	archiveRecords: number;
 	/**
 	 * The share, in percent, of `retentionRecords` and `archiveRecords` that
-	 * cleanup keeps: the limits are ceilings, and cleanup trims each back to
-	 * this share of it. Once the hot log passes its share, cleanup runs at
-	 * once rather than on its interval (checked after posts, at most hourly),
-	 * so the limit is left as headroom for what comes before it runs.
+	 * cleanup keeps: the limits are ceilings, and each daily cleanup trims
+	 * each back to this share of it, so the rest is headroom for what a day
+	 * brings before the next one.
 	 */
 	cleanupThresholdPercent: number;
 	/**

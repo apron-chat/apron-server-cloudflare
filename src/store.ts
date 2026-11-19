@@ -174,7 +174,7 @@ export interface StoreConfig {
   archiveRecords: number;
   /** Whether the runtime has the archive (its ARCHIVE binding and `archiveRecords`): records leaving the hot log go there first. */
   archive: boolean;
-  /** The share of `retentionRecords` (and the archive's) that cleanup keeps, in percent (cleanupPastThreshold). */
+  /** The share of `retentionRecords` (and the archive's) that each cleanup keeps, in percent (keptHotRecords). */
   cleanupThresholdPercent: number;
   /** Inactivity past which an account is removed (pruneIdleIdentities). */
   idleAccountMs: number;
@@ -8628,29 +8628,6 @@ export class Store {
   /** The records cleanup keeps in the hot log: `cleanupThresholdPercent` of `retentionRecords`, 0 without a count. */
   private keptHotRecords(): number {
     return thresholdRecords(this.config.retentionRecords, this.config.cleanupThresholdPercent);
-  }
-
-  /**
-   * Whether the hot log holds more than cleanup keeps (keptHotRecords); if
-   * so, makes cleanup due now rather than on its interval, so the hot log is
-   * trimmed back before it reaches `retentionRecords`. The runtime asks after
-   * posts, at most hourly (ApronDemoServer.checkHistoryThreshold). Counts up
-   * to what it keeps and one more, one index entry each.
-   */
-  cleanupPastThreshold(now = this.clock.now()): boolean {
-    this.ensureReady();
-    const keep = this.keptHotRecords();
-    if (keep <= 0) return false;
-    return this.reserved({ reads: 24 + keep + 1, writes: 4 }, true, now, () => {
-      const count = integerColumn(this.rawRows<{ count: number }>(
-        "SELECT COUNT(*) AS count FROM (SELECT 1 FROM records INDEXED BY records_log_idx WHERE log_id >= ? LIMIT ?)",
-        this.logState().history_floor, keep + 1,
-      )[0]?.count);
-      if (count <= keep) return false;
-      this.rawExec("UPDATE maintenance SET next_cleanup_ms = MIN(next_cleanup_ms, ?) WHERE id = 1", this.effectiveNow(now));
-      this.cleanupDueCache = undefined;
-      return true;
-    });
   }
 
   /**
