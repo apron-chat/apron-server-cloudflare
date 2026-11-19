@@ -1,5 +1,5 @@
 /*
- * Encrypted archives (src/crypto.ts): round trips, every kind of tampering
+ * Encrypted archives (src/crypto/): round trips, every kind of tampering
  * refused, key rotation, and the errors an operator sees, none of which
  * print key material. The secrets are test-only (the same values as the
  * server's HISTORY_BACKUP_KEY and HISTORY_BACKUP_KEY_OLD test bindings in
@@ -11,12 +11,12 @@ import {
 	ArchiveDecryptError,
 	ArchiveKeyError,
 	type DecryptionStatus,
-	decryptingLines,
+	decryptArchive,
 	deriveBackupKey,
-	encryptingSink,
+	encryptArchive,
 	isEncryptedArchive,
 	resolveKeys,
-} from "../src/crypto.ts";
+} from "../src/crypto/index.ts";
 
 /** Test-only secrets, as an environment holds them: 32 random bytes in base64 each, and a longer shared one. */
 const env: Record<string, string> = {
@@ -39,7 +39,7 @@ const ARCHIVE = [
 async function encrypt(lines: readonly string[], name: string, secret: string, chunkBytes?: number): Promise<string[]> {
 	const out: string[] = [];
 	const { key, fingerprint } = await deriveBackupKey(secret);
-	const sink = encryptingSink(async (line) => void out.push(line), { name, key, fingerprint, chunkBytes });
+	const sink = encryptArchive(async (line) => void out.push(line), { name, key, fingerprint, chunkBytes });
 	for (const line of lines) await sink(line);
 	await sink.close();
 	return out;
@@ -51,7 +51,7 @@ async function* from(lines: readonly string[]) {
 
 async function decrypt(lines: readonly string[], keys = resolveKeys(env, ["HISTORY_BACKUP_KEY", "HISTORY_BACKUP_KEY_OLD"])): Promise<string[]> {
 	const out: string[] = [];
-	for await (const line of decryptingLines(from(lines), keys)) out.push(line);
+	for await (const line of decryptArchive(from(lines), keys)) out.push(line);
 	return out;
 }
 
@@ -146,7 +146,7 @@ describe("encrypted archives", () => {
 		const read = async (lines: readonly string[]) => {
 			const status: DecryptionStatus = {};
 			const out: string[] = [];
-			for await (const line of decryptingLines(from(lines), resolveKeys(env, ["HISTORY_BACKUP_KEY"]), status)) out.push(line);
+			for await (const line of decryptArchive(from(lines), resolveKeys(env, ["HISTORY_BACKUP_KEY"]), status)) out.push(line);
 			return { out, status };
 		};
 		const encrypted = await encrypt(ARCHIVE, "HISTORY_BACKUP_KEY", CURRENT, 64);
@@ -155,7 +155,7 @@ describe("encrypted archives", () => {
 		const header = JSON.parse(encrypted[0]!);
 		const large = [JSON.stringify({ ...header, chunk_bytes: 4 * 1024 * 1024 + 1 }), ...encrypted.slice(1)];
 		await expect(read(large)).rejects.toThrow(/chunk_bytes/);
-		expect(() => encryptingSink(async () => {}, { name: "K", key: {} as CryptoKey, fingerprint: "0".repeat(16), chunkBytes: 4 * 1024 * 1024 + 1 })).toThrow(RangeError);
+		expect(() => encryptArchive(async () => {}, { name: "K", key: {} as CryptoKey, fingerprint: "0".repeat(16), chunkBytes: 4 * 1024 * 1024 + 1 })).toThrow(RangeError);
 	});
 
 	it("uses the default 1 MiB chunks and a fresh nonce each time", async () => {
@@ -181,7 +181,7 @@ describe("encrypted archives", () => {
 	it("keeps lines in order when the caller does not wait for each", async () => {
 		const out: string[] = [];
 		const { key, fingerprint } = await deriveBackupKey(CURRENT);
-		const sink = encryptingSink(async (line) => void out.push(line), { name: "HISTORY_BACKUP_KEY", key, fingerprint, chunkBytes: 16 });
+		const sink = encryptArchive(async (line) => void out.push(line), { name: "HISTORY_BACKUP_KEY", key, fingerprint, chunkBytes: 16 });
 		await Promise.all([...ARCHIVE.map((line) => sink(line)), sink.close()]);
 		expect(await decrypt(out)).toEqual(ARCHIVE);
 		await expect(sink("late")).rejects.toThrow(/already closed/);
@@ -307,5 +307,17 @@ describe("encrypted archives", () => {
 		expect(await decrypt(plain, resolveKeys({}, []))).toEqual(plain);
 		expect(await decrypt([], resolveKeys({}, []))).toEqual([]);
 		expect(await decrypt(["", " "], resolveKeys({}, []))).toEqual(["", " "]);
+	});
+});
+
+describe("the core's additional authenticated data", () => {
+	it("is the ID's 22 bytes, the index as uint64 big-endian, then the final flag (CRYPTO.md)", async () => {
+		const { additionalData } = await import("../src/crypto/core.ts");
+		const id = "ABCDEFGHIJKLMNOPQRSTUV";
+		const aad = additionalData(id, 0x0102030405, true);
+		expect([...aad]).toEqual([...new TextEncoder().encode(id), 0, 0, 0, 1, 2, 3, 4, 5, 1]);
+		expect(additionalData(id, 0, false).at(-1)).toBe(0);
+		expect(() => additionalData("short", 0, false)).toThrow(RangeError);
+		expect(() => additionalData(id, -1, false)).toThrow(RangeError);
 	});
 });

@@ -2,7 +2,7 @@ import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { exportArchive } from "../../src/history/archive/export";
 import { type ArchivedUser, collectArchive, compareReplayed, jsonlReader, jsonlWriter, linesOf, replayRecords, writeArchiveToString } from "@apron/archive";
-import { encryptingSink, openArchive, resolveKeys } from "@apron/archive/crypto";
+import { encryptArchive, openArchive, resolveKeys } from "@apron/archive/crypto";
 import { importArchive, place, restoreBatches } from "../../src/history/archive/import";
 import { MemoryBlobStore } from "./support/memory-blob-store";
 import { type BackupSettings, backupFamily, writeBackup } from "../../src/history/exports";
@@ -198,7 +198,7 @@ describe("export and import", () => {
 		const keys = resolveKeys(env, ["HISTORY_BACKUP_KEY", "HISTORY_BACKUP_KEY_OLD"]);
 		const key = (await keys.lookup("HISTORY_BACKUP_KEY"))!;
 		const lines: string[] = [];
-		const sink = encryptingSink(async (line) => { lines.push(line); }, { ...key, name: "HISTORY_BACKUP_KEY", chunkBytes: 512 });
+		const sink = encryptArchive(async (line) => { lines.push(line); }, { ...key, name: "HISTORY_BACKUP_KEY", chunkBytes: 512 });
 		await exportArchive(source.pipeline, jsonlWriter(sink), { clock: source.clock, header: { server: "source.test" } });
 		await sink.close();
 		// The encrypting sink hands on lines without their newline.

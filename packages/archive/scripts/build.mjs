@@ -14,10 +14,10 @@ rmSync(dist, { recursive: true, force: true });
 execFileSync(process.execPath, [join(root, "..", "..", "node_modules", "typescript", "bin", "tsc"), "-p", join(root, "tsconfig.build.json")], { stdio: "inherit" });
 
 // Declarations keep the sources' "./x.ts" specifiers; a consumer resolves "./x.js".
-for (const file of readdirSync(dist)) {
-	if (!file.endsWith(".d.ts")) continue;
-	const path = join(dist, file);
-	writeFileSync(path, readFileSync(path, "utf8").replace(/(from\s+["']\.{1,2}\/[^"']+)\.ts(["'])/g, "$1.js$2"));
+for (const file of readdirSync(dist, { recursive: true })) {
+	if (!String(file).endsWith(".d.ts")) continue;
+	const path = join(dist, String(file));
+	writeFileSync(path, readFileSync(path, "utf8").replace(/(from\s+["'](?:\.{1,2}\/)+[^"']+)\.ts(["'])/g, "$1.js$2"));
 }
 
 const source = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));

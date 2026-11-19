@@ -24,7 +24,7 @@
 		"./validate": "./src/validate.ts",
 		"./plan": "./src/plan.ts",
 		"./export": "./src/export.ts",
-		"./crypto": "./src/crypto.ts"
+		"./crypto": "./src/crypto/index.ts"
 	},
 	"files": [
 		"src"

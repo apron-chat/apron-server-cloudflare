@@ -85,13 +85,15 @@ means; the server says what is true there (`ImportTarget`,
   occurs), `nudgeLogIds` (colliding log IDs to the next free millisecond,
   order kept), `freeUserId`. Which IDs may hold an account is a server's
   rule, passed to `planImport` as `UserIdRules`.
-- `crypto.ts` (`@apron/archive/crypto` only): encrypted archives
-  (backups). AES-256-GCM in chunks bound to the backup's random ID, the
-  chunk's index and a final flag; the key derived from a named secret with
-  HKDF-SHA-256 and identified by a fingerprint. `encryptingSink`,
-  `decryptingLines`, `openArchive` (plain or encrypted input),
-  `deriveBackupKey`, `resolveKeys` (keys by secret name from an
-  environment object), `isEncryptedArchive`.
+- `crypto/` (`@apron/archive/crypto` only): encrypted archives
+  (backups), specified with their threat model and an audit checklist in
+  [CRYPTO.md](CRYPTO.md). AES-256-GCM in chunks bound to the backup's random
+  ID, the chunk's index and a final flag; the key derived from a named
+  secret with HKDF-SHA-256 and identified by a fingerprint. Every
+  cryptographic step is in `crypto/core.ts`; the entry exports only
+  `deriveBackupKey`, `encryptArchive`, `decryptArchive`, `openArchive`
+  (plain or encrypted input), `isEncryptedArchive`, `resolveKeys` (keys by
+  secret name from an environment object) and the two error types.
 
 ## Tests
 

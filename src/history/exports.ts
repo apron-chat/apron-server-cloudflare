@@ -10,7 +10,7 @@
  */
 
 import { type ArchiveHeader, jsonlWriter } from "@apron/archive";
-import { type BackupKeys, encryptingSink } from "@apron/archive/crypto";
+import { type BackupKeys, encryptArchive } from "@apron/archive/crypto";
 import { type ExportOptions, type ExportReport, exportArchive } from "./archive/export";
 import type { BlobStore } from "./blob/store";
 import type { HistoryPipeline } from "./pipeline";
@@ -94,7 +94,7 @@ export async function writeBackup(pipeline: HistoryPipeline, store: BlobStore, s
 	let report: ExportReport;
 	try {
 		const plain = async (line: string) => writer.write(line.endsWith("\n") ? line : `${line}\n`);
-		const sink = encryptWith ? encryptingSink(plain, encryptWith) : undefined;
+		const sink = encryptWith ? encryptArchive(plain, encryptWith) : undefined;
 		report = await exportArchive(pipeline, jsonlWriter(sink ?? plain), {
 			clock: options.clock, header: { server: options.server, ...options.header }, ...(options.roomIds ? { roomIds: options.roomIds } : {}),
 			privateRooms: settings.privateRooms,
