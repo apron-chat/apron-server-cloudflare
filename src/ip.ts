@@ -6,7 +6,7 @@ type CanonicalIp =
 	 * A Worker's subrequest (`CF-Worker`, which Cloudflare sets to the
 	 * calling Worker's zone and a Worker cannot set itself): the zone stands
 	 * for the address. Another Apron server on Workers dials this way to
-	 * send through its link (extension `ext:remote`).
+	 * connect as its link, or to push a wake (extension `ext:remote`).
 	 */
 	| { kind: "worker"; key: string; address: string }
 	/** `prefixKey` is the address's /48, which one host or site may hold whole. */
@@ -133,9 +133,10 @@ function isPseudoIpv4(value: string): boolean {
 }
 
 /**
- * Who a connection comes from: the visitor's address (extractClientIp), or
+ * Who a request comes from: the visitor's address (extractClientIp), or
  * for a Worker's subrequest its zone (`CF-Worker`), so another server on
- * Workers can connect as its link to this one (extension `ext:remote`).
+ * Workers can connect as its link to this one, or wake its mirror rooms
+ * (extension `ext:remote`, only with `REMOTE_SELF`).
  */
 export function extractClientPrincipal(headers: Headers): CanonicalIp | null {
 	const zone = headers.get("CF-Worker");

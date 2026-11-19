@@ -48,6 +48,7 @@ declare global {
 		GUEST_POSTING?: string;
 		PRESENCE?: string;
 		APRON_ADMIN_TOKEN?: string;
+		REMOTE_SELF?: string;
 		ENVIRONMENT?: string;
 		NODE_ENV?: string;
 	}

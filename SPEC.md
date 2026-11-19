@@ -148,7 +148,7 @@ It is the server's: `me` ignores an `ext.permissions` key, as it ignores `roles`
 
 ### Extension `ext:remote`
 
-[`ext:remote`](https://github.com/shazow/apron/blob/main/recipes/trusted_federation.md#draft-extension-extremote) shares rooms between Apron servers as the recipe has it: one **owner** hosts each shared room, and each **mirror** server reads it through a **link** and shows it in a local mirror room, passing its users' writes to the owner. It is on only when `REMOTE_SELF` is set (this server's own address, [configuration](docs/configuration.md)); off, the capability is not listed, `/remote` is an unknown command, `ext.remote` is dropped from every request, a link is an ordinary bot, and `/remote/wake/` answers 404. The code is `src/remote*.ts` and `src/mirror.ts`, with marked hooks in `src/index.ts` and `src/store.ts`.
+[`ext:remote`](https://github.com/shazow/apron/blob/main/recipes/trusted_federation.md#draft-extension-extremote) shares rooms between Apron servers as the recipe has it: one **owner** hosts each shared room, and each **mirror** server reads it through a **link** and shows it in a local mirror room, passing its users' writes to the owner. It is on only when `REMOTE_SELF` is set (this server's own address, [configuration](docs/configuration.md)); off, the capability is not listed, `/remote` is an unknown command, `ext.remote` is dropped from every request, a link is an ordinary bot, a Worker's subrequest is refused as any is without a visitor's address, and `/remote/wake/` answers 404. The code is `src/remote*.ts` and `src/mirror.ts`, with marked hooks in `src/index.ts` and `src/store.ts`.
 
 Owner:
 

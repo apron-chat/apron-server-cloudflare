@@ -2458,8 +2458,9 @@ async function fetchConnection(request: Request, env: Env): Promise<Response> {
 		return responseError(400, "WebSocket upgrade must not contain a body");
 	}
 	if (!isUpgrade(request) && !status) return responseError(400, "WebSocket upgrade required");
-	// A Worker's subrequest counts as its zone: another server on Workers sending through its link (ext:remote).
-	const clientIp = extractClientPrincipal(request.headers);
+	// ext:remote hook: with REMOTE_SELF, a Worker's subrequest counts as its zone, so another
+	// server on Workers can connect as its link (a mirror reading and writing through it).
+	const clientIp = env.REMOTE_SELF ? extractClientPrincipal(request.headers) : extractClientIp(request.headers);
 	if (!clientIp) return responseError(403, "Trusted client address unavailable");
 	let config: RuntimeConfig;
 	try {
