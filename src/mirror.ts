@@ -30,7 +30,6 @@ export interface MirrorClient {
 	tier: string;
 	name?: string;
 	ipKey: string;
-	endpoint?: string;
 }
 
 /** What the mirror needs of the Durable Object (index.ts). */
@@ -44,7 +43,7 @@ export interface MirrorHost {
 	/** Delivers a committed record to its rooms' members (and wakes their mirrors). */
 	broadcastRecord(record: Broadcast): void;
 	/** A room created or saved: its members and its parent's get `room_update` `updated`. */
-	roomChanged(room: RoomRecord, created: boolean): void;
+	roomChanged(room: RoomRecord): void;
 	/** The creator of a new room, a registered admin, joined it: their connections get the room. */
 	roomJoined(userId: string, room: RoomRecord, membership?: Broadcast): void;
 	reply(socket: unknown, request: RequestFrame, result: Record<string, unknown>): void;
@@ -952,7 +951,7 @@ export class RemoteRooms {
 				if (room) room.threads[ownerThread] = result.room.room_id;
 				this.store.setMirrorState(next, this.now());
 			}
-			this.host.roomChanged(result.room, !local);
+			this.host.roomChanged(result.room);
 		});
 	}
 

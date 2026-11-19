@@ -984,10 +984,7 @@ function isLinkConnection(attachment: ConnectionAttachment): boolean {
 	return !!remote && typeof remote === "object" && typeof (remote as Record<string, unknown>).server === "string" && !Object.hasOwn(remote, "user_id");
 }
 
-/**
- * The `data` of a link's error for a room it has not joined (extension
- * `ext:remote`), whatever its code: the sender ends its pair for the room.
- */
+/** The `data` of a link's error for a room it has not joined (extension `ext:remote`), whatever its code. */
 const NOT_JOINED = { ext: { remote: "not_joined" } };
 /** The live threads one link may make here (extension `ext:remote`), so one partner cannot take the server's thread ceiling. */
 const MAX_REMOTE_THREADS = 25;
@@ -2180,11 +2177,6 @@ async function handleLiveWrite(request: Request, env: Env, key: string): Promise
 	return response;
 }
 
-/**
- * `GET` of a live text's `url` (§4.8.3): the kept text, then the rest as it
- * arrives, from the Durable Object's memory, as `text/plain; charset=utf-8`
- * with `nosniff`. Charged as a connection attempt first.
- */
 /** The route an owner's wake push for this server's mirror reaches (extension `ext:remote`, mirror.ts). */
 const REMOTE_WAKE_ROUTE = "/remote/wake/";
 /** The object's path for a wake push, which only the entry Worker builds. */
@@ -2222,6 +2214,11 @@ async function handleRemoteWake(request: Request, env: Env, id: string): Promise
 	return fromObject(await env.DEMO.getByName(OBJECT_NAME).fetch(new Request(`https://remote.internal${REMOTE_WAKE_PATH}${id}`, { method: "POST", headers })));
 }
 
+/**
+ * `GET` of a live text's `url` (§4.8.3): the kept text, then the rest as it
+ * arrives, from the Durable Object's memory, as `text/plain; charset=utf-8`
+ * with `nosniff`. Charged as a connection attempt first.
+ */
 async function handleLiveRead(request: Request, env: Env, id: string): Promise<Response> {
 	if (request.method === "OPTIONS") {
 		return new Response(null, { status: 204, headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS", "Access-Control-Max-Age": "86400" } });
@@ -2599,6 +2596,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 *   (§4.8.3); after a wake, read from storage once (uploadDeadlineRead).
 	 * - `live`: the earliest open live text falls due (liveDeadline, §4.8.3).
 	 * - `presence`: waiting status changes are to be announced (armPresence).
+	 * - `remote`: the mirrored owners are to be read, in case a wake push was
+	 *   lost (ext:remote, RemoteRooms.onAlarm).
 	 */
 	private readonly deadlines = { maintenance: new Deadline(), uploads: new Deadline(), live: new Deadline(), presence: new Deadline(), remote: new Deadline() };
 	/** Each room's parent as read (parentOf): fixed at creation. */
@@ -3151,8 +3150,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.noteBurn("alarm");
 		this.sweepPresence(now);
 		// ext:remote hook: each mirrored owner is read now and then, in case a wake push was lost.
-		if (this.deadlines.remote.passed(now)) this.deadlines.remote.clear();
-		if (this.remote) await this.remote.onAlarm(now).catch(() => undefined);
+		if (this.remote) {
+			if (this.deadlines.remote.passed(now)) this.deadlines.remote.clear();
+			await this.remote.onAlarm(now).catch(() => undefined);
+		}
 		// An alarm that only announced waiting status changes stops here: the
 		// usage refresh, sweeps and cleanup below run on the alarms that have
 		// their own work, as they did before presence used the alarm.
@@ -3737,9 +3738,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// A frame from a connection not idle is its user attended (see attended),
 		// a stale one resuming included: what was pushed is unread no longer.
 		if (!attachment.idle) this.clearUnread(attachment);
-		// ext:remote hooks: a link's wake push, a local user's write in a mirror room, a link acting as a remote user.
+		// ext:remote hook: a link's wake push or act-as request, or a local user's write in a mirror room.
 		if (this.remote && await this.remoteRequest(socket, attachment, request)) return;
-		if (await this.actAs(socket, attachment, request)) return;
 		switch (request.method) {
 			case "auth":
 				await this.handleAuth(socket, attachment, request);
@@ -5297,27 +5297,23 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * A link's act-as request (extension `ext:remote`): from a connection
-	 * signed in as a link account (Store.remoteLink), a `message`,
-	 * `reactions`, `me` or `room_leave` whose `params.ext.remote.user_id` is
-	 * a string runs as the shadow user of that user of the link's server
-	 * (shadowUserId), created on first use (Store.ensureShadow). The
-	 * request's `ext.remote.server` is ignored: the link's binding is the
-	 * server. A `user_id` that is empty, too long, a system identity's, or
-	 * has whitespace is `invalid_params`. Results and deliveries reach the
-	 * link's connection as usual. False for any other request, which runs
-	 * as the connection's own user, and whose `ext.remote` the store drops.
+	 * A link's act-as request (extension `ext:remote`): from `link`, a link
+	 * account bound to `server` (Store.remoteLink), a `message`, `reactions`,
+	 * `me`, `room_join`, `room_leave` or `room_set` whose
+	 * `params.ext.remote.user_id` is a string runs as the remote user of that
+	 * user of the link's server (shadowUserId), created on first use
+	 * (Store.ensureShadow). The request's `ext.remote.server` is ignored: the
+	 * link's binding is the server. A `user_id` that is empty, too long, a
+	 * system identity's, or has whitespace is `invalid_params`. Results and
+	 * deliveries reach the link's connection as usual. False for any other
+	 * request, which runs as the link itself, and whose `ext.remote` the
+	 * store drops.
 	 */
-	private async actAs(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<boolean> {
+	private async actAs(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, link: string, server: string): Promise<boolean> {
 		const method = request.method;
-		// ext:remote hook: off, a link is an ordinary bot, and the store drops `remote` from every request.
-		if (!this.remote) return false;
 		if (method !== "message" && method !== "reactions" && method !== "me" && method !== "room_leave" && method !== "room_set" && method !== "room_join") return false;
 		const remoteUserId = actAsUserId(request.params);
-		const link = attachment.tier === "registered" ? attachment.userId : undefined;
-		if (remoteUserId === undefined || link === undefined) return false;
-		const server = this.store.remoteLink(link, nowMs());
-		if (server === undefined) return false;
+		if (remoteUserId === undefined) return false;
 		const problem = remoteUserIdError(remoteUserId);
 		if (problem) throw { name: "invalid_params", message: problem } satisfies ProtocolError;
 		this.assertMayWrite(attachment);
@@ -5368,13 +5364,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * A link's act-as `room_set` (ext:remote): creates or saves a thread of a
-	 * room the link has joined, as the remote user, and nothing else. A new
-	 * thread is paired with the thread on the link's server that its
-	 * `ext.remote.room_id` names (the pair starts empty and ends with its
-	 * parent's). The usual rules hold: a private room has no threads here
-	 * (`denied`, so the other server sends the thread's messages as replies
-	 * in the room), each remote user may hold `threadsPerUser`, and the
-	 * server's thread ceiling counts them; a link may make at most
+	 * room the link has joined, as the remote user, and nothing else; the
+	 * links in the room then join a new thread (RemoteRooms.threadCreated).
+	 * The usual rules hold: a private room has no threads here (`denied`),
+	 * each remote user may hold `threadsPerUser`, and the server's thread
+	 * ceiling counts them; a link's remote users may make at most
 	 * MAX_REMOTE_THREADS live threads, so one partner cannot take every slot.
 	 */
 	private async shadowRoomSet(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, actor: ActAs): Promise<void> {
@@ -8909,19 +8903,23 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * ext:remote hook (dispatch): a link's `relay` wake push, and a local
-	 * user's `message`, `reactions` or `room_set` in a mirror room, which the
-	 * mirror sends to the room's owner. True when handled here.
+	 * ext:remote hook (dispatch), only while the feature is on: a link's
+	 * `relay` wake push and act-as requests (actAs), and a local user's
+	 * `message`, `reactions` or `room_set` in a mirror room, which the mirror
+	 * sends to the room's owner. True when handled here.
 	 */
 	private async remoteRequest(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<boolean> {
-		const server = attachment.tier === "registered" && attachment.userId !== undefined ? this.store.remoteLink(attachment.userId, nowMs()) : undefined;
-		const link = server !== undefined;
-		// A link's wake push, whether or not this server offers push.
-		if (request.method === "push_register" && server !== undefined && request.params.kind === "relay") {
-			await this.remote!.registerWake(socket, attachment.userId!, server, request);
-			return true;
+		const link = attachment.tier === "registered" ? attachment.userId : undefined;
+		const server = link === undefined ? undefined : this.store.remoteLink(link, nowMs());
+		if (link !== undefined && server !== undefined) {
+			// A link's wake push, whether or not this server offers push.
+			if (request.method === "push_register" && request.params.kind === "relay") {
+				await this.remote!.registerWake(socket, link, server, request);
+				return true;
+			}
+			return this.actAs(socket, attachment, request, link, server);
 		}
-		if (link || !identityOf(attachment) || (request.method !== "message" && request.method !== "reactions" && request.method !== "room_set")) return false;
+		if (!identityOf(attachment) || (request.method !== "message" && request.method !== "reactions" && request.method !== "room_set")) return false;
 		return this.remote!.forward(socket, attachment as MirrorClient, request);
 	}
 
