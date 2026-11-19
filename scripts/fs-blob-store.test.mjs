@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, it, test } from 'node:test';
 import { describeBlobStore } from '../test/history/conformance/blob-store.ts';
-import { FsBlobStore } from './fs-blob-store.mjs';
+import { FsBlobStore, fsBlobStores } from './fs-blob-store.mjs';
 
 // The conformance suite's matchers (test/history/conformance/blob-store.ts, `Expect`) over node:assert.
 const expect = (actual) => ({
@@ -21,6 +21,15 @@ describeBlobStore('FsBlobStore', () => new FsBlobStore(directory), {
 	describe,
 	it: (name, body, timeout) => it(name, { timeout }, body),
 	expect,
+});
+
+test('fsBlobStores registers the directory as the `fs` provider, and nothing else', async () => {
+	const providers = fsBlobStores(join(directory, 'registry'));
+	assert.deepEqual(Object.keys(providers), ['fs']);
+	const store = providers.fs({});
+	assert.ok(store instanceof FsBlobStore);
+	await store.put('backups/x.jsonl', 'x');
+	assert.equal(await (await providers.fs({}).get('backups/x.jsonl')).text(), 'x');
 });
 
 test('FsBlobStore refuses keys that leave its directory or cannot be files', async () => {

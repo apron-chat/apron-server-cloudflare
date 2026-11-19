@@ -5,12 +5,11 @@ import { exportArchive } from "../../src/history/archive/export";
 import { collectArchive, jsonlReader, jsonlWriter, linesOf, writeArchiveToString } from "../../src/history/archive/format";
 import { archiveReader, importArchive, place, restoreBatches } from "../../src/history/archive/import";
 import type { ArchivedUser } from "../../src/history/archive/types";
-import { MemoryBlobStore } from "../../src/history/blob/memory";
-import { exportFamily, writeBackup } from "../../src/history/exports";
-import { parseHistorySettings } from "../../src/history/settings";
+import { MemoryBlobStore } from "./support/memory-blob-store";
+import { type BackupSettings, backupFamily, writeBackup } from "../../src/history/exports";
 import { MemorySegmentIndex } from "../../src/history/blob/segments";
 import { BlobHistoryTier } from "../../src/history/blob/tier";
-import { MemoryHead, MemoryHistoryTier } from "../../src/history/memory";
+import { MemoryHead, MemoryHistoryTier } from "./support/memory-tiers";
 import { HistoryPipeline, type PipelineStage } from "../../src/history/pipeline";
 import { compareRenderedState, renderedState } from "./render";
 import { MemoryTierStateStore } from "../../src/history/tier";
@@ -289,30 +288,46 @@ describe("export and import", () => {
 		expect(moved?.room_id).toBe("random");
 	});
 
-	it("prunes only its own export's backups", async () => {
-		const settings = parseHistorySettings({
-			tiers: [{ name: "hot", kind: "sqlite", retention: { records: 10 } }],
-			exports: [
-				{ name: "daily", store: { provider: "memory", prefix: "backups/" }, keep: 2 },
-				{ name: "daily-full", store: { provider: "memory", prefix: "backups/" }, keep: 2 },
-			],
-		});
-		const family = exportFamily(settings.exports[0], "srv");
-		expect(family.pattern.test("backups/srv-daily-20261119-120000.jsonl")).toBe(true);
-		expect(family.pattern.test("backups/srv-daily-full-20261119-120000.jsonl")).toBe(false);
+	it("keeps the newest backups of each kind, pruning only that kind's", async () => {
+		const settings: BackupSettings = { keep: 2, privateRooms: true, previousKeyNames: [], importPlaintext: true };
+		const family = backupFamily("scheduled", "srv");
+		expect(family.pattern.test("backups/srv-scheduled-20261119-120000.jsonl")).toBe(true);
+		expect(family.pattern.test("backups/srv-scheduled-20261119-120000.jsonl.enc")).toBe(true);
+		expect(family.pattern.test("backups/srv-manual-20261119-120000.jsonl")).toBe(false);
+		expect(family.pattern.test("backups/srv-scheduled-20261119-120000.jsonl.bak")).toBe(false);
+		expect(backupFamily("scheduled", "a.b").pattern.test("backups/axb-scheduled-20261119-120000.jsonl")).toBe(false);
 		const store = new MemoryBlobStore();
 		await store.put("backups/notes.txt", "keep me");
+		await store.put("backups/other-scheduled-20261101-000000.jsonl", "another server's");
 		const source = pipelineOf("head");
 		populate(source.head, source.clock);
 		for (let day = 0; day < 3; day += 1) {
-			for (const entry of settings.exports) await writeBackup(source.pipeline, store, entry, { server: "srv", clock: { now: () => Date.UTC(2026, 10, 19 + day) } });
+			for (const kind of ["scheduled", "manual"] as const) await writeBackup(source.pipeline, store, settings, kind, { server: "srv", clock: { now: () => Date.UTC(2026, 10, 19 + day) } });
 		}
 		const keys = (await store.list("backups/")).keys.map((entry) => entry.key);
 		expect(keys).toEqual([
 			"backups/notes.txt",
-			"backups/srv-daily-20261120-000000.jsonl", "backups/srv-daily-20261121-000000.jsonl",
-			"backups/srv-daily-full-20261120-000000.jsonl", "backups/srv-daily-full-20261121-000000.jsonl",
+			"backups/other-scheduled-20261101-000000.jsonl",
+			"backups/srv-manual-20261120-000000.jsonl", "backups/srv-manual-20261121-000000.jsonl",
+			"backups/srv-scheduled-20261120-000000.jsonl", "backups/srv-scheduled-20261121-000000.jsonl",
 		]);
+	});
+
+	it("encrypts with the named secret, and fails without it rather than writing a plain backup", async () => {
+		const settings: BackupSettings = { keep: 14, privateRooms: true, encryptionKeyName: "HISTORY_BACKUP_KEY", previousKeyNames: [], importPlaintext: false };
+		const store = new MemoryBlobStore();
+		const source = pipelineOf("head");
+		populate(source.head, source.clock);
+		const clock = { now: () => Date.UTC(2026, 10, 19, 12) };
+		await expect(writeBackup(source.pipeline, store, settings, "manual", { server: "srv", clock, keys: resolveKeys({}, ["HISTORY_BACKUP_KEY"]) }))
+			.rejects.toThrow("backups are encrypted with HISTORY_BACKUP_KEY (BACKUP_ENCRYPTION_KEY_NAME), which is not set: set it with `wrangler secret put HISTORY_BACKUP_KEY`");
+		expect((await store.list("backups/")).keys).toEqual([]);
+		const written = await writeBackup(source.pipeline, store, settings, "manual", { server: "srv", clock, keys: resolveKeys(env, ["HISTORY_BACKUP_KEY"]) });
+		expect(written.key).toBe("backups/srv-manual-20261119-120000.jsonl.enc");
+		const text = await (await store.get(written.key))!.text();
+		expect(text).not.toContain("hello 0");
+		const archive = await collectArchive(archiveReader(linesOf(text), resolveKeys(env, ["HISTORY_BACKUP_KEY"])));
+		expect(archive.records.some((record) => record.record_json.includes("hello 0"))).toBe(true);
 	});
 
 	it("imports a room's stretch only: records of unlisted rooms or below history_log_id are references; output_ref is dropped", async () => {
@@ -483,28 +498,29 @@ describe("export and import", () => {
 		expect(abandoned.resumed).toBe(false);
 	});
 
-	it("refuses a second backup of an export within the same second", async () => {
-		const settings = parseHistorySettings({ tiers: [{ name: "hot", kind: "sqlite", retention: { records: 10 } }], exports: [{ name: "manual", store: { provider: "memory", prefix: "backups/" } }] });
+	it("refuses a second backup of a kind within the same second", async () => {
+		const settings: BackupSettings = { keep: 14, privateRooms: true, previousKeyNames: [], importPlaintext: true };
 		const store = new MemoryBlobStore();
 		const source = pipelineOf("head");
 		populate(source.head, source.clock);
 		const at = Date.UTC(2026, 10, 19, 12);
-		await writeBackup(source.pipeline, store, settings.exports[0], { server: "srv", clock: { now: () => at } });
-		await expect(writeBackup(source.pipeline, store, settings.exports[0], { server: "srv", clock: { now: () => at + 500 } })).rejects.toThrow(/exists already/);
-		await writeBackup(source.pipeline, store, settings.exports[0], { server: "srv", clock: { now: () => at + 1_000 } });
+		await writeBackup(source.pipeline, store, settings, "manual", { server: "srv", clock: { now: () => at } });
+		await expect(writeBackup(source.pipeline, store, settings, "manual", { server: "srv", clock: { now: () => at + 500 } })).rejects.toThrow(/exists already/);
+		await writeBackup(source.pipeline, store, settings, "manual", { server: "srv", clock: { now: () => at + 1_000 } });
 		expect((await store.list("backups/")).keys).toHaveLength(2);
 	});
 
-	it("leaves private rooms out of an export that says so", async () => {
+	it("leaves private rooms out of a backup where BACKUP_PRIVATE_ROOMS is false", async () => {
 		const source = pipelineOf("head");
 		populate(source.head, source.clock);
 		source.clock.time += 7;
 		source.head.commit("private_123", "message", { message_id: "secret", from: { user_id: "ada" }, body: { text: "between us" } });
 		source.head.rooms_.set("private_123", { listing: { room_id: "private_123", private: true }, joined: false });
+		const store = new MemoryBlobStore();
 		const lines = async (privateRooms: boolean) => {
-			const out: string[] = [];
-			await exportArchive(source.pipeline, jsonlWriter(async (line) => { out.push(line); }), { clock: source.clock, privateRooms });
-			return out.join("");
+			const settings: BackupSettings = { keep: 14, privateRooms, previousKeyNames: [], importPlaintext: true };
+			const { key } = await writeBackup(source.pipeline, store, settings, privateRooms ? "scheduled" : "manual", { server: "srv", clock: source.clock });
+			return (await store.get(key))!.text();
 		};
 		expect(await lines(true)).toContain("between us");
 		const without = await lines(false);

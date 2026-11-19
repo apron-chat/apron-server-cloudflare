@@ -3,7 +3,8 @@
  * AES-256-GCM in chunks, so a backup in a blob store is unreadable without
  * its key and is written and read as a stream.
  *
- * Keys are Wrangler secrets named in the config's `key_secrets`: any secret
+ * Keys are Wrangler secrets named by BACKUP_ENCRYPTION_KEY_NAME and
+ * BACKUP_PREVIOUS_KEY_NAMES (src/config.ts): any secret
  * of at least 32 characters of randomness, such as the server's own
  * UPLOAD_SIGNING_KEY, or one kept for backups alone (`openssl rand -base64
  * 32`). The encryption key is derived from a secret with HKDF-SHA-256
@@ -145,7 +146,7 @@ export async function deriveBackupKey(secret: string, name?: string): Promise<Ba
 
 /**
  * The backup keys among `env`'s secrets, by name: only the names listed are
- * consulted (every `key_secrets` of the config), and each is derived once,
+ * consulted (the BACKUP_*_KEY_NAME(S) vars name them), and each is derived once,
  * when first asked for. A listed secret that is unset reads as absent.
  */
 export function resolveKeys(env: object, names: readonly string[]): BackupKeys {
@@ -389,7 +390,7 @@ export async function* decryptingLines(lines: AsyncIterable<string>, keys: Pick<
 	const found = await keys.lookup(header.key);
 	if (!found) {
 		throw new ArchiveKeyError(
-			`this backup needs ${header.key} (fingerprint ${header.fingerprint}); set it with \`wrangler secret put\`, list it in key_secrets, and import again`,
+			`this backup needs ${header.key} (fingerprint ${header.fingerprint}); set it with \`wrangler secret put\`, list it in BACKUP_PREVIOUS_KEY_NAMES, and import again`,
 		);
 	}
 	if (found.fingerprint !== header.fingerprint) {

@@ -5,11 +5,11 @@ import { RESTORE_RECORDS_BATCH, Store, UNCLAIMED_ROLE, type RoomRecord, type Sto
 import { exportArchive } from "../../src/history/archive/export";
 import { collectArchive, jsonlReader, jsonlWriter, linesOf, writeArchiveToString } from "../../src/history/archive/format";
 import { importArchive } from "../../src/history/archive/import";
-import { MemoryBlobStore } from "../../src/history/blob/memory";
+import { MemoryBlobStore } from "./support/memory-blob-store";
 import { BlobHistoryTier } from "../../src/history/blob/tier";
 import { archivePipeline } from "../../src/history/config";
 import { HistoryPipeline } from "../../src/history/pipeline";
-import { MemoryHead } from "../../src/history/memory";
+import { MemoryHead } from "./support/memory-tiers";
 import { MemoryTierStateStore } from "../../src/history/tier";
 import { errorCode, withStore, type TestClock } from "../helpers/store";
 
@@ -334,7 +334,7 @@ function messageRecord(roomId: string, logId: number, value: Record<string, unkn
 	return { room_id: roomId, log_id: logId, commit_ms: logId, kind: "message", record_json: JSON.stringify({ message_id: String(logId), log_id: String(logId), room_id: roomId, from: { user_id: "ada", name: "Ada" }, body: { text: `m${logId}` }, ...value }) };
 }
 
-const LIMITS = { retentionRecords: 5_000, retentionSeconds: 0, minRetentionSeconds: 0, archiveRecords: 0, cleanupThresholdPercent: 80 };
+const LIMITS = { retentionRecords: 5_000, retentionSeconds: 0, minRetentionSeconds: 0, historyD1Records: 0, historyBlobRecords: 0, cleanupThresholdPercent: 80 };
 
 it("refuses records past the clock, and raises the log head only by records it stores, never by a listing", async () => {
 	await withStore("restore-future", CONFIG, (store, clock) => {

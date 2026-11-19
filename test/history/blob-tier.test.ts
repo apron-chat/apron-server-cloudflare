@@ -10,12 +10,12 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { collectArchive, jsonlReader, linesOf } from "../../src/history/archive/format";
-import { MemoryBlobStore } from "../../src/history/blob/memory";
+import { MemoryBlobStore } from "./support/memory-blob-store";
 import { R2BlobStore } from "../../src/history/blob/r2";
 import { MemorySegmentIndex, SEGMENT_SCHEMA, type SegmentIndex, type SegmentRef, type SqlPort, SqlSegmentIndex, parseSegmentKey, segmentKey } from "../../src/history/blob/segments";
 import type { BlobStore } from "../../src/history/blob/store";
 import { BlobHistoryTier } from "../../src/history/blob/tier";
-import { MemoryHistoryTier } from "../../src/history/memory";
+import { MemoryHistoryTier } from "./support/memory-tiers";
 import { type ChatRecord, byLog, toRange } from "../../src/history/records";
 import { compareRenderedState, renderedState } from "./render";
 import { describeHistoryTier, sampleLog, wireRecord } from "./conformance/history-tier";

@@ -77,73 +77,60 @@ VAPID_SUBJECT = "https://server.apron.chat"
 # src/config.ts DEFAULT_PUSH_HOSTS), and push.stupidtech.net added to them.
 PUSH_HOSTS_EXTRA = "push.stupidtech.net"
 
-# Where history is kept, and its backups (src/history/settings.ts;
-# docs/configuration.md, The HISTORY config). The tiers below are the paid
-# plan's own limits written out, so this file says what they are: SQLite
-# keeps 5,000 records (none younger than three days leave by count), D1
-# 100,000 more; each daily cleanup keeps 80% of each. With HISTORY set, the
-# LIMIT_* vars for these limits are refused. `npm run budget:check` checks it.
-# Backups are inert until a private R2 bucket is bound as HISTORY_BLOB: a
-# nightly one, and one an admin makes on demand (`/history export`, the
-# export with no `every`). Both are encrypted (`encrypt`: set, so required)
-# with a key derived from UPLOAD_SIGNING_KEY (its own HKDF label); list
-# another secret first to use a key of its own, and keep a rotated one
-# listed (import.key_secrets) to read older backups. Both include private
-# rooms (private_rooms); set it false to leave them out.
-[vars.HISTORY]
-schedule = { every = "1d", threshold_percent = 80 }
-alerts = { stall_after = "6h" }
-
-[[vars.HISTORY.tiers]]
-name = "hot"
-kind = "sqlite"
-retention = { records = 5_000, min_age = "3d" }
-
-[[vars.HISTORY.tiers]]
-name = "recent"
-kind = "d1"
-binding = "HISTORY_D1"
-retention = { records = 100_000 }
-
-[[vars.HISTORY.exports]]
-name = "nightly"
-every = "1d"
-store = { provider = "r2", binding = "HISTORY_BLOB", prefix = "backups/" }
-keep = 14
-private_rooms = true
-encrypt = { key_secrets = ["UPLOAD_SIGNING_KEY"] }
-
-[[vars.HISTORY.exports]]
-name = "manual"
-store = { provider = "r2", binding = "HISTORY_BLOB", prefix = "backups/" }
-keep = 10
-private_rooms = true
-encrypt = { key_secrets = ["UPLOAD_SIGNING_KEY"] }
-
-# `/history import` takes only encrypted backups here (plaintext: false, the
-# default where an export encrypts): a plain file in the bucket is no backup
-# of this server's.
-[vars.HISTORY.import]
-plaintext = false
+# History (docs/configuration.md, History retention, History tiers, Backups
+# and imports): the paid plan's own limits, written out so this file says
+# what they are. SQLite keeps 5,000 records, none younger than three days
+# leaving by count, and no age limit; D1 (HISTORY_D1, below) 100,000 more;
+# the blob tier (HISTORY_BLOB) keeps everything past that (0). Each daily
+# cleanup keeps 80% of each count.
+LIMIT_RETENTION_RECORDS = "5000"
+LIMIT_MIN_RETENTION_SECONDS = "259200"
+LIMIT_RETENTION_SECONDS = "0"
+LIMIT_CLEANUP_THRESHOLD_PERCENT = "80"
+LIMIT_HISTORY_D1_RECORDS = "100000"
+LIMIT_HISTORY_BLOB_RECORDS = "0"
+# Backups to HISTORY_BLOB under backups/, inert until it is bound: one a day
+# (and an admin's `/history export`), the newest 14 of each kept, private
+# rooms included, encrypted with a key derived from the UPLOAD_SIGNING_KEY
+# secret (its own HKDF label). Name another secret to use a key of its own;
+# after a rotation, list the old one in BACKUP_PREVIOUS_KEY_NAMES to read
+# older backups. `/history import` takes only encrypted files here: a plain
+# file in the bucket is no backup of this server's.
+BACKUP_EVERY = "1d"
+BACKUP_KEEP = "14"
+BACKUP_PRIVATE_ROOMS = "true"
+BACKUP_ENCRYPTION_KEY_NAME = "UPLOAD_SIGNING_KEY"
+BACKUP_PREVIOUS_KEY_NAMES = ""
+IMPORT_PLAINTEXT = "false"
 
 # The D1 history tier (src/history/d1.ts, docs/configuration.md, History
-# tiers). Records there stay in history but become read-only: once
-# the object's own SQLite holds more than retentionRecords (LIMIT_RETENTION_RECORDS),
-# the oldest move here, where history pages still read them, but their
-# messages can no longer be edited, reacted to or replied to. The tier
-# keeps archiveRecords (LIMIT_ARCHIVE_RECORDS) of them, then they expire.
-# Both counts are ceilings: once a day, cleanup moves what is past
-# cleanupThresholdPercent (LIMIT_CLEANUP_THRESHOLD_PERCENT, 80) of SQLite's
-# limit to D1, and expires what is past that share of D1's. The HISTORY var
-# above sets these limits as its tiers' retention.
-# `/purge` and `/rename` reach this tier too. Without this binding, records
-# past retentionRecords expire at once. The object creates its table on
+# tiers). Records there stay in history but become read-only: once the
+# object's own SQLite holds more than LIMIT_RETENTION_RECORDS, the oldest
+# move here, where history pages still read them, but their messages can no
+# longer be edited, reacted to or replied to. The tier keeps
+# LIMIT_HISTORY_D1_RECORDS of them, then they go on to the blob tier, or
+# expire without one. Both counts are ceilings: once a day, cleanup moves
+# what is past LIMIT_CLEANUP_THRESHOLD_PERCENT (80) of each.
+# `/purge` and `/rename` reach this tier too. Without this binding (or the
+# blob tier's), records past SQLite's limits expire at once. Once D1 holds
+# history, unbinding it while the blob tier is bound stops history moving
+# below SQLite until it is bound again. The object creates its table on
 # first use (the database keeps its first name, apron-archive). Previews
 # bind none (below), so theirs expire at once.
 [[d1_databases]]
 binding = "HISTORY_D1"
 database_name = "apron-archive"
 database_id = "67f4435a-f9d4-4c9a-89e0-c02f108d4fa2"
+
+# The blob history tier and backups (docs/configuration.md, History tiers,
+# Backups and imports): a private R2 bucket, no custom domain, no r2.dev
+# access, no CORS, no lifecycle rules. Not bound yet: the apron-history
+# bucket's settings are still to be checked. Bound, records past D1's count
+# go there in segments (kept by LIMIT_HISTORY_BLOB_RECORDS) instead of
+# expiring, and the backups above run.
+# [[r2_buckets]]
+# binding = "HISTORY_BLOB"
+# bucket_name = "apron-history"
 
 # Uploaded images (src/budget.ts). The bucket needs lifecycle rules deleting
 # f/ after 120 days and a/ after 61 or more (none for e/, custom emoji), a custom domain

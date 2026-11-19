@@ -4120,6 +4120,13 @@ export class Store {
     });
   }
 
+  /** Whether a lower tier has saved state (historyState): it has held history here since tiers were last on. */
+  hasHistoryTierState(name: string, now = this.clock.now()): boolean {
+    this.ensureReady();
+    if (!this.config.tiered) return false;
+    return this.reserved({ reads: 4 }, true, now, () => this.metaValue(META_HISTORY_TIER + name) !== "");
+  }
+
   /** Saves a tier's state (historyState); for the head only `through`, which never falls. */
   saveHistoryState(name: string, head: string, update: Partial<TierState>, now = this.clock.now()): void {
     this.ensureReady();

@@ -1,13 +1,14 @@
 /*
  * The BlobStore conformance suite (test/history/conformance/blob-store.ts)
- * on the stores the Worker can use: MemoryBlobStore, and R2BlobStore over
- * miniflare's R2 (the HISTORY_BLOB dev bucket in wrangler.toml). FsBlobStore
+ * in the workers runtime: the tests' MemoryBlobStore, and the Worker's
+ * R2BlobStore over miniflare's R2 (the HISTORY_BLOB dev bucket in
+ * wrangler.toml). FsBlobStore
  * runs the same suite under `node --test` (scripts/fs-blob-store.test.mjs).
  */
 
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { MemoryBlobStore } from "../../src/history/blob/memory";
+import { MemoryBlobStore } from "./support/memory-blob-store";
 import { R2BlobStore } from "../../src/history/blob/r2";
 import { describeBlobStore } from "./conformance/blob-store";
 

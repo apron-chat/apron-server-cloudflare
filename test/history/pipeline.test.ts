@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { MemoryBlobStore } from "../../src/history/blob/memory";
+import { MemoryBlobStore } from "./support/memory-blob-store";
 import { MemorySegmentIndex } from "../../src/history/blob/segments";
 import { BlobHistoryTier } from "../../src/history/blob/tier";
-import { MemoryHead, MemoryHistoryTier } from "../../src/history/memory";
+import { MemoryHead, MemoryHistoryTier } from "./support/memory-tiers";
 import { type TierView, checkInvariants, mergePages, planRead, planStep, retentionFloor } from "../../src/history/plan";
 import { HistoryPipeline, type PipelineStage, instrument } from "../../src/history/pipeline";
 import type { ChatRecord, Retention } from "../../src/history/records";

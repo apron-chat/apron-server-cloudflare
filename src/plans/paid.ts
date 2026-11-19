@@ -22,7 +22,7 @@
 //   it rather than requests: one timer keeps the object awake up to a minute
 //   after its last event while a status change waits to be announced.
 // - Storage: SQLite keeps the latest 4,000 records, 80% of its 5,000 limit
-//   (80,000 more go to the D1 archive where it is bound), and the database watermarks stop it at
+//   (80,000 more go to the D1 history tier where it is bound), and the database watermarks stop it at
 //   768 MB (1 GB hard), a fifth of the 5 GB-month included. A week of the
 //   demo's traffic in November 2026 was about 800 message records and a
 //   1.5 MB database, so 5,000 records are a few MB;
@@ -50,10 +50,11 @@ export const PAID_PLAN: Plan = Object.freeze({
 	limits: Object.freeze({
 		...FREE_PLAN.limits,
 		// Limits of 5,000 records in the object's SQLite and 100,000 more in
-		// the history archive (D1) where it is bound, of which cleanup keeps
-		// 80% (below): 84,000, about two years at the demo's traffic (above).
-		// D1's share stays within its included 5 GB even were every archived
-		// record a maximum-size snapshot (80,000 × 24 KiB, about 1.9 GB).
+		// the D1 history tier where it is bound, of which cleanup keeps 80%
+		// (below): 84,000, about two years at the demo's traffic (above).
+		// D1's share stays within its included 5 GB even were every record
+		// there a maximum-size snapshot (80,000 × 24 KiB, about 1.9 GB). The
+		// blob tier (R2), where it is bound, keeps everything past that.
 		// Records younger than three days stay whatever the count, so a flood
 		// cannot push out the last few days before an admin purges it; the
 		// database watermarks still bound what the flood itself stores. No age
@@ -62,7 +63,8 @@ export const PAID_PLAN: Plan = Object.freeze({
 		retentionRecords: 5_000,
 		minRetentionSeconds: 3 * 24 * 60 * 60,
 		retentionSeconds: 0,
-		archiveRecords: 100_000,
+		historyD1Records: 100_000,
+		historyBlobRecords: 0,
 		// Those are ceilings: each daily cleanup moves what is past 80% of
 		// SQLite's to D1, and expires what is past 80% of D1's (4,000 and
 		// 80,000 kept), so the rest is headroom for a day's records.

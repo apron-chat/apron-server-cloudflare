@@ -263,7 +263,7 @@ describe("encrypted archives", () => {
 		const error = await failure(encrypted, resolveKeys(env, ["HISTORY_BACKUP_KEY"]));
 		expect(error).toBeInstanceOf(ArchiveKeyError);
 		expect(error.message).toBe(
-			`this backup needs HISTORY_BACKUP_KEY_OLD (fingerprint ${fingerprint}); set it with \`wrangler secret put\`, list it in key_secrets, and import again`,
+			`this backup needs HISTORY_BACKUP_KEY_OLD (fingerprint ${fingerprint}); set it with \`wrangler secret put\`, list it in BACKUP_PREVIOUS_KEY_NAMES, and import again`,
 		);
 		// Listed but unset reads the same.
 		const unset = await failure(encrypted, resolveKeys({}, ["HISTORY_BACKUP_KEY_OLD"]));

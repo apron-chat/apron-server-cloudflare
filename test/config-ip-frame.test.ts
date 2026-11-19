@@ -126,9 +126,13 @@ describe('configuration policy boundaries', () => {
 	});
 
 	it('keeps history by count, by age or both, but not by neither, and only the retention bounds take 0', () => {
-		expect(config().limits).toMatchObject({ retentionRecords: 5_000, minRetentionSeconds: 3 * 86_400, retentionSeconds: 0, archiveRecords: 100_000 });
-		expect(config({ LIMIT_ARCHIVE_RECORDS: '0' }).limits.archiveRecords).toBe(0);
-		expect(() => config({ LIMIT_ARCHIVE_RECORDS: '100001' })).toThrow('archiveRecords exceeds the calibrated bound');
+		expect(config().limits).toMatchObject({ retentionRecords: 5_000, minRetentionSeconds: 3 * 86_400, retentionSeconds: 0, historyD1Records: 100_000, historyBlobRecords: 0 });
+		expect(config({ LIMIT_HISTORY_D1_RECORDS: '0' }).limits.historyD1Records).toBe(0);
+		expect(() => config({ LIMIT_HISTORY_D1_RECORDS: '100001' })).toThrow('historyD1Records exceeds the calibrated bound');
+		expect(config({ LIMIT_HISTORY_BLOB_RECORDS: '1000000' }).limits.historyBlobRecords).toBe(1_000_000);
+		expect(() => config({ LIMIT_HISTORY_BLOB_RECORDS: '-1' })).toThrow('historyBlobRecords must be a non-negative safe integer');
+		// The old name is no limit any more: a leftover fails rather than being ignored.
+		expect(() => config({ LIMIT_ARCHIVE_RECORDS: '0' })).toThrow('LIMIT_ARCHIVE_RECORDS is not a limit');
 		expect(config().limits.cleanupThresholdPercent).toBe(80);
 		expect(config({ LIMIT_CLEANUP_THRESHOLD_PERCENT: '100' }).limits.cleanupThresholdPercent).toBe(100);
 		expect(() => config({ LIMIT_CLEANUP_THRESHOLD_PERCENT: '101' })).toThrow('cleanupThresholdPercent is a share of the limits, at most 100');

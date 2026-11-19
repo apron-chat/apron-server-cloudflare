@@ -464,135 +464,17 @@ export function wranglerVars(source) {
 }
 
 /**
- * The `[vars.HISTORY]` table of a Wrangler file, as Wrangler hands it to the
- * Worker (an object), or undefined without one. It reads only the TOML that
- * table uses: `[vars.HISTORY]`, then `[vars.HISTORY.x]` tables and
- * `[[vars.HISTORY.x]]` arrays of tables wherever they are in the file, and
- * `key = value` lines of strings, integers (with `_`), booleans, inline
- * tables and arrays. Anything else that would reach HISTORY (a quoted or
- * spaced header naming it, a sub-table before `[vars.HISTORY]`, an inline
- * `HISTORY = {…}` or dotted `HISTORY.x =` key, an inline `vars = {…}`
- * naming it) is an error, not a guess or a silent skip: what this reads is
- * what the Worker would get.
- */
-export function wranglerHistory(source) {
-	const fail = (message) => { throw new Error(`HISTORY in the Wrangler file: ${message}`); };
-	let root;
-	let target;
-	let table = '';
-	for (const raw of source.split('\n')) {
-		const line = raw.trim();
-		if (!line || line.startsWith('#')) continue;
-		if (line.startsWith('[')) {
-			const header = /^(\[\[?)([^\]]*)(\]\]?)\s*(?:#.*)?$/.exec(line);
-			const name = header?.[2] ?? line;
-			const history = header && header[1].length === header[3].length ? /^vars\.HISTORY(?:\.([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)*))?$/.exec(name) : null;
-			if (!history) {
-				if (/HISTORY/.test(name)) fail(`cannot read the table header ${line}: write it as [vars.HISTORY] or [vars.HISTORY.<key>], unquoted`);
-				table = name.trim();
-				target = undefined;
-				continue;
-			}
-			table = name;
-			if (history[1] === undefined) {
-				if (header[1] === '[[') fail('[[vars.HISTORY]] is not a table');
-				if (root) fail('[vars.HISTORY] appears twice');
-				target = root = {};
-				continue;
-			}
-			if (!root) fail(`[${name}] comes before [vars.HISTORY]: put [vars.HISTORY] first`);
-			const path = history[1].split('.');
-			let node = root;
-			for (const key of path.slice(0, -1)) node = node[key] ??= {};
-			const last = path.at(-1);
-			if (header[1] === '[[') {
-				if (node[last] !== undefined && !Array.isArray(node[last])) fail(`[[${name}]] after [${name}]`);
-				(node[last] ??= []).push(target = {});
-			} else {
-				if (Array.isArray(node[last])) fail(`[${name}] after [[${name}]]`);
-				target = node[last] ??= {};
-			}
-			continue;
-		}
-		const pair = /^([^=]+?)\s*=\s*(.+)$/.exec(line);
-		if (!target) {
-			// Outside HISTORY's tables: nothing may set it another way.
-			const key = pair?.[1].trim() ?? '';
-			if (/(^|\.)\s*"?HISTORY"?\s*($|\.)/.test(key)) fail(`write HISTORY as a [vars.HISTORY] table, not "${line}"`);
-			if (/(^|\.)\s*"?vars"?$/.test(key) && /\bHISTORY\b/.test(pair[2])) fail(`write HISTORY as a [vars.HISTORY] table, not inline in "${line}"`);
-			continue;
-		}
-		if (!pair || !/^[A-Za-z_][\w-]*$/.test(pair[1])) fail(`cannot read "${line}"`);
-		target[pair[1]] = tomlValue(pair[2]);
-	}
-	return root;
-}
-
-/**
- * Fails where a backup key secret HISTORY names (`encrypt.key_secrets`,
- * `import.key_secrets`) is also a plain `[vars]` var: vars are public, in
- * the file and the dashboard, so its key would be anyone's. Keys are
+ * Fails where a backup key secret the vars name (BACKUP_ENCRYPTION_KEY_NAME,
+ * BACKUP_PREVIOUS_KEY_NAMES) is also a plain `[vars]` var: vars are public,
+ * in the file and the dashboard, so its key would be anyone's. Keys are
  * secrets (`wrangler secret put`).
  */
 export function checkBackupKeySecrets(source) {
-	const history = wranglerHistory(source);
-	if (!history) return;
 	const vars = wranglerVars(source);
-	const names = [
-		...(Array.isArray(history.exports) ? history.exports.flatMap((entry) => entry?.encrypt?.key_secrets ?? []) : []),
-		...(history.import?.key_secrets ?? []),
-	];
+	const names = [vars.BACKUP_ENCRYPTION_KEY_NAME ?? '', ...(vars.BACKUP_PREVIOUS_KEY_NAMES ?? '').split(',')].map((name) => name.trim()).filter(Boolean);
 	for (const name of names) {
-		if (typeof name === 'string' && Object.hasOwn(vars, name)) throw new Error(`HISTORY names ${name} as a backup key, but it is a plain [vars] var, whose value is public: make it a secret (wrangler secret put ${name}) and remove the var`);
+		if (Object.hasOwn(vars, name)) throw new Error(`${name} is named as a backup key, but it is a plain [vars] var, whose value is public: make it a secret (wrangler secret put ${name}) and remove the var`);
 	}
-}
-
-/** One TOML value of the kinds wranglerHistory reads, with an optional trailing comment. */
-function tomlValue(text) {
-	let at = 0;
-	const fail = () => { throw new Error(`HISTORY in the Wrangler file: cannot read the value ${text}`); };
-	const space = () => { while (at < text.length && /\s/.test(text[at])) at += 1; };
-	const value = () => {
-		space();
-		const rest = text.slice(at);
-		if (rest.startsWith('"')) {
-			const match = /^"(?:[^"\\]|\\.)*"/.exec(rest) ?? fail();
-			at += match[0].length;
-			return JSON.parse(match[0]);
-		}
-		if (rest.startsWith('[') || rest.startsWith('{')) {
-			const array = rest.startsWith('[');
-			const out = array ? [] : {};
-			at += 1;
-			space();
-			while (text[at] !== (array ? ']' : '}')) {
-				if (at >= text.length) fail();
-				if (array) out.push(value());
-				else {
-					const key = /^[A-Za-z_][\w-]*/.exec(text.slice(at)) ?? fail();
-					at += key[0].length;
-					space();
-					if (text[at] !== '=') fail();
-					at += 1;
-					out[key[0]] = value();
-				}
-				space();
-				if (text[at] === ',') {
-					at += 1;
-					space();
-				}
-			}
-			at += 1;
-			return out;
-		}
-		const match = /^(?:true|false|[+-]?\d[\d_]*)/.exec(rest) ?? fail();
-		at += match[0].length;
-		return match[0] === 'true' ? true : match[0] === 'false' ? false : Number(match[0].replace(/_/g, ''));
-	};
-	const result = value();
-	space();
-	if (at < text.length && text[at] !== '#') fail();
-	return result;
 }
 
 /** A `true`/`false` Wrangler var in `source`, else `fallback`. */
@@ -644,11 +526,9 @@ function main() {
 	if (new Set(ids).size !== ids.length) throw new Error('Every rate limiter in every config needs its own namespace ID');
 	const { production: main, previews } = splitPreviews(production);
 	// Both sets of vars must load as the Worker loads them, or it would fail every request.
-	// The HISTORY table too (wranglerHistory), which Wrangler hands over as an object.
 	for (const part of [main, ...(previews ? [previews] : [])]) {
 		checkBackupKeySecrets(part);
-		const history = wranglerHistory(part);
-		loadConfig(history ? { ...wranglerVars(part), HISTORY: history } : wranglerVars(part));
+		loadConfig(wranglerVars(part));
 	}
 	const hosts = customDomains(main).filter((domain) => domain.enabled);
 	if (hosts.length !== 1) throw new Error('Expected exactly one production custom domain');

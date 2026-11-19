@@ -104,29 +104,20 @@ it('puts terminal output kept in R2 back into exported records, never the intern
 	expect(embed.output).toBe('build ok');
 });
 
-it('refuses /history export where no export on demand is configured', async () => {
-	const admin = await signedInAdmin();
-	try {
-		await changed((runtime) => {
-			runtime.config = { ...runtime.config, history: { ...runtime.config.history!, exports: [] } };
-		}, async () => {
-			const refused = await command(admin, 'none', '/history export');
-			expect(refused.frame.error).toMatchObject({ code: -32602, message: expect.stringMatching(/^No export on demand: add one without `every` to HISTORY.exports/) });
-		});
-	} finally {
-		admin.close();
-	}
-});
-
+type Backups = { everySeconds?: number; keep: number; privateRooms: boolean; encryptionKeyName?: string; previousKeyNames: string[]; importPlaintext: boolean };
 type Runtime = {
-	config: { history?: { exports: Array<Record<string, unknown>>; import: { plaintext: boolean } } };
+	config: { backups: Backups };
+	runtimeEnv: Record<string, unknown>;
 	history?: unknown;
 	historyBusy?: 'cycle' | 'job';
-	unboundTiers: Array<{ name: string; missing: string }>;
+	d1Unbound?: boolean;
+	backupUnboundWarned: boolean;
 	announce(alert: Record<string, unknown>): void;
-	noteUnboundTiers(now: number): void;
-	runScheduledExports(now: number): Promise<void>;
-	backupTarget(): unknown;
+	unboundD1(now: number): boolean;
+	noteUnboundD1(now: number): void;
+	runScheduledBackup(now: number): Promise<void>;
+	backupStore(): unknown;
+	store: { historyMetaNumber(key: string): number; setHistoryMeta(key: string, value: string | null): void };
 };
 
 /** Runs `fn` on the runtime, then puts back what it changed of it. */
@@ -134,25 +125,45 @@ async function changed(change: (runtime: Runtime) => void, fn: () => Promise<voi
 	let saved: Partial<Runtime> = {};
 	await runInDurableObject(stub(), (instance) => {
 		const runtime = instance as unknown as Runtime;
-		saved = { config: runtime.config, history: runtime.history, historyBusy: runtime.historyBusy, unboundTiers: runtime.unboundTiers };
+		saved = { config: runtime.config, runtimeEnv: runtime.runtimeEnv, history: runtime.history, historyBusy: runtime.historyBusy, d1Unbound: runtime.d1Unbound, backupUnboundWarned: runtime.backupUnboundWarned };
 		change(runtime);
 	});
 	try {
 		await fn();
 	} finally {
 		await runInDurableObject(stub(), (instance) => {
-			const runtime = instance as unknown as Runtime & { backupTarget?: unknown };
+			const runtime = instance as unknown as Runtime;
 			Object.assign(runtime, saved);
-			delete (runtime as { backupTarget?: unknown }).backupTarget;
+			delete (runtime as { backupStore?: unknown }).backupStore;
 		});
 	}
 }
+
+const withBackups = (change: Partial<Backups>) => (runtime: Runtime) => {
+	runtime.config = { ...runtime.config, backups: { ...runtime.config.backups, ...change } };
+};
+
+it('refuses /history export and import without a backup store (HISTORY_BLOB unbound)', async () => {
+	const admin = await signedInAdmin();
+	try {
+		await changed((runtime) => {
+			runtime.runtimeEnv = { ...runtime.runtimeEnv, HISTORY_BLOB: undefined };
+		}, async () => {
+			for (const [id, text] of [['no-store-export', '/history export'], ['no-store-import', '/history import backups/x.jsonl']]) {
+				const refused = await command(admin, id, text);
+				expect(refused.frame.error, text).toMatchObject({ code: -32602, message: expect.stringMatching(/^No backup store: bind an R2 bucket as HISTORY_BLOB/) });
+			}
+		});
+	} finally {
+		admin.close();
+	}
+});
 
 it('matches users only from a backup sealed with this server\'s key, and imports only sealed backups where they are encrypted', async () => {
 	const admin = await signedInAdmin();
 	try {
 		expect((await request(admin, 'sealed-post', 'message', { room_id: 'general', body: { format: 'plain', text: 'sealed' } })).result).toBeDefined();
-		// A plain file claiming to be this server: imported here (plaintext is on in development), its users new, `admin` too.
+		// A plain file claiming to be this server: imported here (IMPORT_PLAINTEXT is on in development), its users new, `admin` too.
 		const base = Date.now() - 60_000;
 		const lines: string[] = [];
 		const writer = jsonlWriter(async (line) => { lines.push(line); });
@@ -168,21 +179,49 @@ it('matches users only from a backup sealed with this server\'s key, and imports
 		const matched = await command(admin, 'forged-match', '/history import backups/forged.jsonl dry-run match');
 		expect(matched.frame.error).toMatchObject({ code: -32602, message: expect.stringMatching(/^users match takes only a backup encrypted with one of this server's keys/) });
 
-		// Encrypted backups, with plaintext off: one of this server's own is matched; a plain file is refused.
-		await changed((runtime) => {
-			const history = runtime.config.history!;
-			runtime.config = { ...runtime.config, history: { ...history, exports: history.exports.map((entry) => ({ ...entry, encrypt: { keySecrets: ['HISTORY_BACKUP_KEY'] } })), import: { ...history.import, plaintext: false } } };
-		}, async () => {
+		// Encrypted backups, with IMPORT_PLAINTEXT off: one of this server's own is matched; a plain file is refused.
+		await changed(withBackups({ encryptionKeyName: 'HISTORY_BACKUP_KEY', importPlaintext: false }), async () => {
 			const exported = await command(admin, 'sealed-export', '/history export general');
 			const key = /to `([^`]+)`/.exec(exported.notice ?? '')?.[1];
-			expect(key).toMatch(/\.enc$/);
-			await env.HISTORY_BLOB!.put('backups/general-copy.enc', await (await env.HISTORY_BLOB!.get(key!))!.text());
+			expect(key).toMatch(/^backups\/localhost-manual-\d{8}-\d{6}\.jsonl\.enc$/);
+			expect(await (await env.HISTORY_BLOB!.get(key!))!.text()).not.toContain('sealed');
 			const own = await command(admin, 'sealed-import', `/history import ${key} dry-run`);
 			expect(own.notice).toMatch(/^Would import 0 records into 0 new rooms\./);
 			expect(own.notice).toContain('admin → admin');
 			const plain = await command(admin, 'plain-refused', '/history import backups/forged.jsonl dry-run');
-			expect(plain.frame.error).toMatchObject({ code: -32602, message: 'backups/forged.jsonl is not encrypted, and this server imports only encrypted backups (HISTORY.import.plaintext)' });
+			expect(plain.frame.error).toMatchObject({ code: -32602, message: 'backups/forged.jsonl is not encrypted, and this server imports only encrypted backups (IMPORT_PLAINTEXT)' });
+			// Out of the way of the next backup, which may fall in the same second.
+			await env.HISTORY_BLOB!.delete(key!);
 		});
+		// After a rotation, the old secret named in BACKUP_PREVIOUS_KEY_NAMES still reads its backups.
+		await changed(withBackups({ encryptionKeyName: 'HISTORY_BACKUP_KEY_OLD', importPlaintext: false }), async () => {
+			const exported = await command(admin, 'old-export', '/history export general');
+			const key = /to `([^`]+)`/.exec(exported.notice ?? '')?.[1];
+			expect(key).toMatch(/\.enc$/);
+			await changed(withBackups({ encryptionKeyName: 'HISTORY_BACKUP_KEY', previousKeyNames: [] }), async () => {
+				const unreadable = await command(admin, 'old-unreadable', `/history import ${key} dry-run`);
+				expect(unreadable.frame.error?.message).toMatch(/this backup needs HISTORY_BACKUP_KEY_OLD/);
+			});
+			await changed(withBackups({ encryptionKeyName: 'HISTORY_BACKUP_KEY', previousKeyNames: ['HISTORY_BACKUP_KEY_OLD'] }), async () => {
+				const read = await command(admin, 'old-read', `/history import ${key} dry-run`);
+				expect(read.frame.error).toBeUndefined();
+				expect(read.notice).toMatch(/^Would import 0 records into 0 new rooms\./);
+			});
+		});
+	} finally {
+		admin.close();
+	}
+});
+
+it('fails an encrypted export whose secret is not set, writing nothing rather than a plain backup', async () => {
+	const admin = await signedInAdmin();
+	try {
+		const before = (await env.HISTORY_BLOB!.list({ prefix: 'backups/' })).objects.length;
+		await changed(withBackups({ encryptionKeyName: 'NO_SUCH_SECRET' }), async () => {
+			const refused = await command(admin, 'no-secret', '/history export');
+			expect(refused.frame.error).toMatchObject({ code: -32602, message: 'backups are encrypted with NO_SUCH_SECRET (BACKUP_ENCRYPTION_KEY_NAME), which is not set: set it with `wrangler secret put NO_SUCH_SECRET`' });
+		});
+		expect((await env.HISTORY_BLOB!.list({ prefix: 'backups/' })).objects.length).toBe(before);
 	} finally {
 		admin.close();
 	}
@@ -192,9 +231,8 @@ it('refuses a file larger than an import reads, before reading it', async () => 
 	const admin = await signedInAdmin();
 	try {
 		await changed((runtime) => {
-			const settings = runtime.config.history!.exports[0];
 			const read = vi.fn();
-			runtime.backupTarget = () => ({ store: { get: async () => ({ size: 64 * 1024 * 1024 + 1, text: read }) }, settings });
+			runtime.backupStore = () => ({ get: async () => ({ size: 64 * 1024 * 1024 + 1, text: read }) });
 		}, async () => {
 			const big = await command(admin, 'big', '/history import backups/big.jsonl');
 			expect(big.frame.error).toMatchObject({ code: -32602, message: `backups/big.jsonl is ${64 * 1024 * 1024 + 1} bytes; an import reads at most ${64 * 1024 * 1024}` });
@@ -218,17 +256,44 @@ it('runs one history job at a time: an import, export or index rebuild waits for
 	}
 });
 
-it('runs no other composition while a listed tier is unbound: it shows in /history status, and admins are alerted after stall_after', async () => {
+it('takes the D1 tier for unbound only once it holds history: no other composition runs in its place', async () => {
+	const fresh = await runInDurableObject(stub(), (instance, state) => {
+		const runtime = instance as unknown as Runtime & { store: { saveHistoryState(name: string, head: string, update: Record<string, unknown>): void } };
+		const known = state.storage.sql.exec<{ key: string }>("SELECT key FROM _meta WHERE key = 'history:tier:recent'").toArray().length > 0;
+		const env = runtime.runtimeEnv;
+		const cached = runtime.d1Unbound;
+		try {
+			runtime.runtimeEnv = { ...env, HISTORY_D1: undefined };
+			if (known) state.storage.sql.exec("DELETE FROM _meta WHERE key = 'history:tier:recent'");
+			runtime.d1Unbound = undefined;
+			// Bound, never unbound; unbound with no state, a deploy without D1 that simply never had it.
+			const unused = runtime.unboundD1(Date.now());
+			runtime.store.saveHistoryState('recent', 'hot', {});
+			runtime.d1Unbound = undefined;
+			const held = runtime.unboundD1(Date.now());
+			runtime.runtimeEnv = env;
+			runtime.d1Unbound = undefined;
+			return { unused, held, bound: runtime.unboundD1(Date.now()) };
+		} finally {
+			runtime.runtimeEnv = env;
+			runtime.d1Unbound = cached;
+			if (!known) state.storage.sql.exec("DELETE FROM _meta WHERE key = 'history:tier:recent'");
+		}
+	});
+	expect(fresh).toEqual({ unused: false, held: true, bound: false });
+});
+
+it('while the D1 tier is unbound, it shows in /history status, exports wait, and admins are alerted after six hours', async () => {
 	const admin = await signedInAdmin();
 	try {
 		await changed((runtime) => {
-			runtime.history = undefined;
-			runtime.unboundTiers = [{ name: 'recent', missing: 'the HISTORY_D1 binding' }];
+			runtime.d1Unbound = true;
+			runtime.runtimeEnv = { ...runtime.runtimeEnv, HISTORY_D1: undefined };
 		}, async () => {
 			const status = await command(admin, 'unbound-status', '/history status');
-			expect(status.notice).toContain('- History tier `recent`: **unbound** (needs the HISTORY_D1 binding): no history moves below SQLite until it is bound');
+			expect(status.notice).toContain('- History in D1: **unbound** (it holds history; needs the `HISTORY_D1` binding): no history moves below SQLite until it is bound');
 			const refused = await command(admin, 'unbound-export', '/history export');
-			expect(refused.frame.error?.message).toMatch(/^History tier recent is unbound in this deploy/);
+			expect(refused.frame.error?.message).toMatch(/^History tier recent \(D1\) holds history but HISTORY_D1 is unbound in this deploy/);
 			const alerts = await runInDurableObject(stub(), (instance) => {
 				const runtime = instance as unknown as Runtime;
 				const seen: Array<Record<string, unknown>> = [];
@@ -236,11 +301,11 @@ it('runs no other composition while a listed tier is unbound: it shows in /histo
 				runtime.announce = (alert) => { seen.push(alert); };
 				try {
 					const now = Date.now();
-					runtime.noteUnboundTiers(now);
-					runtime.noteUnboundTiers(now + 60_000);
+					runtime.noteUnboundD1(now);
+					runtime.noteUnboundD1(now + 60_000);
 					const early = seen.length;
-					runtime.noteUnboundTiers(now + 7 * 3_600_000);
-					runtime.noteUnboundTiers(now + 8 * 3_600_000);
+					runtime.noteUnboundD1(now + 7 * 3_600_000);
+					runtime.noteUnboundD1(now + 8 * 3_600_000);
 					return { early, alerts: seen };
 				} finally {
 					runtime.announce = announce;
@@ -259,24 +324,56 @@ it('runs no other composition while a listed tier is unbound: it shows in /histo
 	}
 });
 
-it('says once a wake that a scheduled export has no store', async () => {
+it('backs up on BACKUP_EVERY\'s schedule only, keeping BACKUP_KEEP scheduled backups apart from manual ones', async () => {
+	const scheduled = async () => (await env.HISTORY_BLOB!.list({ prefix: 'backups/localhost-scheduled-' })).objects.map((object) => object.key);
+	const manual = (await env.HISTORY_BLOB!.list({ prefix: 'backups/localhost-manual-' })).objects.length;
+	// On demand only (development's BACKUP_EVERY = ""): no schedule runs.
+	await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).runScheduledBackup(Date.now() + 86_400_000));
+	expect(await scheduled()).toEqual([]);
+	await changed(withBackups({ everySeconds: 3_600, keep: 2 }), async () => {
+		await runInDurableObject(stub(), async (instance) => {
+			const runtime = instance as unknown as Runtime;
+			const last = runtime.store.historyMetaNumber('history:export:scheduled');
+			try {
+				// Each run writes one, a second later each; within the interval, none.
+				const at = Date.now();
+				for (const offset of [0, 1_000, 2_000]) {
+					runtime.store.setHistoryMeta('history:export:scheduled', null);
+					vi.useFakeTimers({ now: at + offset, toFake: ['Date'] });
+					try { await runtime.runScheduledBackup(at + offset); } finally { vi.useRealTimers(); }
+				}
+				await runtime.runScheduledBackup(at + 60_000);
+			} finally {
+				runtime.store.setHistoryMeta('history:export:scheduled', last ? String(last) : null);
+			}
+		});
+	});
+	const keys = await scheduled();
+	expect(keys).toHaveLength(2);
+	for (const key of keys) expect(key).toMatch(/^backups\/localhost-scheduled-\d{8}-\d{6}\.jsonl$/);
+	// Pruning the scheduled ones left the manual ones alone.
+	expect((await env.HISTORY_BLOB!.list({ prefix: 'backups/localhost-manual-' })).objects.length).toBe(manual);
+});
+
+it('says once a wake that the scheduled backup has no store', async () => {
 	await changed((runtime) => {
-		const history = runtime.config.history!;
-		runtime.config = { ...runtime.config, history: { ...history, exports: [{ ...history.exports[0], name: 'nightly', everySeconds: 60, store: { provider: 'r2', binding: 'NO_SUCH_BUCKET', prefix: 'backups/' } }] } };
+		withBackups({ everySeconds: 60 })(runtime);
+		runtime.runtimeEnv = { ...runtime.runtimeEnv, HISTORY_BLOB: undefined };
+		runtime.backupUnboundWarned = false;
 	}, async () => {
 		const warnings = await runInDurableObject(stub(), async (instance) => {
 			const runtime = instance as unknown as Runtime;
 			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 			try {
 				const now = Date.now() + 3_600_000;
-				await runtime.runScheduledExports(now);
-				await runtime.runScheduledExports(now + 120_000);
+				await runtime.runScheduledBackup(now);
+				await runtime.runScheduledBackup(now + 120_000);
 				return warn.mock.calls.map((call) => String(call[0])).filter((line) => line.includes('history_export_unbound'));
 			} finally {
 				warn.mockRestore();
 			}
 		});
 		expect(warnings).toHaveLength(1);
-		expect(JSON.parse(warnings[0])).toMatchObject({ event: 'history_export_unbound', name: 'nightly', reason: 'its store is unavailable (bind NO_SUCH_BUCKET)' });
+		expect(JSON.parse(warnings[0])).toMatchObject({ event: 'history_export_unbound', reason: 'no backup store: bind HISTORY_BLOB' });
 	});
 });

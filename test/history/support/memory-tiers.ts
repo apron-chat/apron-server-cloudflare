@@ -1,14 +1,14 @@
 /*
- * History tiers in memory: a rewritable tier and a head, for tests, the
- * reference model's runs (PLAN §12.3) and Node scripts. They keep records
+ * History tiers in memory: a rewritable tier and a head, for tests and the
+ * reference model's runs (PLAN §12.3); never in the Worker. They keep records
  * as the SQLite and D1 tiers do, one per room and log ID, and rewrite them
  * with the same functions (records.ts).
  */
 
-import type { ArchivedRoom, ArchivedUser } from "./archive/types";
-import { retentionFloor } from "./plan";
-import { type ChatRecord, type Clock, type HistoryOp, type HistoryQuery, type QueuedOp, type RecordRange, type Retention, type TierStats, authoredMessages, byLog, limitByLogId, logIds, purgedRecord, renamedRecord, toRange } from "./records";
-import type { FloorContext, HistoryHead, PurgeResult, RewritableTier } from "./tier";
+import type { ArchivedRoom, ArchivedUser } from "../../../src/history/archive/types";
+import { retentionFloor } from "../../../src/history/plan";
+import { type ChatRecord, type Clock, type HistoryOp, type HistoryQuery, type QueuedOp, type RecordRange, type Retention, type TierStats, authoredMessages, byLog, limitByLogId, logIds, purgedRecord, renamedRecord, toRange } from "../../../src/history/records";
+import type { FloorContext, HistoryHead, PurgeResult, RewritableTier } from "../../../src/history/tier";
 
 const key = (record: Pick<ChatRecord, "room_id" | "log_id">) => `${record.log_id}\u0000${record.room_id}`;
 

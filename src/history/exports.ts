@@ -1,7 +1,9 @@
 /*
- * Backups (PLAN §13.2): full ARCHIVE.md exports written to a blob store,
- * optionally encrypted (§13.3), keeping the newest few. Scheduled by the
- * `HISTORY` config's `exports`, or run by an admin's `/history export`.
+ * Backups (PLAN §13.2): full ARCHIVE.md exports written to the history blob
+ * store (HISTORY_BLOB) under `backups/`, encrypted where
+ * BACKUP_ENCRYPTION_KEY_NAME names a secret (§13.3), keeping the newest
+ * BACKUP_KEEP of each kind: `scheduled` (every BACKUP_EVERY) and `manual`
+ * (an admin's `/history export`), on the same settings (src/config.ts).
  * The export streams into the store's writer (R2: a multipart upload), so
  * it is never held whole in memory; a failure aborts the upload, leaving
  * nothing behind.
@@ -14,33 +16,53 @@ import { jsonlWriter } from "./archive/format";
 import type { BlobStore } from "./blob/store";
 import type { HistoryPipeline } from "./pipeline";
 import type { Clock } from "./records";
-import type { ExportSettings } from "./settings";
+
+/** The backup settings (the BACKUP_* and IMPORT_PLAINTEXT vars, parsed by src/config.ts). */
+export interface BackupSettings {
+	/** How often the scheduled backup runs, in seconds; undefined: on demand only (`/history export`). */
+	everySeconds?: number;
+	/** How many backup files of each kind are kept, newest first. */
+	keep: number;
+	/** Whether private rooms are backed up. */
+	privateRooms: boolean;
+	/** The secret the backup key is derived from; undefined: backups are not encrypted. */
+	encryptionKeyName?: string;
+	/** Older secrets, only for reading backups made before a rotation. */
+	previousKeyNames: readonly string[];
+	/** Whether `/history import` takes a file that is not encrypted. */
+	importPlaintext: boolean;
+}
+
+/** A scheduled backup, or one an admin asked for. */
+export type BackupKind = "scheduled" | "manual";
+
+/** Where backups live in the history blob store. */
+export const BACKUP_PREFIX = "backups/";
+
+/** Every backup key secret the settings name: the one backups are encrypted with, then those kept for reading old ones (§13.3). */
+export function backupKeyNames(settings: Pick<BackupSettings, "encryptionKeyName" | "previousKeyNames">): string[] {
+	return [...new Set([...(settings.encryptionKeyName ? [settings.encryptionKeyName] : []), ...settings.previousKeyNames])];
+}
 
 /** `2026-11-19T17:30:05.123Z` → `20261119-173005`: sorts in time order. */
 export function exportStamp(now: number): string {
 	return new Date(now).toISOString().slice(0, 19).replace(/[-:]/g, "").replace("T", "-");
 }
 
-/** An export's object key: its template with `{server}`, `{name}` and `{date}` filled in, `.enc` added when encrypted. */
-export function exportKey(settings: Pick<ExportSettings, "key" | "name" | "store" | "encrypt">, server: string, now: number): string {
-	const name = settings.key.replaceAll("{server}", server).replaceAll("{name}", settings.name).replaceAll("{date}", exportStamp(now));
-	return `${settings.store.prefix}${name}${settings.encrypt && !name.endsWith(".enc") ? ".enc" : ""}`;
+/** A backup's object key: `backups/<server>-<kind>-<date>.jsonl`, `.enc` added when encrypted. */
+export function backupKey(settings: Pick<BackupSettings, "encryptionKeyName">, kind: BackupKind, server: string, now: number): string {
+	return `${BACKUP_PREFIX}${server}-${kind}-${exportStamp(now)}.jsonl${settings.encryptionKeyName ? ".enc" : ""}`;
 }
 
 /**
- * This export's backups: the store prefix to list, and the pattern its keys
- * match whole (the template with a date in place of `{date}`), so another
- * export, or anything else under the prefix, is never taken for one.
+ * One kind's backups: the prefix to list, and the pattern their keys match
+ * whole (encrypted or not), so the other kind, another server's, or
+ * anything else under `backups/` is never taken for one.
  */
-export function exportFamily(settings: Pick<ExportSettings, "key" | "name" | "store" | "encrypt">, server: string): { prefix: string; pattern: RegExp } {
-	const template = settings.key.replaceAll("{server}", server).replaceAll("{name}", settings.name);
-	const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	const [before, after] = [template.slice(0, template.indexOf("{date}")), template.slice(template.indexOf("{date}") + "{date}".length)];
-	const suffix = settings.encrypt && !template.endsWith(".enc") ? ".enc" : "";
-	return {
-		prefix: `${settings.store.prefix}${before}`,
-		pattern: new RegExp(`^${escape(settings.store.prefix + before)}\\d{8}-\\d{6}${escape(after + suffix)}$`),
-	};
+export function backupFamily(kind: BackupKind, server: string): { prefix: string; pattern: RegExp } {
+	const prefix = `${BACKUP_PREFIX}${server}-${kind}-`;
+	const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	return { prefix, pattern: new RegExp(`^${escaped}\\d{8}-\\d{6}\\.jsonl(?:\\.enc)?$`) };
 }
 
 export interface BackupResult extends ExportReport {
@@ -50,23 +72,24 @@ export interface BackupResult extends ExportReport {
 
 /**
  * Writes one backup of the whole pipeline to `store`, then deletes this
- * export's backups past the newest `keep`. With `encrypt`, the first listed
- * key secret encrypts it; a missing key fails before anything is written,
- * as does a backup of this export made in the same second (its key).
+ * kind's backups past the newest `keep`. With an encryption key name, that
+ * secret's key encrypts it; a missing secret fails before anything is
+ * written (never a plain backup instead), as does a backup of this kind
+ * made in the same second (its key).
  */
-export async function writeBackup(pipeline: HistoryPipeline, store: BlobStore, settings: ExportSettings, options: { server: string; clock: Clock; keys?: Pick<BackupKeys, "lookup">; roomIds?: string[]; header?: Partial<ArchiveHeader>; prepare?: ExportOptions["prepare"] }): Promise<BackupResult> {
+export async function writeBackup(pipeline: HistoryPipeline, store: BlobStore, settings: BackupSettings, kind: BackupKind, options: { server: string; clock: Clock; keys?: Pick<BackupKeys, "lookup">; roomIds?: string[]; header?: Partial<ArchiveHeader>; prepare?: ExportOptions["prepare"] }): Promise<BackupResult> {
 	const now = options.clock.now();
-	const key = exportKey(settings, options.server, now);
+	const key = backupKey(settings, kind, options.server, now);
 	let encryptWith: { name: string; key: CryptoKey; fingerprint: string } | undefined;
-	if (settings.encrypt) {
-		const name = settings.encrypt.keySecrets[0];
+	if (settings.encryptionKeyName) {
+		const name = settings.encryptionKeyName;
 		const found = await options.keys?.lookup(name);
-		if (!found) throw new Error(`the export ${settings.name} encrypts with ${name}, which is not set: set it with \`wrangler secret put ${name}\``);
+		if (!found) throw new Error(`backups are encrypted with ${name} (BACKUP_ENCRYPTION_KEY_NAME), which is not set: set it with \`wrangler secret put ${name}\``);
 		encryptWith = { name, ...found };
 	}
 	// Keys are to the second: a second backup within it would replace the first.
 	if ((await store.list(key, { limit: 1 })).keys.some((entry) => entry.key === key)) {
-		throw new Error(`the backup ${key} exists already (another export this second): try again in a moment`);
+		throw new Error(`the backup ${key} exists already (another backup this second): try again in a moment`);
 	}
 	const writer = await store.writer(key, { contentType: encryptWith ? "application/octet-stream" : "application/jsonl" });
 	let report: ExportReport;
@@ -84,8 +107,8 @@ export async function writeBackup(pipeline: HistoryPipeline, store: BlobStore, s
 		await writer.abort().catch(() => undefined);
 		throw error;
 	}
-	// The newest `keep` of this export's backups stay; keys sort by date.
-	const family = exportFamily(settings, options.server);
+	// The newest `keep` of this kind's backups stay; keys sort by date.
+	const family = backupFamily(kind, options.server);
 	const keys: string[] = [];
 	let cursor: string | undefined;
 	do {

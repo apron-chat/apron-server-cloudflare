@@ -395,9 +395,10 @@ are set; set up all of these first:
 5. **Signing key.** `openssl rand -base64 48 | npx wrangler secret put
    UPLOAD_SIGNING_KEY --config wrangler.production.toml`. Rotating it
    invalidates `write_url`s already issued, and, while production's
-   `HISTORY` encrypts backups with it, makes older backups unreadable unless
-   the old value stays set under another name listed in `import.key_secrets`
-   ([Backups and imports](#backups-and-imports)).
+   backups are encrypted with it (`BACKUP_ENCRYPTION_KEY_NAME`), makes older
+   backups unreadable unless the old value stays set under another name
+   listed in `BACKUP_PREVIOUS_KEY_NAMES` ([Backups and
+   imports](#backups-and-imports)).
 6. **Edge rules.** Update `apron_invalid_request` and `apron_budget_stop`,
    and create `apron_media_invalid` and `apron_media_nosniff`, from
    [the generated definitions](edge-rules.generated.json). With uploads,
@@ -738,15 +739,17 @@ maintenance writes (6 if the object was still in memory). See the
 ## History retention
 
 History (the server-wide log) leaves the object's SQLite, the hot log, from
-its oldest end by three limits, and then, where the D1 history tier is
-bound, stays in D1 for a fourth:
+its oldest end by three limits, and then, where the tiers below are bound,
+stays in D1 and R2 by two more ([History tiers](#history-tiers)). Each is a `LIMIT_*` var (`LIMIT_RETENTION_RECORDS`
+and so on), which both Wrangler configs write out:
 
 | Limit | Workers Paid | Workers Free |
 | --- | ---: | ---: |
 | `retentionRecords`: the hot log keeps at least the latest this many records | 5000 | 0 (off) |
 | `minRetentionSeconds`: never move a younger record out by count | 3 days | 1 day |
 | `retentionSeconds`: move an older record out whatever the count | 0 (off) | 1 day |
-| `archiveRecords`: the D1 tier keeps the newest this many records that left | 100000 | 0 (off) |
+| `historyD1Records`: the D1 tier keeps the newest this many records that left | 100000 | 0 (off) |
+| `historyBlobRecords`: the blob tier keeps the newest this many records past D1's | 0 (everything) | 0 (everything) |
 | `cleanupThresholdPercent`: the share of each count limit cleanup keeps | 80 | 80 |
 
 A record leaves the hot log once it is past the latest `retentionRecords` and
@@ -760,7 +763,8 @@ where the count ends, so it is at most 50,000.
 **The limits are ceilings.** Each daily cleanup keeps `cleanupThresholdPercent`
 of each count limit (80%: 4,000 of the hot log's 5,000 and 80,000 of the
 D1 tier's 100,000, 84,000 in all): it moves what is past the hot log's share
-to the D1 tier, and expires what is past the D1 tier's. The rest of each
+to the D1 tier, and what is past the D1 tier's to the blob tier, or expires
+it without one. The rest of each
 limit is headroom for a day's records, so the hot log reaches its limit only
 on a day that brings more than 1,000 records, or when records are younger
 than the minimum age. 100 keeps each limit whole, as a floor rather than a
@@ -774,10 +778,6 @@ more. The minimum age
 keeps a flood from pushing out the last three days before an admin purges
 it; the database watermarks still bound what the flood stores.
 
-These limits compose the default tiers: SQLite, then D1 where it is bound. The
-`HISTORY` var composes them instead ([below](#the-history-config)), and
-then sets these limits itself.
-
 Uploaded files expire by age (`fileRetentionSeconds`, 120 days on Paid), since
 the bucket's lifecycle rules can only expire by age: a message kept longer
 shows without its file. A removed account's `user_id` is retired until history
@@ -787,15 +787,18 @@ below), not for a time, so it follows whichever limit moves the log.
 ### History tiers
 
 History is kept in a pipeline of tiers (`src/history/`; [SPEC section
-9](../SPEC.md#history-tiers)), newest first: the hot log, then the tiers
-records go to when they leave it. By default the one tier below is the D1
-history tier (`src/history/d1.ts`, named `recent`): a D1 database bound as
-`HISTORY_D1` (`wrangler.toml`, a local one; `wrangler.production.toml`,
-`apron-archive`, which keeps the name it was created with; Previews bind
-none), on while `archiveRecords` is above 0. The object creates its table on
-first use.
+9](../SPEC.md#history-tiers)), newest first, in a fixed order that comes
+from the bindings alone (`src/history/config.ts`): the hot log (`hot`),
+then the D1 tier (`recent`, `src/history/d1.ts`) where a D1 database is
+bound as `HISTORY_D1` and `historyD1Records` is above 0, then the blob tier
+(`cold`, `src/history/blob/`) where an R2 bucket is bound as `HISTORY_BLOB`.
+There is no tier list to configure: changing the composition is a code
+change. `wrangler.toml` binds a local database and bucket; production binds
+`apron-archive` (which keeps the name it was created with) and no bucket
+yet, and Previews bind neither. The object creates its D1 table on first
+use.
 
-Records leaving the hot log are copied to the D1 tier first, and removed
+Records leaving the hot log are copied to the tier below first, and removed
 from SQLite only once copied: cleanup moves the hot floor no further than the
 last record copied (`history:head:through` in `_meta`). On each full alarm,
 before cleanup and again after a cleanup batch that removed records, the
@@ -813,13 +816,13 @@ cannot be edited, reacted to or replied to.
 
 `/purge` and `/rename` reach the D1 tier too, on an alarm a second later;
 until it has applied them, history pages that read it apply them in memory.
-They stop at a blob tier (below), whose records they do not rewrite, so
+They stop at the blob tier (below), whose records they do not rewrite, so
 history may still serve a purged user's messages from it. At most 200 of
 them wait for the tiers below at once: past that, `/purge` and `/rename`
 answer `retry_after` until the tiers catch up.
 
 Finding the floor the D1 tier's retention allows reads the D1 index entries
-of the records it keeps (80,000 on Paid), so `archiveRecords` is at most
+of the records it keeps (80,000 on Paid), so `historyD1Records` is at most
 100,000. It is found again only once the hot log copied into D1 or let
 records go since, or an hour after the last time otherwise, so in practice
 once a day, after the daily cleanup: about 2.4 million D1 rows read a month,
@@ -833,176 +836,73 @@ meanwhile, so it grows; at worst posting pauses at the database high-water
 mark, and nothing is lost. `/status` shows a stalled copy (`- History copy
 SQLite → D1: failing since …`), and once a copy has failed for 6 hours the
 admins are told (`history_stall`), once a stall. A history page that needs a
-tier that fails answers `retry_after`. Without the binding, or with
-`archiveRecords` 0, records expire as they leave the hot log, and only 4,000
-are kept on Paid; the tiers' state in `_meta` is forgotten, and turned on
-again, the D1 tier starts at the hot floor.
+tier that fails answers `retry_after`. With no tier below the hot log,
+records expire as they leave it, and only 4,000 are kept on Paid; the
+tiers' state in `_meta` is forgotten, and turned on again, they start at
+the hot floor. The D1 tier is never skipped once it holds history: with
+`HISTORY_D1` unbound (or `historyD1Records` 0) while its state remains and
+the blob tier is bound, history stops moving below SQLite rather than go to
+the blob tier past what D1 holds. SQLite keeps what it holds meanwhile;
+`/status` shows D1 **unbound**, the Worker logs `history_tier_unbound`,
+admins get `history_stall` after 6 hours, history pages below the hot floor
+answer `retry_after`, and exports and imports are refused, until it is
+bound again.
 
 `/history status` (admins) shows each tier's floor, how far it has copied to
 the next, the published floor, and whether the pipeline's invariants hold.
 
-**Blob tiers.** A blob tier keeps history in a blob store, R2 in the Worker,
-as one object a room and stretch of the log, each a complete ARCHIVE.md v1
-file that apron-web can open, with an index in the object's SQLite. It is
-read only for single-room pages (a page of the joined rooms stops above
-it), is not rewritten by `/purge` or `/rename`, keeps everything unless given
-a retention, and merges small segments when nothing else is due. It needs
-the `HISTORY` var and a bucket binding (`HISTORY_BLOB` in the examples).
-`wrangler.toml` binds a local bucket, `apron-history-dev`, which the tests
-and `wrangler dev` use; production has no bucket yet, so it runs no blob tier,
-and Previews bind none. The bucket must be private: no custom domain and no
-r2.dev URL. `/history rebuild-index` adds to the index what a listing of the
-bucket finds that it lacks.
-
-### The HISTORY config
-
-The `HISTORY` var (`src/history/settings.ts`) composes the pipeline, its
-schedule and alerts, scheduled backups and import defaults in one place. It
-is a TOML table under `[vars]`, which reaches the Worker as a JSON object (a
-JSON string is accepted too), and is checked when the Worker starts: an
-invalid one fails every request's configuration check, naming the setting.
-Unset, the default tiers above apply. A full example:
-
-```toml
-[vars.HISTORY]
-# Cleanup's interval and share (cleanupSeconds, cleanupThresholdPercent),
-# and the log IDs one copy step carries (1 to 100).
-schedule = { every = "1d", batch = 100, threshold_percent = 80 }
-# How long a copy to a tier below fails before admins are told.
-alerts = { stall_after = "6h" }
-
-# The tiers, newest first. The first is the object's SQLite.
-[[vars.HISTORY.tiers]]
-name = "hot"
-kind = "sqlite"
-retention = { records = 5_000, min_age = "3d" }
-
-[[vars.HISTORY.tiers]]
-name = "recent"
-kind = "d1"
-binding = "HISTORY_D1"
-retention = { records = 100_000 }
-
-[[vars.HISTORY.tiers]]
-name = "cold"
-kind = "blob"
-store = { provider = "r2", binding = "HISTORY_BLOB", prefix = "history/" }
-# cache = { bytes = "8MiB" }   # decoded segments kept in memory
-# readable = true              # false: written, never read by history
-
-# Backups (below): one each day, and one an admin makes on demand (no `every`).
-[[vars.HISTORY.exports]]
-name = "nightly"
-every = "1d"
-store = { provider = "r2", binding = "HISTORY_BLOB", prefix = "backups/" }
-keep = 14
-private_rooms = true
-encrypt = { key_secrets = ["UPLOAD_SIGNING_KEY"] }
-
-[[vars.HISTORY.exports]]
-name = "manual"
-store = { provider = "r2", binding = "HISTORY_BLOB", prefix = "backups/" }
-keep = 10
-private_rooms = true
-encrypt = { key_secrets = ["UPLOAD_SIGNING_KEY"] }
-
-# Defaults for `/history import`, and secrets kept only to read old backups.
-[vars.HISTORY.import]
-users = "auto"
-key_secrets = ["HISTORY_BACKUP_KEY_2025"]
-plaintext = false   # refuse files that are not encrypted (default here: an export encrypts)
-```
-
-- **Tiers.** The first tier is `kind = "sqlite"`, and no other is. At most
-  one is `kind = "d1"`; any number are `kind = "blob"`. Each has a `name`
-  (lowercase letters, digits, `_` and `-`, up to 32, starting with a letter),
-  unique among them, which keys its state in `_meta` (`history:tier:<name>`)
-  and a blob tier's index: renaming a tier starts it afresh.
-- **Retention.** `retention` takes `records`, `bytes`, `age`, `min_age` and
-  `threshold_percent`, the strictest limit winning. The SQLite tier needs
-  `records` or `age` (`retentionRecords`, `retentionSeconds`; `min_age` is
-  `minRetentionSeconds`), and takes no `bytes`. The D1 tier needs `records`
-  (`archiveRecords`) and takes `records` and `age` only. A blob tier with no
-  retention keeps everything; one with a retention deletes whole segments,
-  oldest first. The values the SQLite and D1 tiers set are checked as the
-  `LIMIT_*` vars are (at most 50,000 and 100,000 records, a minimum age of at
-  least the cleanup interval, and so on).
-- **`threshold_percent`.** `schedule`'s is the share of each count limit
-  that is kept (`cleanupThresholdPercent`); without it, the SQLite tier's
-  retention gives it, and else the plan's 80 applies. A lower tier's own
-  `threshold_percent` overrides it for that tier.
-- **The `LIMIT_*` vars.** `HISTORY` replaces `LIMIT_RETENTION_RECORDS`,
-  `LIMIT_RETENTION_SECONDS`, `LIMIT_MIN_RETENTION_SECONDS`,
-  `LIMIT_ARCHIVE_RECORDS` and `LIMIT_CLEANUP_THRESHOLD_PERCENT`: setting it
-  with any of them is a configuration error naming them, so it is never
-  unclear which wins. `schedule.every` sets the cleanup interval
-  (`cleanupSeconds`).
-- **Durations and sizes.** Durations are `"45s"`, `"30m"`, `"6h"` or
-  `"3d"`, or a number of seconds; sizes are `"512KB"`, `"1MB"` (powers of
-  1,000), `"8MiB"` (powers of 1,024), or a number of bytes. Counts may be
-  written `5_000`.
-- **Stores.** A blob tier's or export's `store` is `{ provider = "r2",
-  binding = "…", prefix = "…/" }` in the Worker. `provider = "memory"` (for
-  tests) and `provider = "fs"` (a directory, for Node scripts:
-  `scripts/fs-blob-store.mjs`) are unavailable in the Worker, as an unbound
-  bucket is. A `prefix` ends in `/`; a blob tier's segments go under
-  `<prefix><RP_ID>/`, so servers may share a bucket.
-- **Missing bindings.** A tier listed here whose binding the deployment
-  lacks (or whose store the Worker cannot use) is not left out, which would
-  run another composition under state kept for this one: history stops
-  moving below SQLite until it is bound. SQLite keeps what it holds
-  meanwhile, `/status` and `/history status` show the tier unbound, the
-  Worker logs `history_tier_unbound` on each wake, admins get the
-  `history_stall` notice after `stall_after`, and exports and imports are
-  refused. So list only tiers the deployment binds: production lists no blob
-  tier, as it has no bucket for one. A scheduled export whose store is
-  missing is skipped, logged once a wake (`history_export_unbound`).
-- **Secrets stay secret.** A name in `encrypt.key_secrets` or
-  `import.key_secrets` must be a secret (`wrangler secret put`), never a
-  `[vars]` var, whose value is public; `npm run budget:check` fails on one.
-  It also reads every `[vars.HISTORY…]` table wherever it is in the file,
-  and fails on any `HISTORY` it cannot read (a quoted header, an inline
-  `HISTORY = {…}`, a dotted `HISTORY.x =` key) rather than skip it.
-- **Blob segments.** Each copy into a blob tier writes one segment per room
-  it names, and segments stay as written: they are never merged or
-  compacted later. `cache.bytes` (8 MiB) caps the decoded segments a
-  reading object keeps.
-- **Previews** read `[previews.vars]`, not `[vars]`; give them a `HISTORY` of
-  their own there, if any. They bind no D1 database and no bucket.
+**The blob tier** keeps history in R2 as one object a room and stretch of
+the log, under `history/<RP_ID>/` (so servers may share a bucket), each a
+complete ARCHIVE.md v1 file that apron-web can open, with an index in the
+object's SQLite. It is read only for single-room pages (a page of the
+joined rooms stops above it), is not rewritten by `/purge` or `/rename`,
+and keeps everything unless `historyBlobRecords` is set, when it deletes
+whole segments, oldest first. Segments stay as written, never merged; the
+object keeps up to 8 MiB of decoded ones in memory. The bucket must be
+private: no custom domain, no r2.dev URL, no CORS, no lifecycle rules.
+`/history rebuild-index` adds to the index what a listing of the bucket
+finds that it lacks.
 
 ### Backups and imports
 
 A backup is the whole server's history, or some rooms', as one ARCHIVE.md
-v1 file in a blob store (`src/history/exports.ts`; [SPEC section
-9](../SPEC.md#backups-and-imports)): every room, the users records name,
-and the records of every tier, as they are logged; private rooms too,
-unless the export sets `private_rooms = false`. It is
-written as a stream (an R2 multipart upload), and a failure leaves no
-object. Each backup is named after its export and the time,
-`<RP_ID>-<name>-<date>.jsonl` by default (`key`, which must contain `{date}`
-and may contain `{server}` and `{name}`), and after writing one, the export
-deletes its own backups past the newest `keep` (14 by default).
+v1 file in the `HISTORY_BLOB` bucket under `backups/`
+(`src/history/exports.ts`; [SPEC section 9](../SPEC.md#backups-and-imports)):
+every room, the users records name, and the records of every tier, as they
+are logged. It is written as a stream (an R2 multipart upload), and a
+failure leaves no object. Plain string vars set it, checked when the Worker
+starts:
 
-- **Scheduled exports.** Each `[[vars.HISTORY.exports]]` with `every` writes
-  one backup every `every`, on the first full alarm after its
-  interval has passed since its last run (`history:export:<name>` in
-  `_meta`, noted before it runs, so one that fails waits its interval). Its
-  result is logged (`history_export`, or `history_export_failed` with the
-  reason). Production's `nightly` waits for its bucket.
-- **`/history export [<room_id>...]`** (admins) writes one now, of every
-  room or of those named, by the first export without `every` (`manual` in
-  both Wrangler configs), as it is configured: its store, `keep`,
-  `private_rooms` and encryption. Nothing is assumed: with no such export,
-  or its store unbound, the command says so and writes nothing. Its notice
-  names the object's key. Two exports sharing a store and prefix must both
-  keep `{name}` in their `key` (the config is refused otherwise), or each
-  would prune the other's backups. A second backup of an export in the
-  same second is refused (keys are to the second); one export, import or
-  index rebuild runs at a time, and none while history upkeep runs.
-- **Encryption is what the config says.** An export with `encrypt` always
-  encrypts, and fails rather than write in the clear when its key is
-  missing; one without it writes plain ARCHIVE.md (the development config's
-  `manual`, to local storage).
+| Var | Default | Production | Development |
+| --- | --- | --- | --- |
+| `BACKUP_EVERY`: how often the scheduled backup runs (`"6h"`, `"1d"`; empty: on demand only) | on demand | `"1d"` | `""` |
+| `BACKUP_KEEP`: how many backup files of each kind are kept, newest first | `14` | `"14"` | `"10"` |
+| `BACKUP_PRIVATE_ROOMS`: whether private rooms are backed up | `true` | `"true"` | `"true"` |
+| `BACKUP_ENCRYPTION_KEY_NAME`: the secret the backup key is derived from (empty: unencrypted) | unencrypted | `"UPLOAD_SIGNING_KEY"` | `""` |
+| `BACKUP_PREVIOUS_KEY_NAMES`: older secrets, comma-separated, only to read backups after a rotation | none | `""` | `""` |
+| `IMPORT_PLAINTEXT`: whether `/history import` takes a file that is not encrypted | false where backups are encrypted, else true | `"false"` | `"true"` |
+
+Each backup's key is `backups/<RP_ID>-<kind>-<date>.jsonl` (`.enc` added
+when encrypted), the kind `scheduled` or `manual`; after writing one, the
+backups of its kind past the newest `BACKUP_KEEP` are deleted, and nothing
+else under `backups/`.
+
+- **The scheduled backup** runs on the first full alarm after
+  `BACKUP_EVERY` has passed since its last run (`history:export:scheduled`
+  in `_meta`, noted before it runs, so one that fails waits its interval).
+  Its result is logged (`history_export`, or `history_export_failed` with
+  the reason); without the bucket it is skipped, logged once a wake
+  (`history_export_unbound`). Production's waits for its bucket.
+- **`/history export [<room_id>...]`** (admins) writes a `manual` one now,
+  of every room or of those named, with the same settings; without the
+  bucket, the command says so and writes nothing. Its notice names the
+  object's key. A second backup of a kind in the same second is refused
+  (keys are to the second); one export, import or index rebuild runs at a
+  time, and none while history upkeep runs.
+- **Encryption is what the vars say.** With `BACKUP_ENCRYPTION_KEY_NAME`
+  set, every backup is encrypted, and one whose secret is missing fails
+  rather than write in the clear; without it, backups are plain ARCHIVE.md
+  (development, to local storage).
 - **`/history import <key> [dry-run] [match|new] [renumber] [restart]`** (admins) reads
   an object of the backup store (at most 64 MiB), a backup or any ARCHIVE.md
   v1 file put there, and adds what is new, after planning the whole file:
@@ -1013,9 +913,8 @@ deletes its own backups past the newest `keep` (14 by default).
   The file may be anyone's, so records are taken only as a client could
   have sent them (bare users, bodies normalized as posts are, a snapshot's
   size), others dropped and counted. A plain file is refused where
-  `plaintext` is false: by default, wherever an export encrypts (production
-  sets it false, the development config true). Users map by `users` (or the
-  command's `match` or `new`): `auto`, the default, matches existing
+  `IMPORT_PLAINTEXT` is false. Users map by the command's `match` or `new`,
+  else `auto`, which matches existing
   accounts by `user_id` only for a backup decrypted with one of this
   server's keys whose `server` is this server, and otherwise makes every
   user new (`match` takes only such a backup); a new user becomes a
@@ -1027,41 +926,39 @@ deletes its own backups past the newest `keep` (14 by default).
   Holding a role, placeholders are never removed as idle (account upkeep),
   and they count toward `registeredIdentityCount`. Kept log IDs may be at
   most five minutes past the clock; a file with later ones is refused:
-  `renumber` (or `ids = "renumber"`) gives every record a new log ID
+  `renumber` gives every record a new log ID
   instead. A room holding nothing past its creation (a new server's
   `general`) is filled, not skipped. An import notes its plan before it
   writes (one too large to note is refused: `renumber` it): run again after
   a failure, the same file finishes; `restart` abandons an unfinished import
   of another file, and the notice names the rooms it left part-restored.
 
-**Encryption.** An export with `encrypt` writes its backups encrypted
-(AES-256-GCM in 1 MiB chunks; `.enc` is added to the key) with a key derived
-from a Wrangler secret: the first of `key_secrets`. The config holds only
-secret names, and the code adds none: what encrypts is what the config
-says. Any secret of at least 32 characters of randomness serves; its text
-goes through HKDF under the label `apron history backup v1`, so a secret
-shared with another use gives a key of its own. Production lists
-`UPLOAD_SIGNING_KEY` (`wrangler.production.toml`), which it has anyway. For
-backups rotated apart from upload links, make a secret of their own and
-list it first:
+**Encryption.** Backups are encrypted (AES-256-GCM in 1 MiB chunks) with
+a key derived from the Wrangler secret `BACKUP_ENCRYPTION_KEY_NAME` names.
+The vars hold only secret names, and the code adds none. Any secret of at
+least 32 characters of randomness serves; its text goes through HKDF under
+the label `apron history backup v1`, so a secret shared with another use
+gives a key of its own. Production names `UPLOAD_SIGNING_KEY`, which it has
+anyway. For backups rotated apart from upload links, make a secret of their
+own and name it:
 
 ```sh
 openssl rand -base64 32 | npx wrangler secret put HISTORY_BACKUP_KEY --config wrangler.production.toml
 ```
 
 Each backup names its secret and a fingerprint of its key, so an import
-decrypts it with any secret the environment has under that name: those in
-any export's `encrypt.key_secrets`, those in `[vars.HISTORY.import]
-key_secrets` (kept only to read older backups), and no other.
+decrypts it with any secret the environment has under that name among
+`BACKUP_ENCRYPTION_KEY_NAME` and `BACKUP_PREVIOUS_KEY_NAMES`, and no other.
 An import that lacks the secret fails naming it and the fingerprint; one
 whose secret has been set to another value since fails by the fingerprint;
 a damaged or truncated backup fails its chunk's authentication; none
-writes anything. To rotate, put the new key under a new name and list it
-first (`key_secrets = ["HISTORY_BACKUP_KEY_2027", "HISTORY_BACKUP_KEY"]`):
-new backups use it, and older ones still decrypt while the older secret
-stays set. Never set a new value under an old name: backups made with the
-old value could no longer be read. A missing or malformed secret fails the
-export that needs it before anything is written. Previews have no secrets
+writes anything. To rotate, put the new key under a new name, name it in
+`BACKUP_ENCRYPTION_KEY_NAME`, and move the old name to
+`BACKUP_PREVIOUS_KEY_NAMES`: new backups use the new key, and older ones
+still decrypt while the old secret stays set. Never set a new value under
+an old name: backups made with the old value could no longer be read. Both
+must be secrets (`wrangler secret put`), never `[vars]` vars, whose values
+are public: `npm run budget:check` fails on one. Previews have no secrets
 (and no bucket), so they make no backups. The tests set fixed keys in
 `vitest.config.ts`; locally, use `.dev.vars` or `wrangler dev --var`.
 
@@ -1075,8 +972,9 @@ Wrangler deployments should use the uppercase form; local tests may use
 camelCase. Omitted variables use the defaults. Each value must be a positive
 JavaScript safe integer: `0`, fractions, negative values, and values above
 `Number.MAX_SAFE_INTEGER` fail startup. `retentionRecords`,
-`retentionSeconds` and `archiveRecords` also take `0`, which turns that bound
-off.
+`retentionSeconds`, `historyD1Records` and `historyBlobRecords` also take
+`0`, which turns that bound off (for `historyD1Records`, the D1 tier; for
+`historyBlobRecords`, the blob tier keeps everything).
 
 Production should use the checked-in budget defaults; retain overrides for local
 tests or deliberate temporary reductions. Overrides do not regenerate the native
@@ -1107,7 +1005,7 @@ defaults:
   registration, identity, and processed-frame caps are fixed demo ceilings.
   Low, high, and hard storage watermarks must be strictly ordered.
 - At least one of `retentionRecords` and `retentionSeconds` is set;
-  `retentionRecords` is at most 50,000 and `archiveRecords` at most 100,000;
+  `retentionRecords` is at most 50,000 and `historyD1Records` at most 100,000;
   `retentionSeconds`, when set, is at least `cleanupSeconds`; with
   `retentionRecords` set, `minRetentionSeconds` is at least `cleanupSeconds`
   and `retentionSeconds`, when set, at least `minRetentionSeconds`. `sessionTtlSeconds` is at most 30 days;
@@ -1181,8 +1079,8 @@ implementation and recalibrating its resource model.
 | `METRICS_DATASET` | The Analytics Engine dataset the `METRICS` binding writes, for `/status` to read active users back (the binding does not tell the Worker its name; `npm run budget:check` holds the two equal); unset, `/status` leaves active users out |
 | `ZONE_ID` | The zone holding `apron_budget_stop`; a Wrangler var (see [Budget guard](#budget-guard)) |
 | `EDGE_STOP_TOKEN` | Secret: an API token with Zone WAF edit permission on `ZONE_ID`, which the budget guard and the flood trip use |
-| `HISTORY` | Optional TOML table (or JSON): the history pipeline's tiers, schedule, alerts, scheduled backups and import defaults ([The HISTORY config](#the-history-config)); unset, SQLite then D1 where `HISTORY_D1` is bound, by the `LIMIT_*` history limits. Setting it together with `LIMIT_RETENTION_RECORDS`, `LIMIT_RETENTION_SECONDS`, `LIMIT_MIN_RETENTION_SECONDS`, `LIMIT_ARCHIVE_RECORDS` or `LIMIT_CLEANUP_THRESHOLD_PERCENT` fails the configuration check |
-| `HISTORY_BACKUP_KEY` | Optional secret: at least 32 characters of randomness, for backups encrypted with a key of their own where `HISTORY` lists it in an export's `encrypt.key_secrets` (production lists `UPLOAD_SIGNING_KEY` instead); set with `openssl rand -base64 32 \| npx wrangler secret put HISTORY_BACKUP_KEY --config wrangler.production.toml` ([Backups and imports](#backups-and-imports)). Other names listed in `HISTORY` work the same way |
+| `BACKUP_EVERY`, `BACKUP_KEEP`, `BACKUP_PRIVATE_ROOMS`, `BACKUP_ENCRYPTION_KEY_NAME`, `BACKUP_PREVIOUS_KEY_NAMES`, `IMPORT_PLAINTEXT` | Backups of history to the `HISTORY_BLOB` bucket and what `/history import` takes: a schedule (empty: on demand only), how many files of each kind are kept (default 14), whether private rooms are included (default `true`), the secret backups are encrypted with a key derived from (empty: unencrypted), older secrets kept to read backups after a rotation, and whether plain files are imported (default: only where backups are unencrypted). See [Backups and imports](#backups-and-imports) |
+| `HISTORY_BACKUP_KEY` | Optional secret: at least 32 characters of randomness, for backups encrypted with a key of their own where `BACKUP_ENCRYPTION_KEY_NAME` names it (production names `UPLOAD_SIGNING_KEY` instead); set with `openssl rand -base64 32 \| npx wrangler secret put HISTORY_BACKUP_KEY --config wrangler.production.toml` ([Backups and imports](#backups-and-imports)). Any other secret name works the same way |
 | `ADMISSION_OFF` | `true` or `false`: operator admission switch; `true` rejects new sockets in the entry Worker with 503 before the limiter or DO call; existing sockets remain subject to DO budgets |
 | `ENVIRONMENT` | Set to `development` to enable local origin defaults when `ALLOWED_ORIGINS` and `RP_ORIGINS` are omitted |
 | `NODE_ENV` | Set to `test` to enable the same local origin defaults for tests; production-like deployments must configure origins explicitly |
@@ -1408,7 +1306,7 @@ deployment that stays awake.
 
 The numeric rows are grouped by their unit and enforcement scope:
 
-- History: `retentionRecords` and `archiveRecords` (counts of records), and
+- History: `retentionRecords`, `historyD1Records` and `historyBlobRecords` (counts of records), and
   `cleanupThresholdPercent` (a percent, at most 100; [above](#history-retention)).
 - Durations: `minRetentionSeconds` and `retentionSeconds` ([History
   retention](#history-retention)), `cleanupSeconds`, `challengeTtlSeconds`,
@@ -1474,7 +1372,8 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `retentionRecords` | 5000 | 0 |
 | `minRetentionSeconds` | 259200 | 86400 |
 | `retentionSeconds` | 0 | 86400 |
-| `archiveRecords` | 100000 | 0 |
+| `historyD1Records` | 100000 | 0 |
+| `historyBlobRecords` | 0 |  |
 | `cleanupSeconds` | 86400 | 3600 |
 | `challengeTtlSeconds` | 120 |  |
 | `sessionTtlSeconds` | 2592000 |  |

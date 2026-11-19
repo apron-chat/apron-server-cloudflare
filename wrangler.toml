@@ -25,22 +25,22 @@ new_sqlite_classes = ["ApronDemoServer"]
 binding = "MEDIA"
 bucket_name = "apron-media-dev"
 
-# History segments and backups (docs/configuration.md, History tiers and
-# Backups and imports): a private bucket, no public access. Used by the tests
-# and `wrangler dev` (miniflare's local R2): a blob tier keeps segments here
-# only where a HISTORY var configures one, and `/history export` writes
-# backups under backups/. Production has none yet, so the blob tier is off
-# there.
+# The blob history tier and backups (docs/configuration.md, History tiers,
+# Backups and imports): a private bucket, no public access. Used by the
+# tests and `wrangler dev` (miniflare's local R2): bound, it is the tier
+# below D1, keeping segments under history/, and backups go under backups/.
+# Production has none yet, so the blob tier is off there.
 [[r2_buckets]]
 binding = "HISTORY_BLOB"
 bucket_name = "apron-history-dev"
 
 # The D1 history tier (src/history/d1.ts, docs/configuration.md, History
 # tiers). Records there stay in history but become read-only: past
-# retentionRecords, the oldest move from the object's SQLite to D1, where
-# history pages still read them but their messages can no longer be edited,
-# reacted to or replied to; past archiveRecords more, they expire. Local
-# development and the tests use a local database; the id is a placeholder.
+# LIMIT_RETENTION_RECORDS, the oldest move from the object's SQLite to D1,
+# where history pages still read them but their messages can no longer be
+# edited, reacted to or replied to; past LIMIT_HISTORY_D1_RECORDS more, they
+# go on to the blob tier (HISTORY_BLOB, above). Local development and the
+# tests use a local database; the id is a placeholder.
 [[d1_databases]]
 binding = "HISTORY_D1"
 database_name = "apron-archive-dev"
@@ -62,36 +62,23 @@ ROOM_METADATA_LIMIT = "8192"
 ROOM_METADATA_MIN_LIMIT = "1024"
 ROOM_METADATA_TOTAL_LIMIT = "262144"
 
-# Where history is kept, and its backups (docs/configuration.md, The HISTORY
-# config): the plan's own limits written out, as in production, and one
-# export on demand (`/history export`, no `every`) to the local HISTORY_BLOB
-# bucket, unencrypted here (no `encrypt`): local data, local keys. Private
-# rooms are exported (private_rooms); set it false to leave them out.
-[vars.HISTORY]
-schedule = { every = "1d", threshold_percent = 80 }
-alerts = { stall_after = "6h" }
-
-[[vars.HISTORY.tiers]]
-name = "hot"
-kind = "sqlite"
-retention = { records = 5_000, min_age = "3d" }
-
-[[vars.HISTORY.tiers]]
-name = "recent"
-kind = "d1"
-binding = "HISTORY_D1"
-retention = { records = 100_000 }
-
-[[vars.HISTORY.exports]]
-name = "manual"
-store = { provider = "r2", binding = "HISTORY_BLOB", prefix = "backups/" }
-keep = 10
-private_rooms = true
-
-# `/history import` takes plain ARCHIVE.md files too (plaintext: true, the
-# default where no export encrypts), as the backups here are plain.
-[vars.HISTORY.import]
-plaintext = true
+# History (docs/configuration.md, History retention, History tiers, Backups
+# and imports): the plan's own limits written out, as in production.
+LIMIT_RETENTION_RECORDS = "5000"
+LIMIT_MIN_RETENTION_SECONDS = "259200"
+LIMIT_RETENTION_SECONDS = "0"
+LIMIT_CLEANUP_THRESHOLD_PERCENT = "80"
+LIMIT_HISTORY_D1_RECORDS = "100000"
+LIMIT_HISTORY_BLOB_RECORDS = "0"
+# Backups on demand only (`/history export`, no schedule) to the local
+# HISTORY_BLOB bucket, the newest 10 kept, private rooms included, and
+# unencrypted: local data, local keys. `/history import` takes plain files.
+BACKUP_EVERY = ""
+BACKUP_KEEP = "14"
+BACKUP_PRIVATE_ROOMS = "true"
+BACKUP_ENCRYPTION_KEY_NAME = ""
+BACKUP_PREVIOUS_KEY_NAMES = ""
+IMPORT_PLAINTEXT = "true"
 
 # BEGIN GENERATED ADMISSION BUDGET
 # Edit src/budget.ts, then run npm run budget:generate.

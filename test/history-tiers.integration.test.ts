@@ -9,7 +9,7 @@ import { connect, greeting, request } from './helpers/socket';
 
 // The tests bind a local D1 database as HISTORY_D1 (wrangler.toml), so the
 // object's D1 history tier is on: records past SQLite's count go there,
-// kept for archiveRecords more.
+// kept for historyD1Records more (no blob tier: the pipeline below is built without one).
 
 const stub = () => env.DEMO.getByName('public-demo-v1');
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -32,10 +32,10 @@ it('moves records past SQLite into D1, serves them in history, and expires them 
 			const runtime = instance as unknown as Runtime;
 			// Three records in the hot log, four more in the archive, with no minimum age.
 			runtime.store.config = {
-				...runtime.store.config, retentionRecords: 3, minRetentionMs: 0, archiveRecords: 4, cleanupThresholdPercent: 100,
+				...runtime.store.config, retentionRecords: 3, minRetentionMs: 0, historyD1Records: 4, cleanupThresholdPercent: 100,
 				anonymousPostsPerMinute: 1_000, ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000,
 			};
-			runtime.config = { ...runtime.config, limits: { ...runtime.config.limits, retentionRecords: 3, archiveRecords: 4, cleanupThresholdPercent: 100 } };
+			runtime.config = { ...runtime.config, limits: { ...runtime.config.limits, retentionRecords: 3, historyD1Records: 4, cleanupThresholdPercent: 100 } };
 			// The pipeline takes its tiers' limits when built.
 			runtime.history = buildHistoryPipeline({ env, limits: runtime.config.limits as never, store: runtime.store, clock: { now: Date.now } });
 			const logs: string[] = [];

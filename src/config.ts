@@ -2,16 +2,22 @@ import * as budget from "./budget.ts";
 import { DEFAULT_FEATURES, DEFAULT_LIMITS, LIVE_TEXT_POLICY, MAX_PUSH_CANDIDATES, MAX_PUSHES_PER_MESSAGE, MAX_STATUS_DELAY_SECONDS, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits, type LiveTextPolicy, type PushPolicy } from "./budget.ts";
 import { billCap, type BillCap } from "./pricing.ts";
 import { base64UrlDecode, P256_PRIVATE_KEY_BYTES, P256_PUBLIC_KEY_BYTES, vapidKeysMatch, type VapidKeys } from "./webpush.ts";
-import { HISTORY_LIMIT_VARS, type HistorySettings, historyLimits, parseHistorySettings } from "./history/settings.ts";
+import type { BackupSettings } from "./history/exports.ts";
 export { DEFAULT_LIMITS } from "./budget.ts";
 
 export interface RuntimeConfig {
 	limits: Limits;
 	/**
-	 * The history pipeline as the `HISTORY` var composes it (src/history/settings.ts,
-	 * PLAN §13.1); without it, the default tiers from the LIMIT_* vars.
+	 * Backups of history (PLAN §13.2), to HISTORY_BLOB under `backups/`:
+	 * `BACKUP_EVERY` (a duration; unset or empty, on demand only),
+	 * `BACKUP_KEEP` (files kept of each kind, default 14),
+	 * `BACKUP_PRIVATE_ROOMS` (default true), `BACKUP_ENCRYPTION_KEY_NAME`
+	 * (the secret the key is derived from; unset or empty, unencrypted),
+	 * `BACKUP_PREVIOUS_KEY_NAMES` (older secrets, to read backups after a
+	 * rotation) and `IMPORT_PLAINTEXT` (whether `/history import` takes a
+	 * plain file; default false where backups are encrypted, else true).
 	 */
-	history?: HistorySettings;
+	backups: BackupSettings;
 	allowedOrigins: readonly string[];
 	rpId: string;
 	rpOrigins: readonly string[];
@@ -290,6 +296,12 @@ type EnvLike = {
 	PUSH_DELAY_SECONDS?: string;
 	OG_MEDIA_HOSTS?: string;
 	OG_MEDIA_HOSTS_EXTRA?: string;
+	BACKUP_EVERY?: string;
+	BACKUP_KEEP?: string;
+	BACKUP_PRIVATE_ROOMS?: string;
+	BACKUP_ENCRYPTION_KEY_NAME?: string;
+	BACKUP_PREVIOUS_KEY_NAMES?: string;
+	IMPORT_PLAINTEXT?: string;
 	ENVIRONMENT?: string;
 	NODE_ENV?: string;
 };
@@ -321,7 +333,7 @@ function envName(name: string): string {
 }
 
 /** Limits where 0 turns the bound off (docs/configuration.md, History retention); every other limit is positive. */
-const OPTIONAL_LIMITS: ReadonlySet<string> = new Set<keyof Limits>(["retentionRecords", "retentionSeconds", "archiveRecords"]);
+const OPTIONAL_LIMITS: ReadonlySet<string> = new Set<keyof Limits>(["retentionRecords", "retentionSeconds", "historyD1Records", "historyBlobRecords"]);
 
 function limitError(name: string): ConfigError {
 	return new ConfigError(`${name} must be a ${OPTIONAL_LIMITS.has(name) ? "non-negative" : "positive"} safe integer`);
@@ -472,7 +484,7 @@ function validateLimits(limits: Limits): void {
 	}
 	if (limits.retentionRecords === 0 && limits.retentionSeconds === 0) fail("retentionRecords or retentionSeconds must be set");
 	if (limits.retentionRecords > budget.MAX_RETENTION_RECORDS) fail("retentionRecords exceeds the calibrated bound");
-	if (limits.archiveRecords > budget.MAX_ARCHIVE_RECORDS) fail("archiveRecords exceeds the calibrated bound");
+	if (limits.historyD1Records > budget.MAX_HISTORY_D1_RECORDS) fail("historyD1Records exceeds the calibrated bound");
 	if (limits.cleanupThresholdPercent > 100) fail("cleanupThresholdPercent is a share of the limits, at most 100");
 	if (limits.retentionSeconds > 0 && limits.retentionSeconds < limits.cleanupSeconds) fail("retentionSeconds must be at least one cleanup interval");
 	// The minimum age applies only to retention by count.
@@ -548,26 +560,13 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 	for (const key of Object.keys(limits) as (keyof Limits)[]) {
 		limits[key] = parsePositiveInt(env, key, limits[key]);
 	}
+	// The HISTORY table of earlier versions is gone: a leftover one would
+	// otherwise be ignored, encryption and all (docs/configuration.md, Backups).
+	if ((env as Record<string, unknown>).HISTORY !== undefined) throw new ConfigError("HISTORY is no longer read: set history with the LIMIT_* vars and backups with the BACKUP_* vars (docs/configuration.md)");
 	// A misspelled override would silently leave the default in force.
 	const limitNames = new Set(Object.keys(limits).map((key) => `LIMIT_${envName(key)}`));
 	for (const name of Object.keys(env)) {
 		if (name.startsWith("LIMIT_") && !limitNames.has(name)) throw new ConfigError(`${name} is not a limit (docs/configuration.md)`);
-	}
-	// `HISTORY` sets history's limits itself; a LIMIT_* var for one of them too would leave it unclear which wins.
-	let history: HistorySettings | undefined;
-	const historyVar = (env as Record<string, unknown>).HISTORY;
-	if (historyVar !== undefined && historyVar !== "") {
-		try {
-			history = parseHistorySettings(historyVar);
-		} catch (error) {
-			throw new ConfigError(error instanceof Error ? error.message : String(error));
-		}
-		// A limit may be set as LIMIT_X, X or its own name (parsePositiveInt): any of them, for any history limit.
-		const names = [...HISTORY_LIMIT_VARS, ...(history.schedule.everySeconds !== undefined ? ["LIMIT_CLEANUP_SECONDS"] : [])]
-			.flatMap((name) => { const upper = name.slice("LIMIT_".length); return [name, upper, upper.toLowerCase().replace(/_([a-z])/g, (_, letter: string) => letter.toUpperCase())]; });
-		const both = names.filter((name) => (env as Record<string, unknown>)[name] !== undefined);
-		if (both.length) throw new ConfigError(`HISTORY sets history's limits: remove ${both.join(", ")}`);
-		Object.assign(limits, historyLimits(history));
 	}
 	Object.assign(limits, overrides);
 	for (const [key, value] of Object.entries(limits)) {
@@ -622,6 +621,7 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 		throw new ConfigError("RP_NAME exceeds the configured display-name policy");
 	}
 	const server = loadServerMetadata(env, limits);
+	const backups = loadBackups(env);
 	let cap: BillCap | null;
 	try {
 		cap = billCap({ BILL_CAP_DAY: env.BILL_CAP_DAY === undefined ? undefined : String(env.BILL_CAP_DAY), BILL_CAP_MONTH: env.BILL_CAP_MONTH === undefined ? undefined : String(env.BILL_CAP_MONTH) });
@@ -630,7 +630,7 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 	}
 	return {
 		limits,
-		...(history ? { history } : {}),
+		backups,
 		allowedOrigins,
 		rpId,
 		rpOrigins,
@@ -697,6 +697,37 @@ function loadServerMetadata(env: EnvLike, limits: Limits): ServerMetadata {
 }
 
 /** Upload settings, when the plan and the deployment both provide them; malformed ones fail the configuration check. */
+const DURATION_UNITS: Record<string, number> = { s: 1, m: 60, h: 3_600, d: 86_400 };
+/** A secret's name, as Wrangler takes one. */
+const SECRET_NAME = /^[A-Z][A-Z0-9_]*$/;
+
+/** The backup vars (RuntimeConfig.backups), validated: a typo fails the deploy's check, not the first backup. */
+function loadBackups(env: EnvLike): BackupSettings {
+	const every = String(env.BACKUP_EVERY ?? "").trim();
+	const match = /^(\d+)([smhd])$/i.exec(every);
+	const everySeconds = match ? Number(match[1]) * DURATION_UNITS[match[2].toLowerCase()] : undefined;
+	if (every && (everySeconds === undefined || everySeconds <= 0 || !Number.isSafeInteger(everySeconds))) {
+		throw new ConfigError('BACKUP_EVERY must be a duration such as "1d" or "6h", or empty for backups on demand only');
+	}
+	const keepText = String(env.BACKUP_KEEP ?? "").trim();
+	const keep = keepText === "" ? 14 : Number(keepText);
+	if (!Number.isSafeInteger(keep) || keep < 1 || keep > 1_000) throw new ConfigError("BACKUP_KEEP must be a whole number from 1 to 1000");
+	const keyName = String(env.BACKUP_ENCRYPTION_KEY_NAME ?? "").trim();
+	const previousKeyNames = splitList(env.BACKUP_PREVIOUS_KEY_NAMES === undefined ? undefined : String(env.BACKUP_PREVIOUS_KEY_NAMES), []);
+	for (const [name, value] of [["BACKUP_ENCRYPTION_KEY_NAME", keyName], ...previousKeyNames.map((entry) => ["BACKUP_PREVIOUS_KEY_NAMES", entry])]) {
+		if (value && !SECRET_NAME.test(value)) throw new ConfigError(`${name} must name secrets (A-Z, 0-9 and _, starting with a letter), not ${JSON.stringify(value)}`);
+	}
+	return {
+		...(everySeconds !== undefined ? { everySeconds } : {}),
+		keep,
+		privateRooms: parseSwitch(env.BACKUP_PRIVATE_ROOMS, "BACKUP_PRIVATE_ROOMS", true),
+		...(keyName ? { encryptionKeyName: keyName } : {}),
+		previousKeyNames,
+		// Where backups are encrypted, a plain file is no backup of this server's.
+		importPlaintext: parseSwitch(env.IMPORT_PLAINTEXT, "IMPORT_PLAINTEXT", !keyName),
+	};
+}
+
 function loadUploads(env: EnvLike): UploadConfig | undefined {
 	const mediaOrigin = env.MEDIA_ORIGIN?.trim() ?? "";
 	const publicOrigin = env.PUBLIC_ORIGIN?.trim() ?? "";

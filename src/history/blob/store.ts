@@ -1,8 +1,9 @@
 /*
  * Blob storage (PLAN §5, §9): the small interface the blob tier and the
- * scheduled exports write through, so the same code runs over R2 in the
- * Worker (blob/r2.ts), over memory in tests (blob/memory.ts), and over a
- * directory in Node scripts (scripts/fs-blob-store.mjs).
+ * backups write through, so the same code runs over R2 in the Worker
+ * (blob/r2.ts), over memory in tests (test/history/support/), and over a
+ * directory in Node scripts (scripts/fs-blob-store.mjs). Each caller
+ * registers the providers it has (history/config.ts, BlobStoreProviders).
  *
  * Keys are plain strings with `/` as a separator by convention. Listings are
  * sorted by key, so zero-padded names (segment keys, dated exports) list in

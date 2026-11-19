@@ -18,9 +18,9 @@ declare global {
 		ZONE_ID?: string;
 		EDGE_STOP_TOKEN?: string;
 		MEDIA?: R2Bucket;
-		/** The history archive (src/archive.ts); without it, records past the hot log's limits expire at once. */
+		/** The D1 history tier (src/history/d1.ts); without it (or the blob tier), records past SQLite's limits expire at once. */
 		HISTORY_D1?: D1Database;
-		/** History segments and backups (PLAN §9): a private R2 bucket; absent in production for now. */
+		/** The blob history tier's segments and the backups (PLAN §9): a private R2 bucket; absent in production for now. */
 		HISTORY_BLOB?: R2Bucket;
 		MEDIA_ORIGIN?: string;
 		MEDIA_NOSNIFF?: string;
@@ -34,6 +34,13 @@ declare global {
 		PUSH_DELAY_SECONDS?: string;
 		OG_MEDIA_HOSTS?: string;
 		OG_MEDIA_HOSTS_EXTRA?: string;
+		/** Backups (src/config.ts, RuntimeConfig.backups). */
+		BACKUP_EVERY?: string;
+		BACKUP_KEEP?: string;
+		BACKUP_PRIVATE_ROOMS?: string;
+		BACKUP_ENCRYPTION_KEY_NAME?: string;
+		BACKUP_PREVIOUS_KEY_NAMES?: string;
+		IMPORT_PLAINTEXT?: string;
 		ASSETS?: Fetcher;
 		ALLOWED_ORIGINS?: string;
 		RP_ID?: string;
@@ -87,6 +94,12 @@ declare global {
 			PUSH_DELAY_SECONDS?: string;
 			OG_MEDIA_HOSTS?: string;
 			OG_MEDIA_HOSTS_EXTRA?: string;
+			BACKUP_EVERY?: string;
+			BACKUP_KEEP?: string;
+			BACKUP_PRIVATE_ROOMS?: string;
+			BACKUP_ENCRYPTION_KEY_NAME?: string;
+			BACKUP_PREVIOUS_KEY_NAMES?: string;
+			IMPORT_PLAINTEXT?: string;
 			ASSETS?: Fetcher;
 			ALLOWED_ORIGINS?: string;
 			RP_ID?: string;

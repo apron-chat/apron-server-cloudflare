@@ -9,7 +9,10 @@
  * are written to a temporary file beside their target and renamed into place,
  * so a reader never sees half a body and a crash leaves only a temporary
  * file, which listings skip. It passes the same conformance suite as the
- * Worker's stores (scripts/fs-blob-store.test.mjs).
+ * Worker's stores (scripts/fs-blob-store.test.mjs). A script registers it as
+ * the `fs` provider (fsBlobStores) with the history code
+ * (src/history/config.ts, BlobStoreProviders); the Worker's registry has
+ * only `r2`.
  */
 
 import { randomBytes } from 'node:crypto';
@@ -23,6 +26,7 @@ import { Readable } from 'node:stream';
 /** @typedef {import('../src/history/blob/store.ts').BlobWriter} BlobWriter */
 /** @typedef {import('../src/history/blob/store.ts').BlobListing} BlobListing */
 /** @typedef {import('../src/history/blob/store.ts').BlobListOptions} BlobListOptions */
+/** @typedef {import('../src/history/config.ts').BlobStoreProviders} BlobStoreProviders */
 
 /** Temporary files start with this; keys may not, and listings skip them. */
 const TEMP_MARK = '.apron-tmp-';
@@ -207,4 +211,15 @@ export class FsBlobStore {
 			}
 		}
 	}
+}
+
+/**
+ * A registry with `fs` alone, over `directory` (the history code's
+ * blobStores, with blobProvider "fs").
+ * @param {string} directory
+ * @returns {BlobStoreProviders}
+ */
+export function fsBlobStores(directory) {
+	const store = new FsBlobStore(directory);
+	return { fs: () => store };
 }

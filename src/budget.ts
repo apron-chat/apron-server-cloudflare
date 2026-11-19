@@ -14,20 +14,25 @@ export interface Limits {
 	/** Records younger than this never expire by count (`retentionRecords`): a flood cannot push out the last few days. */
 	minRetentionSeconds: number;
 	/**
-	 * Records past the limits above that the history archive (D1, binding
-	 * ARCHIVE) keeps, newest first, before they expire. Archived records stay
-	 * in history but become read-only: they leave the object's SQLite, the
-	 * hot log, and history pages still serve them from D1, but their messages
-	 * can no longer be edited, reacted to or replied to, as an expired one
-	 * cannot. 0, or no binding, keeps none: records past the limits expire at
-	 * once.
+	 * Records past the limits above that the D1 history tier (binding
+	 * HISTORY_D1) keeps, newest first, before they go on to the blob tier or
+	 * expire. Records there stay in history but become read-only: they leave
+	 * the object's SQLite, the hot log, and history pages still serve them
+	 * from D1, but their messages can no longer be edited, reacted to or
+	 * replied to, as an expired one cannot. 0, or no binding, turns the tier
+	 * off.
 	 */
-	archiveRecords: number;
+	historyD1Records: number;
 	/**
-	 * The share, in percent, of `retentionRecords` and `archiveRecords` that
-	 * cleanup keeps: the limits are ceilings, and each daily cleanup trims
-	 * each back to this share of it, so the rest is headroom for what a day
-	 * brings before the next one.
+	 * Records the blob history tier (binding HISTORY_BLOB) keeps, newest
+	 * first, past those above; 0 keeps everything it is given.
+	 */
+	historyBlobRecords: number;
+	/**
+	 * The share, in percent, of each history count limit that cleanup keeps:
+	 * the limits are ceilings, and each daily cleanup trims each back to this
+	 * share of it, so the rest is headroom for what a day brings before the
+	 * next one.
 	 */
 	cleanupThresholdPercent: number;
 	/**
@@ -596,9 +601,9 @@ export const MAX_CLEANUP_BATCH = 100;
 // ends; past it, history would also outgrow the log scans /rename and /purge
 // budget for (store.ts, RETAINED_SCAN_CAP).
 export const MAX_RETENTION_RECORDS = 50_000;
-// Each archive cycle reads this many D1 index entries to find where the
-// archive's own count ends (Archive.floor).
-export const MAX_ARCHIVE_RECORDS = 100_000;
+// Each history cycle reads this many D1 index entries to find where the D1
+// tier's own count ends (D1HistoryTier.floorFor).
+export const MAX_HISTORY_D1_RECORDS = 100_000;
 
 /** The records a count limit keeps once cleanup trims it to its threshold (cleanupThresholdPercent); 0 for no limit. */
 export function thresholdRecords(limit: number, percent: number): number {

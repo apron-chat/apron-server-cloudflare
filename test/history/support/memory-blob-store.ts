@@ -2,10 +2,13 @@
  * A BlobStore held in memory (PLAN §9): for tests. It behaves as R2 does
  * where the conformance suite can tell (sorted listings, paging, writers that
  * commit on close), and records each call in `calls` so a test can see what
- * a tier asked of its store.
+ * a tier asked of its store. Tests register it as the `memory` provider
+ * (memoryBlobStores); the Worker's registry has only `r2`
+ * (src/history/config.ts, WORKER_BLOB_STORES), so it never reaches one.
  */
 
-import type { BlobListing, BlobListOptions, BlobObject, BlobPutOptions, BlobStore, BlobWriter } from "./store";
+import type { BlobListing, BlobListOptions, BlobObject, BlobPutOptions, BlobStore, BlobWriter } from "../../../src/history/blob/store";
+import type { BlobStoreProviders } from "../../../src/history/config";
 
 interface Stored {
 	bytes: Uint8Array;
@@ -107,4 +110,9 @@ export class MemoryBlobStore implements BlobStore {
 	contentType(key: string): string | undefined {
 		return this.objects.get(key)?.contentType;
 	}
+}
+
+/** A registry with `memory` alone, over `store` (buildHistoryPipeline's blobStores, with blobProvider "memory"). */
+export function memoryBlobStores(store: BlobStore = new MemoryBlobStore()): BlobStoreProviders {
+	return { memory: () => store };
 }
