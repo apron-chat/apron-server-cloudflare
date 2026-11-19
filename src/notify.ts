@@ -4,8 +4,9 @@
  * degraded, exhausted, account stop), an operation's breaker opening
  * or closing, the day's first storage overrun, and the edge stop turning on
  * (by the budget guard, or by the flood trip, `exceeded: ["flood"]`) or off,
- * the database passing half its high-water mark (`storage`), and long room
- * descriptions filling their total (`room_notes`).
+ * the database passing half its high-water mark (`storage`), long room
+ * descriptions filling their total (`room_notes`), and a history tier
+ * failing to take records for hours (`history_stall`).
  * New kinds of notice, and new ways to tell one, join here.
  */
 export type TriggerNotice =
@@ -17,6 +18,7 @@ export type TriggerNotice =
 	| { kind: "burn"; summary: string; paused?: false }
 	| { kind: "edge_failed"; outcome: string }
 	| { kind: "storage"; bytes: number; highWaterBytes: number; rearmBytes: number }
+	| { kind: "history_stall"; from: string; to: string; hours: number }
 	| { kind: "room_notes"; totalBytes: number; limitBytes: number; ceilingBytes: number; minBytes: number; rearmBytes: number; rooms: readonly { room_id: string; title?: string; bytes: number }[] };
 
 /**
@@ -97,6 +99,10 @@ export function noticeText(notice: TriggerNotice): string {
 			// Raising the limit is advice only below its calibrated ceiling.
 			const raise = notice.limitBytes < notice.ceilingBytes ? `, or raise \`ROOM_METADATA_TOTAL_LIMIT\` (at most ${kib(notice.ceilingBytes)})` : "";
 			return `**Long room descriptions are full: ${kib(notice.totalBytes)} past ${kib(notice.minBytes)} a room, of the ${kib(notice.limitBytes)} they may hold together.** A room's title and description can no longer grow past ${kib(notice.minBytes)}; rooms within it, new ones included, still save.${largest} Shorten one with its Edit${raise}. Told again only after it falls under ${kib(notice.rearmBytes)}.`;
+		}
+		case "history_stall": {
+			const hours = Math.max(1, Math.round(notice.hours));
+			return `**History is not reaching \`${notice.to}\`:** copying from \`${notice.from}\` has failed for about ${hours} hours. Nothing is lost: records stay in \`${notice.from}\` until the copy works, so it grows meanwhile, and posting would pause only at the database's high-water mark. \`/status\` shows the stall; check the tier's binding and service. Told once a stall.`;
 		}
 		case "edge_failed":
 			return `**The attack pause could not turn on the edge stop** (${notice.outcome}). The server still refuses everything, but each request still reaches the Worker and is billed: check \`ZONE_ID\`, \`EDGE_STOP_TOKEN\` and the \`apron_budget_stop\` rule.`;

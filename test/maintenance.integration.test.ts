@@ -272,77 +272,82 @@ it("expires records past retentionSeconds whatever the count", async () => {
 	});
 });
 
-it("with the archive, removes records from the hot log only once copied, and publishes the floor the archive's limit allows", async () => {
-	const archived: Partial<StoreConfig> = {
-		archive: true, retentionRecords: 3, minRetentionMs: DAY_MS, retentionMs: 0, archiveRecords: 4, cleanupThresholdPercent: 100,
+it("with tiers below, removes records from SQLite only once copied, and keeps the published floor until the pipeline raises it", async () => {
+	const tiered: Partial<StoreConfig> = {
+		tiered: true, retentionRecords: 3, minRetentionMs: DAY_MS, retentionMs: 0, cleanupThresholdPercent: 100,
 		anonymousPostsPerMinute: 1_000, ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000,
 	};
-	await withStore("archive-floors", archived, (store, clock, state) => {
+	await withStore("history-floors", tiered, (store, clock, state) => {
 		const general = BigInt(store.getRoomState().log_id);
 		const logs = Array.from({ length: 8 }, (_, index) => {
 			clock.value += 1_000;
-			return oneLog(store.mutate(messageInput(clock, `archive-${index}`, `message ${index}`)));
+			return oneLog(store.mutate(messageInput(clock, `tiered-${index}`, `message ${index}`)));
 		});
 		const hotRecords = () => Number(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM records").one().count);
 		const due = () => state.storage.sql.exec("UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1") && store.forgetCleanupDue();
 		clock.value += 2 * DAY_MS;
 
-		// Past the hot log's count, but nothing copied yet: nothing leaves it, and the job waits.
-		expect(store.archiveCandidates(clock.value).rows).toEqual([]);
+		// No job yet: no target. Past the count, but nothing copied: nothing leaves, and the job waits.
+		expect(store.historyTarget(clock.value)).toBeUndefined();
 		const waiting = store.runCleanup(clock.value);
 		expect(waiting.deleted_records).toBe(0);
 		expect(waiting.next_due_ms).toBe(clock.value + 1_000);
 		expect(hotRecords()).toBe(9);
 
-		// The job's records, oldest first: the general room's and five messages.
-		const batch = store.archiveCandidates(clock.value);
-		expect(batch.rows.map((row) => BigInt(row.log_id))).toEqual([general, ...logs.slice(0, 5)]);
-		expect(batch).toMatchObject({ through: Number(logs[4]), more: false });
-		store.noteArchived(batch.through, clock.value);
+		// The job's target: the first record it keeps. The records below it, oldest first.
+		expect(store.historyTarget(clock.value)).toBe(Number(logs[5]));
+		const scanned = store.historyScan(Number(general), 100, clock.value).filter((row) => row.log_id < Number(logs[5]));
+		expect(scanned.map((row) => BigInt(row.log_id))).toEqual([general, ...logs.slice(0, 5)]);
+		store.saveHistoryState("hot", "hot", { through: Number(logs[4]) }, clock.value);
+		expect(store.historyState(["hot", "recent"], "hot", clock.value)).toEqual({
+			hot: { floor: 1, target: 1, through: Number(logs[4]), ops: 0 },
+			recent: { floor: 1, target: 1, through: 0, ops: 0 },
+		});
 		due();
 		const moved = store.runCleanup(clock.value);
 		expect(moved.deleted_records).toBe(6);
-		// The published floor stays where it was: the archive holds what left.
+		// The published floor stays where it was: the tier below holds what left.
 		expect(moved.history_floor).toBe(moved.previous_floor);
-		expect(store.archiveBounds(clock.value)).toEqual({ hot: Number(logs[4] + 1n), published: Number(moved.history_floor) });
+		expect(store.historyFloors(clock.value)).toEqual({ hot: Number(logs[4] + 1n), published: Number(moved.history_floor) });
 		expect(hotRecords()).toBe(3);
 
-		// History reads the hot log, and asks the archive for what is below it.
-		const pending = store.historyWithArchive({ roomId: "general", before: String(logs[7] + 1n), limit: 10, now: clock.value });
-		if (!("archive" in pending)) throw new Error("expected a page that reads the archive");
-		expect(pending.archive).toEqual({ roomIds: ["general"], lower: Number(general), upper: Number(logs[4]), forward: false, limit: 11 });
-		const page = pending.assemble([...batch.rows].reverse());
+		// History reads SQLite, and asks the tiers below for what is under it.
+		const pending = store.historyAcrossTiers({ roomId: "general", before: String(logs[7] + 1n), limit: 10, now: clock.value });
+		if (!("below" in pending)) throw new Error("expected a page that reads the tiers below");
+		expect(pending.below).toEqual({ roomIds: ["general"], lower: Number(general), upper: Number(logs[4]), forward: false, limit: 11 });
+		const page = pending.assemble([...scanned].reverse());
 		expect(messagesOf(page).map((entry) => BigInt(entry.log_id))).toEqual(logs);
 		expect(page.more).toBe(false);
-		// Without it, the hot log's part alone.
+		// Without them, SQLite's part alone.
 		expect(messagesOf(store.history({ roomId: "general", before: String(logs[7] + 1n), limit: 10, now: clock.value })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(5));
 
-		// The archive's limit (its 4 newest) lets the published floor rise, never past the hot floor.
-		store.setArchiveTarget(Number(logs[1]), clock.value);
-		const raised = store.runCleanup(clock.value);
-		expect(raised.history_floor).toBe(String(logs[1]));
+		// The pipeline raises the published floor, never past the hot floor, and makes cleanup due.
+		store.publishHistoryFloor(Number(logs[1]), clock.value);
 		expect(store.logBounds().history_floor).toBe(String(logs[1]));
-		const narrowed = store.historyWithArchive({ roomId: "general", before: String(logs[7] + 1n), limit: 10, now: clock.value });
-		expect("archive" in narrowed && narrowed.archive.lower).toBe(Number(logs[1]));
+		store.publishHistoryFloor(Number(logs[7]), clock.value);
+		expect(store.historyFloors(clock.value)).toEqual({ hot: Number(logs[4] + 1n), published: Number(logs[4] + 1n) });
+		expect(store.cleanupDue(clock.value)).toBe(true);
+		const narrowed = store.historyAcrossTiers({ roomId: "general", before: String(logs[7] + 1n), limit: 10, now: clock.value });
+		expect("below" in narrowed).toBe(false);
 	});
 });
 
-it("forgets the archive's floors and queue once it is off, so turning it on again starts at the hot floor", async () => {
-	await withStore("archive-off", { cleanupIntervalMs: 3_600_000 }, (_store, clock, state) => {
-		state.storage.sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('archive_floor', '5'), ('archive_floor_target', '6'), ('archived_through', '7'), ('archive_ops', '[]')");
-		const off = new Store(state, { ...BY_AGE, archive: false, cleanupIntervalMs: 3_600_000 }, clock.clock);
+it("forgets the pipeline's floors, queue and tier state once tiers are off, so turning them on again starts at the hot floor", async () => {
+	await withStore("history-off", { cleanupIntervalMs: 3_600_000 }, (_store, clock, state) => {
+		state.storage.sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('history:published', '5'), ('history:head:through', '7'), ('history:ops', '[]'), ('history:tier:recent', '{}'), ('historyx', 'kept')");
+		const off = new Store(state, { ...BY_AGE, tiered: false, cleanupIntervalMs: 3_600_000 }, clock.clock);
 		clock.value += DAY_MS;
 		state.storage.sql.exec("UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1");
 		off.forgetCleanupDue();
 		state.storage.sql.exec("INSERT INTO records (room_id, log_id, commit_ms, kind, record_json) VALUES ('general', 2, 0, 'membership', '{}')");
 		off.runCleanup(clock.value);
-		expect(state.storage.sql.exec("SELECT key FROM _meta WHERE key LIKE 'archive%'").toArray()).toEqual([]);
-		const on = new Store(state, { ...BY_AGE, archive: true }, clock.clock);
+		expect(state.storage.sql.exec("SELECT key FROM _meta WHERE key LIKE 'history%'").toArray()).toEqual([{ key: "historyx" }]);
+		const on = new Store(state, { ...BY_AGE, tiered: true }, clock.clock);
 		expect(on.logBounds().history_floor).toBe(off.logBounds().history_floor);
 	});
 });
 
-it("drops the hot log's reaction sets on messages that only the archive held, for /purge", async () => {
+it("drops SQLite's reaction sets on messages that only a tier below held, for /purge", async () => {
 	await withStore("drop-reactions", { anonymousPostsPerMinute: 1_000, ipPostsPerMinute: 1_000 }, (store, clock, state) => {
 		const posted = store.mutate(messageInput(clock, "reacted", "react to me"));
 		const messageId = String(posted.result.message_id);

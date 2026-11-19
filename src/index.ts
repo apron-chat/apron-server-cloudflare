@@ -3,7 +3,9 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, thresholdRecords } from "./budget";
-import { Archive, withOps, type ArchiveOp } from "./archive";
+import { buildHistoryPipeline } from "./history/config";
+import type { HistoryPipeline } from "./history/pipeline";
+import type { ChatRecord } from "./history/records";
 import { keepLast, LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, showsMorePresent, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor, snapshotBill, snapshotReasons } from "./account-usage";
@@ -139,12 +141,12 @@ import { Deadline } from "./deadline";
 const OBJECT_NAME = "public-demo-v1";
 /** Characters of finished terminals' outputs the object keeps in memory (Store.finishLiveText, withOutputs): about 8 MB. */
 const TERMINAL_OUTPUT_CACHE_BYTES = 8 * 1024 * 1024;
-/** How long cleanup waits for the archive between copies while D1 fails (runArchive); a second otherwise. */
-const ARCHIVE_RETRY_MS = 5 * 60_000;
-/** How long a `/purge` or `/rename` is applied to history pages that read the archive, past its own queue (recentArchiveOps). */
-const ARCHIVE_RECENT_OPS_MS = 10 * 60_000;
-/** Archived records one alarm deletes below the published floor at most, in batches of a fifth. */
-const ARCHIVE_TRIM_ROWS = 2_500;
+/** How long the history pipeline waits after a failed step (runHistory), and cleanup between copies meanwhile; a second otherwise. */
+const HISTORY_RETRY_MS = 5 * 60_000;
+/** Steps one history cycle takes at most (HistoryPipeline.cycle): each a copy, a trim or less. */
+const HISTORY_CYCLE_STEPS = 24;
+/** How long a copy to a tier below fails before the admins are told (PLAN §6). */
+const HISTORY_STALL_ALERT_MS = 6 * 3_600_000;
 const INTERNAL_IP_HEADER = "X-Apron-Trusted-IP-Key";
 /**
  * The paths the entry Worker forwards live text to the object on (§4.8.3):
@@ -1042,7 +1044,6 @@ export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		retentionMs: limits.retentionSeconds * 1_000,
 		retentionRecords: limits.retentionRecords,
 		minRetentionMs: limits.minRetentionSeconds * 1_000,
-		archiveRecords: limits.archiveRecords,
 		cleanupThresholdPercent: limits.cleanupThresholdPercent,
 		idleAccountMs: limits.idleAccountSeconds * 1_000,
 		keptActiveAccounts: limits.keptActiveAccounts,
@@ -2555,24 +2556,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * again for the terminals people are looking at.
 	 */
 	private readonly terminalOutputs = new Map<string, string>();
-	/** The history archive (D1), where records past the hot log's limits go first (runArchive). */
-	private readonly archive?: Archive;
-	/** Archive upkeep that failed in a row: cleanup then waits longer for it (ARCHIVE_RETRY_MS). */
-	private archiveFailures = 0;
-	/** Whether this wake checked the archive's own limit (Archive.floor) since its last copy. */
-	private archiveFloorChecked = false;
-	/** The published floor the archive was last trimmed to (Archive.deleteBelow), this wake. */
-	private archiveTrimmed = 0;
-	/** When the archive's queued work may be tried again after a failure (runArchive); 0 for now. */
-	private archiveRetryAt = 0;
-	/** Whether this wake knows the archive has no queued `/purge` or `/rename` (alarmWorkDue). */
-	private archiveOpsChecked = false;
 	/**
-	 * The `/purge` and `/rename` of the last ARCHIVE_RECENT_OPS_MS, applied to
-	 * a history page that read the archive (withOps): its hot records were
-	 * read before it waited for D1, and may predate one.
+	 * The history tiers below this object's SQLite (src/history/: the D1 tier
+	 * where it is bound), where records past its limits go first
+	 * (runHistory); none without one.
 	 */
-	private recentArchiveOps: Array<{ op: ArchiveOp; at: number }> = [];
+	private readonly history?: HistoryPipeline;
+	/** History cycles that failed in a row: cleanup then waits longer for the copy (HISTORY_RETRY_MS). */
+	private historyFailures = 0;
+	/** When the history pipeline may be tried again after a failure (runHistory); 0 for now. */
+	private historyRetryAt = 0;
+	/** Whether the pipeline asked to run again soon, or has an op to carry down (alarmWorkDue). */
+	private historyPending = false;
+	/** Whether this wake knows the tiers below have no queued `/purge` or `/rename` (alarmWorkDue). */
+	private historyOpsChecked = false;
 	private terminalOutputCacheBytes = 0;
 	/** Whether this instance has ended the live texts a lost one left open (recoverLiveTexts). */
 	private liveRecovered = false;
@@ -2673,9 +2670,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		super(ctx, env);
 		this.runtimeEnv = env;
 		this.config = loadConfig(env);
-		// Records past the hot log's limits go to the archive where it is bound.
-		this.archive = env.ARCHIVE && this.config.limits.archiveRecords > 0 ? new Archive(env.ARCHIVE) : undefined;
-		this.store = new Store(ctx as unknown as ConstructorParameters<typeof Store>[0], { ...asStoreConfig(this.config), archive: !!this.archive });
+		// Records past this SQLite's limits go to the tiers below where they are bound.
+		const tiered = Boolean(env.HISTORY_D1 && this.config.limits.archiveRecords > 0);
+		this.store = new Store(ctx as unknown as ConstructorParameters<typeof Store>[0], { ...asStoreConfig(this.config), tiered });
+		this.history = tiered ? buildHistoryPipeline({
+			env, limits: this.config.limits, store: this.store, clock: { now: nowMs },
+			track: (kind, method, call) => this.stalls.track(kind, method, call()),
+		}) : undefined;
 		// An overrun is observed, not fatal: the day's first is told, and a
 		// breaker it opened is told by the tier evaluation that follows.
 		this.store.onOverrun = (notice) => {
@@ -3126,11 +3127,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 		} catch { /* a bot not yet signed out is found again by the next sweep */ }
 		if (this.deadlines.maintenance.passed(now)) this.deadlines.maintenance.clear();
 		if (now >= this.idlePruneAt) await this.pruneIdle(now);
-		// Records about to leave the hot log are copied to the archive first.
-		if (this.archive) await this.runArchive(now);
+		// Records about to leave this SQLite are copied to the tier below first.
+		if (this.history) await this.runHistory(now);
 		let result: ReturnType<Store["runCleanup"]> | undefined;
 		try {
-			result = this.store.runCleanup(now, { archiveWaitMs: this.archiveFailures ? ARCHIVE_RETRY_MS : 1_000 });
+			result = this.store.runCleanup(now, { copyWaitMs: this.historyFailures ? HISTORY_RETRY_MS : 1_000 });
 		} catch {
 			// A metered maintenance failure is deferred. Do not spin an alarm loop.
 			// The floor may already be durable even if a physical deletion failed,
@@ -3165,11 +3166,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 				this.liveRecovered = true;
 			} catch { /* a metered maintenance failure is retried on the next alarm */ }
 		}
-		if (this.archive) {
-			// Records left the hot log: the archive's limit may now allow a higher floor.
-			if (result?.deleted_records) this.archiveFloorChecked = false;
-			await this.trimArchive(now);
-		}
+		// Records left this SQLite: the tiers below may now let theirs go.
+		if (this.history && result?.deleted_records) await this.runHistory(now);
 		const removed = result?.removed_rooms ?? [];
 		for (const roomId of removed) this.noteRoom(roomId, false);
 		if (removed.length) this.removeRooms(removed);
@@ -3223,13 +3221,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * (Store.cleanupDue).
 	 */
 	private alarmWorkDue(now: number): boolean {
-		// A `/purge` or `/rename` the archive has yet to apply, read once a wake.
-		if (this.archive && !this.archiveOpsChecked && now >= this.archiveRetryAt) {
-			try {
-				if (this.store.archiveOps(now).length) return true;
-				this.archiveOpsChecked = true;
-			} catch {
-				return true;
+		// History upkeep: a cycle that asked to go on, or a `/purge` or
+		// `/rename` the tiers below have yet to apply, read once a wake.
+		if (this.history && now >= this.historyRetryAt) {
+			if (this.historyPending) return true;
+			if (!this.historyOpsChecked) {
+				try {
+					if (this.store.historyOps(now).length) return true;
+					this.historyOpsChecked = true;
+				} catch {
+					return true;
+				}
 			}
 		}
 		if (this.config.uploads && !this.uploadDeadlineRead) {
@@ -5034,7 +5036,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		attachment.historyInFlight += 1;
 		writeAttachment(socket, attachment);
 		try {
-			const found = this.store.historyWithArchive({
+			const found = this.store.historyAcrossTiers({
 				...(roomId !== undefined ? { roomId } : { roomIds: attachment.rooms ?? [] }),
 				after,
 				before,
@@ -5045,20 +5047,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 				ipKey: attachment.ipKey,
 				guest,
 			});
-			// A page below the hot floor reads the archive; without it, no page.
+			// A page below the hot floor reads the tiers below; without them, no
+			// page. They apply a `/purge` or `/rename` they have yet to, or that
+			// came while this page waited (HistoryPipeline.read).
 			let page: StoreHistoryResult;
 			if (!isPendingHistory(found)) page = found;
 			else {
-				let rows: Awaited<ReturnType<Archive["page"]>>;
-				try { rows = await this.stalls.track("d1", "history", this.archive!.page(found.archive)); }
+				let rows: ChatRecord[];
+				try { rows = await this.history!.read(found.below, { skipHead: true }); }
 				catch { throw { name: "retry_after", message: "Older history is unavailable for now", data: { retry_after: 60, ...limitData("read") } } satisfies ProtocolError; }
-				// Read after the wait: a `/purge` or `/rename` the archive has not
-				// applied, or that came while this page waited, applies to it too.
-				const now = nowMs();
-				const recent = this.recentArchiveOps.filter((entry) => entry.at > now - ARCHIVE_RECENT_OPS_MS).map((entry) => entry.op);
-				let pending: ArchiveOp[] = [];
-				try { pending = this.store.archiveOps(now); } catch { /* the recent ones still apply */ }
-				page = withOps(found.assemble(rows), [...pending, ...recent]);
+				page = found.assemble(rows);
 			}
 			this.reply(socket, request, await this.withPageOutputs(page));
 		} finally {
@@ -5071,74 +5069,42 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * The archive's upkeep before cleanup (Store.runCleanup) on a full alarm:
-	 * copies the next records the running cleanup job will remove from the
-	 * hot log (Store.archiveCandidates), and applies the `/purge` and
-	 * `/rename` queued since (Store.archiveOps). Each step may be repeated; a
-	 * failure waits for a later alarm, and cleanup waits longer for the
-	 * archive meanwhile (ARCHIVE_RETRY_MS).
+	 * History upkeep on a full alarm, before and after cleanup
+	 * (Store.runCleanup): a bounded cycle of the pipeline (HistoryPipeline.cycle)
+	 * that applies queued `/purge` and `/rename` below, copies the records the
+	 * running cleanup job will remove to the tier below, and lets each tier
+	 * below go of what its retention no longer keeps. A failure waits
+	 * HISTORY_RETRY_MS, and cleanup waits that long for the copy meanwhile; a
+	 * copy failing for HISTORY_STALL_ALERT_MS tells the admins once.
 	 */
-	private async runArchive(now: number): Promise<void> {
-		const archive = this.archive!;
+	private async runHistory(now: number): Promise<void> {
+		const history = this.history!;
+		if (now < this.historyRetryAt) return;
 		try {
-			const batch = this.store.archiveCandidates(now);
-			if (batch.rows.length) {
-				await this.stalls.track("d1", "copy", archive.insert(batch.rows));
-				this.store.noteArchived(batch.through, now);
-				this.archiveFloorChecked = false;
-				if (batch.more) this.maintenanceSoon(now);
+			const { more, report } = await history.cycle({ steps: HISTORY_CYCLE_STEPS });
+			if (report.failure) {
+				this.historyFailures += 1;
+				this.historyRetryAt = now + HISTORY_RETRY_MS;
+				this.historyPending = true;
+				this.deadlines.maintenance.soonest(this.historyRetryAt);
+				console.warn(JSON.stringify({ event: "history_step_failed", step: report.failure.step.kind, message: report.failure.error instanceof Error ? report.failure.error.message : String(report.failure.error) }));
+			} else {
+				this.historyFailures = 0;
+				this.historyRetryAt = 0;
+				this.historyPending = more;
+				// A finished round applied every op it found.
+				this.historyOpsChecked = !more;
+				if (more) this.maintenanceSoon(now);
 			}
-			for (const op of this.store.archiveOps(now)) {
-				const purged = await this.stalls.track("d1", op.op, archive.apply(op));
-				// Messages only the archive held: their newer reaction sets in the hot log go too.
-				this.store.dropReactionsOn(purged, now);
-				this.store.dropArchiveOp(now);
+			for (const stall of await history.stallsToAlert(HISTORY_STALL_ALERT_MS)) {
+				this.announce({ kind: "history_stall", from: stall.from, to: stall.to, hours: (now - stall.since) / 3_600_000 });
 			}
-			this.archiveOpsChecked = true;
-			this.archiveFailures = 0;
-			this.archiveRetryAt = 0;
 		} catch {
-			// Tried again on an alarm after ARCHIVE_RETRY_MS (alarmWorkDue), not on every one.
-			this.archiveFailures += 1;
-			this.archiveRetryAt = now + ARCHIVE_RETRY_MS;
-			this.archiveOpsChecked = false;
-			this.deadlines.maintenance.soonest(this.archiveRetryAt);
+			// The state could not be read or saved (the maintenance budget): tried again later.
+			this.historyRetryAt = now + HISTORY_RETRY_MS;
+			this.historyPending = true;
+			this.deadlines.maintenance.soonest(this.historyRetryAt);
 		}
-	}
-
-	/**
-	 * The archive's upkeep after cleanup: once what cleanup moved out of the
-	 * hot log is copied, finds where the archive's own limit ends
-	 * (Archive.floor) below the new hot floor, for the next cleanup to
-	 * publish (Store.setArchiveTarget, which makes it due); then deletes
-	 * archived records below the published floor, a bounded number an alarm.
-	 */
-	private async trimArchive(now: number): Promise<void> {
-		try {
-			if (!this.archiveFloorChecked) {
-				const { hot } = this.store.archiveBounds(now);
-				// The archive keeps its threshold's share of its limit, as the hot log does.
-				const keep = thresholdRecords(this.config.limits.archiveRecords, this.config.limits.cleanupThresholdPercent);
-				const floor = await this.stalls.track("d1", "floor", this.archive!.floor(hot, keep));
-				if (floor !== undefined && floor > this.store.archiveBounds(now).published) {
-					this.store.setArchiveTarget(floor, now);
-					this.maintenanceSoon(now);
-				}
-				this.archiveFloorChecked = true;
-			}
-			const { published } = this.store.archiveBounds(now);
-			if (published <= this.archiveTrimmed) return;
-			let deleted = 0;
-			for (let batch = 0; batch < 5; batch += 1) {
-				const count = await this.stalls.track("d1", "trim", this.archive!.deleteBelow(published, ARCHIVE_TRIM_ROWS / 5));
-				deleted += count;
-				if (count < ARCHIVE_TRIM_ROWS / 5) {
-					this.archiveTrimmed = published;
-					return;
-				}
-			}
-			if (deleted) this.maintenanceSoon(now);
-		} catch { /* deleted on a later alarm */ }
 	}
 
 	/** A history page with its stored terminal outputs put back (loadTerminalOutputs). */
@@ -8617,8 +8583,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		});
 		for (const roomId of rooms) this.removeIfEmpty(roomId);
 		this.deleteMedia(purged.deletedUploads);
-		// The archive purges what it holds on the next alarm, in a second.
-		if (this.archive) this.archiveSoon({ op: "purge", userIds, messageIds: [] });
+		// The tiers below purge what they hold on the next alarm, in a second.
+		if (this.history) this.historySoon();
 		// A text left open by a failure here ends at its time limit, publishing nothing.
 		await this.endLiveOf(userIds).catch(() => undefined);
 		await this.forgetTokens(userIds);
@@ -8692,14 +8658,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Runs the archive's upkeep (runArchive) on an alarm in a second, for a
-	 * `/purge` or `/rename` it has to apply, and applies it meanwhile to the
-	 * history pages that read the archive (recentArchiveOps).
+	 * Runs history upkeep (runHistory) on an alarm in a second, for a
+	 * `/purge` or `/rename` the tiers below have to apply; history pages
+	 * that read them apply it meanwhile (HistoryPipeline.read).
 	 */
-	private archiveSoon(op: ArchiveOp): void {
+	private historySoon(): void {
 		const now = nowMs();
-		this.recentArchiveOps = [...this.recentArchiveOps.filter((recent) => recent.at > now - ARCHIVE_RECENT_OPS_MS), { op, at: now }];
-		this.archiveOpsChecked = false;
+		this.historyPending = true;
+		this.historyRetryAt = 0;
 		this.maintenanceSoon(now);
 		this.ctx.waitUntil(this.rescheduleAlarm().catch(() => undefined));
 	}
@@ -9067,7 +9033,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const renamed = this.store.renameIdentity({ from, to, now: nowMs() });
 		// Before any await: from the commit on, nothing on this object acts as the retired user_id.
 		this.moveUserState(from, to);
-		if (this.archive) this.archiveSoon({ op: "rename", from, to });
+		if (this.history) this.historySoon();
 		await this.moveInviteToken(from, to);
 		await this.moveDeviceTokens(from, to);
 		// Clients keep nothing yet for the new `user_id`, so the object carries
@@ -9236,41 +9202,49 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * `/status`'s history lines: the records the object's SQLite (the hot log)
-	 * holds against `retentionRecords`, and the archive's (D1) against
-	 * `archiveRecords`. A count over its limit is the minimum age keeping
-	 * records, or cleanup's day. Never throws; D1 gives up after 5 seconds.
+	 * `/status`'s history lines: the records each tier holds (that only it
+	 * serves) against its limit, with what cleanup keeps of it, and a copy
+	 * that has stalled. Without tiers below, SQLite's alone, and why. Never
+	 * throws; the tiers below give up after 5 seconds.
 	 */
 	private async historyStatus(now: number): Promise<string[]> {
 		const limits = this.config.limits;
 		const count = (value: number) => Math.round(value).toLocaleString("en-US");
 		// Against the limit, with what cleanup keeps of it (cleanupThresholdPercent).
-		const against = (value: number, limit: number) =>
-			`${count(value)} / ${count(limit)} records (${limit > 0 ? Math.round((100 * value) / limit) : 0}%; cleanup keeps ${count(thresholdRecords(limit, limits.cleanupThresholdPercent))})`;
-		let hot: string;
-		try {
-			const records = this.store.hotRecords(now);
-			hot = limits.retentionRecords > 0 ? against(records, limits.retentionRecords) : `${count(records)} records (kept by age)`;
-		} catch {
-			hot = "unknown";
+		const against = (value: number, limit: number | undefined, percent: number) => limit && limit > 0
+			? `${count(value)} / ${count(limit)} records (${Math.round((100 * value) / limit)}%; cleanup keeps ${count(thresholdRecords(limit, percent))})`
+			: `${count(value)} records (${limit === undefined ? "kept by age" : "kept"})`;
+		if (!this.history) {
+			let hot: string;
+			try {
+				const records = this.store.hotRecords(now);
+				hot = limits.retentionRecords > 0 ? against(records, limits.retentionRecords, limits.cleanupThresholdPercent) : `${count(records)} records (kept by age)`;
+			} catch {
+				hot = "unknown";
+			}
+			return [`- History in SQLite: ${hot}`, `- History in D1: off${limits.archiveRecords > 0 ? " (no `HISTORY_D1` binding)" : ""}`];
 		}
-		const lines = [`- History in SQLite: ${hot}`];
-		if (!this.archive) {
-			lines.push(`- History archive (D1): off${limits.archiveRecords > 0 ? " (no `ARCHIVE` binding)" : ""}`);
-			return lines;
-		}
+		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
-			const { hot: floor, published } = this.store.archiveBounds(now);
-			let timer: ReturnType<typeof setTimeout> | undefined;
-			const archived = await this.stalls.track("d1", "count", Promise.race([
-				this.archive.count(published, floor),
+			const tiers = await Promise.race([
+				this.history.stats(),
 				new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("timeout")), 5_000); }),
-			]).finally(() => clearTimeout(timer)));
-			lines.push(`- History archive (D1): ${against(archived, limits.archiveRecords)}`);
+			]).finally(() => clearTimeout(timer));
+			const lines: string[] = [];
+			for (const [index, tier] of tiers.entries()) {
+				const limit = index === 0 ? (limits.retentionRecords > 0 ? limits.retentionRecords : undefined) : tier.retention.records ?? 0;
+				lines.push(`- History in ${tier.label}: ${against(tier.stats.records, limit, tier.retention.thresholdPercent)}`);
+				const next = tiers[index + 1];
+				if (next && tier.state.stalledSince !== undefined) {
+					lines.push(`- History copy ${tier.label} → ${next.label}: failing since ${new Date(tier.state.stalledSince).toISOString()}`);
+				}
+			}
+			return lines;
 		} catch {
-			lines.push("- History archive (D1): unavailable");
+			let hot = "unknown";
+			try { hot = against(this.store.hotRecords(now), limits.retentionRecords > 0 ? limits.retentionRecords : undefined, limits.cleanupThresholdPercent); } catch { /* unknown */ }
+			return [`- History in SQLite: ${hot}`, "- History below SQLite: unavailable"];
 		}
-		return lines;
 	}
 
 	/** `/status`'s active users line (src/active-users.ts): never throws, and gives up after 5 seconds. */

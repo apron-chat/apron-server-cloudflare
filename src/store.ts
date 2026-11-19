@@ -26,7 +26,8 @@ import {
 import { hostListAllowed } from "./config";
 import { keepAppend, keepLast, liveTextString, type LiveKind } from "./live-text";
 import type { AccountUsageSnapshot } from "./account-usage";
-import type { ArchiveOp, ArchiveQuery, ArchiveRow } from "./archive";
+import type { ChatRecord, HistoryOp, HistoryQuery, QueuedOp } from "./history/records";
+import type { TierState } from "./history/tier";
 import {
   BudgetLedger,
   MAINTENANCE_CONTROL_READS,
@@ -168,13 +169,12 @@ export interface StoreConfig {
   /** Records younger than this never expire by count. */
   minRetentionMs: number;
   /**
-   * Records past the hot log's limits (above) that the archive (D1) keeps,
-   * newest first, before they expire; 0 keeps none. Only with `archive`.
+   * Whether history tiers lie below this SQLite (the history pipeline,
+   * src/history/: the D1 tier where it is bound): records leaving it are
+   * copied down first, and history is published from the deepest tier's floor.
    */
-  archiveRecords: number;
-  /** Whether the runtime has the archive (its ARCHIVE binding and `archiveRecords`): records leaving the hot log go there first. */
-  archive: boolean;
-  /** The share of `retentionRecords` (and the archive's) that each cleanup keeps, in percent (keptHotRecords). */
+  tiered: boolean;
+  /** The share of `retentionRecords` that each cleanup keeps, in percent (keptHotRecords). */
   cleanupThresholdPercent: number;
   /** Inactivity past which an account is removed (pruneIdleIdentities). */
   idleAccountMs: number;
@@ -332,17 +332,18 @@ export interface LiveEntry {
 
 /** What a finished live text published, if anything. */
 /**
- * A history page that reaches below the hot floor (Store.historyWithArchive):
- * the archived records it needs, and the page they complete.
+ * A history page that reaches below the hot floor (Store.historyAcrossTiers):
+ * what it needs of the tiers below (HistoryPipeline.read), and the page
+ * their records complete.
  */
 export interface PendingHistory {
-  archive: ArchiveQuery;
-  assemble(rows: readonly ArchiveRow[]): StoreHistoryResult;
+  below: HistoryQuery;
+  assemble(rows: readonly ChatRecord[]): StoreHistoryResult;
 }
 
-/** Whether a history result still needs the archive. */
+/** Whether a history result still needs the tiers below. */
 export function isPendingHistory(result: StoreHistoryResult | PendingHistory): result is PendingHistory {
-  return "archive" in result && "assemble" in result;
+  return "below" in result && "assemble" in result;
 }
 
 export interface LiveFinish {
@@ -609,8 +610,7 @@ const DEFAULT_CONFIG: StoreConfig = {
   retentionMs: DEFAULT_LIMITS.retentionSeconds * 1000,
   retentionRecords: DEFAULT_LIMITS.retentionRecords,
   minRetentionMs: DEFAULT_LIMITS.minRetentionSeconds * 1000,
-  archiveRecords: DEFAULT_LIMITS.archiveRecords,
-  archive: false,
+  tiered: false,
   cleanupThresholdPercent: DEFAULT_LIMITS.cleanupThresholdPercent,
   idleAccountMs: DEFAULT_LIMITS.idleAccountSeconds * 1000,
   keptActiveAccounts: DEFAULT_LIMITS.keptActiveAccounts,
@@ -1080,18 +1080,25 @@ const META_EFFECTIVE_NOW = "effective_now_ms";
  */
 const META_PURGE_ROOMS = "purge_rooms";
 /**
- * `_meta` keys of the archive (D1, src/archive.ts): the published floor,
- * below the hot floor while records between them are archived; the floor
- * the archive's own limit allows (the runtime finds it in D1), which cleanup
- * publishes; the newest log ID copied there; and the `/purge` and `/rename`
- * the archive has yet to apply, in order.
+ * `_meta` keys of the history pipeline (src/history/), all `history:`:
+ * the published floor, below the hot floor while lower tiers hold the
+ * records between them; the newest log ID the next tier holds a copy of
+ * (cleanup's ceiling); a flag that the published floor rose and rooms may
+ * have gone with it; the `/purge` and `/rename` the tiers below have yet to
+ * apply, with the last number given; and each lower tier's state.
  */
-const META_ARCHIVE_FLOOR = "archive_floor";
-const META_ARCHIVE_TARGET = "archive_floor_target";
-const META_ARCHIVED_THROUGH = "archived_through";
-const META_ARCHIVE_OPS = "archive_ops";
-/** Records one archive copy carries at most (archiveCandidates). */
-export const ARCHIVE_BATCH = 100;
+const META_HISTORY_PUBLISHED = "history:published";
+const META_HISTORY_THROUGH = "history:head:through";
+const META_HISTORY_ROOMS_DUE = "history:rooms_due";
+const META_HISTORY_OPS = "history:ops";
+const META_HISTORY_OPS_SEQ = "history:ops_seq";
+const META_HISTORY_TIER = "history:tier:";
+/** Log IDs one copy from this SQLite carries at most (historyScan). */
+export const HISTORY_SCAN_BATCH = 100;
+/** Index entries historyTarget reads past the cutoff at most, looking for the first record it keeps. */
+const HISTORY_TARGET_SCAN = 200;
+/** Ops the log holds at most: a /purge or /rename past it waits for the tiers below to catch up (retry_after). */
+const MAX_HISTORY_OPS = 200;
 /**
  * Reads for checkRoomFieldsTotal(): every row of the capped rooms table,
  * public and private, with slack for index pages.
@@ -2302,8 +2309,8 @@ export class Store {
    * moves it, which keeps them where every record they covered is gone.
    */
   private logCache: RawLogState | null = null;
-  /** The published floor as stored (META_ARCHIVE_FLOOR), 0 for none; read once a wake. */
-  private archiveFloorCache: number | undefined;
+  /** The published floor as stored (META_HISTORY_PUBLISHED), 0 for none; read once a wake. */
+  private publishedCache: number | undefined;
   /**
    * The open live texts (META_LIVE_TEXTS) as last read or saved, undefined
    * until read: every change goes through this instance, and a rolled-back
@@ -2945,7 +2952,7 @@ export class Store {
     this.serverCache = null;
     this.initialized = false;
     this.logCache = null;
-    this.archiveFloorCache = undefined;
+    this.publishedCache = undefined;
     this.accountingUncertain = false;
     this.lostOnWake = false;
     this.accountingMarker.load("0");
@@ -3059,7 +3066,7 @@ export class Store {
       context.commitMs,
     );
     this.logCache = null;
-    this.archiveFloorCache = undefined;
+    this.publishedCache = undefined;
   }
 
   private readSchemaVersion(): number {
@@ -3815,16 +3822,16 @@ export class Store {
   /**
    * The published history floor F: history starts here (§4.3), rooms whose
    * whole log is below it are gone, and retired ids are freed past it. It is
-   * the hot floor (log_state.history_floor), below which the object keeps no
-   * record, unless the archive (D1) holds the records between them: then the
-   * lower of the hot floor and META_ARCHIVE_FLOOR, which cleanup raises to
-   * what the archive's own limit allows (runCleanup).
+   * the hot floor (log_state.history_floor), below which this SQLite keeps
+   * no record, unless tiers below hold the records between them (`tiered`):
+   * then META_HISTORY_PUBLISHED, which the history pipeline raises
+   * (publishHistoryFloor), never past the hot floor.
    */
   private publishedFloor(): number {
     const hot = this.logState().history_floor;
-    if (!this.config.archive) return hot;
-    this.archiveFloorCache ??= this.metaNumber(META_ARCHIVE_FLOOR);
-    return this.archiveFloorCache > 0 ? Math.min(this.archiveFloorCache, hot) : hot;
+    if (!this.config.tiered) return hot;
+    this.publishedCache ??= this.metaNumber(META_HISTORY_PUBLISHED);
+    return this.publishedCache > 0 ? Math.min(this.publishedCache, hot) : hot;
   }
 
   /**
@@ -3840,86 +3847,168 @@ export class Store {
     )[0]?.count));
   }
 
-  /** The hot floor and the published floor (publishedFloor), for the runtime's archive upkeep. */
-  archiveBounds(now = this.clock.now()): { hot: number; published: number } {
+  /** The hot floor and the published floor (publishedFloor), for the history pipeline. */
+  historyFloors(now = this.clock.now()): { hot: number; published: number } {
     this.ensureReady();
     return this.reserved({ reads: 8 }, true, now, () => ({ hot: this.logState().history_floor, published: this.publishedFloor() }));
   }
 
   /**
-   * The next records to copy to the archive before cleanup removes them from
-   * the hot log: those of the running cleanup job's prefix (its pinned
-   * cutoff) from past the last copy on, at most ARCHIVE_BATCH, ending at a
-   * whole log ID (a move's record is a row in each of its rooms); `through`
-   * is the newest log ID copied once they are, for noteArchived; `more` that
-   * a full batch may have left more. Nothing without the archive or a job.
+   * The head's target (HistoryHead.floorFor): while a cleanup job runs, the
+   * log ID of the first record its pinned cutoff keeps, below which records
+   * are copied down before cleanup removes them. A log ID is never below its
+   * commit time, so every record before the cutoff's own log ID has expired;
+   * past it, at most HISTORY_TARGET_SCAN entries are read, and if none is
+   * kept the last read is a target low enough. Undefined without a job.
    */
-  archiveCandidates(now = this.clock.now()): { rows: Array<{ room_id: string; log_id: number; commit_ms: number; kind: string; record_json: string }>; through: number; more: boolean } {
+  historyTarget(now = this.clock.now()): number | undefined {
     this.ensureReady();
-    const none = { rows: [], through: 0, more: false };
-    if (!this.config.archive) return none;
-    return this.reserved({ reads: 24 + 2 * ARCHIVE_BATCH }, true, now, () => {
+    if (!this.config.tiered) return undefined;
+    return this.reserved({ reads: 24 + HISTORY_TARGET_SCAN }, true, now, () => {
       const maintenance = this.maintenanceRow();
-      if (maintenance.cleanup_cursor === null || maintenance.cleanup_cutoff_ms === null) return none;
+      if (maintenance.cleanup_cursor === null || maintenance.cleanup_cutoff_ms === null) return undefined;
       const cutoff = maintenance.cleanup_cutoff_ms;
-      const start = Math.max(this.logState().history_floor, this.metaNumber(META_ARCHIVED_THROUGH) + 1);
-      const rows = this.rawRows<{ room_id: string; log_id: number; commit_ms: number; kind: string; record_json: string }>(
-        `SELECT room_id, log_id, commit_ms, kind, record_json FROM records INDEXED BY records_log_idx
-         WHERE log_id >= ? ORDER BY log_id LIMIT ?`, start, ARCHIVE_BATCH,
-      ).map((row) => ({ ...row, log_id: integerColumn(row.log_id), commit_ms: integerColumn(row.commit_ms) }));
-      const fresh = rows.findIndex((row) => row.commit_ms >= cutoff);
-      let copy = fresh === -1 ? rows : rows.slice(0, fresh);
-      if (!copy.length) return none;
-      const more = fresh === -1 && rows.length === ARCHIVE_BATCH;
-      let through = copy[copy.length - 1].log_id;
-      // A full batch may have cut the last log ID's rows short: it goes next time.
-      if (more && copy[0].log_id !== through) {
-        through -= 1;
-        copy = copy.filter((row) => row.log_id <= through);
+      const state = this.logState();
+      const rows = this.rawRows<{ log_id: number; commit_ms: number }>(
+        "SELECT log_id, commit_ms FROM records INDEXED BY records_log_idx WHERE log_id >= ? ORDER BY log_id LIMIT ?",
+        Math.max(state.history_floor, cutoff), HISTORY_TARGET_SCAN,
+      );
+      const kept = rows.find((row) => integerColumn(row.commit_ms) >= cutoff);
+      if (kept) return integerColumn(kept.log_id);
+      if (rows.length === HISTORY_TARGET_SCAN) return integerColumn(rows[rows.length - 1].log_id);
+      return state.last_log_id + 1;
+    });
+  }
+
+  /**
+   * Records from `from` on, oldest first: those of at most `limit` distinct
+   * log IDs, every room's copy of each (HistoryHead.scan, for the copy down).
+   */
+  historyScan(from: number, limit = HISTORY_SCAN_BATCH, now = this.clock.now()): ChatRecord[] {
+    this.ensureReady();
+    const capped = Math.max(0, Math.min(limit, HISTORY_SCAN_BATCH));
+    return this.reserved({ reads: 24 + 6 * capped }, true, now, () => this.rawRows<ChatRecord>(
+      `SELECT room_id, log_id, commit_ms, kind, record_json FROM records WHERE log_id IN (
+         SELECT DISTINCT log_id FROM records INDEXED BY records_log_idx WHERE log_id >= ? ORDER BY log_id LIMIT ?)
+       ORDER BY log_id, room_id`, from, capped,
+    ).map((row) => ({ ...row, log_id: integerColumn(row.log_id), commit_ms: integerColumn(row.commit_ms) })));
+  }
+
+  /**
+   * The records of `roomIds` in a window, as HistoryTier.read gives them
+   * (the first `limit` distinct log IDs nearest the page's start), outside
+   * the history quota: for exports and the pipeline's own reads.
+   */
+  historyRecords(query: HistoryQuery, now = this.clock.now()): ChatRecord[] {
+    this.ensureReady();
+    const limit = Math.max(0, Math.min(query.limit, 1_000));
+    if (!query.roomIds.length || query.lower > query.upper || !limit) return [];
+    return this.reserved({ reads: 24 + 4 * limit * Math.min(query.roomIds.length, 8) }, true, now, () => this.rawRows<ChatRecord>(
+      `SELECT room_id, log_id, commit_ms, kind, record_json FROM records
+       WHERE room_id IN (SELECT value FROM json_each(?)) AND log_id IN (
+         SELECT DISTINCT log_id FROM records
+         WHERE room_id IN (SELECT value FROM json_each(?)) AND log_id >= ? AND log_id <= ?
+         ORDER BY log_id ${query.forward ? "ASC" : "DESC"} LIMIT ?)
+       ORDER BY log_id ${query.forward ? "ASC" : "DESC"}`,
+      JSON.stringify(query.roomIds), JSON.stringify(query.roomIds), Math.max(query.lower, this.logState().history_floor), query.upper, limit,
+    ).map((row) => ({ ...row, log_id: integerColumn(row.log_id), commit_ms: integerColumn(row.commit_ms) })));
+  }
+
+  /** The records with these log IDs, any room (import's duplicate check). */
+  historyLookup(logIds: readonly number[], now = this.clock.now()): ChatRecord[] {
+    this.ensureReady();
+    const ids = [...new Set(logIds)].slice(0, 1_000);
+    if (!ids.length) return [];
+    return this.reserved({ reads: 24 + 4 * ids.length }, true, now, () => this.rawRows<ChatRecord>(
+      "SELECT room_id, log_id, commit_ms, kind, record_json FROM records WHERE log_id IN (SELECT value FROM json_each(?)) ORDER BY log_id, room_id",
+      JSON.stringify(ids),
+    ).map((row) => ({ ...row, log_id: integerColumn(row.log_id), commit_ms: integerColumn(row.commit_ms) })));
+  }
+
+  /**
+   * The pipeline's tier state (TierStateStore), kept in `_meta`: the head's
+   * floor is the hot floor and its `through` cleanup's ceiling; a lower
+   * tier with no state yet starts at the published floor, holding nothing,
+   * with every op so far behind it.
+   */
+  historyState(names: readonly string[], head: string, now = this.clock.now()): Record<string, TierState> {
+    this.ensureReady();
+    return this.reserved({ reads: 16 + 4 * names.length }, true, now, () => {
+      const state = this.logState();
+      const published = this.publishedFloor();
+      const out: Record<string, TierState> = {};
+      for (const name of names) {
+        if (name === head) {
+          const through = this.metaNumber(META_HISTORY_THROUGH);
+          out[name] = { floor: state.history_floor, target: state.history_floor, through: through > 0 ? through : state.history_floor - 1, ops: 0 };
+          continue;
+        }
+        const fresh: TierState = { floor: published, target: published, through: published - 1, ops: this.metaNumber(META_HISTORY_OPS_SEQ) };
+        out[name] = this.metaJson<TierState>(META_HISTORY_TIER + name, (value) => {
+          const saved = value as Partial<TierState>;
+          return typeof saved.floor === "number" && typeof saved.through === "number" ? { ...fresh, ...saved } : undefined;
+        }, fresh);
       }
-      return { rows: copy, through, more };
+      return out;
     });
   }
 
-  /** Notes that the archive holds every record through `through` (archiveCandidates), so cleanup may remove them. */
-  noteArchived(through: number, now = this.clock.now()): void {
+  /** Saves a tier's state (historyState); for the head only `through`, which never falls. */
+  saveHistoryState(name: string, head: string, update: Partial<TierState>, now = this.clock.now()): void {
     this.ensureReady();
-    this.reserved({ reads: 4, writes: 4 }, true, now, () => {
-      if (through > this.metaNumber(META_ARCHIVED_THROUGH)) this.writeMeta(META_ARCHIVED_THROUGH, String(through));
-    });
-  }
-
-  /** The floor the archive's own limit allows (Archive.floor), for the next cleanup to publish (runCleanup). */
-  setArchiveTarget(floor: number, now = this.clock.now()): void {
-    this.ensureReady();
-    this.reserved({ reads: 4, writes: 4 }, true, now, () => {
-      if (floor > this.metaNumber(META_ARCHIVE_TARGET)) {
-        this.writeMeta(META_ARCHIVE_TARGET, String(floor));
-        this.cleanupDueCache = undefined;
-        this.rawExec("UPDATE maintenance SET next_cleanup_ms = MIN(next_cleanup_ms, ?) WHERE id = 1", this.effectiveNow(now));
+    if (!this.config.tiered) return;
+    this.reserved({ reads: 16, writes: 4 }, true, now, () => {
+      if (name === head) {
+        if (update.through !== undefined && update.through > this.metaNumber(META_HISTORY_THROUGH)) this.writeMeta(META_HISTORY_THROUGH, String(update.through));
+        return;
       }
+      const published = this.publishedFloor();
+      const fresh = { floor: published, target: published, through: published - 1, ops: this.metaNumber(META_HISTORY_OPS_SEQ) };
+      const current = this.metaJson<Record<string, unknown>>(META_HISTORY_TIER + name, (value) => value as Record<string, unknown>, fresh);
+      const merged: Record<string, unknown> = { ...fresh, ...current, ...update };
+      for (const [key, value] of Object.entries(update)) if (value === undefined) delete merged[key];
+      this.writeMeta(META_HISTORY_TIER + name, JSON.stringify(merged));
     });
   }
 
-  /** The `/purge` and `/rename` the archive has yet to apply, oldest first (Archive.apply). */
-  archiveOps(now = this.clock.now()): ArchiveOp[] {
+  /**
+   * Raises the published floor (HistoryHead.publish), never past the hot
+   * floor: history starts there from now on. Rooms whose whole log is below
+   * it go on the next cleanup, made due now.
+   */
+  publishHistoryFloor(floor: number, now = this.clock.now()): void {
     this.ensureReady();
-    if (!this.config.archive) return [];
-    return this.reserved({ reads: 4 }, true, now, () => this.metaJson(META_ARCHIVE_OPS, (value) => Array.isArray(value) ? value as ArchiveOp[] : undefined, []));
+    if (!this.config.tiered) return;
+    this.reserved({ reads: 16, writes: 8 }, true, now, () => {
+      const published = Math.min(floor, this.logState().history_floor);
+      if (published <= this.publishedFloor()) return;
+      this.writeMeta(META_HISTORY_PUBLISHED, String(published));
+      this.publishedCache = published;
+      this.writeMeta(META_HISTORY_ROOMS_DUE, "1");
+      this.cleanupDueCache = undefined;
+      this.rawExec("UPDATE maintenance SET next_cleanup_ms = MIN(next_cleanup_ms, ?) WHERE id = 1", this.effectiveNow(now));
+    });
   }
 
-  /** Forgets the oldest of archiveOps, once the archive applied it. */
-  dropArchiveOp(now = this.clock.now()): void {
+  /** The `/purge` and `/rename` the tiers below have yet to apply, oldest first. */
+  historyOps(now = this.clock.now()): QueuedOp[] {
+    this.ensureReady();
+    if (!this.config.tiered) return [];
+    return this.reserved({ reads: 4 }, true, now, () => this.metaJson(META_HISTORY_OPS, (value) => Array.isArray(value) ? value as QueuedOp[] : undefined, []));
+  }
+
+  /** Forgets the ops through `seq`, once every rewritable tier below applied them. */
+  dropHistoryOps(seq: number, now = this.clock.now()): void {
     this.ensureReady();
     this.reserved({ reads: 4, writes: 4 }, true, now, () => {
-      const ops = this.metaJson(META_ARCHIVE_OPS, (value) => Array.isArray(value) ? value as ArchiveOp[] : undefined, []).slice(1);
-      this.writeMeta(META_ARCHIVE_OPS, ops.length ? JSON.stringify(ops) : null);
+      const ops = this.metaJson(META_HISTORY_OPS, (value) => Array.isArray(value) ? value as QueuedOp[] : undefined, []).filter((entry) => entry.seq > seq);
+      this.writeMeta(META_HISTORY_OPS, ops.length ? JSON.stringify(ops) : null);
     });
   }
 
   /**
    * Deletes the hot log's reaction sets on `messageIds`, messages of purged
-   * users that only the archive held (Archive.apply): /purge found no current
+   * users that only a tier below held (HistoryPipeline: PurgeResult.messageIds): /purge found no current
    * message for them, so their newer reaction records were left. Scans the
    * retained log for them, as /purge does.
    */
@@ -3937,11 +4026,18 @@ export class Store {
     }), true);
   }
 
-  /** Queues what a `/purge` or `/rename` did to the hot log for the archive (archiveOps), within the operation's transaction. */
-  private queueArchiveOp(op: ArchiveOp): void {
-    if (!this.config.archive) return;
-    const ops = this.metaJson(META_ARCHIVE_OPS, (value) => Array.isArray(value) ? value as ArchiveOp[] : undefined, []);
-    this.writeMeta(META_ARCHIVE_OPS, JSON.stringify([...ops, op]));
+  /**
+   * Queues what a `/purge` or `/rename` did here for the tiers below
+   * (historyOps), within the operation's transaction. A full log refuses
+   * the operation: the tiers below must catch up first.
+   */
+  private queueHistoryOp(op: HistoryOp): void {
+    if (!this.config.tiered) return;
+    const ops = this.metaJson(META_HISTORY_OPS, (value) => Array.isArray(value) ? value as QueuedOp[] : undefined, []);
+    if (ops.length >= MAX_HISTORY_OPS) throw new StoreError("retry_after", "older history has yet to catch up with earlier changes");
+    const seq = this.metaNumber(META_HISTORY_OPS_SEQ) + 1;
+    this.writeMeta(META_HISTORY_OPS_SEQ, String(seq));
+    this.writeMeta(META_HISTORY_OPS, JSON.stringify([...ops, { seq, op }]));
   }
 
   private identityRow(userId: string): RawIdentityRow | null {
@@ -4070,7 +4166,7 @@ export class Store {
           this.rewriteRecord(row, JSON.stringify({ ...membership, members: membership.members.map((member) => ({ ...member, user: renamed(member.user) })) }));
         }
       }
-      this.queueArchiveOp({ op: "rename", from, to });
+      this.queueHistoryOp({ op: "rename", from, to });
       // A message's current snapshot is its latest record, renamed above.
       for (const row of found.messages) this.rawExec("UPDATE message_state SET author_id = ? WHERE message_id = ?", to, row.message_id);
       for (const row of found.reactions) {
@@ -4209,8 +4305,8 @@ export class Store {
       this.rawExec(`DELETE FROM reaction_state WHERE user_id IN (${marks})`, ...ids);
       if (messages.length) this.rawExec(`DELETE FROM reaction_state WHERE message_id IN (${messageMarks})`, ...messages);
       this.rawExec(`DELETE FROM message_state WHERE author_id IN (${marks})`, ...ids);
-      // The archive does the same to what it holds (Archive.apply).
-      this.queueArchiveOp({ op: "purge", userIds: ids, messageIds: messages });
+      // The tiers below do the same to what they hold (HistoryPipeline).
+      this.queueHistoryOp({ op: "purge", userIds: ids, messageIds: messages });
       const uploads = this.rawRows<RawUploadRow>(
         `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
          FROM uploads INDEXED BY uploads_owner_idx WHERE owner_id IN (${marks})`,
@@ -4426,7 +4522,7 @@ export class Store {
         "SELECT key FROM _meta WHERE key >= ? AND key < ? AND CAST(value AS INTEGER) <= 1 LIMIT ?", META_PURGED_PREFIX, end, RETIRED_SWEEP_BATCH,
       );
       for (const row of legacy) this.rawExec("UPDATE _meta SET value = ? WHERE key = ?", String(state.last_log_id), row.key);
-      // The published floor: archived records may still name them.
+      // The published floor: records in the tiers below may still name them.
       const floor = this.publishedFloor();
       const below = floor > state.last_log_id ? Number.MAX_SAFE_INTEGER : floor - RETIRED_MARKER_MARGIN;
       return this.rawRows<{ key: string }>(
@@ -8179,7 +8275,7 @@ export class Store {
           const context: CommitContext = { state, commitMs: Math.max(effective, state.last_commit_ms), touched: new Map() };
           const floor = state.history_floor;
           committed = method === "message" ? this.commitMessage(input, context, floor)
-            // A room exists, and is counted, until its records leave the archive too.
+            // A room exists, and is counted, until its records leave the tiers below too.
             : method === "room_set" ? this.commitRoom(input, context, this.publishedFloor(), tier === "registered")
             : this.commitReactions(input, context, floor);
           // Within the transaction: a move its sender cannot pay for is refused whole.
@@ -8213,16 +8309,16 @@ export class Store {
   }
 
   /**
-   * history, for a runtime with the archive: a page that reaches below the
+   * history, for a runtime with tiers below: a page that reaches below the
    * hot floor is a PendingHistory, which the runtime completes with the
-   * archived records it asks for (Archive.page). Charged and checked as
-   * history is, before the archive is read.
+   * records it asks of them (HistoryPipeline.read). Charged and checked as
+   * history is, before they are read.
    */
-  historyWithArchive(query: StoreHistoryQuery): StoreHistoryResult | PendingHistory {
+  historyAcrossTiers(query: StoreHistoryQuery): StoreHistoryResult | PendingHistory {
     return this.historyImpl(query, true);
   }
 
-  private historyImpl(query: StoreHistoryQuery, allowArchive: boolean): StoreHistoryResult | PendingHistory {
+  private historyImpl(query: StoreHistoryQuery, allowTiers: boolean): StoreHistoryResult | PendingHistory {
     this.ensureReady();
     const operationNow = query.now ?? this.clock.now();
     const charged = Boolean(query.userId && query.ipKey);
@@ -8284,7 +8380,7 @@ export class Store {
               return undefined;
             }
           }
-          return this.historyPageInternal({ ...query, now }, allowArchive);
+          return this.historyPageInternal({ ...query, now }, allowTiers);
         });
         if (measuredRefusal) throw measuredRefusal;
         return page!;
@@ -8368,11 +8464,11 @@ export class Store {
     return numericId(typeof value === "bigint" ? numericBigInt(value, field) : value, field);
   }
 
-  private historyPageInternal(query: StoreHistoryQuery, allowArchive = false): StoreHistoryResult | PendingHistory {
+  private historyPageInternal(query: StoreHistoryQuery, allowTiers = false): StoreHistoryResult | PendingHistory {
     const { multiple, sources } = this.historySources(query);
     if (!multiple && !sources.length) throw new StoreError("invalid_params", "unknown room");
     // History starts at the published floor; the hot log holds records from
-    // the hot floor on, and the archive those between them.
+    // the hot floor on, and the tiers below those between them.
     const floor = this.publishedFloor();
     const hot = this.logState().history_floor;
     const after = this.historyBound(query.after, "after");
@@ -8444,19 +8540,20 @@ export class Store {
         for (const [roomId, window] of hotWindows) for (const row of roomSlice(roomId, window)) take(row);
       }
     }
-    // The archive's part: below the hot floor. A forward page starts there;
+    // The tiers' part: below the hot floor. A forward page starts there;
     // a backward one reaches it when the hot log has less than a page.
-    const archived = [...windows].filter(([, window]) => window.lower < hot);
-    if (allowArchive && this.config.archive && archived.length && (forward || byLogId.size <= limit)) {
-      const archive: ArchiveQuery = {
-        roomIds: archived.map(([roomId]) => roomId),
-        lower: Math.min(...archived.map(([, window]) => window.lower)),
-        upper: Math.min(hot - 1, Math.max(...archived.map(([, window]) => window.upper))),
+    const lowered = [...windows].filter(([, window]) => window.lower < hot);
+    if (allowTiers && this.config.tiered && lowered.length && (forward || byLogId.size <= limit)) {
+      const below: HistoryQuery = {
+        roomIds: lowered.map(([roomId]) => roomId),
+        lower: Math.min(...lowered.map(([, window]) => window.lower)),
+        upper: Math.min(hot - 1, Math.max(...lowered.map(([, window]) => window.upper))),
         forward,
         limit: limit + 1,
+        ...(multiple ? { joined: true } : {}),
       };
-      return { archive, assemble: (archivedRows) => {
-        for (const row of archivedRows) take(row);
+      return { below, assemble: (rows) => {
+        for (const row of rows) take(row);
         return assemble();
       } };
     }
@@ -8543,8 +8640,8 @@ export class Store {
    */
   private cleanupHasWork(floor: number, cutoff: number, effective: number, limiterCutoff: number): boolean {
     return roomIdList(this.metaValue(META_PURGE_ROOMS)).length > 0 ||
-      // The archive's limit allows a higher published floor than cleanup published.
-      (this.config.archive && this.metaNumber(META_ARCHIVE_TARGET) > this.publishedFloor()) ||
+      // The published floor rose (publishHistoryFloor): rooms may have gone with it.
+      (this.config.tiered && this.metaValue(META_HISTORY_ROOMS_DUE) !== "") ||
       this.rawRows("SELECT log_id FROM records INDEXED BY records_log_idx WHERE log_id < ? ORDER BY log_id LIMIT 1", floor).length > 0 ||
       // Commit times are nondecreasing in log order, so the oldest record from the floor on says whether any expired.
       this.rawRows<{ commit_ms: number }>("SELECT commit_ms FROM records INDEXED BY records_log_idx WHERE log_id >= ? ORDER BY log_id LIMIT 1", floor)
@@ -8631,14 +8728,16 @@ export class Store {
   }
 
   /**
-   * With the archive (`archive`), records leave the hot log only once it
-   * holds them (archiveCandidates, noteArchived): the hot floor stops at the
-   * last copied, and the job waits `archiveWaitMs` (a second by default; the
-   * runtime lengthens it while D1 fails) for the next copy. The published
-   * floor (publishedFloor) rises to the archive's target (setArchiveTarget),
-   * never past the hot floor, and rooms go when their whole log is below it.
+   * With tiers below (`tiered`), records leave this SQLite only once the
+   * next tier holds them (the history pipeline copies them and marks
+   * META_HISTORY_THROUGH): the hot floor stops at the last copied, and the
+   * job waits `copyWaitMs` (a second by default; the runtime lengthens it
+   * while the tier fails) for the next copy. The published floor
+   * (publishedFloor) stays where it was, below the hot floor, until the
+   * pipeline raises it (publishHistoryFloor); rooms go when their whole log
+   * is below it.
    */
-  runCleanup(now = this.clock.now(), options: { archiveWaitMs?: number } = {}): StoreCleanupResult {
+  runCleanup(now = this.clock.now(), options: { copyWaitMs?: number } = {}): StoreCleanupResult {
     this.ensureReady();
     // An alarm may have fired, and cleanup may establish an earlier continuation.
     this.scheduledAlarmAt = undefined;
@@ -8700,7 +8799,7 @@ export class Store {
     const batch = Math.min(100, this.config.cleanupBatch);
     let floor = previousFloor;
     let published = previousPublished;
-    // With the archive, records leave the hot log only once it holds them.
+    // With tiers below, records leave this SQLite only once the next holds them.
     let ceiling = Number.MAX_SAFE_INTEGER;
     // Commit the server-wide coverage boundary/job before physical deletion.
     // A failed deletion leaves logically expired rows hidden and an
@@ -8715,25 +8814,23 @@ export class Store {
         `SELECT log_id, commit_ms FROM records INDEXED BY records_log_idx
          WHERE log_id >= ? ORDER BY log_id LIMIT ?`, floor, batch,
       );
-      if (this.config.archive) ceiling = this.metaNumber(META_ARCHIVED_THROUGH);
+      if (this.config.tiered) ceiling = this.metaNumber(META_HISTORY_THROUGH);
       const fresh = oldest.findIndex((row) => integerColumn(row.commit_ms) >= cutoff || row.log_id > ceiling);
       const expired = fresh === -1 ? oldest : oldest.slice(0, fresh);
       if (expired.length) floor = Math.max(floor, expired[expired.length - 1].log_id + 1);
-      if (this.config.archive) {
-        // The archive holds what is between the published floor and the hot
-        // one, until its own limit lets the published floor rise.
-        published = Math.min(Math.max(previousPublished, this.metaNumber(META_ARCHIVE_TARGET)), floor);
-        if (published !== this.metaNumber(META_ARCHIVE_FLOOR)) this.writeMeta(META_ARCHIVE_FLOOR, String(published));
-        this.archiveFloorCache = published;
+      if (this.config.tiered) {
+        // The tiers below hold what is between the published floor and the
+        // hot one, until their retention lets the pipeline publish a higher one.
+        published = Math.min(previousPublished, floor);
+        if (published !== this.metaNumber(META_HISTORY_PUBLISHED)) this.writeMeta(META_HISTORY_PUBLISHED, String(published));
+        this.publishedCache = published;
       } else {
         published = floor;
-        // An archive turned off forgets its floors and queue: turned on again,
-        // it starts at the hot floor, and what it held below is trimmed.
-        const stale = this.rawRows<{ key: string }>(
-          "SELECT key FROM _meta WHERE key IN (?, ?, ?, ?) LIMIT 4", META_ARCHIVE_FLOOR, META_ARCHIVE_TARGET, META_ARCHIVED_THROUGH, META_ARCHIVE_OPS,
-        );
+        // Tiers turned off forget their floors, queue and state: turned on
+        // again, they start at the hot floor, and what they held below is trimmed.
+        const stale = this.rawRows<{ key: string }>("SELECT key FROM _meta WHERE key >= 'history:' AND key < 'history;' LIMIT 64");
         for (const row of stale) this.writeMeta(row.key, null);
-        this.archiveFloorCache = undefined;
+        this.publishedCache = undefined;
       }
       const head = this.writeLogHead(floor);
       this.rawExec("UPDATE maintenance SET cleanup_cutoff_ms = ?, cleanup_cursor = ?, next_cleanup_ms = ? WHERE id = 1", cutoff, floor, effective + 1000);
@@ -8785,7 +8882,7 @@ export class Store {
       // capped, bounding these scans. Its registered members' rows are purged
       // below, in batches; until then the join with `rooms` hides them.
       let purge = roomIdList(this.metaValue(META_PURGE_ROOMS));
-      // Below the published floor: a room's archived records keep it.
+      // Below the published floor: a room's records in the tiers below keep it.
       const threads = remaining > 0 && purge.length < MAX_PURGE_ROOMS ? this.rawRows<{ room_id: string }>(
         `SELECT room_id FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IS NOT NULL AND latest_log_id < ? ORDER BY created_log_id LIMIT ?`, published, Math.min(remaining, MAX_PURGE_ROOMS - purge.length),
       ) : [];
@@ -8855,12 +8952,14 @@ export class Store {
       const hasMore = this.cleanupHasWork(floor, cutoff, effective, limiterCutoff) ||
         this.rawRows(`SELECT room_id FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IS NOT NULL AND latest_log_id < ? LIMIT 1`, published).length > 0 ||
         this.rawRows(`SELECT room_id FROM rooms WHERE ${PRIVATE_ROOMS} AND latest_log_id < ? LIMIT 1`, published).length > 0;
-      // Waiting for the archive to copy the next expired records: no sooner
-      // than the runtime can (archiveWaitMs).
-      const waiting = hasMore && this.config.archive && this.rawRows<{ log_id: number; commit_ms: number }>(
+      // Waiting for the tier below to copy the next expired records: no
+      // sooner than the runtime can (copyWaitMs).
+      const waiting = hasMore && this.config.tiered && this.rawRows<{ log_id: number; commit_ms: number }>(
         "SELECT log_id, commit_ms FROM records INDEXED BY records_log_idx WHERE log_id >= ? ORDER BY log_id LIMIT 1", floor,
-      ).some((row) => integerColumn(row.commit_ms) < cutoff && row.log_id > this.metaNumber(META_ARCHIVED_THROUGH));
-      const nextDue = effective + (!hasMore ? this.config.cleanupIntervalMs : waiting ? Math.max(1000, options.archiveWaitMs ?? 1000) : 1000);
+      ).some((row) => integerColumn(row.commit_ms) < cutoff && row.log_id > this.metaNumber(META_HISTORY_THROUGH));
+      // The rooms the published floor left behind are gone once a job ends.
+      if (!hasMore && this.config.tiered && this.metaValue(META_HISTORY_ROOMS_DUE) !== "") this.writeMeta(META_HISTORY_ROOMS_DUE, null);
+      const nextDue = effective + (!hasMore ? this.config.cleanupIntervalMs : waiting ? Math.max(1000, options.copyWaitMs ?? 1000) : 1000);
       this.rawExec("UPDATE maintenance SET next_cleanup_ms = ?, cleanup_cutoff_ms = ?, cleanup_cursor = ? WHERE id = 1", nextDue, hasMore ? cutoff : null, hasMore ? floor : null);
       this.cleanupDueCache = undefined;
       this.assertReservation(reserved, beforeReads, beforeWrites);

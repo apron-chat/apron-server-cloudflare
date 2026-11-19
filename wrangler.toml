@@ -25,14 +25,21 @@ new_sqlite_classes = ["ApronDemoServer"]
 binding = "MEDIA"
 bucket_name = "apron-media-dev"
 
-# The history archive (src/archive.ts). Archived records stay in history but
-# become read-only: past retentionRecords, the oldest move from the object's
-# SQLite to D1, where history pages still read them but their messages can
-# no longer be edited, reacted to or replied to; past archiveRecords more,
-# they expire. Local development and the tests use a local database; the id
-# is a placeholder.
+# History segments and backups (PLAN §9): a private bucket, no public access.
+# Used by the tests and `wrangler dev` (miniflare's local R2); production
+# has none yet, so the blob tier is off there.
+[[r2_buckets]]
+binding = "HISTORY_BLOB"
+bucket_name = "apron-history-dev"
+
+# The D1 history tier (src/history/d1.ts, docs/configuration.md, History
+# tiers). Records there stay in history but become read-only: past
+# retentionRecords, the oldest move from the object's SQLite to D1, where
+# history pages still read them but their messages can no longer be edited,
+# reacted to or replied to; past archiveRecords more, they expire. Local
+# development and the tests use a local database; the id is a placeholder.
 [[d1_databases]]
-binding = "ARCHIVE"
+binding = "HISTORY_D1"
 database_name = "apron-archive-dev"
 database_id = "00000000-0000-0000-0000-000000000000"
 
