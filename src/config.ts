@@ -562,7 +562,10 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 		} catch (error) {
 			throw new ConfigError(error instanceof Error ? error.message : String(error));
 		}
-		const both = HISTORY_LIMIT_VARS.filter((name) => (env as Record<string, unknown>)[name] !== undefined);
+		// A limit may be set as LIMIT_X, X or its own name (parsePositiveInt): any of them, for any history limit.
+		const names = [...HISTORY_LIMIT_VARS, ...(history.schedule.everySeconds !== undefined ? ["LIMIT_CLEANUP_SECONDS"] : [])]
+			.flatMap((name) => { const upper = name.slice("LIMIT_".length); return [name, upper, upper.toLowerCase().replace(/_([a-z])/g, (_, letter: string) => letter.toUpperCase())]; });
+		const both = names.filter((name) => (env as Record<string, unknown>)[name] !== undefined);
 		if (both.length) throw new ConfigError(`HISTORY sets history's limits: remove ${both.join(", ")}`);
 		Object.assign(limits, historyLimits(history));
 	}

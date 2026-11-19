@@ -86,7 +86,8 @@ export function blobStoreOf(settings: BlobStoreSettings, env: HistoryEnv): BlobS
 		case "memory":
 			return new MemoryBlobStore();
 		case "fs":
-			throw new Error("the fs blob store runs in Node scripts only (scripts/fs-blob-store.mjs), not in the Worker");
+			// Node scripts only (scripts/fs-blob-store.mjs): in the Worker, as if unbound.
+			return undefined;
 	}
 }
 

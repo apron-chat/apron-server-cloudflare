@@ -1091,6 +1091,7 @@ const META_PURGE_ROOMS = "purge_rooms";
  */
 const META_HISTORY_PUBLISHED = "history:published";
 const META_HISTORY_THROUGH = "history:head:through";
+const META_HISTORY_HEAD_STALL = "history:head:stall";
 const META_HISTORY_ROOMS_DUE = "history:rooms_due";
 const META_HISTORY_OPS = "history:ops";
 const META_HISTORY_OPS_SEQ = "history:ops_seq";
@@ -4093,7 +4094,13 @@ export class Store {
       for (const name of names) {
         if (name === head) {
           const through = this.metaNumber(META_HISTORY_THROUGH);
-          out[name] = { floor: state.history_floor, target: state.history_floor, through: through > 0 ? through : state.history_floor - 1, ops: 0 };
+          // A failing copy to the next tier: since when, and when admins were told.
+          const stall = this.metaJson<{ stalledSince?: number; alertedAt?: number }>(META_HISTORY_HEAD_STALL, (value) => value as { stalledSince?: number; alertedAt?: number }, {});
+          out[name] = {
+            floor: state.history_floor, target: state.history_floor, through: through > 0 ? through : state.history_floor - 1, ops: 0,
+            ...(typeof stall.stalledSince === "number" ? { stalledSince: stall.stalledSince } : {}),
+            ...(typeof stall.alertedAt === "number" ? { alertedAt: stall.alertedAt } : {}),
+          };
           continue;
         }
         const fresh: TierState = { floor: published, target: published, through: published - 1, ops: this.metaNumber(META_HISTORY_OPS_SEQ) };
@@ -4113,6 +4120,11 @@ export class Store {
     this.reserved({ reads: 16, writes: 4 }, true, now, () => {
       if (name === head) {
         if (update.through !== undefined && update.through > this.metaNumber(META_HISTORY_THROUGH)) this.writeMeta(META_HISTORY_THROUGH, String(update.through));
+        if ("stalledSince" in update || "alertedAt" in update) {
+          const stall = { ...this.metaJson<Record<string, unknown>>(META_HISTORY_HEAD_STALL, (value) => value as Record<string, unknown>, {}), ...update };
+          const kept = { ...(typeof stall.stalledSince === "number" ? { stalledSince: stall.stalledSince } : {}), ...(typeof stall.alertedAt === "number" ? { alertedAt: stall.alertedAt } : {}) };
+          this.writeMeta(META_HISTORY_HEAD_STALL, Object.keys(kept).length ? JSON.stringify(kept) : null);
+        }
         return;
       }
       const published = this.publishedFloor();

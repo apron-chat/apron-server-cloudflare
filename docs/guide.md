@@ -293,10 +293,10 @@ used the old one; `/invite-device remove <id>` revokes it, and
 
 Only the latest 84,000 records (messages, edits, reactions, room changes, and
 registered users' memberships) are retained, however old, 4,000 in the
-server's own storage and 80,000 more in an archive (80% of limits of 5,000
-and 100,000, the rest headroom), and none younger than three days expires;
-without the archive, 4,000; 24 hours on Workers Free.
-Archived messages can be read in history but not edited, reacted to or
+server's own storage and 80,000 more in its D1 history tier (80% of limits
+of 5,000 and 100,000, the rest headroom), and none younger than three days
+expires; without the D1 tier, 4,000; 24 hours on Workers Free.
+Messages in the D1 tier can be read in history but not edited, reacted to or
 replied to. Cleanup runs once a day
 (hourly on Free), so up to a day's records more may show; quota exhaustion may
 delay physical deletion. Uploaded files are kept 120 days, so a message older

@@ -303,6 +303,11 @@ it("with tiers below, removes records from SQLite only once copied, and keeps th
 			hot: { floor: 1, target: 1, through: Number(logs[4]), ops: 0 },
 			recent: { floor: 1, target: 1, through: 0, ops: 0 },
 		});
+		// A failing copy from SQLite is kept, for /status and the admins' alert, until one succeeds.
+		store.saveHistoryState("hot", "hot", { stalledSince: 123, alertedAt: 456 }, clock.value);
+		expect(store.historyState(["hot"], "hot", clock.value).hot).toMatchObject({ stalledSince: 123, alertedAt: 456 });
+		store.saveHistoryState("hot", "hot", { stalledSince: undefined, alertedAt: undefined }, clock.value);
+		expect(store.historyState(["hot"], "hot", clock.value).hot.stalledSince).toBeUndefined();
 		due();
 		const moved = store.runCleanup(clock.value);
 		expect(moved.deleted_records).toBe(6);

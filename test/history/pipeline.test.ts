@@ -271,6 +271,43 @@ describe("HistoryPipeline over memory tiers", () => {
 	});
 });
 
+describe("HistoryPipeline upkeep", () => {
+	it("forgets the op log when no tier below the head is rewritable", async () => {
+		const clock = new TestClock();
+		const head = new MemoryHead("hot", clock);
+		const pipeline = new HistoryPipeline({ head, headRetention: { records: 5, thresholdPercent: 100 }, stages: [{ tier: appendOnly("cold"), retention: { thresholdPercent: 100 } }], state: new MemoryTierStateStore(), clock });
+		head.commit("general", "message", { message_id: "m1", from: { user_id: "ada" } });
+		await head.purge(["ada"]);
+		expect((await head.ops()).length).toBe(1);
+		await pipeline.cycle({ steps: 10 });
+		expect(await head.ops()).toEqual([]);
+	});
+
+	it("does not read a lower tier's count again while nothing above it changed", async () => {
+		const clock = new TestClock();
+		const head = new MemoryHead("hot", clock);
+		let counts = 0;
+		const recent = instrument(new MemoryHistoryTier("recent"), async (method, call) => {
+			if (method === "floorFor") counts += 1;
+			return call();
+		});
+		const pipeline = new HistoryPipeline({ head, headRetention: { records: 3, thresholdPercent: 100 }, stages: [{ tier: recent, retention: { records: 4, thresholdPercent: 100 } }], state: new MemoryTierStateStore(), clock });
+		for (let index = 0; index < 10; index += 1) {
+			clock.time += 10;
+			head.commit("general", "message", { message_id: `m${index}`, from: { user_id: "ada" } });
+		}
+		await settle(pipeline);
+		const settled = counts;
+		for (let round = 0; round < 5; round += 1) await pipeline.cycle({ steps: 10 });
+		expect(counts).toBe(settled);
+		// New records moving down change what is above it: counted again.
+		clock.time += 10;
+		head.commit("general", "message", { message_id: "m-new", from: { user_id: "ada" } });
+		await settle(pipeline);
+		expect(counts).toBeGreaterThan(settled);
+	});
+});
+
 describe("model-based runs", () => {
 	for (const composition of compositions) {
 		for (const seed of seeds(6)) {

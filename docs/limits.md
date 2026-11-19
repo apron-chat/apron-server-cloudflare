@@ -163,9 +163,9 @@ mutation with the **same** `id`.
 
 A history page holds at most 50 records (20 by default) and 256 KiB. History
 keeps the latest 84,000 records (messages, edits, reactions and room changes),
-however old, the oldest 80,000 of them in an archive that history reads from
-as well (4,000 where the server has no archive), trimmed back to that once
-past it; none younger than three days expires. Archived messages cannot be edited, reacted to or replied to.
+however old, the oldest 80,000 of them in a D1 history tier that history reads from
+as well (4,000 where the server has no D1 tier), trimmed back to that once
+past it; none younger than three days expires. Messages in the D1 tier cannot be edited, reacted to or replied to.
 
 ### Server-wide spikes
 

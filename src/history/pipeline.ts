@@ -56,6 +56,8 @@ export interface TierReport {
 const DEFAULT_BATCH = 100;
 const DEFAULT_TRIM_BATCH = 500;
 const DEFAULT_RECENT_OPS_MS = 60_000;
+/** How long a lower tier's target stands while nothing above it changed (age retention moves it with time). */
+const TARGET_REFRESH_MS = 3_600_000;
 
 export class HistoryPipeline {
 	readonly head: HistoryHead;
@@ -75,6 +77,8 @@ export class HistoryPipeline {
 	private static newRound() {
 		return { targeted: new Set<number>(), advanced: new Map<number, number>(), upkept: new Set<number>(), worked: false };
 	}
+	/** What each lower tier's last target was found from (what the tier above held then), and when. */
+	private readonly targetBasis = new Map<number, { basis: string; at: number }>();
 	/** Ops applied lately, for pages that read a tier before they were (PLAN §8). */
 	private recent: Array<{ op: HistoryOp; at: number }> = [];
 
@@ -123,6 +127,11 @@ export class HistoryPipeline {
 	async cycle(budget: { steps: number }): Promise<{ more: boolean; report: CycleReport }> {
 		const report: CycleReport = { steps: [], copied: 0, trimmed: 0 };
 		const progress = this.round;
+		// No rewritable tier below the head: the op log has no one to wait for.
+		if (rewritableReach(await this.views()) <= 1) {
+			const ops = await this.head.ops();
+			if (ops.length) await this.head.dropOps(ops[ops.length - 1].seq);
+		}
 		for (let count = 0; count < budget.steps; count += 1) {
 			const snapshot = await this.snapshot(progress);
 			const step = planStep(snapshot);
@@ -163,7 +172,17 @@ export class HistoryPipeline {
 				const tier = this.tiers[step.tier];
 				const state = snapshot.tiers[step.tier].state;
 				const below = step.tier === 0 ? Number.POSITIVE_INFINITY : snapshot.tiers[step.tier - 1].state.floor;
+				// A lower tier changes only by what the tier above copies into it or lets go
+				// of (and by age): unchanged since its last target, that target stands, and
+				// its count (up to every record it keeps) is not read again within the hour.
+				const basis = step.tier === 0 ? "" : `${below}:${snapshot.tiers[step.tier - 1].state.through}`;
+				const last = this.targetBasis.get(step.tier);
+				if (step.tier > 0 && last && last.basis === basis && now - last.at < TARGET_REFRESH_MS) {
+					progress.targeted.add(step.tier);
+					return;
+				}
 				const target = await tier.floorFor(this.retentions[step.tier], { now, below });
+				if (step.tier > 0) this.targetBasis.set(step.tier, { basis, at: now });
 				if (target !== undefined && target > state.target) await this.state.save(tier.name, { target });
 				progress.targeted.add(step.tier);
 				return;

@@ -1,7 +1,8 @@
 /*
  * The `HISTORY` config (PLAN §13.1): one structured var composing the
  * history pipeline, parsed and validated here at startup (src/config.ts)
- * and by `npm run budget:check`. Wrangler `[vars]` may be TOML tables,
+ * (budget:check's TOML reader does not take tables yet, so it cannot check
+ * one in a wrangler file). Wrangler `[vars]` may be TOML tables,
  * which reach the Worker as JSON objects; a JSON string is accepted too.
  *
  *   [vars.HISTORY]
@@ -183,7 +184,7 @@ function tier(value: unknown, index: number): TierSettings {
 			if (kept.bytes !== undefined) throw new HistoryConfigError(`${where}.retention.bytes is not supported for SQLite`);
 			return { name, kind: "sqlite", retention: kept };
 		case "d1":
-			only(raw, where, ["name", "kind", "binding", "retention", "multi_room"]);
+			only(raw, where, ["name", "kind", "binding", "retention"]);
 			if (kept.records === undefined) throw new HistoryConfigError(`${where}.retention needs records: D1 cannot keep everything`);
 			if (kept.bytes !== undefined || kept.minAgeSeconds !== undefined) throw new HistoryConfigError(`${where}.retention takes records and age only`);
 			return { name, kind: "d1", binding: text(raw.binding, `${where}.binding`, BINDING), retention: kept };

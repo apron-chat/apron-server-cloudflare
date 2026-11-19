@@ -25,9 +25,12 @@ new_sqlite_classes = ["ApronDemoServer"]
 binding = "MEDIA"
 bucket_name = "apron-media-dev"
 
-# History segments and backups (PLAN §9): a private bucket, no public access.
-# Used by the tests and `wrangler dev` (miniflare's local R2); production
-# has none yet, so the blob tier is off there.
+# History segments and backups (docs/configuration.md, History tiers and
+# Backups and imports): a private bucket, no public access. Used by the tests
+# and `wrangler dev` (miniflare's local R2): a blob tier keeps segments here
+# only where a HISTORY var configures one, and `/history export` writes
+# backups under backups/. Production has none yet, so the blob tier is off
+# there.
 [[r2_buckets]]
 binding = "HISTORY_BLOB"
 bucket_name = "apron-history-dev"

@@ -8948,9 +8948,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 				const target = this.backupTarget();
 				if (!target) throw { name: "invalid_params", message: "No backup store: bind HISTORY_BLOB, or configure HISTORY.exports" } satisfies ProtocolError;
 				const roomIds = words.slice(1);
-				const result = await writeBackup(this.archivePipeline(), target.store, target.settings, {
-					server: this.config.rpId, clock: { now: nowMs }, keys: this.backupKeys(), ...(roomIds.length ? { roomIds } : {}),
-				});
+				let result: Awaited<ReturnType<typeof writeBackup>>;
+				try {
+					result = await writeBackup(this.archivePipeline(), target.store, target.settings, {
+						server: this.config.rpId, clock: { now: nowMs }, keys: this.backupKeys(), ...(roomIds.length ? { roomIds } : {}),
+					});
+				} catch (error) {
+					// A missing key or a failing store: said plainly; an upload begun is aborted.
+					throw { name: "invalid_params", message: error instanceof Error ? error.message : String(error) } satisfies ProtocolError;
+				}
 				done(`Backed up ${result.rooms} rooms, ${result.users} users and ${result.records} records to \`${result.key}\`.`);
 				return;
 			}
