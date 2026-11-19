@@ -9,9 +9,9 @@
  */
 
 /** The longest remote server address a link is bound to, in characters. */
-export const MAX_REMOTE_ADDRESS_CHARS = 256;
+const MAX_REMOTE_ADDRESS_CHARS = 256;
 /** The longest remote `user_id` a shadow stands for, in UTF-8 bytes. */
-export const MAX_REMOTE_USER_ID_BYTES = 128;
+const MAX_REMOTE_USER_ID_BYTES = 128;
 /** The most link accounts one server keeps (`_meta` `remote_links`). */
 export const MAX_REMOTE_LINKS = 32;
 /** A link account's `user_id` is this plus a number: `link_1`. */

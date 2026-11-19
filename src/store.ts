@@ -5430,7 +5430,7 @@ export class Store {
   }
 
   private writeRemoteLinks(links: Record<string, RemoteLink>): void {
-    this.writeMeta(META_REMOTE_LINKS, Object.keys(links).length ? JSON.stringify(links) : null);
+    this.writeMeta(META_REMOTE_LINKS, JSON.stringify(links));
     // Read again next time: the transaction writing this may still roll back.
     this.remoteLinksCache = undefined;
   }
@@ -5501,7 +5501,7 @@ export class Store {
   setMirrorState(state: MirrorState, now = this.clock.now()): void {
     this.ensureReady();
     this.reserved({ reads: 2, writes: 2 }, false, now, () => {
-      this.writeMeta(META_REMOTE_MIRROR, state.rooms.length || Object.keys(state.servers).length ? JSON.stringify(state) : null);
+      this.writeMeta(META_REMOTE_MIRROR, JSON.stringify(state));
       this.mirrorCache = clone(state);
     });
   }

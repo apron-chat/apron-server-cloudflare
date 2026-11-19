@@ -126,7 +126,7 @@ import {
 } from "./oauth";
 import { pageHeaders, renderErrorPage, renderSignInPage, type SignInPageView } from "./sign-in-page";
 import { Deadline } from "./deadline";
-import { actAsUserId, isShadowUserId, normalizeRemoteAddress, parseInvite, remoteAuthority, remoteUserIdError, shadowUserId, withoutRemote, type RemoteUser } from "./remote";
+import { actAsUserId, isShadowUserId, remoteAuthority, remoteUserIdError, shadowUserId, withoutRemote, type RemoteUser } from "./remote";
 import { RemoteRooms, type MirrorClient, type MirrorHost } from "./mirror";
 
 const OBJECT_NAME = "public-demo-v1";
