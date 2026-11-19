@@ -6,7 +6,7 @@
  * cross-tier rule.
  */
 
-import type { ArchivedRoom, ArchivedUser } from "./archive/types";
+import type { ArchivedRoom, ArchivedUser } from "@apron/archive";
 import type { ChatRecord, HistoryOp, HistoryQuery, QueuedOp, RecordRange, Retention, TierStats } from "./records";
 
 /** What floorFor may count against: the floor of the tier above (records at or past it are only copies) and the time. */

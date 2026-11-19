@@ -14,8 +14,8 @@
  * Everything here is pure: no I/O, no clock.
  */
 
-import type { ChatRecord } from "../records";
-import type { ArchivedUser, RoomListing } from "./types";
+import type { ChatRecord } from "./records.ts";
+import type { ArchivedUser, RoomListing } from "./types.ts";
 
 /** As Store.PRIVATE_ROOM_PREFIX; kept here so this module stays free of the store. */
 const PRIVATE_ROOM_PREFIX = "private_";
@@ -25,10 +25,13 @@ const DECIMAL_ID = /^(0|[1-9][0-9]*)$/;
 
 /** The old-to-new mapping of log IDs and user IDs that an import applies (PLAN §10.6). IDs absent from a map stay as they are. */
 export class IdMap {
-	constructor(
-		readonly logIds: Map<number, number> = new Map(),
-		readonly users: Map<string, string> = new Map(),
-	) {}
+	readonly logIds: Map<number, number>;
+	readonly users: Map<string, string>;
+
+	constructor(logIds: Map<number, number> = new Map(), users: Map<string, string> = new Map()) {
+		this.logIds = logIds;
+		this.users = users;
+	}
 
 	/** The new log ID of `id`. */
 	logId(id: number): number {

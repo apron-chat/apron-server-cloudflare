@@ -3,6 +3,9 @@
 	"private": true,
 	"version": "0.0.1",
 	"type": "module",
+	"workspaces": [
+		"packages/*"
+	],
 	"engines": {
 		"node": ">=22"
 	},
@@ -18,6 +21,7 @@
 		"usage:report": "node scripts/usage-report.mjs"
 	},
 	"dependencies": {
+		"@apron/archive": "*",
 		"@simplewebauthn/server": "^14.0.0"
 	},
 	"devDependencies": {

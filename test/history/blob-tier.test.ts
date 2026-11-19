@@ -9,7 +9,7 @@
 
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { collectArchive, jsonlReader, linesOf } from "../../src/history/archive/format";
+import { collectArchive, compareReplayed, jsonlReader, linesOf, replayRecords } from "@apron/archive";
 import { MemoryBlobStore } from "./support/memory-blob-store";
 import { R2BlobStore } from "../../src/history/blob/r2";
 import { MemorySegmentIndex, SEGMENT_SCHEMA, type SegmentIndex, type SegmentRef, type SqlPort, SqlSegmentIndex, parseSegmentKey, segmentKey } from "../../src/history/blob/segments";
@@ -17,7 +17,6 @@ import type { BlobStore } from "../../src/history/blob/store";
 import { BlobHistoryTier } from "../../src/history/blob/tier";
 import { MemoryHistoryTier } from "./support/memory-tiers";
 import { type ChatRecord, byLog, toRange } from "../../src/history/records";
-import { compareRenderedState, renderedState } from "./render";
 import { describeHistoryTier, sampleLog, wireRecord } from "./conformance/history-tier";
 
 const clock = { now: () => Date.UTC(2026, 10, 19, 12, 0, 0) };
@@ -94,7 +93,7 @@ describe("BlobHistoryTier segments", () => {
 			expect(archive.rooms).toEqual([{ joined: false, listing: { room_id: ref.roomId, log_id: String(ref.first), title: `Room ${ref.roomId}`, history_log_id: String(ref.first), latest_log_id: String(ref.last) } }]);
 			expect(archive.users.map((user) => user.user_id).sort()).toEqual(ref.roomId === "a" ? ["ada", "bob"] : ["ada"]);
 			const own = log.filter((record) => record.room_id === ref.roomId);
-			expect(compareRenderedState(renderedState(archive.records, archive.rooms, archive.users), renderedState(own, archive.rooms, archive.users))).toEqual({ equal: true, differences: [] });
+			expect(compareReplayed(replayRecords(archive.records, archive.rooms, archive.users), replayRecords(own, archive.rooms, archive.users))).toEqual({ equal: true, differences: [] });
 			// Read back through the tier, each record is in the segment's room, a move's copy included.
 			expect(await roomRecords(tier, ref.roomId)).toEqual(own);
 		}

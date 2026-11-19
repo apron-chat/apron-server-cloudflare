@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { collectArchive, jsonlReader, jsonlWriter, linesOf } from '../src/history/archive/format';
+import { collectArchive, jsonlReader, jsonlWriter, linesOf } from '@apron/archive';
 import { connect as open, exchange, request, type Frame, type Peer } from './helpers/socket';
 
 // `/history` end to end: a backup to the backup store (HISTORY_BLOB, local

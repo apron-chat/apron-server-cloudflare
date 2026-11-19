@@ -15,14 +15,13 @@
  * on) and its older records appended to the tiers below.
  */
 
+import {
+	ADMIN_USER_ID, type ArchivedRoom, type ArchivedUser, type ArchiveReader, type BackupKeys, type ChatRecord, type CollectedArchive, type DecryptionStatus, IdMap,
+	byLog, canonicalJson, collectArchive, decryptingLines, jsonlReader, logIds, namedUsers, nudgeLogIds, parseLogId, placeholderBase, remapListing, remapRecord, restorableUserId,
+} from "@apron/archive";
 import type { HistoryPipeline } from "../pipeline";
 import type { TierView } from "../plan";
-import { type ChatRecord, type Clock, byLog, canonicalJson, logIds, toRange } from "../records";
-import { type BackupKeys, type DecryptionStatus, decryptingLines } from "./crypto";
-import { namedUsers } from "./export";
-import { type CollectedArchive, collectArchive, jsonlReader, parseLogId } from "./format";
-import { ADMIN_USER_ID, IdMap, nudgeLogIds, placeholderBase, remapListing, remapRecord, restorableUserId } from "./ids";
-import type { ArchivedRoom, ArchivedUser, ArchiveReader } from "./types";
+import { type Clock, toRange } from "../records";
 
 export interface ImportOptions {
 	/** Rooms that exist here are skipped whole (decision 6); the only mode for now. */
@@ -37,7 +36,7 @@ export interface ImportOptions {
 	users?: "auto" | "match" | "new";
 	/**
 	 * Whether the archive was decrypted with one of this server's backup
-	 * keys, so it is one of this server's backups (crypto.ts
+	 * keys, so it is one of this server's backups (@apron/archive
 	 * DecryptionStatus): only then may users be matched, since a plain file's
 	 * `server` header is anyone's to write. Default false.
 	 */

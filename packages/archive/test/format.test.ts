@@ -11,10 +11,10 @@ import {
 	utf8Length,
 	wireToRecord,
 	writeArchiveToString,
-} from "../../src/history/archive/format";
-import type { ArchivePart } from "../../src/history/archive/types";
-import type { ChatRecord, RecordKind } from "../../src/history/records";
-import { sceneArchives } from "../fixtures/archives";
+} from "../src/format.ts";
+import type { ChatRecord, RecordKind } from "../src/records.ts";
+import type { ArchivePart } from "../src/types.ts";
+import { sceneArchives } from "./fixtures/scenes/index.ts";
 
 function record(kind: RecordKind, roomId: string, logId: number, fields: Record<string, unknown> = {}): ChatRecord {
 	return { room_id: roomId, log_id: logId, commit_ms: logId, kind, record_json: JSON.stringify({ room_id: roomId, log_id: String(logId), ...fields }) };

@@ -5,7 +5,7 @@
  * with the same functions (records.ts).
  */
 
-import type { ArchivedRoom, ArchivedUser } from "../../../src/history/archive/types";
+import type { ArchivedRoom, ArchivedUser } from "@apron/archive";
 import { retentionFloor } from "../../../src/history/plan";
 import { type ChatRecord, type Clock, type HistoryOp, type HistoryQuery, type QueuedOp, type RecordRange, type Retention, type TierStats, authoredMessages, byLog, limitByLogId, logIds, purgedRecord, renamedRecord, toRange } from "../../../src/history/records";
 import type { FloorContext, HistoryHead, PurgeResult, RewritableTier } from "../../../src/history/tier";

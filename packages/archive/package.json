@@ -1,0 +1,19 @@
+{
+	"name": "@apron/archive",
+	"version": "0.0.1",
+	"private": true,
+	"description": "Apron ARCHIVE.md v1: types, JSON Lines codec, record replay, ID remapping and encrypted archives",
+	"license": "MIT",
+	"type": "module",
+	"sideEffects": false,
+	"exports": {
+		".": "./src/index.ts",
+		"./records": "./src/records.ts",
+		"./types": "./src/types.ts",
+		"./format": "./src/format.ts",
+		"./replay": "./src/replay.ts",
+		"./ids": "./src/ids.ts",
+		"./crypto": "./src/crypto.ts"
+	},
+	"files": ["src"]
+}

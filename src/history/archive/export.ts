@@ -12,9 +12,9 @@
  * (ArchiveSection); history is the only one so far.
  */
 
+import { type ArchiveHeader, type ArchivedRoom, type ArchivedUser, type ArchiveReader, type ArchiveWriter, type ChatRecord, namedUsers } from "@apron/archive";
 import type { HistoryPipeline } from "../pipeline";
-import type { ChatRecord, Clock } from "../records";
-import type { ArchiveHeader, ArchivedRoom, ArchivedUser, ArchiveReader, ArchiveWriter } from "./types";
+import type { Clock } from "../records";
 
 export interface ExportOptions {
 	/** Only these rooms (default: every room). */
@@ -50,21 +50,6 @@ export interface ArchiveSection<Source, Target, Options = unknown, Report = unkn
 	readonly key: string;
 	write(source: Source, out: ArchiveWriter, options: ExportOptions): Promise<{ rooms: number; users: number; records: number }>;
 	read?(input: ArchiveReader, into: Target, options: Options): Promise<Report>;
-}
-
-/** The user IDs a record names: its sender, reaction sets' senders, members. */
-export function namedUsers(record: ChatRecord): string[] {
-	const value = JSON.parse(record.record_json) as {
-		from?: { user_id?: string };
-		reactions?: Array<{ from?: { user_id?: string } }>;
-		members?: Array<{ user?: { user_id?: string } }>;
-	};
-	const ids = [
-		value.from?.user_id,
-		...(value.reactions ?? []).map((set) => set.from?.user_id),
-		...(value.members ?? []).map((member) => member.user?.user_id),
-	];
-	return ids.filter((id): id is string => typeof id === "string" && id.length > 0);
 }
 
 /** Every record of one room from `from` on, through the pipeline, oldest first, a page at a time. */

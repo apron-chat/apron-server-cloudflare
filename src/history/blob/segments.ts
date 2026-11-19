@@ -13,7 +13,7 @@
  * minimal SQL port. One index serves one tier: `rebuild` clears it first.
  */
 
-import { collectArchive, jsonlReader, linesOf } from "../archive/format";
+import { collectArchive, jsonlReader, linesOf } from "@apron/archive";
 import type { ChatRecord } from "../records";
 import { byLog } from "../records";
 import type { BlobStore } from "./store";

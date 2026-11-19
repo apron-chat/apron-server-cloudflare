@@ -6,7 +6,7 @@
  * they do not know.
  */
 
-import type { ChatRecord } from "../records";
+import type { ChatRecord } from "./records.ts";
 
 export interface ArchivedUser {
 	user_id: string;

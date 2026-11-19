@@ -28,8 +28,7 @@ import { keepAppend, keepLast, liveTextString, type LiveKind } from "./live-text
 import type { AccountUsageSnapshot } from "./account-usage";
 import type { ChatRecord, HistoryOp, HistoryQuery, QueuedOp } from "./history/records";
 import type { TierState } from "./history/tier";
-import type { ArchivedRoom, ArchivedUser } from "./history/archive/types";
-import { restorableUserId } from "./history/archive/ids";
+import { type ArchivedRoom, type ArchivedUser, parseLogId, type ReplayedMembership, replayRecords, restorableUserId } from "@apron/archive";
 import { SEGMENT_QUERY_ROWS, SqlSegmentIndex, type SqlPort } from "./history/blob/segments";
 import {
   BudgetLedger,
@@ -1955,12 +1954,6 @@ function recordedUser(userId: string, name: string | null | undefined): Identity
   return { user_id: userId, ...(name ? { name } : {}) };
 }
 
-/** A listing's log ID (a decimal string, or a number) as a number, or undefined when absent or malformed. */
-function restoredLogId(value: unknown): number | undefined {
-  const number = typeof value === "number" ? value : typeof value === "string" && /^\d{1,16}$/.test(value) ? Number(value) : NaN;
-  return Number.isSafeInteger(number) && number > 0 ? number : undefined;
-}
-
 /** The client fields (`title`, `description`, `ext`) of a room record or listing, as a room row keeps them. */
 function restoredRoomFields(value: Record<string, unknown>): Record<string, unknown> {
   return {
@@ -1983,11 +1976,8 @@ function restoredAvatar(value: unknown): string | undefined {
 
 
 /** One record restoreRoom takes, checked, with its parsed wire value. */
-interface RestoredRecord {
-  log_id: number;
-  commit_ms: number;
+interface RestoredRecord extends ChatRecord {
   kind: RecordKind;
-  record_json: string;
   value: Record<string, unknown>;
 }
 
@@ -2017,7 +2007,7 @@ function restoredRecord(roomId: string, record: ChatRecord): RestoredRecord {
       && value.reactions.every((set) => isPlainObject(set) && isRecordedUser(set.from) && Array.isArray(set.emojis) && set.emojis.every((emoji) => typeof emoji === "string"))
     : Array.isArray(value.members) && value.members.every((member) => isPlainObject(member) && isRecordedUser(member.user) && typeof member.joined === "boolean");
   if (!valid) throw new StoreError("invalid_params", `${where} is not a valid ${kind} record`.slice(0, 200));
-  return { log_id: record.log_id, commit_ms: commitMs, kind, record_json: record.record_json, value };
+  return { room_id: roomId, log_id: record.log_id, commit_ms: commitMs, kind, record_json: record.record_json, value };
 }
 
 /** The reaction sets and members a restored record holds (RESTORE_ENTRIES_BATCH). */
@@ -2025,41 +2015,6 @@ function restoredEntries(record: RestoredRecord): number {
   if (record.kind === "reactions") return (record.value.reactions as unknown[]).length;
   if (record.kind === "membership") return (record.value.members as unknown[]).length;
   return 0;
-}
-
-/**
- * The current state records give, replayed in log order, as commits leave
- * it (restoreRoom): each message's latest snapshot, each user's latest
- * reaction set on each message (an empty one removes it), each user's
- * latest membership change, and the latest room record.
- */
-function restoredState(records: readonly RestoredRecord[]): {
-  messages: Map<string, RestoredRecord>;
-  reactions: Map<string, { messageId: string; userId: string; logId: number; from: Identity; emojis: string[] }>;
-  members: Map<string, boolean>;
-  room?: RestoredRecord;
-} {
-  const messages = new Map<string, RestoredRecord>();
-  const reactions = new Map<string, { messageId: string; userId: string; logId: number; from: Identity; emojis: string[] }>();
-  const members = new Map<string, boolean>();
-  let room: RestoredRecord | undefined;
-  for (const record of [...records].sort((a, b) => a.log_id - b.log_id)) {
-    const value = record.value;
-    if (record.kind === "room") room = record;
-    else if (record.kind === "message" && typeof value.message_id === "string" && isRecordedUser(value.from)) messages.set(value.message_id, record);
-    else if (record.kind === "reactions" && typeof value.message_id === "string" && Array.isArray(value.reactions)) {
-      for (const set of value.reactions as Array<{ from?: unknown; emojis?: unknown }>) {
-        if (!isRecordedUser(set.from) || !Array.isArray(set.emojis)) continue;
-        const from = clone(set.from);
-        reactions.set(`${value.message_id}\n${from.user_id}`, { messageId: value.message_id, userId: from.user_id, logId: record.log_id, from, emojis: set.emojis.filter((emoji): emoji is string => typeof emoji === "string") });
-      }
-    } else if (record.kind === "membership" && Array.isArray(value.members)) {
-      for (const member of value.members as Array<{ user?: unknown; joined?: unknown }>) {
-        if (isRecordedUser(member.user) && typeof member.joined === "boolean") members.set(member.user.user_id, member.joined);
-      }
-    }
-  }
-  return { messages, reactions, members, ...(room ? { room } : {}) };
 }
 
 /**
@@ -4366,7 +4321,9 @@ export class Store {
    * past the copy marker (`through`), or the call is refused: older records
    * go to the tiers below (§10.5). The new records are stored, and the
    * state of every message, reaction set and membership they name is
-   * replayed from them and the room's later records: each message's state
+   * replayed from them and the room's later records (@apron/archive's
+   * replayRecords, the one definition of what a record does to current
+   * state; this writes the rows it yields): each message's state
    * points at its latest snapshot, unless another author's message holds
    * its ID, or one in a room this import does not add (`options.rooms`, the
    * rooms it adds besides this one), or the snapshot names such a room (a
@@ -4397,7 +4354,7 @@ export class Store {
     // Log IDs past the clock would hold back every later commit: refused, as the importer refuses them.
     const horizon = now + RESTORE_FUTURE_MS;
     for (const value of [listing.log_id, listing.history_log_id]) {
-      const logId = restoredLogId(value);
+      const logId = parseLogId(value);
       if (logId !== undefined && logId > horizon) throw new StoreError("invalid_params", `The listing of ${roomId} names log ID ${logId}, later than this server's clock`.slice(0, 200));
     }
     const checked = records.map((record) => restoredRecord(roomId, record));
@@ -4421,9 +4378,9 @@ export class Store {
     if (entries > (batch.length === 1 ? RESTORE_ENTRIES_SINGLE : RESTORE_ENTRIES_BATCH)) {
       throw new StoreError("invalid_params", `A call restores at most ${RESTORE_ENTRIES_BATCH} reaction sets and members, or one record of at most ${RESTORE_ENTRIES_SINGLE}`);
     }
-    const listingLog = restoredLogId(listing.log_id);
-    const listingLatest = restoredLogId(listing.latest_log_id);
-    const listingHistory = restoredLogId(listing.history_log_id);
+    const listingLog = parseLogId(listing.log_id);
+    const listingLatest = parseLogId(listing.latest_log_id);
+    const listingHistory = parseLogId(listing.history_log_id);
     const listingParent = typeof listing.parent_room_id === "string" ? listing.parent_room_id : undefined;
     // First the reads: the floors, which records are stored already, and,
     // when new ones are older than the room's newest, the stored ones after
@@ -4446,14 +4403,20 @@ export class Store {
         roomId, fresh[0].log_id, RESTORE_REPLAY_CAP + 1,
       );
       if (rows.length > RESTORE_REPLAY_CAP) throw new StoreError("invalid_params", "Too many of the room's records are newer than these: restore a room's records oldest first");
-      const replay = rows.map((row) => ({
-        log_id: integerColumn(row.log_id), commit_ms: integerColumn(row.commit_ms), kind: row.kind as RecordKind, record_json: row.record_json,
-        value: parseJson<Record<string, unknown>>(row.record_json, {}),
+      const replay = rows.map((row): ChatRecord => ({
+        room_id: roomId, log_id: integerColumn(row.log_id), commit_ms: integerColumn(row.commit_ms), kind: row.kind, record_json: row.record_json,
       }));
       return { fresh, replay };
     });
     const { fresh } = probe;
-    const derived = restoredState([...fresh, ...probe.replay]);
+    // The current state the room's records give (@apron/archive's replay):
+    // each message's latest snapshot, each user's latest reaction set on each
+    // message (an empty one removing it), each user's latest membership
+    // change, and the latest room record. Only rows it names are written.
+    const replayed = replayRecords([...fresh, ...probe.replay]);
+    const latestRoom = replayed.rooms.get(roomId);
+    const memberships = replayed.memberships.get(roomId) ?? new Map<string, ReplayedMembership>();
+    const reactionSets = [...replayed.reactionSets].flatMap(([messageId, sets]) => [...sets].map(([userId, set]) => ({ messageId, userId, ...set })));
     const isPrivate = isPrivateRoomId(roomId);
     // The users the new records name, whose retired markers they raise (noteRetiredRelog).
     const named = new Set<string>();
@@ -4463,29 +4426,28 @@ export class Store {
       for (const set of record.kind === "reactions" ? value.reactions as Array<{ from: Identity }> : []) named.add(set.from.user_id);
       for (const member of record.kind === "membership" ? value.members as Array<{ user: Identity }> : []) named.add(member.user.user_id);
     }
-    const keys = derived.messages.size + derived.reactions.size + derived.members.size;
+    const keys = replayed.messages.size + reactionSets.length + memberships.size;
     // The room row, its parent, the caps and the rooms' fields total; per
     // record its row and index entry; per message, reaction set and member
     // its state row read and written (a member's identity too, and for a
     // private room their private rooms); and the log head.
     const cost = {
       reads: 128 + ROOM_FIELDS_TOTAL_READS + MAX_CREATED_ROOMS + 4 * fresh.length + 8 * keys + 4 * named.size +
-        (isPrivate ? derived.members.size * this.userRoomsReads() : 0),
+        (isPrivate ? memberships.size * this.userRoomsReads() : 0),
       writes: 64 + 6 * fresh.length + 8 * keys + 2 * named.size,
     };
     if (fresh.length) this.ensureGrowthCapacity(2 * fresh.reduce((sum, record) => sum + utf8Bytes(record.record_json), 0) + 1_024);
     return this.reserved(cost, true, now, () => this.transaction(() => {
       const effective = this.effectiveNow(now);
-      const latestRoom = derived.room;
       let row = this.roomRow(roomId);
       const created = row === null;
       if (!row) {
-        const parentRoomId = listingParent ?? (typeof latestRoom?.value.parent_room_id === "string" ? latestRoom.value.parent_room_id : null);
+        const parentRoomId = listingParent ?? (typeof latestRoom?.fields.parent_room_id === "string" ? latestRoom.fields.parent_room_id : null);
         const known = [listingLog, listingHistory, batch[0]?.log_id].filter((logId): logId is number => logId !== undefined);
         if (!known.length) throw new StoreError("invalid_params", "A restored room needs records or its listing's log_id");
         const createdLogId = Math.min(...known);
         const recordLogId = Math.max(createdLogId, listingLog ?? 0, latestRoom?.log_id ?? 0);
-        const fields = latestRoom && latestRoom.log_id >= (listingLog ?? 0) ? restoredRoomFields(latestRoom.value) : restoredRoomFields(listing);
+        const fields = latestRoom && latestRoom.log_id >= (listingLog ?? 0) ? restoredRoomFields(latestRoom.fields) : restoredRoomFields(listing);
         if (isPrivate) {
           if (parentRoomId !== null) throw new StoreError("invalid_params", "A private room cannot be a thread on this server");
           if (this.config.maxPrivateRooms === 0) throw new StoreError("unsupported", "Private rooms are not supported on this server");
@@ -4516,7 +4478,7 @@ export class Store {
       } else {
         if (listingParent !== undefined && listingParent !== row.parent_room_id) throw new StoreError("invalid_params", `The room ${roomId} here has another parent`.slice(0, 200));
         if (latestRoom && latestRoom.log_id >= row.record_log_id) {
-          const fields = restoredRoomFields(latestRoom.value);
+          const fields = restoredRoomFields(latestRoom.fields);
           this.checkRoomFields(fields);
           // The client fields are replaced; a creator kept beside them stays.
           const creator = storedCreator(row.fields_json);
@@ -4531,57 +4493,54 @@ export class Store {
       }
       // Messages: the latest snapshot, unless the state row is newer or another message's.
       const collided = new Set<string>();
-      for (const [messageId, record] of derived.messages) {
-        const snapshot = record.value as unknown as MessageSnapshot;
+      for (const [messageId, message] of replayed.messages) {
         // Where the message is now: the room its snapshot names (a move's copy
         // in the room it left names where it went), if that is a room this
         // import adds; never a room here the import does not add.
-        const named = typeof snapshot.room_id === "string" ? snapshot.room_id : roomId;
-        if (!importRooms.has(named)) {
+        if (!importRooms.has(message.room_id)) {
           collided.add(messageId);
           continue;
         }
-        const target = named;
         const existing = this.rawRows<{ room_id: string; latest_log_id: number; author_id: string }>(
           "SELECT room_id, latest_log_id, author_id FROM message_state WHERE message_id = ? LIMIT 1", messageId,
         )[0];
         if (existing) {
           // The same message only in this room or another this import adds, by
           // the same author; anything else is another message here.
-          if (existing.author_id !== snapshot.from.user_id || !importRooms.has(existing.room_id)) {
+          if (existing.author_id !== message.from.user_id || !importRooms.has(existing.room_id)) {
             collided.add(messageId);
             continue;
           }
-          if (integerColumn(existing.latest_log_id) >= record.log_id) continue;
+          if (integerColumn(existing.latest_log_id) >= message.log_id) continue;
         }
         this.rawExec(
           `INSERT INTO message_state (message_id, room_id, latest_log_id, author_id) VALUES (?, ?, ?, ?)
            ON CONFLICT (message_id) DO UPDATE SET room_id = excluded.room_id, latest_log_id = excluded.latest_log_id`,
-          messageId, target, record.log_id, snapshot.from.user_id,
+          messageId, message.room_id, message.log_id, message.from.user_id,
         );
       }
       // Reaction sets: the latest of each user on each message, unless the state row is newer.
-      for (const set of derived.reactions.values()) {
+      for (const set of reactionSets) {
         if (collided.has(set.messageId)) continue;
         const existing = this.rawRows<{ log_id: number }>(
           "SELECT log_id FROM reaction_state WHERE message_id = ? AND user_id = ? LIMIT 1", set.messageId, set.userId,
         )[0];
         const storedLogId = existing ? integerColumn(existing.log_id) : undefined;
         if (set.emojis.length) {
-          if (storedLogId !== undefined && storedLogId > set.logId) continue;
+          if (storedLogId !== undefined && storedLogId > set.log_id) continue;
           this.rawExec(
             `INSERT INTO reaction_state (message_id, user_id, log_id, from_json, emojis_json) VALUES (?, ?, ?, ?, ?)
              ON CONFLICT (message_id, user_id) DO UPDATE SET
                log_id = excluded.log_id, from_json = excluded.from_json, emojis_json = excluded.emojis_json`,
-            set.messageId, set.userId, set.logId, JSON.stringify(set.from), JSON.stringify(set.emojis),
+            set.messageId, set.userId, set.log_id, JSON.stringify(set.from), JSON.stringify(set.emojis),
           );
-        } else if (storedLogId !== undefined && storedLogId < set.logId) {
+        } else if (storedLogId !== undefined && storedLogId < set.log_id) {
           this.rawExec("DELETE FROM reaction_state WHERE message_id = ? AND user_id = ?", set.messageId, set.userId);
         }
       }
       // Memberships: each user's latest change, joins only for identities here.
       let members = 0;
-      for (const [userId, joined] of derived.members) {
+      for (const [userId, { joined }] of memberships) {
         const member = this.rawRows("SELECT 1 FROM memberships WHERE room_id = ? AND user_id = ? LIMIT 1", roomId, userId).length > 0;
         if (joined && !member) {
           if (!this.identityRow(userId)) continue;

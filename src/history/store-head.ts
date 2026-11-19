@@ -11,7 +11,7 @@
  * running cleanup job: floorFor ignores the Retention passed in.
  */
 
-import type { ArchivedRoom, ArchivedUser } from "./archive/types";
+import type { ArchivedRoom, ArchivedUser } from "@apron/archive";
 import { type ChatRecord, type HistoryOp, type HistoryQuery, type QueuedOp, type RecordRange, type TierStats, toRange } from "./records";
 import type { HistoryHead, PurgeResult, RestoreContext, RestoreResult, TierState, TierStateStore } from "./tier";
 

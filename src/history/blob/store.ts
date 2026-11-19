@@ -8,7 +8,7 @@
  * Keys are plain strings with `/` as a separator by convention. Listings are
  * sorted by key, so zero-padded names (segment keys, dated exports) list in
  * order. Bodies are text: segments and archives are JSON Lines, and an
- * encrypted archive is JSON Lines of base64 (archive/crypto.ts).
+ * encrypted archive is JSON Lines of base64 (@apron/archive, crypto.ts).
  *
  * Every implementation passes the same conformance suite
  * (test/history/conformance/blob-store.ts).

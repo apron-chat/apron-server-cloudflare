@@ -1,7 +1,8 @@
 # Archive fixtures
 
 Real ARCHIVE.md v1 files (apron-web's `ARCHIVE.md`), used by
-`test/history/archive-format.test.ts` and `test/history/render.test.ts`.
+`packages/archive/test/format.test.ts` and `replay.test.ts` (and the
+server's `test/history/export-import.test.ts`).
 
 Each `<scene>.jsonl` is a verbatim copy of `scenes/<scene>/scene.jsonl` from
 <https://github.com/apron-chat/scene.apron.chat>, commit

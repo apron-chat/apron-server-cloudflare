@@ -1,9 +1,8 @@
 import { expect, it } from "vitest";
-import type { ArchivedRoom, ArchivedUser } from "../../src/history/archive/types";
 import type { ChatRecord } from "../../src/history/records";
 import { RESTORE_RECORDS_BATCH, Store, UNCLAIMED_ROLE, type RoomRecord, type StoreConfig, type StoreMutationInput } from "../../src/store";
 import { exportArchive } from "../../src/history/archive/export";
-import { collectArchive, jsonlReader, jsonlWriter, linesOf, writeArchiveToString } from "../../src/history/archive/format";
+import { type ArchivedRoom, type ArchivedUser, collectArchive, jsonlReader, jsonlWriter, linesOf, writeArchiveToString } from "@apron/archive";
 import { importArchive } from "../../src/history/archive/import";
 import { MemoryBlobStore } from "./support/memory-blob-store";
 import { BlobHistoryTier } from "../../src/history/blob/tier";

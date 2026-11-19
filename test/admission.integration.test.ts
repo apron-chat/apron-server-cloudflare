@@ -9,6 +9,18 @@ function upgrade(ip: string, path = '/') {
 	});
 }
 
+/**
+ * Waits out the end of the current minute if it is near. The rate limiters
+ * count in fixed 60-second periods, so a burst that straddles a period's end
+ * is counted in two and never reaches its limit (a flaky 503 for the 429 a
+ * test expects). Bursts here take well under a second, so the last three
+ * seconds of a minute are waited out (within the test timeout).
+ */
+async function freshPeriod(): Promise<void> {
+	const into = Date.now() % 60_000;
+	if (into > 57_000) await new Promise((resolve) => setTimeout(resolve, 60_000 - into + 100));
+}
+
 // Use the real runtime limiter with no DO capability. Responses prove that
 // rejection works even when contacting a Durable Object is impossible.
 function withoutObject(extra: Partial<Env> = {}): Env {
@@ -27,6 +39,7 @@ it('stops admission before the DO and before spending an attempt', async () => {
 });
 
 it('rejects excess attempts before requiring a DO binding and shares the two paths', async () => {
+	await freshPeriod();
 	const ip = '198.18.1.2';
 	for (let i = 0; i < ADMISSION_BUDGET.requestsPerIpMinute; i++) {
 		const response = await fetchEntry(upgrade(ip, i % 2 ? '/' : '/ws'), withoutObject());
@@ -41,6 +54,7 @@ it('rejects excess attempts before requiring a DO binding and shares the two pat
 });
 
 it('groups IPv6 attempts by /56, ignoring supplied internal keys', async () => {
+	await freshPeriod();
 	for (let i = 0; i < ADMISSION_BUDGET.requestsPerIpMinute; i++) {
 		const request = upgrade(`2001:db8:feed:1234::${i + 1}`);
 		request.headers.set('X-Apron-Trusted-IP-Key', `forged-${i}`);
@@ -53,6 +67,7 @@ it('groups IPv6 attempts by /56, ignoring supplied internal keys', async () => {
 });
 
 it('limits a native IPv6 /48 across its /56s', async () => {
+	await freshPeriod();
 	const perAddress = ADMISSION_BUDGET.requestsPerIpMinute;
 	const perPrefix = ADMISSION_BUDGET.requestsPerIpv6PrefixMinute;
 	let sent = 0;

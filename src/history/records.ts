@@ -4,23 +4,17 @@
  * A record is one entry of the server-wide log (a room record, message
  * snapshot, reaction record or membership record) in its wire shape, as
  * `history` serves it, with the room it is logged in and its log ID. A move
- * is logged once per room it belongs to: two records, one log ID.
+ * is logged once per room it belongs to: two records, one log ID. The
+ * record type and its format-level helpers are @apron/archive's
+ * (packages/archive/src/records.ts); this module adds what the pipeline
+ * needs: ranges, queries, retention, and the op log of /purge and /rename.
  *
  * Everything here is pure: no I/O, no clock.
  */
 
-export type RecordKind = "room" | "message" | "reactions" | "membership";
+import { type ChatRecord, authoredMessages, byLog, purgedRecord, renamedRecord } from "@apron/archive";
 
-/** One stored record, the same shape in every tier. */
-export interface ChatRecord {
-	room_id: string;
-	/** Server-wide, increasing: the commit time in ms (PROTOCOL §2.1). */
-	log_id: number;
-	commit_ms: number;
-	kind: RecordKind | string;
-	/** The wire shape, as `history` serves it. */
-	record_json: string;
-}
+export { type ChatRecord, type RecordKind, authoredMessages, byLog, canonicalJson, logIds, namedUsers, purgedRecord, purgedValue, renamedRecord, renamedValue } from "@apron/archive";
 
 /** A contiguous range of the log: the unit tiers hand on. Records sorted by (log_id, room_id). */
 export interface RecordRange {
@@ -83,16 +77,6 @@ export function thresholdCount(limit: number | undefined, percent: number): numb
 	return limit && limit > 0 ? Math.max(1, Math.floor((limit * percent) / 100)) : 0;
 }
 
-/** Orders records by log ID, then room. */
-export function byLog(a: ChatRecord, b: ChatRecord): number {
-	return a.log_id - b.log_id || (a.room_id < b.room_id ? -1 : a.room_id > b.room_id ? 1 : 0);
-}
-
-/** The distinct log IDs of `records`, in order of first appearance. */
-export function logIds(records: readonly ChatRecord[]): number[] {
-	return [...new Set(records.map((record) => record.log_id))];
-}
-
 /**
  * The records of the first `limit` distinct log IDs, nearest the page's
  * start first: oldest first `forward`, else newest. Every room's copy of a
@@ -120,55 +104,6 @@ export function toRange(records: readonly ChatRecord[]): RecordRange {
 		: { first: 1, last: 0, records: [] };
 }
 
-type RecordValue = Record<string, unknown>;
-interface Identity { user_id: string; [key: string]: unknown }
-
-/** A reactions or membership record without the purged users' entries (null if none is left), as Store.purgeUsers rewrites it. */
-export function purgedValue(kind: string, record: RecordValue, userIds: readonly string[], messageIds: readonly string[]): RecordValue | null {
-	if (kind === "reactions") {
-		const sets = (record.reactions as Array<{ from: Identity }>) ?? [];
-		const kept = messageIds.includes(record.message_id as string) ? [] : sets.filter((set) => !userIds.includes(set.from.user_id));
-		return kept.length ? { ...record, reactions: kept } : null;
-	}
-	if (kind === "membership") {
-		const members = ((record.members as Array<{ user: Identity }>) ?? []).filter((member) => !userIds.includes(member.user.user_id));
-		return members.length ? { ...record, members } : null;
-	}
-	if (kind === "message") return userIds.includes((record.from as Identity | undefined)?.user_id ?? "") ? null : record;
-	return record;
-}
-
-/** A record naming `to` wherever it named `from`, as Store.renameIdentity rewrites it. */
-export function renamedValue(kind: string, record: RecordValue, from: string, to: string): RecordValue {
-	const renamed = (user: Identity): Identity => user.user_id === from ? { ...user, user_id: to } : user;
-	if (kind === "message") return record.from ? { ...record, from: renamed(record.from as Identity) } : record;
-	if (kind === "reactions") return { ...record, reactions: ((record.reactions as Array<{ from: Identity }>) ?? []).map((set) => ({ ...set, from: renamed(set.from) })) };
-	if (kind === "membership") return { ...record, members: ((record.members as Array<{ user: Identity }>) ?? []).map((member) => ({ ...member, user: renamed(member.user) })) };
-	return record;
-}
-
-/** purgedValue of a stored record, as JSON; null if the record goes. */
-export function purgedRecord(row: Pick<ChatRecord, "kind" | "record_json">, userIds: readonly string[], messageIds: readonly string[]): string | null {
-	const value = purgedValue(row.kind, JSON.parse(row.record_json) as RecordValue, userIds, messageIds);
-	return value ? JSON.stringify(value) : null;
-}
-
-/** renamedValue of a stored record, as JSON. */
-export function renamedRecord(row: Pick<ChatRecord, "kind" | "record_json">, from: string, to: string): string {
-	return JSON.stringify(renamedValue(row.kind, JSON.parse(row.record_json) as RecordValue, from, to));
-}
-
-/** The message IDs of the message snapshots among `records` sent by `userIds`. */
-export function authoredMessages(records: readonly ChatRecord[], userIds: readonly string[]): string[] {
-	const ids = new Set<string>();
-	for (const record of records) {
-		if (record.kind !== "message") continue;
-		const value = JSON.parse(record.record_json) as { message_id?: string; from?: Identity };
-		if (value.message_id && value.from && userIds.includes(value.from.user_id)) ids.add(value.message_id);
-	}
-	return [...ids];
-}
-
 /**
  * Records with `/purge` and `/rename` applied in order, as a rewritable tier
  * applies them to what it holds: a purged user's message snapshots go, with
@@ -193,14 +128,4 @@ export function applyOps(records: readonly ChatRecord[], ops: readonly HistoryOp
 		}
 	}
 	return out;
-}
-
-/** Canonical JSON: keys sorted at every level, for comparing contents (PLAN §10.3). */
-export function canonicalJson(value: unknown): string {
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-	if (value && typeof value === "object") {
-		const entries = Object.entries(value as RecordValue).filter(([, item]) => item !== undefined).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-		return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
-	}
-	return JSON.stringify(value);
 }

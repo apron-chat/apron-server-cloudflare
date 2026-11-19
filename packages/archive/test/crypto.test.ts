@@ -1,12 +1,11 @@
 /*
- * Encrypted archives (src/history/archive/crypto.ts, PLAN §13.3): round
- * trips, every kind of tampering refused, key rotation, and the errors an
- * operator sees, none of which print key material. The keys are the
- * test-only HISTORY_BACKUP_KEY and HISTORY_BACKUP_KEY_OLD bindings in
- * vitest.config.ts.
+ * Encrypted archives (src/crypto.ts): round trips, every kind of tampering
+ * refused, key rotation, and the errors an operator sees, none of which
+ * print key material. The secrets are test-only (the same values as the
+ * server's HISTORY_BACKUP_KEY and HISTORY_BACKUP_KEY_OLD test bindings in
+ * its vitest.config.ts), given directly, so this runs in any runtime.
  */
 
-import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import {
 	ArchiveDecryptError,
@@ -17,9 +16,15 @@ import {
 	encryptingSink,
 	isEncryptedArchive,
 	resolveKeys,
-} from "../../src/history/archive/crypto";
+} from "../src/crypto.ts";
 
-const secrets = env as unknown as Record<string, string>;
+/** Test-only secrets, as an environment holds them: 32 random bytes in base64 each, and a longer shared one. */
+const env: Record<string, string> = {
+	HISTORY_BACKUP_KEY: "eFGn4jFTKnrUqDnE5adM+1fdPYYD7RXuzs9/jUHnrvs=",
+	HISTORY_BACKUP_KEY_OLD: "sBjpLIt1KHDasdiD+Y6qVIGfnT121t7aBmqRajoQQpo=",
+	UPLOAD_SIGNING_KEY: "test-upload-signing-key-0123456789abcdef",
+};
+const secrets = env;
 const CURRENT = secrets.HISTORY_BACKUP_KEY!;
 const OLD = secrets.HISTORY_BACKUP_KEY_OLD!;
 
@@ -91,7 +96,7 @@ describe("backup keys", () => {
 		const keys = resolveKeys(env, ["UPLOAD_SIGNING_KEY"]);
 		const key = await keys.lookup("UPLOAD_SIGNING_KEY");
 		expect(key?.fingerprint).toMatch(/^[0-9a-f]{16}$/);
-		const encrypted = await encrypt(ARCHIVE, "UPLOAD_SIGNING_KEY", (env as unknown as Record<string, string>).UPLOAD_SIGNING_KEY, 64);
+		const encrypted = await encrypt(ARCHIVE, "UPLOAD_SIGNING_KEY", env.UPLOAD_SIGNING_KEY, 64);
 		expect(await decrypt(encrypted, keys)).toEqual(ARCHIVE);
 	});
 

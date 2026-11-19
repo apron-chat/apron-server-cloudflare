@@ -1,10 +1,13 @@
 /*
- * Rendered state (PLAN §5, §11): what a reader would show after replaying a
- * set of records (PROTOCOL §2.3). It is the oracle of every round trip: two
- * histories are the same when their rendered states compare equal.
+ * Replay (PROTOCOL §2.3; ARCHIVE.md v1): the current state a set of records
+ * gives, as a reader would show it after replaying them. It is the one
+ * definition of what a record does to current state: a server restoring an
+ * archive writes the rows it yields, a client renders it, and it is the
+ * oracle of every round trip: two histories are the same when their
+ * replayed states compare equal.
  *
- * Replay keeps, for each key, the record with the greatest log ID, whatever
- * the order the records come in:
+ * Replay keeps, for each key, the record with the greatest log ID (the
+ * record's `log_id`), whatever the order the records come in:
  * - a room record per room (its `room_id`); a listing of the room counts as
  *   a room record at its `log_id` (a listing without one is older than every
  *   record), and a record wins a tie;
@@ -12,14 +15,17 @@
  *   wins. A moved message is in the room of its latest snapshot (the wire
  *   `room_id`, not the room a copy is stored under). Tombstones stay;
  * - a reaction set per (message, user); an empty set removes the user, and
- *   the reactions of a deleted message are hidden, as clients hide them;
- * - a membership per (room, user); `joined: false` removes the user. A
+ *   the reactions of a deleted message are hidden, as clients hide them
+ *   (`reactions`; `reactionSets` keeps every user's latest set as logged,
+ *   empty ones and deleted messages' included, for a writer of state);
+ * - a membership per (room, user); `joined: false` removes the user
+ *   (`members`; `memberships` keeps each user's latest change as logged). A
  *   listing's `members` is the room's member list as of its `latest_log_id`
  *   (as of everything, without one): only membership records after it
  *   change it;
  * - a user object per user, from the `users` given, the later one winning.
  *
- * compareRenderedState compares:
+ * compareReplayed compares:
  * - rooms: every logged field of the latest room record (`title`,
  *   `description`, `parent_room_id`, `private`, `ext`, and any other), but
  *   not `log_id`, `prev_log_id` or the delivery fields (`latest_log_id`,
@@ -41,13 +47,13 @@
  * Everything here is pure: no I/O, no clock.
  */
 
-import type { ArchivedRoom, ArchivedUser } from "../../src/history/archive/types";
-import { byLog, canonicalJson, type ChatRecord } from "../../src/history/records";
+import { byLog, canonicalJson, type ChatRecord } from "./records.ts";
+import type { ArchivedRoom, ArchivedUser } from "./types.ts";
 
 type JsonObject = Record<string, unknown>;
 
-/** A room as rendered: the logged fields of its latest room record or listing. */
-export interface RenderedRoom {
+/** A room as replayed: the logged fields of its latest room record or listing. */
+export interface ReplayedRoom {
 	room_id: string;
 	/** The log ID of the record or listing it came from; 0 for a listing without one. Not compared. */
 	log_id: number;
@@ -55,8 +61,8 @@ export interface RenderedRoom {
 	fields: JsonObject;
 }
 
-/** A message as rendered: its latest snapshot. */
-export interface RenderedMessage {
+/** A message as replayed: its latest snapshot. */
+export interface ReplayedMessage {
 	message_id: string;
 	/** The room it is in now. */
 	room_id: string;
@@ -70,16 +76,39 @@ export interface RenderedMessage {
 	deleted: boolean;
 }
 
+/** A user's latest reaction set on a message, as logged. */
+export interface ReplayedReactionSet {
+	/** Of the record it came from. */
+	log_id: number;
+	/** The recorded user, as the record holds it. */
+	from: { user_id: string; [extra: string]: unknown };
+	/** Empty when the user's last set removed their reactions. */
+	emojis: string[];
+}
+
+/** A user's latest membership change in a room, as logged. */
+export interface ReplayedMembership {
+	/** Of the record it came from. */
+	log_id: number;
+	/** The recorded user, as the record holds it. */
+	user: { user_id: string; [extra: string]: unknown };
+	joined: boolean;
+}
+
 /** What a reader would render after replaying records (PROTOCOL §2.3). */
-export interface RenderedState {
-	rooms: Map<string, RenderedRoom>;
+export interface ReplayedState {
+	rooms: Map<string, ReplayedRoom>;
 	/** Last snapshot per message_id, tombstones included. */
-	messages: Map<string, RenderedMessage>;
+	messages: Map<string, ReplayedMessage>;
 	/** message_id → user_id → emojis (last set; empty sets and deleted messages' reactions left out). */
 	reactions: Map<string, Map<string, string[]>>;
-	/** room_id → user_ids (last membership). */
+	/** room_id → user_ids (last membership, or a listing's members and the changes after it). */
 	members: Map<string, Set<string>>;
 	users: Map<string, ArchivedUser>;
+	/** message_id → user_id → the latest set as logged, empty sets and deleted messages' included. Not compared. */
+	reactionSets: Map<string, Map<string, ReplayedReactionSet>>;
+	/** room_id → user_id → the latest membership change in the room's records (listings aside). Not compared. */
+	memberships: Map<string, Map<string, ReplayedMembership>>;
 }
 
 /** Room fields that are not logged, or that replay does not compare. */
@@ -114,34 +143,32 @@ function replaces(current: { log_id: number; deleted?: boolean } | undefined, ne
 	return Boolean(next.deleted) && !current.deleted;
 }
 
-interface ReactionEntry { from?: { user_id?: unknown }; emojis?: unknown }
-interface MemberEntry { user?: { user_id?: unknown }; joined?: unknown }
+interface ReactionEntry { from?: unknown; emojis?: unknown }
+interface MemberEntry { user?: unknown; joined?: unknown }
 
 /**
  * Replays records, with listings and users, into what a reader renders. The
  * records may come in any order and hold duplicates (a move's copies).
  */
-export function renderedState(records: Iterable<ChatRecord>, listings: readonly ArchivedRoom[] = [], users: readonly ArchivedUser[] = []): RenderedState {
-	const rooms = new Map<string, RenderedRoom & { fromRecord: boolean }>();
-	const messages = new Map<string, RenderedMessage>();
-	// message_id → user_id → the latest set and its log ID.
-	const reactionSets = new Map<string, Map<string, { log_id: number; emojis: string[] }>>();
-	// room_id → user_id → the latest membership and its log ID.
-	const memberships = new Map<string, Map<string, { log_id: number; joined: boolean }>>();
+export function replayRecords(records: Iterable<ChatRecord>, listings: readonly ArchivedRoom[] = [], users: readonly ArchivedUser[] = []): ReplayedState {
+	const rooms = new Map<string, ReplayedRoom & { fromRecord: boolean }>();
+	const messages = new Map<string, ReplayedMessage>();
+	const reactionSets = new Map<string, Map<string, ReplayedReactionSet>>();
+	const memberships = new Map<string, Map<string, ReplayedMembership>>();
 
 	for (const record of [...records].sort(byLog)) {
 		const value = parse(record);
 		if (!value) continue;
-		const logId = logIdOf(value.log_id) ?? record.log_id;
+		const logId = record.log_id;
 		const roomId = typeof value.room_id === "string" ? value.room_id : record.room_id;
 		if (record.kind === "room") {
 			const current = rooms.get(roomId);
 			if (!current || logId >= current.log_id) rooms.set(roomId, { room_id: roomId, log_id: logId, fields: roomFields(value), fromRecord: true });
 		} else if (record.kind === "message") {
 			if (typeof value.message_id !== "string") continue;
-			const from = isObject(value.from) && typeof value.from.user_id === "string" ? value.from as RenderedMessage["from"] : { user_id: "" };
+			const from = isObject(value.from) && typeof value.from.user_id === "string" ? value.from as ReplayedMessage["from"] : { user_id: "" };
 			const replyTo = isObject(value.reply_to) && typeof value.reply_to.message_id === "string" ? value.reply_to.message_id : undefined;
-			const next: RenderedMessage = {
+			const next: ReplayedMessage = {
 				message_id: value.message_id, room_id: roomId, log_id: logId, from,
 				...(value.body !== undefined ? { body: value.body } : {}),
 				...(value.ext !== undefined ? { ext: value.ext } : {}),
@@ -151,24 +178,24 @@ export function renderedState(records: Iterable<ChatRecord>, listings: readonly 
 			if (replaces(messages.get(next.message_id), next)) messages.set(next.message_id, next);
 		} else if (record.kind === "reactions") {
 			if (typeof value.message_id !== "string" || !Array.isArray(value.reactions)) continue;
-			const sets = reactionSets.get(value.message_id) ?? new Map();
+			const sets = reactionSets.get(value.message_id) ?? new Map<string, ReplayedReactionSet>();
 			reactionSets.set(value.message_id, sets);
 			for (const entry of value.reactions as ReactionEntry[]) {
-				const userId = entry?.from?.user_id;
-				if (typeof userId !== "string") continue;
+				const from = isObject(entry) && isObject(entry.from) && typeof entry.from.user_id === "string" ? entry.from as ReplayedReactionSet["from"] : undefined;
+				if (!from) continue;
 				const emojis = Array.isArray(entry.emojis) ? entry.emojis.filter((emoji): emoji is string => typeof emoji === "string") : [];
-				const current = sets.get(userId);
-				if (!current || logId >= current.log_id) sets.set(userId, { log_id: logId, emojis });
+				const current = sets.get(from.user_id);
+				if (!current || logId >= current.log_id) sets.set(from.user_id, { log_id: logId, from, emojis });
 			}
 		} else if (record.kind === "membership") {
 			if (!Array.isArray(value.members)) continue;
-			const room = memberships.get(roomId) ?? new Map();
+			const room = memberships.get(roomId) ?? new Map<string, ReplayedMembership>();
 			memberships.set(roomId, room);
 			for (const entry of value.members as MemberEntry[]) {
-				const userId = entry?.user?.user_id;
-				if (typeof userId !== "string") continue;
-				const current = room.get(userId);
-				if (!current || logId >= current.log_id) room.set(userId, { log_id: logId, joined: entry.joined === true });
+				const user = isObject(entry) && isObject(entry.user) && typeof entry.user.user_id === "string" ? entry.user as ReplayedMembership["user"] : undefined;
+				if (!user) continue;
+				const current = room.get(user.user_id);
+				if (!current || logId >= current.log_id) room.set(user.user_id, { log_id: logId, user, joined: entry.joined === true });
 			}
 		}
 	}
@@ -213,13 +240,13 @@ export function renderedState(records: Iterable<ChatRecord>, listings: readonly 
 
 	return {
 		rooms: new Map([...rooms].map(([roomId, { fromRecord: _, ...room }]) => [roomId, room])),
-		messages, reactions, members, users: userMap,
+		messages, reactions, members, users: userMap, reactionSets, memberships,
 	};
 }
 
 /**
  * How the 'a' side's IDs map to the 'b' side's, as an import reports it
- * (PLAN §10.6). Each function returns its argument for an ID that did not
+ * (an IdMap, ids.ts). Each function returns its argument for an ID that did not
  * move. `roomId` defaults to: room IDs that are log IDs (threads) and
  * `private_<log ID>` go through `logId`; others stay.
  */
@@ -248,7 +275,7 @@ function emojiSet(emojis: readonly string[]): string[] {
 }
 
 /** The 'a' side of a comparison, with every ID it holds mapped through `idMap`. */
-export function remapRenderedState(state: RenderedState, idMap: CompareIdMap): RenderedState {
+export function remapReplayed(state: ReplayedState, idMap: CompareIdMap): ReplayedState {
 	const logId = (id: string) => idMap.logId?.(id) ?? id;
 	const userId = (id: string) => idMap.userId?.(id) ?? id;
 	const roomId = (id: string): string => {
@@ -266,14 +293,14 @@ export function remapRenderedState(state: RenderedState, idMap: CompareIdMap): R
 		return { ...value, editors: { ...value.editors, edited_by: userId(value.editors.edited_by) } };
 	};
 
-	const rooms = new Map<string, RenderedRoom>();
+	const rooms = new Map<string, ReplayedRoom>();
 	for (const room of state.rooms.values()) {
 		const fields = typeof room.fields.parent_room_id === "string" ? { ...room.fields, parent_room_id: roomId(room.fields.parent_room_id) } : room.fields;
 		rooms.set(roomId(room.room_id), { ...room, room_id: roomId(room.room_id), fields });
 	}
-	const messages = new Map<string, RenderedMessage>();
+	const messages = new Map<string, ReplayedMessage>();
 	for (const message of state.messages.values()) {
-		const mapped: RenderedMessage = {
+		const mapped: ReplayedMessage = {
 			...message,
 			message_id: logId(message.message_id),
 			room_id: roomId(message.room_id),
@@ -287,12 +314,14 @@ export function remapRenderedState(state: RenderedState, idMap: CompareIdMap): R
 	const reactions = new Map([...state.reactions].map(([messageId, sets]) => [logId(messageId), new Map([...sets].map(([id, emojis]) => [userId(id), emojis]))]));
 	const members = new Map([...state.members].map(([id, set]) => [roomId(id), new Set([...set].map(userId))]));
 	const users = new Map([...state.users].map(([id, user]) => [userId(id), { ...user, user_id: userId(id) }]));
-	return { rooms, messages, reactions, members, users };
+	const reactionSets = new Map([...state.reactionSets].map(([messageId, sets]) => [logId(messageId), new Map([...sets].map(([id, set]) => [userId(id), { ...set, from: { ...set.from, user_id: userId(id) } }]))]));
+	const memberships = new Map([...state.memberships].map(([id, room]) => [roomId(id), new Map([...room].map(([user, membership]) => [userId(user), { ...membership, user: { ...membership.user, user_id: userId(user) } }]))]));
+	return { rooms, messages, reactions, members, users, reactionSets, memberships };
 }
 
-/** Compares two rendered states, the 'a' side through `idMap`; `differences` lists each in a readable line. */
-export function compareRenderedState(a: RenderedState, b: RenderedState, options: CompareOptions = {}): { equal: boolean; differences: string[] } {
-	const left = options.idMap ? remapRenderedState(a, options.idMap) : a;
+/** Compares two replayed states, the 'a' side through `idMap`; `differences` lists each in a readable line. */
+export function compareReplayed(a: ReplayedState, b: ReplayedState, options: CompareOptions = {}): { equal: boolean; differences: string[] } {
+	const left = options.idMap ? remapReplayed(a, options.idMap) : a;
 	const differences: string[] = [];
 	const differ = (what: string, field: string, x: unknown, y: unknown) => {
 		if (canonicalJson(x ?? null) !== canonicalJson(y ?? null)) differences.push(`${what}: ${field} differs: a ${quote(x)}, b ${quote(y)}`);

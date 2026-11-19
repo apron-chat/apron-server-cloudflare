@@ -43,8 +43,7 @@
  * shape carries no commit time.
  */
 
-import { jsonlWriter, utf8Length } from "../archive/format";
-import type { ArchiveHeader, ArchivedUser, RoomListing } from "../archive/types";
+import { type ArchiveHeader, type ArchivedUser, jsonlWriter, type RoomListing, utf8Length } from "@apron/archive";
 import { type ChatRecord, type Clock, type HistoryQuery, type RecordRange, type Retention, type TierStats, byLog, limitByLogId, thresholdCount, toRange } from "../records";
 import type { FloorContext, HistoryTier } from "../tier";
 import { type SegmentCursor, type SegmentIndex, type SegmentPosition, type SegmentRef, decodeSegment, segmentKey } from "./segments";

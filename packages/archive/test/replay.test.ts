@@ -1,9 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { collectArchive, jsonlReader, linesOf } from "../../src/history/archive/format";
-import type { ArchivedRoom } from "../../src/history/archive/types";
-import type { ChatRecord, RecordKind } from "../../src/history/records";
-import { compareRenderedState, renderedState } from "./render";
-import { sceneArchives } from "../fixtures/archives";
+import { type ArchivedRoom, type ChatRecord, collectArchive, compareReplayed, jsonlReader, linesOf, type RecordKind, replayRecords } from "../src/index.ts";
+import { sceneArchives } from "./fixtures/scenes/index.ts";
 
 /** A stored record; `storedIn` is the room the row is in, for a move's copy in its source room. */
 function record(kind: RecordKind, roomId: string, logId: number, fields: Record<string, unknown> = {}, storedIn = roomId): ChatRecord {
@@ -47,8 +44,8 @@ const log: ChatRecord[] = [
 	membership("general", 151, [[carol, true]]),
 ];
 
-describe("renderedState", () => {
-	const state = renderedState(log);
+describe("replayRecords", () => {
+	const state = replayRecords(log);
 
 	it("keeps the latest room record, without delivery fields", () => {
 		expect(state.rooms.get("general")).toEqual({ room_id: "general", log_id: 150, fields: { title: "General (ops)", ext: { topic: "deploys" } } });
@@ -72,16 +69,31 @@ describe("renderedState", () => {
 		expect(state.members.get("thread")).toEqual(new Set(["ada", "bob"]));
 	});
 
+	it("keeps every user's latest set and membership change as logged, for a writer of state", () => {
+		// Bob's cleared set stays, as does the set on the deleted message.
+		expect(state.reactionSets.get("110")?.get("bob")).toEqual({ log_id: 115, from: bob, emojis: [] });
+		expect(state.reactionSets.get("130")?.get("bob")).toEqual({ log_id: 131, from: bob, emojis: ["😮"] });
+		expect(state.reactionSets.get("111")?.get("ada")?.log_id).toBe(121);
+		expect(state.memberships.get("general")?.get("bob")).toEqual({ log_id: 140, user: bob, joined: false });
+		expect([...state.memberships.get("general")!.keys()]).toEqual(["ada", "bob", "carol"]);
+	});
+
+	it("orders by the record's log_id, not its wire spelling", () => {
+		const first = message("general", 7, 7, { body: { text: "first" } });
+		const edit = { ...message("general", 8, 7, { body: { text: "edit" } }), record_json: JSON.stringify({ room_id: "general", log_id: "1", message_id: "7", from: ada, body: { text: "edit" } }) };
+		expect(replayRecords([edit, first]).messages.get("7")).toMatchObject({ log_id: 8, body: { text: "edit" } });
+	});
+
 	it("does not depend on record order or duplicates", () => {
 		const shuffled = [...log].reverse().concat(log.slice(3, 9));
-		expect(compareRenderedState(renderedState(shuffled), state)).toEqual({ equal: true, differences: [] });
+		expect(compareReplayed(replayRecords(shuffled), state)).toEqual({ equal: true, differences: [] });
 	});
 
 	it("lets a tombstone win at an equal log ID, in either order", () => {
 		const live = message("general", 5, 5, { body: { text: "x" } });
 		const tomb = message("general", 5, 5, { deleted: true });
-		expect(renderedState([live, tomb]).messages.get("5")?.deleted).toBe(true);
-		expect(renderedState([tomb, live]).messages.get("5")?.deleted).toBe(true);
+		expect(replayRecords([live, tomb]).messages.get("5")?.deleted).toBe(true);
+		expect(replayRecords([tomb, live]).messages.get("5")?.deleted).toBe(true);
 	});
 
 	it("starts members from a listing, as of its latest_log_id", () => {
@@ -89,7 +101,7 @@ describe("renderedState", () => {
 			{ joined: true, listing: { room_id: "general", log_id: "100", title: "Old", latest_log_id: "145", members: [{ user_id: "ada" }, { user_id: "dave" }] } },
 			{ joined: false, listing: { room_id: "lobby", log_id: "90", title: "Lobby", latest_log_id: "90", history_log_id: null } },
 		];
-		const withListings = renderedState(log, listings, [ada, { ...bob, roles: ["admin"] }, { user_id: "ada", name: "Ada L." }]);
+		const withListings = replayRecords(log, listings, [ada, { ...bob, roles: ["admin"] }, { user_id: "ada", name: "Ada L." }]);
 		// Carol's join at 151 comes after the listing; bob's leave at 140 does not.
 		expect(withListings.members.get("general")).toEqual(new Set(["ada", "dave", "carol"]));
 		// The room record at 150 is newer than the listing's log_id; the lobby has only its listing.
@@ -106,16 +118,16 @@ describe("renderedState", () => {
 			record("reactions", "general", 3, { message_id: "1" }),
 			record("membership", "general", 4, {}),
 		];
-		const empty = renderedState(broken);
+		const empty = replayRecords(broken);
 		expect([empty.messages.size, empty.reactions.size, empty.members.size]).toEqual([0, 0, 0]);
 	});
 });
 
-describe("renderedState of the scenes", () => {
+describe("replayRecords of the scenes", () => {
 	for (const name of Object.keys(sceneArchives).sort()) {
 		it(`renders something in every kind scene ${name} holds`, async () => {
 			const archive = await collectArchive(jsonlReader(linesOf(sceneArchives[name])));
-			const full = renderedState(archive.records, archive.rooms, archive.users);
+			const full = replayRecords(archive.records, archive.rooms, archive.users);
 			expect(full.rooms.size).toBeGreaterThan(0);
 			expect(full.messages.size).toBeGreaterThan(0);
 			expect(full.users.size).toBeGreaterThan(0);
@@ -123,7 +135,7 @@ describe("renderedState of the scenes", () => {
 	}
 });
 
-describe("compareRenderedState", () => {
+describe("compareReplayed", () => {
 	it("reports readable differences", () => {
 		const changed: ChatRecord[] = [
 			...log.filter((entry) => !(entry.kind === "message" && entry.log_id === 112) && !(entry.kind === "membership" && entry.log_id === 151)),
@@ -133,7 +145,7 @@ describe("compareRenderedState", () => {
 			membership("general", 162, [[bob, true]]),
 			message("general", 170, 170, { body: { text: "new" } }),
 		];
-		const result = compareRenderedState(renderedState(log, [], [ada, bob]), renderedState(changed, [], [{ ...ada, name: "Ada L." }]));
+		const result = compareReplayed(replayRecords(log, [], [ada, bob]), replayRecords(changed, [], [{ ...ada, name: "Ada L." }]));
 		expect(result.equal).toBe(false);
 		expect(result.differences).toEqual([
 			"room general: ext differs: a {\"topic\":\"deploys\"}, b (none)",
@@ -148,9 +160,9 @@ describe("compareRenderedState", () => {
 	});
 
 	it("reports a moved message's room, author and deletion", () => {
-		const a = renderedState([message("general", 1, 1, { body: { text: "x" } })]);
-		const b = renderedState([message("thread", 2, 1, { from: bob, deleted: true })]);
-		expect(compareRenderedState(a, b).differences).toEqual([
+		const a = replayRecords([message("general", 1, 1, { body: { text: "x" } })]);
+		const b = replayRecords([message("thread", 2, 1, { from: bob, deleted: true })]);
+		expect(compareReplayed(a, b).differences).toEqual([
 			"message 1 in thread: room differs: a general, b thread",
 			"message 1 in thread: from differs: a ada, b bob",
 			"message 1 in thread: deleted differs: a false, b true",
@@ -159,18 +171,18 @@ describe("compareRenderedState", () => {
 	});
 
 	it("ignores log IDs, names as logged, roles and emoji variation selectors", () => {
-		const a = renderedState([
+		const a = replayRecords([
 			record("room", "general", 1, { title: "G", latest_log_id: "9", history_log_id: "1" }),
 			message("general", 2, 2, { from: ada, body: { text: "x" } }),
 			reactions("general", 3, 2, [[bob, ["❤️", "👍"]]]),
 		], [], [{ ...ada, roles: ["admin"] }]);
-		const b = renderedState([
+		const b = replayRecords([
 			record("room", "general", 5, { title: "G", prev_log_id: "1" }),
 			message("general", 2, 2, { from: { user_id: "ada", name: "Someone else" }, body: { text: "x" } }),
 			message("general", 7, 2, { prev_log_id: "2", from: ada, body: { text: "x" } }),
 			reactions("general", 8, 2, [[bob, ["👍", "❤", "👍"]]]),
 		], [], [{ ...ada, roles: ["unclaimed"] }]);
-		expect(compareRenderedState(a, b)).toEqual({ equal: true, differences: [] });
+		expect(compareReplayed(a, b)).toEqual({ equal: true, differences: [] });
 	});
 
 	it("compares through an idMap applied to the 'a' side", () => {
@@ -192,19 +204,19 @@ describe("compareRenderedState", () => {
 			const value = JSON.parse(json);
 			return { ...entry, room_id: value.room_id, log_id: Number(value.log_id), commit_ms: Number(value.log_id), record_json: json };
 		});
-		const a = renderedState(source, [], [ada, bob]);
-		const b = renderedState(renumbered(source), [], [{ ...ada, user_id: "ada-2" }, bob]);
+		const a = replayRecords(source, [], [ada, bob]);
+		const b = replayRecords(renumbered(source), [], [{ ...ada, user_id: "ada-2" }, bob]);
 		expect(b.messages.get("210")?.room_id).toBe("200");
 		expect(b.rooms.has("private_201")).toBe(true);
 		const idMap = { logId: (id: string) => logIds[id] ?? id, userId: (id: string) => userIds[id] ?? id };
-		expect(compareRenderedState(a, b, { idMap })).toEqual({ equal: true, differences: [] });
+		expect(compareReplayed(a, b, { idMap })).toEqual({ equal: true, differences: [] });
 		// Without the map, everything that moved differs.
-		const plain = compareRenderedState(a, b);
+		const plain = compareReplayed(a, b);
 		expect(plain.equal).toBe(false);
 		expect(plain.differences).toContain("room 100: only in a");
 		expect(plain.differences).toContain("user ada-2: only in b");
 		// A map that misses a user shows exactly where.
-		const partial = compareRenderedState(a, b, { idMap: { logId: idMap.logId } });
+		const partial = compareReplayed(a, b, { idMap: { logId: idMap.logId } });
 		expect(partial.differences).toEqual([
 			"message 210 in 200: from differs: a ada, b ada-2",
 			"message 210 in 200: body differs: a {\"mentions\":[\"ada\"],\"text\":\"hi @ada\"}, b {\"mentions\":[\"ada-2\"],\"text\":\"hi @ada\"}",
@@ -217,12 +229,12 @@ describe("compareRenderedState", () => {
 	it("compares every scene with itself as equal, and finds a change in it", async () => {
 		for (const name of Object.keys(sceneArchives)) {
 			const archive = await collectArchive(jsonlReader(linesOf(sceneArchives[name])));
-			const state = renderedState(archive.records, archive.rooms, archive.users);
-			expect(compareRenderedState(state, renderedState([...archive.records].reverse(), archive.rooms, archive.users)).equal).toBe(true);
+			const state = replayRecords(archive.records, archive.rooms, archive.users);
+			expect(compareReplayed(state, replayRecords([...archive.records].reverse(), archive.rooms, archive.users)).equal).toBe(true);
 			const last = archive.records.filter((entry) => entry.kind === "message").pop()!;
 			const value = JSON.parse(last.record_json);
 			const edited = { ...last, log_id: last.log_id + 1_000_000, record_json: JSON.stringify({ ...value, log_id: String(last.log_id + 1_000_000), body: { text: "changed" } }) };
-			const result = compareRenderedState(state, renderedState([...archive.records, edited], archive.rooms, archive.users));
+			const result = compareReplayed(state, replayRecords([...archive.records, edited], archive.rooms, archive.users));
 			expect(result.differences).toHaveLength(1);
 			expect(result.differences[0]).toMatch(new RegExp(`^message ${value.message_id} in .*: body differs`));
 		}

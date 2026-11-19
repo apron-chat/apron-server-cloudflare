@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { IdMap, RECORD_FIELDS, freeUserId, nextFree, nudgeLogIds, remapListing, remapRecord, remapUser } from "../../src/history/archive/ids";
-import type { ChatRecord } from "../../src/history/records";
-import type { ArchivedUser, RoomListing } from "../../src/history/archive/types";
+import { IdMap, RECORD_FIELDS, freeUserId, nextFree, nudgeLogIds, remapListing, remapRecord, remapUser } from "../src/ids.ts";
+import type { ChatRecord } from "../src/records.ts";
+import type { ArchivedUser, RoomListing } from "../src/types.ts";
 
 /** A map moving log IDs 100 and 101 and users ada and bob. */
 function sampleMap(): IdMap {

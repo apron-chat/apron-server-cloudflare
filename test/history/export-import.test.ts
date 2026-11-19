@@ -1,19 +1,16 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { encryptingSink, resolveKeys } from "../../src/history/archive/crypto";
 import { exportArchive } from "../../src/history/archive/export";
-import { collectArchive, jsonlReader, jsonlWriter, linesOf, writeArchiveToString } from "../../src/history/archive/format";
+import { type ArchivedUser, collectArchive, compareReplayed, encryptingSink, jsonlReader, jsonlWriter, linesOf, replayRecords, resolveKeys, writeArchiveToString } from "@apron/archive";
 import { archiveReader, importArchive, place, restoreBatches } from "../../src/history/archive/import";
-import type { ArchivedUser } from "../../src/history/archive/types";
 import { MemoryBlobStore } from "./support/memory-blob-store";
 import { type BackupSettings, backupFamily, writeBackup } from "../../src/history/exports";
 import { MemorySegmentIndex } from "../../src/history/blob/segments";
 import { BlobHistoryTier } from "../../src/history/blob/tier";
 import { MemoryHead, MemoryHistoryTier } from "./support/memory-tiers";
 import { HistoryPipeline, type PipelineStage } from "../../src/history/pipeline";
-import { compareRenderedState, renderedState } from "./render";
 import { MemoryTierStateStore } from "../../src/history/tier";
-import { sceneArchives } from "../fixtures/archives";
+import { sceneArchives } from "../../packages/archive/test/fixtures/scenes";
 
 class TestClock {
 	constructor(public time = 1_000_000) {}
@@ -79,13 +76,13 @@ async function exported(pipeline: HistoryPipeline, clock: TestClock, options: { 
 
 async function stateOf(text: string) {
 	const archive = await collectArchive(jsonlReader(linesOf(text)));
-	return renderedState(archive.records, archive.rooms, archive.users);
+	return replayRecords(archive.records, archive.rooms, archive.users);
 }
 
 describe("export and import", () => {
 	for (const from of ["head", "head+recent", "head+recent+cold"] as const) {
 		for (const to of ["head", "head+recent+cold"] as const) {
-			it(`round-trips ${from} → ${to}, rendered state equal`, async () => {
+			it(`round-trips ${from} → ${to}, replayed state equal`, async () => {
 				const source = pipelineOf(from);
 				populate(source.head, source.clock);
 				await settle(source.pipeline);
@@ -97,7 +94,7 @@ describe("export and import", () => {
 				// With a tier that keeps everything, upkeep loses nothing; SQLite alone would expire by its count.
 				if (to === "head+recent+cold") await settle(target.pipeline);
 				const second = await exported(target.pipeline, target.clock);
-				const comparison = compareRenderedState(await stateOf(first), await stateOf(second));
+				const comparison = compareReplayed(await stateOf(first), await stateOf(second));
 				expect(comparison.differences).toEqual([]);
 			});
 		}
@@ -139,7 +136,7 @@ describe("export and import", () => {
 		for (const [id, message] of [...backState.messages]) if (message.room_id === "lobby") backState.messages.delete(id);
 		backState.members.delete("lobby");
 		backState.users.delete("zed");
-		const comparison = compareRenderedState(await stateOf(text), backState, { idMap: { logId: (id) => report.remapped.logIds[id] ?? id } });
+		const comparison = compareReplayed(await stateOf(text), backState, { idMap: { logId: (id) => report.remapped.logIds[id] ?? id } });
 		expect(comparison.differences).toEqual([]);
 	});
 
@@ -179,7 +176,7 @@ describe("export and import", () => {
 		expect(place(130, tiers, 20)).toEqual([0]);
 	});
 
-	it("imports every scene from scene.apron.chat to the scene's own rendered state", async () => {
+	it("imports every scene from scene.apron.chat to the scene's own replayed state", async () => {
 		for (const [name, text] of Object.entries(sceneArchives)) {
 			// A clock past the scenes' log IDs, which an import keeping them requires.
 			const target = pipelineOf("head+recent+cold", new TestClock(2_000_000_000_000));
@@ -188,7 +185,7 @@ describe("export and import", () => {
 			await settle(target.pipeline);
 			const back = await exported(target.pipeline, target.clock);
 			const scene = await collectArchive(jsonlReader(linesOf(text)));
-			const comparison = compareRenderedState(renderedState(scene.records, scene.rooms, scene.users), await stateOf(back));
+			const comparison = compareReplayed(replayRecords(scene.records, scene.rooms, scene.users), await stateOf(back));
 			// Users carry over by name; rooms and messages exactly.
 			expect(comparison.differences.filter((line) => !line.startsWith("user ")), name).toEqual([]);
 		}
@@ -210,7 +207,7 @@ describe("export and import", () => {
 		const report = await importArchive(target.pipeline, archiveReader(linesOf(encrypted), keys), { clock: target.clock });
 		expect(report.roomsAdded.sort()).toEqual(["general", "random"]);
 		const plain = await exported(source.pipeline, source.clock);
-		expect(compareRenderedState(await stateOf(plain), await stateOf(await exported(target.pipeline, target.clock))).differences).toEqual([]);
+		expect(compareReplayed(await stateOf(plain), await stateOf(await exported(target.pipeline, target.clock))).differences).toEqual([]);
 		const keyless = pipelineOf("head", new TestClock(5_000_000));
 		await expect(importArchive(keyless.pipeline, archiveReader(linesOf(encrypted)), { clock: keyless.clock })).rejects.toThrow(/needs HISTORY_BACKUP_KEY/);
 		expect(keyless.head.all()).toEqual([]);
@@ -262,7 +259,7 @@ describe("export and import", () => {
 		expect(again.resumed).toBe(true);
 		expect(again.users).toEqual({ ada: { placeholder: "ada-2" }, bob: { placeholder: "bob" } });
 		expect(await target.head.journal()).toBeUndefined();
-		expect(compareRenderedState(await stateOf(text), await stateOf(await exported(target.pipeline, target.clock)), { idMap: { userId: (id) => id === "ada" ? "ada-2" : id } }).differences.filter((line) => !line.startsWith("user "))).toEqual([]);
+		expect(compareReplayed(await stateOf(text), await stateOf(await exported(target.pipeline, target.clock)), { idMap: { userId: (id) => id === "ada" ? "ada-2" : id } }).differences.filter((line) => !line.startsWith("user "))).toEqual([]);
 	});
 
 	it("restores in calls bounded by records and by reaction sets and members, a large record alone", () => {

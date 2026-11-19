@@ -4,7 +4,7 @@
  * its key and is written and read as a stream.
  *
  * Keys are Wrangler secrets named by BACKUP_ENCRYPTION_KEY_NAME and
- * BACKUP_PREVIOUS_KEY_NAMES (src/config.ts): any secret
+ * BACKUP_PREVIOUS_KEY_NAMES (in apron-server-cloudflare): any secret
  * of at least 32 characters of randomness, such as the server's own
  * UPLOAD_SIGNING_KEY, or one kept for backups alone (`openssl rand -base64
  * 32`). The encryption key is derived from a secret with HKDF-SHA-256

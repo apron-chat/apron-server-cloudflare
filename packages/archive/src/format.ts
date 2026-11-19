@@ -28,8 +28,8 @@
  * it: no clock, no storage.
  */
 
-import { byLog, type ChatRecord, type RecordKind } from "../records";
-import type { ArchiveHeader, ArchivedRoom, ArchivedUser, ArchivePart, ArchiveReader, ArchiveWriter, RoomListing } from "./types";
+import { byLog, type ChatRecord, type RecordKind } from "./records.ts";
+import type { ArchiveHeader, ArchivedRoom, ArchivedUser, ArchivePart, ArchiveReader, ArchiveWriter, RoomListing } from "./types.ts";
 
 /** The default cap on one line's UTF-8 size, newline included: 256 KiB. */
 export const MAX_LINE_BYTES = 256 * 1024;
@@ -358,7 +358,7 @@ export async function writeArchiveToString(fn: (writer: ArchiveWriter) => Promis
 	return lines.join("");
 }
 
-/** A whole archive read into memory: what renderedState takes, plus the header and the extra parts. */
+/** A whole archive read into memory: what replayRecords takes, plus the header and the extra parts. */
 export interface CollectedArchive {
 	header: ArchiveHeader;
 	/** Every listing in file order (a later listing of a room replaces an earlier one). */
