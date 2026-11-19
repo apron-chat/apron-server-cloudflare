@@ -1,9 +1,12 @@
 /**
- * The audit trail of admin commands: one `admin_action` event per admin
- * command that reached authorization, whether it was refused there, failed,
- * or ran. An event names who acted, the command, what it acted on and how
- * it ended; never message content, a token, a secret, or an error's
- * message, which may quote what the user typed.
+ * A hook for an audit trail of admin commands, not yet kept anywhere: the
+ * dispatcher hands an AuditSink one `admin_action` event per admin command
+ * that reached authorization, whether it was refused there, failed, or
+ * ran. An event names who acted, the command, what it acted on and how it
+ * ended; never message content, a token, a secret, or an error's message,
+ * which may quote what the user typed. The runtime's sink records nothing
+ * (noAuditSink); a later one could post each event as a message in a
+ * private room only admins can read.
  */
 
 /** How an admin command ended: ran, refused at authorization, or failed after it (a usage error included). */
@@ -46,13 +49,7 @@ export function auditField(value: string | undefined): string | undefined {
 	return value === undefined || value === "" ? undefined : value.slice(0, MAX_AUDIT_FIELD_CHARS);
 }
 
-/**
- * The default sink: one JSON line per event on the Worker's log
- * (`console.log`), where Workers Logs and Logpush pick it up like the
- * runtime's other events (`history_export`, `idle_bot_signed_out`).
- */
-export const consoleAuditSink: AuditSink = {
-	record(event) {
-		console.log(JSON.stringify(event));
-	},
+/** The runtime's sink for now: events are made, and kept nowhere. */
+export const noAuditSink: AuditSink = {
+	record() {},
 };

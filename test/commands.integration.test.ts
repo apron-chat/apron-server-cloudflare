@@ -1,7 +1,7 @@
 /// <reference types="vite/client" />
 import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { consoleAuditSink, type AdminAuditEvent, type AuditSink } from '../src/commands/audit';
+import { noAuditSink, type AdminAuditEvent, type AuditSink } from '../src/commands/audit';
 import { AdminCapability, assertAdmin, assertRoles, authorizeAdmin, authorizeRoles, RoleCapability } from '../src/commands/capability';
 import type { CommandTable, ScopeBase } from '../src/commands/registry';
 import { ApronDemoServer } from '../src/index';
@@ -32,7 +32,7 @@ beforeEach(async () => {
 	events = [];
 	await setRuntime(ADMIN_TOKEN, capture);
 });
-afterEach(() => setRuntime(undefined, consoleAuditSink));
+afterEach(() => setRuntime(undefined, noAuditSink));
 
 /** Registers a passkey user straight into the store and signs a connection in with a session token. */
 async function signedIn(userId: string): Promise<Peer> {

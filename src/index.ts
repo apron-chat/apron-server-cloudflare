@@ -118,7 +118,7 @@ import {
 } from "./store";
 import { isProtocolId, type StoredCredential } from "./domain";
 import { arity, inviteUses, issuableUserId, oneOf, passkeyNumber, requiredArg, requiredUserId, roomIdArgs, stripMention, userIdArg, usageError, type InviteUses, type IssuableUserId, type PasskeyNumber, type RoomIdArg, type UserIdArg } from "./commands/args";
-import { consoleAuditSink, type AuditSink } from "./commands/audit";
+import { noAuditSink, type AuditSink } from "./commands/audit";
 import { type AdminCapability, assertAdmin, assertRoles, type RoleCapability } from "./commands/capability";
 import { defineCommands, dispatchCommand, helpText } from "./commands/registry";
 import {
@@ -2578,8 +2578,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly store: Store;
 	private readonly webAuthn: WebAuthnService;
 	private mutationTail: Promise<void> = Promise.resolve();
-	/** Where admin commands' `admin_action` audit events go (src/commands/audit.ts): the log, unless a test captures them. */
-	private audit: AuditSink = consoleAuditSink;
+	/** Where admin commands' `admin_action` audit events go (src/commands/audit.ts): nowhere yet, unless a test captures them. */
+	private audit: AuditSink = noAuditSink;
 	/** The tier and open breakers last announced (Store.announcedTier), read once per instance. */
 	private announcedTier?: { tier: ServerTier; breakers: string[] };
 	/** When the tier was last evaluated (maybeEvaluateTier). */
