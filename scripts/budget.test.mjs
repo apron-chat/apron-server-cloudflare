@@ -196,8 +196,10 @@ test('with uploads, write URLs pass the invalid-request rule and the budget stop
 	// Every file the bucket serves is never sniffed: an uploaded text can't run as a script.
 	assert.deepEqual(edge.headers, { phase: 'http_response_headers_transform', rules: [{ ref: 'apron_media_nosniff', description: edge.headers.rules[0].description, expression: 'http.host eq "media.example.test"', action: 'rewrite', enabled: true, action_parameters: { headers: { 'X-Content-Type-Options': { operation: 'set', value: 'nosniff' } } } }] });
 	assert.equal(plain.headers, undefined);
-	assert.equal(mediaHostname('MEDIA_ORIGIN = "https://media.example.test"\n'), 'media.example.test');
-	assert.equal(mediaHostname('MEDIA_ORIGIN = "http://media.example.test"\n'), undefined);
+	assert.equal(mediaHostname('[vars]\nMEDIA_ORIGIN = "https://media.example.test"\n'), 'media.example.test');
+	assert.equal(mediaHostname('[vars]\nMEDIA_ORIGIN = "http://media.example.test"\n'), undefined);
+	// Only [vars] reach the Worker: a top-level key of the same name is no var.
+	assert.equal(mediaHostname('MEDIA_ORIGIN = "https://media.example.test"\n'), undefined);
 });
 
 test('with live text, write URLs and live reads pass the invalid-request rule', () => {
@@ -347,10 +349,12 @@ test('a Wrangler config\'s Previews are read apart from production\'s settings',
 		'',
 	].join('\n');
 	const { production, previews } = splitPreviews(source);
-	assert.doesNotMatch(production, /previews\.example\.test"\s*#|EXTERNAL_SIGN_IN|name = "B"/);
-	assert.match(production, /name = "A"/);
-	assert.match(previews, /^\[vars\]\nRP_ID = "previews\.example\.test"/m);
-	assert.match(previews, /^\[\[ratelimits\]\]\nname = "B"/m);
+	assert.equal(production.previews, undefined);
+	// smol-toml's tables have no prototype: compare their contents.
+	const plain = (value) => JSON.parse(JSON.stringify(value));
+	assert.deepEqual(plain(production.ratelimits), [{ name: 'A' }]);
+	assert.deepEqual(plain(previews.ratelimits), [{ name: 'B' }]);
+	assert.deepEqual(plain(previews.durable_objects), { bindings: [{ name: 'DEMO', class_name: 'C' }] });
 	assert.deepEqual(wranglerVars(previews), { RP_ID: 'previews.example.test', EXTERNAL_SIGN_IN: 'true' });
 	assert.deepEqual(wranglerVars(production), { RP_ID: 'example.test' });
 	// Production's switches are its own: the Previews' EXTERNAL_SIGN_IN does not reach its rule.
@@ -362,7 +366,9 @@ test('a Wrangler config\'s Previews are read apart from production\'s settings',
 		{ pattern: 'previews.example.test', enabled: false, previews: true },
 	]);
 	assert.equal(splitPreviews('name = "w"\n').previews, undefined);
-	assert.throws(() => splitPreviews('name = "w"\npreviews = { }\n'), /tables/);
+	// Parsed as Wrangler parses it: an inline table reads as [previews.*] tables do.
+	assert.deepEqual(plain(splitPreviews('name = "w"\npreviews = { vars = { RP_ID = "p.example.test" } }\n').previews), { vars: { RP_ID: 'p.example.test' } });
+	assert.throws(() => splitPreviews('name = "w"\npreviews = "x"\n'), /table/);
 });
 
 test('METRICS_DATASET, where set, names the dataset its METRICS binding writes, in production and in Previews', () => {
@@ -416,6 +422,8 @@ binding = "HISTORY_BLOB"
 	assert.doesNotThrow(() => checkBackupKeySecrets(config('')));
 	assert.throws(() => checkBackupKeySecrets(config('BACKUP_KEY = "public"')), /BACKUP_KEY is named as a backup key, but it is a plain \[vars\] var/);
 	assert.throws(() => checkBackupKeySecrets(config('OLDER_KEY = "public"')), /OLDER_KEY is named/);
+	// However the var is written: a TOML literal string is a var all the same.
+	assert.throws(() => checkBackupKeySecrets(config("BACKUP_KEY = 'public'")), /BACKUP_KEY is named/);
 	assert.doesNotThrow(() => checkBackupKeySecrets('[vars]\nRP_ID = "x"\nBACKUP_ENCRYPTION_KEY_NAME = ""\n'));
 	assert.doesNotThrow(() => checkBackupKeySecrets('[vars]\nRP_ID = "x"\n'));
 });
