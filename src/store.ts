@@ -1098,6 +1098,8 @@ const META_HISTORY_OPS_SEQ = "history:ops_seq";
 const META_HISTORY_TIER = "history:tier:";
 /** Backups' schedule state (historyMetaNumber, setHistoryMeta), kept when tiers are off. */
 const META_HISTORY_EXPORT = "history:export:";
+/** The running import's journal: its archive, user mapping and rooms still to finish (importArchive). */
+const META_HISTORY_IMPORT = "history:import";
 /** Segment index rows a blob tier's query reads at most (segmentIndex). */
 const SEGMENT_INDEX_READS = 5_000;
 /** Log IDs one copy from this SQLite carries at most (historyScan). */
@@ -1113,6 +1115,8 @@ const MAX_HISTORY_OPS = 200;
 export const RESTORE_RECORDS_BATCH = 256;
 /** Reaction sets and members, together, one restoreRoom call's records hold at most. */
 export const RESTORE_ENTRIES_BATCH = 1_024;
+/** Reaction sets and members one restored record may hold when it is restored alone (restoreRoom). */
+export const RESTORE_ENTRIES_SINGLE = 20_000;
 /**
  * Stored records of the room a restoreRoom call reads again at most, when
  * some of its records are older than what the room already holds: past it
@@ -4057,6 +4061,14 @@ export class Store {
     this.ensureReady();
     const limit = Math.max(0, Math.min(query.limit, 1_000));
     if (!query.roomIds.length || query.lower > query.upper || !limit) return [];
+    if (query.roomIds.length === 1) {
+      // One room (exports page room by room): its own key range, a page at most.
+      return this.reserved({ reads: 24 + limit + 1 }, true, now, () => this.rawRows<ChatRecord>(
+        `SELECT room_id, log_id, commit_ms, kind, record_json FROM records
+         WHERE room_id = ? AND log_id >= ? AND log_id <= ? ORDER BY log_id ${query.forward ? "ASC" : "DESC"} LIMIT ?`,
+        query.roomIds[0], Math.max(query.lower, this.logState().history_floor), query.upper, limit,
+      ).map((row) => ({ ...row, log_id: integerColumn(row.log_id), commit_ms: integerColumn(row.commit_ms) })));
+    }
     return this.reserved({ reads: 24 + 4 * limit * Math.min(query.roomIds.length, 8) }, true, now, () => this.rawRows<ChatRecord>(
       `SELECT room_id, log_id, commit_ms, kind, record_json FROM records
        WHERE room_id IN (SELECT value FROM json_each(?)) AND log_id IN (
@@ -4315,8 +4327,10 @@ export class Store {
     if (records.length > RESTORE_RECORDS_BATCH) throw new StoreError("invalid_params", `At most ${RESTORE_RECORDS_BATCH} records are restored a call`);
     const batch = records.map((record) => restoredRecord(roomId, record)).sort((a, b) => a.log_id - b.log_id);
     if (batch.some((record, index) => index > 0 && record.log_id === batch[index - 1].log_id)) throw new StoreError("invalid_params", "Two restored records share a log_id");
-    if (batch.reduce((sum, record) => sum + restoredEntries(record), 0) > RESTORE_ENTRIES_BATCH) {
-      throw new StoreError("invalid_params", `A call restores at most ${RESTORE_ENTRIES_BATCH} reaction sets and members`);
+    // One record alone may hold more (a compacted export folds a room's memberships into one), up to RESTORE_ENTRIES_SINGLE.
+    const entries = batch.reduce((sum, record) => sum + restoredEntries(record), 0);
+    if (entries > (batch.length === 1 ? RESTORE_ENTRIES_SINGLE : RESTORE_ENTRIES_BATCH)) {
+      throw new StoreError("invalid_params", `A call restores at most ${RESTORE_ENTRIES_BATCH} reaction sets and members, or one record of at most ${RESTORE_ENTRIES_SINGLE}`);
     }
     const listingLog = restoredLogId(listing.log_id);
     const listingLatest = restoredLogId(listing.latest_log_id);
@@ -4513,7 +4527,8 @@ export class Store {
   segmentIndex(tier: string): SqlSegmentIndex {
     const cached = this.segmentIndexes.get(tier);
     if (cached) return cached;
-    const table = `history_segments_${tier.replace(/[^a-z0-9_]/g, "_")}`;
+    // One table per tier name, and no two names alike: `_` doubles, `-` is `_d`, anything else `_x<hex>`.
+    const table = `history_segments_${[...tier].map((char) => /[a-z0-9]/.test(char) ? char : char === "_" ? "__" : char === "-" ? "_d" : `_x${char.codePointAt(0)!.toString(16)}_`).join("")}`;
     let ready = false;
     const prepare = () => {
       this.ensureReady();
@@ -4553,6 +4568,31 @@ export class Store {
     this.ensureReady();
     if (!key.startsWith(META_HISTORY_EXPORT)) throw new Error(`not a history export key: ${key}`);
     return this.reserved({ reads: 4 }, true, now, () => this.metaNumber(key));
+  }
+
+  /** The running import's journal (`history:import`, HistoryHead.journal): what a retry needs to finish it. */
+  historyImportJournal(now = this.clock.now()): string | undefined {
+    this.ensureReady();
+    return this.reserved({ reads: 4 }, true, now, () => this.metaValue(META_HISTORY_IMPORT) || undefined);
+  }
+
+  /** Writes or clears the running import's journal. */
+  setHistoryImportJournal(value: string | null, now = this.clock.now()): void {
+    this.ensureReady();
+    if (value !== null && value.length > 256 * 1024) throw new StoreError("invalid_params", "This import is too large to resume: import it in parts");
+    this.reserved({ reads: 4, writes: 4 + Math.ceil((value?.length ?? 0) / 4_096) }, true, now, () => this.writeMeta(META_HISTORY_IMPORT, value));
+  }
+
+  /**
+   * Whether a room exists with nothing logged past its creation: the seeded
+   * `general` of a new server, which an import may fill (restoreRoom merges).
+   */
+  roomIsEmpty(roomId: string, now = this.clock.now()): boolean {
+    this.ensureReady();
+    return this.reserved({ reads: 8 }, true, now, () => {
+      const room = this.rawRows<{ created_log_id: number; latest_log_id: number }>("SELECT created_log_id, latest_log_id FROM rooms WHERE room_id = ? LIMIT 1", roomId)[0];
+      return room !== undefined && integerColumn(room.latest_log_id) <= integerColumn(room.created_log_id);
+    });
   }
 
   /** Writes a backup schedule's value in `_meta` (a key under `history:export:`), or removes it for null. */
@@ -9366,7 +9406,7 @@ export class Store {
         // again, they start at the hot floor, and what they held below is trimmed.
         // Backups' schedule (`history:export:`, setHistoryMeta) is no tier's state, and stays.
         const stale = this.rawRows<{ key: string }>(
-          `SELECT key FROM _meta WHERE key >= 'history:' AND key < 'history;' AND NOT (key >= '${META_HISTORY_EXPORT}' AND key < '${META_HISTORY_EXPORT.slice(0, -1)};') LIMIT 64`,
+          `SELECT key FROM _meta WHERE key >= 'history:' AND key < 'history;' AND NOT (key >= '${META_HISTORY_EXPORT}' AND key < '${META_HISTORY_EXPORT.slice(0, -1)};') AND key <> '${META_HISTORY_IMPORT}' LIMIT 64`,
         );
         for (const row of stale) this.writeMeta(row.key, null);
         this.publishedCache = undefined;

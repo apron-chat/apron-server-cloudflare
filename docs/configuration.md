@@ -848,8 +848,8 @@ the `HISTORY` var and a bucket binding (`HISTORY_BLOB` in the examples).
 `wrangler.toml` binds a local bucket, `apron-history-dev`, which the tests
 and `wrangler dev` use; production has no bucket yet, so it runs no blob tier,
 and Previews bind none. The bucket must be private: no custom domain and no
-r2.dev URL. `/history rebuild-index` rebuilds the index from a listing of the
-bucket.
+r2.dev URL. `/history rebuild-index` adds to the index what a listing of the
+bucket finds that it lacks.
 
 ### The HISTORY config
 
@@ -974,7 +974,7 @@ deletes its own backups past the newest `keep` (14 by default).
   `HISTORY_BLOB` bucket under `backups/`, unencrypted. Its notice names the
   object's key. Keep `{name}` in a custom `key`, or the manual backups count
   toward the scheduled ones' `keep`.
-- **`/history import <key> [dry-run] [match|new] [renumber]`** (admins) reads
+- **`/history import <key> [dry-run] [match|new] [renumber] [restart]`** (admins) reads
   an object of the backup store, a backup or any ARCHIVE.md v1 file put
   there, encrypted or not, and adds what is new, after planning the whole
   file: rooms that exist here are skipped whole; records already held here
@@ -989,6 +989,10 @@ deletes its own backups past the newest `keep` (14 by default).
   Holding a role, placeholders are never removed as idle (account upkeep),
   and they count toward `registeredIdentityCount`. `renumber` (or `ids =
   "renumber"`) gives every record a new log ID instead of keeping its own.
+  A room holding nothing past its creation (a new server's `general`) is
+  filled, not skipped. An import notes its plan before it writes: run again
+  after a failure, it finishes; `restart` drops an unfinished plan. One
+  export or import runs at a time.
 
 **Encryption.** An export with `encrypt` writes its backups encrypted
 (AES-256-GCM in 1 MiB chunks; `.enc` is added to the key) with a key derived

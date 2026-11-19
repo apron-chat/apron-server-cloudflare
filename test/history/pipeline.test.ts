@@ -283,6 +283,29 @@ describe("HistoryPipeline upkeep", () => {
 		expect(await head.ops()).toEqual([]);
 	});
 
+	it("notes a stall when the tier below fails at any step, not only at a copy", async () => {
+		const clock = new TestClock();
+		const head = new MemoryHead("hot", clock);
+		let down = true;
+		const recent = instrument(new MemoryHistoryTier("recent"), async (method, call) => {
+			if (down && method !== "stats") throw new Error("D1 is down");
+			return call();
+		});
+		const pipeline = new HistoryPipeline({ head, headRetention: { records: 2, thresholdPercent: 100 }, stages: [{ tier: recent, retention: { records: 4, thresholdPercent: 100 } }], state: new MemoryTierStateStore(), clock });
+		for (let index = 0; index < 5; index += 1) {
+			clock.time += 10;
+			head.commit("general", "message", { message_id: `m${index}`, from: { user_id: "ada" } });
+		}
+		const failed = await pipeline.cycle({ steps: 10 });
+		expect(failed.report.failure?.step.kind).toBe("target");
+		expect((await pipeline.views())[0].state.stalledSince).toBe(clock.time);
+		clock.time += 7 * 3_600_000;
+		expect(await pipeline.stallsToAlert(6 * 3_600_000)).toEqual([{ from: "hot", to: "recent", since: clock.time - 7 * 3_600_000 }]);
+		down = false;
+		await settle(pipeline);
+		expect((await pipeline.views())[0].state.stalledSince).toBeUndefined();
+	});
+
 	it("does not read a lower tier's count again while nothing above it changed", async () => {
 		const clock = new TestClock();
 		const head = new MemoryHead("hot", clock);

@@ -19,6 +19,9 @@ import type { HistoryHead, PurgeResult, TierState, TierStateStore } from "./tier
 export interface StorePort {
 	historyFloors(): { hot: number; published: number; latest: number };
 	listRooms(now?: number, options?: { maintenance?: boolean; withPrivate?: boolean }): Array<{ room_id: string }>;
+	historyImportJournal?(): string | undefined;
+	setHistoryImportJournal?(value: string | null): void;
+	roomIsEmpty?(roomId: string): boolean;
 	getIdentity(userId: string): { userId: string; name: string; avatar?: string; roles: string[]; ext?: Record<string, unknown> } | null;
 	historyTarget(): number | undefined;
 	historyScan(from: number, limit?: number): ChatRecord[];
@@ -142,6 +145,18 @@ export class StoreHead implements HistoryHead {
 
 	async latest(): Promise<number> {
 		return this.store.historyFloors().latest;
+	}
+
+	async roomIsEmpty(roomId: string): Promise<boolean> {
+		return this.store.roomIsEmpty?.(roomId) ?? false;
+	}
+
+	async journal(): Promise<string | undefined> {
+		return this.store.historyImportJournal?.();
+	}
+
+	async setJournal(value: string | null): Promise<void> {
+		this.store.setHistoryImportJournal?.(value);
 	}
 
 	async restoreRoom(room: ArchivedRoom, records: readonly ChatRecord[]): Promise<void> {

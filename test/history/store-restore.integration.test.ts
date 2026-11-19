@@ -295,7 +295,7 @@ it("keeps a blob tier's segment index and the backups' schedule in SQLite, withi
 		expect(store.segmentIndex("Cold-1")).toBe(index);
 		const ref = (roomId: string, first: number, last: number) => ({ roomId, first, last, key: `${roomId}/${first}-${last}`, records: last - first + 1, bytes: 100 });
 		await index.add([ref("general", 10, 20), ref("lobby", 15, 30), ref("general", 21, 40)]);
-		expect(state.storage.sql.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'history_segments%'").toArray()).toEqual([{ name: "history_segments__old_1" }]);
+		expect(state.storage.sql.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'history_segments%'").toArray()).toEqual([{ name: "history_segments__x43_old_d1" }]);
 		expect((await index.find(["general"], 18, 25)).map((segment) => segment.first)).toEqual([10, 21]);
 		expect((await index.after(0, 2)).map((segment) => segment.first)).toEqual([10, 15]);
 		expect((await index.oldest(1))[0].last).toBe(20);

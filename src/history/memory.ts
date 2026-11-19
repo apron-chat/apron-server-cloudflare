@@ -199,6 +199,20 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead {
 		return this.last;
 	}
 
+	journalText: string | undefined;
+
+	async journal(): Promise<string | undefined> {
+		return this.journalText;
+	}
+
+	async setJournal(value: string | null): Promise<void> {
+		this.journalText = value ?? undefined;
+	}
+
+	async roomIsEmpty(roomId: string): Promise<boolean> {
+		return this.rooms_.has(roomId) && !this.all().some((record) => record.room_id === roomId);
+	}
+
 	async restoreUsers(users: readonly ArchivedUser[]): Promise<void> {
 		for (const user of users) if (!this.people.has(user.user_id)) this.people.set(user.user_id, { ...user, roles: ["unclaimed"] });
 	}

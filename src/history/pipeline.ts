@@ -146,15 +146,20 @@ export class HistoryPipeline {
 				return { more: false, report };
 			}
 			report.steps.push(step);
+			// The hop a step depends on: a copy's, or the one into the tier the step works on.
+			const hop = step.kind === "copy" ? step.from : "tier" in step && step.tier > 0 ? step.tier - 1 : undefined;
 			try {
 				await this.execute(step, snapshot, progress, report);
 			} catch (error) {
 				report.failure = { step, error };
-				if (step.kind === "copy") {
-					const state = snapshot.tiers[step.from].state;
-					if (state.stalledSince === undefined) await this.state.save(this.tiers[step.from].name, { stalledSince: this.clock.now() });
+				// Whatever fails below the head stalls the copy into it: noted for /status and the alert.
+				if (hop !== undefined && snapshot.tiers[hop].state.stalledSince === undefined) {
+					await this.state.save(this.tiers[hop].name, { stalledSince: this.clock.now() });
 				}
 				return { more: false, report };
+			}
+			if (hop !== undefined && step.kind !== "copy" && snapshot.tiers[hop].state.stalledSince !== undefined) {
+				await this.state.save(this.tiers[hop].name, { stalledSince: undefined, alertedAt: undefined });
 			}
 		}
 		const more = planStep(await this.snapshot(progress)).kind !== "idle" || progress.worked;

@@ -619,7 +619,7 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "embed-terminal", usage: "/embed-terminal [title]", help: "get a link to stream a terminal (80×40) into this room, such as a build: the message appears when the stream starts", audience: "everyone" },
 	{ name: "emoji", usage: "/emoji add|remove :name:", help: "add a custom emoji, or replace its image: send /emoji add :name: with one image attached; /emoji remove :name: removes it", audience: "owners", roles: EMOJI_ROLES },
 	{ name: "help", usage: "/help", help: "list the commands you can use here", audience: "everyone" },
-	{ name: "history", usage: "/history status | export [<room_id>...] | import <key> [dry-run] [match|new] [renumber] | rebuild-index", help: "show where history is kept; back it up to the backup store, or import a backup or archive (ARCHIVE.md, encrypted or not) from it; rebuild the blob tier's index", audience: "admins" },
+	{ name: "history", usage: "/history status | export [<room_id>...] | import <key> [dry-run] [match|new] [renumber] [restart] | rebuild-index", help: "show where history is kept; back it up to the backup store, or import a backup or archive (ARCHIVE.md, encrypted or not) from it (running a failed import again finishes it; restart drops it); repair the blob tier's index", audience: "admins" },
 	{ name: "invite-bot", usage: "/invite-bot", help: "get a sign-in token for your bot; a new one replaces the last", audience: "owners" },
 	{ name: "invite-code", usage: "/invite-code <uses>", help: `get a token that signs up to <uses> new users (at most ${MAX_JOIN_USES}) for a week, replacing the last one; /invite-code 0 revokes it`, audience: "admins" },
 	{ name: "invite-device", usage: "/invite-device list|add|remove [<id>]", help: "list, get or revoke tokens that sign in as you on another device", audience: "owners" },
@@ -2570,6 +2570,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * (runHistory); none without one.
 	 */
 	private readonly history?: HistoryPipeline;
+	/**
+	 * An import or export is running: history cycles wait for it, so tiers do
+	 * not move under its plan, and another one is refused.
+	 */
+	private historyJobRunning = false;
 	/** History cycles that failed in a row: cleanup then waits longer for the copy (HISTORY_RETRY_MS). */
 	private historyFailures = 0;
 	/** When the history pipeline may be tried again after a failure (runHistory); 0 for now. */
@@ -5091,6 +5096,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async runHistory(now: number): Promise<void> {
 		const history = this.history!;
 		if (now < this.historyRetryAt) return;
+		if (this.historyJobRunning) {
+			this.historyPending = true;
+			this.maintenanceSoon(now);
+			return;
+		}
 		try {
 			const { more, report } = await history.cycle({ steps: HISTORY_CYCLE_STEPS });
 			if (report.failure) {
@@ -8931,6 +8941,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.sendNotice(socket, roomId, text);
 			this.reply(socket, request, {});
 		};
+		if (words[0] === "export" || words[0] === "import") {
+			if (this.historyJobRunning) throw { name: "invalid_params", message: "Another history export or import is running; try again when it ends" } satisfies ProtocolError;
+			this.historyJobRunning = true;
+			try {
+				await this.historyJob(words, done, usage);
+			} finally {
+				this.historyJobRunning = false;
+			}
+			return;
+		}
 		switch (words[0]) {
 			case "status": {
 				if (words.length !== 1) usage();
@@ -8944,6 +8964,26 @@ export class ApronDemoServer extends DurableObject<Env> {
 				done(lines.join("\n"));
 				return;
 			}
+			case "rebuild-index": {
+				if (words.length !== 1) usage();
+				const rebuilt: string[] = [];
+				for (const tier of this.history?.tiers ?? []) {
+					// Adds what the index lacks, from the tier's floor up: a failure partway leaves it no worse.
+					const blob = tier as unknown as { rebuildIndex?: (options: { keep: boolean; floor: number }) => Promise<number> };
+					const floor = (await this.history!.views()).find((view) => view.name === tier.name)?.state.floor ?? 0;
+					if (typeof blob.rebuildIndex === "function") rebuilt.push(`\`${tier.name}\`: ${await blob.rebuildIndex({ keep: true, floor })} segments added`);
+				}
+				done(rebuilt.length ? `Rebuilt ${rebuilt.join(", ")}.` : "No blob tier to rebuild.");
+				return;
+			}
+			default:
+				usage();
+		}
+	}
+
+	/** `/history export` and `/history import` (historyCommand), one at a time. */
+	private async historyJob(words: string[], done: (text: string) => void, usage: () => never): Promise<void> {
+		switch (words[0]) {
 			case "export": {
 				const target = this.backupTarget();
 				if (!target) throw { name: "invalid_params", message: "No backup store: bind HISTORY_BLOB, or configure HISTORY.exports" } satisfies ProtocolError;
@@ -8963,7 +9003,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			case "import": {
 				const key = words[1];
 				const flags = new Set(words.slice(2));
-				if (!key || [...flags].some((flag) => !["dry-run", "match", "new", "renumber"].includes(flag)) || (flags.has("match") && flags.has("new"))) usage();
+				if (!key || [...flags].some((flag) => !["dry-run", "match", "new", "renumber", "restart"].includes(flag)) || (flags.has("match") && flags.has("new"))) usage();
 				const target = this.backupTarget();
 				if (!target) throw { name: "invalid_params", message: "No backup store: bind HISTORY_BLOB, or configure HISTORY.exports" } satisfies ProtocolError;
 				const object = await target.store.get(key);
@@ -8976,6 +9016,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 						clock: { now: nowMs }, server: this.config.rpId, dryRun: flags.has("dry-run"),
 						users: flags.has("match") ? "match" : flags.has("new") ? "new" : defaults?.users ?? "auto",
 						ids: flags.has("renumber") ? "renumber" : defaults?.ids ?? "original",
+						restart: flags.has("restart"),
 					});
 				} catch (error) {
 					// A missing key, a damaged backup or an unreadable file: said plainly, nothing written.
@@ -8983,6 +9024,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				}
 				const users = Object.entries(report.users).map(([from, to]) => "matched" in to ? `${from} → ${to.matched}` : `${from} → ${to.placeholder} (unclaimed)`);
 				done([
+					report.resumed ? "Finished the import an earlier run began." : "",
 					`${report.dryRun ? "Would import" : "Imported"} ${report.records} records into ${report.roomsAdded.length} new rooms${report.roomsAdded.length ? ` (${report.roomsAdded.map((id) => `\`${id}\``).join(", ")})` : ""}.`,
 					report.roomsSkipped.length ? `Skipped ${report.roomsSkipped.length} rooms that exist here.` : "",
 					report.duplicates ? `Skipped ${report.duplicates} records held here already.` : "",
@@ -8993,16 +9035,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (!report.dryRun && report.roomsAdded.length) {
 					try { this.announceUpdated(this.store.listRooms(nowMs(), { withPrivate: true })); } catch { /* listed on the next room_list */ }
 				}
-				return;
-			}
-			case "rebuild-index": {
-				if (words.length !== 1) usage();
-				const rebuilt: string[] = [];
-				for (const tier of this.history?.tiers ?? []) {
-					const blob = tier as unknown as { rebuildIndex?: () => Promise<number> };
-					if (typeof blob.rebuildIndex === "function") rebuilt.push(`\`${tier.name}\`: ${await blob.rebuildIndex()} segments`);
-				}
-				done(rebuilt.length ? `Rebuilt ${rebuilt.join(", ")}.` : "No blob tier to rebuild.");
 				return;
 			}
 			default:
@@ -9016,6 +9048,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * and tried again on the next interval's alarm; never throws.
 	 */
 	private async runScheduledExports(now: number): Promise<void> {
+		if (this.historyJobRunning) return;
 		for (const settings of this.config.history?.exports ?? []) {
 			try {
 				const last = this.store.historyMetaNumber(`history:export:${settings.name}`, now);
@@ -9024,7 +9057,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (!store) continue;
 				// Noted first: a failing export waits its interval rather than retrying on every alarm.
 				this.store.setHistoryMeta(`history:export:${settings.name}`, String(now), now);
-				const result = await writeBackup(this.archivePipeline(), store, settings, { server: this.config.rpId, clock: { now: nowMs }, keys: this.backupKeys() });
+				this.historyJobRunning = true;
+				let result: Awaited<ReturnType<typeof writeBackup>>;
+				try {
+					result = await writeBackup(this.archivePipeline(), store, settings, { server: this.config.rpId, clock: { now: nowMs }, keys: this.backupKeys() });
+				} finally {
+					this.historyJobRunning = false;
+				}
 				console.log(JSON.stringify({ event: "history_export", name: settings.name, key: result.key, records: result.records, deleted: result.deleted.length }));
 			} catch (error) {
 				console.warn(JSON.stringify({ event: "history_export_failed", name: settings.name, message: error instanceof Error ? error.message : String(error) }));

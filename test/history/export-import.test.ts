@@ -3,9 +3,11 @@ import { describe, expect, it } from "vitest";
 import { encryptingSink, resolveKeys } from "../../src/history/archive/crypto";
 import { exportArchive } from "../../src/history/archive/export";
 import { collectArchive, jsonlReader, jsonlWriter, linesOf } from "../../src/history/archive/format";
-import { archiveReader, importArchive, place } from "../../src/history/archive/import";
+import { archiveReader, importArchive, place, restoreBatches } from "../../src/history/archive/import";
 import type { ArchivedUser } from "../../src/history/archive/types";
 import { MemoryBlobStore } from "../../src/history/blob/memory";
+import { exportFamily, writeBackup } from "../../src/history/exports";
+import { parseHistorySettings } from "../../src/history/settings";
 import { MemorySegmentIndex } from "../../src/history/blob/segments";
 import { BlobHistoryTier } from "../../src/history/blob/tier";
 import { MemoryHead, MemoryHistoryTier } from "../../src/history/memory";
@@ -241,5 +243,80 @@ describe("export and import", () => {
 		const target = pipelineOf("head", new TestClock(5_000_000));
 		await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock });
 		expect(target.head.people.get("ada")?.roles).toEqual(["unclaimed"]);
+	});
+
+	it("finishes a failed import when run again, with the same users and log IDs", async () => {
+		const source = pipelineOf("head");
+		populate(source.head, source.clock);
+		const text = await exported(source.pipeline, source.clock);
+		const target = pipelineOf("head", new TestClock(5_000_000));
+		target.head.people.set("ada", { user_id: "ada", name: "Our Ada" });
+		const restore = target.head.restoreRoom.bind(target.head);
+		let calls = 0;
+		target.head.restoreRoom = async (room, records) => {
+			calls += 1;
+			if (calls === 2) throw new Error("the budget ran out");
+			return restore(room, records);
+		};
+		await expect(importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock })).rejects.toThrow(/budget/);
+		expect(await target.head.journal()).toBeDefined();
+		// Another archive waits for this one.
+		const other = pipelineOf("head", new TestClock(7_000_000));
+		populate(other.head, other.clock);
+		await expect(importArchive(target.pipeline, jsonlReader(linesOf(await exported(other.pipeline, other.clock, { server: "other.test" }))), { clock: target.clock })).rejects.toThrow(/another import is unfinished/);
+		const again = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock });
+		expect(again.resumed).toBe(true);
+		expect(again.users).toEqual({ ada: { placeholder: "ada-2" }, bob: { placeholder: "bob" } });
+		expect(await target.head.journal()).toBeUndefined();
+		expect(compareRenderedState(await stateOf(text), await stateOf(await exported(target.pipeline, target.clock)), { idMap: { userId: (id) => id === "ada" ? "ada-2" : id } }).differences.filter((line) => !line.startsWith("user "))).toEqual([]);
+	});
+
+	it("restores in calls bounded by records and by reaction sets and members, a large record alone", () => {
+		const record = (logId: number, entries: number) => ({ room_id: "r", log_id: logId, commit_ms: logId, kind: "reactions", record_json: JSON.stringify({ message_id: "m", reactions: Array.from({ length: entries }, (_, index) => ({ from: { user_id: `u${index}` }, emojis: ["x"] })) }) });
+		const batches = restoreBatches([record(1, 400), record(2, 400), record(3, 400), record(4, 5_000), record(5, 1)], { records: 200, entries: 1_000 });
+		expect(batches.map((batch) => batch.map((entry) => entry.log_id))).toEqual([[1, 2], [3], [4], [5]]);
+	});
+
+	it("fills a room that holds nothing past its creation, and keeps a move out of the room it left when the room it went to is skipped", async () => {
+		const source = pipelineOf("head");
+		populate(source.head, source.clock);
+		const text = await exported(source.pipeline, source.clock);
+		const target = pipelineOf("head", new TestClock(5_000_000));
+		// `general` exists, empty, as on a new server; `random`, where a message moved to, holds this server's own.
+		target.head.rooms_.set("general", { listing: { room_id: "general" }, joined: false });
+		target.head.commit("random", "message", { message_id: "own", from: { user_id: "zed" } });
+		const report = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock });
+		expect(report.roomsAdded).toEqual(["general"]);
+		expect(report.roomsSkipped).toEqual(["random"]);
+		const state = await stateOf(await exported(target.pipeline, target.clock));
+		const moved = [...state.messages.values()].find((message) => message.body && JSON.stringify(message.body).includes("moved"));
+		// Its last snapshot in general says it is in random now: general does not show it.
+		expect(moved?.room_id).toBe("random");
+	});
+
+	it("prunes only its own export's backups", async () => {
+		const settings = parseHistorySettings({
+			tiers: [{ name: "hot", kind: "sqlite", retention: { records: 10 } }],
+			exports: [
+				{ name: "daily", store: { provider: "memory", prefix: "backups/" }, keep: 2 },
+				{ name: "daily-full", store: { provider: "memory", prefix: "backups/" }, keep: 2 },
+			],
+		});
+		const family = exportFamily(settings.exports[0], "srv");
+		expect(family.pattern.test("backups/srv-daily-20261119-120000.jsonl")).toBe(true);
+		expect(family.pattern.test("backups/srv-daily-full-20261119-120000.jsonl")).toBe(false);
+		const store = new MemoryBlobStore();
+		await store.put("backups/notes.txt", "keep me");
+		const source = pipelineOf("head");
+		populate(source.head, source.clock);
+		for (let day = 0; day < 3; day += 1) {
+			for (const entry of settings.exports) await writeBackup(source.pipeline, store, entry, { server: "srv", clock: { now: () => Date.UTC(2026, 10, 19 + day) } });
+		}
+		const keys = (await store.list("backups/")).keys.map((entry) => entry.key);
+		expect(keys).toEqual([
+			"backups/notes.txt",
+			"backups/srv-daily-20261120-000000.jsonl", "backups/srv-daily-20261121-000000.jsonl",
+			"backups/srv-daily-full-20261120-000000.jsonl", "backups/srv-daily-full-20261121-000000.jsonl",
+		]);
 	});
 });

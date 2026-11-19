@@ -65,6 +65,8 @@ export interface RebuildOptions {
 	floor?: number;
 	/** Reads each object to count its records (default true). Without it, `records` is 0 and retention by count sees nothing. */
 	count?: boolean;
+	/** Keeps the index as it is and adds only what it lacks (an admin's repair: a failure partway leaves it no worse). */
+	keep?: boolean;
 }
 
 /** A log ID as 16 digits: every safe integer fits, and keys sort in log order. */
@@ -114,7 +116,7 @@ export async function decodeSegment(roomId: string, text: string): Promise<ChatR
  * segment keys are ignored. Returns how many segments were added.
  */
 export async function rebuildSegmentIndex(index: SegmentIndex, store: BlobStore, prefix: string, options: RebuildOptions = {}): Promise<number> {
-	await index.clear();
+	if (!options.keep) await index.clear();
 	let added = 0;
 	let cursor: string | undefined;
 	do {
@@ -123,6 +125,7 @@ export async function rebuildSegmentIndex(index: SegmentIndex, store: BlobStore,
 		for (const { key, size } of page.keys) {
 			const named = parseSegmentKey(prefix, key);
 			if (!named || (options.floor !== undefined && named.last < options.floor)) continue;
+			if (options.keep && (await index.find([named.roomId], named.first, named.last)).some((ref) => ref.key === key)) continue;
 			let records = 0;
 			if (options.count !== false) {
 				const object = await store.get(key);

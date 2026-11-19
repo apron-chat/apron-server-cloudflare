@@ -90,6 +90,11 @@ export interface HistoryHead extends RewritableTier {
 	users?(userIds: readonly string[]): Promise<ArchivedUser[]>;
 	/** The newest log ID given here (import's renumbering). */
 	latest?(): Promise<number>;
+	/** Import: a room that exists with nothing logged past its creation (a new server's `general`), which an import may fill. */
+	roomIsEmpty?(roomId: string): Promise<boolean>;
+	/** Import: the running import's journal (importArchive), so a retry finishes it. */
+	journal?(): Promise<string | undefined>;
+	setJournal?(value: string | null): Promise<void>;
 }
 
 /** Per-tier progress, persisted in the head's `_meta` under `history:<tier>:<field>`. */

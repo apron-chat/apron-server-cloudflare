@@ -499,7 +499,7 @@ export class BlobHistoryTier implements HistoryTier {
 	}
 
 	/** Restores a lost index from the store (segments.ts, rebuildSegmentIndex). */
-	rebuildIndex(options?: { floor?: number; count?: boolean }): Promise<number> {
+	rebuildIndex(options?: { floor?: number; count?: boolean; keep?: boolean }): Promise<number> {
 		return this.index.rebuild(this.store, this.prefix, options);
 	}
 }

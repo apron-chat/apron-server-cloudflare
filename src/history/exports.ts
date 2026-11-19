@@ -26,10 +26,20 @@ export function exportKey(settings: Pick<ExportSettings, "key" | "name" | "store
 	return `${settings.store.prefix}${name}${settings.encrypt && !name.endsWith(".enc") ? ".enc" : ""}`;
 }
 
-/** The part of an export's keys before its date: every backup of this export starts with it. */
-function exportFamily(settings: Pick<ExportSettings, "key" | "name" | "store">, server: string): string {
+/**
+ * This export's backups: the store prefix to list, and the pattern its keys
+ * match whole (the template with a date in place of `{date}`), so another
+ * export, or anything else under the prefix, is never taken for one.
+ */
+export function exportFamily(settings: Pick<ExportSettings, "key" | "name" | "store" | "encrypt">, server: string): { prefix: string; pattern: RegExp } {
 	const template = settings.key.replaceAll("{server}", server).replaceAll("{name}", settings.name);
-	return `${settings.store.prefix}${template.slice(0, template.indexOf("{date}"))}`;
+	const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const [before, after] = [template.slice(0, template.indexOf("{date}")), template.slice(template.indexOf("{date}") + "{date}".length)];
+	const suffix = settings.encrypt && !template.endsWith(".enc") ? ".enc" : "";
+	return {
+		prefix: `${settings.store.prefix}${before}`,
+		pattern: new RegExp(`^${escape(settings.store.prefix + before)}\\d{8}-\\d{6}${escape(after + suffix)}$`),
+	};
 }
 
 export interface BackupResult extends ExportReport {
@@ -71,8 +81,8 @@ export async function writeBackup(pipeline: HistoryPipeline, store: BlobStore, s
 	const keys: string[] = [];
 	let cursor: string | undefined;
 	do {
-		const page = await store.list(family, { limit: 1_000, ...(cursor ? { cursor } : {}) });
-		keys.push(...page.keys.map((entry) => entry.key));
+		const page = await store.list(family.prefix, { limit: 1_000, ...(cursor ? { cursor } : {}) });
+		keys.push(...page.keys.map((entry) => entry.key).filter((entry) => family.pattern.test(entry)));
 		cursor = page.cursor;
 	} while (cursor);
 	keys.sort();

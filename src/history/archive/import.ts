@@ -45,6 +45,10 @@ export interface ImportOptions {
 	clock: Clock;
 	/** Records per restoreRoom or append call (default 200). */
 	batch?: number;
+	/** Reaction sets and members per restoreRoom call (default 1,000; a record holding more goes alone). */
+	entries?: number;
+	/** Drop an unfinished earlier import's journal and plan afresh. */
+	restart?: boolean;
 }
 
 export interface ImportReport {
@@ -61,6 +65,53 @@ export interface ImportReport {
 	/** Records placed per tier. */
 	placed: Record<string, number>;
 	dryRun: boolean;
+	/** This run finished an earlier one that failed partway (its journal). */
+	resumed: boolean;
+}
+
+/**
+ * What an import that has begun writing keeps in the head (HistoryHead.journal),
+ * so that running it again after a failure finishes it rather than skipping
+ * the rooms it had begun: which archive, its user and log ID mapping, and the
+ * rooms it adds. Cleared once the import finishes.
+ */
+interface ImportJournal {
+	archive: string;
+	users: ImportReport["users"];
+	moved: Array<[number, number]>;
+	rooms: string[];
+}
+
+/** An archive's identity for the journal: its header and the extent of its records. */
+function archiveIdentity(archive: CollectedArchive): string {
+	const records = archive.records;
+	return canonicalJson({ header: archive.header, records: records.length, first: records[0]?.log_id ?? null, last: records[records.length - 1]?.log_id ?? null });
+}
+
+/** The reaction sets and members a record holds (Store.restoreRoom counts them per call). */
+function entriesOf(record: ChatRecord): number {
+	if (record.kind !== "reactions" && record.kind !== "membership") return 0;
+	const value = JSON.parse(record.record_json) as { reactions?: unknown[]; members?: unknown[] };
+	return (value.reactions ?? value.members ?? []).length;
+}
+
+/** Records in calls of at most `records` records and `entries` entries; a record over `entries` goes alone. */
+export function restoreBatches(records: readonly ChatRecord[], limits: { records: number; entries: number }): ChatRecord[][] {
+	const out: ChatRecord[][] = [];
+	let batch: ChatRecord[] = [];
+	let entries = 0;
+	for (const record of records) {
+		const count = entriesOf(record);
+		if (batch.length && (batch.length >= limits.records || entries + count > limits.entries)) {
+			out.push(batch);
+			batch = [];
+			entries = 0;
+		}
+		batch.push(record);
+		entries += count;
+	}
+	if (batch.length) out.push(batch);
+	return out;
 }
 
 /**
@@ -121,30 +172,55 @@ export async function importArchive(pipeline: HistoryPipeline, input: ArchiveRea
 	const head = pipeline.head;
 	const report: ImportReport = {
 		roomsAdded: [], roomsSkipped: [], users: {}, records: 0, duplicates: 0, expired: 0,
-		remapped: { logIds: {}, users: {} }, placed: {}, dryRun: Boolean(options.dryRun),
+		remapped: { logIds: {}, users: {} }, placed: {}, dryRun: Boolean(options.dryRun), resumed: false,
 	};
+	// An earlier run of this import that failed partway is finished with its own plan.
+	const identity = archiveIdentity(archive);
+	let journal: ImportJournal | undefined;
+	const saved = head.journal ? await head.journal() : undefined;
+	if (saved && options.restart && !options.dryRun) await head.setJournal?.(null);
+	else if (saved) {
+		const parsed = JSON.parse(saved) as ImportJournal;
+		if (parsed.archive !== identity) throw new Error("another import is unfinished: run it again to finish it, or import this one with restart to drop it");
+		journal = parsed;
+		report.resumed = true;
+	}
 
 	// Rooms: the listed ones, and any that only records name.
 	const rooms = new Map<string, ArchivedRoom>();
 	for (const room of archive.rooms) rooms.set(room.listing.room_id, room);
 	for (const record of archive.records) if (!rooms.has(record.room_id)) rooms.set(record.room_id, { listing: { room_id: record.room_id }, joined: false });
+	// New rooms: those absent here, a room with nothing logged past its
+	// creation (a new server's `general`), and those an unfinished run began.
 	const fresh = new Set<string>();
 	for (const roomId of rooms.keys()) {
-		if (await head.hasRoom(roomId)) report.roomsSkipped.push(roomId);
-		else fresh.add(roomId);
+		if (journal ? journal.rooms.includes(roomId) : !(await head.hasRoom(roomId)) || (head.roomIsEmpty ? await head.roomIsEmpty(roomId) : false)) fresh.add(roomId);
+		else report.roomsSkipped.push(roomId);
 	}
-	// A move is read back once, in the room it moved to: its copy in the room it left is made again when that room is new too.
-	let records = archive.records.filter((record) => fresh.has(record.room_id));
-	const held = new Set(records.map((record) => `${record.log_id}\u0000${record.room_id}`));
-	for (const record of [...records]) {
+	// A move is read back once, in the room it moved to: its copy in the room
+	// it left is made again when that room is new, whether or not the room it
+	// went to is (else the message would show where it was before).
+	const all = [...archive.records];
+	const held = new Set(all.map((record) => `${record.log_id}\u0000${record.room_id}`));
+	for (const record of archive.records) {
 		if (record.kind !== "message") continue;
 		const previous = (JSON.parse(record.record_json) as { prev_room_id?: string }).prev_room_id;
 		if (previous && previous !== record.room_id && fresh.has(previous) && !held.has(`${record.log_id}\u0000${previous}`)) {
-			records.push({ ...record, room_id: previous });
+			all.push({ ...record, room_id: previous });
 			held.add(`${record.log_id}\u0000${previous}`);
 		}
 	}
-	records.sort(byLog);
+	let records = all.filter((record) => fresh.has(record.room_id)).sort(byLog);
+	// A room's bounds where its listing lacks them: from its records, so its history starts and ends where they do.
+	for (const roomId of fresh) {
+		const own = records.filter((record) => record.room_id === roomId);
+		if (!own.length) continue;
+		const room = rooms.get(roomId)!;
+		const listing = { ...room.listing };
+		if (listing.log_id === undefined) listing.log_id = String(own[0].log_id);
+		if (listing.latest_log_id === undefined || Number(listing.latest_log_id) < own[own.length - 1].log_id) listing.latest_log_id = String(own[own.length - 1].log_id);
+		rooms.set(roomId, { ...room, listing });
+	}
 
 	// Users (§10.4).
 	const mode = options.users === "match" || options.users === "new" ? options.users
@@ -160,6 +236,20 @@ export async function importArchive(pipeline: HistoryPipeline, input: ArchiveRea
 	const users = new Map<string, string>();
 	const placeholders: ArchivedUser[] = [];
 	for (const id of [...ids].sort()) {
+		const planned = journal?.users[id];
+		if (planned) {
+			// The unfinished run's mapping stands: its placeholders may exist already.
+			report.users[id] = planned;
+			const mapped = "matched" in planned ? planned.matched : planned.placeholder;
+			if ("placeholder" in planned) {
+				given.add(planned.placeholder);
+				const { roles: _roles, ...rest } = profiles.get(id) ?? { user_id: id };
+				placeholders.push({ ...rest, user_id: planned.placeholder });
+			}
+			users.set(id, mapped);
+			if (mapped !== id) report.remapped.users[id] = mapped;
+			continue;
+		}
 		const override = options.userMap?.[id];
 		let target: { matched: string } | { placeholder: string };
 		if (override && "existing" in override) {
@@ -188,7 +278,10 @@ export async function importArchive(pipeline: HistoryPipeline, input: ArchiveRea
 	// Log IDs (§10.3).
 	const imported = logIds(records).sort((a, b) => a - b);
 	const moved = new Map<number, number>();
-	if (options.ids === "renumber") {
+	if (journal) {
+		// The unfinished run's log IDs stand: what it wrote is there under them.
+		for (const [from, to] of journal.moved) moved.set(from, to);
+	} else if (options.ids === "renumber") {
 		let next = Math.max(options.clock.now(), (head.latest ? await head.latest() : 0) + 1);
 		for (const id of imported) moved.set(id, next++);
 	} else {
@@ -243,19 +336,26 @@ export async function importArchive(pipeline: HistoryPipeline, input: ArchiveRea
 	report.roomsAdded = [...fresh].map((roomId) => map.roomId(roomId));
 	if (options.dryRun) return report;
 
-	// Write: placeholders, then each room at the head, then the tiers below, oldest first.
+	// Write, after noting the plan (a retry finishes it): placeholders, then
+	// each room at the head, then the tiers below, oldest first. Every write
+	// may be repeated without harm.
+	if (!journal && head.setJournal) {
+		await head.setJournal(JSON.stringify({ archive: identity, users: report.users, moved: [...moved], rooms: [...fresh] } satisfies ImportJournal));
+	}
 	const batch = options.batch ?? 200;
 	for (let start = 0; start < placeholders.length; start += batch) await head.restoreUsers(placeholders.slice(start, start + batch));
 	for (const roomId of fresh) {
 		const room = rooms.get(roomId)!;
 		const listing = remapListing({ ...room.listing }, map);
 		const own = perTier[0].filter((record) => record.room_id === listing.room_id);
-		await head.restoreRoom({ ...room, listing }, own.slice(0, batch));
-		for (let start = batch; start < own.length; start += batch) await head.restoreRoom({ ...room, listing }, own.slice(start, start + batch));
+		const batches = restoreBatches(own, { records: batch, entries: options.entries ?? 1_000 });
+		if (!batches.length) await head.restoreRoom({ ...room, listing }, []);
+		for (const records of batches) await head.restoreRoom({ ...room, listing }, records);
 	}
 	for (let index = 1; index < views.length; index += 1) {
 		const tier = pipeline.tiers[index];
 		for (let start = 0; start < perTier[index].length; start += batch) await tier.append(toRange(perTier[index].slice(start, start + batch)));
 	}
+	await head.setJournal?.(null);
 	return report;
 }
