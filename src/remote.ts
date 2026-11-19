@@ -1,9 +1,11 @@
 /**
- * Link accounts (extension `ext:remote`): an account an admin binds to one
- * remote Apron server with `/remote invite <address>`, whose requests that
- * carry `ext.remote.user_id` run as a shadow user standing for that user of
- * the remote server. The remote server's bridge connects here as the link;
- * this server never dials out.
+ * Links and remote users (extension `ext:remote`, the trusted federation
+ * recipe). A link is an account that an owner's admin binds to one mirror
+ * server with `/remote invite <address>`. The mirror connects as it, reads
+ * the rooms it is in, and sends its users' writes with
+ * `ext.remote.user_id`, which run as a remote user standing for that user
+ * of the mirror. In the code a remote user is a shadow, to keep it apart
+ * from the `user_id` it has on its own server. mirror.ts is both sides.
  */
 
 /** The longest remote server address a link is bound to, in characters. */
@@ -36,7 +38,8 @@ export interface RemoteUser {
  * A remote server's address (protocol §1) as a link is bound to it: a `ws`
  * or `wss` URI without user info or fragment, with its scheme and host
  * lowercased (RFC 3986 §6.2.2.1) and everything else as written, so the
- * operator's spelling of the path stays the one the bridge compares with.
+ * operator's spelling of the path stays the one a mirror compares its
+ * `REMOTE_SELF` with.
  * Undefined when it is not one.
  */
 export function normalizeRemoteAddress(value: string): string | undefined {

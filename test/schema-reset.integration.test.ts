@@ -390,7 +390,7 @@ it('upgrades a schema 10 store to 11 in place: the unread indexes and column go,
 	});
 });
 
-it('upgrades a schema 11 store to 12 in place: links\' remote key and remote_left are added, empty, and the rest stays', async () => {
+it('upgrades a schema 11 store to 12 in place: copies\' remote key and remote_left are added, empty, and the rest stays', async () => {
 	const stub = env.DEMO.getByName(`schema-upgrade-11-${crypto.randomUUID()}`);
 	const now = Date.now();
 	const before = await runInDurableObject(stub, async (instance, state) => {

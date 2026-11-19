@@ -1004,10 +1004,7 @@ export class RemoteRooms {
 		const params = request.params;
 		if (request.method === "message") return typeof params.room_id === "string" ? params.room_id : undefined;
 		if (request.method === "reactions") return typeof params.message_id === "string" ? this.store.messageRoom(params.message_id, this.now()) ?? undefined : undefined;
-		if (request.method === "room_set") {
-			const room = typeof params.room_id === "string" ? params.room_id : typeof params.parent_room_id === "string" ? params.parent_room_id : undefined;
-			return room;
-		}
+		if (request.method === "room_set") return typeof params.room_id === "string" ? params.room_id : typeof params.parent_room_id === "string" ? params.parent_room_id : undefined;
 		return undefined;
 	}
 

@@ -949,7 +949,8 @@ hourly for those connected), its last departure (`seen`), a passkey's last
 use, and its bot's activity, so it holds whether or not user status is on.
 Receiving pushes alone is not activity. It never removes one of the
 `keptActiveAccounts` (100) most recently active, one with a role, the admin
-user, a link's shadow user (an `@` in its id, extension `ext:remote`), one connected now or whose bot is, one whose bot holds a role of its
+user, a remote user (an `@` in its id, extension `ext:remote`), one
+connected now or whose bot is, one whose bot holds a role of its
 own, or one with a live upload (its avatar expires first, up to 61 days after its
 owner's last sign-in). Its bot goes with it, and its passkeys, memberships,
 read cursors, status, mutes, push subscriptions, tokens and limiter rows. Its

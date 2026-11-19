@@ -67,8 +67,8 @@ const ROOM_TITLE = "General";
  * version. A schema 9 object from code before the identities' `seen_ms`
  * column gains it before its upgrade (ensureSeenColumn()); one from code
  * before `push_subscriptions_joined_idx` gains that with the rebuild.
- * Schema 12 adds what links need (extension `ext:remote`): each linked
- * message's remote key, and the rooms remote users left (upgradeFromSchema11).
+ * Schema 12 adds what extension `ext:remote` needs (upgradeFromSchema11):
+ * each mirror's copy's key, and the rooms remote users were removed from.
  */
 export const SCHEMA_VERSION = 12;
 /** The oldest schema upgraded in place rather than reset; each one from it up to SCHEMA_VERSION is. */
@@ -2029,12 +2029,13 @@ const SCHEMA_10_COPIED_COLUMNS: Record<string, readonly string[]> = {
  * and the moderators' `joined` registrations are indexed; and uploads no
  * longer keep their content type, which nothing read.
  *
- * Schema 12 (upgradeFromSchema11), for links (extension `ext:remote`):
- * `message_state.remote_key` is a link's message's key, the link and the
- * remote message ID (remoteMessageKey), indexed where present, so
- * a link's repeated create finds its copy; it goes with the message's state.
- * `remote_left` keeps each room another user removed a remote user from,
- * keyed by user, so a later write from its link does not join it again.
+ * Schema 12 (upgradeFromSchema11), for extension `ext:remote`:
+ * `message_state.remote_key` is a mirror's copy's key, the owner server and
+ * the original's `message_id` (copyKey), indexed where present, so the
+ * owner's later records of the message find its copy (copyOf); it goes
+ * with the message's state. `remote_left` keeps each room another user
+ * removed a remote user from, keyed by user, so a later write from its
+ * link, or a copy of the owner's records on a mirror, does not join it again.
  */
 const SCHEMA_DDL = `
   CREATE TABLE IF NOT EXISTS _meta (
@@ -2612,7 +2613,7 @@ export class Store {
 
   /**
    * Upgrades a schema 11 object to schema 12 in place, once, in one
-   * transaction, for links (extension `ext:remote`): adds the empty
+   * transaction, for extension `ext:remote`: adds the empty
    * `message_state.remote_key` column and its partial index, which no row
    * is in yet, and the empty `remote_left` table. Adding a column rewrites
    * no row. Charged like upgradeFromSchema8 (finishUpgrade).

@@ -70,8 +70,9 @@ export interface RuntimeConfig {
 	adminToken?: string;
 	/**
 	 * This server's own address as other servers dial it (`REMOTE_SELF`,
-	 * extension `ext:remote`): the `server` of its `/remote` invites. Unset,
-	 * the WebSocket URL the admin's connection reached.
+	 * extension `ext:remote`): the `server` of its `/remote` invites, the
+	 * address a mirror checks its link is bound to, and its wake route's
+	 * origin. Unset, the extension is off.
 	 */
 	remoteSelf?: string;
 	/** How long an outbound link connection stays open with nothing to send (`REMOTE_LINGER_MS`, default 30000). */

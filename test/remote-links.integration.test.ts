@@ -3,8 +3,9 @@ import { afterEach, beforeEach, expect, it } from 'vitest';
 import { Store } from '../src/store';
 import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
 
-// Link accounts (extension `ext:remote`): an admin's `/remote invite` binds an
-// account to a remote server, whose bridge then posts as that server's users.
+// The owner's side of extension `ext:remote`: an admin's `/remote invite` binds
+// a link account to a mirror server, which connects as it and writes as its
+// own users (remote users here). The mirror's side runs in the interop harness.
 
 let nextIp = 1;
 const stub = () => env.DEMO.getByName('public-demo-v1');
