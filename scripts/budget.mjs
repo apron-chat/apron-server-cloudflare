@@ -463,6 +463,88 @@ export function wranglerVars(source) {
 	return Object.fromEntries([...table.matchAll(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*("(?:[^"\\]|\\.)*")\s*(?:#.*)?$/gm)].map(([, name, value]) => [name, JSON.parse(value)]));
 }
 
+/**
+ * The `[vars.HISTORY]` table of a Wrangler file, as Wrangler hands it to the
+ * Worker (an object), or undefined without one. It reads only the TOML that
+ * table uses: `[vars.HISTORY.x]` tables, `[[vars.HISTORY.x]]` arrays of
+ * tables, and `key = value` lines of strings, integers (with `_`), booleans,
+ * inline tables and arrays. Anything else is an error, not a guess.
+ */
+export function wranglerHistory(source) {
+	const lines = source.split('\n');
+	const start = lines.findIndex((line) => /^\[vars\.HISTORY\]\s*(?:#.*)?$/.test(line.trim()));
+	if (start === -1) return undefined;
+	const root = {};
+	let target = root;
+	for (const raw of lines.slice(start + 1)) {
+		const line = raw.trim();
+		if (!line || line.startsWith('#')) continue;
+		const header = /^(\[\[?)\s*vars\.HISTORY\.([A-Za-z_][\w.]*)\s*\]\]?\s*(?:#.*)?$/.exec(line);
+		if (header) {
+			const path = header[2].split('.');
+			let node = root;
+			for (const key of path.slice(0, -1)) node = node[key] ??= {};
+			const last = path.at(-1);
+			if (header[1] === '[[') (node[last] ??= []).push(target = {});
+			else target = node[last] ??= {};
+			continue;
+		}
+		if (line.startsWith('[')) break;
+		const pair = /^([A-Za-z_][\w-]*)\s*=\s*(.+)$/.exec(line);
+		if (!pair) throw new Error(`HISTORY in the Wrangler file: cannot read "${line}"`);
+		target[pair[1]] = tomlValue(pair[2]);
+	}
+	return root;
+}
+
+/** One TOML value of the kinds wranglerHistory reads, with an optional trailing comment. */
+function tomlValue(text) {
+	let at = 0;
+	const fail = () => { throw new Error(`HISTORY in the Wrangler file: cannot read the value ${text}`); };
+	const space = () => { while (at < text.length && /\s/.test(text[at])) at += 1; };
+	const value = () => {
+		space();
+		const rest = text.slice(at);
+		if (rest.startsWith('"')) {
+			const match = /^"(?:[^"\\]|\\.)*"/.exec(rest) ?? fail();
+			at += match[0].length;
+			return JSON.parse(match[0]);
+		}
+		if (rest.startsWith('[') || rest.startsWith('{')) {
+			const array = rest.startsWith('[');
+			const out = array ? [] : {};
+			at += 1;
+			space();
+			while (text[at] !== (array ? ']' : '}')) {
+				if (at >= text.length) fail();
+				if (array) out.push(value());
+				else {
+					const key = /^[A-Za-z_][\w-]*/.exec(text.slice(at)) ?? fail();
+					at += key[0].length;
+					space();
+					if (text[at] !== '=') fail();
+					at += 1;
+					out[key[0]] = value();
+				}
+				space();
+				if (text[at] === ',') {
+					at += 1;
+					space();
+				}
+			}
+			at += 1;
+			return out;
+		}
+		const match = /^(?:true|false|[+-]?\d[\d_]*)/.exec(rest) ?? fail();
+		at += match[0].length;
+		return match[0] === 'true' ? true : match[0] === 'false' ? false : Number(match[0].replace(/_/g, ''));
+	};
+	const result = value();
+	space();
+	if (at < text.length && text[at] !== '#') fail();
+	return result;
+}
+
 /** A `true`/`false` Wrangler var in `source`, else `fallback`. */
 export function wranglerSwitch(source, name, fallback) {
 	const value = source.match(new RegExp(`^${name}\\s*=\\s*"(true|false)"\\s*(?:#.*)?$`, 'im'))?.[1].toLowerCase();
@@ -512,7 +594,11 @@ function main() {
 	if (new Set(ids).size !== ids.length) throw new Error('Every rate limiter in every config needs its own namespace ID');
 	const { production: main, previews } = splitPreviews(production);
 	// Both sets of vars must load as the Worker loads them, or it would fail every request.
-	for (const vars of [wranglerVars(main), ...(previews ? [wranglerVars(previews)] : [])]) loadConfig(vars);
+	// The HISTORY table too (wranglerHistory), which Wrangler hands over as an object.
+	for (const part of [main, ...(previews ? [previews] : [])]) {
+		const history = wranglerHistory(part);
+		loadConfig(history ? { ...wranglerVars(part), HISTORY: history } : wranglerVars(part));
+	}
 	const hosts = customDomains(main).filter((domain) => domain.enabled);
 	if (hosts.length !== 1) throw new Error('Expected exactly one production custom domain');
 	const hostname = hosts[0].pattern;

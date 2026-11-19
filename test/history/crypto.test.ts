@@ -69,7 +69,8 @@ function flipByte(line: string, at: number): string {
 
 describe("backup keys", () => {
 	it("derives a fingerprint as the first 8 bytes of SHA-256 of the HKDF output", async () => {
-		const material = Uint8Array.from(atob(CURRENT), (c) => c.charCodeAt(0));
+		// The secret's text is HKDF's input, as it is.
+		const material = new TextEncoder().encode(CURRENT);
 		const hkdf = await crypto.subtle.importKey("raw", material, "HKDF", false, ["deriveBits"]);
 		const bits = await crypto.subtle.deriveBits(
 			{ name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0), info: new TextEncoder().encode("apron history backup v1") },
@@ -85,12 +86,20 @@ describe("backup keys", () => {
 		expect((await deriveBackupKey(OLD)).fingerprint).not.toBe(fingerprint);
 	});
 
-	it("refuses a secret that is not 32 bytes of base64, without printing it", async () => {
-		for (const bad of [btoa("too short"), btoa("x".repeat(33)), "not base64 at all!!", ""]) {
+	it("derives from a secret shared with another use, such as UPLOAD_SIGNING_KEY", async () => {
+		const keys = resolveKeys(env, ["UPLOAD_SIGNING_KEY"]);
+		const key = await keys.lookup("UPLOAD_SIGNING_KEY");
+		expect(key?.fingerprint).toMatch(/^[0-9a-f]{16}$/);
+		const encrypted = await encrypt(ARCHIVE, "UPLOAD_SIGNING_KEY", (env as unknown as Record<string, string>).UPLOAD_SIGNING_KEY, 64);
+		expect(await decrypt(encrypted, keys)).toEqual(ARCHIVE);
+	});
+
+	it("refuses a secret shorter than 32 characters, without printing it", async () => {
+		for (const bad of [btoa("too short"), "x".repeat(31), "   ", ""]) {
 			const error = await deriveBackupKey(bad, "HISTORY_BACKUP_KEY").catch((e: Error) => e);
 			expect(error).toBeInstanceOf(ArchiveKeyError);
-			expect((error as Error).message).toMatch(/^the secret HISTORY_BACKUP_KEY must be 32 random bytes in base64/);
-			if (bad) expect((error as Error).message).not.toContain(bad);
+			expect((error as Error).message).toMatch(/^the secret HISTORY_BACKUP_KEY must be at least 32 characters of randomness/);
+			if (bad.trim()) expect((error as Error).message).not.toContain(bad);
 		}
 		const keys = resolveKeys({ BAD: btoa("short secret value") }, ["BAD"]);
 		const error = await keys.lookup("BAD").catch((e: Error) => e);

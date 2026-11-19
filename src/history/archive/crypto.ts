@@ -3,8 +3,10 @@
  * AES-256-GCM in chunks, so a backup in a blob store is unreadable without
  * its key and is written and read as a stream.
  *
- * Keys are Wrangler secrets, 32 random bytes in base64, named in the config's
- * `key_secrets`. The encryption key is derived from a secret with HKDF-SHA-256
+ * Keys are Wrangler secrets named in the config's `key_secrets`: any secret
+ * of at least 32 characters of randomness, such as the server's own
+ * UPLOAD_SIGNING_KEY, or one kept for backups alone (`openssl rand -base64
+ * 32`). The encryption key is derived from a secret with HKDF-SHA-256
  * (no salt, info "apron history backup v1"), and each backup names the secret
  * it used and a fingerprint of the derived key (the first 8 bytes, hex, of its
  * SHA-256), so any listed key decrypts the backups made with it and a secret
@@ -28,6 +30,8 @@
  */
 
 const HKDF_INFO = "apron history backup v1";
+/** The shortest secret a backup key is derived from: 32 bytes of its text. */
+const MIN_SECRET_BYTES = 32;
 const ALG = "AES-256-GCM";
 const KDF = "HKDF-SHA-256";
 const NONCE_BYTES = 12;
@@ -108,15 +112,16 @@ function hex(bytes: Uint8Array): string {
 }
 
 /**
- * The AES-256-GCM key for a secret (32 random bytes, base64) and its
- * fingerprint. `name` only labels the error for a malformed secret, which
- * never includes the value.
+ * The AES-256-GCM key for a secret and its fingerprint. The secret's text
+ * (trimmed) is HKDF's input as it is, so a secret shared with another use
+ * (UPLOAD_SIGNING_KEY) gives a key of its own under this label. `name` only
+ * labels the error for a short secret, which never includes the value.
  */
-export async function deriveBackupKey(secretBase64: string, name?: string): Promise<BackupKey> {
-	const material = fromBase64(secretBase64.trim());
-	if (!material || material.byteLength !== 32) {
+export async function deriveBackupKey(secret: string, name?: string): Promise<BackupKey> {
+	const material = encoder.encode(secret.trim());
+	if (material.byteLength < MIN_SECRET_BYTES) {
 		const label = name ? `the secret ${name}` : "a backup key";
-		throw new ArchiveKeyError(`${label} must be 32 random bytes in base64 (make one with \`openssl rand -base64 32\`); its value is not`);
+		throw new ArchiveKeyError(`${label} must be at least ${MIN_SECRET_BYTES} characters of randomness (make one with \`openssl rand -base64 32\`); its value is shorter`);
 	}
 	const hkdf = await crypto.subtle.importKey("raw", material, "HKDF", false, ["deriveBits"]);
 	// Derive the raw bits first: the fingerprint is a hash of them, and the

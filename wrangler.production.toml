@@ -77,6 +77,38 @@ VAPID_SUBJECT = "https://server.apron.chat"
 # src/config.ts DEFAULT_PUSH_HOSTS), and push.stupidtech.net added to them.
 PUSH_HOSTS_EXTRA = "push.stupidtech.net"
 
+# Where history is kept, and its backups (src/history/settings.ts;
+# docs/configuration.md, The HISTORY config). The tiers below are the paid
+# plan's own limits written out, so this file says what they are: SQLite
+# keeps 5,000 records (none younger than three days leave by count), D1
+# 100,000 more; each daily cleanup keeps 80% of each. With HISTORY set, the
+# LIMIT_* vars for these limits are refused. `npm run budget:check` checks it.
+# The nightly backup is inert until a private R2 bucket is bound as
+# HISTORY_BLOB. It is encrypted with a key derived from UPLOAD_SIGNING_KEY
+# (its own HKDF label); list another secret first to use a key of its own,
+# and keep a rotated one listed (import.key_secrets) to read older backups.
+[vars.HISTORY]
+schedule = { every = "1d", threshold_percent = 80 }
+alerts = { stall_after = "6h" }
+
+[[vars.HISTORY.tiers]]
+name = "hot"
+kind = "sqlite"
+retention = { records = 5_000, min_age = "3d" }
+
+[[vars.HISTORY.tiers]]
+name = "recent"
+kind = "d1"
+binding = "HISTORY_D1"
+retention = { records = 100_000 }
+
+[[vars.HISTORY.exports]]
+name = "nightly"
+every = "1d"
+store = { provider = "r2", binding = "HISTORY_BLOB", prefix = "backups/" }
+keep = 14
+encrypt = { key_secrets = ["UPLOAD_SIGNING_KEY"] }
+
 # The D1 history tier (src/history/d1.ts, docs/configuration.md, History
 # tiers). Records there stay in history but become read-only: once
 # the object's own SQLite holds more than retentionRecords (LIMIT_RETENTION_RECORDS),
@@ -85,9 +117,8 @@ PUSH_HOSTS_EXTRA = "push.stupidtech.net"
 # keeps archiveRecords (LIMIT_ARCHIVE_RECORDS) of them, then they expire.
 # Both counts are ceilings: once a day, cleanup moves what is past
 # cleanupThresholdPercent (LIMIT_CLEANUP_THRESHOLD_PERCENT, 80) of SQLite's
-# limit to D1, and expires what is past that share of D1's. A HISTORY var
-# would set these limits as its tiers' retention instead
-# (docs/configuration.md, The HISTORY config); production sets none.
+# limit to D1, and expires what is past that share of D1's. The HISTORY var
+# above sets these limits as its tiers' retention.
 # `/purge` and `/rename` reach this tier too. Without this binding, records
 # past retentionRecords expire at once. The object creates its table on
 # first use (the database keeps its first name, apron-archive). Previews

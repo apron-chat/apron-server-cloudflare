@@ -1,8 +1,8 @@
 /*
  * The `HISTORY` config (PLAN §13.1): one structured var composing the
  * history pipeline, parsed and validated here at startup (src/config.ts)
- * (budget:check's TOML reader does not take tables yet, so it cannot check
- * one in a wrangler file). Wrangler `[vars]` may be TOML tables,
+ * and, from wrangler.production.toml, by `npm run budget:check` before a
+ * deploy (scripts/budget.mjs, wranglerHistory). Wrangler `[vars]` may be TOML tables,
  * which reach the Worker as JSON objects; a JSON string is accepted too.
  *
  *   [vars.HISTORY]

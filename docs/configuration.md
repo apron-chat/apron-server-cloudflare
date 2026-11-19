@@ -394,7 +394,10 @@ are set; set up all of these first:
    does not cache by default; without the rule every view is a billed R2 read.
 5. **Signing key.** `openssl rand -base64 48 | npx wrangler secret put
    UPLOAD_SIGNING_KEY --config wrangler.production.toml`. Rotating it
-   invalidates `write_url`s already issued, nothing else.
+   invalidates `write_url`s already issued, and, while production's
+   `HISTORY` encrypts backups with it, makes older backups unreadable unless
+   the old value stays set under another name listed in `import.key_secrets`
+   ([Backups and imports](#backups-and-imports)).
 6. **Edge rules.** Update `apron_invalid_request` and `apron_budget_stop`,
    and create `apron_media_invalid` and `apron_media_nosniff`, from
    [the generated definitions](edge-rules.generated.json). With uploads,
@@ -893,7 +896,7 @@ name = "nightly"
 every = "1d"
 store = { provider = "r2", binding = "HISTORY_BLOB", prefix = "backups/" }
 keep = 14
-encrypt = { key_secrets = ["HISTORY_BACKUP_KEY"] }
+encrypt = { key_secrets = ["UPLOAD_SIGNING_KEY"] }
 
 # Defaults for `/history import`, and secrets kept only to read old backups.
 [vars.HISTORY.import]
@@ -994,7 +997,13 @@ deletes its own backups past the newest `keep` (14 by default).
 **Encryption.** An export with `encrypt` writes its backups encrypted
 (AES-256-GCM in 1 MiB chunks; `.enc` is added to the key) with a key derived
 from a Wrangler secret: the first of `key_secrets`. The config holds only
-secret names. Make a key of 32 random bytes and store it:
+secret names, and the code adds none: what encrypts is what the config
+says. Any secret of at least 32 characters of randomness serves; its text
+goes through HKDF under the label `apron history backup v1`, so a secret
+shared with another use gives a key of its own. Production lists
+`UPLOAD_SIGNING_KEY` (`wrangler.production.toml`), which it has anyway. For
+backups rotated apart from upload links, make a secret of their own and
+list it first:
 
 ```sh
 openssl rand -base64 32 | npx wrangler secret put HISTORY_BACKUP_KEY --config wrangler.production.toml
@@ -1003,7 +1012,7 @@ openssl rand -base64 32 | npx wrangler secret put HISTORY_BACKUP_KEY --config wr
 Each backup names its secret and a fingerprint of its key, so an import
 decrypts it with any secret the environment has under that name: those in
 any export's `encrypt.key_secrets`, those in `[vars.HISTORY.import]
-key_secrets` (kept only to read older backups), and `HISTORY_BACKUP_KEY`.
+key_secrets` (kept only to read older backups), and no other.
 An import that lacks the secret fails naming it and the fingerprint; one
 whose secret has been set to another value since fails by the fingerprint;
 a damaged or truncated backup fails its chunk's authentication; none
@@ -1133,7 +1142,7 @@ implementation and recalibrating its resource model.
 | `ZONE_ID` | The zone holding `apron_budget_stop`; a Wrangler var (see [Budget guard](#budget-guard)) |
 | `EDGE_STOP_TOKEN` | Secret: an API token with Zone WAF edit permission on `ZONE_ID`, which the budget guard and the flood trip use |
 | `HISTORY` | Optional TOML table (or JSON): the history pipeline's tiers, schedule, alerts, scheduled backups and import defaults ([The HISTORY config](#the-history-config)); unset, SQLite then D1 where `HISTORY_D1` is bound, by the `LIMIT_*` history limits. Setting it together with `LIMIT_RETENTION_RECORDS`, `LIMIT_RETENTION_SECONDS`, `LIMIT_MIN_RETENTION_SECONDS`, `LIMIT_ARCHIVE_RECORDS` or `LIMIT_CLEANUP_THRESHOLD_PERCENT` fails the configuration check |
-| `HISTORY_BACKUP_KEY` | Optional secret: 32 random bytes, base64, that encrypts backups where an export lists it in `encrypt.key_secrets`, and that imports always try; set with `openssl rand -base64 32 \| npx wrangler secret put HISTORY_BACKUP_KEY --config wrangler.production.toml` ([Backups and imports](#backups-and-imports)). Other names listed in `HISTORY` work the same way |
+| `HISTORY_BACKUP_KEY` | Optional secret: at least 32 characters of randomness, for backups encrypted with a key of their own where `HISTORY` lists it in an export's `encrypt.key_secrets` (production lists `UPLOAD_SIGNING_KEY` instead); set with `openssl rand -base64 32 \| npx wrangler secret put HISTORY_BACKUP_KEY --config wrangler.production.toml` ([Backups and imports](#backups-and-imports)). Other names listed in `HISTORY` work the same way |
 | `ADMISSION_OFF` | `true` or `false`: operator admission switch; `true` rejects new sockets in the entry Worker with 503 before the limiter or DO call; existing sockets remain subject to DO budgets |
 | `ENVIRONMENT` | Set to `development` to enable local origin defaults when `ALLOWED_ORIGINS` and `RP_ORIGINS` are omitted |
 | `NODE_ENV` | Set to `test` to enable the same local origin defaults for tests; production-like deployments must configure origins explicitly |

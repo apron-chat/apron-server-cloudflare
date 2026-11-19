@@ -8944,10 +8944,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return store ? { store, settings } : undefined;
 	}
 
-	/** The backup keys this environment has: every secret the config names, and HISTORY_BACKUP_KEY (§13.3). */
+	/** The backup keys this environment has: the secrets the `HISTORY` var names, and no other (§13.3). */
 	private backupKeys(): BackupKeys {
-		const names = this.config.history ? backupKeyNames(this.config.history) : [];
-		return resolveKeys(this.runtimeEnv, [...new Set([...names, "HISTORY_BACKUP_KEY"])]);
+		return resolveKeys(this.runtimeEnv, this.config.history ? backupKeyNames(this.config.history) : []);
 	}
 
 	/**

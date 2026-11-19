@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ADMISSION_BUDGET, DEFAULT_LIMITS } from '../src/budget.ts';
-import { customDomains, mediaHostname, relyingPartyId, renderBinding, signInPages, renderEdgeRules, replaceBinding, splitPreviews, validateAdmission, validateDeploymentConfiguration, validateEdgeStop, webClientTarget, wranglerVars } from './budget.mjs';
+import { customDomains, mediaHostname, relyingPartyId, renderBinding, signInPages, renderEdgeRules, replaceBinding, splitPreviews, validateAdmission, validateDeploymentConfiguration, validateEdgeStop, webClientTarget, wranglerHistory, wranglerVars } from './budget.mjs';
+import { readFileSync } from 'node:fs';
+import { loadConfig } from '../src/config.ts';
 
 const namespaces = { attempts: '123', prefix: '124', location: '125', live: '126' };
 
@@ -400,4 +402,42 @@ test('Previews need their own domain and DEMO binding, and share no bucket, data
 	assert.doesNotThrow(() => check(route(previewRoute) + production + previews + '[[previews.r2_buckets]]\nbinding = "MEDIA"\nbucket_name = "apron-media-preview"\n'));
 	// Production's own checks read production's settings only: a Preview's bucket does not stand in for its MEDIA binding.
 	assert.throws(() => check(route(previewRoute) + production.replace('binding = "MEDIA"', 'binding = "OTHER"') + previews + '[[previews.r2_buckets]]\nbinding = "MEDIA"\nbucket_name = "apron-media-preview"\n'), /MEDIA bucket/);
+});
+
+test('reads the HISTORY table of a Wrangler file as Wrangler hands it over', () => {
+	const source = `[vars]
+RP_ID = "x"
+
+[vars.HISTORY]
+schedule = { every = "1d", threshold_percent = 80 } # a comment
+[[vars.HISTORY.tiers]]
+name = "hot"
+retention = { records = 5_000, min_age = "3d" }
+[[vars.HISTORY.tiers]]
+name = "recent"
+flags = [true, false, "a, b"]
+
+[[d1_databases]]
+binding = "HISTORY_D1"
+`;
+	assert.deepEqual(wranglerHistory(source), {
+		schedule: { every: '1d', threshold_percent: 80 },
+		tiers: [{ name: 'hot', retention: { records: 5000, min_age: '3d' } }, { name: 'recent', flags: [true, false, 'a, b'] }],
+	});
+	assert.equal(wranglerHistory('[vars]\nRP_ID = "x"\n'), undefined);
+	assert.throws(() => wranglerHistory('[vars.HISTORY]\nschedule = { every = 1d }\n'), /cannot read the value/);
+});
+
+test("production's HISTORY is valid and keeps the plan's own history limits", () => {
+	const { production } = splitPreviews(readFileSync(new URL('../wrangler.production.toml', import.meta.url), 'utf8'));
+	const history = wranglerHistory(production);
+	assert.ok(history, 'wrangler.production.toml sets HISTORY');
+	const config = loadConfig({ ...wranglerVars(production), HISTORY: history });
+	const plain = loadConfig(wranglerVars(production));
+	for (const key of ['retentionRecords', 'retentionSeconds', 'minRetentionSeconds', 'archiveRecords', 'cleanupThresholdPercent', 'cleanupSeconds']) {
+		assert.equal(config.limits[key], plain.limits[key], key);
+	}
+	assert.deepEqual(config.history.exports[0].encrypt, { keySecrets: ['UPLOAD_SIGNING_KEY'] });
+	// A typo is caught here, before a deploy, not by every request failing after one.
+	assert.throws(() => loadConfig({ ...wranglerVars(production), HISTORY: { ...history, tiers: [{ ...history.tiers[0], kind: 'sqlit' }] } }), /kind must be/);
 });
