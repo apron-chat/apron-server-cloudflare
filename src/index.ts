@@ -117,6 +117,10 @@ import {
 	STORAGE_UNAVAILABLE,
 } from "./store";
 import { isProtocolId, type StoredCredential } from "./domain";
+import { arity, inviteUses, issuableUserId, oneOf, passkeyNumber, requiredArg, requiredUserId, roomIdArgs, stripMention, userIdArg, usageError, type InviteUses, type IssuableUserId, type PasskeyNumber, type RoomIdArg, type UserIdArg } from "./commands/args";
+import { consoleAuditSink, type AuditSink } from "./commands/audit";
+import { type AdminCapability, assertAdmin, assertRoles, type RoleCapability } from "./commands/capability";
+import { defineCommands, dispatchCommand, helpText } from "./commands/registry";
 import {
 	authorizationServerMetadata,
 	AUTHORIZE_PATH,
@@ -603,37 +607,127 @@ function roomServerDescription(description: string | undefined): string | undefi
 }
 
 /**
- * The commands this server provides (§4.1), as `/help` lists them to those
- * who may run them: `everyone`, `registered` (registered users, bots
- * included), `owners` (registered users other than bots, so a bot neither
- * invites nor manages sign-ins), or `admins` (the `APRON_ADMIN_TOKEN` user
- * and those given the `admin` role).
- * An `owners` command with `roles` is for owners who hold one of them.
- * Kept in alphabetical order, the order `/help` lists them in, admins'
- * marked "(admin-only)".
+ * What a command's handler gets (src/commands/registry.ts): the
+ * connection and request it came on, the room it was sent in, and the
+ * runtime; an admin command's handler also gets its AdminCapability.
  */
-const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audience: "everyone" | "registered" | "owners" | "admins"; roles?: readonly string[] }> = [
-	{ name: "admin", usage: "/admin [remove] <user_id>", help: "make a registered user an admin, or no longer one", audience: "admins" },
-	{ name: "avatar", usage: "/avatar", help: "set your avatar: send this command with one image attached", audience: "registered" },
-	{ name: "embed-append", usage: "/embed-append [markdown]", help: "get a link to stream text into a message that starts with [markdown], such as an LLM's reply: the message appears when the stream starts", audience: "everyone" },
-	{ name: "embed-terminal", usage: "/embed-terminal [title]", help: "get a link to stream a terminal (80×40) into this room, such as a build: the message appears when the stream starts", audience: "everyone" },
-	{ name: "emoji", usage: "/emoji add|remove :name:", help: "add a custom emoji, or replace its image: send /emoji add :name: with one image attached; /emoji remove :name: removes it", audience: "owners", roles: EMOJI_ROLES },
-	{ name: "help", usage: "/help", help: "list the commands you can use here", audience: "everyone" },
-	{ name: "history", usage: "/history status | export [<room_id>...] | import <key> [dry-run] [match|new] [renumber] [restart] | rebuild-index", help: "show where history is kept; back it up to the backup store, or import a backup or archive (ARCHIVE.md, encrypted or not) from it (running a failed import again finishes it; restart drops it); repair the blob tier's index", audience: "admins" },
-	{ name: "invite-bot", usage: "/invite-bot", help: "get a sign-in token for your bot; a new one replaces the last", audience: "owners" },
-	{ name: "invite-code", usage: "/invite-code <uses>", help: `get a token that signs up to <uses> new users (at most ${MAX_JOIN_USES}) for a week, replacing the last one; /invite-code 0 revokes it`, audience: "admins" },
-	{ name: "invite-device", usage: "/invite-device list|add|remove [<id>]", help: "list, get or revoke tokens that sign in as you on another device", audience: "owners" },
-	{ name: "invite-purge", usage: "/invite-purge <user_id>", help: "sign a user out everywhere, remove their passkeys and tokens, and get a new token for them", audience: "admins" },
-	{ name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", audience: "admins" },
-	{ name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", audience: "admins" },
-	{ name: "passkeys", usage: "/passkeys [remove <n>]", help: "list your account's passkeys, or remove one of them", audience: "owners" },
-	{ name: "purge", usage: "/purge <user_id>", help: "disconnect a user and delete their account, bot, and everything they posted or uploaded", audience: "admins" },
-	{ name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", audience: "admins" },
-	{ name: "role", usage: "/role <user_id> [<role>]", help: "show a user's roles, or give or take away one (admin, mod, threader and bot act as such; friend, like any role, raises their posting limits, and admin, mod and friend may use /emoji)", audience: "admins" },
-	{ name: "server", usage: "/server [title|description [<text>] | avatar]", help: "show this server's title, description and avatar; set one, the avatar with one image attached; or clear one, back to the deployment's", audience: "admins" },
-	{ name: "status", usage: "/status", help: "show today's Cloudflare usage and the demo's budgets", audience: "admins" },
-	{ name: "toggle", usage: "/toggle <activity|uploads|presence|addmember|livetext>", help: "turn typing activity, uploads, user status (presence), users adding others to rooms (addmember), or live text (livetext: terminals and appends) off or on for everyone", audience: "admins" },
-];
+interface CommandScope {
+	readonly socket: WebSocketConnection;
+	readonly attachment: ConnectionAttachment;
+	readonly request: RequestFrame;
+	readonly roomId: string;
+	readonly runtime: ApronDemoServer;
+}
+
+/** A command that takes no arguments: words after its name are ignored, as they always were. */
+function noArgs(): Record<string, never> {
+	return {};
+}
+
+/** Whether `embeds` is exactly one `upload` embed: what `/avatar`, `/emoji add` and `/server avatar` take. */
+function oneUploadEmbed(embeds: unknown): boolean {
+	return Array.isArray(embeds) && embeds.length === 1 && !!embeds[0] && typeof embeds[0] === "object" && (embeds[0] as Record<string, unknown>).kind === "upload";
+}
+
+/** `/embed-terminal`'s title or `/embed-append`'s opening markdown: the command's text after its first word, newlines and all. */
+function liveOpening(text: string): string {
+	return text.replace(/^\s*\/\S+[ \t]*(?:\r?\n)?/, "");
+}
+
+/** `/invite-device`'s arguments: list the sender's device tokens, mint one (under `id`, or the first free one), or revoke one. */
+type DeviceArgs = { action: "list" } | { action: "add"; id?: string } | { action: "remove"; id: string };
+
+function deviceArgs(words: readonly string[], usage: string): DeviceArgs {
+	const action = words[1];
+	const length = action === "list" ? [2] : action === "add" ? [2, 3] : action === "remove" ? [3] : [];
+	if (!length.includes(words.length)) throw usageError(`Usage: ${usage}`);
+	if (action === "list") return { action };
+	if (action === "add") return words.length === 3 ? { action, id: words[2] } : { action };
+	return { action: "remove", id: words[2] };
+}
+
+/** `/passkeys`' arguments: list the sender's passkeys, or remove the one numbered `remove`. */
+type PasskeysArgs = { remove?: PasskeyNumber };
+
+/** `/passkeys`' usage error, which names its two forms rather than its usage line. */
+function passkeysUsage(): ProtocolError {
+	return usageError("Usage: /passkeys, or /passkeys remove <n>");
+}
+
+function passkeysArgs(words: readonly string[]): PasskeysArgs {
+	const args = words.slice(1);
+	if (args.length === 0) return {};
+	if (args.length !== 2 || args[0] !== "remove") throw passkeysUsage();
+	return { remove: passkeyNumber(args[1], passkeysUsage()) };
+}
+
+/** `/emoji`'s arguments: add (with its image attached) or remove the custom emoji `key`, written `:name:`. */
+type EmojiArgs = { action: "add" | "remove"; key: string };
+
+function emojiArgs(words: readonly string[], body: Readonly<Record<string, unknown>>): EmojiArgs {
+	const args = words.slice(1);
+	const action = args[0];
+	if (args.length !== 2 || (action !== "add" && action !== "remove")) {
+		throw usageError("Usage: /emoji add :name: with one image attached, or /emoji remove :name:");
+	}
+	const key = args[1];
+	if (!isEmojiKey(key) || key.length - 2 > MAX_EMOJI_NAME_CHARS) {
+		throw usageError(`A custom emoji is written :name:, with a name of 1 to ${MAX_EMOJI_NAME_CHARS} letters, digits, _, + or -`);
+	}
+	if (action === "add" && !oneUploadEmbed(body.embeds)) throw usageError(`Attach one image to /emoji add ${key} as an upload embed`);
+	return { action, key };
+}
+
+/**
+ * `/server`'s arguments: show the server's metadata; set its avatar from
+ * the one image attached (`upload`) or clear it; or set the title or
+ * description to `value`, or clear it (no `value`).
+ */
+type ServerArgs = { field: "show" } | { field: "avatar"; upload: boolean } | { field: "title" | "description"; value?: string };
+
+function serverArgs(line: string, body: Readonly<Record<string, unknown>>, limits: RuntimeConfig["limits"]): ServerArgs {
+	// The text after the field is taken as typed, line breaks included.
+	const [, field = "", rest = ""] = /^\/\S+\s*(\S*)([\s\S]*)$/.exec(line) ?? [];
+	const value = rest.trim();
+	const chosen = field.toLowerCase();
+	const embeds = Array.isArray(body.embeds) ? body.embeds : [];
+	if (chosen !== "avatar" && embeds.length) throw usageError("Only /server avatar takes an attachment");
+	if (!chosen) return { field: "show" };
+	if (chosen === "avatar") {
+		if (value) throw usageError("Usage: /server avatar with one image attached, or alone to clear it");
+		if (embeds.length && !oneUploadEmbed(embeds)) throw usageError("Attach one image to /server avatar as an upload embed");
+		return { field: "avatar", upload: embeds.length > 0 };
+	}
+	if (chosen !== "title" && chosen !== "description") throw usageError("Usage: /server, /server title|description [<text>], or /server avatar");
+	if (chosen === "title" && !validServerTitle(value, limits)) throw usageError(`A server title is one line of at most ${limits.maxNameCodePoints} characters`);
+	if (chosen === "description" && !validServerDescription(value)) throw usageError(`A server description is CommonMark of at most ${MAX_SERVER_DESCRIPTION_BYTES} bytes`);
+	return value ? { field: chosen, value } : { field: chosen };
+}
+
+/** `/history`'s arguments, one form each (historyCommand). */
+type HistoryArgs =
+	| { action: "status" | "rebuild-index" }
+	| { action: "export"; roomIds: RoomIdArg[] }
+	| { action: "import"; key: string; dryRun: boolean; users?: "match" | "new"; renumber: boolean; restart: boolean };
+
+/** What may follow `/history import <key>`. */
+const HISTORY_IMPORT_FLAGS: readonly string[] = ["dry-run", "match", "new", "renumber", "restart"];
+
+/** `/history`'s arguments; `busy` while an export or import runs, which refuses another before its arguments are read. */
+function historyArgs(words: readonly string[], usage: string, busy: boolean): HistoryArgs {
+	const action = words[1];
+	if (action === "export" || action === "import") {
+		if (busy) throw usageError("Another history export or import is running; try again when it ends");
+		if (action === "export") return { action, roomIds: roomIdArgs(words.slice(2)) };
+		const key = words[2];
+		const flags = new Set(words.slice(3));
+		if (!key || [...flags].some((flag) => !HISTORY_IMPORT_FLAGS.includes(flag)) || (flags.has("match") && flags.has("new"))) throw usageError(`Usage: ${usage}`);
+		const users = flags.has("match") ? "match" : flags.has("new") ? "new" : undefined;
+		return { action, key, dryRun: flags.has("dry-run"), ...(users ? { users } : {}), renumber: flags.has("renumber"), restart: flags.has("restart") };
+	}
+	if ((action === "status" || action === "rebuild-index") && words.length === 2) return { action };
+	throw usageError(`Usage: ${usage}`);
+}
 /** Why a guest's post, reaction, join, leave, or room change is denied while guests only read. */
 const GUEST_READ_ONLY = "Guests can only read here; sign in with a passkey to post or join rooms";
 /**
@@ -960,18 +1054,6 @@ function endpointOf(request: Request): string | undefined {
 	const url = new URL(request.url);
 	const endpoint = `${url.protocol === "http:" ? "ws:" : "wss:"}//${url.host}${url.pathname}`;
 	return endpoint.length <= MAX_ENDPOINT_CHARS ? endpoint : undefined;
-}
-
-/**
- * Throws unless `userId` may be issued by an admin (`/rename`, `/invite-token`):
- * 1 to 64 letters, digits, `_` or `-`, starting with a letter or digit and
- * ending with a letter, digit or `_`, so that `@` and the whole ID make a
- * mention in text (Appendix A.3), and not a guest's or bot's.
- */
-function assertIssuableUserId(userId: string): void {
-	if (!/^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9_])?$/.test(userId) || /^(guest|bot)(_|$)/i.test(userId)) {
-		throw { name: "invalid_params", message: "A user_id is 1 to 64 letters, digits, _ or -, starting with a letter or digit, ending with a letter, digit or _, and not guest_ or bot_" } satisfies ProtocolError;
-	}
 }
 
 /** Whether a `user_id` is an owner's bot's (`bot_<owner>`); a user may also be a bot by role (`isBot`). */
@@ -2496,6 +2578,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private readonly store: Store;
 	private readonly webAuthn: WebAuthnService;
 	private mutationTail: Promise<void> = Promise.resolve();
+	/** Where admin commands' `admin_action` audit events go (src/commands/audit.ts): the log, unless a test captures them. */
+	private audit: AuditSink = consoleAuditSink;
 	/** The tier and open breakers last announced (Store.announcedTier), read once per instance. */
 	private announcedTier?: { tier: ServerTier; breakers: string[] };
 	/** When the tier was last evaluated (maybeEvaluateTier). */
@@ -4888,14 +4972,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * `/invite-code <uses>`: mints the sign-up invite (protocol Appendix B), a
 	 * token that signs up to `uses` new users within a week, and revokes the
-	 * last one; `/invite-code 0` only revokes. The token goes to this connection
+	 * last one; `/invite-code 0` only revokes. More uses than the server
+	 * allows is a count limit, `denied` (§1.1), when the count is parsed
+	 * (inviteUses). The token goes to this connection
 	 * only, in a `~private` notice, before the result (§1).
 	 */
-	private async invite(socket: WebSocketConnection, request: RequestFrame, roomId: string, count: string): Promise<void> {
-		const uses = /^\d{1,3}$/.test(count) ? Number(count) : -1;
-		if (uses < 0) throw { name: "invalid_params", message: `Usage: /invite-code <uses>, 0 to ${MAX_JOIN_USES}` } satisfies ProtocolError;
-		// More uses than the server allows is a count limit: denied (§1.1).
-		if (uses > MAX_JOIN_USES) throw { name: "denied", message: `An invite signs up at most ${MAX_JOIN_USES} users` } satisfies ProtocolError;
+	private async invite(cap: AdminCapability, socket: WebSocketConnection, request: RequestFrame, roomId: string, uses: InviteUses): Promise<void> {
+		assertAdmin(cap);
 		const token = JOIN_TOKEN_PREFIX + bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 		const key = JOIN_TOKEN_KEY_PREFIX + await sha256Hex(token);
 		const expiresMs = nowMs() + JOIN_INVITE_TTL_MS;
@@ -7651,11 +7734,188 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
+	 * The commands this server provides (§4.1), each with who may run it
+	 * and its handler: `everyone` (publicCommand), `registered` (registered
+	 * users, bots included), `owners` (registered users other than bots, so
+	 * a bot neither invites nor manages sign-ins; with `roles`, those holding
+	 * one of them), or `admins` (the `APRON_ADMIN_TOKEN` user and those given
+	 * the `admin` role). Kept in alphabetical order, the order `/help` lists
+	 * them in, admins' marked "(admin-only)". Each parses its words before
+	 * it runs, and the dispatcher (dispatchCommand) checks who may run it, so
+	 * no handler does; an admin command's handler gets the AdminCapability
+	 * the privileged methods demand, and says what it acted on for the audit
+	 * trail. A command's `user_id` may be written `@user_id`, as a client's
+	 * mention sends it (Appendix A.3), and so may an admin command's one
+	 * argument; a mistyped or wrong one is an error to show (`usageErrors:
+	 * "reply"`), like an unknown command, not a policy violation.
+	 */
+	private static readonly commandTable = defineCommands<CommandScope>(({ adminCommand, ownerCommand, registeredCommand, publicCommand }) => [
+		adminCommand({
+			name: "admin", usage: "/admin [remove] <user_id>", help: "make a registered user an admin, or no longer one", usageErrors: "reply",
+			parse: ({ words, usage }) => {
+				// `/admin remove <user_id>` takes one more word than `/admin <user_id>`.
+				const remove = words[1] === "remove";
+				arity(words, remove ? 2 : 1, usage);
+				return { remove, userId: requiredUserId(words[remove ? 2 : 1], usage) };
+			},
+			audit: ({ remove, userId }) => ({ target: userId, action: remove ? "remove" : "grant" }),
+			run: ({ cap, runtime, socket, request, roomId }, { remove, userId }) => runtime.grantAdmin(cap, socket, request, roomId, userId, remove),
+		}),
+		registeredCommand({
+			name: "avatar", usage: "/avatar", help: "set your avatar: send this command with one image attached", usageErrors: "violation",
+			available: (runtime) => runtime.uploadsOn(),
+			parse: ({ body }) => {
+				if (!oneUploadEmbed(body.embeds)) throw usageError("Attach one image to /avatar as an upload embed");
+				return {};
+			},
+			run: ({ runtime, socket, attachment, request }) => runtime.startAvatar(socket, attachment, request),
+		}),
+		publicCommand({
+			name: "embed-append", usage: "/embed-append [markdown]", help: "get a link to stream text into a message that starts with [markdown], such as an LLM's reply: the message appears when the stream starts", usageErrors: "violation", posting: true,
+			available: (runtime) => runtime.liveTextOn(),
+			parse: ({ text }) => liveOpening(text),
+			run: ({ runtime, socket, attachment, request, roomId }, opening) => runtime.liveCommand(socket, attachment, request, roomId, "append", opening),
+		}),
+		publicCommand({
+			name: "embed-terminal", usage: "/embed-terminal [title]", help: "get a link to stream a terminal (80×40) into this room, such as a build: the message appears when the stream starts", usageErrors: "violation", posting: true,
+			available: (runtime) => runtime.liveTextOn(),
+			parse: ({ text }) => liveOpening(text),
+			run: ({ runtime, socket, attachment, request, roomId }, title) => runtime.liveCommand(socket, attachment, request, roomId, "terminal", title),
+		}),
+		ownerCommand({
+			name: "emoji", usage: "/emoji add|remove :name:", help: "add a custom emoji, or replace its image: send /emoji add :name: with one image attached; /emoji remove :name: removes it", usageErrors: "reply",
+			roles: EMOJI_ROLES,
+			available: (runtime) => !!runtime.config.uploads,
+			parse: ({ words, body }) => emojiArgs(words, body),
+			run: ({ grant, runtime, socket, attachment, request, roomId }, args) => runtime.emojiCommand(grant, socket, attachment, request, roomId, args),
+		}),
+		publicCommand({
+			name: "help", usage: "/help", help: "list the commands you can use here", usageErrors: "violation",
+			parse: noArgs,
+			run: (scope) => scope.runtime.sendHelp(scope),
+		}),
+		adminCommand({
+			name: "history", usage: "/history status | export [<room_id>...] | import <key> [dry-run] [match|new] [renumber] [restart] | rebuild-index", help: "show where history is kept; back it up to the backup store, or import a backup or archive (ARCHIVE.md, encrypted or not) from it (running a failed import again finishes it; restart drops it); repair the blob tier's index", usageErrors: "reply",
+			parse: ({ words, usage }, runtime) => historyArgs(words, usage, runtime.historyJobRunning),
+			audit: (args) => ({ action: args.action, target: args.action === "import" ? args.key : args.action === "export" ? args.roomIds.join(" ") : undefined }),
+			run: ({ cap, runtime, socket, request, roomId }, args) => runtime.historyCommand(cap, socket, request, roomId, args),
+		}),
+		ownerCommand({
+			name: "invite-bot", usage: "/invite-bot", help: "get a sign-in token for your bot; a new one replaces the last", usageErrors: "violation",
+			parse: noArgs,
+			run: ({ runtime, socket, attachment, request, roomId }) => runtime.inviteBot(socket, attachment, request, roomId),
+		}),
+		adminCommand({
+			name: "invite-code", usage: "/invite-code <uses>", help: `get a token that signs up to <uses> new users (at most ${MAX_JOIN_USES}) for a week, replacing the last one; /invite-code 0 revokes it`, usageErrors: "reply",
+			parse: ({ words, usage }) => {
+				arity(words, 1, usage);
+				return inviteUses(requiredArg(words[1], usage), MAX_JOIN_USES);
+			},
+			audit: (uses) => ({ action: uses === 0 ? "revoke" : `mint ${uses}` }),
+			run: ({ cap, runtime, socket, request, roomId }, uses) => runtime.invite(cap, socket, request, roomId, uses),
+		}),
+		ownerCommand({
+			name: "invite-device", usage: "/invite-device list|add|remove [<id>]", help: "list, get or revoke tokens that sign in as you on another device", usageErrors: "reply",
+			parse: ({ words, usage }) => deviceArgs(words, usage),
+			run: ({ runtime, socket, attachment, request, roomId }, args) => args.action === "list" ? runtime.listDevices(socket, attachment, request, roomId)
+				: args.action === "add" ? runtime.inviteDevice(socket, attachment, request, roomId, args.id)
+				: runtime.removeDevice(socket, attachment, request, roomId, args.id),
+		}),
+		adminCommand({
+			name: "invite-purge", usage: "/invite-purge <user_id>", help: "sign a user out everywhere, remove their passkeys and tokens, and get a new token for them", usageErrors: "reply",
+			// A second leading `@` is taken off too, as this command always has.
+			parse: ({ words, usage }) => {
+				arity(words, 1, usage);
+				return userIdArg(requiredArg(words[1], usage));
+			},
+			audit: (userId) => ({ target: userId }),
+			run: ({ cap, runtime, socket, attachment, request, roomId }, userId) => runtime.invitePurge(cap, socket, attachment, request, roomId, userId),
+		}),
+		adminCommand({
+			name: "invite-token", usage: "/invite-token <user_id>", help: "create a user who signs in with a token instead of a passkey, and get the token", usageErrors: "reply",
+			// A second leading `@` is taken off too, as this command always has.
+			parse: ({ words, usage }) => {
+				arity(words, 1, usage);
+				return issuableUserId(stripMention(requiredArg(words[1], usage)));
+			},
+			audit: (userId) => ({ target: userId }),
+			run: ({ cap, runtime, socket, attachment, request, roomId }, userId) => runtime.inviteToken(cap, socket, attachment, request, roomId, userId),
+		}),
+		adminCommand({
+			name: "kick", usage: "/kick <user_id>", help: "remove a user from this room", usageErrors: "reply",
+			parse: ({ words, usage }) => {
+				arity(words, 1, usage);
+				return requiredUserId(words[1], usage);
+			},
+			audit: (userId) => ({ target: userId }),
+			run: ({ cap, runtime, socket, attachment, request, roomId }, userId) => runtime.kick(cap, socket, attachment, request, roomId, userId),
+		}),
+		ownerCommand({
+			name: "passkeys", usage: "/passkeys [remove <n>]", help: "list your account's passkeys, or remove one of them", usageErrors: "reply",
+			parse: ({ words }) => passkeysArgs(words),
+			run: ({ runtime, socket, attachment, request, roomId }, args) => runtime.passkeysCommand(socket, attachment, request, roomId, args),
+		}),
+		adminCommand({
+			name: "purge", usage: "/purge <user_id>", help: "disconnect a user and delete their account, bot, and everything they posted or uploaded", usageErrors: "reply",
+			// A second leading `@` is taken off too, as this command always has.
+			parse: ({ words, usage }) => {
+				arity(words, 1, usage);
+				return userIdArg(requiredArg(words[1], usage));
+			},
+			audit: (userId) => ({ target: userId }),
+			run: ({ cap, runtime, socket, attachment, request, roomId }, userId) => runtime.purge(cap, socket, attachment, request, roomId, userId),
+		}),
+		adminCommand({
+			name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", usageErrors: "reply",
+			parse: ({ words, usage }) => {
+				arity(words, 2, usage);
+				const from = requiredUserId(words[1], usage);
+				if (from === ADMIN_USER_ID) throw { name: "denied", message: "The admin user's user_id is fixed" } satisfies ProtocolError;
+				return { from, to: issuableUserId(stripMention(words[2])) };
+			},
+			audit: ({ from, to }) => ({ target: `${from} -> ${to}` }),
+			run: ({ cap, runtime, socket, request, roomId }, { from, to }) => runtime.rename(cap, socket, request, roomId, from, to),
+		}),
+		adminCommand({
+			name: "role", usage: "/role <user_id> [<role>]", help: "show a user's roles, or give or take away one (admin, mod, threader and bot act as such; friend, like any role, raises their posting limits, and admin, mod and friend may use /emoji)", usageErrors: "reply",
+			parse: ({ words, usage }) => {
+				if (words.length !== 2 && words.length !== 3) throw usageError(`Usage: ${usage}`);
+				return { userId: userIdArg(words[1]), ...(words.length === 3 ? { role: words[2].toLowerCase() } : {}) };
+			},
+			audit: ({ userId, role }) => ({ target: userId, action: role ?? "show" }),
+			run: ({ cap, runtime, socket, request, roomId }, { userId, role }) => runtime.role(cap, socket, request, roomId, userId, role),
+		}),
+		adminCommand({
+			name: "server", usage: "/server [title|description [<text>] | avatar]", help: "show this server's title, description and avatar; set one, the avatar with one image attached; or clear one, back to the deployment's", usageErrors: "reply",
+			parse: ({ line, body }, runtime) => serverArgs(line, body, runtime.config.limits),
+			audit: (args) => ({ action: args.field === "show" ? "show" : args.field === "avatar" ? (args.upload ? "avatar" : "avatar clear") : args.value === undefined ? `${args.field} clear` : args.field }),
+			run: ({ cap, runtime, socket, attachment, request, roomId }, args) => runtime.serverCommand(cap, socket, attachment, request, roomId, args),
+		}),
+		adminCommand({
+			name: "status", usage: "/status", help: "show today's Cloudflare usage and the demo's budgets", usageErrors: "violation",
+			parse: noArgs,
+			audit: () => ({}),
+			run: ({ cap, runtime, socket, request, roomId }) => runtime.sendStatus(cap, socket, request, roomId),
+		}),
+		adminCommand({
+			name: "toggle", usage: "/toggle <activity|uploads|presence|addmember|livetext>", help: "turn typing activity, uploads, user status (presence), users adding others to rooms (addmember), or live text (livetext: terminals and appends) off or on for everyone", usageErrors: "reply",
+			parse: ({ words, usage }, runtime) => {
+				arity(words, 1, usage);
+				const word = requiredArg(words[1], usage);
+				const features = runtime.toggleFeatures();
+				return oneOf(word, features, `Usage: /toggle ${features.join("|")}`);
+			},
+			audit: (feature) => ({ target: feature }),
+			run: ({ cap, runtime, socket, request, roomId }, feature) => runtime.toggle(cap, socket, request, roomId, feature),
+		}),
+	]);
+
+	/**
 	 * `command` (§4.1): never logged, broadcast, or saved. The commands are
-	 * COMMANDS, each for its audience and roles; `/help` replies with a
-	 * `~private` notice listing those the sender may run. An unknown
-	 * command is an error the client shows; it is not a policy violation,
-	 * since people mistype.
+	 * commandTable's, each for its audience and roles, run by
+	 * dispatchCommand; `/help` replies with a `~private` notice listing
+	 * those the sender may run. An unknown command is an error the client
+	 * shows; it is not a policy violation, since people mistype.
 	 */
 	private async handleCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		if (!identityOf(attachment)) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
@@ -7668,148 +7928,24 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!body) throw { name: "invalid_params", message: "Missing body" } satisfies ProtocolError;
 		const text = optionalString(body, "text") ?? "";
 		if (!this.roomExists(roomId) || !this.sees(attachment, roomId)) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
-		const line = text.trim();
-		const words = line.startsWith("/") ? line.slice(1).split(/\s+/) : [""];
-		const name = words[0].toLowerCase();
-		const command = this.commands().find((candidate) => candidate.name === name);
-		if (!command) {
-			const message = line.startsWith("/") ? `Unknown command /${name}; try /help` : "A command starts with /; try /help";
-			this.fail(socket, request, { name: "invalid_params", message: message.slice(0, 200) });
-			return;
-		}
-		const owner = attachment.tier === "registered" && !hasRole(attachment, "bot");
-		if (command.audience === "registered" && attachment.tier !== "registered") throw { name: "denied", message: `Sign in with a passkey to use /${name}` } satisfies ProtocolError;
-		if (command.audience === "owners" && !owner) {
-			throw { name: "denied", message: hasRole(attachment, "bot") ? `A bot can't use /${name}` : `Sign in with a passkey to use /${name}` } satisfies ProtocolError;
-		}
-		const admin = owner && hasRole(attachment, "admin");
-		if (command.audience === "admins" && !admin) throw { name: "denied", message: `Only an admin can use /${name}` } satisfies ProtocolError;
-		if (command.roles && !command.roles.some((role) => hasRole(attachment, role))) {
-			throw { name: "denied", message: `/${name} needs one of the roles ${command.roles.join(", ")}` } satisfies ProtocolError;
-		}
-		// Live text starts with its own commands, or in a message (§4.8.3).
-		if (Array.isArray(body.embeds) && body.embeds.some((embed) => !!embed && typeof embed === "object" && ["terminal", "append"].includes((embed as Record<string, unknown>).kind as string))) {
-			throw { name: "invalid_params", message: "A terminal or append embed goes in a message; or use /embed-terminal or /embed-append" } satisfies ProtocolError;
-		}
-		if (command.name === "embed-terminal" || command.name === "embed-append") {
-			await this.liveCommand(socket, attachment, request, roomId, command.name === "embed-terminal" ? "terminal" : "append", text);
-			return;
-		}
-		if (command.name === "invite-bot") {
-			await this.inviteBot(socket, attachment, request, roomId);
-			return;
-		}
-		if (command.name === "invite-device") {
-			try {
-				const action = words[1];
-				const length = action === "list" ? [2] : action === "add" ? [2, 3] : action === "remove" ? [3] : [];
-				if (!length.includes(words.length)) throw { name: "invalid_params", message: `Usage: ${command.usage}` } satisfies ProtocolError;
-				if (action === "list") await this.listDevices(socket, attachment, request, roomId);
-				else if (action === "add") await this.inviteDevice(socket, attachment, request, roomId, words[2]);
-				else await this.removeDevice(socket, attachment, request, roomId, words[2]);
-			} catch (error) {
-				const protocol = errorToProtocol(error);
-				if (protocol.name !== "invalid_params") throw error;
-				this.fail(socket, request, protocol);
-			}
-			return;
-		}
-		if (command.name === "avatar") {
-			await this.startAvatar(socket, attachment, request, body);
-			return;
-		}
-		if (command.name === "emoji") {
-			try {
-				await this.emojiCommand(socket, attachment, request, roomId, words.slice(1), body);
-			} catch (error) {
-				const protocol = errorToProtocol(error);
-				if (protocol.name !== "invalid_params") throw error;
-				this.fail(socket, request, protocol);
-			}
-			return;
-		}
-		if (command.name === "server") {
-			try {
-				await this.serverCommand(socket, attachment, request, roomId, line, body);
-			} catch (error) {
-				const protocol = errorToProtocol(error);
-				if (protocol.name !== "invalid_params") throw error;
-				this.fail(socket, request, protocol);
-			}
-			return;
-		}
-		if (command.name === "passkeys") {
-			try {
-				this.passkeysCommand(socket, attachment, request, roomId, words.slice(1));
-			} catch (error) {
-				const protocol = errorToProtocol(error);
-				if (protocol.name !== "invalid_params") throw error;
-				this.fail(socket, request, protocol);
-			}
-			return;
-		}
-		if (["admin", "role", "kick", "rename", "purge", "toggle", "invite-token", "invite-code", "invite-purge"].includes(command.name)) {
-			try {
-				if (command.name === "role") {
-					if (words.length !== 2 && words.length !== 3) throw { name: "invalid_params", message: `Usage: ${command.usage}` } satisfies ProtocolError;
-					this.role(socket, request, roomId, words[1], words[2]);
-					return;
-				}
-				// `/admin remove <user_id>` takes one more word than `/admin <user_id>`.
-				const revoke = command.name === "admin" && words[1] === "remove";
-				// A user may be written `@user_id`, as a client's mention sends it (Appendix A.3).
-				const target = (revoke ? words[2] : words[1])?.replace(/^@/, "");
-				const argumentCount = command.name === "rename" || revoke ? 2 : 1;
-				if (!target || words.length !== argumentCount + 1) throw { name: "invalid_params", message: `Usage: ${command.usage}` } satisfies ProtocolError;
-				if (command.name === "admin") this.grantAdmin(socket, request, roomId, target, revoke);
-				else if (command.name === "kick") await this.kick(socket, attachment, request, roomId, target);
-				else if (command.name === "purge") await this.purge(socket, attachment, request, roomId, target);
-				else if (command.name === "toggle") this.toggle(socket, request, roomId, target);
-				else if (command.name === "invite-token") await this.inviteToken(socket, attachment, request, roomId, target);
-				else if (command.name === "invite-purge") await this.invitePurge(socket, attachment, request, roomId, target);
-				else if (command.name === "invite-code") await this.invite(socket, request, roomId, target);
-				else await this.rename(socket, request, roomId, target, words[2].replace(/^@/, ""));
-			} catch (error) {
-				// A mistyped or wrong user_id is an error to show, like an unknown
-				// command, not a policy violation.
-				const protocol = errorToProtocol(error);
-				if (protocol.name !== "invalid_params") throw error;
-				this.fail(socket, request, protocol);
-			}
-			return;
-		}
-		if (command.name === "status") {
-			await this.sendStatus(socket, request, roomId);
-			return;
-		}
-		if (command.name === "history") {
-			try {
-				await this.historyCommand(socket, request, roomId, words.slice(1));
-			} catch (error) {
-				const protocol = errorToProtocol(error);
-				if (protocol.name !== "invalid_params") throw error;
-				this.fail(socket, request, protocol);
-			}
-			return;
-		}
-		// The reply a command causes comes before its result (§1).
-		const writes = attachment.tier !== "anonymous" || this.config.guestPosting;
-		const available = this.commands().filter((candidate) => (candidate.audience === "everyone" && (writes || !candidate.name.startsWith("embed-"))) || (candidate.audience === "registered" && attachment.tier === "registered") || (candidate.audience === "owners" && owner && (!candidate.roles || candidate.roles.some((role) => hasRole(attachment, role)))) || admin);
-		this.send(socket, {
-			method: "message",
-			params: {
-				room_id: roomId,
-				from: { ...PRIVATE_IDENTITY },
-				body: { text: available.map((candidate) => `- \`${candidate.usage}\`: ${candidate.help}${candidate.audience === "admins" ? " (admin-only)" : ""}`).join("\n"), format: "markdown" },
-			},
+		await dispatchCommand(ApronDemoServer.commandTable, { socket, attachment, request, roomId, runtime: this }, attachment, text, body, {
+			fail: (error) => this.fail(socket, request, error),
+			protocolOf: errorToProtocol,
+			audit: this.audit,
+			now: nowMs(),
 		});
+	}
+
+	/** `/help`: a `~private` notice listing the commands the sender may run now, before the result (§1). */
+	private sendHelp({ socket, attachment, request, roomId }: CommandScope): void {
+		const posts = attachment.tier !== "anonymous" || this.config.guestPosting;
+		this.sendNotice(socket, roomId, helpText(ApronDemoServer.commandTable.listFor(attachment, this, posts)));
 		this.reply(socket, request, {});
 	}
 
-	/** The commands this deployment offers: `/avatar` only while uploads are on, `/emoji` where they are configured, and `/embed-terminal` and `/embed-append` while live text is on. */
-	private commands(): typeof COMMANDS {
-		return COMMANDS.filter((command) => (command.name !== "avatar" || this.uploadsOn()) && (command.name !== "emoji" || !!this.config.uploads) &&
-			(!command.name.startsWith("embed-") || this.liveTextOn()));
+	/** The features `/toggle` turns off and on here: uploads, presence and live text only where configured. */
+	private toggleFeatures(): ToggleFeature[] {
+		return ["activity", ...(this.config.uploads ? ["uploads" as const] : []), ...(this.config.push ? ["presence" as const] : []), "addmember", ...(this.config.liveText ? ["livetext" as const] : [])];
 	}
 
 	/**
@@ -7888,10 +8024,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * users but admins and bots get `user` `you` with their new
 	 * `permissions`.
 	 */
-	private toggle(socket: WebSocketConnection, request: RequestFrame, roomId: string, feature: string): void {
-		const features: ToggleFeature[] = ["activity", ...(this.config.uploads ? ["uploads" as const] : []), ...(this.config.push ? ["presence" as const] : []), "addmember", ...(this.config.liveText ? ["livetext" as const] : [])];
-		const chosen = features.find((candidate) => candidate === feature);
-		if (!chosen) throw { name: "invalid_params", message: `Usage: /toggle ${features.join("|")}` } satisfies ProtocolError;
+	private toggle(cap: AdminCapability, socket: WebSocketConnection, request: RequestFrame, roomId: string, chosen: ToggleFeature): void {
+		assertAdmin(cap);
 		// Flipped from what is stored, never from a default stood in for it: one that cannot be read refuses the command.
 		this.readToggle(chosen);
 		const on = !(chosen === "uploads" ? this.uploadsOn() : chosen === "presence" ? this.presenceMode() : chosen === "addmember" ? this.addMemberOn() : chosen === "livetext" ? this.liveTextOn() : this.activityOn());
@@ -7959,22 +8093,20 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * result, and a removal is also told to the account's other connections.
 	 * Sessions a removed passkey started stay valid until they expire.
 	 */
-	private passkeysCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, args: string[]): void {
+	private passkeysCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, args: PasskeysArgs): void {
 		const userId = attachment.userId!;
-		const usage = { name: "invalid_params", message: "Usage: /passkeys, or /passkeys remove <n>" } satisfies ProtocolError;
-		if (args.length !== 0 && (args.length !== 2 || args[0] !== "remove" || !/^\d{1,2}$/.test(args[1]))) throw usage;
 		const passkeys = this.store.passkeys(userId, nowMs());
 		const day = (ms: number) => new Date(ms).toISOString().slice(0, 10);
-		if (args.length === 0) {
+		if (args.remove === undefined) {
 			this.sendNotice(socket, roomId, passkeys.length
 				? ["Your passkeys:", ...passkeys.map((key, index) => `${index + 1}. \`${key.credentialId.slice(0, 8)}…\`, added ${day(key.createdMs)}, last used ${day(key.usedMs)}`)].join("\n")
 				: "Your account has no passkey. Register one while signed in to add it.");
 			this.reply(socket, request, {});
 			return;
 		}
-		const chosen = passkeys[Number(args[1]) - 1];
+		const chosen = passkeys[args.remove - 1];
 		if (!chosen) throw { name: "invalid_params", message: `You have ${passkeys.length} passkey${passkeys.length === 1 ? "" : "s"}; see /passkeys` } satisfies ProtocolError;
-		if (!this.store.removePasskey({ userId, credentialId: chosen.credentialId, now: nowMs() })) throw usage;
+		if (!this.store.removePasskey({ userId, credentialId: chosen.credentialId, now: nowMs() })) throw passkeysUsage();
 		// A device that held the removed passkey must not keep getting the
 		// user's messages by push; the user's other devices register again on
 		// their next connection.
@@ -7998,17 +8130,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * with the write's `{embeds: [{embed_id, kind, write_url}]}`, after a
 	 * `~private` notice with the URL in copy-paste recipes. Nothing is posted
 	 * until the write arrives (liveWrite); one that never comes expires.
-	 * The rest of the command line is the terminal's plain title, or the
-	 * append's opening markdown, newlines and all; a non-empty opening, its
-	 * trailing whitespace trimmed, is followed by a paragraph break ("\n\n")
-	 * so the streamed text starts a new paragraph.
+	 * `rest`, the command's text after its first word (liveOpening), is the
+	 * terminal's plain title, or the append's opening markdown, newlines and
+	 * all; a non-empty opening, its trailing whitespace trimmed, is followed
+	 * by a paragraph break ("\n\n") so the streamed text starts a new
+	 * paragraph.
 	 */
-	private async liveCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, kind: LiveKind, text: string): Promise<void> {
+	private async liveCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, kind: LiveKind, rest: string): Promise<void> {
 		const identity = identityOf(attachment);
 		if (!identity) throw { name: "denied", message: "Authenticate first" } satisfies ProtocolError;
 		this.assertMayWrite(attachment);
 		const live = this.config.liveText!;
-		const rest = text.replace(/^\s*\/\S+[ \t]*(?:\r?\n)?/, "");
 		const replyTo = objectParam(request.params, "reply_to", false);
 		const replyId = replyTo === undefined ? undefined : requiredString(replyTo, "message_id");
 		await this.recoverLiveTexts();
@@ -8351,10 +8483,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return { key, output };
 	}
 
-	private async startAvatar(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, body: Record<string, unknown>): Promise<void> {
-		const embeds = body.embeds;
-		const attached = Array.isArray(embeds) && embeds.length === 1 && !!embeds[0] && typeof embeds[0] === "object" && (embeds[0] as Record<string, unknown>).kind === "upload";
-		if (!attached) throw { name: "invalid_params", message: "Attach one image to /avatar as an upload embed" } satisfies ProtocolError;
+	private async startAvatar(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame): Promise<void> {
 		let started = false;
 		await this.runMutation(async () => {
 			const upload = this.store.startAvatarUpload({ userId: attachment.userId!, now: nowMs() });
@@ -8373,18 +8502,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * A removal answers with a `~private` notice before the result (§1). Either
 	 * change publishes a new catalog (publishEmoji).
 	 */
-	private async emojiCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, args: string[], body: Record<string, unknown>): Promise<void> {
-		if (args.length !== 2 || (args[0] !== "add" && args[0] !== "remove")) {
-			throw { name: "invalid_params", message: "Usage: /emoji add :name: with one image attached, or /emoji remove :name:" } satisfies ProtocolError;
-		}
-		const key = args[1];
-		if (!isEmojiKey(key) || key.length - 2 > MAX_EMOJI_NAME_CHARS) {
-			throw { name: "invalid_params", message: `A custom emoji is written :name:, with a name of 1 to ${MAX_EMOJI_NAME_CHARS} letters, digits, _, + or -` } satisfies ProtocolError;
-		}
-		if (args[0] === "add") {
-			const embeds = body.embeds;
-			const attached = Array.isArray(embeds) && embeds.length === 1 && !!embeds[0] && typeof embeds[0] === "object" && (embeds[0] as Record<string, unknown>).kind === "upload";
-			if (!attached) throw { name: "invalid_params", message: `Attach one image to /emoji add ${key} as an upload embed` } satisfies ProtocolError;
+	private async emojiCommand(grant: RoleCapability, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, { action, key }: EmojiArgs): Promise<void> {
+		assertRoles(grant, EMOJI_ROLES);
+		if (action === "add") {
 			let started = false;
 			await this.runMutation(async () => {
 				const upload = this.store.startEmojiUpload({ userId: attachment.userId!, key, now: nowMs() });
@@ -8418,23 +8538,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `~private` notice before the result (§1), and a change sends every
 	 * connection a new `server` frame (announceServer).
 	 */
-	private async serverCommand(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, line: string, body: Record<string, unknown>): Promise<void> {
-		// The text after the field is taken as typed, line breaks included.
-		const [, field = "", rest = ""] = /^\/\S+\s*(\S*)([\s\S]*)$/.exec(line) ?? [];
-		const value = rest.trim();
-		const chosen = field.toLowerCase();
-		const embeds = Array.isArray(body.embeds) ? body.embeds : [];
-		if (chosen !== "avatar" && embeds.length) throw { name: "invalid_params", message: "Only /server avatar takes an attachment" } satisfies ProtocolError;
-		if (!chosen) {
+	private async serverCommand(cap: AdminCapability, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, args: ServerArgs): Promise<void> {
+		assertAdmin(cap);
+		if (args.field === "show") {
 			this.sendNotice(socket, roomId, this.serverOverview());
 			this.reply(socket, request, {});
 			return;
 		}
-		if (chosen === "avatar") {
-			if (value) throw { name: "invalid_params", message: "Usage: /server avatar with one image attached, or alone to clear it" } satisfies ProtocolError;
-			if (embeds.length) {
-				const attached = embeds.length === 1 && !!embeds[0] && typeof embeds[0] === "object" && (embeds[0] as Record<string, unknown>).kind === "upload";
-				if (!attached) throw { name: "invalid_params", message: "Attach one image to /server avatar as an upload embed" } satisfies ProtocolError;
+		if (args.field === "avatar") {
+			if (args.upload) {
 				let started = false;
 				await this.runMutation(async () => {
 					const upload = this.store.startServerAvatarUpload({ userId: attachment.userId!, now: nowMs() });
@@ -8454,15 +8566,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.reply(socket, request, {});
 			return;
 		}
-		if (chosen !== "title" && chosen !== "description") throw { name: "invalid_params", message: "Usage: /server, /server title|description [<text>], or /server avatar" } satisfies ProtocolError;
-		if (chosen === "title" && !validServerTitle(value, this.config.limits)) {
-			throw { name: "invalid_params", message: `A server title is one line of at most ${this.config.limits.maxNameCodePoints} characters` } satisfies ProtocolError;
-		}
-		if (chosen === "description" && !validServerDescription(value)) {
-			throw { name: "invalid_params", message: `A server description is CommonMark of at most ${MAX_SERVER_DESCRIPTION_BYTES} bytes` } satisfies ProtocolError;
-		}
+		const chosen = args.field;
 		const before = this.storedServerMetadata()[chosen];
-		const next = value || undefined;
+		const next = args.value;
 		if (next !== before) {
 			await this.runMutation(async () => {
 				this.store.setServerText(chosen, next, nowMs());
@@ -8592,8 +8698,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * it until they load history again. They may register a new passkey. The
 	 * sender gets a `~private` notice before the result (§1).
 	 */
-	private async purge(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, target: string): Promise<void> {
-		const userId = target.replace(/^@/, "");
+	private async purge(cap: AdminCapability, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: UserIdArg): Promise<void> {
+		assertAdmin(cap);
 		if (userId === attachment.userId) throw { name: "denied", message: "You can't purge yourself" } satisfies ProtocolError;
 		if (userId === ADMIN_USER_ID) throw { name: "denied", message: "The admin user can't be purged" } satisfies ProtocolError;
 		if (!this.store.identityExists(userId) && !this.connectionsOf(userId).length) {
@@ -8744,10 +8850,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * A.4). A taken `user_id` is `invalid_params`. The token does not expire;
 	 * `/purge` revokes it, and `/rename` moves it.
 	 */
-	private async inviteToken(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, target: string): Promise<void> {
-		const userId = target.replace(/^@/, "");
-		if (userId === ADMIN_USER_ID) throw { name: "invalid_params", message: `The user_id ${userId} is taken` } satisfies ProtocolError;
-		assertIssuableUserId(userId);
+	private async inviteToken(cap: AdminCapability, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: IssuableUserId): Promise<void> {
+		assertAdmin(cap);
 		await this.runMutation(async () => {
 			const created = this.store.createInvitedIdentity({ userId, name: userId, now: nowMs(), ipKey: attachment.ipKey });
 			// The new user's logged join of `general` goes to its members (§4.2.2).
@@ -8777,8 +8881,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `/invite-token` gives it. Their account, posts and bot stay. Not the
 	 * sender, `admin`, or a bot; an unknown user is `invalid_params`.
 	 */
-	private async invitePurge(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, target: string): Promise<void> {
-		const userId = target.replace(/^@/, "");
+	private async invitePurge(cap: AdminCapability, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: UserIdArg): Promise<void> {
+		assertAdmin(cap);
 		if (userId === attachment.userId) throw { name: "denied", message: "You can't /invite-purge yourself" } satisfies ProtocolError;
 		if (userId === ADMIN_USER_ID) throw { name: "denied", message: "The admin user signs in with APRON_ADMIN_TOKEN only" } satisfies ProtocolError;
 		if (isBotId(userId)) throw { name: "denied", message: "A bot signs in with its token only; its owner replaces it with /invite-bot" } satisfies ProtocolError;
@@ -8956,26 +9060,26 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * environment has) and reports what it added, or would; `rebuild-index`
 	 * lists the blob tiers' stores to rebuild their segment indexes.
 	 */
-	private async historyCommand(socket: WebSocketConnection, request: RequestFrame, roomId: string, words: string[]): Promise<void> {
-		const usage = (): never => { throw { name: "invalid_params", message: `Usage: ${COMMANDS.find((entry) => entry.name === "history")!.usage}` } satisfies ProtocolError; };
+	private async historyCommand(cap: AdminCapability, socket: WebSocketConnection, request: RequestFrame, roomId: string, args: HistoryArgs): Promise<void> {
+		assertAdmin(cap);
 		const now = nowMs();
 		const done = (text: string) => {
 			this.sendNotice(socket, roomId, text);
 			this.reply(socket, request, {});
 		};
-		if (words[0] === "export" || words[0] === "import") {
+		if (args.action === "export" || args.action === "import") {
+			// historyArgs refused it already while one runs; nothing awaited since.
 			if (this.historyJobRunning) throw { name: "invalid_params", message: "Another history export or import is running; try again when it ends" } satisfies ProtocolError;
 			this.historyJobRunning = true;
 			try {
-				await this.historyJob(words, done, usage);
+				await this.historyJob(cap, args, done);
 			} finally {
 				this.historyJobRunning = false;
 			}
 			return;
 		}
-		switch (words[0]) {
+		switch (args.action) {
 			case "status": {
-				if (words.length !== 1) usage();
 				const lines = await this.historyStatus(now);
 				const pipeline = this.archivePipeline();
 				const views = await pipeline.views();
@@ -8987,7 +9091,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return;
 			}
 			case "rebuild-index": {
-				if (words.length !== 1) usage();
 				const rebuilt: string[] = [];
 				for (const tier of this.history?.tiers ?? []) {
 					// Adds what the index lacks, from the tier's floor up: a failure partway leaves it no worse.
@@ -8998,17 +9101,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 				done(rebuilt.length ? `Rebuilt ${rebuilt.join(", ")}.` : "No blob tier to rebuild.");
 				return;
 			}
-			default:
-				usage();
 		}
 	}
 
 	/** `/history export` and `/history import` (historyCommand), one at a time. */
-	private async historyJob(words: string[], done: (text: string) => void, usage: () => never): Promise<void> {
-		switch (words[0]) {
+	private async historyJob(cap: AdminCapability, args: Extract<HistoryArgs, { action: "export" | "import" }>, done: (text: string) => void): Promise<void> {
+		assertAdmin(cap);
+		switch (args.action) {
 			case "export": {
 				const target = this.backupTarget();
-				const roomIds = words.slice(1);
+				const roomIds = args.roomIds;
 				let result: Awaited<ReturnType<typeof writeBackup>>;
 				try {
 					result = await writeBackup(this.archivePipeline(), target.store, target.settings, {
@@ -9023,9 +9125,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return;
 			}
 			case "import": {
-				const key = words[1];
-				const flags = new Set(words.slice(2));
-				if (!key || [...flags].some((flag) => !["dry-run", "match", "new", "renumber", "restart"].includes(flag)) || (flags.has("match") && flags.has("new"))) usage();
+				const key = args.key;
 				const target = this.backupTarget();
 				const object = await target.store.get(key);
 				if (!object) throw { name: "invalid_params", message: `No backup ${key}` } satisfies ProtocolError;
@@ -9034,10 +9134,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 				let report: ImportReport;
 				try {
 					report = await importArchive(this.archivePipeline(), archiveReader(lines, this.backupKeys()), {
-						clock: { now: nowMs }, server: this.archiveHeader().server, dryRun: flags.has("dry-run"),
-						users: flags.has("match") ? "match" : flags.has("new") ? "new" : defaults?.users ?? "auto",
-						ids: flags.has("renumber") ? "renumber" : defaults?.ids ?? "original",
-						restart: flags.has("restart"),
+						clock: { now: nowMs }, server: this.archiveHeader().server, dryRun: args.dryRun,
+						users: args.users ?? defaults?.users ?? "auto",
+						ids: args.renumber ? "renumber" : defaults?.ids ?? "original",
+						restart: args.restart,
 					});
 				} catch (error) {
 					// A missing key, a damaged backup or an unreadable file: said plainly, nothing written.
@@ -9058,8 +9158,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 				}
 				return;
 			}
-			default:
-				usage();
 		}
 	}
 
@@ -9105,8 +9203,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `admin` role; `/admin remove <user_id>` takes it away (not from `admin`
 	 * itself). The sender gets a `~private` notice before the result (§1).
 	 */
-	private grantAdmin(socket: WebSocketConnection, request: RequestFrame, roomId: string, userId: string, remove = false): void {
-		const { changed, who } = this.changeRole(userId, "admin", !remove);
+	private grantAdmin(cap: AdminCapability, socket: WebSocketConnection, request: RequestFrame, roomId: string, userId: UserIdArg, remove: boolean): void {
+		assertAdmin(cap);
+		const { changed, who } = this.changeRole(cap, userId, "admin", !remove);
 		const text = remove
 			? (changed ? `${who} is no longer an admin.` : `${who} was not an admin.`)
 			: (changed ? `${who} is now an admin.` : `${who} is already an admin.`);
@@ -9125,9 +9224,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * limits. The sender gets a
 	 * `~private` notice before the result (§1).
 	 */
-	private role(socket: WebSocketConnection, request: RequestFrame, roomId: string, target: string, requested?: string): void {
-		const userId = target.replace(/^@/, "");
-		if (requested === undefined) {
+	private role(cap: AdminCapability, socket: WebSocketConnection, request: RequestFrame, roomId: string, userId: UserIdArg, role?: string): void {
+		assertAdmin(cap);
+		if (role === undefined) {
 			const identity = userId.startsWith("guest_") ? null : this.store.getIdentity(userId);
 			if (!identity) throw { name: "invalid_params", message: `No registered user has the user_id ${userId}`.slice(0, 200) } satisfies ProtocolError;
 			const who = `**${identity.name || userId}** (\`${userId}\`)`;
@@ -9135,8 +9234,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.reply(socket, request, {});
 			return;
 		}
-		const role = requested.toLowerCase();
-		const { changed, on, who } = this.changeRole(userId, role);
+		const { changed, on, who } = this.changeRole(cap, userId, role);
 		const text = on
 			? (changed ? `${who} now has the role \`${role}\`.` : `${who} already has the role \`${role}\`.`)
 			: (changed ? `${who} no longer has the role \`${role}\`.` : `${who} did not have the role \`${role}\`.`);
@@ -9151,7 +9249,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * connections and `new` to those who share a room with them, with
 	 * `roles: []` when the last role went.
 	 */
-	private changeRole(userId: string, role: string, on?: boolean): { changed: boolean; on: boolean; who: string } {
+	private changeRole(cap: AdminCapability, userId: string, role: string, on?: boolean): { changed: boolean; on: boolean; who: string } {
+		assertAdmin(cap);
 		const result = this.store.setRole({ userId, role, on, now: nowMs() });
 		const who = `**${result.name || userId}** (\`${userId}\`)`;
 		if (result.changed) {
@@ -9175,7 +9274,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `room_update` `left`; they may join again. The limits charged are the
 	 * admin's. The sender gets a `~private` notice before the result (§1).
 	 */
-	private async kick(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: string): Promise<void> {
+	private async kick(cap: AdminCapability, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: UserIdArg): Promise<void> {
+		assertAdmin(cap);
 		if (userId === attachment.userId) throw { name: "denied", message: "You can't kick yourself; leave the room instead" } satisfies ProtocolError;
 		// Thrown after the mutation: runMutation treats any other error as fatal.
 		if (!await this.removeMember(attachment, roomId, userId)) throw { name: "invalid_params", message: `${userId} is not in this room`.slice(0, 200) } satisfies ProtocolError;
@@ -9253,10 +9353,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * again. Sessions and the user's bot keep the old `user_id`: a session for
 	 * it is `denied`, and the passkey signs in as the new one.
 	 */
-	private async rename(socket: WebSocketConnection, request: RequestFrame, roomId: string, from: string, to: string): Promise<void> {
-		if (from === ADMIN_USER_ID) throw { name: "denied", message: "The admin user's user_id is fixed" } satisfies ProtocolError;
-		if (to === ADMIN_USER_ID) throw { name: "invalid_params", message: `The user_id ${to} is taken` } satisfies ProtocolError;
-		assertIssuableUserId(to);
+	private async rename(cap: AdminCapability, socket: WebSocketConnection, request: RequestFrame, roomId: string, from: UserIdArg, to: IssuableUserId): Promise<void> {
+		assertAdmin(cap);
 		const renamed = this.store.renameIdentity({ from, to, now: nowMs() });
 		// Before any await: from the commit on, nothing on this object acts as the retired user_id.
 		this.moveUserState(from, to);
@@ -9320,7 +9418,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * when account analytics are configured, at most once a minute), and the
 	 * object's own daily reservations against their budgets.
 	 */
-	private async sendStatus(socket: WebSocketConnection, request: RequestFrame, roomId: string): Promise<void> {
+	private async sendStatus(cap: AdminCapability, socket: WebSocketConnection, request: RequestFrame, roomId: string): Promise<void> {
+		assertAdmin(cap);
 		const now = nowMs();
 		// Read alongside the usage refresh; left out where it is not configured.
 		const active = activeUsersConfigured(this.runtimeEnv) ? this.activeUsersStatus(now) : undefined;
