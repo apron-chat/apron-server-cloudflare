@@ -90,8 +90,8 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead {
 	published = 1;
 	queued: QueuedOp[] = [];
 	private seq = 0;
-	readonly rooms = new Map<string, ArchivedRoom>();
-	readonly users = new Map<string, ArchivedUser>();
+	readonly rooms_ = new Map<string, ArchivedRoom>();
+	readonly people = new Map<string, ArchivedUser>();
 	readonly retired = new Set<string>();
 	private last = 0;
 
@@ -110,7 +110,7 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead {
 			this.records.set(`${logId}\u0000${room}`, record);
 			if (room === roomId) made = record;
 		}
-		if (!this.rooms.has(roomId)) this.rooms.set(roomId, { listing: { room_id: roomId }, joined: false });
+		if (!this.rooms_.has(roomId)) this.rooms_.set(roomId, { listing: { room_id: roomId }, joined: false });
 		return made;
 	}
 
@@ -143,7 +143,7 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead {
 	override async purge(userIds: readonly string[], messageIds: readonly string[] = []): Promise<PurgeResult> {
 		const result = await super.purge(userIds, messageIds);
 		for (const id of userIds) {
-			this.users.delete(id);
+			this.people.delete(id);
 			this.retired.add(id);
 		}
 		await this.queueOp({ op: "purge", userIds: [...userIds], messageIds: [...new Set([...messageIds, ...result.messageIds])] });
@@ -152,10 +152,10 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead {
 
 	override async rename(from: string, to: string): Promise<void> {
 		await super.rename(from, to);
-		const user = this.users.get(from);
+		const user = this.people.get(from);
 		if (user) {
-			this.users.delete(from);
-			this.users.set(to, { ...user, user_id: to });
+			this.people.delete(from);
+			this.people.set(to, { ...user, user_id: to });
 		}
 		this.retired.add(from);
 		await this.queueOp({ op: "rename", from, to });
@@ -170,11 +170,11 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead {
 	}
 
 	async hasRoom(roomId: string): Promise<boolean> {
-		return this.rooms.has(roomId);
+		return this.rooms_.has(roomId);
 	}
 
 	async hasUser(userId: string): Promise<boolean> {
-		return this.users.has(userId);
+		return this.people.has(userId);
 	}
 
 	async isRetired(userId: string): Promise<boolean> {
@@ -182,12 +182,24 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead {
 	}
 
 	async restoreRoom(room: ArchivedRoom, records: readonly ChatRecord[]): Promise<void> {
-		this.rooms.set(room.listing.room_id, room);
+		this.rooms_.set(room.listing.room_id, room);
 		await this.append(toRange(records));
 		for (const record of records) this.last = Math.max(this.last, record.log_id);
 	}
 
+	async rooms(): Promise<ArchivedRoom[]> {
+		return [...this.rooms_.values()];
+	}
+
+	async users(userIds: readonly string[]): Promise<ArchivedUser[]> {
+		return userIds.flatMap((id) => this.people.get(id) ?? []);
+	}
+
+	async latest(): Promise<number> {
+		return this.last;
+	}
+
 	async restoreUsers(users: readonly ArchivedUser[]): Promise<void> {
-		for (const user of users) if (!this.users.has(user.user_id)) this.users.set(user.user_id, { ...user, roles: ["unclaimed"] });
+		for (const user of users) if (!this.people.has(user.user_id)) this.people.set(user.user_id, { ...user, roles: ["unclaimed"] });
 	}
 }

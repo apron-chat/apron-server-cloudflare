@@ -84,6 +84,12 @@ export interface HistoryHead extends RewritableTier {
 	restoreUsers(users: readonly ArchivedUser[]): Promise<void>;
 	/** Import only: whether a user ID is retired (purged or renamed away) and may not be reused. */
 	isRetired?(userId: string): Promise<boolean>;
+	/** Export: every room, as a listing (`room_list`'s shape) with its members. */
+	rooms?(): Promise<ArchivedRoom[]>;
+	/** Export: these users' profiles, as far as they exist here. */
+	users?(userIds: readonly string[]): Promise<ArchivedUser[]>;
+	/** The newest log ID given here (import's renumbering). */
+	latest?(): Promise<number>;
 }
 
 /** Per-tier progress, persisted in the head's `_meta` under `history:<tier>:<field>`. */

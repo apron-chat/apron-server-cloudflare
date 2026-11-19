@@ -2,10 +2,16 @@ import * as budget from "./budget.ts";
 import { DEFAULT_FEATURES, DEFAULT_LIMITS, LIVE_TEXT_POLICY, MAX_PUSH_CANDIDATES, MAX_PUSHES_PER_MESSAGE, MAX_STATUS_DELAY_SECONDS, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, type Limits, type LiveTextPolicy, type PushPolicy } from "./budget.ts";
 import { billCap, type BillCap } from "./pricing.ts";
 import { base64UrlDecode, P256_PRIVATE_KEY_BYTES, P256_PUBLIC_KEY_BYTES, vapidKeysMatch, type VapidKeys } from "./webpush.ts";
+import { HISTORY_LIMIT_VARS, type HistorySettings, historyLimits, parseHistorySettings } from "./history/settings.ts";
 export { DEFAULT_LIMITS } from "./budget.ts";
 
 export interface RuntimeConfig {
 	limits: Limits;
+	/**
+	 * The history pipeline as the `HISTORY` var composes it (src/history/settings.ts,
+	 * PLAN §13.1); without it, the default tiers from the LIMIT_* vars.
+	 */
+	history?: HistorySettings;
 	allowedOrigins: readonly string[];
 	rpId: string;
 	rpOrigins: readonly string[];
@@ -547,6 +553,19 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 	for (const name of Object.keys(env)) {
 		if (name.startsWith("LIMIT_") && !limitNames.has(name)) throw new ConfigError(`${name} is not a limit (docs/configuration.md)`);
 	}
+	// `HISTORY` sets history's limits itself; a LIMIT_* var for one of them too would leave it unclear which wins.
+	let history: HistorySettings | undefined;
+	const historyVar = (env as Record<string, unknown>).HISTORY;
+	if (historyVar !== undefined && historyVar !== "") {
+		try {
+			history = parseHistorySettings(historyVar);
+		} catch (error) {
+			throw new ConfigError(error instanceof Error ? error.message : String(error));
+		}
+		const both = HISTORY_LIMIT_VARS.filter((name) => (env as Record<string, unknown>)[name] !== undefined);
+		if (both.length) throw new ConfigError(`HISTORY sets history's limits: remove ${both.join(", ")}`);
+		Object.assign(limits, historyLimits(history));
+	}
 	Object.assign(limits, overrides);
 	for (const [key, value] of Object.entries(limits)) {
 		if (!validLimitValue(key, value)) throw limitError(key);
@@ -608,6 +627,7 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 	}
 	return {
 		limits,
+		...(history ? { history } : {}),
 		allowedOrigins,
 		rpId,
 		rpOrigins,
