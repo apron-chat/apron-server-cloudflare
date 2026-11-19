@@ -5328,8 +5328,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			return true;
 		}
 		// Created on first use, named as its remote user_id until a `me` names it.
-		const shadow = this.store.ensureShadow({ userId, remote, name: fitName(remoteUserId, this.config.limits), now: nowMs(), ipKey: attachment.ipKey });
-		const actor: ActAs = { identity: { user_id: userId, ...(shadow.name ? { name: shadow.name } : {}), tier: "registered" }, link, remote };
+		const name = this.store.ensureShadow({ userId, remote, name: fitName(remoteUserId, this.config.limits), now: nowMs(), ipKey: attachment.ipKey });
+		const actor: ActAs = { identity: { user_id: userId, ...(name ? { name } : {}), tier: "registered" }, link, remote };
 		if (method === "message") await this.handleMessage(socket, attachment, request, actor);
 		else if (method === "reactions") await this.handleReactions(socket, attachment, request, actor);
 		else if (method === "room_set") await this.shadowRoomSet(socket, attachment, request, actor);

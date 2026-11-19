@@ -255,8 +255,7 @@ it('never signs a link out as an idle bot, nor prunes a shadow as an idle accoun
 		sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('idle_activity_since', ?)", String(clock.now - 365 * day));
 		const { userId: linkId } = store.createRemoteLink({ server: 'ws://a.example/ws', name: 'Link bot', roomId: 'general', now: clock.now, ipKey: 'ip' });
 		expect(store.remoteLink(linkId)).toBe('ws://a.example/ws');
-		const shadow = store.ensureShadow({ userId: 'carol@a.example', remote: { server: 'ws://a.example/ws', user_id: 'carol' }, name: 'carol', now: clock.now, ipKey: 'ip' });
-		expect(shadow).toEqual({ name: 'carol', created: true });
+		expect(store.ensureShadow({ userId: 'carol@a.example', remote: { server: 'ws://a.example/ws', user_id: 'carol' }, name: 'carol', now: clock.now, ipKey: 'ip' })).toBe('carol');
 		// The same id for another server's user is refused (two addresses, one authority).
 		expect(() => store.ensureShadow({ userId: 'carol@a.example', remote: { server: 'wss://a.example/ws', user_id: 'carol' }, name: 'carol', now: clock.now, ipKey: 'ip' })).toThrow(/another server/);
 		// An ordinary bot and an ordinary account, idle as long as the link and the shadow.
@@ -267,8 +266,6 @@ it('never signs a link out as an idle bot, nor prunes a shadow as an idle accoun
 		sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('bot_sweep_ms', '1')");
 		expect(store.idleBots({ now: clock.now, before: clock.now - 7 * day, limit: 10, intervalMs: day, graceMs: day })).toEqual(['plain_bot']);
 		expect(store.pruneIdleIdentities(clock.now).pruned).toEqual(['plain']);
-		expect(store.removeRemoteLink(linkId)).toBe(true);
-		expect(store.remoteLink(linkId)).toBeUndefined();
 	});
 });
 

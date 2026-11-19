@@ -5422,7 +5422,7 @@ export class Store {
     return this.metaJson(META_REMOTE_LINKS, (stored) => {
       const links: Record<string, RemoteLink> = {};
       for (const [userId, link] of Object.entries(stored as Record<string, unknown>)) {
-        if (isPlainObject(link) && typeof link.server === "string") links[userId] = { server: link.server, created_ms: integerColumn(link.created_ms) };
+        if (isPlainObject(link) && typeof link.server === "string") links[userId] = { server: link.server };
       }
       return links;
     }, {});
@@ -5506,20 +5506,14 @@ export class Store {
   }
 
   /**
-   * The threads of `parents` (ext:remote: a thread of a shared room is
-   * shared with it): each with its parent, the log ID it was made at, and
-   * who made it. A scan of the capped public range of the rooms table.
+   * The threads of `parentId` (ext:remote: a thread of a shared room is
+   * shared with it). A scan of the capped public range of the rooms table.
    */
-  threadsOf(parents: readonly string[], now = this.clock.now()): Array<{ room_id: string; parent: string; created_log_id: number; creator?: string }> {
+  threadsOf(parentId: string, now = this.clock.now()): string[] {
     this.ensureReady();
-    if (!parents.length) return [];
-    return this.reserved({ reads: 8 + MAX_THREAD_LIMIT + 2 }, false, now, () => this.rawRows<{ room_id: string; parent_room_id: string; created_log_id: number; fields_json: string }>(
-      `SELECT room_id, parent_room_id, created_log_id, fields_json FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IN (SELECT value FROM json_each(?)) LIMIT ?`,
-      JSON.stringify([...new Set(parents)]), MAX_THREAD_LIMIT + 1,
-    ).map((row) => {
-      const creator = storedCreator(row.fields_json);
-      return { room_id: row.room_id, parent: row.parent_room_id, created_log_id: integerColumn(row.created_log_id), ...(creator ? { creator } : {}) };
-    }));
+    return this.reserved({ reads: 8 + MAX_THREAD_LIMIT + 2 }, false, now, () => this.rawRows<{ room_id: string }>(
+      `SELECT room_id FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id = ? LIMIT ?`, parentId, MAX_THREAD_LIMIT + 1,
+    ).map((row) => row.room_id));
   }
 
   /** Whether another user removed a remote user from a room (ext:remote: `remote_left`), so its link may not join it again. */
@@ -5548,21 +5542,9 @@ export class Store {
     });
     const created = this.createKeylessIdentity({
       userId, name: input.name, tier: "registered", roles: ["bot"], now: input.now, ipKey: input.ipKey, rooms: [input.roomId],
-      onCreate: () => this.writeRemoteLinks({ ...this.readRemoteLinks(), [userId]: { server: input.server, created_ms: input.now } }),
+      onCreate: () => this.writeRemoteLinks({ ...this.readRemoteLinks(), [userId]: { server: input.server } }),
     });
     return { userId, broadcasts: created.broadcasts };
-  }
-
-  /** `/remote revoke`: unbinds a link account (ext:remote); its account and posts stay. Whether it was one. */
-  removeRemoteLink(userId: string, now = this.clock.now()): boolean {
-    this.ensureReady();
-    return this.reserved({ reads: 4, writes: 4 }, false, now, () => this.transaction(() => {
-      const links = this.readRemoteLinks();
-      if (!Object.hasOwn(links, userId)) return false;
-      delete links[userId];
-      this.writeRemoteLinks(links);
-      return true;
-    }));
   }
 
   /**
@@ -5575,7 +5557,7 @@ export class Store {
    * addresses with one authority) is `denied`, and so is a shadow an admin
    * purged, until its id is freed. Returns its name.
    */
-  ensureShadow(input: { userId: string; remote: RemoteUser; name: string; now: number; ipKey: string }): { name: string; created: boolean } {
+  ensureShadow(input: { userId: string; remote: RemoteUser; name: string; now: number; ipKey: string }): string {
     this.ensureReady();
     const found = this.reserved({ reads: 8 }, false, input.now, () => ({
       row: this.identityRow(input.userId), purged: this.metaValue(META_PURGED_PREFIX + input.userId) !== "",
@@ -5585,14 +5567,14 @@ export class Store {
       if (!remote || remote.server !== input.remote.server || remote.user_id !== input.remote.user_id) {
         throw new StoreError("denied", `${input.userId} stands for a user of another server`.slice(0, 200));
       }
-      return { name: found.row.name, created: false };
+      return found.row.name;
     }
     if (found.purged) throw new StoreError("denied", `${input.userId} was removed here`.slice(0, 200));
     this.createKeylessIdentity({
       userId: input.userId, name: input.name, tier: "registered", now: input.now, ipKey: input.ipKey,
       rooms: [], ext: { remote: { server: input.remote.server, user_id: input.remote.user_id } }, uncharged: true,
     });
-    return { name: input.name, created: true };
+    return input.name;
   }
 
   /** The room a retained message is in now, whoever may see it; null when unknown or expired. One indexed read. */

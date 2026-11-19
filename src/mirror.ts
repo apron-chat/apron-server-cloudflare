@@ -165,7 +165,7 @@ export class RemoteRooms {
 		} else if (!this.store.isRoomMember(roomId, linkId, this.now())) {
 			await this.host.addMember({ ipKey: client.ipKey, userId: client.userId }, roomId, linkId);
 		}
-		for (const thread of this.store.threadsOf([roomId], this.now())) await this.joinThread(linkId!, thread.room_id);
+		for (const thread of this.store.threadsOf(roomId, this.now())) await this.joinThread(linkId!, thread);
 		const token = await this.host.mintLinkToken(linkId!);
 		this.host.notice(socket, roomId, [
 			`To mirror this room on ${server}, an admin there runs \`/remote connect\` with this invite. It holds a token of this server's link for that server (\`${linkId}\`), which reads this room and writes in it as that server's users, so hand it over privately. \`/remote unshare\` here stops every mirror of this room; \`/remote revoke ${server}\` stops that server's.`,
@@ -251,7 +251,7 @@ export class RemoteRooms {
 			return;
 		}
 		const removed: string[] = [];
-		const threads = this.store.threadsOf([roomId], this.now()).map((thread) => thread.room_id);
+		const threads = this.store.threadsOf(roomId, this.now());
 		for (const [linkId, link] of Object.entries(this.store.remoteLinks(this.now()))) {
 			for (const room of [roomId, ...threads]) {
 				if (this.store.isRoomMember(room, linkId, this.now()) && await this.host.removeMember({ ipKey: client.ipKey, userId: client.userId }, room, linkId) && room === roomId) removed.push(link.server);
@@ -394,7 +394,7 @@ export class RemoteRooms {
 			const suffix = `@${remoteAuthority(server)}`;
 			// After the mutation that logged the leave (this hook runs inside it).
 			void (async () => {
-				for (const room of [roomId, ...this.store.threadsOf([roomId], this.now()).map((thread) => thread.room_id)]) {
+				for (const room of [roomId, ...this.store.threadsOf(roomId, this.now())]) {
 					for (const user of this.store.roomMembers([room], REMOTE_MEMBERS_LIMIT, this.now()).get(room) ?? []) {
 						if (user.user_id.endsWith(suffix)) await this.host.removeMember({ ipKey: MIRROR_IP_KEY }, room, user.user_id);
 					}
@@ -805,8 +805,7 @@ export class RemoteRooms {
 		if (remoteUserIdError(origin.user_id)) return undefined;
 		const id = shadowUserId(origin.server, origin.user_id);
 		try {
-			const shadow = this.store.ensureShadow({ userId: id, remote: origin, name: (name ?? origin.user_id).slice(0, 64), now: this.now(), ipKey: MIRROR_IP_KEY });
-			return { userId: id, remote: origin, name: shadow.name };
+			return { userId: id, remote: origin, name: this.store.ensureShadow({ userId: id, remote: origin, name: (name ?? origin.user_id).slice(0, 64), now: this.now(), ipKey: MIRROR_IP_KEY }) };
 		} catch {
 			return undefined;
 		}

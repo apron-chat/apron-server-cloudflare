@@ -18,7 +18,6 @@ export const REMOTE_LINK_PREFIX = "link_";
 /** A link account's binding, as `_meta` `remote_links` keeps it by the link's `user_id`. */
 export interface RemoteLink {
 	server: string;
-	created_ms: number;
 }
 
 /** The server-owned `remote` of a link (`user.ext.remote`): its server, with no `user_id`. */
