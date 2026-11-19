@@ -97,9 +97,9 @@ it('/remote invite creates a link bound to the address, in the private room, wit
 	} finally { admin.close(); link.close(); }
 });
 
-it('runs a link\'s message as a shadow user that joins the room, and keeps ext.remote across saves', async () => {
+it('runs a link\'s message as a remote user that joins the room, and keeps ext.remote across saves', async () => {
 	const server = 'ws://127.0.0.1:8081/ws';
-	const { admin, link, linkId, roomId } = await linked(server);
+	const { admin, link, roomId } = await linked(server);
 	const remoteId = unique('carol');
 	const shadowId = `${remoteId}@127.0.0.1:8081`;
 	try {
@@ -107,7 +107,7 @@ it('runs a link\'s message as a shadow user that joins the room, and keeps ext.r
 			room_id: roomId, body: { text: 'hello from A' },
 			ext: { remote: { server: 'wss://forged.example/ws', user_id: remoteId, room_id: 'ops', message_id: '1724803599120' }, other: 1 },
 		} });
-		// The shadow's logged join, then the message, reach the room's members.
+		// The remote user's logged join, then the message, reach the room's members.
 		const join = await until(admin, (frame) => frame.method === 'room_update' && frame.params.memberships?.[0]?.members?.[0]?.user?.user_id === shadowId);
 		expect(join.frame.params.memberships[0].members[0]).toEqual({
 			user: { user_id: shadowId, name: remoteId, ext: { remote: { server, user_id: remoteId } } }, joined: true,
@@ -119,13 +119,13 @@ it('runs a link\'s message as a shadow user that joins the room, and keeps ext.r
 		const reply = await until(link, (frame) => frame.id === 'post');
 		expect(reply.frame.result).toEqual({ message_id: posted.message_id });
 
-		// The shadow is a member with the server-owned ext.remote.
+		// The remote user is a member with the server-owned ext.remote.
 		const members = await request(admin, 'members', 'room_list', { room_id: roomId, members: true });
 		expect(members.result.joined[0].members.map((member: { user_id: string }) => member.user_id)).toContain(shadowId);
 		const shadow = members.result.users.find((member: { user_id: string }) => member.user_id === shadowId);
 		expect(shadow).toMatchObject({ user_id: shadowId, roles: [], ext: { remote: { server, user_id: remoteId } } });
 
-		// A save as the shadow keeps from and the remote IDs; the link itself is not the author.
+		// A save as the remote user keeps from and the remote IDs; the link itself is not the author.
 		const saved = await request(link, 'save', 'message', { message_id: posted.message_id, room_id: roomId, body: { text: 'edited on A' }, ext: { remote: { user_id: remoteId } } });
 		expect(saved.result).toEqual({ message_id: posted.message_id });
 		const edit = (await until(admin, (frame) => frame.method === 'message' && frame.params.message_id === posted.message_id && frame.params.body?.text === 'edited on A')).frame.params;
@@ -137,7 +137,7 @@ it('runs a link\'s message as a shadow user that joins the room, and keeps ext.r
 		const otherSave = await request(link, 'other-save', 'message', { message_id: posted.message_id, room_id: roomId, body: { text: 'x' }, ext: { remote: { user_id: unique('mallory') } } });
 		expect(otherSave.error.code).toBe(DENIED);
 
-		// A delete as the shadow is a tombstone, which carries no ext (§4.13).
+		// A delete as the remote user is a tombstone, which carries no ext (§4.13).
 		const deleted = await request(link, 'delete', 'message', { message_id: posted.message_id, room_id: roomId, deleted: true, ext: { remote: { user_id: remoteId } } });
 		expect(deleted.result).toEqual({ message_id: posted.message_id });
 		const tombstone = (await until(admin, (frame) => frame.method === 'message' && frame.params.message_id === posted.message_id && frame.params.deleted === true)).frame.params;
@@ -149,7 +149,6 @@ it('runs a link\'s message as a shadow user that joins the room, and keeps ext.r
 			const refused = await request(link, `bad-${id}`, 'message', { room_id: roomId, body: { text: 'x' }, ext: { remote: { user_id: userId } } });
 			expect(refused.error.code).toBe(INVALID_PARAMS);
 		}
-		expect(linkId).toMatch(/^link_/);
 	} finally { admin.close(); link.close(); }
 });
 
@@ -175,7 +174,7 @@ it('strips ext.remote from everyone but a link acting as a remote user', async (
 	} finally { admin.close(); link.close(); }
 });
 
-it('sets a shadow\'s reactions, renames it with me, and lets it leave', async () => {
+it('sets a remote user\'s reactions, renames it with me, and lets it leave', async () => {
 	const server = 'ws://127.0.0.1:8083/ws';
 	const { admin, link, linkId, roomId } = await linked(server);
 	const carol = unique('carol');
@@ -189,7 +188,7 @@ it('sets a shadow\'s reactions, renames it with me, and lets it leave', async ()
 		const reactions = (await until(admin, (frame) => frame.method === 'reactions' && frame.params.message_id === messageId)).frame.params;
 		expect(reactions.reactions).toEqual([{ from: { user_id: daveId, name: dave, ext: { remote: { server, user_id: dave } } }, emojis: ['👍'] }]);
 
-		// `me` renames the shadow, not the link, and others are told.
+		// `me` renames the remote user, not the link, and others are told.
 		const renamed = await exchange(link, 'rename', 'me', { name: 'Dave D', ext: { remote: { user_id: dave } } });
 		expect(renamed.frame.result.you).toMatchObject({ user_id: daveId, name: 'Dave D', roles: [], ext: { remote: { server, user_id: dave } } });
 		const told = await until(admin, (frame) => frame.method === 'user' && frame.params.new?.user_id === daveId);
@@ -197,7 +196,7 @@ it('sets a shadow\'s reactions, renames it with me, and lets it leave', async ()
 		expect((await request(link, 'self', 'me', {})).result.you).toMatchObject({ user_id: linkId });
 		expect((await request(link, 'self', 'me', {})).result.you.name).not.toBe('Dave D');
 
-		// The shadow leaves the room.
+		// The remote user leaves the room.
 		const left = await request(link, 'leave', 'room_leave', { room_id: roomId, ext: { remote: { user_id: dave } } });
 		expect(left.result).toEqual({});
 		const membership = await until(admin, (frame) => frame.method === 'room_update' && frame.params.memberships?.[0]?.members?.[0]?.user?.user_id === daveId && frame.params.memberships[0].members[0].joined === false);
@@ -221,7 +220,7 @@ it('refuses act-as writes in a room the link is not in', async () => {
 	} finally { admin.close(); link.close(); }
 });
 
-it('keeps shadow user_ids from being issued, renamed, or acted as by anyone but a link', async () => {
+it('keeps remote users\' user_ids from being issued, renamed, or acted as by anyone but a link', async () => {
 	const { admin, adminId, link, roomId, text } = await linked('ws://127.0.0.1:8085/ws');
 	const carol = unique('carol');
 	const shadowId = `${carol}@127.0.0.1:8085`;
@@ -246,7 +245,7 @@ it('keeps shadow user_ids from being issued, renamed, or acted as by anyone but 
 	} finally { admin.close(); link.close(); }
 });
 
-it('never signs a link out as an idle bot, nor prunes a shadow as an idle account', async () => {
+it('never signs a link out as an idle bot, nor prunes a remote user as an idle account', async () => {
 	const day = 86_400_000;
 	await runInDurableObject(env.DEMO.getByName('remote-idle'), (_instance, state) => {
 		const clock = { now: Date.now() };
@@ -259,7 +258,7 @@ it('never signs a link out as an idle bot, nor prunes a shadow as an idle accoun
 		expect(store.ensureShadow({ userId: 'carol@a.example', remote: { server: 'ws://a.example/ws', user_id: 'carol' }, name: 'carol', now: clock.now, ipKey: 'ip' })).toBe('carol');
 		// The same id for another server's user is refused (two addresses, one authority).
 		expect(() => store.ensureShadow({ userId: 'carol@a.example', remote: { server: 'wss://a.example/ws', user_id: 'carol' }, name: 'carol', now: clock.now, ipKey: 'ip' })).toThrow(/another server/);
-		// An ordinary bot and an ordinary account, idle as long as the link and the shadow.
+		// An ordinary bot and an ordinary account, idle as long as the link and the remote user.
 		sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES ('plain_bot', '', 'bot', 'registered', ?, ?, '[\"bot\"]')", clock.now - 90 * day, clock.now - 90 * day);
 		sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES ('plain', '', 'plain', 'registered', ?, ?, '[]')", clock.now - 90 * day, clock.now - 90 * day);
 		sql.exec("UPDATE identities SET created_ms = ?, updated_ms = ? WHERE user_id IN (?, 'carol@a.example')", clock.now - 90 * day, clock.now - 90 * day, linkId);
@@ -284,8 +283,8 @@ it('gives a link\'s own user object ext.remote with its server and no user_id', 
 		expect(snapshot.from).toEqual({ user_id: linkId, name: expect.any(String), ext: { remote: { server } } });
 		expect(snapshot).not.toHaveProperty('ext');
 		// A `me` of its own keeps it.
-		const renamed = await request(link, 'rename', 'me', { name: 'Bridge bot', ext: { remote: { server: 'ws://forged/ws' } } });
-		expect(renamed.result.you).toMatchObject({ name: 'Bridge bot', ext: { remote: { server } } });
+		const renamed = await request(link, 'rename', 'me', { name: 'Link bot', ext: { remote: { server: 'ws://forged/ws' } } });
+		expect(renamed.result.you).toMatchObject({ name: 'Link bot', ext: { remote: { server } } });
 	} finally { admin.close(); link.close(); }
 });
 
@@ -358,7 +357,7 @@ it('/remote unshare in a shared room takes the links out of it and its threads',
 	const thread = (await request(admin, unique('thread'), 'room_set', { parent_room_id: roomId, title: 'Before' })).result.room_id as string;
 	const invited = await command(admin, unique('invite'), `/remote invite ${server}`, roomId);
 	const token = invited.notice!.params.body.text.match(/&token=(apron_invite_[A-Za-z0-9_-]{43})/)![1];
-	const { peer: link, you } = await signIn(token);
+	const { peer: link } = await signIn(token);
 	try {
 		// Invited, the link is in the room and its existing thread; a new thread takes it too.
 		const after = (await request(admin, unique('thread2'), 'room_set', { parent_room_id: roomId, title: 'After' })).result.room_id as string;
@@ -372,7 +371,6 @@ it('/remote unshare in a shared room takes the links out of it and its threads',
 		// The link may no longer write there.
 		const refused = await request(link, unique('post'), 'message', { room_id: roomId, body: { text: 'x' }, ext: { remote: { user_id: 'carol' } } });
 		expect(refused.error).toMatchObject({ code: DENIED, data: { ext: { remote: 'not_joined' } } });
-		expect(you.user_id).toMatch(/^link_/);
 	} finally { admin.close(); link.close(); }
 });
 
@@ -411,7 +409,7 @@ it('makes and saves a thread of a shared room as a remote user, and joins the li
 });
 
 it('takes a link\'s relay wake push for ext:remote, and nobody else\'s', async () => {
-	const { admin, link, roomId } = await linked('ws://127.0.0.1:8097/ws');
+	const { admin, link } = await linked('ws://127.0.0.1:8097/ws');
 	try {
 		// Only to the link's own server (127.0.0.1:8097 here), http there being a loopback host.
 		expect((await request(link, unique('dev'), 'push_register', { kind: 'relay', url: 'http://127.0.0.1:8097/remote/wake/abcdefgh', token: 't0ken', wake: ['ext:remote'] })).result).toEqual({});
@@ -421,7 +419,6 @@ it('takes a link\'s relay wake push for ext:remote, and nobody else\'s', async (
 		// Anyone else's relay push is the server's ordinary push_register, which has no relay kind.
 		const other = await request(admin, unique('other'), 'push_register', { kind: 'relay', url: 'https://mirror.example/x', token: 't', wake: ['ext:remote'] });
 		expect(other.error).toBeDefined();
-		expect(roomId).toBeDefined();
 	} finally { admin.close(); link.close(); }
 });
 
