@@ -85,6 +85,10 @@ it('moves records past SQLite into D1, serves them in history, and expires them 
 			const runtime = instance as unknown as Runtime;
 			runtime.store.purgeUsers({ userIds: ['archive-victim'] });
 			expect(runtime.store.historyOps()).toEqual([{ seq: 1, op: { op: 'purge', userIds: ['archive-victim'], messageIds: [] } }]);
+			// A tier that finds more of the users' messages adds them to the op, once each; another seq is left alone.
+			runtime.store.amendHistoryPurge(1, ['no-such-message', 'no-such-message']);
+			runtime.store.amendHistoryPurge(9, ['other']);
+			expect(runtime.store.historyOps()).toEqual([{ seq: 1, op: { op: 'purge', userIds: ['archive-victim'], messageIds: ['no-such-message'] } }]);
 		});
 		expect((await archived()).map((row) => String(row.log_id))).toEqual(logs.slice(3, 7));
 		const early = (await request(peer, 'early', 'history', { room_id: 'general', limit: 50 })).result;

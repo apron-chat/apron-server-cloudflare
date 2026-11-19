@@ -4095,6 +4095,17 @@ export class Store {
     return this.reserved({ reads: 4 }, true, now, () => this.metaJson(META_HISTORY_OPS, (value) => Array.isArray(value) ? value as QueuedOp[] : undefined, []));
   }
 
+  /** Adds `messageIds` to queued purge `seq` (HistoryHead.amendPurge): messages of its users a tier below found. */
+  amendHistoryPurge(seq: number, messageIds: readonly string[], now = this.clock.now()): void {
+    this.ensureReady();
+    if (!messageIds.length) return;
+    this.reserved({ reads: 4, writes: 4 }, true, now, () => {
+      const ops = this.metaJson(META_HISTORY_OPS, (value) => Array.isArray(value) ? value as QueuedOp[] : undefined, []);
+      const next = ops.map((entry) => entry.seq === seq && entry.op.op === "purge" ? { seq, op: { ...entry.op, messageIds: [...new Set([...entry.op.messageIds, ...messageIds])] } } : entry);
+      this.writeMeta(META_HISTORY_OPS, JSON.stringify(next));
+    });
+  }
+
   /** Forgets the ops through `seq`, once every rewritable tier below applied them. */
   dropHistoryOps(seq: number, now = this.clock.now()): void {
     this.ensureReady();

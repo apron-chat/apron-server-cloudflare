@@ -229,8 +229,8 @@ export class HistoryPipeline {
 	/**
 	 * Applies the op log to tier `index` (a rewritable tier below the head),
 	 * in order, each op once; then forgets the ops every such tier applied.
-	 * Messages of purged users that only this tier held have their reaction
-	 * records at the head dropped too.
+	 * Messages of purged users that the tiers above did not know have their
+	 * records dropped above (reactions) and below (the amended op).
 	 */
 	private async applyOps(index: number): Promise<void> {
 		const tier = this.tiers[index];
@@ -242,11 +242,16 @@ export class HistoryPipeline {
 			if (seq <= applied) continue;
 			if (op.op === "purge") {
 				const result = await tier.purge(op.userIds, op.messageIds);
-				// Messages only this tier held: reaction records come after their
-				// message, so any on them are here or above, in tiers that already
-				// applied the op without knowing these messages.
+				// Messages the tiers above did not know as the users': their
+				// records can be anywhere. Reactions on them can be above, in
+				// tiers that already applied the op, and also below: a message's
+				// latest snapshot (an edit, a move) can be here while reactions
+				// made before it went further down and its first snapshot is gone.
+				// The op takes them with it for the tiers below (and pages read
+				// from them meanwhile); the tiers above drop them now.
 				const fresh = result.messageIds.filter((id) => !op.messageIds.includes(id));
 				if (fresh.length) {
+					await this.head.amendPurge(seq, fresh);
 					await this.head.dropReactionsOn(fresh);
 					for (let above = 1; above < index; above += 1) await (this.tiers[above] as RewritableTier).purge([], fresh);
 				}

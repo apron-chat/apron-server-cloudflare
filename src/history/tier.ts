@@ -70,6 +70,12 @@ export interface HistoryHead extends RewritableTier {
 	ops(): Promise<QueuedOp[]>;
 	/** Forgets ops through `seq`, once every rewritable tier applied them. */
 	dropOps(seq: number): Promise<void>;
+	/**
+	 * Adds `messageIds` to queued purge `seq`: messages of its users that a
+	 * tier below found (PurgeResult.messageIds), so the tiers below that one,
+	 * and pages read from them meanwhile, drop those messages' records too.
+	 */
+	amendPurge(seq: number, messageIds: readonly string[]): Promise<void>;
 	/** Queues an op for the tiers below, as the head's own purge and rename do. */
 	queueOp?(op: HistoryOp): Promise<void>;
 	/** Drops the head's reaction records on messages only a lower tier held (PurgeResult.messageIds). */

@@ -137,6 +137,10 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead {
 		this.queued = this.queued.filter((entry) => entry.seq > seq);
 	}
 
+	async amendPurge(seq: number, messageIds: readonly string[]): Promise<void> {
+		this.queued = this.queued.map((entry) => entry.seq === seq && entry.op.op === "purge" ? { seq, op: { ...entry.op, messageIds: [...new Set([...entry.op.messageIds, ...messageIds])] } } : entry);
+	}
+
 	async queueOp(op: HistoryOp): Promise<void> {
 		this.seq += 1;
 		this.queued.push({ seq: this.seq, op });

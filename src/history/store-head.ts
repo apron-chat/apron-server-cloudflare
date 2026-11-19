@@ -32,6 +32,7 @@ export interface StorePort {
 	publishHistoryFloor(floor: number): void;
 	historyOps(): QueuedOp[];
 	dropHistoryOps(seq: number): void;
+	amendHistoryPurge(seq: number, messageIds: readonly string[]): void;
 	dropReactionsOn(messageIds: readonly string[]): void;
 	hotRecords(): number;
 	purgeUsers(input: { userIds: readonly string[] }): unknown;
@@ -104,6 +105,10 @@ export class StoreHead implements HistoryHead {
 
 	async dropOps(seq: number): Promise<void> {
 		this.store.dropHistoryOps(seq);
+	}
+
+	async amendPurge(seq: number, messageIds: readonly string[]): Promise<void> {
+		this.store.amendHistoryPurge(seq, messageIds);
 	}
 
 	/** The Store queues its own ops, in /purge's and /rename's transactions. */
