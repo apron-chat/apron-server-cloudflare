@@ -890,12 +890,20 @@ store = { provider = "r2", binding = "HISTORY_BLOB", prefix = "history/" }
 # cache = { bytes = "8MiB" }   # decoded segments kept in memory
 # readable = true              # false: written, never read by history
 
-# Scheduled backups (below).
+# Backups (below): one each day, and one an admin makes on demand (no `every`).
 [[vars.HISTORY.exports]]
 name = "nightly"
 every = "1d"
 store = { provider = "r2", binding = "HISTORY_BLOB", prefix = "backups/" }
 keep = 14
+private_rooms = true
+encrypt = { key_secrets = ["UPLOAD_SIGNING_KEY"] }
+
+[[vars.HISTORY.exports]]
+name = "manual"
+store = { provider = "r2", binding = "HISTORY_BLOB", prefix = "backups/" }
+keep = 10
+private_rooms = true
 encrypt = { key_secrets = ["UPLOAD_SIGNING_KEY"] }
 
 # Defaults for `/history import`, and secrets kept only to read old backups.
@@ -953,27 +961,32 @@ key_secrets = ["HISTORY_BACKUP_KEY_2025"]
 
 A backup is the whole server's history, or some rooms', as one ARCHIVE.md
 v1 file in a blob store (`src/history/exports.ts`; [SPEC section
-9](../SPEC.md#backups-and-imports)): every room and its members, the users
-records name, and the records of every tier, as they are logged. It is
+9](../SPEC.md#backups-and-imports)): every room, the users records name,
+and the records of every tier, as they are logged; private rooms too,
+unless the export sets `private_rooms = false`. It is
 written as a stream (an R2 multipart upload), and a failure leaves no
 object. Each backup is named after its export and the time,
 `<RP_ID>-<name>-<date>.jsonl` by default (`key`, which must contain `{date}`
 and may contain `{server}` and `{name}`), and after writing one, the export
 deletes its own backups past the newest `keep` (14 by default).
 
-- **Scheduled exports.** Each `[[vars.HISTORY.exports]]` writes one backup
-  every `every` (a day by default), on the first full alarm after its
+- **Scheduled exports.** Each `[[vars.HISTORY.exports]]` with `every` writes
+  one backup every `every`, on the first full alarm after its
   interval has passed since its last run (`history:export:<name>` in
   `_meta`, noted before it runs, so one that fails waits its interval). Its
   result is logged (`history_export`, or `history_export_failed` with the
-  reason). Production has none, as it has no bucket yet.
+  reason). Production's `nightly` waits for its bucket.
 - **`/history export [<room_id>...]`** (admins) writes one now, of every
-  room or of those named, to the backup store: the first export's store and
-  settings, encrypted as it is, under the name `manual` and keeping the
-  newest 10 (or the export's `keep`, if more); without exports, the
-  `HISTORY_BLOB` bucket under `backups/`, unencrypted. Its notice names the
-  object's key. Keep `{name}` in a custom `key`, or the manual backups count
-  toward the scheduled ones' `keep`.
+  room or of those named, by the first export without `every` (`manual` in
+  both Wrangler configs), as it is configured: its store, `keep`,
+  `private_rooms` and encryption. Nothing is assumed: with no such export,
+  or its store unbound, the command says so and writes nothing. Its notice
+  names the object's key. Keep `{name}` in a custom `key`, or backups of
+  different exports count toward each other's `keep`.
+- **Encryption is what the config says.** An export with `encrypt` always
+  encrypts, and fails rather than write in the clear when its key is
+  missing; one without it writes plain ARCHIVE.md (the development config's
+  `manual`, to local storage).
 - **`/history import <key> [dry-run] [match|new] [renumber] [restart]`** (admins) reads
   an object of the backup store, a backup or any ARCHIVE.md v1 file put
   there, encrypted or not, and adds what is new, after planning the whole

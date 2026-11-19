@@ -328,4 +328,22 @@ describe("export and import", () => {
 		expect(stored.map((record) => record.log_id)).toEqual([150]);
 		expect(stored[0].record_json).not.toContain("output_ref");
 	});
+
+	it("leaves private rooms out of an export that says so", async () => {
+		const source = pipelineOf("head");
+		populate(source.head, source.clock);
+		source.clock.time += 7;
+		source.head.commit("private_123", "message", { message_id: "secret", from: { user_id: "ada" }, body: { text: "between us" } });
+		source.head.rooms_.set("private_123", { listing: { room_id: "private_123", private: true }, joined: false });
+		const lines = async (privateRooms: boolean) => {
+			const out: string[] = [];
+			await exportArchive(source.pipeline, jsonlWriter(async (line) => { out.push(line); }), { clock: source.clock, privateRooms });
+			return out.join("");
+		};
+		expect(await lines(true)).toContain("between us");
+		const without = await lines(false);
+		expect(without).not.toContain("between us");
+		expect(without).not.toContain("private_123");
+		expect(without).toContain("hello 0");
+	});
 });

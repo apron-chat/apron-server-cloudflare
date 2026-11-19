@@ -70,6 +70,7 @@ export async function writeBackup(pipeline: HistoryPipeline, store: BlobStore, s
 		const sink = encryptWith ? encryptingSink(plain, encryptWith) : undefined;
 		report = await exportArchive(pipeline, jsonlWriter(sink ?? plain), {
 			clock: options.clock, header: { server: options.server, ...options.header }, ...(options.roomIds ? { roomIds: options.roomIds } : {}),
+			privateRooms: settings.privateRooms,
 			...(options.prepare ? { prepare: options.prepare } : {}),
 		});
 		await sink?.close();

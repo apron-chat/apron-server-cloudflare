@@ -62,6 +62,32 @@ ROOM_METADATA_LIMIT = "8192"
 ROOM_METADATA_MIN_LIMIT = "1024"
 ROOM_METADATA_TOTAL_LIMIT = "262144"
 
+# Where history is kept, and its backups (docs/configuration.md, The HISTORY
+# config): the plan's own limits written out, as in production, and one
+# export on demand (`/history export`, no `every`) to the local HISTORY_BLOB
+# bucket, unencrypted here (no `encrypt`): local data, local keys. Private
+# rooms are exported (private_rooms); set it false to leave them out.
+[vars.HISTORY]
+schedule = { every = "1d", threshold_percent = 80 }
+alerts = { stall_after = "6h" }
+
+[[vars.HISTORY.tiers]]
+name = "hot"
+kind = "sqlite"
+retention = { records = 5_000, min_age = "3d" }
+
+[[vars.HISTORY.tiers]]
+name = "recent"
+kind = "d1"
+binding = "HISTORY_D1"
+retention = { records = 100_000 }
+
+[[vars.HISTORY.exports]]
+name = "manual"
+store = { provider = "r2", binding = "HISTORY_BLOB", prefix = "backups/" }
+keep = 10
+private_rooms = true
+
 # BEGIN GENERATED ADMISSION BUDGET
 # Edit src/budget.ts, then run npm run budget:generate.
 [[ratelimits]]

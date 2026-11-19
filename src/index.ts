@@ -8930,18 +8930,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Where backups go and imports come from: the first scheduled export's
-	 * store (HISTORY.exports), else HISTORY_BLOB under `backups/`. With the
-	 * settings `/history export` writes by (the first export's, named
-	 * `manual`, or plain ones).
+	 * What `/history export` writes by, and where `/history import` reads
+	 * from: the first export of HISTORY.exports with no `every` (one run on
+	 * demand only), as configured, encryption and all. Nothing is assumed
+	 * where the config names none.
 	 */
-	private backupTarget(): { store: BlobStore; settings: ExportSettings } | undefined {
-		const scheduled = this.config.history?.exports[0];
-		const settings: ExportSettings = scheduled
-			? { ...scheduled, name: "manual", keep: Math.max(scheduled.keep, 10) }
-			: { name: "manual", everySeconds: 0, store: { provider: "r2", binding: "HISTORY_BLOB", prefix: "backups/" }, key: "{server}-{name}-{date}.jsonl", keep: 10 };
+	private backupTarget(): { store: BlobStore; settings: ExportSettings } {
+		const settings = this.config.history?.exports.find((entry) => entry.everySeconds === undefined);
+		if (!settings) throw { name: "invalid_params", message: "No export on demand: add one without `every` to HISTORY.exports (docs/configuration.md, Backups and imports)" } satisfies ProtocolError;
 		const store = blobStoreOf(settings.store, this.runtimeEnv);
-		return store ? { store, settings } : undefined;
+		if (!store) throw { name: "invalid_params", message: `The export ${settings.name} has no store: bind ${settings.store.provider === "r2" ? settings.store.binding : "its store"}` } satisfies ProtocolError;
+		return { store, settings };
 	}
 
 	/** The backup keys this environment has: the secrets the `HISTORY` var names, and no other (§13.3). */
@@ -9009,7 +9008,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 		switch (words[0]) {
 			case "export": {
 				const target = this.backupTarget();
-				if (!target) throw { name: "invalid_params", message: "No backup store: bind HISTORY_BLOB, or configure HISTORY.exports" } satisfies ProtocolError;
 				const roomIds = words.slice(1);
 				let result: Awaited<ReturnType<typeof writeBackup>>;
 				try {
@@ -9029,7 +9027,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 				const flags = new Set(words.slice(2));
 				if (!key || [...flags].some((flag) => !["dry-run", "match", "new", "renumber", "restart"].includes(flag)) || (flags.has("match") && flags.has("new"))) usage();
 				const target = this.backupTarget();
-				if (!target) throw { name: "invalid_params", message: "No backup store: bind HISTORY_BLOB, or configure HISTORY.exports" } satisfies ProtocolError;
 				const object = await target.store.get(key);
 				if (!object) throw { name: "invalid_params", message: `No backup ${key}` } satisfies ProtocolError;
 				const lines = object.stream ? linesFromStream(await object.stream()) : linesOf(await object.text());
@@ -9076,7 +9073,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		for (const settings of this.config.history?.exports ?? []) {
 			try {
 				const last = this.store.historyMetaNumber(`history:export:${settings.name}`, now);
-				if (now < last + settings.everySeconds * 1_000) continue;
+				// An export with no `every` runs only on demand (/history export).
+				if (settings.everySeconds === undefined || now < last + settings.everySeconds * 1_000) continue;
 				const store = blobStoreOf(settings.store, this.runtimeEnv);
 				if (!store) continue;
 				// Noted first: a failing export waits its interval rather than retrying on every alarm.

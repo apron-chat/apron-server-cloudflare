@@ -103,3 +103,17 @@ it('puts terminal output kept in R2 back into exported records, never the intern
 	expect(embed.output_ref).toBeUndefined();
 	expect(embed.output).toBe('build ok');
 });
+
+it('refuses /history export where no export on demand is configured', async () => {
+	await runInDurableObject(stub(), (instance) => {
+		const runtime = instance as unknown as { config: { history?: { exports: unknown[] } } };
+		runtime.config = { ...runtime.config, history: { ...runtime.config.history!, exports: [] } };
+	});
+	const admin = await signedInAdmin();
+	try {
+		const refused = await command(admin, 'none', '/history export');
+		expect(refused.frame.error).toMatchObject({ code: -32602, message: expect.stringMatching(/^No export on demand: add one without `every` to HISTORY.exports/) });
+	} finally {
+		admin.close();
+	}
+});

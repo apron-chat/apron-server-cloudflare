@@ -83,10 +83,13 @@ PUSH_HOSTS_EXTRA = "push.stupidtech.net"
 # keeps 5,000 records (none younger than three days leave by count), D1
 # 100,000 more; each daily cleanup keeps 80% of each. With HISTORY set, the
 # LIMIT_* vars for these limits are refused. `npm run budget:check` checks it.
-# The nightly backup is inert until a private R2 bucket is bound as
-# HISTORY_BLOB. It is encrypted with a key derived from UPLOAD_SIGNING_KEY
-# (its own HKDF label); list another secret first to use a key of its own,
-# and keep a rotated one listed (import.key_secrets) to read older backups.
+# Backups are inert until a private R2 bucket is bound as HISTORY_BLOB: a
+# nightly one, and one an admin makes on demand (`/history export`, the
+# export with no `every`). Both are encrypted (`encrypt`: set, so required)
+# with a key derived from UPLOAD_SIGNING_KEY (its own HKDF label); list
+# another secret first to use a key of its own, and keep a rotated one
+# listed (import.key_secrets) to read older backups. Both include private
+# rooms (private_rooms); set it false to leave them out.
 [vars.HISTORY]
 schedule = { every = "1d", threshold_percent = 80 }
 alerts = { stall_after = "6h" }
@@ -107,6 +110,14 @@ name = "nightly"
 every = "1d"
 store = { provider = "r2", binding = "HISTORY_BLOB", prefix = "backups/" }
 keep = 14
+private_rooms = true
+encrypt = { key_secrets = ["UPLOAD_SIGNING_KEY"] }
+
+[[vars.HISTORY.exports]]
+name = "manual"
+store = { provider = "r2", binding = "HISTORY_BLOB", prefix = "backups/" }
+keep = 10
+private_rooms = true
 encrypt = { key_secrets = ["UPLOAD_SIGNING_KEY"] }
 
 # The D1 history tier (src/history/d1.ts, docs/configuration.md, History

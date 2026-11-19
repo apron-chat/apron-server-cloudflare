@@ -29,6 +29,12 @@ describe("HISTORY settings", () => {
 		expect(settings.tiers[2]).toMatchObject({ readable: true, cacheBytes: 8_388_608, store: { provider: "r2", binding: "HISTORY_BLOB", prefix: "history/" } });
 		expect(settings.exports[0]).toMatchObject({ name: "nightly", everySeconds: 86_400, keep: 14, key: "{server}-{name}-{date}.jsonl", encrypt: { keySecrets: ["HISTORY_BACKUP_KEY"] } });
 		expect(settings.alerts.stallAfterSeconds).toBe(21_600);
+		// Private rooms are exported unless an export says otherwise; one without `every` runs only on demand.
+		expect(settings.exports[0].privateRooms).toBe(true);
+		const onDemand = parseHistorySettings({ ...full, exports: [{ name: "manual", store: { provider: "memory" }, private_rooms: false }] }).exports[0];
+		expect(onDemand).toMatchObject({ name: "manual", privateRooms: false });
+		expect(onDemand.everySeconds).toBeUndefined();
+		expect(() => parseHistorySettings({ ...full, exports: [{ name: "manual", store: { provider: "memory" }, private_rooms: "no" }] })).toThrow(/private_rooms must be true or false/);
 		expect(backupKeyNames(settings)).toEqual(["HISTORY_BACKUP_KEY", "HISTORY_BACKUP_KEY_OLD"]);
 		expect(historyLimits(settings)).toEqual({ retentionRecords: 5_000, retentionSeconds: 0, minRetentionSeconds: 259_200, archiveRecords: 100_000, cleanupThresholdPercent: 80, cleanupSeconds: 86_400 });
 	});

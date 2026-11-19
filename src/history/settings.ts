@@ -66,7 +66,10 @@ export type TierSettings =
 
 export interface ExportSettings {
 	name: string;
-	everySeconds: number;
+	/** How often it runs on its own; absent, only on demand (`/history export`). */
+	everySeconds?: number;
+	/** Whether private rooms are exported (default true). */
+	privateRooms: boolean;
 	store: BlobStoreSettings;
 	/** The object key, with `{server}`, `{name}` and `{date}` (UTC, YYYYMMDD-HHMMSS) filled in. */
 	key: string;
@@ -204,14 +207,16 @@ function tier(value: unknown, index: number): TierSettings {
 function exported(value: unknown, index: number): ExportSettings {
 	const where = `exports[${index}]`;
 	const raw = object(value, where);
-	only(raw, where, ["name", "every", "store", "key", "keep", "encrypt"]);
+	only(raw, where, ["name", "every", "store", "key", "keep", "encrypt", "private_rooms"]);
+	if (raw.private_rooms !== undefined && typeof raw.private_rooms !== "boolean") throw new HistoryConfigError(`${where}.private_rooms must be true or false`);
 	const encrypt = raw.encrypt === undefined ? undefined : object(raw.encrypt, `${where}.encrypt`);
 	if (encrypt) only(encrypt, `${where}.encrypt`, ["key_secrets"]);
 	const key = raw.key === undefined ? "{server}-{name}-{date}.jsonl" : text(raw.key, `${where}.key`);
 	if (!key.includes("{date}")) throw new HistoryConfigError(`${where}.key must include {date}, so exports do not overwrite each other`);
 	return {
 		name: text(raw.name, `${where}.name`, NAME),
-		everySeconds: raw.every === undefined ? 86_400 : parseDuration(raw.every, `${where}.every`),
+		...(raw.every !== undefined ? { everySeconds: parseDuration(raw.every, `${where}.every`) } : {}),
+		privateRooms: raw.private_rooms !== false,
 		store: blobStore(raw.store, `${where}.store`),
 		key,
 		keep: raw.keep === undefined ? 14 : integer(raw.keep, `${where}.keep`, { min: 1, max: 1_000 }),

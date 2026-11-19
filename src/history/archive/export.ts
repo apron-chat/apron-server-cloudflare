@@ -19,6 +19,8 @@ import type { ArchiveHeader, ArchivedRoom, ArchivedUser, ArchiveReader, ArchiveW
 export interface ExportOptions {
 	/** Only these rooms (default: every room). */
 	roomIds?: readonly string[];
+	/** Private rooms too (default true); without them, their records stay out. */
+	privateRooms?: boolean;
 	/** Header fields: `server` above all, and `media`. */
 	header?: Partial<ArchiveHeader>;
 	clock: Clock;
@@ -83,7 +85,9 @@ export const historySection: ArchiveSection<HistoryPipeline, HistoryPipeline> = 
 		const head = pipeline.head;
 		const all: ArchivedRoom[] = head.rooms ? await head.rooms() : [];
 		const wanted = options.roomIds ? new Set(options.roomIds) : undefined;
-		const rooms = all.filter((room) => !wanted || wanted.has(room.listing.room_id));
+		// A private room is marked so in its listing (PROTOCOL §4.2.4), its ID `private_<log id>`.
+		const isPrivate = (room: ArchivedRoom) => room.listing.private === true || room.listing.room_id.startsWith("private_");
+		const rooms = all.filter((room) => (!wanted || wanted.has(room.listing.room_id)) && (options.privateRooms !== false || !isPrivate(room)));
 		const published = await pipeline.publishedFloor();
 		const listings = rooms.map((room) => {
 			// History starts at the published floor or the room's creation, whichever is later.
