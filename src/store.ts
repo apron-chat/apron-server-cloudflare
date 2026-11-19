@@ -5365,7 +5365,7 @@ export class Store {
     return this.reserved({ reads: 16 + 2 * identities, writes: 4 }, true, input.now, () => {
       const effective = this.effectiveNow(input.now);
       const idle = due === "" ? [] : this.rawRows<{ user_id: string }>(
-        // Link accounts (ext:remote) are never idle bots: their bridge may be quiet for weeks.
+        // Link accounts (ext:remote) are never idle bots: their mirror may be quiet for weeks.
         `SELECT user_id FROM identities WHERE roles_json = '["bot"]' AND updated_ms > 0 AND updated_ms < ?
            AND user_id NOT IN (SELECT key FROM json_each(COALESCE((SELECT value FROM _meta WHERE key = '${META_REMOTE_LINKS}'), '{}')))
          ORDER BY updated_ms LIMIT ?`, input.before, input.limit,
