@@ -89,7 +89,7 @@ LIMIT_RETENTION_SECONDS = "0"
 LIMIT_CLEANUP_THRESHOLD_PERCENT = "80"
 LIMIT_HISTORY_D1_RECORDS = "100000"
 LIMIT_HISTORY_BLOB_RECORDS = "0"
-# Backups to HISTORY_BLOB under backups/, inert until it is bound: one a day
+# Backups to HISTORY_BLOB under backups/: one a day
 # (and an admin's `/history export`), the newest 14 of each kept, private
 # rooms included, encrypted with a key derived from the UPLOAD_SIGNING_KEY
 # secret (its own HKDF label). Name another secret to use a key of its own;
@@ -124,13 +124,13 @@ database_id = "67f4435a-f9d4-4c9a-89e0-c02f108d4fa2"
 
 # The blob history tier and backups (docs/configuration.md, History tiers,
 # Backups and imports): a private R2 bucket, no custom domain, no r2.dev
-# access, no CORS, no lifecycle rules. Not bound yet: the apron-history
-# bucket's settings are still to be checked. Bound, records past D1's count
-# go there in segments (kept by LIMIT_HISTORY_BLOB_RECORDS) instead of
-# expiring, and the backups above run.
-# [[r2_buckets]]
-# binding = "HISTORY_BLOB"
-# bucket_name = "apron-history"
+# access, no CORS, no lifecycle rules (apron-history: Standard class,
+# ENAM, default jurisdiction). Records past D1's count go there in segments
+# (kept by LIMIT_HISTORY_BLOB_RECORDS) instead of expiring, and the backups
+# above run.
+[[r2_buckets]]
+binding = "HISTORY_BLOB"
+bucket_name = "apron-history"
 
 # Uploaded images (src/budget.ts). The bucket needs lifecycle rules deleting
 # f/ after 120 days and a/ after 61 or more (none for e/, custom emoji), a custom domain

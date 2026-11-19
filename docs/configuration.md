@@ -794,8 +794,8 @@ bound as `HISTORY_D1` and `historyD1Records` is above 0, then the blob tier
 (`cold`, `src/history/blob/`) where an R2 bucket is bound as `HISTORY_BLOB`.
 There is no tier list to configure: changing the composition is a code
 change. `wrangler.toml` binds a local database and bucket; production binds
-`apron-archive` (which keeps the name it was created with) and no bucket
-yet, and Previews bind neither. The object creates its D1 table on first
+`apron-archive` (which keeps the name it was created with) and the
+`apron-history` bucket, and Previews bind neither. The object creates its D1 table on first
 use.
 
 Records leaving the hot log are copied to the tier below first, and removed
