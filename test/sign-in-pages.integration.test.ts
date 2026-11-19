@@ -162,7 +162,7 @@ it('offers the passkey page in webauthn begin results, to every client on a host
 		expect(local.result).toMatchObject({ challenge_id: expect.any(String), public_key: { rpId: 'localhost', userVerification: 'required' } });
 		expect(local.result.external).toEqual({ url: `${ORIGIN}/passkey?action=login` });
 		const named = await begin(web, 'register', { name: 'Ada Lovelace' });
-		expect(named.result.external.url).toBe(`${ORIGIN}/passkey?action=register&name=Ada+Lovelace`);
+		expect(named.result.external.url).toBe(`${ORIGIN}/passkey?action=register&name=Ada%20Lovelace`);
 
 		const { server, welcome } = await greeting(app);
 		expect(server.params.auth).toEqual(['webauthn', 'token', 'guest']);
@@ -173,11 +173,62 @@ it('offers the passkey page in webauthn begin results, to every client on a host
 		expect(remote.result).toEqual({ external: { url: `${ORIGIN}/passkey?action=register` } });
 		// A credential finish still needs one of RP_ORIGINS.
 		const finish = await request(app, 'f', 'auth', { scheme: 'webauthn', action: 'login', step: 'finish', challenge_id: 'x', credential: {} });
-		expect(finish.error.code).toBe(-32001);
+		expect(finish.error).toMatchObject({ code: -32001, message: 'This connection sends no Origin; use a code from the passkey page in external.url' });
 
 		expect((await greeting(elsewhere)).server.params.auth).toEqual(['token', 'guest']);
-		expect((await begin(elsewhere, 'login')).error.code).toBe(-32601);
+		expect((await begin(elsewhere, 'login')).error).toMatchObject({ code: -32601, message: 'Passkeys are not offered to a connection that sends no Origin' });
 	} finally { web.close(); app.close(); elsewhere.close(); }
+});
+
+it('says which origin it refuses passkeys in the client to', async () => {
+	const rpOrigins = async (origins?: string[]) => runInDurableObject(stub(), (instance) => {
+		const server = instance as unknown as { config: { rpOrigins: string[] } };
+		const kept = server.config.rpOrigins;
+		if (origins) server.config = { ...server.config, rpOrigins: origins };
+		return kept;
+	});
+	const kept = await rpOrigins();
+	const web = 'http://localhost:5173';
+	const token = await runInDurableObject(stub(), (instance) =>
+		(instance as unknown as { issueSession(userId: string, origin: string, now: number): Promise<string> }).issueSession('user_origin_refused', web, Date.now()));
+	await rpOrigins([]);
+	const paged = await connect(web);
+	const elsewhere = await open({ ip: ip(), origin: web });
+	try {
+		await greeting(paged);
+		await greeting(elsewhere);
+		const finish = await request(paged, 'f', 'auth', { scheme: 'webauthn', action: 'login', step: 'finish', challenge_id: 'x', credential: {} });
+		expect(finish.error.message).toBe('Origin "http://localhost:5173" is not configured for passkeys; use a code from the passkey page in external.url');
+		expect((await begin(elsewhere, 'login')).error).toMatchObject({ code: -32601, message: 'Passkeys are not offered to origin "http://localhost:5173"' });
+		const resumed = await request(elsewhere, 'resume', 'auth', { scheme: 'token', token });
+		expect(resumed.error).toMatchObject({ code: -32001, message: 'Origin "http://localhost:5173" is not configured for passkeys' });
+	} finally {
+		paged.close();
+		elsewhere.close();
+		await rpOrigins(kept);
+	}
+});
+
+it('writes spaces in the passkey page\'s query as %20, so a client that encodes it again keeps the name', async () => {
+	const peer = await connect();
+	try {
+		await greeting(peer);
+		const begun = await begin(peer, 'register', { name: 'Sim Passkey+1' });
+		expect(begun.result.external.url).toBe(`${ORIGIN}/passkey?action=register&name=Sim%20Passkey%2B1`);
+		// A client that decodes each query item, with `+` as a plus, encodes
+		// it again, and adds its own (protocol §4.12.1), as Foundation's
+		// URLComponents does.
+		const app = await client();
+		const [base, query] = begun.result.external.url.split('?');
+		const items = [...query.split('&').map((item: string) => item.split('=').map(decodeURIComponent)), ...Object.entries(app.params)];
+		const url = new URL(`${base}?${items.map((item) => item.map(encodeURIComponent).join('=')).join('&')}`);
+		expect(url.searchParams.get('name')).toBe('Sim Passkey+1');
+		expect((await page(url)).status).toBe(200);
+		const done = await ceremony(url, await softPasskey(ORIGIN));
+		expect(done.status).toBe(200);
+		const finished = await request(peer, 'finish', 'auth', { scheme: 'webauthn', action: 'register', step: 'finish', ...app.redeem(returned(done.body.redirect!, app)) });
+		expect(finished.result.you.name).toBe('Sim Passkey+1');
+	} finally { peer.close(); }
 });
 
 it('creates an account and signs in through the passkey page, with a bearer token that resumes from any client', async () => {

@@ -165,8 +165,8 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   on or off, when the server changes tier or an action's breaker opens or
   closes (see [Server tiers](#server-tiers)), at the day's first storage
   overrun, and when the database passes half its high-water mark (384 MiB
-  of 768 on Paid; the size comes from the `db_bytes` reading, taken at most
-  hourly from an alarm, and the told-once flag is one `_meta` row; told
+  of 768 on Paid; the size is read from the SQL handle, no query, at most
+  hourly an instance from an alarm, and the told-once flag is one `_meta` row; told
   again only after the size falls under 40%), and when long room
   descriptions fill `roomMetadataTotalLimit` (at the first save it refuses,
   naming the public rooms holding the most past the minimum; told again only
@@ -229,13 +229,37 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   tier and the one before), throttle trips (`throttle`: the trigger and the
   method refused; see Server tiers), admin alerts (`admins_notified`), the edge
   stop turning on or off (`edge_stop`: `guard` or `flood`, or `lifted`), the
-  database's occupied bytes (`db_bytes`, valued by the size, at most once an
-  hour from an alarm, so take the max, not the sum: its trend toward the
-  storage watermarks), and refusals (`refusal`, `src/refusals.ts`): `error` for a JSON-RPC error (a
+  database's occupied bytes (`db_bytes`, valued by the size, from a full
+  alarm at most once an hour, about daily on a quiet server, so a day may
+  have none; take the max, not the sum: its trend toward the storage
+  watermarks), anything that took 5 seconds or more (`slow`,
+  `src/stalls.ts`: the object's own `handler` by event, the wait behind
+  earlier changes `queue` and a change's own run `mutation`, `r2` by
+  operation, `push`, the account usage reading `analytics`, and the storage
+  flush after each alarm `storage`; summed a minute at a time like refusals,
+  so `double1` is a count, `double2` the worst and `double3` the total
+  milliseconds), an instance in memory 3 minutes or more without hibernating
+  (`awake`, then every 15 minutes, at most four points an hour: what it had
+  in flight, how many of its sockets are guests, not signed in yet or past
+  their sign-in deadline, and how many it closed that the runtime still
+  lists with the minutes since the oldest of those opened, its age in
+  minutes, the events it handled since the last point and its open sockets;
+  few events with something in flight is a stall, many is traffic), active
+  users (`active`: `read` at a connection's sign-in or its first frame of a
+  UTC day, `write` at its first new message of the day, at most one of each
+  a connection a day, with the tier, `registered`, `guest` or `bot`, and the
+  user_id, or for a guest, whose id is new at each sign-in, `g:` and an HMAC
+  of its address key under a key derived from `UPLOAD_SIGNING_KEY`, stable
+  across days but not traceable to an address without that secret (no guest
+  is recorded without it); count distinct users for daily, weekly and monthly
+  active users; the dataset is internal, read only with the account's API
+  token), and refusals (`refusal`, `src/refusals.ts`): `error` for a JSON-RPC error (a
   `retry_after` by its message and `data.reason`, any other by its name
   alone, since those messages may name users) with the method when the
   server knows it, else `other`; `close` for a policy close, with its code
-  and reason; and `http` for a refusal the object answers before an upgrade,
+  and reason (a sign-in timeout on a connection that never sent a frame,
+  not even a ping, is `silent`: its client may have gone during the
+  upgrade); and `http` for a refusal the object answers before an upgrade,
   with its status and message and `upgrade`, `probe`, `live_write` or
   `live_read`. Refusals the entry Worker answers by itself (the attempt
   limits, a full or paused server it already knows of) are not counted. A
@@ -246,12 +270,21 @@ rejects. The budget guard (`src/budget-guard.ts`) is the stop for that:
   is `blob1` the event, `blob2` onward its details and `double1` its
   value. Writing never awaits or throws, and without the binding nothing is
   written. Workers Paid includes 10 million data points a month; this server
-  writes a few thousand a day, and refusals at most 130 a minute. `npm run usage:report -- --days 3` (with
+  writes a few thousand a day, refusals at most 130 a minute, and slow waits
+  at most two a minute per kind and detail even while every event is slow. `npm run usage:report -- --days 3` (with
   `CLOUDFLARE_ACCOUNT_ID` and a `CLOUDFLARE_API_TOKEN` that has Account
   Analytics Read) prints each UTC day's Durable Object awake time, billed
-  duration, peak sockets and busiest hour from GraphQL analytics, the
-  counters from the dataset, each day's largest database size, and the
-  refusals by kind, reason and method.
+  duration, peak sockets and busiest hour from GraphQL analytics, and each
+  hour awake for 30 minutes or more; the counters from the dataset, each
+  day's largest database size, the slow waits by kind, the latest long-awake
+  instances, active users who read and who wrote by tier, each day and over
+  the last 7 and 30 days, and the refusals by kind, reason and method. An
+  admin's `/status` also shows active users (read / wrote) today, over the
+  last 7 days and over the last 30, and the day counting began while that is
+  within the 30, read back with four small queries through the
+  Analytics Engine SQL API (`ACCOUNT_ID`, `ACCOUNT_ANALYTICS_TOKEN`, whose
+  Account Analytics Read covers it, and `METRICS_DATASET`), or why they are
+  unavailable.
 
 Set it up once per deployment:
 
@@ -670,8 +703,11 @@ Two limits shape how fast changes are announced, both in seconds and at most
 60 (`MAX_STATUS_DELAY_SECONDS`), so what others see is never more than about
 a minute behind:
 
-- `statusCoalesceSeconds` (60): a user's status is announced at most once in
-  this long; changes in between wait, and only the latest goes out. Member
+- `statusCoalesceSeconds` (60): a user's change towards `idle` or `offline`
+  is announced at most once in this long after their last announcement;
+  changes in between wait, and only the latest goes out. Coming back (from
+  `offline`, or `idle` to `online`) is announced at once, so a user's
+  connections cause at most three announcements in this long. Member
   listings are also reused for up to this long, until something they read
   is written.
 - `offlineGraceSeconds` (60): a change caused by a closed connection waits
@@ -802,7 +838,8 @@ implementation and recalibrating its resource model.
 | `OG_MEDIA_HOSTS_EXTRA` | Hosts added to `OG_MEDIA_HOSTS` (or its defaults), written the same way; unset, none |
 | `PUSH_DELAY_SECONDS` | Whole seconds, 0 to 60, a message's wake waits before it pushes; unset, the plan's `push.delaySeconds`; `0` pushes at once |
 | `ACCOUNT_ID` | The Cloudflare account whose analytics the account-usage stop and the budget guard read; a Wrangler var (see [Editing the deployment budget](#editing-the-deployment-budget)) |
-| `ACCOUNT_ANALYTICS_TOKEN` | Secret: a read-only account analytics token; with `ACCOUNT_ID`, turns the account-usage stop on |
+| `ACCOUNT_ANALYTICS_TOKEN` | Secret: a read-only account analytics token; with `ACCOUNT_ID`, turns the account-usage stop on, and with `METRICS_DATASET` too, `/status`'s active users |
+| `METRICS_DATASET` | The Analytics Engine dataset the `METRICS` binding writes, for `/status` to read active users back (the binding does not tell the Worker its name; `npm run budget:check` holds the two equal); unset, `/status` leaves active users out |
 | `ZONE_ID` | The zone holding `apron_budget_stop`; a Wrangler var (see [Budget guard](#budget-guard)) |
 | `EDGE_STOP_TOKEN` | Secret: an API token with Zone WAF edit permission on `ZONE_ID`, which the budget guard and the flood trip use |
 | `ADMISSION_OFF` | `true` or `false`: operator admission switch; `true` rejects new sockets in the entry Worker with 503 before the limiter or DO call; existing sockets remain subject to DO budgets |

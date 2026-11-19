@@ -4,12 +4,14 @@ import { AuthError, AuthTooLargeError, candidateUserIdFor, UnknownCredentialErro
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY } from "./budget";
 import { LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
-import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, statusChoice, type Status, type StatusChoice } from "./presence";
+import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, showsMorePresent, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor, snapshotBill, snapshotReasons } from "./account-usage";
 import { PRICED_LABEL, PRICES, usd } from "./pricing";
+import { activeUsersConfigured, activeUsersLine, fetchActiveUsers } from "./active-users";
 import { EDGE_STOP_RULE_REF, readEdgeStop, runBudgetGuard, setAttackStop, watchForFlood } from "./budget-guard";
 import { attackHoldMs, BURN_POLICY, BurnMeter, burnSummary, type BurnKind } from "./burn";
 import { recordMetric } from "./metrics";
+import { StallMeter, type AwakeSnapshot } from "./stalls";
 import { RefusalMeter } from "./refusals";
 import { notifyTrigger, TIER_LABEL, type NoticeChannels, type ServerTier, type TriggerNotice } from "./notify";
 import { AUDIO_TYPES, sniffAudio } from "./audio";
@@ -107,6 +109,7 @@ import {
 	PAGE_BEGIN_PATH,
 	PAGE_FINISH_PATH,
 	pageOriginServes,
+	pageUrl,
 	parseAuthorizationRequest,
 	parsePasskeyPageRequest,
 	PASSKEY_PAGE_PATH,
@@ -249,6 +252,9 @@ interface ConnectionAttachment {
 	frameTimes: number[];
 	/** When this connection last sent an application frame (pings aside); absent before its first. */
 	lastFrameAt?: number;
+	/** The UTC day this connection last counted its user active (`active` read), and last posted (`active` write). */
+	activeDay?: string;
+	postedDay?: string;
 	/** Per-type throttle events from this connection, oldest first (budget.ts). */
 	throttles?: Partial<Record<ThrottledType, number[]>>;
 	/** When this connection last got a `~private` throttle notice, per type. */
@@ -855,6 +861,16 @@ function checkDeviceId(id: string | undefined): void {
 	}
 }
 
+/** A connection's user counted active (markActive): the bucket, the tier, and who (a guest's address key, hashed before it is recorded). */
+interface ActiveMark {
+	bucket: "read" | "write";
+	tier: "registered" | "guest" | "bot";
+	who: string;
+}
+
+/** A UTC day as utcDay writes it. */
+const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
 /** The UTC day of an epoch-milliseconds time, `YYYY-MM-DD`. */
 function utcDay(ms: number): string {
 	return new Date(ms).toISOString().slice(0, 10);
@@ -1186,6 +1202,9 @@ function connectionAttachment(socket: WebSocketConnection): ConnectionAttachment
 			...presenceState(attachment),
 			...readState(attachment),
 			...(Number.isSafeInteger(attachment.openedAt) && (attachment.openedAt as number) > 0 ? { openedAt: attachment.openedAt } : {}),
+			...(Number.isSafeInteger(attachment.lastFrameAt) && (attachment.lastFrameAt as number) > 0 ? { lastFrameAt: attachment.lastFrameAt } : {}),
+			...(typeof attachment.activeDay === "string" && DAY_PATTERN.test(attachment.activeDay) ? { activeDay: attachment.activeDay } : {}),
+			...(typeof attachment.postedDay === "string" && DAY_PATTERN.test(attachment.postedDay) ? { postedDay: attachment.postedDay } : {}),
 			authDeadline: typeof attachment.authDeadline === "number" ? attachment.authDeadline : 0,
 			pendingFrames: typeof attachment.pendingFrames === "number" ? attachment.pendingFrames : 0,
 			pendingBytes: typeof attachment.pendingBytes === "number" ? attachment.pendingBytes : 0,
@@ -1399,7 +1418,7 @@ function writeSessionAttachment(socket: WebSocketConnection, attachment: Connect
  * ones are ordinary rate limits that clients wait out.
  */
 const LONG_THROTTLE_SECONDS = 300;
-/** How often an alarm records the database's size (ApronDemoServer.maybeRecordDatabaseSize). */
+/** How often an instance checks the database's size against the storage alert, and records it from a full alarm (ApronDemoServer.checkDatabaseSize). */
 const DATABASE_SIZE_METRIC_MS = 60 * 60 * 1_000;
 /** The share of the database high-water mark past which the admins are told (maybeAlertStorage). */
 const STORAGE_ALERT_SHARE = 0.5;
@@ -1540,6 +1559,24 @@ function asDecimalId(value: unknown, field: string, allowZero = true): string | 
 	const number = Number(value);
 	if (!Number.isSafeInteger(number) || (!allowZero && number === 0)) throw { name: "invalid_params", message: `${field} is outside the supported range` } satisfies ProtocolError;
 	return String(number);
+}
+
+/**
+ * The refusal of a passkey ceremony or session in the client (protocol
+ * §4.10) to a connection whose origin is not one of RP_ORIGINS. It quotes
+ * the origin, or says the connection sent none, as a native app does, so a
+ * client can tell the two apart. `page`: the passkey page is the way in
+ * (protocol §4.10.1).
+ */
+function passkeyOriginRefusal(origin: string | null, page = false): ProtocolError {
+	const refused = origin === null ? "This connection sends no Origin" : `Origin ${quotedOrigin(origin)} is not configured for passkeys`;
+	const remedy = page ? "use a code from the passkey page in external.url" : origin === null ? "passkeys need a configured origin" : undefined;
+	return { name: "denied", message: remedy ? `${refused}; ${remedy}` : refused };
+}
+
+/** A connection's Origin as a refusal quotes it, bounded as other echoed values are. */
+function quotedOrigin(origin: string): string {
+	return JSON.stringify(origin.slice(0, 200));
 }
 
 function passkeyCredentialParam(params: Record<string, unknown>, action: "register" | "login"): Record<string, unknown> {
@@ -2524,7 +2561,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private tierCheckedAt = 0;
 	/** When each connection or address was last told of each trip trigger (claimTrip); in memory only. */
 	private readonly trips = new Map<string, number>();
-	/** When the database's size was last recorded (maybeRecordDatabaseSize); in memory only. */
+	/** When this instance last checked the database's size, and last recorded it (checkDatabaseSize). */
+	private databaseSizeCheckedAt = -Infinity;
 	private databaseSizeRecordedAt = -Infinity;
 	/** Whether the storage alert stands (Store.storageAlerted), once read. */
 	private storageAlerted?: boolean;
@@ -2532,6 +2570,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private roomNotesAlerted?: boolean;
 	/** Refusals counted for the `refusal` metric (src/refusals.ts), written at most twice a minute per kind. */
 	private readonly refusals = new RefusalMeter((kind, reason, detail, count) => recordMetric(this.runtimeEnv.METRICS, "refusal", [kind, reason, detail], count));
+	/** The key that hashes a guest's address key for the `active` metric (recordActive), once made. */
+	private activeGuestKey?: Promise<CryptoKey>;
+	/** Slow waits and long stays awake, for the `slow` and `awake` metrics (src/stalls.ts). */
+	private readonly stalls = new StallMeter((event, details, values) => recordMetric(this.runtimeEnv.METRICS, event, details, values), nowMs);
 	/** Shadow dollars spent by recent traffic, for the attack pause (src/burn.ts); in memory only. */
 	private readonly burn = new BurnMeter();
 	/** When the burn was last weighed (maybeCheckBurn), and when a heavy admitted burn was last told. */
@@ -2697,7 +2739,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.accountUsage = new AccountUsageMonitor({
 			env,
 			persist: (snapshot, now) => this.store.persistAccountUsageSnapshot(snapshot, now),
-			waitUntil: (promise) => ctx.waitUntil(promise),
+			waitUntil: (promise) => ctx.waitUntil(this.stalls.track("analytics", "", promise)),
 			onStop: () => {
 				for (const peer of this.ctx.getWebSockets()) {
 					const state = connectionAttachment(peer);
@@ -2729,10 +2771,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	async fetch(request: Request): Promise<Response> {
-		const response = await this.fetchRequest(request);
+		this.stalls.event(() => this.awakeSnapshot());
+		// A live text streams for minutes by design: its requests are counted
+		// in flight while the object answers them, not timed (a reader's
+		// stream outlives its request: `live` in the awake snapshot counts it).
+		const handler = refusedPath(request);
+		const response = await this.stalls.track("handler", handler, this.fetchRequest(request), !handler.startsWith("live_"));
 		// Each one an entry Worker request and an object request, billed whatever it answers.
 		this.noteBurn("fetch", 1, response.status >= 400 ? 1 : 0);
-		if (response.status >= 400) this.refusals.note("http", `${response.status} ${REFUSAL_MESSAGES.get(response) ?? ""}`.trim(), refusedPath(request), nowMs());
+		if (response.status >= 400) this.refusals.note("http", `${response.status} ${REFUSAL_MESSAGES.get(response) ?? ""}`.trim(), handler, nowMs());
 		return response;
 	}
 
@@ -2884,6 +2931,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+		this.stalls.event(() => this.awakeSnapshot());
+		let work: Promise<void>;
+		try { work = this.socketMessage(ws, message); } catch (error) { work = Promise.reject(error); }
+		// From arrival to done, the wait behind the socket's earlier frames included.
+		return this.stalls.track("handler", "message", work);
+	}
+
+	private socketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
 		const socket = ws as WebSocketConnection;
 		this.noteBurn("message");
 		if (this.pausedUntil(nowMs())) {
@@ -2932,7 +2987,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		attachment.pendingFrames += 1;
 		attachment.pendingBytes += bytes;
+		const active = this.markActive(attachment, "read", now);
 		writeAttachment(socket, attachment);
+		if (active) this.recordActive(active);
 		const prior = this.queues.get(socket) ?? Promise.resolve();
 		const actor = connectionActor(socket, attachment);
 		const next = prior.catch(() => undefined).then(() => ACTOR.run(actor, () => this.processFrame(socket, message))).catch((error) => this.handleFrameFailure(socket, error)).finally(() => {
@@ -2948,7 +3005,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return next;
 	}
 
-	async webSocketClose(ws: WebSocket, code = 1000): Promise<void> {
+	webSocketClose(ws: WebSocket, code = 1000): Promise<void> {
+		this.stalls.event(() => this.awakeSnapshot());
+		return this.stalls.track("handler", "close", this.socketClosed(ws, code));
+	}
+
+	private async socketClosed(ws: WebSocket, code: number): Promise<void> {
 		const socket = ws as WebSocketConnection;
 		this.sweepPresence();
 		const attachment = connectionAttachment(socket);
@@ -2961,7 +3023,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		await this.rescheduleAlarm();
 	}
 
-	async webSocketError(ws: WebSocket): Promise<void> {
+	webSocketError(ws: WebSocket): Promise<void> {
+		this.stalls.event(() => this.awakeSnapshot());
+		return this.stalls.track("handler", "error", this.socketFailed(ws));
+	}
+
+	private async socketFailed(ws: WebSocket): Promise<void> {
 		const socket = ws as WebSocketConnection;
 		this.sweepPresence();
 		const attachment = connectionAttachment(socket);
@@ -2974,7 +3041,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		await this.rescheduleAlarm();
 	}
 
-	async alarm(): Promise<void> {
+	alarm(): Promise<void> {
+		this.stalls.event(() => this.awakeSnapshot());
+		return this.stalls.track("handler", "alarm", this.alarmRun());
+	}
+
+	private async alarmRun(): Promise<void> {
 		this.inAlarm = true;
 		let done = false;
 		try {
@@ -2986,6 +3058,89 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// so a presence change asked for meanwhile is not left without one.
 			if (!done) await this.rescheduleAlarm();
 		}
+		// How long its writes take to become durable: what every reply waits
+		// for before it leaves (the output gate), so a slow storage backend
+		// shows here even when the handlers themselves are quick. Events are
+		// delivered during this wait, so it comes after inAlarm is cleared: a
+		// presence change meanwhile schedules its own alarm.
+		// A failed flush is not this alarm's failure: its work is done and the next one set.
+		await this.stalls.track("storage", "sync", Promise.resolve().then(() => this.ctx.storage.sync())).catch(() => undefined);
+	}
+
+	/**
+	 * Marks a signed-in connection's user active today for `bucket` (`read`:
+	 * a sign-in or any frame; `write`: a new message), once a day per
+	 * connection, kept in its attachment so hibernation does not repeat it.
+	 * Returns what to record when this is the day's first, for the caller to
+	 * pass to recordActive once the attachment is written.
+	 */
+	private markActive(attachment: ConnectionAttachment, bucket: "read" | "write", now: number): ActiveMark | undefined {
+		if (attachment.tier === "pending" || !attachment.userId || attachment.closing) return undefined;
+		const day = utcDay(now);
+		const field = bucket === "read" ? "activeDay" : "postedDay";
+		if (attachment[field] === day) return undefined;
+		attachment[field] = day;
+		const tier = attachment.tier === "anonymous" ? "guest" : isBotId(attachment.userId) ? "bot" : "registered";
+		return { bucket, tier, who: tier === "guest" ? attachment.ipKey : attachment.userId };
+	}
+
+	/**
+	 * Records an `active` point. A user counts by user_id; a guest, whose id
+	 * is new at each sign-in, by `g:` and an HMAC of its address key under a
+	 * key derived from UPLOAD_SIGNING_KEY: stable across days for weekly and
+	 * monthly counts, and unlike the address key itself (an unkeyed hash a
+	 * candidate address can be checked against), not traceable to an address
+	 * without the secret. Without that secret a guest is not recorded.
+	 */
+	private recordActive(mark: ActiveMark): void {
+		if (mark.tier !== "guest") {
+			recordMetric(this.runtimeEnv.METRICS, "active", [mark.bucket, mark.tier, mark.who]);
+			return;
+		}
+		const secret = this.runtimeEnv.UPLOAD_SIGNING_KEY;
+		if (!secret || !this.runtimeEnv.METRICS) return;
+		this.activeGuestKey ??= crypto.subtle.importKey("raw", new TextEncoder().encode(`apron active guests v1\u0000${secret}`), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+		void this.activeGuestKey
+			.then((key) => crypto.subtle.sign("HMAC", key, new TextEncoder().encode(mark.who)))
+			.then((digest) => recordMetric(this.runtimeEnv.METRICS, "active", [mark.bucket, "guest", `g:${base64UrlEncode(new Uint8Array(digest).slice(0, 16))}`]))
+			.catch(() => undefined);
+	}
+
+	/**
+	 * What an `awake` report counts besides the waits in flight
+	 * (src/stalls.ts): open sockets, and of them guests (`anonymous`) and
+	 * those not signed in yet (`pending`, and `overdue` past their sign-in
+	 * deadline), so an influx of visitors tells from a stall; sockets this
+	 * object closed that the runtime still lists (`closing`), with the
+	 * minutes since the oldest of them opened (`closing_min`): a client lost
+	 * during its upgrade leaves one that may never get a close event; live
+	 * texts, and pushes waiting out their delay.
+	 */
+	private awakeSnapshot(): AwakeSnapshot {
+		const now = nowMs();
+		const sockets = this.ctx.getWebSockets();
+		let anonymous = 0;
+		let pending = 0;
+		let overdue = 0;
+		let closing = 0;
+		let oldestClosing = now;
+		for (const socket of sockets) {
+			const state = connectionAttachment(socket as WebSocketConnection);
+			if (!state) continue;
+			if (state.closing) {
+				closing += 1;
+				oldestClosing = Math.min(oldestClosing, state.openedAt ?? now);
+			} else if (state.tier === "anonymous") anonymous += 1;
+			else if (state.tier === "pending") {
+				pending += 1;
+				if (state.authDeadline <= now) overdue += 1;
+			}
+		}
+		return {
+			sockets: sockets.length, anonymous, pending, overdue, closing,
+			closing_min: closing ? Math.max(1, Math.round((now - oldestClosing) / 60_000)) : 0,
+			live: this.liveSessions.size, wakes: this.pendingWakes.size,
+		};
 	}
 
 	private async runAlarm(): Promise<void> {
@@ -3003,7 +3158,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// their own work, as they did before presence used the alarm.
 		const full = this.alarmWorkDue(now);
 		recordMetric(this.runtimeEnv.METRICS, "alarm", [full ? "full" : "light"]);
-		this.maybeRecordDatabaseSize(now);
+		this.checkDatabaseSize(now, full);
 		// Every alarm, light or full: what fell due on a connection needs only its attachment.
 		this.runConnectionDeadlines(now);
 		this.maybeEvaluateTier(now);
@@ -3011,7 +3166,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await this.rescheduleAlarm();
 			return;
 		}
-		await this.accountUsage.refresh(now, false);
+		await this.stalls.track("analytics", "", this.accountUsage.refresh(now, false));
 		if (now >= this.nextSessionSweepAt) {
 			try {
 				// A full batch may have left more behind; sweep again on the next alarm.
@@ -3095,7 +3250,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!attachment) continue;
 			const due = new Set(connectionDeadlines(attachment).filter(([, at]) => at <= now).map(([kind]) => kind));
 			if (due.has("auth")) {
-				this.closePolicy(socket, attachment, 1008, AUTH_TIMEOUT_REASON);
+				// One that never sent a frame, not even an answered ping, may have
+				// lost its client during the upgrade: counted apart, as `silent`.
+				// frameTimes is empty until the first frame (it is pruned only as
+				// new frames come), as lastFrameAt is unset.
+				const silent = attachment.frameTimes.length === 0 && !this.ctx.getWebSocketAutoResponseTimestamp(socket);
+				this.closePolicy(socket, attachment, 1008, AUTH_TIMEOUT_REASON, silent ? "silent" : "");
 				continue;
 			}
 			if (due.has("challenge")) {
@@ -3432,14 +3592,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 		try { this.store.noteThrottleTrip(trigger, now); } catch { /* the log and metric still hold it */ }
 	}
 
-	private closePolicy(socket: WebSocketConnection, attachment: ConnectionAttachment, code: number, reason: string): void {
+	private closePolicy(socket: WebSocketConnection, attachment: ConnectionAttachment, code: number, reason: string, detail = ""): void {
 		const closed = attachment.closing === true || connectionAttachment(socket)?.closing === true;
 		attachment.policyViolations = [...attachment.policyViolations.filter((at) => at > nowMs() - 60_000), nowMs()];
 		attachment.closing = true;
 		writeAttachment(socket, attachment);
 		try { socket.close(code, reason.slice(0, 120)); } catch { /* already closed */ }
 		if (!closed) {
-			this.refusals.note("close", `${code} ${reason}`, "", nowMs());
+			this.refusals.note("close", `${code} ${reason}`, detail, nowMs());
 			this.connectionGone(attachment);
 		}
 	}
@@ -3675,7 +3835,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (!DEFINED_AUTH_SCHEMES.has(offered)) throw { name: "invalid_params", message: "Unknown authentication scheme" } satisfies ProtocolError;
 			if (offered === "email") throw { name: "unsupported", message: "Email sign-in is not offered" } satisfies ProtocolError;
 			if (offered === "external" && !this.externalOrigin(attachment)) throw { name: "unsupported", message: "External sign-in is not offered" } satisfies ProtocolError;
-			if (offered === "webauthn" && !this.passkeysOfferedTo(this.requestOrigin(socket), attachment.endpoint)) throw { name: "unsupported", message: "Passkeys are not offered to this origin" } satisfies ProtocolError;
+			if (offered === "webauthn") {
+				const origin = this.requestOrigin(socket);
+				if (!this.passkeysOfferedTo(origin, attachment.endpoint)) {
+					throw { name: "unsupported", message: `Passkeys are not offered to ${origin === null ? "a connection that sends no Origin" : `origin ${quotedOrigin(origin)}`}` } satisfies ProtocolError;
+				}
+			}
 		}
 		this.store.reserveAuthAttempt({ ipKey: attachment.ipKey, now: nowMs() });
 		const params = request.params;
@@ -3734,7 +3899,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// serves every other client, on the server's own origin (protocol §4.10.1).
 		const local = origin !== null && this.config.rpOrigins.includes(origin);
 		const pageOrigin = this.passkeyPageOrigin(attachment);
-		if (!local && !pageOrigin) throw { name: "denied", message: "Frontend origin is not configured for passkeys" } satisfies ProtocolError;
+		if (!local && !pageOrigin) throw passkeyOriginRefusal(origin);
 		if (step === "begin") {
 			const identity = action === "register" ? identityOf(attachment) : undefined;
 			const name = action === "register" && !adding ? this.requestedName(params) : undefined;
@@ -3764,12 +3929,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// carries the action, a new account's name, or an addition's handle,
 			// which the client keeps (protocol §4.10.1, §4.12.1).
 			if (pageOrigin) {
-				const url = new URL(PASSKEY_PAGE_PATH, pageOrigin);
-				url.searchParams.set("action", action);
-				if (name !== undefined) url.searchParams.set("name", name);
-				if (adding) url.searchParams.set("request", await this.createRequestHandle(attachment.userId!, handle, nowMs()));
+				const query: Record<string, string> = { action };
+				if (name !== undefined) query.name = name;
+				if (adding) query.request = await this.createRequestHandle(attachment.userId!, handle, nowMs());
 				if (connectionAttachment(socket)?.closing || !openSocket(socket)) return;
-				result.external = { url: url.href };
+				result.external = { url: pageUrl(pageOrigin, PASSKEY_PAGE_PATH, query) };
 			}
 			this.reply(socket, request, result);
 			await this.rescheduleAlarm();
@@ -3794,7 +3958,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await this.completePasskeySignIn(socket, attachment, request, finished, signIn, { adds: code.adds === true, newAccount: code.action === "register" });
 			return;
 		}
-		if (!local) throw { name: "denied", message: "Frontend origin is not configured for passkeys" } satisfies ProtocolError;
+		if (!local) throw passkeyOriginRefusal(origin, pageOrigin !== undefined);
 		const challengeId = requiredString(params, "challenge_id");
 		const challenge = attachment.challenge;
 		// A matching finish consumes the pending ceremony before any proof work,
@@ -4063,7 +4227,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// This server's own access tokens are Apron tokens, for `token` (ext:oauth).
 		if (params.token !== undefined) throw { name: "denied", message: "Sign in with this server's tokens through the token scheme" } satisfies ProtocolError;
 		if (params.code === undefined) {
-			this.reply(socket, request, { external: { url: `${origin}${AUTHORIZE_PATH}` } });
+			this.reply(socket, request, { external: { url: pageUrl(origin, AUTHORIZE_PATH) } });
 			return;
 		}
 		const code = await this.takeSignInCode(params, "authorize", origin);
@@ -4485,7 +4649,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async handleTokenResumeLocked(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, bearer: boolean): Promise<void> {
 		if (attachment.tier === "registered") throw { name: "denied", message: "Identity switching requires reconnect" } satisfies ProtocolError;
 		const origin = this.requestOrigin(socket);
-		if (!bearer && (!origin || !this.config.rpOrigins.includes(origin))) throw { name: "denied", message: "Frontend origin is not configured for passkeys" } satisfies ProtocolError;
+		if (!bearer && (!origin || !this.config.rpOrigins.includes(origin))) throw passkeyOriginRefusal(origin);
 		const token = requiredString(request.params, "token");
 		if (token.length > MAX_SESSION_TOKEN_CHARS) throw { name: "too_large", message: "token is too long" } satisfies ProtocolError;
 		const key = await sessionKey(token);
@@ -5085,6 +5249,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 		});
 		this.noteBotActive(attachment.userId ?? identity.user_id, attachment.roles ?? []);
 		if (created) {
+			const latest = connectionAttachment(socket);
+			const active = latest && this.markActive(latest, "write", nowMs());
+			if (latest && active) {
+				writeAttachment(socket, latest);
+				this.recordActive(active);
+			}
 			// Posting in a room shows its poster saw it: their waiting and held wakes for it go.
 			this.dropWakes(identity.user_id, created.room_id);
 			this.dropHeld(identity.user_id, created.room_id);
@@ -5899,9 +6069,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 		// counted it up again while the sign-in went on did not see this
 		// connection as theirs: it owes the zeroing too.
 		const signedIn = connectionAttachment(socket);
-		if (signedIn && stored && stored.unreadClaims !== this.unreadClaims) {
-			signedIn.unreadOwed = true;
+		if (signedIn) {
+			// A sign-in counts its user active today, even one this connection
+			// counted as someone else before.
+			delete signedIn.activeDay;
+			delete signedIn.postedDay;
+			const active = this.markActive(signedIn, "read", nowMs());
+			if (stored && stored.unreadClaims !== this.unreadClaims) signedIn.unreadOwed = true;
 			writeAttachment(socket, signedIn);
+			if (active) this.recordActive(active);
 		}
 		this.syncServer(socket);
 		this.sendMutesInEffect(socket, stored);
@@ -6080,9 +6256,11 @@ export class ApronDemoServer extends DurableObject<Env> {
 	// be announced survives hibernation. A change goes out at most once a
 	// `statusCoalesceSeconds` per user, the latest winning, and one a closed
 	// connection caused waits `offlineGraceSeconds` first, so a reload or a
-	// reconnect shows nothing; a change the user makes with `me` goes out at
-	// once. The object's alarm announces a change when it is due
-	// (armPresence), rounded up to `presenceAlarmSeconds` (a guest's to
+	// reconnect shows nothing; a change the user makes with `me`, and one
+	// that shows them more present than others were told (showsMorePresent:
+	// back from `offline`, or `idle` to `online`), goes out at once. The
+	// object's alarm announces a change when it is due (armPresence),
+	// rounded up to `presenceAlarmSeconds` (a guest's to
 	// `guestPresenceAlarmSeconds`), and lets the object hibernate meanwhile;
 	// events sweep too. Changes go as `user` `new` to others who share a room. The
 	// same sweep tells the user's connections of mutes that run out.
@@ -6256,7 +6434,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 					return;
 				}
 				const hold = Math.max(pres.h ?? 0, options.hold ? now + graceMs : 0);
-				const due = options.immediate ? now : Math.max(this.lastAnnounced(userId, pres) + coalesceMs, hold);
+				// Coming back (showsMorePresent) goes out at once, past the minute and any grace.
+				const due = options.immediate || showsMorePresent(pres.s, shown) ? now : Math.max(this.lastAnnounced(userId, pres) + coalesceMs, hold);
 				if (due <= now) {
 					this.announceStatus(userId, states, shown, now, options.seen);
 					return;
@@ -6525,7 +6704,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 					if (pres.h !== undefined) this.writePresence(states, { s: pres.s, a: pres.a });
 					continue;
 				}
-				const due = Math.max(this.lastAnnounced(userId, pres) + coalesceMs, pres.h ?? 0);
+				const due = showsMorePresent(pres.s, shown) ? now : Math.max(this.lastAnnounced(userId, pres) + coalesceMs, pres.h ?? 0);
 				if (due <= now) this.announceStatus(userId, states, shown, now);
 				else wait(userId, due);
 			}
@@ -7223,18 +7402,29 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * Records the database's size in the `db_bytes` metric at most once an
-	 * hour (DATABASE_SIZE_METRIC_MS), so its trend toward the storage
-	 * watermarks shows in npm run usage:report long before they refuse
-	 * anything. Reading the size is a property of the SQL handle: no query.
+	 * Checks the database's size against the storage alert at most once an
+	 * hour an instance (DATABASE_SIZE_METRIC_MS), and records it in the
+	 * `db_bytes` metric from a full alarm, at most as often, so its trend
+	 * toward the storage watermarks shows in npm run usage:report long before
+	 * they refuse anything. Only full alarms record it: a wake from
+	 * hibernation starts a new instance, so an hourly limit in memory alone
+	 * let nearly every light alarm record it, hundreds a day. Reading the
+	 * size is a property of the SQL handle: no query.
 	 */
-	private maybeRecordDatabaseSize(now: number): void {
-		if (now - this.databaseSizeRecordedAt < DATABASE_SIZE_METRIC_MS) return;
+	private checkDatabaseSize(now: number, full: boolean): void {
+		const check = now - this.databaseSizeCheckedAt >= DATABASE_SIZE_METRIC_MS;
+		const record = full && now - this.databaseSizeRecordedAt >= DATABASE_SIZE_METRIC_MS;
+		if (!check && !record) return;
 		const size = this.store.databaseSize();
 		if (size === null) return;
-		this.databaseSizeRecordedAt = now;
-		recordMetric(this.runtimeEnv.METRICS, "db_bytes", [], size);
-		this.maybeAlertStorage(size, now);
+		if (record) {
+			this.databaseSizeRecordedAt = now;
+			recordMetric(this.runtimeEnv.METRICS, "db_bytes", [], size);
+		}
+		if (check) {
+			this.databaseSizeCheckedAt = now;
+			this.maybeAlertStorage(size, now);
+		}
 	}
 
 	/**
@@ -7371,7 +7561,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * Burn samples from an entry Worker isolate (sampleEntry): requests it
 	 * answered without the object, scaled up, and how many it refused.
 	 */
-	async noteEntrySamples(seen: number, refused: number): Promise<void> {
+	noteEntrySamples(seen: number, refused: number): Promise<void> {
+		this.stalls.event(() => this.awakeSnapshot());
+		return this.stalls.track("handler", "rpc_samples", this.entrySamples(seen, refused));
+	}
+
+	private async entrySamples(seen: number, refused: number): Promise<void> {
 		const bounded = (value: number) => Number.isSafeInteger(value) && value >= 0 ? Math.min(value, 100_000_000) : 0;
 		const now = nowMs();
 		this.burn.note("rpc", now);
@@ -7475,8 +7670,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		};
 		// Mentions, replies and private rooms are messages for this user, so
 		// `high`; one pushed only for `joined` is `normal` (§4.9).
-		const outcomes = await Promise.allSettled(subscriptions.map((subscription) =>
-			sendWebPush(subscription, payloadFor(subscription.pushId, subscription.unread), vapid, { ttlSeconds, urgency: subscription.reasons === WAKE_SCOPES.joined ? "normal" : "high", nowMs: nowMs() })));
+		const outcomes = await this.stalls.track("push", "", Promise.allSettled(subscriptions.map((subscription) =>
+			sendWebPush(subscription, payloadFor(subscription.pushId, subscription.unread), vapid, { ttlSeconds, urgency: subscription.reasons === WAKE_SCOPES.joined ? "normal" : "high", nowMs: nowMs() }))));
 		const gone: Array<{ userId: string; url: string; p256dh: string }> = [];
 		let failed = 0;
 		outcomes.forEach((outcome, index) => {
@@ -8451,7 +8646,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (!media) return false;
 		if (draft.key) {
 			try {
-				await media.put(draft.key, draft.json, { httpMetadata: { contentType: "application/json", cacheControl: "public, max-age=31536000, immutable" } });
+				await this.stalls.track("r2", "put", media.put(draft.key, draft.json, { httpMetadata: { contentType: "application/json", cacheControl: "public, max-age=31536000, immutable" } }));
 			} catch {
 				return false;
 			}
@@ -9186,6 +9381,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async sendStatus(socket: WebSocketConnection, request: RequestFrame, roomId: string): Promise<void> {
 		const now = nowMs();
+		// Read alongside the usage refresh; left out where it is not configured.
+		const active = activeUsersConfigured(this.runtimeEnv) ? this.activeUsersStatus(now) : undefined;
 		await this.accountUsage.refresh(now, true);
 		const { budget, identities, databaseBytes, counts } = this.store.status(now);
 		const pruned = this.store.idlePruned(now);
@@ -9281,11 +9478,21 @@ export class ApronDemoServer extends DurableObject<Env> {
 			`- Registrations: ${share(budget.registrations, limits.registrationsPerDay)}`,
 			...(this.config.push && PUSH_POLICY ? [`- Pushes: ${share(this.store.pushesToday(now), PUSH_POLICY.pushesPerDay)}`] : []),
 			`- Registered users: ${share(identities, limits.registeredIdentityCount)}${pruned.total ? ` (idle accounts removed: ${count(pruned.today)} today, ${count(pruned.total)} in all)` : ""}`,
+			...(active ? [await active] : []),
 			`- Open connections: ${share(this.ctx.getWebSockets().length, limits.openConnections)}`,
 			`- Database: ${databaseBytes === null ? "unknown" : mib(databaseBytes)} / ${mib(limits.databaseHardTargetBytes)}`,
 		);
 		this.sendNotice(socket, roomId, lines.join("\n"));
 		this.reply(socket, request, {});
+	}
+
+	/** `/status`'s active users line (src/active-users.ts): never throws, and gives up after 5 seconds. */
+	private async activeUsersStatus(now: number): Promise<string> {
+		try {
+			return activeUsersLine(await this.stalls.track("analytics", "active", fetchActiveUsers(this.runtimeEnv, now, fetch, AbortSignal.timeout(5_000))));
+		} catch (error) {
+			return activeUsersLine(error instanceof Error ? error : new Error(String(error)));
+		}
 	}
 
 	/**
@@ -9882,8 +10089,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const prior = this.mutationTail;
 		let release!: () => void;
 		this.mutationTail = new Promise<void>((resolve) => { release = resolve; });
-		await prior;
-		try { await fn(); }
+		// Time spent behind earlier changes, then this one's own (it awaits only R2 and signing).
+		await this.stalls.track("queue", "", prior);
+		try { await this.stalls.track("mutation", "", fn()); }
 		catch (error) {
 			if (!(error instanceof StoreError) || error.code === "internal_error") {
 				// A platform/accounting failure may make commit visibility uncertain.
@@ -9932,7 +10140,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const media = this.runtimeEnv.MEDIA;
 		if (!media || !keys.length) return;
 		for (let start = 0; start < keys.length; start += 1_000) {
-			this.ctx.waitUntil(media.delete(keys.slice(start, start + 1_000)).catch(() => undefined));
+			this.ctx.waitUntil(this.stalls.track("r2", "delete", media.delete(keys.slice(start, start + 1_000))).catch(() => undefined));
 		}
 	}
 
@@ -9947,7 +10155,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.ctx.waitUntil((async () => {
 			const key = this.store.avatarRefreshDue(userId, nowMs());
 			if (!key) return;
-			const object = await media.get(key);
+			const object = await this.stalls.track("r2", "get", media.get(key));
 			if (!object) {
 				const cleared = this.store.clearAvatar({ userId, now: nowMs() });
 				// This runs at sign-in: telling others of an invisible user's
@@ -9958,7 +10166,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (cleared.changed) this.announceAvatar(userId, "", !hidden);
 				return;
 			}
-			await media.put(key, await object.arrayBuffer(), { httpMetadata: object.httpMetadata });
+			await this.stalls.track("r2", "put", (async () => media.put(key, await object.arrayBuffer(), { httpMetadata: object.httpMetadata }))());
 			this.store.renewAvatar({ userId, key, now: nowMs() });
 		})().catch(() => undefined));
 	}
@@ -9997,6 +10205,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * this upload is waiting for one. Only one request may write it.
 	 */
 	async claimUpload(key: string): Promise<boolean | "closed"> {
+		this.stalls.event(() => this.awakeSnapshot());
 		return !!this.config.uploads && this.asUploadOwner(key, () => this.store.claimUpload(key, nowMs()));
 	}
 
@@ -10017,7 +10226,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * owner's. Returns whether the write was accepted; if not, the Worker
 	 * deletes what it stored.
 	 */
-	async finishUpload(write: UploadWrite): Promise<boolean> {
+	finishUpload(write: UploadWrite): Promise<boolean> {
+		this.stalls.event(() => this.awakeSnapshot());
+		return this.stalls.track("handler", "rpc_upload", this.uploadFinished(write));
+	}
+
+	private async uploadFinished(write: UploadWrite): Promise<boolean> {
 		if (!this.config.uploads) return false;
 		if (write.key.startsWith("e/")) return this.finishEmoji(write);
 		let finished: UploadFinish = { accepted: false, broadcasts: [], deletedUploads: [] };

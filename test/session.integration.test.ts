@@ -146,7 +146,7 @@ it('binds sessions to their origin, refuses them without one, and drops expired 
 	// Without an Origin `token` is still offered, for bot tokens (/invite-bot),
 	// but a passkey session stays on the origin it was issued for.
 	const originless = await resume(await issueSession('user_session_two', 'http://localhost:5173'), 'originless', null);
-	expect(originless.reply.error.code).toBe(-32001);
+	expect(originless.reply.error).toMatchObject({ code: -32001, message: 'This connection sends no Origin; passkeys need a configured origin' });
 	originless.peer.close();
 
 	await runInDurableObject(stub(), async (_instance, state) => {

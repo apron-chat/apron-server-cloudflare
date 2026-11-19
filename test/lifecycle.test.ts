@@ -335,11 +335,19 @@ it("keeps what other events changed on a connection while a passkey ceremony awa
 	}
 });
 
-it("records the database's size from an alarm, at most once an hour", async () => {
+it("records the database's size from a full alarm, at most once an hour, and never from a light one", async () => {
 	const stub = env.DEMO.getByName("public-demo-v1");
-	type Metered = { runtimeEnv: { METRICS?: unknown }; databaseSizeRecordedAt: number };
+	type Metered = { runtimeEnv: { METRICS?: unknown }; databaseSizeRecordedAt: number; store: { forgetCleanupDue(): void } };
 	const calls: Array<{ indexes: string[]; blobs: string[]; doubles: number[] }> = [];
 	const sizes = () => calls.filter((point) => point.indexes[0] === "db_bytes");
+	const alarmAt = async (cleanupMs: number) => {
+		await runInDurableObject(stub, async (instance, state) => {
+			state.storage.sql.exec("UPDATE maintenance SET next_cleanup_ms = ? WHERE id = 1", cleanupMs);
+			(instance as unknown as Metered).store.forgetCleanupDue();
+			if ((await state.storage.getAlarm()) === null) await state.storage.setAlarm(Date.now());
+		});
+		expect(await runDurableObjectAlarm(stub)).toBe(true);
+	};
 	// A pending socket's sign-in deadline schedules a real alarm.
 	const peer = await pendingSocket();
 	try {
@@ -349,14 +357,16 @@ it("records the database's size from an alarm, at most once an hour", async () =
 			// Other suites' alarms may have recorded it within the hour.
 			metered.databaseSizeRecordedAt = -Infinity;
 		});
-		expect(await runDurableObjectAlarm(stub)).toBe(true);
+		// A light alarm (status and connection deadlines only): nothing.
+		await alarmAt(Date.now() + 3_600_000);
+		expect(sizes()).toHaveLength(0);
+		// A full one (cleanup due) records it.
+		await alarmAt(0);
 		expect(sizes()).toHaveLength(1);
 		expect(sizes()[0].blobs).toEqual(["db_bytes"]);
 		expect(sizes()[0].doubles[0]).toBeGreaterThan(0);
-
-		// A later alarm within the hour records nothing more.
-		await runInDurableObject(stub, async (_instance, state) => { if ((await state.storage.getAlarm()) === null) await state.storage.setAlarm(Date.now()); });
-		expect(await runDurableObjectAlarm(stub)).toBe(true);
+		// A later full alarm within the hour records nothing more.
+		await alarmAt(0);
 		expect(sizes()).toHaveLength(1);
 	} finally {
 		await runInDurableObject(stub, async (instance) => { delete (instance as unknown as Metered).runtimeEnv.METRICS; });

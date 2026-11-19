@@ -342,6 +342,31 @@ it('evicts an idle guest only for an upgrade that passes every check, never for 
 	} finally { idle.close(); }
 });
 
+it('counts an idle guest idle from its last frame, not from when it said idle', async () => {
+	const guest = await connect();
+	try {
+		await greeting(guest);
+		const me = (await request(guest, 'auth', 'auth', { scheme: 'guest' })).result.you.user_id;
+		expect((await request(guest, 'idle', 'status', { idle: 60 })).result).toEqual({});
+		// Its last frame, after it said idle: the one the frame handler stores.
+		await request(guest, 'list', 'room_list', {});
+		await runInDurableObject(stub(), (instance, state) => {
+			const runtime = instance as unknown as { idlestGuest(sockets: WebSocket[], now: number): unknown };
+			const mine = state.getWebSockets().filter((socket) => {
+				const attachment = socket.deserializeAttachment() as { userId?: string; idle?: boolean; closing?: boolean; lastFrameAt?: number };
+				return attachment.userId === me && !attachment.closing && attachment.idle && attachment.lastFrameAt !== undefined;
+			});
+			expect(mine).toHaveLength(1);
+			const { idleAt, lastFrameAt } = mine[0].deserializeAttachment() as { idleAt: number; lastFrameAt: number };
+			// Said idle 10 minutes before its last frame: not yet a candidate 9 minutes after that frame.
+			mine[0].serializeAttachment({ ...mine[0].deserializeAttachment(), idleAt: lastFrameAt - 10 * 60_000 });
+			expect(idleAt).toBeLessThanOrEqual(lastFrameAt);
+			expect(runtime.idlestGuest(mine, lastFrameAt + 9 * 60_000)).toBeUndefined();
+			expect(runtime.idlestGuest(mine, lastFrameAt + 10 * 60_000)).toBeDefined();
+		});
+	} finally { guest.close(); }
+});
+
 it('never evicts a guest who is reading (no `idle`), and an evicted address does not evict in turn', async () => {
 	const reader = await connect();
 	const idle = await connect();

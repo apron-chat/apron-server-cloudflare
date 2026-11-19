@@ -56,6 +56,9 @@ ROOM_METADATA_LIMIT = "8192"
 ROOM_METADATA_MIN_LIMIT = "1024"
 ROOM_METADATA_TOTAL_LIMIT = "262144"
 ACCOUNT_ID = "2bfd32937c0c07a923c79f6bb1a17253"
+# The dataset METRICS (below) writes, for /status to read active users back
+# (src/active-users.ts); npm run budget:check holds the two equal.
+METRICS_DATASET = "apron_server_metrics"
 # The apron.chat zone, where the budget guard turns the apron_budget_stop rule
 # on and off (with the EDGE_STOP_TOKEN secret).
 ZONE_ID = "d7467571c212da5b57bbc92afeb967b7"
@@ -114,6 +117,8 @@ RP_ORIGINS = "https://previews.apron.chat"
 # drop it.
 SIGNAL_UNKNOWN_PASSKEYS = "false"
 ALLOWED_ORIGINS = "*"
+# The Previews' own dataset (below), never production's.
+METRICS_DATASET = "apron_server_metrics_preview"
 SERVER_TITLE = "Apron Demo (preview)"
 SERVER_DESCRIPTION = "The public demo of [Apron](https://github.com/shazow/apron), an open chat protocol."
 SERVER_AVATAR = "https://web.apron.chat/icon-512.png"

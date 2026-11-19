@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { STATUSES, STATUS_CHOICES, isStatus, isStatusChoice, shownStatus, statusChoice, type StatusChoice } from '../src/presence';
+import { STATUSES, STATUS_CHOICES, isStatus, isStatusChoice, shownStatus, showsMorePresent, statusChoice, type StatusChoice } from '../src/presence';
 
 const seen = (choice: StatusChoice, connected: boolean, attended = false) => shownStatus({ choice, connected, attended });
 
@@ -39,5 +39,10 @@ describe('user status (§4.5): what others see of the status a user chose', () =
 		expect(isStatusChoice('idle')).toBe(false);
 		expect(isStatus('invisible')).toBe(false);
 		expect(isStatus(undefined)).toBe(false);
+	});
+
+	it('shows a user more present only coming back: offline to any status shown connected, or idle to online or dnd', () => {
+		const more = STATUSES.flatMap((from) => STATUSES.filter((to) => showsMorePresent(from, to)).map((to) => `${from}>${to}`));
+		expect(more.sort()).toEqual(['idle>dnd', 'idle>online', 'offline>dnd', 'offline>idle', 'offline>online']);
 	});
 });
