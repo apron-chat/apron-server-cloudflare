@@ -5,13 +5,30 @@ a header, then listings and `rooms` / `messages` / `reactions` /
 `memberships` records as `room_list` and `history` give them), and what a
 program needs to read, write, replay, renumber and encrypt them.
 
-Pure TypeScript with no runtime dependencies and no storage or platform
-code: WebCrypto, `TextEncoder`, `ReadableStream` and `btoa` only, so it runs
-the same in browsers, Cloudflare Workers and Node (22.18 or later, which
-loads the `.ts` sources by type stripping; bundlers such as esbuild and
-Vite take them as they are). It lives in apron-server-cloudflare as an
-npm workspace for now (`private`), to be shared with scene.apron.chat and
-apron-web.
+TypeScript with no runtime dependencies and no storage or platform code:
+WebCrypto, `TextEncoder`, `ReadableStream` and `btoa` only, so it runs the
+same in browsers, Cloudflare Workers and Node 20 or later. It lives in
+apron-server-cloudflare as an npm workspace, shared with scene.apron.chat
+and, later, apron-web.
+
+## Installing
+
+Releases are compiled: ES modules with `.d.ts` declarations, so a consumer
+needs no TypeScript settings of its own. Each release is a tarball on the
+repository's GitHub releases:
+
+```sh
+npm install https://github.com/apron-chat/apron-server-cloudflare/releases/download/archive-v0.1.0/apron-archive-0.1.0.tgz
+```
+
+and, once an `NPM_TOKEN` secret is set, `npm install @apron/archive`.
+
+To release: bump `version` in `package.json`, merge, and push the tag
+`archive-v<version>`. `.github/workflows/archive.yml` runs the package's
+tests, builds it (`npm run build -w @apron/archive`: `scripts/build.mjs`
+writes `dist/` with a publishable `package.json`), and attaches
+`npm pack dist` to a release. The workspace `package.json` stays `private`
+and points at `src/`: this repository imports the sources directly.
 
 ## Modules
 

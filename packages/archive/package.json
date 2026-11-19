@@ -1,11 +1,19 @@
 {
 	"name": "@apron/archive",
-	"version": "0.0.1",
+	"version": "0.1.0",
 	"private": true,
 	"description": "Apron ARCHIVE.md v1: types, JSON Lines codec, record replay, ID remapping and encrypted archives",
 	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/apron-chat/apron-server-cloudflare.git",
+		"directory": "packages/archive"
+	},
 	"type": "module",
 	"sideEffects": false,
+	"engines": {
+		"node": ">=20"
+	},
 	"exports": {
 		".": "./src/index.ts",
 		"./records": "./src/records.ts",
@@ -15,5 +23,13 @@
 		"./ids": "./src/ids.ts",
 		"./crypto": "./src/crypto.ts"
 	},
-	"files": ["src"]
+	"files": [
+		"src"
+	],
+	"scripts": {
+		"build": "node scripts/build.mjs"
+	},
+	"publishConfig": {
+		"access": "public"
+	}
 }

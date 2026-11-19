@@ -1,0 +1,54 @@
+name: Release @apron/archive
+
+# Tag archive-v<version> (matching packages/archive/package.json) to release
+# the package: its tests run, the build (compiled JS and .d.ts, see
+# packages/archive/scripts/build.mjs) is packed, and the tarball is attached
+# to a GitHub release, installable by URL:
+#   npm install https://github.com/apron-chat/apron-server-cloudflare/releases/download/archive-v<version>/apron-archive-<version>.tgz
+# With an NPM_TOKEN secret, it is also published to npm as @apron/archive.
+
+on:
+  push:
+    tags: ["archive-v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - name: Check the tag names the package's version
+        run: |
+          version=$(node -p "require('./packages/archive/package.json').version")
+          test "$GITHUB_REF_NAME" = "archive-v$version" || { echo "tag $GITHUB_REF_NAME is not archive-v$version"; exit 1; }
+      - run: npx vitest run packages/archive
+      - run: npm run build -w @apron/archive
+      - run: npm pack ./packages/archive/dist
+      - name: Attach the tarball to a release
+        run: |
+          tarball=$(ls apron-archive-*.tgz)
+          gh release create "$GITHUB_REF_NAME" "$tarball" --title "@apron/archive ${GITHUB_REF_NAME#archive-v}" \
+            --notes "npm install https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${tarball}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Publish to npm
+        if: env.NPM_TOKEN != ''
+        run: npm publish ./packages/archive/dist --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ env.NPM_TOKEN }}

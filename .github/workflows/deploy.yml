@@ -28,6 +28,9 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      # @apron/archive as consumers install it: compiled, and loadable by plain Node.
+      - run: npm run build -w @apron/archive
+      - run: node --input-type=module -e "const lib = await import('./packages/archive/dist/index.js'); if (typeof lib.readArchive !== 'function') throw new Error('readArchive missing from the build')"
 
   deploy:
     needs: test
