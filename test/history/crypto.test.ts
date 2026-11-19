@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import {
 	ArchiveDecryptError,
 	ArchiveKeyError,
+	type DecryptionStatus,
 	decryptingLines,
 	deriveBackupKey,
 	encryptingSink,
@@ -134,6 +135,22 @@ describe("encrypted archives", () => {
 		// No plaintext shows through.
 		expect(encrypted.join("\n")).not.toContain("lobby");
 		expect(await decrypt(encrypted)).toEqual(ARCHIVE);
+	});
+
+	it("says whether its input was decrypted, and refuses a header's chunk_bytes past 4 MiB", async () => {
+		const read = async (lines: readonly string[]) => {
+			const status: DecryptionStatus = {};
+			const out: string[] = [];
+			for await (const line of decryptingLines(from(lines), resolveKeys(env, ["HISTORY_BACKUP_KEY"]), status)) out.push(line);
+			return { out, status };
+		};
+		const encrypted = await encrypt(ARCHIVE, "HISTORY_BACKUP_KEY", CURRENT, 64);
+		expect((await read(encrypted)).status).toEqual({ encrypted: true });
+		expect((await read(ARCHIVE)).status).toEqual({ encrypted: false });
+		const header = JSON.parse(encrypted[0]!);
+		const large = [JSON.stringify({ ...header, chunk_bytes: 4 * 1024 * 1024 + 1 }), ...encrypted.slice(1)];
+		await expect(read(large)).rejects.toThrow(/chunk_bytes/);
+		expect(() => encryptingSink(async () => {}, { name: "K", key: {} as CryptoKey, fingerprint: "0".repeat(16), chunkBytes: 4 * 1024 * 1024 + 1 })).toThrow(RangeError);
 	});
 
 	it("uses the default 1 MiB chunks and a fresh nonce each time", async () => {

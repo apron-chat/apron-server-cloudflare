@@ -94,6 +94,8 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead {
 	readonly people = new Map<string, ArchivedUser>();
 	readonly retired = new Set<string>();
 	private last = 0;
+	/** Import: what a client could have sent of a record (HistoryHead.normalizeRecord); unset, every record is taken as it is. */
+	normalizeRecord?: (record: ChatRecord) => ChatRecord | null;
 
 	constructor(name: string, private readonly clock: Clock) {
 		super(name);

@@ -234,7 +234,7 @@ describe("SqlSegmentIndex", () => {
 				rows: <T>(sql: string, ...binds: unknown[]) => state.storage.sql.exec(sql, ...binds).toArray() as T[],
 				run: (sql: string, ...binds: unknown[]) => void state.storage.sql.exec(sql, ...binds),
 			};
-			expect(SEGMENT_SCHEMA.length).toBe(2);
+			expect(SEGMENT_SCHEMA.length).toBe(4);
 			const index = new SqlSegmentIndex(port);
 			index.ensureSchema();
 			index.ensureSchema();

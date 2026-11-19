@@ -34,6 +34,13 @@ import type { ArchiveHeader, ArchivedRoom, ArchivedUser, ArchivePart, ArchiveRea
 /** The default cap on one line's UTF-8 size, newline included: 256 KiB. */
 export const MAX_LINE_BYTES = 256 * 1024;
 
+/**
+ * The longest line a reader takes, in UTF-8 bytes: 1 MiB. A writer puts an
+ * entry larger than MAX_LINE_BYTES on a line of its own, and no record this
+ * server keeps comes near this; a longer line fails the read.
+ */
+export const MAX_READ_LINE_BYTES = 1024 * 1024;
+
 /** The archive key each record kind is written under, in the order a part lists them. */
 export const RECORD_KEYS: Readonly<Record<RecordKind, string>> = {
 	room: "rooms",
@@ -252,7 +259,8 @@ export function partsOfLine(line: JsonObject): ArchivePart[] {
 }
 
 /**
- * An ArchiveReader over lines (with or without their "\n" or "\r\n"). It
+ * An ArchiveReader over lines (with or without their "\n" or "\r\n"); a
+ * line over MAX_READ_LINE_BYTES fails the read. It
  * reads the source once: `header()` may be called any number of times, and
  * `parts()` once, which reads the header first if it has not been read.
  */
@@ -268,6 +276,9 @@ export function jsonlReader(lines: AsyncIterable<string>): ArchiveReader {
 			const step = await iterator.next();
 			if (step.done) return undefined;
 			lineNumber++;
+			if (step.value.length > MAX_READ_LINE_BYTES || (step.value.length > MAX_READ_LINE_BYTES / 3 && utf8Length(step.value) > MAX_READ_LINE_BYTES)) {
+				throw new Error(`archive line ${lineNumber} is longer than ${MAX_READ_LINE_BYTES} bytes`);
+			}
 			const value = parseLine(step.value);
 			if (value) return value;
 		}
@@ -307,8 +318,13 @@ export async function* linesOf(text: string): AsyncIterable<string> {
 	if (start < text.length) yield text.slice(start);
 }
 
-/** The lines of a UTF-8 byte stream, decoded across chunk boundaries, without their "\n". */
-export async function* linesFromStream(stream: ReadableStream<Uint8Array>): AsyncIterable<string> {
+/**
+ * The lines of a UTF-8 byte stream, decoded across chunk boundaries, without
+ * their "\n". A line longer than `maxLine` UTF-16 units (default 8 Mi: an
+ * encrypted archive's chunk lines are base64 of up to 4 MiB) fails, so a
+ * file without line breaks is never held whole.
+ */
+export async function* linesFromStream(stream: ReadableStream<Uint8Array>, maxLine = 8 * 1024 * 1024): AsyncIterable<string> {
 	const reader = stream.getReader();
 	const decoder = new TextDecoder("utf-8");
 	let buffer = "";
@@ -322,6 +338,7 @@ export async function* linesFromStream(stream: ReadableStream<Uint8Array>): Asyn
 				buffer = buffer.slice(end + 1);
 				end = buffer.indexOf("\n");
 			}
+			if (buffer.length > maxLine) throw new Error(`archive line longer than ${maxLine} characters`);
 			if (done) break;
 		}
 		if (buffer) yield buffer;

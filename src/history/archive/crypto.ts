@@ -39,8 +39,16 @@ const NONCE_BYTES = 12;
 const ID_BYTES = 16;
 const TAG_BYTES = 16;
 const DEFAULT_CHUNK_BYTES = 1024 * 1024;
-/** The largest chunk accepted, writing or reading: a corrupt header must not make a reader hold gigabytes. */
-const MAX_CHUNK_BYTES = 64 * 1024 * 1024;
+/** The largest chunk accepted, writing or reading: a corrupt or crafted header must not make a reader hold more. */
+export const MAX_CHUNK_BYTES = 4 * 1024 * 1024;
+/** The longest plaintext line a reader holds while it waits for the line's end (as format.ts MAX_READ_LINE_BYTES, in UTF-16 units). */
+const MAX_PLAIN_LINE = 1024 * 1024;
+
+/** What decryptingLines learned of its input, filled in once it has read the first line. */
+export interface DecryptionStatus {
+	/** Whether the input was an encrypted archive, decrypted (and so authenticated) with one of the keys given. */
+	encrypted?: boolean;
+}
 
 const encoder = new TextEncoder();
 
@@ -348,7 +356,7 @@ async function unseal(key: CryptoKey, id: string, sealed: Uint8Array<ArrayBuffer
  * (import plans first, PLAN §10.2): a cut-off backup is detected only at its
  * end. Rejects with ArchiveKeyError or ArchiveDecryptError.
  */
-export async function* decryptingLines(lines: AsyncIterable<string>, keys: Pick<BackupKeys, "lookup">): AsyncGenerator<string, void, undefined> {
+export async function* decryptingLines(lines: AsyncIterable<string>, keys: Pick<BackupKeys, "lookup">, status: DecryptionStatus = {}): AsyncGenerator<string, void, undefined> {
 	const input = lines[Symbol.asyncIterator]();
 	const leading: string[] = [];
 	let first: string | undefined;
@@ -366,6 +374,7 @@ export async function* decryptingLines(lines: AsyncIterable<string>, keys: Pick<
 	}
 
 	if (first === undefined || !isEncryptedArchive(first)) {
+		status.encrypted = false;
 		yield* leading;
 		if (first === undefined) return;
 		yield first;
@@ -389,6 +398,8 @@ export async function* decryptingLines(lines: AsyncIterable<string>, keys: Pick<
 		);
 	}
 
+	// Every chunk is authenticated before a line of it comes out: what comes out is the key holder's.
+	status.encrypted = true;
 	const decoder = new TextDecoder();
 	let carry = "";
 	/** The chunk seen last, held until the next line shows whether it is the final one. */
@@ -412,6 +423,7 @@ export async function* decryptingLines(lines: AsyncIterable<string>, keys: Pick<
 		carry += decoder.decode(bytes, { stream: !end });
 		const parts = carry.split("\n");
 		carry = parts.pop()!;
+		if (carry.length > MAX_PLAIN_LINE) throw new ArchiveDecryptError(`this backup holds a line longer than ${MAX_PLAIN_LINE} characters`);
 		yield* parts;
 		if (end && carry !== "") yield carry;
 	};

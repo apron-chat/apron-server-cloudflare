@@ -47,7 +47,7 @@ import { jsonlWriter, utf8Length } from "../archive/format";
 import type { ArchiveHeader, ArchivedUser, RoomListing } from "../archive/types";
 import { type ChatRecord, type Clock, type HistoryQuery, type RecordRange, type Retention, type TierStats, byLog, limitByLogId, thresholdCount, toRange } from "../records";
 import type { FloorContext, HistoryTier } from "../tier";
-import { type SegmentCursor, type SegmentIndex, type SegmentRef, decodeSegment, segmentKey } from "./segments";
+import { type SegmentCursor, type SegmentIndex, type SegmentPosition, type SegmentRef, decodeSegment, segmentKey } from "./segments";
 import type { BlobStore } from "./store";
 
 export const DEFAULT_CACHE_BYTES = 8 * 1024 * 1024;
@@ -55,6 +55,11 @@ export const DEFAULT_CACHE_BYTES = 8 * 1024 * 1024;
 const READ_PARALLEL = 4;
 /** Segments a scan asks the index for at a time. */
 const SCAN_PAGE = 16;
+/** Segments floorFor reads a page, newest first, and the pages it reads at most (SegmentIndex.newest). */
+const FLOOR_PAGE = 500;
+const FLOOR_PAGES = 200;
+/** Segments trimBelow reads a page (SegmentIndex.startingBelow). */
+const TRIM_PAGE = 100;
 
 export interface BlobHistoryTierOptions {
 	name: string;
@@ -276,7 +281,9 @@ export class BlobHistoryTier implements HistoryTier {
 	}
 
 	async read(query: HistoryQuery): Promise<ChatRecord[]> {
-		const refs = await this.index.find(query.roomIds, query.lower, query.upper);
+		// A page needs at most its limit's segments a room from the end it reads
+		// from (each holds a record in the window, but one spanning it whole), and a few more.
+		const refs = await this.index.find(query.roomIds, query.lower, query.upper, { forward: query.forward, limit: Math.max(query.limit, 1) + 8 });
 		refs.sort(query.forward ? (a, b) => a.first - b.first || a.last - b.last : (a, b) => b.last - a.last || b.first - a.first);
 		const rooms = new Set(query.roomIds);
 		return this.gather(async () => refs.shift(), (record) => rooms.has(record.room_id) && record.log_id >= query.lower && record.log_id <= query.upper, query.limit, query.forward);
@@ -295,7 +302,9 @@ export class BlobHistoryTier implements HistoryTier {
 	 * From the index alone: segments cut by the bounds count in proportion to
 	 * the part of their stretch inside them, and `oldest` and `newest` are
 	 * the bounds of the segments' stretches, so both are approximate when
-	 * the bounds cut segments. Each room's copy of a move counts.
+	 * the bounds cut segments. Each room's copy of a move counts. Only the
+	 * oldest SEGMENT_QUERY_ROWS segments in the bounds are counted (the index
+	 * query is bounded): past that, the figures are a lower bound.
 	 */
 	async stats(context: { lower?: number; upper?: number } = {}): Promise<TierStats> {
 		const lower = context.lower ?? 1;
@@ -324,87 +333,111 @@ export class BlobHistoryTier implements HistoryTier {
 	 * holding their threshold's share; the age drops segments whose `last`
 	 * is older than `ageMs`; `minAgeMs` keeps any segment younger. The floor
 	 * is a segment's first, lowered until no segment straddles it.
+	 *
+	 * The index is read newest first, a bounded page at a time, only as far
+	 * as the limits need (FLOOR_PAGES pages at most: past that the walk
+	 * stops, as if the limits were not reached). The straddle check and the
+	 * oldest segment look at SEGMENT_QUERY_ROWS segments each (the index's
+	 * `straddling` and `lowestBelow`); a segment the floor still cuts is
+	 * rewritten by trimBelow rather than lost.
 	 */
 	async floorFor(retention: Retention, context: FloorContext): Promise<number | undefined> {
-		const own = (await this.index.overlapping(1, Number.MAX_SAFE_INTEGER)).filter((ref) => ref.last < context.below);
-		if (!own.length) return undefined;
-		const newestFirst = [...own].sort((a, b) => b.last - a.last || b.first - a.first);
-		let floor: number | undefined;
-		const keepNewest = (limit: number, size: (ref: SegmentRef) => number) => {
-			let total = 0;
-			for (const ref of newestFirst) total += size(ref);
-			if (total <= limit) return;
-			let kept = 0;
-			let lowest = Number.POSITIVE_INFINITY;
-			for (const ref of newestFirst) {
-				kept += size(ref);
-				lowest = Math.min(lowest, ref.first);
-				if (kept >= limit) break;
-			}
-			if (floor === undefined || lowest > floor) floor = lowest;
-		};
 		const records = thresholdCount(retention.records, retention.thresholdPercent);
-		if (records > 0) keepNewest(records, (ref) => ref.records);
 		const bytes = thresholdCount(retention.bytes, retention.thresholdPercent);
-		if (bytes > 0) keepNewest(bytes, (ref) => ref.bytes);
-		if (retention.ageMs && retention.ageMs > 0) {
-			const cutoff = context.now - retention.ageMs;
-			const fresh = own.filter((ref) => ref.last >= cutoff);
-			const ageFloor = fresh.length ? Math.min(...fresh.map((ref) => ref.first)) : Math.max(...own.map((ref) => ref.last)) + 1;
+		const cutoff = retention.ageMs && retention.ageMs > 0 ? context.now - retention.ageMs : undefined;
+		const young = retention.minAgeMs && retention.minAgeMs > 0 ? context.now - retention.minAgeMs : undefined;
+		// Per limit: the total of the newest segments so far, the lowest first among
+		// them, the floor once the total reaches the limit, and whether more
+		// lies beyond (the limit is passed, so the floor applies).
+		type Limit = { limit: number; kept: number; lowest: number; floor?: number; passed: boolean };
+		const count: { records: Limit; bytes: Limit } = { records: { limit: records, kept: 0, lowest: Number.POSITIVE_INFINITY, passed: false }, bytes: { limit: bytes, kept: 0, lowest: Number.POSITIVE_INFINITY, passed: false } };
+		let freshFirst = Number.POSITIVE_INFINITY;
+		let youngFirst = Number.POSITIVE_INFINITY;
+		let newestLast: number | undefined;
+		let after: SegmentPosition | undefined;
+		for (let page = 0; page < FLOOR_PAGES; page += 1) {
+			const refs = await this.index.newest(context.below, FLOOR_PAGE, after);
+			for (const ref of refs) {
+				newestLast ??= ref.last;
+				for (const [limit, size] of [[count.records, ref.records], [count.bytes, ref.bytes]] as const) {
+					if (limit.limit <= 0 || limit.passed) continue;
+					if (limit.floor !== undefined) {
+						if (size > 0) limit.passed = true;
+						continue;
+					}
+					limit.kept += size;
+					limit.lowest = Math.min(limit.lowest, ref.first);
+					if (limit.kept >= limit.limit) {
+						limit.floor = limit.lowest;
+						limit.passed = limit.kept > limit.limit;
+					}
+				}
+				if (cutoff !== undefined && ref.last >= cutoff) freshFirst = Math.min(freshFirst, ref.first);
+				if (young !== undefined && ref.last >= young) youngFirst = Math.min(youngFirst, ref.first);
+			}
+			const oldest = refs.at(-1);
+			const done = (limit: Limit) => limit.limit <= 0 || limit.passed;
+			const agesDone = (cutoff === undefined || (oldest !== undefined && oldest.last < cutoff)) && (young === undefined || (oldest !== undefined && oldest.last < young));
+			if (refs.length < FLOOR_PAGE || (done(count.records) && done(count.bytes) && agesDone)) break;
+			after = oldest;
+		}
+		if (newestLast === undefined) return undefined;
+		let floor: number | undefined;
+		// Kept: the newest segments up to the one that brought the total to the limit.
+		for (const limit of [count.records, count.bytes]) if (limit.passed && limit.floor !== undefined && (floor === undefined || limit.floor > floor)) floor = limit.floor;
+		if (cutoff !== undefined) {
+			const ageFloor = Number.isFinite(freshFirst) ? freshFirst : newestLast + 1;
 			if (floor === undefined || ageFloor > floor) floor = ageFloor;
 		}
-		if (floor !== undefined && retention.minAgeMs && retention.minAgeMs > 0) {
-			const young = own.filter((ref) => ref.last >= context.now - retention.minAgeMs!);
-			if (young.length) floor = Math.min(floor, ...young.map((ref) => ref.first));
-		}
+		if (floor !== undefined && Number.isFinite(youngFirst)) floor = Math.min(floor, youngFirst);
 		if (floor === undefined) return undefined;
 		// Lower it to a boundary no segment straddles, the tier above's included.
-		const all = await this.index.overlapping(1, floor - 1);
-		for (let moved = true; moved;) {
-			moved = false;
-			for (const ref of all) {
-				if (ref.first < floor && ref.last >= floor) {
-					floor = ref.first;
-					moved = true;
-				}
-			}
+		for (let step = 0; step < FLOOR_PAGES; step += 1) {
+			const straddling = await this.index.straddling(floor);
+			if (straddling === undefined || straddling >= floor) break;
+			floor = straddling;
 		}
-		return floor <= Math.min(...own.map((ref) => ref.first)) ? undefined : floor;
+		const lowest = await this.index.lowestBelow(context.below);
+		return lowest !== undefined && floor <= lowest ? undefined : floor;
 	}
 
 	/**
-	 * Deletes segments below `floor`, oldest first, until at least `max`
-	 * records went (so a count under `max` means nothing is left below the
-	 * floor); a segment the floor cuts is rewritten without its records
-	 * below it. Returns how many records went.
+	 * Deletes segments starting below `floor`, oldest first, until at least
+	 * `max` records went (so a count under `max` means nothing is left below
+	 * the floor); a segment the floor cuts is rewritten without its records
+	 * below it. Returns how many records went. The index is read a bounded
+	 * page at a time.
 	 */
 	async trimBelow(floor: number, max: number): Promise<number> {
-		const refs = (await this.index.overlapping(1, floor - 1)).sort((a, b) => a.last - b.last || a.first - b.first);
 		let removed = 0;
-		for (const ref of refs) {
-			if (removed >= max) break;
-			if (ref.last < floor) {
-				await this.discard([ref]);
-				removed += ref.records;
-				continue;
+		while (removed < max) {
+			const refs = await this.index.startingBelow(floor, TRIM_PAGE);
+			if (!refs.length) break;
+			for (const ref of refs) {
+				if (removed >= max) break;
+				if (ref.last < floor) {
+					await this.discard([ref]);
+					removed += ref.records;
+					continue;
+				}
+				const records = await this.load(ref);
+				const kept = records.filter((record) => record.log_id >= floor);
+				// Other segments of the room over the kept stretch (a crash's leftovers) merge in, so the new one replaces no row it should not.
+				const others = (await this.index.find([ref.roomId], floor, ref.last)).filter((other) => other.key !== ref.key);
+				const merged = dedupe(kept);
+				for (const other of others) {
+					const held = await this.load(other);
+					dedupe(held.filter((record) => record.log_id >= floor), merged);
+					removed += held.filter((record) => record.log_id < floor).length;
+				}
+				let replacement: SegmentRef | undefined;
+				if (merged.size) {
+					replacement = await this.write(ref.roomId, [...merged.values()], { first: floor, last: Math.max(ref.last, ...others.map((other) => other.last)) });
+					await this.index.add([replacement]);
+				}
+				await this.discard([ref, ...others].filter((old) => old.key !== replacement?.key));
+				removed += records.length - kept.length;
 			}
-			const records = await this.load(ref);
-			const kept = records.filter((record) => record.log_id >= floor);
-			// Other segments of the room over the kept stretch (a crash's leftovers) merge in, so the new one replaces no row it should not.
-			const others = (await this.index.find([ref.roomId], floor, ref.last)).filter((other) => other.key !== ref.key);
-			const merged = dedupe(kept);
-			for (const other of others) {
-				const held = await this.load(other);
-				dedupe(held.filter((record) => record.log_id >= floor), merged);
-				removed += held.filter((record) => record.log_id < floor).length;
-			}
-			let replacement: SegmentRef | undefined;
-			if (merged.size) {
-				replacement = await this.write(ref.roomId, [...merged.values()], { first: floor, last: Math.max(ref.last, ...others.map((other) => other.last)) });
-				await this.index.add([replacement]);
-			}
-			await this.discard([ref, ...others].filter((old) => old.key !== replacement?.key));
-			removed += records.length - kept.length;
 		}
 		return removed;
 	}

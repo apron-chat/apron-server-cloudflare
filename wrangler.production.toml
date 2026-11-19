@@ -120,6 +120,12 @@ keep = 10
 private_rooms = true
 encrypt = { key_secrets = ["UPLOAD_SIGNING_KEY"] }
 
+# `/history import` takes only encrypted backups here (plaintext: false, the
+# default where an export encrypts): a plain file in the bucket is no backup
+# of this server's.
+[vars.HISTORY.import]
+plaintext = false
+
 # The D1 history tier (src/history/d1.ts, docs/configuration.md, History
 # tiers). Records there stay in history but become read-only: once
 # the object's own SQLite holds more than retentionRecords (LIMIT_RETENTION_RECORDS),

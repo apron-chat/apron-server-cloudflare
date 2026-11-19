@@ -90,10 +90,14 @@ export const historySection: ArchiveSection<HistoryPipeline, HistoryPipeline> = 
 		const rooms = all.filter((room) => (!wanted || wanted.has(room.listing.room_id)) && (options.privateRooms !== false || !isPrivate(room)));
 		const published = await pipeline.publishedFloor();
 		const listings = rooms.map((room) => {
-			// History starts at the published floor or the room's creation, whichever is later.
-			const created = Number(room.listing.log_id ?? 0);
-			const start = Math.max(published, Number.isFinite(created) ? created : 0);
-			return { ...room.listing, history_log_id: room.listing.history_log_id === null ? null : String(start) };
+			// History starts where the room's listing says (the head computes it
+			// from the room's creation and the floor), never below the published
+			// floor. A listing's `log_id` is its latest room record, not its
+			// creation: a retitle must not hide the records before it.
+			const listed = room.listing.history_log_id;
+			if (listed === null) return { ...room.listing, history_log_id: null };
+			const start = typeof listed === "string" && /^\d{1,16}$/.test(listed) ? Math.max(published, Number(listed)) : published;
+			return { ...room.listing, history_log_id: String(start) };
 		});
 		const named = new Set<string>();
 		for (const listing of listings) for (const member of listing.members ?? []) named.add(member.user_id);

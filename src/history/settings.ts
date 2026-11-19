@@ -30,6 +30,7 @@
  *   [vars.HISTORY.import]
  *   users = "auto"
  *   key_secrets = ["HISTORY_BACKUP_KEY_2025"]
+ *   plaintext = false              # refuse files that are not encrypted
  *
  * Durations take "45s", "30m", "6h", "3d" (or seconds as a number); sizes
  * "512KB", "1MB", "8MiB" (or bytes). This module is pure and loads nothing
@@ -82,7 +83,12 @@ export interface HistorySettings {
 	alerts: { stallAfterSeconds: number };
 	tiers: TierSettings[];
 	exports: ExportSettings[];
-	import: { users: "auto" | "match" | "new"; ids: "original" | "renumber"; keySecrets: string[] };
+	/**
+	 * `plaintext`: whether `/history import` takes a file that is not
+	 * encrypted. Default false when any export encrypts (backups are sealed,
+	 * so a plain file there is no backup of this server's), true otherwise.
+	 */
+	import: { users: "auto" | "match" | "new"; ids: "original" | "renumber"; keySecrets: string[]; plaintext: boolean };
 }
 
 /** The LIMIT_* vars the `HISTORY` config replaces: setting both is an error, so it is never ambiguous which wins. */
@@ -173,6 +179,12 @@ function blobStore(value: unknown, where: string): BlobStoreSettings {
 	}
 }
 
+/** Where a store's objects live: two settings with the same identity write into the same keys. */
+function storeIdentity(store: BlobStoreSettings): string {
+	const place = store.provider === "r2" ? store.binding : store.provider === "fs" ? store.directory : "";
+	return JSON.stringify([store.provider, place, store.prefix]);
+}
+
 function tier(value: unknown, index: number): TierSettings {
 	const where = `tiers[${index}]`;
 	const raw = object(value, where);
@@ -241,7 +253,8 @@ export function parseHistorySettings(value: unknown): HistorySettings {
 	const alerts = object(root.alerts, "alerts");
 	only(alerts, "alerts", ["stall_after"]);
 	const imports = object(root.import, "import");
-	only(imports, "import", ["users", "ids", "key_secrets"]);
+	only(imports, "import", ["users", "ids", "key_secrets", "plaintext"]);
+	if (imports.plaintext !== undefined && typeof imports.plaintext !== "boolean") throw new HistoryConfigError("import.plaintext must be true or false");
 	if (!Array.isArray(root.tiers) || !root.tiers.length) throw new HistoryConfigError("tiers must list at least the SQLite tier");
 	const tiers = root.tiers.map(tier);
 	if (tiers[0].kind !== "sqlite") throw new HistoryConfigError("tiers[0] must be the SQLite tier (kind = \"sqlite\")");
@@ -258,6 +271,16 @@ export function parseHistorySettings(value: unknown): HistorySettings {
 		if (exportNames.has(entry.name)) throw new HistoryConfigError(`two exports are named ${entry.name}`);
 		exportNames.add(entry.name);
 	}
+	// Exports sharing a store and prefix keep apart only by name: each prunes
+	// (and could overwrite) the other's backups otherwise.
+	for (const [index, entry] of exports.entries()) {
+		for (const other of exports.slice(index + 1)) {
+			if (storeIdentity(entry.store) !== storeIdentity(other.store)) continue;
+			if (!entry.key.includes("{name}") || !other.key.includes("{name}")) {
+				throw new HistoryConfigError(`exports ${entry.name} and ${other.name} share a store and prefix, so both keys must include {name}`);
+			}
+		}
+	}
 	const users = imports.users ?? "auto";
 	if (users !== "auto" && users !== "match" && users !== "new") throw new HistoryConfigError("import.users must be \"auto\", \"match\" or \"new\"");
 	const ids = imports.ids ?? "original";
@@ -271,7 +294,10 @@ export function parseHistorySettings(value: unknown): HistorySettings {
 		alerts: { stallAfterSeconds: alerts.stall_after === undefined ? 6 * 3_600 : parseDuration(alerts.stall_after, "alerts.stall_after") },
 		tiers,
 		exports,
-		import: { users, ids, keySecrets: imports.key_secrets === undefined ? [] : secrets(imports.key_secrets, "import.key_secrets") },
+		import: {
+			users, ids, keySecrets: imports.key_secrets === undefined ? [] : secrets(imports.key_secrets, "import.key_secrets"),
+			plaintext: typeof imports.plaintext === "boolean" ? imports.plaintext : !exports.some((entry) => entry.encrypt),
+		},
 	};
 }
 

@@ -18,10 +18,10 @@
 import type { HistoryPipeline } from "../pipeline";
 import type { TierView } from "../plan";
 import { type ChatRecord, type Clock, byLog, canonicalJson, logIds, toRange } from "../records";
-import { type BackupKeys, decryptingLines } from "./crypto";
+import { type BackupKeys, type DecryptionStatus, decryptingLines } from "./crypto";
 import { namedUsers } from "./export";
-import { type CollectedArchive, collectArchive, jsonlReader } from "./format";
-import { IdMap, nudgeLogIds, remapListing, remapRecord } from "./ids";
+import { type CollectedArchive, collectArchive, jsonlReader, parseLogId } from "./format";
+import { ADMIN_USER_ID, IdMap, nudgeLogIds, placeholderBase, remapListing, remapRecord, restorableUserId } from "./ids";
 import type { ArchivedRoom, ArchivedUser, ArchiveReader } from "./types";
 
 export interface ImportOptions {
@@ -29,11 +29,19 @@ export interface ImportOptions {
 	existingRooms?: "skip";
 	/**
 	 * How the archive's user IDs map to accounts here (§10.4):
-	 * - "auto" (default): "match" if the archive's `server` header is this server, else "new".
-	 * - "match": an ID that exists here IS that user; IDs missing here become placeholders.
+	 * - "auto" (default): "match" if the archive is authenticated (`authenticated`) and its `server` header is this server, else "new".
+	 * - "match": an ID that exists here IS that user; IDs missing here become placeholders. Authenticated archives only.
 	 * - "new": every archive user becomes a new placeholder; an ID taken here, or retired, gets a free one (`ada-2`).
+	 * An ID that cannot stand here (a guest's, a bot's, `~…`, and `admin` unless matched) becomes `imported-…` (placeholderBase).
 	 */
 	users?: "auto" | "match" | "new";
+	/**
+	 * Whether the archive was decrypted with one of this server's backup
+	 * keys, so it is one of this server's backups (crypto.ts
+	 * DecryptionStatus): only then may users be matched, since a plain file's
+	 * `server` header is anyone's to write. Default false.
+	 */
+	authenticated?: boolean;
 	/** Per-user decisions overriding `users`: an existing account, or a placeholder ID. */
 	userMap?: Record<string, { existing: string } | { placeholder: string }>;
 	/** "original" (default) keeps log IDs, moving only collisions; "renumber" gives every record a new one at the head. */
@@ -47,19 +55,36 @@ export interface ImportOptions {
 	batch?: number;
 	/** Reaction sets and members per restoreRoom call (default 1,000; a record holding more goes alone). */
 	entries?: number;
-	/** Drop an unfinished earlier import's journal and plan afresh. */
+	/** Abandon an unfinished earlier import of another archive, and plan this one afresh. */
 	restart?: boolean;
+	/** New placeholder accounts one import may make (default MAX_IMPORT_PLACEHOLDERS). */
+	maxPlaceholders?: number;
 }
+
+/** New placeholder accounts one import makes at most: past it, the import is refused before anything is written. */
+export const MAX_IMPORT_PLACEHOLDERS = 2_000;
+/** How far past the clock an imported log ID may be (`original` IDs): further, and the import is refused, as it would hold back every later commit. */
+export const FUTURE_LOG_ID_MS = 5 * 60_000;
+/** The largest journal an import keeps (Store.setHistoryImportJournal's cap). */
+export const MAX_JOURNAL_BYTES = 256 * 1024;
 
 export interface ImportReport {
 	roomsAdded: string[];
 	roomsSkipped: string[];
 	/** Each archive user and what it became. */
 	users: Record<string, { matched: string } | { placeholder: string }>;
+	/** New placeholder accounts this import makes (an unfinished run's included). */
+	placeholders: number;
 	/** Records imported (a move's copy in each room counted once per room). */
 	records: number;
+	/** The log IDs the imported records take here, lowest and highest. */
+	logIdRange?: { first: number; last: number };
 	duplicates: number;
 	expired: number;
+	/** Records dropped as no client could have sent them: a body a post could not have, a record too large, a user no account could be. */
+	rejected: number;
+	/** Messages whose ID another message here holds already: imported as records, their current state left as it is. */
+	collisions: number;
 	/** Records the file holds only as references (ARCHIVE.md §3.1): of rooms it does not list, or below a room's `history_log_id`. */
 	references: number;
 	/** Log and message IDs that moved (§10.3), and user IDs that changed (§10.4). */
@@ -69,19 +94,27 @@ export interface ImportReport {
 	dryRun: boolean;
 	/** This run finished an earlier one that failed partway (its journal). */
 	resumed: boolean;
+	/** With `restart`: the rooms an abandoned import of another archive had begun, left as far as it got. */
+	abandoned?: string[];
+	/** Why this import would be refused (a dry run reports it rather than failing). */
+	refused?: string;
 }
 
 /**
  * What an import that has begun writing keeps in the head (HistoryHead.journal),
  * so that running it again after a failure finishes it rather than skipping
- * the rooms it had begun: which archive, its user and log ID mapping, and the
- * rooms it adds. Cleared once the import finishes.
+ * the rooms it had begun: which archive, its user mapping and log ID
+ * mapping (`renumber`: the first new ID, the rest following from it;
+ * otherwise the IDs that moved), the rooms it adds, and their IDs here.
+ * Cleared once the import finishes.
  */
 interface ImportJournal {
 	archive: string;
 	users: ImportReport["users"];
 	moved: Array<[number, number]>;
+	renumber?: number;
 	rooms: string[];
+	targetRooms?: string[];
 }
 
 /** An archive's identity for the journal: its header and the extent of its records. */
@@ -119,10 +152,29 @@ export function restoreBatches(records: readonly ChatRecord[], limits: { records
 /**
  * An archive reader over lines that may be an encrypted backup (§13.3): it
  * is decrypted chunk by chunk with the keys given, and read as plain
- * otherwise. Without keys, an encrypted archive fails naming the key it needs.
+ * otherwise. Without keys, an encrypted archive fails naming the key it
+ * needs. `status.encrypted` says, once the header is read, whether it was
+ * decrypted (and so authenticated) with one of them.
  */
-export function archiveReader(lines: AsyncIterable<string>, keys?: Pick<BackupKeys, "lookup">): ArchiveReader {
-	return jsonlReader(decryptingLines(lines, keys ?? { lookup: async () => undefined }));
+export function archiveReader(lines: AsyncIterable<string>, keys?: Pick<BackupKeys, "lookup">, status?: DecryptionStatus): ArchiveReader {
+	return jsonlReader(decryptingLines(lines, keys ?? { lookup: async () => undefined }, status));
+}
+
+/** A recorded user as a client's record holds one: `user_id` and a `name` if a string, nothing else (no roles, no tier). */
+function bareUser(value: unknown): unknown {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+	const user = value as { user_id?: unknown; name?: unknown };
+	return { user_id: user.user_id, ...(typeof user.name === "string" && user.name !== "" ? { name: user.name } : {}) };
+}
+
+/** A record with every recorded user (`from`, reaction sets' `from`, members' `user`) made bare (bareUser); the same record when nothing changed. */
+export function withBareUsers(record: ChatRecord): ChatRecord {
+	const value = JSON.parse(record.record_json) as Record<string, unknown>;
+	if ("from" in value) value.from = bareUser(value.from);
+	if (Array.isArray(value.reactions)) value.reactions = value.reactions.map((set: unknown) => set && typeof set === "object" && !Array.isArray(set) ? { ...set, from: bareUser((set as { from?: unknown }).from) } : set);
+	if (Array.isArray(value.members)) value.members = value.members.map((member: unknown) => member && typeof member === "object" && !Array.isArray(member) ? { ...member, user: bareUser((member as { user?: unknown }).user) } : member);
+	const json = JSON.stringify(value);
+	return json === record.record_json ? record : { ...record, record_json: json };
 }
 
 /** A record's content for duplicate detection: everything but where it is (room, previous room) and its log ID's spelling. */
@@ -185,20 +237,48 @@ export function place(id: number, tiers: readonly Pick<TierView, "state">[], pub
 export async function importArchive(pipeline: HistoryPipeline, input: ArchiveReader | CollectedArchive, options: ImportOptions): Promise<ImportReport> {
 	const archive = "parts" in input ? await collectArchive(input) : input;
 	const head = pipeline.head;
+	const authenticated = options.authenticated === true;
 	const report: ImportReport = {
-		roomsAdded: [], roomsSkipped: [], users: {}, records: 0, duplicates: 0, expired: 0, references: 0,
+		roomsAdded: [], roomsSkipped: [], users: {}, placeholders: 0, records: 0, duplicates: 0, expired: 0, rejected: 0, collisions: 0, references: 0,
 		remapped: { logIds: {}, users: {} }, placed: {}, dryRun: Boolean(options.dryRun), resumed: false,
 	};
-	// An earlier run of this import that failed partway is finished with its own plan.
+	// An earlier run of this import that failed partway is finished with its
+	// own plan, whatever this run asks. An unfinished import of another
+	// archive stops this one, unless `restart` abandons it.
 	const identity = archiveIdentity(archive);
 	let journal: ImportJournal | undefined;
 	const saved = head.journal ? await head.journal() : undefined;
-	if (saved && options.restart && !options.dryRun) await head.setJournal?.(null);
-	else if (saved) {
+	if (saved) {
 		const parsed = JSON.parse(saved) as ImportJournal;
-		if (parsed.archive !== identity) throw new Error("another import is unfinished: run it again to finish it, or import this one with restart to drop it");
-		journal = parsed;
-		report.resumed = true;
+		const begun = parsed.targetRooms ?? parsed.rooms ?? [];
+		if (parsed.archive === identity) {
+			journal = parsed;
+			report.resumed = true;
+		} else if (options.restart) {
+			report.abandoned = begun;
+		} else {
+			throw new Error(`another import is unfinished${begun.length ? ` (rooms ${begun.join(", ")})` : ""}: run it again to finish it, or import this one with restart to abandon it`);
+		}
+	}
+	const renumber = journal ? journal.renumber !== undefined : options.ids === "renumber";
+
+	// Users may be matched to accounts here only from an archive this server
+	// sealed: a plain file's `server` header is anyone's to write.
+	if (options.users === "match" && !authenticated && !journal) {
+		throw new Error("users match takes only a backup encrypted with one of this server's keys; this file is not one: import it with new");
+	}
+	const mode = journal ? undefined : options.users === "match" || options.users === "new" ? options.users
+		: authenticated && archive.header.server !== undefined && archive.header.server === options.server ? "match" : "new";
+
+	// Log IDs past the clock would hold back every later commit (the log head
+	// only rises): an import keeping its IDs refuses them before planning.
+	if (!renumber) {
+		const horizon = options.clock.now() + FUTURE_LOG_ID_MS;
+		const future = archive.records.find((record) => record.log_id > horizon)?.log_id
+			?? archive.rooms.flatMap((room) => [room.listing.log_id, room.listing.latest_log_id, room.listing.history_log_id].map(parseLogId)).find((id) => id !== undefined && id > horizon);
+		if (future !== undefined) {
+			throw new Error(`this archive holds log ID ${future}, later than this server's clock: import it with renumber, which gives its records new log IDs`);
+		}
 	}
 
 	// Rooms: the listed ones (a later listing replaces an earlier one). A
@@ -220,7 +300,7 @@ export async function importArchive(pipeline: HistoryPipeline, input: ArchiveRea
 	// New rooms: those absent here, a room with nothing logged past its
 	// creation (a new server's `general`), and those an unfinished run began.
 	const fresh = new Set<string>();
-	for (const roomId of rooms.keys()) {
+	for (const roomId of [...rooms.keys()].sort()) {
 		if (journal ? journal.rooms.includes(roomId) : !(await head.hasRoom(roomId)) || (head.roomIsEmpty ? await head.roomIsEmpty(roomId) : false)) fresh.add(roomId);
 		else report.roomsSkipped.push(roomId);
 	}
@@ -239,20 +319,31 @@ export async function importArchive(pipeline: HistoryPipeline, input: ArchiveRea
 	}
 	// An embed's `output_ref` names this server's own storage: never taken from a file, as a client's is dropped (Store.normalizedBody).
 	let records = all.filter((record) => fresh.has(record.room_id)).map(withoutOutputRefs).sort(byLog);
-	// A room's bounds where its listing lacks them: from its records, so its history starts and ends where they do.
+	// Renumbered, the records' IDs follow from the first new one and their
+	// order alone (the journal keeps only that first), so they are fixed now,
+	// before anything is dropped.
+	const numbered = logIds(records).sort((a, b) => a - b);
+	// Records as a client could have sent them (Store.restorableRecord): bare
+	// recorded users, a body a post could have, within a snapshot's size.
+	records = records.flatMap((record) => {
+		const normalized = head.normalizeRecord ? head.normalizeRecord(withBareUsers(record)) : withBareUsers(record);
+		if (normalized) return [normalized];
+		report.rejected += 1;
+		return [];
+	});
+	// A room's bounds: from its records, so its history starts and ends where
+	// they do, whatever its listing says of its head.
 	for (const roomId of fresh) {
 		const own = records.filter((record) => record.room_id === roomId);
 		if (!own.length) continue;
 		const room = rooms.get(roomId)!;
 		const listing = { ...room.listing };
 		if (listing.log_id === undefined) listing.log_id = String(own[0].log_id);
-		if (listing.latest_log_id === undefined || Number(listing.latest_log_id) < own[own.length - 1].log_id) listing.latest_log_id = String(own[own.length - 1].log_id);
+		listing.latest_log_id = String(own[own.length - 1].log_id);
 		rooms.set(roomId, { ...room, listing });
 	}
 
 	// Users (§10.4).
-	const mode = options.users === "match" || options.users === "new" ? options.users
-		: archive.header.server !== undefined && archive.header.server === options.server ? "match" : "new";
 	const profiles = new Map<string, ArchivedUser>();
 	for (const user of archive.users) profiles.set(user.user_id, { ...profiles.get(user.user_id), ...user });
 	const ids = new Set<string>([...archive.users.map((user) => user.user_id), ...records.flatMap(namedUsers)]);
@@ -263,17 +354,18 @@ export async function importArchive(pipeline: HistoryPipeline, input: ArchiveRea
 	const taken = async (id: string) => given.has(id) || await exists(id) || await retired(id);
 	const users = new Map<string, string>();
 	const placeholders: ArchivedUser[] = [];
+	const addPlaceholder = (id: string, placeholder: string) => {
+		given.add(placeholder);
+		const { roles: _roles, ...rest } = profiles.get(id) ?? { user_id: id };
+		placeholders.push({ ...rest, user_id: placeholder });
+	};
 	for (const id of [...ids].sort()) {
 		const planned = journal?.users[id];
 		if (planned) {
 			// The unfinished run's mapping stands: its placeholders may exist already.
 			report.users[id] = planned;
 			const mapped = "matched" in planned ? planned.matched : planned.placeholder;
-			if ("placeholder" in planned) {
-				given.add(planned.placeholder);
-				const { roles: _roles, ...rest } = profiles.get(id) ?? { user_id: id };
-				placeholders.push({ ...rest, user_id: planned.placeholder });
-			}
+			if ("placeholder" in planned) addPlaceholder(id, planned.placeholder);
 			users.set(id, mapped);
 			if (mapped !== id) report.remapped.users[id] = mapped;
 			continue;
@@ -284,43 +376,49 @@ export async function importArchive(pipeline: HistoryPipeline, input: ArchiveRea
 			if (!(await exists(override.existing))) throw new Error(`userMap sends ${id} to ${override.existing}, which is no account here`);
 			target = { matched: override.existing };
 		} else if (override && "placeholder" in override) {
+			if (!restorableUserId(override.placeholder)) throw new Error(`userMap gives ${id} the placeholder ${override.placeholder}, which no account here could be`);
 			if (await taken(override.placeholder)) throw new Error(`userMap gives ${id} the placeholder ${override.placeholder}, which is taken`);
 			target = { placeholder: override.placeholder };
-		} else if (mode === "match" && await exists(id)) {
+		} else if (mode === "match" && (restorableUserId(id) || id === ADMIN_USER_ID) && await exists(id)) {
 			target = { matched: id };
 		} else {
-			target = { placeholder: await freeId(id, taken) };
+			// An ID that cannot stand here (a guest's, a bot's, `~…`, `admin`) gets one that can.
+			target = { placeholder: await freeId(restorableUserId(id) ? id : placeholderBase(id), taken) };
 		}
 		report.users[id] = target;
 		const mapped = "matched" in target ? target.matched : target.placeholder;
-		if ("placeholder" in target) {
-			given.add(target.placeholder);
-			const profile = profiles.get(id) ?? { user_id: id };
-			const { roles: _roles, ...rest } = profile;
-			placeholders.push({ ...rest, user_id: target.placeholder });
-		}
+		if ("placeholder" in target) addPlaceholder(id, target.placeholder);
 		users.set(id, mapped);
 		if (mapped !== id) report.remapped.users[id] = mapped;
+	}
+	report.placeholders = placeholders.length;
+	const maxPlaceholders = options.maxPlaceholders ?? MAX_IMPORT_PLACEHOLDERS;
+	if (!journal && placeholders.length > maxPlaceholders) {
+		report.refused = `this archive would make ${placeholders.length} placeholder accounts, more than the ${maxPlaceholders} one import may make`;
 	}
 
 	// Log IDs (§10.3).
 	const imported = logIds(records).sort((a, b) => a - b);
 	const moved = new Map<number, number>();
-	if (journal) {
+	let renumberBase: number | undefined;
+	if (renumber) {
+		// Every record a new ID at the head: the first new one, then in order.
+		renumberBase = journal?.renumber ?? Math.max(options.clock.now(), (head.latest ? await head.latest() : 0) + 1);
+		for (const [index, id] of numbered.entries()) moved.set(id, renumberBase + index);
+	} else if (journal) {
 		// The unfinished run's log IDs stand: what it wrote is there under them.
 		for (const [from, to] of journal.moved) moved.set(from, to);
-	} else if (options.ids === "renumber") {
-		let next = Math.max(options.clock.now(), (head.latest ? await head.latest() : 0) + 1);
-		for (const id of imported) moved.set(id, next++);
 	} else {
 		const userMap = new IdMap(new Map(), users);
 		const known = await existing(pipeline, imported);
 		const duplicate = new Set<string>();
+		const byId = new Map<number, ChatRecord[]>();
+		for (const record of records) byId.set(record.log_id, [...(byId.get(record.log_id) ?? []), record]);
 		for (const id of imported) {
 			const here = known.get(id);
 			if (!here) continue;
 			const held = new Set(here.map(contentKey));
-			for (const record of records.filter((entry) => entry.log_id === id)) {
+			for (const record of byId.get(id) ?? []) {
 				// The same record as before, under this import's user mapping or none
 				// (an earlier import's): a duplicate. Any other is a collision, moved below.
 				if (held.has(contentKey(record)) || held.has(contentKey(remapRecord(record, userMap)))) duplicate.add(`${id}\u0000${record.room_id}`);
@@ -344,7 +442,8 @@ export async function importArchive(pipeline: HistoryPipeline, input: ArchiveRea
 		}
 	}
 	const map = new IdMap(moved, users);
-	for (const [from, to] of moved) report.remapped.logIds[String(from)] = String(to);
+	const kept = new Set(imported);
+	for (const [from, to] of moved) if (kept.has(from)) report.remapped.logIds[String(from)] = String(to);
 	records = records.map((record) => remapRecord(record, map)).sort(byLog);
 
 	// Placement (§10.5).
@@ -359,26 +458,58 @@ export async function importArchive(pipeline: HistoryPipeline, input: ArchiveRea
 		}
 		for (const index of tiers) perTier[index].push(record);
 		report.records += 1;
+		const range = report.logIdRange;
+		report.logIdRange = { first: Math.min(range?.first ?? record.log_id, record.log_id), last: Math.max(range?.last ?? record.log_id, record.log_id) };
 	}
 	for (const [index, view] of views.entries()) if (perTier[index].length) report.placed[view.name] = perTier[index].length;
-	report.roomsAdded = [...fresh].map((roomId) => map.roomId(roomId));
+	const freshRooms = [...fresh];
+	report.roomsAdded = freshRooms.map((roomId) => map.roomId(roomId));
+
+	// Renumbered, a room's listing keeps no log ID of its own: its bounds are
+	// its records' new ones, and a room without records takes the next ID
+	// after them (in room order, so a retry gives the same).
+	const listingOf = (roomId: string, index: number) => {
+		const listing = remapListing({ ...rooms.get(roomId)!.listing }, map);
+		if (renumberBase === undefined) return listing;
+		const target = map.roomId(roomId);
+		const own = records.filter((record) => record.room_id === target);
+		const first = own.length ? own[0].log_id : renumberBase + numbered.length + index;
+		const last = own.length ? own[own.length - 1].log_id : first;
+		return { ...listing, log_id: String(first), latest_log_id: String(last), history_log_id: listing.history_log_id === null && !own.length ? null : String(first) };
+	};
+
+	// The journal, checked before anything is written: an import too large to
+	// resume is refused whole.
+	const plan: ImportJournal = {
+		archive: identity, users: report.users, moved: renumber ? [] : [...moved], ...(renumberBase !== undefined ? { renumber: renumberBase } : {}),
+		rooms: freshRooms, targetRooms: report.roomsAdded,
+	};
+	const journalText = JSON.stringify(plan);
+	if (!journal && !report.refused && journalText.length > MAX_JOURNAL_BYTES) {
+		report.refused = `this import maps ${Object.keys(report.users).length} users and moves ${moved.size} log IDs, too many to resume from if it fails: import it with renumber, or in parts`;
+	}
 	if (options.dryRun) return report;
+	if (report.refused) throw new Error(report.refused);
 
 	// Write, after noting the plan (a retry finishes it): placeholders, then
 	// each room at the head, then the tiers below, oldest first. Every write
 	// may be repeated without harm.
-	if (!journal && head.setJournal) {
-		await head.setJournal(JSON.stringify({ archive: identity, users: report.users, moved: [...moved], rooms: [...fresh] } satisfies ImportJournal));
-	}
+	if (!journal && head.setJournal) await head.setJournal(journalText);
 	const batch = options.batch ?? 200;
 	for (let start = 0; start < placeholders.length; start += batch) await head.restoreUsers(placeholders.slice(start, start + batch));
-	for (const roomId of fresh) {
+	const context = { rooms: report.roomsAdded };
+	for (const [index, roomId] of freshRooms.entries()) {
 		const room = rooms.get(roomId)!;
-		const listing = remapListing({ ...room.listing }, map);
+		const listing = listingOf(roomId, index);
 		const own = perTier[0].filter((record) => record.room_id === listing.room_id);
 		const batches = restoreBatches(own, { records: batch, entries: options.entries ?? 1_000 });
-		if (!batches.length) await head.restoreRoom({ ...room, listing }, []);
-		for (const records of batches) await head.restoreRoom({ ...room, listing }, records);
+		const results = [];
+		if (!batches.length) results.push(await head.restoreRoom({ ...room, listing }, [], context));
+		for (const records of batches) results.push(await head.restoreRoom({ ...room, listing }, records, context));
+		for (const result of results) {
+			report.collisions += result?.collided ?? 0;
+			report.rejected += result?.rejected ?? 0;
+		}
 	}
 	for (let index = 1; index < views.length; index += 1) {
 		const tier = pipeline.tiers[index];

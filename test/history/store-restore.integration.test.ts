@@ -2,6 +2,15 @@ import { expect, it } from "vitest";
 import type { ArchivedRoom, ArchivedUser } from "../../src/history/archive/types";
 import type { ChatRecord } from "../../src/history/records";
 import { RESTORE_RECORDS_BATCH, Store, UNCLAIMED_ROLE, type RoomRecord, type StoreConfig, type StoreMutationInput } from "../../src/store";
+import { exportArchive } from "../../src/history/archive/export";
+import { collectArchive, jsonlReader, jsonlWriter, linesOf, writeArchiveToString } from "../../src/history/archive/format";
+import { importArchive } from "../../src/history/archive/import";
+import { MemoryBlobStore } from "../../src/history/blob/memory";
+import { BlobHistoryTier } from "../../src/history/blob/tier";
+import { archivePipeline } from "../../src/history/config";
+import { HistoryPipeline } from "../../src/history/pipeline";
+import { MemoryHead } from "../../src/history/memory";
+import { MemoryTierStateStore } from "../../src/history/tier";
 import { errorCode, withStore, type TestClock } from "../helpers/store";
 
 const DAY_MS = 86_400_000;
@@ -211,6 +220,7 @@ it("rebuilds the same state from a room's records sent newest batch first", asyn
 	const lobbyRecords = src.records.filter((record) => record.room_id === src.lobby);
 	await withStore("restore-reversed", CONFIG, (store, clock, state) => {
 		const overruns = watched(store);
+		clock.value = src.records[src.records.length - 1].commit_ms + DAY_MS;
 		store.restoreUsers(ARCHIVED_USERS, clock.value);
 		const third = Math.ceil(lobbyRecords.length / 3);
 		for (const start of [2 * third, third, 0]) store.restoreRoom(archived(src.rooms[src.lobby]), lobbyRecords.slice(start, start + third), clock.value);
@@ -233,11 +243,14 @@ it("makes a room from its listing alone, and refuses records below the hot floor
 	const lobbyRecords = src.records.filter((record) => record.room_id === src.lobby);
 	await withStore("restore-listing", { ...CONFIG, maxThreads: 1 }, (store, clock, state) => {
 		const overruns = watched(store);
-		// Every record is in the tiers below: the room lists as it did, with no history here.
+		clock.value = src.records[src.records.length - 1].commit_ms + DAY_MS;
+		const head = Number(store.logBounds().latest_log_id);
+		// Every record is in the tiers below: the room lists as it did, with no history here, but
+		// its head only as far as records known here reach (its room record), and the log head stays.
 		expect(store.restoreRoom(archived(src.rooms[src.lobby]), [], clock.value)).toEqual({ created: true, stored: 0 });
-		expect(store.getRoom(src.lobby, clock.value)).toEqual(src.rooms[src.lobby]);
+		expect(store.getRoom(src.lobby, clock.value)).toEqual({ ...src.rooms[src.lobby], latest_log_id: src.rooms[src.lobby].log_id });
 		expect(store.listRooms(clock.value).map((room) => room.room_id)).toContain(src.lobby);
-		expect(Number(store.logBounds().latest_log_id)).toBe(Number(src.rooms[src.lobby].latest_log_id));
+		expect(Number(store.logBounds().latest_log_id)).toBe(head);
 		// One public room past general is the cap here.
 		expect(errorCode(() => store.restoreRoom(archived(src.rooms[src.thread]), [], clock.value))).toBe("denied");
 		expect(store.getRoom(src.thread, clock.value)).toBeNull();
@@ -312,6 +325,157 @@ it("keeps a blob tier's segment index and the backups' schedule in SQLite, withi
 		expect(store.historyMetaNumber("history:export:nightly", clock.value)).toBe(0);
 		expect(() => store.setHistoryMeta("history:published", "1", clock.value)).toThrow();
 		expect(() => store.historyMetaNumber("identity_count", clock.value)).toThrow();
+		expect(overruns).toEqual([]);
+	});
+});
+
+/** A message record of `roomId` as an archive holds it. */
+function messageRecord(roomId: string, logId: number, value: Record<string, unknown>): ChatRecord {
+	return { room_id: roomId, log_id: logId, commit_ms: logId, kind: "message", record_json: JSON.stringify({ message_id: String(logId), log_id: String(logId), room_id: roomId, from: { user_id: "ada", name: "Ada" }, body: { text: `m${logId}` }, ...value }) };
+}
+
+const LIMITS = { retentionRecords: 5_000, retentionSeconds: 0, minRetentionSeconds: 0, archiveRecords: 0, cleanupThresholdPercent: 80 };
+
+it("refuses records past the clock, and raises the log head only by records it stores, never by a listing", async () => {
+	await withStore("restore-future", CONFIG, (store, clock) => {
+		const overruns = watched(store);
+		store.restoreUsers([{ user_id: "ada", name: "Ada" }], clock.value);
+		const head = Number(store.logBounds().latest_log_id);
+		const listing = (extra: Record<string, unknown> = {}) => ({ listing: { room_id: "lobby", log_id: String(clock.value - 5_000), ...extra }, joined: false });
+		// A record past the clock and five minutes: refused whole.
+		expect(errorCode(() => store.restoreRoom(listing(), [messageRecord("lobby", clock.value + 6 * 60_000, {})], clock.value))).toBe("invalid_params");
+		expect(errorCode(() => store.restoreRoom(listing({ log_id: String(Number.MAX_SAFE_INTEGER) }), [], clock.value))).toBe("invalid_params");
+		expect(store.getRoom("lobby", clock.value)).toBeNull();
+		// A listing's head far in the future counts only as far as the records known here.
+		const logId = clock.value - 4_000;
+		expect(store.restoreRoom(listing({ latest_log_id: String(Number.MAX_SAFE_INTEGER) }), [messageRecord("lobby", logId, {})], clock.value)).toEqual({ created: true, stored: 1 });
+		expect(Number(store.getRoom("lobby", clock.value)!.latest_log_id)).toBe(Math.max(head, logId));
+		expect(Number(store.logBounds().latest_log_id)).toBe(Math.max(head, logId));
+		// Commits go on as before.
+		const posted = store.mutate(input(clock, "ada", "message", { room_id: "lobby", body: { format: "plain", text: "after" } })).message!;
+		expect(Number(posted.log_id)).toBeLessThanOrEqual(clock.value);
+		expect(overruns).toEqual([]);
+	});
+});
+
+it("takes a message here for the same one only in a room the import adds, never by the snapshot's say", async () => {
+	await withStore("restore-collide", CONFIG, (store, clock, state) => {
+		const overruns = watched(store);
+		store.createInvitedIdentity({ userId: "ada", name: "Ada", now: clock.value, ipKey: "ip" });
+		const native = store.mutate(input(clock, "ada", "message", { room_id: "general", body: { format: "plain", text: "mine" } })).message!;
+		const stateOf = (messageId: string) => state.storage.sql.exec<{ room_id: string; latest_log_id: number }>("SELECT room_id, latest_log_id FROM message_state WHERE message_id = ?", messageId).toArray()[0];
+		const before = stateOf(native.message_id);
+		const base = clock.value - 60_000;
+		const room = (roomId: string) => ({ listing: { room_id: roomId, log_id: String(base) }, joined: false });
+		// Its ID again, by its author, in a new room claiming to have moved from general: another message.
+		const claimed = store.restoreRoom(room("lobby"), [messageRecord("lobby", base + 1, { message_id: native.message_id, prev_room_id: "general" })], clock.value, { rooms: ["lobby"] });
+		expect(claimed).toEqual({ created: true, stored: 1, collided: 1 });
+		// A snapshot naming a room here the import does not add moves nothing there either.
+		expect(store.restoreRoom(room("annex"), [messageRecord("annex", base + 2, { message_id: "m-annex", room_id: "general" })], clock.value, { rooms: ["annex"] })).toMatchObject({ collided: 1 });
+		expect(stateOf("m-annex")).toBeUndefined();
+		expect(stateOf(native.message_id)).toEqual(before);
+		// Between two rooms the import adds, a move is the same message.
+		store.restoreRoom(room("hall"), [messageRecord("hall", base + 3, { message_id: "m-move" })], clock.value, { rooms: ["hall", "porch"] });
+		expect(store.restoreRoom(room("porch"), [messageRecord("porch", base + 4, { message_id: "m-move", prev_room_id: "hall", prev_log_id: String(base + 3) })], clock.value, { rooms: ["hall", "porch"] })).toEqual({ created: true, stored: 1 });
+		expect(stateOf("m-move")).toEqual({ room_id: "porch", latest_log_id: base + 4 });
+		expect(overruns).toEqual([]);
+	});
+});
+
+it("takes a record only as a client could have sent it: bare users, a normalized body, a snapshot's size", async () => {
+	await withStore("restore-normalize", CONFIG, (store, clock) => {
+		const overruns = watched(store);
+		const base = clock.value - 60_000;
+		const normalized = (value: Record<string, unknown>) => {
+			const record = store.restorableRecord(messageRecord("lobby", base, value));
+			return record && JSON.parse(record.record_json);
+		};
+		expect(normalized({ from: { user_id: "ada", name: "Ada", roles: ["admin"], tier: "registered" } }).from).toEqual({ user_id: "ada", name: "Ada" });
+		expect(normalized({ body: { text: "hi", embeds: [{ kind: "link", og: { title: "T", image: { url: "https://evil.example/x.png" } } }] } }).body)
+			.toEqual({ text: "hi", format: "plain", embeds: [{ kind: "link", og: { title: "T" } }] });
+		for (const bad of [
+			{ from: { user_id: "~private", name: "Server" } },
+			{ body: { text: "x".repeat(300_000) } },
+			{ body: { text: "hi", embeds: Array.from({ length: 100 }, () => ({ kind: "link" })) } },
+			{ body: { text: "hi", mentions: ["not an id with spaces"] } },
+			{ ext: { padding: "x".repeat(200_000) } },
+		]) expect(normalized(bad), JSON.stringify(bad).slice(0, 80)).toBeNull();
+		const reactions = store.restorableRecord({ room_id: "lobby", log_id: base, commit_ms: base, kind: "reactions", record_json: JSON.stringify({ message_id: "m", reactions: [{ from: { user_id: "bob", roles: ["mod"] }, emojis: ["👍"] }] }) });
+		expect(JSON.parse(reactions!.record_json).reactions).toEqual([{ from: { user_id: "bob" }, emojis: ["👍"] }]);
+		// restoreRoom applies it too: what no client could have sent is dropped and counted.
+		const result = store.restoreRoom({ listing: { room_id: "lobby", log_id: String(base) }, joined: false }, [
+			messageRecord("lobby", base + 1, { from: { user_id: "ada", roles: ["admin"] } }),
+			messageRecord("lobby", base + 2, { from: { user_id: "~private" } }),
+		], clock.value);
+		expect(result).toEqual({ created: true, stored: 1, rejected: 1 });
+		expect(store.historyLookup([base + 1, base + 2]).map((record) => JSON.parse(record.record_json).from)).toEqual([{ user_id: "ada" }]);
+		expect(overruns).toEqual([]);
+	});
+});
+
+it("imports through the Store: IDs that cannot stand here become placeholders, and no message is a guest's", async () => {
+	await withStore("restore-import", CONFIG, async (store, clock, state) => {
+		const base = clock.value - 60_000;
+		const text = await writeArchiveToString(async (writer) => {
+			await writer.header({ apron_archive: 1, server: "wss://elsewhere.test/" });
+			await writer.listing({ not_joined: [{ room_id: "lobby", log_id: String(base), latest_log_id: String(base + 3) }] });
+			await writer.records([
+				messageRecord("lobby", base + 1, { from: { user_id: "guest_7", name: "Guest" } }),
+				messageRecord("lobby", base + 2, { from: { user_id: "bot_ada" } }),
+				messageRecord("lobby", base + 3, { from: { user_id: "admin", roles: ["admin"] }, body: { text: "hi", embeds: Array.from({ length: 100 }, () => ({ kind: "link" })) } }),
+			]);
+		});
+		const pipeline = archivePipeline(undefined, { store, limits: LIMITS, clock: clock.clock });
+		const report = await importArchive(pipeline, jsonlReader(linesOf(text)), { clock: clock.clock });
+		expect(report).toMatchObject({ roomsAdded: ["lobby"], records: 2, rejected: 1, users: { guest_7: { placeholder: "imported-guest_7" }, bot_ada: { placeholder: "imported-bot_ada" } } });
+		const authors = state.storage.sql.exec<{ author_id: string }>("SELECT author_id FROM message_state ORDER BY author_id").toArray().map((row) => row.author_id);
+		expect(authors).toEqual(["imported-bot_ada", "imported-guest_7"]);
+		expect(store.getIdentity("imported-guest_7")?.roles).toEqual([UNCLAIMED_ROLE]);
+		// The admin's own ID is never an import's to take, matched or made.
+		expect(store.restoreUsers([{ user_id: "admin", name: "Admin" }], clock.value)).toEqual([]);
+	});
+});
+
+it("exports a room's whole history after a retitle: the listing's creation, not its latest room record, starts it", async () => {
+	const exported = await withStore("export-retitle", CONFIG, async (store, clock) => {
+		store.createInvitedIdentity({ userId: "ada", name: "Ada", now: clock.value, ipKey: "ip" });
+		store.setRole({ userId: "ada", role: "admin", on: true, now: clock.value });
+		const lobby = store.mutate(input(clock, "ada", "room_set", { title: "Lobby" })).result.room_id as string;
+		for (const text of ["one", "two"]) store.mutate(input(clock, "ada", "message", { room_id: lobby, body: { format: "plain", text } }));
+		store.mutate(input(clock, "ada", "room_set", { room_id: lobby, title: "Lobby, renamed" }));
+		const lines: string[] = [];
+		await exportArchive(archivePipeline(undefined, { store, limits: LIMITS, clock: clock.clock }), jsonlWriter(async (line) => { lines.push(line); }), { clock: clock.clock, roomIds: [lobby] });
+		return { text: lines.join(""), clock: clock.value };
+	});
+	const archive = await collectArchive(jsonlReader(linesOf(exported.text)));
+	const target = new MemoryHead("hot", { now: () => exported.clock });
+	const pipeline = new HistoryPipeline({ head: target, headRetention: { thresholdPercent: 100 }, stages: [], state: new MemoryTierStateStore(), clock: { now: () => exported.clock } });
+	const report = await importArchive(pipeline, archive, { clock: { now: () => exported.clock }, dryRun: true });
+	expect(report.references).toBe(0);
+	expect(report.records).toBe(archive.records.length);
+	expect(archive.records.filter((record) => record.kind === "message")).toHaveLength(2);
+});
+
+it("reads a blob tier's segment index a bounded page at a time, however many segments it holds", async () => {
+	await withStore("segment-bounds", CONFIG, async (store, clock, state) => {
+		const overruns = watched(store);
+		const index = store.segmentIndex("cold");
+		await index.oldest(1);
+		const segments = 6_000;
+		for (let i = 0; i < segments; i += 1) {
+			state.storage.sql.exec(`INSERT INTO history_segments_cold (room_id, "first", "last", key, records, bytes) VALUES (?, ?, ?, ?, 1, 100)`, `r${i % 5}`, i * 10 + 1, i * 10 + 5, `k${i}`);
+		}
+		const tier = new BlobHistoryTier({ name: "cold", store: new MemoryBlobStore(), index, prefix: "history/", clock: clock.clock });
+		// Keep the newest 100 records (a segment each): the floor is the 100th newest segment's first.
+		expect(await tier.floorFor({ records: 100, thresholdPercent: 100 }, { now: clock.value, below: Number.MAX_SAFE_INTEGER })).toBe((segments - 100) * 10 + 1);
+		expect(await tier.floorFor({ records: 10_000, thresholdPercent: 100 }, { now: clock.value, below: Number.MAX_SAFE_INTEGER })).toBeUndefined();
+		expect((await tier.stats()).records).toBeGreaterThan(0);
+		expect(await tier.trimBelow(201, 1_000)).toBe(20);
+		expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM history_segments_cold").one().count).toBe(segments - 20);
+		// The objects are missing here, so reads find nothing (and drop those segments from the index).
+		expect(await tier.read({ roomIds: ["r0"], lower: 1, upper: Number.MAX_SAFE_INTEGER, forward: false, limit: 10 })).toEqual([]);
+		expect((await tier.scan(1, 10)).records).toEqual([]);
+		expect(await tier.lookup([segments * 5])).toEqual([]);
 		expect(overruns).toEqual([]);
 	});
 });

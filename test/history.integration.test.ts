@@ -218,6 +218,43 @@ it("lets a guest page back guestHistoryDepth records from each room's head, and 
 	});
 });
 
+it("counts a guest's page reaching below the hot floor as deep as it may go: what the tiers below hold is not counted", async () => {
+	await withStore("guest-depth-tiers", { ...ROOMY, guestHistoryDepth: 3, tiered: true }, (store, clock, state) => {
+		const logs: bigint[] = [];
+		for (let index = 0; index < 6; index += 1) {
+			logs.push(logId(store.mutate(messageInput(clock, `tiered-${index}`, { body: { format: "plain", text: `entry-${index}` } }))));
+		}
+		// The four oldest moved to the tier below (D1): SQLite holds the newest two, history is published from the first.
+		const sql = state.storage.sql;
+		sql.exec("DELETE FROM records WHERE log_id < ?", Number(logs[4]));
+		sql.exec("UPDATE log_state SET history_floor = ? WHERE id = 1", Number(logs[4]));
+		sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('history:published', ?)", String(logs[0]));
+		const reopened = new Store(state, { ...ROOMY, guestHistoryDepth: 3, tiered: true }, clock.clock);
+		reopened.initialize();
+		const guest = { roomId: "general", limit: 1, now: clock.value, guest: true };
+		// Three records lie past logs[2] (one in D1): as deep as a guest goes, though SQLite holds two of them.
+		expect(errorCode(() => reopened.history({ ...guest, before: logs[2] }))).toBe("denied");
+		expect(errorCode(() => reopened.history({ ...guest, before: logs[1] }))).toBe("denied");
+		// SQLite alone holds fewer than three past logs[2]: counted there only, the page would pass.
+		expect(sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM records WHERE room_id = 'general' AND log_id > ?", Number(logs[2])).one().count).toBeLessThan(3);
+		// Within SQLite, guests page as before; accounts page anywhere.
+		expect(() => reopened.history({ ...guest, before: logs[5] })).not.toThrow();
+		expect(() => reopened.history({ roomId: "general", limit: 1, now: clock.value, before: logs[2] })).not.toThrow();
+	});
+});
+
+it("holds an unclaimed placeholder to the registered posting limits, not the trusted ones", async () => {
+	await withStore("unclaimed-limits", { ...ROOMY, registeredPostsPerMinute: 2, trustedPostsPerMinute: 100, registeredPostsPerDay: 100, trustedPostsPerDay: 100 }, (store, clock) => {
+		store.restoreUsers([{ user_id: "zed", name: "Zed" }], clock.value);
+		store.createInvitedIdentity({ userId: "pal", name: "Pal", now: clock.value, ipKey: "ip" });
+		store.setRole({ userId: "pal", role: "friend", on: true, now: clock.value });
+		const post = (userId: string, index: number) => () => store.mutate(op(clock, `${userId}-${index}`, "message", { room_id: "general", body: { format: "plain", text: `${userId} ${index}` } }, userId));
+		for (let index = 0; index < 2; index += 1) post("zed", index)();
+		expect(errorCode(post("zed", 2))).toBe("retry_after");
+		for (let index = 0; index < 3; index += 1) post("pal", index)();
+	});
+});
+
 it("keeps a refused guest page charged to its address, since measuring it read rows", async () => {
 	await withStore("guest-depth-charge", { ...ROOMY, guestHistoryDepth: 2 }, (store, clock, state) => {
 		const logs: bigint[] = [];

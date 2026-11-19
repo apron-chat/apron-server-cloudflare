@@ -910,6 +910,7 @@ encrypt = { key_secrets = ["UPLOAD_SIGNING_KEY"] }
 [vars.HISTORY.import]
 users = "auto"
 key_secrets = ["HISTORY_BACKUP_KEY_2025"]
+plaintext = false   # refuse files that are not encrypted (default here: an export encrypts)
 ```
 
 - **Tiers.** The first tier is `kind = "sqlite"`, and no other is. At most
@@ -941,15 +942,27 @@ key_secrets = ["HISTORY_BACKUP_KEY_2025"]
   1,000), `"8MiB"` (powers of 1,024), or a number of bytes. Counts may be
   written `5_000`.
 - **Stores.** A blob tier's or export's `store` is `{ provider = "r2",
-  binding = "…", prefix = "…/" }` in the Worker. `provider = "memory"` keeps
-  objects in the object's memory, for tests only: they are gone when it is
-  evicted. `provider = "fs"` (a directory) is for Node scripts only
-  (`scripts/fs-blob-store.mjs`). A `prefix` ends in `/`; a blob tier's
-  segments go under `<prefix><RP_ID>/`, so servers may share a bucket.
-- **Missing bindings.** A tier whose binding the deployment lacks is left
-  out, so the blob tier is off where no bucket is bound, as in production
-  now; with no tier left below SQLite, records expire as they leave it.
-  Exports whose store is missing are skipped.
+  binding = "…", prefix = "…/" }` in the Worker. `provider = "memory"` (for
+  tests) and `provider = "fs"` (a directory, for Node scripts:
+  `scripts/fs-blob-store.mjs`) are unavailable in the Worker, as an unbound
+  bucket is. A `prefix` ends in `/`; a blob tier's segments go under
+  `<prefix><RP_ID>/`, so servers may share a bucket.
+- **Missing bindings.** A tier listed here whose binding the deployment
+  lacks (or whose store the Worker cannot use) is not left out, which would
+  run another composition under state kept for this one: history stops
+  moving below SQLite until it is bound. SQLite keeps what it holds
+  meanwhile, `/status` and `/history status` show the tier unbound, the
+  Worker logs `history_tier_unbound` on each wake, admins get the
+  `history_stall` notice after `stall_after`, and exports and imports are
+  refused. So list only tiers the deployment binds: production lists no blob
+  tier, as it has no bucket for one. A scheduled export whose store is
+  missing is skipped, logged once a wake (`history_export_unbound`).
+- **Secrets stay secret.** A name in `encrypt.key_secrets` or
+  `import.key_secrets` must be a secret (`wrangler secret put`), never a
+  `[vars]` var, whose value is public; `npm run budget:check` fails on one.
+  It also reads every `[vars.HISTORY…]` table wherever it is in the file,
+  and fails on any `HISTORY` it cannot read (a quoted header, an inline
+  `HISTORY = {…}`, a dotted `HISTORY.x =` key) rather than skip it.
 - **Blob segments.** Each copy into a blob tier writes one segment per room
   it names, and segments stay as written: they are never merged or
   compacted later. `cache.bytes` (8 MiB) caps the decoded segments a
@@ -981,31 +994,45 @@ deletes its own backups past the newest `keep` (14 by default).
   both Wrangler configs), as it is configured: its store, `keep`,
   `private_rooms` and encryption. Nothing is assumed: with no such export,
   or its store unbound, the command says so and writes nothing. Its notice
-  names the object's key. Keep `{name}` in a custom `key`, or backups of
-  different exports count toward each other's `keep`.
+  names the object's key. Two exports sharing a store and prefix must both
+  keep `{name}` in their `key` (the config is refused otherwise), or each
+  would prune the other's backups. A second backup of an export in the
+  same second is refused (keys are to the second); one export, import or
+  index rebuild runs at a time, and none while history upkeep runs.
 - **Encryption is what the config says.** An export with `encrypt` always
   encrypts, and fails rather than write in the clear when its key is
   missing; one without it writes plain ARCHIVE.md (the development config's
   `manual`, to local storage).
 - **`/history import <key> [dry-run] [match|new] [renumber] [restart]`** (admins) reads
-  an object of the backup store, a backup or any ARCHIVE.md v1 file put
-  there, encrypted or not, and adds what is new, after planning the whole
-  file: rooms that exist here are skipped whole; records already held here
-  are skipped as duplicates, and others whose log ID is taken move to the
-  next free millisecond; records older than history here are dropped as
-  expired. `dry-run` reports what it would do. Users map by `users` (or the
+  an object of the backup store (at most 64 MiB), a backup or any ARCHIVE.md
+  v1 file put there, and adds what is new, after planning the whole file:
+  rooms that exist here are skipped whole; records already held here are
+  skipped as duplicates, and others whose log ID is taken move to the next
+  free millisecond; records older than history here are dropped as expired.
+  `dry-run` reports what it would do, the log IDs it would add among it.
+  The file may be anyone's, so records are taken only as a client could
+  have sent them (bare users, bodies normalized as posts are, a snapshot's
+  size), others dropped and counted. A plain file is refused where
+  `plaintext` is false: by default, wherever an export encrypts (production
+  sets it false, the development config true). Users map by `users` (or the
   command's `match` or `new`): `auto`, the default, matches existing
-  accounts by `user_id` when the file's `server` is this server's `RP_ID`,
-  and otherwise makes every user new; a new user becomes a placeholder
-  account with no credential and the role `unclaimed` (their own roles are
-  not imported), renamed (`ada-2`) where the `user_id` is taken or retired.
+  accounts by `user_id` only for a backup decrypted with one of this
+  server's keys whose `server` is this server, and otherwise makes every
+  user new (`match` takes only such a backup); a new user becomes a
+  placeholder account with no credential and the role `unclaimed` (their own
+  roles are not imported, and `unclaimed` alone does not raise posting
+  limits), renamed (`ada-2`) where the `user_id` is taken or retired, and
+  `imported-<id>` where it cannot be an account here (a guest's, a bot's, a
+  `~` notice's, or `admin`). One import makes at most 2,000 placeholders.
   Holding a role, placeholders are never removed as idle (account upkeep),
-  and they count toward `registeredIdentityCount`. `renumber` (or `ids =
-  "renumber"`) gives every record a new log ID instead of keeping its own.
-  A room holding nothing past its creation (a new server's `general`) is
-  filled, not skipped. An import notes its plan before it writes: run again
-  after a failure, it finishes; `restart` drops an unfinished plan. One
-  export or import runs at a time.
+  and they count toward `registeredIdentityCount`. Kept log IDs may be at
+  most five minutes past the clock; a file with later ones is refused:
+  `renumber` (or `ids = "renumber"`) gives every record a new log ID
+  instead. A room holding nothing past its creation (a new server's
+  `general`) is filled, not skipped. An import notes its plan before it
+  writes (one too large to note is refused: `renumber` it): run again after
+  a failure, the same file finishes; `restart` abandons an unfinished import
+  of another file, and the notice names the rooms it left part-restored.
 
 **Encryption.** An export with `encrypt` writes its backups encrypted
 (AES-256-GCM in 1 MiB chunks; `.enc` is added to the key) with a key derived
@@ -1418,7 +1445,10 @@ The numeric rows are grouped by their unit and enforcement scope:
   1,000; the newest page is always open): enough to look around every public
   room and thread before signing up, while scrolling further back is for
   accounts. Measuring a page reads up to that many rows, so a refused page is
-  still charged to the guest's address like a served one.
+  still charged to the guest's address like a served one. Only the object's
+  SQLite is counted: a page reaching below its floor, into a tier below,
+  counts as the full depth, so guests page there only through the newest
+  page or `after`.
 - Minute budgets: `historyRequestsPerUserMinute` and
   `historyRequestsPerIpMinute` (after bursts of `historyBurstPerUser` and
   `historyBurstPerIp`, which must drain within the hour cleanup keeps an idle

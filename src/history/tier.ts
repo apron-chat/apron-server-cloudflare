@@ -76,8 +76,19 @@ export interface HistoryHead extends RewritableTier {
 	dropReactionsOn(messageIds: readonly string[]): Promise<void>;
 	hasRoom(roomId: string): Promise<boolean>;
 	hasUser(userId: string): Promise<boolean>;
-	/** Import only: adds a new room (listing and records at or above the head's floor) and rebuilds its current state. */
-	restoreRoom(room: ArchivedRoom, records: readonly ChatRecord[]): Promise<void>;
+	/**
+	 * Import only: adds a new room (listing and records at or above the head's
+	 * floor) and rebuilds its current state. `context.rooms` are the rooms
+	 * this import adds (their IDs here): a message here already is taken for
+	 * the same one only when it is in one of them.
+	 */
+	restoreRoom(room: ArchivedRoom, records: readonly ChatRecord[], context?: RestoreContext): Promise<RestoreResult | void>;
+	/**
+	 * Import only: a record as this head would take it from a client (its
+	 * recorded users bare, a message's body normalized as a post's, its size
+	 * within a snapshot's), or null when a client could not have sent it.
+	 */
+	normalizeRecord?(record: ChatRecord): ChatRecord | null;
 	/** Import only: adds placeholder users, marked unclaimed (PLAN §10.4). */
 	restoreUsers(users: readonly ArchivedUser[]): Promise<void>;
 	/** Import only: whether a user ID is retired (purged or renamed away) and may not be reused. */
@@ -93,6 +104,21 @@ export interface HistoryHead extends RewritableTier {
 	/** Import: the running import's journal (importArchive), so a retry finishes it. */
 	journal?(): Promise<string | undefined>;
 	setJournal?(value: string | null): Promise<void>;
+}
+
+/** What restoreRoom is told of the import it serves. */
+export interface RestoreContext {
+	/** The rooms the import adds, by their IDs here. */
+	rooms: readonly string[];
+}
+
+/** What a restoreRoom call did. */
+export interface RestoreResult {
+	stored?: number;
+	/** Messages whose ID another message here holds: their state (and reaction sets) were left as they are. */
+	collided?: number;
+	/** Records dropped: not something a client could have sent (normalizeRecord). */
+	rejected?: number;
 }
 
 /** Per-tier progress, persisted in the head's `_meta` under `history:<tier>:<field>`. */

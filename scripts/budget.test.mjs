@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ADMISSION_BUDGET, DEFAULT_LIMITS } from '../src/budget.ts';
-import { customDomains, mediaHostname, relyingPartyId, renderBinding, signInPages, renderEdgeRules, replaceBinding, splitPreviews, validateAdmission, validateDeploymentConfiguration, validateEdgeStop, webClientTarget, wranglerHistory, wranglerVars } from './budget.mjs';
+import { checkBackupKeySecrets, customDomains, mediaHostname, relyingPartyId, renderBinding, signInPages, renderEdgeRules, replaceBinding, splitPreviews, validateAdmission, validateDeploymentConfiguration, validateEdgeStop, webClientTarget, wranglerHistory, wranglerVars } from './budget.mjs';
 import { readFileSync } from 'node:fs';
 import { loadConfig } from '../src/config.ts';
 
@@ -426,6 +426,56 @@ binding = "HISTORY_D1"
 	});
 	assert.equal(wranglerHistory('[vars]\nRP_ID = "x"\n'), undefined);
 	assert.throws(() => wranglerHistory('[vars.HISTORY]\nschedule = { every = 1d }\n'), /cannot read the value/);
+});
+
+test('collects every HISTORY section wherever it is, and fails on any HISTORY it cannot read rather than skipping it', () => {
+	// A HISTORY sub-table after another table still reaches the Worker: it is read, not dropped.
+	const scattered = `[vars.HISTORY]
+schedule = { every = "1d" }
+[[vars.HISTORY.tiers]]
+name = "hot"
+
+[[d1_databases]]
+binding = "HISTORY_D1"
+
+[[vars.HISTORY.exports]]
+name = "manual"
+[vars.HISTORY.import]
+plaintext = false
+`;
+	assert.deepEqual(wranglerHistory(scattered), {
+		schedule: { every: '1d' }, tiers: [{ name: 'hot' }], exports: [{ name: 'manual' }], import: { plaintext: false },
+	});
+	for (const [source, pattern] of [
+		['[vars."HISTORY"]\nschedule = { every = "1d" }\n', /cannot read the table header/],
+		['[ vars.HISTORY ]\nschedule = { every = "1d" }\n', /cannot read the table header/],
+		['[vars.HISTORY."tiers"]\nname = "hot"\n', /cannot read the table header/],
+		['[[vars.HISTORY.tiers]]\nname = "hot"\n[vars.HISTORY]\n', /comes before \[vars.HISTORY\]/],
+		['[vars]\nHISTORY = { schedule = { every = "1d" } }\n', /write HISTORY as a \[vars.HISTORY\] table/],
+		['[vars]\nHISTORY.schedule = { every = "1d" }\n', /write HISTORY as a \[vars.HISTORY\] table/],
+		['vars.HISTORY.schedule = { every = "1d" }\n', /write HISTORY as a \[vars.HISTORY\] table/],
+		['vars = { HISTORY = "{}" }\n', /not inline/],
+		['[vars.HISTORY]\n[vars.HISTORY]\n', /appears twice/],
+	]) assert.throws(() => wranglerHistory(source), pattern, source);
+	// Other keys that only contain the word are not HISTORY.
+	assert.equal(wranglerHistory('[vars]\nHISTORY_NOTE = "x"\n[[d1_databases]]\nbinding = "HISTORY_D1"\n'), undefined);
+});
+
+test('fails where a backup key secret is a plain [vars] var', () => {
+	const config = (vars) => `[vars]
+RP_ID = "x"
+${vars}
+[vars.HISTORY]
+[[vars.HISTORY.exports]]
+name = "nightly"
+encrypt = { key_secrets = ["BACKUP_KEY"] }
+[vars.HISTORY.import]
+key_secrets = ["OLD_KEY"]
+`;
+	assert.doesNotThrow(() => checkBackupKeySecrets(config('')));
+	assert.throws(() => checkBackupKeySecrets(config('BACKUP_KEY = "public"')), /names BACKUP_KEY as a backup key, but it is a plain \[vars\] var/);
+	assert.throws(() => checkBackupKeySecrets(config('OLD_KEY = "public"')), /names OLD_KEY/);
+	assert.doesNotThrow(() => checkBackupKeySecrets('[vars]\nRP_ID = "x"\n'));
 });
 
 test("production's HISTORY is valid and keeps the plan's own history limits", () => {

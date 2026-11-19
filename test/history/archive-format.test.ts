@@ -6,6 +6,7 @@ import {
 	linesFromStream,
 	linesOf,
 	MAX_LINE_BYTES,
+	MAX_READ_LINE_BYTES,
 	recordToWire,
 	utf8Length,
 	wireToRecord,
@@ -317,4 +318,17 @@ describe("scene fixtures", () => {
 			expect(again.extras).toEqual(archive.extras);
 		});
 	}
+});
+
+describe("reader limits", () => {
+	it("refuses a line longer than MAX_READ_LINE_BYTES, and a stream line past its cap", async () => {
+		const header = '{"apron_archive":1}';
+		const long = `{"messages":[{"room_id":"r","log_id":"1","text":"${"é".repeat(MAX_READ_LINE_BYTES / 2)}"}]}`;
+		await expect(collectArchive(jsonlReader(linesOf(`${header}\n${long}\n`)))).rejects.toThrow(/line 2 is longer than/);
+		const fits = `{"messages":[{"room_id":"r","log_id":"1","text":"${"x".repeat(MAX_READ_LINE_BYTES - 100)}"}]}`;
+		expect((await collectArchive(jsonlReader(linesOf(`${header}\n${fits}\n`)))).records).toHaveLength(0);
+		const bytes = new TextEncoder().encode("x".repeat(64));
+		const stream = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(bytes); controller.close(); } });
+		await expect((async () => { for await (const _ of linesFromStream(stream, 16)) { /* read */ } })()).rejects.toThrow(/longer than 16/);
+	});
 });

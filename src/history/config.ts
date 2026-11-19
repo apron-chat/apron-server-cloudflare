@@ -9,7 +9,6 @@
  * adding a kind adds one entry.
  */
 
-import { MemoryBlobStore } from "./blob/memory";
 import { R2BlobStore } from "./blob/r2";
 import type { SegmentIndex } from "./blob/segments";
 import type { BlobStore } from "./blob/store";
@@ -78,7 +77,13 @@ export function retentionOf(settings: RetentionSettings, thresholdPercent: numbe
 	};
 }
 
-/** A blob store from its settings, or undefined when its binding is missing. The `fs` provider is for Node scripts only. */
+/**
+ * A blob store from its settings, or undefined when it is unavailable in
+ * the Worker: an R2 binding missing, or the `memory` and `fs` providers,
+ * which are for tests and Node scripts (scripts/fs-blob-store.mjs) only (a
+ * Worker's memory is gone after every wake). The runtime says so in its
+ * log and leaves the tier or export out (unboundTiers).
+ */
 export function blobStoreOf(settings: BlobStoreSettings, env: HistoryEnv): BlobStore | undefined {
 	switch (settings.provider) {
 		case "r2": {
@@ -86,11 +91,24 @@ export function blobStoreOf(settings: BlobStoreSettings, env: HistoryEnv): BlobS
 			return bucket ? new R2BlobStore(bucket) : undefined;
 		}
 		case "memory":
-			return new MemoryBlobStore();
 		case "fs":
-			// Node scripts only (scripts/fs-blob-store.mjs): in the Worker, as if unbound.
 			return undefined;
 	}
+}
+
+/**
+ * The tiers below the head HISTORY lists that this deploy cannot build: a
+ * binding missing, or a store the Worker cannot use (`memory`, `fs`), with
+ * what is missing. While any is, no other composition runs in its place
+ * (the runtime runs no cycles and keeps the copy marker where it is).
+ */
+export function unboundTiers(env: HistoryEnv, settings: HistorySettings): Array<{ name: string; missing: string }> {
+	return settings.tiers.slice(1).flatMap((tier) => {
+		if (tier.kind === "d1") return binding(env, tier.binding) === undefined ? [{ name: tier.name, missing: `the ${tier.binding} binding` }] : [];
+		if (tier.kind !== "blob") return [];
+		if (tier.store.provider !== "r2") return [{ name: tier.name, missing: `a store the Worker can use (provider ${tier.store.provider} is for tests and scripts)` }];
+		return binding(env, tier.store.binding) === undefined ? [{ name: tier.name, missing: `the ${tier.store.binding} binding` }] : [];
+	});
 }
 
 type Factory = (settings: TierSettings, options: BuildOptions, thresholdPercent: number) => PipelineStage | undefined;
@@ -130,7 +148,7 @@ const TIER_FACTORIES: Record<Exclude<TierSettings["kind"], "sqlite">, Factory> =
 export function hasLowerTiers(env: HistoryEnv, limits: HistoryLimits, settings?: HistorySettings): boolean {
 	if (!settings) return Boolean(env.HISTORY_D1 && limits.archiveRecords > 0);
 	return settings.tiers.slice(1).some((tier) => tier.kind === "d1" ? binding(env, tier.binding) !== undefined
-		: tier.kind === "blob" ? tier.store.provider === "memory" || (tier.store.provider === "r2" && binding(env, tier.store.binding) !== undefined)
+		: tier.kind === "blob" ? tier.store.provider === "r2" && binding(env, tier.store.binding) !== undefined
 		: false);
 }
 

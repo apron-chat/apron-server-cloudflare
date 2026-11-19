@@ -155,7 +155,11 @@ describe("export and import", () => {
 		expect(foreign.users).toEqual({ ada: { placeholder: "ada-2" }, bob: { placeholder: "bob-2" } });
 		expect(foreign.dryRun).toBe(true);
 		expect(target.head.all()).toEqual([]);
-		const own = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, server: "here.test", dryRun: true });
+		// Matched only when the archive is authenticated (decrypted with this server's key): a plain file's header is anyone's.
+		const unsealed = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, server: "here.test", dryRun: true });
+		expect(unsealed.users).toEqual({ ada: { placeholder: "ada-2" }, bob: { placeholder: "bob-2" } });
+		await expect(importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, users: "match", dryRun: true })).rejects.toThrow(/users match takes only a backup encrypted/);
+		const own = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, server: "here.test", dryRun: true, authenticated: true });
 		expect(own.users).toEqual({ ada: { matched: "ada" }, bob: { placeholder: "bob-2" } });
 		const chosen = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, userMap: { bob: { placeholder: "robert" }, ada: { existing: "ada" } } });
 		expect(chosen.users).toEqual({ ada: { matched: "ada" }, bob: { placeholder: "robert" } });
@@ -178,7 +182,8 @@ describe("export and import", () => {
 
 	it("imports every scene from scene.apron.chat to the scene's own rendered state", async () => {
 		for (const [name, text] of Object.entries(sceneArchives)) {
-			const target = pipelineOf("head+recent+cold", new TestClock(1));
+			// A clock past the scenes' log IDs, which an import keeping them requires.
+			const target = pipelineOf("head+recent+cold", new TestClock(2_000_000_000_000));
 			const report = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock });
 			expect(report.expired, name).toBe(0);
 			await settle(target.pipeline);
@@ -327,6 +332,167 @@ describe("export and import", () => {
 		const stored = target.head.all().filter((record) => record.kind === "message");
 		expect(stored.map((record) => record.log_id)).toEqual([150]);
 		expect(stored[0].record_json).not.toContain("output_ref");
+	});
+
+	it("refuses log IDs past the clock unless renumbered, deriving a renumbered room's bounds from its records, and reports the range", async () => {
+		const message = (logId: number) => JSON.stringify({ message_id: String(logId), log_id: String(logId), room_id: "lobby", from: { user_id: "zed" }, body: { text: `m${logId}` } });
+		const archive = (latest: string, records: number[]) => writeArchiveToString(async (writer) => {
+			await writer.header({ apron_archive: 1, server: "wss://elsewhere.test/" });
+			await writer.listing({ not_joined: [{ room_id: "lobby", log_id: "100", latest_log_id: latest }] });
+			await writer.records(records.map((logId) => ({ room_id: "lobby", log_id: logId, commit_ms: logId, kind: "message", record_json: message(logId) })));
+		});
+		const target = pipelineOf("head", new TestClock(1_000_000));
+		// A listing's head far in the future, or a record past the clock and five minutes.
+		for (const text of [await archive(String(Number.MAX_SAFE_INTEGER), [100, 200]), await archive("200", [100, 200, 1_000_000 + 5 * 60_000 + 1])]) {
+			await expect(importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock })).rejects.toThrow(/later than this server's clock: import it with renumber/);
+			await expect(importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, dryRun: true })).rejects.toThrow(/renumber/);
+			expect(target.head.all()).toEqual([]);
+			expect(await target.head.journal()).toBeUndefined();
+		}
+		// Within the clock's five minutes, the IDs are kept, and the range is reported.
+		const near = await importArchive(target.pipeline, jsonlReader(linesOf(await archive("200", [100, 200]))), { clock: target.clock, dryRun: true });
+		expect(near.logIdRange).toEqual({ first: 100, last: 200 });
+		// Renumbered, the records take IDs at the clock, and the listing's head is theirs, not the file's.
+		const text = await archive(String(Number.MAX_SAFE_INTEGER), [100, 200, 9_000_000_000_000]);
+		const dry = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, ids: "renumber", dryRun: true });
+		expect(dry.logIdRange).toEqual({ first: 1_000_000, last: 1_000_002 });
+		await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, ids: "renumber" });
+		expect(target.head.rooms_.get("lobby")?.listing).toMatchObject({ log_id: "1000000", latest_log_id: "1000002", history_log_id: "1000000" });
+		expect(Math.max(...target.head.all().map((record) => record.log_id))).toBe(1_000_002);
+	});
+
+	it("never takes an ID that cannot stand here, nor matches users from a file this server did not seal, and caps the placeholders an import makes", async () => {
+		const message = (logId: number, from: Record<string, unknown>) => ({ room_id: "lobby", log_id: logId, commit_ms: logId, kind: "message", record_json: JSON.stringify({ message_id: String(logId), log_id: String(logId), room_id: "lobby", from, body: { text: `m${logId}` } }) });
+		const text = await writeArchiveToString(async (writer) => {
+			// Claims to be this server: unsealed, the header proves nothing.
+			await writer.header({ apron_archive: 1, server: "wss://here.test/" });
+			await writer.listing({ not_joined: [{ room_id: "lobby", log_id: "10" }], users: [{ user_id: "admin", name: "Root", roles: ["admin"] }] });
+			await writer.records([
+				message(10, { user_id: "admin", name: "Root", roles: ["admin"] }),
+				message(11, { user_id: "~private", name: "Server" }),
+				message(12, { user_id: "guest_7" }),
+				message(13, { user_id: "bot_ada", tier: "bot" }),
+				message(14, { user_id: "ada", name: "Ada", roles: ["mod"], tier: "registered" }),
+			]);
+		});
+		const target = pipelineOf("head", new TestClock(1_000_000));
+		target.head.people.set("admin", { user_id: "admin", name: "Admin" });
+		target.head.people.set("ada", { user_id: "ada", name: "Our Ada" });
+		const report = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, server: "wss://here.test/", dryRun: true });
+		expect(report.users).toEqual({
+			"admin": { placeholder: "imported-admin" }, "~private": { placeholder: "imported-private" }, "guest_7": { placeholder: "imported-guest_7" },
+			"bot_ada": { placeholder: "imported-bot_ada" }, "ada": { placeholder: "ada-2" },
+		});
+		expect(report.placeholders).toBe(5);
+		// Capped: a dry run says it would be refused; the import is, before writing anything.
+		const capped = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, dryRun: true, maxPlaceholders: 4 });
+		expect(capped.refused).toMatch(/5 placeholder accounts, more than the 4/);
+		await expect(importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, maxPlaceholders: 4 })).rejects.toThrow(/more than the 4/);
+		expect(target.head.all()).toEqual([]);
+		// Authenticated (one of this server's backups), `admin` and `ada` are matched; the others never are.
+		const sealed = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, server: "wss://here.test/", authenticated: true });
+		expect(sealed.users).toMatchObject({ admin: { matched: "admin" }, ada: { matched: "ada" }, guest_7: { placeholder: "imported-guest_7" } });
+		// Recorded users keep their ID and name only.
+		const froms = target.head.all().filter((record) => record.kind === "message").map((record) => JSON.parse(record.record_json).from);
+		expect(froms).toEqual([
+			{ user_id: "admin", name: "Root" }, { user_id: "imported-private", name: "Server" }, { user_id: "imported-guest_7" }, { user_id: "imported-bot_ada" }, { user_id: "ada", name: "Ada" },
+		]);
+		expect(target.head.people.get("imported-private")?.roles).toEqual(["unclaimed"]);
+	});
+
+	it("drops records the head says no client could have sent, and counts them", async () => {
+		const source = pipelineOf("head");
+		populate(source.head, source.clock);
+		const text = await exported(source.pipeline, source.clock);
+		const target = pipelineOf("head", new TestClock(5_000_000));
+		target.head.normalizeRecord = (record) => record.record_json.includes("hello 4") ? null : record;
+		const report = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock });
+		expect(report.rejected).toBe(1);
+		expect(target.head.all().some((record) => record.record_json.includes("hello 4"))).toBe(false);
+		expect(target.head.all().some((record) => record.record_json.includes("hello 5"))).toBe(true);
+	});
+
+	it("journals a renumbered import by its first ID, and refuses one in original IDs too large to resume before writing", async () => {
+		const many = 25_000;
+		const message = (logId: number) => ({ room_id: "lobby", log_id: logId, commit_ms: logId, kind: "message", record_json: JSON.stringify({ message_id: String(logId), log_id: String(logId), room_id: "lobby", from: { user_id: "zed" }, body: { text: "x" } }) });
+		const records = Array.from({ length: many }, (_, index) => message(1_000 + index));
+		const text = await writeArchiveToString(async (writer) => {
+			await writer.header({ apron_archive: 1 });
+			await writer.listing({ not_joined: [{ room_id: "lobby", log_id: "1000" }] });
+			await writer.records(records);
+		});
+		// Every ID taken here by another record: each would move.
+		const target = pipelineOf("head", new TestClock(100_000));
+		for (const record of records) target.head.records.set(`${record.log_id}\u0000elsewhere`, { ...record, room_id: "elsewhere", record_json: record.record_json.replace('"x"', '"other"') });
+		const dry = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, dryRun: true });
+		expect(dry.refused).toMatch(/moves 25000 log IDs, too many to resume from/);
+		await expect(importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock })).rejects.toThrow(/import it with renumber/);
+		expect(await target.head.journal()).toBeUndefined();
+		// Renumbered: the journal holds the first ID, not every one, and a failed run resumes with the same IDs.
+		const journals: string[] = [];
+		const setJournal = target.head.setJournal.bind(target.head);
+		target.head.setJournal = async (value) => {
+			if (value) journals.push(value);
+			return setJournal(value);
+		};
+		const append = target.head.append.bind(target.head);
+		let fail = true;
+		target.head.append = async (range) => {
+			if (fail && range.records.some((record) => record.room_id === "lobby")) {
+				fail = false;
+				throw new Error("the budget ran out");
+			}
+			return append(range);
+		};
+		await expect(importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, ids: "renumber", batch: 256 })).rejects.toThrow(/budget/);
+		expect(journals[0].length).toBeLessThan(1_000);
+		expect(JSON.parse(journals[0])).toMatchObject({ renumber: 100_000, moved: [] });
+		const again = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock });
+		expect(again.resumed).toBe(true);
+		expect(again.logIdRange).toEqual({ first: 100_000, last: 100_000 + many - 1 });
+		expect(target.head.all().filter((record) => record.room_id === "lobby")).toHaveLength(many);
+	});
+
+	it("resumes an unfinished import of the same archive whatever restart says, and abandons another's only with restart, naming its rooms", async () => {
+		const source = pipelineOf("head");
+		populate(source.head, source.clock);
+		const text = await exported(source.pipeline, source.clock);
+		const target = pipelineOf("head", new TestClock(5_000_000));
+		const restore = target.head.restoreRoom.bind(target.head);
+		let calls = 0;
+		target.head.restoreRoom = async (room, records) => {
+			calls += 1;
+			if (calls === 2) throw new Error("the budget ran out");
+			return restore(room, records);
+		};
+		await expect(importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock })).rejects.toThrow(/budget/);
+		// The same archive with restart: resumed, so the room it began is finished, not skipped.
+		const again = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, restart: true });
+		expect(again).toMatchObject({ resumed: true, roomsAdded: ["general", "random"], roomsSkipped: [] });
+		expect(again.abandoned).toBeUndefined();
+		// Another archive's unfinished import: refused, or with restart abandoned, its rooms named.
+		calls = 0;
+		const other = pipelineOf("head", new TestClock(7_000_000));
+		other.head.commit("lobby", "message", { message_id: "m", from: { user_id: "zed" }, body: { text: "a" } });
+		other.head.commit("hall", "message", { message_id: "n", from: { user_id: "zed" }, body: { text: "b" } });
+		const otherText = await exported(other.pipeline, other.clock, { server: "other.test" });
+		await expect(importArchive(target.pipeline, jsonlReader(linesOf(otherText)), { clock: new TestClock(8_000_000) })).rejects.toThrow(/budget/);
+		await expect(importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock })).rejects.toThrow(/another import is unfinished \(rooms hall, lobby\)/);
+		const abandoned = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, restart: true, dryRun: true });
+		expect(abandoned.abandoned).toEqual(["hall", "lobby"]);
+		expect(abandoned.resumed).toBe(false);
+	});
+
+	it("refuses a second backup of an export within the same second", async () => {
+		const settings = parseHistorySettings({ tiers: [{ name: "hot", kind: "sqlite", retention: { records: 10 } }], exports: [{ name: "manual", store: { provider: "memory", prefix: "backups/" } }] });
+		const store = new MemoryBlobStore();
+		const source = pipelineOf("head");
+		populate(source.head, source.clock);
+		const at = Date.UTC(2026, 10, 19, 12);
+		await writeBackup(source.pipeline, store, settings.exports[0], { server: "srv", clock: { now: () => at } });
+		await expect(writeBackup(source.pipeline, store, settings.exports[0], { server: "srv", clock: { now: () => at + 500 } })).rejects.toThrow(/exists already/);
+		await writeBackup(source.pipeline, store, settings.exports[0], { server: "srv", clock: { now: () => at + 1_000 } });
+		expect((await store.list("backups/")).keys).toHaveLength(2);
 	});
 
 	it("leaves private rooms out of an export that says so", async () => {

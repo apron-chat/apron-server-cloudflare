@@ -36,19 +36,55 @@ export interface SegmentCursor {
 	roomId: string;
 }
 
-/** Where segments are. The names are deterministic, so `rebuild` restores a lost index from a listing. */
+/**
+ * The most rows one index query reads (SqlSegmentIndex): every query is
+ * bounded so, and the Store reserves for it (Store.segmentIndex). Where a
+ * query could need more, it says what it leaves out.
+ */
+export const SEGMENT_QUERY_ROWS = 1_000;
+
+/** Segments a room's query looks at below its range for one that reaches into it (find): segments of a room seldom overlap. */
+const STRADDLE_ROWS = 8;
+
+/** Where a segment sits in a newest-first walk (`newest`), to continue after it. */
+export type SegmentPosition = Pick<SegmentRef, "last" | "first" | "roomId">;
+
+/**
+ * Where segments are. The names are deterministic, so `rebuild` restores a
+ * lost index from a listing. Queries are bounded (SEGMENT_QUERY_ROWS): each
+ * reads and returns at most that many segments, a room's at most that many
+ * per room.
+ */
 export interface SegmentIndex {
-	/** The segments of `roomIds` overlapping `[lower, upper]`, by room, then first. */
-	find(roomIds: readonly string[], lower: number, upper: number): Promise<SegmentRef[]>;
-	/** Every room's segments overlapping `[lower, upper]`, by first, then room. */
+	/**
+	 * The segments of `roomIds` overlapping `[lower, upper]`, by room, then
+	 * first: per room, at most `limit` (default SEGMENT_QUERY_ROWS) from the
+	 * range's start (`forward`, the default) or its end, and the few starting
+	 * below `lower` that reach into it.
+	 */
+	find(roomIds: readonly string[], lower: number, upper: number, options?: { forward?: boolean; limit?: number }): Promise<SegmentRef[]>;
+	/**
+	 * Segments overlapping `[lower, upper]`, by first, then room: of the
+	 * SEGMENT_QUERY_ROWS segments ending first at or after `lower`, those
+	 * starting at or before `upper` (so a long segment ending far past many
+	 * others may be left out of a wide range).
+	 */
 	overlapping(lower: number, upper: number): Promise<SegmentRef[]>;
+	/** At most `limit` segments wholly below `below` (`last < below`), newest first: by last, first and room, descending, strictly after `after`. */
+	newest(below: number, limit: number, after?: SegmentPosition): Promise<SegmentRef[]>;
+	/** At most `limit` segments starting below `floor`, by first, then room. */
+	startingBelow(floor: number, limit: number): Promise<SegmentRef[]>;
+	/** The lowest `first` of a segment wholly below `below`, looking at the SEGMENT_QUERY_ROWS lowest-starting segments; undefined if none of them is. */
+	lowestBelow(below: number): Promise<number | undefined>;
+	/** The lowest `first` of a segment straddling `floor` (`first < floor <= last`), looking at the SEGMENT_QUERY_ROWS segments starting nearest below it; undefined for none. */
+	straddling(floor: number): Promise<number | undefined>;
 	/** At most `limit` segments ending at or after `from`, by first, then room, strictly after `cursor`. */
 	after(from: number, limit: number, cursor?: SegmentCursor): Promise<SegmentRef[]>;
 	/** The `limit` segments ending first: by last, then first, then room. */
 	oldest(limit: number): Promise<SegmentRef[]>;
-	/** A room's segments, by first. */
+	/** A room's segments, by first: at most SEGMENT_QUERY_ROWS, the first. */
 	forRoom(roomId: string): Promise<SegmentRef[]>;
-	/** Every room with a segment, sorted. */
+	/** Rooms with a segment, sorted: those of the first SEGMENT_QUERY_ROWS segments by room. */
 	rooms(): Promise<string[]>;
 	/** Adds segments; one already indexed at the same room and first is replaced. */
 	add(refs: readonly SegmentRef[]): Promise<void>;
@@ -158,13 +194,36 @@ export class MemorySegmentIndex implements SegmentIndex {
 		return [...this.refs.values()].map((ref) => ({ ...ref })).sort(byFirst);
 	}
 
-	async find(roomIds: readonly string[], lower: number, upper: number): Promise<SegmentRef[]> {
-		const rooms = new Set(roomIds);
-		return this.all().filter((ref) => rooms.has(ref.roomId) && ref.first <= upper && ref.last >= lower).sort(byRoom);
+	async find(roomIds: readonly string[], lower: number, upper: number, options: { forward?: boolean; limit?: number } = {}): Promise<SegmentRef[]> {
+		const limit = options.limit ?? SEGMENT_QUERY_ROWS;
+		return [...new Set(roomIds)].flatMap((roomId) => {
+			const own = this.all().filter((ref) => ref.roomId === roomId && ref.first <= upper && ref.last >= lower);
+			const straddling = own.filter((ref) => ref.first < lower).slice(-STRADDLE_ROWS);
+			const inside = own.filter((ref) => ref.first >= lower);
+			return [...straddling, ...(options.forward === false ? inside.slice(-limit) : inside.slice(0, limit))];
+		}).sort(byRoom);
 	}
 
 	async overlapping(lower: number, upper: number): Promise<SegmentRef[]> {
-		return this.all().filter((ref) => ref.first <= upper && ref.last >= lower);
+		return this.all().filter((ref) => ref.last >= lower).sort(byLast).slice(0, SEGMENT_QUERY_ROWS).filter((ref) => ref.first <= upper).sort(byFirst);
+	}
+
+	async newest(below: number, limit: number, after?: SegmentPosition): Promise<SegmentRef[]> {
+		return this.all().filter((ref) => ref.last < below && (!after || byLast(ref, { ...after, key: "", records: 0, bytes: 0 }) < 0)).sort((a, b) => byLast(b, a)).slice(0, limit);
+	}
+
+	async startingBelow(floor: number, limit: number): Promise<SegmentRef[]> {
+		return this.all().filter((ref) => ref.first < floor).slice(0, limit);
+	}
+
+	async lowestBelow(below: number): Promise<number | undefined> {
+		return this.all().slice(0, SEGMENT_QUERY_ROWS).find((ref) => ref.last < below)?.first;
+	}
+
+	async straddling(floor: number): Promise<number | undefined> {
+		const nearest = this.all().filter((ref) => ref.first < floor).slice(-SEGMENT_QUERY_ROWS);
+		const found = nearest.filter((ref) => ref.last >= floor);
+		return found.length ? Math.min(...found.map((ref) => ref.first)) : undefined;
 	}
 
 	async after(from: number, limit: number, cursor?: SegmentCursor): Promise<SegmentRef[]> {
@@ -178,11 +237,11 @@ export class MemorySegmentIndex implements SegmentIndex {
 	}
 
 	async forRoom(roomId: string): Promise<SegmentRef[]> {
-		return this.all().filter((ref) => ref.roomId === roomId);
+		return this.all().filter((ref) => ref.roomId === roomId).slice(0, SEGMENT_QUERY_ROWS);
 	}
 
 	async rooms(): Promise<string[]> {
-		return [...new Set(this.all().map((ref) => ref.roomId))].sort();
+		return [...new Set(this.all().sort(byRoom).slice(0, SEGMENT_QUERY_ROWS).map((ref) => ref.roomId))].sort();
 	}
 
 	async add(refs: readonly SegmentRef[]): Promise<void> {
@@ -223,7 +282,10 @@ export function segmentSchema(table = SEGMENT_TABLE): string[] {
 	checkTable(table);
 	return [
 		`CREATE TABLE IF NOT EXISTS ${table} (room_id TEXT NOT NULL, "first" INTEGER NOT NULL, "last" INTEGER NOT NULL, key TEXT NOT NULL, records INTEGER NOT NULL, bytes INTEGER NOT NULL, PRIMARY KEY (room_id, "first")) WITHOUT ROWID`,
-		`CREATE INDEX IF NOT EXISTS ${table}_last ON ${table} ("last")`,
+		// In the orders queries walk (by last, by first), so a bounded query reads only what it returns.
+		`CREATE INDEX IF NOT EXISTS ${table}_by_last ON ${table} ("last", "first", room_id)`,
+		`CREATE INDEX IF NOT EXISTS ${table}_by_first ON ${table} ("first", room_id)`,
+		`DROP INDEX IF EXISTS ${table}_last`,
 	];
 }
 
@@ -270,30 +332,84 @@ export class SqlSegmentIndex implements SegmentIndex {
 		return this.sql.rows<SegmentRow>(`SELECT ${COLUMNS} FROM ${this.table} ${where} ORDER BY ${order}`, ...binds).map(refOf);
 	}
 
-	async find(roomIds: readonly string[], lower: number, upper: number): Promise<SegmentRef[]> {
-		if (!roomIds.length) return [];
-		return this.select(`WHERE room_id IN (SELECT value FROM json_each(?)) AND "first" <= ? AND "last" >= ?`, `room_id, "first"`, JSON.stringify(roomIds), upper, lower);
+	/** One value of an aggregate over a bounded subquery. */
+	private value(sql: string, ...binds: unknown[]): number | undefined {
+		const value = this.sql.rows<{ value: number | null }>(sql, ...binds)[0]?.value;
+		return value === null || value === undefined ? undefined : Number(value);
+	}
+
+	async find(roomIds: readonly string[], lower: number, upper: number, options: { forward?: boolean; limit?: number } = {}): Promise<SegmentRef[]> {
+		const limit = Math.min(options.limit ?? SEGMENT_QUERY_ROWS, SEGMENT_QUERY_ROWS);
+		const out: SegmentRef[] = [];
+		// One room at a time, by its primary key (room, first): each query reads what it returns.
+		for (const roomId of [...new Set(roomIds)].sort()) {
+			// Those starting below `lower` that reach into the range (few: a room's segments seldom overlap), then those starting in it.
+			const straddling = this.sql.rows<SegmentRow>(
+				`SELECT * FROM (SELECT ${COLUMNS} FROM ${this.table} WHERE room_id = ? AND "first" < ? ORDER BY "first" DESC LIMIT ?) WHERE last >= ? ORDER BY first`,
+				roomId, lower, STRADDLE_ROWS, lower,
+			).map(refOf);
+			const inside = options.forward === false
+				? this.select(`WHERE room_id = ? AND "first" >= ? AND "first" <= ?`, `"first" DESC LIMIT ?`, roomId, lower, upper, limit).reverse()
+				: this.select(`WHERE room_id = ? AND "first" >= ? AND "first" <= ?`, `"first" LIMIT ?`, roomId, lower, upper, limit);
+			out.push(...straddling, ...inside);
+		}
+		return out;
 	}
 
 	async overlapping(lower: number, upper: number): Promise<SegmentRef[]> {
-		return this.select(`WHERE "first" <= ? AND "last" >= ?`, `"first", room_id`, upper, lower);
+		return this.sql.rows<SegmentRow>(
+			`SELECT * FROM (SELECT ${COLUMNS} FROM ${this.table} WHERE "last" >= ? ORDER BY "last" LIMIT ?) WHERE first <= ? ORDER BY first, room_id`,
+			lower, SEGMENT_QUERY_ROWS, upper,
+		).map(refOf);
+	}
+
+	async newest(below: number, limit: number, after?: SegmentPosition): Promise<SegmentRef[]> {
+		const bounded = Math.min(limit, SEGMENT_QUERY_ROWS);
+		if (!after) return this.select(`WHERE "last" < ?`, `"last" DESC, "first" DESC, room_id DESC LIMIT ?`, below, bounded);
+		// One range on the index (last <= the cursor's), the tie on `last` settled by first and room.
+		return this.select(
+			`WHERE "last" <= ? AND ("last" < ? OR "first" < ? OR ("first" = ? AND room_id < ?))`, `"last" DESC, "first" DESC, room_id DESC LIMIT ?`,
+			Math.min(below - 1, after.last), after.last, after.first, after.first, after.roomId, bounded,
+		);
+	}
+
+	async startingBelow(floor: number, limit: number): Promise<SegmentRef[]> {
+		return this.select(`WHERE "first" < ?`, `"first", room_id LIMIT ?`, floor, Math.min(limit, SEGMENT_QUERY_ROWS));
+	}
+
+	async lowestBelow(below: number): Promise<number | undefined> {
+		return this.value(`SELECT MIN(f) AS value FROM (SELECT "first" AS f, "last" AS l FROM ${this.table} ORDER BY "first" LIMIT ?) WHERE l < ?`, SEGMENT_QUERY_ROWS, below);
+	}
+
+	async straddling(floor: number): Promise<number | undefined> {
+		return this.value(`SELECT MIN(f) AS value FROM (SELECT "first" AS f, "last" AS l FROM ${this.table} WHERE "first" < ? ORDER BY "first" DESC LIMIT ?) WHERE l >= ?`, floor, SEGMENT_QUERY_ROWS, floor);
 	}
 
 	async after(from: number, limit: number, cursor?: SegmentCursor): Promise<SegmentRef[]> {
-		if (!cursor) return this.select(`WHERE "last" >= ?`, `"first", room_id LIMIT ?`, from, limit);
-		return this.select(`WHERE "last" >= ? AND ("first" > ? OR ("first" = ? AND room_id > ?))`, `"first", room_id LIMIT ?`, from, cursor.first, cursor.first, cursor.roomId, limit);
+		// Those starting before `from` that reach it (few), then those starting
+		// from it on, by the index on first: no query walks segments wholly below `from`.
+		const bounded = Math.min(limit, SEGMENT_QUERY_ROWS);
+		const straddling = this.sql.rows<SegmentRow>(
+			`SELECT * FROM (SELECT ${COLUMNS} FROM ${this.table} WHERE "first" < ? ORDER BY "first" DESC LIMIT ?) WHERE last >= ?`,
+			from, SEGMENT_QUERY_ROWS, from,
+		).map(refOf);
+		const rest = cursor
+			? this.select(`WHERE "first" >= ? AND ("first" > ? OR ("first" = ? AND room_id > ?))`, `"first", room_id LIMIT ?`, from, cursor.first, cursor.first, cursor.roomId, bounded)
+			: this.select(`WHERE "first" >= ?`, `"first", room_id LIMIT ?`, from, bounded);
+		const past = (ref: SegmentRef) => !cursor || ref.first > cursor.first || (ref.first === cursor.first && ref.roomId > cursor.roomId);
+		return [...straddling.filter(past), ...rest].sort(byFirst).slice(0, bounded);
 	}
 
 	async oldest(limit: number): Promise<SegmentRef[]> {
-		return this.select("", `"last", "first", room_id LIMIT ?`, limit);
+		return this.select("", `"last", "first", room_id LIMIT ?`, Math.min(limit, SEGMENT_QUERY_ROWS));
 	}
 
 	async forRoom(roomId: string): Promise<SegmentRef[]> {
-		return this.select("WHERE room_id = ?", `"first"`, roomId);
+		return this.select("WHERE room_id = ?", `"first" LIMIT ?`, roomId, SEGMENT_QUERY_ROWS);
 	}
 
 	async rooms(): Promise<string[]> {
-		return this.sql.rows<{ room_id: string }>(`SELECT DISTINCT room_id FROM ${this.table} ORDER BY room_id`).map((row) => row.room_id);
+		return this.sql.rows<{ room_id: string }>(`SELECT DISTINCT room_id FROM (SELECT room_id FROM ${this.table} ORDER BY room_id LIMIT ?) ORDER BY room_id`, SEGMENT_QUERY_ROWS).map((row) => row.room_id);
 	}
 
 	async add(refs: readonly SegmentRef[]): Promise<void> {
@@ -306,8 +422,13 @@ export class SqlSegmentIndex implements SegmentIndex {
 		for (const ref of refs) this.sql.run(`DELETE FROM ${this.table} WHERE room_id = ? AND "first" = ? AND key = ?`, ref.roomId, ref.first, ref.key);
 	}
 
+	/** Forgets every segment, a bounded page at a time. */
 	async clear(): Promise<void> {
-		this.sql.run(`DELETE FROM ${this.table}`);
+		for (;;) {
+			const page = this.select("", `room_id, "first" LIMIT ?`, SEGMENT_QUERY_ROWS);
+			if (!page.length) return;
+			await this.remove(page);
+		}
 	}
 
 	rebuild(store: BlobStore, prefix: string, options?: RebuildOptions): Promise<number> {

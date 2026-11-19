@@ -88,6 +88,11 @@ store = { provider = "r2", binding = "HISTORY_BLOB", prefix = "backups/" }
 keep = 10
 private_rooms = true
 
+# `/history import` takes plain ARCHIVE.md files too (plaintext: true, the
+# default where no export encrypts), as the backups here are plain.
+[vars.HISTORY.import]
+plaintext = true
+
 # BEGIN GENERATED ADMISSION BUDGET
 # Edit src/budget.ts, then run npm run budget:generate.
 [[ratelimits]]

@@ -51,7 +51,8 @@ export interface BackupResult extends ExportReport {
 /**
  * Writes one backup of the whole pipeline to `store`, then deletes this
  * export's backups past the newest `keep`. With `encrypt`, the first listed
- * key secret encrypts it; a missing key fails before anything is written.
+ * key secret encrypts it; a missing key fails before anything is written,
+ * as does a backup of this export made in the same second (its key).
  */
 export async function writeBackup(pipeline: HistoryPipeline, store: BlobStore, settings: ExportSettings, options: { server: string; clock: Clock; keys?: Pick<BackupKeys, "lookup">; roomIds?: string[]; header?: Partial<ArchiveHeader>; prepare?: ExportOptions["prepare"] }): Promise<BackupResult> {
 	const now = options.clock.now();
@@ -62,6 +63,10 @@ export async function writeBackup(pipeline: HistoryPipeline, store: BlobStore, s
 		const found = await options.keys?.lookup(name);
 		if (!found) throw new Error(`the export ${settings.name} encrypts with ${name}, which is not set: set it with \`wrangler secret put ${name}\``);
 		encryptWith = { name, ...found };
+	}
+	// Keys are to the second: a second backup within it would replace the first.
+	if ((await store.list(key, { limit: 1 })).keys.some((entry) => entry.key === key)) {
+		throw new Error(`the backup ${key} exists already (another export this second): try again in a moment`);
 	}
 	const writer = await store.writer(key, { contentType: encryptWith ? "application/octet-stream" : "application/jsonl" });
 	let report: ExportReport;

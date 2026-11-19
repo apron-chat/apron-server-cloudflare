@@ -39,6 +39,26 @@ describe("HISTORY settings", () => {
 		expect(historyLimits(settings)).toEqual({ retentionRecords: 5_000, retentionSeconds: 0, minRetentionSeconds: 259_200, archiveRecords: 100_000, cleanupThresholdPercent: 80, cleanupSeconds: 86_400 });
 	});
 
+	it("imports plain files only where no export encrypts, unless import.plaintext says otherwise", () => {
+		expect(parseHistorySettings(full).import.plaintext).toBe(false);
+		const plain = { ...full, exports: [{ name: "manual", store: { provider: "r2", binding: "HISTORY_BLOB", prefix: "backups/" } }] };
+		expect(parseHistorySettings(plain).import.plaintext).toBe(true);
+		expect(parseHistorySettings({ ...plain, import: { plaintext: false } }).import.plaintext).toBe(false);
+		expect(parseHistorySettings({ ...full, import: { plaintext: true } }).import.plaintext).toBe(true);
+		expect(() => parseHistorySettings({ ...full, import: { plaintext: "no" } })).toThrow(/import.plaintext must be true or false/);
+	});
+
+	it("refuses two exports sharing a store and prefix unless both keys include {name}", () => {
+		const store = { provider: "r2", binding: "HISTORY_BLOB", prefix: "backups/" };
+		const exports = (a: string, b: string, other = store) => ({ ...full, exports: [{ name: "a", store, key: a }, { name: "b", store: other, key: b }] });
+		expect(() => parseHistorySettings(exports("{date}.jsonl", "{name}-{date}.jsonl"))).toThrow(/exports a and b share a store and prefix, so both keys must include \{name\}/);
+		expect(() => parseHistorySettings(exports("x-{date}.jsonl", "y-{date}.jsonl"))).toThrow(/share a store/);
+		expect(parseHistorySettings(exports("{name}-{date}.jsonl", "{server}-{name}-{date}.jsonl")).exports).toHaveLength(2);
+		// Another prefix or bucket keeps them apart already.
+		expect(parseHistorySettings(exports("{date}.jsonl", "{date}.jsonl", { ...store, prefix: "other/" })).exports).toHaveLength(2);
+		expect(parseHistorySettings(exports("{date}.jsonl", "{date}.jsonl", { ...store, binding: "OTHER" })).exports).toHaveLength(2);
+	});
+
 	it("refuses what it cannot build, naming the setting", () => {
 		const bad = (change: (config: typeof full) => unknown) => () => parseHistorySettings(change(structuredClone(full)));
 		expect(bad((config) => ({ ...config, tiers: config.tiers.slice(1) }))).toThrow(/tiers\[0\] must be the SQLite tier/);

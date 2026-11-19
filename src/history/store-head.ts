@@ -13,7 +13,7 @@
 
 import type { ArchivedRoom, ArchivedUser } from "./archive/types";
 import { type ChatRecord, type HistoryOp, type HistoryQuery, type QueuedOp, type RecordRange, type TierStats, toRange } from "./records";
-import type { HistoryHead, PurgeResult, TierState, TierStateStore } from "./tier";
+import type { HistoryHead, PurgeResult, RestoreContext, RestoreResult, TierState, TierStateStore } from "./tier";
 
 /** What the adapter needs of the Store (src/store.ts), so this module does not load it. */
 export interface StorePort {
@@ -38,7 +38,8 @@ export interface StorePort {
 	renameIdentity(input: { from: string; to: string }): unknown;
 	getRoom(roomId: string): unknown;
 	identityExists(userId: string): boolean;
-	restoreRoom?(room: ArchivedRoom, records: readonly ChatRecord[]): void;
+	restoreRoom?(room: ArchivedRoom, records: readonly ChatRecord[], now?: number, options?: { rooms?: readonly string[] }): RestoreResult;
+	restorableRecord?(record: ChatRecord): ChatRecord | null;
 	restoreUsers?(users: readonly ArchivedUser[]): void;
 	isRetiredUserId?(userId: string): boolean;
 	importRecords?(records: readonly ChatRecord[]): void;
@@ -159,9 +160,14 @@ export class StoreHead implements HistoryHead {
 		this.store.setHistoryImportJournal?.(value);
 	}
 
-	async restoreRoom(room: ArchivedRoom, records: readonly ChatRecord[]): Promise<void> {
+	async restoreRoom(room: ArchivedRoom, records: readonly ChatRecord[], context?: RestoreContext): Promise<RestoreResult> {
 		if (!this.store.restoreRoom) throw new Error("this head cannot restore rooms");
-		this.store.restoreRoom(room, records);
+		return this.store.restoreRoom(room, records, undefined, context ? { rooms: context.rooms } : {});
+	}
+
+	normalizeRecord(record: ChatRecord): ChatRecord | null {
+		if (!this.store.restorableRecord) return record;
+		return this.store.restorableRecord(record);
 	}
 
 	async restoreUsers(users: readonly ArchivedUser[]): Promise<void> {
