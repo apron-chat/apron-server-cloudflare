@@ -22,7 +22,7 @@ import { StoreError } from "./store-error";
 import type { ProtocolError, RequestFrame } from "./protocol";
 import { apronLink } from "./protocol";
 import { isShadowUserId, normalizeRemoteAddress, parseInvite, remoteAuthority, remoteUserIdError, shadowUserId } from "./remote";
-import { addServerToLinks, LinkConnection, remoteReason, RetryLater, rewriteMentions, type ReplyFrame } from "./remote-client";
+import { addServerToLinks, LinkConnection, remoteReason, rewriteMentions, type ReplyFrame } from "./remote-client";
 
 /** A connection as index.ts holds it: enough to answer it. */
 export interface MirrorClient {
@@ -443,7 +443,7 @@ export class RemoteRooms {
 		// A dial in progress is still catching up (its live records held): wait for it, open or not.
 		if (session.connecting) return session.connecting;
 		if (session.connection?.open) return session.connection;
-		if (!this.host.mayDial()) throw new RetryLater(60_000, "this server is paused or out of capacity");
+		if (!this.host.mayDial()) throw new Error("this server is paused or out of capacity");
 		session.connecting ??= this.dial(session).finally(() => { session.connecting = undefined; });
 		return session.connecting;
 	}
@@ -459,7 +459,7 @@ export class RemoteRooms {
 
 	private async dial(session: Session): Promise<LinkConnection> {
 		const token = this.tokenFor(session.server);
-		if (!token) throw new RetryLater(60_000, "nothing is mirrored from that server");
+		if (!token) throw new Error("nothing is mirrored from that server");
 		session.buffer = [];
 		const connection = await LinkConnection.open(session.server, token, {
 			onFrame: (frame) => this.onFrame(session, frame),
@@ -471,7 +471,7 @@ export class RemoteRooms {
 		const bound = (connection.you.ext as Record<string, unknown> | undefined)?.remote as Record<string, unknown> | undefined;
 		if (bound?.server !== this.host.self) {
 			connection.close();
-			throw new RetryLater(60_000, `the link is bound to ${String(bound?.server ?? "no server")}`);
+			throw new Error(`the link is bound to ${String(bound?.server ?? "no server")}`);
 		}
 		session.connection = connection;
 		console.log(JSON.stringify({ event: "remote_mirror_connected", server: session.server }));
@@ -692,7 +692,7 @@ export class RemoteRooms {
 		for (;;) {
 			const cursor = this.store.mirrorState(this.now()).servers[session.server]?.cursor ?? 0;
 			const page = await connection.call("history", { after: String(cursor + 1), ...(head ? { before: head } : {}), limit: HISTORY_PAGE }, `mirror-history:${cursor}:${this.now()}`);
-			if (page.error || !page.result) throw new RetryLater(5_000, `history: ${page.error?.message ?? "no result"}`);
+			if (page.error || !page.result) throw new Error(`history: ${page.error?.message ?? "no result"}`);
 			head ??= typeof page.result.latest_log_id === "string" ? page.result.latest_log_id : undefined;
 			const records: Array<{ kind: string; record: Record<string, unknown> }> = [];
 			for (const kind of ["rooms", "messages", "reactions", "memberships"]) {

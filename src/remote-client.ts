@@ -12,21 +12,6 @@ export interface ReplyFrame {
 	error?: { code: number; message?: string; data?: Record<string, unknown> };
 }
 
-/** Error codes (§1.1) a connection tells apart. */
-export const DENIED = -32001;
-export const INVALID_PARAMS = -32602;
-export const RETRY_AFTER = -32002;
-
-/** The remote server asks to wait (`retry_after`), or the connection failed: try again later. */
-export class RetryLater extends Error {
-	constructor(readonly afterMs: number, message: string) {
-		super(message);
-	}
-}
-
-/** The remote server refused the link's sign-in: an admin has to act. */
-export class SignInRefused extends Error {}
-
 /** The reason a link's request was refused, from `error.data.ext.remote` ("not_joined", "removed"), if any. */
 export function remoteReason(error: ReplyFrame["error"]): string | undefined {
 	const ext = error?.data?.ext as Record<string, unknown> | undefined;
@@ -97,8 +82,8 @@ export class LinkConnection {
 
 	/**
 	 * Dials `server` (a `ws` or `wss` address, over the platform's fetch with
-	 * an upgrade) and signs in with `token`. A refused sign-in throws
-	 * SignInRefused; a failure to connect, RetryLater.
+	 * an upgrade) and signs in with `token`; throws an Error saying why it
+	 * could not.
 	 */
 	static async open(server: string, token: string, options: { onFrame?: (frame: Record<string, unknown>) => void | Promise<void>; onClose?: () => void; timeoutMs?: number } = {}): Promise<LinkConnection> {
 		const timeoutMs = options.timeoutMs ?? 10_000;
@@ -107,12 +92,12 @@ export class LinkConnection {
 		try {
 			response = await fetch(server.replace(/^ws/i, "http"), { headers: { Upgrade: "websocket" }, signal: AbortSignal.timeout(timeoutMs) });
 		} catch (error) {
-			throw new RetryLater(5_000, `connect failed: ${error instanceof Error ? error.message : String(error)}`);
+			throw new Error(`connect failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
 		const socket = response.webSocket;
 		if (!socket) {
 			const detail = (await response.text().catch(() => "")).slice(0, 120);
-			throw new RetryLater(response.status === 429 || response.status === 503 ? 30_000 : 10_000, `no upgrade: HTTP ${response.status}${detail ? ` ${detail}` : ""}`);
+			throw new Error(`no upgrade: HTTP ${response.status}${detail ? ` ${detail}` : ""}`);
 		}
 		socket.accept();
 		connection.socket = socket;
@@ -137,13 +122,13 @@ export class LinkConnection {
 		clearTimeout(timer);
 		if (!ok) {
 			connection.close();
-			throw new RetryLater(5_000, "no server frame");
+			throw new Error("no server frame");
 		}
 		const auth = await connection.call("auth", { scheme: "token", token }, "auth", timeoutMs);
 		if (auth.error) {
 			connection.close();
-			if (auth.error.code === DENIED) throw new SignInRefused(`sign-in refused: ${auth.error.message ?? ""}`);
-			throw new RetryLater(auth.error.code === RETRY_AFTER ? Math.max(1_000, Number(auth.error.data?.retry_after) * 1_000 || 5_000) : 5_000, `sign-in failed: ${auth.error.message ?? ""}`);
+			// `denied` (§1.1): the token no longer signs in.
+			throw new Error(`sign-in ${auth.error.code === -32001 ? "refused" : "failed"}: ${auth.error.message ?? ""}`);
 		}
 		connection.you = (auth.result?.you as Record<string, unknown> | undefined) ?? {};
 		return connection;
