@@ -1,32 +1,11 @@
 /*
- * The reference model (PLAN §12.3) and its seeded generator: one in-memory
- * map of every record committed, with /purge and /rename applied to all of
- * it, against which a real pipeline's reads are compared. Also a small
- * seeded PRNG (no dependency): the seed is printed on failure, and
- * HISTORY_SEED replays one.
+ * The reference model (PLAN §12.3): one in-memory map of every record
+ * committed, with /purge and /rename applied to all of it, against which a
+ * real pipeline's reads are compared. The model runs that drive it are
+ * fast-check command sequences (pipeline.test.ts).
  */
 
 import { type ChatRecord, type HistoryOp, applyOps, byLog } from "../../src/history/records";
-
-/** mulberry32: a tiny seeded PRNG. */
-export function prng(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (state + 0x6d2b79f5) >>> 0;
-		let t = state;
-		t = Math.imul(t ^ (t >>> 15), t | 1);
-		t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-		return ((t ^ (t >>> 14)) >>> 0) / 4_294_967_296;
-	};
-}
-
-export const pick = <T>(random: () => number, items: readonly T[]): T => items[Math.floor(random() * items.length)];
-
-/** Seeds to run: HISTORY_SEED alone when set, else `count` fixed ones. */
-export function seeds(count: number, base = 1): number[] {
-	const fixed = typeof process !== "undefined" ? process.env?.HISTORY_SEED : undefined;
-	return fixed ? [Number(fixed)] : Array.from({ length: count }, (_, index) => base + index * 7919);
-}
 
 export class Model {
 	private records = new Map<string, ChatRecord>();

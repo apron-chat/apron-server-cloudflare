@@ -1,3 +1,5 @@
+import { env } from "cloudflare:test";
+import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import { MemoryBlobStore } from "./support/memory-blob-store";
 import { MemorySegmentIndex } from "../../src/history/blob/segments";
@@ -7,7 +9,7 @@ import { type TierView, checkInvariants, mergePages, planRead, planStep, retenti
 import { HistoryPipeline, type PipelineStage, instrument } from "../../src/history/pipeline";
 import type { ChatRecord, Retention } from "../../src/history/records";
 import { type HistoryTier, MemoryTierStateStore, type TierState } from "../../src/history/tier";
-import { Model, pick, prng, seeds, show } from "./model";
+import { Model, show } from "./model";
 
 const state = (floor: number, target = floor, through = floor - 1, ops = 0): TierState => ({ floor, target, through, ops });
 const view = (name: string, tierState: TierState, extra: Partial<TierView> = {}): TierView => ({ name, readable: true, rewritable: true, multiRoom: true, state: tierState, ...extra });
@@ -331,112 +333,293 @@ describe("HistoryPipeline upkeep", () => {
 	});
 });
 
+/*
+ * Model-based runs (fast-check): a command sequence of posts, reactions,
+ * memberships, moves, pipeline cycles (some with injected tier faults),
+ * settles, purges and renames, run against a real pipeline and the reference
+ * Model. After every command, the invariants hold against the state before
+ * it (checkInvariants), and every room's history, paged at the command's own
+ * page size, equals the model's from the published floor on (I4). Once the
+ * sequence ends and the pipeline settles, no tier holds a record below its
+ * floor (I3). A failure shrinks to a minimal sequence, and fast-check prints
+ * the seed and path that replay it (HISTORY_SEED and HISTORY_PATH replay
+ * one here).
+ */
+
+/** What the commands know: the reference model and who and what can still be acted on. */
+interface World {
+	model: Model;
+	users: string[];
+	messages: Array<{ id: string; room: string; from: string }>;
+	step: number;
+	renamed: number;
+	rewritableOnly: boolean;
+}
+
+/** The pipeline under test, and the fault pattern a faulty cycle draws from (none otherwise). */
+interface Real {
+	clock: TestClock;
+	head: MemoryHead;
+	pipeline: HistoryPipeline;
+	faults: { pattern: boolean[]; at: number } | undefined;
+	previous: { tiers: TierView[]; published: number };
+}
+
+const ROOMS = ["general", "random"] as const;
+
+/** A command: advances the clock, acts, then checks the invariants and every room's history against the model. */
+abstract class Step implements fc.AsyncCommand<World, Real> {
+	constructor(readonly dt: number, readonly page: number) {}
+	check(_world: Readonly<World>): boolean { return true; }
+	abstract act(world: World, real: Real): Promise<void>;
+	abstract label(): string;
+	toString(): string { return `${this.label()} +${this.dt}ms /${this.page}`; }
+	async run(world: World, real: Real): Promise<void> {
+		world.step += 1;
+		real.clock.time += this.dt;
+		await this.act(world, real);
+		await verify(world, real, this.page);
+	}
+}
+
+class Post extends Step {
+	constructor(dt: number, page: number, readonly room: number, readonly user: number) { super(dt, page); }
+	label() { return `post(${ROOMS[this.room]}, user ${this.user})`; }
+	async act(world: World, real: Real) {
+		const room = ROOMS[this.room];
+		const from = world.users[this.user % world.users.length];
+		const id = `m${world.step}`;
+		world.messages.push({ id, room, from });
+		world.model.add(real.head.commit(room, "message", { message_id: id, from: { user_id: from }, body: { text: `${world.step}` } }));
+	}
+}
+
+class React extends Step {
+	constructor(dt: number, page: number, readonly message: number, readonly user: number) { super(dt, page); }
+	check(world: Readonly<World>) { return world.messages.length > 0; }
+	label() { return `react(message ${this.message}, user ${this.user})`; }
+	async act(world: World, real: Real) {
+		const message = world.messages[this.message % world.messages.length];
+		world.model.add(real.head.commit(message.room, "reactions", { message_id: message.id, reactions: [{ from: { user_id: world.users[this.user % world.users.length] }, emojis: ["👍"] }] }));
+	}
+}
+
+class Membership extends Step {
+	constructor(dt: number, page: number, readonly room: number, readonly user: number, readonly joined: boolean) { super(dt, page); }
+	label() { return `${this.joined ? "join" : "leave"}(${ROOMS[this.room]}, user ${this.user})`; }
+	async act(world: World, real: Real) {
+		world.model.add(real.head.commit(ROOMS[this.room], "membership", { members: [{ user: { user_id: world.users[this.user % world.users.length] }, joined: this.joined }] }));
+	}
+}
+
+/** A move: one record logged in both rooms. */
+class Move extends Step {
+	constructor(dt: number, page: number, readonly message: number) { super(dt, page); }
+	check(world: Readonly<World>) { return world.messages.length > 0; }
+	label() { return `move(message ${this.message})`; }
+	async act(world: World, real: Real) {
+		const message = world.messages[this.message % world.messages.length];
+		const to = ROOMS.find((room) => room !== message.room)!;
+		const record = real.head.commit(to, "message", { message_id: message.id, from: { user_id: message.from }, prev_room_id: message.room }, { alsoIn: message.room });
+		world.model.add(record, message.room);
+		message.room = to;
+	}
+}
+
+/**
+ * Up to `steps` pipeline steps. With a fault pattern, each tier call below
+ * the head draws from it in turn, until it runs out: a failure, and then
+ * whether the call wrote before failing ("wrote but reported failure" as
+ * well as "failed before writing").
+ */
+class Cycle extends Step {
+	constructor(dt: number, page: number, readonly steps: number, readonly faults: boolean[] | undefined) { super(dt, page); }
+	label() { return `cycle(${this.steps}${this.faults ? `, faults ${this.faults.map((fault) => (fault ? 1 : 0)).join("")}` : ""})`; }
+	async act(_world: World, real: Real) {
+		real.faults = this.faults && { pattern: this.faults, at: 0 };
+		try {
+			await real.pipeline.cycle({ steps: this.steps });
+		} finally {
+			real.faults = undefined;
+		}
+	}
+}
+
+class Settle extends Step {
+	label() { return "settle"; }
+	async act(_world: World, real: Real) {
+		await settle(real.pipeline);
+	}
+}
+
+/** /purge, once settled, so every tier holds exactly what it serves. A purged ID is retired: it never posts again, and no one acts on its messages. */
+class Purge extends Step {
+	constructor(dt: number, page: number, readonly user: number) { super(dt, page); }
+	check(world: Readonly<World>) { return world.rewritableOnly; }
+	label() { return `purge(user ${this.user})`; }
+	async act(world: World, real: Real) {
+		const index = this.user % world.users.length;
+		const user = world.users[index];
+		await settle(real.pipeline);
+		await real.pipeline.purge([user]);
+		world.model.apply({ op: "purge", userIds: [user], messageIds: [] }, await real.pipeline.publishedFloor());
+		world.users[index] = `new${world.step}`;
+		world.messages = world.messages.filter((message) => message.from !== user);
+	}
+}
+
+class Rename extends Step {
+	constructor(dt: number, page: number, readonly user: number) { super(dt, page); }
+	check(world: Readonly<World>) { return world.rewritableOnly; }
+	label() { return `rename(user ${this.user})`; }
+	async act(world: World, real: Real) {
+		const index = this.user % world.users.length;
+		const from = world.users[index];
+		const to = `${from}-${(world.renamed += 1)}`;
+		world.users[index] = to;
+		for (const message of world.messages) if (message.from === from) message.from = to;
+		await settle(real.pipeline);
+		await real.pipeline.rename(from, to);
+		world.model.apply({ op: "rename", from, to }, await real.pipeline.publishedFloor());
+	}
+}
+
+/** The invariants against the state before the command, and I4: every room's history equals the model's from the published floor on. */
+async function verify(world: World, real: Real, page: number): Promise<void> {
+	const now = { tiers: await real.pipeline.views(), published: await real.pipeline.publishedFloor() };
+	expect(checkInvariants(now.tiers, now.published, real.previous)).toEqual([]);
+	real.previous = now;
+	for (const room of ROOMS) {
+		const served = show(await history(real.pipeline, room, page));
+		const expected = show(world.model.room(room, now.published));
+		if (served.join("\n") !== expected.join("\n")) {
+			throw new Error(`${room}, published ${now.published}, tiers ${JSON.stringify(now.tiers)}, head holds ${real.head.all().map((record) => record.log_id).join(",")}, lower hold ${JSON.stringify(await Promise.all(real.pipeline.tiers.slice(1).map(async (tier) => (await tier.scan(0, 1000)).records.map((record) => record.log_id + record.room_id))))}:\nserved, not expected:\n${served.filter((line) => !expected.includes(line)).join("\n")}\nexpected, not served:\n${expected.filter((line) => !served.includes(line)).join("\n")}`);
+		}
+	}
+}
+
+/** The commands, weighted as a busy room is: mostly posts and pipeline work, sometimes reactions, moves, purges and renames. */
+function commandsFor(composition: Composition) {
+	const dt = fc.integer({ min: 1, max: 5 });
+	const page = fc.integer({ min: 1, max: 6 });
+	const room = fc.integer({ min: 0, max: ROOMS.length - 1 });
+	const user = fc.nat({ max: 3 });
+	const message = fc.nat({ max: 1_000 });
+	const faults = fc.array(fc.boolean(), { minLength: 1, maxLength: 24 });
+	const weighted = [
+		{ weight: 40, arbitrary: fc.tuple(dt, page, room, user).map(([d, p, r, u]) => new Post(d, p, r, u)) },
+		{ weight: 15, arbitrary: fc.tuple(dt, page, message, user).map(([d, p, m, u]) => new React(d, p, m, u)) },
+		{ weight: 7, arbitrary: fc.tuple(dt, page, room, user, fc.boolean()).map(([d, p, r, u, j]) => new Membership(d, p, r, u, j)) },
+		{ weight: 6, arbitrary: fc.tuple(dt, page, message).map(([d, p, m]) => new Move(d, p, m)) },
+		{ weight: 16, arbitrary: fc.tuple(dt, page, fc.integer({ min: 1, max: 8 })).map(([d, p, s]) => new Cycle(d, p, s, undefined)) },
+		{ weight: 6, arbitrary: fc.tuple(dt, page, fc.integer({ min: 1, max: 8 }), faults).map(([d, p, s, f]) => new Cycle(d, p, s, f)) },
+		{ weight: 4, arbitrary: fc.tuple(dt, page).map(([d, p]) => new Settle(d, p)) },
+		...(composition.rewritableOnly ? [
+			{ weight: 5, arbitrary: fc.tuple(dt, page, user).map(([d, p, u]) => new Purge(d, p, u)) },
+			{ weight: 5, arbitrary: fc.tuple(dt, page, user).map(([d, p, u]) => new Rename(d, p, u)) },
+		] : []),
+	];
+	return fc.commands([fc.oneof(...weighted)], { maxCommands: 120, size: "max" });
+}
+
+/**
+ * fast-check's options: `numRuns`, or HISTORY_RUNS for a longer soak; a
+ * failure's seed and path replay with HISTORY_SEED and HISTORY_PATH.
+ */
+function runOptions(numRuns: number): fc.Parameters<unknown> {
+	const { HISTORY_SEED: seed, HISTORY_PATH: path, HISTORY_RUNS: runs } = env as unknown as Record<string, string | undefined>;
+	return {
+		numRuns: Number(runs) || numRuns,
+		...(seed ? { seed: Number(seed), ...(path ? { path } : {}), endOnFailure: true } : {}),
+	};
+}
+
+/** A soak (HISTORY_RUNS) takes longer than a test's default 5 s. */
+const PROPERTY_TIMEOUT = (env as unknown as Record<string, string | undefined>).HISTORY_RUNS ? 3_600_000 : undefined;
+
 describe("model-based runs", () => {
 	for (const composition of compositions) {
-		for (const seed of seeds(6)) {
-			it(`${composition.name}, seed ${seed}`, async () => {
-				const random = prng(seed);
-				const { clock, head, pipeline } = build(composition);
-				const model = new Model();
-				const users = ["ada", "bob", "cy", "dee"];
-				const rooms = ["general", "random"];
-				const messages: Array<{ id: string; room: string; from: string }> = [];
-				let renamed = 0;
-				const trace: string[] = [];
-				try {
-					for (let step = 0; step < 120; step += 1) {
-						clock.time += 1 + Math.floor(random() * 5);
-						const roll = random();
-						trace.push(`${step}:${roll.toFixed(2)}`);
-						if (roll < 0.4 || !messages.length) {
-							const room = pick(random, rooms);
-							const from = pick(random, users);
-							const id = `m${step}`;
-							messages.push({ id, room, from });
-							model.add(head.commit(room, "message", { message_id: id, from: { user_id: from }, body: { text: `${step}` } }));
-						} else if (roll < 0.55) {
-							const message = pick(random, messages);
-							model.add(head.commit(message.room, "reactions", { message_id: message.id, reactions: [{ from: { user_id: pick(random, users) }, emojis: ["👍"] }] }));
-						} else if (roll < 0.62) {
-							const room = pick(random, rooms);
-							model.add(head.commit(room, "membership", { members: [{ user: { user_id: pick(random, users) }, joined: random() < 0.7 }] }));
-						} else if (roll < 0.68) {
-							// A move: one record in both rooms.
-							const message = pick(random, messages);
-							const to = rooms.find((room) => room !== message.room)!;
-							const record = head.commit(to, "message", { message_id: message.id, from: { user_id: message.from }, prev_room_id: message.room }, { alsoIn: message.room });
-							model.add(record, message.room);
-							message.room = to;
-						} else if (roll < 0.9) {
-							await pipeline.cycle({ steps: 1 + Math.floor(random() * 8) });
-						} else if (composition.rewritableOnly && roll < 0.95) {
-							const user = pick(random, users);
-							// Settled first, so every tier holds exactly what it serves.
-							await settle(pipeline);
-							await pipeline.purge([user]);
-							model.apply({ op: "purge", userIds: [user], messageIds: [] }, await pipeline.publishedFloor());
-							// A purged ID is retired: it never posts again.
-							users[users.indexOf(user)] = `new${step}`;
-							// Their messages are gone: no one reacts to or moves them.
-							for (let index = messages.length - 1; index >= 0; index -= 1) if (messages[index].from === user) messages.splice(index, 1);
-						} else if (composition.rewritableOnly) {
-							const from = pick(random, users);
-							const to = `${from}-${(renamed += 1)}`;
-							users[users.indexOf(from)] = to;
-							for (const message of messages) if (message.from === from) message.from = to;
-							await settle(pipeline);
-							await pipeline.rename(from, to);
-							model.apply({ op: "rename", from, to }, await pipeline.publishedFloor());
-						}
-						if (step % 15 === 14) await settle(pipeline);
-						// I4 coverage: every room's history equals the model's from the published floor on.
-						const published = await pipeline.publishedFloor();
-						for (const room of rooms) {
-							const served = show(await history(pipeline, room, 1 + Math.floor(random() * 6)));
-							const expected = show(model.room(room, published));
-							if (served.join("\n") !== expected.join("\n")) {
-								throw new Error(`step ${step}, ${room}, published ${published}, tiers ${JSON.stringify(await pipeline.views())}, head holds ${head.all().map((record) => record.log_id).join(",")}, lower hold ${JSON.stringify(await Promise.all(pipeline.tiers.slice(1).map(async (tier) => (await tier.scan(0, 1000)).records.map((record) => record.log_id + record.room_id))))}, log ${trace.slice(-12).join(" | ")}:\nserved:\n${served.filter((line) => !expected.includes(line)).join("\n")}\nexpected:\n${expected.filter((line) => !served.includes(line)).join("\n")}`);
-							}
-						}
-					}
-					await settle(pipeline);
-					// I3 containment once settled: no tier holds a record below its floor.
-					const views = await pipeline.views();
-					for (const [index, tier] of pipeline.tiers.entries()) {
-						const held = await tier.scan(0, 1);
-						if (held.records.length) expect(held.records[0].log_id).toBeGreaterThanOrEqual(views[index].state.floor);
-					}
-				} catch (error) {
-					throw new Error(`seed ${seed} (replay with HISTORY_SEED=${seed}): ${(error as Error).message}`);
+		it(composition.name, async () => {
+			await fc.assert(fc.asyncProperty(commandsFor(composition), async (commands) => {
+				let real: Real | undefined;
+				await fc.asyncModelRun(() => {
+					const fault = () => {
+						const faults = real?.faults;
+						if (!faults) return false;
+						return faults.at < faults.pattern.length ? faults.pattern[faults.at++] : false;
+					};
+					const built = build(composition, { faults: fault });
+					real = { clock: built.clock, head: built.head, pipeline: built.pipeline, faults: undefined, previous: { tiers: [], published: 0 } };
+					return {
+						model: { model: new Model(), users: ["ada", "bob", "cy", "dee"], messages: [], step: 0, renamed: 0, rewritableOnly: composition.rewritableOnly },
+						real,
+					};
+				}, commands);
+				// I3, once settled: no tier holds a record below its floor.
+				const { pipeline } = real!;
+				await settle(pipeline);
+				const views = await pipeline.views();
+				for (const [index, tier] of pipeline.tiers.entries()) {
+					const held = await tier.scan(0, 1);
+					if (held.records.length) expect(held.records[0].log_id).toBeGreaterThanOrEqual(views[index].state.floor);
 				}
-			});
-		}
+			// Sequences average 58 commands (up to 120): 12 runs cover about as many steps as the 6 fixed 120-step seeds before.
+			}), runOptions(12));
+		}, PROPERTY_TIMEOUT);
 	}
 });
 
 describe("fault injection", () => {
-	for (const seed of seeds(4, 101)) {
-		it(`loses nothing and duplicates nothing whatever fails, seed ${seed}`, async () => {
-			const random = prng(seed);
-			const composition = compositions[1];
-			const clean = build(composition);
-			const faulty = build(composition, { faults: () => random() < 0.3 });
-			for (let index = 0; index < 40; index += 1) {
-				for (const run of [clean, faulty]) {
-					run.clock.time += 10;
-					run.head.commit(index % 2 ? "general" : "random", "message", { message_id: `m${index}`, from: { user_id: "ada" }, body: { text: `${index}` } });
+	it("loses nothing and duplicates nothing whatever fails", async () => {
+		await fc.assert(fc.asyncProperty(
+			fc.array(fc.boolean(), { minLength: 1, maxLength: 120 }),
+			fc.integer({ min: 10, max: 40 }),
+			fc.integer({ min: 2, max: 9 }),
+			async (pattern, count, every) => {
+				let at = 0;
+				const composition = compositions[1];
+				const clean = build(composition);
+				// Each tier call draws from the pattern in turn until it runs out; then calls work.
+				const faulty = build(composition, { faults: () => (at < pattern.length ? pattern[at++] : false) });
+				for (let index = 0; index < count; index += 1) {
+					for (const run of [clean, faulty]) {
+						run.clock.time += 10;
+						run.head.commit(index % 2 ? "general" : "random", "message", { message_id: `m${index}`, from: { user_id: "ada" }, body: { text: `${index}` } });
+					}
+					if (index % every === every - 1) {
+						await settle(clean.pipeline);
+						await settle(faulty.pipeline);
+					}
 				}
-				if (index % 7 === 6) {
-					await settle(clean.pipeline);
-					await settle(faulty.pipeline);
+				await settle(clean.pipeline);
+				await settle(faulty.pipeline);
+				for (const room of ROOMS) {
+					expect(show(await history(faulty.pipeline, room, 4))).toEqual(show(await history(clean.pipeline, room, 4)));
 				}
-			}
-			await settle(clean.pipeline);
-			await settle(faulty.pipeline);
-			for (const room of ["general", "random"]) {
-				expect(show(await history(faulty.pipeline, room, 4))).toEqual(show(await history(clean.pipeline, room, 4)));
-			}
-			expect((await faulty.pipeline.views()).map((tier) => tier.state.floor)).toEqual((await clean.pipeline.views()).map((tier) => tier.state.floor));
-		});
-	}
+				expect((await faulty.pipeline.views()).map((tier) => tier.state.floor)).toEqual((await clean.pipeline.views()).map((tier) => tier.state.floor));
+			},
+		), runOptions(6));
+	}, PROPERTY_TIMEOUT);
+});
+
+describe("model-based regressions", () => {
+	// Found by the model runs: cy's message m1 is reacted to, then moved, and
+	// trimmed until its first snapshot is gone. Its move snapshot is in
+	// "recent", but the reactions made before the move are in "older". /purge of
+	// cy found m1 as cy's only in "recent", so "older" kept the reactions on it
+	// (HistoryPipeline.applyOps now amends the op for the tiers below).
+	it("drops reactions below the tier that found a purged user's message", async () => {
+		const built = build(compositions[1]);
+		const real: Real = { clock: built.clock, head: built.head, pipeline: built.pipeline, faults: undefined, previous: { tiers: [], published: 0 } };
+		const world: World = { model: new Model(), users: ["ada", "bob", "cy", "dee"], messages: [], step: 0, renamed: 0, rewritableOnly: true };
+		const post = (user: number) => new Post(1, 1, 0, user);
+		const react = () => new React(1, 1, 0, 0);
+		const leave = () => new Membership(1, 1, 0, 0, false);
+		const steps: Step[] = [
+			post(2), post(0), leave(), react(), post(0), post(0), post(0), react(), react(), react(), post(0), react(),
+			post(0), post(0), post(0), post(0), post(0), post(0), new Move(1, 1, 0), leave(), post(0), post(0), react(), post(0), post(0),
+			new Purge(1, 1, 2),
+		];
+		for (const step of steps) await step.run(world, real);
+	});
 });

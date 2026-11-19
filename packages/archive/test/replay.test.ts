@@ -1,3 +1,4 @@
+import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import { type ArchivedRoom, type ChatRecord, collectArchive, compareReplayed, jsonlReader, linesOf, type RecordKind, replayRecords } from "../src/index.ts";
 import { sceneArchives } from "./fixtures/scenes/index.ts";
@@ -85,9 +86,13 @@ describe("replayRecords", () => {
 		expect(replayRecords([edit, first]).messages.get("7")).toMatchObject({ log_id: 8, body: { text: "edit" } });
 	});
 
-	it("does not depend on record order or duplicates", () => {
-		const shuffled = [...log].reverse().concat(log.slice(3, 9));
-		expect(compareReplayed(replayRecords(shuffled), state)).toEqual({ equal: true, differences: [] });
+	it("does not depend on record order or duplicates (property)", () => {
+		// Any order of the log, with any of its records repeated anywhere.
+		const reordered = fc.tuple(fc.shuffledSubarray(log, { minLength: log.length }), fc.array(fc.constantFrom(...log), { maxLength: 12 }))
+			.chain(([all, repeats]) => fc.shuffledSubarray([...all, ...repeats], { minLength: all.length + repeats.length }));
+		fc.assert(fc.property(reordered, (records) => {
+			expect(compareReplayed(replayRecords(records), state)).toEqual({ equal: true, differences: [] });
+		}), { numRuns: 200 });
 	});
 
 	it("lets a tombstone win at an equal log ID, in either order", () => {

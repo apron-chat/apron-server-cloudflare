@@ -44,6 +44,9 @@ export default defineConfig({
 					// the current one and an older one, for rotation. Never used outside tests.
 					HISTORY_BACKUP_KEY: "eFGn4jFTKnrUqDnE5adM+1fdPYYD7RXuzs9/jUHnrvs=",
 					HISTORY_BACKUP_KEY_OLD: "sBjpLIt1KHDasdiD+Y6qVIGfnT121t7aBmqRajoQQpo=",
+					// The property tests' replay and soak switches (test/history/pipeline.test.ts),
+					// from the shell: HISTORY_SEED=… HISTORY_PATH=… or HISTORY_RUNS=… npx vitest run.
+					...Object.fromEntries(["HISTORY_SEED", "HISTORY_PATH", "HISTORY_RUNS"].flatMap((name) => (process.env[name] ? [[name, process.env[name]]] : []))),
 				},
 			},
 		}),

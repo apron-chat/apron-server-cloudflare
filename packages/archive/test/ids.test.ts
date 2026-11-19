@@ -1,3 +1,4 @@
+import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import { IdMap, RECORD_FIELDS, freeUserId, nextFree, nudgeLogIds, remapListing, remapRecord, remapUser } from "../src/ids.ts";
 import type { ChatRecord } from "../src/records.ts";
@@ -160,25 +161,27 @@ describe("nudging log IDs (PLAN §10.3)", () => {
 		expect(nudgeLogIds([1, 2, 3, 6], (id) => taken.has(id))).toEqual(new Map([[1, 6], [2, 8], [3, 9], [6, 10]]));
 	});
 
-	it("keeps order, avoids taken IDs and moves as little as it can (random cases)", () => {
-		const random = prng(7);
-		for (let round = 0; round < 300; round++) {
-			const taken = new Set<number>();
-			for (let i = 0; i < 40; i++) if (random() < 0.5) taken.add(i);
-			const imported = [...new Set(Array.from({ length: 1 + Math.floor(random() * 15) }, () => Math.floor(random() * 40)))].sort((a, b) => a - b);
-			const moved = nudgeLogIds(imported, (id) => taken.has(id));
-			let previous = -Infinity;
-			for (const id of imported) {
-				const out = moved.get(id) ?? id;
-				expect(moved.get(id)).not.toBe(id);
-				expect(taken.has(out)).toBe(false);
-				expect(out).toBeGreaterThanOrEqual(id);
-				expect(out).toBeGreaterThan(previous);
-				// The nearest such ID: every one between the lowest allowed and it is taken.
-				for (let between = Math.max(id, previous + 1); between < out; between++) expect(taken.has(between)).toBe(true);
-				previous = out;
-			}
-		}
+	it("keeps order, avoids taken IDs and moves as little as it can (property)", () => {
+		fc.assert(fc.property(
+			fc.uniqueArray(fc.nat({ max: 39 }), { maxLength: 40 }),
+			fc.uniqueArray(fc.nat({ max: 39 }), { minLength: 1, maxLength: 15 }),
+			(takenIds, importedIds) => {
+				const taken = new Set(takenIds);
+				const imported = [...importedIds].sort((a, b) => a - b);
+				const moved = nudgeLogIds(imported, (id) => taken.has(id));
+				let previous = -Infinity;
+				for (const id of imported) {
+					const out = moved.get(id) ?? id;
+					expect(moved.get(id)).not.toBe(id);
+					expect(taken.has(out)).toBe(false);
+					expect(out).toBeGreaterThanOrEqual(id);
+					expect(out).toBeGreaterThan(previous);
+					// The nearest such ID: every one between the lowest allowed and it is taken.
+					for (let between = Math.max(id, previous + 1); between < out; between++) expect(taken.has(between)).toBe(true);
+					previous = out;
+				}
+			},
+		), { numRuns: 300 });
 	});
 });
 
@@ -191,72 +194,46 @@ describe("freeUserId (PLAN §10.4)", () => {
 	});
 });
 
-/** mulberry32: a small seeded PRNG, so the random cases are the same every run. */
-function prng(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (state + 0x6d2b79f5) >>> 0;
-		let t = state;
-		t = Math.imul(t ^ (t >>> 15), t | 1);
-		t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-	};
-}
-
 describe("remapping round trip (property)", () => {
 	it("returns the original record when remapped with a map and then its inverse", () => {
-		const random = prng(42);
-		const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)];
-		const shuffled = <T>(items: readonly T[]): T[] => {
-			const out = [...items];
-			for (let i = out.length - 1; i > 0; i--) {
-				const j = Math.floor(random() * (i + 1));
-				[out[i], out[j]] = [out[j], out[i]];
-			}
-			return out;
-		};
 		// The map permutes these, so its inverse undoes it; IDs outside them stay.
 		const logPool = Array.from({ length: 12 }, (_, i) => 1000 + i);
 		const userPool = Array.from({ length: 8 }, (_, i) => `u${i}`);
-		const logs = [...logPool, 5000, 5001];
-		const users = [...userPool, "x", "y"];
-
-		for (let round = 0; round < 300; round++) {
-			const logTargets = shuffled(logPool);
-			const userTargets = shuffled(userPool);
-			const map = new IdMap(new Map(logPool.map((id, i) => [id, logTargets[i]])), new Map(userPool.map((id, i) => [id, userTargets[i]])));
-			const inverse = new IdMap(new Map([...map.logIds].map(([a, b]) => [b, a])), new Map([...map.users].map(([a, b]) => [b, a])));
-
-			const logId = pick(logs);
-			const roomId = () => pick([String(pick(logs)), `private_${pick(logs)}`, "general"]);
-			const identity = () => ({ user_id: pick(users), name: "N" });
-			const kind = pick(["room", "message", "reactions", "membership"] as const);
-			let wire: Record<string, unknown>;
-			if (kind === "room") {
-				wire = { room_id: roomId(), log_id: String(logId), ...(random() < 0.5 ? { parent_room_id: roomId() } : {}), title: "t" };
-			} else if (kind === "message") {
-				wire = {
-					message_id: String(pick(logs)), log_id: String(logId), room_id: roomId(), from: identity(),
-					body: { text: "x", ...(random() < 0.5 ? { mentions: [pick(users), pick(users)] } : {}) },
-					...(random() < 0.5 ? { reply_to: { message_id: String(pick(logs)) } } : {}),
-					...(random() < 0.5 ? { ext: { editors: { "body.text": "mentioned", edited_by: pick(users) } } } : {}),
-					...(random() < 0.5 ? { prev_log_id: String(pick(logs)) } : {}),
-					...(random() < 0.5 ? { prev_room_id: roomId() } : {}),
+		const logId = fc.constantFrom(...logPool, 5000, 5001);
+		const userId = fc.constantFrom(...userPool, "x", "y");
+		const roomId = fc.oneof(logId.map(String), logId.map((id) => `private_${id}`), fc.constant("general"));
+		const identity = userId.map((user_id) => ({ user_id, name: "N" }));
+		const optional = <T>(arbitrary: fc.Arbitrary<T>) => fc.option(arbitrary, { nil: undefined });
+		const wire = fc.oneof(
+			fc.record({ kind: fc.constant("room" as const), room_id: roomId, parent_room_id: optional(roomId), title: fc.constant("t") }),
+			fc.record({
+				kind: fc.constant("message" as const), message_id: logId.map(String), room_id: roomId, from: identity,
+				body: fc.record({ text: fc.constant("x"), mentions: optional(fc.tuple(userId, userId)) }),
+				reply_to: optional(logId.map((id) => ({ message_id: String(id) }))),
+				ext: optional(userId.map((edited_by) => ({ editors: { "body.text": "mentioned", edited_by } }))),
+				prev_log_id: optional(logId.map(String)),
+				prev_room_id: optional(roomId),
+			}),
+			fc.record({ kind: fc.constant("reactions" as const), message_id: logId.map(String), room_id: roomId, reactions: fc.tuple(identity, identity).map(([a, b]) => [{ from: a, emojis: ["👍"] }, { from: b, emojis: ["🎉"] }]) }),
+			fc.record({ kind: fc.constant("membership" as const), room_id: roomId, members: fc.tuple(identity, identity).map(([a, b]) => [{ user: a, joined: true }, { user: b, joined: false }]) }),
+		);
+		fc.assert(fc.property(
+			fc.shuffledSubarray(logPool, { minLength: logPool.length }),
+			fc.shuffledSubarray(userPool, { minLength: userPool.length }),
+			logId, wire, fc.boolean(),
+			(logTargets, userTargets, id, { kind, ...fields }, timed) => {
+				const map = new IdMap(new Map(logPool.map((from, i) => [from, logTargets[i]])), new Map(userPool.map((from, i) => [from, userTargets[i]])));
+				const inverse = new IdMap(new Map([...map.logIds].map(([a, b]) => [b, a])), new Map([...map.users].map(([a, b]) => [b, a])));
+				// Absent options are left out of the wire, as a client leaves them.
+				const present = Object.fromEntries(Object.entries({ ...fields, body: "body" in fields && fields.body ? Object.fromEntries(Object.entries(fields.body).filter(([, value]) => value !== undefined)) : undefined }).filter(([, value]) => value !== undefined));
+				const input: ChatRecord = {
+					room_id: present.room_id as string, log_id: id,
+					// Either the log ID's time, or a time no log ID in the map has.
+					commit_ms: timed ? id : 9000,
+					kind, record_json: JSON.stringify({ ...present, log_id: String(id) }),
 				};
-			} else if (kind === "reactions") {
-				wire = { log_id: String(logId), message_id: String(pick(logs)), room_id: roomId(), reactions: [{ from: identity(), emojis: ["👍"] }, { from: identity(), emojis: ["🎉"] }] };
-			} else {
-				wire = { log_id: String(logId), room_id: roomId(), members: [{ user: identity(), joined: true }, { user: identity(), joined: false }] };
-			}
-			const input: ChatRecord = {
-				room_id: wire.room_id as string, log_id: logId,
-				// Either the log ID's time, or a time no log ID in the map has.
-				commit_ms: random() < 0.5 ? logId : 9000,
-				kind, record_json: JSON.stringify(wire),
-			};
-			const there = remapRecord(input, map);
-			const back = remapRecord(there, inverse);
-			expect(back).toEqual(input);
-		}
+				expect(remapRecord(remapRecord(input, map), inverse)).toEqual(input);
+			},
+		), { numRuns: 300 });
 	});
 });
