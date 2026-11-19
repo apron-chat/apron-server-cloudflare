@@ -1,7 +1,6 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { expect, it, vi } from 'vitest';
 import { DEFAULT_LIMITS, UPLOAD_POLICY } from '../src/budget';
-import { historyPolicy } from '../src/index';
 import { canonicalizeIp, hashIpKey } from '../src/ip';
 import { recordMetric } from '../src/metrics';
 import { RefusalMeter } from '../src/refusals';
@@ -1076,10 +1075,8 @@ it('speaks protocol v10: a sign-in welcome, no email sign-in, and ~private notic
 		expect(server.params).toMatchObject({ apron: 10, agent: 'apron-cloudflare-demo/10', auth: ['webauthn', 'token', 'guest'] });
 		// `server.welcome` is for the sign-in screen (§3.2), worded for this origin.
 		expect(server.params.welcome).toMatch(/Create a passkey/);
-		// The tests bind the archive (wrangler.toml): 80% of the hot log's 5,000 and of its 100,000.
-		expect(server.params.welcome).toContain(historyPolicy(DEFAULT_LIMITS, true));
-		expect(historyPolicy(DEFAULT_LIMITS, true)).toBe('History keeps the latest 84,000 messages.');
-		expect(historyPolicy(DEFAULT_LIMITS)).toBe('History keeps the latest 4,000 messages.');
+		// It says nothing of how long history is kept.
+		expect(server.params.welcome).not.toMatch(/History keeps|Messages are kept/);
 		expect(welcome.params.from).toEqual({ user_id: '~private', name: 'System message to you' });
 		const other = (await greeting(bot)).server.params;
 		expect(other.auth).toEqual(['token', 'guest']);

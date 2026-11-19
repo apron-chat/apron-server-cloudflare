@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
-import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, thresholdRecords, type Limits } from "./budget";
+import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, thresholdRecords } from "./budget";
 import { Archive, withOps, type ArchiveOp } from "./archive";
 import { keepLast, LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, showsMorePresent, statusChoice, type Status, type StatusChoice } from "./presence";
@@ -1030,18 +1030,6 @@ function basicClientId(header: string | null): string | null | undefined {
 	} catch {
 		return null;
 	}
-}
-
-/** How long history keeps messages, for the welcome: by count (the archive's included where it is on), by age, or both (the sooner). */
-export function historyPolicy(limits: Pick<Limits, "retentionRecords" | "retentionSeconds" | "archiveRecords" | "cleanupThresholdPercent">, archived = false): string {
-	const days = Math.max(1, Math.round(limits.retentionSeconds / 86_400));
-	const age = days === 1 ? "a day" : `${days} days`;
-	if (limits.retentionRecords <= 0) return `Messages are kept for ${age}.`;
-	// What cleanup keeps of each limit (cleanupThresholdPercent).
-	const kept = thresholdRecords(limits.retentionRecords, limits.cleanupThresholdPercent) +
-		(archived ? thresholdRecords(limits.archiveRecords, limits.cleanupThresholdPercent) : 0);
-	const count = `the latest ${kept.toLocaleString("en-US")} messages`;
-	return limits.retentionSeconds > 0 ? `History keeps ${count}, for up to ${age}.` : `History keeps ${count}.`;
 }
 
 function nowMs(): number {
@@ -3453,13 +3441,12 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * what this origin can sign in with.
 	 */
 	private signInWelcome(origin: string | null, endpoint: string | undefined): string {
-		const history = historyPolicy(this.config.limits, !!this.archive);
 		const guests = this.config.guestPosting ? "Guests can post under a new name each visit." : "Guests can read along.";
 		const signIn = this.passkeysOfferedTo(origin, endpoint)
 			? "**Create a passkey** to post, react, and start threads; it signs you in on your next visit too."
 			: "Passkeys work on the demo's own site; here, sign in with a bot token from `/invite-bot` there, or an invite token from an admin.";
 		const invites = "An admin's invite token also creates an account; add a passkey once you're in, so you can sign in again without it.";
-		return `**Apron public demo.** ${guests} ${signIn} ${invites} Bots sign in with a token their owner gets from \`/invite-bot\`. ${history}`;
+		return `**Apron public demo.** ${guests} ${signIn} ${invites} Bots sign in with a token their owner gets from \`/invite-bot\`.`;
 	}
 
 	/** The `~private` welcome, after the `server` frame; where guests only read, it says so (Appendix B). */
