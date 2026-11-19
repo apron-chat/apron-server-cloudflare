@@ -207,6 +207,13 @@ test('with live text, write URLs and live reads pass the invalid-request rule', 
 	assert.match(renderEdgeRules('chat.example.test', ADMISSION_BUDGET, undefined, true).custom.rules[0].expression, /"\/w\/"/);
 });
 
+test('with REMOTE_SELF, mirror wake pushes pass the invalid-request rule', () => {
+	assert.doesNotMatch(renderEdgeRules('chat.example.test').custom.rules[0].expression, /remote/);
+	const rule = renderEdgeRules('chat.example.test', ADMISSION_BUDGET, undefined, false, false, undefined, undefined, undefined, true).custom.rules[0];
+	assert.match(rule.expression, /^\(http\.host eq "chat\.example\.test"\) and not \(http\.request\.method eq "POST" and starts_with\(http\.request\.uri\.path, "\/remote\/wake\/"\)\) and /);
+	assert.equal(rule.description, 'Apron: allow WebSocket handshakes, connection status probes, and mirror wake pushes');
+});
+
 test('with live text, the edge streams write_url bodies rather than buffering them', () => {
 	assert.equal(renderEdgeRules('chat.example.test', ADMISSION_BUDGET, 'media.example.test').config, undefined);
 	const { config } = renderEdgeRules('chat.example.test', ADMISSION_BUDGET, undefined, true);

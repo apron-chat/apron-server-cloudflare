@@ -138,10 +138,14 @@ simple = { limit = ${admission.liveReadsPerLocationMinute}, period = ${admission
  * scoped to the server's hostname covers the Preview hosts too, so a
  * Preview is no less protected than production: `apron_invalid_request`
  * lets through on them what their own configuration serves
- * (`previews.liveText`, `previews.signIn`, as above), and the admission
- * shutdown, the budget stop and the browser redirect take them as well.
+ * (`previews.liveText`, `previews.signIn`, `previews.remote`, as above and
+ * below), and the admission shutdown, the budget stop and the browser
+ * redirect take them as well.
+ * With `remote` (`REMOTE_SELF`, extension `ext:remote`), `POST` of
+ * `/remote/wake/<id>`, an owner's wake push for this server's mirror rooms,
+ * is allowed too.
  */
-export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHostname = undefined, liveText = false, relatedOrigins = false, webClient = undefined, signIn = undefined, previews = undefined) {
+export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHostname = undefined, liveText = false, relatedOrigins = false, webClient = undefined, signIn = undefined, previews = undefined, remote = false) {
 	validateAdmission(admission);
 	const host = `http.host eq ${JSON.stringify(hostname)}`;
 	if (previews && !/^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/.test(previews.hostname ?? '')) throw new Error('Previews need a custom domain host name');
@@ -149,8 +153,8 @@ export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHos
 	const everyHost = previewHost ? `${host} or ${previewHost}` : host;
 	const handshake = 'any(lower(http.request.headers["upgrade"][*])[*] eq "websocket")';
 	const probe = 'any(http.request.uri.args["apron_connection_status"][*] eq "1")';
-	const { writes, allowed } = edgeAllowances({ mediaHostname, liveText, relatedOrigins, signIn });
-	const previewAllowances = previews && edgeAllowances({ liveText: previews.liveText, signIn: previews.signIn });
+	const { writes, allowed } = edgeAllowances({ mediaHostname, liveText, relatedOrigins, signIn, remote });
+	const previewAllowances = previews && edgeAllowances({ liveText: previews.liveText, signIn: previews.signIn, remote: previews.remote });
 	// Each host with what it lets through, both in one rule: a Free zone has five custom rules.
 	const scoped = (hostExpression, hostWrites) => hostWrites ? `((${hostExpression})${hostWrites})` : `(${hostExpression})`;
 	const scope = previews ? `(${scoped(host, writes)} or ${scoped(previewHost, previewAllowances.writes)})` : `(${host})${writes}`;
@@ -252,13 +256,14 @@ export function renderEdgeRules(hostname, admission = ADMISSION_BUDGET, mediaHos
  * What `apron_invalid_request` lets through on a host, as `and not (...)`
  * clauses (`writes`), and their names for its description (`allowed`).
  */
-function edgeAllowances({ mediaHostname, liveText, relatedOrigins, signIn }) {
+function edgeAllowances({ mediaHostname, liveText, relatedOrigins, signIn, remote }) {
 	const writes = (mediaHostname || liveText ? ' and not (http.request.method in {"PUT" "OPTIONS"} and starts_with(http.request.uri.path, "/w/"))' : '') +
 		(liveText ? ' and not (http.request.method in {"GET" "HEAD" "OPTIONS"} and starts_with(http.request.uri.path, "/live/"))' : '') +
 		(relatedOrigins ? ' and not (http.request.method in {"GET" "HEAD"} and http.request.uri.path eq "/.well-known/webauthn")' : '') +
 		(signIn ? ' and not (http.request.method eq "GET" and http.request.uri.path eq "/passkey") and not (http.request.method eq "POST" and http.request.uri.path in {"/passkey/begin" "/passkey/finish"})' : '') +
-		(signIn?.external ? ' and not (http.request.method eq "GET" and http.request.uri.path eq "/oauth/authorize") and not (http.request.method in {"POST" "OPTIONS"} and http.request.uri.path eq "/oauth/token") and not (http.request.method in {"GET" "HEAD" "OPTIONS"} and http.request.uri.path eq "/.well-known/oauth-authorization-server")' : '');
-	const allowed = ['WebSocket handshakes', 'connection status probes', ...(mediaHostname ? ['upload writes'] : []), ...(liveText ? ['live text'] : []), ...(relatedOrigins ? ['passkey related origins'] : []), ...(signIn ? ['the passkey page'] : []), ...(signIn?.external ? ['external sign-in'] : [])];
+		(signIn?.external ? ' and not (http.request.method eq "GET" and http.request.uri.path eq "/oauth/authorize") and not (http.request.method in {"POST" "OPTIONS"} and http.request.uri.path eq "/oauth/token") and not (http.request.method in {"GET" "HEAD" "OPTIONS"} and http.request.uri.path eq "/.well-known/oauth-authorization-server")' : '') +
+		(remote ? ' and not (http.request.method eq "POST" and starts_with(http.request.uri.path, "/remote/wake/"))' : '');
+	const allowed = ['WebSocket handshakes', 'connection status probes', ...(mediaHostname ? ['upload writes'] : []), ...(liveText ? ['live text'] : []), ...(relatedOrigins ? ['passkey related origins'] : []), ...(signIn ? ['the passkey page'] : []), ...(signIn?.external ? ['external sign-in'] : []), ...(remote ? ['mirror wake pushes'] : [])];
 	return { writes, allowed };
 }
 
@@ -523,8 +528,10 @@ function main() {
 	// Preview's host is never the domain itself, nor has PUBLIC_ORIGIN for
 	// live text (validatePreviews).
 	const relatedOrigins = relyingPartyId(main) === hostname;
-	const previewRules = previewDomain && { hostname: previewDomain, liveText: false, signIn: signInPages(previews, previewDomain) };
-	outputs.push(['docs/edge-rules.generated.json', JSON.stringify(renderEdgeRules(hostname, ADMISSION_BUDGET, media, liveText, relatedOrigins, WEB_CLIENT, signInPages(main, hostname), previewRules), null, 2) + '\n']);
+	// With REMOTE_SELF (ext:remote), owners wake this server's mirror rooms on /remote/wake/.
+	const remote = (vars) => Boolean(vars.REMOTE_SELF);
+	const previewRules = previewDomain && { hostname: previewDomain, liveText: false, signIn: signInPages(previews, previewDomain), remote: remote(wranglerVars(previews ?? '')) };
+	outputs.push(['docs/edge-rules.generated.json', JSON.stringify(renderEdgeRules(hostname, ADMISSION_BUDGET, media, liveText, relatedOrigins, WEB_CLIENT, signInPages(main, hostname), previewRules, remote(wranglerVars(main))), null, 2) + '\n']);
 	let stale = false;
 	for (const [file, expected] of outputs) {
 		const path = new URL(file, root);

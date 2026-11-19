@@ -24,12 +24,6 @@ protected than production. This file
 contains rule definitions grouped by phase; it is not a payload for replacing
 an entire zone ruleset.
 
-With `REMOTE_SELF` set (extension `ext:remote`, hosted rooms and mirrors),
-owners wake this server's mirror rooms with `POST /remote/wake/<id>`, which
-`apron_invalid_request` would block: add `(http.request.method eq "POST" and
-starts_with(http.request.uri.path, "/remote/wake/"))` to its exceptions by
-hand. The generator does not write it yet, as the extension is a prototype.
-
 During an authorized deployment:
 
 1. Verify the account's Workers plan matches `PLAN` in `src/budget.ts`, the zone's WAF capabilities,
@@ -49,7 +43,9 @@ During an authorized deployment:
    /passkey`, and `POST` of `/passkey/begin` and `/passkey/finish`. With
    `EXTERNAL_SIGN_IN` it also lets through `GET /oauth/authorize`, `POST` and
    `OPTIONS` of `/oauth/token`, and `GET`, `HEAD` and `OPTIONS` of
-   `/.well-known/oauth-authorization-server`. With Previews, the same rule
+   `/.well-known/oauth-authorization-server`. With `REMOTE_SELF` (extension
+   `ext:remote`), it lets through `POST` of `/remote/wake/<id>`, an owner's
+   wake push for this server's mirror rooms. With Previews, the same rule
    covers the Preview hosts, each host with what its own configuration
    serves: production's `EXTERNAL_SIGN_IN` is off and the Previews' on, so
    only the Preview hosts let the `external` paths through, and the Preview
