@@ -59,6 +59,8 @@ export interface ReplayedRoom {
 	log_id: number;
 	/** Every logged field but `room_id`, `log_id` and `prev_log_id`, without delivery fields. */
 	fields: JsonObject;
+	/** The record or listing it came from, whole, as logged (not remapped by remapReplayed). Not compared. */
+	value: JsonObject;
 }
 
 /** A message as replayed: its latest snapshot. */
@@ -74,6 +76,8 @@ export interface ReplayedMessage {
 	/** The replied-to message's ID. */
 	reply_to?: string;
 	deleted: boolean;
+	/** The snapshot it came from, whole, as logged (not remapped by remapReplayed). Not compared. */
+	value: JsonObject;
 }
 
 /** A user's latest reaction set on a message, as logged. */
@@ -163,7 +167,7 @@ export function replayRecords(records: Iterable<ChatRecord>, listings: readonly 
 		const roomId = typeof value.room_id === "string" ? value.room_id : record.room_id;
 		if (record.kind === "room") {
 			const current = rooms.get(roomId);
-			if (!current || logId >= current.log_id) rooms.set(roomId, { room_id: roomId, log_id: logId, fields: roomFields(value), fromRecord: true });
+			if (!current || logId >= current.log_id) rooms.set(roomId, { room_id: roomId, log_id: logId, fields: roomFields(value), value, fromRecord: true });
 		} else if (record.kind === "message") {
 			if (typeof value.message_id !== "string") continue;
 			const from = isObject(value.from) && typeof value.from.user_id === "string" ? value.from as ReplayedMessage["from"] : { user_id: "" };
@@ -174,6 +178,7 @@ export function replayRecords(records: Iterable<ChatRecord>, listings: readonly 
 				...(value.ext !== undefined ? { ext: value.ext } : {}),
 				...(replyTo !== undefined ? { reply_to: replyTo } : {}),
 				deleted: value.deleted === true,
+				value,
 			};
 			if (replaces(messages.get(next.message_id), next)) messages.set(next.message_id, next);
 		} else if (record.kind === "reactions") {
@@ -207,7 +212,7 @@ export function replayRecords(records: Iterable<ChatRecord>, listings: readonly 
 		const logId = logIdOf(listing.log_id) ?? 0;
 		const current = rooms.get(roomId);
 		if (!current || logId > current.log_id || (logId === current.log_id && !current.fromRecord)) {
-			rooms.set(roomId, { room_id: roomId, log_id: logId, fields: roomFields(listing), fromRecord: false });
+			rooms.set(roomId, { room_id: roomId, log_id: logId, fields: roomFields(listing), value: listing, fromRecord: false });
 		}
 	}
 

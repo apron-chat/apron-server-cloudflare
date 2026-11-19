@@ -146,8 +146,8 @@ function mapValue(value: unknown, kind: FieldKind, map: IdMap): unknown {
 
 /** `value` with `fn` applied at `path` from `index`; the same object where nothing changed. */
 function mapPath(value: unknown, path: readonly string[], index: number, fn: (value: unknown) => unknown): unknown {
-	if (index === path.length) return fn(value);
 	const key = path[index];
+	if (key === undefined) return fn(value);
 	if (key === "*") {
 		if (!Array.isArray(value)) return value;
 		let changed = false;

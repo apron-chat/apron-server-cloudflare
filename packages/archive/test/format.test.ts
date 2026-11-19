@@ -7,6 +7,7 @@ import {
 	linesOf,
 	MAX_LINE_BYTES,
 	MAX_READ_LINE_BYTES,
+	readArchive,
 	recordToWire,
 	utf8Length,
 	wireToRecord,
@@ -155,7 +156,7 @@ describe("jsonlWriter and jsonlReader", () => {
 });
 
 describe("jsonlReader tolerance (ARCHIVE.md §1)", () => {
-	it("skips blank and non-object lines, accepts \\r\\n, ignores unknown keys", async () => {
+	it("skips blank and non-object lines, accepts \\r\\n, ignores unknown scalar keys", async () => {
 		const text = [
 			"",
 			"   ",
@@ -176,6 +177,7 @@ describe("jsonlReader tolerance (ARCHIVE.md §1)", () => {
 		for await (const part of reader.parts()) parts.push(part);
 		expect(parts).toEqual([
 			{ kind: "records", records: [records[2]] },
+			{ kind: "field", key: "live", value: { typing: [] } },
 			{ kind: "listing", joined: [], not_joined: [], users: [{ user_id: "ada" }] },
 		]);
 	});
@@ -330,5 +332,25 @@ describe("reader limits", () => {
 		const bytes = new TextEncoder().encode("x".repeat(64));
 		const stream = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(bytes); controller.close(); } });
 		await expect((async () => { for await (const _ of linesFromStream(stream, 16)) { /* read */ } })()).rejects.toThrow(/longer than 16/);
+	});
+});
+
+describe("readArchive", () => {
+	it("reads what collectArchive reads, synchronously", async () => {
+		for (const text of Object.values(sceneArchives)) {
+			expect(readArchive(text)).toEqual(await collectArchive(jsonlReader(linesOf(text))));
+		}
+	});
+
+	it("keeps extensions' object sections as fields, in file order", () => {
+		const text = [JSON.stringify(header), JSON.stringify({ live: { a: [[0, "x"]] }, more: true }), JSON.stringify({ live: { b: [] } }), ""].join("\r\n");
+		expect(readArchive(text).fields).toEqual([{ key: "live", value: { a: [[0, "x"]] } }, { key: "live", value: { b: [] } }]);
+	});
+
+	it("requires a v1 header and caps lines, as jsonlReader does", () => {
+		expect(() => readArchive("")).toThrow(/no JSON object line/);
+		expect(() => readArchive('{"hello":1}\n')).toThrow(/has no apron_archive/);
+		expect(() => readArchive('{"apron_archive":2}\n')).toThrow(/unsupported Apron archive version 2/);
+		expect(() => readArchive(`${JSON.stringify(header)}\n${"x".repeat(MAX_READ_LINE_BYTES + 1)}\n`)).toThrow(/line 2 is longer than/);
 	});
 });

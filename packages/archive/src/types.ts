@@ -46,7 +46,9 @@ export interface ArchivedRoom {
 export type ArchivePart =
 	| { kind: "listing"; joined: RoomListing[]; not_joined: RoomListing[]; users: ArchivedUser[] }
 	| { kind: "records"; records: ChatRecord[] }
-	| { kind: "extra"; key: string; values: unknown[] };
+	| { kind: "extra"; key: string; values: unknown[] }
+	/** An unknown key with an object value (an extension's section), as it is. */
+	| { kind: "field"; key: string; value: Record<string, unknown> };
 
 /** Streaming ARCHIVE.md v1 writer: header first, then listings and users, then record parts. */
 export interface ArchiveWriter {

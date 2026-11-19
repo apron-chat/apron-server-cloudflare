@@ -48,14 +48,15 @@ describe("replayRecords", () => {
 	const state = replayRecords(log);
 
 	it("keeps the latest room record, without delivery fields", () => {
-		expect(state.rooms.get("general")).toEqual({ room_id: "general", log_id: 150, fields: { title: "General (ops)", ext: { topic: "deploys" } } });
+		expect(state.rooms.get("general")).toMatchObject({ room_id: "general", log_id: 150, fields: { title: "General (ops)", ext: { topic: "deploys" } } });
 		expect(state.rooms.get("thread")?.fields).toEqual({ title: "Thread", parent_room_id: "general" });
 	});
 
 	it("keeps the latest snapshot: edits, moves and tombstones", () => {
 		expect(state.messages.get("110")).toMatchObject({ room_id: "general", log_id: 112, body: { text: "first, edited" }, deleted: false });
 		expect(state.messages.get("111")).toMatchObject({ room_id: "thread", from: { user_id: "bob" }, reply_to: "110", log_id: 120 });
-		expect(state.messages.get("130")).toEqual({ message_id: "130", room_id: "general", log_id: 132, from: ada, deleted: true });
+		expect(state.messages.get("130")?.value).toEqual(JSON.parse(log.find((r) => r.log_id === 132)!.record_json));
+		expect(state.messages.get("130")).toMatchObject({ message_id: "130", room_id: "general", log_id: 132, from: ada, deleted: true });
 	});
 
 	it("replays reactions per user, dropping cleared sets and a deleted message's", () => {
@@ -106,7 +107,7 @@ describe("replayRecords", () => {
 		expect(withListings.members.get("general")).toEqual(new Set(["ada", "dave", "carol"]));
 		// The room record at 150 is newer than the listing's log_id; the lobby has only its listing.
 		expect(withListings.rooms.get("general")?.fields.title).toBe("General (ops)");
-		expect(withListings.rooms.get("lobby")).toEqual({ room_id: "lobby", log_id: 90, fields: { title: "Lobby" } });
+		expect(withListings.rooms.get("lobby")).toMatchObject({ room_id: "lobby", log_id: 90, fields: { title: "Lobby" } });
 		// A later object of a user replaces an earlier one.
 		expect(withListings.users.get("ada")?.name).toBe("Ada L.");
 	});

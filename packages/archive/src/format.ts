@@ -229,7 +229,12 @@ function listingEntries<T>(value: unknown, idKey: "room_id" | "user_id"): T[] {
 	return value.filter((entry) => isObject(entry) && typeof entry[idKey] === "string" && entry[idKey] !== "") as T[];
 }
 
-/** The parts one line holds, in this order: its listing, its records, then each unknown array-valued key. */
+/**
+ * The parts one line holds, in this order: its listing, its records, then
+ * each unknown key with an array (`extra`) or object (`field`: an
+ * extension's section) value. Other unknown values, such as a `history`
+ * result's `more` and `first_log_id`, are ignored.
+ */
 export function partsOfLine(line: JsonObject): ArchivePart[] {
 	const parts: ArchivePart[] = [];
 	if (LISTING_KEYS.some((key) => Array.isArray(line[key]))) {
@@ -252,10 +257,30 @@ export function partsOfLine(line: JsonObject): ArchivePart[] {
 		}
 	}
 	if (hasRecords) parts.push({ kind: "records", records: records.sort(byLog) });
-	for (const [key, values] of Object.entries(line)) {
-		if (!RESERVED_KEYS.has(key) && Array.isArray(values)) parts.push({ kind: "extra", key, values });
+	for (const [key, value] of Object.entries(line)) {
+		if (RESERVED_KEYS.has(key)) continue;
+		if (Array.isArray(value)) parts.push({ kind: "extra", key, values: value });
+		else if (isObject(value)) parts.push({ kind: "field", key, value });
 	}
 	return parts;
+}
+
+/** Throws for a line over MAX_READ_LINE_BYTES. */
+function checkLineLength(line: string, lineNumber: number): void {
+	if (line.length > MAX_READ_LINE_BYTES || (line.length > MAX_READ_LINE_BYTES / 3 && utf8Length(line) > MAX_READ_LINE_BYTES)) {
+		throw new Error(`archive line ${lineNumber} is longer than ${MAX_READ_LINE_BYTES} bytes`);
+	}
+}
+
+/** The header, from the first JSON object line (undefined when there is none); throws unless it carries `apron_archive: 1`. */
+function checkHeader(first: JsonObject | undefined, lineNumber: number): ArchiveHeader {
+	if (!first) throw new Error("not an Apron archive: no JSON object line");
+	if (first.apron_archive !== 1) {
+		throw new Error(first.apron_archive === undefined
+			? `not an Apron archive: line ${lineNumber} has no apron_archive`
+			: `unsupported Apron archive version ${JSON.stringify(first.apron_archive)} (this reader knows 1)`);
+	}
+	return first as ArchiveHeader;
 }
 
 /**
@@ -276,24 +301,13 @@ export function jsonlReader(lines: AsyncIterable<string>): ArchiveReader {
 			const step = await iterator.next();
 			if (step.done) return undefined;
 			lineNumber++;
-			if (step.value.length > MAX_READ_LINE_BYTES || (step.value.length > MAX_READ_LINE_BYTES / 3 && utf8Length(step.value) > MAX_READ_LINE_BYTES)) {
-				throw new Error(`archive line ${lineNumber} is longer than ${MAX_READ_LINE_BYTES} bytes`);
-			}
+			checkLineLength(step.value, lineNumber);
 			const value = parseLine(step.value);
 			if (value) return value;
 		}
 	};
 
-	const readHeader = () => header ??= (async () => {
-		const first = await next();
-		if (!first) throw new Error("not an Apron archive: no JSON object line");
-		if (first.apron_archive !== 1) {
-			throw new Error(first.apron_archive === undefined
-				? `not an Apron archive: line ${lineNumber} has no apron_archive`
-				: `unsupported Apron archive version ${JSON.stringify(first.apron_archive)} (this reader knows 1)`);
-		}
-		return first as ArchiveHeader;
-	})();
+	const readHeader = () => header ??= (async () => checkHeader(await next(), lineNumber))();
 
 	return {
 		header: readHeader,
@@ -368,19 +382,46 @@ export interface CollectedArchive {
 	/** Every record, sorted by log order. */
 	records: ChatRecord[];
 	extras: Array<{ key: string; values: unknown[] }>;
+	/** Unknown keys with object values (extensions' sections), in file order. */
+	fields: Array<{ key: string; value: JsonObject }>;
+}
+
+function collectPart(out: CollectedArchive, part: ArchivePart): void {
+	if (part.kind === "listing") {
+		for (const listing of part.joined) out.rooms.push({ listing, joined: true });
+		for (const listing of part.not_joined) out.rooms.push({ listing, joined: false });
+		out.users.push(...part.users);
+	} else if (part.kind === "records") out.records.push(...part.records);
+	else if (part.kind === "extra") out.extras.push({ key: part.key, values: part.values });
+	else out.fields.push({ key: part.key, value: part.value });
 }
 
 /** Reads a whole archive. For tests and small files: an export can be tens of MB. */
 export async function collectArchive(reader: ArchiveReader): Promise<CollectedArchive> {
-	const out: CollectedArchive = { header: await reader.header(), rooms: [], users: [], records: [], extras: [] };
-	for await (const part of reader.parts()) {
-		if (part.kind === "listing") {
-			for (const listing of part.joined) out.rooms.push({ listing, joined: true });
-			for (const listing of part.not_joined) out.rooms.push({ listing, joined: false });
-			out.users.push(...part.users);
-		} else if (part.kind === "records") out.records.push(...part.records);
-		else out.extras.push({ key: part.key, values: part.values });
-	}
+	const out: CollectedArchive = { header: await reader.header(), rooms: [], users: [], records: [], extras: [], fields: [] };
+	for await (const part of reader.parts()) collectPart(out, part);
 	out.records.sort(byLog);
 	return out;
+}
+
+/**
+ * A whole archive from its text, synchronously: what collectArchive gives
+ * for `jsonlReader(linesOf(text))`, by the same rules (header, line cap,
+ * tolerance). For build steps and tests that hold the file already.
+ */
+export function readArchive(text: string): CollectedArchive {
+	const lines = text.split("\n");
+	let lineNumber = 0;
+	let header: ArchiveHeader | undefined;
+	const out: Omit<CollectedArchive, "header"> = { rooms: [], users: [], records: [], extras: [], fields: [] };
+	for (const line of lines) {
+		lineNumber++;
+		checkLineLength(line, lineNumber);
+		const value = parseLine(line);
+		if (!value) continue;
+		if (!header) header = checkHeader(value, lineNumber);
+		else for (const part of partsOfLine(value)) collectPart(out as CollectedArchive, part);
+	}
+	out.records.sort(byLog);
+	return { header: checkHeader(header, lineNumber), ...out };
 }
