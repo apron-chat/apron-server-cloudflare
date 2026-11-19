@@ -17,7 +17,9 @@ import type { HistoryHead, PurgeResult, TierState, TierStateStore } from "./tier
 
 /** What the adapter needs of the Store (src/store.ts), so this module does not load it. */
 export interface StorePort {
-	historyFloors(): { hot: number; published: number };
+	historyFloors(): { hot: number; published: number; latest: number };
+	listRooms(now?: number, options?: { maintenance?: boolean; withPrivate?: boolean }): Array<{ room_id: string }>;
+	getIdentity(userId: string): { userId: string; name: string; avatar?: string; roles: string[]; ext?: Record<string, unknown> } | null;
 	historyTarget(): number | undefined;
 	historyScan(from: number, limit?: number): ChatRecord[];
 	historyRecords(query: HistoryQuery): ChatRecord[];
@@ -119,6 +121,27 @@ export class StoreHead implements HistoryHead {
 
 	async isRetired(userId: string): Promise<boolean> {
 		return this.store.isRetiredUserId?.(userId) ?? false;
+	}
+
+	/** Every room, as `room_list` lists it, private ones included (an export is the server's, not a member's view). */
+	async rooms(): Promise<ArchivedRoom[]> {
+		return this.store.listRooms(undefined, { maintenance: true, withPrivate: true }).map((room) => {
+			const { latest_log_id, history_log_id, ...rest } = room as Record<string, unknown> & { room_id: string };
+			// Members come from the membership records the export carries.
+			return { listing: { ...rest, room_id: room.room_id, ...(typeof latest_log_id === "string" ? { latest_log_id } : {}), ...(typeof history_log_id === "string" || history_log_id === null ? { history_log_id } : {}) }, joined: false };
+		});
+	}
+
+	async users(userIds: readonly string[]): Promise<ArchivedUser[]> {
+		return userIds.flatMap((id) => {
+			const identity = this.store.getIdentity(id);
+			if (!identity) return [];
+			return [{ user_id: identity.userId, name: identity.name, ...(identity.avatar ? { avatar: identity.avatar } : {}), roles: identity.roles, ...(identity.ext ? { ext: identity.ext } : {}) }];
+		});
+	}
+
+	async latest(): Promise<number> {
+		return this.store.historyFloors().latest;
 	}
 
 	async restoreRoom(room: ArchivedRoom, records: readonly ChatRecord[]): Promise<void> {

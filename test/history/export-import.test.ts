@@ -179,7 +179,8 @@ describe("export and import", () => {
 		expect(place(30, tiers, 20)).toEqual([2]);
 		expect(place(60, tiers, 20)).toEqual([1, 2]);
 		expect(place(80, tiers, 20)).toEqual([1]);
-		expect(place(110, tiers, 20)).toEqual([0, 1]);
+		// At or below the head's copy marker: the tier below holds it, as it will once the head lets it go.
+		expect(place(110, tiers, 20)).toEqual([1]);
 		expect(place(130, tiers, 20)).toEqual([0]);
 	});
 

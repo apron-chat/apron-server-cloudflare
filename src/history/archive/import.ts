@@ -98,13 +98,19 @@ async function freeId(base: string, taken: (id: string) => Promise<boolean>): Pr
 	}
 }
 
-/** Placement (§10.5): the tiers a record of log ID `id` goes to, or none if it is below the published floor. */
+/**
+ * Placement (§10.5): the tiers a record of log ID `id` goes to, or none if
+ * it is below the published floor: the head when it is past the head's
+ * copy marker (else the next tier would never get it), otherwise the first
+ * tier below, top-down, whose floor is at or below it; then each tier below
+ * that whose copy from above already passed it, so none of them misses it
+ * once the tier above lets it go.
+ */
 export function place(id: number, tiers: readonly Pick<TierView, "state">[], published: number): number[] {
 	if (id < published) return [];
-	let serving = tiers.findIndex((tier) => tier.state.floor <= id);
+	let serving = tiers.length > 1 && tiers[0].state.through >= id ? tiers.findIndex((tier, index) => index > 0 && tier.state.floor <= id) : tiers.findIndex((tier) => tier.state.floor <= id);
 	if (serving === -1) serving = tiers.length - 1;
 	const out = [serving];
-	// The tiers below already hold copies that far: they get this one too, so none of them misses it once the tier above lets it go.
 	for (let below = serving + 1; below < tiers.length && tiers[below - 1].state.through >= id; below += 1) out.push(below);
 	return out;
 }
@@ -238,8 +244,8 @@ export async function importArchive(pipeline: HistoryPipeline, input: ArchiveRea
 	if (options.dryRun) return report;
 
 	// Write: placeholders, then each room at the head, then the tiers below, oldest first.
-	if (placeholders.length) await head.restoreUsers(placeholders);
 	const batch = options.batch ?? 200;
+	for (let start = 0; start < placeholders.length; start += batch) await head.restoreUsers(placeholders.slice(start, start + batch));
 	for (const roomId of fresh) {
 		const room = rooms.get(roomId)!;
 		const listing = remapListing({ ...room.listing }, map);

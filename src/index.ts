@@ -3,7 +3,14 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, thresholdRecords } from "./budget";
-import { buildHistoryPipeline } from "./history/config";
+import { type BackupKeys, resolveKeys } from "./history/archive/crypto";
+import { linesFromStream, linesOf } from "./history/archive/format";
+import { archiveReader, type ImportReport, importArchive } from "./history/archive/import";
+import type { BlobStore } from "./history/blob/store";
+import { archivePipeline, blobStoreOf, buildHistoryPipeline, hasLowerTiers } from "./history/config";
+import { writeBackup } from "./history/exports";
+import { checkInvariants } from "./history/plan";
+import { backupKeyNames, type ExportSettings } from "./history/settings";
 import type { HistoryPipeline } from "./history/pipeline";
 import type { ChatRecord } from "./history/records";
 import { keepLast, LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
@@ -612,6 +619,7 @@ const COMMANDS: ReadonlyArray<{ name: string; usage: string; help: string; audie
 	{ name: "embed-terminal", usage: "/embed-terminal [title]", help: "get a link to stream a terminal (80×40) into this room, such as a build: the message appears when the stream starts", audience: "everyone" },
 	{ name: "emoji", usage: "/emoji add|remove :name:", help: "add a custom emoji, or replace its image: send /emoji add :name: with one image attached; /emoji remove :name: removes it", audience: "owners", roles: EMOJI_ROLES },
 	{ name: "help", usage: "/help", help: "list the commands you can use here", audience: "everyone" },
+	{ name: "history", usage: "/history status | export [<room_id>...] | import <key> [dry-run] [match|new] [renumber] | rebuild-index", help: "show where history is kept; back it up to the backup store, or import a backup or archive (ARCHIVE.md, encrypted or not) from it; rebuild the blob tier's index", audience: "admins" },
 	{ name: "invite-bot", usage: "/invite-bot", help: "get a sign-in token for your bot; a new one replaces the last", audience: "owners" },
 	{ name: "invite-code", usage: "/invite-code <uses>", help: `get a token that signs up to <uses> new users (at most ${MAX_JOIN_USES}) for a week, replacing the last one; /invite-code 0 revokes it`, audience: "admins" },
 	{ name: "invite-device", usage: "/invite-device list|add|remove [<id>]", help: "list, get or revoke tokens that sign in as you on another device", audience: "owners" },
@@ -2671,11 +2679,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.runtimeEnv = env;
 		this.config = loadConfig(env);
 		// Records past this SQLite's limits go to the tiers below where they are bound.
-		const tiered = Boolean(env.HISTORY_D1 && this.config.limits.archiveRecords > 0);
+		const tiered = hasLowerTiers(env, this.config.limits, this.config.history);
 		this.store = new Store(ctx as unknown as ConstructorParameters<typeof Store>[0], { ...asStoreConfig(this.config), tiered });
 		this.history = tiered ? buildHistoryPipeline({
-			env, limits: this.config.limits, store: this.store, clock: { now: nowMs },
+			env, limits: this.config.limits, store: this.store, clock: { now: nowMs }, settings: this.config.history,
 			track: (kind, method, call) => this.stalls.track(kind, method, call()),
+			segmentIndex: (tier) => this.store.segmentIndex(tier),
+			server: this.config.rpId,
 		}) : undefined;
 		// An overrun is observed, not fatal: the day's first is told, and a
 		// breaker it opened is told by the tier evaluation that follows.
@@ -3129,6 +3139,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		if (now >= this.idlePruneAt) await this.pruneIdle(now);
 		// Records about to leave this SQLite are copied to the tier below first.
 		if (this.history) await this.runHistory(now);
+		await this.runScheduledExports(now);
 		let result: ReturnType<Store["runCleanup"]> | undefined;
 		try {
 			result = this.store.runCleanup(now, { copyWaitMs: this.historyFailures ? HISTORY_RETRY_MS : 1_000 });
@@ -5096,7 +5107,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 				this.historyOpsChecked = !more;
 				if (more) this.maintenanceSoon(now);
 			}
-			for (const stall of await history.stallsToAlert(HISTORY_STALL_ALERT_MS)) {
+			const stallAfterMs = this.config.history ? this.config.history.alerts.stallAfterSeconds * 1_000 : HISTORY_STALL_ALERT_MS;
+			for (const stall of await history.stallsToAlert(stallAfterMs)) {
 				this.announce({ kind: "history_stall", from: stall.from, to: stall.to, hours: (now - stall.since) / 3_600_000 });
 			}
 		} catch {
@@ -7759,6 +7771,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 			await this.sendStatus(socket, request, roomId);
 			return;
 		}
+		if (command.name === "history") {
+			try {
+				await this.historyCommand(socket, request, roomId, words.slice(1));
+			} catch (error) {
+				const protocol = errorToProtocol(error);
+				if (protocol.name !== "invalid_params") throw error;
+				this.fail(socket, request, protocol);
+			}
+			return;
+		}
 		// The reply a command causes comes before its result (§1).
 		const writes = attachment.tier !== "anonymous" || this.config.guestPosting;
 		const available = this.commands().filter((candidate) => (candidate.audience === "everyone" && (writes || !candidate.name.startsWith("embed-"))) || (candidate.audience === "registered" && attachment.tier === "registered") || (candidate.audience === "owners" && owner && (!candidate.roles || candidate.roles.some((role) => hasRole(attachment, role)))) || admin);
@@ -8866,6 +8888,142 @@ export class ApronDemoServer extends DurableObject<Env> {
 			user: { user_id: userId, ...(stored.name ? { name: stored.name } : {}), ...(stored.avatar ? { avatar: stored.avatar } : {}), roles: stored.roles },
 			rooms: stored.rooms,
 		};
+	}
+
+	/** The pipeline exports and imports go through: the history pipeline, or SQLite alone. */
+	private archivePipeline(): HistoryPipeline {
+		return archivePipeline(this.history, { store: this.store, limits: this.config.limits, clock: { now: nowMs }, settings: this.config.history });
+	}
+
+	/**
+	 * Where backups go and imports come from: the first scheduled export's
+	 * store (HISTORY.exports), else HISTORY_BLOB under `backups/`. With the
+	 * settings `/history export` writes by (the first export's, named
+	 * `manual`, or plain ones).
+	 */
+	private backupTarget(): { store: BlobStore; settings: ExportSettings } | undefined {
+		const scheduled = this.config.history?.exports[0];
+		const settings: ExportSettings = scheduled
+			? { ...scheduled, name: "manual", keep: Math.max(scheduled.keep, 10) }
+			: { name: "manual", everySeconds: 0, store: { provider: "r2", binding: "HISTORY_BLOB", prefix: "backups/" }, key: "{server}-{name}-{date}.jsonl", keep: 10, compact: true };
+		const store = blobStoreOf(settings.store, this.runtimeEnv);
+		return store ? { store, settings } : undefined;
+	}
+
+	/** The backup keys this environment has: every secret the config names, and HISTORY_BACKUP_KEY (§13.3). */
+	private backupKeys(): BackupKeys {
+		const names = this.config.history ? backupKeyNames(this.config.history) : [];
+		return resolveKeys(this.runtimeEnv, [...new Set([...names, "HISTORY_BACKUP_KEY"])]);
+	}
+
+	/**
+	 * `/history`: `status` shows each tier, its state and what holds of the
+	 * invariants; `export [<room_id>...]` writes a backup to the backup store
+	 * and names its key; `import <key> [dry-run] [match|new] [renumber]` reads
+	 * a backup or an ARCHIVE.md file from it (decrypted with a key the
+	 * environment has) and reports what it added, or would; `rebuild-index`
+	 * lists the blob tiers' stores to rebuild their segment indexes.
+	 */
+	private async historyCommand(socket: WebSocketConnection, request: RequestFrame, roomId: string, words: string[]): Promise<void> {
+		const usage = (): never => { throw { name: "invalid_params", message: `Usage: ${COMMANDS.find((entry) => entry.name === "history")!.usage}` } satisfies ProtocolError; };
+		const now = nowMs();
+		const done = (text: string) => {
+			this.sendNotice(socket, roomId, text);
+			this.reply(socket, request, {});
+		};
+		switch (words[0]) {
+			case "status": {
+				if (words.length !== 1) usage();
+				const lines = await this.historyStatus(now);
+				const pipeline = this.archivePipeline();
+				const views = await pipeline.views();
+				lines.push(...views.map((view) => `- \`${view.name}\`: floor ${view.state.floor}${views.indexOf(view) < views.length - 1 ? `, copied through ${view.state.through}` : ""}${view.state.ops ? `, ops through ${view.state.ops}` : ""}`));
+				lines.push(`- Published floor: ${await pipeline.publishedFloor()}`);
+				const violations = checkInvariants(views, await pipeline.publishedFloor());
+				lines.push(violations.length ? `- **Invariants broken:** ${violations.join("; ")}` : "- Invariants hold.");
+				done(lines.join("\n"));
+				return;
+			}
+			case "export": {
+				const target = this.backupTarget();
+				if (!target) throw { name: "invalid_params", message: "No backup store: bind HISTORY_BLOB, or configure HISTORY.exports" } satisfies ProtocolError;
+				const roomIds = words.slice(1);
+				const result = await writeBackup(this.archivePipeline(), target.store, target.settings, {
+					server: this.config.rpId, clock: { now: nowMs }, keys: this.backupKeys(), ...(roomIds.length ? { roomIds } : {}),
+				});
+				done(`Backed up ${result.rooms} rooms, ${result.users} users and ${result.records} records to \`${result.key}\`.`);
+				return;
+			}
+			case "import": {
+				const key = words[1];
+				const flags = new Set(words.slice(2));
+				if (!key || [...flags].some((flag) => !["dry-run", "match", "new", "renumber"].includes(flag)) || (flags.has("match") && flags.has("new"))) usage();
+				const target = this.backupTarget();
+				if (!target) throw { name: "invalid_params", message: "No backup store: bind HISTORY_BLOB, or configure HISTORY.exports" } satisfies ProtocolError;
+				const object = await target.store.get(key);
+				if (!object) throw { name: "invalid_params", message: `No backup ${key}` } satisfies ProtocolError;
+				const lines = object.stream ? linesFromStream(await object.stream()) : linesOf(await object.text());
+				const defaults = this.config.history?.import;
+				let report: ImportReport;
+				try {
+					report = await importArchive(this.archivePipeline(), archiveReader(lines, this.backupKeys()), {
+						clock: { now: nowMs }, server: this.config.rpId, dryRun: flags.has("dry-run"),
+						users: flags.has("match") ? "match" : flags.has("new") ? "new" : defaults?.users ?? "auto",
+						ids: flags.has("renumber") ? "renumber" : defaults?.ids ?? "original",
+					});
+				} catch (error) {
+					// A missing key, a damaged backup or an unreadable file: said plainly, nothing written.
+					throw { name: "invalid_params", message: error instanceof Error ? error.message : String(error) } satisfies ProtocolError;
+				}
+				const users = Object.entries(report.users).map(([from, to]) => "matched" in to ? `${from} → ${to.matched}` : `${from} → ${to.placeholder} (unclaimed)`);
+				done([
+					`${report.dryRun ? "Would import" : "Imported"} ${report.records} records into ${report.roomsAdded.length} new rooms${report.roomsAdded.length ? ` (${report.roomsAdded.map((id) => `\`${id}\``).join(", ")})` : ""}.`,
+					report.roomsSkipped.length ? `Skipped ${report.roomsSkipped.length} rooms that exist here.` : "",
+					report.duplicates ? `Skipped ${report.duplicates} records held here already.` : "",
+					report.expired ? `Dropped ${report.expired} records older than history here.` : "",
+					Object.keys(report.remapped.logIds).length ? `Moved ${Object.keys(report.remapped.logIds).length} log IDs that other records hold.` : "",
+					users.length ? `Users: ${users.join(", ")}.` : "",
+				].filter(Boolean).join("\n"));
+				if (!report.dryRun && report.roomsAdded.length) {
+					try { this.announceUpdated(this.store.listRooms(nowMs(), { withPrivate: true })); } catch { /* listed on the next room_list */ }
+				}
+				return;
+			}
+			case "rebuild-index": {
+				if (words.length !== 1) usage();
+				const rebuilt: string[] = [];
+				for (const tier of this.history?.tiers ?? []) {
+					const blob = tier as unknown as { rebuildIndex?: () => Promise<number> };
+					if (typeof blob.rebuildIndex === "function") rebuilt.push(`\`${tier.name}\`: ${await blob.rebuildIndex()} segments`);
+				}
+				done(rebuilt.length ? `Rebuilt ${rebuilt.join(", ")}.` : "No blob tier to rebuild.");
+				return;
+			}
+			default:
+				usage();
+		}
+	}
+
+	/**
+	 * Scheduled backups (HISTORY.exports), on a full alarm: each export whose
+	 * interval has passed since its last run writes one. A failure is logged
+	 * and tried again on the next interval's alarm; never throws.
+	 */
+	private async runScheduledExports(now: number): Promise<void> {
+		for (const settings of this.config.history?.exports ?? []) {
+			try {
+				const last = this.store.historyMetaNumber(`history:export:${settings.name}`, now);
+				if (now < last + settings.everySeconds * 1_000) continue;
+				const store = blobStoreOf(settings.store, this.runtimeEnv);
+				if (!store) continue;
+				// Noted first: a failing export waits its interval rather than retrying on every alarm.
+				this.store.setHistoryMeta(`history:export:${settings.name}`, String(now), now);
+				const result = await writeBackup(this.archivePipeline(), store, settings, { server: this.config.rpId, clock: { now: nowMs }, keys: this.backupKeys() });
+				console.log(JSON.stringify({ event: "history_export", name: settings.name, key: result.key, records: result.records, deleted: result.deleted.length }));
+			} catch (error) {
+				console.warn(JSON.stringify({ event: "history_export_failed", name: settings.name, message: error instanceof Error ? error.message : String(error) }));
+			}
+		}
 	}
 
 	/** Sends one connection a `~private` markdown notice in a room (Appendix A.1). */

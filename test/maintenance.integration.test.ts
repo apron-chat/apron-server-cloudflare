@@ -308,7 +308,7 @@ it("with tiers below, removes records from SQLite only once copied, and keeps th
 		expect(moved.deleted_records).toBe(6);
 		// The published floor stays where it was: the tier below holds what left.
 		expect(moved.history_floor).toBe(moved.previous_floor);
-		expect(store.historyFloors(clock.value)).toEqual({ hot: Number(logs[4] + 1n), published: Number(moved.history_floor) });
+		expect(store.historyFloors(clock.value)).toEqual({ hot: Number(logs[4] + 1n), published: Number(moved.history_floor), latest: Number(logs[7]) });
 		expect(hotRecords()).toBe(3);
 
 		// History reads SQLite, and asks the tiers below for what is under it.
@@ -325,7 +325,7 @@ it("with tiers below, removes records from SQLite only once copied, and keeps th
 		store.publishHistoryFloor(Number(logs[1]), clock.value);
 		expect(store.logBounds().history_floor).toBe(String(logs[1]));
 		store.publishHistoryFloor(Number(logs[7]), clock.value);
-		expect(store.historyFloors(clock.value)).toEqual({ hot: Number(logs[4] + 1n), published: Number(logs[4] + 1n) });
+		expect(store.historyFloors(clock.value)).toEqual({ hot: Number(logs[4] + 1n), published: Number(logs[4] + 1n), latest: Number(logs[7]) });
 		expect(store.cleanupDue(clock.value)).toBe(true);
 		const narrowed = store.historyAcrossTiers({ roomId: "general", before: String(logs[7] + 1n), limit: 10, now: clock.value });
 		expect("below" in narrowed).toBe(false);
@@ -334,14 +334,15 @@ it("with tiers below, removes records from SQLite only once copied, and keeps th
 
 it("forgets the pipeline's floors, queue and tier state once tiers are off, so turning them on again starts at the hot floor", async () => {
 	await withStore("history-off", { cleanupIntervalMs: 3_600_000 }, (_store, clock, state) => {
-		state.storage.sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('history:published', '5'), ('history:head:through', '7'), ('history:ops', '[]'), ('history:tier:recent', '{}'), ('historyx', 'kept')");
+		state.storage.sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('history:published', '5'), ('history:head:through', '7'), ('history:ops', '[]'), ('history:tier:recent', '{}'), ('history:export:nightly', '123'), ('historyx', 'kept')");
 		const off = new Store(state, { ...BY_AGE, tiered: false, cleanupIntervalMs: 3_600_000 }, clock.clock);
 		clock.value += DAY_MS;
 		state.storage.sql.exec("UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1");
 		off.forgetCleanupDue();
 		state.storage.sql.exec("INSERT INTO records (room_id, log_id, commit_ms, kind, record_json) VALUES ('general', 2, 0, 'membership', '{}')");
 		off.runCleanup(clock.value);
-		expect(state.storage.sql.exec("SELECT key FROM _meta WHERE key LIKE 'history%'").toArray()).toEqual([{ key: "historyx" }]);
+		// Backups' schedule is no tier's state: it stays.
+		expect(state.storage.sql.exec("SELECT key FROM _meta WHERE key LIKE 'history%' ORDER BY key").toArray()).toEqual([{ key: "history:export:nightly" }, { key: "historyx" }]);
 		const on = new Store(state, { ...BY_AGE, tiered: true }, clock.clock);
 		expect(on.logBounds().history_floor).toBe(off.logBounds().history_floor);
 	});

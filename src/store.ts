@@ -28,6 +28,8 @@ import { keepAppend, keepLast, liveTextString, type LiveKind } from "./live-text
 import type { AccountUsageSnapshot } from "./account-usage";
 import type { ChatRecord, HistoryOp, HistoryQuery, QueuedOp } from "./history/records";
 import type { TierState } from "./history/tier";
+import type { ArchivedRoom, ArchivedUser } from "./history/archive/types";
+import { SqlSegmentIndex, type SqlPort } from "./history/blob/segments";
 import {
   BudgetLedger,
   MAINTENANCE_CONTROL_READS,
@@ -1093,12 +1095,39 @@ const META_HISTORY_ROOMS_DUE = "history:rooms_due";
 const META_HISTORY_OPS = "history:ops";
 const META_HISTORY_OPS_SEQ = "history:ops_seq";
 const META_HISTORY_TIER = "history:tier:";
+/** Backups' schedule state (historyMetaNumber, setHistoryMeta), kept when tiers are off. */
+const META_HISTORY_EXPORT = "history:export:";
+/** Segment index rows a blob tier's query reads at most (segmentIndex). */
+const SEGMENT_INDEX_READS = 5_000;
 /** Log IDs one copy from this SQLite carries at most (historyScan). */
 export const HISTORY_SCAN_BATCH = 100;
 /** Index entries historyTarget reads past the cutoff at most, looking for the first record it keeps. */
 const HISTORY_TARGET_SCAN = 200;
 /** Ops the log holds at most: a /purge or /rename past it waits for the tiers below to catch up (retry_after). */
 const MAX_HISTORY_OPS = 200;
+/**
+ * The records one restoreRoom call takes at most (an import's batch): a
+ * room with more is restored over several calls, oldest records first.
+ */
+export const RESTORE_RECORDS_BATCH = 256;
+/** Reaction sets and members, together, one restoreRoom call's records hold at most. */
+export const RESTORE_ENTRIES_BATCH = 1_024;
+/**
+ * Stored records of the room a restoreRoom call reads again at most, when
+ * some of its records are older than what the room already holds: past it
+ * the call is refused, as a room's records are sent oldest first.
+ */
+const RESTORE_REPLAY_CAP = 1_024;
+/** The users one restoreUsers call takes at most. */
+export const RESTORE_USERS_BATCH = 200;
+/**
+ * The role of an imported placeholder account (PLAN §10.4): it reserves the
+ * archive's user ID, holds no credential, and, holding a role, is never
+ * removed by the idle prune (pruneIdleIdentities).
+ */
+export const UNCLAIMED_ROLE = "unclaimed";
+/** The longest avatar URL an imported user keeps. */
+const MAX_RESTORED_AVATAR_BYTES = 2_048;
 /**
  * Reads for checkRoomFieldsTotal(): every row of the capped rooms table,
  * public and private, with slack for index pages.
@@ -1918,6 +1947,121 @@ function recordedUser(userId: string, name: string | null | undefined): Identity
   return { user_id: userId, ...(name ? { name } : {}) };
 }
 
+/** A listing's log ID (a decimal string, or a number) as a number, or undefined when absent or malformed. */
+function restoredLogId(value: unknown): number | undefined {
+  const number = typeof value === "number" ? value : typeof value === "string" && /^\d{1,16}$/.test(value) ? Number(value) : NaN;
+  return Number.isSafeInteger(number) && number > 0 ? number : undefined;
+}
+
+/** The client fields (`title`, `description`, `ext`) of a room record or listing, as a room row keeps them. */
+function restoredRoomFields(value: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...(typeof value.title === "string" ? { title: value.title } : {}),
+    ...(typeof value.description === "string" && value.description.trim() !== "" ? { description: value.description } : {}),
+    ...(isPlainObject(value.ext) && Object.keys(value.ext).length ? { ext: clone(value.ext) } : {}),
+  };
+}
+
+/** An imported user's avatar: a plain `https:` URL without credentials, of bounded length, or undefined. */
+function restoredAvatar(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value || utf8Bytes(value) > MAX_RESTORED_AVATAR_BYTES) return undefined;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && !url.username && !url.password ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether an archive's `user_id` may become a placeholder account: the
+ * shape an admin may issue (`/invite-token`, `/rename`), and not a guest's
+ * or an owner's bot's, which are no accounts to restore.
+ */
+function restorableUserId(userId: unknown): userId is string {
+  return typeof userId === "string" && /^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9_])?$/.test(userId) && !/^(guest|bot)(_|$)/i.test(userId);
+}
+
+/** One record restoreRoom takes, checked, with its parsed wire value. */
+interface RestoredRecord {
+  log_id: number;
+  commit_ms: number;
+  kind: RecordKind;
+  record_json: string;
+  value: Record<string, unknown>;
+}
+
+/** Whether `value` is a recorded user (`from`, a member's `user`): an object with a string `user_id`. */
+function isRecordedUser(value: unknown): value is Identity {
+  return isPlainObject(value) && typeof value.user_id === "string" && value.user_id.length > 0;
+}
+
+/**
+ * An archived record of `roomId`, checked as restoreRoom stores it: a safe
+ * positive log ID, one of the four kinds, and a wire value of that kind's
+ * shape (a message's `message_id` and `from`, a reaction record's
+ * `message_id` and sets, a membership record's members). Throws otherwise.
+ */
+function restoredRecord(roomId: string, record: ChatRecord): RestoredRecord {
+  const where = `Record ${String(record?.log_id)} of ${roomId}`;
+  if (record?.room_id !== roomId) throw new StoreError("invalid_params", `${where} belongs to another room`.slice(0, 200));
+  if (!Number.isSafeInteger(record.log_id) || record.log_id <= 0) throw new StoreError("invalid_params", `${where} has no valid log_id`.slice(0, 200));
+  const commitMs = Number.isFinite(record.commit_ms) && record.commit_ms > 0 ? Math.trunc(record.commit_ms) : record.log_id;
+  const kind = record.kind;
+  if (kind !== "room" && kind !== "message" && kind !== "reactions" && kind !== "membership") throw new StoreError("invalid_params", `${where} is of an unknown kind`.slice(0, 200));
+  const value = typeof record.record_json === "string" ? parseJson<unknown>(record.record_json, null) : null;
+  if (!isPlainObject(value)) throw new StoreError("invalid_params", `${where} is not a JSON object`.slice(0, 200));
+  const valid = kind === "room" ? true
+    : kind === "message" ? typeof value.message_id === "string" && value.message_id.length > 0 && isRecordedUser(value.from)
+    : kind === "reactions" ? typeof value.message_id === "string" && value.message_id.length > 0 && Array.isArray(value.reactions)
+      && value.reactions.every((set) => isPlainObject(set) && isRecordedUser(set.from) && Array.isArray(set.emojis) && set.emojis.every((emoji) => typeof emoji === "string"))
+    : Array.isArray(value.members) && value.members.every((member) => isPlainObject(member) && isRecordedUser(member.user) && typeof member.joined === "boolean");
+  if (!valid) throw new StoreError("invalid_params", `${where} is not a valid ${kind} record`.slice(0, 200));
+  return { log_id: record.log_id, commit_ms: commitMs, kind, record_json: record.record_json, value };
+}
+
+/** The reaction sets and members a restored record holds (RESTORE_ENTRIES_BATCH). */
+function restoredEntries(record: RestoredRecord): number {
+  if (record.kind === "reactions") return (record.value.reactions as unknown[]).length;
+  if (record.kind === "membership") return (record.value.members as unknown[]).length;
+  return 0;
+}
+
+/**
+ * The current state records give, replayed in log order, as commits leave
+ * it (restoreRoom): each message's latest snapshot, each user's latest
+ * reaction set on each message (an empty one removes it), each user's
+ * latest membership change, and the latest room record.
+ */
+function restoredState(records: readonly RestoredRecord[]): {
+  messages: Map<string, RestoredRecord>;
+  reactions: Map<string, { messageId: string; userId: string; logId: number; from: Identity; emojis: string[] }>;
+  members: Map<string, boolean>;
+  room?: RestoredRecord;
+} {
+  const messages = new Map<string, RestoredRecord>();
+  const reactions = new Map<string, { messageId: string; userId: string; logId: number; from: Identity; emojis: string[] }>();
+  const members = new Map<string, boolean>();
+  let room: RestoredRecord | undefined;
+  for (const record of [...records].sort((a, b) => a.log_id - b.log_id)) {
+    const value = record.value;
+    if (record.kind === "room") room = record;
+    else if (record.kind === "message" && typeof value.message_id === "string" && isRecordedUser(value.from)) messages.set(value.message_id, record);
+    else if (record.kind === "reactions" && typeof value.message_id === "string" && Array.isArray(value.reactions)) {
+      for (const set of value.reactions as Array<{ from?: unknown; emojis?: unknown }>) {
+        if (!isRecordedUser(set.from) || !Array.isArray(set.emojis)) continue;
+        const from = clone(set.from);
+        reactions.set(`${value.message_id}\n${from.user_id}`, { messageId: value.message_id, userId: from.user_id, logId: record.log_id, from, emojis: set.emojis.filter((emoji): emoji is string => typeof emoji === "string") });
+      }
+    } else if (record.kind === "membership" && Array.isArray(value.members)) {
+      for (const member of value.members as Array<{ user?: unknown; joined?: unknown }>) {
+        if (isRecordedUser(member.user) && typeof member.joined === "boolean") members.set(member.user.user_id, member.joined);
+      }
+    }
+  }
+  return { messages, reactions, members, ...(room ? { room } : {}) };
+}
+
 /**
  * The text an embed's `og` may carry, with its longest kept length in code
  * points. Clients build `og` themselves (such as link previews), and the
@@ -2387,6 +2531,8 @@ export class Store {
   private serverCache: StoredServerMetadata | null = null;
   /** The rooms one roomMembers call read, when nothing is kept. */
   private readonly uncachedMembers = new Map<string, MemberCacheEntry>();
+  /** The blob tiers' segment indexes in this SQLite, by tier name (segmentIndex). */
+  private readonly segmentIndexes = new Map<string, SqlSegmentIndex>();
 
   constructor(
     storageOrState: unknown,
@@ -3847,10 +3993,17 @@ export class Store {
     )[0]?.count));
   }
 
-  /** The hot floor and the published floor (publishedFloor), for the history pipeline. */
-  historyFloors(now = this.clock.now()): { hot: number; published: number } {
+  /**
+   * The hot floor, the published floor (publishedFloor) and the log head
+   * (the last log ID issued, `latest`), for the history pipeline: an import
+   * that renumbers its records places them past the head.
+   */
+  historyFloors(now = this.clock.now()): { hot: number; published: number; latest: number } {
     this.ensureReady();
-    return this.reserved({ reads: 8 }, true, now, () => ({ hot: this.logState().history_floor, published: this.publishedFloor() }));
+    return this.reserved({ reads: 8 }, true, now, () => {
+      const state = this.logState();
+      return { hot: state.history_floor, published: this.publishedFloor(), latest: state.last_log_id };
+    });
   }
 
   /**
@@ -4024,6 +4177,377 @@ export class Store {
       for (const row of rows) this.rewriteRecord(row, null);
       this.rawExec("DELETE FROM reaction_state WHERE message_id IN (SELECT value FROM json_each(?))", list);
     }), true);
+  }
+
+  /**
+   * Whether `userId` is retired and may not be issued again (PLAN §10.4):
+   * `/rename` moved its account away (`renamed:`, for good), or `/purge` or
+   * the idle prune removed it and it is not yet freed (`purged:`,
+   * dueRetiredUserIds). An ID an identity holds now is not retired.
+   */
+  isRetiredUserId(userId: string, now = this.clock.now()): boolean {
+    this.ensureReady();
+    return this.reserved({ reads: 8 }, true, now, () => this.retiredUserId(userId));
+  }
+
+  private retiredUserId(userId: string): boolean {
+    return this.metaValue(META_RENAMED_PREFIX + userId) !== "" || this.metaValue(META_PURGED_PREFIX + userId) !== "";
+  }
+
+  /**
+   * Import (PLAN §10.4): makes each archived user that has no identity here
+   * and whose ID is not retired a placeholder account, as
+   * createInvitedIdentity makes an account without a credential: the
+   * archive's name (else the user ID), its avatar if a plain `https:` URL,
+   * its `ext` if it fits as a `me` write's would (else none), and the one
+   * role `unclaimed` (UNCLAIMED_ROLE); the archive's roles are not imported,
+   * as roles grant powers here. A placeholder joins no room by itself: its
+   * memberships come with the rooms' records (restoreRoom). IDs a guest or
+   * an owner's bot has, or that an admin could not issue, are skipped.
+   * Each placeholder counts against registeredIdentityCount; a call that
+   * would pass it is refused whole, before anything is written. At most
+   * RESTORE_USERS_BATCH users a call; charged to maintenance, so a day's
+   * exhausted budget refuses it with `retry_after`, and a retry skips what
+   * an earlier call created. Returns the IDs created, in order.
+   */
+  restoreUsers(users: readonly ArchivedUser[], now = this.clock.now()): string[] {
+    this.ensureReady();
+    if (users.length > RESTORE_USERS_BATCH) throw new StoreError("invalid_params", `At most ${RESTORE_USERS_BATCH} users are restored a call`);
+    const unique = new Map<string, ArchivedUser>();
+    for (const user of users) if (restorableUserId(user?.user_id) && !unique.has(user.user_id)) unique.set(user.user_id, user);
+    if (!unique.size) return [];
+    this.ensureGrowthCapacity(unique.size * 2_048);
+    // Per user, its identity row and two retired markers, then the row and its index pages written.
+    return this.reserved({ reads: 32 + 8 * unique.size, writes: 16 + 8 * unique.size }, true, now, () => this.transaction(() => {
+      const fresh = [...unique.values()].filter((user) => !this.identityRow(user.user_id) && !this.retiredUserId(user.user_id));
+      if (!fresh.length) return [];
+      const count = this.metaNumber("identity_count");
+      if (count + fresh.length > this.config.registeredIdentityCount) {
+        throw new StoreError("denied", `registration_closed: ${fresh.length} new users would pass this server's ${this.config.registeredIdentityCount} accounts (it has ${count})`.slice(0, 200));
+      }
+      const effective = this.effectiveNow(now);
+      for (const user of fresh) {
+        const avatar = restoredAvatar(user.avatar);
+        const ext = isPlainObject(user.ext) ? clientUserExt(clone(user.ext)) : undefined;
+        const kept = ext && Object.keys(ext).length && userExtFits(ext) ? ext : undefined;
+        this.rawExec(
+          `INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, avatar_url, avatar_expires_ms, roles_json, ext_json)
+           VALUES (?, '', ?, 'registered', ?, ?, ?, ?, ?, ?)`,
+          user.user_id, this.restoredName(user), effective, effective,
+          // An imported avatar is no upload of this server's, so nothing expires it.
+          avatar ?? "", avatar ? MAX_SAFE_ID : 0, JSON.stringify([UNCLAIMED_ROLE]), kept ? JSON.stringify(kept) : "",
+        );
+      }
+      this.adjustCount("identity_count", fresh.length);
+      return fresh.map((user) => user.user_id);
+    }));
+  }
+
+  /** An imported user's name: the archive's, if it is one this server takes, else the user ID, cut to the name limits. */
+  private restoredName(user: ArchivedUser): string {
+    const name = user.name;
+    if (typeof name === "string" && name.trim() !== "" && utf8Bytes(name) <= this.config.maxNameBytes && [...name].length <= this.config.maxNameCodePoints) return name;
+    const points = [...user.user_id].slice(0, this.config.maxNameCodePoints);
+    while (utf8Bytes(points.join("")) > this.config.maxNameBytes) points.pop();
+    return points.join("");
+  }
+
+  /**
+   * Import (PLAN §10.2, §10.5): adds a room that is new here, with the
+   * records of it that belong in this SQLite (the hot log), and rebuilds the
+   * current state they give, as if they had been committed here.
+   *
+   * The first call creates the room row: its parent from the listing or its
+   * room record, its creation at the lowest of the listing's `log_id` and
+   * `history_log_id` and the records' log IDs (so history reads every record
+   * restored, here or in the tiers below), its record and fields from its
+   * latest room record or else the listing, and its head at the greatest log
+   * ID known; a room with no records here (all in the tiers below) is made
+   * from its listing alone. It counts against the server's caps as a room
+   * created by `room_set` does (maxThreads and the created top-level rooms,
+   * or maxPrivateRooms), and a thread's parent must be a public top-level
+   * room here already; a cap passed refuses the call.
+   *
+   * A room that exists is merged into: so a room's records may come over
+   * several calls, each at most RESTORE_RECORDS_BATCH records and
+   * RESTORE_ENTRIES_BATCH reaction sets and members, and a call repeated
+   * stores nothing twice (records are keyed by room and log ID) and changes
+   * nothing. Deciding which rooms are new is the importer's (`hasRoom`
+   * before the first call): this never refuses an existing room, but it
+   * does refuse one whose listing names another parent.
+   *
+   * Every record must be at or above the hot floor and, with tiers below,
+   * past the copy marker (`through`), or the call is refused: older records
+   * go to the tiers below (§10.5). The new records are stored, and the
+   * state of every message, reaction set and membership they name is
+   * replayed from them and the room's later records: each message's state
+   * points at its latest snapshot, unless another author's or another
+   * room's message holds its ID (a collision the planner nudges away;
+   * skipped here, with its reaction sets); each user's latest reaction set
+   * stands, an empty one removing theirs; and each user's latest membership
+   * stands, joins only for users who have an identity here (and room in
+   * their private rooms, for a private room). A room's records should come
+   * oldest first; new records older than ones already stored make it read
+   * the stored ones after them again, at most RESTORE_REPLAY_CAP, past
+   * which the call is refused. The log head is raised to the greatest log
+   * ID and commit time restored, so later commits take greater IDs.
+   *
+   * Charged to maintenance, so a day's exhausted budget refuses a call with
+   * `retry_after`, to be repeated later.
+   */
+  restoreRoom(room: ArchivedRoom, records: readonly ChatRecord[], now = this.clock.now()): { created: boolean; stored: number } {
+    this.ensureReady();
+    const listing = room?.listing;
+    const roomId = listing?.room_id;
+    if (!isProtocolId(roomId) || utf8Bytes(roomId) > 256) throw new StoreError("invalid_params", "A restored room needs a valid room_id");
+    if (records.length > RESTORE_RECORDS_BATCH) throw new StoreError("invalid_params", `At most ${RESTORE_RECORDS_BATCH} records are restored a call`);
+    const batch = records.map((record) => restoredRecord(roomId, record)).sort((a, b) => a.log_id - b.log_id);
+    if (batch.some((record, index) => index > 0 && record.log_id === batch[index - 1].log_id)) throw new StoreError("invalid_params", "Two restored records share a log_id");
+    if (batch.reduce((sum, record) => sum + restoredEntries(record), 0) > RESTORE_ENTRIES_BATCH) {
+      throw new StoreError("invalid_params", `A call restores at most ${RESTORE_ENTRIES_BATCH} reaction sets and members`);
+    }
+    const listingLog = restoredLogId(listing.log_id);
+    const listingLatest = restoredLogId(listing.latest_log_id);
+    const listingHistory = restoredLogId(listing.history_log_id);
+    const listingParent = typeof listing.parent_room_id === "string" ? listing.parent_room_id : undefined;
+    // First the reads: the floors, which records are stored already, and,
+    // when new ones are older than the room's newest, the stored ones after
+    // them, from which their state is replayed.
+    const probe = this.reserved({ reads: 48 + 4 * batch.length + 2 * (RESTORE_REPLAY_CAP + 1) }, true, now, () => {
+      const state = this.logState();
+      const through = this.config.tiered ? this.metaNumber(META_HISTORY_THROUGH) : 0;
+      const below = batch.find((record) => record.log_id < state.history_floor || record.log_id <= through);
+      if (below) {
+        throw new StoreError("invalid_params", `Record ${below.log_id} is older than this server's hot history (from ${Math.max(state.history_floor, through + 1)}): it belongs in a tier below`.slice(0, 200));
+      }
+      const stored = new Set(batch.length ? this.rawRows<{ log_id: number }>(
+        "SELECT log_id FROM records WHERE room_id = ? AND log_id IN (SELECT value FROM json_each(?))", roomId, JSON.stringify(batch.map((record) => record.log_id)),
+      ).map((row) => integerColumn(row.log_id)) : []);
+      const fresh = batch.filter((record) => !stored.has(record.log_id));
+      const newest = integerColumn(this.rawRows<{ log_id: number }>("SELECT log_id FROM records WHERE room_id = ? ORDER BY log_id DESC LIMIT 1", roomId)[0]?.log_id);
+      if (!fresh.length || fresh[0].log_id > newest) return { fresh, replay: [] as RestoredRecord[] };
+      const rows = this.rawRows<ChatRecord>(
+        "SELECT room_id, log_id, commit_ms, kind, record_json FROM records WHERE room_id = ? AND log_id > ? ORDER BY log_id LIMIT ?",
+        roomId, fresh[0].log_id, RESTORE_REPLAY_CAP + 1,
+      );
+      if (rows.length > RESTORE_REPLAY_CAP) throw new StoreError("invalid_params", "Too many of the room's records are newer than these: restore a room's records oldest first");
+      const replay = rows.map((row) => ({
+        log_id: integerColumn(row.log_id), commit_ms: integerColumn(row.commit_ms), kind: row.kind as RecordKind, record_json: row.record_json,
+        value: parseJson<Record<string, unknown>>(row.record_json, {}),
+      }));
+      return { fresh, replay };
+    });
+    const { fresh } = probe;
+    const derived = restoredState([...fresh, ...probe.replay]);
+    const isPrivate = isPrivateRoomId(roomId);
+    // The users the new records name, whose retired markers they raise (noteRetiredRelog).
+    const named = new Set<string>();
+    for (const record of fresh) {
+      const value = record.value;
+      if (record.kind === "message") named.add((value.from as Identity).user_id);
+      for (const set of record.kind === "reactions" ? value.reactions as Array<{ from: Identity }> : []) named.add(set.from.user_id);
+      for (const member of record.kind === "membership" ? value.members as Array<{ user: Identity }> : []) named.add(member.user.user_id);
+    }
+    const keys = derived.messages.size + derived.reactions.size + derived.members.size;
+    // The room row, its parent, the caps and the rooms' fields total; per
+    // record its row and index entry; per message, reaction set and member
+    // its state row read and written (a member's identity too, and for a
+    // private room their private rooms); and the log head.
+    const cost = {
+      reads: 128 + ROOM_FIELDS_TOTAL_READS + MAX_CREATED_ROOMS + 4 * fresh.length + 8 * keys + 4 * named.size +
+        (isPrivate ? derived.members.size * this.userRoomsReads() : 0),
+      writes: 64 + 6 * fresh.length + 8 * keys + 2 * named.size,
+    };
+    if (fresh.length) this.ensureGrowthCapacity(2 * fresh.reduce((sum, record) => sum + utf8Bytes(record.record_json), 0) + 1_024);
+    return this.reserved(cost, true, now, () => this.transaction(() => {
+      const effective = this.effectiveNow(now);
+      const latestRoom = derived.room;
+      let row = this.roomRow(roomId);
+      const created = row === null;
+      if (!row) {
+        const parentRoomId = listingParent ?? (typeof latestRoom?.value.parent_room_id === "string" ? latestRoom.value.parent_room_id : null);
+        const known = [listingLog, listingHistory, batch[0]?.log_id].filter((logId): logId is number => logId !== undefined);
+        if (!known.length) throw new StoreError("invalid_params", "A restored room needs records or its listing's log_id");
+        const createdLogId = Math.min(...known);
+        const recordLogId = Math.max(createdLogId, listingLog ?? 0, latestRoom?.log_id ?? 0);
+        const fields = latestRoom && latestRoom.log_id >= (listingLog ?? 0) ? restoredRoomFields(latestRoom.value) : restoredRoomFields(listing);
+        if (isPrivate) {
+          if (parentRoomId !== null) throw new StoreError("invalid_params", "A private room cannot be a thread on this server");
+          if (this.config.maxPrivateRooms === 0) throw new StoreError("unsupported", "Private rooms are not supported on this server");
+          if (this.metaNumber("private_count") >= this.config.maxPrivateRooms) throw new StoreError("denied", "This server holds as many private rooms as it can");
+        } else {
+          if (parentRoomId !== null) {
+            const parent = this.roomRow(parentRoomId);
+            if (!parent || parent.parent_room_id !== null || isPrivateRoomId(parent.room_id)) {
+              throw new StoreError("invalid_params", `A thread's parent must be a public top-level room here: restore ${parentRoomId} first`.slice(0, 200));
+            }
+          } else if (this.rawRows(`SELECT room_id FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IS NULL LIMIT ?`, MAX_CREATED_ROOMS + 1).length > MAX_CREATED_ROOMS) {
+            throw new StoreError("denied", "room_limit");
+          }
+          if (this.metaNumber("thread_count") >= this.config.maxThreads) throw new StoreError("denied", "thread_limit");
+        }
+        this.checkRoomFields(fields);
+        this.checkRoomFieldsTotal(fields);
+        const createdMs = batch.length ? Math.min(...batch.map((record) => record.commit_ms)) : effective;
+        row = {
+          room_id: roomId, parent_room_id: parentRoomId, created_log_id: createdLogId, record_log_id: recordLogId, latest_log_id: recordLogId,
+          fields_json: JSON.stringify(fields), created_ms: createdMs, updated_ms: effective, member_count: 0,
+        };
+        this.rawExec(
+          `INSERT INTO rooms (${ROOM_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+          row.room_id, row.parent_room_id, row.created_log_id, row.record_log_id, row.latest_log_id, row.fields_json, row.created_ms, row.updated_ms,
+        );
+        this.adjustCount(isPrivate ? "private_count" : "thread_count", 1);
+      } else {
+        if (listingParent !== undefined && listingParent !== row.parent_room_id) throw new StoreError("invalid_params", `The room ${roomId} here has another parent`.slice(0, 200));
+        if (latestRoom && latestRoom.log_id >= row.record_log_id) {
+          const fields = restoredRoomFields(latestRoom.value);
+          this.checkRoomFields(fields);
+          // The client fields are replaced; a creator kept beside them stays.
+          const creator = storedCreator(row.fields_json);
+          row = { ...row, record_log_id: latestRoom.log_id, fields_json: JSON.stringify(creator === undefined ? fields : { ...fields, creator_id: creator }) };
+        }
+      }
+      for (const record of fresh) {
+        this.rawExec(
+          "INSERT OR IGNORE INTO records (room_id, log_id, commit_ms, kind, record_json) VALUES (?, ?, ?, ?, ?)",
+          roomId, record.log_id, record.commit_ms, record.kind, record.record_json,
+        );
+      }
+      // Messages: the latest snapshot, unless the state row is newer or another message's.
+      const collided = new Set<string>();
+      for (const [messageId, record] of derived.messages) {
+        const snapshot = record.value as unknown as MessageSnapshot;
+        const target = typeof snapshot.room_id === "string" ? snapshot.room_id : roomId;
+        const existing = this.rawRows<{ room_id: string; latest_log_id: number; author_id: string }>(
+          "SELECT room_id, latest_log_id, author_id FROM message_state WHERE message_id = ? LIMIT 1", messageId,
+        )[0];
+        if (existing) {
+          // A move's copy names the rooms on both sides; any other room or author is another message.
+          if (existing.author_id !== snapshot.from.user_id || ![roomId, target, snapshot.prev_room_id].includes(existing.room_id)) {
+            collided.add(messageId);
+            continue;
+          }
+          if (integerColumn(existing.latest_log_id) >= record.log_id) continue;
+        }
+        this.rawExec(
+          `INSERT INTO message_state (message_id, room_id, latest_log_id, author_id) VALUES (?, ?, ?, ?)
+           ON CONFLICT (message_id) DO UPDATE SET room_id = excluded.room_id, latest_log_id = excluded.latest_log_id`,
+          messageId, target, record.log_id, snapshot.from.user_id,
+        );
+      }
+      // Reaction sets: the latest of each user on each message, unless the state row is newer.
+      for (const set of derived.reactions.values()) {
+        if (collided.has(set.messageId)) continue;
+        const existing = this.rawRows<{ log_id: number }>(
+          "SELECT log_id FROM reaction_state WHERE message_id = ? AND user_id = ? LIMIT 1", set.messageId, set.userId,
+        )[0];
+        const storedLogId = existing ? integerColumn(existing.log_id) : undefined;
+        if (set.emojis.length) {
+          if (storedLogId !== undefined && storedLogId > set.logId) continue;
+          this.rawExec(
+            `INSERT INTO reaction_state (message_id, user_id, log_id, from_json, emojis_json) VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT (message_id, user_id) DO UPDATE SET
+               log_id = excluded.log_id, from_json = excluded.from_json, emojis_json = excluded.emojis_json`,
+            set.messageId, set.userId, set.logId, JSON.stringify(set.from), JSON.stringify(set.emojis),
+          );
+        } else if (storedLogId !== undefined && storedLogId < set.logId) {
+          this.rawExec("DELETE FROM reaction_state WHERE message_id = ? AND user_id = ?", set.messageId, set.userId);
+        }
+      }
+      // Memberships: each user's latest change, joins only for identities here.
+      let members = 0;
+      for (const [userId, joined] of derived.members) {
+        const member = this.rawRows("SELECT 1 FROM memberships WHERE room_id = ? AND user_id = ? LIMIT 1", roomId, userId).length > 0;
+        if (joined && !member) {
+          if (!this.identityRow(userId)) continue;
+          if (isPrivate && this.privateMembershipCount(userId) >= this.config.maxPrivateMembershipsPerUser) continue;
+          this.rawExec("INSERT INTO memberships (room_id, user_id) VALUES (?, ?)", roomId, userId);
+          members += 1;
+        } else if (!joined && member) {
+          this.rawExec("DELETE FROM memberships WHERE room_id = ? AND user_id = ?", roomId, userId);
+          this.rawExec("DELETE FROM read_cursors WHERE user_id = ? AND room_id = ?", userId, roomId);
+          members -= 1;
+        }
+      }
+      const newest = fresh.length ? fresh[fresh.length - 1].log_id : 0;
+      const latest = Math.max(row.latest_log_id, newest, listingLatest ?? 0);
+      const createdLogId = fresh.length ? Math.min(row.created_log_id, fresh[0].log_id) : row.created_log_id;
+      this.rawExec(
+        "UPDATE rooms SET created_log_id = ?, record_log_id = ?, latest_log_id = MAX(latest_log_id, ?), fields_json = ?, member_count = MAX(0, member_count + ?), updated_ms = ? WHERE room_id = ?",
+        createdLogId, row.record_log_id, latest, row.fields_json, members, effective, roomId,
+      );
+      if (fresh.length) this.noteRetiredRelog([...named], newest);
+      // The log head: later commits take greater log IDs than any restored.
+      const state = this.logState();
+      const commitMs = fresh.reduce((max, record) => Math.max(max, record.commit_ms), 0);
+      if (latest > state.last_log_id || commitMs > state.last_commit_ms) {
+        this.rawExec("UPDATE log_state SET last_log_id = MAX(last_log_id, ?), last_commit_ms = MAX(last_commit_ms, ?) WHERE id = 1", latest, commitMs);
+        this.logCache = { ...state, last_log_id: Math.max(state.last_log_id, latest), last_commit_ms: Math.max(state.last_commit_ms, commitMs) };
+      }
+      return { created, stored: fresh.length };
+    }));
+  }
+
+  /**
+   * A blob tier's segment index (PLAN §9), in this SQLite: one table a tier,
+   * `history_segments_<tier>` (characters other than [a-z0-9_] made `_`),
+   * created on first use, and one instance a tier name. Each statement is
+   * charged to maintenance: a read at most SEGMENT_INDEX_READS rows (a
+   * tier's retention keeps its segments well under that), a write one
+   * segment's row and index entry, and clearing the table its every row,
+   * counted first.
+   */
+  segmentIndex(tier: string): SqlSegmentIndex {
+    const cached = this.segmentIndexes.get(tier);
+    if (cached) return cached;
+    const table = `history_segments_${tier.replace(/[^a-z0-9_]/g, "_")}`;
+    let ready = false;
+    const prepare = () => {
+      this.ensureReady();
+      if (ready) return;
+      ready = true;
+      try {
+        index.ensureSchema();
+      } catch (error) {
+        ready = false;
+        throw error;
+      }
+    };
+    const port: SqlPort = {
+      rows: <T>(query: string, ...binds: unknown[]): T[] => {
+        prepare();
+        return this.reserved({ reads: 24 + SEGMENT_INDEX_READS }, true, this.clock.now(), () => this.rawRows<T>(query, ...binds));
+      },
+      run: (query: string, ...binds: unknown[]): void => {
+        prepare();
+        const now = this.clock.now();
+        // Clearing the table (SqlSegmentIndex.clear) deletes every row: counted first, and charged by it.
+        const rows = /^\s*DELETE FROM \w+\s*$/i.test(query)
+          ? this.reserved({ reads: 24 + SEGMENT_INDEX_READS }, true, now, () => integerColumn(this.rawRows<{ count: number }>(`SELECT COUNT(*) AS count FROM ${table}`)[0]?.count))
+          : 0;
+        this.reserved({ reads: 64 + 2 * rows, writes: 64 + 4 * rows }, true, now, () => {
+          this.rawExec(query, ...binds);
+        });
+      },
+    };
+    const index = new SqlSegmentIndex(port, { table });
+    this.segmentIndexes.set(tier, index);
+    return index;
+  }
+
+  /** A backup schedule's number in `_meta` (a key under `history:export:`), 0 when absent. */
+  historyMetaNumber(key: string, now = this.clock.now()): number {
+    this.ensureReady();
+    if (!key.startsWith(META_HISTORY_EXPORT)) throw new Error(`not a history export key: ${key}`);
+    return this.reserved({ reads: 4 }, true, now, () => this.metaNumber(key));
+  }
+
+  /** Writes a backup schedule's value in `_meta` (a key under `history:export:`), or removes it for null. */
+  setHistoryMeta(key: string, value: string | null, now = this.clock.now()): void {
+    this.ensureReady();
+    if (!key.startsWith(META_HISTORY_EXPORT)) throw new Error(`not a history export key: ${key}`);
+    this.reserved({ reads: 4, writes: 4 }, true, now, () => this.writeMeta(key, value));
   }
 
   /**
@@ -8828,7 +9352,10 @@ export class Store {
         published = floor;
         // Tiers turned off forget their floors, queue and state: turned on
         // again, they start at the hot floor, and what they held below is trimmed.
-        const stale = this.rawRows<{ key: string }>("SELECT key FROM _meta WHERE key >= 'history:' AND key < 'history;' LIMIT 64");
+        // Backups' schedule (`history:export:`, setHistoryMeta) is no tier's state, and stays.
+        const stale = this.rawRows<{ key: string }>(
+          `SELECT key FROM _meta WHERE key >= 'history:' AND key < 'history;' AND NOT (key >= '${META_HISTORY_EXPORT}' AND key < '${META_HISTORY_EXPORT.slice(0, -1)};') LIMIT 64`,
+        );
         for (const row of stale) this.writeMeta(row.key, null);
         this.publishedCache = undefined;
       }
