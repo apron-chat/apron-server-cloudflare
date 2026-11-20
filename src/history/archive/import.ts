@@ -149,6 +149,8 @@ function importTarget(chain: HistoryChain, restore: RestorePort): ImportTarget {
 		normalize: (record) => restore.normalize(record),
 		// Placeholders count against the server's accounts (registeredIdentityCount).
 		accounts: () => restore.accounts(),
+		// New rooms count against the server's caps on rooms, as restoreRoom checks them.
+		roomCapacity: (rooms) => restore.roomCapacity(rooms),
 	};
 }
 

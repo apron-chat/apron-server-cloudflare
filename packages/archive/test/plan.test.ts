@@ -184,6 +184,21 @@ describe("planImport", () => {
 		expect(resumed.report.refused).toBeUndefined();
 	});
 
+	it("asks the target about the rooms it would create, not those it skips or fills, and refuses past its caps", async () => {
+		const input = archive([message(10, "a", "ada"), message(11, "b", "ada"), message(12, "general", "ada")], [room("a"), room("b", { parent_room_id: "a" }), room("general")]);
+		const asked: string[][] = [];
+		const target = { ...memoryTarget({ rooms: ["general"] }), roomIsEmpty: async (roomId: string) => roomId === "general" };
+		const checked = { ...target, roomCapacity: async (rooms: readonly { room_id: string }[]) => { asked.push(rooms.map((each) => each.room_id)); return rooms.length > 1 ? "room for 1 more room" : undefined; } };
+		const refused = await planImport(input, checked, options());
+		// general is filled, not created: only a and its thread b are asked about.
+		expect(asked).toEqual([["a", "b"]]);
+		expect(refused.report.refused).toBe("room for 1 more room");
+		// A resumed plan created its rooms already: not asked again.
+		const resumed = await planImport(input, checked, options({ resume: (await planImport(input, target, options())).state }));
+		expect(resumed.report.refused).toBeUndefined();
+		expect(asked).toHaveLength(1);
+	});
+
 	it("journals users that stay themselves compactly, and reads the journal back as the plan's state", async () => {
 		const users = Array.from({ length: 50 }, (_, index) => `user${index}`);
 		const input = archive(users.map((user, index) => message(10 + index, "a", user)), [room("a")]);

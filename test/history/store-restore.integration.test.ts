@@ -590,3 +590,29 @@ it("joins a new room's listed members with no membership record, within its acco
 		expect(overruns).toEqual([]);
 	});
 });
+
+it("refuses an import past the server's caps on rooms in its dry run, before any write; one that fits imports", async () => {
+	await withStore("restore-room-caps", { ...CONFIG, maxThreads: 6 }, async (store, clock, state) => {
+		const base = clock.value - 60_000;
+		const archiveOf = (rooms: number) => writeArchiveToString(async (writer) => {
+			await writer.header({ apron_archive: 1, server: "wss://elsewhere.test/" });
+			await writer.listing({ not_joined: Array.from({ length: rooms }, (_, at) => ({ room_id: `room-${at}`, log_id: String(base + at * 10), latest_log_id: String(base + at * 10 + 1) })) });
+			await writer.records(Array.from({ length: rooms }, (_, at) => messageRecord(`room-${at}`, base + at * 10 + 1, { from: { user_id: "ada" } })));
+		});
+		const chain = archiveChain(undefined, { store, limits: LIMITS, clock: clock.clock });
+		const before = state.storage.sql.exec<{ value: string }>("SELECT value FROM _meta WHERE key = 'thread_count'").toArray().map((row) => Number(row.value))[0] ?? 0;
+		const rooms = () => state.storage.sql.exec<{ c: number }>("SELECT COUNT(*) AS c FROM rooms").toArray()[0].c;
+		const roomsBefore = rooms();
+		// More public rooms than maxThreads leaves room for: refused by the plan, dry run or not, nothing written.
+		const tooMany = 6 - before + 1;
+		const dry = await importArchive(chain, storeRestore(store), jsonlReader(linesOf(await archiveOf(tooMany))), { clock: clock.clock, dryRun: true });
+		expect(dry.refused).toMatch(/thread_limit/);
+		await expect(importArchive(chain, storeRestore(store), jsonlReader(linesOf(await archiveOf(tooMany))), { clock: clock.clock })).rejects.toThrow(/thread_limit/);
+		expect(rooms()).toBe(roomsBefore);
+		expect(store.historyImportJournal()).toBeUndefined();
+		// As many as fit: imported whole.
+		const fits = await importArchive(chain, storeRestore(store), jsonlReader(linesOf(await archiveOf(6 - before))), { clock: clock.clock });
+		expect(fits.refused).toBeUndefined();
+		expect(fits.roomsAdded).toHaveLength(6 - before);
+	});
+});

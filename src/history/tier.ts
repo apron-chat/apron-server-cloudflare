@@ -6,7 +6,7 @@
  * other: a link is the only thing that connects two.
  */
 
-import type { ArchivedRoom, ArchivedUser } from "@apron/archive";
+import type { ArchivedRoom, ArchivedUser, RoomListing } from "@apron/archive";
 import type { ChatRecord, HistoryQuery, KeptRewrite, QueuedRewrite, RecordRange, Retention, Rewrite, TierStats } from "./records";
 import type { Stall } from "./stall";
 
@@ -129,6 +129,8 @@ export interface RestorePort {
 	restoreUsers(users: readonly ArchivedUser[]): Promise<void>;
 	/** The accounts here, in use and at most (registeredIdentityCount): each placeholder takes one. */
 	accounts(): Promise<{ used: number; limit: number }>;
+	/** Why there is no room here for these new rooms (the caps restoreRoom checks), or undefined: asked before anything is written. */
+	roomCapacity(rooms: readonly RoomListing[]): Promise<string | undefined>;
 	/**
 	 * Adds a new room (listing and records at or above the head's floor) and
 	 * rebuilds its current state. `context.rooms` are the rooms this import

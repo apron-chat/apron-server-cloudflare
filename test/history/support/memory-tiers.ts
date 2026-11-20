@@ -5,7 +5,7 @@
  * as they do, with the same functions (records.ts).
  */
 
-import type { ArchivedRoom, ArchivedUser } from "@apron/archive";
+import type { ArchivedRoom, ArchivedUser, RoomListing } from "@apron/archive";
 import { type ChatRecord, type Clock, type HistoryQuery, type KeptRewrite, type QueuedRewrite, type RecordRange, type Retention, type Rewrite, type TierStats, authoredMessages, thresholdCount, byLog, limitByLogId, logIds, purgedRecord, renamedRecord, toRange } from "../../../src/history/records";
 import { NOT_STALLED } from "../../../src/history/stall";
 import type { Cell, ChainState, ChainStateStore, ExportPort, FloorContext, HistoryHead, HistoryTier, LinkState, RestorePort, RestoreResult, RewriteLog, TierFloor } from "../../../src/history/tier";
@@ -288,6 +288,14 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead, Restor
 
 	/** The most accounts this head holds (Store: registeredIdentityCount). */
 	accountLimit = 10_000;
+
+	/** The most rooms this head holds (Store: its caps on rooms, simplified to one count). */
+	roomLimit = Number.POSITIVE_INFINITY;
+
+	async roomCapacity(rooms: readonly RoomListing[]): Promise<string | undefined> {
+		const used = this.rooms_.size;
+		return used + rooms.length > this.roomLimit ? `this archive would add ${rooms.length} rooms, but there is room for ${Math.max(0, this.roomLimit - used)} more` : undefined;
+	}
 
 	async accounts(): Promise<{ used: number; limit: number }> {
 		return { used: this.people.size, limit: this.accountLimit };

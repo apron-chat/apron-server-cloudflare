@@ -28,7 +28,7 @@ import { keepAppend, keepLast, liveTextString, type LiveKind } from "./live-text
 import type { AccountUsageSnapshot } from "./account-usage";
 import type { ChatRecord, HistoryQuery, QueuedRewrite, Rewrite } from "./history/records";
 import { type ChainStatePort, MAX_KEPT_REWRITES } from "./history/state";
-import { type ArchivedRoom, type ArchivedUser, parseLogId, type ReplayedMembership, replayRecords, roomClientFields, type ValidRecord, validateRecord, withClientUsers } from "@apron/archive";
+import { type ArchivedRoom, type ArchivedUser, parseLogId, type ReplayedMembership, replayRecords, type RoomListing, roomClientFields, type ValidRecord, validateRecord, withClientUsers } from "@apron/archive";
 import { ADMIN_USER_ID, restorableUserId } from "./user-ids";
 import { MAX_TERMINAL_OUTPUT_JSON_BYTES, type TerminalOutputRef, outputRef } from "./content/output-ref";
 import type { ChunkIndex, ChunkRef } from "./history/cold/chunks";
@@ -5140,6 +5140,45 @@ export class Store {
   }
 
   /** The accounts in use and the most there may be (registeredIdentityCount): an import's placeholders must fit (restoreUsers). */
+  /**
+   * Import (planning): why there is no room here for these new rooms, or
+   * undefined. The same caps restoreRoom checks room by room, for all of
+   * them at once, so an import past one is refused before it writes: the
+   * private rooms (maxPrivateRooms), the public top-level rooms
+   * (MAX_CREATED_ROOMS), the public rooms in all (maxThreads), and a
+   * thread's parent, a public top-level room here or among them.
+   */
+  restoreRoomCapacity(listings: readonly RoomListing[], now = this.clock.now()): string | undefined {
+    this.ensureReady();
+    return this.reserved({ reads: 24 + MAX_CREATED_ROOMS + listings.length }, true, now, () => {
+      const privates = listings.filter((listing) => isPrivateRoomId(listing.room_id));
+      const publics = listings.filter((listing) => !isPrivateRoomId(listing.room_id));
+      const topLevel = publics.filter((listing) => typeof listing.parent_room_id !== "string");
+      if (privates.length) {
+        if (this.config.maxPrivateRooms === 0) return "this archive has private rooms, and private rooms are not supported on this server";
+        const used = this.metaNumber("private_count");
+        if (used + privates.length > this.config.maxPrivateRooms) return `this archive would add ${privates.length} private rooms, but there is room for ${Math.max(0, this.config.maxPrivateRooms - used)} more (${used} of ${this.config.maxPrivateRooms})`;
+      }
+      if (topLevel.length) {
+        const used = this.rawRows(`SELECT room_id FROM rooms WHERE ${PUBLIC_ROOMS} AND parent_room_id IS NULL LIMIT ?`, MAX_CREATED_ROOMS + 2).length;
+        // restoreRoom refuses a top-level room once more than MAX_CREATED_ROOMS are here before it.
+        if (used + topLevel.length - 1 > MAX_CREATED_ROOMS) return `this archive would add ${topLevel.length} top-level rooms, but there is room for ${Math.max(0, MAX_CREATED_ROOMS + 1 - used)} more (room_limit)`;
+      }
+      if (publics.length) {
+        const used = this.metaNumber("thread_count");
+        if (used + publics.length > this.config.maxThreads) return `this archive would add ${publics.length} public rooms and threads, but there is room for ${Math.max(0, this.config.maxThreads - used)} more (thread_limit, ${used} of ${this.config.maxThreads})`;
+      }
+      const newTop = new Set(topLevel.map((listing) => listing.room_id));
+      for (const listing of publics) {
+        const parent = listing.parent_room_id;
+        if (typeof parent !== "string" || newTop.has(parent)) continue;
+        const row = this.roomRow(parent);
+        if (!row || row.parent_room_id !== null || isPrivateRoomId(row.room_id)) return `thread ${listing.room_id}'s parent ${parent} is neither a public top-level room here nor in this archive`.slice(0, 200);
+      }
+      return undefined;
+    });
+  }
+
   accountCapacity(now = this.clock.now()): { used: number; limit: number } {
     this.ensureReady();
     return this.reserved({ reads: 8 }, true, now, () => ({ used: this.metaNumber("identity_count"), limit: this.config.registeredIdentityCount }));

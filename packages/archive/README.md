@@ -65,7 +65,9 @@ means; the server says what is true there (`ImportTarget`,
   free IDs, placeholders under `UserIdRules`), duplicates and collisions
   (looked up through the target, nudged to free log IDs), renumbering, and
   the remapped records and listings. Placeholders must fit the room the
-  target has for accounts, where it says (`ImportTarget.accounts`).
+  target has for accounts, where it says (`ImportTarget.accounts`), and
+  the rooms it would create must fit the target's caps on rooms
+  (`ImportTarget.roomCapacity`, given their listings).
   Returns a report and a `state` from which a retry makes the same plan
   (`resume`), kept as compact JSON (`importStateJson`, `parseImportState`).
 - `export.ts`: `exportArchive(source, writer, options)`, a history as one

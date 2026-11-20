@@ -14,7 +14,7 @@
  * The chain's state is state.ts over Store.historyStatePort().
  */
 
-import { type ArchivedRoom, type ArchivedUser, MAX_LISTING_MEMBERS } from "@apron/archive";
+import { type ArchivedRoom, type ArchivedUser, MAX_LISTING_MEMBERS, type RoomListing } from "@apron/archive";
 import { type ChatRecord, type HistoryQuery, type QueuedRewrite, type RecordRange, type TierStats, toRange } from "./records";
 import type { ExportPort, HistoryHead, RestoreContext, RestorePort, RestoreResult } from "./tier";
 
@@ -48,6 +48,7 @@ export interface RestoreStore {
 	readonly content: { record(record: ChatRecord): { ok: true; value: ChatRecord } | { ok: false } };
 	restoreUsers(users: readonly ArchivedUser[]): void;
 	accountCapacity(): { used: number; limit: number };
+	restoreRoomCapacity(rooms: readonly RoomListing[]): string | undefined;
 	restoreRoom(room: ArchivedRoom, records: readonly ChatRecord[], now?: number, options?: { rooms?: readonly string[] }): RestoreResult;
 	restoreMembers(roomId: string, changes: { join: readonly string[]; leave: readonly string[] }): { joined: number; left: number; skipped: number };
 	historyImportJournal(): string | undefined;
@@ -103,6 +104,7 @@ export function storeRestore(store: RestoreStore): RestorePort {
 		},
 		restoreUsers: async (users) => store.restoreUsers(users),
 		accounts: async () => store.accountCapacity(),
+		roomCapacity: async (rooms) => store.restoreRoomCapacity(rooms),
 		restoreRoom: async (room: ArchivedRoom, records: readonly ChatRecord[], context: RestoreContext) => store.restoreRoom(room, records, undefined, { rooms: context.rooms }),
 		restoreMembers: async (roomId, changes) => store.restoreMembers(roomId, changes),
 		journal: {

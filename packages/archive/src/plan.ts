@@ -45,6 +45,13 @@ export interface ImportTarget {
 	 * is room for is refused before anything is written.
 	 */
 	accounts?(): Promise<{ used: number; limit: number }>;
+	/**
+	 * Why the target has no room for these new rooms (its caps on rooms),
+	 * or undefined when it has: given the listings of the rooms the import
+	 * would create there (IDs as the target's), so an import past a cap is
+	 * refused before anything is written.
+	 */
+	roomCapacity?(rooms: readonly RoomListing[]): Promise<string | undefined>;
 }
 
 /** Which archive user IDs may stand at the target as themselves. */
@@ -401,6 +408,13 @@ export async function planImport(archive: CollectedArchive, target: ImportTarget
 	const parentOf = (roomId: string) => rooms.get(roomId)!.listing.parent_room_id;
 	const freshRooms = [...fresh].sort((a, b) => Number(typeof parentOf(a) === "string") - Number(typeof parentOf(b) === "string") || (a < b ? -1 : a > b ? 1 : 0));
 	report.roomsAdded = freshRooms.map((roomId) => map.roomId(roomId));
+	// The rooms it would create there (not those it fills) must fit the target's caps on rooms.
+	if (!resume && !report.refused && target.roomCapacity) {
+		const created: RoomListing[] = [];
+		for (const roomId of freshRooms) if (!(await target.hasRoom(roomId))) created.push(remapListing({ ...rooms.get(roomId)!.listing }, map));
+		const refused = created.length ? await target.roomCapacity(created) : undefined;
+		if (refused) report.refused = refused;
+	}
 
 	// Renumbered, a room's listing keeps no log ID of its own: its bounds are
 	// its records' new ones, and a room without records takes the next ID
