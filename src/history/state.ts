@@ -51,6 +51,14 @@ export const LINK_STATE_KEY = "history:link:";
  * than serve what it would change.
  */
 export const MAX_KEPT_GROUPS = 4_096;
+/**
+ * The most one group of kept rewrites holds, as stored (its JSON, one
+ * `_meta` value): a group that would pass it is closed, and the next
+ * rewrite starts another with the same `through`. Well under SQLite's
+ * value limit (2 MB), so a quiet tier, whose `through` seldom moves, never
+ * stores a value too large to keep.
+ */
+export const MAX_KEPT_GROUP_BYTES = 256 * 1024;
 /** A group of kept rewrites (KeptRewrite) of a tier that takes none: `history:kept:<tier>:<first seq, 16 digits>`. */
 export const KEPT_STATE_KEY = "history:kept:";
 

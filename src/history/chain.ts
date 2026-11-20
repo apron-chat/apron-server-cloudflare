@@ -19,7 +19,7 @@
 import { purgedRecord } from "@apron/archive";
 import { type ChainSnapshot, type ChainView, type ReadPart, type Step, type WorkStep, arrivedThrough, chainView, copyNow, mergePages, planRead, planStep } from "./link";
 import { type ChatRecord, type Clock, type HistoryQuery, type KeptRewrite, type QueuedRewrite, type Retention, type Rewrite, type TierStats, logIds, rewritten, toRange, withKept } from "./records";
-import { MAX_KEPT_GROUPS } from "./state";
+import { MAX_KEPT_GROUPS, MAX_KEPT_GROUP_BYTES } from "./state";
 import { type Stall, stallAlert, stallCleared, stallFailed } from "./stall";
 import { type ChainStateStore, type HistoryHead, type HistoryTier, type LinkState, TIER_METHODS, type TierFloor } from "./tier";
 
@@ -340,9 +340,10 @@ export class HistoryChain {
 				// Kept already (a retried delivery): nothing to do.
 				if (!kept.some((group) => group.first <= seq && seq <= group.seq)) {
 					const last = kept[kept.length - 1];
-					// Delivered while the tier holds what it held for the last group: that group grows.
-					if (last && last.through === through) {
-						await this.state.keep(tier.name, { ...last, seq, rewrites: [...last.rewrites, entry.rewrite] });
+					const grown = last && last.through === through ? { ...last, seq, rewrites: [...last.rewrites, entry.rewrite] } : undefined;
+					// Delivered while the tier holds what it held for the last group: that group grows, up to MAX_KEPT_GROUP_BYTES.
+					if (grown && new TextEncoder().encode(JSON.stringify(grown)).length <= MAX_KEPT_GROUP_BYTES) {
+						await this.state.keep(tier.name, grown);
 					} else {
 						if (kept.length >= MAX_KEPT_GROUPS) {
 							throw new Error(`${tier.name} keeps ${MAX_KEPT_GROUPS} groups of rewrites already: it must trim before it takes another /purge or /rename`);

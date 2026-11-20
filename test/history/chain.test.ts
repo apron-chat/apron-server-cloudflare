@@ -8,6 +8,7 @@ import { HISTORY_CODECS } from "../../src/history/config";
 import { MemoryChainStateStore, MemoryHead, MemoryHistoryTier } from "./support/memory-tiers";
 import { type ChainSnapshot, type ChainView, type TierView, checkInvariants, copyNow, mergePages, planRead, planStep } from "../../src/history/link";
 import { type ChainStage, HistoryChain, instrument } from "../../src/history/chain";
+import { MAX_KEPT_GROUP_BYTES } from "../../src/history/state";
 import type { ChatRecord, Retention } from "../../src/history/records";
 import { NOT_STALLED } from "../../src/history/stall";
 import type { LinkState } from "../../src/history/tier";
@@ -803,6 +804,35 @@ describe("model-based regressions", () => {
 		expect(served.some((record) => record.record_json.includes('"cy"'))).toBe(false);
 		expect(served.filter((record) => record.kind === "message")).toHaveLength(20);
 	});
+
+	// A group is bounded by its stored size (MAX_KEPT_GROUP_BYTES): on a quiet
+	// tier, whose `through` never moves, purges with long message lists start
+	// new groups with the same `through` instead of growing one value past
+	// what SQLite keeps, and delivery never stalls on it.
+	it("splits kept rewrites into groups of bounded size on a quiet cold tier", async () => {
+		const { clock, head, chain, state } = build(compositions[2]);
+		for (let index = 0; index < 30; index += 1) {
+			clock.time += 1;
+			head.commit("general", "message", { message_id: `m${index}`, from: { user_id: index % 3 ? "ada" : "cy" }, body: { text: `${index}` } });
+		}
+		await settle(chain);
+		// 300 purges, each with a list of 400 message IDs: about 6 MB as one group.
+		const messages = (index: number) => Array.from({ length: 400 }, (_, at) => `message-${index}-${at}-${"x".repeat(30)}`);
+		for (let index = 0; index < 300; index += 1) {
+			(head as unknown as { queue(rewrite: { user: string; into: null; messages: string[] }): void }).queue({ user: `gone${index}`, into: null, messages: messages(index) });
+			if (index % 50 === 49) await settle(chain);
+		}
+		await head.purge(["cy"]);
+		await settle(chain);
+		const kept = await state.kept("cold");
+		expect(kept.flatMap((group) => group.rewrites)).toHaveLength(301);
+		expect(kept.length).toBeGreaterThan(10);
+		for (const group of kept) expect(new TextEncoder().encode(JSON.stringify(group)).length).toBeLessThanOrEqual(MAX_KEPT_GROUP_BYTES);
+		expect(new Set(kept.map((group) => group.through)).size).toBe(1);
+		expect(await head.rewrites.list()).toEqual([]);
+		const served = await history(chain, "general", 5);
+		expect(served.some((record) => record.record_json.includes('"cy"'))).toBe(false);
+	}, 120_000);
 
 	// A kept rewrite reaches only what the cold tier held when it was
 	// delivered: it is forgotten once the tier's floor passes that, and a
