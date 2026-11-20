@@ -3,7 +3,7 @@
  * One state for each of the two questions the runtime used to answer with
  * loose fields:
  *
- * - What is running: nothing, a pipeline cycle, or a job (an export, an
+ * - What is running: nothing, a chain cycle, or a job (an export, an
  *   import, a scheduled backup), one at a time, plus any number of rewrites
  *   (`/purge`, `/rename`) at the head. Each is held by a lease that only
  *   `acquire` hands out, and only once: a holder releases it, and releasing
@@ -12,7 +12,7 @@
  *   and its copy marker). An import and a rewrite exclude each other: an
  *   import's later writes would put back what a purge removed, past the
  *   op the tiers below already applied.
- * - Whether a cycle is wanted: unknown after a wake (queued ops unread),
+ * - Whether a cycle is wanted: unknown after a wake (queued rewrites unread),
  *   idle, due (a cycle asked to go on, or an op was queued), or backing off
  *   after a failure until a time. A cycle that finds the lock held leaves
  *   itself due, and the lease's release says so, so the holder asks for it
@@ -115,7 +115,7 @@ export class HistorySchedule {
 
 	/**
 	 * Whether upkeep has work for an alarm: a cycle that is due or done
-	 * backing off, or, once a wake, queued ops (`hasOps`; a failure to read
+	 * backing off, or, once a wake, queued rewrites (`hasOps`; a failure to read
 	 * them counts as work).
 	 */
 	workDue(now: number, hasOps: () => boolean): boolean {

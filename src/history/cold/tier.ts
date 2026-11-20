@@ -15,15 +15,9 @@
  * - Retention and trimming: by whole chunks, by count, bytes and age (a
  *   chunk's time is its last log ID: log IDs are commit times). A floor that
  *   cuts a chunk (one set from above) rewrites it without what is below.
- * - /purge and /rename (applyOp): a sweep in log order over the chunks that
- *   can hold what they change, a few chunks a step, rewriting only those
- *   that change. The index names each chunk's users, so a rename visits
- *   only chunks naming its user, and a purge starts at the first chunk
- *   naming one of its users (or at the oldest, when the op names messages
- *   to drop reactions on: those can be anywhere). From there a purge reads
- *   every chunk, since reactions on its users' messages come later in the
- *   log; messages of theirs it finds are told to the pipeline before the
- *   chunk is rewritten.
+ * - /purge and /rename: not taken (no HistoryTier.rewrite). Chunks are
+ *   written once and only trimmed; its link acknowledges rewrites, so what
+ *   a chunk holds keeps what a /purge or /rename changed above it (chain.ts).
  *
  * It depends on nothing but its BlobStore, ChunkIndex, codec chain and
  * clock: what the codecs do to the bytes, and where the index is kept, are
@@ -31,15 +25,13 @@
  */
 
 import type { ArchiveCodec, ArchiveHeader } from "@apron/archive";
-import { type ChatRecord, type Clock, type HistoryOp, type HistoryQuery, type RecordRange, type Retention, type TierStats, authoredMessages, limitByLogId, purgedRecord, renamedRecord, thresholdCount, toRange } from "../records";
+import { type ChatRecord, type Clock, type HistoryQuery, type RecordRange, type Retention, type TierStats, limitByLogId, thresholdCount, toRange } from "../records";
 import type { BlobStore } from "../storage/store";
-import type { FloorContext, LowerTier, OpStep } from "../tier";
+import type { FloorContext, HistoryTier } from "../tier";
 import { type ChunkIndex, type ChunkRef, chunkKey, chunkRef, readChunk, uniqueRecords, writeChunk } from "./chunks";
 
 /** Log IDs a chunk holds, as a copy brings them (appendBatch). */
 const CHUNK_LOG_IDS = 10_000;
-/** Chunks one step of a /purge or /rename reads at most. */
-const OP_CHUNKS = 4;
 /** Decoded chunks kept in memory. */
 const CACHED_CHUNKS = 2;
 
@@ -56,13 +48,11 @@ export interface ColdTierOptions {
 	header?: Partial<ArchiveHeader>;
 	/** Log IDs a chunk holds (default 10,000). */
 	chunkLogIds?: number;
-	/** Chunks one /purge or /rename step reads at most (default 4). */
-	opChunks?: number;
 	/** Decoded chunks kept in memory (default 2; 0 for none). */
 	cachedChunks?: number;
 }
 
-export class ColdHistoryTier implements LowerTier {
+export class ColdHistoryTier implements HistoryTier {
 	readonly name: string;
 	readonly appendBatch: number;
 	private readonly store: BlobStore;
@@ -71,7 +61,6 @@ export class ColdHistoryTier implements LowerTier {
 	private readonly prefix: string;
 	private readonly clock: Clock;
 	private readonly header: Partial<ArchiveHeader>;
-	private readonly opChunks: number;
 	private readonly cacheSize: number;
 	/** Decoded chunks by key, least recently used first. */
 	private readonly cache = new Map<string, ChatRecord[]>();
@@ -85,7 +74,6 @@ export class ColdHistoryTier implements LowerTier {
 		this.clock = options.clock;
 		this.header = options.header ?? {};
 		this.appendBatch = options.chunkLogIds ?? CHUNK_LOG_IDS;
-		this.opChunks = options.opChunks ?? OP_CHUNKS;
 		this.cacheSize = options.cachedChunks ?? CACHED_CHUNKS;
 	}
 
@@ -119,7 +107,7 @@ export class ColdHistoryTier implements LowerTier {
 		return chunkRef(key, records, bounds, bytes);
 	}
 
-	/** Drops chunks from the store, then from the index (a crash between leaves entries only a retried trim or sweep visits again). */
+	/** Drops chunks from the store, then from the index (a crash between leaves entries only a retried trim visits again). */
 	private async discard(refs: readonly ChunkRef[]): Promise<void> {
 		if (!refs.length) return;
 		for (const ref of refs) this.cache.delete(ref.key);
@@ -263,64 +251,5 @@ export class ColdHistoryTier implements LowerTier {
 			await this.index.update({ put: [cut], remove: [ref.first] });
 		}
 		return removed;
-	}
-
-	/**
-	 * A bounded step of /purge or /rename (see the top of the file): up to
-	 * `opChunks` chunks, from `step.cursor` (a log ID) on. Returns the log
-	 * ID to go on from, or undefined once no chunk is left.
-	 */
-	async applyOp(op: HistoryOp, step: OpStep): Promise<string | undefined> {
-		const all = await this.chunks();
-		let from = step.cursor !== undefined ? Number(step.cursor) : undefined;
-		if (from === undefined) {
-			const users = op.op === "purge" ? op.userIds : [op.from];
-			const start = op.op === "purge" && op.messageIds.length ? all[0] : all.find((ref) => ref.users.some((user) => users.includes(user)));
-			if (!start) return undefined;
-			from = start.first;
-		}
-		const ahead = all.filter((ref) => ref.last >= from!);
-		const visit = op.op === "rename" ? ahead.filter((ref) => ref.users.includes(op.from)) : ahead;
-		const messages = new Set(op.op === "purge" ? op.messageIds : []);
-		for (const ref of visit.slice(0, this.opChunks)) {
-			const records = await this.load(ref);
-			let rewritten: ChatRecord[];
-			if (op.op === "purge") {
-				const fresh = authoredMessages(records, op.userIds).filter((id) => !messages.has(id));
-				if (fresh.length) {
-					await step.found(fresh);
-					for (const id of fresh) messages.add(id);
-				}
-				rewritten = records.flatMap((record) => {
-					const json = purgedRecord(record, op.userIds, [...messages]);
-					return json === null ? [] : [json === record.record_json ? record : { ...record, record_json: json }];
-				});
-			} else {
-				rewritten = records.map((record) => {
-					const json = renamedRecord(record, op.from, op.to);
-					return json === record.record_json ? record : { ...record, record_json: json };
-				});
-			}
-			await this.rewrite(ref, records, rewritten);
-		}
-		const next = visit[this.opChunks];
-		return next ? String(Math.max(next.first, from)) : undefined;
-	}
-
-	/** Puts a chunk's rewritten records in place of `records` (dropping it when none is left), and its listing to match. */
-	private async rewrite(ref: ChunkRef, records: readonly ChatRecord[], rewritten: readonly ChatRecord[]): Promise<void> {
-		if (!rewritten.length) {
-			await this.discard([ref]);
-			return;
-		}
-		const changed = rewritten.length !== records.length || rewritten.some((record, index) => record !== records[index]);
-		if (changed) {
-			const updated = await this.write(ref.key, rewritten, ref);
-			await this.index.update({ put: [updated] });
-			return;
-		}
-		// Unchanged, but listed as before a rewrite a crash cut short: listed as it is.
-		const listed = chunkRef(ref.key, records, ref, ref.bytes);
-		if (listed.records !== ref.records || listed.rooms.join() !== ref.rooms.join() || listed.users.join() !== ref.users.join()) await this.index.update({ put: [listed] });
 	}
 }

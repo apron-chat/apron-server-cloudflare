@@ -1,25 +1,28 @@
 /*
- * Tier state kept for the pipeline (TierStateStore), over a small port of
- * the head's storage: plain values by key, and the few numbers the head
- * owns. The rules are here, not in the Store:
+ * The chain's state (ChainStateStore), over a small port of the head's
+ * storage: plain values by key, and the few numbers the head owns. The
+ * rules are here, not in the Store:
  *
- * - The head's floor is its hot floor, and it applies no ops. Its `through`
- *   is the copy marker the head's cleanup stops at (the port's, never
- *   lowered); its target is kept in memory, as the head's cleanup finds it
- *   again after a wake; its stall is a value of its own.
- * - A lower tier with no state yet starts at the published floor, holding
- *   nothing, with every op so far behind it.
+ * - A tier's state is its floor and target. The head's floor is its hot
+ *   floor (its own cleanup moves it); its target is kept in memory, as the
+ *   head's cleanup finds it again after a wake. A lower tier with no state
+ *   yet starts at the published floor, holding nothing.
+ * - A link's state is what it holds of the tier above, what it delivered
+ *   below, and its stall. The head's link holds through the copy marker,
+ *   which the head's cleanup stops at (the port's, never lowered). A link
+ *   with no state yet holds nothing and has delivered nothing: it delivers
+ *   what the head's log still has, which costs nothing on an empty tier.
  *
- * Persisted as JSON under `history:tier:<name>` (a lower tier) and
- * `history:head:stall`, a stall as its fields (stall.ts).
+ * Persisted as JSON under `history:tier:<name>` and `history:link:<from>`
+ * (a stall as its fields, stall.ts).
  */
 
-import { type Stall, type StallFields, stallFromFields, stallToFields } from "./stall";
-import type { HeadStateUpdate, LowerStateUpdate, TierState, TierStateStore } from "./tier";
+import { type StallFields, stallFromFields, stallToFields } from "./stall";
+import type { ChainStateStore, LinkState, TierFloor } from "./tier";
 
-/** What tier state needs of the head's storage. */
-export interface TierStatePort {
-	/** A stored value by key (`history:tier:…`, `history:head:stall`), or undefined. */
+/** What the chain's state needs of the head's storage. */
+export interface ChainStatePort {
+	/** A stored value by key (`history:tier:…`, `history:link:…`), or undefined. */
 	value(key: string): string | undefined;
 	/** Writes a value, or removes it for null. */
 	setValue(key: string, value: string | null): void;
@@ -27,8 +30,6 @@ export interface TierStatePort {
 	hotFloor(): number;
 	/** Where history starts (HistoryHead.publishedFloor). */
 	publishedFloor(): number;
-	/** The newest op queued so far (its seq), 0 for none. */
-	opsSeq(): number;
 	/** The head's copy marker: the newest log ID the next tier holds, 0 for none. */
 	copyMarker(): number;
 	/** Raises the copy marker (never lowers it). */
@@ -36,15 +37,11 @@ export interface TierStatePort {
 }
 
 export const TIER_STATE_KEY = "history:tier:";
-export const HEAD_STALL_KEY = "history:head:stall";
+export const LINK_STATE_KEY = "history:link:";
 
-/** A lower tier's state as stored. */
-interface StoredLower extends StallFields {
-	floor: number;
-	target: number;
-	through: number;
-	ops: number;
-	opCursor?: string;
+interface StoredLink extends StallFields {
+	through?: number;
+	delivered: number;
 }
 
 function parse<T>(text: string | undefined): T | undefined {
@@ -56,55 +53,57 @@ function parse<T>(text: string | undefined): T | undefined {
 	}
 }
 
-/** Tier state over `port`, the head being `head`. */
-export function tierStateStore(port: TierStatePort, head: string): TierStateStore {
+/** The chain's state over `port`, the head being `head`. */
+export function chainStateStore(port: ChainStatePort, head: string): ChainStateStore {
 	let headTarget = 0;
-	const fresh = (): StoredLower => {
+	const tier = (name: string): TierFloor => {
+		if (name === head) {
+			const floor = port.hotFloor();
+			return { floor, target: Math.max(floor, headTarget) };
+		}
+		const saved = parse<Partial<TierFloor>>(port.value(TIER_STATE_KEY + name));
 		const published = port.publishedFloor();
-		return { floor: published, target: published, through: published - 1, ops: port.opsSeq() };
+		return typeof saved?.floor === "number" ? { floor: saved.floor, target: saved.target ?? saved.floor } : { floor: published, target: published };
 	};
-	const lower = (name: string): StoredLower => {
-		const saved = parse<Partial<StoredLower>>(port.value(TIER_STATE_KEY + name));
-		return saved && typeof saved.floor === "number" && typeof saved.through === "number" ? { ...fresh(), ...saved } : fresh();
+	const storedLink = (from: string): StoredLink | undefined => {
+		const saved = parse<StoredLink>(port.value(LINK_STATE_KEY + from));
+		return typeof saved?.delivered === "number" ? saved : undefined;
 	};
-	const headStall = (): Stall => stallFromFields(parse<StallFields>(port.value(HEAD_STALL_KEY)));
-	const writeHeadStall = (stall: Stall) => {
-		const fields = stallToFields(stall);
-		port.setValue(HEAD_STALL_KEY, Object.keys(fields).length ? JSON.stringify(fields) : null);
+	const link = (from: string): LinkState => {
+		const saved = storedLink(from);
+		const marker = from === head ? port.copyMarker() : undefined;
+		const through = from === head ? (marker! > 0 ? marker! : port.hotFloor() - 1) : saved?.through ?? tier(from).floor - 1;
+		return { through, delivered: saved?.delivered ?? 0, stall: stallFromFields(saved) };
 	};
 	return {
 		async load(names) {
-			const out: Record<string, TierState> = {};
-			for (const name of names) {
-				if (name === head) {
-					const floor = port.hotFloor();
-					const through = port.copyMarker();
-					out[name] = { floor, target: Math.max(floor, headTarget), through: through > 0 ? through : floor - 1, ops: 0, stall: headStall() };
-					continue;
-				}
-				const { stalledSince, stalledOn, alertedAt, opCursor, ...rest } = lower(name);
-				out[name] = { ...rest, ...(opCursor !== undefined ? { opCursor } : {}), stall: stallFromFields({ stalledSince, stalledOn, alertedAt }) };
-			}
-			return out;
+			return { tiers: names.map(tier), links: names.slice(0, -1).map(link) };
 		},
-		async saveHead(update: HeadStateUpdate) {
-			// update.floor: the head's floor is its hot floor, which its own cleanup moves.
-			if (update.target !== undefined) headTarget = Math.max(headTarget, update.target);
-			if (update.through !== undefined && update.through > port.copyMarker()) port.raiseCopyMarker(update.through);
-			if (update.stall !== undefined) writeHeadStall(update.stall);
-		},
-		async saveLower(name: string, update: LowerStateUpdate) {
-			const { stall, opCursor, ...given } = update;
-			const numbers = Object.fromEntries(Object.entries(given).filter(([, value]) => value !== undefined));
-			const current = lower(name);
-			const { stalledSince: _since, stalledOn: _on, alertedAt: _at, opCursor: oldCursor, ...kept } = current;
-			const stallFields = stallToFields(stall ?? stallFromFields(current));
-			const cursor = opCursor === null ? undefined : opCursor ?? oldCursor;
-			const next: StoredLower = { ...kept, ...numbers, ...(cursor !== undefined ? { opCursor: cursor } : {}), ...stallFields };
-			port.setValue(TIER_STATE_KEY + name, JSON.stringify(next));
+		async loadLink(from) {
+			return link(from);
 		},
 		async has(name) {
 			return port.value(TIER_STATE_KEY + name) !== undefined;
+		},
+		async saveTier(name, update) {
+			if (name === head) {
+				// The head's floor is its hot floor, which its own cleanup moves.
+				if (update.target !== undefined) headTarget = Math.max(headTarget, update.target);
+				return;
+			}
+			const next = { ...tier(name), ...Object.fromEntries(Object.entries(update).filter(([, value]) => value !== undefined)) };
+			port.setValue(TIER_STATE_KEY + name, JSON.stringify(next));
+		},
+		async saveLink(from, update) {
+			const current = link(from);
+			if (from === head && update.through !== undefined && update.through > port.copyMarker()) port.raiseCopyMarker(update.through);
+			const stall = update.stall ?? current.stall;
+			const next: StoredLink = {
+				...(from === head ? {} : { through: update.through ?? current.through }),
+				delivered: update.delivered ?? current.delivered,
+				...stallToFields(stall),
+			};
+			port.setValue(LINK_STATE_KEY + from, JSON.stringify(next));
 		},
 	};
 }

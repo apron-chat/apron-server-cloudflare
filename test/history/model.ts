@@ -1,11 +1,11 @@
 /*
- * The reference model: one in-memory map of every record
- * committed, with /purge and /rename applied to all of it, against which a
- * real pipeline's reads are compared. The model runs that drive it are
- * fast-check command sequences (pipeline.test.ts).
+ * The reference model: one in-memory map of every record committed, with
+ * /purge and /rename applied as the chain applies them, against which a
+ * real chain's reads are compared. The model runs that drive it are
+ * fast-check command sequences (chain.test.ts).
  */
 
-import { type ChatRecord, type HistoryOp, applyOps, byLog } from "../../src/history/records";
+import { type ChatRecord, type Rewrite, byLog, rewritten } from "../../src/history/records";
 
 export class Model {
 	private records = new Map<string, ChatRecord>();
@@ -16,14 +16,18 @@ export class Model {
 	}
 
 	/**
-	 * /purge or /rename. A purge knows a message's author only from records
-	 * still held (from `floor` on), as the tiers do: a reaction can outlive
-	 * the message it is on, and stays when that message's sender is purged.
+	 * /purge or /rename, applied to the records still held (from `floor` on)
+	 * but those `kept`: a tier that takes no rewrites (the cold tier) keeps
+	 * what it holds as it was. A purge knows a message's author only from
+	 * the records it rewrites, as the tiers do: a reaction can outlive the
+	 * message it is on, and stays when that message's sender is purged.
 	 */
-	apply(op: HistoryOp, floor = 0): void {
-		const held = this.all().filter((record) => record.log_id >= floor);
-		const gone = this.all().filter((record) => record.log_id < floor);
-		const next = [...gone, ...applyOps(held, [op])];
+	apply(rewrite: Rewrite, options: { floor?: number; kept?: (record: ChatRecord) => boolean } = {}): void {
+		const floor = options.floor ?? 0;
+		const kept = options.kept ?? (() => false);
+		const reached = this.all().filter((record) => record.log_id >= floor && !kept(record));
+		const left = this.all().filter((record) => record.log_id < floor || kept(record));
+		const next = [...left, ...rewritten(reached, [rewrite])];
 		this.records = new Map(next.map((record) => [`${record.log_id}\u0000${record.room_id}`, record]));
 	}
 

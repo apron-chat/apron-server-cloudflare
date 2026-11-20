@@ -1,15 +1,15 @@
 /*
  * The D1 history tier (binding HISTORY_D1): records that left the head,
  * kept in the same shape (one row per room and log ID) until its own
- * retention lets them go. /purge and /rename reach it (applyOp), each in
+ * retention lets them go. It takes /purge and /rename (rewrite), each in
  * one step.
  *
  * Every write may be repeated without harm, so a failure is retried by a
  * later cycle.
  */
 
-import { type ChatRecord, type HistoryOp, type HistoryQuery, type RecordRange, type Retention, type TierStats, purgedRecord, renamedRecord, thresholdCount, toRange } from "./records";
-import type { FloorContext, LowerTier, OpStep } from "./tier";
+import { type ChatRecord, type HistoryQuery, type RecordRange, type Retention, type Rewrite, type TierStats, purgedRecord, renamedRecord, thresholdCount, toRange } from "./records";
+import type { FloorContext, HistoryTier } from "./tier";
 
 /** Statements one D1 batch carries at most. */
 const BATCH_STATEMENTS = 50;
@@ -24,7 +24,7 @@ interface Row {
 
 const toRecord = (row: Row): ChatRecord => ({ ...row, log_id: Number(row.log_id), commit_ms: Number(row.commit_ms) });
 
-export class D1HistoryTier implements LowerTier {
+export class D1HistoryTier implements HistoryTier {
 	private ready?: Promise<void>;
 
 	/** The table it keeps records in: one per tier sharing a database (the tests run several). */
@@ -182,10 +182,9 @@ export class D1HistoryTier implements LowerTier {
 	}
 
 	/** /purge and /rename, each in one step: a few statements over the whole table. */
-	async applyOp(op: HistoryOp, step: OpStep): Promise<undefined> {
-		if (op.op === "purge") await this.purge(op.userIds, op.messageIds, step);
-		else await this.rename(op.from, op.to);
-		return undefined;
+	async rewrite(rewrite: Rewrite, found: (messageIds: readonly string[]) => Promise<void>): Promise<void> {
+		if (rewrite.into === null) await this.purge([rewrite.user], rewrite.messages ?? [], found);
+		else await this.rename(rewrite.user, rewrite.into);
 	}
 
 	/**
@@ -194,9 +193,9 @@ export class D1HistoryTier implements LowerTier {
 	 * their current ones, and those whose snapshots are here), and their
 	 * reaction sets and memberships are taken out of the records listing
 	 * them, a record left empty going. The messages of theirs found here are
-	 * told (`step.found`) before anything is rewritten.
+	 * told (`found`) before anything is rewritten.
 	 */
-	private async purge(userIds: readonly string[], messageIds: readonly string[], step: OpStep): Promise<void> {
+	private async purge(userIds: readonly string[], messageIds: readonly string[], found: (messageIds: readonly string[]) => Promise<void>): Promise<void> {
 		await this.schema();
 		const ids = JSON.stringify(userIds);
 		const authored = await this.db.prepare(
@@ -205,7 +204,7 @@ export class D1HistoryTier implements LowerTier {
 		).bind(ids).all<{ message_id: string }>();
 		const mine = authored.results.map((row) => row.message_id);
 		// Told before anything is rewritten: the rewrite removes what found them.
-		await step.found(mine);
+		await found(mine);
 		const messages = [...new Set([...messageIds, ...mine])];
 		const listing = await this.db.prepare(
 			`SELECT room_id, log_id, kind, record_json FROM ${this.table} WHERE
@@ -214,7 +213,7 @@ export class D1HistoryTier implements LowerTier {
 			   OR (kind = 'membership' AND EXISTS (
 			     SELECT 1 FROM json_each(record_json, '$.members') WHERE json_extract(value, '$.user.user_id') IN (SELECT value FROM json_each(?1))))`,
 		).bind(ids, JSON.stringify(messages)).all<Row>();
-		const statements = listing.results.map((row) => this.rewrite(row, purgedRecord(row, userIds, messages)));
+		const statements = listing.results.map((row) => this.rewriteRow(row, purgedRecord(row, userIds, messages)));
 		statements.push(this.db.prepare(
 			`DELETE FROM ${this.table} WHERE kind = 'message' AND json_extract(record_json, '$.from.user_id') IN (SELECT value FROM json_each(?1))`,
 		).bind(ids));
@@ -230,11 +229,11 @@ export class D1HistoryTier implements LowerTier {
 			   OR (kind = 'reactions' AND EXISTS (SELECT 1 FROM json_each(record_json, '$.reactions') WHERE json_extract(value, '$.from.user_id') = ?1))
 			   OR (kind = 'membership' AND EXISTS (SELECT 1 FROM json_each(record_json, '$.members') WHERE json_extract(value, '$.user.user_id') = ?1))`,
 		).bind(from).all<Row>();
-		await this.run(listing.results.map((row) => this.rewrite(row, renamedRecord(row, from, to))));
+		await this.run(listing.results.map((row) => this.rewriteRow(row, renamedRecord(row, from, to))));
 	}
 
 	/** A record's new JSON in place, or its deletion. */
-	private rewrite(row: Pick<Row, "room_id" | "log_id">, json: string | null): D1PreparedStatement {
+	private rewriteRow(row: Pick<Row, "room_id" | "log_id">, json: string | null): D1PreparedStatement {
 		return json === null
 			? this.db.prepare(`DELETE FROM ${this.table} WHERE room_id = ?1 AND log_id = ?2`).bind(row.room_id, row.log_id)
 			: this.db.prepare(`UPDATE ${this.table} SET record_json = ?3 WHERE room_id = ?1 AND log_id = ?2`).bind(row.room_id, row.log_id, json);

@@ -1,9 +1,9 @@
 /*
  * importArchive: reads an ARCHIVE.md v1 file (as
- * @apron/archive openArchive decodes it) into the pipeline.
+ * @apron/archive openArchive decodes it) into the chain.
  *
  * It plans first, writing nothing, with @apron/archive's planImport over
- * the pipeline (importTarget) and this server's user ID rules
+ * the chain (importTarget) and this server's user ID rules
  * (src/user-ids.ts): which rooms are new (rooms that exist here are skipped
  * whole), what each archive user becomes (an existing account
  * or an unclaimed placeholder), which records are duplicates of
@@ -23,8 +23,8 @@ import {
 } from "@apron/archive";
 import { withoutOutputRefs } from "../../output-ref";
 import { USER_ID_RULES } from "../../user-ids";
-import type { HistoryPipeline } from "../pipeline";
-import type { TierView } from "../plan";
+import type { HistoryChain } from "../chain";
+import type { ChainView } from "../link";
 import { type Clock, toRange } from "../records";
 import type { RestorePort } from "../tier";
 
@@ -99,8 +99,8 @@ export function restoreBatches(records: readonly ChatRecord[], limits: { records
 	return out;
 }
 
-/** planImport's target: the server's rooms and users (`restore`), and records across every tier of the pipeline. */
-function importTarget(pipeline: HistoryPipeline, restore: RestorePort): ImportTarget {
+/** planImport's target: the server's rooms and users (`restore`), and records across every tier of the chain. */
+function importTarget(chain: HistoryChain, restore: RestorePort): ImportTarget {
 	return {
 		hasRoom: (roomId) => restore.hasRoom(roomId),
 		roomIsEmpty: (roomId) => restore.roomIsEmpty(roomId),
@@ -109,7 +109,7 @@ function importTarget(pipeline: HistoryPipeline, restore: RestorePort): ImportTa
 		latest: () => restore.latest(),
 		async lookup(ids) {
 			const found: ChatRecord[] = [];
-			for (let start = 0; start < ids.length; start += LOOKUP_BATCH) found.push(...await pipeline.lookup(ids.slice(start, start + LOOKUP_BATCH)));
+			for (let start = 0; start < ids.length; start += LOOKUP_BATCH) found.push(...await chain.lookup(ids.slice(start, start + LOOKUP_BATCH)));
 			return found;
 		},
 		// Records as a client could have sent them (Store.restorableRecord).
@@ -125,17 +125,18 @@ function importTarget(pipeline: HistoryPipeline, restore: RestorePort): ImportTa
  * that whose copy from above already passed it, so none of them misses it
  * once the tier above lets it go.
  */
-export function place(id: number, tiers: readonly Pick<TierView, "state">[], published: number): number[] {
+export function place(id: number, chain: Pick<ChainView, "tiers" | "links">, published: number): number[] {
 	if (id < published) return [];
-	let serving = tiers.length > 1 && tiers[0].state.through >= id ? tiers.findIndex((tier, index) => index > 0 && tier.state.floor <= id) : tiers.findIndex((tier) => tier.state.floor <= id);
+	const { tiers, links } = chain;
+	let serving = links.length && links[0].through >= id ? tiers.findIndex((tier, index) => index > 0 && tier.floor <= id) : tiers.findIndex((tier) => tier.floor <= id);
 	if (serving === -1) serving = tiers.length - 1;
 	const out = [serving];
-	for (let below = serving + 1; below < tiers.length && tiers[below - 1].state.through >= id; below += 1) out.push(below);
+	for (let below = serving + 1; below < tiers.length && links[below - 1].through >= id; below += 1) out.push(below);
 	return out;
 }
 
-/** Reads, plans (@apron/archive planImport) and, unless a dry run, writes an archive into the pipeline, through `restore`. */
-export async function importArchive(pipeline: HistoryPipeline, restore: RestorePort, input: ArchiveReader | CollectedArchive, options: ImportOptions): Promise<ImportReport> {
+/** Reads, plans (@apron/archive planImport) and, unless a dry run, writes an archive into the chain, through `restore`. */
+export async function importArchive(chain: HistoryChain, restore: RestorePort, input: ArchiveReader | CollectedArchive, options: ImportOptions): Promise<ImportReport> {
 	const archive = "parts" in input ? await collectArchive(input) : input;
 	// An earlier run of this import that failed partway is finished with its
 	// own plan (its journal), whatever this run asks. An unfinished import of
@@ -151,7 +152,7 @@ export async function importArchive(pipeline: HistoryPipeline, restore: RestoreP
 		else if (!parsed) throw new Error("an earlier import's journal cannot be read: import with restart to abandon it");
 		else throw new Error(`another import is unfinished${begun.length ? ` (rooms ${begun.join(", ")})` : ""}: run it again to finish it, or import this one with restart to abandon it`);
 	}
-	const plan = await planImport(archive, importTarget(pipeline, restore), {
+	const plan = await planImport(archive, importTarget(chain, restore), {
 		...(options.users ? { users: options.users } : {}),
 		authenticated: options.provenance === "verified",
 		...(options.userMap ? { userMap: options.userMap } : {}),
@@ -168,11 +169,11 @@ export async function importArchive(pipeline: HistoryPipeline, restore: RestoreP
 	const report: ImportReport = { ...plan.report, dryRun: Boolean(options.dryRun), ...(abandoned ? { abandoned } : {}) };
 
 	// Placement.
-	const views = await pipeline.views();
-	const published = await pipeline.publishedFloor();
-	const perTier: ChatRecord[][] = views.map(() => []);
+	const view = await chain.view();
+	const published = await chain.publishedFloor();
+	const perTier: ChatRecord[][] = view.tiers.map(() => []);
 	for (const record of plan.records) {
-		const tiers = place(record.log_id, views, published);
+		const tiers = place(record.log_id, view, published);
 		if (!tiers.length) {
 			report.expired += 1;
 			continue;
@@ -182,7 +183,7 @@ export async function importArchive(pipeline: HistoryPipeline, restore: RestoreP
 		const range = report.logIdRange;
 		report.logIdRange = { first: Math.min(range?.first ?? record.log_id, record.log_id), last: Math.max(range?.last ?? record.log_id, record.log_id) };
 	}
-	for (const [index, view] of views.entries()) if (perTier[index].length) report.placed[view.name] = perTier[index].length;
+	for (const [index, tier] of view.tiers.entries()) if (perTier[index].length) report.placed[tier.name] = perTier[index].length;
 
 	// The journal, checked before anything is written: an import too large to
 	// resume is refused whole.
@@ -211,8 +212,8 @@ export async function importArchive(pipeline: HistoryPipeline, restore: RestoreP
 			report.rejected += result.rejected ?? 0;
 		}
 	}
-	for (let index = 1; index < views.length; index += 1) {
-		const tier = pipeline.tiers[index];
+	for (let index = 1; index < view.tiers.length; index += 1) {
+		const tier = chain.tiers[index];
 		for (let start = 0; start < perTier[index].length; start += batch) await tier.append(toRange(perTier[index].slice(start, start + batch)));
 	}
 	await restore.journal.set(null);

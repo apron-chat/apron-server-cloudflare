@@ -4,13 +4,13 @@ import { AuthError, AuthTooLargeError, candidateUserIdFor, UnknownCredentialErro
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, thresholdRecords } from "./budget";
 import { type ImportReport, importArchive } from "./history/archive/import";
-import { archivePipeline, blobStoreOf, buildHistoryPipeline, D1_TIER, d1Off, HEAD_TIER, HISTORY_CODECS, historyLayout, layoutTiered } from "./history/config";
+import { archiveChain, blobStoreOf, buildHistoryChain, D1_TIER, d1Off, HEAD_TIER, HISTORY_CODECS, historyLayout, layoutTiered } from "./history/config";
 import { type D1Off, detailLines, statusLines } from "./history/status";
 import { storeExport, storeRestore } from "./history/store-head";
 import { hasOutputRef, refsOf, terminalOutputKeys, withTerminalOutputs } from "./output-ref";
 import { type BackupKind, BackupStore, writeBackup } from "./history/exports";
 import { type HistoryHolder, type HistoryLease, HistorySchedule, isRefusal, refusalMessage } from "./history/schedule";
-import type { HistoryPipeline } from "./history/pipeline";
+import type { HistoryChain } from "./history/chain";
 import { type ChatRecord, type PublicRecord, asPublic } from "./history/records";
 import { keepLast, LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, showsMorePresent, statusChoice, type Status, type StatusChoice } from "./presence";
@@ -148,9 +148,9 @@ import { Deadline } from "./deadline";
 const OBJECT_NAME = "public-demo-v1";
 /** Characters of finished terminals' outputs the object keeps in memory (Store.finishLiveText, withOutputs): about 8 MB. */
 const TERMINAL_OUTPUT_CACHE_BYTES = 8 * 1024 * 1024;
-/** How long the history pipeline waits after a failed step (runHistory), and cleanup between copies meanwhile; a second otherwise. */
+/** How long the history chain waits after a failed step (runHistory), and cleanup between copies meanwhile; a second otherwise. */
 const HISTORY_RETRY_MS = 5 * 60_000;
-/** Steps one history cycle takes at most (HistoryPipeline.cycle): each a copy, a trim or less. */
+/** Steps one history cycle takes at most (HistoryChain.cycle): each a copy, a trim or less. */
 const HISTORY_CYCLE_STEPS = 24;
 /** How long a copy to a tier below fails (or waits for an unbound D1 tier) before the admins are told. */
 const HISTORY_STALL_ALERT_MS = 6 * 3_600_000;
@@ -2676,7 +2676,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * D1, then the cold tier, each where it is bound), where records past its
 	 * limits go first (runHistory); none without one.
 	 */
-	private readonly history?: HistoryPipeline;
+	private readonly history?: HistoryChain;
 	/**
 	 * History upkeep's lock and schedule (src/history/schedule.ts): what runs
 	 * (a cycle, a job, rewrites), each under a lease, and whether a cycle is
@@ -2789,10 +2789,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		this.config = loadConfig(env);
 		// Records past this SQLite's limits go to the tiers below where they are
 		// bound: D1 (HISTORY_D1), then the cold tier (HISTORY_BLOB).
-		// The layout first: the Store is tiered exactly when the pipeline has tiers below it.
+		// The layout first: the Store is tiered exactly when the chain has tiers below it.
 		const layout = historyLayout(env, this.config.limits);
 		this.store = new Store(ctx as unknown as ConstructorParameters<typeof Store>[0], { ...asStoreConfig(this.config), tiered: layoutTiered(layout) });
-		this.history = buildHistoryPipeline({
+		this.history = buildHistoryChain({
 			layout, limits: this.config.limits, store: this.store, clock: { now: nowMs },
 			track: (kind, method, call) => this.stalls.track(kind, method, call()),
 			chunkIndex: (tier) => this.store.chunkIndex(tier),
@@ -3346,7 +3346,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private alarmWorkDue(now: number): boolean {
 		// History upkeep: a cycle that asked to go on, or a `/purge` or
 		// `/rename` the tiers below have yet to apply, read once a wake.
-		if (this.history && this.historySchedule.workDue(now, () => this.store.historyOps(now).length > 0)) return true;
+		if (this.history && this.historySchedule.workDue(now, () => this.store.historyRewrites(now).length > 0)) return true;
 		if (this.config.uploads && !this.uploadDeadlineRead) {
 			try {
 				const stored = this.store.nextUploadDeadline(now);
@@ -5161,7 +5161,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			});
 			// A page below the hot floor reads the tiers below; without them, no
 			// page. They apply a `/purge` or `/rename` they have yet to, or that
-			// came while this page waited (HistoryPipeline.read).
+			// came while this page waited (HistoryChain.read).
 			let page: StoreHistoryResult;
 			if (!isPendingHistory(found)) page = found;
 			else {
@@ -5211,7 +5211,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * The D1 tier is off while it holds history (d1Missing): the copy into it
 	 * counts as failing from the first wake that sees it, and once that has
 	 * lasted HISTORY_STALL_ALERT_MS, admins get the history_stall alert, once,
-	 * as for any stalled copy (src/history/stall.ts). On again, the pipeline's
+	 * as for any stalled copy (src/history/stall.ts). On again, the chain's
 	 * first good copy clears it.
 	 */
 	private async noteD1Missing(now: number): Promise<void> {
@@ -5225,7 +5225,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/**
 	 * History upkeep on a full alarm, before and after cleanup
-	 * (Store.runCleanup): a bounded cycle of the pipeline (HistoryPipeline.cycle)
+	 * (Store.runCleanup): a bounded cycle of the chain (HistoryChain.cycle)
 	 * that applies queued `/purge` and `/rename` below, copies the records the
 	 * running cleanup job will remove to the tier below, and lets each tier
 	 * below go of what its retention no longer keeps. A failure waits
@@ -5237,7 +5237,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const schedule = this.historySchedule;
 		if (!schedule.mayRun(now)) return;
 		if (await this.d1Missing()) {
-			// Nothing runs until D1 is on: no cycle or queued op is due meanwhile.
+			// Nothing runs until D1 is on: no cycle or queued rewrite is due meanwhile.
 			schedule.idle();
 			await this.noteD1Missing(now);
 			return;
@@ -8855,7 +8855,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * Runs history upkeep (runHistory) on an alarm in a second, for a
 	 * `/purge` or `/rename` the tiers below have to apply; history pages
-	 * that read them apply it meanwhile (HistoryPipeline.read).
+	 * that read them apply it meanwhile (HistoryChain.read).
 	 */
 	private historySoon(): void {
 		this.historySchedule.request();
@@ -9100,9 +9100,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}));
 	}
 
-	/** The pipeline exports and imports go through: the history pipeline, or SQLite alone. */
-	private archivePipeline(): HistoryPipeline {
-		return archivePipeline(this.history, { store: this.store, limits: this.config.limits, clock: { now: nowMs } });
+	/** The chain exports and imports go through: the history chain, or SQLite alone. */
+	private archiveChain(): HistoryChain {
+		return archiveChain(this.history, { store: this.store, limits: this.config.limits, clock: { now: nowMs } });
 	}
 
 	/** Where `/history export` writes backups and `/history import` reads them: the history blob store (HISTORY_BLOB), through HISTORY_CODECS. */
@@ -9114,7 +9114,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 
 	/** Writes one backup of `kind` with the configured settings (writeBackup). */
 	private writeBackup(backups: BackupStore, kind: BackupKind, roomIds: readonly string[] = []): ReturnType<typeof writeBackup> {
-		return writeBackup(this.archivePipeline(), storeExport(this.store), backups, this.config.backups, kind, {
+		return writeBackup(this.archiveChain(), storeExport(this.store), backups, this.config.backups, kind, {
 			server: this.config.rpId, clock: { now: nowMs }, ...(roomIds.length ? { roomIds: [...roomIds] } : {}),
 			header: this.archiveHeader(), prepare: (records) => this.exportRecords(records),
 		});
@@ -9140,7 +9140,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}
 		switch (args.action) {
 			case "status":
-				done([...await this.historyStatus(now), ...await detailLines(this.archivePipeline())].join("\n"));
+				done([...await this.historyStatus(now), ...await detailLines(this.archiveChain())].join("\n"));
 				return;
 		}
 	}
@@ -9172,7 +9172,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 					// Read whole and bounded, stored and decoded (a small file may decode to a great deal), before anything is written.
 					const opened = await backups.open(key, MAX_IMPORT_BYTES);
 					if (!opened) throw new Error(`No backup ${key}`);
-					report = await importArchive(this.archivePipeline(), storeRestore(this.store), opened.archive, {
+					report = await importArchive(this.archiveChain(), storeRestore(this.store), opened.archive, {
 						clock: { now: nowMs }, server: this.archiveHeader().server, dryRun: args.dryRun,
 						// Only an authenticating codec, read to the end, makes a file this server's own.
 						provenance: opened.provenance,
@@ -9566,7 +9566,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async historyStatus(now: number): Promise<string[]> {
 		const d1Off = await this.d1Missing();
-		return statusLines({ limits: this.config.limits, hotRecords: () => this.store.hotRecords(now), ...(this.history ? { pipeline: this.history } : {}), ...(d1Off ? { d1Off } : {}) });
+		return statusLines({ limits: this.config.limits, hotRecords: () => this.store.hotRecords(now), ...(this.history ? { chain: this.history } : {}), ...(d1Off ? { d1Off } : {}) });
 	}
 
 	/** `/status`'s active users line (src/active-users.ts): never throws, and gives up after 5 seconds. */

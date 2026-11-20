@@ -349,9 +349,9 @@ it('while the D1 tier is unbound, it shows in /history status, exports wait, and
 			});
 			expect(alerts.early).toBe(0);
 			expect(alerts.alerts).toEqual([expect.objectContaining({ kind: 'history_stall', from: 'hot', to: 'recent' })]);
-			// Bound again, the pipeline's first good copy clears the stall.
+			// Bound again, the chain's first good copy clears the stall.
 			await runInDurableObject(stub(), (instance) => {
-				(instance as unknown as Runtime).store.historyStatePort().setValue('history:head:stall', null);
+				(instance as unknown as Runtime).store.historyStatePort().setValue('history:link:hot', null);
 			});
 		});
 		// With no count to keep (LIMIT_HISTORY_D1_RECORDS 0), off as well, and the message says so.

@@ -3,7 +3,7 @@
  * not reimplementations. Each takes only the Store methods it uses (a
  * narrow structural port, so this module does not load the Store):
  *
- * - storeHead: the head the pipeline runs (HistoryHead). Its trimming is
+ * - storeHead: the head the chain runs (HistoryHead). Its trimming is
  *   the Store's own cleanup (Store.runCleanup), which removes records only
  *   below the copy marker and on its own schedule: trimBelow asks nothing
  *   of it. Its retention is the Store's config, found by the running
@@ -11,11 +11,11 @@
  * - storeRestore: what an import writes through (RestorePort).
  * - storeExport: the rooms and users an export carries (ExportPort).
  *
- * Tier state is state.ts over Store.historyStatePort().
+ * The chain's state is state.ts over Store.historyStatePort().
  */
 
 import type { ArchivedRoom, ArchivedUser } from "@apron/archive";
-import { type ChatRecord, type HistoryQuery, type QueuedOp, type RecordRange, type TierStats, toRange } from "./records";
+import { type ChatRecord, type HistoryQuery, type QueuedRewrite, type RecordRange, type TierStats, toRange } from "./records";
 import type { ExportPort, HistoryHead, RestoreContext, RestorePort, RestoreResult } from "./tier";
 
 /** What the head needs of the Store. */
@@ -27,8 +27,9 @@ export interface HeadStore {
 	historyLookup(logIds: readonly number[]): ChatRecord[];
 	hotRecords(): number;
 	publishHistoryFloor(floor: number): void;
-	historyOps(): QueuedOp[];
-	dropHistoryOps(seq: number): void;
+	historyRewrites(): QueuedRewrite[];
+	historyRewritesLogged(): number;
+	dropHistoryRewrites(seq: number): void;
 	amendHistoryPurge(seq: number, messageIds: readonly string[]): void;
 	dropReactionsOn(messageIds: readonly string[]): void;
 	purgeUsers(input: { userIds: readonly string[] }): unknown;
@@ -69,9 +70,10 @@ export function storeHead(name: string, store: HeadStore): HistoryHead {
 		floorFor: async () => store.historyTarget(),
 		/** Cleanup trims, below the copy marker, on its own schedule. */
 		trimBelow: async () => 0,
-		opLog: {
-			list: async () => store.historyOps(),
-			drop: async (seq) => store.dropHistoryOps(seq),
+		rewrites: {
+			list: async () => store.historyRewrites(),
+			logged: async () => store.historyRewritesLogged(),
+			drop: async (seq) => store.dropHistoryRewrites(seq),
 			amend: async (seq, messageIds) => store.amendHistoryPurge(seq, messageIds),
 		},
 		purge: async (userIds) => void store.purgeUsers({ userIds }),

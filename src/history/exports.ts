@@ -18,7 +18,7 @@
 
 import { ARCHIVE_CODECS, type ArchiveCodec, type ArchiveHeader, type ArchiveWriter, archiveName, encodedArchiveWriter, type OpenedArchive, readEncodedArchive } from "@apron/archive";
 import { type ExportOptions, type ExportReport, exportArchive } from "./archive/export";
-import type { HistoryPipeline } from "./pipeline";
+import type { HistoryChain } from "./chain";
 import type { Clock } from "./records";
 import type { ExportPort } from "./tier";
 import { storedChain, storedOptions } from "./storage/encoding";
@@ -136,13 +136,13 @@ export class BackupStore {
 }
 
 /**
- * Writes one backup of the whole pipeline (its records, `server`'s rooms
+ * Writes one backup of the whole chain (its records, `server`'s rooms
  * and users) to `backups`, then deletes this kind's backups past the
  * newest `keep`.
  */
-export async function writeBackup(pipeline: HistoryPipeline, server: ExportPort, backups: BackupStore, settings: BackupSettings, kind: BackupKind, options: { server: string; clock: Clock; roomIds?: string[]; header?: Partial<ArchiveHeader>; prepare: ExportOptions["prepare"] }): Promise<BackupResult> {
+export async function writeBackup(chain: HistoryChain, server: ExportPort, backups: BackupStore, settings: BackupSettings, kind: BackupKind, options: { server: string; clock: Clock; roomIds?: string[]; header?: Partial<ArchiveHeader>; prepare: ExportOptions["prepare"] }): Promise<BackupResult> {
 	const key = backups.key(kind, options.server, options.clock.now());
-	const report = await backups.write(key, (archive) => exportArchive(pipeline, server, archive, {
+	const report = await backups.write(key, (archive) => exportArchive(chain, server, archive, {
 		clock: options.clock, header: { server: options.server, ...options.header }, ...(options.roomIds ? { roomIds: options.roomIds } : {}),
 		privateRooms: settings.privateRooms,
 		prepare: options.prepare,

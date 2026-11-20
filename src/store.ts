@@ -26,8 +26,8 @@ import {
 import { hostListAllowed } from "./config";
 import { keepAppend, keepLast, liveTextString, type LiveKind } from "./live-text";
 import type { AccountUsageSnapshot } from "./account-usage";
-import type { ChatRecord, HistoryOp, HistoryQuery, QueuedOp } from "./history/records";
-import type { TierStatePort } from "./history/state";
+import type { ChatRecord, HistoryQuery, QueuedRewrite, Rewrite } from "./history/records";
+import type { ChainStatePort } from "./history/state";
 import { type ArchivedRoom, type ArchivedUser, parseLogId, type ReplayedMembership, replayRecords, roomClientFields, type ValidRecord, validateRecord, withClientUsers } from "@apron/archive";
 import { ADMIN_USER_ID, restorableUserId } from "./user-ids";
 import { MAX_TERMINAL_OUTPUT_JSON_BYTES, type TerminalOutputRef, outputRef } from "./output-ref";
@@ -170,7 +170,7 @@ export interface StoreConfig {
   /** Records younger than this never expire by count. */
   minRetentionMs: number;
   /**
-   * Whether history tiers lie below this SQLite (the history pipeline,
+   * Whether history tiers lie below this SQLite (the history chain,
    * src/history/: the D1 tier where it is bound): records leaving it are
    * copied down first, and history is published from the deepest tier's floor.
    */
@@ -334,7 +334,7 @@ export interface LiveEntry {
 /** What a finished live text published, if anything. */
 /**
  * A history page that reaches below the hot floor (Store.historyAcrossTiers):
- * what it needs of the tiers below (HistoryPipeline.read), and the page
+ * what it needs of the tiers below (HistoryChain.read), and the page
  * their records complete.
  */
 export interface PendingHistory {
@@ -1020,20 +1020,21 @@ const META_EFFECTIVE_NOW = "effective_now_ms";
  */
 const META_PURGE_ROOMS = "purge_rooms";
 /**
- * `_meta` keys of the history pipeline (src/history/), all `history:`:
+ * `_meta` keys of the history chain (src/history/), all `history:`:
  * the published floor, below the hot floor while lower tiers hold the
  * records between them; the newest log ID the next tier holds a copy of
  * (cleanup's ceiling); a flag that the published floor rose and rooms may
- * have gone with it; the `/purge` and `/rename` the tiers below have yet to
- * apply, with the last number given; and each lower tier's state.
+ * have gone with it; the `/purge` and `/rename` the links have yet to
+ * deliver down the chain, with the last number given; and each lower
+ * tier's and each link's state.
  */
 const META_HISTORY_PUBLISHED = "history:published";
 const META_HISTORY_THROUGH = "history:head:through";
-const META_HISTORY_HEAD_STALL = "history:head:stall";
 const META_HISTORY_ROOMS_DUE = "history:rooms_due";
 const META_HISTORY_OPS = "history:ops";
 const META_HISTORY_OPS_SEQ = "history:ops_seq";
 const META_HISTORY_TIER = "history:tier:";
+const META_HISTORY_LINK = "history:link:";
 /** Backups' schedule state (historyMetaNumber, setHistoryMeta), kept when tiers are off. */
 const META_HISTORY_EXPORT = "history:export:";
 /** The running import's journal: its archive, user mapping and rooms still to finish (importArchive). */
@@ -1042,8 +1043,8 @@ const META_HISTORY_IMPORT = "history:import";
 export const HISTORY_SCAN_BATCH = 100;
 /** Index entries historyTarget reads past the cutoff at most, looking for the first record it keeps. */
 const HISTORY_TARGET_SCAN = 200;
-/** Ops the log holds at most: a /purge or /rename past it waits for the tiers below to catch up (retry_after). */
-const MAX_HISTORY_OPS = 200;
+/** Rewrites the log holds at most: a /purge or /rename past it waits for the links to catch up (retry_after). */
+const MAX_HISTORY_REWRITES = 200;
 /**
  * The records one restoreRoom call takes at most (an import's batch): a
  * room with more is restored over several calls, oldest records first.
@@ -3829,7 +3830,7 @@ export class Store {
    * whole log is below it are gone, and retired ids are freed past it. It is
    * the hot floor (log_state.history_floor), below which this SQLite keeps
    * no record, unless tiers below hold the records between them (`tiered`):
-   * then META_HISTORY_PUBLISHED, which the history pipeline raises
+   * then META_HISTORY_PUBLISHED, which the history chain raises
    * (publishHistoryFloor), never past the hot floor.
    */
   private publishedFloor(): number {
@@ -3854,7 +3855,7 @@ export class Store {
 
   /**
    * The hot floor, the published floor (publishedFloor) and the log head
-   * (the last log ID issued, `latest`), for the history pipeline: an import
+   * (the last log ID issued, `latest`), for the history chain: an import
    * that renumbers its records places them past the head.
    */
   historyFloors(now = this.clock.now()): { hot: number; published: number; latest: number } {
@@ -3909,7 +3910,7 @@ export class Store {
   /**
    * The records of `roomIds` in a window, as HistoryTier.read gives them
    * (the first `limit` distinct log IDs nearest the page's start), outside
-   * the history quota: for exports and the pipeline's own reads.
+   * the history quota: for exports and the chain's own reads.
    */
   historyRecords(query: HistoryQuery, now = this.clock.now()): ChatRecord[] {
     this.ensureReady();
@@ -3946,14 +3947,14 @@ export class Store {
   }
 
   /**
-   * The history pipeline's tier state, as plain values (src/history/state.ts
-   * keeps its rules): values under `history:tier:` and `history:head:stall`,
-   * the hot and published floors, the op log's last seq, and the copy
-   * marker, which cleanup stops at (runCleanup).
+   * The history chain's state, as plain values (src/history/state.ts keeps
+   * its rules): values under `history:tier:` and `history:link:`, the hot
+   * and published floors, and the copy marker, which cleanup stops at
+   * (runCleanup).
    */
-  historyStatePort(): TierStatePort {
+  historyStatePort(): ChainStatePort {
     const owned = (key: string) => {
-      if (!key.startsWith(META_HISTORY_TIER) && key !== META_HISTORY_HEAD_STALL) throw new Error(`not a history tier state key: ${key}`);
+      if (!key.startsWith(META_HISTORY_TIER) && !key.startsWith(META_HISTORY_LINK)) throw new Error(`not a history chain state key: ${key}`);
       return key;
     };
     return {
@@ -3968,10 +3969,6 @@ export class Store {
       },
       hotFloor: () => this.historyFloors().hot,
       publishedFloor: () => this.historyFloors().published,
-      opsSeq: () => {
-        this.ensureReady();
-        return this.reserved({ reads: 4 }, true, this.clock.now(), () => this.metaNumber(META_HISTORY_OPS_SEQ));
-      },
       copyMarker: () => {
         this.ensureReady();
         return this.reserved({ reads: 4 }, true, this.clock.now(), () => this.metaNumber(META_HISTORY_THROUGH));
@@ -4005,36 +4002,45 @@ export class Store {
     });
   }
 
-  /** The `/purge` and `/rename` the tiers below have yet to apply, oldest first. */
-  historyOps(now = this.clock.now()): QueuedOp[] {
+  /** The `/purge` and `/rename` some link has yet to deliver, oldest first. */
+  historyRewrites(now = this.clock.now()): QueuedRewrite[] {
     this.ensureReady();
     if (!this.config.tiered) return [];
-    return this.reserved({ reads: 4 }, true, now, () => this.metaJson(META_HISTORY_OPS, (value) => Array.isArray(value) ? value as QueuedOp[] : undefined, []));
+    return this.reserved({ reads: 4 }, true, now, () => this.queuedRewrites());
   }
 
-  /** Adds `messageIds` to queued purge `seq` (OpLog.amend): messages of its users a tier below found. */
+  /** The newest rewrite's number ever given (0: none), delivered or not. */
+  historyRewritesLogged(now = this.clock.now()): number {
+    this.ensureReady();
+    return this.reserved({ reads: 4 }, true, now, () => this.metaNumber(META_HISTORY_OPS_SEQ));
+  }
+
+  private queuedRewrites(): QueuedRewrite[] {
+    return this.metaJson(META_HISTORY_OPS, (value) => Array.isArray(value) ? value as QueuedRewrite[] : undefined, []);
+  }
+
+  /** Adds `messageIds` to queued purge `seq` (RewriteLog.amend): messages of its user a tier below found. */
   amendHistoryPurge(seq: number, messageIds: readonly string[], now = this.clock.now()): void {
     this.ensureReady();
     if (!messageIds.length) return;
     this.reserved({ reads: 4, writes: 4 }, true, now, () => {
-      const ops = this.metaJson(META_HISTORY_OPS, (value) => Array.isArray(value) ? value as QueuedOp[] : undefined, []);
-      const next = ops.map((entry) => entry.seq === seq && entry.op.op === "purge" ? { seq, op: { ...entry.op, messageIds: [...new Set([...entry.op.messageIds, ...messageIds])] } } : entry);
+      const next = this.queuedRewrites().map((entry) => entry.seq === seq && entry.rewrite.into === null ? { seq, rewrite: { ...entry.rewrite, messages: [...new Set([...(entry.rewrite.messages ?? []), ...messageIds])] } } : entry);
       this.writeMeta(META_HISTORY_OPS, JSON.stringify(next));
     });
   }
 
-  /** Forgets the ops through `seq`, once every tier below applied them. */
-  dropHistoryOps(seq: number, now = this.clock.now()): void {
+  /** Forgets the rewrites through `seq`, once every link delivered them. */
+  dropHistoryRewrites(seq: number, now = this.clock.now()): void {
     this.ensureReady();
     this.reserved({ reads: 4, writes: 4 }, true, now, () => {
-      const ops = this.metaJson(META_HISTORY_OPS, (value) => Array.isArray(value) ? value as QueuedOp[] : undefined, []).filter((entry) => entry.seq > seq);
-      this.writeMeta(META_HISTORY_OPS, ops.length ? JSON.stringify(ops) : null);
+      const kept = this.queuedRewrites().filter((entry) => entry.seq > seq);
+      this.writeMeta(META_HISTORY_OPS, kept.length ? JSON.stringify(kept) : null);
     });
   }
 
   /**
    * Deletes the hot log's reaction sets on `messageIds`, messages of purged
-   * users that only a tier below held (HistoryPipeline: OpStep.found): /purge found no current
+   * users that only a tier below held (a rewrite's `found`, chain.ts): /purge found no current
    * message for them, so their newer reaction records were left. Scans the
    * retained log for them, as /purge does.
    */
@@ -4523,17 +4529,19 @@ export class Store {
   }
 
   /**
-   * Queues what a `/purge` or `/rename` did here for the tiers below
-   * (historyOps), within the operation's transaction. A full log refuses
-   * the operation: the tiers below must catch up first.
+   * Queues what a `/purge` or `/rename` did here for the links to deliver
+   * down the chain (historyRewrites), within the operation's transaction,
+   * numbered in order. A full log refuses the operation: the links must
+   * catch up first.
    */
-  private queueHistoryOp(op: HistoryOp): void {
-    if (!this.config.tiered) return;
-    const ops = this.metaJson(META_HISTORY_OPS, (value) => Array.isArray(value) ? value as QueuedOp[] : undefined, []);
-    if (ops.length >= MAX_HISTORY_OPS) throw new StoreError("retry_after", "older history has yet to catch up with earlier changes");
-    const seq = this.metaNumber(META_HISTORY_OPS_SEQ) + 1;
+  private queueHistoryRewrites(rewrites: readonly Rewrite[]): void {
+    if (!this.config.tiered || !rewrites.length) return;
+    const queued = this.queuedRewrites();
+    if (queued.length + rewrites.length > MAX_HISTORY_REWRITES) throw new StoreError("retry_after", "older history has yet to catch up with earlier changes");
+    let seq = this.metaNumber(META_HISTORY_OPS_SEQ);
+    const added = rewrites.map((rewrite) => ({ seq: (seq += 1), rewrite }));
     this.writeMeta(META_HISTORY_OPS_SEQ, String(seq));
-    this.writeMeta(META_HISTORY_OPS, JSON.stringify([...ops, { seq, op }]));
+    this.writeMeta(META_HISTORY_OPS, JSON.stringify([...queued, ...added]));
   }
 
   private identityRow(userId: string): RawIdentityRow | null {
@@ -4662,7 +4670,7 @@ export class Store {
           this.rewriteRecord(row, JSON.stringify({ ...membership, members: membership.members.map((member) => ({ ...member, user: renamed(member.user) })) }));
         }
       }
-      this.queueHistoryOp({ op: "rename", from, to });
+      this.queueHistoryRewrites([{ user: from, into: to }]);
       // A message's current snapshot is its latest record, renamed above.
       for (const row of found.messages) this.rawExec("UPDATE message_state SET author_id = ? WHERE message_id = ?", to, row.message_id);
       for (const row of found.reactions) {
@@ -4801,8 +4809,8 @@ export class Store {
       this.rawExec(`DELETE FROM reaction_state WHERE user_id IN (${marks})`, ...ids);
       if (messages.length) this.rawExec(`DELETE FROM reaction_state WHERE message_id IN (${messageMarks})`, ...messages);
       this.rawExec(`DELETE FROM message_state WHERE author_id IN (${marks})`, ...ids);
-      // The tiers below do the same to what they hold (HistoryPipeline).
-      this.queueHistoryOp({ op: "purge", userIds: ids, messageIds: messages });
+      // The tiers below do the same to what they hold, as the links deliver it (src/history/chain.ts).
+      this.queueHistoryRewrites(ids.map((user) => ({ user, into: null, messages })));
       const uploads = this.rawRows<RawUploadRow>(
         `SELECT upload_key, owner_id, purpose, message_id, embed_id, state, bytes, write_expires_ms, expires_ms
          FROM uploads INDEXED BY uploads_owner_idx WHERE owner_id IN (${marks})`,
@@ -8808,7 +8816,7 @@ export class Store {
   /**
    * history, for a runtime with tiers below: a page that reaches below the
    * hot floor is a PendingHistory, which the runtime completes with the
-   * records it asks of them (HistoryPipeline.read). Charged and checked as
+   * records it asks of them (HistoryChain.read). Charged and checked as
    * history is, before they are read.
    */
   historyAcrossTiers(query: StoreHistoryQuery): StoreHistoryResult | PendingHistory {
@@ -9231,12 +9239,12 @@ export class Store {
 
   /**
    * With tiers below (`tiered`), records leave this SQLite only once the
-   * next tier holds them (the history pipeline copies them and marks
+   * next tier holds them (the history chain copies them and marks
    * META_HISTORY_THROUGH): the hot floor stops at the last copied, and the
    * job waits `copyWaitMs` (a second by default; the runtime lengthens it
    * while the tier fails) for the next copy. The published floor
    * (publishedFloor) stays where it was, below the hot floor, until the
-   * pipeline raises it (publishHistoryFloor); rooms go when their whole log
+   * chain raises it (publishHistoryFloor); rooms go when their whole log
    * is below it.
    */
   runCleanup(now = this.clock.now(), options: { copyWaitMs?: number } = {}): StoreCleanupResult {
@@ -9322,7 +9330,7 @@ export class Store {
       if (expired.length) floor = Math.max(floor, expired[expired.length - 1].log_id + 1);
       if (this.config.tiered) {
         // The tiers below hold what is between the published floor and the
-        // hot one, until their retention lets the pipeline publish a higher one.
+        // hot one, until their retention lets the chain publish a higher one.
         published = Math.min(previousPublished, floor);
         if (published !== this.metaNumber(META_HISTORY_PUBLISHED)) this.writeMeta(META_HISTORY_PUBLISHED, String(published));
         this.publishedCache = published;

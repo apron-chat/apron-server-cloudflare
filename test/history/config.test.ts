@@ -2,20 +2,20 @@ import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { ConfigError, loadConfig } from "../../src/config";
 import { MemoryChunkIndex } from "./support/memory-chunk-index";
-import { type BlobStoreChoice, type HistoryEnv, type HistoryLimits, type PipelineStore, WORKER_BLOB_STORES, blobStoreOf, buildHistoryPipeline, d1Off, historyLayout, layoutTiered } from "../../src/history/config";
+import { type BlobStoreChoice, type HistoryEnv, type ChainStore, type HistoryLimits, WORKER_BLOB_STORES, blobStoreOf, buildHistoryChain, d1Off, historyLayout, layoutTiered } from "../../src/history/config";
 import { MemoryBlobStore, memoryBlobStores } from "./support/memory-blob-store";
 
 const LIMITS: HistoryLimits = { retentionRecords: 5_000, retentionSeconds: 0, minRetentionSeconds: 0, historyD1Records: 100_000, historyColdRecords: 0, cleanupThresholdPercent: 80 };
 const clock = { now: () => 0 };
-const store = { historyStatePort: () => ({}) } as unknown as PipelineStore;
-/** The pipeline for these bindings and limits, as the Worker builds it: the layout first. */
+const store = { historyStatePort: () => ({}) } as unknown as ChainStore;
+/** The chain for these bindings and limits, as the Worker builds it: the layout first. */
 const build = (envOf: HistoryEnv, limits: HistoryLimits, options: BlobStoreChoice & { chunkIndex?: () => MemoryChunkIndex } = {}) =>
-	buildHistoryPipeline({ layout: historyLayout(envOf, limits, options), limits, store, clock, ...(options.chunkIndex ? { chunkIndex: options.chunkIndex } : {}) });
+	buildHistoryChain({ layout: historyLayout(envOf, limits, options), limits, store, clock, ...(options.chunkIndex ? { chunkIndex: options.chunkIndex } : {}) });
 
 describe("history tiers from bindings", () => {
 	it("builds SQLite, then D1, then the cold tier, each where it is bound", async () => {
 		const index = () => new MemoryChunkIndex();
-		const names = (pipeline: ReturnType<typeof buildHistoryPipeline>) => pipeline?.tiers.map((tier) => tier.name);
+		const names = (chain: ReturnType<typeof buildHistoryChain>) => chain?.tiers.map((tier) => tier.name);
 		expect(build({}, LIMITS, { chunkIndex: index })).toBeUndefined();
 		expect(names(build({ HISTORY_D1: env.HISTORY_D1 }, LIMITS, { chunkIndex: index }))).toEqual(["hot", "recent"]);
 		// No count for D1 turns it off: D1 cannot keep everything.
@@ -26,8 +26,8 @@ describe("history tiers from bindings", () => {
 		expect(names(build({}, LIMITS, { chunkIndex: index, ...memory }))).toEqual(["hot", "cold"]);
 		// The cold tier keeps everything at 0, else LIMIT_HISTORY_COLD_RECORDS.
 		const kept = async (historyColdRecords: number) => {
-			const pipeline = build({}, { ...LIMITS, historyColdRecords }, { chunkIndex: index, ...memory })!;
-			return (pipeline as unknown as { retentions: Array<{ records?: number }> }).retentions[1].records;
+			const chain = build({}, { ...LIMITS, historyColdRecords }, { chunkIndex: index, ...memory })!;
+			return (chain as unknown as { retentions: Array<{ records?: number }> }).retentions[1].records;
 		};
 		expect(await kept(0)).toBeUndefined();
 		expect(await kept(1_000_000)).toBe(1_000_000);

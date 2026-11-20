@@ -1,14 +1,14 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
-import { buildHistoryPipeline, historyLayout } from '../src/history/config';
-import type { HistoryPipeline } from '../src/history/pipeline';
-import { applyOps, purgedRecord, renamedRecord } from '../src/history/records';
+import type { HistoryChain } from '../src/history/chain';
+import { buildHistoryChain, historyLayout } from '../src/history/config';
+import { purgedRecord, renamedRecord, rewritten } from '../src/history/records';
 import type { Store } from '../src/store';
 import { connect, greeting, request } from './helpers/socket';
 
 // The tests bind a local D1 database as HISTORY_D1 (wrangler.toml), so the
 // object's D1 history tier is on: records past SQLite's count go there,
-// kept for historyD1Records more (no cold tier: the pipeline below is built without one).
+// kept for historyD1Records more (no cold tier: the chain below is built without one).
 
 const stub = () => env.DEMO.getByName('public-demo-v1');
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -16,7 +16,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 type Runtime = {
 	store: Store & { config: Record<string, unknown> };
 	config: { limits: Record<string, number> };
-	history?: HistoryPipeline;
+	history?: HistoryChain;
 	alarm(): Promise<void>;
 };
 
@@ -35,8 +35,8 @@ it('moves records past SQLite into D1, serves them in history, and expires them 
 				anonymousPostsPerMinute: 1_000, ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000,
 			};
 			runtime.config = { ...runtime.config, limits: { ...runtime.config.limits, retentionRecords: 3, historyD1Records: 4, cleanupThresholdPercent: 100 } };
-			// The pipeline takes its tiers' limits when built.
-			runtime.history = buildHistoryPipeline({ layout: historyLayout(env, runtime.config.limits as never), limits: runtime.config.limits as never, store: runtime.store, clock: { now: Date.now } });
+			// The chain takes its tiers' limits when built.
+			runtime.history = buildHistoryChain({ layout: historyLayout(env, runtime.config.limits as never), limits: runtime.config.limits as never, store: runtime.store, clock: { now: Date.now } });
 			const logs: string[] = [];
 			for (let index = 0; index < 10; index += 1) {
 				// One sender's message among those the archive will hold, for /purge below.
@@ -79,26 +79,26 @@ it('moves records past SQLite into D1, serves them in history, and expires them 
 		const across = (await request(peer, 'across', 'history', { room_id: 'general', before: logs[7], limit: 3 })).result;
 		expect(across.messages.map((message: { log_id: string }) => message.log_id)).toEqual(logs.slice(5, 8));
 
-		// /purge: queued for the archive, and applied to pages that read it before D1 has it.
+		// /purge: queued for the link into D1, and applied to pages that read it before D1 has it.
 		await runInDurableObject(stub(), (instance) => {
 			const runtime = instance as unknown as Runtime;
 			runtime.store.purgeUsers({ userIds: ['archive-victim'] });
-			expect(runtime.store.historyOps()).toEqual([{ seq: 1, op: { op: 'purge', userIds: ['archive-victim'], messageIds: [] } }]);
-			// A tier that finds more of the users' messages adds them to the op, once each; another seq is left alone.
+			expect(runtime.store.historyRewrites()).toEqual([{ seq: 1, rewrite: { user: 'archive-victim', into: null, messages: [] } }]);
+			// A tier that finds more of the user's messages adds them to the rewrite, once each; another seq is left alone.
 			runtime.store.amendHistoryPurge(1, ['no-such-message', 'no-such-message']);
 			runtime.store.amendHistoryPurge(9, ['other']);
-			expect(runtime.store.historyOps()).toEqual([{ seq: 1, op: { op: 'purge', userIds: ['archive-victim'], messageIds: ['no-such-message'] } }]);
+			expect(runtime.store.historyRewrites()).toEqual([{ seq: 1, rewrite: { user: 'archive-victim', into: null, messages: ['no-such-message'] } }]);
 		});
 		expect((await archived()).map((row) => String(row.log_id))).toEqual(logs.slice(3, 7));
 		const early = (await request(peer, 'early', 'history', { room_id: 'general', limit: 50 })).result;
 		expect(early.messages.map((message: { log_id: string }) => message.log_id)).toEqual([logs[3], logs[4], ...logs.slice(6)]);
-		// The next full alarm applies it to D1 (the command asks for one in a second).
+		// The next full alarm delivers it to D1 (the command asks for one in a second).
 		await runInDurableObject(stub(), async (instance, state) => {
 			const runtime = instance as unknown as Runtime;
 			state.storage.sql.exec('UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1');
 			runtime.store.forgetCleanupDue();
 			await runtime.alarm();
-			expect(runtime.store.historyOps()).toEqual([]);
+			expect(runtime.store.historyRewrites()).toEqual([]);
 		});
 		expect((await archived()).map((row) => String(row.log_id))).toEqual([logs[3], logs[4], logs[6]]);
 		// /status shows what each holds against its limit.
@@ -109,7 +109,7 @@ it('moves records past SQLite into D1, serves them in history, and expires them 
 	} finally { peer.close(); }
 });
 
-it('rewrites records below SQLite as /purge and /rename rewrite SQLite\'s, and applies pending ops to pages read there', () => {
+it('rewrites records below SQLite as /purge and /rename rewrite SQLite\'s, and applies pending rewrites to pages read there', () => {
 	const reactions = { kind: 'reactions', record_json: JSON.stringify({ message_id: 'm1', reactions: [{ from: { user_id: 'a' }, emojis: ['👍'] }, { from: { user_id: 'b' }, emojis: ['🎉'] }] }) };
 	expect(JSON.parse(purgedRecord(reactions, ['a'], [])!).reactions).toEqual([{ from: { user_id: 'b' }, emojis: ['🎉'] }]);
 	// Every set on a purged message goes, and a record left empty with them.
@@ -120,7 +120,7 @@ it('rewrites records below SQLite as /purge and /rename rewrite SQLite\'s, and a
 	expect(JSON.parse(renamedRecord(message, 'a', 'b')).from).toEqual({ user_id: 'b', name: 'A' });
 	expect(JSON.parse(renamedRecord(reactions, 'a', 'c')).reactions.map((set: { from: { user_id: string } }) => set.from.user_id)).toEqual(['c', 'b']);
 	expect(JSON.parse(renamedRecord(membership, 'a', 'd')).members[0].user.user_id).toBe('d');
-	// Ops pending for a tier, applied in order to what a page read from it.
+	// Rewrites pending for a tier, applied in order to what a page read from it.
 	const at = (logId: number, kind: string, value: object) => ({ room_id: 'general', log_id: logId, commit_ms: logId, kind, record_json: JSON.stringify(value) });
 	const records = [
 		at(1, 'message', { message_id: 'm1', from: { user_id: 'gone' } }),
@@ -129,7 +129,7 @@ it('rewrites records below SQLite as /purge and /rename rewrite SQLite\'s, and a
 		at(4, 'reactions', { message_id: 'm2', reactions: [{ from: { user_id: 'gone' }, emojis: ['👍'] }, { from: { user_id: 'old' }, emojis: ['🎉'] }] }),
 		at(5, 'membership', { members: [{ user: { user_id: 'gone' }, joined: true }] }),
 	];
-	const result = applyOps(records, [{ op: 'purge', userIds: ['gone'], messageIds: [] }, { op: 'rename', from: 'old', to: 'new' }]);
+	const result = rewritten(records, [{ user: 'gone', into: null }, { user: 'old', into: 'new' }]);
 	expect(result.map((entry) => [entry.log_id, JSON.parse(entry.record_json)])).toEqual([
 		[2, { message_id: 'm2', from: { user_id: 'new' } }],
 		[4, { message_id: 'm2', reactions: [{ from: { user_id: 'new' }, emojis: ['🎉'] }] }],

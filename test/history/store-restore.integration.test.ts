@@ -6,12 +6,12 @@ import { type ArchivedRoom, type ArchivedUser, collectArchive, jsonlReader, json
 import { importArchive } from "../../src/history/archive/import";
 import { MemoryBlobStore } from "./support/memory-blob-store";
 import { ColdHistoryTier } from "../../src/history/cold/tier";
-import { HISTORY_CODECS, archivePipeline } from "../../src/history/config";
+import { HISTORY_CODECS, archiveChain } from "../../src/history/config";
 import { storeExport, storeRestore } from "../../src/history/store-head";
 import { withoutOutputs } from "../../src/history/records";
-import { HistoryPipeline } from "../../src/history/pipeline";
+import { HistoryChain } from "../../src/history/chain";
 import { MemoryHead } from "./support/memory-tiers";
-import { MemoryTierStateStore } from "./support/memory-tiers";
+import { MemoryChainStateStore } from "./support/memory-tiers";
 import { errorCode, withStore, type TestClock } from "../helpers/store";
 
 const DAY_MS = 86_400_000;
@@ -441,8 +441,8 @@ it("imports through the Store: IDs that cannot stand here become placeholders, a
 				messageRecord("lobby", base + 3, { from: { user_id: "admin", roles: ["admin"] }, body: { text: "hi", embeds: Array.from({ length: 100 }, () => ({ kind: "link" })) } }),
 			]);
 		});
-		const pipeline = archivePipeline(undefined, { store, limits: LIMITS, clock: clock.clock });
-		const report = await importArchive(pipeline, storeRestore(store), jsonlReader(linesOf(text)), { clock: clock.clock });
+		const chain = archiveChain(undefined, { store, limits: LIMITS, clock: clock.clock });
+		const report = await importArchive(chain, storeRestore(store), jsonlReader(linesOf(text)), { clock: clock.clock });
 		expect(report).toMatchObject({ roomsAdded: ["lobby"], records: 2, rejected: 1, users: { guest_7: { placeholder: "imported-guest_7" }, bot_ada: { placeholder: "imported-bot_ada" } } });
 		const authors = state.storage.sql.exec<{ author_id: string }>("SELECT author_id FROM message_state ORDER BY author_id").toArray().map((row) => row.author_id);
 		expect(authors).toEqual(["imported-bot_ada", "imported-guest_7"]);
@@ -460,13 +460,13 @@ it("exports a room's whole history after a retitle: the listing's creation, not 
 		for (const text of ["one", "two"]) store.mutate(input(clock, "ada", "message", { room_id: lobby, body: { format: "plain", text } }));
 		store.mutate(input(clock, "ada", "room_set", { room_id: lobby, title: "Lobby, renamed" }));
 		const lines: string[] = [];
-		await exportArchive(archivePipeline(undefined, { store, limits: LIMITS, clock: clock.clock }), storeExport(store), jsonlWriter(async (line) => { lines.push(line); }), { clock: clock.clock, roomIds: [lobby], prepare: withoutOutputs });
+		await exportArchive(archiveChain(undefined, { store, limits: LIMITS, clock: clock.clock }), storeExport(store), jsonlWriter(async (line) => { lines.push(line); }), { clock: clock.clock, roomIds: [lobby], prepare: withoutOutputs });
 		return { text: lines.join(""), clock: clock.value };
 	});
 	const archive = await collectArchive(jsonlReader(linesOf(exported.text)));
 	const target = new MemoryHead("hot", { now: () => exported.clock });
-	const pipeline = new HistoryPipeline({ head: target, headRetention: { thresholdPercent: 100 }, stages: [], state: new MemoryTierStateStore(), clock: { now: () => exported.clock } });
-	const report = await importArchive(pipeline, target, archive, { clock: { now: () => exported.clock }, dryRun: true });
+	const chain = new HistoryChain({ head: target, headRetention: { thresholdPercent: 100 }, stages: [], state: new MemoryChainStateStore(), clock: { now: () => exported.clock } });
+	const report = await importArchive(chain, target, archive, { clock: { now: () => exported.clock }, dryRun: true });
 	expect(report.references).toBe(0);
 	expect(report.records).toBe(archive.records.length);
 	expect(archive.records.filter((record) => record.kind === "message")).toHaveLength(2);

@@ -1,14 +1,14 @@
 /*
  * History tiers in memory: a tier below the head and a head, for tests and the
  * reference model's runs; never in the Worker. They keep records
- * as the SQLite and D1 tiers do, one per room and log ID, and rewrite them
- * with the same functions (records.ts).
+ * as the SQLite and D1 tiers do, one per room and log ID, and take rewrites
+ * as they do, with the same functions (records.ts).
  */
 
 import type { ArchivedRoom, ArchivedUser } from "@apron/archive";
-import { type ChatRecord, type Clock, type HistoryOp, type HistoryQuery, type QueuedOp, type RecordRange, type Retention, type TierStats, authoredMessages, thresholdCount, byLog, limitByLogId, logIds, purgedRecord, renamedRecord, toRange } from "../../../src/history/records";
+import { type ChatRecord, type Clock, type HistoryQuery, type QueuedRewrite, type RecordRange, type Retention, type Rewrite, type TierStats, authoredMessages, thresholdCount, byLog, limitByLogId, logIds, purgedRecord, renamedRecord, toRange } from "../../../src/history/records";
 import { NOT_STALLED } from "../../../src/history/stall";
-import type { Cell, ExportPort, FloorContext, HeadStateUpdate, HistoryHead, LowerStateUpdate, LowerTier, OpLog, OpStep, RestorePort, RestoreResult, TierState, TierStateStore } from "../../../src/history/tier";
+import type { Cell, ChainState, ChainStateStore, ExportPort, FloorContext, HistoryHead, HistoryTier, LinkState, RestorePort, RestoreResult, RewriteLog, TierFloor } from "../../../src/history/tier";
 
 /**
  * The floor a retention allows over a tier's log entries, oldest first
@@ -39,7 +39,7 @@ function retentionFloor(entries: ReadonlyArray<{ log_id: number; commit_ms: numb
 
 const key = (record: Pick<ChatRecord, "room_id" | "log_id">) => `${record.log_id}\u0000${record.room_id}`;
 
-export class MemoryHistoryTier implements LowerTier {
+export class MemoryHistoryTier implements HistoryTier {
 	readonly records = new Map<string, ChatRecord>();
 
 	constructor(readonly name: string) {}
@@ -88,13 +88,12 @@ export class MemoryHistoryTier implements LowerTier {
 		return removed;
 	}
 
-	/** /purge and /rename in one step; a purge tells the messages of its users found here first. */
-	async applyOp(op: HistoryOp, step: OpStep): Promise<undefined> {
-		if (op.op === "purge") {
-			await step.found(authoredMessages(this.all(), op.userIds));
-			this.purgeHere(op.userIds, op.messageIds);
-		} else this.renameHere(op.from, op.to);
-		return undefined;
+	/** /purge and /rename in one step; a purge tells the messages of its user found here first. */
+	async rewrite(rewrite: Rewrite, found: (messageIds: readonly string[]) => Promise<void>): Promise<void> {
+		if (rewrite.into === null) {
+			await found(authoredMessages(this.all(), [rewrite.user]));
+			this.purgeHere([rewrite.user], rewrite.messages ?? []);
+		} else this.renameHere(rewrite.user, rewrite.into);
 	}
 
 	/** Purges the records here: returns the messages of the users found here. */
@@ -118,14 +117,14 @@ export class MemoryHistoryTier implements LowerTier {
 }
 
 /**
- * A head in memory: the records, the op log, the published floor, rooms and
+ * A head in memory: the records, the rewrite log, the published floor, rooms and
  * users; also what imports and exports need of a server (RestorePort,
  * ExportPort). Commits come through `commit` (tests make the log); its
- * retention is its tier's (floorFor), as the pipeline asks.
+ * retention is its tier's (floorFor), as the chain asks.
  */
 export class MemoryHead extends MemoryHistoryTier implements HistoryHead, RestorePort, ExportPort {
 	published = 1;
-	queued: QueuedOp[] = [];
+	queued: QueuedRewrite[] = [];
 	private seq = 0;
 	readonly rooms_ = new Map<string, ArchivedRoom>();
 	readonly people = new Map<string, ArchivedUser>();
@@ -166,13 +165,14 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead, Restor
 		if (floor > this.published) this.published = floor;
 	}
 
-	readonly opLog: OpLog = {
+	readonly rewrites: RewriteLog = {
 		list: async () => this.queued.map((entry) => ({ ...entry })),
+		logged: async () => this.seq,
 		drop: async (seq) => {
 			this.queued = this.queued.filter((entry) => entry.seq > seq);
 		},
 		amend: async (seq, messageIds) => {
-			this.queued = this.queued.map((entry) => entry.seq === seq && entry.op.op === "purge" ? { seq, op: { ...entry.op, messageIds: [...new Set([...entry.op.messageIds, ...messageIds])] } } : entry);
+			this.queued = this.queued.map((entry) => entry.seq === seq && entry.rewrite.into === null ? { seq, rewrite: { ...entry.rewrite, messages: [...new Set([...(entry.rewrite.messages ?? []), ...messageIds])] } } : entry);
 		},
 	};
 
@@ -180,9 +180,9 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead, Restor
 		return this.normalizer ? this.normalizer(record) : record;
 	}
 
-	async queueOp(op: HistoryOp): Promise<void> {
+	private queue(rewrite: Rewrite): void {
 		this.seq += 1;
-		this.queued.push({ seq: this.seq, op });
+		this.queued.push({ seq: this.seq, rewrite });
 	}
 
 	async purge(userIds: readonly string[]): Promise<void> {
@@ -191,7 +191,7 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead, Restor
 			this.people.delete(id);
 			this.retired.add(id);
 		}
-		await this.queueOp({ op: "purge", userIds: [...userIds], messageIds: authored });
+		for (const user of userIds) this.queue({ user, into: null, messages: authored });
 	}
 
 	async rename(from: string, to: string): Promise<void> {
@@ -202,7 +202,7 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead, Restor
 			this.people.set(to, { ...user, user_id: to });
 		}
 		this.retired.add(from);
-		await this.queueOp({ op: "rename", from, to });
+		this.queue({ user: from, into: to });
 	}
 
 	async dropReactionsOn(messageIds: readonly string[]): Promise<void> {
@@ -262,25 +262,29 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead, Restor
 	}
 }
 
-/** A TierStateStore in memory; the head is "hot". */
-export class MemoryTierStateStore implements TierStateStore {
-	private readonly states = new Map<string, TierState>();
-	private readonly initial = (): TierState => ({ floor: 1, target: 1, through: 0, ops: 0, stall: NOT_STALLED });
-	private readonly head = "hot";
-	async load(names: readonly string[]): Promise<Record<string, TierState>> {
-		return Object.fromEntries(names.map((name) => [name, { ...(this.states.get(name) ?? this.initial()) }]));
+/** A ChainStateStore in memory: each tier's and link's state by name, fresh as an empty chain's. */
+export class MemoryChainStateStore implements ChainStateStore {
+	private readonly tiers = new Map<string, TierFloor>();
+	private readonly links = new Map<string, LinkState>();
+	private tier(name: string): TierFloor {
+		return { ...(this.tiers.get(name) ?? { floor: 1, target: 1 }) };
+	}
+	private link(from: string): LinkState {
+		return { ...(this.links.get(from) ?? { through: 0, delivered: 0, stall: NOT_STALLED }) };
+	}
+	async load(names: readonly string[]): Promise<ChainState> {
+		return { tiers: names.map((name) => this.tier(name)), links: names.slice(0, -1).map((name) => this.link(name)) };
+	}
+	async loadLink(from: string): Promise<LinkState> {
+		return this.link(from);
 	}
 	async has(name: string): Promise<boolean> {
-		return this.states.has(name);
+		return this.tiers.has(name);
 	}
-	async saveHead(update: HeadStateUpdate): Promise<void> {
-		await this.saveLower(this.head, update);
+	async saveTier(name: string, update: Partial<TierFloor>): Promise<void> {
+		this.tiers.set(name, { ...this.tier(name), ...Object.fromEntries(Object.entries(update).filter(([, value]) => value !== undefined)) });
 	}
-	async saveLower(name: string, update: LowerStateUpdate): Promise<void> {
-		const { opCursor, ...rest } = update;
-		const merged: TierState = { ...(this.states.get(name) ?? this.initial()), ...Object.fromEntries(Object.entries(rest).filter(([, value]) => value !== undefined)) };
-		if (opCursor === null) delete merged.opCursor;
-		else if (opCursor !== undefined) merged.opCursor = opCursor;
-		this.states.set(name, merged);
+	async saveLink(from: string, update: Partial<LinkState>): Promise<void> {
+		this.links.set(from, { ...this.link(from), ...Object.fromEntries(Object.entries(update).filter(([, value]) => value !== undefined)) });
 	}
 }

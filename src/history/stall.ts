@@ -1,9 +1,8 @@
 /*
- * A hop's stall: whether the work of copying from one tier into the next
- * (the copy itself, or a step on the tier below that the copy waits on) is
- * failing, since when, and whether admins were told. One lifecycle, used by
- * the pipeline and by the runtime for a tier it cannot reach (the D1 tier
- * unbound):
+ * A link's stall: whether its work (a copy or delivery down it, or a step on
+ * the tier below that it waits on) is failing, since when, and whether
+ * admins were told. One lifecycle, used by the chain and by the runtime for
+ * a tier it cannot reach (the D1 tier unbound):
  *
  *   ok --fail(step)--> stalled(since, step) --alert--> alerted(since, step, at)
  *   stalled | alerted --clear(step)--> ok, when `step` is a copy or the step that failed
@@ -11,12 +10,12 @@
  * A success of some other step clears nothing: a trim that works says
  * nothing of a copy that keeps failing.
  *
- * Persisted as `stalledSince`, `stalledOn` and `alertedAt` (fields), the
- * shape tier state is kept in; a stall without `stalledOn` was a copy's.
+ * Persisted as `stalledSince`, `stalledOn` and `alertedAt` (fields), in the
+ * link's state; a stall without a known `stalledOn` is taken for a copy's.
  */
 
-/** The step kinds that can stall a hop (plan.ts Step kinds, but `idle`). */
-export type StallStep = "ops" | "target" | "copy" | "advance" | "trim" | "publish";
+/** The step kinds that can stall a link (link.ts Step kinds, but `idle`). */
+export type StallStep = "deliver" | "target" | "copy" | "advance" | "trim" | "publish";
 
 export type Stall =
 	| { kind: "ok" }
@@ -47,7 +46,7 @@ export interface StallFields {
 	alertedAt?: number;
 }
 
-const STEPS: readonly string[] = ["ops", "target", "copy", "advance", "trim", "publish"];
+const STEPS: readonly string[] = ["deliver", "target", "copy", "advance", "trim", "publish"];
 
 export function stallFromFields(fields: StallFields | undefined): Stall {
 	if (typeof fields?.stalledSince !== "number") return NOT_STALLED;

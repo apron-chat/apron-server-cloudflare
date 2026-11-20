@@ -25,7 +25,7 @@ describe('a hop\'s stall', () => {
 	});
 
 	it('is kept as fields, and read back as it was', () => {
-		const alerted = { kind: 'alerted', since: 1, step: 'ops', at: 2 } as const;
+		const alerted = { kind: 'alerted', since: 1, step: 'deliver', at: 2 } as const;
 		expect(stallFromFields(stallToFields(alerted))).toEqual(alerted);
 		expect(stallToFields(NOT_STALLED)).toEqual({});
 		// A step it cannot read (a damaged field) holds the stall as a copy's, which only a copy clears.

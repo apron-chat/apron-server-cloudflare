@@ -1,7 +1,7 @@
 /*
- * Builds the history pipeline from the Worker's bindings and the
- * LIMIT_* history limits, in a fixed order: the head over the Store's
- * SQLite, then D1 where HISTORY_D1 is bound (and LIMIT_HISTORY_D1_RECORDS is
+ * Builds the history chain from the Worker's bindings and the LIMIT_*
+ * history limits, in a fixed order (the order the tiers are linked in): the
+ * head over the Store's SQLite, then D1 where HISTORY_D1 is bound (and LIMIT_HISTORY_D1_RECORDS is
  * above 0), then the cold tier where HISTORY_BLOB is. There is no tier list
  * to configure: a tier exists where its binding does. Every tier is wrapped
  * for stall tracking.
@@ -19,11 +19,11 @@ import { type ArchiveCodec, gzip } from "@apron/archive";
 import type { ChunkIndex } from "./cold/chunks";
 import { ColdHistoryTier } from "./cold/tier";
 import { D1HistoryTier } from "./d1";
-import { HistoryPipeline, type PipelineStage, instrument } from "./pipeline";
+import { type ChainStage, HistoryChain, instrument } from "./chain";
 import type { Clock, Retention } from "./records";
 import { R2BlobStore } from "./storage/r2";
 import type { BlobStore } from "./storage/store";
-import { type TierStatePort, tierStateStore } from "./state";
+import { type ChainStatePort, chainStateStore } from "./state";
 import type { D1Off } from "./status";
 import { type HeadStore, storeHead } from "./store-head";
 
@@ -75,16 +75,16 @@ export interface BlobStoreChoice {
 	blobProvider?: string;
 }
 
-/** The Store as the pipeline needs it: the head's records and its tier state. */
-export interface PipelineStore extends HeadStore {
-	historyStatePort(): TierStatePort;
+/** The Store as the chain needs it: the head's records and the chain's state. */
+export interface ChainStore extends HeadStore {
+	historyStatePort(): ChainStatePort;
 }
 
 /**
  * Which tiers below the head exist in this deploy, from the bindings and
  * limits alone: the D1 database where the D1 tier is on (d1Enabled), and
  * the blob store where one is bound. Resolved once, before the Store: the
- * Store is `tiered` when there is any (layoutTiered), and the pipeline is
+ * Store is `tiered` when there is any (layoutTiered), and the chain is
  * built from the same layout, so the two cannot disagree.
  */
 export interface HistoryLayout {
@@ -111,7 +111,7 @@ export function layoutTiered(layout: HistoryLayout): boolean {
 export interface BuildOptions {
 	layout: HistoryLayout;
 	limits: HistoryLimits;
-	store: PipelineStore;
+	store: ChainStore;
 	clock: Clock;
 	track?: HistoryTrack;
 	/** The cold tier's chunk index (the Store's SQLite in the Durable Object); without it, no cold tier. */
@@ -158,11 +158,15 @@ export function headRetention(limits: HistoryLimits): Retention {
 
 const tracker = (options: BuildOptions): HistoryTrack => options.track ?? ((_kind, _method, call) => call());
 
-/** The pipeline: SQLite, then D1 and the cold tier where the layout has them. Undefined when there is no tier below the head. */
-export function buildHistoryPipeline(options: BuildOptions): HistoryPipeline | undefined {
+/**
+ * The chain: SQLite, linked to D1 and D1 to the cold tier, where the layout
+ * has them. D1 takes /purge and /rename; the cold tier does not, so its link
+ * acknowledges them (chain.ts). Undefined when there is no tier below the head.
+ */
+export function buildHistoryChain(options: BuildOptions): HistoryChain | undefined {
 	const { layout, limits } = options;
 	const track = tracker(options);
-	const stages: PipelineStage[] = [];
+	const stages: ChainStage[] = [];
 	if (layout.d1) {
 		stages.push({
 			tier: instrument(new D1HistoryTier(D1_TIER, layout.d1), (method, call) => track("d1", method, call)),
@@ -182,20 +186,20 @@ export function buildHistoryPipeline(options: BuildOptions): HistoryPipeline | u
 			label: layout.blobLabel ?? "blobs",
 		});
 	}
-	return stages.length ? headPipeline(options, stages) : undefined;
+	return stages.length ? headChain(options, stages) : undefined;
 }
 
-/** A pipeline of the Store's head and `stages`. */
-function headPipeline(options: Pick<BuildOptions, "store" | "limits" | "clock">, stages: PipelineStage[]): HistoryPipeline {
+/** A chain of the Store's head and `stages`. */
+function headChain(options: Pick<BuildOptions, "store" | "limits" | "clock">, stages: ChainStage[]): HistoryChain {
 	const head = storeHead(HEAD_TIER, options.store);
-	return new HistoryPipeline({ head, headRetention: headRetention(options.limits), stages, state: tierStateStore(options.store.historyStatePort(), HEAD_TIER), clock: options.clock });
+	return new HistoryChain({ head, headRetention: headRetention(options.limits), stages, state: chainStateStore(options.store.historyStatePort(), HEAD_TIER), clock: options.clock });
 }
 
 /**
- * The pipeline exports and imports read and write: the history pipeline
- * when there is one, else the head alone (a server whose history lives in
- * its SQLite only can still be backed up and restored).
+ * The chain exports and imports read and write: the history chain when
+ * there is one, else the head alone (a server whose history lives in its
+ * SQLite only can still be backed up and restored).
  */
-export function archivePipeline(pipeline: HistoryPipeline | undefined, options: Pick<BuildOptions, "store" | "limits" | "clock">): HistoryPipeline {
-	return pipeline ?? headPipeline(options, []);
+export function archiveChain(chain: HistoryChain | undefined, options: Pick<BuildOptions, "store" | "limits" | "clock">): HistoryChain {
+	return chain ?? headChain(options, []);
 }

@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 import { Store, type StoreConfig, type StoreMutationInput } from "../src/store";
-import { tierStateStore } from "../src/history/state";
+import { chainStateStore } from "../src/history/state";
 import { NOT_STALLED } from "../src/history/stall";
 import { BY_AGE, expectRetryAfter, messagesOf, RETENTION_MS, withStore as withNamedStore, type TestClock } from "./helpers/store";
 
@@ -274,7 +274,7 @@ it("expires records past retentionSeconds whatever the count", async () => {
 	});
 });
 
-it("with tiers below, removes records from SQLite only once copied, and keeps the published floor until the pipeline raises it", async () => {
+it("with tiers below, removes records from SQLite only once copied, and keeps the published floor until the chain raises it", async () => {
 	const tiered: Partial<StoreConfig> = {
 		tiered: true, retentionRecords: 3, minRetentionMs: DAY_MS, retentionMs: 0, cleanupThresholdPercent: 100,
 		anonymousPostsPerMinute: 1_000, ipPostsPerMinute: 1_000, globalPostsPerMinute: 1_000,
@@ -300,18 +300,18 @@ it("with tiers below, removes records from SQLite only once copied, and keeps th
 		expect(store.historyTarget(clock.value)).toBe(Number(logs[5]));
 		const scanned = store.historyScan(Number(general), 100, clock.value).filter((row) => row.log_id < Number(logs[5]));
 		expect(scanned.map((row) => BigInt(row.log_id))).toEqual([general, ...logs.slice(0, 5)]);
-		const tiers = tierStateStore(store.historyStatePort(), "hot");
-		await tiers.saveHead({ through: Number(logs[4]) });
+		const tiers = chainStateStore(store.historyStatePort(), "hot");
+		await tiers.saveLink("hot", { through: Number(logs[4]) });
 		expect(await tiers.load(["hot", "recent"])).toEqual({
-			hot: { floor: 1, target: 1, through: Number(logs[4]), ops: 0, stall: NOT_STALLED },
-			recent: { floor: 1, target: 1, through: 0, ops: 0, stall: NOT_STALLED },
+			tiers: [{ floor: 1, target: 1 }, { floor: 1, target: 1 }],
+			links: [{ through: Number(logs[4]), delivered: 0, stall: NOT_STALLED }],
 		});
-		// A failing copy from SQLite is kept, for /status and the admins' alert, until one succeeds.
+		// A failing link from SQLite is kept, for /status and the admins' alert, until it works again.
 		const alerted = { kind: "alerted", since: 123, step: "copy", at: 456 } as const;
-		await tiers.saveHead({ stall: alerted });
-		expect((await tiers.load(["hot"])).hot.stall).toEqual(alerted);
-		await tiers.saveHead({ stall: NOT_STALLED });
-		expect((await tiers.load(["hot"])).hot.stall).toEqual(NOT_STALLED);
+		await tiers.saveLink("hot", { stall: alerted });
+		expect((await tiers.loadLink("hot")).stall).toEqual(alerted);
+		await tiers.saveLink("hot", { stall: NOT_STALLED });
+		expect((await tiers.loadLink("hot")).stall).toEqual(NOT_STALLED);
 		due();
 		const moved = store.runCleanup(clock.value);
 		expect(moved.deleted_records).toBe(6);
@@ -330,7 +330,7 @@ it("with tiers below, removes records from SQLite only once copied, and keeps th
 		// Without them, SQLite's part alone.
 		expect(messagesOf(store.history({ roomId: "general", before: String(logs[7] + 1n), limit: 10, now: clock.value })).map((entry) => BigInt(entry.log_id))).toEqual(logs.slice(5));
 
-		// The pipeline raises the published floor, never past the hot floor, and makes cleanup due.
+		// The chain raises the published floor, never past the hot floor, and makes cleanup due.
 		store.publishHistoryFloor(Number(logs[1]), clock.value);
 		expect(store.logBounds().history_floor).toBe(String(logs[1]));
 		store.publishHistoryFloor(Number(logs[7]), clock.value);
@@ -341,9 +341,9 @@ it("with tiers below, removes records from SQLite only once copied, and keeps th
 	});
 });
 
-it("forgets the pipeline's floors, queue and tier state once tiers are off, so turning them on again starts at the hot floor", async () => {
+it("forgets the chain's floors, queue, tier and link state once tiers are off, so turning them on again starts at the hot floor", async () => {
 	await withStore("history-off", { cleanupIntervalMs: 3_600_000 }, (_store, clock, state) => {
-		state.storage.sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('history:published', '5'), ('history:head:through', '7'), ('history:ops', '[]'), ('history:tier:recent', '{}'), ('history:export:nightly', '123'), ('historyx', 'kept')");
+		state.storage.sql.exec("INSERT OR REPLACE INTO _meta (key, value) VALUES ('history:published', '5'), ('history:head:through', '7'), ('history:ops', '[]'), ('history:tier:recent', '{}'), ('history:link:hot', '{}'), ('history:export:nightly', '123'), ('historyx', 'kept')");
 		const off = new Store(state, { ...BY_AGE, tiered: false, cleanupIntervalMs: 3_600_000 }, clock.clock);
 		clock.value += DAY_MS;
 		state.storage.sql.exec("UPDATE maintenance SET next_cleanup_ms = 0 WHERE id = 1");

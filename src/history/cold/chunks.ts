@@ -10,7 +10,7 @@
  * such log ID is stored in, and decoding gives one record per room again.
  */
 
-import { type ArchiveCodec, type ArchiveHeader, archiveName, encodedArchiveWriter, namedUsers, openArchive } from "@apron/archive";
+import { type ArchiveCodec, type ArchiveHeader, archiveName, encodedArchiveWriter, openArchive } from "@apron/archive";
 import { type ChatRecord, byLog } from "../records";
 import { storedChain, storedOptions } from "../storage/encoding";
 import type { BlobStore } from "../storage/store";
@@ -29,8 +29,6 @@ export interface ChunkRef {
 	bytes: number;
 	/** Rooms with a record in it, sorted: reads skip chunks without theirs. */
 	rooms: string[];
-	/** Users its records name (namedUsers), sorted: /purge and /rename skip chunks without theirs. */
-	users: string[];
 }
 
 /**
@@ -70,7 +68,6 @@ export function chunkRef(key: string, records: readonly ChatRecord[], bounds: { 
 	return {
 		first: bounds.first, last: bounds.last, key, records: records.length, bytes,
 		rooms: [...new Set(records.map((record) => record.room_id))].sort(),
-		users: [...new Set(records.flatMap(namedUsers))].sort(),
 	};
 }
 

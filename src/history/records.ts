@@ -6,8 +6,9 @@
  * `history` serves it, with the room it is logged in and its log ID. A move
  * is logged once per room it belongs to: two records, one log ID. The
  * record type and its format-level helpers are @apron/archive's
- * (packages/archive/src/records.ts); this module adds what the pipeline
- * needs: ranges, queries, retention, and the op log of /purge and /rename.
+ * (packages/archive/src/records.ts); this module adds what the chain
+ * needs: ranges, queries, retention, and the rewrites /purge and /rename
+ * send down the chain.
  *
  * Everything here is pure: no I/O, no clock.
  */
@@ -80,15 +81,22 @@ export interface Clock {
 	now(): number;
 }
 
-/** What `/purge` or `/rename` did to the head, for the tiers below to do too. */
-export type HistoryOp =
-	| { op: "purge"; userIds: string[]; messageIds: string[] }
-	| { op: "rename"; from: string; to: string };
+/**
+ * What `/purge` or `/rename` did at the head, for the tiers below to do
+ * too: `user` renamed `into` another ID, or purged (`into` null). A purge
+ * goes with the messages of its user found so far (`messages`): reaction
+ * sets on them go too, wherever they are.
+ */
+export interface Rewrite {
+	user: string;
+	into: string | null;
+	messages?: string[];
+}
 
-/** A HistoryOp in the head's op log, numbered in order. */
-export interface QueuedOp {
+/** A Rewrite in the head's log, numbered in order: links deliver them down the chain in that order. */
+export interface QueuedRewrite {
 	seq: number;
-	op: HistoryOp;
+	rewrite: Rewrite;
 }
 
 /** The records a count keeps under a threshold: `percent` of `limit`, at least one; 0 without a limit. */
@@ -124,24 +132,25 @@ export function toRange(records: readonly ChatRecord[]): RecordRange {
 }
 
 /**
- * Records with `/purge` and `/rename` applied in order, as a tier below the head
- * applies them to what it holds: a purged user's message snapshots go, with
- * every reaction set on those messages (the op's own, and those found among
- * `records`), and their reaction sets and memberships; a record left empty
- * goes. Used on pages read from a tier that has yet to apply them.
+ * Records with rewrites applied in order, as a tier that takes them
+ * (HistoryTier.rewrite) applies them to what it holds: a purged user's
+ * message snapshots go, with every reaction set on those messages (the
+ * rewrite's own, and those found among `records`), and their reaction sets
+ * and memberships; a record left empty goes. Used on pages read from a tier
+ * a rewrite has yet to reach.
  */
-export function applyOps(records: readonly ChatRecord[], ops: readonly HistoryOp[]): ChatRecord[] {
+export function rewritten(records: readonly ChatRecord[], rewrites: readonly Rewrite[]): ChatRecord[] {
 	let out = [...records];
-	for (const op of ops) {
-		if (op.op === "purge") {
-			const messages = [...new Set([...op.messageIds, ...authoredMessages(out, op.userIds)])];
+	for (const { user, into, messages } of rewrites) {
+		if (into === null) {
+			const dropped = [...new Set([...(messages ?? []), ...authoredMessages(out, [user])])];
 			out = out.flatMap((record) => {
-				const json = purgedRecord(record, op.userIds, messages);
+				const json = purgedRecord(record, [user], dropped);
 				return json === null ? [] : [json === record.record_json ? record : { ...record, record_json: json }];
 			});
 		} else {
 			out = out.map((record) => {
-				const json = renamedRecord(record, op.from, op.to);
+				const json = renamedRecord(record, user, into);
 				return json === record.record_json ? record : { ...record, record_json: json };
 			});
 		}
