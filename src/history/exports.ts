@@ -16,7 +16,7 @@
  * nothing behind.
  */
 
-import { ARCHIVE_CODECS, type ArchiveCodec, type ArchiveHeader, type ArchiveWriter, archiveName, encodedArchiveWriter, type OpenedArchive, readEncodedArchive } from "@apron/archive";
+import { ARCHIVE_CODECS, type ArchiveCodec, type ArchiveHeader, type ArchiveWriter, archiveName, archiveSink, jsonlWriter, type OpenedArchive, readEncodedArchive, utf8Length } from "@apron/archive";
 import { type ExportOptions, type ExportReport, exportArchive } from "./archive/export";
 import type { HistoryChain } from "./chain";
 import type { Clock } from "./records";
@@ -62,9 +62,31 @@ export function backupFamily(kind: BackupKind, server: string, registry: Readonl
 	return { prefix, pattern: new RegExp(`^${escape(prefix)}\\d{8}-\\d{6}\\.jsonl${extensions ? `(?:${extensions})*` : ""}$`) };
 }
 
+/**
+ * The largest archive `/history import` reads, decoded (and stored): it
+ * holds the whole archive in memory while it plans, in the object's 128 MB
+ * isolate. Collecting and planning take over 3 times the decoded size at
+ * their peak (the records, parsed parts, then remapped and normalized
+ * copies): measured in V8 under a 100 MB heap, 24 MiB fit and 32 MiB ran
+ * out. 16 MiB peaks near 55 MB, leaving the rest for the object's own state
+ * and the restore's writes. Streaming the import is future work; until
+ * then, a backup larger than this (BackupResult.decodedBytes) is said so
+ * when written.
+ */
+export const MAX_IMPORT_BYTES = 16 * 1024 * 1024;
+
+/** A backup past what an import takes: said with its size, so an operator knows before needing it. */
+export function importableWarning(decodedBytes: number): string {
+	if (decodedBytes <= MAX_IMPORT_BYTES) return "";
+	const mib = (bytes: number) => `${(bytes / 1_048_576).toFixed(1)} MiB`;
+	return `\nThis backup is ${mib(decodedBytes)} decoded, more than the ${mib(MAX_IMPORT_BYTES)} \`/history import\` reads: it cannot be imported here whole. Export rooms in parts (\`/history export <room_id>...\`) to have importable backups.`;
+}
+
 export interface BackupResult extends ExportReport {
 	key: string;
 	deleted: string[];
+	/** The archive's size before the codec chain (what an import decodes and holds). */
+	decodedBytes: number;
 }
 
 /**
@@ -86,19 +108,26 @@ export class BackupStore {
 	 * into the store (R2: a multipart upload); a failure aborts it, leaving
 	 * nothing. A key taken already (a backup this second) fails it.
 	 */
-	async write<T>(key: string, fill: (archive: ArchiveWriter) => Promise<T>): Promise<T> {
+	async write<T>(key: string, fill: (archive: ArchiveWriter) => Promise<T>): Promise<{ value: T; decodedBytes: number }> {
 		// Keys are to the second: a second backup within it would replace the first.
 		if ((await this.blobs.list(key, { limit: 1 })).keys.some((entry) => entry.key === key)) {
 			throw new Error(`the backup ${key} exists already (another backup this second): try again in a moment`);
 		}
 		const writer = await this.blobs.writer(key, storedOptions(this.codecs));
-		const archive = encodedArchiveWriter((bytes) => writer.write(bytes), this.codecs);
+		// The archive's lines as written, counted before the chain: what an import decodes.
+		let decodedBytes = 0;
+		const sink = archiveSink((bytes) => writer.write(bytes), this.codecs);
+		const lines = jsonlWriter((line) => {
+			decodedBytes += utf8Length(line) + (line.endsWith("\n") ? 0 : 1);
+			return sink.write(line);
+		});
+		const archive: ArchiveWriter = { ...lines, close: async () => { await lines.close(); await sink.close(); } };
 		try {
-			const result = await fill(archive);
+			const value = await fill(archive);
 			await writer.close();
-			return result;
+			return { value, decodedBytes };
 		} catch (error) {
-			await archive.abort(error);
+			await sink.abort(error);
 			await writer.abort().catch(() => undefined);
 			throw error;
 		}
@@ -142,11 +171,11 @@ export class BackupStore {
  */
 export async function writeBackup(chain: HistoryChain, server: ExportPort, backups: BackupStore, settings: BackupSettings, kind: BackupKind, options: { server: string; clock: Clock; roomIds?: string[]; header?: Partial<ArchiveHeader>; prepare: ExportOptions["prepare"]; maxMembers?: number }): Promise<BackupResult> {
 	const key = backups.key(kind, options.server, options.clock.now());
-	const report = await backups.write(key, (archive) => exportArchive(chain, server, archive, {
+	const { value: report, decodedBytes } = await backups.write(key, (archive) => exportArchive(chain, server, archive, {
 		clock: options.clock, header: { server: options.server, ...options.header }, ...(options.roomIds ? { roomIds: options.roomIds } : {}),
 		privateRooms: settings.privateRooms,
 		prepare: options.prepare,
 		...(options.maxMembers !== undefined ? { maxMembers: options.maxMembers } : {}),
 	}));
-	return { ...report, key, deleted: await backups.prune(kind, options.server, settings.keep) };
+	return { ...report, key, decodedBytes, deleted: await backups.prune(kind, options.server, settings.keep) };
 }

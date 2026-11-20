@@ -9,7 +9,7 @@ import { archiveChain, blobStoreOf, buildHistoryChain, D1_TIER, d1Off, HEAD_TIER
 import { type D1Off, detailLines, statusLines } from "./history/status";
 import { storeExport, storeRestore } from "./history/store-head";
 import { hasOutputRef, refsOf, terminalOutputKeys, withTerminalOutputs } from "./content/output-ref";
-import { type BackupKind, BackupStore, writeBackup } from "./history/exports";
+import { type BackupKind, BackupStore, MAX_IMPORT_BYTES, importableWarning, writeBackup } from "./history/exports";
 import { type HistoryHolder, type HistoryLease, HistorySchedule, isRefusal, refusalMessage } from "./history/schedule";
 import type { HistoryChain } from "./history/chain";
 import { type ChatRecord, type PublicRecord, asPublic } from "./history/records";
@@ -709,9 +709,6 @@ type HistoryArgs =
 const HISTORY_IMPORT_FLAGS: readonly string[] = ["dry-run", "match", "new", "renumber", "restart"];
 
 /** `/history`'s arguments; `busy` while an export or import runs, which refuses another before its arguments are read. */
-/** The largest file `/history import` reads: it holds the whole archive in memory while it plans. */
-const MAX_IMPORT_BYTES = 64 * 1024 * 1024;
-
 /** `/history import`'s notice: what it added, or would, and what it left out. */
 function importNotice(report: ImportReport): string {
 	const users = Object.entries(report.users).map(([from, to]) => "matched" in to ? `${from} → ${to.matched}` : `${from} → ${to.placeholder} (unclaimed)`);
@@ -9176,7 +9173,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				const truncated = result.truncated.length
 					? `\nMembers truncated in ${result.truncated.length} rooms (${result.truncated.map((room) => `\`${room.room_id}\` ${room.kept} of ${room.members}`).join(", ")}): a listing carries at most ${MAX_LISTING_MEMBERS} members.`
 					: "";
-				done(`Backed up ${result.rooms} rooms, ${result.users} users and ${result.records} records to \`${result.key}\`.${truncated}`);
+				done(`Backed up ${result.rooms} rooms, ${result.users} users and ${result.records} records to \`${result.key}\`.${truncated}${importableWarning(result.decodedBytes)}`);
 				return;
 			}
 			case "import": {
@@ -9233,7 +9230,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 			// Noted first: a failing backup waits its interval rather than retrying on every alarm.
 			this.store.setHistoryMeta(META_SCHEDULED_BACKUP, String(now), now);
 			const result = await this.underHistoryLease({ kind: "job", job: "backup" }, () => this.writeBackup(store, "scheduled"));
-			console.log(JSON.stringify({ event: "history_export", key: result.key, records: result.records, deleted: result.deleted.length }));
+			console.log(JSON.stringify({ event: "history_export", key: result.key, records: result.records, decoded_bytes: result.decodedBytes, deleted: result.deleted.length }));
+			if (result.decodedBytes > MAX_IMPORT_BYTES) console.warn(JSON.stringify({ event: "history_export_unimportable", key: result.key, decoded_bytes: result.decodedBytes, max_import_bytes: MAX_IMPORT_BYTES }));
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "history_export_failed", message: error instanceof Error ? error.message : String(error) }));
 		}

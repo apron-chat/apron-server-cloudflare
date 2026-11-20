@@ -921,7 +921,9 @@ the newest `BACKUP_KEEP` are deleted, and nothing else under `backups/`.
   `/rename` are refused while an import runs, and an import while one of
   them does.
 - **`/history import <key> [dry-run] [match|new] [renumber] [restart]`** (admins) reads
-  an object of the backup store (at most 64 MiB, stored and decoded), a
+  an object of the backup store (at most 16 MiB, stored and decoded: a
+  backup past that is warned of when written, and a streaming import is
+  future work), a
   backup or any ARCHIVE.md v1 file put there, gzip-compressed (`.jsonl.gz`,
   or its metadata says so) or plain (`.jsonl`), and adds what is new, after
   planning the whole file:
