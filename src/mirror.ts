@@ -512,6 +512,7 @@ export class RemoteRooms {
 		this.touch(session.server);
 		// Joins and leaves that a close cut off go now (they wait for this dial to finish).
 		void this.flushMemberships(session.server);
+		void this.flushRenames(session.server);
 		return connection;
 	}
 
@@ -1127,15 +1128,63 @@ export class RemoteRooms {
 		return id;
 	}
 
-	/** Mirror hook, after a local user's profile change: sent to each owner that knows them, if connected. */
-	onProfile(userId: string, name: string): void {
-		for (const [server, session] of this.sessions) {
-			const connection = session.connection;
-			if (!connection?.open) continue;
-			void this.store.withMeterAsync("foreground", { reads: 1 }, () => this.host.storage.get<OwnerUser>(`${USER_KEY_PREFIX}${server}|${userId}`))
-				.then((known) => (known ? this.ownerUser(connection, server, userId, name) : undefined))
-				.catch(() => undefined);
+	/**
+	 * Mirror hook, after a local user's change of name: queued for each owner
+	 * (MirrorState `renames`), and sent at once to those connected; the
+	 * others get it on their next connection (flushRenames).
+	 */
+	onProfile(userId: string): void {
+		const state = this.store.mirrorState(this.now());
+		for (const [server, entry] of Object.entries(state.servers)) {
+			entry.renames = [...(entry.renames ?? []).filter((id) => id !== userId), userId].slice(-MAX_QUEUED_MEMBERSHIPS);
 		}
+		if (!Object.keys(state.servers).length) return;
+		this.store.setMirrorState(state, this.now());
+		for (const [server, session] of this.sessions) if (session.connection?.open) void this.flushRenames(server);
+	}
+
+	private readonly renameFlushes = new Map<string, Promise<void>>();
+
+	/**
+	 * Sends the queued names of one owner, one flush at a time, on its open
+	 * connection: a `me` for each user the owner knows (ownerUser) whose name
+	 * there is not their name here. Each leaves the queue once the owner
+	 * answered, or when the owner does not know the user (their first write
+	 * sends it).
+	 */
+	private flushRenames(server: string): Promise<void> {
+		const next = (this.renameFlushes.get(server) ?? Promise.resolve()).then(async () => {
+			const connection = this.sessions.get(server)?.connection;
+			const session = this.sessions.get(server);
+			if (!connection?.open || !session) return;
+			session.inflight += 1;
+			try {
+				for (const userId of [...this.store.mirrorState(this.now()).servers[server]?.renames ?? []]) {
+					const name = this.store.getIdentity(userId)?.name ?? "";
+					const key = `${USER_KEY_PREFIX}${server}|${userId}`;
+					const known = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.host.storage.get<OwnerUser>(key));
+					if (known && known.name !== name) {
+						await this.ownerUser(connection, server, userId, name);
+						const sent = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.host.storage.get<OwnerUser>(key));
+						// Unanswered (the connection closed): it stays for the next connection.
+						if (sent?.name !== name) return;
+					}
+					const state = this.store.mirrorState(this.now());
+					const entry = state.servers[server];
+					if (!entry?.renames) return;
+					entry.renames = entry.renames.filter((id) => id !== userId);
+					if (!entry.renames.length) delete entry.renames;
+					this.store.setMirrorState(state, this.now());
+				}
+			} finally {
+				session.inflight -= 1;
+				this.touch(server);
+			}
+		}).catch((error) => {
+			console.warn(JSON.stringify({ event: "remote_rename_not_sent", server, error: error instanceof Error ? error.message : String(error) }));
+		});
+		this.renameFlushes.set(server, next);
+		return next;
 	}
 
 	/** A local request's params with its IDs mapped to the owner's: rooms, messages (from the copies), users. */

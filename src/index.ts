@@ -5196,7 +5196,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.reply(socket, request, { you: { ...this.you(current), ...cleared } });
 			if (result.deduplicated || (name === undefined && !changed)) return;
 			// ext:remote hook: the owners of the rooms this user writes in mirrored get the new name.
-			if (name !== undefined) this.remote?.onProfile(identity.user_id, name);
+			if (name !== undefined) this.remote?.onProfile(identity.user_id);
 			// §3.3: `you` to the user's other connections, `new` to those who share
 			// a room with the user, with the ext keys that changed (§4.13).
 			const user = { ...this.current(current)!, ...(current.name ? {} : { name: "" }), ...(changed ? { ext: changed } : {}) };

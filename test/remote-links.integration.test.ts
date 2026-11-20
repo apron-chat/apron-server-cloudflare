@@ -2,6 +2,7 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { Store, type MessageSnapshot } from '../src/store';
 import { RemoteRooms, type MirrorHost } from '../src/mirror';
+import { LinkConnection } from '../src/remote-client';
 import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
 
 // The owner's side of extension `ext:remote`: an admin's `/remote invite` binds
@@ -626,5 +627,46 @@ it('a mirror maps an owner\'s user without remote by the form of its ID, and nev
 		expect(store.getIdentity('zed@c.example')?.name).toBe('Zed Z');
 		// Its stored remote is the normalized address.
 		expect(store.getIdentity('zed@c.example')?.ext?.remote).toEqual({ server: 'wss://c.example/ws', user_id: 'zed' });
+	});
+});
+
+it('a mirror sends a rename made while disconnected on its next connection', async () => {
+	await runInDurableObject(env.DEMO.getByName(`mirror-rename-${crypto.randomUUID()}`), async (_instance, state) => {
+		const now = Date.now();
+		const store = new Store(state, {});
+		store.initialize();
+		state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES ('bob', '', 'Bob', 'registered', ?, ?, '[]')", now, now);
+		const server = 'ws://a.example/ws';
+		store.setMirrorState({ rooms: [{ room_id: 'general', server, owner_room: 'ops', token: 't', start: 0, threads: {} }], servers: { [server]: { cursor: 0 } } });
+		// The owner knows Bob by his old name.
+		await state.storage.put(`remote-user:${server}|bob`, { id: 'bob@demo.test', name: 'Bobby' });
+		const host = { store, self: 'wss://demo.test/ws', storage: state.storage, lingerMs: 60_000 } as unknown as MirrorHost;
+		const mirror = new RemoteRooms(host) as unknown as { onProfile(userId: string): void; flushRenames(server: string): Promise<void>; sessions: Map<string, unknown> };
+		// Disconnected: it is queued.
+		mirror.onProfile('bob');
+		expect(store.mirrorState().servers[server].renames).toEqual(['bob']);
+		// A stand-in owner on the next connection gets the me, and the queue empties.
+		const pair = new WebSocketPair();
+		const owner = pair[1];
+		owner.accept();
+		const requests: Array<Record<string, any>> = [];
+		owner.addEventListener('message', (event) => {
+			const frame = JSON.parse(String(event.data));
+			requests.push(frame);
+			owner.send(JSON.stringify({ id: frame.id, result: frame.method === 'auth' ? { you: { user_id: 'link_1' } } : { you: { user_id: 'bob@demo.test', name: 'Bob' } } }));
+		});
+		vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+			setTimeout(() => owner.send(JSON.stringify({ method: 'server', params: { apron: 10 } })), 0);
+			return new Response(null, { status: 101, webSocket: pair[0] });
+		});
+		try {
+			const connection = await LinkConnection.open(server, 't');
+			mirror.sessions.set(server, { server, connection, inflight: 0 });
+			await mirror.flushRenames(server);
+			expect(requests.filter((frame) => frame.method === 'me').map((frame) => frame.params)).toEqual([{ name: 'Bob', ext: { remote: { user_id: 'bob' } } }]);
+			expect(store.mirrorState().servers[server].renames).toBeUndefined();
+			expect(await state.storage.get(`remote-user:${server}|bob`)).toEqual({ id: 'bob@demo.test', name: 'Bob' });
+			connection.close();
+		} finally { vi.restoreAllMocks(); }
 	});
 });
