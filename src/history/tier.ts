@@ -165,7 +165,7 @@ export interface RestoreResult {
 	stored?: number;
 	/** Messages whose ID another message here holds: their state (and reaction sets) were left as they are. */
 	collided?: number;
-	/** Records dropped: not something a client could have sent (normalizeRecord). */
+	/** Records dropped: not something a client could have sent (RestorePort.normalize). */
 	rejected?: number;
 }
 

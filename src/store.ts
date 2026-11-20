@@ -4012,7 +4012,7 @@ export class Store {
     return this.reserved({ reads: 4 }, true, now, () => this.metaJson(META_HISTORY_OPS, (value) => Array.isArray(value) ? value as QueuedOp[] : undefined, []));
   }
 
-  /** Adds `messageIds` to queued purge `seq` (HistoryHead.amendPurge): messages of its users a tier below found. */
+  /** Adds `messageIds` to queued purge `seq` (OpLog.amend): messages of its users a tier below found. */
   amendHistoryPurge(seq: number, messageIds: readonly string[], now = this.clock.now()): void {
     this.ensureReady();
     if (!messageIds.length) return;
@@ -4127,7 +4127,7 @@ export class Store {
 
   /**
    * Import: an archived record as a client could have sent it, or null when
-   * none could have (HistoryHead.normalizeRecord): every recorded user
+   * none could have (RestorePort.normalize): every recorded user
    * (`from`, reaction sets' `from`, members' `user`) bare, `user_id` and a
    * name within the name limits, and never a server notice's (`~…`); a
    * message's body normalized as a post's (normalizedBody: text size, embeds,
@@ -4491,7 +4491,7 @@ export class Store {
     return this.reserved({ reads: 4 }, true, now, () => this.metaNumber(key));
   }
 
-  /** The running import's journal (`history:import`, HistoryHead.journal): what a retry needs to finish it. */
+  /** The running import's journal (`history:import`, RestorePort.journal): what a retry needs to finish it. */
   historyImportJournal(now = this.clock.now()): string | undefined {
     this.ensureReady();
     return this.reserved({ reads: 4 }, true, now, () => this.metaValue(META_HISTORY_IMPORT) || undefined);
