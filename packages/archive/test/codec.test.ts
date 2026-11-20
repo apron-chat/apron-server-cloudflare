@@ -14,6 +14,7 @@ import {
 	encodeStream,
 	gzip,
 	openArchive,
+	readEncodedArchive,
 	parseCodecNames,
 } from "../src/codec.ts";
 import { collectArchive, jsonlReader, linesOf } from "../src/format.ts";
@@ -124,14 +125,13 @@ describe("codecs", () => {
 			await writer.header({ apron_archive: 1 });
 			await writer.listing({ not_joined: [{ room_id: "r", log_id: "1" }] });
 		});
-		const reader = openArchive(streamOf([bytes]), { codecs: [gzip, sealed] });
-		await reader.header();
-		expect(reader.verified()).toBe(false);
-		await collectArchive(reader);
-		expect(reader.verified()).toBe(true);
-		const plain = openArchive(streamOf([await written([gzip], async (writer) => { await writer.header({ apron_archive: 1 }); })]), { codecs: [gzip] });
-		await collectArchive(plain);
-		expect(plain.verified()).toBe(false);
+		const opened = await readEncodedArchive(streamOf([bytes]), { codecs: [gzip, sealed] });
+		expect(opened.provenance).toBe("verified");
+		expect(opened.archive.rooms).toHaveLength(1);
+		const plain = await readEncodedArchive(streamOf([await written([gzip], async (writer) => { await writer.header({ apron_archive: 1 }); })]), { codecs: [gzip] });
+		expect(plain.provenance).toBe("unverified");
+		// A damaged archive gives nothing to trust: it does not read at all.
+		await expect(readEncodedArchive(streamOf([bytes.slice(0, bytes.length - 4)]), { codecs: [gzip, sealed] })).rejects.toThrow();
 	});
 
 	it("are named, recorded and found by name or extension; an unknown one is refused", () => {

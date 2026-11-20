@@ -13,10 +13,10 @@
  * and decoded in reverse. A codec that authenticates (`authenticates:
  * true`) must error its decoder's stream on any failure, a truncated end
  * included, so that an archive read to its end through it is verified: that
- * is the one fact a reader may trust more on (see openArchive, `verified`).
+ * is the one fact a reader may trust more on (see readEncodedArchive, `provenance`).
  */
 
-import { jsonlReader, jsonlWriter, type JsonlWriterOptions, linesFromStream, MAX_READ_LINE_BYTES } from "./format.ts";
+import { type CollectedArchive, collectArchive, jsonlReader, jsonlWriter, type JsonlWriterOptions, linesFromStream, MAX_READ_LINE_BYTES } from "./format.ts";
 import type { ArchiveReader, ArchiveWriter } from "./types.ts";
 
 export interface ArchiveCodec {
@@ -193,14 +193,13 @@ export interface OpenArchiveOptions {
 	maxBytes?: number;
 }
 
-/** An ArchiveReader that also says whether what it read was verified. */
-export interface OpenedArchive extends ArchiveReader {
-	/**
-	 * True once the archive has been read to its end through a chain with an
-	 * authenticating codec: only then is it known to be this deployment's
-	 * own, unaltered. False before the end, and always without one.
-	 */
-	verified(): boolean;
+/** Whether an archive was read through an authenticating codec to its end (readEncodedArchive): the one fact a reader may trust more on. */
+export type Provenance = "verified" | "unverified";
+
+/** An archive read whole, and what it is known to be. */
+export interface OpenedArchive {
+	archive: CollectedArchive;
+	provenance: Provenance;
 }
 
 /**
@@ -208,7 +207,7 @@ export interface OpenedArchive extends ArchiveReader {
  * from its lines (no codecs). The decoded bytes are split into lines with
  * the reader's line cap, then read as jsonlReader reads them.
  */
-export function openArchive(source: ReadableStream<Uint8Array> | AsyncIterable<string>, options: OpenArchiveOptions = {}): OpenedArchive {
+export function openArchive(source: ReadableStream<Uint8Array> | AsyncIterable<string>, options: OpenArchiveOptions = {}): ArchiveReader {
 	const chain = options.codecs ?? [];
 	let lines: AsyncIterable<string>;
 	if (source instanceof ReadableStream) {
@@ -219,12 +218,17 @@ export function openArchive(source: ReadableStream<Uint8Array> | AsyncIterable<s
 		if (chain.length) throw new Error("an archive read through codecs is read from its bytes, not its lines");
 		lines = source;
 	}
-	let ended = false;
-	const tracked = (async function* () {
-		for await (const line of lines) yield line;
-		ended = true;
-	})();
-	const reader = jsonlReader(tracked);
-	const authenticating = chain.some((codec) => codec.authenticates);
-	return { ...reader, verified: () => authenticating && ended };
+	return jsonlReader(lines);
+}
+
+/**
+ * Reads a whole archive from its stored bytes (openArchive), and says what
+ * it is: "verified" when a codec in the chain authenticates, as it then has
+ * read every byte without an error (an authenticating decoder errors on
+ * any damage, a truncated end included); "unverified" otherwise. Decided
+ * once, after the whole read: nothing reads as verified before its end.
+ */
+export async function readEncodedArchive(source: ReadableStream<Uint8Array>, options: OpenArchiveOptions = {}): Promise<OpenedArchive> {
+	const archive = await collectArchive(openArchive(source, options));
+	return { archive, provenance: (options.codecs ?? []).some((codec) => codec.authenticates) ? "verified" : "unverified" };
 }

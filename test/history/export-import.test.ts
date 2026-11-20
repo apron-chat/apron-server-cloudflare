@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { exportArchive } from "../../src/history/archive/export";
-import { type ArchiveCodec, type ArchivedUser, collectArchive, compareReplayed, gzip, jsonlReader, jsonlWriter, linesOf, openArchive, replayRecords, writeArchiveToString } from "@apron/archive";
+import { type ArchiveCodec, type ArchivedUser, collectArchive, compareReplayed, gzip, jsonlReader, jsonlWriter, linesOf, openArchive, readEncodedArchive, replayRecords, writeArchiveToString } from "@apron/archive";
 import { importArchive, place, restoreBatches } from "../../src/history/archive/import";
 import { MemoryBlobStore } from "./support/memory-blob-store";
-import { type BackupSettings, backupFamily, writeBackup } from "../../src/history/exports";
+import { type BackupSettings, BackupStore, backupFamily, writeBackup } from "../../src/history/exports";
 import { CODECS_METADATA } from "../../src/history/storage/encoding";
 import { MemoryChunkIndex } from "./support/memory-chunk-index";
 import { ColdHistoryTier } from "../../src/history/cold/tier";
@@ -156,7 +156,7 @@ describe("export and import", () => {
 		const unsealed = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, server: "here.test", dryRun: true });
 		expect(unsealed.users).toEqual({ ada: { placeholder: "ada-2" }, bob: { placeholder: "bob-2" } });
 		await expect(importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, users: "match", dryRun: true })).rejects.toThrow(/users match needs an archive verified as this server's own/);
-		const own = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, server: "here.test", dryRun: true, authenticated: true });
+		const own = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, server: "here.test", dryRun: true, provenance: "verified" });
 		expect(own.users).toEqual({ ada: { matched: "ada" }, bob: { placeholder: "bob-2" } });
 		const chosen = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, userMap: { bob: { placeholder: "robert" }, ada: { existing: "ada" } } });
 		expect(chosen.users).toEqual({ ada: { matched: "ada" }, bob: { placeholder: "robert" } });
@@ -196,7 +196,7 @@ describe("export and import", () => {
 		const source = pipelineOf("head");
 		populate(source.head, source.clock);
 		const store = new MemoryBlobStore();
-		const { key } = await writeBackup(source.pipeline, source.head, store, { keep: 14, privateRooms: true }, "manual", { server: "srv", codecs: HISTORY_CODECS, clock: { now: () => Date.UTC(2026, 10, 19, 12) } });
+		const { key } = await writeBackup(source.pipeline, source.head, new BackupStore(store, HISTORY_CODECS), { keep: 14, privateRooms: true }, "manual", { server: "srv", clock: { now: () => Date.UTC(2026, 10, 19, 12) } });
 		expect(key).toBe("backups/srv-manual-20261119-120000.jsonl.gz");
 		expect(store.contentType(key)).toBe("application/octet-stream");
 		const object = (await store.get(key))!;
@@ -204,11 +204,11 @@ describe("export and import", () => {
 		const bytes = new Uint8Array(await new Response(await object.stream()).arrayBuffer());
 		// gzip's magic number: compressed, not plain JSON Lines.
 		expect([bytes[0], bytes[1]]).toEqual([0x1f, 0x8b]);
-		const reader = openArchive(await (await store.get(key))!.stream(), { codecs: [gzip] });
+		const opened = (await new BackupStore(store, HISTORY_CODECS).open(key, 1_000_000))!;
+		expect(opened.provenance).toBe("unverified");
 		const target = pipelineOf("head", new TestClock(5_000_000));
-		const report = await importArchive(target.pipeline, target.head, reader, { clock: target.clock, authenticated: () => reader.verified() });
+		const report = await importArchive(target.pipeline, target.head, opened.archive, { clock: target.clock, provenance: opened.provenance });
 		expect(report.roomsAdded.sort()).toEqual(["general", "random"]);
-		expect(reader.verified()).toBe(false);
 		const plain = await exported(source.pipeline, source.clock);
 		expect(compareReplayed(await stateOf(plain), await stateOf(await exported(target.pipeline, target.clock))).differences).toEqual([]);
 		// Without its codec, or bounded below its decoded size, it does not read.
@@ -225,13 +225,13 @@ describe("export and import", () => {
 		const bytesOf = () => new Response(text).body!;
 		const target = pipelineOf("head", new TestClock(5_000_000));
 		target.head.people.set("ada", { user_id: "ada", name: "Our Ada" });
-		const reader = openArchive(bytesOf(), { codecs: [sealed] });
-		expect(reader.verified()).toBe(false);
-		const own = await importArchive(target.pipeline, target.head, reader, { clock: target.clock, server: "here.test", dryRun: true, authenticated: () => reader.verified() });
-		expect(reader.verified()).toBe(true);
+		const sealedRead = await readEncodedArchive(bytesOf(), { codecs: [sealed] });
+		expect(sealedRead.provenance).toBe("verified");
+		const own = await importArchive(target.pipeline, target.head, sealedRead.archive, { clock: target.clock, server: "here.test", dryRun: true, provenance: sealedRead.provenance });
 		expect(own.users).toEqual({ ada: { matched: "ada" }, bob: { placeholder: "bob" } });
-		const plain = openArchive(bytesOf());
-		const unverified = await importArchive(target.pipeline, target.head, plain, { clock: target.clock, server: "here.test", dryRun: true, authenticated: () => plain.verified() });
+		const plain = await readEncodedArchive(bytesOf());
+		expect(plain.provenance).toBe("unverified");
+		const unverified = await importArchive(target.pipeline, target.head, plain.archive, { clock: target.clock, server: "here.test", dryRun: true, provenance: plain.provenance });
 		expect(unverified.users).toEqual({ ada: { placeholder: "ada-2" }, bob: { placeholder: "bob" } });
 	});
 
@@ -322,7 +322,7 @@ describe("export and import", () => {
 		const source = pipelineOf("head");
 		populate(source.head, source.clock);
 		for (let day = 0; day < 3; day += 1) {
-			for (const kind of ["scheduled", "manual"] as const) await writeBackup(source.pipeline, source.head, store, settings, kind, { server: "srv", codecs: HISTORY_CODECS, clock: { now: () => Date.UTC(2026, 10, 19 + day) } });
+			for (const kind of ["scheduled", "manual"] as const) await writeBackup(source.pipeline, source.head, new BackupStore(store, HISTORY_CODECS), settings, kind, { server: "srv", clock: { now: () => Date.UTC(2026, 10, 19 + day) } });
 		}
 		const keys = (await store.list("backups/")).keys.map((entry) => entry.key);
 		expect(keys).toEqual([
@@ -408,7 +408,7 @@ describe("export and import", () => {
 		await expect(importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, maxPlaceholders: 4 })).rejects.toThrow(/more than the 4/);
 		expect(target.head.all()).toEqual([]);
 		// Authenticated (one of this server's backups), `admin` and `ada` are matched; the others never are.
-		const sealed = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, server: "wss://here.test/", authenticated: true });
+		const sealed = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, server: "wss://here.test/", provenance: "verified" });
 		expect(sealed.users).toMatchObject({ admin: { matched: "admin" }, ada: { matched: "ada" }, guest_7: { placeholder: "imported-guest_7" } });
 		// Recorded users keep their ID and name only.
 		const froms = target.head.all().filter((record) => record.kind === "message").map((record) => JSON.parse(record.record_json).from);
@@ -507,9 +507,9 @@ describe("export and import", () => {
 		const source = pipelineOf("head");
 		populate(source.head, source.clock);
 		const at = Date.UTC(2026, 10, 19, 12);
-		await writeBackup(source.pipeline, source.head, store, settings, "manual", { server: "srv", codecs: HISTORY_CODECS, clock: { now: () => at } });
-		await expect(writeBackup(source.pipeline, source.head, store, settings, "manual", { server: "srv", codecs: HISTORY_CODECS, clock: { now: () => at + 500 } })).rejects.toThrow(/exists already/);
-		await writeBackup(source.pipeline, source.head, store, settings, "manual", { server: "srv", codecs: HISTORY_CODECS, clock: { now: () => at + 1_000 } });
+		await writeBackup(source.pipeline, source.head, new BackupStore(store, HISTORY_CODECS), settings, "manual", { server: "srv", clock: { now: () => at } });
+		await expect(writeBackup(source.pipeline, source.head, new BackupStore(store, HISTORY_CODECS), settings, "manual", { server: "srv", clock: { now: () => at + 500 } })).rejects.toThrow(/exists already/);
+		await writeBackup(source.pipeline, source.head, new BackupStore(store, HISTORY_CODECS), settings, "manual", { server: "srv", clock: { now: () => at + 1_000 } });
 		expect((await store.list("backups/")).keys).toHaveLength(2);
 	});
 
@@ -522,7 +522,7 @@ describe("export and import", () => {
 		const store = new MemoryBlobStore();
 		const lines = async (privateRooms: boolean) => {
 			const settings: BackupSettings = { keep: 14, privateRooms };
-			const { key } = await writeBackup(source.pipeline, source.head, store, settings, privateRooms ? "scheduled" : "manual", { server: "srv", codecs: HISTORY_CODECS, clock: source.clock });
+			const { key } = await writeBackup(source.pipeline, source.head, new BackupStore(store, HISTORY_CODECS), settings, privateRooms ? "scheduled" : "manual", { server: "srv", clock: source.clock });
 			return new Response((await (await store.get(key))!.stream()).pipeThrough(gzip.decoder())).text();
 		};
 		expect(await lines(true)).toContain("between us");

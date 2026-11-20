@@ -19,7 +19,7 @@
  */
 
 import {
-	type ArchiveReader, type ChatRecord, type CollectedArchive, type ImportReport, type ImportState, type ImportTarget, archiveIdentity, collectArchive, planImport,
+	type ArchiveReader, type ChatRecord, type CollectedArchive, type ImportReport, type ImportState, type ImportTarget, type Provenance, archiveIdentity, collectArchive, planImport,
 } from "@apron/archive";
 import { USER_ID_RULES } from "../../user-ids";
 import type { HistoryPipeline } from "../pipeline";
@@ -32,19 +32,18 @@ export type { ImportReport };
 export interface ImportOptions {
 	/**
 	 * How the archive's user IDs map to accounts here (@apron/archive PlanOptions.users):
-	 * "auto" (default), "match" (authenticated archives only) or "new". An ID
+	 * "auto" (default), "match" (verified archives only) or "new". An ID
 	 * that cannot stand here (a guest's, a bot's, `~…`, and `admin` unless
 	 * matched) becomes `imported-…` (USER_ID_RULES).
 	 */
 	users?: "auto" | "match" | "new";
 	/**
-	 * Whether the archive is verified as one of this server's own (an
-	 * authenticating codec read it to its end: @apron/archive openArchive,
-	 * `verified`): only then may users be matched, since a file's `server`
-	 * header is anyone's to write. A function is asked once the archive has
-	 * been read whole. Default false; no codec this server has authenticates.
+	 * What the archive is known to be (@apron/archive readEncodedArchive):
+	 * "verified" as one of this server's own (an authenticating codec read it
+	 * whole) lets users be matched, since a file's `server` header is anyone's
+	 * to write. Default "unverified"; no codec this server has authenticates.
 	 */
-	authenticated?: boolean | (() => boolean);
+	provenance?: Provenance;
 	/** Per-user decisions overriding `users`: an existing account, or a placeholder ID. */
 	userMap?: Record<string, { existing: string } | { placeholder: string }>;
 	/** "original" (default) keeps log IDs, moving only collisions; "renumber" gives every record a new one at the head. */
@@ -165,7 +164,7 @@ export async function importArchive(pipeline: HistoryPipeline, restore: RestoreP
 	}
 	const plan = await planImport(archive, importTarget(pipeline, restore), {
 		...(options.users ? { users: options.users } : {}),
-		authenticated: typeof options.authenticated === "function" ? options.authenticated() : options.authenticated === true,
+		authenticated: options.provenance === "verified",
 		...(options.userMap ? { userMap: options.userMap } : {}),
 		...(options.ids ? { ids: options.ids } : {}),
 		...(options.server !== undefined ? { server: options.server } : {}),

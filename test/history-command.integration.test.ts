@@ -3,6 +3,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { collectArchive, gzip, jsonlWriter, openArchive } from '@apron/archive';
 import { connect as open, exchange, request, type Frame, type Peer } from './helpers/socket';
 import { type HistoryHolder, type HistorySchedule, isRefusal } from '../src/history/schedule';
+import { BackupStore } from '../src/history/exports';
 
 // `/history` end to end: a backup to the backup store (HISTORY_BLOB, local
 // R2 in the tests), and imports from it: a backup of this server's own,
@@ -222,7 +223,7 @@ it('refuses a file larger than an import reads, before reading it', async () => 
 	try {
 		await changed((runtime) => {
 			const read = vi.fn();
-			runtime.backupStore = () => ({ get: async () => ({ size: 64 * 1024 * 1024 + 1, text: read }) });
+			runtime.backupStore = () => new BackupStore({ get: async () => ({ size: 64 * 1024 * 1024 + 1, stream: read }) } as never, []);
 		}, async () => {
 			const big = await command(admin, 'big', '/history import backups/big.jsonl');
 			expect(big.frame.error).toMatchObject({ code: -32602, message: `backups/big.jsonl is ${64 * 1024 * 1024 + 1} bytes; an import reads at most ${64 * 1024 * 1024}` });

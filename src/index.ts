@@ -3,14 +3,11 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, thresholdRecords } from "./budget";
-import { openArchive } from "@apron/archive";
 import { type ImportReport, importArchive } from "./history/archive/import";
 import { archivePipeline, blobStoreOf, buildHistoryPipeline, D1_TIER, d1Off, HEAD_TIER, HISTORY_CODECS, historyLayout, layoutTiered } from "./history/config";
 import { type D1Off, detailLines, statusLines } from "./history/status";
 import { storeExport, storeRestore } from "./history/store-head";
-import { type BackupKind, writeBackup } from "./history/exports";
-import { storedChain } from "./history/storage/encoding";
-import type { BlobStore } from "./history/storage/store";
+import { type BackupKind, BackupStore, writeBackup } from "./history/exports";
 import { type HistoryHolder, type HistoryLease, HistorySchedule, isRefusal, refusalMessage } from "./history/schedule";
 import type { HistoryPipeline } from "./history/pipeline";
 import type { ChatRecord } from "./history/records";
@@ -9110,17 +9107,17 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return archivePipeline(this.history, { store: this.store, limits: this.config.limits, clock: { now: nowMs } });
 	}
 
-	/** Where `/history export` writes backups and `/history import` reads them: the history blob store (HISTORY_BLOB). */
-	private backupStore(): BlobStore {
+	/** Where `/history export` writes backups and `/history import` reads them: the history blob store (HISTORY_BLOB), through HISTORY_CODECS. */
+	private backupStore(): BackupStore {
 		const store = blobStoreOf(this.runtimeEnv);
 		if (!store) throw { name: "invalid_params", message: "No backup store: bind an R2 bucket as HISTORY_BLOB (docs/configuration.md, Backups and imports)" } satisfies ProtocolError;
-		return store;
+		return new BackupStore(store, HISTORY_CODECS);
 	}
 
 	/** Writes one backup of `kind` with the configured settings (writeBackup). */
-	private writeBackup(store: BlobStore, kind: BackupKind, roomIds: readonly string[] = []): ReturnType<typeof writeBackup> {
-		return writeBackup(this.archivePipeline(), storeExport(this.store), store, this.config.backups, kind, {
-			server: this.config.rpId, clock: { now: nowMs }, codecs: HISTORY_CODECS, ...(roomIds.length ? { roomIds: [...roomIds] } : {}),
+	private writeBackup(backups: BackupStore, kind: BackupKind, roomIds: readonly string[] = []): ReturnType<typeof writeBackup> {
+		return writeBackup(this.archivePipeline(), storeExport(this.store), backups, this.config.backups, kind, {
+			server: this.config.rpId, clock: { now: nowMs }, ...(roomIds.length ? { roomIds: [...roomIds] } : {}),
 			header: this.archiveHeader(), prepare: (records) => this.exportRecords(records),
 		});
 	}
@@ -9171,18 +9168,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 			case "import": {
 				const key = args.key;
-				const object = await this.backupStore().get(key);
-				if (!object) throw { name: "invalid_params", message: `No backup ${key}` } satisfies ProtocolError;
-				// Read whole before anything is written (import plans first): bounded, so a file cannot exhaust the object's memory.
-				if (object.size > MAX_IMPORT_BYTES) throw { name: "invalid_params", message: `${key} is ${object.size} bytes; an import reads at most ${MAX_IMPORT_BYTES}` } satisfies ProtocolError;
+				const backups = this.backupStore();
 				let report: ImportReport;
 				try {
-					// Read back through the codecs it went through, bounded decoded too: a small file may decode to a great deal.
-					const reader = openArchive(await object.stream(), { codecs: storedChain(key, object), maxBytes: MAX_IMPORT_BYTES });
-					report = await importArchive(this.archivePipeline(), storeRestore(this.store), reader, {
+					// Read whole and bounded, stored and decoded (a small file may decode to a great deal), before anything is written.
+					const opened = await backups.open(key, MAX_IMPORT_BYTES);
+					if (!opened) throw new Error(`No backup ${key}`);
+					report = await importArchive(this.archivePipeline(), storeRestore(this.store), opened.archive, {
 						clock: { now: nowMs }, server: this.archiveHeader().server, dryRun: args.dryRun,
 						// Only an authenticating codec, read to the end, makes a file this server's own.
-						authenticated: () => reader.verified(),
+						provenance: opened.provenance,
 						users: args.users ?? "auto",
 						ids: args.renumber ? "renumber" : "original",
 						restart: args.restart,
@@ -9211,7 +9206,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 		try {
 			const last = this.store.historyMetaNumber(META_SCHEDULED_BACKUP, now);
 			if (now < last + everySeconds * 1_000) return;
-			const store = blobStoreOf(this.runtimeEnv);
+			const blobs = blobStoreOf(this.runtimeEnv);
+			const store = blobs && new BackupStore(blobs, HISTORY_CODECS);
 			const missing = await this.d1Missing();
 			if (!store || missing) {
 				// Said once a wake: a backup that silently never runs is no backup.

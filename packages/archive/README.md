@@ -99,9 +99,9 @@ means; the server says what is true there (`ImportTarget`,
   Encryption or signing can be added as codecs of their own after gzip
   (`stream.pipeThrough(gzip.encoder()).pipeThrough(encrypt.encoder())`).
   A codec that `authenticates` must error its decoder on any damage, a
-  truncated end included; `openArchive(...).verified()` is then true once
-  the archive has been read to its end through it, the one fact a reader
-  (an import matching users) may trust more on.
+  truncated end included; `readEncodedArchive(bytes, { codecs })` reads
+  an archive whole and gives its `provenance`, "verified" only through
+  one: the one fact a reader (an import matching users) may trust more on.
 
 ## Tests
 
