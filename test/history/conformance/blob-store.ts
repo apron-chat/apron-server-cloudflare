@@ -100,12 +100,11 @@ export function describeBlobStore(name: string, makeStore: () => BlobStore | Pro
 			expect(await empty!.text()).toBe("");
 		});
 
-		it("streams a body when it offers a stream", async () => {
+		it("streams a body", async () => {
 			const store = await makeStore();
 			const root = freshRoot(name);
 			await store.put(`${root}s`, "streamed body");
 			const object = await store.get(`${root}s`);
-			if (!object!.stream) return;
 			const reader = (await object!.stream()).getReader();
 			const decoder = new TextDecoder();
 			let text = "";
@@ -217,8 +216,8 @@ export function describeBlobStore(name: string, makeStore: () => BlobStore | Pro
 			await writer.close();
 			const object = await store.get(`${root}bytes`);
 			expect(object!.size).toBe(6);
-			const read = object!.stream ? new Uint8Array(await new Response(await object!.stream()).arrayBuffer()) : undefined;
-			if (read) expect([...read]).toEqual([0x1f, 0x8b, 0x00, 0xff, 0xc3, 0xa9]);
+			const read = new Uint8Array(await new Response(await object!.stream()).arrayBuffer());
+			expect([...read]).toEqual([0x1f, 0x8b, 0x00, 0xff, 0xc3, 0xa9]);
 			// A store with no metadata (a directory) leaves it out; one with it gives it back as stored.
 			if (object!.metadata !== undefined) expect(object!.metadata).toEqual({ codecs: "gzip" });
 		});

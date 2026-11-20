@@ -198,10 +198,10 @@ describe("export and import", () => {
 		expect(store.contentType(key)).toBe("application/gzip");
 		const object = (await store.get(key))!;
 		expect(object.metadata).toEqual({ [CODECS_METADATA]: "gzip" });
-		const bytes = new Uint8Array(await new Response(await object.stream!()).arrayBuffer());
+		const bytes = new Uint8Array(await new Response(await object.stream()).arrayBuffer());
 		// gzip's magic number: compressed, not plain JSON Lines.
 		expect([bytes[0], bytes[1]]).toEqual([0x1f, 0x8b]);
-		const reader = openArchive(await (await store.get(key))!.stream!(), { codecs: [gzip] });
+		const reader = openArchive(await (await store.get(key))!.stream(), { codecs: [gzip] });
 		const target = pipelineOf("head", new TestClock(5_000_000));
 		const report = await importArchive(target.pipeline, reader, { clock: target.clock, authenticated: () => reader.verified() });
 		expect(report.roomsAdded.sort()).toEqual(["general", "random"]);
@@ -209,8 +209,8 @@ describe("export and import", () => {
 		const plain = await exported(source.pipeline, source.clock);
 		expect(compareReplayed(await stateOf(plain), await stateOf(await exported(target.pipeline, target.clock))).differences).toEqual([]);
 		// Without its codec, or bounded below its decoded size, it does not read.
-		await expect(collectArchive(openArchive(await (await store.get(key))!.stream!()))).rejects.toThrow();
-		await expect(collectArchive(openArchive(await (await store.get(key))!.stream!(), { codecs: [gzip], maxBytes: 100 }))).rejects.toThrow(/larger than 100 bytes decoded/);
+		await expect(collectArchive(openArchive(await (await store.get(key))!.stream()))).rejects.toThrow();
+		await expect(collectArchive(openArchive(await (await store.get(key))!.stream(), { codecs: [gzip], maxBytes: 100 }))).rejects.toThrow(/larger than 100 bytes decoded/);
 	});
 
 	it("takes an archive as this server's own only once an authenticating codec has read it to its end", async () => {
@@ -520,7 +520,7 @@ describe("export and import", () => {
 		const lines = async (privateRooms: boolean) => {
 			const settings: BackupSettings = { keep: 14, privateRooms };
 			const { key } = await writeBackup(source.pipeline, store, settings, privateRooms ? "scheduled" : "manual", { server: "srv", clock: source.clock });
-			return new Response((await (await store.get(key))!.stream!()).pipeThrough(gzip.decoder())).text();
+			return new Response((await (await store.get(key))!.stream()).pipeThrough(gzip.decoder())).text();
 		};
 		expect(await lines(true)).toContain("between us");
 		const without = await lines(false);

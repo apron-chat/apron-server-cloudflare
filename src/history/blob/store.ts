@@ -24,11 +24,10 @@ export interface BlobObject {
 	text(): Promise<string>;
 	/**
 	 * The body as a byte stream, for bodies too large to hold as one string
-	 * (a full export being imported). Optional: a store without it is read with
-	 * `text()`. A body is read once, through either `text()` or `stream()`:
-	 * R2 hands out a single body stream per `get`.
+	 * (a full export being imported). A body is read once, through either
+	 * `text()` or `stream()`: R2 hands out a single body stream per `get`.
 	 */
-	stream?(): Promise<ReadableStream<Uint8Array>>;
+	stream(): Promise<ReadableStream<Uint8Array>>;
 }
 
 export interface BlobPutOptions {

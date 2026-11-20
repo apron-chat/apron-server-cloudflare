@@ -3,7 +3,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, thresholdRecords } from "./budget";
-import { codecChain, codecsFromName, linesOf, openArchive, parseCodecNames } from "@apron/archive";
+import { codecChain, codecsFromName, openArchive, parseCodecNames } from "@apron/archive";
 import { type ImportReport, importArchive } from "./history/archive/import";
 import type { BlobStore } from "./history/blob/store";
 import { archivePipeline, blobStoreOf, buildHistoryPipeline, D1_TIER, d1Enabled, HEAD_TIER, hasLowerTiers } from "./history/config";
@@ -9221,9 +9221,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 					// The codecs it went through: as its metadata records them, else as its name says (`.jsonl.gz`), else none.
 					const recorded = object.metadata?.[CODECS_METADATA];
 					const codecs = recorded !== undefined ? codecChain(parseCodecNames(recorded)) : codecsFromName(key) ?? [];
-					if (codecs.length && !object.stream) throw new Error(`${key} is encoded (${codecs.map((codec) => codec.name).join(", ")}), and this store cannot stream it`);
 					// Bounded decoded too: a small compressed file may decode to a great deal.
-					const reader = object.stream ? openArchive(await object.stream(), { codecs, maxBytes: MAX_IMPORT_BYTES }) : openArchive(linesOf(await object.text()));
+					const reader = openArchive(await object.stream(), { codecs, maxBytes: MAX_IMPORT_BYTES });
 					report = await importArchive(this.archivePipeline(), reader, {
 						clock: { now: nowMs }, server: this.archiveHeader().server, dryRun: args.dryRun,
 						// Only an authenticating codec, read to the end, makes a file this server's own; gzip is none.
