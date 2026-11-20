@@ -489,6 +489,33 @@ it("takes a room with only joins and leaves past its creation as empty, so a fre
 	});
 });
 
+it("fills an empty room with the archive's room record in place of its own, so a round trip adds no room record", async () => {
+	await withStore("restore-fill-empty", CONFIG, (store, clock, state) => {
+		const overruns = watched(store);
+		const roomRecords = () => state.storage.sql.exec<{ log_id: number; record_json: string }>("SELECT log_id, record_json FROM records WHERE room_id = 'general' AND kind = 'room' ORDER BY log_id").toArray();
+		const [own] = roomRecords();
+		expect(store.roomIsEmpty("general")).toBe(true);
+		// An archive's general, older than this fresh server's: its room record and a message.
+		const base = clock.value - 60_000;
+		const archived = { room_id: "general", log_id: String(base), title: "General", description: "Day-to-day chatter." };
+		const result = store.restoreRoom({ listing: { ...archived }, joined: false }, [
+			{ room_id: "general", log_id: base, commit_ms: base, kind: "room", record_json: JSON.stringify(archived) },
+			messageRecord("general", base + 1, {}),
+		], clock.value, { rooms: ["general"] });
+		expect(result).toMatchObject({ created: false, stored: 2 });
+		// The archive's room record is the room's: this server's own, logged after it, is gone.
+		expect(roomRecords().map((row) => row.log_id)).toEqual([base]);
+		expect(roomRecords()[0].log_id).not.toBe(own.log_id);
+		const room = store.getRoom("general", clock.value)!;
+		expect(room).toMatchObject({ title: "General", description: "Day-to-day chatter.", log_id: String(base) });
+		// Its head is its newest record, not the deleted creation.
+		expect(room.latest_log_id).toBe(String(base + 1));
+		// Not empty now: a later import into it merges as into any room, keeping its records.
+		expect(store.roomIsEmpty("general")).toBe(false);
+		expect(overruns).toEqual([]);
+	});
+});
+
 it("imports through the Store: IDs that cannot stand here become placeholders, and no message is a guest's", async () => {
 	await withStore("restore-import", CONFIG, async (store, clock, state) => {
 		const base = clock.value - 60_000;

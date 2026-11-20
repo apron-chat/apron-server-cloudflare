@@ -357,7 +357,10 @@ export async function planImport(archive: CollectedArchive, target: ImportTarget
 	const kept = new Set(imported);
 	for (const [from, to] of moved) if (kept.has(from)) report.remapped.logIds[String(from)] = String(to);
 	records = records.map((record) => remapRecord(record, map)).sort(byLog);
-	const freshRooms = [...fresh];
+	// Top-level rooms before threads, each in name order: a thread's parent
+	// must exist where it is restored, and a thread names it.
+	const parentOf = (roomId: string) => rooms.get(roomId)!.listing.parent_room_id;
+	const freshRooms = [...fresh].sort((a, b) => Number(typeof parentOf(a) === "string") - Number(typeof parentOf(b) === "string") || (a < b ? -1 : a > b ? 1 : 0));
 	report.roomsAdded = freshRooms.map((roomId) => map.roomId(roomId));
 
 	// Renumbered, a room's listing keeps no log ID of its own: its bounds are
