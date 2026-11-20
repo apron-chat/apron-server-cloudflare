@@ -851,21 +851,47 @@ export class RemoteRooms {
 	 * comes from, the owner or a third one. Never a system identity.
 	 */
 	private localUser(server: string, from: Record<string, unknown> | undefined): { userId: string; remote?: { server: string; user_id: string }; name?: string } | undefined {
-		const userId = from?.user_id;
-		if (typeof userId !== "string" || userId.startsWith("~")) return undefined;
-		const remote = (from!.ext as Record<string, unknown> | undefined)?.remote as Record<string, unknown> | undefined;
+		const place = this.placeOf(server, from);
+		if (!place) return undefined;
+		if ("own" in place) return this.store.identityExists(place.own) ? { userId: place.own } : undefined;
 		const name = typeof from!.name === "string" ? from!.name : undefined;
-		if (remote !== undefined && sameAddress(remote.server as string | undefined, this.host.self) && typeof remote.user_id === "string") {
-			return this.store.identityExists(remote.user_id) ? { userId: remote.user_id } : undefined;
+		// An ID that already has an `@`, with no `remote` to say where from: only a remote user this mirror has.
+		if (!place.origin) {
+			const stored = this.store.getIdentity(place.id);
+			const remote = stored?.ext?.remote as { server?: unknown; user_id?: unknown } | undefined;
+			return typeof remote?.server === "string" && typeof remote.user_id === "string"
+				? { userId: place.id, remote: { server: remote.server, user_id: remote.user_id }, name: stored!.name }
+				: undefined;
 		}
-		const origin = typeof remote?.server === "string" && typeof remote.user_id === "string" ? { server: normalizeRemoteAddress(remote.server) ?? remote.server, user_id: remote.user_id } : { server, user_id: userId };
-		if (remoteUserIdError(origin.user_id)) return undefined;
-		const id = shadowUserId(origin.server, origin.user_id);
 		try {
-			return { userId: id, remote: origin, name: this.store.ensureShadow({ userId: id, remote: origin, name: (name ?? origin.user_id).slice(0, 64), now: this.now(), ipKey: MIRROR_IP_KEY }) };
+			return { userId: place.id, remote: place.origin, name: this.store.ensureShadow({ userId: place.id, remote: place.origin, name: (name ?? place.origin.user_id).slice(0, 64), now: this.now(), ipKey: MIRROR_IP_KEY }) };
 		} catch {
 			return undefined;
 		}
+	}
+
+	/**
+	 * Where a user object of the owner `server` lives here: this server's own
+	 * user (`own`), or a remote user's ID, with its origin when that is known.
+	 * By the object's `ext.remote`; without one, by the form of its ID (the
+	 * recipe): one that ends in `@` and this server's host is that user here,
+	 * one with another `@` is that remote user as it is, whose origin the
+	 * mirror cannot tell (so it makes no remote user for it), and any other
+	 * is the owner's. Never a system identity.
+	 */
+	private placeOf(server: string, user: Record<string, unknown> | undefined): { own: string } | { id: string; origin?: { server: string; user_id: string } } | undefined {
+		const userId = user?.user_id;
+		if (typeof userId !== "string" || userId.startsWith("~")) return undefined;
+		const remote = (user!.ext as Record<string, unknown> | undefined)?.remote as Record<string, unknown> | undefined;
+		if (typeof remote?.server === "string" && typeof remote.user_id === "string") {
+			if (sameAddress(remote.server, this.host.self)) return { own: remote.user_id };
+			const origin = { server: normalizeRemoteAddress(remote.server) ?? remote.server, user_id: remote.user_id };
+			return remoteUserIdError(origin.user_id) ? undefined : { id: shadowUserId(origin.server, origin.user_id), origin };
+		}
+		const self = `@${remoteAuthority(this.host.self)}`;
+		if (userId.endsWith(self)) return { own: userId.slice(0, -self.length) };
+		if (isShadowUserId(userId)) return { id: userId };
+		return remoteUserIdError(userId) ? undefined : { id: shadowUserId(server, userId), origin: { server, user_id: userId } };
 	}
 
 	/** A remote user's name from the owner's records, when it changed. */
@@ -880,11 +906,13 @@ export class RemoteRooms {
 		});
 	}
 
+	/** A `user` notification of the owner: a remote user here that it names (placeOf), the owner's or a third server's, takes its new name. */
 	private async profileFrom(server: string, user: Record<string, unknown> | undefined): Promise<void> {
-		if (!user || typeof user.user_id !== "string" || typeof user.name !== "string" || isShadowUserId(user.user_id) || user.user_id.startsWith("~")) return;
-		const id = shadowUserId(server, user.user_id);
-		const stored = this.store.getIdentity(id);
-		if (stored && stored.name !== user.name) await this.rename({ userId: id, remote: true, name: stored.name }, user.name);
+		if (!user || typeof user.name !== "string") return;
+		const place = this.placeOf(server, user);
+		if (!place || "own" in place) return;
+		const stored = this.store.getIdentity(place.id);
+		if (stored && stored.name !== user.name) await this.rename({ userId: place.id, remote: true, name: stored.name }, user.name);
 	}
 
 	/** Owner IDs in a message's mentions and text, as this mirror knows the users (the reverse of ownerIds). */

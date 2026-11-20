@@ -595,3 +595,36 @@ it('a mirror thread takes its first members from the room_update that joins the 
 		expect(store.roomMembers([thread], 10).get(thread)?.map((member) => member.user_id).sort()).toEqual(['bob', 'carol@a.example']);
 	});
 });
+
+it('a mirror maps an owner\'s user without remote by the form of its ID, and never makes one with an @', async () => {
+	await runInDurableObject(env.DEMO.getByName(`mirror-form-${crypto.randomUUID()}`), async (_instance, state) => {
+		const store = new Store(state, {});
+		store.initialize();
+		const server = 'ws://a.example/ws';
+		store.setMirrorState({ rooms: [{ room_id: 'general', server, owner_room: 'ops', token: 't', start: 0, threads: {} }], servers: { [server]: { cursor: 0 } } });
+		const host = { store, self: 'wss://demo.test/ws', runMutation: (fn: () => Promise<void>) => fn(), broadcastRecord: () => undefined, pushFor: () => undefined, userChanged: () => undefined } as unknown as MirrorHost;
+		const mirror = new RemoteRooms(host) as unknown as { apply(server: string, frame: Record<string, unknown>): Promise<void> };
+		let logId = 2_000;
+		const message = (messageId: string, from: Record<string, unknown>) => mirror.apply(server, { method: 'message', params: {
+			message_id: messageId, log_id: String(++logId), room_id: 'ops', from, body: { text: messageId },
+		} });
+		const author = (messageId: string) => { const copy = store.copyOf(server, messageId); return copy ? store.pushedMessage(copy)?.from.user_id : undefined; };
+		// The owner's own user, without remote: <id>@<owner's host>.
+		await message('m1', { user_id: 'carol', name: 'Carol' });
+		expect(author('m1')).toBe('carol@a.example');
+		// A third server's user without remote, not seen yet: no remote user is made for an ID with an @.
+		await message('m2', { user_id: 'zed@c.example', name: 'Zed' });
+		expect(author('m2')).toBeUndefined();
+		expect(store.identityExists('zed@c.example')).toBe(false);
+		expect(store.identityExists('zed@c.example@a.example')).toBe(false);
+		// Seen once with remote, later records without it map to that remote user, and its user notes rename it.
+		await message('m3', { user_id: 'zed@c.example', name: 'Zed', ext: { remote: { server: 'wss://C.example/ws', user_id: 'zed' } } });
+		expect(author('m3')).toBe('zed@c.example');
+		await message('m4', { user_id: 'zed@c.example', name: 'Zed' });
+		expect(author('m4')).toBe('zed@c.example');
+		await mirror.apply(server, { method: 'user', params: { new: { user_id: 'zed@c.example', name: 'Zed Z' } } });
+		expect(store.getIdentity('zed@c.example')?.name).toBe('Zed Z');
+		// Its stored remote is the normalized address.
+		expect(store.getIdentity('zed@c.example')?.ext?.remote).toEqual({ server: 'wss://c.example/ws', user_id: 'zed' });
+	});
+});
