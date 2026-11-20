@@ -602,7 +602,7 @@ export class RemoteRooms {
 	private async copyMember(server: string, roomId: string, user: Record<string, unknown>, joined: boolean): Promise<void> {
 		const remote = (user.ext as Record<string, unknown> | undefined)?.remote as Record<string, unknown> | undefined;
 		if (remote && remote.user_id === undefined) return;
-		if (remote?.server === this.host.self) return;
+		if (sameAddress(remote?.server as string | undefined, this.host.self)) return;
 		const local = this.localUser(server, user);
 		if (!local?.remote) return;
 		if (joined === this.store.isRoomMember(roomId, local.userId, this.now())) return;
@@ -797,7 +797,7 @@ export class RemoteRooms {
 				const user = byId.get(member.user_id) ?? member;
 				const remote = (user.ext as Record<string, unknown> | undefined)?.remote as Record<string, unknown> | undefined;
 				try {
-					if (remote?.server === this.host.self && typeof remote.user_id === "string") {
+					if (remote !== undefined && sameAddress(remote.server as string | undefined, this.host.self) && typeof remote.user_id === "string") {
 						if (this.store.identityExists(remote.user_id) && !this.store.isRoomMember(target.roomId, remote.user_id, this.now())) await this.host.addMember({ ipKey: MIRROR_IP_KEY }, target.roomId, remote.user_id);
 					} else await this.copyMember(server, target.roomId, user, true);
 				} catch (error) {
@@ -855,7 +855,7 @@ export class RemoteRooms {
 		if (typeof userId !== "string" || userId.startsWith("~")) return undefined;
 		const remote = (from!.ext as Record<string, unknown> | undefined)?.remote as Record<string, unknown> | undefined;
 		const name = typeof from!.name === "string" ? from!.name : undefined;
-		if (remote?.server === this.host.self && typeof remote.user_id === "string") {
+		if (remote !== undefined && sameAddress(remote.server as string | undefined, this.host.self) && typeof remote.user_id === "string") {
 			return this.store.identityExists(remote.user_id) ? { userId: remote.user_id } : undefined;
 		}
 		const origin = typeof remote?.server === "string" && typeof remote.user_id === "string" ? { server: normalizeRemoteAddress(remote.server) ?? remote.server, user_id: remote.user_id } : { server, user_id: userId };
@@ -1162,7 +1162,7 @@ export class RemoteRooms {
 	private async ownerIdOf(connection: LinkConnection, server: string, userId: string): Promise<string | undefined> {
 		if (isShadowUserId(userId)) {
 			const remote = this.store.getIdentity(userId)?.ext?.remote as Record<string, unknown> | undefined;
-			if (remote?.server === server && typeof remote.user_id === "string") return remote.user_id;
+			if (sameAddress(remote?.server as string | undefined, server) && typeof remote?.user_id === "string") return remote.user_id;
 			return remote ? userId : undefined;
 		}
 		const name = this.store.getIdentity(userId)?.name;
