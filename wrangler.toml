@@ -69,6 +69,8 @@ LIMIT_RETENTION_SECONDS = "0"
 LIMIT_CLEANUP_THRESHOLD_PERCENT = "80"
 LIMIT_HISTORY_D1_RECORDS = "100000"
 LIMIT_HISTORY_COLD_RECORDS = "0"
+# Quiet threads and private rooms archive after 30 days, as in production.
+LIMIT_ROOM_ARCHIVE_SECONDS = "2592000"
 # Backups on demand only (`/history export`, no schedule) to the local
 # HISTORY_BLOB bucket, the newest 14 of each kind kept, private rooms
 # included, gzip-compressed (not encrypted).

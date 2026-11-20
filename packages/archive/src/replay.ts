@@ -115,8 +115,8 @@ export interface ReplayedState {
 	memberships: Map<string, Map<string, ReplayedMembership>>;
 }
 
-/** Room fields that are not logged, or that replay does not compare. */
-const ROOM_IGNORED = new Set(["room_id", "log_id", "prev_log_id", "latest_log_id", "history_log_id", "members", "member_count"]);
+/** Room fields that are not logged, or that replay does not compare (a server's `archived` mark among them). */
+const ROOM_IGNORED = new Set(["room_id", "log_id", "prev_log_id", "latest_log_id", "history_log_id", "members", "member_count", "archived"]);
 
 function isObject(value: unknown): value is JsonObject {
 	return typeof value === "object" && value !== null && !Array.isArray(value);

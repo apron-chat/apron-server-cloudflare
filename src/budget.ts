@@ -219,9 +219,19 @@ export interface Limits {
 	databaseHardTargetBytes: number;
 	databaseResumeLowWaterBytes: number;
 	cleanupBatch: number;
+	/** Active public rooms and threads that may exist at once (`general` aside); archived threads do not count (roomArchiveSeconds). */
 	threadLimit: number;
-	/** Live threads one registered user may have created; removed and expired ones do not count. */
+	/** Active threads one registered user may have created; removed and archived ones do not count. */
 	threadsPerUser: number;
+	/**
+	 * A thread or private room whose newest record is older than this is
+	 * archived: still listed and readable through every history tier, but no
+	 * longer counted against `threadLimit`, `threadsPerUser`,
+	 * `privateRoomLimit` or `privateRoomsPerUser`. A new post in it makes it
+	 * active again, taking a slot. 0 never archives a room: rooms count until
+	 * they are removed.
+	 */
+	roomArchiveSeconds: number;
 	/** One room's serialized client fields (`title`, `description`, `ext`). */
 	roomMetadataLimit: number;
 	/**
@@ -240,7 +250,7 @@ export interface Limits {
 	roomMetadataTotalLimit: number;
 	/** Private rooms (§4.2.4) that may exist at once; they do not count against threadLimit. */
 	privateRoomLimit: number;
-	/** Live private rooms one registered user may have created; removed and expired ones do not count. */
+	/** Active private rooms one registered user may have created; removed and archived ones do not count. */
 	privateRoomsPerUser: number;
 	/** Private rooms one registered user may be a member of at once, the ones others added them to included. */
 	privateMembershipsPerUser: number;

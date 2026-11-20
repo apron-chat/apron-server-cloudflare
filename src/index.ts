@@ -1166,6 +1166,7 @@ export function asStoreConfig(config: RuntimeConfig): Partial<StoreConfig> {
 		maxEmbeds: limits.maxEmbeds,
 		maxThreads: limits.threadLimit,
 		maxThreadsPerUser: limits.threadsPerUser,
+		roomArchiveMs: limits.roomArchiveSeconds * 1_000,
 		roomMetadataLimit: limits.roomMetadataLimit,
 		roomMetadataMinLimit: limits.roomMetadataMinLimit,
 		roomMetadataTotalLimit: limits.roomMetadataTotalLimit,
@@ -9578,12 +9579,28 @@ export class ApronDemoServer extends DurableObject<Env> {
 			...(this.config.push && PUSH_POLICY ? [`- Pushes: ${share(this.store.pushesToday(now), PUSH_POLICY.pushesPerDay)}`] : []),
 			`- Registered users: ${share(identities, limits.registeredIdentityCount)}${pruned.total ? ` (idle accounts removed: ${count(pruned.today)} today, ${count(pruned.total)} in all)` : ""}`,
 			...(active ? [await active] : []),
+			...this.roomCountLines(now),
 			`- Open connections: ${share(this.ctx.getWebSockets().length, limits.openConnections)}`,
 			`- Database: ${databaseBytes === null ? "unknown" : mib(databaseBytes)} / ${mib(limits.databaseHardTargetBytes)}`,
 			...await this.historyStatus(now),
 		);
 		this.sendNotice(socket, roomId, lines.join("\n"));
 		this.reply(socket, request, {});
+	}
+
+	/**
+	 * `/status`'s room lines: the public rooms and threads, and the private
+	 * rooms, counted against their caps, and those archived (quiet for
+	 * roomArchiveSeconds), which no longer count.
+	 */
+	private roomCountLines(now: number): string[] {
+		const limits = this.config.limits;
+		const rooms = this.store.roomCounts(now);
+		const archived = (n: number) => (n ? `, ${n.toLocaleString("en-US")} archived` : "");
+		return [
+			`- Rooms and threads: ${rooms.public.active.toLocaleString("en-US")} / ${limits.threadLimit.toLocaleString("en-US")} active${archived(rooms.public.archived)}`,
+			...(limits.privateRoomLimit > 0 ? [`- Private rooms: ${rooms.private.active.toLocaleString("en-US")} / ${limits.privateRoomLimit.toLocaleString("en-US")} active${archived(rooms.private.archived)}`] : []),
+		];
 	}
 
 	/**
