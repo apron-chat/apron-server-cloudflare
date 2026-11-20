@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { addServerToLinks, remoteReason, rewriteMentions } from '../src/remote-client';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { addServerToLinks, LinkConnection, remoteReason, rewriteMentions } from '../src/remote-client';
 import { wakeUrlAllowed } from '../src/mirror';
 import { sameAddress } from '../src/remote';
 
@@ -42,5 +42,38 @@ describe('wake pushes', () => {
 		expect(wakeUrlAllowed('http://mirror.example/remote/wake/x')).toBe(false);
 		expect(wakeUrlAllowed('https://user:pass@mirror.example/x')).toBe(false);
 		expect(wakeUrlAllowed('ftp://mirror.example/x')).toBe(false);
+	});
+});
+
+describe('a link connection', () => {
+	afterEach(() => { vi.restoreAllMocks(); });
+
+	it('paces its requests: at most 4 awaiting answers, and 10 frames a second', async () => {
+		// A stand-in owner on the other end of a WebSocketPair: it greets, signs the link in, and holds every other request.
+		const pair = new WebSocketPair();
+		const owner = pair[1];
+		owner.accept();
+		const held: Array<{ id: string; at: number }> = [];
+		owner.addEventListener('message', (event) => {
+			const frame = JSON.parse(String(event.data)) as { id: string; method: string };
+			if (frame.method === 'auth') owner.send(JSON.stringify({ id: frame.id, result: { you: { user_id: 'link_1' } } }));
+			else held.push({ id: frame.id, at: Date.now() });
+		});
+		vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+			setTimeout(() => owner.send(JSON.stringify({ method: 'server', params: { apron: 10 } })), 0);
+			return new Response(null, { status: 101, webSocket: pair[0] });
+		});
+		const connection = await LinkConnection.open('ws://owner.example/ws', 'token');
+		const answers = Array.from({ length: 6 }, (_, n) => connection.call('me', {}, `r${n}`));
+		await new Promise((resolve) => setTimeout(resolve, 600));
+		// Four went, a turn apart; the other two wait for answers.
+		expect(held.map((request) => request.id)).toEqual(['r0', 'r1', 'r2', 'r3']);
+		for (let n = 1; n < held.length; n += 1) expect(held[n].at - held[n - 1].at).toBeGreaterThanOrEqual(90);
+		for (const request of held.splice(0, 2)) owner.send(JSON.stringify({ id: request.id, result: {} }));
+		await new Promise((resolve) => setTimeout(resolve, 400));
+		expect(held.map((request) => request.id)).toEqual(['r2', 'r3', 'r4', 'r5']);
+		for (const request of held.splice(0)) owner.send(JSON.stringify({ id: request.id, result: {} }));
+		expect((await Promise.all(answers)).every((answer) => answer.result !== undefined)).toBe(true);
+		connection.close();
 	});
 });

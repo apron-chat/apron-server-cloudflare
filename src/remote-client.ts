@@ -62,19 +62,29 @@ export function addServerToLinks(text: string, self: string): string {
 		/(^|&)server=/.test(keys) ? whole : `${lead}server=${self}${keys ? `&${keys}` : ""}`);
 }
 
+/** The recipe's suggested pacing of a link's connection: at most this many requests awaiting their answers… */
+const MAX_IN_FLIGHT = 4;
+/** …and at most one frame sent this often (10 a second). */
+const SEND_INTERVAL_MS = 100;
+
 /**
  * One outbound connection to a remote server, signed in as its link for
  * this server (§3.2, `token` scheme). Every frame is handled in arrival
  * order, one at a time: a reply resolves its request, and anything else
  * (the room's records, `user` notifications) goes to `onFrame`, awaited
  * before the next frame. So a request's record (§1: it comes before the
- * result) is handled before its result is seen.
+ * result) is handled before its result is seen. Requests are paced as the
+ * recipe suggests (MAX_IN_FLIGHT, SEND_INTERVAL_MS): more wait their turn.
  */
 export class LinkConnection {
 	private socket: WebSocket | undefined;
 	private readonly waiting = new Map<string, (frame: ReplyFrame) => void>();
 	private closedReason: string | undefined;
 	private chain: Promise<void> = Promise.resolve();
+	/** Requests sent and not yet answered, those waiting for one of them to be, and when the next may go. */
+	private inFlight = 0;
+	private readonly queued: Array<() => void> = [];
+	private nextSendAt = 0;
 	/** The link's own user object, from the sign-in's `you`. */
 	you: Record<string, unknown> = {};
 
@@ -149,9 +159,36 @@ export class LinkConnection {
 		return this.socket !== undefined && this.closedReason === undefined;
 	}
 
-	/** Sends a request and waits for its answer; a closed connection, or none in time, answers with an error. */
-	call(method: string, params: Record<string, unknown>, id: string, timeoutMs = 10_000): Promise<ReplyFrame> {
-		if (!this.open) return Promise.resolve({ error: { code: -32603, message: this.closedReason ?? "not connected" } });
+	/**
+	 * Sends a request, in its turn (slot), and waits for its answer; a closed
+	 * connection, or no answer in time (the wait for its turn included),
+	 * answers with an error.
+	 */
+	async call(method: string, params: Record<string, unknown>, id: string, timeoutMs = 10_000): Promise<ReplyFrame> {
+		const deadline = Date.now() + timeoutMs;
+		if (!this.open) return { error: { code: -32603, message: this.closedReason ?? "not connected" } };
+		await this.slot();
+		try {
+			if (!this.open) return { error: { code: -32603, message: this.closedReason ?? "not connected" } };
+			if (Date.now() >= deadline) return { error: { code: -32603, message: `no answer to ${method}` } };
+			return await this.send(method, params, id, deadline - Date.now());
+		} finally {
+			this.inFlight -= 1;
+			this.queued.shift()?.();
+		}
+	}
+
+	/** Waits until fewer than MAX_IN_FLIGHT requests are out and SEND_INTERVAL_MS has passed since the last went, then takes the turn. */
+	private async slot(): Promise<void> {
+		while (this.inFlight >= MAX_IN_FLIGHT && this.open) await new Promise<void>((resolve) => this.queued.push(resolve));
+		this.inFlight += 1;
+		const now = Date.now();
+		const at = Math.max(now, this.nextSendAt);
+		this.nextSendAt = at + SEND_INTERVAL_MS;
+		if (at > now) await new Promise((resolve) => setTimeout(resolve, at - now));
+	}
+
+	private send(method: string, params: Record<string, unknown>, id: string, timeoutMs: number): Promise<ReplyFrame> {
 		return new Promise((resolve) => {
 			const timer = setTimeout(() => {
 				this.waiting.delete(id);
@@ -188,5 +225,7 @@ export class LinkConnection {
 			this.waiting.delete(id);
 			waiter({ error: { code: -32603, message: reason } });
 		}
+		// Those waiting for their turn find the connection closed.
+		for (const wake of this.queued.splice(0)) wake();
 	}
 }
