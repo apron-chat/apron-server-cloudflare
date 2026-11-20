@@ -1,8 +1,7 @@
 /*
  * The HistoryTier conformance suite: what every tier must do,
- * whatever it keeps records in. Run on MemoryHistoryTier, on the D1 tier
- * (test/history/d1-tier.test.ts), and on ColdHistoryTier over
- * MemoryBlobStore and R2 (test/history/cold-tier.test.ts).
+ * whatever it keeps records in. Run on MemoryHistoryTier, the D1 tier, and
+ * ColdHistoryTier over MemoryBlobStore and R2 (test/history/tiers.test.ts).
  *
  * Records are written as valid wire records (an archive drops invalid ones),
  * with `commit_ms` equal to `log_id`, as the cold tier reads them back. The
@@ -130,17 +129,18 @@ export function describeHistoryTier(name: string, makeTier: () => HistoryTier | 
 			}
 		});
 
-		it("reads windows forward and backward, bounds inclusive, a move once per room", async () => {
+		it("reads windows of one room or several, forward and backward, bounds inclusive, a page counted by log ID", async () => {
 			const tier = await makeTier();
 			if (!tier.read) return;
 			const log = sampleLog();
 			await appendInBatches(tier, log, 2);
-			for (const room of ["a", "b"]) {
-				for (const [lower, upper, limit] of [[1, Number.MAX_SAFE_INTEGER, 100], [1003, 1008, 100], [1003, 1008, 2], [1008, 1008, 1], [1, 1007, 3], [1012, 1012, 5], [1013, 2000, 5]] as const) {
+			// Both rooms at once: the move at 1008 is two rows but one place in a page (a page left short of it would end history early).
+			for (const rooms of [["a"], ["b"], ["a", "b"]]) {
+				for (const [lower, upper, limit] of [[1, Number.MAX_SAFE_INTEGER, 100], [1003, 1008, 100], [1003, 1008, 2], [1007, 1009, 2], [1008, 1008, 1], [1, 1007, 3], [1012, 1012, 5], [1013, 2000, 5]] as const) {
 					for (const forward of [true, false]) {
-						const got = await tier.read({ roomIds: [room], lower, upper, forward, limit });
-						const expected = limitByLogId(log.filter((record) => record.room_id === room && record.log_id >= lower && record.log_id <= upper), limit, forward);
-						expect([room, lower, upper, limit, forward, got]).toEqual([room, lower, upper, limit, forward, expected]);
+						const got = await tier.read({ roomIds: rooms, lower, upper, forward, limit });
+						const expected = limitByLogId(log.filter((record) => rooms.includes(record.room_id) && record.log_id >= lower && record.log_id <= upper), limit, forward);
+						expect([rooms, lower, upper, limit, forward, got]).toEqual([rooms, lower, upper, limit, forward, expected]);
 					}
 				}
 			}

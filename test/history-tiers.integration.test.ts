@@ -1,7 +1,6 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, it } from 'vitest';
 import { buildHistoryPipeline, historyLayout } from '../src/history/config';
-import { D1HistoryTier } from '../src/history/d1';
 import type { HistoryPipeline } from '../src/history/pipeline';
 import { applyOps, purgedRecord, renamedRecord } from '../src/history/records';
 import type { Store } from '../src/store';
@@ -110,7 +109,7 @@ it('moves records past SQLite into D1, serves them in history, and expires them 
 	} finally { peer.close(); }
 });
 
-it('rewrites records below SQLite as /purge and /rename rewrite SQLite\'s', () => {
+it('rewrites records below SQLite as /purge and /rename rewrite SQLite\'s, and applies pending ops to pages read there', () => {
 	const reactions = { kind: 'reactions', record_json: JSON.stringify({ message_id: 'm1', reactions: [{ from: { user_id: 'a' }, emojis: ['👍'] }, { from: { user_id: 'b' }, emojis: ['🎉'] }] }) };
 	expect(JSON.parse(purgedRecord(reactions, ['a'], [])!).reactions).toEqual([{ from: { user_id: 'b' }, emojis: ['🎉'] }]);
 	// Every set on a purged message goes, and a record left empty with them.
@@ -121,29 +120,14 @@ it('rewrites records below SQLite as /purge and /rename rewrite SQLite\'s', () =
 	expect(JSON.parse(renamedRecord(message, 'a', 'b')).from).toEqual({ user_id: 'b', name: 'A' });
 	expect(JSON.parse(renamedRecord(reactions, 'a', 'c')).reactions.map((set: { from: { user_id: string } }) => set.from.user_id)).toEqual(['c', 'b']);
 	expect(JSON.parse(renamedRecord(membership, 'a', 'd')).members[0].user.user_id).toBe('d');
-});
-
-it('counts a D1 page by log ID, so a move\'s two rows take one place', async () => {
-	const archive = new D1HistoryTier('recent', env.HISTORY_D1!);
-	const base = 9_000_000_000_000;
-	const row = (room: string, offset: number) => ({ room_id: room, log_id: base + offset, commit_ms: base + offset, kind: 'message', record_json: '{}' });
-	// Log IDs 1 and 2 are moves, a row in each room.
-	const rows = [row('page-a', 1), row('page-b', 1), row('page-a', 2), row('page-b', 2), row('page-a', 3), row('page-b', 4)];
-	await archive.append({ first: base + 1, last: base + 4, records: rows });
-	const forward = await archive.read({ roomIds: ['page-a', 'page-b'], lower: base, upper: base + 10, forward: true, limit: 3 });
-	expect([...new Set(forward.map((entry) => entry.log_id - base))]).toEqual([1, 2, 3]);
-	const backward = await archive.read({ roomIds: ['page-a', 'page-b'], lower: base, upper: base + 10, forward: false, limit: 3 });
-	expect([...new Set(backward.map((entry) => entry.log_id - base))]).toEqual([4, 3, 2]);
-});
-
-it('applies a pending /purge and /rename to records read below SQLite', () => {
-	const record = (logId: number, kind: string, value: object) => ({ room_id: 'general', log_id: logId, commit_ms: logId, kind, record_json: JSON.stringify(value) });
+	// Ops pending for a tier, applied in order to what a page read from it.
+	const at = (logId: number, kind: string, value: object) => ({ room_id: 'general', log_id: logId, commit_ms: logId, kind, record_json: JSON.stringify(value) });
 	const records = [
-		record(1, 'message', { message_id: 'm1', from: { user_id: 'gone' } }),
-		record(2, 'message', { message_id: 'm2', from: { user_id: 'old' } }),
-		record(3, 'reactions', { message_id: 'm1', reactions: [{ from: { user_id: 'x' }, emojis: ['👍'] }] }),
-		record(4, 'reactions', { message_id: 'm2', reactions: [{ from: { user_id: 'gone' }, emojis: ['👍'] }, { from: { user_id: 'old' }, emojis: ['🎉'] }] }),
-		record(5, 'membership', { members: [{ user: { user_id: 'gone' }, joined: true }] }),
+		at(1, 'message', { message_id: 'm1', from: { user_id: 'gone' } }),
+		at(2, 'message', { message_id: 'm2', from: { user_id: 'old' } }),
+		at(3, 'reactions', { message_id: 'm1', reactions: [{ from: { user_id: 'x' }, emojis: ['👍'] }] }),
+		at(4, 'reactions', { message_id: 'm2', reactions: [{ from: { user_id: 'gone' }, emojis: ['👍'] }, { from: { user_id: 'old' }, emojis: ['🎉'] }] }),
+		at(5, 'membership', { members: [{ user: { user_id: 'gone' }, joined: true }] }),
 	];
 	const result = applyOps(records, [{ op: 'purge', userIds: ['gone'], messageIds: [] }, { op: 'rename', from: 'old', to: 'new' }]);
 	expect(result.map((entry) => [entry.log_id, JSON.parse(entry.record_json)])).toEqual([

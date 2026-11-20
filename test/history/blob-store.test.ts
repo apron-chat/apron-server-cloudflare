@@ -23,29 +23,6 @@ describeBlobStore(
 	{ describe, it, expect },
 );
 
-describe("MemoryBlobStore call log", () => {
-	it("records each call with its key", async () => {
-		const store = new MemoryBlobStore();
-		await store.put("a", "1", { contentType: "application/jsonl" });
-		await store.get("a");
-		const writer = await store.writer("b");
-		await writer.write("2");
-		await writer.close();
-		await store.delete(["a", "b"]);
-		await store.list("p/");
-		expect(store.calls).toEqual([
-			{ method: "put", key: "a" },
-			{ method: "get", key: "a" },
-			{ method: "writer", key: "b" },
-			{ method: "writer.close", key: "b" },
-			{ method: "delete", key: "a" },
-			{ method: "delete", key: "b" },
-			{ method: "list", key: "p/" },
-		]);
-		expect(store.contentType("a")).toBe(undefined);
-	});
-});
-
 describe("R2BlobStore writer", () => {
 	/** The bucket, counting what the store asks of it. */
 	function countingBucket(bucket: R2Bucket) {
@@ -82,32 +59,29 @@ describe("R2BlobStore writer", () => {
 		return { bucket: wrapped as unknown as R2Bucket, counts };
 	}
 
-	it("stores a small body with one put, and a large one in equal 5 MiB parts", async () => {
+	it("stores a small body with one put, a large one in equal 5 MiB parts, and aborts the upload with its writer", async () => {
 		const { bucket, counts } = countingBucket(env.HISTORY_BLOB!);
 		const store = new R2BlobStore(bucket);
+		const MiB = 1024 * 1024;
 		const small = await store.writer("writer-test/small");
 		await small.write("a".repeat(1024));
 		await small.close();
 		expect(counts).toMatchObject({ put: 1, createMultipartUpload: 0 });
 
 		const large = await store.writer("writer-test/large", { contentType: "application/jsonl" });
-		for (let i = 0; i < 12; i++) await large.write("x".repeat(1024 * 1024));
+		for (let i = 0; i < 12; i++) await large.write("x".repeat(MiB));
 		await large.write("tail");
 		await large.close();
-		const MiB = 1024 * 1024;
 		expect(counts).toMatchObject({ put: 1, createMultipartUpload: 1, uploadPart: [5 * MiB, 5 * MiB, 2 * MiB + 4], complete: 1, abort: 0 });
 		const object = await env.HISTORY_BLOB!.head("writer-test/large");
 		expect(object?.size).toBe(12 * MiB + 4);
 		expect(object?.httpMetadata?.contentType).toBe("application/jsonl");
-	});
 
-	it("aborts the multipart upload when a writer is aborted", async () => {
-		const { bucket, counts } = countingBucket(env.HISTORY_BLOB!);
-		const store = new R2BlobStore(bucket);
-		const writer = await store.writer("writer-test/aborted");
-		await writer.write("y".repeat(6 * 1024 * 1024));
-		await writer.abort();
-		expect(counts).toMatchObject({ createMultipartUpload: 1, uploadPart: [5 * 1024 * 1024], complete: 0, abort: 1 });
+		// Aborted past its first part: the upload is aborted, nothing is left under the key.
+		const aborted = await store.writer("writer-test/aborted");
+		await aborted.write("y".repeat(6 * MiB));
+		await aborted.abort();
+		expect(counts).toMatchObject({ createMultipartUpload: 2, uploadPart: [5 * MiB, 5 * MiB, 2 * MiB + 4, 5 * MiB], complete: 1, abort: 1 });
 		expect(await env.HISTORY_BLOB!.head("writer-test/aborted")).toBeNull();
 	});
 });

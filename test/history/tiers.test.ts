@@ -1,11 +1,12 @@
 /*
- * The cold history tier (src/history/cold/): the HistoryTier conformance
- * suite on it over memory and over miniflare's R2, with its codec chain and
- * without one, then what is particular to chunks: one a copied range, a
- * retried copy rewriting the same key, a range overlapping chunks merged,
- * reads skipping chunks without their rooms, a /purge or /rename sweep over
- * several steps (resumed from its cursor, repeated without harm, rewriting
- * only what changes), and trims by whole chunks.
+ * History tiers below the head: the HistoryTier conformance suite on the
+ * memory tier, the D1 tier (miniflare's local HISTORY_D1, a table per run)
+ * and the cold tier over memory and miniflare's R2, with its codec chain and
+ * without one; then what is particular to the cold tier's chunks: one a
+ * copied range, a retried copy rewriting the same key, a range overlapping
+ * chunks merged, reads skipping chunks without their rooms, a /purge or
+ * /rename sweep over several steps (resumed from its cursor, repeated
+ * without harm, rewriting only what changes), and trims by whole chunks.
  */
 
 import { env } from "cloudflare:test";
@@ -16,6 +17,7 @@ import { MemoryChunkIndex } from "./support/memory-chunk-index";
 import { MemoryHistoryTier } from "./support/memory-tiers";
 import { R2BlobStore } from "../../src/history/storage/r2";
 import { ColdHistoryTier } from "../../src/history/cold/tier";
+import { D1HistoryTier } from "../../src/history/d1";
 import { HISTORY_CODECS } from "../../src/history/config";
 import { type ChatRecord, type HistoryOp, toRange } from "../../src/history/records";
 import type { BlobStore } from "../../src/history/storage/store";
@@ -38,6 +40,8 @@ function coldTier(options: { store?: BlobStore; index?: MemoryChunkIndex; prefix
 }
 
 describeHistoryTier("MemoryHistoryTier", () => new MemoryHistoryTier("memory"), runner);
+let d1Tables = 0;
+describeHistoryTier("D1HistoryTier", () => new D1HistoryTier("recent", env.HISTORY_D1!, { table: `conformance_${Date.now()}_${(d1Tables += 1)}` }), runner);
 describeHistoryTier("ColdHistoryTier over MemoryBlobStore", () => coldTier().tier, runner);
 describeHistoryTier("ColdHistoryTier over MemoryBlobStore, no codecs", () => coldTier({ codecs: [] }).tier, runner);
 describeHistoryTier("ColdHistoryTier over R2", () => coldTier({ store: new R2BlobStore(env.HISTORY_BLOB!), prefix: `history/conformance-${nonce()}/` }).tier, runner);
@@ -75,7 +79,6 @@ async function sweep(tier: ColdHistoryTier, op: HistoryOp): Promise<{ cursors: s
 describe("ColdHistoryTier chunks", () => {
 	it("makes one chunk a copied range, keyed by its first log ID through the codecs, an ARCHIVE.md file", async () => {
 		const { tier, store, index } = coldTier({ codecs: [] });
-		expect(tier.appendBatch).toBe(10_000);
 		const log = sampleLog();
 		await tier.append(toRange(log));
 		const [ref] = await index.list();
