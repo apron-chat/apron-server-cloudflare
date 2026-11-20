@@ -42,8 +42,7 @@ export interface StoredIdentity {
 
 /**
  * Whether `value` can be a `user_id` or `room_id` (protocol §2.4): a string
- * that is not empty and has no whitespace or control characters.
+ * that is not empty and has no whitespace or control characters. One
+ * definition, @apron/archive's.
  */
-export function isProtocolId(value: unknown): value is string {
-	return typeof value === "string" && /^[^\s\p{Cc}]+$/u.test(value);
-}
+export { isProtocolId } from "@apron/archive";

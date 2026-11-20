@@ -1,6 +1,7 @@
 import { env, runDurableObjectAlarm, runInDurableObject, SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { terminalOg, type Store } from '../src/store';
+import type { Store } from '../src/store';
+import { terminalOg } from '../src/content/embeds';
 import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
 
 // vitest.config.ts sets LIVE_TEXT_MAX_SECONDS 2, LIVE_TEXT_MODERATOR_MAX_SECONDS 3

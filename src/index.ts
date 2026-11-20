@@ -7,7 +7,7 @@ import { type ImportReport, importArchive } from "./history/archive/import";
 import { archiveChain, blobStoreOf, buildHistoryChain, D1_TIER, d1Off, HEAD_TIER, HISTORY_CODECS, historyLayout, layoutTiered } from "./history/config";
 import { type D1Off, detailLines, statusLines } from "./history/status";
 import { storeExport, storeRestore } from "./history/store-head";
-import { hasOutputRef, refsOf, terminalOutputKeys, withTerminalOutputs } from "./output-ref";
+import { hasOutputRef, refsOf, terminalOutputKeys, withTerminalOutputs } from "./content/output-ref";
 import { type BackupKind, BackupStore, writeBackup } from "./history/exports";
 import { type HistoryHolder, type HistoryLease, HistorySchedule, isRefusal, refusalMessage } from "./history/schedule";
 import type { HistoryChain } from "./history/chain";
@@ -23,10 +23,12 @@ import { recordMetric } from "./metrics";
 import { StallMeter, type AwakeSnapshot } from "./stalls";
 import { RefusalMeter } from "./refusals";
 import { notifyTrigger, TIER_LABEL, type NoticeChannels, type ServerTier, type TriggerNotice } from "./notify";
-import { AUDIO_TYPES, sniffAudio } from "./audio";
-import { IMAGE_TYPES, sniffImage } from "./image";
-import { TEXT_CONTENT_TYPE, TEXT_TYPES, sniffText } from "./text";
-import { isEmojiKey, MAX_EMOJI_NAME_CHARS } from "./emoji";
+import { AUDIO_TYPES, sniffAudio } from "./content/media/audio";
+import { IMAGE_TYPES, sniffImage } from "./content/media/image";
+import { TEXT_CONTENT_TYPE, TEXT_TYPES, sniffText } from "./content/media/text";
+import { isEmojiKey, MAX_EMOJI_NAME_CHARS } from "./content/emoji";
+import { liveInputLimit, liveResultEmbed, uploadResultEmbed } from "./content/embeds";
+import { MAX_USER_EXT_BYTES, clientUserExt, userExtFits } from "./content/user";
 import { limitData } from "./store-error";
 import { looksLikeUploadToken, signUploadToken, verifyUploadToken } from "./upload-token";
 import { AUTH_SECRET_BYTES, base64UrlDecode, base64UrlEncode, sendWebPush, validP256PublicKey, type VapidKeys } from "./webpush";
@@ -70,24 +72,18 @@ import {
 	WAKE_SCOPES,
 	MAX_ROOM_MUTES_PER_USER,
 	ROOM_ID,
-	MAX_USER_EXT_BYTES,
 	JOINED_WAKE_ROLES,
 	EMOJI_ROLES,
 	MODERATOR_ROLES,
 	BOT_MODERATOR_ROLES,
 	BOT_NAME_PATTERN,
 	BOT_NAME_RULE,
-	clientUserExt,
 	mergeExt,
-	userExtFits,
 	Store,
 	StoreError,
 	UPLOAD_SWEEP_BATCH,
 	UPLOAD_WRITE_GRACE_MS,
-	uploadResultEmbed,
 	liveDeadline,
-	liveInputLimit,
-	liveResultEmbed,
 	isPrivateRoomId,
 	MAX_READ_RECEIPT_MEMBERS,
 	seenStands,

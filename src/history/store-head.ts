@@ -43,7 +43,7 @@ export interface RestoreStore {
 	identityExists(userId: string): boolean;
 	isRetiredUserId(userId: string): boolean;
 	historyFloors(): { latest: number };
-	restorableRecord(record: ChatRecord): ChatRecord | null;
+	readonly content: { record(record: ChatRecord): { ok: true; value: ChatRecord } | { ok: false } };
 	restoreUsers(users: readonly ArchivedUser[]): void;
 	restoreRoom(room: ArchivedRoom, records: readonly ChatRecord[], now?: number, options?: { rooms?: readonly string[] }): RestoreResult;
 	historyImportJournal(): string | undefined;
@@ -91,7 +91,10 @@ export function storeRestore(store: RestoreStore): RestorePort {
 		hasUser: async (userId) => store.identityExists(userId),
 		isRetired: async (userId) => store.isRetiredUserId(userId),
 		latest: async () => store.historyFloors().latest,
-		normalize: (record) => store.restorableRecord(record),
+		normalize: (record) => {
+			const checked = store.content.record(record);
+			return checked.ok ? checked.value : null;
+		},
 		restoreUsers: async (users) => store.restoreUsers(users),
 		restoreRoom: async (room: ArchivedRoom, records: readonly ChatRecord[], context: RestoreContext) => store.restoreRoom(room, records, undefined, { rooms: context.rooms }),
 		journal: {

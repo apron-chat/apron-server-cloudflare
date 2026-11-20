@@ -14,7 +14,7 @@
  */
 
 import { type ChatRecord, authoredMessages, byLog, purgedRecord, renamedRecord } from "@apron/archive";
-import { refsOf, withoutOutputRefs } from "../output-ref";
+import { refsOf, withoutOutputRefs } from "../content/output-ref";
 
 export { type ChatRecord, type RecordKind, authoredMessages, byLog, logIds, purgedRecord, renamedRecord } from "@apron/archive";
 

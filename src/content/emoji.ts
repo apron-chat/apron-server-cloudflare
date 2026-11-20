@@ -1,7 +1,18 @@
 /**
  * Reaction entries (protocol §4.7) and custom emoji keys (extension
- * `ext:emoji`, EXTENSIONS.md).
+ * `ext:emoji`, EXTENSIONS.md): one entry's form and identity, and a whole
+ * reaction set as this server keeps it (normalizeEmojis). Whether a custom
+ * key is in this server's catalog is the Store's to check: it reads state.
  */
+
+import { type Verdict, accept, refuse, utf8Bytes } from "./verdict.ts";
+
+/** Most UTF-8 bytes in one reaction entry. */
+export const MAX_EMOJI_BYTES = 64;
+
+/** A control character: an entry holding one is not a single sequence. */
+// eslint-disable-next-line no-control-regex
+const CONTROL = /[\u0000-\u001f\u007f]/;
 
 /** A custom emoji key: `:`, a name of `[A-Za-z0-9_+-]`, and `:`. Case-sensitive. */
 export const EMOJI_KEY = /^:[A-Za-z0-9_+-]+:$/;
@@ -48,4 +59,28 @@ export function qualifyEmoji(entry: string): string {
 	});
 	const joined = parts.join(ZWJ);
 	return RGI_EMOJI.test(joined) ? joined : entry;
+}
+
+/**
+ * A reaction set as kept (§4.7): strings, bounded, each emoji sequence
+ * fully qualified (qualifyEmoji), custom keys as written, and duplicates
+ * collapsed, entries that differ only in U+FE0F included; at most
+ * `reactionEmojisPerUser` of them (a count limit this server sets: denied).
+ */
+export function normalizeEmojis(value: unknown, limits: { reactionEmojisPerUser: number }): Verdict<string[]> {
+	if (!Array.isArray(value)) return refuse("invalid_params", "emojis must be an array");
+	const emojis: string[] = [];
+	const seen = new Set<string>();
+	for (const item of value) {
+		if (typeof item !== "string" || item.length === 0) return refuse("invalid_params", "each emoji must be a non-empty string");
+		if (utf8Bytes(item) > MAX_EMOJI_BYTES) return refuse("too_large", "emoji is too long");
+		if (CONTROL.test(item)) return refuse("invalid_params", "emoji is not a single sequence");
+		const entry = isEmojiKey(item) ? item : qualifyEmoji(item);
+		const identity = emojiIdentity(entry);
+		if (seen.has(identity)) continue;
+		seen.add(identity);
+		emojis.push(entry);
+	}
+	if (emojis.length > limits.reactionEmojisPerUser) return refuse("denied", `A reaction set holds at most ${limits.reactionEmojisPerUser} emoji`);
+	return accept(emojis);
 }

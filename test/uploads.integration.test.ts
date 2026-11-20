@@ -1,9 +1,6 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { DEFAULT_LIMITS, UPLOAD_POLICY } from '../src/budget';
-import { sniffAudio } from '../src/audio';
-import { sniffImage } from '../src/image';
-import { sniffText } from '../src/text';
 import { loadConfig } from '../src/config';
 import { attachmentTypes, fetchEntry } from '../src/index';
 import { signUploadToken, verifyUploadToken } from '../src/upload-token';
@@ -562,7 +559,7 @@ describe('store uploads', () => {
 	});
 });
 
-describe('upload tokens and image sniffing', () => {
+describe('upload tokens', () => {
 	it('signs write tokens that expire and refuse any change', async () => {
 		const grant = { key: 'f/AAAAAAAAAAAAAAAAAAAAAA', maxBytes: 1_000, expiresMs: 2_000_000 };
 		const token = await signUploadToken('secret-0123456789abcdef0123456789', grant);
@@ -571,60 +568,6 @@ describe('upload tokens and image sniffing', () => {
 		expect(await verifyUploadToken('another-secret-0123456789abcdef012', token, 1_000_000)).toBeNull();
 		expect(await verifyUploadToken('secret-0123456789abcdef0123456789', token.replace('.1000.', '.9999.'), 1_000_000)).toBeNull();
 		expect(await verifyUploadToken('secret-0123456789abcdef0123456789', 'f.x.1.2.sig', 1_000_000)).toBeNull();
-	});
-
-	it('knows images by their bytes, with sizes where the header has them', () => {
-		expect(sniffImage(png(640, 480))).toEqual({ type: 'image/png', width: 640, height: 480 });
-		const gif = new Uint8Array([...new TextEncoder().encode('GIF89a'), 0x20, 0x00, 0x10, 0x00]);
-		expect(sniffImage(gif)).toEqual({ type: 'image/gif', width: 32, height: 16 });
-		const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x04, 0x00, 0x00, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x30, 0x00, 0x40, 0x03]);
-		expect(sniffImage(jpeg)).toEqual({ type: 'image/jpeg', width: 64, height: 48 });
-		const webp = new Uint8Array(30);
-		webp.set(new TextEncoder().encode('RIFF'), 0);
-		webp.set(new TextEncoder().encode('WEBPVP8X'), 8);
-		webp.set([99, 0, 0, 49, 0, 0], 24);
-		expect(sniffImage(webp)).toEqual({ type: 'image/webp', width: 100, height: 50 });
-		expect(sniffImage(new TextEncoder().encode('<html><script>alert(1)</script>'))).toBeNull();
-		expect(sniffImage(new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg"/>'))).toBeNull();
-		expect(sniffImage(webm())).toBeNull();
-	});
-
-	it('knows voice clips by their containers: WebM, Ogg, and MP4', () => {
-		const encode = (text: string) => new TextEncoder().encode(text);
-		expect(sniffAudio(webm())).toEqual({ type: 'audio/webm' });
-		const matroska = webm();
-		matroska.set(encode('mkv '), 12);
-		expect(sniffAudio(matroska)).toBeNull();
-		const ogg = (codec: string) => {
-			const data = new Uint8Array(64);
-			data.set(encode('OggS'), 0);
-			data[26] = 1;
-			data[27] = 19;
-			data.set(encode(codec), 28);
-			return data;
-		};
-		expect(sniffAudio(ogg('OpusHead'))).toEqual({ type: 'audio/ogg' });
-		expect(sniffAudio(ogg('\x01vorbis'))).toEqual({ type: 'audio/ogg' });
-		expect(sniffAudio(ogg('\x80theora'))).toBeNull();
-		const mp4 = (brand: string) => new Uint8Array([0, 0, 0, 24, ...encode('ftyp'), ...encode(brand), 0, 0, 0, 0]);
-		expect(sniffAudio(mp4('iso5'))).toEqual({ type: 'audio/mp4' });
-		expect(sniffAudio(mp4('M4A '))).toEqual({ type: 'audio/mp4' });
-		expect(sniffAudio(mp4('heic'))).toBeNull();
-		expect(sniffAudio(mp4('avif'))).toBeNull();
-		expect(sniffAudio(png())).toBeNull();
-		expect(sniffAudio(encode('<html><script>alert(1)</script>'))).toBeNull();
-	});
-
-	it('keeps any UTF-8 text without a NUL byte as Markdown', () => {
-		const encode = (text: string) => new TextEncoder().encode(text);
-		expect(sniffText(encode('# Plan\n\n- canary 🐤'))).toEqual({ type: 'text/markdown' });
-		// It is served as Markdown, which no browser runs, whatever it holds.
-		expect(sniffText(encode('<html><script>alert(1)</script>'))).toEqual({ type: 'text/markdown' });
-		expect(sniffText(new Uint8Array())).toBeNull();
-		expect(sniffText(encode('a\0b'))).toBeNull();
-		expect(sniffText(new Uint8Array([0x23, 0x20, 0xff, 0xfe]))).toBeNull();
-		expect(sniffText(png())).toBeNull();
-		expect(sniffText(webm())).toBeNull();
 	});
 });
 

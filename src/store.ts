@@ -30,7 +30,7 @@ import type { ChatRecord, HistoryQuery, QueuedRewrite, Rewrite } from "./history
 import type { ChainStatePort } from "./history/state";
 import { type ArchivedRoom, type ArchivedUser, parseLogId, type ReplayedMembership, replayRecords, roomClientFields, type ValidRecord, validateRecord, withClientUsers } from "@apron/archive";
 import { ADMIN_USER_ID, restorableUserId } from "./user-ids";
-import { MAX_TERMINAL_OUTPUT_JSON_BYTES, type TerminalOutputRef, outputRef } from "./output-ref";
+import { MAX_TERMINAL_OUTPUT_JSON_BYTES, type TerminalOutputRef, outputRef } from "./content/output-ref";
 import type { ChunkIndex, ChunkRef } from "./history/cold/chunks";
 import {
   BudgetLedger,
@@ -52,7 +52,13 @@ import { isProtocolId, type StoredCredential, type StoredIdentity } from "./doma
 // @ts-expect-error Workers' nodejs_compat runtime supplies this module; the
 // worker type package intentionally omits Node's full module declarations.
 import { createHash } from "node:crypto";
-import { emojiIdentity, isEmojiKey, qualifyEmoji } from "./emoji";
+import { emojiIdentity, isEmojiKey } from "./content/emoji";
+import { type ContentPolicy, contentPolicy } from "./content/policy";
+import { type Verdict, boundedText } from "./content/verdict";
+import { type MessageBody, isEmptyBody } from "./content/body";
+import { liveInputLimit, liveResultEmbed, terminalOg, uploadResultEmbed, uploadTitle } from "./content/embeds";
+import { hasAppend, messageContent, sharesText, withEditedBy, withoutOutputs } from "./content/snapshot";
+import { MAX_USER_EXT_BYTES, clientUserExt, recordedUser, userExtFits } from "./content/user";
 
 /** The seeded, permanent top-level room. */
 export const ROOM_ID = "general";
@@ -442,40 +448,6 @@ export interface UploadFinish {
 }
 
 /**
- * A new upload as a result lists it (§4.8.3), with `write` in place of the
- * `write_url` the runtime signs from it. Kept in the stored result, so a
- * retry signs the same URL.
- */
-export function uploadResultEmbed(upload: PendingUpload): Record<string, unknown> {
-  return {
-    embed_id: upload.embedId,
-    kind: "upload",
-    write: { key: upload.key, max_bytes: upload.maxBytes, expires_ms: upload.writeExpiresMs },
-  };
-}
-
-/**
- * A new live text as a result lists it (§4.8.3), with `write` in place of
- * the `write_url` the runtime signs from it, as for an upload.
- */
-export function liveResultEmbed(entry: LiveEntry, policy: Pick<LiveTextPolicy, "maxInputBytes">): Record<string, unknown> {
-  return {
-    embed_id: entry.embedId,
-    kind: entry.kind,
-    write: { key: entry.key, max_bytes: liveInputLimit(entry, policy), expires_ms: entry.writeExpiresMs },
-  };
-}
-
-/**
- * The most bytes a write may send: for an append, the bytes it keeps (its
- * `limit`), so edits never let it stream more than an append without them;
- * for a terminal, `maxInputBytes`.
- */
-export function liveInputLimit(entry: Pick<LiveEntry, "kind" | "limit">, policy: Pick<LiveTextPolicy, "maxInputBytes">): number {
-  return entry.kind === "append" ? Math.min(entry.limit, policy.maxInputBytes) : policy.maxInputBytes;
-}
-
-/**
  * When an open live text falls due: its `write_url`'s expiry while it
  * waits, and its time limit plus LIVE_ORPHAN_GRACE_MS while it streams.
  */
@@ -500,34 +472,12 @@ function liveUrl(live: Pick<StoreLiveTextConfig, "publicOrigin">, entry: Pick<Li
   return `${live.publicOrigin}/live/${entry.id}`;
 }
 
-/**
- * A terminal embed's `og` (protocol §4.8.1): what it is, for a client that
- * doesn't render terminal embeds and shows it as the card its `og`
- * describes, which opens its `url`. Titled as the embed is.
- */
-export function terminalOg(title: unknown): { title: string; description: string } {
-  return { title: typeof title === "string" && title ? title : "Terminal", description: "Terminal output. Open it to watch." };
-}
-
 function isLiveEntry(value: unknown): value is LiveEntry {
   if (!isPlainObject(value)) return false;
   return typeof value.key === "string" && /^l\/[A-Za-z0-9_-]{22}$/.test(value.key) && typeof value.id === "string" &&
     (value.kind === "terminal" || value.kind === "append") && typeof value.owner === "string" && typeof value.ip === "string" &&
     (value.state === "pending" || value.state === "live") && Number.isSafeInteger(value.writeExpiresMs) &&
     Number.isSafeInteger(value.maxMs) && Number.isSafeInteger(value.limit) && typeof value.embedId === "string";
-}
-
-/** A snapshot without the server's finished terminal `output`s (or their refs), for the client size policy. */
-function withoutOutputs(snapshot: MessageSnapshot): MessageSnapshot {
-  const embeds = snapshot.body?.embeds;
-  if (!Array.isArray(embeds) || !embeds.some((embed) => isPlainObject(embed) && (embed.output !== undefined || embed.output_ref !== undefined))) return snapshot;
-  return { ...snapshot, body: { ...snapshot.body, embeds: embeds.map((embed) => {
-    if (!isPlainObject(embed) || (embed.output === undefined && embed.output_ref === undefined)) return embed;
-    const { output: _output, output_ref: _ref, ...rest } = embed;
-    void _output;
-    void _ref;
-    return rest;
-  }) } };
 }
 
 /**
@@ -1298,13 +1248,6 @@ export const ROOM_CREATOR_ROLES: readonly string[] = ["admin", "mod"];
 export const MAX_CREATED_ROOMS = 16;
 /** Most roles one user holds, so the column stays small. */
 export const MAX_ROLES_PER_USER = 8;
-/**
- * Largest serialized `ext` a user keeps (protocol §4.13), after a write's
- * merge: room for an extension's few fields, such as a bridge's nick or a
- * time zone. Every connection of the user carries it in its attachment, and
- * every listing that shows the user carries it in `users`.
- */
-export const MAX_USER_EXT_BYTES = 512;
 /** A role name: lowercase letters, digits, `_` or `-`, starting with a letter. */
 export const ROLE_PATTERN = /^[a-z][a-z0-9_-]{0,23}$/;
 
@@ -1698,43 +1641,6 @@ export function mergeExt(stored: unknown, write: Record<string, unknown> | undef
 }
 
 /**
- * ext:editors (apron's EXTENSIONS.md): whether `userId`, who did not send
- * the message, may save its `body.text`. Its sender shares it with
- * `ext.editors {"body.text": "mentioned"}`, and then each user in the current
- * `body.mentions` may save it. Any other key or value shares nothing.
- */
-export function sharesText(snapshot: MessageSnapshot, userId: string): boolean {
-  if (snapshot.deleted) return false;
-  const editors = snapshot.ext?.editors;
-  if (!isPlainObject(editors) || editors["body.text"] !== "mentioned") return false;
-  const mentions = snapshot.body?.mentions;
-  return Array.isArray(mentions) && mentions.includes(userId);
-}
-
-/** Whether a message's body has an `append` embed, whose live text writes into `body.text` (§4.8.5). */
-function hasAppend(snapshot: MessageSnapshot): boolean {
-  const embeds = snapshot.body?.embeds;
-  return Array.isArray(embeds) && embeds.some((embed) => isPlainObject(embed) && embed.kind === "append");
-}
-
-/**
- * `ext` with `ext.editors.edited_by` set to `userId`, or removed without one
- * (ext:editors): the server sets it on a save by someone other than the
- * sender, removes it on the sender's saves, and ignores it in requests.
- */
-export function withEditedBy(ext: Record<string, unknown> | undefined, userId: string | undefined): Record<string, unknown> | undefined {
-  const editors = ext?.editors;
-  if (!ext || !isPlainObject(editors) || (userId === undefined && !Object.hasOwn(editors, "edited_by"))) return ext;
-  const { edited_by: _, ...grants } = editors;
-  void _;
-  const next = userId === undefined ? grants : { ...grants, edited_by: userId };
-  const { editors: _old, ...rest } = ext;
-  void _old;
-  if (Object.keys(next).length) return { ...rest, editors: next };
-  return Object.keys(rest).length ? rest : undefined;
-}
-
-/**
  * The keys of a user's `ext` that a write changed (protocol §4.13), as a
  * `user` notification carries them: each new or replaced value, and `""`
  * for each key it cleared. Undefined when nothing changed.
@@ -1748,30 +1654,11 @@ function changedExt(before: Record<string, unknown> | undefined, after: Record<s
   return changed.size ? Object.fromEntries(changed) : undefined;
 }
 
-/**
- * Keys of a user's `ext` that the server owns: `permissions` (extension
- * `ext:permissions`), which only the user's own `you` carries. A `me` write
- * of one is ignored, like `roles`, and one stored before is never read.
- */
-const SERVER_USER_EXT_KEYS: readonly string[] = ["permissions"];
-
-/** A user's `ext` without the keys the server owns (SERVER_USER_EXT_KEYS), or undefined when nothing is left. */
-export function clientUserExt(ext: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
-  if (!ext || !SERVER_USER_EXT_KEYS.some((key) => Object.hasOwn(ext, key))) return ext;
-  const kept = Object.fromEntries(Object.entries(ext).filter(([key]) => !SERVER_USER_EXT_KEYS.includes(key)));
-  return Object.keys(kept).length ? kept : undefined;
-}
-
 /** An identity row's `ext_json`: its object without server-owned keys, or undefined when empty or unreadable. */
 function parseUserExt(json: string | null | undefined): Record<string, unknown> | undefined {
   if (!json) return undefined;
   const parsed = parseJson<unknown>(json, null);
   return isPlainObject(parsed) && Object.keys(parsed).length ? clientUserExt(parsed) : undefined;
-}
-
-/** Whether a user's merged `ext` fits MAX_USER_EXT_BYTES. */
-export function userExtFits(ext: Record<string, unknown> | undefined): boolean {
-  return ext === undefined || utf8Bytes(JSON.stringify(ext)) <= MAX_USER_EXT_BYTES;
 }
 
 function dayFor(ms: number): string {
@@ -1827,12 +1714,6 @@ function canonicalize(value: unknown): string {
   throw new StoreError("invalid_params", "unsupported value in request");
 }
 
-
-/** A snapshot's content, which only its author changes: what a save keeps besides `room_id` and the server's links. */
-function messageContent(snapshot: MessageSnapshot): Record<string, unknown> {
-  return { body: snapshot.body, reply_to: snapshot.reply_to, deleted: snapshot.deleted === true, ext: snapshot.ext };
-}
-
 function digestOperation(method: string, params: unknown): string {
   return createHash("sha256").update(canonicalize({ method, params }), "utf8").digest("hex");
 }
@@ -1886,11 +1767,6 @@ function roomIdList(value: string | null | undefined): string[] {
   return [...new Set(parsed.filter((item): item is string => typeof item === "string" && item.length > 0 && item.length <= 64))];
 }
 
-/** A membership's recorded user (§3.3): `user_id` and a non-empty `name`. */
-function recordedUser(userId: string, name: string | null | undefined): Identity {
-  return { user_id: userId, ...(name ? { name } : {}) };
-}
-
 /** An imported user's avatar: a plain `https:` URL without credentials, of bounded length, or undefined. */
 function restoredAvatar(value: unknown): string | undefined {
   if (typeof value !== "string" || !value || utf8Bytes(value) > MAX_RESTORED_AVATAR_BYTES) return undefined;
@@ -1901,7 +1777,6 @@ function restoredAvatar(value: unknown): string | undefined {
     return undefined;
   }
 }
-
 
 /** One record restoreRoom takes, checked (@apron/archive validateRecord), with its parsed wire value. */
 type RestoredRecord = ValidRecord;
@@ -1920,31 +1795,9 @@ function restoredEntries(record: RestoredRecord): number {
   return 0;
 }
 
-/**
- * The text an embed's `og` may carry, with its longest kept length in code
- * points. Clients build `og` themselves (such as link previews), and the
- * server has the last word on it (§4.8.1): it keeps these fields as one line
- * of plain text and drops the rest. Media are kept only from `ogMediaHosts`.
- */
-const OG_TEXT_FIELDS: Record<string, number> = { title: 256, description: 512, site_name: 128 };
-const OG_MEDIA_FIELDS = ["image", "video", "audio"] as const;
-const OG_MEDIA_URL_BYTES = 2_048;
-const OG_MEDIA_TYPE_BYTES = 128;
-const OG_MEDIA_ALT_CODE_POINTS = 512;
-const OG_MEDIA_MAX_DIMENSION = 16_384;
-
-/** Control, bidirectional override, and line or paragraph separator characters. */
-const OG_UNSAFE_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
-
-/** `value` as one line of plain text of at most `max` code points, or undefined when empty. */
 /** An identity's avatar while it has not expired (protocol §4.8.7). */
 function liveAvatar(row: { avatar_url: string | null; avatar_expires_ms: number | null }, now: number): string | undefined {
   return row.avatar_url && (row.avatar_expires_ms ?? 0) > now ? row.avatar_url : undefined;
-}
-
-/** An upload embed's `title`: its sender's single line of text, bounded like `og.title`. */
-function uploadTitle(value: unknown): string | undefined {
-  return ogLine(value, OG_TEXT_FIELDS.title);
 }
 
 /** An unguessable object key segment (protocol §4.8.2): 128 random bits, base64url. */
@@ -1953,70 +1806,18 @@ function randomKey(): string {
   return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-function ogLine(value: unknown, max: number): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const line = value.replace(OG_UNSAFE_CHARACTERS, " ").replace(/\s+/g, " ").trim();
-  const points = [...line];
-  if (!points.length) return undefined;
-  return points.length > max ? `${points.slice(0, max - 1).join("").trimEnd()}…` : line;
-}
-
-/**
- * An `og` media object with an absolute `https:` `url` on one of `hosts`,
- * without credentials or a port, and bounded details; or undefined.
- */
-function ogMedia(value: unknown, hosts: readonly string[] | "*"): Record<string, unknown> | undefined {
-  if (!isPlainObject(value) || typeof value.url !== "string" || utf8Bytes(value.url) > OG_MEDIA_URL_BYTES) return undefined;
-  let url: URL;
-  try {
-    url = new URL(value.url);
-  } catch {
-    return undefined;
-  }
-  if (url.protocol !== "https:" || url.username || url.password || url.port) return undefined;
-  if (!hostListAllowed(hosts, url.hostname)) return undefined;
-  const media: Record<string, unknown> = { url: url.href };
-  if (typeof value.type === "string" && /^[\w.+-]+\/[\w.+-]+$/.test(value.type) && value.type.length <= OG_MEDIA_TYPE_BYTES) media.type = value.type;
-  for (const field of ["width", "height"] as const) {
-    const size = value[field];
-    if (Number.isInteger(size) && (size as number) > 0 && (size as number) <= OG_MEDIA_MAX_DIMENSION) media[field] = size;
-  }
-  const alt = ogLine(value.alt, OG_MEDIA_ALT_CODE_POINTS);
-  if (alt) media.alt = alt;
-  return media;
-}
-
-/**
- * `embed` with its `og` reduced to kept text fields, plus media on one of
- * `mediaHosts`, or without `og` when nothing is left.
- */
-function withCleanOg(embed: Record<string, unknown>, mediaHosts: readonly string[] | "*"): Record<string, unknown> {
-  if (embed.og === undefined) return embed;
-  const { og, ...rest } = embed;
-  const clean: Record<string, unknown> = {};
-  if (isPlainObject(og)) {
-    for (const [field, max] of Object.entries(OG_TEXT_FIELDS)) {
-      const line = ogLine(og[field], max);
-      if (line) clean[field] = line;
-    }
-    if (mediaHosts === "*" || mediaHosts.length) {
-      for (const field of OG_MEDIA_FIELDS) {
-        const media = ogMedia(og[field], mediaHosts);
-        if (media) clean[field] = media;
-      }
-    }
-  }
-  return Object.keys(clean).length ? { ...rest, og: clean } : rest;
-}
-
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
 function ensureText(value: unknown, field: string, maxBytes: number): string {
-  if (typeof value !== "string") throw new StoreError("invalid_params", `${field} must be a string`);
-  if (utf8Bytes(value) > maxBytes) throw new StoreError("too_large", `${field} is too large`);
-  return value;
+  return must(boundedText(value, field, maxBytes));
+}
+
+/** A content check's value, or its refusal thrown as the StoreError a request answers with (content/policy.ts). */
+function must<T>(verdict: Verdict<T>): T {
+  if (!verdict.ok) throw new StoreError(verdict.code, verdict.message);
+  return verdict.value;
 }
 
 /** The indexes of schema 9's tables that schema 10 rebuilds (upgradeFromSchema9), dropped before the rebuild creates its own. */
@@ -2393,6 +2194,8 @@ export class Store {
   private readonly chunkIndexes = new Map<string, Map<number, ChunkRef>>();
   /** Whether the chunk table exists, this instance (chunkIndex). */
   private chunkTableReady = false;
+  /** What this server takes as content, for a post and an import alike (content/policy.ts), from its limits. */
+  readonly content: ContentPolicy;
 
   constructor(
     storageOrState: unknown,
@@ -2414,6 +2217,7 @@ export class Store {
     }
     this.transactionSync = this.durableStorage?.transactionSync?.bind(this.durableStorage);
     this.config = defaultStoreConfig(config);
+    this.content = contentPolicy(this.config);
     this.clock = typeof clock === "function" ? { now: clock } : clock;
     this.ledger = new BudgetLedger({
       exec: (query, ...bindings) => this.rawExec(query, ...bindings),
@@ -4132,42 +3936,6 @@ export class Store {
   }
 
   /**
-   * Import: an archived record as a client could have sent it, or null when
-   * none could have (RestorePort.normalize): every recorded user
-   * (`from`, reaction sets' `from`, members' `user`) bare, `user_id` and a
-   * name within the name limits, and never a server notice's (`~…`); a
-   * message's body normalized as a post's (normalizedBody: text size, embeds,
-   * `og` media hosts, mentions), refused where a post's would be; and a
-   * message or room record within maxSnapshotBytes, as a save's snapshot
-   * is (a finished terminal's `output` aside). Pure: no reads. The same
-   * record when nothing changes.
-   */
-  restorableRecord(record: ChatRecord): ChatRecord | null {
-    const value = typeof record?.record_json === "string" ? parseJson<unknown>(record.record_json, null) : null;
-    if (!isPlainObject(value)) return null;
-    // Every recorded user a client's: bare, a protocol ID, a name within the limits (clientUser).
-    if (!withClientUsers(value, record.kind, this.config)) return null;
-    if (record.kind === "message") {
-      if (value.body !== undefined) {
-        if (value.deleted === true) delete value.body;
-        else {
-          try {
-            value.body = this.normalizedBody(value.body);
-          } catch (error) {
-            if (error instanceof StoreError) return null;
-            throw error;
-          }
-        }
-      }
-      if (utf8Bytes(JSON.stringify(withoutOutputs(value as unknown as MessageSnapshot))) > this.config.maxSnapshotBytes + 1_024) return null;
-    } else if (record.kind === "room") {
-      if (utf8Bytes(record.record_json) > this.config.maxSnapshotBytes + 1_024) return null;
-    }
-    const json = JSON.stringify(value);
-    return json === record.record_json ? record : { ...record, record_json: json };
-  }
-
-  /**
    * Import: adds a room that is new here, with the
    * records of it that belong in this SQLite (the hot log), and rebuilds the
    * current state they give, as if they had been committed here.
@@ -4234,15 +4002,15 @@ export class Store {
     const checked = records.map((record) => restoredRecord(roomId, record));
     const late = checked.find((record) => record.log_id > horizon || record.commit_ms > horizon);
     if (late) throw new StoreError("invalid_params", `Record ${late.log_id} of ${roomId} is later than this server's clock`.slice(0, 200));
-    // Only what a client could have sent (restorableRecord): anything else is dropped and counted.
+    // Only what a client could have sent (content.record, as a post is checked): anything else is dropped and counted.
     let rejected = 0;
     const batch = checked.flatMap((record) => {
-      const normalized = this.restorableRecord({ room_id: roomId, log_id: record.log_id, commit_ms: record.commit_ms, kind: record.kind, record_json: record.record_json });
-      if (!normalized) {
+      const normalized = this.content.record({ room_id: roomId, log_id: record.log_id, commit_ms: record.commit_ms, kind: record.kind, record_json: record.record_json });
+      if (!normalized.ok) {
         rejected += 1;
         return [];
       }
-      return normalized.record_json === record.record_json ? [record] : [restoredRecord(roomId, normalized)];
+      return normalized.value.record_json === record.record_json ? [record] : [restoredRecord(roomId, normalized.value)];
     }).sort((a, b) => a.log_id - b.log_id);
     // The rooms a message here may already be in and still be this one: this room, and the others this import adds.
     const importRooms = new Set([roomId, ...(options.rooms ?? [])]);
@@ -5936,58 +5704,10 @@ export class Store {
     return { user_id: input.identity.user_id, ...(name ? { name } : {}) };
   }
 
-  private normalizedBody(value: unknown): Record<string, unknown> {
-    const body = jsonObject(value, "body");
-    const text = body.text === undefined ? "" : ensureText(body.text, "body.text", this.config.maxTextBytes);
-    // The protocol defaults an omitted format to plain text.
-    const format = body.format === undefined ? "plain" : body.format;
-    if (format !== "plain" && format !== "markdown") throw new StoreError("invalid_params", "body.format is invalid");
-    const embeds = body.embeds === undefined ? [] : body.embeds;
-    if (!Array.isArray(embeds)) throw new StoreError("invalid_params", "body.embeds must be an array");
-    // A count limit this server sets: denied (§1.1).
-    if (embeds.length > this.config.maxEmbeds) throw new StoreError("denied", `A message has at most ${this.config.maxEmbeds} embeds`);
-    for (const embed of embeds) {
-      if (!isPlainObject(embed) || typeof embed.kind !== "string" || embed.kind.length === 0) {
-        throw new StoreError("invalid_params", "body.embeds must be objects with a kind");
-      }
-    }
-    // Who a message mentions is the list its sender gives (§3.5); the server
-    // never reads mentions out of text. Duplicates collapse.
-    let mentions: string[] | undefined;
-    if (body.mentions !== undefined) {
-      if (!Array.isArray(body.mentions)) throw new StoreError("invalid_params", "body.mentions must be an array of user_id strings");
-      const unique = new Set<string>();
-      for (const item of body.mentions) {
-        // Mentions are user_ids (§2.4): a string that cannot be one makes the
-        // whole message, new or edited, invalid.
-        if (!isProtocolId(item)) {
-          throw new StoreError("invalid_params", "body.mentions must be an array of user_id strings");
-        }
-        if (utf8Bytes(item) > 256) throw new StoreError("too_large", "a mentioned user_id is too long");
-        unique.add(item);
-      }
-      mentions = [...unique];
-    }
-    // `output_ref` is the server's alone (TerminalOutputRef): a client's is dropped.
-    const clientEmbeds = (clone(embeds) as Record<string, unknown>[]).map(({ output_ref: _ref, ...embed }) => withCleanOg(embed, this.config.ogMediaHosts));
-    return { ...clone(body), text, format, embeds: clientEmbeds, ...(mentions ? { mentions } : {}) };
-  }
-
-  /**
-   * The body of an editor's save (ext:editors): the current snapshot's body,
-   * with the text that the request carries, checked as any text is.
-   */
-  private sharedTextBody(previous: MessageSnapshot, value: unknown): Record<string, unknown> {
-    const body = jsonObject(value, "body");
-    const text = body.text === undefined ? "" : ensureText(body.text, "body.text", this.config.maxTextBytes);
-    return { ...clone(previous.body ?? {}), text };
-  }
-
   /** A new message with no text and no embeds, which is neither logged nor broadcast (§3.5). */
   private emptyNewMessage(params: Record<string, unknown>): boolean {
     if (params.message_id !== undefined || (params.deleted !== undefined && params.deleted !== false) || !isPlainObject(params.body)) return false;
-    const body = this.normalizedBody(params.body);
-    return body.text === "" && (body.embeds as unknown[]).length === 0;
+    return isEmptyBody(must(this.content.body(params.body)));
   }
 
   /**
@@ -6444,10 +6164,10 @@ export class Store {
     if (!deleted) {
       if (params.body === undefined) throw new StoreError("invalid_params", "message body is required");
       // An editor's save keeps every other field of the body.
-      body = editor ? this.sharedTextBody(previous!, params.body) : this.normalizedBody(params.body);
+      body = editor ? must(this.content.sharedText(previous!.body, params.body)) : must(this.content.body(params.body));
       // Emptied, a message whose last embed then fails or ends with nothing is a tombstone (rewriteEmbed): only its sender deletes it.
       if (editor && body.text === "") throw new StoreError("invalid_params", "Only the sender may empty this message's text");
-      if (body.text === "" && (body.embeds as unknown[]).length === 0) throw new StoreError("invalid_params", "message cannot be empty");
+      if (isEmptyBody(body as MessageBody)) throw new StoreError("invalid_params", "message cannot be empty");
     }
     // A save merges `ext` into the current snapshot's (§4.13); a tombstone carries none (§4.4),
     // so a creation, or a save of a tombstone, merges into an empty `ext`.
@@ -6491,7 +6211,7 @@ export class Store {
     }
     // The size policy bounds client content, the merged ext included; the server's prev_log_id and
     // prev_room_id links are added after it, and a finished terminal's `output` is the server's too.
-    if (utf8Bytes(JSON.stringify(withoutOutputs(snapshot))) > this.config.maxSnapshotBytes) throw new StoreError("too_large", "message snapshot is too large");
+    must(this.content.snapshot(snapshot));
     const moved = current !== null && current.room_id !== roomId;
     if (current) snapshot.prev_log_id = idString(current.latest_log_id);
     // After a move the previous snapshot is in the source room's log (§4.3.1).
@@ -8259,38 +7979,12 @@ export class Store {
     });
   }
 
-  /**
-   * Normalize a reaction set (§4.7): strings, bounded, each emoji sequence
-   * fully qualified (qualifyEmoji), and duplicates collapsed, entries that
-   * differ only in U+FE0F included. Custom emoji keys (extension
-   * `ext:emoji`) are checked against the catalog by commitReactions.
-   */
-  private normalizedEmojis(value: unknown): string[] {
-    if (!Array.isArray(value)) throw new StoreError("invalid_params", "emojis must be an array");
-    const emojis: string[] = [];
-    const seen = new Set<string>();
-    for (const item of value) {
-      if (typeof item !== "string" || item.length === 0) throw new StoreError("invalid_params", "each emoji must be a non-empty string");
-      // eslint-disable-next-line no-control-regex
-      if (utf8Bytes(item) > MAX_EMOJI_BYTES) throw new StoreError("too_large", "emoji is too long");
-      if (/[\u0000-\u001f\u007f]/.test(item)) throw new StoreError("invalid_params", "emoji is not a single sequence");
-      const entry = isEmojiKey(item) ? item : qualifyEmoji(item);
-      const identity = emojiIdentity(entry);
-      if (seen.has(identity)) continue;
-      seen.add(identity);
-      emojis.push(entry);
-    }
-    // A count limit this server sets: denied (§1.1).
-    if (emojis.length > this.config.reactionEmojisPerUser) throw new StoreError("denied", `A reaction set holds at most ${this.config.reactionEmojisPerUser} emoji`);
-    return emojis;
-  }
-
   /** Replace the caller's reaction set on one message (§4.7). */
   private commitReactions(input: StoreMutationInput, context: CommitContext, floor: number): StoreMutationResult {
     const params = input.params;
     const messageIdParam = params.message_id;
     if (typeof messageIdParam !== "string" || messageIdParam.length === 0) throw new StoreError("invalid_params", "message_id must be a non-empty string");
-    const emojis = this.normalizedEmojis(params.emojis);
+    const emojis = must(this.content.emojis(params.emojis));
     const message = this.visibleMessage(ensureText(messageIdParam, "message_id", 256), input.userId, floor);
     if (!message) throw new StoreError("invalid_params", "unknown or expired message");
     const snapshot = parseJson<MessageSnapshot>(message.snapshot_json);
@@ -8546,10 +8240,9 @@ export class Store {
     return this.isMember(row.room_id, userId) ? row : null;
   }
 
-
   /** A room's client fields (`title`, `description`, `ext`) fit roomMetadataLimit serialized. */
   private checkRoomFields(fields: Record<string, unknown>): void {
-    if (utf8Bytes(JSON.stringify(fields)) > this.config.roomMetadataLimit) throw new StoreError("too_large", "room metadata is too large");
+    must(this.content.roomFields(fields));
   }
 
   /**

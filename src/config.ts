@@ -144,12 +144,10 @@ export const DEFAULT_PUSH_HOSTS: readonly string[] = [
 /**
  * Whether a host list (`PUSH_HOSTS`, `OG_MEDIA_HOSTS`) allows `host`
  * (lowercase, no trailing dot): an exact entry, or a `*.host` entry for its
- * subdomains only.
+ * subdomains only. Defined with the `og` rules that use it (content/embeds.ts).
  */
-export function hostListAllowed(hosts: readonly string[] | "*", host: string): boolean {
-	if (hosts === "*") return true;
-	return hosts.some((entry) => entry.startsWith("*.") ? host.endsWith(entry.slice(1)) : host === entry);
-}
+export { hostListAllowed } from "./content/embeds.ts";
+import { hostListAllowed } from "./content/embeds.ts";
 
 /** Whether `PUSH_HOSTS` allows an endpoint host (lowercase, no trailing dot). */
 export function pushHostAllowed(hosts: RuntimeConfig["pushHosts"], host: string): boolean {

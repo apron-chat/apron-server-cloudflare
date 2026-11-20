@@ -21,7 +21,7 @@
 import {
 	type ArchiveReader, type ChatRecord, type CollectedArchive, type ImportReport, type ImportState, type ImportTarget, type Provenance, archiveIdentity, collectArchive, parseImportState, planImport,
 } from "@apron/archive";
-import { withoutOutputRefs } from "../../output-ref";
+import { withoutOutputRefs } from "../../content/output-ref";
 import { USER_ID_RULES } from "../../user-ids";
 import type { HistoryChain } from "../chain";
 import type { ChainView } from "../link";
