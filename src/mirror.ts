@@ -179,9 +179,9 @@ export class RemoteRooms {
 
 	/**
 	 * Mirror: dials the invite's owner, signs in as its link for this
-	 * server, reads the room, and makes the mirror room: its title and
-	 * privacy, `ext.remote` the owner's room, with the admin in it. It starts
-	 * at the owner's head; older records are not copied.
+	 * server, reads the room, and makes the mirror room: its title,
+	 * description and privacy, `ext.remote` the owner's room, with the admin
+	 * in it. It starts at the owner's head; older records are not copied.
 	 */
 	private async connect(socket: unknown, client: MirrorClient, request: RequestFrame, link: string): Promise<void> {
 		const invite = parseInvite(link);
@@ -207,13 +207,14 @@ export class RemoteRooms {
 			connection?.close();
 		}
 		const title = typeof owned.title === "string" && owned.title.trim() ? owned.title : remoteAuthority(invite.server);
+		const description = typeof owned.description === "string" && owned.description ? owned.description : undefined;
 		const isPrivate = owned.private === true;
 		const start = Number(owned.latest_log_id) || 0;
 		let room: RoomRecord | undefined;
 		await this.host.runMutation(async () => {
 			const result = this.store.mutate({
 				userId: client.userId!, tier: "registered", ipKey: client.ipKey, method: "room_set", now: this.now(),
-				params: { title, ...(isPrivate ? { private: true } : {}) },
+				params: { title, ...(description !== undefined ? { description } : {}), ...(isPrivate ? { private: true } : {}) },
 				identity: { user_id: client.userId!, ...(client.name ? { name: client.name } : {}), tier: "registered" },
 				roomRemote: { server: invite.server, room_id: invite.room },
 			});
