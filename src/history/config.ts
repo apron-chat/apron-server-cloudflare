@@ -59,8 +59,6 @@ export const D1_TIER = "recent";
 export const BLOB_TIER = "cold";
 /** Where blob segments live in the store, before the server's name (`history/<server>/`). */
 export const SEGMENT_PREFIX = "history/";
-/** What the blob tier keeps of its segments in memory. */
-const SEGMENT_CACHE_BYTES = 8 * 1_048_576;
 
 /** Where blob stores come from: a registry and the name of the provider to use (default: the Worker's `r2`). */
 export interface BlobStoreChoice {
@@ -133,7 +131,6 @@ export function buildHistoryPipeline(options: BuildOptions): HistoryPipeline | u
 		const tier = new BlobHistoryTier({
 			name: BLOB_TIER, store: blobs, index: options.segmentIndex(BLOB_TIER), prefix: `${SEGMENT_PREFIX}${options.server ?? "server"}/`,
 			header: { ...(options.serverUrl ?? options.server ? { server: options.serverUrl ?? options.server } : {}) }, clock: options.clock,
-			cacheBytes: SEGMENT_CACHE_BYTES,
 		});
 		stages.push({
 			tier: instrument(tier, (method, call) => track("r2", method, call)),
@@ -141,9 +138,13 @@ export function buildHistoryPipeline(options: BuildOptions): HistoryPipeline | u
 			label: (options.blobProvider ?? BLOB_PROVIDER) === "r2" ? "R2" : options.blobProvider,
 		});
 	}
-	if (!stages.length) return undefined;
+	return stages.length ? headPipeline(options, stages) : undefined;
+}
+
+/** A pipeline of the Store's head and `stages`. */
+function headPipeline(options: Pick<BuildOptions, "store" | "limits" | "clock">, stages: PipelineStage[]): HistoryPipeline {
 	const head = new StoreHead(HEAD_TIER, options.store);
-	return new HistoryPipeline({ head, headRetention: headRetention(limits), stages, state: head.stateStore(), clock: options.clock, headLabel: "SQLite" });
+	return new HistoryPipeline({ head, headRetention: headRetention(options.limits), stages, state: head.stateStore(), clock: options.clock, headLabel: "SQLite" });
 }
 
 /**
@@ -152,7 +153,5 @@ export function buildHistoryPipeline(options: BuildOptions): HistoryPipeline | u
  * its SQLite only can still be backed up and restored).
  */
 export function archivePipeline(pipeline: HistoryPipeline | undefined, options: Pick<BuildOptions, "store" | "limits" | "clock">): HistoryPipeline {
-	if (pipeline) return pipeline;
-	const head = new StoreHead(HEAD_TIER, options.store);
-	return new HistoryPipeline({ head, headRetention: headRetention(options.limits), stages: [], state: head.stateStore(), clock: options.clock, headLabel: "SQLite" });
+	return pipeline ?? headPipeline(options, []);
 }

@@ -29,8 +29,6 @@ import { type Clock, toRange } from "../records";
 export type { ImportReport };
 
 export interface ImportOptions {
-	/** Rooms that exist here are skipped whole (decision 6); the only mode for now. */
-	existingRooms?: "skip";
 	/**
 	 * How the archive's user IDs map to accounts here (§10.4, @apron/archive PlanOptions.users):
 	 * "auto" (default), "match" (authenticated archives only) or "new". An ID
@@ -161,7 +159,7 @@ export async function importArchive(pipeline: HistoryPipeline, input: ArchiveRea
 	const saved = head.journal ? await head.journal() : undefined;
 	if (saved) {
 		const parsed = JSON.parse(saved) as ImportState;
-		const begun = parsed.targetRooms ?? parsed.rooms ?? [];
+		const begun = parsed.targetRooms;
 		if (parsed.archive === archiveIdentity(archive)) resume = parsed;
 		else if (options.restart) abandoned = begun;
 		else throw new Error(`another import is unfinished${begun.length ? ` (rooms ${begun.join(", ")})` : ""}: run it again to finish it, or import this one with restart to abandon it`);

@@ -4,11 +4,10 @@ import { type ArchiveCodec, type ArchivedUser, collectArchive, compareReplayed, 
 import { importArchive, place, restoreBatches } from "../../src/history/archive/import";
 import { MemoryBlobStore } from "./support/memory-blob-store";
 import { type BackupSettings, CODECS_METADATA, backupFamily, writeBackup } from "../../src/history/exports";
-import { MemorySegmentIndex } from "../../src/history/blob/segments";
+import { MemorySegmentIndex } from "./support/memory-segment-index";
 import { BlobHistoryTier } from "../../src/history/blob/tier";
-import { MemoryHead, MemoryHistoryTier } from "./support/memory-tiers";
+import { MemoryHead, MemoryHistoryTier, MemoryTierStateStore } from "./support/memory-tiers";
 import { HistoryPipeline, type PipelineStage } from "../../src/history/pipeline";
-import { MemoryTierStateStore } from "../../src/history/tier";
 import { sceneArchives } from "../../packages/archive/test/fixtures/scenes";
 
 class TestClock {

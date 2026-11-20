@@ -72,7 +72,7 @@ export interface ImportState {
 	/** The rooms it adds, by their IDs in the archive. */
 	rooms: string[];
 	/** The same rooms, by their IDs at the target. */
-	targetRooms?: string[];
+	targetRooms: string[];
 }
 
 export interface PlanOptions {

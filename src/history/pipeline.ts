@@ -6,7 +6,7 @@
  * Planning is pure (plan.ts); this file only executes.
  */
 
-import { type PipelineSnapshot, type ReadPart, type Step, type TierView, deepestReadable, mergePages, planRead, planStep, rewritableReach } from "./plan";
+import { type PipelineSnapshot, type ReadPart, type Step, type TierView, mergePages, planRead, planStep, rewritableReach } from "./plan";
 import { type ChatRecord, type Clock, type HistoryOp, type HistoryQuery, type QueuedOp, type Retention, type TierStats, applyOps, logIds, toRange } from "./records";
 import { type HistoryHead, type HistoryTier, type RewritableTier, type TierState, type TierStateStore, isRewritable } from "./tier";
 
@@ -95,11 +95,6 @@ export class HistoryPipeline {
 		this.recentOpsMs = options.recentOpsMs ?? DEFAULT_RECENT_OPS_MS;
 	}
 
-	/** Whether any tier is below the head. */
-	get tiered(): boolean {
-		return this.tiers.length > 1;
-	}
-
 	/** The tiers as the planner sees them, with their saved state. */
 	async views(): Promise<TierView[]> {
 		const states = await this.state.load(this.tiers.map((tier) => tier.name));
@@ -137,12 +132,8 @@ export class HistoryPipeline {
 			if (step.kind === "idle") {
 				// The round is done: the next one finds every target afresh, at
 				// once if this one moved anything (a tier's target may have moved with it).
-				const worked = progress.worked;
 				this.round = HistoryPipeline.newRound();
-				if (worked) {
-					return { more: true, report };
-				}
-				return { more: false, report };
+				return { more: progress.worked, report };
 			}
 			report.steps.push(step);
 			// The hop a step depends on: a copy's, or the one into the tier the step works on.
@@ -161,9 +152,9 @@ export class HistoryPipeline {
 				await this.state.save(this.tiers[hop].name, { stalledSince: undefined, alertedAt: undefined });
 			}
 		}
-		const more = planStep(await this.snapshot(progress)).kind !== "idle" || progress.worked;
-		if (planStep(await this.snapshot(progress)).kind === "idle") this.round = HistoryPipeline.newRound();
-		return { more, report };
+		const idle = planStep(await this.snapshot(progress)).kind === "idle";
+		if (idle) this.round = HistoryPipeline.newRound();
+		return { more: !idle || progress.worked, report };
 	}
 
 	private async execute(step: Step, snapshot: PipelineSnapshot, progress: { targeted: Set<number>; advanced: Map<number, number>; worked: boolean }, report: CycleReport): Promise<void> {
@@ -384,11 +375,6 @@ export class HistoryPipeline {
 			await this.state.save(views[index].name, { alertedAt: now });
 		}
 		return due;
-	}
-
-	/** The index of the deepest readable tier. */
-	async deepest(): Promise<number> {
-		return deepestReadable(await this.views());
 	}
 }
 

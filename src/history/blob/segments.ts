@@ -6,11 +6,11 @@
  *
  * Keys are `${prefix}${encodeURIComponent(room)}/${pad16(first)}-${pad16(last)}.jsonl`:
  * a room's segments list in log order, and the key alone says what a segment
- * covers, so a lost index is rebuilt from a listing (`rebuild`).
+ * covers, so a lost index is rebuilt from a listing (rebuildSegmentIndex).
  *
- * The index has two implementations: MemorySegmentIndex for tests and Node
- * scripts, and SqlSegmentIndex over the Durable Object's SQLite through a
- * minimal SQL port. One index serves one tier: `rebuild` clears it first.
+ * The index is SqlSegmentIndex, over the Durable Object's SQLite through a
+ * minimal SQL port (the tests have one in memory too). One index serves one
+ * tier: a rebuild clears it first.
  */
 
 import { collectArchive, jsonlReader, linesOf } from "@apron/archive";
@@ -44,14 +44,14 @@ export interface SegmentCursor {
 export const SEGMENT_QUERY_ROWS = 1_000;
 
 /** Segments a room's query looks at below its range for one that reaches into it (find): segments of a room seldom overlap. */
-const STRADDLE_ROWS = 8;
+export const STRADDLE_ROWS = 8;
 
 /** Where a segment sits in a newest-first walk (`newest`), to continue after it. */
 export type SegmentPosition = Pick<SegmentRef, "last" | "first" | "roomId">;
 
 /**
- * Where segments are. The names are deterministic, so `rebuild` restores a
- * lost index from a listing. Queries are bounded (SEGMENT_QUERY_ROWS): each
+ * Where segments are. The names are deterministic, so rebuildSegmentIndex
+ * restores a lost index from a listing. Queries are bounded (SEGMENT_QUERY_ROWS): each
  * reads and returns at most that many segments, a room's at most that many
  * per room.
  */
@@ -92,8 +92,6 @@ export interface SegmentIndex {
 	remove(refs: readonly SegmentRef[]): Promise<void>;
 	/** Forgets every segment. */
 	clear(): Promise<void>;
-	/** Clears the index and adds every segment under `prefix` in `store`; returns how many. See rebuildSegmentIndex. */
-	rebuild(store: BlobStore, prefix: string, options?: RebuildOptions): Promise<number>;
 }
 
 export interface RebuildOptions {
@@ -178,91 +176,6 @@ export async function rebuildSegmentIndex(index: SegmentIndex, store: BlobStore,
 }
 
 const byFirst = (a: SegmentRef, b: SegmentRef) => a.first - b.first || (a.roomId < b.roomId ? -1 : a.roomId > b.roomId ? 1 : 0);
-const byRoom = (a: SegmentRef, b: SegmentRef) => (a.roomId < b.roomId ? -1 : a.roomId > b.roomId ? 1 : 0) || a.first - b.first;
-const byLast = (a: SegmentRef, b: SegmentRef) => a.last - b.last || byFirst(a, b);
-
-/** A SegmentIndex in memory. */
-export class MemorySegmentIndex implements SegmentIndex {
-	private readonly refs = new Map<string, SegmentRef>();
-
-	private static id(ref: Pick<SegmentRef, "roomId" | "first">): string {
-		return `${ref.roomId}\u0000${ref.first}`;
-	}
-
-	/** Every segment, by first. */
-	all(): SegmentRef[] {
-		return [...this.refs.values()].map((ref) => ({ ...ref })).sort(byFirst);
-	}
-
-	async find(roomIds: readonly string[], lower: number, upper: number, options: { forward?: boolean; limit?: number } = {}): Promise<SegmentRef[]> {
-		const limit = options.limit ?? SEGMENT_QUERY_ROWS;
-		return [...new Set(roomIds)].flatMap((roomId) => {
-			const own = this.all().filter((ref) => ref.roomId === roomId && ref.first <= upper && ref.last >= lower);
-			const straddling = own.filter((ref) => ref.first < lower).slice(-STRADDLE_ROWS);
-			const inside = own.filter((ref) => ref.first >= lower);
-			return [...straddling, ...(options.forward === false ? inside.slice(-limit) : inside.slice(0, limit))];
-		}).sort(byRoom);
-	}
-
-	async overlapping(lower: number, upper: number): Promise<SegmentRef[]> {
-		return this.all().filter((ref) => ref.last >= lower).sort(byLast).slice(0, SEGMENT_QUERY_ROWS).filter((ref) => ref.first <= upper).sort(byFirst);
-	}
-
-	async newest(below: number, limit: number, after?: SegmentPosition): Promise<SegmentRef[]> {
-		return this.all().filter((ref) => ref.last < below && (!after || byLast(ref, { ...after, key: "", records: 0, bytes: 0 }) < 0)).sort((a, b) => byLast(b, a)).slice(0, limit);
-	}
-
-	async startingBelow(floor: number, limit: number): Promise<SegmentRef[]> {
-		return this.all().filter((ref) => ref.first < floor).slice(0, limit);
-	}
-
-	async lowestBelow(below: number): Promise<number | undefined> {
-		return this.all().slice(0, SEGMENT_QUERY_ROWS).find((ref) => ref.last < below)?.first;
-	}
-
-	async straddling(floor: number): Promise<number | undefined> {
-		const nearest = this.all().filter((ref) => ref.first < floor).slice(-SEGMENT_QUERY_ROWS);
-		const found = nearest.filter((ref) => ref.last >= floor);
-		return found.length ? Math.min(...found.map((ref) => ref.first)) : undefined;
-	}
-
-	async after(from: number, limit: number, cursor?: SegmentCursor): Promise<SegmentRef[]> {
-		return this.all()
-			.filter((ref) => ref.last >= from && (!cursor || ref.first > cursor.first || (ref.first === cursor.first && ref.roomId > cursor.roomId)))
-			.slice(0, limit);
-	}
-
-	async oldest(limit: number): Promise<SegmentRef[]> {
-		return this.all().sort(byLast).slice(0, limit);
-	}
-
-	async forRoom(roomId: string): Promise<SegmentRef[]> {
-		return this.all().filter((ref) => ref.roomId === roomId).slice(0, SEGMENT_QUERY_ROWS);
-	}
-
-	async rooms(): Promise<string[]> {
-		return [...new Set(this.all().sort(byRoom).slice(0, SEGMENT_QUERY_ROWS).map((ref) => ref.roomId))].sort();
-	}
-
-	async add(refs: readonly SegmentRef[]): Promise<void> {
-		for (const ref of refs) this.refs.set(MemorySegmentIndex.id(ref), { ...ref });
-	}
-
-	async remove(refs: readonly SegmentRef[]): Promise<void> {
-		for (const ref of refs) {
-			const id = MemorySegmentIndex.id(ref);
-			if (this.refs.get(id)?.key === ref.key) this.refs.delete(id);
-		}
-	}
-
-	async clear(): Promise<void> {
-		this.refs.clear();
-	}
-
-	rebuild(store: BlobStore, prefix: string, options?: RebuildOptions): Promise<number> {
-		return rebuildSegmentIndex(this, store, prefix, options);
-	}
-}
 
 /**
  * The SQL the index needs, synchronous as the Durable Object's SQLite is
@@ -285,12 +198,8 @@ export function segmentSchema(table = SEGMENT_TABLE): string[] {
 		// In the orders queries walk (by last, by first), so a bounded query reads only what it returns.
 		`CREATE INDEX IF NOT EXISTS ${table}_by_last ON ${table} ("last", "first", room_id)`,
 		`CREATE INDEX IF NOT EXISTS ${table}_by_first ON ${table} ("first", room_id)`,
-		`DROP INDEX IF EXISTS ${table}_last`,
 	];
 }
-
-/** The statements for the default table. */
-export const SEGMENT_SCHEMA: readonly string[] = segmentSchema();
 
 function checkTable(table: string): void {
 	if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(table)) throw new Error(`invalid segment table name ${JSON.stringify(table)}`);
@@ -431,7 +340,4 @@ export class SqlSegmentIndex implements SegmentIndex {
 		}
 	}
 
-	rebuild(store: BlobStore, prefix: string, options?: RebuildOptions): Promise<number> {
-		return rebuildSegmentIndex(this, store, prefix, options);
-	}
 }

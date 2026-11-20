@@ -2,13 +2,13 @@ import { env } from "cloudflare:test";
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import { MemoryBlobStore } from "./support/memory-blob-store";
-import { MemorySegmentIndex } from "../../src/history/blob/segments";
+import { MemorySegmentIndex } from "./support/memory-segment-index";
 import { BlobHistoryTier } from "../../src/history/blob/tier";
-import { MemoryHead, MemoryHistoryTier } from "./support/memory-tiers";
+import { MemoryHead, MemoryHistoryTier, MemoryTierStateStore } from "./support/memory-tiers";
 import { type TierView, checkInvariants, mergePages, planRead, planStep, retentionFloor } from "../../src/history/plan";
 import { HistoryPipeline, type PipelineStage, instrument } from "../../src/history/pipeline";
 import type { ChatRecord, Retention } from "../../src/history/records";
-import { type HistoryTier, MemoryTierStateStore, type TierState } from "../../src/history/tier";
+import type { HistoryTier, TierState } from "../../src/history/tier";
 import { Model, show } from "./model";
 
 const state = (floor: number, target = floor, through = floor - 1, ops = 0): TierState => ({ floor, target, through, ops });

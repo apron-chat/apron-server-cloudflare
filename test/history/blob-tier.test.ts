@@ -12,10 +12,11 @@ import { describe, expect, it } from "vitest";
 import { collectArchive, compareReplayed, jsonlReader, linesOf, replayRecords } from "@apron/archive";
 import { MemoryBlobStore } from "./support/memory-blob-store";
 import { R2BlobStore } from "../../src/history/blob/r2";
-import { MemorySegmentIndex, SEGMENT_SCHEMA, type SegmentIndex, type SegmentRef, type SqlPort, SqlSegmentIndex, parseSegmentKey, segmentKey } from "../../src/history/blob/segments";
+import { type SegmentIndex, type SegmentRef, type SqlPort, SqlSegmentIndex, parseSegmentKey, rebuildSegmentIndex, segmentKey } from "../../src/history/blob/segments";
 import type { BlobStore } from "../../src/history/blob/store";
 import { BlobHistoryTier } from "../../src/history/blob/tier";
 import { MemoryHistoryTier } from "./support/memory-tiers";
+import { MemorySegmentIndex } from "./support/memory-segment-index";
 import { type ChatRecord, byLog, toRange } from "../../src/history/records";
 import { describeHistoryTier, sampleLog, wireRecord } from "./conformance/history-tier";
 
@@ -233,7 +234,6 @@ describe("SqlSegmentIndex", () => {
 				rows: <T>(sql: string, ...binds: unknown[]) => state.storage.sql.exec(sql, ...binds).toArray() as T[],
 				run: (sql: string, ...binds: unknown[]) => void state.storage.sql.exec(sql, ...binds),
 			};
-			expect(SEGMENT_SCHEMA.length).toBe(4);
 			const index = new SqlSegmentIndex(port);
 			index.ensureSchema();
 			index.ensureSchema();
@@ -263,7 +263,7 @@ describe("SqlSegmentIndex", () => {
 			expect(await roomRecords(tier, "a")).toEqual(log);
 			const other = new SqlSegmentIndex(port, { table: "history_segments_backup" });
 			other.ensureSchema();
-			expect(await other.rebuild(store, "history/test/")).toBe((await index.forRoom("a")).length);
+			expect(await rebuildSegmentIndex(other, store, "history/test/")).toBe((await index.forRoom("a")).length);
 			expect(await other.forRoom("a")).toEqual(await index.forRoom("a"));
 			expect(() => new SqlSegmentIndex(port, { table: "bad name" })).toThrow(/invalid segment table/);
 		});

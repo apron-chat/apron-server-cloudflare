@@ -8,7 +8,7 @@
 import type { ArchivedRoom, ArchivedUser } from "@apron/archive";
 import { retentionFloor } from "../../../src/history/plan";
 import { type ChatRecord, type Clock, type HistoryOp, type HistoryQuery, type QueuedOp, type RecordRange, type Retention, type TierStats, authoredMessages, byLog, limitByLogId, logIds, purgedRecord, renamedRecord, toRange } from "../../../src/history/records";
-import type { FloorContext, HistoryHead, PurgeResult, RewritableTier } from "../../../src/history/tier";
+import type { FloorContext, HistoryHead, PurgeResult, RewritableTier, TierState, TierStateStore } from "../../../src/history/tier";
 
 const key = (record: Pick<ChatRecord, "room_id" | "log_id">) => `${record.log_id}\u0000${record.room_id}`;
 
@@ -221,5 +221,19 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead {
 
 	async restoreUsers(users: readonly ArchivedUser[]): Promise<void> {
 		for (const user of users) if (!this.people.has(user.user_id)) this.people.set(user.user_id, { ...user, roles: ["unclaimed"] });
+	}
+}
+
+/** A TierStateStore in memory. */
+export class MemoryTierStateStore implements TierStateStore {
+	readonly states = new Map<string, TierState>();
+	constructor(private readonly initial: () => TierState = () => ({ floor: 1, target: 1, through: 0, ops: 0 })) {}
+	async load(names: readonly string[]): Promise<Record<string, TierState>> {
+		return Object.fromEntries(names.map((name) => [name, { ...(this.states.get(name) ?? this.initial()) }]));
+	}
+	async save(name: string, state: Partial<TierState>): Promise<void> {
+		const merged: TierState = { ...(this.states.get(name) ?? this.initial()), ...state };
+		for (const key of Object.keys(state) as Array<keyof TierState>) if (state[key] === undefined) delete merged[key];
+		this.states.set(name, merged);
 	}
 }

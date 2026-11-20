@@ -46,10 +46,11 @@
 import { type ArchiveHeader, type ArchivedUser, jsonlWriter, type RoomListing, utf8Length } from "@apron/archive";
 import { type ChatRecord, type Clock, type HistoryQuery, type RecordRange, type Retention, type TierStats, byLog, limitByLogId, thresholdCount, toRange } from "../records";
 import type { FloorContext, HistoryTier } from "../tier";
-import { type SegmentCursor, type SegmentIndex, type SegmentPosition, type SegmentRef, decodeSegment, segmentKey } from "./segments";
+import { type RebuildOptions, type SegmentCursor, type SegmentIndex, type SegmentPosition, type SegmentRef, decodeSegment, rebuildSegmentIndex, segmentKey } from "./segments";
 import type { BlobStore } from "./store";
 
-export const DEFAULT_CACHE_BYTES = 8 * 1024 * 1024;
+/** The decoded-segment cache's default cap. */
+const DEFAULT_CACHE_BYTES = 8 * 1024 * 1024;
 /** Segments fetched at once by a read. */
 const READ_PARALLEL = 4;
 /** Segments a scan asks the index for at a time. */
@@ -442,7 +443,7 @@ export class BlobHistoryTier implements HistoryTier {
 	}
 
 	/** Restores a lost index from the store (segments.ts, rebuildSegmentIndex). */
-	rebuildIndex(options?: { floor?: number; count?: boolean; keep?: boolean }): Promise<number> {
-		return this.index.rebuild(this.store, this.prefix, options);
+	rebuildIndex(options?: RebuildOptions): Promise<number> {
+		return rebuildSegmentIndex(this.index, this.store, this.prefix, options);
 	}
 }

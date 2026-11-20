@@ -14,7 +14,7 @@
 
 import { type ChatRecord, authoredMessages, byLog, purgedRecord, renamedRecord } from "@apron/archive";
 
-export { type ChatRecord, type RecordKind, authoredMessages, byLog, canonicalJson, logIds, namedUsers, purgedRecord, purgedValue, renamedRecord, renamedValue } from "@apron/archive";
+export { type ChatRecord, type RecordKind, authoredMessages, byLog, logIds, purgedRecord, renamedRecord } from "@apron/archive";
 
 /** A contiguous range of the log: the unit tiers hand on. Records sorted by (log_id, room_id). */
 export interface RecordRange {

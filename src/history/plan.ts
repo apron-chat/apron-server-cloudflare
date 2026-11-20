@@ -4,7 +4,7 @@
  * Synchronous, no I/O; HistoryPipeline (pipeline.ts) executes the plans.
  */
 
-import { type ChatRecord, type HistoryQuery, type Retention, byLog, limitByLogId, thresholdCount } from "./records";
+import { type ChatRecord, type HistoryQuery, type Retention, limitByLogId, thresholdCount } from "./records";
 import type { TierState } from "./tier";
 
 /** One tier as the planner sees it. Index 0 is the head. */
@@ -206,9 +206,4 @@ export function retentionFloor(entries: ReadonlyArray<{ log_id: number; commit_m
 	}
 	if (floor === undefined || !own.length || floor <= own[0].log_id) return undefined;
 	return floor;
-}
-
-/** Records sorted in log order, for tiers that keep them in memory. */
-export function sortedRecords(records: Iterable<ChatRecord>): ChatRecord[] {
-	return [...records].sort(byLog);
 }

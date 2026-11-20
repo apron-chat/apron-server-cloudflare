@@ -9,7 +9,7 @@ import { BlobHistoryTier } from "../../src/history/blob/tier";
 import { archivePipeline } from "../../src/history/config";
 import { HistoryPipeline } from "../../src/history/pipeline";
 import { MemoryHead } from "./support/memory-tiers";
-import { MemoryTierStateStore } from "../../src/history/tier";
+import { MemoryTierStateStore } from "./support/memory-tiers";
 import { errorCode, withStore, type TestClock } from "../helpers/store";
 
 const DAY_MS = 86_400_000;

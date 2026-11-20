@@ -12,16 +12,16 @@
  */
 
 import type { ArchivedRoom, ArchivedUser } from "@apron/archive";
-import { type ChatRecord, type HistoryOp, type HistoryQuery, type QueuedOp, type RecordRange, type TierStats, toRange } from "./records";
+import { type ChatRecord, type HistoryQuery, type QueuedOp, type RecordRange, type TierStats, toRange } from "./records";
 import type { HistoryHead, PurgeResult, RestoreContext, RestoreResult, TierState, TierStateStore } from "./tier";
 
 /** What the adapter needs of the Store (src/store.ts), so this module does not load it. */
 export interface StorePort {
 	historyFloors(): { hot: number; published: number; latest: number };
 	listRooms(now?: number, options?: { maintenance?: boolean; withPrivate?: boolean }): Array<{ room_id: string }>;
-	historyImportJournal?(): string | undefined;
-	setHistoryImportJournal?(value: string | null): void;
-	roomIsEmpty?(roomId: string): boolean;
+	historyImportJournal(): string | undefined;
+	setHistoryImportJournal(value: string | null): void;
+	roomIsEmpty(roomId: string): boolean;
 	getIdentity(userId: string): { userId: string; name: string; avatar?: string; roles: string[]; ext?: Record<string, unknown> } | null;
 	historyTarget(): number | undefined;
 	historyScan(from: number, limit?: number): ChatRecord[];
@@ -39,11 +39,10 @@ export interface StorePort {
 	renameIdentity(input: { from: string; to: string }): unknown;
 	getRoom(roomId: string): unknown;
 	identityExists(userId: string): boolean;
-	restoreRoom?(room: ArchivedRoom, records: readonly ChatRecord[], now?: number, options?: { rooms?: readonly string[] }): RestoreResult;
-	restorableRecord?(record: ChatRecord): ChatRecord | null;
-	restoreUsers?(users: readonly ArchivedUser[]): void;
-	isRetiredUserId?(userId: string): boolean;
-	importRecords?(records: readonly ChatRecord[]): void;
+	restoreRoom(room: ArchivedRoom, records: readonly ChatRecord[], now?: number, options?: { rooms?: readonly string[] }): RestoreResult;
+	restorableRecord(record: ChatRecord): ChatRecord | null;
+	restoreUsers(users: readonly ArchivedUser[]): void;
+	isRetiredUserId(userId: string): boolean;
 }
 
 export class StoreHead implements HistoryHead {
@@ -51,10 +50,9 @@ export class StoreHead implements HistoryHead {
 
 	constructor(readonly name: string, private readonly store: StorePort) {}
 
+	/** The Store makes its records by commit: nothing is copied into it. */
 	async append(range: RecordRange): Promise<void> {
-		if (!range.records.length) return;
-		if (!this.store.importRecords) throw new Error("this head takes records only by commit");
-		this.store.importRecords(range.records);
+		if (range.records.length) throw new Error("this head takes records only by commit");
 	}
 
 	async scan(from: number, limit: number): Promise<RecordRange> {
@@ -111,11 +109,6 @@ export class StoreHead implements HistoryHead {
 		this.store.amendHistoryPurge(seq, messageIds);
 	}
 
-	/** The Store queues its own ops, in /purge's and /rename's transactions. */
-	async queueOp(_op: HistoryOp): Promise<void> {
-		throw new Error("the Store queues its own history ops");
-	}
-
 	async dropReactionsOn(messageIds: readonly string[]): Promise<void> {
 		this.store.dropReactionsOn(messageIds);
 	}
@@ -129,7 +122,7 @@ export class StoreHead implements HistoryHead {
 	}
 
 	async isRetired(userId: string): Promise<boolean> {
-		return this.store.isRetiredUserId?.(userId) ?? false;
+		return this.store.isRetiredUserId(userId);
 	}
 
 	/** Every room, as `room_list` lists it, private ones included (an export is the server's, not a member's view). */
@@ -154,29 +147,26 @@ export class StoreHead implements HistoryHead {
 	}
 
 	async roomIsEmpty(roomId: string): Promise<boolean> {
-		return this.store.roomIsEmpty?.(roomId) ?? false;
+		return this.store.roomIsEmpty(roomId);
 	}
 
 	async journal(): Promise<string | undefined> {
-		return this.store.historyImportJournal?.();
+		return this.store.historyImportJournal();
 	}
 
 	async setJournal(value: string | null): Promise<void> {
-		this.store.setHistoryImportJournal?.(value);
+		this.store.setHistoryImportJournal(value);
 	}
 
 	async restoreRoom(room: ArchivedRoom, records: readonly ChatRecord[], context?: RestoreContext): Promise<RestoreResult> {
-		if (!this.store.restoreRoom) throw new Error("this head cannot restore rooms");
 		return this.store.restoreRoom(room, records, undefined, context ? { rooms: context.rooms } : {});
 	}
 
 	normalizeRecord(record: ChatRecord): ChatRecord | null {
-		if (!this.store.restorableRecord) return record;
 		return this.store.restorableRecord(record);
 	}
 
 	async restoreUsers(users: readonly ArchivedUser[]): Promise<void> {
-		if (!this.store.restoreUsers) throw new Error("this head cannot restore users");
 		this.store.restoreUsers(users);
 	}
 

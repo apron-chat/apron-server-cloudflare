@@ -7,7 +7,7 @@
  */
 
 import type { ArchivedRoom, ArchivedUser } from "@apron/archive";
-import type { ChatRecord, HistoryOp, HistoryQuery, QueuedOp, RecordRange, Retention, TierStats } from "./records";
+import type { ChatRecord, HistoryQuery, QueuedOp, RecordRange, Retention, TierStats } from "./records";
 
 /** What floorFor may count against: the floor of the tier above (records at or past it are only copies) and the time. */
 export interface FloorContext {
@@ -76,8 +76,6 @@ export interface HistoryHead extends RewritableTier {
 	 * and pages read from them meanwhile, drop those messages' records too.
 	 */
 	amendPurge(seq: number, messageIds: readonly string[]): Promise<void>;
-	/** Queues an op for the tiers below, as the head's own purge and rename do. */
-	queueOp?(op: HistoryOp): Promise<void>;
 	/** Drops the head's reaction records on messages only a lower tier held (PurgeResult.messageIds). */
 	dropReactionsOn(messageIds: readonly string[]): Promise<void>;
 	hasRoom(roomId: string): Promise<boolean>;
@@ -146,18 +144,4 @@ export interface TierState {
 export interface TierStateStore {
 	load(names: readonly string[]): Promise<Record<string, TierState>>;
 	save(name: string, state: Partial<TierState>): Promise<void>;
-}
-
-/** A TierStateStore in memory, for tests and Node scripts. */
-export class MemoryTierStateStore implements TierStateStore {
-	readonly states = new Map<string, TierState>();
-	constructor(private readonly initial: () => TierState = () => ({ floor: 1, target: 1, through: 0, ops: 0 })) {}
-	async load(names: readonly string[]): Promise<Record<string, TierState>> {
-		return Object.fromEntries(names.map((name) => [name, { ...(this.states.get(name) ?? this.initial()) }]));
-	}
-	async save(name: string, state: Partial<TierState>): Promise<void> {
-		const merged: TierState = { ...(this.states.get(name) ?? this.initial()), ...state };
-		for (const key of Object.keys(state) as Array<keyof TierState>) if (state[key] === undefined) delete merged[key];
-		this.states.set(name, merged);
-	}
 }
