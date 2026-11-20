@@ -5,7 +5,7 @@
  * has always answered with (or, for a count past its limit, `denied`).
  */
 import type { ProtocolError } from "../protocol";
-import { ADMIN_USER_ID } from "../store";
+import { ADMIN_USER_ID, issuableShape } from "../user-ids";
 
 declare const brand: unique symbol;
 /** A `T` that went through the parser named `B`. */
@@ -58,22 +58,12 @@ export function requiredUserId(word: string | undefined, usage: string): UserIdA
 	return requiredArg(word, usage) as UserIdArg;
 }
 
-/**
- * Throws unless `userId` may be issued by an admin (`/rename`, `/invite-token`):
- * 1 to 64 letters, digits, `_` or `-`, starting with a letter or digit and
- * ending with a letter, digit or `_`, so that `@` and the whole ID make a
- * mention in text (Appendix A.3), and not a guest's or bot's.
- */
-export function assertIssuableUserId(userId: string): void {
-	if (!/^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9_])?$/.test(userId) || /^(guest|bot)(_|$)/i.test(userId)) {
-		throw { name: "invalid_params", message: "A user_id is 1 to 64 letters, digits, _ or -, starting with a letter or digit, ending with a letter, digit or _, and not guest_ or bot_" } satisfies ProtocolError;
-	}
-}
-
-/** A `user_id` an admin may issue: `admin` is taken (it is no passkey user's to take), and the rest must pass assertIssuableUserId. */
+/** A `user_id` an admin may issue: `admin` is taken (it is no passkey user's to take), and the rest must be of issuableShape. */
 export function issuableUserId(userId: string): IssuableUserId {
 	if (userId === ADMIN_USER_ID) throw usageError(`The user_id ${userId} is taken`);
-	assertIssuableUserId(userId);
+	if (!issuableShape(userId)) {
+		throw usageError("A user_id is 1 to 64 letters, digits, _ or -, starting with a letter or digit, ending with a letter, digit or _, and not guest_ or bot_");
+	}
 	return userId as IssuableUserId;
 }
 

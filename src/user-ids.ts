@@ -5,7 +5,7 @@
  * UserIdRules; Store.restoreUsers checks placeholders with them again.
  */
 
-import type { UserIdRules } from "@apron/archive";
+import { type UserIdRules, defaultUserIdRules } from "@apron/archive";
 
 /**
  * The registered user `APRON_ADMIN_TOKEN` signs in as, always an admin. It
@@ -14,28 +14,31 @@ import type { UserIdRules } from "@apron/archive";
 export const ADMIN_USER_ID = "admin";
 
 /**
- * Whether an archive's `user_id` may stand here as itself, matched or as a
- * placeholder account: the shape an admin may issue (`/invite-token`,
- * `/rename`), and not a guest's, an owner's bot's, a server notice's (`~…`)
- * or the admin's.
+ * The shape of a `user_id` an admin may issue (`/invite-token`, `/rename`):
+ * 1 to 64 letters, digits, `_` or `-`, starting with a letter or digit and
+ * ending with a letter, digit or `_`, so that `@` and the whole ID make a
+ * mention in text (Appendix A.3), and not a guest's or bot's.
  */
-export function restorableUserId(userId: unknown): userId is string {
-	return typeof userId === "string" && /^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9_])?$/.test(userId) && !/^(guest|bot)(_|$)/i.test(userId) && userId.toLowerCase() !== ADMIN_USER_ID;
+export function issuableShape(userId: string): boolean {
+	return /^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9_])?$/.test(userId) && !/^(guest|bot)(_|$)/i.test(userId);
 }
 
 /**
- * The placeholder ID an archive user whose ID cannot stand here starts from
- * (restorableUserId): `imported-` and the ID's letters, digits, `_` and
- * `-`, short enough that a `-<n>` suffix still fits.
+ * Whether an archive's `user_id` may stand here as itself, matched or as a
+ * placeholder account: the shape an admin may issue (issuableShape), and
+ * not a server notice's (`~…`) or the admin's.
  */
-export function placeholderBase(userId: string): string {
-	const cleaned = userId.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^[-_]+/, "").slice(0, 40).replace(/[-_]+$/, "");
-	return `imported-${cleaned || "user"}`;
+export function restorableUserId(userId: unknown): userId is string {
+	return typeof userId === "string" && issuableShape(userId) && userId.toLowerCase() !== ADMIN_USER_ID;
 }
 
-/** The rules as planImport takes them: the admin may be matched (its account exists), never made. */
+/**
+ * The rules as planImport takes them: the admin may be matched (its account
+ * exists), never made. An ID that cannot stand here starts from
+ * `imported-` and its letters, digits, `_` and `-` (the library's default).
+ */
 export const USER_ID_RULES: UserIdRules = {
 	restorable: restorableUserId,
 	matchable: (userId) => restorableUserId(userId) || userId === ADMIN_USER_ID,
-	placeholderBase,
+	placeholderBase: defaultUserIdRules.placeholderBase,
 };
