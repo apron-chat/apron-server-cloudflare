@@ -4,7 +4,7 @@
  * Synchronous, no I/O; HistoryPipeline (pipeline.ts) executes the plans.
  */
 
-import { type ChatRecord, type HistoryQuery, type Retention, limitByLogId, thresholdCount } from "./records";
+import { type ChatRecord, type HistoryQuery, limitByLogId } from "./records";
 import type { TierState } from "./tier";
 
 /** One tier as the planner sees it. Index 0 is the head. */
@@ -169,30 +169,4 @@ export function mergePages(pages: ReadonlyArray<{ tier: number; records: readonl
 		}
 	}
 	return limitByLogId([...chosen.values()].map((entry) => entry.record), query.limit, query.forward);
-}
-
-/**
- * The floor a retention allows over a tier's log entries, oldest first
- * (one per log ID), counting only those below `below` (records past it are
- * copies held above). The count keeps its threshold's share newest first;
- * the age drops what is older than `ageMs`; `minAgeMs` holds back whatever
- * is younger. Undefined while nothing need leave.
- */
-export function retentionFloor(entries: ReadonlyArray<{ log_id: number; commit_ms: number }>, retention: Retention, context: { now: number; below: number }): number | undefined {
-	const own = entries.filter((entry) => entry.log_id < context.below);
-	let floor: number | undefined;
-	const keep = thresholdCount(retention.records, retention.thresholdPercent);
-	if (keep > 0 && own.length > keep) floor = own[own.length - keep].log_id;
-	if (retention.ageMs && retention.ageMs > 0) {
-		const cutoff = context.now - retention.ageMs;
-		const fresh = own.find((entry) => entry.commit_ms >= cutoff);
-		const ageFloor = fresh ? fresh.log_id : own.length ? own[own.length - 1].log_id + 1 : undefined;
-		if (ageFloor !== undefined && (floor === undefined || ageFloor > floor)) floor = ageFloor;
-	}
-	if (floor !== undefined && retention.minAgeMs && retention.minAgeMs > 0) {
-		const young = own.find((entry) => entry.commit_ms >= context.now - retention.minAgeMs!);
-		if (young && young.log_id < floor) floor = young.log_id;
-	}
-	if (floor === undefined || !own.length || floor <= own[0].log_id) return undefined;
-	return floor;
 }

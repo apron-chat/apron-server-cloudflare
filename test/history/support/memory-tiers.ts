@@ -6,10 +6,36 @@
  */
 
 import type { ArchivedRoom, ArchivedUser } from "@apron/archive";
-import { retentionFloor } from "../../../src/history/plan";
-import { type ChatRecord, type Clock, type HistoryOp, type HistoryQuery, type QueuedOp, type RecordRange, type Retention, type TierStats, authoredMessages, byLog, limitByLogId, logIds, purgedRecord, renamedRecord, toRange } from "../../../src/history/records";
+import { type ChatRecord, type Clock, type HistoryOp, type HistoryQuery, type QueuedOp, type RecordRange, type Retention, type TierStats, authoredMessages, thresholdCount, byLog, limitByLogId, logIds, purgedRecord, renamedRecord, toRange } from "../../../src/history/records";
 import { NOT_STALLED } from "../../../src/history/stall";
 import type { Cell, ExportPort, FloorContext, HeadStateUpdate, HistoryHead, LowerStateUpdate, LowerTier, OpLog, OpStep, RestorePort, RestoreResult, TierState, TierStateStore } from "../../../src/history/tier";
+
+/**
+ * The floor a retention allows over a tier's log entries, oldest first
+ * (one per log ID), counting only those below `below` (records past it are
+ * copies held above). The count keeps its threshold's share newest first;
+ * the age drops what is older than `ageMs`; `minAgeMs` holds back whatever
+ * is younger. Undefined while nothing need leave. The tiers the Worker
+ * runs find theirs in their own storage (SQL, the chunk index).
+ */
+function retentionFloor(entries: ReadonlyArray<{ log_id: number; commit_ms: number }>, retention: Retention, context: { now: number; below: number }): number | undefined {
+	const own = entries.filter((entry) => entry.log_id < context.below);
+	let floor: number | undefined;
+	const keep = thresholdCount(retention.records, retention.thresholdPercent);
+	if (keep > 0 && own.length > keep) floor = own[own.length - keep].log_id;
+	if (retention.ageMs && retention.ageMs > 0) {
+		const cutoff = context.now - retention.ageMs;
+		const fresh = own.find((entry) => entry.commit_ms >= cutoff);
+		const ageFloor = fresh ? fresh.log_id : own.length ? own[own.length - 1].log_id + 1 : undefined;
+		if (ageFloor !== undefined && (floor === undefined || ageFloor > floor)) floor = ageFloor;
+	}
+	if (floor !== undefined && retention.minAgeMs && retention.minAgeMs > 0) {
+		const young = own.find((entry) => entry.commit_ms >= context.now - retention.minAgeMs!);
+		if (young && young.log_id < floor) floor = young.log_id;
+	}
+	if (floor === undefined || !own.length || floor <= own[0].log_id) return undefined;
+	return floor;
+}
 
 const key = (record: Pick<ChatRecord, "room_id" | "log_id">) => `${record.log_id}\u0000${record.room_id}`;
 
@@ -236,10 +262,11 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead, Restor
 	}
 }
 
-/** A TierStateStore in memory; the head is `head` (default "hot"). */
+/** A TierStateStore in memory; the head is "hot". */
 export class MemoryTierStateStore implements TierStateStore {
-	readonly states = new Map<string, TierState>();
-	constructor(private readonly initial: () => TierState = () => ({ floor: 1, target: 1, through: 0, ops: 0, stall: NOT_STALLED }), private readonly head = "hot") {}
+	private readonly states = new Map<string, TierState>();
+	private readonly initial = (): TierState => ({ floor: 1, target: 1, through: 0, ops: 0, stall: NOT_STALLED });
+	private readonly head = "hot";
 	async load(names: readonly string[]): Promise<Record<string, TierState>> {
 		return Object.fromEntries(names.map((name) => [name, { ...(this.states.get(name) ?? this.initial()) }]));
 	}
