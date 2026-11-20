@@ -193,7 +193,8 @@ it('sets a remote user\'s reactions, renames it with me, and lets it leave', asy
 		const renamed = await exchange(link, 'rename', 'me', { name: 'Dave D', ext: { remote: { user_id: dave } } });
 		expect(renamed.frame.result.you).toMatchObject({ user_id: daveId, name: 'Dave D', roles: [], ext: { remote: { server, user_id: dave } } });
 		const told = await until(admin, (frame) => frame.method === 'user' && frame.params.new?.user_id === daveId);
-		expect(told.frame.params.new).toEqual({ user_id: daveId, name: 'Dave D', roles: [] });
+		// Its `user` `new` carries its ext.remote, though only the name changed.
+		expect(told.frame.params.new).toEqual({ user_id: daveId, name: 'Dave D', roles: [], ext: { remote: { server, user_id: dave } } });
 		expect((await request(link, 'self', 'me', {})).result.you).toMatchObject({ user_id: linkId });
 		expect((await request(link, 'self', 'me', {})).result.you.name).not.toBe('Dave D');
 
@@ -286,6 +287,9 @@ it('gives a link\'s own user object ext.remote with its server and no user_id', 
 		// A `me` of its own keeps it.
 		const renamed = await request(link, 'rename', 'me', { name: 'Link bot', ext: { remote: { server: 'ws://forged/ws' } } });
 		expect(renamed.result.you).toMatchObject({ name: 'Link bot', ext: { remote: { server } } });
+		// Those who share a room are told, with its ext.remote, though only the name changed.
+		const told = await until(admin, (frame) => frame.method === 'user' && frame.params.new?.user_id === linkId);
+		expect(told.frame.params.new).toMatchObject({ user_id: linkId, name: 'Link bot', ext: { remote: { server } } });
 	} finally { admin.close(); link.close(); }
 });
 
@@ -522,7 +526,7 @@ it('a mirror takes the owner\'s restore of a deleted message, but keeps a copy i
 		state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES ('boss', '', 'Boss', 'registered', ?, ?, '[\"admin\"]')", now, now);
 		const server = 'ws://a.example/ws';
 		store.setMirrorState({ rooms: [{ room_id: 'general', server, owner_room: 'ops', token: 't', start: 0, threads: {} }], servers: { [server]: { cursor: 0 } } });
-		const host = { store, self: 'wss://demo.test/ws', runMutation: (fn: () => Promise<void>) => fn(), broadcastRecord: () => undefined, pushFor: () => undefined } as unknown as MirrorHost;
+		const host = { store, self: 'wss://demo.test/ws', runMutation: (fn: () => Promise<void>) => fn(), broadcastRecord: () => undefined, pushFor: () => undefined, userChanged: () => undefined } as unknown as MirrorHost;
 		const mirror = new RemoteRooms(host) as unknown as { copyMessage(server: string, snapshot: MessageSnapshot): Promise<void> };
 		let logId = 1_000;
 		const owner = (messageId: string, fields: Record<string, unknown>) => mirror.copyMessage(server, {
@@ -566,7 +570,7 @@ it('a mirror thread takes its first members from the room_update that joins the 
 		const server = 'ws://a.example/ws';
 		store.setMirrorState({ rooms: [{ room_id: 'general', server, owner_room: 'ops', token: 't', start: 0, threads: {} }], servers: { [server]: { cursor: 0 } } });
 		const host = {
-			store, self: 'wss://demo.test/ws', runMutation: (fn: () => Promise<void>) => fn(), broadcastRecord: () => undefined, pushFor: () => undefined, roomChanged: () => undefined,
+			store, self: 'wss://demo.test/ws', runMutation: (fn: () => Promise<void>) => fn(), broadcastRecord: () => undefined, pushFor: () => undefined, roomChanged: () => undefined, userChanged: () => undefined,
 			addMember: async (actor: { ipKey: string }, roomId: string, userId: string) => { store.changeMembership({ userId, ipKey: actor.ipKey, roomId, join: true }); },
 		} as unknown as MirrorHost;
 		const mirror = new RemoteRooms(host) as unknown as { apply(server: string, frame: Record<string, unknown>): Promise<void> };

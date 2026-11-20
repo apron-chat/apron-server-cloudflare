@@ -50,6 +50,8 @@ export interface MirrorHost {
 	notice(socket: unknown, roomId: string, text: string): void;
 	/** Joins a user (a link) to a room as `actorId` would add them, with every delivery a join makes. */
 	addMember(actor: { ipKey: string; userId?: string }, roomId: string, userId: string): Promise<void>;
+	/** A user's profile changed: their rooms' members get `user` `new`. */
+	userChanged(userId: string): void;
 	/** addMember within the mutation that runs now. */
 	addMemberNow(actor: { ipKey: string; userId?: string }, roomId: string, userId: string): void;
 	removeMember(actor: { ipKey: string; userId?: string }, roomId: string, userId: string): Promise<boolean>;
@@ -870,6 +872,7 @@ export class RemoteRooms {
 				userId: user.userId, tier: "registered", ipKey: MIRROR_IP_KEY, method: "me", now: this.now(), system: true,
 				params: { name: name.slice(0, 64) }, identity: { user_id: user.userId, tier: "registered" },
 			});
+			this.host.userChanged(user.userId);
 		});
 	}
 

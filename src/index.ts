@@ -5461,7 +5461,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			const changed = result.profile?.changed;
 			// The change comes before the result on the link's connection, which shares the rooms (§1).
 			if (!result.deduplicated && after && ((name !== undefined && name !== before?.name) || changed)) {
-				this.announceUser(null, { user_id: userId, name: after.name ?? "", roles: [], ...(changed ? { ext: changed } : {}) }, after.rooms);
+				this.announceUser(null, { user_id: userId, name: after.name ?? "", roles: [], ext: { ...changed, remote: actor.remote } }, after.rooms);
 			}
 			this.reply(socket, request, { you: shadowObject(after) });
 		});
@@ -8954,6 +8954,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			notice: (socket, roomId, text) => this.sendNotice(socket as WebSocketConnection, roomId, text),
 			addMember: (actor, roomId, userId) => this.joinMember(actor, roomId, userId),
 			addMemberNow: (actor, roomId, userId) => this.joinMemberNow(actor, roomId, userId),
+			userChanged: (userId) => {
+				const current = this.currentOf(userId);
+				if (current) this.announceUser(null, current.user, current.rooms);
+			},
 			removeMember: (actor, roomId, userId) => this.removeMember(actor, roomId, userId),
 			mintLinkToken: (linkId) => this.mintLinkToken(linkId),
 			forgetLinkTokens: (linkId) => this.forgetLinkTokens(linkId),
@@ -9899,7 +9903,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private announceUser(origin: WebSocketConnection | null, user: PublicUser | null, rooms: readonly string[], old?: { user_id: string; name?: string } | null): void {
 		if (!user) return;
-		const identity = user;
+		// ext:remote hook: a link's or remote user's every user object carries its `remote`, a change of name alone included.
+		const identity = this.remote ? this.withRemote(user) : user;
 		const shared = new Set(rooms);
 		// A new `user_id` (/rename) is a user others have not seen: it carries
 		// the status they were shown under the old one. A profile change leaves
@@ -9920,6 +9925,18 @@ export class ApronDemoServer extends DurableObject<Env> {
 				this.syncServer(socket);
 			} else if (state.rooms?.some((id) => shared.has(id))) this.deliverTo(socket, { method: "user", params: { new: others, ...(old ? { old } : {}) } });
 		}
+	}
+
+	/**
+	 * A user object with the `remote` the server sets on a link or remote user
+	 * (ext:remote), when the object lacks it, such as the `ext` of a change
+	 * that holds only the keys that changed. Anyone else's is unchanged.
+	 */
+	private withRemote(user: PublicUser): PublicUser {
+		if (user.ext?.remote !== undefined) return user;
+		const server = this.store.remoteLink(user.user_id, nowMs());
+		const remote = server !== undefined ? { server } : isShadowUserId(user.user_id) ? this.store.getIdentity(user.user_id)?.ext?.remote : undefined;
+		return remote === undefined ? user : { ...user, ext: { ...user.ext, remote } };
 	}
 
 	/** Authenticated, open connections of one user. */
