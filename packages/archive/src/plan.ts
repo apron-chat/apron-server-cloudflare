@@ -60,19 +60,34 @@ export const defaultUserIdRules: UserIdRules = {
 /** What an archive user becomes: an existing account, or a new placeholder. */
 export type UserTarget = { matched: string } | { placeholder: string };
 
+const isObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** How a plan's log IDs stand: renumbered from a first new one (in order), or kept, with the ones that collided moved. */
+export type ImportIds = { mode: "renumber"; base: number } | { mode: "original"; moved: Array<[number, number]> };
+
 /** A plan's state, as JSON: what a retry needs to make the same plan again (`resume`). */
 export interface ImportState {
 	/** archiveIdentity of the archive. */
 	archive: string;
 	users: Record<string, UserTarget>;
-	/** Log IDs that moved (not with `renumber`). */
-	moved: Array<[number, number]>;
-	/** Renumbered: the first new log ID (the rest follow in order). */
-	renumber?: number;
-	/** The rooms it adds, by their IDs in the archive. */
-	rooms: string[];
-	/** The same rooms, by their IDs at the target. */
-	targetRooms: string[];
+	ids: ImportIds;
+	/** The rooms it adds: each by its ID in the archive and at the target. */
+	rooms: Array<{ archive: string; target: string }>;
+}
+
+/** An ImportState from its JSON (a journal), or undefined for text that is not one. */
+export function parseImportState(text: string): ImportState | undefined {
+	let value: unknown;
+	try {
+		value = JSON.parse(text);
+	} catch {
+		return undefined;
+	}
+	if (!isObject(value) || typeof value.archive !== "string" || !isObject(value.users) || !isObject(value.ids) || !Array.isArray(value.rooms)) return undefined;
+	const ids = value.ids;
+	const idsOk = (ids.mode === "renumber" && typeof ids.base === "number") || (ids.mode === "original" && Array.isArray(ids.moved) && ids.moved.every((pair) => Array.isArray(pair) && pair.length === 2 && pair.every((id) => typeof id === "number")));
+	const roomsOk = value.rooms.every((room) => isObject(room) && typeof room.archive === "string" && typeof room.target === "string");
+	return idsOk && roomsOk ? value as unknown as ImportState : undefined;
 }
 
 export interface PlanOptions {
@@ -178,7 +193,7 @@ export async function planImport(archive: CollectedArchive, target: ImportTarget
 		roomsAdded: [], roomsSkipped: [], users: {}, placeholders: 0, records: 0, duplicates: 0, expired: 0, rejected: 0, collisions: 0, references: 0,
 		remapped: { logIds: {}, users: {} }, placed: {}, dryRun: false, resumed: Boolean(resume),
 	};
-	const renumber = resume ? resume.renumber !== undefined : options.ids === "renumber";
+	const renumber = resume ? resume.ids.mode === "renumber" : options.ids === "renumber";
 
 	// Users may be matched to accounts only from an archive the target
 	// sealed: a plain file's `server` header is anyone's to write.
@@ -205,7 +220,7 @@ export async function planImport(archive: CollectedArchive, target: ImportTarget
 	// and those an unfinished run began. Rooms that exist are skipped whole.
 	const fresh = new Set<string>();
 	for (const roomId of [...rooms.keys()].sort()) {
-		if (resume ? resume.rooms.includes(roomId) : !(await target.hasRoom(roomId)) || (target.roomIsEmpty ? await target.roomIsEmpty(roomId) : false)) fresh.add(roomId);
+		if (resume ? resume.rooms.some((room) => room.archive === roomId) : !(await target.hasRoom(roomId)) || (target.roomIsEmpty ? await target.roomIsEmpty(roomId) : false)) fresh.add(roomId);
 		else report.roomsSkipped.push(roomId);
 	}
 	// A move is read back once, in the room it moved to: its copy in the room
@@ -300,11 +315,11 @@ export async function planImport(archive: CollectedArchive, target: ImportTarget
 	let renumberBase: number | undefined;
 	if (renumber) {
 		// Every record a new ID after the target's latest, in order.
-		renumberBase = resume?.renumber ?? Math.max(options.now(), (target.latest ? await target.latest() : 0) + 1);
+		renumberBase = resume?.ids.mode === "renumber" ? resume.ids.base : Math.max(options.now(), (target.latest ? await target.latest() : 0) + 1);
 		for (const [index, id] of numbered.entries()) moved.set(id, renumberBase + index);
 	} else if (resume) {
 		// The unfinished run's log IDs stand: what it wrote is there under them.
-		for (const [from, to] of resume.moved) moved.set(from, to);
+		if (resume.ids.mode === "original") for (const [from, to] of resume.ids.moved) moved.set(from, to);
 	} else {
 		const userMap = new IdMap(new Map(), users);
 		const known = await held(target, imported);
@@ -359,8 +374,9 @@ export async function planImport(archive: CollectedArchive, target: ImportTarget
 	};
 
 	const state: ImportState = {
-		archive: archiveIdentity(archive), users: report.users, moved: renumber ? [] : [...moved], ...(renumberBase !== undefined ? { renumber: renumberBase } : {}),
-		rooms: freshRooms, targetRooms: report.roomsAdded,
+		archive: archiveIdentity(archive), users: report.users,
+		ids: renumberBase !== undefined ? { mode: "renumber", base: renumberBase } : { mode: "original", moved: [...moved] },
+		rooms: freshRooms.map((roomId, index) => ({ archive: roomId, target: report.roomsAdded[index]! })),
 	};
 	return {
 		report,

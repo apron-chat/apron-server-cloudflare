@@ -464,7 +464,7 @@ describe("export and import", () => {
 		};
 		await expect(importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock, ids: "renumber", batch: 256 })).rejects.toThrow(/budget/);
 		expect(journals[0].length).toBeLessThan(1_000);
-		expect(JSON.parse(journals[0])).toMatchObject({ renumber: 100_000, moved: [] });
+		expect(JSON.parse(journals[0])).toMatchObject({ ids: { mode: "renumber", base: 100_000 } });
 		const again = await importArchive(target.pipeline, target.head, jsonlReader(linesOf(text)), { clock: target.clock });
 		expect(again.resumed).toBe(true);
 		expect(again.logIdRange).toEqual({ first: 100_000, last: 100_000 + many - 1 });

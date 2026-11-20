@@ -117,8 +117,7 @@ describe("planImport", () => {
 			["a", String(NOW + 51), String(NOW + 51)],
 			["empty", String(NOW + 51 + 2 + 1), null],
 		]);
-		expect(plan.state.renumber).toBe(NOW + 51);
-		expect(plan.state.moved).toEqual([]);
+		expect(plan.state.ids).toEqual({ mode: "renumber", base: NOW + 51 });
 	});
 
 	it("refuses log IDs past the clock unless renumbered", async () => {

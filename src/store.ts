@@ -4557,10 +4557,9 @@ export class Store {
     return this.reserved({ reads: 4 }, true, now, () => this.metaValue(META_HISTORY_IMPORT) || undefined);
   }
 
-  /** Writes or clears the running import's journal. */
+  /** Writes or clears the running import's journal (its size is the importer's to bound: MAX_JOURNAL_BYTES). */
   setHistoryImportJournal(value: string | null, now = this.clock.now()): void {
     this.ensureReady();
-    if (value !== null && value.length > 256 * 1024) throw new StoreError("invalid_params", "This import is too large to resume: import it in parts");
     this.reserved({ reads: 4, writes: 4 + Math.ceil((value?.length ?? 0) / 4_096) }, true, now, () => this.writeMeta(META_HISTORY_IMPORT, value));
   }
 

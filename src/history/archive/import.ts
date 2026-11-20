@@ -19,7 +19,7 @@
  */
 
 import {
-	type ArchiveReader, type ChatRecord, type CollectedArchive, type ImportReport, type ImportState, type ImportTarget, type Provenance, archiveIdentity, collectArchive, planImport,
+	type ArchiveReader, type ChatRecord, type CollectedArchive, type ImportReport, type ImportState, type ImportTarget, type Provenance, archiveIdentity, collectArchive, parseImportState, planImport,
 } from "@apron/archive";
 import { USER_ID_RULES } from "../../user-ids";
 import type { HistoryPipeline } from "../pipeline";
@@ -156,10 +156,11 @@ export async function importArchive(pipeline: HistoryPipeline, restore: RestoreP
 	let abandoned: string[] | undefined;
 	const saved = await restore.journal.get();
 	if (saved) {
-		const parsed = JSON.parse(saved) as ImportState;
-		const begun = parsed.targetRooms;
-		if (parsed.archive === archiveIdentity(archive)) resume = parsed;
+		const parsed = parseImportState(saved);
+		const begun = parsed ? parsed.rooms.map((room) => room.target) : [];
+		if (parsed && parsed.archive === archiveIdentity(archive)) resume = parsed;
 		else if (options.restart) abandoned = begun;
+		else if (!parsed) throw new Error("an earlier import's journal cannot be read: import with restart to abandon it");
 		else throw new Error(`another import is unfinished${begun.length ? ` (rooms ${begun.join(", ")})` : ""}: run it again to finish it, or import this one with restart to abandon it`);
 	}
 	const plan = await planImport(archive, importTarget(pipeline, restore), {
