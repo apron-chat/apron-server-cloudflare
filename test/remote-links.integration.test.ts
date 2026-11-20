@@ -223,6 +223,33 @@ it('refuses act-as writes in a room the link is not in', async () => {
 	} finally { admin.close(); link.close(); }
 });
 
+it('refuses act-as requests in a thread of its room that the link is not in, with not_joined', async () => {
+	const server = 'ws://127.0.0.1:8070/ws';
+	const { peer: admin } = await freshAdmin();
+	const roomId = (await request(admin, unique('room'), 'room_set', { title: unique('Shared') })).result.room_id as string;
+	const thread = (await request(admin, unique('thread'), 'room_set', { parent_room_id: roomId, title: 'Side' })).result.room_id as string;
+	const invited = await command(admin, unique('invite'), `/remote invite ${server}`, roomId);
+	const { peer: link } = await signIn(invited.notice!.params.body.text.match(/&token=(apron_invite_[A-Za-z0-9_-]{43})/)![1]);
+	const as = { ext: { remote: { user_id: unique('carol') } } };
+	try {
+		// In the thread, as the link joined it with the room.
+		expect((await request(link, unique('post'), 'message', { room_id: thread, body: { text: 'x' }, ...as })).result.message_id).toBeDefined();
+		// The link leaves the thread, not its room: the thread is no longer one it acts in.
+		expect((await request(link, unique('leave'), 'room_leave', { room_id: thread })).result).toEqual({});
+		for (const [method, params] of [
+			['message', { room_id: thread, body: { text: 'y' } }],
+			['room_join', { room_id: thread }],
+			['room_leave', { room_id: thread }],
+			['room_set', { room_id: thread, title: 'Taken' }],
+		] as const) {
+			const refused = await request(link, unique(method), method, { ...params, ...as });
+			expect(refused.error, method).toMatchObject({ code: DENIED, data: { ext: { remote: 'not_joined' } } });
+		}
+		// Its room still takes the link's writes.
+		expect((await request(link, unique('room'), 'message', { room_id: roomId, body: { text: 'z' }, ...as })).result.message_id).toBeDefined();
+	} finally { admin.close(); link.close(); }
+});
+
 it('refuses an act-as room_leave in a room the link is not in, with not_joined', async () => {
 	const { admin, link, roomId } = await linked('ws://127.0.0.1:8086/ws');
 	try {

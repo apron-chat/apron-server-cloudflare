@@ -5348,16 +5348,16 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
-	 * A link acts only in the rooms it has joined, and in their threads
-	 * (ext:remote): a room it cannot see is unknown (`invalid_params`), and
-	 * any other is `denied`, both with `not_joined`.
+	 * A link acts only in the rooms it has joined, threads included
+	 * (ext:remote): the server joins it to each thread of its rooms
+	 * (RemoteRooms.threadCreated), so a thread it is not in is one it left.
+	 * A room it cannot see is unknown (`invalid_params`), and any other is
+	 * `denied`, both with `not_joined`.
 	 */
 	private assertLinkIn(socket: WebSocketConnection, attachment: ConnectionAttachment, roomId: string): void {
 		const current = connectionAttachment(socket) ?? attachment;
 		if (!this.roomExists(roomId) || !this.sees(current, roomId)) throw { name: "invalid_params", message: "unknown room", data: NOT_JOINED } satisfies ProtocolError;
-		const parent = this.parentOf(roomId);
-		const joined = current.rooms ?? [];
-		if (!joined.includes(roomId) && (parent === null || !joined.includes(parent))) throw { name: "denied", message: "This link is not in that room, so its remote users may not act there", data: NOT_JOINED } satisfies ProtocolError;
+		if (!(current.rooms ?? []).includes(roomId)) throw { name: "denied", message: "This link is not in that room, so its remote users may not act there", data: NOT_JOINED } satisfies ProtocolError;
 	}
 
 	/**
@@ -5395,9 +5395,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 		const roomId = optionalString(params, "room_id");
 		const parentId = roomId === undefined ? optionalString(params, "parent_room_id") : this.parentOf(roomId) ?? undefined;
 		if (parentId === undefined) throw { name: "denied", message: "A link creates and saves threads only" } satisfies ProtocolError;
-		const current = connectionAttachment(socket) ?? attachment;
-		if (!this.roomExists(parentId) || !this.sees(current, parentId)) throw { name: "invalid_params", message: "unknown room", data: NOT_JOINED } satisfies ProtocolError;
-		if (!(current.rooms ?? []).includes(parentId)) throw { name: "denied", message: "This link is not in that room, so its remote users may not make threads there", data: NOT_JOINED } satisfies ProtocolError;
+		// Under a room the link is in, and a save only of a thread it is in.
+		this.assertLinkIn(socket, attachment, parentId);
+		if (roomId !== undefined) this.assertLinkIn(socket, attachment, roomId);
 		if (roomId === undefined) {
 			if (this.store.remoteThreadCount(remoteAuthority(actor.remote.server), nowMs()) >= MAX_REMOTE_THREADS) throw { name: "denied", message: `A link's remote users make at most ${MAX_REMOTE_THREADS} threads here at once` } satisfies ProtocolError;
 			// The remote user joins the room first, so the room's own rules answer (a private room has no threads).
