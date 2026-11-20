@@ -101,10 +101,8 @@ describe("remapRecord (PLAN §10.6)", () => {
 	it("leaves every record untouched under an identity map", () => {
 		const records = [record(setAt(base, ["log_id"], "100"), { log_id: 100, commit_ms: 100, room_id: "100" })];
 		for (const map of [new IdMap(), new IdMap(new Map([[100, 100]]), new Map([["ada", "ada"]]))]) {
-			expect(map.isIdentity()).toBe(true);
 			for (const input of records) expect(remapRecord(input, map)).toBe(input);
 		}
-		expect(sampleMap().isIdentity()).toBe(false);
 	});
 });
 
@@ -128,13 +126,6 @@ describe("remapListing and remapUser", () => {
 		expect(remapUser(user, sampleMap())).toEqual({ user_id: "ada-2", name: "Ada", roles: ["admin"] });
 		const other: ArchivedUser = { user_id: "carol" };
 		expect(remapUser(other, sampleMap())).toBe(other);
-	});
-});
-
-describe("IdMap.toJSON", () => {
-	it("reports log IDs as decimal strings", () => {
-		expect(sampleMap().toJSON()).toEqual({ logIds: { "100": "200", "101": "201" }, users: { ada: "ada-2", bob: "bob-2" } });
-		expect(JSON.parse(JSON.stringify({ map: new IdMap() }))).toEqual({ map: { logIds: {}, users: {} } });
 	});
 });
 

@@ -65,22 +65,6 @@ export class IdMap {
 		}
 		return this.logIdString(id);
 	}
-
-	/** Whether the map changes nothing: every entry maps an ID to itself. */
-	isIdentity(): boolean {
-		for (const [from, to] of this.logIds) if (from !== to) return false;
-		for (const [from, to] of this.users) if (from !== to) return false;
-		return true;
-	}
-
-	/** The mapping as ImportReport carries it: log IDs as decimal strings, as the wire writes them. */
-	toJSON(): { logIds: Record<string, string>; users: Record<string, string> } {
-		const logIds: Record<string, string> = {};
-		for (const [from, to] of this.logIds) logIds[String(from)] = String(to);
-		const users: Record<string, string> = {};
-		for (const [from, to] of this.users) users[from] = to;
-		return { logIds, users };
-	}
 }
 
 /** How a field's value is mapped: a log ID (a decimal string, or a number), a room ID, or a user ID. */
