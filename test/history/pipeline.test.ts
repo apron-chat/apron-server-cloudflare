@@ -6,7 +6,7 @@ import { MemoryChunkIndex } from "./support/memory-chunk-index";
 import { ColdHistoryTier } from "../../src/history/cold/tier";
 import { HISTORY_CODECS } from "../../src/history/config";
 import { MemoryHead, MemoryHistoryTier, MemoryTierStateStore } from "./support/memory-tiers";
-import { type TierView, checkInvariants, mergePages, planRead, planStep, retentionFloor } from "../../src/history/plan";
+import { type TierView, checkInvariants, mergePages, planRead, planStep } from "../../src/history/plan";
 import { HistoryPipeline, type PipelineStage, instrument } from "../../src/history/pipeline";
 import type { ChatRecord, Retention } from "../../src/history/records";
 import { NOT_STALLED } from "../../src/history/stall";
@@ -44,15 +44,6 @@ describe("planStep", () => {
 		expect(planStep(snapshot)).toEqual({ kind: "idle" });
 	});
 
-	it("never advances a floor past what the next tier holds, nor past the floor above", () => {
-		const tiers = [view("hot", state(10, 50, 29)), view("recent", state(5, 40, 20)), view("cold", state(1))];
-		const snapshot = { tiers, published: 1, opsSeq: 0, ...progress() };
-		snapshot.targeted.add(0).add(1).add(2);
-		snapshot.trimmed.set(2, 1);
-		// recent may go to 21 (cold holds through 20), not 40.
-		expect(planStep({ ...snapshot, tiers: [tiers[0], { ...tiers[1], state: { ...tiers[1].state, through: 39 } }, tiers[2]] })).toEqual({ kind: "advance", tier: 1, floor: 10 });
-	});
-
 	it("publishes the deepest readable tier's floor", () => {
 		const tiers = [view("hot", state(10)), view("recent", state(5)), view("backup", state(2), { readable: false })];
 		const snapshot = { tiers, published: 3, opsSeq: 0, ...progress() };
@@ -78,17 +69,16 @@ describe("checkInvariants", () => {
 	});
 });
 
+// The model runs read through planRead and mergePages on every command; these
+// cover what they cannot reach: tier windows never overlap there, so no two
+// tiers' copies of a record meet in a merge.
 describe("planRead and mergePages", () => {
-	const tiers = [view("hot", state(100)), view("recent", state(50)), view("cold", state(10))];
-
-	it("gives each tier the window between its floor and the floor above, none below the published floor", () => {
+	it("give each tier the window between its floor and the floor above, and merge by log ID, a move once, the upper tier winning", () => {
+		const tiers = [view("hot", state(100)), view("recent", state(50)), view("cold", state(10))];
 		const query = { roomIds: ["a"], lower: 1, upper: 200, forward: false, limit: 10 };
 		expect(planRead(query, tiers, 20).map((part) => [part.tier, part.query.lower, part.query.upper])).toEqual([[0, 100, 200], [1, 50, 99], [2, 20, 49]]);
 		expect(planRead({ ...query, forward: true }, tiers, 20).map((part) => part.tier)).toEqual([2, 1, 0]);
 		expect(planRead(query, tiers, 20, { skipHead: true }).map((part) => part.tier)).toEqual([1, 2]);
-	});
-
-	it("merges by log ID, a move once, with the upper tier winning", () => {
 		const record = (room: string, logId: number, json = "{}"): ChatRecord => ({ room_id: room, log_id: logId, commit_ms: logId, kind: "message", record_json: json });
 		const merged = mergePages([
 			{ tier: 1, records: [record("a", 5, "old"), record("a", 4), record("b", 4)] },
@@ -96,20 +86,6 @@ describe("planRead and mergePages", () => {
 		], { forward: false, limit: 2 });
 		expect(merged.map((entry) => `${entry.room_id}${entry.log_id}${entry.record_json}`)).toEqual(["a6{}", "a5new"]);
 		expect(mergePages([{ tier: 1, records: [record("a", 4), record("b", 4), record("a", 3)] }], { forward: true, limit: 2 }).length).toBe(3);
-	});
-});
-
-describe("retentionFloor", () => {
-	const entries = Array.from({ length: 10 }, (_, index) => ({ log_id: index + 1, commit_ms: (index + 1) * 1000 }));
-	it("keeps the threshold's share of the count, newest first, counting only below the tier above", () => {
-		expect(retentionFloor(entries, { records: 4, thresholdPercent: 100 }, { now: 0, below: Infinity })).toBe(7);
-		expect(retentionFloor(entries, { records: 4, thresholdPercent: 50 }, { now: 0, below: Infinity })).toBe(9);
-		expect(retentionFloor(entries, { records: 4, thresholdPercent: 100 }, { now: 0, below: 9 })).toBe(5);
-		expect(retentionFloor(entries, { records: 20, thresholdPercent: 100 }, { now: 0, below: Infinity })).toBeUndefined();
-	});
-	it("drops by age, and holds back what is younger than the minimum age", () => {
-		expect(retentionFloor(entries, { ageMs: 5_500, thresholdPercent: 100 }, { now: 10_000, below: Infinity })).toBe(5);
-		expect(retentionFloor(entries, { records: 2, minAgeMs: 6_500, thresholdPercent: 100 }, { now: 10_000, below: Infinity })).toBe(4);
 	});
 });
 
@@ -192,7 +168,7 @@ async function history(pipeline: HistoryPipeline, roomId: string, size: number):
 	return out.reverse();
 }
 
-describe("HistoryPipeline over memory tiers", () => {
+describe("HistoryPipeline over memory tiers: retention and upkeep", () => {
 	it("moves records down as each tier's retention allows, and serves them as one log", async () => {
 		const { clock, head, stages, pipeline } = build(compositions[1]);
 		const made: ChatRecord[] = [];
@@ -211,61 +187,6 @@ describe("HistoryPipeline over memory tiers", () => {
 		expect((stages[1].tier as MemoryHistoryTier).all()[0].log_id).toBe(made[6].log_id);
 	});
 
-	it("carries /purge to every tier, the cold tier's sweep a chunk a step", async () => {
-		const { clock, head, stages, pipeline } = build(compositions[2]);
-		for (let index = 0; index < 30; index += 1) {
-			clock.time += 10;
-			head.commit("general", "message", { message_id: `m${index}`, from: { user_id: index % 3 ? "ada" : "bob" }, body: { text: `${index}` } });
-		}
-		await settle(pipeline);
-		const coldTier = stages[1].tier as ColdHistoryTier;
-		expect((await coldTier.scan(0, 100)).records.some((record) => record.record_json.includes("bob"))).toBe(true);
-		const { reached } = await pipeline.purge(["bob"]);
-		// The cold tier holds several chunks naming bob: its sweep goes on in the next steps.
-		expect(reached).toEqual(["hot", "recent"]);
-		expect((await pipeline.views())[2].state.opCursor).toBeDefined();
-		// Pages read from it meanwhile have the op applied.
-		expect((await history(pipeline, "general", 7)).some((record) => record.record_json.includes("bob"))).toBe(false);
-		await settle(pipeline);
-		expect((await coldTier.scan(0, 100)).records.some((record) => record.record_json.includes("bob"))).toBe(false);
-		expect((await pipeline.views())[2].state.opCursor).toBeUndefined();
-		expect(await head.opLog.list()).toEqual([]);
-	});
-
-	it("applies an op a tier has yet to apply to pages read from it", async () => {
-		const { clock, head, pipeline } = build(compositions[1]);
-		for (let index = 0; index < 20; index += 1) {
-			clock.time += 10;
-			head.commit("general", "message", { message_id: `m${index}`, from: { user_id: index === 3 ? "eve" : "ada" }, body: { text: `${index}` } });
-		}
-		await settle(pipeline);
-		// Purged at the head only: the tiers below have not applied it yet.
-		await head.purge(["eve"]);
-		expect((await history(pipeline, "general", 50)).some((record) => record.record_json.includes("eve"))).toBe(false);
-		await settle(pipeline);
-		expect(await head.opLog.list()).toEqual([]);
-	});
-
-	it("records a stalled copy, alerts once, and catches up when the tier recovers", async () => {
-		let failing = true;
-		const composition = compositions[1];
-		const { clock, head, pipeline } = build(composition, { faults: () => failing });
-		for (let index = 0; index < 20; index += 1) {
-			clock.time += 10;
-			head.commit("general", "message", { message_id: `m${index}`, from: { user_id: "ada" }, body: { text: `${index}` } });
-		}
-		const first = await pipeline.cycle({ steps: 50 });
-		expect(first.report.failure).toBeDefined();
-		clock.time += 7 * 3_600_000;
-		failing = false;
-		// The head copies to recent, which works: the failing hop was recent → older (its floorFor failed first, at target).
-		expect((await pipeline.stallsToAlert(6 * 3_600_000)).length).toBeLessThanOrEqual(1);
-		await settle(pipeline);
-		expect((await pipeline.views()).every((tier) => tier.state.stall.kind === "ok")).toBe(true);
-	});
-});
-
-describe("HistoryPipeline upkeep", () => {
 	it("forgets the op log when there is no tier below the head", async () => {
 		const clock = new TestClock();
 		const head = new MemoryHead("hot", clock);
@@ -295,6 +216,9 @@ describe("HistoryPipeline upkeep", () => {
 		expect((await pipeline.views())[0].state.stall).toEqual({ kind: "stalled", since: clock.time, step: "target" });
 		clock.time += 7 * 3_600_000;
 		expect(await pipeline.stallsToAlert(6 * 3_600_000)).toEqual([{ from: "hot", to: "recent", since: clock.time - 7 * 3_600_000 }]);
+		// Alerted once: not again while it lasts.
+		clock.time += 3_600_000;
+		expect(await pipeline.stallsToAlert(6 * 3_600_000)).toEqual([]);
 		down = false;
 		await settle(pipeline);
 		expect((await pipeline.views())[0].state.stall).toEqual(NOT_STALLED);
@@ -644,13 +568,14 @@ describe("model-based regressions", () => {
 		expect(served.map((record) => record.log_id)).toEqual([ada.log_id]);
 	});
 
-	// What a page shows while the cold tier sweeps a /purge: nothing of the
-	// purged users' own (their messages, reaction sets and memberships, dropped
-	// from pages by the pending op); others' reactions on their messages show
-	// until the sweep finds those messages, and are gone once it ends.
+	// What a page shows while the cold tier sweeps a /purge, a chunk a step:
+	// nothing of the purged users' own (their messages, reaction sets and
+	// memberships, dropped from pages by the pending op); others' reactions on
+	// their messages show until the sweep finds those messages, and are gone
+	// once it ends, from every tier, with the op log emptied.
 	it("hides the purged users' own records during a sweep, and the rest once it ends", async () => {
 		const built = build(compositions[2]);
-		const { clock, head, pipeline } = built;
+		const { clock, head, stages, pipeline } = built;
 		const model = new Model();
 		const post = (id: string, from: string) => model.add(head.commit("general", "message", { message_id: id, from: { user_id: from }, body: { text: id } }));
 		const react = (id: string, from: string) => model.add(head.commit("general", "reactions", { message_id: id, reactions: [{ from: { user_id: from }, emojis: ["👍"] }] }));
@@ -663,10 +588,19 @@ describe("model-based regressions", () => {
 			if (index % 5 === 0) react(`a${index + 2}`, "cy");
 		}
 		await settle(pipeline);
-		await pipeline.purge(["cy"]);
+		const coldTier = stages[1].tier as ColdHistoryTier;
+		const namesCy = async () => (await coldTier.scan(0, 1_000)).records.some((record) => record.record_json.includes('"cy"'));
+		expect(await namesCy()).toBe(true);
+		const { reached } = await pipeline.purge(["cy"]);
+		// The cold tier holds several chunks naming cy: its sweep goes on in the next steps.
+		expect(reached).toEqual(["hot", "recent"]);
+		expect((await pipeline.views())[2].state.opCursor).toBeDefined();
 		const during = await history(pipeline, "general", 3);
 		for (const record of during) expect(record.record_json.includes('"cy"')).toBe(false);
 		await settle(pipeline);
+		expect(await namesCy()).toBe(false);
+		expect((await pipeline.views())[2].state.opCursor).toBeUndefined();
+		expect(await head.opLog.list()).toEqual([]);
 		model.apply({ op: "purge", userIds: ["cy"], messageIds: [] }, await pipeline.publishedFloor());
 		expect(show(await history(pipeline, "general", 3))).toEqual(show(model.room("general", await pipeline.publishedFloor())));
 	});

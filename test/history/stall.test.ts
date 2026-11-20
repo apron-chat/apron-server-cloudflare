@@ -24,11 +24,12 @@ describe('a hop\'s stall', () => {
 		expect(stallCleared(targeting, 'copy')).toEqual(NOT_STALLED);
 	});
 
-	it('is kept as fields, a stall without its step being a copy\'s', () => {
+	it('is kept as fields, and read back as it was', () => {
 		const alerted = { kind: 'alerted', since: 1, step: 'ops', at: 2 } as const;
 		expect(stallFromFields(stallToFields(alerted))).toEqual(alerted);
 		expect(stallToFields(NOT_STALLED)).toEqual({});
-		expect(stallFromFields({ stalledSince: 5 })).toEqual({ kind: 'stalled', since: 5, step: 'copy' });
+		// A step it cannot read (a damaged field) holds the stall as a copy's, which only a copy clears.
+		expect(stallFromFields({ stalledSince: 5, stalledOn: 'rebuild' as never })).toEqual({ kind: 'stalled', since: 5, step: 'copy' });
 		expect(stallFromFields({})).toEqual(NOT_STALLED);
 	});
 });
