@@ -131,6 +131,9 @@ function randomDigits(count: number): string {
 	return Array.from(raw, (value) => String(value % 10)).join("");
 }
 
+/** The name of a new account that asks for none: not "Guest", which names guests. */
+export const MEMBER_NAME = "Member";
+
 /**
  * A new registered `user_id`: `<slug>_<4 random digits>` for a requested name
  * (`Foo` → `foo_1234`), retried while taken, else `u_` plus 16 random bytes.
@@ -266,13 +269,16 @@ export class WebAuthnService {
 		if (action === "register" && identity?.tier === "registered" && !adds) throw new Error("identity switching requires reconnect");
 		const challengeId = randomBase64Url(18);
 		const challenge = randomBase64Url(32);
-		const candidateUserId = action !== "register" ? undefined
-			: adds ? identity!.user_id : candidateUserIdFor(registration.name, registration.userIdTaken ?? (() => false));
-		const candidateUserHandle = action !== "register" ? undefined
-			: adds && registration.adds?.userHandle ? registration.adds.userHandle : randomBase64Url(16);
+		// A new account without a requested name (or a guest's to keep) is a
+		// "Member", as an invite's sign-up is (not "Guest", which names
+		// guests), and its `user_id` comes from its name (a guest's gives `u_…`).
 		const candidateName = action !== "register" ? undefined
 			: adds ? (identity!.name || identity!.user_id)
-			: (registration.name ?? identity?.name ?? `Guest ${randomBase64Url(4)}`.slice(0, Math.min(this.config.limits.maxNameCodePoints, this.config.limits.maxNameBytes)));
+			: (registration.name ?? identity?.name ?? MEMBER_NAME);
+		const candidateUserId = action !== "register" ? undefined
+			: adds ? identity!.user_id : candidateUserIdFor(candidateName, registration.userIdTaken ?? (() => false));
+		const candidateUserHandle = action !== "register" ? undefined
+			: adds && registration.adds?.userHandle ? registration.adds.userHandle : randomBase64Url(16);
 		const options = action === "register"
 			? await generateRegistrationOptions({
 				rpName: this.config.rpName,

@@ -427,16 +427,19 @@ it('adds a passkey through the page only to the account whose connection began i
 			return returned(done.body.redirect!, app);
 		};
 		const finish = (target: Peer, code: string) => request(target, `add-${crypto.randomUUID()}`, 'auth', { scheme: 'webauthn', action: 'register', step: 'finish', ...app.redeem(code) });
-		// Another account's connection, and a connection that is not signed in, are denied.
-		expect((await finish(stranger, await add())).error.code).toBe(-32001);
+		// Another account's connection, and a connection that is not signed in, are denied,
+		// and the code is kept for the account's own connection.
+		const misplaced = await add();
+		expect((await finish(stranger, misplaced)).error.code).toBe(-32001);
 		const anonymous = await connect();
 		try {
 			await greeting(anonymous);
-			expect((await finish(anonymous, await add())).error.code).toBe(-32001);
+			expect((await finish(anonymous, misplaced)).error.code).toBe(-32001);
 		} finally { anonymous.close(); }
-		// The account's own connection adds it, and answers `you` only.
-		const added = await finish(owner, await add());
+		// The account's own connection adds it, and answers `you` only; then the code is used up.
+		const added = await finish(owner, misplaced);
 		expect(added.result).toEqual({ you: expect.objectContaining({ user_id: userId }) });
+		expect((await finish(owner, misplaced)).error.code).toBe(-32001);
 		const credentials = await runInDurableObject(stub(), (instance) => (instance as unknown as { store: { credentialIdsForUser(id: string): string[] } }).store.credentialIdsForUser(userId));
 		expect(credentials).toHaveLength(2);
 		expect(credentials).toContain(passkey.id);
@@ -639,6 +642,52 @@ it('offers external with EXTERNAL_SIGN_IN: metadata, /oauth/authorize with a pas
 		const pageCode = returned(pageDone.body.redirect!, pageClient);
 		expect(await (await tokenRequest({ grant_type: 'authorization_code', code: pageCode, code_verifier: pageClient.verifier, redirect_uri: pageClient.redirectUri, client_id: pageClient.clientId })).json()).toEqual({ error: 'invalid_grant' });
 	} finally { peer.close(); }
+});
+
+it('keeps an external code a connection cannot take for one that can, and names a new account by the request', async () => {
+	await setExternal(true);
+	const fresh = async () => { const target = await connect(); await greeting(target); return target; };
+	const redeem = (target: Peer, params: Record<string, unknown>) => request(target, `ext-${crypto.randomUUID()}`, 'auth', { scheme: 'external', ...params });
+	const newAccount = async () => {
+		const app = await client();
+		const passkey = await softPasskey(ORIGIN);
+		const created = await ceremony(app.url(`${ORIGIN}/oauth/authorize`), passkey, { page: 'authorize', action: 'register' });
+		expect(created.status).toBe(200);
+		return { app, passkey, code: returned(created.body.redirect!, app) };
+	};
+	const { peer: signedIn } = await registerThroughPage('Fay');
+	const targets: Peer[] = [signedIn];
+	try {
+		// A new account's code on a signed-in connection is denied, and still works on a new connection.
+		const kept = await newAccount();
+		expect((await redeem(signedIn, kept.app.redeem(kept.code))).error.code).toBe(-32001);
+		const target = await fresh();
+		targets.push(target);
+		// A name over the limits is `too_large` before the code is tried.
+		expect((await redeem(target, kept.app.redeem(kept.code, { name: 'x'.repeat(1_000) }))).error.code).toBe(-32003);
+		const signedUp = await redeem(target, kept.app.redeem(kept.code, { name: '  Gil  ' }));
+		expect(signedUp.result.you).toMatchObject({ user_id: expect.stringMatching(/^gil_\d{4}$/), name: 'Gil' });
+		expect(signedUp.result.token).toMatch(/^apron_session_/);
+		// Then it is used up, and its passkey signs in to the new account.
+		const again = await fresh();
+		targets.push(again);
+		expect((await redeem(again, kept.app.redeem(kept.code))).error.code).toBe(-32001);
+		const login = await client();
+		const done = await ceremony(login.url(`${ORIGIN}/oauth/authorize`), kept.passkey, { page: 'authorize', action: 'login' });
+		expect((await redeem(again, login.redeem(returned(done.body.redirect!, login)))).result.you.user_id).toBe(signedUp.result.you.user_id);
+
+		// An invalid attempt still uses the code up.
+		const burned = await newAccount();
+		const other = await fresh();
+		targets.push(other);
+		expect((await redeem(other, burned.app.redeem(burned.code, { code_verifier: b64(crypto.getRandomValues(new Uint8Array(32))) }))).error.code).toBe(-32001);
+		expect((await redeem(other, burned.app.redeem(burned.code))).error.code).toBe(-32001);
+
+		// Without a name, the new account is a "Member", never a "Guest".
+		const unnamed = await newAccount();
+		const member = await redeem(other, unnamed.app.redeem(unnamed.code));
+		expect(member.result.you).toMatchObject({ user_id: expect.stringMatching(/^member_\d{4}$/), name: 'Member' });
+	} finally { for (const target of targets) target.close(); }
 });
 
 it('takes a public client\'s client_id at /oauth/token in the body or with HTTP Basic, and keeps a code it refuses before redeeming', async () => {
