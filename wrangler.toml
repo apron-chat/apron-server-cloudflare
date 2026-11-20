@@ -29,7 +29,6 @@ bucket_name = "apron-media-dev"
 # Backups and imports): a private bucket, no public access. Used by the
 # tests and `wrangler dev` (miniflare's local R2): bound, it is the tier
 # below D1, keeping segments under history/, and backups go under backups/.
-# Production has none yet, so the blob tier is off there.
 [[r2_buckets]]
 binding = "HISTORY_BLOB"
 bucket_name = "apron-history-dev"

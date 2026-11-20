@@ -20,7 +20,7 @@ declare global {
 		MEDIA?: R2Bucket;
 		/** The D1 history tier (src/history/d1.ts); without it (or the blob tier), records past SQLite's limits expire at once. */
 		HISTORY_D1?: D1Database;
-		/** The blob history tier's segments and the backups (PLAN §9): a private R2 bucket; absent in production for now. */
+		/** The blob history tier's segments and the backups: a private R2 bucket. */
 		HISTORY_BLOB?: R2Bucket;
 		MEDIA_ORIGIN?: string;
 		MEDIA_NOSNIFF?: string;
