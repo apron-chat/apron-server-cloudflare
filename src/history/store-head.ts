@@ -57,7 +57,8 @@ export interface RestoreStore {
 
 /** What an export needs of the Store. */
 export interface ExportStore {
-	listRooms(now?: number, options?: { maintenance?: boolean; withPrivate?: boolean }): Array<{ room_id: string }>;
+	/** Every room, archived ones included (an export names every room, however many). */
+	allRooms(now?: number): Array<{ room_id: string }>;
 	getIdentity(userId: string): { userId: string; name: string; avatar?: string; roles: string[]; ext?: Record<string, unknown> } | null;
 	exportMembers(roomId: string, limit: number): { members: string[]; count: number };
 }
@@ -125,7 +126,7 @@ export function storeExport(store: ExportStore): ExportPort {
 		 * are read; the export bounds them further (boundedMembers).
 		 */
 		async rooms() {
-			return store.listRooms(undefined, { maintenance: true, withPrivate: true }).map((room) => {
+			return store.allRooms().map((room) => {
 				const { latest_log_id, history_log_id, members: _members, member_count: _count, ...rest } = room as Record<string, unknown> & { room_id: string };
 				const { members, count } = store.exportMembers(room.room_id, MAX_LISTING_MEMBERS);
 				return {

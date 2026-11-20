@@ -1,8 +1,7 @@
 // Archived rooms (roomArchiveMs): a thread or private room whose newest
 // record is older than the archive window stays listed and readable but no
 // longer counts against the room caps; a new record in it makes it active
-// again, taking a slot, and cleanup keeps as many archived rooms of each
-// kind as the cap, the newest.
+// again, taking a slot. Archived rooms are kept for good, however many.
 import { env, runInDurableObject } from "cloudflare:test";
 import { expect, it } from "vitest";
 import type { HistoryChain } from "../src/history/chain";
@@ -132,27 +131,63 @@ it("private rooms archive the same way, with their own cap", async () => {
 	});
 });
 
-it("cleanup keeps as many archived rooms as the cap, the newest, and removes the older", async () => {
-	await withStore("archive-cleanup", CONFIG, (store, clock) => {
-		const generations: string[][] = [];
-		for (let generation = 0; generation < 3; generation += 1) {
-			generations.push([thread(store, clock, `g${generation}a`), thread(store, clock, `g${generation}b`)]);
+it("archived rooms are kept however many there are: listed newest first up to a bound, never removed, never in the way of a new room", async () => {
+	const config = { ...CONFIG, retentionMs: 10_000 * DAY, maxThreads: 4, maxThreadsPerUser: 4 };
+	await withStore("archive-unbounded", config, (store, clock) => {
+		const reads = () => (store as unknown as { observed: { reads: number } }).observed.reads;
+		const countReads = () => {
+			const before = reads();
+			store.roomCounts(clock.value);
+			return reads() - before;
+		};
+		const created: string[] = [];
+		let early = 0;
+		// 152 threads, four at a time, each generation archived before the next:
+		// past the 100 archived threads a listing names, and far past the cap.
+		for (let generation = 0; generation < 38; generation += 1) {
+			for (let i = 0; i < 4; i += 1) created.push(thread(store, clock, `g${generation}-${i}`));
 			clock.value += 11 * DAY;
+			if (generation === 2) early = countReads();
 		}
-		// Six threads, all archived; the table holds at most three times the cap.
-		expect(store.roomCounts(clock.value).public).toEqual({ active: 0, archived: 6 });
-		expect(refusal(() => thread(store, clock))).toBe("denied: thread_limit");
-		const removed: string[] = [];
+		expect(store.roomCounts(clock.value).public).toEqual({ active: 0, archived: 152 });
+		// Counting the live rooms reads ranges of the kind index, whatever the archived ones number.
+		expect(countReads()).toBeLessThanOrEqual(early + 2);
+		// Cleanup removes none of them: their history is still there.
 		for (let round = 0; round < 4; round += 1) {
 			const result = store.runCleanup(clock.value);
-			removed.push(...result.removed_rooms);
+			expect(result.removed_rooms).toEqual([]);
 			clock.value = Math.max(clock.value, result.next_due_ms);
 		}
-		// The four oldest go, oldest first; the newest two stay, archived and readable.
-		expect(removed).toEqual([...generations[0], ...generations[1]]);
-		expect(archived(store, clock)).toEqual(generations[2]);
-		expect(store.roomCounts(clock.value).public).toEqual({ active: 0, archived: 2 });
-		thread(store, clock, "fresh");
+		expect(store.roomCounts(clock.value).public).toEqual({ active: 0, archived: 152 });
+		// A listing names the 100 most recently active archived threads; an older one is read by its room_id.
+		const listed = archived(store, clock);
+		expect(listed).toHaveLength(100);
+		expect(new Set(listed)).toEqual(new Set(created.slice(-100)));
+		expect(store.getRoom(created[0], clock.value)?.archived).toBe(true);
+		// An export names every room, archived ones included.
+		expect(store.allRooms(clock.value).filter((room) => room.archived).map((room) => room.room_id)).toEqual(created);
+		// New rooms take live slots only.
+		for (let i = 0; i < 4; i += 1) thread(store, clock, `fresh-${i}`);
+		expect(refusal(() => thread(store, clock))).toBe("denied: thread_limit");
+		expect(store.roomCounts(clock.value).public).toEqual({ active: 4, archived: 152 });
+	});
+});
+
+it("an object made before the room kind index works without it, and its first cleanup adds it", async () => {
+	await withStore("archive-index", CONFIG, (store, clock, state) => {
+		const sql = state.storage.sql;
+		const hasIndex = () => sql.exec("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'rooms_kind_head_idx'").toArray().length === 1;
+		expect(hasIndex()).toBe(true);
+		sql.exec("DROP INDEX rooms_kind_head_idx");
+		const first = thread(store, clock, "Before");
+		clock.value += 11 * DAY;
+		expect(archived(store, clock)).toEqual([first]);
+		expect(store.roomCounts(clock.value).public).toEqual({ active: 0, archived: 1 });
+		thread(store, clock, "Fresh");
+		expect(hasIndex()).toBe(false);
+		store.runCleanup(clock.value);
+		expect(hasIndex()).toBe(true);
+		expect(store.roomCounts(clock.value).public).toEqual({ active: 1, archived: 1 });
 	});
 });
 
