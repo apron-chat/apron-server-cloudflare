@@ -8,6 +8,7 @@ import { MemoryBlobStore } from "./support/memory-blob-store";
 import { ColdHistoryTier } from "../../src/history/cold/tier";
 import { HISTORY_CODECS, archivePipeline } from "../../src/history/config";
 import { storeExport, storeRestore } from "../../src/history/store-head";
+import { withoutOutputs } from "../../src/history/records";
 import { HistoryPipeline } from "../../src/history/pipeline";
 import { MemoryHead } from "./support/memory-tiers";
 import { MemoryTierStateStore } from "./support/memory-tiers";
@@ -445,7 +446,7 @@ it("exports a room's whole history after a retitle: the listing's creation, not 
 		for (const text of ["one", "two"]) store.mutate(input(clock, "ada", "message", { room_id: lobby, body: { format: "plain", text } }));
 		store.mutate(input(clock, "ada", "room_set", { room_id: lobby, title: "Lobby, renamed" }));
 		const lines: string[] = [];
-		await exportArchive(archivePipeline(undefined, { store, limits: LIMITS, clock: clock.clock }), storeExport(store), jsonlWriter(async (line) => { lines.push(line); }), { clock: clock.clock, roomIds: [lobby] });
+		await exportArchive(archivePipeline(undefined, { store, limits: LIMITS, clock: clock.clock }), storeExport(store), jsonlWriter(async (line) => { lines.push(line); }), { clock: clock.clock, roomIds: [lobby], prepare: withoutOutputs });
 		return { text: lines.join(""), clock: clock.value };
 	});
 	const archive = await collectArchive(jsonlReader(linesOf(exported.text)));

@@ -13,8 +13,29 @@
  */
 
 import { type ChatRecord, authoredMessages, byLog, purgedRecord, renamedRecord } from "@apron/archive";
+import { refsOf, withoutOutputRefs } from "../output-ref";
 
 export { type ChatRecord, type RecordKind, authoredMessages, byLog, logIds, purgedRecord, renamedRecord } from "@apron/archive";
+
+declare const PUBLIC: unique symbol;
+
+/**
+ * A record as it may leave the server (an export, a backup): no internal
+ * `output_ref`, its terminal output put back or dropped (src/output-ref.ts).
+ * Only asPublic makes one.
+ */
+export type PublicRecord = ChatRecord & { readonly [PUBLIC]: true };
+
+/** Records as public, checked: one still holding an `output_ref` is an error, never written out. */
+export function asPublic(records: readonly ChatRecord[]): PublicRecord[] {
+	for (const record of records) if (refsOf(record)) throw new Error(`record ${record.log_id} in ${record.room_id} still holds an internal output reference`);
+	return records as PublicRecord[];
+}
+
+/** Records made public with every `output_ref` dropped, no output put back: for a server with no terminal output to resolve. */
+export async function withoutOutputs(records: readonly ChatRecord[]): Promise<PublicRecord[]> {
+	return asPublic(records.map(withoutOutputRefs));
+}
 
 /** A contiguous range of the log: the unit tiers hand on. Records sorted by (log_id, room_id). */
 export interface RecordRange {

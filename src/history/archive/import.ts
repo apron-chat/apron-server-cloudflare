@@ -21,6 +21,7 @@
 import {
 	type ArchiveReader, type ChatRecord, type CollectedArchive, type ImportReport, type ImportState, type ImportTarget, type Provenance, archiveIdentity, collectArchive, parseImportState, planImport,
 } from "@apron/archive";
+import { withoutOutputRefs } from "../../output-ref";
 import { USER_ID_RULES } from "../../user-ids";
 import type { HistoryPipeline } from "../pipeline";
 import type { TierView } from "../plan";
@@ -98,19 +99,6 @@ export function restoreBatches(records: readonly ChatRecord[], limits: { records
 	return out;
 }
 
-/** A message record without any embed's `output_ref`: it names this server's own storage, never taken from a file (Store.normalizedBody drops a client's). */
-function withoutOutputRefs(record: ChatRecord): ChatRecord {
-	if (record.kind !== "message" || !record.record_json.includes('"output_ref"')) return record;
-	const value = JSON.parse(record.record_json) as { body?: { embeds?: unknown[] } };
-	if (!Array.isArray(value.body?.embeds)) return record;
-	value.body.embeds = value.body.embeds.map((embed) => {
-		if (!embed || typeof embed !== "object" || !("output_ref" in embed)) return embed;
-		const { output_ref: _ref, ...rest } = embed as Record<string, unknown>;
-		return rest;
-	});
-	return { ...record, record_json: JSON.stringify(value) };
-}
-
 /** planImport's target: the server's rooms and users (`restore`), and records across every tier of the pipeline. */
 function importTarget(pipeline: HistoryPipeline, restore: RestorePort): ImportTarget {
 	return {
@@ -174,6 +162,7 @@ export async function importArchive(pipeline: HistoryPipeline, restore: RestoreP
 		maxPlaceholders: options.maxPlaceholders ?? MAX_IMPORT_PLACEHOLDERS,
 		futureMs: FUTURE_LOG_ID_MS,
 		...(resume ? { resume } : {}),
+		// An `output_ref` names this server's own storage: never taken from a file (Store.normalizedBody drops a client's).
 		prepare: withoutOutputRefs,
 	});
 	const report: ImportReport = { ...plan.report, dryRun: Boolean(options.dryRun), ...(abandoned ? { abandoned } : {}) };

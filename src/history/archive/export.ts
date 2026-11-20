@@ -8,7 +8,7 @@
 
 import { type ArchiveSource, type ArchiveWriter, type ChatRecord, type ExportOptions as ArchiveExportOptions, type ExportReport, exportArchive as writeArchive } from "@apron/archive";
 import type { HistoryPipeline } from "../pipeline";
-import type { Clock } from "../records";
+import type { Clock, PublicRecord } from "../records";
 import type { ExportPort } from "../tier";
 
 export type { ExportReport };
@@ -16,11 +16,12 @@ export type { ExportReport };
 export interface ExportOptions extends Omit<ArchiveExportOptions, "exportedAt"> {
 	clock: Clock;
 	/**
-	 * Makes a page's records what clients would get: the runtime puts back
-	 * terminal output kept in R2 for its internal `output_ref`, which must
-	 * never leave the server.
+	 * Makes a page's records what clients would get (required: nothing is
+	 * exported unprepared): the runtime puts back terminal output kept in R2
+	 * for its internal `output_ref`, which must never leave the server;
+	 * withoutOutputs drops it where there is none to put back.
 	 */
-	prepare?: (records: ChatRecord[]) => Promise<ChatRecord[]>;
+	prepare: (records: ChatRecord[]) => Promise<PublicRecord[]>;
 }
 
 /** Log IDs an export reads a page. */

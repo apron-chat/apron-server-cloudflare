@@ -7,10 +7,11 @@ import { type ImportReport, importArchive } from "./history/archive/import";
 import { archivePipeline, blobStoreOf, buildHistoryPipeline, D1_TIER, d1Off, HEAD_TIER, HISTORY_CODECS, historyLayout, layoutTiered } from "./history/config";
 import { type D1Off, detailLines, statusLines } from "./history/status";
 import { storeExport, storeRestore } from "./history/store-head";
+import { hasOutputRef, refsOf, terminalOutputKeys, withTerminalOutputs } from "./output-ref";
 import { type BackupKind, BackupStore, writeBackup } from "./history/exports";
 import { type HistoryHolder, type HistoryLease, HistorySchedule, isRefusal, refusalMessage } from "./history/schedule";
 import type { HistoryPipeline } from "./history/pipeline";
-import type { ChatRecord } from "./history/records";
+import { type ChatRecord, type PublicRecord, asPublic } from "./history/records";
 import { keepLast, LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
 import { isStatus, isStatusChoice, OPTIONAL_STATUS_CHOICES, shownStatus, showsMorePresent, statusChoice, type Status, type StatusChoice } from "./presence";
 import { AccountUsageMonitor, snapshotBill, snapshotReasons } from "./account-usage";
@@ -93,9 +94,6 @@ import {
 	isPendingHistory,
 	newTerminalOutputKey,
 	terminalOutput,
-	terminalOutputKeys,
-	hasOutputRef,
-	withTerminalOutputs,
 	type Broadcast,
 	type TerminalStored,
 	type ClaimedPush,
@@ -9092,14 +9090,14 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/** Exported records as clients get them: terminal output kept in R2 put back, its internal reference never written. */
-	private async exportRecords(records: ChatRecord[]): Promise<ChatRecord[]> {
-		const values = records.map((record) => record.kind === "message" && record.record_json.includes('"output_ref"') ? JSON.parse(record.record_json) as unknown : undefined);
-		if (!values.some((value) => value !== undefined && hasOutputRef(value))) return records;
-		await this.loadTerminalOutputs(values.filter((value) => value !== undefined));
-		return records.map((record, index) => {
+	private async exportRecords(records: ChatRecord[]): Promise<PublicRecord[]> {
+		const values = records.map(refsOf);
+		const held = values.filter((value) => value !== undefined);
+		if (held.length) await this.loadTerminalOutputs(held);
+		return asPublic(records.map((record, index) => {
 			const value = values[index];
-			return value !== undefined && hasOutputRef(value) ? { ...record, record_json: JSON.stringify(withTerminalOutputs(value, (key) => this.cachedOutput(key))) } : record;
-		});
+			return value ? { ...record, record_json: JSON.stringify(withTerminalOutputs(value, (key) => this.cachedOutput(key))) } : record;
+		}));
 	}
 
 	/** The pipeline exports and imports go through: the history pipeline, or SQLite alone. */

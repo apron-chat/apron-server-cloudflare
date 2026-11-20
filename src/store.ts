@@ -30,6 +30,7 @@ import type { ChatRecord, HistoryOp, HistoryQuery, QueuedOp } from "./history/re
 import type { TierStatePort } from "./history/state";
 import { type ArchivedRoom, type ArchivedUser, parseLogId, type ReplayedMembership, replayRecords, roomClientFields, type ValidRecord, validateRecord, withClientUsers } from "@apron/archive";
 import { ADMIN_USER_ID, restorableUserId } from "./user-ids";
+import { MAX_TERMINAL_OUTPUT_JSON_BYTES, type TerminalOutputRef, outputRef } from "./output-ref";
 import type { ChunkIndex, ChunkRef } from "./history/cold/chunks";
 import {
   BudgetLedger,
@@ -364,62 +365,9 @@ export interface TerminalStored {
   output: string;
 }
 
-/**
- * Where a stored terminal snapshot keeps its output instead of `output`:
- * the R2 key and the output's size as JSON, so a history page budgets for
- * it before the runtime puts it back (withTerminalOutputs). Never sent: the
- * runtime replaces it with `output`, or leaves it out.
- */
-export interface TerminalOutputRef {
-  key: string;
-  bytes: number;
-}
-
 /** The key of an R2 object for a terminal's output, an attached file's kind. */
 export function newTerminalOutputKey(): string {
   return `f/${randomKey()}`;
-}
-
-/** A terminal embed's TerminalOutputRef as the server writes it (storeTerminalOutput), or undefined. */
-function outputRef(embed: unknown): TerminalOutputRef | undefined {
-  if (!isPlainObject(embed) || embed.kind !== "terminal" || !isPlainObject(embed.output_ref)) return undefined;
-  const { key, bytes } = embed.output_ref;
-  return typeof key === "string" && /^f\/[A-Za-z0-9_-]{22}$/.test(key) && Number.isSafeInteger(bytes) && (bytes as number) >= 0 && (bytes as number) <= MAX_TERMINAL_OUTPUT_JSON_BYTES
-    ? { key, bytes: bytes as number } : undefined;
-}
-
-/** Whether a record has any `output_ref`, valid or not: one that must be resolved or removed before it is sent. */
-export function hasOutputRef(record: unknown): boolean {
-  const embeds = isPlainObject(record) && isPlainObject(record.body) ? record.body.embeds : undefined;
-  return Array.isArray(embeds) && embeds.some((embed) => isPlainObject(embed) && embed.output_ref !== undefined);
-}
-
-/** The R2 keys of the terminal outputs a record refers to (TerminalOutputRef); only well-formed refs on terminal embeds. */
-export function terminalOutputKeys(record: unknown): string[] {
-  const embeds = isPlainObject(record) && isPlainObject(record.body) ? record.body.embeds : undefined;
-  if (!Array.isArray(embeds)) return [];
-  return embeds.flatMap((embed) => {
-    const ref = outputRef(embed);
-    return ref ? [ref.key] : [];
-  });
-}
-
-/**
- * A record with each stored terminal's output put back from `outputs` (by
- * R2 key), and its TerminalOutputRef removed either way: a terminal whose
- * output could not be read goes without it. The record itself is unchanged.
- */
-export function withTerminalOutputs<T>(record: T, outputs: (key: string) => string | undefined): T {
-  if (!hasOutputRef(record)) return record;
-  const value = record as unknown as Record<string, unknown> & { body: Record<string, unknown> & { embeds: unknown[] } };
-  const embeds = value.body.embeds.map((embed) => {
-    if (!isPlainObject(embed) || embed.output_ref === undefined) return embed;
-    const ref = outputRef(embed);
-    const { output_ref: _ref, ...rest } = embed;
-    const output = ref ? outputs(ref.key) : undefined;
-    return output === undefined ? rest : { ...rest, output };
-  });
-  return { ...value, body: { ...value.body, embeds } } as unknown as T;
 }
 
 /** What a record's stored terminal outputs add to it once put back, beyond their refs: for a history page's byte budget. */
@@ -830,15 +778,7 @@ const META_LIVE_TEXTS = "live_texts";
  * redeployed, so its bytes are gone (finishLiveText with nothing kept).
  */
 export const LIVE_ORPHAN_GRACE_MS = 30_000;
-/**
- * The largest finished terminal `output`, in bytes of JSON: a control
- * character escapes to six (`\u001b`), so the kept bytes are cut further when
- * escaping would pass it, and one record always fits a history response.
- * Colored output escapes to about 1.4 times its bytes (32 KB of it was 45 KB
- * of JSON), so this cuts only output dense in control characters, and it
- * bounds what history by count (retentionRecords) can hold of terminals.
- */
-export const MAX_TERMINAL_OUTPUT_JSON_BYTES = 64 * 1024;
+export { MAX_TERMINAL_OUTPUT_JSON_BYTES };
 /** Rows one live text's bookkeeping may write: the `_meta` row, three limiter rows and their counter. */
 const LIVE_WRITES = 16;
 
