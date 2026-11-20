@@ -138,6 +138,10 @@ export interface ImportReport {
 	rejected: number;
 	/** Messages whose ID another message there holds already: imported as records, their current state left as it is. */
 	collisions: number;
+	/** Members a new room's listing names that were joined there with no membership record (the writer's count). */
+	membersJoined: number;
+	/** Listed members not joined there: no account, or a cap of the target's (the writer's count). */
+	membersSkipped: number;
 	/** Records the file holds only as references (ARCHIVE.md §3.1). */
 	references: number;
 	/** Log and message IDs that moved, and user IDs that changed. */
@@ -190,7 +194,7 @@ export async function planImport(archive: CollectedArchive, target: ImportTarget
 	const matchable = rules.matchable ?? rules.restorable;
 	const authenticated = options.authenticated === true;
 	const report: ImportReport = {
-		roomsAdded: [], roomsSkipped: [], users: {}, placeholders: 0, records: 0, duplicates: 0, expired: 0, rejected: 0, collisions: 0, references: 0,
+		roomsAdded: [], roomsSkipped: [], users: {}, placeholders: 0, records: 0, duplicates: 0, expired: 0, rejected: 0, collisions: 0, membersJoined: 0, membersSkipped: 0, references: 0,
 		remapped: { logIds: {}, users: {} }, placed: {}, dryRun: false, resumed: Boolean(resume),
 	};
 	const renumber = resume ? resume.ids.mode === "renumber" : options.ids === "renumber";
@@ -260,10 +264,12 @@ export async function planImport(archive: CollectedArchive, target: ImportTarget
 		rooms.set(roomId, { ...room, listing });
 	}
 
-	// Users.
+	// Users: those the import uses, as a record names them or a new room's
+	// listing lists them as members. A user the file only lists (a scene's
+	// reader, say) gets no account: nothing here would show it.
 	const profiles = new Map<string, ArchivedUser>();
 	for (const user of archive.users) profiles.set(user.user_id, { ...profiles.get(user.user_id), ...user });
-	const ids = new Set<string>([...archive.users.map((user) => user.user_id), ...records.flatMap(namedUsers)]);
+	const ids = new Set<string>(records.flatMap(namedUsers));
 	for (const roomId of fresh) for (const member of rooms.get(roomId)!.listing.members ?? []) ids.add(member.user_id);
 	const given = new Set<string>();
 	const exists = async (id: string) => await target.hasUser(id);

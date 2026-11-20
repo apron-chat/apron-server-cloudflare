@@ -68,8 +68,11 @@ means; the server says what is true there (`ImportTarget`,
   from which a retry makes the same plan (`resume`).
 - `export.ts`: `exportArchive(source, writer, options)`, a history as one
   archive from any `ArchiveSource` (rooms, users, paged records, a floor):
-  listings, users before the page that names them first, private rooms
-  left out on request, `history_log_id` clamped to the floor.
+  listings with their members (bounded by `MAX_LISTING_MEMBERS` and
+  `MAX_LISTING_MEMBER_BYTES`, in user ID order, `member_count` the true
+  count, the truncation reported; `boundedMembers`), users before the page
+  that names them first, private rooms left out on request,
+  `history_log_id` clamped to the floor.
 - `replay.ts`: `replayRecords(records, listings?, users?)`, the current
   state records give (PROTOCOL §2.3), in any order and with duplicates:
   each room's latest room record or listing, each message's latest snapshot

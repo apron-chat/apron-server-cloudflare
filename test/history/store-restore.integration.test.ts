@@ -558,3 +558,35 @@ it("exports a room's whole history after a retitle: the listing's creation, not 
 	expect(report.records).toBe(archive.records.length);
 	expect(archive.records.filter((record) => record.kind === "message")).toHaveLength(2);
 });
+
+it("joins a new room's listed members with no membership record, within its accounts and caps, and exports a room's members in user ID order", async () => {
+	await withStore("restore-members", { ...CONFIG, maxPrivateRooms: 10, maxPrivateMembershipsPerUser: 1 }, (store, clock, state) => {
+		const overruns = watched(store);
+		store.restoreUsers(["ana", "ben", "cy"].map((user_id) => ({ user_id, name: user_id.toUpperCase() })));
+		const base = clock.value - 60_000;
+		const room = (room_id: string) => ({ listing: { room_id, log_id: String(base) }, joined: false });
+		store.restoreRoom(room("lounge"), []);
+		const members = (roomId: string) => state.storage.sql.exec<{ user_id: string }>("SELECT user_id FROM memberships WHERE room_id = ? ORDER BY user_id", roomId).toArray().map((row) => row.user_id);
+		const count = (roomId: string) => state.storage.sql.exec<{ member_count: number }>("SELECT member_count FROM rooms WHERE room_id = ?", roomId).one().member_count;
+		// No account here (ghost) is skipped; a repeat joins nothing more.
+		expect(store.restoreMembers("lounge", { join: ["cy", "ana", "ghost"], leave: [] })).toEqual({ joined: 2, left: 0, skipped: 1 });
+		expect(store.restoreMembers("lounge", { join: ["cy", "ana"], leave: [] })).toEqual({ joined: 0, left: 0, skipped: 0 });
+		expect(members("lounge")).toEqual(["ana", "cy"]);
+		// A complete listing that leaves out a member the records joined removes them.
+		expect(store.restoreMembers("lounge", { join: ["ben"], leave: ["cy"] })).toEqual({ joined: 1, left: 1, skipped: 0 });
+		expect(members("lounge")).toEqual(["ana", "ben"]);
+		expect(count("lounge")).toBe(2);
+		// No log record is made for them.
+		expect(state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM records WHERE room_id = 'lounge' AND kind = 'membership'").one().n).toBe(0);
+		// Exported: in user ID order, at most the limit, with the true count.
+		expect(store.exportMembers("lounge", 10)).toEqual({ members: ["ana", "ben"], count: 2 });
+		expect(store.exportMembers("lounge", 1)).toEqual({ members: ["ana"], count: 2 });
+		// A private room's cap per user: past it, skipped.
+		store.restoreRoom(room(`private_${base}`), []);
+		store.restoreRoom(room(`private_${base + 1}`), []);
+		expect(store.restoreMembers(`private_${base}`, { join: ["ana"], leave: [] })).toEqual({ joined: 1, left: 0, skipped: 0 });
+		expect(store.restoreMembers(`private_${base + 1}`, { join: ["ana"], leave: [] })).toEqual({ joined: 0, left: 0, skipped: 1 });
+		expect(() => store.restoreMembers("no-such-room", { join: ["ana"], leave: [] })).toThrow(/No room/);
+		expect(overruns).toEqual([]);
+	});
+});

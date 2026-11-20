@@ -140,12 +140,13 @@ export class BackupStore {
  * and users) to `backups`, then deletes this kind's backups past the
  * newest `keep`.
  */
-export async function writeBackup(chain: HistoryChain, server: ExportPort, backups: BackupStore, settings: BackupSettings, kind: BackupKind, options: { server: string; clock: Clock; roomIds?: string[]; header?: Partial<ArchiveHeader>; prepare: ExportOptions["prepare"] }): Promise<BackupResult> {
+export async function writeBackup(chain: HistoryChain, server: ExportPort, backups: BackupStore, settings: BackupSettings, kind: BackupKind, options: { server: string; clock: Clock; roomIds?: string[]; header?: Partial<ArchiveHeader>; prepare: ExportOptions["prepare"]; maxMembers?: number }): Promise<BackupResult> {
 	const key = backups.key(kind, options.server, options.clock.now());
 	const report = await backups.write(key, (archive) => exportArchive(chain, server, archive, {
 		clock: options.clock, header: { server: options.server, ...options.header }, ...(options.roomIds ? { roomIds: options.roomIds } : {}),
 		privateRooms: settings.privateRooms,
 		prepare: options.prepare,
+		...(options.maxMembers !== undefined ? { maxMembers: options.maxMembers } : {}),
 	}));
 	return { ...report, key, deleted: await backups.prune(kind, options.server, settings.keep) };
 }

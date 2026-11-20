@@ -2,7 +2,7 @@ import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { type ChatRecord, compareReplayed, namedUsers, remapRecord, replayRecords, IdMap } from "@apron/archive";
 import { sceneArchives } from "../../packages/archive/test/fixtures/scenes";
-import { idMapOf, normalizeIn, roundTrip } from "./support/roundtrip";
+import { exportFrom, idMapOf, importInto, normalizeIn, roundTrip, snapshot } from "./support/roundtrip";
 
 // The scene round trip (test/history/support/roundtrip.ts): each archive is
 // imported into a fresh server, exported, imported into another fresh
@@ -25,8 +25,6 @@ const FIRST_TRIP = {
 	"header": "The header names this server (`server`: its WebSocket URL, `media`: its origins); a scene's own header fields (`title`, `description`, `avatar`, `you`, `room`) are not kept.",
 	"extensions": "A scene's extension lines (`activity`, `live`) are not stored, so not exported.",
 	"presence": "Users' presence (`status`, `seen`) is not imported.",
-	"users unnamed": "A user no record names (a scene's reader, `you`) gets a placeholder, but no record names it, so it is not exported.",
-	"listing members": "Members a listing names without a membership record are not joined: memberships come from records.",
 	"server rooms": "The importing server's own rooms (a fresh server's `general`) are in its export; an archive's `general` fills it instead.",
 	"users made bare": "A record's recorded users (`from`, reaction sets' `from`, members' `user`) keep `user_id` and `name` only: roles and the like are this server's to say.",
 	"embeds defaulted": "Content policy: a message body without `embeds` gets `embeds: []`, as a post's does.",
@@ -127,18 +125,15 @@ describe("scene round trip: import, export, import, export", () => {
 			});
 			expect(unexplained).toEqual([]);
 
-			// What the first export should hold: those records, the listings without members only
-			// they name, and the users some record names, remapped as the import's report says.
+			// What the first export should hold: those records, the listings with their members
+			// (the rooms' current membership), and the users a record names or a listing lists,
+			// remapped as the import's report says. A user the scene only lists is not one of them.
 			const idMap = new IdMap(new Map(Object.entries(first.report.remapped.logIds).map(([from, to]) => [Number(from), Number(to)])), new Map(Object.entries(first.report.remapped.users)));
 			const records = taken.map((record) => remapRecord(record, idMap));
-			const listings = scene.archive.rooms.map((room) => {
-				const { members, ...rest } = room.listing;
-				if (Array.isArray(members) && members.length) note("listing members");
-				return { ...room, listing: rest };
-			});
-			const named = new Set(scene.archive.records.flatMap((record) => namedUsers(record)));
-			const users = scene.archive.users.filter((user) => named.has(user.user_id));
-			note("users unnamed", scene.archive.users.length - users.length);
+			const listings = scene.archive.rooms.map((room) => ({ ...room, listing: { ...room.listing, members: (room.listing.members ?? []).map((member) => ({ user_id: idMap.userId(member.user_id) })) } }));
+			const used = new Set([...scene.archive.records.flatMap((record) => namedUsers(record)), ...scene.archive.rooms.flatMap((room) => (room.listing.members ?? []).map((member) => member.user_id))]);
+			const users = scene.archive.users.filter((user) => used.has(user.user_id));
+			expect(first.export.archive.users.map((user) => user.user_id).sort()).toEqual([...used].map((id) => idMap.userId(id)).sort());
 			const expected = replayRecords(records, listings, users.map((user) => ({ ...user, user_id: idMap.userId(user.user_id) })));
 			// The server's own rooms the scene does not have.
 			const sceneRooms = new Set(scene.archive.rooms.map((room) => map.roomId?.(room.listing.room_id) ?? room.listing.room_id));
@@ -152,4 +147,57 @@ describe("scene round trip: import, export, import, export", () => {
 			for (const what of applied.keys()) expect(Object.keys(FIRST_TRIP)).toContain(what);
 		}, 120_000);
 	}
+
+	// Members whose joins aged out of the log: the listing carries them, and they survive every trip.
+	// ana posted, ben's join is a record, cy's join is gone, dee is only listed as a user.
+	it("keeps members whose join records aged out, and gives an account only to users the import uses", async () => {
+		const base = Date.now() - 3_600_000;
+		const lines = [
+			{ apron_archive: 1, server: "wss://old.test/" },
+			{
+				not_joined: [{ room_id: "lounge", title: "Lounge", log_id: String(base), history_log_id: String(base + 10), members: [{ user_id: "ana" }, { user_id: "ben" }, { user_id: "cy" }], member_count: 3 }],
+				users: ["ana", "ben", "cy", "dee"].map((user_id) => ({ user_id, name: user_id.toUpperCase() })),
+			},
+			{ memberships: [{ room_id: "lounge", log_id: String(base + 20), members: [{ user: { user_id: "ben", name: "BEN" }, joined: true }] }] },
+			{ messages: [{ room_id: "lounge", log_id: String(base + 30), message_id: "m1", from: { user_id: "ana", name: "ANA" }, body: { text: "hi", format: "plain", embeds: [] } }] },
+		];
+		const trip = await roundTrip("aged-joins", `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+		expect(trip.first.report).toMatchObject({ placeholders: 3, membersJoined: 2, membersSkipped: 0 });
+		expect(Object.keys(trip.first.report.users).sort()).toEqual(["ana", "ben", "cy"]);
+		for (const exported of [trip.first.export, trip.second.export]) {
+			const lounge = exported.archive.rooms.find((room) => room.listing.room_id === "lounge")!;
+			expect(lounge.listing.members).toEqual([{ user_id: "ana" }, { user_id: "ben" }, { user_id: "cy" }]);
+			expect(lounge.listing.member_count).toBe(3);
+			expect(exported.archive.users.map((user) => user.user_id).sort()).toEqual(["ana", "ben", "cy"]);
+			expect([...exported.state.members.get("lounge")!].sort()).toEqual(["ana", "ben", "cy"]);
+		}
+		const body = (text: string) => text.split("\n").filter(Boolean).slice(1);
+		expect(body(trip.second.export.text)).toEqual(body(trip.first.export.text));
+	}, 120_000);
+
+	// A room with more members than an export carries: truncated in user ID order, reported, and
+	// the truncated set goes round unchanged (the second server knows only those, so its count is theirs).
+	it("truncates a room's members past the cap, reports it, and keeps the truncated set from then on", async () => {
+		const base = Date.now() - 3_600_000;
+		const people = ["eve", "cal", "amy", "dan", "bob"];
+		const lines = [
+			{ apron_archive: 1, server: "wss://old.test/" },
+			{ not_joined: [{ room_id: "crowd", title: "Crowd", log_id: String(base), history_log_id: String(base), members: people.map((user_id) => ({ user_id })) }], users: people.map((user_id) => ({ user_id, name: user_id })) },
+		];
+		const results: Array<{ truncated: Array<{ room_id: string; members: number; kept: number }> }> = [];
+		const trip = await roundTrip("truncated-members", `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`, { maxMembers: 3 });
+		expect(trip.first.report).toMatchObject({ membersJoined: 5 });
+		const crowd = (exported: typeof trip.first.export) => exported.archive.rooms.find((room) => room.listing.room_id === "crowd")!.listing;
+		expect(crowd(trip.first.export)).toMatchObject({ members: [{ user_id: "amy" }, { user_id: "bob" }, { user_id: "cal" }], member_count: 5 });
+		expect(crowd(trip.second.export)).toMatchObject({ members: [{ user_id: "amy" }, { user_id: "bob" }, { user_id: "cal" }], member_count: 3 });
+		// The users part holds the members carried, and the truncation is reported.
+		expect(trip.first.export.archive.users.map((user) => user.user_id).sort()).toEqual(["amy", "bob", "cal"]);
+		await exportFrom("roundtrip-truncated-members-a", "roundtrip/truncated-members/report.jsonl.gz", { maxMembers: 3, report: (result) => results.push(result) });
+		expect(results[0]!.truncated).toEqual([{ room_id: "crowd", members: 5, kept: 3 }]);
+		// From the second trip on, nothing changes.
+		await importInto("roundtrip-truncated-members-c", "roundtrip/truncated-members/export-2.jsonl.gz");
+		const third = await snapshot(await exportFrom("roundtrip-truncated-members-c", "roundtrip/truncated-members/export-3.jsonl.gz", { maxMembers: 3 }));
+		const body = (text: string) => text.split("\n").filter(Boolean).slice(1);
+		expect(body(third.text)).toEqual(body(trip.second.export.text));
+	}, 120_000);
 });

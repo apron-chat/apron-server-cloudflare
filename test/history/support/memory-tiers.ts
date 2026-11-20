@@ -232,6 +232,27 @@ export class MemoryHead extends MemoryHistoryTier implements HistoryHead, Restor
 		return {};
 	}
 
+	/** Import: members a listing gave a room (restoreMembers), by room. */
+	readonly members_ = new Map<string, Set<string>>();
+
+	async restoreMembers(roomId: string, changes: { join: readonly string[]; leave: readonly string[] }): Promise<{ joined: number; left: number; skipped: number }> {
+		const set = this.members_.get(roomId) ?? new Set<string>();
+		this.members_.set(roomId, set);
+		let joined = 0;
+		let left = 0;
+		let skipped = 0;
+		for (const userId of changes.join) {
+			if (set.has(userId)) continue;
+			if (!this.people.has(userId)) skipped += 1;
+			else {
+				set.add(userId);
+				joined += 1;
+			}
+		}
+		for (const userId of changes.leave) if (set.delete(userId)) left += 1;
+		return { joined, left, skipped };
+	}
+
 	async rooms(): Promise<ArchivedRoom[]> {
 		return [...this.rooms_.values()];
 	}

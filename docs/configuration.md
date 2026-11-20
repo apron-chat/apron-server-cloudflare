@@ -881,8 +881,11 @@ r2.dev URL, no CORS, no lifecycle rules.
 A backup is the whole server's history, or some rooms', as one ARCHIVE.md
 v1 file in the `HISTORY_BLOB` bucket under `backups/`
 (`src/history/exports.ts`; [SPEC section 9](../SPEC.md#backups-and-imports)):
-every room, the users records name, and the records of every tier, as they
-are logged, gzip-compressed. It is written as a stream (an R2 multipart
+every room with its current members (at most 10,000 a room: past that a
+room's members are truncated, by `user_id`, its `member_count` keeping the
+true count, and the notice names the room), the users those members and
+the records name, and the records of every tier, as they are logged,
+gzip-compressed. It is written as a stream (an R2 multipart
 upload), and a failure leaves no object. **Backups are not encrypted**: the
 bucket being private is what keeps them so, as it does the cold tier's
 chunks (no custom domain, no r2.dev URL, no CORS, and API tokens with R2
@@ -942,7 +945,11 @@ the newest `BACKUP_KEEP` are deleted, and nothing else under `backups/`.
   most five minutes past the clock; a file with later ones is refused:
   `renumber` gives every record a new log ID
   instead. A room holding nothing past its creation (a new server's
-  `general`) is filled, not skipped. An import notes its plan before it
+  `general`) is filled, not skipped. Only users the import uses get an
+  account: those a record names and the members a new room's listing names.
+  Those members are joined, with no membership record made, so members who
+  joined long ago and have not posted since are kept; one with no account
+  here, or past the private-room cap, is left out and counted. An import notes its plan before it
   writes (one too large to note is refused: `renumber` it): run again after
   a failure, the same file finishes; `restart` abandons an unfinished import
   of another file, and the notice names the rooms it left part-restored.

@@ -15,9 +15,10 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { type ChatRecord, type CollectedArchive, type CompareIdMap, IdMap, type ImportReport, type ReplayedState, collectArchive, jsonlReader, linesOf, replayRecords, withBareUsers } from "@apron/archive";
 import { importArchive } from "../../../src/history/archive/import";
-import type { BackupStore, BackupResult } from "../../../src/history/exports";
+import { type BackupStore, type BackupResult, type BackupSettings, writeBackup } from "../../../src/history/exports";
 import type { HistoryChain } from "../../../src/history/chain";
-import { storeRestore } from "../../../src/history/store-head";
+import { storeExport, storeRestore } from "../../../src/history/store-head";
+import type { PublicRecord } from "../../../src/history/records";
 
 /** The runtime's parts a trip drives (private members, reached as the tests reach them elsewhere). */
 type Runtime = {
@@ -26,6 +27,8 @@ type Runtime = {
 	backupStore(): BackupStore;
 	archiveHeader(): { server: string; media: string[] };
 	writeBackup(backups: BackupStore, kind: "manual"): Promise<BackupResult>;
+	config: { rpId: string; backups: BackupSettings };
+	exportRecords(records: ChatRecord[]): Promise<PublicRecord[]>;
 };
 
 const MAX_IMPORT_BYTES = 64 * 1024 * 1024;
@@ -67,13 +70,19 @@ export async function importInto(name: string, key: string): Promise<ImportRepor
 /**
  * Exports server `name` as `/history export` does, then moves the backup
  * to `keep` (the same encoding, its codec metadata kept) and returns its
- * decoded text.
+ * decoded text. `maxMembers` exports with a smaller member cap (writeBackup
+ * called as the runtime calls it, with that option); otherwise the
+ * runtime's own path.
  */
-export async function exportFrom(name: string, keep: string): Promise<string> {
+export async function exportFrom(name: string, keep: string, options: { maxMembers?: number; report?: (result: BackupResult) => void } = {}): Promise<string> {
 	const result = await runInDurableObject(env.DEMO.getByName(name), (instance) => {
 		const runtime = instance as unknown as Runtime;
-		return runtime.writeBackup(runtime.backupStore(), "manual");
+		if (options.maxMembers === undefined) return runtime.writeBackup(runtime.backupStore(), "manual");
+		return writeBackup(runtime.archiveChain(), storeExport(runtime.store as unknown as Parameters<typeof storeExport>[0]), runtime.backupStore(), runtime.config.backups, "manual", {
+			server: runtime.config.rpId, clock: { now: Date.now }, header: runtime.archiveHeader(), prepare: (records) => runtime.exportRecords(records), maxMembers: options.maxMembers,
+		});
 	});
+	options.report?.(result);
 	const bucket = env.HISTORY_BLOB!;
 	const object = await bucket.get(result.key);
 	if (!object) throw new Error(`no backup at ${result.key}`);
@@ -107,14 +116,14 @@ export async function normalizeIn(name: string, records: readonly ChatRecord[]):
 }
 
 /** The whole trip for one archive's text, under a run name unique to the caller. */
-export async function roundTrip(run: string, text: string): Promise<RoundTrip> {
+export async function roundTrip(run: string, text: string, options: { maxMembers?: number } = {}): Promise<RoundTrip> {
 	const bucket = env.HISTORY_BLOB!;
 	const sceneKey = `roundtrip/${run}/scene.jsonl`;
 	await bucket.put(sceneKey, text);
 	const firstReport = await importInto(`roundtrip-${run}-a`, sceneKey);
-	const firstText = await exportFrom(`roundtrip-${run}-a`, `roundtrip/${run}/export-1.jsonl.gz`);
+	const firstText = await exportFrom(`roundtrip-${run}-a`, `roundtrip/${run}/export-1.jsonl.gz`, options);
 	const secondReport = await importInto(`roundtrip-${run}-b`, `roundtrip/${run}/export-1.jsonl.gz`);
-	const secondText = await exportFrom(`roundtrip-${run}-b`, `roundtrip/${run}/export-2.jsonl.gz`);
+	const secondText = await exportFrom(`roundtrip-${run}-b`, `roundtrip/${run}/export-2.jsonl.gz`, options);
 	return {
 		scene: await snapshot(text),
 		first: { report: firstReport, export: await snapshot(firstText) },

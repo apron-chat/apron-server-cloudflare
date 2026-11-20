@@ -127,13 +127,19 @@ export interface RestorePort {
 	 * only when it is in one of them.
 	 */
 	restoreRoom(room: ArchivedRoom, records: readonly ChatRecord[], context: RestoreContext): Promise<RestoreResult>;
+	/**
+	 * A new room's members as its listing gives them: `join` joined where
+	 * they are not (no membership record made), `leave` removed. Joins only
+	 * for accounts here, within the server's caps; the rest are `skipped`.
+	 */
+	restoreMembers(roomId: string, changes: { join: readonly string[]; leave: readonly string[] }): Promise<{ joined: number; left: number; skipped: number }>;
 	/** The running import's journal, so a retry finishes it. */
 	readonly journal: Cell<string>;
 }
 
 /** What an export needs of the server beside its records (exportArchive). */
 export interface ExportPort {
-	/** Every room, as a listing (`room_list`'s shape) with its members. */
+	/** Every room, as a listing (`room_list`'s shape) with its current members and `member_count` (at most MAX_LISTING_MEMBERS of them). */
 	rooms(): Promise<ArchivedRoom[]>;
 	/** These users' profiles, as far as they exist here. */
 	users(userIds: readonly string[]): Promise<ArchivedUser[]>;

@@ -42,6 +42,29 @@ function memoryTarget(init: { rooms?: string[]; users?: string[]; retired?: stri
 const options = (extra: Partial<PlanOptions> = {}): PlanOptions => ({ now: () => NOW, ...extra });
 
 describe("planImport", () => {
+	it("makes accounts only for users the import uses: named by a record, or listed as a new room's member", async () => {
+		// ana posted, ben's join is a record, cy is a member the listing names (his join aged out), dee is only listed as a user.
+		const join = (log: number, roomId: string, userId: string): ChatRecord => ({
+			room_id: roomId, log_id: log, commit_ms: log, kind: "membership",
+			record_json: JSON.stringify({ room_id: roomId, log_id: String(log), members: [{ user: { user_id: userId }, joined: true }] }),
+		});
+		const plan = await planImport(
+			archive(
+				[join(60, "general", "ben"), message(70, "general", "ana"), message(80, "old", "eli")],
+				[room("general", { history_log_id: "50", members: [{ user_id: "ana" }, { user_id: "ben" }, { user_id: "cy" }] }), room("old", { members: [{ user_id: "fay" }] })],
+				["ana", "ben", "cy", "dee", "eli", "fay"].map((user_id) => ({ user_id, name: user_id.toUpperCase() })),
+			),
+			memoryTarget({ rooms: ["old"] }),
+			options(),
+		);
+		expect(Object.keys(plan.report.users).sort()).toEqual(["ana", "ben", "cy"]);
+		expect(plan.placeholders.map((user) => user.user_id).sort()).toEqual(["ana", "ben", "cy"]);
+		// A placeholder keeps its profile from the file's users part.
+		expect(plan.placeholders.find((user) => user.user_id === "cy")).toMatchObject({ name: "CY" });
+		// The listing goes to the writer with its members, which it joins (importArchive's membersOf).
+		expect(plan.rooms[0]!.listing.members).toEqual([{ user_id: "ana" }, { user_id: "ben" }, { user_id: "cy" }]);
+	});
+
 	it("orders new rooms top-level first, so a thread's parent is restored before it whatever their names", async () => {
 		// `battleplan` sorts before its parent `security`: restored in name order, the thread would come first.
 		const plan = await planImport(

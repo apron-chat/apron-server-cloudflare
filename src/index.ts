@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, thresholdRecords } from "./budget";
+import { MAX_LISTING_MEMBERS } from "@apron/archive";
 import { type ImportReport, importArchive } from "./history/archive/import";
 import { archiveChain, blobStoreOf, buildHistoryChain, D1_TIER, d1Off, HEAD_TIER, HISTORY_CODECS, historyLayout, layoutTiered } from "./history/config";
 import { type D1Off, detailLines, statusLines } from "./history/status";
@@ -727,6 +728,8 @@ function importNotice(report: ImportReport): string {
 		report.collisions ? `Left ${report.collisions} messages as they are here: another message holds their ID.` : "",
 		Object.keys(report.remapped.logIds).length ? `Moved ${Object.keys(report.remapped.logIds).length} log IDs that other records hold.` : "",
 		report.placeholders ? `${report.dryRun ? "Would make" : "Made"} ${report.placeholders} placeholder accounts.` : "",
+		report.membersJoined ? `Joined ${report.membersJoined} members the rooms' listings name.` : "",
+		report.membersSkipped ? `Left out ${report.membersSkipped} listed members: no account here, or past a cap.` : "",
 		users.length ? `Users: ${users.join(", ")}.` : "",
 	].filter(Boolean).join("\n");
 }
@@ -9157,7 +9160,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 					// A failing store: said plainly; an upload begun is aborted.
 					throw { name: "invalid_params", message: error instanceof Error ? error.message : String(error) } satisfies ProtocolError;
 				}
-				done(`Backed up ${result.rooms} rooms, ${result.users} users and ${result.records} records to \`${result.key}\`.`);
+				const truncated = result.truncated.length
+					? `\nMembers truncated in ${result.truncated.length} rooms (${result.truncated.map((room) => `\`${room.room_id}\` ${room.kept} of ${room.members}`).join(", ")}): a listing carries at most ${MAX_LISTING_MEMBERS} members.`
+					: "";
+				done(`Backed up ${result.rooms} rooms, ${result.users} users and ${result.records} records to \`${result.key}\`.${truncated}`);
 				return;
 			}
 			case "import": {

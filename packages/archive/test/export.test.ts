@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { type ArchiveSource, exportArchive, isPrivateRoom } from "../src/export.ts";
-import { jsonlWriter, readArchive } from "../src/format.ts";
+import { type ArchiveSource, MAX_LISTING_MEMBER_BYTES, MAX_LISTING_MEMBERS, boundedMembers, exportArchive, isPrivateRoom } from "../src/export.ts";
+import { MAX_READ_LINE_BYTES, jsonlWriter, readArchive } from "../src/format.ts";
 import type { ChatRecord } from "../src/records.ts";
 import type { ArchivedRoom, ArchivedUser } from "../src/types.ts";
 
@@ -67,7 +67,7 @@ describe("exportArchive", () => {
 		expect(archive.records.map((record) => record.log_id)).toEqual([10, 11, 12, 60]);
 		// Members first, then each page's new names, never a user twice.
 		expect(source.asked).toEqual([["ada"], ["bob"], ["cy"]]);
-		expect(report).toEqual({ rooms: 3, users: 3, records: 4, sections: ["history"] });
+		expect(report).toEqual({ rooms: 3, users: 3, records: 4, truncated: [], sections: ["history"] });
 	});
 
 	it("leaves private rooms out when asked, and keeps only the rooms asked for", async () => {
@@ -90,5 +90,31 @@ describe("exportArchive", () => {
 			prepare: async (page) => page.map((record) => ({ ...record, record_json: record.record_json.replace(/"m(\d+)"/, '"prepared $1"') })),
 		});
 		expect(readArchive(text).records.map((record) => JSON.parse(record.record_json).body.text)).toEqual(["prepared 10", "prepared 11", "prepared 12", "prepared 60"]);
+	});
+
+	it("bounds a listing's members: user ID order, at most the cap, member_count the true count, the truncation reported", async () => {
+		const members = ["cy", "ada", "bob", "dee", "eve"].map((user_id) => ({ user_id }));
+		const big: ArchivedRoom[] = [{ listing: { room_id: "big", log_id: "1", members, member_count: 7 }, joined: false }, { listing: { room_id: "small", log_id: "2", members: [{ user_id: "zed" }] }, joined: false }];
+		const { text, report } = await exported(memorySource(big, [], []), { maxMembers: 3 });
+		const listed = Object.fromEntries(readArchive(text).rooms.map((room) => [room.listing.room_id, room.listing]));
+		expect(listed.big).toMatchObject({ members: [{ user_id: "ada" }, { user_id: "bob" }, { user_id: "cy" }], member_count: 7 });
+		expect(listed.small).toMatchObject({ members: [{ user_id: "zed" }], member_count: 1 });
+		expect(report.truncated).toEqual([{ room_id: "big", members: 7, kept: 3 }]);
+		// A listing without members stays without.
+		expect(boundedMembers({ room_id: "none" })).toEqual({ listing: { room_id: "none" } });
+	});
+
+	it("keeps a listing's members within the bytes a reader takes on one line, whatever their IDs", () => {
+		const long = Array.from({ length: MAX_LISTING_MEMBERS }, (_, index) => ({ user_id: `${String(index).padStart(5, "0")}${"x".repeat(251)}` }));
+		const { listing, truncated } = boundedMembers({ room_id: "wide", members: long });
+		const bytes = new TextEncoder().encode(JSON.stringify(listing.members)).length;
+		expect(bytes).toBeLessThanOrEqual(MAX_LISTING_MEMBER_BYTES);
+		expect(truncated).toMatchObject({ members: MAX_LISTING_MEMBERS });
+		expect(truncated!.kept).toBeLessThan(MAX_LISTING_MEMBERS);
+		// IDs of 64 bytes, the longest this server issues: the count bounds them, and the line fits.
+		const issued = Array.from({ length: MAX_LISTING_MEMBERS + 5 }, (_, index) => ({ user_id: `${String(index).padStart(6, "0")}${"y".repeat(58)}` }));
+		const bounded = boundedMembers({ room_id: "full", title: "t".repeat(8 * 1024), members: issued });
+		expect(bounded.truncated).toEqual({ room_id: "full", members: MAX_LISTING_MEMBERS + 5, kept: MAX_LISTING_MEMBERS });
+		expect(new TextEncoder().encode(JSON.stringify(bounded.listing)).length).toBeLessThan(MAX_READ_LINE_BYTES);
 	});
 });

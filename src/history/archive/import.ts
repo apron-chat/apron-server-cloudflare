@@ -14,12 +14,13 @@
  * to each tier below it that already holds copies that far. A dry run stops
  * there and returns the plan's report. Then the plan's state is journaled
  * (so a retry finishes it), placeholders are made, and each new room is
- * restored at the head (with its records from the head's floor on) and its
- * older records appended to the tiers below.
+ * restored at the head (with its records from the head's floor on), then
+ * given the members its listing names (membersOf), and its older records
+ * appended to the tiers below.
  */
 
 import {
-	type ArchiveReader, type ChatRecord, type CollectedArchive, type ImportReport, type ImportState, type ImportTarget, type Provenance, archiveIdentity, collectArchive, parseImportState, planImport,
+	type ArchiveReader, type ChatRecord, type CollectedArchive, type ImportReport, type ImportState, type ImportTarget, type Provenance, type RoomListing, archiveIdentity, collectArchive, parseImportState, planImport,
 } from "@apron/archive";
 import { withoutOutputRefs } from "../../content/output-ref";
 import { USER_ID_RULES } from "../../user-ids";
@@ -78,6 +79,31 @@ function entriesOf(record: ChatRecord): number {
 	if (record.kind !== "reactions" && record.kind !== "membership") return 0;
 	const value = JSON.parse(record.record_json) as { reactions?: unknown[]; members?: unknown[] };
 	return (value.reactions ?? value.members ?? []).length;
+}
+
+/**
+ * The membership changes a new room's listing makes, once its records are
+ * restored: the listing is the archive's snapshot of current state when it
+ * was written, and its records are history. Every member it names is
+ * joined; a member the import's own membership records name that a
+ * complete listing leaves out (a hand-made file's disagreement) is removed.
+ * A truncated listing (`member_count` above its members: MAX_LISTING_MEMBERS)
+ * only adds: what it leaves out is unknown, not absent. A listing without
+ * `members` (a third-party archive's) changes nothing: the records decide.
+ */
+export function membersOf(listing: RoomListing, records: readonly ChatRecord[]): { join: string[]; leave: string[] } | undefined {
+	if (!Array.isArray(listing.members)) return undefined;
+	const join = [...new Set(listing.members.map((member) => member.user_id).filter((id): id is string => typeof id === "string"))];
+	const complete = !(typeof listing.member_count === "number" && listing.member_count > listing.members.length);
+	if (!complete) return { join, leave: [] };
+	const listed = new Set(join);
+	const named = new Set<string>();
+	for (const record of records) {
+		if (record.kind !== "membership" || record.room_id !== listing.room_id) continue;
+		const value = JSON.parse(record.record_json) as { members?: Array<{ user?: { user_id?: unknown } }> };
+		for (const entry of value.members ?? []) if (typeof entry.user?.user_id === "string") named.add(entry.user.user_id);
+	}
+	return { join, leave: [...named].filter((id) => !listed.has(id)) };
 }
 
 /** Records in calls of at most `records` records and `entries` entries; a record over `entries` goes alone. */
@@ -210,6 +236,18 @@ export async function importArchive(chain: HistoryChain, restore: RestorePort, i
 		for (const result of results) {
 			report.collisions += result.collided ?? 0;
 			report.rejected += result.rejected ?? 0;
+		}
+		// Then the members its listing names (records the room has in every tier count).
+		const changes = membersOf(listing, plan.records);
+		if (changes) {
+			const per = options.entries ?? 1_000;
+			const all = [...changes.join.map((id) => ({ id, join: true })), ...changes.leave.map((id) => ({ id, join: false }))];
+			for (let start = 0; start < all.length; start += per) {
+				const slice = all.slice(start, start + per);
+				const result = await restore.restoreMembers(listing.room_id, { join: slice.filter((entry) => entry.join).map((entry) => entry.id), leave: slice.filter((entry) => !entry.join).map((entry) => entry.id) });
+				report.membersJoined += result.joined;
+				report.membersSkipped += result.skipped;
+			}
 		}
 	}
 	for (let index = 1; index < view.tiers.length; index += 1) {

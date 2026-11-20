@@ -3880,6 +3880,65 @@ export class Store {
   }
 
   /**
+   * Export: a room's current members (registered: guests' memberships are
+   * not stored), in user ID order, at most `limit`, and how many it has in
+   * all. Charged to maintenance.
+   */
+  exportMembers(roomId: string, limit: number, now = this.clock.now()): { members: string[]; count: number } {
+    this.ensureReady();
+    const max = Math.max(0, Math.floor(limit));
+    return this.reserved({ reads: 8 + max }, true, now, () => {
+      const members = max ? this.rawRows<{ user_id: string }>("SELECT user_id FROM memberships WHERE room_id = ? ORDER BY user_id LIMIT ?", roomId, max).map((row) => row.user_id) : [];
+      // A full page may be truncated: the room row's count (one read) says how many there are.
+      const count = members.length < max ? members.length : Math.max(members.length, integerColumn(this.rawRows<{ member_count: number }>("SELECT member_count FROM rooms WHERE room_id = ? LIMIT 1", roomId)[0]?.member_count));
+      return { members, count };
+    });
+  }
+
+  /**
+   * Import: a new room's members as its listing gives them (the archive's
+   * snapshot of current state when it was written; its membership records
+   * are history): `join` are joined where they are not, with no membership
+   * record made (as a membership is kept after its record leaves the log),
+   * and `leave` (members the import's own records joined that a complete
+   * listing leaves out) are removed. Joins only for identities here, and in
+   * a private room only within maxPrivateMembershipsPerUser; the others are
+   * counted as `skipped`. At most RESTORE_ENTRIES_BATCH users a call;
+   * charged to maintenance. Repeating a call changes nothing.
+   */
+  restoreMembers(roomId: string, changes: { join: readonly string[]; leave: readonly string[] }, now = this.clock.now()): { joined: number; left: number; skipped: number } {
+    this.ensureReady();
+    const size = changes.join.length + changes.leave.length;
+    if (size > RESTORE_ENTRIES_BATCH) throw new StoreError("invalid_params", `At most ${RESTORE_ENTRIES_BATCH} members are restored a call`);
+    const isPrivate = isPrivateRoomId(roomId);
+    const cost = { reads: 16 + 4 * size + (isPrivate ? changes.join.length * this.userRoomsReads() : 0), writes: 8 + 3 * size };
+    return this.reserved(cost, true, now, () => this.transaction(() => {
+      if (!this.roomRow(roomId)) throw new StoreError("invalid_params", `No room ${roomId} to restore members into`.slice(0, 200));
+      const member = (userId: string) => this.rawRows("SELECT 1 FROM memberships WHERE room_id = ? AND user_id = ? LIMIT 1", roomId, userId).length > 0;
+      let joined = 0;
+      let left = 0;
+      let skipped = 0;
+      for (const userId of new Set(changes.join)) {
+        if (member(userId)) continue;
+        if (!this.identityRow(userId) || (isPrivate && this.privateMembershipCount(userId) >= this.config.maxPrivateMembershipsPerUser)) {
+          skipped += 1;
+          continue;
+        }
+        this.rawExec("INSERT INTO memberships (room_id, user_id) VALUES (?, ?)", roomId, userId);
+        joined += 1;
+      }
+      for (const userId of new Set(changes.leave)) {
+        if (!member(userId)) continue;
+        this.rawExec("DELETE FROM memberships WHERE room_id = ? AND user_id = ?", roomId, userId);
+        this.rawExec("DELETE FROM read_cursors WHERE user_id = ? AND room_id = ?", userId, roomId);
+        left += 1;
+      }
+      if (joined || left) this.rawExec("UPDATE rooms SET member_count = MAX(0, member_count + ?) WHERE room_id = ?", joined - left, roomId);
+      return { joined, left, skipped };
+    }));
+  }
+
+  /**
    * Import: makes each archived user that has no identity here
    * and whose ID is not retired a placeholder account, as
    * createInvitedIdentity makes an account without a credential: the
@@ -3887,7 +3946,8 @@ export class Store {
    * its `ext` if it fits as a `me` write's would (else none), and the one
    * role `unclaimed` (UNCLAIMED_ROLE); the archive's roles are not imported,
    * as roles grant powers here. A placeholder joins no room by itself: its
-   * memberships come with the rooms' records (restoreRoom). IDs a guest or
+   * memberships come with the rooms' records (restoreRoom) and listings
+   * (restoreMembers). IDs a guest or
    * an owner's bot has, or that an admin could not issue, are skipped.
    * Each placeholder counts against registeredIdentityCount; a call that
    * would pass it is refused whole, before anything is written. At most

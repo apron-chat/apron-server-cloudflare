@@ -14,7 +14,7 @@
  * The chain's state is state.ts over Store.historyStatePort().
  */
 
-import type { ArchivedRoom, ArchivedUser } from "@apron/archive";
+import { type ArchivedRoom, type ArchivedUser, MAX_LISTING_MEMBERS } from "@apron/archive";
 import { type ChatRecord, type HistoryQuery, type QueuedRewrite, type RecordRange, type TierStats, toRange } from "./records";
 import type { ExportPort, HistoryHead, RestoreContext, RestorePort, RestoreResult } from "./tier";
 
@@ -46,6 +46,7 @@ export interface RestoreStore {
 	readonly content: { record(record: ChatRecord): { ok: true; value: ChatRecord } | { ok: false } };
 	restoreUsers(users: readonly ArchivedUser[]): void;
 	restoreRoom(room: ArchivedRoom, records: readonly ChatRecord[], now?: number, options?: { rooms?: readonly string[] }): RestoreResult;
+	restoreMembers(roomId: string, changes: { join: readonly string[]; leave: readonly string[] }): { joined: number; left: number; skipped: number };
 	historyImportJournal(): string | undefined;
 	setHistoryImportJournal(value: string | null): void;
 }
@@ -54,6 +55,7 @@ export interface RestoreStore {
 export interface ExportStore {
 	listRooms(now?: number, options?: { maintenance?: boolean; withPrivate?: boolean }): Array<{ room_id: string }>;
 	getIdentity(userId: string): { userId: string; name: string; avatar?: string; roles: string[]; ext?: Record<string, unknown> } | null;
+	exportMembers(roomId: string, limit: number): { members: string[]; count: number };
 }
 
 export function storeHead(name: string, store: HeadStore): HistoryHead {
@@ -97,6 +99,7 @@ export function storeRestore(store: RestoreStore): RestorePort {
 		},
 		restoreUsers: async (users) => store.restoreUsers(users),
 		restoreRoom: async (room: ArchivedRoom, records: readonly ChatRecord[], context: RestoreContext) => store.restoreRoom(room, records, undefined, { rooms: context.rooms }),
+		restoreMembers: async (roomId, changes) => store.restoreMembers(roomId, changes),
 		journal: {
 			get: async () => store.historyImportJournal(),
 			set: async (value) => store.setHistoryImportJournal(value),
@@ -106,12 +109,27 @@ export function storeRestore(store: RestoreStore): RestorePort {
 
 export function storeExport(store: ExportStore): ExportPort {
 	return {
-		/** Every room, as `room_list` lists it, private ones included (an export is the server's, not a member's view). */
+		/**
+		 * Every room, as `room_list` lists it, private ones included (an
+		 * export is the server's, not a member's view), with its current
+		 * members (registered ones: guests' are not kept) and how many it has:
+		 * a membership outlives its record in the log, so the records alone
+		 * would lose members who joined long ago. At most MAX_LISTING_MEMBERS
+		 * are read; the export bounds them further (boundedMembers).
+		 */
 		async rooms() {
 			return store.listRooms(undefined, { maintenance: true, withPrivate: true }).map((room) => {
-				const { latest_log_id, history_log_id, ...rest } = room as Record<string, unknown> & { room_id: string };
-				// Members come from the membership records the export carries.
-				return { listing: { ...rest, room_id: room.room_id, ...(typeof latest_log_id === "string" ? { latest_log_id } : {}), ...(typeof history_log_id === "string" || history_log_id === null ? { history_log_id } : {}) }, joined: false };
+				const { latest_log_id, history_log_id, members: _members, member_count: _count, ...rest } = room as Record<string, unknown> & { room_id: string };
+				const { members, count } = store.exportMembers(room.room_id, MAX_LISTING_MEMBERS);
+				return {
+					listing: {
+						...rest, room_id: room.room_id,
+						...(typeof latest_log_id === "string" ? { latest_log_id } : {}),
+						...(typeof history_log_id === "string" || history_log_id === null ? { history_log_id } : {}),
+						members: members.map((user_id) => ({ user_id })), member_count: count,
+					},
+					joined: false,
+				};
 			});
 		},
 		async users(userIds) {
