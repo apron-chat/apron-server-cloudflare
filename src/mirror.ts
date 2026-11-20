@@ -400,7 +400,11 @@ export class RemoteRooms {
 						// §4.9.2: a push without `message` is `low`; a wake older than the mirror's own check is worth nothing.
 						headers: { Authorization: `Bearer ${registration.token}`, "Content-Type": "application/json", TTL: String(WAKE_TTL_SECONDS), Urgency: "low" },
 						body: JSON.stringify(registration.push_id ? { push_id: registration.push_id } : {}),
-					}).then((response) => response.body?.cancel(), (error) => {
+					}).then(async (response) => {
+						await response.body?.cancel();
+						// The mirror no longer knows it (§4.9.1): the registration goes, unless replaced meanwhile.
+						if ((response.status === 404 || response.status === 410) && this.wakeRegistrations?.get(linkId) === registration) await this.forgetWake(linkId);
+					}, (error) => {
 						console.warn(JSON.stringify({ event: "remote_wake_failed", link: linkId, error: error instanceof Error ? error.message : String(error) }));
 					});
 				}, Math.max(0, slot.last + WAKE_INTERVAL_MS - Date.now()));

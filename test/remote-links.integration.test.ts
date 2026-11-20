@@ -421,7 +421,7 @@ it('makes and saves a thread of a shared room as a remote user, and joins the li
 	} finally { admin.close(); link.close(); }
 });
 
-it('takes a link\'s relay wake push for ext:remote, and nobody else\'s', async () => {
+it('takes a link\'s relay wake push for ext:remote, and nobody else\'s, until its url answers 404', async () => {
 	const { admin, link, roomId } = await linked('ws://127.0.0.1:8097/ws');
 	try {
 		// Only to the link's own server (127.0.0.1:8097 here), http there being a loopback host.
@@ -447,8 +447,27 @@ it('takes a link\'s relay wake push for ext:remote, and nobody else\'s', async (
 		expect(Object.fromEntries(['authorization', 'content-type', 'ttl', 'urgency'].map((name) => [name, wake.headers.get(name)])))
 			.toEqual({ authorization: 'Bearer t0ken', 'content-type': 'application/json', ttl: '300', urgency: 'low' });
 		expect(JSON.parse(wake.body)).toEqual({ push_id: 'p1' });
+		// A url that answers 404 loses its registration: no more wakes go there.
+		vi.restoreAllMocks();
+		const gone: string[] = [];
+		vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
+			gone.push(input instanceof Request ? input.url : String(input));
+			return new Response(null, { status: 404 });
+		});
+		const registered = () => runInDurableObject(stub(), async (_instance, state) => [...(await state.storage.list<{ url: string }>({ prefix: 'remote-wake:' })).values()].some((value) => value.url === 'http://127.0.0.1:8097/remote/wake/abcdefgh'));
+		expect(await registered()).toBe(true);
+		// Past the 2-second spacing of one link's wakes.
+		await new Promise((resolve) => setTimeout(resolve, 2_100));
+		expect((await request(admin, unique('post2'), 'message', { room_id: roomId, body: { text: 'gone?' } })).result.message_id).toBeDefined();
+		for (let i = 0; i < 100 && (!gone.length || await registered()); i += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(gone).toEqual(['http://127.0.0.1:8097/remote/wake/abcdefgh']);
+		expect(await registered()).toBe(false);
+		await new Promise((resolve) => setTimeout(resolve, 2_100));
+		expect((await request(admin, unique('post3'), 'message', { room_id: roomId, body: { text: 'gone' } })).result.message_id).toBeDefined();
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		expect(gone).toHaveLength(1);
 	} finally { vi.restoreAllMocks(); admin.close(); link.close(); }
-});
+}, 20_000);
 
 it('changes nothing while REMOTE_SELF is unset: no capability, no /remote, links act as bots, ext.remote dropped', async () => {
 	const { admin, link, linkId, roomId } = await linked('ws://127.0.0.1:8098/ws');
