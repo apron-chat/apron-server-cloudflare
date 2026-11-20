@@ -27,7 +27,7 @@ import { hostListAllowed } from "./config";
 import { keepAppend, keepLast, liveTextString, type LiveKind } from "./live-text";
 import type { AccountUsageSnapshot } from "./account-usage";
 import type { ChatRecord, HistoryQuery, QueuedRewrite, Rewrite } from "./history/records";
-import { type ChainStatePort, MAX_KEPT_REWRITES } from "./history/state";
+import { type ChainStatePort, MAX_KEPT_GROUPS } from "./history/state";
 import { type ArchivedRoom, type ArchivedUser, parseLogId, type ReplayedMembership, replayRecords, type RoomListing, roomClientFields, type ValidRecord, validateRecord, withClientUsers } from "@apron/archive";
 import { ADMIN_USER_ID, restorableUserId } from "./user-ids";
 import { MAX_TERMINAL_OUTPUT_JSON_BYTES, type TerminalOutputRef, outputRef } from "./content/output-ref";
@@ -3760,7 +3760,7 @@ export class Store {
   /**
    * The history chain's state, as plain values (src/history/state.ts keeps
    * its rules): values under `history:tier:`, `history:link:` and
-   * `history:kept:` (at most MAX_KEPT_REWRITES read a call), the hot
+   * `history:kept:` (at most MAX_KEPT_GROUPS read a call), the hot
    * and published floors, and the copy marker, which cleanup stops at
    * (runCleanup).
    */
@@ -3795,8 +3795,8 @@ export class Store {
       entries: (prefix) => {
         this.ensureReady();
         const end = prefix.slice(0, -1) + String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1);
-        return this.reserved({ reads: 16 + MAX_KEPT_REWRITES }, true, this.clock.now(), () => this.rawRows<{ key: string; value: string }>(
-          "SELECT key, value FROM _meta WHERE key >= ? AND key < ? ORDER BY key LIMIT ?", owned(prefix), end, MAX_KEPT_REWRITES,
+        return this.reserved({ reads: 16 + MAX_KEPT_GROUPS }, true, this.clock.now(), () => this.rawRows<{ key: string; value: string }>(
+          "SELECT key, value FROM _meta WHERE key >= ? AND key < ? ORDER BY key LIMIT ?", owned(prefix), end, MAX_KEPT_GROUPS,
         ).map((row) => [row.key, row.value] as [string, string]));
       },
     };

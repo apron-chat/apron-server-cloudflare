@@ -16,10 +16,10 @@
  * from it does.
  */
 
-import { authoredMessages, purgedRecord } from "@apron/archive";
+import { purgedRecord } from "@apron/archive";
 import { type ChainSnapshot, type ChainView, type ReadPart, type Step, type WorkStep, arrivedThrough, chainView, copyNow, mergePages, planRead, planStep } from "./link";
 import { type ChatRecord, type Clock, type HistoryQuery, type KeptRewrite, type QueuedRewrite, type Retention, type Rewrite, type TierStats, logIds, rewritten, toRange, withKept } from "./records";
-import { MAX_KEPT_REWRITES } from "./state";
+import { MAX_KEPT_GROUPS } from "./state";
 import { type Stall, stallAlert, stallCleared, stallFailed } from "./stall";
 import { type ChainStateStore, type HistoryHead, type HistoryTier, type LinkState, TIER_METHODS, type TierFloor } from "./tier";
 
@@ -337,11 +337,20 @@ export class HistoryChain {
 			const through = view.links[link].through;
 			if (through >= view.tiers[below].floor) {
 				const kept = await this.kept(below);
-				if (!kept.some((each) => each.seq === seq) && kept.length >= MAX_KEPT_REWRITES) {
-					throw new Error(`${tier.name} keeps ${MAX_KEPT_REWRITES} rewrites already: it must trim before it takes another /purge or /rename`);
+				// Kept already (a retried delivery): nothing to do.
+				if (!kept.some((group) => group.first <= seq && seq <= group.seq)) {
+					const last = kept[kept.length - 1];
+					// Delivered while the tier holds what it held for the last group: that group grows.
+					if (last && last.through === through) {
+						await this.state.keep(tier.name, { ...last, seq, rewrites: [...last.rewrites, entry.rewrite] });
+					} else {
+						if (kept.length >= MAX_KEPT_GROUPS) {
+							throw new Error(`${tier.name} keeps ${MAX_KEPT_GROUPS} groups of rewrites already: it must trim before it takes another /purge or /rename`);
+						}
+						await this.state.keep(tier.name, { first: seq, seq, through, rewrites: [entry.rewrite] });
+					}
+					this.keptCache.delete(below);
 				}
-				await this.state.keep(tier.name, { seq, rewrite: entry.rewrite, through });
-				this.keptCache.delete(below);
 			}
 		}
 		await this.state.saveLink(this.tiers[link].name, { delivered: seq });
@@ -426,19 +435,13 @@ export class HistoryChain {
 			const rewrites = coming.map((entry) => entry.rewrite);
 			return rewrites.length ? (records) => rewritten(records, rewrites) : undefined;
 		}
-		const kept: KeptRewrite[] = [...await this.kept(index), ...coming.map((entry) => ({ ...entry, through: Number.MAX_SAFE_INTEGER }))];
+		const kept: KeptRewrite[] = [
+			...await this.kept(index),
+			...(coming.length ? [{ first: coming[0].seq, seq: coming[coming.length - 1].seq, through: Number.MAX_SAFE_INTEGER, rewrites: coming.map((entry) => entry.rewrite) }] : []),
+		];
 		if (!kept.length) return undefined;
-		return (records) => {
-			if (purged) {
-				// Each purge's messages as this tier holds them, its earlier rewrites applied (a rename may come first).
-				for (const [at, entry] of kept.entries()) {
-					if (entry.rewrite.into !== null) continue;
-					const held = withKept(records, kept.slice(0, at)).filter((record) => record.log_id <= entry.through);
-					for (const id of authoredMessages(held, [entry.rewrite.user])) purged.add(id);
-				}
-			}
-			return withKept(records, kept);
-		};
+		// With `purged`, each purge's messages as this tier holds them (its earlier rewrites applied) are noted as they go.
+		return (records) => withKept(records, kept, purged);
 	}
 
 	/**

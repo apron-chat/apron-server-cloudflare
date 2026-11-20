@@ -100,13 +100,29 @@ export interface QueuedRewrite {
 }
 
 /**
- * A rewrite delivered to a tier that takes none (the cold tier): kept, and
- * applied to what that tier holds whenever it is read, up to `through`, the
- * newest log ID it held when the rewrite reached it. What it took later came
- * from a tier that had applied the rewrite already.
+ * Rewrites delivered to a tier that takes none (the cold tier), kept
+ * together: those delivered, in log order (seqs `first` through `seq`),
+ * while it held the same newest log ID (`through`). Each is applied to
+ * what that tier holds whenever it is read, up to `through`; what it took
+ * later came from a tier that had applied them already. Rewrites arrive
+ * far more often than the tier changes (a chunk at a time), so the groups
+ * stay few however many /purge and /rename it keeps.
  */
-export interface KeptRewrite extends QueuedRewrite {
+export interface KeptRewrite {
+	first: number;
+	seq: number;
 	through: number;
+	rewrites: Rewrite[];
+}
+
+/** Every JSON string literal in `json`, as JSON.stringify writes it. */
+function stringsOf(json: string): Set<string> {
+	const out = new Set<string>();
+	for (const match of json.matchAll(/"(?:[^"\\]|\\.)*"/g)) {
+		const literal = match[0];
+		out.add(literal.includes("\\") ? JSON.stringify(JSON.parse(literal) as string) : literal);
+	}
+	return out;
 }
 
 /**
@@ -117,18 +133,53 @@ export interface KeptRewrite extends QueuedRewrite {
  * ID changes. Nothing is inferred across records, so a page shows the same
  * whatever records share it (a reaction set on a purged message only this
  * tier holds stays, unless the purge names that message). Only records at
- * or below each rewrite's `through` are touched.
+ * or below each group's `through` are touched.
+ *
+ * A record is parsed only for the rewrites that name one of its strings (a
+ * user's or a message's ID), found from its JSON's string literals once, so
+ * the work is the records' size, not their number times the rewrites'.
+ * With `purged`, each purged user's messages it drops are added to it (an
+ * export drops the reaction sets on them wherever they are).
  */
-export function withKept(records: readonly ChatRecord[], kept: readonly KeptRewrite[]): ChatRecord[] {
-	let out = [...records];
-	for (const { rewrite, through } of kept) {
-		out = out.flatMap((record) => {
-			if (record.log_id > through) return [record];
-			const json = rewrite.into === null ? purgedRecord(record, [rewrite.user], rewrite.messages ?? []) : renamedRecord(record, rewrite.user, rewrite.into);
-			return json === null ? [] : [json === record.record_json ? record : { ...record, record_json: json }];
-		});
+export function withKept(records: readonly ChatRecord[], kept: readonly KeptRewrite[], purged?: Set<string>): ChatRecord[] {
+	const entries = kept.flatMap((group) => group.rewrites.map((rewrite) => ({ rewrite, through: group.through })));
+	if (!entries.length) return [...records];
+	const naming = new Map<string, number[]>();
+	for (const [index, { rewrite }] of entries.entries()) {
+		for (const id of [rewrite.user, ...(rewrite.into === null ? rewrite.messages ?? [] : [])]) {
+			const key = JSON.stringify(id);
+			const list = naming.get(key);
+			if (list) list.push(index);
+			else naming.set(key, [index]);
+		}
 	}
-	return out;
+	const named = (json: string, after: number): number[] => {
+		const found = new Set<number>();
+		for (const literal of stringsOf(json)) for (const index of naming.get(literal) ?? []) if (index > after) found.add(index);
+		return [...found].sort((a, b) => a - b);
+	};
+	return records.flatMap((original) => {
+		let record = original;
+		let pending = named(record.record_json, -1);
+		while (pending.length) {
+			const index = pending.shift()!;
+			const { rewrite, through } = entries[index];
+			if (record.log_id > through) continue;
+			if (rewrite.into === null) {
+				if (purged) for (const id of authoredMessages([record], [rewrite.user])) purged.add(id);
+				const json = purgedRecord(record, [rewrite.user], rewrite.messages ?? []);
+				if (json === null) return [];
+				if (json !== record.record_json) record = { ...record, record_json: json };
+			} else {
+				const json = renamedRecord(record, rewrite.user, rewrite.into);
+				if (json === record.record_json) continue;
+				record = { ...record, record_json: json };
+				// Renamed, it names the new ID: the rewrites after this one are found again.
+				pending = named(record.record_json, index);
+			}
+		}
+		return [record];
+	});
 }
 
 /** The records a count keeps under a threshold: `percent` of `limit`, at least one; 0 without a limit. */

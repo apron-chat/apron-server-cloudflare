@@ -757,7 +757,7 @@ describe("model-based regressions", () => {
 		expect(await namesCy(coldTier)).toBe(true);
 		expect(await head.rewrites.list()).toEqual([]);
 		expect((await chain.view()).links.map((each) => each.delivered)).toEqual([1, 1]);
-		expect((await state.kept("cold")).map((entry) => entry.rewrite.user)).toEqual(["cy"]);
+		expect((await state.kept("cold")).flatMap((group) => group.rewrites.map((rewrite) => rewrite.user))).toEqual(["cy"]);
 		model.apply({ user: "cy", into: null }, { floor: await chain.publishedFloor(), kept });
 		const served = await history(chain, "general", 3);
 		expect(served.some((record) => record.record_json.includes('"cy"'))).toBe(false);
@@ -767,10 +767,41 @@ describe("model-based regressions", () => {
 		await settle(chain);
 		await head.rename("ada-2", "ada-3");
 		await settle(chain);
-		expect((await state.kept("cold")).map((entry) => `${entry.rewrite.user}>${entry.rewrite.into}`)).toEqual(["cy>null", "ada>ada-2", "ada-2>ada-3"]);
+		expect((await state.kept("cold")).flatMap((group) => group.rewrites.map((rewrite) => `${rewrite.user}>${rewrite.into}`))).toEqual(["cy>null", "ada>ada-2", "ada-2>ada-3"]);
+		// Delivered while the cold tier held the same records: one group, not one a rewrite.
+		expect(await state.kept("cold")).toHaveLength(1);
 		const renamed = await history(chain, "general", 4);
 		expect(renamed.some((record) => record.record_json.includes('"ada"') || record.record_json.includes('"ada-2"'))).toBe(false);
 		expect(renamed.filter((record) => record.record_json.includes('"ada-3"')).length).toBe(20);
+	});
+
+	// Rewrites delivered while the cold tier holds the same records are kept
+	// as one group: however many /purge and /rename it takes, its kept
+	// rewrites stay few, delivery never stalls on their number, and reads
+	// stay correct.
+	it("keeps hundreds of purges and renames delivered to an unchanged cold tier as one group", async () => {
+		const { clock, head, chain, state } = build(compositions[2]);
+		for (let index = 0; index < 30; index += 1) {
+			clock.time += 1;
+			head.commit("general", "message", { message_id: `m${index}`, from: { user_id: index % 3 ? "ada" : "cy" }, body: { text: `${index}` } });
+		}
+		await settle(chain);
+		const cold = (await chain.view()).tiers[2];
+		expect(cold.floor).toBeGreaterThan(0);
+		for (let index = 0; index < 600; index += 1) {
+			if (index % 2) await head.purge([`gone${index}`]);
+			else await head.rename(`old${index}`, `new${index}`);
+			if (index % 100 === 99) await settle(chain);
+		}
+		await head.purge(["cy"]);
+		await settle(chain);
+		const kept = await state.kept("cold");
+		expect(kept.flatMap((group) => group.rewrites)).toHaveLength(601);
+		expect(kept).toHaveLength(1);
+		expect(await head.rewrites.list()).toEqual([]);
+		const served = await history(chain, "general", 5);
+		expect(served.some((record) => record.record_json.includes('"cy"'))).toBe(false);
+		expect(served.filter((record) => record.kind === "message")).toHaveLength(20);
 	});
 
 	// A kept rewrite reaches only what the cold tier held when it was
@@ -787,7 +818,7 @@ describe("model-based regressions", () => {
 		await head.purge(["cy"]);
 		await settle(chain);
 		const [entry] = await state.kept("cold");
-		expect(entry.rewrite.user).toBe("cy");
+		expect(entry.rewrites.map((rewrite) => rewrite.user)).toEqual(["cy"]);
 		// Enough later posts that the cold tier (30 records, by count) trims past the purge's reach.
 		for (let index = 20; index < 120; index += 1) post(index, "ada");
 		await settle(chain);

@@ -31,7 +31,7 @@ export class Model {
 		const held = this.all().filter((record) => record.log_id >= floor && kept(record));
 		const expired = this.all().filter((record) => record.log_id < floor);
 		const messages = rewrite.into === null ? [...new Set([...(rewrite.messages ?? []), ...authoredMessages(reached, [rewrite.user])])] : undefined;
-		const read = withKept(held, [{ seq: 0, rewrite: messages ? { ...rewrite, messages } : rewrite, through: Number.MAX_SAFE_INTEGER }]);
+		const read = withKept(held, [{ first: 0, seq: 0, through: Number.MAX_SAFE_INTEGER, rewrites: [messages ? { ...rewrite, messages } : rewrite] }]);
 		const next = [...expired, ...read, ...rewritten(reached, [rewrite])];
 		this.records = new Map(next.map((record) => [`${record.log_id}\u0000${record.room_id}`, record]));
 	}

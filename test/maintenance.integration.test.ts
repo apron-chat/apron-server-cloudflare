@@ -312,15 +312,17 @@ it("with tiers below, removes records from SQLite only once copied, and keeps th
 		expect((await tiers.loadLink("hot")).stall).toEqual(alerted);
 		await tiers.saveLink("hot", { stall: NOT_STALLED });
 		expect((await tiers.loadLink("hot")).stall).toEqual(NOT_STALLED);
-		// A tier that takes no rewrites keeps those it is delivered, each under its own key, in log order, until its floor passes them.
-		await tiers.keep("cold", { seq: 12, rewrite: { user: "dee", into: "dee-2" }, through: 900 });
-		await tiers.keep("cold", { seq: 3, rewrite: { user: "cy", into: null, messages: ["m1"] }, through: 400 });
-		await tiers.keep("recent", { seq: 5, rewrite: { user: "zed", into: null }, through: 1 });
-		expect((await tiers.kept("cold")).map((entry) => entry.seq)).toEqual([3, 12]);
-		expect((await tiers.kept("cold"))[0]).toEqual({ seq: 3, rewrite: { user: "cy", into: null, messages: ["m1"] }, through: 400 });
+		// A tier that takes no rewrites keeps those it is delivered in groups, each under its first seq, in log order, until its floor passes them.
+		await tiers.keep("cold", { first: 12, seq: 12, through: 900, rewrites: [{ user: "dee", into: "dee-2" }] });
+		await tiers.keep("cold", { first: 3, seq: 3, through: 400, rewrites: [{ user: "cy", into: null, messages: ["m1"] }] });
+		await tiers.keep("recent", { first: 5, seq: 5, through: 1, rewrites: [{ user: "zed", into: null }] });
+		// A group grows under its key.
+		await tiers.keep("cold", { first: 3, seq: 4, through: 400, rewrites: [{ user: "cy", into: null, messages: ["m1"] }, { user: "eve", into: null }] });
+		expect((await tiers.kept("cold")).map((entry) => entry.first)).toEqual([3, 12]);
+		expect((await tiers.kept("cold"))[0]).toEqual({ first: 3, seq: 4, through: 400, rewrites: [{ user: "cy", into: null, messages: ["m1"] }, { user: "eve", into: null }] });
 		await tiers.forgetKept("cold", 500);
-		expect((await tiers.kept("cold")).map((entry) => entry.seq)).toEqual([12]);
-		expect((await tiers.kept("recent")).map((entry) => entry.seq)).toEqual([5]);
+		expect((await tiers.kept("cold")).map((entry) => entry.first)).toEqual([12]);
+		expect((await tiers.kept("recent")).map((entry) => entry.first)).toEqual([5]);
 		await tiers.forgetKept("cold", 1_000);
 		await tiers.forgetKept("recent", 2);
 		expect(await tiers.kept("cold")).toEqual([]);

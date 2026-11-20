@@ -329,11 +329,11 @@ export class MemoryChainStateStore implements ChainStateStore {
 	}
 	private readonly keeps = new Map<string, Map<number, KeptRewrite>>();
 	async kept(name: string): Promise<KeptRewrite[]> {
-		return [...(this.keeps.get(name)?.values() ?? [])].sort((a, b) => a.seq - b.seq).map((entry) => structuredClone(entry));
+		return [...(this.keeps.get(name)?.values() ?? [])].sort((a, b) => a.first - b.first).map((entry) => structuredClone(entry));
 	}
 	async keep(name: string, entry: KeptRewrite): Promise<void> {
 		const entries = this.keeps.get(name) ?? new Map<number, KeptRewrite>();
-		entries.set(entry.seq, structuredClone(entry));
+		entries.set(entry.first, structuredClone(entry));
 		this.keeps.set(name, entries);
 	}
 	async forgetKept(name: string, floor: number): Promise<void> {

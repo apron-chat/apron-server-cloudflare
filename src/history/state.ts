@@ -44,15 +44,20 @@ export interface ChainStatePort {
 export const TIER_STATE_KEY = "history:tier:";
 export const LINK_STATE_KEY = "history:link:";
 /**
- * The most rewrites a tier that takes none keeps at once (each a /purge or
- * /rename of what it still holds): past it, delivering another fails, and
- * the link stalls (and alerts) rather than serve what it would change.
+ * The most groups of kept rewrites a tier that takes none holds at once
+ * (KeptRewrite: those delivered while it held the same newest log ID, so a
+ * group a change of the tier, not a /purge or /rename): past it, delivering
+ * another into a new group fails, and the link stalls (and alerts) rather
+ * than serve what it would change.
  */
-export const MAX_KEPT_REWRITES = 4_096;
-/** A kept rewrite (KeptRewrite) of a tier that takes none: `history:kept:<tier>:<seq, 16 digits>`. */
+export const MAX_KEPT_GROUPS = 4_096;
+/** A group of kept rewrites (KeptRewrite) of a tier that takes none: `history:kept:<tier>:<first seq, 16 digits>`. */
 export const KEPT_STATE_KEY = "history:kept:";
 
-const keptKey = (name: string, seq: number) => `${KEPT_STATE_KEY}${name}:${String(seq).padStart(16, "0")}`;
+const keptKey = (name: string, first: number) => `${KEPT_STATE_KEY}${name}:${String(first).padStart(16, "0")}`;
+const isKept = (entry: KeptRewrite | undefined): entry is KeptRewrite =>
+	!!entry && typeof entry.first === "number" && typeof entry.seq === "number" && typeof entry.through === "number" && Array.isArray(entry.rewrites)
+	&& entry.rewrites.every((rewrite) => typeof rewrite?.user === "string");
 
 interface StoredLink extends StallFields {
 	through?: number;
@@ -123,16 +128,16 @@ export function chainStateStore(port: ChainStatePort, head: string): ChainStateS
 		async kept(name) {
 			return port.entries(`${KEPT_STATE_KEY}${name}:`).flatMap(([, text]) => {
 				const entry = parse<KeptRewrite>(text);
-				return entry && typeof entry.seq === "number" && typeof entry.through === "number" && typeof entry.rewrite?.user === "string" ? [entry] : [];
+				return isKept(entry) ? [entry] : [];
 			});
 		},
 		async keep(name, entry) {
-			port.setValue(keptKey(name, entry.seq), JSON.stringify(entry));
+			port.setValue(keptKey(name, entry.first), JSON.stringify(entry));
 		},
 		async forgetKept(name, floor) {
 			for (const [key, text] of port.entries(`${KEPT_STATE_KEY}${name}:`)) {
 				const entry = parse<KeptRewrite>(text);
-				if (!entry || entry.through < floor) port.setValue(key, null);
+				if (!isKept(entry) || entry.through < floor) port.setValue(key, null);
 			}
 		},
 	};
