@@ -126,7 +126,7 @@ export function planStep(snapshot: ChainSnapshot): Step {
  *
  * - I1: floors are ordered down the chain, and never fall.
  * - I2: a tier's floor never passes what the link below holds of it (copy before delete).
- * - I5: rewrites go down in order: a link has delivered no more than the tier above holds, and never fewer than before.
+ * - I7: rewrites go down in order: a link has delivered no more than the tier above holds, and never fewer than before.
  * - I6: history starts at the deepest tier's floor or above, and never earlier than before.
  */
 export function checkInvariants(chain: ChainView, published: number, logged: number, previous?: { chain: ChainView; published: number }): string[] {
@@ -138,7 +138,7 @@ export function checkInvariants(chain: ChainView, published: number, logged: num
 	for (let index = 0; index < links.length; index += 1) {
 		if (tiers[index].floor > links[index].through + 1) violations.push(`I2: ${tiers[index].name}'s floor ${tiers[index].floor} passed what ${tiers[index + 1].name} holds (through ${links[index].through})`);
 		const above = upstream(chain, index, logged);
-		if (links[index].delivered > above) violations.push(`I5: ${tiers[index + 1].name} was delivered rewrite ${links[index].delivered}, past ${above}, what ${tiers[index].name} holds`);
+		if (links[index].delivered > above) violations.push(`I7: ${tiers[index + 1].name} was delivered rewrite ${links[index].delivered}, past ${above}, what ${tiers[index].name} holds`);
 	}
 	const deepest = tiers[tiers.length - 1].floor;
 	if (published > deepest) violations.push(`I6: the published floor ${published} is above ${deepest}, the deepest tier's`);
@@ -148,7 +148,7 @@ export function checkInvariants(chain: ChainView, published: number, logged: num
 			if (before && tier.floor < before.floor) violations.push(`I1: ${tier.name}'s floor fell from ${before.floor} to ${tier.floor}`);
 			const link = links[index];
 			const was = previous.chain.links[index];
-			if (link && was && previous.chain.tiers[index]?.name === tier.name && link.delivered < was.delivered) violations.push(`I5: the link from ${tier.name} went back from rewrite ${was.delivered} to ${link.delivered}`);
+			if (link && was && previous.chain.tiers[index]?.name === tier.name && link.delivered < was.delivered) violations.push(`I7: the link from ${tier.name} went back from rewrite ${was.delivered} to ${link.delivered}`);
 		}
 		if (published < previous.published) violations.push(`I6: the published floor fell from ${previous.published} to ${published}`);
 	}

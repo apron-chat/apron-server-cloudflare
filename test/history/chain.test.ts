@@ -71,10 +71,10 @@ describe("checkInvariants", () => {
 		expect(checkInvariants(now, 13, 2, { chain: before, published: 14 })).toEqual([
 			"I1: recent's floor 12 is above hot's 10",
 			"I2: hot's floor 10 passed what recent holds (through 5)",
-			"I5: recent was delivered rewrite 3, past 2, what hot holds",
+			"I7: recent was delivered rewrite 3, past 2, what hot holds",
 			"I6: the published floor 13 is above 12, the deepest tier's",
 			"I1: hot's floor fell from 11 to 10",
-			"I5: the link from hot went back from rewrite 4 to 3",
+			"I7: the link from hot went back from rewrite 4 to 3",
 			"I6: the published floor fell from 14 to 13",
 		]);
 		expect(checkInvariants({ tiers: [tier("hot", 10), tier("recent", 4)], links: [link(9, 2)] }, 4, 2)).toEqual([]);

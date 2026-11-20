@@ -782,8 +782,8 @@ below), not for a time, so it follows whichever limit moves the log.
 
 ### History tiers
 
-History is kept in a pipeline of tiers (`src/history/`; [SPEC section
-9](../SPEC.md#history-tiers)), newest first, in a fixed order that comes
+History is kept in a chain of tiers joined by links (`src/history/`;
+[SPEC section 9](../SPEC.md#history-tiers)), newest first, in a fixed order that comes
 from the bindings alone (`src/history/config.ts`): the hot log (`hot`),
 then the D1 tier (`recent`, `src/history/d1.ts`) where a D1 database is
 bound as `HISTORY_D1` and `historyD1Records` is above 0, then the cold tier
@@ -798,11 +798,13 @@ Records leaving the hot log are copied to the tier below first, and removed
 from SQLite only once copied: cleanup moves the hot floor no further than the
 last record copied (`history:head:through` in `_meta`). On each full alarm,
 before cleanup and again after a cleanup batch that removed records, the
-object runs one cycle of the pipeline, at most 24 steps, working from the
-deepest tier up: each tier finds the floor its retention allows, copies what
-is below it to the next tier (100 log IDs a step, a 10,000-record chunk
-into the cold tier), raises its floor, and
-deletes what is below its floor (500 records a step). History serves records
+object runs one cycle of the chain, at most 24 steps, working from the
+deepest tier up: each tier's link from above delivers it the next queued
+`/purge` or `/rename`; the tier finds the floor its retention allows; its
+link below copies what is below that to the next tier (100 log IDs a step,
+a 10,000-record chunk into the cold tier), once the tier holds every queued
+rewrite; the tier raises its floor, and deletes what is below it (500
+records a step). History serves records
 in the tiers below as if they had never left: a page that reaches below the
 hot floor reads the rest from them, and `history_log_id` starts at the
 published floor, the floor of the deepest tier history reads, which it
@@ -811,14 +813,15 @@ published floor go then, not when their records leave the hot log. Messages
 in a tier below the hot log are history only: like expired ones, they
 cannot be edited, reacted to or replied to.
 
-`/purge` and `/rename` reach every tier below the hot log too, on an alarm
-a second later: the D1 tier in one step, then the cold tier in a sweep of a
-few chunks a step (below); until a tier has applied them, history pages
-that read it apply them in memory. Until the cold tier's sweep reaches a
-purged user's message, others' reactions on it can still show above; the
-purged user's own records never do. At most 200 of them wait for the
-tiers below at once: past that, `/purge` and `/rename` answer `retry_after`
-until the tiers catch up.
+`/purge` and `/rename` reach the D1 tier too: the links deliver them down
+the chain in order, on an alarm a second later, and D1 applies each in one
+step; until it has, history pages that read it apply them in memory. The
+cold tier does not take them: its link acknowledges them, and the history it
+holds keeps the users, messages and reactions a `/purge` or `/rename`
+changed, served as they were. Purge a user before their history reaches the
+cold tier where that matters. At most 200 of them wait for the links at
+once: past that, `/purge` and `/rename` answer `retry_after` until the links
+catch up.
 
 Finding the floor the D1 tier's retention allows reads the D1 index entries
 of the records it keeps (80,000 on Paid), so `historyD1Records` is at most
@@ -832,12 +835,12 @@ maximum-size snapshot. Each history page below the hot floor is a D1 query.
 There is no fallback for a tier below that fails. Copying waits five minutes
 between tries rather than a second, and records stay in the hot log
 meanwhile, so it grows; at worst posting pauses at the database high-water
-mark, and nothing is lost. `/status` shows a stalled copy (`- History copy
-SQLite → D1: failing since …`), and once a copy has failed for 6 hours the
+mark, and nothing is lost. `/status` shows a stalled link (`- History copy
+SQLite → D1: failing since …`), and once a link has failed for 6 hours the
 admins are told (`history_stall`), once a stall. A history page that needs a
 tier that fails answers `retry_after`. With no tier below the hot log,
 records expire as they leave it, and only 4,000 are kept on Paid; the
-tiers' state in `_meta` is forgotten, and turned on again, they start at
+tiers' and links' state in `_meta` is forgotten, and turned on again, they start at
 the hot floor. The D1 tier is never skipped once it holds history: with
 `HISTORY_D1` unbound (or `historyD1Records` 0) while its state remains and
 the cold tier is bound, history stops moving below SQLite rather than go to
@@ -847,18 +850,19 @@ admins get `history_stall` after 6 hours, history pages below the hot floor
 answer `retry_after`, and exports and imports are refused, until it is
 bound again.
 
-`/history status` (admins) shows each tier's floor, how far it has copied to
-the next, the published floor, and whether the pipeline's invariants hold.
+`/history status` (admins) shows each tier's floor, how far its link has
+copied to the next and which rewrites it delivered, the published floor,
+and whether the chain's invariants hold.
 
 **The cold tier** keeps the oldest history in R2 as chunks of the whole
 log, about 10,000 log IDs each (every room's records over that stretch),
 under `history/<RP_ID>/` (so servers may share a bucket), each a complete
 ARCHIVE.md v1 file, gzip-encoded through the same codec chain as backups,
 with one small row a chunk in the object's SQLite (`history_chunks`: its
-bounds, size, and the rooms and users it names). It serves every history
-page, joined rooms' too, reading only the chunks that hold one of the
-page's rooms, and keeps two decoded chunks in memory. `/purge` and
-`/rename` rewrite only the chunks that change, a few a step. It keeps
+bounds, size, and the rooms it holds). It serves every history page,
+joined rooms' too, reading only the chunks that hold one of the page's
+rooms, and keeps two decoded chunks in memory. Chunks are written once and
+only trimmed: it takes no `/purge` or `/rename` (above). It keeps
 everything unless `historyColdRecords` is set, when it deletes whole
 chunks, oldest first. The bucket must be private: no custom domain, no
 r2.dev URL, no CORS, no lifecycle rules.
