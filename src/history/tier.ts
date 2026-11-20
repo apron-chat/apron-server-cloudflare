@@ -105,7 +105,7 @@ export interface Cell<T> {
  */
 export interface RestorePort {
 	hasRoom(roomId: string): Promise<boolean>;
-	/** A room that exists with nothing logged past its creation (a new server's `general`), which an import may fill. */
+	/** A room that exists with nothing logged past its creation but joins and leaves (a new server's `general`), which an import may fill. */
 	roomIsEmpty(roomId: string): Promise<boolean>;
 	hasUser(userId: string): Promise<boolean>;
 	/** Whether a user ID is retired (purged or renamed away) and may not be reused. */

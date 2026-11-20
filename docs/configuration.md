@@ -829,6 +829,14 @@ of the records it keeps (80,000 on Paid), so `historyD1Records` is at most
 records go since, or an hour after the last time otherwise, so in practice
 once a day, after the daily cleanup: about 2.4 million D1 rows read a month,
 of the 25 billion Workers Paid includes.
+
+The link into the cold tier copies whole chunks (10,000 log IDs): it waits
+while less than a chunk is due and D1 is under its limit, so D1 holds what
+has yet to make one besides its 80,000, between 80,000 and 89,999 records in
+steady state and never more than its limit and one chunk (110,000). Each
+time it looks, it counts what is due and, when that is short of a chunk, all
+D1 serves: up to about 90,000 rows read, a few times after each daily
+cleanup.
 Its 80,000 records stay within the included 5 GB even were each a
 maximum-size snapshot. Each history page below the hot floor is a D1 query.
 

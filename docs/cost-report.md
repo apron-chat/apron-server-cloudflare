@@ -929,6 +929,38 @@ the second mutation was rejected by that daily limit. The SQLite file
 remained the same size across eviction (151,552 bytes, measured with schema
 10).
 
+## History in R2: the cold tier and backups
+
+The cold tier (SPEC section 9) writes chunks of 10,000 log IDs, gzip-encoded:
+a chunk measured 129 KB in the upgrade rehearsal (`wrangler dev`, local R2;
+short chat messages with reactions and edits), about 13 bytes a record. A
+chunk is written once (one Class A `PUT`; a merge after a retried copy writes
+one more) and, with `historyColdRecords` at 0 (production), never deleted;
+its index entry is a row in the object's SQLite, not an R2 operation. Reads
+past D1 fetch one chunk (one Class B `GET`) for every chunk a page reaches
+that is not among the two kept decoded in memory.
+
+Backups write the whole history once a day (`BACKUP_EVERY`), multipart in
+5 MiB parts (one Class A operation a part, plus the upload's start and
+finish), read every chunk once (Class B), and keep the newest 14
+(`BACKUP_KEEP`); a pruned one is one free `DELETE`.
+
+At the posting ceiling (10,000 posts a day on Paid; say 20,000 records a day
+with reactions, edits and memberships), against R2 Standard's free tier
+(10 GB-month, 1 million Class A and 10 million Class B operations a month):
+
+| | A month | Against the free tier |
+|---|---|---|
+| Chunks written | about 60 (2 a day) | 60 Class A |
+| Cold storage after a year | about 7.3 million records, about 95 MB | 1% of 10 GB |
+| A day's backup after a year | about 95 MB, about 20 parts | about 700 Class A, about 22,000 Class B (each backup reads every chunk) |
+| Backups kept | 14, about 1.3 GB after a year | 13% of 10 GB |
+| Deep reads | one `GET` per chunk a page reaches, past the two in memory | bounded by the history page limits |
+
+So the tiers below SQLite stay inside R2's free tier for years at the
+posting ceiling; backups, which copy the whole history daily, are the larger
+share, and grow with it.
+
 ## Storage pressure and page reuse
 
 The pressure integration
