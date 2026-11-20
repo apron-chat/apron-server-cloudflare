@@ -274,11 +274,9 @@ describe('the source', () => {
 	/** The files a pattern occurs in, by path. */
 	const where = (pattern: RegExp) => files.filter(([, text]) => pattern.test(text)).map(([path]) => path).sort();
 
-	it('was read', () => {
-		expect(files.map(([path]) => path)).toEqual(expect.arrayContaining(['src/index.ts', 'src/commands/capability.ts', 'src/commands/registry.ts']));
-	});
-
 	it('constructs and issues capabilities in src/commands/capability.ts alone, from the dispatcher alone', () => {
+		// The glob found the source, so the checks below mean something.
+		expect(files.map(([path]) => path)).toEqual(expect.arrayContaining(['src/index.ts', 'src/commands/capability.ts', 'src/commands/registry.ts']));
 		expect(where(/new\s+(AdminCapability|RoleCapability)\b/)).toEqual(['src/commands/capability.ts']);
 		expect(where(/\bmint(Admin|Roles)\b/)).toEqual(['src/commands/capability.ts']);
 		// authorizeAdmin and authorizeRoles: defined in capability.ts, called by the dispatcher in registry.ts alone.

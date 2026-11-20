@@ -52,15 +52,15 @@ describe("history tiers from bindings", () => {
 describe("backup vars", () => {
 	const config = (vars: Record<string, string> = {}) => loadConfig({ NODE_ENV: "test", ...vars } as never);
 
-	it("default to backups on demand, 14 kept, private rooms included", () => {
-		expect(config().backups).toEqual({ keep: 14, privateRooms: true });
-		expect(config({ BACKUP_EVERY: "" }).backups).toEqual(config().backups);
-	});
-
-	it("parse a schedule, a count and the private rooms switch", () => {
-		const backups = config({ BACKUP_EVERY: "6h", BACKUP_KEEP: "3", BACKUP_PRIVATE_ROOMS: "false" }).backups;
-		expect(backups).toEqual({ everySeconds: 21_600, keep: 3, privateRooms: false });
-		expect(["45s", "30m", "1d"].map((every) => config({ BACKUP_EVERY: every }).backups.everySeconds)).toEqual([45, 1_800, 86_400]);
+	it.each([
+		[{}, { keep: 14, privateRooms: true }],
+		[{ BACKUP_EVERY: "" }, { keep: 14, privateRooms: true }],
+		[{ BACKUP_EVERY: "6h", BACKUP_KEEP: "3", BACKUP_PRIVATE_ROOMS: "false" }, { everySeconds: 21_600, keep: 3, privateRooms: false }],
+		[{ BACKUP_EVERY: "45s", BACKUP_KEEP: "1000" }, { everySeconds: 45, keep: 1000, privateRooms: true }],
+		[{ BACKUP_EVERY: "30m" }, { everySeconds: 1_800, keep: 14, privateRooms: true }],
+		[{ BACKUP_EVERY: "1d", BACKUP_PRIVATE_ROOMS: "true" }, { everySeconds: 86_400, keep: 14, privateRooms: true }],
+	])("read %j as %j (on demand, 14 kept, private rooms in, by default)", (vars, backups) => {
+		expect(config(vars).backups).toEqual(backups);
 	});
 
 	it("refuse what they cannot use, naming the var", () => {
@@ -68,6 +68,7 @@ describe("backup vars", () => {
 			[{ BACKUP_EVERY: "1 week" }, /BACKUP_EVERY must be a duration/],
 			[{ BACKUP_EVERY: "0h" }, /BACKUP_EVERY must be a duration/],
 			[{ BACKUP_KEEP: "0" }, /BACKUP_KEEP must be a whole number from 1 to 1000/],
+			[{ BACKUP_KEEP: "1001" }, /BACKUP_KEEP must be a whole number from 1 to 1000/],
 			[{ BACKUP_KEEP: "many" }, /BACKUP_KEEP/],
 			[{ BACKUP_PRIVATE_ROOMS: "no" }, /BACKUP_PRIVATE_ROOMS must be true or false/],
 		] as const) {

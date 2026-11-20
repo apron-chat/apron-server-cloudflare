@@ -131,8 +131,8 @@ describe('configuration policy boundaries', () => {
 		expect(() => config({ LIMIT_HISTORY_D1_RECORDS: '100001' })).toThrow('historyD1Records exceeds the calibrated bound');
 		expect(config({ LIMIT_HISTORY_COLD_RECORDS: '1000000' }).limits.historyColdRecords).toBe(1_000_000);
 		expect(() => config({ LIMIT_HISTORY_COLD_RECORDS: '-1' })).toThrow('historyColdRecords must be a non-negative safe integer');
-		// The old name is no limit any more: a leftover fails rather than being ignored.
-		expect(() => config({ LIMIT_ARCHIVE_RECORDS: '0' })).toThrow('LIMIT_ARCHIVE_RECORDS is not a limit');
+		// A misspelled limit fails rather than leave the default in force.
+		expect(() => config({ LIMIT_HISTORY_D1_RECORD: '0' })).toThrow('LIMIT_HISTORY_D1_RECORD is not a limit');
 		expect(config().limits.cleanupThresholdPercent).toBe(80);
 		expect(config({ LIMIT_CLEANUP_THRESHOLD_PERCENT: '100' }).limits.cleanupThresholdPercent).toBe(100);
 		expect(() => config({ LIMIT_CLEANUP_THRESHOLD_PERCENT: '101' })).toThrow('cleanupThresholdPercent is a share of the limits, at most 100');
