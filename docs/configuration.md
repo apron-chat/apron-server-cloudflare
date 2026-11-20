@@ -845,7 +845,8 @@ the hot floor. The D1 tier is never skipped once it holds history: with
 `HISTORY_D1` unbound (or `historyD1Records` 0) while its state remains and
 the cold tier is bound, history stops moving below SQLite rather than go to
 the cold tier past what D1 holds. SQLite keeps what it holds meanwhile;
-`/status` shows D1 **unbound**, the Worker logs `history_tier_unbound`,
+`/status` shows D1 **unbound** (or **off**, for a limit of 0, with what to
+change), the Worker logs `history_tier_unbound`,
 admins get `history_stall` after 6 hours, history pages below the hot floor
 answer `retry_after`, and exports and imports are refused, until it is
 bound again.
@@ -901,8 +902,10 @@ the newest `BACKUP_KEEP` are deleted, and nothing else under `backups/`.
   of every room or of those named, with the same settings; without the
   bucket, the command says so and writes nothing. Its notice names the
   object's key. A second backup of a kind in the same second is refused
-  (keys are to the second); one export, import or index rebuild runs at a
-  time, and none while history upkeep runs.
+  (keys are to the second); one export or import runs at a time, and none
+  while history upkeep runs (`src/history/schedule.ts`); `/purge` and
+  `/rename` are refused while an import runs, and an import while one of
+  them does.
 - **`/history import <key> [dry-run] [match|new] [renumber] [restart]`** (admins) reads
   an object of the backup store (at most 64 MiB, stored and decoded), a
   backup or any ARCHIVE.md v1 file put there, gzip-compressed (`.jsonl.gz`,
@@ -913,8 +916,10 @@ the newest `BACKUP_KEEP` are deleted, and nothing else under `backups/`.
   free millisecond; records older than history here are dropped as expired.
   `dry-run` reports what it would do, the log IDs it would add among it.
   The file may be anyone's, so records are taken only as a client could
-  have sent them (bare users, bodies normalized as posts are, a snapshot's
-  size), others dropped and counted. Users are never matched to existing
+  have sent them, by the same content policy posting uses
+  (`src/content/policy.ts`: bare users, bodies and reaction sets normalized
+  as posts are, room fields and snapshot sizes within a post's limits),
+  others dropped and counted. Users are never matched to existing
   accounts: that takes a file verified as this server's own, and no codec
   here verifies one (`auto`, the default, makes every user new, and `match`
   is refused); a codec that authenticates, such as encryption added after
@@ -934,13 +939,14 @@ the newest `BACKUP_KEEP` are deleted, and nothing else under `backups/`.
   a failure, the same file finishes; `restart` abandons an unfinished import
   of another file, and the notice names the rooms it left part-restored.
 
-**Codecs.** A backup goes through `@apron/archive` codecs on its way to
-the bucket (`packages/archive/src/codec.ts`): each is a pair of standard
-Streams `TransformStream`s, composed with `pipeThrough`. Backups use `gzip`
-alone (`BACKUP_CODECS`, `src/history/exports.ts`). Encryption can be added
-later as a codec after it, with no change to how backups are named,
-pruned or read: the import decodes through whatever chain an object
-records.
+**Codecs.** Backups and the cold tier's chunks go through `@apron/archive`
+codecs on their way to the bucket (`packages/archive/src/codec.ts`): each is
+a pair of standard Streams `TransformStream`s, composed with `pipeThrough`.
+Both use the history codec chain, `gzip` alone today (`HISTORY_CODECS` in
+`src/history/config.ts`, the one place it is named; nothing else names a
+codec). Encryption can be added later as a codec after it, with no change
+to how backups are named, pruned or read: the import decodes through
+whatever chain an object records.
 
 ## Runtime overrides
 
