@@ -42,6 +42,17 @@ function memoryTarget(init: { rooms?: string[]; users?: string[]; retired?: stri
 const options = (extra: Partial<PlanOptions> = {}): PlanOptions => ({ now: () => NOW, ...extra });
 
 describe("planImport", () => {
+	it("orders new rooms top-level first, so a thread's parent is restored before it whatever their names", async () => {
+		// `battleplan` sorts before its parent `security`: restored in name order, the thread would come first.
+		const plan = await planImport(
+			archive([message(10, "security", "kate"), message(20, "battleplan", "kevin"), message(30, "aside", "kate")], [room("security"), room("battleplan", { parent_room_id: "security" }), room("aside", { parent_room_id: "zeta" }), room("zeta")]),
+			memoryTarget(),
+			options(),
+		);
+		expect(plan.rooms.map((entry) => entry.roomId)).toEqual(["security", "zeta", "aside", "battleplan"]);
+		expect(plan.state.rooms.map((entry) => entry.archive)).toEqual(["security", "zeta", "aside", "battleplan"]);
+	});
+
 	it("imports listed rooms that are new, skips existing ones, and counts references", async () => {
 		const plan = await planImport(
 			archive([message(10, "a", "ada"), message(20, "b", "ada"), message(30, "unlisted", "ada"), message(5, "a", "ada")], [room("a", { history_log_id: "8" }), room("b")]),

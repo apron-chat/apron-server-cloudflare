@@ -4076,7 +4076,7 @@ export class Store {
     // its state row read and written (a member's identity too, and for a
     // private room their private rooms); and the log head.
     const cost = {
-      reads: 128 + ROOM_FIELDS_TOTAL_READS + MAX_CREATED_ROOMS + 4 * fresh.length + 8 * keys + 4 * named.size +
+      reads: 128 + EMPTY_ROOM_SCAN + ROOM_FIELDS_TOTAL_READS + MAX_CREATED_ROOMS + 4 * fresh.length + 8 * keys + 4 * named.size +
         (isPrivate ? memberships.size * this.userRoomsReads() : 0),
       writes: 64 + 6 * fresh.length + 8 * keys + 2 * named.size,
     };
@@ -4121,7 +4121,23 @@ export class Store {
         this.adjustCount(isPrivate ? "private_count" : "thread_count", 1);
       } else {
         if (listingParent !== undefined && listingParent !== row.parent_room_id) throw new StoreError("invalid_params", `The room ${roomId} here has another parent`.slice(0, 200));
-        if (latestRoom && latestRoom.log_id >= row.record_log_id) {
+        // The latest room record among the new ones alone: the replay above also reads the room's own records.
+        const imported = fresh.some((record) => record.kind === "room") ? replayRecords(fresh).rooms.get(roomId) : undefined;
+        const own = imported && imported.log_id < row.record_log_id ? this.emptyRoomOwnRecord(row) : undefined;
+        if (imported && own !== undefined) {
+          // An empty room the import fills (a fresh server's `general`): the
+          // archive's room record stands for it, and the room's own, which
+          // says only what a new server made, goes. Kept, it would be the
+          // room's latest record, and a round trip would add one each time.
+          const fields = roomClientFields(imported.fields);
+          this.checkRoomFields(fields);
+          this.rawExec("DELETE FROM records WHERE room_id = ? AND log_id = ? AND kind = 'room'", roomId, own);
+          // Its head is what is left of it (joins after it), raised below by the records restored.
+          const left = integerColumn(this.rawRows<{ latest: number }>("SELECT COALESCE(MAX(log_id), 0) AS latest FROM records WHERE room_id = ?", roomId)[0]?.latest);
+          this.rawExec("UPDATE rooms SET latest_log_id = ? WHERE room_id = ?", left, roomId);
+          const creator = storedCreator(row.fields_json);
+          row = { ...row, latest_log_id: left, record_log_id: imported.log_id, fields_json: JSON.stringify(creator === undefined ? fields : { ...fields, creator_id: creator }) };
+        } else if (latestRoom && latestRoom.log_id >= row.record_log_id) {
           const fields = roomClientFields(latestRoom.fields);
           this.checkRoomFields(fields);
           // The client fields are replaced; a creator kept beside them stays.
@@ -4295,6 +4311,23 @@ export class Store {
       const later = this.rawRows<{ kind: string }>("SELECT kind FROM records WHERE room_id = ? AND log_id > ? ORDER BY log_id LIMIT ?", roomId, integerColumn(room.created_log_id), EMPTY_ROOM_SCAN);
       return later.length < EMPTY_ROOM_SCAN && later.every((row) => row.kind === "membership");
     });
+  }
+
+  /**
+   * The log ID of an empty room's own room record, which an import filling
+   * the room replaces (restoreRoom): the room's creation is its only room
+   * record and nothing but joins and leaves follows it (as roomIsEmpty), and
+   * it is not yet copied below (past the copy marker), so no tier below
+   * holds a copy. Undefined otherwise.
+   */
+  private emptyRoomOwnRecord(row: RawRoomRow): number | undefined {
+    const created = integerColumn(row.created_log_id);
+    if (integerColumn(row.record_log_id) !== created) return undefined;
+    if (this.config.tiered && created <= this.metaNumber(META_HISTORY_THROUGH)) return undefined;
+    const own = this.rawRows<{ kind: string }>("SELECT kind FROM records WHERE room_id = ? AND log_id = ? LIMIT 1", row.room_id, created)[0];
+    if (own?.kind !== "room") return undefined;
+    const later = this.rawRows<{ kind: string }>("SELECT kind FROM records WHERE room_id = ? AND log_id > ? ORDER BY log_id LIMIT ?", row.room_id, created, EMPTY_ROOM_SCAN);
+    return later.length < EMPTY_ROOM_SCAN && later.every((record) => record.kind === "membership") ? created : undefined;
   }
 
   /** Writes a backup schedule's value in `_meta` (a key under `history:export:`), or removes it for null. */
