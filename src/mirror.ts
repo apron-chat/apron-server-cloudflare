@@ -722,12 +722,14 @@ export class RemoteRooms {
 			const page = await connection.call("history", { after: String(cursor + 1), ...(head ? { before: head } : {}), limit: HISTORY_PAGE }, `mirror-history:${cursor}:${this.now()}`);
 			if (page.error || !page.result) throw new Error(`history: ${page.error?.message ?? "no result"}`);
 			head ??= typeof page.result.latest_log_id === "string" ? page.result.latest_log_id : undefined;
-			const records: Array<{ kind: string; record: Record<string, unknown> }> = [];
-			for (const kind of ["rooms", "messages", "reactions", "memberships"]) {
-				for (const record of (page.result[kind] as Array<Record<string, unknown>> | undefined) ?? []) records.push({ kind, record });
+			// The owner's log no longer reaches back to this mirror's place (§4.3.3): it reads from the bound, and what lay between is lost.
+			const bound = lowerBound(page.result);
+			if (bound !== undefined && bound > cursor + 1) {
+				console.warn(JSON.stringify({ event: "remote_history_lost", server: session.server, from: cursor + 1, to: bound - 1 }));
+				this.advance(session.server, bound - 1);
+				continue;
 			}
-			records.sort((a, b) => Number(a.record.log_id) - Number(b.record.log_id) || Number(b.kind === "rooms") - Number(a.kind === "rooms"));
-			for (const { kind, record } of records) await this.applyRecord(session.server, kind, record);
+			for (const { kind, record } of pageRecords(page.result)) await this.applyRecord(session.server, kind, record);
 			const last = Number(page.result.last_log_id);
 			if (Number.isFinite(last)) this.advance(session.server, last);
 			if (page.result.more !== true) return;
@@ -1333,6 +1335,21 @@ export class RemoteRooms {
 function boundServer(connection: LinkConnection): string | undefined {
 	const server = ((connection.you.ext as Record<string, unknown> | undefined)?.remote as Record<string, unknown> | undefined)?.server;
 	return typeof server === "string" ? server : undefined;
+}
+
+/** A `history` result's records across its arrays, in `log_id` order, a room record before others of its `log_id` (a thread before its messages). */
+function pageRecords(result: Record<string, unknown>): Array<{ kind: string; record: Record<string, unknown> }> {
+	const records: Array<{ kind: string; record: Record<string, unknown> }> = [];
+	for (const kind of ["rooms", "messages", "reactions", "memberships"]) {
+		for (const record of (result[kind] as Array<Record<string, unknown>> | undefined) ?? []) records.push({ kind, record });
+	}
+	return records.sort((a, b) => Number(a.record.log_id) - Number(b.record.log_id) || Number(b.kind === "rooms") - Number(a.kind === "rooms"));
+}
+
+/** A `history` result's effective lower bound (§4.3.3): `history_log_id`, or `latest_log_id + 1` when that is null; undefined when unreadable. */
+function lowerBound(result: Record<string, unknown>): number | undefined {
+	const bound = result.history_log_id === null ? Number(result.latest_log_id) + 1 : Number(result.history_log_id);
+	return Number.isSafeInteger(bound) ? bound : undefined;
 }
 
 /** Whether a request's error is the connection's own (closed, or no answer in time), not the owner's answer. */

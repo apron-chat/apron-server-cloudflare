@@ -685,3 +685,36 @@ it('a mirror sends a rename made while disconnected on its next connection', asy
 		} finally { vi.restoreAllMocks(); }
 	});
 });
+
+it('a mirror reads from the owner\'s history bound once it has passed its place', async () => {
+	await runInDurableObject(env.DEMO.getByName(`mirror-bound-${crypto.randomUUID()}`), async (_instance, state) => {
+		const store = new Store(state, {});
+		store.initialize();
+		const server = 'ws://a.example/ws';
+		store.setMirrorState({ rooms: [{ room_id: 'general', server, owner_room: 'ops', token: 't', start: 0, threads: {} }], servers: { [server]: { cursor: 10 } } });
+		const host = { store, self: 'wss://demo.test/ws', storage: state.storage, lingerMs: 60_000 } as unknown as MirrorHost;
+		const mirror = new RemoteRooms(host) as unknown as { catchUp(session: unknown, connection: LinkConnection): Promise<void> };
+		const pair = new WebSocketPair();
+		const owner = pair[1];
+		owner.accept();
+		const afters: string[] = [];
+		owner.addEventListener('message', (event) => {
+			const frame = JSON.parse(String(event.data));
+			if (frame.method === 'auth') return owner.send(JSON.stringify({ id: frame.id, result: { you: { user_id: 'link_1' } } }));
+			afters.push(frame.params.after);
+			// The log now starts at 500: what this mirror had not read below it is gone.
+			owner.send(JSON.stringify({ id: frame.id, result: { latest_log_id: '600', history_log_id: '500', ...(frame.params.after === '500' ? { first_log_id: '600', last_log_id: '600' } : {}), messages: [], more: false } }));
+		});
+		vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+			setTimeout(() => owner.send(JSON.stringify({ method: 'server', params: { apron: 10 } })), 0);
+			return new Response(null, { status: 101, webSocket: pair[0] });
+		});
+		try {
+			const connection = await LinkConnection.open(server, 't');
+			await mirror.catchUp({ server, inflight: 0 }, connection);
+			expect(afters).toEqual(['11', '500']);
+			expect(store.mirrorState().servers[server].cursor).toBe(600);
+			connection.close();
+		} finally { vi.restoreAllMocks(); }
+	});
+});
