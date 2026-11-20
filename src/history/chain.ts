@@ -111,6 +111,8 @@ export class HistoryChain {
 	}
 	/** What each lower tier's last target was found from (what the tier above held then), and when. */
 	private readonly targetBasis = new Map<number, { basis: string; at: number }>();
+	/** The tiers known to have state saved (noteHeld), in this instance. */
+	private readonly held = new Set<number>();
 	/** The kept rewrites of each tier that takes none, as last read (this instance alone changes them). */
 	private readonly keptCache = new Map<number, KeptRewrite[]>();
 
@@ -215,7 +217,10 @@ export class HistoryChain {
 					return;
 				}
 				const { records, exhausted } = await this.gather(from, step.start, step.below, batch);
-				if (records.length) await to.append(toRange(records));
+				if (records.length) {
+					await to.append(toRange(records));
+					await this.noteHeld(step.link + 1);
+				}
 				// The tier below holds everything below the target once the tier above had no more below it.
 				const through = exhausted ? step.below - 1 : records[records.length - 1].log_id;
 				const link = snapshot.links[step.link];
@@ -245,6 +250,20 @@ export class HistoryChain {
 				await this.head.publish(step.floor);
 				return;
 		}
+	}
+
+	/**
+	 * Tier `index` holds history from its first copy on: its state is saved
+	 * then (hasTierState), not first at its first trim, so a deploy that
+	 * drops it from the chain (D1 unbound, or its limit 0) is refused rather
+	 * than copying past it into the tier below (the copy marker into it
+	 * describes it).
+	 */
+	private async noteHeld(index: number): Promise<void> {
+		if (this.held.has(index)) return;
+		const name = this.tiers[index].name;
+		if (!await this.state.has(name)) await this.state.saveTier(name, {});
+		this.held.add(index);
 	}
 
 	/**

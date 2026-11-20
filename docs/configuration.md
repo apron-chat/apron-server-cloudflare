@@ -851,7 +851,8 @@ admins are told (`history_stall`), once a stall. A history page that needs a
 tier that fails answers `retry_after`. With no tier below the hot log,
 records expire as they leave it, and only 4,000 are kept on Paid; the
 tiers' and links' state in `_meta` is forgotten, and turned on again, they start at
-the hot floor. The D1 tier is never skipped once it holds history: with
+the hot floor. The D1 tier is never skipped once it holds history, from
+the first copy into it on (not first at its first trim): with
 `HISTORY_D1` unbound (or `historyD1Records` 0) while its state remains and
 the cold tier is bound, history stops moving below SQLite rather than go to
 the cold tier past what D1 holds. SQLite keeps what it holds meanwhile;
