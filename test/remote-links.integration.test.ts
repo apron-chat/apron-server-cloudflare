@@ -511,6 +511,34 @@ it('takes a link\'s relay wake push for ext:remote, and nobody else\'s, until it
 	} finally { vi.restoreAllMocks(); admin.close(); link.close(); }
 }, 20_000);
 
+it('sends a link one wake push for the records before it, and another for the records after it', async () => {
+	const { admin, link, roomId } = await linked('ws://127.0.0.1:8072/ws');
+	const url = 'http://127.0.0.1:8072/remote/wake/batching';
+	const posts: number[] = [];
+	try {
+		expect((await request(link, unique('wake'), 'push_register', { kind: 'relay', url, token: 't0ken', wake: ['ext:remote'] })).result).toEqual({});
+		vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
+			if ((input instanceof Request ? input.url : String(input)) === url) posts.push(Date.now());
+			return new Response(null, { status: 204 });
+		});
+		const post = async (text: string) => expect((await request(admin, unique('post'), 'message', { room_id: roomId, body: { text } })).result.message_id).toBeDefined();
+		// The first record wakes the link at once.
+		await post('one');
+		for (let i = 0; i < 100 && posts.length < 1; i += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(posts).toHaveLength(1);
+		// Records right after it wait out the spacing together: one more push covers them, none is left for the poll.
+		await post('two');
+		await post('three');
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		expect(posts).toHaveLength(1);
+		for (let i = 0; i < 150 && posts.length < 2; i += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(posts).toHaveLength(2);
+		expect(posts[1]! - posts[0]!).toBeGreaterThanOrEqual(1_900);
+		await new Promise((resolve) => setTimeout(resolve, 2_300));
+		expect(posts).toHaveLength(2);
+	} finally { vi.restoreAllMocks(); admin.close(); link.close(); }
+}, 20_000);
+
 it('changes nothing while REMOTE_SELF is unset: no capability, no /remote, links act as bots, ext.remote dropped', async () => {
 	const { admin, link, linkId, roomId } = await linked('ws://127.0.0.1:8098/ws');
 	link.close();
