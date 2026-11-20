@@ -84,7 +84,7 @@ const ERROR_NAMES: Record<number, ProtocolError["name"]> = {
 };
 /** How long a forwarded write waits for the owner before its user is told to try again. */
 const FORWARD_TIMEOUT_MS = 10_000;
-/** How long an accepted `message` waits for its copy (reconnecting and catching up as needed) before an error. */
+/** How long an accepted new message or thread waits for its copy or mirror thread (reconnecting and catching up as needed) before an error. */
 const COPY_WAIT_MS = 60_000;
 /** The members of a room a link's leave looks through for its remote users. */
 const REMOTE_MEMBERS_LIMIT = 1_000;
@@ -993,6 +993,8 @@ export class RemoteRooms {
 			this.store.messageAuthor(request.params.message_id, this.now()) !== client.userId && this.store.mayDeleteAny(client.userId, this.now())) return false;
 		if (mirror.room.unshared) throw { name: "denied", message: "This room is no longer shared by its owner; it takes no more writes" } satisfies ProtocolError;
 		if (client.tier !== "registered" || !client.userId) throw { name: "denied", message: "Sign in to write in a shared room" } satisfies ProtocolError;
+		// A private mirror room has no threads here, so the owner's thread would have nowhere to go.
+		if (request.method === "room_set" && typeof request.params.room_id !== "string" && mirror.room.room_id.startsWith("private_")) throw { name: "denied", message: "A private room has no threads" } satisfies ProtocolError;
 		const server = mirror.room.server;
 		const session = this.session(server);
 		session.inflight += 1;
@@ -1125,32 +1127,32 @@ export class RemoteRooms {
 		return this.ownerUser(connection, server, userId, name);
 	}
 
-	/** The owner's result, with its IDs mapped back to this server's: the copy, or the mirror thread. */
+	/**
+	 * The owner's result, with its IDs mapped back to this server's: a new
+	 * message's copy, or a new thread's mirror thread. The owner sends the
+	 * record before the result, so on a live connection it is here already;
+	 * one dialed meanwhile holds records while it catches up, and one that
+	 * closed is dialed again (catching up from the cursor). So the answer
+	 * waits for it, for a limited time.
+	 */
 	private async mapResult(server: string, request: RequestFrame, result: Record<string, unknown>, deadline: number): Promise<Record<string, unknown>> {
-		if (request.method === "message" && typeof result.message_id === "string") {
-			// The owner took it: the answer waits for the copy, for a limited time. Its record comes before the
-			// result on a live connection, but one dialed meanwhile holds records while it catches up, and one
-			// that closed is dialed again (catching up from the cursor).
-			const ownerId = result.message_id;
-			for (;;) {
-				const copy = this.store.copyOf(server, ownerId, this.now());
-				if (copy) return { message_id: copy };
-				if (Date.now() >= deadline) break;
-				const session = this.sessions.get(server);
-				if (session?.connecting) await session.connecting.catch(() => undefined);
-				else if (!session?.connection?.open) await this.ensure(server).catch(() => new Promise((resolve) => setTimeout(resolve, 1_000)));
-				else await new Promise((resolve) => setTimeout(resolve, 100));
-			}
-			// Accepted, not copied in time: the copy comes with a later read, and a resend (same request id) is the owner's duplicate.
-			console.warn(JSON.stringify({ event: "remote_copy_late", server, message_id: ownerId }));
-			throw { name: "internal_error", message: "The owner took it, but its copy has not arrived here yet; sending it again with the same id is safe" } satisfies ProtocolError;
+		const ownerId = request.method === "message" ? result.message_id : request.method === "room_set" ? result.room_id : undefined;
+		if (typeof ownerId !== "string") return {};
+		const find = request.method === "message"
+			? () => this.store.copyOf(server, ownerId, this.now())
+			: () => this.store.mirrorState(this.now()).rooms.find((room) => room.server === server && room.threads[ownerId])?.threads[ownerId];
+		for (;;) {
+			const local = find();
+			if (local) return request.method === "message" ? { message_id: local } : { room_id: local };
+			if (Date.now() >= deadline) break;
+			const session = this.sessions.get(server);
+			if (session?.connecting) await session.connecting.catch(() => undefined);
+			else if (!session?.connection?.open) await this.ensure(server).catch(() => new Promise((resolve) => setTimeout(resolve, 1_000)));
+			else await new Promise((resolve) => setTimeout(resolve, 100));
 		}
-		if (request.method === "room_set" && typeof result.room_id === "string") {
-			const local = this.store.mirrorState(this.now()).rooms.find((room) => room.server === server && room.threads[result.room_id as string]);
-			const thread = local?.threads[result.room_id];
-			return thread ? { room_id: thread } : {};
-		}
-		return {};
+		// Accepted, not copied in time: it comes with a later read, and a resend (same request id) is the owner's duplicate.
+		console.warn(JSON.stringify({ event: "remote_copy_late", server, method: request.method, id: ownerId }));
+		throw { name: "internal_error", message: "The owner took it, but its copy has not arrived here yet; sending it again with the same id is safe" } satisfies ProtocolError;
 	}
 
 	// ─────────────────────────── mirror: waking ───────────────────────────
