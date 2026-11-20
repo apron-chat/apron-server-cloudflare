@@ -19,6 +19,7 @@ import { type ChatRecord, byLog, logIds, namedUsers } from "./records.ts";
 import type { ArchivedRoom, ArchivedUser, RoomListing } from "./types.ts";
 import { type CollectedArchive, parseLogId } from "./format.ts";
 import { archiveIdentity, contentKey, splitReferences, withBareUsers } from "./validate.ts";
+import { replayRecords } from "./replay.ts";
 
 /** What is true where an archive is imported to. */
 export interface ImportTarget {
@@ -146,6 +147,13 @@ export interface PlanOptions {
 	userIds?: UserIdRules;
 	/** New placeholders one import may make (default: no cap); past it, the report says why it would be refused. */
 	maxPlaceholders?: number;
+	/**
+	 * Rooms one user may be a member of (default: no cap): an import that
+	 * would make anyone a member of more of the rooms it adds, by their
+	 * listings and membership records, is refused. Its users are new
+	 * placeholders (`match` aside), so these are all their rooms.
+	 */
+	maxMembershipsPerUser?: number;
 	/** How far past `now` an `original` log ID may be (default 5 minutes): further, and the plan throws. */
 	futureMs?: number;
 	/** The state of an earlier run of this plan that stopped partway: its decisions stand. */
@@ -353,6 +361,15 @@ export async function planImport(archive: CollectedArchive, target: ImportTarget
 		report.refused = `this archive would make ${placeholders.length} placeholder accounts, but there is room for ${Math.max(0, limit - used)} more (${used} of ${limit} accounts are in use)`;
 	} else if (!resume && options.maxPlaceholders !== undefined && placeholders.length > options.maxPlaceholders) {
 		report.refused = `this archive would make ${placeholders.length} placeholder accounts, more than the ${options.maxPlaceholders} one import may make`;
+	}
+	const maxMemberships = options.maxMembershipsPerUser;
+	if (!resume && !report.refused && maxMemberships !== undefined) {
+		const counts = new Map<string, number>();
+		for (const members of replayRecords(records, [...fresh].map((roomId) => rooms.get(roomId)!)).members.values()) {
+			for (const userId of members) counts.set(userId, (counts.get(userId) ?? 0) + 1);
+		}
+		const over = [...counts].find(([, rooms]) => rooms > maxMemberships);
+		if (over) report.refused = `this archive would make ${over[0]} a member of ${over[1]} rooms, more than the ${maxMemberships} anyone may be in`.slice(0, 300);
 	}
 
 	// Log IDs.

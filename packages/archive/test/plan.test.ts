@@ -171,6 +171,17 @@ describe("planImport", () => {
 		expect(plan.report.refused).toMatch(/2 placeholder accounts, more than the 1/);
 	});
 
+	it("refuses an import that would make anyone a member of more rooms than the target allows", async () => {
+		// ada is listed in three rooms and joins a fourth by a membership record; bob is in one.
+		const listed = (roomId: string, members: string[]) => room(roomId, { members: members.map((user_id) => ({ user_id })) });
+		const join: ChatRecord = { room_id: "d", log_id: 20, commit_ms: 20, kind: "membership", record_json: JSON.stringify({ room_id: "d", log_id: "20", members: [{ user: { user_id: "ada" }, joined: true }] }) };
+		const input = archive([message(10, "a", "ada"), join], [listed("a", ["ada", "bob"]), listed("b", ["ada"]), listed("c", ["ada"]), room("d")]);
+		expect((await planImport(input, memoryTarget(), options({ maxMembershipsPerUser: 4 }))).report.refused).toBeUndefined();
+		expect((await planImport(input, memoryTarget(), options({ maxMembershipsPerUser: 3 }))).report.refused).toMatch(/make ada a member of 4 rooms, more than the 3 anyone may be in/);
+		// Rooms that exist there are skipped, so they do not count.
+		expect((await planImport(input, memoryTarget({ rooms: ["c"] }), options({ maxMembershipsPerUser: 3 }))).report.refused).toBeUndefined();
+	});
+
 	it("refuses more placeholders than the target has room for, saying how many fit", async () => {
 		const input = archive([message(10, "a", "ada"), message(11, "a", "bob"), message(12, "a", "cy")], [room("a")]);
 		const full = { ...memoryTarget(), accounts: async () => ({ used: 8, limit: 10 }) };

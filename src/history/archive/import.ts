@@ -22,6 +22,7 @@
 import {
 	type ArchiveReader, type ChatRecord, type CollectedArchive, type ImportReport, type ImportState, type ImportTarget, type Provenance, type RoomListing, archiveIdentity, collectArchive, importStateJson, parseImportState, planImport, utf8Length,
 } from "@apron/archive";
+import { MAX_MEMBERSHIPS_PER_USER } from "../../budget";
 import { withoutOutputRefs } from "../../content/output-ref";
 import { USER_ID_RULES } from "../../user-ids";
 import type { HistoryChain } from "../chain";
@@ -198,6 +199,7 @@ export async function importArchive(chain: HistoryChain, restore: RestorePort, i
 		now: () => options.clock.now(),
 		userIds: USER_ID_RULES,
 		...(options.maxPlaceholders !== undefined ? { maxPlaceholders: options.maxPlaceholders } : {}),
+		maxMembershipsPerUser: MAX_MEMBERSHIPS_PER_USER,
 		futureMs: FUTURE_LOG_ID_MS,
 		...(resume ? { resume } : {}),
 		// An `output_ref` names this server's own storage: never taken from a file (Store.normalizedBody drops a client's).
