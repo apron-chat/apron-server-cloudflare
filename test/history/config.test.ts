@@ -1,7 +1,7 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { ConfigError, loadConfig } from "../../src/config";
-import { MemorySegmentIndex } from "../../src/history/blob/segments";
+import { MemorySegmentIndex } from "./support/memory-segment-index";
 import { type HistoryLimits, WORKER_BLOB_STORES, blobStoreOf, buildHistoryPipeline, hasLowerTiers } from "../../src/history/config";
 import type { StorePort } from "../../src/history/store-head";
 import { MemoryBlobStore, memoryBlobStores } from "./support/memory-blob-store";
@@ -64,18 +64,9 @@ describe("backup vars", () => {
 			[{ BACKUP_KEEP: "0" }, /BACKUP_KEEP must be a whole number from 1 to 1000/],
 			[{ BACKUP_KEEP: "many" }, /BACKUP_KEEP/],
 			[{ BACKUP_PRIVATE_ROOMS: "no" }, /BACKUP_PRIVATE_ROOMS must be true or false/],
-			// Backup encryption's vars are gone: set at all, they fail rather than mean nothing.
-			[{ IMPORT_PLAINTEXT: "true" }, /IMPORT_PLAINTEXT is no longer read: backups are gzip-compressed, not encrypted/],
-			[{ BACKUP_ENCRYPTION_KEY_NAME: "" }, /BACKUP_ENCRYPTION_KEY_NAME is no longer read/],
-			[{ BACKUP_PREVIOUS_KEY_NAMES: "OLD_KEY" }, /BACKUP_PREVIOUS_KEY_NAMES is no longer read/],
 		] as const) {
 			expect(() => config(vars), JSON.stringify(vars)).toThrow(ConfigError);
 			expect(() => config(vars), JSON.stringify(vars)).toThrow(message);
 		}
 	});
-});
-
-it("refuses a leftover HISTORY table rather than ignore it", async () => {
-	const { loadConfig } = await import("../../src/config");
-	expect(() => loadConfig({ NODE_ENV: "test", HISTORY: "{}" } as never)).toThrow(/HISTORY is no longer read/);
 });

@@ -420,10 +420,6 @@ test("production writes out the plan's own history limits, and daily backups", (
 		assert.equal(config.limits[key], DEFAULT_LIMITS[key], key);
 	}
 	assert.deepEqual(config.backups, { everySeconds: 86_400, keep: 14, privateRooms: true });
-	// Backup encryption's vars are gone: a stale one fails the check instead of meaning nothing.
-	for (const name of ['BACKUP_ENCRYPTION_KEY_NAME', 'BACKUP_PREVIOUS_KEY_NAMES', 'IMPORT_PLAINTEXT']) {
-		assert.throws(() => loadConfig({ ...vars, [name]: '' }), new RegExp(`${name} is no longer read`));
-	}
 	// A typo is caught here, before a deploy, not by every request failing after one.
 	assert.throws(() => loadConfig({ ...vars, BACKUP_EVERY: '1 day' }), /BACKUP_EVERY must be a duration/);
 });

@@ -882,10 +882,6 @@ Each backup's key is `backups/<RP_ID>-<kind>-<date>.jsonl.gz`, the kind
 `scheduled` or `manual`, with the codecs it went through recorded in its
 metadata (`codecs: gzip`); after writing one, the backups of its kind past
 the newest `BACKUP_KEEP` are deleted, and nothing else under `backups/`.
-`BACKUP_ENCRYPTION_KEY_NAME`, `BACKUP_PREVIOUS_KEY_NAMES` and
-`IMPORT_PLAINTEXT`, the vars of an earlier version's encryption, are no
-longer read: a config that still sets one fails the deploy's check and the
-Worker's start, rather than seem to encrypt.
 
 - **The scheduled backup** runs on the first full alarm after
   `BACKUP_EVERY` has passed since its last run (`history:export:scheduled`

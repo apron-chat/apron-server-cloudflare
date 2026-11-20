@@ -554,14 +554,6 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 	for (const key of Object.keys(limits) as (keyof Limits)[]) {
 		limits[key] = parsePositiveInt(env, key, limits[key]);
 	}
-	// The HISTORY table of earlier versions is gone: a leftover one would
-	// otherwise be ignored (docs/configuration.md, Backups).
-	if ((env as Record<string, unknown>).HISTORY !== undefined) throw new ConfigError("HISTORY is no longer read: set history with the LIMIT_* vars and backups with the BACKUP_* vars (docs/configuration.md)");
-	// So are backup encryption's vars: a leftover one would let a deploy
-	// believe its backups encrypted, which they no longer are.
-	for (const name of RETIRED_BACKUP_VARS) {
-		if ((env as Record<string, unknown>)[name] !== undefined) throw new ConfigError(`${name} is no longer read: backups are gzip-compressed, not encrypted; remove it (docs/configuration.md, Backups and imports)`);
-	}
 	// A misspelled override would silently leave the default in force.
 	const limitNames = new Set(Object.keys(limits).map((key) => `LIMIT_${envName(key)}`));
 	for (const name of Object.keys(env)) {
@@ -695,10 +687,7 @@ function loadServerMetadata(env: EnvLike, limits: Limits): ServerMetadata {
 	return { ...(title ? { title } : {}), ...(description ? { description } : {}), ...(avatar ? { avatar } : {}) };
 }
 
-/** Upload settings, when the plan and the deployment both provide them; malformed ones fail the configuration check. */
 const DURATION_UNITS: Record<string, number> = { s: 1, m: 60, h: 3_600, d: 86_400 };
-/** Backup encryption's vars, removed with it: set, they fail the configuration rather than mean nothing. */
-const RETIRED_BACKUP_VARS = ["BACKUP_ENCRYPTION_KEY_NAME", "BACKUP_PREVIOUS_KEY_NAMES", "IMPORT_PLAINTEXT"] as const;
 
 /** The backup vars (RuntimeConfig.backups), validated: a typo fails the deploy's check, not the first backup. */
 function loadBackups(env: EnvLike): BackupSettings {
@@ -718,6 +707,7 @@ function loadBackups(env: EnvLike): BackupSettings {
 	};
 }
 
+/** Upload settings, when the plan and the deployment both provide them; malformed ones fail the configuration check. */
 function loadUploads(env: EnvLike): UploadConfig | undefined {
 	const mediaOrigin = env.MEDIA_ORIGIN?.trim() ?? "";
 	const publicOrigin = env.PUBLIC_ORIGIN?.trim() ?? "";
