@@ -50,6 +50,8 @@ export interface MirrorHost {
 	notice(socket: unknown, roomId: string, text: string): void;
 	/** Joins a user (a link) to a room as `actorId` would add them, with every delivery a join makes. */
 	addMember(actor: { ipKey: string; userId?: string }, roomId: string, userId: string): Promise<void>;
+	/** addMember within the mutation that runs now. */
+	addMemberNow(actor: { ipKey: string; userId?: string }, roomId: string, userId: string): void;
 	removeMember(actor: { ipKey: string; userId?: string }, roomId: string, userId: string): Promise<boolean>;
 	mintLinkToken(linkId: string): Promise<string>;
 	forgetLinkTokens(linkId: string): Promise<void>;
@@ -290,13 +292,19 @@ export class RemoteRooms {
 	// ─────────────────────────── owner ───────────────────────────
 
 	/**
-	 * Owner hook, after a thread is made: each link in its parent joins it
-	 * (every member of the room can see a thread here: private rooms have
-	 * none), so its mirrors read it.
+	 * Owner hook, in the mutation that made a thread, before its result: each
+	 * link in its parent joins it (every member of the room can see a thread
+	 * here: private rooms have none), so its mirrors read it from its first
+	 * records on.
 	 */
-	async threadCreated(threadId: string, parentId: string): Promise<void> {
+	threadCreated(threadId: string, parentId: string): void {
 		for (const linkId of Object.keys(this.store.remoteLinks(this.now()))) {
-			if (this.store.isRoomMember(parentId, linkId, this.now())) await this.joinThread(linkId, threadId);
+			if (!this.store.isRoomMember(parentId, linkId, this.now())) continue;
+			try {
+				this.host.addMemberNow({ ipKey: MIRROR_IP_KEY }, threadId, linkId);
+			} catch (error) {
+				console.warn(JSON.stringify({ event: "remote_thread_join_failed", link: linkId, room_id: threadId, error: error instanceof Error ? error.message : String(error) }));
+			}
 		}
 	}
 

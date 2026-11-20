@@ -388,13 +388,12 @@ it('makes and saves a thread of a shared room as a remote user, and joins the li
 		const shadowId = `${carol}@127.0.0.1:8096`;
 		const made = await exchange(link, unique('thread'), 'room_set', { parent_room_id: roomId, title: 'Plans', ext: { remote: { user_id: carol } } });
 		const threadId = made.frame.result.room_id as string;
-		// The thread's record reached the link before the result (§1).
+		// The thread's record reached the link before the result (§1), and so did the link's own join of it.
 		expect(made.skipped.some((frame) => frame.method === 'room_update' && frame.params.updated?.some((room: { room_id: string }) => room.room_id === threadId))).toBe(true);
+		expect(made.skipped.some((frame) => frame.method === 'room_update' && frame.params.joined?.[0]?.room_id === threadId)).toBe(true);
 		const listed = await request(admin, unique('list'), 'room_list', { room_id: threadId, members: true });
 		expect([...listed.result.joined, ...listed.result.not_joined][0]).toMatchObject({ room_id: threadId, parent_room_id: roomId, title: 'Plans' });
 		expect(listed.result.users.map((user: { user_id: string }) => user.user_id)).toContain(shadowId);
-		// The link joins its remote user's thread too.
-		await until(link, (frame) => frame.method === 'room_update' && frame.params.joined?.[0]?.room_id === threadId);
 		const posted = await request(link, unique('post'), 'message', { room_id: threadId, body: { text: 'in the thread' }, ext: { remote: { user_id: unique('dave') } } });
 		expect(posted.result.message_id).toBeDefined();
 		const saved = await request(link, unique('save'), 'room_set', { room_id: threadId, title: 'Plans v2', ext: { remote: { user_id: carol } } });

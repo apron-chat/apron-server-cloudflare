@@ -5396,10 +5396,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 				this.noteRoom(room.room_id, true);
 				this.deliver(roomUpdate("updated", room), [room.room_id, parentId]);
 				if (result.membership) this.broadcastRecord(result.membership);
+				// The links in the room join its new thread before the result, so its records reach them from the first.
+				if (result.created) this.remote?.threadCreated(room.room_id, parentId);
 			}
 			this.reply(socket, request, result.result);
-			// The links in the room join its new thread, so their mirrors read it (queued after this mutation).
-			if (room && result.created && !result.deduplicated) void this.remote?.threadCreated(room.room_id, parentId).catch(() => undefined);
 		});
 	}
 
@@ -5499,8 +5499,6 @@ export class ApronDemoServer extends DurableObject<Env> {
 				this.noteRoom(room.room_id, true);
 				const scope = [room.room_id, ...(room.parent_room_id !== undefined ? [room.parent_room_id] : [])];
 				if (result.created) {
-					// ext:remote hook: the links in the room join its new thread, so their mirrors read it.
-					if (room.parent_room_id !== undefined) void this.remote?.threadCreated(room.room_id, room.parent_room_id).catch(() => undefined);
 					if (room.parent_room_id === undefined && !room.private) this.topLevelRooms?.push(room.room_id);
 					this.setRooms(identity.user_id, [...(this.liveRoomsOf(identity.user_id) ?? []), room.room_id]);
 					// A new room's only member is its creator: no storage to read.
@@ -5509,6 +5507,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 					this.sendToUser(identity.user_id, this.joinedUpdate(room, [creator], undefined, undefined, result.membership));
 					if (result.membership) this.broadcastRecord(result.membership, identity.user_id);
 					this.deliver(roomUpdate("updated", room), scope, (state) => state.userId !== identity.user_id);
+					// ext:remote hook: the links in the room join its new thread, so their mirrors read it.
+					if (room.parent_room_id !== undefined) this.remote?.threadCreated(room.room_id, room.parent_room_id);
 				} else {
 					this.deliver(roomUpdate("updated", room), scope, (state) => state.userId !== identity.user_id);
 					this.sendToUser(identity.user_id, roomUpdate("updated", room));
@@ -8887,20 +8887,23 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * it when the actor is in it.
 	 */
 	private async joinMember(actor: { ipKey: string; userId?: string }, roomId: string, userId: string): Promise<void> {
+		await this.runMutation(async () => this.joinMemberNow(actor, roomId, userId));
+	}
+
+	/** joinMember's work, within a mutation the caller runs. */
+	private joinMemberNow(actor: { ipKey: string; userId?: string }, roomId: string, userId: string): void {
 		const room = this.store.getRoom(roomId, nowMs());
 		if (!room) throw { name: "invalid_params", message: "Unknown room" } satisfies ProtocolError;
 		const totals = new Map<string, number>();
 		const before = this.membersOf([roomId], totals);
-		await this.runMutation(async () => {
-			const change = this.store.changeMembership({ userId, ipKey: actor.ipKey, roomId, join: true, now: nowMs(), ...(actor.userId ? { actorId: actor.userId } : {}) });
-			if (!change.changed) return;
-			this.setRooms(userId, change.rooms);
-			if (change.membership) this.broadcastRecord(change.membership, userId);
-			const peer = this.connectionsOf(userId)[0];
-			const state = peer ? connectionAttachment(peer) : null;
-			const joiner = state ? this.complete(state) : null;
-			if (joiner) this.sendToUser(userId, this.joinedUpdate(change.room ?? room, before.get(roomId), joiner, totals.get(roomId), change.membership));
-		});
+		const change = this.store.changeMembership({ userId, ipKey: actor.ipKey, roomId, join: true, now: nowMs(), ...(actor.userId ? { actorId: actor.userId } : {}) });
+		if (!change.changed) return;
+		this.setRooms(userId, change.rooms);
+		if (change.membership) this.broadcastRecord(change.membership, userId);
+		const peer = this.connectionsOf(userId)[0];
+		const state = peer ? connectionAttachment(peer) : null;
+		const joiner = state ? this.complete(state) : null;
+		if (joiner) this.sendToUser(userId, this.joinedUpdate(change.room ?? room, before.get(roomId), joiner, totals.get(roomId), change.membership));
 	}
 
 	/**
@@ -8950,6 +8953,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			reply: (socket, request, result) => this.reply(socket as WebSocketConnection, request, result),
 			notice: (socket, roomId, text) => this.sendNotice(socket as WebSocketConnection, roomId, text),
 			addMember: (actor, roomId, userId) => this.joinMember(actor, roomId, userId),
+			addMemberNow: (actor, roomId, userId) => this.joinMemberNow(actor, roomId, userId),
 			removeMember: (actor, roomId, userId) => this.removeMember(actor, roomId, userId),
 			mintLinkToken: (linkId) => this.mintLinkToken(linkId),
 			forgetLinkTokens: (linkId) => this.forgetLinkTokens(linkId),
