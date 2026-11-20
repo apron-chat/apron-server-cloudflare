@@ -460,6 +460,35 @@ it("keeps imported reaction sets and room records only as a post would: one cont
 	});
 });
 
+it("takes a room with only joins and leaves past its creation as empty, so a fresh server's general is filled (the importing admin joined it)", async () => {
+	await withStore("restore-empty-room", CONFIG, (store, clock) => {
+		const overruns = watched(store);
+		expect(store.roomIsEmpty("general")).toBe(true);
+		expect(store.roomIsEmpty("no-such-room")).toBe(false);
+		// Signing in joins general: a logged membership, and still empty.
+		for (const userId of ["ada", "bob"]) {
+			store.registerIdentity({ userId, name: userId, userHandle: `handle-${userId}`, now: clock.value, ipKey: `${userId}-ip`, credential: { credentialId: `cred-${userId}`, userId, publicKey: "AAAA", counter: 0 } });
+		}
+		const membership = (userId: string, join: boolean) => {
+			clock.value += 1_000;
+			store.changeMembership({ userId, ipKey: `${userId}-ip`, roomId: "general", join, now: clock.value });
+		};
+		membership("ada", true);
+		membership("bob", true);
+		membership("bob", false);
+		expect(store.historyLookup([clock.value]).map((record) => record.kind)).toEqual(["membership"]);
+		expect(store.roomIsEmpty("general")).toBe(true);
+		// A message, or a room record past its creation, puts it in use.
+		store.mutate(input(clock, "ada", "message", { room_id: "general", body: { text: "hello" } }));
+		expect(store.roomIsEmpty("general")).toBe(false);
+		const thread = store.mutate(input(clock, "ada", "room_set", { parent_room_id: "general", title: "Thread" })).result as { room_id: string };
+		expect(store.roomIsEmpty(thread.room_id)).toBe(true);
+		store.mutate(input(clock, "ada", "room_set", { room_id: thread.room_id, title: "Renamed" }));
+		expect(store.roomIsEmpty(thread.room_id)).toBe(false);
+		expect(overruns).toEqual([]);
+	});
+});
+
 it("imports through the Store: IDs that cannot stand here become placeholders, and no message is a guest's", async () => {
 	await withStore("restore-import", CONFIG, async (store, clock, state) => {
 		const base = clock.value - 60_000;

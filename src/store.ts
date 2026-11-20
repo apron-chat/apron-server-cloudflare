@@ -1010,6 +1010,8 @@ export const RESTORE_ENTRIES_SINGLE = 20_000;
  * the call is refused, as a room's records are sent oldest first.
  */
 const RESTORE_REPLAY_CAP = 1_024;
+/** Records past a room's creation roomIsEmpty reads at most: joins and leaves alone (the importing admin's own join of `general`) leave a room an import may fill. */
+const EMPTY_ROOM_SCAN = 64;
 /** How far past the clock a restored record's log ID or commit time may be (importArchive's FUTURE_LOG_ID_MS). */
 const RESTORE_FUTURE_MS = 5 * 60_000;
 /** The users one restoreUsers call takes at most. */
@@ -4283,9 +4285,15 @@ export class Store {
    */
   roomIsEmpty(roomId: string, now = this.clock.now()): boolean {
     this.ensureReady();
-    return this.reserved({ reads: 8 }, true, now, () => {
+    return this.reserved({ reads: 8 + EMPTY_ROOM_SCAN }, true, now, () => {
       const room = this.rawRows<{ created_log_id: number; latest_log_id: number }>("SELECT created_log_id, latest_log_id FROM rooms WHERE room_id = ? LIMIT 1", roomId)[0];
-      return room !== undefined && integerColumn(room.latest_log_id) <= integerColumn(room.created_log_id);
+      if (room === undefined) return false;
+      if (integerColumn(room.latest_log_id) <= integerColumn(room.created_log_id)) return true;
+      // Joins and leaves alone leave it empty: the admin who runs the import
+      // joined `general` by signing in. Only the first EMPTY_ROOM_SCAN records
+      // past its creation are looked at; a room with more is taken as in use.
+      const later = this.rawRows<{ kind: string }>("SELECT kind FROM records WHERE room_id = ? AND log_id > ? ORDER BY log_id LIMIT ?", roomId, integerColumn(room.created_log_id), EMPTY_ROOM_SCAN);
+      return later.length < EMPTY_ROOM_SCAN && later.every((row) => row.kind === "membership");
     });
   }
 
