@@ -556,3 +556,32 @@ it('a mirror takes the owner\'s restore of a deleted message, but keeps a copy i
 		expect(store.copyOf(server, '901')).toBe(hidden);
 	});
 });
+
+it('a mirror thread takes its first members from the room_update that joins the link to it', async () => {
+	await runInDurableObject(env.DEMO.getByName(`mirror-thread-${crypto.randomUUID()}`), async (_instance, state) => {
+		const now = Date.now();
+		const store = new Store(state, {});
+		store.initialize();
+		state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES ('bob', '', 'Bob', 'registered', ?, ?, '[]')", now, now);
+		const server = 'ws://a.example/ws';
+		store.setMirrorState({ rooms: [{ room_id: 'general', server, owner_room: 'ops', token: 't', start: 0, threads: {} }], servers: { [server]: { cursor: 0 } } });
+		const host = {
+			store, self: 'wss://demo.test/ws', runMutation: (fn: () => Promise<void>) => fn(), broadcastRecord: () => undefined, pushFor: () => undefined, roomChanged: () => undefined,
+			addMember: async (actor: { ipKey: string }, roomId: string, userId: string) => { store.changeMembership({ userId, ipKey: actor.ipKey, roomId, join: true }); },
+		} as unknown as MirrorHost;
+		const mirror = new RemoteRooms(host) as unknown as { apply(server: string, frame: Record<string, unknown>): Promise<void> };
+		// The owner's thread, made by this server's Bob (a remote user there), with Carol of the owner and the link.
+		await mirror.apply(server, { method: 'room_update', params: {
+			joined: [{ room_id: '5000', parent_room_id: 'ops', title: 'Plans', log_id: '5000', members: [{ user_id: 'bob@demo.test' }, { user_id: 'carol' }, { user_id: 'link_1' }] }],
+			users: [
+				{ user_id: 'bob@demo.test', name: 'Bob', roles: [], ext: { remote: { server: 'wss://demo.test/ws', user_id: 'bob' } } },
+				{ user_id: 'carol', name: 'Carol', roles: [] },
+				{ user_id: 'link_1', name: 'Link bot', roles: ['bot'], ext: { remote: { server: 'wss://demo.test/ws' } } },
+			],
+		} });
+		const thread = store.mirrorState().rooms[0].threads['5000'];
+		expect(thread).toBeDefined();
+		// Bob as himself, Carol as a remote user of the owner; never the link.
+		expect(store.roomMembers([thread], 10).get(thread)?.map((member) => member.user_id).sort()).toEqual(['bob', 'carol@a.example']);
+	});
+});

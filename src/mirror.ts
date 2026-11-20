@@ -195,6 +195,7 @@ export class RemoteRooms {
 		let owned: Record<string, unknown> | undefined;
 		// The room's threads that the link is in: each gets a mirror thread now (their records after the start follow).
 		let threads: Array<Record<string, unknown>> = [];
+		let threadUsers: unknown;
 		try {
 			connection = await LinkConnection.open(invite.server, invite.token);
 			const bound = boundServer(connection);
@@ -204,8 +205,9 @@ export class RemoteRooms {
 			const rooms = [...(listed.result?.joined as unknown[] ?? []), ...(listed.result?.not_joined as unknown[] ?? [])] as Array<Record<string, unknown>>;
 			owned = rooms.find((room) => room.room_id === invite.room);
 			if (!owned) throw new Error("the link is not in that room");
-			const listedThreads = await connection.call("room_list", { parent_room_id: invite.room, filter: "joined" }, `mirror-threads:${this.now()}`);
+			const listedThreads = await connection.call("room_list", { parent_room_id: invite.room, filter: "joined", members: true }, `mirror-threads:${this.now()}`);
 			threads = (listedThreads.result?.joined as Array<Record<string, unknown>> | undefined) ?? [];
+			threadUsers = listedThreads.result?.users;
 		} catch (error) {
 			throw { name: "invalid_params", message: `Could not connect to ${invite.server}: ${error instanceof Error ? error.message : String(error)}`.slice(0, 200) } satisfies ProtocolError;
 		} finally {
@@ -233,6 +235,7 @@ export class RemoteRooms {
 		this.store.setMirrorState(state, this.now());
 		// A private mirror room has no threads here (copyRoom leaves them out).
 		for (const thread of threads) await this.applyRecord(invite.server, "rooms", thread);
+		await this.seedThreads(invite.server, threads, threadUsers);
 		this.host.notice(socket, room.room_id, `Mirroring ${title} from ${remoteAuthority(invite.server)} in room \`${room.room_id}\`.`);
 		this.host.reply(socket, request, {});
 		// Live from now on, with the wake push registered, then idle until there is more.
@@ -765,6 +768,36 @@ export class RemoteRooms {
 			if (kind !== "rooms" && Number.isFinite(logId) && logId <= cursor) continue;
 			await this.applyRecord(server, kind, record);
 			if (kind !== "rooms" && Number.isFinite(logId)) this.advance(server, logId);
+		}
+		// The link was joined to a thread: its first members come with it (the creator joined before the link).
+		if (frame.method === "room_update") await this.seedThreads(server, (params.joined as Array<Record<string, unknown>> | undefined) ?? [], params.users);
+	}
+
+	/**
+	 * The members of owner threads that the link was just joined to (a
+	 * `room_update` `joined`, or `/remote connect`'s listing), into their
+	 * mirror threads: remote users as copyMember joins them, and this
+	 * server's own users (a thread's creator) as themselves, which goes back
+	 * to the owner as a join it already has. `users` are the frame's user
+	 * objects, by which bare members are mapped.
+	 */
+	private async seedThreads(server: string, rooms: Array<Record<string, unknown>>, users: unknown): Promise<void> {
+		const byId = new Map(((users as Array<Record<string, unknown>> | undefined) ?? []).map((user) => [user.user_id, user]));
+		for (const room of rooms) {
+			if (typeof room.room_id !== "string" || typeof room.parent_room_id !== "string") continue;
+			const target = this.localRoom(this.store.mirrorState(this.now()), server, room.room_id);
+			if (!target || target.roomId === target.mirror.room_id) continue;
+			for (const member of (room.members as Array<Record<string, unknown>> | undefined) ?? []) {
+				const user = byId.get(member.user_id) ?? member;
+				const remote = (user.ext as Record<string, unknown> | undefined)?.remote as Record<string, unknown> | undefined;
+				try {
+					if (remote?.server === this.host.self && typeof remote.user_id === "string") {
+						if (this.store.identityExists(remote.user_id) && !this.store.isRoomMember(target.roomId, remote.user_id, this.now())) await this.host.addMember({ ipKey: MIRROR_IP_KEY }, target.roomId, remote.user_id);
+					} else await this.copyMember(server, target.roomId, user, true);
+				} catch (error) {
+					console.warn(JSON.stringify({ event: "remote_member_skipped", server, room_id: target.roomId, user_id: String(member.user_id), error: error instanceof Error ? error.message : String(error) }));
+				}
+			}
 		}
 	}
 
