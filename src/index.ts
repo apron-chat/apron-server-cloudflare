@@ -973,6 +973,12 @@ function fitName(text: string, limits: { maxNameCodePoints: number; maxNameBytes
  * writes. The server-wide frame limits still hold.
  */
 const LINK_FRAMES_PER_MINUTE = 600;
+/**
+ * The `room_list` requests a minute a link may make at least (extension
+ * `ext:remote`; the recipe's suggestion), past the plan's per-user limit.
+ * Its `history` pages are the plan's per-user ones, 10 or more a minute.
+ */
+const LINK_LISTINGS_PER_MINUTE = 10;
 
 /**
  * Whether a connection is signed in as a link (extension `ext:remote`): its
@@ -7736,7 +7742,9 @@ export class ApronDemoServer extends DurableObject<Env> {
 			attachment.listedJoined = true;
 			writeAttachment(socket, attachment);
 		} else {
-			const retry = this.throttleRetry(identity.user_id, "room_list", this.config.limits.roomListRequestsPerUserMinute, now);
+			// ext:remote hook: a link lists at least LINK_LISTINGS_PER_MINUTE, as a mirror checks its rooms and threads on each connection.
+			const perMinute = isLinkConnection(attachment) ? Math.max(LINK_LISTINGS_PER_MINUTE, this.config.limits.roomListRequestsPerUserMinute) : this.config.limits.roomListRequestsPerUserMinute;
+			const retry = this.throttleRetry(identity.user_id, "room_list", perMinute, now);
 			if (retry !== undefined) throw { name: "retry_after", message: "Room listing limited", data: { retry_after: retry, ...limitData("read") } } satisfies ProtocolError;
 			// Counted before the storage read, so a listing of an unknown room counts too.
 			this.takeThrottle(socket, identity.user_id, "room_list", Number.MAX_SAFE_INTEGER, now);

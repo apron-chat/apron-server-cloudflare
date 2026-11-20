@@ -321,7 +321,7 @@ it('joins a remote user that left a room again on its next write, but not one an
 	} finally { admin.close(); link.close(); }
 });
 
-it('lets a link send past the per-connection frame limit, and keeps it open through invalid_params', async () => {
+it('lets a link send past the per-connection frame limit and list rooms more often, and keeps it open through invalid_params', async () => {
 	const { admin, link, linkId } = await linked('ws://127.0.0.1:8090/ws');
 	try {
 		for (let i = 0; i < 5; i += 1) {
@@ -329,6 +329,9 @@ it('lets a link send past the per-connection frame limit, and keeps it open thro
 		}
 		for (let i = 0; i < 70; i += 1) expect((await request(link, `me-${i}`, 'me', {})).result.you.user_id).toBe(linkId);
 		expect(link.closed()).toBeUndefined();
+		// It lists rooms 10 times a minute, past a user's 6.
+		for (let i = 0; i < 10; i += 1) expect((await request(link, `list-${i}`, 'room_list', { filter: 'not_joined' })).error).toBeUndefined();
+		expect((await request(link, 'list-more', 'room_list', { filter: 'not_joined' })).error.data.retry_after).toBeGreaterThan(0);
 	} finally { admin.close(); link.close(); }
 });
 
