@@ -92,3 +92,27 @@ describe('a link connection', () => {
 		connection.close();
 	});
 });
+
+describe('a link connection that closes while signing in', () => {
+	afterEach(() => { vi.restoreAllMocks(); });
+
+	it('fails the open at once with the reason, and tells onClose once', async () => {
+		const pair = new WebSocketPair();
+		const owner = pair[1];
+		owner.accept();
+		owner.addEventListener('message', (event) => {
+			const frame = JSON.parse(String(event.data)) as { method: string };
+			// The owner goes away instead of answering the sign-in.
+			if (frame.method === 'auth') owner.close(1001, 'going away');
+		});
+		vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+			setTimeout(() => owner.send(JSON.stringify({ method: 'server', params: { apron: 10 } })), 0);
+			return new Response(null, { status: 101, webSocket: pair[0] });
+		});
+		const started = Date.now();
+		const closes: string[] = [];
+		await expect(LinkConnection.open('ws://owner.example/ws', 'token', { onClose: () => closes.push('closed') })).rejects.toThrow(/sign-in failed: connection (closed|failed)/);
+		expect(Date.now() - started).toBeLessThan(5_000);
+		expect(closes).toEqual(['closed']);
+	});
+});

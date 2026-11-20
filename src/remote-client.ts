@@ -217,15 +217,15 @@ export class LinkConnection {
 	}
 
 	private fail(reason: string): void {
-		if (this.closedReason === undefined) {
-			this.closedReason = reason;
-			this.onClose();
-		}
+		const first = this.closedReason === undefined;
+		if (first) this.closedReason = reason;
 		for (const [id, waiter] of this.waiting) {
 			this.waiting.delete(id);
 			waiter({ error: { code: -32603, message: reason } });
 		}
 		// Those waiting for their turn find the connection closed.
 		for (const wake of this.queued.splice(0)) wake();
+		// Last, so that whatever onClose does, every request has its answer.
+		if (first) this.onClose();
 	}
 }

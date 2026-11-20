@@ -496,10 +496,13 @@ export class RemoteRooms {
 		const token = this.tokenFor(session.server);
 		if (!token) throw new Error("nothing is mirrored from that server");
 		session.buffer = [];
-		const connection = await LinkConnection.open(session.server, token, {
+		// Unset until the sign-in is done: a close during it is the open's failure, which throws.
+		let opened: LinkConnection | undefined;
+		const connection = opened = await LinkConnection.open(session.server, token, {
 			onFrame: (frame) => this.onFrame(session, frame),
 			onClose: () => {
-				if (session.connection === connection) session.connection = undefined;
+				if (opened === undefined) return;
+				if (session.connection === opened) session.connection = undefined;
 				console.log(JSON.stringify({ event: "remote_mirror_closed", server: session.server }));
 			},
 		});

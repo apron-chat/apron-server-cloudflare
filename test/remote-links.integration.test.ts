@@ -775,3 +775,28 @@ it('a mirror reads again the records of a new mirror room that it read before th
 		} finally { vi.restoreAllMocks(); }
 	});
 });
+
+it('a mirror whose owner closes during the sign-in fails the dial with the owner\'s reason', async () => {
+	await runInDurableObject(env.DEMO.getByName(`mirror-dial-${crypto.randomUUID()}`), async (_instance, state) => {
+		const store = new Store(state, {});
+		store.initialize();
+		const server = 'ws://a.example/ws';
+		store.setMirrorState({ rooms: [{ room_id: 'general', server, owner_room: 'ops', token: 't', start: 0, threads: {} }], servers: { [server]: { cursor: 0 } } });
+		const host = { store, self: 'wss://demo.test/ws', storage: state.storage, lingerMs: 60_000, mayDial: () => true } as unknown as MirrorHost;
+		const mirror = new RemoteRooms(host) as unknown as { ensure(server: string): Promise<LinkConnection> };
+		const pair = new WebSocketPair();
+		const owner = pair[1];
+		owner.accept();
+		owner.addEventListener('message', (event) => {
+			if (JSON.parse(String(event.data)).method === 'auth') owner.close(1001, 'going away');
+		});
+		vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+			setTimeout(() => owner.send(JSON.stringify({ method: 'server', params: { apron: 10 } })), 0);
+			return new Response(null, { status: 101, webSocket: pair[0] });
+		});
+		try {
+			// Not "Cannot access 'connection' before initialization", from the close callback.
+			await expect(mirror.ensure(server)).rejects.toThrow(/^sign-in failed: connection (closed|failed)/);
+		} finally { vi.restoreAllMocks(); }
+	});
+});
