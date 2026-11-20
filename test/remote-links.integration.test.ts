@@ -223,6 +223,21 @@ it('refuses act-as writes in a room the link is not in', async () => {
 	} finally { admin.close(); link.close(); }
 });
 
+it('refuses an act-as room_leave in a room the link is not in, with not_joined', async () => {
+	const { admin, link, roomId } = await linked('ws://127.0.0.1:8086/ws');
+	try {
+		// `general` is public, and the link is not in it: denied, also for a remote user that is not there.
+		const general = await request(link, unique('general'), 'room_leave', { room_id: 'general', ext: { remote: { user_id: 'carol' } } });
+		expect(general.error).toMatchObject({ code: DENIED, data: { ext: { remote: 'not_joined' } } });
+		// A private room the link is not in is unknown to it.
+		const other = (await request(admin, unique('other'), 'room_set', { private: true })).result.room_id as string;
+		const hidden = await request(link, unique('hidden'), 'room_leave', { room_id: other, ext: { remote: { user_id: 'carol' } } });
+		expect(hidden.error).toMatchObject({ code: INVALID_PARAMS, data: { ext: { remote: 'not_joined' } } });
+		// In its own room, a remote user that is not in it leaves with no change.
+		expect((await request(link, unique('ok'), 'room_leave', { room_id: roomId, ext: { remote: { user_id: 'carol' } } })).result).toEqual({});
+	} finally { admin.close(); link.close(); }
+});
+
 it('keeps remote users\' user_ids from being issued, renamed, or acted as by anyone but a link', async () => {
 	const { admin, adminId, link, roomId, text } = await linked('ws://127.0.0.1:8085/ws');
 	const carol = unique('carol');

@@ -5348,6 +5348,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 	}
 
 	/**
+	 * A link acts only in the rooms it has joined, and in their threads
+	 * (ext:remote): a room it cannot see is unknown (`invalid_params`), and
+	 * any other is `denied`, both with `not_joined`.
+	 */
+	private assertLinkIn(socket: WebSocketConnection, attachment: ConnectionAttachment, roomId: string): void {
+		const current = connectionAttachment(socket) ?? attachment;
+		if (!this.roomExists(roomId) || !this.sees(current, roomId)) throw { name: "invalid_params", message: "unknown room", data: NOT_JOINED } satisfies ProtocolError;
+		const parent = this.parentOf(roomId);
+		const joined = current.rooms ?? [];
+		if (!joined.includes(roomId) && (parent === null || !joined.includes(parent))) throw { name: "denied", message: "This link is not in that room, so its remote users may not act there", data: NOT_JOINED } satisfies ProtocolError;
+	}
+
+	/**
 	 * Joins a link's shadow (ext:remote) to the room it writes in, with a
 	 * logged membership charged to the shadow at its link's limits, unless it
 	 * is in it already. Only into a room the link is in: one the link cannot
@@ -5356,12 +5369,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * is not (`denied`), until someone adds it back.
 	 */
 	private async shadowJoins(socket: WebSocketConnection, attachment: ConnectionAttachment, actor: ActAs, roomId: string): Promise<void> {
-		const current = connectionAttachment(socket) ?? attachment;
-		if (!this.roomExists(roomId) || !this.sees(current, roomId)) throw { name: "invalid_params", message: "unknown room", data: NOT_JOINED } satisfies ProtocolError;
-		// A link acts in the rooms it has joined, and in their threads.
-		const parent = this.parentOf(roomId);
-		const joined = current.rooms ?? [];
-		if (!joined.includes(roomId) && (parent === null || !joined.includes(parent))) throw { name: "denied", message: "This link is not in that room, so its remote users may not write there", data: NOT_JOINED } satisfies ProtocolError;
+		this.assertLinkIn(socket, attachment, roomId);
 		const userId = actor.identity.user_id;
 		if (this.store.isRoomMember(roomId, userId, nowMs())) return;
 		if (this.store.remoteUserLeft(userId, roomId, nowMs())) throw { name: "denied", message: "This remote user was removed from that room, so may not write there again", data: { ext: { remote: "removed" } } } satisfies ProtocolError;
@@ -5415,12 +5423,13 @@ export class ApronDemoServer extends DurableObject<Env> {
 	/**
 	 * A link's act-as `room_leave` (ext:remote): the shadow leaves the room,
 	 * logged and charged as its join was; `user_id` in the request is
-	 * ignored. A shadow that does not exist or is not in the room changes
-	 * nothing.
+	 * ignored. Only in a room the link has joined, or a thread of one
+	 * (assertLinkIn). A shadow that does not exist or is not in the room
+	 * changes nothing.
 	 */
 	private async shadowLeaves(socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, actor: ActAs): Promise<void> {
 		const roomId = requiredString(request.params, "room_id");
-		if (!this.roomExists(roomId) || !this.sees(connectionAttachment(socket) ?? attachment, roomId)) throw { name: "invalid_params", message: "Unknown room", data: NOT_JOINED } satisfies ProtocolError;
+		this.assertLinkIn(socket, attachment, roomId);
 		const userId = actor.identity.user_id;
 		if (!this.store.isRoomMember(roomId, userId, nowMs())) {
 			this.reply(socket, request, {});
