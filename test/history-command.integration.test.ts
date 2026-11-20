@@ -247,33 +247,20 @@ async function holding<R>(holder: HistoryHolder, fn: () => Promise<R>): Promise<
 	}
 }
 
-it('runs one history job at a time: an import or export waits for a running cycle', async () => {
+// One history job at a time, and no /purge or /rename beside an import:
+// its later writes would put back what they remove.
+it.each([
+	[{ kind: 'cycle' }, '/history import backups/none.jsonl', 'History upkeep is running; try again in a moment'],
+	[{ kind: 'cycle' }, '/history export', 'History upkeep is running; try again in a moment'],
+	[{ kind: 'job', job: 'import' }, '/purge nobody-here', 'A history import is running; try again when it ends'],
+	[{ kind: 'job', job: 'import' }, '/rename nobody-here someone-else', 'A history import is running; try again when it ends'],
+	[{ kind: 'rewrite' }, '/history import backups/none.jsonl', 'A purge or rename is running; try again in a moment'],
+] as Array<[HistoryHolder, string, string]>)('while %j holds the history lock, refuses %s', async (holder, text, message) => {
 	const admin = await signedInAdmin();
 	try {
-		await holding({ kind: 'cycle' }, async () => {
-			for (const [id, text] of [['busy-import', '/history import backups/none.jsonl'], ['busy-export', '/history export']]) {
-				const refused = await command(admin, id, text);
-				expect(refused.frame.error, text).toMatchObject({ code: -32602, message: 'History upkeep is running; try again in a moment' });
-			}
-		});
-	} finally {
-		admin.close();
-	}
-});
-
-it('refuses /purge and /rename while an import runs: its later writes would put back what they remove', async () => {
-	const admin = await signedInAdmin();
-	try {
-		await holding({ kind: 'job', job: 'import' }, async () => {
-			for (const [id, text] of [['import-purge', '/purge nobody-here'], ['import-rename', '/rename nobody-here someone-else']]) {
-				const refused = await command(admin, id, text);
-				expect(refused.frame.error, text).toMatchObject({ code: -32602, message: 'A history import is running; try again when it ends' });
-			}
-		});
-		// And an import waits for a purge or rename that runs.
-		await holding({ kind: 'rewrite' }, async () => {
-			const refused = await command(admin, 'rewrite-import', '/history import backups/none.jsonl');
-			expect(refused.frame.error).toMatchObject({ code: -32602, message: 'A purge or rename is running; try again in a moment' });
+		await holding(holder, async () => {
+			const refused = await command(admin, 'busy', text);
+			expect(refused.frame.error).toMatchObject({ code: -32602, message });
 		});
 	} finally {
 		admin.close();

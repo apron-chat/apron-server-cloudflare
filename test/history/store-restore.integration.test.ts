@@ -302,7 +302,7 @@ it("never lets the idle prune remove an unclaimed placeholder, until the claim t
 	});
 });
 
-it("keeps a cold tier's chunk index and the backups' schedule in SQLite, within their reservations", async () => {
+it("keeps a cold tier's chunk index and the backups' schedule in SQLite, within their reservations however many chunks it lists", async () => {
 	await withStore("chunk-index", CONFIG, async (store, clock, state) => {
 		const overruns = watched(store);
 		const index = store.chunkIndex("cold");
@@ -327,6 +327,20 @@ it("keeps a cold tier's chunk index and the backups' schedule in SQLite, within 
 		expect(store.historyMetaNumber("history:export:nightly", clock.value)).toBe(0);
 		expect(() => store.setHistoryMeta("history:published", "1", clock.value)).toThrow();
 		expect(() => store.historyMetaNumber("identity_count", clock.value)).toThrow();
+
+		// However many chunks it lists, the cold tier over it stays within them.
+		const chunks = 3_000;
+		const many = Array.from({ length: chunks }, (_, i) => ({ first: i * 10 + 1, last: i * 10 + 5, key: `history/x/${i}.jsonl`, records: 1, bytes: 100, rooms: [`r${i % 5}`], users: ["ada"] }));
+		for (let i = 0; i < chunks; i += 500) await store.chunkIndex("cold").update({ put: many.slice(i, i + 500) });
+		const tier = new ColdHistoryTier({ name: "cold", store: new MemoryBlobStore(), index: store.chunkIndex("cold"), codecs: HISTORY_CODECS, prefix: "history/x/", clock: clock.clock });
+		// Keep the newest 100 records (a chunk each): the floor is the 100th newest chunk's first.
+		expect(await tier.floorFor({ records: 100, thresholdPercent: 100 }, { now: clock.value, below: Number.MAX_SAFE_INTEGER })).toBe((chunks - 100) * 10 + 1);
+		expect(await tier.floorFor({ records: 10_000, thresholdPercent: 100 }, { now: clock.value, below: Number.MAX_SAFE_INTEGER })).toBeUndefined();
+		expect((await tier.stats()).records).toBe(chunks);
+		expect(await tier.trimBelow(201, 1_000)).toBe(20);
+		expect((await store.chunkIndex("cold").list()).length).toBe(chunks - 20);
+		// The objects are missing here, so reads find nothing.
+		expect(await tier.read({ roomIds: ["r0"], lower: 1, upper: Number.MAX_SAFE_INTEGER, forward: false, limit: 10 })).toEqual([]);
 		expect(overruns).toEqual([]);
 	});
 });
@@ -456,23 +470,4 @@ it("exports a room's whole history after a retitle: the listing's creation, not 
 	expect(report.references).toBe(0);
 	expect(report.records).toBe(archive.records.length);
 	expect(archive.records.filter((record) => record.kind === "message")).toHaveLength(2);
-});
-
-it("runs the cold tier over the Store's chunk index within its reservations, however many chunks it lists", async () => {
-	await withStore("chunk-bounds", CONFIG, async (store, clock) => {
-		const overruns = watched(store);
-		const chunks = 3_000;
-		const refs = Array.from({ length: chunks }, (_, i) => ({ first: i * 10 + 1, last: i * 10 + 5, key: `history/x/${i}.jsonl`, records: 1, bytes: 100, rooms: [`r${i % 5}`], users: ["ada"] }));
-		for (let i = 0; i < chunks; i += 500) await store.chunkIndex("cold").update({ put: refs.slice(i, i + 500) });
-		const tier = new ColdHistoryTier({ name: "cold", store: new MemoryBlobStore(), index: store.chunkIndex("cold"), codecs: HISTORY_CODECS, prefix: "history/x/", clock: clock.clock });
-		// Keep the newest 100 records (a chunk each): the floor is the 100th newest chunk's first.
-		expect(await tier.floorFor({ records: 100, thresholdPercent: 100 }, { now: clock.value, below: Number.MAX_SAFE_INTEGER })).toBe((chunks - 100) * 10 + 1);
-		expect(await tier.floorFor({ records: 10_000, thresholdPercent: 100 }, { now: clock.value, below: Number.MAX_SAFE_INTEGER })).toBeUndefined();
-		expect((await tier.stats()).records).toBe(chunks);
-		expect(await tier.trimBelow(201, 1_000)).toBe(20);
-		expect((await store.chunkIndex("cold").list()).length).toBe(chunks - 20);
-		// The objects are missing here, so reads find nothing.
-		expect(await tier.read({ roomIds: ["r0"], lower: 1, upper: Number.MAX_SAFE_INTEGER, forward: false, limit: 10 })).toEqual([]);
-		expect(overruns).toEqual([]);
-	});
 });

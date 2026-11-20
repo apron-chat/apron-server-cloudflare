@@ -130,6 +130,7 @@ describe("codecs", () => {
 		expect(opened.archive.rooms).toHaveLength(1);
 		const plain = await readEncodedArchive(streamOf([await written([gzip], async (writer) => { await writer.header({ apron_archive: 1 }); })]), { codecs: [gzip] });
 		expect(plain.provenance).toBe("unverified");
+		expect((await readEncodedArchive(streamOf([encoder.encode('{"apron_archive":1}\n')]))).provenance).toBe("unverified");
 		// A damaged archive gives nothing to trust: it does not read at all.
 		await expect(readEncodedArchive(streamOf([bytes.slice(0, bytes.length - 4)]), { codecs: [gzip, sealed] })).rejects.toThrow();
 	});
