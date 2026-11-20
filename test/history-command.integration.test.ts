@@ -124,7 +124,7 @@ type Runtime = {
 	noteD1Missing(now: number): Promise<void>;
 	runScheduledBackup(now: number): Promise<void>;
 	backupStore(): unknown;
-	store: { historyMetaNumber(key: string): number; setHistoryMeta(key: string, value: string | null): void; historyStatePort(): { setValue(key: string, value: string | null): void } };
+	store: { historyMetaNumber(key: string): number; setHistoryMeta(key: string, value: string | null): void; historyStatePort(): { setValue(key: string, value: string | null): void }; setHistoryImportJournal(value: string | null): void };
 };
 
 /** Runs `fn` on the runtime, then puts back what it changed of it. */
@@ -263,6 +263,30 @@ it.each([
 			expect(refused.frame.error).toMatchObject({ code: -32602, message });
 		});
 	} finally {
+		admin.close();
+	}
+});
+
+// The lock lives in memory, but an import's journal outlives a restart: an
+// import left unfinished (its object evicted mid-import) still refuses
+// /purge and /rename, which its resumed writes would undo.
+it('refuses /purge and /rename while an unfinished import\'s journal remains, with no lease held', async () => {
+	const admin = await signedInAdmin();
+	try {
+		await runInDurableObject(stub(), (instance) => {
+			const runtime = instance as unknown as Runtime;
+			expect(runtime.historySchedule.holder).toBeUndefined();
+			runtime.store.setHistoryImportJournal(JSON.stringify({ archive: 'left-over', users: {}, ids: { mode: 'original', moved: [] }, rooms: [] }));
+		});
+		for (const text of ['/purge nobody-here', '/rename nobody-here someone-else']) {
+			const refused = await command(admin, `pending-${text.length}`, text);
+			expect(refused.frame.error).toMatchObject({ code: -32602 });
+			expect(refused.frame.error.message).toMatch(/unfinished history import is pending.*restart/);
+		}
+		// Each refusal gave its lease back.
+		await runInDurableObject(stub(), (instance) => expect((instance as unknown as Runtime).historySchedule.holder).toBeUndefined());
+	} finally {
+		await runInDurableObject(stub(), (instance) => (instance as unknown as Runtime).store.setHistoryImportJournal(null));
 		admin.close();
 	}
 });

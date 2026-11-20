@@ -919,7 +919,8 @@ the newest `BACKUP_KEEP` are deleted, and nothing else under `backups/`.
   (keys are to the second); one export or import runs at a time, and none
   while history upkeep runs (`src/history/schedule.ts`); `/purge` and
   `/rename` are refused while an import runs, and an import while one of
-  them does.
+  them does, and also while an unfinished import's journal remains (after
+  a restart mid-import): finish it, or abandon it with `restart`, first.
 - **`/history import <key> [dry-run] [match|new] [renumber] [restart]`** (admins) reads
   an object of the backup store (at most 16 MiB, stored and decoded: a
   backup past that is warned of when written, and a streaming import is

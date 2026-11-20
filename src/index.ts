@@ -8880,6 +8880,21 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private async underHistoryLease<H extends HistoryHolder, R>(holder: H, fn: (lease: HistoryLease<H>) => Promise<R>): Promise<R> {
 		const lease = this.historySchedule.acquire(holder);
 		if (isRefusal(lease)) throw { name: "invalid_params", message: refusalMessage(lease) } satisfies ProtocolError;
+		// The schedule's lease lives in memory; an import's journal outlives a restart. An
+		// unfinished import resumed later would write back what a /purge or /rename removed.
+		if (holder.kind === "rewrite") {
+			let pending: boolean;
+			try {
+				pending = this.store.historyImportJournal() !== undefined;
+			} catch (error) {
+				lease.release();
+				throw error;
+			}
+			if (pending) {
+				lease.release();
+				throw { name: "invalid_params", message: "An unfinished history import is pending: run its `/history import <key>` again to finish it, or `/history import <key> restart` to abandon it; /purge and /rename wait until then" } satisfies ProtocolError;
+			}
+		}
 		try {
 			return await fn(lease);
 		} finally {
