@@ -92,6 +92,8 @@ const REMOTE_MEMBERS_LIMIT = 1_000;
 const MAX_QUEUED_MEMBERSHIPS = 200;
 /** While anything is mirrored, the alarm reads every owner this often, in case a wake push was lost. */
 const MIRROR_CHECK_MS = 5 * 60_000;
+/** A wake push's `TTL` (§4.9.2): the mirror reads every MIRROR_CHECK_MS anyway. */
+const WAKE_TTL_SECONDS = 300;
 /** At most one wake push a link this often (the owner's debounce). */
 const WAKE_INTERVAL_MS = 2_000;
 /** History pages a catch-up reads at a time. */
@@ -374,7 +376,8 @@ export class RemoteRooms {
 					slot.last = Date.now();
 					void fetch(registration.url, {
 						method: "POST",
-						headers: { Authorization: `Bearer ${registration.token}`, "Content-Type": "application/json" },
+						// §4.9.2: a push without `message` is `low`; a wake older than the mirror's own check is worth nothing.
+						headers: { Authorization: `Bearer ${registration.token}`, "Content-Type": "application/json", TTL: String(WAKE_TTL_SECONDS), Urgency: "low" },
 						body: JSON.stringify(registration.push_id ? { push_id: registration.push_id } : {}),
 					}).then((response) => response.body?.cancel(), (error) => {
 						console.warn(JSON.stringify({ event: "remote_wake_failed", link: linkId, error: error instanceof Error ? error.message : String(error) }));

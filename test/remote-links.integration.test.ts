@@ -1,5 +1,5 @@
 import { env, runInDurableObject } from 'cloudflare:test';
-import { afterEach, beforeEach, expect, it } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { Store } from '../src/store';
 import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
 
@@ -408,7 +408,7 @@ it('makes and saves a thread of a shared room as a remote user, and joins the li
 });
 
 it('takes a link\'s relay wake push for ext:remote, and nobody else\'s', async () => {
-	const { admin, link } = await linked('ws://127.0.0.1:8097/ws');
+	const { admin, link, roomId } = await linked('ws://127.0.0.1:8097/ws');
 	try {
 		// Only to the link's own server (127.0.0.1:8097 here), http there being a loopback host.
 		expect((await request(link, unique('dev'), 'push_register', { kind: 'relay', url: 'http://127.0.0.1:8097/remote/wake/abcdefgh', token: 't0ken', wake: ['ext:remote'] })).result).toEqual({});
@@ -418,7 +418,22 @@ it('takes a link\'s relay wake push for ext:remote, and nobody else\'s', async (
 		// Anyone else's relay push is the server's ordinary push_register, which has no relay kind.
 		const other = await request(admin, unique('other'), 'push_register', { kind: 'relay', url: 'https://mirror.example/x', token: 't', wake: ['ext:remote'] });
 		expect(other.error).toBeDefined();
-	} finally { admin.close(); link.close(); }
+		// A record of the link's room wakes it: a POST of {"push_id"} as JSON, with the token and §4.9.2's TTL and Urgency.
+		const posts: Array<{ url: string; method: string; headers: Headers; body: string }> = [];
+		vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+			const sent = new Request(input as RequestInfo, init as RequestInit);
+			posts.push({ url: sent.url, method: sent.method, headers: sent.headers, body: await sent.text() });
+			return new Response(null, { status: 204 });
+		});
+		expect((await request(link, unique('wake'), 'push_register', { kind: 'relay', url: 'http://127.0.0.1:8097/remote/wake/abcdefgh', token: 't0ken', push_id: 'p1', wake: ['ext:remote'] })).result).toEqual({});
+		expect((await request(admin, unique('post'), 'message', { room_id: roomId, body: { text: 'wake up' } })).result.message_id).toBeDefined();
+		for (let i = 0; i < 100 && !posts.length; i += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+		const wake = posts.find((post) => post.url === 'http://127.0.0.1:8097/remote/wake/abcdefgh')!;
+		expect(wake.method).toBe('POST');
+		expect(Object.fromEntries(['authorization', 'content-type', 'ttl', 'urgency'].map((name) => [name, wake.headers.get(name)])))
+			.toEqual({ authorization: 'Bearer t0ken', 'content-type': 'application/json', ttl: '300', urgency: 'low' });
+		expect(JSON.parse(wake.body)).toEqual({ push_id: 'p1' });
+	} finally { vi.restoreAllMocks(); admin.close(); link.close(); }
 });
 
 it('changes nothing while REMOTE_SELF is unset: no capability, no /remote, links act as bots, ext.remote dropped', async () => {
