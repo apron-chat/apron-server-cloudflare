@@ -1,6 +1,7 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { Store } from '../src/store';
+import { Store, type MessageSnapshot } from '../src/store';
+import { RemoteRooms, type MirrorHost } from '../src/mirror';
 import { connect as open, exchange, request, until, type Frame, type Peer } from './helpers/socket';
 
 // The owner's side of extension `ext:remote`: an admin's `/remote invite` binds
@@ -511,4 +512,47 @@ it('takes a link\'s remote users out of the room and its threads when the link l
 		const again = await request(link, unique('again'), 'room_join', { room_id: roomId, ext: { remote: { user_id: carol } } });
 		expect(again.result).toEqual({});
 	} finally { admin.close(); link.close(); }
+});
+
+it('a mirror takes the owner\'s restore of a deleted message, but keeps a copy its admin hid', async () => {
+	await runInDurableObject(env.DEMO.getByName(`mirror-restore-${crypto.randomUUID()}`), async (_instance, state) => {
+		const now = Date.now();
+		const store = new Store(state, {});
+		store.initialize();
+		state.storage.sql.exec("INSERT INTO identities (user_id, user_handle, name, tier, created_ms, updated_ms, roles_json) VALUES ('boss', '', 'Boss', 'registered', ?, ?, '[\"admin\"]')", now, now);
+		const server = 'ws://a.example/ws';
+		store.setMirrorState({ rooms: [{ room_id: 'general', server, owner_room: 'ops', token: 't', start: 0, threads: {} }], servers: { [server]: { cursor: 0 } } });
+		const host = { store, self: 'wss://demo.test/ws', runMutation: (fn: () => Promise<void>) => fn(), broadcastRecord: () => undefined, pushFor: () => undefined } as unknown as MirrorHost;
+		const mirror = new RemoteRooms(host) as unknown as { copyMessage(server: string, snapshot: MessageSnapshot): Promise<void> };
+		let logId = 1_000;
+		const owner = (messageId: string, fields: Record<string, unknown>) => mirror.copyMessage(server, {
+			message_id: messageId, log_id: String(++logId), room_id: 'ops', from: { user_id: 'carol', name: 'Carol' }, ...fields,
+		} as unknown as MessageSnapshot);
+		const copyState = (copy: string) => {
+			const message = store.pushedMessage(copy)!;
+			return message.deleted ? 'deleted' : message.body!.text;
+		};
+
+		// The owner deletes and restores: the copy follows.
+		await owner('900', { body: { text: 'first' } });
+		const copy = store.copyOf(server, '900')!;
+		expect(copyState(copy)).toBe('first');
+		await owner('900', { deleted: true });
+		expect(copyState(copy)).toBe('deleted');
+		await owner('900', { body: { text: 'restored' } });
+		expect(copyState(copy)).toBe('restored');
+		expect(store.originalOf(copy)).toEqual({ server, message_id: '900', hidden: false });
+
+		// An admin here hides another copy: the owner's later edits, deletes and restores leave it hidden.
+		await owner('901', { body: { text: 'second' } });
+		const hidden = store.copyOf(server, '901')!;
+		store.mutate({ userId: 'boss', tier: 'registered', ipKey: 'ip-boss', requestId: 'hide', method: 'message', now, identity: { user_id: 'boss' }, params: { message_id: hidden, room_id: 'general', deleted: true } });
+		expect(store.originalOf(hidden)).toEqual({ server, message_id: '901', hidden: true });
+		await owner('901', { body: { text: 'edited' } });
+		await owner('901', { deleted: true });
+		await owner('901', { body: { text: 'back' } });
+		expect(copyState(hidden)).toBe('deleted');
+		// Still found by its original, so no second copy is made.
+		expect(store.copyOf(server, '901')).toBe(hidden);
+	});
 });

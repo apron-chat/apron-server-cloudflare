@@ -867,8 +867,9 @@ export class RemoteRooms {
 	/**
 	 * A message snapshot of the owner: a new snapshot of its copy (made on
 	 * the first), as its author here, with `ext.remote` the original's. A
-	 * move out of the mirrored rooms deletes the copy; a copy deleted here
-	 * (hidden by an admin) and a remote user removed from the room here take
+	 * move out of the mirrored rooms deletes the copy, and a later snapshot
+	 * restores it; a copy hidden here (an admin's or mod's delete,
+	 * Store.originalOf) and a remote user removed from the room here take
 	 * nothing more.
 	 */
 	private async copyMessage(server: string, snapshot: MessageSnapshot): Promise<void> {
@@ -880,8 +881,9 @@ export class RemoteRooms {
 		if (!author) return;
 		await this.rename(author, (snapshot.from as unknown as Record<string, unknown>)?.name);
 		const copy = this.store.copyOf(server, snapshot.message_id, this.now());
+		// A copy hidden here (an admin's or mod's delete) takes nothing more; one the owner deleted takes its restore.
+		if (copy && this.store.originalOf(copy, this.now())?.hidden) return;
 		const current = copy ? this.store.pushedMessage(copy, this.now()) : null;
-		if (current?.deleted && !snapshot.deleted) return;
 		if (!target || snapshot.deleted) {
 			if (!copy || current?.deleted) return;
 			await this.write(author, { message_id: copy, room_id: current?.room_id ?? "", deleted: true }, server, snapshot);
@@ -1072,11 +1074,11 @@ export class RemoteRooms {
 		const params = request.params;
 		// The act-as user is this server's `user_id` (§ext:remote); the owner shows it as `<user_id>@<this host>`.
 		const ext = { remote: { user_id: userId } };
+		// From the copy's state, not its `ext`, which a tombstone lacks (a restore of the user's deleted message).
 		const original = (copy: unknown) => {
 			if (typeof copy !== "string") return undefined;
-			const message = this.store.pushedMessage(copy, this.now());
-			const remote = message?.ext?.remote as Record<string, unknown> | undefined;
-			return remote?.server === server && typeof remote.message_id === "string" ? remote.message_id : undefined;
+			const origin = this.store.originalOf(copy, this.now());
+			return origin?.server === server ? origin.message_id : undefined;
 		};
 		if (request.method === "reactions") {
 			const messageId = original(params.message_id);

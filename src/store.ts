@@ -1846,8 +1846,15 @@ function recordedUser(userId: string, name: string | null | undefined, remote?: 
  * holds it: the owner server and the original's `message_id`, unique
  * across the owner's rooms (§2.2).
  */
-function copyKey(server: string, messageId: string): string {
-  return JSON.stringify([server, messageId]);
+function copyKey(server: string, messageId: string, hidden = false): string {
+  return JSON.stringify(hidden ? [server, messageId, "hidden"] : [server, messageId]);
+}
+
+/** The original a `remote_key` (copyKey) names, and whether its copy is hidden here; undefined for none. */
+function parseCopyKey(key: string | null | undefined): { server: string; message_id: string; hidden: boolean } | undefined {
+  const value = key ? parseJson<unknown>(key, null) : undefined;
+  if (!Array.isArray(value) || typeof value[0] !== "string" || typeof value[1] !== "string") return undefined;
+  return { server: value[0], message_id: value[1], hidden: value[2] === "hidden" };
 }
 
 /** A shadow user's `remote` from its identity row's `ext_json` (ext:remote); undefined for anyone else. */
@@ -2031,7 +2038,8 @@ const SCHEMA_10_COPIED_COLUMNS: Record<string, readonly string[]> = {
  *
  * Schema 12 (upgradeFromSchema11), for extension `ext:remote`:
  * `message_state.remote_key` is a mirror's copy's key, the owner server and
- * the original's `message_id` (copyKey), indexed where present, so the
+ * the original's `message_id` (copyKey), with a third entry `"hidden"` once
+ * an admin or mod here deleted the copy, indexed where present, so the
  * owner's later records of the message find its copy (copyOf); it goes
  * with the message's state. `remote_left` keeps each room another user
  * removed a remote user from, keyed by user, so a later write from its
@@ -5475,12 +5483,26 @@ export class Store {
     )[0]?.count));
   }
 
-  /** A mirror's copy of the owner `server`'s message `messageId` (ext:remote, mirror.ts), or undefined: one indexed read. */
+  /** A mirror's copy of the owner `server`'s message `messageId` (ext:remote, mirror.ts), hidden here or not, or undefined: one indexed read. */
   copyOf(server: string, messageId: string, now = this.clock.now()): string | undefined {
     this.ensureReady();
     return this.reserved({ reads: 4 }, false, now, () => this.rawRows<{ message_id: string }>(
-      "SELECT message_id FROM message_state INDEXED BY message_state_remote_idx WHERE remote_key = ? LIMIT 1", copyKey(server, messageId),
+      "SELECT message_id FROM message_state INDEXED BY message_state_remote_idx WHERE remote_key IN (?, ?) LIMIT 1",
+      copyKey(server, messageId), copyKey(server, messageId, true),
     )[0]?.message_id);
+  }
+
+  /**
+   * The original of a mirror's copy (ext:remote): its owner server and
+   * `message_id`, kept apart from the copy's `ext`, which a tombstone lacks,
+   * and whether an admin or mod here hid the copy. Undefined for a message
+   * that is no copy. One read.
+   */
+  originalOf(copyId: string, now = this.clock.now()): { server: string; message_id: string; hidden: boolean } | undefined {
+    this.ensureReady();
+    return this.reserved({ reads: 4 }, false, now, () => parseCopyKey(this.rawRows<{ remote_key: string | null }>(
+      "SELECT remote_key FROM message_state WHERE message_id = ? LIMIT 1", copyId,
+    )[0]?.remote_key));
   }
 
   /** The link bound to `server` (ext:remote: one a remote server), or undefined. */
@@ -5975,6 +5997,12 @@ export class Store {
          latest_log_id = excluded.latest_log_id`,
       messageId, roomId, logId, from.user_id, remoteKey ?? null,
     );
+    // A copy that an admin or mod deletes here is hidden here (ext:remote): the
+    // mirror keeps it so whatever the owner does to the original later.
+    if (moderatorDelete) {
+      const original = parseCopyKey(this.rawRows<{ remote_key: string | null }>("SELECT remote_key FROM message_state WHERE message_id = ? LIMIT 1", messageId)[0]?.remote_key);
+      if (original && !original.hidden) this.rawExec("UPDATE message_state SET remote_key = ? WHERE message_id = ?", copyKey(original.server, original.message_id, true), messageId);
+    }
     const broadcasts: Broadcast[] = [{
       method: "message", params: clone(snapshot) as unknown as Record<string, unknown>, rooms: moved ? [current.room_id, roomId] : [roomId],
     }];
