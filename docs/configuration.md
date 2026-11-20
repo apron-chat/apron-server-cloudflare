@@ -888,7 +888,7 @@ the newest `BACKUP_KEEP` are deleted, and nothing else under `backups/`.
   in `_meta`, noted before it runs, so one that fails waits its interval).
   Its result is logged (`history_export`, or `history_export_failed` with
   the reason); without the bucket it is skipped, logged once a wake
-  (`history_export_unbound`). Production's waits for its bucket.
+  (`history_export_unbound`).
 - **`/history export [<room_id>...]`** (admins) writes a `manual` one now,
   of every room or of those named, with the same settings; without the
   bucket, the command says so and writes nothing. Its notice names the
