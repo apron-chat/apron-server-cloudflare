@@ -745,7 +745,7 @@ and so on), which both Wrangler configs write out:
 | `minRetentionSeconds`: never move a younger record out by count | 3 days | 1 day |
 | `retentionSeconds`: move an older record out whatever the count | 0 (off) | 1 day |
 | `historyD1Records`: the D1 tier keeps the newest this many records that left | 100000 | 0 (off) |
-| `historyBlobRecords`: the blob tier keeps the newest this many records past D1's | 0 (everything) | 0 (everything) |
+| `historyColdRecords`: the cold tier keeps the newest this many records past D1's | 0 (everything) | 0 (everything) |
 | `cleanupThresholdPercent`: the share of each count limit cleanup keeps | 80 | 80 |
 
 A record leaves the hot log once it is past the latest `retentionRecords` and
@@ -759,7 +759,7 @@ where the count ends, so it is at most 50,000.
 **The limits are ceilings.** Each daily cleanup keeps `cleanupThresholdPercent`
 of each count limit (80%: 4,000 of the hot log's 5,000 and 80,000 of the
 D1 tier's 100,000, 84,000 in all): it moves what is past the hot log's share
-to the D1 tier, and what is past the D1 tier's to the blob tier, or expires
+to the D1 tier, and what is past the D1 tier's to the cold tier, or expires
 it without one. The rest of each
 limit is headroom for a day's records, so the hot log reaches its limit only
 on a day that brings more than 1,000 records, or when records are younger
@@ -786,8 +786,8 @@ History is kept in a pipeline of tiers (`src/history/`; [SPEC section
 9](../SPEC.md#history-tiers)), newest first, in a fixed order that comes
 from the bindings alone (`src/history/config.ts`): the hot log (`hot`),
 then the D1 tier (`recent`, `src/history/d1.ts`) where a D1 database is
-bound as `HISTORY_D1` and `historyD1Records` is above 0, then the blob tier
-(`cold`, `src/history/blob/`) where an R2 bucket is bound as `HISTORY_BLOB`.
+bound as `HISTORY_D1` and `historyD1Records` is above 0, then the cold tier
+(`cold`, `src/history/cold/`) where an R2 bucket is bound as `HISTORY_BLOB`.
 There is no tier list to configure: changing the composition is a code
 change. `wrangler.toml` binds a local database and bucket; production binds
 `apron-archive` (which keeps the name it was created with) and the
@@ -800,7 +800,8 @@ last record copied (`history:head:through` in `_meta`). On each full alarm,
 before cleanup and again after a cleanup batch that removed records, the
 object runs one cycle of the pipeline, at most 24 steps, working from the
 deepest tier up: each tier finds the floor its retention allows, copies what
-is below it to the next tier (100 log IDs a step), raises its floor, and
+is below it to the next tier (100 log IDs a step, a 10,000-record chunk
+into the cold tier), raises its floor, and
 deletes what is below its floor (500 records a step). History serves records
 in the tiers below as if they had never left: a page that reaches below the
 hot floor reads the rest from them, and `history_log_id` starts at the
@@ -810,12 +811,14 @@ published floor go then, not when their records leave the hot log. Messages
 in a tier below the hot log are history only: like expired ones, they
 cannot be edited, reacted to or replied to.
 
-`/purge` and `/rename` reach the D1 tier too, on an alarm a second later;
-until it has applied them, history pages that read it apply them in memory.
-They stop at the blob tier (below), whose records they do not rewrite, so
-history may still serve a purged user's messages from it. At most 200 of
-them wait for the tiers below at once: past that, `/purge` and `/rename`
-answer `retry_after` until the tiers catch up.
+`/purge` and `/rename` reach every tier below the hot log too, on an alarm
+a second later: the D1 tier in one step, then the cold tier in a sweep of a
+few chunks a step (below); until a tier has applied them, history pages
+that read it apply them in memory. Until the cold tier's sweep reaches a
+purged user's message, others' reactions on it can still show above; the
+purged user's own records never do. At most 200 of them wait for the
+tiers below at once: past that, `/purge` and `/rename` answer `retry_after`
+until the tiers catch up.
 
 Finding the floor the D1 tier's retention allows reads the D1 index entries
 of the records it keeps (80,000 on Paid), so `historyD1Records` is at most
@@ -837,8 +840,8 @@ records expire as they leave it, and only 4,000 are kept on Paid; the
 tiers' state in `_meta` is forgotten, and turned on again, they start at
 the hot floor. The D1 tier is never skipped once it holds history: with
 `HISTORY_D1` unbound (or `historyD1Records` 0) while its state remains and
-the blob tier is bound, history stops moving below SQLite rather than go to
-the blob tier past what D1 holds. SQLite keeps what it holds meanwhile;
+the cold tier is bound, history stops moving below SQLite rather than go to
+the cold tier past what D1 holds. SQLite keeps what it holds meanwhile;
 `/status` shows D1 **unbound**, the Worker logs `history_tier_unbound`,
 admins get `history_stall` after 6 hours, history pages below the hot floor
 answer `retry_after`, and exports and imports are refused, until it is
@@ -847,17 +850,18 @@ bound again.
 `/history status` (admins) shows each tier's floor, how far it has copied to
 the next, the published floor, and whether the pipeline's invariants hold.
 
-**The blob tier** keeps history in R2 as one object a room and stretch of
-the log, under `history/<RP_ID>/` (so servers may share a bucket), each a
-complete ARCHIVE.md v1 file that apron-web can open, with an index in the
-object's SQLite. It is read only for single-room pages (a page of the
-joined rooms stops above it), is not rewritten by `/purge` or `/rename`,
-and keeps everything unless `historyBlobRecords` is set, when it deletes
-whole segments, oldest first. Segments stay as written, never merged; the
-object keeps up to 8 MiB of decoded ones in memory. The bucket must be
-private: no custom domain, no r2.dev URL, no CORS, no lifecycle rules.
-`/history rebuild-index` adds to the index what a listing of the bucket
-finds that it lacks.
+**The cold tier** keeps the oldest history in R2 as chunks of the whole
+log, about 10,000 log IDs each (every room's records over that stretch),
+under `history/<RP_ID>/` (so servers may share a bucket), each a complete
+ARCHIVE.md v1 file, gzip-encoded through the same codec chain as backups,
+with one small row a chunk in the object's SQLite (`history_chunks`: its
+bounds, size, and the rooms and users it names). It serves every history
+page, joined rooms' too, reading only the chunks that hold one of the
+page's rooms, and keeps two decoded chunks in memory. `/purge` and
+`/rename` rewrite only the chunks that change, a few a step. It keeps
+everything unless `historyColdRecords` is set, when it deletes whole
+chunks, oldest first. The bucket must be private: no custom domain, no
+r2.dev URL, no CORS, no lifecycle rules.
 
 ### Backups and imports
 
@@ -867,8 +871,8 @@ v1 file in the `HISTORY_BLOB` bucket under `backups/`
 every room, the users records name, and the records of every tier, as they
 are logged, gzip-compressed. It is written as a stream (an R2 multipart
 upload), and a failure leaves no object. **Backups are not encrypted**: the
-bucket being private is what keeps them so, as it does the blob tier's
-segments (no custom domain, no r2.dev URL, no CORS, and API tokens with R2
+bucket being private is what keeps them so, as it does the cold tier's
+chunks (no custom domain, no r2.dev URL, no CORS, and API tokens with R2
 access kept to those who may read the whole history). Plain string vars set
 them, checked when the Worker starts:
 
@@ -944,9 +948,9 @@ Wrangler deployments should use the uppercase form; local tests may use
 camelCase. Omitted variables use the defaults. Each value must be a positive
 JavaScript safe integer: `0`, fractions, negative values, and values above
 `Number.MAX_SAFE_INTEGER` fail startup. `retentionRecords`,
-`retentionSeconds`, `historyD1Records` and `historyBlobRecords` also take
+`retentionSeconds`, `historyD1Records` and `historyColdRecords` also take
 `0`, which turns that bound off (for `historyD1Records`, the D1 tier; for
-`historyBlobRecords`, the blob tier keeps everything).
+`historyColdRecords`, the cold tier keeps everything).
 
 Production should use the checked-in budget defaults; retain overrides for local
 tests or deliberate temporary reductions. Overrides do not regenerate the native
@@ -1277,7 +1281,7 @@ deployment that stays awake.
 
 The numeric rows are grouped by their unit and enforcement scope:
 
-- History: `retentionRecords`, `historyD1Records` and `historyBlobRecords` (counts of records), and
+- History: `retentionRecords`, `historyD1Records` and `historyColdRecords` (counts of records), and
   `cleanupThresholdPercent` (a percent, at most 100; [above](#history-retention)).
 - Durations: `minRetentionSeconds` and `retentionSeconds` ([History
   retention](#history-retention)), `cleanupSeconds`, `challengeTtlSeconds`,
@@ -1344,7 +1348,7 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `minRetentionSeconds` | 259200 | 86400 |
 | `retentionSeconds` | 0 | 86400 |
 | `historyD1Records` | 100000 | 0 |
-| `historyBlobRecords` | 0 |  |
+| `historyColdRecords` | 0 |  |
 | `cleanupSeconds` | 86400 | 3600 |
 | `challengeTtlSeconds` | 120 |  |
 | `sessionTtlSeconds` | 2592000 |  |
