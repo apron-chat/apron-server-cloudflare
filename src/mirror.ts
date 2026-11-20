@@ -659,7 +659,9 @@ export class RemoteRooms {
 	private queueMembership(server: string, ownerRoom: string, userId: string, name: string, joined: boolean): void {
 		const state = this.store.mirrorState(this.now());
 		const entry = state.servers[server] ??= { cursor: 0 };
-		entry.memberships = [...(entry.memberships ?? []).filter((item) => item.owner_room !== ownerRoom || item.user_id !== userId), { owner_room: ownerRoom, user_id: userId, name, joined }]
+		// Its request id is fixed now, so a resend after a close is the owner's duplicate.
+		const id = `${userId}:${joined ? "join" : "leave"}:${ownerRoom}:${this.now()}`;
+		entry.memberships = [...(entry.memberships ?? []).filter((item) => item.owner_room !== ownerRoom || item.user_id !== userId), { owner_room: ownerRoom, user_id: userId, name, joined, id }]
 			.slice(-MAX_QUEUED_MEMBERSHIPS);
 		this.store.setMirrorState(state, this.now());
 	}
@@ -684,13 +686,13 @@ export class RemoteRooms {
 			const connection = await this.ensure(server);
 			for (let item = queued()[0]; item; item = queued()[0]) {
 				// No answer (the connection closed or timed out): the rest wait for the next connection.
-				if (!await this.sendMembership(connection, server, item.owner_room, item.user_id, item.name, item.joined)) return;
+				if (!await this.sendMembership(connection, server, item)) return;
 				const state = this.store.mirrorState(this.now());
 				const entry = state.servers[server];
 				if (!entry?.memberships) return;
 				// Sent: off the queue, unless a newer change of the same user and room replaced it meanwhile.
 				const sent = item;
-				entry.memberships = entry.memberships.filter((other) => other.owner_room !== sent.owner_room || other.user_id !== sent.user_id || other.joined !== sent.joined);
+				entry.memberships = entry.memberships.filter((other) => other.owner_room !== sent.owner_room || other.user_id !== sent.user_id || other.joined !== sent.joined || other.id !== sent.id);
 				if (!entry.memberships.length) delete entry.memberships;
 				this.store.setMirrorState(state, this.now());
 			}
@@ -701,9 +703,11 @@ export class RemoteRooms {
 	}
 
 	/** One join or leave as the user's remote user; false when the owner gave no answer (a closed connection, or none in time). */
-	private async sendMembership(connection: LinkConnection, server: string, ownerRoom: string, userId: string, name: string, joined: boolean): Promise<boolean> {
+	private async sendMembership(connection: LinkConnection, server: string, item: { owner_room: string; user_id: string; name: string; joined: boolean; id?: string }): Promise<boolean> {
+		const { owner_room: ownerRoom, user_id: userId, name, joined } = item;
 		await this.ownerUser(connection, server, userId, name);
-		const answer = await connection.call(joined ? "room_join" : "room_leave", { room_id: ownerRoom, ext: { remote: { user_id: userId } } }, `${userId}:${joined ? "join" : "leave"}:${ownerRoom}:${this.now()}`);
+		const id = await requestId(item.id ?? `${userId}:${joined ? "join" : "leave"}:${ownerRoom}`);
+		const answer = await connection.call(joined ? "room_join" : "room_leave", { room_id: ownerRoom, ext: { remote: { user_id: userId } } }, id);
 		if (answer.error && unanswered(connection, answer)) return false;
 		if (answer.error) console.warn(JSON.stringify({ event: "remote_membership_refused", server, owner_room: ownerRoom, user_id: userId, error: answer.error.message ?? answer.error.code }));
 		return true;
@@ -1048,7 +1052,7 @@ export class RemoteRooms {
 			// The user's remote user exists on the owner before their first write.
 			await this.ownerUser(connection, server, userId, client.name ?? "");
 			const params = await this.mapOut(connection, server, request, mirror.ownerRoom, userId);
-			const answer = await connection.call(request.method, params, `${userId}:${request.id ?? this.now()}`.slice(0, 128), FORWARD_TIMEOUT_MS);
+			const answer = await connection.call(request.method, params, await requestId(`${userId}:${request.id ?? this.now()}`), FORWARD_TIMEOUT_MS);
 			await connection.settled();
 			if (answer.error) throw this.ownerError(server, mirror.ownerRoom, answer.error);
 			this.host.reply(socket, request, await this.mapResult(server, request, answer.result ?? {}, Date.now() + COPY_WAIT_MS));
@@ -1086,7 +1090,7 @@ export class RemoteRooms {
 		const key = `${USER_KEY_PREFIX}${server}|${userId}`;
 		const known = await this.store.withMeterAsync("foreground", { reads: 1 }, () => this.host.storage.get<OwnerUser>(key));
 		if (known && known.name === name) return known.id;
-		const answer = await connection.call("me", { name, ext: { remote: { user_id: userId } } }, `${userId}:me:${this.now()}`);
+		const answer = await connection.call("me", { name, ext: { remote: { user_id: userId } } }, await requestId(`${userId}:me:${this.now()}`));
 		const you = answer.result?.you as Record<string, unknown> | undefined;
 		const id = typeof you?.user_id === "string" ? you.user_id : known?.id ?? shadowUserId(this.host.self, userId);
 		// Unanswered, it is sent again next time (the act-as write still makes the remote user).
@@ -1275,6 +1279,21 @@ export function wakeUrlAllowed(url: string): boolean {
 	if (parsed.username || parsed.password) return false;
 	if (parsed.protocol === "https:") return true;
 	return parsed.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(parsed.hostname);
+}
+
+/** The longest request `id` a mirror sends, in UTF-8 bytes. */
+const MAX_REQUEST_ID_BYTES = 128;
+
+/**
+ * A request `id` for the owner within MAX_REQUEST_ID_BYTES: `raw` itself,
+ * or, when longer, `h:` and its SHA-256, which a resend of the same `raw`
+ * repeats, so the owner still takes it for a duplicate (§1.2).
+ */
+export async function requestId(raw: string): Promise<string> {
+	const bytes = new TextEncoder().encode(raw);
+	if (bytes.length <= MAX_REQUEST_ID_BYTES) return raw;
+	const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+	return "h:" + [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function randomId(): string {

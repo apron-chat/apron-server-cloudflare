@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { addServerToLinks, LinkConnection, remoteReason, rewriteMentions } from '../src/remote-client';
-import { wakeUrlAllowed } from '../src/mirror';
+import { requestId, wakeUrlAllowed } from '../src/mirror';
 import { sameAddress } from '../src/remote';
 
 // The text mapping a mirror applies both ways, and the wake push policy (extension `ext:remote`).
@@ -20,6 +20,19 @@ describe('text', () => {
 		expect(remoteReason({ code: -32001, data: { ext: { remote: 'not_joined' } } })).toBe('not_joined');
 		expect(remoteReason({ code: -32001, data: { ext: { remote: 'removed' } } })).toBe('removed');
 		expect(remoteReason({ code: -32001, message: 'no' })).toBeUndefined();
+	});
+});
+
+describe('request ids', () => {
+	it('stay within 128 bytes, the same for the same request', async () => {
+		expect(await requestId('bob:c19')).toBe('bob:c19');
+		const long = `${'b'.repeat(100)}:${'c'.repeat(100)}`;
+		const hashed = await requestId(long);
+		expect(hashed).toMatch(/^h:[0-9a-f]{64}$/);
+		expect(await requestId(long)).toBe(hashed);
+		expect(await requestId(`${long}x`)).not.toBe(hashed);
+		expect(await requestId('é'.repeat(64))).toBe('é'.repeat(64));
+		expect(await requestId('é'.repeat(65))).toMatch(/^h:/);
 	});
 });
 

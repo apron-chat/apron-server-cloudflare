@@ -1289,7 +1289,8 @@ export interface MirrorState {
     cursor: number;
     wake?: { id: string; token: string };
     /** Local joins and leaves of mirror rooms not yet answered by the owner (sent on the next connection). */
-    memberships?: Array<{ owner_room: string; user_id: string; name: string; joined: boolean }>;
+    /** `id` is the request's, kept so a resend is the owner's duplicate (§1.2). */
+    memberships?: Array<{ owner_room: string; user_id: string; name: string; joined: boolean; id?: string }>;
   }>;
 }
 
