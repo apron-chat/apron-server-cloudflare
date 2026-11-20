@@ -89,19 +89,13 @@ LIMIT_RETENTION_SECONDS = "0"
 LIMIT_CLEANUP_THRESHOLD_PERCENT = "80"
 LIMIT_HISTORY_D1_RECORDS = "100000"
 LIMIT_HISTORY_BLOB_RECORDS = "0"
-# Backups to HISTORY_BLOB under backups/: one a day
-# (and an admin's `/history export`), the newest 14 of each kept, private
-# rooms included, encrypted with a key derived from the UPLOAD_SIGNING_KEY
-# secret (its own HKDF label). Name another secret to use a key of its own;
-# after a rotation, list the old one in BACKUP_PREVIOUS_KEY_NAMES to read
-# older backups. `/history import` takes only encrypted files here: a plain
-# file in the bucket is no backup of this server's.
+# Backups to HISTORY_BLOB under backups/: one a day (and an admin's
+# `/history export`), the newest 14 of each kind kept, private rooms
+# included, gzip-compressed. They are not encrypted: the bucket being
+# private is what keeps them so.
 BACKUP_EVERY = "1d"
 BACKUP_KEEP = "14"
 BACKUP_PRIVATE_ROOMS = "true"
-BACKUP_ENCRYPTION_KEY_NAME = "UPLOAD_SIGNING_KEY"
-BACKUP_PREVIOUS_KEY_NAMES = ""
-IMPORT_PLAINTEXT = "false"
 
 # The D1 history tier (src/history/d1.ts, docs/configuration.md, History
 # tiers). Records there stay in history but become read-only: once the

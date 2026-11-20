@@ -3,11 +3,13 @@
 Apron chat archives as a library: apron-web's `ARCHIVE.md` v1 (JSON Lines:
 a header, then listings and `rooms` / `messages` / `reactions` /
 `memberships` records as `room_list` and `history` give them), and what a
-program needs to read, write, replay, renumber and encrypt them.
+program needs to read, write, validate, plan imports of, replay, renumber
+and compress them.
 
 TypeScript with no runtime dependencies and no storage or platform code:
-WebCrypto, `TextEncoder`, `ReadableStream` and `btoa` only, so it runs the
-same in browsers, Cloudflare Workers and Node 20 or later. It lives in
+`TextEncoder`, `ReadableStream` / `TransformStream` and `CompressionStream`
+only, so it runs the same in browsers, Cloudflare Workers and Node 20 or
+later. It lives in
 apron-server-cloudflare as an npm workspace, shared with scene.apron.chat
 and, later, apron-web.
 
@@ -30,10 +32,8 @@ a build elsewhere before a release, `npm pack packages/archive/dist`.
 
 ## Modules
 
-Everything but `crypto` is exported from `@apron/archive`; each module is
-also its own entry (`@apron/archive/format`, ...). Encrypted archives are
-only `@apron/archive/crypto`, so a reader that parses archives never
-bundles WebCrypto code.
+Everything is exported from `@apron/archive`; each module is also its own
+entry (`@apron/archive/format`, ...).
 
 The line between the library and a server that uses it: the library says
 what a record, an archive, a duplicate, a move, a reference or a collision
@@ -85,15 +85,23 @@ means; the server says what is true there (`ImportTarget`,
   occurs), `nudgeLogIds` (colliding log IDs to the next free millisecond,
   order kept), `freeUserId`. Which IDs may hold an account is a server's
   rule, passed to `planImport` as `UserIdRules`.
-- `crypto/` (`@apron/archive/crypto` only): encrypted archives
-  (backups), specified with their threat model and an audit checklist in
-  [CRYPTO.md](CRYPTO.md). AES-256-GCM in chunks bound to the backup's random
-  ID, the chunk's index and a final flag; the key derived from a named
-  secret with HKDF-SHA-256 and identified by a fingerprint. Every
-  cryptographic step is in `crypto/core.ts`; the entry exports only
-  `deriveBackupKey`, `encryptArchive`, `decryptArchive`, `openArchive`
-  (plain or encrypted input), `isEncryptedArchive`, `resolveKeys` (keys by
-  secret name from an environment object) and the two error types.
+- `codec.ts`: what an archive's bytes go through between a writer and
+  where they are stored, and back. An `ArchiveCodec` is a pair of standard
+  WHATWG Streams `TransformStream`s over bytes (`encoder()`,
+  `decoder()`), so chains compose with `pipeThrough`: `encodeStream`
+  applies a chain in order, `decodeStream` in reverse. `gzip` (through
+  `CompressionStream`) is the one codec here; `ARCHIVE_CODECS` /
+  `codecChain` find codecs by name (an unknown one is refused), and
+  `codecNames` / `codecsFromName` / `archiveName` record a chain with what
+  it encoded (metadata, `x.jsonl.gz`). `encodedArchiveWriter` writes an
+  archive through a chain to any byte sink; `openArchive(bytes, { codecs,
+  maxBytes })` reads one back (decoded size bounded), or reads lines.
+  Encryption or signing can be added as codecs of their own after gzip
+  (`stream.pipeThrough(gzip.encoder()).pipeThrough(encrypt.encoder())`).
+  A codec that `authenticates` must error its decoder on any damage, a
+  truncated end included; `openArchive(...).verified()` is then true once
+  the archive has been read to its end through it, the one fact a reader
+  (an import matching users) may trust more on.
 
 ## Tests
 

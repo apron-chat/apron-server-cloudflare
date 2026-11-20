@@ -91,7 +91,7 @@ export class FsBlobStore {
 	/**
 	 * @param {string} key
 	 * @param {string} body
-	 * @param {{ contentType?: string }} [_options] Accepted; a file has no content type.
+	 * @param {{ contentType?: string, metadata?: Record<string, string> }} [_options] Accepted; a file has no content type or metadata.
 	 */
 	async put(key, body, _options) {
 		const path = this.path(key);
@@ -108,7 +108,7 @@ export class FsBlobStore {
 
 	/**
 	 * @param {string} key
-	 * @param {{ contentType?: string }} [_options] Accepted; a file has no content type.
+	 * @param {{ contentType?: string, metadata?: Record<string, string> }} [_options] Accepted; a file has no content type or metadata.
 	 * @returns {Promise<BlobWriter>}
 	 */
 	async writer(key, _options) {
@@ -123,7 +123,11 @@ export class FsBlobStore {
 		return {
 			write: async (chunk) => {
 				ensureOpen();
-				if (chunk !== '') await file.writeFile(chunk, 'utf8');
+				if (typeof chunk === 'string') {
+					if (chunk !== '') await file.writeFile(chunk, 'utf8');
+				} else if (chunk.byteLength) {
+					await file.writeFile(chunk);
+				}
 			},
 			close: async () => {
 				ensureOpen();

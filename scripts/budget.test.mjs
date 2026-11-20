@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ADMISSION_BUDGET, DEFAULT_LIMITS } from '../src/budget.ts';
-import { checkBackupKeySecrets, customDomains, mediaHostname, relyingPartyId, renderBinding, signInPages, renderEdgeRules, replaceBinding, splitPreviews, validateAdmission, validateDeploymentConfiguration, validateEdgeStop, webClientTarget, wranglerVars } from './budget.mjs';
+import { customDomains, mediaHostname, relyingPartyId, renderBinding, signInPages, renderEdgeRules, replaceBinding, splitPreviews, validateAdmission, validateDeploymentConfiguration, validateEdgeStop, webClientTarget, wranglerVars } from './budget.mjs';
 import { readFileSync } from 'node:fs';
 import { loadConfig } from '../src/config.ts';
 
@@ -410,25 +410,7 @@ test('Previews need their own domain and DEMO binding, and share no bucket, data
 	assert.throws(() => check(route(previewRoute) + production.replace('binding = "MEDIA"', 'binding = "OTHER"') + previews + '[[previews.r2_buckets]]\nbinding = "MEDIA"\nbucket_name = "apron-media-preview"\n'), /MEDIA bucket/);
 });
 
-test('fails where a backup key secret is a plain [vars] var', () => {
-	const config = (vars) => `[vars]
-RP_ID = "x"
-BACKUP_ENCRYPTION_KEY_NAME = "BACKUP_KEY"
-BACKUP_PREVIOUS_KEY_NAMES = "OLD_KEY, OLDER_KEY"
-${vars}
-[[r2_buckets]]
-binding = "HISTORY_BLOB"
-`;
-	assert.doesNotThrow(() => checkBackupKeySecrets(config('')));
-	assert.throws(() => checkBackupKeySecrets(config('BACKUP_KEY = "public"')), /BACKUP_KEY is named as a backup key, but it is a plain \[vars\] var/);
-	assert.throws(() => checkBackupKeySecrets(config('OLDER_KEY = "public"')), /OLDER_KEY is named/);
-	// However the var is written: a TOML literal string is a var all the same.
-	assert.throws(() => checkBackupKeySecrets(config("BACKUP_KEY = 'public'")), /BACKUP_KEY is named/);
-	assert.doesNotThrow(() => checkBackupKeySecrets('[vars]\nRP_ID = "x"\nBACKUP_ENCRYPTION_KEY_NAME = ""\n'));
-	assert.doesNotThrow(() => checkBackupKeySecrets('[vars]\nRP_ID = "x"\n'));
-});
-
-test("production writes out the plan's own history limits, and encrypted daily backups", () => {
+test("production writes out the plan's own history limits, and daily backups", () => {
 	const { production } = splitPreviews(readFileSync(new URL('../wrangler.production.toml', import.meta.url), 'utf8'));
 	const vars = wranglerVars(production);
 	const config = loadConfig(vars);
@@ -437,7 +419,11 @@ test("production writes out the plan's own history limits, and encrypted daily b
 		assert.ok(Object.hasOwn(vars, name), `wrangler.production.toml sets ${name}`);
 		assert.equal(config.limits[key], DEFAULT_LIMITS[key], key);
 	}
-	assert.deepEqual(config.backups, { everySeconds: 86_400, keep: 14, privateRooms: true, encryptionKeyName: 'UPLOAD_SIGNING_KEY', previousKeyNames: [], importPlaintext: false });
+	assert.deepEqual(config.backups, { everySeconds: 86_400, keep: 14, privateRooms: true });
+	// Backup encryption's vars are gone: a stale one fails the check instead of meaning nothing.
+	for (const name of ['BACKUP_ENCRYPTION_KEY_NAME', 'BACKUP_PREVIOUS_KEY_NAMES', 'IMPORT_PLAINTEXT']) {
+		assert.throws(() => loadConfig({ ...vars, [name]: '' }), new RegExp(`${name} is no longer read`));
+	}
 	// A typo is caught here, before a deploy, not by every request failing after one.
 	assert.throws(() => loadConfig({ ...vars, BACKUP_EVERY: '1 day' }), /BACKUP_EVERY must be a duration/);
 });

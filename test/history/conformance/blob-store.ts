@@ -207,6 +207,22 @@ export function describeBlobStore(name: string, makeStore: () => BlobStore | Pro
 			expect(await (await store.get(`${root}fresh`))!.text()).toBe("pending");
 		});
 
+		it("writes bytes as they are, mixed with text, and keeps metadata where it keeps any", async () => {
+			const store = await makeStore();
+			const root = freshRoot(name);
+			const writer = await store.writer(`${root}bytes`, { contentType: "application/gzip", metadata: { codecs: "gzip" } });
+			await writer.write(new Uint8Array([0x1f, 0x8b, 0x00, 0xff]));
+			await writer.write(new Uint8Array(0));
+			await writer.write("é");
+			await writer.close();
+			const object = await store.get(`${root}bytes`);
+			expect(object!.size).toBe(6);
+			const read = object!.stream ? new Uint8Array(await new Response(await object!.stream()).arrayBuffer()) : undefined;
+			if (read) expect([...read]).toEqual([0x1f, 0x8b, 0x00, 0xff, 0xc3, 0xa9]);
+			// A store with no metadata (a directory) leaves it out; one with it gives it back as stored.
+			if (object!.metadata !== undefined) expect(object!.metadata).toEqual({ codecs: "gzip" });
+		});
+
 		it("writes an empty body when closed with nothing written", async () => {
 			const store = await makeStore();
 			const root = freshRoot(name);

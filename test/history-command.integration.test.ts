@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { collectArchive, jsonlReader, jsonlWriter, linesOf } from '@apron/archive';
+import { collectArchive, gzip, jsonlWriter, openArchive } from '@apron/archive';
 import { connect as open, exchange, request, type Frame, type Peer } from './helpers/socket';
 
 // `/history` end to end: a backup to the backup store (HISTORY_BLOB, local
@@ -45,9 +45,12 @@ it('backs history up to the backup store, and imports a foreign archive as a new
 		const exported = await command(admin, 'export', '/history export general');
 		expect(exported.frame.result).toEqual({});
 		const key = /to `([^`]+)`/.exec(exported.notice ?? '')?.[1];
-		expect(key, exported.notice).toMatch(/^backups\/localhost-manual-\d{8}-\d{6}\.jsonl$/);
+		expect(key, exported.notice).toMatch(/^backups\/localhost-manual-\d{8}-\d{6}\.jsonl\.gz$/);
 		const object = await env.HISTORY_BLOB!.get(key!);
-		const archive = await collectArchive(jsonlReader(linesOf(await object!.text())));
+		// gzip-compressed, the codec recorded with it (not encrypted).
+		expect(object!.customMetadata).toEqual({ codecs: 'gzip' });
+		expect(object!.httpMetadata?.contentType).toBe('application/gzip');
+		const archive = await collectArchive(openArchive(object!.body, { codecs: [gzip] }));
 		// ARCHIVE.md §2: the server's WebSocket URL, and the origins its media loads from.
 		expect(archive.header).toMatchObject({ apron_archive: 1, server: 'wss://demo.test/', media: ['https://demo.test', 'https://media.test'] });
 		expect(archive.records.some((record) => record.record_json.includes('backed up 2'))).toBe(true);
@@ -104,7 +107,7 @@ it('puts terminal output kept in R2 back into exported records, never the intern
 	expect(embed.output).toBe('build ok');
 });
 
-type Backups = { everySeconds?: number; keep: number; privateRooms: boolean; encryptionKeyName?: string; previousKeyNames: string[]; importPlaintext: boolean };
+type Backups = { everySeconds?: number; keep: number; privateRooms: boolean };
 type Runtime = {
 	config: { backups: Backups };
 	runtimeEnv: Record<string, unknown>;
@@ -159,11 +162,11 @@ it('refuses /history export and import without a backup store (HISTORY_BLOB unbo
 	}
 });
 
-it('matches users only from a backup sealed with this server\'s key, and imports only sealed backups where they are encrypted', async () => {
+it('never matches users without an authenticating codec, and refuses a codec it does not know', async () => {
 	const admin = await signedInAdmin();
 	try {
-		expect((await request(admin, 'sealed-post', 'message', { room_id: 'general', body: { format: 'plain', text: 'sealed' } })).result).toBeDefined();
-		// A plain file claiming to be this server: imported here (IMPORT_PLAINTEXT is on in development), its users new, `admin` too.
+		expect((await request(admin, 'gz-post', 'message', { room_id: 'general', body: { format: 'plain', text: 'compressed' } })).result).toBeDefined();
+		// A plain file claiming to be this server: its users new, `admin` too.
 		const base = Date.now() - 60_000;
 		const lines: string[] = [];
 		const writer = jsonlWriter(async (line) => { lines.push(line); });
@@ -177,51 +180,35 @@ it('matches users only from a backup sealed with this server\'s key, and imports
 		expect(forged.notice).toContain('Users: admin → imported-admin (unclaimed).');
 		expect(forged.notice).toContain(`Log IDs ${base + 1} to ${base + 1}.`);
 		const matched = await command(admin, 'forged-match', '/history import backups/forged.jsonl dry-run match');
-		expect(matched.frame.error).toMatchObject({ code: -32602, message: expect.stringMatching(/^users match takes only a backup encrypted with one of this server's keys/) });
+		expect(matched.frame.error).toMatchObject({ code: -32602, message: expect.stringMatching(/^users match needs an archive verified as this server's own, by an authenticating codec/) });
 
-		// Encrypted backups, with IMPORT_PLAINTEXT off: one of this server's own is matched; a plain file is refused.
-		await changed(withBackups({ encryptionKeyName: 'HISTORY_BACKUP_KEY', importPlaintext: false }), async () => {
-			const exported = await command(admin, 'sealed-export', '/history export general');
-			const key = /to `([^`]+)`/.exec(exported.notice ?? '')?.[1];
-			expect(key).toMatch(/^backups\/localhost-manual-\d{8}-\d{6}\.jsonl\.enc$/);
-			expect(await (await env.HISTORY_BLOB!.get(key!))!.text()).not.toContain('sealed');
-			const own = await command(admin, 'sealed-import', `/history import ${key} dry-run`);
-			expect(own.notice).toMatch(/^Would import 0 records into 0 new rooms\./);
-			expect(own.notice).toContain('admin → admin');
-			const plain = await command(admin, 'plain-refused', '/history import backups/forged.jsonl dry-run');
-			expect(plain.frame.error).toMatchObject({ code: -32602, message: 'backups/forged.jsonl is not encrypted, and this server imports only encrypted backups (IMPORT_PLAINTEXT)' });
-			// Out of the way of the next backup, which may fall in the same second.
-			await env.HISTORY_BLOB!.delete(key!);
-		});
-		// After a rotation, the old secret named in BACKUP_PREVIOUS_KEY_NAMES still reads its backups.
-		await changed(withBackups({ encryptionKeyName: 'HISTORY_BACKUP_KEY_OLD', importPlaintext: false }), async () => {
-			const exported = await command(admin, 'old-export', '/history export general');
-			const key = /to `([^`]+)`/.exec(exported.notice ?? '')?.[1];
-			expect(key).toMatch(/\.enc$/);
-			await changed(withBackups({ encryptionKeyName: 'HISTORY_BACKUP_KEY', previousKeyNames: [] }), async () => {
-				const unreadable = await command(admin, 'old-unreadable', `/history import ${key} dry-run`);
-				expect(unreadable.frame.error?.message).toMatch(/this backup needs HISTORY_BACKUP_KEY_OLD/);
-			});
-			await changed(withBackups({ encryptionKeyName: 'HISTORY_BACKUP_KEY', previousKeyNames: ['HISTORY_BACKUP_KEY_OLD'] }), async () => {
-				const read = await command(admin, 'old-read', `/history import ${key} dry-run`);
-				expect(read.frame.error).toBeUndefined();
-				expect(read.notice).toMatch(/^Would import 0 records into 0 new rooms\./);
-			});
-		});
-	} finally {
-		admin.close();
-	}
-});
+		// This server's own backup, gzip-compressed: read back, but gzip verifies nothing, so no users are matched either.
+		// (An earlier test's backup may hold this second's key: out of the way.)
+		const earlier = (await env.HISTORY_BLOB!.list({ prefix: 'backups/localhost-manual-' })).objects.map((object) => object.key);
+		if (earlier.length) await env.HISTORY_BLOB!.delete(earlier);
+		const exported = await command(admin, 'gz-export', '/history export general');
+		const key = /to `([^`]+)`/.exec(exported.notice ?? '')?.[1];
+		expect(key, JSON.stringify(exported)).toMatch(/\.jsonl\.gz$/);
+		const own = await command(admin, 'gz-import', `/history import ${key} dry-run`);
+		expect(own.frame.error).toBeUndefined();
+		expect(own.notice).toMatch(/^Would import 0 records into 0 new rooms\./);
+		const ownMatch = await command(admin, 'gz-match', `/history import ${key} dry-run match`);
+		expect(ownMatch.frame.error?.message).toMatch(/^users match needs an archive verified/);
+		// Out of the way of the next backup, which may fall in the same second.
+		await env.HISTORY_BLOB!.delete(key!);
 
-it('fails an encrypted export whose secret is not set, writing nothing rather than a plain backup', async () => {
-	const admin = await signedInAdmin();
-	try {
-		const before = (await env.HISTORY_BLOB!.list({ prefix: 'backups/' })).objects.length;
-		await changed(withBackups({ encryptionKeyName: 'NO_SUCH_SECRET' }), async () => {
-			const refused = await command(admin, 'no-secret', '/history export');
-			expect(refused.frame.error).toMatchObject({ code: -32602, message: 'backups are encrypted with NO_SUCH_SECRET (BACKUP_ENCRYPTION_KEY_NAME), which is not set: set it with `wrangler secret put NO_SUCH_SECRET`' });
-		});
-		expect((await env.HISTORY_BLOB!.list({ prefix: 'backups/' })).objects.length).toBe(before);
+		// A codec this server does not have, by name or by metadata: refused, nothing read.
+		await env.HISTORY_BLOB!.put('backups/odd.jsonl.zst', 'x');
+		const byName = await command(admin, 'odd-name', '/history import backups/odd.jsonl.zst dry-run');
+		expect(byName.frame.error).toMatchObject({ code: -32602, message: 'unknown archive extension ".zst" in "backups/odd.jsonl.zst"' });
+		await env.HISTORY_BLOB!.put('backups/odd.jsonl', 'x', { customMetadata: { codecs: 'gzip,rot13' } });
+		const byMetadata = await command(admin, 'odd-metadata', '/history import backups/odd.jsonl dry-run');
+		expect(byMetadata.frame.error).toMatchObject({ code: -32602, message: 'unknown archive codec "rot13"' });
+		// gzip that is not: a damaged backup fails plainly.
+		await env.HISTORY_BLOB!.put('backups/damaged.jsonl.gz', 'not gzip at all');
+		const damaged = await command(admin, 'damaged', '/history import backups/damaged.jsonl.gz dry-run');
+		expect(damaged.frame.error?.code).toBe(-32602);
+		await env.HISTORY_BLOB!.delete(['backups/odd.jsonl.zst', 'backups/odd.jsonl', 'backups/damaged.jsonl.gz', 'backups/forged.jsonl']);
 	} finally {
 		admin.close();
 	}
@@ -350,7 +337,7 @@ it('backs up on BACKUP_EVERY\'s schedule only, keeping BACKUP_KEEP scheduled bac
 	});
 	const keys = await scheduled();
 	expect(keys).toHaveLength(2);
-	for (const key of keys) expect(key).toMatch(/^backups\/localhost-scheduled-\d{8}-\d{6}\.jsonl$/);
+	for (const key of keys) expect(key).toMatch(/^backups\/localhost-scheduled-\d{8}-\d{6}\.jsonl\.gz$/);
 	// Pruning the scheduled ones left the manual ones alone.
 	expect((await env.HISTORY_BLOB!.list({ prefix: 'backups/localhost-manual-' })).objects.length).toBe(manual);
 });

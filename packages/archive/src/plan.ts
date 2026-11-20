@@ -83,7 +83,7 @@ export interface PlanOptions {
 	 * - "new": every archive user becomes a new placeholder; an ID taken there, or retired, gets a free one (`ada-2`).
 	 */
 	users?: "auto" | "match" | "new";
-	/** The archive is known to be the target's own (decrypted with its key): only then may users be matched. */
+	/** The archive is known to be the target's own (verified by an authenticating codec, openArchive): only then may users be matched. */
 	authenticated?: boolean;
 	/** Per-user decisions overriding `users`: an existing account, or a placeholder ID. */
 	userMap?: Record<string, { existing: string } | { placeholder: string }>;
@@ -183,7 +183,7 @@ export async function planImport(archive: CollectedArchive, target: ImportTarget
 	// Users may be matched to accounts only from an archive the target
 	// sealed: a plain file's `server` header is anyone's to write.
 	if (options.users === "match" && !authenticated && !resume) {
-		throw new Error("users match takes only a backup encrypted with one of this server's keys; this file is not one: import it with new");
+		throw new Error("users match needs an archive verified as this server's own, by an authenticating codec, and none verified this one: import it with new");
 	}
 	const mode = resume ? undefined : options.users === "match" || options.users === "new" ? options.users
 		: authenticated && archive.header.server !== undefined && archive.header.server === options.server ? "match" : "new";

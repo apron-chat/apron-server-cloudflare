@@ -71,14 +71,11 @@ LIMIT_CLEANUP_THRESHOLD_PERCENT = "80"
 LIMIT_HISTORY_D1_RECORDS = "100000"
 LIMIT_HISTORY_BLOB_RECORDS = "0"
 # Backups on demand only (`/history export`, no schedule) to the local
-# HISTORY_BLOB bucket, the newest 10 kept, private rooms included, and
-# unencrypted: local data, local keys. `/history import` takes plain files.
+# HISTORY_BLOB bucket, the newest 14 of each kind kept, private rooms
+# included, gzip-compressed (not encrypted).
 BACKUP_EVERY = ""
 BACKUP_KEEP = "14"
 BACKUP_PRIVATE_ROOMS = "true"
-BACKUP_ENCRYPTION_KEY_NAME = ""
-BACKUP_PREVIOUS_KEY_NAMES = ""
-IMPORT_PLAINTEXT = "true"
 
 # BEGIN GENERATED ADMISSION BUDGET
 # Edit src/budget.ts, then run npm run budget:generate.

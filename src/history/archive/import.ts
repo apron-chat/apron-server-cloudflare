@@ -1,6 +1,6 @@
 /*
- * importArchive (PLAN §10.2–§10.6): reads an ARCHIVE.md v1 file (plain, or
- * encrypted with a key the environment has, §13.3) into the pipeline.
+ * importArchive (PLAN §10.2–§10.6): reads an ARCHIVE.md v1 file (as
+ * @apron/archive openArchive decodes it) into the pipeline.
  *
  * It plans first, writing nothing, with @apron/archive's planImport over
  * the pipeline (importTarget) and this server's user ID rules
@@ -39,12 +39,13 @@ export interface ImportOptions {
 	 */
 	users?: "auto" | "match" | "new";
 	/**
-	 * Whether the archive was decrypted with one of this server's backup
-	 * keys, so it is one of this server's backups (@apron/archive
-	 * DecryptionStatus): only then may users be matched, since a plain file's
-	 * `server` header is anyone's to write. Default false.
+	 * Whether the archive is verified as one of this server's own (an
+	 * authenticating codec read it to its end: @apron/archive openArchive,
+	 * `verified`): only then may users be matched, since a file's `server`
+	 * header is anyone's to write. A function is asked once the archive has
+	 * been read whole. Default false; no codec this server has authenticates.
 	 */
-	authenticated?: boolean;
+	authenticated?: boolean | (() => boolean);
 	/** Per-user decisions overriding `users`: an existing account, or a placeholder ID. */
 	userMap?: Record<string, { existing: string } | { placeholder: string }>;
 	/** "original" (default) keeps log IDs, moving only collisions; "renumber" gives every record a new one at the head. */
@@ -167,7 +168,7 @@ export async function importArchive(pipeline: HistoryPipeline, input: ArchiveRea
 	}
 	const plan = await planImport(archive, importTarget(pipeline), {
 		...(options.users ? { users: options.users } : {}),
-		authenticated: options.authenticated === true,
+		authenticated: typeof options.authenticated === "function" ? options.authenticated() : options.authenticated === true,
 		...(options.userMap ? { userMap: options.userMap } : {}),
 		...(options.ids ? { ids: options.ids } : {}),
 		...(options.server !== undefined ? { server: options.server } : {}),

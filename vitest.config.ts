@@ -40,10 +40,6 @@ export default defineConfig({
 					LIVE_TEXT_MAX_SECONDS: "2",
 					LIVE_TEXT_MODERATOR_MAX_SECONDS: "3",
 					LIVE_TEXT_WRITE_WINDOW_SECONDS: "3",
-					// Test-only history backup keys (PLAN §13.3), 32 random bytes in base64:
-					// the current one and an older one, for rotation. Never used outside tests.
-					HISTORY_BACKUP_KEY: "eFGn4jFTKnrUqDnE5adM+1fdPYYD7RXuzs9/jUHnrvs=",
-					HISTORY_BACKUP_KEY_OLD: "sBjpLIt1KHDasdiD+Y6qVIGfnT121t7aBmqRajoQQpo=",
 					// The property tests' replay and soak switches (test/history/pipeline.test.ts),
 					// from the shell: HISTORY_SEED=… HISTORY_PATH=… or HISTORY_RUNS=… npx vitest run.
 					...Object.fromEntries(["HISTORY_SEED", "HISTORY_PATH", "HISTORY_RUNS"].flatMap((name) => (process.env[name] ? [[name, process.env[name]]] : []))),

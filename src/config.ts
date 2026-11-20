@@ -11,11 +11,8 @@ export interface RuntimeConfig {
 	 * Backups of history (PLAN §13.2), to HISTORY_BLOB under `backups/`:
 	 * `BACKUP_EVERY` (a duration; unset or empty, on demand only),
 	 * `BACKUP_KEEP` (files kept of each kind, default 14),
-	 * `BACKUP_PRIVATE_ROOMS` (default true), `BACKUP_ENCRYPTION_KEY_NAME`
-	 * (the secret the key is derived from; unset or empty, unencrypted),
-	 * `BACKUP_PREVIOUS_KEY_NAMES` (older secrets, to read backups after a
-	 * rotation) and `IMPORT_PLAINTEXT` (whether `/history import` takes a
-	 * plain file; default false where backups are encrypted, else true).
+	 * and `BACKUP_PRIVATE_ROOMS` (default true). Backups are gzip-compressed,
+	 * not encrypted (src/history/exports.ts).
 	 */
 	backups: BackupSettings;
 	allowedOrigins: readonly string[];
@@ -299,9 +296,6 @@ type EnvLike = {
 	BACKUP_EVERY?: string;
 	BACKUP_KEEP?: string;
 	BACKUP_PRIVATE_ROOMS?: string;
-	BACKUP_ENCRYPTION_KEY_NAME?: string;
-	BACKUP_PREVIOUS_KEY_NAMES?: string;
-	IMPORT_PLAINTEXT?: string;
 	ENVIRONMENT?: string;
 	NODE_ENV?: string;
 };
@@ -561,8 +555,13 @@ function buildConfig(env: EnvLike, overrides: Partial<Limits>): RuntimeConfig {
 		limits[key] = parsePositiveInt(env, key, limits[key]);
 	}
 	// The HISTORY table of earlier versions is gone: a leftover one would
-	// otherwise be ignored, encryption and all (docs/configuration.md, Backups).
+	// otherwise be ignored (docs/configuration.md, Backups).
 	if ((env as Record<string, unknown>).HISTORY !== undefined) throw new ConfigError("HISTORY is no longer read: set history with the LIMIT_* vars and backups with the BACKUP_* vars (docs/configuration.md)");
+	// So are backup encryption's vars: a leftover one would let a deploy
+	// believe its backups encrypted, which they no longer are.
+	for (const name of RETIRED_BACKUP_VARS) {
+		if ((env as Record<string, unknown>)[name] !== undefined) throw new ConfigError(`${name} is no longer read: backups are gzip-compressed, not encrypted; remove it (docs/configuration.md, Backups and imports)`);
+	}
 	// A misspelled override would silently leave the default in force.
 	const limitNames = new Set(Object.keys(limits).map((key) => `LIMIT_${envName(key)}`));
 	for (const name of Object.keys(env)) {
@@ -698,8 +697,8 @@ function loadServerMetadata(env: EnvLike, limits: Limits): ServerMetadata {
 
 /** Upload settings, when the plan and the deployment both provide them; malformed ones fail the configuration check. */
 const DURATION_UNITS: Record<string, number> = { s: 1, m: 60, h: 3_600, d: 86_400 };
-/** A secret's name, as Wrangler takes one. */
-const SECRET_NAME = /^[A-Z][A-Z0-9_]*$/;
+/** Backup encryption's vars, removed with it: set, they fail the configuration rather than mean nothing. */
+const RETIRED_BACKUP_VARS = ["BACKUP_ENCRYPTION_KEY_NAME", "BACKUP_PREVIOUS_KEY_NAMES", "IMPORT_PLAINTEXT"] as const;
 
 /** The backup vars (RuntimeConfig.backups), validated: a typo fails the deploy's check, not the first backup. */
 function loadBackups(env: EnvLike): BackupSettings {
@@ -712,19 +711,10 @@ function loadBackups(env: EnvLike): BackupSettings {
 	const keepText = String(env.BACKUP_KEEP ?? "").trim();
 	const keep = keepText === "" ? 14 : Number(keepText);
 	if (!Number.isSafeInteger(keep) || keep < 1 || keep > 1_000) throw new ConfigError("BACKUP_KEEP must be a whole number from 1 to 1000");
-	const keyName = String(env.BACKUP_ENCRYPTION_KEY_NAME ?? "").trim();
-	const previousKeyNames = splitList(env.BACKUP_PREVIOUS_KEY_NAMES === undefined ? undefined : String(env.BACKUP_PREVIOUS_KEY_NAMES), []);
-	for (const [name, value] of [["BACKUP_ENCRYPTION_KEY_NAME", keyName], ...previousKeyNames.map((entry) => ["BACKUP_PREVIOUS_KEY_NAMES", entry])]) {
-		if (value && !SECRET_NAME.test(value)) throw new ConfigError(`${name} must name secrets (A-Z, 0-9 and _, starting with a letter), not ${JSON.stringify(value)}`);
-	}
 	return {
 		...(everySeconds !== undefined ? { everySeconds } : {}),
 		keep,
 		privateRooms: parseSwitch(env.BACKUP_PRIVATE_ROOMS, "BACKUP_PRIVATE_ROOMS", true),
-		...(keyName ? { encryptionKeyName: keyName } : {}),
-		previousKeyNames,
-		// Where backups are encrypted, a plain file is no backup of this server's.
-		importPlaintext: parseSwitch(env.IMPORT_PLAINTEXT, "IMPORT_PLAINTEXT", !keyName),
 	};
 }
 

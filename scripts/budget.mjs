@@ -450,21 +450,6 @@ export function wranglerVars(source) {
 	return isTable(vars) ? { ...vars } : {};
 }
 
-/**
- * Fails where a backup key secret the vars name (BACKUP_ENCRYPTION_KEY_NAME,
- * BACKUP_PREVIOUS_KEY_NAMES) is also a plain `[vars]` var: vars are public,
- * in the file and the dashboard, so its key would be anyone's. Keys are
- * secrets (`wrangler secret put`).
- */
-export function checkBackupKeySecrets(source) {
-	const vars = wranglerVars(source);
-	const list = (value) => (typeof value === 'string' ? value.split(',') : []);
-	const names = [...list(vars.BACKUP_ENCRYPTION_KEY_NAME), ...list(vars.BACKUP_PREVIOUS_KEY_NAMES)].map((name) => name.trim()).filter(Boolean);
-	for (const name of names) {
-		if (Object.hasOwn(vars, name)) throw new Error(`${name} is named as a backup key, but it is a plain [vars] var, whose value is public: make it a secret (wrangler secret put ${name}) and remove the var`);
-	}
-}
-
 /** A `true`/`false` Wrangler var in `source`, else `fallback`. */
 export function wranglerSwitch(source, name, fallback) {
 	const value = wranglerVars(source)[name];
@@ -519,7 +504,6 @@ function main() {
 	const { production: main, previews } = splitPreviews(production);
 	// Both sets of vars must load as the Worker loads them, or it would fail every request.
 	for (const part of [main, ...(previews ? [previews] : [])]) {
-		checkBackupKeySecrets(part);
 		loadConfig(wranglerVars(part));
 	}
 	const hosts = customDomains(main).filter((domain) => domain.enabled);

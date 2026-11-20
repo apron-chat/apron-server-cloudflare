@@ -7,8 +7,8 @@
  *
  * Keys are plain strings with `/` as a separator by convention. Listings are
  * sorted by key, so zero-padded names (segment keys, dated exports) list in
- * order. Bodies are text: segments and archives are JSON Lines, and an
- * encrypted archive is JSON Lines of base64 (@apron/archive, crypto.ts).
+ * order. Bodies are text (segments are JSON Lines) or, written through a
+ * writer, bytes (a backup encoded through @apron/archive codecs, gzip).
  *
  * Every implementation passes the same conformance suite
  * (test/history/conformance/blob-store.ts).
@@ -18,6 +18,8 @@
 export interface BlobObject {
 	/** The body's size in bytes (UTF-8). */
 	size: number;
+	/** The custom metadata it was stored with (BlobPutOptions.metadata), where the store keeps any. */
+	metadata?: Record<string, string>;
 	/** The whole body as text. */
 	text(): Promise<string>;
 	/**
@@ -31,6 +33,12 @@ export interface BlobObject {
 
 export interface BlobPutOptions {
 	contentType?: string;
+	/**
+	 * Custom metadata stored with the object (R2: customMetadata), such as the
+	 * codecs a backup went through. A store that cannot keep it (a directory)
+	 * ignores it, so a reader also has the object's name to go by.
+	 */
+	metadata?: Record<string, string>;
 }
 
 export interface BlobListOptions {
@@ -67,7 +75,8 @@ export interface BlobStore {
 
 /** A body written in pieces. Call `close` or `abort` exactly once. */
 export interface BlobWriter {
-	write(chunk: string): Promise<void>;
+	/** Text is written as UTF-8; bytes as they are. */
+	write(chunk: string | Uint8Array): Promise<void>;
 	close(): Promise<void>;
 	abort(): Promise<void>;
 }

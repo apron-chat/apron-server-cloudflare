@@ -3,12 +3,11 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { AuthError, AuthTooLargeError, candidateUserIdFor, UnknownCredentialError, WebAuthnService, type ChallengeRecord, type CredentialRepository } from "./auth";
 import { isAllowedOrigin, loadConfig, MAX_SERVER_DESCRIPTION_BYTES, pushHostAllowed, validServerDescription, validServerTitle, type RuntimeConfig, type ServerMetadata } from "./config";
 import { ACCOUNT_USAGE_POLICY, ADMISSION_BUDGET, PLAN, IDLE_CHANGES_PER_CONNECTION_MINUTE, MAX_FRAME_LEASE, MAX_PENDING_WAKES, MAX_PRIVATE_MEMBERSHIPS_PER_USER, MAX_PUSH_CANDIDATES, MAX_ROOM_METADATA_TOTAL_LIMIT, MAX_STATUS_DELAY_SECONDS, MAX_THREAD_LIMIT, MAX_TYPE_THROTTLE_PER_MINUTE, PUSH_POLICY, UPLOAD_POLICY, thresholdRecords } from "./budget";
-import { linesFromStream, linesOf } from "@apron/archive";
-import { type BackupKeys, type DecryptionStatus, openArchive, resolveKeys } from "@apron/archive/crypto";
+import { codecChain, codecsFromName, linesOf, openArchive, parseCodecNames } from "@apron/archive";
 import { type ImportReport, importArchive } from "./history/archive/import";
 import type { BlobStore } from "./history/blob/store";
 import { archivePipeline, blobStoreOf, buildHistoryPipeline, D1_TIER, d1Enabled, HEAD_TIER, hasLowerTiers } from "./history/config";
-import { backupKeyNames, type BackupKind, writeBackup } from "./history/exports";
+import { type BackupKind, CODECS_METADATA, writeBackup } from "./history/exports";
 import { checkInvariants } from "./history/plan";
 import type { HistoryPipeline } from "./history/pipeline";
 import type { ChatRecord } from "./history/records";
@@ -7886,7 +7885,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			run: (scope) => scope.runtime.sendHelp(scope),
 		}),
 		adminCommand({
-			name: "history", usage: "/history status | export [<room_id>...] | import <key> [dry-run] [match|new] [renumber] [restart] | rebuild-index", help: "show where history is kept; back it up to the backup store, or import a backup or archive (ARCHIVE.md, encrypted or not) from it (running a failed import again finishes it; restart abandons another file's); repair the blob tier's index", usageErrors: "reply",
+			name: "history", usage: "/history status | export [<room_id>...] | import <key> [dry-run] [match|new] [renumber] [restart] | rebuild-index", help: "show where history is kept; back it up to the backup store, or import a backup or archive (ARCHIVE.md, gzip-compressed or not) from it (running a failed import again finishes it; restart abandons another file's); repair the blob tier's index", usageErrors: "reply",
 			parse: ({ words, usage }, runtime) => historyArgs(words, usage, runtime.historyBusy),
 			audit: (args) => ({ action: args.action, target: args.action === "import" ? args.key : args.action === "export" ? args.roomIds.join(" ") : undefined }),
 			run: ({ cap, runtime, socket, request, roomId }, args) => runtime.historyCommand(cap, socket, request, roomId, args),
@@ -9131,15 +9130,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 		return store;
 	}
 
-	/** The backup keys this environment has: the secrets the BACKUP_* vars name, and no other (§13.3). */
-	private backupKeys(): BackupKeys {
-		return resolveKeys(this.runtimeEnv, backupKeyNames(this.config.backups));
-	}
-
 	/** Writes one backup of `kind` with the configured settings (writeBackup). */
 	private writeBackup(store: BlobStore, kind: BackupKind, roomIds: readonly string[] = []): ReturnType<typeof writeBackup> {
 		return writeBackup(this.archivePipeline(), store, this.config.backups, kind, {
-			server: this.config.rpId, clock: { now: nowMs }, keys: this.backupKeys(), ...(roomIds.length ? { roomIds: [...roomIds] } : {}),
+			server: this.config.rpId, clock: { now: nowMs }, ...(roomIds.length ? { roomIds: [...roomIds] } : {}),
 			header: this.archiveHeader(), prepare: (records) => this.exportRecords(records),
 		});
 	}
@@ -9148,8 +9142,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * `/history`: `status` shows each tier, its state and what holds of the
 	 * invariants; `export [<room_id>...]` writes a backup to the backup store
 	 * and names its key; `import <key> [dry-run] [match|new] [renumber]` reads
-	 * a backup or an ARCHIVE.md file from it (decrypted with a key the
-	 * environment has) and reports what it added, or would; `rebuild-index`
+	 * a backup or an ARCHIVE.md file from it (decoded through the codecs it
+	 * names: gzip) and reports what it added, or would; `rebuild-index`
 	 * lists the blob tiers' stores to rebuild their segment indexes.
 	 */
 	private async historyCommand(cap: AdminCapability, socket: WebSocketConnection, request: RequestFrame, roomId: string, args: HistoryArgs): Promise<void> {
@@ -9210,7 +9204,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				try {
 					result = await this.writeBackup(store, "manual", args.roomIds);
 				} catch (error) {
-					// A missing key or a failing store: said plainly; an upload begun is aborted.
+					// A failing store: said plainly; an upload begun is aborted.
 					throw { name: "invalid_params", message: error instanceof Error ? error.message : String(error) } satisfies ProtocolError;
 				}
 				done(`Backed up ${result.rooms} rooms, ${result.users} users and ${result.records} records to \`${result.key}\`.`);
@@ -9222,23 +9216,24 @@ export class ApronDemoServer extends DurableObject<Env> {
 				if (!object) throw { name: "invalid_params", message: `No backup ${key}` } satisfies ProtocolError;
 				// Read whole before anything is written (import plans first): bounded, so a file cannot exhaust the object's memory.
 				if (object.size > MAX_IMPORT_BYTES) throw { name: "invalid_params", message: `${key} is ${object.size} bytes; an import reads at most ${MAX_IMPORT_BYTES}` } satisfies ProtocolError;
-				const lines = object.stream ? linesFromStream(await object.stream()) : linesOf(await object.text());
 				let report: ImportReport;
 				try {
-					const status: DecryptionStatus = {};
-					const reader = openArchive(lines, this.backupKeys(), status);
-					await reader.header();
-					// Where backups are encrypted, a plain file is none of this server's (IMPORT_PLAINTEXT).
-					if (!status.encrypted && !this.config.backups.importPlaintext) throw new Error(`${key} is not encrypted, and this server imports only encrypted backups (IMPORT_PLAINTEXT)`);
+					// The codecs it went through: as its metadata records them, else as its name says (`.jsonl.gz`), else none.
+					const recorded = object.metadata?.[CODECS_METADATA];
+					const codecs = recorded !== undefined ? codecChain(parseCodecNames(recorded)) : codecsFromName(key) ?? [];
+					if (codecs.length && !object.stream) throw new Error(`${key} is encoded (${codecs.map((codec) => codec.name).join(", ")}), and this store cannot stream it`);
+					// Bounded decoded too: a small compressed file may decode to a great deal.
+					const reader = object.stream ? openArchive(await object.stream(), { codecs, maxBytes: MAX_IMPORT_BYTES }) : openArchive(linesOf(await object.text()));
 					report = await importArchive(this.archivePipeline(), reader, {
 						clock: { now: nowMs }, server: this.archiveHeader().server, dryRun: args.dryRun,
-						authenticated: status.encrypted === true,
+						// Only an authenticating codec, read to the end, makes a file this server's own; gzip is none.
+						authenticated: () => reader.verified(),
 						users: args.users ?? "auto",
 						ids: args.renumber ? "renumber" : "original",
 						restart: args.restart,
 					});
 				} catch (error) {
-					// A missing key, a damaged backup or an unreadable file: said plainly, nothing written.
+					// A damaged backup, an unknown codec or an unreadable file: said plainly, nothing written.
 					throw { name: "invalid_params", message: error instanceof Error ? error.message : String(error) } satisfies ProtocolError;
 				}
 				done(importNotice(report));

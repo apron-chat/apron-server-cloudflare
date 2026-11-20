@@ -394,11 +394,7 @@ are set; set up all of these first:
    does not cache by default; without the rule every view is a billed R2 read.
 5. **Signing key.** `openssl rand -base64 48 | npx wrangler secret put
    UPLOAD_SIGNING_KEY --config wrangler.production.toml`. Rotating it
-   invalidates `write_url`s already issued, and, while production's
-   backups are encrypted with it (`BACKUP_ENCRYPTION_KEY_NAME`), makes older
-   backups unreadable unless the old value stays set under another name
-   listed in `BACKUP_PREVIOUS_KEY_NAMES` ([Backups and
-   imports](#backups-and-imports)).
+   invalidates `write_url`s already issued.
 6. **Edge rules.** Update `apron_invalid_request` and `apron_budget_stop`,
    and create `apron_media_invalid` and `apron_media_nosniff`, from
    [the generated definitions](edge-rules.generated.json). With uploads,
@@ -869,23 +865,27 @@ A backup is the whole server's history, or some rooms', as one ARCHIVE.md
 v1 file in the `HISTORY_BLOB` bucket under `backups/`
 (`src/history/exports.ts`; [SPEC section 9](../SPEC.md#backups-and-imports)):
 every room, the users records name, and the records of every tier, as they
-are logged. It is written as a stream (an R2 multipart upload), and a
-failure leaves no object. Plain string vars set it, checked when the Worker
-starts:
+are logged, gzip-compressed. It is written as a stream (an R2 multipart
+upload), and a failure leaves no object. **Backups are not encrypted**: the
+bucket being private is what keeps them so, as it does the blob tier's
+segments (no custom domain, no r2.dev URL, no CORS, and API tokens with R2
+access kept to those who may read the whole history). Plain string vars set
+them, checked when the Worker starts:
 
 | Var | Default | Production | Development |
 | --- | --- | --- | --- |
 | `BACKUP_EVERY`: how often the scheduled backup runs (`"6h"`, `"1d"`; empty: on demand only) | on demand | `"1d"` | `""` |
-| `BACKUP_KEEP`: how many backup files of each kind are kept, newest first | `14` | `"14"` | `"10"` |
+| `BACKUP_KEEP`: how many backup files of each kind are kept, newest first | `14` | `"14"` | `"14"` |
 | `BACKUP_PRIVATE_ROOMS`: whether private rooms are backed up | `true` | `"true"` | `"true"` |
-| `BACKUP_ENCRYPTION_KEY_NAME`: the secret the backup key is derived from (empty: unencrypted) | unencrypted | `"UPLOAD_SIGNING_KEY"` | `""` |
-| `BACKUP_PREVIOUS_KEY_NAMES`: older secrets, comma-separated, only to read backups after a rotation | none | `""` | `""` |
-| `IMPORT_PLAINTEXT`: whether `/history import` takes a file that is not encrypted | false where backups are encrypted, else true | `"false"` | `"true"` |
 
-Each backup's key is `backups/<RP_ID>-<kind>-<date>.jsonl` (`.enc` added
-when encrypted), the kind `scheduled` or `manual`; after writing one, the
-backups of its kind past the newest `BACKUP_KEEP` are deleted, and nothing
-else under `backups/`.
+Each backup's key is `backups/<RP_ID>-<kind>-<date>.jsonl.gz`, the kind
+`scheduled` or `manual`, with the codecs it went through recorded in its
+metadata (`codecs: gzip`); after writing one, the backups of its kind past
+the newest `BACKUP_KEEP` are deleted, and nothing else under `backups/`.
+`BACKUP_ENCRYPTION_KEY_NAME`, `BACKUP_PREVIOUS_KEY_NAMES` and
+`IMPORT_PLAINTEXT`, the vars of an earlier version's encryption, are no
+longer read: a config that still sets one fails the deploy's check and the
+Worker's start, rather than seem to encrypt.
 
 - **The scheduled backup** runs on the first full alarm after
   `BACKUP_EVERY` has passed since its last run (`history:export:scheduled`
@@ -899,25 +899,22 @@ else under `backups/`.
   object's key. A second backup of a kind in the same second is refused
   (keys are to the second); one export, import or index rebuild runs at a
   time, and none while history upkeep runs.
-- **Encryption is what the vars say.** With `BACKUP_ENCRYPTION_KEY_NAME`
-  set, every backup is encrypted, and one whose secret is missing fails
-  rather than write in the clear; without it, backups are plain ARCHIVE.md
-  (development, to local storage).
 - **`/history import <key> [dry-run] [match|new] [renumber] [restart]`** (admins) reads
-  an object of the backup store (at most 64 MiB), a backup or any ARCHIVE.md
-  v1 file put there, and adds what is new, after planning the whole file:
+  an object of the backup store (at most 64 MiB, stored and decoded), a
+  backup or any ARCHIVE.md v1 file put there, gzip-compressed (`.jsonl.gz`,
+  or its metadata says so) or plain (`.jsonl`), and adds what is new, after
+  planning the whole file:
   rooms that exist here are skipped whole; records already held here are
   skipped as duplicates, and others whose log ID is taken move to the next
   free millisecond; records older than history here are dropped as expired.
   `dry-run` reports what it would do, the log IDs it would add among it.
   The file may be anyone's, so records are taken only as a client could
   have sent them (bare users, bodies normalized as posts are, a snapshot's
-  size), others dropped and counted. A plain file is refused where
-  `IMPORT_PLAINTEXT` is false. Users map by the command's `match` or `new`,
-  else `auto`, which matches existing
-  accounts by `user_id` only for a backup decrypted with one of this
-  server's keys whose `server` is this server, and otherwise makes every
-  user new (`match` takes only such a backup); a new user becomes a
+  size), others dropped and counted. Users are never matched to existing
+  accounts: that takes a file verified as this server's own, and no codec
+  here verifies one (`auto`, the default, makes every user new, and `match`
+  is refused); a codec that authenticates, such as encryption added after
+  gzip, would make this server's own backups matchable again. A new user becomes a
   placeholder account with no credential and the role `unclaimed` (their own
   roles are not imported, and `unclaimed` alone does not raise posting
   limits), renamed (`ada-2`) where the `user_id` is taken or retired, and
@@ -933,34 +930,13 @@ else under `backups/`.
   a failure, the same file finishes; `restart` abandons an unfinished import
   of another file, and the notice names the rooms it left part-restored.
 
-**Encryption.** Backups are encrypted (AES-256-GCM in 1 MiB chunks) with
-a key derived from the Wrangler secret `BACKUP_ENCRYPTION_KEY_NAME` names.
-The vars hold only secret names, and the code adds none. Any secret of at
-least 32 characters of randomness serves; its text goes through HKDF under
-the label `apron history backup v1`, so a secret shared with another use
-gives a key of its own. Production names `UPLOAD_SIGNING_KEY`, which it has
-anyway. For backups rotated apart from upload links, make a secret of their
-own and name it:
-
-```sh
-openssl rand -base64 32 | npx wrangler secret put HISTORY_BACKUP_KEY --config wrangler.production.toml
-```
-
-Each backup names its secret and a fingerprint of its key, so an import
-decrypts it with any secret the environment has under that name among
-`BACKUP_ENCRYPTION_KEY_NAME` and `BACKUP_PREVIOUS_KEY_NAMES`, and no other.
-An import that lacks the secret fails naming it and the fingerprint; one
-whose secret has been set to another value since fails by the fingerprint;
-a damaged or truncated backup fails its chunk's authentication; none
-writes anything. To rotate, put the new key under a new name, name it in
-`BACKUP_ENCRYPTION_KEY_NAME`, and move the old name to
-`BACKUP_PREVIOUS_KEY_NAMES`: new backups use the new key, and older ones
-still decrypt while the old secret stays set. Never set a new value under
-an old name: backups made with the old value could no longer be read. Both
-must be secrets (`wrangler secret put`), never `[vars]` vars, whose values
-are public: `npm run budget:check` fails on one. Previews have no secrets
-(and no bucket), so they make no backups. The tests set fixed keys in
-`vitest.config.ts`; locally, use `.dev.vars` or `wrangler dev --var`.
+**Codecs.** A backup goes through `@apron/archive` codecs on its way to
+the bucket (`packages/archive/src/codec.ts`): each is a pair of standard
+Streams `TransformStream`s, composed with `pipeThrough`. Backups use `gzip`
+alone (`BACKUP_CODECS`, `src/history/exports.ts`). Encryption can be added
+later as a codec after it, with no change to how backups are named,
+pruned or read: the import decodes through whatever chain an object
+records.
 
 ## Runtime overrides
 
@@ -1079,8 +1055,7 @@ implementation and recalibrating its resource model.
 | `METRICS_DATASET` | The Analytics Engine dataset the `METRICS` binding writes, for `/status` to read active users back (the binding does not tell the Worker its name; `npm run budget:check` holds the two equal); unset, `/status` leaves active users out |
 | `ZONE_ID` | The zone holding `apron_budget_stop`; a Wrangler var (see [Budget guard](#budget-guard)) |
 | `EDGE_STOP_TOKEN` | Secret: an API token with Zone WAF edit permission on `ZONE_ID`, which the budget guard and the flood trip use |
-| `BACKUP_EVERY`, `BACKUP_KEEP`, `BACKUP_PRIVATE_ROOMS`, `BACKUP_ENCRYPTION_KEY_NAME`, `BACKUP_PREVIOUS_KEY_NAMES`, `IMPORT_PLAINTEXT` | Backups of history to the `HISTORY_BLOB` bucket and what `/history import` takes: a schedule (empty: on demand only), how many files of each kind are kept (default 14), whether private rooms are included (default `true`), the secret backups are encrypted with a key derived from (empty: unencrypted), older secrets kept to read backups after a rotation, and whether plain files are imported (default: only where backups are unencrypted). See [Backups and imports](#backups-and-imports) |
-| `HISTORY_BACKUP_KEY` | Optional secret: at least 32 characters of randomness, for backups encrypted with a key of their own where `BACKUP_ENCRYPTION_KEY_NAME` names it (production names `UPLOAD_SIGNING_KEY` instead); set with `openssl rand -base64 32 \| npx wrangler secret put HISTORY_BACKUP_KEY --config wrangler.production.toml` ([Backups and imports](#backups-and-imports)). Any other secret name works the same way |
+| `BACKUP_EVERY`, `BACKUP_KEEP`, `BACKUP_PRIVATE_ROOMS` | Backups of history to the `HISTORY_BLOB` bucket, gzip-compressed and not encrypted: a schedule (empty: on demand only), how many files of each kind are kept (default 14), whether private rooms are included (default `true`). See [Backups and imports](#backups-and-imports) |
 | `ADMISSION_OFF` | `true` or `false`: operator admission switch; `true` rejects new sockets in the entry Worker with 503 before the limiter or DO call; existing sockets remain subject to DO budgets |
 | `ENVIRONMENT` | Set to `development` to enable local origin defaults when `ALLOWED_ORIGINS` and `RP_ORIGINS` are omitted |
 | `NODE_ENV` | Set to `test` to enable the same local origin defaults for tests; production-like deployments must configure origins explicitly |

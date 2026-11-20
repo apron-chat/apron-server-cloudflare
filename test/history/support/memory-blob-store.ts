@@ -13,6 +13,7 @@ import type { BlobStoreProviders } from "../../../src/history/config";
 interface Stored {
 	bytes: Uint8Array;
 	contentType?: string;
+	metadata?: Record<string, string>;
 }
 
 const encoder = new TextEncoder();
@@ -34,6 +35,7 @@ function objectOf(stored: Stored): BlobObject {
 	const bytes = stored.bytes;
 	return {
 		size: bytes.byteLength,
+		...(stored.metadata ? { metadata: { ...stored.metadata } } : {}),
 		text: async () => decoder.decode(bytes),
 		stream: async () =>
 			new ReadableStream<Uint8Array>({
@@ -58,7 +60,7 @@ export class MemoryBlobStore implements BlobStore {
 
 	async put(key: string, body: string, options?: BlobPutOptions): Promise<void> {
 		this.calls.push({ method: "put", key });
-		this.objects.set(key, { bytes: encoder.encode(body), contentType: options?.contentType });
+		this.objects.set(key, { bytes: encoder.encode(body), contentType: options?.contentType, ...(options?.metadata ? { metadata: { ...options.metadata } } : {}) });
 	}
 
 	async writer(key: string, options?: BlobPutOptions): Promise<BlobWriter> {
@@ -71,13 +73,13 @@ export class MemoryBlobStore implements BlobStore {
 		};
 		return {
 			write: async (chunk) => {
-				open().push(encoder.encode(chunk));
+				open().push(typeof chunk === "string" ? encoder.encode(chunk) : chunk.slice());
 			},
 			close: async () => {
 				const bytes = concat(open());
 				chunks = undefined;
 				this.calls.push({ method: "writer.close", key });
-				this.objects.set(key, { bytes, contentType: options?.contentType });
+				this.objects.set(key, { bytes, contentType: options?.contentType, ...(options?.metadata ? { metadata: { ...options.metadata } } : {}) });
 			},
 			abort: async () => {
 				chunks = undefined;

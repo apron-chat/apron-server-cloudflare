@@ -1,11 +1,9 @@
-import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { exportArchive } from "../../src/history/archive/export";
-import { type ArchivedUser, collectArchive, compareReplayed, jsonlReader, jsonlWriter, linesOf, replayRecords, writeArchiveToString } from "@apron/archive";
-import { encryptArchive, openArchive, resolveKeys } from "@apron/archive/crypto";
+import { type ArchiveCodec, type ArchivedUser, collectArchive, compareReplayed, gzip, jsonlReader, jsonlWriter, linesOf, openArchive, replayRecords, writeArchiveToString } from "@apron/archive";
 import { importArchive, place, restoreBatches } from "../../src/history/archive/import";
 import { MemoryBlobStore } from "./support/memory-blob-store";
-import { type BackupSettings, backupFamily, writeBackup } from "../../src/history/exports";
+import { type BackupSettings, CODECS_METADATA, backupFamily, writeBackup } from "../../src/history/exports";
 import { MemorySegmentIndex } from "../../src/history/blob/segments";
 import { BlobHistoryTier } from "../../src/history/blob/tier";
 import { MemoryHead, MemoryHistoryTier } from "./support/memory-tiers";
@@ -152,10 +150,10 @@ describe("export and import", () => {
 		expect(foreign.users).toEqual({ ada: { placeholder: "ada-2" }, bob: { placeholder: "bob-2" } });
 		expect(foreign.dryRun).toBe(true);
 		expect(target.head.all()).toEqual([]);
-		// Matched only when the archive is authenticated (decrypted with this server's key): a plain file's header is anyone's.
+		// Matched only when the archive is authenticated (verified by an authenticating codec): a file's header is anyone's.
 		const unsealed = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, server: "here.test", dryRun: true });
 		expect(unsealed.users).toEqual({ ada: { placeholder: "ada-2" }, bob: { placeholder: "bob-2" } });
-		await expect(importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, users: "match", dryRun: true })).rejects.toThrow(/users match takes only a backup encrypted/);
+		await expect(importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, users: "match", dryRun: true })).rejects.toThrow(/users match needs an archive verified as this server's own/);
 		const own = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, server: "here.test", dryRun: true, authenticated: true });
 		expect(own.users).toEqual({ ada: { matched: "ada" }, bob: { placeholder: "bob-2" } });
 		const chosen = await importArchive(target.pipeline, jsonlReader(linesOf(text)), { clock: target.clock, userMap: { bob: { placeholder: "robert" }, ada: { existing: "ada" } } });
@@ -192,26 +190,47 @@ describe("export and import", () => {
 		}
 	});
 
-	it("reads an encrypted backup with the key the environment has, and names the key it lacks", async () => {
+	it("reads a gzip backup back through the codecs its metadata records, which verify nothing", async () => {
 		const source = pipelineOf("head");
 		populate(source.head, source.clock);
-		const keys = resolveKeys(env, ["HISTORY_BACKUP_KEY", "HISTORY_BACKUP_KEY_OLD"]);
-		const key = (await keys.lookup("HISTORY_BACKUP_KEY"))!;
-		const lines: string[] = [];
-		const sink = encryptArchive(async (line) => { lines.push(line); }, { ...key, name: "HISTORY_BACKUP_KEY", chunkBytes: 512 });
-		await exportArchive(source.pipeline, jsonlWriter(sink), { clock: source.clock, header: { server: "source.test" } });
-		await sink.close();
-		// The encrypting sink hands on lines without their newline.
-		const encrypted = lines.map((line) => line.endsWith("\n") ? line : `${line}\n`).join("");
-		expect(encrypted).not.toContain("hello");
+		const store = new MemoryBlobStore();
+		const { key } = await writeBackup(source.pipeline, store, { keep: 14, privateRooms: true }, "manual", { server: "srv", clock: { now: () => Date.UTC(2026, 10, 19, 12) } });
+		expect(key).toBe("backups/srv-manual-20261119-120000.jsonl.gz");
+		expect(store.contentType(key)).toBe("application/gzip");
+		const object = (await store.get(key))!;
+		expect(object.metadata).toEqual({ [CODECS_METADATA]: "gzip" });
+		const bytes = new Uint8Array(await new Response(await object.stream!()).arrayBuffer());
+		// gzip's magic number: compressed, not plain JSON Lines.
+		expect([bytes[0], bytes[1]]).toEqual([0x1f, 0x8b]);
+		const reader = openArchive(await (await store.get(key))!.stream!(), { codecs: [gzip] });
 		const target = pipelineOf("head", new TestClock(5_000_000));
-		const report = await importArchive(target.pipeline, openArchive(linesOf(encrypted), keys), { clock: target.clock });
+		const report = await importArchive(target.pipeline, reader, { clock: target.clock, authenticated: () => reader.verified() });
 		expect(report.roomsAdded.sort()).toEqual(["general", "random"]);
+		expect(reader.verified()).toBe(false);
 		const plain = await exported(source.pipeline, source.clock);
 		expect(compareReplayed(await stateOf(plain), await stateOf(await exported(target.pipeline, target.clock))).differences).toEqual([]);
-		const keyless = pipelineOf("head", new TestClock(5_000_000));
-		await expect(importArchive(keyless.pipeline, openArchive(linesOf(encrypted)), { clock: keyless.clock })).rejects.toThrow(/needs HISTORY_BACKUP_KEY/);
-		expect(keyless.head.all()).toEqual([]);
+		// Without its codec, or bounded below its decoded size, it does not read.
+		await expect(collectArchive(openArchive(await (await store.get(key))!.stream!()))).rejects.toThrow();
+		await expect(collectArchive(openArchive(await (await store.get(key))!.stream!(), { codecs: [gzip], maxBytes: 100 }))).rejects.toThrow(/larger than 100 bytes decoded/);
+	});
+
+	it("takes an archive as this server's own only once an authenticating codec has read it to its end", async () => {
+		const source = pipelineOf("head");
+		populate(source.head, source.clock);
+		const text = await exported(source.pipeline, source.clock, { server: "here.test" });
+		// A stand-in for a future encryption or signing codec: it passes bytes through and claims to authenticate.
+		const sealed: ArchiveCodec = { name: "sealed", extension: ".sealed", authenticates: true, encoder: () => new TransformStream(), decoder: () => new TransformStream() };
+		const bytesOf = () => new Response(text).body!;
+		const target = pipelineOf("head", new TestClock(5_000_000));
+		target.head.people.set("ada", { user_id: "ada", name: "Our Ada" });
+		const reader = openArchive(bytesOf(), { codecs: [sealed] });
+		expect(reader.verified()).toBe(false);
+		const own = await importArchive(target.pipeline, reader, { clock: target.clock, server: "here.test", dryRun: true, authenticated: () => reader.verified() });
+		expect(reader.verified()).toBe(true);
+		expect(own.users).toEqual({ ada: { matched: "ada" }, bob: { placeholder: "bob" } });
+		const plain = openArchive(bytesOf());
+		const unverified = await importArchive(target.pipeline, plain, { clock: target.clock, server: "here.test", dryRun: true, authenticated: () => plain.verified() });
+		expect(unverified.users).toEqual({ ada: { placeholder: "ada-2" }, bob: { placeholder: "bob" } });
 	});
 
 	it("renumbers at the head when asked", async () => {
@@ -287,10 +306,11 @@ describe("export and import", () => {
 	});
 
 	it("keeps the newest backups of each kind, pruning only that kind's", async () => {
-		const settings: BackupSettings = { keep: 2, privateRooms: true, previousKeyNames: [], importPlaintext: true };
+		const settings: BackupSettings = { keep: 2, privateRooms: true };
 		const family = backupFamily("scheduled", "srv");
+		expect(family.pattern.test("backups/srv-scheduled-20261119-120000.jsonl.gz")).toBe(true);
 		expect(family.pattern.test("backups/srv-scheduled-20261119-120000.jsonl")).toBe(true);
-		expect(family.pattern.test("backups/srv-scheduled-20261119-120000.jsonl.enc")).toBe(true);
+		expect(family.pattern.test("backups/srv-scheduled-20261119-120000.jsonl.enc")).toBe(false);
 		expect(family.pattern.test("backups/srv-manual-20261119-120000.jsonl")).toBe(false);
 		expect(family.pattern.test("backups/srv-scheduled-20261119-120000.jsonl.bak")).toBe(false);
 		expect(backupFamily("scheduled", "a.b").pattern.test("backups/axb-scheduled-20261119-120000.jsonl")).toBe(false);
@@ -306,26 +326,9 @@ describe("export and import", () => {
 		expect(keys).toEqual([
 			"backups/notes.txt",
 			"backups/other-scheduled-20261101-000000.jsonl",
-			"backups/srv-manual-20261120-000000.jsonl", "backups/srv-manual-20261121-000000.jsonl",
-			"backups/srv-scheduled-20261120-000000.jsonl", "backups/srv-scheduled-20261121-000000.jsonl",
+			"backups/srv-manual-20261120-000000.jsonl.gz", "backups/srv-manual-20261121-000000.jsonl.gz",
+			"backups/srv-scheduled-20261120-000000.jsonl.gz", "backups/srv-scheduled-20261121-000000.jsonl.gz",
 		]);
-	});
-
-	it("encrypts with the named secret, and fails without it rather than writing a plain backup", async () => {
-		const settings: BackupSettings = { keep: 14, privateRooms: true, encryptionKeyName: "HISTORY_BACKUP_KEY", previousKeyNames: [], importPlaintext: false };
-		const store = new MemoryBlobStore();
-		const source = pipelineOf("head");
-		populate(source.head, source.clock);
-		const clock = { now: () => Date.UTC(2026, 10, 19, 12) };
-		await expect(writeBackup(source.pipeline, store, settings, "manual", { server: "srv", clock, keys: resolveKeys({}, ["HISTORY_BACKUP_KEY"]) }))
-			.rejects.toThrow("backups are encrypted with HISTORY_BACKUP_KEY (BACKUP_ENCRYPTION_KEY_NAME), which is not set: set it with `wrangler secret put HISTORY_BACKUP_KEY`");
-		expect((await store.list("backups/")).keys).toEqual([]);
-		const written = await writeBackup(source.pipeline, store, settings, "manual", { server: "srv", clock, keys: resolveKeys(env, ["HISTORY_BACKUP_KEY"]) });
-		expect(written.key).toBe("backups/srv-manual-20261119-120000.jsonl.enc");
-		const text = await (await store.get(written.key))!.text();
-		expect(text).not.toContain("hello 0");
-		const archive = await collectArchive(openArchive(linesOf(text), resolveKeys(env, ["HISTORY_BACKUP_KEY"])));
-		expect(archive.records.some((record) => record.record_json.includes("hello 0"))).toBe(true);
 	});
 
 	it("imports a room's stretch only: records of unlisted rooms or below history_log_id are references; output_ref is dropped", async () => {
@@ -497,7 +500,7 @@ describe("export and import", () => {
 	});
 
 	it("refuses a second backup of a kind within the same second", async () => {
-		const settings: BackupSettings = { keep: 14, privateRooms: true, previousKeyNames: [], importPlaintext: true };
+		const settings: BackupSettings = { keep: 14, privateRooms: true };
 		const store = new MemoryBlobStore();
 		const source = pipelineOf("head");
 		populate(source.head, source.clock);
@@ -516,9 +519,9 @@ describe("export and import", () => {
 		source.head.rooms_.set("private_123", { listing: { room_id: "private_123", private: true }, joined: false });
 		const store = new MemoryBlobStore();
 		const lines = async (privateRooms: boolean) => {
-			const settings: BackupSettings = { keep: 14, privateRooms, previousKeyNames: [], importPlaintext: true };
+			const settings: BackupSettings = { keep: 14, privateRooms };
 			const { key } = await writeBackup(source.pipeline, store, settings, privateRooms ? "scheduled" : "manual", { server: "srv", clock: source.clock });
-			return (await store.get(key))!.text();
+			return new Response((await (await store.get(key))!.stream!()).pipeThrough(gzip.decoder())).text();
 		};
 		expect(await lines(true)).toContain("between us");
 		const without = await lines(false);

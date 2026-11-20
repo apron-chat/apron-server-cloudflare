@@ -334,9 +334,9 @@ export async function* linesOf(text: string): AsyncIterable<string> {
 
 /**
  * The lines of a UTF-8 byte stream, decoded across chunk boundaries, without
- * their "\n". A line longer than `maxLine` UTF-16 units (default 8 Mi: an
- * encrypted archive's chunk lines are base64 of up to 4 MiB) fails, so a
- * file without line breaks is never held whole.
+ * their "\n". A line longer than `maxLine` UTF-16 units (default 8 Mi; the
+ * reader's own cap, MAX_READ_LINE_BYTES, is smaller) fails, so a file
+ * without line breaks is never held whole.
  */
 export async function* linesFromStream(stream: ReadableStream<Uint8Array>, maxLine = 8 * 1024 * 1024): AsyncIterable<string> {
 	const reader = stream.getReader();

@@ -2,7 +2,7 @@
 	"name": "@apron/archive",
 	"version": "0.1.0",
 	"private": true,
-	"description": "Apron ARCHIVE.md v1: types, JSON Lines codec, record replay, ID remapping and encrypted archives",
+	"description": "Apron ARCHIVE.md v1: types, JSON Lines codec, validation, import planning, export, record replay, ID remapping and stream codecs",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
@@ -24,7 +24,7 @@
 		"./validate": "./src/validate.ts",
 		"./plan": "./src/plan.ts",
 		"./export": "./src/export.ts",
-		"./crypto": "./src/crypto/index.ts"
+		"./codec": "./src/codec.ts"
 	},
 	"files": [
 		"src"

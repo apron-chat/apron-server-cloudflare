@@ -26,7 +26,11 @@ export interface R2BlobStoreOptions {
 }
 
 function httpMetadata(options?: BlobPutOptions): R2PutOptions | undefined {
-	return options?.contentType ? { httpMetadata: { contentType: options.contentType } } : undefined;
+	const put: R2PutOptions = {
+		...(options?.contentType ? { httpMetadata: { contentType: options.contentType } } : {}),
+		...(options?.metadata ? { customMetadata: options.metadata } : {}),
+	};
+	return Object.keys(put).length ? put : undefined;
 }
 
 /** Joins `chunks` and returns the first `bytes` of them, leaving the rest in `chunks`. */
@@ -63,6 +67,7 @@ export class R2BlobStore implements BlobStore {
 		if (!object) return null;
 		return {
 			size: object.size,
+			...(object.customMetadata && Object.keys(object.customMetadata).length ? { metadata: { ...object.customMetadata } } : {}),
 			text: () => object.text(),
 			stream: async () => object.body,
 		};
@@ -95,7 +100,7 @@ export class R2BlobStore implements BlobStore {
 		return {
 			write: async (chunk) => {
 				open();
-				const bytes = encoder.encode(chunk);
+				const bytes = typeof chunk === "string" ? encoder.encode(chunk) : chunk;
 				if (bytes.byteLength === 0) return;
 				pending.push(bytes);
 				pendingBytes += bytes.byteLength;

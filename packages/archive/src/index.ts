@@ -11,5 +11,4 @@ export * from "./ids.ts";
 export * from "./validate.ts";
 export * from "./plan.ts";
 export * from "./export.ts";
-// Encrypted archives are their own entry, @apron/archive/crypto, so a reader
-// that only parses archives never bundles WebCrypto code.
+export * from "./codec.ts";

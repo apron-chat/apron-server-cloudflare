@@ -38,9 +38,6 @@ declare global {
 		BACKUP_EVERY?: string;
 		BACKUP_KEEP?: string;
 		BACKUP_PRIVATE_ROOMS?: string;
-		BACKUP_ENCRYPTION_KEY_NAME?: string;
-		BACKUP_PREVIOUS_KEY_NAMES?: string;
-		IMPORT_PLAINTEXT?: string;
 		ASSETS?: Fetcher;
 		ALLOWED_ORIGINS?: string;
 		RP_ID?: string;
@@ -97,9 +94,6 @@ declare global {
 			BACKUP_EVERY?: string;
 			BACKUP_KEEP?: string;
 			BACKUP_PRIVATE_ROOMS?: string;
-			BACKUP_ENCRYPTION_KEY_NAME?: string;
-			BACKUP_PREVIOUS_KEY_NAMES?: string;
-			IMPORT_PLAINTEXT?: string;
 			ASSETS?: Fetcher;
 			ALLOWED_ORIGINS?: string;
 			RP_ID?: string;

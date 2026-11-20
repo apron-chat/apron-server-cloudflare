@@ -79,7 +79,7 @@ describe("planImport", () => {
 
 	it("matches users only from an authenticated archive", async () => {
 		const input = archive([message(10, "a", "ada"), message(11, "a", "cy")], [room("a")], [], { server: "wss://here" });
-		await expect(planImport(input, memoryTarget({ users: ["ada"] }), options({ users: "match" }))).rejects.toThrow(/users match takes only/);
+		await expect(planImport(input, memoryTarget({ users: ["ada"] }), options({ users: "match" }))).rejects.toThrow(/users match needs an archive verified/);
 		const auto = await planImport(input, memoryTarget({ users: ["ada"] }), options({ authenticated: true, server: "wss://here" }));
 		expect(auto.report.users).toEqual({ ada: { matched: "ada" }, cy: { placeholder: "cy" } });
 		const elsewhere = await planImport(input, memoryTarget({ users: ["ada"] }), options({ authenticated: true, server: "wss://other" }));
