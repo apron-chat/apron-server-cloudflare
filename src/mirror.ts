@@ -1195,7 +1195,7 @@ export class RemoteRooms {
 		}
 		// Accepted, not copied in time: it comes with a later read, and a resend (same request id) is the owner's duplicate.
 		console.warn(JSON.stringify({ event: "remote_copy_late", server, method: request.method, id: ownerId }));
-		throw { name: "internal_error", message: "The owner took it, but its copy has not arrived here yet; sending it again with the same id is safe" } satisfies ProtocolError;
+		throw { name: "retry_after", message: "The owner took it, but its copy has not arrived here yet; sending it again with the same id is safe", data: { retry_after: 5 } } satisfies ProtocolError;
 	}
 
 	// ─────────────────────────── mirror: waking ───────────────────────────
