@@ -9,6 +9,8 @@ describe('text', () => {
 	it('rewrites mentions by A.3 rules, outside code', () => {
 		const ids = new Map([['ada', 'ada@a.example']]);
 		expect(rewriteMentions('@ada, @ada. x@ada `@ada` ```\n@ada\n``` @adam', ids)).toBe('@ada@a.example, @ada@a.example. x@ada `@ada` ```\n@ada\n``` @adam');
+		// Plain text has no code: a backtick is a character.
+		expect(rewriteMentions('`@ada`', ids, false)).toBe('`@ada@a.example`');
 	});
 
 	it('gives links without server the owner\'s', () => {

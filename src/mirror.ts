@@ -972,7 +972,7 @@ export class RemoteRooms {
 			if (typeof id !== "string" || id.startsWith("~")) continue;
 			ids.set(id, id.endsWith(`@${self}`) ? id.slice(0, -(self.length + 1)) : isShadowUserId(id) ? id : `${id}@${owner}`);
 		}
-		const text = typeof source.text === "string" ? addServerToLinks(rewriteMentions(source.text, ids), server) : "";
+		const text = typeof source.text === "string" ? addServerToLinks(rewriteMentions(source.text, ids, source.format === "markdown"), server) : "";
 		// The owner's embeds load from its own origins: their URLs go as text.
 		const urls = (Array.isArray(source.embeds) ? source.embeds : []).map((embed) => (embed as Record<string, unknown>)?.url).filter((url): url is string => typeof url === "string");
 		const full = [text, ...urls].filter(Boolean).join("\n") || "(attachment)";
@@ -1273,7 +1273,7 @@ export class RemoteRooms {
 				if (mapped) ids.set(id, mapped);
 			}
 			out.body = {
-				...(typeof body.text === "string" ? { text: rewriteMentions(body.text, ids) } : {}),
+				...(typeof body.text === "string" ? { text: rewriteMentions(body.text, ids, body.format === "markdown") } : {}),
 				...(body.format !== undefined ? { format: body.format } : {}),
 				...(ids.size ? { mentions: [...ids.values()] } : {}),
 			};

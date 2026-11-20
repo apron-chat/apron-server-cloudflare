@@ -21,15 +21,15 @@ export function remoteReason(error: ReplyFrame["error"]): string | undefined {
 /**
  * Rewrites each `@id` of `body.text` whose id `ids` maps (Appendix A.3:
  * the longest run of `[A-Za-z0-9_.+@:-]` ending in a letter, digit or `_`,
- * after an `@` that no letter or digit precedes), outside code spans and
- * fenced code.
+ * after an `@` that no letter or digit precedes); in Markdown text
+ * (`markdown`), outside code spans and fenced code, which plain text has none of.
  */
-export function rewriteMentions(text: string, ids: ReadonlyMap<string, string>): string {
+export function rewriteMentions(text: string, ids: ReadonlyMap<string, string>, markdown = true): string {
 	if (!ids.size || !text.includes("@")) return text;
 	let out = "";
 	let index = 0;
 	while (index < text.length) {
-		if (text[index] === "`") {
+		if (markdown && text[index] === "`") {
 			// A run of backticks opens code that the same run closes; unclosed, it is text.
 			let run = 1;
 			while (text[index + run] === "`") run += 1;
