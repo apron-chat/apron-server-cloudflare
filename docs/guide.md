@@ -301,7 +301,7 @@ address>` in the room (a private one works). The `~private` notice holds an
 invite, `https://link.apron.chat/#server=<this server>&room=<room>&token=<token>`;
 hand it privately to an admin of the mirror server, who runs
 `/remote connect <invite>` there. That makes a mirror room with the owner's
-title, which the admin then adds people to. The mirror reads the owner's room
+title and description, and its threads, which the admin then adds people to. The mirror reads the owner's room
 through the link and copies it in; its users' writes in the mirror room go to
 the owner, and come back as copies. The mirror connects when there is
 something to do (a write, the owner's wake push to `/remote/wake/<id>`, the

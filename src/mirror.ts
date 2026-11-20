@@ -181,7 +181,8 @@ export class RemoteRooms {
 	 * Mirror: dials the invite's owner, signs in as its link for this
 	 * server, reads the room, and makes the mirror room: its title,
 	 * description and privacy, `ext.remote` the owner's room, with the admin
-	 * in it. It starts at the owner's head; older records are not copied.
+	 * in it, and a mirror thread for each of the room's threads that the link
+	 * is in. It starts at the owner's head; older records are not copied.
 	 */
 	private async connect(socket: unknown, client: MirrorClient, request: RequestFrame, link: string): Promise<void> {
 		const invite = parseInvite(link);
@@ -192,6 +193,8 @@ export class RemoteRooms {
 		}
 		let connection: LinkConnection | undefined;
 		let owned: Record<string, unknown> | undefined;
+		// The room's threads that the link is in: each gets a mirror thread now (their records after the start follow).
+		let threads: Array<Record<string, unknown>> = [];
 		try {
 			connection = await LinkConnection.open(invite.server, invite.token);
 			const bound = boundServer(connection);
@@ -201,6 +204,8 @@ export class RemoteRooms {
 			const rooms = [...(listed.result?.joined as unknown[] ?? []), ...(listed.result?.not_joined as unknown[] ?? [])] as Array<Record<string, unknown>>;
 			owned = rooms.find((room) => room.room_id === invite.room);
 			if (!owned) throw new Error("the link is not in that room");
+			const listedThreads = await connection.call("room_list", { parent_room_id: invite.room, filter: "joined" }, `mirror-threads:${this.now()}`);
+			threads = (listedThreads.result?.joined as Array<Record<string, unknown>> | undefined) ?? [];
 		} catch (error) {
 			throw { name: "invalid_params", message: `Could not connect to ${invite.server}: ${error instanceof Error ? error.message : String(error)}`.slice(0, 200) } satisfies ProtocolError;
 		} finally {
@@ -226,6 +231,8 @@ export class RemoteRooms {
 		state.rooms.push({ room_id: room.room_id, server: invite.server, owner_room: invite.room, token: invite.token, start, threads: {} });
 		state.servers[invite.server] ??= { cursor: start };
 		this.store.setMirrorState(state, this.now());
+		// A private mirror room has no threads here (copyRoom leaves them out).
+		for (const thread of threads) await this.applyRecord(invite.server, "rooms", thread);
 		this.host.notice(socket, room.room_id, `Mirroring ${title} from ${remoteAuthority(invite.server)} in room \`${room.room_id}\`.`);
 		this.host.reply(socket, request, {});
 		// Live from now on, with the wake push registered, then idle until there is more.
