@@ -48,9 +48,10 @@ export interface StallFields {
 
 const STEPS: readonly string[] = ["deliver", "target", "copy", "advance", "trim", "publish"];
 
+/** A stall from its fields, as stallToFields keeps it: none where they do not make one (no time, or no step it knows). */
 export function stallFromFields(fields: StallFields | undefined): Stall {
-	if (typeof fields?.stalledSince !== "number") return NOT_STALLED;
-	const step = typeof fields.stalledOn === "string" && STEPS.includes(fields.stalledOn) ? fields.stalledOn : "copy";
+	if (typeof fields?.stalledSince !== "number" || typeof fields.stalledOn !== "string" || !STEPS.includes(fields.stalledOn)) return NOT_STALLED;
+	const step = fields.stalledOn;
 	return typeof fields.alertedAt === "number"
 		? { kind: "alerted", since: fields.stalledSince, step, at: fields.alertedAt }
 		: { kind: "stalled", since: fields.stalledSince, step };

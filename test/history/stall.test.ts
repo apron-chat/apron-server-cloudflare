@@ -28,8 +28,9 @@ describe('a hop\'s stall', () => {
 		const alerted = { kind: 'alerted', since: 1, step: 'deliver', at: 2 } as const;
 		expect(stallFromFields(stallToFields(alerted))).toEqual(alerted);
 		expect(stallToFields(NOT_STALLED)).toEqual({});
-		// A step it cannot read (a damaged field) holds the stall as a copy's, which only a copy clears.
-		expect(stallFromFields({ stalledSince: 5, stalledOn: 'rebuild' as never })).toEqual({ kind: 'stalled', since: 5, step: 'copy' });
+		// Fields that do not make a stall (no step, or one it does not know) read as none: the next failure stalls afresh.
+		expect(stallFromFields({ stalledSince: 5, stalledOn: 'rebuild' as never })).toEqual(NOT_STALLED);
+		expect(stallFromFields({ stalledSince: 5 })).toEqual(NOT_STALLED);
 		expect(stallFromFields({})).toEqual(NOT_STALLED);
 	});
 });
