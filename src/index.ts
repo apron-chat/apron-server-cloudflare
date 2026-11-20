@@ -3253,7 +3253,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		await this.runScheduledBackup(now);
 		let result: ReturnType<Store["runCleanup"]> | undefined;
 		try {
-			result = this.store.runCleanup(now, { copyWaitMs: this.historySchedule.retrying ? HISTORY_RETRY_MS : 1_000 });
+			result = this.store.runCleanup(now, { copyWaitMs: this.copyWaitMs() });
 		} catch {
 			// A metered maintenance failure is deferred. Do not spin an alarm loop.
 			// The floor may already be durable even if a physical deletion failed,
@@ -5204,6 +5204,19 @@ export class ApronDemoServer extends DurableObject<Env> {
 			if (this.d1Held) console.warn(JSON.stringify({ event: "history_tier_unbound", tier: D1_TIER, missing: off === "unbound" ? "HISTORY_D1" : "LIMIT_HISTORY_D1_RECORDS" }));
 		}
 		return this.d1Held ? off : undefined;
+	}
+
+	/**
+	 * How long a cleanup job waiting on a copy below waits before it looks
+	 * again: a second only while a cycle is due and nothing holds the lock,
+	 * so the copy it waits for can come next wake. Otherwise nothing will
+	 * have moved by then (the D1 tier off, upkeep backing off or settled with
+	 * the link waiting for a whole batch, a job running: its release asks
+	 * for a cycle), so it waits HISTORY_RETRY_MS: no alarm a second.
+	 */
+	private copyWaitMs(): number {
+		const schedule = this.historySchedule;
+		return schedule.want.kind === "due" && schedule.holder === undefined ? 1_000 : HISTORY_RETRY_MS;
 	}
 
 	/**
