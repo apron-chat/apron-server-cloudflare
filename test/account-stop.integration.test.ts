@@ -89,21 +89,28 @@ it('keeps every socket open when the daily frame budget runs out, refusing reque
 	first.socket.send(JSON.stringify({ id: 'over-budget', method: 'auth', params: { scheme: 'guest' } }));
 	await vi.waitFor(() => expect(replies).toHaveLength(1));
 	expect(replies[0].error?.message).toBe('Daily frame budget exhausted');
-	expect(replies[0].error?.data?.retry_after).toBeGreaterThan(0);
-	// A refusal that lasts is explained once, in a ~private notice asking for a report.
-	await vi.waitFor(() => expect(notices).toHaveLength(1));
-	expect(notices[0]).toMatch(/^\*\*Daily frame budget exhausted\.\*\* The server has handled as many messages and requests as it allows in a day\. This lasts until/);
-	expect(notices[0]).toMatch(/please report it to an admin with the code `frame_budget` and the time \d{4}-\d\d-\d\d \d\d:\d\d UTC\.$/);
+	const retry = replies[0].error?.data?.retry_after ?? 0;
+	expect(retry).toBeGreaterThan(0);
+	// The budget resets at UTC midnight: in a day's last LONG_THROTTLE_SECONDS
+	// (300) the refusal is too short to announce or count (src/index.ts,
+	// noteTrip), so this checks whichever the clock gives.
+	const lasting = retry >= 300;
+	if (lasting) {
+		// A refusal that lasts is explained once, in a ~private notice asking for a report.
+		await vi.waitFor(() => expect(notices).toHaveLength(1));
+		expect(notices[0]).toMatch(/^\*\*Daily frame budget exhausted\.\*\* The server has handled as many messages and requests as it allows in a day\. This lasts until/);
+		expect(notices[0]).toMatch(/please report it to an admin with the code `frame_budget` and the time \d{4}-\d\d-\d\d \d\d:\d\d UTC\.$/);
+	}
 	// Retrying is refused again, without another notice or count.
 	first.socket.send(JSON.stringify({ id: 'over-budget-again', method: 'auth', params: { scheme: 'guest' } }));
 	await vi.waitFor(() => expect(replies).toHaveLength(2));
 	await runInDurableObject(stub, (instance) => {
-		expect((instance as unknown as { store: Store }).store.throttleTrips()).toEqual([['frame_budget', 1]]);
+		expect((instance as unknown as { store: Store }).store.throttleTrips()).toEqual(lasting ? [['frame_budget', 1]] : []);
 	});
-	expect(notices).toHaveLength(1);
-	expect(warn.mock.calls.map(([line]) => String(line)).filter((line) => line.includes('"throttle_tripped"'))).toEqual([
+	expect(notices).toHaveLength(lasting ? 1 : 0);
+	expect(warn.mock.calls.map(([line]) => String(line)).filter((line) => line.includes('"throttle_tripped"'))).toEqual(lasting ? [
 		expect.stringContaining('"trigger":"frame_budget","method":"auth"'),
-	]);
+	] : []);
 	// Neither socket is closed: readers stay connected, and nobody reconnects into the same refusal.
 	const closed = await Promise.race([first.closed, second.closed, new Promise((resolve) => setTimeout(() => resolve('open'), 200))]);
 	expect(closed).toBe('open');
