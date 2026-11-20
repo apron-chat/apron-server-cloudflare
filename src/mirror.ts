@@ -21,7 +21,7 @@ import type { Broadcast, MessageSnapshot, MirrorRoom, MirrorState, RoomRecord, S
 import { StoreError } from "./store-error";
 import type { ProtocolError, RequestFrame } from "./protocol";
 import { apronLink } from "./protocol";
-import { isShadowUserId, normalizeRemoteAddress, parseInvite, remoteAuthority, remoteUserIdError, shadowUserId } from "./remote";
+import { isShadowUserId, normalizeRemoteAddress, parseInvite, remoteAuthority, remoteUserIdError, sameAddress, shadowUserId } from "./remote";
 import { addServerToLinks, LinkConnection, remoteReason, rewriteMentions, type ReplyFrame } from "./remote-client";
 
 /** A connection as index.ts holds it: enough to answer it. */
@@ -192,8 +192,8 @@ export class RemoteRooms {
 		let owned: Record<string, unknown> | undefined;
 		try {
 			connection = await LinkConnection.open(invite.server, invite.token);
-			const bound = (connection.you.ext as Record<string, unknown> | undefined)?.remote as Record<string, unknown> | undefined;
-			if (bound?.server !== this.host.self) throw new Error(`the link there is bound to ${String(bound?.server ?? "no server")}, not ${this.host.self}`);
+			const bound = boundServer(connection);
+			if (!sameAddress(bound, this.host.self)) throw new Error(`the link there is bound to ${bound ?? "no server"}, not ${this.host.self}`);
 			const listed = await connection.call("room_list", { room_id: invite.room }, `mirror-connect:${this.now()}`);
 			if (listed.error) throw new Error(listed.error.message ?? `error ${listed.error.code}`);
 			const rooms = [...(listed.result?.joined as unknown[] ?? []), ...(listed.result?.not_joined as unknown[] ?? [])] as Array<Record<string, unknown>>;
@@ -475,10 +475,10 @@ export class RemoteRooms {
 				console.log(JSON.stringify({ event: "remote_mirror_closed", server: session.server }));
 			},
 		});
-		const bound = (connection.you.ext as Record<string, unknown> | undefined)?.remote as Record<string, unknown> | undefined;
-		if (bound?.server !== this.host.self) {
+		const bound = boundServer(connection);
+		if (!sameAddress(bound, this.host.self)) {
 			connection.close();
-			throw new Error(`the link is bound to ${String(bound?.server ?? "no server")}`);
+			throw new Error(`the link is bound to ${bound ?? "no server"}`);
 		}
 		session.connection = connection;
 		console.log(JSON.stringify({ event: "remote_mirror_connected", server: session.server }));
@@ -1194,6 +1194,12 @@ export class RemoteRooms {
 		}
 		await this.host.wakeAt(now + MIRROR_CHECK_MS);
 	}
+}
+
+/** The address the link signed in on is bound to: its `you.ext.remote.server`. */
+function boundServer(connection: LinkConnection): string | undefined {
+	const server = ((connection.you.ext as Record<string, unknown> | undefined)?.remote as Record<string, unknown> | undefined)?.server;
+	return typeof server === "string" ? server : undefined;
 }
 
 /** Whether a request's error is the connection's own (closed, or no answer in time), not the owner's answer. */

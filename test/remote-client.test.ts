@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { addServerToLinks, remoteReason, rewriteMentions } from '../src/remote-client';
 import { wakeUrlAllowed } from '../src/mirror';
+import { sameAddress } from '../src/remote';
 
 // The text mapping a mirror applies both ways, and the wake push policy (extension `ext:remote`).
 
@@ -19,6 +20,17 @@ describe('text', () => {
 		expect(remoteReason({ code: -32001, data: { ext: { remote: 'not_joined' } } })).toBe('not_joined');
 		expect(remoteReason({ code: -32001, data: { ext: { remote: 'removed' } } })).toBe('removed');
 		expect(remoteReason({ code: -32001, message: 'no' })).toBeUndefined();
+	});
+});
+
+describe('addresses', () => {
+	it('compare after lowercasing scheme and host, keeping port and path', () => {
+		expect(sameAddress('WSS://Chat.Example/ws', 'wss://chat.example/ws')).toBe(true);
+		expect(sameAddress('ws://127.0.0.1:8788/ws', 'ws://127.0.0.1:8788/ws')).toBe(true);
+		expect(sameAddress('wss://chat.example/WS', 'wss://chat.example/ws')).toBe(false);
+		expect(sameAddress('wss://chat.example:443/ws', 'wss://chat.example/ws')).toBe(false);
+		expect(sameAddress(undefined, 'wss://chat.example/ws')).toBe(false);
+		expect(sameAddress('chat.example', 'chat.example')).toBe(false);
 	});
 });
 

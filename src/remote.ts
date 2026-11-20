@@ -61,6 +61,12 @@ export function normalizeRemoteAddress(value: string): string | undefined {
 	return normalized;
 }
 
+/** Whether two addresses are the same once normalized (normalizeRemoteAddress); false when either is not one. */
+export function sameAddress(a: string | undefined, b: string | undefined): boolean {
+	const left = a === undefined ? undefined : normalizeRemoteAddress(a);
+	return left !== undefined && left === (b === undefined ? undefined : normalizeRemoteAddress(b));
+}
+
 /** The authority of a normalized address: its host, plus `:port` when it has one. */
 export function remoteAuthority(address: string): string {
 	return /^wss?:\/\/([^/?#]+)/.exec(address)?.[1] ?? address;
