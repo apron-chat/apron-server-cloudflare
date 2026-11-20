@@ -292,7 +292,7 @@ first.
 | Room mutes per user | 100 |
 | Registered accounts on the server | 50,000 (an account inactive for 30 days is removed, or up to 61 if it has an avatar, unless among the 100 most recently active or holding a role; a device token unused for 30 days stops working) |
 
-A thread or private room stops counting when everyone has left it, or when it has been quiet for 30 days: it is then archived, still listed (`archived: true`) and readable, and a new post makes it active again, taking a slot (refused with `thread_limit` while the cap is full; leaving is always allowed). The server keeps as many archived rooms of each kind as the cap, the newest; older ones are removed.
+A thread or private room stops counting when everyone has left it, or when it has been quiet for 30 days: it is then archived, still listed (`archived: true`) and readable, and a new post makes it active again, taking a slot (refused with `thread_limit` while the cap is full; leaving is always allowed). Archived rooms are kept for good, however many there are: only live rooms count against the caps. A room list names the 100 most recently active archived threads; an older one is still there by its `room_id`.
 
 ## Checklist: a well-behaved client
 

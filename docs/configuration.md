@@ -797,14 +797,29 @@ without losing anything. A new post, reaction, move, room save or join in it
 makes it active again and takes a slot; while the cap is full that request is
 refused as a new room would be (`thread_limit`). Leaving is never refused.
 
-The rooms table keeps the newest archived rooms of each kind, up to as many
-as the cap (100 threads, 100 private rooms on Paid); each daily cleanup
-removes older ones, as it removes a room whose whole log has left every tier
-(its members get `room_update` `left`, and its history is no longer
-reachable, since history is read room by room). Each kind's rows therefore
-stay within three times its cap, which the scans of the rooms table and
-their reservations are sized for; `/status` shows the active and archived
-counts.
+Archived rooms are kept for good, however many there are: only the live
+rooms are bounded, by the caps. A room is removed only when its whole log has
+left every tier (with keep-everything in the cold tier, never), or by an
+explicit removal (its last member leaving, `/purge`). Counting and listing
+rooms reads an index of the rooms table by kind and head
+(`rooms_kind_head_idx`), so their cost follows the live rooms, not the
+archived ones. An object made before this version gets the index from its
+first cleanup after the deploy (an additive index, no schema version change);
+until then the same queries scan the table instead.
+
+What still grows with archived rooms:
+
+- A `room_list` names every top-level room, every live thread and the 100
+  archived threads most recently active; an older archived thread is still
+  listed by its `room_id` (`room_list` with `room_id`) and read by `history`.
+  A user's joined rooms are listed the same way: their most recently active
+  rooms, at most the live ones plus 100 archived threads and their private
+  rooms.
+- `/purge`, `/rename` and idle-account pruning read every room row for its
+  creator; their reservations count the rows the table holds.
+- An export names every room (`Store.allRooms`), read in pages.
+
+`/status` shows the active and archived counts.
 
 ### History tiers
 
@@ -1018,7 +1033,9 @@ the first daily cleanup that finds more than `retentionRecords`' share):
   floor, with their memberships, where this version keeps them because their
   records are in D1 or R2, archived or not.
 - It counts every thread row against `threadLimit`, archived ones included,
-  so it refuses new threads until its own cleanup removes old ones.
+  so it refuses new threads until its own cleanup removes old ones (threads
+  whose whole log is below its SQLite floor). It ignores `rooms_kind_head_idx`,
+  which SQLite keeps up to date for it.
 
 Records already in D1 and R2 survive a rollback, and come back into history
 when this version is deployed again. If a rollback cannot wait, make it in the
