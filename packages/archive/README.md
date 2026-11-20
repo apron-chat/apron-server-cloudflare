@@ -83,7 +83,7 @@ means; the server says what is true there (`ImportTarget`,
 - `ids.ts`: renumbering on import. `IdMap` (old to new log IDs and user
   IDs), `remapRecord` / `remapListing` / `remapUser` (every place an ID
   occurs), `nudgeLogIds` (colliding log IDs to the next free millisecond,
-  order kept), `freeUserId`. Which IDs may hold an account is a server's
+  order kept; `nextFree`), `freeUserId`. Which IDs may hold an account is a server's
   rule, passed to `planImport` as `UserIdRules`.
 - `codec.ts`: what an archive's bytes go through between a writer and
   where they are stored, and back. An `ArchiveCodec` is a pair of standard
@@ -92,10 +92,12 @@ means; the server says what is true there (`ImportTarget`,
   applies a chain in order, `decodeStream` in reverse. `gzip` (through
   `CompressionStream`) is the one codec here; `ARCHIVE_CODECS` /
   `codecChain` find codecs by name (an unknown one is refused), and
-  `codecNames` / `codecsFromName` / `archiveName` record a chain with what
-  it encoded (metadata, `x.jsonl.gz`). `encodedArchiveWriter` writes an
-  archive through a chain to any byte sink; `openArchive(bytes, { codecs,
-  maxBytes })` reads one back (decoded size bounded), or reads lines.
+  `codecNames` / `parseCodecNames` / `codecsFromName` / `archiveName`
+  record a chain with what it encoded and read it back (metadata,
+  `x.jsonl.gz`). `archiveSink` and `encodedArchiveWriter` write an archive
+  through a chain to any byte sink; `openArchive(bytes, { codecs,
+  maxBytes })` reads one back (decoded size bounded by `byteLimit`), or
+  reads lines.
   Encryption or signing can be added as codecs of their own after gzip
   (`stream.pipeThrough(gzip.encoder()).pipeThrough(encrypt.encoder())`).
   A codec that `authenticates` must error its decoder on any damage, a

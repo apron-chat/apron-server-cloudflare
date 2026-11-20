@@ -105,8 +105,9 @@ BACKUP_PRIVATE_ROOMS = "true"
 # LIMIT_HISTORY_D1_RECORDS of them, then they go on to the cold tier, or
 # expire without one. Both counts are ceilings: once a day, cleanup moves
 # what is past LIMIT_CLEANUP_THRESHOLD_PERCENT (80) of each.
-# `/purge` and `/rename` reach this tier too. Without this binding (or the
-# cold tier's), records past SQLite's limits expire at once. Once D1 holds
+# `/purge` and `/rename` reach this tier too (not the cold tier). Without
+# this binding and the cold tier's, records past SQLite's limits expire at
+# once. Once D1 holds
 # history, unbinding it while the cold tier is bound stops history moving
 # below SQLite until it is bound again. The object creates its table on
 # first use (the database keeps its first name, apron-archive). Previews

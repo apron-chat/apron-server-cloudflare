@@ -162,10 +162,13 @@ mutation with the **same** `id`.
 | Room listing limited | 6 `room_list` a minute per account | The first `filter: "joined"` listing after each sign-in is free. Keep the list current from `room_update` rather than polling. |
 
 A history page holds at most 50 records (20 by default) and 256 KiB. History
-keeps the latest 84,000 records (messages, edits, reactions and room changes),
-however old, the oldest 80,000 of them in a D1 history tier that history reads from
-as well (4,000 where the server has no D1 tier), trimmed back to that once
-past it; none younger than three days expires. Messages in the D1 tier cannot be edited, reacted to or replied to.
+keeps the latest 4,000 records (messages, edits, reactions and room changes) in
+the server's own storage, 80,000 more in a D1 history tier, and everything
+older in a cold tier in R2 (kept indefinitely by default), all read by history;
+each is trimmed back to its share once past it, and none younger than three
+days leaves the server's own storage. Where the server has no tiers below it,
+4,000 are kept and older records expire. Messages below the server's own
+storage cannot be edited, reacted to or replied to.
 
 ### Server-wide spikes
 
