@@ -214,11 +214,9 @@ export class HistoryChain {
 					round.waiting.set(step.link, arrivedThrough(snapshot, step.link));
 					return;
 				}
-				const range = await from.scan(step.start, batch);
-				const records = range.records.filter((record) => record.log_id < step.below);
+				const { records, exhausted } = await this.gather(from, step.start, step.below, batch);
 				if (records.length) await to.append(toRange(records));
-				// The tier below holds everything below the target once a scan came short of a batch or reached it.
-				const exhausted = logIds(range.records).length < batch || records.length < range.records.length;
+				// The tier below holds everything below the target once the tier above had no more below it.
 				const through = exhausted ? step.below - 1 : records[records.length - 1].log_id;
 				const link = snapshot.links[step.link];
 				await this.state.saveLink(from.name, { through: Math.max(link.through, through), stall: stallCleared(link.stall, "copy") });
@@ -247,6 +245,31 @@ export class HistoryChain {
 				await this.head.publish(step.floor);
 				return;
 		}
+	}
+
+	/**
+	 * Up to `batch` log IDs of `from`'s records from `start`, below `below`,
+	 * gathered over as many scans as its scanLimit needs. `exhausted` only
+	 * when a scan returned fewer log IDs than it was asked, or reached
+	 * `below`: a source that caps its scans is never taken to be empty when
+	 * it only returned its most.
+	 */
+	private async gather(from: HistoryTier, start: number, below: number, batch: number): Promise<{ records: ChatRecord[]; exhausted: boolean }> {
+		const most = Math.max(1, Math.min(batch, from.scanLimit ?? batch));
+		const records: ChatRecord[] = [];
+		let gathered = 0;
+		let next = start;
+		while (gathered < batch) {
+			const asked = Math.min(most, batch - gathered);
+			const range = await from.scan(next, asked);
+			const ids = logIds(range.records);
+			const kept = range.records.filter((record) => record.log_id < below);
+			records.push(...kept);
+			gathered += logIds(kept).length;
+			if (ids.length < asked || kept.length < range.records.length) return { records, exhausted: true };
+			next = Math.max(...ids) + 1;
+		}
+		return { records, exhausted: false };
 	}
 
 	/**

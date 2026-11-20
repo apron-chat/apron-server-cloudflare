@@ -23,6 +23,8 @@ export interface HeadStore {
 	historyFloors(): { hot: number; published: number; latest: number };
 	historyTarget(): number | undefined;
 	historyScan(from: number, limit?: number): ChatRecord[];
+	/** The most log IDs historyScan returns at once, whatever it is asked. */
+	readonly historyScanLimit: number;
 	historyRecords(query: HistoryQuery): ChatRecord[];
 	historyLookup(logIds: readonly number[]): ChatRecord[];
 	hotRecords(): number;
@@ -66,6 +68,7 @@ export function storeHead(name: string, store: HeadStore): HistoryHead {
 		async append(range: RecordRange) {
 			if (range.records.length) throw new Error("this head takes records only by commit");
 		},
+		scanLimit: store.historyScanLimit,
 		scan: async (from, limit) => toRange(store.historyScan(from, limit)),
 		read: async (query) => store.historyRecords(query),
 		lookup: async (ids) => store.historyLookup(ids),

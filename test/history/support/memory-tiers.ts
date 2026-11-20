@@ -41,6 +41,8 @@ const key = (record: Pick<ChatRecord, "room_id" | "log_id">) => `${record.log_id
 
 export class MemoryHistoryTier implements HistoryTier {
 	readonly records = new Map<string, ChatRecord>();
+	/** The most log IDs one scan returns (HistoryTier.scanLimit), as the Store's head caps its scans; unset, no cap. */
+	scanLimit?: number;
 
 	constructor(readonly name: string) {}
 
@@ -54,7 +56,7 @@ export class MemoryHistoryTier implements HistoryTier {
 	}
 
 	async scan(from: number, limit: number): Promise<RecordRange> {
-		return toRange(limitByLogId(this.all().filter((record) => record.log_id >= from), limit, true));
+		return toRange(limitByLogId(this.all().filter((record) => record.log_id >= from), Math.min(limit, this.scanLimit ?? limit), true));
 	}
 
 	async read(query: HistoryQuery): Promise<ChatRecord[]> {

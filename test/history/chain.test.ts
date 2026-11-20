@@ -149,6 +149,8 @@ interface Composition {
 	name: string;
 	headRetention: Retention;
 	stages: () => ChainStage[];
+	/** The head's scan cap (HistoryTier.scanLimit), as the Store's: a copy gathers a larger batch over several scans. */
+	headScanLimit?: number;
 }
 
 /** A cold tier over memory: chunks of `chunkLogIds` log IDs. It takes no rewrites. */
@@ -170,11 +172,15 @@ const compositions: Composition[] = [
 		{ tier: new MemoryHistoryTier("recent"), retention: { records: 8, thresholdPercent: 100 } },
 		{ tier: cold(3), retention: { records: 30, thresholdPercent: 100 } },
 	] },
+	{ name: "head → cold (head scans capped below a chunk)", headRetention: { records: 6, thresholdPercent: 80 }, headScanLimit: 2, stages: () => [
+		{ tier: cold(5), retention: { thresholdPercent: 100 } },
+	] },
 ];
 
 function build(composition: Composition, options: { faults?: () => boolean } = {}) {
 	const clock = new TestClock();
 	const head = new MemoryHead("hot", clock);
+	if (composition.headScanLimit !== undefined) head.scanLimit = composition.headScanLimit;
 	const stages = composition.stages();
 	const faulty = options.faults;
 	const wrapped = faulty ? stages.map((stage) => ({ ...stage, tier: instrument(stage.tier, async (method, call) => {

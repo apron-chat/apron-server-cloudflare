@@ -27,6 +27,13 @@ export interface HistoryTier {
 	 * tier's chunks) asks for a piece's worth. Default: the chain's batch.
 	 */
 	readonly appendBatch?: number;
+	/**
+	 * The most distinct log IDs one scan returns, whatever it is asked (the
+	 * Store's head caps a scan by its budget). A copy asks no more than this
+	 * of the tier it copies from, and gathers a larger batch over several
+	 * scans. Default: no cap.
+	 */
+	readonly scanLimit?: number;
 	/** INSERT OR REPLACE semantics. */
 	append(range: RecordRange): Promise<void>;
 	/** Oldest first from `from`, at most `limit` distinct log IDs, every room's copy of each. */

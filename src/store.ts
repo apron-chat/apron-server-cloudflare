@@ -3705,6 +3705,9 @@ export class Store {
    * Records from `from` on, oldest first: those of at most `limit` distinct
    * log IDs, every room's copy of each (HistoryHead.scan, for the copy down).
    */
+  /** The most log IDs historyScan returns at once (HistoryTier.scanLimit): a copy gathers a larger batch over several scans. */
+  readonly historyScanLimit = HISTORY_SCAN_BATCH;
+
   historyScan(from: number, limit = HISTORY_SCAN_BATCH, now = this.clock.now()): ChatRecord[] {
     this.ensureReady();
     const capped = Math.max(0, Math.min(limit, HISTORY_SCAN_BATCH));
