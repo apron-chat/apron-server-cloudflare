@@ -18,7 +18,8 @@
 		"test": "npm run budget:check && node --test scripts/budget.test.mjs scripts/fs-blob-store.test.mjs && vitest run",
 		"test:watch": "vitest",
 		"cf-typegen": "wrangler types",
-		"usage:report": "node scripts/usage-report.mjs"
+		"usage:report": "node scripts/usage-report.mjs",
+		"roundtrip": "node scripts/roundtrip.mjs"
 	},
 	"dependencies": {
 		"@apron/archive": "*",
