@@ -2,6 +2,7 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { collectArchive, gzip, jsonlWriter, openArchive } from '@apron/archive';
 import { connect as open, exchange, request, type Frame, type Peer } from './helpers/socket';
+import { type HistoryHolder, type HistorySchedule, isRefusal } from '../src/history/schedule';
 
 // `/history` end to end: a backup to the backup store (HISTORY_BLOB, local
 // R2 in the tests), and imports from it: a backup of this server's own,
@@ -112,7 +113,9 @@ type Runtime = {
 	config: { backups: Backups };
 	runtimeEnv: Record<string, unknown>;
 	history?: unknown;
-	historyBusy?: 'cycle' | 'job';
+	historySchedule: HistorySchedule;
+	deadlines: { maintenance: { at?: number; clear(): void; soonest(at: number): boolean } };
+	runHistory(now: number): Promise<void>;
 	d1Unbound?: boolean;
 	backupUnboundWarned: boolean;
 	announce(alert: Record<string, unknown>): void;
@@ -128,7 +131,7 @@ async function changed(change: (runtime: Runtime) => void, fn: () => Promise<voi
 	let saved: Partial<Runtime> = {};
 	await runInDurableObject(stub(), (instance) => {
 		const runtime = instance as unknown as Runtime;
-		saved = { config: runtime.config, runtimeEnv: runtime.runtimeEnv, history: runtime.history, historyBusy: runtime.historyBusy, d1Unbound: runtime.d1Unbound, backupUnboundWarned: runtime.backupUnboundWarned };
+		saved = { config: runtime.config, runtimeEnv: runtime.runtimeEnv, history: runtime.history, d1Unbound: runtime.d1Unbound, backupUnboundWarned: runtime.backupUnboundWarned };
 		change(runtime);
 	});
 	try {
@@ -229,10 +232,24 @@ it('refuses a file larger than an import reads, before reading it', async () => 
 	}
 });
 
+/** Runs `fn` while the history lock is held for `holder` (as a running cycle or job would hold it), then releases it. */
+async function holding<R>(holder: HistoryHolder, fn: () => Promise<R>): Promise<R> {
+	const lease = await runInDurableObject(stub(), (instance) => {
+		const acquired = (instance as unknown as Runtime).historySchedule.acquire(holder);
+		if (isRefusal(acquired)) throw new Error(`the history lock is held: ${JSON.stringify(acquired)}`);
+		return acquired;
+	});
+	try {
+		return await fn();
+	} finally {
+		await runInDurableObject(stub(), () => lease.release());
+	}
+}
+
 it('runs one history job at a time: an import or export waits for a running cycle', async () => {
 	const admin = await signedInAdmin();
 	try {
-		await changed((runtime) => { runtime.historyBusy = 'cycle'; }, async () => {
+		await holding({ kind: 'cycle' }, async () => {
 			for (const [id, text] of [['busy-import', '/history import backups/none.jsonl'], ['busy-export', '/history export']]) {
 				const refused = await command(admin, id, text);
 				expect(refused.frame.error, text).toMatchObject({ code: -32602, message: 'History upkeep is running; try again in a moment' });
@@ -241,6 +258,44 @@ it('runs one history job at a time: an import or export waits for a running cycl
 	} finally {
 		admin.close();
 	}
+});
+
+it('refuses /purge and /rename while an import runs: its later writes would put back what they remove', async () => {
+	const admin = await signedInAdmin();
+	try {
+		await holding({ kind: 'job', job: 'import' }, async () => {
+			for (const [id, text] of [['import-purge', '/purge nobody-here'], ['import-rename', '/rename nobody-here someone-else']]) {
+				const refused = await command(admin, id, text);
+				expect(refused.frame.error, text).toMatchObject({ code: -32602, message: 'A history import is running; try again when it ends' });
+			}
+		});
+		// And an import waits for a purge or rename that runs.
+		await holding({ kind: 'rewrite' }, async () => {
+			const refused = await command(admin, 'rewrite-import', '/history import backups/none.jsonl');
+			expect(refused.frame.error).toMatchObject({ code: -32602, message: 'A purge or rename is running; try again in a moment' });
+		});
+	} finally {
+		admin.close();
+	}
+});
+
+it('does not poll while a job holds the history lock: the cycle waits, and the job\'s end asks for it', async () => {
+	const result = await runInDurableObject(stub(), async (instance) => {
+		const runtime = instance as unknown as Runtime;
+		const lease = runtime.historySchedule.acquire({ kind: 'job', job: 'export' });
+		if (isRefusal(lease)) throw new Error('the history lock is held');
+		const now = Date.now();
+		const before = runtime.deadlines.maintenance.at;
+		runtime.deadlines.maintenance.clear();
+		await runtime.runHistory(now);
+		// No maintenance a second away: nothing would change until the job ends.
+		const polled = (runtime.deadlines.maintenance.at ?? Infinity) <= now + 1_000;
+		const wanted = runtime.historySchedule.want.kind;
+		const released = lease.release();
+		if (before !== undefined) runtime.deadlines.maintenance.soonest(before);
+		return { polled, wanted, released };
+	});
+	expect(result).toEqual({ polled: false, wanted: 'due', released: { cycleSoon: true } });
 });
 
 it('takes the D1 tier for unbound only once it holds history: no other composition runs in its place', async () => {

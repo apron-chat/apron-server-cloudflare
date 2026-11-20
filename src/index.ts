@@ -10,6 +10,7 @@ import { type BackupKind, writeBackup } from "./history/exports";
 import { storedChain } from "./history/storage/encoding";
 import type { BlobStore } from "./history/storage/store";
 import { checkInvariants } from "./history/plan";
+import { type HistoryHolder, type HistoryLease, HistorySchedule, isRefusal, refusalMessage } from "./history/schedule";
 import type { HistoryPipeline } from "./history/pipeline";
 import type { ChatRecord } from "./history/records";
 import { keepLast, LiveBuffer, LiveReaders, liveTextHeaders, type LiveEnd, type LiveKind } from "./live-text";
@@ -738,14 +739,11 @@ function importNotice(report: ImportReport): string {
 	].filter(Boolean).join("\n");
 }
 
-/** Why a history job cannot start now (Runtime.historyBusy). */
-function historyBusyMessage(busy: "cycle" | "job"): string {
-	return busy === "cycle" ? "History upkeep is running; try again in a moment" : "Another history export or import is running; try again when it ends";
-}
+/** The lease `/purge` and `/rename` hold (HistorySchedule): no import runs beside them. */
+type RewriteLease = HistoryLease<{ kind: "rewrite" }>;
 
-function historyArgs(words: readonly string[], usage: string, busy: "cycle" | "job" | undefined): HistoryArgs {
+function historyArgs(words: readonly string[], usage: string): HistoryArgs {
 	const action = words[1];
-	if (busy && (action === "export" || action === "import")) throw usageError(historyBusyMessage(busy));
 	if (action === "export" || action === "import") {
 		if (action === "export") return { action, roomIds: roomIdArgs(words.slice(2)) };
 		const key = words[2];
@@ -2684,25 +2682,15 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private readonly history?: HistoryPipeline;
 	/**
-	 * What history work is running, one at a time: a pipeline cycle
-	 * (runHistory), or an admin's or a schedule's job (an import, an
-	 * export). A cycle waits for a job, so tiers do not move under
-	 * its plan; a job is refused while a cycle or another job runs, so it
-	 * never writes between a cycle's copy and its saving of the copy marker.
+	 * History upkeep's lock and schedule (src/history/schedule.ts): what runs
+	 * (a cycle, a job, rewrites), each under a lease, and whether a cycle is
+	 * wanted, backing off after failures.
 	 */
-	private historyBusy: "cycle" | "job" | undefined;
+	private readonly historySchedule = new HistorySchedule();
 	/** Whether the D1 tier holds history but is off in this deploy (unboundD1), once read; undefined until then. */
 	private d1Unbound: boolean | undefined;
 	/** Whether this wake has warned that the scheduled backup has no store (runScheduledBackup). */
 	private backupUnboundWarned = false;
-	/** History cycles that failed in a row: cleanup then waits longer for the copy (HISTORY_RETRY_MS). */
-	private historyFailures = 0;
-	/** When the history pipeline may be tried again after a failure (runHistory); 0 for now. */
-	private historyRetryAt = 0;
-	/** Whether the pipeline asked to run again soon, or has an op to carry down (alarmWorkDue). */
-	private historyPending = false;
-	/** Whether this wake knows the tiers below have no queued `/purge` or `/rename` (alarmWorkDue). */
-	private historyOpsChecked = false;
 	private terminalOutputCacheBytes = 0;
 	/** Whether this instance has ended the live texts a lost one left open (recoverLiveTexts). */
 	private liveRecovered = false;
@@ -3269,7 +3257,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		await this.runScheduledBackup(now);
 		let result: ReturnType<Store["runCleanup"]> | undefined;
 		try {
-			result = this.store.runCleanup(now, { copyWaitMs: this.historyFailures ? HISTORY_RETRY_MS : 1_000 });
+			result = this.store.runCleanup(now, { copyWaitMs: this.historySchedule.retrying ? HISTORY_RETRY_MS : 1_000 });
 		} catch {
 			// A metered maintenance failure is deferred. Do not spin an alarm loop.
 			// The floor may already be durable even if a physical deletion failed,
@@ -3361,17 +3349,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	private alarmWorkDue(now: number): boolean {
 		// History upkeep: a cycle that asked to go on, or a `/purge` or
 		// `/rename` the tiers below have yet to apply, read once a wake.
-		if (this.history && now >= this.historyRetryAt) {
-			if (this.historyPending) return true;
-			if (!this.historyOpsChecked) {
-				try {
-					if (this.store.historyOps(now).length) return true;
-					this.historyOpsChecked = true;
-				} catch {
-					return true;
-				}
-			}
-		}
+		if (this.history && this.historySchedule.workDue(now, () => this.store.historyOps(now).length > 0)) return true;
 		if (this.config.uploads && !this.uploadDeadlineRead) {
 			try {
 				const stored = this.store.nextUploadDeadline(now);
@@ -5261,34 +5239,26 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async runHistory(now: number): Promise<void> {
 		const history = this.history!;
-		if (now < this.historyRetryAt) return;
+		const schedule = this.historySchedule;
+		if (!schedule.mayRun(now)) return;
 		if (this.unboundD1(now)) {
 			// Nothing runs until D1 is bound: no cycle or queued op is due meanwhile.
-			this.historyPending = false;
-			this.historyOpsChecked = true;
+			schedule.idle();
 			this.noteUnboundD1(now);
 			return;
 		}
-		if (this.historyBusy) {
-			this.historyPending = true;
-			this.maintenanceSoon(now);
-			return;
-		}
-		this.historyBusy = "cycle";
+		// Held by a job: the cycle is left due, and the job's release asks for it.
+		const lease = schedule.acquire({ kind: "cycle" });
+		if (isRefusal(lease)) return;
 		try {
 			const { more, report } = await history.cycle({ steps: HISTORY_CYCLE_STEPS });
 			if (report.failure) {
-				this.historyFailures += 1;
-				this.historyRetryAt = now + HISTORY_RETRY_MS;
-				this.historyPending = true;
-				this.deadlines.maintenance.soonest(this.historyRetryAt);
+				schedule.failed(now, HISTORY_RETRY_MS, true);
+				this.deadlines.maintenance.soonest(now + HISTORY_RETRY_MS);
 				console.warn(JSON.stringify({ event: "history_step_failed", step: report.failure.step.kind, message: report.failure.error instanceof Error ? report.failure.error.message : String(report.failure.error) }));
 			} else {
-				this.historyFailures = 0;
-				this.historyRetryAt = 0;
-				this.historyPending = more;
 				// A finished round applied every op it found.
-				this.historyOpsChecked = !more;
+				schedule.succeeded(more);
 				if (more) this.maintenanceSoon(now);
 			}
 			for (const stall of await history.stallsToAlert(HISTORY_STALL_ALERT_MS)) {
@@ -5296,11 +5266,10 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 		} catch {
 			// The state could not be read or saved (the maintenance budget): tried again later.
-			this.historyRetryAt = now + HISTORY_RETRY_MS;
-			this.historyPending = true;
-			this.deadlines.maintenance.soonest(this.historyRetryAt);
+			schedule.failed(now, HISTORY_RETRY_MS, false);
+			this.deadlines.maintenance.soonest(now + HISTORY_RETRY_MS);
 		} finally {
-			this.historyBusy = undefined;
+			lease.release();
 		}
 	}
 
@@ -7887,7 +7856,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 		}),
 		adminCommand({
 			name: "history", usage: "/history status | export [<room_id>...] | import <key> [dry-run] [match|new] [renumber] [restart]", help: "show where history is kept; back it up to the backup store, or import a backup or archive (ARCHIVE.md, as written or through the codecs its name or metadata gives) from it (running a failed import again finishes it; restart abandons another file's)", usageErrors: "reply",
-			parse: ({ words, usage }, runtime) => historyArgs(words, usage, runtime.historyBusy),
+			parse: ({ words, usage }) => historyArgs(words, usage),
 			audit: (args) => ({ action: args.action, target: args.action === "import" ? args.key : args.action === "export" ? args.roomIds.join(" ") : undefined }),
 			run: ({ cap, runtime, socket, request, roomId }, args) => runtime.historyCommand(cap, socket, request, roomId, args),
 		}),
@@ -7954,7 +7923,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return userIdArg(requiredArg(words[1], usage));
 			},
 			audit: (userId) => ({ target: userId }),
-			run: ({ cap, runtime, socket, attachment, request, roomId }, userId) => runtime.purge(cap, socket, attachment, request, roomId, userId),
+			run: ({ cap, runtime, socket, attachment, request, roomId }, userId) => runtime.underHistoryLease({ kind: "rewrite" }, (lease) => runtime.purge(cap, lease, socket, attachment, request, roomId, userId)),
 		}),
 		adminCommand({
 			name: "rename", usage: "/rename <old_user_id> <new_user_id>", help: "change a registered user's user_id", usageErrors: "reply",
@@ -7965,7 +7934,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 				return { from, to: issuableUserId(stripMention(words[2])) };
 			},
 			audit: ({ from, to }) => ({ target: `${from} -> ${to}` }),
-			run: ({ cap, runtime, socket, request, roomId }, { from, to }) => runtime.rename(cap, socket, request, roomId, from, to),
+			run: ({ cap, runtime, socket, request, roomId }, { from, to }) => runtime.underHistoryLease({ kind: "rewrite" }, (lease) => runtime.rename(cap, lease, socket, request, roomId, from, to)),
 		}),
 		adminCommand({
 			name: "role", usage: "/role <user_id> [<role>]", help: "show a user's roles, or give or take away one (admin, mod, threader and bot act as such; friend, like any role, raises their posting limits, and admin, mod and friend may use /emoji)", usageErrors: "reply",
@@ -8789,7 +8758,8 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * it until they load history again. They may register a new passkey. The
 	 * sender gets a `~private` notice before the result (§1).
 	 */
-	private async purge(cap: AdminCapability, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: UserIdArg): Promise<void> {
+	/** `lease`: an import must not run meanwhile (its later writes would put back what this removes). */
+	private async purge(cap: AdminCapability, _lease: RewriteLease, socket: WebSocketConnection, attachment: ConnectionAttachment, request: RequestFrame, roomId: string, userId: UserIdArg): Promise<void> {
 		assertAdmin(cap);
 		if (userId === attachment.userId) throw { name: "denied", message: "You can't purge yourself" } satisfies ProtocolError;
 		if (userId === ADMIN_USER_ID) throw { name: "denied", message: "The admin user can't be purged" } satisfies ProtocolError;
@@ -8893,11 +8863,27 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * that read them apply it meanwhile (HistoryPipeline.read).
 	 */
 	private historySoon(): void {
-		const now = nowMs();
-		this.historyPending = true;
-		this.historyRetryAt = 0;
-		this.maintenanceSoon(now);
+		this.historySchedule.request();
+		this.maintenanceSoon(nowMs());
 		this.ctx.waitUntil(this.rescheduleAlarm().catch(() => undefined));
+	}
+
+	/**
+	 * Runs `fn` under a history lease for `holder`, refusing (as `invalid_params`)
+	 * while what it excludes runs (src/history/schedule.ts); on release, a
+	 * cycle that waited for it is asked for.
+	 */
+	private async underHistoryLease<H extends HistoryHolder, R>(holder: H, fn: (lease: HistoryLease<H>) => Promise<R>): Promise<R> {
+		const lease = this.historySchedule.acquire(holder);
+		if (isRefusal(lease)) throw { name: "invalid_params", message: refusalMessage(lease) } satisfies ProtocolError;
+		try {
+			return await fn(lease);
+		} finally {
+			if (lease.release().cycleSoon) {
+				this.maintenanceSoon(nowMs());
+				this.ctx.waitUntil(this.rescheduleAlarm().catch(() => undefined));
+			}
+		}
 	}
 
 	/** Deletes one device token and its entry in its user's list (an expired one); never throws. */
@@ -9154,14 +9140,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			this.reply(socket, request, {});
 		};
 		if (args.action === "export" || args.action === "import") {
-			// historyArgs refused it already while one runs; nothing awaited since.
-			if (this.historyBusy) throw { name: "invalid_params", message: historyBusyMessage(this.historyBusy) } satisfies ProtocolError;
-			this.historyBusy = "job";
-			try {
-				await this.historyJob(cap, args, done);
-			} finally {
-				this.historyBusy = undefined;
-			}
+			await this.underHistoryLease({ kind: "job", job: args.action }, () => this.historyJob(cap, args, done));
 			return;
 		}
 		switch (args.action) {
@@ -9235,7 +9214,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 */
 	private async runScheduledBackup(now: number): Promise<void> {
 		const everySeconds = this.config.backups.everySeconds;
-		if (this.historyBusy || everySeconds === undefined) return;
+		if (everySeconds === undefined || this.historySchedule.holder !== undefined) return;
 		try {
 			const last = this.store.historyMetaNumber(META_SCHEDULED_BACKUP, now);
 			if (now < last + everySeconds * 1_000) return;
@@ -9251,13 +9230,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 			}
 			// Noted first: a failing backup waits its interval rather than retrying on every alarm.
 			this.store.setHistoryMeta(META_SCHEDULED_BACKUP, String(now), now);
-			this.historyBusy = "job";
-			let result: Awaited<ReturnType<typeof writeBackup>>;
-			try {
-				result = await this.writeBackup(store, "scheduled");
-			} finally {
-				this.historyBusy = undefined;
-			}
+			const result = await this.underHistoryLease({ kind: "job", job: "backup" }, () => this.writeBackup(store, "scheduled"));
 			console.log(JSON.stringify({ event: "history_export", key: result.key, records: result.records, deleted: result.deleted.length }));
 		} catch (error) {
 			console.warn(JSON.stringify({ event: "history_export_failed", message: error instanceof Error ? error.message : String(error) }));
@@ -9424,7 +9397,7 @@ export class ApronDemoServer extends DurableObject<Env> {
 	 * again. Sessions and the user's bot keep the old `user_id`: a session for
 	 * it is `denied`, and the passkey signs in as the new one.
 	 */
-	private async rename(cap: AdminCapability, socket: WebSocketConnection, request: RequestFrame, roomId: string, from: UserIdArg, to: IssuableUserId): Promise<void> {
+	private async rename(cap: AdminCapability, _lease: RewriteLease, socket: WebSocketConnection, request: RequestFrame, roomId: string, from: UserIdArg, to: IssuableUserId): Promise<void> {
 		assertAdmin(cap);
 		const renamed = this.store.renameIdentity({ from, to, now: nowMs() });
 		// Before any await: from the commit on, nothing on this object acts as the retired user_id.
