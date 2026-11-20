@@ -1,5 +1,5 @@
 /*
- * History tiers (PLAN §5): each store holding a contiguous range of the log.
+ * History tiers: each store holding a contiguous range of the log.
  * Tier 0 is the head (the Durable Object's SQLite), where records are made;
  * the tiers below hold what left it, ordered newest to oldest. Tiers know
  * nothing of each other: HistoryPipeline orders them and keeps every
@@ -20,7 +20,7 @@ export interface FloorContext {
 export interface HistoryTier {
 	/** Stable: names its state. */
 	readonly name: string;
-	/** Serves joined-rooms pages, which read several rooms at once (PLAN §7). Default true. */
+	/** Serves joined-rooms pages, which read several rooms at once. Default true. */
 	readonly multiRoom?: boolean;
 	/** INSERT OR REPLACE semantics. */
 	append(range: RecordRange): Promise<void>;
@@ -28,7 +28,7 @@ export interface HistoryTier {
 	scan(from: number, limit: number): Promise<RecordRange>;
 	/** Absent: write-only (a backup tier). Records of the window's first `limit` distinct log IDs. */
 	read?(query: HistoryQuery): Promise<ChatRecord[]>;
-	/** Records with these log IDs, any room (import's duplicate check, PLAN §10.3). */
+	/** Records with these log IDs, any room (import's duplicate check). */
 	lookup?(logIds: readonly number[]): Promise<ChatRecord[]>;
 	stats(context?: { lower?: number; upper?: number }): Promise<TierStats>;
 	/** The floor its retention allows: records below it may leave. Undefined: nothing need leave. */
@@ -43,7 +43,7 @@ export interface PurgeResult {
 	messageIds: string[];
 }
 
-/** A tier /purge and /rename reach (decision 3). */
+/** A tier /purge and /rename reach. */
 export interface RewritableTier extends HistoryTier {
 	/** Removes the users' message snapshots, every reaction set on those messages (and on `messageIds`), and their reaction sets and memberships elsewhere. */
 	purge(userIds: readonly string[], messageIds?: readonly string[]): Promise<PurgeResult>;
@@ -66,7 +66,7 @@ export interface HistoryHead extends RewritableTier {
 	publishedFloor(): Promise<number>;
 	/** Raises the published floor (never past the head's own floor). */
 	publish(floor: number): Promise<void>;
-	/** The op log: `/purge` and `/rename` done here, for the rewritable tiers below (PLAN §8). */
+	/** The op log: `/purge` and `/rename` done here, for the rewritable tiers below. */
 	ops(): Promise<QueuedOp[]>;
 	/** Forgets ops through `seq`, once every rewritable tier applied them. */
 	dropOps(seq: number): Promise<void>;
@@ -93,7 +93,7 @@ export interface HistoryHead extends RewritableTier {
 	 * within a snapshot's), or null when a client could not have sent it.
 	 */
 	normalizeRecord?(record: ChatRecord): ChatRecord | null;
-	/** Import only: adds placeholder users, marked unclaimed (PLAN §10.4). */
+	/** Import only: adds placeholder users, marked unclaimed. */
 	restoreUsers(users: readonly ArchivedUser[]): Promise<void>;
 	/** Import only: whether a user ID is retired (purged or renamed away) and may not be reused. */
 	isRetired?(userId: string): Promise<boolean>;

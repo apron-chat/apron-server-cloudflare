@@ -1,5 +1,5 @@
 /*
- * This server's user ID rules for archives it imports (PLAN §10.4): which
+ * This server's user ID rules for archives it imports: which
  * archive user IDs may hold an account here as themselves, and where one
  * that may not starts from. @apron/archive's planImport takes them as its
  * UserIdRules; Store.restoreUsers checks placeholders with them again.

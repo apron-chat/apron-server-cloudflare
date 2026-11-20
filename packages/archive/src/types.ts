@@ -1,5 +1,5 @@
 /*
- * ARCHIVE.md v1 types (apron-web's ARCHIVE.md; PLAN §1, §5): JSON Lines, a
+ * ARCHIVE.md v1 types (apron-web's ARCHIVE.md): JSON Lines, a
  * header on line 1, then parts holding listings (`joined`, `not_joined`,
  * `users`, as `room_list` gives them) and records (`rooms`, `messages`,
  * `reactions`, `memberships`, as `history` gives them). Readers ignore keys

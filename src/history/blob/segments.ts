@@ -1,5 +1,5 @@
 /*
- * Segments of the blob tier (PLAN §5, §9): each one room's records over a
+ * Segments of the blob tier: each one room's records over a
  * stretch of the log, stored as one complete ARCHIVE.md v1 file under a key
  * made of the room and the stretch, and listed in an index so reads need no
  * listing of the store.
@@ -221,7 +221,7 @@ function refOf(row: SegmentRow): SegmentRef {
 }
 
 /**
- * A SegmentIndex in SQLite (PLAN §9: the head's database). Call
+ * A SegmentIndex in SQLite (the head's database). Call
  * `ensureSchema` once before use. `table` lets several blob tiers share one
  * database, one table each.
  */

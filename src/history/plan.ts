@@ -1,5 +1,5 @@
 /*
- * The pipeline's pure core (PLAN §6, §7, §12.1): what to do next, what to
+ * The pipeline's pure core: what to do next, what to
  * ask each tier for a page, how pages merge, and what must always hold.
  * Synchronous, no I/O; HistoryPipeline (pipeline.ts) executes the plans.
  */
@@ -46,7 +46,7 @@ export type Step =
 	| { kind: "publish"; floor: number }
 	| { kind: "idle" };
 
-/** The rewritable tiers /purge and /rename reach: the head and each following one, up to the first that is not (decision 3). */
+/** The rewritable tiers /purge and /rename reach: the head and each following one, up to the first that is not. */
 export function rewritableReach(tiers: readonly Pick<TierView, "rewritable">[]): number {
 	let reach = 0;
 	while (reach < tiers.length && tiers[reach].rewritable) reach += 1;
@@ -69,7 +69,7 @@ export function allowedFloor(tiers: readonly TierView[], index: number): number 
 }
 
 /**
- * The next step of a cycle (PLAN §6): first the op log for the rewritable
+ * The next step of a cycle: first the op log for the rewritable
  * tiers below the head; then bottom-up, so space is made before it is
  * filled, each tier's target, copy of what is below it to the next tier,
  * advance and trim; then the published floor.
@@ -104,7 +104,7 @@ export function planStep(snapshot: PipelineSnapshot): Step {
 }
 
 /**
- * What must always hold (PLAN §6), as readable violations; empty when all
+ * What must always hold, as readable violations; empty when all
  * do. I3 and I4 need the tiers' contents: the model tests check them.
  */
 export function checkInvariants(tiers: readonly Pick<TierView, "name" | "readable" | "state">[], published: number, previous?: { tiers: readonly Pick<TierView, "name" | "state">[]; published: number }): string[] {
@@ -140,7 +140,7 @@ export interface ReadPart {
 }
 
 /**
- * Which tier serves which part of a page's window (PLAN §7): each readable
+ * Which tier serves which part of a page's window: each readable
  * tier the log IDs from its floor up to the floor of the readable tier
  * above it (records it holds past that are copies, served above), none
  * below the published floor. A joined-rooms page stops at the first tier

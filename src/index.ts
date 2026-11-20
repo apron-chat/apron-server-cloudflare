@@ -154,7 +154,7 @@ const TERMINAL_OUTPUT_CACHE_BYTES = 8 * 1024 * 1024;
 const HISTORY_RETRY_MS = 5 * 60_000;
 /** Steps one history cycle takes at most (HistoryPipeline.cycle): each a copy, a trim or less. */
 const HISTORY_CYCLE_STEPS = 24;
-/** How long a copy to a tier below fails (or waits for an unbound D1 tier) before the admins are told (PLAN §6). */
+/** How long a copy to a tier below fails (or waits for an unbound D1 tier) before the admins are told. */
 const HISTORY_STALL_ALERT_MS = 6 * 3_600_000;
 /** When the scheduled backup last ran (Store.historyMetaNumber). */
 const META_SCHEDULED_BACKUP = "history:export:scheduled";

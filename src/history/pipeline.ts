@@ -1,5 +1,5 @@
 /*
- * HistoryPipeline (PLAN §4, §6–§8): the head and the tiers below it, in
+ * HistoryPipeline: the head and the tiers below it, in
  * order, and every rule between them. It runs bounded maintenance cycles
  * (copy down, mark, advance, trim, publish), serves history pages across
  * tiers, and carries /purge and /rename down to each rewritable tier.
@@ -75,7 +75,7 @@ export class HistoryPipeline {
 	}
 	/** What each lower tier's last target was found from (what the tier above held then), and when. */
 	private readonly targetBasis = new Map<number, { basis: string; at: number }>();
-	/** Ops applied lately, for pages that read a tier before they were (PLAN §8). */
+	/** Ops applied lately, for pages that read a tier before they were. */
 	private recent: Array<{ op: HistoryOp; at: number }> = [];
 
 	constructor(options: PipelineOptions) {
@@ -108,7 +108,7 @@ export class HistoryPipeline {
 	}
 
 	/**
-	 * One bounded maintenance pass (PLAN §6): at most `steps` steps, each
+	 * One bounded maintenance pass: at most `steps` steps, each
 	 * planned from a fresh snapshot. Stops at the first failure: nothing is
 	 * trimmed that is not copied, so a failing tier only stalls the ones
 	 * above it. `more` asks to be called again soon.
@@ -261,7 +261,7 @@ export class HistoryPipeline {
 
 	/**
 	 * /purge through the pipeline: the head first, then each rewritable tier
-	 * below it in order, stopping at the first that is not (decision 3). A
+	 * below it in order, stopping at the first that is not. A
 	 * tier that fails now is caught up by the next cycle; pages read from it
 	 * meanwhile have the op applied in memory.
 	 */
@@ -300,7 +300,7 @@ export class HistoryPipeline {
 	}
 
 	/**
-	 * A history page across tiers (PLAN §7): each tier's part of the window,
+	 * A history page across tiers: each tier's part of the window,
 	 * filled from the page's start until it has `limit` log IDs, merged with
 	 * upper tiers winning. Records read below the head have the ops they have
 	 * yet to apply (and those applied lately) applied. `skipHead` reads only

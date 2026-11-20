@@ -1,5 +1,5 @@
 /*
- * exportArchive (PLAN §10.1): the whole server's history, or some rooms',
+ * exportArchive: the whole server's history, or some rooms',
  * as one ARCHIVE.md v1 file, read across every tier of the pipeline (upper
  * tiers winning, as pages do). The file's shape is @apron/archive's
  * exportArchive; this module is its source over the pipeline
@@ -47,7 +47,7 @@ function pipelineSource(pipeline: HistoryPipeline): ArchiveSource {
 	};
 }
 
-/** Writes the pipeline's history as one ARCHIVE.md v1 file (PLAN §10.1). The writer is closed at the end. */
+/** Writes the pipeline's history as one ARCHIVE.md v1 file. The writer is closed at the end. */
 export async function exportArchive(pipeline: HistoryPipeline, out: ArchiveWriter, options: ExportOptions): Promise<ExportReport> {
 	const { clock, ...rest } = options;
 	return writeArchive(pipelineSource(pipeline), out, { ...rest, exportedAt: new Date(clock.now()).toISOString() });

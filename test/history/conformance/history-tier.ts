@@ -1,5 +1,5 @@
 /*
- * The HistoryTier conformance suite (PLAN §12.2): what every tier must do,
+ * The HistoryTier conformance suite: what every tier must do,
  * whatever it keeps records in. Run on MemoryHistoryTier and on
  * BlobHistoryTier over MemoryBlobStore and R2 (test/history/blob-tier.test.ts).
  *

@@ -1,5 +1,5 @@
 /*
- * A BlobStore over an R2 bucket (PLAN §9): the store the Worker uses, which
+ * A BlobStore over an R2 bucket: the store the Worker uses, which
  * under `wrangler dev` and the vitest pool is miniflare's local R2.
  *
  * A writer buffers what it is given and, once the body outgrows one part,

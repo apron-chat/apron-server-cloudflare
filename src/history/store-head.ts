@@ -1,5 +1,5 @@
 /*
- * The head over the Durable Object's Store (PLAN §5, store-head.ts): an
+ * The head over the Durable Object's Store: an
  * adapter, not a reimplementation. The Store keeps its records, current
  * state and cleanup; this hands the pipeline what it needs of them, and
  * keeps the pipeline's tier state in the Store's `_meta`.

@@ -8,7 +8,7 @@ export { DEFAULT_LIMITS } from "./budget.ts";
 export interface RuntimeConfig {
 	limits: Limits;
 	/**
-	 * Backups of history (PLAN §13.2), to HISTORY_BLOB under `backups/`:
+	 * Backups of history, to HISTORY_BLOB under `backups/`:
 	 * `BACKUP_EVERY` (a duration; unset or empty, on demand only),
 	 * `BACKUP_KEEP` (files kept of each kind, default 14),
 	 * and `BACKUP_PRIVATE_ROOMS` (default true). Backups are gzip-compressed,

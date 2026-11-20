@@ -1,5 +1,5 @@
 /*
- * A BlobStore held in memory (PLAN §9): for tests. It behaves as R2 does
+ * A BlobStore held in memory: for tests. It behaves as R2 does
  * where the conformance suite can tell (sorted listings, paging, writers that
  * commit on close), and records each call in `calls` so a test can see what
  * a tier asked of its store. Tests register it as the `memory` provider

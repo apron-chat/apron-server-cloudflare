@@ -1,15 +1,15 @@
 /*
- * importArchive (PLAN §10.2–§10.6): reads an ARCHIVE.md v1 file (as
+ * importArchive: reads an ARCHIVE.md v1 file (as
  * @apron/archive openArchive decodes it) into the pipeline.
  *
  * It plans first, writing nothing, with @apron/archive's planImport over
  * the pipeline (importTarget) and this server's user ID rules
  * (src/user-ids.ts): which rooms are new (rooms that exist here are skipped
- * whole, decision 6), what each archive user becomes (an existing account
- * or an unclaimed placeholder, §10.4), which records are duplicates of
+ * whole), what each archive user becomes (an existing account
+ * or an unclaimed placeholder), which records are duplicates of
  * records held here (skipped), which collide with a different record's log
- * ID (moved to the next free millisecond, §10.3). This module adds where
- * each record goes (§10.5): records older than the published floor are
+ * ID (moved to the next free millisecond). This module adds where
+ * each record goes: records older than the published floor are
  * dropped as expired; the rest go to the tier that serves their log ID, and
  * to each tier below it that already holds copies that far. A dry run stops
  * there and returns the plan's report. Then the plan's state is journaled
@@ -30,7 +30,7 @@ export type { ImportReport };
 
 export interface ImportOptions {
 	/**
-	 * How the archive's user IDs map to accounts here (§10.4, @apron/archive PlanOptions.users):
+	 * How the archive's user IDs map to accounts here (@apron/archive PlanOptions.users):
 	 * "auto" (default), "match" (authenticated archives only) or "new". An ID
 	 * that cannot stand here (a guest's, a bot's, `~…`, and `admin` unless
 	 * matched) becomes `imported-…` (USER_ID_RULES).
@@ -131,7 +131,7 @@ function importTarget(pipeline: HistoryPipeline): ImportTarget {
 }
 
 /**
- * Placement (§10.5): the tiers a record of log ID `id` goes to, or none if
+ * Placement: the tiers a record of log ID `id` goes to, or none if
  * it is below the published floor: the head when it is past the head's
  * copy marker (else the next tier would never get it), otherwise the first
  * tier below, top-down, whose floor is at or below it; then each tier below
@@ -179,7 +179,7 @@ export async function importArchive(pipeline: HistoryPipeline, input: ArchiveRea
 	});
 	const report: ImportReport = { ...plan.report, dryRun: Boolean(options.dryRun), ...(abandoned ? { abandoned } : {}) };
 
-	// Placement (§10.5).
+	// Placement.
 	const views = await pipeline.views();
 	const published = await pipeline.publishedFloor();
 	const perTier: ChatRecord[][] = views.map(() => []);

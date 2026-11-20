@@ -1,5 +1,5 @@
 /*
- * ARCHIVE.md v1 as JSON Lines (PLAN §5, §10; apron-web's ARCHIVE.md §1–§3).
+ * ARCHIVE.md v1 as JSON Lines (apron-web's ARCHIVE.md §1–§3).
  *
  * The writer turns a header, listings and ChatRecords into lines: the header
  * first, then parts. Records go out in their wire shape (`record_json`

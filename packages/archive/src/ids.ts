@@ -1,5 +1,5 @@
 /*
- * ID remapping on import (PLAN §10.3, §10.4, §10.6).
+ * ID remapping on import.
  *
  * An import keeps each record's log ID unless it collides with one this
  * server holds; a colliding record moves to the next free millisecond, and
@@ -23,7 +23,7 @@ const PRIVATE_ROOM_PREFIX = "private_";
 /** A decimal log ID as the wire writes it: digits, no sign, no leading zeros. */
 const DECIMAL_ID = /^(0|[1-9][0-9]*)$/;
 
-/** The old-to-new mapping of log IDs and user IDs that an import applies (PLAN §10.6). IDs absent from a map stay as they are. */
+/** The old-to-new mapping of log IDs and user IDs that an import applies. IDs absent from a map stay as they are. */
 export class IdMap {
 	readonly logIds: Map<number, number>;
 	readonly users: Map<string, string>;
@@ -77,7 +77,7 @@ interface Field {
 }
 
 /**
- * Every place an ID occurs in a record's wire shape (PLAN §10.6), whatever
+ * Every place an ID occurs in a record's wire shape, whatever
  * its kind: a field a kind does not have is skipped. Room records log no
  * delivery fields, but a record holding them maps them too.
  */
@@ -196,7 +196,7 @@ export function nextFree(taken: (id: number) => boolean, from: number): number {
 }
 
 /**
- * Where colliding imported log IDs move (PLAN §10.3): each imported ID that
+ * Where colliding imported log IDs move: each imported ID that
  * is taken moves to the next free millisecond after it, and a later imported
  * ID that the move reaches or passes moves on past it too, so the imported
  * records keep their order. `imported` is sorted ascending, without
@@ -215,7 +215,7 @@ export function nudgeLogIds(imported: readonly number[], taken: (id: number) => 
 	return moved;
 }
 
-/** A user ID for `base` that is not taken: `base` itself, else `base-2`, `base-3`, ... (PLAN §10.4). */
+/** A user ID for `base` that is not taken: `base` itself, else `base-2`, `base-3`, and so on. */
 export function freeUserId(base: string, taken: (id: string) => boolean): string {
 	if (!taken(base)) return base;
 	for (let n = 2; ; n++) {

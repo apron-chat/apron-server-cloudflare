@@ -1,5 +1,5 @@
 /*
- * The blob history tier (PLAN §5, §9): the log kept as per-room segments in
+ * The blob history tier: the log kept as per-room segments in
  * a BlobStore (R2 in the Worker), each a complete ARCHIVE.md v1 file that
  * apron-web or scene.apron.chat can open as it is, found through a
  * SegmentIndex.
@@ -36,8 +36,7 @@
  *   either both (reads de-duplicate them, and the next append or trim over
  *   that stretch merges them) or the new one.
  *
- * Deliberately not a RewritableTier: /purge and /rename stop above it
- * (decision 3).
+ * Deliberately not a RewritableTier: /purge and /rename stop above it.
  *
  * Records read back have `commit_ms` equal to their `log_id`: the wire
  * shape carries no commit time.

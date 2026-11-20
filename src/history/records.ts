@@ -1,5 +1,5 @@
 /*
- * Records: the unit every history tier stores and hands on (PLAN §3, §5).
+ * Records: the unit every history tier stores and hands on.
  *
  * A record is one entry of the server-wide log (a room record, message
  * snapshot, reaction record or membership record) in its wire shape, as
@@ -61,7 +61,7 @@ export interface Clock {
 	now(): number;
 }
 
-/** What `/purge` or `/rename` did to the head, for the tiers below to do too (PLAN §8). */
+/** What `/purge` or `/rename` did to the head, for the tiers below to do too. */
 export type HistoryOp =
 	| { op: "purge"; userIds: string[]; messageIds: string[] }
 	| { op: "rename"; from: string; to: string };
@@ -109,7 +109,7 @@ export function toRange(records: readonly ChatRecord[]): RecordRange {
  * applies them to what it holds: a purged user's message snapshots go, with
  * every reaction set on those messages (the op's own, and those found among
  * `records`), and their reaction sets and memberships; a record left empty
- * goes. Used on pages read from a tier that has yet to apply them (PLAN §8).
+ * goes. Used on pages read from a tier that has yet to apply them.
  */
 export function applyOps(records: readonly ChatRecord[], ops: readonly HistoryOp[]): ChatRecord[] {
 	let out = [...records];

@@ -1,5 +1,5 @@
 /*
- * Blob storage (PLAN §5, §9): the small interface the blob tier and the
+ * Blob storage: the small interface the blob tier and the
  * backups write through, so the same code runs over R2 in the Worker
  * (blob/r2.ts), over memory in tests (test/history/support/), and over a
  * directory in Node scripts (scripts/fs-blob-store.mjs). Each caller

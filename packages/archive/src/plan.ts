@@ -1,6 +1,6 @@
 /*
  * planImport: what importing an archive into a history would do, before
- * anything is written (PLAN §10.2–§10.4, §10.6). The library decides what
+ * anything is written. The library decides what
  * the archive means: which records are content and which references, a
  * move's copy in the room it left, which records duplicate ones held (same
  * content at the same log ID), which collide (moved to the next free
@@ -245,7 +245,7 @@ export async function planImport(archive: CollectedArchive, target: ImportTarget
 		rooms.set(roomId, { ...room, listing });
 	}
 
-	// Users (§10.4).
+	// Users.
 	const profiles = new Map<string, ArchivedUser>();
 	for (const user of archive.users) profiles.set(user.user_id, { ...profiles.get(user.user_id), ...user });
 	const ids = new Set<string>([...archive.users.map((user) => user.user_id), ...records.flatMap(namedUsers)]);
@@ -294,7 +294,7 @@ export async function planImport(archive: CollectedArchive, target: ImportTarget
 		report.refused = `this archive would make ${placeholders.length} placeholder accounts, more than the ${options.maxPlaceholders} one import may make`;
 	}
 
-	// Log IDs (§10.3).
+	// Log IDs.
 	const imported = logIds(records).sort((a, b) => a - b);
 	const moved = new Map<number, number>();
 	let renumberBase: number | undefined;

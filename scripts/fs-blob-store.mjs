@@ -1,5 +1,5 @@
 /*
- * A BlobStore over a local directory (PLAN §9), for Node scripts that export
+ * A BlobStore over a local directory, for Node scripts that export
  * to or import from local files. Node only: the Worker never imports it (it
  * has no filesystem), so it lives under scripts/ rather than src/.
  *

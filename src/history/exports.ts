@@ -1,5 +1,5 @@
 /*
- * Backups (PLAN §13.2): full ARCHIVE.md exports written to the history blob
+ * Backups: full ARCHIVE.md exports written to the history blob
  * store (HISTORY_BLOB) under `backups/`, keeping the newest BACKUP_KEEP of
  * each kind: `scheduled` (every BACKUP_EVERY) and `manual` (an admin's
  * `/history export`), on the same settings (src/config.ts).

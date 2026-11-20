@@ -1,5 +1,5 @@
 /*
- * The reference model (PLAN §12.3): one in-memory map of every record
+ * The reference model: one in-memory map of every record
  * committed, with /purge and /rename applied to all of it, against which a
  * real pipeline's reads are compared. The model runs that drive it are
  * fast-check command sequences (pipeline.test.ts).

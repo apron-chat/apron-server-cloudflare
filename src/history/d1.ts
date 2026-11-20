@@ -1,7 +1,7 @@
 /*
  * The D1 history tier (binding HISTORY_D1): records that left the head,
  * kept in the same shape (one row per room and log ID) until its own
- * retention lets them go. Rewritable: /purge and /rename reach it (PLAN §8),
+ * retention lets them go. Rewritable: /purge and /rename reach it,
  * and it serves joined-rooms pages.
  *
  * Every write may be repeated without harm, so a failure is retried by a

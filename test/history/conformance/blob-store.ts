@@ -1,5 +1,5 @@
 /*
- * The BlobStore conformance suite (PLAN §12.2): what every store must do,
+ * The BlobStore conformance suite: what every store must do,
  * run on MemoryBlobStore and R2BlobStore (miniflare R2) in vitest
  * (test/history/blob-store.test.ts) and on FsBlobStore under `node --test`
  * (scripts/fs-blob-store.test.mjs).

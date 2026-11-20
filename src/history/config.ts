@@ -1,5 +1,5 @@
 /*
- * Builds the history pipeline (PLAN §13) from the Worker's bindings and the
+ * Builds the history pipeline from the Worker's bindings and the
  * LIMIT_* history limits, in a fixed order: the head over the Store's
  * SQLite, then D1 where HISTORY_D1 is bound (and LIMIT_HISTORY_D1_RECORDS is
  * above 0), then the blob tier where HISTORY_BLOB is. There is no tier list

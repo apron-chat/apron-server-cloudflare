@@ -57,7 +57,7 @@ const fieldCases: Array<{ field: string; path: Array<string | number>; from: unk
 	{ field: "ext.editors.edited_by", path: ["ext", "editors", "edited_by"], from: "ada", to: "ada-2" },
 ];
 
-describe("remapRecord (PLAN §10.6)", () => {
+describe("remapRecord", () => {
 	it("has a case for every field it maps", () => {
 		expect(fieldCases.map((c) => c.field).sort()).toEqual(RECORD_FIELDS.map((f) => f.path.join(".")).sort());
 	});
@@ -129,7 +129,7 @@ describe("remapListing and remapUser", () => {
 	});
 });
 
-describe("nudging log IDs (PLAN §10.3)", () => {
+describe("nudging log IDs", () => {
 	it("finds the next free ID at or after a start", () => {
 		const taken = new Set([5, 6, 8]);
 		expect(nextFree((id) => taken.has(id), 5)).toBe(7);
@@ -176,7 +176,7 @@ describe("nudging log IDs (PLAN §10.3)", () => {
 	});
 });
 
-describe("freeUserId (PLAN §10.4)", () => {
+describe("freeUserId", () => {
 	it("numbers a taken ID from 2", () => {
 		expect(freeUserId("ada", () => false)).toBe("ada");
 		expect(freeUserId("ada", (id) => id === "ada")).toBe("ada-2");

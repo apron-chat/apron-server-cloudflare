@@ -1126,7 +1126,7 @@ const RESTORE_FUTURE_MS = 5 * 60_000;
 /** The users one restoreUsers call takes at most. */
 export const RESTORE_USERS_BATCH = 200;
 /**
- * The role of an imported placeholder account (PLAN §10.4): it reserves the
+ * The role of an imported placeholder account: it reserves the
  * archive's user ID, holds no credential, and, holding a role, is never
  * removed by the idle prune (pruneIdleIdentities).
  */
@@ -4136,7 +4136,7 @@ export class Store {
   }
 
   /**
-   * Whether `userId` is retired and may not be issued again (PLAN §10.4):
+   * Whether `userId` is retired and may not be issued again:
    * `/rename` moved its account away (`renamed:`, for good), or `/purge` or
    * the idle prune removed it and it is not yet freed (`purged:`,
    * dueRetiredUserIds). An ID an identity holds now is not retired.
@@ -4151,7 +4151,7 @@ export class Store {
   }
 
   /**
-   * Import (PLAN §10.4): makes each archived user that has no identity here
+   * Import: makes each archived user that has no identity here
    * and whose ID is not retired a placeholder account, as
    * createInvitedIdentity makes an account without a credential: the
    * archive's name (else the user ID), its avatar if a plain `https:` URL,
@@ -4245,7 +4245,7 @@ export class Store {
   }
 
   /**
-   * Import (PLAN §10.2, §10.5): adds a room that is new here, with the
+   * Import: adds a room that is new here, with the
    * records of it that belong in this SQLite (the hot log), and rebuilds the
    * current state they give, as if they had been committed here.
    *
@@ -4270,7 +4270,7 @@ export class Store {
    *
    * Every record must be at or above the hot floor and, with tiers below,
    * past the copy marker (`through`), or the call is refused: older records
-   * go to the tiers below (§10.5). The new records are stored, and the
+   * go to the tiers below. The new records are stored, and the
    * state of every message, reaction set and membership they name is
    * replayed from them and the room's later records (@apron/archive's
    * replayRecords, the one definition of what a record does to current
@@ -4527,7 +4527,7 @@ export class Store {
   }
 
   /**
-   * A blob tier's segment index (PLAN §9), in this SQLite: one table a tier,
+   * A blob tier's segment index, in this SQLite: one table a tier,
    * `history_segments_<tier>` (characters other than [a-z0-9_] made `_`),
    * created on first use, and one instance a tier name. Each statement is
    * charged to maintenance: a read at most SEGMENT_INDEX_READS rows (every

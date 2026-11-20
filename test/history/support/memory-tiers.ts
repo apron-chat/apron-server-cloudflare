@@ -1,6 +1,6 @@
 /*
  * History tiers in memory: a rewritable tier and a head, for tests and the
- * reference model's runs (PLAN §12.3); never in the Worker. They keep records
+ * reference model's runs; never in the Worker. They keep records
  * as the SQLite and D1 tiers do, one per room and log ID, and rewrite them
  * with the same functions (records.ts).
  */
