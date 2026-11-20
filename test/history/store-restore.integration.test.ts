@@ -398,13 +398,13 @@ it("takes a message here for the same one only in a room the import adds, never 
 	});
 });
 
-it("takes a record only as a client could have sent it: bare users, a normalized body, a snapshot's size", async () => {
+it("takes a record only as a post would have made it: the Store's content policy, record by record", async () => {
 	await withStore("restore-normalize", CONFIG, (store, clock) => {
 		const overruns = watched(store);
 		const base = clock.value - 60_000;
 		const normalized = (value: Record<string, unknown>) => {
-			const record = store.restorableRecord(messageRecord("lobby", base, value));
-			return record && JSON.parse(record.record_json);
+			const record = store.content.record(messageRecord("lobby", base, value));
+			return record.ok ? JSON.parse(record.value.record_json) : null;
 		};
 		expect(normalized({ from: { user_id: "ada", name: "Ada", roles: ["admin"], tier: "registered" } }).from).toEqual({ user_id: "ada", name: "Ada" });
 		expect(normalized({ body: { text: "hi", embeds: [{ kind: "link", og: { title: "T", image: { url: "https://evil.example/x.png" } } }] } }).body)
@@ -416,8 +416,8 @@ it("takes a record only as a client could have sent it: bare users, a normalized
 			{ body: { text: "hi", mentions: ["not an id with spaces"] } },
 			{ ext: { padding: "x".repeat(200_000) } },
 		]) expect(normalized(bad), JSON.stringify(bad).slice(0, 80)).toBeNull();
-		const reactions = store.restorableRecord({ room_id: "lobby", log_id: base, commit_ms: base, kind: "reactions", record_json: JSON.stringify({ message_id: "m", reactions: [{ from: { user_id: "bob", roles: ["mod"] }, emojis: ["👍"] }] }) });
-		expect(JSON.parse(reactions!.record_json).reactions).toEqual([{ from: { user_id: "bob" }, emojis: ["👍"] }]);
+		const reactions = store.content.record({ room_id: "lobby", log_id: base, commit_ms: base, kind: "reactions", record_json: JSON.stringify({ message_id: "m", reactions: [{ from: { user_id: "bob", roles: ["mod"] }, emojis: ["👍"] }] }) });
+		expect(reactions.ok && JSON.parse(reactions.value.record_json).reactions).toEqual([{ from: { user_id: "bob" }, emojis: ["👍"] }]);
 		// restoreRoom applies it too: what no client could have sent is dropped and counted.
 		const result = store.restoreRoom({ listing: { room_id: "lobby", log_id: String(base) }, joined: false }, [
 			messageRecord("lobby", base + 1, { from: { user_id: "ada", roles: ["admin"] } }),
@@ -425,6 +425,37 @@ it("takes a record only as a client could have sent it: bare users, a normalized
 		], clock.value);
 		expect(result).toEqual({ created: true, stored: 1, rejected: 1 });
 		expect(store.historyLookup([base + 1, base + 2]).map((record) => JSON.parse(record.record_json).from)).toEqual([{ user_id: "ada" }]);
+		expect(overruns).toEqual([]);
+	});
+});
+
+it("keeps imported reaction sets and room records only as a post would: one content policy for both", async () => {
+	await withStore("restore-content-drift", { ...CONFIG, reactionEmojisPerUser: 3, roomMetadataLimit: 256 }, (store, clock) => {
+		const overruns = watched(store);
+		const base = clock.value - 60_000;
+		const reactions = (logId: number, from: string, emojis: unknown[]): ChatRecord => ({
+			room_id: "lobby", log_id: logId, commit_ms: logId, kind: "reactions",
+			record_json: JSON.stringify({ message_id: String(base + 1), room_id: "lobby", log_id: String(logId), reactions: [{ from: { user_id: from }, emojis }] }),
+		});
+		const roomRecord = (logId: number, title: string): ChatRecord => ({
+			room_id: "lobby", log_id: logId, commit_ms: logId, kind: "room", record_json: JSON.stringify({ room_id: "lobby", log_id: String(logId), title }),
+		});
+		const result = store.restoreRoom({ listing: { room_id: "lobby", log_id: String(base) }, joined: false }, [
+			messageRecord("lobby", base + 1, { from: { user_id: "ada" } }),
+			// Unqualified and repeated: kept qualified and once, as a post keeps them.
+			reactions(base + 2, "bob", ["❤", "❤️", "👍", "👍"]),
+			// What a post refuses: past the cap, too long, a control character.
+			reactions(base + 3, "carol", ["👍", "❤", "🎉", "🚀"]),
+			reactions(base + 4, "dan", ["x".repeat(65)]),
+			reactions(base + 5, "eve", ["👍\u0007"]),
+			// A room record whose fields a room_set would refuse.
+			roomRecord(base + 6, "x".repeat(300)),
+			roomRecord(base + 7, "Lobby"),
+		], clock.value);
+		expect(result).toEqual({ created: true, stored: 3, rejected: 4 });
+		const sets = store.historyLookup([base + 2]).map((record) => JSON.parse(record.record_json).reactions);
+		expect(sets).toEqual([[{ from: { user_id: "bob" }, emojis: ["❤️", "👍"] }]]);
+		expect(store.historyLookup([base + 3, base + 4, base + 5, base + 6])).toEqual([]);
 		expect(overruns).toEqual([]);
 	});
 });

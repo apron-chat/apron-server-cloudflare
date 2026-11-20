@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { asPublic, withoutOutputs } from '../src/history/records';
-import { refsOf, withoutOutputRefs } from '../src/output-ref';
+import { asPublic, withoutOutputs } from '../../src/history/records';
+import { refsOf, withoutOutputRefs } from '../../src/content/output-ref';
 
 const record = (embeds: unknown[]) => ({ room_id: 'general', log_id: 5, commit_ms: 5, kind: 'message' as const, record_json: JSON.stringify({ message_id: '5', log_id: '5', room_id: 'general', from: { user_id: 'ada' }, body: { text: '', embeds } }) });
 const ref = { kind: 'terminal', title: 'build', output_ref: { key: 'f/AAAAAAAAAAAAAAAAAAAAAA', bytes: 8 } };

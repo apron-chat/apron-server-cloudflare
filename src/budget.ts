@@ -626,7 +626,7 @@ export const MAX_PRIVATE_MEMBERSHIPS_PER_USER = 50;
 // per-message cap bounds that record, its SQL work, and its history response.
 export const MAX_REACTION_USERS_PER_MESSAGE = 64;
 export const MAX_REACTION_EMOJIS_PER_USER = 16;
-export const MAX_EMOJI_BYTES = 64;
+export { MAX_EMOJI_BYTES } from "./content/emoji.ts";
 export const MAX_CONNECTION_FRAME_RATE = 120;
 // The server-wide frame window is one in-memory timestamp per frame.
 export const MAX_GLOBAL_FRAMES_PER_MINUTE = 5_000;
