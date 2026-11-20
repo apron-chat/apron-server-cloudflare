@@ -308,10 +308,12 @@ delay physical deletion. Uploaded files are kept 120 days, so a message older
 than that shows without them. The `general` room ID, the top-level rooms admins
 and mods create, and the log head never rotate. Recent edits can keep old
 messages visible. Rooms keep their current record after its log entry
-expires; a thread or private room whose whole log has expired is removed (its
-members get `room_update` `left`), which frees its slot under the
-[caps](limits.md#hard-caps). It also goes, and frees its slot, as soon as the
-last one in it leaves (or is removed, or purged), and its messages go with it.
+expires. A thread or private room quiet for 30 days is archived: it stays
+listed (`archived: true`) with all its history, and stops counting under the
+[caps](limits.md#hard-caps) until a new post makes it active again; the oldest
+archived rooms past as many as the cap, and one whose whole log has expired
+everywhere, are removed (their members get `room_update` `left`). A thread or
+private room also goes, and frees its slot, as soon as the last one in it leaves (or is removed, or purged), and its messages go with it.
 This is not secure erasure, and says nothing about provider backups or copies
 on clients.
 

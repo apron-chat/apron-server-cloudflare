@@ -778,7 +778,33 @@ Uploaded files expire by age (`fileRetentionSeconds`, 120 days on Paid), since
 the bucket's lifecycle rules can only expire by age: a message kept longer
 shows without its file. A removed account's `user_id` is retired until history
 has expired past the log position where it was removed (account upkeep,
-below), not for a time, so it follows whichever limit moves the log.
+below), not for a time, so it follows whichever limit moves the log. With the
+cold tier keeping everything, that is never: history that names the account
+(an idle-pruned account's own posts, which stay, and other people's mentions
+of it) stays readable in some tier, and a new account given the same ID would
+take it over. Registration picks another ID instead (registered IDs are
+`<name>_<digits>` or `u_…`), so a retired ID costs nothing but its name.
+
+### Rooms that go quiet
+
+A thread or private room whose newest record is older than
+`roomArchiveSeconds` (`LIMIT_ROOM_ARCHIVE_SECONDS`, 30 days on both plans; 0
+never archives) is archived. It stays in `room_list`, marked
+`archived: true`, and its whole history stays readable through every tier,
+but it no longer counts against `threadLimit`, `threadsPerUser`,
+`privateRoomLimit` or `privateRoomsPerUser`, so quiet rooms free their slots
+without losing anything. A new post, reaction, move, room save or join in it
+makes it active again and takes a slot; while the cap is full that request is
+refused as a new room would be (`thread_limit`). Leaving is never refused.
+
+The rooms table keeps the newest archived rooms of each kind, up to as many
+as the cap (100 threads, 100 private rooms on Paid); each daily cleanup
+removes older ones, as it removes a room whose whole log has left every tier
+(its members get `room_update` `left`, and its history is no longer
+reachable, since history is read room by room). Each kind's rows therefore
+stay within three times its cap, which the scans of the rooms table and
+their reservations are sized for; `/status` shows the active and archived
+counts.
 
 ### History tiers
 
@@ -970,6 +996,36 @@ codec). Encryption can be added later as a codec after it, with no change
 to how backups are named, pruned or read: the import decodes through
 whatever chain an object records.
 
+## Upgrading and rolling back
+
+This version moves history out of the object's SQLite into D1 and R2 by
+count, where earlier versions expired it by age (30 days). Deploying it over
+an older version loses nothing: the copy marker starts at 0, so nothing
+leaves SQLite until the tier below has written it, and a copy that fails
+stalls and alerts while SQLite holds everything (the hot log grows instead).
+It needs no schema change: the schema version and tables of the older
+version stay as they are, and it adds tables (`history_chunks`) and `_meta`
+keys (`history:*`) that the older version ignores.
+
+**Fix forward; do not roll back** once records have moved below SQLite (after
+the first daily cleanup that finds more than `retentionRecords`' share):
+
+- An older version knows neither the copy marker nor the tiers. It would
+  finish a cleanup this version started, whose cutoff is by count and may be
+  past what D1 holds yet, and apply its own age rule to SQLite: it deletes
+  records that were never copied and that it would itself have kept.
+- It removes thread and private rooms whose whole log is below its SQLite
+  floor, with their memberships, where this version keeps them because their
+  records are in D1 or R2, archived or not.
+- It counts every thread row against `threadLimit`, archived ones included,
+  so it refuses new threads until its own cleanup removes old ones.
+
+Records already in D1 and R2 survive a rollback, and come back into history
+when this version is deployed again. If a rollback cannot wait, make it in the
+first days after the deploy, before anything has moved, or deploy this
+version with a much higher `LIMIT_RETENTION_RECORDS` instead, which stops
+records moving without losing any.
+
 ## Runtime overrides
 
 Wrangler string variables use the exact names below. Every row of the numeric
@@ -980,9 +1036,10 @@ Wrangler deployments should use the uppercase form; local tests may use
 camelCase. Omitted variables use the defaults. Each value must be a positive
 JavaScript safe integer: `0`, fractions, negative values, and values above
 `Number.MAX_SAFE_INTEGER` fail startup. `retentionRecords`,
-`retentionSeconds`, `historyD1Records` and `historyColdRecords` also take
-`0`, which turns that bound off (for `historyD1Records`, the D1 tier; for
-`historyColdRecords`, the cold tier keeps everything).
+`retentionSeconds`, `historyD1Records`, `historyColdRecords` and
+`roomArchiveSeconds` also take `0`, which turns that bound off (for
+`historyD1Records`, the D1 tier; for `historyColdRecords`, the cold tier
+keeps everything; for `roomArchiveSeconds`, rooms never archive).
 
 Production should use the checked-in budget defaults; retain overrides for local
 tests or deliberate temporary reductions. Overrides do not regenerate the native
@@ -1267,12 +1324,12 @@ wall-clock jump cannot reset them. Cleanup and deduplication run in bounded
 batches/records, while `foreground*` and `maintenance*` are daily SQL
 operation budgets.
 
-`threadLimit` counts thread rooms (rooms with a `parent_room_id`) and the
-top-level rooms admins and mods create (at most 16 of them);
-`threadsPerUser` (at most `threadLimit`) caps the live threads one
+`threadLimit` counts active thread rooms (rooms with a `parent_room_id`)
+and the top-level rooms admins and mods create (at most 16 of them);
+`threadsPerUser` (at most `threadLimit`) caps the active threads one
 registered user has created, so one account cannot take every slot.
-`privateRoomLimit` (at most 200) counts private rooms apart from the
-threads; `privateRoomsPerUser` caps the live private rooms one registered
+`privateRoomLimit` (at most 200) counts active private rooms apart from the
+threads; `privateRoomsPerUser` caps the active private rooms one registered
 user has started, and `privateMembershipsPerUser` (at most 50, and at least
 `privateRoomsPerUser`) the private rooms one user is in, theirs and those
 others added them to, which `ext.settings.private_rooms` advertises.
@@ -1316,7 +1373,8 @@ The numeric rows are grouped by their unit and enforcement scope:
 - History: `retentionRecords`, `historyD1Records` and `historyColdRecords` (counts of records), and
   `cleanupThresholdPercent` (a percent, at most 100; [above](#history-retention)).
 - Durations: `minRetentionSeconds` and `retentionSeconds` ([History
-  retention](#history-retention)), `cleanupSeconds`, `challengeTtlSeconds`,
+  retention](#history-retention)), `roomArchiveSeconds` ([Rooms that go
+  quiet](#rooms-that-go-quiet)), `cleanupSeconds`, `challengeTtlSeconds`,
   `sessionTtlSeconds` (a passkey session token's lifetime, renewed on each
   resume), `idleAccountSeconds` (account upkeep, above), `unauthenticatedTimeoutSeconds`, `dedupTtlSeconds`, and
   `statusCoalesceSeconds`, `offlineGraceSeconds`, `presenceAlarmSeconds` and
@@ -1460,6 +1518,7 @@ The numeric rows are grouped by their unit and enforcement scope:
 | `cleanupBatch` | 100 |  |
 | `threadLimit` | 100 |  |
 | `threadsPerUser` | 25 |  |
+| `roomArchiveSeconds` | 2592000 |  |
 | `roomMetadataLimit` | 8192 |  |
 | `roomMetadataMinLimit` | 1024 |  |
 | `roomMetadataTotalLimit` | 262144 |  |

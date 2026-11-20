@@ -283,8 +283,8 @@ first.
 
 | Cap | Limit |
 | --- | ---: |
-| Threads a user has started and still live | 25 |
-| Threads on the server (`thread_limit`) | 100 |
+| Active threads a user has started | 25 |
+| Active threads on the server (`thread_limit`) | 100 |
 | Private rooms a user has started / is a member of | 5 / 20 |
 | Private rooms on the server | 100 |
 | Users with a reaction on one message ("reaction limit reached for this message") | 32 |
@@ -292,7 +292,7 @@ first.
 | Room mutes per user | 100 |
 | Registered accounts on the server | 50,000 (an account inactive for 30 days is removed, or up to 61 if it has an avatar, unless among the 100 most recently active or holding a role; a device token unused for 30 days stops working) |
 
-A thread stops counting when everyone has left it or its history expires.
+A thread or private room stops counting when everyone has left it, or when it has been quiet for 30 days: it is then archived, still listed (`archived: true`) and readable, and a new post makes it active again, taking a slot (refused with `thread_limit` while the cap is full; leaving is always allowed). The server keeps as many archived rooms of each kind as the cap, the newest; older ones are removed.
 
 ## Checklist: a well-behaved client
 
