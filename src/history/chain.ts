@@ -14,7 +14,7 @@
  * /rename changed above it (unrewrittenFilter is where a filter would go).
  */
 
-import { type ChainSnapshot, type ChainView, type ReadPart, type Step, type WorkStep, chainView, mergePages, planRead, planStep } from "./link";
+import { type ChainSnapshot, type ChainView, type ReadPart, type Step, type WorkStep, arrivedThrough, chainView, copyNow, mergePages, planRead, planStep } from "./link";
 import { type ChatRecord, type Clock, type HistoryQuery, type QueuedRewrite, type Retention, type Rewrite, type TierStats, logIds, rewritten, toRange } from "./records";
 import { type Stall, stallAlert, stallCleared, stallFailed } from "./stall";
 import { type ChainStateStore, type HistoryHead, type HistoryTier, type LinkState, TIER_METHODS, type TierFloor } from "./tier";
@@ -60,8 +60,6 @@ export interface TierReport {
 
 const DEFAULT_BATCH = 100;
 const DEFAULT_TRIM_BATCH = 500;
-/** How long a delivered rewrite still applies to pages read below the head (a page may have read before it was delivered). */
-const RECENT_MS = 60_000;
 /** How long a lower tier's target stands while nothing above it changed (age retention moves it with time). */
 const TARGET_REFRESH_MS = 3_600_000;
 
@@ -89,12 +87,10 @@ export class HistoryChain {
 	/** What the running round of cycles has done: it ends when a cycle finds nothing to do. */
 	private round = HistoryChain.newRound();
 	private static newRound() {
-		return { targeted: new Set<number>(), advanced: new Map<number, number>(), worked: false };
+		return { targeted: new Set<number>(), advanced: new Map<number, number>(), waiting: new Map<number, number>(), worked: false };
 	}
 	/** What each lower tier's last target was found from (what the tier above held then), and when. */
 	private readonly targetBasis = new Map<number, { basis: string; at: number }>();
-	/** Rewrites delivered lately, by the tier they reached, for pages that read it before. */
-	private recent: Array<{ tier: number; rewrite: Rewrite; at: number }> = [];
 
 	constructor(options: ChainOptions) {
 		this.head = options.head;
@@ -119,8 +115,9 @@ export class HistoryChain {
 	}
 
 	private async snapshot(): Promise<ChainSnapshot> {
-		const [view, published, logged] = await Promise.all([this.view(), this.head.publishedFloor(), this.logged()]);
-		return { ...view, published, logged, trimmed: this.trimmed, targeted: this.round.targeted, advanced: this.round.advanced };
+		const [view, published, logged, queued] = await Promise.all([this.view(), this.head.publishedFloor(), this.logged(), this.head.rewrites.list()]);
+		const oldest = queued.length ? queued[0].seq : logged + 1;
+		return { ...view, published, logged, oldest, trimmed: this.trimmed, targeted: this.round.targeted, advanced: this.round.advanced, waiting: this.round.waiting };
 	}
 
 	/**
@@ -189,6 +186,11 @@ export class HistoryChain {
 				const from = this.tiers[step.link];
 				const to = this.tiers[step.link + 1];
 				const batch = to.appendBatch ?? this.batch;
+				if (to.appendBatch !== undefined && !await this.copyNow(step, snapshot, batch)) {
+					// Less than a whole batch is due, and the tier above has room: it holds the rest until more arrives.
+					round.waiting.set(step.link, arrivedThrough(snapshot, step.link));
+					return;
+				}
 				const range = await from.scan(step.start, batch);
 				const records = range.records.filter((record) => record.log_id < step.below);
 				if (records.length) await to.append(toRange(records));
@@ -225,6 +227,22 @@ export class HistoryChain {
 	}
 
 	/**
+	 * Whether a copy into a tier that takes whole batches goes now (link.ts,
+	 * copyNow): from what the tier above holds below its target, and in all,
+	 * against its count limit.
+	 */
+	private async copyNow(step: Extract<Step, { kind: "copy" }>, snapshot: ChainSnapshot, batch: number): Promise<boolean> {
+		const from = this.tiers[step.link];
+		const limit = this.retentions[step.link].records;
+		const pending = (await from.stats({ lower: step.start, upper: step.below - 1 })).records;
+		if (pending >= batch || !limit) return true;
+		// What it serves: from its floor up to the floor of the tier above (the rest are copies).
+		const upper = step.link === 0 ? undefined : snapshot.tiers[step.link - 1].floor - 1;
+		const held = (await from.stats({ lower: snapshot.tiers[step.link].floor, ...(upper === undefined ? {} : { upper }) })).records;
+		return copyNow({ pending, batch, held, limit });
+	}
+
+	/**
 	 * Link `link` delivers rewrite `seq` to the tier below it: applied where
 	 * the tier takes rewrites, acknowledged where it does not. A purge's
 	 * messages that tier finds go with the rewrite from now on (the log's
@@ -236,14 +254,8 @@ export class HistoryChain {
 		const tier = this.tiers[below];
 		const queued = await this.head.rewrites.list();
 		const entry = queued.find((item) => item.seq === seq);
-		if (!entry) {
-			// Gone from the log (delivered everywhere before this link had state): on to the next one it has.
-			const next = queued.find((item) => item.seq > seq);
-			const upstream = link === 0 ? await this.logged() : (await this.view()).links[link - 1].delivered;
-			await this.state.saveLink(this.tiers[link].name, { delivered: next ? Math.min(next.seq - 1, upstream) : upstream });
-			return;
-		}
-		if (tier.rewrite) {
+		// Gone from the log: delivered everywhere before this link had state, while its tier was empty (link.ts, nextRewrite).
+		if (entry && tier.rewrite) {
 			const { rewrite } = entry;
 			await tier.rewrite(rewrite, async (messageIds) => {
 				const fresh = messageIds.filter((id) => !(rewrite.messages ?? []).includes(id));
@@ -253,7 +265,6 @@ export class HistoryChain {
 				const drop: Rewrite = { user: rewrite.user, into: null, messages: fresh };
 				for (const above of this.tiers.slice(1, below)) await above.rewrite?.(drop, async () => undefined);
 			});
-			this.recent = [...this.recent.filter((item) => item.at > this.clock.now() - RECENT_MS), { tier: below, rewrite, at: this.clock.now() }];
 		}
 		await this.state.saveLink(this.tiers[link].name, { delivered: seq });
 		await this.forgetDelivered();
@@ -275,7 +286,9 @@ export class HistoryChain {
 	 * A history page down the chain: each tier's part of the window, filled
 	 * from the page's start until it has `limit` log IDs, merged with upper
 	 * tiers winning. A part read from a tier that takes rewrites has those
-	 * its link has yet to deliver (and those delivered lately) applied.
+	 * its link has yet to deliver applied: the log is read after the links'
+	 * state, so a rewrite delivered meanwhile is either among them or already
+	 * in the tier when it is read (applying one twice changes nothing).
 	 * `skipHead` reads only the tiers below the head, for a head (the Store)
 	 * that read its own.
 	 */
@@ -296,13 +309,11 @@ export class HistoryChain {
 		return mergePages(pages, query);
 	}
 
-	/** What a page part read from tier `index` has applied: what its link has yet to deliver, and what it delivered lately. */
+	/** What a page part read from tier `index` has applied: what its link has yet to deliver. */
 	private rewritesFor(index: number, view: ChainView, pending: readonly QueuedRewrite[]): Rewrite[] {
 		const tier = this.tiers[index];
 		if (!tier.rewrite) return unrewrittenFilter(tier);
-		const now = this.clock.now();
-		const recent = this.recent.filter((item) => item.tier === index && item.at > now - RECENT_MS).map((item) => item.rewrite);
-		return [...recent, ...pending.filter((entry) => entry.seq > view.links[index - 1].delivered).map((entry) => entry.rewrite)];
+		return pending.filter((entry) => entry.seq > view.links[index - 1].delivered).map((entry) => entry.rewrite);
 	}
 
 	/**

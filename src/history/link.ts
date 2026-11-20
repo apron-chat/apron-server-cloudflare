@@ -14,7 +14,11 @@
  *   acknowledged: the link moves on.
  * - copy: link `i` copies what its tier above holds below that tier's
  *   target, once that tier is current (every rewrite delivered to it): a
- *   copy never carries a record a rewrite on its way would change.
+ *   copy never carries a record a rewrite on its way would change. Into a
+ *   tier that takes whole batches (HistoryTier.appendBatch: the cold tier's
+ *   chunks), only a whole batch at a time, unless the tier above is at its
+ *   limit (copyNow): until then the link waits, and the tier above holds
+ *   the rest.
  * - target, advance, trim: a tier's own floor, never past what the link
  *   below holds of it (copy before delete) nor past the tier above.
  * - publish: the deepest tier's floor is where history starts; it rises
@@ -45,12 +49,25 @@ export interface ChainSnapshot extends ChainView {
 	published: number;
 	/** The newest rewrite in the head's log (0: none). */
 	logged: number;
+	/**
+	 * The oldest rewrite still in the head's log (logged + 1: none). Older
+	 * ones were delivered everywhere there was a link then: a link that has
+	 * delivered fewer is new, its tier empty when they were logged, so it
+	 * starts here.
+	 */
+	oldest: number;
 	/** Tiers whose target this round has found. */
 	targeted: ReadonlySet<number>;
 	/** The floor each tier was asked to advance to, this round (the head's advances by its own cleanup, later). */
 	advanced: ReadonlyMap<number, number>;
 	/** The floor each tier was last trimmed below, completely. */
 	trimmed: ReadonlyMap<number, number>;
+	/**
+	 * Links waiting for a whole batch this round (copyNow said no), by what
+	 * the tier above held then (arrivedThrough): they look again only once
+	 * more has arrived in it.
+	 */
+	waiting: ReadonlyMap<number, number>;
 }
 
 export type Step =
@@ -70,6 +87,32 @@ export type Step =
 
 /** The step kinds that can fail (and so stall a link). */
 export type WorkStep = Exclude<Step["kind"], "idle">;
+
+/**
+ * Whether a link into a tier that takes whole batches copies now: a whole
+ * batch is due (`pending` records below the tier above's target), the tier
+ * above holds its limit or more (`held` of `limit` records: it must let
+ * them go now), or no count limits it (its retention is by age or bytes
+ * alone). Otherwise the link waits, so the tier below gets whole batches,
+ * and the tier above holds at most its limit and one batch.
+ */
+export function copyNow(input: { pending: number; batch: number; held: number; limit?: number }): boolean {
+	return input.pending >= input.batch || input.limit === undefined || input.limit <= 0 || input.held >= input.limit;
+}
+
+/** What has arrived in the tier above link `link`, for `waiting`: the copy marker of the link into it (-1 for the head, which nothing copies into). */
+export function arrivedThrough(chain: Pick<ChainView, "links">, link: number): number {
+	return link === 0 ? -1 : chain.links[link - 1].through;
+}
+
+/**
+ * The next rewrite link `link` delivers: after what it has, from the oldest
+ * still logged. Where the log holds none it has yet to deliver (all gone
+ * from it), the step acknowledges up to what the tier above holds.
+ */
+export function nextRewrite(snapshot: Pick<ChainSnapshot, "links" | "oldest">, link: number): number {
+	return Math.max(snapshot.links[link].delivered + 1, snapshot.oldest);
+}
 
 /** The newest rewrite the tier above link `link` holds: the head holds every one logged. */
 export function upstream(chain: Pick<ChainView, "links">, link: number, logged: number): number {
@@ -98,12 +141,14 @@ export function planStep(snapshot: ChainSnapshot): Step {
 		const tier = tiers[index];
 		if (index > 0) {
 			const link = index - 1;
-			if (links[link].delivered < upstream(snapshot, link, logged)) return { kind: "deliver", link, seq: links[link].delivered + 1 };
+			const above = upstream(snapshot, link, logged);
+			if (links[link].delivered < above) return { kind: "deliver", link, seq: Math.min(nextRewrite(snapshot, link), above) };
 		}
 		if (!snapshot.targeted.has(index)) return { kind: "target", tier: index };
 		if (index < last && current(snapshot, index, logged)) {
 			const start = Math.max(tier.floor, links[index].through + 1);
-			if (start < tier.target) return { kind: "copy", link: index, start, below: tier.target };
+			const waiting = snapshot.waiting.get(index) === arrivedThrough(snapshot, index);
+			if (start < tier.target && !waiting) return { kind: "copy", link: index, start, below: tier.target };
 		}
 		const floor = allowedFloor(snapshot, index);
 		const advanced = Math.max(tier.floor, snapshot.advanced.get(index) ?? 0);

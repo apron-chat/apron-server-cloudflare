@@ -6,7 +6,7 @@ import { MemoryChunkIndex } from "./support/memory-chunk-index";
 import { ColdHistoryTier } from "../../src/history/cold/tier";
 import { HISTORY_CODECS } from "../../src/history/config";
 import { MemoryChainStateStore, MemoryHead, MemoryHistoryTier } from "./support/memory-tiers";
-import { type ChainSnapshot, type ChainView, type TierView, checkInvariants, mergePages, planRead, planStep } from "../../src/history/link";
+import { type ChainSnapshot, type ChainView, type TierView, checkInvariants, copyNow, mergePages, planRead, planStep } from "../../src/history/link";
 import { type ChainStage, HistoryChain, instrument } from "../../src/history/chain";
 import type { ChatRecord, Retention } from "../../src/history/records";
 import { NOT_STALLED } from "../../src/history/stall";
@@ -15,7 +15,7 @@ import { Model, show } from "./model";
 
 const tier = (name: string, floor: number, target = floor, rewrites = true): TierView => ({ name, floor, target, rewrites });
 const link = (through: number, delivered = 0): LinkState => ({ through, delivered, stall: NOT_STALLED });
-const round = () => ({ targeted: new Set<number>(), advanced: new Map<number, number>(), trimmed: new Map<number, number>() });
+const round = () => ({ targeted: new Set<number>(), advanced: new Map<number, number>(), trimmed: new Map<number, number>(), waiting: new Map<number, number>(), oldest: 1 });
 
 describe("planStep", () => {
 	it("delivers rewrites down each link in order, bottom-up, a link only what the tier above holds", () => {
@@ -40,6 +40,44 @@ describe("planStep", () => {
 		expect(planStep(snapshot)).toEqual({ kind: "deliver", link: 1, seq: 2 });
 		snapshot.links = [link(9, 2), link(4, 2)];
 		expect(planStep(snapshot)).toEqual({ kind: "copy", link: 1, start: 5, below: 8 });
+	});
+
+	it("starts a new link at the oldest rewrite still logged, and acknowledges what the log no longer holds", () => {
+		const snapshot: ChainSnapshot & ReturnType<typeof round> = { tiers: [tier("hot", 10), tier("recent", 5)], links: [link(9, 0)], published: 1, logged: 6, ...round(), oldest: 5 };
+		snapshot.targeted.add(0);
+		snapshot.targeted.add(1);
+		// Rewrites 1 to 4 were delivered everywhere and dropped before this link had state: it starts at 5.
+		expect(planStep(snapshot)).toEqual({ kind: "deliver", link: 0, seq: 5 });
+		// Nothing left in the log (oldest is past what was logged): the step acknowledges up to what the head holds.
+		snapshot.oldest = 7;
+		expect(planStep(snapshot)).toEqual({ kind: "deliver", link: 0, seq: 6 });
+	});
+
+	it("leaves a waiting link until more arrives in the tier above it", () => {
+		const snapshot: ChainSnapshot & ReturnType<typeof round> = { tiers: [tier("hot", 10, 10), tier("recent", 5, 8), tier("cold", 1)], links: [link(9), link(4)], published: 1, logged: 0, ...round() };
+		for (const index of [0, 1, 2]) snapshot.targeted.add(index);
+		snapshot.trimmed.set(2, 1);
+		expect(planStep(snapshot)).toEqual({ kind: "copy", link: 1, start: 5, below: 8 });
+		// The copy found less than a whole batch due: the link waits, recent keeps its floor, and the round moves up.
+		snapshot.waiting.set(1, 9);
+		expect(planStep(snapshot)).toEqual({ kind: "trim", tier: 1, below: 5 });
+		snapshot.trimmed.set(1, 5);
+		snapshot.trimmed.set(0, 10);
+		expect(planStep(snapshot)).toEqual({ kind: "idle" });
+		// Records arrived in recent (the head's link copied more): the link looks again.
+		snapshot.links = [link(12), link(4)];
+		expect(planStep(snapshot)).toEqual({ kind: "copy", link: 1, start: 5, below: 8 });
+	});
+
+	it("copies into a batched tier a whole batch at a time, unless the tier above is at its limit or has none by count", () => {
+		const cases: Array<[Parameters<typeof copyNow>[0], boolean]> = [
+			[{ pending: 10, batch: 10, held: 50, limit: 100 }, true],
+			[{ pending: 9, batch: 10, held: 99, limit: 100 }, false],
+			[{ pending: 9, batch: 10, held: 100, limit: 100 }, true],
+			[{ pending: 1, batch: 10, held: 0 }, true],
+			[{ pending: 1, batch: 10, held: 0, limit: 0 }, true],
+		];
+		for (const [input, expected] of cases) expect(copyNow(input)).toBe(expected);
 	});
 
 	it("works bottom-up: target, copy, advance and trim each tier, then publishes", () => {
@@ -225,6 +263,40 @@ describe("HistoryChain over memory tiers: retention and upkeep", () => {
 		expect((await head.rewrites.list()).length).toBe(1);
 		await chain.cycle({ steps: 10 });
 		expect(await head.rewrites.list()).toEqual([]);
+	});
+
+	it("hides a purge from a page that was reading while the purge was delivered and dropped from the log", async () => {
+		const clock = new TestClock();
+		const head = new MemoryHead("hot", clock);
+		let gate: Promise<void> | undefined;
+		let open = () => {};
+		let entered = () => {};
+		const reading = new Promise<void>((resolve) => { entered = resolve; });
+		// A read that has its records (from before the purge reached recent) and is held before it returns them.
+		const recent = instrument(new MemoryHistoryTier("recent"), async (method, call) => {
+			const result = await call();
+			if (method === "read" && gate) {
+				entered();
+				await gate;
+			}
+			return result;
+		});
+		const chain = new HistoryChain({ head, headRetention: { records: 2, thresholdPercent: 100 }, stages: [{ tier: recent, retention: { records: 100, thresholdPercent: 100 } }], state: new MemoryChainStateStore(), clock });
+		for (let index = 0; index < 6; index += 1) {
+			clock.time += 10;
+			head.commit("general", "message", { message_id: `m${index}`, from: { user_id: index % 2 ? "bob" : "ada" } });
+		}
+		await settle(chain);
+		await head.purge(["ada"]);
+		gate = new Promise<void>((resolve) => { open = resolve; });
+		const page = chain.read({ roomIds: ["general"], lower: 0, upper: Number.MAX_SAFE_INTEGER, forward: true, limit: 100 }, { skipHead: true });
+		await reading;
+		// Meanwhile the purge reaches recent and leaves the log; then the page's read goes on.
+		gate = undefined;
+		await settle(chain);
+		expect(await head.rewrites.list()).toEqual([]);
+		open();
+		expect((await page).filter((record) => record.record_json.includes('"ada"'))).toEqual([]);
 	});
 
 	it("notes a stall on the link when the tier below fails at any step, not only at a copy", async () => {
@@ -485,6 +557,62 @@ function runOptions(numRuns: number): fc.Parameters<unknown> {
 
 /** A soak (HISTORY_RUNS) takes longer than a test's default 5 s. */
 const PROPERTY_TIMEOUT = (env as unknown as Record<string, string | undefined>).HISTORY_RUNS ? 3_600_000 : undefined;
+
+/** head → recent → cold, with the cold tier's chunk index to read chunk sizes from. */
+function batched(recent: Retention, chunk: number) {
+	const clock = new TestClock();
+	const head = new MemoryHead("hot", clock);
+	const index = new MemoryChunkIndex();
+	const coldTier = new ColdHistoryTier({ name: "cold", store: new MemoryBlobStore(), index, codecs: HISTORY_CODECS, prefix: "history/batched/", clock: { now: () => 0 }, chunkLogIds: chunk });
+	const chain = new HistoryChain({
+		head, headRetention: { records: 4, thresholdPercent: 100 }, state: new MemoryChainStateStore(), clock, batch: 3, trimBatch: 50,
+		stages: [{ tier: new MemoryHistoryTier("recent"), retention: recent }, { tier: coldTier, retention: { thresholdPercent: 100 } }],
+	});
+	let posted = 0;
+	const post = (count: number) => {
+		for (let index = 0; index < count; index += 1, posted += 1) {
+			clock.time += 10;
+			head.commit(ROOMS[posted % ROOMS.length], "message", { message_id: `m${posted}`, from: { user_id: "ada" }, body: { text: `${posted}` } });
+		}
+	};
+	/** What recent serves (below the head's floor): what it holds against its limit. */
+	const held = async () => (await chain.stats())[1].stats.records;
+	const chunks = async () => (await index.list()).map((ref) => ref.records);
+	return { chain, post, held, chunks };
+}
+
+describe("copies into the cold tier", () => {
+	it("cuts whole chunks in steady state, and the tier above holds at most its limit and one chunk", async () => {
+		// recent keeps 10 of 20: 10 records of room before its limit, more than a chunk of 5.
+		const { chain, post, held, chunks } = batched({ records: 20, thresholdPercent: 50 }, 5);
+		for (let count = 0; count < 200; count += 1) {
+			post(1);
+			await settle(chain);
+			expect(await held()).toBeLessThanOrEqual(20 + 5);
+		}
+		const sizes = await chunks();
+		expect(sizes.length).toBeGreaterThan(30);
+		expect(sizes.every((size) => size === 5)).toBe(true);
+	});
+
+	it("never lets the tier above pass its limit and one chunk, whatever arrives at once", async () => {
+		await fc.assert(fc.asyncProperty(
+			fc.array(fc.integer({ min: 1, max: 30 }), { minLength: 1, maxLength: 40 }),
+			fc.integer({ min: 2, max: 12 }),
+			async (bursts, chunk) => {
+				const { chain, post, held, chunks } = batched({ records: 16, thresholdPercent: 50 }, chunk);
+				for (const burst of bursts) {
+					post(burst);
+					await settle(chain);
+					// At rest: within its limit and one chunk.
+					expect(await held()).toBeLessThanOrEqual(16 + chunk);
+				}
+				// A chunk is never more than a batch; a short one only where recent was at its limit.
+				expect((await chunks()).every((size) => size >= 1 && size <= chunk)).toBe(true);
+			},
+		), runOptions(20));
+	}, PROPERTY_TIMEOUT);
+});
 
 describe("model-based runs", () => {
 	for (const composition of compositions) {
