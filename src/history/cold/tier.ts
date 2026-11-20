@@ -5,9 +5,11 @@
  *
  * - Appending: a copy brings a chunk's worth at once (`appendBatch`), and
  *   becomes one chunk, keyed by its first log ID. A copy retried over the
- *   same stretch rewrites the same key. A range overlapping chunks already
- *   listed (a retry over a source that changed since) is merged with them
- *   into one chunk, the new records winning, and they go: INSERT OR REPLACE.
+ *   same stretch rewrites the same key. A range is split at the chunks
+ *   already listed: what falls inside one is merged into it, the new
+ *   records winning (INSERT OR REPLACE), split in place past a chunk's
+ *   worth; what falls between them becomes new chunks. Chunks never
+ *   overlap, and an append holds one listed chunk in memory at a time.
  * - Reading: chunks are ordered and do not overlap, so a page reads the
  *   chunks over its window that hold one of its rooms, in page order, until
  *   it is full. A few decoded chunks are cached, as a page often reads the
@@ -115,22 +117,89 @@ export class ColdHistoryTier implements HistoryTier {
 		await this.index.update({ remove: refs.map((ref) => ref.first) });
 	}
 
+	/**
+	 * Appends a range, split at the chunks already listed so no two chunks
+	 * ever overlap and none is merged with another: records inside a listed
+	 * chunk's stretch are merged into that chunk, the new records winning
+	 * (INSERT OR REPLACE), and those between chunks become new ones, each at
+	 * most a chunk's worth of log IDs. A copy brings a chunk's worth past
+	 * every listed chunk, so it makes one chunk; a retry over the same
+	 * stretch rewrites the same keys; an import landing among listed chunks
+	 * touches each one apart. Chunks are written one at a time, so memory
+	 * holds at most one listed chunk and the range itself.
+	 */
 	async append(range: RecordRange): Promise<void> {
 		const fresh = uniqueRecords(range.records);
 		if (!fresh.length) return;
 		const first = fresh[0].log_id;
 		const last = fresh[fresh.length - 1].log_id;
-		const overlapping = (await this.chunks()).filter((ref) => ref.first <= last && ref.last >= first);
-		const held = (await Promise.all(overlapping.map((ref) => this.load(ref)))).flat();
-		const bounds = { first: Math.min(first, ...overlapping.map((ref) => ref.first)), last: Math.max(last, ...overlapping.map((ref) => ref.last)) };
-		// A chunk listed at the same first is rewritten in place, under its key.
-		const key = overlapping.find((ref) => ref.first === bounds.first)?.key ?? chunkKey(this.prefix, bounds.first, this.codecs);
-		const ref = await this.write(key, uniqueRecords([...held, ...fresh]), bounds);
-		// The new chunk is listed, and those it replaces unlisted, at once; their objects go after.
-		await this.index.update({ put: [ref], remove: overlapping.filter((old) => old.first !== ref.first).map((old) => old.first) });
-		const gone = overlapping.filter((old) => old.key !== key);
-		for (const old of gone) this.cache.delete(old.key);
-		if (gone.length) await this.store.delete(gone.map((old) => old.key));
+		const listed = await this.chunks();
+		let rest = fresh;
+		for (const ref of listed.filter((each) => each.first <= last && each.last >= first)) {
+			const inside = rest.filter((record) => record.log_id >= ref.first && record.log_id <= ref.last);
+			if (!inside.length) continue;
+			rest = rest.filter((record) => record.log_id < ref.first || record.log_id > ref.last);
+			await this.mergeInto(ref, inside);
+		}
+		// What lies between listed chunks: new chunks, each inside one gap and at most a chunk's worth.
+		const bounds = listed.map((ref) => ref.first);
+		let piece: ChatRecord[] = [];
+		const flush = async () => {
+			if (!piece.length) return;
+			const records = piece;
+			piece = [];
+			const span = { first: records[0].log_id, last: records[records.length - 1].log_id };
+			await this.index.update({ put: [await this.write(chunkKey(this.prefix, span.first, this.codecs), records, span)] });
+		};
+		let ids = 0;
+		let gap = -1;
+		for (const record of rest) {
+			const at = bounds.filter((bound) => bound <= record.log_id).length;
+			const startsLogId = !piece.length || piece[piece.length - 1].log_id !== record.log_id;
+			if (piece.length && (at !== gap || (startsLogId && ids >= this.appendBatch))) {
+				await flush();
+				ids = 0;
+			}
+			gap = at;
+			if (startsLogId) ids += 1;
+			piece.push(record);
+		}
+		await flush();
+	}
+
+	/**
+	 * Merges `records` (all inside `ref`'s stretch) into that chunk. Past a
+	 * chunk's worth of log IDs it is split, inside its own stretch: the new
+	 * pieces are written and listed first (with the chunk itself, cut), and
+	 * the chunk's own object is rewritten last, so a crash between leaves
+	 * records twice (reads drop duplicates), never missing.
+	 */
+	private async mergeInto(ref: ChunkRef, records: readonly ChatRecord[]): Promise<void> {
+		const merged = uniqueRecords([...await this.load(ref), ...records]);
+		const pieces: ChatRecord[][] = [];
+		let ids = 0;
+		for (const record of merged) {
+			const piece = pieces[pieces.length - 1];
+			const startsLogId = !piece || piece[piece.length - 1].log_id !== record.log_id;
+			if (!piece || (startsLogId && ids >= this.appendBatch)) {
+				pieces.push([record]);
+				ids = 1;
+				continue;
+			}
+			if (startsLogId) ids += 1;
+			piece.push(record);
+		}
+		const spans = pieces.map((piece, index) => ({
+			first: index === 0 ? ref.first : piece[0].log_id,
+			last: index === pieces.length - 1 ? ref.last : pieces[index + 1][0].log_id - 1,
+		}));
+		const later: ChunkRef[] = [];
+		for (const [index, piece] of pieces.entries()) {
+			if (index === 0) continue;
+			later.push(await this.write(chunkKey(this.prefix, spans[index].first, this.codecs), piece, spans[index]));
+		}
+		if (later.length) await this.index.update({ put: [chunkRef(ref.key, pieces[0], spans[0], ref.bytes), ...later] });
+		await this.index.update({ put: [await this.write(ref.key, pieces[0], spans[0])] });
 	}
 
 	/** Records of the chunks `refs` hands out in page order, kept by `keep`, until `limit` distinct log IDs are in. */

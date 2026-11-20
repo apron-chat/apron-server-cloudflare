@@ -27,13 +27,14 @@ const clock = { now: () => Date.UTC(2026, 10, 19, 12, 0, 0) };
 const runner = { describe, it, expect };
 const nonce = () => Math.floor(Math.random() * 0x100000000).toString(16).padStart(8, "0");
 
-function coldTier(options: { store?: BlobStore; index?: MemoryChunkIndex; prefix?: string; codecs?: typeof HISTORY_CODECS } = {}) {
+function coldTier(options: { store?: BlobStore; index?: MemoryChunkIndex; prefix?: string; codecs?: typeof HISTORY_CODECS; chunkLogIds?: number } = {}) {
 	// The memory store's call log is what tests read; R2 is given only to the conformance suite.
 	const store = (options.store ?? new MemoryBlobStore()) as MemoryBlobStore;
 	const index = options.index ?? new MemoryChunkIndex();
 	const prefix = options.prefix ?? "history/test/";
 	const tier = new ColdHistoryTier({
 		name: "cold", store, index, prefix, clock, codecs: options.codecs ?? HISTORY_CODECS, header: { server: "wss://test.example/" },
+		...(options.chunkLogIds ? { chunkLogIds: options.chunkLogIds } : {}),
 	});
 	return { tier, store, index, prefix };
 }
@@ -78,7 +79,7 @@ describe("ColdHistoryTier chunks", () => {
 		expect((await tier.scan(0, 100)).records).toEqual(sampleLog());
 	});
 
-	it("rewrites the same key when a copy is retried, and merges a range overlapping chunks into one", async () => {
+	it("rewrites the same key when a copy is retried, and splits a range overlapping chunks at their bounds", async () => {
 		const { tier, store, index } = coldTier();
 		const log = sampleLog();
 		const first = log.filter((record) => record.log_id <= 1004);
@@ -87,12 +88,53 @@ describe("ColdHistoryTier chunks", () => {
 		await tier.append(toRange(first));
 		await tier.append(toRange(second));
 		expect((await index.list()).map((ref) => [ref.first, ref.last])).toEqual([[1001, 1004], [1005, 1008]]);
-		// A retry over a source that changed since reaches past both: one chunk, at the first one's key.
+		// A retry over a source that changed since reaches past both: merged into each where it falls, the rest a new chunk.
 		await tier.append(toRange(log.filter((record) => record.log_id >= 1003)));
-		const refs = await index.list();
-		expect(refs.map((ref) => [ref.first, ref.last])).toEqual([[1001, 1012]]);
-		expect((await store.list("history/test/")).keys.map((entry) => entry.key)).toEqual([refs[0].key]);
+		const refs = (await index.list()).sort((a, b) => a.first - b.first);
+		expect(refs.map((ref) => [ref.first, ref.last])).toEqual([[1001, 1004], [1005, 1008], [1009, 1012]]);
+		expect((await store.list("history/test/")).keys.map((entry) => entry.key).sort()).toEqual(refs.map((ref) => ref.key).sort());
 		expect((await tier.scan(0, 100)).records).toEqual(log);
+	});
+
+	it("takes an import landing among many chunks into each one apart, at most a chunk's worth each", async () => {
+		const { tier, store, index } = coldTier({ chunkLogIds: 4 });
+		// Twenty chunks of four log IDs each, 10 apart: 1000..1003, 1010..1013, ...
+		const copied = Array.from({ length: 20 }, (_, chunk) => Array.from({ length: 4 }, (_, at) => message("a", 1000 + chunk * 10 + at, ada)));
+		for (const chunk of copied) await tier.append(toRange(chunk));
+		const before = (await index.list()).sort((a, b) => a.first - b.first).map((ref) => [ref.first, ref.last]);
+		expect(before).toHaveLength(20);
+		// A sparse import: one record inside each chunk's stretch, and one in each gap between them.
+		const imported = [
+			...Array.from({ length: 20 }, (_, chunk) => message("b", 1000 + chunk * 10 + 2, ada)),
+			...Array.from({ length: 19 }, (_, chunk) => message("b", 1000 + chunk * 10 + 6, ada)),
+		];
+		const gets = store.calls.filter((call) => call.method === "get").length;
+		await tier.append(toRange(imported));
+		const refs = (await index.list()).sort((a, b) => a.first - b.first);
+		// Every chunk keeps its bounds; the gaps' records are new chunks inside their gaps; none overlap.
+		for (const [first, last] of before) expect(refs.some((ref) => ref.first === first && ref.last === last)).toBe(true);
+		for (const [at, ref] of refs.entries()) if (at > 0) expect(ref.first).toBeGreaterThan(refs[at - 1].last);
+		expect(refs).toHaveLength(39);
+		// Each listed chunk was read once, not all at once into one merged chunk.
+		expect(store.calls.filter((call) => call.method === "get").length - gets).toBeLessThanOrEqual(20);
+		const all = (await tier.scan(0, 1_000)).records;
+		expect(all).toHaveLength(80 + 39);
+	});
+
+	it("splits a chunk merged past a chunk's worth, inside its own stretch", async () => {
+		const { tier, index } = coldTier({ chunkLogIds: 4 });
+		await tier.append(toRange([1000, 1001, 1002, 1020].map((id) => message("a", id, ada))));
+		await tier.append(toRange([1030, 1031].map((id) => message("a", id, ada))));
+		// Twelve more log IDs inside the first chunk's stretch.
+		await tier.append(toRange(Array.from({ length: 12 }, (_, at) => message("b", 1003 + at, ada))));
+		const refs = (await index.list()).sort((a, b) => a.first - b.first);
+		expect(refs[0].first).toBe(1000);
+		expect(refs.find((ref) => ref.first === 1030)?.last).toBe(1031);
+		const inFirst = refs.filter((ref) => ref.last <= 1020);
+		expect(inFirst[inFirst.length - 1].last).toBe(1020);
+		for (const ref of inFirst) expect(ref.records).toBeLessThanOrEqual(4);
+		for (const [at, ref] of refs.entries()) if (at > 0) expect(ref.first).toBeGreaterThan(refs[at - 1].last);
+		expect((await tier.scan(0, 100)).records.map((record) => record.log_id)).toEqual([1000, 1001, 1002, ...Array.from({ length: 12 }, (_, at) => 1003 + at), 1020, 1030, 1031]);
 	});
 
 	it("reads only the chunks that hold one of a page's rooms", async () => {
